@@ -72,6 +72,6 @@ def test_ctsp_vs_direct_range_of_bands():
         chi_dir = direct(A_v, A_c)
         chi_ctsp = ctsp(A_v, A_c)
         assert np.isclose(chi_ctsp, chi_dir, rtol=5e-2)
-        print(f"chi_dir: {chi_dir}, chi_ctsp: {chi_ctsp}")
+        print(f"chi_dir: {chi_dir:.5f}, chi_ctsp: {chi_ctsp:.5f}")
 
 test_ctsp_vs_direct_range_of_bands()

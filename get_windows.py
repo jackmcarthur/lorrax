@@ -35,7 +35,7 @@ class WindowPair:
         self.cond_window = cond_window
         self.ntau = round(N_tau_window(cond_window, val_window, epsq))
         self.tau_i, self.w_i = roots_laguerre(self.ntau)
-        self.z_lm = np.sqrt((cond_window.end_energy - val_window.start_energy) / (cond_window.start_energy - val_window.end_energy))
+        self.z_lm = np.sqrt(1.0/((cond_window.end_energy - val_window.start_energy)*(cond_window.start_energy - val_window.end_energy))) # very important bug fixed here...
 
 def compute_dos(wfn_file, n_points=2000):
     """
