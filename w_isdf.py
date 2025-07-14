@@ -19,7 +19,7 @@ def get_chi_lm_Yt(psi_v, psi_c, win, wfn, xp):
     Gv_lm = LabeledArray(shape=(*wfn.kgrid, ntau, nspinor, nrmu, nspinor, nrmu), axes=('nkx', 'nky', 'nkz', 'ntau', 'nspinor1', 'nrmu1', 'nspinor2', 'nrmu2'))
     Gc_lm = LabeledArray(shape=(*wfn.kgrid, ntau, nspinor, nrmu, nspinor, nrmu), axes=('nkx', 'nky', 'nkz', 'ntau', 'nspinor1', 'nrmu1', 'nspinor2', 'nrmu2'))
     chi_lm_Yt = LabeledArray(shape=(ntau, npol, nrmu, npol, nrmu, *wfn.kgrid), axes=('ntau', 'npol1', 'nrmu1', 'npol2', 'nrmu2', 'nkx', 'nky', 'nkz'))
-    scratch = xp.empty((ntau, 1, nrmu, 1, nrmu, *wfn.kgrid), dtype=xp.complex128) # holds one chi^IJ piece at a time
+
     Gv_lm.join('nkx', 'nky', 'nkz')
     Gc_lm.join('nkx', 'nky', 'nkz')
     Gv_lm.join('nspinor1', 'nrmu1')
@@ -34,7 +34,7 @@ def get_chi_lm_Yt(psi_v, psi_c, win, wfn, xp):
     # need to loop over 'nk','nb' in psi_v then psi_c
     # for each ik, for each ib, if win.val_window.start_energy < psi_v.enk.data[ik,ib] < win.val_window.end_energy:
     # add to Gv_lm.data[ik,:,:,:] the outer product of psi_v.wfn.data[ik,ib,:] with xp.conj(psi_v.wfn.data[ik,ib,:]).T into the last two axes, duplicated along the first (tau) axis, multiplied by exp_tauE_v[tau,ik,ib] for each tau
-
+    
     # Iterate over k-points
     for ik in range(psi_v.psi.shape('nk')):
         # Mask for energies within the valence window (windows are inclusive)
@@ -51,6 +51,11 @@ def get_chi_lm_Yt(psi_v, psi_c, win, wfn, xp):
         # this does a batched GEMM over t dimension:
         Gv_lm.data[ik] = xp.matmul(M, psi_v_selected)
 
+        # Free intermediate arrays to reduce memory pressure
+        del psi_v_selected, exp_v_selected, psi_v_conj, M, val_mask
+        if hasattr(xp, 'get_default_memory_pool'):  # CuPy
+            xp.get_default_memory_pool().free_all_blocks()
+
     # Similar process for conduction bands
     for ik in range(psi_c.psi.shape('nk')):
         cond_mask = (psi_c.enk.data[ik] >= win.cond_window.start_energy) & (psi_c.enk.data[ik] <= win.cond_window.end_energy)
@@ -61,10 +66,17 @@ def get_chi_lm_Yt(psi_v, psi_c, win, wfn, xp):
         psi_c_conj = xp.conj(psi_c_selected)
         M = xp.einsum('tb,bi->tib', exp_c_selected, psi_c_selected)
         Gc_lm.data[ik] = xp.matmul(M, psi_c_conj)
+        
+        # Free intermediate arrays to reduce memory pressure
+        del psi_c_selected, exp_c_selected, psi_c_conj, M, cond_mask
+        if hasattr(xp, 'get_default_memory_pool'):  # CuPy
+            xp.get_default_memory_pool().free_all_blocks()
 
     Gv_lm.unjoin('nkx', 'nky', 'nkz')
     Gv_lm = Gv_lm.kgrid_to_last()
     Gv_lm.ifft_kgrid() # G_k -> G_R
+    if hasattr(xp, 'get_default_memory_pool'):
+        xp.get_default_memory_pool().free_all_blocks()
 
     Gc_lm.unjoin('nkx', 'nky', 'nkz')
     Gc_lm = Gc_lm.kgrid_to_last()
@@ -224,14 +236,14 @@ def get_static_w_q(chi_q, Vq, wfn, sym, xp, n_mult=10, block_f=1, bispinor=False
         #     # for _ in range(n_mult):
         #     #     xp.matmul(P, cb, out=P)
         #     #     wb += P
-        #     cb = a.copy() # chi array now contains vchi
-        #     for _ in range(n_mult-1):
-        #         xp.matmul(cb, a, out=P)
-        #         wb += P
-        #         cb = P.copy()
-        #         #print('mtx norm P: ', xp.linalg.norm(P))
-        #     # 4) Multiply by Vb → W = (1 - Vχ)^(-1) V
-        #     xp.matmul(wb, Vf, out=Wf[f0:f1])
+        #     #     cb = a.copy() # chi array now contains vchi
+        #     #     for _ in range(n_mult-1):
+        #     #         xp.matmul(cb, a, out=P)
+        #     #         wb += P
+        #     #         cb = P.copy()
+        #     #         #print('mtx norm P: ', xp.linalg.norm(P))
+        #     #     # 4) Multiply by Vb → W = (1 - Vχ)^(-1) V
+        #     #     xp.matmul(wb, Vf, out=Wf[f0:f1])
 
         #     # 5) write‐back
         #     #Wf[f0:f1] = wb
