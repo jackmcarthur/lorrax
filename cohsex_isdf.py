@@ -814,7 +814,7 @@ if __name__ == "__main__":
 
     ryd2ev = 13.6056980659
 
-    wfn = WFNReader("WFN.h5")
+    wfn = WFNReader("WFNsmall.h5")
     #wfnq = WFNReader("WFNq.h5")
     #eps0 = EPSReader("eps0mat.h5")
     #eps = EPSReader("epsmat.h5")
