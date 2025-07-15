@@ -419,7 +419,8 @@ def get_zeta_q_and_v_q_mu_nu(wfn, sym, centroid_indices, bandrange_l, bandrange_
         for k_r in range(sym.nk_tot):
             k_l_full = xp.asarray(sym.kvecs_asints[k_r]) - qvec
             k_l_gt0 = xp.mod(k_l_full, kgridgpu)
-            k_l = np.where(np.all(sym.kvecs_asints == k_l_gt0.get(), axis=1))[0][0]
+            k_l_gt0_cpu = k_l_gt0.get() if hasattr(k_l_gt0, 'get') else k_l_gt0
+            k_l = np.where(np.all(sym.kvecs_asints == k_l_gt0_cpu, axis=1))[0][0]
 
             psi_l_rtot = psi_l_rtot_out.slice('nk', k_l, tagged=False).reshape(nb_l * nspinor, *wfn.fft_grid)
             psi_r_rtot = psi_r_rtot_out.slice('nk', k_r, tagged=False).reshape(nb_r * nspinor, *wfn.fft_grid)
@@ -470,11 +471,12 @@ def get_zeta_q_and_v_q_mu_nu(wfn, sym, centroid_indices, bandrange_l, bandrange_
         q_rounded = xp.round(qveccrys)
         q_ext = xp.where(xp.abs(qveccrys - q_rounded) < 1e-8, q_rounded, qveccrys)
         iq = find_qpoint_index(q_ext, sym, tol=1e-6)
-        iq_cpu = iq.get()
+        iq_cpu = iq.get() if hasattr(iq, 'get') else int(iq)
 
         iqbar = sym.irk_to_k_map[iq_cpu]
         Sq = sym.sym_mats_k[sym.irk_sym_map[iq_cpu]]
-        G_Sq = np.round(q_ext.get() - Sq @ wfn.kpoints[iqbar]).astype(np.int32)
+        q_ext_cpu = q_ext.get() if hasattr(q_ext, 'get') else q_ext
+        G_Sq = np.round(q_ext_cpu - Sq @ wfn.kpoints[iqbar]).astype(np.int32)
         vcoul_psiG_comps = xp.asarray(np.einsum('ij,kj->ki', Sq.astype(np.int32), wfn.get_gvec_nk(iqbar)) - G_Sq[np.newaxis, :], dtype=xp.int32)
         V_qfullG.fill(0.0 + 0.0j)
         V_qfullG[:vcoul_psiG_comps.shape[0]] = V_qG[0, 0, iqbar, :vcoul_psiG_comps.shape[0]]
@@ -716,13 +718,13 @@ def write_labeled_arrays_to_h5(filename, V_qmunu, psi_l, psi_r):
     """
     with h5py.File(filename, 'w') as f:
         # Access the underlying numerical data arrays
-        V_qmunu_data = V_qmunu.data.get() if isinstance(V_qmunu.data, cp.ndarray) else V_qmunu.data
-        
+        V_qmunu_data = V_qmunu.data.get() if hasattr(V_qmunu.data, 'get') else V_qmunu.data
+
         # Handle WfnArray psi and enk data
-        psi_l_data = psi_l.psi.data.get() if isinstance(psi_l.psi.data, cp.ndarray) else psi_l.psi.data
-        psi_r_data = psi_r.psi.data.get() if isinstance(psi_r.psi.data, cp.ndarray) else psi_r.psi.data
-        enk_l_data = psi_l.enk.data.get() if isinstance(psi_l.enk.data, cp.ndarray) else psi_l.enk.data
-        enk_r_data = psi_r.enk.data.get() if isinstance(psi_r.enk.data, cp.ndarray) else psi_r.enk.data
+        psi_l_data = psi_l.psi.data.get() if hasattr(psi_l.psi.data, 'get') else psi_l.psi.data
+        psi_r_data = psi_r.psi.data.get() if hasattr(psi_r.psi.data, 'get') else psi_r.psi.data
+        enk_l_data = psi_l.enk.data.get() if hasattr(psi_l.enk.data, 'get') else psi_l.enk.data
+        enk_r_data = psi_r.enk.data.get() if hasattr(psi_r.enk.data, 'get') else psi_r.enk.data
 
         # Write data arrays
         f.create_dataset('V_qmunu_data', data=V_qmunu_data)

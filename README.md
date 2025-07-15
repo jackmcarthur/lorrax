@@ -39,3 +39,11 @@ To install the Python dependencies, run:
 ```bash
 ./run/setup.sh
 ```
+
+## Docker environment
+A basic Dockerfile is provided to make it easy to run the code in a clean environment. To build the image and start a shell inside it, run:
+```bash
+docker build -t isdf_cohsex .
+docker run --rm -it isdf_cohsex bash
+```
+This installs the Python requirements defined in `run/setup.sh` and drops you into a shell where you can run the examples, tests, or your own scripts.

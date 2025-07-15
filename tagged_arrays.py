@@ -185,11 +185,15 @@ class LabeledArray:
     def _apply_fft_inplace(self, k_axes, inverse=False):
         k_idxs = [self.axes.index(ax) for ax in k_axes]
 
-        if self.xp is cp:
+        if GPU_AVAILABLE:
             plan = cufft.get_fft_plan(self.data, axes=tuple(k_idxs))
             func = cufft.ifftn if inverse else cufft.fftn
             self.data[...] = func(
-                self.data, axes=k_idxs, norm='ortho', plan=plan, overwrite_x=True
+                self.data,
+                axes=k_idxs,
+                norm='ortho',
+                plan=plan,
+                overwrite_x=True,
             )
         else:
             func = np.fft.ifftn if inverse else np.fft.fftn

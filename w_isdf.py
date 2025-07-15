@@ -181,7 +181,7 @@ def get_chi_lm_Yt(psi_v, psi_c, win, wfn, xp):
     #oneoverkgrid = xp.complex128(np.power(np.complex128(wfn.kgrid[0]*wfn.kgrid[1]*wfn.kgrid[2]),0.5))
     #xp.multiply(chi_out.data, oneoverkgrid, out=chi_out.data)
     #xp.multiply(chi_out.data, 0.45, out=chi_out.data)
-    print('one chi_lm element ', chi_out.data[0,0,0,0,0,0,0].get())
+    print('one chi_lm element ', chi_out.data[0,0,0,0,0,0,0].item())
     return chi_out.data
 
 
@@ -216,7 +216,7 @@ def get_static_w_q(chi_q, Vq, wfn, sym, xp, n_mult=10, block_f=1, bispinor=False
     #    raise ValueError("bispinor not implemented yet")
     npol_w = chi_q.shape('npol1')
     nrmu = chi_q.shape('nrmu1')
-    print('one chi element: ', chi_q.data[0,0,0,0,0,0,0,0].get())
+    print('one chi element: ', chi_q.data[0,0,0,0,0,0,0,0].item())
 
     # does not matter if bispinor or not
     V_q = Vq.transpose('nfreq','nkx','nky','nkz','npol1','nrmu1','npol2','nrmu2')
