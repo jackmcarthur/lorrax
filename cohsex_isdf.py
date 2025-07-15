@@ -828,7 +828,7 @@ if __name__ == "__main__":
     ncplussigrange = (min(nsigmarange),max(n_fullrange))
 
     # Load centroids
-    centroids_frac = np.loadtxt('centroids_frac_600.txt')
+    centroids_frac = np.loadtxt('centroids_frac_60.txt')
     n_rmu = int(centroids_frac.shape[0])
 
     try:
