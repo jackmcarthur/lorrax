@@ -2,6 +2,10 @@
 
 All code contributions should ensure the project runs on machines without GPUs. When adding or editing Python, avoid `.get()` calls on arrays unless you first check that the object has that method.
 
+Agents must run `./run/setup.sh` to install dependencies. This script only
+installs the base requirements and deliberately skips heavyweight optional
+packages such as **Spiral**, **FFTX**, and **CuPy** so setup finishes quickly.
+
 Before committing changes, run the following commands:
 
 ```bash

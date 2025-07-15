@@ -1,5 +1,5 @@
 import numpy as np
-from gpu_utils import cp, xp, fftx, GPU_AVAILABLE
+from gpu_utils import cp, xp, GPU_AVAILABLE
 import h5py as h5
 import datetime
 
@@ -15,7 +15,7 @@ epspath = 'epsmat.h5'
 eps0path = 'eps0mat.h5'
 
 def perform_fft_3d(data_1d, gvecs, fft_grid):
-    """Transform 1D complex array to real space using FFTX.
+    """Transform 1D complex array to real space using an FFT.
     
     Args:
         data_1d: 1D complex array of coefficients (length ngk[ik])
@@ -39,16 +39,16 @@ def perform_fft_3d(data_1d, gvecs, fft_grid):
     # Use advanced indexing to assign all values at once
     fft_box[ix, iy, iz] = data_1d
     
-    # Perform inverse FFT using FFTX
+    # Perform inverse FFT using CuPy if available, otherwise NumPy
     # Note: ifftn performs the inverse FFT which is what we want for G-space to real-space
-    fft_result = fftx.fft.ifftn(fft_box)
+    fft_result = xp.fft.ifftn(fft_box)
     
     return fft_result
 
 def calculate_charge_density(wfn, sym, nval=None, ncond=None):
     """
-    Calculate charge density in real space from wavefunctions using WFNReader: goes over all occ. states c_nk(G),
-    FFTs them to c_nk(R) (using GPU for FFTs when available via FFTX), squares and sums to get rho(R).
+    Calculate charge density in real space from wavefunctions using WFNReader: goes over all occupied states c_nk(G),
+    FFTs them to c_nk(R) (using GPU acceleration when available), squares and sums to get rho(R).
     k-point symmetries are used. The loop order is (nband, nk_irr, n_sym).
     n_sym is done on the GPU since symmetry operations over Gvecs can be parallelized.
     """
