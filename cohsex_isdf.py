@@ -731,6 +731,8 @@ def write_labeled_arrays_to_h5(filename, V_qmunu, psi_l, psi_r):
         f.create_dataset('enk_l_data', data=enk_l_data)
         f.create_dataset('enk_r_data', data=enk_r_data)
 
+    print("wrote taggedarrays.h5")
+
 def read_labeled_arrays_from_h5(filename):
     """
     Read the data arrays from an HDF5 file and reconstruct LabeledArrays and WfnArrays.
