@@ -1,15 +1,143 @@
-import h5py
-#from gpu_utils import cp, xp
 import numpy as np
-import cupy as cp
+from gpu_utils import cp
+from wfnreader import WFNReader
+import symmetry_maps
+import sys
+import os
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D  # Import for 3D plotting
-from wfnreader import WFNReader  # Ensure wfnreader is correctly implemented or installed
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 - imported for side effects
 from scipy.ndimage import zoom
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "test_scripts"))
+from get_charge_density import calculate_charge_density
 # This script selects ISDF sampling points via a weighted k-means algorithm.
 # The density-driven clustering will remain relevant once the self-consistency
 # loop is introduced, since new charge densities will require recomputing these
 # centroids.
+
+# Functions below keep previously used visualization logic available
+# for debugging without affecting runtime when not called.
+
+def interpolate_density(rho_np, zoom_factors=(1, 1, 1)):
+    """Return a zoomed copy of ``rho_np`` using ``scipy.ndimage.zoom``."""
+    if zoom_factors == (1, 1, 1):
+        return rho_np
+    return zoom(rho_np, zoom_factors, order=3)
+
+
+def plot_density_and_centroids(wfn, rho_np, centroids, labels=None):
+    """Plot charge density and centroids in 3D."""
+    # Create 3D plot
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # Turn off grid and panes
+    ax.grid(False)
+    ax.xaxis.pane.fill = False
+    ax.yaxis.pane.fill = False
+    ax.zaxis.pane.fill = False
+    ax.xaxis.pane.set_edgecolor("none")
+    ax.yaxis.pane.set_edgecolor("none")
+    ax.zaxis.pane.set_edgecolor("none")
+
+    ax.set_xlim(-1, 3)
+    ax.set_ylim(-1, 3)
+    ax.set_zlim(0, 4)
+
+    # Plot density points where rho > threshold
+    threshold = 0.05 * np.amax(rho_np)
+    X, Y, Z = np.meshgrid(
+        np.linspace(0, 1, rho_np.shape[0]),
+        np.linspace(0, 1, rho_np.shape[1]),
+        np.linspace(0, 1, rho_np.shape[2]),
+        indexing="ij",
+    )
+
+    density_mask = rho_np > threshold
+    density_points = (
+        np.stack([X[density_mask], Y[density_mask], Z[density_mask]], axis=1)
+        @ wfn.avec
+    )
+    density_values = rho_np[density_mask]
+
+    scatter = ax.scatter(
+        density_points[:, 0],
+        density_points[:, 1],
+        density_points[:, 2],
+        c=np.log(np.abs(density_values) - 0.9 * threshold),
+        cmap="viridis",
+        alpha=0.05,
+        s=20,
+        marker="s",
+        label="Density",
+        zorder=1,
+    )
+    plt.colorbar(scatter, label="Charge Density")
+
+    # Optional Voronoi cell visualization
+    # mask0 = (labels == 0)
+    # mask1 = (labels == 1)
+    # voronoi0_points = positions[mask0].get()
+    # ax.scatter(voronoi0_points[:, 0], voronoi0_points[:, 1], voronoi0_points[:, 2],
+    #            c='blue', alpha=0.5, s=1, label='Voronoi Cell 0')
+    # voronoi1_points = positions[mask1].get()
+    # ax.scatter(voronoi1_points[:, 0], voronoi1_points[:, 1], voronoi1_points[:, 2],
+    #            c='green', alpha=0.5, s=1, label='Voronoi Cell 1')
+
+    centroids_np = centroids.get() @ wfn.avec
+    ax.scatter(
+        centroids_np[:, 0],
+        centroids_np[:, 1],
+        centroids_np[:, 2],
+        c="red",
+        s=100,
+        marker="*",
+        label="Centroids",
+        zorder=2,
+    )
+
+    vertices = np.array(
+        [
+            [0, 0, 0],
+            [1, 0, 0],
+            [0, 1, 0],
+            [1, 1, 0],
+            [0, 0, 1],
+            [1, 0, 1],
+            [0, 1, 1],
+            [1, 1, 1],
+        ]
+    )
+    vertices_cart = vertices @ wfn.avec
+    edges = [
+        (0, 1),
+        (1, 3),
+        (3, 2),
+        (2, 0),
+        (4, 5),
+        (5, 7),
+        (7, 6),
+        (6, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ]
+    for start, end in edges:
+        ax.plot(
+            [vertices_cart[start, 0], vertices_cart[end, 0]],
+            [vertices_cart[start, 1], vertices_cart[end, 1]],
+            [vertices_cart[start, 2], vertices_cart[end, 2]],
+            "k-",
+            linewidth=1,
+        )
+
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    ax.legend()
+    plt.title("Charge Density and Centroids")
+    plt.show()
 
 def weighted_kmeans_cupy(
     avec,
@@ -68,7 +196,7 @@ def weighted_kmeans_cupy(
     centroids_frac = cp.zeros((N_k, 3), dtype=cp.float32)
     
     # Choose first centroid randomly with probability proportional to density
-    probs = rho.ravel() / rho.sum()
+    probs = rho_cp.ravel() / rho_cp.sum()
     first_idx = cp.random.choice(len(positions), size=1, p=probs)[0]
     centroids_frac[0] = positions[first_idx]
     
@@ -146,7 +274,7 @@ def weighted_kmeans_cupy(
             mask = cp.equal(labels[:, cp.newaxis], cp.arange(N_k))  # Shape: (P, K)
 
             # Reshape rho to (P, 1) for broadcasting
-            rho_flat = rho.ravel()[:, cp.newaxis]  # Shape: (P, 1)
+            rho_flat = rho_cp.ravel()[:, cp.newaxis]  # Shape: (P, 1)
 
             # Apply mask to rho to get weights for each centroid
             masked_rho = mask * rho_flat  # Shape: (P, K)
@@ -168,7 +296,9 @@ def weighted_kmeans_cupy(
 
             # Calculate centroid movement
             centroid_movement = cp.linalg.norm(new_centroids_frac - centroids_frac, axis=1)
-            max_movement = cp.max(centroid_movement).get()  # Convert to CPU for logging
+            max_movement = cp.max(centroid_movement)
+            if hasattr(max_movement, "get"):
+                max_movement = max_movement.get()
             movement_file.write(f"{step}, {max_movement}\n")  # Log the maximum movement
             
             new_centroids_frac = new_centroids_frac % 1.0
@@ -199,172 +329,25 @@ def weighted_kmeans_cupy(
     return labels, centroids_frac, centroid_z_history, steps_taken
 
 if __name__ == "__main__":
+    wfn = WFNReader("WFNsmall.h5")
+    sym = symmetry_maps.SymMaps(wfn)
 
-    # Read 'avec' from file using WFNReader
-    wfn = WFNReader("WFN.h5")  # Ensure 'WFN.h5' exists and is correctly formatted
-    #wfn.avec = np.diag([1.,1.,1.])
-    wfn.avec = wfn.avec
-    avec = cp.asarray(wfn.avec, dtype=cp.float32)  # Shape: (3, 3)
+    charge_density = calculate_charge_density(wfn, sym)
+    rho_np = interpolate_density(charge_density)  # default no-op
+    rho_cp = cp.asarray(rho_np, dtype=cp.float32)
+    avec_cp = cp.asarray(wfn.avec, dtype=cp.float32)
 
+    _, centroids, _, _ = weighted_kmeans_cupy(avec_cp, rho_cp, N_k=16)
 
-    # First read the original density
-    with h5py.File("charge_density.h5", "r") as h5f:
-        rho_np = h5f['charge_density'][()]
-
-    # Pad each dimension to even size if needed
-    # shape = rho.shape
-    # pad_width = [(0, shape[i] % 2) for i in range(3)]  # Calculate padding for each dimension
-    # if any(p[1] for p in pad_width):  # If any padding is needed
-    #     # Pad using edge values
-    #     rho = cp.pad(rho, pad_width, mode='edge')
-    #     print(f"Padded array from {shape} to {rho.shape}")
-
-    # Now reshape the padded array
-    # shape = rho.shape
-    # new_shape = (shape[0]//2, 2, shape[1]//2, 2, shape[2]//2, 2)
-    # rho = rho.reshape(new_shape).sum(axis=(1,3,5))
-
-
-    # use "zoom factors" to interpolate density onto a coarser/faster grid
-    # since the procedure is not very resolution-sensitive
-    zoom_factors = (15/25, 15/25, 60/100)  # (0.6, 0.6, 0.6)
-    #zoom_factors = (1,1,1)
-
-    # Interpolate using spline interpolation
-    # order=3 is cubic spline interpolation
-    rho_interp = zoom(rho_np, zoom_factors, order=3)
-    
-    rho = cp.array(rho_interp, dtype=cp.float32)
-    rho_np = rho.get()
-
-    print(f"Original shape: {rho.shape}")  # (25, 25, 100)
-    print(f"New shape: {rho_interp.shape}")  # (15, 15, 60)
-
-    labels, centroids, centroid_z_history, steps_taken = weighted_kmeans_cupy(avec, rho, N_k=60)
-    
-    # Save fractional coordinates to file
-    np.savetxt('centroids_frac.txt', 
-               centroids.get(),  # Convert from cupy to numpy array
-               header='x y z',   # Column headers
-               fmt='%.6f',       # Format as float with 6 decimal places
-               delimiter=' ',     # Space-separated
-               comments='# ')    # Use # for header comment
-    
-    #rho = rho.get()
-    # Create 3D plot
-    fig = plt.figure(figsize=(10, 10))
-    ax = fig.add_subplot(111, projection='3d')
-    
-    # Turn off grid and panes
-    ax.grid(False)
-    ax.xaxis.pane.fill = False
-    ax.yaxis.pane.fill = False
-    ax.zaxis.pane.fill = False
-    ax.xaxis.pane.set_edgecolor('none')
-    ax.yaxis.pane.set_edgecolor('none')
-    ax.zaxis.pane.set_edgecolor('none')
-    
-    ax.set_xlim(-1,3)
-    ax.set_ylim(-1,3)
-    ax.set_zlim(0,4)
-
-    # Plot density points where rho > threshold
-    threshold = 0.05 * np.amax(rho_np) #* 10 # remove 10 if charge density fixed
-    print(f"Density threshold: {threshold}")
-    print(f"Max density: {np.amax(rho_np)}")
-    print(f"Min density: {np.amin(rho_np)}")
-    
-    X, Y, Z = np.meshgrid(
-        np.linspace(0,1,rho_np.shape[0]),
-        np.linspace(0,1,rho_np.shape[1]),
-        np.linspace(0,1,rho_np.shape[2]),
-        indexing='ij'
+    centroids_np = centroids.get() if hasattr(centroids, "get") else np.asarray(centroids)
+    np.savetxt(
+        "centroids_frac.txt",
+        centroids_np,
+        header="x y z",
+        fmt="%.6f",
+        delimiter=" ",
+        comments="# ",
     )
-    
-    # Get points above threshold
-    density_mask = rho_np > threshold
-    print(f"Number of points above threshold: {np.sum(density_mask)}")
-    
-    density_points = np.stack([X[density_mask], Y[density_mask], Z[density_mask]], axis=1) @ wfn.avec
-    density_values = rho_np[density_mask]
-    print(f"Shape of density_points: {density_points.shape}")
-    print(f"Range of density values: {density_values.min()} to {density_values.max()}")
-    
-    # Plot density points with color intensity based on density values
-    scatter = ax.scatter(density_points[:, 0], 
-                        density_points[:, 1], 
-                        density_points[:, 2], 
-                        c=np.log(np.abs(density_values)-0.9*threshold),  # Color by density
-                        cmap='viridis',    # Choose a colormap
-                        alpha=0.05,         # Much more opaque
-                        s=20,              # Larger markers
-                        marker='s',        # Square markers ('s' for square)
-                        label='Density',
-                        zorder=1)
-    plt.colorbar(scatter, label='Charge Density')
 
-    # # Get the masks for first two Voronoi cells
-    # mask0 = (labels == 0)
-    # mask1 = (labels == 1)
-    
-    # # Plot points in first Voronoi cell
-    # voronoi0_points = positions[mask0].get()  # Convert to numpy for plotting
-    # ax.scatter(voronoi0_points[:, 0], 
-    #           voronoi0_points[:, 1], 
-    #           voronoi0_points[:, 2],
-    #           c='blue',
-    #           alpha=0.5,
-    #           s=1,
-    #           label='Voronoi Cell 0')
-
-    # # Plot points in second Voronoi cell
-    # voronoi1_points = positions[mask1].get()  # Convert to numpy for plotting
-    # ax.scatter(voronoi1_points[:, 0], 
-    #           voronoi1_points[:, 1], 
-    #           voronoi1_points[:, 2],
-    #           c='green',
-    #           alpha=0.5,
-    #           s=1,
-    #           label='Voronoi Cell 1')
-    
-    # Plot centroids
-    centroids_np = centroids.get() @ wfn.avec
-    ax.scatter(centroids_np[:, 0], 
-              centroids_np[:, 1], 
-              centroids_np[:, 2], 
-              c='red', s=100, marker='*', label='Centroids',zorder=2)
-
-    # Define vertices of unit cube in fractional coordinates
-    vertices = np.array([
-        [0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0],
-        [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1]
-    ])
-    
-    # Transform to Cartesian coordinates
-    vertices_cart = vertices @ wfn.avec
-    
-    # Define edges as pairs of vertex indices
-    edges = [
-        # Bottom face
-        (0,1), (1,3), (3,2), (2,0),
-        # Top face
-        (4,5), (5,7), (7,6), (6,4),
-        # Vertical edges
-        (0,4), (1,5), (2,6), (3,7)
-    ]
-    
-    # Plot each edge
-    for start, end in edges:
-        ax.plot([vertices_cart[start,0], vertices_cart[end,0]],
-                [vertices_cart[start,1], vertices_cart[end,1]],
-                [vertices_cart[start,2], vertices_cart[end,2]],
-                'k-', linewidth=1)  # 'k-' means black solid line
-
-    # Customize the plot
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-    ax.legend()
-    
-    plt.title('Charge Density and Centroids')
-    plt.show()
+    # Uncomment to visualize the charge density and centroids
+    # plot_density_and_centroids(wfn, rho_np, centroids)
