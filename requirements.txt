@@ -2,3 +2,5 @@ numpy
 scipy
 h5py
 matplotlib
+jaxlib==0.4.26
+jax==0.4.26
