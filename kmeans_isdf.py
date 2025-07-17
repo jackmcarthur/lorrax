@@ -20,7 +20,7 @@ from test_scripts.get_charge_density import calculate_charge_density
 
 def interpolate_density(rho_np, zoom_factors=(1, 1, 1)):
     """Return a zoomed copy of ``rho_np`` using ``scipy.ndimage.zoom``."""
-    if zoom_factors == (1, 1, 1):
+    if zoom_factors.all() == 1:
         return rho_np
     return zoom(rho_np, zoom_factors, order=3)
 
@@ -346,7 +346,13 @@ if __name__ == "__main__":
     sym = symmetry_maps.SymMaps(wfn)
 
     charge_density = calculate_charge_density(wfn, sym)
-    rho_np = interpolate_density(charge_density)  # default no-op
+    # making interpolation the default: we could do fourier interpolation 
+    # (a good idea actually) but it's probably fine to use the scipy function. 
+    # the 3d orbital psuedization radius is 1.3 au; assume we want to sample 10 points in that radius.
+    zoom_factors = np.round(np.linalg.norm(wfn.avec, axis=0)/0.13) / charge_density.shape
+    print("charge density shape: ", charge_density.shape)
+    print("zoom factors: ", zoom_factors)
+    rho_np = interpolate_density(charge_density, zoom_factors)  # default no-op
     rho_cp = cp.asarray(rho_np, dtype=cp.float32)
     avec_cp = cp.asarray(wfn.avec, dtype=cp.float32)
 
