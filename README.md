@@ -30,9 +30,6 @@ to keep the repository root focused on the main COHSEX drivers.
 - h5py
 - matplotlib
 
-Optional GPU acceleration is supported with CuPy and FFTX. The code will
-automatically fall back to NumPy if these libraries are not installed.
-
 JAX is used for CPU-only parallelism in `kmeans_isdf.py`. To create multiple
 host devices for testing, set the environment variable:
 
@@ -40,12 +37,7 @@ host devices for testing, set the environment variable:
 export XLA_FLAGS="--xla_force_host_platform_device_count=4"
 ```
 
-This repository avoids optional packages such as FFTX and Spiral, so the JAX
-setup uses only the standard CPU backend. Real-space positions and the density
-array are flattened and evenly sharded across the available devices so each
-processor works on a contiguous slice of the grid while keeping a copy of all
-centroids.
-
+The JAX setup uses only the standard CPU backend. 
 
 ## Setup
 To install the Python dependencies, run:

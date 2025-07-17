@@ -445,7 +445,7 @@ def weighted_kmeans_jax(
         labels = jnp.argmin(dists, axis=1)
         mask = jax.nn.one_hot(labels, N_k, dtype=rho_slice.dtype)
         weights = rho_slice[:, None]
-        weighted = weights[:, :, None] * delta_cart
+        weighted = mask[..., None] * weights[:, :, None] * delta_cart
         sum_w_pos = jnp.sum(weighted, axis=0)
         sum_w = jnp.sum(mask * weights, axis=0)
         return jax.lax.psum(sum_w_pos, "d"), jax.lax.psum(sum_w, "d")
