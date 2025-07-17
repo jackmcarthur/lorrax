@@ -1,22 +1,39 @@
 import numpy as np
 import os
 
-# Configure JAX for four CPU devices so tests run the same everywhere
-os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=4")
+# Configure JAX for 4 virtual CPU devices
+print("Setting up JAX with 4 virtual CPU devices...")
 
-from gpu_utils import cp
+# MUST set environment variables before importing JAX
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+
+from jax import config
+config.update("jax_enable_x64", True)
+config.update("jax_platform_name", "cpu")  # Force CPU backend
+
+import jax
+import jax.numpy as jnp
+
+print(f"✓ JAX CPU backend initialized with {len(jax.devices())} virtual devices")
+print(f"✓ Devices: {jax.devices()}")
+
+# Import CuPy for other parts of the code that might need it
+try:
+    from gpu_utils import cp
+    gpu_available = True
+except ImportError:
+    # Fallback: create a dummy cp that just uses numpy
+    import numpy as cp
+    gpu_available = False
+    print("CuPy not available, using NumPy as fallback")
+
+from functools import partial
 from wfnreader import WFNReader
 import symmetry_maps
 import sys
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 - imported for side effects
 from scipy.ndimage import zoom
-
-from jax import config
-config.update("jax_enable_x64", True)
-import jax
-import jax.numpy as jnp
-from functools import partial
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "test_scripts"))
 from test_scripts.get_charge_density import calculate_charge_density
@@ -366,6 +383,9 @@ def weighted_kmeans_jax(
     """Weighted k-means using JAX on multiple CPU devices."""
     devices = jax.devices()
     n_dev = len(devices)
+    
+    # If using a single GPU, we'll just replicate across the same device
+    # JAX will handle this efficiently
 
     grid_x, grid_y, grid_z = rho_jax.shape
 
@@ -466,8 +486,18 @@ if __name__ == "__main__":
     print("charge density shape: ", charge_density.shape)
     print("zoom factors: ", zoom_factors)
     rho_np = interpolate_density(charge_density, zoom_factors)  # default no-op
-    rho_jax = jnp.asarray(rho_np, dtype=jnp.float32)
-    avec_jax = jnp.asarray(wfn.avec, dtype=jnp.float32)
+    # Convert to JAX arrays, ensuring we use CPU backend
+    # Convert CuPy arrays to NumPy first if needed
+    if hasattr(rho_np, 'get'):
+        rho_np_cpu = rho_np.get()
+    else:
+        rho_np_cpu = np.asarray(rho_np)
+    
+    avec_np_cpu = np.asarray(wfn.avec)
+    
+    # Now convert to JAX arrays (will use CPU backend)
+    rho_jax = jnp.asarray(rho_np_cpu, dtype=jnp.float32)
+    avec_jax = jnp.asarray(avec_np_cpu, dtype=jnp.float32)
 
     _, centroids, _, _ = weighted_kmeans_jax(avec_jax, rho_jax, N_k=16)
 
