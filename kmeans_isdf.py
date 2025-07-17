@@ -9,7 +9,7 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 - imported for side effect
 from scipy.ndimage import zoom
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "test_scripts"))
-from get_charge_density import calculate_charge_density
+from test_scripts.get_charge_density import calculate_charge_density
 # This script selects ISDF sampling points via a weighted k-means algorithm.
 # The density-driven clustering will remain relevant once the self-consistency
 # loop is introduced, since new charge densities will require recomputing these
@@ -45,20 +45,33 @@ def plot_density_and_centroids(wfn, rho_np, centroids, labels=None):
     ax.set_zlim(0, 4)
 
     # Plot density points where rho > threshold
-    threshold = 0.05 * np.amax(rho_np)
+    # Handle both NumPy and CuPy arrays
+    if hasattr(rho_np, 'get'):
+        rho_shape = rho_np.shape
+        threshold = 0.05 * float(rho_np.max().get())
+    else:
+        rho_shape = rho_np.shape
+        threshold = 0.05 * np.amax(rho_np)
+    
     X, Y, Z = np.meshgrid(
-        np.linspace(0, 1, rho_np.shape[0]),
-        np.linspace(0, 1, rho_np.shape[1]),
-        np.linspace(0, 1, rho_np.shape[2]),
+        np.linspace(0, 1, rho_shape[0]),
+        np.linspace(0, 1, rho_shape[1]),
+        np.linspace(0, 1, rho_shape[2]),
         indexing="ij",
     )
 
     density_mask = rho_np > threshold
+    # Convert CuPy arrays to NumPy if needed
+    if hasattr(density_mask, 'get'):
+        density_mask = density_mask.get()
     density_points = (
         np.stack([X[density_mask], Y[density_mask], Z[density_mask]], axis=1)
         @ wfn.avec
     )
-    density_values = rho_np[density_mask]
+    if hasattr(rho_np, 'get'):
+        density_values = rho_np.get()[density_mask]
+    else:
+        density_values = rho_np[density_mask]
 
     scatter = ax.scatter(
         density_points[:, 0],
@@ -350,4 +363,4 @@ if __name__ == "__main__":
     )
 
     # Uncomment to visualize the charge density and centroids
-    # plot_density_and_centroids(wfn, rho_np, centroids)
+    plot_density_and_centroids(wfn, rho_np, centroids)
