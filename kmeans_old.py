@@ -356,7 +356,8 @@ if __name__ == "__main__":
     rho_cp = cp.asarray(rho_np, dtype=cp.float32)
     avec_cp = cp.asarray(wfn.avec, dtype=cp.float32)
 
-    _, centroids, _, _ = weighted_kmeans_cupy(avec_cp, rho_cp, N_k=16)
+    cp.random.seed(0)
+    _, centroids, _, _ = weighted_kmeans_cupy(avec_cp, rho_cp, N_k=15)
 
     centroids_np = centroids.get() if hasattr(centroids, "get") else np.asarray(centroids)
     np.savetxt(
@@ -369,4 +370,4 @@ if __name__ == "__main__":
     )
 
     # Uncomment to visualize the charge density and centroids
-    plot_density_and_centroids(wfn, rho_np, centroids)
+    # plot_density_and_centroids(wfn, rho_np, centroids)

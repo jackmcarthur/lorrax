@@ -380,15 +380,10 @@ def weighted_kmeans_jax(
     tolerance=5e-3,
     seed=0,
 ):
-    """Weighted k-means using JAX on multiple CPU devices."""
-    devices = jax.devices()
-    n_dev = len(devices)
-    
-    # If using a single GPU, we'll just replicate across the same device
-    # JAX will handle this efficiently
+    """Weighted k-means using JAX with the same logic as the legacy version."""
+    cp.random.seed(seed)
 
     grid_x, grid_y, grid_z = rho_jax.shape
-
     X, Y, Z = jnp.meshgrid(
         jnp.linspace(0, 1, grid_x),
         jnp.linspace(0, 1, grid_y),
@@ -399,71 +394,57 @@ def weighted_kmeans_jax(
     avec_inv = jnp.linalg.inv(avec)
 
     rho_flat = rho_jax.reshape(-1)
-    key = jax.random.PRNGKey(seed)
     centroids = jnp.zeros((N_k, 3), dtype=jnp.float32)
     probs = rho_flat / rho_flat.sum()
-    key, sub = jax.random.split(key)
-    first_idx = jax.random.choice(sub, positions.shape[0], shape=(1,), p=probs)[0]
+    first_idx = int(cp.random.choice(len(positions), size=1, p=np.array(probs))[0])
     centroids = centroids.at[0].set(positions[first_idx])
 
+    batch_size = 5
     min_dist_sq = jnp.zeros(positions.shape[0])
-    for k in range(1, N_k):
+    for k in range(1, N_k, batch_size):
+        curr_k = min(k + batch_size, N_k)
         diff = positions[:, None, :] - centroids[:k][None, :, :]
         diff = diff - jnp.round(diff)
         dcart = diff @ avec
-        dist_sq = jnp.sum(dcart**2, axis=2)
-        if k == 1:
-            min_dist_sq = dist_sq[:, 0]
-        else:
-            min_dist_sq = jnp.minimum(min_dist_sq, dist_sq[:, k - 1])
-        probs = min_dist_sq * rho_flat
-        probs = probs / probs.sum()
-        key, sub = jax.random.split(key)
-        next_idx = jax.random.choice(sub, positions.shape[0], shape=(1,), p=probs)[0]
-        centroids = centroids.at[k].set(positions[next_idx])
+        min_dist_sq = jnp.min(jnp.sum(dcart**2, axis=2), axis=1)
+        for b in range(k, curr_k):
+            probs = min_dist_sq * rho_flat
+            probs = probs / probs.sum()
+            next_idx = int(cp.random.choice(len(positions), size=1, p=np.array(probs))[0])
+            centroids = centroids.at[b].set(positions[next_idx])
+            if b < curr_k - 1:
+                diff_new = positions[:, None, :] - centroids[b:b+1][None, :, :]
+                diff_new = diff_new - jnp.round(diff_new)
+                dcart_new = diff_new @ avec
+                new_dist_sq = jnp.sum(dcart_new**2, axis=2)
+                min_dist_sq = jnp.minimum(min_dist_sq, new_dist_sq[:, 0])
 
-    # Shard the flattened real-space grid across devices
-    total_points = positions.shape[0]
-    indices = np.array_split(np.arange(total_points), n_dev)
-    pos_slices = [positions[idx] for idx in indices]
-    rho_slices = [rho_flat[idx] for idx in indices]
-    pos_sharded = jax.device_put_sharded(pos_slices, devices)
-    rho_sharded = jax.device_put_sharded(rho_slices, devices)
-    centroids_rep = jax.device_put_replicated(centroids, devices)
-    avec_rep = jax.device_put_replicated(avec, devices)
-    inv_rep = jax.device_put_replicated(avec_inv, devices)
-
-    @partial(jax.pmap, axis_name="d")
-    def partial_sums(pos_slice, rho_slice, cents, a, a_inv):
-        pos_cart = pos_slice @ a
-        cent_cart = cents @ a
-        delta_cart = pos_cart[:, None, :] - cent_cart[None, :, :]
-        delta_frac = delta_cart @ a_inv
-        delta_frac = delta_frac - jnp.round(delta_frac)
-        delta_cart = delta_frac @ a
-        dists = jnp.linalg.norm(delta_cart, axis=2)
-        labels = jnp.argmin(dists, axis=1)
-        mask = jax.nn.one_hot(labels, N_k, dtype=rho_slice.dtype)
-        weights = rho_slice[:, None]
-        weighted = mask[..., None] * weights[:, :, None] * delta_cart
-        sum_w_pos = jnp.sum(weighted, axis=0)
-        sum_w = jnp.sum(mask * weights, axis=0)
-        return jax.lax.psum(sum_w_pos, "d"), jax.lax.psum(sum_w, "d")
-
-    history = jnp.zeros((N_k, max_steps), dtype=jnp.float32)
+    centroid_z_history = jnp.zeros((N_k, max_steps), dtype=jnp.float32)
     steps_taken = max_steps
     for step in range(max_steps):
-        sum_pos, sum_w = partial_sums(pos_sharded, rho_sharded, centroids_rep, avec_rep, inv_rep)
-        total_pos = np.array(sum_pos[0])
-        total_w = np.array(sum_w[0])
-        cent_np = np.array(centroids)
-        valid = total_w > 0
-        cent_np[valid] = cent_np[valid] + (total_pos[valid] / total_w[valid, None]) @ np.linalg.inv(np.array(avec))
-        movement = np.linalg.norm(cent_np - np.array(centroids), axis=1)
-        history = history.at[:, step].set(jnp.array(cent_np % 1.0)[:, 2])
-        centroids = jnp.array(cent_np % 1.0, dtype=jnp.float32)
-        centroids_rep = jax.device_put_replicated(centroids, devices)
-        if np.all(movement < tolerance):
+        positions_cart = positions @ avec
+        centroids_cart = centroids @ avec
+        delta_cart = positions_cart[:, None, :] - centroids_cart[None, :, :]
+        delta_frac = delta_cart @ avec_inv
+        delta_frac = delta_frac - jnp.round(delta_frac)
+        delta_cart = delta_frac @ avec
+        distances = jnp.linalg.norm(delta_cart, axis=2)
+        labels = jnp.argmin(distances, axis=1)
+        mask = jnp.equal(labels[:, None], jnp.arange(N_k))
+        rho_flat_v = rho_flat[:, None]
+        masked_rho = mask * rho_flat_v
+        weighted_positions = masked_rho[:, :, None] * delta_cart
+        sum_weighted_frac = weighted_positions.sum(axis=0)
+        sum_weights = masked_rho.sum(axis=0)
+        valid = sum_weights > 0
+        new_centroids = centroids
+        if jnp.any(valid):
+            delta_update = (sum_weighted_frac[valid] / sum_weights[valid, None]) @ avec_inv
+            new_centroids = new_centroids.at[valid].set(centroids[valid] + delta_update)
+        centroid_movement = jnp.linalg.norm(new_centroids - centroids, axis=1)
+        centroid_z_history = centroid_z_history.at[:, step].set((new_centroids % 1.0)[:, 2])
+        centroids = new_centroids % 1.0
+        if jnp.all(centroid_movement < tolerance):
             steps_taken = step
             break
 
@@ -472,7 +453,7 @@ def weighted_kmeans_jax(
     dcart = diff @ avec
     labels = jnp.argmin(jnp.linalg.norm(dcart, axis=2), axis=1)
 
-    return labels, centroids, history, steps_taken
+    return labels, centroids, centroid_z_history, steps_taken
 
 if __name__ == "__main__":
     wfn = WFNReader("WFNsmall.h5")
@@ -499,17 +480,32 @@ if __name__ == "__main__":
     rho_jax = jnp.asarray(rho_np_cpu, dtype=jnp.float32)
     avec_jax = jnp.asarray(avec_np_cpu, dtype=jnp.float32)
 
-    _, centroids, _, _ = weighted_kmeans_jax(avec_jax, rho_jax, N_k=15)
+    cp.random.seed(0)
+    _, centroids_ref, _, _ = weighted_kmeans_cupy(cp.asarray(avec_np_cpu, dtype=cp.float32), cp.asarray(rho_np_cpu, dtype=cp.float32), N_k=15)
 
-    centroids_np = np.array(centroids)
+    _, centroids_jax, _, _ = weighted_kmeans_jax(avec_jax, rho_jax, N_k=15, seed=0)
+
+    centroids_ref_np = centroids_ref.get() if hasattr(centroids_ref, "get") else np.asarray(centroids_ref)
+    centroids_jax_np = np.array(centroids_jax)
     np.savetxt(
         "centroids_frac.txt",
-        centroids_np,
+        centroids_ref_np,
         header="x y z",
         fmt="%.6f",
         delimiter=" ",
         comments="# ",
     )
+    np.savetxt(
+        "centroids_frac_jax.txt",
+        centroids_jax_np,
+        header="x y z",
+        fmt="%.6f",
+        delimiter=" ",
+        comments="# ",
+    )
+    if not np.allclose(centroids_ref_np, centroids_jax_np):
+        diff = np.max(np.abs(centroids_ref_np - centroids_jax_np))
+        print(f"WARNING: JAX centroids differ from reference by {diff}")
 
     # Uncomment to visualize the charge density and centroids
-    plot_density_and_centroids(wfn, rho_np, centroids)
+    # plot_density_and_centroids(wfn, rho_np, centroids_jax)
