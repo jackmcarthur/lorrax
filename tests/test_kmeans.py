@@ -1,3 +1,8 @@
+import sys
+import os
+# Add parent directory to path so we can import modules
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 import h5py as h5
 from gpu_utils import cp
@@ -21,6 +26,8 @@ def test_kmeans_agreement(tmp_path):
     _, cent_ref, _, _ = weighted_kmeans_cupy(avec_cp, rho_cp, N_k=5)
     _, cent_jax, _, _ = weighted_kmeans_jax(avec_jax, rho_jax, N_k=5, seed=0)
 
+    import pathlib
+    tmp_path = pathlib.Path(tmp_path)
     ref_file = tmp_path/'centroids_ref.txt'
     jax_file = tmp_path/'centroids_jax.txt'
     np.savetxt(ref_file, cp.asnumpy(cent_ref) if hasattr(cp, 'asnumpy') else np.asarray(cent_ref))
@@ -35,3 +42,5 @@ def test_kmeans_agreement(tmp_path):
     row, col = linear_sum_assignment(cost)
     jax_sorted = jax[col]
     assert np.allclose(ref, jax_sorted, atol=0.07)
+
+test_kmeans_agreement('./')

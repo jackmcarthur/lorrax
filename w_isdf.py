@@ -108,47 +108,47 @@ def get_chi_lm_Yt(psi_v, psi_c, win, wfn, xp):
             xp.get_default_memory_pool().free_all_blocks()
 
         # Transform to real space for this tau
-        Gv_lm.unjoin('nkx', 'nky', 'nkz')
-        Gv_lm = Gv_lm.kgrid_to_last()
-        Gv_lm.ifft_kgrid() # G_k -> G_R
+    Gv_lm.unjoin('nkx', 'nky', 'nkz')
+    Gv_lm = Gv_lm.kgrid_to_last()
+    Gv_lm.ifft_kgrid() # G_k -> G_R
 
-        Gc_lm.unjoin('nkx', 'nky', 'nkz')
-        Gc_lm = Gc_lm.kgrid_to_last()
-        Gc_lm.ifft_kgrid()
+    Gc_lm.unjoin('nkx', 'nky', 'nkz')
+    Gc_lm = Gc_lm.kgrid_to_last()
+    Gc_lm.ifft_kgrid()
 
-        # flip Gv_R -> Gv_-R, keeping Gv_R=0 in the 0th index
+    # flip Gv_R -> Gv_-R, keeping Gv_R=0 in the 0th index
         for ik in range(2,5):
-            Gv_lm.data = xp.flip(Gv_lm.data, axis=ik)
-            Gv_lm.data = xp.roll(Gv_lm.data, 1, axis=ik)
+        Gv_lm.data = xp.flip(Gv_lm.data, axis=ik)
+        Gv_lm.data = xp.roll(Gv_lm.data, 1, axis=ik)
 
-        Gv_lm.unjoin('nspinor1', 'nrmu1')
-        Gv_lm.unjoin('nspinor2', 'nrmu2')
-        Gc_lm.unjoin('nspinor1', 'nrmu1')
-        Gc_lm.unjoin('nspinor2', 'nrmu2')
+    Gv_lm.unjoin('nspinor1', 'nrmu1')
+    Gv_lm.unjoin('nspinor2', 'nrmu2')
+    Gc_lm.unjoin('nspinor1', 'nrmu1')
+    Gc_lm.unjoin('nspinor2', 'nrmu2')
 
         # Compute chi contribution for this tau and accumulate with quadrature weight
         current_weight = quad_weights[itau]
         
-        if npol == 4:
-            scratch = xp.empty_like(Gc_lm.slice_many({'nspinor1': 0, 'nspinor2': 0}))
+    if npol == 4:
+        scratch = xp.empty_like(Gc_lm.slice_many({'nspinor1': 0, 'nspinor2': 0}))
 
-            for I, (rI, cI, vI) in enumerate(gammas_sparse):
-                for J, (rJ, cJ, vJ) in enumerate(gammas_sparse):
+        for I, (rI, cI, vI) in enumerate(gammas_sparse):
+            for J, (rJ, cJ, vJ) in enumerate(gammas_sparse):
                     target = chi_lm_integrated.data[I,:,J,:,:,:,:] 
-                    for p in range(len(vI)):
-                        a = int(rI[p])
-                        c = int(cI[p])
-                        gI = vI[p]
-                        for q in range(len(vJ)):
-                            b = int(rJ[q])
-                            d = int(cJ[q])
-                            gJ = vJ[q]
-                            xp.multiply(Gc_lm.slice_many({'nspinor1': a, 'nspinor2': b}),
-                                        Gv_lm.slice_many({'nspinor1': c, 'nspinor2': d}),
-                                        out=scratch)
+                for p in range(len(vI)):
+                    a = int(rI[p])
+                    c = int(cI[p])
+                    gI = vI[p]
+                    for q in range(len(vJ)):
+                        b = int(rJ[q])
+                        d = int(cJ[q])
+                        gJ = vJ[q]
+                        xp.multiply(Gc_lm.slice_many({'nspinor1': a, 'nspinor2': b}),
+                                    Gv_lm.slice_many({'nspinor1': c, 'nspinor2': d}),
+                                    out=scratch)
                             # Apply quadrature weight and accumulate
                             xp.add(target, current_weight * gI * gJ * scratch, out=target)
-        else:
+    else:
             for a in range(nspinor):
                 for b in range(nspinor):
                     chi_contribution = xp.multiply(Gc_lm.slice_many({'nspinor1':a,'nspinor2':b}), Gv_lm.slice_many({'nspinor1':b,'nspinor2':a}))
