@@ -117,7 +117,7 @@ def get_chi_lm_Yt(psi_v, psi_c, win, wfn, xp):
     Gc_lm.ifft_kgrid()
 
     # flip Gv_R -> Gv_-R, keeping Gv_R=0 in the 0th index
-        for ik in range(2,5):
+    for ik in range(2,5):
         Gv_lm.data = xp.flip(Gv_lm.data, axis=ik)
         Gv_lm.data = xp.roll(Gv_lm.data, 1, axis=ik)
 
@@ -126,15 +126,15 @@ def get_chi_lm_Yt(psi_v, psi_c, win, wfn, xp):
     Gc_lm.unjoin('nspinor1', 'nrmu1')
     Gc_lm.unjoin('nspinor2', 'nrmu2')
 
-        # Compute chi contribution for this tau and accumulate with quadrature weight
-        current_weight = quad_weights[itau]
+    # Compute chi contribution for this tau and accumulate with quadrature weight
+    current_weight = quad_weights[itau]
         
     if npol == 4:
         scratch = xp.empty_like(Gc_lm.slice_many({'nspinor1': 0, 'nspinor2': 0}))
 
         for I, (rI, cI, vI) in enumerate(gammas_sparse):
             for J, (rJ, cJ, vJ) in enumerate(gammas_sparse):
-                    target = chi_lm_integrated.data[I,:,J,:,:,:,:] 
+                target = chi_lm_integrated.data[I,:,J,:,:,:,:] 
                 for p in range(len(vI)):
                     a = int(rI[p])
                     c = int(cI[p])
@@ -147,13 +147,13 @@ def get_chi_lm_Yt(psi_v, psi_c, win, wfn, xp):
                                     Gv_lm.slice_many({'nspinor1': c, 'nspinor2': d}),
                                     out=scratch)
                             # Apply quadrature weight and accumulate
-                            xp.add(target, current_weight * gI * gJ * scratch, out=target)
+                        xp.add(target, current_weight * gI * gJ * scratch, out=target)
     else:
-            for a in range(nspinor):
-                for b in range(nspinor):
-                    chi_contribution = xp.multiply(Gc_lm.slice_many({'nspinor1':a,'nspinor2':b}), Gv_lm.slice_many({'nspinor1':b,'nspinor2':a}))
-                    # Apply quadrature weight and accumulate
-                    chi_lm_integrated.data[0,:,0,:,:,:,:] += current_weight * chi_contribution
+        for a in range(nspinor):
+            for b in range(nspinor):
+                chi_contribution = xp.multiply(Gc_lm.slice_many({'nspinor1':a,'nspinor2':b}), Gv_lm.slice_many({'nspinor1':b,'nspinor2':a}))
+                # Apply quadrature weight and accumulate
+                chi_lm_integrated.data[0,:,0,:,:,:,:] += current_weight * chi_contribution
 
         # Prepare for next tau iteration - rejoin for k-space operations
         Gv_lm.join('nspinor1', 'nrmu1')
