@@ -21,6 +21,35 @@ specialised low-rank kernel.
 from gpu_utils import cp, xp
 
 
+# the actual matrix to vector function will be the application of the BSE hamiltonian 
+# (in the TDA, H_BSE(cvk,c'v'k') = D + 2V - W) to a test eigenvector A_c'v'k'.
+# [DX](cvk) = (E_ck-E_vk')X_cvk
+
+# [VX](cvk) = \sum_{c'v'k'} V(cvk,c'v'k') X(c'v'k')
+# [VX](cvk) = 1/Nk 
+#             \sum_mu u*_ck(rmu)u_vk(rmu) [
+#                 \sum_nu V_munu(q=0) [
+#                     \sum_k'[
+#                          \sum_c' u_ck'(rnu) [
+#                              \sum_v' u*_v'k'(rnu)X(c'v'k')
+#                          ]
+#                      ]
+#                  ]
+#              ]
+# shapes become: shape N_rnu * Nc * Nk', then N_rnu * Nk, 
+
+# [WX](cvk) = \sum_{c'v'k'} W(cvk,c'v'k') X(c'v'k')
+# [WX](cvk) = 1/Nk 
+#             \sum_nu u_vk(rnu) [
+#                 \sum_mu u*_ck(rmu) [
+#                     \sum_k' W_munu(k-k') [
+#                          \sum_c' u_ck'(rmu) [
+#                              \sum_v' u*_v'k'(rnu)X(c'v'k')
+#                          ]
+#                      ]
+#                  ]
+#              ]
+
 def apply_matrix_to_vector(mat, vec):
     """Apply the matrix ``mat`` to ``vec``."""
     return xp.matmul(mat, vec)
