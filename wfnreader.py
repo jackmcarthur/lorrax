@@ -35,7 +35,7 @@ class WFNReader:
 
         self.nelec = int(np.sum(self.occs[0,0]))
         # in-gap chemical potential
-        #self.efermi = 0.5 * (np.amin(self.energies[0,:,self.nelec]) - np.amax(self.energies[0,:,self.nelec-1]))
+        self.efermi = 0.5 * (np.amin(self.energies[0,:,self.nelec]) - np.amax(self.energies[0,:,self.nelec-1]))
         self.cbm = np.amax(self.energies[0,:,self.nelec-1])
         self.vbm = np.amin(self.energies[0,:,self.nelec])
         

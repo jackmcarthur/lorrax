@@ -253,7 +253,7 @@ def fft_bandrange(wfn, sym, bandrange, is_left, psi_rtot_out, xp=cp, bispinor=Fa
     psi_rtot_out *= xp.sqrt(n_rtot) # fixes to unit norm
     #print("norm of one wfn:", xp.linalg.norm(psi_rtot_out[0,0]))
 
-def get_enk_bandrange(wfn, sym, bandrange, xp):
+def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, xp):
     nb = bandrange[1] - bandrange[0]
     en_irk = xp.asarray(wfn.energies[0,:,bandrange[0]:bandrange[1]])
     enk = LabeledArray(shape=(sym.nk_tot,nb), axes=['nk', 'nb'])
@@ -262,7 +262,37 @@ def get_enk_bandrange(wfn, sym, bandrange, xp):
     # we also use nk as the first index because other arrays use nb as the faster index.
     enk.data = en_irk[sym.irk_to_k_map,:]
 
-    return enk
+    # LSTSQ WEIGHTS
+    # best chi obtained not when residuals of the full M(cvkq) are minimized,
+    # but when residuals of M(cvkq)/sqrt(E_ck-q - E_vk) are minimized.
+    # we can nearly account for this by:
+    # picking the smallest energy in the sigma bandrange, giving cond states weights 1/sqrt(E_ck - E_min)
+    # picking the largest energy in the sigma bandrange, giving val states weights 1/sqrt(E_max - E_vk)
+    # set all weights in the sigma bandrange to the max conduction and valence weights, then
+    # normalize such that those weights are 1.0.
+    # this produces a very large (order of magnitude) improvement in SX energies.
+    sigma_start, sigma_end = sigma_bandrange
+    enk_sigma_start = max([sigma_start - bandrange[0], 0])
+    enk_sigma_end = min([sigma_end - bandrange[0], nb])
+    energies_sym = xp.asarray(wfn.energies[0, :, :])            # (nk_sym, nband_total)
+    energies_full = energies_sym[sym.irk_to_k_map, :]             # (nk_full, nband_total)
+    energies_sigma = energies_full[:, sigma_start:sigma_end]      # (nk_full, n_sigma)
+    # Reference energies per k-point
+    E_min = xp.min(energies_sigma)            # (nk_full,)
+    E_max = xp.max(energies_sigma)          # (nk_full,)
+    # Determine valence vs conduction bands within sigma range
+    #band_idxs = xp.arange(sigma_start, sigma_end)[None, :]  # (1, n_sigma)
+    mask_val = enk.data <= wfn.efermi                       # (1, n_sigma) broadcast to (nk_full, n_sigma)
+    # Compute weights
+    val_weights  = 1.0 / xp.sqrt((E_max - enk.data))
+    cond_weights = 1.0 / xp.sqrt((enk.data - E_min))
+    weights_full = xp.where(mask_val, val_weights, cond_weights)
+    # Normalize so the maximum weight across the sigma range is 1.0
+    wmax = xp.max(weights_full)
+    weights_full = weights_full / wmax
+    weights_full[:,enk_sigma_start:enk_sigma_end] = 1.0
+    # TODO: in bispinor case repeats should = 4
+    return enk, xp.repeat(weights_full, repeats=2, axis=1)
 
 def get_WminV_qGG(wfn, iqbar, eps0mat, epsmat,xp):
     # get correct qpt index.
@@ -396,8 +426,8 @@ def get_zeta_q_and_v_q_mu_nu(wfn, sym, centroid_indices, bandrange_l, bandrange_
     print("FFTs complete")
     
     # make WfnArray's that contain psi_nk(r_mu),E_nk together.
-    enk_l = get_enk_bandrange(wfn, sym, bandrange_l, xp)
-    enk_r = get_enk_bandrange(wfn, sym, bandrange_r, xp)
+    enk_l, weights_l = get_enk_bandrange(wfn, sym, bandrange_l, (bandrange_r[0], bandrange_l[1]), xp)
+    enk_r, weights_r = get_enk_bandrange(wfn, sym, bandrange_r, (bandrange_r[0], bandrange_l[1]), xp)
 
     ##########################################
     # Loop over all q-points
@@ -431,6 +461,8 @@ def get_zeta_q_and_v_q_mu_nu(wfn, sym, centroid_indices, bandrange_l, bandrange_
             psi_r_rmuT = xp.ascontiguousarray(psi_r_rmu.T)
 
             # TODO: weight by sqrt(1/E_nk - E_F) for l/r
+            psi_l_rmuT = xp.multiply(psi_l_rmuT, weights_l[k_l,xp.newaxis,:])
+            psi_r_rmuT = xp.multiply(psi_r_rmuT, weights_r[k_r,xp.newaxis,:])
             #psi_l_rmuT = xp.multiply(psi_l_rmuT, xp.sqrt(xp.divide(1.0,xp.abs(enk_l.data[k_l]-wfn.vbm))))
             #psi_r_rmuT = xp.multiply(psi_r_rmuT, enk_r.data[k_r])
 
@@ -832,8 +864,9 @@ if __name__ == "__main__":
     ncplussigrange = (min(nsigmarange),max(n_fullrange))
 
     # Load centroids
-    centroids_frac = np.loadtxt('centroids_frac_60.txt')
+    centroids_frac = np.loadtxt('centroids_frac_600.txt')
     n_rmu = int(centroids_frac.shape[0])
+    taggedarray_filename = "taggedarrays" + str(n_rmu) + ".h5"
 
     try:
         cp.cuda.runtime.getDeviceCount()
@@ -862,7 +895,7 @@ if __name__ == "__main__":
     print('\n')
 
     # restart: if True, read interp. vectors and V_qmunu from file
-    restart = True
+    restart = False
     # x_only: if True, skip calculation of Chi(RPA)/W_q, only get exchange self energy
     x_only = False
     do_screened = True
@@ -885,12 +918,12 @@ if __name__ == "__main__":
     ####################################
         if x_only:
             V_qmunu, psi_l_rmu_out, psi_r_rmu_out = get_zeta_q_and_v_q_mu_nu(wfn, sym, centroid_indices, n_valrange, nsigmarange, V_qG, xp, bispinor=bispinor)
-            write_labeled_arrays_to_h5("taggedarrays.h5", V_qmunu, psi_l_rmu_out, psi_r_rmu_out)
+            write_labeled_arrays_to_h5(taggedarray_filename, V_qmunu, psi_l_rmu_out, psi_r_rmu_out)
         else:
             V_qmunu, psi_l_rmu_out, psi_r_rmu_out = get_zeta_q_and_v_q_mu_nu(wfn, sym, centroid_indices, nvplussigrange, ncplussigrange, V_qG, xp, bispinor=bispinor)
-            write_labeled_arrays_to_h5("taggedarrays.h5", V_qmunu, psi_l_rmu_out, psi_r_rmu_out)
+            write_labeled_arrays_to_h5(taggedarray_filename, V_qmunu, psi_l_rmu_out, psi_r_rmu_out)
     elif restart and not x_only:
-        V_qmunu, psi_l_rmu_out, psi_r_rmu_out = read_labeled_arrays_from_h5("taggedarrays.h5")
+        V_qmunu, psi_l_rmu_out, psi_r_rmu_out = read_labeled_arrays_from_h5(taggedarray_filename)
 
     if not x_only:
         chi0 = get_chi0(psi_l_rmu_out, psi_r_rmu_out, window_pairs, wfn, xp)
