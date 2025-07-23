@@ -213,6 +213,7 @@ def get_static_w_q(chi_q, Vq, wfn, sym, xp, n_mult=10, block_f=1, bispinor=False
     # A^N is done with blocked GEMMs along the frequency axis; since we currently do COHSEX we set block_q=1
 
     #if bispinor:
+    
         # die because no chi_munu = gamma_mu gamma_nu G G yet
     #    raise ValueError("bispinor not implemented yet")
     npol_w = chi_q.shape('npol1')

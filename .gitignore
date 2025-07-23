@@ -8,4 +8,4 @@ WFN_unfolded.h5
 debug_arrays.h5
 __pycache__/
 *.py[cod]
-taggedarrays600.h5
+taggedarrays*00.h5

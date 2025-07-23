@@ -8,7 +8,7 @@ import h5py as h5
 from gpu_utils import cp
 from wfnreader import WFNReader
 from kmeans_isdf import weighted_kmeans_jax
-from kmeans_old import weighted_kmeans_cupy
+from test_scripts.kmeans_old import weighted_kmeans_cupy
 
 
 def test_kmeans_agreement(tmp_path):

@@ -850,7 +850,7 @@ if __name__ == "__main__":
 
     ryd2ev = 13.6056980659
 
-    wfn = WFNReader("WFNsmall.h5")
+    wfn = WFNReader("WFN.h5")
     #wfnq = WFNReader("WFNq.h5")
     #eps0 = EPSReader("eps0mat.h5")
     #eps = EPSReader("epsmat.h5")
@@ -864,7 +864,7 @@ if __name__ == "__main__":
     ncplussigrange = (min(nsigmarange),max(n_fullrange))
 
     # Load centroids
-    centroids_frac = np.loadtxt('centroids_frac_600.txt')
+    centroids_frac = np.loadtxt('centroids_frac_60.txt')
     n_rmu = int(centroids_frac.shape[0])
     taggedarray_filename = "taggedarrays" + str(n_rmu) + ".h5"
 
@@ -878,6 +878,8 @@ if __name__ == "__main__":
     # Replace any index equal to the grid size with 0 (periodic boundary)
     for i in range(3):
         centroid_indices[centroid_indices[:, i] == wfn.fft_grid[i], i] = 0
+    print("unique centroid indices:")
+    print(np.unique(centroid_indices, axis=0).shape)
 
 
     # windows for polarizability and sigma
@@ -895,7 +897,7 @@ if __name__ == "__main__":
     print('\n')
 
     # restart: if True, read interp. vectors and V_qmunu from file
-    restart = False
+    restart = True
     # x_only: if True, skip calculation of Chi(RPA)/W_q, only get exchange self energy
     x_only = False
     do_screened = True

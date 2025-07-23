@@ -477,12 +477,20 @@ def weighted_kmeans_jax(
 
     return labels, centroids, history, steps_taken
 
+
+
 if __name__ == "__main__":
-    wfn = WFNReader("WFNsmall.h5")
+    wfn = WFNReader("WFN.h5")
     sym = symmetry_maps.SymMaps(wfn)
 
     charge_density = calculate_charge_density(wfn, sym)
-    zoom_factors = np.round(np.linalg.norm(wfn.avec, axis=0)/0.13) / charge_density.shape
+    # with large PW cutoffs, the charge density grid is excessively large; reset so that in 
+    # the radius of a 3d orbital core region (1.3 A) we have 10 points.
+    # resize according to z axis:
+    zoom_f = np.round(np.linalg.norm(wfn.avec[2,2])/0.13) / charge_density.shape[2]
+    zoom_factors = np.array([zoom_f, zoom_f, zoom_f])
+    if any(wfn.fft_grid < 20):
+        zoom_factors = np.ones_like(zoom_factors)
     print("charge density shape: ", charge_density.shape)
     print("zoom factors: ", zoom_factors)
     rho_np = interpolate_density(charge_density, zoom_factors)
@@ -498,31 +506,31 @@ if __name__ == "__main__":
     avec_jax = jnp.asarray(avec_np_cpu, dtype=jnp.float32)
 
     cp.random.seed(0)
-    _, centroids_ref, _, _ = weighted_kmeans_cupy(cp.asarray(avec_np_cpu, dtype=cp.float32), cp.asarray(rho_np_cpu, dtype=cp.float32), N_k=15)
+    #_, centroids_ref, _, _ = weighted_kmeans_cupy(cp.asarray(avec_np_cpu, dtype=cp.float32), cp.asarray(rho_np_cpu, dtype=cp.float32), N_k=15)
+    N_k = 600
+    _, centroids_jax, _, _ = weighted_kmeans_jax(avec_jax, rho_jax, N_k=N_k, seed=0)
 
-    _, centroids_jax, _, _ = weighted_kmeans_jax(avec_jax, rho_jax, N_k=15, seed=0)
-
-    centroids_ref_np = centroids_ref.get() if hasattr(centroids_ref, "get") else np.asarray(centroids_ref)
+    #centroids_ref_np = centroids_ref.get() if hasattr(centroids_ref, "get") else np.asarray(centroids_ref)
     centroids_jax_np = np.array(centroids_jax)
+    # np.savetxt(
+    #     "centroids_frac.txt",
+    #     centroids_ref_np,
+    #     header="x y z",
+    #     fmt="%.6f",
+    #     delimiter=" ",
+    #     comments="# ",
+    # )
     np.savetxt(
-        "centroids_frac.txt",
-        centroids_ref_np,
-        header="x y z",
-        fmt="%.6f",
-        delimiter=" ",
-        comments="# ",
-    )
-    np.savetxt(
-        "centroids_frac_jax.txt",
+        "centroids_frac_" + str(N_k) + ".txt",
         centroids_jax_np,
         header="x y z",
         fmt="%.6f",
         delimiter=" ",
         comments="# ",
     )
-    if not np.allclose(centroids_ref_np, centroids_jax_np):
-        diff = np.max(np.abs(centroids_ref_np - centroids_jax_np))
-        print(f"WARNING: JAX centroids differ from reference by {diff}")
+    #if not np.allclose(centroids_ref_np, centroids_jax_np):
+    #    diff = np.max(np.abs(centroids_ref_np - centroids_jax_np))
+    #    print(f"WARNING: JAX centroids differ from reference by {diff}")
 
     # Uncomment to visualize
-    # plot_density_and_centroids(wfn, rho_np, centroids_jax)
+    plot_density_and_centroids(wfn, rho_np, centroids_jax)
