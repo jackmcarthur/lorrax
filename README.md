@@ -51,3 +51,15 @@ The JAX setup uses only the standard CPU backend.
 ## Setup
 To install the Python dependencies use uv/Docker setup.
 
+
+### Local uv usage
+To create the environment and install dependencies:
+```bash
+uv venv
+uv sync --no-install-project --locked
+```
+Run the code with:
+```bash
+uv run python cohsex_isdf.py
+```
+The provided `Dockerfile` mirrors these steps.
