@@ -863,6 +863,7 @@ def read_labeled_arrays_from_h5(filename):
 
 
 def main(argv=None):
+    global sym
     argp = argparse.ArgumentParser(description="COHSEX self-energy driver")
     argp.add_argument(
         "-i",
@@ -891,6 +892,7 @@ def main(argv=None):
 
     ryd2ev = 13.6056980659
 
+    global wfn
     wfn = WFNReader(params["wfn_file"])
     #wfnq = WFNReader("WFNq.h5")
     #eps0 = EPSReader("eps0mat.h5")
@@ -943,6 +945,7 @@ def main(argv=None):
     restart = params["restart"]
     x_only = params["x_only"]
     do_screened = params["do_screened"]
+    global bispinor
     bispinor = params["bispinor"]
 
     if x_only and do_screened:
