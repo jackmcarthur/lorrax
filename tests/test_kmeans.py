@@ -1,21 +1,18 @@
-import sys
 import os
-# Add parent directory to path so we can import modules
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import h5py as h5
-from gpu_utils import cp
-from wfnreader import WFNReader
-from kmeans_isdf import weighted_kmeans_jax
-from test_scripts.kmeans_old import weighted_kmeans_cupy
+from isdf.common.gpu_utils import cp
+from isdf.common.wfnreader import WFNReader
+from isdf.isdf_init.kmeans_isdf import weighted_kmeans_jax
+from misc.test_scripts.kmeans_old import weighted_kmeans_cupy
 
 
 def test_kmeans_agreement(tmp_path):
     cp.random.seed(0)
-    with h5.File('charge_density.h5', 'r') as f:
+    with h5.File('examples/cohsex_test/charge_density.h5', 'r') as f:
         rho = f['charge_density'][...]
-    wfn = WFNReader('WFNsmall.h5')
+    wfn = WFNReader('examples/cohsex_test/WFNsmall.h5')
     avec = wfn.avec
 
     rho_cp = cp.asarray(rho, dtype=cp.float32)

@@ -1,4 +1,4 @@
-from gpu_utils import xp
+from .gpu_utils import xp
 #import cupy as xp
 #import numpy as np
 

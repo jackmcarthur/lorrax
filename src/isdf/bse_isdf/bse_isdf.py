@@ -23,7 +23,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
 import numpy as np
-from cohsex_isdf import read_labeled_arrays_from_h5
+from ..gw_isdf.cohsex_isdf import read_labeled_arrays_from_h5
 
 # Enable 64-bit precision
 jax.config.update("jax_enable_x64", True)

@@ -18,3 +18,11 @@ dependencies = [
 gpu = [
     "cupy-cuda12x>=13.5.1",
 ]
+
+[project.scripts]
+cohsex_isdf = "isdf.gw_isdf.cohsex_isdf:main"
+kmeans_isdf = "isdf.isdf_init.kmeans_isdf:main"
+bse_isdf = "isdf.bse_isdf.bse_isdf:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

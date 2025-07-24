@@ -1,5 +1,5 @@
 import numpy as np
-from gpu_utils import cp, xp, GPU_AVAILABLE
+from ..common.gpu_utils import cp, xp, GPU_AVAILABLE
 import h5py as h5
 import datetime
 
@@ -7,8 +7,8 @@ import datetime
 # COHSEX iterations.  This routine will later be called repeatedly as the
 # quasiparticle wavefunctions are updated.
 
-from wfnreader import WFNReader
-import symmetry_maps
+from ..common.wfnreader import WFNReader
+from ..common import symmetry_maps
 
 wfnpath = 'WFN.h5'
 epspath = 'epsmat.h5'

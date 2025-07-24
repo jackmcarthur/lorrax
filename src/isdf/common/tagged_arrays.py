@@ -1,5 +1,5 @@
 import numpy as np
-from gpu_utils import cp, xp, cufft, GPU_AVAILABLE
+from .gpu_utils import cp, xp, cufft, GPU_AVAILABLE
 from numpy import s_
 from typing import Union
 

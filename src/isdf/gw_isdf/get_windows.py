@@ -12,10 +12,10 @@ the frequency resolution of the full GW calculations.
 
 import sys
 import numpy as np
-import symmetry_maps               # imported as requested
-from wfnreader import WFNReader
+from ..common import symmetry_maps  # imported as requested
+from ..common.wfnreader import WFNReader
 from scipy.special import roots_laguerre
-from gpu_utils import cp, xp, GPU_AVAILABLE
+from ..common.gpu_utils import cp, xp, GPU_AVAILABLE
 
 class GL_window:
     def __init__(self, start_ind, end_ind, wfn):

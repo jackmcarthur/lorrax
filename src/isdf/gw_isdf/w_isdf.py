@@ -1,8 +1,8 @@
 import numpy as np
-from gpu_utils import cp, xp
-from wfnreader import WFNReader
-from tagged_arrays import LabeledArray
-from gamma_matrices import gammas_sparse
+from ..common.gpu_utils import cp, xp
+from ..common.wfnreader import WFNReader
+from ..common.tagged_arrays import LabeledArray
+from ..common.gamma_matrices import gammas_sparse
 # The routines here construct chi^0 and the screened interaction W using the
 # CTSP approach in the static limit.  Once the frequency grids are restored, the
 # same machinery will let us tackle full dynamical GW.
