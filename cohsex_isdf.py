@@ -881,6 +881,7 @@ if __name__ == "__main__":
         print(f"Memory Usage: {(mem_info[1] - mem_info[0])/1024**2:.1f}MB / {mem_info[1]/1024**2:.1f}MB")
     except Exception:
         print("Using CPU (NumPy)")
+    xp.random.seed(4)
 
     nval = params["nval"]
     ncond = params["ncond"]
