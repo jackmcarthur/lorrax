@@ -15,13 +15,22 @@ the time-dependent COHSEX method for nonequilibrium simulations. The code is hea
 
 The package requires as input the BerkeleyGW format wavefunction files `WFN.h5` and `WFNq.h5`. It is currently only compatible with full-spinor wavefunctions, but it can be used with wavefunction k-grids that are reduced by symmetry using `kgrid.x`, in which case it will make use of a symmetry-reduced q-grid in self-energy matrix element calculations.
 
-Core routines include:
-- `get_charge_density.py`
+The current most important executable files are:
 - `kmeans_isdf.py`
-- `get_interp_vectors.py`
 - `cohsex_main.py`
 
-These supplementary scripts are now stored in the `test_scripts/` directory
+Which depend on I/O and support from
+- `wfnreader.py`
+- `symmetry_maps.py`
+- `tagged_arrays.py`
+
+And call routines important to the physics from
+- `gamma_matrices.py`
+- `w_isdf.py`
+- `get_charge_density.py`
+- `get_windows.py`
+
+These supplementary scripts are now stored in the root and `test_scripts/` directories
 to keep the repository root focused on the main COHSEX drivers.
 
 ## Requirements
@@ -40,15 +49,5 @@ export XLA_FLAGS="--xla_force_host_platform_device_count=4"
 The JAX setup uses only the standard CPU backend. 
 
 ## Setup
-To install the Python dependencies, run:
-```bash
-./run/setup.sh
-```
+To install the Python dependencies use uv/Docker setup.
 
-## Docker environment
-A basic Dockerfile is provided to make it easy to run the code in a clean environment. To build the image and start a shell inside it, run:
-```bash
-docker build -t isdf_cohsex .
-docker run --rm -it isdf_cohsex bash
-```
-This installs the Python requirements defined in `run/setup.sh` and drops you into a shell where you can run the examples, tests, or your own scripts.

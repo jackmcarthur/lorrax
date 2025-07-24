@@ -1,17 +1,6 @@
 # AGENTS instructions
 
-All code contributions should ensure the project runs on machines without GPUs, as no GPUs are available on the agent's host device. Do not attempt to install CuPy or GPU libraries, only the numpy fallback is available. When adding or editing Python, avoid `.get()` calls on arrays unless you first check that the object has that method.
-
-Agents must run `./run/setup.sh` to install dependencies. This script only
-installs the base requirements and deliberately skips optional
-packages such as **Spiral**, **FFTX**, and **CuPy** so setup finishes quickly.
-
-Do **not** add imports of Spiral or FFTX in the code base. When using JAX,
-configure the host device count via
-`os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"` so the
-tests run deterministically on CPUs. JAX arrays should be sharded across the
-flattened real-space dimension (R) so each device has all centroids and a slice
-of the density grid.
+Test Docker + uv setup please.
 
 Before committing changes, run the following commands:
 
