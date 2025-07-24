@@ -1,4 +1,0 @@
-[console_scripts]
-bse_isdf = isdf.bse_isdf.bse_isdf:main
-cohsex_isdf = isdf.gw_isdf.cohsex_isdf:main
-kmeans_isdf = isdf.isdf_init.kmeans_isdf:main
