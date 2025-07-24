@@ -1,0 +1,20 @@
+[project]
+name = "isdf_gw"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "cupy-cuda12x>=13.5.1",
+    "h5py>=3.14.0",
+    "jax>=0.7.0",
+    "jaxlib>=0.7.0",
+    "matplotlib>=3.10.3",
+    "numpy>=2.3.1",
+    "scipy>=1.16.0",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "cupy-cuda12x>=13.5.1",
+]

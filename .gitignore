@@ -9,3 +9,5 @@ debug_arrays.h5
 __pycache__/
 *.py[cod]
 taggedarrays*00.h5
+.venv
+.vscode

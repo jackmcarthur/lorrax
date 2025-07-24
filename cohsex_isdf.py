@@ -897,7 +897,7 @@ if __name__ == "__main__":
     print('\n')
 
     # restart: if True, read interp. vectors and V_qmunu from file
-    restart = False
+    restart = True
     # x_only: if True, skip calculation of Chi(RPA)/W_q, only get exchange self energy
     x_only = False
     do_screened = True
