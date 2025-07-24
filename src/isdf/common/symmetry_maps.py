@@ -1,6 +1,6 @@
 import numpy as np
-from gpu_utils import cp, xp
-from wfnreader import WFNReader
+from .gpu_utils import cp, xp
+from .wfnreader import WFNReader
 
 
 class SymMaps:

@@ -18,7 +18,7 @@ cupy_stub.cuda = types.SimpleNamespace(runtime=types.SimpleNamespace(getDeviceCo
 cupy_stub.complex128 = np.complex128
 sys.modules.setdefault('cupy', cupy_stub)
 
-import wfnreader
+from isdf.common import wfnreader
 
 
 def ctsp_chi(A_v, A_c, valence, conduction, z, tau, w, E_gap):
@@ -39,7 +39,7 @@ def direct_chi(A_v, A_c, valence, conduction):
 
 
 def test_ctsp_matches_direct():
-    wfn = wfnreader.WFNReader('WFN.h5')
+    wfn = wfnreader.WFNReader('examples/cohsex_test/WFNsmall.h5')
     energies = wfn.energies[0, 0]
     valence = energies[: wfn.nelec]
     conduction = energies[wfn.nelec :]

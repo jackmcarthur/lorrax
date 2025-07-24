@@ -11,3 +11,4 @@ __pycache__/
 taggedarrays*00.h5
 .venv
 .vscode
+*.egg-info/

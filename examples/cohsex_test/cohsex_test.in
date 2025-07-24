@@ -1,0 +1,12 @@
+[cohsex]
+restart = true
+x_only = false
+do_screened = true
+bispinor = false
+wfn_file = WFNsmall.h5
+centroids_file = centroids_frac_60.txt
+output_file = eqp0_noqsym.dat
+nval = 5
+ncond = 5
+nband = 110
+sys_dim = 2
