@@ -1,24 +1,18 @@
-"""Haydock/Lanczos diagonalization demo for the Bethe--Salpeter equation.
+"""JAX based ISDF-BSE matrix vector product.
 
-The BSE Hamiltonian is Hermitian but far too large to form explicitly in
-real calculations.  A practical solver therefore only needs a routine
-that applies the matrix to a trial vector.  The Haydock recursion
-produces a Krylov basis from repeated applications of this routine.  In
-that basis the Hamiltonian reduces to a tridiagonal matrix whose
-eigenpairs approximate those of the full operator.  By mapping the
-tridiagonal eigenvectors back to the Krylov basis we obtain
-approximations to the desired eigenvectors.
+This module implements a prototype Bethe--Salpeter matrix--vector multiply using
+interpolative separable density fitting (ISDF).  The Hamiltonian action is
 
-This file illustrates the procedure on a small dense matrix.  The code
-is written with ``gpu_utils`` so that all operations run on either NumPy
-or CuPy.  The only unavoidable Python loop is over the number of Krylov
-iterations.  Expensive steps such as reorthogonalization are expressed as
-matrix--vector products so that they execute efficiently on the GPU.
-In a full implementation ``apply_matrix_to_vector`` would call a
-specialised low-rank kernel.
+.. math:: H = D + V - W
 
-JAX-based Haydock/Lanczos diagonalization demo for the Bethe--Salpeter equation
-with explicit matrix-vector products sharded across 8 devices via pmap.
+where ``D`` is the diagonal term from single particle energies and ``V`` and
+``W`` are the direct and screened exchange interactions.  For this simplified
+demo both ``V`` and ``W`` are taken from the same ``V_\mu\nu`` array stored in
+``taggedarrays.h5``.  The heavy real-space dimension (``nrmu``) is sharded
+across devices so the code runs on multiple CPU devices via JAX.
+
+The ``haydock_eig`` routine below is unchanged and provides a Lanczos solver
+using a user supplied ``apply_matrix_to_vector`` callback.
 """
 import os
 # Force 8 host devices for XLA
@@ -27,42 +21,16 @@ os.environ.setdefault("JAX_ENABLE_X64", "1")
 
 import jax
 import jax.numpy as jnp
-from jax import lax
-from jax.sharding import Mesh, PartitionSpec
-from jax.experimental.shard_map import shard_map
+from jax.sharding import Mesh, PartitionSpec, NamedSharding
+import numpy as np
+from cohsex_isdf import read_labeled_arrays_from_h5
 
 # Enable 64-bit precision
 jax.config.update("jax_enable_x64", True)
 
-# Set up a 1D device mesh for row sharding
-device_mesh = Mesh(jax.local_devices(), ('i',))
-# Partition specs for shard_map (PartitionSpec slices)
-mat_spec = PartitionSpec('i', None)
-out_spec = PartitionSpec('i',)
 
-# Sharded matrix-vector function via shard_map
-def _matvec_fn(mat_sh, v):
-    return mat_sh @ v
-_matvec_sharded = shard_map(_matvec_fn, device_mesh, in_specs=(mat_spec, None), out_specs=out_spec)
-
-def shard_matvec(mat, vec):
-    # Helper to shard mat/vec across devices
-    devices = jax.local_devices()
-    P = len(devices)
-    rows, cols = mat.shape
-    base = rows // P
-    extra = rows % P
-    rows_per_device = [base + (1 if i < extra else 0) for i in range(P)]
-    max_rpd = max(rows_per_device)
-    padded_rows = max_rpd * P
-    # Pad and reshape into (P, max_rpd, cols)
-
-    mat_padded = jnp.pad(mat, ((0, padded_rows - rows), (0, 0)))
-    mat_sh = mat_padded.reshape(P, max_rpd, cols)
-
-    # Use shard_map for local matrix-vector multiply
-    res_sh = _matvec_sharded(mat_sh, vec)  # (P, max_rpd)
-    return res_sh.reshape(-1)[:rows]
+# Build a 1D device mesh used for sharding along the real-space (mu) axis
+device_mesh = Mesh(np.array(jax.devices()[:4]), ('mu',))
 
 
 # [WX](cvk) = \sum_{c'v'k'} W(cvk,c'v'k') X(c'v'k')
@@ -93,29 +61,76 @@ def shard_matvec(mat, vec):
 #              ]
 # shapes become: shape N_rnu * Nc * Nk', then N_rnu * Nk
 
-def apply_matrix_to_vector(mat, vec):
-    """Single-device matrix-vector multiply on root only (no sharding)."""
-    return mat @ vec
+def load_isdf_data(filename: str = "taggedarrays.h5"):
+    """Load Vmunu and wavefunctions from an HDF5 file into JAX arrays."""
+    V_qmunu, psi_l_wfn, psi_r_wfn = read_labeled_arrays_from_h5(filename)
+
+    def _to_jax(arr):
+        data = arr.data if hasattr(arr, "data") else arr
+        if hasattr(data, "get"):
+            data = data.get()
+        return jnp.asarray(data)
+
+    V = _to_jax(V_qmunu)[0, 0, 0, 0, 0, :, 0, :]
+    psi_l = _to_jax(psi_l_wfn.psi)
+    psi_r = _to_jax(psi_r_wfn.psi)
+    eps_v = _to_jax(psi_l_wfn.enk)
+    eps_c = _to_jax(psi_r_wfn.enk)
+
+    mu_sharding = NamedSharding(device_mesh, PartitionSpec('mu'))
+    psi_sharding = NamedSharding(device_mesh, PartitionSpec(None, None, None, 'mu'))
+
+    V = jax.device_put(V, NamedSharding(device_mesh, PartitionSpec('mu', None)))
+    psi_l = jax.device_put(psi_l, psi_sharding)
+    psi_r = jax.device_put(psi_r, psi_sharding)
+
+    return V, psi_l, psi_r, eps_v, eps_c
 
 
-def haydock_eig(mat, n_eig, max_iter=40):
-    n = mat.shape[0]
+@jax.jit
+def apply_matrix_to_vector(X, V, psi_v, psi_c, eps_v, eps_c):
+    """Apply simplified ISDF-BSE Hamiltonian to X."""
+    # Diagonal term
+    D = (eps_c[:, None, :] - eps_v[:, :, None]) * X
+
+    # rho(k,v,c,mu)
+    rho = jnp.einsum('kvsm,kcsm->kvcm', jnp.conj(psi_v), psi_c)
+
+    # Projection of X onto mu basis
+    zeta_mu = jnp.einsum('kvcm,kvc->km', rho, X)
+    zeta_mu = jnp.einsum('mn,kn->km', V, zeta_mu)
+
+    # Direct term
+    V_term = jnp.einsum('kvcm,km->kvc', rho, zeta_mu) / psi_v.shape[0]
+
+    # Screened term (very simplified FFT-convolution)
+    A = jnp.einsum('kvcm,km->kvcm', rho, zeta_mu)
+    A_k = jnp.fft.fftn(A, axes=(0,))
+    B_k = A_k * V[None, None, None, :]
+    W_term = jnp.real(jnp.fft.ifftn(B_k, axes=(0,))).sum(-1) / psi_v.shape[0]
+
+    return D + V_term - W_term
+
+
+def haydock_eig(matvec, n, n_eig, max_iter=40):
+    """Lanczos/Haydock solver using a matrix-vector callback."""
     # initial q
     key = jax.random.PRNGKey(0)
     k1, k2 = jax.random.split(key)
-    q = jax.random.normal(k1, (n,), dtype=mat.dtype) + 1j*jax.random.normal(k2, (n,), dtype=mat.dtype)
+    q = jax.random.normal(k1, (n,), dtype=jnp.complex128)
+    q = q + 1j * jax.random.normal(k2, (n,), dtype=jnp.complex128)
     q = q / jnp.linalg.norm(q)
 
     # preallocate
-    Q    = jnp.zeros((n, max_iter+1), dtype=mat.dtype).at[:,0].set(q)
-    alpha = jnp.zeros((max_iter,), dtype=mat.real.dtype)
-    beta  = jnp.zeros((max_iter,), dtype=mat.real.dtype)
+    Q    = jnp.zeros((n, max_iter+1), dtype=q.dtype).at[:,0].set(q)
+    alpha = jnp.zeros((max_iter,), dtype=q.real.dtype)
+    beta  = jnp.zeros((max_iter,), dtype=q.real.dtype)
     col_idx = jnp.arange(max_iter+1)
 
     actual_iter = max_iter
     for j in range(max_iter):
         # iteration logging removed for JIT compatibility
-        z = apply_matrix_to_vector(mat, q)
+        z = matvec(q)
         alpha = alpha.at[j].set(jnp.vdot(q,z).real)
         if j>0:
             z = z - beta[j-1] * Q[:, j-1]
@@ -143,31 +158,22 @@ def haydock_eig(mat, n_eig, max_iter=40):
     return evals, vecs
 
 # JIT compile haydock_eig (functional) for GPU acceleration
-haydock_eig = jax.jit(haydock_eig, static_argnums=(1,2))
+haydock_eig = jax.jit(haydock_eig, static_argnums=(1,2,3))
 
 def main():
-    # Example usage
-    n = 100
-    n_eig = 5
-    # Random Hermitian matrix
-    key = jax.random.PRNGKey(42)
-    k1, k2 = jax.random.split(key)
-    A = jax.random.normal(k1, (n, n)) + 1j * jax.random.normal(k2, (n, n))
-    mat = 0.5 * (A + A.conj().T)
+    """Demonstrate the ISDF-BSE matrix-vector multiply."""
+    V, psi_l, psi_r, eps_v, eps_c = load_isdf_data()
 
-    evals_hay, evecs_hay = haydock_eig(mat, n_eig)
-    evals_exact, evecs_exact = jnp.linalg.eigh(mat)
-    idx = jnp.argsort(evals_exact)
-    evals_exact = evals_exact[idx][:n_eig]
-    evecs_exact = evecs_exact[:, idx[:n_eig]]
+    nk, nv, ns, nrmu = psi_l.shape
+    nc = psi_r.shape[1]
 
-    print("Haydock eigenvalues:", evals_hay)
-    print("Exact eigenvalues:", evals_exact)
-    print("Max abs difference:", jnp.max(jnp.abs(evals_hay - evals_exact)))
+    def mv(v):
+        vec = v.reshape(nk, nv, nc)
+        return apply_matrix_to_vector(vec, V, psi_l, psi_r, eps_v, eps_c).reshape(-1)
 
-    # Orthonormality check
-    overlap = evecs_hay.conj().T @ evecs_hay - jnp.eye(n_eig)
-    print("Orthonormality error:", jnp.linalg.norm(overlap))
+    n = nk * nv * nc
+    evals, _ = haydock_eig(mv, n, n_eig=2, max_iter=10)
+    print("Example eigenvalues:", evals)
 
 
 if __name__ == "__main__":
