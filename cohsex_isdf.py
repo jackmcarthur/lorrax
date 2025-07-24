@@ -1,3 +1,7 @@
+# Standard Library imports
+import argparse
+import configparser
+
 import numpy as np
 from gpu_utils import cp, xp
 from wfnreader import WFNReader
@@ -9,6 +13,31 @@ from w_isdf import get_chi0, get_static_w_q
 from gamma_matrices import gammas_sparse
 import h5py
 #import matplotlib.pyplot as plt
+
+
+def read_cohsex_input(filename: str) -> dict:
+    """Parse a simple INI-style input file for the COHSEX driver."""
+    parser = configparser.ConfigParser()
+    parser.read(filename)
+    section = parser["cohsex"] if "cohsex" in parser else parser[parser.sections()[0]]
+
+    getb = section.getboolean
+    get = section.get
+    geti = section.getint
+
+    return {
+        "restart": getb("restart", fallback=True),
+        "x_only": getb("x_only", fallback=False),
+        "do_screened": getb("do_screened", fallback=True),
+        "bispinor": getb("bispinor", fallback=False),
+        "wfn_file": get("wfn_file", fallback="WFN.h5"),
+        "centroids_file": get("centroids_file", fallback="centroids_frac.txt"),
+        "output_file": get("output_file", fallback="eqp0_noqsym.dat"),
+        "nval": geti("nval", fallback=5),
+        "ncond": geti("ncond", fallback=5),
+        "nband": geti("nband", fallback=110),
+        "sys_dim": geti("sys_dim", fallback=2),
+    }
 
 # Using the xp alias keeps the code agnostic to NumPy/CuPy, enabling testing on
 # CPUs while still targeting GPU acceleration.
@@ -833,6 +862,17 @@ def read_labeled_arrays_from_h5(filename):
 
 
 if __name__ == "__main__":
+    argp = argparse.ArgumentParser(description="COHSEX self-energy driver")
+    argp.add_argument(
+        "-i",
+        "--input",
+        default="cohsex_test.in",
+        help="Input file",
+    )
+    args = argp.parse_args()
+
+    params = read_cohsex_input(args.input)
+
     # Check GPU availability
     try:
         cp.cuda.runtime.getDeviceCount()
@@ -842,15 +882,15 @@ if __name__ == "__main__":
     except Exception:
         print("Using CPU (NumPy)")
 
-    nval = 5
-    ncond = 5
-    nband = 110
+    nval = params["nval"]
+    ncond = params["ncond"]
+    nband = params["nband"]
 
-    sys_dim = 2 # 3 for 3D, 2 for 2D (only 2D coulomb interaction implemented currently)
+    sys_dim = params["sys_dim"]  # 3 for 3D, 2 for 2D
 
     ryd2ev = 13.6056980659
 
-    wfn = WFNReader("WFNsmall.h5")
+    wfn = WFNReader(params["wfn_file"])
     #wfnq = WFNReader("WFNq.h5")
     #eps0 = EPSReader("eps0mat.h5")
     #eps = EPSReader("epsmat.h5")
@@ -864,7 +904,7 @@ if __name__ == "__main__":
     ncplussigrange = (min(nsigmarange),max(n_fullrange))
 
     # Load centroids
-    centroids_frac = np.loadtxt('centroids_frac_60.txt')
+    centroids_frac = np.loadtxt(params["centroids_file"])
     n_rmu = int(centroids_frac.shape[0])
     taggedarray_filename = "taggedarrays" + str(n_rmu) + ".h5"
 
@@ -897,12 +937,10 @@ if __name__ == "__main__":
     print('\n')
 
     # restart: if True, read interp. vectors and V_qmunu from file
-    restart = True
-    # x_only: if True, skip calculation of Chi(RPA)/W_q, only get exchange self energy
-    x_only = False
-    do_screened = True
-    # bispinor: if True, expand spinor wavefunctions into bispinors, do 4-component calculations
-    bispinor = False
+    restart = params["restart"]
+    x_only = params["x_only"]
+    do_screened = params["do_screened"]
+    bispinor = params["bispinor"]
 
     if x_only and do_screened:
         raise ValueError("x_only and do_screened cannot both be True")
@@ -959,7 +997,7 @@ if __name__ == "__main__":
     sigma_x_kbar_ij = get_sigma_x_kij(psi_r_rmu_out, psi_r_rmu_out, sigma_x_kbar_munu, xp)
 
 
-    write_sigma_to_file(ryd2ev*sigma_x_kbar_ij, "eqp0_noqsym.dat")
+    write_sigma_to_file(ryd2ev*sigma_x_kbar_ij, params["output_file"])
 
     # Later stages of this project will iterate this workflow so that the COHSEX
     # potential feeds back into updated wavefunctions (self-consistent COHSEX)
