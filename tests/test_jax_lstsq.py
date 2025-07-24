@@ -19,6 +19,7 @@ Usage:
 """
 
 import os
+import pytest
 # Ensure these are set before JAX initialization
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=7"
 os.environ.setdefault("JAX_ENABLE_X64", "1")
@@ -72,6 +73,7 @@ def main():
         print(f"\n🧪 Test Case {case_i+1}: {rows}×{cols} @ X = {rows}×{rhs}")
         test_single_case(rows, cols, rhs)
 
+@pytest.mark.parametrize("rows,cols,rhs", [(15, 8, 10)])
 def test_single_case(rows, cols, rhs):
     """Test a single problem size"""
     # Discover devices
@@ -135,3 +137,4 @@ def test_single_case(rows, cols, rhs):
 
 if __name__ == "__main__":
     main()
+
