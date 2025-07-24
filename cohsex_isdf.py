@@ -850,7 +850,7 @@ if __name__ == "__main__":
 
     ryd2ev = 13.6056980659
 
-    wfn = WFNReader("WFN.h5")
+    wfn = WFNReader("WFNsmall.h5")
     #wfnq = WFNReader("WFNq.h5")
     #eps0 = EPSReader("eps0mat.h5")
     #eps = EPSReader("epsmat.h5")
@@ -897,7 +897,7 @@ if __name__ == "__main__":
     print('\n')
 
     # restart: if True, read interp. vectors and V_qmunu from file
-    restart = True
+    restart = False
     # x_only: if True, skip calculation of Chi(RPA)/W_q, only get exchange self energy
     x_only = False
     do_screened = True
