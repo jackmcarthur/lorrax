@@ -106,7 +106,7 @@ wheels = [
 [[package]]
 name = "isdf-gw"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "cupy-cuda12x" },
     { name = "h5py" },

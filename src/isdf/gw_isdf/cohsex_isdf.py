@@ -324,7 +324,7 @@ def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, xp):
     # TODO: in bispinor case repeats should = 4
     return enk, xp.repeat(weights_full, repeats=2, axis=1)
 
-def get_WminV_qGG(wfn, iqbar, eps0mat, epsmat,xp):
+def get_WminV_qGG(wfn, iqbar, V_qG, wcoul0,eps0mat, epsmat,xp):
     # get correct qpt index.
     # handle the existence of eps0mat vs epsmat
     if iqbar == 0:
