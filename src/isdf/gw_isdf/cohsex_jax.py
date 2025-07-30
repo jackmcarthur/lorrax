@@ -213,6 +213,9 @@ def get_small_psi_component(gvecs, kvec, bvec, psi_G, xp):
 
 
 
+# this should be done with pjit; we should define a jax array to hold all band G-coeffs for one kpt
+# and shard it over bands just like the psi_rtot_out array, then read the entries for the each
+# k-point directly from WFN.h5 into that array. Then the fft's are easy to do with the existing sharding.
 
 def fft_bandrange(wfn, sym, bandrange, is_left, psi_rtot_out, xp=cp, bispinor=False):
     """
@@ -231,9 +234,6 @@ def fft_bandrange(wfn, sym, bandrange, is_left, psi_rtot_out, xp=cp, bispinor=Fa
     nspinor_wfnfile = wfn.nspinor
     nspinor = wfn.nspinor if not bispinor else 4
 
-    # jax temporary buffers
-    psi_rtot = jnp.zeros((nb, nspinor, *wfn.fft_grid), dtype=jnp.complex128)
-
     # Initialize exp(ikr) phase factor arrays 
     fft_nx, fft_ny, fft_nz = wfn.fft_grid
     fx = jnp.arange(fft_nx, dtype=float)[None, :, None, None] / fft_nx
@@ -244,6 +244,10 @@ def fft_bandrange(wfn, sym, bandrange, is_left, psi_rtot_out, xp=cp, bispinor=Fa
     px = jnp.zeros((1, fft_nx, 1, 1), dtype=jnp.complex128)
     py = jnp.zeros((1, 1, fft_ny, 1), dtype=jnp.complex128)
     pz = jnp.zeros((1, 1, 1, fft_nz), dtype=jnp.complex128)
+
+    # jax temporary buffers. two because 
+    psi_Gtot = jnp.zeros((nb, nspinor, *wfn.fft_grid), dtype=jnp.complex128)
+    psi_rtot = jnp.zeros((nb, nspinor, *wfn.fft_grid), dtype=jnp.complex128)
     
     # Loop over all k-points in full BZ
     for k_idx in range(sym.nk_tot):
