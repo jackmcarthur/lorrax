@@ -5,6 +5,7 @@ import configparser
 import numpy as np
 import os
 from ..common.gpu_utils import cp, xp
+from ..common import Meta
 from ..common.wfnreader import WFNReader
 from ..common.epsreader import EPSReader
 from ..common import symmetry_maps
@@ -947,6 +948,7 @@ def main(argv=None):
     do_screened = params["do_screened"]
     global bispinor
     bispinor = params["bispinor"]
+    meta = Meta.from_system(wfn, sym, nval, ncond, nband, n_rmu, bispinor)
 
     if x_only and do_screened:
         raise ValueError("x_only and do_screened cannot both be True")
@@ -972,11 +974,11 @@ def main(argv=None):
         V_qmunu, psi_l_rmu_out, psi_r_rmu_out = read_labeled_arrays_from_h5(taggedarray_filename)
 
     if not x_only:
-        chi0 = get_chi0(psi_l_rmu_out, psi_r_rmu_out, window_pairs, wfn, xp)
+        chi0 = get_chi0(psi_l_rmu_out, psi_r_rmu_out, window_pairs, meta, wfn, xp)
         # hyperparameters: (1-vX)^-1 = sum_n=0,n_mult (vX)^n, block_f is how many freqs are batched for inversion
         # update: currently inverting directly; i suspect it's ill posed in the low-dim case
         V_for_w = V_qmunu
-        W_q = get_static_w_q(chi0, V_for_w, wfn, sym, xp, n_mult=10, block_f=1, bispinor=bispinor)
+        W_q = get_static_w_q(chi0, V_for_w, meta, wfn, sym, xp, n_mult=10, block_f=1, bispinor=bispinor)
 
 
     psi_l_rmu_out.psi = psi_l_rmu_out.psi.slice('nb',xp.s_[:wfn.nelec],tagged=True)
