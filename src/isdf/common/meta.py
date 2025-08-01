@@ -43,6 +43,7 @@ class Meta:
         bispinor: bool = False,
     ):
         rank = jax.process_index()
+        rank_topo = np.where(np.asarray(jax.devices()) == rank)
         n_proc = jax.process_count()
         b_id_0 = 0
         b_id_1 = int(wfn.nelec - nval)

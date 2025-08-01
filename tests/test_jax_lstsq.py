@@ -23,7 +23,7 @@ import pytest
 # Ensure these are set before JAX initialization
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=7"
 os.environ.setdefault("JAX_ENABLE_X64", "1")
-
+jax.config.update("jax_platform_name", "cpu")
 import jax
 import jax.numpy as jnp
 from jax import lax

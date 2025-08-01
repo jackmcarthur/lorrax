@@ -1,18 +1,22 @@
 # Standard Library imports
+import os
+# Force JAX to create four CPU devices before import
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+os.environ.setdefault("JAX_ENABLE_X64", "1")
 import argparse
 import configparser
 
 import numpy as np
-import os
-
-os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=4")
 from ..common.gpu_utils import cp, xp
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from functools import partial
+#jax.config.update("jax_enable_x64", True)
+#jax.config.update("jax_platform_name", "cpu")
 
 # Global mesh for sharding across bands
-mesh = Mesh(np.asarray(jax.devices()), ("bands",))
+mesh_bands = Mesh(np.asarray(jax.devices()), ("bands",))
 from ..common.wfnreader import WFNReader
 from ..common.epsreader import EPSReader
 from ..common import symmetry_maps
@@ -46,7 +50,7 @@ def read_cohsex_input(filename: str) -> dict:
         "output_file": get("output_file", fallback="eqp0_noqsym.dat"),
         "nval": geti("nval", fallback=5),
         "ncond": geti("ncond", fallback=5),
-        "nband": geti("nband", fallback=110),
+        "nband": geti("nband", fallback=100),
         "sys_dim": geti("sys_dim", fallback=2),
     }
 
@@ -256,13 +260,11 @@ def get_small_psi_component(gvecs, kvec, bvec, psi_G, xp):
     )
 
 
-# this should be done with pjit; we should define a jax array to hold all band G-coeffs for one kpt
-# and shard it over bands just like the psi_rtot_out array, then read the entries for the each
-# k-point directly from WFN.h5 into that array. Then the fft's are easy to do with the existing sharding.
-
-
+# this is the worst function in the code because it is nontrivial to get 
+#@partial(jax.shard_map, mesh=mesh_bands, in_specs=(P(),P(),P(),P(),P(),P()),
+#         out_specs=P(None, "bands", None, None, None, None))
 def fft_bandrange(
-    wfn, sym, bandrange, is_left, psi_rtot_out, meta: Meta, xp=cp, bispinor=False
+    wfn, sym, bandrange, is_left, meta: Meta, bispinor=False
 ):
     """
     Get psi_nk(r) for all k-points in the full Brillouin zone.
@@ -277,6 +279,21 @@ def fft_bandrange(
     # Get dimensions
     nb = bandrange[1] - bandrange[0]
 
+    # Create 2D mesh with host and device dimensions
+    mesh = Mesh(
+        np.array(jax.devices()).reshape(jax.process_count(), jax.local_device_count()), 
+        ['host', 'dev']
+    )
+    
+    # Calculate distribution across all devices
+    total_devices = jax.process_count() * jax.local_device_count()
+    devices_per_host = jax.local_device_count()
+    host_id = jax.process_index()
+    
+    # Bands per device (rounded up)
+    bands_per_device = (nb + total_devices - 1) // total_devices
+    total_bands_padded = total_devices * bands_per_device
+
     # Initialize exp(ikr) phase factor arrays
     fx = jnp.arange(meta.fft_grid[0], dtype=float)[None, :, None, None] / meta.fft_grid[0]
     fy = jnp.arange(meta.fft_grid[1], dtype=float)[None, None, :, None] / meta.fft_grid[1]
@@ -287,66 +304,92 @@ def fft_bandrange(
     py = jnp.zeros((1, 1, meta.fft_grid[1], 1), dtype=jnp.complex128)
     pz = jnp.zeros((1, 1, 1, meta.fft_grid[2]), dtype=jnp.complex128)
 
-    # jax temporary buffers. two because
-    psi_Gtot = jnp.zeros((nb, meta.nspinor, *meta.fft_grid), dtype=jnp.complex128)
-    psi_rtot = jnp.zeros((nb, meta.nspinor, *meta.fft_grid), dtype=jnp.complex128)
+    @partial(jax.jit)
+    def fft_psi_jax(psi_Gspace, psi_Gtot, gvecs_k_rot):
+        psi_Gtot = psi_Gtot.at[
+            :,:,gvecs_k_rot[:,0],gvecs_k_rot[:,1],gvecs_k_rot[:,2]
+        ].set(psi_Gspace)
+        return jnp.fft.ifftn(psi_Gtot, axes=(-3, -2, -1))
 
-    # Loop over all k-points in full BZ
-    for k_idx in range(sym.nk_tot):
-        # Get reduced k-point index and symmetry operation
-        # note these both take the unfolded k-point index
-        k_red = sym.irk_to_k_map[k_idx]
-        psi_Gspace = jnp.zeros((nb, meta.nspinor, wfn.ngk[k_red]), dtype=jnp.complex128)
+    # Process each local device separately for memory efficiency
+    local_shards = []
+    for local_dev_idx in range(devices_per_host):
+        device = jax.local_devices()[local_dev_idx]
+        global_dev_idx = host_id * devices_per_host + local_dev_idx
+        
+        # Calculate band range for this specific device
+        dev_start = global_dev_idx * bands_per_device + bandrange[0]
+        dev_end = min((global_dev_idx + 1) * bands_per_device + bandrange[0], bandrange[1])
+        
+        # Skip if this device has no bands to process
+        if dev_start >= bandrange[1]:
+            dev_start = bandrange[1]
+            dev_end = bandrange[1]
+        if dev_end > bandrange[1]:
+            dev_end = bandrange[1]
+            
+        dev_nb = dev_end - dev_start
+        
+        # Allocate arrays for this device only
+        psi_Gtot = jnp.zeros((bands_per_device, meta.nspinor, *meta.fft_grid), dtype=jnp.complex128)
+        psi_rtot_dev = jnp.zeros((meta.nk_tot, bands_per_device, meta.nspinor, *meta.fft_grid), dtype=jnp.complex128)
 
-        # Get G-vectors and rotate them
-        gvecs_k_rot = jnp.asarray(sym.get_gvecs_kfull(wfn, k_idx))
-        # Get wavefunction coefficients (symmetry unfolded)
-        for ib, band_idx in enumerate(range(bandrange[0], bandrange[1])):
-            psi_Gspace = psi_Gspace.at[ib, 0 : meta.nspinor_wfnfile, :].set(
-                jnp.asarray(sym.get_cnk_fullzone(wfn, band_idx, k_idx))
-            )
+        # Loop over all k-points for this device
+        for k_idx in range(sym.nk_tot):
+            k_red = sym.irk_to_k_map[k_idx]
+            psi_Gspace = jnp.zeros((bands_per_device, meta.nspinor, wfn.ngk[k_red]), dtype=jnp.complex128)
 
-        # get small psi component. probably needs performance improvement.
-        if bispinor:
-            psi_Gspace = psi_Gspace.at[:, 2:4, :].set(
-                get_small_psi_component(
-                    gvecs_k_rot,
-                    jnp.asarray(sym.unfolded_kpts[k_idx], dtype=jnp.float64),
-                    jnp.asarray(wfn.bvec, dtype=jnp.float64),
-                    psi_Gspace,
-                    jnp,
+            # Get G-vectors and rotate them
+            gvecs_k_rot = jnp.asarray(sym.get_gvecs_kfull(wfn, k_idx))
+            
+            # Load wavefunction coefficients for this device's band range
+            for ib, band_idx in enumerate(range(dev_start, dev_end)):
+                psi_Gspace = psi_Gspace.at[ib, 0:meta.nspinor_wfnfile, :].set(
+                    jnp.asarray(sym.get_cnk_fullzone(wfn, band_idx, k_idx))
                 )
-            )
 
-        # FFT to real space
-        psi_rtot = psi_rtot.at[:].set(0.0 + 0.0j)
-        for ib in range(nb):
-            for ispinor in range(meta.nspinor):
-                # Place G-space coefficients
-                arr = jnp.zeros(meta.fft_grid, dtype=jnp.complex128)
-                arr = arr.at[
-                    gvecs_k_rot[:, 0], gvecs_k_rot[:, 1], gvecs_k_rot[:, 2]
-                ].set(psi_Gspace[ib, ispinor])
-                psi_rtot = psi_rtot.at[ib, ispinor].set(jnp.fft.ifftn(arr))
+            # get small psi component
+            if bispinor:
+                psi_Gspace = psi_Gspace.at[:dev_nb, 2:4, :].set(
+                    get_small_psi_component(
+                        gvecs_k_rot,
+                        jnp.asarray(sym.unfolded_kpts[k_idx], dtype=jnp.float64),
+                        jnp.asarray(wfn.bvec, dtype=jnp.float64),
+                        psi_Gspace[:dev_nb],
+                        jnp,
+                    )
+                )
 
-        # multiply by exp(ikr) phase factor
-        k_gpu = jnp.asarray(sym.unfolded_kpts[k_idx], dtype=jnp.float64)
-        px = jnp.exp(2j * jnp.pi * k_gpu[0] * fx)
-        py = jnp.exp(2j * jnp.pi * k_gpu[1] * fy)
-        pz = jnp.exp(2j * jnp.pi * k_gpu[2] * fz)
-        psi_rtot *= px
-        psi_rtot *= py
-        psi_rtot *= pz
+            # FFT to real space (only for actual bands)
+            if dev_nb > 0:
+                fft_result = fft_psi_jax(psi_Gspace[:dev_nb], psi_Gtot[:dev_nb], gvecs_k_rot)
+                psi_rtot_dev = psi_rtot_dev.at[k_idx, :dev_nb, :].set(fft_result)
+            
+                # multiply by exp(ikr) phase factor
+                k_gpu = jnp.asarray(sym.unfolded_kpts[k_idx], dtype=jnp.float64)
+                px = jnp.exp(2j * jnp.pi * k_gpu[0] * fx)
+                py = jnp.exp(2j * jnp.pi * k_gpu[1] * fy)
+                pz = jnp.exp(2j * jnp.pi * k_gpu[2] * fz)
+                psi_rtot_dev = psi_rtot_dev.at[k_idx, :dev_nb].set(psi_rtot_dev[k_idx, :dev_nb] * px * py * pz)
 
-        # Store results with new ordering
-        if is_left:
-            psi_rtot_out = psi_rtot_out.at[k_idx].set(jnp.conj(psi_rtot))
-        else:
-            psi_rtot_out = psi_rtot_out.at[k_idx].set(psi_rtot)
+        # Keep shard on CPU for concatenation, will device_put the final result
+        local_shards.append(psi_rtot_dev)
 
-    psi_rtot_out = psi_rtot_out * jnp.sqrt(meta.n_rtot)
-    return psi_rtot_out
-    # print("norm of one wfn:", xp.linalg.norm(psi_rtot_out[0,0]))
+    # Combine all local shards into a host-local array (all on CPU)
+    host_array = jnp.concatenate(local_shards, axis=1)
+    
+    # Create the global array using make_array_from_process_local_data
+    global_shape = (meta.nk_tot, total_bands_padded, meta.nspinor, *meta.fft_grid)
+    band_sharding = NamedSharding(mesh, P(None, 'host', None, None, None, None))
+    global_psi_rtot = jax.make_array_from_process_local_data(band_sharding, host_array, global_shape)
+
+    # Apply final transformations and slice to remove padding
+    if is_left:
+        global_psi_rtot = jnp.conj(global_psi_rtot)
+    global_psi_rtot = global_psi_rtot * jnp.sqrt(meta.n_rtot)
+    
+    # Slice to return only the requested bands (remove padding)
+    return global_psi_rtot[:, :nb, :, :, :, :]
 
 
 def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, xp):
@@ -471,32 +514,34 @@ def get_zeta_q_and_v_q_mu_nu(
     """Find the interpolative separable density fitting representation."""
     # Get dimensions
     nb_l = bandrange_l[1] - bandrange_l[0]
+    nb_l_jax = ((nb_l + meta.n_proc - 1) // meta.n_proc) * meta.n_proc
     nb_r = bandrange_r[1] - bandrange_r[0]
+    nb_r_jax = ((nb_r + meta.n_proc - 1) // meta.n_proc) * meta.n_proc
     kgridgpu = xp.asarray((meta.nkx, meta.nky, meta.nkz), dtype=xp.int32)
 
     # Initialize output arrays with (nk, nb) ordering
     psi_rtot_names = ["nk", "nb", "nspinor", "rx", "ry", "rz"]
     psi_rmu_names = ["nk", "nb", "nspinor", "nrmu"]
     psi_l_rtot_out = LabeledArray(
-        shape=(sym.nk_tot, nb_l, meta.nspinor, *meta.fft_grid), axes=psi_rtot_names
+        shape=(meta.nk_tot, nb_l, meta.nspinor, *meta.fft_grid), axes=psi_rtot_names
     )
     psi_r_rtot_out = LabeledArray(
-        shape=(sym.nk_tot, nb_r, meta.nspinor, *meta.fft_grid), axes=psi_rtot_names
+        shape=(meta.nk_tot, nb_r, meta.nspinor, *meta.fft_grid), axes=psi_rtot_names
     )
     psi_l_rmu_out = LabeledArray(
-        shape=(sym.nk_tot, nb_l, meta.nspinor, meta.n_rmu), axes=psi_rmu_names
+        shape=(meta.nk_tot, nb_l, meta.nspinor, meta.n_rmu), axes=psi_rmu_names
     )
     psi_r_rmu_out = LabeledArray(
-        shape=(sym.nk_tot, nb_r, meta.nspinor, meta.n_rmu), axes=psi_rmu_names
+        shape=(meta.nk_tot, nb_r, meta.nspinor, meta.n_rmu), axes=psi_rmu_names
     )
 
-    sharding = NamedSharding(mesh, P(None, "bands", None, None, None, None))
-    psi_l_rtot_jax = jax.device_put(
-        jnp.zeros(psi_l_rtot_out.shape, dtype=jnp.complex128), sharding
-    )
-    psi_r_rtot_jax = jax.device_put(
-        jnp.zeros(psi_r_rtot_out.shape, dtype=jnp.complex128), sharding
-    )
+    #band_sharding = NamedSharding(mesh_bands, P(None, "bands", None, None, None, None))
+    #psi_l_rtot_jax = jax.device_put(
+    #    jnp.zeros((meta.nk_tot, nb_l_jax, meta.nspinor, *meta.fft_grid), dtype=jnp.complex128), sharding
+    #)
+    #psi_r_rtot_jax = jax.device_put(
+    #    jnp.zeros((meta.nk_tot, nb_r_jax, meta.nspinor, *meta.fft_grid), dtype=jnp.complex128), sharding
+    #)
 
     # Initialize temporary arrays for processing (1 kpt, bands in bandrange) at a time
     psi_l_rtot = xp.zeros((nb_l * meta.nspinor, *meta.fft_grid), dtype=xp.complex128)
@@ -542,11 +587,16 @@ def get_zeta_q_and_v_q_mu_nu(
     # fill psi_l/r_rtot_out with respective psi(*)_l/r(r) for all k
     print(f"Performing FFTs for wavefunction ranges {bandrange_l} and {bandrange_r}")
     psi_l_rtot_jax = fft_bandrange(
-        wfn, sym, bandrange_l, True, psi_l_rtot_jax, xp=jnp, bispinor=bispinor
+        wfn, sym, bandrange_l, True, meta, bispinor=bispinor
     )
     psi_r_rtot_jax = fft_bandrange(
-        wfn, sym, bandrange_r, False, psi_r_rtot_jax, xp=jnp, bispinor=bispinor
+        wfn, sym, bandrange_r, False, meta, bispinor=bispinor
     )
+    # Debug: show how the arrays are sharded across devices
+    print("psi_l_rtot_jax sharding:", psi_l_rtot_jax.sharding)
+    print("psi_r_rtot_jax sharding:", psi_r_rtot_jax.sharding)
+
+    # Continue with the rest of processing...
     psi_l_rtot_out.data = xp.asarray(np.array(psi_l_rtot_jax))
     psi_r_rtot_out.data = xp.asarray(np.array(psi_r_rtot_jax))
     print("FFTs complete")
@@ -1135,6 +1185,12 @@ def main(argv=None):
     bispinor = params["bispinor"]
 
     meta = Meta.from_system(wfn, sym, nval, ncond, nband, n_rmu, bispinor)
+    meta.rank = jax.process_index()
+    meta.n_proc = jax.process_count()
+    print(jax.devices())
+    print(jax.process_indices())
+    if jax.Device.id == 1:
+        print('i am proc 1')
 
     if x_only and do_screened:
         raise ValueError("x_only and do_screened cannot both be True")
@@ -1235,4 +1291,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    jax.distributed.initialize()
     raise SystemExit(main())
