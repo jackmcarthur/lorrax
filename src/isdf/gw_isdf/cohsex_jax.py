@@ -383,13 +383,13 @@ def fft_bandrange(
     band_sharding = NamedSharding(mesh, P(None, 'host', None, None, None, None))
     global_psi_rtot = jax.make_array_from_process_local_data(band_sharding, host_array, global_shape)
 
-    # Apply final transformations and slice to remove padding
+    # Apply final transformations but keep padded shape
     if is_left:
         global_psi_rtot = jnp.conj(global_psi_rtot)
     global_psi_rtot = global_psi_rtot * jnp.sqrt(meta.n_rtot)
     
-    # Slice to return only the requested bands (remove padding)
-    return global_psi_rtot[:, :nb, :, :, :, :]
+    # Return padded arrays - trimming will be handled later when needed
+    return global_psi_rtot
 
 
 def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, xp):
@@ -512,14 +512,17 @@ def get_zeta_q_and_v_q_mu_nu(
     bispinor=False,
 ):
     """Find the interpolative separable density fitting representation."""
-    # Get dimensions
+    # Get dimensions with padding for distributed computation
     nb_l = bandrange_l[1] - bandrange_l[0]
-    nb_l_jax = ((nb_l + meta.n_proc - 1) // meta.n_proc) * meta.n_proc
     nb_r = bandrange_r[1] - bandrange_r[0]
-    nb_r_jax = ((nb_r + meta.n_proc - 1) // meta.n_proc) * meta.n_proc
+    total_devices = jax.process_count() * jax.local_device_count()
+    bands_per_device_l = (nb_l + total_devices - 1) // total_devices
+    bands_per_device_r = (nb_r + total_devices - 1) // total_devices
+    nb_l_padded = total_devices * bands_per_device_l
+    nb_r_padded = total_devices * bands_per_device_r
     kgridgpu = xp.asarray((meta.nkx, meta.nky, meta.nkz), dtype=xp.int32)
 
-    # Initialize output arrays with (nk, nb) ordering
+    # Initialize output arrays with (nk, nb) ordering - use original sizes for output
     psi_rtot_names = ["nk", "nb", "nspinor", "rx", "ry", "rz"]
     psi_rmu_names = ["nk", "nb", "nspinor", "nrmu"]
     psi_l_rtot_out = LabeledArray(
@@ -534,32 +537,6 @@ def get_zeta_q_and_v_q_mu_nu(
     psi_r_rmu_out = LabeledArray(
         shape=(meta.nk_tot, nb_r, meta.nspinor, meta.n_rmu), axes=psi_rmu_names
     )
-
-    #band_sharding = NamedSharding(mesh_bands, P(None, "bands", None, None, None, None))
-    #psi_l_rtot_jax = jax.device_put(
-    #    jnp.zeros((meta.nk_tot, nb_l_jax, meta.nspinor, *meta.fft_grid), dtype=jnp.complex128), sharding
-    #)
-    #psi_r_rtot_jax = jax.device_put(
-    #    jnp.zeros((meta.nk_tot, nb_r_jax, meta.nspinor, *meta.fft_grid), dtype=jnp.complex128), sharding
-    #)
-
-    # Initialize temporary arrays for processing (1 kpt, bands in bandrange) at a time
-    psi_l_rtot = xp.zeros((nb_l * meta.nspinor, *meta.fft_grid), dtype=xp.complex128)
-    psi_r_rtot = xp.zeros((nb_r * meta.nspinor, *meta.fft_grid), dtype=xp.complex128)
-    psi_l_rmu = xp.zeros((nb_l * meta.nspinor, meta.n_rmu), dtype=xp.complex128)
-    psi_r_rmu = xp.zeros((nb_r * meta.nspinor, meta.n_rmu), dtype=xp.complex128)
-    psi_l_rmuT = xp.zeros((meta.n_rmu, nb_l * meta.nspinor), dtype=xp.complex128)
-    psi_r_rmuT = xp.zeros((meta.n_rmu, nb_r * meta.nspinor), dtype=xp.complex128)
-
-    # TODO: once the group's distributed GPU linear algebra backend is ready,
-    # these explicit buffer allocations will be refactored to call that library
-    # for improved scalability across many devices.
-
-    P_l = xp.zeros((meta.n_rmu, meta.n_rtot), dtype=xp.complex128)
-    P_r = xp.zeros((meta.n_rmu, meta.n_rtot), dtype=xp.complex128)
-
-    ZCT = xp.zeros((meta.n_rmu, meta.n_rtot), dtype=xp.complex128)
-    CCT = xp.zeros((meta.n_rmu, meta.n_rmu), dtype=xp.complex128)
 
     # note zeta_q only stores one q at a time.
     zeta_q = xp.zeros((meta.n_rmu, meta.n_rtot), dtype=xp.complex128)
@@ -586,99 +563,229 @@ def get_zeta_q_and_v_q_mu_nu(
 
     # fill psi_l/r_rtot_out with respective psi(*)_l/r(r) for all k
     print(f"Performing FFTs for wavefunction ranges {bandrange_l} and {bandrange_r}")
-    psi_l_rtot_jax = fft_bandrange(
+    psi_l_rtot_jax_padded = fft_bandrange(
         wfn, sym, bandrange_l, True, meta, bispinor=bispinor
     )
-    psi_r_rtot_jax = fft_bandrange(
+    psi_r_rtot_jax_padded = fft_bandrange(
         wfn, sym, bandrange_r, False, meta, bispinor=bispinor
     )
     # Debug: show how the arrays are sharded across devices
-    print("psi_l_rtot_jax sharding:", psi_l_rtot_jax.sharding)
-    print("psi_r_rtot_jax sharding:", psi_r_rtot_jax.sharding)
+    print("psi_l_rtot_jax_padded sharding:", psi_l_rtot_jax_padded.sharding)
+    print("psi_r_rtot_jax_padded sharding:", psi_r_rtot_jax_padded.sharding)
+    
+    # Record original band counts for trimming later
+    nb_l_original = nb_l
+    nb_r_original = nb_r
 
-    # Continue with the rest of processing...
-    psi_l_rtot_out.data = xp.asarray(np.array(psi_l_rtot_jax))
-    psi_r_rtot_out.data = xp.asarray(np.array(psi_r_rtot_jax))
+    # Continue with rest of processing - convert to JAX arrays and set up sharding
     print("FFTs complete")
-
-    # make WfnArray's that contain psi_nk(r_mu),E_nk together.
+    
+    # Force JAX to use CPU backend for consistency with distributed setup
+    jax.config.update("jax_platform_name", "cpu")
+    
+    # Create 2D mesh for parallelizing over bands and r_mu
+    mesh = Mesh(
+        np.array(jax.devices()).reshape(jax.process_count(), jax.local_device_count()), 
+        ['host', 'dev']
+    )
+    
+    # Keep the JAX arrays with band sharding from fft_bandrange (now padded)
+    psi_l_rtot_jax_sharded = psi_l_rtot_jax_padded
+    psi_r_rtot_jax_sharded = psi_r_rtot_jax_padded
+    
+    # Convert other arrays to JAX (ensure numpy arrays before JAX conversion)
+    centroid_indices_cpu = centroid_indices.get() if hasattr(centroid_indices, 'get') else centroid_indices
+    centroid_indices_jax = jnp.asarray(centroid_indices_cpu)
+    kgridgpu_jax = jnp.asarray((meta.nkx, meta.nky, meta.nkz), dtype=jnp.int32)
+    
+    # Get band ranges and weights in JAX
     enk_l, weights_l = get_enk_bandrange(
         wfn, sym, bandrange_l, (bandrange_r[0], bandrange_l[1]), xp
     )
     enk_r, weights_r = get_enk_bandrange(
         wfn, sym, bandrange_r, (bandrange_r[0], bandrange_l[1]), xp
     )
+    # Convert weights to numpy before JAX conversion and pad to match distributed arrays
+    weights_l_cpu = weights_l.get() if hasattr(weights_l, 'get') else weights_l
+    weights_r_cpu = weights_r.get() if hasattr(weights_r, 'get') else weights_r
+    
+    # Pad weights to match the padded band dimensions
+    weights_l_padded = np.pad(weights_l_cpu, [(0, 0), (0, (nb_l_padded * meta.nspinor) - weights_l_cpu.shape[1])], mode='constant')
+    weights_r_padded = np.pad(weights_r_cpu, [(0, 0), (0, (nb_r_padded * meta.nspinor) - weights_r_cpu.shape[1])], mode='constant')
+    
+    weights_l_jax = jnp.asarray(weights_l_padded)
+    weights_r_jax = jnp.asarray(weights_r_padded)
+    
+    @partial(jax.jit)
+    def compute_k_contribution_local(psi_l_rmu, psi_r_rmu, psi_l_rtot, psi_r_rtot, weights_l_k, weights_r_k):
+        """Compute partial P matrices for this device's bands."""
+        # Apply weights and transpose for matrix multiplies
+        psi_l_rmuT = psi_l_rmu.T * weights_l_k[None, :]  # (n_rmu, nb_local*nspinor)
+        psi_r_rmuT = psi_r_rmu.T * weights_r_k[None, :]  # (n_rmu, nb_local*nspinor)
+        
+        # Compute PARTIAL P matrices (only this device's bands)
+        Pmu_l_partial = psi_l_rmuT @ psi_l_rmu  # (n_rmu, n_rmu) - partial sum over bands
+        Pmu_r_partial = psi_r_rmuT @ psi_r_rmu  # (n_rmu, n_rmu) - partial sum over bands
+        
+        P_l_partial = psi_l_rmuT @ psi_l_rtot    # (n_rmu, n_rtot) - partial sum over bands  
+        P_r_partial = psi_r_rmuT @ psi_r_rtot    # (n_rmu, n_rtot) - partial sum over bands
+        
+        return Pmu_l_partial, Pmu_r_partial, P_l_partial, P_r_partial
+
+    @partial(jax.jit) 
+    def extract_centroids(psi_rtot, centroid_indices):
+        """Extract wavefunction values at centroid points."""
+        # psi_rtot shape: (nb*nspinor, nx, ny, nz)
+        # centroid_indices shape: (n_rmu, 3)
+        return psi_rtot[:, centroid_indices[:, 0], centroid_indices[:, 1], centroid_indices[:, 2]]
 
     ##########################################
-    # Loop over all q-points
-    # for each q, we get zeta_q via least squares, then immediately get W/v_q,mu,nu so we don't have to store all zeta_q
+    # Precompute all q,k mappings for JIT compilation
     ##########################################
-    qvec = xp.array([0, 0, 0], dtype=xp.int32)
+    print("Precomputing q,k mappings for JIT compilation...")
+    
+    # Create arrays of all q-vectors and k-indices
+    all_qvecs = []
+    all_k_r_indices = []
+    all_k_l_indices = []
+    
     for qvec_nonneg in xp.ndindex(meta.nkx, meta.nky, meta.nkz):
-        # where qvec[i] > ceil(kgrid[i]/2), umklapp to negative (for k<->R FFTs later)
-        # note: not necessary
-        qvec = xp.asarray(qvec_nonneg)
-        if qvec_nonneg[0] > kgridgpu[0] // 2:
-            qvec[0] = qvec_nonneg[0] - kgridgpu[0]
-        if qvec_nonneg[1] > kgridgpu[1] // 2:
-            qvec[1] = qvec_nonneg[1] - kgridgpu[1]
-        if qvec_nonneg[2] > kgridgpu[2] // 2:
-            qvec[2] = qvec_nonneg[2] - kgridgpu[2]
-
-        ZCT.fill(0)
-        CCT.fill(0)
-
-        # note no symmetries used here but it would be possible to do so, though it's not a bottleneck.
+        qvec = jnp.asarray(qvec_nonneg)
+        qvec = jnp.where(qvec > kgridgpu_jax // 2, qvec - kgridgpu_jax, qvec)
+        
         for k_r in range(sym.nk_tot):
-            k_l_full = xp.asarray(sym.kvecs_asints[k_r]) - qvec
-            k_l_gt0 = xp.mod(k_l_full, kgridgpu)
-            k_l_gt0_cpu = k_l_gt0.get() if hasattr(k_l_gt0, "get") else k_l_gt0
-            k_l = np.where(np.all(sym.kvecs_asints == k_l_gt0_cpu, axis=1))[0][0]
+            # Calculate k_l from k_r - qvec (with wraparound)
+            k_l_full = jnp.asarray(sym.kvecs_asints[k_r]) - qvec
+            k_l_wrapped = k_l_full % kgridgpu_jax
+            
+            # Find matching k_l index
+            k_l_wrapped_cpu = np.array(k_l_wrapped)
+            k_l = np.where(np.all(sym.kvecs_asints == k_l_wrapped_cpu, axis=1))[0][0]
+            
+            all_qvecs.append(qvec_nonneg)
+            all_k_r_indices.append(k_r)
+            all_k_l_indices.append(k_l)
+    
+    # Convert to JAX arrays for vectorized computation
+    all_qvecs_jax = jnp.array(all_qvecs)  # Shape: (n_qk_pairs, 3)
+    all_k_r_indices_jax = jnp.array(all_k_r_indices)  # Shape: (n_qk_pairs,)
+    all_k_l_indices_jax = jnp.array(all_k_l_indices)  # Shape: (n_qk_pairs,)
+    n_qk_pairs = len(all_qvecs)
+    n_q_points = meta.nkx * meta.nky * meta.nkz
+    
+    print(f"Precomputed {n_qk_pairs} q,k pairs for {n_q_points} q-points")
 
-            psi_l_rtot = psi_l_rtot_out.slice("nk", k_l, tagged=False).reshape(
-                nb_l * meta.nspinor, *meta.fft_grid
+    # JIT-compiled function to compute all contributions
+    @partial(jax.jit)
+    def compute_all_qk_contributions(
+        psi_l_rtot_jax_sharded, psi_r_rtot_jax_sharded, 
+        weights_l_jax, weights_r_jax, centroid_indices_jax,
+        all_k_l_indices, all_k_r_indices
+    ):
+        # Initialize accumulation for each q-point
+        CCT_all_q = jnp.zeros((n_q_points, meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
+        ZCT_all_q = jnp.zeros((n_q_points, meta.n_rmu, meta.n_rtot), dtype=jnp.complex128)
+        
+        # Vectorized computation over all q,k pairs
+        def process_qk_pair(i):
+            k_l = all_k_l_indices[i]
+            k_r = all_k_r_indices[i]
+            q_idx = i // sym.nk_tot  # Which q-point this pair belongs to
+            
+            # Extract wavefunctions for this k-point pair
+            psi_l_rtot_k = psi_l_rtot_jax_sharded[k_l].reshape(-1, *meta.fft_grid)
+            psi_r_rtot_k = psi_r_rtot_jax_sharded[k_r].reshape(-1, *meta.fft_grid)
+            
+            # Extract at centroid points and flatten
+            psi_l_rmu_k = extract_centroids(psi_l_rtot_k, centroid_indices_jax)
+            psi_r_rmu_k = extract_centroids(psi_r_rtot_k, centroid_indices_jax)
+            psi_l_rtot_flat = psi_l_rtot_k.reshape(psi_l_rtot_k.shape[0], -1)
+            psi_r_rtot_flat = psi_r_rtot_k.reshape(psi_r_rtot_k.shape[0], -1)
+            
+            # Get weights and compute partial P matrices
+            weights_l_k = weights_l_jax[k_l]
+            weights_r_k = weights_r_jax[k_r]
+            
+            Pmu_l_partial, Pmu_r_partial, P_l_partial, P_r_partial = compute_k_contribution_local(
+                psi_l_rmu_k, psi_r_rmu_k, psi_l_rtot_flat, psi_r_rtot_flat,
+                weights_l_k, weights_r_k
             )
-            psi_r_rtot = psi_r_rtot_out.slice("nk", k_r, tagged=False).reshape(
-                nb_r * meta.nspinor, *meta.fft_grid
-            )
+            
+            return q_idx, Pmu_l_partial, Pmu_r_partial, P_l_partial, P_r_partial
+        
+        # Process all pairs (this will be vectorized by JAX)
+        indices = jnp.arange(n_qk_pairs)
+        results = jax.vmap(process_qk_pair)(indices)
+        q_indices, Pmu_l_all, Pmu_r_all, P_l_all, P_r_all = results
+        
+        # Accumulate contributions for each q-point using vectorized operations
+        def accumulate_for_q(q):
+            mask = q_indices == q
+            # Sum over all k-points for this q (masked sum)
+            Pmu_l_q = jnp.sum(jnp.where(mask[:, None, None], Pmu_l_all, 0), axis=0)
+            Pmu_r_q = jnp.sum(jnp.where(mask[:, None, None], Pmu_r_all, 0), axis=0)
+            P_l_q = jnp.sum(jnp.where(mask[:, None, None], P_l_all, 0), axis=0)
+            P_r_q = jnp.sum(jnp.where(mask[:, None, None], P_r_all, 0), axis=0)
+            
+            # Compute contributions for this q
+            CCT_q = Pmu_l_q * Pmu_r_q
+            ZCT_q = P_l_q * P_r_q
+            
+            return CCT_q, ZCT_q
+        
+        # Vectorize over all q-points
+        q_range = jnp.arange(n_q_points)
+        CCT_results, ZCT_results = jax.vmap(accumulate_for_q)(q_range)
+        
+        CCT_all_q = CCT_results
+        ZCT_all_q = ZCT_results
+        
+        return CCT_all_q, ZCT_all_q
+    
+    # Use shard_map for distributed computation with proper collective operations
+    @partial(jax.shard_map, mesh=mesh, in_specs=(P(None, 'host'), P(None, 'host'), P(None), P(None), P(None), P(None), P(None)), out_specs=(P(None), P(None)))
+    def distributed_qk_computation(psi_l_sharded, psi_r_sharded, weights_l, weights_r, centroids, k_l_indices, k_r_indices):
+        # Compute partial contributions on each device
+        CCT_partial, ZCT_partial = compute_all_qk_contributions(
+            psi_l_sharded, psi_r_sharded, weights_l, weights_r, centroids, k_l_indices, k_r_indices
+        )
+        
+        # Sum across devices to get full contributions
+        CCT_full = jax.lax.psum(CCT_partial, 'host')
+        ZCT_full = jax.lax.psum(ZCT_partial, 'host')
+        
+        return CCT_full, ZCT_full
 
-            psi_l_rmu = psi_l_rtot[
-                :,
-                centroid_indices[:, 0],
-                centroid_indices[:, 1],
-                centroid_indices[:, 2],
-            ]
-            psi_r_rmu = psi_r_rtot[
-                :,
-                centroid_indices[:, 0],
-                centroid_indices[:, 1],
-                centroid_indices[:, 2],
-            ]
-            psi_l_rmuT = xp.ascontiguousarray(
-                psi_l_rmu.T
-            )  # memory locality in matmuls. extra mem may be a negative
-            psi_r_rmuT = xp.ascontiguousarray(psi_r_rmu.T)
+    print("Computing all q,k contributions with JIT compilation...")
+    CCT_all_q, ZCT_all_q = distributed_qk_computation(
+        psi_l_rtot_jax_sharded, psi_r_rtot_jax_sharded,
+        weights_l_jax, weights_r_jax, centroid_indices_jax,
+        all_k_l_indices_jax, all_k_r_indices_jax
+    )
+    
+    ##########################################
+    # Process each q-point for zeta solve and downstream
+    ##########################################
+    q_idx = 0
+    for qvec_nonneg in xp.ndindex(meta.nkx, meta.nky, meta.nkz):
+        # Handle umklapp for qvec  
+        qvec = jnp.asarray(qvec_nonneg)
+        qvec = jnp.where(qvec > kgridgpu_jax // 2, qvec - kgridgpu_jax, qvec)
+        
+        # Get precomputed CCT and ZCT for this q-point
+        CCT_jax = CCT_all_q[q_idx]
+        ZCT_jax = ZCT_all_q[q_idx]
 
-            # TODO: weight by sqrt(1/E_nk - E_F) for l/r
-            psi_l_rmuT = xp.multiply(psi_l_rmuT, weights_l[k_l, xp.newaxis, :])
-            psi_r_rmuT = xp.multiply(psi_r_rmuT, weights_r[k_r, xp.newaxis, :])
-            # psi_l_rmuT = xp.multiply(psi_l_rmuT, xp.sqrt(xp.divide(1.0,xp.abs(enk_l.data[k_l]-wfn.vbm))))
-            # psi_r_rmuT = xp.multiply(psi_r_rmuT, enk_r.data[k_r])
-
-            psi_l_rtot = psi_l_rtot.reshape(nb_l * meta.nspinor, -1)
-            psi_r_rtot = psi_r_rtot.reshape(nb_r * meta.nspinor, -1)
-
-            # Add contribution from this k,q pair to ZC^T and CC^T
-            Pmu_l = xp.matmul(psi_l_rmuT, psi_l_rmu)
-            Pmu_r = xp.matmul(psi_r_rmuT, psi_r_rmu)
-            CCT += xp.multiply(Pmu_l, Pmu_r)
-
-            P_l = xp.matmul(psi_l_rmuT, psi_l_rtot)
-            P_r = xp.matmul(psi_r_rmuT, psi_r_rtot)
-            ZCT += xp.multiply(P_l, P_r)
-
-        # Solve for zeta_q
-        zeta_q = xp.linalg.lstsq(CCT, ZCT, rcond=-1)[0]
+        # Solve for zeta_q using sharded lstsq
+        lstsq_sharding = NamedSharding(mesh, P(None, 'host'))
+        CCT_for_solve = jax.lax.with_sharding_constraint(CCT_jax, lstsq_sharding)
+        ZCT_for_solve = jax.lax.with_sharding_constraint(ZCT_jax, lstsq_sharding)
+        
+        zeta_q_jax = jnp.linalg.lstsq(CCT_for_solve, ZCT_for_solve, rcond=None)[0]
+        
+        # Convert back to original backend for downstream processing
+        zeta_q = xp.asarray(np.array(zeta_q_jax))
+        qvec = xp.asarray(np.array(qvec))
 
         # Fourier transform zeta_q to G space
         zeta_q = zeta_q.reshape(meta.n_rmu, *meta.fft_grid)
@@ -737,21 +844,21 @@ def get_zeta_q_and_v_q_mu_nu(
         #    WminV = get_WminV_qGG(wfn,iqbar,eps0mat,epsmat,xp)
 
         print(f"qpoint {iq} done")
+        q_idx += 1  # Increment for next q-point
 
-    psi_l_rmu_out.data = psi_l_rtot_out.slice_many(
-        {
-            "rx": centroid_indices[:, 0],
-            "ry": centroid_indices[:, 1],
-            "rz": centroid_indices[:, 2],
-        }
-    )
-    psi_r_rmu_out.data = psi_r_rtot_out.slice_many(
-        {
-            "rx": centroid_indices[:, 0],
-            "ry": centroid_indices[:, 1],
-            "rz": centroid_indices[:, 2],
-        }
-    )
+    # Convert JAX arrays back to output format, trimming to original band counts
+    psi_l_rtot_out.data = xp.asarray(np.array(psi_l_rtot_jax_sharded[:, :nb_l_original, :, :, :, :]))
+    psi_r_rtot_out.data = xp.asarray(np.array(psi_r_rtot_jax_sharded[:, :nb_r_original, :, :, :, :]))
+    
+    # Extract centroid values efficiently using JAX operations, trimming to original sizes
+    psi_l_rmu_out.data = xp.asarray(np.array(
+        extract_centroids(psi_l_rtot_jax_sharded[:, :nb_l_original].reshape(meta.nk_tot * nb_l_original * meta.nspinor, *meta.fft_grid), 
+                         centroid_indices_jax).reshape(meta.nk_tot, nb_l_original, meta.nspinor, meta.n_rmu)
+    ))
+    psi_r_rmu_out.data = xp.asarray(np.array(
+        extract_centroids(psi_r_rtot_jax_sharded[:, :nb_r_original].reshape(meta.nk_tot * nb_r_original * meta.nspinor, *meta.fft_grid), 
+                         centroid_indices_jax).reshape(meta.nk_tot, nb_r_original, meta.nspinor, meta.n_rmu)
+    ))
 
     xp.conj(psi_l_rmu_out.data, out=psi_l_rmu_out.data)
 
