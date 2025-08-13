@@ -13,3 +13,6 @@ taggedarrays*00.h5
 .vscode
 *.egg-info/
 .localignore
+*/WFN.h5
+misc/WFNq.h5
+examples/cohsex_prod/WFN.h5

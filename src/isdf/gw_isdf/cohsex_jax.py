@@ -11,7 +11,6 @@ from ..common.gpu_utils import cp, xp
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-import lineax as lx # more efficient jax-compatible Ax=B solver
 from functools import partial
 #jax.config.update("jax_enable_x64", True)
 #jax.config.update("jax_platform_name", "cpu")
