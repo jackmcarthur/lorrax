@@ -754,6 +754,7 @@ def get_zeta_q_and_v_q_mu_nu(
         # Clean CCT and ZCT computation for this q-point
         CCT, ZCT = compute_CCT_ZCT_for_q(k_l_indices, k_r_indices)
         # lstsq solve with optimal sharding (Y over longer rtot dimension)
+        CCT = CCT + 1e-8 * jnp.mean(jnp.real(jnp.diag(CCT))) * jnp.eye(CCT.shape[0], dtype=CCT.dtype)
         CCT_cholesky = jax.scipy.linalg.cho_factor(CCT)
         zeta_q = jax.scipy.linalg.cho_solve(CCT_cholesky, ZCT, overwrite_b=True)
         #zeta_q = jnp.linalg.lstsq(CCT, ZCT, rcond=-1)[0]  # (n_rmu, n_rtot)

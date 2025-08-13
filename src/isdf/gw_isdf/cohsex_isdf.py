@@ -950,8 +950,8 @@ def main(argv=None):
 
     # restart: if True, read interp. vectors and V_qmunu from file
     restart = params["restart"]
-    x_only = True #params["x_only"]
-    do_screened = False #params["do_screened"]
+    x_only = params["x_only"]
+    do_screened = params["do_screened"]
     global bispinor
     bispinor = params["bispinor"]
     meta = Meta.from_system(wfn, sym, nval, ncond, nband, n_rmu, bispinor)
