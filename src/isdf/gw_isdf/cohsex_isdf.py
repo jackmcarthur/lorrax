@@ -452,7 +452,7 @@ def get_zeta_q_and_v_q_mu_nu(wfn, sym, centroid_indices, bandrange_l, bandrange_
 
     # fill psi_l/r_rtot_out with respective psi(*)_l/r(r) for all k
     print(f"Performing FFTs for wavefunction ranges {bandrange_l} and {bandrange_r}")
-    fft_bandrange(wfn, sym, bandrange_l, True, psi_l_rtot_out.data, xp=cp, bispinor=bispinor)
+    fft_bandrange(wfn, sym, bandrange_l, False, psi_l_rtot_out.data, xp=cp, bispinor=bispinor)
     fft_bandrange(wfn, sym, bandrange_r, False, psi_r_rtot_out.data, xp=cp, bispinor=bispinor)
     print("FFTs complete")
     
@@ -488,12 +488,12 @@ def get_zeta_q_and_v_q_mu_nu(wfn, sym, centroid_indices, bandrange_l, bandrange_
 
             psi_l_rmu = psi_l_rtot[:, centroid_indices[:, 0], centroid_indices[:, 1], centroid_indices[:, 2]]
             psi_r_rmu = psi_r_rtot[:, centroid_indices[:, 0], centroid_indices[:, 1], centroid_indices[:, 2]]
-            psi_l_rmuT = xp.ascontiguousarray(psi_l_rmu.T)  # memory locality in matmuls. extra mem may be a negative
-            psi_r_rmuT = xp.ascontiguousarray(psi_r_rmu.T)
+            psi_l_rmuT = xp.conj(xp.ascontiguousarray(psi_l_rmu.T))  # memory locality in matmuls. extra mem may be a negative
+            psi_r_rmuT = xp.conj(xp.ascontiguousarray(psi_r_rmu.T))
 
             # TODO: weight by sqrt(1/E_nk - E_F) for l/r
-            psi_l_rmuT = xp.multiply(psi_l_rmuT, weights_l[k_l,xp.newaxis,:])
-            psi_r_rmuT = xp.multiply(psi_r_rmuT, weights_r[k_r,xp.newaxis,:])
+            #psi_l_rmuT = xp.multiply(psi_l_rmuT, weights_l[k_l,xp.newaxis,:])
+            #psi_r_rmuT = xp.multiply(psi_r_rmuT, weights_r[k_r,xp.newaxis,:])
             #psi_l_rmuT = xp.multiply(psi_l_rmuT, xp.sqrt(xp.divide(1.0,xp.abs(enk_l.data[k_l]-wfn.vbm))))
             #psi_r_rmuT = xp.multiply(psi_r_rmuT, enk_r.data[k_r])
 
@@ -503,14 +503,20 @@ def get_zeta_q_and_v_q_mu_nu(wfn, sym, centroid_indices, bandrange_l, bandrange_
             # Add contribution from this k,q pair to ZC^T and CC^T
             Pmu_l = xp.matmul(psi_l_rmuT, psi_l_rmu)
             Pmu_r = xp.matmul(psi_r_rmuT, psi_r_rmu)
-            CCT += xp.multiply(Pmu_l, Pmu_r)
+            CCT += xp.multiply(xp.conj(Pmu_l), Pmu_r)
 
             P_l = xp.matmul(psi_l_rmuT, psi_l_rtot)
             P_r = xp.matmul(psi_r_rmuT, psi_r_rtot)
-            ZCT += xp.multiply(P_l, P_r)
+            ZCT += xp.multiply(xp.conj(P_l), P_r)
 
         # Solve for zeta_q
-        zeta_q = xp.linalg.lstsq(CCT, ZCT, rcond=-1)[0]
+        lam = 1e-8 * xp.mean(xp.real(xp.diag(CCT)))
+        Creg = CCT if lam == 0 else CCT + lam * xp.eye(CCT.shape[0], dtype=CCT.dtype)
+
+        #L = jnp.linalg.cholesky(Creg)                            # (n_mu, n_mu)
+        #Y = jax.scipy.linalg.solve_triangular(L, ZCT, lower=True)
+        #zeta = jax.scipy.linalg.solve_triangular(L.conj().T, Y, lower=False)
+        zeta_q = xp.linalg.lstsq(Creg, ZCT, rcond=-1)[0]
 
         # Fourier transform zeta_q to G space
         zeta_q = zeta_q.reshape(n_rmu, *wfn.fft_grid)
@@ -564,7 +570,7 @@ def get_zeta_q_and_v_q_mu_nu(wfn, sym, centroid_indices, bandrange_l, bandrange_
     psi_l_rmu_out.data = psi_l_rtot_out.slice_many({'rx': centroid_indices[:, 0], 'ry': centroid_indices[:, 1], 'rz': centroid_indices[:, 2]})
     psi_r_rmu_out.data = psi_r_rtot_out.slice_many({'rx': centroid_indices[:, 0], 'ry': centroid_indices[:, 1], 'rz': centroid_indices[:, 2]})
 
-    xp.conj(psi_l_rmu_out.data, out=psi_l_rmu_out.data)
+    #xp.conj(psi_l_rmu_out.data, out=psi_l_rmu_out.data)
 
     wfn_l = WfnArray(psi_l_rmu_out, enk_l)
     wfn_r = WfnArray(psi_r_rmu_out, enk_r)
@@ -944,8 +950,8 @@ def main(argv=None):
 
     # restart: if True, read interp. vectors and V_qmunu from file
     restart = params["restart"]
-    x_only = params["x_only"]
-    do_screened = params["do_screened"]
+    x_only = True #params["x_only"]
+    do_screened = False #params["do_screened"]
     global bispinor
     bispinor = params["bispinor"]
     meta = Meta.from_system(wfn, sym, nval, ncond, nband, n_rmu, bispinor)

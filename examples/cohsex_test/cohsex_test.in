@@ -1,7 +1,7 @@
 [cohsex]
 restart = false
-x_only = false
-do_screened = true
+x_only = true
+do_screened = false
 bispinor = false
 wfn_file = WFNsmall.h5
 centroids_file = centroids_frac_60.txt
