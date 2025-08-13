@@ -579,216 +579,109 @@ def get_zeta_q_and_v_q_mu_nu(
     
     weights_l = jnp.asarray(weights_l_padded)
     weights_r = jnp.asarray(weights_r_padded)
-    
     ##########################################
-    # Precompute ALL q-point and k-point mappings outside JIT
+    # Original ISDF physics with minimal JAX sharding
     ##########################################
-    print("Precomputing all q-point and k-point mappings...")
-    
-    # Collect all q-vectors and their mappings
-    all_qvecs_nonneg = []
-    all_qvecs_wrapped = []
-    all_k_l_indices = []
-    all_k_r_indices = []
-    all_V_qfullG = []
-    all_vcoul_comps = []
-    all_iq_indices = []
-    
-    for qvec_nonneg in xp.ndindex(meta.nkx, meta.nky, meta.nkz):  # Match original: *wfn.kgrid
-        # Handle umklapp for qvec (exact match to original)
+
+    # Pre-allocate phase factor arrays
+    fft_nx, fft_ny, fft_nz = meta.fft_grid
+    fx = jnp.arange(fft_nx, dtype=float)[None, :, None, None] / fft_nx
+    fy = jnp.arange(fft_ny, dtype=float)[None, None, :, None] / fft_ny
+    fz = jnp.arange(fft_nz, dtype=float)[None, None, None, :] / fft_nz
+    px = jnp.zeros((1, fft_nx, 1, 1), dtype=jnp.complex128)
+    py = jnp.zeros((1, 1, fft_ny, 1), dtype=jnp.complex128)
+    pz = jnp.zeros((1, 1, 1, fft_nz), dtype=jnp.complex128)
+
+    P_l = jnp.zeros((meta.n_rmu, meta.n_rtot), dtype=jnp.complex128)
+    P_r = jnp.zeros((meta.n_rmu, meta.n_rtot), dtype=jnp.complex128)
+    ZCT = jnp.zeros((meta.n_rmu, meta.n_rtot), dtype=jnp.complex128)
+    CCT = jnp.zeros((meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
+    zeta_q = jnp.zeros((meta.n_rmu, meta.n_rtot), dtype=jnp.complex128)
+    zeta_qG_mu = jnp.zeros((meta.n_rmu, int(wfn.ngkmax)), dtype=jnp.complex128)
+
+    qvec = jnp.array([0, 0, 0], dtype=jnp.int32)
+    for qvec_nonneg in xp.ndindex(meta.nkx, meta.nky, meta.nkz):
         qvec = jnp.asarray(qvec_nonneg)
-        qvec = jnp.where(qvec > kgrid // 2, qvec - kgrid, qvec)
-        
-        # Precompute k_l indices for this q
-        k_l_indices_q = []
-        k_r_indices_q = []
-        
+        if qvec_nonneg[0] > kgrid[0] // 2:
+            qvec = qvec.at[0].set(qvec_nonneg[0] - kgrid[0])
+        if qvec_nonneg[1] > kgrid[1] // 2:
+            qvec = qvec.at[1].set(qvec_nonneg[1] - kgrid[1])
+        if qvec_nonneg[2] > kgrid[2] // 2:
+            qvec = qvec.at[2].set(qvec_nonneg[2] - kgrid[2])
+
+        ZCT = jnp.zeros((meta.n_rmu, meta.n_rtot), dtype=jnp.complex128)
+        CCT = jnp.zeros((meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
+
         for k_r in range(sym.nk_tot):
             k_l_full = jnp.asarray(sym.kvecs_asints[k_r]) - qvec
-            k_l_wrapped = k_l_full % kgrid
-            k_l_wrapped_cpu = np.array(k_l_wrapped)
-            k_l = np.where(np.all(sym.kvecs_asints == k_l_wrapped_cpu, axis=1))[0][0]
-            
-            k_l_indices_q.append(k_l)
-            k_r_indices_q.append(k_r)
-        
-        # Precompute V_qG extraction for this q
-        qvec_cpu = np.array(qvec)
-        qveccrys = qvec_cpu.astype(np.float64) / np.array(kgrid)
-        q_rounded = np.round(qveccrys)
-        q_ext = np.where(np.abs(qveccrys - q_rounded) < 1e-8, q_rounded, qveccrys)
-        
-        # Fix the find_qpoint_index function to handle mixed array types
-        iq = find_qpoint_index(q_ext, sym, tol=1e-6)
-        iq_cpu = iq.get() if hasattr(iq, "get") else int(iq)
+            k_l_gt0 = k_l_full % kgrid
+            k_l_gt0_cpu = np.array(k_l_gt0)
+            k_l = np.where(np.all(sym.kvecs_asints == k_l_gt0_cpu, axis=1))[0][0]
 
+            psi_l_rtot_k = psi_l_rtot[k_l].reshape(-1, meta.n_rtot)
+            psi_r_rtot_k = psi_r_rtot[k_r].reshape(-1, meta.n_rtot)
+            psi_l_rmu_k = psi_l_rmu[k_l].reshape(-1, meta.n_rmu)
+            psi_r_rmu_k = psi_r_rmu[k_r].reshape(-1, meta.n_rmu)
+
+            psi_l_rmuT = jnp.conj(psi_l_rmu_k.T)
+            psi_r_rmuT = jnp.conj(psi_r_rmu_k.T)
+
+            Pmu_l = psi_l_rmuT @ psi_l_rmu_k
+            Pmu_r = psi_r_rmuT @ psi_r_rmu_k
+            CCT = CCT + jnp.multiply(jnp.conj(Pmu_l), Pmu_r)
+
+            P_l = psi_l_rmuT @ psi_l_rtot_k
+            P_r = psi_r_rmuT @ psi_r_rtot_k
+            ZCT = ZCT + jnp.multiply(jnp.conj(P_l), P_r)
+
+        lam = 1e-8 * jnp.mean(jnp.real(jnp.diag(CCT)))
+        Creg = CCT if lam == 0 else CCT + lam * jnp.eye(CCT.shape[0], dtype=CCT.dtype)
+        y_matrix_sharding = NamedSharding(mesh_2d, P('proc_y', None))
+        Creg = jax.lax.with_sharding_constraint(Creg, y_matrix_sharding)
+        ZCT = jax.lax.with_sharding_constraint(ZCT, y_matrix_sharding)
+        zeta_q = jnp.linalg.lstsq(Creg, ZCT, rcond=-1)[0]
+        zeta_q = jax.lax.with_sharding_constraint(zeta_q, y_matrix_sharding)
+
+        zeta_q = zeta_q.reshape(meta.n_rmu, *meta.fft_grid)
+        px = jnp.exp(-2j * jnp.pi * qvec[0] / kgrid[0] * fx)
+        py = jnp.exp(-2j * jnp.pi * qvec[1] / kgrid[1] * fy)
+        pz = jnp.exp(-2j * jnp.pi * qvec[2] / kgrid[2] * fz)
+        zeta_q *= px
+        zeta_q *= py
+        zeta_q *= pz
+
+        for mu in range(meta.n_rmu):
+            zeta_q = zeta_q.at[mu].set(jnp.fft.fftn(zeta_q[mu]))
+
+        qveccrys = jnp.asarray(qvec, dtype=jnp.float64) / kgrid
+        q_rounded = jnp.round(qveccrys)
+        q_ext = jnp.where(jnp.abs(qveccrys - q_rounded) < 1e-8, q_rounded, qveccrys)
+        iq = find_qpoint_index(q_ext, sym, tol=1e-6)
+        iq_cpu = int(iq)
         iqbar = sym.irk_to_k_map[iq_cpu]
         Sq = sym.sym_mats_k[sym.irk_sym_map[iq_cpu]]
-        q_ext_cpu = q_ext if not hasattr(q_ext, "get") else q_ext
+        q_ext_cpu = np.array(q_ext)
         G_Sq = np.round(q_ext_cpu - Sq @ wfn.kpoints[iqbar]).astype(np.int32)
-        vcoul_psiG_comps = np.einsum("ij,kj->ki", Sq.astype(np.int32), wfn.get_gvec_nk(iqbar)) - G_Sq[np.newaxis, :]
-        
-        # Get V_qG for this q-point
-        V_qfullG_np = np.zeros(int(wfn.ngkmax), dtype=np.complex128)
-        V_qG_slice = V_qG[0, 0, iqbar, :vcoul_psiG_comps.shape[0]]
-        V_qG_slice_np = V_qG_slice.get() if hasattr(V_qG_slice, 'get') else np.asarray(V_qG_slice)
-        V_qfullG_np[:vcoul_psiG_comps.shape[0]] = V_qG_slice_np
-        
-        # Store all data for this q-point
-        all_qvecs_nonneg.append(qvec_nonneg)
-        all_qvecs_wrapped.append(np.array(qvec))
-        all_k_l_indices.append(k_l_indices_q)
-        all_k_r_indices.append(k_r_indices_q)
-        all_V_qfullG.append(V_qfullG_np)
-        all_vcoul_comps.append(vcoul_psiG_comps)
-        all_iq_indices.append(iq_cpu)
-    
-    # Convert to JAX arrays with proper padding for consistent shapes
-    n_q_points = len(all_qvecs_nonneg)
-    max_G = max(comps.shape[0] for comps in all_vcoul_comps)
-    
-    # Pad and convert to JAX arrays
-    all_k_l_indices = jnp.array(all_k_l_indices)  # (n_q, n_k)
-    all_k_r_indices = jnp.array(all_k_r_indices)  # (n_q, n_k)
-    all_qvecs_wrapped = jnp.array(all_qvecs_wrapped)  # (n_q, 3)
-    
-    # Pad V_qfullG and vcoul_comps to consistent shapes
-    V_qfullG_padded = np.zeros((n_q_points, int(wfn.ngkmax)), dtype=np.complex128)
-    vcoul_comps_padded = np.zeros((n_q_points, max_G, 3), dtype=np.int32)
-    n_G_per_q = np.zeros(n_q_points, dtype=np.int32)
-    
-    for i, (V_q, comps) in enumerate(zip(all_V_qfullG, all_vcoul_comps)):
-        V_qfullG_padded[i] = V_q
-        n_G_actual = comps.shape[0] 
-        vcoul_comps_padded[i, :n_G_actual] = comps
-        n_G_per_q[i] = n_G_actual
-    
-    all_V_qfullG = jnp.array(V_qfullG_padded)
-    all_vcoul_comps = jnp.array(vcoul_comps_padded)
-    n_G_per_q = jnp.array(n_G_per_q)
-    
-    print(f"Precomputed data for {n_q_points} q-points")
+        vcoul_psiG_comps = jnp.asarray(
+            np.einsum('ij,kj->ki', Sq.astype(np.int32), wfn.get_gvec_nk(iqbar)) - G_Sq[np.newaxis, :],
+            dtype=jnp.int32,
+        )
 
-    ##########################################
-    # Clean idiomatic distributed computation
-    ##########################################
-    
-    # Compute weighted wavefunctions for all k-points
-    # @partial(jax.jit)
-    # def compute_weighted_psi(psi_rmu, psi_rtot, weights):
-    #     # Apply weights: sqrt(weights) to each wavefunction
-    #     # weights shape: (nk, nb_padded*nspinor) → need to reshape to (nk, nb_local, nspinor)
-    #     nk, nb_local, nspinor = psi_rmu.shape[:3]
-    #     weights_reshaped = weights[:, :nb_local*nspinor].reshape(nk, nb_local, nspinor)  # (nk, nb_local, nspinor)
-    #     weights_expanded = weights_reshaped[..., None]  # (nk, nb_local, nspinor, 1)
-        
-    #     weighted_psi_rmu = jnp.sqrt(weights_expanded) * psi_rmu    # (nk, nb_local, nspinor, n_rmu)
-    #     weighted_psi_rtot = jnp.sqrt(weights_expanded) * psi_rtot  # (nk, nb_local, nspinor, n_rtot)
-        
-    #     return weighted_psi_rmu, weighted_psi_rtot
-    
-    # # Compute weighted arrays for l and r
-    # weighted_psi_l_rmu, weighted_psi_l_rtot = compute_weighted_psi(psi_l_rmu, psi_l_rtot, weights_l)
-    # weighted_psi_r_rmu, weighted_psi_r_rtot = compute_weighted_psi(psi_r_rmu, psi_r_rtot, weights_r)
-    
-    # Simplify to match original cohsex_isdf.py implementation
-    print("Processing q-points with original ISDF physics...")
-    
-    @partial(jax.jit) 
-    def compute_CCT_ZCT_for_q(k_l_indices, k_r_indices):
-        """Exact match to original cohsex_isdf.py physics - direct accumulation"""
-        
-        def accumulate_k_pair(carry, i):
-            CCT_acc, ZCT_acc = carry
-            k_l, k_r = k_l_indices[i], k_r_indices[i]
-            
-            # Extract wavefunctions for this k-point pair
-            psi_l_rmu_k = psi_l_rmu[k_l].reshape(-1, meta.n_rmu)      # (nb*nspinor, n_rmu)
-            psi_r_rmu_k = psi_r_rmu[k_r].reshape(-1, meta.n_rmu)      # (nb*nspinor, n_rmu)
-            psi_l_rtot_k = psi_l_rtot[k_l].reshape(-1, meta.n_rtot)   # (nb*nspinor, n_rtot)
-            psi_r_rtot_k = psi_r_rtot[k_r].reshape(-1, meta.n_rtot)   # (nb*nspinor, n_rtot)
-            
-            # Original: psi_l_rmuT = xp.ascontiguousarray(psi_l_rmu.T)
-            psi_l_rmuT_k = jnp.conj(psi_l_rmu_k.T)    # (n_rmu, nb*nspinor)
-            psi_r_rmuT_k = jnp.conj(psi_r_rmu_k.T)    # (n_rmu, nb*nspinor)
-            
-            # Original ISDF physics:
-            # Pmu_l = xp.matmul(psi_l_rmuT, psi_l_rmu)
-            # Pmu_r = xp.matmul(psi_r_rmuT, psi_r_rmu)  
-            # CCT += xp.multiply(Pmu_l, Pmu_r)
-            Pmu_l = psi_l_rmuT_k @ psi_l_rmu_k  # (n_rmu, n_rmu)
-            Pmu_r = psi_r_rmuT_k @ psi_r_rmu_k  # (n_rmu, n_rmu)
-            CCT_acc = CCT_acc + jnp.conj(Pmu_l) * Pmu_r   # Direct accumulation!
-            
-            # P_l = xp.matmul(psi_l_rmuT, psi_l_rtot)
-            # P_r = xp.matmul(psi_r_rmuT, psi_r_rtot)
-            # ZCT += xp.multiply(P_l, P_r)
-            P_l = psi_l_rmuT_k @ psi_l_rtot_k   # (n_rmu, n_rtot)
-            P_r = psi_r_rmuT_k @ psi_r_rtot_k   # (n_rmu, n_rtot)
-            ZCT_acc = ZCT_acc + jnp.conj(P_l) * P_r       # Direct accumulation!
-            
-            return (CCT_acc, ZCT_acc), None
-        
-        # Initialize accumulators
-        CCT_init = jnp.zeros((meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
-        ZCT_init = jnp.zeros((meta.n_rmu, meta.n_rtot), dtype=jnp.complex128)
-        
-        # Use lax.scan for memory-efficient accumulation (no huge intermediate arrays!)
-        k_indices = jnp.arange(len(k_l_indices))
-        (CCT, ZCT), _ = jax.lax.scan(accumulate_k_pair, (CCT_init, ZCT_init), k_indices)
-        
-        return CCT, ZCT
-    
-    # Main q-point loop
-    for q_idx, (qvec_nonneg, iq_cpu) in enumerate(zip(all_qvecs_nonneg, all_iq_indices)):
-        print(f"Processing q-point {iq_cpu}...")
-        
-        # Get data for this q
-        k_l_indices = all_k_l_indices[q_idx]
-        k_r_indices = all_k_r_indices[q_idx]
-        qvec = all_qvecs_wrapped[q_idx]
-        V_qfullG = all_V_qfullG[q_idx]
-        vcoul_comps = all_vcoul_comps[q_idx]
-        n_G_q = n_G_per_q[q_idx]
-        
-        # Clean CCT and ZCT computation for this q-point
-        CCT, ZCT = compute_CCT_ZCT_for_q(k_l_indices, k_r_indices)
-        # lstsq solve with optimal sharding (Y over longer rtot dimension)
-        CCT = CCT + 1e-8 * jnp.mean(jnp.real(jnp.diag(CCT))) * jnp.eye(CCT.shape[0], dtype=CCT.dtype)
-        CCT_cholesky = jax.scipy.linalg.cho_factor(CCT)
-        zeta_q = jax.scipy.linalg.cho_solve(CCT_cholesky, ZCT, overwrite_b=True)
-        #zeta_q = jnp.linalg.lstsq(CCT, ZCT, rcond=-1)[0]  # (n_rmu, n_rtot)
-        
-        # Reshard to be sharded over ALL processors in rmu dimension (1D mesh)
-        # zeta_q shape: (n_rmu, n_rtot) - shard over n_rmu dimension only
-        all_procs = jax.devices()
-        mesh_1d = jax.sharding.Mesh(all_procs, ['all_procs'])
-        rmu_1d_sharding = NamedSharding(mesh_1d, P('all_procs', None))  # Shard n_rmu over all procs
-        zeta_q = jax.lax.with_sharding_constraint(zeta_q, rmu_1d_sharding)
-        
-        # Reshape zeta_q: (n_rmu, n_rtot) → (n_rmu, nx, ny, nz) 
-        zeta_q_spatial = zeta_q.reshape(meta.n_rmu, *meta.fft_grid)
-        
-        # Phase removal and FFT  
-        fx = jnp.arange(meta.fft_grid[0])[None, :, None, None] / meta.fft_grid[0]
-        fy = jnp.arange(meta.fft_grid[1])[None, None, :, None] / meta.fft_grid[1]
-        fz = jnp.arange(meta.fft_grid[2])[None, None, None, :] / meta.fft_grid[2]
-        
-        phase = jnp.exp(-2j * jnp.pi * (qvec[0] * fx + qvec[1] * fy + qvec[2] * fz))
-        zeta_q_spatial = zeta_q_spatial * phase
-        zeta_qG = jnp.fft.fftn(zeta_q_spatial, axes=(-3, -2, -1))
-        
-        # Extract G-components and compute V_qmunu
-        zeta_qG_extracted = zeta_qG[:, vcoul_comps[:, 0], vcoul_comps[:, 1], vcoul_comps[:, 2]]
-        G_mask = jnp.arange(vcoul_comps.shape[0]) < n_G_q
-        zeta_qG_masked = jnp.where(G_mask[None, :], zeta_qG_extracted, 0.0)
-        V_qfullG_masked = jnp.where(G_mask, V_qfullG, 0.0)
-        
-        V_weighted = V_qfullG_masked[None, :] * zeta_qG_masked
-        V_qmunu_q = jnp.conj(zeta_qG_masked) @ V_weighted.T
-        
-        # Store result
-        V_qmunu.data[0, 0, 0, *qvec_nonneg, :, :] = xp.asarray(np.array(V_qmunu_q))
+        V_qfullG = jnp.zeros((int(wfn.ngkmax)), dtype=jnp.complex128)
+        V_qfullG = V_qfullG.at[:vcoul_psiG_comps.shape[0]].set(
+            V_qG[0, 0, iqbar, :vcoul_psiG_comps.shape[0]]
+        )
+
+        zeta_qG_mu = jnp.zeros((meta.n_rmu, int(wfn.ngkmax)), dtype=jnp.complex128)
+        for mu in range(meta.n_rmu):
+            zeta_qG_mu = zeta_qG_mu.at[mu, :vcoul_psiG_comps.shape[0]].set(
+                zeta_q[mu, vcoul_psiG_comps[:, 0], vcoul_psiG_comps[:, 1], vcoul_psiG_comps[:, 2]]
+            )
+
+        temp = jnp.multiply(V_qfullG[:, None], zeta_qG_mu.T)
+        V_qmunu.data[0, 0, 0, *qvec_nonneg, :, :] = xp.asarray(
+            np.array(jnp.matmul(jnp.conj(zeta_qG_mu), temp))
+        )
         print(f"qpoint {iq_cpu} done")
 
     # Convert JAX arrays back to output format, trimming to original band counts

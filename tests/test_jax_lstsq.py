@@ -20,14 +20,15 @@ Usage:
 
 import os
 import pytest
-# Ensure these are set before JAX initialization
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=7"
-os.environ.setdefault("JAX_ENABLE_X64", "1")
-jax.config.update("jax_platform_name", "cpu")
 import jax
 import jax.numpy as jnp
 from jax import lax
 import jax.scipy.linalg as jsp
+
+# Ensure these are set before JAX initialization
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=7"
+os.environ.setdefault("JAX_ENABLE_X64", "1")
+jax.config.update("jax_platform_name", "cpu")
 
 # 1) Enable 64‑bit
 jax.config.update("jax_enable_x64", True)
