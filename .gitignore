@@ -37,3 +37,4 @@ charge-density.hdf5
 qe_pp
 qe_src
 qe_upflib
+bgw_src
