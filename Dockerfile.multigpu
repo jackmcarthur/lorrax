@@ -1,0 +1,89 @@
+# Runtime image based on NVIDIA JAX (CUDA 12), suitable for multi-GPU (Perlmutter-style)
+FROM nvcr.io/nvidia/jax:25.04-py3
+
+# Install build essentials and tools for building MPICH/HDF5 and Python extensions
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    wget \
+    ca-certificates \
+    build-essential \
+    gfortran \
+    zlib1g-dev \
+    libzstd-dev \
+    libcurl4-openssl-dev \
+    libssl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv (user-level) and ensure it is on PATH
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    echo 'export PATH="$HOME/.local/bin:$PATH"' >> /etc/profile.d/uv.sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+# Workdir for application
+WORKDIR /workspace/ISDF
+
+# Copy project metadata and source
+COPY pyproject.toml uv.lock ./
+COPY src ./src
+COPY tests ./tests
+
+# Environment recommendations for JAX and HDF5
+ENV XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 \
+    HDF5_USE_FILE_LOCKING=FALSE
+
+# Create uv environment (without JAX group; base image supplies JAX)
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-group jax
+
+# Ensure uv venv is active by default for python/pip
+ENV VIRTUAL_ENV="/workspace/ISDF/.venv"
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+# Build and install MPICH from source
+ARG MPICH_VERSION=3.4.3
+RUN set -eux; \
+    cd /tmp; \
+    wget -q https://www.mpich.org/static/downloads/${MPICH_VERSION}/mpich-${MPICH_VERSION}.tar.gz; \
+    tar xf mpich-${MPICH_VERSION}.tar.gz; \
+    cd mpich-${MPICH_VERSION}; \
+    ./configure --disable-fortran --prefix=/opt/mpich; \
+    make -j"$(nproc)"; \
+    make install; \
+    cd /; rm -rf /tmp/mpich-${MPICH_VERSION} /tmp/mpich-${MPICH_VERSION}.tar.gz
+
+ENV MPICH_HOME="/opt/mpich"
+ENV PATH="${MPICH_HOME}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${MPICH_HOME}/lib:${LD_LIBRARY_PATH}"
+
+# Build and install HDF5 with MPI support
+ARG HDF5_VERSION=1.14.3
+RUN set -eux; \
+    cd /tmp; \
+    wget -q https://support.hdfgroup.org/ftp/HDF5/releases/hdf5-${HDF5_VERSION%.*}/hdf5-${HDF5_VERSION}/src/hdf5-${HDF5_VERSION}.tar.gz; \
+    tar xf hdf5-${HDF5_VERSION}.tar.gz; \
+    cd hdf5-${HDF5_VERSION}; \
+    CC=${MPICH_HOME}/bin/mpicc ./configure --enable-parallel --enable-shared --prefix=/opt/hdf5; \
+    make -j"$(nproc)"; \
+    make install; \
+    cd /; rm -rf /tmp/hdf5-${HDF5_VERSION} /tmp/hdf5-${HDF5_VERSION}.tar.gz
+
+ENV HDF5_DIR="/opt/hdf5"
+ENV LD_LIBRARY_PATH="${HDF5_DIR}/lib:${LD_LIBRARY_PATH}"
+
+# Prepare Python build tooling inside the uv venv
+RUN python3 -m pip install -U pip wheel setuptools cython pkgconfig
+
+# Install MPI-enabled mpi4py and parallel h5py
+RUN MPICC=${MPICH_HOME}/bin/mpicc \
+    pip install --no-binary=mpi4py mpi4py && \
+    HDF5_MPI=ON CC=${MPICH_HOME}/bin/mpicc HDF5_DIR=${HDF5_DIR} \
+    pip install -U --no-binary=h5py --no-build-isolation h5py
+
+# Install project itself (editable) into the uv venv
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv run pip install -e .
+
+CMD ["bash", "-lc", "python3 -c 'import jax; print(jax.devices())'"]
+

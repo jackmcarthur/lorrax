@@ -1,0 +1,45 @@
+# Updated GPU image (CUDA 13.x JAX base) for modern drivers
+FROM nvcr.io/nvidia/jax:25.04-py3
+
+ENV XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 \
+    JAX_ENABLE_X64=1
+
+# Target GPU arch - will be overridden by setup script based on detected hardware
+ENV CMAKE_CUDA_ARCHITECTURES=89
+# Ensure CUDA libs are visible to the linker during source builds
+ENV LD_LIBRARY_PATH="/usr/local/cuda/targets/x86_64-linux/lib:${LD_LIBRARY_PATH}"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl git build-essential cmake ninja-build libfftw3-dev pkg-config python3-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    echo 'export PATH="$HOME/.local/bin:$PATH"' >> /etc/profile.d/uv.sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+WORKDIR /workspace/ISDF_MB
+
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-group jax --no-install-project
+
+# Place venv outside bind mount so it isn't shadowed at runtime
+ENV VIRTUAL_ENV="/opt/venv"
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+RUN uv venv --system-site-packages ${VIRTUAL_ENV}
+
+# jax-finufft is built at runtime by scripts/setup_gpu.sh to avoid Python dev/header
+# mismatches during image build. This keeps the image lean and prevents CMake from
+# picking the wrong interpreter. The runtime script installs build deps and compiles
+# against the active /opt/venv Python inside the container.
+
+# your project
+COPY src ./src
+COPY README.md ./
+COPY tests ./tests
+
+RUN uv pip install -e .
+
+CMD ["bash", "-lc", "python -c 'import jax, cufinufft, jax_finufft; print(jax.devices()); print(\"cufinufft+jax-finufft OK\")'"]

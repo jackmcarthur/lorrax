@@ -1,0 +1,19 @@
+loaders:
+  - type: python
+    search_path: [src]
+    packages:
+      - isdf.gw_isdf
+      - isdf.common
+      - isdf.isdf_init
+
+processors:
+  - type: filter
+    skip_empty_modules: true
+
+renderer:
+  type: markdown
+  filename: docs/api/index.md
+  render_toc: true
+  render_module_header: true
+  data_code_block: true
+

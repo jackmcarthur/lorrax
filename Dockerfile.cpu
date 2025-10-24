@@ -1,0 +1,52 @@
+# Lightweight CPU-only dev image for Windows/macOS/Linux laptops
+# - No MPI, no parallel HDF5
+# - Installs jax[cpu] and uses uv for the project env
+
+FROM python:3.11-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+	PYTHONUNBUFFERED=1 \
+	PIP_NO_CACHE_DIR=1 \
+	JAX_ENABLE_X64=1 \
+	XLA_PYTHON_CLIENT_PREALLOCATE=false \
+	XLA_PYTHON_CLIENT_MEM_FRACTION=0.85
+
+# Basic build tools and FFTW (optional, useful if finufft/jax-finufft is needed)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+		curl \
+		build-essential \
+		git \
+		libfftw3-dev \
+		&& rm -rf /var/lib/apt/lists/*
+
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+	echo 'export PATH="\$HOME/.local/bin:\$PATH"' >> /etc/profile.d/uv.sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+WORKDIR /workspace/ISDF
+
+# Copy only metadata first for better caching
+COPY pyproject.toml uv.lock ./
+
+# Create the uv venv and sync deps (without JAX group if defined)
+RUN --mount=type=cache,target=/root/.cache/uv \
+	uv sync --frozen --no-group jax || uv sync --no-group jax
+
+# Ensure venv on PATH
+ENV VIRTUAL_ENV="/workspace/ISDF/.venv"
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+# Explicitly install CPU JAX wheels (fast on Linux)
+RUN uv run -- python -m pip install -U "jax[cpu]"
+
+# Copy source and tests
+COPY src ./src
+COPY tests ./tests
+
+# Install project in editable mode
+RUN uv run -- python -m pip install -e .
+
+CMD ["bash", "-lc", "python -c 'import jax; print(jax.devices())' && ls -la"]
+
+

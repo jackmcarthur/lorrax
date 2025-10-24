@@ -1,0 +1,489 @@
+JAX¶
+Setting up JAX¶
+Pip Installation¶
+The following instructions, adapted from the JAX installation instructions, demonstrate how to set up a custom Conda environment and use pip to set up JAX on Perlmutter:
+
+
+module load python
+# Create a new conda environment
+conda create -n jax-demo python=3.11 pip numpy scipy rich
+# Activate the environment and install the latest JAX
+conda activate jax-demo
+pip install --upgrade "jax[cuda12]==0.4.37"
+Do note that here JAX brings its own versions of CUDA and cuDNN, which may become incompatible with Perlmutter as the system environment or JAX dependencies evolve, requiring you to change the JAX version being used.
+
+NVIDIA Containers¶
+We recommend using NVIDIA's containerized JAX installations: NVIDIA NGC containers (updated every 3-4 months) or NVIDIA JAX-Toolbox containers (updated daily). This process is relatively straightforward and will reliably give you a working installation of JAX.
+
+You can for example start a GPU job using the NGC nvcr.io/nvidia/jax:25.04-py3 image via Shifter with the following Slurm script:
+
+
+#!/bin/bash
+#SBATCH --image=nvcr.io/nvidia/jax:25.04-py3
+#SBATCH --nodes=1
+#SBATCH --qos=regular
+#SBATCH --constraint=gpu
+#SBATCH --gpus-per-node=4
+#SBATCH --module=gpu,nccl-plugin
+
+srun shifter python3 ./my_script.py
+You could also run a script locally as follows:
+
+
+shifter --module=gpu,nccl-plugin --image=nvcr.io/nvidia/jax:25.04-py3 python3 ./my_script.py
+See the Shifter documentation for further details on how to use Shifter containers.
+
+
+
+### JM: Shifter advice page:
+
+Using Shifter at NERSC¶
+Shifter is a software package that allows user-created images to run at NERSC. These images can be Docker images or other formats. Using Shifter you can create an image with your desired operating system and easily install your software stacks and dependencies. If you make your image in Docker, it can also be run at any other computing center that is Docker friendly. Shifter also comes with improvements in performance, especially for shared libraries. It is currently the best performing option for python code stacks across multiple nodes. Also, Shifter can leverage its volume mounting capabilities to provide local-disk like functionality and I/O performance. Shifter can be used interactively on login nodes or in a batch job.
+
+Shifter functionality at NERSC is undergoing rapid development and is an experimental service. Usage will change over time, we will do our best to keep the documentation up to date, but there may be inconsistencies. You will find general information about Shifter on the readthedocs page but please continue reading for more specific information about Shifter at NERSC.
+
+Shifter Images¶
+Building Shifter Friendly Images¶
+Step-by-step instructions
+
+See our detailed beginner's tutorial for step-by-step instructions on building a Shifter image.
+
+The easiest way to create a Shifter image is with Docker. You can run Docker on your laptop or local node (see the Docker Getting Started page for help setting up and running Docker). You can create a Docker image with your desired software and operating system. Note that you must build Docker images on x86 hardware or use a cross-platform build, since Perlmutter is an x86-based system.
+
+When you're building images it's better to try to keep the image as compact as possible. This will decrease the time to upload the image to Docker Hub and to upload it into the Shifter framework. Images larger than about 20GB will likely timeout when uploading to Docker Hub. You can keep image size down by removing software source tarballs after you install them and by limiting images to specific target applications and what is needed to support them. Be aware that the size of an image includes all intermediate layers, not just your final layer! Read more about using multi-stage builds to remove build dependencies from your final image size. Small datasets that are static could go into an image, but it is better to put large datasets on the file system and use Shifter's volume mount capability to mount them into the image.
+
+Once you have built your image, you can upload it to Docker Hub. Once that's done you can pull the image to NERSC. Alternatively, you can use our private image registry if you do not want to upload your image to a public repository. If your image is too large to comfortably go through Docker Hub or our private repository (> 20GB), please contact us through our support page.
+
+Shifter images have a naming scheme that follows source:image_name:image_version. Typically the image source will be docker and the image name and version are defined by the user.
+
+Differences Between Shifter and Docker¶
+Please keep in mind that root is squashed on Shifter images, so the software should be installed in a way that is executable to someone with user-level permissions. Additionally, images are mounted read-only at NERSC, so software should be configured to output to NERSC file systems, like $SCRATCH or Community. You can test user level access permissions with your docker image by running as a non-root user:
+
+
+docker run -it --user 500 <image_name> /bin/bash
+Currently the /etc, /var, and /tmp directories are reserved for use by the system and will be overwritten when the image is mounted.
+
+Community must be accessed in a shifter image by using its full path /global/cfs/ instead of just /cfs.
+
+Downloading Images To NERSC's Shifter Repository¶
+Shifter images can be downloaded from public docker repositories.
+
+
+shifterimg -v pull docker:image_name:latest
+where docker:image_name:latest is replaced with some existing and publicly available docker image (like docker:ubuntu:15.10). The output will update while the image is pulled down and converted so it can run on our systems. Once the "status" field is "READY", the image has been downloaded and can be used.
+
+To see a list of all available images, type:
+
+
+shifterimg images
+Shifter can also be used to pull private images. To do this you need to first do a login with shifterimg (similar to a docker login). During the image pull, you can specify which users or groups should have access to the pulled image. You can specify which registry the login is for (e.g. , , etc). Note that the login operation doesn't check the correctness of the username and password. If this is entered incorrectly, a subsequent pull would fail.
+
+
+shifterimg login docker.io
+default username: auser
+default password:
+
+shifterimg --user buser  pull auser/private:latest
+2019-03-21T21:36:05 Pulling Image: docker:auser/private:latest, status: READY
+Using MPI in Shifter¶
+Shifter has the ability to automatically allow communication between nodes using the high-speed network. Just compile your image against the standard MPICH libraries and the Cray libraries will be swapped into the image at run time. No special compiler arguments are needed. However, the image must support a glibc version that is at or above the version required by the mpich module.
+
+Here's an example batch script showing how to run on two nodes:
+
+
+#!/bin/bash
+#SBATCH --image=docker:image_name:latest
+#SBATCH --qos=regular
+#SBATCH -N 2
+#SBATCH -C cpu
+
+srun -n 64 shifter python3 ~/hello.py
+Currently this functionality is only available for images where MPICH is installed manually (i.e. not with apt-get install mpich-dev). Below is a sample Dockerfile that shows how to build a basic image with mpi4py. Note you can find this and other examples at our experimental nersc-official-images project.
+
+
+FROM ubuntu:22.04
+ARG workdir=/opt
+WORKDIR $workdir
+
+RUN \
+    apt-get update        && \
+    apt-get install --yes    \
+        build-essential      \
+        gfortran             \
+        python3-dev          \
+        python3-pip          \
+        wget              && \
+    apt-get clean all
+
+ARG mpich=3.4a2
+ARG mpich_prefix=mpich-$mpich
+ARG mpich_prefix_install=${workdir}/mpich-install
+
+# Set environment variables to avoid warnings for configure
+# https://github.com/pmodels/mpich/issues/5811
+ARG CONFIGURE_FLAGS="-prefix=${mpich_prefix_install} FFLAGS=-fallow-argument-mismatch FCFLAGS=-fallow-argument-mismatch"
+
+RUN \
+    wget https://www.mpich.org/static/downloads/$mpich/$mpich_prefix.tar.gz && \
+    tar xvzf $mpich_prefix.tar.gz                                           && \
+    cd $mpich_prefix                                                        && \
+    ./configure                                                             && \
+    make -j 4                                                               && \
+    make install                                                            && \
+    make clean                                                              && \
+    cd ..                                                                   && \
+    rm -rf $mpich_prefix
+
+ENV PATH="${mpich_prefix_install}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${mpich_prefix_install}/lib:${LD_LIBRARY_PATH}"
+ENV MPICC="${mpich_prefix_install}/bin/mpicc"
+
+RUN python3 -m pip install --no-cache-dir --no-binary=mpi4py mpi4py
+Shifter Modules¶
+Shifter modules are different than system modules
+
+Shifter modules control Shifter functionality only. These modules are different than our system modules which are typically used via commands like module load and module show. You can invoke Shifter modules by using --module=<module name> either on the command line or in your batch script.
+
+Shifter has functionality that can be toggled on or off using module flags. By default, the mpich module is enabled on all login nodes and compute nodes to allow MPI communication between nodes using the high-speed interconnect.
+
+To change modules, you can add the #SBATCH --module=<module name> flag to your batch script, or via the command line, you can shifter --module=<module name>. Please take a look at the summary table below.
+
+The current Shifter modules are:
+
+Module Name	Function
+mpich	Uses current optimized Cray MPI
+cvmfs	Makes access to DVS shared CVMFS software stack available at /cvmfs in the image
+gpu	Provides CUDA user driver and tools like nvidia-smi
+cuda-mpich	Allows CUDA-aware communication in Cray MPICH
+nccl-2.18	Enables NCCL + OFI plugin for improved performance on Slingshot network; for CUDA 12 containers
+nccl-plugin	Enables NCCL OFI plugin only for improved performance on Slingshot network; for CUDA 12 containers
+none	Turns off all modules
+Modules can be used together. For example, if you wanted MPI functionality and access to cvmfs, use #SBATCH --module=mpich,cvmfs. Using the flag none will disable all modules (even if you list others in the command line).
+
+Shifter mpich module¶
+The default mpich module provides CPU-only (i.e. non-CUDA-aware) Cray MPICH functionality for image that contain a build of MPICH that can be swapped at runtime for the Cray MPICH libraries.
+
+Shifter Open MPI users
+
+Open MPI users (or anyone who does not want the mpich module functionality) can unload it simply by specifying shifter --module=gpu. Shifter Open MPI users should also specify --mpi=pmi2. A sample srun could look like srun -N 2 --mpi=pmi2 --module=gpu shifter <Open MPI.program>
+
+Shifter cuda-mpich module¶
+Although the mpich module is loaded by default, it does not provide any support for CUDA-aware MPI. For this, users will need to load the cuda-mpich module. To use this module, users must build an image with both MPICH and CUDA capabilities, and the cuda-mpich module will swap the MPICH in the image with Cray's CUDA-aware MPICH at runtime. Note that this module will only work correctly on Perlmutter's GPU partition.
+
+Requires MPICH_GPU_SUPPORT_ENABLED=1
+
+To use CUDA-aware Cray MPICH, the environment variable MPICH_GPU_SUPPORT_ENABLED must be set. (This is required both inside and outside of Shifter.) This variable is set by default in Perlmutter's user environment, but if you have done a module purge or cleared your user environment in some way, you must ensure that this has been reset before using the cuda-mpich module in Shifter.
+
+Shifter gpu module¶
+The default gpu module provides tools like nvidia-smi, a CUDA user driver, and the corresponding CUDA compatibility libraries. The compatibility libraries are designed to provide backwards compatibility for CUDA versions running inside Shifter. For example, running shifter nvidia-smi may report CUDA 11.4, but the compatibility libraries enable Shifter to also run older versions of CUDA like 11.0. If for some reason you are unable to run your CUDA application with our current compatibility configuration, please let us know at help.nersc.gov.
+
+Shifter nccl modules¶
+The Shifter NCCL modules, which are not loaded by default, enable a plugin which improves NCCL performance over Perlmutter's Slingshot network. If you are running multi-node GPU jobs which use NCCL for GPU communication (e.g., ML workloads), enabling this option is likely to improve performance. There are a few versions available depending on the CUDA version in your container and whether to provide both NCCL and the plugin or just the OFI plugin by itself. The latter is the new approach we've decided to adopt which should hopefully have better compatibility with a range of containers that already have NCCL installed.
+
+The nccl-2.18 module has NCCL 2.18 and is built for CUDA 12 containers
+The nccl-plugin module has the NCCL OFI plugin and should be compatible with a broad range of CUDA 12 containers that already have NCCL installed.
+Note these are meant to be used in conjunction with the gpu module, so a #SBATCH header or shifter launch command would have to include --module=gpu,nccl-plugin for proper functionality.
+
+Running Jobs in Shifter Images¶
+For each of the examples below, you can submit them to the batch system with sbatch <your_shifter_job_script_name.sh>.
+
+Basic Job Script¶
+Here's the syntax for a basic Shifter script:
+
+
+#!/bin/bash
+#SBATCH --image=docker:image_name:latest
+#SBATCH --nodes=1
+#SBATCH --qos=regular
+#SBATCH --constraint=cpu
+
+srun -n 32 shifter python3 myPythonScript.py args
+This will invoke 32 instances of your image and run the myPythonScript.py in each one. If you are running in the jgi qos, you will need to add #SBATCH --exclusive for spark to work.
+
+For serial jobs (aka shared or single-node jobs), you can leave off the srun since it runs on a single core by default:
+
+
+#!/bin/bash
+#SBATCH --image=docker:image_name:latest
+#SBATCH --qos=shared
+#SBATCH --constraint=cpu
+
+shifter python3 myPythonScript.py args
+Requesting an image
+
+Note that in all of the above job scripts, the image is passed to #SBATCH --image and not directly to shifter; this is required for multi-node runs.
+
+Interactive Shifter Jobs¶
+Sometimes it may be helpful during debugging to run a Shifter image interactively. You can do this on any NERSC login node or via the batch system. To get an interactive session on a login node use
+
+
+shifter --image=docker:image_name:latest /bin/bash
+or via the batch system to get an interactive bash shell in your Shifter image on a single node.
+
+
+salloc -N 1 -q interactive --image=docker:image_name:latest -t 00:30:00
+shifter /bin/bash
+Please note that for these examples to work you must have bash installed in your image.
+
+Volume Mounting in Shifter¶
+Existing directories can be mounted inside a Shifter image using a --volume directory_to_be_mounted:target_directory_in_image flag. This allows you to potentially run an image at multiple sites and direct the output to the best file system without modifying the code in the image. This option can be used on the shifter command-line or in an #SBATCH-directive. When specifying a volume mount in a batch submission using an #SBATCH-directive, you must avoid using environment variables such as $HOME or $SCRATCH since they will not be resolved. For example, you might want to mount your scratch directory into a directory called output in your Shifter image. You can do this with a batch directive by including the line:
+
+
+#SBATCH --volume="/pscratch/sd/<first letter of username>/<username>:/output"
+To do multiple volume mounts, separate the mounts with a semi-colon. Also, note that Community File System (CFS) mounts should include /global in the beginning of the path. Here is an example that mounts the same CFS space in two locations inside the container:
+
+
+#SBATCH --volume="/global/cfs/cdirs/mpcc:/output;/global/cfs/cdirs/mpccc:/input"
+Extra permissions required to mount from $HOME
+
+Due to behavior of our $HOME filesystem metadata server, users will need to grant x permission for their top-level directory on $HOME and other directories they wish to mount to the user nobody. Please see our FAQ page for more details.
+
+Temporary Xfs Files for Optimizing IO¶
+Shifter also has the ability to create temporary xfs files for each node. These files are created on the Lustre file system, but because all of the metadata operations are taking place on a single node the IO is very fast. This is a good place to put temporary output, just remember to copy anything you want to keep to a permanent home at the end of the job. Users have also had success storing small databases that will be accessed frequently in these temporary directories. You can request the temporary files be created by adding this flag to your batch script:
+
+
+#SBATCH --volume="/pscratch/sd/<first letter of username>/<username>/tmpfiles:/tmp:perNodeCache=size=200G"
+This will create a xfs file with a 200 GB capacity for every node in the job and mount it at /tmp in the image.
+
+Tip
+
+If your job is frequently accessing many temporary files that are local to the node, you may find better performance writing these files to the xfs file.
+
+Environment Variables¶
+All environment variables defined in the calling process's environment are transferred into the image. However, any environment variables defined in the image description, e.g., Docker ENV-defined variables, will be sourced and will override those from the calling process.
+
+The --clearenv option can be pssed to Shifter to ignore the external environment. If --env-file=/path/to/env/file is specified, then environmental variables will be read from the file and set in the image environment. Lines in the env file starting with # or only containing white-space will be ignored. Quotes embedded in a variable name or value will be copied into the environment.
+
+Environment variables can also be set on the command line with shifter --env=<name>=<value> or shifter -e <name>=<value>. Multiple --env=<name>=<value> or -e <name>=<value> arguments can be specified to set specific environmental variables in the image environment.
+
+The order of precedence of the image environment is:
+
+LD_*, RTLD_*, TMPDIR in the external environment are unset.
+All remaining environment variables in the external environment are set in the image (unless --clearenv is specified).
+Any environment variables specified in the image definition are set.
+Any environment variables specified in the optional env file are set.
+Any environment variables specified by --env options are set.
+Any environment variables modified/set by active Shifter modules.
+Any environment variables modified/set by the site Shifter configuration.
+Running multiple Shifter containers¶
+You can also run several different Shifter images inside of a single job. The script below starts two images. The first runs only once and uses the workflow_manager image. Inside this image it runs a lightweight manager program that mostly sleeps and occasionally monitors the other jobs. The second image runs 4096 times (on 32 cores for 128 nodes) and uses the workflow image. It runs the worker.sh script that checks in with the workflow manager and runs the heavy workload. The second image also binds a directory on our Lustre scratch file system to a predefined directory inside the image.
+
+
+#!/bin/bash
+#SBATCH --image=docker:workflow:latest
+#SBATCH -N 128
+#SBATCH -q regular
+#SBATCH -C cpu
+
+tasks = $(( 128 * 32 ))
+
+srun -N 1 -n 1 shifter --image=docker:workflow_manager:latest workflow_man.sh &
+srun -N 128 -n $tasks shifter --volume=$SCRATCH/path/to/my/data:/data/in worker.sh
+
+
+
+
+### JM: Global common filesystem
+Moving your conda setup to /global/common/software¶
+For better performance or if you plan to run your application at scale, we recommend installing your custom environment in your project's directory on /global/common/software:
+
+
+module load conda
+conda create --prefix /global/common/software/myproject/myenv python=3.8
+conda activate /global/common/software/myproject/myenv
+conda install numpy scipy astropy
+You can also change your default conda location to /global/common/software. An easy way to do this is to change the settings in your $HOME/.condarc file
+
+
+envs_dirs:
+  - /global/common/software/<your project>/conda
+
+pkgs_dirs:
+  - /global/common/software/<your project>/conda
+
+channels:
+ - defaults
+This will place all of your environments in this directory by default, and you won't have to worry about specifying the full prefix to your environment when installing it or activating it.
+
+We are aware the project directory quotas on /global/common/software are small. Please open a ticket at help.nersc.gov if you need more space.
+
+
+
+
+### JM: Python in Shifter
+How to use Python in Shifter¶
+Do you:
+
+want better performance at large scales (10+ nodes) by improving library load times?
+want a more portable way to manage your Python stack?
+want an environment that is easy to use on a login node, compute node, or as a Jupyter kernel?
+want much more control over your software stack, for stability or legacy software reasons?
+feel tired of conda environments that make it hard to stay under your filesystem quota?
+If any of these apply to you, you may find Shifter a good solution for using Python at NERSC.
+
+We performed a small benchmarking study to compare Python performance on $HOME, /global/common/software, and Shifter. We summarize the results here:
+
+Number of nodes	$HOME	/global/common/software	Shifter
+1	0m4.256s	0m3.894s	0m3.998s
+10	0m10.025s	0m4.891s	0m4.274s
+100	0m30.790s	0m17.392s	0m7.098s
+500	4m7.673s	0m48.916s	0m14.193s
+This benchmark example supports our recommendation that users consider using Shifter at jobsizes larger than 10 nodes. At large scale (100+ nodes), we strongly urge users to use Shifter. If Shifter is not an option, we suggest that users consider /global/common/software instead.
+
+Shifter¶
+At NERSC, our current container solution are Shifter and Podman-HPC. Below, we provide several example Python Dockerfiles intended to help get you started using Python in Shifter.
+
+You should be able to copy and use all of these Dockerfiles to build images on your own system, you will find instructions on building a container in our Building Shifter Images documentation.
+
+You will also find an mpi4py example on our main Shifter page and documentation on integrating Shifter with Jupyter kernels on our Using Shifter with Jupyter page.
+
+Example Python Dockerfiles¶
+Basic Python Dockerfile example¶
+First we'll demonstrate a basic container with Python. We'll make it easy by starting from an image where Python 3 is already installed. Note that we are using the latest tag, so if you require a different version, you will need to adjust this tag. We'll install numpy and scipy using pip. If your Python setup is relatively simple, you may find that pip will meet your package installation requirements within an image. If your setup is more complex or if you rely on packages that are only distributed via conda, you'll want to skip ahead to our next example.
+
+
+FROM docker.io/library/python:latest
+
+WORKDIR /opt
+
+RUN \
+    pip3 install            \
+        --no-cache-dir      \
+        numpy               \
+        scipy
+Using pip inside a container.
+
+Do not install dependencies with pip from within a running container. This will install the dependencies in your .local folder, making them visible to any container you might run, causing unwanted behavior as an installation contaminates another environment.
+
+Conda environment Dockerfile example¶
+For those of you who are used to conda environments, there are a few key concepts that you will find different in containers. First, you won't want to build and activate a separate custom environment. Instead, you'll just want to install the packages you need into the base environment and then make this environment available by adding it to your PATH. We suggest that each image be used for a single Python environment. (If you find yourself needing multiple conda environments in the same image, most likely you'll want multiple images.) To save space, you'll likely want to start with miniconda. In this example, we'll start from an image in which miniconda has already been installed. As in our previous example, we'll install numpy and scipy.
+
+
+FROM docker.io/continuumio/miniconda3:latest
+
+ENV PATH=/opt/conda/bin:$PATH
+
+RUN /opt/conda/bin/conda install numpy scipy
+Python GPU Dockerfile example¶
+If you plan to use Python on GPUs, you will likely find it easiest to start with an NVIDIA-provided image that includes CUDA and related libraries. This example demonstrates how to build an image to use Dask. In our example, we FROM on top of an NVIDIA CUDA base image. Note that in addition to base, NVIDIA also offers runtime and devel flavors of images.
+
+In this example, we use mamba to speed up the package installation process. You can also see that we attempt to shrink our image by deleting whatever we can when we're done. This will reduce the time it takes to upload to the registry and download via Shifter. Note however that the NVIDIA images, even the base image, are quite large.
+
+
+FROM nvidia/cuda:11.2.1-base-ubuntu20.04
+
+ENV DEBIAN_FRONTEND noninteractive
+
+WORKDIR /opt
+
+RUN \
+    apt-get update        && \
+    apt-get upgrade --yes && \
+    apt-get install --yes    \
+        wget                 \
+        vim              &&  \
+    apt-get clean all    &&  \
+    rm -rf /var/lib/apt/lists/*
+
+#install miniconda
+#pin to python 3.8 for rapids compatibility
+ENV installer=Miniconda3-py38_4.9.2-Linux-x86_64.sh
+
+RUN wget https://repo.anaconda.com/miniconda/$installer && \
+    /bin/bash $installer -b -p /opt/miniconda3          && \
+    rm -rf $installer
+
+ENV PATH=/opt/miniconda3/bin:$PATH
+
+#use mamba to speed up package resolution
+RUN /opt/miniconda3/bin/conda install mamba -c conda-forge -y
+
+RUN \
+    /opt/miniconda3/bin/mamba install \
+    dask-cuda \
+    dask-cudf \
+    ipykernel \
+    matplotlib \
+    seaborn \
+    -c rapidsai-nightly -c nvidia -c conda-forge -c defaults -y && \
+    /opt/miniconda3/bin/mamba clean -a -y
+If you have questions about any of these examples or about how to use Python in Shifter, we encourage you to check our How to use Shifter page or contact NERSC's online help desk.
+
+
+
+### JM: Nersc distributed JAX .slurm input file example. can be run with zero preparation beforehand
+
+#!/bin/bash -l
+#SBATCH --time=00:10:00
+#SBATCH --qos=debug
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=4
+#SBATCH --constraint=gpu
+#SBATCH --gpus-per-node=4
+#SBATCH --job-name=jax_distributed_container_demo
+#SBATCH --output=output_%j.out
+#SBATCH --account=nstaff
+#SBATCH --image=ghcr.io/nvidia/jax:jax
+
+# Run script
+srun shifter --module=gpu python3 ./distributed.py
+
+
+
+### JM: Setting up h5py with parallel support on NERSC including building from scratch
+
+Parallel I/O with h5py¶
+You can use h5py for either serial or parallel I/O.
+
+For more general information about HDF5 at NERSC please see the NERSC HDF5 page.
+
+If you would like to use h5py for parallel I/O, you have two choices:
+
+build h5py against mpi4py in your custom conda environment;
+use the nersc-h5py conda environment that we provide, or clone it if you want to add other packages.
+Both options are based on packages built against the GNU compiler and Cray MPICH, so if you want a build with a different compiler or MPI library, you'll have to recompile both mpi4py and h5py from scratch.
+
+HDF5 File Locking
+
+You will have to disable file locking if you are writing to a filesystem other than $SCRATCH.
+
+
+export HDF5_USE_FILE_LOCKING=FALSE
+Pre-built h5py conda environment¶
+To use the conda environment that we provide:
+
+
+module load python
+conda activate nersc-h5py
+And you are good to go; you can test it with a smoketest, see below.
+
+You cannot install other packages in that conda environment, though, since it's read-only, but you can clone it and work on it:
+
+
+module load python
+conda create --name h5pyenv --clone nersc-h5py
+conda activate h5pyenv
+
+conda install ...
+Building h5py from source¶
+Build h5py (and mpi4py) from source at NERSC with support for multinode parallel IO using cray-hdf5-parallel and cray-mpich. These instructions (adapted from the h5py documentation) assume you are starting from the NERSC default environment with at least the PrgEnv-gnu and cray-mpich modules already loaded.
+
+First, load the conda and cray-hdf5-parallel modules:
+
+
+module load cray-hdf5-parallel
+module load conda
+Create and activate a conda environment with h5py dependencies (except for mpi4py which we'll build from source in the next step):
+
+
+conda create -n h5pyenv python numpy cython pkgconfig setuptools
+conda activate h5pyenv
+Build mpi4py from source with the cray compiler wrapper to include support for multinode parallel communication at NERSC:
+
+
+MPICC="cc -shared" pip install --force-reinstall --no-cache-dir --no-binary=mpi4py mpi4py
+Build h5py from source with the cray compiler wrapper to include support for multinode parallel IO at NERSC:
+
+
+HDF5_MPI=ON CC=cc pip install -v --force-reinstall --no-cache-dir --no-binary=h5py --no-build-isolation --no-deps h5py
+We used a few pip install flags to help achieve the desired outcome in this case. Not all were strictly necessary but they may come in handy in case you run into any issues.

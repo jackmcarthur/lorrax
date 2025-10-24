@@ -1,0 +1,58 @@
+## ISDF + GW (COHSEX) Overview
+
+This repository implements an efficient GW workflow accelerated by Interpolative Separable Density Fitting (ISDF). It reads plane-wave DFT wavefunctions (WFN.h5) and computes quasiparticle corrections in the static COHSEX limit, with a path toward full-frequency GW.
+
+- **Input**: DFT wavefunctions on a plane-wave grid, symmetry maps, and k-point sampling
+- **Core idea**: Replace dense charge-density products with a compact ISDF basis defined by centroids r_mu
+- **Outcome**: Exchange and screened-exchange self-energy matrix elements and band-edge corrections
+
+### High-level pipeline
+
+1. Charge density from selected bands → choose ISDF points r_mu via k-means/CVT
+2. Read wavefunctions cnk(G), FFT to real space psi_nk(r)
+3. For each q, construct zeta_q,mu(r) by solving C_q zeta_q = Z_q using least-squares
+4. Compute V_q,mu,nu from zeta_q,mu in G-space with the Coulomb kernel v_q(G)
+5. Build Green’s function G and (optionally) chi0 and screened interaction W
+6. Form sigma_X/SX/COH and project to band representation Sigma_kij
+
+See formalism details in formalism.md. For runnable examples, see examples/.
+
+### API reference (Markdown-only)
+
+Generated Markdown lives under `docs/api/`.
+
+Generate locally (no server):
+
+```bash
+uv add pdoc  # once per environment
+uv run -- bash scripts/gen_api_docs.sh
+```
+
+Then browse the `.md` files in `docs/api/` in your editor or on GitHub.
+
+### Key modules
+
+- `src/isdf/gw_isdf/cohsex_jax.py`: COHSEX driver (JAX, sharded)
+- `src/isdf/gw_isdf/w_isdf.py`: static screening and chi0 helpers
+- `src/isdf/isdf_init/kmeans_isdf.py`: centroid selection
+- `src/isdf/common/wfnreader.py`: wavefunction I/O
+
+### Getting started
+
+1. Create the environment (uv recommended) and run tests
+2. Provide WFN.h5 and centroids
+3. Run the COHSEX driver
+
+See the root README for full instructions.
+
+### Root scripts for quick runs
+
+- Debug (fast, <10s, uses `tests/cohsex_debug`):
+  - `python run_cohsex_jax_debug.py` → JAX pipeline
+  - `python run_cohsex_isdf_debug.py` → legacy ISDF pipeline
+- Prod (minutes on a laptop, uses `tests/cohsex_prod`):
+  - `python run_cohsex_jax_prod.py`
+  - `python run_cohsex_isdf_prod.py`
+
+Pass `--input <file>` to override the default test inputs.
+

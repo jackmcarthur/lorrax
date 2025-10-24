@@ -1,0 +1,20 @@
+services:
+  isdf:
+    image: isdf-gpu
+    working_dir: /workspace/ISDF_MB
+    volumes:
+      - .:/workspace/ISDF_MB
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    # GPU request (Compose v2+; if not supported, use `docker compose run --gpus all`)
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    command: sleep infinity
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]

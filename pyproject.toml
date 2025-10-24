@@ -1,0 +1,77 @@
+[project]
+name = "isdf_gw"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "jax-finufft",
+    "cupy-cuda13x>=13.6.0",
+    "h5py>=3.14.0",
+    "jax[cuda13]>=0.7.2",
+    "jaxlib>=0.7.2",
+    "matplotlib>=3.10.3",
+    "mkdocs>=1.6.1",
+    "mkdocs-material>=9.6.20",
+    "mkdocstrings>=0.30.1",
+    "mkdocstrings-python>=1.18.2",
+    "numpy>=2.3.1",
+    "scipy>=1.16.0",
+    "xmlschema>=4.1.0",
+    "xsdata[cli]>=25.7",
+]
+
+[project.scripts]
+cohsex_isdf = "isdf.gw_isdf.cohsex_isdf:main"
+kmeans_isdf = "isdf.isdf_init.kmeans_isdf:main"
+bse_isdf = "isdf.bse_isdf.bse_isdf:main"
+load_psp = "isdf.psp.load_psp:main"
+load_upf = "isdf.psp.load_upf:main"
+
+[tool.uv.sources]
+jax-finufft = { git = "https://github.com/flatironinstitute/jax-finufft", rev = "main" }
+finufft = { git = "https://github.com/flatironinstitute/finufft", rev = "master" }
+
+[tool.uv]
+no-binary-package = ["jax-finufft", "finufft", "cufinufft","numpy"]
+package = true
+
+[tool.uv.extra-build-dependencies]
+jax-finufft = ["scikit-build-core>=0.11", "cmake>=3.26", "ninja"]
+finufft     = ["scikit-build-core>=0.11", "cmake>=3.26", "ninja"]
+
+# Tell CMake exactly where nvcc is and enable CUDA build
+[tool.uv.extra-build-variables.jax-finufft]
+CMAKE_CUDA_COMPILER = "/usr/local/cuda/bin/nnvcc"  # FIX THIS PATH (see note below)
+CUDACXX             = "/usr/local/cuda/bin/nvcc"   # same path as above
+CUDAHOME            = "/usr/local/cuda"
+CMAKE_ARGS          = "-DJAX_FINUFFT_USE_CUDA=OFF -DCMAKE_CUDA_ARCHITECTURES=native"
+
+[tool.uv.extra-build-variables.finufft]
+CMAKE_CUDA_COMPILER = "/usr/local/cuda/bin/nvcc"
+CUDACXX             = "/usr/local/cuda/bin/nvcc"
+CUDAHOME            = "/usr/local/cuda"
+CMAKE_ARGS          = "-DJAX_FINUFFT_USE_CUDA=OFF -DCMAKE_CUDA_ARCHITECTURES=native -DCMAKE_CUDA_FLAGS=-DCUFFT_PARSE_ERROR=0\n -DCUFFT_LICENSE_ERROR=0\n -DCUFFT_INCOMPLETE_PARAMETER_LIST=0"
+
+[tool.uv.workspace]
+members = [
+    
+]
+
+[dependency-groups]
+dev = [
+    "flake8>=7.3.0",
+    "pdoc>=15.0.4",
+    "pydoc-markdown>=4.8.2",
+]
+jax = [
+    "jax[cuda13]>=0.7.2",
+    "jaxlib>=0.7.2",
+]
+build = [
+    "scikit-build-core>=0.11.0",
+    "cmake>=4.0.0",
+    "ninja>=1.10.0",
+    "pybind11>=3.0.0",
+    "nanobind>=2.0.0",
+]
