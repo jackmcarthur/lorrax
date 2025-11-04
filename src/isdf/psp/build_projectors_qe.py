@@ -157,11 +157,7 @@ def qe_real_sph_harmonics(l: int, vectors: np.ndarray) -> np.ndarray:
     return ylm_all[:, start:end].T
 
 
-def qe_complex_sph_harmonics(l: int, vectors: np.ndarray) -> np.ndarray:
-    """Return complex Y_{ℓm} (m=-ℓ..ℓ) using QE's real-harmonic convention."""
-    real = qe_real_sph_harmonics(l, vectors)
-    U_l = U_complex_from_real(l)
-    return U_l @ real
+# Removed: qe_complex_sph_harmonics (unused in production)
 
 
 # --------------------------
@@ -423,74 +419,7 @@ def _form_factors_qe(pseudo, K_norm: np.ndarray, cell_volume: float) -> Dict[Tup
     return result
 
 
-def build_species_rows_qe(
-    pseudo,
-    K_norm: np.ndarray,
-    Omega_dicts: List[Dict[float, np.ndarray]],
-    cell_volume: float,
-    use_spinor: bool = True,
-):
-    """Construct QE-style species projector rows (without structure factors)."""
-    ppnl = getattr(pseudo, 'pp_nonlocal', None)
-    betas = list(getattr(ppnl, 'pp_beta', [])) if ppnl is not None else []
-    if not betas:
-        return (
-            np.zeros((0, 2 if use_spinor else 1, 0), dtype=np.complex128),
-            np.zeros((0,), dtype=np.int32),
-            np.zeros((0,), dtype=np.int32),
-            np.zeros((0,), dtype=float),
-            np.zeros((0,), dtype=np.int32),
-            np.zeros((0, 0), dtype=np.complex128),
-        )
-
-    Fdict = _form_factors_qe(pseudo, K_norm, cell_volume)
-    try:
-        D_mat = np.asarray(ppnl.pp_dij.value, dtype=float)
-        nproj = int(getattr(pseudo.pp_header, 'number_of_proj', len(betas)))
-        D_mat = D_mat.reshape(nproj, nproj)
-    except Exception:
-        raise RuntimeError("Pseudopotential missing PP_DIJ matrix for nonlocal term")
-
-    rows: List[np.ndarray] = []
-    beta_idx_rows: List[int] = []
-    ell_rows: List[int] = []
-    j_rows: List[float] = []
-    mj_slot_rows: List[int] = []
-
-    for beta_idx, beta in enumerate(betas, start=1):
-        l = int(getattr(beta, 'lll', getattr(beta, 'angular_momentum', 0)))
-        F_on_K = Fdict.get((l, beta_idx))
-        if F_on_K is None:
-            continue
-        j_val = float(getattr(beta, 'jjj', l + 0.5))
-        if use_spinor:
-            Omega = Omega_dicts[l].get(j_val)
-            if Omega is None:
-                raise RuntimeError("Missing spinor harmonics for j = {}".format(j_val))
-            for mj in range(Omega.shape[1]):
-                row = np.stack(
-                    [(-1j) ** l * F_on_K * Omega[0, mj, :],
-                     (-1j) ** l * F_on_K * Omega[1, mj, :]],
-                    axis=0,
-                )
-                rows.append(row)
-                beta_idx_rows.append(beta_idx - 1)
-                ell_rows.append(l)
-                j_rows.append(j_val)
-                mj_slot_rows.append(mj)
-        else:
-            Y_complex = qe_complex_sph_harmonics(l, np.zeros((0, 3)))  # placeholder
-            raise NotImplementedError("Scalar-relativistic path not implemented in QE projector builder")
-
-    Z = np.asarray(rows, dtype=np.complex128)
-    return (
-        Z,
-        np.asarray(beta_idx_rows, dtype=np.int32),
-        np.asarray(ell_rows, dtype=np.int32),
-        np.asarray(j_rows, dtype=float),
-        np.asarray(mj_slot_rows, dtype=np.int32),
-        np.asarray(D_mat, dtype=np.complex128),
-    )
+# Removed: build_species_rows_qe (not used by production pipeline)
 
 
 # --------------------------
@@ -742,15 +671,7 @@ def real_harmonic_slot(l: int, m_label: int) -> int:
     return -2 * m_label
 
 
-def per_type_beta_m_slots(pseudo) -> List[tuple[int, int, int]]:
-    """Return ordered list of (beta_index, ℓ, m_slot) in QE projector order."""
-    entries: List[tuple[int, int, int]] = []
-    betas = list(getattr(getattr(pseudo, 'pp_nonlocal', None), 'pp_beta', []))
-    for beta_idx, beta in enumerate(betas, start=1):
-        l = int(getattr(beta, 'lll', getattr(beta, 'angular_momentum', 0)))
-        for mslot in range(0, 2 * l + 1):
-            entries.append((beta_idx, l, mslot))
-    return entries
+# Removed: per_type_beta_m_slots (unused)
 
 
 def build_E_blocks_full(pseudo) -> Dict[int, np.ndarray]:
@@ -940,10 +861,8 @@ __all__ = [
     "E_spin_blocks_for_atom_l",
     "E_all_l_for_atom",
     "qe_real_sph_harmonics",
-    "qe_complex_sph_harmonics",
-    "build_species_rows_qe",
+    "qe_real_sph_harmonics_with_grad",
     "real_harmonic_slot",
-    "per_type_beta_m_slots",
     "build_E_blocks_full",
     "compute_type_projectors_real",
     "precompute_projector_splines",

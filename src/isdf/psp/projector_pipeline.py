@@ -647,16 +647,34 @@ def compute_V_NL_velocity_k_numeric(
     vNL = jnp.zeros((3, nb, nb), dtype=jnp.complex128)
 
     for ic in range(3):
-        d_cart = _np.zeros((3,), dtype=float); d_cart[ic] = float(h)
-        d_crys = d_cart @ Binv
-        Kp_crys = K_crys_np + d_crys[None, :]
-        Km_crys = K_crys_np - d_crys[None, :]
-        Kp_cart = Kp_crys @ B
-        Km_cart = Km_crys @ B
+        # Central difference with Richardson extrapolation for stability
+        h1 = float(h)
+        h2 = 0.5 * h1
 
-        Zp, _, _ = build_beta_rows_with_grad(wfn_k, Gk_crys, Kp_crys, Kp_cart, plan, cell_volume)
-        Zm, _, _ = build_beta_rows_with_grad(wfn_k, Gk_crys, Km_crys, Km_cart, plan, cell_volume)
-        dZ = (Zp - Zm) / (2.0 * float(h))  # (R, nG)
+        # Step h1
+        d_cart1 = _np.zeros((3,), dtype=float); d_cart1[ic] = h1
+        d_crys1 = d_cart1 @ Binv
+        Kp1_crys = K_crys_np + d_crys1[None, :]
+        Km1_crys = K_crys_np - d_crys1[None, :]
+        Kp1_cart = Kp1_crys @ B
+        Km1_cart = Km1_crys @ B
+        Zp1, _, _ = build_beta_rows_with_grad(wfn_k, Gk_crys, Kp1_crys, Kp1_cart, plan, cell_volume)
+        Zm1, _, _ = build_beta_rows_with_grad(wfn_k, Gk_crys, Km1_crys, Km1_cart, plan, cell_volume)
+        dZ1 = (Zp1 - Zm1) / (2.0 * h1)  # (R, nG)
+
+        # Step h2
+        d_cart2 = _np.zeros((3,), dtype=float); d_cart2[ic] = h2
+        d_crys2 = d_cart2 @ Binv
+        Kp2_crys = K_crys_np + d_crys2[None, :]
+        Km2_crys = K_crys_np - d_crys2[None, :]
+        Kp2_cart = Kp2_crys @ B
+        Km2_cart = Km2_crys @ B
+        Zp2, _, _ = build_beta_rows_with_grad(wfn_k, Gk_crys, Kp2_crys, Kp2_cart, plan, cell_volume)
+        Zm2, _, _ = build_beta_rows_with_grad(wfn_k, Gk_crys, Km2_crys, Km2_cart, plan, cell_volume)
+        dZ2 = (Zp2 - Zm2) / (2.0 * h2)
+
+        # Richardson extrapolation (O(h^2) -> O(h^4))
+        dZ = (4.0 * dZ2 - dZ1) / 3.0
 
         offset = 0
         acc = jnp.zeros((nb, nb), dtype=jnp.complex128)
