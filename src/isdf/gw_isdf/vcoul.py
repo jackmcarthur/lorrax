@@ -6,6 +6,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from functools import partial
 
 from ..common import Meta
+from ..common.chi_from_dipole import compute_S_omega  # optional import for callers that pass S(ω)
 
 
 def wrap_points_to_voronoi(randcart, bvec, nmax=1):
@@ -211,3 +212,47 @@ def compute_q0_averages(wfn, epshead, meta: Meta):
 	vc0_mean, wcoul0 = minibz_mc(jax.random.PRNGKey(0), bvec, meta.nkx, meta.nky, meta.nkz, zk, jnp.asarray(epshead.real, dtype=jnp.float64))
 	#fact = jnp.float64(1.0 / wfn.cell_volume)
 	return (vc0_mean).astype(jnp.complex128), (wcoul0).astype(jnp.complex128)
+
+
+def compute_wcoul0_with_S(bvec: jnp.ndarray,
+                          nkx: int,
+                          nky: int,
+                          nkz: int,
+                          S_cart: jnp.ndarray,
+                          nsamples: int = 2_500_000) -> jnp.complex128:
+    """Average wcoul0 over Voronoi-cell q using small-q tensor S(ω).
+
+    Computes wcoul0 = ⟨ v(q) · (1 - v(q) · q^T S q)^{-1} ⟩_{q∈Voronoi cell}
+    with 2D truncation consistent with vcoul setup.
+
+    Parameters
+    ----------
+    bvec : (3,3) reciprocal lattice matrix (crystal→Cartesian), scaled by blat
+    nkx,nky,nkz : integers defining the k-grid extents
+    S_cart : (3,3) complex128, small-q tensor in Cartesian components at chosen ω
+    nsamples : number of Monte Carlo samples in the cell
+    """
+    bvec = jnp.asarray(bvec, dtype=jnp.float64)
+    S = jnp.asarray(S_cart, dtype=jnp.complex128)
+    zc = jnp.pi / bvec[2, 2]
+
+    @jax.jit
+    def _average(key):
+        # Sample random q in Cartesian space covering Voronoi region of the mini-BZ cell
+        randvals = jax.random.uniform(key, (nsamples, 3), dtype=jnp.float64)
+        randcart = (bvec.T @ randvals.T).T
+        wrapped_cart = wrap_points_to_voronoi(randcart, bvec, nmax=1)
+        # Scale by grid to Voronoi cell of the Gamma-centered tile
+        kgrid = jnp.asarray((nkx, nky, nkz), dtype=jnp.float64)
+        randqcart = (bvec.T @ (jnp.diag(1.0 / kgrid) @ jnp.linalg.inv(bvec.T)) @ wrapped_cart.T).T
+        # 2D truncation
+        kxy = jnp.linalg.norm(randqcart[:, :2], axis=1)
+        kz = randqcart[:, 2]
+        vq = 4.0 * jnp.pi / jnp.einsum('ij,ij->i', randqcart, randqcart)
+        vq = vq * 2.0 * (1.0 - jnp.exp(-zc * kxy) * jnp.cos(kz * zc))  # 8π/|q|^2 * f2d
+        # q^T S q (complex)
+        Sq = jnp.einsum('qi,ij,qj->q', randqcart, S, randqcart)
+        w = vq.astype(jnp.complex128) / (1.0 - vq.astype(jnp.complex128) * Sq)
+        return jnp.mean(w)
+
+    return _average(jax.random.PRNGKey(0)).astype(jnp.complex128)

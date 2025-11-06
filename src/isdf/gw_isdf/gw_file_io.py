@@ -27,8 +27,9 @@ def write_sigma_to_file(sigma_kij, filename="eqp0.dat", hartree_kij=None):
 				real = float(sigma_kij[k, n, n].real)
 				imag = float(sigma_kij[k, n, n].imag)
 				if hartree_kij is not None:
-					hv = float(np.real(hartree_kij[k, n, n]))
-					f.write(f"n={n:<3} sigX={real:>15.6f} + {imag:>15.6f}i  VH={hv:>15.6f}\n")
+					hv_re = float(np.real(hartree_kij[k, n, n]))
+					hv_im = float(np.imag(hartree_kij[k, n, n]))
+					f.write(f"n={n:<3} sigX={real:>15.6f} + {imag:>15.6f}i  VH={hv_re:>15.6f} + {hv_im:>15.6f}i\n")
 				else:
 					f.write(f"n={n:<3} {real:>15.6f} + {imag:>15.6f}i\n")
 

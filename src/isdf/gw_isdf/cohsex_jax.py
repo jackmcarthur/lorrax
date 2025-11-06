@@ -620,15 +620,17 @@ def compute_sigma_pipeline_jax(
 	# Hartree from q=0 component
 	# rho_mu = sum_{k,n,s} |psi_l(k,n,s,mu)|^2, shape (n_rmu,)
 	# Density overlap per centroid, normalized by cell volume
-	rho_mu = jnp.einsum('knsx,knsx->x', psi_l_rmu_Y, jnp.conj(psi_l_rmu_Y), optimize=True)
-	rho_mu = rho_mu #* fft_vol_au / jnp.asarray(nk_tot, dtype=jnp.float64) # bz integration factor
+	#rho_mu = jnp.sum(jnp.conj(psi_l_rmu_Y) * psi_l_rmu_Y, axis=(0,1,2))
+	rho_mu = jnp.einsum('knsx,knsx->x', jnp.conj(psi_l_rmu_Y), psi_l_rmu_Y, optimize=True)
+	rho_mu = rho_mu * 1.0 / jnp.asarray(nk_tot, dtype=jnp.float64) # bz integration factor
 	# V0(mu,nu) = V_mu_nu at (q=0)
 	# Vrho(mu) = V0(mu,nu) @ rho(nu); implicit psum over Y when lowered
-	Vrho_mu = jnp.einsum('xy,y->x', V0_munu, rho_mu, optimize=True)
+	#Vrho_mu = jnp.matmul(V0_munu, rho_mu) 
+	Vrho_mu =jnp.einsum('xy,y->x', V0_munu, rho_mu, optimize=True)
 	# psi_overlap(k,m,n,mu) = sum_s psi*_mk(μ) psi_nk(μ) using right X-sharded copy
-	psi_overlap = jnp.einsum('kmsx,knsx->kmnx', jnp.conj(psi_r_rmu_X), psi_r_rmu_X, optimize=True)
+	#psi_overlap = jnp.einsum('kmsx,knsx->kmnx', jnp.conj(psi_r_rmu_X), psi_r_rmu_X, optimize=True)
 	# Hartree matrix elements per k: sum_mu psi_overlap * Vrho_mu
-	hartree_kmn = jnp.einsum('kmnx,x->kmn', psi_overlap, Vrho_mu, optimize=True)
+	hartree_kmn = jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_r_rmu_X), Vrho_mu, psi_r_rmu_X, optimize=True)
 	return sigma_kij, hartree_kmn
 
 
@@ -952,7 +954,7 @@ def main(argv=None):
 
 			# get V_q=0,munu with G=0 component zeroed for Hartree potential (to compare to dft)
 			if q_idx == 0:
-				V_qfullG_noG0 = V_qfullG.at[0].set(0.0)
+				V_qfullG_noG0 = compute_V_qfullG_for_q(wfn, qvec_wrapped, vcoul_comps, 0.0, do_Dmunu=bispinor, sys_dim=sys_dim)
 				v_q0_noG0_munu = compute_v_munu_from_zeta(
 					zeta_q,
 					jnp.asarray(qvec, dtype=jnp.float64),
@@ -1014,10 +1016,10 @@ def main(argv=None):
 		valence_slice = slice(b0, b2)
 		nb_valence = int(b2 - b0)
 		nb_sigma = int(b3 - b0)
-		psi_l = psi_l_full[:, valence_slice, :, :]
-		psi_lT = psi_lT_full[:, :, :, valence_slice]
-		psi_r = psir_X[:, :nb_sigma, :, :]
-		psi_rT = psirT_Y[:, :, :, :nb_sigma]
+		psi_l = psi_l_full#[:, valence_slice, :, :]
+		psi_lT = psi_lT_full#[:, :, :, valence_slice]
+		psi_r = psir_X#[:, :nb_sigma, :, :]
+		psi_rT = psirT_Y#[:, :, :, :nb_sigma]
 
 		# Persist restart artifacts (store full-sized left/right; trim on load/use)
 		write_labeled_arrays_to_h5(
@@ -1050,16 +1052,16 @@ def main(argv=None):
 			taggedarray_filename, mesh_xy
 		)
 		# Preserve full-sized left wavefunctions (b3) and derive trimmed views
-		psi_l_full = psi_l
-		psi_lT_full = psi_lT
-		valence_slice = slice(b0, b2)
-		nb_valence = int(b2 - b0)
-		nb_sigma = int(b3 - b0)
-		psi_l = psi_l_full[:, valence_slice, :, :]
-		psi_lT = psi_lT_full[:, :, :, valence_slice]
-		psi_r = psi_r[:, :nb_sigma, :, :]
-		psi_rT = psi_rT[:, :, :, :nb_sigma]
-		nb_full = int(psi_l_full.shape[1])
+		# psi_l_full = psi_l
+		# psi_lT_full = psi_lT
+		# valence_slice = slice(b0, b2)
+		# nb_valence = int(b2 - b0)
+		# nb_sigma = int(b3 - b0)
+		# psi_l = psi_l_full[:, valence_slice, :, :]
+		# psi_lT = psi_lT_full[:, :, :, valence_slice]
+		# psi_r = psi_r[:, :nb_sigma, :, :]
+		# psi_rT = psi_rT[:, :, :, :nb_sigma]
+		# nb_full = int(psi_l_full.shape[1])
 		V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0]
 	elif restart and x_only:
 		# Same restart flow for X-only
@@ -1075,17 +1077,6 @@ def main(argv=None):
 		V_qmunu, S_qmunu, psi_lT, psi_l, psi_r, psi_rT, enk_l, enk_r, v_q0_noG0_munu, G0_mu_nu = load_labeled_arrays_from_h5(
 			taggedarray_filename, mesh_xy
 		)
-		# Preserve full-sized left wavefunctions (b3) and derive trimmed views
-		psi_l_full = psi_l
-		psi_lT_full = psi_lT
-		valence_slice = slice(b0, b2)
-		nb_valence = int(b2 - b0)
-		nb_sigma = int(b3 - b0)
-		psi_l = psi_l_full[:, valence_slice, :, :]
-		psi_lT = psi_lT_full[:, :, :, valence_slice]
-		psi_r = psi_r[:, :nb_sigma, :, :]
-		psi_rT = psi_rT[:, :, :, :nb_sigma]
-		nb_full = int(psi_l_full.shape[1])
 		V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0]
 
 	# Add JAX steps here:
@@ -1096,8 +1087,6 @@ def main(argv=None):
 		enk_v_arr = jnp.asarray(getattr(enk_l, 'data', enk_l))
 		enk_c_arr = jnp.asarray(getattr(enk_r, 'data', enk_r))
 		print(psi_lT.shape, psi_l.shape, psi_r.shape, psi_rT.shape)
-		print(psi_lT[0,0,1,2]-psi_l[0,2,0,1])
-		print(psi_rT[0,0,1,2]-psi_r[0,2,0,1])
 		# Four wavefunction copies and shardings for low-comm G and Sigma construction:
 		# psi_lT: (nk, ns, rmu, nb) XT_shard; psi_l: (nk, nb, ns, rmu) Y_shard
 		# psi_r:  (nk, nb, ns, rmu) X_shard;  psi_rT: (nk, ns, rmu, nb) YT_shard
@@ -1112,6 +1101,7 @@ def main(argv=None):
 		chiw_secs = time.perf_counter() - _t_chiw_start
 		# Compute static W under k_XY sharding (S_qmunu included but unused for now)
 		#W_q = get_static_w_q_jax(V_qmunu, chi0, S_qmunu, meta, mesh_xy)
+
  
 	# Prepare V_mu_nu (nrmu1,nrmu2,nkx,nky,nkz) from LabeledArray V_qmunu data
 	# V_qmunu has axes [nfreq, npol1, npol2, nkx, nky, nkz, nrmu1, nrmu2]
@@ -1124,8 +1114,13 @@ def main(argv=None):
 	# After W is computed, the trimmed views (psi_l, psi_lT, psi_r, psi_rT)
 	# are already defined; preserve psi_l_full/psi_lT_full as b3-sized copies.
 	print("shapes of psi_l and psi_r: ", psi_l.shape, psi_r.shape)
-	sigma_slice = slice(b0, b3)
-	nb_full = int(psi_l_full.shape[1])
+
+	valence_slice = slice(b0, b2)
+	nb_sigma = int(b3 - b0)
+	psi_l = psi_l[:, valence_slice, :, :]
+	psi_lT = psi_lT[:, :, :, valence_slice]
+	psi_r = psi_r[:, :nb_sigma, :, :]
+	psi_rT = psi_rT[:, :, :, :nb_sigma]
 
 	# Define shardings
 	XT_shard = NamedSharding(mesh_xy, P(None, None, 'x', None))
@@ -1161,69 +1156,81 @@ def main(argv=None):
 	hartree_kbar_ij_jax.block_until_ready()
 	pipe_secs = time.perf_counter() - _t_pipe_start
 
+	rho_k_mu = jnp.einsum('knsx,knsx->x', jnp.conj(psi_l), psi_l, optimize=True)
+	vhartree_k_mu = jnp.einsum('xy,y->x', v_q0_noG0_munu, rho_k_mu, optimize=True)
+	hartree_kmn = jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_r), vhartree_k_mu, psi_r, optimize=True)
+	#rho_k_mu = jnp.transpose(rho_k_mu, (1,0)).reshape(-1,meta.nkx,meta.nky,meta.nkz)
+	#rho_R_mu = jnp.fft.ifftn(rho_k_mu, axes=(3,2,1), norm='ortho')
+	print(rho_k_mu[:4])
+	print(vhartree_k_mu[:4])
+	print(hartree_kmn[:4])
+
+
 	sigma_total_full = sigma_x_kbar_ij_jax #+ hartree_kbar_ij_jax
 	sigma_full_shape = sigma_total_full.shape
+
 	qp_band_start = int(b0)
 	qp_band_stop = int(b3)
 	kin_ion_path = params["kin_ion_file"]
 	kin_ion_full = load_kin_ion_submatrix(kin_ion_path, qp_band_start, qp_band_stop)
 
-	# Fixed reference gauge from initial Hamiltonian H0 = kin_ion + initial sigma_x
-	H0 = kin_ion_full + sigma_total_full
-	H0 = 0.5 * (H0 + jnp.conj(jnp.swapaxes(H0, -1, -2)))
-	_E0, U_fix0 = jax.vmap(jnp.linalg.eigh, in_axes=0)(H0)
-
-#@jax.jit
-	def sigma_iteration_step(sigma_full: jax.Array):
-		# Build current Hamiltonian and diagonalize
-		H_full = kin_ion_full + sigma_full
-		H_full = 0.5 * (H_full + jnp.conj(jnp.swapaxes(H_full, -1, -2)))
-		# Batched eigh over k
-		evals_full, U_full_raw = jax.vmap(jnp.linalg.eigh, in_axes=0)(H_full)
-		def align_unitaries(U_ref, U_full):
-			# M = U_ref^† U_full = W S V^†  => polar unitary Q = W V^†
-			def one_k(Ur, U):
-				M = jnp.conj(Ur).swapaxes(-1, -2) @ U
-				W, S, Vh = jnp.linalg.svd(M, full_matrices=False)
-				Q = W @ Vh  # unitary closest to M in Frobenius norm
-				return U @ jnp.conj(Q).swapaxes(-1, -2)  # rotate U toward reference
-			return jax.vmap(one_k)(U_ref, U_full)
-		# Align U to fixed gauge U_fix0
-		U_full = align_unitaries(U_fix0, U_full_raw)
-		# Rotate left wavefunctions explicitly: psi' = U psi, psi_T' = psi_T @ U^T
-		# Ensure we run under mesh context for inner constraints
-		with mesh_xy:
-			psi_full_rot = jnp.einsum('kij, kjab->kiab', U_full, psi_l_full, optimize=True)
-			psiT_full_rot = jnp.einsum('kij, kabj->kabi', U_full, psi_lT_full, optimize=True)
-			psi_val_rot = psi_full_rot[:, valence_slice, :, :]
-			psi_valT_rot = psiT_full_rot[:, :, :, valence_slice]
-
-			sigma_x_val, hartree_val = pipeline_jit(
-			psi_valT_rot,
-			psi_val_rot,
-			psi_r,
-			psi_rT,
-			V_mu_nu,
-			v_q0_noG0_munu,
-			meta.nkx, meta.nky, meta.nkz, meta.nk_tot, meta.nspinor,
-			float(wfn.cell_volume/np.prod(wfn.fft_grid)),
-			)
-		sigma_full_updated = sigma_x_val #+ hartree_val
-		#sigma_full_updated = sigma_full.at[:, sigma_slice, sigma_slice].set(sigma_total_block_local)
-		return sigma_full_updated, (
-			sigma_x_val,
-			hartree_val,
-			evals_full,
-			U_full,
-			H_full,
-		)
-
-	def residual_map(vec: jax.Array) -> jax.Array:
-		sigma_full = jnp.reshape(vec, sigma_full_shape)
-		sigma_next, _ = sigma_iteration_step(sigma_full)
-		return jnp.reshape(sigma_next - sigma_full, (-1,))
-
+	
 	if self_consistent:
+		# Fixed reference gauge from initial Hamiltonian H0 = kin_ion + initial sigma_x
+		H0 = kin_ion_full + sigma_total_full
+		H0 = 0.5 * (H0 + jnp.conj(jnp.swapaxes(H0, -1, -2)))
+		_E0, U_fix0 = jax.vmap(jnp.linalg.eigh, in_axes=0)(H0)
+
+		def sigma_iteration_step(sigma_full: jax.Array):
+			# Build current Hamiltonian and diagonalize
+			H_full = kin_ion_full + sigma_full
+			H_full = 0.5 * (H_full + jnp.conj(jnp.swapaxes(H_full, -1, -2)))
+			# Batched eigh over k
+			evals_full, U_full_raw = jax.vmap(jnp.linalg.eigh, in_axes=0)(H_full)
+			def align_unitaries(U_ref, U_full):
+				# M = U_ref^† U_full = W S V^†  => polar unitary Q = W V^†
+				def one_k(Ur, U):
+					M = jnp.conj(Ur).swapaxes(-1, -2) @ U
+					W, S, Vh = jnp.linalg.svd(M, full_matrices=False)
+					Q = W @ Vh  # unitary closest to M in Frobenius norm
+					return U @ jnp.conj(Q).swapaxes(-1, -2)  # rotate U toward reference
+				return jax.vmap(one_k)(U_ref, U_full)
+			# Align U to fixed gauge U_fix0
+			U_full = align_unitaries(U_fix0, U_full_raw)
+			# Rotate left wavefunctions explicitly: psi' = U psi, psi_T' = psi_T @ U^T
+			# Ensure we run under mesh context for inner constraints
+			with mesh_xy:
+				psi_full_rot = jnp.einsum('kij, kjab->kiab', U_full, psi_l_full, optimize=True)
+				psiT_full_rot = jnp.einsum('kij, kabj->kabi', U_full, psi_lT_full, optimize=True)
+				psi_val_rot = psi_full_rot[:, valence_slice, :, :]
+				psi_valT_rot = psiT_full_rot[:, :, :, valence_slice]
+
+				sigma_x_val, hartree_val = pipeline_jit(
+				psi_valT_rot,
+				psi_val_rot,
+				psi_r,
+				psi_rT,
+				V_mu_nu,
+				v_q0_noG0_munu,
+				meta.nkx, meta.nky, meta.nkz, meta.nk_tot, meta.nspinor,
+				float(wfn.cell_volume/np.prod(wfn.fft_grid)),
+				)
+			sigma_full_updated = sigma_x_val #+ hartree_val
+			#sigma_full_updated = sigma_full.at[:, sigma_slice, sigma_slice].set(sigma_total_block_local)
+			return sigma_full_updated, (
+				sigma_x_val,
+				hartree_val,
+				evals_full,
+				U_full,
+				H_full,
+			)
+
+		def residual_map(vec: jax.Array) -> jax.Array:
+			sigma_full = jnp.reshape(vec, sigma_full_shape)
+			sigma_next, _ = sigma_iteration_step(sigma_full)
+			return jnp.reshape(sigma_next - sigma_full, (-1,))
+
+
 		sigma_vec0 = jnp.reshape(sigma_total_full, (-1,))
 		sigma_vec_final, residual_hist, n_iters = crop_family_fixed_history_map(
 			residual_map,
@@ -1270,7 +1277,7 @@ def main(argv=None):
 
 	# Host copies for downstream I/O (keep qp eigenpairs for forthcoming steps)
 	sigma_x_kbar_ij = np.array(sigma_x_full)
-	hartree_kbar_ij = np.array(hartree_full)
+	hartree_kbar_ij = np.array(hartree_kbar_ij_jax)
 	H_qp_mnk_host = np.array(H_qp_mnk)
 	E_qp_mnk_host = np.array(E_full)
 	U_qp_mnk_host = np.array(U_full)
