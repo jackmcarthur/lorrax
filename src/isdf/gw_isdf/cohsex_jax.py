@@ -49,6 +49,7 @@ from ..common.load_wfns import read_Gvecs_to_devices, get_sharded_wfns, get_enk_
 from .get_windows import get_window_info
 from .w_isdf import get_chi0_jax, get_static_w_q_jax
 from .vcoul import compute_vcoul_comps_for_q, compute_V_qfullG_for_q, compute_q0_averages
+from ..common.chi_from_dipole import read_dipole_h5, compute_S_omega
 from .gw_file_io import (write_sigma_to_file, write_eqp_table, write_labeled_arrays_to_h5, 
                          read_labeled_arrays_from_h5, load_labeled_arrays_from_h5, 
                          save_restart_per_proc)
@@ -889,9 +890,40 @@ def main(argv=None):
 		####################################
 		# 1.) q=0 special handling then per-q on-demand vcoul data
 		####################################
-		# q=0 averages once
-		vc0_mean, wcoul0 = compute_q0_averages(wfn, jnp.asarray(0.2, dtype=jnp.float64), meta)
+		# q=0 averages once: try anisotropic wcoul0 from S(omega=0) via dipole.h5
+		S_cart_omega0 = None
+		dipole_path = os.path.join(input_dir, "dipole.h5")
+		if os.path.exists(dipole_path):
+			try:
+				# Read dipole.h5 and build occupations
+				dipole_cart, deltaE = read_dipole_h5(dipole_path)  # (3,nk,nb,nb), (nk,nb,nb)
+				nk_tot = int(sym.nk_tot)
+				nb = int(wfn.nbands)
+				nelec = int(wfn.nelec)
+				occ = np.zeros((nk_tot, nb), dtype=float)
+				occ[:, :max(0, min(nelec, nb))] = 1.0
+				f_nk = jnp.asarray(occ, dtype=jnp.float64)
+				omegas = jnp.asarray([0.0], dtype=jnp.float64)
+				S_all = compute_S_omega(
+					dipole_cart,
+					deltaE,
+					f_nk,
+					float(wfn.cell_volume),
+					int(sym.nk_tot),
+					int(wfn.nspin),
+					int(wfn.nspinor),
+					omegas,
+					eta=0.0,
+				)
+				S_cart_omega0 = S_all[0]
+			except Exception as e:
+				print(f"Warning: failed to compute S(0) from dipole.h5 at {dipole_path}: {e}")
+		else:
+			print(f"ERROR: dipole.h5 not found at {dipole_path}; falling back to isotropic model for wcoul0.")
+
+		vc0_mean, wcoul0 = compute_q0_averages(wfn, jnp.asarray(0.2, dtype=jnp.float64), meta, S_cart=S_cart_omega0)
 		print(f"V_q=0,G=0 from miniBZ monte carlo: {float(vc0_mean.real):.4f}")
+		print(f"W_q=0(G=G'=0) small-q avg: {float(wcoul0.real):.6f} + {float(wcoul0.imag):.6f}i")
 
 		####################################
 		# 1.5) Preprocess q-point mappings for efficient computation
@@ -964,40 +996,9 @@ def main(argv=None):
 					int(meta.nkx), int(meta.nky), int(meta.nkz),
 				)
 
-				# build dual basis and "head element" contributions
-				# equations: 
-				# --- Hermitian eigendecomposition: S = U Λ U^H  [Eq: S = U Λ U†]
-    			# eigh returns ascending eigenvalues; flip to descending for rank selection
-				S = compute_Sq_from_zeta(zeta_q)
-				lam, U = jnp.linalg.eigh(S)
-				idx = jnp.arange(lam.size - 1, -1, -1)
-				lam, U = lam[idx], U[:, idx]                   # lam: descending
-
-				# --- Rank selection by relative cutoff: keep λ_j / λ_1 >= tau_rel  [threshold on eigs]
-				lam_max = lam[0]
-				tau_rel = 1e-8
-				keep_mask = lam >= (tau_rel * lam_max)
-				Ur = U[:, keep_mask]
-				lamr = lam[keep_mask]
-
-				# --- Whitening transform on kept subspace: T = U_r Λ_r^{-1/2}  [Eq: Φ = Z T, Φ† Φ = I]
-				inv_sqrt_lamr = 1.0 / jnp.sqrt(lamr)
-				T = Ur * inv_sqrt_lamr  # broadcast columns: (M,r) = (M,r) * (r,)
-				# --- Orthonormalized basis on grid: Φ = Z T  [Eq: Φ = Z U_r Λ_r^{-1/2}]
-				Phi = zeta_q.T @ T
-				# --- Constant vector on grid (no weights): c = 1  [Eq: c_i = 1]
-				c = jnp.ones((zeta_q.shape[1],), dtype=zeta_q.dtype)
-				# --- Const overlaps in orthonormal basis: â = Φ^H c  [Eq: â = Φ† c]
-				a_hat = Phi.conj().T @ c
-				# --- Back to original basis: a = T â = U_r Λ_r^{-1/2} â  [Eq: a = S^+ s = U_r Λ_r^{-1} U_r† s]
-				G0_mu_nu = T @ a_hat
-				# --- Optional: residual check for representing the constant
-				# r = c - Φ â ; require ||r||/||c|| <= eps_const
-				if 1: #eps_const is not None:
-					r = c - Phi @ a_hat
-					rel = jnp.linalg.norm(r) / jnp.linalg.norm(c)
-					print(f"constant fn: {rel:.5e}")
-					# If needed in practice: tighten keep_mask until rel <= eps_const
+				# Head-direction vector u in ISDF index space (unnormalized):
+				# Use the real-space average over r of zeta_{q=0,mu}(r) as the G=0 component.
+				G0_mu_nu = jnp.mean(zeta_q, axis=1)
 
 
 			print(f"qpoint {iq_cpu} done")
@@ -1156,14 +1157,14 @@ def main(argv=None):
 	hartree_kbar_ij_jax.block_until_ready()
 	pipe_secs = time.perf_counter() - _t_pipe_start
 
-	rho_k_mu = jnp.einsum('knsx,knsx->x', jnp.conj(psi_l), psi_l, optimize=True)
-	vhartree_k_mu = jnp.einsum('xy,y->x', v_q0_noG0_munu, rho_k_mu, optimize=True)
-	hartree_kmn = jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_r), vhartree_k_mu, psi_r, optimize=True)
+	#rho_k_mu = jnp.einsum('knsx,knsx->x', jnp.conj(psi_l), psi_l, optimize=True)
+	#vhartree_k_mu = jnp.einsum('xy,y->x', v_q0_noG0_munu, rho_k_mu, optimize=True)
+	#hartree_kmn = jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_r), vhartree_k_mu, psi_r, optimize=True)
 	#rho_k_mu = jnp.transpose(rho_k_mu, (1,0)).reshape(-1,meta.nkx,meta.nky,meta.nkz)
 	#rho_R_mu = jnp.fft.ifftn(rho_k_mu, axes=(3,2,1), norm='ortho')
-	print(rho_k_mu[:4])
-	print(vhartree_k_mu[:4])
-	print(hartree_kmn[:4])
+	#print(rho_k_mu[:4])
+	#print(vhartree_k_mu[:4])
+	#print(hartree_kmn[:4])
 
 
 	sigma_total_full = sigma_x_kbar_ij_jax #+ hartree_kbar_ij_jax

@@ -30,13 +30,13 @@ We will construct (S^{\text{eff}}) either as the **head-only** tensor (S) or the
 ## B.1 ISDF head/wing projectors and Coulomb blocks
 
 * ISDF interpolation vectors: ({\zeta_\mu}*{\mu=1}^{\mu*{\max}}) at (q{=}0).
-* Define the **head direction** (no metric needed in collocation ISDF):
+* Define the **head direction** from the physical G{=}0 component of the ISDF vectors:
   [
-  u_\mu ;\equiv; \zeta_{\mu}(G{=}0),\qquad \hat u \equiv \frac{u}{|u|}.
+  u_\mu ;\equiv; \zeta_{\mu}(G{=}0)\quad\text{(unnormalized)}.
   ]
-* Projectors in the ISDF index space:
+* Projectors in the ISDF index space (no ad hoc normalization):
   [
-  P \equiv \hat u \hat u^\dagger,\qquad Q \equiv I - P.
+  P \equiv \frac{u\,u^\dagger}{u^\dagger u}\,,\qquad Q \equiv I - P.
   ]
 * Coulomb matrix in ISDF space at (q{=}0): (V \equiv [V_{\mu\nu}] = \langle \zeta_\mu|,v,|\zeta_\nu\rangle).
 
@@ -240,9 +240,11 @@ with band-exclusion by (\mathcal P_n) (skip rows/cols where (|E_m{-}E_n|<\vareps
 **(Optional) Head patch in the ISDF matrix**
 15) If you want ISDF-matrix (W_{q=0}) to carry this averaged head exactly, apply the **rank-1** update
 [
-W \leftarrow W + \Delta(\omega),\hat u \hat u^\dagger,\quad
-\Delta(\omega)=\big\langle W_{00}(\omega)\big\rangle_{\text{Vor}} - \hat u^\dagger W \hat u.
+W \leftarrow W + \alpha(\omega)\,u u^\dagger,\quad
+\alpha(\omega)=\frac{\big\langle W_{00}(\omega)\big\rangle_{\text{Vor}} - u^\dagger W u}{\big(u^\dagger u\big)^2}.
 ]
+
+Practical note: if you construct the truncated Coulomb so that the G{=}0 plane‑wave component is explicitly zeroed when forming v_q(G), then the contractions \(\sum_G \zeta^*_{\mu}(G)\,v_q(G)\,\zeta_{\nu}(G)\) already exclude the head and you do not need to explicitly project off wing components of v.
 
 ---
 
