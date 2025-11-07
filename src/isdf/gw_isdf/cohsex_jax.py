@@ -21,6 +21,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from functools import partial
 from types import SimpleNamespace
+from collections.abc import Iterable, Iterator
 #jax.config.update("jax_enable_x64", True)
 #jax.config.update("jax_platform_name", "cpu")
 
@@ -48,7 +49,6 @@ from ..common import symmetry_maps
 from ..common.load_wfns import read_Gvecs_to_devices, get_sharded_wfns, get_enk_bandrange
 from .get_windows import get_window_info
 from .w_isdf import get_chi0_jax, get_static_w_q_jax
-from .w_from_eps0 import compute_Wmunu_from_eps0_body
 from .vcoul import compute_vcoul_comps_for_q, compute_V_qfullG_for_q, compute_q0_averages
 from ..common.chi_from_dipole import read_dipole_h5, compute_S_omega
 from ..common.epsreader import EPSReader
@@ -213,6 +213,129 @@ def make_shardings(mesh_xy: Mesh) -> SimpleNamespace:
 		V_shard = NamedSharding(mesh_xy, P('x', 'y', None, None, None)),
 		out_shard = NamedSharding(mesh_xy, P(None, None, None)),
 	)
+
+
+def _get_kvec_lookup(sym) -> tuple[np.ndarray, dict[tuple[int, int, int], int]]:
+	kvecs_np = getattr(sym, "_kvecs_asints_np", None)
+	if kvecs_np is None:
+		kvecs_np = np.asarray(sym.kvecs_asints, dtype=np.int32)
+		setattr(sym, "_kvecs_asints_np", kvecs_np)
+	lookup = getattr(sym, "_kvec_lookup", None)
+	if lookup is None:
+		lookup = {tuple(int(v) for v in vec): idx for idx, vec in enumerate(kvecs_np)}
+		setattr(sym, "_kvec_lookup", lookup)
+	return kvecs_np, lookup
+
+
+def iter_qpoint_data(sym, meta: Meta) -> Iterator[SimpleNamespace]:
+	kvecs_np, k_lookup = _get_kvec_lookup(sym)
+	kgrid_np = meta.kgrid_np
+	half_grid = kgrid_np // 2
+	k_r_indices = jnp.arange(kvecs_np.shape[0], dtype=jnp.int32)
+	for qvec_nonneg in np.ndindex(*meta.kgrid):
+		qvec_nonneg_np = np.asarray(qvec_nonneg, dtype=np.int32)
+		qvec_wrapped = np.where(qvec_nonneg_np > half_grid, qvec_nonneg_np - kgrid_np, qvec_nonneg_np)
+		targets = (kvecs_np - qvec_wrapped) % kgrid_np
+		k_l_np = np.fromiter((k_lookup[tuple(t)] for t in targets), dtype=np.int32, count=targets.shape[0])
+		qvec_frac = qvec_wrapped.astype(np.float64) / kgrid_np
+		iq = sym.find_qpoint_index(qvec_frac, tol=1e-6)
+		iq_cpu = iq.get() if hasattr(iq, "get") else int(iq)
+		yield SimpleNamespace(
+			q_index=iq_cpu,
+			q_nonneg=qvec_nonneg_np,
+			q_wrapped=jnp.asarray(qvec_wrapped, dtype=jnp.int32),
+			k_l_indices=jnp.asarray(k_l_np, dtype=jnp.int32),
+			k_r_indices=k_r_indices,
+		)
+
+
+def _legacy_q_data_iter(preprocessed_q_data) -> Iterator[SimpleNamespace]:
+	all_k_l_indices, all_k_r_indices, all_qvecs_wrapped, all_qvecs_nonneg, all_iq_indices = preprocessed_q_data[:5]
+	for k_l, k_r, q_wrapped, q_nonneg, iq in zip(
+		np.asarray(all_k_l_indices),
+		np.asarray(all_k_r_indices),
+		np.asarray(all_qvecs_wrapped),
+		np.asarray(all_qvecs_nonneg),
+		np.asarray(all_iq_indices),
+	):
+		yield SimpleNamespace(
+			q_index=int(np.asarray(iq)),
+			q_nonneg=np.asarray(q_nonneg, dtype=np.int32),
+			q_wrapped=jnp.asarray(q_wrapped, dtype=jnp.int32),
+			k_l_indices=jnp.asarray(k_l, dtype=jnp.int32),
+			k_r_indices=jnp.asarray(k_r, dtype=jnp.int32),
+		)
+
+
+def determine_wcoul0(params, input_dir, wfn, sym, meta, print_fn):
+	"""Resolve (v_c0, w_c0) head averages using user preference fallback order."""
+	want_source = str(params.get("wcoul0_source", "epshead")).strip().lower()
+	if want_source not in ("epshead", "s_tensor"):
+		print_fn(f"Unknown wcoul0_source={want_source}; defaulting to 'epshead'")
+		want_source = "epshead"
+
+	eps0_path = os.path.join(input_dir, "eps0mat.h5")
+	dipole_path = os.path.join(input_dir, "dipole.h5")
+
+	def from_epshead():
+		if not os.path.exists(eps0_path):
+			return None
+		try:
+			eps0 = EPSReader(eps0_path)
+			vc0_mean, wcoul0 = compute_q0_averages(
+				wfn,
+				jnp.asarray(eps0.epshead, dtype=jnp.complex128),
+				meta,
+				S_cart=None,
+			)
+			print_fn("Using eps0mat.h5 epshead-based wcoul0")
+			return vc0_mean, wcoul0, "epshead"
+		except Exception as exc:  # pragma: no cover - diagnostic path
+			print_fn(f"epshead wcoul0 failed: {exc}")
+			return None
+
+	def from_s_tensor():
+		if not os.path.exists(dipole_path):
+			print_fn(f"dipole.h5 not found at {dipole_path}; cannot build S(0) wcoul0")
+			return None
+		try:
+			dipole_cart, deltaE = read_dipole_h5(dipole_path)
+			nk_tot = int(sym.nk_tot)
+			nb = int(wfn.nbands)
+			nelec = int(wfn.nelec)
+			occ = np.zeros((nk_tot, nb), dtype=float)
+			occ[:, :max(0, min(nelec, nb))] = 1.0
+			f_nk = jnp.asarray(occ, dtype=jnp.float64)
+			omegas = jnp.asarray([0.0], dtype=jnp.float64)
+			S_cart_omega0 = compute_S_omega(
+				dipole_cart,
+				deltaE,
+				f_nk,
+				float(wfn.cell_volume),
+				int(sym.nk_tot),
+				int(wfn.nspin),
+				int(wfn.nspinor),
+				omegas,
+				eta=0.0,
+			)[0]
+			vc0_mean, wcoul0 = compute_q0_averages(
+				wfn,
+				jnp.asarray(0.0, dtype=jnp.float64),
+				meta,
+				S_cart=S_cart_omega0,
+			)
+			print_fn("Using dipole.h5 S(0)-based wcoul0")
+			return vc0_mean, wcoul0, "s_tensor"
+		except Exception as exc:  # pragma: no cover - diagnostic path
+			print_fn(f"S(0) wcoul0 failed: {exc}")
+			return None
+
+	source_order = [want_source] + [s for s in ("epshead", "s_tensor") if s != want_source]
+	for source in source_order:
+		result = from_epshead() if source == "epshead" else from_s_tensor()
+		if result is not None:
+			return result
+	raise RuntimeError("Failed to determine wcoul0: neither eps0mat.h5 epshead nor dipole.h5 S(0) available")
 
 
 def read_cohsex_input(filename: str) -> dict:
@@ -422,17 +545,17 @@ def get_zeta_q_and_v_q_mu_nu(
 	##weights_r = jnp.pad(weights_r, ((0, 0), (0, pad_r)), mode='constant') if pad_r > 0 else weights_r
 
 	##########################################
-	# Use preprocessed q-point and k-point mappings
+	# Iterate q-point data on demand (optional legacy cache)
 	##########################################
 	if preprocessed_q_data is None:
-		# Fall back to computing on-the-fly if no preprocessed data provided
-		print("No preprocessed q-data provided, computing on-the-fly...")
-		preprocessed_q_data = preprocess_q_loops(wfn, sym, meta, mesh_xy=mesh_xy)
-
-	(all_k_l_indices, all_k_r_indices, all_qvecs_wrapped,
-	 all_qvecs_nonneg, all_iq_indices) = preprocessed_q_data
-
-	print(f"Using preprocessed data for {all_k_l_indices.shape[0]} q-points")
+		print("Iterating q-point data on demand (no preprocessing cache).")
+		q_data_iter: Iterable[SimpleNamespace] = iter_qpoint_data(sym, meta)
+	else:
+		if isinstance(preprocessed_q_data, tuple):
+			print("Using legacy preprocessed q-point tuple.")
+			q_data_iter = _legacy_q_data_iter(preprocessed_q_data)
+		else:
+			q_data_iter = iter(preprocessed_q_data)
 
 	##########################################
 	# Clean idiomatic distributed computation
@@ -464,16 +587,17 @@ def get_zeta_q_and_v_q_mu_nu(
 		# Initialize accumulators
 		CCT_init = jnp.zeros((n_rmu, n_rmu), dtype=jnp.complex128)
 		ZCT_init = jnp.zeros((n_rmu, n_rtot), dtype=jnp.complex128)
-		k_indices = jnp.arange(len(k_l_indices))
+		k_indices = jnp.arange(k_l_indices.shape[0], dtype=jnp.int32)
 		(CCT, ZCT), _ = jax.lax.scan(accumulate_k_pair, (CCT_init, ZCT_init), k_indices)
 		return CCT, ZCT
 
 	# Main q-point loop
-	for q_idx, (qvec_nonneg, iq_cpu) in enumerate(zip(all_qvecs_nonneg, all_iq_indices)):
-		# Get data for this q
-		k_l_indices = all_k_l_indices[q_idx]
-		k_r_indices = all_k_r_indices[q_idx]
-		qvec = all_qvecs_wrapped[q_idx]
+	for q_idx, q_data in enumerate(q_data_iter):
+		k_l_indices = q_data.k_l_indices
+		k_r_indices = q_data.k_r_indices
+		qvec_nonneg = q_data.q_nonneg
+		iq_cpu = q_data.q_index
+		qvec = jnp.asarray(q_data.q_wrapped, dtype=jnp.float64)
 		_, _, qvec_wrapped, vcoul_comps = compute_vcoul_comps_for_q(wfn, sym, meta, qvec_nonneg)
 		V_qfullG = compute_V_qfullG_for_q(
 			wfn,
@@ -667,82 +791,30 @@ def summarize_hermitian_matrix(name: str, mats: np.ndarray, print_fn=print, warn
 
 def preprocess_q_loops(wfn, sym, meta, mesh_xy=None):
 	"""
-	Precompute all q-point and k-point mappings for the zeta/v_q function.
-	
-	This function processes all q-vectors in the Brillouin zone and precomputes:
-	- k-point index mappings for each q-vector  
-	- G-vector index mappings for interpolation
-	
-	Parameters
-	----------
-	wfn : WFNReader
-		Wavefunction data
-	sym : symmetry_maps object  
-		Symmetry information
-	meta : Meta
-		System metadata
-	
-	Returns
-	-------
-	tuple
-		(all_k_l_indices, all_k_r_indices, all_qvecs_wrapped,
-		 all_qvecs_nonneg, all_iq_indices)
+	Compatibility helper that materializes the legacy q-point cache.
+
+	Prefer :func:`iter_qpoint_data` plus on-demand evaluation. This function
+	exists so downstream code that still expects the old tuple-of-arrays
+	representation keeps working.
 	"""
-	print("Precomputing all q-point and k-point mappings...")
+	print("Precomputing q-point mappings (compatibility path)...")
+	q_entries = list(iter_qpoint_data(sym, meta))
+	if not q_entries:
+		return (
+			jnp.zeros((0, 0), dtype=jnp.int32),
+			jnp.zeros((0, 0), dtype=jnp.int32),
+			jnp.zeros((0, 3), dtype=jnp.int32),
+			jnp.zeros((0, 3), dtype=jnp.int32),
+			jnp.zeros((0,), dtype=jnp.int32),
+		)
 
-	kgrid = meta.kgrid_jax
-	kgrid_np = meta.kgrid_np
-
-	# Collect all q-vectors and their mappings
-	all_qvecs_nonneg = []
-	all_qvecs_wrapped = []
-	all_k_l_indices = []
-	all_k_r_indices = []
-	all_iq_indices = []
-
-	for qvec_nonneg in np.ndindex(*meta.kgrid):
-		# Handle umklapp for qvec (exact match to original)
-		qvec = jnp.asarray(qvec_nonneg)
-		qvec = jnp.where(qvec > kgrid // 2, qvec - kgrid, qvec)
-		
-		# Precompute k_l indices for this q
-		k_l_indices_q = []
-		k_r_indices_q = []
-		
-		for k_r in range(sym.nk_tot):
-			k_l_full = jnp.asarray(sym.kvecs_asints[k_r]) - qvec
-			k_l_wrapped = k_l_full % kgrid
-			k_l_wrapped_cpu = np.array(k_l_wrapped)
-			k_l = np.where(np.all(sym.kvecs_asints == k_l_wrapped_cpu, axis=1))[0][0]
-			
-			k_l_indices_q.append(k_l)
-			k_r_indices_q.append(k_r)
-		
-		# Bookkeeping only
-		qvec_cpu = np.array(qvec)
-		qveccrys = qvec_cpu.astype(np.float64) / kgrid_np
-		q_rounded = np.round(qveccrys)
-		q_ext = np.where(np.abs(qveccrys - q_rounded) < 1e-8, q_rounded, qveccrys)
-		iq = sym.find_qpoint_index(q_ext, tol=1e-6)
-		iq_cpu = iq.get() if hasattr(iq, "get") else int(iq)
-		# Store all data for this q-point
-		all_qvecs_nonneg.append(qvec_nonneg)
-		all_qvecs_wrapped.append(np.array(qvec))
-		all_k_l_indices.append(k_l_indices_q)
-		all_k_r_indices.append(k_r_indices_q)
-		all_iq_indices.append(iq_cpu)
-	
-	# Convert to JAX arrays for mapping data only (per-q vcoul computed later)
-	n_q_points = len(all_qvecs_nonneg)
-	
-	# Pad and convert to JAX arrays
-	all_k_l_indices = jnp.array(all_k_l_indices)  # (n_q, n_k)
-	all_k_r_indices = jnp.array(all_k_r_indices)  # (n_q, n_k)
-	all_qvecs_wrapped = jnp.array(all_qvecs_wrapped)  # (n_q, 3)
-	all_qvecs_nonneg = jnp.array(all_qvecs_nonneg)  # (n_q, 3)
-	all_iq_indices = jnp.array(all_iq_indices)  # (n_q,)
-	
-	print(f"Precomputed q/k mappings for {n_q_points} q-points")
+	all_k_l_indices = jnp.stack([entry.k_l_indices for entry in q_entries])
+	k_r_indices = q_entries[0].k_r_indices
+	all_k_r_indices = jnp.repeat(k_r_indices[None, :], all_k_l_indices.shape[0], axis=0)
+	all_qvecs_wrapped = jnp.stack([entry.q_wrapped for entry in q_entries])
+	all_qvecs_nonneg = jnp.asarray([entry.q_nonneg for entry in q_entries], dtype=jnp.int32)
+	all_iq_indices = jnp.asarray([entry.q_index for entry in q_entries], dtype=jnp.int32)
+	print(f"Precomputed q/k mappings for {len(q_entries)} q-points")
 	return (all_k_l_indices, all_k_r_indices, all_qvecs_wrapped, all_qvecs_nonneg, all_iq_indices)
 
 
@@ -836,6 +908,7 @@ def main(argv=None):
 	shard_debug = True
 	# Default mesh when not constructed (e.g., restart path)
 	mesh_xy = None
+	sh = None
 
 
 	# Initialize timing accumulators for both fresh and restart flows
@@ -852,6 +925,7 @@ def main(argv=None):
 		grid_y = total_devices // grid_x
 		devices_2d = np.array(jax.devices()).reshape(grid_x, grid_y)
 		mesh_xy = Mesh(devices_2d, ['x', 'y'])
+		sh = make_shardings(mesh_xy)
 		print0(f"Device mesh: (X={grid_x}, Y={grid_y})")
 
 		# Left window: read G-vectors -> global G-space; then jitted sharded wfn build
@@ -879,11 +953,6 @@ def main(argv=None):
 		print0('wavefunction sharding complete')
 
 		####################################
-		# 1.5) Preprocess q-point mappings for efficient computation
-		####################################
-		preprocessed_q_data = preprocess_q_loops(wfn, sym, meta, mesh_xy=mesh_xy)
- 
-		####################################
 		# 2.) Explicit q-loop: build zeta_q,mu(r), S_q, and V_q,mu,nu
 		####################################
 		_t_zeta_start = time.perf_counter()
@@ -892,7 +961,6 @@ def main(argv=None):
 		enk_r, weights_r = get_enk_bandrange(wfn, sym, brange_r, (b1,b3))
 
 		# Allocate sharded outputs
-		sh = make_shardings(mesh_xy)
 		V_qmunu = jnp.zeros((1, meta.npol, meta.npol, meta.nkx, meta.nky, meta.nkz, meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
 		S_qmunu = jnp.zeros((meta.nkx, meta.nky, meta.nkz, meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
 		V_qmunu = jax.lax.with_sharding_constraint(V_qmunu, sh.x6y7_8)
@@ -900,34 +968,38 @@ def main(argv=None):
 		v_q0_noG0_munu = jnp.zeros((meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
 		v_q0_noG0_munu = jax.lax.with_sharding_constraint(v_q0_noG0_munu, sh.xy_shard)
 		G0_mu_nu = None
-		W_munu_eps_body = None
 
 		# No local kernel definitions; use module-scope jitted helpers
-
-		# Unpack preprocessed data
-		(all_k_l_indices, all_k_r_indices, all_qvecs_wrapped, all_qvecs_nonneg, all_iq_indices) = preprocessed_q_data
 
 		#################################################################################
 		# Main q-point loop
 		# zeta_q(r) is ephemeral inside the loop
 		################################################################################
-		for q_idx, (qvec_nonneg, iq_cpu) in enumerate(zip(all_qvecs_nonneg, all_iq_indices)):
-			k_l_indices = all_k_l_indices[q_idx]
-			k_r_indices = all_k_r_indices[q_idx]
-			qvec = all_qvecs_wrapped[q_idx]
+		q_data_iter = iter_qpoint_data(sym, meta)
+		for q_idx, q_data in enumerate(q_data_iter):
+			k_l_indices = q_data.k_l_indices
+			k_r_indices = q_data.k_r_indices
+			qvec_nonneg = q_data.q_nonneg
+			iq_cpu = q_data.q_index
+			qvec = jnp.asarray(q_data.q_wrapped, dtype=jnp.float64)
 			# Compute vcoul data on demand for this q (head set to zero inside kernel)
 			_, iqbar, qvec_wrapped, vcoul_comps = compute_vcoul_comps_for_q(wfn, sym, meta, qvec_nonneg)
 			V_qfullG = compute_V_qfullG_for_q(wfn, qvec_wrapped, vcoul_comps, 0.0, do_Dmunu=bispinor, sys_dim=sys_dim)
 			# Build CCT/ZCT then Cholesky solve for zeta_q
 			CCT, ZCT = compute_CCT_ZCT_for_q(
-				psi_l_rmu_Y, psi_r_rmu_Y, psi_l_rtot_Y, psi_r_rtot_Y, psi_l_rmuT_X, psi_r_rmuT_X,
-				k_l_indices, k_r_indices
+				psi_l_rmu_Y, 
+				psi_r_rmu_Y, 
+				psi_l_rtot_Y, 
+				psi_r_rtot_Y, 
+				psi_l_rmuT_X, 
+				psi_r_rmuT_X,
+				k_l_indices, 
+				k_r_indices
 			)
 			zeta_q = solve_zeta_cholesky(CCT, ZCT)
 			zeta_q = set_zeta_sharding(zeta_q, mesh_xy)
 			# Compute S_q and write into S_qmunu
 			qx = int(qvec_nonneg[0]); qy = int(qvec_nonneg[1]); qz = int(qvec_nonneg[2])
-			#S_qmunu = S_qmunu.at[qx, qy, qz, :, :].set(compute_Sq_from_zeta(zeta_q))
 			# FFT to G and accumulate V_q,mu,nu using explicit-arg kernel
 			v_munu = compute_v_munu_from_zeta(
 				zeta_q,
@@ -957,26 +1029,6 @@ def main(argv=None):
 				else:
 					g0_idx = int(np.where(g0_mask_np)[0][0])
 				G0_mu_nu = z_G[:, vc_np[g0_idx, 0], vc_np[g0_idx, 1], vc_np[g0_idx, 2]]
-				# Optional diagnostic: build W_{mu,nu} from eps^{-1}(q=0) body and stash for later compare
-				try:
-					_eps0_path = os.path.join(input_dir, "eps0mat.h5")
-					if os.path.exists(_eps0_path):
-						W_munu_eps = compute_Wmunu_from_eps0_body(
-							wfn,
-							sym,
-							meta,
-							np.asarray(zeta_q),
-							np.asarray(qvec),
-							np.asarray(vcoul_comps),
-							np.asarray(V_qfullG),
-							_eps0_path,
-						)
-						# cache on python side for printing after W is built
-						W_munu_eps_body = jnp.asarray(W_munu_eps)
-					else:
-						W_munu_eps_body = None
-				except Exception as _e:
-					print(f"Warning: eps0 comparison failed: {_e}")
 
 
 			print(f"qpoint {iq_cpu} done")
@@ -1027,20 +1079,10 @@ def main(argv=None):
 			devices_2d = np.array(jax.devices()).reshape(grid_x, grid_y)
 			mesh_xy = Mesh(devices_2d, ['x', 'y'])
 			print(f"Device mesh: (X={grid_x}, Y={grid_y}) [restart]")
+		sh = make_shardings(mesh_xy)
 		V_qmunu, S_qmunu, psi_lT, psi_l, psi_r, psi_rT, enk_l, enk_r, v_q0_noG0_munu, G0_mu_nu = load_labeled_arrays_from_h5(
 			taggedarray_filename, mesh_xy
 		)
-		# Preserve full-sized left wavefunctions (b3) and derive trimmed views
-		# psi_l_full = psi_l
-		# psi_lT_full = psi_lT
-		# valence_slice = slice(b0, b2)
-		# nb_valence = int(b2 - b0)
-		# nb_sigma = int(b3 - b0)
-		# psi_l = psi_l_full[:, valence_slice, :, :]
-		# psi_lT = psi_lT_full[:, :, :, valence_slice]
-		# psi_r = psi_r[:, :nb_sigma, :, :]
-		# psi_rT = psi_rT[:, :, :, :nb_sigma]
-		# nb_full = int(psi_l_full.shape[1])
 		V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0]
 	elif restart and x_only:
 		# Same restart flow for X-only
@@ -1053,111 +1095,35 @@ def main(argv=None):
 			devices_2d = np.array(jax.devices()).reshape(grid_x, grid_y)
 			mesh_xy = Mesh(devices_2d, ['x', 'y'])
 			print(f"Device mesh: (X={grid_x}, Y={grid_y}) [restart]")
+		sh = make_shardings(mesh_xy)
 		V_qmunu, S_qmunu, psi_lT, psi_l, psi_r, psi_rT, enk_l, enk_r, v_q0_noG0_munu, G0_mu_nu = load_labeled_arrays_from_h5(
 			taggedarray_filename, mesh_xy
 		)
 		V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0]
-
-	# Add JAX steps here:
 
 	# Optionally compute chi0 via JAX for screened interaction if requested
 	if do_screened:
 		# Ensure energies are plain arrays for JAX
 		enk_v_arr = jnp.asarray(getattr(enk_l, 'data', enk_l))
 		enk_c_arr = jnp.asarray(getattr(enk_r, 'data', enk_r))
-		print(psi_lT.shape, psi_l.shape, psi_r.shape, psi_rT.shape)
 		# Four wavefunction copies and shardings for low-comm G and Sigma construction:
 		# psi_lT: (nk, ns, rmu, nb) XT_shard; psi_l: (nk, nb, ns, rmu) Y_shard
 		# psi_r:  (nk, nb, ns, rmu) X_shard;  psi_rT: (nk, ns, rmu, nb) YT_shard
 		# We reshard psi_rT to XT for chi0 so both G_v and G_c use {mu_X, nu_Y} without communication.
 		window_pairs = get_window_info(epsq, wfn, nband_max=nband)
-		#psi_rT_X = jax.lax.with_sharding_constraint(psi_rT, NamedSharding(mesh_xy, P(None, None, 'x', None)))
 		_t_chiw_start = time.perf_counter()
 		chi0 = get_chi0_jax(psi_lT, psi_l, psi_r, psi_rT, enk_v_arr, enk_c_arr, window_pairs, meta, mesh_xy)
 		# Compute static W under k_XY sharding (S_qmunu included but unused for now)
 		W_q = get_static_w_q_jax(V_qmunu, chi0, None, meta, mesh_xy)
 		W_q.block_until_ready()
-		W_gamma_body_pre = W_q[0, 0, 0, 0, :, 0, :]
 		chiw_secs = time.perf_counter() - _t_chiw_start
 		# Compute static W under k_XY sharding (S_qmunu included but unused for now)
 		#W_q = get_static_w_q_jax(V_qmunu, chi0, S_qmunu, meta, mesh_xy)
 
  
 	# Compute q=0 averages (after restart/loop) and inject head-averages
-	# Choose wcoul0 source matching best agreement and plot normalization
-	eps0_path = os.path.join(input_dir, "eps0mat.h5")
-	want_source = str(params.get("wcoul0_source", "epshead")).strip().lower()
-	vc0_mean = None; wcoul0 = None
-	if want_source not in ("epshead", "s_tensor"):
-		print(f"Unknown wcoul0_source={want_source}; defaulting to 'epshead'")
-		want_source = "epshead"
-
-	def _try_epshead():
-		nonlocal vc0_mean, wcoul0
-		if not os.path.exists(eps0_path):
-			return False
-		try:
-			eps0 = EPSReader(eps0_path)
-			epshead = eps0.epshead
-			vc0_mean, wcoul0 = compute_q0_averages(
-				wfn, jnp.asarray(epshead, dtype=jnp.complex128), meta, S_cart=None
-			)
-			print("Using eps0mat.h5 epshead-based wcoul0 (gamma model)")
-			return True
-		except Exception as e:
-			print(f"Warning: eps0mat.h5 present but failed to compute wcoul0 from epshead: {e}")
-			return False
-
-	def _try_s_tensor():
-		nonlocal vc0_mean, wcoul0
-		dipole_path = os.path.join(input_dir, "dipole.h5")
-		if not os.path.exists(dipole_path):
-			print(f"dipole.h5 not found at {dipole_path}; cannot build S(0) wcoul0")
-			return False
-		try:
-			dipole_cart, deltaE = read_dipole_h5(dipole_path)
-			nk_tot = int(sym.nk_tot)
-			nb = int(wfn.nbands)
-			nelec = int(wfn.nelec)
-			occ = np.zeros((nk_tot, nb), dtype=float)
-			occ[:, :max(0, min(nelec, nb))] = 1.0
-			f_nk = jnp.asarray(occ, dtype=jnp.float64)
-			omegas = jnp.asarray([0.0], dtype=jnp.float64)
-			S_all = compute_S_omega(
-				dipole_cart,
-				deltaE,
-				f_nk,
-				float(wfn.cell_volume),
-				int(sym.nk_tot),
-				int(wfn.nspin),
-				int(wfn.nspinor),
-				omegas,
-				eta=0.0,
-			)
-			S_cart_omega0 = S_all[0]
-			vc0_mean, wcoul0 = compute_q0_averages(
-				wfn, jnp.asarray(0.0, dtype=jnp.float64), meta, S_cart=S_cart_omega0
-			)
-			print("Using dipole.h5 S(0)-based wcoul0 (anisotropic model)")
-			return True
-		except Exception as e:
-			print(f"Warning: failed to compute S(0) from dipole.h5 at {dipole_path}: {e}")
-			return False
-
-	ok = False
-	if want_source == "epshead":
-		ok = _try_epshead() or _try_s_tensor()
-	else:  # s_tensor preferred
-		ok = _try_s_tensor() or _try_epshead()
-	if not ok:
-		raise RuntimeError("Failed to determine wcoul0: neither eps0mat.h5 epshead nor dipole.h5 S(0) available")
-	print(f"V_q=0,G=0 from miniBZ monte carlo: {float(vc0_mean.real):.4f}")
-	print(f"W_q=0(G=G'=0) small-q avg: {float(wcoul0.real):.6f} + {float(wcoul0.imag):.6f}i")
-	# Also report cell-volume scaled versions used in μν space
-	_vol_scale = float(1.0 / float(wfn.cell_volume))
-	print(f"V_q=0,G=0 / Ω: {float(vc0_mean.real * _vol_scale):.6f}")
-	print(f"W_q=0(G=G'=0) / Ω: {float(wcoul0.real * _vol_scale):.6f} + {float(wcoul0.imag * _vol_scale):.6f}i")
-
+	vc0_mean, wcoul0, wcoul0_source = determine_wcoul0(params, input_dir, wfn, sym, meta, print0)
+	print0(f"wcoul0 source: {wcoul0_source}")
 	# Inject head-averages after building W/V
 	# - Add wcoul0 * u u^† to W at q=0 (if screened)
 	# - Add vcoul0 * u u^† to V at q=0 for Sigma_X
@@ -1172,50 +1138,6 @@ def main(argv=None):
 	if do_screened:
 		W_q = W_q.at[0, 0, 0, 0, :, 0, :].add((wcoul0 * vol_scale) * outer_u)
 
-	# If do_screened and we computed the eps^{-1} body comparison, print diagnostics
-	if do_screened:
-		try:
-			if 'W_munu_eps_body' in locals() and W_munu_eps_body is not None:
-				avg_eps = jnp.real(jnp.mean(W_munu_eps_body))
-				avg_w_body = jnp.real(jnp.mean(W_gamma_body_pre))
-				print(f"W_q=0 μν avg from eps^{-1} (body): {float(avg_eps):.6f}")
-				print(f"W_q=0 μν avg from pipeline (body): {float(avg_w_body):.6f}")
-				# Hermiticity diagnostics
-				W_eps_np = np.asarray(W_munu_eps_body)
-				W_pip_np = np.asarray(W_gamma_body_pre)
-				res_eps = np.max(np.abs(W_eps_np - W_eps_np.conj().T))
-				di_eps = float(np.max(np.abs(np.imag(np.diag(W_eps_np)))))
-				res_pip = np.max(np.abs(W_pip_np - W_pip_np.conj().T))
-				di_pip = float(np.max(np.abs(np.imag(np.diag(W_pip_np)))))
-				print(f"[eps body] herm_resid={res_eps:.3e} max|Im diag|={di_eps:.3e}")
-				print(f"[pipeline body] herm_resid={res_pip:.3e} max|Im diag|={di_pip:.3e}")
-				# Sample elements
-				print("W(0,0) eps^{-1}/body vs pipeline/body:", complex(W_munu_eps_body[0,0]), complex(W_gamma_body_pre[0,0]))
-				if W_munu_eps_body.shape[0] > 1:
-					print("W(1,1) eps^{-1}/body vs pipeline/body:", complex(W_munu_eps_body[1,1]), complex(W_gamma_body_pre[1,1]))
-				# Pretty top-left 3x3 (real parts, 2 decimals)
-				def _print3(label, A):
-					A3 = np.asarray(A)[:3, :3]
-					R = np.real(A3)
-					rows = [" ".join(f"{x:8.2f}" for x in R[i]) for i in range(min(3, R.shape[0]))]
-					print(label)
-					for r in rows:
-						print(r)
-				_print3("V (body, Γ) top-left 3x3 (Re)", v_q0_noG0_munu)
-				_print3("W (pipeline body, Γ) top-left 3x3 (Re)", W_gamma_body_pre)
-				_print3("W (eps^{-1} body, Γ) top-left 3x3 (Re)", W_munu_eps_body)
-				# Also print pipeline with head injected and u†Wu/u†Vu checks
-				W_gamma_full = W_q[0, 0, 0, 0, :, 0, :]
-				_print3("W (pipeline head+body, Γ) top-left 3x3 (Re)", W_gamma_full)
-				u = G0_mu_nu
-				uWu = jnp.vdot(u, jnp.matmul(W_gamma_full, u))
-				uVu = jnp.vdot(u, jnp.matmul(V_qmunu[0,0,0,0,0,0], u))
-				print(f"u^† W_Γ u (Re) vs wcoul0/Ω: {float(jnp.real(uWu)):.6f} vs {float(jnp.real(wcoul0 * vol_scale)):.6f}")
-				print(f"u^† V_Γ u (Re) vs vcoul0/Ω: {float(jnp.real(uVu)):.6f} vs {float(jnp.real(vc0_mean * vol_scale)):.6f}")
-		except Exception as _e:
-			print(f"Warning: printing eps^{-1} body comparison failed: {_e}")
-		print('increased W_q by wcoul0 * u u^† ', jnp.sum((wcoul0 * vol_scale) * outer_u) / jnp.sum(W_q))
-
 	# Prepare V_mu_nu (nrmu1,nrmu2,nkx,nky,nkz) from LabeledArray V_qmunu data
 	# V_qmunu has axes [nfreq, npol1, npol2, nkx, nky, nkz, nrmu1, nrmu2]
 	# We need V_mu_nu = V_qmunu[0,0,0,:,:,:, :, :].transpose(6->0,7->1,3->2,4->3,5->4)
@@ -1226,8 +1148,6 @@ def main(argv=None):
 
 	# After W is computed, the trimmed views (psi_l, psi_lT, psi_r, psi_rT)
 	# are already defined; preserve psi_l_full/psi_lT_full as b3-sized copies.
-	print("shapes of psi_l and psi_r: ", psi_l.shape, psi_r.shape)
-
 	valence_slice = slice(b0, b2)
 	nb_sigma = int(b3 - b0)
 	psi_l = psi_l[:, valence_slice, :, :]
@@ -1235,22 +1155,15 @@ def main(argv=None):
 	psi_r = psi_r[:, :nb_sigma, :, :]
 	psi_rT = psi_rT[:, :, :, :nb_sigma]
 
-	# Define shardings
-	XT_shard = NamedSharding(mesh_xy, P(None, None, 'x', None))
-	Y_shard = NamedSharding(mesh_xy, P(None, None, None, 'y'))
-	X_shard = NamedSharding(mesh_xy, P(None, None, None, 'x'))
-	YT_shard = NamedSharding(mesh_xy, P(None, None, 'y', None))
-	V_shard = NamedSharding(mesh_xy, P('x', 'y', None, None, None))
-	V0_shard = NamedSharding(mesh_xy, P('x', 'y'))
-	out_shard = NamedSharding(mesh_xy, P(None, None, None))
+	if sh is None and mesh_xy is not None:
+		sh = make_shardings(mesh_xy)
 
 	# Jitted pipeline with explicit shardings along rmu/rnu XY
-	# Pass NamedShardings for inner with_sharding_constraint use
 	pipeline_jit = jax.jit(
 		compute_sigma_pipeline_jax,
 		static_argnames=('nkx', 'nky', 'nkz', 'nk_tot', 'nspinor', 'fft_vol_au'),
-		in_shardings=(XT_shard, Y_shard, X_shard, YT_shard, V_shard, V0_shard),
-		out_shardings=(out_shard, out_shard),
+		in_shardings=(sh.XT_shard, sh.Y_shard, sh.X_shard, sh.YT_shard, sh.V_shard, sh.xy_shard),
+		out_shardings=(sh.out_shard, sh.out_shard),
 	)
 
 	with mesh_xy:
@@ -1268,8 +1181,6 @@ def main(argv=None):
 	sigma_x_kbar_ij_jax.block_until_ready()
 	hartree_kbar_ij_jax.block_until_ready()
 	pipe_secs = time.perf_counter() - _t_pipe_start
-
-	#rho_k_mu = jnp.einsum('knsx,knsx->x', jnp.conj(psi_l), psi_l, optimize=True)
 	#vhartree_k_mu = jnp.einsum('xy,y->x', v_q0_noG0_munu, rho_k_mu, optimize=True)
 	#hartree_kmn = jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_r), vhartree_k_mu, psi_r, optimize=True)
 	#rho_k_mu = jnp.transpose(rho_k_mu, (1,0)).reshape(-1,meta.nkx,meta.nky,meta.nkz)
