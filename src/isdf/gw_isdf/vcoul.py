@@ -1,17 +1,20 @@
-# Standard Library imports
+"""Coulomb utilities: Voronoi-cell sampling and per-q V(q,G).
+
+This module now supports Sobol QMC sampling for the q=0 averages by default
+and keeps the V(q,G) head zero so head averages are injected explicitly later.
+"""
+
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec as P
-from functools import partial
 
 from ..common import Meta
-from ..common.chi_from_dipole import compute_S_omega  # optional import for callers that pass S(ω)
+
 
 
 def wrap_points_to_voronoi(randcart, bvec, nmax=1):
 	"""
-	Helper function to get test q-points for mini-BZ average with correct voronoi cell.
+	Helper function to get test q-points for mini-BZ average with correct Voronoi cell.
 	Rewritten to use JAX arrays.
 	"""
 	randcart_j = jnp.asarray(randcart, dtype=jnp.float64)
@@ -157,12 +160,14 @@ def compute_vcoul_comps_for_q(wfn, sym, meta: Meta, qvec_nonneg):
 	Sq = sym.sym_mats_k[sym.irk_sym_map[iq_cpu]]
 	G_Sq = np.round(qvec_wrapped - Sq @ wfn.kpoints[iqbar]).astype(jnp.float64)
 	vcoul_comps = np.einsum("ij,kj->ki", Sq.astype(jnp.int32), wfn.get_gvec_nk(iqbar)) - G_Sq[np.newaxis, :]
-	#comps_qG = vcoul_comps.astype(jnp.float64) + qvec_wrapped
 	return iq_cpu, iqbar, qvec_wrapped, vcoul_comps.astype(jnp.int32)
 
 
 def compute_V_qfullG_for_q(wfn, qvec_wrapped, comps_qG, vc0_mean, do_Dmunu, sys_dim):
-	"""Compute V_q(G) vector (length nG for this q) using 2D truncation if sys_dim==2."""
+	"""Compute V_q(G) vector (length nG for this q) using 2D truncation if sys_dim==2.
+
+	The head (q+G=0) is set to zero; head averages are injected later.
+	"""
 	bvec = jnp.asarray(wfn.blat * wfn.bvec, dtype=jnp.float64)
 	if sys_dim == 3:
 		raise NotImplementedError("3D system calculation not yet implemented")
@@ -177,157 +182,151 @@ def compute_V_qfullG_for_q(wfn, qvec_wrapped, comps_qG, vc0_mean, do_Dmunu, sys_
 	f2d = (1.0 - jnp.exp(-zc * kxy) * jnp.cos(kz * zc))
 	# Regular entries: 4pi/|q+G|^2 * f2d
 	denom_safe = jnp.where(denom_zero, 1.0, denom)
-	v_reg = (8.0 * jnp.pi / denom_safe) * f2d #TODO PUT THIS BACK. Note, to use in V_H may also need to use in poisson solve for V_ion
+	v_reg = (8.0 * jnp.pi / denom_safe) * f2d
 	# Physical scaling by cell volume
 	fact = jnp.float64(1.0 / wfn.cell_volume)
 	v_reg_scaled = v_reg * fact
-	# Only for q=0 replace the head (q+G=0) by vc0_mean (already unscaled here) and then scale once
-	is_q0 = jnp.all(jnp.asarray(qvec_wrapped) < 1e-12)
-	v_scaled = jnp.where(jnp.logical_and(is_q0, denom_zero), vc0_mean * fact, v_reg_scaled)
+	# Zero the head (q+G=0) so that W/V head is injected via explicit averages later
+	v_scaled = jnp.where(denom_zero, 0.0, v_reg_scaled)
 	return v_scaled.astype(jnp.complex128)
 
 
 def compute_q0_averages(
-    wfn,
-    epshead,
-    meta: Meta,
-    S_cart: jnp.ndarray | None = None,
-    nsamples: int = 2**18,
-    method: str = "sobol",
-    qmc_reps: int = 1,
+	wfn,
+	epshead,
+	meta: Meta,
+	S_cart: jnp.ndarray | None = None,
+	nsamples: int = 2**18,
+	method: str = "sobol",
+	qmc_reps: int = 1,
 ):
-    """Compute q=0 averages (vc0_mean, wcoul0) on the same Monte Carlo points.
+	"""Compute q=0 averages (vc0_mean, wcoul0) on the same Monte Carlo points.
 
-    If ``S_cart`` is provided, compute
-        wcoul0 = < v(q) / (1 - v(q) q^T S q) >
-    using the same mini-BZ Voronoi samples used to compute ``vc0_mean``.
+	If ``S_cart`` is provided, compute
+		wcoul0 = < v(q) / (1 - v(q) q^T S q) >
+	using the same mini-BZ Voronoi samples used to compute ``vc0_mean``.
 
-    Otherwise, fall back to the historical Ismail‑Beigi gamma model using
-    ``epshead`` (for continuity with older runs).
-    """
-    bvec = jnp.asarray(wfn.blat * wfn.bvec, dtype=jnp.float64)
-    zk = jnp.pi / bvec[2, 2]
+	Otherwise, fall back to the historical Ismail–Beigi gamma model using
+	``epshead`` (for continuity with older runs).
+	"""
+	bvec = jnp.asarray(wfn.blat * wfn.bvec, dtype=jnp.float64)
+	zk = jnp.pi / bvec[2, 2]
 
-    # Sample points: default Sobol QMC (3D with Owen scrambling), fallback to uniform
-    randlims = bvec.T @ (jnp.diag(1.0 / jnp.asarray((meta.nkx, meta.nky, meta.nkz))) @ jnp.linalg.inv(bvec.T))
-    use_qmc = (method.lower() == "sobol")
-    randqcart = None
-    if use_qmc:
-        try:
-            from scipy.stats import qmc as _qmc  # type: ignore
-            # Ensure nsamples is a power of two for Sobol; use nearest lower power if needed
-            import math as _math
-            m = max(1, int(_math.floor(_math.log2(max(2, int(nsamples))))))
-            npts = 1 << m
-            means = []
-            wmeans = []
-            for rep in range(max(1, int(qmc_reps))):
-                sob = _qmc.Sobol(d=3, scramble=True, seed=rep)
-                U = sob.random_base2(m)  # (npts,3) in [0,1)
-                # Map through same pipeline as uniform: lattice -> wrap -> mini-BZ scale
-                import numpy as _np
-                Uj = jnp.asarray(_np.asarray(U, dtype=_np.float64))
-                randcart = (bvec.T @ Uj.T).T
-                wrapped_cart = wrap_points_to_voronoi(randcart, bvec, nmax=1)
-                rq = (randlims @ wrapped_cart.T).T
-                # Set qz=0 for 2D-truncated head, matching historical evaluation
-                rq2 = rq.at[:, 2].set(0.0)
-                # Compute v(q)
-                denom = jnp.einsum("ij,ij->i", rq2, rq2)
-                base = 4.0 * jnp.pi / denom
-                kxy = jnp.linalg.norm(rq2[:, :2], axis=1)
-                f2d = 2.0 * (1.0 - jnp.exp(-jnp.pi / bvec[2, 2] * kxy) * jnp.cos(rq2[:, 2] * jnp.pi / bvec[2, 2]))
-                vq = base * f2d
-                means.append(jnp.mean(vq))
-                if S_cart is not None:
-                    S = jnp.asarray(S_cart, dtype=jnp.complex128)
-                    qSq = jnp.einsum('qi,ij,qj->q', rq2, S, rq2)
-                    vqc = vq.astype(jnp.complex128)
-                    wmeans.append(jnp.mean(vqc / (1.0 - vqc * qSq)))
-            # Aggregate replicate means
-            vc0_mean = jnp.mean(jnp.stack(means))
-            if S_cart is not None:
-                wcoul0 = jnp.mean(jnp.stack(wmeans))
-                return (vc0_mean).astype(jnp.complex128), (wcoul0).astype(jnp.complex128)
-            # If no S_cart, continue to isotropic path below for wcoul0
-            randqcart = rq2  # reuse last batch points for isotropic fallback below
-        except Exception:
-            # Fallback to uniform sampling with dense points to preserve accuracy
-            use_qmc = False
-            nsamples = max(int(nsamples), 2_500_000)
+	# Sample points: default Sobol QMC (3D with Owen scrambling), fallback to uniform
+	randlims = bvec.T @ (jnp.diag(1.0 / jnp.asarray((meta.nkx, meta.nky, meta.nkz))) @ jnp.linalg.inv(bvec.T))
+	use_qmc = (method.lower() == "sobol")
+	randqcart = None
+	if use_qmc:
+		try:
+			from scipy.stats import qmc as _qmc  # type: ignore
+			import math as _math
+			# Ensure nsamples is a power of two for Sobol; use nearest lower power if needed
+			m = max(1, int(_math.floor(_math.log2(max(2, int(nsamples))))))
+			npts = 1 << m
+			means = []
+			wmeans = []
+			for rep in range(max(1, int(qmc_reps))):
+				sob = _qmc.Sobol(d=3, scramble=True, seed=rep)
+				U = sob.random_base2(m)  # (npts,3) in [0,1)
+				# Map through same pipeline as uniform: lattice -> wrap -> mini-BZ scale
+				import numpy as _np
+				Uj = jnp.asarray(_np.asarray(U, dtype=_np.float64))
+				randcart = (bvec.T @ Uj.T).T
+				wrapped_cart = wrap_points_to_voronoi(randcart, bvec, nmax=1)
+				rq = (randlims @ wrapped_cart.T).T
+				# Set qz=0 for 2D-truncated head, matching historical evaluation
+				rq2 = rq.at[:, 2].set(0.0)
+				# Compute v(q)
+				denom = jnp.einsum("ij,ij->i", rq2, rq2)
+				base = 4.0 * jnp.pi / denom
+				kxy = jnp.linalg.norm(rq2[:, :2], axis=1)
+				f2d = 2.0 * (1.0 - jnp.exp(-jnp.pi / bvec[2, 2] * kxy) * jnp.cos(rq2[:, 2] * jnp.pi / bvec[2, 2]))
+				vq = base * f2d
+				means.append(jnp.mean(vq))
+				if S_cart is not None:
+					S = jnp.asarray(S_cart, dtype=jnp.complex128)
+					qSq = jnp.einsum('qi,ij,qj->q', rq2, S, rq2)
+					vqc = vq.astype(jnp.complex128)
+					wmeans.append(jnp.mean(vqc / (1.0 - vqc * qSq)))
+			# Aggregate replicate means
+			vc0_mean = jnp.mean(jnp.stack(means))
+			if S_cart is not None:
+				wcoul0 = jnp.mean(jnp.stack(wmeans))
+				return (vc0_mean).astype(jnp.complex128), (wcoul0).astype(jnp.complex128)
+			# If no S_cart, continue to isotropic path below for wcoul0 using epshead
+			randqcart = rq2  # reuse last batch points for isotropic fallback below
+		except Exception:
+			# Fallback to uniform sampling with dense points to preserve accuracy
+			use_qmc = False
+			nsamples = max(int(nsamples), 2_500_000)
 
-    if not use_qmc:
-        key = jax.random.PRNGKey(0)
-        randvals = jax.random.uniform(key, (nsamples, 3), dtype=jnp.float64)
-        randcart = (bvec.T @ randvals.T).T
-        wrapped_cart = wrap_points_to_voronoi(randcart, bvec, nmax=1)
-        randqcart = (randlims @ wrapped_cart.T).T
-        randqcart = randqcart.at[:, 2].set(0.0)
-    # 2D truncation: enforce qz=0 for vcoul head sampling (as before)
-    qcart2 = randqcart
-    # v(q) = 4π/|q|^2 * 2 * (1 - e^{-zc kxy} * cos(qz zc))
-    denom = jnp.einsum("ij,ij->i", qcart2, qcart2)
-    base = 4.0 * jnp.pi / denom
-    kxy = jnp.linalg.norm(qcart2[:, :2], axis=1)
-    f2d = 2.0 * (1.0 - jnp.exp(-jnp.pi / bvec[2, 2] * kxy) * jnp.cos(qcart2[:, 2] * jnp.pi / bvec[2, 2]))
-    vq = base * f2d
-    vc0_mean = jnp.mean(vq)
+	if not use_qmc:
+		key = jax.random.PRNGKey(0)
+		randvals = jax.random.uniform(key, (nsamples, 3), dtype=jnp.float64)
+		randcart = (bvec.T @ randvals.T).T
+		wrapped_cart = wrap_points_to_voronoi(randcart, bvec, nmax=1)
+		randqcart = (randlims @ wrapped_cart.T).T
+		randqcart = randqcart.at[:, 2].set(0.0)
+	# 2D truncation: enforce qz=0 for vcoul head sampling (as before)
+	qcart2 = randqcart
+	# v(q) = 4π/|q|^2 * 2 * (1 - e^{-zc kxy} * cos(qz zc))
+	denom = jnp.einsum("ij,ij->i", qcart2, qcart2)
+	base = 4.0 * jnp.pi / denom
+	kxy = jnp.linalg.norm(qcart2[:, :2], axis=1)
+	f2d = 2.0 * (1.0 - jnp.exp(-jnp.pi / bvec[2, 2] * kxy) * jnp.cos(qcart2[:, 2] * jnp.pi / bvec[2, 2]))
+	vq = base * f2d
+	vc0_mean = jnp.mean(vq)
 
-    if S_cart is not None:
-        # Anisotropic wcoul0 on identical samples using S(0) and q with qz=0
-        S = jnp.asarray(S_cart, dtype=jnp.complex128)
-        qSq = jnp.einsum('qi,ij,qj->q', qcart2, S, qcart2)
-        vqc = vq.astype(jnp.complex128)
-        wcoul0 = jnp.mean(vqc / (1.0 - vqc * qSq))
-    else:
-        # Fallback: isotropic gamma model (unchanged)
-        vc_q = (1.0 - jnp.exp(-kxy * zk)) / (kxy * kxy)
-        gamma = (1.0 / jnp.asarray(epshead.real, dtype=jnp.float64) - 1.0)
-        wq = vc_q / (1.0 + vc_q * (kxy * kxy) * gamma)
-        wcoul0 = 8.0 * jnp.pi * jnp.mean(wq)
+	if S_cart is not None:
+		# Anisotropic wcoul0 on identical samples using S(0) and q with qz=0
+		S = jnp.asarray(S_cart, dtype=jnp.complex128)
+		qSq = jnp.einsum('qi,ij,qj->q', qcart2, S, qcart2)
+		vqc = vq.astype(jnp.complex128)
+		wcoul0 = jnp.mean(vqc / (1.0 - vqc * qSq))
+	else:
+		# Fallback: isotropic gamma model from epshead (dimensionless)
+		vc_q = (1.0 - jnp.exp(-kxy * zk)) / (kxy * kxy)
+		gamma = (1.0 / jnp.asarray(epshead.real, dtype=jnp.float64) - 1.0)
+		wq = vc_q / (1.0 + vc_q * (kxy * kxy) * gamma)
+		wcoul0 = 8.0 * jnp.pi * jnp.mean(wq)
 
-    return (vc0_mean).astype(jnp.complex128), (wcoul0).astype(jnp.complex128)
+	return (vc0_mean).astype(jnp.complex128), (wcoul0).astype(jnp.complex128)
 
 
-def compute_wcoul0_with_S(bvec: jnp.ndarray,
-                          nkx: int,
-                          nky: int,
-                          nkz: int,
-                          S_cart: jnp.ndarray,
-                          nsamples: int = 2_500_000) -> jnp.complex128:
-    """Average wcoul0 over Voronoi-cell q using small-q tensor S(ω).
+def compute_wcoul0_with_S(
+	bvec: jnp.ndarray,
+	nkx: int,
+	nky: int,
+	nkz: int,
+	S_cart: jnp.ndarray,
+	nsamples: int = 2_500_000,
+) -> jnp.complex128:
+	"""Average wcoul0 over Voronoi-cell q using small-q tensor S(ω).
 
-    Computes wcoul0 = ⟨ v(q) · (1 - v(q) · q^T S q)^{-1} ⟩_{q∈Voronoi cell}
-    with 2D truncation consistent with vcoul setup.
+	Computes wcoul0 = ⟨ v(q) · (1 - v(q) · q^T S q)^{-1} ⟩ over the Voronoi cell,
+	with 2D truncation consistent with vcoul setup.
+	"""
+	bvec = jnp.asarray(bvec, dtype=jnp.float64)
+	S = jnp.asarray(S_cart, dtype=jnp.complex128)
+	zc = jnp.pi / bvec[2, 2]
 
-    Parameters
-    ----------
-    bvec : (3,3) reciprocal lattice matrix (crystal→Cartesian), scaled by blat
-    nkx,nky,nkz : integers defining the k-grid extents
-    S_cart : (3,3) complex128, small-q tensor in Cartesian components at chosen ω
-    nsamples : number of Monte Carlo samples in the cell
-    """
-    bvec = jnp.asarray(bvec, dtype=jnp.float64)
-    S = jnp.asarray(S_cart, dtype=jnp.complex128)
-    zc = jnp.pi / bvec[2, 2]
+	@jax.jit
+	def _average(key):
+		# Sample random q in Cartesian space covering Voronoi region of the mini-BZ cell
+		randvals = jax.random.uniform(key, (nsamples, 3), dtype=jnp.float64)
+		randcart = (bvec.T @ randvals.T).T
+		wrapped_cart = wrap_points_to_voronoi(randcart, bvec, nmax=1)
+		# Scale by grid to Voronoi cell of the Gamma-centered tile
+		kgrid = jnp.asarray((nkx, nky, nkz), dtype=jnp.float64)
+		randqcart = (bvec.T @ (jnp.diag(1.0 / kgrid) @ jnp.linalg.inv(bvec.T)) @ wrapped_cart.T).T
+		# 2D truncation
+		kxy = jnp.linalg.norm(randqcart[:, :2], axis=1)
+		kz = randqcart[:, 2]
+		vq = 4.0 * jnp.pi / jnp.einsum('ij,ij->i', randqcart, randqcart)
+		vq = vq * 2.0 * (1.0 - jnp.exp(-zc * kxy) * jnp.cos(kz * zc))
+		# q^T S q (complex)
+		Sq = jnp.einsum('qi,ij,qj->q', randqcart, S, randqcart)
+		w = vq.astype(jnp.complex128) / (1.0 - vq.astype(jnp.complex128) * Sq)
+		return jnp.mean(w)
 
-    @jax.jit
-    def _average(key):
-        # Sample random q in Cartesian space covering Voronoi region of the mini-BZ cell
-        randvals = jax.random.uniform(key, (nsamples, 3), dtype=jnp.float64)
-        randcart = (bvec.T @ randvals.T).T
-        wrapped_cart = wrap_points_to_voronoi(randcart, bvec, nmax=1)
-        # Scale by grid to Voronoi cell of the Gamma-centered tile
-        kgrid = jnp.asarray((nkx, nky, nkz), dtype=jnp.float64)
-        randqcart = (bvec.T @ (jnp.diag(1.0 / kgrid) @ jnp.linalg.inv(bvec.T)) @ wrapped_cart.T).T
-        # 2D truncation
-        kxy = jnp.linalg.norm(randqcart[:, :2], axis=1)
-        kz = randqcart[:, 2]
-        vq = 4.0 * jnp.pi / jnp.einsum('ij,ij->i', randqcart, randqcart)
-        vq = vq * 2.0 * (1.0 - jnp.exp(-zc * kxy) * jnp.cos(kz * zc))  # 8π/|q|^2 * f2d
-        # q^T S q (complex)
-        Sq = jnp.einsum('qi,ij,qj->q', randqcart, S, randqcart)
-        w = vq.astype(jnp.complex128) / (1.0 - vq.astype(jnp.complex128) * Sq)
-        return jnp.mean(w)
-
-    return _average(jax.random.PRNGKey(0)).astype(jnp.complex128)
+	return _average(jax.random.PRNGKey(0)).astype(jnp.complex128)

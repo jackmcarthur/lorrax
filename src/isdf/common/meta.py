@@ -21,6 +21,7 @@ class Meta:
     n_rmu: int
     npol: int
     nfreq: int
+    nspin: int
     nspinor: int
     nspinor_wfnfile: int
     nkx: int
@@ -52,6 +53,7 @@ class Meta:
         b_id_4 = int(nband)
         fft_grid = tuple(int(x) for x in wfn.fft_grid)
         n_rtot = int(np.prod(fft_grid))
+        nspin = int(wfn.nspin)
         nspinor_wfnfile = int(wfn.nspinor)
         nspinor = 4 if bispinor else nspinor_wfnfile
         npol = 4 if nspinor == 4 else 1
@@ -73,6 +75,7 @@ class Meta:
             n_rmu,
             npol,
             1,
+            nspin,
             nspinor,
             nspinor_wfnfile,
             nkx,

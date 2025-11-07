@@ -48,6 +48,7 @@ from ..common import symmetry_maps
 from ..common.load_wfns import read_Gvecs_to_devices, get_sharded_wfns, get_enk_bandrange
 from .get_windows import get_window_info
 from .w_isdf import get_chi0_jax, get_static_w_q_jax
+from .w_from_eps0 import compute_Wmunu_from_eps0_body
 from .vcoul import compute_vcoul_comps_for_q, compute_V_qfullG_for_q, compute_q0_averages
 from ..common.chi_from_dipole import read_dipole_h5, compute_S_omega
 from .gw_file_io import (write_sigma_to_file, write_eqp_table, write_labeled_arrays_to_h5, 
@@ -138,7 +139,7 @@ def make_v_munu_kernel(fft_nx: int, fft_ny: int, fft_nz: int, nkx: int, nky: int
 	def kernel(zeta_q: jax.Array, qvec_wrapped: jax.Array, vcoul_comps: jax.Array, V_qfullG: jax.Array) -> jax.Array:
 		zeta_q_spatial = zeta_q.reshape(zeta_q.shape[0], fft_nx, fft_ny, fft_nz)
 		phase = jnp.exp(-2j * jnp.pi * (qvec_wrapped[0]/nkx * fx + qvec_wrapped[1]/nky * fy + qvec_wrapped[2]/nkz * fz))
-		zeta_qG = jnp.fft.fftn(zeta_q_spatial * phase, axes=(-3, -2, -1))
+		zeta_qG = jnp.fft.fftn(zeta_q_spatial * phase, axes=(-3, -2, -1)) # unscaled.
 		zeta_qG_flat = zeta_qG[:, vcoul_comps[:, 0], vcoul_comps[:, 1], vcoul_comps[:, 2]]
 		zeta_v = zeta_qG_flat * jnp.sqrt(V_qfullG)
 		return jnp.einsum('mG,nG->mn', jnp.conj(zeta_v), zeta_v, optimize=True)
@@ -823,7 +824,7 @@ def main(argv=None):
 	# windows for polarizability and sigma
 	# Get window information
 	epsq = 0.01
-	window_pairs = get_window_info(epsq, wfn)
+	#window_pairs = get_window_info(epsq, wfn)
 
 	# restart: if True, read interp. vectors and V_qmunu from file
 	restart = params["restart"]
@@ -888,44 +889,6 @@ def main(argv=None):
 		print0('wavefunction sharding complete')
 
 		####################################
-		# 1.) q=0 special handling then per-q on-demand vcoul data
-		####################################
-		# q=0 averages once: try anisotropic wcoul0 from S(omega=0) via dipole.h5
-		S_cart_omega0 = None
-		dipole_path = os.path.join(input_dir, "dipole.h5")
-		if os.path.exists(dipole_path):
-			try:
-				# Read dipole.h5 and build occupations
-				dipole_cart, deltaE = read_dipole_h5(dipole_path)  # (3,nk,nb,nb), (nk,nb,nb)
-				nk_tot = int(sym.nk_tot)
-				nb = int(wfn.nbands)
-				nelec = int(wfn.nelec)
-				occ = np.zeros((nk_tot, nb), dtype=float)
-				occ[:, :max(0, min(nelec, nb))] = 1.0
-				f_nk = jnp.asarray(occ, dtype=jnp.float64)
-				omegas = jnp.asarray([0.0], dtype=jnp.float64)
-				S_all = compute_S_omega(
-					dipole_cart,
-					deltaE,
-					f_nk,
-					float(wfn.cell_volume),
-					int(sym.nk_tot),
-					int(wfn.nspin),
-					int(wfn.nspinor),
-					omegas,
-					eta=0.0,
-				)
-				S_cart_omega0 = S_all[0]
-			except Exception as e:
-				print(f"Warning: failed to compute S(0) from dipole.h5 at {dipole_path}: {e}")
-		else:
-			print(f"ERROR: dipole.h5 not found at {dipole_path}; falling back to isotropic model for wcoul0.")
-
-		vc0_mean, wcoul0 = compute_q0_averages(wfn, jnp.asarray(0.2, dtype=jnp.float64), meta, S_cart=S_cart_omega0)
-		print(f"V_q=0,G=0 from miniBZ monte carlo: {float(vc0_mean.real):.4f}")
-		print(f"W_q=0(G=G'=0) small-q avg: {float(wcoul0.real):.6f} + {float(wcoul0.imag):.6f}i")
-
-		####################################
 		# 1.5) Preprocess q-point mappings for efficient computation
 		####################################
 		preprocessed_q_data = preprocess_q_loops(wfn, sym, meta, mesh_xy=mesh_xy)
@@ -934,7 +897,7 @@ def main(argv=None):
 		# 2.) Explicit q-loop: build zeta_q,mu(r), S_q, and V_q,mu,nu
 		####################################
 		_t_zeta_start = time.perf_counter()
-		# Energies and weights for windows (kept as before)
+		# Energies and weights for windows (kept as before, last entry is just sigma range)
 		enk_l, weights_l = get_enk_bandrange(wfn, sym, brange_l, (b1,b3))
 		enk_r, weights_r = get_enk_bandrange(wfn, sym, brange_r, (b1,b3))
 
@@ -946,6 +909,8 @@ def main(argv=None):
 		S_qmunu = jax.lax.with_sharding_constraint(S_qmunu, sh.x3y4_5)
 		v_q0_noG0_munu = jnp.zeros((meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
 		v_q0_noG0_munu = jax.lax.with_sharding_constraint(v_q0_noG0_munu, sh.xy_shard)
+		G0_mu_nu = None
+		W_munu_eps_body = None
 
 		# No local kernel definitions; use module-scope jitted helpers
 
@@ -960,9 +925,9 @@ def main(argv=None):
 			k_l_indices = all_k_l_indices[q_idx]
 			k_r_indices = all_k_r_indices[q_idx]
 			qvec = all_qvecs_wrapped[q_idx]
-			# Compute vcoul data on demand for this q
+			# Compute vcoul data on demand for this q (head set to zero inside kernel)
 			_, iqbar, qvec_wrapped, vcoul_comps = compute_vcoul_comps_for_q(wfn, sym, meta, qvec_nonneg)
-			V_qfullG = compute_V_qfullG_for_q(wfn, qvec_wrapped, vcoul_comps, vc0_mean, do_Dmunu=bispinor, sys_dim=sys_dim)
+			V_qfullG = compute_V_qfullG_for_q(wfn, qvec_wrapped, vcoul_comps, 0.0, do_Dmunu=bispinor, sys_dim=sys_dim)
 			# Build CCT/ZCT then Cholesky solve for zeta_q
 			CCT, ZCT = compute_CCT_ZCT_for_q(
 				psi_l_rmu_Y, psi_r_rmu_Y, psi_l_rtot_Y, psi_r_rtot_Y, psi_l_rmuT_X, psi_r_rmuT_X,
@@ -984,21 +949,33 @@ def main(argv=None):
 			)
 			V_qmunu = V_qmunu.at[0, 0, 0, qx, qy, qz, :, :].set(v_munu)
 
-			# get V_q=0,munu with G=0 component zeroed for Hartree potential (to compare to dft)
-			if q_idx == 0:
-				V_qfullG_noG0 = compute_V_qfullG_for_q(wfn, qvec_wrapped, vcoul_comps, 0.0, do_Dmunu=bispinor, sys_dim=sys_dim)
-				v_q0_noG0_munu = compute_v_munu_from_zeta(
-					zeta_q,
-					jnp.asarray(qvec, dtype=jnp.float64),
-					vcoul_comps,
-					V_qfullG_noG0,
-					int(meta.fft_grid[0]), int(meta.fft_grid[1]), int(meta.fft_grid[2]),
-					int(meta.nkx), int(meta.nky), int(meta.nkz),
-				)
-
+			# Capture the q=0 Coulomb (with G=0 removed) for Hartree, and the head vector u
+			if int(qx) == 0 and int(qy) == 0 and int(qz) == 0:
+				v_q0_noG0_munu = v_munu  # V_qfullG already has head zeroed; reuse v_munu
 				# Head-direction vector u in ISDF index space (unnormalized):
-				# Use the real-space average over r of zeta_{q=0,mu}(r) as the G=0 component.
-				G0_mu_nu = jnp.mean(zeta_q, axis=1)
+				# Use the real-space SUM over r of zeta_{q=0,mu}(r), which equals the
+				# forward-FFT G=0 coefficient with default (unnormalized) FFT convention.
+				G0_mu_nu = jnp.sum(zeta_q, axis=1)
+				# Optional diagnostic: build W_{mu,nu} from eps^{-1}(q=0) body and stash for later compare
+				try:
+					_eps0_path = os.path.join(input_dir, "eps0mat.h5")
+					if os.path.exists(_eps0_path):
+						W_munu_eps = compute_Wmunu_from_eps0_body(
+							wfn,
+							sym,
+							meta,
+							np.asarray(zeta_q),
+							np.asarray(qvec),
+							np.asarray(vcoul_comps),
+							np.asarray(V_qfullG),
+							_eps0_path,
+						)
+						# cache on python side for printing after W is built
+						W_munu_eps_body = jnp.asarray(W_munu_eps)
+					else:
+						W_munu_eps_body = None
+				except Exception as _e:
+					print(f"Warning: eps0 comparison failed: {_e}")
 
 
 			print(f"qpoint {iq_cpu} done")
@@ -1092,18 +1069,107 @@ def main(argv=None):
 		# psi_lT: (nk, ns, rmu, nb) XT_shard; psi_l: (nk, nb, ns, rmu) Y_shard
 		# psi_r:  (nk, nb, ns, rmu) X_shard;  psi_rT: (nk, ns, rmu, nb) YT_shard
 		# We reshard psi_rT to XT for chi0 so both G_v and G_c use {mu_X, nu_Y} without communication.
-		window_pairs = get_window_info(0.01, wfn, nband_max=nband)
+		window_pairs = get_window_info(epsq, wfn, nband_max=nband)
 		#psi_rT_X = jax.lax.with_sharding_constraint(psi_rT, NamedSharding(mesh_xy, P(None, None, 'x', None)))
 		_t_chiw_start = time.perf_counter()
 		chi0 = get_chi0_jax(psi_lT, psi_l, psi_r, psi_rT, enk_v_arr, enk_c_arr, window_pairs, meta, mesh_xy)
 		# Compute static W under k_XY sharding (S_qmunu included but unused for now)
 		W_q = get_static_w_q_jax(V_qmunu, chi0, None, meta, mesh_xy)
 		W_q.block_until_ready()
+		W_gamma_body_pre = W_q[0, 0, 0, 0, :, 0, :]
 		chiw_secs = time.perf_counter() - _t_chiw_start
 		# Compute static W under k_XY sharding (S_qmunu included but unused for now)
 		#W_q = get_static_w_q_jax(V_qmunu, chi0, S_qmunu, meta, mesh_xy)
 
  
+	# Compute q=0 averages (after restart/loop) and inject head-averages
+	# Build S(0) from dipole.h5 if available for anisotropic wcoul0
+	S_cart_omega0 = None
+	dipole_path = os.path.join(input_dir, "dipole.h5")
+	if os.path.exists(dipole_path):
+		try:
+			# Read dipole.h5 and build occupations
+			dipole_cart, deltaE = read_dipole_h5(dipole_path)
+			nk_tot = int(sym.nk_tot)
+			nb = int(wfn.nbands)
+			nelec = int(wfn.nelec)
+			occ = np.zeros((nk_tot, nb), dtype=float)
+			occ[:, :max(0, min(nelec, nb))] = 1.0
+			f_nk = jnp.asarray(occ, dtype=jnp.float64)
+			omegas = jnp.asarray([0.0], dtype=jnp.float64)
+			S_all = compute_S_omega(
+					dipole_cart,
+					deltaE,
+					f_nk,
+					float(wfn.cell_volume),
+					int(sym.nk_tot),
+					int(wfn.nspin),
+					int(wfn.nspinor),
+					omegas,
+					eta=0.0,
+				)
+			S_cart_omega0 = S_all[0]
+		except Exception as e:
+			print(f"Warning: failed to compute S(0) from dipole.h5 at {dipole_path}: {e}")
+	else:
+		print(f"ERROR: dipole.h5 not found at {dipole_path}; falling back to isotropic model for wcoul0.")
+
+	vc0_mean, wcoul0 = compute_q0_averages(wfn, jnp.asarray(0.2, dtype=jnp.float64), meta, S_cart=S_cart_omega0)
+	print(f"V_q=0,G=0 from miniBZ monte carlo: {float(vc0_mean.real):.4f}")
+	print(f"W_q=0(G=G'=0) small-q avg: {float(wcoul0.real):.6f} + {float(wcoul0.imag):.6f}i")
+	# Also report cell-volume scaled versions used in μν space
+	_vol_scale = float(1.0 / float(wfn.cell_volume))
+	print(f"V_q=0,G=0 / Ω: {float(vc0_mean.real * _vol_scale):.6f}")
+	print(f"W_q=0(G=G'=0) / Ω: {float(wcoul0.real * _vol_scale):.6f} + {float(wcoul0.imag * _vol_scale):.6f}i")
+
+	# Inject head-averages after building W/V
+	# - Add wcoul0 * u u^† to W at q=0 (if screened)
+	# - Add vcoul0 * u u^† to V at q=0 for Sigma_X
+
+	outer_u = (G0_mu_nu[:, None] * jnp.conj(G0_mu_nu)[None, :])
+	# Scale by 1/Volume to match V/W units used in μν-space (see compute_V_qfullG_for_q)
+	vol_scale = jnp.asarray(1.0 / float(wfn.cell_volume), dtype=jnp.float64)
+	# Update V first (used for Sigma_X); q=0 slice is [0,0,0,0,0,0]
+	V_qmunu = V_qmunu.at[0, 0, 0, 0, 0, 0, :, :].add((vc0_mean * vol_scale) * outer_u)
+	#if do_screened:
+		#W_q = W_q.at[0, 0, 0, 0, :, 0, :].add((wcoul0 * vol_scale) * outer_u)
+
+	# If do_screened and we computed the eps^{-1} body comparison, print diagnostics
+	if do_screened:
+		try:
+			if 'W_munu_eps_body' in locals() and W_munu_eps_body is not None:
+				avg_eps = jnp.real(jnp.mean(W_munu_eps_body))
+				avg_w_body = jnp.real(jnp.mean(W_gamma_body_pre))
+				print(f"W_q=0 μν avg from eps^{-1} (body): {float(avg_eps):.6f}")
+				print(f"W_q=0 μν avg from pipeline (body): {float(avg_w_body):.6f}")
+				# Hermiticity diagnostics
+				W_eps_np = np.asarray(W_munu_eps_body)
+				W_pip_np = np.asarray(W_gamma_body_pre)
+				res_eps = np.max(np.abs(W_eps_np - W_eps_np.conj().T))
+				di_eps = float(np.max(np.abs(np.imag(np.diag(W_eps_np)))))
+				res_pip = np.max(np.abs(W_pip_np - W_pip_np.conj().T))
+				di_pip = float(np.max(np.abs(np.imag(np.diag(W_pip_np)))))
+				print(f"[eps body] herm_resid={res_eps:.3e} max|Im diag|={di_eps:.3e}")
+				print(f"[pipeline body] herm_resid={res_pip:.3e} max|Im diag|={di_pip:.3e}")
+				# Sample elements
+				print("W(0,0) eps^{-1}/body vs pipeline/body:", complex(W_munu_eps_body[0,0]), complex(W_gamma_body_pre[0,0]))
+				if W_munu_eps_body.shape[0] > 1:
+					print("W(1,1) eps^{-1}/body vs pipeline/body:", complex(W_munu_eps_body[1,1]), complex(W_gamma_body_pre[1,1]))
+				# Pretty top-left 3x3 (real parts, 2 decimals)
+				def _print3(label, A):
+					A3 = np.asarray(A)[:3, :3]
+					R = np.real(A3)
+					rows = [" ".join(f"{x:8.2f}" for x in R[i]) for i in range(min(3, R.shape[0]))]
+					print(label)
+					for r in rows:
+						print(r)
+				_print3("V (body, Γ) top-left 3x3 (Re)", v_q0_noG0_munu)
+				_print3("W (pipeline body, Γ) top-left 3x3 (Re)", W_gamma_body_pre)
+				_print3("W (eps^{-1} body, Γ) top-left 3x3 (Re)", W_munu_eps_body)
+		except Exception as _e:
+			print(f"Warning: printing eps^{-1} body comparison failed: {_e}")
+		print('increased W_q by wcoul0 * u u^† ', jnp.sum((wcoul0 * vol_scale) * outer_u / jnp.sum(W_q)))
+
 	# Prepare V_mu_nu (nrmu1,nrmu2,nkx,nky,nkz) from LabeledArray V_qmunu data
 	# V_qmunu has axes [nfreq, npol1, npol2, nkx, nky, nkz, nrmu1, nrmu2]
 	# We need V_mu_nu = V_qmunu[0,0,0,:,:,:, :, :].transpose(6->0,7->1,3->2,4->3,5->4)
