@@ -51,6 +51,7 @@ from .w_isdf import get_chi0_jax, get_static_w_q_jax
 from .w_from_eps0 import compute_Wmunu_from_eps0_body
 from .vcoul import compute_vcoul_comps_for_q, compute_V_qfullG_for_q, compute_q0_averages
 from ..common.chi_from_dipole import read_dipole_h5, compute_S_omega
+from ..common.epsreader import EPSReader
 from .gw_file_io import (write_sigma_to_file, write_eqp_table, write_labeled_arrays_to_h5, 
                          read_labeled_arrays_from_h5, load_labeled_arrays_from_h5, 
                          save_restart_per_proc)
@@ -273,6 +274,8 @@ def read_cohsex_input(filename: str) -> dict:
 			"x_only": getb("x_only", fallback=False),
 			"do_screened": getb("do_screened", fallback=True),
 			"bispinor": getb("bispinor", fallback=False),
+			# Source for wcoul0 small-q head average: 'epshead' or 's_tensor'
+			"wcoul0_source": get("wcoul0_source", fallback="s_tensor").strip().lower(),
 			"wfn_file": get("wfn_file", fallback="WFN.h5"),
 			"centroids_file": get("centroids_file", fallback="centroids_frac.txt"),
 			"output_file": get("output_file", fallback="eqp0_noqsym.dat"),
@@ -291,6 +294,7 @@ def read_cohsex_input(filename: str) -> dict:
 			"x_only": False,
 			"do_screened": True,
 			"bispinor": False,
+			"wcoul0_source": "s_tensor",
 			"wfn_file": "WFN.h5",
 			"centroids_file": "centroids_frac.txt",
 			"output_file": "eqp0_noqsym.dat",
@@ -1094,12 +1098,37 @@ def main(argv=None):
 
  
 	# Compute q=0 averages (after restart/loop) and inject head-averages
-	# Build S(0) from dipole.h5 if available for anisotropic wcoul0
-	S_cart_omega0 = None
-	dipole_path = os.path.join(input_dir, "dipole.h5")
-	if os.path.exists(dipole_path):
+	# Choose wcoul0 source matching best agreement and plot normalization
+	eps0_path = os.path.join(input_dir, "eps0mat.h5")
+	want_source = str(params.get("wcoul0_source", "epshead")).strip().lower()
+	vc0_mean = None; wcoul0 = None
+	if want_source not in ("epshead", "s_tensor"):
+		print(f"Unknown wcoul0_source={want_source}; defaulting to 'epshead'")
+		want_source = "epshead"
+
+	def _try_epshead():
+		nonlocal vc0_mean, wcoul0
+		if not os.path.exists(eps0_path):
+			return False
 		try:
-			# Read dipole.h5 and build occupations
+			eps0 = EPSReader(eps0_path)
+			epshead = eps0.epshead
+			vc0_mean, wcoul0 = compute_q0_averages(
+				wfn, jnp.asarray(epshead, dtype=jnp.complex128), meta, S_cart=None
+			)
+			print("Using eps0mat.h5 epshead-based wcoul0 (gamma model)")
+			return True
+		except Exception as e:
+			print(f"Warning: eps0mat.h5 present but failed to compute wcoul0 from epshead: {e}")
+			return False
+
+	def _try_s_tensor():
+		nonlocal vc0_mean, wcoul0
+		dipole_path = os.path.join(input_dir, "dipole.h5")
+		if not os.path.exists(dipole_path):
+			print(f"dipole.h5 not found at {dipole_path}; cannot build S(0) wcoul0")
+			return False
+		try:
 			dipole_cart, deltaE = read_dipole_h5(dipole_path)
 			nk_tot = int(sym.nk_tot)
 			nb = int(wfn.nbands)
@@ -1109,23 +1138,33 @@ def main(argv=None):
 			f_nk = jnp.asarray(occ, dtype=jnp.float64)
 			omegas = jnp.asarray([0.0], dtype=jnp.float64)
 			S_all = compute_S_omega(
-					dipole_cart,
-					deltaE,
-					f_nk,
-					float(wfn.cell_volume),
-					int(sym.nk_tot),
-					int(wfn.nspin),
-					int(wfn.nspinor),
-					omegas,
-					eta=0.0,
-				)
+				dipole_cart,
+				deltaE,
+				f_nk,
+				float(wfn.cell_volume),
+				int(sym.nk_tot),
+				int(wfn.nspin),
+				int(wfn.nspinor),
+				omegas,
+				eta=0.0,
+			)
 			S_cart_omega0 = S_all[0]
+			vc0_mean, wcoul0 = compute_q0_averages(
+				wfn, jnp.asarray(0.0, dtype=jnp.float64), meta, S_cart=S_cart_omega0
+			)
+			print("Using dipole.h5 S(0)-based wcoul0 (anisotropic model)")
+			return True
 		except Exception as e:
 			print(f"Warning: failed to compute S(0) from dipole.h5 at {dipole_path}: {e}")
-	else:
-		print(f"ERROR: dipole.h5 not found at {dipole_path}; falling back to isotropic model for wcoul0.")
+			return False
 
-	vc0_mean, wcoul0 = compute_q0_averages(wfn, jnp.asarray(0.2, dtype=jnp.float64), meta, S_cart=S_cart_omega0)
+	ok = False
+	if want_source == "epshead":
+		ok = _try_epshead() or _try_s_tensor()
+	else:  # s_tensor preferred
+		ok = _try_s_tensor() or _try_epshead()
+	if not ok:
+		raise RuntimeError("Failed to determine wcoul0: neither eps0mat.h5 epshead nor dipole.h5 S(0) available")
 	print(f"V_q=0,G=0 from miniBZ monte carlo: {float(vc0_mean.real):.4f}")
 	print(f"W_q=0(G=G'=0) small-q avg: {float(wcoul0.real):.6f} + {float(wcoul0.imag):.6f}i")
 	# Also report cell-volume scaled versions used in μν space

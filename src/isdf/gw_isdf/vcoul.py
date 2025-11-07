@@ -284,9 +284,15 @@ def compute_q0_averages(
 		vqc = vq.astype(jnp.complex128)
 		wcoul0 = jnp.mean(vqc / (1.0 - vqc * qSq))
 	else:
-		# Fallback: isotropic gamma model from epshead (dimensionless)
+		# epshead-based small-q model consistent with cohsex_isdf
+		# Calibrate gamma using a tiny q0 in crystal units (e.g., 0.001,0,0)
+		q0_crys = jnp.asarray((0.001, 0.0, 0.0), dtype=jnp.float64)
+		q0_cart = q0_crys @ bvec
+		q0len = jnp.linalg.norm(q0_cart)
+		vc_q0 = (1.0 - jnp.exp(-q0len * zk)) / jnp.where(q0len > 0, q0len * q0len, 1.0)
+		gamma = (1.0 / jnp.asarray(jnp.real(epshead), dtype=jnp.float64) - 1.0) / jnp.where(vc_q0 > 0, (q0len * q0len) * vc_q0, 1.0)
+		# Build w(q) on the same samples (qz=0 shell)
 		vc_q = (1.0 - jnp.exp(-kxy * zk)) / (kxy * kxy)
-		gamma = (1.0 / jnp.asarray(epshead.real, dtype=jnp.float64) - 1.0)
 		wq = vc_q / (1.0 + vc_q * (kxy * kxy) * gamma)
 		wcoul0 = 8.0 * jnp.pi * jnp.mean(wq)
 
