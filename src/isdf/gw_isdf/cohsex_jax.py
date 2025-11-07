@@ -953,9 +953,20 @@ def main(argv=None):
 			if int(qx) == 0 and int(qy) == 0 and int(qz) == 0:
 				v_q0_noG0_munu = v_munu  # V_qfullG already has head zeroed; reuse v_munu
 				# Head-direction vector u in ISDF index space (unnormalized):
-				# Use the real-space SUM over r of zeta_{q=0,mu}(r), which equals the
-				# forward-FFT G=0 coefficient with default (unnormalized) FFT convention.
-				G0_mu_nu = jnp.sum(zeta_q, axis=1)
+				# Extract u = zeta_{mu}(G=0) using the SAME FFT convention as used in V/W build.
+				# Build zeta_G and pick the G=0 index from vcoul_comps.
+				fft_nx, fft_ny, fft_nz = int(meta.fft_grid[0]), int(meta.fft_grid[1]), int(meta.fft_grid[2])
+				z_sp = zeta_q.reshape(zeta_q.shape[0], fft_nx, fft_ny, fft_nz)
+				phase = jnp.ones((1, fft_nx, fft_ny, fft_nz), dtype=jnp.complex128)  # q=0
+				z_G = jnp.fft.fftn(z_sp * phase, axes=(-3, -2, -1))
+				# find index of G=(0,0,0) in vcoul_comps (use NumPy for robustness outside jit)
+				vc_np = np.asarray(vcoul_comps)
+				g0_mask_np = (vc_np[:, 0] == 0) & (vc_np[:, 1] == 0) & (vc_np[:, 2] == 0)
+				if not np.any(g0_mask_np):
+					g0_idx = int(np.argmin(np.sum(vc_np * vc_np, axis=1)))
+				else:
+					g0_idx = int(np.where(g0_mask_np)[0][0])
+				G0_mu_nu = z_G[:, vc_np[g0_idx, 0], vc_np[g0_idx, 1], vc_np[g0_idx, 2]]
 				# Optional diagnostic: build W_{mu,nu} from eps^{-1}(q=0) body and stash for later compare
 				try:
 					_eps0_path = os.path.join(input_dir, "eps0mat.h5")
@@ -1129,10 +1140,12 @@ def main(argv=None):
 	outer_u = (G0_mu_nu[:, None] * jnp.conj(G0_mu_nu)[None, :])
 	# Scale by 1/Volume to match V/W units used in μν-space (see compute_V_qfullG_for_q)
 	vol_scale = jnp.asarray(1.0 / float(wfn.cell_volume), dtype=jnp.float64)
-	# Update V first (used for Sigma_X); q=0 slice is [0,0,0,0,0,0]
+	# For Sigma_X, use the simple head injection as before:
+	# V_Γ ← V_Γ + (vcoul0/Ω) · u u†
 	V_qmunu = V_qmunu.at[0, 0, 0, 0, 0, 0, :, :].add((vc0_mean * vol_scale) * outer_u)
-	#if do_screened:
-		#W_q = W_q.at[0, 0, 0, 0, :, 0, :].add((wcoul0 * vol_scale) * outer_u)
+	# For screened W, apply the same simple head injection when enabled
+	if do_screened:
+		W_q = W_q.at[0, 0, 0, 0, :, 0, :].add((wcoul0 * vol_scale) * outer_u)
 
 	# If do_screened and we computed the eps^{-1} body comparison, print diagnostics
 	if do_screened:
@@ -1166,9 +1179,17 @@ def main(argv=None):
 				_print3("V (body, Γ) top-left 3x3 (Re)", v_q0_noG0_munu)
 				_print3("W (pipeline body, Γ) top-left 3x3 (Re)", W_gamma_body_pre)
 				_print3("W (eps^{-1} body, Γ) top-left 3x3 (Re)", W_munu_eps_body)
+				# Also print pipeline with head injected and u†Wu/u†Vu checks
+				W_gamma_full = W_q[0, 0, 0, 0, :, 0, :]
+				_print3("W (pipeline head+body, Γ) top-left 3x3 (Re)", W_gamma_full)
+				u = G0_mu_nu
+				uWu = jnp.vdot(u, jnp.matmul(W_gamma_full, u))
+				uVu = jnp.vdot(u, jnp.matmul(V_qmunu[0,0,0,0,0,0], u))
+				print(f"u^† W_Γ u (Re) vs wcoul0/Ω: {float(jnp.real(uWu)):.6f} vs {float(jnp.real(wcoul0 * vol_scale)):.6f}")
+				print(f"u^† V_Γ u (Re) vs vcoul0/Ω: {float(jnp.real(uVu)):.6f} vs {float(jnp.real(vc0_mean * vol_scale)):.6f}")
 		except Exception as _e:
 			print(f"Warning: printing eps^{-1} body comparison failed: {_e}")
-		print('increased W_q by wcoul0 * u u^† ', jnp.sum((wcoul0 * vol_scale) * outer_u / jnp.sum(W_q)))
+		print('increased W_q by wcoul0 * u u^† ', jnp.sum((wcoul0 * vol_scale) * outer_u) / jnp.sum(W_q))
 
 	# Prepare V_mu_nu (nrmu1,nrmu2,nkx,nky,nkz) from LabeledArray V_qmunu data
 	# V_qmunu has axes [nfreq, npol1, npol2, nkx, nky, nkz, nrmu1, nrmu2]
