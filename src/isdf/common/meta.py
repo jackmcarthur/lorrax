@@ -1,6 +1,8 @@
 from dataclasses import dataclass
+from types import SimpleNamespace
 import numpy as np
 import jax
+import jax.numpy as jnp
 
 
 def _round_up(x: int, n: int) -> int:
@@ -31,6 +33,39 @@ class Meta:
     nbnd_jax: int
     n_rtot_jax: int
     n_rmu_jax: int
+
+    def __post_init__(self):
+        # Cache commonly reused grid/band descriptors to avoid ad-hoc rebuilds elsewhere.
+        self.kgrid = (self.nkx, self.nky, self.nkz)
+        self.kgrid_np = np.asarray(self.kgrid, dtype=np.int32)
+        self.kgrid_jax = jnp.asarray(self.kgrid_np)
+        self.fft_grid_np = np.asarray(self.fft_grid, dtype=np.int32)
+        self.fft_grid_jax = jnp.asarray(self.fft_grid_np)
+        b0, b1, b2, b3, b4 = (
+            self.b_id_0,
+            self.b_id_1,
+            self.b_id_2,
+            self.b_id_3,
+            self.b_id_4,
+        )
+        self.band_edges = (b0, b1, b2, b3, b4)
+        self.band_ranges = SimpleNamespace(
+            valence=(b1, b2),
+            conduction=(b2, b3),
+            sigma=(b1, b3),
+            full=(b0, b4),
+            occupied=(b0, b2),
+            val_plus_sigma=(b0, b3),
+            cond_plus_sigma=(b1, b4),
+        )
+
+    def band_range(self, name: str) -> tuple[int, int]:
+        if not hasattr(self, "band_ranges"):
+            raise AttributeError("Meta.band_ranges not initialised")
+        try:
+            return getattr(self.band_ranges, name)
+        except AttributeError as exc:
+            raise KeyError(f"Unknown band window '{name}'") from exc
 
     @classmethod
     def from_system(

@@ -194,6 +194,7 @@ def make_shardings(mesh_xy: Mesh) -> SimpleNamespace:
 	return SimpleNamespace(
 		# General 2D shardings
 		xy_shard = NamedSharding(mesh_xy, P('x', 'y')),
+		replicated_2 = NamedSharding(mesh_xy, P(None, None)),
 		y_shard_vec = NamedSharding(mesh_xy, P('y')),
 		xy0_2 = NamedSharding(mesh_xy, P(('x','y'), None)),
 		x0y1_2 = NamedSharding(mesh_xy, P('x','y')),
@@ -390,29 +391,23 @@ def get_zeta_q_and_v_q_mu_nu(
 	nb_r_padded = total_devices * bands_per_device_r
 
 	# initialize output V_q,mu,nu array
-	G_dim_total = int(V_qG.shape[-1])
-	V_qfullG = jnp.zeros((G_dim_total), dtype=jnp.complex128)
+	sys_dim = getattr(meta, "sys_dim", 2)
+	# V_qG retained for API compatibility; per-q Coulomb data is built on demand below.
 	# Create a JAX array for V_qmunu with 2D sharding over the last two dims (nrmu1,nrmu2)
 
-	if mesh_xy is not None:
-		x6y7_8 = NamedSharding(mesh_xy, P(None, None, None, None, None, None, 'x', 'y'))
-		x3y4_5 = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-		V_qmunu = jnp.zeros(
-			(1, meta.npol, meta.npol, meta.nkx, meta.nky, meta.nkz, meta.n_rmu, meta.n_rmu),
-			dtype=jnp.complex128)
-		S_qmunu = jnp.zeros((meta.nkx, meta.nky, meta.nkz, meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
-		V_qmunu = jax.lax.with_sharding_constraint(V_qmunu, x6y7_8)
-		S_qmunu = jax.lax.with_sharding_constraint(S_qmunu, x3y4_5)
-	else:
-		V_qmunu = jnp.zeros(
-			(1, meta.npol, meta.npol, meta.nkx, meta.nky, meta.nkz, meta.n_rmu, meta.n_rmu),
-			dtype=jnp.complex128)
-		S_qmunu = jnp.zeros((meta.nkx, meta.nky, meta.nkz, meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
+	sh = make_shardings(mesh_xy) if mesh_xy is not None else None
+	V_shape = (1, meta.npol, meta.npol, *meta.kgrid, meta.n_rmu, meta.n_rmu)
+	S_shape = (*meta.kgrid, meta.n_rmu, meta.n_rmu)
+	V_qmunu = jnp.zeros(V_shape, dtype=jnp.complex128)
+	S_qmunu = jnp.zeros(S_shape, dtype=jnp.complex128)
+	if sh is not None:
+		V_qmunu = jax.lax.with_sharding_constraint(V_qmunu, sh.x6y7_8)
+		S_qmunu = jax.lax.with_sharding_constraint(S_qmunu, sh.x3y4_5)
 
 	V_q_names = ["nfreq", "npol1", "npol2", "nkx", "nky", "nkz", "nrmu1", "nrmu2"]
 
 	# 3. Convert weights and other arrays to JAX
-	kgrid = jnp.asarray((meta.nkx, meta.nky, meta.nkz), dtype=jnp.int32)
+	kgrid = meta.kgrid_jax
 	# Get band ranges and weights in JAX
 	enk_l, weights_l = get_enk_bandrange(
 		wfn, sym, bandrange_l, (bandrange_r[0], bandrange_l[1])
@@ -435,7 +430,7 @@ def get_zeta_q_and_v_q_mu_nu(
 		preprocessed_q_data = preprocess_q_loops(wfn, sym, meta, mesh_xy=mesh_xy)
 
 	(all_k_l_indices, all_k_r_indices, all_qvecs_wrapped,
-	 all_V_qfullG, all_vcoul_comps, n_G_per_q, all_qvecs_nonneg, all_iq_indices) = preprocessed_q_data
+	 all_qvecs_nonneg, all_iq_indices) = preprocessed_q_data
 
 	print(f"Using preprocessed data for {all_k_l_indices.shape[0]} q-points")
 
@@ -479,19 +474,23 @@ def get_zeta_q_and_v_q_mu_nu(
 		k_l_indices = all_k_l_indices[q_idx]
 		k_r_indices = all_k_r_indices[q_idx]
 		qvec = all_qvecs_wrapped[q_idx]
-		V_qfullG = all_V_qfullG[q_idx]
-		vcoul_comps = all_vcoul_comps[q_idx]
-		n_G_q = n_G_per_q[q_idx]
+		_, _, qvec_wrapped, vcoul_comps = compute_vcoul_comps_for_q(wfn, sym, meta, qvec_nonneg)
+		V_qfullG = compute_V_qfullG_for_q(
+			wfn,
+			qvec_wrapped,
+			vcoul_comps,
+			0.0,
+			do_Dmunu=bispinor,
+			sys_dim=sys_dim,
+		)
 		# CCT and ZCT for this q-point
 		CCT, ZCT = compute_CCT_ZCT_for_q(k_l_indices, k_r_indices, psi_l_rmu, psi_r_rmu, psi_l_rtot, psi_r_rtot, psi_l_rmuT, psi_r_rmuT)
 
 		# Minimal sharding hint: keep rows on x and cols on y, matching wfn shardings
 		try:
-			if mesh_xy is not None:
-				xy2d = NamedSharding(mesh_xy, P('x', 'y'))
-				null_2 = NamedSharding(mesh_xy, P(None, None))
-				CCT = jax.lax.with_sharding_constraint(CCT, null_2)
-				ZCT = jax.lax.with_sharding_constraint(ZCT, xy2d)
+			if sh is not None:
+				CCT = jax.lax.with_sharding_constraint(CCT, sh.replicated_2)
+				ZCT = jax.lax.with_sharding_constraint(ZCT, sh.xy_shard)
 			print("CCT sharding:", jax.sharding.get_array_sharding(CCT))
 			print("ZCT sharding:", jax.sharding.get_array_sharding(ZCT))
 		except Exception:
@@ -503,39 +502,36 @@ def get_zeta_q_and_v_q_mu_nu(
 		zeta_q = jax.scipy.linalg.cho_solve(CCT_cholesky, ZCT, overwrite_b=True)
 
 		# Reshard to be sharded over ALL processors in rmu dimension (1D mesh)
-		if mesh_xy is not None:
-			xy0_2 = NamedSharding(mesh_xy, P(('x','y'), None))
-			x0y1_2 = NamedSharding(mesh_xy, P('x','y'))
-			zeta_q = jax.lax.with_sharding_constraint(zeta_q, xy0_2)
-		# Overlap matrix S_q = sum_r zeta^*_q,mu(r) * zeta_q,nu(r)
-		@partial(jax.jit, in_shardings=(xy0_2), out_shardings=(x0y1_2))
-		def compute_Sq(zeta_q_spatial):
-			return jnp.einsum('mu,nu->mn', jnp.conj(zeta_q_spatial), zeta_q_spatial, optimize=True)
-		
-		qx = int(qvec_nonneg[0])
-		qy = int(qvec_nonneg[1])
-		qz = int(qvec_nonneg[2])
-		S_qmunu = S_qmunu.at[qx, qy, qz, :, :].set(compute_Sq(zeta_q))
-		  
-		# Reshape zeta_q: (n_rmu, n_rtot) → (n_rmu, nx, ny, nz) 
+		if sh is not None:
+			zeta_q = jax.lax.with_sharding_constraint(zeta_q, sh.xy0_2)
+		S_q_local = compute_Sq_from_zeta(zeta_q)
+		if sh is not None:
+			S_q_local = jax.lax.with_sharding_constraint(S_q_local, sh.x0y1_2)
+		qx, qy, qz = (int(v) for v in qvec_nonneg)
+		S_qmunu = S_qmunu.at[qx, qy, qz, :, :].set(S_q_local)
+
+		# Reshape zeta_q: (n_rmu, n_rtot) → (n_rmu, nx, ny, nz)
 		zeta_q_spatial = zeta_q.reshape(meta.n_rmu, *meta.fft_grid)
-		# Phase removal and FFT  
+		# Phase removal and FFT
 		fx = jnp.arange(meta.fft_grid[0])[None, :, None, None] / meta.fft_grid[0]
 		fy = jnp.arange(meta.fft_grid[1])[None, None, :, None] / meta.fft_grid[1]
 		fz = jnp.arange(meta.fft_grid[2])[None, None, None, :] / meta.fft_grid[2]
 		kgrfloat = jnp.asarray(kgrid, dtype=jnp.float64)
-		phase = jnp.exp(-2j * jnp.pi * (qvec[0]/kgrfloat[0] * fx + qvec[1]/kgrfloat[1] * fy + qvec[2]/kgrfloat[2] * fz))
+		phase = jnp.exp(-2j * jnp.pi * (qvec[0] / kgrfloat[0] * fx + qvec[1] / kgrfloat[1] * fy + qvec[2] / kgrfloat[2] * fz))
 		zeta_q_spatial = zeta_q_spatial * phase
 		zeta_qG = jnp.fft.fftn(zeta_q_spatial, axes=(-3, -2, -1))
 		zeta_qG_flat = zeta_qG[:, vcoul_comps[:, 0], vcoul_comps[:, 1], vcoul_comps[:, 2]]
 
 		# Compute v[mu@X,nu@Y] = (zeta_qG .* sqrt(V))^H @ (zeta_qG .* sqrt(V)) with 2D sharding over (x,y)
 		# This keeps G sharded along Y inside the jitted matmul
-		xy_shard = NamedSharding(mesh_xy, P('x','y'))
-		y_shard_vec = NamedSharding(mesh_xy, P('y'))
-		zeta_qG_flat = jax.lax.with_sharding_constraint(zeta_qG_flat, xy_shard)
+		if sh is not None:
+			zeta_qG_flat = jax.lax.with_sharding_constraint(zeta_qG_flat, sh.xy_shard)
 
-		@partial(jax.jit, in_shardings=(xy_shard, y_shard_vec), out_shardings=xy_shard)
+		@partial(
+			jax.jit,
+			in_shardings=(sh.xy_shard if sh is not None else None, sh.y_shard_vec if sh is not None else None),
+			out_shardings=sh.xy_shard if sh is not None else None,
+		)
 		def v_munu_matmul(zflat, vmask):
 			zeta_v = zflat * jnp.sqrt(vmask)
 			return jnp.einsum('mG,nG->mn', jnp.conj(zeta_v), zeta_v, optimize=True)
@@ -545,26 +541,21 @@ def get_zeta_q_and_v_q_mu_nu(
 		#V_weighted = V_qfullG_masked[None, :] * zeta_qG_flat
 		#V_qmunu_q = jnp.conj(zeta_qG_masked) @ V_weighted.T
 		# Store result into sharded JAX array at this q-point
-		qx = int(qvec_nonneg[0])
-		qy = int(qvec_nonneg[1])
-		qz = int(qvec_nonneg[2])
+		qx, qy, qz = (int(v) for v in qvec_nonneg)
 		V_qmunu = V_qmunu.at[0, 0, 0, qx, qy, qz, :, :].set(v_munu)
 		print(f"qpoint {iq_cpu} done")
 
-	y3_4 = NamedSharding(mesh_xy, P(None, None, None, 'y'))
-	x3_4 = NamedSharding(mesh_xy, P(None, None, None, 'x'))
-	y2_4 = NamedSharding(mesh_xy, P(None, None, 'y', None))
-	x2_4 = NamedSharding(mesh_xy, P(None, None, 'x', None))
-	
-	# @partial(jax.jit, out_shardings=(y3_4, y2_4, x3_4, x2_4))
-	# def shard_psimu_2d(psil_rmu, psir_rmu):
-	#	return psil_rmu, psir_rmu, psil_rmu.transpose(0, 2, 3, 1), psir_rmu.transpose(0, 2, 3, 1)
-	# psil_rmu, psir_rmu, psil_rmuT, psir_rmuT = shard_psimu_2d(psi_l_rmu, psi_r_rmu)
-	with mesh_xy:
-		psil_Y = jax.device_put(psi_l_rmu, y3_4)
-		psilT_X = jax.lax.with_sharding_constraint(psil_Y.transpose(0, 2, 3, 1), x2_4)
-		psir_X = jax.device_put(psi_r_rmu, x3_4)
-		psirT_Y = jax.lax.with_sharding_constraint(psir_X.transpose(0, 2, 3, 1), y2_4)
+	if sh is not None:
+		with mesh_xy:
+			psil_Y = jax.device_put(psi_l_rmu, sh.y3_4)
+			psilT_X = jax.lax.with_sharding_constraint(psil_Y.transpose(0, 2, 3, 1), sh.x2_4)
+			psir_X = jax.device_put(psi_r_rmu, sh.x3_4)
+			psirT_Y = jax.lax.with_sharding_constraint(psir_X.transpose(0, 2, 3, 1), sh.y2_4)
+	else:
+		psil_Y = psi_l_rmu
+		psilT_X = psi_l_rmuT
+		psir_X = psi_r_rmu
+		psirT_Y = psi_r_rmuT
 
 	return V_qmunu, S_qmunu, psilT_X, psil_Y, psir_X, psirT_Y, enk_l, enk_r # T indicates b at end.
 
@@ -694,24 +685,22 @@ def preprocess_q_loops(wfn, sym, meta, mesh_xy=None):
 	Returns
 	-------
 	tuple
-		(all_k_l_indices, all_k_r_indices, all_qvecs_wrapped, 
-		 all_V_qfullG, all_vcoul_comps, n_G_per_q, all_qvecs_nonneg, all_iq_indices)
+		(all_k_l_indices, all_k_r_indices, all_qvecs_wrapped,
+		 all_qvecs_nonneg, all_iq_indices)
 	"""
 	print("Precomputing all q-point and k-point mappings...")
-	
-	kgrid = jnp.asarray((meta.nkx, meta.nky, meta.nkz), dtype=jnp.int32)
-	unfolded_kpts = jnp.asarray(sym.unfolded_kpts)
+
+	kgrid = meta.kgrid_jax
+	kgrid_np = meta.kgrid_np
 
 	# Collect all q-vectors and their mappings
 	all_qvecs_nonneg = []
 	all_qvecs_wrapped = []
 	all_k_l_indices = []
 	all_k_r_indices = []
-	all_V_qfullG = []
-	all_vcoul_comps = []
 	all_iq_indices = []
-	
-	for qvec_nonneg in np.ndindex(int(meta.nkx), int(meta.nky), int(meta.nkz)):
+
+	for qvec_nonneg in np.ndindex(*meta.kgrid):
 		# Handle umklapp for qvec (exact match to original)
 		qvec = jnp.asarray(qvec_nonneg)
 		qvec = jnp.where(qvec > kgrid // 2, qvec - kgrid, qvec)
@@ -731,7 +720,7 @@ def preprocess_q_loops(wfn, sym, meta, mesh_xy=None):
 		
 		# Bookkeeping only
 		qvec_cpu = np.array(qvec)
-		qveccrys = qvec_cpu.astype(np.float64) / np.array(kgrid)
+		qveccrys = qvec_cpu.astype(np.float64) / kgrid_np
 		q_rounded = np.round(qveccrys)
 		q_ext = np.where(np.abs(qveccrys - q_rounded) < 1e-8, q_rounded, qveccrys)
 		iq = sym.find_qpoint_index(q_ext, tol=1e-6)
@@ -799,16 +788,6 @@ def main(argv=None):
 	wfn = WFNReader(params["wfn_file"])
 	sym = symmetry_maps.SymMaps(wfn)
 	
-	nvrange, ncrange, nsigmarange, n_fullrange, n_valrange = get_bandranges(nval, ncond, nband, wfn.nelec)
-	nvplussigrange = (min(n_valrange), max(nsigmarange))
-	ncplussigrange = (min(nsigmarange), max(n_fullrange))
-	# notating as simply as possible all the possible edges of a band range
-	b0 = 0
-	b1 = ncplussigrange[0]
-	b2 = wfn.nelec
-	b3 = nvplussigrange[1]
-	b4 = n_fullrange[1]
-
 	# Load centroids
 	centroids_frac = np.loadtxt(params["centroids_file"])
 	_n_rmu = int(centroids_frac.shape[0])
@@ -842,6 +821,12 @@ def main(argv=None):
 	meta = Meta.from_system(wfn, sym, nval, ncond, nband, _n_rmu, bispinor)
 	meta.rank = jax.process_index()
 	meta.n_proc = jax.process_count()
+	meta.sys_dim = sys_dim
+	meta.bispinor = bispinor
+	band = meta.band_ranges
+	b0, b1, b2, b3, b4 = meta.band_edges
+	nvplussigrange = band.val_plus_sigma
+	ncplussigrange = band.cond_plus_sigma
 	# rank-aware print helper
 	def print0(*a, **k):
 		if meta.rank == 0:
@@ -870,7 +855,8 @@ def main(argv=None):
 		print0(f"Device mesh: (X={grid_x}, Y={grid_y})")
 
 		# Left window: read G-vectors -> global G-space; then jitted sharded wfn build
-		brange_l = nvplussigrange if not x_only else [b0,b3]
+		sigma_window = nvplussigrange
+		brange_l = sigma_window
 		global_psiG_l, nb_l = read_Gvecs_to_devices(wfn, sym, brange_l, meta, bispinor, mesh_xy)
 		psi_l_rtot_Y, psi_l_rmu_Y, psi_l_rmuT_X = get_sharded_wfns(
 			global_psiG_l, sym, meta, centroid_indices, nb_l, False, mesh_xy
@@ -881,7 +867,7 @@ def main(argv=None):
 		gc.collect()
 
 		# Right window (nv+sigma or sigma-only)
-		brange_r = ncplussigrange if not x_only else [b0,b3]
+		brange_r = sigma_window if x_only else ncplussigrange
 		global_psiG_r, nb_r = read_Gvecs_to_devices(wfn, sym, brange_r, meta, bispinor, mesh_xy)
 		psi_r_rtot_Y, psi_r_rmu_Y, psi_r_rmuT_X = get_sharded_wfns(
 			global_psiG_r, sym, meta, centroid_indices, nb_r, False, mesh_xy
