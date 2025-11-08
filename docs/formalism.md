@@ -53,3 +53,14 @@ then project back to band space Sigma_kij by contracting with psi. Screened exch
 
 For implementation details, see `src/isdf/gw_isdf/cohsex_jax.py` and `src/isdf/gw_isdf/w_isdf.py`.
 
+
+
+### Self consistency
+To do self consistent updates, we need to iterate the V_hartree and Sigma_GW contributions to the self energy until the wavefunctions remain unchanged.
+
+The DFT hamiltonian is K (kinetic E) + I (ionic local + nonlocal E) + H (hartree E) + Vxc.
+We use isdf.psp.kin_ion_io to write the K+I elements to file so we can update V_hartree+Sigma_GW ourselves.
+
+We also use the output of the interpolation-point finding code (kmeans clustering step weighted by the charge density) and the dipole matrix elements from isdf.psp.get_dipole_mtxels to calculate the "head correction" to the screened interaction W. Theoretically these should probably all be done on startup of cohsex_jax but they are all kind of slow (like 10+ seconds each) and we shouldn't do that until they have been profiled and highly optimized with JAX for performance.
+
+The self consistent iterations right now are untested (alpha only, not converging well).

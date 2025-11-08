@@ -155,7 +155,7 @@ def compute_v_munu_from_zeta(
 	zeta_q: jax.Array,
 	qvec_wrapped: jax.Array,
 	vcoul_comps: jax.Array,
-	V_qfullG: jax.Array,
+	sqrt_V_qfullG: jax.Array,
 	fft_nx: int,
 	fft_ny: int,
 	fft_nz: int,
@@ -166,7 +166,8 @@ def compute_v_munu_from_zeta(
 	"""Compute v_{mu,nu}(q) from zeta_q(r) with explicit arguments.
 
 	All required sizes and vectors are passed as arguments to avoid reliance on
-	outer-scope state. Returns (n_rmu, n_rmu) for a single q.
+	outer-scope state. Returns (n_rmu, n_rmu) for a single q. Expects sqrt(V_qfullG)
+	to avoid recomputing the square root inside the loop.
 	"""
 	fx = jnp.arange(fft_nx)[None, :, None, None] / float(fft_nx)
 	fy = jnp.arange(fft_ny)[None, None, :, None] / float(fft_ny)
@@ -180,7 +181,7 @@ def compute_v_munu_from_zeta(
 	))
 	zeta_qG = jnp.fft.fftn(zeta_q_spatial * phase, axes=(-3, -2, -1))
 	zeta_qG_flat = zeta_qG[:, vcoul_comps[:, 0], vcoul_comps[:, 1], vcoul_comps[:, 2]]
-	zeta_v = zeta_qG_flat * jnp.sqrt(V_qfullG)
+	zeta_v = zeta_qG_flat * sqrt_V_qfullG
 	return jnp.einsum('mG,nG->mn', jnp.conj(zeta_v), zeta_v, optimize=True)
 
 def set_zeta_sharding(zeta_q: jax.Array, mesh_xy: Mesh | None):
@@ -265,6 +266,80 @@ def _legacy_q_data_iter(preprocessed_q_data) -> Iterator[SimpleNamespace]:
 			k_l_indices=jnp.asarray(k_l, dtype=jnp.int32),
 			k_r_indices=jnp.asarray(k_r, dtype=jnp.int32),
 		)
+
+
+def build_q_coulomb_cache(
+	wfn,
+	sym,
+	meta: Meta,
+	do_Dmunu: bool,
+	sys_dim: int,
+	mesh_xy: Mesh | None = None,
+) -> SimpleNamespace:
+	"""Precompute q-grid Coulomb metadata reused inside the q-loop.
+
+	Returns batched JAX arrays for the regular shapes so the q-loop can
+	run with minimal host-device transfers. Ragged per-q data (vcoul
+	components and sqrt(V)) are returned as tuples of device arrays.
+	"""
+	vcoul_comps_list: list[jax.Array] = []
+	sqrt_V_list: list[jax.Array] = []
+	k_l_list: list[jax.Array] = []
+	q_nonneg_list: list[jax.Array] = []
+	q_wrapped_list: list[jax.Array] = []
+	iq_indices: list[int] = []
+	k_r_indices_ref: jax.Array | None = None
+
+	for q_data in iter_qpoint_data(sym, meta):
+		if k_r_indices_ref is None:
+			k_r_indices_ref = q_data.k_r_indices
+		k_l_list.append(q_data.k_l_indices)
+		q_nonneg_list.append(jnp.asarray(q_data.q_nonneg, dtype=jnp.int32))
+		q_wrapped_list.append(jnp.asarray(q_data.q_wrapped, dtype=jnp.int32))
+		iq_indices.append(int(q_data.q_index))
+		_, _, qvec_wrapped_frac, vcoul_comps = compute_vcoul_comps_for_q(wfn, sym, meta, q_data.q_nonneg)
+		V_qfullG = compute_V_qfullG_for_q(wfn, qvec_wrapped_frac, vcoul_comps, 0.0, do_Dmunu=do_Dmunu, sys_dim=sys_dim)
+		vcoul_comps_list.append(jnp.asarray(vcoul_comps, dtype=jnp.int32))
+		sqrt_V_list.append(jnp.sqrt(V_qfullG))
+
+	if not k_l_list:
+		return SimpleNamespace(
+			num_q=0,
+			k_l_indices=jnp.zeros((0, 0), dtype=jnp.int32),
+			k_r_indices=jnp.zeros((0,), dtype=jnp.int32),
+			q_nonneg=jnp.zeros((0, 3), dtype=jnp.int32),
+			q_wrapped=jnp.zeros((0, 3), dtype=jnp.int32),
+			iq_indices=jnp.zeros((0,), dtype=jnp.int32),
+			vcoul_comps=tuple(),
+			sqrt_V_qfullG=tuple(),
+		)
+
+	k_l_stacked = jnp.stack(k_l_list, axis=0)
+	q_nonneg_arr = jnp.stack(q_nonneg_list, axis=0)
+	q_wrapped_arr = jnp.stack(q_wrapped_list, axis=0)
+	iq_arr = jnp.asarray(iq_indices, dtype=jnp.int32)
+	k_r_indices_arr = jnp.asarray(k_r_indices_ref, dtype=jnp.int32)
+
+	if mesh_xy is not None:
+		# Replicate metadata across the mesh to avoid repeated transfers.
+		rep_q = NamedSharding(mesh_xy, P(None, None))
+		q_nonneg_arr = jax.device_put(q_nonneg_arr, rep_q)
+		q_wrapped_arr = jax.device_put(q_wrapped_arr, rep_q)
+		rep_k = NamedSharding(mesh_xy, P(None, None))
+		k_l_stacked = jax.device_put(k_l_stacked, rep_k)
+		k_r_indices_arr = jax.device_put(k_r_indices_arr, NamedSharding(mesh_xy, P(None)))
+		iq_arr = jax.device_put(iq_arr, NamedSharding(mesh_xy, P(None)))
+
+	return SimpleNamespace(
+		num_q=int(q_nonneg_arr.shape[0]),
+		k_l_indices=k_l_stacked,
+		k_r_indices=k_r_indices_arr,
+		q_nonneg=q_nonneg_arr,
+		q_wrapped=q_wrapped_arr,
+		iq_indices=iq_arr,
+		vcoul_comps=tuple(vcoul_comps_list),
+		sqrt_V_qfullG=tuple(sqrt_V_list),
+	)
 
 
 def determine_wcoul0(params, input_dir, wfn, sym, meta, print_fn):
@@ -853,6 +928,7 @@ def main(argv=None):
 	nband = params["nband"]
 	sys_dim = params["sys_dim"]  # 3 for 3D, 2 for 2D
 	self_consistent = bool(params.get("self_consistent", False))
+	profile_qloop = bool(params.get("profile_qloop", False))
 
 	ryd2ev = 13.6056980659
 
@@ -975,16 +1051,17 @@ def main(argv=None):
 		# Main q-point loop
 		# zeta_q(r) is ephemeral inside the loop
 		################################################################################
-		q_data_iter = iter_qpoint_data(sym, meta)
-		for q_idx, q_data in enumerate(q_data_iter):
-			k_l_indices = q_data.k_l_indices
-			k_r_indices = q_data.k_r_indices
-			qvec_nonneg = q_data.q_nonneg
-			iq_cpu = q_data.q_index
-			qvec = jnp.asarray(q_data.q_wrapped, dtype=jnp.float64)
-			# Compute vcoul data on demand for this q (head set to zero inside kernel)
-			_, iqbar, qvec_wrapped, vcoul_comps = compute_vcoul_comps_for_q(wfn, sym, meta, qvec_nonneg)
-			V_qfullG = compute_V_qfullG_for_q(wfn, qvec_wrapped, vcoul_comps, 0.0, do_Dmunu=bispinor, sys_dim=sys_dim)
+		q_cache = build_q_coulomb_cache(wfn, sym, meta, do_Dmunu=bispinor, sys_dim=sys_dim, mesh_xy=mesh_xy)
+		q_profile_samples: list[tuple[int, float]] = []
+		for q_idx in range(q_cache.num_q):
+			k_l_indices = q_cache.k_l_indices[q_idx]
+			k_r_indices = q_cache.k_r_indices
+			qvec_nonneg = q_cache.q_nonneg[q_idx]
+			iq_cpu = int(q_cache.iq_indices[q_idx])
+			qvec = jnp.asarray(q_cache.q_wrapped[q_idx], dtype=jnp.float64)
+			vcoul_comps = q_cache.vcoul_comps[q_idx]
+			sqrt_V_qfullG = q_cache.sqrt_V_qfullG[q_idx]
+			_t_q_start = time.perf_counter() if profile_qloop else None
 			# Build CCT/ZCT then Cholesky solve for zeta_q
 			CCT, ZCT = compute_CCT_ZCT_for_q(
 				psi_l_rmu_Y, 
@@ -1003,13 +1080,17 @@ def main(argv=None):
 			# FFT to G and accumulate V_q,mu,nu using explicit-arg kernel
 			v_munu = compute_v_munu_from_zeta(
 				zeta_q,
-				jnp.asarray(qvec, dtype=jnp.float64),
+				qvec,
 				vcoul_comps,
-				V_qfullG,
+				sqrt_V_qfullG,
 				int(meta.fft_grid[0]), int(meta.fft_grid[1]), int(meta.fft_grid[2]),
 				int(meta.nkx), int(meta.nky), int(meta.nkz),
 			)
 			V_qmunu = V_qmunu.at[0, 0, 0, qx, qy, qz, :, :].set(v_munu)
+
+			if _t_q_start is not None:
+				v_munu.block_until_ready()
+				q_profile_samples.append((iq_cpu, time.perf_counter() - _t_q_start))
 
 			# Capture the q=0 Coulomb (with G=0 removed) for Hartree, and the head vector u
 			if int(qx) == 0 and int(qy) == 0 and int(qz) == 0:
@@ -1032,6 +1113,10 @@ def main(argv=None):
 
 
 			print(f"qpoint {iq_cpu} done")
+
+		if q_profile_samples and profile_qloop and meta.rank == 0:
+			elapsed = np.asarray([sample[1] for sample in q_profile_samples], dtype=np.float64)
+			print0(f"q-loop timing: mean={elapsed.mean()*1e3:.2f} ms, max={elapsed.max()*1e3:.2f} ms over {len(elapsed)} q-points")
 
 		# Sharded psi variants outside q-loop
 		with mesh_xy:
