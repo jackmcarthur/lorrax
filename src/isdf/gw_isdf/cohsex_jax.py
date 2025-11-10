@@ -14,10 +14,12 @@ import argparse
 import configparser
 import re
 import time
+from contextlib import nullcontext
 
 import numpy as np
 import jax
 import jax.numpy as jnp
+import jax.profiler as jax_profiler
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from functools import partial
 from types import SimpleNamespace
@@ -65,8 +67,10 @@ import gc
 
 # ================= Helper kernels (jitted) defined at module scope =================
 
-@partial(jax.jit)
+@partial(jax.jit, donate_argnums=(0, 1))
 def compute_CCT_ZCT_for_q(
+	CCT_buf: jax.Array,
+	ZCT_buf: jax.Array,
 	psi_l_rmu: jax.Array,
 	psi_r_rmu: jax.Array,
 	psi_l_rtot: jax.Array,
@@ -84,8 +88,12 @@ def compute_CCT_ZCT_for_q(
 	- psi_*_rmuT: (nk, n_rmu, nb, ns)
 	- k_*_indices: (n_pairs,)
 	"""
-	n_rmu = psi_l_rmu.shape[-1]
-	n_rtot = psi_l_rtot.shape[-1]
+	n_rmu = int(psi_l_rmu.shape[-1])
+	n_rtot = int(psi_l_rtot.shape[-1])
+
+	# Zero reuse buffers (donated by caller) without allocating fresh storage.
+	CCT_buf = jnp.zeros_like(CCT_buf)
+	ZCT_buf = jnp.zeros_like(ZCT_buf)
 
 	def accumulate_k_pair(carry, i):
 		CCT_acc, ZCT_acc = carry
@@ -105,9 +113,11 @@ def compute_CCT_ZCT_for_q(
 		ZCT_acc = ZCT_acc + jnp.conj(P_l) * P_r
 		return (CCT_acc, ZCT_acc), None
 
-	CCT_init = jnp.zeros((n_rmu, n_rmu), dtype=jnp.complex128)
-	ZCT_init = jnp.zeros((n_rmu, n_rtot), dtype=jnp.complex128)
-	(CCT, ZCT), _ = jax.lax.scan(accumulate_k_pair, (CCT_init, ZCT_init), jnp.arange(k_l_indices.shape[0]))
+	(CCT, ZCT), _ = jax.lax.scan(
+		accumulate_k_pair,
+		(CCT_buf, ZCT_buf),
+		jnp.arange(k_l_indices.shape[0]),
+	)
 	return CCT, ZCT
 
 
@@ -485,6 +495,8 @@ def read_cohsex_input(filename: str) -> dict:
 			"ncond": geti("ncond", fallback=5),
 			"nband": geti("nband", fallback=100),
 			"sys_dim": geti("sys_dim", fallback=2),
+			"profile_qloop": getb("profile_qloop", fallback=False),
+			"profile_trace_dir": get("profile_trace_dir", fallback=None),
 		}
 	else:
 		# Fallback defaults if no section found
@@ -504,6 +516,8 @@ def read_cohsex_input(filename: str) -> dict:
 			"ncond": 5,
 			"nband": 100,
 			"sys_dim": 2,
+			"profile_qloop": False,
+			"profile_trace_dir": None,
 		}
 
 	# Parse optional QE-style K_POINTS block: take the number after it, read next that many lines
@@ -683,7 +697,20 @@ def get_zeta_q_and_v_q_mu_nu(
 			sys_dim=sys_dim,
 		)
 		# CCT and ZCT for this q-point
-		CCT, ZCT = compute_CCT_ZCT_for_q(k_l_indices, k_r_indices, psi_l_rmu, psi_r_rmu, psi_l_rtot, psi_r_rtot, psi_l_rmuT, psi_r_rmuT)
+		n_rmu = psi_l_rmu.shape[-1]
+		n_rtot = psi_l_rtot.shape[-1]
+		CCT, ZCT = compute_CCT_ZCT_for_q(
+			jnp.zeros((n_rmu, n_rmu), dtype=jnp.complex128),
+			jnp.zeros((n_rmu, n_rtot), dtype=jnp.complex128),
+			psi_l_rmu,
+			psi_r_rmu,
+			psi_l_rtot,
+			psi_r_rtot,
+			psi_l_rmuT,
+			psi_r_rmuT,
+			k_l_indices,
+			k_r_indices,
+		)
 
 		# Minimal sharding hint: keep rows on x and cols on y, matching wfn shardings
 		try:
@@ -929,6 +956,7 @@ def main(argv=None):
 	sys_dim = params["sys_dim"]  # 3 for 3D, 2 for 2D
 	self_consistent = bool(params.get("self_consistent", False))
 	profile_qloop = bool(params.get("profile_qloop", False))
+	profile_trace_dir = params.get("profile_trace_dir")
 
 	ryd2ev = 13.6056980659
 
@@ -1044,6 +1072,12 @@ def main(argv=None):
 		v_q0_noG0_munu = jnp.zeros((meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
 		v_q0_noG0_munu = jax.lax.with_sharding_constraint(v_q0_noG0_munu, sh.xy_shard)
 		G0_mu_nu = None
+		# Reusable buffers for the expensive CCT/ZCT accumulation.
+		CCT_buf = jnp.zeros((meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
+		ZCT_buf = jnp.zeros((meta.n_rmu, psi_l_rtot_Y.shape[-1]), dtype=jnp.complex128)
+		if mesh_xy is not None:
+			CCT_buf = jax.lax.with_sharding_constraint(CCT_buf, sh.replicated_2)
+			ZCT_buf = jax.lax.with_sharding_constraint(ZCT_buf, sh.xy_shard)
 
 		# No local kernel definitions; use module-scope jitted helpers
 
@@ -1051,72 +1085,116 @@ def main(argv=None):
 		# Main q-point loop
 		# zeta_q(r) is ephemeral inside the loop
 		################################################################################
-		q_cache = build_q_coulomb_cache(wfn, sym, meta, do_Dmunu=bispinor, sys_dim=sys_dim, mesh_xy=mesh_xy)
-		q_profile_samples: list[tuple[int, float]] = []
-		for q_idx in range(q_cache.num_q):
-			k_l_indices = q_cache.k_l_indices[q_idx]
-			k_r_indices = q_cache.k_r_indices
-			qvec_nonneg = q_cache.q_nonneg[q_idx]
-			iq_cpu = int(q_cache.iq_indices[q_idx])
-			qvec = jnp.asarray(q_cache.q_wrapped[q_idx], dtype=jnp.float64)
-			vcoul_comps = q_cache.vcoul_comps[q_idx]
-			sqrt_V_qfullG = q_cache.sqrt_V_qfullG[q_idx]
-			_t_q_start = time.perf_counter() if profile_qloop else None
-			# Build CCT/ZCT then Cholesky solve for zeta_q
-			CCT, ZCT = compute_CCT_ZCT_for_q(
-				psi_l_rmu_Y, 
-				psi_r_rmu_Y, 
-				psi_l_rtot_Y, 
-				psi_r_rtot_Y, 
-				psi_l_rmuT_X, 
-				psi_r_rmuT_X,
-				k_l_indices, 
-				k_r_indices
-			)
-			zeta_q = solve_zeta_cholesky(CCT, ZCT)
-			zeta_q = set_zeta_sharding(zeta_q, mesh_xy)
-			# Compute S_q and write into S_qmunu
-			qx = int(qvec_nonneg[0]); qy = int(qvec_nonneg[1]); qz = int(qvec_nonneg[2])
-			# FFT to G and accumulate V_q,mu,nu using explicit-arg kernel
-			v_munu = compute_v_munu_from_zeta(
-				zeta_q,
-				qvec,
-				vcoul_comps,
-				sqrt_V_qfullG,
-				int(meta.fft_grid[0]), int(meta.fft_grid[1]), int(meta.fft_grid[2]),
-				int(meta.nkx), int(meta.nky), int(meta.nkz),
-			)
-			V_qmunu = V_qmunu.at[0, 0, 0, qx, qy, qz, :, :].set(v_munu)
+		if profile_trace_dir:
+			profile_trace_dir = _resolve_path(profile_trace_dir)
+			os.makedirs(profile_trace_dir, exist_ok=True)
+		trace_context = jax_profiler.trace(profile_trace_dir, create_perfetto_link=False) if profile_trace_dir else nullcontext()
+		with trace_context:
+			q_cache = build_q_coulomb_cache(wfn, sym, meta, do_Dmunu=bispinor, sys_dim=sys_dim, mesh_xy=mesh_xy)
+			q_profile_samples: list[tuple[int, float]] = []
+			cct_samples: list[float] = []
+			zeta_samples: list[float] = []
+			vmunu_samples: list[float] = []
+			for q_idx in range(q_cache.num_q):
+				k_l_indices = q_cache.k_l_indices[q_idx]
+				k_r_indices = q_cache.k_r_indices
+				qvec_nonneg = q_cache.q_nonneg[q_idx]
+				iq_cpu = int(q_cache.iq_indices[q_idx])
+				qvec = jnp.asarray(q_cache.q_wrapped[q_idx], dtype=jnp.float64)
+				vcoul_comps = q_cache.vcoul_comps[q_idx]
+				sqrt_V_qfullG = q_cache.sqrt_V_qfullG[q_idx]
+				_t_q_start = time.perf_counter() if profile_qloop else None
+				annotation = (
+					jax_profiler.StepTraceAnnotation("cohsex_q_iteration", q_index=iq_cpu, q_idx=int(q_idx))
+					if profile_trace_dir else nullcontext()
+				)
+				with annotation:
+					# Build CCT/ZCT then Cholesky solve for zeta_q
+					_t_cct = time.perf_counter()
+					CCT, ZCT = compute_CCT_ZCT_for_q(
+						CCT_buf,
+						ZCT_buf,
+						psi_l_rmu_Y, 
+						psi_r_rmu_Y, 
+						psi_l_rtot_Y, 
+						psi_r_rtot_Y, 
+						psi_l_rmuT_X, 
+						psi_r_rmuT_X,
+						k_l_indices, 
+						k_r_indices
+					)
+					CCT_buf, ZCT_buf = CCT, ZCT
+					if profile_qloop:
+						CCT = CCT.block_until_ready()
+						ZCT = ZCT.block_until_ready()
+						cct_samples.append(time.perf_counter() - _t_cct)
+						_t_zeta = time.perf_counter()
+					else:
+						_t_zeta = None
+					zeta_q = solve_zeta_cholesky(CCT, ZCT)
+					if profile_qloop:
+						zeta_q = zeta_q.block_until_ready()
+						zeta_samples.append(time.perf_counter() - _t_zeta)
+					zeta_q = set_zeta_sharding(zeta_q, mesh_xy)
+					# Compute S_q and write into S_qmunu
+					qx = int(qvec_nonneg[0]); qy = int(qvec_nonneg[1]); qz = int(qvec_nonneg[2])
+					# FFT to G and accumulate V_q,mu,nu using explicit-arg kernel
+					_t_v = time.perf_counter()
+					v_munu = compute_v_munu_from_zeta(
+						zeta_q,
+						qvec,
+						vcoul_comps,
+						sqrt_V_qfullG,
+						int(meta.fft_grid[0]), int(meta.fft_grid[1]), int(meta.fft_grid[2]),
+						int(meta.nkx), int(meta.nky), int(meta.nkz),
+					)
+					V_qmunu = V_qmunu.at[0, 0, 0, qx, qy, qz, :, :].set(v_munu)
+					if profile_trace_dir or profile_qloop:
+						v_munu = v_munu.block_until_ready()
+						if profile_qloop:
+							vmunu_samples.append(time.perf_counter() - _t_v)
 
-			if _t_q_start is not None:
-				v_munu.block_until_ready()
-				q_profile_samples.append((iq_cpu, time.perf_counter() - _t_q_start))
+				if profile_trace_dir and hasattr(jax_profiler, "step_end"):
+					jax_profiler.step_end()
 
-			# Capture the q=0 Coulomb (with G=0 removed) for Hartree, and the head vector u
-			if int(qx) == 0 and int(qy) == 0 and int(qz) == 0:
-				v_q0_noG0_munu = v_munu  # V_qfullG already has head zeroed; reuse v_munu
-				# Head-direction vector u in ISDF index space (unnormalized):
-				# Extract u = zeta_{mu}(G=0) using the SAME FFT convention as used in V/W build.
-				# Build zeta_G and pick the G=0 index from vcoul_comps.
-				fft_nx, fft_ny, fft_nz = int(meta.fft_grid[0]), int(meta.fft_grid[1]), int(meta.fft_grid[2])
-				z_sp = zeta_q.reshape(zeta_q.shape[0], fft_nx, fft_ny, fft_nz)
-				phase = jnp.ones((1, fft_nx, fft_ny, fft_nz), dtype=jnp.complex128)  # q=0
-				z_G = jnp.fft.fftn(z_sp * phase, axes=(-3, -2, -1))
-				# find index of G=(0,0,0) in vcoul_comps (use NumPy for robustness outside jit)
-				vc_np = np.asarray(vcoul_comps)
-				g0_mask_np = (vc_np[:, 0] == 0) & (vc_np[:, 1] == 0) & (vc_np[:, 2] == 0)
-				if not np.any(g0_mask_np):
-					g0_idx = int(np.argmin(np.sum(vc_np * vc_np, axis=1)))
-				else:
-					g0_idx = int(np.where(g0_mask_np)[0][0])
-				G0_mu_nu = z_G[:, vc_np[g0_idx, 0], vc_np[g0_idx, 1], vc_np[g0_idx, 2]]
+				if _t_q_start is not None:
+					q_profile_samples.append((iq_cpu, time.perf_counter() - _t_q_start))
+
+				# Capture the q=0 Coulomb (with G=0 removed) for Hartree, and the head vector u
+				if int(qx) == 0 and int(qy) == 0 and int(qz) == 0:
+					v_q0_noG0_munu = v_munu  # V_qfullG already has head zeroed; reuse v_munu
+					# Head-direction vector u in ISDF index space (unnormalized):
+					# Extract u = zeta_{mu}(G=0) using the SAME FFT convention as used in V/W build.
+					# Build zeta_G and pick the G=0 index from vcoul_comps.
+					fft_nx, fft_ny, fft_nz = int(meta.fft_grid[0]), int(meta.fft_grid[1]), int(meta.fft_grid[2])
+					z_sp = zeta_q.reshape(zeta_q.shape[0], fft_nx, fft_ny, fft_nz)
+					phase = jnp.ones((1, fft_nx, fft_ny, fft_nz), dtype=jnp.complex128)  # q=0
+					z_G = jnp.fft.fftn(z_sp * phase, axes=(-3, -2, -1))
+					# find index of G=(0,0,0) in vcoul_comps (use NumPy for robustness outside jit)
+					vc_np = np.asarray(vcoul_comps)
+					g0_mask_np = (vc_np[:, 0] == 0) & (vc_np[:, 1] == 0) & (vc_np[:, 2] == 0)
+					if not np.any(g0_mask_np):
+						g0_idx = int(np.argmin(np.sum(vc_np * vc_np, axis=1)))
+					else:
+						g0_idx = int(np.where(g0_mask_np)[0][0])
+					G0_mu_nu = z_G[:, vc_np[g0_idx, 0], vc_np[g0_idx, 1], vc_np[g0_idx, 2]]
 
 
-			print(f"qpoint {iq_cpu} done")
+				print(f"qpoint {iq_cpu} done")
 
-		if q_profile_samples and profile_qloop and meta.rank == 0:
-			elapsed = np.asarray([sample[1] for sample in q_profile_samples], dtype=np.float64)
-			print0(f"q-loop timing: mean={elapsed.mean()*1e3:.2f} ms, max={elapsed.max()*1e3:.2f} ms over {len(elapsed)} q-points")
+			if profile_qloop and meta.rank == 0:
+				if q_profile_samples:
+					elapsed = np.asarray([sample[1] for sample in q_profile_samples], dtype=np.float64)
+					print0(f"q-loop timing: mean={elapsed.mean()*1e3:.2f} ms, max={elapsed.max()*1e3:.2f} ms over {len(elapsed)} q-points")
+				if cct_samples:
+					cct_arr = np.asarray(cct_samples, dtype=np.float64)
+					print0(f"  CCT/ZCT build: mean={cct_arr.mean()*1e3:.2f} ms, max={cct_arr.max()*1e3:.2f} ms")
+				if zeta_samples:
+					zeta_arr = np.asarray(zeta_samples, dtype=np.float64)
+					print0(f"  zeta solve: mean={zeta_arr.mean()*1e3:.2f} ms, max={zeta_arr.max()*1e3:.2f} ms")
+				if vmunu_samples:
+					vmunu_arr = np.asarray(vmunu_samples, dtype=np.float64)
+					print0(f"  v_munu FFT build: mean={vmunu_arr.mean()*1e3:.2f} ms, max={vmunu_arr.max()*1e3:.2f} ms")
 
 		# Sharded psi variants outside q-loop
 		with mesh_xy:
