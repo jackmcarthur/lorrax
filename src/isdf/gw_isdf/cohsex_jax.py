@@ -99,8 +99,12 @@ def compute_CCT_ZCT_for_q(
 	psi_r_rmuT_flat = psi_r_rmuT.reshape(psi_r_rmuT.shape[0], n_rmu, -1)
 
 	# Zero reuse buffers (donated by caller) without allocating fresh storage.
-	CCT_buf = jax.lax.full_like(CCT_buf, 0.0)
-	ZCT_buf = jax.lax.full_like(ZCT_buf, 0.0)
+	CCT_acc_init = CCT_buf * 0.0
+	ZCT_acc_init = ZCT_buf * 0.0
+
+	total_pairs = int(k_l_indices.shape[0])
+	if total_pairs == 0:
+		return CCT_acc_init, ZCT_acc_init
 
 	def accumulate_k_pair(carry, i):
 		CCT_acc, ZCT_acc = carry
@@ -122,8 +126,8 @@ def compute_CCT_ZCT_for_q(
 
 	(CCT, ZCT), _ = jax.lax.scan(
 		accumulate_k_pair,
-		(CCT_buf, ZCT_buf),
-		jnp.arange(k_l_indices.shape[0]),
+		(CCT_acc_init, ZCT_acc_init),
+		jnp.arange(total_pairs, dtype=jnp.int32),
 	)
 	return CCT, ZCT
 
@@ -652,44 +656,6 @@ def get_zeta_q_and_v_q_mu_nu(
 			q_data_iter = _legacy_q_data_iter(preprocessed_q_data)
 		else:
 			q_data_iter = iter(preprocessed_q_data)
-
-	##########################################
-	# Clean idiomatic distributed computation
-	##########################################
-		@partial(jax.jit)
-		def compute_CCT_ZCT_for_q(k_l_indices, k_r_indices, psi_l_rmu, psi_r_rmu, psi_l_rtot, psi_r_rtot, psi_l_rmuT, psi_r_rmuT):
-			"""Exact match to original cohsex_isdf.py physics - direct accumulation."""
-			n_rmu = psi_l_rmu.shape[-1]
-			n_rtot = psi_l_rtot.shape[-1]
-			psi_l_rmu_flat = psi_l_rmu.reshape(psi_l_rmu.shape[0], -1, n_rmu)
-			psi_r_rmu_flat = psi_r_rmu.reshape(psi_r_rmu.shape[0], -1, n_rmu)
-			psi_l_rtot_flat = psi_l_rtot.reshape(psi_l_rtot.shape[0], -1, n_rtot)
-			psi_r_rtot_flat = psi_r_rtot.reshape(psi_r_rtot.shape[0], -1, n_rtot)
-			psi_l_rmuT_flat = psi_l_rmuT.reshape(psi_l_rmuT.shape[0], n_rmu, -1)
-			psi_r_rmuT_flat = psi_r_rmuT.reshape(psi_r_rmuT.shape[0], n_rmu, -1)
-
-			def accumulate_k_pair(carry, i):
-				CCT_acc, ZCT_acc = carry
-				k_l, k_r = k_l_indices[i], k_r_indices[i]
-				psi_l_rmu_k = psi_l_rmu_flat[k_l]
-				psi_r_rmu_k = psi_r_rmu_flat[k_r]
-				psi_l_rtot_k = psi_l_rtot_flat[k_l]
-				psi_r_rtot_k = psi_r_rtot_flat[k_r]
-				psi_l_rmuT_k = psi_l_rmuT_flat[k_l]
-				psi_r_rmuT_k = psi_r_rmuT_flat[k_r]
-				Pmu_l = psi_l_rmuT_k @ psi_l_rmu_k
-				Pmu_r = psi_r_rmuT_k @ psi_r_rmu_k
-				CCT_acc = CCT_acc + jnp.conj(Pmu_l) * Pmu_r
-				P_l = psi_l_rmuT_k @ psi_l_rtot_k
-				P_r = psi_r_rmuT_k @ psi_r_rtot_k
-				ZCT_acc = ZCT_acc + jnp.conj(P_l) * P_r
-				return (CCT_acc, ZCT_acc), None
-		# Initialize accumulators
-		CCT_init = jnp.zeros((n_rmu, n_rmu), dtype=jnp.complex128)
-		ZCT_init = jnp.zeros((n_rmu, n_rtot), dtype=jnp.complex128)
-		k_indices = jnp.arange(k_l_indices.shape[0], dtype=jnp.int32)
-		(CCT, ZCT), _ = jax.lax.scan(accumulate_k_pair, (CCT_init, ZCT_init), k_indices)
-		return CCT, ZCT
 
 	# Main q-point loop
 	for q_idx, q_data in enumerate(q_data_iter):
