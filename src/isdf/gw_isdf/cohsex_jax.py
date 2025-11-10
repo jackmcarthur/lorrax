@@ -90,26 +90,33 @@ def compute_CCT_ZCT_for_q(
 	"""
 	n_rmu = int(psi_l_rmu.shape[-1])
 	n_rtot = int(psi_l_rtot.shape[-1])
+	# Flatten band/spinor dimensions once to avoid per-iteration reshapes.
+	psi_l_rmu_flat = psi_l_rmu.reshape(psi_l_rmu.shape[0], -1, n_rmu)
+	psi_r_rmu_flat = psi_r_rmu.reshape(psi_r_rmu.shape[0], -1, n_rmu)
+	psi_l_rtot_flat = psi_l_rtot.reshape(psi_l_rtot.shape[0], -1, n_rtot)
+	psi_r_rtot_flat = psi_r_rtot.reshape(psi_r_rtot.shape[0], -1, n_rtot)
+	psi_l_rmuT_flat = psi_l_rmuT.reshape(psi_l_rmuT.shape[0], n_rmu, -1)
+	psi_r_rmuT_flat = psi_r_rmuT.reshape(psi_r_rmuT.shape[0], n_rmu, -1)
 
 	# Zero reuse buffers (donated by caller) without allocating fresh storage.
-	CCT_buf = jnp.zeros_like(CCT_buf)
-	ZCT_buf = jnp.zeros_like(ZCT_buf)
+	CCT_buf = jax.lax.full_like(CCT_buf, 0.0)
+	ZCT_buf = jax.lax.full_like(ZCT_buf, 0.0)
 
 	def accumulate_k_pair(carry, i):
 		CCT_acc, ZCT_acc = carry
 		k_l = k_l_indices[i]
 		k_r = k_r_indices[i]
-		psi_l_rmu_k = psi_l_rmu[k_l].reshape(-1, n_rmu)
-		psi_r_rmu_k = psi_r_rmu[k_r].reshape(-1, n_rmu)
-		psi_l_rtot_k = psi_l_rtot[k_l].reshape(-1, n_rtot)
-		psi_r_rtot_k = psi_r_rtot[k_r].reshape(-1, n_rtot)
-		psi_l_rmuT_k = psi_l_rmuT[k_l].reshape(n_rmu, -1)
-		psi_r_rmuT_k = psi_r_rmuT[k_r].reshape(n_rmu, -1)
-		Pmu_l = jnp.einsum('ij,jk->ik', psi_l_rmuT_k, psi_l_rmu_k, optimize=True)
-		Pmu_r = jnp.einsum('ij,jk->ik', psi_r_rmuT_k, psi_r_rmu_k, optimize=True)
+		psi_l_rmu_k = psi_l_rmu_flat[k_l]
+		psi_r_rmu_k = psi_r_rmu_flat[k_r]
+		psi_l_rtot_k = psi_l_rtot_flat[k_l]
+		psi_r_rtot_k = psi_r_rtot_flat[k_r]
+		psi_l_rmuT_k = psi_l_rmuT_flat[k_l]
+		psi_r_rmuT_k = psi_r_rmuT_flat[k_r]
+		Pmu_l = psi_l_rmuT_k @ psi_l_rmu_k
+		Pmu_r = psi_r_rmuT_k @ psi_r_rmu_k
 		CCT_acc = CCT_acc + jnp.conj(Pmu_l) * Pmu_r
-		P_l = jnp.einsum('ij,jk->ik', psi_l_rmuT_k, psi_l_rtot_k, optimize=True)
-		P_r = jnp.einsum('ij,jk->ik', psi_r_rmuT_k, psi_r_rtot_k, optimize=True)
+		P_l = psi_l_rmuT_k @ psi_l_rtot_k
+		P_r = psi_r_rmuT_k @ psi_r_rtot_k
 		ZCT_acc = ZCT_acc + jnp.conj(P_l) * P_r
 		return (CCT_acc, ZCT_acc), None
 
@@ -649,30 +656,34 @@ def get_zeta_q_and_v_q_mu_nu(
 	##########################################
 	# Clean idiomatic distributed computation
 	##########################################
-	@partial(jax.jit)
-	def compute_CCT_ZCT_for_q(k_l_indices, k_r_indices, psi_l_rmu, psi_r_rmu, psi_l_rtot, psi_r_rtot, psi_l_rmuT, psi_r_rmuT):
-		"""Exact match to original cohsex_isdf.py physics - direct accumulation"""
-		# Derive sizes from array shapes
-		n_rmu = psi_l_rmu.shape[-1]
-		n_rtot = psi_l_rtot.shape[-1]
-		def accumulate_k_pair(carry, i):
-			CCT_acc, ZCT_acc = carry
-			k_l, k_r = k_l_indices[i], k_r_indices[i]
-			# Extract wavefunctions for this k-point pair
-			psi_l_rmu_k = psi_l_rmu[k_l].reshape(-1, n_rmu)	  # (nb*nspinor, n_rmu)
-			psi_r_rmu_k = psi_r_rmu[k_r].reshape(-1, n_rmu)	  # (nb*nspinor, n_rmu)
-			psi_l_rtot_k = psi_l_rtot[k_l].reshape(-1, n_rtot)   # (nb*nspinor, n_rtot)
-			psi_r_rtot_k = psi_r_rtot[k_r].reshape(-1, n_rtot)   # (nb*nspinor, n_rtot)
-			psi_l_rmuT_k = psi_l_rmuT[k_l].reshape(n_rmu, -1)
-			psi_r_rmuT_k = psi_r_rmuT[k_r].reshape(n_rmu, -1)
-			
-			Pmu_l = jnp.einsum('ij,jk->ik',psi_l_rmuT_k, psi_l_rmu_k, optimize=True)  # (n_rmu, n_rmu)
-			Pmu_r = jnp.einsum('ij,jk->ik',psi_r_rmuT_k, psi_r_rmu_k, optimize=True)  # (n_rmu, n_rmu)
-			CCT_acc = CCT_acc + jnp.conj(Pmu_l) * Pmu_r   # Direct accumulation!
-			P_l = jnp.einsum('ij,jk->ik',psi_l_rmuT_k, psi_l_rtot_k, optimize=True)   # (n_rmu, n_rtot)
-			P_r = jnp.einsum('ij,jk->ik',psi_r_rmuT_k, psi_r_rtot_k, optimize=True)   # (n_rmu, n_rtot)
-			ZCT_acc = ZCT_acc + jnp.conj(P_l) * P_r	   # Direct accumulation!
-			return (CCT_acc, ZCT_acc), None
+		@partial(jax.jit)
+		def compute_CCT_ZCT_for_q(k_l_indices, k_r_indices, psi_l_rmu, psi_r_rmu, psi_l_rtot, psi_r_rtot, psi_l_rmuT, psi_r_rmuT):
+			"""Exact match to original cohsex_isdf.py physics - direct accumulation."""
+			n_rmu = psi_l_rmu.shape[-1]
+			n_rtot = psi_l_rtot.shape[-1]
+			psi_l_rmu_flat = psi_l_rmu.reshape(psi_l_rmu.shape[0], -1, n_rmu)
+			psi_r_rmu_flat = psi_r_rmu.reshape(psi_r_rmu.shape[0], -1, n_rmu)
+			psi_l_rtot_flat = psi_l_rtot.reshape(psi_l_rtot.shape[0], -1, n_rtot)
+			psi_r_rtot_flat = psi_r_rtot.reshape(psi_r_rtot.shape[0], -1, n_rtot)
+			psi_l_rmuT_flat = psi_l_rmuT.reshape(psi_l_rmuT.shape[0], n_rmu, -1)
+			psi_r_rmuT_flat = psi_r_rmuT.reshape(psi_r_rmuT.shape[0], n_rmu, -1)
+
+			def accumulate_k_pair(carry, i):
+				CCT_acc, ZCT_acc = carry
+				k_l, k_r = k_l_indices[i], k_r_indices[i]
+				psi_l_rmu_k = psi_l_rmu_flat[k_l]
+				psi_r_rmu_k = psi_r_rmu_flat[k_r]
+				psi_l_rtot_k = psi_l_rtot_flat[k_l]
+				psi_r_rtot_k = psi_r_rtot_flat[k_r]
+				psi_l_rmuT_k = psi_l_rmuT_flat[k_l]
+				psi_r_rmuT_k = psi_r_rmuT_flat[k_r]
+				Pmu_l = psi_l_rmuT_k @ psi_l_rmu_k
+				Pmu_r = psi_r_rmuT_k @ psi_r_rmu_k
+				CCT_acc = CCT_acc + jnp.conj(Pmu_l) * Pmu_r
+				P_l = psi_l_rmuT_k @ psi_l_rtot_k
+				P_r = psi_r_rmuT_k @ psi_r_rtot_k
+				ZCT_acc = ZCT_acc + jnp.conj(P_l) * P_r
+				return (CCT_acc, ZCT_acc), None
 		# Initialize accumulators
 		CCT_init = jnp.zeros((n_rmu, n_rmu), dtype=jnp.complex128)
 		ZCT_init = jnp.zeros((n_rmu, n_rtot), dtype=jnp.complex128)
