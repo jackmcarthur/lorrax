@@ -7,9 +7,10 @@ import os
 # ]))
 
 os.environ.setdefault("JAX_ENABLE_X64", "1")
-# Force CPU backend regardless of external environment
-os.environ["JAX_PLATFORM_NAME"] = "cpu"
-os.environ["JAX_PLATFORMS"] = "cpu"
+os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
+os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 import argparse
 import configparser
 import re
@@ -44,7 +45,16 @@ def _maybe_init_jax_distributed():
 
 # Global mesh for sharding across bands
 _maybe_init_jax_distributed()
-mesh_bands = Mesh(np.asarray(jax.devices()), ("bands",))
+try:
+	_default_devices = jax.devices()
+except RuntimeError as exc:
+	if "Unknown backend: 'gpu'" in str(exc):
+		os.environ.pop("JAX_PLATFORM_NAME", None)
+		os.environ["JAX_PLATFORMS"] = "cpu"
+		_default_devices = jax.devices("cpu")
+	else:
+		raise
+mesh_bands = Mesh(np.asarray(_default_devices), ("bands",))
 from ..common.wfnreader import WFNReader
 #from ..common.epsreader import EPSReader
 from ..common import symmetry_maps
@@ -918,6 +928,9 @@ def main(argv=None):
 	builtins.print = _print0
  
 	params = read_cohsex_input(args.input)
+	current_backend = jax.default_backend()
+	_print0(f"JAX backend in use: {current_backend}")
+	_print0(jax.devices())
 	# Resolve relative paths against the input file's directory
 	input_dir = os.path.dirname(os.path.abspath(args.input))
 	def _resolve_path(path: str) -> str:
