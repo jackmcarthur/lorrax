@@ -408,7 +408,7 @@ def determine_wcoul0(params, input_dir, wfn, sym, meta, print_fn):
 		try:
 			dipole_cart, deltaE = read_dipole_h5(dipole_path)
 			nk_tot = int(sym.nk_tot)
-			nb = int(wfn.nbands)
+			nb = int(dipole_cart.shape[2])
 			nelec = int(wfn.nelec)
 			occ = np.zeros((nk_tot, nb), dtype=float)
 			occ[:, :max(0, min(nelec, nb))] = 1.0
@@ -1277,6 +1277,7 @@ def main(argv=None):
 	# Compute q=0 averages (after restart/loop) and inject head-averages
 	vc0_mean, wcoul0, wcoul0_source = determine_wcoul0(params, input_dir, wfn, sym, meta, print0)
 	print0(f"wcoul0 source: {wcoul0_source}")
+	print0(f"wcoul0 value (atomic units): {wcoul0}")
 	# Inject head-averages after building W/V
 	# - Add wcoul0 * u u^† to W at q=0 (if screened)
 	# - Add vcoul0 * u u^† to V at q=0 for Sigma_X

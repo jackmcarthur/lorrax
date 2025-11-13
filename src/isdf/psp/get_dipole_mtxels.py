@@ -273,35 +273,35 @@ def main(argv=None):
 				Binv = np.linalg.inv(B)
 				vNL_cart = np.zeros((3, nb, nb), dtype=np.complex128)
 				K_cart_this = np.asarray(K_cart_all[i])
-			K_med = float(np.median(np.linalg.norm(K_cart_this, axis=1))) if K_cart_this.size else 1.0
-			h_base = max(float(args.vnl_h), float(args.vnl_h_rel) * max(K_med, 1.0))
-			h1 = h_base
-			h2 = 0.5 * h_base
-			for ic in range(3):
-				# D1 at h1
-				d1 = np.zeros((3,), dtype=float); d1[ic] = h1
-				d1c = d1 @ Binv
-				Kp1_crys = np.asarray(K_crys_all[i]) + d1c[None, :]
-				Km1_crys = np.asarray(K_crys_all[i]) - d1c[None, :]
-				Kp1_cart = Kp1_crys @ B
-				Km1_cart = Km1_crys @ B
-				Vp1 = compute_V_NL_k_minimal(wfn_k, Gk_crys, Kp1_crys, Kp1_cart, plan, float(wfn.cell_volume))
-				Vm1 = compute_V_NL_k_minimal(wfn_k, Gk_crys, Km1_crys, Km1_cart, plan, float(wfn.cell_volume))
-				D1 = - (Vp1 - Vm1) / (2.0 * h1)
-				if args.vnl_num_scheme == "richardson":
-					# D2 at h2
-					d2 = np.zeros((3,), dtype=float); d2[ic] = h2
-					d2c = d2 @ Binv
-					Kp2_crys = np.asarray(K_crys_all[i]) + d2c[None, :]
-					Km2_crys = np.asarray(K_crys_all[i]) - d2c[None, :]
-					Kp2_cart = Kp2_crys @ B
-					Km2_cart = Km2_crys @ B
-					Vp2 = compute_V_NL_k_minimal(wfn_k, Gk_crys, Kp2_crys, Kp2_cart, plan, float(wfn.cell_volume))
-					Vm2 = compute_V_NL_k_minimal(wfn_k, Gk_crys, Km2_crys, Km2_cart, plan, float(wfn.cell_volume))
-					D2 = - (Vp2 - Vm2) / (2.0 * h2)
-					vNL_cart[ic] = (4.0 * D2 - D1) / 3.0
-				else:
-					vNL_cart[ic] = D1
+				K_med = float(np.median(np.linalg.norm(K_cart_this, axis=1))) if K_cart_this.size else 1.0
+				h_base = max(float(args.vnl_h), float(args.vnl_h_rel) * max(K_med, 1.0))
+				h1 = h_base
+				h2 = 0.5 * h_base
+				for ic in range(3):
+					# D1 at h1
+					d1 = np.zeros((3,), dtype=float); d1[ic] = h1
+					d1c = d1 @ Binv
+					Kp1_crys = np.asarray(K_crys_all[i]) + d1c[None, :]
+					Km1_crys = np.asarray(K_crys_all[i]) - d1c[None, :]
+					Kp1_cart = Kp1_crys @ B
+					Km1_cart = Km1_crys @ B
+					Vp1 = compute_V_NL_k_minimal(wfn_k, Gk_crys, Kp1_crys, Kp1_cart, plan, float(wfn.cell_volume))
+					Vm1 = compute_V_NL_k_minimal(wfn_k, Gk_crys, Km1_crys, Km1_cart, plan, float(wfn.cell_volume))
+					D1 = - (Vp1 - Vm1) / (2.0 * h1)
+					if args.vnl_num_scheme == "richardson":
+						# D2 at h2
+						d2 = np.zeros((3,), dtype=float); d2[ic] = h2
+						d2c = d2 @ Binv
+						Kp2_crys = np.asarray(K_crys_all[i]) + d2c[None, :]
+						Km2_crys = np.asarray(K_crys_all[i]) - d2c[None, :]
+						Kp2_cart = Kp2_crys @ B
+						Km2_cart = Km2_crys @ B
+						Vp2 = compute_V_NL_k_minimal(wfn_k, Gk_crys, Kp2_crys, Kp2_cart, plan, float(wfn.cell_volume))
+						Vm2 = compute_V_NL_k_minimal(wfn_k, Gk_crys, Km2_crys, Km2_cart, plan, float(wfn.cell_volume))
+						D2 = - (Vp2 - Vm2) / (2.0 * h2)
+						vNL_cart[ic] = (4.0 * D2 - D1) / 3.0
+					else:
+						vNL_cart[ic] = D1
 		else:
 			vNL_cart = compute_V_NL_velocity_k(
 				wfn_k,
