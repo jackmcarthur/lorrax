@@ -70,6 +70,7 @@ from .gw_file_io import (write_sigma_to_file, write_eqp_table, write_labeled_arr
 from .jax_fixed_point_demo import crop_family_fixed_history_map
 from ..common import Meta
 from ..common.gamma_matrices import gammas_sparse
+import isdf.common.timing as timing
 import h5py
 import builtins
 import gc
@@ -1005,273 +1006,272 @@ def main(argv=None):
 	sh = None
 
 
-	# Initialize timing accumulators for both fresh and restart flows
-	zeta_secs = 0.0
-	chiw_secs = 0.0
+	# Initialize timing system
+	timing.reset()
 	if not restart:
-		####################################
-		# 0.) Build a 2D mesh ['x','y'] up-front and materialize global G-space arrays
-		####################################
-		total_devices = jax.process_count() * jax.local_device_count()
-		grid_x = int(np.sqrt(total_devices))
-		while total_devices % grid_x != 0:
-			grid_x -= 1
-		grid_y = total_devices // grid_x
-		devices_2d = np.array(jax.devices()).reshape(grid_x, grid_y)
-		mesh_xy = Mesh(devices_2d, ['x', 'y'])
-		sh = make_shardings(mesh_xy)
-		print0(f"Device mesh: (X={grid_x}, Y={grid_y})")
+		with timing.section("cohsex_jax.wavefunction_setup") as timer_setup:
+			####################################
+			# 0.) Build a 2D mesh ['x','y'] up-front and materialize global G-space arrays
+			####################################
+			total_devices = jax.process_count() * jax.local_device_count()
+			grid_x = int(np.sqrt(total_devices))
+			while total_devices % grid_x != 0:
+				grid_x -= 1
+			grid_y = total_devices // grid_x
+			devices_2d = np.array(jax.devices()).reshape(grid_x, grid_y)
+			mesh_xy = Mesh(devices_2d, ['x', 'y'])
+			sh = make_shardings(mesh_xy)
+			print0(f"Device mesh: (X={grid_x}, Y={grid_y})")
 
-		# Left window: read G-vectors -> global G-space; then jitted sharded wfn build
-		sigma_window = nvplussigrange
-		brange_l = sigma_window
-		global_psiG_l, nb_l = read_Gvecs_to_devices(wfn, sym, brange_l, meta, bispinor, mesh_xy)
-		psi_l_rtot_Y, psi_l_rmu_Y, psi_l_rmuT_X = get_sharded_wfns(
-			global_psiG_l, sym, meta, centroid_indices, nb_l, False, mesh_xy
-		)
-		# Ensure kernels finish then free the large G-space buffer to reduce peak memory
-		psi_l_rtot_Y.block_until_ready(); psi_l_rmu_Y.block_until_ready(); psi_l_rmuT_X.block_until_ready()
-		del global_psiG_l
-		gc.collect()
+			# Left window: read G-vectors -> global G-space; then jitted sharded wfn build
+			sigma_window = nvplussigrange
+			brange_l = sigma_window
+			global_psiG_l, nb_l = read_Gvecs_to_devices(wfn, sym, brange_l, meta, bispinor, mesh_xy)
+			psi_l_rtot_Y, psi_l_rmu_Y, psi_l_rmuT_X = get_sharded_wfns(
+				global_psiG_l, sym, meta, centroid_indices, nb_l, False, mesh_xy
+			)
+			# Ensure kernels finish then free the large G-space buffer to reduce peak memory
+			psi_l_rtot_Y.block_until_ready(); psi_l_rmu_Y.block_until_ready(); psi_l_rmuT_X.block_until_ready()
+			del global_psiG_l
+			gc.collect()
 
-		# Right window (nv+sigma or sigma-only)
-		brange_r = sigma_window if x_only else ncplussigrange
-		global_psiG_r, nb_r = read_Gvecs_to_devices(wfn, sym, brange_r, meta, bispinor, mesh_xy)
-		psi_r_rtot_Y, psi_r_rmu_Y, psi_r_rmuT_X = get_sharded_wfns(
-			global_psiG_r, sym, meta, centroid_indices, nb_r, False, mesh_xy
-		)
-		# Free the right G-space buffer as well
-		psi_r_rtot_Y.block_until_ready(); psi_r_rmu_Y.block_until_ready(); psi_r_rmuT_X.block_until_ready()
-		del global_psiG_r
-		gc.collect()
-		print0('wavefunction sharding complete')
+			# Right window (nv+sigma or sigma-only)
+			brange_r = sigma_window if x_only else ncplussigrange
+			global_psiG_r, nb_r = read_Gvecs_to_devices(wfn, sym, brange_r, meta, bispinor, mesh_xy)
+			psi_r_rtot_Y, psi_r_rmu_Y, psi_r_rmuT_X = get_sharded_wfns(
+				global_psiG_r, sym, meta, centroid_indices, nb_r, False, mesh_xy
+			)
+			# Free the right G-space buffer as well
+			psi_r_rtot_Y.block_until_ready(); psi_r_rmu_Y.block_until_ready(); psi_r_rmuT_X.block_until_ready()
+			del global_psiG_r
+			gc.collect()
+			print0('wavefunction sharding complete')
 
-		####################################
-		# 2.) Explicit q-loop: build zeta_q,mu(r), S_q, and V_q,mu,nu
-		####################################
-		_t_zeta_start = time.perf_counter()
-		# Energies and weights for windows (kept as before, last entry is just sigma range)
-		enk_l, weights_l = get_enk_bandrange(wfn, sym, brange_l, (b1,b3))
-		enk_r, weights_r = get_enk_bandrange(wfn, sym, brange_r, (b1,b3))
+		with timing.section("cohsex_jax.zeta_V_build") as timer_zeta:
+			####################################
+			# 2.) Explicit q-loop: build zeta_q,mu(r), S_q, and V_q,mu,nu
+			####################################
+			# Energies and weights for windows (kept as before, last entry is just sigma range)
+			enk_l, weights_l = get_enk_bandrange(wfn, sym, brange_l, (b1,b3))
+			enk_r, weights_r = get_enk_bandrange(wfn, sym, brange_r, (b1,b3))
 
-		# Allocate sharded outputs
-		V_qmunu = jnp.zeros((1, meta.npol, meta.npol, meta.nkx, meta.nky, meta.nkz, meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
-		S_qmunu = jnp.zeros((meta.nkx, meta.nky, meta.nkz, meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
-		V_qmunu = jax.lax.with_sharding_constraint(V_qmunu, sh.x6y7_8)
-		S_qmunu = jax.lax.with_sharding_constraint(S_qmunu, sh.x3y4_5)
-		v_q0_noG0_munu = jnp.zeros((meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
-		v_q0_noG0_munu = jax.lax.with_sharding_constraint(v_q0_noG0_munu, sh.xy_shard)
-		G0_mu_nu = None
-		# Reusable buffers for the expensive CCT/ZCT accumulation.
-		CCT_buf = jnp.zeros((meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
-		ZCT_buf = jnp.zeros((meta.n_rmu, psi_l_rtot_Y.shape[-1]), dtype=jnp.complex128)
-		if mesh_xy is not None:
-			CCT_buf = jax.lax.with_sharding_constraint(CCT_buf, sh.replicated_2)
-			ZCT_buf = jax.lax.with_sharding_constraint(ZCT_buf, sh.xy_shard)
+			# Allocate sharded outputs
+			V_qmunu = jnp.zeros((1, meta.npol, meta.npol, meta.nkx, meta.nky, meta.nkz, meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
+			S_qmunu = jnp.zeros((meta.nkx, meta.nky, meta.nkz, meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
+			V_qmunu = jax.lax.with_sharding_constraint(V_qmunu, sh.x6y7_8)
+			S_qmunu = jax.lax.with_sharding_constraint(S_qmunu, sh.x3y4_5)
+			v_q0_noG0_munu = jnp.zeros((meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
+			v_q0_noG0_munu = jax.lax.with_sharding_constraint(v_q0_noG0_munu, sh.xy_shard)
+			G0_mu_nu = None
+			# Reusable buffers for the expensive CCT/ZCT accumulation.
+			CCT_buf = jnp.zeros((meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
+			ZCT_buf = jnp.zeros((meta.n_rmu, psi_l_rtot_Y.shape[-1]), dtype=jnp.complex128)
+			if mesh_xy is not None:
+				CCT_buf = jax.lax.with_sharding_constraint(CCT_buf, sh.replicated_2)
+				ZCT_buf = jax.lax.with_sharding_constraint(ZCT_buf, sh.xy_shard)
 
-		# No local kernel definitions; use module-scope jitted helpers
+			# No local kernel definitions; use module-scope jitted helpers
 
-		#################################################################################
-		# Main q-point loop
-		# zeta_q(r) is ephemeral inside the loop
-		################################################################################
-		if profile_trace_dir:
-			profile_trace_dir = _resolve_path(profile_trace_dir)
-			os.makedirs(profile_trace_dir, exist_ok=True)
-		trace_context = jax_profiler.trace(profile_trace_dir, create_perfetto_link=False) if profile_trace_dir else nullcontext()
-		with trace_context:
-			q_cache = build_q_coulomb_cache(wfn, sym, meta, do_Dmunu=bispinor, sys_dim=sys_dim, mesh_xy=mesh_xy)
-			q_profile_samples: list[tuple[int, float]] = []
-			cct_samples: list[float] = []
-			zeta_samples: list[float] = []
-			vmunu_samples: list[float] = []
-			for q_idx in range(q_cache.num_q):
-				k_l_indices = q_cache.k_l_indices[q_idx]
-				k_r_indices = q_cache.k_r_indices
-				qvec_nonneg = q_cache.q_nonneg[q_idx]
-				iq_cpu = int(q_cache.iq_indices[q_idx])
-				qvec = jnp.asarray(q_cache.q_wrapped[q_idx], dtype=jnp.float64)
-				vcoul_comps = q_cache.vcoul_comps[q_idx]
-				sqrt_V_qfullG = q_cache.sqrt_V_qfullG[q_idx]
-				_t_q_start = time.perf_counter() if profile_qloop else None
-				annotation = (
-					jax_profiler.StepTraceAnnotation("cohsex_q_iteration", q_index=iq_cpu, q_idx=int(q_idx))
-					if profile_trace_dir else nullcontext()
-				)
-				with annotation:
-					# Build CCT/ZCT then Cholesky solve for zeta_q
-					_t_cct = time.perf_counter()
-					CCT, ZCT = compute_CCT_ZCT_for_q(
-						CCT_buf,
-						ZCT_buf,
-						psi_l_rmu_Y, 
-						psi_r_rmu_Y, 
-						psi_l_rtot_Y, 
-						psi_r_rtot_Y, 
-						psi_l_rmuT_X, 
-						psi_r_rmuT_X,
-						k_l_indices, 
-						k_r_indices
+			#################################################################################
+			# Main q-point loop
+			# zeta_q(r) is ephemeral inside the loop
+			################################################################################
+			if profile_trace_dir:
+				profile_trace_dir = _resolve_path(profile_trace_dir)
+				os.makedirs(profile_trace_dir, exist_ok=True)
+			trace_context = jax_profiler.trace(profile_trace_dir, create_perfetto_link=False) if profile_trace_dir else nullcontext()
+			with trace_context:
+				q_cache = build_q_coulomb_cache(wfn, sym, meta, do_Dmunu=bispinor, sys_dim=sys_dim, mesh_xy=mesh_xy)
+				q_profile_samples: list[tuple[int, float]] = []
+				cct_samples: list[float] = []
+				zeta_samples: list[float] = []
+				vmunu_samples: list[float] = []
+				for q_idx in range(q_cache.num_q):
+					k_l_indices = q_cache.k_l_indices[q_idx]
+					k_r_indices = q_cache.k_r_indices
+					qvec_nonneg = q_cache.q_nonneg[q_idx]
+					iq_cpu = int(q_cache.iq_indices[q_idx])
+					qvec = jnp.asarray(q_cache.q_wrapped[q_idx], dtype=jnp.float64)
+					vcoul_comps = q_cache.vcoul_comps[q_idx]
+					sqrt_V_qfullG = q_cache.sqrt_V_qfullG[q_idx]
+					_t_q_start = time.perf_counter() if profile_qloop else None
+					annotation = (
+						jax_profiler.StepTraceAnnotation("cohsex_q_iteration", q_index=iq_cpu, q_idx=int(q_idx))
+						if profile_trace_dir else nullcontext()
 					)
-					CCT_buf, ZCT_buf = CCT, ZCT
-					if profile_qloop:
-						CCT = CCT.block_until_ready()
-						ZCT = ZCT.block_until_ready()
-						cct_samples.append(time.perf_counter() - _t_cct)
-						_t_zeta = time.perf_counter()
-					else:
-						_t_zeta = None
-					zeta_q = solve_zeta_cholesky(CCT, ZCT)
-					if profile_qloop:
-						zeta_q = zeta_q.block_until_ready()
-						zeta_samples.append(time.perf_counter() - _t_zeta)
-					zeta_q = set_zeta_sharding(zeta_q, mesh_xy)
-					# Compute S_q and write into S_qmunu
-					qx = int(qvec_nonneg[0]); qy = int(qvec_nonneg[1]); qz = int(qvec_nonneg[2])
-					# FFT to G and accumulate V_q,mu,nu using explicit-arg kernel
-					_t_v = time.perf_counter()
-					v_munu = compute_v_munu_from_zeta(
-						zeta_q,
-						qvec,
-						vcoul_comps,
-						sqrt_V_qfullG,
-						int(meta.fft_grid[0]), int(meta.fft_grid[1]), int(meta.fft_grid[2]),
-						int(meta.nkx), int(meta.nky), int(meta.nkz),
-					)
-					V_qmunu = V_qmunu.at[0, 0, 0, qx, qy, qz, :, :].set(v_munu)
-					if profile_trace_dir or profile_qloop:
-						v_munu = v_munu.block_until_ready()
+					with annotation:
+						# Build CCT/ZCT then Cholesky solve for zeta_q
+						_t_cct = time.perf_counter()
+						CCT, ZCT = compute_CCT_ZCT_for_q(
+							CCT_buf,
+							ZCT_buf,
+							psi_l_rmu_Y, 
+							psi_r_rmu_Y, 
+							psi_l_rtot_Y, 
+							psi_r_rtot_Y, 
+							psi_l_rmuT_X, 
+							psi_r_rmuT_X,
+							k_l_indices, 
+							k_r_indices
+						)
+						CCT_buf, ZCT_buf = CCT, ZCT
 						if profile_qloop:
-							vmunu_samples.append(time.perf_counter() - _t_v)
+							CCT = CCT.block_until_ready()
+							ZCT = ZCT.block_until_ready()
+							cct_samples.append(time.perf_counter() - _t_cct)
+							_t_zeta = time.perf_counter()
+						else:
+							_t_zeta = None
+						zeta_q = solve_zeta_cholesky(CCT, ZCT)
+						if profile_qloop:
+							zeta_q = zeta_q.block_until_ready()
+							zeta_samples.append(time.perf_counter() - _t_zeta)
+						zeta_q = set_zeta_sharding(zeta_q, mesh_xy)
+						# Compute S_q and write into S_qmunu
+						qx = int(qvec_nonneg[0]); qy = int(qvec_nonneg[1]); qz = int(qvec_nonneg[2])
+						# FFT to G and accumulate V_q,mu,nu using explicit-arg kernel
+						_t_v = time.perf_counter()
+						v_munu = compute_v_munu_from_zeta(
+							zeta_q,
+							qvec,
+							vcoul_comps,
+							sqrt_V_qfullG,
+							int(meta.fft_grid[0]), int(meta.fft_grid[1]), int(meta.fft_grid[2]),
+							int(meta.nkx), int(meta.nky), int(meta.nkz),
+						)
+						V_qmunu = V_qmunu.at[0, 0, 0, qx, qy, qz, :, :].set(v_munu)
+						if profile_trace_dir or profile_qloop:
+							v_munu = v_munu.block_until_ready()
+							if profile_qloop:
+								vmunu_samples.append(time.perf_counter() - _t_v)
 
-				if profile_trace_dir and hasattr(jax_profiler, "step_end"):
-					jax_profiler.step_end()
+					if profile_trace_dir and hasattr(jax_profiler, "step_end"):
+						jax_profiler.step_end()
 
-				if _t_q_start is not None:
-					q_profile_samples.append((iq_cpu, time.perf_counter() - _t_q_start))
+					if _t_q_start is not None:
+						q_profile_samples.append((iq_cpu, time.perf_counter() - _t_q_start))
 
-				# Capture the q=0 Coulomb (with G=0 removed) for Hartree, and the head vector u
-				if int(qx) == 0 and int(qy) == 0 and int(qz) == 0:
-					v_q0_noG0_munu = v_munu  # V_qfullG already has head zeroed; reuse v_munu
-					# Head-direction vector u in ISDF index space (unnormalized):
-					# Extract u = zeta_{mu}(G=0) using the SAME FFT convention as used in V/W build.
-					# Build zeta_G and pick the G=0 index from vcoul_comps.
-					fft_nx, fft_ny, fft_nz = int(meta.fft_grid[0]), int(meta.fft_grid[1]), int(meta.fft_grid[2])
-					z_sp = zeta_q.reshape(zeta_q.shape[0], fft_nx, fft_ny, fft_nz)
-					phase = jnp.ones((1, fft_nx, fft_ny, fft_nz), dtype=jnp.complex128)  # q=0
-					z_G = jnp.fft.fftn(z_sp * phase, axes=(-3, -2, -1))
-					# find index of G=(0,0,0) in vcoul_comps (use NumPy for robustness outside jit)
-					vc_np = np.asarray(vcoul_comps)
-					g0_mask_np = (vc_np[:, 0] == 0) & (vc_np[:, 1] == 0) & (vc_np[:, 2] == 0)
-					if not np.any(g0_mask_np):
-						g0_idx = int(np.argmin(np.sum(vc_np * vc_np, axis=1)))
-					else:
-						g0_idx = int(np.where(g0_mask_np)[0][0])
-					G0_mu_nu = z_G[:, vc_np[g0_idx, 0], vc_np[g0_idx, 1], vc_np[g0_idx, 2]]
+					# Capture the q=0 Coulomb (with G=0 removed) for Hartree, and the head vector u
+					if int(qx) == 0 and int(qy) == 0 and int(qz) == 0:
+						v_q0_noG0_munu = v_munu  # V_qfullG already has head zeroed; reuse v_munu
+						# Head-direction vector u in ISDF index space (unnormalized):
+						# Extract u = zeta_{mu}(G=0) using the SAME FFT convention as used in V/W build.
+						# Build zeta_G and pick the G=0 index from vcoul_comps.
+						fft_nx, fft_ny, fft_nz = int(meta.fft_grid[0]), int(meta.fft_grid[1]), int(meta.fft_grid[2])
+						z_sp = zeta_q.reshape(zeta_q.shape[0], fft_nx, fft_ny, fft_nz)
+						phase = jnp.ones((1, fft_nx, fft_ny, fft_nz), dtype=jnp.complex128)  # q=0
+						z_G = jnp.fft.fftn(z_sp * phase, axes=(-3, -2, -1))
+						# find index of G=(0,0,0) in vcoul_comps (use NumPy for robustness outside jit)
+						vc_np = np.asarray(vcoul_comps)
+						g0_mask_np = (vc_np[:, 0] == 0) & (vc_np[:, 1] == 0) & (vc_np[:, 2] == 0)
+						if not np.any(g0_mask_np):
+							g0_idx = int(np.argmin(np.sum(vc_np * vc_np, axis=1)))
+						else:
+							g0_idx = int(np.where(g0_mask_np)[0][0])
+						G0_mu_nu = z_G[:, vc_np[g0_idx, 0], vc_np[g0_idx, 1], vc_np[g0_idx, 2]]
 
+					print(f"qpoint {iq_cpu} done")
 
-				print(f"qpoint {iq_cpu} done")
+				if profile_qloop and meta.rank == 0:
+					if q_profile_samples:
+						elapsed = np.asarray([sample[1] for sample in q_profile_samples], dtype=np.float64)
+						print0(f"q-loop timing: mean={elapsed.mean()*1e3:.2f} ms, max={elapsed.max()*1e3:.2f} ms over {len(elapsed)} q-points")
+					if cct_samples:
+						cct_arr = np.asarray(cct_samples, dtype=np.float64)
+						print0(f"  CCT/ZCT build: mean={cct_arr.mean()*1e3:.2f} ms, max={cct_arr.max()*1e3:.2f} ms")
+					if zeta_samples:
+						zeta_arr = np.asarray(zeta_samples, dtype=np.float64)
+						print0(f"  zeta solve: mean={zeta_arr.mean()*1e3:.2f} ms, max={zeta_arr.max()*1e3:.2f} ms")
+					if vmunu_samples:
+						vmunu_arr = np.asarray(vmunu_samples, dtype=np.float64)
+						print0(f"  v_munu FFT build: mean={vmunu_arr.mean()*1e3:.2f} ms, max={vmunu_arr.max()*1e3:.2f} ms")
 
-			if profile_qloop and meta.rank == 0:
-				if q_profile_samples:
-					elapsed = np.asarray([sample[1] for sample in q_profile_samples], dtype=np.float64)
-					print0(f"q-loop timing: mean={elapsed.mean()*1e3:.2f} ms, max={elapsed.max()*1e3:.2f} ms over {len(elapsed)} q-points")
-				if cct_samples:
-					cct_arr = np.asarray(cct_samples, dtype=np.float64)
-					print0(f"  CCT/ZCT build: mean={cct_arr.mean()*1e3:.2f} ms, max={cct_arr.max()*1e3:.2f} ms")
-				if zeta_samples:
-					zeta_arr = np.asarray(zeta_samples, dtype=np.float64)
-					print0(f"  zeta solve: mean={zeta_arr.mean()*1e3:.2f} ms, max={zeta_arr.max()*1e3:.2f} ms")
-				if vmunu_samples:
-					vmunu_arr = np.asarray(vmunu_samples, dtype=np.float64)
-					print0(f"  v_munu FFT build: mean={vmunu_arr.mean()*1e3:.2f} ms, max={vmunu_arr.max()*1e3:.2f} ms")
+			# Sharded psi variants outside q-loop
+			with mesh_xy:
+				psil_Y = jax.device_put(psi_l_rmu_Y, sh.y3_4)
+				psilT_X = jax.lax.with_sharding_constraint(psil_Y.transpose(0, 2, 3, 1), sh.x2_4)
+				psir_X = jax.device_put(psi_r_rmu_Y, sh.x3_4)
+				psirT_Y = jax.lax.with_sharding_constraint(psir_X.transpose(0, 2, 3, 1), sh.y2_4)
 
-		# Sharded psi variants outside q-loop
-		with mesh_xy:
-			psil_Y = jax.device_put(psi_l_rmu_Y, sh.y3_4)
-			psilT_X = jax.lax.with_sharding_constraint(psil_Y.transpose(0, 2, 3, 1), sh.x2_4)
-			psir_X = jax.device_put(psi_r_rmu_Y, sh.x3_4)
-			psirT_Y = jax.lax.with_sharding_constraint(psir_X.transpose(0, 2, 3, 1), sh.y2_4)
+			# Preserve full-sized left wavefunctions (b3) for rotation in SCF loop
+			psi_l_full = psil_Y
+			psi_lT_full = psilT_X
+			# Define slices and trimmed copies for the one-shot sigma pipeline
+			valence_slice = slice(b0, b2)
+			nb_valence = int(b2 - b0)
+			nb_sigma = int(b3 - b0)
+			psi_l = psi_l_full#[:, valence_slice, :, :]
+			psi_lT = psi_lT_full#[:, :, :, valence_slice]
+			psi_r = psir_X#[:, :nb_sigma, :, :]
+			psi_rT = psirT_Y#[:, :, :, :nb_sigma]
 
-		# Preserve full-sized left wavefunctions (b3) for rotation in SCF loop
-		psi_l_full = psil_Y
-		psi_lT_full = psilT_X
-		# Define slices and trimmed copies for the one-shot sigma pipeline
-		valence_slice = slice(b0, b2)
-		nb_valence = int(b2 - b0)
-		nb_sigma = int(b3 - b0)
-		psi_l = psi_l_full#[:, valence_slice, :, :]
-		psi_lT = psi_lT_full#[:, :, :, valence_slice]
-		psi_r = psir_X#[:, :nb_sigma, :, :]
-		psi_rT = psirT_Y#[:, :, :, :nb_sigma]
-
-		# Persist restart artifacts (store full-sized left/right; trim on load/use)
-		write_labeled_arrays_to_h5(
-			taggedarray_filename,
-			V_qmunu,
-			psi_l_full,
-			psir_X,
-			enk_l,
-			enk_r,
-			S_qmunu,
-			V0_noG0_munu=v_q0_noG0_munu,
-			G0_mu_nu=G0_mu_nu,
-		)
-		save_restart_per_proc(os.path.join(tmp_dir, "taggedarrays"), V_qmunu, S_qmunu, psi_l_full, psir_X, enk_l, enk_r, meta, mesh_xy, V0_noG0_munu=v_q0_noG0_munu)
-		V_qmunu.block_until_ready()
-		zeta_secs = time.perf_counter() - _t_zeta_start
+			# Persist restart artifacts (store full-sized left/right; trim on load/use)
+			write_labeled_arrays_to_h5(
+				taggedarray_filename,
+				V_qmunu,
+				psi_l_full,
+				psir_X,
+				enk_l,
+				enk_r,
+				S_qmunu,
+				V0_noG0_munu=v_q0_noG0_munu,
+				G0_mu_nu=G0_mu_nu,
+			)
+			save_restart_per_proc(os.path.join(tmp_dir, "taggedarrays"), V_qmunu, S_qmunu, psi_l_full, psir_X, enk_l, enk_r, meta, mesh_xy, V0_noG0_munu=v_q0_noG0_munu)
+			V_qmunu.block_until_ready()
 
 	elif restart and not x_only: # TODO update for jax
-		# Build mesh for sharding in restart path if missing
-		if mesh_xy is None:
-			total_devices = jax.process_count() * jax.local_device_count()
-			grid_x = int(np.sqrt(total_devices))
-			while total_devices % grid_x != 0:
-				grid_x -= 1
-			grid_y = total_devices // grid_x
-			devices_2d = np.array(jax.devices()).reshape(grid_x, grid_y)
-			mesh_xy = Mesh(devices_2d, ['x', 'y'])
-			print(f"Device mesh: (X={grid_x}, Y={grid_y}) [restart]")
-		sh = make_shardings(mesh_xy)
-		V_qmunu, S_qmunu, psi_lT, psi_l, psi_r, psi_rT, enk_l, enk_r, v_q0_noG0_munu, G0_mu_nu = load_labeled_arrays_from_h5(
-			taggedarray_filename, mesh_xy
-		)
-		V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0]
+		with timing.section("cohsex_jax.restart_load") as restart_timer:
+			# Build mesh for sharding in restart path if missing
+			if mesh_xy is None:
+				total_devices = jax.process_count() * jax.local_device_count()
+				grid_x = int(np.sqrt(total_devices))
+				while total_devices % grid_x != 0:
+					grid_x -= 1
+				grid_y = total_devices // grid_x
+				devices_2d = np.array(jax.devices()).reshape(grid_x, grid_y)
+				mesh_xy = Mesh(devices_2d, ['x', 'y'])
+				print(f"Device mesh: (X={grid_x}, Y={grid_y}) [restart]")
+			sh = make_shardings(mesh_xy)
+			V_qmunu, S_qmunu, psi_lT, psi_l, psi_r, psi_rT, enk_l, enk_r, v_q0_noG0_munu, G0_mu_nu = load_labeled_arrays_from_h5(
+				taggedarray_filename, mesh_xy
+			)
+			V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0]
 	elif restart and x_only:
-		# Same restart flow for X-only
-		if mesh_xy is None:
-			total_devices = jax.process_count() * jax.local_device_count()
-			grid_x = int(np.sqrt(total_devices))
-			while total_devices % grid_x != 0:
-				grid_x -= 1
-			grid_y = total_devices // grid_x
-			devices_2d = np.array(jax.devices()).reshape(grid_x, grid_y)
-			mesh_xy = Mesh(devices_2d, ['x', 'y'])
-			print(f"Device mesh: (X={grid_x}, Y={grid_y}) [restart]")
-		sh = make_shardings(mesh_xy)
-		V_qmunu, S_qmunu, psi_lT, psi_l, psi_r, psi_rT, enk_l, enk_r, v_q0_noG0_munu, G0_mu_nu = load_labeled_arrays_from_h5(
-			taggedarray_filename, mesh_xy
-		)
-		V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0]
+		with timing.section("cohsex_jax.restart_load_x_only") as restart_timer:
+			# Same restart flow for X-only
+			if mesh_xy is None:
+				total_devices = jax.process_count() * jax.local_device_count()
+				grid_x = int(np.sqrt(total_devices))
+				while total_devices % grid_x != 0:
+					grid_x -= 1
+				grid_y = total_devices // grid_x
+				devices_2d = np.array(jax.devices()).reshape(grid_x, grid_y)
+				mesh_xy = Mesh(devices_2d, ['x', 'y'])
+				print(f"Device mesh: (X={grid_x}, Y={grid_y}) [restart]")
+			sh = make_shardings(mesh_xy)
+			V_qmunu, S_qmunu, psi_lT, psi_l, psi_r, psi_rT, enk_l, enk_r, v_q0_noG0_munu, G0_mu_nu = load_labeled_arrays_from_h5(
+				taggedarray_filename, mesh_xy
+			)
+			V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0]
 
 	# Optionally compute chi0 via JAX for screened interaction if requested
 	if do_screened:
-		# Ensure energies are plain arrays for JAX
-		enk_v_arr = jnp.asarray(getattr(enk_l, 'data', enk_l))
-		enk_c_arr = jnp.asarray(getattr(enk_r, 'data', enk_r))
-		# Four wavefunction copies and shardings for low-comm G and Sigma construction:
-		# psi_lT: (nk, ns, rmu, nb) XT_shard; psi_l: (nk, nb, ns, rmu) Y_shard
-		# psi_r:  (nk, nb, ns, rmu) X_shard;  psi_rT: (nk, ns, rmu, nb) YT_shard
-		# We reshard psi_rT to XT for chi0 so both G_v and G_c use {mu_X, nu_Y} without communication.
-		window_pairs = get_window_info(epsq, wfn, nband_max=nband)
-		_t_chiw_start = time.perf_counter()
-		chi0 = get_chi0_jax(psi_lT, psi_l, psi_r, psi_rT, enk_v_arr, enk_c_arr, window_pairs, meta, mesh_xy)
-		# Compute static W under k_XY sharding (S_qmunu included but unused for now)
-		W_q = get_static_w_q_jax(V_qmunu, chi0, None, meta, mesh_xy)
-		W_q.block_until_ready()
-		chiw_secs = time.perf_counter() - _t_chiw_start
-		# Compute static W under k_XY sharding (S_qmunu included but unused for now)
-		#W_q = get_static_w_q_jax(V_qmunu, chi0, S_qmunu, meta, mesh_xy)
+		with timing.section("cohsex_jax.chi0_W") as timer_chiw:
+			# Ensure energies are plain arrays for JAX
+			enk_v_arr = jnp.asarray(getattr(enk_l, 'data', enk_l))
+			enk_c_arr = jnp.asarray(getattr(enk_r, 'data', enk_r))
+			# Four wavefunction copies and shardings for low-comm G and Sigma construction:
+			# psi_lT: (nk, ns, rmu, nb) XT_shard; psi_l: (nk, nb, ns, rmu) Y_shard
+			# psi_r:  (nk, nb, ns, rmu) X_shard;  psi_rT: (nk, ns, rmu, nb) YT_shard
+			# We reshard psi_rT to XT for chi0 so both G_v and G_c use {mu_X, nu_Y} without communication.
+			window_pairs = get_window_info(epsq, wfn, nband_max=nband)
+			chi0 = get_chi0_jax(psi_lT, psi_l, psi_r, psi_rT, enk_v_arr, enk_c_arr, window_pairs, meta, mesh_xy)
+			# Compute static W under k_XY sharding (S_qmunu included but unused for now)
+			W_q = get_static_w_q_jax(V_qmunu, chi0, None, meta, mesh_xy)
+			W_q.block_until_ready()
+			# Compute static W under k_XY sharding (S_qmunu included but unused for now)
+			#W_q = get_static_w_q_jax(V_qmunu, chi0, S_qmunu, meta, mesh_xy)
 
  
 	# Compute q=0 averages (after restart/loop) and inject head-averages
@@ -1320,20 +1320,19 @@ def main(argv=None):
 	)
 
 	with mesh_xy:
-		_t_pipe_start = time.perf_counter()
-		sigma_x_kbar_ij_jax, hartree_kbar_ij_jax = pipeline_jit(
-			psi_lT,  # (nk, nb, ns, rmu) X-sharded over rmu (resharded by jit)
-			psi_l,   # (nk, nb, ns, rmu) Y-sharded over rmu
-			psi_r,   # (nk, ns, rmu, nb)  X-sharded over rmu (unused inside)
-			psi_rT,  # (nk, nb, ns, rmu)  X-sharded over rmu (unused inside)
-			V_mu_nu, # (rmu1, rmu2, nkx, nky, nkz) rmu1, rmu2 sharded over (x,y)
-			v_q0_noG0_munu, # (rmu1, rmu2) sharded over (x,y)
-			meta.nkx, meta.nky, meta.nkz, meta.nk_tot, meta.nspinor,
-			float(wfn.cell_volume/np.prod(wfn.fft_grid)),
-		)
-	sigma_x_kbar_ij_jax.block_until_ready()
-	hartree_kbar_ij_jax.block_until_ready()
-	pipe_secs = time.perf_counter() - _t_pipe_start
+			with timing.section("cohsex_jax.pipeline"):
+				sigma_x_kbar_ij_jax, hartree_kbar_ij_jax = pipeline_jit(
+					psi_lT,  # (nk, nb, ns, rmu) X-sharded over rmu (resharded by jit)
+					psi_l,   # (nk, nb, ns, rmu) Y-sharded over rmu
+					psi_r,   # (nk, ns, rmu, nb)  X-sharded over rmu (unused inside)
+					psi_rT,  # (nk, nb, ns, rmu)  X-sharded over rmu (unused inside)
+					V_mu_nu, # (rmu1, rmu2, nkx, nky, nkz) rmu1, rmu2 sharded over (x,y)
+					v_q0_noG0_munu, # (rmu1, rmu2) sharded over (x,y)
+					meta.nkx, meta.nky, meta.nkz, meta.nk_tot, meta.nspinor,
+					float(wfn.cell_volume/np.prod(wfn.fft_grid)),
+				)
+				sigma_x_kbar_ij_jax.block_until_ready()
+				hartree_kbar_ij_jax.block_until_ready()
 	#vhartree_k_mu = jnp.einsum('xy,y->x', v_q0_noG0_munu, rho_k_mu, optimize=True)
 	#hartree_kmn = jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_r), vhartree_k_mu, psi_r, optimize=True)
 	#rho_k_mu = jnp.transpose(rho_k_mu, (1,0)).reshape(-1,meta.nkx,meta.nky,meta.nkz)
@@ -1470,13 +1469,7 @@ def main(argv=None):
 		summarize_hermitian_matrix("H_qp", H_qp_mnk_host, print_fn=print0)
 	# Timing report
 	if jax.process_index() == 0:
-		print0("--- Timing (seconds) ---")
-		print0(f"zeta/V build: {zeta_secs:.3f}")
-		if do_screened:
-			print0(f"chi0 + W_q: {chiw_secs:.3f}")
-		else:
-			print0("chi0 + W_q: n/a")
-		print0(f"pipeline_jit: {pipe_secs:.3f}")
+		timing.report(print_fn=print0, title="--- Timing (seconds) ---")
 
 	# Later stages of this project will iterate this workflow so that the COHSEX
 	# potential feeds back into updated wavefunctions (self-consistent COHSEX)

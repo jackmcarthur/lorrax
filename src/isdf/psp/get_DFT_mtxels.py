@@ -60,6 +60,7 @@ import h5py
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import isdf.common.timing as timing
 # Lightweight device report (CPU-only by default)
 try:
     devs = jax.devices()
@@ -551,6 +552,7 @@ def compute_local_V_k(wfn_k, Gk_crys, V_r, cell_volume):
     raise NotImplementedError("compute_V_NL_k legacy path removed; use compute_V_NL_k_minimal via ISDF_USE_MINIMAL_VNL=1 or call projector_pipeline directly.")
 
 
+@timing.timed("psp.get_DFT_mtxels.get_H_matrix_elements", watch=True)
 def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valrange):
     """
     Compute nonlocal pseudopotential matrix elements <mk|V_NL|nk> for all k-points.
@@ -726,6 +728,7 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valr
     
     return H_sharded, rho_valence, first_k_components
     
+@timing.timed("psp.get_DFT_mtxels.get_kin_ion", watch=True)
 def get_kin_ion(
     global_psi_G,
     wfn,
@@ -857,7 +860,7 @@ def main(argv=None):
     print("="*60)
     print("Nonlocal Pseudopotential Matrix Elements Calculator")
     print("="*60)
-    
+
     argp = argparse.ArgumentParser(description="Nonlocal pseudopotential V_NL calculator")
     argp.add_argument(
         "-i",
@@ -867,6 +870,8 @@ def main(argv=None):
     )
     args = argp.parse_args(argv)
     
+    timing.reset()
+
     # Read input parameters
     print(f"\nReading input from: {args.input}")
     params = read_cohsex_input(args.input)
@@ -887,16 +892,18 @@ def main(argv=None):
     
     # Load wavefunction file
     print(f"\nLoading wavefunction file: {os.path.basename(params['wfn_file'])}")
-    try:
-        wfn = WFNReader(params["wfn_file"])
-        print(f"  Success: {wfn.nkpts} k-points, {wfn.nbands} bands, {wfn.nelec} electrons")
-    except Exception as e:
-        print(f"  Error loading WFN file: {e}")
-        return 1
+    with timing.section("psp.get_DFT_mtxels.load_wfn"):
+        try:
+            wfn = WFNReader(params["wfn_file"])
+            print(f"  Success: {wfn.nkpts} k-points, {wfn.nbands} bands, {wfn.nelec} electrons")
+        except Exception as e:
+            print(f"  Error loading WFN file: {e}")
+            return 1
     
     # Initialize symmetry mappings
     print("\nInitializing symmetry mappings...")
-    sym = symmetry_maps.SymMaps(wfn)
+    with timing.section("psp.get_DFT_mtxels.symmetry"):
+        sym = symmetry_maps.SymMaps(wfn)
     print(f"  Success: {sym.nk_tot} total k-points, {sym.nk_red} irreducible k-points")
     
     # Get band ranges
@@ -936,12 +943,15 @@ def main(argv=None):
     # Load G-vectors and wavefunction coefficients
     print("\nLoading wavefunction coefficients to devices...")
     brange = (0, nsigmarange[1])  # Load all bands for now
-    global_psi_G, nb_actual = read_Gvecs_to_devices(wfn, sym, brange, meta, bispinor, mesh_xy)
+    with timing.section("psp.get_DFT_mtxels.read_Gvecs") as timer_read:
+        global_psi_G, nb_actual = read_Gvecs_to_devices(wfn, sym, brange, meta, bispinor, mesh_xy)
+        timer_read.watch(global_psi_G)
     print(f"  Loaded {nb_actual} bands in G-space, shape: {global_psi_G.shape}")
     
     # Load pseudopotentials from working directory
     print("\nScanning for pseudopotential files...")
-    pseudos = load_pseudopotentials(input_dir)
+    with timing.section("psp.get_DFT_mtxels.load_pseudos"):
+        pseudos = load_pseudopotentials(input_dir)
     
     # Print atomic structure information
     print_atomic_structure(wfn, pseudos)
@@ -1052,6 +1062,8 @@ def main(argv=None):
         print(f"Wrote kin+ion matrices to {out_h5}")
     except Exception as e:
         print(f"Warning: failed to write kin_ion.h5 ({e})")
+
+    timing.report(title="--- Timing (seconds) ---")
 
     return 0
 
