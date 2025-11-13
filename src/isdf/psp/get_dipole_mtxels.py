@@ -42,7 +42,6 @@ from isdf.psp.projector_pipeline import (
 )
 from dataclasses import dataclass
 import h5py
-import isdf.common.timing as timing
 # --------------------------
 # K+G helpers
 # --------------------------
@@ -63,7 +62,6 @@ def build_K_vectors(Gk_crys, kpoint_crys, wfn):
 
  
 
-@timing.timed("psp.get_dipole.compute_p_operator_k", watch=True)
 def compute_p_operator_k(wfn_k: jax.Array, Gk_crys: np.ndarray, kpoint_crys: np.ndarray, bdot: np.ndarray, bvec: np.ndarray, blat: float) -> jax.Array:
 	"""Compute p-operator matrix elements per Cartesian component.
 
@@ -149,8 +147,6 @@ def main(argv=None):
 	)
 	args = parser.parse_args(argv)
 
-	timing.reset()
-
 
 	input_path = Path(args.input).resolve()
 	params = read_cohsex_input(str(input_path))
@@ -160,10 +156,8 @@ def main(argv=None):
 		wfn_path = (input_path.parent / wfn_path).resolve()
 
 	# Open WFN and symmetry
-	with timing.section("psp.get_dipole.load_wfn"):
-		wfn = WFNReader(str(wfn_path))
-	with timing.section("psp.get_dipole.symmetry"):
-		sym = symmetry_maps.SymMaps(wfn)
+	wfn = WFNReader(str(wfn_path))
+	sym = symmetry_maps.SymMaps(wfn)
 
 	nval = int(params.get("nval", 5))
 	ncond = int(params.get("ncond", 5))
@@ -189,119 +183,110 @@ def main(argv=None):
 	# Ensure we load enough conduction bands for debug/output comparisons
 	nband_eff = min(int(wfn.nbands), max(int(wfn.nelec) + int(ncond), int(nband)))
 	brange = (0, nband_eff)
-	with timing.section("psp.get_dipole.read_Gvecs") as timer_read:
-		global_psi_G, nb_actual = read_Gvecs_to_devices(wfn, sym, brange, meta, bispinor, mesh_xy)
-		timer_read.watch(global_psi_G)
+	global_psi_G, nb_actual = read_Gvecs_to_devices(wfn, sym, brange, meta, bispinor, mesh_xy)
 	print(f"  Loaded {nb_actual} bands in G-space, shape: {global_psi_G.shape}")
 
 	print("\nScanning for pseudopotential files...")
-	with timing.section("psp.get_dipole.load_pseudos"):
-		pseudos = load_pseudopotentials(str(input_path.parent))
+	pseudos = load_pseudopotentials(str(input_path.parent))
 
 	# Structure summary (reuse DFT helper)
 	print_atomic_structure(wfn, pseudos)
 
 	# Precompute per-species caches for nonlocal projectors
-	with timing.section("psp.get_dipole.projector_caches"):
-		assignments = build_atom_pp_assignments(jnp.asarray(wfn.atom_crys, dtype=jnp.float64), jnp.asarray(wfn.atom_types, dtype=jnp.int32), pseudos)
-		species_payload: list[tuple[object, np.ndarray]] = []
-		for ap in assignments:
-			pseudo = ap.pseudo
-			if pseudo is None:
-				continue
-			if not any(id(pseudo) == id(p) for p, _ in species_payload):
-				positions = np.asarray([a.position for a in assignments if id(a.pseudo) == id(pseudo)], dtype=float)
-				species_payload.append((pseudo, positions))
+	assignments = build_atom_pp_assignments(jnp.asarray(wfn.atom_crys, dtype=jnp.float64), jnp.asarray(wfn.atom_types, dtype=jnp.int32), pseudos)
+	species_payload: list[tuple[object, np.ndarray]] = []
+	for ap in assignments:
+		pseudo = ap.pseudo
+		if pseudo is None:
+			continue
+		if not any(id(pseudo) == id(p) for p, _ in species_payload):
+			positions = np.asarray([a.position for a in assignments if id(a.pseudo) == id(pseudo)], dtype=float)
+			species_payload.append((pseudo, positions))
 
 	# Precompute G and K scaffolding for all k-points
-	with timing.section("psp.get_dipole.precompute_scaffolding"):
-		Gk_crys_all: list[jnp.ndarray] = []
-		K_crys_all: list[jnp.ndarray] = []
-		K_cart_all: list[jnp.ndarray] = []
-		K_norm_all: list[np.ndarray] = []
-		bvec_np = np.asarray(wfn.bvec, dtype=float)
-		B = float(wfn.blat) * bvec_np
-		for i in range(sym.nk_tot):
-			Gk_crys_i, _ = generate_gvectors_k(i, sym, wfn, meta)
-			Gk = np.asarray(Gk_crys_i, dtype=float)
-			kvec = np.asarray(sym.unfolded_kpts[i], dtype=float)
-			Kc = Gk + kvec[None, :]
-			Kcart = Kc @ B
-			Knorm = np.sqrt(np.sum(Kcart**2, axis=1))
-			Gk_crys_all.append(jnp.asarray(Gk_crys_i, dtype=jnp.int32))
-			K_crys_all.append(jnp.asarray(Kc, dtype=jnp.float64))
-			K_cart_all.append(jnp.asarray(Kcart, dtype=jnp.float64))
-			K_norm_all.append(Knorm)
+	Gk_crys_all: list[jnp.ndarray] = []
+	K_crys_all: list[jnp.ndarray] = []
+	K_cart_all: list[jnp.ndarray] = []
+	K_norm_all: list[np.ndarray] = []
+	bvec_np = np.asarray(wfn.bvec, dtype=float)
+	B = float(wfn.blat) * bvec_np
+	for i in range(sym.nk_tot):
+		Gk_crys_i, _ = generate_gvectors_k(i, sym, wfn, meta)
+		Gk = np.asarray(Gk_crys_i, dtype=float)
+		kvec = np.asarray(sym.unfolded_kpts[i], dtype=float)
+		Kc = Gk + kvec[None, :]
+		Kcart = Kc @ B
+		Knorm = np.sqrt(np.sum(Kcart**2, axis=1))
+		Gk_crys_all.append(jnp.asarray(Gk_crys_i, dtype=jnp.int32))
+		K_crys_all.append(jnp.asarray(Kc, dtype=jnp.float64))
+		K_cart_all.append(jnp.asarray(Kcart, dtype=jnp.float64))
+		K_norm_all.append(Knorm)
 
 	# Build minimal VNL plan
 	q_max = 0.0
 	for Knorm in K_norm_all:
 		if Knorm.size:
 			q_max = max(q_max, float(np.max(Knorm)))
-	with timing.section("psp.get_dipole.build_vnl_plan"):
-		plan = build_vnl_plan(pseudos, assignments, float(wfn.cell_volume), float(q_max))
+	plan = build_vnl_plan(pseudos, assignments, float(wfn.cell_volume), float(q_max))
 
 	# Reshard wavefunctions over mesh
 	k_xy_shard = NamedSharding(mesh_xy, P(('x','y'), None, None, None, None, None))
-	with timing.section("psp.get_dipole.reshard_wfn") as timer_reshard:
-		wfn_k_sharded = jax.lax.with_sharding_constraint(global_psi_G, k_xy_shard)
-		timer_reshard.watch(wfn_k_sharded)
+	wfn_k_sharded = jax.lax.with_sharding_constraint(global_psi_G, k_xy_shard)
 
 	nk = sym.nk_tot
 	nb = int(wfn_k_sharded.shape[1])
 	dipole = np.zeros((3, nk, nb, nb), dtype=np.complex128)
 	deltaE = np.zeros((nk, nb, nb), dtype=np.float64)
 
-	with timing.section("psp.get_dipole.build_dipole"):
-		for i in range(nk):
-			wfn_k = wfn_k_sharded[i]
-			kpoint = jnp.asarray(sym.unfolded_kpts[i], dtype=jnp.float64)
-			Gk_crys = Gk_crys_all[i]
-			# Momentum per component
-			p_cart = compute_p_operator_k(
-				wfn_k,
-				Gk_crys,
-				kpoint,
-				jnp.asarray(wfn.bdot, dtype=jnp.float64),
-				jnp.asarray(wfn.bvec, dtype=jnp.float64),
-				float(wfn.blat),
-			)  # (3, nb, nb)
-			# Nonlocal velocity components via commutator i[r_i, V_NL]
-			if args.vnl_mode == "numeric":
-				# Numeric derivative on V_NL with optional Richardson and adaptive h
-				B = (np.asarray(wfn.bvec, dtype=float)) * float(wfn.blat)
-				Binv = np.linalg.inv(B)
-				vNL_cart = np.zeros((3, nb, nb), dtype=np.complex128)
-				K_cart_this = np.asarray(K_cart_all[i])
-				K_med = float(np.median(np.linalg.norm(K_cart_this, axis=1))) if K_cart_this.size else 1.0
-				h_base = max(float(args.vnl_h), float(args.vnl_h_rel) * max(K_med, 1.0))
-				h1 = h_base
-				h2 = 0.5 * h_base
-				for ic in range(3):
-					# D1 at h1
-					d1 = np.zeros((3,), dtype=float); d1[ic] = h1
-					d1c = d1 @ Binv
-					Kp1_crys = np.asarray(K_crys_all[i]) + d1c[None, :]
-					Km1_crys = np.asarray(K_crys_all[i]) - d1c[None, :]
-					Kp1_cart = Kp1_crys @ B
-					Km1_cart = Km1_crys @ B
-					Vp1 = compute_V_NL_k_minimal(wfn_k, Gk_crys, Kp1_crys, Kp1_cart, plan, float(wfn.cell_volume))
-					Vm1 = compute_V_NL_k_minimal(wfn_k, Gk_crys, Km1_crys, Km1_cart, plan, float(wfn.cell_volume))
-					D1 = - (Vp1 - Vm1) / (2.0 * h1)
-					if args.vnl_num_scheme == "richardson":
-						# D2 at h2
-						d2 = np.zeros((3,), dtype=float); d2[ic] = h2
-						d2c = d2 @ Binv
-						Kp2_crys = np.asarray(K_crys_all[i]) + d2c[None, :]
-						Km2_crys = np.asarray(K_crys_all[i]) - d2c[None, :]
-						Kp2_cart = Kp2_crys @ B
-						Km2_cart = Km2_crys @ B
-						Vp2 = compute_V_NL_k_minimal(wfn_k, Gk_crys, Kp2_crys, Kp2_cart, plan, float(wfn.cell_volume))
-						Vm2 = compute_V_NL_k_minimal(wfn_k, Gk_crys, Km2_crys, Km2_cart, plan, float(wfn.cell_volume))
-						D2 = - (Vp2 - Vm2) / (2.0 * h2)
-						vNL_cart[ic] = (4.0 * D2 - D1) / 3.0
-					else:
-						vNL_cart[ic] = D1
+	for i in range(nk):
+		wfn_k = wfn_k_sharded[i]
+		kpoint = jnp.asarray(sym.unfolded_kpts[i], dtype=jnp.float64)
+		Gk_crys = Gk_crys_all[i]
+		# Momentum per component
+		p_cart = compute_p_operator_k(
+			wfn_k,
+			Gk_crys,
+			kpoint,
+			jnp.asarray(wfn.bdot, dtype=jnp.float64),
+			jnp.asarray(wfn.bvec, dtype=jnp.float64),
+			float(wfn.blat),
+		)  # (3, nb, nb)
+		# Nonlocal velocity components via commutator i[r_i, V_NL]
+		if args.vnl_mode == "numeric":
+			# Numeric derivative on V_NL with optional Richardson and adaptive h
+			B = (np.asarray(wfn.bvec, dtype=float)) * float(wfn.blat)
+			Binv = np.linalg.inv(B)
+			vNL_cart = np.zeros((3, nb, nb), dtype=np.complex128)
+			K_cart_this = np.asarray(K_cart_all[i])
+			K_med = float(np.median(np.linalg.norm(K_cart_this, axis=1))) if K_cart_this.size else 1.0
+			h_base = max(float(args.vnl_h), float(args.vnl_h_rel) * max(K_med, 1.0))
+			h1 = h_base
+			h2 = 0.5 * h_base
+			for ic in range(3):
+				# D1 at h1
+				d1 = np.zeros((3,), dtype=float); d1[ic] = h1
+				d1c = d1 @ Binv
+				Kp1_crys = np.asarray(K_crys_all[i]) + d1c[None, :]
+				Km1_crys = np.asarray(K_crys_all[i]) - d1c[None, :]
+				Kp1_cart = Kp1_crys @ B
+				Km1_cart = Km1_crys @ B
+				Vp1 = compute_V_NL_k_minimal(wfn_k, Gk_crys, Kp1_crys, Kp1_cart, plan, float(wfn.cell_volume))
+				Vm1 = compute_V_NL_k_minimal(wfn_k, Gk_crys, Km1_crys, Km1_cart, plan, float(wfn.cell_volume))
+				D1 = - (Vp1 - Vm1) / (2.0 * h1)
+				if args.vnl_num_scheme == "richardson":
+					# D2 at h2
+					d2 = np.zeros((3,), dtype=float); d2[ic] = h2
+					d2c = d2 @ Binv
+					Kp2_crys = np.asarray(K_crys_all[i]) + d2c[None, :]
+					Km2_crys = np.asarray(K_crys_all[i]) - d2c[None, :]
+					Kp2_cart = Kp2_crys @ B
+					Km2_cart = Km2_crys @ B
+					Vp2 = compute_V_NL_k_minimal(wfn_k, Gk_crys, Kp2_crys, Kp2_cart, plan, float(wfn.cell_volume))
+					Vm2 = compute_V_NL_k_minimal(wfn_k, Gk_crys, Km2_crys, Km2_cart, plan, float(wfn.cell_volume))
+					D2 = - (Vp2 - Vm2) / (2.0 * h2)
+					vNL_cart[ic] = (4.0 * D2 - D1) / 3.0
+				else:
+					vNL_cart[ic] = D1
 		else:
 			vNL_cart = compute_V_NL_velocity_k(
 				wfn_k,
@@ -340,48 +325,48 @@ def main(argv=None):
 			c_count = min(4, max(0, nb - nelec))
 			if v_count == 0 or c_count == 0:
 				print("[DEBUG] Skipping 4x6 debug blocks: insufficient v/c bands (v_count=", v_count, ", c_count=", c_count, ")")
-			else:
-				v_idx = np.arange(nelec - 1, nelec - v_count - 1, -1, dtype=int)  # descending
-				c_idx = np.arange(nelec, nelec + c_count, dtype=int)              # ascending
-				p_x = np.asarray(p_cart[0])
-				full_x = np.asarray(p_cart[0] + vNL_cart[0])
-				if args.divide_energy:
-					with np.errstate(divide='ignore', invalid='ignore'):
-						dE = deltaE[i]
-						p_x = np.where(np.abs(dE) < 1e-12, 0.0, p_x / dE)
-						full_x = np.where(np.abs(dE) < 1e-12, 0.0, full_x / dE)
-				mom_block = p_x[np.ix_(c_idx, v_idx)]
-				full_block = full_x[np.ix_(c_idx, v_idx)]
-				print("\n[DEBUG] 4x6 x-direction momentum block (real):")
-				for r in range(mom_block.shape[0]):
-					print(' '.join(f"{np.real(mom_block[r, c]):.5f}" for c in range(mom_block.shape[1])))
-				print("[DEBUG] 4x6 x-direction momentum block (imag):")
-				for r in range(mom_block.shape[0]):
-					print(' '.join(f"{np.imag(mom_block[r, c]):.5f}" for c in range(mom_block.shape[1])))
-				print("[DEBUG] 4x6 x-direction (p + vNL) block (real):")
-				for r in range(full_block.shape[0]):
-					print(' '.join(f"{np.real(full_block[r, c]):.5f}" for c in range(full_block.shape[1])))
-				print("[DEBUG] 4x6 x-direction (p + vNL) block (imag):")
-				for r in range(full_block.shape[0]):
-					print(' '.join(f"{np.imag(full_block[r, c]):.5f}" for c in range(full_block.shape[1])))
+				continue
+			v_idx = np.arange(nelec - 1, nelec - v_count - 1, -1, dtype=int)  # descending
+			c_idx = np.arange(nelec, nelec + c_count, dtype=int)              # ascending
+			p_x = np.asarray(p_cart[0])
+			full_x = np.asarray(p_cart[0] + vNL_cart[0])
+			if args.divide_energy:
+				with np.errstate(divide='ignore', invalid='ignore'):
+					dE = deltaE[i]
+					p_x = np.where(np.abs(dE) < 1e-12, 0.0, p_x / dE)
+					full_x = np.where(np.abs(dE) < 1e-12, 0.0, full_x / dE)
+			mom_block = p_x[np.ix_(c_idx, v_idx)]
+			full_block = full_x[np.ix_(c_idx, v_idx)]
+			print("\n[DEBUG] 4x6 x-direction momentum block (real):")
+			for r in range(mom_block.shape[0]):
+				print(' '.join(f"{np.real(mom_block[r, c]):.5f}" for c in range(mom_block.shape[1])))
+			print("[DEBUG] 4x6 x-direction momentum block (imag):")
+			for r in range(mom_block.shape[0]):
+				print(' '.join(f"{np.imag(mom_block[r, c]):.5f}" for c in range(mom_block.shape[1])))
+			print("[DEBUG] 4x6 x-direction (p + vNL) block (real):")
+			for r in range(full_block.shape[0]):
+				print(' '.join(f"{np.real(full_block[r, c]):.5f}" for c in range(full_block.shape[1])))
+			print("[DEBUG] 4x6 x-direction (p + vNL) block (imag):")
+			for r in range(full_block.shape[0]):
+				print(' '.join(f"{np.imag(full_block[r, c]):.5f}" for c in range(full_block.shape[1])))
 
-				# 2x3 grid of 2x2 Frobenius norms from the 4x6 (p+vNL) block, matching parse_vmtxel.py
-				if full_block.shape[0] >= 4 and full_block.shape[1] >= 6:
-					B00 = full_block[0:2, 0:2]
-					B01 = full_block[0:2, 2:4]
-					B02 = full_block[0:2, 4:6]
-					B10 = full_block[2:4, 0:2]
-					B11 = full_block[2:4, 2:4]
-					B12 = full_block[2:4, 4:6]
-					fn00 = float(np.linalg.norm(B00, ord='fro'))
-					fn01 = float(np.linalg.norm(B01, ord='fro'))
-					fn02 = float(np.linalg.norm(B02, ord='fro'))
-					fn10 = float(np.linalg.norm(B10, ord='fro'))
-					fn11 = float(np.linalg.norm(B11, ord='fro'))
-					fn12 = float(np.linalg.norm(B12, ord='fro'))
-					print("[DEBUG] 2x3 grid of 2x2 Frobenius norms (|p+vNL|, x-direction):")
-					print(f"  {fn00:.6f} {fn01:.6f} {fn02:.6f}")
-					print(f"  {fn10:.6f} {fn11:.6f} {fn12:.6f}")
+			# 2x3 grid of 2x2 Frobenius norms from the 4x6 (p+vNL) block, matching parse_vmtxel.py
+			if full_block.shape[0] >= 4 and full_block.shape[1] >= 6:
+				B00 = full_block[0:2, 0:2]
+				B01 = full_block[0:2, 2:4]
+				B02 = full_block[0:2, 4:6]
+				B10 = full_block[2:4, 0:2]
+				B11 = full_block[2:4, 2:4]
+				B12 = full_block[2:4, 4:6]
+				fn00 = float(np.linalg.norm(B00, ord='fro'))
+				fn01 = float(np.linalg.norm(B01, ord='fro'))
+				fn02 = float(np.linalg.norm(B02, ord='fro'))
+				fn10 = float(np.linalg.norm(B10, ord='fro'))
+				fn11 = float(np.linalg.norm(B11, ord='fro'))
+				fn12 = float(np.linalg.norm(B12, ord='fro'))
+				print("[DEBUG] 2x3 grid of 2x2 Frobenius norms (|p+vNL|, x-direction):")
+				print(f"  {fn00:.6f} {fn01:.6f} {fn02:.6f}")
+				print(f"  {fn10:.6f} {fn11:.6f} {fn12:.6f}")
 
 
 	# Save to dipole.h5 with deltaE
@@ -393,8 +378,6 @@ def main(argv=None):
 		h5.attrs['nk'] = int(sym.nk_tot)
 		h5.attrs['note'] = 'dipole_cart[3,x,y] = p_i + i[r_i, V_NL]; deltaE[k,:,:] = E_b - E_b\''
 	print(f"\nWrote dipole data to {out_path}")
-
-	timing.report(title="--- Timing (seconds) ---")
 
 
 if __name__ == '__main__':
