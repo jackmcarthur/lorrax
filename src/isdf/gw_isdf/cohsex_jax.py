@@ -99,8 +99,8 @@ def compute_CCT_ZCT_for_q(
 	- psi_*_rmuT: (nk, n_rmu, nb, ns)
 	- k_*_indices: (n_pairs,)
 	"""
-	n_rmu = int(psi_l_rmu.shape[-1])
-	n_rtot = int(psi_l_rtot.shape[-1])
+	n_rmu = psi_l_rmu.shape[-1]
+	n_rtot = psi_l_rtot.shape[-1]
 	# Flatten band/spinor dimensions once to avoid per-iteration reshapes.
 	psi_l_rmu_flat = psi_l_rmu.reshape(psi_l_rmu.shape[0], -1, n_rmu)
 	psi_r_rmu_flat = psi_r_rmu.reshape(psi_r_rmu.shape[0], -1, n_rmu)
@@ -113,7 +113,7 @@ def compute_CCT_ZCT_for_q(
 	CCT_acc_init = CCT_buf * 0.0
 	ZCT_acc_init = ZCT_buf * 0.0
 
-	total_pairs = int(k_l_indices.shape[0])
+	total_pairs = k_l_indices.shape[0]
 	if total_pairs == 0:
 		return CCT_acc_init, ZCT_acc_init
 
@@ -156,25 +156,41 @@ def compute_Sq_from_zeta(zeta_q: jax.Array) -> jax.Array:
 	return jnp.einsum('mu,nu->mn', jnp.conj(zeta_q), zeta_q, optimize=True)
 
 
+def exp_ikr_fftbox(fft_nx: int, fft_ny: int, fft_nz: int) -> tuple[jax.Array, jax.Array, jax.Array]:
+	"""Return fractional coordinate grids for constructing exp(ik·r) on the FFT box."""
+	fx = jnp.arange(fft_nx, dtype=jnp.float64)[None, :, None, None] / float(fft_nx)
+	fy = jnp.arange(fft_ny, dtype=jnp.float64)[None, None, :, None] / float(fft_ny)
+	fz = jnp.arange(fft_nz, dtype=jnp.float64)[None, None, None, :] / float(fft_nz)
+	return fx, fy, fz
+
+
+def as_index_tuple(vec) -> tuple[int, ...]:
+	"""Convert an integer vector into a Python index tuple."""
+	return tuple(np.asarray(vec, dtype=np.int64))
+
+
 def make_v_munu_kernel(fft_nx: int, fft_ny: int, fft_nz: int, nkx: int, nky: int, nkz: int):
 	"""Factory for a jitted kernel that computes v_{mu,nu} for one q.
 
 	Captures static FFT/k-grid sizes to keep the jitted function shape-stable.
 	"""
-	fx = jnp.arange(fft_nx)[None, :, None, None] / fft_nx
-	fy = jnp.arange(fft_ny)[None, None, :, None] / fft_ny
-	fz = jnp.arange(fft_nz)[None, None, None, :] / fft_nz
-	nkx = jnp.asarray(nkx, dtype=jnp.float64)
-	nky = jnp.asarray(nky, dtype=jnp.float64)
-	nkz = jnp.asarray(nkz, dtype=jnp.float64)
+	fx, fy, fz = exp_ikr_fftbox(fft_nx, fft_ny, fft_nz)
+	nkx = jnp.asarray(float(nkx))
+	nky = jnp.asarray(float(nky))
+	nkz = jnp.asarray(float(nkz))
 
 	@partial(jax.jit)
-	def kernel(zeta_q: jax.Array, qvec_wrapped: jax.Array, vcoul_comps: jax.Array, V_qfullG: jax.Array) -> jax.Array:
+	def kernel(
+		zeta_q: jax.Array,
+		qvec_wrapped: jax.Array,
+		vcoul_comps: jax.Array,
+		sqrt_V_qfullG: jax.Array,
+	) -> jax.Array:
 		zeta_q_spatial = zeta_q.reshape(zeta_q.shape[0], fft_nx, fft_ny, fft_nz)
 		phase = jnp.exp(-2j * jnp.pi * (qvec_wrapped[0]/nkx * fx + qvec_wrapped[1]/nky * fy + qvec_wrapped[2]/nkz * fz))
 		zeta_qG = jnp.fft.fftn(zeta_q_spatial * phase, axes=(-3, -2, -1)) # unscaled.
 		zeta_qG_flat = zeta_qG[:, vcoul_comps[:, 0], vcoul_comps[:, 1], vcoul_comps[:, 2]]
-		zeta_v = zeta_qG_flat * jnp.sqrt(V_qfullG)
+		zeta_v = zeta_qG_flat * sqrt_V_qfullG
 		return jnp.einsum('mG,nG->mn', jnp.conj(zeta_v), zeta_v, optimize=True)
 
 	return kernel
@@ -201,9 +217,7 @@ def compute_v_munu_from_zeta(
 	outer-scope state. Returns (n_rmu, n_rmu) for a single q. Expects sqrt(V_qfullG)
 	to avoid recomputing the square root inside the loop.
 	"""
-	fx = jnp.arange(fft_nx)[None, :, None, None] / float(fft_nx)
-	fy = jnp.arange(fft_ny)[None, None, :, None] / float(fft_ny)
-	fz = jnp.arange(fft_nz)[None, None, None, :] / float(fft_nz)
+	fx, fy, fz = exp_ikr_fftbox(fft_nx, fft_ny, fft_nz)
 	denx = jnp.asarray(float(nkx))
 	deny = jnp.asarray(float(nky))
 	denz = jnp.asarray(float(nkz))
@@ -639,6 +653,7 @@ def get_zeta_q_and_v_q_mu_nu(
 		S_qmunu = jax.lax.with_sharding_constraint(S_qmunu, sh.x3y4_5)
 
 	V_q_names = ["nfreq", "npol1", "npol2", "nkx", "nky", "nkz", "nrmu1", "nrmu2"]
+	fft_nx, fft_ny, fft_nz = (int(dim) for dim in meta.fft_grid)
 
 	# 3. Convert weights and other arrays to JAX
 	kgrid = meta.kgrid_jax
@@ -712,15 +727,13 @@ def get_zeta_q_and_v_q_mu_nu(
 		zeta_q = jax.lax.with_sharding_constraint(zeta_q, sh.xy0_2)
 		S_q_local = compute_Sq_from_zeta(zeta_q)
 		S_q_local = jax.lax.with_sharding_constraint(S_q_local, sh.x0y1_2)
-		qx, qy, qz = (int(v) for v in qvec_nonneg)
+		qx, qy, qz = as_index_tuple(qvec_nonneg)
 		S_qmunu = S_qmunu.at[qx, qy, qz, :, :].set(S_q_local)
 
 		# Reshape zeta_q: (n_rmu, n_rtot) → (n_rmu, nx, ny, nz)
-		zeta_q_spatial = zeta_q.reshape(meta.n_rmu, *meta.fft_grid)
+		zeta_q_spatial = zeta_q.reshape(meta.n_rmu, fft_nx, fft_ny, fft_nz)
 		# Phase removal and FFT
-		fx = jnp.arange(meta.fft_grid[0])[None, :, None, None] / meta.fft_grid[0]
-		fy = jnp.arange(meta.fft_grid[1])[None, None, :, None] / meta.fft_grid[1]
-		fz = jnp.arange(meta.fft_grid[2])[None, None, None, :] / meta.fft_grid[2]
+		fx, fy, fz = exp_ikr_fftbox(fft_nx, fft_ny, fft_nz)
 		kgrfloat = jnp.asarray(kgrid, dtype=jnp.float64)
 		phase = jnp.exp(-2j * jnp.pi * (qvec[0] / kgrfloat[0] * fx + qvec[1] / kgrfloat[1] * fy + qvec[2] / kgrfloat[2] * fz))
 		zeta_q_spatial = zeta_q_spatial * phase
@@ -734,8 +747,8 @@ def get_zeta_q_and_v_q_mu_nu(
 
 		@partial(
 			jax.jit,
-			in_shardings=(sh.xy_shard if sh is not None else None, sh.y_shard_vec if sh is not None else None),
-			out_shardings=sh.xy_shard if sh is not None else None,
+			in_shardings=(sh.xy_shard, sh.y_shard_vec),
+			out_shardings=sh.xy_shard,
 		)
 		def v_munu_matmul(zflat, vmask):
 			zeta_v = zflat * jnp.sqrt(vmask)
@@ -746,7 +759,7 @@ def get_zeta_q_and_v_q_mu_nu(
 		#V_weighted = V_qfullG_masked[None, :] * zeta_qG_flat
 		#V_qmunu_q = jnp.conj(zeta_qG_masked) @ V_weighted.T
 		# Store result into sharded JAX array at this q-point
-		qx, qy, qz = (int(v) for v in qvec_nonneg)
+		qx, qy, qz = as_index_tuple(qvec_nonneg)
 		V_qmunu = V_qmunu.at[0, 0, 0, qx, qy, qz, :, :].set(v_munu)
 		print(f"qpoint {iq_cpu} done")
 
@@ -981,6 +994,8 @@ def main(argv=None):
 	meta.n_proc = jax.process_count()
 	meta.sys_dim = sys_dim
 	meta.bispinor = bispinor
+	fft_nx, fft_ny, fft_nz = (int(dim) for dim in meta.fft_grid)
+	nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
 	band = meta.band_ranges
 	b0, b1, b2, b3, b4 = meta.band_edges
 	nvplussigrange = band.val_plus_sigma
@@ -1071,17 +1086,19 @@ def main(argv=None):
 				profile_trace_dir = _resolve_path(profile_trace_dir)
 				os.makedirs(profile_trace_dir, exist_ok=True)
 			trace_context = jax_profiler.trace(profile_trace_dir, create_perfetto_link=False) if profile_trace_dir else nullcontext()
+			v_munu_kernel = make_v_munu_kernel(fft_nx, fft_ny, fft_nz, nkx, nky, nkz)
 			with trace_context:
 				q_cache = build_q_coulomb_cache(wfn, sym, meta, do_Dmunu=bispinor, sys_dim=sys_dim, mesh_xy=mesh_xy)
 				q_profile_samples: list[tuple[int, float]] = []
 				cct_samples: list[float] = []
 				zeta_samples: list[float] = []
 				vmunu_samples: list[float] = []
+
 				for q_idx in range(q_cache.num_q):
 					k_l_indices = q_cache.k_l_indices[q_idx]
 					k_r_indices = q_cache.k_r_indices
 					qvec_nonneg = q_cache.q_nonneg[q_idx]
-					iq_cpu = int(q_cache.iq_indices[q_idx])
+					iq_cpu = np.asarray(q_cache.iq_indices[q_idx]).item()
 					qvec = jnp.asarray(q_cache.q_wrapped[q_idx], dtype=jnp.float64)
 					vcoul_comps = q_cache.vcoul_comps[q_idx]
 					sqrt_V_qfullG = q_cache.sqrt_V_qfullG[q_idx]
@@ -1119,16 +1136,14 @@ def main(argv=None):
 							zeta_samples.append(time.perf_counter() - _t_zeta)
 						zeta_q = set_zeta_sharding(zeta_q, mesh_xy)
 						# Compute S_q and write into S_qmunu
-						qx = int(qvec_nonneg[0]); qy = int(qvec_nonneg[1]); qz = int(qvec_nonneg[2])
+						qx, qy, qz = as_index_tuple(qvec_nonneg)
 						# FFT to G and accumulate V_q,mu,nu using explicit-arg kernel
 						_t_v = time.perf_counter()
-						v_munu = compute_v_munu_from_zeta(
+						v_munu = v_munu_kernel(
 							zeta_q,
 							qvec,
 							vcoul_comps,
 							sqrt_V_qfullG,
-							int(meta.fft_grid[0]), int(meta.fft_grid[1]), int(meta.fft_grid[2]),
-							int(meta.nkx), int(meta.nky), int(meta.nkz),
 						)
 						V_qmunu = V_qmunu.at[0, 0, 0, qx, qy, qz, :, :].set(v_munu)
 						if profile_trace_dir or profile_qloop:
@@ -1163,7 +1178,7 @@ def main(argv=None):
 			q0_candidates = np.where(np.all(q_nonneg_np == 0, axis=1))[0]
 			if q0_candidates.size == 0:
 				raise ValueError('q=0 not found in Coulomb cache')
-			q0_idx = int(q0_candidates[0])
+			q0_idx = np.asarray(q0_candidates[0]).item()
 			k_l_q0 = q_cache.k_l_indices[q0_idx]
 			k_r_q0 = q_cache.k_r_indices
 			vcoul_q0 = q_cache.vcoul_comps[q0_idx]
@@ -1184,15 +1199,14 @@ def main(argv=None):
 			zeta_q0 = solve_zeta_cholesky(CCT0, ZCT0)
 			zeta_q0 = set_zeta_sharding(zeta_q0, mesh_xy)
 			v_q0_noG0_munu = V_qmunu[0, 0, 0, 0, 0, 0]
-			fft_nx, fft_ny, fft_nz = int(meta.fft_grid[0]), int(meta.fft_grid[1]), int(meta.fft_grid[2])
 			zeta_q0_spatial = zeta_q0.reshape(zeta_q0.shape[0], fft_nx, fft_ny, fft_nz)
 			zeta_q0G = jnp.fft.fftn(zeta_q0_spatial, axes=(-3, -2, -1))
 			vc_np_q0 = np.asarray(vcoul_q0)
 			g0_mask_np = (vc_np_q0[:, 0] == 0) & (vc_np_q0[:, 1] == 0) & (vc_np_q0[:, 2] == 0)
 			if not np.any(g0_mask_np):
-				g0_idx = int(np.argmin(np.sum(vc_np_q0 * vc_np_q0, axis=1)))
+				g0_idx = np.argmin(np.sum(vc_np_q0 * vc_np_q0, axis=1)).item()
 			else:
-				g0_idx = int(np.where(g0_mask_np)[0][0])
+				g0_idx = np.asarray(np.where(g0_mask_np)[0][0]).item()
 			G0_mu_nu = zeta_q0G[:, vc_np_q0[g0_idx, 0], vc_np_q0[g0_idx, 1], vc_np_q0[g0_idx, 2]]
 
 			# Sharded psi variants outside q-loop
