@@ -1072,9 +1072,8 @@ def main(argv=None):
 			# Reusable buffers for the expensive CCT/ZCT accumulation.
 			CCT_buf = jnp.zeros((meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
 			ZCT_buf = jnp.zeros((meta.n_rmu, psi_l_rtot_Y.shape[-1]), dtype=jnp.complex128)
-			if mesh_xy is not None:
-				CCT_buf = jax.lax.with_sharding_constraint(CCT_buf, sh.replicated_2)
-				ZCT_buf = jax.lax.with_sharding_constraint(ZCT_buf, sh.xy_shard)
+			CCT_buf = jax.lax.with_sharding_constraint(CCT_buf, sh.replicated_2)
+			ZCT_buf = jax.lax.with_sharding_constraint(ZCT_buf, sh.xy_shard)
 
 			# No local kernel definitions; use module-scope jitted helpers
 
