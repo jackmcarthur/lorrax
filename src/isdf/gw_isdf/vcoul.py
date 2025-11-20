@@ -163,7 +163,14 @@ def compute_vcoul_comps_for_q(wfn, sym, meta: Meta, qvec_nonneg):
 	return iq_cpu, iqbar, qvec_wrapped, vcoul_comps.astype(jnp.int32)
 
 
-def compute_V_qfullG_for_q(wfn, qvec_wrapped, comps_qG, vc0_mean, do_Dmunu, sys_dim):
+def compute_V_qfullG_for_q(
+	wfn,
+	qvec_wrapped,
+	comps_qG,
+	vc0_mean,
+	do_Dmunu,
+	sys_dim,
+):
 	"""Compute V_q(G) vector (length nG for this q) using 2D truncation if sys_dim==2.
 
 	The head (q+G=0) is set to zero; head averages are injected later.
@@ -171,24 +178,24 @@ def compute_V_qfullG_for_q(wfn, qvec_wrapped, comps_qG, vc0_mean, do_Dmunu, sys_
 	bvec = np.asarray(wfn.blat * wfn.bvec, dtype=np.float64)
 	if sys_dim == 3:
 		raise NotImplementedError("3D system calculation not yet implemented")
-	# Build G_cart for q (q components are already absorbed in comps mapping)
+	_ = vc0_mean
+	_ = do_Dmunu
+
 	comps_qG = np.asarray(comps_qG, dtype=np.float64)
 	qvec_wrapped = np.asarray(qvec_wrapped, dtype=np.float64)
-	G_cart = (comps_qG + qvec_wrapped) @ bvec  # (nG,3)
+	G_cart = (comps_qG + qvec_wrapped) @ bvec  # (nG, 3)
 	denom = np.sum(G_cart * G_cart, axis=1)
 	denom_zero = denom < 1e-12
-	# 2D truncation factor
+
 	zc = np.pi / bvec[2, 2]
 	kxy = np.linalg.norm(G_cart[:, :2], axis=1)
 	kz = G_cart[:, 2]
-	f2d = (1.0 - np.exp(-zc * kxy) * np.cos(kz * zc))
-	# Regular entries: 4pi/|q+G|^2 * f2d
+	f2d = 1.0 - np.exp(-zc * kxy) * np.cos(kz * zc)
+
 	denom_safe = np.where(denom_zero, 1.0, denom)
 	v_reg = (8.0 * np.pi / denom_safe) * f2d
-	# Physical scaling by cell volume
 	fact = np.float64(1.0 / wfn.cell_volume)
 	v_reg_scaled = v_reg * fact
-	# Zero the head (q+G=0) so that W/V head is injected via explicit averages later
 	v_scaled = np.where(denom_zero, 0.0, v_reg_scaled)
 	return jnp.asarray(v_scaled, dtype=jnp.complex128)
 

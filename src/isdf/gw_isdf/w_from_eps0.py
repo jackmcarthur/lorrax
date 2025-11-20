@@ -10,47 +10,23 @@ This mirrors the mapping and contraction used in the legacy cohsex_isdf path
 but forces the head and wings at q=0 to zero.
 """
 
-from typing import Tuple
 import numpy as np
 
 from ..common.epsreader import EPSReader
 
 
-def _map_indices_v_to_eps(
-    wfn,
-    eps: EPSReader,
-    iqbar: int,
-    sym,
-    v_comps_q: np.ndarray,
-) -> Tuple[np.ndarray, int]:
-    """Return indices that map eps ordering -> our V/zeta ordering, and G0 index in eps order.
-
-    Uses robust tuple-key mapping of (Gx,Gy,Gz) integer components.
-    """
-    # Components used by eps reader for this q (in eps ordering)
-    eps_G_qbar_comps = np.asarray(
-        eps.unfold_eps_comps(iqbar, sym.sym_mats_k[0], np.array([0.0, 0.0, 0.0])),
-        dtype=np.int32,
-    )
-    n_eps = int(eps.nmtx[iqbar])
-    eps_G_qbar_comps = eps_G_qbar_comps[:n_eps]
-
-    # Build dict from our V/zeta ordering triples -> index
-    v_map = {tuple(int(x) for x in v_comps_q[k]): int(k) for k in range(v_comps_q.shape[0])}
-    vcoul_eps_inds = np.empty((n_eps,), dtype=np.int64)
-    for ie, g3 in enumerate(eps_G_qbar_comps):
-        key = (int(g3[0]), int(g3[1]), int(g3[2]))
-        if key not in v_map:
-            raise ValueError(f"G triple {key} from eps ordering not found in V/zeta ordering")
-        vcoul_eps_inds[ie] = v_map[key]
-
-    # Locate G=0 index in eps ordering via gind_eps2rho
-    gind = np.asarray(eps.gind_eps2rho[iqbar, : n_eps], dtype=np.int64)
-    G0_candidates = np.where(gind == 0)[0]
-    if G0_candidates.size == 0:
-        raise ValueError("Could not find G=0 index in eps g-indices.")
-    G0_idx = int(G0_candidates[0])
-    return vcoul_eps_inds, G0_idx
+def _fft_integer_axis(n: int) -> np.ndarray:
+	if n <= 0:
+		raise ValueError(f"FFT dimension must be positive, got {n}")
+	if n % 2 == 0:
+		half = n // 2
+		positives = np.arange(0, half + 1, dtype=np.int32)
+		negatives = np.arange(-half + 1, 0, dtype=np.int32)
+	else:
+		half = n // 2
+		positives = np.arange(0, half + 1, dtype=np.int32)
+		negatives = np.arange(-half, 0, dtype=np.int32)
+	return np.concatenate([positives, negatives], axis=0)
 
 
 def compute_Wmunu_from_eps0_body(
@@ -59,17 +35,13 @@ def compute_Wmunu_from_eps0_body(
     meta,
     zeta_q_r: np.ndarray,
     qvec_wrapped: np.ndarray,
-    vcoul_comps: np.ndarray,
-    V_qfullG: np.ndarray,
     eps0_path: str,
 ) -> np.ndarray:
-    """Compute body-only W_{mu,nu}(q=0) from eps^{-1}_q=0 and V(q=0,G) (head=0).
+    """Compute body-only W_{mu,nu}(q=0) from eps^{-1}_q=0 and dense FFT data.
 
     Args:
         zeta_q_r: (n_mu, n_rtot) real-space zeta for this q (q=0)
         qvec_wrapped: fractional q-vector (length-3) (used for phase; here should be 0)
-        vcoul_comps: (nG,3) integer components matching the V/zeta ordering
-        V_qfullG: (nG,) values of Coulomb for this q with head already zeroed
         eps0_path: path to eps0mat.h5 (assumed eps^{-1} at q=0)
     Returns:
         W_{mu,nu} as a complex128 NumPy array (n_mu, n_mu)
@@ -79,14 +51,42 @@ def compute_Wmunu_from_eps0_body(
     iq_eps = 0  # q=0 only
     epsinv = eps.get_eps_matrix(iq_eps)  # (nG_eps, nG_eps)
 
-    # 2) Build mapping from eps ordering -> our V/zeta ordering
-    vcoul_comps_np = np.asarray(vcoul_comps, dtype=np.int32)
-    map_eps_to_v, G0_idx = _map_indices_v_to_eps(wfn, eps, iq_eps, sym, vcoul_comps_np)
+    # 2) Build mapping from eps ordering -> dense FFT cube indices
+    nx, ny, nz = map(int, meta.fft_grid)
+    gx_vals = _fft_integer_axis(nx)
+    gy_vals = _fft_integer_axis(ny)
+    gz_vals = _fft_integer_axis(nz)
+    gx_lookup = {int(v): idx for idx, v in enumerate(gx_vals)}
+    gy_lookup = {int(v): idx for idx, v in enumerate(gy_vals)}
+    gz_lookup = {int(v): idx for idx, v in enumerate(gz_vals)}
 
-    # 3) Reorder V to eps ordering and build W in the BGW eps-space metric:
+    eps_G_qbar_comps = np.asarray(
+        eps.unfold_eps_comps(0, sym.sym_mats_k[0], np.array([0.0, 0.0, 0.0])),
+        dtype=np.int32,
+    )
+
+    n_eps = int(eps.nmtx[iq_eps])
+    eps_G_qbar_comps = eps_G_qbar_comps[:n_eps]
+
+    map_eps_to_flat = np.empty((n_eps,), dtype=np.int64)
+    for ie, g3 in enumerate(eps_G_qbar_comps):
+        gx_idx = gx_lookup.get(int(g3[0]))
+        gy_idx = gy_lookup.get(int(g3[1]))
+        gz_idx = gz_lookup.get(int(g3[2]))
+        if gx_idx is None or gy_idx is None or gz_idx is None:
+            raise ValueError(f"G triple {tuple(int(x) for x in g3)} not found in FFT grid.")
+        map_eps_to_flat[ie] = gx_idx * ny * nz + gy_idx * nz + gz_idx
+
+    # Locate G=0 index in eps ordering via gind_eps2rho
+    gind = np.asarray(eps.gind_eps2rho[iq_eps, : n_eps], dtype=np.int64)
+    G0_candidates = np.where(gind == 0)[0]
+    if G0_candidates.size == 0:
+        raise ValueError("Could not find G=0 index in eps g-indices.")
+    G0_idx = int(G0_candidates[0])
+
+    # 3) Build W in the BGW eps-space metric:
     #    W = diag(V) · eps^{-1}   (row scaling by v(G))
     #    IMPORTANT: use v from eps file order (unscaled by 1/Ω); apply 1/Ω after μν contraction.
-    n_eps = int(eps.nmtx[iq_eps])
     v_eps = np.asarray(eps.vcoul[iq_eps, :n_eps], dtype=np.complex128)
     # Rows scaled by v(G): left-multiply by diag(V)
     W_eps = (v_eps[:, None]) * epsinv
@@ -95,16 +95,9 @@ def compute_Wmunu_from_eps0_body(
     W_eps[G0_idx, :] = 0.0
     W_eps[:, G0_idx] = 0.0
 
-    # 5) Reorder W back to V/zeta ordering
-    # map eps->v; to invert, build an array inv_map such that inv_map[v_idx]=eps_idx
-    inv_map = np.empty_like(map_eps_to_v)
-    inv_map[map_eps_to_v] = np.arange(map_eps_to_v.size, dtype=map_eps_to_v.dtype)
-    W_v = W_eps[inv_map][:, inv_map]
-
-    # 6) Build zeta(G) in V/zeta ordering by FFT and extraction
+    # 5) Build zeta(G) on the dense FFT grid
     #    (reproduce the phase convention used in compute_v_munu_from_zeta)
     n_mu, n_rtot = zeta_q_r.shape
-    nx, ny, nz = map(int, meta.fft_grid)
     # zeta_r: (n_mu, nx, ny, nz)
     zeta_r = zeta_q_r.reshape(n_mu, nx, ny, nz)
     # Phase for wrapped q (typically zero here)
@@ -115,12 +108,11 @@ def compute_Wmunu_from_eps0_body(
     nkx, nky, nkz = float(meta.nkx), float(meta.nky), float(meta.nkz)
     phase = np.exp(-2j * np.pi * (qx / nkx * fx + qy / nky * fy + qz / nkz * fz))
     zeta_G = np.fft.fftn(zeta_r * phase, axes=(-3, -2, -1))  # (n_mu,nx,ny,nz)
-    # Extract G in V/zeta ordering
-    idx = tuple([slice(None), vcoul_comps_np[:, 0], vcoul_comps_np[:, 1], vcoul_comps_np[:, 2]])
-    Z = zeta_G[idx]  # (n_mu, nG)
+    Z_flat = zeta_G.reshape(n_mu, nx * ny * nz)
+    Z = Z_flat[:, map_eps_to_flat]  # (n_mu, nG_eps)
 
-    # 7) Contract: W_{mu,nu} = Z^* · W · Z^T, then divide by Ω to match μν units
-    W_munu = Z.conj() @ W_v @ Z.T
+    # 6) Contract: W_{mu,nu} = Z^* · W · Z^T, then divide by Ω to match μν units
+    W_munu = Z.conj() @ W_eps @ Z.T
     W_munu = W_munu / float(wfn.cell_volume)
     return W_munu.astype(np.complex128)
 
