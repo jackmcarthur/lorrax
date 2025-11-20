@@ -433,17 +433,17 @@ def build_local_ionic_potential_on_G_total(
     bdot: np.ndarray,
     cell_volume: float,
 ) -> np.ndarray:
-    """Simplified builder: return only total V_loc(r) on doubled FFT grid (Ry).
+    """Simplified builder: return total V_loc(r) on the provided FFT grid (Ry).
 
     - Builds SR in G with QE's SR integrand (adds Z e2 erf(r)/r) and alpha‑Z at G=0.
     - Adds LR Coulomb tail from ρ_ion(G) with Gaussian damping; G=0 set to 0.
     - Maps with phases exp(-2π i τ·G) on the FFT grid and IFFT (orthonormal) to real.
     """
-    nx2, ny2, nz2 = (int(fft_grid[0]), int(fft_grid[1]), int(fft_grid[2]))
+    nx, ny, nz = (int(fft_grid[0]), int(fft_grid[1]), int(fft_grid[2]))
 
-    fx = np.fft.fftfreq(nx2) * nx2
-    fy = np.fft.fftfreq(ny2) * ny2
-    fz = np.fft.fftfreq(nz2) * nz2
+    fx = np.fft.fftfreq(nx) * nx
+    fy = np.fft.fftfreq(ny) * ny
+    fz = np.fft.fftfreq(nz) * nz
     ix = fx[:, None, None]
     iy = fy[None, :, None]
     iz = fz[None, None, :]
@@ -454,11 +454,11 @@ def build_local_ionic_potential_on_G_total(
         + 2.0 * M[0, 1] * ix * iy + 2.0 * M[0, 2] * ix * iz + 2.0 * M[1, 2] * iy * iz
     )
     q_flat = np.sqrt(np.maximum(0.0, G2)).ravel()
-    sqrtN = np.sqrt(float(nx2 * ny2 * nz2))
+    sqrtN = np.sqrt(float(nx * ny * nz))
     inv_omega = 1.0 / float(cell_volume)
 
     # ρ_ion(G) on grid
-    rho_ion_G = np.zeros((nx2, ny2, nz2), dtype=np.complex128)
+    rho_ion_G = np.zeros((nx, ny, nz), dtype=np.complex128)
     for entry in assignments:
         pseudo = entry.get("pseudo")
         tau = np.asarray(entry.get("position"), dtype=float).reshape(3)
@@ -466,7 +466,7 @@ def build_local_ionic_potential_on_G_total(
         rho_ion_G -= Zval * np.exp(-2j * np.pi * (tau[0] * ix + tau[1] * iy + tau[2] * iz))
 
     # SR from UPF
-    Vloc_G_sr = np.zeros((nx2, ny2, nz2), dtype=np.complex128)
+    Vloc_G_sr = np.zeros((nx, ny, nz), dtype=np.complex128)
     for pseudo, positions in species_groups:
         if pseudo is None:
             continue
@@ -490,7 +490,7 @@ def build_local_ionic_potential_on_G_total(
         V_q_sr = _fourier_transform_vloc_qe(r, rab, v_r, q_grid, Zval, cell_volume)
         spl = InterpolatedUnivariateSpline(q_grid, V_q_sr, k=3, ext=1)
         V_sr_on_flat = (sqrtN * (4.0 * np.pi) * inv_omega) * spl(q_flat)
-        V_sr_on_grid = V_sr_on_flat.reshape((nx2, ny2, nz2))
+        V_sr_on_grid = V_sr_on_flat.reshape((nx, ny, nz))
 
         # Alpha‑Z at G=0
         try:
@@ -512,7 +512,7 @@ def build_local_ionic_potential_on_G_total(
             pass
 
         # Species phases
-        S = np.zeros((nx2, ny2, nz2), dtype=np.complex128)
+        S = np.zeros((nx, ny, nz), dtype=np.complex128)
         for tau in positions:
             tau = np.asarray(tau, dtype=float).reshape(3)
             S += np.exp(-2j * np.pi * (tau[0] * ix + tau[1] * iy + tau[2] * iz))

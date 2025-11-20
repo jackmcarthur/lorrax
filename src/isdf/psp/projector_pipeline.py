@@ -16,6 +16,25 @@ from .build_projectors_qe import (
 from scipy.special import spherical_jn
 
 
+@jax.jit
+def _accumulate_species_channel(
+    C_bsg: jax.Array,
+    radial_j: jax.Array,
+    Y_j: jax.Array,
+    phase_j: jax.Array,
+    E_l: jax.Array,
+) -> jax.Array:
+    """Contract one species/ℓ contribution over all atoms at once."""
+    Z_bmg = radial_j[:, None, :] * Y_j[None, :, :]
+    Z_atoms = phase_j[:, None, None, :] * Z_bmg[None, :, :, :]  # (natoms, nbeta, msize, nG)
+    natoms = Z_atoms.shape[0]
+    R = Z_bmg.shape[0] * Z_bmg.shape[1]
+    Z_atoms = Z_atoms.reshape(natoms, R, C_bsg.shape[-1])
+    P_atoms = jnp.einsum('arg,bsg->arsb', jnp.conj(Z_atoms), C_bsg, optimize=True)
+    Delta_atoms = jnp.einsum('arsi, strq, aqtj -> aij', jnp.conj(P_atoms), E_l, P_atoms, optimize=True)
+    return jnp.sum(Delta_atoms, axis=0)
+
+
 @dataclass
 class Species:
     pseudo: object
@@ -502,8 +521,10 @@ def build_vnl_plan(pseudos: Dict[str, object], assignments, cell_volume: float, 
             l = int(getattr(beta, 'lll', getattr(beta, 'angular_momentum', 0)))
             per_l.setdefault(l, []).append(idx)
         for l, beta_ids in per_l.items():
+            Eb = E_blocks.get(int(l))
             l_channels[int(l)] = {
-                'E': E_blocks.get(int(l)),
+                'E': Eb,
+                'E_j': (jnp.asarray(Eb, dtype=jnp.complex128) if Eb is not None else None),
                 'beta_ids': list(beta_ids),
             }
         plan[key] = {
@@ -526,6 +547,7 @@ def compute_V_NL_k_minimal(
     K_cart: np.ndarray,
     plan: Dict[int, Dict[str, object]],
     cell_volume: float,
+    g_mask: jax.Array | None = None,
 ) -> jax.Array:
     """Vectorized minimal V_NL(k) using prebuilt plan.
 
@@ -549,10 +571,16 @@ def compute_V_NL_k_minimal(
 
     K_cart_np = np.asarray(K_cart, dtype=float)
     K_crys_np = np.asarray(K_crys, dtype=float)
+    K_cart_j = jnp.asarray(K_cart_np, dtype=jnp.float64)
+    K_crys_j = jnp.asarray(K_crys_np, dtype=jnp.float64)
     K_norm = np.sqrt(np.sum(K_cart_np ** 2, axis=1)) if K_cart_np.size else np.zeros((0,), dtype=float)
-    K_norm_j = jnp.asarray(K_norm, dtype=jnp.float64)
 
     V_NL_k = jnp.zeros((nb, nb), dtype=jnp.complex128)
+    if nG == 0:
+        return V_NL_k
+
+    # Cache Y_ℓm(K) once per ℓ for this k-point to reuse across species
+    Y_cache: Dict[int, jax.Array] = {}
 
     for key, sp in plan.items():
         tau = np.asarray(sp['atoms']['tau'], dtype=float)
@@ -561,6 +589,13 @@ def compute_V_NL_k_minimal(
         indices = np.asarray(sp['atoms']['indices'], dtype=int)
         pref = float(sp['prefactor'])
         splines = sp['splines']
+
+        # Precompute phases once per species (independent of ℓ)
+        if tau.ndim == 1:
+            tau = tau.reshape(1, 3)
+        tau_j_all = jnp.asarray(tau, dtype=jnp.float64)
+        phase_all = jnp.exp(-2j * jnp.pi * (K_crys_j @ tau_j_all.T))  # (nG, natoms)
+        phase_all = jnp.transpose(phase_all)  # (natoms, nG)
 
         for l, info in sp['l_channels'].items():
             E_l_np = info['E']
@@ -572,34 +607,36 @@ def compute_V_NL_k_minimal(
             msize = 2 * int(l) + 1
 
             # F_ℓ,β(|K|) for all beta in this ℓ
-            F_bG = np.stack([splines[(int(l), int(bid))](K_norm) for bid in beta_ids], axis=0) if nG else np.zeros((len(beta_ids), 0))
+            if nG == 0:
+                continue
+            F_bG = np.stack([splines[(int(l), int(bid))](K_norm) for bid in beta_ids], axis=0)
             radial = pref * (1j) ** int(l) * F_bG  # (nbeta, nG)
             radial_j = jnp.asarray(radial, dtype=jnp.complex128)
 
             # Y'_{ℓm}(K) and phases per atom
-            Y_real = qe_real_sph_harmonics(int(l), K_cart_np)  # (msize, nG) np
-            Y_j = jnp.asarray(Y_real, dtype=jnp.complex128)
+            Y_j = Y_cache.get(int(l))
+            if Y_j is None:
+                Y_real = qe_real_sph_harmonics(int(l), K_cart_np)  # (msize, nG) np
+                Y_j = jnp.asarray(Y_real, dtype=jnp.complex128)
+                Y_cache[int(l)] = Y_j
 
-            # Structure phases per atom: exp(-2πi K_crys·τ)
-            if tau.ndim == 1:
-                tau = tau.reshape(1, 3)
-            phase = np.exp(-2j * np.pi * (K_crys_np @ tau.T))  # (nG, natoms)
-            phase_j = jnp.asarray(phase.T, dtype=jnp.complex128)  # (natoms, nG)
+            # Reuse per-species phases across ℓ
+            phase_j = phase_all
+            if phase_j.shape[0] == 0:
+                continue
 
-            E_l = jnp.asarray(E_l_np, dtype=jnp.complex128)  # (2,2,R,R)
-            R = len(beta_ids) * msize
+            E_l = info.get('E_j')
+            if E_l is None:
+                E_l = jnp.asarray(E_l_np, dtype=jnp.complex128)  # (2,2,R,R)
 
-            # For each atom, build Z_block and contract in a fully vectorized way
-            for a in range(phase_j.shape[0]):
-                Z_bmg = radial_j[:, None, :] * Y_j[None, :, :] * phase_j[a, None, None, :]
-                Z_block = Z_bmg.reshape((R, nG))  # (R, nG)
+            if g_mask is not None:
+                g_mask_j = jnp.asarray(g_mask, dtype=jnp.complex128)
+                radial_eff = radial_j * g_mask_j[None, :]
+            else:
+                radial_eff = radial_j
 
-                # ############ VNL MATRIX ELEMENT CONSTRUCTION ############
-                # P(r,s,j) = Σ_g Z*(r,g) C(j,s,g)
-                P = jnp.einsum('rg,bsg->rsb', jnp.conj(Z_block), C_bsg, optimize=True)
-                # Δ_ℓ(i,j) = Σ_{s,t,r,q} conj(P(r,s,i)) E_l(s,t,r,q) P(q,t,j)
-                Delta_l = jnp.einsum('rsi, strq, qtj -> ij', jnp.conj(P), E_l, P, optimize=True)
-                V_NL_k = V_NL_k + Delta_l
+            Delta_l = _accumulate_species_channel(C_bsg, radial_eff, Y_j, phase_j, E_l)
+            V_NL_k = V_NL_k + Delta_l
 
     return V_NL_k
 

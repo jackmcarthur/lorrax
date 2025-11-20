@@ -18,16 +18,20 @@ import re
 import glob
 from pathlib import Path
 
-# Set JAX configs BEFORE importing JAX
+# Set JAX configs BEFORE importing JAX (prefer GPU if available)
 os.environ.setdefault("JAX_ENABLE_X64", "1")
-os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
+# Respect user/project overrides; otherwise prefer GPU-capable platforms
+if "JAX_PLATFORMS" not in os.environ and "JAX_PLATFORM_NAME" not in os.environ:
+    os.environ["JAX_PLATFORMS"] = "cuda,cpu"
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
+os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 
 import numpy as np
 import jax
-# Force CPU backend to avoid GPU plugin errors in test envs
-jax.config.update('jax_platform_name', 'cpu')
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from functools import partial
 # Support both `python -m isdf.psp.get_DFT_mtxels` and direct script execution
 try:
     from .normalize import normalize_dataclass
@@ -304,44 +308,46 @@ def compute_valence_density(wfn_k, sym, wfn):
     try:
         nx_pad, ny_pad, nz_pad = int(wfn.grid_rho[0]), int(wfn.grid_rho[1]), int(wfn.grid_rho[2])
     except Exception:
-        nx_pad, ny_pad, nz_pad = 2*nx, 2*ny, 2*nz
-    
-    # Allocate arrays outside loops for performance
+        nx_pad, ny_pad, nz_pad = nx, ny, nz
+
+    same_grid = (nx_pad == nx) and (ny_pad == ny) and (nz_pad == nz)
+
     rho_val_local = jnp.zeros((nx_pad, ny_pad, nz_pad), dtype=jnp.float64)
     volume = jnp.asarray(wfn.cell_volume, dtype=jnp.float64)
-    scale = jnp.sqrt((nx_pad * ny_pad * nz_pad) / volume)
-    
-    # Loop over k-points and bands
-    for ik in range(nk_local):
-        # Get G-vectors for this k-point (crystal coordinates)
-        gvecs_k = np.asarray(sym.get_gvecs_kfull(wfn, ik))
-        nG = gvecs_k.shape[0]
-        
-        # Integer G-indices (allow negative values to wrap from the end)
-        Gx = jnp.asarray(gvecs_k[:, 0], dtype=jnp.int32)
-        Gy = jnp.asarray(gvecs_k[:, 1], dtype=jnp.int32)
-        Gz = jnp.asarray(gvecs_k[:, 2], dtype=jnp.int32)
+    ngrid_pad = nx_pad * ny_pad * nz_pad
+    scale_pad = jnp.sqrt(ngrid_pad / volume)
 
-        # Take the lowest nelec bands
+    for ik in range(nk_local):
         nocc = int(wfn.nelec)
         nocc = min(nocc, nb_all)
 
-        # For each spinor component, gather all occupied bands and scatter to padded grid (handles negative indices)
-        for ispin in range(nspinor):
-            # Gather occupied coefficients at (Gx,Gy,Gz) for each band via vmap to respect negative indices
-            C_src = wfn_k[ik, :nocc, ispin, :, :, :]  # (nocc, nx, ny, nz)
-            def gather_one(arr3d):
-                return arr3d[Gx, Gy, Gz]  # (nG,)
-            C_occ = jax.vmap(gather_one, in_axes=0, out_axes=0)(C_src)  # (nocc, nG)
+        if same_grid:
+            psi_occ = wfn_k[ik, :nocc]  # (nocc, nspinor, nx, ny, nz)
+            psi_r = jnp.fft.ifftn(psi_occ, axes=(-3, -2, -1), norm='ortho') * scale_pad
+            rho_val_local += jnp.sum(
+                jnp.real(jnp.conj(psi_r) * psi_r), axis=(0, 1)
+            )
+        else:
+            gvecs_k = np.asarray(sym.get_gvecs_kfull(wfn, ik))
+            Gx = jnp.asarray(gvecs_k[:, 0], dtype=jnp.int32)
+            Gy = jnp.asarray(gvecs_k[:, 1], dtype=jnp.int32)
+            Gz = jnp.asarray(gvecs_k[:, 2], dtype=jnp.int32)
 
-            # Scatter each band's G-coeffs into the 2× padded FFT box
-            def scatter_one(row):
-                buf = jnp.zeros((nx_pad, ny_pad, nz_pad), dtype=jnp.complex128)
-                return buf.at[Gx, Gy, Gz].set(row)
-            psi_G_padded_batch = jax.vmap(scatter_one, in_axes=0, out_axes=0)(C_occ)  # (nocc, nx2, ny2, nz2)
-            psi_r_batch = jnp.fft.ifftn(psi_G_padded_batch, axes=(-3, -2, -1), norm='ortho')  # (nocc, ...)
-            psi_r_batch = psi_r_batch * scale
-            rho_val_local += jnp.sum(jnp.real(psi_r_batch.conj() * psi_r_batch), axis=0)
+            for ispin in range(nspinor):
+                C_src = wfn_k[ik, :nocc, ispin, :, :, :]
+
+                def gather_one(arr3d):
+                    return arr3d[Gx, Gy, Gz]
+
+                C_occ = jax.vmap(gather_one, in_axes=0, out_axes=0)(C_src)
+
+                def scatter_one(row):
+                    buf = jnp.zeros((nx_pad, ny_pad, nz_pad), dtype=jnp.complex128)
+                    return buf.at[Gx, Gy, Gz].set(row)
+
+                psi_G_padded_batch = jax.vmap(scatter_one, in_axes=0, out_axes=0)(C_occ)
+                psi_r_batch = jnp.fft.ifftn(psi_G_padded_batch, axes=(-3, -2, -1), norm='ortho') * scale_pad
+                rho_val_local += jnp.sum(jnp.real(psi_r_batch.conj() * psi_r_batch), axis=0)
     
     # Sum contributions across all processors
     # For now, since we're not in a distributed context, just use the local result
@@ -446,7 +452,7 @@ def generate_gvectors_k(kpoint_idx, sym, wfn, meta):
     return Gk_crys, kpoint_crys
 
 
-def compute_kinetic_k(wfn_k, Gk_crys, kpoint_crys, bdot):
+def compute_kinetic_k(wfn_k, Gk_crys, kpoint_crys, bdot, g_mask: jax.Array | None = None):
     """
     Compute kinetic energy matrix elements <mk|T|nk> for a single k-point.
     
@@ -461,28 +467,35 @@ def compute_kinetic_k(wfn_k, Gk_crys, kpoint_crys, bdot):
     Returns:
         Kinetic energy matrix elements, shape (nb, nb)
     """
-    # Use reciprocal metric bdot: |k+G|^2 = (k+G)^T bdot (k+G)
+    G_int = jnp.asarray(Gk_crys, dtype=jnp.int32)
+    G_float = jnp.asarray(Gk_crys, dtype=jnp.float64)
     k_crys = jnp.asarray(kpoint_crys, dtype=jnp.float64)
-    K_crys = jnp.asarray(Gk_crys, dtype=jnp.float64) + k_crys[None, :]
     bdot = jnp.asarray(bdot, dtype=jnp.float64)
-    T_G = jnp.einsum('gi,ij,gj->g', K_crys, bdot, K_crys, optimize=True)
-    
-    Gx = Gk_crys[:, 0]
-    Gy = Gk_crys[:, 1]  
-    Gz = Gk_crys[:, 2]
-    wfn_coeffs = wfn_k[:, :, Gx, Gy, Gz]
-    
-    # Compute kinetic energy matrix elements using einsum
-    # <m|T|n> = sum_G sum_spinor conj(psi_m(G,s)) * T_G * psi_n(G,s)
-    T_psi = T_G[None, None, :] * wfn_coeffs  # shape (nb, nspinor, nG)
-    
-    # Compute matrix elements: <m|T|n> = sum_G sum_s conj(psi_m(G,s)) * T_G * psi_n(G,s)
-    # Use einsum: 'msg,nsg->mn' where m,n=bands, s=spinor, g=G-vectors
-    T_k = jnp.einsum('msg,nsg->mn', jnp.conj(wfn_coeffs), T_psi, optimize=True)
-    
-    return T_k
+    g_mask_j = None if g_mask is None else jnp.asarray(g_mask, dtype=jnp.float64)
+    return _compute_kinetic_k_jit(wfn_k, G_int, G_float, k_crys, bdot, g_mask_j)
 
-def compute_local_V_k(wfn_k, Gk_crys, V_r, cell_volume):
+
+@jax.jit
+def _compute_kinetic_k_jit(
+    wfn_k: jax.Array,
+    G_int: jax.Array,
+    G_float: jax.Array,
+    k_crys: jax.Array,
+    bdot: jax.Array,
+    g_mask: jax.Array | None,
+) -> jax.Array:
+    K_crys = G_float + k_crys[None, :]
+    T_G = jnp.einsum('gi,ij,gj->g', K_crys, bdot, K_crys, optimize=True)
+    if g_mask is not None:
+        T_G = T_G * g_mask
+    Gx = G_int[:, 0]
+    Gy = G_int[:, 1]
+    Gz = G_int[:, 2]
+    psi_G = wfn_k[:, :, Gx, Gy, Gz]
+    T_psi = T_G[None, None, :] * psi_G
+    return jnp.einsum('msg,nsg->mn', jnp.conj(psi_G), T_psi, optimize=True)
+
+def compute_local_V_k(wfn_k, Gk_crys, V_r, cell_volume, g_mask: jax.Array | None = None):
     """
     Compute elements of a local potential (V_ion or V_H) <mk|V|nk> for a single k-point.
     
@@ -494,59 +507,46 @@ def compute_local_V_k(wfn_k, Gk_crys, V_r, cell_volume):
     Returns:
         Hartree potential matrix elements, shape (nb, nb)
     """
-    nb, nspinor = wfn_k.shape[:2]
-    
-    # Original FFT grid for wavefunctions and 2x padded grid for potential
-    _, _, nx, ny, nz = wfn_k.shape
-    nx2, ny2, nz2 = V_r.shape
-
-    # Indices of G-vectors for this k-point (already in positive FFT indexing)
-    Gx = Gk_crys[:, 0].astype(jnp.int32)
-    Gy = Gk_crys[:, 1].astype(jnp.int32)
-    Gz = Gk_crys[:, 2].astype(jnp.int32)
-
-    # Allocate result matrix
-    V_H_k = jnp.zeros((nb, nb), dtype=jnp.complex128)
-
-    ngrid = nx2 * ny2 * nz2
+    V_r = jnp.asarray(V_r, dtype=jnp.complex128)
+    Gx = jnp.asarray(Gk_crys[:, 0], dtype=jnp.int32)
+    Gy = jnp.asarray(Gk_crys[:, 1], dtype=jnp.int32)
+    Gz = jnp.asarray(Gk_crys[:, 2], dtype=jnp.int32)
     volume = jnp.asarray(cell_volume, dtype=jnp.float64)
+    g_mask_j = None if g_mask is None else jnp.asarray(g_mask, dtype=jnp.float64)
+    return _compute_local_V_k_jit(wfn_k, Gx, Gy, Gz, V_r, volume, g_mask_j)
+
+
+@jax.jit
+def _compute_local_V_k_jit(
+    wfn_k: jax.Array,
+    Gx: jax.Array,
+    Gy: jax.Array,
+    Gz: jax.Array,
+    V_r: jax.Array,
+    volume: jax.Array,
+    g_mask: jax.Array | None,
+) -> jax.Array:
+    psi_G = jnp.asarray(wfn_k, dtype=jnp.complex128)
+    nb = psi_G.shape[0]
+    nspinor = psi_G.shape[1]
+    nx, ny, nz = psi_G.shape[-3:]
+
+    ngrid = nx * ny * nz
     scale = jnp.sqrt(ngrid / volume)
     deltaV = volume / ngrid
     fft_norm = jnp.sqrt(ngrid)
 
-    # Vectorized scatter over bands, following compute_valence_density
-    def scatter_one(row):
-        buf = jnp.zeros((nx2, ny2, nz2), dtype=jnp.complex128)
-        return buf.at[Gx, Gy, Gz].set(row)
+    psi_r = jnp.fft.ifftn(psi_G, axes=(-3, -2, -1), norm='ortho') * scale
+    phi_r = psi_r * V_r
+    phi_G = jnp.fft.fftn(phi_r, axes=(-3, -2, -1), norm='ortho') * (deltaV * fft_norm)
 
-    # Number of G points used for this k
-    nG = Gx.shape[0]
-
-    # Build vpsi per spinor and do a single matmul psibar @ vpsi per spinor
-    for s in range(nspinor):
-        # conj(psi_mks(G)) for all m as rows: shape (nb, nG)
-        psi_bar = jnp.conj(wfn_k[:, s, Gx, Gy, Gz])
-
-        # Gather all bands' G-coefficients: (nb, nG)
-        C_nb_g = wfn_k[:, s, Gx, Gy, Gz]
-
-        # Scatter each band's G coefficients into the 2x FFT box: (nb, nx2, ny2, nz2)
-        psi_G_padded_batch = jax.vmap(scatter_one, in_axes=0, out_axes=0)(C_nb_g)
-
-        # To real space, apply local potential, back to G-space (all bands at once)
-        psi_r_batch = jnp.fft.ifftn(psi_G_padded_batch, axes=(-3, -2, -1), norm='ortho') * scale
-        phi_r_batch = psi_r_batch * V_r
-        phi_G_padded_batch = jnp.fft.fftn(phi_r_batch, axes=(-3, -2, -1), norm='ortho') * (deltaV * fft_norm)
-
-        # Gather onto original G-set for all bands: (nb, nG)
-        vpsi_nb_g = phi_G_padded_batch[:, Gx, Gy, Gz]
-        # Transpose to (nG, nb) for matmul
-        vpsi = jnp.transpose(vpsi_nb_g, (1, 0))
-
-        # Matrix multiply once for this spinor: (nb, nG) @ (nG, nb) -> (nb, nb)
-        V_H_k = V_H_k + psi_bar @ vpsi
-
-    return V_H_k * jnp.sqrt(1.0/volume)
+    psi_coeffs = psi_G[:, :, Gx, Gy, Gz]
+    vpsi = phi_G[:, :, Gx, Gy, Gz]
+    if g_mask is not None:
+        psi_coeffs = psi_coeffs * g_mask[None, None, :]
+        vpsi = vpsi * g_mask[None, None, :]
+    V_loc = jnp.einsum('bsg,nsg->bn', jnp.conj(psi_coeffs), vpsi, optimize=True)
+    return V_loc * jnp.sqrt(1.0 / volume)
 
     # Legacy implementation removed in favor of minimal vectorized pipeline
     raise NotImplementedError("compute_V_NL_k legacy path removed; use compute_V_NL_k_minimal via ISDF_USE_MINIMAL_VNL=1 or call projector_pipeline directly.")
@@ -635,9 +635,36 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valr
 
     # Determine q_max across all k and build per-pseudo cache once
     q_max = 0.0
+    nG_list: list[int] = []
     for Knorm in K_norm_all:
         if Knorm.size:
             q_max = max(q_max, float(np.max(Knorm)))
+        nG_list.append(int(Knorm.shape[0]))
+    nG_max = max(nG_list) if nG_list else 0
+    Gk_crys_pad: list[jnp.ndarray] = []
+    K_crys_pad: list[jnp.ndarray] = []
+    K_cart_pad: list[jnp.ndarray] = []
+    G_mask: list[jnp.ndarray] = []
+    for i in range(sym.nk_tot):
+        Gcur = jnp.asarray(Gk_crys_all[i], dtype=jnp.int32)
+        Kc = jnp.asarray(K_crys_all[i], dtype=jnp.float64)
+        Kt = jnp.asarray(K_cart_all[i], dtype=jnp.float64)
+        nG = int(Gcur.shape[0])
+        if nG < nG_max:
+            pad = nG_max - nG
+            Gpad = jnp.pad(Gcur, ((0, pad), (0, 0)))
+            Kcpad = jnp.pad(Kc, ((0, pad), (0, 0)))
+            Ktpad = jnp.pad(Kt, ((0, pad), (0, 0)))
+            mask = jnp.concatenate(
+                [jnp.ones((nG,), dtype=jnp.float64), jnp.zeros((pad,), dtype=jnp.float64)]
+            )
+        else:
+            Gpad, Kcpad, Ktpad = Gcur, Kc, Kt
+            mask = jnp.ones((nG_max,), dtype=jnp.float64)
+        Gk_crys_pad.append(Gpad)
+        K_crys_pad.append(Kcpad)
+        K_cart_pad.append(Ktpad)
+        G_mask.append(mask)
     # Build minimal VNL plan once for all k
     plan = build_vnl_plan(pseudos, assignments, float(wfn.cell_volume), float(q_max))
     
@@ -648,9 +675,10 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valr
     rho_valence = compute_valence_density(wfn_k_sharded, sym, wfn)
     print(f"    Valence density grid: {rho_valence.shape}")
     # Precompute Hartree potential V_H(r) on the rho grid using reciprocal metric bdot
+    bdot_j = jnp.asarray(wfn.bdot, dtype=jnp.float64)
     V_H_r = compute_hartree_potential_real(
         rho_valence,
-        jnp.asarray(wfn.bdot, dtype=jnp.float64),
+        bdot_j,
     )
     deltaV = float(wfn.cell_volume) / float(np.prod(V_H_r.shape))
     print(f"    Hartree potential grid: {V_H_r.shape}")
@@ -684,26 +712,24 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valr
     for i in range(1):
         wfn_k = wfn_k_sharded[i]  # (nb, nspinor, nx, ny, nz)
         kpoint = kpoints[i]
-        Gk_crys = Gk_crys_all[i]
-        # Build K vectors in both crystal and Cartesian coordinates
-        k_crys = jnp.asarray(kpoint, dtype=jnp.float64)
-        K_crys = jnp.asarray(Gk_crys, dtype=jnp.float64) + k_crys[None, :]
-        B = jnp.asarray(wfn.bvec, dtype=jnp.float64).T * float(wfn.blat)
-        K_cart = jnp.asarray(K_crys) @ B
+        Gk_crys = Gk_crys_pad[i]
+        K_crys = K_crys_pad[i]
+        K_cart = K_cart_pad[i]
 
         T_k = compute_kinetic_k(
-            wfn_k, Gk_crys, kpoint, jnp.asarray(wfn.bdot, dtype=jnp.float64)
+            wfn_k, Gk_crys, kpoint, bdot_j
         )
-        V_ion_k = compute_local_V_k(wfn_k, Gk_crys, V_loc_r, wfn.cell_volume)
-        V_H_k = compute_local_V_k(wfn_k, Gk_crys, V_H_r, wfn.cell_volume)
+        V_ion_k = compute_local_V_k(wfn_k, Gk_crys, V_loc_r, wfn.cell_volume, G_mask[i])
+        V_H_k = compute_local_V_k(wfn_k, Gk_crys, V_H_r, wfn.cell_volume, G_mask[i])
         # Minimal, vectorized V_NL(k)
         V_NL_k = compute_V_NL_k_minimal(
             wfn_k,
             Gk_crys,
-            K_crys_all[i],
-            K_cart_all[i],
+            K_crys,
+            K_cart,
             plan,
             float(wfn.cell_volume),
+            G_mask[i],
         )
 
         # Temporary debug prints: first 4x4 blocks (2 decimals, scientific)
@@ -751,61 +777,105 @@ def get_kin_ion(
     wfn_k_sharded = jax.lax.with_sharding_constraint(global_psi_G, k_xy_shard)
 
     # Structure setup
-    atom_positions = jnp.asarray(wfn.atom_crys, dtype=jnp.float64)
-    atom_types = jnp.asarray(wfn.atom_types, dtype=jnp.int32)
-    if assignments is None:
-        assignments = build_atom_pp_assignments(atom_positions, atom_types, pseudos)
-    if species_payload is None:
-        tmp: dict[int, dict[str, object]] = {}
-        for ap in assignments:
-            pseudo = ap.pseudo
-            if pseudo is None:
-                continue
-            key = id(pseudo)
-            entry = tmp.setdefault(key, {"pseudo": pseudo, "positions": []})
-            entry["positions"].append(np.asarray(ap.position, dtype=float))
-        species_payload = [(e["pseudo"], np.asarray(e["positions"], dtype=float) if e["positions"] else np.zeros((0,3), dtype=float)) for e in tmp.values()]
+    with timing.section("psp.get_DFT_mtxels.get_kin_ion.structure_setup") as timer_struct:
+        atom_positions = jnp.asarray(wfn.atom_crys, dtype=jnp.float64)
+        atom_types = jnp.asarray(wfn.atom_types, dtype=jnp.int32)
+        if assignments is None:
+            assignments = build_atom_pp_assignments(atom_positions, atom_types, pseudos)
+        if species_payload is None:
+            tmp: dict[int, dict[str, object]] = {}
+            for ap in assignments:
+                pseudo = ap.pseudo
+                if pseudo is None:
+                    continue
+                key = id(pseudo)
+                entry = tmp.setdefault(key, {"pseudo": pseudo, "positions": []})
+                entry["positions"].append(np.asarray(ap.position, dtype=float))
+            species_payload = [
+                (
+                    e["pseudo"],
+                    np.asarray(e["positions"], dtype=float) if e["positions"] else np.zeros((0, 3), dtype=float),
+                )
+                for e in tmp.values()
+            ]
+        timer_struct.watch(assignments, species_payload)
 
     # Precompute K scaffolding identical to the main flow (no refactor)
-    Gk_crys_all: list[jnp.ndarray] = []
-    K_crys_all: list[jnp.ndarray] = []
-    K_cart_all: list[jnp.ndarray] = []
-    K_norm_all: list[np.ndarray] = []
-    bvec_np = np.asarray(wfn.bvec, dtype=float).T
-    B = float(wfn.blat) * bvec_np.T
-    for i in range(sym.nk_tot):
-        Gk_crys_i, _ = generate_gvectors_k(i, sym, wfn, meta)
-        Gk = np.asarray(Gk_crys_i, dtype=float)
-        kvec = np.asarray(sym.unfolded_kpts[i], dtype=float)
-        Kc = Gk + kvec[None, :]
-        Kcart = Kc @ B
-        Knorm = np.sqrt(np.sum(Kcart**2, axis=1))
-        Gk_crys_all.append(jnp.asarray(Gk_crys_i, dtype=jnp.int32))
-        K_crys_all.append(jnp.asarray(Kc, dtype=jnp.float64))
-        K_cart_all.append(jnp.asarray(Kcart, dtype=jnp.float64))
-        K_norm_all.append(Knorm)
+    with timing.section("psp.get_DFT_mtxels.get_kin_ion.k_scaffolding") as timer_kprep:
+        Gk_crys_all: list[jnp.ndarray] = []
+        K_crys_all: list[jnp.ndarray] = []
+        K_cart_all: list[jnp.ndarray] = []
+        K_norm_all: list[np.ndarray] = []
+        bvec_np = np.asarray(wfn.bvec, dtype=float).T
+        B = float(wfn.blat) * bvec_np.T
+        for i in range(sym.nk_tot):
+            Gk_crys_i, _ = generate_gvectors_k(i, sym, wfn, meta)
+            Gk = np.asarray(Gk_crys_i, dtype=float)
+            kvec = np.asarray(sym.unfolded_kpts[i], dtype=float)
+            Kc = Gk + kvec[None, :]
+            Kcart = Kc @ B
+            Knorm = np.sqrt(np.sum(Kcart**2, axis=1))
+            Gk_crys_all.append(jnp.asarray(Gk_crys_i, dtype=jnp.int32))
+            K_crys_all.append(jnp.asarray(Kc, dtype=jnp.float64))
+            K_cart_all.append(jnp.asarray(Kcart, dtype=jnp.float64))
+            K_norm_all.append(Knorm)
+        timer_kprep.watch(Gk_crys_all, K_crys_all, K_cart_all)
 
-    # q_max across all k for plan construction
+    # q_max across all k for plan construction, and build fixed-size G/K pads
     q_max = 0.0
+    nG_list = []
     for Knorm in K_norm_all:
         if Knorm.size:
             q_max = max(q_max, float(np.max(Knorm)))
+        nG_list.append(int(Knorm.shape[0]))
+
+    nG_max = max(nG_list) if nG_list else 0
+    Gk_crys_pad: list[jnp.ndarray] = []
+    K_crys_pad: list[jnp.ndarray] = []
+    K_cart_pad: list[jnp.ndarray] = []
+    G_mask: list[jnp.ndarray] = []
+    for i in range(sym.nk_tot):
+        Gcur = jnp.asarray(Gk_crys_all[i], dtype=jnp.int32)
+        Kc = jnp.asarray(K_crys_all[i], dtype=jnp.float64)
+        Kt = jnp.asarray(K_cart_all[i], dtype=jnp.float64)
+        nG = int(Gcur.shape[0])
+        if nG < nG_max:
+            pad = nG_max - nG
+            Gpad = jnp.pad(Gcur, ((0, pad), (0, 0)))
+            Kcpad = jnp.pad(Kc, ((0, pad), (0, 0)))
+            Ktpad = jnp.pad(Kt, ((0, pad), (0, 0)))
+            mask = jnp.concatenate([jnp.ones((nG,), dtype=jnp.float64), jnp.zeros((pad,), dtype=jnp.float64)])
+        else:
+            Gpad, Kcpad, Ktpad = Gcur, Kc, Kt
+            mask = jnp.ones((nG_max,), dtype=jnp.float64)
+        Gk_crys_pad.append(Gpad)
+        K_crys_pad.append(Kcpad)
+        K_cart_pad.append(Ktpad)
+        G_mask.append(mask)
 
     # Build minimal VNL plan once for all k
-    plan = build_vnl_plan(pseudos, assignments, float(wfn.cell_volume), float(q_max))
+    with timing.section("psp.get_DFT_mtxels.get_kin_ion.plan_build"):
+        plan = build_vnl_plan(pseudos, assignments, float(wfn.cell_volume), float(q_max))
 
     # Build V_loc on 2x grid once
-    V_loc_r = build_local_ionic_potential_on_G_total(
-        assignments=[{"pseudo": ap.pseudo, "position": np.asarray(ap.position, dtype=float)} for ap in assignments],
-        species_groups=[
-            (sp[0], (np.asarray(sp[1], dtype=float) if np.asarray(sp[1]).size > 0 else np.zeros((0, 3), dtype=float)))
-            for sp in species_payload
-        ],
-        fft_grid=tuple(int(x) for x in meta.fft_grid),
-        bdot=np.asarray(wfn.bdot, dtype=float),
-        cell_volume=float(wfn.cell_volume),
-    )
-    V_loc_r = jnp.asarray(V_loc_r, dtype=jnp.float64)
+    with timing.section("psp.get_DFT_mtxels.get_kin_ion.build_V_loc") as timer_vloc:
+        V_loc_r = build_local_ionic_potential_on_G_total(
+            assignments=[
+                {"pseudo": ap.pseudo, "position": np.asarray(ap.position, dtype=float)} for ap in assignments
+            ],
+            species_groups=[
+                (
+                    sp[0],
+                    (np.asarray(sp[1], dtype=float) if np.asarray(sp[1]).size > 0 else np.zeros((0, 3), dtype=float)),
+                )
+                for sp in species_payload
+            ],
+            fft_grid=tuple(int(x) for x in meta.fft_grid),
+            bdot=np.asarray(wfn.bdot, dtype=float),
+            cell_volume=float(wfn.cell_volume),
+        )
+        V_loc_r = jnp.asarray(V_loc_r, dtype=jnp.float64)
+        # Avoid forcing device sync here; leave compute lazy
 
     V_H_r = None
     if include_hartree:
@@ -814,8 +884,10 @@ def get_kin_ion(
                 f"include_hartree=True requires at least nelec={wfn.nelec} bands (got {wfn_k_sharded.shape[1]})"
             )
         print("  Computing valence density and Hartree potential for kin+ion...")
-        rho_valence = compute_valence_density(wfn_k_sharded, sym, wfn)
-        V_H_r = compute_hartree_potential_real(rho_valence, jnp.asarray(wfn.bdot, dtype=jnp.float64))
+        with timing.section("psp.get_DFT_mtxels.get_kin_ion.hartree") as timer_hartree:
+            rho_valence = compute_valence_density(wfn_k_sharded, sym, wfn)
+            bdot_j = jnp.asarray(wfn.bdot, dtype=jnp.float64)
+            V_H_r = compute_hartree_potential_real(rho_valence, bdot_j)
 
     # Allocate output and compute per-k
     nk, nb_total = wfn_k_sharded.shape[0], wfn_k_sharded.shape[1]
@@ -823,25 +895,33 @@ def get_kin_ion(
     if nb_limit is not None:
         nb = max(1, min(nb, int(nb_limit)))
     kin_ion = np.zeros((nk, nb, nb), dtype=np.complex128)
+    bdot_j = jnp.asarray(wfn.bdot, dtype=jnp.float64)
     for i in range(sym.nk_tot):
-        wfn_k = wfn_k_sharded[i, :nb]
-        kpoint = jnp.asarray(sym.unfolded_kpts[i], dtype=jnp.float64)
-        Gk_crys = Gk_crys_all[i]
-        T_k = compute_kinetic_k(wfn_k, Gk_crys, kpoint, jnp.asarray(wfn.bdot, dtype=jnp.float64))
-        V_ion_k = compute_local_V_k(wfn_k, Gk_crys, V_loc_r, wfn.cell_volume)
-        V_NL_k = compute_V_NL_k_minimal(
-            wfn_k,
-            Gk_crys,
-            K_crys_all[i],
-            K_cart_all[i],
-            plan,
-            float(wfn.cell_volume),
-        )
-        total_k = T_k + V_ion_k + V_NL_k
-        if include_hartree:
-            V_H_k = compute_local_V_k(wfn_k, Gk_crys, V_H_r, wfn.cell_volume)
-            total_k = total_k + V_H_k
-        kin_ion[i] = np.asarray(total_k)
+        with timing.section("psp.get_DFT_mtxels.get_kin_ion.k_loop") as timer_kloop:
+            wfn_k = wfn_k_sharded[i, :nb]
+            kpoint = jnp.asarray(sym.unfolded_kpts[i], dtype=jnp.float64)
+            Gk_crys = Gk_crys_pad[i]
+            with timing.section("psp.get_DFT_mtxels.get_kin_ion.compute_T"):
+                T_k = compute_kinetic_k(wfn_k, Gk_crys, kpoint, bdot_j, G_mask[i])
+            with timing.section("psp.get_DFT_mtxels.get_kin_ion.compute_V_loc"):
+                V_ion_k = compute_local_V_k(wfn_k, Gk_crys, V_loc_r, wfn.cell_volume, G_mask[i])
+            with timing.section("psp.get_DFT_mtxels.get_kin_ion.compute_V_NL"):
+                V_NL_k = compute_V_NL_k_minimal(
+                    wfn_k,
+                    Gk_crys,
+                    K_crys_pad[i],
+                    K_cart_pad[i],
+                    plan,
+                    float(wfn.cell_volume),
+                    G_mask[i],
+                )
+            total_k = T_k + V_ion_k + V_NL_k
+            if include_hartree:
+                with timing.section("psp.get_DFT_mtxels.get_kin_ion.compute_V_H"):
+                    V_H_k = compute_local_V_k(wfn_k, Gk_crys, V_H_r, wfn.cell_volume, G_mask[i])
+                total_k = total_k + V_H_k
+            kin_ion[i] = np.asarray(total_k)
+            timer_kloop.watch(kin_ion[i])
 
     return kin_ion
 

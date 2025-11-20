@@ -701,26 +701,17 @@ def get_zeta_q_and_v_q_mu_nu(
 		)
 
 		# Minimal sharding hint: keep rows on x and cols on y, matching wfn shardings
-		try:
-			if sh is not None:
-				CCT = jax.lax.with_sharding_constraint(CCT, sh.replicated_2)
-				ZCT = jax.lax.with_sharding_constraint(ZCT, sh.xy_shard)
-			print("CCT sharding:", jax.sharding.get_array_sharding(CCT))
-			print("ZCT sharding:", jax.sharding.get_array_sharding(ZCT))
-		except Exception:
-			pass
+		CCT = jax.lax.with_sharding_constraint(CCT, sh.replicated_2)
+		ZCT = jax.lax.with_sharding_constraint(ZCT, sh.xy_shard)
+
 		# lstsq solve with optimal sharding (Y over longer rtot dimension)
 		CCT = CCT + 1e-8 * jnp.mean(jnp.real(jnp.diag(CCT))) * jnp.eye(CCT.shape[0], dtype=CCT.dtype)
 		CCT_cholesky = jax.scipy.linalg.cho_factor(CCT)
 		# should make this parallel over xy in ZCT, CCT_cholesky replicated
 		zeta_q = jax.scipy.linalg.cho_solve(CCT_cholesky, ZCT, overwrite_b=True)
-
-		# Reshard to be sharded over ALL processors in rmu dimension (1D mesh)
-		if sh is not None:
-			zeta_q = jax.lax.with_sharding_constraint(zeta_q, sh.xy0_2)
+		zeta_q = jax.lax.with_sharding_constraint(zeta_q, sh.xy0_2)
 		S_q_local = compute_Sq_from_zeta(zeta_q)
-		if sh is not None:
-			S_q_local = jax.lax.with_sharding_constraint(S_q_local, sh.x0y1_2)
+		S_q_local = jax.lax.with_sharding_constraint(S_q_local, sh.x0y1_2)
 		qx, qy, qz = (int(v) for v in qvec_nonneg)
 		S_qmunu = S_qmunu.at[qx, qy, qz, :, :].set(S_q_local)
 
@@ -1148,29 +1139,10 @@ def main(argv=None):
 					if profile_trace_dir and hasattr(jax_profiler, "step_end"):
 						jax_profiler.step_end()
 
-					if _t_q_start is not None:
-						q_profile_samples.append((iq_cpu, time.perf_counter() - _t_q_start))
+				if _t_q_start is not None:
+					q_profile_samples.append((iq_cpu, time.perf_counter() - _t_q_start))
 
-					# Capture the q=0 Coulomb (with G=0 removed) for Hartree, and the head vector u
-					if int(qx) == 0 and int(qy) == 0 and int(qz) == 0:
-						v_q0_noG0_munu = v_munu  # V_qfullG already has head zeroed; reuse v_munu
-						# Head-direction vector u in ISDF index space (unnormalized):
-						# Extract u = zeta_{mu}(G=0) using the SAME FFT convention as used in V/W build.
-						# Build zeta_G and pick the G=0 index from vcoul_comps.
-						fft_nx, fft_ny, fft_nz = int(meta.fft_grid[0]), int(meta.fft_grid[1]), int(meta.fft_grid[2])
-						z_sp = zeta_q.reshape(zeta_q.shape[0], fft_nx, fft_ny, fft_nz)
-						phase = jnp.ones((1, fft_nx, fft_ny, fft_nz), dtype=jnp.complex128)  # q=0
-						z_G = jnp.fft.fftn(z_sp * phase, axes=(-3, -2, -1))
-						# find index of G=(0,0,0) in vcoul_comps (use NumPy for robustness outside jit)
-						vc_np = np.asarray(vcoul_comps)
-						g0_mask_np = (vc_np[:, 0] == 0) & (vc_np[:, 1] == 0) & (vc_np[:, 2] == 0)
-						if not np.any(g0_mask_np):
-							g0_idx = int(np.argmin(np.sum(vc_np * vc_np, axis=1)))
-						else:
-							g0_idx = int(np.where(g0_mask_np)[0][0])
-						G0_mu_nu = z_G[:, vc_np[g0_idx, 0], vc_np[g0_idx, 1], vc_np[g0_idx, 2]]
-
-					print(f"qpoint {iq_cpu} done")
+				print(f"qpoint {iq_cpu} done")
 
 				if profile_qloop and meta.rank == 0:
 					if q_profile_samples:
@@ -1185,6 +1157,43 @@ def main(argv=None):
 					if vmunu_samples:
 						vmunu_arr = np.asarray(vmunu_samples, dtype=np.float64)
 						print0(f"  v_munu FFT build: mean={vmunu_arr.mean()*1e3:.2f} ms, max={vmunu_arr.max()*1e3:.2f} ms")
+
+			# Reconstruct q=0 head data outside the q-loop (no conditional inside)
+			q_nonneg_np = np.asarray(q_cache.q_nonneg)
+			q0_candidates = np.where(np.all(q_nonneg_np == 0, axis=1))[0]
+			if q0_candidates.size == 0:
+				raise ValueError('q=0 not found in Coulomb cache')
+			q0_idx = int(q0_candidates[0])
+			k_l_q0 = q_cache.k_l_indices[q0_idx]
+			k_r_q0 = q_cache.k_r_indices
+			vcoul_q0 = q_cache.vcoul_comps[q0_idx]
+			sqrt_V_q0 = q_cache.sqrt_V_qfullG[q0_idx]
+			qvec_q0 = jnp.asarray(q_cache.q_wrapped[q0_idx], dtype=jnp.float64)
+			CCT0, ZCT0 = compute_CCT_ZCT_for_q(
+				CCT_buf,
+				ZCT_buf,
+				psi_l_rmu_Y,
+				psi_r_rmu_Y,
+				psi_l_rtot_Y,
+				psi_r_rtot_Y,
+				psi_l_rmuT_X,
+				psi_r_rmuT_X,
+				k_l_q0,
+				k_r_q0,
+			)
+			zeta_q0 = solve_zeta_cholesky(CCT0, ZCT0)
+			zeta_q0 = set_zeta_sharding(zeta_q0, mesh_xy)
+			v_q0_noG0_munu = V_qmunu[0, 0, 0, 0, 0, 0]
+			fft_nx, fft_ny, fft_nz = int(meta.fft_grid[0]), int(meta.fft_grid[1]), int(meta.fft_grid[2])
+			zeta_q0_spatial = zeta_q0.reshape(zeta_q0.shape[0], fft_nx, fft_ny, fft_nz)
+			zeta_q0G = jnp.fft.fftn(zeta_q0_spatial, axes=(-3, -2, -1))
+			vc_np_q0 = np.asarray(vcoul_q0)
+			g0_mask_np = (vc_np_q0[:, 0] == 0) & (vc_np_q0[:, 1] == 0) & (vc_np_q0[:, 2] == 0)
+			if not np.any(g0_mask_np):
+				g0_idx = int(np.argmin(np.sum(vc_np_q0 * vc_np_q0, axis=1)))
+			else:
+				g0_idx = int(np.where(g0_mask_np)[0][0])
+			G0_mu_nu = zeta_q0G[:, vc_np_q0[g0_idx, 0], vc_np_q0[g0_idx, 1], vc_np_q0[g0_idx, 2]]
 
 			# Sharded psi variants outside q-loop
 			with mesh_xy:
