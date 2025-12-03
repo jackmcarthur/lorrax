@@ -189,6 +189,26 @@ explicitly forms $V_{0}\rho$ and projects it with the same centroids used for
 $\Sigma^{\text{SX}}$.【F:src/isdf/gw_isdf/cohsex_jax.py†L820-L834】  A dynamical Coulomb-hole contribution will
 reuse the same machinery once the frequency dependence of \(W\) is reinstated.
 
+### Spin conventions
+
+For spinor calculations, `nspin=1` and `nspinor=1` does **not** imply spin
+degeneracy.  These systems have no factor of 2 for spin in the density or
+self-energy formulas.  The wavefunctions already represent the full spinor
+structure (though collapsed to a single component when SOC lifts degeneracy),
+so occupation is strictly 1 per state rather than 2.
+
+### Known Hartree normalization issue (TODO)
+
+The ISDF Hartree matrix elements currently exhibit a **constant additive offset**
+of approximately 17 Ry compared to QE reference values.  The exchange self-energy
+$\Sigma_X$ computed with the same wavefunctions and $V_{\mu\nu}$ is correct,
+so the issue is specific to the Hartree formula or its $\mathbf{q}=0$ Coulomb
+block $V_0$.  Possible causes under investigation:
+- The ISDF Coulomb matrix $V_{0,\mu\nu}$ naturally has a large projection onto
+  the "head" direction $\zeta_\mu^*(G{=}0)\zeta_\nu(G{=}0)$ even with $G=0$ zeroed,
+  which may require explicit subtraction.
+- Missing integration weight or cell-volume factor in the centroid sum.
+
 ## 7. Fixed-point self-consistency (prototype)
 
 The current driver contains a fixed-point prototype that would iterate the total

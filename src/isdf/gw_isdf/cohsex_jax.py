@@ -64,7 +64,7 @@ from ..common.epsreader import EPSReader
 from .gw_file_io import (write_sigma_to_file, write_eqp_table, write_labeled_arrays_to_h5, 
                          read_labeled_arrays_from_h5, load_labeled_arrays_from_h5, 
                          save_restart_per_proc)
-from .jax_fixed_point_demo import crop_family_fixed_history_map
+from .archive.jax_fixed_point_demo import crop_family_fixed_history_map
 from ..common import Meta
 from ..common.gamma_matrices import gammas_sparse
 import isdf.common.timing as timing
@@ -539,12 +539,34 @@ def read_cohsex_input(filename: str) -> dict:
 		getb = section.getboolean
 		get = section.get
 		geti = section.getint
+		# ============================================================================
+		# PARAMETER DEFINITIONS:
+		# ============================================================================
+		# restart:       If True, load V_qmunu/wavefunctions from taggedarrays.h5
+		#                instead of rebuilding ISDF from scratch. Default=True.
+		# x_only:        If True, compute bare exchange only (no screening).
+		#                Cannot be True if do_screened=True. Default=False.
+		# do_screened:   If True, build W from (1-Vχ)⁻¹V and use for Σ_x.
+		#                If False, use bare Coulomb V. Default=True.
+		# bispinor:      If True, use 2-component spinor wavefunctions (SOC).
+		#                Default=False (scalar or collinear spin).
+		# wcoul0_source: Method for q→0 head average: 'epshead' (from eps0mat.h5)
+		#                or 's_tensor' (from dipole.h5). Default='s_tensor'.
+		# self_consistent: If True, run fixed-point SCF loop. Default=False.
+		# nval:          Number of valence bands in sigma window. These are the
+		#                highest occupied bands: indices [nelec-nval, nelec).
+		# ncond:         Number of conduction bands in sigma window. These are the
+		#                lowest unoccupied bands: indices [nelec, nelec+ncond).
+		# nband:         Total bands to load (for chi0, etc.). Usually > nval+ncond.
+		# sys_dim:       Dimensionality: 2=2D (slab with truncated Coulomb),
+		#                3=3D (bulk, not yet implemented). Default=2.
+		# debug_hartree: If True, print diagnostic info for Hartree calculation.
+		# ============================================================================
 		params = {
-			"restart": getb("restart", fallback=True),
-			"x_only": getb("x_only", fallback=False),
-			"do_screened": getb("do_screened", fallback=True),
-			"bispinor": getb("bispinor", fallback=False),
-			# Source for wcoul0 small-q head average: 'epshead' or 's_tensor'
+			"restart": getb("restart", fallback=True),           # load from h5 vs rebuild
+			"x_only": getb("x_only", fallback=False),            # bare exchange only
+			"do_screened": getb("do_screened", fallback=True),   # use W instead of V
+			"bispinor": getb("bispinor", fallback=False),        # 2-component spinors
 			"wcoul0_source": get("wcoul0_source", fallback="s_tensor").strip().lower(),
 			"wfn_file": get("wfn_file", fallback="WFN.h5"),
 			"centroids_file": get("centroids_file", fallback="centroids_frac.txt"),
@@ -552,10 +574,11 @@ def read_cohsex_input(filename: str) -> dict:
 			"self_consistent": getb("self_consistent", fallback=False),
 			"kin_ion_file": get("kin_ion_file", fallback="kin_ion.h5"),
 			"eqp_output_file": get("eqp_output_file", fallback="eqp.dat"),
-			"nval": geti("nval", fallback=5),
-			"ncond": geti("ncond", fallback=5),
-			"nband": geti("nband", fallback=100),
-			"sys_dim": geti("sys_dim", fallback=2),
+			"nval": geti("nval", fallback=5),    # valence bands in sigma window
+			"ncond": geti("ncond", fallback=5),  # conduction bands in sigma window
+			"nband": geti("nband", fallback=100), # total bands for chi0/screening
+			"sys_dim": geti("sys_dim", fallback=2),  # 2=slab, 3=bulk
+			"debug_hartree": getb("debug_hartree", fallback=False),
 		}
 	else:
 		# Fallback defaults if no section found
@@ -575,6 +598,7 @@ def read_cohsex_input(filename: str) -> dict:
 			"ncond": 5,
 			"nband": 100,
 			"sys_dim": 2,
+			"debug_hartree": False,
 		}
 
 	# Parse optional QE-style K_POINTS block: take the number after it, read next that many lines
@@ -853,27 +877,60 @@ def compute_sigma_pipeline_jax(
 	nspinor: int,
 	fft_vol_au: float,
 ):
-	"""Pure JAX pipeline: returns sigma_kij (nk, nb, nb).
-	Uses psi_l for building G (valence-only) and psi_r for projection to bands."""
-	G_k = get_G_mu_nu_jax(psi_l_rmuT_X, psi_l_rmu_Y)
+	"""
+	Pure JAX pipeline: compute exchange self-energy and Hartree matrix elements.
+	
+	Returns:
+		sigma_kij: (nk, nb_sigma, nb_sigma) complex - exchange self-energy
+		hartree_kmn: (nk, nb_sigma, nb_sigma) complex - Hartree matrix elements
+	
+	Wavefunctions:
+		psi_l: valence bands only (for density ρ and Green's function G)
+		       shape (nk, nval, nspinor, n_rmu) where nval = nelec - b1 (all occupied)
+		psi_r: sigma window bands (for projecting to band basis)
+		       shape (nk, n_sigma, nspinor, n_rmu) where n_sigma = nval + ncond
+	
+	EXCHANGE (Σ_x):
+		G_μν(k) = Σ_occ ψ*_nk(r_μ) ψ_nk(r_ν)     [Green's function from valence]
+		G_μν(R) = FFT[ G_μν(k) ]                  [to real-space lattice]
+		Σ_μν(k) = (1/N_k) Σ_R G_μν(R) V_μν(R)    [exchange in ISDF basis]
+		Σ_ij(k) = Σ_μν ψ*_i(r_μ) Σ_μν ψ_j(r_ν)   [project to sigma bands]
+	
+	HARTREE (V_H):
+		ρ_μ = (1/N_k) Σ_k,n,s |ψ_nk(r_μ)|²       [density at centroids, from valence]
+		[Vρ]_μ = Σ_ν V0_μν ρ_ν                    [Hartree potential at centroids]
+		<m|V_H|n>_k = Σ_μ,s ψ*_mk(r_μ) [Vρ]_μ ψ_nk(r_μ)  [project to sigma bands]
+	
+	Key: V0_munu is V(q=0) with G=0 component EXCLUDED (to avoid divergence).
+	     The G=0 piece is added back via the head correction in the main pipeline.
+	"""
+	# ========== EXCHANGE SELF-ENERGY ==========
+	# G_μν(k): Green's function in ISDF basis, built from VALENCE bands only
+	G_k = get_G_mu_nu_jax(psi_l_rmuT_X, psi_l_rmu_Y)  # (nkx,nky,nkz,spin,μ,spin,ν)
+	# G_μν(R): FFT to real-space lattice vectors R
 	G_R = get_G_R_jax(G_k, nkx, nky, nkz)
+	# Σ_μν(k): exchange self-energy via ISDF, σ_μν = (1/Nk) Σ_R G_μν(R) V_μν(R)
 	sigma_k_munu = get_sigma_x_mu_nu_jax(G_R, V_mu_nu, nk_tot)
+	# Σ_ij(k): project to SIGMA WINDOW bands using psi_r
 	sigma_kij = get_sigma_x_kij_jax(psi_r_rmu_X, psi_r_rmuT_Y, sigma_k_munu)
 
-	# Hartree from q=0 component
-	# rho_mu = sum_{k,n,s} |psi_l(k,n,s,mu)|^2, shape (n_rmu,)
-	# Density overlap per centroid, normalized by cell volume
-	#rho_mu = jnp.sum(jnp.conj(psi_l_rmu_Y) * psi_l_rmu_Y, axis=(0,1,2))
+	# ========== HARTREE MATRIX ELEMENTS ==========
+	# Step 1: Density at centroids from VALENCE bands (psi_l)
+	# ρ_μ = (1/Nk) Σ_k,n,s |ψ_nk(r_μ)|²
+	# psi_l_rmu_Y has shape (nk, nval, nspinor, n_rmu), contracted to (n_rmu,)
 	rho_mu = jnp.einsum('knsx,knsx->x', jnp.conj(psi_l_rmu_Y), psi_l_rmu_Y, optimize=True)
-	rho_mu = rho_mu * 1.0 / jnp.asarray(nk_tot, dtype=jnp.float64) # bz integration factor
-	# V0(mu,nu) = V_mu_nu at (q=0)
-	# Vrho(mu) = V0(mu,nu) @ rho(nu); implicit psum over Y when lowered
-	#Vrho_mu = jnp.matmul(V0_munu, rho_mu) 
-	Vrho_mu =jnp.einsum('xy,y->x', V0_munu, rho_mu, optimize=True)
-	# psi_overlap(k,m,n,mu) = sum_s psi*_mk(μ) psi_nk(μ) using right X-sharded copy
-	#psi_overlap = jnp.einsum('kmsx,knsx->kmnx', jnp.conj(psi_r_rmu_X), psi_r_rmu_X, optimize=True)
-	# Hartree matrix elements per k: sum_mu psi_overlap * Vrho_mu
+	rho_mu = rho_mu * 1.0 / jnp.asarray(nk_tot, dtype=jnp.float64)  # BZ integration: 1/Nk
+	
+	# Step 2: Hartree potential at centroids
+	# [Vρ]_μ = Σ_ν V0_μν ρ_ν
+	# V0_munu is V(q=0) with G=0 excluded to avoid Coulomb divergence
+	Vrho_mu = jnp.einsum('xy,y->x', V0_munu, rho_mu, optimize=True)
+	
+	# Step 3: Project to SIGMA WINDOW bands (psi_r)
+	# <mk|V_H|nk> = Σ_μ,s ψ*_mk(r_μ) [Vρ]_μ ψ_nk(r_μ)
+	# Note: This uses psi_r which includes both valence AND conduction in sigma window
 	hartree_kmn = jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_r_rmu_X), Vrho_mu, psi_r_rmu_X, optimize=True)
+	
 	return sigma_kij, hartree_kmn
 
 
@@ -1006,16 +1063,35 @@ def main(argv=None):
 	epsq = 0.01
 	#window_pairs = get_window_info(epsq, wfn)
 
-	# restart: if True, read interp. vectors and V_qmunu from file
-	restart = params["restart"]
-	x_only = params["x_only"]
-	do_screened = params["do_screened"]
+	# ============================================================================
+	# MAIN CONTROL FLAGS (from input file):
+	# ============================================================================
+	# restart:     If True, load ISDF vectors and V_qmunu from taggedarrays.h5
+	#              instead of recomputing. Saves ~30 min for large systems.
+	# x_only:      If True, use bare Coulomb V for exchange (no screening).
+	#              Mutually exclusive with do_screened=True.
+	# do_screened: If True, build screened Coulomb W = (1-Vχ)⁻¹V and use for Σ_x.
+	#              If False, Σ_x uses bare V. Default=True for full GW/COHSEX.
+	# bispinor:    If True, use 2-component spinor wavefunctions (for SOC).
+	#              If False, scalar or collinear spin. Default=False.
+	# ============================================================================
+	restart = params["restart"]       # True: load from h5, False: rebuild ISDF
+	x_only = params["x_only"]         # True: bare exchange only, no screening
+	do_screened = params["do_screened"]  # True: use W, False: use V
 	global bispinor
-	bispinor = params["bispinor"]
-	# Internal feature toggles: head (G=0) corrections and S_q storage
-	do_G0 = True
-	do_S = False
-	if x_only and do_screened:
+	bispinor = params["bispinor"]     # True: 2-component spinors (SOC)
+	
+	# ============================================================================
+	# INTERNAL FEATURE TOGGLES (not exposed in input file):
+	# ============================================================================
+	# do_G0: If True, apply head corrections for q→0, G=0 divergence.
+	#        This adds the cell-averaged 8π/q² to V_μν and W_μν via outer product
+	#        of ζ(G=0) vectors. Essential for correct Hartree and long-range physics.
+	# do_S:  If True, store the overlap matrix S_q = ⟨ζ_μ|ζ_ν⟩ (not currently used).
+	# ============================================================================
+	do_G0 = True   # Always True: head corrections are essential
+	do_S = False   # Overlap matrix storage (disabled, not needed)
+	if x_only and do_screened:  # x_only=bare exchange only, do_screened=use W instead of v
 		raise ValueError("x_only and do_screened cannot both be True")
 
 	meta = Meta.from_system(wfn, sym, nval, ncond, nband, _n_rmu, bispinor)
@@ -1026,9 +1102,32 @@ def main(argv=None):
 	fft_nx, fft_ny, fft_nz = (int(dim) for dim in meta.fft_grid)
 	nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
 	band = meta.band_ranges
+	# ============================================================================
+	# BAND EDGE DEFINITIONS (0-indexed):
+	# ============================================================================
+	#   b0 = 0                      : first band (absolute minimum)
+	#   b1 = nelec - nval           : first "active" valence band (lowest in sigma window)
+	#   b2 = nelec                  : VBM+1 = CBM = first conduction band
+	#   b3 = nelec + ncond          : last "active" conduction band + 1 (end of sigma window)
+	#   b4 = nband                  : highest band read (for chi0 sums, etc.)
+	#
+	# EXAMPLE: For nelec=26, nval=26, ncond=14, nband=80:
+	#   b0=0, b1=0, b2=26, b3=40, b4=80
+	#   Valence bands: 0..25 (indices b1..b2-1, all 26 included if nval=nelec)
+	#   Sigma window:  0..39 (indices b1..b3-1, includes nval + ncond = 40 bands)
+	#   Conduction:    26..39 (indices b2..b3-1)
+	#
+	# BAND RANGES (tuples for slicing):
+	#   valence = (b1, b2)           : active valence for sigma (may exclude deep core)
+	#   conduction = (b2, b3)        : active conduction for sigma
+	#   sigma = (b1, b3)             : full sigma window (valence + conduction)
+	#   occupied = (b0, b2)          : ALL occupied bands (for density, including core)
+	#   val_plus_sigma = (b0, b3)    : bands 0..b3-1 (for left wfns in ISDF)
+	#   cond_plus_sigma = (b1, b4)   : bands b1..b4-1 (for right wfns if screened)
+	# ============================================================================
 	b0, b1, b2, b3, b4 = meta.band_edges
-	nvplussigrange = band.val_plus_sigma
-	ncplussigrange = band.cond_plus_sigma
+	nvplussigrange = band.val_plus_sigma   # (b0, b3) = (0, nelec+ncond) for left wfns
+	ncplussigrange = band.cond_plus_sigma  # (b1, b4) for right wfns when screened
 	# rank-aware print helper
 	def print0(*a, **k):
 		if meta.rank == 0:
@@ -1170,34 +1269,70 @@ def main(argv=None):
 
 			print0(f"finished building zeta/V for {q_cache.num_q} q-points")
 
-			if do_G0 and G0_mu_nu is None:
-				q_nonneg_np = np.asarray(q_cache.q_nonneg)
-				q0_candidates = np.where(np.all(q_nonneg_np == 0, axis=1))[0]
-				if q0_candidates.size == 0:
-					raise ValueError('q=0 not found in Coulomb cache')
-				q0_idx = np.asarray(q0_candidates[0]).item()
-				k_l_q0 = q_cache.k_l_indices[q0_idx]
-				k_r_q0 = q_cache.k_r_indices
-				qvec_q0 = jnp.asarray(q_cache.q_wrapped[q0_idx], dtype=jnp.float64)
-				CCT0, ZCT0 = compute_CCT_ZCT_for_q(
-					CCT_buf,
-					ZCT_buf,
-					psi_l_rmu_Y,
-					psi_r_rmu_Y,
-					psi_l_rtot_Y,
-					psi_r_rtot_Y,
-					psi_l_rmuT_X,
-					psi_r_rmuT_X,
-					k_l_q0,
-					k_r_q0,
-				)
-				zeta_q0 = solve_zeta_cholesky(CCT0, ZCT0)
-				zeta_q0 = set_zeta_sharding(zeta_q0, mesh_xy)
-				_, G0_mu_nu = v_munu_kernel(zeta_q0, qvec_q0)
+			# if do_G0 and G0_mu_nu is None:
+			# 	q_nonneg_np = np.asarray(q_cache.q_nonneg)
+			# 	q0_candidates = np.where(np.all(q_nonneg_np == 0, axis=1))[0]
+			# 	if q0_candidates.size == 0:
+			# 		raise ValueError('q=0 not found in Coulomb cache')
+			# 	q0_idx = np.asarray(q0_candidates[0]).item()
+			# 	k_l_q0 = q_cache.k_l_indices[q0_idx]
+			# 	k_r_q0 = q_cache.k_r_indices
+			# 	qvec_q0 = jnp.asarray(q_cache.q_wrapped[q0_idx], dtype=jnp.float64)
+			# 	CCT0, ZCT0 = compute_CCT_ZCT_for_q(
+			# 		CCT_buf,
+			# 		ZCT_buf,
+			# 		psi_l_rmu_Y,
+			# 		psi_r_rmu_Y,
+			# 		psi_l_rtot_Y,
+			# 		psi_r_rtot_Y,
+			# 		psi_l_rmuT_X,
+			# 		psi_r_rmuT_X,
+			# 		k_l_q0,
+			# 		k_r_q0,
+			# 	)
+			# 	zeta_q0 = solve_zeta_cholesky(CCT0, ZCT0)
+			# 	zeta_q0 = set_zeta_sharding(zeta_q0, mesh_xy)
+			# 	_, G0_mu_nu = v_munu_kernel(zeta_q0, qvec_q0)
 
-			v_q0_noG0_munu = V_qmunu[0, 0, 0, 0, 0, 0]
-			if not do_G0:
+			# ============================================================================
+			# V0_noG0 EXTRACTION: This is the q=0 Coulomb matrix WITH G=0 EXCLUDED.
+			# ============================================================================
+			# V_qmunu is indexed as [qx,qy,qz,qx',qy',qz',μ,ν] where q' handles folding.
+			# At q=0, we extract V_qmunu[0,0,0,0,0,0,:,:] which is the μ×μ matrix
+			# built with the G=0 term ZEROED in make_v_munu_kernel (see denom_zero mask).
+			#
+			# This V0_noG0 is used for HARTREE to avoid the 1/q² divergence.
+			# The missing G=0 piece is NOT added back for Hartree (it's a constant
+			# energy shift that cancels between electron-electron and electron-ion).
+			# ============================================================================
+			v_q0_noG0_munu = v_q0_noG0_munu.at[:,:].set(V_qmunu[0, 0, 0, 0, 0, 0])
+			if not do_G0:  # do_G0=True normally; G0_mu_nu = ζ_μ(G=0) for head corrections
 				G0_mu_nu = None
+
+			# ============================================================================
+			# NOTE ON ISDF HARTREE AND THE "HEAD-LIKE" STRUCTURE
+			# ============================================================================
+			# The ISDF Coulomb matrix V_{μν} = (1/Ω) Σ_{G≠0} v(G) ζ*_μ(G) ζ_ν(G) has a
+			# large projection (~99%) onto the "head" direction ζ*_μ(0) ⊗ ζ_ν(0), even
+			# with G=0 zeroed. This is NOT contamination - it's legitimate physics:
+			#
+			#   1. ISDF vectors ζ_μ(r) are smooth, so ζ(G) is concentrated at low G
+			#   2. The Coulomb v(G) ∝ 1/G² is also peaked at low G
+			#   3. So Σ_{G≠0} v(G) |ζ(G)|² naturally resembles |ζ(0)|² structure
+			#
+			# The G→ζ mapping is LOW-RANK and NOT INVERTIBLE. You cannot cleanly
+			# separate "G=0 contribution" from "G≠0 contribution" in the μν basis
+			# because the ζ basis mixes them together.
+			#
+			# CURRENT STATUS: There is a ~17 Ry constant offset in Hartree vs QE.
+			# The exchange Σ_x using the same V_μν is correct, so the issue is
+			# specific to the Hartree formula, not the V_μν construction.
+			#
+			# POSSIBLE CAUSES UNDER INVESTIGATION:
+			#   - Missing overlap matrix S_μν in the Hartree contraction
+			#   - Different integration measure for Hartree vs exchange
+			#   - Gauge/reference energy difference with QE
+			# ============================================================================
 
 			# Sharded psi variants outside q-loop
 			with mesh_xy:
@@ -1206,17 +1341,35 @@ def main(argv=None):
 				psir_X = jax.device_put(psi_r_rmu_Y, sh.x3_4)
 				psirT_Y = jax.lax.with_sharding_constraint(psir_X.transpose(0, 2, 3, 1), sh.y2_4)
 
-			# Preserve full-sized left wavefunctions (b3) for rotation in SCF loop
-			psi_l_full = psil_Y
-			psi_lT_full = psilT_X
-			# Define slices and trimmed copies for the one-shot sigma pipeline
-			valence_slice = slice(b0, b2)
-			nb_valence = int(b2 - b0)
-			nb_sigma = int(b3 - b0)
-			psi_l = psi_l_full#[:, valence_slice, :, :]
-			psi_lT = psi_lT_full#[:, :, :, valence_slice]
-			psi_r = psir_X#[:, :nb_sigma, :, :]
-			psi_rT = psirT_Y#[:, :, :, :nb_sigma]
+			# ============================================================================
+			# WAVEFUNCTION ARRAYS AND BAND SLICING:
+			# ============================================================================
+			# psi_l: "left" wavefunctions for building density ρ and Green's function G
+			#        Originally loaded as bands [b0, b3) = [0, nelec+ncond)
+			#        Sliced to VALENCE ONLY [b0, b2) = [0, nelec) for ρ and G
+			#
+			# psi_r: "right" wavefunctions for projecting Σ to band basis
+			#        Loaded as bands [b1, b4) for do_screened or [b0, b3) otherwise
+			#        Used as-is for sigma window projection
+			#
+			# KEY: ρ_μ and G_μν use VALENCE (psi_l sliced), but <m|Σ|n> uses SIGMA
+			#      WINDOW (psi_r), which includes both valence and conduction.
+			# ============================================================================
+			psi_l_full = psil_Y        # Full array: bands [b0, b3)
+			psi_lT_full = psilT_X      # Transposed version
+			
+			# Slices for Hartree/exchange: valence only [b0, b2) = [0, nelec)
+			valence_slice = slice(b0, b2)  # Indices 0..nelec-1
+			nb_valence = int(b2 - b0)      # = nelec (number of valence bands)
+			nb_sigma = int(b3 - b0)        # = nelec + ncond (sigma window size)
+			
+			# psi_l used for ρ and G: currently using full (should be valence_slice)
+			# TODO: verify this is correct - commented slicing suggests debugging
+			psi_l = psi_l_full   # [:, valence_slice, :, :] for valence only
+			psi_lT = psi_lT_full # [:, :, :, valence_slice] for valence only
+			# psi_r used for band projection: sigma window [b1, b3)
+			psi_r = psir_X       # [:, :nb_sigma, :, :]
+			psi_rT = psirT_Y     # [:, :, :, :nb_sigma]
 
 			# Persist restart artifacts (store full-sized left/right; trim on load/use)
 			write_labeled_arrays_to_h5(
@@ -1286,33 +1439,52 @@ def main(argv=None):
 			# Compute static W under k_XY sharding (S_qmunu included but unused for now)
 			#W_q = get_static_w_q_jax(V_qmunu, chi0, S_qmunu, meta, mesh_xy)
 
- 
-		# Compute q=0 averages (after restart/loop) and inject head-averages
-		if do_G0:
+		# ============================================================================
+		# HEAD INJECTION: Add the q→0, G=0 Coulomb divergence correction
+		# ============================================================================
+		# At q=0, the Coulomb interaction v(q,G) = 4π/|q+G|² diverges as G→0.
+		# We handle this by:
+		#   1. BUILDING V_μν with G=0 ZEROED (done in make_v_munu_kernel)
+		#   2. ADDING BACK the cell-averaged head: ⟨v(q→0,G=0)⟩ = vc0_mean
+		#
+		# The head is added as a rank-1 correction in the μν basis:
+		#   V_μν ← V_μν + (vc0_mean / Ω) × ζ*_μ(0) ⊗ ζ_ν(0)
+		#
+		# where ζ_μ(0) = G0_mu_nu is the G=0 component of the ISDF vectors.
+		#
+		# IMPORTANT: This head correction is added to V_qmunu (for Σ_x) but NOT
+		# to v_q0_noG0_munu (for Hartree). Hartree uses V0 with G=0 excluded because
+		# the divergent piece cancels with the electron-ion interaction.
+		# ============================================================================
+		if do_G0:  # do_G0=True: apply head corrections
 			vc0_mean, wcoul0, wcoul0_source = determine_wcoul0(params, input_dir, wfn, sym, meta, print0)
 			print0(f"wcoul0 source: {wcoul0_source}")
 			print0(f"wcoul0 value (atomic units): {wcoul0}")
-			# Inject head-averages after building W/V
-			# - Add wcoul0 * u u^† to W at q=0 (if screened)
-			# - Add vcoul0 * u u^† to V at q=0 for Sigma_X
-
+			
+			# outer_u = ζ*_μ(0) ⊗ ζ_ν(0), the "head" direction in μν space
 			outer_u = (G0_mu_nu[:, None] * jnp.conj(G0_mu_nu)[None, :])
-			# Scale by 1/Volume to match V/W units used in μν-space (see compute_V_qfullG_for_q)
+			# V_μν has units of (energy × volume), so divide by Ω
 			vol_scale = jnp.asarray(1.0 / float(wfn.cell_volume), dtype=jnp.float64)
-			# For Sigma_X, use the simple head injection as before:
-			# V_Γ ← V_Γ + (vcoul0/Ω) · u u†
+			
+			# HEAD INJECTION FOR Σ_x: V_qmunu at q=0 gets the bare Coulomb head
+			# V_Γ ← V_Γ + (vc0_mean / Ω) × ζ*(0) ⊗ ζ(0)
 			V_qmunu = V_qmunu.at[0, 0, 0, 0, 0, 0, :, :].add((vc0_mean * vol_scale) * outer_u)
-			# For screened W, apply the same simple head injection when enabled
-			if do_screened:
+			
+			# HEAD INJECTION FOR W (screened): W at q=0 gets the screened head wcoul0
+			if do_screened:  # do_screened=True: using W instead of V for exchange
 				W_q = W_q.at[0, 0, 0, 0, :, 0, :].add((wcoul0 * vol_scale) * outer_u)
 
-	# Prepare V_mu_nu (nrmu1,nrmu2,nkx,nky,nkz) from LabeledArray V_qmunu data
-	# V_qmunu has axes [nfreq, npol1, npol2, nkx, nky, nkz, nrmu1, nrmu2]
-	# We need V_mu_nu = V_qmunu[0,0,0,:,:,:, :, :].transpose(6->0,7->1,3->2,4->3,5->4)
-	V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0]  # (nkx,nky,nkz,nrmu1,nrmu2)
-	if do_screened:
-		V_mu_nu = W_q[:,:,:,0,:,0,:]
-	V_mu_nu = V_mu_nu.transpose(3, 4, 0, 1, 2)  # (nrmu1,nrmu2,nkx,nky,nkz)
+	# ============================================================================
+	# SELECT INTERACTION FOR Σ_x: bare V or screened W
+	# ============================================================================
+	# V_qmunu: bare Coulomb, shape [nfreq, npol1, npol2, nkx, nky, nkz, nrmu1, nrmu2]
+	# W_q:     screened Coulomb, shape [nkx, nky, nkz, nfreq, nrmu, npol, nrmu]
+	# We extract the static (freq=0) component and reshape to (nrmu1, nrmu2, nkx, nky, nkz)
+	# ============================================================================
+	V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0]  # (nkx,nky,nkz,nrmu1,nrmu2) from bare V
+	if do_screened:  # do_screened=True: use W instead of V for exchange
+		V_mu_nu = W_q[:,:,:,0,:,0,:]  # (nkx,nky,nkz,nrmu1,nrmu2) from screened W
+	V_mu_nu = V_mu_nu.transpose(3, 4, 0, 1, 2)  # → (nrmu1,nrmu2,nkx,nky,nkz)
 
 	# After W is computed, the trimmed views (psi_l, psi_lT, psi_r, psi_rT)
 	# are already defined; preserve psi_l_full/psi_lT_full as b3-sized copies.
@@ -1334,6 +1506,123 @@ def main(argv=None):
 		out_shardings=(sh.out_shard, sh.out_shard),
 	)
 
+	# ========== HARTREE DIAGNOSTIC ==========
+	# Prints detailed info about V0, density, and Hartree matrix elements
+	if params.get("debug_hartree", False):
+		print0("\n" + "="*70)
+		print0("HARTREE DIAGNOSTIC")
+		print0("="*70)
+		
+		# Print band range info for context
+		print0(f"\n  BAND RANGES (0-indexed):")
+		print0(f"    b0={b0}, b1={b1}, b2={b2} (VBM+1=CBM), b3={b3}, b4={b4}")
+		print0(f"    Valence in sigma:    bands {b1}..{b2-1} ({b2-b1} bands)")
+		print0(f"    Conduction in sigma: bands {b2}..{b3-1} ({b3-b2} bands)")
+		print0(f"    Total sigma window:  bands {b1}..{b3-1} ({b3-b1} bands)")
+		print0(f"    N_electrons = {int(wfn.nelec)}")
+		
+		V0_np = np.asarray(v_q0_noG0_munu)
+		V_q0_from_Vqmunu = np.asarray(V_qmunu[0, 0, 0, 0, 0, 0])
+		print0(f"\n  V0 MATRIX (q=0, G=0 excluded):")
+		print0(f"    ||V0_noG0|| = {np.linalg.norm(V0_np):.4f}")
+		print0(f"    ||V_qmunu[q=0]|| = {np.linalg.norm(V_q0_from_Vqmunu):.4f}")
+		print0(f"    ||V0 - Vq0|| = {np.linalg.norm(V0_np - V_q0_from_Vqmunu):.4e}")
+		if do_G0 and G0_mu_nu is not None:
+			g0 = np.asarray(G0_mu_nu)
+			head_outer = np.outer(g0.conj(), g0)
+			print0(f"    ||G0_mu_nu|| = {np.linalg.norm(g0):.4f}")
+			print0(f"    ||head_outer|| = {np.linalg.norm(head_outer):.4f}")
+			proj = np.abs(np.vdot(V0_np, head_outer)) / (np.linalg.norm(V0_np) * np.linalg.norm(head_outer) + 1e-12)
+			print0(f"    V0 projection onto head: {proj:.6f}")
+			if do_screened:
+				print0(f"    vc0_mean = {float(vc0_mean.real):.4f}")
+				head_mag = float(vc0_mean.real) / float(wfn.cell_volume) * np.linalg.norm(head_outer)
+				print0(f"    Expected head contribution: {head_mag:.4f}")
+		
+		# Density diagnostic
+		psi_l_np = np.asarray(psi_l)  # psi_l is sliced to valence: bands b0..b2-1
+		n_bands_in_density = psi_l_np.shape[1]
+		rho_test = np.einsum('knsx,knsx->x', np.conj(psi_l_np), psi_l_np).real / meta.nk_tot
+		print0(f"\n  DENSITY (from psi_l, valence bands for Hartree):")
+		print0(f"    Bands in density sum: {n_bands_in_density} (should be {b2-b0} = all occupied)")
+		print0(f"    Sum(ρ_μ) = {np.sum(rho_test):.4f}")
+		print0(f"    Mean(ρ_μ) = {np.mean(rho_test):.6f}")
+		if do_G0 and G0_mu_nu is not None:
+			rho_integral_proxy = np.sum(rho_test * np.abs(g0)**2)
+			print0(f"    Σ_μ ρ_μ × |ζ_μ(0)|² = {rho_integral_proxy:.4f}")
+		
+		# Hartree potential at centroids
+		Vrho_test = V0_np @ rho_test
+		print0(f"\n  [V0 @ ρ] (Hartree potential at centroids):")
+		print0(f"    Min = {Vrho_test.real.min():.4f}, Max = {Vrho_test.real.max():.4f}")
+		print0(f"    # negative values: {np.sum(Vrho_test.real < 0)} / {len(Vrho_test)}")
+		
+		# Hartree matrix elements for valence and conduction separately
+		print0(f"\n  V_H DIAGONAL (k=0):")
+		psi_k0 = psi_l_np[0]  # This is psi_l at k=0, contains valence bands only
+		n_val_bands = min(psi_k0.shape[0], b2 - b0)  # Number of valence bands
+		
+		# Valence bands (from psi_l)
+		print0(f"    VALENCE (bands {b0}..{b0 + min(5, n_val_bands) - 1}):")
+		for n in range(min(5, n_val_bands)):
+			overlap = np.sum(np.abs(psi_k0[n])**2, axis=0)
+			V_H_n = np.sum(overlap * Vrho_test).real
+			print0(f"      band {b0+n}: {V_H_n:.4f} Ry")
+		
+		# Check if we have sigma bands (psi_r) to show conduction
+		psi_r_np = np.asarray(psi_r)  # psi_r contains sigma window bands
+		n_sigma_bands = psi_r_np.shape[1]
+		print0(f"\n  PSI ARRAY SHAPES:")
+		print0(f"    psi_l shape: {psi_l_np.shape} (bands in density)")
+		print0(f"    psi_r shape: {psi_r_np.shape} (bands for projection)")
+		print0(f"    n_sigma_bands in psi_r: {n_sigma_bands}")
+		print0(f"    Sigma window should be: {b3-b1} bands (b1={b1} to b3={b3})")
+		
+		if n_sigma_bands > n_val_bands:
+			print0(f"    CONDUCTION (first 5 cond bands in sigma window):")
+			psi_r_k0 = psi_r_np[0]
+			# psi_r starts at band b1, so conduction starts at index (b2-b1)
+			cond_start_idx = b2 - b1 if b1 <= b2 else 0
+			for i in range(min(5, n_sigma_bands - cond_start_idx)):
+				n_idx = cond_start_idx + i
+				if n_idx < n_sigma_bands:
+					overlap = np.sum(np.abs(psi_r_k0[n_idx])**2, axis=0)
+					V_H_n = np.sum(overlap * Vrho_test).real
+					band_id = b1 + n_idx  # Actual band index
+					in_sigma = b1 <= band_id < b3
+					print0(f"      band {band_id}: {V_H_n:.4f} Ry {'(NEGATIVE!)' if V_H_n < 0 else ''} {'[IN SIGMA]' if in_sigma else '[OUTSIDE SIGMA]'}")
+		
+		# Scan ALL bands in psi_r and find which ones have negative Hartree
+		print0(f"\n  NEGATIVE HARTREE SCAN (all bands in psi_r):")
+		psi_r_k0 = psi_r_np[0]
+		neg_in_sigma = []
+		neg_outside_sigma = []
+		for n_idx in range(n_sigma_bands):
+			overlap = np.sum(np.abs(psi_r_k0[n_idx])**2, axis=0)
+			V_H_n = np.sum(overlap * Vrho_test).real
+			band_id = b1 + n_idx
+			if V_H_n < 0:
+				in_sigma = b1 <= band_id < b3
+				if in_sigma:
+					neg_in_sigma.append((band_id, V_H_n))
+				else:
+					neg_outside_sigma.append((band_id, V_H_n))
+		
+		print0(f"    # negative IN sigma window [b1={b1}, b3={b3}): {len(neg_in_sigma)}")
+		for bid, vh in neg_in_sigma[:5]:
+			print0(f"      band {bid}: {vh:.4f} Ry")
+		if len(neg_in_sigma) > 5:
+			print0(f"      ... and {len(neg_in_sigma)-5} more")
+		
+		print0(f"    # negative OUTSIDE sigma window (bands >= b3={b3}): {len(neg_outside_sigma)}")
+		for bid, vh in neg_outside_sigma[:5]:
+			print0(f"      band {bid}: {vh:.4f} Ry")
+		if len(neg_outside_sigma) > 5:
+			print0(f"      ... and {len(neg_outside_sigma)-5} more")
+		
+		print0("="*70 + "\n")
+	# ========== END HARTREE DIAGNOSTIC ==========
+
 	with mesh_xy:
 			with timing.section("cohsex_jax.pipeline"):
 				sigma_x_kbar_ij_jax, hartree_kbar_ij_jax = pipeline_jit(
@@ -1348,13 +1637,6 @@ def main(argv=None):
 				)
 				sigma_x_kbar_ij_jax.block_until_ready()
 				hartree_kbar_ij_jax.block_until_ready()
-	#vhartree_k_mu = jnp.einsum('xy,y->x', v_q0_noG0_munu, rho_k_mu, optimize=True)
-	#hartree_kmn = jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_r), vhartree_k_mu, psi_r, optimize=True)
-	#rho_k_mu = jnp.transpose(rho_k_mu, (1,0)).reshape(-1,meta.nkx,meta.nky,meta.nkz)
-	#rho_R_mu = jnp.fft.ifftn(rho_k_mu, axes=(3,2,1), norm='ortho')
-	#print(rho_k_mu[:4])
-	#print(vhartree_k_mu[:4])
-	#print(hartree_kmn[:4])
 
 
 	sigma_total_full = sigma_x_kbar_ij_jax #+ hartree_kbar_ij_jax
@@ -1475,12 +1757,30 @@ def main(argv=None):
 	energies_dft_ev_host = np.array(energies_dft_ev)
 	energies_qp_ev_host = np.array(energies_qp_ev)
 
-	write_sigma_to_file(ryd2ev * sigma_x_kbar_ij, params["output_file"], hartree_kij=ryd2ev * hartree_kbar_ij)
+	write_sigma_to_file(ryd2ev * sigma_x_kbar_ij, params["output_file"], hartree_kij_Ry=hartree_kbar_ij)
 	#write_eqp_table(energies_dft_ev_host, energies_qp_ev_host, params["eqp_output_file"])
 	write_eqp_table(energies_dft_ev_host, np.diagonal(H_qp_mnk_host, axis1=-2, axis2=-1), params["eqp_output_file"])
+	
+	# ============================================================================
+	# MATRIX SUMMARY: Report diagnostics for key matrices
+	# ============================================================================
+	# sigma_x:  exchange self-energy, shape (nk, nb_sigma, nb_sigma)
+	# hartree:  Hartree matrix elements (may include bands outside sigma window
+	#           if psi_r has more bands than sigma window - see psi_r shape in debug)
+	# H_qp:     quasiparticle Hamiltonian after SCF/diagonalization
+	# ============================================================================
 	if meta.rank == 0:
 		summarize_hermitian_matrix("sigma_x", sigma_x_kbar_ij, print_fn=print0)
-		summarize_hermitian_matrix("hartree", hartree_kbar_ij, print_fn=print0)
+		# Hartree might include bands outside sigma window; report both full and sliced
+		nb_sigma_window = int(b3 - b1)  # Expected sigma window size
+		nb_hartree = hartree_kbar_ij.shape[1]
+		if nb_hartree > nb_sigma_window:
+			print0(f"[hartree] NOTE: matrix has {nb_hartree} bands but sigma window is {nb_sigma_window}")
+			hartree_sigma_only = hartree_kbar_ij[:, :nb_sigma_window, :nb_sigma_window]
+			summarize_hermitian_matrix("hartree (full)", hartree_kbar_ij, print_fn=print0)
+			summarize_hermitian_matrix("hartree (sigma)", hartree_sigma_only, print_fn=print0)
+		else:
+			summarize_hermitian_matrix("hartree", hartree_kbar_ij, print_fn=print0)
 		summarize_hermitian_matrix("H_qp", H_qp_mnk_host, print_fn=print0)
 	# Timing report
 	if jax.process_index() == 0:

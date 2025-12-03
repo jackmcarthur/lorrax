@@ -8,9 +8,16 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from ..common import Meta
 
 
-def write_sigma_to_file(sigma_kij, filename="eqp0.dat", hartree_kij=None):
-	print(f"sigma_kij dtype before writing: {sigma_kij.dtype}")
-	nk, nbands, _ = sigma_kij.shape
+def write_sigma_to_file(sigma_kij_eV, filename="eqp0.dat", hartree_kij_Ry=None):
+	"""Write sigma (eV) and optionally Hartree (Ry) matrix elements to file.
+	
+	Args:
+		sigma_kij_eV: Self-energy matrix elements in eV, shape (nk, nb, nb)
+		filename: Output file path
+		hartree_kij_Ry: Hartree matrix elements in Rydberg, shape (nk, nb, nb)
+	"""
+	print(f"sigma_kij dtype before writing: {sigma_kij_eV.dtype}")
+	nk, nbands, _ = sigma_kij_eV.shape
 
 	# Resolve to absolute path, ensure directory exists, and report destination
 	abs_path = os.path.abspath(filename)
@@ -20,18 +27,20 @@ def write_sigma_to_file(sigma_kij, filename="eqp0.dat", hartree_kij=None):
 	print(f"Writing sigma to: {abs_path}")
 
 	with open(abs_path, "w") as f:
+		# Write header with units
+		f.write("# COHSEX output: sigX in eV, VH in Ry\n")
 		for k in range(nk):
 			f.write(f"\nk-point {k}:\n")
-			f.write("-" * 60 + "\n")
+			f.write("-" * 70 + "\n")
 			for n in range(nbands):
-				real = float(sigma_kij[k, n, n].real)
-				imag = float(sigma_kij[k, n, n].imag)
-				if hartree_kij is not None:
-					hv_re = float(np.real(hartree_kij[k, n, n]))
-					hv_im = float(np.imag(hartree_kij[k, n, n]))
-					f.write(f"n={n:<3} sigX={real:>15.6f} + {imag:>15.6f}i  VH={hv_re:>15.6f} + {hv_im:>15.6f}i\n")
+				real = float(sigma_kij_eV[k, n, n].real)
+				imag = float(sigma_kij_eV[k, n, n].imag)
+				if hartree_kij_Ry is not None:
+					hv_re = float(np.real(hartree_kij_Ry[k, n, n]))
+					hv_im = float(np.imag(hartree_kij_Ry[k, n, n]))
+					f.write(f"n={n:<3} sigX(eV)={real:>12.6f} + {imag:>12.6f}i  VH(Ry)={hv_re:>12.6f} + {hv_im:>12.6f}i\n")
 				else:
-					f.write(f"n={n:<3} {real:>15.6f} + {imag:>15.6f}i\n")
+					f.write(f"n={n:<3} sigX(eV)={real:>12.6f} + {imag:>12.6f}i\n")
 
 
 def write_eqp_table(dft_energies_ev, qp_energies_ev, filename="eqp.dat"):

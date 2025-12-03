@@ -1,0 +1,636 @@
+"""
+JAX implementations of Anderson, CROP, and rCROP acceleration methods.
+
+These methods accelerate fixed-point iterations of the form:
+    x^{(k+1)} = g(x^{(k)}) = x^{(k)} + f(x^{(k)})
+
+where f(x) = 0 at the solution. In the context of GW self-consistency:
+    x  ↔ vec(Σ^{in}_{mnk})     (flattened self-energy)
+    f(x) = Σ^{out}[x] - Σ^{in}[x]  (residual)
+
+All implementations:
+- Work with complex128 arrays (required for GW)
+- Use fixed-size circular history buffers (JIT-compatible)
+- Support early stopping via jax.lax.while_loop
+- Return residual history for convergence analysis
+
+References:
+    Wan & Międlar, "On the Convergence of CROP-Anderson Acceleration Method"
+    Algorithm 2.1 (Anderson), Algorithm 2.2 (CROP), Algorithm 3.1 (CROP-Anderson)
+"""
+
+from __future__ import annotations
+
+import os
+from functools import partial
+from typing import Callable, NamedTuple
+
+# Enable 64-bit precision before importing JAX
+os.environ.setdefault("JAX_ENABLE_X64", "1")
+
+import jax
+import jax.numpy as jnp
+from jax.scipy.linalg import solve_triangular
+
+
+# -----------------------------------------------------------------------------
+# Result containers
+# -----------------------------------------------------------------------------
+
+
+class AccelerationResult(NamedTuple):
+    """Result from an acceleration method."""
+
+    x: jnp.ndarray  # Final iterate
+    residual_norms: jnp.ndarray  # Residual norm at each iteration
+    iterations: int  # Number of iterations performed
+    converged: bool  # Whether tolerance was reached
+
+
+# -----------------------------------------------------------------------------
+# Least-squares solvers
+# -----------------------------------------------------------------------------
+
+
+def _qr_least_squares(F: jnp.ndarray, r: jnp.ndarray, ridge: float = 1e-12) -> jnp.ndarray:
+    """Solve min_γ || r - F γ ||_2 via QR factorization.
+
+    Handles zero columns gracefully by masking out their coefficients.
+
+    Args:
+        F: Matrix of shape (n, m), complex128
+        r: Vector of shape (n,), complex128
+        ridge: Regularization for numerical stability
+
+    Returns:
+        γ: Solution vector of shape (m,)
+    """
+    m = F.shape[1]
+    if m == 0:
+        return jnp.zeros((0,), dtype=F.dtype)
+
+    # Identify valid (non-zero) columns
+    col_norms = jnp.linalg.norm(F, axis=0)
+    valid_mask = col_norms > 1e-14
+
+    Q, R = jnp.linalg.qr(F, mode="reduced")
+    rhs = Q.conj().T @ r
+    if ridge > 0:
+        R = R + ridge * jnp.eye(R.shape[0], dtype=R.dtype)
+    gamma = solve_triangular(R, rhs, lower=False)
+
+    # Zero out coefficients for invalid (zero) columns
+    gamma = jnp.where(valid_mask, gamma, 0.0 + 0.0j)
+    return gamma
+
+
+def _solve_crop_alpha(
+    Fw: jnp.ndarray, filled_cols: jnp.ndarray, m: int
+) -> jnp.ndarray:
+    """Solve for CROP mixing coefficients with sum-to-one constraint (old version).
+
+    Deprecated: use _solve_crop_alpha_v2 instead.
+    """
+
+    def do_zero(_):
+        alpha = jnp.zeros((m + 2,), dtype=Fw.dtype)
+        alpha = alpha.at[m + 1].set(1.0 + 0.0j)
+        return alpha
+
+    def do_solve(_):
+        f_trial = Fw[:, m + 1]
+        F_prev = Fw[:, : m + 1] - f_trial[:, None]
+
+        hist_mask = jnp.arange(m) < filled_cols
+        mask = jnp.concatenate([hist_mask, jnp.array([True])])
+        mask_c = mask.astype(Fw.dtype)
+
+        F_masked = F_prev * mask_c[None, :]
+        Q, R = jnp.linalg.qr(F_masked, mode="reduced")
+        rhs = Q.conj().T @ (-f_trial)
+        R_reg = R + 1e-12 * jnp.eye(R.shape[0], dtype=R.dtype)
+        gamma_full = solve_triangular(R_reg, rhs, lower=False)
+        gamma = gamma_full * mask_c
+
+        alpha_last = (1.0 + 0.0j) - jnp.sum(gamma)
+        return jnp.concatenate([gamma, jnp.array([alpha_last])])
+
+    return jax.lax.cond(filled_cols == 0, do_zero, do_solve, operand=None)
+
+
+def _solve_crop_alpha_v2(Fw: jnp.ndarray, filled_cols: jnp.ndarray) -> jnp.ndarray:
+    """Solve for CROP mixing coefficients with sum-to-one constraint.
+
+    Solves: min_α ||F_w α||_2^2  s.t. Σα_i = 1
+
+    The window Fw has shape (n, m+2) = (n, history_size + 1).
+    Only the first `filled_cols` history columns are valid; rest are zeros.
+    Last column is always the trial residual.
+
+    We convert to affine coordinates centered on the trial vector:
+        α = [γ, 1 - sum(γ)] where γ minimizes ||f_trial + F_valid @ γ||
+
+    Args:
+        Fw: Residual window matrix, shape (n, history_size + 1)
+        filled_cols: Number of valid history columns
+
+    Returns:
+        α: Mixing coefficients summing to 1, shape (history_size + 1,)
+    """
+    ncols = Fw.shape[1]
+    hist_cols = ncols - 1
+
+    # Last column is the trial residual
+    f_trial = Fw[:, -1]
+
+    # History columns (may have zeros for unfilled slots)
+    F_hist = Fw[:, :hist_cols]
+
+    # Identify valid history columns (non-zero norm in original Fw, not the difference)
+    hist_norms = jnp.linalg.norm(F_hist, axis=0)
+    valid_hist = hist_norms > 1e-14  # shape (hist_cols,)
+
+    # Compute differences for valid columns only
+    # F_prev = f_hist - f_trial for valid columns, 0 for invalid
+    F_prev = F_hist - f_trial[:, None]
+    F_prev_masked = jnp.where(valid_hist[None, :], F_prev, 0.0 + 0.0j)
+
+    # Solve via QR: min ||f_trial + F_prev_masked @ γ||
+    # Note: This includes zero columns, but they won't affect the solution
+    Q, R = jnp.linalg.qr(F_prev_masked, mode="reduced")
+    rhs = Q.conj().T @ (-f_trial)
+    R_reg = R + 1e-12 * jnp.eye(R.shape[0], dtype=R.dtype)
+    gamma = solve_triangular(R_reg, rhs, lower=False)
+
+    # Zero out coefficients for invalid columns
+    gamma = jnp.where(valid_hist, gamma, 0.0 + 0.0j)
+
+    # Convert back: α = [γ; 1 - sum(γ)]
+    alpha_last = (1.0 + 0.0j) - jnp.sum(gamma)
+    return jnp.concatenate([gamma, jnp.array([alpha_last])])
+
+
+# -----------------------------------------------------------------------------
+# Anderson Acceleration (Algorithm 2.1)
+# -----------------------------------------------------------------------------
+
+
+@partial(jax.jit, static_argnums=(0, 2, 3))
+def _anderson_core(
+    residual_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    x0: jnp.ndarray,
+    m: int,
+    maxit: int,
+    tol: float,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Core Anderson acceleration loop.
+
+    Anderson stores differences ΔX and ΔF, then solves:
+        min_γ ||f^{(k)} - ΔF γ||_2
+
+    and updates:
+        x^{(k+1)} = x^{(k)} + f^{(k)} - (ΔX + ΔF) γ
+    """
+    n = x0.size
+    dtype = x0.dtype
+
+    x = x0
+    f = residual_fn(x)
+
+    # Circular buffers for differences
+    dX = jnp.zeros((n, m), dtype=dtype)
+    dF = jnp.zeros((n, m), dtype=dtype)
+    head = jnp.int32(0)
+    filled = jnp.int32(0)
+
+    res0 = jnp.linalg.norm(f)
+    res_buf = jnp.zeros((maxit + 1,), dtype=res0.dtype).at[0].set(res0)
+    done0 = res0 <= tol
+    it0 = jnp.int32(0)
+
+    def cond(state):
+        _, _, _, _, _, _, res_buf, done, it = state
+        return jnp.logical_and(it < maxit, jnp.logical_not(done))
+
+    def body(state):
+        x, f, dX, dF, head, filled, res_buf, done, it = state
+
+        # Roll buffers to get chronological order
+        # oldest_pos = (head - filled) % m, roll by -oldest_pos to put oldest at column 0
+        oldest_pos = (head - filled) % m
+        dX_ord = jnp.roll(dX, shift=-oldest_pos, axis=1)
+        dF_ord = jnp.roll(dF, shift=-oldest_pos, axis=1)
+
+        # Mask unfilled columns (first `filled` columns are valid after rolling)
+        mask_cols = (jnp.arange(m) < filled)[None, :]
+        dX_use = jnp.where(mask_cols, dX_ord, 0.0 + 0.0j)
+        dF_use = jnp.where(mask_cols, dF_ord, 0.0 + 0.0j)
+
+        # Solve least-squares: min ||f - dF γ||
+        gamma = _qr_least_squares(dF_use, f)
+
+        # Anderson step: x_new = x + f - (dX + dF) γ
+        step = f - (dX_use + dF_use) @ gamma
+        x_new = x + step
+        f_new = residual_fn(x_new)
+
+        # Update history buffers
+        dX = dX.at[:, head].set(x_new - x)
+        dF = dF.at[:, head].set(f_new - f)
+        head = (head + 1) % m
+        filled = jnp.minimum(filled + 1, m)
+
+        res = jnp.linalg.norm(f_new)
+        it1 = it + 1
+        res_buf = res_buf.at[it1].set(res)
+        done1 = res <= tol
+
+        return (x_new, f_new, dX, dF, head, filled, res_buf, done1, it1)
+
+    x, f, dX, dF, head, filled, res_buf, done, it = jax.lax.while_loop(
+        cond, body, (x, f, dX, dF, head, filled, res_buf, done0, it0)
+    )
+    return x, res_buf, it, done
+
+
+def anderson_acceleration(
+    residual_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    x0: jnp.ndarray,
+    m: int = 5,
+    maxit: int = 100,
+    tol: float = 1e-10,
+) -> AccelerationResult:
+    """Anderson Acceleration (Pulay mixing / DIIS).
+
+    Solves x = g(x) where g(x) = x + f(x), i.e., finds f(x) = 0.
+
+    Args:
+        residual_fn: Function computing f(x) = g(x) - x
+        x0: Initial guess (flattened, complex128)
+        m: History depth (number of previous iterates to use)
+        maxit: Maximum iterations
+        tol: Convergence tolerance on ||f(x)||
+
+    Returns:
+        AccelerationResult with final x, residual history, iteration count
+    """
+    x, res_buf, it, done = _anderson_core(residual_fn, x0, m, maxit, tol)
+    return AccelerationResult(
+        x=x,
+        residual_norms=res_buf[: int(it) + 1],
+        iterations=int(it),
+        converged=bool(done),
+    )
+
+
+# -----------------------------------------------------------------------------
+# CROP Algorithm (Algorithm 2.2)
+# -----------------------------------------------------------------------------
+
+
+@partial(jax.jit, static_argnums=(0, 2, 3, 5))
+def _crop_core(
+    residual_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    x0: jnp.ndarray,
+    m: int,
+    maxit: int,
+    tol: float,
+    use_real_residual: bool,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Core CROP/rCROP loop.
+
+    CROP stores iterates X and control residuals F, then builds window:
+        X_w = [x^{k-m+1}, ..., x^k, x̃^{k+1}]
+        F_w = [f^{k-m+1}, ..., f^k, f̃^{k+1}]
+
+    Window size is m+1: m history slots (including current) + 1 trial.
+    The current (x, f) is stored in history at position `head` BEFORE the iteration.
+
+    Solves min ||F_w α||_2  s.t. Σα = 1, then:
+        x^{k+1} = X_w α
+        f^{k+1} = F_w α  (CROP) or f(x^{k+1})  (rCROP)
+    """
+    n = x0.size
+    dtype = x0.dtype
+
+    x = x0
+    f = residual_fn(x)
+
+    # History buffer: stores [x^{(k-m+1)}, ..., x^{(k)}] as a circular buffer
+    # Size m: CROP(m) uses at most m previous iterates + 1 trial = m+1 window cols
+    Xhist = jnp.zeros((n, m), dtype=dtype)
+    Fhist = jnp.zeros((n, m), dtype=dtype)
+
+    # Store initial (x0, f0) in history
+    Xhist = Xhist.at[:, 0].set(x)
+    Fhist = Fhist.at[:, 0].set(f)
+    head = jnp.int32(1 % m)  # Next write position (handles m=1 case)
+    filled = jnp.int32(1)  # One entry filled
+
+    res0 = jnp.linalg.norm(f)
+    res_buf = jnp.zeros((maxit + 1,), dtype=res0.dtype).at[0].set(res0)
+    done0 = res0 <= tol
+    it0 = jnp.int32(0)
+
+    def cond(state):
+        _, _, _, _, _, _, res_buf, done, it = state
+        return jnp.logical_and(it < maxit, jnp.logical_not(done))
+
+    def body(state):
+        x, f, Xhist, Fhist, head, filled, res_buf, done, it = state
+
+        # Trial step: x̃ = x + f, f̃ = f(x̃)
+        x_trial = x + f
+        f_trial = residual_fn(x_trial)
+
+        # Roll history to chronological order
+        # After rolling, columns 0..filled-1 contain oldest to newest
+        oldest_pos = (head - filled) % m
+        X_ord = jnp.roll(Xhist, shift=-oldest_pos, axis=1)
+        F_ord = jnp.roll(Fhist, shift=-oldest_pos, axis=1)
+
+        # Mask unfilled columns
+        mask_cols = (jnp.arange(m) < filled)[None, :]
+        X_ord = jnp.where(mask_cols, X_ord, 0.0 + 0.0j)
+        F_ord = jnp.where(mask_cols, F_ord, 0.0 + 0.0j)
+
+        # Build window: [history (m cols) | trial (1 col)] = m+1 cols max
+        # Note: current (x, f) is already in history as the most recent entry
+        Xw = jnp.concatenate([X_ord, x_trial[:, None]], axis=1)
+        Fw = jnp.concatenate([F_ord, f_trial[:, None]], axis=1)
+
+        # Solve for mixing coefficients with sum-to-one constraint
+        alpha = _solve_crop_alpha_v2(Fw, filled)
+
+        # Update iterate
+        x_new = Xw @ alpha
+
+        # Update residual: control (CROP) or real (rCROP)
+        f_new = jax.lax.cond(
+            use_real_residual,
+            lambda _: residual_fn(x_new),
+            lambda _: Fw @ alpha,
+            operand=None,
+        )
+
+        # Store new iterate in history (circular buffer)
+        Xhist = Xhist.at[:, head].set(x_new)
+        Fhist = Fhist.at[:, head].set(f_new)
+        head = (head + 1) % m
+        filled = jnp.minimum(filled + 1, m)
+
+        res = jnp.linalg.norm(f_new)
+        it1 = it + 1
+        res_buf = res_buf.at[it1].set(res)
+        done1 = res <= tol
+
+        return (x_new, f_new, Xhist, Fhist, head, filled, res_buf, done1, it1)
+
+    x, f, Xhist, Fhist, head, filled, res_buf, done, it = jax.lax.while_loop(
+        cond, body, (x, f, Xhist, Fhist, head, filled, res_buf, done0, it0)
+    )
+    return x, res_buf, it, done
+
+
+def crop(
+    residual_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    x0: jnp.ndarray,
+    m: int = 5,
+    maxit: int = 100,
+    tol: float = 1e-10,
+) -> AccelerationResult:
+    """CROP algorithm (Conjugate Residual with Optimal trial vectors).
+
+    Uses control residuals (linear combination) which may not equal true residuals.
+    More efficient than rCROP but may break down for highly nonlinear problems.
+
+    Args:
+        residual_fn: Function computing f(x) = g(x) - x
+        x0: Initial guess (flattened, complex128)
+        m: History depth
+        maxit: Maximum iterations
+        tol: Convergence tolerance
+
+    Returns:
+        AccelerationResult
+    """
+    x, res_buf, it, done = _crop_core(residual_fn, x0, m, maxit, tol, False)
+    return AccelerationResult(
+        x=x,
+        residual_norms=res_buf[: int(it) + 1],
+        iterations=int(it),
+        converged=bool(done),
+    )
+
+
+def rcrop(
+    residual_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    x0: jnp.ndarray,
+    m: int = 5,
+    maxit: int = 100,
+    tol: float = 1e-10,
+) -> AccelerationResult:
+    """rCROP algorithm (CROP with real residuals).
+
+    Recomputes f(x_new) at each step instead of using linear combination.
+    More robust for nonlinear problems but requires extra function evaluation.
+
+    Args:
+        residual_fn: Function computing f(x) = g(x) - x
+        x0: Initial guess (flattened, complex128)
+        m: History depth
+        maxit: Maximum iterations
+        tol: Convergence tolerance
+
+    Returns:
+        AccelerationResult
+    """
+    x, res_buf, it, done = _crop_core(residual_fn, x0, m, maxit, tol, True)
+    return AccelerationResult(
+        x=x,
+        residual_norms=res_buf[: int(it) + 1],
+        iterations=int(it),
+        converged=bool(done),
+    )
+
+
+# -----------------------------------------------------------------------------
+# CROP-Anderson (Algorithm 3.1)
+# -----------------------------------------------------------------------------
+
+
+@partial(jax.jit, static_argnums=(0, 2, 3, 5))
+def _crop_anderson_core(
+    residual_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    x0: jnp.ndarray,
+    m: int,
+    maxit: int,
+    tol: float,
+    use_real_residual: bool,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Core CROP-Anderson loop.
+
+    CROP-Anderson is like CROP but checks convergence at the trial step and
+    returns the trial vector x̃ when converged (equivalent to Anderson).
+    """
+    n = x0.size
+    dtype = x0.dtype
+
+    x = x0
+    f = residual_fn(x)
+
+    Xhist = jnp.zeros((n, m), dtype=dtype)
+    Fhist = jnp.zeros((n, m), dtype=dtype)
+    head = jnp.int32(0)
+    filled = jnp.int32(0)
+
+    res0 = jnp.linalg.norm(f)
+    res_buf = jnp.zeros((maxit + 1,), dtype=res0.dtype).at[0].set(res0)
+    done0 = res0 <= tol
+    it0 = jnp.int32(0)
+
+    # Store trial for output
+    x_trial_out = x + f
+
+    def cond(state):
+        _, _, _, _, _, _, _, res_buf, done, it = state
+        return jnp.logical_and(it < maxit, jnp.logical_not(done))
+
+    def body(state):
+        x, f, x_trial_out, Xhist, Fhist, head, filled, res_buf, done, it = state
+
+        # Trial step
+        x_trial = x + f
+        f_trial = residual_fn(x_trial)
+        res_trial = jnp.linalg.norm(f_trial)
+
+        it1 = it + 1
+        res_buf = res_buf.at[it1].set(res_trial)
+
+        # Check if trial converged
+        trial_done = res_trial <= tol
+
+        # If trial converged, we're done; otherwise do CROP mixing
+        def do_crop(_):
+            oldest_pos = (head - filled) % m
+            X_ord = jnp.roll(Xhist, shift=-oldest_pos, axis=1)
+            F_ord = jnp.roll(Fhist, shift=-oldest_pos, axis=1)
+
+            mask_cols = (jnp.arange(m) < filled)[None, :]
+            X_ord = jnp.where(mask_cols, X_ord, 0.0 + 0.0j)
+            F_ord = jnp.where(mask_cols, F_ord, 0.0 + 0.0j)
+
+            Xw = jnp.zeros((n, m + 2), dtype=dtype)
+            Fw = jnp.zeros((n, m + 2), dtype=dtype)
+            Xw = Xw.at[:, :m].set(X_ord)
+            Fw = Fw.at[:, :m].set(F_ord)
+            Xw = Xw.at[:, m].set(x)
+            Fw = Fw.at[:, m].set(f)
+            Xw = Xw.at[:, m + 1].set(x_trial)
+            Fw = Fw.at[:, m + 1].set(f_trial)
+
+            alpha = _solve_crop_alpha(Fw, filled, m)
+            x_new = Xw @ alpha
+            f_new = jax.lax.cond(
+                use_real_residual,
+                lambda _: residual_fn(x_new),
+                lambda _: Fw @ alpha,
+                operand=None,
+            )
+            return x_new, f_new
+
+        def skip_crop(_):
+            return x_trial, f_trial
+
+        x_new, f_new = jax.lax.cond(trial_done, skip_crop, do_crop, operand=None)
+
+        # Update history
+        Xhist_new = Xhist.at[:, head].set(x_new)
+        Fhist_new = Fhist.at[:, head].set(f_new)
+        head_new = (head + 1) % m
+        filled_new = jnp.minimum(filled + 1, m)
+
+        return (
+            x_new,
+            f_new,
+            x_trial,
+            Xhist_new,
+            Fhist_new,
+            head_new,
+            filled_new,
+            res_buf,
+            trial_done,
+            it1,
+        )
+
+    x, f, x_trial_out, Xhist, Fhist, head, filled, res_buf, done, it = jax.lax.while_loop(
+        cond,
+        body,
+        (x, f, x_trial_out, Xhist, Fhist, head, filled, res_buf, done0, it0),
+    )
+
+    # CROP-Anderson returns the trial vector when converged
+    x_out = jax.lax.cond(done, lambda _: x_trial_out, lambda _: x, operand=None)
+    return x_out, res_buf, it, done
+
+
+def crop_anderson(
+    residual_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    x0: jnp.ndarray,
+    m: int = 5,
+    maxit: int = 100,
+    tol: float = 1e-10,
+) -> AccelerationResult:
+    """CROP-Anderson algorithm.
+
+    Like CROP but checks convergence at the trial step (equivalent to Anderson
+    when there's no truncation). Uses control residuals.
+
+    Args:
+        residual_fn: Function computing f(x) = g(x) - x
+        x0: Initial guess
+        m: History depth
+        maxit: Maximum iterations
+        tol: Convergence tolerance
+
+    Returns:
+        AccelerationResult
+    """
+    x, res_buf, it, done = _crop_anderson_core(residual_fn, x0, m, maxit, tol, False)
+    return AccelerationResult(
+        x=x,
+        residual_norms=res_buf[: int(it) + 1],
+        iterations=int(it),
+        converged=bool(done),
+    )
+
+
+def rcrop_anderson(
+    residual_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    x0: jnp.ndarray,
+    m: int = 5,
+    maxit: int = 100,
+    tol: float = 1e-10,
+) -> AccelerationResult:
+    """rCROP-Anderson algorithm.
+
+    CROP-Anderson with real residuals (recomputes f(x) at each step).
+
+    Args:
+        residual_fn: Function computing f(x) = g(x) - x
+        x0: Initial guess
+        m: History depth
+        maxit: Maximum iterations
+        tol: Convergence tolerance
+
+    Returns:
+        AccelerationResult
+    """
+    x, res_buf, it, done = _crop_anderson_core(residual_fn, x0, m, maxit, tol, True)
+    return AccelerationResult(
+        x=x,
+        residual_norms=res_buf[: int(it) + 1],
+        iterations=int(it),
+        converged=bool(done),
+    )
+
