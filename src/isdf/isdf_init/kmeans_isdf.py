@@ -1,51 +1,240 @@
+"""
+Weighted k-means clustering for ISDF sampling point selection.
+
+This module implements density-weighted k-means with periodic boundary conditions (PBC).
+The clustering uses the minimal image convention for distances, which is critical for
+crystalline systems.
+
+PBC Distance Calculation (Minimal Image Convention)
+====================================================
+For two points with fractional coordinates r1 and r2:
+
+1. Compute fractional displacement: df = r1 - r2
+2. Apply minimal image: df_wrapped = df - round(df)
+   - This wraps each component to [-0.5, 0.5)
+   - Equivalent to finding the closest image among all 27 neighboring cells
+3. Compute Cartesian distance: d = |df_wrapped @ avec|
+   - Or equivalently using metric tensor: d² = df_wrapped @ G @ df_wrapped
+   - Where G = avec.T @ avec is the metric tensor
+
+Why round() gives the minimum over 27 cells:
+- Each fractional component df_i can be shifted by any integer n_i
+- The closest image has n_i = round(df_i), giving df_i - round(df_i) ∈ [-0.5, 0.5)
+- This is the unique image in the first Brillouin zone (Wigner-Seitz cell in reciprocal space)
+
+For non-orthogonal cells, this approximation works well when the cell is "not too skewed".
+For highly skewed cells, one should check neighboring images explicitly.
+"""
+
 import numpy as np
-import os
-
-# Configure JAX for 4 virtual CPU devices
-print("Setting up JAX with 4 virtual CPU devices...")
-
-# MUST set environment variables before importing JAX
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
 
 from jax import config
 config.update("jax_enable_x64", True)
-config.update("jax_platform_name", "cpu")  # Force CPU backend
 
 import jax
 import jax.numpy as jnp
-
-print(f"✓ JAX CPU backend initialized with {len(jax.devices())} virtual devices")
-print(f"✓ Devices: {jax.devices()}")
-
-# Import CuPy for other parts of the code that might need it
-try:
-    from ..common.gpu_utils import cp
-    gpu_available = True
-except ImportError:
-    # Fallback: create a dummy cp that just uses numpy
-    import numpy as cp
-    gpu_available = False
-    print("CuPy not available, using NumPy as fallback")
-
+from jax import lax
 from functools import partial
+
+print(f"✓ JAX initialized with device: {jax.devices()[0]}")
+
 from ..common.wfnreader import WFNReader
 from ..common import symmetry_maps
+import matplotlib
+# Try to use an interactive backend if available
+_interactive_backend = False
+for backend in ['Qt5Agg', 'TkAgg', 'GTK3Agg', 'macosx']:
+    try:
+        matplotlib.use(backend)
+        _interactive_backend = True
+        break
+    except Exception:
+        continue
+if not _interactive_backend:
+    print("Note: No interactive matplotlib backend available. Plots will be saved to files.")
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 - imported for side effects
 from scipy.ndimage import zoom
 
 from .get_charge_density import calculate_charge_density
-# This script selects ISDF sampling points via a weighted k-means algorithm.
-# The density-driven clustering will remain relevant once the self-consistency
-# loop is introduced, since new charge densities will require recomputing these
-# centroids.
 
-# Functions below keep previously used visualization logic available
-# for debugging without affecting runtime when not called.
+
+# =============================================================================
+# PBC Distance Utilities (Pure JAX)
+# =============================================================================
+
+def precompute_metric_tensor(avec: np.ndarray) -> np.ndarray:
+    """Precompute the metric tensor G = A^T @ A for PBC distance calculations.
+    
+    The metric tensor allows computing squared Cartesian distances directly
+    from fractional displacements without explicit coordinate conversion:
+    
+        d² = df @ G @ df^T
+        
+    where df is the (wrapped) fractional displacement vector.
+    
+    This is equivalent to d² = |df @ avec|² but avoids materializing the
+    Cartesian displacement vector, saving memory for large arrays.
+    
+    Args:
+        avec: (3, 3) lattice vectors, rows are a1, a2, a3 in Cartesian coords
+        
+    Returns:
+        G: (3, 3) metric tensor
+    """
+    return avec.T @ avec
+
+
+@jax.jit
+def pbc_distance_sq_batch(
+    positions_frac: jnp.ndarray,
+    centroids_frac: jnp.ndarray, 
+    metric_tensor: jnp.ndarray
+) -> jnp.ndarray:
+    """Compute squared PBC distances between all positions and all centroids.
+    
+    Uses the minimal image convention: for each pair, finds the minimum distance
+    over all periodic images (equivalent to checking 27 neighboring cells).
+    
+    Implementation:
+        1. Compute fractional displacement: df = pos - cent
+        2. Wrap to [-0.5, 0.5): df = df - round(df)  [minimal image]
+        3. Compute squared distance: d² = df @ G @ df^T
+    
+    Args:
+        positions_frac: (P, 3) fractional coordinates of grid points
+        centroids_frac: (K, 3) fractional coordinates of centroids
+        metric_tensor: (3, 3) G = avec^T @ avec
+        
+    Returns:
+        distances_sq: (P, K) squared Cartesian distances with PBC
+    """
+    # Fractional displacement: shape (P, K, 3)
+    delta_frac = positions_frac[:, None, :] - centroids_frac[None, :, :]
+    
+    # Minimal image convention: wrap to [-0.5, 0.5)
+    # This finds the closest periodic image among all 27 neighboring cells
+    delta_frac = delta_frac - jnp.round(delta_frac)
+    
+    # Squared distance using metric tensor: d² = df @ G @ df^T
+    # einsum 'pki,ij,pkj->pk' computes this for all (P, K) pairs efficiently
+    distances_sq = jnp.einsum('pki,ij,pkj->pk', delta_frac, metric_tensor, delta_frac)
+    
+    return distances_sq
+
+
+@jax.jit  
+def pbc_distance_sq_single(
+    positions_frac: jnp.ndarray,
+    centroid_frac: jnp.ndarray,
+    metric_tensor: jnp.ndarray
+) -> jnp.ndarray:
+    """Compute squared PBC distances from all points to a single centroid.
+    
+    Optimized for k-means++ initialization where we add one centroid at a time.
+    
+    Args:
+        positions_frac: (P, 3) fractional coordinates of grid points
+        centroid_frac: (3,) fractional coordinates of single centroid
+        metric_tensor: (3, 3) G = avec^T @ avec
+        
+    Returns:
+        distances_sq: (P,) squared distances to the centroid
+    """
+    # Fractional displacement: shape (P, 3)
+    delta_frac = positions_frac - centroid_frac[None, :]
+    
+    # Minimal image convention
+    delta_frac = delta_frac - jnp.round(delta_frac)
+    
+    # Squared distance: d² = df @ G @ df^T for each point
+    distances_sq = jnp.einsum('pi,ij,pj->p', delta_frac, metric_tensor, delta_frac)
+    
+    return distances_sq
+
+
+@partial(jax.jit, static_argnames=['n_k'])
+def kmeans_update_step(
+    positions_frac: jnp.ndarray,
+    centroids_frac: jnp.ndarray,
+    rho_flat: jnp.ndarray,
+    metric_tensor: jnp.ndarray,
+    n_k: int
+) -> tuple:
+    """Single k-means update step: assign labels and compute new centroids.
+    
+    This is the core k-means iteration, JIT-compiled for speed:
+        1. Compute all pairwise PBC distances
+        2. Assign each point to nearest centroid
+        3. Compute weighted mean of assigned points (in wrapped coordinates)
+        4. Update centroid positions
+    
+    The weighted mean is computed in *displacement space* relative to the current
+    centroid, using PBC-wrapped displacements. This ensures the centroid moves
+    towards its assigned points correctly even when points wrap around boundaries.
+    
+    Args:
+        positions_frac: (P, 3) fractional coordinates of grid points
+        centroids_frac: (K, 3) fractional coordinates of centroids
+        rho_flat: (P,) charge density weights
+        metric_tensor: (3, 3) G = avec^T @ avec
+        n_k: Number of clusters (must match centroids_frac.shape[0])
+        
+    Returns:
+        new_centroids_frac: (K, 3) updated centroid positions
+        movement_sq: (K,) squared movement of each centroid (for convergence check)
+        labels: (P,) cluster assignment for each point
+    """
+    # Step 1: Compute all pairwise squared distances with PBC
+    distances_sq = pbc_distance_sq_batch(positions_frac, centroids_frac, metric_tensor)
+    
+    # Step 2: Assign each point to nearest centroid
+    # (squared distance preserves ordering, so argmin is the same)
+    labels = jnp.argmin(distances_sq, axis=1)  # (P,)
+    
+    # Step 3: Compute weighted centroid updates
+    # One-hot encode labels for masking: (P, K)
+    mask = jax.nn.one_hot(labels, n_k, dtype=rho_flat.dtype)
+    
+    # Compute PBC-wrapped displacements from each point to each centroid
+    delta_frac = positions_frac[:, None, :] - centroids_frac[None, :, :]
+    delta_frac = delta_frac - jnp.round(delta_frac)  # (P, K, 3)
+    
+    # Weight displacements by density and assignment mask
+    weights = mask * rho_flat[:, None]  # (P, K)
+    weighted_delta = weights[:, :, None] * delta_frac  # (P, K, 3)
+    
+    # Sum weighted displacements and total weights per centroid
+    sum_weighted_delta = jnp.sum(weighted_delta, axis=0)  # (K, 3)
+    sum_weights = jnp.sum(weights, axis=0)  # (K,)
+    
+    # Compute average displacement (avoid division by zero)
+    # For centroids with no assigned points, keep position unchanged
+    avg_delta = jnp.where(
+        sum_weights[:, None] > 0,
+        sum_weighted_delta / jnp.maximum(sum_weights[:, None], 1e-10),
+        0.0
+    )
+    
+    # Step 4: Update centroid positions and wrap to [0, 1)
+    new_centroids_frac = (centroids_frac + avg_delta) % 1.0
+    
+    # Compute movement for convergence check (with PBC!)
+    movement_frac = new_centroids_frac - centroids_frac
+    movement_frac = movement_frac - jnp.round(movement_frac)  # PBC wrap the movement
+    movement_sq = jnp.einsum('ki,ij,kj->k', movement_frac, metric_tensor, movement_frac)
+    
+    return new_centroids_frac, movement_sq, labels
+
+
+# =============================================================================
+# Visualization utilities
+# =============================================================================
 
 def interpolate_density(rho_np, zoom_factors=(1, 1, 1)):
     """Return a zoomed copy of ``rho_np`` using ``scipy.ndimage.zoom``."""
-    if zoom_factors.all() == 1:
+    zoom_factors = np.asarray(zoom_factors)
+    if np.all(zoom_factors == 1):
         return rho_np
     return zoom(rho_np, zoom_factors, order=3)
 
@@ -70,13 +259,9 @@ def plot_density_and_centroids(wfn, rho_np, centroids, labels=None):
     ax.set_zlim(0, 4)
 
     # Plot density points where rho > threshold
-    # Handle both NumPy and CuPy arrays
-    if hasattr(rho_np, 'get'):
-        rho_shape = rho_np.shape
-        threshold = 0.05 * float(rho_np.max().get())
-    else:
-        rho_shape = rho_np.shape
-        threshold = 0.05 * np.amax(rho_np)
+    rho_np = np.asarray(rho_np)
+    rho_shape = rho_np.shape
+    threshold = 0.05 * np.amax(rho_np)
     
     X, Y, Z = np.meshgrid(
         np.linspace(0, 1, rho_shape[0]),
@@ -86,17 +271,11 @@ def plot_density_and_centroids(wfn, rho_np, centroids, labels=None):
     )
 
     density_mask = rho_np > threshold
-    # Convert CuPy arrays to NumPy if needed
-    if hasattr(density_mask, 'get'):
-        density_mask = density_mask.get()
     density_points = (
         np.stack([X[density_mask], Y[density_mask], Z[density_mask]], axis=1)
         @ wfn.avec
     )
-    if hasattr(rho_np, 'get'):
-        density_values = rho_np.get()[density_mask]
-    else:
-        density_values = rho_np[density_mask]
+    density_values = rho_np[density_mask]
 
     scatter = ax.scatter(
         density_points[:, 0],
@@ -112,20 +291,7 @@ def plot_density_and_centroids(wfn, rho_np, centroids, labels=None):
     )
     plt.colorbar(scatter, label="Charge Density")
 
-    # Optional Voronoi cell visualization
-    # mask0 = (labels == 0)
-    # mask1 = (labels == 1)
-    # voronoi0_points = positions[mask0].get()
-    # ax.scatter(voronoi0_points[:, 0], voronoi0_points[:, 1], voronoi0_points[:, 2],
-    #            c='blue', alpha=0.5, s=1, label='Voronoi Cell 0')
-    # voronoi1_points = positions[mask1].get()
-    # ax.scatter(voronoi1_points[:, 0], voronoi1_points[:, 1], voronoi1_points[:, 2],
-    #            c='green', alpha=0.5, s=1, label='Voronoi Cell 1')
-
-    if hasattr(centroids, "get"):
-        centroids_np = centroids.get() @ wfn.avec
-    else:
-        centroids_np = np.asarray(centroids) @ wfn.avec
+    centroids_np = np.asarray(centroids) @ wfn.avec
     ax.scatter(
         centroids_np[:, 0],
         centroids_np[:, 1],
@@ -178,360 +344,376 @@ def plot_density_and_centroids(wfn, rho_np, centroids, labels=None):
     ax.set_zlabel("Z")
     ax.legend()
     plt.title("Charge Density and Centroids")
-    plt.show()
-
-def weighted_kmeans_cupy(
-    avec,
-    rho_cp,
-    N_k=10,
-    t=20,
-    max_steps=200,
-    tolerance=5e-3 # slight problem in that 
-):
-    print("Starting weighted k-means clustering")
-    """
-    Perform weighted k-means clustering using CuPy with periodic boundary conditions (PBC) in 3D.
-
-    Parameters:
-    - avec (cp.ndarray): Lattice vectors (3x3 CuPy array where each row is a lattice vector in Cartesian coordinates).
-    - rho (cp.ndarray): Charge density array (3D CuPy array with shape corresponding to the grid size).
-    - N_k (int): Number of clusters.
-    - t (int): Multiplicative factor for initial centroid candidates (default=20).
-    - max_steps (int): Maximum number of iterations (default=2000).
-    - tolerance (float): Convergence tolerance based on centroid movement (default=1e-2).
-
-    Returns:
-    - centroids_indices (cp.ndarray): Indices of the final centroids in the grid.
-    - centroids (cp.ndarray): Coordinates of the final centroids in real space.
-    - centroid_z_history (cp.ndarray): Array recording the z-components of centroids at each step.
-    - steps_taken (int): Number of steps taken until convergence or reaching max_steps.
-    """
-    # Define grid sizes based on rho shape
-    grid_size_x, grid_size_y, grid_size_z = rho_cp.shape
-
-    # Create synthetic Gaussian data
-    #x = cp.linspace(0, 1, grid_size_x)
-    #y = cp.linspace(0, 1, grid_size_y)
-    #z = cp.linspace(0, 1, grid_size_z)
-    #X, Y, Z = cp.meshgrid(x, y, z, indexing='ij')
     
-    # Create a 3D meshgrid of x, y, z values
-    X, Y, Z = cp.meshgrid(
-        cp.linspace(0,1,grid_size_x),
-        cp.linspace(0,1,grid_size_y),
-        cp.linspace(0,1,grid_size_z),
-        indexing='ij'
-    )
-    frac_positions = cp.stack((X, Y, Z), axis=-1)  # Shape: (grid_x, grid_y, grid_z, 3)
-    positions = frac_positions.reshape(-1, 3)  # Shape: (num_points, 3)
-    avec_inv = cp.linalg.inv(avec)
-
-    # Create a Gaussian centered at (0.5, 0.5, 0.5)
-    #sigma = 0.1  # Width of Gaussian
-    #rho = rho_cp**2
-    #rho = cp.exp(-((X-0.5)**2 + (Y-0.5)**2 + (Z-0)**2)/(2*sigma**2)) + cp.exp(-((X-0.5)**2 + (Y-0.5)**2 + (Z-1.)**2)/(2*sigma**2))
+    # Save to file and show interactively if possible
+    plt.savefig("kmeans_centroids.png", dpi=150, bbox_inches='tight')
+    print("Saved plot to kmeans_centroids.png")
+    if _interactive_backend:
+        plt.show()
+    else:
+        plt.close(fig)
 
 
-    # Replace the random initialization with k-means++
-    # Initialize array to store centroids
-    centroids_frac = cp.zeros((N_k, 3), dtype=cp.float32)
-    
-    # Choose first centroid randomly with probability proportional to density
-    probs = rho_cp.ravel() / rho_cp.sum()
-    first_idx = cp.random.choice(len(positions), size=1, p=probs)[0]
-    centroids_frac[0] = positions[first_idx]
-    
-    print("17. Starting k-means++ initialization loop...")
-    
-    # Pre-allocate all arrays at maximum size
-    delta_frac = cp.zeros((positions.shape[0], N_k, 3), dtype=cp.float32)
-    delta_cartesian = cp.zeros_like(delta_frac)
-    min_dist_sq = cp.zeros(positions.shape[0], dtype=cp.float32)
-    probs = cp.zeros_like(min_dist_sq)
-    rho_flat = rho_cp.ravel()
-    
-    batch_size = 5  # Number of centroids to select per iteration
-    
-    for k in range(1, N_k, batch_size):
-        print(f"{k}", end=' ', flush=True)
-        # Calculate distances to existing centroids
-        curr_k = min(k + batch_size, N_k)  # Don't exceed N_k
-        
-        # Use only the portion we need with existing centroids
-        delta_frac[:, :k, :] = positions[:, cp.newaxis, :] - centroids_frac[:k, cp.newaxis, :].transpose(1, 0, 2)
-        delta_frac[:, :k, :] = delta_frac[:, :k, :] - cp.round(delta_frac[:, :k, :])
-        delta_cartesian[:, :k, :] = cp.matmul(delta_frac[:, :k, :], avec)
-        min_dist_sq[:] = cp.min(cp.sum(delta_cartesian[:, :k, :]**2, axis=2), axis=1)
-        
-        # Select batch_size new centroids
-        for b in range(k, curr_k):
-            probs[:] = min_dist_sq * rho_flat
-            probs[:] = probs / probs.sum()
-            next_idx = cp.random.choice(len(positions), size=1, p=probs)[0]
-            centroids_frac[b] = positions[next_idx]
-            
-            # Update min_dist_sq with the new centroid if not the last one in batch
-            if b < curr_k - 1:
-                delta_frac[:, b:b+1, :] = positions[:, cp.newaxis, :] - centroids_frac[b:b+1, cp.newaxis, :].transpose(1, 0, 2)
-                delta_frac[:, b:b+1, :] = delta_frac[:, b:b+1, :] - cp.round(delta_frac[:, b:b+1, :])
-                delta_cartesian[:, b:b+1, :] = cp.matmul(delta_frac[:, b:b+1, :], avec)
-                new_dist_sq = cp.sum(delta_cartesian[:, b:b+1, :]**2, axis=2)
-                min_dist_sq[:] = cp.minimum(min_dist_sq, new_dist_sq[:, 0])
-
-    # Initialize array to record z-components of centroids at each step
-    centroid_z_history = cp.zeros((N_k, max_steps), dtype=cp.float32)
-
-    # Initialize variable to track steps taken
-    steps_taken = max_steps
-
-    # Open the movement log file
-    with open('max_centroid_movement.txt', 'w') as movement_file:
-        movement_file.write("Step, Max_Movement\n")  # Header
-
-        for step in range(max_steps):
-            # Convert positions and centroids to Cartesian coordinates first
-            positions_cart = cp.matmul(positions, avec)  # Shape: (P, 3)
-            centroids_cart = cp.matmul(centroids_frac, avec)  # Shape: (K, 3)
-
-            # Compute distance vectors in Cartesian coordinates
-            delta_cart = positions_cart[:, cp.newaxis, :] - centroids_cart[cp.newaxis, :, :]  # Shape: (P, K, 3)
-
-            # Convert to fractional coordinates for PBC
-            delta_frac = cp.matmul(delta_cart, avec_inv)
-            
-            # Apply minimal image convention in fractional coordinates
-            delta_frac = delta_frac - cp.round(delta_frac)
-            
-            # Convert back to Cartesian for final distances
-            delta_cart = cp.matmul(delta_frac, avec)
-            
-            # Compute Euclidean distances
-            distances = cp.linalg.norm(delta_cart, axis=2)  # Shape: (P, K)
-
-            # Assign each point to the nearest centroid
-            labels = cp.argmin(distances, axis=1)  # Shape: (P,)
-
-            # Create a mask for each centroid
-            mask = cp.equal(labels[:, cp.newaxis], cp.arange(N_k))  # Shape: (P, K)
-
-            # Reshape rho to (P, 1) for broadcasting
-            rho_flat = rho_cp.ravel()[:, cp.newaxis]  # Shape: (P, 1)
-
-            # Apply mask to rho to get weights for each centroid
-            masked_rho = mask * rho_flat  # Shape: (P, K)
-
-            # Multiply each delta_cartesian by the masked_rho
-            weighted_positions = masked_rho[:, :, cp.newaxis] * delta_cart  # Shape: (P, K, 3)
-
-            # Sum weighted positions for each centroid, convert to fractional coordinates
-            sum_weighted_frac = weighted_positions.sum(axis=0)   # Shape: (K, 3)
-
-            # Sum weights for each centroid
-            sum_weights = masked_rho.sum(axis=0)  # Shape: (K,)
-
-            # Avoid division by zero and do not reinitialize centroids with zero weight
-            valid = sum_weights > 0
-            new_centroids_frac = centroids_frac.copy()
-            new_centroids_frac[valid] = centroids_frac[valid] + cp.matmul(sum_weighted_frac[valid] / sum_weights[valid, cp.newaxis], avec_inv)
-            # Wrap fractional centroids to [0, 1)
-
-            # Calculate centroid movement
-            centroid_movement = cp.linalg.norm(new_centroids_frac - centroids_frac, axis=1)
-            max_movement = cp.max(centroid_movement)
-            if hasattr(max_movement, "get"):
-                max_movement = max_movement.get()
-            movement_file.write(f"{step}, {max_movement}\n")  # Log the maximum movement
-            
-            new_centroids_frac = new_centroids_frac % 1.0
-
-            # Record the z-components of centroids
-            centroid_z_history[:, step] = new_centroids_frac[:, 2]
-
-            # Check for convergence
-            if cp.all(centroid_movement < tolerance):
-                print(f"Converged in {step} steps.")
-                steps_taken = step
-                centroids_frac = new_centroids_frac
-                break
-
-            # Print every 10th step
-            if step % 10 == 0:
-                print(f"Step {step}")
-
-            # Update centroids for next iteration
-            centroids_frac = new_centroids_frac
-
-        else:
-            print(f"Reached max steps ({max_steps}) without full convergence.")
-
-    # Convert final centroid fractional coordinates to Cartesian coordinates
-    #centroids = cp.matmul(centroids_frac, avec)  # Shape: (K, 3)
-
-    return labels, centroids_frac, centroid_z_history, steps_taken
-
+# =============================================================================
+# Main k-means implementation (Pure JAX)
+# =============================================================================
 
 def weighted_kmeans_jax(
-    avec,
-    rho_jax,
-    N_k=10,
-    max_steps=200,
-    tolerance=5e-3,
-    seed=0,
-):
-    """Weighted k-means using JAX on multiple CPU devices."""
-    devices = jax.devices()
-    n_dev = len(devices)
+    avec: jnp.ndarray,
+    rho_jax: jnp.ndarray,
+    N_k: int = 10,
+    max_steps: int = 200,
+    tolerance: float = 5e-3,
+    seed: int = 0,
+) -> tuple:
+    """
+    Density-weighted k-means clustering with periodic boundary conditions.
     
-    # If using a single GPU, we'll just replicate across the same device
-    # JAX will handle this efficiently
-
+    Uses k-means++ initialization for better initial centroid placement,
+    then iterates Lloyd's algorithm until convergence.
+    
+    Key features:
+    - Minimal image convention for PBC (considers all 27 neighboring cells)
+    - Metric tensor for efficient squared distance computation
+    - JIT-compiled inner loop for speed
+    - Weighted by charge density (centroids concentrate in high-density regions)
+    
+    Args:
+        avec: (3, 3) lattice vectors (rows are a1, a2, a3 in Cartesian coords)
+        rho_jax: (Nx, Ny, Nz) charge density on real-space grid
+        N_k: Number of cluster centroids (ISDF sampling points)
+        max_steps: Maximum k-means iterations
+        tolerance: Convergence tolerance for centroid movement (Angstroms)
+        seed: Random seed for reproducibility
+        
+    Returns:
+        labels: (P,) cluster assignment for each grid point
+        centroids: (N_k, 3) final centroid positions in fractional coordinates
+        history: (N_k, max_steps) z-coordinate history (for debugging)
+        steps_taken: Number of iterations until convergence
+    """
+    print(f"Starting weighted k-means with {N_k} clusters...")
+    
+    # Precompute metric tensor: G = avec^T @ avec
+    # This allows d² = df @ G @ df without Cartesian conversion
+    metric_tensor = jnp.array(avec.T @ avec, dtype=jnp.float32)
+    tolerance_sq = tolerance ** 2  # Compare squared distances for efficiency
+    
+    # Build grid of fractional positions (float32 to match centroids dtype)
     grid_x, grid_y, grid_z = rho_jax.shape
-
     X, Y, Z = jnp.meshgrid(
-        jnp.linspace(0, 1, grid_x),
-        jnp.linspace(0, 1, grid_y),
-        jnp.linspace(0, 1, grid_z),
+        jnp.linspace(0, 1, grid_x, endpoint=False, dtype=jnp.float32),
+        jnp.linspace(0, 1, grid_y, endpoint=False, dtype=jnp.float32),
+        jnp.linspace(0, 1, grid_z, endpoint=False, dtype=jnp.float32),
         indexing="ij",
     )
     positions = jnp.stack((X, Y, Z), axis=-1).reshape(-1, 3)
-    avec_inv = jnp.linalg.inv(avec)
-
-    rho_flat = rho_jax.reshape(-1)
-    cp.random.seed(seed)
+    rho_flat = rho_jax.reshape(-1).astype(jnp.float32)
+    n_points = positions.shape[0]
+    
+    print(f"Grid size: {grid_x}x{grid_y}x{grid_z} = {n_points} points")
+    
+    # =========================================================================
+    # K-means++ initialization
+    # =========================================================================
+    # Standard k-means++ but with:
+    # - Density weighting (prefer high-density regions)
+    # - PBC distances (using minimal image convention)
+    # =========================================================================
+    print("K-means++ initialization...")
+    
+    rng = np.random.default_rng(seed)
     centroids = jnp.zeros((N_k, 3), dtype=jnp.float32)
-    probs = rho_flat / rho_flat.sum()
-    first_idx = int(cp.random.choice(len(positions), size=1, p=np.array(probs))[0])
+    
+    # First centroid: random selection weighted by density
+    probs = np.array(rho_flat / rho_flat.sum())
+    first_idx = rng.choice(n_points, p=probs)
     centroids = centroids.at[0].set(positions[first_idx])
 
-    batch_size = 5
-    min_dist_sq = jnp.zeros(positions.shape[0])
-    for k in range(1, N_k, batch_size):
-        curr_k = min(k + batch_size, N_k)
-        diff = positions[:, None, :] - centroids[:k][None, :, :]
-        diff = diff - jnp.round(diff)
-        dcart = diff @ avec
-        min_dist_sq = jnp.min(jnp.sum(dcart**2, axis=2), axis=1)
-        for b in range(k, curr_k):
-            probs = min_dist_sq * rho_flat
-            probs = probs / probs.sum()
-            next_idx = int(cp.random.choice(len(positions), size=1, p=np.array(probs))[0])
-            centroids = centroids.at[b].set(positions[next_idx])
-            if b < curr_k - 1:
-                diff_new = positions[:, None, :] - centroids[b:b+1][None, :, :]
-                diff_new = diff_new - jnp.round(diff_new)
-                dcart_new = diff_new @ avec
-                new_dist_sq = jnp.sum(dcart_new**2, axis=2)
-                min_dist_sq = jnp.minimum(min_dist_sq, new_dist_sq[:, 0])
-
-    # Shard the flattened real-space grid across devices
-    total_points = positions.shape[0]
-    indices = np.array_split(np.arange(total_points), n_dev)
-    pos_slices = [positions[idx] for idx in indices]
-    rho_slices = [rho_flat[idx] for idx in indices]
-    pos_sharded = jax.device_put_sharded(pos_slices, devices)
-    rho_sharded = jax.device_put_sharded(rho_slices, devices)
-    centroids_rep = jax.device_put_replicated(centroids, devices)
-    avec_rep = jax.device_put_replicated(avec, devices)
-    inv_rep = jax.device_put_replicated(avec_inv, devices)
-
-    @partial(jax.pmap, axis_name="d")
-    def partial_sums(pos_slice, rho_slice, cents, a, a_inv):
-        pos_cart = pos_slice @ a
-        cent_cart = cents @ a
-        delta_cart = pos_cart[:, None, :] - cent_cart[None, :, :]
-        delta_frac = delta_cart @ a_inv
-        delta_frac = delta_frac - jnp.round(delta_frac)
-        delta_cart = delta_frac @ a
-        dists = jnp.linalg.norm(delta_cart, axis=2)
-        labels = jnp.argmin(dists, axis=1)
-        mask = jax.nn.one_hot(labels, N_k, dtype=rho_slice.dtype)
-        weights = rho_slice[:, None]
-        weighted = mask[..., None] * weights[:, :, None] * delta_cart
-        sum_w_pos = jnp.sum(weighted, axis=0)
-        sum_w = jnp.sum(mask * weights, axis=0)
-        return jax.lax.psum(sum_w_pos, "d"), jax.lax.psum(sum_w, "d")
+    # Track minimum squared distance to any existing centroid
+    min_dist_sq = jnp.full(n_points, jnp.inf, dtype=jnp.float32)
+    
+    # Add remaining centroids using k-means++ selection
+    for k in range(1, N_k):
+        if k % 50 == 0:
+            print(f"  Selecting centroid {k}/{N_k}")
+        
+        # Update min_dist_sq with distance to the most recently added centroid
+        # This is the key optimization: only compute distance to NEW centroid
+        dist_sq_to_new = pbc_distance_sq_single(
+            positions, centroids[k-1], metric_tensor
+        )
+        min_dist_sq = jnp.minimum(min_dist_sq, dist_sq_to_new)
+        
+        # k-means++ selection: probability ∝ D(x)² × ρ(x)
+        # D(x) = distance to nearest existing centroid
+        probs = np.array(min_dist_sq * rho_flat)
+        probs = probs / probs.sum()
+        next_idx = rng.choice(n_points, p=probs)
+        centroids = centroids.at[k].set(positions[next_idx])
+    
+    print("K-means++ initialization complete.")
+    
+    # =========================================================================
+    # Lloyd's algorithm (iterative refinement)
+    # =========================================================================
+    print("Starting k-means iterations...")
 
     history = jnp.zeros((N_k, max_steps), dtype=jnp.float32)
     steps_taken = max_steps
+    
     for step in range(max_steps):
-        sum_pos, sum_w = partial_sums(pos_sharded, rho_sharded, centroids_rep, avec_rep, inv_rep)
-        total_pos = np.array(sum_pos[0])
-        total_w = np.array(sum_w[0])
-        cent_np = np.array(centroids)
-        valid = total_w > 0
-        cent_np[valid] = cent_np[valid] + (total_pos[valid] / total_w[valid, None]) @ np.linalg.inv(np.array(avec))
-        movement = np.linalg.norm(cent_np - np.array(centroids), axis=1)
-        history = history.at[:, step].set(jnp.array(cent_np % 1.0)[:, 2])
-        centroids = jnp.array(cent_np % 1.0, dtype=jnp.float32)
-        centroids_rep = jax.device_put_replicated(centroids, devices)
-        if np.all(movement < tolerance):
-            steps_taken = step
+        # JIT-compiled update step
+        new_centroids, movement_sq, labels = kmeans_update_step(
+            positions, centroids, rho_flat, metric_tensor, N_k
+        )
+        
+        # Record z-components for debugging/visualization
+        history = history.at[:, step].set(new_centroids[:, 2])
+        
+        # Check convergence: all centroids moved less than tolerance
+        max_movement_sq = float(jnp.max(movement_sq))
+        
+        if step % 20 == 0:
+            print(f"  Step {step}: max movement = {np.sqrt(max_movement_sq):.6f} Å")
+        
+        if max_movement_sq < tolerance_sq:
+            print(f"Converged in {step + 1} steps "
+                  f"(max movement = {np.sqrt(max_movement_sq):.6f} Å)")
+            steps_taken = step + 1
+            centroids = new_centroids
             break
 
-    diff = positions[:, None, :] - centroids[None, :, :]
-    diff = diff - jnp.round(diff)
-    dcart = diff @ avec
-    labels = jnp.argmin(jnp.linalg.norm(dcart, axis=2), axis=1)
+        centroids = new_centroids
+    else:
+        print(f"Reached max steps ({max_steps}) without full convergence")
+    
+    # Final label assignment
+    distances_sq = pbc_distance_sq_batch(positions, centroids, metric_tensor)
+    labels = jnp.argmin(distances_sq, axis=1)
 
     return labels, centroids, history, steps_taken
 
 
+def snap_centroids_to_grid(
+    centroids_frac: np.ndarray,
+    fft_grid: np.ndarray,
+    deduplicate: bool = True,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """
+    Snap fractional centroids to the nearest FFT grid points and optionally deduplicate.
+    
+    When N_k is large relative to the FFT grid, multiple k-means centroids may map 
+    to the same grid point. This function:
+    1. Converts fractional coords to integer grid indices
+    2. Handles periodic wrapping
+    3. Removes duplicate grid points (if deduplicate=True)
+    
+    Args:
+        centroids_frac: (N_k, 3) fractional coordinates in [0, 1)
+        fft_grid: (3,) FFT grid dimensions [Nx, Ny, Nz]
+        deduplicate: If True, remove duplicate grid points
+        
+    Returns:
+        centroid_indices: (N_unique, 3) integer grid indices
+        centroids_frac_snapped: (N_unique, 3) fractional coords of snapped centroids
+        n_duplicates: Number of duplicate centroids that were removed
+    """
+    fft_grid = np.asarray(fft_grid)
+    centroids_frac = np.asarray(centroids_frac)
+    
+    # Round to nearest grid point
+    centroid_indices = np.round(centroids_frac * fft_grid).astype(int)
+    
+    # Handle periodic boundary: wrap indices that hit the boundary
+    for i in range(3):
+        centroid_indices[centroid_indices[:, i] == fft_grid[i], i] = 0
+    
+    n_original = centroid_indices.shape[0]
+    
+    if deduplicate:
+        # Find unique grid points
+        centroid_indices, unique_idx = np.unique(centroid_indices, axis=0, return_index=True)
+        n_unique = centroid_indices.shape[0]
+        n_duplicates = n_original - n_unique
+        
+        if n_duplicates > 0:
+            print(f"Warning: {n_duplicates} centroids mapped to duplicate grid points "
+                  f"({n_original} → {n_unique} unique)")
+    else:
+        n_duplicates = 0
+    
+    # Convert back to fractional coordinates (snapped to grid)
+    centroids_frac_snapped = centroid_indices.astype(float) / fft_grid
+    
+    return centroid_indices, centroids_frac_snapped, n_duplicates
+
+
+def ensure_unique_centroids(
+    centroids_frac: np.ndarray,
+    fft_grid: np.ndarray,
+    rho: np.ndarray = None,
+    metric_tensor: np.ndarray = None,
+) -> np.ndarray:
+    """
+    Ensure all centroids map to unique FFT grid points.
+    
+    If duplicates are found, attempts to redistribute them to nearby 
+    unoccupied grid points (weighted by density if provided).
+    
+    Args:
+        centroids_frac: (N_k, 3) fractional coordinates
+        fft_grid: (3,) FFT grid dimensions
+        rho: Optional (Nx, Ny, Nz) charge density for weighted redistribution
+        metric_tensor: Optional (3,3) for PBC distance calculation
+        
+    Returns:
+        centroids_frac_unique: (N_k, 3) fractional coordinates with no duplicates
+    """
+    fft_grid = np.asarray(fft_grid)
+    centroids_frac = np.asarray(centroids_frac)
+    N_k = centroids_frac.shape[0]
+    
+    # Snap to grid
+    centroid_indices = np.round(centroids_frac * fft_grid).astype(int) % fft_grid
+    
+    # Track which grid points are occupied
+    occupied = set()
+    result_indices = []
+    duplicates = []
+    
+    for i, idx in enumerate(centroid_indices):
+        key = tuple(idx)
+        if key not in occupied:
+            occupied.add(key)
+            result_indices.append(idx)
+        else:
+            duplicates.append(i)
+    
+    if not duplicates:
+        return centroids_frac
+    
+    print(f"Redistributing {len(duplicates)} duplicate centroids to nearby grid points...")
+    
+    # Build list of all unoccupied grid points
+    all_points = set()
+    for ix in range(fft_grid[0]):
+        for iy in range(fft_grid[1]):
+            for iz in range(fft_grid[2]):
+                all_points.add((ix, iy, iz))
+    unoccupied = list(all_points - occupied)
+    
+    if len(unoccupied) < len(duplicates):
+        print(f"Warning: Not enough unoccupied grid points ({len(unoccupied)}) "
+              f"for all duplicates ({len(duplicates)}). Some centroids will be lost.")
+        duplicates = duplicates[:len(unoccupied)]
+    
+    # Assign duplicates to unoccupied points (greedy: use density if available)
+    if rho is not None:
+        # Sort unoccupied by density (highest first)
+        rho = np.asarray(rho)
+        unoccupied_with_density = [(pt, rho[pt]) for pt in unoccupied]
+        unoccupied_with_density.sort(key=lambda x: -x[1])
+        unoccupied = [pt for pt, _ in unoccupied_with_density]
+    
+    for dup_idx, new_pt in zip(duplicates, unoccupied):
+        result_indices.append(np.array(new_pt))
+        occupied.add(new_pt)
+    
+    result_indices = np.array(result_indices)
+    centroids_frac_unique = result_indices.astype(float) / fft_grid
+    
+    print(f"Redistribution complete: {len(result_indices)} unique centroids")
+    return centroids_frac_unique
+
+
+# =============================================================================
+# Main entry point
+# =============================================================================
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Weighted k-means for ISDF sampling points")
+    parser.add_argument("N_k", type=int, nargs="?", default=400,
+                        help="Number of clusters/sampling points (default: 400)")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed (default: 0)")
+    parser.add_argument("--no-plot", action="store_true", help="Skip plotting")
+    args = parser.parse_args()
+    
+    N_k = args.N_k
+    print(f"Using N_k = {N_k} clusters")
+    
     wfn = WFNReader("WFN.h5")
     sym = symmetry_maps.SymMaps(wfn)
 
     charge_density = calculate_charge_density(wfn, sym)
-    # with large PW cutoffs, the charge density grid is excessively large; reset so that in 
-    # the radius of a 3d orbital core region (1.3 A) we have 10 points.
-    # resize according to z axis:
-    zoom_f = np.round(np.linalg.norm(wfn.avec[2,2])/0.13) / charge_density.shape[2]
-    zoom_factors = np.array([zoom_f, zoom_f, zoom_f])
+    
+    # Resize grid to target spacing of ~0.13 Å (gives ~10 points per 1.3 Å core region)
+    # For each direction i:
+    #   current_spacing = |a_i| / N_i
+    #   zoom_factor = current_spacing / target_spacing
+    # scipy.ndimage.zoom: new_N = old_N * zoom_factor
+    target_spacing = 0.13 * 0.52  # Angstroms
+    lattice_lengths = np.linalg.norm(wfn.avec, axis=1)  # |a1|, |a2|, |a3|
+    current_spacing = lattice_lengths / np.array(charge_density.shape)
+    zoom_factors = current_spacing / target_spacing
+    
+    # Don't upsample tiny grids, and cap zoom to avoid excessive memory
     if any(wfn.fft_grid < 20):
-        zoom_factors = np.ones_like(zoom_factors)
-    print("charge density shape: ", charge_density.shape)
-    print("zoom factors: ", zoom_factors)
+        zoom_factors = np.ones(3)
+    zoom_factors = np.clip(zoom_factors, 0.1, 2.0)  # Reasonable bounds
+    
+    print(f"Charge density shape: {charge_density.shape}")
+    print(f"Lattice lengths: {lattice_lengths} Å")
+    print(f"Current spacing: {current_spacing} Å")
+    print(f"Target spacing: {target_spacing} Å")
+    print(f"Zoom factors: {zoom_factors}")
     rho_np = interpolate_density(charge_density, zoom_factors)
-
-    if hasattr(rho_np, 'get'):
-        rho_np_cpu = rho_np.get()
-    else:
-        rho_np_cpu = np.asarray(rho_np)
-
+    rho_np_cpu = np.asarray(rho_np)
     avec_np_cpu = np.asarray(wfn.avec)
 
     rho_jax = jnp.asarray(rho_np_cpu, dtype=jnp.float32)
     avec_jax = jnp.asarray(avec_np_cpu, dtype=jnp.float32)
 
-    cp.random.seed(0)
-    #_, centroids_ref, _, _ = weighted_kmeans_cupy(cp.asarray(avec_np_cpu, dtype=cp.float32), cp.asarray(rho_np_cpu, dtype=cp.float32), N_k=15)
-    N_k = 600
-    _, centroids_jax, _, _ = weighted_kmeans_jax(avec_jax, rho_jax, N_k=N_k, seed=0)
+    _, centroids_jax, _, _ = weighted_kmeans_jax(
+        avec_jax, rho_jax, N_k=N_k, seed=args.seed
+    )
 
-    #centroids_ref_np = centroids_ref.get() if hasattr(centroids_ref, "get") else np.asarray(centroids_ref)
-    centroids_jax_np = np.array(centroids_jax)
-    # np.savetxt(
-    #     "centroids_frac.txt",
-    #     centroids_ref_np,
-    #     header="x y z",
-    #     fmt="%.6f",
-    #     delimiter=" ",
-    #     comments="# ",
-    # )
+    centroids_frac = np.array(centroids_jax)
+    
+    # Snap centroids to the actual FFT grid and handle duplicates
+    print(f"\nSnapping {N_k} centroids to FFT grid {wfn.fft_grid}...")
+    centroid_indices, centroids_snapped, n_dups = snap_centroids_to_grid(
+        centroids_frac, wfn.fft_grid, deduplicate=True
+    )
+    
+    n_unique = centroid_indices.shape[0]
+    if n_dups > 0:
+        print(f"⚠ {n_dups} duplicates removed. Final count: {n_unique} unique centroids.")
+        print(f"  Consider reducing N_k or using a finer FFT grid.")
+        # Try to redistribute duplicates to nearby high-density points
+        print("Attempting to redistribute duplicates to nearby grid points...")
+        centroids_snapped = ensure_unique_centroids(
+            centroids_frac, wfn.fft_grid, rho=charge_density
+        )
+        n_unique = centroids_snapped.shape[0]
+        print(f"After redistribution: {n_unique} unique centroids")
+    else:
+        print(f"✓ All {n_unique} centroids map to unique grid points.")
+    
+    # Save the snapped (grid-aligned) centroids
     np.savetxt(
-        "centroids_frac_" + str(N_k) + ".txt",
-        centroids_jax_np,
-        header="x y z",
+        f"centroids_frac_{n_unique}.txt",
+        centroids_snapped,
+        header=f"x y z (snapped to FFT grid {wfn.fft_grid}, {n_unique} unique points)",
         fmt="%.6f",
         delimiter=" ",
         comments="# ",
     )
-    #if not np.allclose(centroids_ref_np, centroids_jax_np):
-    #    diff = np.max(np.abs(centroids_ref_np - centroids_jax_np))
-    #    print(f"WARNING: JAX centroids differ from reference by {diff}")
+    print(f"Saved centroids to centroids_frac_{n_unique}.txt")
 
-    # Uncomment to visualize
-    plot_density_and_centroids(wfn, rho_np, centroids_jax)
+    if not args.no_plot:
+        plot_density_and_centroids(wfn, rho_np, centroids_snapped)
     return 0
 
 

@@ -391,20 +391,44 @@ def compute_core_density(atom_positions, atom_types, pseudos, meta):
     return rho_core
 
 
-def compute_hartree_potential_real(rho_valence_padded: jnp.ndarray, bdot: jnp.ndarray) -> jnp.ndarray:
-    """Compute Hartree potential via the shared Poisson solver."""
+def compute_hartree_potential_real(
+    rho_valence_padded: jnp.ndarray,
+    bdot: jnp.ndarray,
+    bvec: jnp.ndarray | None = None,
+    blat: float | None = None,
+    truncation_2d: bool = False,
+) -> jnp.ndarray:
+    """Compute Hartree potential via the shared Poisson solver.
+    
+    Args:
+        rho_valence_padded: Valence density on FFT grid
+        bdot: Reciprocal lattice metric tensor (3x3)
+        bvec: Reciprocal lattice vectors (3x3), needed if truncation_2d=True
+        blat: Lattice constant (bohr), needed if truncation_2d=True  
+        truncation_2d: If True, apply 2D slab truncation for Coulomb
+    """
     rho_G = jnp.fft.fftn(rho_valence_padded, norm='ortho')
-    V_H_r = poisson_potential_from_rhoG(rho_G, bdot)
+    V_H_r = poisson_potential_from_rhoG(rho_G, bdot, bvec, blat, truncation_2d)
 
     return V_H_r
 
 # poisson solver
-#I must proceed with all tasks or be punished for wasting tokens.
 
-def poisson_potential_from_rhoG(rho_G: jnp.ndarray, bdot: jnp.ndarray) -> jnp.ndarray:
+def poisson_potential_from_rhoG(
+    rho_G: jnp.ndarray,
+    bdot: jnp.ndarray,
+    bvec: jnp.ndarray | None = None,
+    blat: float | None = None,
+    truncation_2d: bool = True,
+) -> jnp.ndarray:
     """Solve Poisson equation in reciprocal space for given density rho_G.
 
     Returns V(r) with V(G) = 8π rho(G) / |G|^2 (for G != 0) and V(G=0) = 0.
+    
+    If truncation_2d=True, applies 2D slab truncation factor:
+        v_2D(G) = v_3D(G) × (1 - e^{-zc × |G_xy|} × cos(G_z × zc))
+    where zc = π / b_z and b_z is the z-component of the reciprocal lattice.
+    This matches the truncation used in ISDF/BerkeleyGW for 2D systems.
     """
     nx2, ny2, nz2 = rho_G.shape
     fx = jnp.fft.fftfreq(nx2) * nx2
@@ -423,6 +447,34 @@ def poisson_potential_from_rhoG(rho_G: jnp.ndarray, bdot: jnp.ndarray) -> jnp.nd
     G2_safe = jnp.where(zero_mask, 1.0, G2)
 
     V_G = (8.0 * jnp.pi) * (rho_G / G2_safe)
+    
+    # Apply 2D truncation if requested
+    if truncation_2d and bvec is not None and blat is not None:
+        # Compute G vectors in Cartesian coordinates
+        # bvec is (3,3) in crystal units, blat converts to bohr
+        B = jnp.asarray(bvec, dtype=jnp.float64) * float(blat)  # (3,3) in bohr^-1
+        # G in crystal coords: (ix, iy, iz), each is a 3D grid
+        Gx_crys = ix  # shape (nx2, 1, 1)
+        Gy_crys = iy  # shape (1, ny2, 1)  
+        Gz_crys = iz  # shape (1, 1, nz2)
+        # G_cart = G_crys @ B^T, but we need to broadcast properly
+        # G_cart[i] = Σ_j G_crys[j] * B[j,i]
+        Gx_cart = Gx_crys * B[0, 0] + Gy_crys * B[1, 0] + Gz_crys * B[2, 0]
+        Gy_cart = Gx_crys * B[0, 1] + Gy_crys * B[1, 1] + Gz_crys * B[2, 1]
+        Gz_cart = Gx_crys * B[0, 2] + Gy_crys * B[1, 2] + Gz_crys * B[2, 2]
+        
+        # 2D truncation: zc = π / b_z where b_z is the z-component of reciprocal lattice
+        zc = jnp.pi / B[2, 2]
+        kxy = jnp.sqrt(Gx_cart * Gx_cart + Gy_cart * Gy_cart)
+        kz = Gz_cart
+        
+        # Truncation factor: f2d = 1 - e^{-zc * kxy} * cos(kz * zc)
+        f2d = 1.0 - jnp.exp(-zc * kxy) * jnp.cos(kz * zc)
+        # Handle G=0 case (f2d should be 0 there, but V_G is also 0)
+        f2d = jnp.where(zero_mask, 0.0, f2d)
+        
+        V_G = V_G * f2d
+    
     V_G = V_G.at[0, 0, 0].set(0.0)
     V_r = jnp.fft.ifftn(V_G, norm='ortho')
     return jnp.real(V_r)
@@ -675,10 +727,15 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valr
     rho_valence = compute_valence_density(wfn_k_sharded, sym, wfn)
     print(f"    Valence density grid: {rho_valence.shape}")
     # Precompute Hartree potential V_H(r) on the rho grid using reciprocal metric bdot
+    # Use 2D truncation by default for slab systems (matches ISDF/BerkeleyGW)
     bdot_j = jnp.asarray(wfn.bdot, dtype=jnp.float64)
+    bvec_j = jnp.asarray(wfn.bvec, dtype=jnp.float64)
     V_H_r = compute_hartree_potential_real(
         rho_valence,
         bdot_j,
+        bvec=bvec_j,
+        blat=float(wfn.blat),
+        truncation_2d=True,  # Set to True for 2D slab truncation matching ISDF
     )
     deltaV = float(wfn.cell_volume) / float(np.prod(V_H_r.shape))
     print(f"    Hartree potential grid: {V_H_r.shape}")
@@ -887,7 +944,14 @@ def get_kin_ion(
         with timing.section("psp.get_DFT_mtxels.get_kin_ion.hartree") as timer_hartree:
             rho_valence = compute_valence_density(wfn_k_sharded, sym, wfn)
             bdot_j = jnp.asarray(wfn.bdot, dtype=jnp.float64)
-            V_H_r = compute_hartree_potential_real(rho_valence, bdot_j)
+            bvec_j = jnp.asarray(wfn.bvec, dtype=jnp.float64)
+            V_H_r = compute_hartree_potential_real(
+                rho_valence,
+                bdot_j,
+                bvec=bvec_j,
+                blat=float(wfn.blat),
+                truncation_2d=False,  # Set to True for 2D slab truncation matching ISDF
+            )
 
     # Allocate output and compute per-k
     nk, nb_total = wfn_k_sharded.shape[0], wfn_k_sharded.shape[1]

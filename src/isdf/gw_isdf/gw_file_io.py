@@ -8,16 +8,17 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from ..common import Meta
 
 
-def write_sigma_to_file(sigma_kij_eV, filename="eqp0.dat", hartree_kij_Ry=None):
-	"""Write sigma (eV) and optionally Hartree (Ry) matrix elements to file.
+def write_sigma_to_file(sigma_sx_kij_eV, filename="eqp0.dat", sigma_coh_kij_eV=None, hartree_kij_eV=None):
+	"""Write COHSEX self-energy components to file.
 	
 	Args:
-		sigma_kij_eV: Self-energy matrix elements in eV, shape (nk, nb, nb)
+		sigma_sx_kij_eV: Screened exchange self-energy in eV, shape (nk, nb, nb)
 		filename: Output file path
-		hartree_kij_Ry: Hartree matrix elements in Rydberg, shape (nk, nb, nb)
+		sigma_coh_kij_eV: Coulomb hole self-energy in eV, shape (nk, nb, nb)
+		hartree_kij_eV: Hartree matrix elements in eV, shape (nk, nb, nb)
 	"""
-	print(f"sigma_kij dtype before writing: {sigma_kij_eV.dtype}")
-	nk, nbands, _ = sigma_kij_eV.shape
+	print(f"sigma_sx_kij dtype before writing: {sigma_sx_kij_eV.dtype}")
+	nk, nbands, _ = sigma_sx_kij_eV.shape
 
 	# Resolve to absolute path, ensure directory exists, and report destination
 	abs_path = os.path.abspath(filename)
@@ -28,19 +29,45 @@ def write_sigma_to_file(sigma_kij_eV, filename="eqp0.dat", hartree_kij_Ry=None):
 
 	with open(abs_path, "w") as f:
 		# Write header with units
-		f.write("# COHSEX output: sigX in eV, VH in Ry\n")
+		f.write("# COHSEX output: Sigma_SX (screened exchange), Sigma_COH (Coulomb hole), VH (Hartree) - all in eV\n")
+		f.write("# Sigma_COHSEX = Sigma_SX + Sigma_COH\n")
 		for k in range(nk):
 			f.write(f"\nk-point {k}:\n")
-			f.write("-" * 70 + "\n")
+			f.write("-" * 100 + "\n")
 			for n in range(nbands):
-				real = float(sigma_kij_eV[k, n, n].real)
-				imag = float(sigma_kij_eV[k, n, n].imag)
-				if hartree_kij_Ry is not None:
-					hv_re = float(np.real(hartree_kij_Ry[k, n, n]))
-					hv_im = float(np.imag(hartree_kij_Ry[k, n, n]))
-					f.write(f"n={n:<3} sigX(eV)={real:>12.6f} + {imag:>12.6f}i  VH(Ry)={hv_re:>12.6f} + {hv_im:>12.6f}i\n")
+				sx_re = float(sigma_sx_kij_eV[k, n, n].real)
+				sx_im = float(sigma_sx_kij_eV[k, n, n].imag)
+				line = f"n={n:<3} sigSX={sx_re:>12.6f}"
+				if abs(sx_im) > 1e-10:
+					line += f"+{sx_im:>10.6f}i"
 				else:
-					f.write(f"n={n:<3} sigX(eV)={real:>12.6f} + {imag:>12.6f}i\n")
+					line += "            "
+				
+				if sigma_coh_kij_eV is not None:
+					coh_re = float(np.real(sigma_coh_kij_eV[k, n, n]))
+					coh_im = float(np.imag(sigma_coh_kij_eV[k, n, n]))
+					line += f"  sigCOH={coh_re:>12.6f}"
+					if abs(coh_im) > 1e-10:
+						line += f"+{coh_im:>10.6f}i"
+					else:
+						line += "            "
+					# Total COHSEX
+					total_re = sx_re + coh_re
+					total_im = sx_im + coh_im
+					line += f"  sigTOT={total_re:>12.6f}"
+					if abs(total_im) > 1e-10:
+						line += f"+{total_im:>10.6f}i"
+					else:
+						line += "            "
+				
+				if hartree_kij_eV is not None:
+					hv_re = float(np.real(hartree_kij_eV[k, n, n]))
+					hv_im = float(np.imag(hartree_kij_eV[k, n, n]))
+					line += f"  VH={hv_re:>12.6f}"
+					if abs(hv_im) > 1e-10:
+						line += f"+{hv_im:>10.6f}i"
+				
+				f.write(line + "\n")
 
 
 def write_eqp_table(dft_energies_ev, qp_energies_ev, filename="eqp.dat"):

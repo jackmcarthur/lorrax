@@ -831,12 +831,35 @@ def get_zeta_q_and_v_q_mu_nu(
 
 # ================= JAX-sharded Sigma pipeline =================
 
-def get_G_mu_nu_jax(psi_vTX, psi_vY):
-	"""Pure: psi_* (nk, nb, nspinor, n_rmu) -> G_k (nk, nspinor, n_rmu, nspinor, n_rmu).
+def get_G_mu_nu_jax(psi_vTX, psi_vY, Gij_static):
+	"""Pure: psi_* (nk, nb, nspinor, n_rmu), Gij_static (nk,nb,nb) -> G_k (nk, nspinor, n_rmu, nspinor, n_rmu).
+	
+	Computes G_μν(k) = Σ_ij ψ*_ik(r_μ) G_ijk ψ_jk(r_ν)
+	
 	Zero-comm contraction when left is X-sharded on rmu and right is Y-sharded on rmu.
-	Einsum order: kxmb,kbyn->kxmyn (spin indices x,y kept separate from rmu m,n)."""
-	# Contract over band m only. x y rmu, s,t spinor. believe this is optimal
-	G_k = jnp.einsum('ksxm,kmty->ksxty', psi_vTX, jnp.conj(psi_vY), optimize=True)
+	Gij_static should be initialized as zeros with diagonal 0:nelec set to 1.0+0.j
+	for the static COHSEX Green's function (identity on occupied states).
+	"""
+		
+	# G[k,s,x,t,y] = Σ_ij ψ*_ik(s,x) G_ijk ψ_jk(t,y)
+	# psi_vTX: (k, spinor, rmu, band) = 'ksxi'
+	# Gij: (k, band_i, band_j) = 'kij'  
+	# conj(psi_vY): (k, band, spinor, rmu) = 'kjty'
+	G_k = jnp.einsum('ksxi,kij,kjty->ksxty', psi_vTX, Gij_static, jnp.conj(psi_vY), optimize=True)
+	return G_k
+
+def get_G_mu_nu_RI(psi_vTX, psi_vY):
+	"""Pure: psi_* (nk, nb, nspinor, n_rmu) -> G_k (nk, nspinor, n_rmu, nspinor, n_rmu).
+	
+	Computes G_μν(k) = Σ_n ψ*_nk(r_μ) ψ_nk(r_ν) for ALL bands (no occupation weighting).
+	
+	This is the "resolution of identity" style sum used for the Coulomb hole term.
+	Zero-comm contraction when left is X-sharded on rmu and right is Y-sharded on rmu.
+	"""
+	# G[k,s,x,t,y] = Σ_n ψ*_nk(s,x) ψ_nk(t,y)
+	# psi_vTX: (k, spinor, rmu, band) = 'ksxn'
+	# conj(psi_vY): (k, band, spinor, rmu) = 'knty'
+	G_k = jnp.einsum('ksxn,knty->ksxty', psi_vTX, jnp.conj(psi_vY), optimize=True)
 	return G_k
 
 def get_G_R_jax(G_k, nkx, nky, nkz):
@@ -846,7 +869,7 @@ def get_G_R_jax(G_k, nkx, nky, nkz):
 	G_k = jax.lax.with_sharding_constraint(G_k, P(None, 'x', None, 'y', None, None, None))
 	return jnp.fft.ifftn(G_k, axes=(4,5,6), norm='ortho')
 
-def get_sigma_x_mu_nu_jax(G_R, V_mu_nu, nk_tot):
+def get_sigma_static_mu_nu_jax(G_R, V_mu_nu, nk_tot):
 	"""Pure: G_R (s1,rmu1,s2,rmu2,nkx,nky,nkz), V_mu_nu (rmu1,rmu2,nkx,nky,nkz) -> sigma_k same shape as G_R."""
 	V_R = V_mu_nu[None, :, None, :, :, :, :]
 	V_R = jnp.array(V_R, copy=True)
@@ -854,7 +877,7 @@ def get_sigma_x_mu_nu_jax(G_R, V_mu_nu, nk_tot):
 	sigma_R = jax.lax.with_sharding_constraint(sigma_R, P(None, 'x', None, 'y', None, None, None))
 	return jnp.fft.fftn(sigma_R, axes=(4,5,6), norm='ortho')
 
-def get_sigma_x_kij_jax(psi_sigX, psi_sigTY, sigma_k_munu):
+def get_sigma_static_kij_jax(psi_sigX, psi_sigTY, sigma_k_munu):
 	"""Pure: psi_* (nk, nb, ns, rmu), sigma_k_munu (s1,rmu1,s2,rmu2,nkx,nky,nkz) -> sigma_kij (nk, nb, nb)."""
 	nkx, nky, nkz = sigma_k_munu.shape[-3:]
 	nk = nkx * nky * nkz
@@ -866,10 +889,14 @@ def get_sigma_x_kij_jax(psi_sigX, psi_sigTY, sigma_k_munu):
 def compute_sigma_pipeline_jax(
 	psi_l_rmuT_X,
 	psi_l_rmu_Y,
-	psi_r_rmu_X,
-	psi_r_rmuT_Y,
+	psi_coh_rmuT_X,
+	psi_coh_rmu_Y,
+	psi_proj_rmu_X,
+	psi_proj_rmuT_Y,
+	W_mu_nu,
 	V_mu_nu,
 	V0_munu,
+	Gij_static,
 	nkx: int,
 	nky: int,
 	nkz: int,
@@ -878,60 +905,106 @@ def compute_sigma_pipeline_jax(
 	fft_vol_au: float,
 ):
 	"""
-	Pure JAX pipeline: compute exchange self-energy and Hartree matrix elements.
+	Pure JAX pipeline: compute static COHSEX self-energy components and Hartree.
 	
 	Returns:
-		sigma_kij: (nk, nb_sigma, nb_sigma) complex - exchange self-energy
+		sigma_sx_kij: (nk, nb_sigma, nb_sigma) complex - screened exchange self-energy
+		sigma_coh_kij: (nk, nb_sigma, nb_sigma) complex - Coulomb hole self-energy
 		hartree_kmn: (nk, nb_sigma, nb_sigma) complex - Hartree matrix elements
 	
 	Wavefunctions:
-		psi_l: valence bands only (for density ρ and Green's function G)
-		       shape (nk, nval, nspinor, n_rmu) where nval = nelec - b1 (all occupied)
-		psi_r: sigma window bands (for projecting to band basis)
-		       shape (nk, n_sigma, nspinor, n_rmu) where n_sigma = nval + ncond
+		psi_l: sigma window bands (b0, b3) for SX Green's function + Hartree density
+		       shape (nk, nb_sigma, nspinor, n_rmu)
+		psi_coh: ALL bands (b0, b4) for COH resolution of identity
+		         shape (nk, nband_full, nspinor, n_rmu)
+		psi_proj: sigma window bands (b0, b3) for final projection <m|Σ|n>
+		          shape (nk, nb_sigma, nspinor, n_rmu)
 	
-	EXCHANGE (Σ_x):
-		G_μν(k) = Σ_occ ψ*_nk(r_μ) ψ_nk(r_ν)     [Green's function from valence]
-		G_μν(R) = FFT[ G_μν(k) ]                  [to real-space lattice]
-		Σ_μν(k) = (1/N_k) Σ_R G_μν(R) V_μν(R)    [exchange in ISDF basis]
-		Σ_ij(k) = Σ_μν ψ*_i(r_μ) Σ_μν ψ_j(r_ν)   [project to sigma bands]
+	Gij_static:
+		Static Green's function matrix in band space, shape (nk, nb_sigma, nb_sigma).
+		For COHSEX: zeros with diagonal 0:nelec set to 1.0+0.j (projector onto occupied).
+		Must match psi_l band range.
+	
+	W_mu_nu:
+		Screened Coulomb interaction, shape (nrmu1, nrmu2, nkx, nky, nkz).
+		Same shardings as V_mu_nu.
+	
+	SCREENED EXCHANGE (Σ_sx):
+		G_μν(k) = Σ_ij ψ*_ik(r_μ) G_ijk ψ_jk(r_ν)  [Green's function from Gij_static]
+		G_μν(R) = FFT[ G_μν(k) ]                    [to real-space lattice]
+		Σ_sx_μν(k) = (1/N_k) Σ_R G_μν(R) W_μν(R)   [screened exchange in ISDF basis]
+		Σ_sx_ij(k) = Σ_μν ψ*_i(r_μ) Σ_μν ψ_j(r_ν)  [project to sigma bands]
+	
+	COULOMB HOLE (Σ_coh):
+		G_RI_μν(k) = Σ_n ψ*_nk(r_μ) ψ_nk(r_ν)      [RI sum over ALL nband bands]
+		G_RI_μν(R) = FFT[ G_RI_μν(k) ]              [to real-space lattice]
+		Σ_coh_μν(k) = (1/N_k) Σ_R G_RI_μν(R) [V_μν(R) - W_μν(R)]
+		Σ_coh_ij(k) = Σ_μν ψ*_i(r_μ) Σ_μν ψ_j(r_ν) [project to sigma bands]
 	
 	HARTREE (V_H):
-		ρ_μ = (1/N_k) Σ_k,n,s |ψ_nk(r_μ)|²       [density at centroids, from valence]
+		ρ_μ = (1/N_k) Σ_k,n,s f_n |ψ_nk(r_μ)|²   [density, weighted by Gij diagonal]
 		[Vρ]_μ = Σ_ν V0_μν ρ_ν                    [Hartree potential at centroids]
 		<m|V_H|n>_k = Σ_μ,s ψ*_mk(r_μ) [Vρ]_μ ψ_nk(r_μ)  [project to sigma bands]
 	
 	Key: V0_munu is V(q=0) with G=0 component EXCLUDED (to avoid divergence).
 	     The G=0 piece is added back via the head correction in the main pipeline.
 	"""
-	# ========== EXCHANGE SELF-ENERGY ==========
-	# G_μν(k): Green's function in ISDF basis, built from VALENCE bands only
-	G_k = get_G_mu_nu_jax(psi_l_rmuT_X, psi_l_rmu_Y)  # (nkx,nky,nkz,spin,μ,spin,ν)
+	# psi_l: sigma window (b0, b3) for SX Green's function + Hartree density
+	# psi_coh: all bands (b0, b4) for COH resolution of identity
+	# psi_proj: sigma window (b0, b3) for final projection <m|Σ|n>
+	
+	# ========== SCREENED EXCHANGE SELF-ENERGY (Σ_sx) ==========
+	# G_μν(k): Green's function in ISDF basis, built via Gij_static projector
+	# Gij_static is sized for psi_l bands (nb_sigma x nb_sigma)
+	G_k = get_G_mu_nu_jax(psi_l_rmuT_X, psi_l_rmu_Y, Gij_static)  # (nk,spin,μ,spin,ν)
 	# G_μν(R): FFT to real-space lattice vectors R
 	G_R = get_G_R_jax(G_k, nkx, nky, nkz)
-	# Σ_μν(k): exchange self-energy via ISDF, σ_μν = (1/Nk) Σ_R G_μν(R) V_μν(R)
-	sigma_k_munu = get_sigma_x_mu_nu_jax(G_R, V_mu_nu, nk_tot)
-	# Σ_ij(k): project to SIGMA WINDOW bands using psi_r
-	sigma_kij = get_sigma_x_kij_jax(psi_r_rmu_X, psi_r_rmuT_Y, sigma_k_munu)
+	# Σ_sx_μν(k): screened exchange via ISDF
+	sigma_sx_k_munu = get_sigma_static_mu_nu_jax(G_R, W_mu_nu, nk_tot)
+	# Σ_sx_ij(k): project to SIGMA WINDOW bands using psi_proj
+	sigma_sx_kij = get_sigma_static_kij_jax(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_sx_k_munu)
+
+	# ========== COULOMB HOLE SELF-ENERGY (Σ_coh) ==========
+	# G_RI_μν(k): resolution of identity sum over ALL bands (no occupation weighting)
+	# Use psi_coh which has all bands (b0, b4)
+	G_RI_k = get_G_mu_nu_RI(psi_coh_rmuT_X, psi_coh_rmu_Y)  # (nk,spin,μ,spin,ν)
+	# G_RI_μν(R): FFT to real-space lattice vectors R
+	G_RI_R = get_G_R_jax(G_RI_k, nkx, nky, nkz)
+	# Σ_coh_μν(k): Coulomb hole via (W - V)
+	# BerkeleyGW uses [ε⁻¹_{GG'} - δ_{GG'}] v(q+G') = (W - V), NOT (V - W)
+	# See bgw_src/Sigma/mtxel_cor.f90 lines 604-607
+	# 
+	# IMPORTANT: CH has a factor of 1/2 that SX does not have!
+	# See mtxel_cor.f90 line 1646: achtemp_loc = achtemp_loc + 0.5d0*aqsn_Ieps
+	# vs line 1648: if (flag_occ) asxtemp_loc = asxtemp_loc - aqsn_Ieps
+	W_minus_V = W_mu_nu - V_mu_nu
+	sigma_coh_k_munu = get_sigma_static_mu_nu_jax(G_RI_R, W_minus_V, nk_tot)
+	# Σ_coh_ij(k): project to SIGMA WINDOW bands using psi_proj
+	# Apply the 0.5 factor for COH and the overall minus sign
+	sigma_coh_kij = -0.5 * get_sigma_static_kij_jax(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_coh_k_munu)
 
 	# ========== HARTREE MATRIX ELEMENTS ==========
-	# Step 1: Density at centroids from VALENCE bands (psi_l)
-	# ρ_μ = (1/Nk) Σ_k,n,s |ψ_nk(r_μ)|²
-	# psi_l_rmu_Y has shape (nk, nval, nspinor, n_rmu), contracted to (n_rmu,)
-	rho_mu = jnp.einsum('knsx,knsx->x', jnp.conj(psi_l_rmu_Y), psi_l_rmu_Y, optimize=True)
+	# Step 1: Density at centroids using Gij_static for occupation weights
+	# ρ_μ = (1/Nk) Σ_k,n,s f_n |ψ_nk(r_μ)|²  where f_n = G_nn (occupation)
+	# psi_l_rmu_Y has shape (nk, nb_sigma, nspinor, n_rmu), Gij_static is (nk, nb_sigma, nb_sigma)
+	# Extract occupation from diagonal of Gij_static
+	occ_kn = jnp.diagonal(Gij_static, axis1=1, axis2=2)  # (nk, nb) - occupation per band
+	occ_kn = jnp.real(occ_kn)  # Should be real (0 or 1 for static COHSEX)
+	# Weighted density: Σ_k,n,s f_n |ψ_nk(r_μ)|²
+	psi_sq = jnp.real(jnp.conj(psi_l_rmu_Y) * psi_l_rmu_Y)  # (nk, nb_sigma, ns, rmu)
+	rho_mu = jnp.einsum('kn,knsx->x', occ_kn, psi_sq, optimize=True)
 	rho_mu = rho_mu * 1.0 / jnp.asarray(nk_tot, dtype=jnp.float64)  # BZ integration: 1/Nk
 	
 	# Step 2: Hartree potential at centroids
-	# [Vρ]_μ = Σ_ν V0_μν ρ_ν
+	# [Vρ]_μ = Σ_ν V_μν ρ_ν
 	# V0_munu is V(q=0) with G=0 excluded to avoid Coulomb divergence
 	Vrho_mu = jnp.einsum('xy,y->x', V0_munu, rho_mu, optimize=True)
 	
-	# Step 3: Project to SIGMA WINDOW bands (psi_r)
+	# Step 3: Project to SIGMA WINDOW bands (psi_proj)
 	# <mk|V_H|nk> = Σ_μ,s ψ*_mk(r_μ) [Vρ]_μ ψ_nk(r_μ)
-	# Note: This uses psi_r which includes both valence AND conduction in sigma window
-	hartree_kmn = jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_r_rmu_X), Vrho_mu, psi_r_rmu_X, optimize=True)
+	hartree_kmn = jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_proj_rmu_X), Vrho_mu, psi_proj_rmu_X, optimize=True)
 	
-	return sigma_kij, hartree_kmn
+	return sigma_sx_kij, sigma_coh_kij, hartree_kmn
 
 
 def load_kin_ion_submatrix(h5_path: str, band_start: int, band_stop: int) -> jax.Array:
@@ -1157,27 +1230,73 @@ def main(argv=None):
 			sh = make_shardings(mesh_xy)
 			print0(f"Device mesh: (X={grid_x}, Y={grid_y})")
 
-			# Left window: read G-vectors -> global G-space; then jitted sharded wfn build
-			sigma_window = nvplussigrange
-			brange_l = sigma_window
+			# ============================================================================
+			# WAVEFUNCTION LOADING STRATEGY:
+			# ============================================================================
+			# For ISDF fitting (zeta construction):
+			#   - psi_l: nvplussigrange (b0, b3) - all valence + sigma-window conduction
+			#   - psi_r: ncplussigrange (b1, b4) - sigma-window valence + all conduction
+			# For chi0/W calculation (screened interaction):
+			#   - psi_v: VALENCE bands only (b0, b2) - used as left/right in chi0
+			#   - psi_c: CONDUCTION bands only (b2, b4) - used as left/right in chi0
+			# For COH G_RI (resolution of identity):
+			#   - psi_coh: ALL bands (b0, b4) - needed for COH sum over all bands
+			# For final sigma projection:
+			#   - uses psi_l (b0, b3) which covers sigma window
+			# ============================================================================
+			
+			valence_range = (b0, b2)      # Valence bands only (for chi0)
+			conduction_range = (b2, b4)   # Conduction bands only (for chi0)
+			# ISDF ranges - MUST match original for zeta fitting!
+			brange_l = nvplussigrange     # (b0, b3) for ISDF left
+			brange_r = ncplussigrange     # (b1, b4) for ISDF right
+			full_band_range = (b0, b4)    # All bands (for COH G_RI)
+			
+			# Load LEFT wavefunctions for ISDF fitting and sigma projection (psi_l)
+			# Range: (b0, b3) = all valence + sigma-window conduction
 			global_psiG_l, nb_l = read_Gvecs_to_devices(wfn, sym, brange_l, meta, bispinor, mesh_xy)
 			psi_l_rtot_Y, psi_l_rmu_Y, psi_l_rmuT_X = get_sharded_wfns(
 				global_psiG_l, sym, meta, centroid_indices, nb_l, False, mesh_xy
 			)
-			# Ensure kernels finish then free the large G-space buffer to reduce peak memory
 			psi_l_rtot_Y.block_until_ready(); psi_l_rmu_Y.block_until_ready(); psi_l_rmuT_X.block_until_ready()
 			del global_psiG_l
 			gc.collect()
-
-			# Right window (nv+sigma or sigma-only)
-			brange_r = sigma_window if x_only else ncplussigrange
+			
+			# Load RIGHT wavefunctions for ISDF fitting (psi_r)
+			# Range: (b1, b4) = sigma-window valence + all conduction
 			global_psiG_r, nb_r = read_Gvecs_to_devices(wfn, sym, brange_r, meta, bispinor, mesh_xy)
 			psi_r_rtot_Y, psi_r_rmu_Y, psi_r_rmuT_X = get_sharded_wfns(
 				global_psiG_r, sym, meta, centroid_indices, nb_r, False, mesh_xy
 			)
-			# Free the right G-space buffer as well
 			psi_r_rtot_Y.block_until_ready(); psi_r_rmu_Y.block_until_ready(); psi_r_rmuT_X.block_until_ready()
 			del global_psiG_r
+			gc.collect()
+			
+			# Load VALENCE wavefunctions for chi0 (psi_v)
+			global_psiG_v, nb_v = read_Gvecs_to_devices(wfn, sym, valence_range, meta, bispinor, mesh_xy)
+			psi_v_rtot_Y, psi_v_rmu_Y, psi_v_rmuT_X = get_sharded_wfns(
+				global_psiG_v, sym, meta, centroid_indices, nb_v, False, mesh_xy
+			)
+			psi_v_rtot_Y.block_until_ready(); psi_v_rmu_Y.block_until_ready(); psi_v_rmuT_X.block_until_ready()
+			del global_psiG_v
+			gc.collect()
+			
+			# Load CONDUCTION wavefunctions for chi0 (psi_c)
+			global_psiG_c, nb_c = read_Gvecs_to_devices(wfn, sym, conduction_range, meta, bispinor, mesh_xy)
+			psi_c_rtot_Y, psi_c_rmu_Y, psi_c_rmuT_X = get_sharded_wfns(
+				global_psiG_c, sym, meta, centroid_indices, nb_c, False, mesh_xy
+			)
+			psi_c_rtot_Y.block_until_ready(); psi_c_rmu_Y.block_until_ready(); psi_c_rmuT_X.block_until_ready()
+			del global_psiG_c
+			gc.collect()
+			
+			# Load ALL bands for COH resolution of identity (psi_coh)
+			global_psiG_coh, nb_coh = read_Gvecs_to_devices(wfn, sym, full_band_range, meta, bispinor, mesh_xy)
+			psi_coh_rtot_Y, psi_coh_rmu_Y, psi_coh_rmuT_X = get_sharded_wfns(
+				global_psiG_coh, sym, meta, centroid_indices, nb_coh, False, mesh_xy
+			)
+			psi_coh_rtot_Y.block_until_ready(); psi_coh_rmu_Y.block_until_ready(); psi_coh_rmuT_X.block_until_ready()
+			del global_psiG_coh
 			gc.collect()
 			print0('wavefunction sharding complete')
 
@@ -1185,9 +1304,12 @@ def main(argv=None):
 			####################################
 			# 2.) Explicit q-loop: build zeta_q,mu(r), S_q, and V_q,mu,nu
 			####################################
-			# Energies and weights for windows (kept as before, last entry is just sigma range)
-			enk_l, weights_l = get_enk_bandrange(wfn, sym, brange_l, (b1,b3))
-			enk_r, weights_r = get_enk_bandrange(wfn, sym, brange_r, (b1,b3))
+			# Energies for chi0: valence and conduction separately
+			enk_v, weights_v = get_enk_bandrange(wfn, sym, valence_range, (b1, b2))
+			enk_c, weights_c = get_enk_bandrange(wfn, sym, conduction_range, (b2, b4))
+			# Energies for ISDF left/right arrays
+			enk_l, weights_l = get_enk_bandrange(wfn, sym, brange_l, (b1, b3))
+			enk_r, weights_r = get_enk_bandrange(wfn, sym, brange_r, (b1, b3))
 
 			# Allocate sharded outputs
 			V_qmunu = jnp.zeros((1, meta.npol, meta.npol, meta.nkx, meta.nky, meta.nkz, meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
@@ -1336,40 +1458,45 @@ def main(argv=None):
 
 			# Sharded psi variants outside q-loop
 			with mesh_xy:
+				# Valence wavefunctions for chi0 (psi_v)
+				psiv_Y = jax.device_put(psi_v_rmu_Y, sh.y3_4)
+				psivT_X = jax.lax.with_sharding_constraint(psiv_Y.transpose(0, 2, 3, 1), sh.x2_4)
+				# Conduction wavefunctions for chi0 (psi_c)  
+				psic_X = jax.device_put(psi_c_rmu_Y, sh.x3_4)
+				psicT_Y = jax.lax.with_sharding_constraint(psic_X.transpose(0, 2, 3, 1), sh.y2_4)
+				# ISDF left wavefunctions (psi_l): (b0, b3) for ISDF fitting and projection
 				psil_Y = jax.device_put(psi_l_rmu_Y, sh.y3_4)
 				psilT_X = jax.lax.with_sharding_constraint(psil_Y.transpose(0, 2, 3, 1), sh.x2_4)
+				# ISDF right wavefunctions (psi_r): (b1, b4) for ISDF fitting
 				psir_X = jax.device_put(psi_r_rmu_Y, sh.x3_4)
 				psirT_Y = jax.lax.with_sharding_constraint(psir_X.transpose(0, 2, 3, 1), sh.y2_4)
+				# COH resolution of identity (psi_coh): (b0, b4) = all bands
+				psicoh_Y = jax.device_put(psi_coh_rmu_Y, sh.y3_4)
+				psicohT_X = jax.lax.with_sharding_constraint(psicoh_Y.transpose(0, 2, 3, 1), sh.x2_4)
 
 			# ============================================================================
-			# WAVEFUNCTION ARRAYS AND BAND SLICING:
+			# WAVEFUNCTION ARRAYS:
 			# ============================================================================
-			# psi_l: "left" wavefunctions for building density ρ and Green's function G
-			#        Originally loaded as bands [b0, b3) = [0, nelec+ncond)
-			#        Sliced to VALENCE ONLY [b0, b2) = [0, nelec) for ρ and G
-			#
-			# psi_r: "right" wavefunctions for projecting Σ to band basis
-			#        Loaded as bands [b1, b4) for do_screened or [b0, b3) otherwise
-			#        Used as-is for sigma window projection
-			#
-			# KEY: ρ_μ and G_μν use VALENCE (psi_l sliced), but <m|Σ|n> uses SIGMA
-			#      WINDOW (psi_r), which includes both valence and conduction.
+			# psi_v, psi_vT: VALENCE bands (b0, b2) for chi0/W calculation
+			# psi_c, psi_cT: CONDUCTION bands (b2, b4) for chi0/W calculation
+			# psi_l, psi_lT: (b0, b3) for ISDF fitting left + sigma projection
+			# psi_r, psi_rT: (b1, b4) for ISDF fitting right
+			# psi_coh, psi_cohT: ALL bands (b0, b4) for COH G_RI resolution of identity
 			# ============================================================================
-			psi_l_full = psil_Y        # Full array: bands [b0, b3)
-			psi_lT_full = psilT_X      # Transposed version
+			psi_v = psiv_Y       # Valence for chi0
+			psi_vT = psivT_X     # Valence transposed for chi0
+			psi_c = psic_X       # Conduction for chi0
+			psi_cT = psicT_Y     # Conduction transposed for chi0
+			psi_l = psil_Y       # ISDF left + sigma projection
+			psi_lT = psilT_X     # ISDF left transposed
+			psi_l_full = psi_l   # Alias for h5 saving
+			psi_lT_full = psi_lT # Alias for h5 saving
+			psi_r = psir_X       # ISDF right
+			psi_rT = psirT_Y     # ISDF right transposed
+			psi_coh = psicoh_Y   # COH G_RI (all bands)
+			psi_cohT = psicohT_X # COH G_RI transposed
 			
-			# Slices for Hartree/exchange: valence only [b0, b2) = [0, nelec)
-			valence_slice = slice(b0, b2)  # Indices 0..nelec-1
-			nb_valence = int(b2 - b0)      # = nelec (number of valence bands)
-			nb_sigma = int(b3 - b0)        # = nelec + ncond (sigma window size)
-			
-			# psi_l used for ρ and G: currently using full (should be valence_slice)
-			# TODO: verify this is correct - commented slicing suggests debugging
-			psi_l = psi_l_full   # [:, valence_slice, :, :] for valence only
-			psi_lT = psi_lT_full # [:, :, :, valence_slice] for valence only
-			# psi_r used for band projection: sigma window [b1, b3)
-			psi_r = psir_X       # [:, :nb_sigma, :, :]
-			psi_rT = psirT_Y     # [:, :, :, :nb_sigma]
+			nb_sigma = int(b3 - b0)  # = nelec + ncond (sigma window size)
 
 			# Persist restart artifacts (store full-sized left/right; trim on load/use)
 			write_labeled_arrays_to_h5(
@@ -1403,6 +1530,15 @@ def main(argv=None):
 				taggedarray_filename, mesh_xy
 			)
 			V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0]
+			# Aliases for self-consistent loop
+			# NOTE: In restart mode, psi_l from file has OLD format (all bands).
+			# We use it for both SX and COH since the restart file doesn't have
+			# the new separate arrays. This may cause dimension mismatches.
+			psi_l_full = psi_l
+			psi_lT_full = psi_lT
+			# COH needs all bands - in restart mode, psi_l has all bands (old format)
+			psi_coh = psi_l
+			psi_cohT = psi_lT
 	elif restart and x_only:
 		with timing.section("cohsex_jax.restart_load_x_only") as restart_timer:
 			# Same restart flow for X-only
@@ -1420,90 +1556,148 @@ def main(argv=None):
 				taggedarray_filename, mesh_xy
 			)
 			V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0]
+			# Aliases for self-consistent loop
+			psi_l_full = psi_l
+			psi_lT_full = psi_lT
+			# COH needs all bands - in restart mode, psi_l has all bands (old format)
+			psi_coh = psi_l
+			psi_cohT = psi_lT
 
 	# Optionally compute chi0 via JAX for screened interaction if requested
 	if do_screened:
+		# Check if valence/conduction wavefunctions are available (only in non-restart path)
+		if restart:
+			raise NotImplementedError(
+				"do_screened=True with restart=True is not yet supported. "
+				"Please run with restart=False to compute W from scratch, or save W to h5."
+			)
 		with timing.section("cohsex_jax.chi0_W") as timer_chiw:
 			# Ensure energies are plain arrays for JAX
-			enk_v_arr = jnp.asarray(getattr(enk_l, 'data', enk_l))
-			enk_c_arr = jnp.asarray(getattr(enk_r, 'data', enk_r))
-			# Four wavefunction copies and shardings for low-comm G and Sigma construction:
-			# psi_lT: (nk, ns, rmu, nb) XT_shard; psi_l: (nk, nb, ns, rmu) Y_shard
-			# psi_r:  (nk, nb, ns, rmu) X_shard;  psi_rT: (nk, ns, rmu, nb) YT_shard
-			# We reshard psi_rT to XT for chi0 so both G_v and G_c use {mu_X, nu_Y} without communication.
+			# Use VALENCE energies for psi_v and CONDUCTION energies for psi_c
+			enk_v_arr = jnp.asarray(getattr(enk_v, 'data', enk_v))
+			enk_c_arr = jnp.asarray(getattr(enk_c, 'data', enk_c))
+			# chi0 expects:
+			#   psi_vTX: valence, transposed, X-sharded on rmu
+			#   psi_vY:  valence, Y-sharded on rmu
+			#   psi_cX:  conduction, X-sharded on rmu  
+			#   psi_cTY: conduction, transposed, Y-sharded on rmu
 			window_pairs = get_window_info(epsq, wfn, nband_max=nband)
-			chi0 = get_chi0_jax(psi_lT, psi_l, psi_r, psi_rT, enk_v_arr, enk_c_arr, window_pairs, meta, mesh_xy)
+			chi0 = get_chi0_jax(psi_vT, psi_v, psi_c, psi_cT, enk_v_arr, enk_c_arr, window_pairs, meta, mesh_xy)
 			# Compute static W under k_XY sharding (S_qmunu included but unused for now)
 			W_q = get_static_w_q_jax(V_qmunu, chi0, None, meta, mesh_xy)
 			W_q.block_until_ready()
 			# Compute static W under k_XY sharding (S_qmunu included but unused for now)
 			#W_q = get_static_w_q_jax(V_qmunu, chi0, S_qmunu, meta, mesh_xy)
 
-		# ============================================================================
-		# HEAD INJECTION: Add the q→0, G=0 Coulomb divergence correction
-		# ============================================================================
-		# At q=0, the Coulomb interaction v(q,G) = 4π/|q+G|² diverges as G→0.
-		# We handle this by:
-		#   1. BUILDING V_μν with G=0 ZEROED (done in make_v_munu_kernel)
-		#   2. ADDING BACK the cell-averaged head: ⟨v(q→0,G=0)⟩ = vc0_mean
-		#
-		# The head is added as a rank-1 correction in the μν basis:
-		#   V_μν ← V_μν + (vc0_mean / Ω) × ζ*_μ(0) ⊗ ζ_ν(0)
-		#
-		# where ζ_μ(0) = G0_mu_nu is the G=0 component of the ISDF vectors.
-		#
-		# IMPORTANT: This head correction is added to V_qmunu (for Σ_x) but NOT
-		# to v_q0_noG0_munu (for Hartree). Hartree uses V0 with G=0 excluded because
-		# the divergent piece cancels with the electron-ion interaction.
-		# ============================================================================
-		if do_G0:  # do_G0=True: apply head corrections
-			vc0_mean, wcoul0, wcoul0_source = determine_wcoul0(params, input_dir, wfn, sym, meta, print0)
-			print0(f"wcoul0 source: {wcoul0_source}")
-			print0(f"wcoul0 value (atomic units): {wcoul0}")
-			
-			# outer_u = ζ*_μ(0) ⊗ ζ_ν(0), the "head" direction in μν space
-			outer_u = (G0_mu_nu[:, None] * jnp.conj(G0_mu_nu)[None, :])
-			# V_μν has units of (energy × volume), so divide by Ω
-			vol_scale = jnp.asarray(1.0 / float(wfn.cell_volume), dtype=jnp.float64)
-			
-			# HEAD INJECTION FOR Σ_x: V_qmunu at q=0 gets the bare Coulomb head
-			# V_Γ ← V_Γ + (vc0_mean / Ω) × ζ*(0) ⊗ ζ(0)
-			V_qmunu = V_qmunu.at[0, 0, 0, 0, 0, 0, :, :].add((vc0_mean * vol_scale) * outer_u)
-			
-			# HEAD INJECTION FOR W (screened): W at q=0 gets the screened head wcoul0
-			if do_screened:  # do_screened=True: using W instead of V for exchange
-				W_q = W_q.at[0, 0, 0, 0, :, 0, :].add((wcoul0 * vol_scale) * outer_u)
+	# ============================================================================
+	# HEAD INJECTION: Add the q→0, G=0 Coulomb divergence correction
+	# ============================================================================
+	# At q=0, the Coulomb interaction v(q,G) = 4π/|q+G|² diverges as G→0.
+	# We handle this by:
+	#   1. BUILDING V_μν with G=0 ZEROED (done in make_v_munu_kernel)
+	#   2. ADDING BACK the cell-averaged head: ⟨v(q→0,G=0)⟩ = vc0_mean
+	#
+	# The head is added as a rank-1 correction in the μν basis:
+	#   V_μν ← V_μν + (vc0_mean / Ω) × ζ*_μ(0) ⊗ ζ_ν(0)
+	#
+	# where ζ_μ(0) = G0_mu_nu is the G=0 component of the ISDF vectors.
+	#
+	# IMPORTANT: This head correction is added to V_qmunu (for Σ_x) but NOT
+	# to v_q0_noG0_munu (for Hartree). Hartree uses V0 with G=0 excluded because
+	# the divergent piece cancels with the electron-ion interaction.
+	# ============================================================================
+	if do_G0:  # do_G0=True: apply head corrections
+		vc0_mean, wcoul0, wcoul0_source = determine_wcoul0(params, input_dir, wfn, sym, meta, print0)
+		print0(f"wcoul0 source: {wcoul0_source}")
+		print0(f"vc0_mean (bare head, atomic units): {vc0_mean}")
+		if do_screened:
+			print0(f"wcoul0 (screened head, atomic units): {wcoul0}")
+			print0(f"(W-V)_head = wcoul0 - vc0_mean = {wcoul0 - vc0_mean}")
+		
+		# outer_u = ζ*_μ(0) ⊗ ζ_ν(0), the "head" direction in μν space
+		# Must match V_μν construction: V = Σ_G v(G) ζ*_μ(G) ζ_ν(G)
+		# So the head should have conjugate on the LEFT (μ index), not right (ν index)
+		outer_u = (jnp.conj(G0_mu_nu)[:, None] * G0_mu_nu[None, :])
+		vol_scale = jnp.asarray(1.0 / float(wfn.cell_volume), dtype=jnp.float64)
+		
+		# HEAD INJECTION FOR V: V_qmunu at q=0 gets the bare Coulomb head
+		# V_Γ ← V_Γ + (vc0_mean / Ω) × ζ*(0) ⊗ ζ(0)
+		# This is ALWAYS applied regardless of do_screened
+		V_qmunu = V_qmunu.at[0, 0, 0, 0, 0, 0, :, :].add((vc0_mean * vol_scale) * outer_u)
+		
+		# HEAD INJECTION FOR W (screened): W at q=0 gets the screened head wcoul0
+		# Only applied when do_screened=True since W_q only exists then
+		if do_screened:
+			W_q = W_q.at[0, 0, 0, 0, :, 0, :].add((wcoul0 * vol_scale) * outer_u)
 
 	# ============================================================================
-	# SELECT INTERACTION FOR Σ_x: bare V or screened W
+	# EXTRACT BARE V AND SCREENED W INTERACTIONS
 	# ============================================================================
 	# V_qmunu: bare Coulomb, shape [nfreq, npol1, npol2, nkx, nky, nkz, nrmu1, nrmu2]
 	# W_q:     screened Coulomb, shape [nkx, nky, nkz, nfreq, nrmu, npol, nrmu]
 	# We extract the static (freq=0) component and reshape to (nrmu1, nrmu2, nkx, nky, nkz)
 	# ============================================================================
 	V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0]  # (nkx,nky,nkz,nrmu1,nrmu2) from bare V
-	if do_screened:  # do_screened=True: use W instead of V for exchange
-		V_mu_nu = W_q[:,:,:,0,:,0,:]  # (nkx,nky,nkz,nrmu1,nrmu2) from screened W
 	V_mu_nu = V_mu_nu.transpose(3, 4, 0, 1, 2)  # → (nrmu1,nrmu2,nkx,nky,nkz)
+	if do_screened:  # do_screened=True: use W for exchange
+		W_mu_nu = W_q[:,:,:,0,:,0,:]  # (nkx,nky,nkz,nrmu1,nrmu2) from screened W
+		W_mu_nu = W_mu_nu.transpose(3, 4, 0, 1, 2)  # → (nrmu1,nrmu2,nkx,nky,nkz)
+	else:
+		W_mu_nu = V_mu_nu  # For bare exchange, W = V
 
-	# After W is computed, the trimmed views (psi_l, psi_lT, psi_r, psi_rT)
-	# are already defined; preserve psi_l_full/psi_lT_full as b3-sized copies.
+	# All nband bands are passed to the pipeline for the COH resolution of identity.
+	# The sigma window slicing (to nb_sigma bands) is done inside the pipeline
+	# for the final projection step only.
 	valence_slice = slice(b0, b2)
-	nb_sigma = int(b3 - b0)
-	psi_l = psi_l[:, valence_slice, :, :]
-	psi_lT = psi_lT[:, :, :, valence_slice]
-	psi_r = psi_r[:, :nb_sigma, :, :]
-	psi_rT = psi_rT[:, :, :, :nb_sigma]
+	# psi_l/psi_lT and psi_r/psi_rT: all nband bands (no slicing here)
 
 	if sh is None and mesh_xy is not None:
 		sh = make_shardings(mesh_xy)
 
+	# Create Gij_static: (nk, nb_sigma, nb_sigma) with diagonal 0:nelec set to 1.0
+	# This is the static COHSEX Green's function (projector onto occupied states)
+	# Sized for psi_l which has bands (b0, b3) = sigma window
+	nband_full = int(b4 - b0)  # All bands from 0 to nband (for COH G_RI)
+	nb_sigma = int(b3 - b0)    # Sigma window size (for SX Green's function + projection)
+	nk = meta.nk_tot
+	
+	# DEBUG: Print band counts and wavefunction shapes
+	print0(f"DEBUG bands: b0={b0}, b3={b3}, b4={b4}, nb_sigma={nb_sigma}, nband_full={nband_full}")
+	print0(f"DEBUG psi_l shape: {psi_l.shape} (sigma window for SX)")
+	print0(f"DEBUG psi_lT shape: {psi_lT.shape}")
+	print0(f"DEBUG psi_r shape: {psi_r.shape} (ISDF right, bands b1 to b4)")
+	print0(f"DEBUG psi_coh shape: {psi_coh.shape} (all bands for COH G_RI)")
+	if not restart:
+		print0(f"DEBUG psi_v shape: {psi_v.shape} (valence for chi0)")
+		print0(f"DEBUG psi_c shape: {psi_c.shape} (conduction for chi0)")
+	
+	# Gij_static sized for psi_l (sigma window), NOT psi_coh (all bands)
+	Gij_static = jnp.zeros((nk, nb_sigma, nb_sigma), dtype=jnp.complex128)
+	nelec = int(wfn.nelec)
+	# Set diagonal elements for occupied bands to 1.0
+	occ_diag = jnp.arange(min(nelec, nb_sigma))
+	Gij_static = Gij_static.at[:, occ_diag, occ_diag].set(1.0 + 0.0j)
+	# Replicate Gij_static across all devices
+	Gij_shard = NamedSharding(mesh_xy, P(None, None, None))
+	Gij_static = jax.device_put(Gij_static, Gij_shard)
+
 	# Jitted pipeline with explicit shardings along rmu/rnu XY
+	# New signature: psi_l (SX), psi_coh (COH), psi_proj (projection), W, V, V0, Gij
+	# psi_l: (b0, b3) sigma window for SX Green's function + Hartree density
+	# psi_coh: (b0, b4) all bands for COH resolution of identity
+	# psi_proj: same as psi_l for final projection
+	# Returns: (sigma_sx_kij, sigma_coh_kij, hartree_kmn)
 	pipeline_jit = jax.jit(
 		compute_sigma_pipeline_jax,
 		static_argnames=('nkx', 'nky', 'nkz', 'nk_tot', 'nspinor', 'fft_vol_au'),
-		in_shardings=(sh.XT_shard, sh.Y_shard, sh.X_shard, sh.YT_shard, sh.V_shard, sh.xy_shard),
-		out_shardings=(sh.out_shard, sh.out_shard),
+		in_shardings=(
+			sh.XT_shard, sh.Y_shard,     # psi_l for SX
+			sh.XT_shard, sh.Y_shard,     # psi_coh for COH
+			sh.X_shard, sh.YT_shard,     # psi_proj for projection
+			sh.V_shard, sh.V_shard,      # W_mu_nu, V_mu_nu
+			sh.xy_shard, Gij_shard,      # V0_munu, Gij_static
+		),
+		out_shardings=(sh.out_shard, sh.out_shard, sh.out_shard),
 	)
 
 	# ========== HARTREE DIAGNOSTIC ==========
@@ -1547,6 +1741,14 @@ def main(argv=None):
 		print0(f"    Bands in density sum: {n_bands_in_density} (should be {b2-b0} = all occupied)")
 		print0(f"    Sum(ρ_μ) = {np.sum(rho_test):.4f}")
 		print0(f"    Mean(ρ_μ) = {np.mean(rho_test):.6f}")
+		
+		# Check wavefunction normalization at centroids
+		# For properly normalized ψ: ∫|ψ|²dr = 1
+		# In ISDF: Σ_μ |ψ(r_μ)|² × (implicit weight from ζ_μ) should ≈ 1
+		psi_norm_per_band = np.einsum('knsx,knsx->kn', np.conj(psi_l_np), psi_l_np).real
+		print0(f"    Σ_μ,s |ψ_nk(r_μ)|² per band (k=0, first 5 bands): {psi_norm_per_band[0, :5]}")
+		print0(f"    Mean over all k,n: {np.mean(psi_norm_per_band):.4f}")
+		print0(f"    If this is ~n_rmu, wavefunctions are per-centroid normalized (not ISDF-weighted)")
 		if do_G0 and G0_mu_nu is not None:
 			rho_integral_proxy = np.sum(rho_test * np.abs(g0)**2)
 			print0(f"    Σ_μ ρ_μ × |ζ_μ(0)|² = {rho_integral_proxy:.4f}")
@@ -1563,19 +1765,35 @@ def main(argv=None):
 		n_val_bands = min(psi_k0.shape[0], b2 - b0)  # Number of valence bands
 		
 		# Valence bands (from psi_l)
+		# Compare with k0_diag.txt reference if available
+		k0_ref_path = os.path.join(input_dir, 'k0_diag.txt')
+		k0_ref = None
+		if os.path.exists(k0_ref_path):
+			try:
+				k0_ref = np.loadtxt(k0_ref_path)
+				print0(f"    (Loaded reference from k0_diag.txt)")
+			except Exception:
+				pass
+		
 		print0(f"    VALENCE (bands {b0}..{b0 + min(5, n_val_bands) - 1}):")
 		for n in range(min(5, n_val_bands)):
 			overlap = np.sum(np.abs(psi_k0[n])**2, axis=0)
 			V_H_n = np.sum(overlap * Vrho_test).real
-			print0(f"      band {b0+n}: {V_H_n:.4f} Ry")
+			ref_str = ""
+			if k0_ref is not None and n < len(k0_ref):
+				V_H_ref = k0_ref[n, 3] if k0_ref.ndim == 2 and k0_ref.shape[1] > 3 else 0
+				ratio = V_H_n / V_H_ref if abs(V_H_ref) > 1e-6 else 0
+				ref_str = f" | ref={V_H_ref:.4f} Ry | ratio={ratio:.2f}x"
+			print0(f"      band {b0+n}: {V_H_n:.4f} Ry{ref_str}")
 		
 		# Check if we have sigma bands (psi_r) to show conduction
 		psi_r_np = np.asarray(psi_r)  # psi_r contains sigma window bands
 		n_sigma_bands = psi_r_np.shape[1]
 		print0(f"\n  PSI ARRAY SHAPES:")
-		print0(f"    psi_l shape: {psi_l_np.shape} (bands in density)")
-		print0(f"    psi_r shape: {psi_r_np.shape} (bands for projection)")
-		print0(f"    n_sigma_bands in psi_r: {n_sigma_bands}")
+		print0(f"    psi_l shape: {psi_l_np.shape} (b0→b3: SX, Hartree density, projection)")
+		print0(f"    psi_r shape: {psi_r_np.shape} (b1→b4: ISDF fitting right)")
+		print0(f"    psi_coh shape: {np.asarray(psi_coh).shape} (b0→b4: COH G_RI sum)")
+		print0(f"    n_sigma_bands in psi_l: {psi_l_np.shape[1]} (sigma window for projection)")
 		print0(f"    Sigma window should be: {b3-b1} bands (b1={b1} to b3={b3})")
 		
 		if n_sigma_bands > n_val_bands:
@@ -1625,21 +1843,26 @@ def main(argv=None):
 
 	with mesh_xy:
 			with timing.section("cohsex_jax.pipeline"):
-				sigma_x_kbar_ij_jax, hartree_kbar_ij_jax = pipeline_jit(
-					psi_lT,  # (nk, nb, ns, rmu) X-sharded over rmu (resharded by jit)
-					psi_l,   # (nk, nb, ns, rmu) Y-sharded over rmu
-					psi_r,   # (nk, ns, rmu, nb)  X-sharded over rmu (unused inside)
-					psi_rT,  # (nk, nb, ns, rmu)  X-sharded over rmu (unused inside)
-					V_mu_nu, # (rmu1, rmu2, nkx, nky, nkz) rmu1, rmu2 sharded over (x,y)
+				sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = pipeline_jit(
+					psi_lT,    # psi_l for SX (sigma window, b0..b3)
+					psi_l,     
+					psi_cohT,  # psi_coh for COH (all bands, b0..b4)
+					psi_coh,
+					psi_l,     # psi_proj for projection (sigma window)
+					psi_lT,
+					W_mu_nu,   # (rmu1, rmu2, nkx, nky, nkz) screened Coulomb
+					V_mu_nu,   # (rmu1, rmu2, nkx, nky, nkz) bare Coulomb
 					v_q0_noG0_munu, # (rmu1, rmu2) sharded over (x,y)
+					Gij_static, # (nk, nb_sigma, nb_sigma) replicated
 					meta.nkx, meta.nky, meta.nkz, meta.nk_tot, meta.nspinor,
 					float(wfn.cell_volume/np.prod(wfn.fft_grid)),
 				)
-				sigma_x_kbar_ij_jax.block_until_ready()
+				sigma_sx_kbar_ij_jax.block_until_ready()
+				sigma_coh_kbar_ij_jax.block_until_ready()
 				hartree_kbar_ij_jax.block_until_ready()
 
 
-	sigma_total_full = sigma_x_kbar_ij_jax #+ hartree_kbar_ij_jax
+	sigma_total_full = sigma_sx_kbar_ij_jax + sigma_coh_kbar_ij_jax  # COHSEX = SX + COH
 	sigma_full_shape = sigma_total_full.shape
 
 	qp_band_start = int(b0)
@@ -1670,28 +1893,43 @@ def main(argv=None):
 				return jax.vmap(one_k)(U_ref, U_full)
 			# Align U to fixed gauge U_fix0
 			U_full = align_unitaries(U_fix0, U_full_raw)
-			# Rotate left wavefunctions explicitly: psi' = U psi, psi_T' = psi_T @ U^T
-			# Ensure we run under mesh context for inner constraints
+			# Rotate wavefunctions explicitly: psi' = U psi, psi_T' = psi_T @ U^T
+			# psi_l and psi_l_full have (b0, b3) = nb_sigma bands, matches U_full size
+			# psi_coh has (b0, b4) = nband_full bands, only first nb_sigma get rotated
 			with mesh_xy:
-				psi_full_rot = jnp.einsum('kij, kjab->kiab', U_full, psi_l_full, optimize=True)
-				psiT_full_rot = jnp.einsum('kij, kabj->kabi', U_full, psi_lT_full, optimize=True)
-				psi_val_rot = psi_full_rot[:, valence_slice, :, :]
-				psi_valT_rot = psiT_full_rot[:, :, :, valence_slice]
+				# Rotate psi_l (sigma window) for SX and projection
+				psi_l_rot = jnp.einsum('kij, kjab->kiab', U_full, psi_l_full, optimize=True)
+				psi_lT_rot = jnp.einsum('kij, kabj->kabi', U_full, psi_lT_full, optimize=True)
+				
+				# Rotate first nb_sigma bands of psi_coh, keep rest unchanged
+				psi_coh_sigma = psi_coh[:, :nb_sigma, :, :]   # (nk, nb_sigma, ns, rmu)
+				psi_coh_rest = psi_coh[:, nb_sigma:, :, :]    # (nk, nband_full-nb_sigma, ns, rmu)
+				psi_coh_sigma_rot = jnp.einsum('kij, kjab->kiab', U_full, psi_coh_sigma, optimize=True)
+				psi_coh_rot = jnp.concatenate([psi_coh_sigma_rot, psi_coh_rest], axis=1)
+				
+				psi_cohT_sigma = psi_cohT[:, :, :, :nb_sigma]
+				psi_cohT_rest = psi_cohT[:, :, :, nb_sigma:]
+				psi_cohT_sigma_rot = jnp.einsum('kij, kabj->kabi', U_full, psi_cohT_sigma, optimize=True)
+				psi_cohT_rot = jnp.concatenate([psi_cohT_sigma_rot, psi_cohT_rest], axis=3)
 
-				sigma_x_val, hartree_val = pipeline_jit(
-				psi_valT_rot,
-				psi_val_rot,
-				psi_r,
-				psi_rT,
+				sigma_sx_val, sigma_coh_val, hartree_val = pipeline_jit(
+				psi_lT_rot,      # psi_l for SX (sigma window)
+				psi_l_rot,
+				psi_cohT_rot,    # psi_coh for COH (all bands, rotated)
+				psi_coh_rot,
+				psi_l_rot,       # psi_proj for final projection (same as psi_l)
+				psi_lT_rot,
+				W_mu_nu,
 				V_mu_nu,
 				v_q0_noG0_munu,
+				Gij_static,
 				meta.nkx, meta.nky, meta.nkz, meta.nk_tot, meta.nspinor,
 				float(wfn.cell_volume/np.prod(wfn.fft_grid)),
 				)
-			sigma_full_updated = sigma_x_val #+ hartree_val
-			#sigma_full_updated = sigma_full.at[:, sigma_slice, sigma_slice].set(sigma_total_block_local)
+			sigma_full_updated = sigma_sx_val + sigma_coh_val  # COHSEX = SX + COH
 			return sigma_full_updated, (
-				sigma_x_val,
+				sigma_sx_val,
+				sigma_coh_val,
 				hartree_val,
 				evals_full,
 				U_full,
@@ -1721,8 +1959,7 @@ def main(argv=None):
 			for i in range(_nit + 1):
 				print0(f"  it {i:02d}: {_hist[i]:.6e}")
 		sigma_total_full = jnp.reshape(sigma_vec_final, sigma_full_shape)
-		sigma_total_full, (sigma_x_kbar_ij_jax, hartree_kbar_ij_jax, E_full, U_full, H_qp_mnk) = sigma_iteration_step(sigma_total_full)
-		#sigma_total_block = sigma_total_full[:, sigma_slice, sigma_slice]
+		sigma_total_full, (sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax, E_full, U_full, H_qp_mnk) = sigma_iteration_step(sigma_total_full)
 		if meta.rank == 0:
 			final_res = float(residual_hist[int(n_iters)])
 			print0(f"Self-consistent GW completed in {int(n_iters)} iterations; final residual={final_res:.3e}")
@@ -1731,10 +1968,6 @@ def main(argv=None):
 		H_qp_mnk = kin_ion_full + sigma_total_full
 		H_qp_mnk = 0.5 * (H_qp_mnk + jnp.conj(jnp.swapaxes(H_qp_mnk, -1, -2)))
 		E_full, U_full = jax.vmap(jnp.linalg.eigh, in_axes=0)(H_qp_mnk)
-		#E_full = 
-		#sigma_total_block = sigma_total_full[:, sigma_slice, sigma_slice]
-
-	#sigma_total_val = sigma_total_full[:, valence_slice, valence_slice]
 
 	energies_full_dft, _ = get_enk_bandrange(
 		wfn,
@@ -1745,11 +1978,9 @@ def main(argv=None):
 	energies_dft_ev = jnp.asarray(energies_full_dft) * ryd2ev
 	energies_qp_ev = E_full * ryd2ev
 
-	sigma_x_full = sigma_x_kbar_ij_jax
-	hartree_full = sigma_total_full - sigma_x_full # this isn't even right, delete later
-
 	# Host copies for downstream I/O (keep qp eigenpairs for forthcoming steps)
-	sigma_x_kbar_ij = np.array(sigma_x_full)
+	sigma_sx_kbar_ij = np.array(sigma_sx_kbar_ij_jax)
+	sigma_coh_kbar_ij = np.array(sigma_coh_kbar_ij_jax)
 	hartree_kbar_ij = np.array(hartree_kbar_ij_jax)
 	H_qp_mnk_host = np.array(H_qp_mnk)
 	E_qp_mnk_host = np.array(E_full)
@@ -1757,20 +1988,25 @@ def main(argv=None):
 	energies_dft_ev_host = np.array(energies_dft_ev)
 	energies_qp_ev_host = np.array(energies_qp_ev)
 
-	write_sigma_to_file(ryd2ev * sigma_x_kbar_ij, params["output_file"], hartree_kij_Ry=hartree_kbar_ij)
-	#write_eqp_table(energies_dft_ev_host, energies_qp_ev_host, params["eqp_output_file"])
+	write_sigma_to_file(
+		ryd2ev * sigma_sx_kbar_ij,
+		params["output_file"],
+		sigma_coh_kij_eV=ryd2ev * sigma_coh_kbar_ij,
+		hartree_kij_eV=ryd2ev * hartree_kbar_ij,
+	)
 	write_eqp_table(energies_dft_ev_host, np.diagonal(H_qp_mnk_host, axis1=-2, axis2=-1), params["eqp_output_file"])
 	
 	# ============================================================================
 	# MATRIX SUMMARY: Report diagnostics for key matrices
 	# ============================================================================
-	# sigma_x:  exchange self-energy, shape (nk, nb_sigma, nb_sigma)
-	# hartree:  Hartree matrix elements (may include bands outside sigma window
-	#           if psi_r has more bands than sigma window - see psi_r shape in debug)
-	# H_qp:     quasiparticle Hamiltonian after SCF/diagonalization
+	# sigma_sx:  screened exchange self-energy, shape (nk, nb_sigma, nb_sigma)
+	# sigma_coh: Coulomb hole self-energy, shape (nk, nb_sigma, nb_sigma)
+	# hartree:   Hartree matrix elements
+	# H_qp:      quasiparticle Hamiltonian after SCF/diagonalization
 	# ============================================================================
 	if meta.rank == 0:
-		summarize_hermitian_matrix("sigma_x", sigma_x_kbar_ij, print_fn=print0)
+		summarize_hermitian_matrix("sigma_sx", sigma_sx_kbar_ij, print_fn=print0)
+		summarize_hermitian_matrix("sigma_coh", sigma_coh_kbar_ij, print_fn=print0)
 		# Hartree might include bands outside sigma window; report both full and sliced
 		nb_sigma_window = int(b3 - b1)  # Expected sigma window size
 		nb_hartree = hartree_kbar_ij.shape[1]
