@@ -530,6 +530,13 @@ class SymMaps:
         sym_krep = self.sym_mats_k[sym_idx] # note we apply with no changes
 
         wfn_kG = wfn.get_cnk(kbar_idx,nb)
+        
+        # For time-reversal symmetries (sym_idx >= ntran), apply complex conjugation
+        # Time-reversal: ψ_{n,-k}(r) = ψ*_{nk}(r), so u_{n,-k}(G) = u*_{nk}(-G)
+        ntran = len(self.sym_matrices)  # Number of spatial symmetries
+        if sym_idx >= ntran:
+            wfn_kG = np.conj(wfn_kG)
+        
         wfn_kG = np.einsum('jk,kl->jl', self.U_spinor[sym_idx], wfn_kG)
         return wfn_kG
 
