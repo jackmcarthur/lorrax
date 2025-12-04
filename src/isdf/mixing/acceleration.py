@@ -634,3 +634,284 @@ def rcrop_anderson(
         converged=bool(done),
     )
 
+
+# -----------------------------------------------------------------------------
+# Hermitian matrix utilities for SCF
+# -----------------------------------------------------------------------------
+
+
+def hermitian_to_upper_flat(H: jnp.ndarray) -> jnp.ndarray:
+    """Extract upper triangle of Hermitian matrix and flatten.
+    
+    Args:
+        H: Array of shape (..., n, n) - Hermitian matrices
+        
+    Returns:
+        Flattened upper triangle, shape (..., n*(n+1)//2) complex
+        Stored as: [H[0,0], H[0,1], ..., H[0,n-1], H[1,1], H[1,2], ..., H[n-1,n-1]]
+    """
+    *batch, n, _ = H.shape
+    # Get upper triangle indices
+    i_upper, j_upper = jnp.triu_indices(n)
+    # Extract upper triangle for each batch element
+    H_flat = H[..., i_upper, j_upper]
+    return H_flat
+
+
+def upper_flat_to_hermitian(H_flat: jnp.ndarray, n: int) -> jnp.ndarray:
+    """Reconstruct Hermitian matrix from flattened upper triangle.
+    
+    Args:
+        H_flat: Flattened upper triangle, shape (..., n*(n+1)//2)
+        n: Matrix dimension
+        
+    Returns:
+        Hermitian matrix of shape (..., n, n)
+    """
+    batch_shape = H_flat.shape[:-1]
+    i_upper, j_upper = jnp.triu_indices(n)
+    
+    # Initialize output
+    H = jnp.zeros(batch_shape + (n, n), dtype=H_flat.dtype)
+    
+    # Fill upper triangle
+    H = H.at[..., i_upper, j_upper].set(H_flat)
+    
+    # Fill lower triangle (conjugate transpose)
+    # H[i,j] = conj(H[j,i]) for i > j
+    i_lower, j_lower = jnp.tril_indices(n, k=-1)
+    H = H.at[..., i_lower, j_lower].set(jnp.conj(H[..., j_lower, i_lower]))
+    
+    return H
+
+
+@partial(jax.jit, static_argnums=(0, 2, 3, 4, 5))
+def _rcrop_hermitian_core(
+    residual_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    x0: jnp.ndarray,
+    n_matrix: int,
+    m: int,
+    maxit: int,
+    tol: float,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """rCROP for Hermitian matrices stored as upper triangles.
+    
+    The residual_fn takes and returns flattened upper triangles.
+    Internally, we work with these upper-triangle vectors.
+    
+    Args:
+        residual_fn: f(x_upper_flat) -> residual_upper_flat
+        x0: Initial flattened upper triangle
+        n_matrix: Matrix dimension (to reconstruct Hermitian)
+        m: History depth
+        maxit: Maximum iterations
+        tol: Convergence tolerance
+    """
+    n = x0.size
+    x = x0
+    f = residual_fn(x)
+    
+    Xhist = jnp.zeros((n, m), dtype=jnp.complex128)
+    Fhist = jnp.zeros((n, m), dtype=jnp.complex128)
+    head = jnp.int32(0)
+    filled = jnp.int32(0)
+    
+    res0 = jnp.linalg.norm(f)
+    res_buf = jnp.zeros((maxit + 1,), dtype=res0.dtype).at[0].set(res0)
+    done0 = res0 <= tol
+    it0 = jnp.int32(0)
+    
+    def cond(state):
+        _, _, _, _, _, _, res_buf, done, it = state
+        return jnp.logical_and(it < maxit, jnp.logical_not(done))
+    
+    def body(state):
+        x, f, Xhist, Fhist, head, filled, res_buf, done, it = state
+        
+        # Trial step
+        x_trial = x + f
+        f_trial = residual_fn(x_trial)
+        
+        # Roll history to chronological order
+        oldest_pos = (head - filled) % m
+        X_ord = jnp.roll(Xhist, shift=-oldest_pos, axis=1)
+        F_ord = jnp.roll(Fhist, shift=-oldest_pos, axis=1)
+        
+        # Mask unfilled columns
+        mask_cols = (jnp.arange(m) < filled)[None, :]
+        X_ord = jnp.where(mask_cols, X_ord, 0.0 + 0.0j)
+        F_ord = jnp.where(mask_cols, F_ord, 0.0 + 0.0j)
+        
+        # Build window
+        Xw = jnp.concatenate([X_ord, x_trial[:, None]], axis=1)
+        Fw = jnp.concatenate([F_ord, f_trial[:, None]], axis=1)
+        
+        # Solve for mixing coefficients
+        alpha = _solve_crop_alpha_v2(Fw, filled)
+        
+        # Update iterate
+        x_new = Xw @ alpha
+        
+        # Real residual (rCROP)
+        f_new = residual_fn(x_new)
+        
+        # Store in history
+        Xhist = Xhist.at[:, head].set(x_new)
+        Fhist = Fhist.at[:, head].set(f_new)
+        head = (head + 1) % m
+        filled = jnp.minimum(filled + 1, m)
+        
+        res = jnp.linalg.norm(f_new)
+        it1 = it + 1
+        res_buf = res_buf.at[it1].set(res)
+        done1 = res <= tol
+        
+        return (x_new, f_new, Xhist, Fhist, head, filled, res_buf, done1, it1)
+    
+    x, f, Xhist, Fhist, head, filled, res_buf, done, it = jax.lax.while_loop(
+        cond, body, (x, f, Xhist, Fhist, head, filled, res_buf, done0, it0)
+    )
+    return x, res_buf, it, done
+
+
+def rcrop_hermitian(
+    residual_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    x0: jnp.ndarray,
+    n_matrix: int,
+    m: int = 5,
+    maxit: int = 100,
+    tol: float = 1e-10,
+) -> AccelerationResult:
+    """rCROP for self-consistent Hermitian matrix problems.
+    
+    Optimized for Hermitian matrices by working with upper triangles only.
+    The residual_fn should take/return flattened upper triangles.
+    
+    Args:
+        residual_fn: f(x_upper_flat) -> residual_upper_flat
+        x0: Initial flattened upper triangle
+        n_matrix: Matrix dimension
+        m: History depth
+        maxit: Maximum iterations
+        tol: Convergence tolerance
+        
+    Returns:
+        AccelerationResult with final x (flattened upper triangle)
+    """
+    x, res_buf, it, done = _rcrop_hermitian_core(
+        residual_fn, x0, n_matrix, m, maxit, tol
+    )
+    return AccelerationResult(
+        x=x,
+        residual_norms=res_buf[: int(it) + 1],
+        iterations=int(it),
+        converged=bool(done),
+    )
+
+
+def rcrop_nojit(
+    residual_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    x0: jnp.ndarray,
+    m: int = 5,
+    maxit: int = 100,
+    tol: float = 1e-10,
+    print_fn: Callable = None,
+) -> AccelerationResult:
+    """rCROP without JIT - for use when residual_fn contains JIT'd code.
+    
+    This avoids XLA constant folding issues when the residual function
+    calls pre-JIT'd pipelines.
+    
+    Args:
+        residual_fn: f(x) -> residual (NOT JIT'd as static)
+        x0: Initial guess
+        m: History depth
+        maxit: Maximum iterations
+        tol: Convergence tolerance
+        print_fn: Optional print function for progress
+        
+    Returns:
+        AccelerationResult
+    """
+    n = x0.size
+    dtype = x0.dtype
+    
+    x = x0
+    f = residual_fn(x)
+    
+    # History buffers
+    Xhist = jnp.zeros((n, m), dtype=dtype)
+    Fhist = jnp.zeros((n, m), dtype=dtype)
+    
+    # Store initial
+    Xhist = Xhist.at[:, 0].set(x)
+    Fhist = Fhist.at[:, 0].set(f)
+    head = 1 % m
+    filled = 1
+    
+    res0 = float(jnp.linalg.norm(f))
+    res_history = [res0]
+    
+    if res0 <= tol:
+        return AccelerationResult(x=x, residual_norms=jnp.array(res_history),
+                                  iterations=0, converged=True)
+    
+    for it in range(maxit):
+        # Trial step
+        x_trial = x + f
+        f_trial = residual_fn(x_trial)
+        
+        # Roll history to chronological order
+        oldest_pos = (head - filled) % m
+        X_ord = jnp.roll(Xhist, shift=-oldest_pos, axis=1)
+        F_ord = jnp.roll(Fhist, shift=-oldest_pos, axis=1)
+        
+        # Mask unfilled columns
+        mask_cols = (jnp.arange(m) < filled)[None, :]
+        X_ord = jnp.where(mask_cols, X_ord, 0.0 + 0.0j)
+        F_ord = jnp.where(mask_cols, F_ord, 0.0 + 0.0j)
+        
+        # Build window
+        Xw = jnp.concatenate([X_ord, x_trial[:, None]], axis=1)
+        Fw = jnp.concatenate([F_ord, f_trial[:, None]], axis=1)
+        
+        # Solve for mixing coefficients
+        alpha = _solve_crop_alpha_v2(Fw, jnp.int32(filled))
+        
+        # Update iterate
+        x_new = Xw @ alpha
+        
+        # rCROP: compute real residual
+        f_new = residual_fn(x_new)
+        
+        # Store in history
+        Xhist = Xhist.at[:, head].set(x_new)
+        Fhist = Fhist.at[:, head].set(f_new)
+        head = (head + 1) % m
+        filled = min(filled + 1, m)
+        
+        res = float(jnp.linalg.norm(f_new))
+        res_history.append(res)
+        
+        if print_fn is not None and it < 10:
+            print_fn(f"  rCROP iter {it:02d}: residual = {res:.6e}")
+        
+        if res <= tol:
+            if print_fn is not None:
+                print_fn(f"rCROP converged in {it+1} iterations")
+            return AccelerationResult(
+                x=x_new, residual_norms=jnp.array(res_history),
+                iterations=it+1, converged=True
+            )
+        
+        x = x_new
+        f = f_new
+    
+    if print_fn is not None:
+        print_fn(f"rCROP did not converge after {maxit} iterations (residual = {res:.6e})")
+    
+    return AccelerationResult(
+        x=x, residual_norms=jnp.array(res_history),
+        iterations=maxit, converged=False
+    )
+

@@ -64,7 +64,9 @@ from ..common.epsreader import EPSReader
 from .gw_file_io import (write_sigma_to_file, write_eqp_table, write_labeled_arrays_to_h5, 
                          read_labeled_arrays_from_h5, load_labeled_arrays_from_h5, 
                          save_restart_per_proc)
-from .archive.jax_fixed_point_demo import crop_family_fixed_history_map
+from ..mixing.acceleration import (
+    rcrop_nojit, hermitian_to_upper_flat, upper_flat_to_hermitian
+)
 from ..common import Meta
 from ..common.gamma_matrices import gammas_sparse
 import isdf.common.timing as timing
@@ -884,7 +886,69 @@ def get_sigma_static_kij_jax(psi_sigX, psi_sigTY, sigma_k_munu):
 	sigma_k = sigma_k_munu.transpose(4, 5, 6, 0, 1, 2, 3).reshape(nk, *sigma_k_munu.shape[:4]) # (nk,s1,rmu1,s2,rmu2)
 	left = jnp.einsum('kmsx,ksxty->kmty', jnp.conj(psi_sigX), sigma_k, optimize=True)
 	return jnp.einsum('kmty,ktyn->kmn', left, psi_sigTY, optimize=True)
-# m,n bands, s,t spinor, x,y rmu
+
+
+# ================= Hartree helper functions =================
+
+def build_density_from_Gij(psi_rmu, Gij, nk_tot):
+	"""Build charge density at centroids from wavefunctions and Green's function.
+	
+	ρ_μ = (1/Nk) Σ_k Σ_{ij} G_ij(k) ψ*_ik(r_μ) ψ_jk(r_μ)
+	
+	For diagonal Gij (initial), this reduces to Σ_n f_n |ψ_n|².
+	For Gij = U @ diag(f) @ U† (self-consistent), this correctly computes
+	the density from the QP Green's function in the DFT basis.
+	
+	Args:
+		psi_rmu: (nk, nb, nspinor, n_rmu) wavefunctions at centroids
+		Gij: (nk, nb, nb) Green's function matrix (FULL matrix, not just diagonal)
+		nk_tot: Total number of k-points for BZ averaging
+		
+	Returns:
+		rho_mu: (n_rmu,) density at centroids
+	"""
+	# psi_rmu: (nk, nb, ns, rmu)
+	# Gij: (nk, ni, nj)
+	# rho_μ = Σ_k Σ_{ij} Σ_s G_ij ψ*_is(μ) ψ_js(μ)
+	# Contract: 'kij,kismu,kjsmu->mu' but need real part
+	# Build ψ*_i ψ_j first: (nk, ni, nj, ns, rmu)
+	psi_conj = jnp.conj(psi_rmu)  # (nk, nb, ns, rmu)
+	# ψ*_i(μ) ψ_j(μ) summed over spinor
+	psi_ij = jnp.einsum('kisx,kjsx->kijx', psi_conj, psi_rmu, optimize=True)  # (nk, ni, nj, rmu)
+	# Contract with Gij and sum over k, i, j
+	rho_mu = jnp.einsum('kij,kijx->x', Gij, psi_ij, optimize=True)
+	rho_mu = jnp.real(rho_mu) / jnp.asarray(nk_tot, dtype=jnp.float64)
+	return rho_mu
+
+
+def build_hartree_potential(rho_mu, V0_munu):
+	"""Build Hartree potential at centroids from density.
+	
+	[Vρ]_μ = Σ_ν V0_μν ρ_ν
+	
+	Args:
+		rho_mu: (n_rmu,) density at centroids
+		V0_munu: (n_rmu, n_rmu) bare Coulomb at q=0 (G=0 excluded)
+		
+	Returns:
+		Vrho_mu: (n_rmu,) Hartree potential at centroids
+	"""
+	return jnp.einsum('xy,y->x', V0_munu, rho_mu, optimize=True)
+
+
+def project_potential_to_bands(psi_rmu, Vrho_mu):
+	"""Project local potential to band matrix elements.
+	
+	V_mn(k) = Σ_μ,s ψ*_mk(r_μ) V_μ ψ_nk(r_μ)
+	
+	Args:
+		psi_rmu: (nk, nb, nspinor, n_rmu) wavefunctions at centroids
+		Vrho_mu: (n_rmu,) potential at centroids
+		
+	Returns:
+		V_kmn: (nk, nb, nb) potential matrix elements
+	"""
+	return jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_rmu), Vrho_mu, psi_rmu, optimize=True)
 
 def compute_sigma_pipeline_jax(
 	psi_l_rmuT_X,
@@ -984,25 +1048,10 @@ def compute_sigma_pipeline_jax(
 	sigma_coh_kij = -0.5 * get_sigma_static_kij_jax(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_coh_k_munu)
 
 	# ========== HARTREE MATRIX ELEMENTS ==========
-	# Step 1: Density at centroids using Gij_static for occupation weights
-	# ρ_μ = (1/Nk) Σ_k,n,s f_n |ψ_nk(r_μ)|²  where f_n = G_nn (occupation)
-	# psi_l_rmu_Y has shape (nk, nb_sigma, nspinor, n_rmu), Gij_static is (nk, nb_sigma, nb_sigma)
-	# Extract occupation from diagonal of Gij_static
-	occ_kn = jnp.diagonal(Gij_static, axis1=1, axis2=2)  # (nk, nb) - occupation per band
-	occ_kn = jnp.real(occ_kn)  # Should be real (0 or 1 for static COHSEX)
-	# Weighted density: Σ_k,n,s f_n |ψ_nk(r_μ)|²
-	psi_sq = jnp.real(jnp.conj(psi_l_rmu_Y) * psi_l_rmu_Y)  # (nk, nb_sigma, ns, rmu)
-	rho_mu = jnp.einsum('kn,knsx->x', occ_kn, psi_sq, optimize=True)
-	rho_mu = rho_mu * 1.0 / jnp.asarray(nk_tot, dtype=jnp.float64)  # BZ integration: 1/Nk
-	
-	# Step 2: Hartree potential at centroids
-	# [Vρ]_μ = Σ_ν V_μν ρ_ν
-	# V0_munu is V(q=0) with G=0 excluded to avoid Coulomb divergence
-	Vrho_mu = jnp.einsum('xy,y->x', V0_munu, rho_mu, optimize=True)
-	
-	# Step 3: Project to SIGMA WINDOW bands (psi_proj)
-	# <mk|V_H|nk> = Σ_μ,s ψ*_mk(r_μ) [Vρ]_μ ψ_nk(r_μ)
-	hartree_kmn = jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_proj_rmu_X), Vrho_mu, psi_proj_rmu_X, optimize=True)
+	# Uses Gij_static diagonal for occupation weights
+	rho_mu = build_density_from_Gij(psi_l_rmu_Y, Gij_static, nk_tot)
+	Vrho_mu = build_hartree_potential(rho_mu, V0_munu)
+	hartree_kmn = project_potential_to_bands(psi_proj_rmu_X, Vrho_mu)
 	
 	return sigma_sx_kij, sigma_coh_kij, hartree_kmn
 
@@ -1513,7 +1562,7 @@ def main(argv=None):
 			save_restart_per_proc(os.path.join(tmp_dir, "taggedarrays"), V_qmunu, S_qmunu, psi_l_full, psir_X, enk_l, enk_r, meta, mesh_xy, V0_noG0_munu=v_q0_noG0_munu)
 			V_qmunu.block_until_ready()
 
-	elif restart and not x_only: # TODO update for jax
+	elif restart and not x_only:
 		with timing.section("cohsex_jax.restart_load") as restart_timer:
 			# Build mesh for sharding in restart path if missing
 			if mesh_xy is None:
@@ -1531,14 +1580,53 @@ def main(argv=None):
 			)
 			V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0]
 			# Aliases for self-consistent loop
-			# NOTE: In restart mode, psi_l from file has OLD format (all bands).
-			# We use it for both SX and COH since the restart file doesn't have
-			# the new separate arrays. This may cause dimension mismatches.
 			psi_l_full = psi_l
 			psi_lT_full = psi_lT
 			# COH needs all bands - in restart mode, psi_l has all bands (old format)
 			psi_coh = psi_l
 			psi_cohT = psi_lT
+			
+		# If do_screened, load valence/conduction wavefunctions from WFN for chi0
+		if do_screened:
+			with timing.section("cohsex_jax.restart_load_chi0_wfns") as timer_chi_wfns:
+				valence_range = (b0, b2)
+				conduction_range = (b2, b4)
+				
+				# Load VALENCE wavefunctions for chi0
+				global_psiG_v, nb_v = read_Gvecs_to_devices(wfn, sym, valence_range, meta, bispinor, mesh_xy)
+				psi_v_rtot_Y, psi_v_rmu_Y, psi_v_rmuT_X = get_sharded_wfns(
+					global_psiG_v, sym, meta, centroid_indices, nb_v, False, mesh_xy
+				)
+				del global_psiG_v
+				gc.collect()
+				
+				# Load CONDUCTION wavefunctions for chi0
+				global_psiG_c, nb_c = read_Gvecs_to_devices(wfn, sym, conduction_range, meta, bispinor, mesh_xy)
+				psi_c_rtot_Y, psi_c_rmu_Y, psi_c_rmuT_X = get_sharded_wfns(
+					global_psiG_c, sym, meta, centroid_indices, nb_c, False, mesh_xy
+				)
+				del global_psiG_c
+				gc.collect()
+				
+				# Get energies for valence/conduction
+				enk_v, _ = get_enk_bandrange(wfn, sym, valence_range, (b1, b2))
+				enk_c, _ = get_enk_bandrange(wfn, sym, conduction_range, (b2, b4))
+				
+				# Apply shardings for chi0 - MUST match non-restart path transposition!
+				# psi_rmu_Y: (nk, nb, nspinor, n_rmu)
+				# psi_vTX needs: (nk, nspinor, n_rmu, nb) = transpose(0, 2, 3, 1)
+				# psi_cTY needs: (nk, nspinor, n_rmu, nb) = transpose(0, 2, 3, 1)
+				with mesh_xy:
+					# Valence: psi_v = Y-sharded, psi_vT = X-sharded with correct transpose
+					psi_v = jax.device_put(psi_v_rmu_Y, sh.y3_4)
+					psi_vT = jax.lax.with_sharding_constraint(psi_v.transpose(0, 2, 3, 1), sh.x2_4)
+					# Conduction: psi_c = X-sharded, psi_cT = Y-sharded with correct transpose
+					psi_c = jax.device_put(psi_c_rmu_Y, sh.x3_4)
+					psi_cT = jax.lax.with_sharding_constraint(psi_c.transpose(0, 2, 3, 1), sh.y2_4)
+				print0(f"[restart] Loaded chi0 wavefunctions: valence {valence_range}, conduction {conduction_range}")
+				print0(f"[restart] psi_v shape: {psi_v.shape}, psi_vT shape: {psi_vT.shape}")
+				print0(f"[restart] psi_c shape: {psi_c.shape}, psi_cT shape: {psi_cT.shape}")
+				print0(f"[restart] enk_v shape: {enk_v.shape}, enk_c shape: {enk_c.shape}")
 	elif restart and x_only:
 		with timing.section("cohsex_jax.restart_load_x_only") as restart_timer:
 			# Same restart flow for X-only
@@ -1565,17 +1653,15 @@ def main(argv=None):
 
 	# Optionally compute chi0 via JAX for screened interaction if requested
 	if do_screened:
-		# Check if valence/conduction wavefunctions are available (only in non-restart path)
-		if restart:
-			raise NotImplementedError(
-				"do_screened=True with restart=True is not yet supported. "
-				"Please run with restart=False to compute W from scratch, or save W to h5."
-			)
 		with timing.section("cohsex_jax.chi0_W") as timer_chiw:
 			# Ensure energies are plain arrays for JAX
 			# Use VALENCE energies for psi_v and CONDUCTION energies for psi_c
 			enk_v_arr = jnp.asarray(getattr(enk_v, 'data', enk_v))
 			enk_c_arr = jnp.asarray(getattr(enk_c, 'data', enk_c))
+			# Debug: verify shapes match
+			print0(f"[chi0] enk_v_arr shape: {enk_v_arr.shape}, enk_c_arr shape: {enk_c_arr.shape}")
+			print0(f"[chi0] psi_vT shape: {psi_vT.shape}, psi_v shape: {psi_v.shape}")
+			print0(f"[chi0] psi_cT shape: {psi_cT.shape}, psi_c shape: {psi_c.shape}")
 			# chi0 expects:
 			#   psi_vTX: valence, transposed, X-sharded on rmu
 			#   psi_vY:  valence, Y-sharded on rmu
@@ -1661,16 +1747,6 @@ def main(argv=None):
 	nb_sigma = int(b3 - b0)    # Sigma window size (for SX Green's function + projection)
 	nk = meta.nk_tot
 	
-	# DEBUG: Print band counts and wavefunction shapes
-	print0(f"DEBUG bands: b0={b0}, b3={b3}, b4={b4}, nb_sigma={nb_sigma}, nband_full={nband_full}")
-	print0(f"DEBUG psi_l shape: {psi_l.shape} (sigma window for SX)")
-	print0(f"DEBUG psi_lT shape: {psi_lT.shape}")
-	print0(f"DEBUG psi_r shape: {psi_r.shape} (ISDF right, bands b1 to b4)")
-	print0(f"DEBUG psi_coh shape: {psi_coh.shape} (all bands for COH G_RI)")
-	if not restart:
-		print0(f"DEBUG psi_v shape: {psi_v.shape} (valence for chi0)")
-		print0(f"DEBUG psi_c shape: {psi_c.shape} (conduction for chi0)")
-	
 	# Gij_static sized for psi_l (sigma window), NOT psi_coh (all bands)
 	Gij_static = jnp.zeros((nk, nb_sigma, nb_sigma), dtype=jnp.complex128)
 	nelec = int(wfn.nelec)
@@ -1700,147 +1776,6 @@ def main(argv=None):
 		out_shardings=(sh.out_shard, sh.out_shard, sh.out_shard),
 	)
 
-	# ========== HARTREE DIAGNOSTIC ==========
-	# Prints detailed info about V0, density, and Hartree matrix elements
-	if params.get("debug_hartree", False):
-		print0("\n" + "="*70)
-		print0("HARTREE DIAGNOSTIC")
-		print0("="*70)
-		
-		# Print band range info for context
-		print0(f"\n  BAND RANGES (0-indexed):")
-		print0(f"    b0={b0}, b1={b1}, b2={b2} (VBM+1=CBM), b3={b3}, b4={b4}")
-		print0(f"    Valence in sigma:    bands {b1}..{b2-1} ({b2-b1} bands)")
-		print0(f"    Conduction in sigma: bands {b2}..{b3-1} ({b3-b2} bands)")
-		print0(f"    Total sigma window:  bands {b1}..{b3-1} ({b3-b1} bands)")
-		print0(f"    N_electrons = {int(wfn.nelec)}")
-		
-		V0_np = np.asarray(v_q0_noG0_munu)
-		V_q0_from_Vqmunu = np.asarray(V_qmunu[0, 0, 0, 0, 0, 0])
-		print0(f"\n  V0 MATRIX (q=0, G=0 excluded):")
-		print0(f"    ||V0_noG0|| = {np.linalg.norm(V0_np):.4f}")
-		print0(f"    ||V_qmunu[q=0]|| = {np.linalg.norm(V_q0_from_Vqmunu):.4f}")
-		print0(f"    ||V0 - Vq0|| = {np.linalg.norm(V0_np - V_q0_from_Vqmunu):.4e}")
-		if do_G0 and G0_mu_nu is not None:
-			g0 = np.asarray(G0_mu_nu)
-			head_outer = np.outer(g0.conj(), g0)
-			print0(f"    ||G0_mu_nu|| = {np.linalg.norm(g0):.4f}")
-			print0(f"    ||head_outer|| = {np.linalg.norm(head_outer):.4f}")
-			proj = np.abs(np.vdot(V0_np, head_outer)) / (np.linalg.norm(V0_np) * np.linalg.norm(head_outer) + 1e-12)
-			print0(f"    V0 projection onto head: {proj:.6f}")
-			if do_screened:
-				print0(f"    vc0_mean = {float(vc0_mean.real):.4f}")
-				head_mag = float(vc0_mean.real) / float(wfn.cell_volume) * np.linalg.norm(head_outer)
-				print0(f"    Expected head contribution: {head_mag:.4f}")
-		
-		# Density diagnostic
-		psi_l_np = np.asarray(psi_l)  # psi_l is sliced to valence: bands b0..b2-1
-		n_bands_in_density = psi_l_np.shape[1]
-		rho_test = np.einsum('knsx,knsx->x', np.conj(psi_l_np), psi_l_np).real / meta.nk_tot
-		print0(f"\n  DENSITY (from psi_l, valence bands for Hartree):")
-		print0(f"    Bands in density sum: {n_bands_in_density} (should be {b2-b0} = all occupied)")
-		print0(f"    Sum(ρ_μ) = {np.sum(rho_test):.4f}")
-		print0(f"    Mean(ρ_μ) = {np.mean(rho_test):.6f}")
-		
-		# Check wavefunction normalization at centroids
-		# For properly normalized ψ: ∫|ψ|²dr = 1
-		# In ISDF: Σ_μ |ψ(r_μ)|² × (implicit weight from ζ_μ) should ≈ 1
-		psi_norm_per_band = np.einsum('knsx,knsx->kn', np.conj(psi_l_np), psi_l_np).real
-		print0(f"    Σ_μ,s |ψ_nk(r_μ)|² per band (k=0, first 5 bands): {psi_norm_per_band[0, :5]}")
-		print0(f"    Mean over all k,n: {np.mean(psi_norm_per_band):.4f}")
-		print0(f"    If this is ~n_rmu, wavefunctions are per-centroid normalized (not ISDF-weighted)")
-		if do_G0 and G0_mu_nu is not None:
-			rho_integral_proxy = np.sum(rho_test * np.abs(g0)**2)
-			print0(f"    Σ_μ ρ_μ × |ζ_μ(0)|² = {rho_integral_proxy:.4f}")
-		
-		# Hartree potential at centroids
-		Vrho_test = V0_np @ rho_test
-		print0(f"\n  [V0 @ ρ] (Hartree potential at centroids):")
-		print0(f"    Min = {Vrho_test.real.min():.4f}, Max = {Vrho_test.real.max():.4f}")
-		print0(f"    # negative values: {np.sum(Vrho_test.real < 0)} / {len(Vrho_test)}")
-		
-		# Hartree matrix elements for valence and conduction separately
-		print0(f"\n  V_H DIAGONAL (k=0):")
-		psi_k0 = psi_l_np[0]  # This is psi_l at k=0, contains valence bands only
-		n_val_bands = min(psi_k0.shape[0], b2 - b0)  # Number of valence bands
-		
-		# Valence bands (from psi_l)
-		# Compare with k0_diag.txt reference if available
-		k0_ref_path = os.path.join(input_dir, 'k0_diag.txt')
-		k0_ref = None
-		if os.path.exists(k0_ref_path):
-			try:
-				k0_ref = np.loadtxt(k0_ref_path)
-				print0(f"    (Loaded reference from k0_diag.txt)")
-			except Exception:
-				pass
-		
-		print0(f"    VALENCE (bands {b0}..{b0 + min(5, n_val_bands) - 1}):")
-		for n in range(min(5, n_val_bands)):
-			overlap = np.sum(np.abs(psi_k0[n])**2, axis=0)
-			V_H_n = np.sum(overlap * Vrho_test).real
-			ref_str = ""
-			if k0_ref is not None and n < len(k0_ref):
-				V_H_ref = k0_ref[n, 3] if k0_ref.ndim == 2 and k0_ref.shape[1] > 3 else 0
-				ratio = V_H_n / V_H_ref if abs(V_H_ref) > 1e-6 else 0
-				ref_str = f" | ref={V_H_ref:.4f} Ry | ratio={ratio:.2f}x"
-			print0(f"      band {b0+n}: {V_H_n:.4f} Ry{ref_str}")
-		
-		# Check if we have sigma bands (psi_r) to show conduction
-		psi_r_np = np.asarray(psi_r)  # psi_r contains sigma window bands
-		n_sigma_bands = psi_r_np.shape[1]
-		print0(f"\n  PSI ARRAY SHAPES:")
-		print0(f"    psi_l shape: {psi_l_np.shape} (b0→b3: SX, Hartree density, projection)")
-		print0(f"    psi_r shape: {psi_r_np.shape} (b1→b4: ISDF fitting right)")
-		print0(f"    psi_coh shape: {np.asarray(psi_coh).shape} (b0→b4: COH G_RI sum)")
-		print0(f"    n_sigma_bands in psi_l: {psi_l_np.shape[1]} (sigma window for projection)")
-		print0(f"    Sigma window should be: {b3-b1} bands (b1={b1} to b3={b3})")
-		
-		if n_sigma_bands > n_val_bands:
-			print0(f"    CONDUCTION (first 5 cond bands in sigma window):")
-			psi_r_k0 = psi_r_np[0]
-			# psi_r starts at band b1, so conduction starts at index (b2-b1)
-			cond_start_idx = b2 - b1 if b1 <= b2 else 0
-			for i in range(min(5, n_sigma_bands - cond_start_idx)):
-				n_idx = cond_start_idx + i
-				if n_idx < n_sigma_bands:
-					overlap = np.sum(np.abs(psi_r_k0[n_idx])**2, axis=0)
-					V_H_n = np.sum(overlap * Vrho_test).real
-					band_id = b1 + n_idx  # Actual band index
-					in_sigma = b1 <= band_id < b3
-					print0(f"      band {band_id}: {V_H_n:.4f} Ry {'(NEGATIVE!)' if V_H_n < 0 else ''} {'[IN SIGMA]' if in_sigma else '[OUTSIDE SIGMA]'}")
-		
-		# Scan ALL bands in psi_r and find which ones have negative Hartree
-		print0(f"\n  NEGATIVE HARTREE SCAN (all bands in psi_r):")
-		psi_r_k0 = psi_r_np[0]
-		neg_in_sigma = []
-		neg_outside_sigma = []
-		for n_idx in range(n_sigma_bands):
-			overlap = np.sum(np.abs(psi_r_k0[n_idx])**2, axis=0)
-			V_H_n = np.sum(overlap * Vrho_test).real
-			band_id = b1 + n_idx
-			if V_H_n < 0:
-				in_sigma = b1 <= band_id < b3
-				if in_sigma:
-					neg_in_sigma.append((band_id, V_H_n))
-				else:
-					neg_outside_sigma.append((band_id, V_H_n))
-		
-		print0(f"    # negative IN sigma window [b1={b1}, b3={b3}): {len(neg_in_sigma)}")
-		for bid, vh in neg_in_sigma[:5]:
-			print0(f"      band {bid}: {vh:.4f} Ry")
-		if len(neg_in_sigma) > 5:
-			print0(f"      ... and {len(neg_in_sigma)-5} more")
-		
-		print0(f"    # negative OUTSIDE sigma window (bands >= b3={b3}): {len(neg_outside_sigma)}")
-		for bid, vh in neg_outside_sigma[:5]:
-			print0(f"      band {bid}: {vh:.4f} Ry")
-		if len(neg_outside_sigma) > 5:
-			print0(f"      ... and {len(neg_outside_sigma)-5} more")
-		
-		print0("="*70 + "\n")
-	# ========== END HARTREE DIAGNOSTIC ==========
-
 	with mesh_xy:
 			with timing.section("cohsex_jax.pipeline"):
 				sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = pipeline_jit(
@@ -1862,169 +1797,279 @@ def main(argv=None):
 				hartree_kbar_ij_jax.block_until_ready()
 
 
-	sigma_total_full = sigma_sx_kbar_ij_jax + sigma_coh_kbar_ij_jax  # COHSEX = SX + COH
-	sigma_full_shape = sigma_total_full.shape
+	# Initial Σ = SX + COH + Hartree (all three combined for self-consistency)
+	sigma_total_full = sigma_sx_kbar_ij_jax + sigma_coh_kbar_ij_jax + hartree_kbar_ij_jax
+	
+	# Save INITIAL sigma for one-shot diagnostic (before self-consistency changes them)
+	sigma_sx_initial = sigma_sx_kbar_ij_jax
+	sigma_coh_initial = sigma_coh_kbar_ij_jax
+	hartree_initial = hartree_kbar_ij_jax
 
 	qp_band_start = int(b0)
 	qp_band_stop = int(b3)
 	kin_ion_path = params["kin_ion_file"]
 	kin_ion_full = load_kin_ion_submatrix(kin_ion_path, qp_band_start, qp_band_stop)
-
+	nelec = int(wfn.nelec)
 	
-	if self_consistent:
-		# Fixed reference gauge from initial Hamiltonian H0 = kin_ion + initial sigma_x
-		H0 = kin_ion_full + sigma_total_full
-		H0 = 0.5 * (H0 + jnp.conj(jnp.swapaxes(H0, -1, -2)))
-		_E0, U_fix0 = jax.vmap(jnp.linalg.eigh, in_axes=0)(H0)
+	# Diagnostic: check initial values (in Ry) before self-consistency
+	# kin_ion = T + V_ion + V_NL (no V_H, no V_XC)
+	# k0_diag.txt has K+I+H+NL = T + V_ion + V_H + V_NL (no V_XC)
+	# So kin_ion + VH should match k0_diag.txt's K+I+H+NL column
+	if meta.rank == 0:
+		sx_diag = np.real(np.diag(np.asarray(sigma_sx_kbar_ij_jax[0])))
+		coh_diag = np.real(np.diag(np.asarray(sigma_coh_kbar_ij_jax[0])))
+		vh_diag = np.real(np.diag(np.asarray(hartree_kbar_ij_jax[0])))
+		kin_diag = np.real(np.diag(np.asarray(kin_ion_full[0])))
+		print(f"[Diagnostic k=0] kin_ion (T+Vion+VNL) diag[:5] (Ry): {kin_diag[:5]}")
+		print(f"[Diagnostic k=0] VH diag[:5] (Ry): {vh_diag[:5]}")
+		print(f"[Diagnostic k=0] kin_ion+VH diag[:5] (Ry): {kin_diag[:5] + vh_diag[:5]}  <-- compare to k0_diag K+I+H+NL")
+		print(f"[Diagnostic k=0] SX diag[:5] (Ry): {sx_diag[:5]}")
+		print(f"[Diagnostic k=0] COH diag[:5] (Ry): {coh_diag[:5]}")
+		
+		# Check off-diagonal structure of V_H and (kin_ion + V_H)
+		# In DFT eigenbasis: (kin_ion + V_H + V_xc) is diagonal
+		# => (kin_ion + V_H)_mn = -V_xc_mn for m != n
+		kin_mat = np.asarray(kin_ion_full[0])
+		vh_mat = np.asarray(hartree_kbar_ij_jax[0])
+		kin_vh = kin_mat + vh_mat
+		sx_mat = np.asarray(sigma_sx_kbar_ij_jax[0])
+		coh_mat = np.asarray(sigma_coh_kbar_ij_jax[0])
+		
+		# Remove diagonal to get off-diagonal
+		kin_off = kin_mat - np.diag(np.diag(kin_mat))
+		vh_off = vh_mat - np.diag(np.diag(vh_mat))
+		kin_vh_off = kin_vh - np.diag(np.diag(kin_vh))
+		sx_off = sx_mat - np.diag(np.diag(sx_mat))
+		coh_off = coh_mat - np.diag(np.diag(coh_mat))
+		sigma_off = sx_off + coh_off + vh_off
+		
+		print(f"[Off-diag k=0] |kin_ion|_max: {np.abs(kin_off).max():.4f} Ry = {np.abs(kin_off).max()*13.6:.1f} eV")
+		print(f"[Off-diag k=0] |V_H|_max: {np.abs(vh_off).max():.4f} Ry = {np.abs(vh_off).max()*13.6:.1f} eV")
+		print(f"[Off-diag k=0] |kin_ion+V_H|_max: {np.abs(kin_vh_off).max():.4f} Ry = {np.abs(kin_vh_off).max()*13.6:.1f} eV  <-- should be |V_xc|_max")
+		print(f"[Off-diag k=0] |SX|_max: {np.abs(sx_off).max():.4f} Ry")
+		print(f"[Off-diag k=0] |COH|_max: {np.abs(coh_off).max():.4f} Ry")
+		
+		# The COHSEX self-energy (without V_H) vs V_xc comparison
+		sigma_cohsex_off = sx_off + coh_off  # Just SX + COH (the "exchange-correlation" replacement)
+		print(f"[Off-diag k=0] |SX+COH|_max: {np.abs(sigma_cohsex_off).max():.4f} Ry = {np.abs(sigma_cohsex_off).max()*13.6:.1f} eV")
+		print(f"[Off-diag k=0] |kin_ion+V_H|_max = |V_xc|_max: {np.abs(kin_vh_off).max():.4f} Ry = {np.abs(kin_vh_off).max()*13.6:.1f} eV")
+		
+		# H_QP = kin_ion + V_H + SX + COH (no double counting!)
+		H_QP_off = kin_vh_off + sigma_cohsex_off
+		print(f"[Off-diag k=0] |H_QP|_max = |(SX+COH) - V_xc|_max: {np.abs(H_QP_off).max():.4f} Ry = {np.abs(H_QP_off).max()*13.6:.1f} eV")
+		print(f"[Off-diag k=0] --> Large because COHSEX has small off-diag (~{np.abs(sigma_cohsex_off).max()*13.6:.1f} eV) but V_xc has large off-diag (~{np.abs(kin_vh_off).max()*13.6:.1f} eV)")
 
-		def sigma_iteration_step(sigma_full: jax.Array):
-			# Build current Hamiltonian and diagonalize
+	if self_consistent:
+		# Self-consistent COHSEX: iterate until Σ converges
+		# Key equations:
+		#   H = H_DFT + Σ
+		#   Diagonalize: H U = U ε
+		#   G_ij = U @ diag(f) @ U†  where f = occupation (1 for occupied, 0 for empty)
+		#   Compute new Σ_SX, Σ_COH, V_H using G_ij
+		#   Σ_new = Σ_SX + Σ_COH + V_H
+		# Wavefunctions stay fixed; rotation is encoded in G_ij.
+		
+		n_upper = nb_sigma * (nb_sigma + 1) // 2  # Upper triangle size per k-point
+		
+		def sigma_iteration_step(sigma_upper_flat: jax.Array) -> jax.Array:
+			"""One iteration of self-consistent COHSEX.
+			
+			Takes/returns upper triangle of Σ (Hermitian optimization).
+			"""
+			# Restore full Hermitian matrix from upper triangle
+			# Input is (nk * n_upper,), reshape to (nk, n_upper) then convert
+			sigma_upper = sigma_upper_flat.reshape(nk, n_upper)
+			sigma_full = upper_flat_to_hermitian(sigma_upper, nb_sigma)  # (nk, nb_sigma, nb_sigma)
+			
+			# Diagonalize H = H_DFT + Σ
 			H_full = kin_ion_full + sigma_full
 			H_full = 0.5 * (H_full + jnp.conj(jnp.swapaxes(H_full, -1, -2)))
-			# Batched eigh over k
-			evals_full, U_full_raw = jax.vmap(jnp.linalg.eigh, in_axes=0)(H_full)
-			def align_unitaries(U_ref, U_full):
-				# M = U_ref^† U_full = W S V^†  => polar unitary Q = W V^†
-				def one_k(Ur, U):
-					M = jnp.conj(Ur).swapaxes(-1, -2) @ U
-					W, S, Vh = jnp.linalg.svd(M, full_matrices=False)
-					Q = W @ Vh  # unitary closest to M in Frobenius norm
-					return U @ jnp.conj(Q).swapaxes(-1, -2)  # rotate U toward reference
-				return jax.vmap(one_k)(U_ref, U_full)
-			# Align U to fixed gauge U_fix0
-			U_full = align_unitaries(U_fix0, U_full_raw)
-			# Rotate wavefunctions explicitly: psi' = U psi, psi_T' = psi_T @ U^T
-			# psi_l and psi_l_full have (b0, b3) = nb_sigma bands, matches U_full size
-			# psi_coh has (b0, b4) = nband_full bands, only first nb_sigma get rotated
+			_, U_full = jax.vmap(jnp.linalg.eigh, in_axes=0)(H_full)
+			
+			# Build G_ij = U @ diag(f) @ U† (projector onto occupied states)
+			# f = [1,1,...,1,0,0,...,0] with nelec ones
+			f_occ = (jnp.arange(nb_sigma) < nelec).astype(jnp.float64)
+			Gij_new = jnp.einsum('kim,m,kjm->kij', U_full, f_occ, jnp.conj(U_full), optimize=True)
+			
+			# Compute new Σ using original wavefunctions but updated G_ij
 			with mesh_xy:
-				# Rotate psi_l (sigma window) for SX and projection
-				psi_l_rot = jnp.einsum('kij, kjab->kiab', U_full, psi_l_full, optimize=True)
-				psi_lT_rot = jnp.einsum('kij, kabj->kabi', U_full, psi_lT_full, optimize=True)
-				
-				# Rotate first nb_sigma bands of psi_coh, keep rest unchanged
-				psi_coh_sigma = psi_coh[:, :nb_sigma, :, :]   # (nk, nb_sigma, ns, rmu)
-				psi_coh_rest = psi_coh[:, nb_sigma:, :, :]    # (nk, nband_full-nb_sigma, ns, rmu)
-				psi_coh_sigma_rot = jnp.einsum('kij, kjab->kiab', U_full, psi_coh_sigma, optimize=True)
-				psi_coh_rot = jnp.concatenate([psi_coh_sigma_rot, psi_coh_rest], axis=1)
-				
-				psi_cohT_sigma = psi_cohT[:, :, :, :nb_sigma]
-				psi_cohT_rest = psi_cohT[:, :, :, nb_sigma:]
-				psi_cohT_sigma_rot = jnp.einsum('kij, kabj->kabi', U_full, psi_cohT_sigma, optimize=True)
-				psi_cohT_rot = jnp.concatenate([psi_cohT_sigma_rot, psi_cohT_rest], axis=3)
-
-				sigma_sx_val, sigma_coh_val, hartree_val = pipeline_jit(
-				psi_lT_rot,      # psi_l for SX (sigma window)
-				psi_l_rot,
-				psi_cohT_rot,    # psi_coh for COH (all bands, rotated)
-				psi_coh_rot,
-				psi_l_rot,       # psi_proj for final projection (same as psi_l)
-				psi_lT_rot,
-				W_mu_nu,
-				V_mu_nu,
-				v_q0_noG0_munu,
-				Gij_static,
-				meta.nkx, meta.nky, meta.nkz, meta.nk_tot, meta.nspinor,
-				float(wfn.cell_volume/np.prod(wfn.fft_grid)),
+				sigma_sx_new, sigma_coh_new, hartree_new = pipeline_jit(
+					psi_lT, psi_l,      # psi_l for SX
+					psi_cohT, psi_coh,  # psi_coh for COH (unchanged, uses G_RI)
+					psi_l, psi_lT,      # psi_proj for projection
+					W_mu_nu, V_mu_nu,
+					v_q0_noG0_munu,
+					Gij_new,            # Updated Green's function
+					meta.nkx, meta.nky, meta.nkz, meta.nk_tot, meta.nspinor,
+					float(wfn.cell_volume/np.prod(wfn.fft_grid)),
 				)
-			sigma_full_updated = sigma_sx_val + sigma_coh_val  # COHSEX = SX + COH
-			return sigma_full_updated, (
-				sigma_sx_val,
-				sigma_coh_val,
-				hartree_val,
-				evals_full,
-				U_full,
-				H_full,
-			)
-
-		def residual_map(vec: jax.Array) -> jax.Array:
-			sigma_full = jnp.reshape(vec, sigma_full_shape)
-			sigma_next, _ = sigma_iteration_step(sigma_full)
-			return jnp.reshape(sigma_next - sigma_full, (-1,))
-
-
-		sigma_vec0 = jnp.reshape(sigma_total_full, (-1,))
-		sigma_vec_final, residual_hist, n_iters = crop_family_fixed_history_map(
-			residual_map,
-			sigma_vec0,
-			m=2,
+			
+			# Combine and extract upper triangle
+			sigma_new = sigma_sx_new + sigma_coh_new + hartree_new
+			return hermitian_to_upper_flat(sigma_new).flatten()
+		
+		def residual_fn(sigma_upper_flat: jax.Array) -> jax.Array:
+			sigma_next = sigma_iteration_step(sigma_upper_flat)
+			return sigma_next - sigma_upper_flat
+		
+		# Initial guess: upper triangle of Σ
+		sigma0_upper = hermitian_to_upper_flat(sigma_total_full).flatten()
+		
+		# Run rCROP acceleration (Python loop to avoid XLA constant folding)
+		result = rcrop_nojit(
+			residual_fn,
+			sigma0_upper,
+			m=3,
 			maxit=40,
 			tol=1e-5,
-			real_residual=True,
+			print_fn=print0 if meta.rank == 0 else None,
 		)
-		# Print residual history on rank 0
-		if meta.rank == 0:
-			_hist = np.array(residual_hist)
-			_nit = int(n_iters)
-			print0(f"CROP residual history (iters={_nit}):")
-			for i in range(_nit + 1):
-				print0(f"  it {i:02d}: {_hist[i]:.6e}")
-		sigma_total_full = jnp.reshape(sigma_vec_final, sigma_full_shape)
-		sigma_total_full, (sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax, E_full, U_full, H_qp_mnk) = sigma_iteration_step(sigma_total_full)
-		if meta.rank == 0:
-			final_res = float(residual_hist[int(n_iters)])
-			print0(f"Self-consistent GW completed in {int(n_iters)} iterations; final residual={final_res:.3e}")
+		
+		# Restore final Σ
+		sigma_final = result.x.reshape(nk, n_upper)
+		sigma_total_full = upper_flat_to_hermitian(sigma_final, nb_sigma)
+		
+		# Final diagonalization
+		H_qp_mnk = kin_ion_full + sigma_total_full
+		H_qp_mnk = 0.5 * (H_qp_mnk + jnp.conj(jnp.swapaxes(H_qp_mnk, -1, -2)))
+		E_full, U_full = jax.vmap(jnp.linalg.eigh, in_axes=0)(H_qp_mnk)
+		
+		# Get final components for output
+		f_occ = (jnp.arange(nb_sigma) < nelec).astype(jnp.float64)
+		Gij_final = jnp.einsum('kim,m,kjm->kij', U_full, f_occ, jnp.conj(U_full), optimize=True)
+		
+		# Diagnostic: check Gij_final properties
+		Gij_trace = jnp.real(jnp.trace(Gij_final[0]))
+		Gij_diag = jnp.real(jnp.diagonal(Gij_final[0]))
+		print(f"[Diagnostic] Gij_final trace at k=0: {float(Gij_trace):.4f} (should be {nelec})")
+		print(f"[Diagnostic] Gij_final diag[:5] at k=0: {np.array(Gij_diag[:5])}")
+		print(f"[Diagnostic] Gij_final diag sum at k=0: {float(jnp.sum(Gij_diag)):.4f}")
+		
+		# Check U unitarity: U† @ U should be identity
+		UdagU = jnp.einsum('kim,kin->kmn', jnp.conj(U_full[0:1]), U_full[0:1])
+		unitarity_err = jnp.max(jnp.abs(UdagU[0] - jnp.eye(nb_sigma)))
+		print(f"[Diagnostic] U unitarity error at k=0: {float(unitarity_err):.2e} (should be ~0)")
+		
+		# Check eigenvector structure: U[i,m] = <i_DFT|m_QP>
+		# For nearly-identity rotation, U[i,i] should be ~1
+		U_diag = jnp.abs(jnp.diagonal(U_full[0]))
+		print(f"[Diagnostic] |U| diagonal[:5] at k=0: {np.array(U_diag[:5])} (should be ~1 if no mixing)")
+		print(f"[Diagnostic] |U| diagonal[25:30] at k=0: {np.array(U_diag[25:30])} (valence-cond boundary)")
+		
+		# First eigenvector (lowest QP state): which DFT bands contribute?
+		U_col0_abs = jnp.abs(U_full[0, :, 0])  # |<i_DFT|0_QP>|
+		top_contrib = jnp.argsort(U_col0_abs)[::-1][:5]  # Top 5 DFT contributors
+		print(f"[Diagnostic] Lowest QP state: top DFT contributors = {np.array(top_contrib)}")
+		print(f"[Diagnostic] Lowest QP state: their |U| values = {np.array(U_col0_abs[top_contrib])}")
+		
+		with mesh_xy:
+			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = pipeline_jit(
+				psi_lT, psi_l, psi_cohT, psi_coh, psi_l, psi_lT,
+				W_mu_nu, V_mu_nu, v_q0_noG0_munu, Gij_final,
+				meta.nkx, meta.nky, meta.nkz, meta.nk_tot, meta.nspinor,
+				float(wfn.cell_volume/np.prod(wfn.fft_grid)),
+			)
+		
+		# Diagnostic: check Hartree in DFT basis before rotation
+		hartree_dft_diag = jnp.real(jnp.diagonal(hartree_kbar_ij_jax[0]))
+		hartree_dft_trace = jnp.sum(hartree_dft_diag)
+		print(f"[Diagnostic] Hartree DFT-basis diag[:5] (Ry): {np.array(hartree_dft_diag[:5])}")
+		print(f"[Diagnostic] Hartree DFT-basis trace (Ry): {float(hartree_dft_trace):.4f}")
 	else:
-		# One-shot diagonalization consistent with the in-loop path
+		# One-shot: diagonalize H = H_DFT + Σ
 		H_qp_mnk = kin_ion_full + sigma_total_full
 		H_qp_mnk = 0.5 * (H_qp_mnk + jnp.conj(jnp.swapaxes(H_qp_mnk, -1, -2)))
 		E_full, U_full = jax.vmap(jnp.linalg.eigh, in_axes=0)(H_qp_mnk)
 
 	energies_full_dft, _ = get_enk_bandrange(
-		wfn,
-		sym,
-		(qp_band_start, qp_band_stop),
-		(qp_band_start, qp_band_stop),
+		wfn, sym, (qp_band_start, qp_band_stop), (qp_band_start, qp_band_stop),
 	)
 	energies_dft_ev = jnp.asarray(energies_full_dft) * ryd2ev
 	energies_qp_ev = E_full * ryd2ev
 
-	# Host copies for downstream I/O (keep qp eigenpairs for forthcoming steps)
-	sigma_sx_kbar_ij = np.array(sigma_sx_kbar_ij_jax)
-	sigma_coh_kbar_ij = np.array(sigma_coh_kbar_ij_jax)
-	hartree_kbar_ij = np.array(hartree_kbar_ij_jax)
-	H_qp_mnk_host = np.array(H_qp_mnk)
-	E_qp_mnk_host = np.array(E_full)
-	U_qp_mnk_host = np.array(U_full)
+	# Rotate sigma components to QP basis: Σ_QP = U† Σ U
+	# U_full: (nk, nb_sigma, nb_sigma) eigenvector matrix from diagonalizing H_QP
+	# U[k,i,m] = ⟨i_DFT|m_QP⟩ = component i of eigenvector m
+	# σ_QP[m,n] = ⟨m_QP|σ|n_QP⟩ = Σ_{ij} conj(U[i,m]) σ[i,j] U[j,n]
+	def rotate_to_qp_basis(sigma_dft, U):
+		# sigma_dft: (nk, i, j) in DFT basis
+		# U: (nk, i, m) where columns m are eigenvectors
+		# sigma_qp = U† @ sigma @ U → output (nk, m, n) in QP basis
+		return jnp.einsum('kim,kij,kjn->kmn', jnp.conj(U), sigma_dft, U, optimize=True)
+	
+	sigma_sx_qp = rotate_to_qp_basis(sigma_sx_kbar_ij_jax, U_full)
+	sigma_coh_qp = rotate_to_qp_basis(sigma_coh_kbar_ij_jax, U_full)
+	hartree_qp = rotate_to_qp_basis(hartree_kbar_ij_jax, U_full)
+	
+	# Diagnostic: check trace preservation after rotation
+	if self_consistent:
+		hartree_qp_diag = jnp.real(jnp.diagonal(hartree_qp[0]))
+		hartree_qp_trace = jnp.sum(hartree_qp_diag)
+		print(f"[Diagnostic] Hartree QP-basis diag[:5] (Ry): {np.array(hartree_qp_diag[:5])}")
+		print(f"[Diagnostic] Hartree QP-basis trace (Ry): {float(hartree_qp_trace):.4f} (should match DFT-basis trace)")
+
 	energies_dft_ev_host = np.array(energies_dft_ev)
 	energies_qp_ev_host = np.array(energies_qp_ev)
 
+	# Write PRE-self-consistency sigma to eqp0_noqsym (initial, one-shot values)
+	sigma_sx_initial_host = np.array(sigma_sx_initial)
+	sigma_coh_initial_host = np.array(sigma_coh_initial)
+	hartree_initial_host = np.array(hartree_initial)
 	write_sigma_to_file(
-		ryd2ev * sigma_sx_kbar_ij,
-		params["output_file"],
-		sigma_coh_kij_eV=ryd2ev * sigma_coh_kbar_ij,
-		hartree_kij_eV=ryd2ev * hartree_kbar_ij,
+		ryd2ev * sigma_sx_initial_host, params["output_file"],
+		sigma_coh_kij_eV=ryd2ev * sigma_coh_initial_host,
+		hartree_kij_eV=ryd2ev * hartree_initial_host,
 	)
-	write_eqp_table(energies_dft_ev_host, np.diagonal(H_qp_mnk_host, axis1=-2, axis2=-1), params["eqp_output_file"])
-	
-	# ============================================================================
-	# MATRIX SUMMARY: Report diagnostics for key matrices
-	# ============================================================================
-	# sigma_sx:  screened exchange self-energy, shape (nk, nb_sigma, nb_sigma)
-	# sigma_coh: Coulomb hole self-energy, shape (nk, nb_sigma, nb_sigma)
-	# hartree:   Hartree matrix elements
-	# H_qp:      quasiparticle Hamiltonian after SCF/diagonalization
-	# ============================================================================
-	if meta.rank == 0:
-		summarize_hermitian_matrix("sigma_sx", sigma_sx_kbar_ij, print_fn=print0)
-		summarize_hermitian_matrix("sigma_coh", sigma_coh_kbar_ij, print_fn=print0)
-		# Hartree might include bands outside sigma window; report both full and sliced
-		nb_sigma_window = int(b3 - b1)  # Expected sigma window size
-		nb_hartree = hartree_kbar_ij.shape[1]
-		if nb_hartree > nb_sigma_window:
-			print0(f"[hartree] NOTE: matrix has {nb_hartree} bands but sigma window is {nb_sigma_window}")
-			hartree_sigma_only = hartree_kbar_ij[:, :nb_sigma_window, :nb_sigma_window]
-			summarize_hermitian_matrix("hartree (full)", hartree_kbar_ij, print_fn=print0)
-			summarize_hermitian_matrix("hartree (sigma)", hartree_sigma_only, print_fn=print0)
-		else:
-			summarize_hermitian_matrix("hartree", hartree_kbar_ij, print_fn=print0)
-		summarize_hermitian_matrix("H_qp", H_qp_mnk_host, print_fn=print0)
-	# Timing report
-	if jax.process_index() == 0:
-		timing.report(print_fn=print0, title="--- Timing (seconds) ---")
 
-	# Later stages of this project will iterate this workflow so that the COHSEX
-	# potential feeds back into updated wavefunctions (self-consistent COHSEX)
-	# and eventually into a full quasiparticle self-consistent GW cycle.
+	# Write POST-self-consistency sigma to eqp0_sc (rotated to QP basis)
+	if self_consistent:
+		sigma_sx_final_host = np.array(sigma_sx_qp)
+		sigma_coh_final_host = np.array(sigma_coh_qp)
+		hartree_final_host = np.array(hartree_qp)
+		sc_output_file = params["output_file"].replace("eqp0", "eqp0_sc").replace(".dat", "_sc.dat")
+		if sc_output_file == params["output_file"]:
+			sc_output_file = params["output_file"].replace(".dat", "_sc.dat")
+		write_sigma_to_file(
+			ryd2ev * sigma_sx_final_host, sc_output_file,
+			sigma_coh_kij_eV=ryd2ev * sigma_coh_final_host,
+			hartree_kij_eV=ryd2ev * hartree_final_host,
+		)
+
+	# Write eqp1.dat-style output for self-consistent runs
+	if self_consistent and meta.rank == 0:
+		eqp1_path = os.path.join(input_dir, "eqp1.dat")
+		# Generate full k-mesh in crystal coords
+		nkx, nky, nkz = meta.nkx, meta.nky, meta.nkz
+		
+		# Compute one-shot diagonal: H_QP[n,n] = kin_ion[n,n] + sigma_total[n,n] (DFT basis)
+		# Use INITIAL sigma (before self-consistency) for one-shot
+		sigma_total_initial = sigma_sx_initial + sigma_coh_initial + hartree_initial
+		H_oneshot_diag = np.array(jnp.real(jnp.diagonal(kin_ion_full, axis1=1, axis2=2) + 
+		                                    jnp.diagonal(sigma_total_initial, axis1=1, axis2=2)))
+		E_oneshot_ev = H_oneshot_diag * ryd2ev
+		
+		with open(eqp1_path, "w") as f:
+			f.write("# kx ky kz nbands\n")
+			f.write("# spin band E_DFT E_oneshot(DFT-basis) E_QP(eigh)\n")
+			ik = 0
+			for ikz in range(nkz):
+				for iky in range(nky):
+					for ikx in range(nkx):
+						kx = ikx / nkx
+						ky = iky / nky
+						kz = ikz / nkz
+						f.write(f"  {kx:.9f}  {ky:.9f}  {kz:.9f}      {nb_sigma}\n")
+						for ib in range(nb_sigma):
+							e_dft = float(energies_dft_ev_host[ik, ib])
+							e_oneshot = float(E_oneshot_ev[ik, ib])
+							e_qp = float(energies_qp_ev_host[ik, ib])
+							f.write(f"       1       {ib+1}  {e_dft:14.9f}  {e_oneshot:14.9f}  {e_qp:14.9f}\n")
+						ik += 1
+		print0(f"Wrote {eqp1_path}")
+
+	if jax.process_index() == 0:
+		timing.report(print_fn=print0, title="--- Timing ---")
+
 	return 0
 
 

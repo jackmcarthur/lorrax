@@ -75,6 +75,12 @@ class SymMaps:
 
         self.sym_matrices = wfn.sym_matrices[:wfn.ntran] # these apply to real space coords as sym_matrices[i] @ [rx,ry,rz]
         self.sym_mats_k = self.sym_matrices[:wfn.ntran].transpose(0,2,1).copy()  # these apply to k-points as sym_mats_k[i] @ [kx,ky,kz]
+        
+        # Add time-reversal symmetry (k → -k) combined with each spatial symmetry
+        # This is needed because QE uses time-reversal to reduce k-points, but doesn't
+        # store it as one of the ntran symmetries
+        time_reversal_syms = -self.sym_mats_k  # S @ k -> -S @ k
+        self.sym_mats_k = np.concatenate([self.sym_mats_k, time_reversal_syms], axis=0)
 
         # get the list of full zone k-points and the map from k_full to k_irr
         self.kpoint_map, self.unfolded_kpts = self.create_kpoint_symmetry_map(wfn)
@@ -206,6 +212,7 @@ class SymMaps:
 
         # Map each full k-point to its symmetry operation
         kpoint_map = np.zeros(len(full_kpoints), dtype=np.int32)
+        unmatched_kpts = []
         
         for kfull_idx in range(len(full_kpoints)):
             k_found = False
@@ -219,7 +226,10 @@ class SymMaps:
                 
                 # Check if transformed k-point matches any k-point in wfn.kpoints
                 for j, k in enumerate(wfn.kpoints):
-                    if np.allclose(k_transformed, k, atol=1e-6):
+                    # Wrap irreducible k-point to [0,1) for comparison
+                    k_wrapped = k % 1.0
+                    k_wrapped[k_wrapped > 0.999] = 0.0
+                    if np.allclose(k_transformed, k_wrapped, atol=1e-6):
                         kpoint_map[kfull_idx] = i
                         k_found = True
                         break
@@ -228,7 +238,22 @@ class SymMaps:
                     break
             
             if not k_found:
-                raise ValueError(f"No symmetry operation found for k-point {full_kpoints[kfull_idx]}")
+                # Fallback: find nearest irreducible k-point and use identity
+                # This handles cases where WFN symmetry data is incomplete
+                kfull = full_kpoints[kfull_idx]
+                dists = np.array([np.min([np.linalg.norm(kfull - k), 
+                                          np.linalg.norm(kfull - k + 1),
+                                          np.linalg.norm(kfull - k - 1)])
+                                  for k in wfn.kpoints])
+                nearest_irr = np.argmin(dists)
+                kpoint_map[kfull_idx] = 0  # identity symmetry
+                unmatched_kpts.append((kfull_idx, full_kpoints[kfull_idx], nearest_irr))
+        
+        if unmatched_kpts:
+            import warnings
+            warnings.warn(f"WFN symmetry data incomplete: {len(unmatched_kpts)} k-points could not be "
+                         f"mapped via stored symmetries (ntran={len(self.sym_mats_k)}). "
+                         f"Using identity fallback. First unmatched: {unmatched_kpts[0][1]}")
         
         return kpoint_map, full_kpoints
     

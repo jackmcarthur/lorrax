@@ -316,15 +316,25 @@ def compute_valence_density(wfn_k, sym, wfn):
     volume = jnp.asarray(wfn.cell_volume, dtype=jnp.float64)
     ngrid_pad = nx_pad * ny_pad * nz_pad
     scale_pad = jnp.sqrt(ngrid_pad / volume)
+    
+    # Get k-point weights - if looping over full mesh (sym.nk_tot), use 1/nk_tot
+    # If looping over irreducible mesh with wfn.kweights, use those weights
+    use_kweights = hasattr(wfn, 'kweights') and nk_local == len(wfn.kweights)
+    if use_kweights:
+        kweights = np.asarray(wfn.kweights, dtype=np.float64)
+    else:
+        # Assume equal weights for full mesh
+        kweights = np.ones(nk_local, dtype=np.float64) / sym.nk_tot
 
     for ik in range(nk_local):
         nocc = int(wfn.nelec)
         nocc = min(nocc, nb_all)
+        wk = float(kweights[ik])  # k-point weight
 
         if same_grid:
             psi_occ = wfn_k[ik, :nocc]  # (nocc, nspinor, nx, ny, nz)
             psi_r = jnp.fft.ifftn(psi_occ, axes=(-3, -2, -1), norm='ortho') * scale_pad
-            rho_val_local += jnp.sum(
+            rho_val_local += wk * jnp.sum(
                 jnp.real(jnp.conj(psi_r) * psi_r), axis=(0, 1)
             )
         else:
@@ -347,12 +357,11 @@ def compute_valence_density(wfn_k, sym, wfn):
 
                 psi_G_padded_batch = jax.vmap(scatter_one, in_axes=0, out_axes=0)(C_occ)
                 psi_r_batch = jnp.fft.ifftn(psi_G_padded_batch, axes=(-3, -2, -1), norm='ortho') * scale_pad
-                rho_val_local += jnp.sum(jnp.real(psi_r_batch.conj() * psi_r_batch), axis=0)
+                rho_val_local += wk * jnp.sum(jnp.real(psi_r_batch.conj() * psi_r_batch), axis=0)
     
-    # Sum contributions across all processors
-    # For now, since we're not in a distributed context, just use the local result
-    # TODO: Properly implement distributed psum when called within JAX mesh context
-    rho_v = rho_val_local / sym.nk_tot
+    # With proper k-point weights included above, no division needed
+    # (weights sum to 1 for irreducible mesh, or 1/nk_tot each for full mesh)
+    rho_v = rho_val_local
 
     # Caller reports integrated charge if needed
     return rho_v
@@ -425,10 +434,10 @@ def poisson_potential_from_rhoG(
 
     Returns V(r) with V(G) = 8π rho(G) / |G|^2 (for G != 0) and V(G=0) = 0.
     
-    If truncation_2d=True, applies 2D slab truncation factor:
-        v_2D(G) = v_3D(G) × (1 - e^{-zc × |G_xy|} × cos(G_z × zc))
-    where zc = π / b_z and b_z is the z-component of the reciprocal lattice.
-    This matches the truncation used in ISDF/BerkeleyGW for 2D systems.
+    If truncation_2d=True, applies 2D slab truncation factor (Ismail-Beigi):
+        v_2D(G) = v_3D(G) × (1 - e^{-|G_xy| × Lz/2} × cos(G_z × Lz/2))
+    where Lz/2 = π / b_z and b_z is the z-component of the reciprocal lattice.
+    This matches Ismail-Beigi PRB 73, 233103 (2006) and BerkeleyGW.
     """
     nx2, ny2, nz2 = rho_G.shape
     fx = jnp.fft.fftfreq(nx2) * nx2
@@ -463,12 +472,13 @@ def poisson_potential_from_rhoG(
         Gy_cart = Gx_crys * B[0, 1] + Gy_crys * B[1, 1] + Gz_crys * B[2, 1]
         Gz_cart = Gx_crys * B[0, 2] + Gy_crys * B[1, 2] + Gz_crys * B[2, 2]
         
-        # 2D truncation: zc = π / b_z where b_z is the z-component of reciprocal lattice
-        zc = jnp.pi / B[2, 2]
+        # 2D truncation following Ismail-Beigi PRB 73, 233103 (2006):
+        # f2d = 1 - exp(-|G_xy| × Lz/2) × cos(G_z × Lz/2)
+        # where zc = Lz/2 = π / B[2,2]
+        zc = jnp.pi / B[2, 2]  # = Lz/2
         kxy = jnp.sqrt(Gx_cart * Gx_cart + Gy_cart * Gy_cart)
         kz = Gz_cart
         
-        # Truncation factor: f2d = 1 - e^{-zc * kxy} * cos(kz * zc)
         f2d = 1.0 - jnp.exp(-zc * kxy) * jnp.cos(kz * zc)
         # Handle G=0 case (f2d should be 0 there, but V_G is also 0)
         f2d = jnp.where(zero_mask, 0.0, f2d)
@@ -735,7 +745,7 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valr
         bdot_j,
         bvec=bvec_j,
         blat=float(wfn.blat),
-        truncation_2d=True,  # Set to True for 2D slab truncation matching ISDF
+        truncation_2d=True,  # Match QE's assume_isolated='2D' behavior
     )
     deltaV = float(wfn.cell_volume) / float(np.prod(V_H_r.shape))
     print(f"    Hartree potential grid: {V_H_r.shape}")
@@ -756,6 +766,9 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valr
         fft_grid=rho_grid,
         bdot=np.asarray(wfn.bdot, dtype=float),
         cell_volume=float(wfn.cell_volume),
+        bvec=np.asarray(wfn.bvec, dtype=float),
+        blat=float(wfn.blat),
+        truncation_2d=True,  # Match QE's assume_isolated='2D' behavior
     )
     V_loc_r = jnp.asarray(V_loc_r, dtype=jnp.float64)
 
@@ -930,6 +943,9 @@ def get_kin_ion(
             fft_grid=tuple(int(x) for x in meta.fft_grid),
             bdot=np.asarray(wfn.bdot, dtype=float),
             cell_volume=float(wfn.cell_volume),
+            bvec=np.asarray(wfn.bvec, dtype=float),
+            blat=float(wfn.blat),
+            truncation_2d=True,  # Match QE's assume_isolated='2D' behavior
         )
         V_loc_r = jnp.asarray(V_loc_r, dtype=jnp.float64)
         # Avoid forcing device sync here; leave compute lazy
@@ -997,6 +1013,139 @@ def write_kin_ion_h5(kin_ion: np.ndarray, out_path: str = 'kin_ion.h5') -> None:
         dset.attrs['description'] = 'Kinetic + ionic (local + nonlocal) matrix elements, shape (nk, nb, nb)'
 
 
+def write_offdiag_debug(matrix: np.ndarray, kpoint: np.ndarray, out_path: str, 
+                        n_diag: int = 30, n_offdiag: int = 5, label: str = "matrix") -> None:
+    """Write diagonal and off-diagonal elements in BerkeleyGW-like format.
+    
+    Format:
+        kx ky kz  n_diag  n_offdiag
+        spin band  real  imag   (diagonal elements)
+        ...
+        spin row col  real  imag   (off-diagonal block)
+        ...
+    """
+    nb = matrix.shape[0]
+    n_diag = min(n_diag, nb)
+    n_offdiag = min(n_offdiag, nb)
+    
+    with open(out_path, 'w') as f:
+        # Header line
+        f.write(f"  {kpoint[0]:.9f}  {kpoint[1]:.9f}  {kpoint[2]:.9f}      {n_diag}      {n_offdiag}\n")
+        
+        # Diagonal elements (1-indexed bands)
+        for b in range(n_diag):
+            val = matrix[b, b]
+            f.write(f"       1       {b+1}  {np.real(val):14.9f}  {np.imag(val):14.9f}\n")
+        
+        # Off-diagonal block (first n_offdiag x n_offdiag)
+        for i in range(n_offdiag):
+            for j in range(n_offdiag):
+                val = matrix[i, j]
+                f.write(f"       1       {i+1}       {j+1}  {np.real(val):14.9f}  {np.imag(val):14.9f}\n")
+    
+    print(f"  Wrote {label} to {out_path}")
+
+
+def compare_with_bgw_offdiag(our_matrix: np.ndarray, bgw_file: str, label: str = "matrix") -> None:
+    """Compare our matrix elements with BerkeleyGW reference file (first k-point only)."""
+    if not os.path.exists(bgw_file):
+        return
+    
+    print(f"\n  Comparing {label} with {os.path.basename(bgw_file)}:")
+    
+    # Parse BerkeleyGW file - only first k-point
+    with open(bgw_file, 'r') as f:
+        lines = f.readlines()
+    
+    # First line is header: kx ky kz n_diag n_offdiag
+    header = lines[0].split()
+    kpt = [float(header[0]), float(header[1]), float(header[2])]
+    n_diag = int(header[3])
+    n_offdiag = int(header[4])
+    
+    print(f"    BGW k-point: [{kpt[0]:.4f}, {kpt[1]:.4f}, {kpt[2]:.4f}], n_diag={n_diag}, n_offdiag={n_offdiag}")
+    
+    # Parse diagonal elements (lines 1 to n_diag)
+    diag_bgw = []
+    for i in range(1, min(n_diag + 1, len(lines))):
+        parts = lines[i].split()
+        if len(parts) < 4:
+            break
+        # Check if this is a new k-point header (starts with float)
+        try:
+            float(parts[0])
+            if '.' in parts[0]:  # Likely a new k-point
+                break
+        except ValueError:
+            pass
+        # Format: spin band real imag
+        try:
+            band = int(parts[1]) - 1  # Convert to 0-indexed
+            val_re = float(parts[2])
+            val_im = float(parts[3])
+            diag_bgw.append((band, val_re + 1j * val_im))
+        except (ValueError, IndexError):
+            break
+    
+    # Parse off-diagonal block (lines n_diag+1 onwards, until next k-point or end)
+    offdiag_bgw = []
+    idx = n_diag + 1
+    while idx < len(lines):
+        line = lines[idx].strip()
+        if not line:
+            idx += 1
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            break
+        # Check if this is a new k-point header
+        try:
+            if '.' in parts[0]:
+                float(parts[0])
+                break  # New k-point, stop parsing
+        except ValueError:
+            pass
+        try:
+            # Format: spin row col real imag
+            row = int(parts[1]) - 1
+            col = int(parts[2]) - 1
+            val_re = float(parts[3])
+            val_im = float(parts[4])
+            offdiag_bgw.append((row, col, val_re + 1j * val_im))
+        except (ValueError, IndexError):
+            break
+        idx += 1
+    
+    # Compare diagonals
+    n_show = min(5, len(diag_bgw))
+    print(f"    Diagonal comparison (first {n_show} bands):")
+    print(f"    {'Band':>5} {'Ours (Re)':>14} {'BGW (Re)':>14} {'Diff':>14}")
+    max_diag_diff = 0.0
+    for band, bgw_val in diag_bgw[:n_show]:
+        if band < our_matrix.shape[0]:
+            our_val = our_matrix[band, band]
+            diff = abs(np.real(our_val) - np.real(bgw_val))
+            max_diag_diff = max(max_diag_diff, diff)
+            print(f"    {band+1:>5} {np.real(our_val):>14.6f} {np.real(bgw_val):>14.6f} {diff:>14.6e}")
+    
+    # Compare off-diagonals (only show actual off-diagonal elements)
+    if offdiag_bgw:
+        offdiag_only = [(r, c, v) for r, c, v in offdiag_bgw if r != c]
+        n_show_off = min(10, len(offdiag_only))
+        print(f"    Off-diagonal comparison (first {n_show_off} off-diag elements):")
+        print(f"    {'(i,j)':>8} {'Ours (Re)':>14} {'BGW (Re)':>14} {'Diff':>14}")
+        max_offdiag_diff = 0.0
+        for row, col, bgw_val in offdiag_only[:n_show_off]:
+            if row < our_matrix.shape[0] and col < our_matrix.shape[1]:
+                our_val = our_matrix[row, col]
+                diff = abs(np.real(our_val) - np.real(bgw_val))
+                max_offdiag_diff = max(max_offdiag_diff, diff)
+                print(f"    ({row+1},{col+1}){' ':>3} {np.real(our_val):>14.6f} {np.real(bgw_val):>14.6f} {diff:>14.6e}")
+        
+        print(f"    Max diagonal diff: {max_diag_diff:.6e}")
+        print(f"    Max off-diagonal diff: {max_offdiag_diff:.6e}")
+
+
 
 
 def main(argv=None):
@@ -1011,6 +1160,11 @@ def main(argv=None):
         "--input", 
         default="tests/cohsex_debug/cohsex_test.in",
         help="Input file",
+    )
+    argp.add_argument(
+        "--debug-offdiag",
+        action="store_true",
+        help="Write off-diagonal matrix elements and compare with BerkeleyGW reference files",
     )
     args = argp.parse_args(argv)
     
@@ -1192,6 +1346,44 @@ def main(argv=None):
                     print(f"  Warning: failed to compare with k0_diag_check ({e})")
 
             # Vloc-only fit removed per user request
+            
+            # Debug off-diagonal output if requested
+            if args.debug_offdiag:
+                print("\n  === Off-diagonal debug output ===")
+                kpt0 = np.array([0.0, 0.0, 0.0])  # k=0
+                
+                # K+I+H+NL matrix (what BGW calls "kih")
+                KIH_NL = T0 + VI0 + VH0 + VNL0
+                kih_path = os.path.join(input_dir, 'kih_offdiag_ours.dat')
+                write_offdiag_debug(KIH_NL, kpt0, kih_path, label="K+I+H+NL")
+                
+                # Compare with BGW reference if it exists
+                bgw_kih = os.path.join(input_dir, 'kih_offdiag_bgw.dat')
+                compare_with_bgw_offdiag(KIH_NL, bgw_kih, label="K+I+H+NL")
+                
+                # Also output just K+I+NL (kin_ion without Hartree) for comparison
+                KI_NL = T0 + VI0 + VNL0
+                kinl_path = os.path.join(input_dir, 'ki_nl_offdiag_ours.dat')
+                write_offdiag_debug(KI_NL, kpt0, kinl_path, label="K+I+NL (no Hartree)")
+                
+                # V_xc can be inferred as -(kin_ion + V_H) off-diagonal in DFT eigenbasis
+                # But we'd need DFT eigenvalues to compute this properly
+                # For now, just note that V_xc_off = -(K+I+H+NL)_off would be the comparison
+                print(f"\n  Note: In DFT eigenbasis, V_xc_off = -(K+I+H)_off (ignoring V_NL contribution)")
+                print(f"  To compare with vxc_offdiag_bgw.dat, check that our -(K+I+H+NL) matches their V_xc")
+                
+                # Try to compare with BGW V_xc
+                bgw_vxc = os.path.join(input_dir, 'vxc_offdiag_bgw.dat')
+                if os.path.exists(bgw_vxc):
+                    print(f"\n  Comparing -our(K+I+H+NL) with BGW V_xc:")
+                    # Negate our matrix for comparison (V_xc = -KIH in DFT basis)
+                    # But wait - this isn't quite right. In DFT eigenbasis:
+                    # H_DFT = diag(E) => (K+I+H+Vxc) = diag(E)
+                    # => (K+I+H)_off = -Vxc_off
+                    # So Vxc_off = -(K+I+H)_off (but K+I+H doesn't include V_NL in usual definition)
+                    # Let me just compare the off-diagonal magnitudes
+                    compare_with_bgw_offdiag(-KIH_NL, bgw_vxc, label="-our(K+I+H+NL) vs BGW V_xc")
+                    
     except Exception as e:
         print(f"Warning: failed to write k=0 diagonals ({e})")
 

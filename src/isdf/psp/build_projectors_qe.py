@@ -432,12 +432,20 @@ def build_local_ionic_potential_on_G_total(
     fft_grid: Tuple[int, int, int],
     bdot: np.ndarray,
     cell_volume: float,
+    bvec: np.ndarray | None = None,
+    blat: float | None = None,
+    truncation_2d: bool = False,
 ) -> np.ndarray:
     """Simplified builder: return total V_loc(r) on the provided FFT grid (Ry).
 
     - Builds SR in G with QE's SR integrand (adds Z e2 erf(r)/r) and alpha‑Z at G=0.
     - Adds LR Coulomb tail from ρ_ion(G) with Gaussian damping; G=0 set to 0.
     - Maps with phases exp(-2π i τ·G) on the FFT grid and IFFT (orthonormal) to real.
+    
+    If truncation_2d=True, applies 2D slab truncation factor to the LR part:
+        cutoff_2D = 1 - exp(-|G_xy| * lz) * cos(G_z * lz)
+    where lz = π / b_z and b_z is the z-component of the reciprocal lattice.
+    This matches QE's Coul_cut_2D module for assume_isolated='2D'.
     """
     nx, ny, nz = (int(fft_grid[0]), int(fft_grid[1]), int(fft_grid[2]))
 
@@ -493,21 +501,32 @@ def build_local_ionic_potential_on_G_total(
         V_sr_on_grid = V_sr_on_flat.reshape((nx, ny, nz))
 
         # Alpha‑Z at G=0
+        # For 2D (modified_coulomb), QE uses tab_vloc(0) = tab_vloc(1), meaning the G=0
+        # value is set to the q→0 limit of the main formula (NOT the alpha_Z integral).
+        # This effectively means using the interpolated value at q→0.
+        # For 3D, we use the full alpha_Z integral.
         try:
             e2 = 2.0
-            if rab is not None:
-                integrand = r * (r * v_r + Zval * e2)
-                alphaZ = (4.0 * np.pi) * np.sum(integrand * rab) * inv_omega
+            if truncation_2d:
+                # 2D: V_sr at G=0 already has the q→0 limit from interpolation (spl(0))
+                # We don't need to override it - the spline already handles this.
+                # Just ensure it's properly scaled.
+                pass  # V_sr_on_grid[0,0,0] is already set by spl(0) * prefactor
             else:
-                if len(r) > 1:
+                # 3D: use alpha_Z integral
+                if rab is not None:
                     integrand = r * (r * v_r + Zval * e2)
-                    dr = r[1] - r[0]
-                    w = np.ones_like(r)
-                    w[0] = 0.5; w[-1] = 0.5
-                    alphaZ = (4.0 * np.pi) * np.sum(integrand * w) * dr * inv_omega
+                    alphaZ = (4.0 * np.pi) * np.sum(integrand * rab) * inv_omega
                 else:
-                    alphaZ = 0.0
-            V_sr_on_grid[0, 0, 0] = sqrtN * alphaZ
+                    if len(r) > 1:
+                        integrand = r * (r * v_r + Zval * e2)
+                        dr = r[1] - r[0]
+                        w = np.ones_like(r)
+                        w[0] = 0.5; w[-1] = 0.5
+                        alphaZ = (4.0 * np.pi) * np.sum(integrand * w) * dr * inv_omega
+                    else:
+                        alphaZ = 0.0
+                V_sr_on_grid[0, 0, 0] = sqrtN * alphaZ
         except Exception:
             pass
 
@@ -520,8 +539,27 @@ def build_local_ionic_potential_on_G_total(
 
     # LR with Gaussian damping
     e2 = 2.0
-    G2_safe = np.where((ix == 0) & (iy == 0) & (iz == 0), 1.0, G2)
+    zero_mask = (ix == 0) & (iy == 0) & (iz == 0)
+    G2_safe = np.where(zero_mask, 1.0, G2)
     Vloc_G_lr = (sqrtN * 4.0 * np.pi * e2) * inv_omega * (rho_ion_G / G2_safe) * np.exp(-0.25 * G2)
+    
+    # Apply 2D truncation if requested (matches QE's cutoff_lr_Vloc)
+    if truncation_2d and bvec is not None and blat is not None:
+        # Compute G vectors in Cartesian coordinates
+        B = np.asarray(bvec, dtype=float) * float(blat)  # (3,3) reciprocal lattice in bohr^-1
+        # G_cart = G_crys @ B^T
+        Gx_cart = ix * B[0, 0] + iy * B[1, 0] + iz * B[2, 0]
+        Gy_cart = ix * B[0, 1] + iy * B[1, 1] + iz * B[2, 1]
+        Gz_cart = ix * B[0, 2] + iy * B[1, 2] + iz * B[2, 2]
+        
+        # 2D cutoff: lz = π / b_z, cutoff = 1 - exp(-|G_xy| * lz) * cos(G_z * lz)
+        lz = np.pi / B[2, 2]
+        Gxy = np.sqrt(Gx_cart * Gx_cart + Gy_cart * Gy_cart)
+        cutoff_2d = 1.0 - np.exp(-Gxy * lz) * np.cos(Gz_cart * lz)
+        cutoff_2d = np.where(zero_mask, 0.0, cutoff_2d)
+        
+        Vloc_G_lr = Vloc_G_lr * cutoff_2d
+    
     Vloc_G_lr[0, 0, 0] = 0.0
 
     # Total to real
