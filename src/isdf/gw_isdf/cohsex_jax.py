@@ -96,7 +96,7 @@ def write_qp_rotations_h5(
     Args:
         filepath: Output path for the h5 file
         U_mnk: Unitary matrices (nk, nb, nb) where U[k,m,n] = <m_DFT|n_QP>
-               To rotate coefficients: c_qp_n(G) = Σ_m U*[k,m,n] c_dft_m(G)
+               To rotate coefficients: c_qp_n(G) = Σ_m U[k,m,n] c_dft_m(G)
         E_qp_nk: QP eigenvalues (nk, nb) in Hartree atomic units
         band_start: First band index (0-based) included in the calculation
         band_stop: One past last band index included
@@ -108,7 +108,7 @@ def write_qp_rotations_h5(
     For postprocessing WFN.h5 → WFN_qp.h5:
         1. Load WFN.h5 coefficients for bands [band_start:band_stop]
         2. For each k-point k:
-           c_qp[n, G] = Σ_m conj(U[k, m, n]) * c_dft[m, G]
+           c_qp[n, G] = Σ_m U[k, m, n] * c_dft[m, G]  (matrix form: c_qp = U^T @ c_dft)
         3. Replace eigenvalues with E_qp_nk (convert to Rydberg if needed)
         4. Write rotated coefficients back to WFN_qp.h5
     """
@@ -133,7 +133,7 @@ def write_qp_rotations_h5(
         f.attrs['description'] = (
             'QP rotation data for transforming DFT wavefunctions to QP basis. '
             'U_mnk[k,m,n] = <m_DFT|n_QP>. '
-            'To rotate: c_qp[n,G] = sum_m conj(U[k,m,n]) * c_dft[m,G]'
+            'To rotate: c_qp[n,G] = sum_m U[k,m,n] * c_dft[m,G] (i.e. c_qp = U^T @ c_dft)'
         )
         f.attrs['energy_units'] = 'E_qp_nk_hartree in Hartree, E_qp_nk_rydberg in Rydberg'
         f.attrs['band_convention'] = '0-based indexing; bands [band_start, band_stop) were computed'
@@ -775,12 +775,12 @@ def get_zeta_q_and_v_q_mu_nu(
 
 	# 3. Convert weights and other arrays to JAX
 	kgrid = meta.kgrid_jax
-	# Get band ranges and weights in JAX
+	# Get band ranges and weights in JAX (pass nspinor for bispinor support)
 	enk_l, weights_l = get_enk_bandrange(
-		wfn, sym, bandrange_l, (bandrange_r[0], bandrange_l[1])
+		wfn, sym, bandrange_l, (bandrange_r[0], bandrange_l[1]), nspinor=meta.nspinor
 	)
 	enk_r, weights_r = get_enk_bandrange(
-		wfn, sym, bandrange_r, (bandrange_r[0], bandrange_l[1])
+		wfn, sym, bandrange_r, (bandrange_r[0], bandrange_l[1]), nspinor=meta.nspinor
 	)
 	# Pad weights purely on device to match the padded band dimensions
 	#pad_l = int((nb_l_padded * meta.nspinor) - int(weights_l.shape[1]))
@@ -940,16 +940,60 @@ def get_G_R_jax(G_k, nkx, nky, nkz):
 	G_k = jax.lax.with_sharding_constraint(G_k, P(None, 'x', None, 'y', None, None, None))
 	return jnp.fft.ifftn(G_k, axes=(4,5,6), norm='ortho')
 
-def get_sigma_static_mu_nu_jax(G_R, V_mu_nu, nk_tot):
-	"""Pure: G_R (s1,rmu1,s2,rmu2,nkx,nky,nkz), V_mu_nu (rmu1,rmu2,nkx,nky,nkz) -> sigma_k same shape as G_R."""
+def get_sigma_static_mu_nu_jax(G_R, V_mu_nu, nk_tot, bispinor=False):
+	"""Compute sigma in (s1,rmu1,s2,rmu2,nkx,nky,nkz) basis via convolution in real space.
+	
+	For nspinor=2: Σ_ab(μ,ν,R) = G_ab(μ,ν,R) * V(μ,ν,R)
+	
+	For nspinor=4 (bispinor): Uses γ⁰ Coulomb vertex:
+		Σ_ab = γ⁰_aa γ⁰_bb G_ab V
+	where γ⁰ = diag(1,1,-1,-1) in the Dirac representation.
+	This gives sign_a × sign_b × G_ab × V where sign=[1,1,-1,-1].
+	Large-large and small-small blocks get +1, cross terms get -1.
+	
+	Args:
+		G_R: (nspinor, rmu1, nspinor, rmu2, nkx, nky, nkz) Green's function in real space
+		V_mu_nu: (rmu1, rmu2, nkx, nky, nkz) Coulomb interaction
+		nk_tot: Total number of k-points for normalization
+		bispinor: If True, apply γ⁰ vertex factors for 4-component spinors
+		
+	Returns:
+		sigma_k: Same shape as G_R, self-energy in k-space
+	"""
 	V_R = V_mu_nu[None, :, None, :, :, :, :]
 	V_R = jnp.array(V_R, copy=True)
-	sigma_R = G_R * jnp.fft.ifftn(V_R, axes=(4,5,6), norm='ortho') * (-1.0 / jnp.sqrt(nk_tot)) # 1/sqrt(Nk) is the correct round-trip factor for a convolution with ortho ffts.
+	
+	# For bispinor case, apply γ⁰ vertex: Σ_ab = γ⁰_aa γ⁰_bb G_ab V
+	# γ⁰ = diag(1,1,-1,-1), so sign_a * sign_b gives the prefactor
+	if bispinor:
+		# sign[a] * sign[b] for 4-component spinors: [1,1,-1,-1]
+		gamma0_diag = jnp.array([1.0, 1.0, -1.0, -1.0], dtype=jnp.float64)
+		# Outer product gives sign_a * sign_b matrix of shape (4, 4)
+		gamma0_vertex = gamma0_diag[:, None] * gamma0_diag[None, :]  # (4,4)
+		# Broadcast to G_R shape: (s1, 1, s2, 1, 1, 1, 1)
+		gamma0_vertex = gamma0_vertex[:, None, :, None, None, None, None]
+		G_R = G_R * gamma0_vertex
+	
+	sigma_R = G_R * jnp.fft.ifftn(V_R, axes=(4,5,6), norm='ortho') * (-1.0 / jnp.sqrt(nk_tot))
 	sigma_R = jax.lax.with_sharding_constraint(sigma_R, P(None, 'x', None, 'y', None, None, None))
 	return jnp.fft.fftn(sigma_R, axes=(4,5,6), norm='ortho')
 
 def get_sigma_static_kij_jax(psi_sigX, psi_sigTY, sigma_k_munu):
-	"""Pure: psi_* (nk, nb, ns, rmu), sigma_k_munu (s1,rmu1,s2,rmu2,nkx,nky,nkz) -> sigma_kij (nk, nb, nb)."""
+	"""Project self-energy from (spinor,rmu) basis to band basis.
+	
+	Computes: Σ_mn(k) = Σ_{s,t,μ,ν} ψ*_ms(k,μ) Σ_st(k,μ,ν) ψ_nt(k,ν)
+	
+	Works for both 2-component (Pauli) and 4-component (bispinor) wavefunctions.
+	The spinor contraction sums over all spinor components (s,t indices).
+	
+	Args:
+		psi_sigX: (nk, nb, nspinor, rmu) wavefunctions
+		psi_sigTY: (nk, nspinor, rmu, nb) transposed wavefunctions
+		sigma_k_munu: (nspinor, rmu1, nspinor, rmu2, nkx, nky, nkz) self-energy
+		
+	Returns:
+		sigma_kij: (nk, nb, nb) band-space self-energy matrix
+	"""
 	nkx, nky, nkz = sigma_k_munu.shape[-3:]
 	nk = nkx * nky * nkz
 	sigma_k = sigma_k_munu.transpose(4, 5, 6, 0, 1, 2, 3).reshape(nk, *sigma_k_munu.shape[:4]) # (nk,s1,rmu1,s2,rmu2)
@@ -1036,6 +1080,7 @@ def compute_sigma_pipeline_jax(
 	nk_tot: int,
 	nspinor: int,
 	fft_vol_au: float,
+	bispinor: bool = False,
 ):
 	"""
 	Pure JAX pipeline: compute static COHSEX self-energy components and Hartree.
@@ -1093,7 +1138,8 @@ def compute_sigma_pipeline_jax(
 	# G_μν(R): FFT to real-space lattice vectors R
 	G_R = get_G_R_jax(G_k, nkx, nky, nkz)
 	# Σ_sx_μν(k): screened exchange via ISDF
-	sigma_sx_k_munu = get_sigma_static_mu_nu_jax(G_R, W_mu_nu, nk_tot)
+	# For bispinor: applies γ⁰ vertex factors to Coulomb interaction
+	sigma_sx_k_munu = get_sigma_static_mu_nu_jax(G_R, W_mu_nu, nk_tot, bispinor=bispinor)
 	# Σ_sx_ij(k): project to SIGMA WINDOW bands using psi_proj
 	sigma_sx_kij = get_sigma_static_kij_jax(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_sx_k_munu)
 
@@ -1111,7 +1157,8 @@ def compute_sigma_pipeline_jax(
 	# See mtxel_cor.f90 line 1646: achtemp_loc = achtemp_loc + 0.5d0*aqsn_Ieps
 	# vs line 1648: if (flag_occ) asxtemp_loc = asxtemp_loc - aqsn_Ieps
 	W_minus_V = W_mu_nu - V_mu_nu
-	sigma_coh_k_munu = get_sigma_static_mu_nu_jax(G_RI_R, W_minus_V, nk_tot)
+	# For bispinor: applies γ⁰ vertex factors to Coulomb interaction
+	sigma_coh_k_munu = get_sigma_static_mu_nu_jax(G_RI_R, W_minus_V, nk_tot, bispinor=bispinor)
 	# Σ_coh_ij(k): project to SIGMA WINDOW bands using psi_proj
 	# Apply the 0.5 factor for COH and the overall minus sign
 	sigma_coh_kij = -0.5 * get_sigma_static_kij_jax(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_coh_k_munu)
@@ -1422,12 +1469,12 @@ def main(argv=None):
 			####################################
 			# 2.) Explicit q-loop: build zeta_q,mu(r), S_q, and V_q,mu,nu
 			####################################
-			# Energies for chi0: valence and conduction separately
-			enk_v, weights_v = get_enk_bandrange(wfn, sym, valence_range, (b1, b2))
-			enk_c, weights_c = get_enk_bandrange(wfn, sym, conduction_range, (b2, b4))
+			# Energies for chi0: valence and conduction separately (pass nspinor for bispinor)
+			enk_v, weights_v = get_enk_bandrange(wfn, sym, valence_range, (b1, b2), nspinor=meta.nspinor)
+			enk_c, weights_c = get_enk_bandrange(wfn, sym, conduction_range, (b2, b4), nspinor=meta.nspinor)
 			# Energies for ISDF left/right arrays
-			enk_l, weights_l = get_enk_bandrange(wfn, sym, brange_l, (b1, b3))
-			enk_r, weights_r = get_enk_bandrange(wfn, sym, brange_r, (b1, b3))
+			enk_l, weights_l = get_enk_bandrange(wfn, sym, brange_l, (b1, b3), nspinor=meta.nspinor)
+			enk_r, weights_r = get_enk_bandrange(wfn, sym, brange_r, (b1, b3), nspinor=meta.nspinor)
 
 			# Allocate sharded outputs
 			V_qmunu = jnp.zeros((1, meta.npol, meta.npol, meta.nkx, meta.nky, meta.nkz, meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
@@ -1677,9 +1724,9 @@ def main(argv=None):
 				del global_psiG_c
 				gc.collect()
 				
-				# Get energies for valence/conduction
-				enk_v, _ = get_enk_bandrange(wfn, sym, valence_range, (b1, b2))
-				enk_c, _ = get_enk_bandrange(wfn, sym, conduction_range, (b2, b4))
+				# Get energies for valence/conduction (pass nspinor for bispinor)
+				enk_v, _ = get_enk_bandrange(wfn, sym, valence_range, (b1, b2), nspinor=meta.nspinor)
+				enk_c, _ = get_enk_bandrange(wfn, sym, conduction_range, (b2, b4), nspinor=meta.nspinor)
 				
 				# Apply shardings for chi0 - MUST match non-restart path transposition!
 				# psi_rmu_Y: (nk, nb, nspinor, n_rmu)
@@ -1834,7 +1881,7 @@ def main(argv=None):
 	# Returns: (sigma_sx_kij, sigma_coh_kij, hartree_kmn)
 	pipeline_jit = jax.jit(
 		compute_sigma_pipeline_jax,
-		static_argnames=('nkx', 'nky', 'nkz', 'nk_tot', 'nspinor', 'fft_vol_au'),
+		static_argnames=('nkx', 'nky', 'nkz', 'nk_tot', 'nspinor', 'fft_vol_au', 'bispinor'),
 		in_shardings=(
 			sh.XT_shard, sh.Y_shard,     # psi_l for SX
 			sh.XT_shard, sh.Y_shard,     # psi_coh for COH
@@ -1860,6 +1907,7 @@ def main(argv=None):
 					Gij_static, # (nk, nb_sigma, nb_sigma) replicated
 					meta.nkx, meta.nky, meta.nkz, meta.nk_tot, meta.nspinor,
 					float(wfn.cell_volume/np.prod(wfn.fft_grid)),
+					bispinor,  # γ⁰ vertex for 4-component spinors
 				)
 				sigma_sx_kbar_ij_jax.block_until_ready()
 				sigma_coh_kbar_ij_jax.block_until_ready()
@@ -1971,6 +2019,7 @@ def main(argv=None):
 					Gij_new,            # Updated Green's function
 					meta.nkx, meta.nky, meta.nkz, meta.nk_tot, meta.nspinor,
 					float(wfn.cell_volume/np.prod(wfn.fft_grid)),
+					bispinor,  # γ⁰ vertex for 4-component spinors
 				)
 			
 			# Combine and extract upper triangle
@@ -2052,6 +2101,7 @@ def main(argv=None):
 
 	energies_full_dft, _ = get_enk_bandrange(
 		wfn, sym, (qp_band_start, qp_band_stop), (qp_band_start, qp_band_stop),
+		nspinor=meta.nspinor,
 	)
 	energies_dft_ev = jnp.asarray(energies_full_dft) * ryd2ev
 	energies_qp_ev = E_full * ryd2ev

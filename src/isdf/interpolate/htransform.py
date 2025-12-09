@@ -4,9 +4,7 @@ import argparse
 import numpy as np
 
 os.environ.setdefault("JAX_ENABLE_X64", "1")
-# Force CPU backend regardless of external environment
-os.environ["JAX_PLATFORM_NAME"] = "cpu"
-os.environ["JAX_PLATFORMS"] = "cpu"
+# Allow GPU if available (previously forced CPU)
 
 import jax
 import jax.numpy as jnp
@@ -410,7 +408,17 @@ def h_transform(meta, psi_rtot, psi_rmu, enk_sigma, wfn, kpath_data, log_fn):
 
     if kpath_frac is not None:
         wrapped_k = (kpath_frac + 0.5) % 1.0 - 0.5
-        lambda_q = jax.vmap(_solve_generalized)(project_to_q(wrapped_k))
+        # Process q-points in batches to avoid OOM on large paths
+        batch_size = 32
+        nq = wrapped_k.shape[0]
+        lambda_q_list = []
+        for i in range(0, nq, batch_size):
+            batch_k = wrapped_k[i:i+batch_size]
+            batch_H = project_to_q(batch_k)
+            batch_eigs = jax.vmap(_solve_generalized)(batch_H)
+            lambda_q_list.append(batch_eigs)
+            jax.block_until_ready(batch_eigs)  # Free memory before next batch
+        lambda_q = jnp.concatenate(lambda_q_list, axis=0)
         energies_on_path = jax.vmap(lambda row: f_inv_newton(row.real, a=a_f, n=n_f) + epsilon0)(lambda_q)
         energies_sorted = np.asarray(jnp.sort(energies_on_path, axis=1)[:, :nb_keep])
         # Determine Fermi energy as the maximum along path of the wfn.nelec-th band (1-based -> 0-based)
@@ -508,6 +516,7 @@ def write_bands_to_file(output_path: str, energies_on_path, kpath_frac, x_path):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Hamiltonian interpolation driver")
     parser.add_argument("-i", "--input", default="cohsex_test.in", help="Input file")
+    parser.add_argument("-wfn", "--wfn-file", default=None, help="Override WFN file (e.g. WFN_qp.h5)")
     parser.add_argument("--plot", action="store_true", help="Show interpolated band plot")
     parser.add_argument("--eqp-file", default=None, help="Path to EQP/sigX file to override DFT band energies")
     parser.add_argument("--verbose", action="store_true", help="Print diagnostic details")
@@ -516,6 +525,11 @@ def main(argv=None):
 
     from ..gw_isdf.cohsex_jax import read_cohsex_input
     params = read_cohsex_input(args.input)
+    
+    # Override WFN file if provided via CLI
+    if args.wfn_file is not None:
+        params["wfn_file"] = args.wfn_file
+        log(f"Using WFN file from CLI: {args.wfn_file}")
 
     wfn, sym, meta, psi_rtot, psi_rmu, enk_sigma = initialize_wfns(args.input, params, log, args.eqp_file)
     kpath_data = initialize_kpath(wfn, params)
@@ -527,7 +541,7 @@ def main(argv=None):
     output_dir = os.path.dirname(os.path.abspath(args.input))
     write_bands_to_file(
         os.path.join(output_dir, 'bandstructure.dat'),
-        result['energies_on_path'],
+        result['energies_sorted'],  # Use sorted & truncated to nb_keep, not raw eigenvalues
         kpath_data[0],
         kpath_data[1],
     )

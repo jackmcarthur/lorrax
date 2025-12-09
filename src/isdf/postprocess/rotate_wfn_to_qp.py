@@ -70,7 +70,7 @@ def find_kpoint_mapping(wfn_kpoints, rot_kpoints, kgrid, shift, tol=1e-6):
     return kirr_to_kfull
 
 
-def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True):
+def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True, energy_only=False):
     """
     Rotate WFN coefficients from DFT to QP basis.
     
@@ -79,6 +79,7 @@ def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True):
         rot_file: Path to qp_wfn_rotations.h5
         output_file: Path to output WFN_qp.h5
         verbose: Print progress information
+        energy_only: If True, only update energies, don't rotate wavefunctions
     """
     # Copy WFN.h5 to output file first
     if verbose:
@@ -146,8 +147,14 @@ def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True):
             print(f"\nCoefficients shape: {coeffs_shape}")
             print(f"  (mnband, nspin*nspinor, ngktot, real/imag)")
         
+        if energy_only:
+            if verbose:
+                print("\n[energy-only mode] Skipping wavefunction rotation")
+        
         # Process each reduced k-point
         for ik_red in range(nk_red):
+            if energy_only:
+                continue  # Skip rotation, only update energies below
             ik_full = kirr_to_kfull[ik_red]
             U_k = U_mnk[ik_full]  # (nb_sigma, nb_sigma), U[m,n] = <m_DFT|n_QP>
             
@@ -168,17 +175,41 @@ def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True):
                         1j * coeffs[ib, ispinor, start:end, 1]
                     )
             
-            # Rotate: c_qp[n, G] = Σ_m conj(U[m, n]) * c_dft[m, G]
-            # U[m, n] = <m_DFT|n_QP>, so to get c_qp from c_dft:
-            # c_qp = U^† @ c_dft (treating bands as vector)
-            # For each spinor component and G-vector
+            # Rotate: c_qp[n, G] = Σ_m U[m, n] * c_dft[m, G]
+            # U[m, n] = <m_DFT|n_QP>, meaning |n_QP> = Σ_m U[m,n] |m_DFT>
+            # So: c_qp[n,G] = <G|n_QP> = Σ_m U[m,n] <G|m_DFT> = Σ_m U[m,n] c_dft[m,G]
+            # Matrix form: c_qp = U^T @ c_dft  (NOT U^H!)
             c_qp = np.zeros_like(c_dft)
             for ispinor in range(nspinor):
                 # c_dft[ib, G] shape (nb_sigma, ng_k)
                 # U_k shape (nb_sigma, nb_sigma)
-                # c_qp[n, G] = sum_m U*[m, n] c_dft[m, G]
-                # = (U^H @ c_dft)[n, G]
-                c_qp[:, ispinor, :] = np.conj(U_k.T) @ c_dft[:, ispinor, :]
+                # c_qp[n, G] = sum_m U[m, n] c_dft[m, G] = (U^T @ c_dft)[n, G]
+                c_qp[:, ispinor, :] = U_k.T @ c_dft[:, ispinor, :]
+            
+            # Diagnostic: check unitarity of U and norm preservation
+            if ik_red == 0 and verbose:
+                # U should be unitary: U^H @ U = I
+                UhU = np.conj(U_k.T) @ U_k
+                unitarity_err = np.max(np.abs(UhU - np.eye(nb_sigma)))
+                print(f"  [Diagnostic k=0] U unitarity error: {unitarity_err:.2e}")
+                
+                # Check norm preservation (should be same before/after rotation)
+                dft_norms = np.sum(np.abs(c_dft[:, 0, :])**2, axis=1)
+                qp_norms = np.sum(np.abs(c_qp[:, 0, :])**2, axis=1)
+                norm_diff = np.max(np.abs(dft_norms - qp_norms))
+                print(f"  [Diagnostic k=0] Max norm diff (DFT vs QP): {norm_diff:.2e}")
+                
+                # Check if U is close to identity (small rotation)
+                diag_weight = np.sum(np.abs(np.diag(U_k))**2) / nb_sigma
+                print(f"  [Diagnostic k=0] Avg |U_nn|^2 (1.0 = identity): {diag_weight:.4f}")
+                
+                # Show which DFT bands contribute most to each QP band (top 3)
+                print(f"  [Diagnostic k=0] Band mixing (QP band <- DFT contributions):")
+                for n_qp in range(min(5, nb_sigma)):  # First 5 QP bands
+                    weights = np.abs(U_k[:, n_qp])**2
+                    top_indices = np.argsort(weights)[::-1][:3]
+                    top_str = ", ".join([f"{i}({weights[i]:.2f})" for i in top_indices])
+                    print(f"    QP {n_qp} <- DFT bands: {top_str}")
             
             # Write back to file
             for ib_local, ib in enumerate(range(band_start, band_stop)):
@@ -202,17 +233,26 @@ def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True):
         energies = el[:]
         
         # Update with QP energies for each reduced k-point
+        if verbose:
+            print(f"\n  Energy comparison at k=0 (Rydberg):")
+            print(f"  {'Band':>4s}  {'DFT':>12s}  {'QP':>12s}  {'Diff':>12s}")
+        
         for ik_red in range(nk_red):
             ik_full = kirr_to_kfull[ik_red]
             for ib_local, ib in enumerate(range(band_start, band_stop)):
+                e_dft = energies[0, ik_red, ib]
+                e_qp = E_qp_ry[ik_full, ib_local]
                 # energies[ispin, ik, ib] - update all spins with the same QP energy
-                energies[:, ik_red, ib] = E_qp_ry[ik_full, ib_local]
+                energies[:, ik_red, ib] = e_qp
+                
+                if ik_red == 0 and verbose and ib_local < 10:
+                    print(f"  {ib:4d}  {e_dft:12.6f}  {e_qp:12.6f}  {e_qp - e_dft:12.6f}")
         
         # Write updated energies
         el[...] = energies
         
         if verbose:
-            print(f"Updated energies for bands [{band_start}, {band_stop})")
+            print(f"\nUpdated energies for bands [{band_start}, {band_stop})")
     
     if verbose:
         print(f"\nWrote {output_file}")
@@ -273,6 +313,8 @@ def main():
                         help='Output file (default: WFN_qp.h5 in same directory as WFN.h5)')
     parser.add_argument('--add-mapping', action='store_true',
                         help='Also add k-point mapping to the rotation file')
+    parser.add_argument('--energy-only', action='store_true',
+                        help='Only update energies, do not rotate wavefunctions (for debugging)')
     parser.add_argument('--quiet', '-q', action='store_true',
                         help='Suppress progress output')
     
@@ -312,9 +354,10 @@ def main():
     if args.add_mapping:
         add_kpoint_mapping_to_rotation_file(rotation_file, wfn_file, verbose=verbose)
     
-    # Rotate wavefunctions
+    # Rotate wavefunctions (or just update energies if --energy-only)
     kirr_to_kfull = rotate_wfn_coefficients(
-        wfn_file, rotation_file, output_file, verbose=verbose
+        wfn_file, rotation_file, output_file, verbose=verbose,
+        energy_only=args.energy_only
     )
     
     if verbose:

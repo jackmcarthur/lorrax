@@ -7,7 +7,7 @@ from functools import partial
 from . import Meta
 
 
-def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange):
+def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, nspinor=2):
 	"""Return band energies and per-band weights for a given band window.
 
 	Args:
@@ -15,10 +15,11 @@ def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange):
 		sym: SymMaps with mappings between irreducible and full k sets
 		bandrange: tuple[int,int] inclusive-exclusive (start, end) bands to extract
 		sigma_bandrange: tuple[int,int] band window used to compute weighting
+		nspinor: Number of spinor components (2 for Pauli, 4 for bispinor)
 
 	Returns:
 		enk: jax.Array of shape (nk_full, nb)
-		weights: jax.Array of shape (nk_full, nb * 2) with simple val/cond weights
+		weights: jax.Array of shape (nk_full, nb * nspinor) with simple val/cond weights
 	"""
 	# Energies are stored on irreducible k; expand to full k using mapping
 	nb = int(bandrange[1] - bandrange[0])
@@ -44,8 +45,8 @@ def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange):
 	wmax = jnp.max(weights_full)
 	weights_full = jnp.where(wmax > 0, weights_full / wmax, weights_full)
 	weights_full = weights_full.at[:, enk_sigma_start:enk_sigma_end].set(1.0)
-	# TODO: in bispinor case repeats should equal 4 instead of 2
-	return enk, jnp.repeat(weights_full, repeats=2, axis=1)
+	# Repeat weights for each spinor component (2 for Pauli, 4 for bispinor)
+	return enk, jnp.repeat(weights_full, repeats=nspinor, axis=1)
 
 
 def get_small_psi_component(gvecs, kvec, bvec, psi_G):
@@ -127,15 +128,14 @@ def read_Gvecs_to_devices(
 			band_idx = bandrange[0] + j
 			cnk = np.asarray(sym.get_cnk_fullzone(wfn, band_idx, k_idx))
 			psi_Gspace_local[local_band, 0:meta.nspinor_wfnfile, :] = cnk
-		# Expand to 4 components if requested
+		# Expand to 4 components if requested: small component ≈ (α/2)(σ·p)ψ_large
 		if bispinor:
-			psi_Gspace_local[:, 2:4, :] = get_small_psi_component(
-				gvecs_k_rot,
-				np.asarray(sym.unfolded_kpts[k_idx], dtype=np.float64),
-				np.asarray(wfn.bvec, dtype=np.float64),
-				psi_Gspace_local,
-				np,
-			)
+			psi_Gspace_local[:, 2:4, :] = np.asarray(get_small_psi_component(
+				jnp.asarray(gvecs_k_rot),
+				jnp.asarray(sym.unfolded_kpts[k_idx], dtype=jnp.float64),
+				jnp.asarray(wfn.bvec, dtype=jnp.float64),
+				jnp.asarray(psi_Gspace_local),
+			))
 		# Scatter G-space coefficients into the FFT box for all local bands
 		psi_Gtot_local[k_idx, :, :, gvecs_k_rot[:, 0], gvecs_k_rot[:, 1], gvecs_k_rot[:, 2]] = np.transpose(
 			psi_Gspace_local, (2, 0, 1)
