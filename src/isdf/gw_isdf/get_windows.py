@@ -34,9 +34,17 @@ class GL_window:
         self.end_energy = wfn.energies[end_ind]
 
 class WindowInfo:
-    def __init__(self, start_energy, end_energy):
+    def __init__(self, start_energy, end_energy, index=None, count=None):
         self.start_energy = start_energy
         self.end_energy = end_energy
+        self.index = index
+        self.count = count
+
+    @property
+    def upper_inclusive(self) -> bool:
+        if self.index is None or self.count is None:
+            return True
+        return self.index >= self.count - 1
 
 class WindowPair:
     def __init__(self, val_window, cond_window, epsq):
@@ -45,6 +53,16 @@ class WindowPair:
         self.ntau = round(N_tau_window(cond_window, val_window, epsq))
         self.tau_i, self.w_i = roots_laguerre(self.ntau)
         self.z_lm = np.sqrt(1.0/((cond_window.end_energy - val_window.start_energy)*(cond_window.start_energy - val_window.end_energy))) # very important bug fixed here...
+        # Populated on-demand when the JAX kernels need per-k band ranges.
+        self.val_band_start = None
+        self.val_band_len = None
+        self.val_band_offset = None
+        self.cond_band_start = None
+        self.cond_band_len = None
+        self.cond_band_offset = None
+        self.max_val_len = 0
+        self.max_cond_len = 0
+        self._has_band_ranges = False
 
 def compute_dos(wfn_file, n_points=2000):
     """
@@ -298,10 +316,10 @@ def get_window_info(epsq, wfn, cond_bounds=None, nband_max=None):
     # Fill valence and conduction window information and create pairs
     for iv in range(optimal_val_windows):
         v0, v1 = val_e[optimal_v_partitions[iv]], val_e[optimal_v_partitions[iv+1]-1]
-        val_window = WindowInfo(v0, v1)
+        val_window = WindowInfo(v0, v1, index=iv, count=optimal_val_windows)
         for jc in range(optimal_cond_windows):
             c0, c1 = cond_e[optimal_c_partitions[jc]], cond_e[optimal_c_partitions[jc+1]-1]
-            cond_window = WindowInfo(c0, c1)
+            cond_window = WindowInfo(c0, c1, index=jc, count=optimal_cond_windows)
             window_pairs.append(WindowPair(val_window, cond_window, epsq))
 
     return window_pairs

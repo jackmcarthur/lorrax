@@ -68,6 +68,7 @@ from ..mixing.acceleration import (
     rcrop_nojit, hermitian_to_upper_flat, upper_flat_to_hermitian
 )
 from ..common import Meta
+from ..common import jax_profile
 from ..common.gamma_matrices import gammas_sparse
 import isdf.common.timing as timing
 import h5py
@@ -1770,26 +1771,27 @@ def main(argv=None):
 	# Optionally compute chi0 via JAX for screened interaction if requested
 	if do_screened:
 		with timing.section("cohsex_jax.chi0_W") as timer_chiw:
-			# Ensure energies are plain arrays for JAX
-			# Use VALENCE energies for psi_v and CONDUCTION energies for psi_c
-			enk_v_arr = jnp.asarray(getattr(enk_v, 'data', enk_v))
-			enk_c_arr = jnp.asarray(getattr(enk_c, 'data', enk_c))
-			# Debug: verify shapes match
-			print0(f"[chi0] enk_v_arr shape: {enk_v_arr.shape}, enk_c_arr shape: {enk_c_arr.shape}")
-			print0(f"[chi0] psi_vT shape: {psi_vT.shape}, psi_v shape: {psi_v.shape}")
-			print0(f"[chi0] psi_cT shape: {psi_cT.shape}, psi_c shape: {psi_c.shape}")
-			# chi0 expects:
-			#   psi_vTX: valence, transposed, X-sharded on rmu
-			#   psi_vY:  valence, Y-sharded on rmu
-			#   psi_cX:  conduction, X-sharded on rmu  
-			#   psi_cTY: conduction, transposed, Y-sharded on rmu
-			window_pairs = get_window_info(epsq, wfn, nband_max=nband)
-			chi0 = get_chi0_jax(psi_vT, psi_v, psi_c, psi_cT, enk_v_arr, enk_c_arr, window_pairs, meta, mesh_xy)
-			# Compute static W under k_XY sharding (S_qmunu included but unused for now)
-			W_q = get_static_w_q_jax(V_qmunu, chi0, None, meta, mesh_xy)
-			W_q.block_until_ready()
-			# Compute static W under k_XY sharding (S_qmunu included but unused for now)
-			#W_q = get_static_w_q_jax(V_qmunu, chi0, S_qmunu, meta, mesh_xy)
+			with jax_profile.trace_section("chi0_W"):
+				# Ensure energies are plain arrays for JAX
+				# Use VALENCE energies for psi_v and CONDUCTION energies for psi_c
+				enk_v_arr = jnp.asarray(getattr(enk_v, 'data', enk_v))
+				enk_c_arr = jnp.asarray(getattr(enk_c, 'data', enk_c))
+				# Debug: verify shapes match
+				print0(f"[chi0] enk_v_arr shape: {enk_v_arr.shape}, enk_c_arr shape: {enk_c_arr.shape}")
+				print0(f"[chi0] psi_vT shape: {psi_vT.shape}, psi_v shape: {psi_v.shape}")
+				print0(f"[chi0] psi_cT shape: {psi_cT.shape}, psi_c shape: {psi_c.shape}")
+				# chi0 expects:
+				#   psi_vTX: valence, transposed, X-sharded on rmu
+				#   psi_vY:  valence, Y-sharded on rmu
+				#   psi_cX:  conduction, X-sharded on rmu  
+				#   psi_cTY: conduction, transposed, Y-sharded on rmu
+				window_pairs = get_window_info(epsq, wfn, nband_max=nband)
+				chi0 = get_chi0_jax(psi_vT, psi_v, psi_c, psi_cT, enk_v_arr, enk_c_arr, window_pairs, meta, mesh_xy)
+				# Compute static W under k_XY sharding (S_qmunu included but unused for now)
+				W_q = get_static_w_q_jax(V_qmunu, chi0, None, meta, mesh_xy)
+				W_q.block_until_ready()
+				# Compute static W under k_XY sharding (S_qmunu included but unused for now)
+				#W_q = get_static_w_q_jax(V_qmunu, chi0, S_qmunu, meta, mesh_xy)
 
 	# ============================================================================
 	# HEAD INJECTION: Add the q→0, G=0 Coulomb divergence correction
@@ -1825,11 +1827,15 @@ def main(argv=None):
 		# HEAD INJECTION FOR V: V_qmunu at q=0 gets the bare Coulomb head
 		# V_Γ ← V_Γ + (vc0_mean / Ω) × ζ*(0) ⊗ ζ(0)
 		# This is ALWAYS applied regardless of do_screened
+		# DEBUG TODO REMOVE JM
+		vc0_mean = 1649.14397
 		V_qmunu = V_qmunu.at[0, 0, 0, 0, 0, 0, :, :].add((vc0_mean * vol_scale) * outer_u)
 		
 		# HEAD INJECTION FOR W (screened): W at q=0 gets the screened head wcoul0
 		# Only applied when do_screened=True since W_q only exists then
 		if do_screened:
+			#DEBUG TODO REMOVE JM
+			wcoul0 = 394.450575
 			W_q = W_q.at[0, 0, 0, 0, :, 0, :].add((wcoul0 * vol_scale) * outer_u)
 
 	# ============================================================================
@@ -1928,54 +1934,6 @@ def main(argv=None):
 	kin_ion_full = load_kin_ion_submatrix(kin_ion_path, qp_band_start, qp_band_stop)
 	nelec = int(wfn.nelec)
 	
-	# Diagnostic: check initial values (in Ry) before self-consistency
-	# kin_ion = T + V_ion + V_NL (no V_H, no V_XC)
-	# k0_diag.txt has K+I+H+NL = T + V_ion + V_H + V_NL (no V_XC)
-	# So kin_ion + VH should match k0_diag.txt's K+I+H+NL column
-	if meta.rank == 0:
-		sx_diag = np.real(np.diag(np.asarray(sigma_sx_kbar_ij_jax[0])))
-		coh_diag = np.real(np.diag(np.asarray(sigma_coh_kbar_ij_jax[0])))
-		vh_diag = np.real(np.diag(np.asarray(hartree_kbar_ij_jax[0])))
-		kin_diag = np.real(np.diag(np.asarray(kin_ion_full[0])))
-		print(f"[Diagnostic k=0] kin_ion (T+Vion+VNL) diag[:5] (Ry): {kin_diag[:5]}")
-		print(f"[Diagnostic k=0] VH diag[:5] (Ry): {vh_diag[:5]}")
-		print(f"[Diagnostic k=0] kin_ion+VH diag[:5] (Ry): {kin_diag[:5] + vh_diag[:5]}  <-- compare to k0_diag K+I+H+NL")
-		print(f"[Diagnostic k=0] SX diag[:5] (Ry): {sx_diag[:5]}")
-		print(f"[Diagnostic k=0] COH diag[:5] (Ry): {coh_diag[:5]}")
-		
-		# Check off-diagonal structure of V_H and (kin_ion + V_H)
-		# In DFT eigenbasis: (kin_ion + V_H + V_xc) is diagonal
-		# => (kin_ion + V_H)_mn = -V_xc_mn for m != n
-		kin_mat = np.asarray(kin_ion_full[0])
-		vh_mat = np.asarray(hartree_kbar_ij_jax[0])
-		kin_vh = kin_mat + vh_mat
-		sx_mat = np.asarray(sigma_sx_kbar_ij_jax[0])
-		coh_mat = np.asarray(sigma_coh_kbar_ij_jax[0])
-		
-		# Remove diagonal to get off-diagonal
-		kin_off = kin_mat - np.diag(np.diag(kin_mat))
-		vh_off = vh_mat - np.diag(np.diag(vh_mat))
-		kin_vh_off = kin_vh - np.diag(np.diag(kin_vh))
-		sx_off = sx_mat - np.diag(np.diag(sx_mat))
-		coh_off = coh_mat - np.diag(np.diag(coh_mat))
-		sigma_off = sx_off + coh_off + vh_off
-		
-		print(f"[Off-diag k=0] |kin_ion|_max: {np.abs(kin_off).max():.4f} Ry = {np.abs(kin_off).max()*13.6:.1f} eV")
-		print(f"[Off-diag k=0] |V_H|_max: {np.abs(vh_off).max():.4f} Ry = {np.abs(vh_off).max()*13.6:.1f} eV")
-		print(f"[Off-diag k=0] |kin_ion+V_H|_max: {np.abs(kin_vh_off).max():.4f} Ry = {np.abs(kin_vh_off).max()*13.6:.1f} eV  <-- should be |V_xc|_max")
-		print(f"[Off-diag k=0] |SX|_max: {np.abs(sx_off).max():.4f} Ry")
-		print(f"[Off-diag k=0] |COH|_max: {np.abs(coh_off).max():.4f} Ry")
-		
-		# The COHSEX self-energy (without V_H) vs V_xc comparison
-		sigma_cohsex_off = sx_off + coh_off  # Just SX + COH (the "exchange-correlation" replacement)
-		print(f"[Off-diag k=0] |SX+COH|_max: {np.abs(sigma_cohsex_off).max():.4f} Ry = {np.abs(sigma_cohsex_off).max()*13.6:.1f} eV")
-		print(f"[Off-diag k=0] |kin_ion+V_H|_max = |V_xc|_max: {np.abs(kin_vh_off).max():.4f} Ry = {np.abs(kin_vh_off).max()*13.6:.1f} eV")
-		
-		# H_QP = kin_ion + V_H + SX + COH (no double counting!)
-		H_QP_off = kin_vh_off + sigma_cohsex_off
-		print(f"[Off-diag k=0] |H_QP|_max = |(SX+COH) - V_xc|_max: {np.abs(H_QP_off).max():.4f} Ry = {np.abs(H_QP_off).max()*13.6:.1f} eV")
-		print(f"[Off-diag k=0] --> Large because COHSEX has small off-diag (~{np.abs(sigma_cohsex_off).max()*13.6:.1f} eV) but V_xc has large off-diag (~{np.abs(kin_vh_off).max()*13.6:.1f} eV)")
-
 	if self_consistent:
 		# Self-consistent COHSEX: iterate until Σ converges
 		# Key equations:

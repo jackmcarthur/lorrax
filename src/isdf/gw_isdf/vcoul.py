@@ -247,9 +247,9 @@ def compute_q0_averages(
 				rq2 = rq.at[:, 2].set(0.0)
 				# Compute v(q)
 				denom = jnp.einsum("ij,ij->i", rq2, rq2)
-				base = 4.0 * jnp.pi / denom
+				base = 8.0 * jnp.pi / denom # Ry units (m=1/2)
 				kxy = jnp.linalg.norm(rq2[:, :2], axis=1)
-				f2d = 2.0 * (1.0 - jnp.exp(-jnp.pi / bvec[2, 2] * kxy) * jnp.cos(rq2[:, 2] * jnp.pi / bvec[2, 2]))
+				f2d = (1.0 - jnp.exp(-jnp.pi / bvec[2, 2] * kxy) * jnp.cos(rq2[:, 2] * jnp.pi / bvec[2, 2]))
 				vq = base * f2d
 				means.append(jnp.mean(vq))
 				if S_cart is not None:
