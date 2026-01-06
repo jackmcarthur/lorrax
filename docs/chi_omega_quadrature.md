@@ -147,56 +147,47 @@ $$
 
 *No crossing* ($\omega < E^{(\mathrm{gap})}_{lm}$ or $\omega > E^{(\mathrm{bw})}_{lm}$): Use GL with shifted gap.
 
-*Crossing* ($E^{(\mathrm{gap})}_{lm} < \omega < E^{(\mathrm{bw})}_{lm}$): Use HGL with sin/cos separation.
+*Crossing* ($E^{(\mathrm{gap})}_{lm} < \omega < E^{(\mathrm{bw})}_{lm}$): Use HGL with Euler identity.
 
 ---
 
-## 6. HGL Separable Form for Crossings
+## 6. HGL Separable Form via Euler Identity
 
-When $\omega - \Delta E_{cv}$ changes sign, use angle-addition to factor ω from band energies.
+When $\omega - \Delta E_{cv}$ changes sign, use **Euler's identity** to reduce memory by 2×.
 
-### Angle-Addition Factorization
+### Complex Propagators (2 arrays instead of 4)
 
-For $x = \omega - (E_c - E_v) = \omega + E_v - E_c$, define $\theta_\omega = \gamma\tau\omega$, $\theta_v = \gamma\tau E_v$, $\theta_c = \gamma\tau E_c$:
-
+Instead of storing 4 sin/cos arrays, define 2 complex propagators per τ:
 $$
-\sin(\theta_\omega + \theta_v - \theta_c) = \sin\theta_\omega\underbrace{(\cos\theta_v\cos\theta_c + \sin\theta_v\sin\theta_c)}_{P_+} + \cos\theta_\omega\underbrace{(\sin\theta_v\cos\theta_c - \cos\theta_v\sin\theta_c)}_{P_\times}
-$$
-
-### ω-Independent Band Propagators
-
-Define 4 propagators per τ (no ω-dependence):
-$$
-C^{v}_{\mathbf{k},ab}(\tau) = \sum_{v \in \mathcal{L}} \cos(\gamma\tau E_{v\mathbf{k}}) \, \psi_{v\mathbf{k},a}\psi^*_{v\mathbf{k},b}
+G^{v}_{\mathbf{k},ab}(\tau) = \sum_{v \in \mathcal{L}} e^{i\gamma\tau E_{v\mathbf{k}}} \, \psi_{v\mathbf{k},a}\psi^*_{v\mathbf{k},b}
 $$
 $$
-S^{v}_{\mathbf{k},ab}(\tau) = \sum_{v \in \mathcal{L}} \sin(\gamma\tau E_{v\mathbf{k}}) \, \psi_{v\mathbf{k},a}\psi^*_{v\mathbf{k},b}
-$$
-$$
-C^{c}_{\mathbf{k},ab}(\tau) = \sum_{c \in \mathcal{M}} \cos(\gamma\tau E_{c\mathbf{k}}) \, \psi_{c\mathbf{k},a}\psi^*_{c\mathbf{k},b}
-$$
-$$
-S^{c}_{\mathbf{k},ab}(\tau) = \sum_{c \in \mathcal{M}} \sin(\gamma\tau E_{c\mathbf{k}}) \, \psi_{c\mathbf{k},a}\psi^*_{c\mathbf{k},b}
+G^{c}_{\mathbf{k},ab}(\tau) = \sum_{c \in \mathcal{M}} e^{i\gamma\tau E_{c\mathbf{k}}} \, \psi_{c\mathbf{k},a}\psi^*_{c\mathbf{k},b}
 $$
 
-### ω-Independent Products
+These satisfy $G = C + iS$ where $C = \sum_n \cos(\gamma\tau E_n)\psi_n\psi_n^\dagger$ and $S = \sum_n \sin(\gamma\tau E_n)\psi_n\psi_n^\dagger$.
 
-After FFT to R-space, form two product tiles (shape: R, μ, ν):
+### Products via Hermitian Conjugate
+
+After FFT to R-space, form the product (single complex contraction):
 $$
-P_+(\tau)_\mathbf{R} = \sum_{ab} C^v_{\mathbf{R},ab} C^c_{-\mathbf{R},ba} + S^v_{\mathbf{R},ab} S^c_{-\mathbf{R},ba}
+(G^c_{-\mathbf{R}})^\dagger \cdot G^v_{\mathbf{R}} = P_+ - i P_\times
 $$
-$$
-P_\times(\tau)_\mathbf{R} = \sum_{ab} S^v_{\mathbf{R},ab} C^c_{-\mathbf{R},ba} - C^v_{\mathbf{R},ab} S^c_{-\mathbf{R},ba}
-$$
+
+where:
+- $P_+ = \mathrm{Re}[(G^c)^\dagger G^v] = C^c C^v + S^c S^v$
+- $P_\times = -\mathrm{Im}[(G^c)^\dagger G^v] = S^c C^v - C^c S^v$
+
+**Why it works**: For Hermitian matrices $\psi\psi^\dagger$, the conjugate equals the Hermitian transpose.
 
 ### Batch All Frequencies
 
 The crossing contribution for **all** ω simultaneously:
 $$
-\chi^{\mathrm{cross}}_{lm}(\omega_i) = \gamma \sum_u w_u \left[\sin(\gamma\tau_u\omega_i)\,P_+(\tau_u) + \cos(\gamma\tau_u\omega_i)\,P_\times(\tau_u)\right]
+\chi^{\mathrm{cross}}_{lm}(\omega_i) = -\gamma \sum_u w_u \left[\cos(\gamma\tau_u\omega_i)\,P_\times(\tau_u) - \sin(\gamma\tau_u\omega_i)\,P_+(\tau_u)\right]
 $$
 
-This is a matrix multiply: `chi[i] = sin_phase[i, :] @ P_plus[:] + cos_phase[i, :] @ P_cross[:]` where the phase matrices are shape `(n_omega, n_tau)` and products are `(n_tau, nq, nmu, nmu)`.
+**Memory savings**: 2 complex arrays instead of 4 real → **2× reduction** in peak memory.
 
 ---
 
@@ -230,19 +221,19 @@ $$
 \chi^{\mathrm{GL}}(\omega_i) = -2\zeta \sum_u w_u \underbrace{e^{(\zeta E^{(\mathrm{gap})} - 1)\tau_u}}_{\text{ω-indep}} \cdot \underbrace{e^{-\zeta\omega_i\tau_u}}_{\text{phase}[\omega_i, u]} \cdot \underbrace{\tilde{\chi}(\tau_u)}_{\text{tile}}
 $$
 
-**HGL case** (crossing): Use angle-addition to factor ω from band energies:
+**HGL case** (crossing): Use Euler identity for 2× memory savings:
 $$
-\sin(\gamma\tau(\omega + E_v - E_c)) = \sin(\gamma\tau\omega)\,P_+(\tau) + \cos(\gamma\tau\omega)\,P_\times(\tau)
+G^{v/c}_\tau = \sum_n e^{i\gamma\tau E_n}\psi_n\psi_n^\dagger
 $$
-where the **ω-independent** products are:
-$$
-P_+(\tau) = C^v_\tau C^c_\tau + S^v_\tau S^c_\tau, \qquad P_\times(\tau) = S^v_\tau C^c_\tau - C^v_\tau S^c_\tau
-$$
-with $C^{v/c}_\tau = \sum_n \cos(\gamma\tau E_n)\psi_n\psi_n^*$ and $S^{v/c}_\tau = \sum_n \sin(\gamma\tau E_n)\psi_n\psi_n^*$.
 
-Then batch all crossing frequencies:
+Then form products via Hermitian conjugate:
 $$
-\chi^{\mathrm{HGL}}(\omega_i) = \gamma \sum_u w_u \left[\sin(\gamma\tau_u\omega_i)\,P_+(\tau_u) + \cos(\gamma\tau_u\omega_i)\,P_\times(\tau_u)\right]
+(G^c_\tau)^\dagger G^v_\tau = P_+(\tau) - i P_\times(\tau)
+$$
+
+Extract real/imag and batch all crossing frequencies:
+$$
+\chi^{\mathrm{HGL}}(\omega_i) = -\gamma \sum_u w_u \left[\cos(\gamma\tau_u\omega_i)\,P_\times(\tau_u) - \sin(\gamma\tau_u\omega_i)\,P_+(\tau_u)\right]
 $$
 
 ### 8.2 Loop Structure (JAX-friendly)
@@ -284,26 +275,23 @@ FOR (l,m) in window_pairs:  # OUTERMOST: fixes array shapes
         cos_phase = cos(γ * ω_cross[:, None] * τ_hgl[None, :])
         
         FOR u in range(n_tau_hgl):
-            # 4 propagators (ω-independent), each shape (k, s, μ, s', μ')
-            C_v = sum_v cos(γ*τ[u]*E_v) * psi_v @ psi_v.H
-            S_v = sum_v sin(γ*τ[u]*E_v) * psi_v @ psi_v.H
-            C_c = sum_c cos(γ*τ[u]*E_c) * psi_c @ psi_c.H
-            S_c = sum_c sin(γ*τ[u]*E_c) * psi_c @ psi_c.H
+            # 2 complex propagators via Euler (2× memory savings)
+            G_v = sum_v exp(i*γ*τ[u]*E_v) * psi_v @ psi_v.H
+            G_c = sum_c exp(i*γ*τ[u]*E_c) * psi_c @ psi_c.H
             
-            # FFT to R-space, form products
-            C_v_R, S_v_R = IFFT_kR(C_v), IFFT_kR(S_v)
-            C_c_R, S_c_R = IFFT_kR(C_c), IFFT_kR(S_c)
+            # FFT to R-space
+            G_v_R = IFFT_kR(G_v)
+            G_c_mR = FFT_kR(G_c)  # -R for convolution
             
-            P_plus  = contract(C_v_R, C_c_R) + contract(S_v_R, S_c_R)
-            P_cross = contract(S_v_R, C_c_R) - contract(C_v_R, S_c_R)
-            
-            P_plus_q  = FFT_Rq(P_plus)
-            P_cross_q = FFT_Rq(P_cross)
+            # Products from Hermitian conjugate: (G_c)† G_v = P_+ - i P_×
+            product = contract(conj(G_c_mR), G_v_R)
+            P_plus_q  = FFT_Rq(product.real)
+            P_cross_q = FFT_Rq(-product.imag)
             
             # Batch ALL crossing ω (vectorized multiply-add)
             chi_cross += γ * w_hgl[u] * (
-                sin_phase[:, u, None, None, None] * P_plus_q +
-                cos_phase[:, u, None, None, None] * P_cross_q
+                cos_phase[:, u, None, None, None] * P_cross_q -
+                sin_phase[:, u, None, None, None] * P_plus_q
             )
 
 # Finalize
@@ -319,7 +307,8 @@ write_to_file(chi_accum)
 | `phase_GL` | `(n_ω, n_τ)` | Precomputed, reused per window |
 | `sin/cos_phase` | `(n_ω_cross, n_τ_hgl)` | Only for crossing ω |
 | `χ_tile` | `(nq, nμ, nμ)` | Temporary per τ, overwritten |
-| `P_plus, P_cross` | `(nq, nμ, nμ)` | Temporary per τ |
+| `G_v, G_c` | `(k, s, μ, s', μ')` complex | 2 arrays via Euler (not 4 real) |
+| `P_plus, P_cross` | `(nq, nμ, nμ)` | Extracted from `(G^c)† G^v` |
 
 ### 8.4 JAX Implementation Notes
 
@@ -487,9 +476,9 @@ The coefficient $a_1$ vanishes when $\int_0^\infty \tau h(\tau) d\tau / \int_0^\
 | $\epsilon^{(q)}$ | Target fractional quadrature error |
 | $\alpha$ | Bandwidth ratio $\sqrt{E^{(\mathrm{bw})}/E^{(\mathrm{gap})}}$ |
 | $\mathcal{L}, \mathcal{M}$ | Index sets for valence/conduction bands in windows |
-| $\rho^{(v/c)}$ | Exponentially-damped density matrix (GL): $\sum_n e^{-\zeta\tau\Delta E}\psi_n\psi_n^*$ |
-| $C^{v/c}, S^{v/c}$ | Cos/sin-weighted density matrices (HGL): $\sum_n \cos/\sin(\gamma\tau E_n)\psi_n\psi_n^*$ |
-| $P_+, P_\times$ | ω-independent HGL products: $C^v C^c + S^v S^c$ and $S^v C^c - C^v S^c$ |
+| $\rho^{(v/c)}$ | Exponentially-damped density matrix (GL): $\sum_n e^{-\zeta\tau\Delta E}\psi_n\psi_n^\dagger$ |
+| $G^{v/c}$ | Complex propagator (HGL, Euler): $\sum_n e^{i\gamma\tau E_n}\psi_n\psi_n^\dagger$ |
+| $P_+, P_\times$ | Products from $(G^c)^\dagger G^v$: $P_+ = \mathrm{Re}[\cdot]$, $P_\times = -\mathrm{Im}[\cdot]$ |
 | $E^{(\mathrm{gap})}_{lm}$ | $E_m^{(c,\min)} - E_l^{(v,\max)}$ — minimum transition energy |
 | $E^{(\mathrm{bw})}_{lm}$ | $E_m^{(c,\max)} - E_l^{(v,\min)}$ — maximum transition energy |
 | `phase_GL` | Complex phase $e^{-\zeta z\tau}$, shape `(n_z, n_τ)`, dtype `complex128` |
@@ -675,9 +664,9 @@ def integrate_hgl(
             ctx.nkx, ctx.nky, ctx.nkz
         )
         
-        # Accumulate: sin_phase × P_+ + cos_phase × P_×
-        w_plus = ctx.prefactor * win.gamma * win.w_hgl[u] * phases.sin_phase[:, u]
+        # Accumulate: cos_phase × P_× - sin_phase × P_+
         w_cross = ctx.prefactor * win.gamma * win.w_hgl[u] * phases.cos_phase[:, u]
+        w_plus = -ctx.prefactor * win.gamma * win.w_hgl[u] * phases.sin_phase[:, u]
         accumulate_tiles(ctx.output_file, phases.omega_hgl_idx, w_plus, P_plus, w_cross, P_cross)
 ```
 
@@ -731,25 +720,20 @@ def chi_tile_hgl(
     nkx, nky, nkz,
 ) -> tuple[Array, Array]:
     """
-    Compute P_+(τ), P_×(τ) for one HGL quadrature point.
-    Returns two (nμ, nμ, nqx, nqy, nqz) tiles.
+    Compute P_+(τ), P_×(τ) for one HGL quadrature point using Euler identity.
+    Returns two (nμ, nμ, nqx, nqy, nqz) real tiles.
+    
+    Memory: 2 complex arrays (G_v, G_c) instead of 4 real (S_v, C_v, S_c, C_c).
     """
-    # Sin/cos weights for bands
-    sin_v = jnp.where(mask_v, jnp.sin(gamma * tau * E_v), 0.0)
-    cos_v = jnp.where(mask_v, jnp.cos(gamma * tau * E_v), 0.0)
-    sin_c = jnp.where(mask_c, jnp.sin(gamma * tau * E_c), 0.0)
-    cos_c = jnp.where(mask_c, jnp.cos(gamma * tau * E_c), 0.0)
+    # Complex phase weights: exp(iγτE)
+    phase_v = jnp.where(mask_v, jnp.exp(1j * gamma * tau * E_v), 0.0)
+    phase_c = jnp.where(mask_c, jnp.exp(1j * gamma * tau * E_c), 0.0)
     
-    # 4 propagators
-    def build_G(weight):
-        G_v = jnp.einsum('kamn,kn,knbv->kambv', psi_v_X.conj(), weight[0], psi_v_Y)
-        G_c = jnp.einsum('kamn,kn,knbv->kambv', psi_c_X.conj(), weight[1], psi_c_Y)
-        return G_v, G_c
+    # 2 complex propagators (instead of 4 real)
+    G_v_k = jnp.einsum('kamn,kn,knbv->kambv', psi_v_X.conj(), phase_v, psi_v_Y)
+    G_c_k = jnp.einsum('kamn,kn,knbv->kambv', psi_c_X.conj(), phase_c, psi_c_Y)
     
-    S_v, S_c = build_G((sin_v, sin_c))
-    C_v, C_c = build_G((cos_v, cos_c))
-    
-    # FFT to R-space (same transpose as GL)
+    # FFT to R-space (transpose for contiguous FFT axes)
     def to_R(G_k):
         G = G_k.reshape(nkx, nky, nkz, *G_k.shape[1:])
         G = G.transpose(3, 4, 5, 6, 0, 1, 2)
@@ -760,15 +744,19 @@ def chi_tile_hgl(
         G = G.transpose(3, 4, 5, 6, 0, 1, 2)
         return jnp.fft.fftn(G, axes=(-3, -2, -1), norm='ortho')
     
-    S_v_R, C_v_R = to_R(S_v), to_R(C_v)
-    S_c_mR, C_c_mR = to_mR(S_c), to_mR(C_c)
+    G_v_R = to_R(G_v_k)
+    G_c_mR = to_mR(G_c_k)
     
-    # Form P_+ = C_v C_c + S_v S_c,  P_× = S_v C_c - C_v S_c
+    # Hermitian product: (G_c)† @ G_v = P_+ - i P_×
+    # For Hermitian propagators, conj = Hermitian transpose
     def contract(A, B):
         return jnp.einsum('ambvxyz,bvamxyz->mvxyz', A, B)
     
-    P_plus_R = contract(C_c_mR, C_v_R) + contract(S_c_mR, S_v_R)
-    P_cross_R = contract(S_c_mR, C_v_R) - contract(C_c_mR, S_v_R)
+    product_R = contract(G_c_mR.conj(), G_v_R)
+    
+    # Extract P_+ and P_× from complex product
+    P_plus_R = product_R.real
+    P_cross_R = -product_R.imag
     
     # FFT to q
     P_plus_q = jnp.fft.fftn(P_plus_R, axes=(-3, -2, -1), norm='ortho')
@@ -869,6 +857,26 @@ def accumulate_tiles(path, omega_idx, w1, tile1, w2, tile2) -> None:
 | `chi_tile` | `(nμ, nμ, nqx, nqy, nqz)` | ~10 MB | Per τ (overwritten) |
 
 **Total per-τ footprint**: ~120 MB (wfns) + 10 MB (tile) = manageable on GPU
+
+### 11.11 HGL Memory: Euler vs Naive
+
+The Euler identity is the **default approach** (used in `chi_tile_hgl` above):
+$$
+G^{v/c} = \sum_n e^{i\gamma\tau E_n}\, \psi_n \psi_n^\dagger = C + iS
+$$
+
+Products via single complex contraction:
+$$
+(G^c)^\dagger \cdot G^v = P_+ - i P_\times
+$$
+
+| Approach | Arrays per τ | Peak memory |
+|----------|--------------|-------------|
+| **Euler (default)** | 2 complex ($G^v, G^c$) | 2× (μ,μ,k) |
+| Naive (4 real) | 4 real ($S^v, C^v, S^c, C^c$) | 4× (μ,μ,k) |
+| **Euler (default)** | 2 complex ($G^v, G^c$) | **2× (μ,μ,k)** |
+
+**Euler is the default** — see `chi_tile_hgl` implementation above.
 
 ---
 
