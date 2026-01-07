@@ -17,15 +17,13 @@ def write_sigma_to_file(sigma_sx_kij_eV, filename="eqp0.dat", sigma_coh_kij_eV=N
 		sigma_coh_kij_eV: Coulomb hole self-energy in eV, shape (nk, nb, nb)
 		hartree_kij_eV: Hartree matrix elements in eV, shape (nk, nb, nb)
 	"""
-	print(f"sigma_sx_kij dtype before writing: {sigma_sx_kij_eV.dtype}")
 	nk, nbands, _ = sigma_sx_kij_eV.shape
 
-	# Resolve to absolute path, ensure directory exists, and report destination
+	# Resolve to absolute path, ensure directory exists
 	abs_path = os.path.abspath(filename)
 	dirname = os.path.dirname(abs_path)
 	if dirname:
 		os.makedirs(dirname, exist_ok=True)
-	print(f"Writing sigma to: {abs_path}")
 
 	with open(abs_path, "w") as f:
 		# Write header with units
@@ -146,7 +144,7 @@ def write_labeled_arrays_to_h5(filename, V_qmunu, psi_l, psi_r, enk_l=None, enk_
 				f.create_dataset("enk_l", data=_np.asarray(enk_l_h))
 			if enk_r_h is not None:
 				f.create_dataset("enk_r", data=_np.asarray(enk_r_h))
-		print("wrote restart arrays to", filename)
+		# Silently write restart arrays (paths shown in outputs summary)
 
 
 def read_labeled_arrays_from_h5(filename):
@@ -269,4 +267,4 @@ def save_restart_per_proc(prefix: str, V_qmunu, S_qmunu, psi_l, psi_r, enk_l, en
 			f.create_dataset("enk_l", data=_to_np(getattr(enk_l, 'data', enk_l)))
 		if enk_r is not None:
 			f.create_dataset("enk_r", data=_to_np(getattr(enk_r, 'data', enk_r)))
-	print("wrote per-proc restart to", fname)
+	# Silently write per-proc restart (paths shown in outputs summary)

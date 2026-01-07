@@ -50,19 +50,87 @@ class WindowPair:
     def __init__(self, val_window, cond_window, epsq):
         self.val_window = val_window
         self.cond_window = cond_window
+        self.epsq = epsq  # store for lazy HGL initialization
         self.ntau = round(N_tau_window(cond_window, val_window, epsq))
         self.tau_i, self.w_i = roots_laguerre(self.ntau)
         self.z_lm = np.sqrt(1.0/((cond_window.end_energy - val_window.start_energy)*(cond_window.start_energy - val_window.end_energy))) # very important bug fixed here...
         # Populated on-demand when the JAX kernels need per-k band ranges.
-        self.val_band_start = None
-        self.val_band_len = None
-        self.val_band_offset = None
-        self.cond_band_start = None
-        self.cond_band_len = None
-        self.cond_band_offset = None
-        self.max_val_len = 0
-        self.max_cond_len = 0
-        self._has_band_ranges = False
+        # All fields are typed for safe use in JAX kernels without casting.
+        self.val_band_start: np.ndarray | None = None  # (nk,) int32
+        self.val_band_len: np.ndarray | None = None    # (nk,) int32
+        self.val_band_offset: np.ndarray | None = None
+        self.cond_band_start: np.ndarray | None = None # (nk,) int32
+        self.cond_band_len: np.ndarray | None = None   # (nk,) int32
+        self.cond_band_offset: np.ndarray | None = None
+        self.max_val_len: int = 0   # int, ready for static_argnames
+        self.max_cond_len: int = 0  # int, ready for static_argnames
+        self._has_band_ranges: bool = False
+        # HGL quadrature fields (None until needed for crossing frequencies)
+        # gamma = z_lm (same scaling parameter)
+        self.tau_hgl: np.ndarray | None = None
+        self.w_hgl: np.ndarray | None = None
+        self.ntau_hgl: int = 0
+
+    def init_hgl_quadrature(self, epsq: float | None = None):
+        """Initialize HGL nodes/weights. Call once per window that needs HGL.
+        
+        HGL quadrature is used when a frequency ω causes an energy crossing,
+        i.e., when E_gap < ω < E_bw for this window pair. The caller is
+        responsible for determining which windows need HGL and calling this
+        exactly once for each.
+        
+        Args:
+            epsq: Target fractional error (defaults to self.epsq from __init__)
+        """
+        from .hgl_quadrature import hgl_nodes_weights, n_tau_hgl
+        if epsq is None:
+            epsq = self.epsq
+        E_bw = self.cond_window.end_energy - self.val_window.start_energy
+        self.ntau_hgl = n_tau_hgl(self.z_lm, E_bw, epsq)
+        self.tau_hgl, self.w_hgl = hgl_nodes_weights(self.ntau_hgl)
+
+    def classify_frequencies(self, omega: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Classify which ω values use GL vs HGL quadrature for this window.
+        
+        GL (Gauss-Laguerre): |ω| < E_gap or |ω| > E_bw (denominator doesn't change sign)
+        HGL (Hermite-Gauss-Laguerre): E_gap < |ω| < E_bw (energy crossing region)
+        
+        Args:
+            omega: Array of frequencies to classify (can be complex for contour integration)
+        
+        Returns:
+            gl_indices: Indices into omega array for GL treatment (non-crossing)
+            hgl_indices: Indices into omega array for HGL treatment (crossing)
+        """
+        E_gap = self.cond_window.start_energy - self.val_window.end_energy
+        E_bw = self.cond_window.end_energy - self.val_window.start_energy
+        omega_abs = np.abs(np.real(omega))  # Use real part for classification
+        
+        # GL for non-crossing: outside the [E_gap, E_bw] range
+        gl_mask = (omega_abs < E_gap) | (omega_abs > E_bw)
+        gl_indices = np.where(gl_mask)[0]
+        hgl_indices = np.where(~gl_mask)[0]
+        return gl_indices, hgl_indices
+
+
+def classify_frequencies(omega: np.ndarray, win: 'WindowPair') -> tuple[np.ndarray, np.ndarray]:
+    """
+    Classify which ω values use GL vs HGL quadrature for a window pair.
+    
+    This is a standalone function that can be used without a WindowPair object
+    (useful for testing or when window bounds are known but not wrapped in a class).
+    
+    Args:
+        omega: Array of frequencies to classify (can be complex)
+        win: WindowPair object with val_window and cond_window
+    
+    Returns:
+        gl_indices: Indices into omega array for GL treatment (non-crossing)
+        hgl_indices: Indices into omega array for HGL treatment (crossing)
+    """
+    return win.classify_frequencies(omega)
+
 
 def compute_dos(wfn_file, n_points=2000):
     """
@@ -232,40 +300,112 @@ def minimize_cost_fn(wfn, epsq, max_val_windows=8, max_cond_windows=8, cond_boun
     optimal_v_partitions = window_bounds.get((optimal_val_windows, optimal_cond_windows), (None, None))[0]
     optimal_c_partitions = window_bounds.get((optimal_val_windows, optimal_cond_windows), (None, None))[1]
 
-    # Print the energy ranges of the most optimal windows
-    print(f"Optimal valence windows ({optimal_val_windows}):")
+    # Conversion: Ry to eV
+    RY_TO_EV = 13.605693122994
+    
+    # Compute Fermi level and gap
+    # Fermi level is max of occupied bands
+    efermi = np.max(val_e)
+    efermi_ev = efermi * RY_TO_EV
+    
+    # Gap = minimum Ec - maximum Ev
+    if optimal_v_partitions is not None and optimal_c_partitions is not None:
+        v_max = val_e[optimal_v_partitions[-1] - 1]
+        c_min = cond_e[optimal_c_partitions[0]]
+        gap_ry = c_min - v_max
+        gap_ev = gap_ry * RY_TO_EV
+    else:
+        gap_ry = gap_ev = 0.0
+    
+    # Section header
+    print("")
+    print("=" * 72)
+    print("  FREQUENCY INTEGRATION WINDOWS")
+    print("=" * 72)
+    print(f"  Fermi level: {efermi_ev:8.3f} eV       Band gap: {gap_ev:8.3f} eV")
+    print("")
+    
+    # Print valence windows
+    print(f"  Valence windows ({optimal_val_windows}):")
+    print(f"  {'Win':>4}  {'E_min (eV)':>12}  {'E_max (eV)':>12}  {'Width (eV)':>11}")
+    print("  " + "-" * 48)
     if optimal_v_partitions is not None:
         for iv in range(optimal_val_windows):
             v0, v1 = val_e[optimal_v_partitions[iv]], val_e[optimal_v_partitions[iv+1]-1]
-            print(f"  Window {iv+1}: {v0:.4f} to {v1:.4f}")
-
-    print(f"Optimal conduction windows ({optimal_cond_windows}):")
+            v0_ev, v1_ev = v0 * RY_TO_EV, v1 * RY_TO_EV
+            width_ev = (v1 - v0) * RY_TO_EV
+            print(f"  {iv+1:>4}  {v0_ev:>12.3f}  {v1_ev:>12.3f}  {width_ev:>11.3f}")
+    print("")
+    
+    # Print conduction windows
+    print(f"  Conduction windows ({optimal_cond_windows}):")
+    print(f"  {'Win':>4}  {'E_min (eV)':>12}  {'E_max (eV)':>12}  {'Width (eV)':>11}")
+    print("  " + "-" * 48)
     if optimal_c_partitions is not None:
         for jc in range(optimal_cond_windows):
             c0, c1 = cond_e[optimal_c_partitions[jc]], cond_e[optimal_c_partitions[jc+1]-1]
-            print(f"  Window {jc+1}: {c0:.4f} to {c1:.4f}")
-
-    # Print the table of N_tau_window values
-    print("\nN_tau_window Table (rounded):")
-    header = "Val\\Cond" + "".join([f"\t{j+1}" for j in range(optimal_cond_windows)])
-    print("-" * (8 + 8 * optimal_cond_windows))
-    print(header)
-    print("-" * (8 + 8 * optimal_cond_windows))
-
+            c0_ev, c1_ev = c0 * RY_TO_EV, c1 * RY_TO_EV
+            width_ev = (c1 - c0) * RY_TO_EV
+            print(f"  {jc+1:>4}  {c0_ev:>12.3f}  {c1_ev:>12.3f}  {width_ev:>11.3f}")
+    print("")
+    
+    # Build window pair info for tables
+    window_data = []
     if optimal_v_partitions is not None and optimal_c_partitions is not None:
         for iv in range(optimal_val_windows):
-            row = f"{iv+1}\t"
             v0, v1 = val_e[optimal_v_partitions[iv]], val_e[optimal_v_partitions[iv+1]-1]
             for jc in range(optimal_cond_windows):
                 c0, c1 = cond_e[optimal_c_partitions[jc]], cond_e[optimal_c_partitions[jc+1]-1]
-                # Create window-like objects
                 class _W: pass
                 wv = _W(); wv.start_energy, wv.end_energy = v0, v1
                 wc = _W(); wc.start_energy, wc.end_energy = c0, c1
-                Nt = N_tau_window(wc, wv, epsq)
-                row += f"\t{round(Nt):<7}"
-            print(row)
-    print("-" * (8 + 8 * optimal_cond_windows))
+                n_gl = round(N_tau_window(wc, wv, epsq))
+                # Compute HGL nodes (using the same z_lm formula)
+                E_bw = c1 - v0
+                E_gap_pair = c0 - v1
+                z_lm = np.sqrt(1.0 / (E_bw * E_gap_pair)) if E_bw > 0 and E_gap_pair > 0 else 1.0
+                from .hgl_quadrature import n_tau_hgl
+                n_hgl = n_tau_hgl(z_lm, E_bw, epsq)
+                window_data.append((iv, jc, n_gl, n_hgl))
+    
+    # Print quadrature node tables
+    col_width = 6
+    n_cond = optimal_cond_windows
+    n_val = optimal_val_windows
+    header_nums = "".join([f"{j+1:>{col_width}}" for j in range(n_cond)])
+    
+    print("  Quadrature nodes per window pair (val × cond):")
+    print("")
+    
+    # GL table
+    print(f"  Gauss-Laguerre (static/non-crossing):")
+    print(f"  {'V\\C':<4}{header_nums}")
+    print("  " + "-" * (4 + col_width * n_cond))
+    for iv in range(n_val):
+        row = f"  {iv+1:<4}"
+        for jc in range(n_cond):
+            for (v, c, n_gl, n_hgl) in window_data:
+                if v == iv and c == jc:
+                    row += f"{n_gl:>{col_width}}"
+                    break
+        print(row)
+    print("")
+    
+    # HGL table
+    print(f"  Hermite-Gauss-Laguerre (dynamic/crossing):")
+    print(f"  {'V\\C':<4}{header_nums}")
+    print("  " + "-" * (4 + col_width * n_cond))
+    for iv in range(n_val):
+        row = f"  {iv+1:<4}"
+        for jc in range(n_cond):
+            for (v, c, n_gl, n_hgl) in window_data:
+                if v == iv and c == jc:
+                    row += f"{n_hgl:>{col_width}}"
+                    break
+        print(row)
+    
+    print("=" * 72)
+    print("")
 
     return cost_matrix, window_bounds
 

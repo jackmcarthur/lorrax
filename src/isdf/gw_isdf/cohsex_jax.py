@@ -57,7 +57,7 @@ from ..common.wfnreader import WFNReader
 from ..common import symmetry_maps
 from ..common.load_wfns import read_Gvecs_to_devices, get_sharded_wfns, get_enk_bandrange
 from .get_windows import get_window_info
-from .w_isdf import get_chi0_jax, get_static_w_q_jax
+from .w_isdf import get_chi0_jax, get_static_w_q_jax, get_w_omega_jax
 from .vcoul import compute_q0_averages
 from ..common.chi_from_dipole import read_dipole_h5, compute_S_omega
 from ..common.epsreader import EPSReader
@@ -506,7 +506,7 @@ def determine_wcoul0(params, input_dir, wfn, sym, meta, print_fn):
 				meta,
 				S_cart=None,
 			)
-			print_fn("Using eps0mat.h5 epshead-based wcoul0")
+			# Source printed in finite-size corrections section
 			return vc0_mean, wcoul0, "epshead"
 		except Exception as exc:  # pragma: no cover - diagnostic path
 			print_fn(f"epshead wcoul0 failed: {exc}")
@@ -542,7 +542,7 @@ def determine_wcoul0(params, input_dir, wfn, sym, meta, print_fn):
 				meta,
 				S_cart=S_cart_omega0,
 			)
-			print_fn("Using dipole.h5 S(0)-based wcoul0")
+			# Source printed in finite-size corrections section
 			return vc0_mean, wcoul0, "s_tensor"
 		except Exception as exc:  # pragma: no cover - diagnostic path
 			print_fn(f"S(0) wcoul0 failed: {exc}")
@@ -611,6 +611,7 @@ def read_cohsex_input(filename: str) -> dict:
 		getb = section.getboolean
 		get = section.get
 		geti = section.getint
+		getf = section.getfloat
 		# ============================================================================
 		# PARAMETER DEFINITIONS:
 		# ============================================================================
@@ -633,6 +634,8 @@ def read_cohsex_input(filename: str) -> dict:
 		# sys_dim:       Dimensionality: 2=2D (slab with truncated Coulomb),
 		#                3=3D (bulk, not yet implemented). Default=2.
 		# debug_hartree: If True, print diagnostic info for Hartree calculation.
+		# debug_omega:   If set (float, in Ry), compute W(ω) at this frequency
+		#                instead of static W. For testing dynamic screening.
 		# ============================================================================
 		params = {
 			"restart": getb("restart", fallback=True),           # load from h5 vs rebuild
@@ -651,6 +654,7 @@ def read_cohsex_input(filename: str) -> dict:
 			"nband": geti("nband", fallback=100), # total bands for chi0/screening
 			"sys_dim": geti("sys_dim", fallback=2),  # 2=slab, 3=bulk
 			"debug_hartree": getb("debug_hartree", fallback=False),
+			"debug_omega": getf("debug_omega", fallback=None),   # test W(ω) at this freq
 		}
 	else:
 		# Fallback defaults if no section found
@@ -671,6 +675,7 @@ def read_cohsex_input(filename: str) -> dict:
 			"nband": 100,
 			"sys_dim": 2,
 			"debug_hartree": False,
+			"debug_omega": None,
 		}
 
 	# Parse optional QE-style K_POINTS block: take the number after it, read next that many lines
@@ -1257,9 +1262,33 @@ def main(argv=None):
 	builtins.print = _print0
  
 	params = read_cohsex_input(args.input)
+	
+	# ========================================================================
+	# INITIALIZATION - Build device mesh early for banner
+	# ========================================================================
 	current_backend = jax.default_backend()
-	_print0(f"JAX backend in use: {current_backend}")
-	_print0(jax.devices())
+	n_devices = len(jax.devices())
+	n_procs = jax.process_count()
+	device_names = jax.devices()[0].device_kind if n_devices > 0 else "unknown"
+	
+	# Construct device mesh early so we can report it in the banner
+	total_devices = jax.process_count() * jax.local_device_count()
+	grid_x = int(np.sqrt(total_devices))
+	while total_devices % grid_x != 0:
+		grid_x -= 1
+	grid_y = total_devices // grid_x
+	devices_2d = np.array(jax.devices()).reshape(grid_x, grid_y)
+	mesh_xy = Mesh(devices_2d, ['x', 'y'])
+	
+	_print0("")
+	_print0("=" * 72)
+	_print0("  COHSEX-JAX: Self-Energy Calculation")
+	_print0("=" * 72)
+	_print0(f"  Backend: {current_backend.upper():<8}  Devices: {n_devices}  Mesh: {grid_x}×{grid_y}  Processes: {n_procs}")
+	_print0(f"  Device type: {device_names}")
+	_print0("=" * 72)
+	_print0("")
+	
 	# Resolve relative paths against the input file's directory
 	input_dir = os.path.dirname(os.path.abspath(args.input))
 	def _resolve_path(path: str) -> str:
@@ -1293,9 +1322,9 @@ def main(argv=None):
 	centroid_indices = np.round(centroids_frac * wfn.fft_grid).astype(int)
 	for i in range(3):
 		centroid_indices[centroid_indices[:, i] == wfn.fft_grid[i], i] = 0
-	print("unique centroid indices:")
-	print(np.unique(centroid_indices, axis=0).shape)
-	print(f"fft grid: {wfn.fft_grid}, celvol: {wfn.cell_volume}")
+	_print0(f"  ISDF basis: {_n_rmu} centroids")
+	_print0(f"  FFT grid: {wfn.fft_grid[0]}×{wfn.fft_grid[1]}×{wfn.fft_grid[2]}   Cell volume: {wfn.cell_volume:.2f} a.u.³")
+	_print0("")
 
 	# windows for polarizability and sigma
 	# Get window information
@@ -1371,31 +1400,14 @@ def main(argv=None):
 	def print0(*a, **k):
 		if meta.rank == 0:
 			print(*a, **k)
-	print0(jax.devices())
-	print0(jax.process_indices())
-	shard_debug = True
-	# Default mesh when not constructed (e.g., restart path)
-	mesh_xy = None
-	sh = None
+	# Shardings from the pre-constructed mesh
+	sh = make_shardings(mesh_xy)
 
 
 	# Initialize timing system
 	timing.reset()
 	if not restart:
 		with timing.section("cohsex_jax.wavefunction_setup") as timer_setup:
-			####################################
-			# 0.) Build a 2D mesh ['x','y'] up-front and materialize global G-space arrays
-			####################################
-			total_devices = jax.process_count() * jax.local_device_count()
-			grid_x = int(np.sqrt(total_devices))
-			while total_devices % grid_x != 0:
-				grid_x -= 1
-			grid_y = total_devices // grid_x
-			devices_2d = np.array(jax.devices()).reshape(grid_x, grid_y)
-			mesh_xy = Mesh(devices_2d, ['x', 'y'])
-			sh = make_shardings(mesh_xy)
-			print0(f"Device mesh: (X={grid_x}, Y={grid_y})")
-
 			# ============================================================================
 			# WAVEFUNCTION LOADING STRATEGY:
 			# ============================================================================
@@ -1464,7 +1476,7 @@ def main(argv=None):
 			psi_coh_rtot_Y.block_until_ready(); psi_coh_rmu_Y.block_until_ready(); psi_coh_rmuT_X.block_until_ready()
 			del global_psiG_coh
 			gc.collect()
-			print0('wavefunction sharding complete')
+			print0("  Wavefunction loading complete")
 
 		with timing.section("cohsex_jax.zeta_V_build") as timer_zeta:
 			####################################
@@ -1555,7 +1567,7 @@ def main(argv=None):
 				if do_G0 and np.all(np.asarray(qvec_nonneg) == 0):
 					G0_mu_nu = g0_mu
 
-			print0(f"finished building zeta/V for {q_cache.num_q} q-points")
+			print0(f"  ISDF fitting complete ({q_cache.num_q} q-points)")
 
 			# if do_G0 and G0_mu_nu is None:
 			# 	q_nonneg_np = np.asarray(q_cache.q_nonneg)
@@ -1681,17 +1693,6 @@ def main(argv=None):
 
 	elif restart and not x_only:
 		with timing.section("cohsex_jax.restart_load") as restart_timer:
-			# Build mesh for sharding in restart path if missing
-			if mesh_xy is None:
-				total_devices = jax.process_count() * jax.local_device_count()
-				grid_x = int(np.sqrt(total_devices))
-				while total_devices % grid_x != 0:
-					grid_x -= 1
-				grid_y = total_devices // grid_x
-				devices_2d = np.array(jax.devices()).reshape(grid_x, grid_y)
-				mesh_xy = Mesh(devices_2d, ['x', 'y'])
-				print(f"Device mesh: (X={grid_x}, Y={grid_y}) [restart]")
-			sh = make_shardings(mesh_xy)
 			V_qmunu, S_qmunu, psi_lT, psi_l, psi_r, psi_rT, enk_l, enk_r, v_q0_noG0_munu, G0_mu_nu = load_labeled_arrays_from_h5(
 				taggedarray_filename, mesh_xy
 			)
@@ -1729,34 +1730,15 @@ def main(argv=None):
 				enk_v, _ = get_enk_bandrange(wfn, sym, valence_range, (b1, b2), nspinor=meta.nspinor)
 				enk_c, _ = get_enk_bandrange(wfn, sym, conduction_range, (b2, b4), nspinor=meta.nspinor)
 				
-				# Apply shardings for chi0 - MUST match non-restart path transposition!
-				# psi_rmu_Y: (nk, nb, nspinor, n_rmu)
-				# psi_vTX needs: (nk, nspinor, n_rmu, nb) = transpose(0, 2, 3, 1)
-				# psi_cTY needs: (nk, nspinor, n_rmu, nb) = transpose(0, 2, 3, 1)
+				# Apply shardings for chi0
 				with mesh_xy:
-					# Valence: psi_v = Y-sharded, psi_vT = X-sharded with correct transpose
 					psi_v = jax.device_put(psi_v_rmu_Y, sh.y3_4)
 					psi_vT = jax.lax.with_sharding_constraint(psi_v.transpose(0, 2, 3, 1), sh.x2_4)
-					# Conduction: psi_c = X-sharded, psi_cT = Y-sharded with correct transpose
 					psi_c = jax.device_put(psi_c_rmu_Y, sh.x3_4)
 					psi_cT = jax.lax.with_sharding_constraint(psi_c.transpose(0, 2, 3, 1), sh.y2_4)
-				print0(f"[restart] Loaded chi0 wavefunctions: valence {valence_range}, conduction {conduction_range}")
-				print0(f"[restart] psi_v shape: {psi_v.shape}, psi_vT shape: {psi_vT.shape}")
-				print0(f"[restart] psi_c shape: {psi_c.shape}, psi_cT shape: {psi_cT.shape}")
-				print0(f"[restart] enk_v shape: {enk_v.shape}, enk_c shape: {enk_c.shape}")
+				print0(f"  Loaded χ₀ wavefunctions: {nb_v} valence, {nb_c} conduction bands")
 	elif restart and x_only:
 		with timing.section("cohsex_jax.restart_load_x_only") as restart_timer:
-			# Same restart flow for X-only
-			if mesh_xy is None:
-				total_devices = jax.process_count() * jax.local_device_count()
-				grid_x = int(np.sqrt(total_devices))
-				while total_devices % grid_x != 0:
-					grid_x -= 1
-				grid_y = total_devices // grid_x
-				devices_2d = np.array(jax.devices()).reshape(grid_x, grid_y)
-				mesh_xy = Mesh(devices_2d, ['x', 'y'])
-				print(f"Device mesh: (X={grid_x}, Y={grid_y}) [restart]")
-			sh = make_shardings(mesh_xy)
 			V_qmunu, S_qmunu, psi_lT, psi_l, psi_r, psi_rT, enk_l, enk_r, v_q0_noG0_munu, G0_mu_nu = load_labeled_arrays_from_h5(
 				taggedarray_filename, mesh_xy
 			)
@@ -1773,25 +1755,32 @@ def main(argv=None):
 		with timing.section("cohsex_jax.chi0_W") as timer_chiw:
 			with jax_profile.trace_section("chi0_W"):
 				# Ensure energies are plain arrays for JAX
-				# Use VALENCE energies for psi_v and CONDUCTION energies for psi_c
 				enk_v_arr = jnp.asarray(getattr(enk_v, 'data', enk_v))
 				enk_c_arr = jnp.asarray(getattr(enk_c, 'data', enk_c))
-				# Debug: verify shapes match
-				print0(f"[chi0] enk_v_arr shape: {enk_v_arr.shape}, enk_c_arr shape: {enk_c_arr.shape}")
-				print0(f"[chi0] psi_vT shape: {psi_vT.shape}, psi_v shape: {psi_v.shape}")
-				print0(f"[chi0] psi_cT shape: {psi_cT.shape}, psi_c shape: {psi_c.shape}")
-				# chi0 expects:
-				#   psi_vTX: valence, transposed, X-sharded on rmu
-				#   psi_vY:  valence, Y-sharded on rmu
-				#   psi_cX:  conduction, X-sharded on rmu  
-				#   psi_cTY: conduction, transposed, Y-sharded on rmu
+				
+				# Compute optimal energy windows for CTSP quadrature
 				window_pairs = get_window_info(epsq, wfn, nband_max=nband)
-				chi0 = get_chi0_jax(psi_vT, psi_v, psi_c, psi_cT, enk_v_arr, enk_c_arr, window_pairs, meta, mesh_xy)
-				# Compute static W under k_XY sharding (S_qmunu included but unused for now)
-				W_q = get_static_w_q_jax(V_qmunu, chi0, None, meta, mesh_xy)
-				W_q.block_until_ready()
-				# Compute static W under k_XY sharding (S_qmunu included but unused for now)
-				#W_q = get_static_w_q_jax(V_qmunu, chi0, S_qmunu, meta, mesh_xy)
+				
+				# Check if debug_omega is set for dynamic W(ω) testing
+				debug_omega = params.get("debug_omega", None)
+				if debug_omega is not None:
+					ryd2ev = 13.605693122994
+					omega_ev = debug_omega * ryd2ev
+					print0("")
+					print0(f"  [DEBUG] Dynamic screening at ω = {omega_ev:.4f} eV ({debug_omega:.6f} Ry)")
+					W_q, chi_omega = get_w_omega_jax(
+						V_qmunu, psi_vT, psi_v, psi_c, psi_cT,
+						enk_v_arr, enk_c_arr, window_pairs, debug_omega,
+						meta, mesh_xy
+					)
+					W_q.block_until_ready()
+					chi_max = float(jnp.max(jnp.abs(chi_omega)))
+					print0(f"  [DEBUG] |χ(ω)|_max = {chi_max:.6e}")
+				else:
+					# Static case (ω = 0)
+					chi0 = get_chi0_jax(psi_vT, psi_v, psi_c, psi_cT, enk_v_arr, enk_c_arr, window_pairs, meta, mesh_xy)
+					W_q = get_static_w_q_jax(V_qmunu, chi0, None, meta, mesh_xy)
+					W_q.block_until_ready()
 
 	# ============================================================================
 	# HEAD INJECTION: Add the q→0, G=0 Coulomb divergence correction
@@ -1812,11 +1801,20 @@ def main(argv=None):
 	# ============================================================================
 	if do_G0:  # do_G0=True: apply head corrections
 		vc0_mean, wcoul0, wcoul0_source = determine_wcoul0(params, input_dir, wfn, sym, meta, print0)
-		print0(f"wcoul0 source: {wcoul0_source}")
-		print0(f"vc0_mean (bare head, atomic units): {vc0_mean}")
+		
+		# Print finite-size corrections
+		print0("")
+		print0("-" * 72)
+		print0("  FINITE-SIZE CORRECTIONS")
+		print0("-" * 72)
+		print0(f"  Head source: {wcoul0_source}")
+		vc0_real = float(vc0_mean.real) if hasattr(vc0_mean, 'real') else float(vc0_mean)
+		print0(f"  v(q→0)  = {vc0_real:12.3f} a.u.  (bare Coulomb head)")
 		if do_screened:
-			print0(f"wcoul0 (screened head, atomic units): {wcoul0}")
-			print0(f"(W-V)_head = wcoul0 - vc0_mean = {wcoul0 - vc0_mean}")
+			wcoul0_real = float(wcoul0.real) if hasattr(wcoul0, 'real') else float(wcoul0)
+			dW_real = wcoul0_real - vc0_real
+			print0(f"  W(q→0)  = {wcoul0_real:12.3f} a.u.  (screened Coulomb head)")
+			print0(f"  ΔW      = {dW_real:12.3f} a.u.  (screening correction)")
 		
 		# outer_u = ζ*_μ(0) ⊗ ζ_ν(0), the "head" direction in μν space
 		# Must match V_μν construction: V = Σ_G v(G) ζ*_μ(G) ζ_ν(G)
@@ -2099,6 +2097,7 @@ def main(argv=None):
 	)
 
 	# Write POST-self-consistency sigma to eqp0_sc (rotated to QP basis)
+	sc_output_file = None
 	if self_consistent:
 		sigma_sx_final_host = np.array(sigma_sx_qp)
 		sigma_coh_final_host = np.array(sigma_coh_qp)
@@ -2113,6 +2112,7 @@ def main(argv=None):
 		)
 
 	# Write eqp1.dat-style output for self-consistent runs
+	eqp1_written = None
 	if self_consistent and meta.rank == 0:
 		eqp1_path = os.path.join(input_dir, "eqp1.dat")
 		# Generate full k-mesh in crystal coords
@@ -2142,7 +2142,9 @@ def main(argv=None):
 							e_qp = float(energies_qp_ev_host[ik, ib])
 							f.write(f"       1       {ib+1}  {e_dft:14.9f}  {e_oneshot:14.9f}  {e_qp:14.9f}\n")
 						ik += 1
-		print0(f"Wrote {eqp1_path}")
+		eqp1_written = eqp1_path
+	else:
+		eqp1_written = None
 
 	# Write QP rotation matrices and eigenvalues to h5 file
 	if meta.rank == 0:
@@ -2168,7 +2170,25 @@ def main(argv=None):
 			kpoints_reduced=kpoints_reduced,
 			kirr_to_kfull=kirr_to_kfull,
 		)
-		print0(f"Wrote {qp_rot_path}")
+	else:
+		qp_rot_path = None
+
+	# ========================================================================
+	# OUTPUT FILES SUMMARY
+	# ========================================================================
+	print0("")
+	print0("-" * 72)
+	print0("  OUTPUT FILES")
+	print0("-" * 72)
+	print0(f"  Sigma matrix elements:  {params['output_file']}")
+	if self_consistent:
+		print0(f"  Sigma (SC rotated):     {sc_output_file}")
+	if eqp1_written:
+		print0(f"  QP energies (eqp1):     {eqp1_written}")
+	if qp_rot_path:
+		print0(f"  QP rotations (h5):      {qp_rot_path}")
+	print0(f"  Restart arrays:         {taggedarray_filename}")
+	print0("")
 
 	if jax.process_index() == 0:
 		timing.report(print_fn=print0, title="--- Timing ---")

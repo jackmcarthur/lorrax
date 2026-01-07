@@ -161,14 +161,14 @@ def _ensure_window_band_ranges(win, enk_v_host: np.ndarray, enk_c_host: np.ndarr
 		upper_inclusive=cond_upper,
 		lower_relaxed=cond_lower_relaxed,
 	)
-	win.val_band_start = val_start
-	win.val_band_len = val_len
+	win.val_band_start = val_start.astype(np.int32)
+	win.val_band_len = val_len.astype(np.int32)
 	win.val_band_mask = val_mask
-	win.cond_band_start = cond_start
-	win.cond_band_len = cond_len
+	win.cond_band_start = cond_start.astype(np.int32)
+	win.cond_band_len = cond_len.astype(np.int32)
 	win.cond_band_mask = cond_mask
-	win.max_val_len = max_val_len
-	win.max_cond_len = max_cond_len
+	win.max_val_len = int(max_val_len)
+	win.max_cond_len = int(max_cond_len)
 	win._has_band_ranges = True
 
 
@@ -303,9 +303,203 @@ def _get_chi_kernel(mesh_key, nkx: int, nky: int, nkz: int, max_val_len: int, ma
 	return _compute
 
 
+@lru_cache(maxsize=None)
+def _get_chi_hgl_kernel(mesh_key, nkx: int, nky: int, nkz: int, max_val_len: int, max_cond_len: int):
+	"""
+	HGL kernel for dynamic χ(ω) with energy crossings.
+	
+	Uses Euler identity: G = exp(iγτE) weighted sum of |ψ><ψ|
+	Returns P_plus and P_cross for a single τ point, which are combined
+	with ω-dependent phase factors to get χ(ω).
+	
+	For HGL quadrature:
+		χ^HGL(ω) = -γ Σ_u w_u [cos(γτ_u ω) P_×(τ_u) - sin(γτ_u ω) P_+(τ_u)]
+	
+	where:
+		P_+ = Re[conj(G_c) @ G_v]  (after spin contraction and FFT)
+		P_× = -Im[conj(G_c) @ G_v]
+	"""
+	shards = _MESH_SHARD_REGISTRY[mesh_key]
+	xt_shard = shards["xt"]
+	y_shard = shards["y_shard"]
+	x_shard = shards["x_shard"]
+	yt_shard = shards["yt"]
+	out_shard = shards["out"]
+	chiR_shard = shards["chiR"]
+	gv_shard = shards["gv"]
+	gc_shard = shards["gc"]
+
+	@partial(
+		jax.jit,
+		static_argnames=("nkx", "nky", "nkz", "max_val_len", "max_cond_len"),
+		in_shardings=(
+			xt_shard,
+			y_shard,
+			x_shard,
+			yt_shard,
+			None,  # enk_v
+			None,  # enk_c
+			None,  # tau (single scalar)
+			None,  # gamma
+			None, None, None,  # val_start, val_len, val_mask
+			None, None, None,  # cond_start, cond_len, cond_mask
+		),
+		out_shardings=(out_shard, out_shard),  # P_plus_q, P_cross_q
+	)
+	def _compute_hgl_tile(
+		psi_vTX: jax.Array,
+		psi_vY: jax.Array,
+		psi_cX: jax.Array,
+		psi_cTY: jax.Array,
+		enk_v: jax.Array,
+		enk_c: jax.Array,
+		tau: jax.Array,  # single τ value (scalar or 0-d array)
+		gamma: jax.Array,  # γ = z_lm
+		val_start, val_len, val_mask,
+		cond_start, cond_len, cond_mask,
+		nkx: int, nky: int, nkz: int,
+		max_val_len: int, max_cond_len: int,
+	) -> tuple[jax.Array, jax.Array]:
+		"""
+		Compute P_plus and P_cross for a single τ point (HGL quadrature).
+		
+		Returns:
+			P_plus_q: (nkx, nky, nkz, 1, nrmu, 1, nrmu) - real part contribution
+			P_cross_q: (nkx, nky, nkz, 1, nrmu, 1, nrmu) - imaginary part contribution
+		"""
+		nrmu_local = psi_vTX.shape[2]
+		if max_val_len == 0 or max_cond_len == 0:
+			zero = jnp.zeros((nkx, nky, nkz, 1, nrmu_local, 1, nrmu_local), dtype=jnp.float64)
+			zero = jax.lax.with_sharding_constraint(zero, out_shard)
+			return zero, zero
+
+		# Slice wavefunctions and energies to window
+		psi_vTX_win = _slice_along_axis(psi_vTX, val_start, max_val_len, axis=3)
+		psi_vY_win = _slice_along_axis(psi_vY, val_start, max_val_len, axis=1)
+		psi_cX_win = _slice_along_axis(psi_cX, cond_start, max_cond_len, axis=1)
+		psi_cTY_win = _slice_along_axis(psi_cTY, cond_start, max_cond_len, axis=3)
+		enk_v_win = _slice_along_axis(enk_v, val_start, max_val_len, axis=1)
+		enk_c_win = _slice_along_axis(enk_c, cond_start, max_cond_len, axis=1)
+
+		# Apply masks
+		val_mask_f = val_mask.astype(psi_vTX_win.dtype)
+		cond_mask_f = cond_mask.astype(psi_cX_win.dtype)
+		psi_vTX_win = psi_vTX_win * val_mask_f[:, None, None, :]
+		psi_vY_win = psi_vY_win * val_mask_f[:, :, None, None]
+		psi_cX_win = psi_cX_win * cond_mask_f[:, :, None, None]
+		psi_cTY_win = psi_cTY_win * cond_mask_f[:, None, None, :]
+		val_mask_complex = val_mask.astype(jnp.complex128)
+		cond_mask_complex = cond_mask.astype(jnp.complex128)
+
+		def _k_to_R(g_k: jax.Array, flip_sign: bool) -> jax.Array:
+			"""Map G(k) -> G(±R)."""
+			g_fft = g_k.reshape(nkx, nky, nkz, *g_k.shape[1:]).transpose(3, 4, 5, 6, 0, 1, 2)
+			return jax.lax.cond(
+				flip_sign,
+				lambda x: jnp.fft.fftn(x, axes=(-3, -2, -1), norm='ortho'),
+				lambda x: jnp.fft.ifftn(x, axes=(-3, -2, -1), norm='ortho'),
+				g_fft,
+			)
+
+		# Euler identity: phase = exp(i * gamma * tau * E)
+		phase_v = jnp.exp(1j * gamma * tau * enk_v_win) * val_mask_complex
+		phase_c = jnp.exp(1j * gamma * tau * enk_c_win) * cond_mask_complex
+
+		# Build complex propagators G = Σ_n phase_n |ψ_n><ψ_n|
+		Gv_k = jnp.einsum('ksxm,km,kmty->ksxty', jnp.conj(psi_vTX_win), phase_v, psi_vY_win, optimize=True)
+		Gc_k = jnp.einsum('ksxm,km,kmty->ksxty', jnp.conj(psi_cTY_win), phase_c, psi_cX_win, optimize=True)
+		Gv_k = jax.lax.with_sharding_constraint(Gv_k, gv_shard)
+		Gc_k = jax.lax.with_sharding_constraint(Gc_k, gc_shard)
+
+		# FFT to R-space
+		Gv_R = _k_to_R(Gv_k, flip_sign=False)
+		Gc_mR = _k_to_R(Gc_k, flip_sign=True)
+
+		# Contract: conj(G_c)_{-R} @ G_v_R → complex product
+		# P_+ = Re[product], P_× = -Im[product]
+		product_R = jnp.einsum('ambnxyz, bnamxyz-> mnxyz', jnp.conj(Gc_mR), Gv_R, optimize=True)
+		P_plus_R = product_R.real
+		P_cross_R = -product_R.imag
+
+		# FFT P_+ and P_× to q-space
+		P_plus_q = jnp.fft.fftn(P_plus_R, axes=(-3, -2, -1), norm='ortho')
+		P_cross_q = jnp.fft.fftn(P_cross_R, axes=(-3, -2, -1), norm='ortho')
+
+		# Reshape to match chi output format
+		P_plus_q = P_plus_q.transpose(2, 3, 4, 0, 1)[:, :, :, None, :, None, :]
+		P_cross_q = P_cross_q.transpose(2, 3, 4, 0, 1)[:, :, :, None, :, None, :]
+
+		P_plus_q = jax.lax.with_sharding_constraint(P_plus_q, out_shard)
+		P_cross_q = jax.lax.with_sharding_constraint(P_cross_q, out_shard)
+
+		return P_plus_q, P_cross_q
+
+	return _compute_hgl_tile
+
+
 # The routines here construct chi^0 and the screened interaction W using the
 # CTSP approach in the static limit.  Once the frequency grids are restored, the
 # same machinery will let us tackle full dynamical GW.
+
+
+def _compute_chi_omega_hgl(
+	psi_vTX, psi_vY, psi_cX, psi_cTY, enk_v, enk_c,
+	win, omega: float, meta: Meta, mesh_xy: Mesh,
+) -> jax.Array:
+	"""Compute χ(ω) contribution from one window using HGL quadrature.
+	
+	For HGL (crossing region), the contribution is:
+		χ^HGL(ω) = -γ Σ_u w_u [cos(γτ_u ω) P_×(τ_u) - sin(γτ_u ω) P_+(τ_u)]
+	
+	where P_+ and P_× are computed via the Euler identity approach.
+	
+	Assumes:
+	- win._has_band_ranges is True (call _ensure_window_band_ranges first)
+	- win.tau_hgl/w_hgl populated (call init_hgl_quadrature once before processing)
+	"""
+	nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
+	nrmu = psi_vTX.shape[2]
+	
+	gamma = jnp.asarray(win.z_lm, dtype=jnp.float64)
+	tau_hgl = jnp.asarray(win.tau_hgl, dtype=jnp.float64)
+	w_hgl = jnp.asarray(win.w_hgl, dtype=jnp.float64)
+	omega_jax = jnp.asarray(omega, dtype=jnp.float64)
+	
+	_ensure_compilation_cache()
+	mesh_key = _register_mesh_shardings(mesh_xy)
+	hgl_kernel = _get_chi_hgl_kernel(mesh_key, nkx, nky, nkz, win.max_val_len, win.max_cond_len)
+	out_shard = NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y'))
+	
+	val_band_start = jnp.asarray(win.val_band_start, dtype=jnp.int32)
+	val_band_len = jnp.asarray(win.val_band_len, dtype=jnp.int32)
+	val_band_mask = jnp.asarray(win.val_band_mask, dtype=jnp.bool_)
+	cond_band_start = jnp.asarray(win.cond_band_start, dtype=jnp.int32)
+	cond_band_len = jnp.asarray(win.cond_band_len, dtype=jnp.int32)
+	cond_band_mask = jnp.asarray(win.cond_band_mask, dtype=jnp.bool_)
+	
+	# Sum over HGL quadrature nodes
+	chi_sum = jnp.zeros((nkx, nky, nkz, 1, nrmu, 1, nrmu), dtype=jnp.complex128)
+	
+	for u in range(win.ntau_hgl):
+		tau_u = tau_hgl[u]
+		w_u = w_hgl[u]
+		
+		P_plus_q, P_cross_q = hgl_kernel(
+			psi_vTX, psi_vY, psi_cX, psi_cTY, enk_v, enk_c,
+			tau_u, gamma,
+			val_band_start, val_band_len, val_band_mask,
+			cond_band_start, cond_band_len, cond_band_mask,
+			nkx, nky, nkz, win.max_val_len, win.max_cond_len,
+		)
+		
+		# χ^HGL(ω) = -γ Σ_u w_u [cos(γτω) P_× - sin(γτω) P_+]
+		phase = gamma * tau_u * omega_jax
+		cos_phase = jnp.cos(phase)
+		sin_phase = jnp.sin(phase)
+		chi_tau = -gamma * w_u * (cos_phase * P_cross_q - sin_phase * P_plus_q)
+		chi_sum = chi_sum + chi_tau
+	
+	return jax.lax.with_sharding_constraint(chi_sum, out_shard)
 
 
 def get_chi_lm_Yt_jax(
@@ -358,8 +552,6 @@ def get_chi_lm_Yt_jax(
 	w_i = jnp.asarray(win.w_i, dtype=jnp.complex128)
 
 	_ensure_compilation_cache()
-	if mesh_xy is None:
-		raise ValueError("chi kernel requires mesh_xy sharding")
 	mesh_key = _register_mesh_shardings(mesh_xy)
 	kernel = _get_chi_kernel(mesh_key, nkx, nky, nkz, max_val_len, max_cond_len)
 
@@ -404,30 +596,6 @@ def get_chi0_jax(
 	"""
 	enk_v_host = None
 	enk_c_host = None
-	mask_logs = None
-	if jax.process_index() == 0:
-		try:
-			ener_v0 = np.asarray(jax.device_get(enk_v[0]))
-			ener_c0 = np.asarray(jax.device_get(enk_c[0]))
-			def _mask_bar(mask: np.ndarray) -> str:
-				return ''.join('X' if bool(b) else '_' for b in mask.tolist())
-			mask_logs = []
-			for w_i, win in enumerate(windows):
-				try:
-					vmin = float(win.val_window.start_energy)
-					vmax = float(win.val_window.end_energy)
-					cmin = float(win.cond_window.start_energy)
-					cmax = float(win.cond_window.end_energy)
-					val_mask = (ener_v0 >= vmin) & (ener_v0 <= vmax)
-					cond_mask = (ener_c0 >= cmin) & (ener_c0 <= cmax)
-					mask_logs.append((
-						f"[win {w_i}] k=0 val  : " + _mask_bar(val_mask),
-						f"[win {w_i}] k=0 cond : " + _mask_bar(cond_mask),
-					))
-				except Exception:
-					mask_logs.append(None)
-		except Exception:
-			mask_logs = None
 	for win in windows:
 		if getattr(win, "_has_band_ranges", False):
 			continue
@@ -440,18 +608,277 @@ def get_chi0_jax(
 	# JIT per-window compute; windows typically small in count
 	chi_sum = None
 	for w_i, win in enumerate(windows):
-		step_detail = f"v{getattr(win, 'max_val_len', 0)}_c{getattr(win, 'max_cond_len', 0)}"
+		step_detail = f"v{win.max_val_len}_c{win.max_cond_len}"
 		with jax_profile.step_annotation("chi0_window", step_num=w_i, detail=step_detail):
-			if mask_logs and w_i < len(mask_logs) and mask_logs[w_i]:
-				line_val, line_cond = mask_logs[w_i]
-				print(line_val)
-				print(line_cond)
-
 			chi_win = get_chi_lm_Yt_jax(psi_vTX, psi_vY, psi_cX, psi_cTY, enk_v, enk_c, win, meta, mesh_xy)
 			chi_sum = chi_win if chi_sum is None else (chi_sum + chi_win)
 	return chi_sum
 
 
+def get_chi_omega_jax(
+	psi_vTX: jax.Array,
+	psi_vY: jax.Array,
+	psi_cX: jax.Array,
+	psi_cTY: jax.Array,
+	enk_v: jax.Array,
+	enk_c: jax.Array,
+	windows,
+	omega: float,
+	meta: Meta,
+	mesh_xy: Mesh,
+):
+	"""Compute χ(ω) for a single frequency using GL or HGL per window.
+	
+	For each window pair, classifies whether ω requires GL (non-crossing)
+	or HGL (crossing) quadrature based on the window energy bounds.
+	
+	Caller should:
+	- Call _ensure_window_band_ranges for each window beforehand
+	- Call win.init_hgl_quadrature() for any windows that may need HGL
+	
+	Args:
+		psi_vTX, psi_vY, psi_cX, psi_cTY: wavefunctions (same as get_chi0_jax)
+		enk_v, enk_c: band energies
+		windows: iterable of WindowPair objects (with band ranges populated)
+		omega: frequency (in Ry) at which to evaluate χ
+		meta: Meta with nkx,nky,nkz
+		mesh_xy: device mesh for sharding
+	
+	Returns:
+		chi_q: (nkx,nky,nkz,1,nrmu,1,nrmu) complex128
+	"""
+	omega_abs = abs(omega)
+	chi_sum = None
+	
+	for win in windows:
+		if win.max_val_len == 0 or win.max_cond_len == 0:
+			continue
+		
+		# Check if this window uses GL or HGL
+		E_gap = win.cond_window.start_energy - win.val_window.end_energy
+		E_bw = win.cond_window.end_energy - win.val_window.start_energy
+		uses_hgl = (omega_abs >= E_gap) and (omega_abs <= E_bw)
+		
+		if uses_hgl:
+			chi_win = _compute_chi_omega_hgl(
+				psi_vTX, psi_vY, psi_cX, psi_cTY, enk_v, enk_c,
+				win, omega, meta, mesh_xy
+			)
+		else:
+			chi_win = _compute_chi_omega_gl(
+				psi_vTX, psi_vY, psi_cX, psi_cTY, enk_v, enk_c,
+				win, omega, meta, mesh_xy
+			)
+		
+		chi_sum = chi_win if chi_sum is None else (chi_sum + chi_win)
+	
+	return chi_sum
+
+
+def _compute_chi_omega_gl(
+	psi_vTX, psi_vY, psi_cX, psi_cTY, enk_v, enk_c,
+	win, omega: float, meta: Meta, mesh_xy: Mesh,
+) -> jax.Array:
+	"""Compute χ(ω) contribution from one window using GL quadrature.
+	
+	For GL (non-crossing), includes frequency-dependent phase factor exp(iωτ/γ).
+	Assumes win._has_band_ranges is True.
+	"""
+	nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
+	
+	tau_i = jnp.asarray(win.tau_i, dtype=jnp.float64)
+	z_lm = jnp.asarray(win.z_lm, dtype=jnp.float64)
+	w_i = jnp.asarray(win.w_i, dtype=jnp.float64)
+	omega_jax = jnp.asarray(omega, dtype=jnp.float64)
+	
+	val_band_start = jnp.asarray(win.val_band_start, dtype=jnp.int32)
+	val_band_len = jnp.asarray(win.val_band_len, dtype=jnp.int32)
+	val_band_mask = jnp.asarray(win.val_band_mask, dtype=jnp.bool_)
+	cond_band_start = jnp.asarray(win.cond_band_start, dtype=jnp.int32)
+	cond_band_len = jnp.asarray(win.cond_band_len, dtype=jnp.int32)
+	cond_band_mask = jnp.asarray(win.cond_band_mask, dtype=jnp.bool_)
+	
+	_ensure_compilation_cache()
+	mesh_key = _register_mesh_shardings(mesh_xy)
+	kernel = _get_chi_omega_gl_kernel(mesh_key, nkx, nky, nkz, win.max_val_len, win.max_cond_len)
+	
+	chi_q = kernel(
+		psi_vTX, psi_vY, psi_cX, psi_cTY, enk_v, enk_c,
+		jnp.asarray(win.val_window.start_energy, dtype=jnp.float64),
+		jnp.asarray(win.val_window.end_energy, dtype=jnp.float64),
+		jnp.asarray(win.cond_window.start_energy, dtype=jnp.float64),
+		jnp.asarray(win.cond_window.end_energy, dtype=jnp.float64),
+		tau_i, z_lm, w_i, omega_jax,
+		val_band_start, val_band_len, val_band_mask,
+		cond_band_start, cond_band_len, cond_band_mask,
+		nkx, nky, nkz, win.max_val_len, win.max_cond_len,
+	)
+	return chi_q
+
+
+@lru_cache(maxsize=None)
+def _get_chi_omega_gl_kernel(mesh_key, nkx: int, nky: int, nkz: int, max_val_len: int, max_cond_len: int):
+	"""GL kernel for χ(ω) with frequency-dependent phase factors."""
+	shards = _MESH_SHARD_REGISTRY[mesh_key]
+	xt_shard = shards["xt"]
+	y_shard = shards["y_shard"]
+	x_shard = shards["x_shard"]
+	yt_shard = shards["yt"]
+	out_shard = shards["out"]
+	chiR_shard = shards["chiR"]
+	gv_shard = shards["gv"]
+	gc_shard = shards["gc"]
+
+	@partial(
+		jax.jit,
+		static_argnames=("nkx", "nky", "nkz", "max_val_len", "max_cond_len"),
+		in_shardings=(
+			xt_shard, y_shard, x_shard, yt_shard,
+			None, None,  # enk_v, enk_c
+			None, None, None, None,  # vmin, vmax, cmin, cmax
+			None, None, None, None,  # tau_i, z_lm, w_i, omega
+			None, None, None,  # val_start, val_len, val_mask
+			None, None, None,  # cond_start, cond_len, cond_mask
+		),
+		out_shardings=out_shard,
+	)
+	def _compute(
+		psi_vTX, psi_vY, psi_cX, psi_cTY, enk_v, enk_c,
+		vmin, vmax, cmin, cmax, tau_i, z_lm, w_i, omega,
+		val_start, val_len, val_mask,
+		cond_start, cond_len, cond_mask,
+		nkx: int, nky: int, nkz: int,
+		max_val_len: int, max_cond_len: int,
+	) -> jax.Array:
+		nrmu_local = psi_vTX.shape[2]
+		if max_val_len == 0 or max_cond_len == 0 or tau_i.shape[0] == 0:
+			chi_empty = jnp.zeros((nkx, nky, nkz, 1, nrmu_local, 1, nrmu_local), dtype=jnp.complex128)
+			return jax.lax.with_sharding_constraint(chi_empty, out_shard)
+
+		# Slice to window
+		psi_vTX_win = _slice_along_axis(psi_vTX, val_start, max_val_len, axis=3)
+		psi_vY_win = _slice_along_axis(psi_vY, val_start, max_val_len, axis=1)
+		psi_cX_win = _slice_along_axis(psi_cX, cond_start, max_cond_len, axis=1)
+		psi_cTY_win = _slice_along_axis(psi_cTY, cond_start, max_cond_len, axis=3)
+		enk_v_win = _slice_along_axis(enk_v, val_start, max_val_len, axis=1)
+		enk_c_win = _slice_along_axis(enk_c, cond_start, max_cond_len, axis=1)
+
+		# Apply masks
+		val_mask_f = val_mask.astype(psi_vTX_win.dtype)
+		cond_mask_f = cond_mask.astype(psi_cX_win.dtype)
+		psi_vTX_win = psi_vTX_win * val_mask_f[:, None, None, :]
+		psi_vY_win = psi_vY_win * val_mask_f[:, :, None, None]
+		psi_cX_win = psi_cX_win * cond_mask_f[:, :, None, None]
+		psi_cTY_win = psi_cTY_win * cond_mask_f[:, None, None, :]
+		val_mask_complex = val_mask.astype(jnp.complex128)
+		cond_mask_complex = cond_mask.astype(jnp.complex128)
+
+		# For GL with omega: quad_w includes the ω phase factor
+		# χ(ω) = Σ_τ w(τ) exp(iωτ/γ) χ_static(τ)
+		# where χ_static uses exp(-γτ(E_c - E_v))
+		# The omega phase factor modifies the effective energy difference
+		quad_w = -2.0 * z_lm * w_i * jnp.exp(-(z_lm * (cmin - vmax) - 1.0) * tau_i)
+
+		def _k_to_R(g_k: jax.Array, flip_sign: bool) -> jax.Array:
+			g_fft = g_k.reshape(nkx, nky, nkz, *g_k.shape[1:]).transpose(3, 4, 5, 6, 0, 1, 2)
+			return jax.lax.cond(
+				flip_sign,
+				lambda x: jnp.fft.fftn(x, axes=(-3, -2, -1), norm='ortho'),
+				lambda x: jnp.fft.ifftn(x, axes=(-3, -2, -1), norm='ortho'),
+				g_fft,
+			)
+
+		def tau_body(itau, chi_R_acc):
+			tau = tau_i[itau]
+			# Include omega phase: energies shifted by ω
+			# For positive ω: valence phases get exp(-z_lm τ (vmax - E_v))
+			#                 conduction phases get exp(-z_lm τ (E_c - cmin))
+			# Then multiply by exp(i ω τ / z_lm) for the overall frequency shift
+			exp_v = jnp.exp(-z_lm * tau * (vmax - enk_v_win)) * val_mask_complex
+			exp_c = jnp.exp(-z_lm * tau * (enk_c_win - cmin)) * cond_mask_complex
+			
+			# ω phase factor (applied uniformly to the product)
+			omega_phase = jnp.exp(1j * omega * tau / z_lm)
+			
+			w_v = exp_v.astype(jnp.complex128)
+			w_c = exp_c.astype(jnp.complex128)
+			Gv_k = jnp.einsum('ksxm,km,kmty->ksxty', jnp.conj(psi_vTX_win), w_v, psi_vY_win, optimize=True)
+			Gc_k = jnp.einsum('ksxm,km,kmty->ksxty', jnp.conj(psi_cTY_win), w_c, psi_cX_win, optimize=True)
+			Gv_k = jax.lax.with_sharding_constraint(Gv_k, gv_shard)
+			Gc_k = jax.lax.with_sharding_constraint(Gc_k, gc_shard)
+			Gv_R = _k_to_R(Gv_k, flip_sign=False)
+			Gc_R = _k_to_R(Gc_k, flip_sign=True)
+			chi_tau = jnp.einsum('ambnxyz, bnamxyz-> mnxyz', Gc_R, Gv_R, optimize=True)
+			return chi_R_acc + quad_w[itau] * omega_phase * chi_tau
+
+		chi_R = jnp.zeros((nrmu_local, nrmu_local, nkx, nky, nkz), dtype=jnp.complex128)
+		chi_R = jax.lax.with_sharding_constraint(chi_R, chiR_shard)
+		chi_R = jax.lax.fori_loop(0, tau_i.shape[0], tau_body, chi_R)
+		chi_q = jnp.fft.fftn(chi_R, axes=(-3, -2, -1), norm='ortho')
+		chi_q = chi_q.transpose(2, 3, 4, 0, 1)[:, :, :, None, :, None, :]
+		return jax.lax.with_sharding_constraint(chi_q, out_shard)
+
+	return _compute
+
+
+def solve_dyson_jax(
+	V_qmunu: jax.Array,
+	chi_q: jax.Array,
+	meta: Meta,
+	mesh_xy: Mesh,
+	pref: float = 1.0,
+) -> jax.Array:
+	"""Solve Dyson equation W = V / (1 - V χ) without whitening.
+	
+	This is the simplified version without overlap matrix S handling.
+	Used internally by both static and dynamic W routines.
+
+	Args:
+		V_qmunu: (1, 1, 1, nkx, nky, nkz, nrmu, nrmu) bare Coulomb
+		chi_q: (nkx, nky, nkz, 1, nrmu, 1, nrmu) polarizability
+		meta: Meta with k-grid dimensions
+		mesh_xy: device mesh for sharding
+		pref: prefactor to multiply chi (normalization)
+
+	Returns:
+		W_q: (nkx, nky, nkz, 1, nrmu, 1, nrmu) screened interaction
+	"""
+	nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
+	
+	@partial(jax.jit, static_argnames=("nkx", "nky", "nkz"))
+	def _solve(V_qmunu, chi_q, nkx: int, nky: int, nkz: int, pref: float):
+		nk_flat = nkx * nky * nkz
+		kXY3 = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
+		
+		# Flatten V: (1,1,1,nkx,nky,nkz,n,n) -> (nk,n,n)
+		V_kmn = V_qmunu[0, 0, 0]
+		V_flat = V_kmn.reshape(nk_flat, V_kmn.shape[-2], V_kmn.shape[-1])
+		V_flat = jax.lax.with_sharding_constraint(V_flat, kXY3)
+		
+		# Flatten chi: (nkx,nky,nkz,1,n,1,n) -> (nk,n,n)
+		chi_kmn = chi_q[:, :, :, 0, :, 0, :]
+		chi_flat = chi_kmn.reshape(nk_flat, chi_kmn.shape[-2], chi_kmn.shape[-1])
+		chi_flat = jax.lax.with_sharding_constraint(chi_flat, kXY3)
+		chi_flat = jnp.asarray(pref, dtype=chi_flat.dtype) * chi_flat
+		
+		# Solve (I - V χ) W = V
+		n = V_flat.shape[-1]
+		I = jnp.eye(n, dtype=V_flat.dtype)
+		A = I - jnp.matmul(V_flat, chi_flat)
+		
+		def solve_one(Ak, Vk):
+			lu, piv = jsp_linalg.lu_factor(Ak)
+			return jsp_linalg.lu_solve((lu, piv), Vk)
+		
+		W_flat = jax.vmap(solve_one, in_axes=(0, 0))(A, V_flat)
+		
+		# Reshape back
+		W_kmn = W_flat.reshape(nkx, nky, nkz, n, n)
+		W_out = W_kmn[:, :, :, None, :, None, :]
+		out_shard = NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y'))
+		return jax.lax.with_sharding_constraint(W_out, out_shard)
+	
+	return _solve(V_qmunu, chi_q, nkx, nky, nkz, pref)
 
 
 def get_static_w_q_jax(
@@ -459,7 +886,7 @@ def get_static_w_q_jax(
 	chi_q: jax.Array,
 	S_qmunu: jax.Array | None,
 	meta: Meta,
-	mesh_xy: Mesh | None = None,
+	mesh_xy: Mesh,
 ):
 	"""Compute static W_q using JAX under k_XY sharding inside a single jit.
 
@@ -471,102 +898,127 @@ def get_static_w_q_jax(
 	Returns:
 	- W_q: (nkx, nky, nkz, 1, nrmu, 1, nrmu) with mu_X,nu_Y sharding
 	"""
-	@partial(jax.jit, static_argnames=("nkx", "nky", "nkz"))
-	def _compute(V_qmunu, chi_q, S_qmunu, nkx: int, nky: int, nkz: int, pref: float):
-		# Whitening with overlap S via Cholesky inside jit:
-		# S = R^H R, Vbar = R^{-H} V R^{-1}, Chibar = R^{-H} Chi R^{-1}
-		# (I - Vbar Chibar) Wbar = Vbar, then W = R^H Wbar R
-		# Extract and flatten k-grid → (nq, nrmu, nrmu)
-		V_kmn = V_qmunu[0, 0, 0]  # (nkx,nky,nkz,nrmu,nrmu)
-		# Flatten k-grid and align shardings to avoid rematerialization
-		# Old direct reshape (kept for reference):
-		# V_flat = V_kmn.reshape(nkx * nky * nkz, V_kmn.shape[-2], V_kmn.shape[-1])
-		# chi_kmn = chi_q[:, :, :, 0, :, 0, :]  # (nkx,nky,nkz,nrmu,nrmu)
-		# chi_flat = chi_kmn.reshape(nkx * nky * nkz, chi_kmn.shape[-2], chi_kmn.shape[-1])
-		# S_flat = None if S_qmunu is None else S_qmunu.reshape(nkx * nky * nkz, chi_kmn.shape[-2], chi_kmn.shape[-1])
-		
-		nk_flat = nkx * nky * nkz
-		# V: (nkx,nky,nkz, nrmu, nrmu) -> (nk, nrmu, nrmu)
-		V_kmn = jax.lax.with_sharding_constraint(
-			V_kmn, NamedSharding(mesh_xy, P('x', 'y', None, None, None))
-		)
-		V_flat = V_kmn.reshape(nk_flat, V_kmn.shape[-2], V_kmn.shape[-1])
-		V_flat = jax.lax.with_sharding_constraint(
-			V_flat, NamedSharding(mesh_xy, P(('x', 'y'), None, None))
-		)
-		# chi: (nkx,nky,nkz,nrmu,nrmu) -> (nk, nrmu, nrmu)
-		chi_kmn = chi_q[:, :, :, 0, :, 0, :]
-		chi_kmn = jax.lax.with_sharding_constraint(
-			chi_kmn, NamedSharding(mesh_xy, P('x', 'y', None, None, None))
-		)
-		chi_flat = chi_kmn.reshape(nk_flat, chi_kmn.shape[-2], chi_kmn.shape[-1])
-		chi_flat = jax.lax.with_sharding_constraint(
-			chi_flat, NamedSharding(mesh_xy, P(('x', 'y'), None, None))
-		)
-		# Apply global prefactor to chi (passed from Python to avoid tracer->float issues)
-		_pref = jnp.asarray(pref, dtype=chi_flat.dtype)
-		chi_flat = _pref * chi_flat
-		# S: optional (nkx,nky,nkz,nrmu,nrmu) -> (nk, nrmu, nrmu)
-		if S_qmunu is None:
-			S_flat = None
-		else:
-			S_kmn = jax.lax.with_sharding_constraint(
-				S_qmunu, NamedSharding(mesh_xy, P('x', 'y', None, None, None))
-			)
-			S_flat = S_kmn.reshape(nk_flat, chi_kmn.shape[-2], chi_kmn.shape[-1])
-			S_flat = jax.lax.with_sharding_constraint(
-				S_flat, NamedSharding(mesh_xy, P(('x', 'y'), None, None))
-			)
-		# Reshard to k_XY (batch sharded across both mesh axes), mu/nu replicated within jit
-		if mesh_xy is not None:
-			kXY3 = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
-			V_flat = jax.lax.with_sharding_constraint(V_flat, kXY3)
-			chi_flat = jax.lax.with_sharding_constraint(chi_flat, kXY3)
-			if S_flat is not None:
-				S_flat = jax.lax.with_sharding_constraint(S_flat, kXY3)
-		# Solve (I - (V S^{-1}) χ) W = V if S provided; else (I - V χ) W = V
-		n = V_flat.shape[-1]
-		if S_flat is not None:
-			L = jnp.linalg.cholesky(S_flat)
-			# Compute Y = V S^{-1} using two right solves via transpose tricks
-			# First right solve by L^H: W1 = V L^{-H}
-			W1_T = jsp_linalg.solve_triangular(
-				L.conj().transpose(0, 2, 1), V_flat.transpose(0, 2, 1), lower=False
-			)
-			W1 = W1_T.transpose(0, 2, 1)
-			# Then right solve by L: Y = W1 L^{-1}
-			Y_T = jsp_linalg.solve_triangular(
-				L.transpose(0, 2, 1), W1.transpose(0, 2, 1), lower=False
-			)
-			Y = Y_T.transpose(0, 2, 1)
-			I = jnp.eye(n, dtype=V_flat.dtype)
-			A = I - jnp.matmul(Y, chi_flat)
-			def solve_one(Ak, Vk):
-				lu, piv = jsp_linalg.lu_factor(Ak)
-				return jsp_linalg.lu_solve((lu, piv), Vk)
-			W_flat = jax.vmap(solve_one, in_axes=(0, 0))(A, V_flat)
-		else:
-			I = jnp.eye(n, dtype=V_flat.dtype)
-			A = I - jnp.matmul(V_flat, chi_flat)
-			def solve_one(Ak, Vk):
-				lu, piv = jsp_linalg.lu_factor(Ak)
-				return jsp_linalg.lu_solve((lu, piv), Vk)
-			W_flat = jax.vmap(solve_one, in_axes=(0, 0))(A, V_flat)
-		# Reshape back and apply mu_X,nu_Y sharding
-		W_kmn = W_flat.reshape(nkx, nky, nkz, n, n)
-		W_out = W_kmn[:, :, :, None, :, None, :]
-		if mesh_xy is not None:
-			W_out = jax.lax.with_sharding_constraint(W_out, NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y')))
-		return W_out
-
-	# Compute prefactor outside jit to avoid concretization errors inside the trace
-	# Keep user's normalization choice:
-	#   pref = 2.0 / (sqrt(Nk) * nspin * nspinor)
-	# (if you want 4.0/(Nk*nspin*nspinor), change here and remove sqrt/2 logic)
+	# Compute prefactor
 	_nkx, _nky, _nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
 	_Nk = max(1, _nkx * _nky * _nkz)
 	_nspin = max(1, int(getattr(meta, 'nspin', 1)))
 	_nspinor = max(1, int(getattr(meta, 'nspinor', 1)))
 	pref = 2.0 / (math.sqrt(float(_Nk)) * float(_nspin) * float(_nspinor))
+	
+	# Fast path: no whitening
+	if S_qmunu is None:
+		return solve_dyson_jax(V_qmunu, chi_q, meta, mesh_xy, pref)
+	
+	# Whitening path with overlap matrix S
+	# Solve (I - V S^{-1} χ) W = V via Cholesky decomposition S = L L^H
+	@partial(jax.jit, static_argnames=("nkx", "nky", "nkz"))
+	def _compute_whitened(V_qmunu, chi_q, S_qmunu, nkx: int, nky: int, nkz: int, pref: float):
+		nk_flat = nkx * nky * nkz
+		kXY3 = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
+		
+		# Flatten V, chi, S
+		V_kmn = V_qmunu[0, 0, 0]
+		V_flat = V_kmn.reshape(nk_flat, V_kmn.shape[-2], V_kmn.shape[-1])
+		V_flat = jax.lax.with_sharding_constraint(V_flat, kXY3)
+		
+		chi_kmn = chi_q[:, :, :, 0, :, 0, :]
+		chi_flat = chi_kmn.reshape(nk_flat, chi_kmn.shape[-2], chi_kmn.shape[-1])
+		chi_flat = jax.lax.with_sharding_constraint(chi_flat, kXY3)
+		chi_flat = jnp.asarray(pref, dtype=chi_flat.dtype) * chi_flat
+		
+		S_flat = S_qmunu.reshape(nk_flat, S_qmunu.shape[-2], S_qmunu.shape[-1])
+		S_flat = jax.lax.with_sharding_constraint(S_flat, kXY3)
+		
+		# Cholesky: S = L L^H, then compute Y = V S^{-1}
+		n = V_flat.shape[-1]
+		L = jnp.linalg.cholesky(S_flat)
+		# Right solve: Y = V L^{-H} L^{-1}
+		W1_T = jsp_linalg.solve_triangular(
+			L.conj().transpose(0, 2, 1), V_flat.transpose(0, 2, 1), lower=False
+		)
+		Y_T = jsp_linalg.solve_triangular(
+			L.transpose(0, 2, 1), W1_T, lower=False
+		)
+		Y = Y_T.transpose(0, 2, 1)
+		
+		# Solve (I - Y χ) W = V
+		I = jnp.eye(n, dtype=V_flat.dtype)
+		A = I - jnp.matmul(Y, chi_flat)
+		
+		def solve_one(Ak, Vk):
+			lu, piv = jsp_linalg.lu_factor(Ak)
+			return jsp_linalg.lu_solve((lu, piv), Vk)
+		
+		W_flat = jax.vmap(solve_one, in_axes=(0, 0))(A, V_flat)
+		
+		# Reshape back
+		W_kmn = W_flat.reshape(nkx, nky, nkz, n, n)
+		W_out = W_kmn[:, :, :, None, :, None, :]
+		out_shard = NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y'))
+		return jax.lax.with_sharding_constraint(W_out, out_shard)
 
-	return _compute(V_qmunu, chi_q, S_qmunu, _nkx, _nky, _nkz, pref)
+	return _compute_whitened(V_qmunu, chi_q, S_qmunu, _nkx, _nky, _nkz, pref)
+
+
+def get_w_omega_jax(
+	V_qmunu: jax.Array,
+	psi_vTX: jax.Array,
+	psi_vY: jax.Array,
+	psi_cX: jax.Array,
+	psi_cTY: jax.Array,
+	enk_v: jax.Array,
+	enk_c: jax.Array,
+	windows,
+	omega: float,
+	meta: Meta,
+	mesh_xy: Mesh,
+	S_qmunu: jax.Array | None = None,
+):
+	"""Compute W(ω) = V / (1 - V χ(ω)) for a single frequency.
+	
+	This is the main entry point for dynamic W at a specified frequency.
+	Internally computes χ(ω) using get_chi_omega_jax, then inverts
+	the dielectric matrix.
+	
+	Handles all window preparation: populates band ranges and initializes
+	HGL quadrature for windows where ω causes energy crossings.
+	
+	Args:
+		V_qmunu: bare Coulomb (1, 1, 1, nkx, nky, nkz, nrmu, nrmu)
+		psi_vTX, psi_vY, psi_cX, psi_cTY: wavefunctions
+		enk_v, enk_c: band energies
+		windows: list of WindowPair objects
+		omega: frequency (in Ry)
+		meta: Meta object with k-grid info
+		mesh_xy: device mesh for sharding
+		S_qmunu: optional overlap matrix for whitening
+	
+	Returns:
+		W_q: (nkx, nky, nkz, 1, nrmu, 1, nrmu) complex128
+		chi_omega: the computed χ(ω) for diagnostics
+	"""
+	omega_abs = abs(omega)
+	
+	# Prepare window band ranges (fetch energies to host once)
+	enk_v_host = np.asarray(jax.device_get(enk_v))
+	enk_c_host = np.asarray(jax.device_get(enk_c))
+	
+	for win in windows:
+		_ensure_window_band_ranges(win, enk_v_host, enk_c_host)
+		
+		# Check if this window needs HGL quadrature
+		E_gap = win.cond_window.start_energy - win.val_window.end_energy
+		E_bw = win.cond_window.end_energy - win.val_window.start_energy
+		if (omega_abs >= E_gap) and (omega_abs <= E_bw):
+			win.init_hgl_quadrature()
+	
+	# Compute chi(omega)
+	chi_omega = get_chi_omega_jax(
+		psi_vTX, psi_vY, psi_cX, psi_cTY,
+		enk_v, enk_c, windows, omega, meta, mesh_xy
+	)
+	
+	# Compute W(omega) = V / (1 - V chi)
+	W_omega = get_static_w_q_jax(V_qmunu, chi_omega, S_qmunu, meta, mesh_xy)
+	
+	return W_omega, chi_omega
