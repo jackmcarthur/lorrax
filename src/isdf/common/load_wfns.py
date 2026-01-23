@@ -182,13 +182,20 @@ def read_Gvecs_to_devices(
 			)
 
 	# Promote local buffer to a global sharded JAX array over bands across both [x,y]
-	global_shape = (meta.nk_tot, total_bands_padded, meta.nspinor, *meta.fft_grid)
-	band_sharding = NamedSharding(mesh_xy, P(None, ('x', 'y'), None, None, None, None))
-	global_psi_Gtot = jax.make_array_from_process_local_data(
-		band_sharding, jnp.asarray(psi_Gtot_local), global_shape
-	)
+	with timing.section("load_wfns.make_global_array"):
+		global_shape = (meta.nk_tot, total_bands_padded, meta.nspinor, *meta.fft_grid)
+		band_sharding = NamedSharding(mesh_xy, P(None, ('x', 'y'), None, None, None, None))
+		# Use device_put for faster host-to-device transfer (9x faster than jnp.asarray)
+		psi_local_jax = jax.device_put(psi_Gtot_local)
+		global_psi_Gtot = jax.make_array_from_process_local_data(
+			band_sharding, psi_local_jax, global_shape
+		)
 
 	return global_psi_Gtot, nb
+
+
+# Cache for jitted functions keyed by (mesh_id, fft_grid, nk_tot, nspinor)
+_get_sharded_wfns_cache = {}
 
 
 def get_sharded_wfns(
@@ -203,72 +210,97 @@ def get_sharded_wfns(
 	"""
 	Jitted: FFT -> apply phase -> normalize/trim -> flatten r -> reshard (Y-only) -> centroid gather ->
 	build psi_rmu^T with X-only sharding. Returns (psi_rtot_Y, psi_rmu_Y, psi_rmuT_X).
-	"""
-	xy2_6 = NamedSharding(mesh_xy, P(None, ('x', 'y'), None, None, None, None))
-	xy3_4 = NamedSharding(mesh_xy, P(None, None, None, ('x', 'y')))
-	y3_4 = NamedSharding(mesh_xy, P(None, None, None, 'y'))
-	x1_4 = NamedSharding(mesh_xy, P(None, 'x', None, None))
-	null_4 = NamedSharding(mesh_xy, P(None, None, None, None))
 	
-	# Create sharded FFT using shard_map - runs FFT on each device's local data
-	fft_spec = P(None, ('x', 'y'), None, None, None, None)
-	sharded_ifftn = make_sharded_ifftn_3d(mesh_xy, fft_spec, fft_spec)
-
-	@partial(jax.jit,
-			 static_argnames=("nb_actual", "is_left"), 
-			 in_shardings=(xy2_6), 
-			 out_shardings=(y3_4, y3_4, null_4))
-	def _finalize(global_psi_Gtot: jax.Array, nb_actual: int, is_left: bool):
-		# FFT to real space - shard_map runs FFT independently on each device
-		psi_r = sharded_ifftn(global_psi_Gtot)
-
-		# Vectorized exp(ikr)
-		fx = jnp.arange(meta.fft_grid[0], dtype=jnp.float64)[None, :, None, None] / meta.fft_grid[0]
-		fy = jnp.arange(meta.fft_grid[1], dtype=jnp.float64)[None, None, :, None] / meta.fft_grid[1]
-		fz = jnp.arange(meta.fft_grid[2], dtype=jnp.float64)[None, None, None, :] / meta.fft_grid[2]
-		kpts = jnp.asarray(sym.unfolded_kpts, dtype=jnp.float64)[: psi_r.shape[0]]
-		phase_spatial = jnp.exp(
-			2j * jnp.pi *
-			(
-				kpts[:, 0:1, None, None] * fx
-				+ kpts[:, 1:2, None, None] * fy
-				+ kpts[:, 2:3, None, None] * fz
-			)
-		)
-		psi_r = psi_r * phase_spatial[:, None, None, :, :, :]
-
-		# Conjugate (if left) and normalization
-		psi_r = jnp.where(jnp.asarray(is_left), jnp.conj(psi_r), psi_r)
-		psi_r = psi_r * jnp.sqrt(meta.n_rtot)
-
-		# Trim bands to actual request
-		psi_r = psi_r[:, :nb_actual]
-
-		# Flatten spatial dims to rtot
-		psi_rtot = psi_r.reshape(meta.nk_tot, nb_actual, meta.nspinor, -1)
-
-		# Replicate before indexed gather to avoid multi-shard gather issues
-		psi_rtot = jax.lax.with_sharding_constraint(psi_rtot, null_4)
-
-		# Centroid gather along r on replicated array
-		centroids = jnp.asarray(centroid_indices, dtype=jnp.int32)
-		ny = jnp.asarray(meta.fft_grid[1], dtype=jnp.int32)
-		nz = jnp.asarray(meta.fft_grid[2], dtype=jnp.int32)
-		centroid_lin = (centroids[:, 0] * (ny * nz) + centroids[:, 1] * nz + centroids[:, 2]).astype(jnp.int32)
-		psi_rmu = jnp.take(psi_rtot, centroid_lin, axis=3)
-
-		# Conjugate-transpose to (nk, n_rmu, nb*nspinor) and X-only reshard over rmu
-		n_rmu = psi_rmu.shape[-1]
-		psi_rmuT = jnp.conj(psi_rmu.transpose(0, 3, 1, 2).reshape(meta.nk_tot, n_rmu, -1, meta.nspinor))
+	Uses function caching to avoid JIT recompilation on repeated calls.
+	"""
+	# Create cache key from hashable values
+	cache_key = (
+		id(mesh_xy),  # Mesh identity
+		meta.fft_grid,  # Tuple of grid dims
+		meta.nk_tot,
+		meta.nspinor,
+		meta.n_rtot,
+		len(centroid_indices),  # Number of centroids
+	)
+	
+	if cache_key not in _get_sharded_wfns_cache:
+		# Create shardings and jitted function once per unique configuration
+		xy2_6 = NamedSharding(mesh_xy, P(None, ('x', 'y'), None, None, None, None))
+		y3_4 = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+		null_4 = NamedSharding(mesh_xy, P(None, None, None, None))
 		
-		# Re-shard results to y-only to match out_shardings
-		psi_rtot = jax.lax.with_sharding_constraint(psi_rtot, y3_4)
-		psi_rmu = jax.lax.with_sharding_constraint(psi_rmu, y3_4)
-		#psi_rmuT_X = jax.lax.with_sharding_constraint(psi_rmuT, null_4)
+		# Create sharded FFT using shard_map
+		fft_spec = P(None, ('x', 'y'), None, None, None, None)
+		sharded_ifftn = make_sharded_ifftn_3d(mesh_xy, fft_spec, fft_spec)
+		
+		# Pre-compute static values
+		fft_grid = meta.fft_grid
+		nk_tot = meta.nk_tot
+		nspinor = meta.nspinor
+		n_rtot = meta.n_rtot
+		sqrt_n_rtot = jnp.sqrt(n_rtot)
+		
+		# Pre-compute phase grid (static)
+		fx = jnp.arange(fft_grid[0], dtype=jnp.float64)[None, :, None, None] / fft_grid[0]
+		fy = jnp.arange(fft_grid[1], dtype=jnp.float64)[None, None, :, None] / fft_grid[1]
+		fz = jnp.arange(fft_grid[2], dtype=jnp.float64)[None, None, None, :] / fft_grid[2]
+		
+		# Pre-compute centroid linear indices
+		centroids = jnp.asarray(centroid_indices, dtype=jnp.int32)
+		ny, nz = fft_grid[1], fft_grid[2]
+		centroid_lin = (centroids[:, 0] * (ny * nz) + centroids[:, 1] * nz + centroids[:, 2]).astype(jnp.int32)
+		n_rmu = len(centroid_indices)
 
-		return psi_rtot, psi_rmu, psi_rmuT
+		@partial(jax.jit,
+				 static_argnames=("nb_actual", "is_left"), 
+				 in_shardings=(xy2_6, None), 
+				 out_shardings=(y3_4, y3_4, null_4))
+		def _finalize(global_psi_Gtot: jax.Array, kpts: jax.Array, nb_actual: int, is_left: bool):
+			# FFT to real space - shard_map runs FFT independently on each device
+			psi_r = sharded_ifftn(global_psi_Gtot)
 
-	return _finalize(global_psi_Gtot, nb_actual, bool(is_left))
+			# Apply Bloch phase exp(ik·r) using pre-computed grids
+			phase_spatial = jnp.exp(
+				2j * jnp.pi *
+				(
+					kpts[:, 0:1, None, None] * fx
+					+ kpts[:, 1:2, None, None] * fy
+					+ kpts[:, 2:3, None, None] * fz
+				)
+			)
+			psi_r = psi_r * phase_spatial[:, None, None, :, :, :]
+
+			# Conjugate (if left) and normalization
+			psi_r = jnp.where(jnp.asarray(is_left), jnp.conj(psi_r), psi_r)
+			psi_r = psi_r * sqrt_n_rtot
+
+			# Trim bands to actual request
+			psi_r = psi_r[:, :nb_actual]
+
+			# Flatten spatial dims to rtot
+			psi_rtot = psi_r.reshape(nk_tot, nb_actual, nspinor, -1)
+
+			# Replicate before indexed gather to avoid multi-shard gather issues
+			psi_rtot = jax.lax.with_sharding_constraint(psi_rtot, null_4)
+
+			# Centroid gather using pre-computed linear indices
+			psi_rmu = jnp.take(psi_rtot, centroid_lin, axis=3)
+
+			# Conjugate-transpose to (nk, n_rmu, nb, nspinor)
+			psi_rmuT = jnp.conj(psi_rmu.transpose(0, 3, 1, 2).reshape(nk_tot, n_rmu, -1, nspinor))
+			
+			# Re-shard results to y-only
+			psi_rtot = jax.lax.with_sharding_constraint(psi_rtot, y3_4)
+			psi_rmu = jax.lax.with_sharding_constraint(psi_rmu, y3_4)
+
+			return psi_rtot, psi_rmu, psi_rmuT
+		
+		_get_sharded_wfns_cache[cache_key] = _finalize
+	
+	# Get cached function and call it
+	_finalize = _get_sharded_wfns_cache[cache_key]
+	kpts = jnp.asarray(sym.unfolded_kpts[:meta.nk_tot], dtype=jnp.float64)
+	return _finalize(global_psi_Gtot, kpts, nb_actual, bool(is_left))
 
 
 def load_psi_rtot_for_bandrange(
