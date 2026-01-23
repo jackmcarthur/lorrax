@@ -12,8 +12,6 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
 os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 import argparse
-import configparser
-import re
 
 import numpy as np
 import jax
@@ -52,18 +50,21 @@ except RuntimeError as exc:
 	else:
 		raise
 mesh_bands = Mesh(np.asarray(_default_devices), ("bands",))
-from ..common.wfnreader import WFNReader
-#from ..common.epsreader import EPSReader
+from ..io import (
+    WFNReader, EPSReader,
+    write_sigma_to_file, write_eqp_table,
+    write_labeled_arrays_to_h5, read_labeled_arrays_from_h5,
+    load_labeled_arrays_from_h5, save_restart_per_proc,
+    write_qp_rotations_h5, load_kin_ion_submatrix,
+    load_centroids, resolve_input_paths,
+)
 from ..common import symmetry_maps
 from ..common.load_wfns import read_Gvecs_to_devices, get_sharded_wfns, get_enk_bandrange
 from .get_windows import get_window_info
 from .w_isdf import get_chi0_jax, get_static_w_q_jax, get_w_omega_jax
 from .vcoul import compute_q0_averages
 from ..common.chi_from_dipole import read_dipole_h5, compute_S_omega
-from ..common.epsreader import EPSReader
-from .gw_file_io import (write_sigma_to_file, write_eqp_table, write_labeled_arrays_to_h5, 
-                         read_labeled_arrays_from_h5, load_labeled_arrays_from_h5, 
-                         save_restart_per_proc)
+from .cohsex_init import get_effective_chunk_size, read_cohsex_input, get_bandranges
 from ..mixing.acceleration import (
     rcrop_nojit, hermitian_to_upper_flat, upper_flat_to_hermitian
 )
@@ -74,75 +75,6 @@ import isdf.common.timing as timing
 import h5py
 import builtins
 import gc
-
-
-def write_qp_rotations_h5(
-    filepath: str,
-    U_mnk: np.ndarray,
-    E_qp_nk: np.ndarray,
-    band_start: int,
-    band_stop: int,
-    kpoints_crys: np.ndarray,
-    nkx: int,
-    nky: int,
-    nkz: int,
-    kpoints_reduced: np.ndarray = None,
-    kirr_to_kfull: np.ndarray = None,
-):
-    """Write QP rotation matrices and eigenvalues to HDF5 file.
-    
-    This file can be used to postprocess WFN.h5 → WFN_qp.h5 by rotating
-    the G-vector coefficients and replacing eigenvalues.
-    
-    Args:
-        filepath: Output path for the h5 file
-        U_mnk: Unitary matrices (nk, nb, nb) where U[k,m,n] = <m_DFT|n_QP>
-               To rotate coefficients: c_qp_n(G) = Σ_m U[k,m,n] c_dft_m(G)
-        E_qp_nk: QP eigenvalues (nk, nb) in Hartree atomic units
-        band_start: First band index (0-based) included in the calculation
-        band_stop: One past last band index included
-        kpoints_crys: Full k-mesh in crystal coordinates (nk, 3)
-        nkx, nky, nkz: k-mesh dimensions
-        kpoints_reduced: Reduced k-points from WFN.h5 (nk_red, 3), optional
-        kirr_to_kfull: Mapping from reduced k-point index to full zone index, optional
-    
-    For postprocessing WFN.h5 → WFN_qp.h5:
-        1. Load WFN.h5 coefficients for bands [band_start:band_stop]
-        2. For each k-point k:
-           c_qp[n, G] = Σ_m U[k, m, n] * c_dft[m, G]  (matrix form: c_qp = U^T @ c_dft)
-        3. Replace eigenvalues with E_qp_nk (convert to Rydberg if needed)
-        4. Write rotated coefficients back to WFN_qp.h5
-    """
-    with h5py.File(filepath, 'w') as f:
-        # Main data
-        f.create_dataset('U_mnk', data=U_mnk, dtype=np.complex128)
-        f.create_dataset('E_qp_nk_hartree', data=E_qp_nk, dtype=np.float64)
-        f.create_dataset('E_qp_nk_rydberg', data=E_qp_nk * 2.0, dtype=np.float64)  # Also save in Ry
-        
-        # Metadata
-        f.create_dataset('band_range', data=np.array([band_start, band_stop], dtype=np.int32))
-        f.create_dataset('kpoints_crys', data=kpoints_crys, dtype=np.float64)
-        f.create_dataset('kgrid', data=np.array([nkx, nky, nkz], dtype=np.int32))
-        
-        # Optional: reduced k-points and mapping for easy WFN.h5 lookup
-        if kpoints_reduced is not None:
-            f.create_dataset('kpoints_reduced', data=kpoints_reduced, dtype=np.float64)
-        if kirr_to_kfull is not None:
-            f.create_dataset('kirr_to_kfull', data=kirr_to_kfull, dtype=np.int32)
-        
-        # Attributes for documentation
-        f.attrs['description'] = (
-            'QP rotation data for transforming DFT wavefunctions to QP basis. '
-            'U_mnk[k,m,n] = <m_DFT|n_QP>. '
-            'To rotate: c_qp[n,G] = sum_m U[k,m,n] * c_dft[m,G] (i.e. c_qp = U^T @ c_dft)'
-        )
-        f.attrs['energy_units'] = 'E_qp_nk_hartree in Hartree, E_qp_nk_rydberg in Rydberg'
-        f.attrs['band_convention'] = '0-based indexing; bands [band_start, band_stop) were computed'
-        if kirr_to_kfull is not None:
-            f.attrs['mapping_description'] = (
-                'kirr_to_kfull[ik_red] gives the index into kpoints_crys/U_mnk/E_qp_nk '
-                'for the reduced k-point ik_red from WFN.h5'
-            )
 
 
 # ================= Helper kernels (jitted) defined at module scope =================
@@ -556,178 +488,10 @@ def determine_wcoul0(params, input_dir, wfn, sym, meta, print_fn):
 	raise RuntimeError("Failed to determine wcoul0: neither eps0mat.h5 epshead nor dipole.h5 S(0) available")
 
 
-def read_cohsex_input(filename: str) -> dict:
-	"""Parse input file for the COHSEX driver, allowing a QE K_POINTS block.
-
-	We extract the [cohsex] section using a substring to avoid configparser
-	errors from non-INI blocks like K_POINTS. The K_POINTS {crystal_b} block
-	is parsed manually and returned under 'kpoints_crystal_b'.
-	"""
-	with open(filename, 'r') as f:
-		lines = f.readlines()
-
-	# Locate [cohsex] section boundaries
-	start = None
-	for i, l in enumerate(lines):
-		if l.strip().lower().startswith('[cohsex]'):
-			start = i
-			break
-	if start is None:
-		for i, l in enumerate(lines):
-			if re.match(r"\s*\[.*\]", l):
-				start = i
-				break
-	end = len(lines)
-	# Locate optional K_POINTS block in full file first
-	kp_idx = None
-	for i, l in enumerate(lines):
-		ls = l.strip().lower()
-		if ls.startswith("k_points"):
-			kp_idx = i
-			break
-	seg_count = 0
-	kp_end = None
-	if kp_idx is not None and kp_idx + 1 < len(lines):
-		# count is on the next line; read exactly that many entries
-		try:
-			seg_count = int(lines[kp_idx + 1].strip().split()[0])
-		except Exception:
-			seg_count = 0
-		kp_end = min(len(lines), kp_idx + 2 + max(seg_count, 0))
-	if start is not None:
-		for j in range(start + 1, len(lines)):
-			if re.match(r"\s*\[.*\]", lines[j]):
-				end = j
-				break
-		# Remove K_POINTS block from the ini text before feeding to configparser
-		if kp_idx is not None and (start <= kp_idx < end):
-			section_lines = lines[start:kp_idx] + lines[(kp_end if kp_end is not None else kp_idx+1):end]
-			ini_text = ''.join(section_lines)
-		else:
-			ini_text = ''.join(lines[start:end])
-		parser = configparser.ConfigParser()
-		parser.read_string(ini_text)
-		section = parser["cohsex"] if "cohsex" in parser else parser[parser.sections()[0]]
-		getb = section.getboolean
-		get = section.get
-		geti = section.getint
-		getf = section.getfloat
-		# ============================================================================
-		# PARAMETER DEFINITIONS:
-		# ============================================================================
-		# restart:       If True, load V_qmunu/wavefunctions from taggedarrays.h5
-		#                instead of rebuilding ISDF from scratch. Default=True.
-		# x_only:        If True, compute bare exchange only (no screening).
-		#                Cannot be True if do_screened=True. Default=False.
-		# do_screened:   If True, build W from (1-Vχ)⁻¹V and use for Σ_x.
-		#                If False, use bare Coulomb V. Default=True.
-		# bispinor:      If True, use 2-component spinor wavefunctions (SOC).
-		#                Default=False (scalar or collinear spin).
-		# wcoul0_source: Method for q→0 head average: 'epshead' (from eps0mat.h5)
-		#                or 's_tensor' (from dipole.h5). Default='s_tensor'.
-		# self_consistent: If True, run fixed-point SCF loop. Default=False.
-		# nval:          Number of valence bands in sigma window. These are the
-		#                highest occupied bands: indices [nelec-nval, nelec).
-		# ncond:         Number of conduction bands in sigma window. These are the
-		#                lowest unoccupied bands: indices [nelec, nelec+ncond).
-		# nband:         Total bands to load (for chi0, etc.). Usually > nval+ncond.
-		# sys_dim:       Dimensionality: 2=2D (slab with truncated Coulomb),
-		#                3=3D (bulk, not yet implemented). Default=2.
-		# debug_hartree: If True, print diagnostic info for Hartree calculation.
-		# debug_omega:   If set (float, in Ry), compute W(ω) at this frequency
-		#                instead of static W. For testing dynamic screening.
-		# ============================================================================
-		params = {
-			"restart": getb("restart", fallback=True),           # load from h5 vs rebuild
-			"x_only": getb("x_only", fallback=False),            # bare exchange only
-			"do_screened": getb("do_screened", fallback=True),   # use W instead of V
-			"bispinor": getb("bispinor", fallback=False),        # 2-component spinors
-			"wcoul0_source": get("wcoul0_source", fallback="s_tensor").strip().lower(),
-			"wfn_file": get("wfn_file", fallback="WFN.h5"),
-			"centroids_file": get("centroids_file", fallback="centroids_frac.txt"),
-			"output_file": get("output_file", fallback="eqp0_noqsym.dat"),
-			"self_consistent": getb("self_consistent", fallback=False),
-			"kin_ion_file": get("kin_ion_file", fallback="kin_ion.h5"),
-			"eqp_output_file": get("eqp_output_file", fallback="eqp.dat"),
-			"nval": geti("nval", fallback=5),    # valence bands in sigma window
-			"ncond": geti("ncond", fallback=5),  # conduction bands in sigma window
-			"nband": geti("nband", fallback=100), # total bands for chi0/screening
-			"sys_dim": geti("sys_dim", fallback=2),  # 2=slab, 3=bulk
-			"debug_hartree": getb("debug_hartree", fallback=False),
-			"debug_omega": getf("debug_omega", fallback=None),   # test W(ω) at this freq
-		}
-	else:
-		# Fallback defaults if no section found
-		params = {
-			"restart": True,
-			"x_only": False,
-			"do_screened": True,
-			"bispinor": False,
-			"wcoul0_source": "s_tensor",
-			"wfn_file": "WFN.h5",
-			"centroids_file": "centroids_frac.txt",
-			"output_file": "eqp0_noqsym.dat",
-			"self_consistent": False,
-			"kin_ion_file": "kin_ion.h5",
-			"eqp_output_file": "eqp.dat",
-			"nval": 5,
-			"ncond": 5,
-			"nband": 100,
-			"sys_dim": 2,
-			"debug_hartree": False,
-			"debug_omega": None,
-		}
-
-	# Parse optional QE-style K_POINTS block: take the number after it, read next that many lines
-	if kp_idx is not None:
-		j = kp_idx + 1
-		try:
-			nseg = int(lines[j].strip().split()[0])
-		except Exception:
-			nseg = 0
-		segments = []
-		for k in range(nseg):
-			row_idx = j + 1 + k
-			if row_idx >= len(lines):
-				break
-			row_full = lines[row_idx].rstrip('\n')
-			label = None
-			comment_split = None
-			for marker in ('#', '!', ';'):
-				if marker in row_full:
-					comment_split = row_full.split(marker, 1)
-					label = comment_split[1].strip() or None
-					row = comment_split[0].strip()
-					break
-			if comment_split is None:
-				row = row_full.strip()
-			if not row:
-				continue
-			parts = row.split()
-			if len(parts) < 3:
-				continue
-			x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
-			npts = int(parts[3]) if len(parts) >= 4 else 1
-			segments.append({"k": [x, y, z], "n": npts, "label": label})
-		if segments:
-			params["kpoints_crystal_b"] = {"segments": segments}
-	return params
-
 # The current implementation focuses on the static COHSEX limit.  Many of the
 # routines below (e.g. chi0 and sigma construction) are written in a style that
 # follows the complex time shredded propagator (CTSP) formulation so that we can
 # later restore full frequency dependence and iterate towards self-consistency.
-
-
-# return ranges of bands necessary for \sigma_{X,SX,COH}
-def get_bandranges(nv, nc, nband, nelec):
-	r"""Return ranges of bands necessary for \sigma_{X,SX,COH}"""
-	nvrange = [int(nelec - nv), int(nelec)]
-	ncrange = [int(nelec), int(nelec + nc)]
-	nsigmarange = [int(nelec - nv), int(nelec + nc)]
-	n_fullrange = [0, int(nband)]
-	n_valrange = [0, int(nelec)]
-	return nvrange, ncrange, nsigmarange, n_fullrange, n_valrange
 
 
 # get_enk_bandrange moved to common.load_wfns and refactored to return plain JAX arrays
@@ -1178,26 +942,6 @@ def compute_sigma_pipeline_jax(
 	return sigma_sx_kij, sigma_coh_kij, hartree_kmn
 
 
-def load_kin_ion_submatrix(h5_path: str, band_start: int, band_stop: int) -> jax.Array:
-	"""Load sub-block of the kin+ion Hamiltonian for the requested band slice."""
-	if band_stop <= band_start:
-		raise ValueError(f"Invalid band slice [{band_start}, {band_stop})")
-	if not os.path.exists(h5_path):
-		raise FileNotFoundError(f"kin_ion file not found: {h5_path}")
-	with h5py.File(h5_path, "r") as h5:
-		if "kin_ion" not in h5:
-			raise KeyError("Dataset 'kin_ion' missing from kin_ion file")
-		kin_dset = h5["kin_ion"]
-		nb_total = kin_dset.shape[1]
-		if band_stop > nb_total:
-			raise ValueError(
-				f"Requested bands require {band_stop} states but kin_ion only has {nb_total}"
-			)
-		sub = kin_dset[:, band_start:band_stop, band_start:band_stop]
-	return jnp.asarray(sub, dtype=jnp.complex128)
-
-
-
 def summarize_hermitian_matrix(name: str, mats: np.ndarray, print_fn=print, warn_threshold: float = 1e-6):
 	"""Emit diagnostics for a batch of Hermitian matrices shaped (nk, nb, nb)."""
 	if mats.ndim != 3:
@@ -1291,13 +1035,7 @@ def main(argv=None):
 	
 	# Resolve relative paths against the input file's directory
 	input_dir = os.path.dirname(os.path.abspath(args.input))
-	def _resolve_path(path: str) -> str:
-		return path if os.path.isabs(path) else os.path.join(input_dir, path)
-	params["wfn_file"] = _resolve_path(params["wfn_file"])
-	params["centroids_file"] = _resolve_path(params["centroids_file"])
-	params["output_file"] = _resolve_path(params["output_file"])
-	params["kin_ion_file"] = _resolve_path(params["kin_ion_file"])
-	params["eqp_output_file"] = _resolve_path(params["eqp_output_file"])
+	resolve_input_paths(params, input_dir)
 	nval = params["nval"]
 	ncond = params["ncond"]
 	nband = params["nband"]
@@ -1311,17 +1049,11 @@ def main(argv=None):
 	sym = symmetry_maps.SymMaps(wfn)
 	
 	# Load centroids
-	centroids_frac = np.loadtxt(params["centroids_file"])
-	_n_rmu = int(centroids_frac.shape[0])
+	centroids_frac, centroid_indices, _n_rmu = load_centroids(params["centroids_file"], wfn.fft_grid)
 	# Resolve tmp_dir and output path relative to input file directory
 	tmp_dir = os.path.join(input_dir, "tmp")
 	os.makedirs(tmp_dir, exist_ok=True)
 	taggedarray_filename = os.path.join(tmp_dir, f"taggedarrays{_n_rmu}.h5")
-
-	# Build centroid indices on host (NumPy), handle periodic boundary in-place, then promote to JAX later
-	centroid_indices = np.round(centroids_frac * wfn.fft_grid).astype(int)
-	for i in range(3):
-		centroid_indices[centroid_indices[:, i] == wfn.fft_grid[i], i] = 0
 	_print0(f"  ISDF basis: {_n_rmu} centroids")
 	_print0(f"  FFT grid: {wfn.fft_grid[0]}×{wfn.fft_grid[1]}×{wfn.fft_grid[2]}   Cell volume: {wfn.cell_volume:.2f} a.u.³")
 	_print0("")
@@ -1367,6 +1099,7 @@ def main(argv=None):
 	meta.n_proc = jax.process_count()
 	meta.sys_dim = sys_dim
 	meta.bispinor = bispinor
+	meta.chunk_size = get_effective_chunk_size(params["chunk_size"])
 	fft_nx, fft_ny, fft_nz = (int(dim) for dim in meta.fft_grid)
 	nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
 	band = meta.band_ranges
@@ -1402,7 +1135,9 @@ def main(argv=None):
 			print(*a, **k)
 	# Shardings from the pre-constructed mesh
 	sh = make_shardings(mesh_xy)
-
+	
+	chunk_str = "disabled" if meta.chunk_size is None else str(meta.chunk_size)
+	print0(f"  Band chunk size: {chunk_str}")
 
 	# Initialize timing system
 	timing.reset()

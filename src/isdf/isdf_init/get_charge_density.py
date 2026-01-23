@@ -7,7 +7,7 @@ import datetime
 # COHSEX iterations.  This routine will later be called repeatedly as the
 # quasiparticle wavefunctions are updated.
 
-from ..common.wfnreader import WFNReader
+from ..io import WFNReader
 from ..common import symmetry_maps
 
 wfnpath = 'WFN.h5'

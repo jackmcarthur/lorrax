@@ -540,6 +540,32 @@ class SymMaps:
         wfn_kG = np.einsum('jk,kl->jl', self.U_spinor[sym_idx], wfn_kG)
         return wfn_kG
 
+    def get_cnk_fullzone_batch(self, wfn, band_indices, nk):
+        """Apply symmetry operations to multiple bands at once (vectorized).
+        
+        Args:
+            wfn: WFNReader instance
+            band_indices: array-like of band indices
+            nk: index of k-point in unfolded grid
+            
+        Returns:
+            np.ndarray: Rotated coefficients of shape (nb, 2, ngk)
+        """
+        sym_idx = self.irk_sym_map[nk]
+        kbar_idx = self.irk_to_k_map[nk]
+        
+        # Batch read from WFN: (nb, 2, ngk)
+        cnk_batch = wfn.get_cnk_batch(kbar_idx, band_indices)
+        
+        # Time-reversal conjugation if needed
+        ntran = len(self.sym_matrices)
+        if sym_idx >= ntran:
+            cnk_batch = np.conj(cnk_batch)
+        
+        # Vectorized spinor rotation: U[j,k] @ cnk[n,k,l] -> result[n,j,l]
+        # U_spinor is (2, 2), cnk_batch is (nb, 2, ngk)
+        return np.einsum('jk,nkl->njl', self.U_spinor[sym_idx], cnk_batch)
+
     def find_qpoint_index(self, q_ext, tol=1e-6):
         """Find index of q-point in unfolded k-points list.
 

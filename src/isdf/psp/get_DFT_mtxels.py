@@ -36,7 +36,7 @@ from functools import partial
 try:
     from .normalize import normalize_dataclass
     from .load_upf import load_upf
-    from ..common.wfnreader import WFNReader
+    from ..io import WFNReader
     from ..common import symmetry_maps
     from ..common.load_wfns import read_Gvecs_to_devices
     from ..common import Meta
@@ -47,7 +47,7 @@ except ImportError:
     _sys.path.append(str(_Path(__file__).resolve().parents[2]))  # .../src
     from isdf.psp.normalize import normalize_dataclass
     from isdf.psp.load_upf import load_upf
-    from isdf.common.wfnreader import WFNReader
+    from isdf.io import WFNReader
     from isdf.common import symmetry_maps
     from isdf.common.load_wfns import read_Gvecs_to_devices
     from isdf.common import Meta

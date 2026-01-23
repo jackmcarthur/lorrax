@@ -14,7 +14,7 @@ import numpy as np
 from ..common import Meta, jax_profile
 from ..common.gamma_matrices import gammas_sparse
 from ..common.gpu_utils import cp, xp
-from ..common.wfnreader import WFNReader
+from ..io import WFNReader
 
 
 _MESH_SHARD_REGISTRY: dict[int | str, dict[str, NamedSharding | None]] = {}

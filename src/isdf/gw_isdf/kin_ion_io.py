@@ -24,7 +24,7 @@ import numpy as np
 import jax
 from jax.sharding import Mesh
 
-from isdf.common.wfnreader import WFNReader
+from isdf.io import WFNReader
 from isdf.common import symmetry_maps
 from isdf.common import Meta
 from isdf.common.load_wfns import read_Gvecs_to_devices
