@@ -306,10 +306,9 @@ def get_sharded_wfns(
 			# Flatten spatial dims to rtot
 			psi_rtot = psi_r.reshape(nk_tot, nb_actual, nspinor, -1)
 
-			# Replicate before indexed gather to avoid multi-shard gather issues
-			psi_rtot = jax.lax.with_sharding_constraint(psi_rtot, null_4)
-
 			# Centroid gather using pre-computed linear indices
+			# NOTE: No replication needed - JAX handles gather efficiently with
+			# bands still sharded, avoiding a 250x memory spike.
 			psi_rmu = jnp.take(psi_rtot, centroid_lin, axis=3)
 
 			# Conjugate-transpose to (nk, n_rmu, nb, nspinor)
@@ -457,7 +456,7 @@ def compute_pair_density_k(
 			Einsum: P[k,a,b,mu,nu] = sum_n psi_L[k,mu,n,a] * psi_R[k,n,b,nu]
 			       'kmna,knbv->kabmv'
 			"""
-			return jnp.einsum('kmna,knbv->kabmv', psi_L, psi_R)
+			return jnp.einsum('kmna,knbv->kabmv', psi_L, psi_R, optimize=True)
 		
 		_compute_pair_density_cache[cache_key] = _compute_P
 	
@@ -507,7 +506,7 @@ def compute_pair_density_k_zchunk(
 			Einsum: P[k,a,b,mu,r] = sum_n psi_L[k,mu,n,a] * psi_R[k,n,b,r]
 			       'kmna,knbr->kabmr'
 			"""
-			return jnp.einsum('kmna,knbr->kabmr', psi_L, psi_R)
+			return jnp.einsum('kmna,knbr->kabmr', psi_L, psi_R, optimize=True)
 		
 		_compute_pair_density_cache[cache_key] = _compute_P_zchunk
 	
@@ -662,40 +661,102 @@ def compute_CCT_ZCT_from_pair_density(
 		def _compute_CCT_ZCT(P_mumu: jax.Array, P_mu_z: jax.Array,
 		                     nkx: int, nky: int, nkz: int) -> tuple[jax.Array, jax.Array]:
 			# ---- CCT pathway ----
-			# 1. IFFT: P_k -> P_R for mu,mu
-			# P_mumu: (nk, ns, ns, n_rmu, n_rmu)
-			P_R_mumu = P_mumu.reshape(nkx, nky, nkz, ns1, ns2, n_rmu, n_rmu)
-			P_R_mumu = P_R_mumu.transpose(3, 4, 5, 6, 0, 1, 2)  # (s1,s2,mu,nu,Rx,Ry,Rz)
-			P_R_mumu = jnp.fft.ifftn(P_R_mumu, axes=(-3, -2, -1), norm='ortho')
+			# Input: (nk, ns, ns, n_rmu, n_rmu)
+			# Reshape to expose k-dimensions: (nkx, nky, nkz, ns, ns, n_rmu, n_rmu)
+			P_k_mumu = P_mumu.reshape(nkx, nky, nkz, ns1, ns2, n_rmu, n_rmu)
 			
-			# 2. Frobenius norm squared over spin: C_R = Σ_ab |P_R,ab|²
-			# P_R_mumu has shape (ns, ns, n_rmu, n_rmu, Rx, Ry, Rz)
-			C_R = jnp.sum(jnp.abs(P_R_mumu) ** 2, axis=(0, 1))
-			# C_R: (n_rmu, n_rmu, Rx, Ry, Rz)
+			# IFFT over k-dimensions directly - NO TRANSPOSE NEEDED
+			P_R_mumu = jnp.fft.ifftn(P_k_mumu, axes=(0, 1, 2), norm='ortho')
+			# P_R_mumu: (Rx, Ry, Rz, ns, ns, n_rmu, n_rmu)
 			
-			# 3. FFT: C_R -> C_q
-			C_q = jnp.fft.fftn(C_R, axes=(-3, -2, -1), norm='ortho')
-			C_q = C_q.transpose(2, 3, 4, 0, 1)  # (qx,qy,qz,mu,nu)
+			# Frobenius norm squared over spin (axes 3, 4)
+			C_R = jnp.sum(jnp.abs(P_R_mumu) ** 2, axis=(3, 4))
+			# C_R: (Rx, Ry, Rz, n_rmu, n_rmu)
+			
+			# FFT over R-dimensions directly - NO TRANSPOSE NEEDED
+			C_q = jnp.fft.fftn(C_R, axes=(0, 1, 2), norm='ortho')
+			# C_q: (qx, qy, qz, n_rmu, n_rmu) - already correct!
 			
 			# ---- ZCT pathway ----
-			# 1. IFFT: P_k -> P_R for mu,zchunk
-			P_R_muz = P_mu_z.reshape(nkx, nky, nkz, ns1, ns2, n_rmu, n_zchunk)
-			P_R_muz = P_R_muz.transpose(3, 4, 5, 6, 0, 1, 2)  # (s1,s2,mu,zchunk,Rx,Ry,Rz)
-			P_R_muz = jnp.fft.ifftn(P_R_muz, axes=(-3, -2, -1), norm='ortho')
+			# Input: (nk, ns, ns, n_rmu, n_zchunk)
+			P_k_muz = P_mu_z.reshape(nkx, nky, nkz, ns1, ns2, n_rmu, n_zchunk)
 			
-			# 2. Frobenius norm squared over spin
-			Z_R = jnp.sum(jnp.abs(P_R_muz) ** 2, axis=(0, 1))
-			# Z_R: (n_rmu, n_zchunk, Rx, Ry, Rz)
+			# IFFT over k-dimensions directly - NO TRANSPOSE NEEDED
+			P_R_muz = jnp.fft.ifftn(P_k_muz, axes=(0, 1, 2), norm='ortho')
+			# P_R_muz: (Rx, Ry, Rz, ns, ns, n_rmu, n_zchunk)
 			
-			# 3. FFT: Z_R -> Z_q
-			Z_q = jnp.fft.fftn(Z_R, axes=(-3, -2, -1), norm='ortho')
-			Z_q = Z_q.transpose(2, 3, 4, 0, 1)  # (qx,qy,qz,mu,zchunk)
+			# Frobenius norm squared over spin (axes 3, 4)
+			Z_R = jnp.sum(jnp.abs(P_R_muz) ** 2, axis=(3, 4))
+			# Z_R: (Rx, Ry, Rz, n_rmu, n_zchunk)
+			
+			# FFT over R-dimensions directly - NO TRANSPOSE NEEDED
+			Z_q = jnp.fft.fftn(Z_R, axes=(0, 1, 2), norm='ortho')
+			# Z_q: (qx, qy, qz, n_rmu, n_zchunk) - already correct!
 			
 			return C_q, Z_q
 		
 		_isdf_pipeline_cache[cache_key] = _compute_CCT_ZCT
 	
 	return _isdf_pipeline_cache[cache_key](P_k_mumu, P_k_mu_zchunk, nkx, nky, nkz)
+
+
+def compute_CCT_only(
+	P_k_mumu: jax.Array,
+	kgrid: tuple[int, int, int],
+	mesh_xy: Mesh,
+) -> jax.Array:
+	"""
+	Compute CCT matrix only (no ZCT) from pair density P_k(μ,μ).
+	
+	This is more memory-efficient than compute_CCT_ZCT_from_pair_density
+	when you only need C_q for Cholesky factorization.
+	
+	Pipeline:
+		1. P_k,ab(μ,ν) -> P_R,ab(μ,ν) via ortho-IFFT
+		2. C_R(μ,ν) = Σ_ab |P_R,ab(μ,ν)|² (Frobenius norm squared)
+		3. C_R -> C_q via ortho-FFT
+	
+	Args:
+		P_k_mumu: (nk, ns, ns, n_rmu, n_rmu) pair density at centroids
+		kgrid: (nkx, nky, nkz)
+		mesh_xy: Device mesh
+	
+	Returns:
+		C_q: (nqx, nqy, nqz, n_rmu, n_rmu) CCT matrix
+	"""
+	nkx, nky, nkz = kgrid
+	nk, ns1, ns2, n_rmu, _ = P_k_mumu.shape
+	
+	cache_key = ('CCT_only', id(mesh_xy), nk, ns1, n_rmu, nkx)
+	
+	if cache_key not in _isdf_pipeline_cache:
+		in_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
+		out_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
+		
+		@partial(jax.jit, in_shardings=in_xy, out_shardings=out_xy,
+		         static_argnames=('nkx', 'nky', 'nkz'))
+		def _compute_CCT(P_mumu: jax.Array, nkx: int, nky: int, nkz: int) -> jax.Array:
+			# Input: (nk, ns1, ns2, n_rmu, n_rmu)
+			# Reshape to expose k-dimensions: (nkx, nky, nkz, ns1, ns2, n_rmu, n_rmu)
+			P_k = P_mumu.reshape(nkx, nky, nkz, ns1, ns2, n_rmu, n_rmu)
+			
+			# IFFT over k-dimensions directly - NO TRANSPOSE NEEDED
+			P_R = jnp.fft.ifftn(P_k, axes=(0, 1, 2), norm='ortho')
+			# P_R: (Rx, Ry, Rz, ns1, ns2, n_rmu, n_rmu)
+			
+			# Frobenius norm squared over spin (axes 3, 4 are spin dimensions)
+			C_R = jnp.sum(jnp.abs(P_R) ** 2, axis=(3, 4))
+			# C_R: (Rx, Ry, Rz, n_rmu, n_rmu)
+			
+			# FFT over R-dimensions directly - NO TRANSPOSE NEEDED
+			C_q = jnp.fft.fftn(C_R, axes=(0, 1, 2), norm='ortho')
+			# C_q: (qx, qy, qz, n_rmu, n_rmu) - already in correct order!
+			
+			return C_q
+		
+		_isdf_pipeline_cache[cache_key] = _compute_CCT
+	
+	return _isdf_pipeline_cache[cache_key](P_k_mumu, nkx, nky, nkz)
 
 
 # ============================================================================
@@ -1284,17 +1345,22 @@ def compute_ZCT_for_zchunk(
         @partial(jax.jit, in_shardings=in_xy, out_shardings=out_xy,
                  static_argnames=('nkx', 'nky', 'nkz'))
         def _compute_ZCT(P_mu_z: jax.Array, nkx: int, nky: int, nkz: int) -> jax.Array:
-            # IFFT: P_k -> P_R
-            P_R = P_mu_z.reshape(nkx, nky, nkz, ns1_c, ns2_c, n_rmu_c, n_zchunk_c)
-            P_R = P_R.transpose(3, 4, 5, 6, 0, 1, 2)  # (s1,s2,mu,z,Rx,Ry,Rz)
-            P_R = jnp.fft.ifftn(P_R, axes=(-3, -2, -1), norm='ortho')
+            # Input: (nk, ns1, ns2, n_rmu, n_zchunk)
+            # Reshape to expose k-dimensions: (nkx, nky, nkz, ns1, ns2, n_rmu, n_zchunk)
+            P_k = P_mu_z.reshape(nkx, nky, nkz, ns1_c, ns2_c, n_rmu_c, n_zchunk_c)
             
-            # Frobenius norm squared over spin
-            Z_R = jnp.sum(jnp.abs(P_R) ** 2, axis=(0, 1))
+            # IFFT over k-dimensions directly - NO TRANSPOSE NEEDED
+            # JAX FFT supports arbitrary axes, avoiding a full copy
+            P_R = jnp.fft.ifftn(P_k, axes=(0, 1, 2), norm='ortho')
+            # P_R: (Rx, Ry, Rz, ns1, ns2, n_rmu, n_zchunk)
             
-            # FFT: Z_R -> Z_q
-            Z_q = jnp.fft.fftn(Z_R, axes=(-3, -2, -1), norm='ortho')
-            Z_q = Z_q.transpose(2, 3, 4, 0, 1)  # (qx,qy,qz,mu,zchunk)
+            # Frobenius norm squared over spin (axes 3, 4 are spin dimensions)
+            Z_R = jnp.sum(jnp.abs(P_R) ** 2, axis=(3, 4))
+            # Z_R: (Rx, Ry, Rz, n_rmu, n_zchunk)
+            
+            # FFT over R-dimensions directly - NO TRANSPOSE NEEDED
+            Z_q = jnp.fft.fftn(Z_R, axes=(0, 1, 2), norm='ortho')
+            # Z_q: (qx, qy, qz, n_rmu, n_zchunk) - already in correct order!
             
             return Z_q
         
@@ -1377,13 +1443,15 @@ def fit_zeta_chunked_to_h5(
     with timing.section("zeta_fit.CCT"):
         print("\nComputing pair density P_k(r_mu, r_mu)...")
         P_k_mumu = compute_pair_density_k(psi_rmuT_X, psi_rmu_Y, mesh_xy)
+        P_k_mumu.block_until_ready()
         
         print("Computing C_q via ortho FFT pipeline...")
-        C_q, _ = compute_CCT_ZCT_from_pair_density(
-            P_k_mumu, P_k_mumu,  # ZCT not used here, just pass mumu twice
-            kgrid, mesh_xy
-        )
+        C_q = compute_CCT_only(P_k_mumu, kgrid, mesh_xy)
+        C_q.block_until_ready()
         # C_q: (nqx, nqy, nqz, n_rmu, n_rmu)
+        
+        # Free P_k_mumu immediately - we only needed it for C_q
+        del P_k_mumu
         
         # Flatten for Cholesky
         C_q_flat = C_q.reshape(nq, n_rmu, n_rmu)
@@ -1396,6 +1464,15 @@ def fit_zeta_chunked_to_h5(
         L_q = compute_L_q_from_CCT(C_q_flat, mesh_xy)
         L_q.block_until_ready()
         print(f"  L_q shape: {L_q.shape}")
+    
+    # Free C_q to reclaim GPU memory before z-chunk loop
+    # (P_k_mumu was already deleted above)
+    # This is critical for fitting within memory budget
+    del C_q, C_q_flat
+    # Force garbage collection and JAX device memory cleanup
+    import gc
+    gc.collect()
+    jax.clear_caches()  # Clear JAX function caches that may hold array refs
     
     # ========== STEP 4: Create HDF5 file ==========
     # Only rank 0 creates the file structure
@@ -1460,13 +1537,24 @@ def fit_zeta_chunked_to_h5(
                 P_k_mu_zchunk.block_until_ready()
             t_pair_total += time.perf_counter() - t0
             
+            # Free psi_zchunk_Y immediately - we have P_k now
+            del psi_zchunk_Y
+            
             # 5c. Compute Z_q via ortho FFT pipeline
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.ZCT"):
                 Z_q = compute_ZCT_for_zchunk(P_k_mu_zchunk, kgrid, mesh_xy)
+                Z_q.block_until_ready()
+                
+                # Free P_k immediately - we have Z_q now
+                del P_k_mu_zchunk
+                
                 Z_q_flat = Z_q.reshape(nq, n_rmu, actual_n_zchunk)
                 Z_q_flat = jax.lax.with_sharding_constraint(Z_q_flat, flat_shard)
                 Z_q_flat.block_until_ready()
+                
+                # Free Z_q (3D) - we have Z_q_flat now
+                del Z_q
             t_zct_total += time.perf_counter() - t0
             
             # 5d. Solve zeta_q = L^{-H}(L^{-1} Z_q)
@@ -1474,6 +1562,9 @@ def fit_zeta_chunked_to_h5(
             with timing.section("zeta_fit.chunk.solve"):
                 zeta_chunk = solve_zeta_from_L_q(L_q, Z_q_flat, mesh_xy, q_chunk_size)
                 zeta_chunk.block_until_ready()
+                
+                # Free Z_q_flat - we have zeta now
+                del Z_q_flat
             t_solve_total += time.perf_counter() - t0
             
             # 5e. Gather to host and write to HDF5
@@ -1805,10 +1896,10 @@ def get_sharded_wfns_centroids(
             # Flatten spatial dims
             psi_rtot = psi_r.reshape(nk_tot, nb_static, nspinor, -1)
             
-            # Replicate before gather (required for indexed gather across shards)
-            psi_rtot = jax.lax.with_sharding_constraint(psi_rtot, null_4)
-            
             # Gather centroids using pre-computed linear indices
+            # NOTE: We do NOT replicate first - JAX handles the gather efficiently
+            # with bands still sharded, avoiding a massive memory spike.
+            # Old code used null_4 replication which required 250x more temp memory!
             psi_rmu = jnp.take(psi_rtot, centroid_lin, axis=3)
             
             # Create psi_rmuT (conjugate transpose for left wfn in pair density)

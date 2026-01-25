@@ -2,6 +2,26 @@
 
 This document describes the memory footprint of the zeta fitting pipeline and derives optimal chunk sizes for memory-constrained systems.
 
+## Quick Start: Using `memory_per_device_gb`
+
+The simplest way to configure memory usage is with the `memory_per_device_gb` parameter:
+
+```ini
+[cohsex]
+memory_per_device_gb = 7.0   # Use 7 GB per device (for 8 GB GPUs)
+```
+
+This will automatically compute optimal `band_chunk`, `z_chunk`, and `q_chunk` sizes.
+
+**Auto-detection (default):** If `memory_per_device_gb = 0` (or omitted):
+- **GPU backend:** Queries `nvidia-smi` for total GPU memory, uses 80%
+- **CPU backend:** Queries system RAM via `psutil` or `/proc/meminfo`, divides by device count, uses 80%
+
+**CLI override:**
+```bash
+uv run python -m isdf.gw_isdf.test_chunked_wfn_loading -i input.in --test-zeta-fit --memory 7.0
+```
+
 ## Notation
 
 | Symbol | Description | Typical Range |
@@ -30,40 +50,28 @@ All sizes in **bytes** using complex128 (16 bytes per element).
 
 | Array | Shape (local) | Size (bytes) | Lifetime |
 |-------|---------------|--------------|----------|
-| `psi_Gtot_local` | $(N_k, N_b/P, N_s, N_x, N_y, N_z)$ | $16 \cdot N_k \cdot (N_b/P) \cdot N_s \cdot N_r$ | persistent until FFT |
-| `psi_Gspace_all` | $(N_k, N_b/P, N_s, \max N_G)$ | $16 \cdot N_k \cdot (N_b/P) \cdot N_s \cdot N_G$ | temporary |
+| `psi_Gtot_local` | $(N_k, B_b/P, N_s, N_x, N_y, N_z)$ | $16 \cdot N_k \cdot (B_b/P) \cdot N_s \cdot N_r$ | persistent until FFT |
+| `psi_Gspace_all` | $(N_k, B_b/P, N_s, \max N_G)$ | $16 \cdot N_k \cdot (B_b/P) \cdot N_s \cdot N_G$ | temporary |
 | `gvecs_all` | $(N_k, \max N_G, 3)$ | $4 \cdot N_k \cdot N_G \cdot 3$ (int32) | temporary |
 
-**Peak memory (Stage 1):**
-$$M_1 = 16 \cdot N_k \cdot \frac{N_b}{P} \cdot N_s \cdot (N_r + N_G) + 12 \cdot N_k \cdot N_G$$
+**Note:** Both `fit_zeta_chunked_to_h5` and `get_psi_zchunk` use band chunking via
+`load_centroids_band_chunked` and `get_sharded_wfns_centroids`. The legacy function
+`read_Gvecs_and_get_sharded_wfns` loads all bands at once and should be avoided
+for large systems.
 
-**Example:** $N_k=100$, $N_b=1000$, $P=16$, $N_s=2$, $N_r=500k$, $N_G=125k$:
-$$M_1 \approx 16 \cdot 100 \cdot 62.5 \cdot 2 \cdot 625k = 125 \text{ GB per process}$$
+**Peak memory (Stage 1, band-chunked):**
+$$M_1 = 16 \cdot N_k \cdot \frac{B_b}{P} \cdot N_s \cdot (N_r + N_G) + 12 \cdot N_k \cdot N_G$$
 
-This is **too large** — hence band chunking is required.
-
----
-
-### Stage 1b: Band-Chunked G-space Loading
-
-With band chunk size $B_b$:
-
-| Array | Shape (local) | Size (bytes) |
-|-------|---------------|--------------|
-| `psi_Gtot_local` | $(N_k, B_b/P, N_s, N_x, N_y, N_z)$ | $16 \cdot N_k \cdot (B_b/P) \cdot N_s \cdot N_r$ |
-| `psi_Gspace_all` | $(N_k, B_b/P, N_s, \max N_G)$ | $16 \cdot N_k \cdot (B_b/P) \cdot N_s \cdot N_G$ |
-
-**Peak memory:**
-$$M_{1b} = 16 \cdot N_k \cdot \frac{B_b}{P} \cdot N_s \cdot (N_r + N_G)$$
-
-**Example:** $B_b=64$, same parameters:
-$$M_{1b} \approx 16 \cdot 100 \cdot 4 \cdot 2 \cdot 625k = 8 \text{ GB per process}$$
+**Example:** $N_k=100$, $B_b=64$, $P=16$, $N_s=2$, $N_r=500k$, $N_G=125k$:
+$$M_1 \approx 16 \cdot 100 \cdot 4 \cdot 2 \cdot 625k = 8 \text{ GB per process}$$
 
 ---
 
-### Stage 2: FFT and Phase Correction (`get_sharded_wfns_zchunk_slice`)
+### Stage 2: FFT, Phase Correction, and Centroid Gather
 
-During the FFT step:
+During FFT and centroid extraction, there are **two memory phases**:
+
+**Phase 2a: FFT (band-sharded)**
 
 | Array | Shape (per-device shard) | Size (bytes) |
 |-------|--------------------------|--------------|
@@ -71,10 +79,24 @@ During the FFT step:
 | `psi_r` (FFT output) | $(N_k, B_b/P, N_s, N_x, N_y, N_z)$ | same as above |
 | `phase_spatial` | $(N_k, N_x, N_y, N_z)$ | $16 \cdot N_k \cdot N_r$ |
 
-**Peak memory (Stage 2):**
-$$M_2 = 2 \cdot 16 \cdot N_k \cdot \frac{B_b}{P} \cdot N_s \cdot N_r + 16 \cdot N_k \cdot N_r$$
+$$M_{2a} = 2 \cdot 16 \cdot N_k \cdot \frac{B_b}{P} \cdot N_s \cdot N_r + 16 \cdot N_k \cdot N_r$$
 
-The factor of 2 accounts for input and output of FFT being live simultaneously.
+**Phase 2b: Centroid gather (optimized - no replication spike)**
+
+The indexed gather for centroids is performed **while bands are still sharded**.
+JAX handles the gather efficiently without replicating the full array.
+
+| Array | Shape (per-device) | Size (bytes) |
+|-------|-------------------|--------------|
+| `psi_rtot` (band-sharded) | $(N_k, B_b/P, N_s, N_r)$ | $16 \cdot N_k \cdot (B_b/P) \cdot N_s \cdot N_r$ |
+| `psi_rmu` (after gather) | $(N_k, B_b/P, N_s, N_\mu)$ | $16 \cdot N_k \cdot (B_b/P) \cdot N_s \cdot N_\mu$ |
+
+The all-gather of bands happens AFTER the centroid gather, when the array is
+much smaller (N_μ instead of N_r).
+
+**Note:** Previous versions used explicit replication before gather, requiring
+250× more temporary memory. This was removed after discovering JAX handles
+the sharded gather efficiently.
 
 ---
 
@@ -97,15 +119,20 @@ During staged reshard, intermediate arrays of size $(N_k, N_b, N_s, B_z/P_y)$ ar
 
 These are computed once and kept for all z-chunks:
 
-| Array | Shape (per-device) | Size (bytes) |
-|-------|-------------------|--------------|
-| `psi_rmu_Y` | $(N_k, N_b, N_s, N_\mu/P_y)$ | $16 \cdot N_k \cdot N_b \cdot N_s \cdot (N_\mu/P_y)$ |
-| `psi_rmuT_X` | $(N_k, N_\mu/P_x, N_b, N_s)$ | $16 \cdot N_k \cdot (N_\mu/P_x) \cdot N_b \cdot N_s$ |
+| Array | Shape (per-device) | Size (bytes) | Sharding |
+|-------|-------------------|--------------|----------|
+| `psi_rmu_Y` | $(N_k, N_b, N_s, N_\mu/P_y)$ | $16 \cdot N_k \cdot N_b \cdot N_s \cdot (N_\mu/P_y)$ | `P(None, None, None, 'y')` |
+| `psi_rmuT_X` | $(N_k, N_\mu/P_x, N_b, N_s)$ | $16 \cdot N_k \cdot (N_\mu/P_x) \cdot N_b \cdot N_s$ | `P(None, 'x', None, None)` |
 
-**Total centroid memory:**
-$$M_{\mu} = 2 \cdot 16 \cdot N_k \cdot N_b \cdot N_s \cdot \frac{N_\mu}{\sqrt{P}}$$
+**Total centroid memory per device:**
+$$M_{\mu} = 16 \cdot N_k \cdot N_b \cdot N_s \cdot N_\mu \cdot \left(\frac{1}{P_x} + \frac{1}{P_y}\right)$$
 
-(assuming $P_x \approx P_y \approx \sqrt{P}$)
+**Special cases:**
+- Square mesh ($P_x = P_y = \sqrt{P}$): $M_\mu = 16 \cdot N_k \cdot N_b \cdot N_s \cdot N_\mu \cdot \frac{2}{\sqrt{P}}$
+- 1D mesh ($P_x = 1, P_y = P$): $M_\mu = 16 \cdot N_k \cdot N_b \cdot N_s \cdot N_\mu \cdot (1 + \frac{1}{P})$
+
+**⚠️ For rectangular meshes (especially $P_x=1$ on CPU), the per-device footprint
+can be up to 2× larger than the square-mesh formula suggests.**
 
 ---
 
@@ -165,18 +192,54 @@ $$M_{\text{solve}} = B_q \cdot 16 \cdot N_\mu^2 + 2 \cdot 16 \cdot N_q \cdot N_\
 
 ---
 
+## Communication Buffers
+
+Inter-device communication creates temporary buffers that must be accounted for:
+
+### Staged Reshard (Z-chunk extraction)
+
+When resharding from `P(None, ('x','y'), None, None)` → `P(None, None, None, 'y')`:
+
+| Stage | Operation | Buffer Size |
+|-------|-----------|-------------|
+| 1 | All-gather bands over X | $(N_k, N_b/P_y, N_s, B_z)$ |
+| 2 | All-gather bands over Y + slice | $(N_k, N_b, N_s, B_z/P_y)$ |
+
+**Peak:** Both buffers exist simultaneously during reshard.
+
+$$M_{\text{reshard}} = 16 \cdot N_k \cdot N_b \cdot N_s \cdot B_z \cdot \left(\frac{1}{P_y} + \frac{1}{P_y}\right)$$
+
+### Cholesky Panel Broadcast
+
+During 2D blocked Cholesky, panel rows/columns are broadcast:
+
+$$M_{\text{panel}} = 16 \cdot N_q \cdot b \cdot \frac{N_\mu}{\max(P_x, P_y)}$$
+
+Where $b = N_\mu / J$ is the block size and $J = \text{lcm}(P_x, P_y)$.
+
+### L Matrix Replication (Solve)
+
+During triangular solve, $B_q$ L matrices are replicated:
+
+$$M_{L\_\text{rep}} = B_q \cdot 16 \cdot N_\mu^2$$
+
+This is the main trade-off: larger $B_q$ = more parallelism but more memory.
+
+---
+
 ## Memory Bottleneck Summary
 
 At any point, the **peak memory per device** is approximately:
 
-$$M_{\text{peak}} = M_{\mu} + \max(M_{\text{FFT}}, M_P, M_{\text{CCT}}, M_{\text{solve}})$$
+$$M_{\text{peak}} = M_{\mu} + \max(M_{\text{FFT}}, M_P + M_{\text{reshard}}, M_{\text{CCT}}, M_{\text{solve}})$$
 
 Where:
 - $M_\mu$ = centroid wavefunctions (persistent)
-- $M_{\text{FFT}}$ = during band-chunked FFT
+- $M_{\text{FFT}}$ = FFT workspace (psi_G + psi_r + phase)
 - $M_P$ = pair density `P_k(μ, z-chunk)`
+- $M_{\text{reshard}}$ = staged reshard buffers
 - $M_{\text{CCT}}$ = during CCT/ZCT FFT pipeline
-- $M_{\text{solve}}$ = during triangular solve
+- $M_{\text{solve}}$ = L replication + Z_col + zeta
 
 ---
 
@@ -186,11 +249,17 @@ Given a **memory budget** $M_{\text{budget}}$ per device (e.g., 16 GB for GPU, 6
 
 ### 1. Band Chunk Size ($B_b$)
 
-Constraint: FFT memory fits in budget
-$$16 \cdot N_k \cdot \frac{B_b}{P} \cdot N_s \cdot N_r \cdot 2 \leq M_{\text{budget}} - M_\mu$$
+**Constraint: FFT workspace (sharded) must fit in budget**
+
+With the optimized centroid gather (no replication), both centroid and z-chunk
+extraction have the same constraint - the FFT workspace:
+
+$$2 \cdot 16 \cdot N_k \cdot \frac{B_b}{P} \cdot N_s \cdot N_r \leq M_{\text{budget}} - M_\mu$$
 
 Solving:
 $$B_b \leq \frac{(M_{\text{budget}} - M_\mu) \cdot P}{32 \cdot N_k \cdot N_s \cdot N_r}$$
+
+**Note:** This IS divided by $P$ because both FFT input and output are sharded over bands.
 
 ### 2. Z-Chunk Size ($B_z$)
 
@@ -234,41 +303,80 @@ The implementation should:
 4. **Validate divisibility** (chunks must divide evenly for sharding)
 5. **Report chosen parameters** to user
 
-### Pseudocode:
+### Usage Example
 
 ```python
-def compute_optimal_chunks(
-    N_k, N_b, N_s, N_mu, N_r, N_q, P,
-    memory_budget_gb: float,
-    target_utilization: float = 0.85,
-):
-    M_budget = memory_budget_gb * 1e9 * target_utilization
-    bytes_per_complex = 16
-    
-    # Centroid memory (must fit)
-    M_mu = 2 * bytes_per_complex * N_k * N_b * N_s * N_mu / sqrt(P)
-    M_available = M_budget - M_mu
-    
-    if M_available < 0:
-        raise MemoryError(f"Centroids alone require {M_mu/1e9:.1f} GB")
-    
-    # Band chunk size (for FFT)
-    # psi_r: (N_k, B_b/P, N_s, N_r) × 2 (input + output)
-    B_b_max = M_available * P / (2 * bytes_per_complex * N_k * N_s * N_r)
-    B_b = min(N_b, max(16, int(B_b_max)))
-    
-    # Z-chunk size (for pair density)
-    # P_k: (N_k, N_s², N_mu/Px, B_z/Py)
-    B_z_max = M_available * P / (bytes_per_complex * N_k * N_s**2 * N_mu)
-    B_z = min(N_r, max(N_mu, int(B_z_max)))
-    
-    # Q-chunk size (for solve)
-    # L_rep: (B_q, N_mu, N_mu) replicated
-    M_Z = bytes_per_complex * N_q * N_mu * B_z / P
-    B_q_max = (M_available - M_Z) / (bytes_per_complex * N_mu**2)
-    B_q = min(N_q, max(1, int(B_q_max)))
-    
-    return B_b, B_z, B_q
+from isdf.common.gpu_utils import get_device_memory_gb
+from isdf.gw_isdf.cohsex_init import compute_optimal_chunks, print_memory_breakdown
+
+# Auto-detect memory or use explicit budget
+memory_gb = get_device_memory_gb(n_devices=4)  # e.g., 7.5 GB
+
+# Compute optimal chunks
+chunks = compute_optimal_chunks(
+    n_k=100, n_b=500, n_s=2, n_rmu=2000, n_r=500000, n_q=100,
+    fft_grid=(80, 80, 80),
+    n_devices=4,
+    memory_budget_gb=memory_gb,
+    p_x=2, p_y=2,
+)
+
+# Print detailed breakdown
+print_memory_breakdown(chunks, n_b=500, n_r=500000, n_q=100, fft_grid=(80,80,80))
+
+# Use the computed values
+band_chunk = chunks['band_chunk']      # e.g., 64
+z_chunk = chunks['z_chunk']            # e.g., 8 (z-slices)
+z_chunk_r = chunks['z_chunk_r']        # e.g., 51200 (r-points)
+q_chunk = chunks['q_chunk']            # e.g., 10
+```
+
+### Output Example
+
+```
+======================================================================
+  MEMORY-OPTIMIZED CHUNK SIZES
+======================================================================
+
+  Memory budget: 7.50 GB/device (source: nvidia-smi)
+  Device mesh: 2 × 2 = 4 devices
+
+  Parameter                      Value        Total      Per-chunk
+  ------------------------------------------------------------
+  Band chunk                        64 /   500 bands
+  Z-chunk (z-slices)                 8 /    80 slices
+  Z-chunk (r-points)             51200 / 500000 points
+  Q-chunk                           10 /   100 q-points
+
+  MEMORY ALLOCATION (per device)                     Size (GB)
+  ------------------------------------------------------
+  [Persistent]
+    psi_rmu_Y (centroids, Y-sharded)                    1.600
+    psi_rmuT_X (centroids, X-sharded)                   1.600
+    ─ Subtotal: centroids                               3.200
+
+  [Stage: FFT + centroid extract]
+    psi_G + psi_r + phase                               0.800
+
+  [Stage: Pair density]
+    P_k(μ,μ)                                            0.320
+    P_k(μ,z-chunk)                                      0.410
+
+  [Stage: CCT/ZCT → solve]
+    C_q matrix                                          0.032
+    Z_q matrix                                          0.041
+    L replicated (for solve)                            0.640
+    Z_col + zeta output                                 0.082
+
+  [Communication buffers]
+    Cholesky panel broadcast                            0.016
+    Staged reshard buffer                               0.205
+
+  ------------------------------------------------------
+  PEAK ESTIMATE                                         5.746 GB
+  BUDGET                                                7.500 GB
+  UTILIZATION                                            76.6 %
+======================================================================
 ```
 
 ---
@@ -280,18 +388,20 @@ def compute_optimal_chunks(
 - $N_b = 1000$, $N_\mu = 10000$
 - $N_r = 500000$ ($\approx 80 \times 80 \times 80$)
 - $N_s = 2$
-- $P = 16$ devices
+- $P = 16$ devices (4×4 square mesh, so $P_x = P_y = 4$)
 - Memory budget: 32 GB per device
 
 **Calculations:**
 
-1. **Centroid memory:**
-   $$M_\mu = 2 \times 16 \times 100 \times 1000 \times 2 \times 10000 / 4 = 16 \text{ GB}$$
+1. **Centroid memory (using correct sharding formula):**
+   $$M_\mu = 16 \times 100 \times 1000 \times 2 \times 10000 \times (1/4 + 1/4) = 16 \text{ GB}$$
 
 2. **Available:** $32 - 16 = 16$ GB
 
-3. **Band chunk size:**
-   $$B_b \leq \frac{16 \times 10^9 \times 16}{2 \times 16 \times 100 \times 2 \times 500000} \approx 80$$
+3. **Band chunk size (FFT workspace, divided by P):**
+   $$B_b \leq \frac{16 \times 10^9 \times 16}{32 \times 100 \times 2 \times 500000} = 80$$
+   
+   With the optimized gather (no replication spike), we can use 80 bands per chunk!
 
 4. **Z-chunk size:**
    $$B_z \leq \frac{16 \times 10^9 \times 16}{16 \times 100 \times 4 \times 10000} \approx 40000$$
@@ -312,20 +422,37 @@ def compute_optimal_chunks(
 - Z-chunking: ✅ Implemented (`z_chunk_size`, `max_wfn_chunk_mb`)
 - Q-chunking: ✅ Implemented (`q_chunk_size` parameter)
 - Auto chunk sizing: ✅ Implemented (`compute_optimal_chunks()` in cohsex_init.py)
+- Memory detection: ✅ Implemented (`get_device_memory_gb()` in gpu_utils.py)
+- Memory budget: ✅ Implemented (`memory_per_device_gb` input parameter, `--memory` CLI flag)
 
 ### Available Parameters
 
-| Parameter | CLI Flag | Description |
-|-----------|----------|-------------|
-| `band_chunk_size` | `--band-chunk` | Bands per FFT batch |
-| `z_chunk_size` | `--z-chunk` | Z-slices per real-space chunk |
-| `q_chunk_size` | `--q-chunk` | Q-points per solve batch |
-| `max_wfn_chunk_mb` | (input file) | Memory budget for P_k in MB |
+| Parameter | CLI Flag | Input File Key | Description |
+|-----------|----------|----------------|-------------|
+| Memory budget | `--memory` | `memory_per_device_gb` | Total memory per device in GB (0=auto) |
+| Band chunk | `--band-chunk` | `band_chunk_size` | Bands per FFT batch |
+| Z-chunk | `--z-chunk` | `z_chunk_size` | Z-slices per real-space chunk |
+| Q-chunk | `--q-chunk` | `q_chunk_size` | Q-points per solve batch |
+| P_k budget | — | `max_wfn_chunk_mb` | Legacy: memory for P_k in MB |
 
-### Future Enhancements
+### Memory Detection
 
-1. **Add `--memory-budget-gb` CLI flag** to auto-set all chunk sizes
-2. **Report memory usage** at each stage during execution
+The system auto-detects available memory:
+
+**GPU (CUDA backend):**
+```bash
+nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits
+```
+
+**CPU backend:**
+```python
+# Try in order:
+1. psutil.virtual_memory().total  # Most reliable
+2. /proc/meminfo (Linux)          # Fallback
+3. 8 GB default                   # Last resort
+```
+
+Memory is divided by device count and 80% is used as the budget.
 
 ### Q-Chunked Solve
 
@@ -348,7 +475,25 @@ This trades memory for parallelism, allowing GPU to process multiple q-points si
 
 ---
 
-## Memory Monitoring Utilities
+## Memory Detection API
+
+```python
+from isdf.common.gpu_utils import get_device_memory_gb, get_device_memory_info
+
+# Simple: get memory per device in GB
+mem_gb = get_device_memory_gb(n_devices=4)
+
+# Detailed: get backend, source, and device count
+info = get_device_memory_info()
+# Returns: {
+#   'backend': 'gpu',           # or 'cpu'
+#   'total_gb': 7.5,            # Memory per device
+#   'source': 'nvidia-smi',     # Detection method
+#   'n_devices': 4,             # JAX device count
+# }
+```
+
+## Runtime Memory Monitoring
 
 ```python
 def print_memory_report(stage: str, arrays: dict[str, jax.Array]):

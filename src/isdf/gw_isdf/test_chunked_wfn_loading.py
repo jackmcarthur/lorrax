@@ -38,7 +38,13 @@ from ..common.load_wfns import (
     fit_zeta_chunked_to_h5,
 )
 from ..common import Meta, timing
-from .cohsex_init import read_cohsex_input, get_effective_z_chunk_size
+from ..common.gpu_utils import get_device_memory_gb, get_device_memory_info
+from .cohsex_init import (
+    read_cohsex_input, 
+    get_effective_z_chunk_size, 
+    compute_optimal_chunks,
+    print_memory_breakdown,
+)
 
 
 def print_sharding_info(name: str, arr: jax.Array):
@@ -758,9 +764,11 @@ def main(argv=None):
     argp.add_argument("-i", "--input", default="cohsex_test.in", help="Input file")
     argp.add_argument("--z-chunk", type=int, default=None, 
                       help="Z-axis chunk size (overrides input file; 0=auto)")
-    argp.add_argument("--band-chunk", type=int, default=16, help="Band chunk size")
+    argp.add_argument("--band-chunk", type=int, default=None, help="Band chunk size (overrides auto)")
     argp.add_argument("--q-chunk", type=int, default=None, 
                       help="Q-points to solve simultaneously (default=all, reduce for memory)")
+    argp.add_argument("--memory", type=float, default=None,
+                      help="Memory budget per device in GB (default: auto-detect)")
     argp.add_argument("--save-ref", action="store_true", help="Save reference arrays to h5")
     argp.add_argument("--test-chunked", action="store_true", help="Test chunked implementation")
     argp.add_argument("--test-fft-only", action="store_true", help="Only test custom FFT sharding")
@@ -825,19 +833,31 @@ def main(argv=None):
     # Create Meta object
     meta = Meta.from_system(wfn, sym, nval, ncond, nband, n_rmu, bispinor)
     
-    # Compute effective z_chunk_size
-    # Priority: max_wfn_chunk_mb > CLI arg > input file z_chunk_size > auto (0)
-    z_chunk_input = args.z_chunk if args.z_chunk is not None else params.get("z_chunk_size", 0)
-    max_wfn_chunk_mb = params.get("max_wfn_chunk_mb", 0.0)
-    # Get mesh Y dimension for divisibility constraint
+    # =========================================================================
+    # MEMORY DETECTION AND OPTIMAL CHUNK SIZING
+    # =========================================================================
+    # Priority for memory budget:
+    # 1. --memory CLI arg
+    # 2. memory_per_device_gb from input file
+    # 3. auto-detect (80% of GPU/CPU memory)
+    
+    memory_info = get_device_memory_info()
+    memory_source = memory_info['source']
+    
+    if args.memory is not None:
+        memory_budget_gb = args.memory
+        memory_source = f"CLI --memory={args.memory}"
+    elif params.get("memory_per_device_gb", 0.0) > 0:
+        memory_budget_gb = params["memory_per_device_gb"]
+        memory_source = f"input file (memory_per_device_gb={memory_budget_gb})"
+    else:
+        memory_budget_gb = memory_info['total_gb']
+        memory_source = f"auto-detect ({memory_info['source']})"
+    
+    # Get mesh dimensions
+    mesh_x_size = mesh_xy.devices.shape[0] if len(mesh_xy.devices.shape) > 0 else 1
     mesh_y_size = mesh_xy.devices.shape[1] if len(mesh_xy.devices.shape) > 1 else 1
-    z_chunk_size = get_effective_z_chunk_size(
-        z_chunk_input, meta.fft_grid, n_rmu, 
-        mesh_y_size=mesh_y_size,
-        max_wfn_chunk_mb=max_wfn_chunk_mb,
-        nk_tot=meta.nk_tot,
-        nspinor=meta.nspinor,
-    )
+    n_devices = jax.device_count()
     
     # Print system info
     print(f"\nSystem info:")
@@ -848,25 +868,84 @@ def main(argv=None):
     print(f"  nspinor: {meta.nspinor}")
     print(f"  Band edges: b0={meta.b_id_0}, b1={meta.b_id_1}, b2={meta.b_id_2}, b3={meta.b_id_3}, b4={meta.b_id_4}")
     
-    # Print z_chunk info
+    # Compute optimal chunk sizes from memory budget
     nx, ny, nz = meta.fft_grid
-    n_zchunk = nx * ny * z_chunk_size
-    # Compute actual memory for P_k chunk
-    pk_chunk_bytes = meta.nk_tot * meta.nspinor * meta.nspinor * n_rmu * n_zchunk * 16
-    pk_chunk_mb = pk_chunk_bytes / 1e6
+    nqx, nqy, nqz = meta.kgrid
+    n_q = nqx * nqy * nqz
+    n_b = meta.b_id_3 - meta.b_id_0  # bands in sigma window
     
-    print(f"\nZ-chunk configuration:")
-    z_source = "auto"
-    if max_wfn_chunk_mb > 0:
-        z_source = f"max_wfn_chunk_mb={max_wfn_chunk_mb}"
-    elif z_chunk_input > 0:
-        z_source = f"explicit={z_chunk_input}"
-    print(f"  z_chunk_size: {z_chunk_size} z-slices (source: {z_source})")
-    print(f"  n_zchunk: {n_zchunk} = {nx}×{ny}×{z_chunk_size}")
-    print(f"  P_k(rmu, rchunk) size: {pk_chunk_mb:.1f} MB")
-    print(f"  Target: 16×n_rmu = {16*n_rmu}")
-    print(f"  Ratio n_zchunk/n_rmu: {n_zchunk/n_rmu:.2f}x")
-    print(f"  Num z-chunks to cover full grid: {(nz + z_chunk_size - 1) // z_chunk_size}")
+    try:
+        chunks = compute_optimal_chunks(
+            n_k=meta.nk_tot,
+            n_b=n_b,
+            n_s=meta.nspinor,
+            n_rmu=n_rmu,
+            n_r=meta.n_rtot,
+            n_q=n_q,
+            fft_grid=meta.fft_grid,
+            n_devices=n_devices,
+            memory_budget_gb=memory_budget_gb,
+            target_utilization=0.85,
+            p_x=mesh_x_size,
+            p_y=mesh_y_size,
+            verbose=True,
+        )
+        
+        # Print memory breakdown
+        print_memory_breakdown(
+            chunks, n_b, meta.n_rtot, n_q, meta.fft_grid,
+            memory_source=memory_source
+        )
+        
+        # Use computed chunks, but allow CLI overrides
+        band_chunk_size = args.band_chunk if args.band_chunk is not None else chunks['band_chunk']
+        z_chunk_size = args.z_chunk if args.z_chunk is not None else chunks['z_chunk']
+        q_chunk_size = args.q_chunk if args.q_chunk is not None else chunks['q_chunk']
+        
+        if args.band_chunk or args.z_chunk or args.q_chunk:
+            print(f"\n  CLI overrides applied:")
+            if args.band_chunk:
+                print(f"    --band-chunk={args.band_chunk} (was {chunks['band_chunk']})")
+            if args.z_chunk:
+                print(f"    --z-chunk={args.z_chunk} (was {chunks['z_chunk']})")
+            if args.q_chunk:
+                print(f"    --q-chunk={args.q_chunk} (was {chunks['q_chunk']})")
+        
+    except ValueError as e:
+        print(f"\nWARNING: Memory auto-sizing failed: {e}")
+        print("Using fallback chunk sizes...")
+        
+        # Fallback to legacy z_chunk_size computation
+        z_chunk_input = args.z_chunk if args.z_chunk is not None else params.get("z_chunk_size", 0)
+        max_wfn_chunk_mb = params.get("max_wfn_chunk_mb", 0.0)
+        z_chunk_size = get_effective_z_chunk_size(
+            z_chunk_input, meta.fft_grid, n_rmu, 
+            mesh_y_size=mesh_y_size,
+            max_wfn_chunk_mb=max_wfn_chunk_mb,
+            nk_tot=meta.nk_tot,
+            nspinor=meta.nspinor,
+        )
+        band_chunk_size = args.band_chunk if args.band_chunk is not None else 16
+        q_chunk_size = args.q_chunk if args.q_chunk is not None else n_q
+        
+        # Print legacy z_chunk info
+        n_zchunk = nx * ny * z_chunk_size
+        pk_chunk_bytes = meta.nk_tot * meta.nspinor * meta.nspinor * n_rmu * n_zchunk * 16
+        pk_chunk_mb = pk_chunk_bytes / 1e6
+        
+        print(f"\nFallback chunk configuration:")
+        print(f"  z_chunk_size: {z_chunk_size} z-slices")
+        print(f"  n_zchunk: {n_zchunk} = {nx}×{ny}×{z_chunk_size}")
+        print(f"  P_k(rmu, rchunk) size: {pk_chunk_mb:.1f} MB")
+        print(f"  band_chunk_size: {band_chunk_size}")
+        print(f"  q_chunk_size: {q_chunk_size}")
+    
+    # Summary of final chunk sizes
+    print(f"\n  Final chunk sizes:")
+    print(f"    band_chunk_size = {band_chunk_size}")
+    print(f"    z_chunk_size = {z_chunk_size}")
+    print(f"    q_chunk_size = {q_chunk_size}")
+    print(f"    Num z-chunks to cover full grid: {(nz + z_chunk_size - 1) // z_chunk_size}")
     
     # Test with a small band range first
     b0, b1, b2, b3, b4 = meta.band_edges
@@ -885,15 +964,14 @@ def main(argv=None):
         print(f"\n{'='*60}")
         print("RUNNING FULL ZETA FITTING PIPELINE")
         print(f"{'='*60}")
-        # Q-chunk size: default to nq (batch all), can be reduced for memory
-        nqx, nqy, nqz = meta.kgrid
-        nq = nqx * nqy * nqz
-        q_chunk_size = args.q_chunk if args.q_chunk is not None else nq
-        print(f"Q-chunk size: {q_chunk_size} (of {nq} total)")
+        print(f"  Using memory-optimized chunk sizes:")
+        print(f"    band_chunk = {band_chunk_size}")
+        print(f"    z_chunk = {z_chunk_size}")
+        print(f"    q_chunk = {q_chunk_size}")
         with mesh_xy:
             fit_zeta_chunked_to_h5(
                 wfn, sym, meta, centroid_indices, mesh_xy,
-                z_chunk_size, output_path, args.band_chunk, q_chunk_size, bispinor
+                z_chunk_size, output_path, band_chunk_size, q_chunk_size, bispinor
             )
         
         # Verify output
@@ -932,7 +1010,7 @@ def main(argv=None):
     if args.test_chunked:
         psi_rmu_chunked, psi_rmuT_chunked = test_chunked_loading(
             wfn, sym, meta, centroid_indices, bispinor, mesh_xy,
-            test_band_range, z_chunk_size, args.band_chunk,
+            test_band_range, z_chunk_size, band_chunk_size,
             ref_psi_rmu=psi_rmu_Y, ref_psi_rmuT=psi_rmuT_X
         )
     
