@@ -1,35 +1,18 @@
 #!/usr/bin/env python3
 """
-Test script for memory-efficient chunked wavefunction loading.
+Test script for chunked zeta fitting pipeline.
+See ZETA_FITTING_ALGORITHM.md for algorithm details.
 
-Validates wavefunction loading produces correct physics:
-- psi_rmuT is conjugate transpose of psi_rmu
-- Spinor components sum to unity per band
-- Results are reproducible across runs
-- Multi-device CPU and GPU backends work via shard_map FFT
-
-Run with 4 CPU devices for testing:
+Usage:
     XLA_FLAGS='--xla_force_host_platform_device_count=4' JAX_PLATFORMS=cpu \
-    uv run python -m isdf.gw_isdf.test_chunked_wfn_loading -i cohsex_test.in
-
-Run on GPU:
-    JAX_PLATFORMS=cuda,cpu uv run python -m isdf.gw_isdf.test_chunked_wfn_loading -i cohsex_test.in
-
-Test modes:
-    --test-fft-only     : Test shard_map FFT implementation
-    --test-sharding-only: Test sharding logic with mock data (no FFT)
-    --test-chunked      : Test chunked loading against reference
-
-Outputs:
-- psi_nk(r_μ)_Y:  shape (nk, nb, ns, n_rmu), sharding P(None, None, None, 'y')
-- psi_nk(r_μ)T_X: shape (nk, n_rmu, nb, ns), sharding P(None, 'x', None, None)  
-- psi_nk(r_zchunk)_Y: shape (nk, nb, ns, nx*ny*z_chunk), sharding P(None, None, None, 'y')
+    uv run python -m isdf.gw_isdf.test_chunked_wfn_loading -i input.in --test-zeta-fit
 """
 import os
 
 # JAX environment setup - must be before jax import
 os.environ.setdefault("JAX_ENABLE_X64", "1")
-os.environ.setdefault("JAX_PLATFORMS", "cpu")  # Force CPU for laptop testing
+# Don't set JAX_PLATFORMS - let JAX auto-detect GPU, fall back to CPU
+# To force CPU for testing: JAX_PLATFORMS=cpu uv run ...
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import argparse
@@ -42,9 +25,20 @@ from functools import partial
 # Project imports
 from ..io import WFNReader, load_centroids, resolve_input_paths
 from ..common import symmetry_maps
-from ..common.load_wfns import read_Gvecs_to_devices, get_sharded_wfns
+from ..common.load_wfns import (
+    read_Gvecs_to_devices, 
+    get_sharded_wfns,
+    compute_pair_density_k,
+    compute_pair_density_k_zchunk,
+    pair_density_k_to_R,
+    pair_density_R_to_q,
+    compute_CCT_ZCT_from_pair_density,
+    solve_zeta_q_from_CCT_ZCT,
+    solve_zeta_q_blocked_2d,
+    fit_zeta_chunked_to_h5,
+)
 from ..common import Meta, timing
-from .cohsex_init import read_cohsex_input
+from .cohsex_init import read_cohsex_input, get_effective_z_chunk_size
 
 
 def print_sharding_info(name: str, arr: jax.Array):
@@ -158,15 +152,295 @@ def extract_z_chunk(psi_rtot: jax.Array, fft_grid: tuple, z_start: int, z_chunk_
     return psi_zchunk
 
 
-def test_current_loading(wfn, sym, meta, centroid_indices, bispinor, mesh_xy, band_range, z_chunk_size=16):
-    """
-    Test the current loading method and extract the three target arrays.
+def test_pair_density(psi_rmuT_X, psi_rmu_Y, psi_zchunk_Y, mesh_xy):
+    """Test P_k,ab(μ,ν) = Σ_n ψ*_nka(μ)·ψ_nkb(ν). See ZETA_FITTING_ALGORITHM.md."""
+    print("\n" + "="*60)
+    print("TEST: Pair Density Computation")
+    print("="*60)
     
-    Target outputs (with nk index):
-    - psi_nk(r_μ)_Y:      shape (nk, nb, ns, n_rmu), sharded P(None, None, None, 'y')
-    - psi_nk(r_μ)T_X:     shape (nk, n_rmu, nb, ns), sharded P(None, 'x', None, None)
-    - psi_nk(r_zchunk)_Y: shape (nk, nb, ns, nx*ny*z_chunk), sharded P(None, None, None, 'y')
-    """
+    nk, n_rmu, nb, ns = psi_rmuT_X.shape
+    _, _, _, n_zchunk = psi_zchunk_Y.shape
+    
+    print(f"\nInput shapes:")
+    print(f"  psi_rmuT_X: {psi_rmuT_X.shape} - conj(psi_nk,s(r_mu)) with mu on X")
+    print(f"  psi_rmu_Y:  {psi_rmu_Y.shape} - psi_nk,s(r_nu) with nu on Y")
+    print(f"  psi_zchunk_Y: {psi_zchunk_Y.shape} - psi_nk,s(r_zchunk) with zchunk on Y")
+    
+    # Test 1: P_k,ab(r_mu, r_nu) for centroids
+    print("\n--- Test 1: P_k,ab(r_mu, r_nu) for centroids ---")
+    with timing.section("pair_density.rmu_rmu"):
+        P_k_ab = compute_pair_density_k(psi_rmuT_X, psi_rmu_Y, mesh_xy)
+        P_k_ab.block_until_ready()
+    
+    expected_shape = (nk, ns, ns, n_rmu, n_rmu)
+    print(f"  Output shape: {P_k_ab.shape} (expected {expected_shape})")
+    assert P_k_ab.shape == expected_shape, f"Shape mismatch: {P_k_ab.shape} != {expected_shape}"
+    
+    print_sharding_info("  P_k,ab(r_mu, r_nu)", P_k_ab)
+    
+    # Check sharding is correct
+    if hasattr(P_k_ab.sharding, 'spec'):
+        spec = P_k_ab.sharding.spec
+        print(f"  Expected sharding: P(None, None, None, 'x', 'y')")
+        # The output should have mu on x, nu on y
+        assert spec[3] in ('x', ('x',)), f"mu should be on 'x', got {spec[3]}"
+        assert spec[4] in ('y', ('y',)), f"nu should be on 'y', got {spec[4]}"
+    
+    # Test 2: P_k,ab(r_mu, r_zchunk) for ZCT accumulation
+    print("\n--- Test 2: P_k,ab(r_mu, r_zchunk) for ZCT ---")
+    with timing.section("pair_density.rmu_zchunk"):
+        P_k_ab_zchunk = compute_pair_density_k_zchunk(psi_rmuT_X, psi_zchunk_Y, mesh_xy)
+        P_k_ab_zchunk.block_until_ready()
+    
+    expected_shape_zchunk = (nk, ns, ns, n_rmu, n_zchunk)
+    print(f"  Output shape: {P_k_ab_zchunk.shape} (expected {expected_shape_zchunk})")
+    assert P_k_ab_zchunk.shape == expected_shape_zchunk, f"Shape mismatch"
+    
+    print_sharding_info("  P_k,ab(r_mu, r_zchunk)", P_k_ab_zchunk)
+    
+    # Test 3: Verify definition matches manual computation (small check)
+    print("\n--- Test 3: Verify P = sum_n psi*_L @ psi_R ---")
+    # Manual computation: P[k,a,b,mu,nu] = sum_n psi_L[k,mu,n,a] * psi_R[k,n,b,nu]
+    psi_L_np = np.array(psi_rmuT_X)  # (nk, n_rmu, nb, ns)
+    psi_R_np = np.array(psi_rmu_Y)   # (nk, nb, ns, n_rmu)
+    P_manual = np.einsum('kmna,knbv->kabmv', psi_L_np, psi_R_np)
+    P_jax = np.array(P_k_ab)
+    
+    match = np.allclose(P_manual, P_jax, rtol=1e-10)
+    max_diff = np.max(np.abs(P_manual - P_jax))
+    print(f"  Manual einsum matches JAX: {match} (max diff: {max_diff:.2e})")
+    assert match, f"Pair density mismatch: max diff = {max_diff}"
+    
+    # Test 4: Memory footprint
+    print("\n--- Memory footprint ---")
+    P_size_mb = P_k_ab.nbytes / 1e6
+    P_zchunk_size_mb = P_k_ab_zchunk.nbytes / 1e6
+    print(f"  P_k,ab(r_mu, r_mu): {P_size_mb:.2f} MB")
+    print(f"  P_k,ab(r_mu, r_zchunk): {P_zchunk_size_mb:.2f} MB")
+    print(f"  Ratio zchunk/rmu: {P_zchunk_size_mb/P_size_mb:.1f}x")
+    
+    print("\n✓ Pair density tests passed!")
+    return P_k_ab, P_k_ab_zchunk
+
+
+def test_CCT_ZCT_pipeline(P_k_mumu, P_k_mu_zchunk, kgrid, mesh_xy):
+    """Test P_k → P_R → C_R/Z_R → C_q/Z_q pipeline. See ZETA_FITTING_ALGORITHM.md."""
+    print("\n" + "="*60)
+    print("TEST: CCT/ZCT Pipeline (P_k -> P_R -> C_R/Z_R -> C_q/Z_q)")
+    print("="*60)
+    
+    nk, ns1, ns2, n_rmu, _ = P_k_mumu.shape
+    _, _, _, _, n_zchunk = P_k_mu_zchunk.shape
+    nkx, nky, nkz = kgrid
+    
+    print(f"\nInput shapes:")
+    print(f"  P_k,ab(μ,μ):       {P_k_mumu.shape}")
+    print(f"  P_k,ab(μ,zchunk):  {P_k_mu_zchunk.shape}")
+    print(f"  k-grid:            {kgrid}")
+    
+    # Test 1: k -> R transform for CCT pathway
+    print("\n--- Test 1: P_k -> P_R ortho-IFFT ---")
+    with timing.section("CCT_ZCT.k_to_R"):
+        P_R_mumu = pair_density_k_to_R(P_k_mumu, kgrid, mesh_xy)
+        P_R_mumu.block_until_ready()
+    
+    expected_R_shape = (ns1, ns2, n_rmu, n_rmu, nkx, nky, nkz)
+    print(f"  P_R,ab(μ,μ) shape: {P_R_mumu.shape} (expected {expected_R_shape})")
+    assert P_R_mumu.shape == expected_R_shape
+    print_sharding_info("  P_R,ab(μ,μ)", P_R_mumu)
+    
+    # Test 2: R -> q transform
+    print("\n--- Test 2: P_R -> P_q ortho-FFT ---")
+    with timing.section("CCT_ZCT.R_to_q"):
+        P_q_mumu = pair_density_R_to_q(P_R_mumu, mesh_xy)
+        P_q_mumu.block_until_ready()
+    
+    expected_q_shape = (nkx, nky, nkz, ns1, ns2, n_rmu, n_rmu)
+    print(f"  P_q,ab(μ,μ) shape: {P_q_mumu.shape} (expected {expected_q_shape})")
+    assert P_q_mumu.shape == expected_q_shape
+    print_sharding_info("  P_q,ab(μ,μ)", P_q_mumu)
+    
+    # Test 3: Full CCT/ZCT computation
+    print("\n--- Test 3: compute_CCT_ZCT_from_pair_density ---")
+    with timing.section("CCT_ZCT.full_pipeline"):
+        C_q, Z_q = compute_CCT_ZCT_from_pair_density(
+            P_k_mumu, P_k_mu_zchunk, kgrid, mesh_xy
+        )
+        C_q.block_until_ready()
+        Z_q.block_until_ready()
+    
+    expected_C_shape = (nkx, nky, nkz, n_rmu, n_rmu)
+    expected_Z_shape = (nkx, nky, nkz, n_rmu, n_zchunk)
+    print(f"  C_q shape: {C_q.shape} (expected {expected_C_shape})")
+    print(f"  Z_q shape: {Z_q.shape} (expected {expected_Z_shape})")
+    assert C_q.shape == expected_C_shape
+    assert Z_q.shape == expected_Z_shape
+    print_sharding_info("  C_q (CCT)", C_q)
+    print_sharding_info("  Z_q (ZCT)", Z_q)
+    
+    # Test 4: Verify CCT properties
+    # C_R = Σ_ab |P_R,ab|² is real, with symmetry C_R(μ,ν,R) = C_R(ν,μ,-R)
+    # C_q[q=0] is real, symmetric, and positive definite
+    print("\n--- Test 4: Verify CCT properties ---")
+    
+    # Verify C_R is real
+    P_R_test = pair_density_k_to_R(P_k_mumu, kgrid, mesh_xy)
+    C_R_test = jnp.sum(jnp.abs(P_R_test) ** 2, axis=(0, 1))  # Frobenius norm over spin
+    C_R_np = np.array(C_R_test)  # (n_rmu, n_rmu, Rx, Ry, Rz)
+    C_R_is_real = np.allclose(C_R_np.imag, 0, atol=1e-14)
+    print(f"  C_R is real: {C_R_is_real}")
+    
+    # Verify C_R(μ,ν,R) = C_R(ν,μ,-R) symmetry
+    # This is the correct R-space symmetry from P*_k,ab(μ,ν) = P_k,ba(ν,μ)
+    def flip_R_axes(arr):
+        '''Flip R indices to get -R with periodic BC for 5D array'''
+        result = arr.copy()
+        for ax in [2, 3, 4]:  # R axes
+            if arr.shape[ax] > 1:
+                result = np.roll(np.flip(result, axis=ax), 1, axis=ax)
+        return result
+    
+    C_R_swap_minusR = flip_R_axes(C_R_np.transpose(1, 0, 2, 3, 4))
+    rel_asym = np.max(np.abs(C_R_np - C_R_swap_minusR)) / np.max(np.abs(C_R_np))
+    print(f"  C_R(μ,ν,R) = C_R(ν,μ,-R): rel diff = {rel_asym:.2e}")
+    
+    # Verify C_q[q=0] properties
+    C_q_np = np.array(C_q)  # (qx, qy, qz, n_rmu, n_rmu)
+    C_q0 = C_q_np[0, 0, 0]  # (n_rmu, n_rmu)
+    q0_real = np.allclose(C_q0.imag, 0, atol=1e-10)
+    q0_symmetric = np.allclose(C_q0, C_q0.T, rtol=1e-10)
+    q0_pos_diag = (np.diag(C_q0).real > 0).all()
+    print(f"  C_q[q=0] is real: {q0_real}")
+    print(f"  C_q[q=0] is symmetric: {q0_symmetric}")
+    print(f"  C_q[q=0] has positive diagonal: {q0_pos_diag}")
+    
+    # Test 5: Verify parseval's theorem (roughly preserved power after FFT)
+    print("\n--- Test 5: Parseval's theorem check ---")
+    # For ortho-FFT, ||X_q||² = ||X_R||² = ||X_k||² 
+    P_k_power = float(jnp.sum(jnp.abs(P_k_mumu)**2))
+    P_R_power = float(jnp.sum(jnp.abs(P_R_mumu)**2))
+    print(f"  ||P_k||² = {P_k_power:.6e}")
+    print(f"  ||P_R||² = {P_R_power:.6e}")
+    print(f"  Ratio: {P_R_power/P_k_power:.6f} (should be ~1.0 for ortho)")
+    
+    # Memory footprint
+    print("\n--- Memory footprint ---")
+    C_size_mb = C_q.nbytes / 1e6
+    Z_size_mb = Z_q.nbytes / 1e6
+    print(f"  C_q: {C_size_mb:.2f} MB")
+    print(f"  Z_q: {Z_size_mb:.2f} MB")
+    print(f"  Total CCT+ZCT: {C_size_mb + Z_size_mb:.2f} MB")
+    
+    print("\n✓ CCT/ZCT pipeline tests passed!")
+    return C_q, Z_q
+
+
+def test_zeta_solve(C_q, Z_q, mesh_xy, use_blocked_2d: bool = True):
+    """Test zeta_q = L_q^{-H}(L_q^{-1} Z_q) with 2D blocked Cholesky."""
+    print("\n" + "="*60)
+    if use_blocked_2d:
+        print("TEST: Zeta Solve (2D Blocked Cholesky)")
+    else:
+        print("TEST: Zeta Solve (Replicate + Local Cholesky)")
+    print("="*60)
+    
+    # C_q and Z_q from CCT/ZCT have shape (nqx, nqy, nqz, n_rmu, *)
+    # Need to flatten to (nq, n_rmu, *) for solve
+    nqx, nqy, nqz, n_rmu, n_rmu2 = C_q.shape
+    _, _, _, _, n_zchunk = Z_q.shape
+    nq = nqx * nqy * nqz
+    
+    print(f"\nInput shapes:")
+    print(f"  C_q: {C_q.shape} (nqx={nqx}, nqy={nqy}, nqz={nqz}, n_rmu={n_rmu})")
+    print(f"  Z_q: {Z_q.shape} (n_zchunk={n_zchunk})")
+    print(f"  Strategy: {'2D blocked' if use_blocked_2d else 'replicate'}")
+    
+    # Flatten q-grid
+    C_q_flat = C_q.reshape(nq, n_rmu, n_rmu)
+    Z_q_flat = Z_q.reshape(nq, n_rmu, n_zchunk)
+    
+    # Apply required input sharding
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    input_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    C_q_flat = jax.lax.with_sharding_constraint(C_q_flat, input_shard)
+    Z_q_flat = jax.lax.with_sharding_constraint(Z_q_flat, input_shard)
+    
+    print("\nInput shardings:")
+    print_sharding_info("  C_q (flattened)", C_q_flat)
+    print_sharding_info("  Z_q (flattened)", Z_q_flat)
+    
+    # Select solver
+    if use_blocked_2d:
+        solve_fn = lambda C, Z: solve_zeta_q_blocked_2d(C, Z, mesh_xy)
+        solver_name = "solve_zeta_q_blocked_2d"
+    else:
+        solve_fn = lambda C, Z: solve_zeta_q_from_CCT_ZCT(C, Z, mesh_xy)
+        solver_name = "solve_zeta_q_from_CCT_ZCT"
+    
+    # Test 1: Solve for zeta
+    print(f"\n--- Test 1: {solver_name} ---")
+    with timing.section("zeta_solve.solve"):
+        zeta_q = solve_fn(C_q_flat, Z_q_flat)
+        zeta_q.block_until_ready()
+    
+    print(f"  zeta_q shape: {zeta_q.shape}")
+    print_sharding_info("  zeta_q", zeta_q)
+    
+    # Verify sharding
+    assert zeta_q.sharding.spec == P(None, None, ('x', 'y')), \
+        f"Expected P(None, None, ('x','y')), got {zeta_q.sharding.spec}"
+    print("  ✓ Output sharding preserved: P(None, None, ('x','y'))")
+    
+    # Test 2: Verify solution correctness C_q @ zeta_q ≈ Z_q
+    print("\n--- Test 2: Solution correctness ---")
+    
+    # Need to gather C_q to do the verification (it's small enough)
+    C_q_rep = jax.lax.with_sharding_constraint(
+        C_q_flat, NamedSharding(mesh_xy, P(None, None, None)))
+    zeta_rep = jax.lax.with_sharding_constraint(
+        zeta_q, NamedSharding(mesh_xy, P(None, None, None)))
+    Z_q_rep = jax.lax.with_sharding_constraint(
+        Z_q_flat, NamedSharding(mesh_xy, P(None, None, None)))
+    
+    # Check C_q @ zeta_q ≈ Z_q for all q
+    # Use batched matmul
+    Z_reconstructed = jnp.einsum('qmn,qnr->qmr', C_q_rep, zeta_rep)
+    
+    max_diff = float(jnp.max(jnp.abs(Z_reconstructed - Z_q_rep)))
+    rel_error = max_diff / float(jnp.max(jnp.abs(Z_q_rep)))
+    print(f"  max|C_q @ zeta - Z_q| = {max_diff:.2e}")
+    print(f"  relative error = {rel_error:.2e}")
+    
+    assert rel_error < 1e-10, f"Solution error too large: {rel_error:.2e}"
+    print("  ✓ Solution verified: C_q @ zeta_q = Z_q")
+    
+    # Test 3: Benchmark repeated calls
+    print("\n--- Test 3: Timing benchmark ---")
+    import time
+    
+    # Warmup is already done
+    times = []
+    for _ in range(5):
+        t0 = time.perf_counter()
+        zeta = solve_fn(C_q_flat, Z_q_flat)
+        zeta.block_until_ready()
+        times.append(time.perf_counter() - t0)
+    
+    print(f"  Per solve: {np.mean(times)*1000:.2f} ± {np.std(times)*1000:.2f} ms")
+    print(f"  Per q-point: {np.mean(times)/nq*1000:.3f} ms")
+    
+    # Memory footprint
+    print("\n--- Memory footprint ---")
+    zeta_mb = zeta_q.nbytes / 1e6
+    print(f"  zeta_q: {zeta_mb:.2f} MB")
+    print(f"  Per device (with sharding): {zeta_mb/len(jax.devices()):.2f} MB")
+    
+    print("\n✓ Zeta solve tests passed!")
+    return zeta_q
+
+
+def test_current_loading(wfn, sym, meta, centroid_indices, bispinor, mesh_xy, band_range, z_chunk_size=16):
+    """Load ψ_nk(r_μ)_Y, ψ_nk(r_μ)^T_X, ψ_nk(r_zchunk)_Y. See ZETA_FITTING_ALGORITHM.md."""
     print("\n" + "="*60)
     print("Testing CURRENT (full) wavefunction loading method")
     print("="*60)
@@ -224,28 +498,7 @@ def load_wfn_band_chunk_and_sample(
     wfn, sym, band_range, meta, centroid_indices, bispinor, mesh_xy,
     band_chunk_size: int = 16,
 ):
-    """
-    PLACEHOLDER: Chunked band loading that avoids storing full psi(r_tot).
-    
-    This will eventually replace read_Gvecs_to_devices + get_sharded_wfns.
-    
-    Algorithm:
-    1. FOR band_chunk in [0:chunk_size, chunk_size:2*chunk_size, ...]:
-        a. Load u_nk(G) for this band chunk (sharded over XY_1D on bands)
-        b. FFT to u_nk(r) [per-device, no communication]
-        c. Apply exp(ik·r) to get ψ_nk(r) [transient, not returned]
-        d. Gather ψ at centroids → accumulate into psi_rmu_acc
-        e. Delete ψ_nk(r)
-    2. Reshard psi_rmu_acc to get Y and X copies
-    
-    Args:
-        wfn, sym, band_range, meta, centroid_indices, bispinor, mesh_xy: as usual
-        band_chunk_size: number of bands to load at once
-        
-    Returns:
-        psi_nk_rmu_Y: (nk, nb, ns, n_rmu) sharded P(None, None, None, 'y')
-        psi_nk_rmuT_X: (nk, n_rmu, nb, ns) sharded P(None, 'x', None, None)
-    """
+    """PLACEHOLDER: Band-chunked loading. See get_psi_zchunk in load_wfns.py."""
     # TODO: Implement chunked loading
     # For now, fall back to current implementation
     print("  [PLACEHOLDER] Using current (non-chunked) implementation")
@@ -259,12 +512,7 @@ def load_wfn_band_chunk_and_sample(
 
 
 def test_shard_map_fft(mesh_xy):
-    """
-    Test that shard_map FFT works with multi-device sharding.
-    shard_map runs FFT independently on each device's local data.
-    
-    See: https://docs.jax.dev/en/latest/notebooks/shard_map.html
-    """
+    """Test shard_map FFT workaround for multi-device CPU/GPU."""
     from isdf.common.load_wfns import make_sharded_ifftn_3d
     
     print("\n" + "="*60)
@@ -324,12 +572,7 @@ def test_shard_map_fft(mesh_xy):
 
 
 def test_sharding_logic_only(mesh_xy, meta, centroid_indices):
-    """
-    Test sharding logic with mock data (no file I/O).
-    
-    Validates that centroid gather, z-chunk extraction, and P^L @ P^R
-    accumulation all produce correctly sharded outputs.
-    """
+    """Test sharding patterns with mock data (no file I/O)."""
     print("\n" + "="*60)
     print("Testing SHARDING LOGIC (no FFT - for multi-device CPU)")
     print("="*60)
@@ -513,18 +756,31 @@ def test_chunked_loading(wfn, sym, meta, centroid_indices, bispinor, mesh_xy,
 def main(argv=None):
     argp = argparse.ArgumentParser(description="Test chunked wavefunction loading")
     argp.add_argument("-i", "--input", default="cohsex_test.in", help="Input file")
-    argp.add_argument("--z-chunk", type=int, default=16, help="Z-axis chunk size")
+    argp.add_argument("--z-chunk", type=int, default=None, 
+                      help="Z-axis chunk size (overrides input file; 0=auto)")
     argp.add_argument("--band-chunk", type=int, default=16, help="Band chunk size")
+    argp.add_argument("--q-chunk", type=int, default=None, 
+                      help="Q-points to solve simultaneously (default=all, reduce for memory)")
     argp.add_argument("--save-ref", action="store_true", help="Save reference arrays to h5")
     argp.add_argument("--test-chunked", action="store_true", help="Test chunked implementation")
     argp.add_argument("--test-fft-only", action="store_true", help="Only test custom FFT sharding")
     argp.add_argument("--test-sharding-only", action="store_true", 
                       help="Test sharding logic with mock data (for multi-device CPU)")
+    argp.add_argument("--test-zeta-fit", action="store_true",
+                      help="Test full zeta fitting pipeline with z-chunk loop and HDF5 output")
+    argp.add_argument("--zeta-output", type=str, default="zeta_q.h5",
+                      help="Output HDF5 file for zeta fitting (default: zeta_q.h5)")
     args = argp.parse_args(argv)
     
     print("\n" + "="*72)
-    print("  TEST: Chunked Wavefunction Loading")
+    print("  ISDF Preprocessing Pipeline Test")
     print("="*72)
+    print("  Steps tested:")
+    print("    1. Wavefunction loading (HDF5 → G-space → FFT → real-space)")
+    print("    2. Pair density P_k,ab(r_μ, r_ν) and P_k,ab(r_μ, r_zchunk)")
+    print("    3. CCT/ZCT: P_k → P_R → C_R/Z_R → C_q/Z_q")
+    print("    4. Zeta fitting: C_q @ zeta_q = Z_q (2D blocked Cholesky)")
+    print("-"*72)
     print(f"  JAX backend: {jax.default_backend()}")
     print(f"  Device count: {jax.device_count()}")
     print(f"  Local device count: {jax.local_device_count()}")
@@ -569,6 +825,20 @@ def main(argv=None):
     # Create Meta object
     meta = Meta.from_system(wfn, sym, nval, ncond, nband, n_rmu, bispinor)
     
+    # Compute effective z_chunk_size
+    # Priority: max_wfn_chunk_mb > CLI arg > input file z_chunk_size > auto (0)
+    z_chunk_input = args.z_chunk if args.z_chunk is not None else params.get("z_chunk_size", 0)
+    max_wfn_chunk_mb = params.get("max_wfn_chunk_mb", 0.0)
+    # Get mesh Y dimension for divisibility constraint
+    mesh_y_size = mesh_xy.devices.shape[1] if len(mesh_xy.devices.shape) > 1 else 1
+    z_chunk_size = get_effective_z_chunk_size(
+        z_chunk_input, meta.fft_grid, n_rmu, 
+        mesh_y_size=mesh_y_size,
+        max_wfn_chunk_mb=max_wfn_chunk_mb,
+        nk_tot=meta.nk_tot,
+        nspinor=meta.nspinor,
+    )
+    
     # Print system info
     print(f"\nSystem info:")
     print(f"  FFT grid: {meta.fft_grid}")
@@ -577,6 +847,26 @@ def main(argv=None):
     print(f"  nk_tot: {meta.nk_tot}")
     print(f"  nspinor: {meta.nspinor}")
     print(f"  Band edges: b0={meta.b_id_0}, b1={meta.b_id_1}, b2={meta.b_id_2}, b3={meta.b_id_3}, b4={meta.b_id_4}")
+    
+    # Print z_chunk info
+    nx, ny, nz = meta.fft_grid
+    n_zchunk = nx * ny * z_chunk_size
+    # Compute actual memory for P_k chunk
+    pk_chunk_bytes = meta.nk_tot * meta.nspinor * meta.nspinor * n_rmu * n_zchunk * 16
+    pk_chunk_mb = pk_chunk_bytes / 1e6
+    
+    print(f"\nZ-chunk configuration:")
+    z_source = "auto"
+    if max_wfn_chunk_mb > 0:
+        z_source = f"max_wfn_chunk_mb={max_wfn_chunk_mb}"
+    elif z_chunk_input > 0:
+        z_source = f"explicit={z_chunk_input}"
+    print(f"  z_chunk_size: {z_chunk_size} z-slices (source: {z_source})")
+    print(f"  n_zchunk: {n_zchunk} = {nx}×{ny}×{z_chunk_size}")
+    print(f"  P_k(rmu, rchunk) size: {pk_chunk_mb:.1f} MB")
+    print(f"  Target: 16×n_rmu = {16*n_rmu}")
+    print(f"  Ratio n_zchunk/n_rmu: {n_zchunk/n_rmu:.2f}x")
+    print(f"  Num z-chunks to cover full grid: {(nz + z_chunk_size - 1) // z_chunk_size}")
     
     # Test with a small band range first
     b0, b1, b2, b3, b4 = meta.band_edges
@@ -589,10 +879,38 @@ def main(argv=None):
             success = test_sharding_logic_only(mesh_xy, meta, centroid_indices)
         return 0 if success else 1
     
+    # Full zeta fitting pipeline with z-chunk loop and HDF5 output
+    if args.test_zeta_fit:
+        output_path = os.path.join(input_dir, args.zeta_output)
+        print(f"\n{'='*60}")
+        print("RUNNING FULL ZETA FITTING PIPELINE")
+        print(f"{'='*60}")
+        # Q-chunk size: default to nq (batch all), can be reduced for memory
+        nqx, nqy, nqz = meta.kgrid
+        nq = nqx * nqy * nqz
+        q_chunk_size = args.q_chunk if args.q_chunk is not None else nq
+        print(f"Q-chunk size: {q_chunk_size} (of {nq} total)")
+        with mesh_xy:
+            fit_zeta_chunked_to_h5(
+                wfn, sym, meta, centroid_indices, mesh_xy,
+                z_chunk_size, output_path, args.band_chunk, q_chunk_size, bispinor
+            )
+        
+        # Verify output
+        import h5py
+        if jax.process_index() == 0:
+            with h5py.File(output_path, 'r') as f:
+                print(f"\nOutput file: {output_path}")
+                print(f"  zeta_q shape: {f['zeta_q'].shape}")
+                print(f"  Metadata: n_rmu={f.attrs['n_rmu']}, n_rtot={f.attrs['n_rtot']}")
+        
+        timing.get_collector().report(title="--- Timing Report ---", min_percent=0.1)
+        return 0
+    
     # Run the test
     psi_rmu_Y, psi_rmuT_X, psi_rtot_Y, psi_zchunk_ref = test_current_loading(
         wfn, sym, meta, centroid_indices, bispinor, mesh_xy,
-        test_band_range, args.z_chunk
+        test_band_range, z_chunk_size
     )
     
     # Save reference if requested
@@ -607,16 +925,34 @@ def main(argv=None):
             f.create_dataset("psi_zchunk_ref", data=np.array(psi_zchunk_ref))
             f.attrs["band_range_start"] = test_band_range[0]
             f.attrs["band_range_end"] = test_band_range[1]
-            f.attrs["z_chunk_size"] = args.z_chunk
+            f.attrs["z_chunk_size"] = z_chunk_size
         print("  Reference saved successfully")
     
     # Test chunked implementation if requested
     if args.test_chunked:
         psi_rmu_chunked, psi_rmuT_chunked = test_chunked_loading(
             wfn, sym, meta, centroid_indices, bispinor, mesh_xy,
-            test_band_range, args.z_chunk, args.band_chunk,
+            test_band_range, z_chunk_size, args.band_chunk,
             ref_psi_rmu=psi_rmu_Y, ref_psi_rmuT=psi_rmuT_X
         )
+    
+    # Test pair density computation
+    with mesh_xy:
+        P_k_ab, P_k_ab_zchunk = test_pair_density(
+            psi_rmuT_X, psi_rmu_Y, psi_zchunk_ref, mesh_xy
+        )
+    
+    # Test CCT/ZCT pipeline
+    kgrid = meta.kgrid  # (nkx, nky, nkz)
+    with mesh_xy:
+        C_q, Z_q = test_CCT_ZCT_pipeline(
+            P_k_ab, P_k_ab_zchunk, kgrid, mesh_xy
+        )
+    
+    # Test zeta solve (Cholesky + triangular solve)
+    # Use 2D blocked Cholesky for memory efficiency
+    with mesh_xy:
+        zeta_q = test_zeta_solve(C_q, Z_q, mesh_xy, use_blocked_2d=True)
     
     # Benchmark cached performance
     print("\n" + "-"*40)
