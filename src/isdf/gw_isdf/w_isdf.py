@@ -1,1024 +1,470 @@
+"""
+Static χ₀ and W computation with JAX.
+
+Streamlined pipeline for COHSEX:
+- Single universal chi kernel with energy masking (no per-window JIT recompilation)
+- Two-stage resharding for W solve following load_wfns pattern
+- χ computed with P(..., μ_X, ..., ν_Y) sharding
+- V, χ resharded to P(q_XY, μ, ν) for Dyson solve
+
+For dynamic W(ω) with window-specific kernels, see w_isdf_legacy.py.
+"""
 import os
-from pathlib import Path
 import math
-from functools import lru_cache, partial
+from functools import partial
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
 from jax.experimental import compilation_cache as jax_compilation_cache
+from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 import numpy as np
 
 from ..common import Meta, jax_profile
-from ..common.gamma_matrices import gammas_sparse
-from ..common.gpu_utils import cp, xp
-from ..io import WFNReader
 
 
-_MESH_SHARD_REGISTRY: dict[int | str, dict[str, NamedSharding | None]] = {}
+# ============================================================================
+# Cache and sharding registry
+# ============================================================================
+
 _COMPILATION_CACHE_READY = False
-_ENERGY_TOL = 1e-6
+_chi_kernel_cache: dict = {}
+_w_solve_cache: dict = {}
 
 
 def _ensure_compilation_cache():
-	global _COMPILATION_CACHE_READY
-	if _COMPILATION_CACHE_READY:
-		return
-	cache_dir = os.environ.get("ISDF_JAX_CACHE_DIR")
-	if cache_dir is None:
-		base_cache = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
-		cache_dir = os.path.join(base_cache, "isdf_jax_compilation")
-	cache_path = Path(cache_dir).expanduser()
-	cache_path.mkdir(parents=True, exist_ok=True)
-	try:
-		jax_compilation_cache.set_cache_dir(cache_path)
-		_COMPILATION_CACHE_READY = True
-	except Exception:
-		# If compilation cache is not supported, we simply proceed without it.
-		_COMPILATION_CACHE_READY = True
+    """Enable JAX persistent compilation cache."""
+    global _COMPILATION_CACHE_READY
+    if _COMPILATION_CACHE_READY:
+        return
+    cache_dir = os.environ.get("ISDF_JAX_CACHE_DIR")
+    if cache_dir is None:
+        base_cache = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+        cache_dir = os.path.join(base_cache, "isdf_jax_compilation")
+    cache_path = Path(cache_dir).expanduser()
+    cache_path.mkdir(parents=True, exist_ok=True)
+    try:
+        jax_compilation_cache.set_cache_dir(cache_path)
+    except Exception:
+        pass
+    _COMPILATION_CACHE_READY = True
 
 
-def _register_mesh_shardings(mesh_xy: Mesh | None) -> str | int:
-	"""Ensure shardings for a mesh are cached and return the registry key."""
-	if mesh_xy is None:
-		key = "none"
-		if key not in _MESH_SHARD_REGISTRY:
-			_MESH_SHARD_REGISTRY[key] = {
-				"xt": None,
-				"y_shard": None,
-				"x_shard": None,
-				"yt": None,
-				"y": None,
-				"out": None,
-				"chiR": None,
-				"gv": None,
-				"gc": None,
-			}
-		return key
+# ============================================================================
+# χ₀ kernel with energy masking (single JIT for all windows)
+# ============================================================================
 
-	key = id(mesh_xy)
-	if key not in _MESH_SHARD_REGISTRY:
-		_MESH_SHARD_REGISTRY[key] = {
-			"xt": NamedSharding(mesh_xy, P(None, None, 'x', None)),
-			"y_shard": NamedSharding(mesh_xy, P(None, None, None, 'y')),
-			"x_shard": NamedSharding(mesh_xy, P(None, None, None, 'x')),
-			"yt": NamedSharding(mesh_xy, P(None, None, 'y', None)),
-			"out": NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y')),
-			"chiR": NamedSharding(mesh_xy, P('x', 'y', None, None, None)),
-			"gv": NamedSharding(mesh_xy, P(None, None, 'x', None, 'y')),
-			"gc": NamedSharding(mesh_xy, P(None, None, 'y', None, 'x')),
-		}
-	return key
-
-
-def _band_slice_metadata(
-	energies: np.ndarray,
-	emin: float,
-	emax: float,
-	upper_inclusive: bool = True,
-	lower_relaxed: bool = False,
-):
-	"""Return per-k slice metadata covering all bands within [emin, emax].
-
-	Args:
-		energies: Array of shape (nk, nb) with per-k band energies.
-		emin/emax: Energy window bounds.
-		upper_inclusive: If False, treat emax as an open boundary to avoid overlaps.
-		lower_relaxed: Allow a small tolerance below emin (for the first window) to avoid
-			losing states to numerical round-off.
-
-	Returns:
-		clipped_start (nk,): actual slice origin after enforcing fixed max span
-		spans (nk,): span in bands between first and last included band (inclusive)
-		mask_arr (nk,max_span): boolean mask aligned to the clipped slice
-		max_span: global maximum span length (used for fixed slice length)
-	"""
-	if energies is None or energies.size == 0:
-		nk = 0 if energies is None else energies.shape[0]
-		zero = np.zeros(nk, dtype=np.int32)
-		mask = np.zeros((nk, 1), dtype=bool)
-		return zero, zero, mask, 0
-	lower_bound = emin - (_ENERGY_TOL if lower_relaxed else 0.0)
-	if upper_inclusive:
-		upper_bound = emax + _ENERGY_TOL
-		mask = (energies >= lower_bound) & (energies <= upper_bound)
-	else:
-		mask = (energies >= lower_bound) & (energies < emax)
-	nk, nb = mask.shape
-	starts = np.zeros(nk, dtype=np.int32)
-	spans = np.zeros(nk, dtype=np.int32)
-	slice_masks: list[np.ndarray] = []
-	max_span = 0
-	for k in range(nk):
-		idx = np.nonzero(mask[k])[0]
-		if idx.size == 0:
-			slice_masks.append(np.zeros(0, dtype=bool))
-			continue
-		start = int(idx[0])
-		end = int(idx[-1])
-		span = end - start + 1
-		starts[k] = start
-		spans[k] = span
-		slice_masks.append(mask[k, start:start + span])
-		if span > max_span:
-			max_span = span
-	if max_span == 0:
-		clipped_start = np.zeros_like(starts)
-		return clipped_start, spans, np.zeros((nk, 1), dtype=bool), 0
-
-	slice_cap = max(nb - max_span, 0)
-	clipped_start = np.minimum(starts, slice_cap).astype(np.int32)
-	offsets = (starts - clipped_start).astype(np.int32)
-	mask_arr = np.zeros((nk, max_span), dtype=bool)
-	for k, sl in enumerate(slice_masks):
-		if sl.size:
-			off = offsets[k]
-			mask_arr[k, off:off + sl.size] = sl
-	return clipped_start, spans, mask_arr, max_span
-
-
-def _ensure_window_band_ranges(win, enk_v_host: np.ndarray, enk_c_host: np.ndarray):
-	"""Populate per-window band metadata for efficient slicing."""
-	if getattr(win, "_has_band_ranges", False):
-		return
-	val_upper = getattr(win.val_window, "upper_inclusive", True)
-	val_lower_relaxed = getattr(win.val_window, "index", 0) == 0
-	val_start, val_len, val_mask, max_val_len = _band_slice_metadata(
-		enk_v_host,
-		win.val_window.start_energy,
-		win.val_window.end_energy,
-		upper_inclusive=val_upper,
-		lower_relaxed=val_lower_relaxed,
-	)
-	cond_upper = getattr(win.cond_window, "upper_inclusive", True)
-	cond_lower_relaxed = getattr(win.cond_window, "index", 0) == 0
-	cond_start, cond_len, cond_mask, max_cond_len = _band_slice_metadata(
-		enk_c_host,
-		win.cond_window.start_energy,
-		win.cond_window.end_energy,
-		upper_inclusive=cond_upper,
-		lower_relaxed=cond_lower_relaxed,
-	)
-	win.val_band_start = val_start.astype(np.int32)
-	win.val_band_len = val_len.astype(np.int32)
-	win.val_band_mask = val_mask
-	win.cond_band_start = cond_start.astype(np.int32)
-	win.cond_band_len = cond_len.astype(np.int32)
-	win.cond_band_mask = cond_mask
-	win.max_val_len = int(max_val_len)
-	win.max_cond_len = int(max_cond_len)
-	win._has_band_ranges = True
+def _get_chi_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
+    """
+    Get or create universal chi kernel for given mesh and k-grid.
+    
+    Single JIT compilation regardless of window configuration.
+    Uses energy masks to select band contributions.
+    """
+    cache_key = (id(mesh_xy), nkx, nky, nkz)
+    if cache_key in _chi_kernel_cache:
+        return _chi_kernel_cache[cache_key]
+    
+    # Define shardings
+    psi_XT = NamedSharding(mesh_xy, P(None, None, 'x', None))   # (nk, ns, μ_X, nb)
+    psi_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))    # (nk, nb, ns, μ_Y)
+    chi_out = NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y'))
+    chi_R = NamedSharding(mesh_xy, P('x', 'y', None, None, None))
+    G_v = NamedSharding(mesh_xy, P(None, None, 'x', None, 'y'))  # (nk, ns, μ_X, ns, μ_Y)
+    G_c = NamedSharding(mesh_xy, P(None, None, 'y', None, 'x'))
+    
+    @partial(jax.jit, static_argnames=("nkx", "nky", "nkz"))
+    def _chi_kernel(
+        psi_vTX: jax.Array,    # (nk, ns, μ, nb_v) valence, μ sharded X
+        psi_vY: jax.Array,     # (nk, nb_v, ns, μ) valence, μ sharded Y
+        psi_cX: jax.Array,     # (nk, nb_c, ns, μ) conduction, μ sharded X
+        psi_cTY: jax.Array,    # (nk, ns, μ, nb_c) conduction, μ sharded Y
+        enk_v: jax.Array,      # (nk, nb_v)
+        enk_c: jax.Array,      # (nk, nb_c)
+        val_mask: jax.Array,   # (nk, nb_v) True if band in window
+        cond_mask: jax.Array,  # (nk, nb_c) True if band in window
+        vmax: jax.Array,       # scalar: upper valence window edge
+        cmin: jax.Array,       # scalar: lower conduction window edge
+        tau_i: jax.Array,      # (ntau,) quadrature nodes
+        z_lm: jax.Array,       # scalar: γ = z_lm
+        w_i: jax.Array,        # (ntau,) quadrature weights
+        nkx: int, nky: int, nkz: int,
+    ) -> jax.Array:
+        """Compute static χ₀ with energy masking."""
+        n_rmu = psi_vTX.shape[2]
+        ntau = tau_i.shape[0]
+        
+        # Handle empty case
+        def empty_chi():
+            chi = jnp.zeros((nkx, nky, nkz, 1, n_rmu, 1, n_rmu), dtype=jnp.complex128)
+            return jax.lax.with_sharding_constraint(chi, chi_out)
+        
+        if ntau == 0:
+            return empty_chi()
+        
+        # Quadrature prefactor: -2γ z_lm w_i exp(-(γ(E_gap) - 1)τ)
+        E_gap = cmin - vmax
+        quad_w = -2.0 * z_lm * w_i * jnp.exp(-(z_lm * E_gap - 1.0) * tau_i)
+        
+        def _k_to_R(g_k: jax.Array, flip_sign: bool) -> jax.Array:
+            """G(k) → G(±R) via FFT."""
+            # g_k: (nk, ns, μ, ns, ν) → reshape to (nkx, nky, nkz, ns, μ, ns, ν)
+            g_fft = g_k.reshape(nkx, nky, nkz, *g_k.shape[1:]).transpose(3, 4, 5, 6, 0, 1, 2)
+            return jax.lax.cond(
+                flip_sign,
+                lambda x: jnp.fft.fftn(x, axes=(-3, -2, -1), norm='ortho'),
+                lambda x: jnp.fft.ifftn(x, axes=(-3, -2, -1), norm='ortho'),
+                g_fft,
+            )
+        
+        def tau_body(itau, chi_R_acc):
+            tau = tau_i[itau]
+            
+            # Valence: exp(-γτ(E_vmax - E_v)) * mask_v
+            # Use jnp.where to avoid computing exp() for masked bands (which could overflow)
+            delta_v = vmax - enk_v  # positive for bands in window
+            exp_v_raw = jnp.exp(-z_lm * tau * delta_v)
+            exp_v = jnp.where(val_mask, exp_v_raw, jnp.zeros_like(exp_v_raw))  # (nk, nb_v) complex
+            
+            # Conduction: exp(-γτ(E_c - E_cmin)) * mask_c
+            delta_c = enk_c - cmin  # positive for bands in window
+            exp_c_raw = jnp.exp(-z_lm * tau * delta_c)
+            exp_c = jnp.where(cond_mask, exp_c_raw, jnp.zeros_like(exp_c_raw))  # (nk, nb_c) complex
+            
+            # G_v(k) = Σ_n exp_v[n] |ψ_v^n⟩⟨ψ_v^n|
+            # psi_vTX: (nk, ns, μ, nb_v), psi_vY: (nk, nb_v, ns, μ)
+            Gv_k = jnp.einsum('ksxn,kn,knty->ksxty', jnp.conj(psi_vTX), exp_v.astype(jnp.complex128), psi_vY, optimize=True)
+            
+            # G_c(k) = Σ_m exp_c[m] |ψ_c^m⟩⟨ψ_c^m|
+            # Note: for conduction, psi_cX: (nk, nb_c, ns, μ), psi_cTY: (nk, ns, μ, nb_c)
+            Gc_k = jnp.einsum('ksxm,km,kmty->ksxty', jnp.conj(psi_cTY), exp_c.astype(jnp.complex128), psi_cX, optimize=True)
+            
+            # Apply sharding constraints
+            Gv_k = jax.lax.with_sharding_constraint(Gv_k, G_v)
+            Gc_k = jax.lax.with_sharding_constraint(Gc_k, G_c)
+            
+            # FFT to R-space
+            Gv_R = _k_to_R(Gv_k, flip_sign=False)   # IFFT for valence
+            Gc_mR = _k_to_R(Gc_k, flip_sign=True)   # FFT for conduction (gives -R)
+            
+            # Contract: χ(R) = Σ_{s,s'} conj(G_c)_{-R}^{ss'} · G_v_R^{s's}
+            # (a,μ,b,ν,x,y,z) × (b,ν,a,μ,x,y,z) → (μ,ν,x,y,z)
+            chi_tau = jnp.einsum('ambnxyz,bnamxyz->mnxyz', Gc_mR, Gv_R, optimize=True)
+            
+            return chi_R_acc + quad_w[itau] * chi_tau
+        
+        # Accumulate χ(R) over τ
+        chi_R_init = jnp.zeros((n_rmu, n_rmu, nkx, nky, nkz), dtype=jnp.complex128)
+        chi_R_init = jax.lax.with_sharding_constraint(chi_R_init, chi_R)
+        chi_R_final = jax.lax.fori_loop(0, ntau, tau_body, chi_R_init)
+        
+        # FFT to q-space: χ(R) → χ(q)
+        chi_q = jnp.fft.fftn(chi_R_final, axes=(-3, -2, -1), norm='ortho')
+        
+        # Reshape: (μ, ν, qx, qy, qz) → (qx, qy, qz, 1, μ, 1, ν)
+        chi_q = chi_q.transpose(2, 3, 4, 0, 1)
+        chi_q = chi_q[:, :, :, None, :, None, :]
+        chi_q = jax.lax.with_sharding_constraint(chi_q, chi_out)
+        
+        return chi_q
+    
+    _chi_kernel_cache[cache_key] = _chi_kernel
+    return _chi_kernel
 
 
-def _slice_along_axis(arr: jax.Array, starts: jax.Array, max_len: int, axis: int):
-	"""Slice each k-row of arr along the given axis using per-row start indices."""
-	if max_len <= 0:
-		raise ValueError("max_len must be positive for slicing")
-	if axis == 0:
-		raise ValueError("Axis 0 (k-dimension) is not sliceable via _slice_along_axis")
-	axis_row = axis - 1  # remove the leading k-dimension
-	max_len = int(max_len)
-	axis_size = arr.shape[axis]
-	if max_len > axis_size:
-		raise ValueError(f"Requested slice length {max_len} exceeds axis {axis} size {axis_size}")
-	max_start_allowed = max(axis_size - max_len, 0)
-	starts = jnp.clip(starts, 0, max_start_allowed)
-
-	def _slice_one(row, start_idx):
-		return jax.lax.dynamic_slice_in_dim(row, start_idx, max_len, axis=axis_row)
-
-	return jax.vmap(_slice_one, in_axes=(0, 0), out_axes=0)(arr, starts)
-
-
-def _as_int_array(data: np.ndarray | jax.Array | None, nk: int) -> jax.Array:
-	if data is None:
-		return jnp.zeros((nk,), dtype=jnp.int32)
-	return jnp.asarray(data, dtype=jnp.int32)
-
-
-@lru_cache(maxsize=None)
-def _get_chi_kernel(mesh_key, nkx: int, nky: int, nkz: int, max_val_len: int, max_cond_len: int):
-	shards = _MESH_SHARD_REGISTRY[mesh_key]
-	xt_shard = shards["xt"]
-	y_shard = shards["y_shard"]
-	x_shard = shards["x_shard"]
-	yt_shard = shards["yt"]
-	out_shard = shards["out"]
-	chiR_shard = shards["chiR"]
-	gv_shard = shards["gv"]
-	gc_shard = shards["gc"]
-
-	@partial(
-		jax.jit,
-		static_argnames=("nkx", "nky", "nkz", "max_val_len", "max_cond_len"),
-		in_shardings=(
-			xt_shard,
-			y_shard,
-			x_shard,
-			yt_shard,
-			None,
-			None,
-			None, None, None, None,
-			None,
-			None,
-			None,
-			None, None, None,
-			None, None, None,
-		),
-		out_shardings=out_shard,
-	)
-	def _compute(
-		psi_vTX: jax.Array,
-		psi_vY: jax.Array,
-		psi_cX: jax.Array,
-		psi_cTY: jax.Array,
-		enk_v: jax.Array,
-		enk_c: jax.Array,
-		vmin, vmax, cmin, cmax, tau_i, z_lm, w_i,
-		val_start, val_len, val_mask,
-		cond_start, cond_len, cond_mask,
-		nkx: int, nky: int, nkz: int,
-		max_val_len: int, max_cond_len: int,
-	) -> jax.Array:
-		nrmu_local = psi_vTX.shape[2]
-		if max_val_len == 0 or max_cond_len == 0 or tau_i.shape[0] == 0:
-			chi_empty = jnp.zeros((nkx, nky, nkz, 1, nrmu_local, 1, nrmu_local), dtype=jnp.complex128)
-			chi_empty = jax.lax.with_sharding_constraint(chi_empty, out_shard)
-			return chi_empty
-
-		psi_vTX_win = _slice_along_axis(psi_vTX, val_start, max_val_len, axis=3)
-		psi_vY_win = _slice_along_axis(psi_vY, val_start, max_val_len, axis=1)
-		psi_cX_win = _slice_along_axis(psi_cX, cond_start, max_cond_len, axis=1)
-		psi_cTY_win = _slice_along_axis(psi_cTY, cond_start, max_cond_len, axis=3)
-		enk_v_win = _slice_along_axis(enk_v, val_start, max_val_len, axis=1)
-		enk_c_win = _slice_along_axis(enk_c, cond_start, max_cond_len, axis=1)
-
-		val_mask_f = val_mask.astype(psi_vTX_win.dtype)
-		cond_mask_f = cond_mask.astype(psi_cX_win.dtype)
-		psi_vTX_win = psi_vTX_win * val_mask_f[:, None, None, :]
-		psi_vY_win = psi_vY_win * val_mask_f[:, :, None, None]
-		psi_cX_win = psi_cX_win * cond_mask_f[:, :, None, None]
-		psi_cTY_win = psi_cTY_win * cond_mask_f[:, None, None, :]
-		val_mask_complex = val_mask.astype(jnp.complex128)
-		cond_mask_complex = cond_mask.astype(jnp.complex128)
-
-		quad_w = -2.0 * z_lm * w_i * jnp.exp(-(z_lm * (cmin - vmax) - 1.0) * tau_i)
-
-		def _k_to_R(g_k: jax.Array, flip_sign: bool) -> jax.Array:
-			"""Map G(k) -> G(±R) with the same layout used in the legacy kernel."""
-			g_fft = g_k.reshape(nkx, nky, nkz, *g_k.shape[1:]).transpose(3, 4, 5, 6, 0, 1, 2)
-			return jax.lax.cond(
-				flip_sign,
-				lambda x: jnp.fft.fftn(x, axes=(-3, -2, -1), norm='ortho'),
-				lambda x: jnp.fft.ifftn(x, axes=(-3, -2, -1), norm='ortho'),
-				g_fft,
-			)
-
-		def tau_body(itau, chi_R_acc):
-			tau = tau_i[itau]
-			exp_v = jnp.exp(-z_lm * tau * (vmax - enk_v_win)) * val_mask_complex
-			exp_c = jnp.exp(-z_lm * tau * (enk_c_win - cmin)) * cond_mask_complex
-			w_v = exp_v.astype(jnp.complex128)
-			w_c = exp_c.astype(jnp.complex128)
-			Gv_k = jnp.einsum('ksxm,km,kmty->ksxty', jnp.conj(psi_vTX_win), w_v, psi_vY_win, optimize=True)
-			Gc_k = jnp.einsum('ksxm,km,kmty->ksxty', jnp.conj(psi_cTY_win), w_c, psi_cX_win, optimize=True)
-			Gv_k = jax.lax.with_sharding_constraint(Gv_k, gv_shard)
-			Gc_k = jax.lax.with_sharding_constraint(Gc_k, gc_shard)
-			Gv_R = _k_to_R(Gv_k, flip_sign=False)
-			Gc_R = _k_to_R(Gc_k, flip_sign=True)
-			chi_tau = jnp.einsum('ambnxyz, bnamxyz-> mnxyz', Gc_R, Gv_R, optimize=True)
-			return chi_R_acc + quad_w[itau] * chi_tau
-
-		chi_R = jnp.zeros((nrmu_local, nrmu_local, nkx, nky, nkz), dtype=jnp.complex128)
-		chi_R = jax.lax.with_sharding_constraint(chi_R, chiR_shard)
-		chi_R = jax.lax.fori_loop(0, tau_i.shape[0], tau_body, chi_R)
-		chi_q = jnp.fft.fftn(chi_R, axes=(-3, -2, -1), norm='ortho')
-		chi_q = chi_q.transpose(2, 3, 4, 0, 1)
-		chi_q = chi_q[:, :, :, None, :, None, :]
-		chi_q = jax.lax.with_sharding_constraint(chi_q, out_shard)
-		return chi_q
-
-	return _compute
-
-
-@lru_cache(maxsize=None)
-def _get_chi_hgl_kernel(mesh_key, nkx: int, nky: int, nkz: int, max_val_len: int, max_cond_len: int):
-	"""
-	HGL kernel for dynamic χ(ω) with energy crossings.
-	
-	Uses Euler identity: G = exp(iγτE) weighted sum of |ψ><ψ|
-	Returns P_plus and P_cross for a single τ point, which are combined
-	with ω-dependent phase factors to get χ(ω).
-	
-	For HGL quadrature:
-		χ^HGL(ω) = -γ Σ_u w_u [cos(γτ_u ω) P_×(τ_u) - sin(γτ_u ω) P_+(τ_u)]
-	
-	where:
-		P_+ = Re[conj(G_c) @ G_v]  (after spin contraction and FFT)
-		P_× = -Im[conj(G_c) @ G_v]
-	"""
-	shards = _MESH_SHARD_REGISTRY[mesh_key]
-	xt_shard = shards["xt"]
-	y_shard = shards["y_shard"]
-	x_shard = shards["x_shard"]
-	yt_shard = shards["yt"]
-	out_shard = shards["out"]
-	chiR_shard = shards["chiR"]
-	gv_shard = shards["gv"]
-	gc_shard = shards["gc"]
-
-	@partial(
-		jax.jit,
-		static_argnames=("nkx", "nky", "nkz", "max_val_len", "max_cond_len"),
-		in_shardings=(
-			xt_shard,
-			y_shard,
-			x_shard,
-			yt_shard,
-			None,  # enk_v
-			None,  # enk_c
-			None,  # tau (single scalar)
-			None,  # gamma
-			None, None, None,  # val_start, val_len, val_mask
-			None, None, None,  # cond_start, cond_len, cond_mask
-		),
-		out_shardings=(out_shard, out_shard),  # P_plus_q, P_cross_q
-	)
-	def _compute_hgl_tile(
-		psi_vTX: jax.Array,
-		psi_vY: jax.Array,
-		psi_cX: jax.Array,
-		psi_cTY: jax.Array,
-		enk_v: jax.Array,
-		enk_c: jax.Array,
-		tau: jax.Array,  # single τ value (scalar or 0-d array)
-		gamma: jax.Array,  # γ = z_lm
-		val_start, val_len, val_mask,
-		cond_start, cond_len, cond_mask,
-		nkx: int, nky: int, nkz: int,
-		max_val_len: int, max_cond_len: int,
-	) -> tuple[jax.Array, jax.Array]:
-		"""
-		Compute P_plus and P_cross for a single τ point (HGL quadrature).
-		
-		Returns:
-			P_plus_q: (nkx, nky, nkz, 1, nrmu, 1, nrmu) - real part contribution
-			P_cross_q: (nkx, nky, nkz, 1, nrmu, 1, nrmu) - imaginary part contribution
-		"""
-		nrmu_local = psi_vTX.shape[2]
-		if max_val_len == 0 or max_cond_len == 0:
-			zero = jnp.zeros((nkx, nky, nkz, 1, nrmu_local, 1, nrmu_local), dtype=jnp.float64)
-			zero = jax.lax.with_sharding_constraint(zero, out_shard)
-			return zero, zero
-
-		# Slice wavefunctions and energies to window
-		psi_vTX_win = _slice_along_axis(psi_vTX, val_start, max_val_len, axis=3)
-		psi_vY_win = _slice_along_axis(psi_vY, val_start, max_val_len, axis=1)
-		psi_cX_win = _slice_along_axis(psi_cX, cond_start, max_cond_len, axis=1)
-		psi_cTY_win = _slice_along_axis(psi_cTY, cond_start, max_cond_len, axis=3)
-		enk_v_win = _slice_along_axis(enk_v, val_start, max_val_len, axis=1)
-		enk_c_win = _slice_along_axis(enk_c, cond_start, max_cond_len, axis=1)
-
-		# Apply masks
-		val_mask_f = val_mask.astype(psi_vTX_win.dtype)
-		cond_mask_f = cond_mask.astype(psi_cX_win.dtype)
-		psi_vTX_win = psi_vTX_win * val_mask_f[:, None, None, :]
-		psi_vY_win = psi_vY_win * val_mask_f[:, :, None, None]
-		psi_cX_win = psi_cX_win * cond_mask_f[:, :, None, None]
-		psi_cTY_win = psi_cTY_win * cond_mask_f[:, None, None, :]
-		val_mask_complex = val_mask.astype(jnp.complex128)
-		cond_mask_complex = cond_mask.astype(jnp.complex128)
-
-		def _k_to_R(g_k: jax.Array, flip_sign: bool) -> jax.Array:
-			"""Map G(k) -> G(±R)."""
-			g_fft = g_k.reshape(nkx, nky, nkz, *g_k.shape[1:]).transpose(3, 4, 5, 6, 0, 1, 2)
-			return jax.lax.cond(
-				flip_sign,
-				lambda x: jnp.fft.fftn(x, axes=(-3, -2, -1), norm='ortho'),
-				lambda x: jnp.fft.ifftn(x, axes=(-3, -2, -1), norm='ortho'),
-				g_fft,
-			)
-
-		# Euler identity: phase = exp(i * gamma * tau * E)
-		phase_v = jnp.exp(1j * gamma * tau * enk_v_win) * val_mask_complex
-		phase_c = jnp.exp(1j * gamma * tau * enk_c_win) * cond_mask_complex
-
-		# Build complex propagators G = Σ_n phase_n |ψ_n><ψ_n|
-		Gv_k = jnp.einsum('ksxm,km,kmty->ksxty', jnp.conj(psi_vTX_win), phase_v, psi_vY_win, optimize=True)
-		Gc_k = jnp.einsum('ksxm,km,kmty->ksxty', jnp.conj(psi_cTY_win), phase_c, psi_cX_win, optimize=True)
-		Gv_k = jax.lax.with_sharding_constraint(Gv_k, gv_shard)
-		Gc_k = jax.lax.with_sharding_constraint(Gc_k, gc_shard)
-
-		# FFT to R-space
-		Gv_R = _k_to_R(Gv_k, flip_sign=False)
-		Gc_mR = _k_to_R(Gc_k, flip_sign=True)
-
-		# Contract: conj(G_c)_{-R} @ G_v_R → complex product
-		# P_+ = Re[product], P_× = -Im[product]
-		product_R = jnp.einsum('ambnxyz, bnamxyz-> mnxyz', jnp.conj(Gc_mR), Gv_R, optimize=True)
-		P_plus_R = product_R.real
-		P_cross_R = -product_R.imag
-
-		# FFT P_+ and P_× to q-space
-		P_plus_q = jnp.fft.fftn(P_plus_R, axes=(-3, -2, -1), norm='ortho')
-		P_cross_q = jnp.fft.fftn(P_cross_R, axes=(-3, -2, -1), norm='ortho')
-
-		# Reshape to match chi output format
-		P_plus_q = P_plus_q.transpose(2, 3, 4, 0, 1)[:, :, :, None, :, None, :]
-		P_cross_q = P_cross_q.transpose(2, 3, 4, 0, 1)[:, :, :, None, :, None, :]
-
-		P_plus_q = jax.lax.with_sharding_constraint(P_plus_q, out_shard)
-		P_cross_q = jax.lax.with_sharding_constraint(P_cross_q, out_shard)
-
-		return P_plus_q, P_cross_q
-
-	return _compute_hgl_tile
-
-
-# The routines here construct chi^0 and the screened interaction W using the
-# CTSP approach in the static limit.  Once the frequency grids are restored, the
-# same machinery will let us tackle full dynamical GW.
-
-
-def _compute_chi_omega_hgl(
-	psi_vTX, psi_vY, psi_cX, psi_cTY, enk_v, enk_c,
-	win, omega: float, meta: Meta, mesh_xy: Mesh,
+def compute_chi0(
+    psi_vTX: jax.Array, psi_vY: jax.Array,
+    psi_cX: jax.Array, psi_cTY: jax.Array,
+    enk_v: jax.Array, enk_c: jax.Array,
+    windows, meta: Meta, mesh_xy: Mesh,
 ) -> jax.Array:
-	"""Compute χ(ω) contribution from one window using HGL quadrature.
-	
-	For HGL (crossing region), the contribution is:
-		χ^HGL(ω) = -γ Σ_u w_u [cos(γτ_u ω) P_×(τ_u) - sin(γτ_u ω) P_+(τ_u)]
-	
-	where P_+ and P_× are computed via the Euler identity approach.
-	
-	Assumes:
-	- win._has_band_ranges is True (call _ensure_window_band_ranges first)
-	- win.tau_hgl/w_hgl populated (call init_hgl_quadrature once before processing)
-	"""
-	nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
-	nrmu = psi_vTX.shape[2]
-	
-	gamma = jnp.asarray(win.z_lm, dtype=jnp.float64)
-	tau_hgl = jnp.asarray(win.tau_hgl, dtype=jnp.float64)
-	w_hgl = jnp.asarray(win.w_hgl, dtype=jnp.float64)
-	omega_jax = jnp.asarray(omega, dtype=jnp.float64)
-	
-	_ensure_compilation_cache()
-	mesh_key = _register_mesh_shardings(mesh_xy)
-	hgl_kernel = _get_chi_hgl_kernel(mesh_key, nkx, nky, nkz, win.max_val_len, win.max_cond_len)
-	out_shard = NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y'))
-	
-	val_band_start = jnp.asarray(win.val_band_start, dtype=jnp.int32)
-	val_band_len = jnp.asarray(win.val_band_len, dtype=jnp.int32)
-	val_band_mask = jnp.asarray(win.val_band_mask, dtype=jnp.bool_)
-	cond_band_start = jnp.asarray(win.cond_band_start, dtype=jnp.int32)
-	cond_band_len = jnp.asarray(win.cond_band_len, dtype=jnp.int32)
-	cond_band_mask = jnp.asarray(win.cond_band_mask, dtype=jnp.bool_)
-	
-	# Sum over HGL quadrature nodes
-	chi_sum = jnp.zeros((nkx, nky, nkz, 1, nrmu, 1, nrmu), dtype=jnp.complex128)
-	
-	for u in range(win.ntau_hgl):
-		tau_u = tau_hgl[u]
-		w_u = w_hgl[u]
-		
-		P_plus_q, P_cross_q = hgl_kernel(
-			psi_vTX, psi_vY, psi_cX, psi_cTY, enk_v, enk_c,
-			tau_u, gamma,
-			val_band_start, val_band_len, val_band_mask,
-			cond_band_start, cond_band_len, cond_band_mask,
-			nkx, nky, nkz, win.max_val_len, win.max_cond_len,
-		)
-		
-		# χ^HGL(ω) = -γ Σ_u w_u [cos(γτω) P_× - sin(γτω) P_+]
-		phase = gamma * tau_u * omega_jax
-		cos_phase = jnp.cos(phase)
-		sin_phase = jnp.sin(phase)
-		chi_tau = -gamma * w_u * (cos_phase * P_cross_q - sin_phase * P_plus_q)
-		chi_sum = chi_sum + chi_tau
-	
-	return jax.lax.with_sharding_constraint(chi_sum, out_shard)
+    """
+    Compute static χ₀(q) by summing over all window pairs.
+    
+    Uses a single universal kernel with energy masking - no per-window JIT.
+    
+    Args:
+        psi_vTX: (nk, ns, μ, nb_v) valence, μ sharded on X axis
+        psi_vY:  (nk, nb_v, ns, μ) valence, μ sharded on Y axis
+        psi_cX:  (nk, nb_c, ns, μ) conduction, μ sharded on X axis
+        psi_cTY: (nk, ns, μ, nb_c) conduction, μ sharded on Y axis
+        enk_v: (nk, nb_v) valence energies
+        enk_c: (nk, nb_c) conduction energies
+        windows: list of WindowPair objects
+        meta: Meta with nkx, nky, nkz
+        mesh_xy: 2D device mesh
+    
+    Returns:
+        chi_q: (nkx, nky, nkz, 1, n_rmu, 1, n_rmu) with μ_X, ν_Y sharding
+    """
+    _ensure_compilation_cache()
+    
+    nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
+    nk = psi_vTX.shape[0]
+    nb_v = enk_v.shape[1]
+    nb_c = enk_c.shape[1]
+    n_rmu = psi_vTX.shape[2]
+    
+    # Get energies on host for mask computation
+    enk_v_host = np.asarray(jax.device_get(enk_v))
+    enk_c_host = np.asarray(jax.device_get(enk_c))
+    
+    # Get the universal kernel
+    kernel = _get_chi_kernel(mesh_xy, nkx, nky, nkz)
+    
+    # Output sharding
+    chi_out = NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y'))
+    chi_sum = jnp.zeros((nkx, nky, nkz, 1, n_rmu, 1, n_rmu), dtype=jnp.complex128)
+    chi_sum = jax.lax.with_sharding_constraint(chi_sum, chi_out)
+    
+    for win in windows:
+        # Compute energy masks for this window
+        vmin = win.val_window.start_energy
+        vmax = win.val_window.end_energy
+        cmin = win.cond_window.start_energy
+        cmax = win.cond_window.end_energy
+        
+        # Handle window boundary inclusivity to avoid double-counting
+        val_upper_incl = getattr(win.val_window, "upper_inclusive", True)
+        val_lower_relaxed = getattr(win.val_window, "index", 0) == 0
+        cond_upper_incl = getattr(win.cond_window, "upper_inclusive", True)
+        cond_lower_relaxed = getattr(win.cond_window, "index", 0) == 0
+        
+        # Valence mask
+        val_lower = vmin - (1e-6 if val_lower_relaxed else 0.0)
+        if val_upper_incl:
+            val_mask = (enk_v_host >= val_lower) & (enk_v_host <= vmax + 1e-6)
+        else:
+            val_mask = (enk_v_host >= val_lower) & (enk_v_host < vmax)
+        
+        # Conduction mask
+        cond_lower = cmin - (1e-6 if cond_lower_relaxed else 0.0)
+        if cond_upper_incl:
+            cond_mask = (enk_c_host >= cond_lower) & (enk_c_host <= cmax + 1e-6)
+        else:
+            cond_mask = (enk_c_host >= cond_lower) & (enk_c_host < cmax)
+        
+        # Skip if no bands in window
+        if not val_mask.any() or not cond_mask.any():
+            continue
+        
+        # Convert to JAX arrays
+        val_mask_jax = jnp.asarray(val_mask, dtype=jnp.bool_)
+        cond_mask_jax = jnp.asarray(cond_mask, dtype=jnp.bool_)
+        
+        # Get quadrature params
+        tau_i = jnp.asarray(win.tau_i, dtype=jnp.float64)
+        z_lm = jnp.asarray(win.z_lm, dtype=jnp.complex128)
+        w_i = jnp.asarray(win.w_i, dtype=jnp.complex128)
+        vmax_j = jnp.asarray(vmax, dtype=jnp.float64)
+        cmin_j = jnp.asarray(cmin, dtype=jnp.float64)
+        
+        with jax_profile.annotation(f"chi0_window"):
+            chi_win = kernel(
+                psi_vTX, psi_vY, psi_cX, psi_cTY,
+                enk_v, enk_c,
+                val_mask_jax, cond_mask_jax,
+                vmax_j, cmin_j,
+                tau_i, z_lm, w_i,
+                nkx, nky, nkz,
+            )
+        
+        chi_sum = chi_sum + chi_win
+    
+    return chi_sum
 
 
-def get_chi_lm_Yt_jax(
-	psi_vTX: jax.Array,
-	psi_vY: jax.Array,
-	psi_cX: jax.Array,
-	psi_cTY: jax.Array,
-	enk_v: jax.Array,
-	enk_c: jax.Array,
-	win,
-	meta: Meta,
-	mesh_xy: Mesh | None = None,
-):
-	"""Compute chi_lm integrated over tau using only JAX arrays.
+# ============================================================================
+# W solve with two-stage resharding (following load_wfns pattern)
+# ============================================================================
 
-	Args:
-		psi_vTX: (nk, ns, rmu, nb)  left valence, rmu sharded on X, band is fastest
-		psi_vY:  (nk, nb, ns, rmu)  right valence, rmu sharded on Y, rmu is fastest
-		psi_cX:  (nk, ns, rmu, nb)  left conduction, rmu sharded on X, band is fastest
-		psi_cTY: (nk, nb, ns, rmu)  right conduction, rmu sharded on Y, rmu is fastest
-		enk_v: (nk, nb_v)
-		enk_c: (nk, nb_c)
-		win: window object with attributes (tau_i, z_lm, w_i, val_window, cond_window)
-		meta: Meta with nkx,nky,nkz
-		mesh_xy: optional 2D device mesh for sharding (mu on x, nu on y)
-
-	Returns:
-		chi_q: (nkx, nky, nkz, npol1=1, nrmu1, npol2=1, nrmu2) complex128
-	"""
-	nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
-	nspinor = psi_vTX.shape[1]
-	nrmu = psi_vTX.shape[2]
-	nk = psi_vTX.shape[0]
-	max_val_len = int(getattr(win, "max_val_len", 0))
-	max_cond_len = int(getattr(win, "max_cond_len", 0))
-	val_band_start = _as_int_array(getattr(win, "val_band_start", None), nk)
-	val_band_len = _as_int_array(getattr(win, "val_band_len", None), nk)
-	val_band_mask = jnp.asarray(getattr(win, "val_band_mask", None), dtype=jnp.bool_)
-	cond_band_start = _as_int_array(getattr(win, "cond_band_start", None), nk)
-	cond_band_len = _as_int_array(getattr(win, "cond_band_len", None), nk)
-	cond_band_mask = jnp.asarray(getattr(win, "cond_band_mask", None), dtype=jnp.bool_)
-
-	# Extract window params
-	vmin = jnp.asarray(win.val_window.start_energy)
-	vmax = jnp.asarray(win.val_window.end_energy)
-	cmin = jnp.asarray(win.cond_window.start_energy)
-	cmax = jnp.asarray(win.cond_window.end_energy)
-	tau_i = jnp.asarray(win.tau_i, dtype=jnp.float64)
-	z_lm = jnp.asarray(win.z_lm, dtype=jnp.complex128)
-	w_i = jnp.asarray(win.w_i, dtype=jnp.complex128)
-
-	_ensure_compilation_cache()
-	mesh_key = _register_mesh_shardings(mesh_xy)
-	kernel = _get_chi_kernel(mesh_key, nkx, nky, nkz, max_val_len, max_cond_len)
-
-	with jax_profile.annotation(f"chi0_kernel[v{max_val_len}_c{max_cond_len}]"):
-		chi_q = kernel(
-			psi_vTX, psi_vY, psi_cX, psi_cTY, enk_v, enk_c,
-			vmin, vmax, cmin, cmax, tau_i, z_lm, w_i,
-			val_band_start, val_band_len, val_band_mask,
-			cond_band_start, cond_band_len, cond_band_mask,
-			nkx, nky, nkz, max_val_len, max_cond_len,
-		)
-	chi_q = jax.lax.with_sharding_constraint(chi_q, NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y')))
-	return chi_q
-
-
-def get_chi0_jax(
-	psi_vTX: jax.Array,
-	psi_vY: jax.Array,
-	psi_cX: jax.Array,
-	psi_cTY: jax.Array,
-	enk_v: jax.Array,
-	enk_c: jax.Array,
-	windows,
-	meta: Meta,
-	mesh_xy: Mesh | None = None,
-):
-	"""Sum chi_lm over windows using JAX arrays.
-
-	Args:
-		psi_vTX: (nk, ns, rmu, nb)  left valence, rmu sharded on X, band is fastest
-		psi_vY:  (nk, nb, ns, rmu)  right valence, rmu sharded on Y, rmu is fastest
-		psi_cX:  (nk, ns, rmu, nb)  left conduction, rmu sharded on X, band is fastest
-		psi_cTY: (nk, nb, ns, rmu)  right conduction, rmu sharded on Y, rmu is fastest
-		enk_v: (nk, nb_v)
-		enk_c: (nk, nb_c)
-		windows: iterable of window objects
-		meta: Meta
-		mesh_xy: optional mesh for sharding
-
-	Returns:
-		chi_q: (nkx,nky,nkz,npol1=1,nrmu1,npol2=1,nrmu2) complex128
-	"""
-	enk_v_host = None
-	enk_c_host = None
-	for win in windows:
-		if getattr(win, "_has_band_ranges", False):
-			continue
-		if enk_v_host is None:
-			enk_v_host = np.asarray(jax.device_get(enk_v))
-		if enk_c_host is None:
-			enk_c_host = np.asarray(jax.device_get(enk_c))
-		_ensure_window_band_ranges(win, enk_v_host, enk_c_host)
-
-	# JIT per-window compute; windows typically small in count
-	chi_sum = None
-	for w_i, win in enumerate(windows):
-		step_detail = f"v{win.max_val_len}_c{win.max_cond_len}"
-		with jax_profile.step_annotation("chi0_window", step_num=w_i, detail=step_detail):
-			chi_win = get_chi_lm_Yt_jax(psi_vTX, psi_vY, psi_cX, psi_cTY, enk_v, enk_c, win, meta, mesh_xy)
-			chi_sum = chi_win if chi_sum is None else (chi_sum + chi_win)
-	return chi_sum
-
-
-def get_chi_omega_jax(
-	psi_vTX: jax.Array,
-	psi_vY: jax.Array,
-	psi_cX: jax.Array,
-	psi_cTY: jax.Array,
-	enk_v: jax.Array,
-	enk_c: jax.Array,
-	windows,
-	omega: float,
-	meta: Meta,
-	mesh_xy: Mesh,
-):
-	"""Compute χ(ω) for a single frequency using GL or HGL per window.
-	
-	For each window pair, classifies whether ω requires GL (non-crossing)
-	or HGL (crossing) quadrature based on the window energy bounds.
-	
-	Caller should:
-	- Call _ensure_window_band_ranges for each window beforehand
-	- Call win.init_hgl_quadrature() for any windows that may need HGL
-	
-	Args:
-		psi_vTX, psi_vY, psi_cX, psi_cTY: wavefunctions (same as get_chi0_jax)
-		enk_v, enk_c: band energies
-		windows: iterable of WindowPair objects (with band ranges populated)
-		omega: frequency (in Ry) at which to evaluate χ
-		meta: Meta with nkx,nky,nkz
-		mesh_xy: device mesh for sharding
-	
-	Returns:
-		chi_q: (nkx,nky,nkz,1,nrmu,1,nrmu) complex128
-	"""
-	omega_abs = abs(omega)
-	chi_sum = None
-	
-	for win in windows:
-		if win.max_val_len == 0 or win.max_cond_len == 0:
-			continue
-		
-		# Check if this window uses GL or HGL
-		E_gap = win.cond_window.start_energy - win.val_window.end_energy
-		E_bw = win.cond_window.end_energy - win.val_window.start_energy
-		uses_hgl = (omega_abs >= E_gap) and (omega_abs <= E_bw)
-		
-		if uses_hgl:
-			chi_win = _compute_chi_omega_hgl(
-				psi_vTX, psi_vY, psi_cX, psi_cTY, enk_v, enk_c,
-				win, omega, meta, mesh_xy
-			)
-		else:
-			chi_win = _compute_chi_omega_gl(
-				psi_vTX, psi_vY, psi_cX, psi_cTY, enk_v, enk_c,
-				win, omega, meta, mesh_xy
-			)
-		
-		chi_sum = chi_win if chi_sum is None else (chi_sum + chi_win)
-	
-	return chi_sum
-
-
-def _compute_chi_omega_gl(
-	psi_vTX, psi_vY, psi_cX, psi_cTY, enk_v, enk_c,
-	win, omega: float, meta: Meta, mesh_xy: Mesh,
-) -> jax.Array:
-	"""Compute χ(ω) contribution from one window using GL quadrature.
-	
-	For GL (non-crossing), includes frequency-dependent phase factor exp(iωτ/γ).
-	Assumes win._has_band_ranges is True.
-	"""
-	nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
-	
-	tau_i = jnp.asarray(win.tau_i, dtype=jnp.float64)
-	z_lm = jnp.asarray(win.z_lm, dtype=jnp.float64)
-	w_i = jnp.asarray(win.w_i, dtype=jnp.float64)
-	omega_jax = jnp.asarray(omega, dtype=jnp.float64)
-	
-	val_band_start = jnp.asarray(win.val_band_start, dtype=jnp.int32)
-	val_band_len = jnp.asarray(win.val_band_len, dtype=jnp.int32)
-	val_band_mask = jnp.asarray(win.val_band_mask, dtype=jnp.bool_)
-	cond_band_start = jnp.asarray(win.cond_band_start, dtype=jnp.int32)
-	cond_band_len = jnp.asarray(win.cond_band_len, dtype=jnp.int32)
-	cond_band_mask = jnp.asarray(win.cond_band_mask, dtype=jnp.bool_)
-	
-	_ensure_compilation_cache()
-	mesh_key = _register_mesh_shardings(mesh_xy)
-	kernel = _get_chi_omega_gl_kernel(mesh_key, nkx, nky, nkz, win.max_val_len, win.max_cond_len)
-	
-	chi_q = kernel(
-		psi_vTX, psi_vY, psi_cX, psi_cTY, enk_v, enk_c,
-		jnp.asarray(win.val_window.start_energy, dtype=jnp.float64),
-		jnp.asarray(win.val_window.end_energy, dtype=jnp.float64),
-		jnp.asarray(win.cond_window.start_energy, dtype=jnp.float64),
-		jnp.asarray(win.cond_window.end_energy, dtype=jnp.float64),
-		tau_i, z_lm, w_i, omega_jax,
-		val_band_start, val_band_len, val_band_mask,
-		cond_band_start, cond_band_len, cond_band_mask,
-		nkx, nky, nkz, win.max_val_len, win.max_cond_len,
-	)
-	return chi_q
-
-
-@lru_cache(maxsize=None)
-def _get_chi_omega_gl_kernel(mesh_key, nkx: int, nky: int, nkz: int, max_val_len: int, max_cond_len: int):
-	"""GL kernel for χ(ω) with frequency-dependent phase factors."""
-	shards = _MESH_SHARD_REGISTRY[mesh_key]
-	xt_shard = shards["xt"]
-	y_shard = shards["y_shard"]
-	x_shard = shards["x_shard"]
-	yt_shard = shards["yt"]
-	out_shard = shards["out"]
-	chiR_shard = shards["chiR"]
-	gv_shard = shards["gv"]
-	gc_shard = shards["gc"]
-
-	@partial(
-		jax.jit,
-		static_argnames=("nkx", "nky", "nkz", "max_val_len", "max_cond_len"),
-		in_shardings=(
-			xt_shard, y_shard, x_shard, yt_shard,
-			None, None,  # enk_v, enk_c
-			None, None, None, None,  # vmin, vmax, cmin, cmax
-			None, None, None, None,  # tau_i, z_lm, w_i, omega
-			None, None, None,  # val_start, val_len, val_mask
-			None, None, None,  # cond_start, cond_len, cond_mask
-		),
-		out_shardings=out_shard,
-	)
-	def _compute(
-		psi_vTX, psi_vY, psi_cX, psi_cTY, enk_v, enk_c,
-		vmin, vmax, cmin, cmax, tau_i, z_lm, w_i, omega,
-		val_start, val_len, val_mask,
-		cond_start, cond_len, cond_mask,
-		nkx: int, nky: int, nkz: int,
-		max_val_len: int, max_cond_len: int,
-	) -> jax.Array:
-		nrmu_local = psi_vTX.shape[2]
-		if max_val_len == 0 or max_cond_len == 0 or tau_i.shape[0] == 0:
-			chi_empty = jnp.zeros((nkx, nky, nkz, 1, nrmu_local, 1, nrmu_local), dtype=jnp.complex128)
-			return jax.lax.with_sharding_constraint(chi_empty, out_shard)
-
-		# Slice to window
-		psi_vTX_win = _slice_along_axis(psi_vTX, val_start, max_val_len, axis=3)
-		psi_vY_win = _slice_along_axis(psi_vY, val_start, max_val_len, axis=1)
-		psi_cX_win = _slice_along_axis(psi_cX, cond_start, max_cond_len, axis=1)
-		psi_cTY_win = _slice_along_axis(psi_cTY, cond_start, max_cond_len, axis=3)
-		enk_v_win = _slice_along_axis(enk_v, val_start, max_val_len, axis=1)
-		enk_c_win = _slice_along_axis(enk_c, cond_start, max_cond_len, axis=1)
-
-		# Apply masks
-		val_mask_f = val_mask.astype(psi_vTX_win.dtype)
-		cond_mask_f = cond_mask.astype(psi_cX_win.dtype)
-		psi_vTX_win = psi_vTX_win * val_mask_f[:, None, None, :]
-		psi_vY_win = psi_vY_win * val_mask_f[:, :, None, None]
-		psi_cX_win = psi_cX_win * cond_mask_f[:, :, None, None]
-		psi_cTY_win = psi_cTY_win * cond_mask_f[:, None, None, :]
-		val_mask_complex = val_mask.astype(jnp.complex128)
-		cond_mask_complex = cond_mask.astype(jnp.complex128)
-
-		# For GL with omega: quad_w includes the ω phase factor
-		# χ(ω) = Σ_τ w(τ) exp(iωτ/γ) χ_static(τ)
-		# where χ_static uses exp(-γτ(E_c - E_v))
-		# The omega phase factor modifies the effective energy difference
-		quad_w = -2.0 * z_lm * w_i * jnp.exp(-(z_lm * (cmin - vmax) - 1.0) * tau_i)
-
-		def _k_to_R(g_k: jax.Array, flip_sign: bool) -> jax.Array:
-			g_fft = g_k.reshape(nkx, nky, nkz, *g_k.shape[1:]).transpose(3, 4, 5, 6, 0, 1, 2)
-			return jax.lax.cond(
-				flip_sign,
-				lambda x: jnp.fft.fftn(x, axes=(-3, -2, -1), norm='ortho'),
-				lambda x: jnp.fft.ifftn(x, axes=(-3, -2, -1), norm='ortho'),
-				g_fft,
-			)
-
-		def tau_body(itau, chi_R_acc):
-			tau = tau_i[itau]
-			# Include omega phase: energies shifted by ω
-			# For positive ω: valence phases get exp(-z_lm τ (vmax - E_v))
-			#                 conduction phases get exp(-z_lm τ (E_c - cmin))
-			# Then multiply by exp(i ω τ / z_lm) for the overall frequency shift
-			exp_v = jnp.exp(-z_lm * tau * (vmax - enk_v_win)) * val_mask_complex
-			exp_c = jnp.exp(-z_lm * tau * (enk_c_win - cmin)) * cond_mask_complex
-			
-			# ω phase factor (applied uniformly to the product)
-			omega_phase = jnp.exp(1j * omega * tau / z_lm)
-			
-			w_v = exp_v.astype(jnp.complex128)
-			w_c = exp_c.astype(jnp.complex128)
-			Gv_k = jnp.einsum('ksxm,km,kmty->ksxty', jnp.conj(psi_vTX_win), w_v, psi_vY_win, optimize=True)
-			Gc_k = jnp.einsum('ksxm,km,kmty->ksxty', jnp.conj(psi_cTY_win), w_c, psi_cX_win, optimize=True)
-			Gv_k = jax.lax.with_sharding_constraint(Gv_k, gv_shard)
-			Gc_k = jax.lax.with_sharding_constraint(Gc_k, gc_shard)
-			Gv_R = _k_to_R(Gv_k, flip_sign=False)
-			Gc_R = _k_to_R(Gc_k, flip_sign=True)
-			chi_tau = jnp.einsum('ambnxyz, bnamxyz-> mnxyz', Gc_R, Gv_R, optimize=True)
-			return chi_R_acc + quad_w[itau] * omega_phase * chi_tau
-
-		chi_R = jnp.zeros((nrmu_local, nrmu_local, nkx, nky, nkz), dtype=jnp.complex128)
-		chi_R = jax.lax.with_sharding_constraint(chi_R, chiR_shard)
-		chi_R = jax.lax.fori_loop(0, tau_i.shape[0], tau_body, chi_R)
-		chi_q = jnp.fft.fftn(chi_R, axes=(-3, -2, -1), norm='ortho')
-		chi_q = chi_q.transpose(2, 3, 4, 0, 1)[:, :, :, None, :, None, :]
-		return jax.lax.with_sharding_constraint(chi_q, out_shard)
-
-	return _compute
-
-
-def solve_dyson_jax(
-	V_qmunu: jax.Array,
-	chi_q: jax.Array,
-	meta: Meta,
-	mesh_xy: Mesh,
-	pref: float = 1.0,
-) -> jax.Array:
-	"""Solve Dyson equation W = V / (1 - V χ) without whitening.
-	
-	This is the simplified version without overlap matrix S handling.
-	Used internally by both static and dynamic W routines.
-
-	Args:
-		V_qmunu: (1, 1, 1, nkx, nky, nkz, nrmu, nrmu) bare Coulomb
-		chi_q: (nkx, nky, nkz, 1, nrmu, 1, nrmu) polarizability
-		meta: Meta with k-grid dimensions
-		mesh_xy: device mesh for sharding
-		pref: prefactor to multiply chi (normalization)
-
-	Returns:
-		W_q: (nkx, nky, nkz, 1, nrmu, 1, nrmu) screened interaction
-	"""
-	nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
-	
-	@partial(jax.jit, static_argnames=("nkx", "nky", "nkz"))
-	def _solve(V_qmunu, chi_q, nkx: int, nky: int, nkz: int, pref: float):
-		nk_flat = nkx * nky * nkz
-		kXY3 = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
-		
-		# Flatten V: (1,1,1,nkx,nky,nkz,n,n) -> (nk,n,n)
-		V_kmn = V_qmunu[0, 0, 0]
-		V_flat = V_kmn.reshape(nk_flat, V_kmn.shape[-2], V_kmn.shape[-1])
-		V_flat = jax.lax.with_sharding_constraint(V_flat, kXY3)
-		
-		# Flatten chi: (nkx,nky,nkz,1,n,1,n) -> (nk,n,n)
-		chi_kmn = chi_q[:, :, :, 0, :, 0, :]
-		chi_flat = chi_kmn.reshape(nk_flat, chi_kmn.shape[-2], chi_kmn.shape[-1])
-		chi_flat = jax.lax.with_sharding_constraint(chi_flat, kXY3)
-		chi_flat = jnp.asarray(pref, dtype=chi_flat.dtype) * chi_flat
-		
-		# Solve (I - V χ) W = V
-		n = V_flat.shape[-1]
-		I = jnp.eye(n, dtype=V_flat.dtype)
-		A = I - jnp.matmul(V_flat, chi_flat)
-		
-		def solve_one(Ak, Vk):
-			lu, piv = jsp_linalg.lu_factor(Ak)
-			return jsp_linalg.lu_solve((lu, piv), Vk)
-		
-		W_flat = jax.vmap(solve_one, in_axes=(0, 0))(A, V_flat)
-		
-		# Reshape back
-		W_kmn = W_flat.reshape(nkx, nky, nkz, n, n)
-		W_out = W_kmn[:, :, :, None, :, None, :]
-		out_shard = NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y'))
-		return jax.lax.with_sharding_constraint(W_out, out_shard)
-	
-	return _solve(V_qmunu, chi_q, nkx, nky, nkz, pref)
+def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int):
+    """
+    Get or create W solve function with two-stage resharding.
+    
+    Strategy (from load_wfns):
+    1. Reshard V, χ from P(..., μ_X, ..., ν_Y) to P((q_XY), μ, ν) for q-parallel solve
+    2. fori_loop over q with replicated (μ, ν) solve per q
+    3. Reshard W back to P(..., μ_X, ..., ν_Y)
+    """
+    cache_key = (id(mesh_xy), nq, n_rmu)
+    if cache_key in _w_solve_cache:
+        return _w_solve_cache[cache_key]
+    
+    Pr = mesh_xy.shape['x']
+    Pc = mesh_xy.shape['y']
+    P_total = Pr * Pc
+    
+    # Shardings
+    chi_in = NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y'))  # χ input
+    V_in = NamedSharding(mesh_xy, P(None, None, None, None, None, 'x', 'y'))    # V input (same for last 2 dims)
+    q_flat_shard = NamedSharding(mesh_xy, P(('x', 'y'), None, None))            # (nq, μ, ν) q-sharded
+    W_out = NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y'))   # W output
+    rep_shard = NamedSharding(mesh_xy, P(None, None))                           # replicated (μ, ν)
+    
+    @jax.jit
+    def _solve_w(V_q: jax.Array, chi_q: jax.Array, pref: jax.Array) -> jax.Array:
+        """
+        Solve W = V (I - V χ)^{-1} = (I - V χ)^{-1} V via LU per q.
+        
+        Two-stage resharding:
+        1. χ, V: P(..., μ_X, ν_Y) → P(q_XY, μ, ν)
+        2. Solve per q with replicated matrices
+        3. W: P(q_XY, μ, ν) → P(..., μ_X, ν_Y)
+        """
+        # Extract shapes
+        nkx, nky, nkz = chi_q.shape[0], chi_q.shape[1], chi_q.shape[2]
+        nq_local = nkx * nky * nkz
+        n = chi_q.shape[4]  # n_rmu
+        
+        # Flatten V: (1, 1, 1, nkx, nky, nkz, μ, ν) → (nq, μ, ν)
+        V_flat = V_q[0, 0, 0].reshape(nq_local, n, n)
+        V_flat = jax.lax.with_sharding_constraint(V_flat, q_flat_shard)
+        
+        # Flatten χ: (nkx, nky, nkz, 1, μ, 1, ν) → (nq, μ, ν)
+        chi_flat = chi_q[:, :, :, 0, :, 0, :].reshape(nq_local, n, n)
+        chi_flat = pref * chi_flat
+        chi_flat = jax.lax.with_sharding_constraint(chi_flat, q_flat_shard)
+        
+        # fori_loop over q with replicated solve
+        def solve_body(iq, W_acc):
+            # All-gather V[iq] and chi[iq] to replicated
+            V_iq = jax.lax.with_sharding_constraint(V_flat[iq], rep_shard)
+            chi_iq = jax.lax.with_sharding_constraint(chi_flat[iq], rep_shard)
+            
+            # Build A = I - V χ
+            I = jnp.eye(n, dtype=V_iq.dtype)
+            A = I - V_iq @ chi_iq
+            
+            # Solve A W = V via LU
+            lu, piv = jsp_linalg.lu_factor(A)
+            W_iq = jsp_linalg.lu_solve((lu, piv), V_iq)
+            
+            return W_acc.at[iq].set(W_iq)
+        
+        # Initialize output with same sharding
+        W_flat = jnp.zeros_like(V_flat)
+        W_flat = jax.lax.with_sharding_constraint(W_flat, q_flat_shard)
+        W_flat = jax.lax.fori_loop(0, nq_local, solve_body, W_flat)
+        
+        # Reshape back: (nq, μ, ν) → (nkx, nky, nkz, 1, μ, 1, ν)
+        W_kqmn = W_flat.reshape(nkx, nky, nkz, n, n)
+        W_out_arr = W_kqmn[:, :, :, None, :, None, :]
+        W_out_arr = jax.lax.with_sharding_constraint(W_out_arr, W_out)
+        
+        return W_out_arr
+    
+    _w_solve_cache[cache_key] = _solve_w
+    return _solve_w
 
 
 def get_static_w_q_jax(
-	V_qmunu: jax.Array,
-	chi_q: jax.Array,
-	S_qmunu: jax.Array | None,
-	meta: Meta,
-	mesh_xy: Mesh,
-):
-	"""Compute static W_q using JAX under k_XY sharding inside a single jit.
-
-	Inputs:
-	- V_qmunu: (1, npol1=1, npol2=1, nkx, nky, nkz, nrmu, nrmu)
-	- chi_q:   (nkx, nky, nkz, 1, nrmu, 1, nrmu)
-	- S_qmunu: (nkx, nky, nkz, nrmu, nrmu) or None (whitening; required for overlap)
-
-	Returns:
-	- W_q: (nkx, nky, nkz, 1, nrmu, 1, nrmu) with mu_X,nu_Y sharding
-	"""
-	# Compute prefactor
-	_nkx, _nky, _nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
-	_Nk = max(1, _nkx * _nky * _nkz)
-	_nspin = max(1, int(getattr(meta, 'nspin', 1)))
-	_nspinor = max(1, int(getattr(meta, 'nspinor', 1)))
-	pref = 2.0 / (math.sqrt(float(_Nk)) * float(_nspin) * float(_nspinor))
-	
-	# Fast path: no whitening
-	if S_qmunu is None:
-		return solve_dyson_jax(V_qmunu, chi_q, meta, mesh_xy, pref)
-	
-	# Whitening path with overlap matrix S
-	# Solve (I - V S^{-1} χ) W = V via Cholesky decomposition S = L L^H
-	@partial(jax.jit, static_argnames=("nkx", "nky", "nkz"))
-	def _compute_whitened(V_qmunu, chi_q, S_qmunu, nkx: int, nky: int, nkz: int, pref: float):
-		nk_flat = nkx * nky * nkz
-		kXY3 = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
-		
-		# Flatten V, chi, S
-		V_kmn = V_qmunu[0, 0, 0]
-		V_flat = V_kmn.reshape(nk_flat, V_kmn.shape[-2], V_kmn.shape[-1])
-		V_flat = jax.lax.with_sharding_constraint(V_flat, kXY3)
-		
-		chi_kmn = chi_q[:, :, :, 0, :, 0, :]
-		chi_flat = chi_kmn.reshape(nk_flat, chi_kmn.shape[-2], chi_kmn.shape[-1])
-		chi_flat = jax.lax.with_sharding_constraint(chi_flat, kXY3)
-		chi_flat = jnp.asarray(pref, dtype=chi_flat.dtype) * chi_flat
-		
-		S_flat = S_qmunu.reshape(nk_flat, S_qmunu.shape[-2], S_qmunu.shape[-1])
-		S_flat = jax.lax.with_sharding_constraint(S_flat, kXY3)
-		
-		# Cholesky: S = L L^H, then compute Y = V S^{-1}
-		n = V_flat.shape[-1]
-		L = jnp.linalg.cholesky(S_flat)
-		# Right solve: Y = V L^{-H} L^{-1}
-		W1_T = jsp_linalg.solve_triangular(
-			L.conj().transpose(0, 2, 1), V_flat.transpose(0, 2, 1), lower=False
-		)
-		Y_T = jsp_linalg.solve_triangular(
-			L.transpose(0, 2, 1), W1_T, lower=False
-		)
-		Y = Y_T.transpose(0, 2, 1)
-		
-		# Solve (I - Y χ) W = V
-		I = jnp.eye(n, dtype=V_flat.dtype)
-		A = I - jnp.matmul(Y, chi_flat)
-		
-		def solve_one(Ak, Vk):
-			lu, piv = jsp_linalg.lu_factor(Ak)
-			return jsp_linalg.lu_solve((lu, piv), Vk)
-		
-		W_flat = jax.vmap(solve_one, in_axes=(0, 0))(A, V_flat)
-		
-		# Reshape back
-		W_kmn = W_flat.reshape(nkx, nky, nkz, n, n)
-		W_out = W_kmn[:, :, :, None, :, None, :]
-		out_shard = NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y'))
-		return jax.lax.with_sharding_constraint(W_out, out_shard)
-
-	return _compute_whitened(V_qmunu, chi_q, S_qmunu, _nkx, _nky, _nkz, pref)
+    V_qmunu: jax.Array,
+    chi_q: jax.Array,
+    S_qmunu: jax.Array | None,
+    meta: Meta,
+    mesh_xy: Mesh,
+) -> jax.Array:
+    """
+    Compute static W_q = (I - V χ)^{-1} V.
+    
+    Uses two-stage resharding following load_wfns pattern:
+    - χ input: P(None, None, None, None, 'x', None, 'y')
+    - Reshard to q-parallel for solve
+    - W output: same as χ
+    
+    Args:
+        V_qmunu: (1, 1, 1, nkx, nky, nkz, n_rmu, n_rmu)
+        chi_q:   (nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
+        S_qmunu: overlap matrix (not yet implemented) or None
+        meta: Meta with k-grid info
+        mesh_xy: 2D device mesh
+    
+    Returns:
+        W_q: (nkx, nky, nkz, 1, n_rmu, 1, n_rmu) with μ_X, ν_Y sharding
+    """
+    if S_qmunu is not None:
+        raise NotImplementedError("Whitening (S_qmunu) not yet implemented in refactored W solve")
+    
+    nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
+    nq = nkx * nky * nkz
+    n_rmu = chi_q.shape[4]
+    
+    # Normalization prefactor
+    Nk = max(1, nq)
+    nspin = max(1, int(getattr(meta, 'nspin', 1)))
+    nspinor = max(1, int(getattr(meta, 'nspinor', 1)))
+    pref = jnp.asarray(2.0 / (math.sqrt(float(Nk)) * float(nspin) * float(nspinor)), dtype=jnp.complex128)
+    
+    # Get cached solve function
+    solve_fn = _get_w_solve_fn(mesh_xy, nq, n_rmu)
+    
+    with jax_profile.annotation("W_solve"):
+        W_q = solve_fn(V_qmunu, chi_q, pref)
+    
+    return W_q
 
 
-def get_w_omega_jax(
-	V_qmunu: jax.Array,
-	psi_vTX: jax.Array,
-	psi_vY: jax.Array,
-	psi_cX: jax.Array,
-	psi_cTY: jax.Array,
-	enk_v: jax.Array,
-	enk_c: jax.Array,
-	windows,
-	omega: float,
-	meta: Meta,
-	mesh_xy: Mesh,
-	S_qmunu: jax.Array | None = None,
-):
-	"""Compute W(ω) = V / (1 - V χ(ω)) for a single frequency.
-	
-	This is the main entry point for dynamic W at a specified frequency.
-	Internally computes χ(ω) using get_chi_omega_jax, then inverts
-	the dielectric matrix.
-	
-	Handles all window preparation: populates band ranges and initializes
-	HGL quadrature for windows where ω causes energy crossings.
-	
-	Args:
-		V_qmunu: bare Coulomb (1, 1, 1, nkx, nky, nkz, nrmu, nrmu)
-		psi_vTX, psi_vY, psi_cX, psi_cTY: wavefunctions
-		enk_v, enk_c: band energies
-		windows: list of WindowPair objects
-		omega: frequency (in Ry)
-		meta: Meta object with k-grid info
-		mesh_xy: device mesh for sharding
-		S_qmunu: optional overlap matrix for whitening
-	
-	Returns:
-		W_q: (nkx, nky, nkz, 1, nrmu, 1, nrmu) complex128
-		chi_omega: the computed χ(ω) for diagnostics
-	"""
-	omega_abs = abs(omega)
-	
-	# Prepare window band ranges (fetch energies to host once)
-	enk_v_host = np.asarray(jax.device_get(enk_v))
-	enk_c_host = np.asarray(jax.device_get(enk_c))
-	
-	for win in windows:
-		_ensure_window_band_ranges(win, enk_v_host, enk_c_host)
-		
-		# Check if this window needs HGL quadrature
-		E_gap = win.cond_window.start_energy - win.val_window.end_energy
-		E_bw = win.cond_window.end_energy - win.val_window.start_energy
-		if (omega_abs >= E_gap) and (omega_abs <= E_bw):
-			win.init_hgl_quadrature()
-	
-	# Compute chi(omega)
-	chi_omega = get_chi_omega_jax(
-		psi_vTX, psi_vY, psi_cX, psi_cTY,
-		enk_v, enk_c, windows, omega, meta, mesh_xy
-	)
-	
-	# Compute W(omega) = V / (1 - V chi)
-	W_omega = get_static_w_q_jax(V_qmunu, chi_omega, S_qmunu, meta, mesh_xy)
-	
-	return W_omega, chi_omega
+# ============================================================================
+# Combined χ₀ → W pipeline
+# ============================================================================
+
+def compute_chi0_and_w(
+    V_qmunu: jax.Array,
+    psi_vTX: jax.Array, psi_vY: jax.Array,
+    psi_cX: jax.Array, psi_cTY: jax.Array,
+    enk_v: jax.Array, enk_c: jax.Array,
+    windows, meta: Meta, mesh_xy: Mesh,
+) -> tuple[jax.Array, jax.Array]:
+    """
+    Compute static χ₀ and screened interaction W.
+    
+    Streamlined pipeline:
+    1. χ₀(q) via universal kernel with energy masking
+    2. W(q) via two-stage resharding + Dyson solve
+    
+    Returns:
+        chi_q: (nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
+        W_q:   (nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
+    """
+    chi_q = compute_chi0(
+        psi_vTX, psi_vY, psi_cX, psi_cTY,
+        enk_v, enk_c, windows, meta, mesh_xy,
+    )
+    
+    W_q = get_static_w_q_jax(V_qmunu, chi_q, None, meta, mesh_xy)
+    
+    return chi_q, W_q
+
+
+# ============================================================================
+# Legacy interface aliases (for backward compatibility)
+# ============================================================================
+
+def get_chi0_jax(
+    psi_vTX: jax.Array, psi_vY: jax.Array,
+    psi_cX: jax.Array, psi_cTY: jax.Array,
+    enk_v: jax.Array, enk_c: jax.Array,
+    windows, meta: Meta, mesh_xy: Mesh | None = None,
+) -> jax.Array:
+    """Compute static χ₀ (alias for compute_chi0)."""
+    return compute_chi0(
+        psi_vTX, psi_vY, psi_cX, psi_cTY,
+        enk_v, enk_c, windows, meta, mesh_xy,
+    )
+
+
+# Re-export legacy functions for W(ω)
+def get_w_omega_jax(*args, **kwargs):
+    """Dynamic W(ω) - delegates to legacy implementation."""
+    from .w_isdf_legacy import get_w_omega_jax as legacy_w_omega
+    return legacy_w_omega(*args, **kwargs)
+
+
+def get_chi_omega_jax(*args, **kwargs):
+    """Dynamic χ(ω) - delegates to legacy implementation."""
+    from .w_isdf_legacy import get_chi_omega_jax as legacy_chi_omega
+    return legacy_chi_omega(*args, **kwargs)

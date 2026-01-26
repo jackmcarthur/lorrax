@@ -1388,15 +1388,6 @@ def fit_zeta_chunked_to_h5(
        d. Solve zeta_q = L^{-H}(L^{-1} Z_q) (q-chunked)
        e. Write zeta_q chunk to HDF5
     
-    X-chunking advantage: With r = x*(ny*nz) + y*nz + z, an x-chunk with
-    x in [x_start, x_end) maps to CONTIGUOUS r-indices [x_start*ny*nz, x_end*ny*nz).
-    This enables single sequential HDF5 writes instead of strided writes.
-    
-    Physics note (spin treatment):
-        cohsex_jax traces over spin for ISDF fitting:
-        P_k(μ,ν) = Σ_{n,s} ψ*_{n,k,s}(μ) ψ_{n,k,s}(ν)
-        This reduces rank of the fitted object vs keeping all (a,b) combinations.
-    
     Args:
         wfn: WFNReader object
         sym: SymMaps object
@@ -1405,8 +1396,8 @@ def fit_zeta_chunked_to_h5(
         mesh_xy: 2D device mesh
         x_chunk_size: Number of x-slices per chunk
         output_file: Path to output HDF5 file
-        band_chunk_size: Bands to process at once (memory control)
-        q_chunk_size: Q-points to solve simultaneously
+        band_chunk_size: Bands to process at once when FFTing wavefunctions (with global r)
+        q_chunk_size: Q-points to solve C_q @ zeta_q = Z_q simultaneously
         bispinor: Whether to use bispinor wavefunctions
         use_gspace_cache: If True, cache G-space across x-chunks
         band_range_left: (start, end) for left wfns. Default: (b0, b3)

@@ -800,6 +800,15 @@ def fit_zeta_and_compute_V_q_chunked(
 	bvec = np.asarray(wfn.blat * wfn.bvec, dtype=np.float64)
 	cell_volume = float(wfn.cell_volume)
 	
+	# V_q memory: zeta_mu(G) + zeta_nu(G) + FFT workspace + V_q block
+	# Available: full budget (no centroids needed, zeta read from H5)
+	n_G = meta.n_rtot
+	bytes_per_complex = 16
+	m_budget_vcoul = memory_budget_gb * 1e9 * 0.9  # 90% of budget
+	# Each mu needs: 2 × n_G × 16 (zeta_mu + zeta_nu for off-diag) + 1 × n_G × 16 (FFT workspace)
+	m_per_mu = 3 * bytes_per_complex * n_G
+	mu_chunk_vcoul = max(1, min(meta.n_rmu, int(m_budget_vcoul / m_per_mu)))
+	
 	with timing.section("cohsex_jax.V_q_compute"):
 		with h5py.File(zeta_h5_path, 'r') as zeta_h5:
 			with mesh_xy:
@@ -809,7 +818,7 @@ def fit_zeta_and_compute_V_q_chunked(
 					fft_grid=meta.fft_grid,
 					bvec=bvec,
 					cell_volume=cell_volume,
-					mu_chunk_size=meta.n_rmu,  # Full mu chunk since we have memory
+					mu_chunk_size=mu_chunk_vcoul,
 					mesh_xy=mesh_xy,
 					sys_dim=sys_dim,
 				)

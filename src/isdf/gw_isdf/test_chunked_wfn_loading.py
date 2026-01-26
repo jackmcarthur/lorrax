@@ -49,7 +49,6 @@ from ..common import Meta, timing
 from ..common.gpu_utils import get_device_memory_gb, get_device_memory_info
 from .cohsex_init import (
     read_cohsex_input, 
-    get_effective_z_chunk_size, 
     compute_optimal_chunks,
     print_memory_breakdown,
 )
@@ -774,8 +773,8 @@ def test_chunked_loading(wfn, sym, meta, centroid_indices, bispinor, mesh_xy,
 def main(argv=None):
     argp = argparse.ArgumentParser(description="ISDF Preprocessing: zeta fitting and V_q computation")
     argp.add_argument("-i", "--input", default="cohsex_test.in", help="Input file")
-    argp.add_argument("--z-chunk", type=int, default=None, 
-                      help="Z-axis chunk size (overrides auto)")
+    argp.add_argument("--x-chunk", type=int, default=None, 
+                      help="X-axis chunk size (overrides auto)")
     argp.add_argument("--band-chunk", type=int, default=None, help="Band chunk size (overrides auto)")
     argp.add_argument("--q-chunk", type=int, default=None, 
                       help="Q-points to solve simultaneously (default=auto)")
@@ -799,7 +798,7 @@ def main(argv=None):
     print("  Steps:")
     print("    1. Load centroid wavefunctions (band-chunked FFT)")
     print("    2. Compute CCT: C_q = Σ_k |P_k(r_μ, r_ν)|²")
-    print("    3. Loop over z-chunks: compute ZCT, solve zeta, write to HDF5")
+    print("    3. Loop over x-chunks: compute ZCT, solve zeta, write to HDF5")
     if args.compute_vcoul:
         print("    4. Compute V_q(μ,ν) = Σ_G ζ̃*_μ(G) v(q+G) ζ̃_ν(G)")
     print("-"*72)
@@ -920,15 +919,15 @@ def main(argv=None):
         
         # Use computed chunks, but allow CLI overrides
         band_chunk_size = args.band_chunk if args.band_chunk is not None else chunks['band_chunk']
-        z_chunk_size = args.z_chunk if args.z_chunk is not None else chunks['z_chunk']
+        x_chunk_size = args.x_chunk if args.x_chunk is not None else chunks['x_chunk']
         q_chunk_size = args.q_chunk if args.q_chunk is not None else chunks['q_chunk']
         
-        if args.band_chunk or args.z_chunk or args.q_chunk:
+        if args.band_chunk or args.x_chunk or args.q_chunk:
             print(f"\n  CLI overrides applied:")
             if args.band_chunk:
                 print(f"    --band-chunk={args.band_chunk} (was {chunks['band_chunk']})")
-            if args.z_chunk:
-                print(f"    --z-chunk={args.z_chunk} (was {chunks['z_chunk']})")
+            if args.x_chunk:
+                print(f"    --x-chunk={args.x_chunk} (was {chunks['x_chunk']})")
             if args.q_chunk:
                 print(f"    --q-chunk={args.q_chunk} (was {chunks['q_chunk']})")
         
@@ -936,12 +935,13 @@ def main(argv=None):
         print(f"\nWARNING: Memory auto-sizing failed: {e}")
         print("Using fallback chunk sizes...")
         
-        # Fallback to legacy z_chunk_size computation
-        z_chunk_input = args.z_chunk if args.z_chunk is not None else params.get("z_chunk_size", 0)
+        # Fallback to legacy x_chunk_size computation
+        x_chunk_input = args.x_chunk if args.x_chunk is not None else params.get("x_chunk_size", 0)
         max_wfn_chunk_mb = params.get("max_wfn_chunk_mb", 0.0)
-        z_chunk_size = get_effective_z_chunk_size(
-            z_chunk_input, meta.fft_grid, n_rmu, 
-            mesh_y_size=mesh_y_size,
+        from .cohsex_init import get_effective_x_chunk_size
+        x_chunk_size = get_effective_x_chunk_size(
+            x_chunk_input, meta.fft_grid, n_rmu, 
+            mesh_x_size=mesh_x_size,
             max_wfn_chunk_mb=max_wfn_chunk_mb,
             nk_tot=meta.nk_tot,
             nspinor=meta.nspinor,
@@ -949,14 +949,14 @@ def main(argv=None):
         band_chunk_size = args.band_chunk if args.band_chunk is not None else 16
         q_chunk_size = args.q_chunk if args.q_chunk is not None else n_q
         
-        # Print legacy z_chunk info
-        n_zchunk = nx * ny * z_chunk_size
-        pk_chunk_bytes = meta.nk_tot * meta.nspinor * meta.nspinor * n_rmu * n_zchunk * 16
+        # Print fallback x_chunk info
+        n_xchunk = x_chunk_size * ny * nz
+        pk_chunk_bytes = meta.nk_tot * n_rmu * n_xchunk * 16  # Spin-traced pair density
         pk_chunk_mb = pk_chunk_bytes / 1e6
         
         print(f"\nFallback chunk configuration:")
-        print(f"  z_chunk_size: {z_chunk_size} z-slices")
-        print(f"  n_zchunk: {n_zchunk} = {nx}×{ny}×{z_chunk_size}")
+        print(f"  x_chunk_size: {x_chunk_size} x-slices")
+        print(f"  n_xchunk: {n_xchunk} = {x_chunk_size}×{ny}×{nz}")
         print(f"  P_k(rmu, rchunk) size: {pk_chunk_mb:.1f} MB")
         print(f"  band_chunk_size: {band_chunk_size}")
         print(f"  q_chunk_size: {q_chunk_size}")
@@ -964,31 +964,20 @@ def main(argv=None):
     # =========================================================================
     # COMPUTE OPTIMAL MU-CHUNK SIZE FOR V_q (if requested)
     # =========================================================================
-    # V_q computation memory model:
-    #   - FFT workspace: 2 × B_μ × n_G (input + output)
-    #   - √v(G): n_G (small, replicated)
-    #   - V_q output: n_μ × n_μ (sharded P('x','y'))
-    # Peak per device: 2 × B_μ × n_G × 16 bytes
-    # Available after zeta fitting: budget - centroids
+    # V_q memory: zeta_mu(G) + zeta_nu(G) + FFT workspace + V_q block (small)
+    # No centroids needed - zeta is read from H5
+    # Available: full budget
     
     if args.compute_vcoul:
-        # Compute mu_chunk_size from remaining memory
         bytes_per_complex = 16
         n_G = meta.n_rtot
         
-        # After zeta fitting, we have: centroids in memory (psi_rmu_Y, psi_rmuT_X)
-        # V_q output: (n_q, n_rmu, n_rmu) but computed one q at a time → (n_rmu, n_rmu)
-        m_centroids_gb = chunks['memory_estimate']['centroids_gb']
-        m_V_q_output = bytes_per_complex * n_rmu * n_rmu / n_devices  # Sharded
+        # Available: 90% of budget (no centroids needed for V_q)
+        m_budget_vcoul = memory_budget_gb * 1e9 * 0.9
         
-        # Available for FFT workspace
-        m_available_vcoul = (memory_budget_gb * 1e9 * 0.7) - m_centroids_gb * 1e9 - m_V_q_output
-        
-        # FFT workspace: 2 chunks (for μ and ν) × B_μ × n_G × 16
-        # Need to fit 2 chunks simultaneously for off-diagonal blocks
-        m_per_chunk = bytes_per_complex * n_G
-        max_mu_chunk = int(m_available_vcoul / (2 * m_per_chunk))
-        mu_chunk_size = max(16, min(n_rmu, max_mu_chunk))
+        # Per mu: zeta_mu(G) + zeta_nu(G) for off-diag + FFT workspace = 3 × n_G × 16
+        m_per_mu = 3 * bytes_per_complex * n_G
+        mu_chunk_size = max(1, min(n_rmu, int(m_budget_vcoul / m_per_mu)))
         
         # Allow CLI override
         if args.mu_chunk is not None:
@@ -997,16 +986,16 @@ def main(argv=None):
         n_mu_chunks = (n_rmu + mu_chunk_size - 1) // mu_chunk_size
         print(f"\n  V_q computation:")
         print(f"    mu_chunk_size = {mu_chunk_size} ({n_mu_chunks} chunks)")
-        print(f"    FFT workspace = {2 * mu_chunk_size * n_G * 16 / 1e6:.1f} MB/device")
+        print(f"    Memory per mu = {m_per_mu / 1e6:.1f} MB")
     else:
         mu_chunk_size = None
     
     # Summary of final chunk sizes
     print(f"\n  Final chunk sizes:")
     print(f"    band_chunk_size = {band_chunk_size}")
-    print(f"    z_chunk_size = {z_chunk_size}")
+    print(f"    x_chunk_size = {x_chunk_size}")
     print(f"    q_chunk_size = {q_chunk_size}")
-    print(f"    Num z-chunks to cover full grid: {(nz + z_chunk_size - 1) // z_chunk_size}")
+    print(f"    Num x-chunks to cover full grid: {(nx + x_chunk_size - 1) // x_chunk_size}")
     if mu_chunk_size:
         print(f"    mu_chunk_size = {mu_chunk_size} (for V_q)")
     
@@ -1024,7 +1013,7 @@ def main(argv=None):
     print("STEP 1: ZETA FITTING")
     print(f"{'='*60}")
     use_gspace_cache = chunks.get('use_gspace_cache', True)
-    print(f"  Chunk sizes: band={band_chunk_size}, z={z_chunk_size}, q={q_chunk_size}")
+    print(f"  Chunk sizes: band={band_chunk_size}, x={x_chunk_size}, q={q_chunk_size}")
     print(f"  G-space cache: {'enabled' if use_gspace_cache else 'disabled'}")
     print(f"  Output: {output_path}")
     
@@ -1037,7 +1026,7 @@ def main(argv=None):
     with mesh_xy:
         psi_l_rmu_Y, psi_l_rmuT_X, psi_r_rmu_Y, psi_r_rmuT_X = fit_zeta_chunked_to_h5(
             wfn, sym, meta, centroid_indices, mesh_xy,
-            z_chunk_size, output_path, band_chunk_size, q_chunk_size, bispinor,
+            x_chunk_size, output_path, band_chunk_size, q_chunk_size, bispinor,
             use_gspace_cache=use_gspace_cache,
             band_range_left=band_range_left,
             band_range_right=band_range_right,
