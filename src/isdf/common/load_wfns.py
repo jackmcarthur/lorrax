@@ -1364,7 +1364,7 @@ def fit_zeta_chunked_to_h5(
     meta: Meta,
     centroid_indices: jax.Array,
     mesh_xy: Mesh,
-    z_chunk_size: int,
+    x_chunk_size: int,
     output_file: str,
     band_chunk_size: int = 16,
     q_chunk_size: int = 1,
@@ -1374,19 +1374,23 @@ def fit_zeta_chunked_to_h5(
     band_range_right: tuple[int, int] | None = None,
 ):
     """
-    Full zeta fitting pipeline with z-chunk loop and HDF5 output.
+    Full zeta fitting pipeline with x-chunk loop and HDF5 output.
     
     Workflow:
     1. Load wavefunctions (band-chunked FFT) for max range
     2. Slice to get left (0:b3) and right (0:b4) views
     3. Compute C_q from spin-traced P_l × P_r via ortho FFT
     4. Compute L_q = chol(C_q) using 2D blocked algorithm
-    5. For each z-chunk:
+    5. For each x-chunk:
        a. Compute psi_nk,a(r_chunk) via FFT
-       b. Compute spin-traced P_l and P_r at z-chunk
+       b. Compute spin-traced P_l and P_r at x-chunk
        c. Compute Z_q via ortho FFT with left/right cross-product
        d. Solve zeta_q = L^{-H}(L^{-1} Z_q) (q-chunked)
        e. Write zeta_q chunk to HDF5
+    
+    X-chunking advantage: With r = x*(ny*nz) + y*nz + z, an x-chunk with
+    x in [x_start, x_end) maps to CONTIGUOUS r-indices [x_start*ny*nz, x_end*ny*nz).
+    This enables single sequential HDF5 writes instead of strided writes.
     
     Physics note (spin treatment):
         cohsex_jax traces over spin for ISDF fitting:
@@ -1399,12 +1403,12 @@ def fit_zeta_chunked_to_h5(
         meta: Meta object with system info
         centroid_indices: ISDF centroid indices
         mesh_xy: 2D device mesh
-        z_chunk_size: Number of z-slices per chunk
+        x_chunk_size: Number of x-slices per chunk
         output_file: Path to output HDF5 file
         band_chunk_size: Bands to process at once (memory control)
         q_chunk_size: Q-points to solve simultaneously
         bispinor: Whether to use bispinor wavefunctions
-        use_gspace_cache: If True, cache G-space across z-chunks
+        use_gspace_cache: If True, cache G-space across x-chunks
         band_range_left: (start, end) for left wfns. Default: (b0, b3)
         band_range_right: (start, end) for right wfns. Default: (b0, b4)
     
@@ -1424,9 +1428,9 @@ def fit_zeta_chunked_to_h5(
     nqx, nqy, nqz = kgrid
     nq = nqx * nqy * nqz
     
-    # Number of z-chunks
-    num_z_chunks = (nz + z_chunk_size - 1) // z_chunk_size
-    n_zchunk = nx * ny * z_chunk_size
+    # Number of x-chunks (x is the slowest-varying index, so x-chunks are contiguous in r)
+    num_x_chunks = (nx + x_chunk_size - 1) // x_chunk_size
+    n_xchunk = x_chunk_size * ny * nz  # Points per full x-chunk (contiguous in r-space!)
     
     # Band ranges for left and right wavefunctions (cohsex_jax convention)
     # Left:  (b0, b3) = all occupied + sigma conduction
@@ -1445,7 +1449,7 @@ def fit_zeta_chunked_to_h5(
     nb_full = band_range_full[1] - band_range_full[0]
     
     print(f"\n{'='*60}")
-    print(f"Zeta fitting: {num_z_chunks} z-chunks, {n_zchunk} points each")
+    print(f"Zeta fitting: {num_x_chunks} x-chunks, {n_xchunk} points each")
     print(f"  Left bands:  {band_range_left} ({nb_left} bands)")
     print(f"  Right bands: {band_range_right} ({nb_right} bands)")
     print(f"  Full range:  {band_range_full} ({nb_full} bands)")
@@ -1531,28 +1535,28 @@ def fit_zeta_chunked_to_h5(
                 'zeta_q',
                 shape=(nqx, nqy, nqz, n_rmu, n_rtot),
                 dtype=np.complex128,
-                chunks=(1, 1, 1, n_rmu, n_zchunk),  # Chunk by z-slice
+                chunks=(1, 1, 1, n_rmu, n_xchunk),  # Chunk by x-slice (contiguous in r!)
             )
             # Store metadata
             f.attrs['n_rmu'] = n_rmu
             f.attrs['n_rtot'] = n_rtot
             f.attrs['fft_grid'] = meta.fft_grid
             f.attrs['kgrid'] = kgrid
-            f.attrs['z_chunk_size'] = z_chunk_size
-            f.attrs['num_z_chunks'] = num_z_chunks
+            f.attrs['x_chunk_size'] = x_chunk_size
+            f.attrs['num_x_chunks'] = num_x_chunks
     
     # Synchronize before writing
     jax.experimental.multihost_utils.sync_global_devices("zeta_h5_create")
     
     # ========== STEP 5: Pre-load G-space for all band chunks (ONCE) ==========
     # This caches the expensive HDF5 read + scatter so we don't repeat it
-    # for each z-chunk. Memory cost depends on band_range_full (can be large).
+    # for each x-chunk. Memory cost depends on band_range_full (can be large).
     kgrid_arr = np.array(meta.kgrid)
     kvecs_frac = sym.kvecs_asints / kgrid_arr[None, :]
     
     if use_gspace_cache:
         with timing.section("zeta_fit.cache_gspace"):
-            print("\nCaching G-space wavefunctions for z-chunk loop...")
+            print("\nCaching G-space wavefunctions for x-chunk loop...")
             # Cache FULL band range (max of left and right)
             cached_gspace = load_gspace_for_bands(
                 wfn, sym, meta, mesh_xy, band_range_full, bispinor, band_chunk_size
@@ -1561,9 +1565,9 @@ def fit_zeta_chunked_to_h5(
     else:
         cached_gspace = None
         print("\nG-space caching DISABLED (too large for memory budget)")
-        print("  Will reload from HDF5 each z-chunk (slower)")
+        print("  Will reload from HDF5 each x-chunk (slower)")
     
-    # ========== STEP 6: Loop over z-chunks ==========
+    # ========== STEP 6: Loop over x-chunks ==========
     # Track timing for summary (manual perf_counter for detailed breakdown)
     t_load_total = 0.0
     t_pair_total = 0.0
@@ -1578,19 +1582,27 @@ def fit_zeta_chunked_to_h5(
     write_error = [None]  # Mutable container to capture errors from writer thread
     
     def writer_worker():
-        """Background thread that processes HDF5 writes from the queue."""
+        """Background thread that processes HDF5 writes from the queue.
+        
+        X-chunking advantage: With r = x*(ny*nz) + y*nz + z, an x-chunk with
+        x in [x_start, x_end) maps to CONTIGUOUS r-indices [x_start*ny*nz, x_end*ny*nz).
+        This enables a single sequential HDF5 write per chunk!
+        """
         try:
             while True:
                 item = write_queue.get()
                 if item is None:  # Poison pill signals shutdown
                     break
                 zeta_data, r_start, r_end, chunk_id = item
-                # Open file, write, close (HDF5 isn't thread-safe for concurrent access)
+                # zeta_data: (nq, n_rmu, actual_n_xchunk) 
+                # X-chunks are CONTIGUOUS in r-space, so we can write directly!
+                
                 with h5py.File(output_file, 'a') as f:
                     for q_flat in range(nq):
                         qx = q_flat // (nqy * nqz)
                         qy = (q_flat % (nqy * nqz)) // nqz
                         qz = q_flat % nqz
+                        # Single contiguous write per q-point!
                         f['zeta_q'][qx, qy, qz, :, r_start:r_end] = zeta_data[q_flat]
                 write_queue.task_done()
         except Exception as e:
@@ -1604,71 +1616,72 @@ def fit_zeta_chunked_to_h5(
         writer_thread.start()
     
     with timing.section("zeta_fit.chunk_loop"):
-        for chunk_idx in range(num_z_chunks):
-            z_start = chunk_idx * z_chunk_size
-            z_end = min(z_start + z_chunk_size, nz)
-            actual_z_size = z_end - z_start
-            actual_n_zchunk = nx * ny * actual_z_size
+        for chunk_idx in range(num_x_chunks):
+            x_start = chunk_idx * x_chunk_size
+            x_end = min(x_start + x_chunk_size, nx)
+            actual_x_size = x_end - x_start
+            actual_n_xchunk = actual_x_size * ny * nz
             
-            r_start = chunk_idx * n_zchunk
-            r_end = r_start + actual_n_zchunk
+            # X-chunks are CONTIGUOUS in r-space: r = x*(ny*nz) + y*nz + z
+            r_start = x_start * ny * nz
+            r_end = x_end * ny * nz
             
-            print(f"Chunk {chunk_idx+1}/{num_z_chunks}: r=[{r_start}:{r_end}]")
+            print(f"Chunk {chunk_idx+1}/{num_x_chunks}: x=[{x_start}:{x_end}], r=[{r_start}:{r_end}]")
             
             # 6a. Get psi_nk,a(r_chunk) for FULL band range
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.load"):
                 if cached_gspace is not None:
                     # Fast path: FFT only (G-space is cached)
-                    psi_zchunk_full_Y = get_psi_zchunk_from_cached(
+                    psi_xchunk_full_Y = get_psi_xchunk_from_cached(
                         cached_gspace, meta, mesh_xy, band_range_full,
-                        z_start, z_end, kvecs_frac,
+                        x_start, x_end, kvecs_frac,
                         band_chunk_size=band_chunk_size
                     )
                 else:
                     # Slow path: reload from HDF5 each chunk
-                    psi_zchunk_full_Y = get_psi_zchunk(
+                    psi_xchunk_full_Y = get_psi_xchunk(
                         wfn, sym, meta, mesh_xy, band_range_full,
-                        z_start, z_end, bispinor,
+                        x_start, x_end, bispinor,
                         band_chunk_size=band_chunk_size
                     )
-                psi_zchunk_full_Y.block_until_ready()
+                psi_xchunk_full_Y.block_until_ready()
                 
                 # Slice for left and right (same logic as centroids)
-                psi_l_zchunk_Y = psi_zchunk_full_Y[:, l_band_start:l_band_end, :, :]
-                psi_r_zchunk_Y = psi_zchunk_full_Y[:, r_band_start:r_band_end, :, :]
+                psi_l_xchunk_Y = psi_xchunk_full_Y[:, l_band_start:l_band_end, :, :]
+                psi_r_xchunk_Y = psi_xchunk_full_Y[:, r_band_start:r_band_end, :, :]
             t_load_total += time.perf_counter() - t0
             
             # 6b. Compute spin-traced pair densities for left and right
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.pair_density"):
                 # Left: P_l_k(μ, r) = Σ_{n,s} ψ*_l(μ) ψ_l(r)
-                P_l_k_muz = compute_pair_density_spin_traced_zchunk(
-                    psi_l_rmuT_X, psi_l_zchunk_Y, mesh_xy
+                P_l_k_mux = compute_pair_density_spin_traced_xchunk(
+                    psi_l_rmuT_X, psi_l_xchunk_Y, mesh_xy
                 )
                 # Right: P_r_k(μ, r) = Σ_{n,s} ψ*_r(μ) ψ_r(r)
-                P_r_k_muz = compute_pair_density_spin_traced_zchunk(
-                    psi_r_rmuT_X, psi_r_zchunk_Y, mesh_xy
+                P_r_k_mux = compute_pair_density_spin_traced_xchunk(
+                    psi_r_rmuT_X, psi_r_xchunk_Y, mesh_xy
                 )
-                P_l_k_muz.block_until_ready()
-                P_r_k_muz.block_until_ready()
+                P_l_k_mux.block_until_ready()
+                P_r_k_mux.block_until_ready()
             t_pair_total += time.perf_counter() - t0
             
-            # Free psi_zchunk arrays - we have P_k now
-            del psi_zchunk_full_Y, psi_l_zchunk_Y, psi_r_zchunk_Y
+            # Free psi_xchunk arrays - we have P_k now
+            del psi_xchunk_full_Y, psi_l_xchunk_Y, psi_r_xchunk_Y
             
             # 6c. Compute Z_q via left/right cross-product FFT
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.ZCT"):
-                Z_q = compute_ZCT_from_left_right_zchunk(
-                    P_l_k_muz, P_r_k_muz, kgrid, mesh_xy
+                Z_q = compute_ZCT_from_left_right_xchunk(
+                    P_l_k_mux, P_r_k_mux, kgrid, mesh_xy
                 )
                 Z_q.block_until_ready()
                 
                 # Free P_k arrays - we have Z_q now
-                del P_l_k_muz, P_r_k_muz
+                del P_l_k_mux, P_r_k_mux
                 
-                Z_q_flat = Z_q.reshape(nq, n_rmu, actual_n_zchunk)
+                Z_q_flat = Z_q.reshape(nq, n_rmu, actual_n_xchunk)
                 Z_q_flat = jax.lax.with_sharding_constraint(Z_q_flat, flat_shard)
                 Z_q_flat.block_until_ready()
                 
@@ -1676,7 +1689,7 @@ def fit_zeta_chunked_to_h5(
                 del Z_q
             t_zct_total += time.perf_counter() - t0
             
-            # 5d. Solve zeta_q = L^{-H}(L^{-1} Z_q)
+            # 6d. Solve zeta_q = L^{-H}(L^{-1} Z_q)
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.solve"):
                 zeta_chunk = solve_zeta_from_L_q(L_q, Z_q_flat, mesh_xy, q_chunk_size)
@@ -1686,15 +1699,15 @@ def fit_zeta_chunked_to_h5(
                 del Z_q_flat
             t_solve_total += time.perf_counter() - t0
             
-            # 5e. Copy to host and queue async write to HDF5
+            # 6e. Copy to host and queue async write to HDF5
             # GPU→CPU copy is fast; actual HDF5 write happens in background thread
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.h5_write"):
                 if jax.process_index() == 0:
                     # Copy all q-points to CPU at once (faster than one-by-one)
-                    zeta_cpu = np.asarray(zeta_chunk)  # (nq, n_rmu, n_zchunk) on CPU
+                    zeta_cpu = np.asarray(zeta_chunk)  # (nq, n_rmu, n_xchunk) on CPU
                     
-                    # Queue the write (non-blocking - GPU can continue immediately)
+                    # Queue the write with r-range (x-chunks are contiguous in r-space!)
                     write_queue.put((zeta_cpu, r_start, r_end, chunk_idx))
                 
                 # Synchronize across devices (but not waiting for HDF5 write)
@@ -1728,16 +1741,16 @@ def fit_zeta_chunked_to_h5(
     print(f"Zeta fitting complete!")
     print(f"  Shape: ({nqx}, {nqy}, {nqz}, {n_rmu}, {n_rtot})")
     print(f"{'='*60}")
-    print(f"\nTiming Summary ({num_z_chunks} z-chunks):")
+    print(f"\nTiming Summary ({num_x_chunks} x-chunks):")
     print(f"  {'Phase':<20} {'Total':>10} {'Per-chunk':>12} {'%':>6}")
     print(f"  {'-'*50}")
-    print(f"  {'Load zchunk':<20} {t_load_total:>10.2f}s {t_load_total/num_z_chunks*1000:>10.1f}ms {100*t_load_total/t_chunks_total:>6.1f}%")
-    print(f"  {'Pair density':<20} {t_pair_total:>10.2f}s {t_pair_total/num_z_chunks*1000:>10.1f}ms {100*t_pair_total/t_chunks_total:>6.1f}%")
-    print(f"  {'ZCT (FFT pipeline)':<20} {t_zct_total:>10.2f}s {t_zct_total/num_z_chunks*1000:>10.1f}ms {100*t_zct_total/t_chunks_total:>6.1f}%")
-    print(f"  {'Solve (L^-1 Z)':<20} {t_solve_total:>10.2f}s {t_solve_total/num_z_chunks*1000:>10.1f}ms {100*t_solve_total/t_chunks_total:>6.1f}%")
-    print(f"  {'H5 write':<20} {t_write_total:>10.2f}s {t_write_total/num_z_chunks*1000:>10.1f}ms {100*t_write_total/t_chunks_total:>6.1f}%")
+    print(f"  {'Load xchunk':<20} {t_load_total:>10.2f}s {t_load_total/num_x_chunks*1000:>10.1f}ms {100*t_load_total/t_chunks_total:>6.1f}%")
+    print(f"  {'Pair density':<20} {t_pair_total:>10.2f}s {t_pair_total/num_x_chunks*1000:>10.1f}ms {100*t_pair_total/t_chunks_total:>6.1f}%")
+    print(f"  {'ZCT (FFT pipeline)':<20} {t_zct_total:>10.2f}s {t_zct_total/num_x_chunks*1000:>10.1f}ms {100*t_zct_total/t_chunks_total:>6.1f}%")
+    print(f"  {'Solve (L^-1 Z)':<20} {t_solve_total:>10.2f}s {t_solve_total/num_x_chunks*1000:>10.1f}ms {100*t_solve_total/t_chunks_total:>6.1f}%")
+    print(f"  {'H5 write':<20} {t_write_total:>10.2f}s {t_write_total/num_x_chunks*1000:>10.1f}ms {100*t_write_total/t_chunks_total:>6.1f}%")
     print(f"  {'-'*50}")
-    print(f"  {'Chunk loop total':<20} {t_chunks_total:>10.2f}s {t_chunks_total/num_z_chunks*1000:>10.1f}ms")
+    print(f"  {'Chunk loop total':<20} {t_chunks_total:>10.2f}s {t_chunks_total/num_x_chunks*1000:>10.1f}ms")
     print(f"  {'Per r-point':<20} {'':<10} {t_chunks_total/n_rtot*1e6:>10.1f}μs")
     
     # Return left and right centroid wavefunctions (persist for downstream use)
@@ -2011,6 +2024,227 @@ def get_sharded_wfns_zchunk_slice(
     
     # Call cached function - psi_G and z_start are dynamic, nb is static per band chunk
     return _zchunk_slice_cache[cache_key](global_psi_Gtot, z_start, nb)
+
+
+# ============================================================================
+# X-CHUNK EXTRACTION: Contiguous r-space chunking via x-axis slicing
+# ============================================================================
+# X-chunking advantage: With r = x*(ny*nz) + y*nz + z, an x-chunk with
+# x in [x_start, x_end) maps to CONTIGUOUS r-indices [x_start*ny*nz, x_end*ny*nz).
+# This enables single sequential HDF5 writes instead of strided writes.
+# ============================================================================
+
+# Cache for xchunk extraction function
+_xchunk_slice_cache = {}
+
+
+def get_sharded_wfns_xchunk_slice(
+    global_psi_Gtot: jax.Array,
+    meta: Meta,
+    x_start: int,
+    x_end: int,
+    kvecs_frac: np.ndarray,
+    mesh_xy: Mesh,
+    band_range: tuple[int, int],
+) -> jax.Array:
+    """
+    FFT wavefunctions and extract x-chunk via slicing.
+    
+    X-chunking gives CONTIGUOUS r-indices: slicing x in [x_start, x_end)
+    produces r-indices [x_start*ny*nz, x_end*ny*nz) which can be written
+    to HDF5 in a single sequential operation.
+    
+    Args:
+        global_psi_Gtot: G-space wfns from read_Gvecs_to_devices
+        meta: Meta object
+        x_start, x_end: X-slice range [x_start, x_end)
+        kvecs_frac: (nk, 3) k-vectors in fractional coordinates
+        mesh_xy: Device mesh
+        band_range: (b_start, b_end)
+    
+    Returns:
+        psi_xchunk_Y: (nk, nb, ns, n_xchunk) with P(None, None, None, 'y')
+    """
+    nk_tot = meta.nk_tot
+    nspinor = meta.nspinor
+    fft_grid = meta.fft_grid
+    nx, ny, nz = fft_grid
+    x_chunk_size = x_end - x_start
+    n_xchunk = x_chunk_size * ny * nz  # CONTIGUOUS in r-space!
+    b_start, b_end = band_range
+    nb = b_end - b_start
+    n_rtot = nx * ny * nz
+    
+    # Cache key - use hash of kvecs since it's constant for a given system
+    kvecs_hash = hash(kvecs_frac.tobytes())
+    cache_key = ('xchunk_slice', id(mesh_xy), nk_tot, nspinor, x_chunk_size, nx, ny, nz, kvecs_hash)
+    
+    if cache_key not in _xchunk_slice_cache:
+        out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+        
+        sharded_ifftn = make_sharded_ifftn_3d(
+            mesh_xy, 
+            P(None, ('x', 'y'), None, None, None, None),
+            P(None, ('x', 'y'), None, None, None, None)
+        )
+        
+        # Intermediate sharding for staged reshard
+        stage1_shard = NamedSharding(mesh_xy, P(None, 'y', None, None))
+        
+        # Pre-compute phase grids and kvecs ONCE in closure
+        fx_cached = jnp.arange(nx, dtype=jnp.float64)[None, :, None, None] / nx
+        fy_cached = jnp.arange(ny, dtype=jnp.float64)[None, None, :, None] / ny
+        fz_cached = jnp.arange(nz, dtype=jnp.float64)[None, None, None, :] / nz
+        kvecs_cached = jnp.asarray(kvecs_frac)
+        n_rtot_cached = n_rtot
+        
+        # x_chunk_size is static (from cache key), x_start is dynamic
+        x_chunk_size_static = x_chunk_size
+        
+        @partial(jax.jit, static_argnames=('nb_static',))
+        def _extract_xchunk_slice(psi_G, x_start_dyn, nb_static):
+            # FFT to real space: (nk, nb_padded, ns, nx, ny, nz)
+            psi_r = sharded_ifftn(psi_G)
+            
+            # Apply Bloch phase exp(ik·r)
+            phase_spatial = jnp.exp(
+                2j * jnp.pi * (
+                    kvecs_cached[:, 0:1, None, None] * fx_cached
+                    + kvecs_cached[:, 1:2, None, None] * fy_cached
+                    + kvecs_cached[:, 2:3, None, None] * fz_cached
+                )
+            )
+            psi_r = psi_r * phase_spatial[:, None, None, :, :, :]
+            
+            # Normalize
+            psi_r = psi_r * jnp.sqrt(n_rtot_cached)
+            
+            # Trim bands
+            psi_r = psi_r[:, :nb_static, :, :, :, :]
+            
+            # Slice x-axis with DYNAMIC start, STATIC size
+            # psi_r: (nk, nb, ns, nx, ny, nz) -> (nk, nb, ns, x_chunk, ny, nz)
+            psi_xslice = jax.lax.dynamic_slice(
+                psi_r,
+                (0, 0, 0, x_start_dyn, 0, 0),
+                (nk_tot, nb_static, nspinor, x_chunk_size_static, ny, nz)
+            )
+            
+            # Flatten spatial dims: (nk, nb, ns, x_chunk*ny*nz)
+            # This is CONTIGUOUS in r-space since r = x*ny*nz + y*nz + z
+            psi_xchunk = psi_xslice.reshape(nk_tot, nb_static, nspinor, -1)
+            
+            # Staged reshard
+            psi_xchunk = jax.lax.with_sharding_constraint(psi_xchunk, stage1_shard)
+            psi_xchunk = jax.lax.with_sharding_constraint(psi_xchunk, out_Y)
+            
+            return psi_xchunk
+        
+        _xchunk_slice_cache[cache_key] = _extract_xchunk_slice
+    
+    return _xchunk_slice_cache[cache_key](global_psi_Gtot, x_start, nb)
+
+
+def get_psi_xchunk_from_cached(
+    cached_gspace: list[tuple[jax.Array, tuple[int, int]]],
+    meta, mesh_xy, band_range, x_start, x_end, kvecs_frac,
+    band_chunk_size: int = 16,
+) -> jax.Array:
+    """
+    Extract x-chunk from pre-loaded G-space (FFT only, no HDF5 read).
+    
+    This is the fast path that reuses cached G-space across x-chunk iterations.
+    X-chunks are contiguous in r-space, enabling efficient HDF5 writes.
+    
+    Args:
+        cached_gspace: Pre-loaded G-space from load_gspace_for_bands()
+        meta: Meta object
+        mesh_xy: Device mesh
+        band_range: (b_start, b_end) - total bands needed
+        x_start, x_end: X-slice range
+        kvecs_frac: (nk, 3) k-vectors in fractional coordinates
+        band_chunk_size: Bands to FFT at once
+    
+    Returns:
+        psi_xchunk_Y: (nk, nb, ns, n_xchunk) with P(None, None, None, 'y')
+    """
+    nx, ny, nz = meta.fft_grid
+    n_xchunk = (x_end - x_start) * ny * nz
+    b_start, b_end = band_range
+    nb_total = b_end - b_start
+    nk_tot = meta.nk_tot
+    nspinor = meta.nspinor
+    
+    # Output sharding
+    out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+    
+    # Allocate output array
+    psi_xchunk_all = jnp.zeros((nk_tot, nb_total, nspinor, n_xchunk), dtype=jnp.complex128)
+    psi_xchunk_all = jax.lax.with_sharding_constraint(psi_xchunk_all, out_Y)
+    
+    # Process each cached band chunk
+    for bc_idx, (global_psi_Gtot, bc_range) in enumerate(cached_gspace):
+        nb_chunk = bc_range[1] - bc_range[0]
+        
+        # FFT and extract x-slice
+        psi_xchunk_chunk = get_sharded_wfns_xchunk_slice(
+            global_psi_Gtot, meta, x_start, x_end, kvecs_frac, mesh_xy, bc_range
+        )
+        
+        # Place into output array
+        local_bc_start = bc_idx * band_chunk_size
+        local_bc_end = local_bc_start + nb_chunk
+        psi_xchunk_all = psi_xchunk_all.at[:, local_bc_start:local_bc_end, :, :].set(psi_xchunk_chunk)
+        
+        del psi_xchunk_chunk
+    
+    return psi_xchunk_all
+
+
+def get_psi_xchunk(
+    wfn, sym, meta, mesh_xy, band_range, x_start, x_end, bispinor,
+    band_chunk_size: int = 16,
+) -> jax.Array:
+    """
+    Load and FFT wavefunctions for a specific x-chunk.
+    
+    NOTE: This function reloads G-space from HDF5 each call. For multiple
+    x-chunks, use load_gspace_for_bands() + get_psi_xchunk_from_cached()
+    to avoid redundant HDF5 reads.
+    
+    Args:
+        wfn: WFNReader
+        sym: SymMaps
+        meta: Meta object
+        mesh_xy: Device mesh
+        band_range: (b_start, b_end) - total bands needed
+        x_start, x_end: X-slice range
+        bispinor: Whether to use bispinor
+        band_chunk_size: Bands to FFT at once
+    
+    Returns:
+        psi_xchunk_Y: (nk, nb, ns, n_xchunk) with P(None, None, None, 'y')
+    """
+    kgrid = np.array(meta.kgrid)
+    kvecs_frac = sym.kvecs_asints / kgrid[None, :]
+    
+    cached_gspace = load_gspace_for_bands(
+        wfn, sym, meta, mesh_xy, band_range, bispinor, band_chunk_size
+    )
+    
+    result = get_psi_xchunk_from_cached(
+        cached_gspace, meta, mesh_xy, band_range, x_start, x_end, kvecs_frac,
+        band_chunk_size
+    )
+    
+    del cached_gspace
+    return result
+
+
+# Aliases for x-chunk pair density and ZCT functions
+# These are generic and work with any chunk shape (z-chunk or x-chunk)
+compute_pair_density_spin_traced_xchunk = compute_pair_density_spin_traced_zchunk
+compute_ZCT_from_left_right_xchunk = compute_ZCT_from_left_right_zchunk
 
 
 # ============================================================================

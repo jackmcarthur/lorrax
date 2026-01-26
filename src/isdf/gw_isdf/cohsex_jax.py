@@ -686,6 +686,7 @@ def fit_zeta_and_compute_V_q_chunked(
 	bispinor: bool = False,
 	memory_budget_gb: float = 6.0,
 	sys_dim: int = 2,
+	x_chunk_size_override: int = 0,
 ):
 	"""
 	Chunked zeta fitting and V_q computation pipeline.
@@ -712,6 +713,7 @@ def fit_zeta_and_compute_V_q_chunked(
 		bispinor: Whether to use bispinor wavefunctions
 		memory_budget_gb: Memory budget per device in GB
 		sys_dim: System dimensionality (2 or 3)
+		x_chunk_size_override: If > 0, use this explicit x-chunk size instead of auto-compute
 	
 	Returns:
 		Dictionary with:
@@ -759,16 +761,22 @@ def fit_zeta_and_compute_V_q_chunked(
 	)
 	
 	band_chunk_size = chunks['band_chunk']
-	z_chunk_size = chunks['z_chunk']
+	x_chunk_size = chunks['x_chunk']
 	q_chunk_size = chunks['q_chunk']
 	use_gspace_cache = chunks.get('use_gspace_cache', True)
+	
+	# Override x_chunk_size if explicitly specified
+	if x_chunk_size_override > 0:
+		nx, ny, nz = meta.fft_grid
+		x_chunk_size = min(x_chunk_size_override, nx)
+		print(f"  NOTE: Using explicit x_chunk_size={x_chunk_size} (override)")
 	
 	# Output path for zeta
 	zeta_h5_path = os.path.join(output_dir, "zeta_q.h5")
 	
 	print(f"\n  Chunked ISDF fitting:")
 	print(f"    Band chunks: {band_chunk_size}")
-	print(f"    Z chunks:    {z_chunk_size}")
+	print(f"    X chunks:    {x_chunk_size} (contiguous r-space)")
 	print(f"    Q chunks:    {q_chunk_size}")
 	print(f"    G-space cache: {'enabled' if use_gspace_cache else 'disabled'}")
 	print(f"    Zeta output: {zeta_h5_path}")
@@ -777,7 +785,7 @@ def fit_zeta_and_compute_V_q_chunked(
 	with timing.section("cohsex_jax.zeta_fit_chunked"):
 		psi_l_rmu_Y, psi_l_rmuT_X, psi_r_rmu_Y, psi_r_rmuT_X = fit_zeta_chunked_to_h5(
 			wfn, sym, meta, centroid_indices, mesh_xy,
-			z_chunk_size, zeta_h5_path, band_chunk_size, q_chunk_size, bispinor,
+			x_chunk_size, zeta_h5_path, band_chunk_size, q_chunk_size, bispinor,
 			use_gspace_cache=use_gspace_cache,
 			band_range_left=band_range_left,
 			band_range_right=band_range_right,
@@ -1282,6 +1290,9 @@ def main(argv=None):
 		if jax.process_index() == 0:
 			print(f"  Auto-detected memory budget: {memory_per_device_gb:.2f} GB/device")
 	
+	# Explicit x_chunk_size override (0 = auto-compute from memory budget)
+	x_chunk_size_override = params.get("x_chunk_size", 0)
+	
 	if x_only and do_screened:  # x_only=bare exchange only, do_screened=use W instead of v
 		raise ValueError("x_only and do_screened cannot both be True")
 
@@ -1356,6 +1367,7 @@ def main(argv=None):
 					bispinor=bispinor,
 					memory_budget_gb=memory_per_device_gb,
 					sys_dim=sys_dim,
+					x_chunk_size_override=x_chunk_size_override,
 				)
 			
 			# Extract results
@@ -1878,37 +1890,47 @@ def main(argv=None):
 	# the divergent piece cancels with the electron-ion interaction.
 	# ============================================================================
 	if do_G0:  # do_G0=True: apply head corrections
-		vc0_mean, wcoul0, wcoul0_source = determine_wcoul0(params, input_dir, wfn, sym, meta, print0)
-		
-		# Print finite-size corrections
-		print0("")
-		print0("-" * 72)
-		print0("  FINITE-SIZE CORRECTIONS")
-		print0("-" * 72)
-		print0(f"  Head source: {wcoul0_source}")
-		vc0_real = float(vc0_mean.real) if hasattr(vc0_mean, 'real') else float(vc0_mean)
-		print0(f"  v(q→0)  = {vc0_real:12.3f} a.u.  (bare Coulomb head)")
-		if do_screened:
-			wcoul0_real = float(wcoul0.real) if hasattr(wcoul0, 'real') else float(wcoul0)
-			dW_real = wcoul0_real - vc0_real
-			print0(f"  W(q→0)  = {wcoul0_real:12.3f} a.u.  (screened Coulomb head)")
-			print0(f"  ΔW      = {dW_real:12.3f} a.u.  (screening correction)")
-		
-		# outer_u = ζ*_μ(0) ⊗ ζ_ν(0), the "head" direction in μν space
-		# Must match V_μν construction: V = Σ_G v(G) ζ*_μ(G) ζ_ν(G)
-		# So the head should have conjugate on the LEFT (μ index), not right (ν index)
-		outer_u = (jnp.conj(G0_mu_nu)[:, None] * G0_mu_nu[None, :])
-		vol_scale = jnp.asarray(1.0 / float(wfn.cell_volume), dtype=jnp.float64)
-		
-		# HEAD INJECTION FOR V: V_qmunu at q=0 gets the bare Coulomb head
-		# V_Γ ← V_Γ + (vc0_mean / Ω) × ζ*(0) ⊗ ζ(0)
-		# This is ALWAYS applied regardless of do_screened
-		V_qmunu = V_qmunu.at[0, 0, 0, 0, 0, 0, :, :].add((vc0_mean * vol_scale) * outer_u)
-		
-		# HEAD INJECTION FOR W (screened): W at q=0 gets the screened head wcoul0
-		# Only applied when do_screened=True since W_q only exists then
-		if do_screened:
-			W_q = W_q.at[0, 0, 0, 0, :, 0, :].add((wcoul0 * vol_scale) * outer_u)
+		# Check if G0_mu_nu is available (might be None for old restart files)
+		if G0_mu_nu is None:
+			print0("")
+			print0("-" * 72)
+			print0("  WARNING: G0_mu_nu not available (missing from restart file?)")
+			print0("  Skipping head corrections - results may be inaccurate!")
+			print0("  Re-run with restart=false to regenerate G0_mu_nu.")
+			print0("-" * 72)
+			do_G0 = False  # Skip head corrections this run
+		else:
+			vc0_mean, wcoul0, wcoul0_source = determine_wcoul0(params, input_dir, wfn, sym, meta, print0)
+			
+			# Print finite-size corrections
+			print0("")
+			print0("-" * 72)
+			print0("  FINITE-SIZE CORRECTIONS")
+			print0("-" * 72)
+			print0(f"  Head source: {wcoul0_source}")
+			vc0_real = float(vc0_mean.real) if hasattr(vc0_mean, 'real') else float(vc0_mean)
+			print0(f"  v(q→0)  = {vc0_real:12.3f} a.u.  (bare Coulomb head)")
+			if do_screened:
+				wcoul0_real = float(wcoul0.real) if hasattr(wcoul0, 'real') else float(wcoul0)
+				dW_real = wcoul0_real - vc0_real
+				print0(f"  W(q→0)  = {wcoul0_real:12.3f} a.u.  (screened Coulomb head)")
+				print0(f"  ΔW      = {dW_real:12.3f} a.u.  (screening correction)")
+			
+			# outer_u = ζ*_μ(0) ⊗ ζ_ν(0), the "head" direction in μν space
+			# Must match V_μν construction: V = Σ_G v(G) ζ*_μ(G) ζ_ν(G)
+			# So the head should have conjugate on the LEFT (μ index), not right (ν index)
+			outer_u = (jnp.conj(G0_mu_nu)[:, None] * G0_mu_nu[None, :])
+			vol_scale = jnp.asarray(1.0 / float(wfn.cell_volume), dtype=jnp.float64)
+			
+			# HEAD INJECTION FOR V: V_qmunu at q=0 gets the bare Coulomb head
+			# V_Γ ← V_Γ + (vc0_mean / Ω) × ζ*(0) ⊗ ζ(0)
+			# This is ALWAYS applied regardless of do_screened
+			V_qmunu = V_qmunu.at[0, 0, 0, 0, 0, 0, :, :].add((vc0_mean * vol_scale) * outer_u)
+			
+			# HEAD INJECTION FOR W (screened): W at q=0 gets the screened head wcoul0
+			# Only applied when do_screened=True since W_q only exists then
+			if do_screened:
+				W_q = W_q.at[0, 0, 0, 0, :, 0, :].add((wcoul0 * vol_scale) * outer_u)
 
 	# ============================================================================
 	# EXTRACT BARE V AND SCREENED W INTERACTIONS
