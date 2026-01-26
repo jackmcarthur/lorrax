@@ -807,9 +807,8 @@ def fit_zeta_and_compute_V_q_chunked(
 	# Available: full budget (no centroids needed, zeta read from H5)
 	n_G = meta.n_rtot
 	bytes_per_complex = 16
-	budget_bytes_eff = mem_est.get('effective_budget_bytes', memory_budget_gb * 1e9 * 0.85)
-	centroids_bytes = mem_est.get('centroids_bytes', 0.0)
-	m_budget_vcoul = max(0.0, budget_bytes_eff - centroids_bytes)
+	# Use 90% of budget - zeta is streamed from H5, no centroids in memory
+	m_budget_vcoul = memory_budget_gb * 1e9 * 0.90
 	# Each mu needs: 2 × n_G × 16 (zeta_mu + zeta_nu for off-diag) + 1 × n_G × 16 (FFT workspace)
 	m_per_mu = 3 * bytes_per_complex * n_G
 	mu_chunk_vcoul = max(1, min(meta.n_rmu, int(m_budget_vcoul / m_per_mu)))
