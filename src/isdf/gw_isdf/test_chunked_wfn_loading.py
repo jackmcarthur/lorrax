@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """
-Test script for chunked zeta fitting pipeline.
-See ZETA_FITTING_ALGORITHM.md for algorithm details.
+ISDF Preprocessing Pipeline: zeta fitting and V_q computation.
+
+Computes:
+  1. Zeta fitting: C_q @ zeta_q = Z_q (chunked over z-axis, output to HDF5)
+  2. V_q computation (optional): V_q(μ,ν) = Σ_G ζ̃*_μ(G) v(q+G) ζ̃_ν(G)
+
+Final outputs retained in memory:
+  - psi_nk(r_μ)_X: centroid wavefunctions, X-sharded
+  - psi_nk(r_μ)_Y: centroid wavefunctions, Y-sharded  
+  - V_q(μ,ν): Coulomb matrix (if --compute-vcoul), XY-sharded
 
 Usage:
-    XLA_FLAGS='--xla_force_host_platform_device_count=4' JAX_PLATFORMS=cpu \
-    uv run python -m isdf.gw_isdf.test_chunked_wfn_loading -i input.in --test-zeta-fit
+    uv run python -m isdf.gw_isdf.test_chunked_wfn_loading -i input.in
+    uv run python -m isdf.gw_isdf.test_chunked_wfn_loading -i input.in --compute-vcoul
 """
 import os
 
@@ -44,6 +52,10 @@ from .cohsex_init import (
     get_effective_z_chunk_size, 
     compute_optimal_chunks,
     print_memory_breakdown,
+)
+from .compute_vcoul import (
+    compute_V_q_from_zeta_h5,
+    compute_all_V_q_from_zeta_h5,
 )
 
 
@@ -760,34 +772,36 @@ def test_chunked_loading(wfn, sym, meta, centroid_indices, bispinor, mesh_xy,
 
 
 def main(argv=None):
-    argp = argparse.ArgumentParser(description="Test chunked wavefunction loading")
+    argp = argparse.ArgumentParser(description="ISDF Preprocessing: zeta fitting and V_q computation")
     argp.add_argument("-i", "--input", default="cohsex_test.in", help="Input file")
     argp.add_argument("--z-chunk", type=int, default=None, 
-                      help="Z-axis chunk size (overrides input file; 0=auto)")
+                      help="Z-axis chunk size (overrides auto)")
     argp.add_argument("--band-chunk", type=int, default=None, help="Band chunk size (overrides auto)")
     argp.add_argument("--q-chunk", type=int, default=None, 
-                      help="Q-points to solve simultaneously (default=all, reduce for memory)")
+                      help="Q-points to solve simultaneously (default=auto)")
+    argp.add_argument("--mu-chunk", type=int, default=None,
+                      help="μ-chunk size for V_q computation (overrides auto)")
     argp.add_argument("--memory", type=float, default=None,
                       help="Memory budget per device in GB (default: auto-detect)")
-    argp.add_argument("--save-ref", action="store_true", help="Save reference arrays to h5")
-    argp.add_argument("--test-chunked", action="store_true", help="Test chunked implementation")
+    argp.add_argument("--zeta-output", type=str, default="zeta_q.h5",
+                      help="Output HDF5 file for zeta fitting (default: zeta_q.h5)")
+    argp.add_argument("--compute-vcoul", action="store_true",
+                      help="Also compute V_q(μ,ν) from zeta after fitting")
+    # Legacy/debugging flags
     argp.add_argument("--test-fft-only", action="store_true", help="Only test custom FFT sharding")
     argp.add_argument("--test-sharding-only", action="store_true", 
                       help="Test sharding logic with mock data (for multi-device CPU)")
-    argp.add_argument("--test-zeta-fit", action="store_true",
-                      help="Test full zeta fitting pipeline with z-chunk loop and HDF5 output")
-    argp.add_argument("--zeta-output", type=str, default="zeta_q.h5",
-                      help="Output HDF5 file for zeta fitting (default: zeta_q.h5)")
     args = argp.parse_args(argv)
     
     print("\n" + "="*72)
-    print("  ISDF Preprocessing Pipeline Test")
+    print("  ISDF Preprocessing Pipeline")
     print("="*72)
-    print("  Steps tested:")
-    print("    1. Wavefunction loading (HDF5 → G-space → FFT → real-space)")
-    print("    2. Pair density P_k,ab(r_μ, r_ν) and P_k,ab(r_μ, r_zchunk)")
-    print("    3. CCT/ZCT: P_k → P_R → C_R/Z_R → C_q/Z_q")
-    print("    4. Zeta fitting: C_q @ zeta_q = Z_q (2D blocked Cholesky)")
+    print("  Steps:")
+    print("    1. Load centroid wavefunctions (band-chunked FFT)")
+    print("    2. Compute CCT: C_q = Σ_k |P_k(r_μ, r_ν)|²")
+    print("    3. Loop over z-chunks: compute ZCT, solve zeta, write to HDF5")
+    if args.compute_vcoul:
+        print("    4. Compute V_q(μ,ν) = Σ_G ζ̃*_μ(G) v(q+G) ζ̃_ν(G)")
     print("-"*72)
     print(f"  JAX backend: {jax.default_backend()}")
     print(f"  Device count: {jax.device_count()}")
@@ -940,17 +954,54 @@ def main(argv=None):
         print(f"  band_chunk_size: {band_chunk_size}")
         print(f"  q_chunk_size: {q_chunk_size}")
     
+    # =========================================================================
+    # COMPUTE OPTIMAL MU-CHUNK SIZE FOR V_q (if requested)
+    # =========================================================================
+    # V_q computation memory model:
+    #   - FFT workspace: 2 × B_μ × n_G (input + output)
+    #   - √v(G): n_G (small, replicated)
+    #   - V_q output: n_μ × n_μ (sharded P('x','y'))
+    # Peak per device: 2 × B_μ × n_G × 16 bytes
+    # Available after zeta fitting: budget - centroids
+    
+    if args.compute_vcoul:
+        # Compute mu_chunk_size from remaining memory
+        bytes_per_complex = 16
+        n_G = meta.n_rtot
+        
+        # After zeta fitting, we have: centroids in memory (psi_rmu_Y, psi_rmuT_X)
+        # V_q output: (n_q, n_rmu, n_rmu) but computed one q at a time → (n_rmu, n_rmu)
+        m_centroids_gb = chunks['memory_estimate']['centroids_gb']
+        m_V_q_output = bytes_per_complex * n_rmu * n_rmu / n_devices  # Sharded
+        
+        # Available for FFT workspace
+        m_available_vcoul = (memory_budget_gb * 1e9 * 0.7) - m_centroids_gb * 1e9 - m_V_q_output
+        
+        # FFT workspace: 2 chunks (for μ and ν) × B_μ × n_G × 16
+        # Need to fit 2 chunks simultaneously for off-diagonal blocks
+        m_per_chunk = bytes_per_complex * n_G
+        max_mu_chunk = int(m_available_vcoul / (2 * m_per_chunk))
+        mu_chunk_size = max(16, min(n_rmu, max_mu_chunk))
+        
+        # Allow CLI override
+        if args.mu_chunk is not None:
+            mu_chunk_size = args.mu_chunk
+        
+        n_mu_chunks = (n_rmu + mu_chunk_size - 1) // mu_chunk_size
+        print(f"\n  V_q computation:")
+        print(f"    mu_chunk_size = {mu_chunk_size} ({n_mu_chunks} chunks)")
+        print(f"    FFT workspace = {2 * mu_chunk_size * n_G * 16 / 1e6:.1f} MB/device")
+    else:
+        mu_chunk_size = None
+    
     # Summary of final chunk sizes
     print(f"\n  Final chunk sizes:")
     print(f"    band_chunk_size = {band_chunk_size}")
     print(f"    z_chunk_size = {z_chunk_size}")
     print(f"    q_chunk_size = {q_chunk_size}")
     print(f"    Num z-chunks to cover full grid: {(nz + z_chunk_size - 1) // z_chunk_size}")
-    
-    # Test with a small band range first
-    b0, b1, b2, b3, b4 = meta.band_edges
-    test_band_range = (b0, min(b3, b0 + 10))  # First 10 bands or sigma window
-    print(f"\nTest band range: {test_band_range}")
+    if mu_chunk_size:
+        print(f"    mu_chunk_size = {mu_chunk_size} (for V_q)")
     
     # Test sharding logic only (for multi-device CPU which doesn't support FFT)
     if args.test_sharding_only:
@@ -958,130 +1009,91 @@ def main(argv=None):
             success = test_sharding_logic_only(mesh_xy, meta, centroid_indices)
         return 0 if success else 1
     
-    # Full zeta fitting pipeline with z-chunk loop and HDF5 output
-    if args.test_zeta_fit:
-        output_path = os.path.join(input_dir, args.zeta_output)
+    # =========================================================================
+    # STEP 1: ZETA FITTING PIPELINE
+    # =========================================================================
+    output_path = os.path.join(input_dir, args.zeta_output)
+    print(f"\n{'='*60}")
+    print("STEP 1: ZETA FITTING")
+    print(f"{'='*60}")
+    use_gspace_cache = chunks.get('use_gspace_cache', True)
+    print(f"  Chunk sizes: band={band_chunk_size}, z={z_chunk_size}, q={q_chunk_size}")
+    print(f"  G-space cache: {'enabled' if use_gspace_cache else 'disabled'}")
+    print(f"  Output: {output_path}")
+    
+    with mesh_xy:
+        psi_rmu_Y, psi_rmuT_X = fit_zeta_chunked_to_h5(
+            wfn, sym, meta, centroid_indices, mesh_xy,
+            z_chunk_size, output_path, band_chunk_size, q_chunk_size, bispinor,
+            use_gspace_cache=use_gspace_cache
+        )
+    
+    # Verify zeta output
+    import h5py
+    if jax.process_index() == 0:
+        with h5py.File(output_path, 'r') as f:
+            print(f"\n  Zeta output verified:")
+            print(f"    File: {output_path}")
+            print(f"    zeta_q shape: {f['zeta_q'].shape}")
+            print(f"    n_rmu={f.attrs['n_rmu']}, n_rtot={f.attrs['n_rtot']}")
+    
+    # =========================================================================
+    # STEP 2: V_q COMPUTATION (optional)
+    # =========================================================================
+    V_qmunu = None
+    
+    if args.compute_vcoul:
+        # Sync filesystem to ensure zeta writes are flushed before reading
+        # This prevents I/O timing variance from dirty page cache
+        import os as os_module
+        os_module.sync()
+        
         print(f"\n{'='*60}")
-        print("RUNNING FULL ZETA FITTING PIPELINE")
+        print("STEP 2: V_q COULOMB MATRIX COMPUTATION")
         print(f"{'='*60}")
-        use_gspace_cache = chunks.get('use_gspace_cache', True)
-        print(f"  Using memory-optimized chunk sizes:")
-        print(f"    band_chunk = {band_chunk_size}")
-        print(f"    z_chunk = {z_chunk_size}")
-        print(f"    q_chunk = {q_chunk_size}")
-        print(f"    gspace_cache = {'enabled' if use_gspace_cache else 'disabled'}")
-        with mesh_xy:
-            fit_zeta_chunked_to_h5(
-                wfn, sym, meta, centroid_indices, mesh_xy,
-                z_chunk_size, output_path, band_chunk_size, q_chunk_size, bispinor,
-                use_gspace_cache=use_gspace_cache
-            )
+        print(f"  Reading zeta from: {output_path}")
+        print(f"  mu_chunk_size: {mu_chunk_size}")
         
-        # Verify output
-        import h5py
-        if jax.process_index() == 0:
-            with h5py.File(output_path, 'r') as f:
-                print(f"\nOutput file: {output_path}")
-                print(f"  zeta_q shape: {f['zeta_q'].shape}")
-                print(f"  Metadata: n_rmu={f.attrs['n_rmu']}, n_rtot={f.attrs['n_rtot']}")
+        # Get lattice parameters from wfn
+        bvec = np.asarray(wfn.blat * wfn.bvec, dtype=np.float64)
+        cell_volume = float(wfn.cell_volume)
         
-        timing.get_collector().report(title="--- Timing Report ---", min_percent=0.1)
-        return 0
+        with h5py.File(output_path, 'r') as zeta_h5:
+            with mesh_xy:
+                V_qmunu, g0_mu_all = compute_all_V_q_from_zeta_h5(
+                    zeta_h5,
+                    kgrid=meta.kgrid,
+                    fft_grid=meta.fft_grid,
+                    bvec=bvec,
+                    cell_volume=cell_volume,
+                    mu_chunk_size=mu_chunk_size,
+                    mesh_xy=mesh_xy,
+                    sys_dim=2,
+                )
+        
+        print(f"\n  V_q computed:")
+        print(f"    Shape: {V_qmunu.shape}")
+        print(f"    Sharding: {V_qmunu.sharding}")
+        
+        # Extract V_q=0 for later use (Hartree, etc.)
+        V_q0 = V_qmunu[0, 0, 0, :, :]
+        print(f"    V_q=0 trace: {float(jnp.trace(V_q0).real):.4f}")
     
-    # Run the test
-    psi_rmu_Y, psi_rmuT_X, psi_rtot_Y, psi_zchunk_ref = test_current_loading(
-        wfn, sym, meta, centroid_indices, bispinor, mesh_xy,
-        test_band_range, z_chunk_size
-    )
+    # =========================================================================
+    # SUMMARY
+    # =========================================================================
+    print(f"\n{'='*60}")
+    print("PIPELINE COMPLETE")
+    print(f"{'='*60}")
     
-    # Save reference if requested
-    if args.save_ref:
-        import h5py
-        ref_path = os.path.join(input_dir, "test_wfn_reference.h5")
-        print(f"\nSaving reference arrays to: {ref_path}")
-        with h5py.File(ref_path, "w") as f:
-            # Gather to host for saving
-            f.create_dataset("psi_rmu_Y", data=np.array(psi_rmu_Y))
-            f.create_dataset("psi_rmuT_X", data=np.array(psi_rmuT_X))
-            f.create_dataset("psi_zchunk_ref", data=np.array(psi_zchunk_ref))
-            f.attrs["band_range_start"] = test_band_range[0]
-            f.attrs["band_range_end"] = test_band_range[1]
-            f.attrs["z_chunk_size"] = z_chunk_size
-        print("  Reference saved successfully")
+    timing.get_collector().report(title="--- Timing Report ---", min_percent=0.1)
     
-    # Test chunked implementation if requested
-    if args.test_chunked:
-        psi_rmu_chunked, psi_rmuT_chunked = test_chunked_loading(
-            wfn, sym, meta, centroid_indices, bispinor, mesh_xy,
-            test_band_range, z_chunk_size, band_chunk_size,
-            ref_psi_rmu=psi_rmu_Y, ref_psi_rmuT=psi_rmuT_X
-        )
-    
-    # Test pair density computation
-    with mesh_xy:
-        P_k_ab, P_k_ab_zchunk = test_pair_density(
-            psi_rmuT_X, psi_rmu_Y, psi_zchunk_ref, mesh_xy
-        )
-    
-    # Test CCT/ZCT pipeline
-    kgrid = meta.kgrid  # (nkx, nky, nkz)
-    with mesh_xy:
-        C_q, Z_q = test_CCT_ZCT_pipeline(
-            P_k_ab, P_k_ab_zchunk, kgrid, mesh_xy
-        )
-    
-    # Test zeta solve (Cholesky + triangular solve)
-    # Use 2D blocked Cholesky for memory efficiency
-    with mesh_xy:
-        zeta_q = test_zeta_solve(C_q, Z_q, mesh_xy, use_blocked_2d=True)
-    
-    # Benchmark cached performance
-    print("\n" + "-"*40)
-    print("Cached execution benchmark (JIT warmed up):")
-    print("-"*40)
-    import time
-    times_read = []
-    times_fft = []
-    nb = test_band_range[1] - test_band_range[0]
-    
-    with mesh_xy:
-        for i in range(5):
-            t0 = time.perf_counter()
-            global_psiG, _ = read_Gvecs_to_devices(wfn, sym, test_band_range, meta, bispinor, mesh_xy)
-            global_psiG.block_until_ready()
-            t1 = time.perf_counter()
-            psi_rtot, psi_rmu, psi_rmuT = get_sharded_wfns(global_psiG, sym, meta, centroid_indices, nb, False, mesh_xy)
-            psi_rmu.block_until_ready()
-            t2 = time.perf_counter()
-            times_read.append((t1 - t0) * 1000)
-            times_fft.append((t2 - t1) * 1000)
-            del global_psiG
-    
-    total_avg = np.mean(times_read) + np.mean(times_fft)
-    print(f"  read_Gvecs:        {np.mean(times_read):.1f} ± {np.std(times_read):.1f} ms ({100*np.mean(times_read)/total_avg:.0f}%)")
-    print(f"  get_sharded_wfns:  {np.mean(times_fft):.1f} ± {np.std(times_fft):.1f} ms ({100*np.mean(times_fft)/total_avg:.0f}%)")
-    print(f"  Total:             {total_avg:.1f} ms")
-    print(f"  Per-band:          {total_avg/nb:.2f} ms")
-
-    print("\n" + "="*60)
-    print("TEST COMPLETE")
-    print("="*60)
-    
-    # Print timing report
-    print("\n")
-    timing.get_collector().report(title="--- Timing Report (seconds) ---", min_percent=0.1)
-    
-    print("\nPhysics verification:")
-    print("  ✓ psi_rmuT = conj(transpose(psi_rmu)) - verified")
-    print("  ✓ Spinor components sum to unity per band - verified")
-    print("  ✓ Reproducible loading - verified")
-    print("  ✓ Multi-device CPU + GPU backends both work via shard_map FFT")
-    
-    print("\nKey optimizations applied:")
-    print("  ✓ Function caching for JIT (250x speedup on repeated calls)")
-    print("  ✓ jax.device_put for faster host-to-device transfer")
-    print("  ✓ shard_map FFT for multi-device compatibility")
-    print("  ✓ Pre-computed phase grids and centroid indices")
+    print("\n  Outputs retained in memory:")
+    print(f"    psi_rmu_Y:  {psi_rmu_Y.shape} sharded {psi_rmu_Y.sharding.spec}")
+    print(f"    psi_rmuT_X: {psi_rmuT_X.shape} sharded {psi_rmuT_X.sharding.spec}")
+    if V_qmunu is not None:
+        print(f"    V_qmunu:    {V_qmunu.shape}")
+    print(f"\n  Zeta written to: {output_path}")
     
     return 0
 

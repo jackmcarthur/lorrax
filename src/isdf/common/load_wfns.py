@@ -1,3 +1,7 @@
+import gc
+import math
+import queue
+import threading
 import time
 import numpy as np
 import jax
@@ -15,6 +19,57 @@ from .cholesky_2d import (
 )
 
 
+def compute_block_size_for_2d_cholesky(n_rmu: int, Pr: int, Pc: int) -> tuple[int, int]:
+    """
+    Compute block size for 2D blocked Cholesky that satisfies distribution constraints.
+    
+    Constraints (fundamental to 2D blocked algorithms):
+        - n_rmu % block_size == 0  (matrix divides into whole tiles)
+        - J % Pr == 0              (tile rows distribute evenly on X-axis)
+        - J % Pc == 0              (tile cols distribute evenly on Y-axis)
+    
+    Where J = n_rmu / block_size is the number of tiles per dimension.
+    
+    The simplest solution: J = lcm(Pr, Pc), giving block_size = n_rmu / J.
+    If n_rmu doesn't divide evenly, we try multiples of lcm(Pr, Pc).
+    
+    Args:
+        n_rmu: Matrix dimension (number of ISDF centroids)
+        Pr: Number of devices on X-axis
+        Pc: Number of devices on Y-axis
+    
+    Returns:
+        (block_size, J) tuple
+    
+    Raises:
+        ValueError: If no valid block size exists (n_rmu incompatible with mesh)
+    """
+    target_J = math.lcm(Pr, Pc)
+    
+    if n_rmu % target_J == 0:
+        block_size = n_rmu // target_J
+        return block_size, target_J
+    
+    # Try multiples of lcm(Pr, Pc)
+    for j_mult in range(2, 20):
+        J = target_J * j_mult
+        if n_rmu % J == 0:
+            block_size = n_rmu // J
+            return block_size, J
+    
+    # Last resort: find any valid block size
+    for b in range(n_rmu, 0, -1):
+        if n_rmu % b == 0:
+            J = n_rmu // b
+            if J % Pr == 0 and J % Pc == 0:
+                return b, J
+    
+    raise ValueError(
+        f"No valid block size for n_rmu={n_rmu} with mesh {Pr}×{Pc}. "
+        f"n_rmu should be divisible by lcm({Pr},{Pc})={target_J} or a multiple thereof."
+    )
+
+
 # ============================================================================
 # shard_map based FFT - runs FFT independently on each device's local data
 # See: https://docs.jax.dev/en/latest/notebooks/shard_map.html
@@ -22,11 +77,8 @@ from .cholesky_2d import (
 
 def make_sharded_ifftn_3d(mesh: Mesh, in_spec: P, out_spec: P):
     """
-    Create a 3D inverse FFT function that works on sharded arrays.
-    
     Uses shard_map to run FFT independently on each device's local data.
     The FFT axes (last 3) must NOT be sharded - only batch dims can be sharded.
-    
     Args:
         mesh: The device mesh
         in_spec: PartitionSpec for input (e.g., P(None, ('x','y'), None, None, None, None))
@@ -235,7 +287,6 @@ def get_sharded_wfns(
 	"""
 	Jitted: FFT -> apply phase -> normalize/trim -> flatten r -> reshard (Y-only) -> centroid gather ->
 	build psi_rmu^T with X-only sharding. Returns (psi_rtot_Y, psi_rmu_Y, psi_rmuT_X).
-	
 	Uses function caching to avoid JIT recompilation on repeated calls.
 	"""
 	# Create cache key from hashable values
@@ -327,78 +378,6 @@ def get_sharded_wfns(
 	_finalize = _get_sharded_wfns_cache[cache_key]
 	kpts = jnp.asarray(sym.unfolded_kpts[:meta.nk_tot], dtype=jnp.float64)
 	return _finalize(global_psi_Gtot, kpts, nb_actual, bool(is_left))
-
-
-def load_psi_rtot_for_bandrange(
-	wfn,
-	sym,
-	band_start: int,
-	band_end: int,
-	meta: Meta,
-	bispinor: bool,
-	mesh_xy: Mesh,
-	chunk_size: int = 64,
-):
-	"""Load psi_nk(r) on the full FFT grid for a specific band range.
-	
-	Designed for future ZCT chunking: call repeatedly with different band ranges,
-	accumulate contributions, then discard intermediate results to save memory.
-	
-	This function does NOT return centroid-sampled psi_rmu - use get_sharded_wfns
-	for that (centroids should be loaded once for all bands and kept in memory).
-	
-	Args:
-		wfn: WFNReader instance
-		sym: SymMaps instance
-		band_start: First band index (inclusive)
-		band_end: Last band index (exclusive)
-		meta: Meta instance with grid/dimension info
-		bispinor: If True, compute 4-component spinors
-		mesh_xy: JAX device mesh for sharding
-		chunk_size: Bands per chunk (default 64, for memory tuning)
-		
-	Returns:
-		psi_rtot: jax.Array of shape (nk, nb, nspinor, n_rtot)
-	"""
-	bandrange = (band_start, band_end)
-	nb = band_end - band_start
-	
-	# Load G-space coefficients using the optimized batch path
-	with timing.section("load_psi_rtot.read_Gvecs"):
-		global_psi_Gtot, _ = read_Gvecs_to_devices(wfn, sym, bandrange, meta, bispinor, mesh_xy)
-	
-	# FFT to real space and apply phase
-	xy2_6 = NamedSharding(mesh_xy, P(None, ('x', 'y'), None, None, None, None))
-	y3_4 = NamedSharding(mesh_xy, P(None, None, None, 'y'))
-	
-	# Create sharded FFT using shard_map
-	fft_spec = P(None, ('x', 'y'), None, None, None, None)
-	sharded_ifftn = make_sharded_ifftn_3d(mesh_xy, fft_spec, fft_spec)
-	
-	@partial(jax.jit, static_argnames=("nb",), in_shardings=(xy2_6,), out_shardings=y3_4)
-	def _to_rtot(psi_Gtot: jax.Array, nb: int) -> jax.Array:
-		# FFT to real space - shard_map runs FFT independently on each device
-		psi_r = sharded_ifftn(psi_Gtot)
-		# Apply Bloch phase exp(ik·r)
-		fx = jnp.arange(meta.fft_grid[0], dtype=jnp.float64)[None, :, None, None] / meta.fft_grid[0]
-		fy = jnp.arange(meta.fft_grid[1], dtype=jnp.float64)[None, None, :, None] / meta.fft_grid[1]
-		fz = jnp.arange(meta.fft_grid[2], dtype=jnp.float64)[None, None, None, :] / meta.fft_grid[2]
-		kpts = jnp.asarray(sym.unfolded_kpts, dtype=jnp.float64)[:psi_r.shape[0]]
-		phase = jnp.exp(2j * jnp.pi * (
-			kpts[:, 0:1, None, None] * fx +
-			kpts[:, 1:2, None, None] * fy +
-			kpts[:, 2:3, None, None] * fz
-		))
-		psi_r = psi_r * phase[:, None, None, :, :, :]
-		psi_r = psi_r * jnp.sqrt(meta.n_rtot)
-		psi_r = psi_r[:, :nb]
-		# Flatten spatial dims: (nk, nb, nspinor, nx, ny, nz) -> (nk, nb, nspinor, n_rtot)
-		return psi_r.reshape(meta.nk_tot, nb, meta.nspinor, -1)
-	
-	with timing.section("load_psi_rtot.fft_phase"):
-		psi_rtot = _to_rtot(global_psi_Gtot, nb)
-	
-	return psi_rtot
 
 
 # ============================================================================
@@ -612,39 +591,9 @@ def compute_CCT_ZCT_from_pair_density(
 	mesh_xy: Mesh,
 ) -> tuple[jax.Array, jax.Array]:
 	"""
-	Compute CCT and ZCT matrices from pair densities using ortho FFT pipeline.
-	
-	For ISDF fitting of spin-traced pair products:
-		target(r) = ψ*_{m,k-q,↑}(r)ψ_{n,k,↑}(r) + ψ*_{m,k-q,↓}(r)ψ_{n,k,↓}(r)
-	
-	The Galerkin condition (see docs/isdf_spin_galerkin_derivation.md) gives:
-		C(μ,ν) = Σ_{k,s,s'} P*_{k-q,s's}(ν,μ) P_{k,ss'}(ν,μ)
-	
-	For q=0 (k-q = k), this simplifies to the Frobenius norm:
-		C(μ,ν) = Σ_k ||P_k(μ,ν)||²_F = Σ_{k,a,b} |P_{k,ab}(μ,ν)|²
-	
-	PHYSICS NOTE:
-	Even though we fit only the spin-diagonal sum (↑↑ + ↓↓), the Galerkin
-	condition involves ALL FOUR spin combinations |P_ab|² because the band
-	summation in the error metric couples spin channels via Σ_m ψ*_{m,s} ψ_{m,s'}.
-	
-	This is NOT equivalent to |P_↑↑ + P_↓↓|², which would miss the off-diagonal
-	spin contributions |P_↑↓|² + |P_↓↑|² and incorrectly include cross-terms.
-	
-	Pipeline:
-		1. P_k,ab(μ,ν) -> P_R,ab(μ,ν)  via ortho-IFFT
-		2. C_R(μ,ν) = Σ_ab |P_R,ab(μ,ν)|²  (Frobenius norm squared)
-		3. C_R -> C_q  via ortho-FFT
-	
-	Args:
-		P_k_mumu: (nk, ns, ns, n_rmu, n_rmu) pair density at centroids
-		P_k_mu_zchunk: (nk, ns, ns, n_rmu, n_zchunk) pair density for z-chunk
-		kgrid: (nkx, nky, nkz)
-		mesh_xy: Device mesh
-	
-	Returns:
-		C_q: (nqx, nqy, nqz, n_rmu, n_rmu) CCT matrix for all q
-		Z_q: (nqx, nqy, nqz, n_rmu, n_zchunk) ZCT matrix for all q
+	Compute CCT and ZCT matrices via ortho FFT: P_k -> P_R -> C_q/Z_q.
+	Uses Frobenius norm over spin: C_R(μ,ν) = Σ_ab |P_R,ab(μ,ν)|²
+	See docs/isdf_spin_galerkin_derivation.md for derivation.
 	"""
 	nkx, nky, nkz = kgrid
 	nk, ns1, ns2, n_rmu, _ = P_k_mumu.shape
@@ -664,32 +613,22 @@ def compute_CCT_ZCT_from_pair_density(
 			# Input: (nk, ns, ns, n_rmu, n_rmu)
 			# Reshape to expose k-dimensions: (nkx, nky, nkz, ns, ns, n_rmu, n_rmu)
 			P_k_mumu = P_mumu.reshape(nkx, nky, nkz, ns1, ns2, n_rmu, n_rmu)
-			
-			# IFFT over k-dimensions directly - NO TRANSPOSE NEEDED
 			P_R_mumu = jnp.fft.ifftn(P_k_mumu, axes=(0, 1, 2), norm='ortho')
 			# P_R_mumu: (Rx, Ry, Rz, ns, ns, n_rmu, n_rmu)
 			
 			# Frobenius norm squared over spin (axes 3, 4)
 			C_R = jnp.sum(jnp.abs(P_R_mumu) ** 2, axis=(3, 4))
-			# C_R: (Rx, Ry, Rz, n_rmu, n_rmu)
-			
-			# FFT over R-dimensions directly - NO TRANSPOSE NEEDED
 			C_q = jnp.fft.fftn(C_R, axes=(0, 1, 2), norm='ortho')
 			# C_q: (qx, qy, qz, n_rmu, n_rmu) - already correct!
 			
 			# ---- ZCT pathway ----
 			# Input: (nk, ns, ns, n_rmu, n_zchunk)
 			P_k_muz = P_mu_z.reshape(nkx, nky, nkz, ns1, ns2, n_rmu, n_zchunk)
-			
-			# IFFT over k-dimensions directly - NO TRANSPOSE NEEDED
 			P_R_muz = jnp.fft.ifftn(P_k_muz, axes=(0, 1, 2), norm='ortho')
 			# P_R_muz: (Rx, Ry, Rz, ns, ns, n_rmu, n_zchunk)
 			
 			# Frobenius norm squared over spin (axes 3, 4)
 			Z_R = jnp.sum(jnp.abs(P_R_muz) ** 2, axis=(3, 4))
-			# Z_R: (Rx, Ry, Rz, n_rmu, n_zchunk)
-			
-			# FFT over R-dimensions directly - NO TRANSPOSE NEEDED
 			Z_q = jnp.fft.fftn(Z_R, axes=(0, 1, 2), norm='ortho')
 			# Z_q: (qx, qy, qz, n_rmu, n_zchunk) - already correct!
 			
@@ -705,25 +644,7 @@ def compute_CCT_only(
 	kgrid: tuple[int, int, int],
 	mesh_xy: Mesh,
 ) -> jax.Array:
-	"""
-	Compute CCT matrix only (no ZCT) from pair density P_k(μ,μ).
-	
-	This is more memory-efficient than compute_CCT_ZCT_from_pair_density
-	when you only need C_q for Cholesky factorization.
-	
-	Pipeline:
-		1. P_k,ab(μ,ν) -> P_R,ab(μ,ν) via ortho-IFFT
-		2. C_R(μ,ν) = Σ_ab |P_R,ab(μ,ν)|² (Frobenius norm squared)
-		3. C_R -> C_q via ortho-FFT
-	
-	Args:
-		P_k_mumu: (nk, ns, ns, n_rmu, n_rmu) pair density at centroids
-		kgrid: (nkx, nky, nkz)
-		mesh_xy: Device mesh
-	
-	Returns:
-		C_q: (nqx, nqy, nqz, n_rmu, n_rmu) CCT matrix
-	"""
+	"""Compute CCT matrix C_q from P_k(μ,μ) via ortho FFT pipeline."""
 	nkx, nky, nkz = kgrid
 	nk, ns1, ns2, n_rmu, _ = P_k_mumu.shape
 	
@@ -739,16 +660,11 @@ def compute_CCT_only(
 			# Input: (nk, ns1, ns2, n_rmu, n_rmu)
 			# Reshape to expose k-dimensions: (nkx, nky, nkz, ns1, ns2, n_rmu, n_rmu)
 			P_k = P_mumu.reshape(nkx, nky, nkz, ns1, ns2, n_rmu, n_rmu)
-			
-			# IFFT over k-dimensions directly - NO TRANSPOSE NEEDED
 			P_R = jnp.fft.ifftn(P_k, axes=(0, 1, 2), norm='ortho')
 			# P_R: (Rx, Ry, Rz, ns1, ns2, n_rmu, n_rmu)
 			
 			# Frobenius norm squared over spin (axes 3, 4 are spin dimensions)
 			C_R = jnp.sum(jnp.abs(P_R) ** 2, axis=(3, 4))
-			# C_R: (Rx, Ry, Rz, n_rmu, n_rmu)
-			
-			# FFT over R-dimensions directly - NO TRANSPOSE NEEDED
 			C_q = jnp.fft.fftn(C_R, axes=(0, 1, 2), norm='ortho')
 			# C_q: (qx, qy, qz, n_rmu, n_rmu) - already in correct order!
 			
@@ -762,7 +678,6 @@ def compute_CCT_only(
 # ============================================================================
 # ISDF Zeta Fitting: Cholesky Solve with Optimized Sharding
 # ============================================================================
-#
 # Strategy: "fori_loop + shard_map" (benchmarked as fastest for large n_rmu)
 #
 # Input shardings (from CCT/ZCT pipeline):
@@ -806,32 +721,7 @@ def solve_zeta_q_from_CCT_ZCT(
     Z_q: jax.Array,
     mesh_xy: Mesh,
 ) -> jax.Array:
-    """
-    Solve for zeta_q,μ(r) given CCT and ZCT matrices.
-    
-    Implements: C_q · zeta_q = Z_q  =>  zeta_q = (L L^H)^{-1} Z_q
-    where L = cholesky(C_q).
-    
-    Uses optimized "fori_loop + shard_map" strategy:
-    - Input C_q, Z_q: sharded P(None, 'x', 'y') from CCT/ZCT pipeline
-    - Z_q resharded to P(None, None, ('x','y')) for column-parallel solve
-    - Each q: replicate C_q[q], do local Cholesky, shard_map triangular solve
-    - Output zeta: P(None, None, ('x','y')) preserving column sharding
-    
-    Args:
-        C_q: (nq, n_rmu, n_rmu) CCT matrix with P(None, 'x', 'y')
-             (flattened q-grid: nq = nqx * nqy * nqz)
-        Z_q: (nq, n_rmu, n_zchunk) ZCT matrix with P(None, 'x', 'y')
-        mesh_xy: Device mesh
-    
-    Returns:
-        zeta_q: (nq, n_rmu, n_zchunk) interpolation vectors with P(None, None, ('x','y'))
-    
-    Notes:
-        - For 3D q-grid, reshape output as (nqx, nqy, nqz, n_rmu, n_zchunk)
-        - Communication: one all-gather of n_rmu² per q
-        - Solve is embarrassingly parallel over rchunk columns
-    """
+    """Solve C_q · zeta_q = Z_q via Cholesky, with column-parallel triangular solve."""
     nq, n_rmu, n_rmu2 = C_q.shape
     _, _, n_zchunk = Z_q.shape
     assert n_rmu == n_rmu2, f"C_q must be square, got {n_rmu} x {n_rmu2}"
@@ -890,50 +780,53 @@ def solve_zeta_q_from_CCT_ZCT(
     return _zeta_solve_cache[cache_key](C_q, Z_q)
 
 
-def solve_zeta_q_3d(
-    C_q_3d: jax.Array,
-    Z_q_3d: jax.Array,
-    mesh_xy: Mesh,
-) -> jax.Array:
-    """
-    Solve for zeta with 3D q-grid indexing.
-    
-    Convenience wrapper that handles the q-grid reshaping.
-    
-    Args:
-        C_q_3d: (nqx, nqy, nqz, n_rmu, n_rmu) with P(None, None, None, 'x', 'y')
-        Z_q_3d: (nqx, nqy, nqz, n_rmu, n_zchunk) with P(None, None, None, 'x', 'y')
-        mesh_xy: Device mesh
-    
-    Returns:
-        zeta_3d: (nqx, nqy, nqz, n_rmu, n_zchunk) with P(None, None, None, None, ('x','y'))
-    """
-    nqx, nqy, nqz, n_rmu, n_rmu2 = C_q_3d.shape
-    _, _, _, _, n_zchunk = Z_q_3d.shape
-    nq = nqx * nqy * nqz
-    
-    # Flatten q-grid
-    C_q_flat = C_q_3d.reshape(nq, n_rmu, n_rmu2)
-    Z_q_flat = Z_q_3d.reshape(nq, n_rmu, n_zchunk)
-    
-    # Ensure correct input sharding
-    flat_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    C_q_flat = jax.lax.with_sharding_constraint(C_q_flat, flat_shard)
-    Z_q_flat = jax.lax.with_sharding_constraint(Z_q_flat, flat_shard)
-    
-    # Solve
-    zeta_flat = solve_zeta_q_from_CCT_ZCT(C_q_flat, Z_q_flat, mesh_xy)
-    
-    # Reshape back to 3D q-grid
-    return zeta_flat.reshape(nqx, nqy, nqz, n_rmu, n_zchunk)
-
-
 # ============================================================================
 # 2D Blocked Cholesky Solver - memory efficient for large n_rmu
 # ============================================================================
 
-# Cache for 2D cholesky function
+# Caches for 2D Cholesky and solve functions
 _chol_2d_cache = {}
+_solve_fn_cache = {}
+
+
+def _get_sharded_cho_solve(mesh_xy: Mesh):
+    """Get or create cached shard_map function for column-parallel triangular solve."""
+    cache_key = ('cho_solve', id(mesh_xy))
+    if cache_key not in _solve_fn_cache:
+        @partial(shard_map, mesh=mesh_xy,
+                 in_specs=(P(None, None), P(None, ('x', 'y'))),
+                 out_specs=P(None, ('x', 'y')))
+        def _sharded_cho_solve(L: jax.Array, Z_cols: jax.Array) -> jax.Array:
+            """Column-parallel solve: L L^H zeta = Z => zeta = L^{-H}(L^{-1} Z)"""
+            y = jax.scipy.linalg.solve_triangular(L, Z_cols, lower=True)
+            zeta = jax.scipy.linalg.solve_triangular(L.conj().T, y, lower=False)
+            return zeta
+        _solve_fn_cache[cache_key] = _sharded_cho_solve
+    return _solve_fn_cache[cache_key]
+
+
+def _get_solve_all_q_fn(mesh_xy: Mesh, nq: int):
+    """Get or create cached fori_loop solve function for all q-points."""
+    cache_key = ('solve_all_q', id(mesh_xy), nq)
+    if cache_key not in _solve_fn_cache:
+        L_rep_shard = NamedSharding(mesh_xy, P(None, None))
+        cho_solve = _get_sharded_cho_solve(mesh_xy)
+        
+        @jax.jit
+        def _solve_all_q(L_q_sharded: jax.Array, Z_col_sharded: jax.Array) -> jax.Array:
+            """Solve zeta for all q using fori_loop, all-gathering L[q] one at a time."""
+            def body(q, zeta_all):
+                L_single = L_q_sharded[q]
+                L_rep = jax.lax.with_sharding_constraint(L_single, L_rep_shard)
+                Z_single = Z_col_sharded[q]
+                zeta_q = cho_solve(L_rep, Z_single)
+                return zeta_all.at[q].set(zeta_q)
+            
+            zeta_init = jnp.zeros_like(Z_col_sharded)
+            return jax.lax.fori_loop(0, nq, body, zeta_init)
+        
+        _solve_fn_cache[cache_key] = _solve_all_q
+    return _solve_fn_cache[cache_key]
 
 
 def solve_zeta_q_blocked_2d(
@@ -950,177 +843,55 @@ def solve_zeta_q_blocked_2d(
     2. Loop over q: all-gather L_q[q] to every device (one at a time)
     3. Triangular solve: with Z_q(μ, rchunk_XY) column-sharded (zero comm)
     
-    Memory comparison for n_rmu=10k, nq=100, P=128:
-        - Full replicate: nq × n_rmu² × 16B = 160 GB total, 1.25 GB/device
-        - This approach:   n_rmu² × 16B = 1.6 GB (peak, during solve loop)
-        - During Cholesky: n_rmu²/P × 16B ≈ 12 MB/device
-    
-    Performance:
-        - Cholesky: O(J × log P) communication rounds, O(n³/P) compute
-        - Solve: O(nq) all-gathers of n_rmu² each, O(nq × n_rmu² × n_zchunk/P) compute
-        - Solve is zero-comm after all-gather (embarrassingly parallel over columns)
-    
     Args:
         C_q: (nq, n_rmu, n_rmu) CCT matrix, sharded P(None, 'x', 'y')
         Z_q: (nq, n_rmu, n_zchunk) ZCT matrix, sharded P(None, 'x', 'y')  
         mesh_xy: 2D device mesh with axes ('x', 'y')
         block_size: Tile block size for Cholesky. If None, auto-selects
-                    based on n_rmu (default: n_rmu / lcm(Pr, Pc))
     
     Returns:
         zeta_q: (nq, n_rmu, n_zchunk) solution, sharded P(None, None, ('x','y'))
-    
-    Example:
-        zeta = solve_zeta_q_blocked_2d(C_q, Z_q, mesh_xy)
     """
     nq, n_rmu, n_rmu2 = C_q.shape
     _, _, n_zchunk = Z_q.shape
     assert n_rmu == n_rmu2, f"C_q must be square, got {n_rmu} x {n_rmu2}"
     
-    # Auto-select block size for 2D distribution
     Pr = mesh_xy.shape['x']
     Pc = mesh_xy.shape['y']
     
     if block_size is None:
-        # Choose block size so J = n_rmu/b is divisible by both Pr and Pc
-        # Target: J = lcm(Pr, Pc) or a small multiple
-        import math
-        target_J = math.lcm(Pr, Pc)
-        if n_rmu % target_J == 0:
-            block_size = n_rmu // target_J
-        else:
-            # Fall back: make b divide n_rmu and J divisible by Pr*Pc
-            for j_mult in range(1, 10):
-                J = target_J * j_mult
-                if n_rmu % J == 0:
-                    block_size = n_rmu // J
-                    break
-            else:
-                # Last resort: simple block size
-                block_size = max(1, n_rmu // (Pr * Pc))
-    
-    J = n_rmu // block_size
-    
-    # Validate
-    assert n_rmu % block_size == 0, f"n_rmu={n_rmu} must divide block_size={block_size}"
-    assert J % Pr == 0, f"J={J} must divide Pr={Pr}"
-    assert J % Pc == 0, f"J={J} must divide Pc={Pc}"
+        block_size, J = compute_block_size_for_2d_cholesky(n_rmu, Pr, Pc)
+    else:
+        J = n_rmu // block_size
     
     # Get or build cached Cholesky function
     cache_key = ('chol_2d', id(mesh_xy), J, block_size)
     if cache_key not in _chol_2d_cache:
         _chol_2d_cache[cache_key] = cholesky_2d_batched(mesh_xy, J, block_size)
-    
     chol_fn = _chol_2d_cache[cache_key]
     
-    # Convert C_q to tiles
-    C_q_tiles = dense_to_tiles(C_q, block_size)  # (nq, J, J, b, b)
-    
-    # Apply sharding for 2D distribution
+    # Convert C_q to tiles and apply sharding
+    C_q_tiles = dense_to_tiles(C_q, block_size)
     tiles_shard = NamedSharding(mesh_xy, P(None, 'x', 'y', None, None))
     C_q_tiles = jax.lax.with_sharding_constraint(C_q_tiles, tiles_shard)
     
-    # ========== STEP 1: 2D Blocked Cholesky ==========
-    # L_q remains distributed as (nq, J_x, J_y, b, b) during factorization
-    L_q_tiles = chol_fn(C_q_tiles)  # (nq, J, J, b, b), sharded P(None, 'x', 'y', None, None)
+    # STEP 1: 2D Blocked Cholesky
+    L_q_tiles = chol_fn(C_q_tiles)
     
-    # Convert to dense but keep sharded P(None, 'x', 'y')
-    L_q_dense = tiles_to_dense(L_q_tiles, block_size)  # (nq, n_rmu, n_rmu)
+    # Convert to dense, keep sharded P(None, 'x', 'y')
+    L_q_dense = tiles_to_dense(L_q_tiles, block_size)
     L_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     L_q_dense = jax.lax.with_sharding_constraint(L_q_dense, L_shard)
     
-    # ========== STEP 2: Reshard Z for column-parallel solve ==========
-    # Z_q: P(None, 'x', 'y') → P(None, None, ('x','y'))
+    # STEP 2: Reshard Z for column-parallel solve
     z_col_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
     Z_col = jax.lax.with_sharding_constraint(Z_q, z_col_shard)
     
-    # ========== STEP 3: Loop over q, replicate L[q], solve ==========
-    # Define shardings for the solve
-    L_rep_shard = NamedSharding(mesh_xy, P(None, None))  # Replicated
+    # STEP 3: Solve using cached function
+    solve_fn = _get_solve_all_q_fn(mesh_xy, nq)
+    zeta_q = solve_fn(L_q_dense, Z_col)
     
-    # shard_map for column-parallel triangular solve
-    # L is replicated (full n_rmu × n_rmu on each device)
-    # Z_cols is local columns (n_rmu, n_zchunk/P)
-    @partial(shard_map, mesh=mesh_xy,
-             in_specs=(P(None, None), P(None, ('x', 'y'))),
-             out_specs=P(None, ('x', 'y')))
-    def _sharded_cho_solve(L: jax.Array, Z_cols: jax.Array) -> jax.Array:
-        """Column-parallel solve: L L^H zeta = Z => zeta = L^{-H}(L^{-1} Z)"""
-        # Forward: L y = Z
-        y = jax.scipy.linalg.solve_triangular(L, Z_cols, lower=True)
-        # Backward: L^H zeta = y
-        zeta = jax.scipy.linalg.solve_triangular(L.conj().T, y, lower=False)
-        return zeta
-    
-    # Build the solve function with fori_loop over q
-    @jax.jit
-    def _solve_all_q(L_q_sharded: jax.Array, Z_col_sharded: jax.Array) -> jax.Array:
-        """Solve zeta for all q using fori_loop, all-gathering L[q] one at a time."""
-        
-        def body(q, zeta_all):
-            # Extract L[q] (still sharded as P('x', 'y'))
-            L_single = L_q_sharded[q]  # (n_rmu_X, n_rmu_Y)
-            
-            # All-gather to replicate L[q] on every device
-            L_rep = jax.lax.with_sharding_constraint(L_single, L_rep_shard)
-            
-            # Extract Z[q] (already column-sharded as P(None, ('x','y')))
-            Z_single = Z_col_sharded[q]  # (n_rmu, n_zchunk_XY)
-            
-            # Column-parallel triangular solve (zero communication)
-            zeta_q = _sharded_cho_solve(L_rep, Z_single)
-            
-            # Store result
-            return zeta_all.at[q].set(zeta_q)
-        
-        # Initialize output with column sharding
-        zeta_init = jnp.zeros_like(Z_col_sharded)
-        return jax.lax.fori_loop(0, nq, body, zeta_init)
-    
-    zeta_q = _solve_all_q(L_q_dense, Z_col)
-    
-    # Output already has correct sharding P(None, None, ('x','y'))
     return zeta_q
-
-
-def solve_zeta_q_blocked_2d_3d(
-    C_q_3d: jax.Array,
-    Z_q_3d: jax.Array,
-    mesh_xy: Mesh,
-    block_size: int = None,
-) -> jax.Array:
-    """
-    Solve zeta with 3D q-grid using 2D blocked Cholesky.
-    
-    Convenience wrapper that handles q-grid reshaping.
-    
-    Args:
-        C_q_3d: (nqx, nqy, nqz, n_rmu, n_rmu) with P(None, None, None, 'x', 'y')
-        Z_q_3d: (nqx, nqy, nqz, n_rmu, n_zchunk) with P(None, None, None, 'x', 'y')
-        mesh_xy: 2D device mesh
-        block_size: Tile block size (auto if None)
-    
-    Returns:
-        zeta_3d: (nqx, nqy, nqz, n_rmu, n_zchunk) with P(None, None, None, None, ('x','y'))
-    """
-    nqx, nqy, nqz, n_rmu, n_rmu2 = C_q_3d.shape
-    _, _, _, _, n_zchunk = Z_q_3d.shape
-    nq = nqx * nqy * nqz
-    
-    # Flatten q-grid
-    C_q_flat = C_q_3d.reshape(nq, n_rmu, n_rmu2)
-    Z_q_flat = Z_q_3d.reshape(nq, n_rmu, n_zchunk)
-    
-    # Ensure correct input sharding
-    flat_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    C_q_flat = jax.lax.with_sharding_constraint(C_q_flat, flat_shard)
-    Z_q_flat = jax.lax.with_sharding_constraint(Z_q_flat, flat_shard)
-    
-    # Solve using 2D blocked Cholesky
-    zeta_flat = solve_zeta_q_blocked_2d(C_q_flat, Z_q_flat, mesh_xy, block_size)
-    
-    # Reshape back to 3D q-grid
-    return zeta_flat.reshape(nqx, nqy, nqz, n_rmu, n_zchunk)
 
 
 # ============================================================================
@@ -1135,9 +906,6 @@ def compute_L_q_from_CCT(
     """
     Compute Cholesky factor L_q from CCT matrix using 2D blocked algorithm.
     
-    This is the first step of zeta fitting - L_q is computed once and reused
-    for all z-chunks.
-    
     Args:
         C_q: (nq, n_rmu, n_rmu) CCT matrix, sharded P(None, 'x', 'y')
         mesh_xy: 2D device mesh
@@ -1146,8 +914,6 @@ def compute_L_q_from_CCT(
     Returns:
         L_q: (nq, n_rmu, n_rmu) Cholesky factor, sharded P(None, 'x', 'y')
     """
-    import math
-    
     nq, n_rmu, n_rmu2 = C_q.shape
     assert n_rmu == n_rmu2, f"C_q must be square, got {n_rmu} x {n_rmu2}"
     
@@ -1155,29 +921,14 @@ def compute_L_q_from_CCT(
     Pc = mesh_xy.shape['y']
     
     if block_size is None:
-        target_J = math.lcm(Pr, Pc)
-        if n_rmu % target_J == 0:
-            block_size = n_rmu // target_J
-        else:
-            for j_mult in range(1, 10):
-                J = target_J * j_mult
-                if n_rmu % J == 0:
-                    block_size = n_rmu // J
-                    break
-            else:
-                block_size = max(1, n_rmu // (Pr * Pc))
-    
-    J = n_rmu // block_size
-    
-    assert n_rmu % block_size == 0, f"n_rmu={n_rmu} must divide block_size={block_size}"
-    assert J % Pr == 0, f"J={J} must divide Pr={Pr}"
-    assert J % Pc == 0, f"J={J} must divide Pc={Pc}"
+        block_size, J = compute_block_size_for_2d_cholesky(n_rmu, Pr, Pc)
+    else:
+        J = n_rmu // block_size
     
     # Get or build cached Cholesky function
     cache_key = ('chol_2d', id(mesh_xy), J, block_size)
     if cache_key not in _chol_2d_cache:
         _chol_2d_cache[cache_key] = cholesky_2d_batched(mesh_xy, J, block_size)
-    
     chol_fn = _chol_2d_cache[cache_key]
     
     # Convert to tiles
@@ -1411,7 +1162,8 @@ def fit_zeta_chunked_to_h5(
                          If False, reload from HDF5 each z-chunk (slower but less memory).
     
     Returns:
-        None (writes to HDF5)
+        psi_rmu_Y: (nk, nb, ns, n_rmu) centroid wfns, Y-sharded (persists for V_q)
+        psi_rmuT_X: (nk, n_rmu, nb, ns) conjugated centroid wfns, X-sharded
     """
     import h5py
     
@@ -1473,7 +1225,6 @@ def fit_zeta_chunked_to_h5(
     # This is critical for fitting within memory budget
     del C_q, C_q_flat
     # Force garbage collection and JAX device memory cleanup
-    import gc
     gc.collect()
     jax.clear_caches()  # Clear JAX function caches that may hold array refs
     
@@ -1527,6 +1278,37 @@ def fit_zeta_chunked_to_h5(
     t_write_total = 0.0
     t_chunk_start = time.perf_counter()
     
+    # Setup async writer thread for overlapped I/O
+    # This allows GPU computation to continue while HDF5 writes happen in background
+    write_queue = queue.Queue()
+    write_error = [None]  # Mutable container to capture errors from writer thread
+    
+    def writer_worker():
+        """Background thread that processes HDF5 writes from the queue."""
+        try:
+            while True:
+                item = write_queue.get()
+                if item is None:  # Poison pill signals shutdown
+                    break
+                zeta_data, r_start, r_end, chunk_id = item
+                # Open file, write, close (HDF5 isn't thread-safe for concurrent access)
+                with h5py.File(output_file, 'a') as f:
+                    for q_flat in range(nq):
+                        qx = q_flat // (nqy * nqz)
+                        qy = (q_flat % (nqy * nqz)) // nqz
+                        qz = q_flat % nqz
+                        f['zeta_q'][qx, qy, qz, :, r_start:r_end] = zeta_data[q_flat]
+                write_queue.task_done()
+        except Exception as e:
+            write_error[0] = e
+            write_queue.task_done()
+    
+    # Start writer thread (only on rank 0)
+    writer_thread = None
+    if jax.process_index() == 0:
+        writer_thread = threading.Thread(target=writer_worker, daemon=True)
+        writer_thread.start()
+    
     with timing.section("zeta_fit.chunk_loop"):
         for chunk_idx in range(num_z_chunks):
             z_start = chunk_idx * z_chunk_size
@@ -1537,7 +1319,7 @@ def fit_zeta_chunked_to_h5(
             r_start = chunk_idx * n_zchunk
             r_end = r_start + actual_n_zchunk
             
-            print(f"Chunk {chunk_idx+1}/{num_z_chunks}: r=[{r_start}:{r_end}]", end="\r")
+            print(f"Chunk {chunk_idx+1}/{num_z_chunks}: r=[{r_start}:{r_end}]")
             
             # 6a. Get psi_nk,a(r_chunk)
             t0 = time.perf_counter()
@@ -1598,28 +1380,36 @@ def fit_zeta_chunked_to_h5(
                 del Z_q_flat
             t_solve_total += time.perf_counter() - t0
             
-            # 5e. Gather to host and write to HDF5
+            # 5e. Copy to host and queue async write to HDF5
+            # GPU→CPU copy is fast; actual HDF5 write happens in background thread
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.h5_write"):
-                # Write q-by-q to avoid gathering full (nq × n_rmu × n_zchunk) to host
-                # Each q gather is only (n_rmu × n_zchunk) ≈ 160 MB for large systems
                 if jax.process_index() == 0:
-                    with h5py.File(output_file, 'a') as f:
-                        for q_flat in range(nq):
-                            # Get one q-point at a time
-                            zeta_q_single = np.asarray(zeta_chunk[q_flat])  # (n_rmu, n_zchunk)
-                            # Convert flat q to 3D indices
-                            qx = q_flat // (nqy * nqz)
-                            qy = (q_flat % (nqy * nqz)) // nqz
-                            qz = q_flat % nqz
-                            f['zeta_q'][qx, qy, qz, :, r_start:r_end] = zeta_q_single
+                    # Copy all q-points to CPU at once (faster than one-by-one)
+                    zeta_cpu = np.asarray(zeta_chunk)  # (nq, n_rmu, n_zchunk) on CPU
+                    
+                    # Queue the write (non-blocking - GPU can continue immediately)
+                    write_queue.put((zeta_cpu, r_start, r_end, chunk_idx))
                 
-                # Synchronize
+                # Synchronize across devices (but not waiting for HDF5 write)
                 jax.experimental.multihost_utils.sync_global_devices(f"zeta_chunk_{chunk_idx}")
             t_write_total += time.perf_counter() - t0
             
     
     t_chunks_total = time.perf_counter() - t_chunk_start
+    
+    # Wait for all async writes to complete
+    if jax.process_index() == 0 and writer_thread is not None:
+        write_queue.join()  # Wait for all queued writes
+        write_queue.put(None)  # Poison pill to stop writer thread
+        writer_thread.join()  # Wait for thread to exit
+        
+        # Check for errors from writer thread
+        if write_error[0] is not None:
+            raise RuntimeError(f"Async writer failed: {write_error[0]}")
+    
+    # Sync all processes after writes complete
+    jax.experimental.multihost_utils.sync_global_devices("zeta_writes_complete")
     
     # Free cached G-space now that chunk loop is done
     if cached_gspace is not None:
@@ -1643,6 +1433,9 @@ def fit_zeta_chunked_to_h5(
     print(f"  {'-'*50}")
     print(f"  {'Chunk loop total':<20} {t_chunks_total:>10.2f}s {t_chunks_total/num_z_chunks*1000:>10.1f}ms")
     print(f"  {'Per r-point':<20} {'':<10} {t_chunks_total/n_rtot*1e6:>10.1f}μs")
+    
+    # Return centroid wavefunctions (persist for downstream V_q computation)
+    return psi_rmu_Y, psi_rmuT_X
 
 
 def load_gspace_for_bands(
@@ -2106,26 +1899,3 @@ def load_centroids_band_chunked(
     return psi_rmu_all, psi_rmuT_all
 
 
-def read_Gvecs_and_get_sharded_wfns(wfn, sym, meta, centroid_indices, bispinor, mesh_xy, band_range):
-    """
-    Combined wavefunction loading: read G-space + FFT + extract centroids.
-    
-    WARNING: This loads all bands at once - can cause OOM for large systems.
-    For memory-safe loading, use load_centroids_band_chunked instead.
-    
-    Returns:
-        psi_rmu_Y: (nk, nb, ns, n_rmu) with P(None, None, None, 'y')
-        psi_rmuT_X: (nk, n_rmu, nb, ns) with P(None, 'x', None, None)
-        psi_rtot_Y: (nk, nb, ns, n_rtot) with P(None, None, None, 'y') - full grid
-    """
-    nb = band_range[1] - band_range[0]
-    
-    # Load to G-space (note argument order: wfn, sym, bandrange, meta, bispinor, mesh_xy)
-    global_psi_Gtot, nb_actual = read_Gvecs_to_devices(wfn, sym, band_range, meta, bispinor, mesh_xy)
-    
-    # FFT + extract centroids (note: is_left=False for right wfn)
-    psi_rtot_Y, psi_rmu_Y, psi_rmuT_X = get_sharded_wfns(
-        global_psi_Gtot, sym, meta, centroid_indices, nb, False, mesh_xy
-    )
-    
-    return psi_rmu_Y, psi_rmuT_X, psi_rtot_Y
