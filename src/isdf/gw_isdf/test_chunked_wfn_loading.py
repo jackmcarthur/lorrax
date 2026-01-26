@@ -886,12 +886,19 @@ def main(argv=None):
     nx, ny, nz = meta.fft_grid
     nqx, nqy, nqz = meta.kgrid
     n_q = nqx * nqy * nqz
-    n_b = meta.b_id_3 - meta.b_id_0  # bands in sigma window
+    
+    # Band counts for left/right wavefunctions (cohsex_jax convention):
+    # Left:  (b0, b3) = all occupied + sigma conduction
+    # Right: (b0, b4) = all occupied + all conduction up to nband
+    # For memory estimation, use FULL range (b0 to b4) since that's what we load
+    n_b_left = meta.b_id_3 - meta.b_id_0
+    n_b_right = meta.b_id_4 - meta.b_id_0
+    n_b_full = max(n_b_left, n_b_right)  # = b4 - b0
     
     try:
         chunks = compute_optimal_chunks(
             n_k=meta.nk_tot,
-            n_b=n_b,
+            n_b=n_b_full,  # Use full band range for memory estimation
             n_s=meta.nspinor,
             n_rmu=n_rmu,
             n_r=meta.n_rtot,
@@ -907,7 +914,7 @@ def main(argv=None):
         
         # Print memory breakdown
         print_memory_breakdown(
-            chunks, n_b, meta.n_rtot, n_q, meta.fft_grid,
+            chunks, n_b_full, meta.n_rtot, n_q, meta.fft_grid,
             memory_source=memory_source
         )
         
@@ -1021,11 +1028,19 @@ def main(argv=None):
     print(f"  G-space cache: {'enabled' if use_gspace_cache else 'disabled'}")
     print(f"  Output: {output_path}")
     
+    # Band ranges for left/right wavefunctions (cohsex_jax convention)
+    # Left:  (b0, b3) = all occupied + sigma conduction
+    # Right: (b0, b4) = all occupied + all conduction up to nband
+    band_range_left = (meta.b_id_0, meta.b_id_3)
+    band_range_right = (meta.b_id_0, meta.b_id_4)
+    
     with mesh_xy:
-        psi_rmu_Y, psi_rmuT_X = fit_zeta_chunked_to_h5(
+        psi_l_rmu_Y, psi_l_rmuT_X, psi_r_rmu_Y, psi_r_rmuT_X = fit_zeta_chunked_to_h5(
             wfn, sym, meta, centroid_indices, mesh_xy,
             z_chunk_size, output_path, band_chunk_size, q_chunk_size, bispinor,
-            use_gspace_cache=use_gspace_cache
+            use_gspace_cache=use_gspace_cache,
+            band_range_left=band_range_left,
+            band_range_right=band_range_right,
         )
     
     # Verify zeta output
@@ -1089,8 +1104,10 @@ def main(argv=None):
     timing.get_collector().report(title="--- Timing Report ---", min_percent=0.1)
     
     print("\n  Outputs retained in memory:")
-    print(f"    psi_rmu_Y:  {psi_rmu_Y.shape} sharded {psi_rmu_Y.sharding.spec}")
-    print(f"    psi_rmuT_X: {psi_rmuT_X.shape} sharded {psi_rmuT_X.sharding.spec}")
+    print(f"    psi_l_rmu_Y:  {psi_l_rmu_Y.shape} sharded {psi_l_rmu_Y.sharding.spec}")
+    print(f"    psi_l_rmuT_X: {psi_l_rmuT_X.shape} sharded {psi_l_rmuT_X.sharding.spec}")
+    print(f"    psi_r_rmu_Y:  {psi_r_rmu_Y.shape} sharded {psi_r_rmu_Y.sharding.spec}")
+    print(f"    psi_r_rmuT_X: {psi_r_rmuT_X.shape} sharded {psi_r_rmuT_X.sharding.spec}")
     if V_qmunu is not None:
         print(f"    V_qmunu:    {V_qmunu.shape}")
     print(f"\n  Zeta written to: {output_path}")

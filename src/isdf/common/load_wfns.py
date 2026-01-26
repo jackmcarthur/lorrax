@@ -362,8 +362,8 @@ def get_sharded_wfns(
 			# bands still sharded, avoiding a 250x memory spike.
 			psi_rmu = jnp.take(psi_rtot, centroid_lin, axis=3)
 
-			# Conjugate-transpose to (nk, n_rmu, nb, nspinor)
-			psi_rmuT = jnp.conj(psi_rmu.transpose(0, 3, 1, 2).reshape(nk_tot, n_rmu, -1, nspinor))
+			# Conjugate-transpose to (nk, n_rmu, nb, nspinor) for pair density
+			psi_rmuT = jnp.conj(psi_rmu.transpose(0, 3, 1, 2))  # (nk, n_rmu, nb, ns)
 			
 			# Re-shard results: rtot and rmu to Y, rmuT to X
 			psi_rtot = jax.lax.with_sharding_constraint(psi_rtot, y3_4)
@@ -491,6 +491,89 @@ def compute_pair_density_k_zchunk(
 	
 	_compute_P_zchunk = _compute_pair_density_cache[cache_key]
 	return _compute_P_zchunk(psi_rmuT_X, psi_zchunk_Y)
+
+
+# ============================================================================
+# Spin-traced pair density (matching cohsex_jax treatment)
+# ============================================================================
+# cohsex_jax traces over spin for ISDF fitting:
+#   P_k(μ,ν) = Σ_{n,s} ψ*_{n,k,s}(r_μ) × ψ_{n,k,s}(r_ν)
+# This reduces lstsq error by fitting a lower-rank object.
+
+def compute_pair_density_spin_traced(
+	psi_rmuT_X: jax.Array,
+	psi_rmu_Y: jax.Array,
+	mesh_xy: Mesh,
+) -> jax.Array:
+	"""
+	Compute spin-traced pair density P_k(μ,ν) = Σ_{n,s} ψ*_{n,k,s}(μ) ψ_{n,k,s}(ν).
+	
+	This matches cohsex_jax spin treatment for ISDF fitting.
+	
+	Input shapes and shardings:
+		psi_rmuT_X: (nk, n_rmu, nb, ns) with P(None, 'x', None, None)
+			- conj(psi_nk,s(r_mu)) with mu sharded on X
+		psi_rmu_Y: (nk, nb, ns, n_rmu) with P(None, None, None, 'y')
+			- psi_nk,s(r_nu) with nu sharded on Y
+	
+	Output:
+		P_k: (nk, n_rmu, n_rmu) with P(None, 'x', 'y')
+			- P[k, mu, nu] = Σ_{n,s} psi*_nk,s(r_mu) * psi_nk,s(r_nu)
+	"""
+	nk, n_rmu, nb, ns = psi_rmuT_X.shape
+	cache_key = ('spin_traced', id(mesh_xy), nk, n_rmu, nb, ns)
+	
+	if cache_key not in _compute_pair_density_cache:
+		x1_4 = NamedSharding(mesh_xy, P(None, 'x', None, None))
+		y3_4 = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+		xy_out = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+		
+		@partial(jax.jit, in_shardings=(x1_4, y3_4), out_shardings=xy_out)
+		def _compute_P_traced(psi_L: jax.Array, psi_R: jax.Array) -> jax.Array:
+			"""
+			psi_L: (nk, n_rmu, nb, ns) - conjugated, mu on X
+			psi_R: (nk, nb, ns, n_rmu) - nu on Y
+			
+			Contract over band (n) and spin (s): 'kmns,knsv->kmv'
+			"""
+			return jnp.einsum('kmns,knsv->kmv', psi_L, psi_R, optimize=True)
+		
+		_compute_pair_density_cache[cache_key] = _compute_P_traced
+	
+	return _compute_pair_density_cache[cache_key](psi_rmuT_X, psi_rmu_Y)
+
+
+def compute_pair_density_spin_traced_zchunk(
+	psi_rmuT_X: jax.Array,
+	psi_zchunk_Y: jax.Array,
+	mesh_xy: Mesh,
+) -> jax.Array:
+	"""
+	Spin-traced pair density for z-chunk: P_k(μ,r) = Σ_{n,s} ψ*_{n,k,s}(μ) ψ_{n,k,s}(r).
+	
+	Input shapes and shardings:
+		psi_rmuT_X: (nk, n_rmu, nb, ns) with P(None, 'x', None, None)
+		psi_zchunk_Y: (nk, nb, ns, n_zchunk) with P(None, None, None, 'y')
+	
+	Output:
+		P_k_zchunk: (nk, n_rmu, n_zchunk) with P(None, 'x', 'y')
+	"""
+	nk, n_rmu, nb, ns = psi_rmuT_X.shape
+	_, _, _, n_zchunk = psi_zchunk_Y.shape
+	cache_key = ('spin_traced_zchunk', id(mesh_xy), nk, n_rmu, nb, ns, n_zchunk)
+	
+	if cache_key not in _compute_pair_density_cache:
+		x1_4 = NamedSharding(mesh_xy, P(None, 'x', None, None))
+		y3_4 = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+		xy_out = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+		
+		@partial(jax.jit, in_shardings=(x1_4, y3_4), out_shardings=xy_out)
+		def _compute_P_traced_z(psi_L: jax.Array, psi_R: jax.Array) -> jax.Array:
+			return jnp.einsum('kmns,knsr->kmr', psi_L, psi_R, optimize=True)
+		
+		_compute_pair_density_cache[cache_key] = _compute_P_traced_z
+	
+	return _compute_pair_density_cache[cache_key](psi_rmuT_X, psi_zchunk_Y)
 
 
 # ============================================================================
@@ -673,6 +756,161 @@ def compute_CCT_only(
 		_isdf_pipeline_cache[cache_key] = _compute_CCT
 	
 	return _isdf_pipeline_cache[cache_key](P_k_mumu, nkx, nky, nkz)
+
+
+# ============================================================================
+# Left/Right CCT and ZCT (matching cohsex_jax physics)
+# ============================================================================
+# cohsex_jax uses separate left and right wavefunctions:
+#   - Left:  bands 0 to b3 (all occupied + sigma conduction)
+#   - Right: bands 0 to b4 (all occupied + all conduction up to nband)
+#
+# CCT: C_q(μ,ν) = Σ_k exp(iq·k) [Σ_n,s ψ_l,n,k,s(μ) ψ*_l,n,k,s(ν)]* × [Σ_m,s ψ*_r,m,k,s(μ) ψ_r,m,k,s(ν)]
+#    = FFT_k→q[ conj(P_l_R) ⊙ P_r_R ] where P_l_R = IFFT(P_l_k), P_r_R = IFFT(P_r_k)
+#
+# ZCT follows the same pattern for (μ, r) instead of (μ, ν).
+
+def compute_CCT_from_left_right(
+	P_l_k: jax.Array,
+	P_r_k: jax.Array,
+	kgrid: tuple[int, int, int],
+	mesh_xy: Mesh,
+) -> jax.Array:
+	"""
+	Compute CCT from separate left and right spin-traced pair densities.
+	
+	C_q(μ,ν) = FFT[ conj(IFFT(P_l)) ⊙ IFFT(P_r) ]
+	
+	This matches cohsex_jax physics where left and right have different band ranges.
+	
+	Args:
+		P_l_k: (nk, n_rmu, n_rmu) left pair density, P(None, 'x', 'y')
+		P_r_k: (nk, n_rmu, n_rmu) right pair density, P(None, 'x', 'y')
+		kgrid: (nkx, nky, nkz)
+		mesh_xy: Device mesh
+	
+	Returns:
+		C_q: (nqx, nqy, nqz, n_rmu, n_rmu) with P(None, None, None, 'x', 'y')
+	"""
+	nkx, nky, nkz = kgrid
+	nk, n_rmu, _ = P_l_k.shape
+	
+	cache_key = ('CCT_LR', id(mesh_xy), nk, n_rmu, nkx)
+	
+	if cache_key not in _isdf_pipeline_cache:
+		in_xy = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+		out_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
+		
+		@partial(jax.jit, in_shardings=(in_xy, in_xy), out_shardings=out_xy,
+		         static_argnames=('nkx', 'nky', 'nkz'))
+		def _compute_CCT_LR(P_l: jax.Array, P_r: jax.Array,
+		                    nkx: int, nky: int, nkz: int) -> jax.Array:
+			# Reshape to 3D k-grid: (nk, μ, ν) -> (nkx, nky, nkz, μ, ν)
+			P_l_3d = P_l.reshape(nkx, nky, nkz, n_rmu, n_rmu)
+			P_r_3d = P_r.reshape(nkx, nky, nkz, n_rmu, n_rmu)
+			
+			# Use norm='forward' for BOTH IFFT and FFT to match direct k-sum.
+			# With forward: IFFT is unscaled (sum), FFT divides by N.
+			# Convolution theorem: C_q = FFT(IFFT(A)* ⊙ IFFT(B))
+			# This gives C_q = Σ_k A*_k B_{k+q} (matches cohsex_jax direct sum)
+			P_l_R = jnp.fft.ifftn(P_l_3d, axes=(0, 1, 2), norm='forward')
+			P_r_R = jnp.fft.ifftn(P_r_3d, axes=(0, 1, 2), norm='forward')
+			
+			# Cross-product: C_R = conj(P_l_R) * P_r_R (element-wise)
+			C_R = jnp.conj(P_l_R) * P_r_R
+			
+			# FFT to q-space
+			C_q = jnp.fft.fftn(C_R, axes=(0, 1, 2), norm='forward')
+			return C_q
+		
+		_isdf_pipeline_cache[cache_key] = _compute_CCT_LR
+	
+	return _isdf_pipeline_cache[cache_key](P_l_k, P_r_k, nkx, nky, nkz)
+
+
+def compute_ZCT_from_left_right(
+	P_l_k_mumu: jax.Array,
+	P_r_k_muz: jax.Array,
+	kgrid: tuple[int, int, int],
+	mesh_xy: Mesh,
+) -> jax.Array:
+	"""
+	Compute ZCT from separate left (at centroids) and right (at z-chunk) pair densities.
+	
+	Z_q(μ,r) = FFT[ conj(IFFT(P_l(μ,μ))) ⊙ IFFT(P_r(μ,r)) ]
+	
+	Wait - this is wrong! For ZCT we need:
+	Z_q(μ,r) = Σ_k exp(iq·k) [Σ_n,s ψ_l,n,k,s(μ)* ψ_l,n,k,s(μ')]  ???
+	
+	Actually looking at cohsex_jax more carefully:
+	P_l = psi_l_rmuT @ psi_l_rtot  -> (n_rmu, n_rtot)
+	P_r = psi_r_rmuT @ psi_r_rtot  -> (n_rmu, n_rtot)
+	ZCT += conj(P_l) * P_r
+	
+	So ZCT uses (μ, r) for BOTH left and right.
+	
+	Args:
+		P_l_k_mumu: Not used - kept for signature compatibility
+		P_r_k_muz: Actually we need P_l(μ,r) and P_r(μ,r) separately!
+	
+	This function needs redesign - see compute_ZCT_from_left_right_zchunk.
+	"""
+	raise NotImplementedError("Use compute_ZCT_from_left_right_zchunk instead")
+
+
+def compute_ZCT_from_left_right_zchunk(
+	P_l_k_muz: jax.Array,
+	P_r_k_muz: jax.Array,
+	kgrid: tuple[int, int, int],
+	mesh_xy: Mesh,
+) -> jax.Array:
+	"""
+	Compute ZCT from left and right pair densities, both at (μ, z-chunk).
+	
+	Z_q(μ,r) = FFT[ conj(IFFT(P_l(μ,r))) ⊙ IFFT(P_r(μ,r)) ]
+	
+	Args:
+		P_l_k_muz: (nk, n_rmu, n_zchunk) left pair density at z-chunk, P(None, 'x', 'y')
+		P_r_k_muz: (nk, n_rmu, n_zchunk) right pair density at z-chunk, P(None, 'x', 'y')
+		kgrid: (nkx, nky, nkz)
+		mesh_xy: Device mesh
+	
+	Returns:
+		Z_q: (nqx, nqy, nqz, n_rmu, n_zchunk) with P(None, None, None, 'x', 'y')
+	"""
+	nkx, nky, nkz = kgrid
+	nk, n_rmu, n_zchunk = P_l_k_muz.shape
+	
+	cache_key = ('ZCT_LR', id(mesh_xy), nk, n_rmu, n_zchunk, nkx)
+	
+	if cache_key not in _isdf_pipeline_cache:
+		in_xy = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+		out_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
+		
+		@partial(jax.jit, in_shardings=(in_xy, in_xy), out_shardings=out_xy,
+		         static_argnames=('nkx', 'nky', 'nkz'))
+		def _compute_ZCT_LR(P_l: jax.Array, P_r: jax.Array,
+		                    nkx: int, nky: int, nkz: int) -> jax.Array:
+			# Reshape to 3D k-grid
+			P_l_3d = P_l.reshape(nkx, nky, nkz, n_rmu, n_zchunk)
+			P_r_3d = P_r.reshape(nkx, nky, nkz, n_rmu, n_zchunk)
+			
+			# Use norm='forward' for BOTH IFFT and FFT to match direct k-sum.
+			# With forward: IFFT is unscaled (sum), FFT divides by N.
+			# This gives Z_q = Σ_k P_l*_k P_r_{k+q} (matches cohsex_jax)
+			P_l_R = jnp.fft.ifftn(P_l_3d, axes=(0, 1, 2), norm='forward')
+			P_r_R = jnp.fft.ifftn(P_r_3d, axes=(0, 1, 2), norm='forward')
+			
+			# Cross-product
+			Z_R = jnp.conj(P_l_R) * P_r_R
+			
+			# FFT to q-space
+			Z_q = jnp.fft.fftn(Z_R, axes=(0, 1, 2), norm='forward')
+			return Z_q
+		
+		_isdf_pipeline_cache[cache_key] = _compute_ZCT_LR
+	
+	return _isdf_pipeline_cache[cache_key](P_l_k_muz, P_r_k_muz, nkx, nky, nkz)
 
 
 # ============================================================================
@@ -1132,20 +1370,28 @@ def fit_zeta_chunked_to_h5(
     q_chunk_size: int = 1,
     bispinor: bool = True,
     use_gspace_cache: bool = True,
+    band_range_left: tuple[int, int] | None = None,
+    band_range_right: tuple[int, int] | None = None,
 ):
     """
     Full zeta fitting pipeline with z-chunk loop and HDF5 output.
     
     Workflow:
-    1. Load wavefunctions (band-chunked FFT)
-    2. Compute C_q from P_k(r_mu, r_mu) - once
-    3. Compute L_q = chol(C_q) using 2D blocked algorithm - once
-    4. For each z-chunk:
+    1. Load wavefunctions (band-chunked FFT) for max range
+    2. Slice to get left (0:b3) and right (0:b4) views
+    3. Compute C_q from spin-traced P_l × P_r via ortho FFT
+    4. Compute L_q = chol(C_q) using 2D blocked algorithm
+    5. For each z-chunk:
        a. Compute psi_nk,a(r_chunk) via FFT
-       b. Compute P_k,ab(r_mu, r_chunk)
-       c. Compute Z_q via ortho FFT pipeline
+       b. Compute spin-traced P_l and P_r at z-chunk
+       c. Compute Z_q via ortho FFT with left/right cross-product
        d. Solve zeta_q = L^{-H}(L^{-1} Z_q) (q-chunked)
        e. Write zeta_q chunk to HDF5
+    
+    Physics note (spin treatment):
+        cohsex_jax traces over spin for ISDF fitting:
+        P_k(μ,ν) = Σ_{n,s} ψ*_{n,k,s}(μ) ψ_{n,k,s}(ν)
+        This reduces rank of the fitted object vs keeping all (a,b) combinations.
     
     Args:
         wfn: WFNReader object
@@ -1156,14 +1402,17 @@ def fit_zeta_chunked_to_h5(
         z_chunk_size: Number of z-slices per chunk
         output_file: Path to output HDF5 file
         band_chunk_size: Bands to process at once (memory control)
-        q_chunk_size: Q-points to solve simultaneously (memory vs parallelism trade-off)
+        q_chunk_size: Q-points to solve simultaneously
         bispinor: Whether to use bispinor wavefunctions
-        use_gspace_cache: If True, cache G-space across z-chunks (faster but uses more memory).
-                         If False, reload from HDF5 each z-chunk (slower but less memory).
+        use_gspace_cache: If True, cache G-space across z-chunks
+        band_range_left: (start, end) for left wfns. Default: (b0, b3)
+        band_range_right: (start, end) for right wfns. Default: (b0, b4)
     
     Returns:
-        psi_rmu_Y: (nk, nb, ns, n_rmu) centroid wfns, Y-sharded (persists for V_q)
-        psi_rmuT_X: (nk, n_rmu, nb, ns) conjugated centroid wfns, X-sharded
+        psi_l_rmu_Y: Left centroid wfns (nk, nb_l, ns, n_rmu), Y-sharded
+        psi_l_rmuT_X: Left conjugated wfns (nk, n_rmu, nb_l, ns), X-sharded
+        psi_r_rmu_Y: Right centroid wfns (nk, nb_r, ns, n_rmu), Y-sharded
+        psi_r_rmuT_X: Right conjugated wfns (nk, n_rmu, nb_r, ns), X-sharded
     """
     import h5py
     
@@ -1179,34 +1428,79 @@ def fit_zeta_chunked_to_h5(
     num_z_chunks = (nz + z_chunk_size - 1) // z_chunk_size
     n_zchunk = nx * ny * z_chunk_size
     
+    # Band ranges for left and right wavefunctions (cohsex_jax convention)
+    # Left:  (b0, b3) = all occupied + sigma conduction
+    # Right: (b0, b4) = all occupied + all conduction up to nband
+    if band_range_left is None:
+        band_range_left = (meta.b_id_0, meta.b_id_3)
+    if band_range_right is None:
+        band_range_right = (meta.b_id_0, meta.b_id_4)
+    
+    # Full range for loading (max of left and right)
+    band_range_full = (min(band_range_left[0], band_range_right[0]),
+                       max(band_range_left[1], band_range_right[1]))
+    
+    nb_left = band_range_left[1] - band_range_left[0]
+    nb_right = band_range_right[1] - band_range_right[0]
+    nb_full = band_range_full[1] - band_range_full[0]
+    
     print(f"\n{'='*60}")
     print(f"Zeta fitting: {num_z_chunks} z-chunks, {n_zchunk} points each")
+    print(f"  Left bands:  {band_range_left} ({nb_left} bands)")
+    print(f"  Right bands: {band_range_right} ({nb_right} bands)")
+    print(f"  Full range:  {band_range_full} ({nb_full} bands)")
     print(f"Output: {output_file}")
     print(f"{'='*60}")
     
-    # Band range for pair density (all occupied + sigma window)
-    band_range = (meta.b_id_0, meta.b_id_3)
-    
     # ========== STEP 1: Load wavefunctions at centroids (band-chunked) ==========
+    # Load full range, then slice for left and right
     with timing.section("zeta_fit.load_wfns"):
-        psi_rmu_Y, psi_rmuT_X = load_centroids_band_chunked(
-            wfn, sym, meta, centroid_indices, bispinor, mesh_xy, band_range,
+        psi_full_rmu_Y, psi_full_rmuT_X = load_centroids_band_chunked(
+            wfn, sym, meta, centroid_indices, bispinor, mesh_xy, band_range_full,
             band_chunk_size=band_chunk_size
         )
-    
-    # ========== STEP 2: Compute CCT (C_q) from r_mu × r_mu ==========
-    with timing.section("zeta_fit.CCT"):
-        print("\nComputing pair density P_k(r_mu, r_mu)...")
-        P_k_mumu = compute_pair_density_k(psi_rmuT_X, psi_rmu_Y, mesh_xy)
-        P_k_mumu.block_until_ready()
+        # psi_full shapes: (nk, nb_full, ns, n_rmu) and (nk, n_rmu, nb_full, ns)
         
-        print("Computing C_q via ortho FFT pipeline...")
-        C_q = compute_CCT_only(P_k_mumu, kgrid, mesh_xy)
+        # Slice for left and right wavefunctions
+        # Convert global band ranges to local indices in the full array
+        # Left: bands [band_range_left[0], band_range_left[1]) relative to full[0]
+        # Right: bands [band_range_right[0], band_range_right[1]) relative to full[0]
+        l_band_start = band_range_left[0] - band_range_full[0]
+        l_band_end = l_band_start + nb_left
+        r_band_start = band_range_right[0] - band_range_full[0]
+        r_band_end = r_band_start + nb_right
+        
+        # NOTE: JAX slices are views sharing memory with the parent array.
+        # To allow garbage collection of the full array, we must make
+        # the slices independent using jnp.asarray which forces a copy.
+        psi_l_rmu_Y = jnp.asarray(psi_full_rmu_Y[:, l_band_start:l_band_end, :, :])
+        psi_l_rmuT_X = jnp.asarray(psi_full_rmuT_X[:, :, l_band_start:l_band_end, :])
+        psi_r_rmu_Y = jnp.asarray(psi_full_rmu_Y[:, r_band_start:r_band_end, :, :])
+        psi_r_rmuT_X = jnp.asarray(psi_full_rmuT_X[:, :, r_band_start:r_band_end, :])
+        
+        # Now safe to delete full arrays - slices are independent copies
+        del psi_full_rmu_Y, psi_full_rmuT_X
+        
+        print(f"  Left wfns:  {psi_l_rmu_Y.shape}")
+        print(f"  Right wfns: {psi_r_rmu_Y.shape}")
+    
+    # ========== STEP 2: Compute CCT (C_q) from left/right pair densities ==========
+    # Uses spin-traced pair density matching cohsex_jax physics
+    with timing.section("zeta_fit.CCT"):
+        print("\nComputing spin-traced pair densities P_l and P_r...")
+        P_l_k = compute_pair_density_spin_traced(psi_l_rmuT_X, psi_l_rmu_Y, mesh_xy)
+        P_r_k = compute_pair_density_spin_traced(psi_r_rmuT_X, psi_r_rmu_Y, mesh_xy)
+        P_l_k.block_until_ready()
+        P_r_k.block_until_ready()
+        # P_l_k, P_r_k: (nk, n_rmu, n_rmu)
+        
+        print("Computing C_q from left/right cross-product...")
+        C_q = compute_CCT_from_left_right(P_l_k, P_r_k, kgrid, mesh_xy)
         C_q.block_until_ready()
         # C_q: (nqx, nqy, nqz, n_rmu, n_rmu)
         
-        # Free P_k_mumu immediately - we only needed it for C_q
-        del P_k_mumu
+        # Free pair densities - only needed for C_q
+        del P_l_k, P_r_k
         
         # Flatten for Cholesky
         C_q_flat = C_q.reshape(nq, n_rmu, n_rmu)
@@ -1252,16 +1546,16 @@ def fit_zeta_chunked_to_h5(
     
     # ========== STEP 5: Pre-load G-space for all band chunks (ONCE) ==========
     # This caches the expensive HDF5 read + scatter so we don't repeat it
-    # for each z-chunk. Memory cost: ~0.5-1 GB (fits within budget).
-    # For large systems (many k-points), caching may be disabled to save memory.
+    # for each z-chunk. Memory cost depends on band_range_full (can be large).
     kgrid_arr = np.array(meta.kgrid)
     kvecs_frac = sym.kvecs_asints / kgrid_arr[None, :]
     
     if use_gspace_cache:
         with timing.section("zeta_fit.cache_gspace"):
             print("\nCaching G-space wavefunctions for z-chunk loop...")
+            # Cache FULL band range (max of left and right)
             cached_gspace = load_gspace_for_bands(
-                wfn, sym, meta, mesh_xy, band_range, bispinor, band_chunk_size
+                wfn, sym, meta, mesh_xy, band_range_full, bispinor, band_chunk_size
             )
             print(f"  Cached {len(cached_gspace)} band chunks (sharded across devices)")
     else:
@@ -1321,46 +1615,58 @@ def fit_zeta_chunked_to_h5(
             
             print(f"Chunk {chunk_idx+1}/{num_z_chunks}: r=[{r_start}:{r_end}]")
             
-            # 6a. Get psi_nk,a(r_chunk)
+            # 6a. Get psi_nk,a(r_chunk) for FULL band range
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.load"):
                 if cached_gspace is not None:
                     # Fast path: FFT only (G-space is cached)
-                    psi_zchunk_Y = get_psi_zchunk_from_cached(
-                        cached_gspace, meta, mesh_xy, band_range,
+                    psi_zchunk_full_Y = get_psi_zchunk_from_cached(
+                        cached_gspace, meta, mesh_xy, band_range_full,
                         z_start, z_end, kvecs_frac,
                         band_chunk_size=band_chunk_size
                     )
                 else:
                     # Slow path: reload from HDF5 each chunk
-                    psi_zchunk_Y = get_psi_zchunk(
-                        wfn, sym, meta, mesh_xy, band_range,
+                    psi_zchunk_full_Y = get_psi_zchunk(
+                        wfn, sym, meta, mesh_xy, band_range_full,
                         z_start, z_end, bispinor,
                         band_chunk_size=band_chunk_size
                     )
-                psi_zchunk_Y.block_until_ready()
+                psi_zchunk_full_Y.block_until_ready()
+                
+                # Slice for left and right (same logic as centroids)
+                psi_l_zchunk_Y = psi_zchunk_full_Y[:, l_band_start:l_band_end, :, :]
+                psi_r_zchunk_Y = psi_zchunk_full_Y[:, r_band_start:r_band_end, :, :]
             t_load_total += time.perf_counter() - t0
             
-            # 5b. Compute P_k,ab(r_mu, r_chunk)
+            # 6b. Compute spin-traced pair densities for left and right
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.pair_density"):
-                P_k_mu_zchunk = compute_pair_density_k_zchunk(
-                    psi_rmuT_X, psi_zchunk_Y, mesh_xy
+                # Left: P_l_k(μ, r) = Σ_{n,s} ψ*_l(μ) ψ_l(r)
+                P_l_k_muz = compute_pair_density_spin_traced_zchunk(
+                    psi_l_rmuT_X, psi_l_zchunk_Y, mesh_xy
                 )
-                P_k_mu_zchunk.block_until_ready()
+                # Right: P_r_k(μ, r) = Σ_{n,s} ψ*_r(μ) ψ_r(r)
+                P_r_k_muz = compute_pair_density_spin_traced_zchunk(
+                    psi_r_rmuT_X, psi_r_zchunk_Y, mesh_xy
+                )
+                P_l_k_muz.block_until_ready()
+                P_r_k_muz.block_until_ready()
             t_pair_total += time.perf_counter() - t0
             
-            # Free psi_zchunk_Y immediately - we have P_k now
-            del psi_zchunk_Y
+            # Free psi_zchunk arrays - we have P_k now
+            del psi_zchunk_full_Y, psi_l_zchunk_Y, psi_r_zchunk_Y
             
-            # 5c. Compute Z_q via ortho FFT pipeline
+            # 6c. Compute Z_q via left/right cross-product FFT
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.ZCT"):
-                Z_q = compute_ZCT_for_zchunk(P_k_mu_zchunk, kgrid, mesh_xy)
+                Z_q = compute_ZCT_from_left_right_zchunk(
+                    P_l_k_muz, P_r_k_muz, kgrid, mesh_xy
+                )
                 Z_q.block_until_ready()
                 
-                # Free P_k immediately - we have Z_q now
-                del P_k_mu_zchunk
+                # Free P_k arrays - we have Z_q now
+                del P_l_k_muz, P_r_k_muz
                 
                 Z_q_flat = Z_q.reshape(nq, n_rmu, actual_n_zchunk)
                 Z_q_flat = jax.lax.with_sharding_constraint(Z_q_flat, flat_shard)
@@ -1434,8 +1740,9 @@ def fit_zeta_chunked_to_h5(
     print(f"  {'Chunk loop total':<20} {t_chunks_total:>10.2f}s {t_chunks_total/num_z_chunks*1000:>10.1f}ms")
     print(f"  {'Per r-point':<20} {'':<10} {t_chunks_total/n_rtot*1e6:>10.1f}μs")
     
-    # Return centroid wavefunctions (persist for downstream V_q computation)
-    return psi_rmu_Y, psi_rmuT_X
+    # Return left and right centroid wavefunctions (persist for downstream use)
+    # Note: full arrays were already deleted after slicing in STEP 1
+    return psi_l_rmu_Y, psi_l_rmuT_X, psi_r_rmu_Y, psi_r_rmuT_X
 
 
 def load_gspace_for_bands(
@@ -1755,6 +2062,7 @@ def get_sharded_wfns_centroids(
     
     if cache_key not in _centroid_extract_cache:
         out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+        # out_X: transposed shape is (nk, n_rmu, nb, ns) for pair density einsum
         out_X = NamedSharding(mesh_xy, P(None, 'x', None, None))
         null_4 = NamedSharding(mesh_xy, P(None, None, None, None))
         stage1_shard = NamedSharding(mesh_xy, P(None, 'y', None, None))
@@ -1865,6 +2173,7 @@ def load_centroids_band_chunked(
     out_X = NamedSharding(mesh_xy, P(None, 'x', None, None))
     
     # Allocate output arrays for all bands
+    # psi_rmu: (nk, nb, ns, n_rmu), psi_rmuT: (nk, n_rmu, nb, ns) for pair density
     psi_rmu_all = jnp.zeros((nk_tot, nb_total, nspinor, n_rmu), dtype=jnp.complex128)
     psi_rmuT_all = jnp.zeros((nk_tot, n_rmu, nb_total, nspinor), dtype=jnp.complex128)
     psi_rmu_all = jax.lax.with_sharding_constraint(psi_rmu_all, out_Y)
@@ -1888,6 +2197,8 @@ def load_centroids_band_chunked(
         )
         
         # Place into output arrays
+        # psi_rmu_chunk: (nk, nb_chunk, ns, n_rmu)
+        # psi_rmuT_chunk: (nk, n_rmu, nb_chunk, ns)
         local_bc_start = bc_idx * band_chunk_size
         local_bc_end = local_bc_start + nb_chunk
         psi_rmu_all = psi_rmu_all.at[:, local_bc_start:local_bc_end, :, :].set(psi_rmu_chunk)

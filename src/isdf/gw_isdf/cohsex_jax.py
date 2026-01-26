@@ -59,7 +59,12 @@ from ..io import (
     load_centroids, resolve_input_paths,
 )
 from ..common import symmetry_maps
-from ..common.load_wfns import read_Gvecs_to_devices, get_sharded_wfns, get_enk_bandrange
+from ..common.load_wfns import (
+    read_Gvecs_to_devices, get_sharded_wfns, get_enk_bandrange,
+    fit_zeta_chunked_to_h5,
+)
+from .compute_vcoul import compute_all_V_q_from_zeta_h5
+from .cohsex_init import compute_optimal_chunks
 from .get_windows import get_window_info
 from .w_isdf import get_chi0_jax, get_static_w_q_jax, get_w_omega_jax
 from .vcoul import compute_q0_averages
@@ -670,6 +675,179 @@ def get_zeta_q_and_v_q_mu_nu(
 
 	return V_qmunu, S_qmunu, psilT_X, psil_Y, psir_X, psirT_Y, enk_l, enk_r # T indicates b at end.
 
+
+def fit_zeta_and_compute_V_q_chunked(
+	wfn,
+	sym,
+	meta: Meta,
+	centroid_indices: jax.Array,
+	mesh_xy: Mesh,
+	output_dir: str,
+	bispinor: bool = False,
+	memory_budget_gb: float = 6.0,
+	sys_dim: int = 2,
+):
+	"""
+	Chunked zeta fitting and V_q computation pipeline.
+	
+	This replaces the per-q-point zeta fitting in the main loop with a memory-efficient
+	chunked approach that:
+	1. Loads wavefunctions for full band range (b0 to b4)
+	2. Slices for left (b0→b3) and right (b0→b4) with spin-traced pair density
+	3. Fits zeta via z-chunked algorithm and writes to HDF5
+	4. Reads zeta back and computes V_qmunu
+	
+	Physics note:
+		Uses spin-traced pair density P_k(μ,ν) = Σ_{n,s} ψ*_{n,k,s}(μ) ψ_{n,k,s}(ν)
+		matching cohsex_jax convention for ISDF fitting. Different from keeping all
+		spin combinations which would increase lstsq error.
+	
+	Args:
+		wfn: WFNReader object
+		sym: SymMaps object
+		meta: Meta object with system info
+		centroid_indices: ISDF centroid indices
+		mesh_xy: 2D device mesh
+		output_dir: Directory for zeta HDF5 file
+		bispinor: Whether to use bispinor wavefunctions
+		memory_budget_gb: Memory budget per device in GB
+		sys_dim: System dimensionality (2 or 3)
+	
+	Returns:
+		Dictionary with:
+		- V_qmunu: (1, npol, npol, nkx, nky, nkz, n_rmu, n_rmu) Coulomb matrix
+		- v_q0_noG0_munu: (n_rmu, n_rmu) V_q at q=0 with G=0 excluded
+		- G0_mu_nu: (n_rmu,) ζ_μ(G=0) for head corrections
+		- psi_l_rmu_Y: Left centroid wfns, Y-sharded
+		- psi_l_rmuT_X: Left conjugated wfns, X-sharded  
+		- psi_r_rmu_Y: Right centroid wfns, Y-sharded
+		- psi_r_rmuT_X: Right conjugated wfns, X-sharded
+		- zeta_h5_path: Path to zeta HDF5 file
+	"""
+	import os
+	
+	n_devices = jax.device_count()
+	p_x = mesh_xy.devices.shape[0]
+	p_y = mesh_xy.devices.shape[1]
+	
+	# Band ranges for left and right (cohsex_jax convention)
+	# Left: nvplussigrange = (b0, b3) = all valence + sigma-window conduction
+	# Right: ncplussigrange = (b1, b4) = sigma-window valence + all conduction
+	b0, b1, b2, b3, b4 = meta.band_edges
+	band_range_left = (b0, b3)
+	band_range_right = (b1, b4)
+	n_b_full = b4 - b0
+	
+	# Compute optimal chunk sizes
+	nqx, nqy, nqz = meta.kgrid
+	n_q = nqx * nqy * nqz
+	
+	chunks = compute_optimal_chunks(
+		n_k=meta.nk_tot,
+		n_b=n_b_full,
+		n_s=meta.nspinor,
+		n_rmu=meta.n_rmu,
+		n_r=meta.n_rtot,
+		n_q=n_q,
+		fft_grid=meta.fft_grid,
+		n_devices=n_devices,
+		memory_budget_gb=memory_budget_gb,
+		target_utilization=0.85,
+		p_x=p_x,
+		p_y=p_y,
+		verbose=True,
+	)
+	
+	band_chunk_size = chunks['band_chunk']
+	z_chunk_size = chunks['z_chunk']
+	q_chunk_size = chunks['q_chunk']
+	use_gspace_cache = chunks.get('use_gspace_cache', True)
+	
+	# Output path for zeta
+	zeta_h5_path = os.path.join(output_dir, "zeta_q.h5")
+	
+	print(f"\n  Chunked ISDF fitting:")
+	print(f"    Band chunks: {band_chunk_size}")
+	print(f"    Z chunks:    {z_chunk_size}")
+	print(f"    Q chunks:    {q_chunk_size}")
+	print(f"    G-space cache: {'enabled' if use_gspace_cache else 'disabled'}")
+	print(f"    Zeta output: {zeta_h5_path}")
+	
+	# Step 1: Fit zeta and write to HDF5
+	with timing.section("cohsex_jax.zeta_fit_chunked"):
+		psi_l_rmu_Y, psi_l_rmuT_X, psi_r_rmu_Y, psi_r_rmuT_X = fit_zeta_chunked_to_h5(
+			wfn, sym, meta, centroid_indices, mesh_xy,
+			z_chunk_size, zeta_h5_path, band_chunk_size, q_chunk_size, bispinor,
+			use_gspace_cache=use_gspace_cache,
+			band_range_left=band_range_left,
+			band_range_right=band_range_right,
+		)
+	
+	# Step 2: Compute V_qmunu from zeta
+	# Ensure filesystem is flushed before reading
+	if jax.process_index() == 0:
+		os.sync()
+	jax.experimental.multihost_utils.sync_global_devices("zeta_flush")
+	
+	bvec = np.asarray(wfn.blat * wfn.bvec, dtype=np.float64)
+	cell_volume = float(wfn.cell_volume)
+	
+	with timing.section("cohsex_jax.V_q_compute"):
+		with h5py.File(zeta_h5_path, 'r') as zeta_h5:
+			with mesh_xy:
+				V_qmunu_raw, g0_mu_all = compute_all_V_q_from_zeta_h5(
+					zeta_h5,
+					kgrid=meta.kgrid,
+					fft_grid=meta.fft_grid,
+					bvec=bvec,
+					cell_volume=cell_volume,
+					mu_chunk_size=meta.n_rmu,  # Full mu chunk since we have memory
+					mesh_xy=mesh_xy,
+					sys_dim=sys_dim,
+				)
+	
+	# Write G0 (ζ_μ(G=0) for each q) to the zeta HDF5 file for restart/reuse
+	# g0_mu_all shape: (nqx, nqy, nqz, n_rmu)
+	if jax.process_index() == 0:
+		with h5py.File(zeta_h5_path, 'a') as f:
+			g0_np = np.asarray(g0_mu_all)
+			if 'g0_mu' in f:
+				del f['g0_mu']  # Overwrite if exists
+			f.create_dataset('g0_mu', data=g0_np)
+			print(f"    G0 written to {zeta_h5_path} (shape: {g0_np.shape})")
+	jax.experimental.multihost_utils.sync_global_devices("g0_write")
+	
+	# TODO: Compute and store S_qmunu = ⟨ζ_μ|ζ_ν⟩ overlap matrix during V_q computation.
+	# This would be useful for Hartree potential and other applications.
+	# S_q = zeta^H @ zeta, can be computed from zeta chunks as sum over q.
+	
+	# Reshape V_qmunu to match expected format: (1, npol, npol, nkx, nky, nkz, n_rmu, n_rmu)
+	# Our V_qmunu_raw is (nkx, nky, nkz, n_rmu, n_rmu)
+	V_qmunu = V_qmunu_raw[None, None, None, :, :, :, :, :]  # Add leading dims
+	# Broadcast to (1, npol, npol, ...)
+	V_qmunu = jnp.broadcast_to(V_qmunu, (1, meta.npol, meta.npol, nqx, nqy, nqz, meta.n_rmu, meta.n_rmu))
+	V_qmunu = jnp.array(V_qmunu)  # Force copy to avoid broadcast issues
+	
+	# Extract v_q0 (q=0 with G=0 excluded) and G0 (ζ_μ at G=0)
+	v_q0_noG0_munu = V_qmunu_raw[0, 0, 0, :, :]  # At q=(0,0,0)
+	G0_mu_nu = g0_mu_all[0, 0, 0, :]  # ζ_μ(G=0) at q=0
+	
+	print(f"\n  V_q computed:")
+	print(f"    Shape: {V_qmunu.shape}")
+	print(f"    V_q=0 trace: {jnp.trace(v_q0_noG0_munu).real:.4f}")
+	
+	return {
+		'V_qmunu': V_qmunu,
+		'v_q0_noG0_munu': v_q0_noG0_munu,
+		'G0_mu_nu': G0_mu_nu,
+		'psi_l_rmu_Y': psi_l_rmu_Y,
+		'psi_l_rmuT_X': psi_l_rmuT_X,
+		'psi_r_rmu_Y': psi_r_rmu_Y,
+		'psi_r_rmuT_X': psi_r_rmuT_X,
+		'zeta_h5_path': zeta_h5_path,
+	}
+
+
 # ================= JAX-sharded Sigma pipeline =================
 
 def get_G_mu_nu_jax(psi_vTX, psi_vY, Gij_static):
@@ -1088,9 +1266,22 @@ def main(argv=None):
 	#        This adds the cell-averaged 8π/q² to V_μν and W_μν via outer product
 	#        of ζ(G=0) vectors. Essential for correct Hartree and long-range physics.
 	# do_S:  If True, store the overlap matrix S_q = ⟨ζ_μ|ζ_ν⟩ (not currently used).
+	# use_chunked_isdf: If True, use the memory-efficient chunked ISDF fitting
+	#        that writes zeta to HDF5 and computes V_q separately. Enables larger
+	#        systems by chunking over z-axis and using spin-traced pair density.
 	# ============================================================================
 	do_G0 = True   # Always True: head corrections are essential
 	do_S = False   # Overlap matrix storage (disabled, not needed)
+	use_chunked_isdf = params.get("use_chunked_isdf", True)  # Read from input file
+	
+	# Memory budget for chunked ISDF (0 = auto-detect)
+	memory_per_device_gb = params.get("memory_per_device_gb", 0.0)
+	if memory_per_device_gb <= 0:
+		from ..common.gpu_utils import get_device_memory_gb
+		memory_per_device_gb = get_device_memory_gb()
+		if jax.process_index() == 0:
+			print(f"  Auto-detected memory budget: {memory_per_device_gb:.2f} GB/device")
+	
 	if x_only and do_screened:  # x_only=bare exchange only, do_screened=use W instead of v
 		raise ValueError("x_only and do_screened cannot both be True")
 
@@ -1142,165 +1333,299 @@ def main(argv=None):
 	# Initialize timing system
 	timing.reset()
 	if not restart:
-		with timing.section("cohsex_jax.wavefunction_setup") as timer_setup:
-			# ============================================================================
-			# WAVEFUNCTION LOADING STRATEGY:
-			# ============================================================================
-			# For ISDF fitting (zeta construction):
-			#   - psi_l: nvplussigrange (b0, b3) - all valence + sigma-window conduction
-			#   - psi_r: ncplussigrange (b1, b4) - sigma-window valence + all conduction
-			# For chi0/W calculation (screened interaction):
-			#   - psi_v: VALENCE bands only (b0, b2) - used as left/right in chi0
-			#   - psi_c: CONDUCTION bands only (b2, b4) - used as left/right in chi0
-			# For COH G_RI (resolution of identity):
-			#   - psi_coh: ALL bands (b0, b4) - needed for COH sum over all bands
-			# For final sigma projection:
-			#   - uses psi_l (b0, b3) which covers sigma window
-			# ============================================================================
+		# ============================================================================
+		# BAND RANGE DEFINITIONS
+		# ============================================================================
+		valence_range = (b0, b2)      # Valence bands only (for chi0)
+		conduction_range = (b2, b4)   # Conduction bands only (for chi0)
+		brange_l = nvplussigrange     # (b0, b3) for ISDF left
+		brange_r = ncplussigrange     # (b1, b4) for ISDF right
+		full_band_range = (b0, b4)    # All bands (for COH G_RI)
+		
+		# ============================================================================
+		# CHUNKED ISDF PATH (memory-efficient, spin-traced pair density)
+		# ============================================================================
+		if use_chunked_isdf:
+			print0("  Using CHUNKED ISDF fitting (memory-efficient)")
 			
-			valence_range = (b0, b2)      # Valence bands only (for chi0)
-			conduction_range = (b2, b4)   # Conduction bands only (for chi0)
-			# ISDF ranges - MUST match original for zeta fitting!
-			brange_l = nvplussigrange     # (b0, b3) for ISDF left
-			brange_r = ncplussigrange     # (b1, b4) for ISDF right
-			full_band_range = (b0, b4)    # All bands (for COH G_RI)
+			# Fit zeta and compute V_q using chunked approach
+			with mesh_xy:
+				chunked_result = fit_zeta_and_compute_V_q_chunked(
+					wfn, sym, meta, centroid_indices, mesh_xy,
+					output_dir=tmp_dir,
+					bispinor=bispinor,
+					memory_budget_gb=memory_per_device_gb,
+					sys_dim=sys_dim,
+				)
 			
-			# Load LEFT wavefunctions for ISDF fitting and sigma projection (psi_l)
-			# Range: (b0, b3) = all valence + sigma-window conduction
-			global_psiG_l, nb_l = read_Gvecs_to_devices(wfn, sym, brange_l, meta, bispinor, mesh_xy)
-			psi_l_rtot_Y, psi_l_rmu_Y, psi_l_rmuT_X = get_sharded_wfns(
-				global_psiG_l, sym, meta, centroid_indices, nb_l, False, mesh_xy
-			)
-			psi_l_rtot_Y.block_until_ready(); psi_l_rmu_Y.block_until_ready(); psi_l_rmuT_X.block_until_ready()
-			del global_psiG_l
-			gc.collect()
+			# Extract results
+			V_qmunu = chunked_result['V_qmunu']
+			v_q0_noG0_munu = chunked_result['v_q0_noG0_munu']
+			G0_mu_nu = chunked_result['G0_mu_nu']
+			psi_l_rmu_Y = chunked_result['psi_l_rmu_Y']
+			psi_l_rmuT_X = chunked_result['psi_l_rmuT_X']
+			psi_r_rmu_Y = chunked_result['psi_r_rmu_Y']
+			psi_r_rmuT_X = chunked_result['psi_r_rmuT_X']
 			
-			# Load RIGHT wavefunctions for ISDF fitting (psi_r)
-			# Range: (b1, b4) = sigma-window valence + all conduction
-			global_psiG_r, nb_r = read_Gvecs_to_devices(wfn, sym, brange_r, meta, bispinor, mesh_xy)
-			psi_r_rtot_Y, psi_r_rmu_Y, psi_r_rmuT_X = get_sharded_wfns(
-				global_psiG_r, sym, meta, centroid_indices, nb_r, False, mesh_xy
-			)
-			psi_r_rtot_Y.block_until_ready(); psi_r_rmu_Y.block_until_ready(); psi_r_rmuT_X.block_until_ready()
-			del global_psiG_r
-			gc.collect()
+			# Still need to load psi_v, psi_c, psi_coh for chi0 and COH
+			with timing.section("cohsex_jax.wavefunction_setup"):
+				# Load VALENCE wavefunctions for chi0 (psi_v)
+				global_psiG_v, nb_v = read_Gvecs_to_devices(wfn, sym, valence_range, meta, bispinor, mesh_xy)
+				psi_v_rtot_Y, psi_v_rmu_Y, psi_v_rmuT_X = get_sharded_wfns(
+					global_psiG_v, sym, meta, centroid_indices, nb_v, False, mesh_xy
+				)
+				psi_v_rtot_Y.block_until_ready(); psi_v_rmu_Y.block_until_ready(); psi_v_rmuT_X.block_until_ready()
+				del global_psiG_v
+				gc.collect()
+				
+				# Load CONDUCTION wavefunctions for chi0 (psi_c)
+				global_psiG_c, nb_c = read_Gvecs_to_devices(wfn, sym, conduction_range, meta, bispinor, mesh_xy)
+				psi_c_rtot_Y, psi_c_rmu_Y, psi_c_rmuT_X = get_sharded_wfns(
+					global_psiG_c, sym, meta, centroid_indices, nb_c, False, mesh_xy
+				)
+				psi_c_rtot_Y.block_until_ready(); psi_c_rmu_Y.block_until_ready(); psi_c_rmuT_X.block_until_ready()
+				del global_psiG_c
+				gc.collect()
+				
+				# Load ALL bands for COH resolution of identity (psi_coh)
+				global_psiG_coh, nb_coh = read_Gvecs_to_devices(wfn, sym, full_band_range, meta, bispinor, mesh_xy)
+				psi_coh_rtot_Y, psi_coh_rmu_Y, psi_coh_rmuT_X = get_sharded_wfns(
+					global_psiG_coh, sym, meta, centroid_indices, nb_coh, False, mesh_xy
+				)
+				psi_coh_rtot_Y.block_until_ready(); psi_coh_rmu_Y.block_until_ready(); psi_coh_rmuT_X.block_until_ready()
+				del global_psiG_coh
+				gc.collect()
+				print0("  Wavefunction loading complete")
 			
-			# Load VALENCE wavefunctions for chi0 (psi_v)
-			global_psiG_v, nb_v = read_Gvecs_to_devices(wfn, sym, valence_range, meta, bispinor, mesh_xy)
-			psi_v_rtot_Y, psi_v_rmu_Y, psi_v_rmuT_X = get_sharded_wfns(
-				global_psiG_v, sym, meta, centroid_indices, nb_v, False, mesh_xy
-			)
-			psi_v_rtot_Y.block_until_ready(); psi_v_rmu_Y.block_until_ready(); psi_v_rmuT_X.block_until_ready()
-			del global_psiG_v
-			gc.collect()
-			
-			# Load CONDUCTION wavefunctions for chi0 (psi_c)
-			global_psiG_c, nb_c = read_Gvecs_to_devices(wfn, sym, conduction_range, meta, bispinor, mesh_xy)
-			psi_c_rtot_Y, psi_c_rmu_Y, psi_c_rmuT_X = get_sharded_wfns(
-				global_psiG_c, sym, meta, centroid_indices, nb_c, False, mesh_xy
-			)
-			psi_c_rtot_Y.block_until_ready(); psi_c_rmu_Y.block_until_ready(); psi_c_rmuT_X.block_until_ready()
-			del global_psiG_c
-			gc.collect()
-			
-			# Load ALL bands for COH resolution of identity (psi_coh)
-			global_psiG_coh, nb_coh = read_Gvecs_to_devices(wfn, sym, full_band_range, meta, bispinor, mesh_xy)
-			psi_coh_rtot_Y, psi_coh_rmu_Y, psi_coh_rmuT_X = get_sharded_wfns(
-				global_psiG_coh, sym, meta, centroid_indices, nb_coh, False, mesh_xy
-			)
-			psi_coh_rtot_Y.block_until_ready(); psi_coh_rmu_Y.block_until_ready(); psi_coh_rmuT_X.block_until_ready()
-			del global_psiG_coh
-			gc.collect()
-			print0("  Wavefunction loading complete")
-
-		with timing.section("cohsex_jax.zeta_V_build") as timer_zeta:
-			####################################
-			# 2.) Explicit q-loop: build zeta_q,mu(r), S_q, and V_q,mu,nu
-			####################################
-			# Energies for chi0: valence and conduction separately (pass nspinor for bispinor)
+			# Get energies (still needed for downstream)
 			enk_v, weights_v = get_enk_bandrange(wfn, sym, valence_range, (b1, b2), nspinor=meta.nspinor)
 			enk_c, weights_c = get_enk_bandrange(wfn, sym, conduction_range, (b2, b4), nspinor=meta.nspinor)
-			# Energies for ISDF left/right arrays
 			enk_l, weights_l = get_enk_bandrange(wfn, sym, brange_l, (b1, b3), nspinor=meta.nspinor)
 			enk_r, weights_r = get_enk_bandrange(wfn, sym, brange_r, (b1, b3), nspinor=meta.nspinor)
-
-			# Allocate sharded outputs
-			V_qmunu = jnp.zeros((1, meta.npol, meta.npol, meta.nkx, meta.nky, meta.nkz, meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
-			if sh is not None:
-				V_qmunu = jax.lax.with_sharding_constraint(V_qmunu, sh.x6y7_8)
-			if do_S:
-				S_qmunu = jnp.zeros((meta.nkx, meta.nky, meta.nkz, meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
-				if sh is not None:
-					S_qmunu = jax.lax.with_sharding_constraint(S_qmunu, sh.x3y4_5)
-			else:
-				S_qmunu = None
-			v_q0_noG0_munu = jnp.zeros((meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
-			if sh is not None:
-				v_q0_noG0_munu = jax.lax.with_sharding_constraint(v_q0_noG0_munu, sh.xy_shard)
-			G0_mu_nu = None
-			# Reusable buffers for the expensive CCT/ZCT accumulation.
-			CCT_buf = jnp.zeros((meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
-			ZCT_buf = jnp.zeros((meta.n_rmu, psi_l_rtot_Y.shape[-1]), dtype=jnp.complex128)
-			if sh is not None:
-				CCT_buf = jax.lax.with_sharding_constraint(CCT_buf, sh.replicated_2)
-				ZCT_buf = jax.lax.with_sharding_constraint(ZCT_buf, sh.xy_shard)
-
-			# No local kernel definitions; use module-scope jitted helpers
-
-			#################################################################################
-			# Main q-point loop
-			# zeta_q(r) is ephemeral inside the loop
-			################################################################################
-			bvec_cart = np.asarray(wfn.blat * wfn.bvec, dtype=np.float64)
-			v_munu_kernel = make_v_munu_kernel(
-				fft_nx,
-				fft_ny,
-				fft_nz,
-				nkx,
-				nky,
-				nkz,
-				bvec_cart,
-				float(wfn.cell_volume),
-				sys_dim,
+			
+			# Apply sharding (matching original code)
+			with mesh_xy:
+				# Valence wavefunctions for chi0 (psi_v)
+				psiv_Y = jax.device_put(psi_v_rmu_Y, sh.y3_4)
+				psivT_X = jax.lax.with_sharding_constraint(psiv_Y.transpose(0, 2, 3, 1), sh.x2_4)
+				# Conduction wavefunctions for chi0 (psi_c)  
+				psic_X = jax.device_put(psi_c_rmu_Y, sh.x3_4)
+				psicT_Y = jax.lax.with_sharding_constraint(psic_X.transpose(0, 2, 3, 1), sh.y2_4)
+				# ISDF left wavefunctions (psi_l) - Y-sharded for SX/Hartree
+				psil_Y = jax.device_put(psi_l_rmu_Y, sh.y3_4)
+				psilT_X = jax.lax.with_sharding_constraint(psil_Y.transpose(0, 2, 3, 1), sh.x2_4)
+				# ISDF left wavefunctions - X-sharded for projection
+				psil_X = jax.device_put(psi_l_rmu_Y, sh.x3_4)
+				psilT_Y = jax.lax.with_sharding_constraint(psil_X.transpose(0, 2, 3, 1), sh.y2_4)
+				# ISDF right wavefunctions (psi_r)
+				psir_X = jax.device_put(psi_r_rmu_Y, sh.x3_4)
+				psirT_Y = jax.lax.with_sharding_constraint(psir_X.transpose(0, 2, 3, 1), sh.y2_4)
+				# COH resolution of identity (psi_coh)
+				psicoh_Y = jax.device_put(psi_coh_rmu_Y, sh.y3_4)
+				psicohT_X = jax.lax.with_sharding_constraint(psicoh_Y.transpose(0, 2, 3, 1), sh.x2_4)
+			
+			# S_qmunu not computed by chunked approach (do_S=False)
+			S_qmunu = None
+			
+			# ============================================================================
+			# WAVEFUNCTION ARRAYS (matching else block structure):
+			# ============================================================================
+			psi_v = psiv_Y       # Valence for chi0
+			psi_vT = psivT_X     # Valence transposed for chi0
+			psi_c = psic_X       # Conduction for chi0
+			psi_cT = psicT_Y     # Conduction transposed for chi0
+			psi_l = psil_Y       # ISDF left (Y-sharded for SX/Hartree)
+			psi_lT = psilT_X     # ISDF left transposed (X-sharded)
+			psi_l_proj = psil_X  # ISDF left (X-sharded for projection)
+			psi_lT_proj = psilT_Y  # ISDF left transposed (Y-sharded for projection)
+			psi_l_full = psi_l   # Alias for h5 saving
+			psi_lT_full = psi_lT # Alias for h5 saving
+			psi_r = psir_X       # ISDF right
+			psi_rT = psirT_Y     # ISDF right transposed
+			psi_coh = psicoh_Y   # COH G_RI (all bands)
+			psi_cohT = psicohT_X # COH G_RI transposed
+			
+			nb_sigma = int(b3 - b0)  # = nelec + ncond (sigma window size)
+			
+			# V_mu_nu is V_qmunu without q indices (for screened interaction calculation)
+			# Extract and transpose to match expected shape: (n_rmu, n_rmu, nkx, nky, nkz)
+			V_mu_nu_raw = jnp.asarray(V_qmunu)[0, 0, 0]  # (nkx, nky, nkz, n_rmu, n_rmu)
+			V_mu_nu = V_mu_nu_raw.transpose(3, 4, 0, 1, 2)  # → (n_rmu, n_rmu, nkx, nky, nkz)
+			with mesh_xy:
+				V_mu_nu = jax.lax.with_sharding_constraint(V_mu_nu, sh.V_shard)
+			
+			# Persist restart artifacts
+			write_labeled_arrays_to_h5(
+				taggedarray_filename,
+				V_qmunu,
+				psi_l_full,
+				psir_X,
+				enk_l,
+				enk_r,
+				S_qmunu,
+				V0_noG0_munu=v_q0_noG0_munu,
+				G0_mu_nu=G0_mu_nu,
 			)
-			q_cache = build_q_coulomb_cache(wfn, sym, meta, do_Dmunu=bispinor, sys_dim=sys_dim, mesh_xy=mesh_xy)
-
-			for q_idx in range(q_cache.num_q):
-				k_l_indices = q_cache.k_l_indices[q_idx]
-				k_r_indices = q_cache.k_r_indices
-				qvec_nonneg = q_cache.q_nonneg[q_idx]
-				iq_cpu = np.asarray(q_cache.iq_indices[q_idx]).item()
-				qvec = jnp.asarray(q_cache.q_wrapped[q_idx], dtype=jnp.float64)
-
-				CCT, ZCT = compute_CCT_ZCT_for_q(
-					CCT_buf,
-					ZCT_buf,
-					psi_l_rmu_Y,
-					psi_r_rmu_Y,
-					psi_l_rtot_Y,
-					psi_r_rtot_Y,
-					psi_l_rmuT_X,
-					psi_r_rmuT_X,
-					k_l_indices,
-					k_r_indices,
+			save_restart_per_proc(os.path.join(tmp_dir, "taggedarrays"), V_qmunu, S_qmunu, psi_l_full, psir_X, enk_l, enk_r, meta, mesh_xy, V0_noG0_munu=v_q0_noG0_munu)
+			V_qmunu.block_until_ready()
+			print0("  Chunked ISDF path complete")
+		
+		# ============================================================================
+		# ORIGINAL ISDF PATH (per-q-point fitting, keeps rtot in memory)
+		# ============================================================================
+		else:
+			with timing.section("cohsex_jax.wavefunction_setup") as timer_setup:
+				# ============================================================================
+				# WAVEFUNCTION LOADING STRATEGY:
+				# ============================================================================
+				# For ISDF fitting (zeta construction):
+				#   - psi_l: nvplussigrange (b0, b3) - all valence + sigma-window conduction
+				#   - psi_r: ncplussigrange (b1, b4) - sigma-window valence + all conduction
+				# For chi0/W calculation (screened interaction):
+				#   - psi_v: VALENCE bands only (b0, b2) - used as left/right in chi0
+				#   - psi_c: CONDUCTION bands only (b2, b4) - used as left/right in chi0
+				# For COH G_RI (resolution of identity):
+				#   - psi_coh: ALL bands (b0, b4) - needed for COH sum over all bands
+				# For final sigma projection:
+				#   - uses psi_l (b0, b3) which covers sigma window
+				# ============================================================================
+				
+				# Load LEFT wavefunctions for ISDF fitting and sigma projection (psi_l)
+				# Range: (b0, b3) = all valence + sigma-window conduction
+				global_psiG_l, nb_l = read_Gvecs_to_devices(wfn, sym, brange_l, meta, bispinor, mesh_xy)
+				psi_l_rtot_Y, psi_l_rmu_Y, psi_l_rmuT_X = get_sharded_wfns(
+					global_psiG_l, sym, meta, centroid_indices, nb_l, False, mesh_xy
 				)
-				CCT_buf, ZCT_buf = CCT, ZCT
+				psi_l_rtot_Y.block_until_ready(); psi_l_rmu_Y.block_until_ready(); psi_l_rmuT_X.block_until_ready()
+				del global_psiG_l
+				gc.collect()
+				
+				# Load RIGHT wavefunctions for ISDF fitting (psi_r)
+				# Range: (b1, b4) = sigma-window valence + all conduction
+				global_psiG_r, nb_r = read_Gvecs_to_devices(wfn, sym, brange_r, meta, bispinor, mesh_xy)
+				psi_r_rtot_Y, psi_r_rmu_Y, psi_r_rmuT_X = get_sharded_wfns(
+					global_psiG_r, sym, meta, centroid_indices, nb_r, False, mesh_xy
+				)
+				psi_r_rtot_Y.block_until_ready(); psi_r_rmu_Y.block_until_ready(); psi_r_rmuT_X.block_until_ready()
+				del global_psiG_r
+				gc.collect()
+				
+				# Load VALENCE wavefunctions for chi0 (psi_v)
+				global_psiG_v, nb_v = read_Gvecs_to_devices(wfn, sym, valence_range, meta, bispinor, mesh_xy)
+				psi_v_rtot_Y, psi_v_rmu_Y, psi_v_rmuT_X = get_sharded_wfns(
+					global_psiG_v, sym, meta, centroid_indices, nb_v, False, mesh_xy
+				)
+				psi_v_rtot_Y.block_until_ready(); psi_v_rmu_Y.block_until_ready(); psi_v_rmuT_X.block_until_ready()
+				del global_psiG_v
+				gc.collect()
+				
+				# Load CONDUCTION wavefunctions for chi0 (psi_c)
+				global_psiG_c, nb_c = read_Gvecs_to_devices(wfn, sym, conduction_range, meta, bispinor, mesh_xy)
+				psi_c_rtot_Y, psi_c_rmu_Y, psi_c_rmuT_X = get_sharded_wfns(
+					global_psiG_c, sym, meta, centroid_indices, nb_c, False, mesh_xy
+				)
+				psi_c_rtot_Y.block_until_ready(); psi_c_rmu_Y.block_until_ready(); psi_c_rmuT_X.block_until_ready()
+				del global_psiG_c
+				gc.collect()
+				
+				# Load ALL bands for COH resolution of identity (psi_coh)
+				global_psiG_coh, nb_coh = read_Gvecs_to_devices(wfn, sym, full_band_range, meta, bispinor, mesh_xy)
+				psi_coh_rtot_Y, psi_coh_rmu_Y, psi_coh_rmuT_X = get_sharded_wfns(
+					global_psiG_coh, sym, meta, centroid_indices, nb_coh, False, mesh_xy
+				)
+				psi_coh_rtot_Y.block_until_ready(); psi_coh_rmu_Y.block_until_ready(); psi_coh_rmuT_X.block_until_ready()
+				del global_psiG_coh
+				gc.collect()
+				print0("  Wavefunction loading complete")
 
-				zeta_q = solve_zeta_cholesky(CCT, ZCT)
-				zeta_q = set_zeta_sharding(zeta_q, mesh_xy)
+			with timing.section("cohsex_jax.zeta_V_build") as timer_zeta:
+				####################################
+				# 2.) Explicit q-loop: build zeta_q,mu(r), S_q, and V_q,mu,nu
+				####################################
+				# Energies for chi0: valence and conduction separately (pass nspinor for bispinor)
+				enk_v, weights_v = get_enk_bandrange(wfn, sym, valence_range, (b1, b2), nspinor=meta.nspinor)
+				enk_c, weights_c = get_enk_bandrange(wfn, sym, conduction_range, (b2, b4), nspinor=meta.nspinor)
+				# Energies for ISDF left/right arrays
+				enk_l, weights_l = get_enk_bandrange(wfn, sym, brange_l, (b1, b3), nspinor=meta.nspinor)
+				enk_r, weights_r = get_enk_bandrange(wfn, sym, brange_r, (b1, b3), nspinor=meta.nspinor)
 
-				qx, qy, qz = as_index_tuple(qvec_nonneg)
+				# Allocate sharded outputs
+				V_qmunu = jnp.zeros((1, meta.npol, meta.npol, meta.nkx, meta.nky, meta.nkz, meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
+				if sh is not None:
+					V_qmunu = jax.lax.with_sharding_constraint(V_qmunu, sh.x6y7_8)
 				if do_S:
-					S_q_local = compute_Sq_from_zeta(zeta_q)
+					S_qmunu = jnp.zeros((meta.nkx, meta.nky, meta.nkz, meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
 					if sh is not None:
-						S_q_local = jax.lax.with_sharding_constraint(S_q_local, sh.x0y1_2)
-					S_qmunu = S_qmunu.at[qx, qy, qz, :, :].set(S_q_local)
+						S_qmunu = jax.lax.with_sharding_constraint(S_qmunu, sh.x3y4_5)
+				else:
+					S_qmunu = None
+				v_q0_noG0_munu = jnp.zeros((meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
+				if sh is not None:
+					v_q0_noG0_munu = jax.lax.with_sharding_constraint(v_q0_noG0_munu, sh.xy_shard)
+				G0_mu_nu = None
+				# Reusable buffers for the expensive CCT/ZCT accumulation.
+				CCT_buf = jnp.zeros((meta.n_rmu, meta.n_rmu), dtype=jnp.complex128)
+				ZCT_buf = jnp.zeros((meta.n_rmu, psi_l_rtot_Y.shape[-1]), dtype=jnp.complex128)
+				if sh is not None:
+					CCT_buf = jax.lax.with_sharding_constraint(CCT_buf, sh.replicated_2)
+					ZCT_buf = jax.lax.with_sharding_constraint(ZCT_buf, sh.xy_shard)
 
-				v_munu, g0_mu = v_munu_kernel(zeta_q, qvec)
-				V_qmunu = V_qmunu.at[0, 0, 0, qx, qy, qz, :, :].set(v_munu)
+				# No local kernel definitions; use module-scope jitted helpers
 
-				if do_G0 and np.all(np.asarray(qvec_nonneg) == 0):
-					G0_mu_nu = g0_mu
+				#################################################################################
+				# Main q-point loop
+				# zeta_q(r) is ephemeral inside the loop
+				################################################################################
+				bvec_cart = np.asarray(wfn.blat * wfn.bvec, dtype=np.float64)
+				v_munu_kernel = make_v_munu_kernel(
+					fft_nx,
+					fft_ny,
+					fft_nz,
+					nkx,
+					nky,
+					nkz,
+					bvec_cart,
+					float(wfn.cell_volume),
+					sys_dim,
+				)
+				q_cache = build_q_coulomb_cache(wfn, sym, meta, do_Dmunu=bispinor, sys_dim=sys_dim, mesh_xy=mesh_xy)
+
+				for q_idx in range(q_cache.num_q):
+					k_l_indices = q_cache.k_l_indices[q_idx]
+					k_r_indices = q_cache.k_r_indices
+					qvec_nonneg = q_cache.q_nonneg[q_idx]
+					iq_cpu = np.asarray(q_cache.iq_indices[q_idx]).item()
+					qvec = jnp.asarray(q_cache.q_wrapped[q_idx], dtype=jnp.float64)
+
+					CCT, ZCT = compute_CCT_ZCT_for_q(
+						CCT_buf,
+						ZCT_buf,
+						psi_l_rmu_Y,
+						psi_r_rmu_Y,
+						psi_l_rtot_Y,
+						psi_r_rtot_Y,
+						psi_l_rmuT_X,
+						psi_r_rmuT_X,
+						k_l_indices,
+						k_r_indices,
+					)
+					CCT_buf, ZCT_buf = CCT, ZCT
+
+					zeta_q = solve_zeta_cholesky(CCT, ZCT)
+					zeta_q = set_zeta_sharding(zeta_q, mesh_xy)
+
+					qx, qy, qz = as_index_tuple(qvec_nonneg)
+					if do_S:
+						S_q_local = compute_Sq_from_zeta(zeta_q)
+						if sh is not None:
+							S_q_local = jax.lax.with_sharding_constraint(S_q_local, sh.x0y1_2)
+						S_qmunu = S_qmunu.at[qx, qy, qz, :, :].set(S_q_local)
+
+					v_munu, g0_mu = v_munu_kernel(zeta_q, qvec)
+					V_qmunu = V_qmunu.at[0, 0, 0, qx, qy, qz, :, :].set(v_munu)
+
+					if do_G0 and np.all(np.asarray(qvec_nonneg) == 0):
+						G0_mu_nu = g0_mu
 
 			print0(f"  ISDF fitting complete ({q_cache.num_q} q-points)")
 
@@ -1377,9 +1702,12 @@ def main(argv=None):
 				# Conduction wavefunctions for chi0 (psi_c)  
 				psic_X = jax.device_put(psi_c_rmu_Y, sh.x3_4)
 				psicT_Y = jax.lax.with_sharding_constraint(psic_X.transpose(0, 2, 3, 1), sh.y2_4)
-				# ISDF left wavefunctions (psi_l): (b0, b3) for ISDF fitting and projection
+				# ISDF left wavefunctions (psi_l) - Y-sharded for SX/Hartree
 				psil_Y = jax.device_put(psi_l_rmu_Y, sh.y3_4)
 				psilT_X = jax.lax.with_sharding_constraint(psil_Y.transpose(0, 2, 3, 1), sh.x2_4)
+				# ISDF left wavefunctions - X-sharded for projection
+				psil_X = jax.device_put(psi_l_rmu_Y, sh.x3_4)
+				psilT_Y = jax.lax.with_sharding_constraint(psil_X.transpose(0, 2, 3, 1), sh.y2_4)
 				# ISDF right wavefunctions (psi_r): (b1, b4) for ISDF fitting
 				psir_X = jax.device_put(psi_r_rmu_Y, sh.x3_4)
 				psirT_Y = jax.lax.with_sharding_constraint(psir_X.transpose(0, 2, 3, 1), sh.y2_4)
@@ -1392,7 +1720,8 @@ def main(argv=None):
 			# ============================================================================
 			# psi_v, psi_vT: VALENCE bands (b0, b2) for chi0/W calculation
 			# psi_c, psi_cT: CONDUCTION bands (b2, b4) for chi0/W calculation
-			# psi_l, psi_lT: (b0, b3) for ISDF fitting left + sigma projection
+			# psi_l, psi_lT: (b0, b3) for ISDF fitting left (Y-sharded for SX/Hartree)
+			# psi_l_proj, psi_lT_proj: same as psi_l but X-sharded for projection
 			# psi_r, psi_rT: (b1, b4) for ISDF fitting right
 			# psi_coh, psi_cohT: ALL bands (b0, b4) for COH G_RI resolution of identity
 			# ============================================================================
@@ -1400,8 +1729,10 @@ def main(argv=None):
 			psi_vT = psivT_X     # Valence transposed for chi0
 			psi_c = psic_X       # Conduction for chi0
 			psi_cT = psicT_Y     # Conduction transposed for chi0
-			psi_l = psil_Y       # ISDF left + sigma projection
-			psi_lT = psilT_X     # ISDF left transposed
+			psi_l = psil_Y       # ISDF left (Y-sharded for SX/Hartree)
+			psi_lT = psilT_X     # ISDF left transposed (X-sharded)
+			psi_l_proj = psil_X  # ISDF left (X-sharded for projection)
+			psi_lT_proj = psilT_Y  # ISDF left transposed (Y-sharded for projection)
 			psi_l_full = psi_l   # Alias for h5 saving
 			psi_lT_full = psi_lT # Alias for h5 saving
 			psi_r = psir_X       # ISDF right
@@ -1438,6 +1769,12 @@ def main(argv=None):
 			# COH needs all bands - in restart mode, psi_l has all bands (old format)
 			psi_coh = psi_l
 			psi_cohT = psi_lT
+			# Create X-sharded versions for projection
+			with mesh_xy:
+				psi_l_proj = jax.lax.with_sharding_constraint(psi_l, sh.x3_4)
+				psi_lT_proj = jax.lax.with_sharding_constraint(
+					psi_l_proj.transpose(0, 2, 3, 1), sh.y2_4
+				)
 			
 		# If do_screened, load valence/conduction wavefunctions from WFN for chi0
 		if do_screened:
@@ -1484,6 +1821,12 @@ def main(argv=None):
 			# COH needs all bands - in restart mode, psi_l has all bands (old format)
 			psi_coh = psi_l
 			psi_cohT = psi_lT
+			# Create X-sharded versions for projection
+			with mesh_xy:
+				psi_l_proj = jax.lax.with_sharding_constraint(psi_l, sh.x3_4)
+				psi_lT_proj = jax.lax.with_sharding_constraint(
+					psi_l_proj.transpose(0, 2, 3, 1), sh.y2_4
+				)
 
 	# Optionally compute chi0 via JAX for screened interaction if requested
 	if do_screened:
@@ -1560,15 +1903,11 @@ def main(argv=None):
 		# HEAD INJECTION FOR V: V_qmunu at q=0 gets the bare Coulomb head
 		# V_Γ ← V_Γ + (vc0_mean / Ω) × ζ*(0) ⊗ ζ(0)
 		# This is ALWAYS applied regardless of do_screened
-		# DEBUG TODO REMOVE JM
-		vc0_mean = 1649.14397
 		V_qmunu = V_qmunu.at[0, 0, 0, 0, 0, 0, :, :].add((vc0_mean * vol_scale) * outer_u)
 		
 		# HEAD INJECTION FOR W (screened): W at q=0 gets the screened head wcoul0
 		# Only applied when do_screened=True since W_q only exists then
 		if do_screened:
-			#DEBUG TODO REMOVE JM
-			wcoul0 = 394.450575
 			W_q = W_q.at[0, 0, 0, 0, :, 0, :].add((wcoul0 * vol_scale) * outer_u)
 
 	# ============================================================================
@@ -1578,13 +1917,33 @@ def main(argv=None):
 	# W_q:     screened Coulomb, shape [nkx, nky, nkz, nfreq, nrmu, npol, nrmu]
 	# We extract the static (freq=0) component and reshape to (nrmu1, nrmu2, nkx, nky, nkz)
 	# ============================================================================
-	V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0]  # (nkx,nky,nkz,nrmu1,nrmu2) from bare V
-	V_mu_nu = V_mu_nu.transpose(3, 4, 0, 1, 2)  # → (nrmu1,nrmu2,nkx,nky,nkz)
+	# Skip V_mu_nu extraction if already set by chunked path (check shape)
+	need_extract_V = False
+	try:
+		_ = V_mu_nu.shape  # Check if V_mu_nu exists
+		if V_mu_nu.shape != (meta.n_rmu, meta.n_rmu, meta.nkx, meta.nky, meta.nkz):
+			need_extract_V = True
+	except NameError:
+		need_extract_V = True
+	
+	if need_extract_V:
+		V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0]  # (nkx,nky,nkz,nrmu1,nrmu2) from bare V
+		V_mu_nu = V_mu_nu.transpose(3, 4, 0, 1, 2)  # → (nrmu1,nrmu2,nkx,nky,nkz)
+	
+	# Apply sharding to V_mu_nu and W_mu_nu
+	if sh is None and mesh_xy is not None:
+		sh = make_shardings(mesh_xy)
+	
+	with mesh_xy:
+		V_mu_nu = jax.lax.with_sharding_constraint(V_mu_nu, sh.V_shard)
+	
 	if do_screened:  # do_screened=True: use W for exchange
 		W_mu_nu = W_q[:,:,:,0,:,0,:]  # (nkx,nky,nkz,nrmu1,nrmu2) from screened W
 		W_mu_nu = W_mu_nu.transpose(3, 4, 0, 1, 2)  # → (nrmu1,nrmu2,nkx,nky,nkz)
+		with mesh_xy:
+			W_mu_nu = jax.lax.with_sharding_constraint(W_mu_nu, sh.V_shard)
 	else:
-		W_mu_nu = V_mu_nu  # For bare exchange, W = V
+		W_mu_nu = V_mu_nu  # For bare exchange, W = V (already sharded)
 
 	# All nband bands are passed to the pipeline for the COH resolution of identity.
 	# The sigma window slicing (to nb_sigma bands) is done inside the pipeline
@@ -1638,8 +1997,8 @@ def main(argv=None):
 					psi_l,     
 					psi_cohT,  # psi_coh for COH (all bands, b0..b4)
 					psi_coh,
-					psi_l,     # psi_proj for projection (sigma window)
-					psi_lT,
+					psi_l_proj,   # psi_proj for projection (X-sharded)
+					psi_lT_proj,  # psi_proj transposed (Y-sharded)
 					W_mu_nu,   # (rmu1, rmu2, nkx, nky, nkz) screened Coulomb
 					V_mu_nu,   # (rmu1, rmu2, nkx, nky, nkz) bare Coulomb
 					v_q0_noG0_munu, # (rmu1, rmu2) sharded over (x,y)
@@ -1704,7 +2063,7 @@ def main(argv=None):
 				sigma_sx_new, sigma_coh_new, hartree_new = pipeline_jit(
 					psi_lT, psi_l,      # psi_l for SX
 					psi_cohT, psi_coh,  # psi_coh for COH (unchanged, uses G_RI)
-					psi_l, psi_lT,      # psi_proj for projection
+					psi_l_proj, psi_lT_proj,  # psi_proj for projection (X/Y-sharded)
 					W_mu_nu, V_mu_nu,
 					v_q0_noG0_munu,
 					Gij_new,            # Updated Green's function
@@ -1773,7 +2132,7 @@ def main(argv=None):
 		
 		with mesh_xy:
 			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = pipeline_jit(
-				psi_lT, psi_l, psi_cohT, psi_coh, psi_l, psi_lT,
+				psi_lT, psi_l, psi_cohT, psi_coh, psi_l_proj, psi_lT_proj,
 				W_mu_nu, V_mu_nu, v_q0_noG0_munu, Gij_final,
 				meta.nkx, meta.nky, meta.nkz, meta.nk_tot, meta.nspinor,
 				float(wfn.cell_volume/np.prod(wfn.fft_grid)),

@@ -126,9 +126,10 @@ def compute_optimal_chunks(
     # Check if we have room for caching after centroids
     m_available_for_cache = m_budget - m_centroids
     
-    # Only enable caching if it uses less than 30% of available memory
-    # (need to leave room for P_k, Z_q, L_q, etc.)
-    cache_threshold = 0.30 * m_available_for_cache
+    # Enable caching if it uses less than 40% of available memory
+    # (need to leave room for P_k, Z_q, L_q, etc. which use the other 60%)
+    # The cache provides ~10x speedup for z-chunk loop, so it's worth the memory.
+    cache_threshold = 0.40 * m_available_for_cache
     use_gspace_cache = m_cached_gspace_full <= cache_threshold and m_cached_gspace_full > 0
     
     if use_gspace_cache:
@@ -199,14 +200,24 @@ def compute_optimal_chunks(
     z_chunk_r = nx * ny * z_chunk_slices
     
     # ========================================================================
-    # STAGE 4: PAIR DENSITY P_k
+    # STAGE 4: PAIR DENSITY P_k (LEFT and RIGHT, spin-traced)
     # ========================================================================
-    # P_k_mumu: (n_k, n_s, n_s, n_rmu/p_x, n_rmu/p_y)
-    # P_k_mu_zchunk: (n_k, n_s, n_s, n_rmu/p_x, z_chunk_r/p_y)
-    # Both exist simultaneously during ZCT computation
+    # Spin-traced pair density: P_k(μ,ν) = Σ_{n,s} ψ*_{n,k,s}(μ) ψ_{n,k,s}(ν)
+    # No explicit spin dimensions in output (smaller than keeping all 4 spin combos).
+    #
+    # For CCT: P_l_mumu and P_r_mumu both exist simultaneously
+    # For ZCT: P_l_zchunk and P_r_zchunk both exist simultaneously
+    #
+    # P_l_mumu, P_r_mumu: (n_k, n_rmu/p_x, n_rmu/p_y)
+    # P_l_zchunk, P_r_zchunk: (n_k, n_rmu/p_x, z_chunk_r/p_y)
     
-    m_P_mumu = bytes_per_complex * n_k * n_s * n_s * (n_rmu / p_x) * (n_rmu / p_y)
-    m_P_zchunk = bytes_per_complex * n_k * n_s * n_s * (n_rmu / p_x) * (z_chunk_r / p_y)
+    # Per pair density (left OR right)
+    m_P_mumu_single = bytes_per_complex * n_k * (n_rmu / p_x) * (n_rmu / p_y)
+    m_P_zchunk_single = bytes_per_complex * n_k * (n_rmu / p_x) * (z_chunk_r / p_y)
+    
+    # Both left and right exist during CCT/ZCT computation
+    m_P_mumu = 2 * m_P_mumu_single  # P_l + P_r
+    m_P_zchunk = 2 * m_P_zchunk_single  # P_l + P_r
     
     # ========================================================================
     # STAGE 5: CCT/ZCT FFT PIPELINE
@@ -703,6 +714,7 @@ def read_cohsex_input(filename: str) -> dict:
 			"max_wfn_chunk_mb": getf("max_wfn_chunk_mb", fallback=0.0),  # max P_k chunk size in MB (0=use z_chunk_size)
 			"band_chunk_size": geti("band_chunk_size", fallback=16),  # bands per FFT during z-chunk loop
 			"memory_per_device_gb": getf("memory_per_device_gb", fallback=0.0),  # 0=auto-detect
+			"use_chunked_isdf": getb("use_chunked_isdf", fallback=True),  # chunked (memory-efficient) vs original ISDF
 		}
 	else:
 		# Fallback defaults if no section found
@@ -729,6 +741,7 @@ def read_cohsex_input(filename: str) -> dict:
 			"max_wfn_chunk_mb": 0.0,
 			"band_chunk_size": 16,
 			"memory_per_device_gb": 0.0,
+			"use_chunked_isdf": True,
 		}
 
 	# Parse optional QE-style K_POINTS block: take the number after it, read next that many lines

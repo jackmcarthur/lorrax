@@ -101,7 +101,7 @@ def get_cpu_memory_total() -> float | None:
     return None
 
 
-def get_device_memory_gb(n_devices: int = 1) -> float:
+def get_device_memory_gb(n_devices: int | None = None) -> float:
     """Get available memory per device for JAX computations.
     
     Detection strategy:
@@ -111,7 +111,8 @@ def get_device_memory_gb(n_devices: int = 1) -> float:
     3. Fallback: return conservative 4 GB default
     
     Args:
-        n_devices: Number of devices to divide memory among (for CPU)
+        n_devices: Number of devices to divide memory among (for CPU).
+                   If None, auto-detects via jax.device_count().
     
     Returns:
         Memory per device in GB (usable for computation)
@@ -120,8 +121,12 @@ def get_device_memory_gb(n_devices: int = 1) -> float:
     try:
         import jax
         backend = jax.default_backend()
+        if n_devices is None:
+            n_devices = jax.device_count()
     except ImportError:
         backend = 'cpu'
+        if n_devices is None:
+            n_devices = 1
     
     if backend in ('gpu', 'cuda'):
         # For GPU, prefer JAX's bytes_limit which reflects actual usable memory
