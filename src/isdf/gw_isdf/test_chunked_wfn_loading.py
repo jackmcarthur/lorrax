@@ -908,6 +908,8 @@ def main(argv=None):
             target_utilization=0.85,
             p_x=mesh_x_size,
             p_y=mesh_y_size,
+            n_b_left=n_b_left,
+            n_b_right=n_b_right,
             verbose=True,
         )
         
@@ -1106,4 +1108,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

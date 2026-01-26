@@ -11,6 +11,7 @@ import configparser
 import math
 
 
+
 def compute_optimal_chunks(
     n_k: int,
     n_b: int,
@@ -25,386 +26,231 @@ def compute_optimal_chunks(
     p_x: int | None = None,
     p_y: int | None = None,
     verbose: bool = True,
+    n_b_left: int | None = None,
+    n_b_right: int | None = None,
 ) -> dict:
-    """
-    Compute optimal chunk sizes based on memory budget.
-    
-    Uses the memory model from MEMORY_MODEL.md to derive chunk sizes
-    that will fit within the per-device memory budget. Accounts for all
-    arrays AND inter-device communication buffers.
-    
-    X-chunking advantage: With r = x*(ny*nz) + y*nz + z, an x-chunk with
-    x in [x_start, x_end) maps to CONTIGUOUS r-indices [x_start*ny*nz, x_end*ny*nz).
-    This enables single sequential HDF5 writes instead of strided writes.
-    
-    Memory Model Stages (see MEMORY_MODEL.md for details):
-    
-    1. PERSISTENT: Centroid wavefunctions (psi_rmu_Y, psi_rmuT_X)
-       - psi_rmu_Y: (n_k, n_b, n_s, n_rmu/p_y) per device
-       - psi_rmuT_X: (n_k, n_rmu/p_x, n_b, n_s) per device
-    
-    2. FFT WORKSPACE: Band-chunked G->r transform
-       - psi_G (input): (n_k, B_b/P, n_s, n_r) per device
-       - psi_r (output): same shape
-       - phase_spatial: (n_k, n_r) broadcast
-       - COMMUNICATION: all-gather for psi_rmu after centroid gather
-    
-    3. X-CHUNK EXTRACTION:
-       - psi_xchunk_Y: (n_k, n_b, n_s, B_x/p_y) per device
-       - COMMUNICATION: staged reshard P(None,('x','y'),None,None) → P(None,None,None,'y')
-         - Stage 1 buffer: (n_k, n_b/p_y, n_s, B_x)
-    
-    4. PAIR DENSITY (P_k):
-       - P_k_mumu: (n_k, n_s², n_rmu/p_x, n_rmu/p_y) per device
-       - P_k_mu_xchunk: (n_k, n_s², n_rmu/p_x, B_x/p_y) per device
-    
-    5. CCT/ZCT FFT PIPELINE:
-       - P_R, C_R intermediate: same shape as P_k
-       - C_q: (n_q, n_rmu/p_x, n_rmu/p_y) per device
-       - Z_q: (n_q, n_rmu/p_x, B_x/p_y) per device
-    
-    6. CHOLESKY + SOLVE:
-       - L_q tiles: (n_q, J/p_x, J/p_y, b, b) per device
-       - COMMUNICATION: panel broadcast during Cholesky: O(n_q × b × n_rmu/√P)
-       - L_rep (replicated): B_q × (n_rmu, n_rmu) per device
-       - Z_col, zeta: (n_q, n_rmu, B_x/P) per device
-    
-    Args:
-        n_k: Number of k-points
-        n_b: Number of bands
-        n_s: Number of spinor components (2 or 4)
-        n_rmu: Number of ISDF centroids
-        n_r: Total real-space grid points (nx*ny*nz)
-        n_q: Number of q-points
-        fft_grid: (nx, ny, nz) FFT grid dimensions
-        n_devices: Total number of devices
-        memory_budget_gb: Memory budget per device in GB
-        target_utilization: Fraction of budget to use (default 0.85)
-        p_x: X-dimension of mesh (default: sqrt(n_devices))
-        p_y: Y-dimension of mesh (default: sqrt(n_devices))
-        verbose: Print detailed memory breakdown
-    
-    Returns:
-        Dictionary with:
-        - band_chunk: Optimal band chunk size
-        - x_chunk: Optimal x-axis chunk size (in x-slices)
-        - x_chunk_r: Optimal x-axis chunk size (in r-points = x_chunk*ny*nz)
-        - q_chunk: Optimal q-point chunk size for solve
-        - memory_estimate: Dict of estimated memory usage by stage
-    """
-    bytes_per_complex = 16
-    m_budget = memory_budget_gb * 1e9 * target_utilization
-    p = n_devices
+    """Derive chunk sizes that saturate (but do not exceed) the memory budget."""
+    if memory_budget_gb <= 0:
+        raise ValueError("memory_per_device_gb must be > 0 for automatic chunk sizing.")
+    if n_devices <= 0:
+        raise ValueError("n_devices must be at least 1.")
+
+    bytes_per_complex = 16.0
     nx, ny, nz = fft_grid
-    
-    # Default to square mesh if not specified
+    n_rtot = nx * ny * nz
+    p = max(1, int(n_devices))
+    n_b_full = int(n_b)
+    nb_left = int(n_b_left) if n_b_left is not None else n_b_full
+    nb_right = int(n_b_right) if n_b_right is not None else n_b_full
+
+    # Default mesh: prefer the most square factorisation.
     if p_x is None or p_y is None:
         sqrt_p = int(math.sqrt(p))
-        while p % sqrt_p != 0:
+        while sqrt_p > 1 and p % sqrt_p != 0:
             sqrt_p -= 1
         p_x = sqrt_p
         p_y = p // p_x
-    
-    # ========================================================================
-    # STAGE 1: PERSISTENT CENTROID MEMORY
-    # ========================================================================
-    # psi_rmu_Y: P(None,None,None,'y') → (n_k, n_b, n_s, n_rmu) with n_rmu/p_y per device
-    # psi_rmuT_X: P(None,'x',None,None) → (n_k, n_rmu, n_b, n_s) with n_rmu/p_x per device
-    # Both arrays exist simultaneously
-    m_psi_rmu_Y = bytes_per_complex * n_k * n_b * n_s * (n_rmu / p_y)
-    m_psi_rmuT_X = bytes_per_complex * n_k * n_b * n_s * (n_rmu / p_x)
-    m_centroids = m_psi_rmu_Y + m_psi_rmuT_X
-    
-    # ========================================================================
-    # STAGE 1b: CACHED G-SPACE FOR X-CHUNK LOOP (optional)
-    # ========================================================================
-    # G-space is loaded ONCE and cached across all x-chunk iterations.
-    # Shape: (n_k, n_b, n_s, nx, ny, nz) sharded as P(None,('x','y'),None,None,None,None)
-    # Per-device: (n_k, n_b/p, n_s, nx, ny, nz)
-    # This avoids re-reading HDF5 for each x-chunk (huge speedup!)
-    #
-    # If the cache is too large (e.g., many k-points), we skip caching and
-    # fall back to per-chunk HDF5 loading (slower but uses less memory).
-    m_cached_gspace_full = bytes_per_complex * n_k * (n_b / p) * n_s * n_r
-    
-    # Check if we have room for caching after centroids
-    m_available_for_cache = m_budget - m_centroids
-    
-    # Enable caching if it uses less than 40% of available memory
-    # (need to leave room for P_k, Z_q, L_q, etc. which use the other 60%)
-    # The cache provides ~10x speedup for x-chunk loop, so it's worth the memory.
-    cache_threshold = 0.40 * m_available_for_cache
-    use_gspace_cache = m_cached_gspace_full <= cache_threshold and m_cached_gspace_full > 0
-    
-    if use_gspace_cache:
-        m_cached_gspace = m_cached_gspace_full
-    else:
-        m_cached_gspace = 0  # No cache - will reload from HDF5 each x-chunk
-    
-    m_available = m_budget - m_centroids - m_cached_gspace
-    
-    if m_available <= 0:
+    if p_x <= 0 or p_y <= 0:
+        raise ValueError(f"Invalid mesh dimensions p_x={p_x}, p_y={p_y}.")
+
+    def to_gb(value: float) -> float:
+        return value / 1e9
+
+    m_budget = memory_budget_gb * 1e9 * target_utilization
+    n_k_f = float(n_k)
+    n_s_f = float(n_s)
+    n_rmu_f = float(n_rmu)
+    n_q_f = float(n_q)
+    n_r_f = float(n_r)
+
+    # Stage 0: centroid storage
+    m_centroids_full = bytes_per_complex * n_k_f * n_s_f * n_rmu_f * n_b_full * (1 / p_y + 1 / p_x)
+    m_centroids_persist = bytes_per_complex * n_k_f * n_s_f * n_rmu_f * (nb_left + nb_right) * (1 / p_y + 1 / p_x)
+    m_centroid_copy_peak = m_centroids_full + m_centroids_persist
+    if m_centroid_copy_peak > m_budget:
         raise ValueError(
-            f"Centroid wavefunctions alone require {m_centroids/1e9:.2f} GB per device, "
-            f"but budget is {memory_budget_gb:.2f} GB. Increase memory budget or reduce n_b."
+            f"Centroid storage requires {to_gb(m_centroid_copy_peak):.2f} GB/device but only "
+            f"{memory_budget_gb:.2f} GB were allocated. Reduce band counts or increase the budget."
         )
-    
-    # ========================================================================
-    # STAGE 2: FFT WORKSPACE (band-chunked)
-    # ========================================================================
-    # psi_G (input): (n_k, B_b/P, n_s, nx, ny, nz) - sharded over bands
-    # psi_r (output): same shape
-    # phase_spatial: (n_k, nx, ny, nz) - broadcast to all devices
-    # Communication buffer: None during FFT (shard_map runs locally)
-    #
-    # Constraint: 2 * psi_G/r + phase <= m_available
-    # Solve for B_b:
-    #   2 * 16 * n_k * (B_b/P) * n_s * n_r + 16 * n_k * n_r <= m_available
-    #   B_b <= (m_available - 16 * n_k * n_r) * P / (32 * n_k * n_s * n_r)
-    
-    m_phase = bytes_per_complex * n_k * n_r  # phase_spatial (broadcast)
-    m_fft_overhead = m_phase + m_available * 0.05  # 5% XLA overhead
-    
-    b_b_max = (m_available - m_fft_overhead) * p / (2 * bytes_per_complex * n_k * n_s * n_r)
-    band_chunk = max(8, min(n_b, int(b_b_max)))
-    
-    # Actual FFT memory with chosen band_chunk
-    m_fft_workspace = 2 * bytes_per_complex * n_k * (band_chunk / p) * n_s * n_r + m_phase
-    
-    # ========================================================================
-    # STAGE 3: X-CHUNK EXTRACTION (contiguous r-space chunking)
-    # ========================================================================
-    # X-chunking advantage: With r = x*(ny*nz) + y*nz + z, an x-chunk with
-    # x in [x_start, x_end) maps to CONTIGUOUS r-indices [x_start*ny*nz, x_end*ny*nz).
-    # This enables single sequential HDF5 writes instead of strided writes.
-    #
-    # psi_xchunk_Y: (n_k, n_b, n_s, B_x/p_y)
-    # Staged reshard communication:
-    #   - Stage 1: P(None,('x','y'),...) → P(None,'y',...) requires all-gather over X
-    #   - Buffer: (n_k, n_b/p_y, n_s, B_x)
-    #   - Stage 2: P(None,'y',...) → P(None,None,None,'y') requires all-gather over Y + slice
-    #   - Buffer: (n_k, n_b, n_s, B_x/p_y)
-    #
-    # Both exist during reshape, so peak = Stage1 + psi_xchunk_Y
-    # Constraint: m_stage1 + m_xchunk <= m_available - m_fft_workspace
-    #
-    # Solve for B_x:
-    #   16 * n_k * (n_b/p_y) * n_s * B_x + 16 * n_k * n_b * n_s * (B_x/p_y) <= budget
-    #   B_x * 16 * n_k * n_s * n_b * (1/p_y + 1/p_y) <= budget
-    #   B_x <= budget * p_y / (32 * n_k * n_s * n_b)
-    
-    m_for_xchunk = m_available * 0.30  # Allocate 30% of available for x-chunk
-    
-    b_x_r_max = m_for_xchunk * p_y / (2 * bytes_per_complex * n_k * n_s * n_b)
-    
-    # Convert to x-slices and ensure divisibility
-    # B_x (in r-points) = x_chunk_slices * ny * nz (since x is outermost)
-    x_chunk_slices_max = int(b_x_r_max / (ny * nz))
-    x_chunk_slices = max(1, min(nx, x_chunk_slices_max))
-    
-    # Ensure n_xchunk = x*ny*nz is divisible by p_y
-    while x_chunk_slices > 1 and (x_chunk_slices * ny * nz) % p_y != 0:
-        x_chunk_slices -= 1
-    
-    x_chunk_r = x_chunk_slices * ny * nz
-    
-    # ========================================================================
-    # STAGE 4: PAIR DENSITY P_k (LEFT and RIGHT, spin-traced)
-    # ========================================================================
-    # Spin-traced pair density: P_k(μ,ν) = Σ_{n,s} ψ*_{n,k,s}(μ) ψ_{n,k,s}(ν)
-    # No explicit spin dimensions in output (smaller than keeping all 4 spin combos).
-    #
-    # For CCT: P_l_mumu and P_r_mumu both exist simultaneously
-    # For ZCT: P_l_xchunk and P_r_xchunk both exist simultaneously
-    #
-    # P_l_mumu, P_r_mumu: (n_k, n_rmu/p_x, n_rmu/p_y)
-    # P_l_xchunk, P_r_xchunk: (n_k, n_rmu/p_x, x_chunk_r/p_y)
-    
-    # Per pair density (left OR right)
-    m_P_mumu_single = bytes_per_complex * n_k * (n_rmu / p_x) * (n_rmu / p_y)
-    m_P_xchunk_single = bytes_per_complex * n_k * (n_rmu / p_x) * (x_chunk_r / p_y)
-    
-    # Both left and right exist during CCT/ZCT computation
-    m_P_mumu = 2 * m_P_mumu_single  # P_l + P_r
-    m_P_xchunk = 2 * m_P_xchunk_single  # P_l + P_r
-    
-    # ========================================================================
-    # STAGE 5: CCT/ZCT FFT PIPELINE
-    # ========================================================================
-    # C_q: (n_q, n_rmu/p_x, n_rmu/p_y)
-    # Z_q: (n_q, n_rmu/p_x, x_chunk_r/p_y)
-    # Intermediate P_R has same footprint as P_k
-    
-    m_C_q = bytes_per_complex * n_q * (n_rmu / p_x) * (n_rmu / p_y)
-    m_Z_q = bytes_per_complex * n_q * (n_rmu / p_x) * (x_chunk_r / p_y)
-    
-    # ========================================================================
-    # STAGE 6: CHOLESKY + SOLVE
-    # ========================================================================
-    # L_q: (n_q, n_rmu/p_x, n_rmu/p_y) - persists after Cholesky for all x-chunks
-    # L_rep: B_q × (n_rmu, n_rmu) - REPLICATED on each device during solve
-    # Z_col: (n_q, n_rmu, x_chunk_r/P) - column sharded
-    # zeta: same as Z_col
-    #
-    # CRITICAL: L_q persists through entire x-chunk loop!
-    # q_chunk is calculated AFTER x_chunk is finalized (see below)
-    
-    # L_q persists through x-chunk loop
-    m_L_q = bytes_per_complex * n_q * (n_rmu / p_x) * (n_rmu / p_y)
-    
-    # ========================================================================
-    # COMMUNICATION BUFFERS
-    # ========================================================================
-    # Cholesky panel broadcast: (n_q, b, n_rmu) where b = n_rmu/J
-    # Estimate J = lcm(p_x, p_y), b = n_rmu/J
-    j_target = math.lcm(p_x, p_y) if p_x > 1 and p_y > 1 else max(p_x, p_y)
-    j_target = max(1, min(n_rmu, j_target))
-    block_size = max(1, n_rmu // j_target) if n_rmu >= j_target else n_rmu
-    m_chol_panel = bytes_per_complex * n_q * block_size * n_rmu / max(p_x, p_y)
-    
-    # Staged reshard buffer (x-chunk extraction)
-    m_reshard_buffer = bytes_per_complex * n_k * (n_b / p_y) * n_s * x_chunk_r
-    
-    # psi_xchunk_Y: loaded each x-chunk iteration
-    m_psi_xchunk = bytes_per_complex * n_k * n_b * n_s * (x_chunk_r / p_y)
-    
-    # Total communication overhead estimate
-    m_comm_overhead = m_chol_panel + m_reshard_buffer
-    
-    # ========================================================================
-    # PEAK MEMORY: TWO BOTTLENECK STAGES
-    # ========================================================================
-    #
-    # STAGE A: Pair density + ZCT (per x-chunk)
-    # Simultaneous:
-    #   - G-space cache (if enabled) OR one band chunk (if disabled)
-    #   - L_q (persistent after Cholesky)
-    #   - Centroids: 4 arrays (psi_l/r_rmu_Y, psi_l/r_rmuT_X)
-    #   - psi_nk(rchunk) for all bands, left+right, Y-sharded
-    #   - Z_q(rmu, rchunk)
-    #   - FFT workspace: 1x P_xchunk (P_k → P_R coexist during FFT)
-    #
-    # STAGE B: Solve (per x-chunk, after psi_xchunk deleted)
-    # Simultaneous:
-    #   - G-space cache (if enabled) OR one band chunk
-    #   - Centroids: 4 arrays
-    #   - Z_q(rmu, rchunk_XY) resharded for column-parallel solve
-    #   - q_chunk copies of L_q REPLICATED per device
-    #   - q_chunk copies of zeta_q (output)
-    #
-    # Note: psi_xchunk is DELETED before solve stage
-    
-    # FFT workspace: P_k and P_R coexist during FFT (1x extra)
-    m_fft_workspace_pd = m_P_xchunk * 1
-    
-    # Stage A peak: pair density + ZCT
-    m_stage_a = (m_centroids + m_cached_gspace + m_L_q + 
-                 m_psi_xchunk + m_P_xchunk + m_Z_q + m_fft_workspace_pd)
-    
-    # Stage B peak: solve
-    # Z_q resharded to column-parallel: (n_q, n_rmu, x_chunk_r/P)
-    m_Z_col = bytes_per_complex * n_q * n_rmu * (x_chunk_r / p)
-    # zeta output: same shape as Z_col
-    m_zeta = m_Z_col
-    # L_rep: q_chunk copies of (n_rmu, n_rmu) REPLICATED per device
-    # q_chunk determined later, use n_q as upper bound for now
-    m_L_rep_per_q = bytes_per_complex * n_rmu * n_rmu  # Full matrix, replicated
-    
-    m_stage_b = (m_centroids + m_cached_gspace + m_L_q +
-                 m_Z_col + m_zeta + m_L_rep_per_q)  # 1 q at a time baseline
-    
-    # Initial FFT stage (loading centroids): sequential, not concurrent with above
-    m_peak_fft = m_centroids + m_fft_workspace
-    
-    # Peak is max of all stages
-    m_peak_xchunk = max(m_stage_a, m_stage_b)
-    m_peak = max(m_peak_xchunk, m_peak_fft)
-    
-    # Verify we fit, and iteratively reduce x_chunk if needed
-    max_iterations = 20
-    for _ in range(max_iterations):
-        utilization = m_peak / m_budget
-        if utilization <= 1.0:
-            break
-        
-        # Reduce x_chunk to fit
-        reduction_factor = 0.85 / utilization
-        x_chunk_slices = max(1, int(x_chunk_slices * reduction_factor))
-        while x_chunk_slices > 1 and (x_chunk_slices * ny * nz) % p_y != 0:
-            x_chunk_slices -= 1
-        x_chunk_r = x_chunk_slices * ny * nz
-        
-        # Recompute dependent values for both stages
-        m_psi_xchunk = bytes_per_complex * n_k * n_b * n_s * (x_chunk_r / p_y)
-        m_P_xchunk_single = bytes_per_complex * n_k * (n_rmu / p_x) * (x_chunk_r / p_y)
-        m_P_xchunk = 2 * m_P_xchunk_single
-        m_Z_q = bytes_per_complex * n_q * (n_rmu / p_x) * (x_chunk_r / p_y)
-        m_fft_workspace_pd = m_P_xchunk * 1
-        m_Z_col = bytes_per_complex * n_q * n_rmu * (x_chunk_r / p)
-        m_zeta = m_Z_col
-        
-        # Stage A: pair density + ZCT
-        m_stage_a = (m_centroids + m_cached_gspace + m_L_q + 
-                     m_psi_xchunk + m_P_xchunk + m_Z_q + m_fft_workspace_pd)
-        # Stage B: solve (psi_xchunk deleted, 1 q at a time baseline)
-        m_stage_b = (m_centroids + m_cached_gspace + m_L_q +
-                     m_Z_col + m_zeta + m_L_rep_per_q)
-        
-        m_peak_xchunk = max(m_stage_a, m_stage_b)
-        m_peak = max(m_peak_xchunk, m_peak_fft)
-    
-    # ========================================================================
-    # Q-CHUNK CALCULATION (after x_chunk is finalized)
-    # ========================================================================
-    # At solve time: need q_chunk copies of L (replicated) + Z_col + zeta
-    # Available = budget - centroids - gspace_cache - L_q - Z_col - zeta
-    # Each additional q needs: 1 × L_rep = n_rmu² × 16 bytes
-    m_solve_base = m_centroids + m_cached_gspace + m_L_q + m_Z_col + m_zeta
-    m_for_q = m_budget - m_solve_base
-    b_q_max = m_for_q / (bytes_per_complex * n_rmu * n_rmu)
-    q_chunk = max(1, min(n_q, int(b_q_max)))
-    
-    # Memory estimates dictionary - based on two bottleneck stages
+
+    # Stage 1: band-chunked FFT workspace for centroid extraction
+    phase_bytes = bytes_per_complex * n_k_f * n_r_f
+    headroom_fft = m_budget - m_centroids_full
+    if headroom_fft <= phase_bytes:
+        raise ValueError("Insufficient memory for even a single-band FFT chunk.")
+
+    fft_denom = 2 * bytes_per_complex * n_k_f * n_s_f * n_r_f
+    b_b_max = (headroom_fft - phase_bytes) * p / fft_denom
+    if b_b_max < 1:
+        raise ValueError(
+            "Band chunk computation produced <1 band. Increase the memory budget or decrease system size."
+        )
+    band_chunk = max(1, min(n_b_full, int(b_b_max)))
+    m_fft_workspace = 2 * bytes_per_complex * n_k_f * (band_chunk / p) * n_s_f * n_r_f + phase_bytes
+    peak_fft_stage = m_centroids_full + m_fft_workspace
+
+    # Stage 2: pair-density build for C_q (before x-chunk loop)
+    m_pair_mumu = bytes_per_complex * n_k_f * (n_rmu_f / p_x) * (n_rmu_f / p_y)
+    m_C_q = bytes_per_complex * n_q_f * (n_rmu_f / p_x) * (n_rmu_f / p_y)
+    stage_cct = m_centroids_persist + 2 * m_pair_mumu + m_C_q
+    if stage_cct > m_budget:
+        raise ValueError(
+            f"C_q build requires {to_gb(stage_cct):.2f} GB/device which exceeds the budget. Reduce n_rmu or n_q."
+        )
+    m_L_q = m_C_q
+
+    # Optional G-space cache (sum of all cached band chunks)
+    m_cached_gspace_full = bytes_per_complex * n_k_f * (n_b_full / p) * n_s_f * n_r_f
+
+    def compute_chunk_metrics(x_chunk_r: int, base_const: float) -> tuple[float, str, dict]:
+        chunk_r = float(x_chunk_r)
+        per_y = chunk_r / p_y
+        m_xchunk = bytes_per_complex * n_k_f * n_b_full * n_s_f * per_y
+        m_pair = bytes_per_complex * n_k_f * (n_rmu_f / p_x) * per_y
+        m_z = bytes_per_complex * n_q_f * (n_rmu_f / p_x) * per_y
+        m_zcol = bytes_per_complex * n_q_f * n_rmu_f * (chunk_r / p)
+        stage_pair = base_const + m_xchunk + 2 * m_pair
+        stage_zct = base_const + 2 * m_pair + m_z
+        stage_solve = base_const + 2 * m_zcol + bytes_per_complex * (n_rmu_f ** 2)
+        peak = max(stage_pair, stage_zct, stage_solve)
+        if peak == stage_pair:
+            name = 'pair'
+        elif peak == stage_zct:
+            name = 'zct'
+        else:
+            name = 'solve'
+        info = {
+            'psi_xchunk': m_xchunk,
+            'pair_xchunk': 2 * m_pair,
+            'Z_q': m_z,
+            'Z_col': m_zcol,
+            'stage_pair': stage_pair,
+            'stage_zct': stage_zct,
+            'stage_solve': stage_solve,
+        }
+        return peak, name, info
+
+    def choose_x_chunk(use_cache: bool) -> dict | None:
+        m_cache = m_cached_gspace_full if use_cache else 0.0
+        base_const = m_centroids_persist + m_L_q + m_cache
+        headroom = m_budget - base_const
+        if headroom <= bytes_per_complex * (n_rmu_f ** 2):
+            return None
+
+        limits = []
+        denom_pair = n_k_f * n_b_full * n_s_f + 2 * n_k_f * (n_rmu_f / p_x)
+        if denom_pair > 0:
+            limits.append(headroom * p_y / (bytes_per_complex * denom_pair))
+        denom_zct = (n_rmu_f / p_x) * (2 * n_k_f + n_q_f)
+        if denom_zct > 0:
+            limits.append(headroom * p_y / (bytes_per_complex * denom_zct))
+        solve_numer = headroom - bytes_per_complex * (n_rmu_f ** 2)
+        denom_solve = 2 * n_q_f * n_rmu_f / p
+        if denom_solve > 0 and solve_numer > 0:
+            limits.append(solve_numer * p / (bytes_per_complex * denom_solve))
+        if not limits:
+            limits.append(float(n_r))
+        x_chunk_r_guess = min(float(n_r), max(float(ny * nz), min(limits)))
+
+        x_slices = min(nx, max(1, int(x_chunk_r_guess // (ny * nz))))
+
+        def make_divisible(val: int) -> int:
+            out = val
+            while out > 1 and (out * ny * nz) % p_y != 0:
+                out -= 1
+            return out
+
+        x_slices = make_divisible(x_slices)
+        if x_slices <= 0:
+            return None
+
+        while x_slices > 0:
+            x_chunk_r = x_slices * ny * nz
+            peak_bytes, stage_name, info = compute_chunk_metrics(x_chunk_r, base_const)
+            if peak_bytes <= m_budget:
+                return {
+                    'x_chunk': x_slices,
+                    'x_chunk_r': x_chunk_r,
+                    'peak_bytes': peak_bytes,
+                    'stage_name': stage_name,
+                    'stage_info': info,
+                    'cache_bytes': m_cache,
+                    'base_const': base_const,
+                }
+            x_slices = make_divisible(x_slices - 1)
+        return None
+
+    chunk_result = choose_x_chunk(use_cache=True) or choose_x_chunk(use_cache=False)
+    if chunk_result is None:
+        raise ValueError(
+            "Unable to find an x_chunk that fits the memory budget (with or without G-space caching)."
+        )
+
+    use_gspace_cache = chunk_result['cache_bytes'] > 0
+    x_chunk_slices = chunk_result['x_chunk']
+    x_chunk_r = chunk_result['x_chunk_r']
+    stage_info = chunk_result['stage_info']
+    peak_chunk_bytes = chunk_result['peak_bytes']
+    base_const = chunk_result['base_const']
+
+    m_Z_col = stage_info['Z_col']
+    l_rep_bytes = bytes_per_complex * (n_rmu_f ** 2)
+    base_solve = base_const + 2 * m_Z_col
+    available_for_q = max(0.0, m_budget - base_solve)
+    if available_for_q < l_rep_bytes:
+        q_chunk = 1
+    else:
+        q_chunk = max(1, min(n_q, int(available_for_q // l_rep_bytes)))
+
+    overall_peak = max(peak_chunk_bytes, peak_fft_stage, m_centroid_copy_peak, stage_cct)
+    bottleneck = chunk_result['stage_name'] if peak_chunk_bytes >= max(peak_fft_stage, m_centroid_copy_peak, stage_cct) else (
+        'fft' if peak_fft_stage >= max(m_centroid_copy_peak, stage_cct) else (
+            'centroid_copy' if m_centroid_copy_peak >= stage_cct else 'C_q'
+        )
+    )
+
     memory_estimate = {
-        # Persistent arrays (exist through x-chunk loop)
-        'centroids_gb': m_centroids / 1e9,
-        'cached_gspace_gb': m_cached_gspace / 1e9,
+        'centroids_full_gb': to_gb(m_centroids_full),
+        'centroids_gb': to_gb(m_centroids_persist),
+        'centroid_copy_peak_gb': to_gb(m_centroid_copy_peak),
+        'cached_gspace_gb': to_gb(chunk_result['cache_bytes']),
         'use_gspace_cache': use_gspace_cache,
-        'L_q_gb': m_L_q / 1e9,
-        # Stage A: pair density + ZCT
-        'psi_xchunk_gb': m_psi_xchunk / 1e9,
-        'pair_density_xchunk_gb': m_P_xchunk / 1e9,
-        'Z_q_gb': m_Z_q / 1e9,
-        'fft_workspace_pd_gb': m_fft_workspace_pd / 1e9,
-        'stage_a_gb': m_stage_a / 1e9,
-        # Stage B: solve (psi_xchunk deleted)
-        'Z_col_gb': m_Z_col / 1e9,
-        'zeta_gb': m_zeta / 1e9,
-        'L_rep_per_q_gb': m_L_rep_per_q / 1e9,
-        'stage_b_gb': m_stage_b / 1e9,
-        # Initial FFT stage
-        'fft_workspace_gb': m_fft_workspace / 1e9,
-        'peak_fft_gb': m_peak_fft / 1e9,
-        # Summary
-        'peak_estimate_gb': m_peak / 1e9,
+        'fft_workspace_gb': to_gb(m_fft_workspace),
+        'peak_fft_gb': to_gb(peak_fft_stage),
+        'stage_cct_gb': to_gb(stage_cct),
+        'L_q_gb': to_gb(m_L_q),
+        'psi_xchunk_gb': to_gb(stage_info['psi_xchunk']),
+        'pair_density_xchunk_gb': to_gb(stage_info['pair_xchunk']),
+        'Z_q_gb': to_gb(stage_info['Z_q']),
+        'Z_col_gb': to_gb(stage_info['Z_col']),
+        'zeta_gb': to_gb(stage_info['Z_col']),
+        'L_rep_per_q_gb': to_gb(l_rep_bytes),
+        'stage_pair_gb': to_gb(stage_info['stage_pair']),
+        'stage_zct_gb': to_gb(stage_info['stage_zct']),
+        'stage_solve_gb': to_gb(stage_info['stage_solve']),
+        'peak_chunk_gb': to_gb(peak_chunk_bytes),
+        'peak_estimate_gb': to_gb(overall_peak),
         'budget_gb': memory_budget_gb,
-        'utilization_pct': 100 * m_peak / m_budget,
-        'bottleneck': 'stage_a' if m_stage_a >= m_stage_b else 'stage_b',
-        # Mesh info
+        'effective_budget_gb': to_gb(m_budget),
+        'utilization_pct': 100.0 * overall_peak / m_budget,
+        'bottleneck': bottleneck,
         'p_x': p_x,
         'p_y': p_y,
         'n_devices': p,
+        'x_chunk_r': x_chunk_r,
+        'centroids_bytes': m_centroids_persist,
+        'effective_budget_bytes': m_budget,
+        'available_vcoul_gb': to_gb(max(0.0, m_budget - m_centroids_persist)),
     }
-    
+
     return {
         'band_chunk': band_chunk,
         'x_chunk': x_chunk_slices,
         'x_chunk_r': x_chunk_r,
         'q_chunk': q_chunk,
-        'use_gspace_cache': use_gspace_cache,  # Whether to cache G-space across x-chunks
+        'use_gspace_cache': use_gspace_cache,
         'memory_estimate': memory_estimate,
     }
-
 
 def print_memory_breakdown(
     chunks: dict,
@@ -437,6 +283,7 @@ def print_memory_breakdown(
     
     # Persistent arrays
     print(f"  {'[Persistent]':<40}")
+    print(f"    {'Centroid union (load stage)':<38} {mem['centroids_full_gb']:>10.3f}")
     print(f"    {'Centroids (4 arrays: l/r × X/Y)':<38} {mem['centroids_gb']:>10.3f}")
     if mem.get('use_gspace_cache', False):
         print(f"    {'G-space cache':<38} {mem['cached_gspace_gb']:>10.3f}")
@@ -444,23 +291,30 @@ def print_memory_breakdown(
         print(f"    {'G-space cache':<38} {'(disabled)'}")
     print(f"    {'L_q (Cholesky factor)':<38} {mem['L_q_gb']:>10.3f}")
     
-    # Stage A
-    print(f"\n  {'[Stage A: Pair density + ZCT]':<40}")
+    # CCT stage
+    print(f"\n  {'[Stage: C_q build]':<40}")
+    print(f"    {'Pair densities + C_q':<38} {mem['stage_cct_gb']:>10.3f}")
+    
+    # Pair density stage
+    print(f"\n  {'[Stage: Pair density]':<40}")
     print(f"    {'psi_nk(rchunk) all bands':<38} {mem['psi_xchunk_gb']:>10.3f}")
     print(f"    {'P_l + P_r (spin-traced)':<38} {mem['pair_density_xchunk_gb']:>10.3f}")
-    print(f"    {'Z_q(rmu, rchunk)':<38} {mem['Z_q_gb']:>10.3f}")
-    print(f"    {'FFT workspace (P_k → P_R)':<38} {mem['fft_workspace_pd_gb']:>10.3f}")
-    print(f"    {'─ STAGE A TOTAL':<38} {mem['stage_a_gb']:>10.3f}")
+    print(f"    {'─ STAGE TOTAL':<38} {mem['stage_pair_gb']:>10.3f}")
     
-    # Stage B
-    print(f"\n  {'[Stage B: Solve (psi_xchunk deleted)]':<40}")
+    # ZCT stage
+    print(f"\n  {'[Stage: ZCT / FFT pipeline]':<40}")
+    print(f"    {'Z_q(rmu, rchunk)':<38} {mem['Z_q_gb']:>10.3f}")
+    print(f"    {'─ STAGE TOTAL':<38} {mem['stage_zct_gb']:>10.3f}")
+    
+    # Solve
+    print(f"\n  {'[Stage: Solve (psi_xchunk deleted)]':<40}")
     print(f"    {'Z_col (resharded)':<38} {mem['Z_col_gb']:>10.3f}")
     print(f"    {'zeta_q (output)':<38} {mem['zeta_gb']:>10.3f}")
     print(f"    {'L_rep (replicated per q)':<38} {mem['L_rep_per_q_gb']:>10.3f}")
-    print(f"    {'─ STAGE B TOTAL':<38} {mem['stage_b_gb']:>10.3f}")
+    print(f"    {'─ STAGE TOTAL':<38} {mem['stage_solve_gb']:>10.3f}")
     
     print(f"\n  {'-'*54}")
-    bottleneck = mem.get('bottleneck', 'stage_a')
+    bottleneck = mem.get('bottleneck', 'pair')
     print(f"  {'PEAK ('+bottleneck+')':<38} {mem['peak_estimate_gb']:>10.3f} GB")
     print(f"  {'BUDGET':<38} {mem['budget_gb']:>10.3f} GB")
     print(f"  {'UTILIZATION':<38} {mem['utilization_pct']:>10.1f} %")
@@ -834,4 +688,3 @@ def get_bandranges(nv, nc, nband, nelec):
 	n_fullrange = [0, int(nband)]
 	n_valrange = [0, int(nelec)]
 	return nvrange, ncrange, nsigmarange, n_fullrange, n_valrange
-

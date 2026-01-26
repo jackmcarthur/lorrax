@@ -219,31 +219,39 @@ def make_v_munu_chunked_kernel(
         
         return sqrt_v, phase
     
-    @jax.jit
+    fft_weight_cache: dict[int, callable] = {}
+
     def fft_and_weight(
         zeta_r: jax.Array,
         sqrt_v: jax.Array,
         phase: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
         """
-        FFT a chunk of zeta and weight by √v.
-        
-        Args:
-            zeta_r: (B_μ, n_rtot) real-space zeta chunk
-            sqrt_v: (fft_nx, fft_ny, fft_nz) precomputed √v(q+G)
-            phase: (1, fft_nx, fft_ny, fft_nz) phase factor
-        
-        Returns:
-            zeta_weighted: (B_μ, n_G) weighted G-space zeta
-            g0_chunk: (B_μ,) unweighted G=0 component for head corrections
+        FFT a chunk of zeta and weight by √v. The implementation is cached per
+        μ-chunk size so that XLA only compiles once for each distinct chunk.
         """
-        B_mu = zeta_r.shape[0]
-        zeta_spatial = zeta_r.reshape(B_mu, fft_nx, fft_ny, fft_nz)
-        zeta_phased = zeta_spatial * phase
-        zeta_G = jnp.fft.fftn(zeta_phased, axes=(-3, -2, -1))
-        g0_chunk = zeta_G[:, 0, 0, 0]  # Extract G=0 before weighting
-        zeta_weighted = zeta_G * sqrt_v[None, :, :, :]
-        return zeta_weighted.reshape(B_mu, n_G), g0_chunk
+        B_mu = int(zeta_r.shape[0])
+        fn = fft_weight_cache.get(B_mu)
+        if fn is None:
+            mu_static = B_mu
+
+            @jax.jit
+            def _fft_and_weight(
+                zeta_r_inner: jax.Array,
+                sqrt_v_inner: jax.Array,
+                phase_inner: jax.Array,
+            ) -> tuple[jax.Array, jax.Array]:
+                zeta_spatial = zeta_r_inner.reshape(mu_static, fft_nx, fft_ny, fft_nz)
+                zeta_phased = zeta_spatial * phase_inner
+                zeta_G = jnp.fft.fftn(zeta_phased, axes=(-3, -2, -1))
+                g0_chunk_local = zeta_G[:, 0, 0, 0]
+                zeta_weighted_local = zeta_G * sqrt_v_inner[None, :, :, :]
+                return zeta_weighted_local.reshape(mu_static, n_G), g0_chunk_local
+
+            fft_weight_cache[B_mu] = _fft_and_weight
+            fn = _fft_and_weight
+
+        return fn(zeta_r, sqrt_v, phase)
     
     @jax.jit
     def contract_block(
@@ -577,12 +585,15 @@ def compute_all_V_q_from_zeta_h5(
     mu_chunk_size: int = 128,
     mesh_xy: Mesh = None,
     sys_dim: int = 2,
+    q_batch_size: int | None = None,
     verbose: bool = True,
 ) -> jax.Array:
     """
     Compute V_q for all q-points from zeta stored in HDF5.
     
-    Loops over all q-points, computing V_q using μ-chunking for each.
+    Loops over all q-points, computing V_q using μ-chunking for each. When the
+    μ chunks already cover the full set (single chunk), q-points can be batched
+    to reuse the FFT and contraction kernels.
     
     Args:
         zeta_h5: Open HDF5 file containing 'zeta_q' with shape (nqx, nqy, nqz, n_rmu, n_rtot)
@@ -593,6 +604,8 @@ def compute_all_V_q_from_zeta_h5(
         mu_chunk_size: Number of μ indices per chunk
         mesh_xy: Optional device mesh for 2D sharding
         sys_dim: System dimensionality
+        q_batch_size: Number of q-points to process simultaneously when
+            mu_chunk_size ≥ n_rmu (default: no batching)
         verbose: Print timing breakdown
     
     Returns:
@@ -616,6 +629,29 @@ def compute_all_V_q_from_zeta_h5(
     
     # For single-chunk case, keep on GPU and batch. For multi-chunk, use numpy.
     single_chunk = (n_chunks == 1)
+    effective_q_batch = 1
+    if single_chunk:
+        if q_batch_size is None:
+            effective_q_batch = 1
+        else:
+            effective_q_batch = max(1, min(q_batch_size, nq_total))
+    else:
+        effective_q_batch = 1
+    
+    # Cache for batched single-chunk processing
+    q_batch_proc_cache: dict[int, callable] = {}
+
+    def _get_single_chunk_batch_proc(batch_size: int):
+        proc = q_batch_proc_cache.get(batch_size)
+        if proc is None:
+            def _single(zeta_q, sqrt_v_q, phase_q):
+                zeta_weighted_q, g0_q = kernels.fft_and_weight(zeta_q, sqrt_v_q, phase_q)
+                V_q = kernels.contract_block(zeta_weighted_q, zeta_weighted_q)
+                return V_q, g0_q
+            vmapped = jax.vmap(_single, in_axes=(0, 0, 0))
+            proc = jax.jit(vmapped)
+            q_batch_proc_cache[batch_size] = proc
+        return proc
     
     # Determine if we should use sharded reads
     use_sharded_io = (mesh_xy is not None and jax.process_count() > 1)
@@ -624,51 +660,58 @@ def compute_all_V_q_from_zeta_h5(
         # Single-chunk path: keep results on GPU, avoid CPU round-trips
         V_qmunu_list = []
         g0_mu_list = []
+        q_coords = [
+            (qx, qy, qz)
+            for qx in range(nkx)
+            for qy in range(nky)
+            for qz in range(nkz)
+        ]
         
         with timing.section("compute_all_V_q"):
-            q_flat = 0
-            for qx in range(nkx):
-                for qy in range(nky):
-                    for qz in range(nkz):
-                        if verbose:
-                            print(f"  q-point {q_flat+1}/{nq_total}: q=({qx},{qy},{qz})")
-                        
-                        # Compute phase and sqrt_v for this q
-                        qvec_nonneg = np.array([qx, qy, qz], dtype=np.float64)
-                        kgrid_arr = np.array([nkx, nky, nkz], dtype=np.float64)
-                        qvec_wrapped = np.where(
-                            qvec_nonneg > kgrid_arr / 2,
-                            qvec_nonneg - kgrid_arr,
-                            qvec_nonneg
+            for batch_start in range(0, nq_total, effective_q_batch):
+                batch = q_coords[batch_start:batch_start + effective_q_batch]
+                if verbose:
+                    qb = ', '.join(f"({qx},{qy},{qz})" for (qx, qy, qz) in batch)
+                    print(f"  q-points {batch_start+1}-{batch_start+len(batch)} / {nq_total}: {qb}")
+                
+                zeta_batch = []
+                sqrt_batch = []
+                phase_batch = []
+                for qx, qy, qz in batch:
+                    qvec_nonneg = np.array([qx, qy, qz], dtype=np.float64)
+                    kgrid_arr = np.array([nkx, nky, nkz], dtype=np.float64)
+                    qvec_wrapped = np.where(
+                        qvec_nonneg > kgrid_arr / 2,
+                        qvec_nonneg - kgrid_arr,
+                        qvec_nonneg
+                    )
+                    qvec_wrapped_jax = jnp.asarray(qvec_wrapped)
+                    sqrt_v, phase = kernels.get_sqrt_v_and_phase(qvec_wrapped_jax)
+                    
+                    if use_sharded_io:
+                        zeta_q = read_zeta_q_sharded(
+                            zeta_h5, qx, qy, qz, n_rmu, n_rtot, mesh_xy
                         )
-                        qvec_wrapped_jax = jnp.asarray(qvec_wrapped)
-                        sqrt_v, phase = kernels.get_sqrt_v_and_phase(qvec_wrapped_jax)
-                        
-                        # Load zeta for this q
-                        if use_sharded_io:
-                            zeta_q = read_zeta_q_sharded(
-                                zeta_h5, qx, qy, qz, n_rmu, n_rtot, mesh_xy
-                            )
-                        else:
-                            zeta_q_np = zeta_dset[qx, qy, qz, :, :]
-                            zeta_q = jnp.asarray(zeta_q_np)
-                        
-                        # FFT and weight (stays on GPU)
-                        zeta_weighted, g0_mu = kernels.fft_and_weight(zeta_q, sqrt_v, phase)
-                        
-                        # Contract V = zeta^H @ zeta
-                        V_q = kernels.contract_block(zeta_weighted, zeta_weighted)
-                        
-                        V_qmunu_list.append(V_q)
-                        g0_mu_list.append(g0_mu)
-                        q_flat += 1
-            
-            if verbose:
-                print()
+                    else:
+                        zeta_q_np = zeta_dset[qx, qy, qz, :, :]
+                        zeta_q = jnp.asarray(zeta_q_np)
+                    
+                    zeta_batch.append(zeta_q)
+                    sqrt_batch.append(sqrt_v)
+                    phase_batch.append(phase)
+                
+                zeta_batch_arr = jnp.stack(zeta_batch, axis=0)
+                sqrt_batch_arr = jnp.stack(sqrt_batch, axis=0)
+                phase_batch_arr = jnp.stack(phase_batch, axis=0)
+                
+                processor = _get_single_chunk_batch_proc(len(batch))
+                V_batch, g0_batch = processor(zeta_batch_arr, sqrt_batch_arr, phase_batch_arr)
+                
+                V_qmunu_list.append(V_batch)
+                g0_mu_list.append(g0_batch)
         
-        # Stack results on GPU
-        V_qmunu = jnp.stack(V_qmunu_list).reshape(nkx, nky, nkz, n_rmu, n_rmu)
-        g0_mu_all = jnp.stack(g0_mu_list).reshape(nkx, nky, nkz, n_rmu)
+        V_qmunu = jnp.concatenate(V_qmunu_list, axis=0).reshape(nkx, nky, nkz, n_rmu, n_rmu)
+        g0_mu_all = jnp.concatenate(g0_mu_list, axis=0).reshape(nkx, nky, nkz, n_rmu)
     
     else:
         # Multi-chunk path: use numpy accumulation to avoid .at[].set() overhead
@@ -778,4 +821,3 @@ def make_v_munu_kernel_chunked(
         )
     
     return kernel
-

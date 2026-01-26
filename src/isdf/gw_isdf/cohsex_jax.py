@@ -757,6 +757,8 @@ def fit_zeta_and_compute_V_q_chunked(
 		target_utilization=0.85,
 		p_x=p_x,
 		p_y=p_y,
+		n_b_left=band_range_left[1] - band_range_left[0],
+		n_b_right=band_range_right[1] - band_range_right[0],
 		verbose=True,
 	)
 	
@@ -764,6 +766,7 @@ def fit_zeta_and_compute_V_q_chunked(
 	x_chunk_size = chunks['x_chunk']
 	q_chunk_size = chunks['q_chunk']
 	use_gspace_cache = chunks.get('use_gspace_cache', True)
+	mem_est = chunks.get('memory_estimate', {})
 	
 	# Override x_chunk_size if explicitly specified
 	if x_chunk_size_override > 0:
@@ -804,24 +807,34 @@ def fit_zeta_and_compute_V_q_chunked(
 	# Available: full budget (no centroids needed, zeta read from H5)
 	n_G = meta.n_rtot
 	bytes_per_complex = 16
-	m_budget_vcoul = memory_budget_gb * 1e9 * 0.9  # 90% of budget
+	budget_bytes_eff = mem_est.get('effective_budget_bytes', memory_budget_gb * 1e9 * 0.85)
+	centroids_bytes = mem_est.get('centroids_bytes', 0.0)
+	m_budget_vcoul = max(0.0, budget_bytes_eff - centroids_bytes)
 	# Each mu needs: 2 × n_G × 16 (zeta_mu + zeta_nu for off-diag) + 1 × n_G × 16 (FFT workspace)
 	m_per_mu = 3 * bytes_per_complex * n_G
 	mu_chunk_vcoul = max(1, min(meta.n_rmu, int(m_budget_vcoul / m_per_mu)))
+	q_batch_vcoul = 1
+	n_q_total = n_q
+	if mu_chunk_vcoul >= meta.n_rmu and n_q_total > 1:
+		q_batch_vcoul = min(4, n_q_total)
+	print(f"    V_q mu chunks: {mu_chunk_vcoul}")
+	if q_batch_vcoul > 1:
+		print(f"    V_q q batches: {q_batch_vcoul}")
 	
-	with timing.section("cohsex_jax.V_q_compute"):
-		with h5py.File(zeta_h5_path, 'r') as zeta_h5:
-			with mesh_xy:
-				V_qmunu_raw, g0_mu_all = compute_all_V_q_from_zeta_h5(
-					zeta_h5,
-					kgrid=meta.kgrid,
-					fft_grid=meta.fft_grid,
-					bvec=bvec,
-					cell_volume=cell_volume,
-					mu_chunk_size=mu_chunk_vcoul,
-					mesh_xy=mesh_xy,
-					sys_dim=sys_dim,
-				)
+		with timing.section("cohsex_jax.V_q_compute"):
+			with h5py.File(zeta_h5_path, 'r') as zeta_h5:
+				with mesh_xy:
+					V_qmunu_raw, g0_mu_all = compute_all_V_q_from_zeta_h5(
+						zeta_h5,
+						kgrid=meta.kgrid,
+						fft_grid=meta.fft_grid,
+						bvec=bvec,
+						cell_volume=cell_volume,
+						mu_chunk_size=mu_chunk_vcoul,
+						mesh_xy=mesh_xy,
+						sys_dim=sys_dim,
+						q_batch_size=q_batch_vcoul if mu_chunk_vcoul >= meta.n_rmu else None,
+					)
 	
 	# Write G0 (ζ_μ(G=0) for each q) to the zeta HDF5 file for restart/reuse
 	# g0_mu_all shape: (nqx, nqy, nqz, n_rmu)
