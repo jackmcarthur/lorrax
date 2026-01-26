@@ -964,14 +964,17 @@ def main(argv=None):
         print(f"\n{'='*60}")
         print("RUNNING FULL ZETA FITTING PIPELINE")
         print(f"{'='*60}")
+        use_gspace_cache = chunks.get('use_gspace_cache', True)
         print(f"  Using memory-optimized chunk sizes:")
         print(f"    band_chunk = {band_chunk_size}")
         print(f"    z_chunk = {z_chunk_size}")
         print(f"    q_chunk = {q_chunk_size}")
+        print(f"    gspace_cache = {'enabled' if use_gspace_cache else 'disabled'}")
         with mesh_xy:
             fit_zeta_chunked_to_h5(
                 wfn, sym, meta, centroid_indices, mesh_xy,
-                z_chunk_size, output_path, band_chunk_size, q_chunk_size, bispinor
+                z_chunk_size, output_path, band_chunk_size, q_chunk_size, bispinor,
+                use_gspace_cache=use_gspace_cache
             )
         
         # Verify output

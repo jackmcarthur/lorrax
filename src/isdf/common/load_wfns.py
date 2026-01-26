@@ -1380,6 +1380,7 @@ def fit_zeta_chunked_to_h5(
     band_chunk_size: int = 16,
     q_chunk_size: int = 1,
     bispinor: bool = True,
+    use_gspace_cache: bool = True,
 ):
     """
     Full zeta fitting pipeline with z-chunk loop and HDF5 output.
@@ -1406,6 +1407,8 @@ def fit_zeta_chunked_to_h5(
         band_chunk_size: Bands to process at once (memory control)
         q_chunk_size: Q-points to solve simultaneously (memory vs parallelism trade-off)
         bispinor: Whether to use bispinor wavefunctions
+        use_gspace_cache: If True, cache G-space across z-chunks (faster but uses more memory).
+                         If False, reload from HDF5 each z-chunk (slower but less memory).
     
     Returns:
         None (writes to HDF5)
@@ -1496,7 +1499,26 @@ def fit_zeta_chunked_to_h5(
     # Synchronize before writing
     jax.experimental.multihost_utils.sync_global_devices("zeta_h5_create")
     
-    # ========== STEP 5: Loop over z-chunks ==========
+    # ========== STEP 5: Pre-load G-space for all band chunks (ONCE) ==========
+    # This caches the expensive HDF5 read + scatter so we don't repeat it
+    # for each z-chunk. Memory cost: ~0.5-1 GB (fits within budget).
+    # For large systems (many k-points), caching may be disabled to save memory.
+    kgrid_arr = np.array(meta.kgrid)
+    kvecs_frac = sym.kvecs_asints / kgrid_arr[None, :]
+    
+    if use_gspace_cache:
+        with timing.section("zeta_fit.cache_gspace"):
+            print("\nCaching G-space wavefunctions for z-chunk loop...")
+            cached_gspace = load_gspace_for_bands(
+                wfn, sym, meta, mesh_xy, band_range, bispinor, band_chunk_size
+            )
+            print(f"  Cached {len(cached_gspace)} band chunks (sharded across devices)")
+    else:
+        cached_gspace = None
+        print("\nG-space caching DISABLED (too large for memory budget)")
+        print("  Will reload from HDF5 each z-chunk (slower)")
+    
+    # ========== STEP 6: Loop over z-chunks ==========
     # Track timing for summary (manual perf_counter for detailed breakdown)
     t_load_total = 0.0
     t_pair_total = 0.0
@@ -1515,16 +1537,25 @@ def fit_zeta_chunked_to_h5(
             r_start = chunk_idx * n_zchunk
             r_end = r_start + actual_n_zchunk
             
-            print(f"\nChunk {chunk_idx+1}/{num_z_chunks}: z=[{z_start}:{z_end}], r=[{r_start}:{r_end}]")
+            print(f"Chunk {chunk_idx+1}/{num_z_chunks}: r=[{r_start}:{r_end}]", end="\r")
             
-            # 5a. Get psi_nk,a(r_chunk) - need to FFT again with this z-slice
+            # 6a. Get psi_nk,a(r_chunk)
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.load"):
-                psi_zchunk_Y = get_psi_zchunk(
-                    wfn, sym, meta, mesh_xy, band_range, 
-                    z_start, z_end, bispinor,
-                    band_chunk_size=band_chunk_size
-                )
+                if cached_gspace is not None:
+                    # Fast path: FFT only (G-space is cached)
+                    psi_zchunk_Y = get_psi_zchunk_from_cached(
+                        cached_gspace, meta, mesh_xy, band_range,
+                        z_start, z_end, kvecs_frac,
+                        band_chunk_size=band_chunk_size
+                    )
+                else:
+                    # Slow path: reload from HDF5 each chunk
+                    psi_zchunk_Y = get_psi_zchunk(
+                        wfn, sym, meta, mesh_xy, band_range,
+                        z_start, z_end, bispinor,
+                        band_chunk_size=band_chunk_size
+                    )
                 psi_zchunk_Y.block_until_ready()
             t_load_total += time.perf_counter() - t0
             
@@ -1587,14 +1618,18 @@ def fit_zeta_chunked_to_h5(
                 jax.experimental.multihost_utils.sync_global_devices(f"zeta_chunk_{chunk_idx}")
             t_write_total += time.perf_counter() - t0
             
-            print(f"  Written to {output_file}[:, :, :, :, {r_start}:{r_end}]")
     
     t_chunks_total = time.perf_counter() - t_chunk_start
     
+    # Free cached G-space now that chunk loop is done
+    if cached_gspace is not None:
+        del cached_gspace
+    
     # Print summary
-    print(f"\n{'='*60}")
+    print()  # Clear the \r line
+    print(f"\nWritten to {output_file}")
+    print(f"{'='*60}")
     print(f"Zeta fitting complete!")
-    print(f"Output: {output_file}")
     print(f"  Shape: ({nqx}, {nqy}, {nqz}, {n_rmu}, {n_rtot})")
     print(f"{'='*60}")
     print(f"\nTiming Summary ({num_z_chunks} z-chunks):")
@@ -1610,12 +1645,112 @@ def fit_zeta_chunked_to_h5(
     print(f"  {'Per r-point':<20} {'':<10} {t_chunks_total/n_rtot*1e6:>10.1f}μs")
 
 
+def load_gspace_for_bands(
+    wfn, sym, meta, mesh_xy, band_range, bispinor,
+    band_chunk_size: int = 16,
+) -> list[tuple[jax.Array, tuple[int, int]]]:
+    """
+    Load G-space wavefunctions for all band chunks ONCE.
+    
+    This caches the expensive HDF5 read + scatter operation so it can be
+    reused across multiple z-chunk iterations. Memory cost is ~0.5-1 GB
+    for typical systems (nk * nb * ns * fft_grid * 16 bytes).
+    
+    Args:
+        wfn: WFNReader
+        sym: SymMaps
+        meta: Meta object
+        mesh_xy: Device mesh
+        band_range: (b_start, b_end) - total bands needed
+        bispinor: Whether to use bispinor
+        band_chunk_size: Bands to process at once
+    
+    Returns:
+        List of (global_psi_Gtot, bc_range) for each band chunk
+    """
+    b_start, b_end = band_range
+    nb_total = b_end - b_start
+    num_band_chunks = (nb_total + band_chunk_size - 1) // band_chunk_size
+    
+    cached_gspace = []
+    for bc_idx in range(num_band_chunks):
+        bc_start = b_start + bc_idx * band_chunk_size
+        bc_end = min(bc_start + band_chunk_size, b_end)
+        bc_range = (bc_start, bc_end)
+        
+        # Load G-space for this band chunk
+        global_psi_Gtot, _ = read_Gvecs_to_devices(wfn, sym, bc_range, meta, bispinor, mesh_xy)
+        cached_gspace.append((global_psi_Gtot, bc_range))
+    
+    return cached_gspace
+
+
+def get_psi_zchunk_from_cached(
+    cached_gspace: list[tuple[jax.Array, tuple[int, int]]],
+    meta, mesh_xy, band_range, z_start, z_end, kvecs_frac,
+    band_chunk_size: int = 16,
+) -> jax.Array:
+    """
+    Extract z-chunk from pre-loaded G-space (FFT only, no HDF5 read).
+    
+    This is the fast path that reuses cached G-space across z-chunk iterations.
+    
+    Args:
+        cached_gspace: Pre-loaded G-space from load_gspace_for_bands()
+        meta: Meta object
+        mesh_xy: Device mesh
+        band_range: (b_start, b_end) - total bands needed
+        z_start, z_end: Z-slice range
+        kvecs_frac: (nk, 3) k-vectors in fractional coordinates
+        band_chunk_size: Bands to FFT at once
+    
+    Returns:
+        psi_zchunk_Y: (nk, nb, ns, n_zchunk) with P(None, None, None, 'y')
+    """
+    nx, ny, nz = meta.fft_grid
+    n_zchunk = nx * ny * (z_end - z_start)
+    b_start, b_end = band_range
+    nb_total = b_end - b_start
+    nk_tot = meta.nk_tot
+    nspinor = meta.nspinor
+    
+    # Output sharding
+    out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+    
+    # Allocate output array for all bands (z-chunk is small enough)
+    psi_zchunk_all = jnp.zeros((nk_tot, nb_total, nspinor, n_zchunk), dtype=jnp.complex128)
+    psi_zchunk_all = jax.lax.with_sharding_constraint(psi_zchunk_all, out_Y)
+    
+    # Process each cached band chunk - FFT only (no HDF5 read)
+    for bc_idx, (global_psi_Gtot, bc_range) in enumerate(cached_gspace):
+        nb_chunk = bc_range[1] - bc_range[0]
+        
+        # FFT and extract z-slice for this chunk
+        psi_zchunk_chunk = get_sharded_wfns_zchunk_slice(
+            global_psi_Gtot, meta, z_start, z_end, kvecs_frac, mesh_xy, bc_range
+        )
+        
+        # Place into output array at correct band indices
+        local_bc_start = bc_idx * band_chunk_size
+        local_bc_end = local_bc_start + nb_chunk
+        psi_zchunk_all = psi_zchunk_all.at[:, local_bc_start:local_bc_end, :, :].set(psi_zchunk_chunk)
+        
+        # Free FFT output only (keep G-space cached)
+        del psi_zchunk_chunk
+    
+    return psi_zchunk_all
+
+
 def get_psi_zchunk(
     wfn, sym, meta, mesh_xy, band_range, z_start, z_end, bispinor,
     band_chunk_size: int = 16,
 ) -> jax.Array:
     """
     Load and FFT wavefunctions for a specific z-chunk.
+    
+    NOTE: This function reloads G-space from HDF5 each call. For multiple
+    z-chunks, use load_gspace_for_bands() + get_psi_zchunk_from_cached()
+    to avoid redundant HDF5 reads.
     
     Uses band chunking to limit memory during FFT step:
     - Loop over band chunks
@@ -1638,50 +1773,24 @@ def get_psi_zchunk(
     Returns:
         psi_zchunk_Y: (nk, nb, ns, n_zchunk) with P(None, None, None, 'y')
     """
-    nx, ny, nz = meta.fft_grid
-    n_zchunk = nx * ny * (z_end - z_start)
-    b_start, b_end = band_range
-    nb_total = b_end - b_start
-    nk_tot = meta.nk_tot
-    nspinor = meta.nspinor
-    
     # Get k-vectors from sym (as fractions of kgrid)
     kgrid = np.array(meta.kgrid)
     kvecs_frac = sym.kvecs_asints / kgrid[None, :]  # (nk, 3) in fractional coords
     
-    # Output sharding
-    out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+    # Load G-space and extract z-chunk (non-cached path)
+    cached_gspace = load_gspace_for_bands(
+        wfn, sym, meta, mesh_xy, band_range, bispinor, band_chunk_size
+    )
     
-    # Allocate output array for all bands (z-chunk is small enough)
-    psi_zchunk_all = jnp.zeros((nk_tot, nb_total, nspinor, n_zchunk), dtype=jnp.complex128)
-    psi_zchunk_all = jax.lax.with_sharding_constraint(psi_zchunk_all, out_Y)
+    result = get_psi_zchunk_from_cached(
+        cached_gspace, meta, mesh_xy, band_range, z_start, z_end, kvecs_frac,
+        band_chunk_size
+    )
     
-    # Process bands in chunks to limit FFT memory
-    num_band_chunks = (nb_total + band_chunk_size - 1) // band_chunk_size
+    # Free cached G-space
+    del cached_gspace
     
-    for bc_idx in range(num_band_chunks):
-        bc_start = b_start + bc_idx * band_chunk_size
-        bc_end = min(bc_start + band_chunk_size, b_end)
-        bc_range = (bc_start, bc_end)
-        nb_chunk = bc_end - bc_start
-        
-        # Load G-space for this band chunk only
-        global_psi_Gtot, _ = read_Gvecs_to_devices(wfn, sym, bc_range, meta, bispinor, mesh_xy)
-        
-        # FFT and extract z-slice for this chunk
-        psi_zchunk_chunk = get_sharded_wfns_zchunk_slice(
-            global_psi_Gtot, meta, z_start, z_end, kvecs_frac, mesh_xy, bc_range
-        )
-        
-        # Place into output array at correct band indices
-        local_bc_start = bc_idx * band_chunk_size
-        local_bc_end = local_bc_start + nb_chunk
-        psi_zchunk_all = psi_zchunk_all.at[:, local_bc_start:local_bc_end, :, :].set(psi_zchunk_chunk)
-        
-        # Free memory
-        del global_psi_Gtot, psi_zchunk_chunk
-    
-    return psi_zchunk_all
+    return result
 
 
 # Cache for zchunk extraction function

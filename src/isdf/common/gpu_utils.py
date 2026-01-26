@@ -124,27 +124,28 @@ def get_device_memory_gb(n_devices: int = 1) -> float:
         backend = 'cpu'
     
     if backend in ('gpu', 'cuda'):
-        # For GPU, try nvidia-smi first (works even with XLA device count override)
-        mem = get_gpu_memory_nvidia_smi()
-        if mem is not None:
-            # GPU memory is significantly reduced by:
-            # - CUDA driver overhead (~500 MB)
-            # - XLA runtime and JIT compilation buffers
-            # - Memory fragmentation during computation
-            # Empirically, ~50% of total is safely usable
-            return mem * 0.50
-        
-        # Fallback to JAX device info if available
+        # For GPU, prefer JAX's bytes_limit which reflects actual usable memory
+        # (nvidia-smi reports total, but XLA/CUDA overhead reduces usable amount)
         try:
             import jax
+            import jax.numpy as jnp
+            # Force JAX to initialize to get accurate memory stats
+            _ = jnp.zeros(1).block_until_ready()
             devices = jax.devices()
             if devices and hasattr(devices[0], 'memory_stats'):
-                # Some backends expose memory stats
                 stats = devices[0].memory_stats()
-                if 'bytes_limit' in stats:
-                    return stats['bytes_limit'] / (1024**3) * 0.50
+                if 'bytes_limit' in stats and stats['bytes_limit'] > 0:
+                    # bytes_limit is JAX's actual allocatable memory
+                    # Apply 80% factor for runtime overhead (JIT buffers, fragmentation)
+                    return stats['bytes_limit'] / 1e9 * 0.80
         except Exception:
             pass
+        
+        # Fallback to nvidia-smi if JAX stats not available
+        mem = get_gpu_memory_nvidia_smi()
+        if mem is not None:
+            # nvidia-smi reports total memory, apply 50% factor
+            return mem * 0.50
         
         # Default GPU memory if detection fails
         return 4.0
@@ -183,9 +184,30 @@ def get_device_memory_info() -> dict:
     total_gb = 8.0
     
     if backend in ('gpu', 'cuda'):
+        # Prefer JAX bytes_limit (actual usable memory)
+        try:
+            import jax
+            import jax.numpy as jnp
+            _ = jnp.zeros(1).block_until_ready()
+            devices = jax.devices()
+            if devices and hasattr(devices[0], 'memory_stats'):
+                stats = devices[0].memory_stats()
+                if 'bytes_limit' in stats and stats['bytes_limit'] > 0:
+                    total_gb = stats['bytes_limit'] / 1e9 * 0.80
+                    source = f'JAX bytes_limit (80% of {stats["bytes_limit"]/1e9:.1f} GB)'
+                    return {
+                        'backend': backend,
+                        'total_gb': total_gb,
+                        'source': source,
+                        'n_devices': len(devices),
+                    }
+        except Exception:
+            pass
+        
+        # Fallback to nvidia-smi
         mem = get_gpu_memory_nvidia_smi()
         if mem is not None:
-            total_gb = mem * 0.50  # 50% factor for GPU (driver + XLA + fragmentation)
+            total_gb = mem * 0.50
             source = 'nvidia-smi (50% usable)'
     else:
         # Try psutil
