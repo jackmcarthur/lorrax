@@ -6,16 +6,18 @@ This module implements a high-performance BSE solver using ISDF for low-rank app
 
 ### BSE Hamiltonian (Tamm-Dancoff Approximation)
 
-The BSE Hamiltonian in TDA is:
+The BSE Hamiltonian in TDA for **spinors** is:
 
 ```
-H_BSE = D + 2V - W
+H_BSE = D + V - W
 ```
 
 where:
 - **D**: Diagonal term from QP energy differences: `D_{cvk} = ε_c(k) - ε_v(k)`
-- **V**: Direct (Coulomb/Hartree) term at q=0 (repulsive)
+- **V**: Direct (bare Coulomb) term at q=0 (repulsive)
 - **W**: Screened exchange term with k→k' momentum transfer (attractive)
+
+**Note on spin factors**: For spin-restricted singlet excitons the textbook form is `D + 2V - W`, where the factor of 2 comes from spin summation. For spinors (spin-orbit coupled wavefunctions), we use `D + V - W` because the Coulomb interaction is spin-independent and couples to the charge density at each vertex, which is already spin-traced in the pair amplitude `M = Σ_σ ψ*_{c,σ} ψ_{v,σ}`.
 
 ### ISDF Representation
 
@@ -27,7 +29,7 @@ The pair density is expanded in ISDF interpolation vectors:
 
 where:
 - `ζ_μ(r)`: ISDF interpolation vectors at centroids
-- `M_cv(μ,k) = Σ_s ψ*_{c,s}(μ,k) ψ_{v,s}(μ,k)`: Spin-traced pair amplitude
+- `M_cv(μ,k) = Σ_s ψ*_{c,s}(μ,k) ψ_{v,s}(μ,k)`: **Spin-traced** pair amplitude (scalar)
 
 This reduces the 4-index electron-hole interaction to 2-index matrices `V_{μν}` and `W_{μν}(q)`.
 
@@ -35,24 +37,43 @@ This reduces the 4-index electron-hole interaction to 2-index matrices `V_{μν}
 
 For trial vector `X(c,v,k)`, the matvec `HX` is computed as:
 
-1. **Encode**: Project X to μ-space via pair amplitude M
+1. **Encode**:
+   - **V term**: project `X(c,v,k)` to μ-space via the **spin-traced** cv pair amplitude `M_cv`
+   - **W term**: build a **2×2 spin matrix** at each ISDF point pair (μ,ν) as in Henneke (2020) eq (4-6)
    ```
    S(ν,k) = Σ_{c',v'} M(k,c',v',ν) X(c',v',k)
    ```
 
 2. **Apply interaction**:
    - **V term** (q=0 only): `U_V(μ,k) = Σ_ν V_{μν} S(ν,k)`
-   - **W term** (FFT convolution):
+   - **W term** (FFT convolution, Henneke eq (4-6)):
+
+     Build the spin-matrix intermediate
+
+     \[
+     T_{ts}(μ,ν,k)=\sum_{c',v'} ψ_{c',t}(μ,k)\,ψ^{*}_{v',s}(ν,k)\,X(c',v',k)
+     \]
+
+     and apply the convolution in k for each \((μ,ν,t,s)\):
+
      ```
-     S(ν,R) = IFFT_k[S(ν,k)]           # k → R
-     U(μ,R) = Σ_ν W(μ,ν,R) S(ν,R)      # pointwise multiply
-     U(μ,k) = FFT_R[U(μ,R)]            # R → k
+     T(μ,ν,t,s,R) = IFFT_k[T(μ,ν,t,s,k)]     # k → R
+     U(μ,ν,t,s,R) = W(μ,ν,R) * T(μ,ν,t,s,R)  # scalar W multiplies each spin component
+     U(μ,ν,t,s,k) = FFT_R[U(μ,ν,t,s,R)]      # R → k
      ```
 
-3. **Decode**: Project back to (c,v) space
-   ```
-   [HX](c,v,k) = D_{cvk} X + 2·Σ_μ M*(c,v,k,μ) U_V(μ,k) - Σ_μ M*(c,v,k,μ) U_W(μ,k)
-   ```
+     The BSE definition carries an overall **`1/Nk`** prefactor on the W term. We use
+     unitary FFTs (`norm='ortho'`), so the FFT-based convolution carries a natural
+     **`1/sqrt(Nk)`** scaling; we apply one additional **`1/sqrt(Nk)`** factor to recover
+     the physical **`1/Nk`** overall normalization.
+
+3. **Decode**:
+   - **V**: project back to (c,v) using `M*` as usual
+   - **W**: contract the spin matrix with the external (c,v) spinors:
+
+     \[
+     [WX](c,v,k)=\sum_{μ,ν,t,s} ψ^*_{c,t}(μ,k)\,U_{ts}(μ,ν,k)\,ψ_{v,s}(ν,k)
+     \]
 
 ### Eigensolver: Lanczos Algorithm
 

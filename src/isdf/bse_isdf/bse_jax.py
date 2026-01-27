@@ -161,7 +161,7 @@ def apply_bse_hamiltonian(
     W_q: jax.Array,
     V_q0: jax.Array,
 ) -> jax.Array:
-    """Apply BSE Hamiltonian H = D + 2V - W to trial vectors.
+    """Apply BSE Hamiltonian to trial vectors.
     
     This is the main computational kernel for iterative BSE eigensolvers.
     Handles batched trial vectors with X sharded on conduction bands.
@@ -189,7 +189,14 @@ def apply_bse_hamiltonian(
     V_term = apply_V(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, V_q0, nk)
     W_term = apply_W(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_q, nkx, nky, nkz)
     
-    return D_term + 2.0 * V_term - W_term
+    # Spinor default: H = D + V - W.
+    #
+    # IMPORTANT: V and W are applied with different internal contractions for spinors.
+    # - V (direct) uses the usual spin-traced cv pair density at each vertex.
+    # - W (exchange-like screened direct kernel in Henneke eq (2-16)/(4-6)) is applied via
+    #   an intermediate 2x2 spin matrix built from a conduction spinor at μ and a valence
+    #   spinor at ν, then contracted with the external (c,v) spinors after applying W.
+    return D_term + V_term - W_term
 
 
 def apply_D(
@@ -259,6 +266,10 @@ def apply_V(
     
     # Complete c-sum across X-axis
     S = lax.psum(S_partial, axis_name='x')  # (b, ν_Y, k)
+
+    # Split the overall 1/Nk BZ prefactor symmetrically as 1/sqrt(Nk) on encode and decode.
+    sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=jnp.float64))
+    S = S / sqrt_nk
     
     # 3. Apply V(μ,ν) at q=0
     # U_partial(b, μ_X, k) = Σ_{ν ∈ local} V(μ_X, ν_Y) S(b, ν_Y, k)
@@ -277,9 +288,9 @@ def apply_V(
     # reduce_scatter: sum over μ (X-axis) and scatter c
     # This completes the μ-sum while distributing c across devices
     VX = lax.psum_scatter(VX_partial, axis_name='x', scatter_dimension=1, tiled=True)
-    
-    # 1/Nk factor for BZ averaging
-    return VX / nk
+
+    # Second 1/sqrt(Nk) factor (decode side)
+    return VX / sqrt_nk
 
 
 def apply_W(
@@ -295,14 +306,17 @@ def apply_W(
 ) -> jax.Array:
     """Apply screened exchange term with momentum transfer.
     
-    [WX](b,c,v,k) = (1/Nk) Σ_{c'v'k'μν} M*_cv(k,μ) W(μ,ν,k-k') M_{c'v'}(k',ν) X(b,c',v',k')
+    This implements the contraction pattern in Henneke (2020) eq (4-6), i.e.
+    the kernel connects a (c,c') bilinear at r=μ and a (v',v) bilinear at r'=ν.
+    For spinors, the efficient reordering naturally produces a 2x2 spin matrix:
+        T_{t s}(μ,ν,k') = Σ_{c',v'} ψ_{c',t}(μ,k') * ψ*_{v',s}(ν,k') * X(c',v',k')
+    (t,s are spinor component indices associated with μ and ν, respectively).
+    W is spin-independent (scalar), so it multiplies each spin-matrix element.
+    The final decode contracts this spin matrix with the external (c,v) spinors.
     
-    Uses FFT convolution following load_wfns.py pattern with norm='forward':
-    - IFFT(S_k) gives S_R (unscaled sum)
-    - Multiply by W_R in R-space
-    - FFT(U_R) gives U_q (divides by Nk)
-    
-    This gives the correct 1/Nk normalization from the convolution.
+    Uses FFT convolution with norm='ortho' (unitary FFT).
+    With unitary FFTs, the convolution theorem introduces a 1/sqrt(Nk) scaling,
+    so we apply an extra 1/sqrt(Nk) prefactor to recover the physical 1/Nk.
     
     Communication: psum_X (encode) + psum_Y (W contract) + reduce_scatter_X (decode)
     
@@ -318,54 +332,47 @@ def apply_W(
     """
     nk = nkx * nky * nkz
     nb_trial, nc_local, nv, _ = X.shape
+    sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=jnp.float64))
     
-    # 1. Compute pair amplitudes M at ν-points (Y-sharded)
-    # M_Y: (nk, nc, nv, n_rmu/Py)
-    M_Y = compute_pair_amplitude(psi_c_Y, psi_v_Y)
-    
-    # 2. Encode: project X onto ν basis at each k'
-    # S_partial(b, ν_Y, k') = Σ_{c' ∈ local, v'} M(k', c', v', ν_Y) * X(b, c'_X, v', k')
-    S_partial = jnp.einsum('kcvN,bcvk->bNk', M_Y, X)
-    
-    # Complete c-sum across X-axis
-    S = lax.psum(S_partial, axis_name='x')  # (b, ν_Y, nk)
-    
-    # 3. Reshape for FFT: (b, ν_Y, nkx, nky, nkz)
-    n_rmu_local_Y = S.shape[1]
-    S_k = S.reshape(nb_trial, n_rmu_local_Y, nkx, nky, nkz)
-    
-    # 4. IFFT k → R with norm='forward' (unscaled sum, matching load_wfns.py)
-    S_R = jnp.fft.ifftn(S_k, axes=(2, 3, 4), norm='forward')
-    
-    # 5. Transform W_q to W_R (same normalization)
-    W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm='forward')
-    
-    # 6. Apply W_R(μ_X, ν_Y, R): elementwise multiply then contract ν
-    # U_R_partial(b, μ_X, R) = Σ_{ν ∈ local} W_R(μ_X, ν_Y, R) * S_R(b, ν_Y, R)
-    U_R_partial = jnp.einsum('MNxyz,bNxyz->bMxyz', W_R, S_R)
-    
-    # Complete ν-sum across Y-axis
-    U_R = lax.psum(U_R_partial, axis_name='y')  # (b, μ_X, nkx, nky, nkz)
-    
-    # 7. FFT R → q with norm='forward' (divides by Nk, giving 1/Nk factor)
-    U_q = jnp.fft.fftn(U_R, axes=(2, 3, 4), norm='forward')
-    
-    # 8. Reshape back: (b, μ_X, nk)
-    n_rmu_local_X = U_q.shape[1]
-    U = U_q.reshape(nb_trial, n_rmu_local_X, nk)
-    
-    # 9. Decode: project back to (c,v) space
-    # M_X: (nk, nc, nv, n_rmu/Px)
-    M_X = compute_pair_amplitude(psi_c_X, psi_v_X)
-    
-    # [WX]_full(b, c, v, k) = Σ_{μ ∈ local} conj(M_X)(k, c, v, μ_X) * U(b, μ_X, k)
-    WX_partial = jnp.einsum('kcvM,bMk->bcvk', jnp.conj(M_X), U)
-    
-    # reduce_scatter: sum over μ (X-axis) and scatter c
-    WX = lax.psum_scatter(WX_partial, axis_name='x', scatter_dimension=1, tiled=True)
-    
-    # Note: 1/Nk normalization is already included via FFT norm='forward'
-    return WX
+    nspinor = psi_c_X.shape[2]
+    n_rmu_local_Y = psi_v_Y.shape[-1]
+    n_rmu_local_X = psi_c_X.shape[-1]
+
+    # ----- Encode (k-space): build spin-matrix T(b, μ_X, ν_Y, t, s, k) -----
+    # R_partial(b, c_local, k, s, ν_Y) = Σ_v conj(ψ_v_Y(k,v,s,ν_Y)) * X(b,c_local,v,k)
+    R_partial = jnp.einsum('kv sN,bcvk->bcksN', jnp.conj(psi_v_Y), X)
+
+    # T_partial(b, μ_X, ν_Y, t, s, k) = Σ_{c in local shard} ψ_c_X(k,c,t,μ_X) * R_partial(b,c,k,s,ν_Y)
+    T_partial = jnp.einsum('kctM,bcksN->bMNtsk', psi_c_X, R_partial)
+
+    # Complete c-sum across X-axis (c has been eliminated, so this is safe)
+    T = lax.psum(T_partial, axis_name='x')  # (b, μ_X, ν_Y, t, s, nk)
+
+    # ----- Convolution in k using FFT (elementwise in μ,ν,t,s) -----
+    T_k = T.reshape(nb_trial, n_rmu_local_X, n_rmu_local_Y, nspinor, nspinor, nkx, nky, nkz)
+    T_R = jnp.fft.ifftn(T_k, axes=(5, 6, 7), norm='ortho')
+
+    W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm='ortho')  # (μ_X, ν_Y, nkx, nky, nkz)
+    U_R = W_R[None, :, :, None, None, :, :, :] * T_R
+
+    U_q = jnp.fft.fftn(U_R, axes=(5, 6, 7), norm='ortho')
+    U = U_q.reshape(nb_trial, n_rmu_local_X, n_rmu_local_Y, nspinor, nspinor, nk)
+
+    # ----- Decode: contract spin matrix with external (c,v) spinors -----
+    # A_partial(b, c, ν_Y, s, k) = Σ_{μ_X,t} conj(ψ_c_X(k,c,t,μ_X)) * U(b,μ_X,ν_Y,t,s,k)
+    A_partial = jnp.einsum('kctM,bMNtsk->bcNsk', jnp.conj(psi_c_X), U)
+
+    # WX_partial(b, c, v, k) = Σ_{ν_Y,s} ψ_v_Y(k,v,s,ν_Y) * A_partial(b,c,ν_Y,s,k)
+    WX_partial = jnp.einsum('kvsN,bcNsk->bcvk', psi_v_Y, A_partial)
+
+    # Complete ν sum across Y-axis (ν has been eliminated by the contraction above)
+    WX_nu = lax.psum(WX_partial, axis_name='y')
+
+    # Sum over μ contributions across X-axis and scatter c back onto X sharding
+    WX = lax.psum_scatter(WX_nu, axis_name='x', scatter_dimension=1, tiled=True)
+
+    # Apply the remaining 1/sqrt(Nk) to recover the physical 1/Nk prefactor.
+    return WX / sqrt_nk
 
 
 # ============== Single-device version for testing ==============
@@ -419,36 +426,38 @@ def apply_bse_hamiltonian_single_device(
     # ===== V term: q=0 only =====
     # S(b, ν, k) = Σ_{c'v'} M(k, c', v', ν) X(b, c', v', k)
     S_V = jnp.einsum('kcvN,bcvk->bNk', M, X)
-    
-    # U(b, μ, k) = Σ_ν V(μ,ν) S(b, ν, k)  
+
+    # Split the overall 1/Nk BZ prefactor symmetrically as 1/sqrt(Nk) on encode and decode.
+    sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=jnp.float64))
+    S_V = S_V / sqrt_nk
     U_V = jnp.einsum('MN,bNk->bMk', V_q0, S_V)
+    V_term = jnp.einsum('kcvM,bMk->bcvk', jnp.conj(M), U_V) / sqrt_nk
     
-    # VX(b, c, v, k) = Σ_μ M*(k, c, v, μ) U(b, μ, k)
-    # 1/Nk for BZ averaging
-    V_term = jnp.einsum('kcvM,bMk->bcvk', jnp.conj(M), U_V) / nk
+    # ===== W term: FFT convolution (Henneke eq (4-6), spin-matrix form) =====
+    # Build T(b, μ, ν, t, s, k) = Σ_{c',v'} ψ_c(k,c',t,μ) * ψ*_v(k,v',s,ν) * X(b,c',v',k)
+    n_rmu = psi_c.shape[-1]
+    nspinor = psi_c.shape[2]
+
+    # R(b, c, k, s, ν) = Σ_v conj(ψ_v(k,v,s,ν)) * X(b,c,v,k)
+    R = jnp.einsum('kvsN,bcvk->bcksN', jnp.conj(psi_v), X)
+    # T(b, μ, ν, t, s, k) = Σ_c ψ_c(k,c,t,μ) * R(b,c,k,s,ν)
+    T = jnp.einsum('kctM,bcksN->bMNtsk', psi_c, R)
+
+    # Convolution in k for each (μ,ν,t,s) using unitary FFTs
+    T_k = T.reshape(nb_trial, n_rmu, n_rmu, nspinor, nspinor, nkx, nky, nkz)
+    T_R = jnp.fft.ifftn(T_k, axes=(5, 6, 7), norm='ortho')
+    W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm='ortho')  # (μ,ν,nkx,nky,nkz)
+    U_R = W_R[None, :, :, None, None, :, :, :] * T_R
+    U_q = jnp.fft.fftn(U_R, axes=(5, 6, 7), norm='ortho')
+    U = U_q.reshape(nb_trial, n_rmu, n_rmu, nspinor, nspinor, nk)
+
+    # Decode: WX(b,c,v,k) = Σ_{μ,ν,t,s} ψ*_c(k,c,t,μ) * U(b,μ,ν,t,s,k) * ψ_v(k,v,s,ν)
+    A = jnp.einsum('kctM,bMNtsk->bcNsk', jnp.conj(psi_c), U)
+    W_term = jnp.einsum('kvsN,bcNsk->bcvk', psi_v, A) / sqrt_nk
     
-    # ===== W term: FFT convolution with norm='forward' =====
-    # Following load_wfns.py pattern for correct 1/Nk normalization
-    n_rmu = M.shape[-1]
-    S_k = S_V.reshape(nb_trial, n_rmu, nkx, nky, nkz)
-    
-    # IFFT k → R (unscaled with 'forward')
-    S_R = jnp.fft.ifftn(S_k, axes=(2, 3, 4), norm='forward')
-    
-    # Transform W_q to W_R (same normalization)
-    W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm='forward')
-    
-    # Multiply by W_R in R-space (convolution becomes multiplication)
-    U_R = jnp.einsum('MNxyz,bNxyz->bMxyz', W_R, S_R)
-    
-    # FFT R → q (divides by Nk with 'forward', giving 1/Nk factor automatically)
-    U_q = jnp.fft.fftn(U_R, axes=(2, 3, 4), norm='forward')
-    U_W = U_q.reshape(nb_trial, n_rmu, nk)
-    
-    # Decode - no additional 1/Nk needed (already in FFT)
-    W_term = jnp.einsum('kcvM,bMk->bcvk', jnp.conj(M), U_W)
-    
-    return D_term + 2.0 * V_term - W_term
+    # For spinors: H = D + V - W (no factor of 2 on V)
+    # V and W couple to charge density at each vertex, which is spin-traced: ρ = Σ_σ ψ*_σ ψ_σ
+    return D_term + V_term - W_term
 
 
 @jax.jit
@@ -910,7 +919,8 @@ if __name__ == "__main__":
     )
     print(f"Input shape: {X.shape}, Output shape: {HX.shape}")
     E_expect = jnp.vdot(X.flatten(), HX.flatten()).real
-    print(f"Expectation value: {E_expect:.6f} Ha = {E_expect * 27.2114:.4f} eV")
+    ryd2ev = 13.6056980659
+    print(f"Expectation value: {E_expect:.6f} Ry = {E_expect * ryd2ev:.4f} eV")
     
     # Test Lanczos solver
     print("\nRunning Lanczos solver...")
@@ -918,6 +928,7 @@ if __name__ == "__main__":
         psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz,
         n_eig=5, max_iter=30
     )
-    print(f"Lowest 5 eigenvalues (Ha): {eigenvalues}")
-    print(f"Lowest 5 eigenvalues (eV): {eigenvalues * 27.2114}")
+    ryd2ev = 13.6056980659
+    print(f"Lowest 5 eigenvalues (Ry): {eigenvalues}")
+    print(f"Lowest 5 eigenvalues (eV): {eigenvalues * ryd2ev}")
 

@@ -50,7 +50,7 @@ def load_bse_data_from_restart(
         restart_file: Path to taggedarrays.h5
         n_val: Number of valence bands (highest occupied)
         n_cond: Number of conduction bands (lowest unoccupied)
-        fermi_energy: Fermi energy in Ha. Default 0.0 (DFT referenced to VBM).
+        fermi_energy: Fermi energy in Ry. Default 0.0 (DFT referenced to VBM).
         
     Returns:
         Dictionary with all BSE inputs
@@ -97,7 +97,8 @@ def load_bse_data_from_restart(
     cond_mask_r = mean_enk_r > fermi_energy
     n_cond_available = int(jnp.sum(cond_mask_r))
     
-    print(f"  Fermi energy: {fermi_energy:.4f} Ha = {fermi_energy * 27.2114:.3f} eV")
+    ryd2ev = 13.6056980659
+    print(f"  Fermi energy: {fermi_energy:.4f} Ry = {fermi_energy * ryd2ev:.3f} eV")
     print(f"  Available: {n_val_available} valence, {n_cond_available} conduction bands")
     
     # Limit to requested number
@@ -126,9 +127,10 @@ def load_bse_data_from_restart(
     
     print(f"  Selected: {n_val} valence, {n_cond} conduction bands")
     print(f"  psi_v shape: {psi_v.shape}, psi_c shape: {psi_c.shape}")
-    print(f"  Valence energy range: [{float(eps_v.min()):.4f}, {float(eps_v.max()):.4f}] Ha")
-    print(f"  Conduction energy range: [{float(eps_c.min()):.4f}, {float(eps_c.max()):.4f}] Ha")
-    print(f"  Gap: {float(eps_c.min() - eps_v.max()):.4f} Ha = {float(eps_c.min() - eps_v.max()) * 27.2114:.3f} eV")
+    print(f"  Valence energy range: [{float(eps_v.min()):.4f}, {float(eps_v.max()):.4f}] Ry")
+    print(f"  Conduction energy range: [{float(eps_c.min()):.4f}, {float(eps_c.max()):.4f}] Ry")
+    gap_ry = float(eps_c.min() - eps_v.max())
+    print(f"  Gap: {gap_ry:.4f} Ry = {gap_ry * ryd2ev:.3f} eV")
     
     # Extract V at q=0 for direct term: (n_rmu, n_rmu)
     V_q0 = V_qmunu[0, 0, 0, 0, 0, 0, :, :]
@@ -199,7 +201,8 @@ def test_matvec(data, n_warmup=2, n_bench=10):
     
     # Compute expectation value <X|H|X>
     E = jnp.vdot(X.flatten(), HX.flatten()).real
-    print(f"Expectation value <X|H|X>: {E:.6f} Ha = {E * 27.2114:.4f} eV")
+    ryd2ev = 13.6056980659
+    print(f"Expectation value <X|H|X>: {E:.6f} Ry = {E * ryd2ev:.4f} eV")
     
     return HX
 
@@ -251,8 +254,9 @@ def test_lanczos(data, n_eig=5, max_iter=50, use_jit_lanczos=True):
     
     print(f"\nLowest {n_eig} exciton energies:")
     for i, E in enumerate(eigenvalues):
-        E_eV = float(E) * 27.2114  # Ha to eV
-        print(f"  {i+1}: {float(E):.6f} Ha = {E_eV:.4f} eV")
+        ryd2ev = 13.6056980659
+        E_eV = float(E) * ryd2ev  # Ry to eV
+        print(f"  {i+1}: {float(E):.6f} Ry = {E_eV:.4f} eV")
     
     print(f"\nEigenvector shapes: {eigenvectors.shape}")
     

@@ -35,7 +35,7 @@ def write_eigenvectors_h5(
     
     Args:
         output_file: Path to output HDF5 file
-        eigenvalues: (n_eig,) exciton energies in Ha
+        eigenvalues: (n_eig,) exciton energies in Ry
         eigenvectors: (n_eig, nc, nv, nk) or (n_eig, ns, nc, nv, nk) exciton coefficients
                       Complex array with A_cvk amplitudes
         kpts: (nk, 3) k-point coordinates in crystal units
@@ -148,8 +148,9 @@ def write_eigenvectors_h5(
     print(f"  Dimensions: ns={ns}, nc={nc}, nv={nv}, nk={nk}, nQ={nQ}")
     print(f"  Hamiltonian size: {bse_hamiltonian_size}")
     print(f"  Flavor: {'complex' if flavor == 2 else 'real'}")
-    print(f"  Eigenvalue range: [{eigenvalues.min():.6f}, {eigenvalues.max():.6f}] Ha")
-    print(f"                  = [{eigenvalues.min() * 27.2114:.4f}, {eigenvalues.max() * 27.2114:.4f}] eV")
+    ryd2ev = 13.6056980659
+    print(f"  Eigenvalue range: [{eigenvalues.min():.6f}, {eigenvalues.max():.6f}] Ry")
+    print(f"                  = [{eigenvalues.min() * ryd2ev:.4f}, {eigenvalues.max() * ryd2ev:.4f}] eV")
 
 
 def generate_kpts_grid(nkx: int, nky: int, nkz: int) -> np.ndarray:
