@@ -1,0 +1,40 @@
+# Copy this file to `config` and fill in values.
+# `config` is ignored by git (see repo .gitignore).
+#
+# This file is sourced by the submit wrappers as bash, so you can use quotes and comments.
+
+# Slurm allocation/account name (e.g. m1234)
+ISDF_SLURM_ACCOUNT=""
+
+# Host path to this repo (the directory that contains pyproject.toml, src/, etc.)
+# Examples:
+#   /global/homes/j/jackm/scratchperl/isdf_cohsex
+#   /global/cfs/cdirs/<proj>/ISDF/isdf_cohsex
+ISDF_CODE_HOST_PATH=""
+
+# Host path where the persistent venv will live (recommend PSCRATCH).
+# This should be a stable per-user location reused across runs.
+# Example:
+#   /pscratch/sd/j/jackm/isdf_venvs
+ISDF_VENV_HOST_PATH=""
+
+# Default input filename to use when you submit without an explicit input path.
+# (In that case, the submit script mounts your current working directory as /workspace/run.)
+# Example:
+#   cohsex_test.in
+ISDF_DEFAULT_INPUT_BASENAME="cohsex_test.in"
+
+# Shifter image to use (leave default unless you know you want a different one)
+ISDF_SHIFTER_IMAGE="nvcr.io/nvidia/jax:25.04-py3"
+
+# Shifter modules (Perlmutter commonly uses gpu and nccl-plugin)
+ISDF_SHIFTER_MODULES="gpu,nccl-plugin"
+
+# Optional: offline wheelhouse directory on the HOST.
+# If set, wrappers will mount it to /workspace/output/wheelhouse and bootstrap_venv.sh
+# will install from it with --no-index.
+# Example:
+#   /pscratch/sd/j/jackm/isdf/wheelhouse
+ISDF_WHEELHOUSE_HOST_PATH=""
+
+

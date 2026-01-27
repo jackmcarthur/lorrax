@@ -39,3 +39,6 @@ qe_src
 qe_upflib
 bgw_src
 GPUtop*
+
+# local cluster shifter config (per-user)
+cluster_shifter/config
