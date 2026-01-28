@@ -761,8 +761,9 @@ def fit_zeta_and_compute_V_q_chunked(
 	n_b_full = b4 - b0
 	
 	# Compute optimal chunk sizes
-	nqx, nqy, nqz = meta.kgrid
-	n_q = nqx * nqy * nqz
+	# [NUFFT BACKEND] Use q-grid dimensions (may differ from k-grid if NUFFT enabled)
+	nqx, nqy, nqz = meta.qgrid
+	n_q = meta.nq_tot
 	
 	chunks = compute_optimal_chunks(
 		n_k=meta.nk_tot,
@@ -1337,12 +1338,42 @@ def main(argv=None):
 	if x_only and do_screened:  # x_only=bare exchange only, do_screened=use W instead of v
 		raise ValueError("x_only and do_screened cannot both be True")
 
-	meta = Meta.from_system(wfn, sym, nval, ncond, nband, _n_rmu, bispinor)
+	# ============================================================================
+	# [NUFFT BACKEND] Parse optional q_grid parameter
+	# ============================================================================
+	# q_grid format: "nqx nqy nqz" (e.g., "6 6 1" for coarser q-grid)
+	# If specified AND different from k-grid, enables NUFFT for k→R transforms
+	# ============================================================================
+	q_grid_tuple = None
+	if "q_grid" in params and params["q_grid"] is not None:
+		q_grid_str = str(params["q_grid"]).strip()
+		if q_grid_str:
+			try:
+				nqx, nqy, nqz = map(int, q_grid_str.split())
+				q_grid_tuple = (nqx, nqy, nqz)
+				_print0(f"\n  [NUFFT BACKEND] Q-grid specified: {nqx}×{nqy}×{nqz}")
+				_print0(f"  [NUFFT BACKEND] K-grid: {wfn.kgrid[0]}×{wfn.kgrid[1]}×{wfn.kgrid[2]}")
+				if q_grid_tuple != tuple(wfn.kgrid):
+					_print0("  [NUFFT BACKEND] ENABLED: Using non-uniform FFT for k→R transforms")
+					_print0("  [NUFFT BACKEND] WARNING: GW pipeline not yet updated - will break!")
+				else:
+					_print0("  [NUFFT BACKEND] Q-grid == K-grid: Using standard uniform FFT")
+			except (ValueError, TypeError) as e:
+				_print0(f"  WARNING: Invalid q_grid format '{q_grid_str}': {e}")
+				_print0("  Expected format: 'nqx nqy nqz' (e.g., '6 6 1')")
+				q_grid_tuple = None
+
+	meta = Meta.from_system(wfn, sym, nval, ncond, nband, _n_rmu, bispinor, q_grid=q_grid_tuple)
 	meta.rank = jax.process_index()
 	meta.n_proc = jax.process_count()
 	meta.sys_dim = sys_dim
 	meta.bispinor = bispinor
 	meta.chunk_size = get_effective_chunk_size(params["chunk_size"])
+	
+	# [NUFFT BACKEND] Print q-grid status after Meta creation
+	if meta.use_nufft:
+		_print0(f"  [NUFFT BACKEND] meta.nqx={meta.nqx}, meta.nqy={meta.nqy}, meta.nqz={meta.nqz}, meta.nq_tot={meta.nq_tot}")
+		_print0(f"  [NUFFT BACKEND] meta.use_nufft={meta.use_nufft}")
 	fft_nx, fft_ny, fft_nz = (int(dim) for dim in meta.fft_grid)
 	nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
 	band = meta.band_ranges
