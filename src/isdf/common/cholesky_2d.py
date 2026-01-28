@@ -178,8 +178,8 @@ def cholesky_2d_single(mesh: Mesh, J: int, b: int):
             A_local = lax.fori_loop(0, J_row, do_trsm, A_local)
             
             # Step 4: Broadcast panel L[:, k] via psum
-            # Initialize with pvary to declare axis variance
-            panel_init = lax.pvary(jnp.zeros((J, b, b), dtype), ('x', 'y'))
+            # Each device contributes its local portion, then psum aggregates
+            panel_init = jnp.zeros((J, b, b), dtype)
             
             def fill_panel(i_loc, panel):
                 i_glob = my_row_start + i_loc

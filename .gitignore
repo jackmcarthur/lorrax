@@ -37,8 +37,13 @@ charge-density.hdf5
 qe_pp
 qe_src
 qe_upflib
+# local BerkeleyGW source tree (often a user-specific symlink)
 bgw_src
+bgw_src/
 GPUtop*
 
 # local cluster shifter config (per-user)
 cluster_shifter/config
+
+# locally generated job scripts
+*.run

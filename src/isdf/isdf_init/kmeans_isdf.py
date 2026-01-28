@@ -40,20 +40,30 @@ print(f"✓ JAX initialized with device: {jax.devices()[0]}")
 
 from ..io import WFNReader
 from ..common import symmetry_maps
-import matplotlib
-# Try to use an interactive backend if available
-_interactive_backend = False
-for backend in ['Qt5Agg', 'TkAgg', 'GTK3Agg', 'macosx']:
-    try:
-        matplotlib.use(backend)
-        _interactive_backend = True
-        break
-    except Exception:
-        continue
-if not _interactive_backend:
-    print("Note: No interactive matplotlib backend available. Plots will be saved to files.")
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 - imported for side effects
+
+# matplotlib is optional - only needed for plotting
+try:
+    import matplotlib
+    # Try to use an interactive backend if available
+    _interactive_backend = False
+    for backend in ['Qt5Agg', 'TkAgg', 'GTK3Agg', 'macosx']:
+        try:
+            matplotlib.use(backend)
+            _interactive_backend = True
+            break
+        except Exception:
+            continue
+    if not _interactive_backend:
+        print("Note: No interactive matplotlib backend available. Plots will be saved to files.")
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 - imported for side effects
+    _HAS_MATPLOTLIB = True
+except ImportError:
+    print("Note: matplotlib not available. Plotting disabled.")
+    _HAS_MATPLOTLIB = False
+    _interactive_backend = False
+    plt = None
+
 from scipy.ndimage import zoom
 
 from .get_charge_density import calculate_charge_density
@@ -241,6 +251,9 @@ def interpolate_density(rho_np, zoom_factors=(1, 1, 1)):
 
 def plot_density_and_centroids(wfn, rho_np, centroids, labels=None):
     """Plot charge density and centroids in 3D."""
+    if not _HAS_MATPLOTLIB:
+        print("Skipping plot (matplotlib not available)")
+        return
     # Create 3D plot
     fig = plt.figure(figsize=(10, 10))
     ax = fig.add_subplot(111, projection="3d")

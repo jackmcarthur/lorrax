@@ -55,6 +55,9 @@ The JAX setup uses only the standard CPU backend.
 ## Setup
 To install the Python dependencies use uv/Docker setup.
 
+### Perlmutter (Shifter) quickstart
+If you're running on NERSC Perlmutter with Shifter, see [`cluster_shifter/README_CLUSTER.md`](cluster_shifter/README_CLUSTER.md) for batch and interactive workflows. The setup uses the NVIDIA JAX container—no venv or extra setup needed.
+
 
 ### Local uv usage
 To create the environment and install dependencies:

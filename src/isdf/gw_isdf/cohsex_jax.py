@@ -29,10 +29,30 @@ def _maybe_init_jax_distributed():
 						 os.environ.get("JAX_NUM_PROCESSES",
 						 os.environ.get("SLURM_NTASKS", "1"))))
 	if proc_count > 1:
+		# Prefer auto-detection (NERSC pattern): JAX reads SLURM env vars directly
+		try:
+			jax.distributed.initialize()
+			return
+		except Exception:
+			pass
+		# Fallback: explicit coordinator from SLURM_NODELIST (first node)
 		coord = os.environ.get("JAX_COORDINATOR_ADDRESS")
 		if coord is None:
-			host = os.environ.get("SLURMD_NODENAME") or os.environ.get("HOSTNAME") or "localhost"
-			coord = f"{host}:12355"
+			import subprocess
+			nodelist = os.environ.get("SLURM_NODELIST")
+			if nodelist:
+				try:
+					result = subprocess.run(
+						["scontrol", "show", "hostnames", nodelist],
+						capture_output=True, text=True, check=True
+					)
+					first_host = result.stdout.strip().split("\n")[0]
+					coord = f"{first_host}:12355"
+				except Exception:
+					pass
+			if coord is None:
+				host = os.environ.get("SLURMD_NODENAME") or os.environ.get("HOSTNAME") or "localhost"
+				coord = f"{host}:12355"
 		proc_id = int(os.environ.get("JAX_PROCESS_INDEX", os.environ.get("SLURM_PROCID", "0")))
 		jax.distributed.initialize(coordinator_address=coord,
 								   num_processes=proc_count,

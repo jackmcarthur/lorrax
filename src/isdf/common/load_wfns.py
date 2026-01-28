@@ -87,12 +87,11 @@ def make_sharded_ifftn_3d(mesh: Mesh, in_spec: P, out_spec: P):
     Returns:
         A function that performs 3D IFFT on sharded data
     """
-    @jax.shard_map(mesh=mesh, in_specs=(in_spec,), out_specs=out_spec)
     def _local_ifftn(x_local):
         # Each device runs FFT on its local shard independently
         return jnp.fft.ifftn(x_local, axes=(-3, -2, -1))
     
-    return _local_ifftn
+    return shard_map(_local_ifftn, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec)
 
 
 def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, nspinor=2):
@@ -357,9 +356,8 @@ def get_sharded_wfns(
 			# Flatten spatial dims to rtot
 			psi_rtot = psi_r.reshape(nk_tot, nb_actual, nspinor, -1)
 
-			# Centroid gather using pre-computed linear indices
-			# NOTE: No replication needed - JAX handles gather efficiently with
-			# bands still sharded, avoiding a 250x memory spike.
+			# Centroid gather on axis 3 (spatial) - this axis is replicated so gather is LOCAL
+			# Bands stay sharded on axis 1 throughout, no all-gather needed
 			psi_rmu = jnp.take(psi_rtot, centroid_lin, axis=3)
 
 			# Conjugate-transpose to (nk, n_rmu, nb, nspinor) for pair density
@@ -1217,8 +1215,13 @@ def solve_zeta_from_L_q(
     nq, n_rmu, _ = L_q.shape
     _, _, n_zchunk = Z_q.shape
     
-    # Cache key for solve function (includes q_chunk_size)
-    cache_key = ('solve_from_L', id(mesh_xy), nq, n_rmu, n_zchunk, q_chunk_size)
+    # Compute padding needed for even sharding across all devices
+    total_devices = mesh_xy.devices.size
+    n_zchunk_padded = ((n_zchunk + total_devices - 1) // total_devices) * total_devices
+    needs_padding = n_zchunk_padded != n_zchunk
+    
+    # Cache key for solve function (includes q_chunk_size and padded size)
+    cache_key = ('solve_from_L', id(mesh_xy), nq, n_rmu, n_zchunk_padded, q_chunk_size)
     
     if cache_key not in _solve_cache:
         # Reshard Z for column-parallel solve
@@ -1227,6 +1230,7 @@ def solve_zeta_from_L_q(
         L_batch_rep_shard = NamedSharding(mesh_xy, P(None, None, None))  # (B_q, n_rmu, n_rmu)
         nq_c = nq
         q_chunk_c = min(q_chunk_size, nq)
+        n_zchunk_c = n_zchunk_padded  # Use padded size
         
         @partial(shard_map, mesh=mesh_xy,
                  in_specs=(P(None, None), P(None, ('x', 'y'))),
@@ -1294,7 +1298,15 @@ def solve_zeta_from_L_q(
         
         _solve_cache[cache_key] = _solve_all_q
     
-    return _solve_cache[cache_key](L_q, Z_q)
+    # Pad Z if needed (zeros on RHS → zero solution for those columns, harmless)
+    if needs_padding:
+        pad_width = n_zchunk_padded - n_zchunk
+        Z_q_padded = jnp.pad(Z_q, ((0, 0), (0, 0), (0, pad_width)), mode='constant')
+        result_padded = _solve_cache[cache_key](L_q, Z_q_padded)
+        # Trim back to original size
+        return result_padded[:, :, :n_zchunk]
+    else:
+        return _solve_cache[cache_key](L_q, Z_q)
 
 
 # Cache for ZCT computation function
@@ -2290,7 +2302,6 @@ def get_sharded_wfns_centroids(
         # out_X: transposed shape is (nk, n_rmu, nb, ns) for pair density einsum
         out_X = NamedSharding(mesh_xy, P(None, 'x', None, None))
         null_4 = NamedSharding(mesh_xy, P(None, None, None, None))
-        stage1_shard = NamedSharding(mesh_xy, P(None, 'y', None, None))
         
         sharded_ifftn = make_sharded_ifftn_3d(
             mesh_xy,
@@ -2331,10 +2342,8 @@ def get_sharded_wfns_centroids(
             # Flatten spatial dims
             psi_rtot = psi_r.reshape(nk_tot, nb_static, nspinor, -1)
             
-            # Gather centroids using pre-computed linear indices
-            # NOTE: We do NOT replicate first - JAX handles the gather efficiently
-            # with bands still sharded, avoiding a massive memory spike.
-            # Old code used null_4 replication which required 250x more temp memory!
+            # Gather centroids on axis 3 (spatial) - this axis is replicated so gather is LOCAL
+            # Bands stay sharded on axis 1 throughout, no all-gather of the large array
             psi_rmu = jnp.take(psi_rtot, centroid_lin, axis=3)
             
             # Create psi_rmuT (conjugate transpose for left wfn in pair density)

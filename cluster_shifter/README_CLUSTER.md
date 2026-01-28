@@ -1,100 +1,97 @@
-## Cluster config (“clone-and-go”)
+# Running COHSEX-JAX on NERSC Perlmutter with Shifter
 
-The goal is: after cloning the repo, you fill out **one local config file** and then submit jobs without editing the `.sbatch` scripts.
+This directory contains scripts for running `cohsex_jax` on NERSC Perlmutter using the NVIDIA JAX Shifter image.
 
-### 1) Create your local config
+## Quick Start
 
-From the repo root:
+### Batch Job
 
-```bash
-cp cluster_shifter/config.example cluster_shifter/config
-```
+1. Copy the batch script to your run directory:
+   ```bash
+   cp $HOME/software/isdf_cohsex/cluster_shifter/run_cohsex.slurm /path/to/your/run_dir/
+   cd /path/to/your/run_dir/
+   ```
 
-Edit `cluster_shifter/config` and set:
+2. Edit the script if needed (change `#SBATCH` options, `RUN_DIR`, `INPUT_FILE`)
 
-- `ISDF_SLURM_ACCOUNT`
-- `ISDF_CODE_HOST_PATH`
-- `ISDF_VENV_HOST_PATH`
-- `ISDF_DEFAULT_INPUT_BASENAME` (optional, default is fine)
+3. Submit:
+   ```bash
+   sbatch run_cohsex.slurm
+   ```
 
-`cluster_shifter/config` is ignored by git automatically.
+### Interactive Session
 
-### 2) Submit
+1. Allocate an interactive GPU node:
+   ```bash
+   salloc --nodes=1 --qos=interactive --time=01:00:00 --constraint=gpu \
+          --gpus=4 --account=m2651 --image=nvcr.io/nvidia/jax:25.04-py3
+   ```
 
-Single node:
+2. Run from your input directory:
+   ```bash
+   cd /path/to/your/run_dir
+   
+   # Run cohsex_jax
+   srun -n 4 shifter --module=gpu --env=PYTHONPATH=$HOME/software/isdf_cohsex/src \
+       python3 -m isdf.gw_isdf.cohsex_jax -i gw.inp
+   
+   # Or run any other module (e.g., generate centroids)
+   srun -n 1 shifter --module=gpu --env=PYTHONPATH=$HOME/software/isdf_cohsex/src \
+       python3 -m isdf.isdf_init.kmeans_isdf -i gw.inp
+   ```
 
-```bash
-bash cluster_shifter/submit_singlenode.sh /pscratch/.../your_run_dir/cohsex_test.in
-```
+## Key Points
 
-Multi node:
+- **No venv needed**: The NVIDIA JAX container has all dependencies pre-installed
+- **No volume mounts needed**: NERSC auto-mounts `$HOME` and `$PSCRATCH` in Shifter
+- **`--module=gpu` is required**: This enables GPU access inside the container
+- **Image**: `nvcr.io/nvidia/jax:25.04-py3` (NVIDIA's official JAX container)
 
-```bash
-bash cluster_shifter/submit_multinode.sh /pscratch/.../your_run_dir/cohsex_test.in
-```
+## Running from a Separate Terminal (e.g., Cursor IDE)
 
-If you omit the input argument, the submit script will:
-
-- mount your current working directory as `/workspace/run`
-- use `ISDF_DEFAULT_INPUT_BASENAME` as the input filename inside that directory
-
-### Notes
-
-- **Why wrappers?** Slurm directives like `#SBATCH --account` and `#SBATCH --volume` are
-  parsed before the script runs, so we can’t read a config file inside the sbatch script
-  to populate those. The wrappers solve that by passing `--account/--volume` on the
-  `sbatch` command line.
-- **Venv reuse:** the job creates/reuses a venv under:
-  `${ISDF_VENV_HOST_PATH}/isdf_cohsex_py311` (mounted as `/workspace/venvroot/isdf_cohsex_py311`)
-- **Output directory:** `cohsex_jax.py` writes `tmp/` under the **input file directory**,
-  so put the input file in a writable run directory (recommended: `$PSCRATCH`).
-
-### Interactive workflow (dedicated nodes)
-
-This is handy for debugging and “manual runs” where you want to run multiple times without resubmitting jobs.
-
-1) Get an interactive allocation (example: 1 node / 4 GPUs):
+If your `salloc` is running in one terminal but you want to run commands from another (like Cursor's integrated terminal), you need the job ID:
 
 ```bash
-salloc -N 1 -C gpu -G 4 -q interactive -t 01:00:00 -A <YOUR_ACCOUNT>
+# Find your job ID
+squeue -u $USER
+# Shows: 48182279 urgent_gp interact ...
+
+# Run with explicit --jobid and --image
+srun --jobid=48182279 -n 4 shifter --module=gpu \
+    --image=nvcr.io/nvidia/jax:25.04-py3 \
+    --env=PYTHONPATH=$HOME/software/isdf_cohsex/src \
+    python3 -m isdf.gw_isdf.cohsex_jax -i gw.inp
 ```
 
-2) Once allocated, run a one-time bootstrap to build/reuse the venv under your venv root (PSCRATCH):
+**Important**: When using `--jobid`, you MUST specify `--image=` explicitly (it's not inherited from the allocation).
+
+## Convenience Wrapper
+
+For a simpler interactive experience, add this to your `~/.bashrc`:
 
 ```bash
-# Example host paths (replace):
-export CODE_HOST="$HOME/software/isdf_cohsex"
-export VENV_HOST="$PSCRATCH/isdf_venvs"
-mkdir -p "$VENV_HOST"
-
-# Choose a run directory (recommended on PSCRATCH) and put your input file there.
-export RUN_HOST="$PSCRATCH/isdf_tmp/run1"
-mkdir -p "$RUN_HOST"
-
-# Start shifter shell on one rank just to build the venv.
-srun -n 1 --image=nvcr.io/nvidia/jax:25.04-py3 --module=gpu,nccl-plugin \
-  --volume="$CODE_HOST:/workspace/ISDF" \
-  --volume="$VENV_HOST:/workspace/venvroot" \
-  --volume="$RUN_HOST:/workspace/run" \
-  shifter bash -lc "bash /workspace/ISDF/cluster_shifter/bootstrap_venv.sh"
+isdfrun() {
+    local ntasks="${ISDF_NTASKS:-4}"
+    srun -n "$ntasks" shifter --module=gpu \
+        --env=PYTHONPATH=$HOME/software/isdf_cohsex/src \
+        python3 "$@"
+}
 ```
 
-3) Run your job with 1 process per GPU (example: 4 ranks), reading input from the run dir:
+Then use:
+```bash
+isdfrun -m isdf.gw_isdf.cohsex_jax -i gw.inp
+isdfrun -m isdf.isdf_init.kmeans_isdf -i gw.inp
+```
+
+## Multi-Node Jobs
+
+For multi-node jobs, increase `--nodes` and `--ntasks-per-node`:
 
 ```bash
-srun -n 4 --gpus-per-task=1 --image=nvcr.io/nvidia/jax:25.04-py3 --module=gpu,nccl-plugin \
-  --volume="$CODE_HOST:/workspace/ISDF" \
-  --volume="$VENV_HOST:/workspace/venvroot" \
-  --volume="$RUN_HOST:/workspace/run" \
-  shifter bash -lc "
-    source /workspace/venvroot/isdf_cohsex_py311/bin/activate
-    export XLA_PYTHON_CLIENT_PREALLOCATE=false
-    export XLA_PYTHON_CLIENT_MEM_FRACTION=0.85
-    export HDF5_USE_FILE_LOCKING=FALSE
-    python3 /workspace/ISDF/src/isdf/gw_isdf/cohsex_jax.py -i /workspace/run/<your_input>.in
-  "
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=4
+#SBATCH --gpus-per-node=4
 ```
 
-4) Multi-node interactive is the same idea; just request `-N <nodes>` and set JAX coordinator env vars (same as in `perlmutter_shifter_multinode.sbatch`).
-
-
+This gives you 8 GPUs across 2 nodes (4 per node).
