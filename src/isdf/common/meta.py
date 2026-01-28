@@ -33,6 +33,17 @@ class Meta:
     nbnd_jax: int
     n_rtot_jax: int
     n_rmu_jax: int
+    # ============================================================================
+    # [NUFFT BACKEND] Q-grid for non-uniform FFT k→R transforms (experimental)
+    # ============================================================================
+    # If nqx/nqy/nqz differ from nkx/nky/nkz, NUFFT will be used for k→R
+    # transforms in ISDF fitting. All q-dependent arrays (C_q, Z_q, V_q, etc.)
+    # will be sized to the q-grid instead of the k-grid.
+    # ============================================================================
+    nqx: int = None  # Q-grid dimensions (defaults to k-grid if not specified)
+    nqy: int = None
+    nqz: int = None
+    nq_tot: int = None
 
     def __post_init__(self):
         # Cache commonly reused grid/band descriptors to avoid ad-hoc rebuilds elsewhere.
@@ -41,6 +52,25 @@ class Meta:
         self.kgrid_jax = jnp.asarray(self.kgrid_np)
         self.fft_grid_np = np.asarray(self.fft_grid, dtype=np.int32)
         self.fft_grid_jax = jnp.asarray(self.fft_grid_np)
+        
+        # [NUFFT BACKEND] Set q-grid to k-grid if not explicitly specified
+        if self.nqx is None:
+            self.nqx = self.nkx
+        if self.nqy is None:
+            self.nqy = self.nky
+        if self.nqz is None:
+            self.nqz = self.nkz
+        if self.nq_tot is None:
+            self.nq_tot = self.nqx * self.nqy * self.nqz
+        
+        # [NUFFT BACKEND] Cache q-grid arrays (for NUFFT or standard FFT)
+        self.qgrid = (self.nqx, self.nqy, self.nqz)
+        self.qgrid_np = np.asarray(self.qgrid, dtype=np.int32)
+        self.qgrid_jax = jnp.asarray(self.qgrid_np)
+        
+        # [NUFFT BACKEND] Flag to indicate whether NUFFT is needed
+        self.use_nufft = (self.nqx != self.nkx or self.nqy != self.nky or self.nqz != self.nkz)
+        
         b0, b1, b2, b3, b4 = (
             self.b_id_0,
             self.b_id_1,
@@ -77,6 +107,7 @@ class Meta:
         nband: int,
         n_rmu: int,
         bispinor: bool = False,
+        q_grid: tuple[int, int, int] | None = None,  # [NUFFT BACKEND] Optional q-grid
     ):
         rank = jax.process_index()
         rank_topo = np.where(np.asarray(jax.devices()) == rank)
@@ -97,6 +128,15 @@ class Meta:
         nbnd_jax = _round_up(b_id_4, n_proc)
         n_rtot_jax = _round_up(n_rtot, n_proc)
         n_rmu_jax = _round_up(n_rmu, n_proc)
+        
+        # [NUFFT BACKEND] Parse optional q-grid
+        if q_grid is not None:
+            nqx, nqy, nqz = (int(x) for x in q_grid)
+            nq_tot = nqx * nqy * nqz
+        else:
+            nqx, nqy, nqz = nkx, nky, nkz  # Default to k-grid
+            nq_tot = nk_tot
+        
         return cls(
             rank,
             n_proc,
@@ -120,4 +160,8 @@ class Meta:
             nbnd_jax,
             n_rtot_jax,
             n_rmu_jax,
+            nqx,  # [NUFFT BACKEND] Q-grid dimensions
+            nqy,
+            nqz,
+            nq_tot,
         )
