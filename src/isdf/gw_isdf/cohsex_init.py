@@ -105,17 +105,19 @@ def compute_optimal_chunks(
     def compute_chunk_metrics(x_chunk_r: int, base_const: float) -> tuple[float, str, dict]:
         """Compute peak memory for each stage given an x-chunk size.
         
-        The ZCT (FFT cross-correlation) stage uses sharded FFT (shard_map) to avoid
-        XLA rematerialization. Each device FFTs its local shard independently over
-        replicated k-dimensions, with (μ, r-chunk) sharded across devices.
+        CRITICAL: The ZCT (FFT cross-correlation) stage causes XLA to create 
+        FULL UNSHARDED copies during resharding/FFT operations. The XLA log shows:
+            "[spmd] Involuntary full rematerialization..."
         
+        This means we must budget for the GLOBAL array sizes, not local sharded sizes.
         compute_ZCT_from_left_right_zchunk does:
-            1. P_l_R = sharded_ifftn(P_l)  -- local FFT, no communication
-            2. P_r_R = sharded_ifftn(P_r)  -- local FFT, no communication
-            3. Z_R = conj(P_l_R) * P_r_R   -- element-wise, local
-            4. Z_q = sharded_fftn(Z_R)     -- local FFT, no communication
+            1. P_l_R = ifftn(P_l)  -- XLA may all-gather to full array
+            2. P_r_R = ifftn(P_r)  -- XLA may all-gather to full array  
+            3. Z_R = conj(P_l_R) * P_r_R  -- full array
+            4. Z_q = fftn(Z_R)  -- full array
         
-        Peak memory: ~2x input arrays (P_l, P_r) for FFT intermediate buffers.
+        Peak observed: ~62GB for (36, 600, 48600) complex128 arrays = 4x 16.8GB
+        This is the FULL global array × 4 intermediate buffers.
         """
         chunk_r = float(x_chunk_r)
         per_y = chunk_r / p_y
@@ -126,10 +128,13 @@ def compute_optimal_chunks(
         m_z_local = bytes_per_complex * n_q_f * (n_rmu_f / p_x) * per_y
         m_zcol = bytes_per_complex * n_q_f * n_rmu_f * (chunk_r / p)
         
-        # FFT intermediate buffer: 2x for temporary copies during FFT
-        # (input + output coexist briefly, no global rematerialization)
-        FFT_BUFFERS = 2
-        m_fft_peak = FFT_BUFFERS * m_pair_local
+        # GLOBAL (unsharded) sizes for FFT stage where XLA rematerializes
+        # P_l, P_r shape: (nk, n_rmu, chunk_r) - FULL, not sharded during FFT
+        m_pair_global = bytes_per_complex * n_k_f * n_rmu_f * chunk_r
+        
+        # XLA needs ~4 full arrays during FFT pipeline (inputs + intermediates)
+        FFT_BUFFERS = 4
+        m_fft_peak = FFT_BUFFERS * m_pair_global
         
         stage_pair = base_const + m_xchunk + 2 * m_pair_local
         # FFT stage: XLA holds full unsharded arrays during rematerialization
@@ -146,6 +151,7 @@ def compute_optimal_chunks(
             'psi_xchunk': m_xchunk,
             'pair_xchunk': 2 * m_pair_local,
             'pair_fft_peak': m_fft_peak,
+            'pair_global': m_pair_global,
             'Z_q': m_z_local,
             'Z_col': m_zcol,
             'stage_pair': stage_pair,
@@ -162,10 +168,9 @@ def compute_optimal_chunks(
         if headroom <= bytes_per_complex * (n_rmu_f ** 2):
             return None
 
-        # FFT stage uses sharded FFT (shard_map) - no global rematerialization
-        # FFT over k-dims (replicated), with (μ, chunk_r) sharded
-        # Peak: 2x local pair density for FFT intermediate buffers
-        FFT_BUFFERS = 2
+        # FFT stage uses GLOBAL (unsharded) arrays due to XLA rematerialization
+        # P_l, P_r shape: (nk, n_rmu, chunk_r) - 4 buffers during FFT
+        FFT_BUFFERS = 4
 
         limits = []
         # Pair density stage limit (uses sharded local sizes)
@@ -173,13 +178,13 @@ def compute_optimal_chunks(
         if denom_pair > 0:
             limits.append(headroom * p_y / (bytes_per_complex * denom_pair))
         
-        # ZCT/FFT stage limit - uses LOCAL sharded sizes with sharded FFT
-        # m_fft_peak = FFT_BUFFERS * m_pair_local
-        #            = FFT_BUFFERS * bytes_per_complex * n_k * (n_rmu / p_x) * (chunk_r / p_y)
-        # Solve for chunk_r: chunk_r <= headroom * p_y / (FFT_BUFFERS * bytes_per_complex * n_k * (n_rmu / p_x))
-        denom_fft_local = FFT_BUFFERS * n_k_f * (n_rmu_f / p_x)
-        if denom_fft_local > 0:
-            limits.append(headroom * p_y / (bytes_per_complex * denom_fft_local))
+        # ZCT/FFT stage limit - CRITICAL: uses GLOBAL array size
+        # XLA rematerializes to full unsharded arrays during FFT
+        # m_fft_peak = FFT_BUFFERS * bytes_per_complex * n_k * n_rmu * chunk_r
+        # Solve for chunk_r: chunk_r <= headroom / (FFT_BUFFERS * bytes_per_complex * n_k * n_rmu)
+        denom_fft_global = FFT_BUFFERS * n_k_f * n_rmu_f
+        if denom_fft_global > 0:
+            limits.append(headroom / (bytes_per_complex * denom_fft_global))
         
         # Solve stage limit
         solve_numer = headroom - bytes_per_complex * (n_rmu_f ** 2)
@@ -260,6 +265,7 @@ def compute_optimal_chunks(
         'psi_xchunk_gb': to_gb(stage_info['psi_xchunk']),
         'pair_density_xchunk_gb': to_gb(stage_info['pair_xchunk']),
         'pair_fft_peak_gb': to_gb(stage_info['pair_fft_peak']),
+        'pair_global_gb': to_gb(stage_info['pair_global']),
         'fft_overhead_factor': stage_info['fft_overhead_factor'],
         'Z_q_gb': to_gb(stage_info['Z_q']),
         'Z_col_gb': to_gb(stage_info['Z_col']),
@@ -342,10 +348,11 @@ def print_memory_breakdown(
     print(f"    {'─ STAGE TOTAL':<38} {mem['stage_pair_gb']:>10.3f}")
     
     # ZCT stage
-    fft_factor = int(mem.get('fft_overhead_factor', 2))
+    fft_factor = int(mem.get('fft_overhead_factor', 4))
     print(f"\n  {'[Stage: ZCT / FFT pipeline]':<40}")
     print(f"    {'P_l, P_r (local sharded)':<38} {mem['pair_density_xchunk_gb']:>10.3f}")
-    print(f"    {'FFT overhead (' + str(fft_factor) + '× local)':<38} {mem.get('pair_fft_peak_gb', 0):>10.3f}")
+    print(f"    {'P_l, P_r (GLOBAL, XLA remat)':<38} {mem.get('pair_global_gb', 0):>10.3f}")
+    print(f"    {'FFT peak (' + str(fft_factor) + ' × global)':<38} {mem.get('pair_fft_peak_gb', 0):>10.3f}")
     print(f"    {'─ STAGE TOTAL':<38} {mem['stage_zct_gb']:>10.3f}")
     
     # Solve

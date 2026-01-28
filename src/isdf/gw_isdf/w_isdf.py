@@ -50,7 +50,7 @@ def _ensure_compilation_cache():
         jax_compilation_cache.set_cache_dir(cache_path)
     except Exception:
         pass
-        _COMPILATION_CACHE_READY = True
+    _COMPILATION_CACHE_READY = True
 
 
 # ============================================================================
@@ -108,7 +108,7 @@ def _get_chi_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
         # Quadrature prefactor: -2γ z_lm w_i exp(-(γ(E_gap) - 1)τ)
         E_gap = cmin - vmax
         quad_w = -2.0 * z_lm * w_i * jnp.exp(-(z_lm * E_gap - 1.0) * tau_i)
-
+        
         def _k_to_R(g_k: jax.Array, flip_sign: bool) -> jax.Array:
             """G(k) → G(±R) via FFT."""
             # g_k: (nk, ns, μ, ns, ν) → reshape to (nkx, nky, nkz, ns, μ, ns, ν)
@@ -119,7 +119,7 @@ def _get_chi_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
                 lambda x: jnp.fft.ifftn(x, axes=(-3, -2, -1), norm='ortho'),
                 g_fft,
             )
-
+        
         def tau_body(itau, chi_R_acc):
             tau = tau_i[itau]
             
@@ -145,11 +145,11 @@ def _get_chi_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
             # Apply sharding constraints
             Gv_k = jax.lax.with_sharding_constraint(Gv_k, G_v)
             Gc_k = jax.lax.with_sharding_constraint(Gc_k, G_c)
-
-        # FFT to R-space
+            
+            # FFT to R-space
             Gv_R = _k_to_R(Gv_k, flip_sign=False)   # IFFT for valence
             Gc_mR = _k_to_R(Gc_k, flip_sign=True)   # FFT for conduction (gives -R)
-
+            
             # Contract: χ(R) = Σ_{s,s'} conj(G_c)_{-R}^{ss'} · G_v_R^{s's}
             # (a,μ,b,ν,x,y,z) × (b,ν,a,μ,x,y,z) → (μ,ν,x,y,z)
             chi_tau = jnp.einsum('ambnxyz,bnamxyz->mnxyz', Gc_mR, Gv_R, optimize=True)
@@ -163,12 +163,12 @@ def _get_chi_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
         
         # FFT to q-space: χ(R) → χ(q)
         chi_q = jnp.fft.fftn(chi_R_final, axes=(-3, -2, -1), norm='ortho')
-
+        
         # Reshape: (μ, ν, qx, qy, qz) → (qx, qy, qz, 1, μ, 1, ν)
         chi_q = chi_q.transpose(2, 3, 4, 0, 1)
         chi_q = chi_q[:, :, :, None, :, None, :]
         chi_q = jax.lax.with_sharding_constraint(chi_q, chi_out)
-
+        
         return chi_q
     
     _chi_kernel_cache[cache_key] = _chi_kernel
@@ -185,7 +185,7 @@ def compute_chi0(
     Compute static χ₀(q) by summing over all window pairs.
     
     Uses a single universal kernel with energy masking - no per-window JIT.
-
+    
     Args:
         psi_vTX: (nk, ns, μ, nb_v) valence, μ sharded on X axis
         psi_vY:  (nk, nb_v, ns, μ) valence, μ sharded on Y axis
@@ -196,7 +196,7 @@ def compute_chi0(
         windows: list of WindowPair objects
         meta: Meta with nkx, nky, nkz
         mesh_xy: 2D device mesh
-
+    
     Returns:
         chi_q: (nkx, nky, nkz, 1, n_rmu, 1, n_rmu) with μ_X, ν_Y sharding
     """
@@ -214,7 +214,7 @@ def compute_chi0(
     
     # Get the universal kernel
     kernel = _get_chi_kernel(mesh_xy, nkx, nky, nkz)
-
+    
     # Output sharding
     chi_out = NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y'))
     chi_sum = jnp.zeros((nkx, nky, nkz, 1, n_rmu, 1, n_rmu), dtype=jnp.complex128)
@@ -342,7 +342,7 @@ def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int):
             # Solve A W = V via LU
             lu, piv = jsp_linalg.lu_factor(A)
             W_iq = jsp_linalg.lu_solve((lu, piv), V_iq)
-        
+            
             return W_acc.at[iq].set(W_iq)
         
         # Initialize output with same sharding
@@ -354,7 +354,7 @@ def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int):
         W_kqmn = W_flat.reshape(nkx, nky, nkz, n, n)
         W_out_arr = W_kqmn[:, :, :, None, :, None, :]
         W_out_arr = jax.lax.with_sharding_constraint(W_out_arr, W_out)
-    
+        
         return W_out_arr
     
     _w_solve_cache[cache_key] = _solve_w
@@ -382,7 +382,7 @@ def get_static_w_q_jax(
         S_qmunu: overlap matrix (not yet implemented) or None
         meta: Meta with k-grid info
         mesh_xy: 2D device mesh
-
+    
     Returns:
         W_q: (nkx, nky, nkz, 1, n_rmu, 1, n_rmu) with μ_X, ν_Y sharding
     """
