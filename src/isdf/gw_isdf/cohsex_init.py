@@ -640,6 +640,17 @@ def read_cohsex_input(filename: str) -> dict:
 		#                0 = auto-detect (80% of GPU via nvidia-smi, or CPU/n_devices)
 		#                >0 = explicit budget in GB
 		# ============================================================================
+		# [NUFFT BACKEND] q_grid: Optional non-uniform FFT q-grid size (experimental)
+		# ============================================================================
+		# q_grid:        EXPERIMENTAL: Coarser q-grid for NUFFT k→R transforms.
+		#                Format: "nqx nqy nqz" (e.g., "6 6 1")
+		#                If specified AND different from k-grid, enables NUFFT backend:
+		#                - All pair densities P_k are NUFFT'd to this q-grid
+		#                - C_q, Z_q, V_q arrays sized to (nqx,nqy,nqz) instead of k-grid
+		#                - Uses jax-finufft for non-uniform k→R transforms
+		#                If omitted or equal to k-grid: standard uniform FFT (default)
+		#                WARNING: GW pipeline not yet updated for NUFFT - will break!
+		# ============================================================================
 		params = {
 			"restart": getb("restart", fallback=True),           # load from h5 vs rebuild
 			"x_only": getb("x_only", fallback=False),            # bare exchange only
@@ -664,6 +675,8 @@ def read_cohsex_input(filename: str) -> dict:
 			"band_chunk_size": geti("band_chunk_size", fallback=16),  # bands per FFT during x-chunk loop
 			"memory_per_device_gb": getf("memory_per_device_gb", fallback=0.0),  # 0=auto-detect
 			"use_chunked_isdf": getb("use_chunked_isdf", fallback=True),  # chunked (memory-efficient) vs original ISDF
+			# [NUFFT BACKEND] Parse q_grid as "nqx nqy nqz" string
+			"q_grid": get("q_grid", fallback=None),  # e.g. "6 6 1" for coarser q-grid
 		}
 	else:
 		# Fallback defaults if no section found
@@ -691,6 +704,7 @@ def read_cohsex_input(filename: str) -> dict:
 			"band_chunk_size": 16,
 			"memory_per_device_gb": 0.0,
 			"use_chunked_isdf": True,
+			"q_grid": None,  # [NUFFT BACKEND] No coarse q-grid by default
 		}
 
 	# Parse optional QE-style K_POINTS block: take the number after it, read next that many lines
