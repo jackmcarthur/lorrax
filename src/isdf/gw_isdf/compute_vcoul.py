@@ -224,7 +224,7 @@ def make_v_munu_chunked_kernel(
     # NOTE: These are NOT JIT'd - they're meant to be called from an outer JIT
     # to avoid nested JIT compilation overhead. The outer JIT (_batch_proc or 
     # the chunked loop) compiles everything together.
-    
+
     def fft_and_weight_inner(
         zeta_r: jax.Array,
         sqrt_v: jax.Array,

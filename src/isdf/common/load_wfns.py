@@ -77,8 +77,12 @@ def compute_block_size_for_2d_cholesky(n_rmu: int, Pr: int, Pc: int) -> tuple[in
 
 def make_sharded_ifftn_3d(mesh: Mesh, in_spec: P, out_spec: P):
     """
-    Uses shard_map to run FFT independently on each device's local data.
+    Uses shard_map to run IFFT independently on each device's local data.
     The FFT axes (last 3) must NOT be sharded - only batch dims can be sharded.
+    
+    This works around an XLA bug where regular jnp.fft on sharded arrays
+    triggers unnecessary all-gathers even when FFT axes are replicated.
+    
     Args:
         mesh: The device mesh
         in_spec: PartitionSpec for input (e.g., P(None, ('x','y'), None, None, None, None))
@@ -92,6 +96,29 @@ def make_sharded_ifftn_3d(mesh: Mesh, in_spec: P, out_spec: P):
         return jnp.fft.ifftn(x_local, axes=(-3, -2, -1))
     
     return shard_map(_local_ifftn, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec)
+
+
+def make_sharded_fftn_3d(mesh: Mesh, in_spec: P, out_spec: P):
+    """
+    Uses shard_map to run FFT independently on each device's local data.
+    The FFT axes (last 3) must NOT be sharded - only batch dims can be sharded.
+    
+    This works around an XLA bug where regular jnp.fft on sharded arrays
+    triggers unnecessary all-gathers even when FFT axes are replicated.
+    
+    Args:
+        mesh: The device mesh
+        in_spec: PartitionSpec for input (e.g., P(None, None, None, 'x', 'y'))
+        out_spec: PartitionSpec for output (same as in_spec for FFT)
+    
+    Returns:
+        A function that performs 3D FFT on sharded data
+    """
+    def _local_fftn(x_local):
+        # Each device runs FFT on its local shard independently
+        return jnp.fft.fftn(x_local, axes=(-3, -2, -1))
+    
+    return shard_map(_local_fftn, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec)
 
 
 def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, nspinor=2):
@@ -799,6 +826,12 @@ def compute_CCT_from_left_right(
 		in_xy = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 		out_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
 		
+		# Create sharded FFT for k-space operations (FFT over first 3 axes, (μ,ν) sharded)
+		# Input/output: (nkx, nky, nkz, μ, ν) with P(None, None, None, 'x', 'y')
+		sharded_spec_5d = P(None, None, None, 'x', 'y')
+		sharded_ifftn_k = make_sharded_ifftn_3d(mesh_xy, sharded_spec_5d, sharded_spec_5d)
+		sharded_fftn_k = make_sharded_fftn_3d(mesh_xy, sharded_spec_5d, sharded_spec_5d)
+		
 		@partial(jax.jit, in_shardings=(in_xy, in_xy), out_shardings=out_xy,
 		         static_argnames=('nkx', 'nky', 'nkz'))
 		def _compute_CCT_LR(P_l: jax.Array, P_r: jax.Array,
@@ -807,18 +840,17 @@ def compute_CCT_from_left_right(
 			P_l_3d = P_l.reshape(nkx, nky, nkz, n_rmu, n_rmu)
 			P_r_3d = P_r.reshape(nkx, nky, nkz, n_rmu, n_rmu)
 			
-			# Use norm='forward' for BOTH IFFT and FFT to match direct k-sum.
-			# With forward: IFFT is unscaled (sum), FFT divides by N.
-			# Convolution theorem: C_q = FFT(IFFT(A)* ⊙ IFFT(B))
-			# This gives C_q = Σ_k A*_k B_{k+q} (matches cohsex_jax direct sum)
-			P_l_R = jnp.fft.ifftn(P_l_3d, axes=(0, 1, 2), norm='forward')
-			P_r_R = jnp.fft.ifftn(P_r_3d, axes=(0, 1, 2), norm='forward')
+			# Use sharded FFT to avoid XLA rematerialization bug
+			# k-dims are replicated, so each device can FFT independently
+			# Note: norm='forward' gives unscaled IFFT, scaled FFT (matches direct k-sum)
+			P_l_R = sharded_ifftn_k(P_l_3d) / nk  # Apply forward normalization
+			P_r_R = sharded_ifftn_k(P_r_3d) / nk
 			
 			# Cross-product: C_R = conj(P_l_R) * P_r_R (element-wise)
 			C_R = jnp.conj(P_l_R) * P_r_R
 			
 			# FFT to q-space
-			C_q = jnp.fft.fftn(C_R, axes=(0, 1, 2), norm='forward')
+			C_q = sharded_fftn_k(C_R) / nk  # Apply forward normalization
 			return C_q
 		
 		_isdf_pipeline_cache[cache_key] = _compute_CCT_LR
@@ -885,6 +917,12 @@ def compute_ZCT_from_left_right_zchunk(
 		in_xy = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 		out_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
 		
+		# Create sharded FFT for k-space operations (FFT over first 3 axes, (μ,zchunk) sharded)
+		# Input/output: (nkx, nky, nkz, μ, zchunk) with P(None, None, None, 'x', 'y')
+		sharded_spec_5d = P(None, None, None, 'x', 'y')
+		sharded_ifftn_k = make_sharded_ifftn_3d(mesh_xy, sharded_spec_5d, sharded_spec_5d)
+		sharded_fftn_k = make_sharded_fftn_3d(mesh_xy, sharded_spec_5d, sharded_spec_5d)
+		
 		@partial(jax.jit, in_shardings=(in_xy, in_xy), out_shardings=out_xy,
 		         static_argnames=('nkx', 'nky', 'nkz'))
 		def _compute_ZCT_LR(P_l: jax.Array, P_r: jax.Array,
@@ -893,17 +931,17 @@ def compute_ZCT_from_left_right_zchunk(
 			P_l_3d = P_l.reshape(nkx, nky, nkz, n_rmu, n_zchunk)
 			P_r_3d = P_r.reshape(nkx, nky, nkz, n_rmu, n_zchunk)
 			
-			# Use norm='forward' for BOTH IFFT and FFT to match direct k-sum.
-			# With forward: IFFT is unscaled (sum), FFT divides by N.
-			# This gives Z_q = Σ_k P_l*_k P_r_{k+q} (matches cohsex_jax)
-			P_l_R = jnp.fft.ifftn(P_l_3d, axes=(0, 1, 2), norm='forward')
-			P_r_R = jnp.fft.ifftn(P_r_3d, axes=(0, 1, 2), norm='forward')
+			# Use sharded FFT to avoid XLA rematerialization bug
+			# k-dims are replicated, so each device can FFT independently
+			# Note: norm='forward' gives unscaled IFFT, scaled FFT (matches direct k-sum)
+			P_l_R = sharded_ifftn_k(P_l_3d) / nk  # Apply forward normalization
+			P_r_R = sharded_ifftn_k(P_r_3d) / nk
 			
 			# Cross-product
 			Z_R = jnp.conj(P_l_R) * P_r_R
 			
 			# FFT to q-space
-			Z_q = jnp.fft.fftn(Z_R, axes=(0, 1, 2), norm='forward')
+			Z_q = sharded_fftn_k(Z_R) / nk  # Apply forward normalization
 			return Z_q
 		
 		_isdf_pipeline_cache[cache_key] = _compute_ZCT_LR
