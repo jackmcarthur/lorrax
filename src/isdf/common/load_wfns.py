@@ -944,6 +944,7 @@ def compute_CCT_from_left_right(
 	P_r_k: jax.Array,
 	kgrid: tuple[int, int, int],
 	mesh_xy: Mesh,
+	meta: Meta | None = None,  # [NUFFT BACKEND] Optional meta for q-grid info
 ) -> jax.Array:
 	"""
 	Compute CCT from separate left and right spin-traced pair densities.
@@ -952,47 +953,72 @@ def compute_CCT_from_left_right(
 	
 	This matches cohsex_jax physics where left and right have different band ranges.
 	
+	[NUFFT BACKEND] If meta.use_nufft is True:
+	- Output C_q is sized to qgrid (meta.nqx, meta.nqy, meta.nqz) instead of kgrid
+	- Uses NUFFT for k→R transform to handle non-uniform q-grid sampling
+	
 	Args:
 		P_l_k: (nk, n_rmu, n_rmu) left pair density, P(None, 'x', 'y')
 		P_r_k: (nk, n_rmu, n_rmu) right pair density, P(None, 'x', 'y')
-		kgrid: (nkx, nky, nkz)
+		kgrid: (nkx, nky, nkz) k-grid dimensions
 		mesh_xy: Device mesh
+		meta: [NUFFT BACKEND] Meta object with q-grid info (optional, defaults to kgrid)
 	
 	Returns:
 		C_q: (nqx, nqy, nqz, n_rmu, n_rmu) with P(None, None, None, 'x', 'y')
+		     If meta.use_nufft: nq != nk (coarser q-grid)
+		     Otherwise: nq == nk (standard FFT)
 	"""
 	nkx, nky, nkz = kgrid
 	nk, n_rmu, _ = P_l_k.shape
 	
-	cache_key = ('CCT_LR', id(mesh_xy), nk, n_rmu, nkx)
+	# [NUFFT BACKEND] Determine output grid dimensions
+	if meta is not None and meta.use_nufft:
+		nqx, nqy, nqz = meta.qgrid
+		use_nufft = True
+	else:
+		nqx, nqy, nqz = kgrid
+		use_nufft = False
+	
+	cache_key = ('CCT_LR', id(mesh_xy), nk, n_rmu, nkx, use_nufft, nqx, nqy, nqz)
 	
 	if cache_key not in _isdf_pipeline_cache:
 		in_xy = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 		out_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
 		
-		@partial(jax.jit, in_shardings=(in_xy, in_xy), out_shardings=out_xy,
-		         static_argnames=('nkx', 'nky', 'nkz'))
-		def _compute_CCT_LR(P_l: jax.Array, P_r: jax.Array,
-		                    nkx: int, nky: int, nkz: int) -> jax.Array:
-			# Reshape to 3D k-grid: (nk, μ, ν) -> (nkx, nky, nkz, μ, ν)
-			P_l_3d = P_l.reshape(nkx, nky, nkz, n_rmu, n_rmu)
-			P_r_3d = P_r.reshape(nkx, nky, nkz, n_rmu, n_rmu)
+		if use_nufft:
+			# [NUFFT BACKEND] Non-uniform q-grid path: NUFFT k→R transform
+			# TODO: Implement full NUFFT path - for now just resize output
+			# The actual NUFFT implementation would use jax_finufft here
+			raise NotImplementedError(
+				"[NUFFT BACKEND] Full NUFFT path for CCT not yet implemented. "
+				"Currently only standard FFT (q-grid == k-grid) is supported."
+			)
+		else:
+			# [NUFFT BACKEND] Standard uniform FFT path (q-grid == k-grid)
+			@partial(jax.jit, in_shardings=(in_xy, in_xy), out_shardings=out_xy,
+			         static_argnames=('nkx', 'nky', 'nkz'))
+			def _compute_CCT_LR(P_l: jax.Array, P_r: jax.Array,
+			                    nkx: int, nky: int, nkz: int) -> jax.Array:
+				# Reshape to 3D k-grid: (nk, μ, ν) -> (nkx, nky, nkz, μ, ν)
+				P_l_3d = P_l.reshape(nkx, nky, nkz, n_rmu, n_rmu)
+				P_r_3d = P_r.reshape(nkx, nky, nkz, n_rmu, n_rmu)
+				
+				# Use norm='forward' for BOTH IFFT and FFT to match direct k-sum.
+				# With forward: IFFT is unscaled (sum), FFT divides by N.
+				# Convolution theorem: C_q = FFT(IFFT(A)* ⊙ IFFT(B))
+				# This gives C_q = Σ_k A*_k B_{k+q} (matches cohsex_jax direct sum)
+				P_l_R = jnp.fft.ifftn(P_l_3d, axes=(0, 1, 2), norm='forward')
+				P_r_R = jnp.fft.ifftn(P_r_3d, axes=(0, 1, 2), norm='forward')
+				
+				# Cross-product: C_R = conj(P_l_R) * P_r_R (element-wise)
+				C_R = jnp.conj(P_l_R) * P_r_R
+				
+				# FFT to q-space
+				C_q = jnp.fft.fftn(C_R, axes=(0, 1, 2), norm='forward')
+				return C_q
 			
-			# Use norm='forward' for BOTH IFFT and FFT to match direct k-sum.
-			# With forward: IFFT is unscaled (sum), FFT divides by N.
-			# Convolution theorem: C_q = FFT(IFFT(A)* ⊙ IFFT(B))
-			# This gives C_q = Σ_k A*_k B_{k+q} (matches cohsex_jax direct sum)
-			P_l_R = jnp.fft.ifftn(P_l_3d, axes=(0, 1, 2), norm='forward')
-			P_r_R = jnp.fft.ifftn(P_r_3d, axes=(0, 1, 2), norm='forward')
-			
-			# Cross-product: C_R = conj(P_l_R) * P_r_R (element-wise)
-			C_R = jnp.conj(P_l_R) * P_r_R
-			
-			# FFT to q-space
-			C_q = jnp.fft.fftn(C_R, axes=(0, 1, 2), norm='forward')
-			return C_q
-		
-		_isdf_pipeline_cache[cache_key] = _compute_CCT_LR
+			_isdf_pipeline_cache[cache_key] = _compute_CCT_LR
 	
 	return _isdf_pipeline_cache[cache_key](P_l_k, P_r_k, nkx, nky, nkz)
 
@@ -1032,29 +1058,53 @@ def compute_ZCT_from_left_right_zchunk(
 	P_r_k_muz: jax.Array,
 	kgrid: tuple[int, int, int],
 	mesh_xy: Mesh,
+	meta: Meta | None = None,  # [NUFFT BACKEND] Optional meta for q-grid info
 ) -> jax.Array:
 	"""
 	Compute ZCT from left and right pair densities, both at (μ, z-chunk).
 	
 	Z_q(μ,r) = FFT[ conj(IFFT(P_l(μ,r))) ⊙ IFFT(P_r(μ,r)) ]
 	
+	[NUFFT BACKEND] If meta.use_nufft is True:
+	- Output Z_q is sized to qgrid (meta.nqx, meta.nqy, meta.nqz) instead of kgrid
+	- Uses NUFFT for k→R transform to handle non-uniform q-grid sampling
+	
 	Args:
 		P_l_k_muz: (nk, n_rmu, n_zchunk) left pair density at z-chunk, P(None, 'x', 'y')
 		P_r_k_muz: (nk, n_rmu, n_zchunk) right pair density at z-chunk, P(None, 'x', 'y')
-		kgrid: (nkx, nky, nkz)
+		kgrid: (nkx, nky, nkz) k-grid dimensions
 		mesh_xy: Device mesh
+		meta: [NUFFT BACKEND] Meta object with q-grid info (optional, defaults to kgrid)
 	
 	Returns:
 		Z_q: (nqx, nqy, nqz, n_rmu, n_zchunk) with P(None, None, None, 'x', 'y')
+		     If meta.use_nufft: nq != nk (coarser q-grid)
+		     Otherwise: nq == nk (standard FFT)
 	"""
 	nkx, nky, nkz = kgrid
 	nk, n_rmu, n_zchunk = P_l_k_muz.shape
 	
-	cache_key = ('ZCT_LR', id(mesh_xy), nk, n_rmu, n_zchunk, nkx)
+	# [NUFFT BACKEND] Determine output grid dimensions
+	if meta is not None and meta.use_nufft:
+		nqx, nqy, nqz = meta.qgrid
+		use_nufft = True
+	else:
+		nqx, nqy, nqz = kgrid
+		use_nufft = False
+	
+	cache_key = ('ZCT_LR', id(mesh_xy), nk, n_rmu, n_zchunk, nkx, use_nufft, nqx, nqy, nqz)
 	
 	if cache_key not in _isdf_pipeline_cache:
 		in_xy = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 		out_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
+		
+		if use_nufft:
+			# [NUFFT BACKEND] Non-uniform q-grid path: NUFFT k→R transform
+			# TODO: Implement full NUFFT path - for now just raise NotImplementedError
+			raise NotImplementedError(
+				"[NUFFT BACKEND] Full NUFFT path for ZCT not yet implemented. "
+				"Currently only standard FFT (q-grid == k-grid) is supported."
+			)
 		
 		@partial(jax.jit, in_shardings=(in_xy, in_xy), out_shardings=out_xy,
 		         static_argnames=('nkx', 'nky', 'nkz'))
@@ -1673,9 +1723,10 @@ def fit_zeta_chunked_to_h5(
         # P_l_k, P_r_k: (nk, n_rmu, n_rmu)
         
         print("Computing C_q from left/right cross-product...")
-        C_q = compute_CCT_from_left_right(P_l_k, P_r_k, kgrid, mesh_xy)
+        # [NUFFT BACKEND] Pass meta to enable q-grid sizing
+        C_q = compute_CCT_from_left_right(P_l_k, P_r_k, kgrid, mesh_xy, meta=meta)
         C_q.block_until_ready()
-        # C_q: (nqx, nqy, nqz, n_rmu, n_rmu)
+        # C_q: (nqx, nqy, nqz, n_rmu, n_rmu) where nq = k-grid or q-grid
         
         # Free pair densities - only needed for C_q
         del P_l_k, P_r_k
@@ -1847,8 +1898,9 @@ def fit_zeta_chunked_to_h5(
             # 6c. Compute Z_q via left/right cross-product FFT
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.ZCT"):
+                # [NUFFT BACKEND] Pass meta to enable q-grid sizing
                 Z_q = compute_ZCT_from_left_right_xchunk(
-                    P_l_k_mux, P_r_k_mux, kgrid, mesh_xy
+                    P_l_k_mux, P_r_k_mux, kgrid, mesh_xy, meta=meta
                 )
                 Z_q.block_until_ready()
                 
