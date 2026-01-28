@@ -179,7 +179,8 @@ def cholesky_2d_single(mesh: Mesh, J: int, b: int):
             
             # Step 4: Broadcast panel L[:, k] via psum
             # Each device contributes its local portion, then psum aggregates
-            panel_init = jnp.zeros((J, b, b), dtype)
+            # JAX 0.9+: mark as varying for fori_loop within shard_map
+            panel_init = lax.pcast(jnp.zeros((J, b, b), dtype), ('x', 'y'), to='varying')
             
             def fill_panel(i_loc, panel):
                 i_glob = my_row_start + i_loc
