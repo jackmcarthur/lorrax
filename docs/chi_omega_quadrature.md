@@ -112,7 +112,7 @@ Think of $(a,\mathbf{r})$ and $(b,\mathbf{r}')$ as combined indices. The trace c
 
 ### Window-Pair Propagators
 
-For a window pair $(l,m)$ at quadrature point $\tau_u$, define **k-space propagators**:
+For a window pair $(l,m)$ at quadrature point $\tau_u$, define **k-space propagators** which are equivalent to the windowed Green's function G_k,ab(r,r',tau).
 
 **Valence (occupied) propagator:**
 $$

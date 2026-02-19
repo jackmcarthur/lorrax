@@ -1,0 +1,25 @@
+--- a/vendor/finufft/include/cufinufft/contrib/helper_cuda.h
++++ b/vendor/finufft/include/cufinufft/contrib/helper_cuda.h
+@@ -114,15 +114,21 @@ inline const char *_cufftGetErrorString(cufftResult error) {
+   case CUFFT_INTERNAL_ERROR:
+     return "CUFFT_INTERNAL_ERROR";
+ 
++#ifdef CUFFT_INCOMPLETE_PARAMETER_LIST
+   case CUFFT_INCOMPLETE_PARAMETER_LIST:
+     return "CUFFT_INCOMPLETE_PARAMETER_LIST";
++#endif
+ 
++#ifdef CUFFT_PARSE_ERROR
+   case CUFFT_PARSE_ERROR:
+     return "CUFFT_PARSE_ERROR";
++#endif
+ 
++#ifdef CUFFT_LICENSE_ERROR
+   case CUFFT_LICENSE_ERROR:
+     return "CUFFT_LICENSE_ERROR";
++#endif
++
+   }
+ 
+   return "<unknown>";
+
