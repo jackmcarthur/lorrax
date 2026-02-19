@@ -80,7 +80,7 @@ spin-channel normalization is applied later in the screening stage.
 The overlap metric of the ISDF basis is the Hermitian matrix
 $S_{\mathbf{q},\mu\nu} = \langle \zeta_{\mathbf{q},\mu} | \zeta_{\mathbf{q},\nu} \rangle$,
 implemented as $S = \zeta^\dagger \zeta$.【F:src/isdf/gw_isdf/cohsex_jax.py†L708-L733】  The code caches
-`S_qmunu` because it whitens the basis before inverting the dielectric matrix.
+`S_qmunu` because of a suggestion to whiten the basis before inverting the dielectric matrix which is currently not used.
 
 ## 3. Coulomb matrix elements in the ISDF basis
 
@@ -196,18 +196,6 @@ degeneracy.  These systems have no factor of 2 for spin in the density or
 self-energy formulas.  The wavefunctions already represent the full spinor
 structure (though collapsed to a single component when SOC lifts degeneracy),
 so occupation is strictly 1 per state rather than 2.
-
-### Known Hartree normalization issue (TODO)
-
-The ISDF Hartree matrix elements currently exhibit a **constant additive offset**
-of approximately 17 Ry compared to QE reference values.  The exchange self-energy
-$\Sigma_X$ computed with the same wavefunctions and $V_{\mu\nu}$ is correct,
-so the issue is specific to the Hartree formula or its $\mathbf{q}=0$ Coulomb
-block $V_0$.  Possible causes under investigation:
-- The ISDF Coulomb matrix $V_{0,\mu\nu}$ naturally has a large projection onto
-  the "head" direction $\zeta_\mu^*(G{=}0)\zeta_\nu(G{=}0)$ even with $G=0$ zeroed,
-  which may require explicit subtraction.
-- Missing integration weight or cell-volume factor in the centroid sum.
 
 ## 7. Fixed-point self-consistency (prototype)
 

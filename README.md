@@ -19,23 +19,71 @@ the time-dependent COHSEX method for nonequilibrium simulations. The code is hea
 
 The package requires as input the BerkeleyGW format wavefunction files `WFN.h5` and `WFNq.h5`. It is currently only compatible with full-spinor wavefunctions, but it can be used with wavefunction k-grids that are reduced by symmetry using `kgrid.x`, in which case it will make use of a symmetry-reduced q-grid in self-energy matrix element calculations.
 
-The current most important executable files are:
-- `kmeans_isdf.py`
-- `cohsex_main.py`
+The main drivers are located in `src/isdf/`:
+- **GW/COHSEX**: `gw_isdf/cohsex_jax.py` (main driver), `w_isdf.py` (screened interaction)
+- **ISDF initialization**: `isdf_init/kmeans_isdf.py` (k-means clustering for interpolation points)
+- **Wavefunction loading**: `common/load_wfns.py` (FFT transforms, CCT/ZCT fitting)
 
-Which depend on I/O and support from
-- `wfnreader.py`
-- `symmetry_maps.py`
-- `tagged_arrays.py`
+Available as console commands: `cohsex_isdf`, `kmeans_isdf`, `bse_isdf`.
 
-And call routines important to the physics from
-- `gamma_matrices.py`
-- `w_isdf.py`
-- `get_charge_density.py`
-- `get_windows.py`
+## Documentation Guide
 
-These supplementary scripts are now stored in the root and `test_scripts/` directories
-to keep the repository root focused on the main COHSEX drivers.
+**For AI agents**: Read only the documentation relevant to your task to avoid context window overflow.
+
+### Core Comprehensive Guides (START HERE)
+
+- **[`docs/PHYSICS_COMPREHENSIVE.md`](docs/PHYSICS_COMPREHENSIVE.md)** — Physics & theory
+  - §1-3: ISDF theory, k-means clustering, Galerkin CCT/ZCT derivation
+  - §4: Complete 5-stage zeta fitting procedure
+  - §5: Chunking strategy and memory-efficient implementation
+  - §6: GW self-energy equations (COHSEX, head correction, self-consistency)
+  - §7: JAX sharding reference tables
+
+- **[`docs/CODEBASE_COMPREHENSIVE.md`](docs/CODEBASE_COMPREHENSIVE.md)** — Code structure & architecture
+  - Module organization, key classes (Meta, WFNReader, etc.)
+  - Data flow pipeline, file formats (HDF5)
+  - Entry points, function call hierarchy
+  - JAX sharding patterns, code location quick reference
+
+- **[`docs/ENVIRONMENT_COMPREHENSIVE.md`](docs/ENVIRONMENT_COMPREHENSIVE.md)** — Setup & deployment
+  - Dependencies, installation (uv, conda-forge, Docker)
+  - JAX configuration, environment variables
+  - Cluster usage (NERSC Perlmutter, SLURM)
+  - Multi-host/multi-GPU setup, CUDA compatibility
+
+### Specialized Topics
+
+- **[`docs/MEMORY_MODEL.md`](docs/MEMORY_MODEL.md)** — Memory footprints and GPU/CPU allocation strategy
+- **[`docs/CHUNK_BUDGETS.md`](docs/CHUNK_BUDGETS.md)** — Band/R/q chunking constraints and buffer sizes
+- **[`docs/chi_omega_quadrature.md`](docs/chi_omega_quadrature.md)** — CTSP (Complex-Time Shredded Propagator) quadrature method for χ⁰(iω)
+
+### Experimental/Reference
+
+- **[`docs/advanced/`](docs/advanced/)** — Multi-host JAX, specialized derivations (GPP model)
+- **[`docs/references/`](docs/references/)** — Reference papers (Kim 2020 CTSP, self-consistent GW)
+- **[`docs/archive/`](docs/archive/)** — **OUTDATED**: superseded docs (see archive/README.md for mapping)
+- **[`docs/NUFFT_BACKEND_STATUS.md`](docs/NUFFT_BACKEND_STATUS.md)** — NUFFT backend (CPU-only, not active)
+- **[`JAX_FINUFFT_USAGE.md`](JAX_FINUFFT_USAGE.md)** — jax-finufft notes and CUDA 13.0 issues
+
+### Agent Suggestions
+
+- **[`docs/AGENT_TODO.md`](docs/AGENT_TODO.md)** — **Code improvement suggestions (NOT user priorities)**
+
+### Task-Specific File Guide
+
+| Task | Read These Files |
+|------|------------------|
+| **Understanding ISDF theory** | `docs/PHYSICS_COMPREHENSIVE.md` §1-3 |
+| **Setting up environment** | `docs/ENVIRONMENT_COMPREHENSIVE.md` |
+| **Understanding code structure** | `docs/CODEBASE_COMPREHENSIVE.md` |
+| **Working on zeta fitting** | `docs/PHYSICS_COMPREHENSIVE.md` §4-5, `docs/CODEBASE_COMPREHENSIVE.md` §6, `src/isdf/common/load_wfns.py` |
+| **Debugging memory issues** | `docs/MEMORY_MODEL.md`, `docs/CHUNK_BUDGETS.md` |
+| **Modifying GW self-energy** | `docs/PHYSICS_COMPREHENSIVE.md` §6, `src/isdf/gw_isdf/cohsex_jax.py` |
+| **χ⁰ or W calculations** | `docs/chi_omega_quadrature.md`, `src/isdf/gw_isdf/w_isdf.py` |
+| **K-means clustering** | `docs/PHYSICS_COMPREHENSIVE.md` §1.2, `src/isdf/isdf_init/kmeans_isdf.py` |
+| **JAX sharding/chunking** | `docs/PHYSICS_COMPREHENSIVE.md` §5,§7, `src/isdf/common/load_wfns.py` |
+| **Multi-GPU/cluster setup** | `docs/ENVIRONMENT_COMPREHENSIVE.md` §4-5, `docs/advanced/jax_multihost.md` |
+| **Build issues (CUDA, finufft)** | `docs/ENVIRONMENT_COMPREHENSIVE.md` §6-7, `JAX_FINUFFT_USAGE.md` |
 
 ## Requirements
 - numpy
@@ -76,10 +124,19 @@ The provided `Dockerfile` mirrors these steps. If a GPU is available and cupy us
 
 - `src/isdf/` – Python package with all driver routines and utilities.
   - `isdf_init/` – k-means point generation and charge density tools.
-  - `gw_isdf/` – GW/COHSEX calculations (`cohsex_isdf`, `w_isdf`, `get_windows`).
+  - `gw_isdf/` – GW/COHSEX calculations (`cohsex_jax.py`, `w_isdf.py`, `get_windows.py`).
   - `bse_isdf/` – Bethe-Salpeter driver and notes.
-  - `common/` – shared helpers: wavefunction readers, symmetry maps, tagged arrays and GPU utilities.
-- `examples/` – runnable directories for the test and production COHSEX setups.
+  - `common/` – shared helpers: wavefunction readers (`load_wfns.py`), symmetry maps, FFT/NUFFT wrappers, tagged arrays.
+  - `io/` – HDF5 I/O for wavefunctions, centroids, self-energy output.
+  - `mixing/` – Self-consistent GW acceleration (Anderson mixing).
+- `docs/` – comprehensive documentation (see Documentation Guide above).
+  - Core guides: `PHYSICS_COMPREHENSIVE.md`, `CODEBASE_COMPREHENSIVE.md`, `ENVIRONMENT_COMPREHENSIVE.md`
+  - Specialized: `MEMORY_MODEL.md`, `CHUNK_BUDGETS.md`, `chi_omega_quadrature.md`
+  - `archive/` – outdated documentation (superseded, see archive/README.md).
+  - `references/` – reference papers (Kim 2020, self-consistent GW).
+  - `advanced/` – multi-host JAX, specialized derivations.
+  - `AGENT_TODO.md` – code improvement suggestions (not user priorities).
+- `examples/` – runnable directories for test and production COHSEX setups.
 - `tests/` – small regression tests.
 - `misc/` – larger data files and archived scripts.
 - `cohsex_isdf.py` – wrapper that launches the test example when run directly.
