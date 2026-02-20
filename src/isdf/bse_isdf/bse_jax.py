@@ -27,6 +27,10 @@ from __future__ import annotations
 import os
 from typing import Tuple, Callable, Optional, NamedTuple
 from functools import partial
+from types import SimpleNamespace
+import glob
+import math
+import sys
 
 import numpy as np
 import jax
@@ -34,6 +38,13 @@ import jax.numpy as jnp
 import h5py
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 from jax import lax
+try:
+    from jax import shard_map as _shard_map_fn
+except ImportError:  # pragma: no cover - older JAX
+    from jax.experimental import shard_map as _shard_map_mod
+    _shard_map_fn = _shard_map_mod.shard_map
+
+from isdf.bse_isdf.bse_preconditioner import energy_diff_cv_k
 
 # Enable 64-bit precision
 jax.config.update("jax_enable_x64", True)
@@ -85,6 +96,325 @@ def create_mesh_2d(devices: Optional[list] = None) -> Mesh:
     return Mesh(device_array, axis_names=('x', 'y'))
 
 
+def make_bse_shardings(mesh_xy: Mesh) -> SimpleNamespace:
+    return SimpleNamespace(
+        X=NamedSharding(mesh_xy, P(None, 'x', 'y', None)),
+        psi_x=NamedSharding(mesh_xy, P(None, None, None, 'x')),
+        psi_y=NamedSharding(mesh_xy, P(None, None, None, 'y')),
+        V=NamedSharding(mesh_xy, P('x', 'y')),
+        W=NamedSharding(mesh_xy, P('x', 'y', None, None, None)),
+        eps=NamedSharding(mesh_xy, P(None, None)),
+    )
+
+
+def build_bse_ring_matvec(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
+    px, py = mesh_xy.devices.shape
+    sh = make_bse_shardings(mesh_xy)
+
+    def _matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_q, V_q0):
+        return apply_bse_hamiltonian_ring(
+            X, nkx, nky, nkz,
+            psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
+            eps_c, eps_v, W_q, V_q0,
+            px, py,
+        )
+
+    return _shard_map_fn(
+        _matvec,
+        mesh=mesh_xy,
+        in_specs=(P(None, 'x', 'y', None), P(None, None, None, 'x'), P(None, None, None, 'y'),
+                  P(None, None, None, 'x'), P(None, None, None, 'y'),
+                  P(None, None), P(None, None), P('x', 'y', None, None, None), P('x', 'y')),
+        out_specs=P(None, 'x', 'y', None),
+    )
+
+
+def _ring_perm(axis_size: int) -> tuple[tuple[int, int], ...]:
+    return tuple((i, (i + 1) % axis_size) for i in range(axis_size))
+
+
+def _pad_to_multiple(x: jax.Array, axis: int, multiple: int) -> tuple[jax.Array, int]:
+    size = x.shape[axis]
+    pad = (-size) % multiple
+    if pad == 0:
+        return x, size
+    pad_width = [(0, 0)] * x.ndim
+    pad_width[axis] = (0, pad)
+    return jnp.pad(x, pad_width, mode="constant"), size
+
+
+def _pad_last_axis(x: jax.Array, target: int) -> jax.Array:
+    pad = target - x.shape[-1]
+    if pad <= 0:
+        return x
+    pad_width = [(0, 0)] * x.ndim
+    pad_width[-1] = (0, pad)
+    return jnp.pad(x, pad_width, mode="constant")
+
+
+def _pad_last_two_axes(x: jax.Array, target: int) -> jax.Array:
+    pad0 = target - x.shape[-2]
+    pad1 = target - x.shape[-1]
+    if pad0 <= 0 and pad1 <= 0:
+        return x
+    pad_width = [(0, 0)] * x.ndim
+    pad_width[-2] = (0, max(0, pad0))
+    pad_width[-1] = (0, max(0, pad1))
+    return jnp.pad(x, pad_width, mode="constant")
+
+
+def _pad_first_two_axes(x: jax.Array, target: int) -> jax.Array:
+    pad0 = target - x.shape[0]
+    pad1 = target - x.shape[1]
+    if pad0 <= 0 and pad1 <= 0:
+        return x
+    pad_width = [(0, 0)] * x.ndim
+    pad_width[0] = (0, max(0, pad0))
+    pad_width[1] = (0, max(0, pad1))
+    return jnp.pad(x, pad_width, mode="constant")
+
+
+def _pad_axis_to_multiple(x: jax.Array, axis: int, multiple: int) -> tuple[jax.Array, int]:
+    size = x.shape[axis]
+    pad = (-size) % multiple
+    if pad == 0:
+        return x, size
+    pad_width = [(0, 0)] * x.ndim
+    pad_width[axis] = (0, pad)
+    return jnp.pad(x, pad_width, mode="constant"), size
+
+
+def _ring_sum_valence(
+    X: jax.Array,
+    psi_v_Y: jax.Array,
+    v_chunk: int,
+    py: int,
+    nu_local: int,
+) -> jax.Array:
+    """Ring over Y to sum valence contraction into R(b, c_x, k, s, nu_y)."""
+    axis_index_y = jnp.asarray(lax.axis_index("y"), dtype=jnp.int32)
+    nk, _, nspinor, _ = psi_v_Y.shape
+
+    R0 = jnp.zeros((X.shape[0], X.shape[1], nk, nspinor, nu_local), dtype=X.dtype)
+    perm = _ring_perm(py)
+
+    def step(i, carry):
+        buf, R = carry
+        origin = (axis_index_y - jnp.asarray(i, dtype=jnp.int32)) % py
+        v_start = origin * jnp.asarray(v_chunk, dtype=jnp.int32)
+        z = jnp.int32(0)
+        psi_v_slice = lax.dynamic_slice(
+            psi_v_Y, (z, v_start, z, z), (nk, v_chunk, nspinor, nu_local)
+        )
+        R = R + jnp.einsum("kv sN,bcvk->bcksN", jnp.conj(psi_v_slice), buf)
+        buf = lax.ppermute(buf, axis_name="y", perm=perm)
+        return buf, R
+
+    R0 = lax.pcast(R0, axis_name=("x", "y"), to="varying")
+    _, R_total = lax.fori_loop(0, py, step, (X, R0))
+    return R_total
+
+
+def _ring_sum_conduction(
+    R: jax.Array,
+    psi_c_X: jax.Array,
+    c_chunk: int,
+    px: int,
+    mu_local: int,
+) -> jax.Array:
+    """Ring over X to sum conduction contraction into T(b, mu_x, nu_y, t, s, k)."""
+    axis_index_x = jnp.asarray(lax.axis_index("x"), dtype=jnp.int32)
+    nk, _, nspinor, _ = psi_c_X.shape
+    nu_local = R.shape[4]
+
+    T0 = jnp.zeros((R.shape[0], mu_local, nu_local, nspinor, nspinor, nk), dtype=R.dtype)
+    perm = _ring_perm(px)
+
+    def step(i, carry):
+        buf, T = carry
+        origin = (axis_index_x - jnp.asarray(i, dtype=jnp.int32)) % px
+        c_start = origin * jnp.asarray(c_chunk, dtype=jnp.int32)
+        z = jnp.int32(0)
+        psi_c_slice = lax.dynamic_slice(
+            psi_c_X, (z, c_start, z, z), (nk, c_chunk, nspinor, mu_local)
+        )
+        T = T + jnp.einsum("kctM,bcksN->bMNtsk", psi_c_slice, buf)
+        buf = lax.ppermute(buf, axis_name="x", perm=perm)
+        return buf, T
+
+    T0 = lax.pcast(T0, axis_name=("x", "y"), to="varying")
+    _, T_total = lax.fori_loop(0, px, step, (R, T0))
+    return T_total
+
+
+def apply_W_ring(
+    X: jax.Array,
+    psi_c_X: jax.Array,
+    psi_v_Y: jax.Array,
+    W_q: jax.Array,
+    nkx: int,
+    nky: int,
+    nkz: int,
+    px: int,
+    py: int,
+) -> jax.Array:
+    """Apply screened exchange using ring communication over X/Y."""
+    nk = nkx * nky * nkz
+    nb_trial, nc_local, nv_local, _ = X.shape
+    sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=jnp.float64))
+
+    c_chunk = X.shape[1]
+    v_chunk = X.shape[2]
+
+    # ----- Encode via ring reductions -----
+    n_rmu_local_X = psi_c_X.shape[-1]
+    n_rmu_local_Y = psi_v_Y.shape[-1]
+    R = _ring_sum_valence(X, psi_v_Y, v_chunk, py, n_rmu_local_Y)
+    T = _ring_sum_conduction(R, psi_c_X, c_chunk, px, n_rmu_local_X)
+
+    # ----- Convolution in k using FFT -----
+    nspinor = psi_c_X.shape[2]
+
+    T_k = T.reshape(nb_trial, n_rmu_local_X, n_rmu_local_Y, nspinor, nspinor, nkx, nky, nkz)
+    T_R = jnp.fft.ifftn(T_k, axes=(5, 6, 7), norm="ortho")
+    W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
+    U_R = W_R[None, :, :, None, None, :, :, :] * T_R
+    U_q = jnp.fft.fftn(U_R, axes=(5, 6, 7), norm="ortho")
+    U = U_q.reshape(nb_trial, n_rmu_local_X, n_rmu_local_Y, nspinor, nspinor, nk)
+
+    # ----- Decode: reduce-scatter over X then Y -----
+    A_partial = jnp.einsum("kctM,bMNtsk->bcNsk", jnp.conj(psi_c_X), U)
+    D = lax.psum_scatter(A_partial, axis_name="x", scatter_dimension=1, tiled=True)
+    WX_partial = jnp.einsum("kvsN,bcNsk->bcvk", psi_v_Y, D)
+    WX = lax.psum_scatter(WX_partial, axis_name="y", scatter_dimension=2, tiled=True)
+
+    return WX / sqrt_nk
+
+
+def apply_V_ring(
+    X: jax.Array,
+    psi_c_Y: jax.Array,
+    psi_v_Y: jax.Array,
+    psi_c_X: jax.Array,
+    psi_v_X: jax.Array,
+    V_q0: jax.Array,
+    nk: int,
+    px: int,
+    py: int,
+) -> jax.Array:
+    """Apply direct term using ring communication over Y (v) then X (c)."""
+    nb_trial, _, _, _ = X.shape
+    sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=jnp.float64))
+
+    c_chunk = X.shape[1]
+    v_chunk = X.shape[2]
+
+    axis_index_x = jnp.asarray(lax.axis_index("x"), dtype=jnp.int32)
+    axis_index_y = jnp.asarray(lax.axis_index("y"), dtype=jnp.int32)
+
+    nk_local = psi_c_Y.shape[0]
+    nspinor = psi_c_Y.shape[2]
+    nu_local = psi_c_Y.shape[-1]
+    mu_local = psi_c_X.shape[-1]
+
+    # ----- Ring over Y: sum over v for local c chunk -----
+    c_start_local = axis_index_x * jnp.asarray(c_chunk, dtype=jnp.int32)
+    z = jnp.int32(0)
+    psi_c_slice = lax.dynamic_slice(
+        psi_c_Y, (z, c_start_local, z, z), (nk_local, c_chunk, nspinor, nu_local)
+    )
+
+    A0 = jnp.zeros((nb_trial, c_chunk, nu_local, nk_local), dtype=X.dtype)
+    perm_y = _ring_perm(py)
+
+    def step_y(i, carry):
+        buf, A = carry
+        origin = (axis_index_y - jnp.asarray(i, dtype=jnp.int32)) % py
+        v_start = origin * jnp.asarray(v_chunk, dtype=jnp.int32)
+        psi_v_slice = lax.dynamic_slice(
+            psi_v_Y, (z, v_start, z, z), (nk_local, v_chunk, nspinor, nu_local)
+        )
+        R_v = jnp.einsum("kvsN,bcvk->bcksN", psi_v_slice, buf)
+        A = A + jnp.einsum("kcsN,bcksN->bcNk", jnp.conj(psi_c_slice), R_v)
+        buf = lax.ppermute(buf, axis_name="y", perm=perm_y)
+        return buf, A
+
+    A0 = lax.pcast(A0, axis_name=("x", "y"), to="varying")
+    _, A_local = lax.fori_loop(0, py, step_y, (X, A0))
+
+    # ----- Ring over X: sum over c to build S(b, nu, k) -----
+    S0 = jnp.zeros((nb_trial, nu_local, nk_local), dtype=X.dtype)
+    perm_x = _ring_perm(px)
+
+    def step_x(i, carry):
+        buf, S = carry
+        S = S + jnp.sum(buf, axis=1)
+        buf = lax.ppermute(buf, axis_name="x", perm=perm_x)
+        return buf, S
+
+    S0 = lax.pcast(S0, axis_name=("x", "y"), to="varying")
+    _, S_total = lax.fori_loop(0, px, step_x, (A_local, S0))
+
+    # Split 1/Nk across encode/decode
+    S_total = S_total / sqrt_nk
+
+    # ----- Apply V(μ,ν) at q=0 -----
+    U_partial = jnp.einsum("MN,bNk->bMk", V_q0, S_total)
+    U = lax.psum(U_partial, axis_name="y")
+
+    # ----- Decode: local v chunk, reduce-scatter over X for c -----
+    v_start_local = axis_index_y * jnp.asarray(v_chunk, dtype=jnp.int32)
+    psi_v_slice_X = lax.dynamic_slice(
+        psi_v_X, (z, v_start_local, z, z), (nk_local, v_chunk, nspinor, mu_local)
+    )
+    M_X = jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c_X), psi_v_slice_X)
+    VX_partial = jnp.einsum("kcvM,bMk->bcvk", jnp.conj(M_X), U)
+    VX = lax.psum_scatter(VX_partial, axis_name="x", scatter_dimension=1, tiled=True)
+
+    return VX / sqrt_nk
+
+
+def apply_bse_hamiltonian_ring(
+    X: jax.Array,
+    nkx: int,
+    nky: int,
+    nkz: int,
+    psi_c_X: jax.Array,
+    psi_c_Y: jax.Array,
+    psi_v_X: jax.Array,
+    psi_v_Y: jax.Array,
+    eps_c: jax.Array,
+    eps_v: jax.Array,
+    W_q: jax.Array,
+    V_q0: jax.Array,
+    px: int,
+    py: int,
+) -> jax.Array:
+    nk = nkx * nky * nkz
+    if X.shape[1] % px != 0 or X.shape[2] % py != 0:
+        raise ValueError("X band dimensions must be divisible by px/py for ring matvec")
+
+    eps_c_pad = eps_c
+    eps_v_pad = eps_v
+    X_pad = X
+    axis_index_x = jnp.asarray(lax.axis_index("x"), dtype=jnp.int32)
+    axis_index_y = jnp.asarray(lax.axis_index("y"), dtype=jnp.int32)
+    c_chunk = X_pad.shape[1]
+    v_chunk = X_pad.shape[2]
+    c_chunk_i = jnp.asarray(c_chunk, dtype=jnp.int32)
+    v_chunk_i = jnp.asarray(v_chunk, dtype=jnp.int32)
+    z = jnp.int32(0)
+    eps_c_local = lax.dynamic_slice(eps_c_pad, (z, axis_index_x * c_chunk_i), (nk, c_chunk))
+    eps_v_local = lax.dynamic_slice(eps_v_pad, (z, axis_index_y * v_chunk_i), (nk, v_chunk))
+    delta_E = eps_c_local.T[None, :, None, :] - eps_v_local.T[None, None, :, :]
+    D_term = delta_E * X_pad
+    V_term = apply_V_ring(X_pad, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0, nk, px, py)
+    W_term = apply_W_ring(X_pad, psi_c_X, psi_v_Y, W_q, nkx, nky, nkz, px, py)
+
+    HX = D_term + V_term - W_term
+    return HX
+
+
 def _get_local_mesh_coords(mesh_xy: Mesh) -> tuple[list[tuple[int, int]], int, int]:
     devices_2d = np.asarray(mesh_xy.devices)
     grid_x, grid_y = devices_2d.shape
@@ -116,7 +446,9 @@ def _read_psi_mu_sharded(
     mu_per_shard: int,
     axis: str,
     mesh_xy: Mesh,
+    n_rmu_pad: int,
     dtype: np.dtype = np.complex128,
+    trim: bool = True,
 ) -> jax.Array:
     local_coords, grid_x, grid_y = _get_local_mesh_coords(mesh_xy)
     local_x, local_y = _get_local_axis_coords(local_coords)
@@ -149,11 +481,11 @@ def _read_psi_mu_sharded(
         mu_off = i * mu_per_shard
         local_psi[:, :, :, mu_off:mu_off + mu_per_shard] = slab
 
-    global_shape = (nk, nb, nspinor, mu_per_shard * n_axis)
+    global_shape = (nk, nb, nspinor, n_rmu_pad)
     psi_sharding = NamedSharding(mesh_xy, P(None, None, None, axis))
     local_psi_jax = jax.device_put(local_psi)
     psi_global = jax.make_array_from_process_local_data(psi_sharding, local_psi_jax, global_shape)
-    if global_shape[-1] > n_rmu:
+    if trim and global_shape[-1] > n_rmu:
         psi_global = psi_global[..., :n_rmu]
     return psi_global
 
@@ -163,7 +495,9 @@ def _read_vq0_sharded(
     mu_per_x: int,
     nu_per_y: int,
     mesh_xy: Mesh,
+    n_rmu_pad: int,
     dtype: np.dtype = np.complex128,
+    trim: bool = True,
 ) -> jax.Array:
     local_coords, grid_x, grid_y = _get_local_mesh_coords(mesh_xy)
     local_x, local_y = _get_local_axis_coords(local_coords)
@@ -194,11 +528,11 @@ def _read_vq0_sharded(
             nu_off = iy * nu_per_y
             local_v[mu_off:mu_off + mu_per_x, nu_off:nu_off + nu_per_y] = slab
 
-    global_shape = (mu_per_x * grid_x, nu_per_y * grid_y)
+    global_shape = (n_rmu_pad, n_rmu_pad)
     v_sharding = NamedSharding(mesh_xy, P("x", "y"))
     local_v_jax = jax.device_put(local_v)
     v_global = jax.make_array_from_process_local_data(v_sharding, local_v_jax, global_shape)
-    if global_shape[0] > n_rmu or global_shape[1] > n_rnu:
+    if trim and (global_shape[0] > n_rmu or global_shape[1] > n_rnu):
         v_global = v_global[:n_rmu, :n_rnu]
     return v_global
 
@@ -208,7 +542,9 @@ def _read_wq_sharded(
     mu_per_x: int,
     nu_per_y: int,
     mesh_xy: Mesh,
+    n_rmu_pad: int,
     dtype: np.dtype = np.complex128,
+    trim: bool = True,
 ) -> jax.Array:
     local_coords, grid_x, grid_y = _get_local_mesh_coords(mesh_xy)
     local_x, local_y = _get_local_axis_coords(local_coords)
@@ -241,11 +577,11 @@ def _read_wq_sharded(
             nu_off = iy * nu_per_y
             local_w[mu_off:mu_off + mu_per_x, nu_off:nu_off + nu_per_y, :, :, :] = slab
 
-    global_shape = (mu_per_x * grid_x, nu_per_y * grid_y, nkx, nky, nkz)
+    global_shape = (n_rmu_pad, n_rmu_pad, nkx, nky, nkz)
     w_sharding = NamedSharding(mesh_xy, P("x", "y", None, None, None))
     local_w_jax = jax.device_put(local_w)
     w_global = jax.make_array_from_process_local_data(w_sharding, local_w_jax, global_shape)
-    if global_shape[0] > n_rmu or global_shape[1] > n_rnu:
+    if trim and (global_shape[0] > n_rmu or global_shape[1] > n_rnu):
         w_global = w_global[:n_rmu, :n_rnu, :, :, :]
     return w_global
 
@@ -256,6 +592,7 @@ def load_bse_data_from_restart_sharded(
     n_cond: int = 4,
     fermi_energy: float = 0.0,
     mesh_xy: Optional[Mesh] = None,
+    pad_bands: bool = True,
 ) -> dict:
     """Load BSE inputs from a COHSEX restart file using sharded HDF5 reads.
 
@@ -299,16 +636,27 @@ def load_bse_data_from_restart_sharded(
         eps_c = jnp.asarray(enk_r[:, cond_indices])
 
         _, grid_x, grid_y = _get_local_mesh_coords(mesh_xy)
-        mu_per_x = (n_rmu + grid_x - 1) // grid_x
-        nu_per_y = (n_rmu + grid_y - 1) // grid_y
+        lcm_xy = math.lcm(grid_x, grid_y)
+        n_rmu_pad = ((n_rmu + lcm_xy - 1) // lcm_xy) * lcm_xy
+        mu_per_x = n_rmu_pad // grid_x
+        nu_per_y = n_rmu_pad // grid_y
 
-        psi_v_X = _read_psi_mu_sharded(psi_l_dset, val_indices, mu_per_x, "x", mesh_xy)
-        psi_c_X = _read_psi_mu_sharded(psi_r_dset, cond_indices, mu_per_x, "x", mesh_xy)
+        psi_v_X = _read_psi_mu_sharded(psi_l_dset, val_indices, mu_per_x, "x", mesh_xy, n_rmu_pad, trim=False)
+        psi_c_X = _read_psi_mu_sharded(psi_r_dset, cond_indices, mu_per_x, "x", mesh_xy, n_rmu_pad, trim=False)
+
+        if pad_bands:
+            psi_v_X, n_val_pad = _pad_axis_to_multiple(psi_v_X, axis=1, multiple=grid_y)
+            psi_c_X, n_cond_pad = _pad_axis_to_multiple(psi_c_X, axis=1, multiple=grid_x)
+            eps_v, _ = _pad_axis_to_multiple(eps_v, axis=1, multiple=grid_y)
+            eps_c, _ = _pad_axis_to_multiple(eps_c, axis=1, multiple=grid_x)
+        else:
+            n_val_pad = int(psi_v_X.shape[1])
+            n_cond_pad = int(psi_c_X.shape[1])
         psi_v_Y = jax.lax.with_sharding_constraint(psi_v_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
         psi_c_Y = jax.lax.with_sharding_constraint(psi_c_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
 
-        V_q0 = _read_vq0_sharded(vq_dset, mu_per_x, nu_per_y, mesh_xy)
-        W_q = _read_wq_sharded(wq_dset, mu_per_x, nu_per_y, mesh_xy)
+        V_q0 = _read_vq0_sharded(vq_dset, mu_per_x, nu_per_y, mesh_xy, n_rmu_pad, trim=False)
+        W_q = _read_wq_sharded(wq_dset, mu_per_x, nu_per_y, mesh_xy, n_rmu_pad, trim=False)
 
     return {
         "psi_c_X": psi_c_X,
@@ -322,8 +670,12 @@ def load_bse_data_from_restart_sharded(
         "nkx": nkx,
         "nky": nky,
         "nkz": nkz,
+        "n_rmu": n_rmu,
+        "n_rmu_pad": n_rmu_pad,
         "n_val": n_val,
         "n_cond": n_cond,
+        "n_val_pad": n_val_pad,
+        "n_cond_pad": n_cond_pad,
         "fermi_energy": fermi_energy,
     }
 
@@ -460,10 +812,8 @@ def apply_D(
     Returns:
         DX: (nb_trial, nc, nv, nk)
     """
-    # Energy difference: (nk, nc, nv) -> broadcast with X
-    # eps_c: (nk, nc) -> (1, nc, 1, nk)
-    # eps_v: (nk, nv) -> (1, 1, nv, nk)
-    delta_E = eps_c.T[None, :, None, :] - eps_v.T[None, None, :, :]  # (1, nc, nv, nk)
+    # Energy difference: (nc, nv, nk) -> broadcast with X
+    delta_E = energy_diff_cv_k(eps_c, eps_v)[None, :, :, :]
     return delta_E * X
 
 
@@ -661,7 +1011,7 @@ def apply_bse_hamiltonian_single_device(
     # Note: eps are (nk, nb), need to broadcast correctly
     # D(c,v,k) = ε_c(k,c) - ε_v(k,v)
     # X is (b, c, v, k) so we need (1, nc, 1, nk) - (1, 1, nv, nk)
-    delta_E = eps_c.T[None, :, None, :] - eps_v.T[None, None, :, :]
+    delta_E = energy_diff_cv_k(eps_c, eps_v)[None, :, :, :]
     D_term = delta_E * X
     
     # ===== Pair amplitude: M(k, c, v, μ) = Σ_s ψ*_{c,s}(μ,k) ψ_{v,s}(μ,k) =====
@@ -1131,7 +1481,213 @@ def solve_bse(
     return eigenvalues, eigenvectors
 
 
+def ring_matvec_smoke_test(px: int = 2, py: int = 2) -> None:
+    """Small CPU-mesh smoke test for ring-based matvec and shardings."""
+    devices = jax.devices()
+    if len(devices) < px * py:
+        raise RuntimeError(
+            f"Need {px*py} devices, found {len(devices)}. "
+            "Set XLA_FLAGS=--xla_force_host_platform_device_count=... before running."
+        )
+    mesh = Mesh(np.array(devices[:px * py]).reshape(px, py), axis_names=("x", "y"))
+    sh = make_bse_shardings(mesh)
+
+    nkx, nky, nkz = 2, 2, 1
+    nk = nkx * nky * nkz
+    nc, nv, nspinor, n_rmu = 4 * px, 4 * py, 2, 8 * px * py
+
+    key = jax.random.PRNGKey(0)
+    psi_c = jax.random.normal(key, (nk, nc, nspinor, n_rmu)) + 1j * jax.random.normal(key, (nk, nc, nspinor, n_rmu))
+    psi_v = jax.random.normal(key, (nk, nv, nspinor, n_rmu)) + 1j * jax.random.normal(key, (nk, nv, nspinor, n_rmu))
+    eps_c = jax.random.uniform(key, (nk, nc), minval=0.1, maxval=0.5)
+    eps_v = jax.random.uniform(key, (nk, nv), minval=-0.5, maxval=-0.1)
+    W_q = jax.random.normal(key, (n_rmu, n_rmu, nkx, nky, nkz)) * 0.01
+    V_q0 = jnp.eye(n_rmu) * 0.05
+    X = jax.random.normal(key, (1, nc, nv, nk)) + 1j * jax.random.normal(key, (1, nc, nv, nk))
+
+    with mesh:
+        psi_c_X = jax.lax.with_sharding_constraint(psi_c, sh.psi_x)
+        psi_c_Y = jax.lax.with_sharding_constraint(psi_c, sh.psi_y)
+        psi_v_X = jax.lax.with_sharding_constraint(psi_v, sh.psi_x)
+        psi_v_Y = jax.lax.with_sharding_constraint(psi_v, sh.psi_y)
+        W_q = jax.lax.with_sharding_constraint(W_q, sh.W)
+        V_q0 = jax.lax.with_sharding_constraint(V_q0, sh.V)
+        X = jax.lax.with_sharding_constraint(X, sh.X)
+
+        matvec = build_bse_ring_matvec(mesh, nkx, nky, nkz)
+        HX = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_q, V_q0)
+        HX.block_until_ready()
+
+    print(f"HX sharding: {HX.sharding}")
+    if hasattr(jax.debug, "inspect_array_sharding"):
+        try:
+            jax.debug.inspect_array_sharding(HX, name="HX")
+        except TypeError:
+            try:
+                jax.debug.inspect_array_sharding(HX, callback=lambda *_: None)
+            except TypeError:
+                pass
+
+
+def _find_restart_file(input_file: str) -> str:
+    input_dir = os.path.dirname(os.path.abspath(input_file))
+    candidates = []
+    candidates.extend(sorted(glob.glob(os.path.join(input_dir, "tmp", "isdf_tensors_*.h5"))))
+    candidates.extend(sorted(glob.glob(os.path.join(input_dir, "isdf_tensors_*.h5"))))
+    candidates.extend([
+        os.path.join(input_dir, "tmp", "taggedarrays600.h5"),
+        os.path.join(input_dir, "tmp", "taggedarrays.h5"),
+        os.path.join(input_dir, "taggedarrays.h5"),
+    ])
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError(f"Could not find restart file in {input_dir}")
+
+
+def ring_matvec_correctness_check(
+    input_file: str,
+    n_val: int = 4,
+    n_cond: int = 4,
+    px: int = 2,
+    py: int = 2,
+    component_check: bool = False,
+) -> None:
+    restart_file = _find_restart_file(input_file)
+    devices = jax.devices()
+    if len(devices) < px * py:
+        raise RuntimeError(
+            f"Need {px*py} devices, found {len(devices)}. "
+            "Set XLA_FLAGS=--xla_force_host_platform_device_count=... before running."
+        )
+    mesh = Mesh(np.array(devices[:px * py]).reshape(px, py), axis_names=("x", "y"))
+    sh = make_bse_shardings(mesh)
+
+    with h5py.File(restart_file, "r") as f:
+        V_qmunu = jnp.asarray(f["V_qmunu"][:])
+        if "W0_qmunu" in f and bool(f["W0_qmunu"].attrs.get("W0_ready", False)):
+            W0_qmunu = jnp.asarray(f["W0_qmunu"][:])
+        else:
+            W0_qmunu = None
+        psi_l = jnp.asarray(f["psi_l"][:])
+        psi_r = jnp.asarray(f["psi_r"][:])
+        enk_l = jnp.asarray(f["enk_l"][:])
+        enk_r = jnp.asarray(f["enk_r"][:])
+
+    nkx, nky, nkz = V_qmunu.shape[3:6]
+    nk = nkx * nky * nkz
+    n_rmu = int(V_qmunu.shape[-1])
+    lcm_xy = math.lcm(px, py)
+    n_rmu_pad = ((n_rmu + lcm_xy - 1) // lcm_xy) * lcm_xy
+
+    mean_enk_l = jnp.mean(enk_l, axis=0)
+    mean_enk_r = jnp.mean(enk_r, axis=0)
+    val_mask_l = mean_enk_l < 0.0
+    cond_mask_r = mean_enk_r > 0.0
+    n_val = min(n_val, int(jnp.sum(val_mask_l)))
+    n_cond = min(n_cond, int(jnp.sum(cond_mask_r)))
+    val_indices = jnp.argsort(jnp.where(val_mask_l, mean_enk_l, -jnp.inf))[-n_val:]
+    cond_indices = jnp.argsort(jnp.where(cond_mask_r, mean_enk_r, jnp.inf))[:n_cond]
+
+    psi_v = psi_l[:, val_indices, :, :]
+    psi_c = psi_r[:, cond_indices, :, :]
+    eps_v = enk_l[:, val_indices]
+    eps_c = enk_r[:, cond_indices]
+
+    psi_v = _pad_last_axis(psi_v, n_rmu_pad)
+    psi_c = _pad_last_axis(psi_c, n_rmu_pad)
+    psi_v, n_val_pad = _pad_axis_to_multiple(psi_v, axis=1, multiple=py)
+    psi_c, n_cond_pad = _pad_axis_to_multiple(psi_c, axis=1, multiple=px)
+    eps_v, _ = _pad_axis_to_multiple(eps_v, axis=1, multiple=py)
+    eps_c, _ = _pad_axis_to_multiple(eps_c, axis=1, multiple=px)
+    V_q0 = V_qmunu[0, 0, 0, 0, 0, 0, :, :]
+    V_q0 = _pad_last_two_axes(V_q0, n_rmu_pad)
+    W_src = W0_qmunu if W0_qmunu is not None else V_qmunu
+    W_q = W_src[0, 0, 0, :, :, :, :, :].transpose(3, 4, 0, 1, 2)
+    W_q = _pad_first_two_axes(W_q, n_rmu_pad)
+
+    key = jax.random.PRNGKey(0)
+    X = jax.random.normal(key, (1, n_cond_pad, n_val_pad, nk)) + 1j * jax.random.normal(key, (1, n_cond_pad, n_val_pad, nk))
+
+    HX_ref = apply_bse_hamiltonian_single_device(
+        X, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz
+    )
+
+    with mesh:
+        psi_c_X = jax.lax.with_sharding_constraint(psi_c, sh.psi_x)
+        psi_c_Y = jax.lax.with_sharding_constraint(psi_c, sh.psi_y)
+        psi_v_X = jax.lax.with_sharding_constraint(psi_v, sh.psi_x)
+        psi_v_Y = jax.lax.with_sharding_constraint(psi_v, sh.psi_y)
+        W_q = jax.lax.with_sharding_constraint(W_q, sh.W)
+        V_q0 = jax.lax.with_sharding_constraint(V_q0, sh.V)
+        X = jax.lax.with_sharding_constraint(X, sh.X)
+
+        matvec = build_bse_ring_matvec(mesh, nkx, nky, nkz)
+        HX_ring = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_q, V_q0)
+        HX_ring.block_until_ready()
+
+    HX_ring_host = jax.device_get(HX_ring)
+    diff = jnp.linalg.norm(HX_ring_host - HX_ref) / jnp.maximum(jnp.linalg.norm(HX_ref), 1e-12)
+    print(f"Relative error ||HX_ring - HX_ref||/||HX_ref||: {float(diff):.3e}")
+
+    if component_check:
+        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=jnp.float64))
+        M = compute_pair_amplitude(psi_c, psi_v)
+        D_ref = apply_D(X, eps_c, eps_v)
+        S_V = jnp.einsum('kcvN,bcvk->bNk', M, X) / sqrt_nk
+        U_V = jnp.einsum('MN,bNk->bMk', V_q0, S_V)
+        V_ref = jnp.einsum('kcvM,bMk->bcvk', jnp.conj(M), U_V) / sqrt_nk
+
+        R = jnp.einsum('kvsN,bcvk->bcksN', jnp.conj(psi_v), X)
+        T = jnp.einsum('kctM,bcksN->bMNtsk', psi_c, R)
+        T_k = T.reshape(X.shape[0], n_rmu_pad, n_rmu_pad, psi_c.shape[2], psi_c.shape[2], nkx, nky, nkz)
+        T_R = jnp.fft.ifftn(T_k, axes=(5, 6, 7), norm='ortho')
+        W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm='ortho')
+        U_R = W_R[None, :, :, None, None, :, :, :] * T_R
+        U_q = jnp.fft.fftn(U_R, axes=(5, 6, 7), norm='ortho')
+        U = U_q.reshape(X.shape[0], n_rmu_pad, n_rmu_pad, psi_c.shape[2], psi_c.shape[2], nk)
+        A = jnp.einsum('kctM,bMNtsk->bcNsk', jnp.conj(psi_c), U)
+        W_ref = jnp.einsum('kvsN,bcNsk->bcvk', psi_v, A) / sqrt_nk
+
+        comp_matvec = build_bse_ring_matvec(mesh, nkx, nky, nkz)
+        with mesh:
+            D_ring = apply_D(X, eps_c, eps_v)
+            V_ring = comp_matvec(
+                X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c * 0.0, eps_v * 0.0, W_q * 0.0, V_q0
+            )
+            W_ring = comp_matvec(
+                X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c * 0.0, eps_v * 0.0, W_q, V_q0 * 0.0
+            )
+            D_ring.block_until_ready()
+            V_ring.block_until_ready()
+            W_ring.block_until_ready()
+
+        def _rel_err(a, b):
+            return float(jnp.linalg.norm(a - b) / jnp.maximum(jnp.linalg.norm(b), 1e-12))
+
+        print(f"Component error D: { _rel_err(D_ring, D_ref):.3e}")
+        print(f"Component error V: { _rel_err(V_ring, V_ref):.3e}")
+        print(f"Component error W: { _rel_err(-W_ring, W_ref):.3e}")
+
+
 if __name__ == "__main__":
+    if "--ring-check" in sys.argv:
+        import argparse
+
+        parser = argparse.ArgumentParser(description="Ring matvec correctness check")
+        parser.add_argument("-i", "--input", required=True, help="COHSEX input file (for restart lookup)")
+        parser.add_argument("--n-val", type=int, default=4)
+        parser.add_argument("--n-cond", type=int, default=4)
+        parser.add_argument("--px", type=int, default=2)
+        parser.add_argument("--py", type=int, default=2)
+        args, _ = parser.parse_known_args()
+        ring_matvec_correctness_check(args.input, args.n_val, args.n_cond, args.px, args.py, "--components" in sys.argv)
+        raise SystemExit(0)
+
+    if "--ring-test" in sys.argv:
+        ring_matvec_smoke_test()
+        raise SystemExit(0)
+
     # Quick sanity check with random data
     print("Testing BSE matvec with random data...")
     
