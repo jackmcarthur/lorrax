@@ -31,6 +31,7 @@ from functools import partial
 import numpy as np
 import jax
 import jax.numpy as jnp
+import h5py
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 from jax import lax
 
@@ -82,6 +83,249 @@ def create_mesh_2d(devices: Optional[list] = None) -> Mesh:
     
     device_array = np.array(devices).reshape(px, py)
     return Mesh(device_array, axis_names=('x', 'y'))
+
+
+def _get_local_mesh_coords(mesh_xy: Mesh) -> tuple[list[tuple[int, int]], int, int]:
+    devices_2d = np.asarray(mesh_xy.devices)
+    grid_x, grid_y = devices_2d.shape
+    local_devices = list(jax.local_devices())
+    local_coords = [tuple(np.argwhere(devices_2d == d)[0]) for d in local_devices]
+    local_coords = sorted(local_coords, key=lambda c: c[0] * grid_y + c[1])
+    return local_coords, grid_x, grid_y
+
+
+def _get_local_axis_coords(local_coords: list[tuple[int, int]]) -> tuple[list[int], list[int]]:
+    local_x = sorted({coord[0] for coord in local_coords})
+    local_y = sorted({coord[1] for coord in local_coords})
+    return local_x, local_y
+
+
+def _assert_local_block(local_coords: list[tuple[int, int]], local_x: list[int], local_y: list[int]) -> None:
+    expected = {(x, y) for x in local_x for y in local_y}
+    actual = set(local_coords)
+    if actual != expected:
+        raise ValueError(
+            "Local devices are not a full x/y block; shard-aware loader expects "
+            "local device coords to form a Cartesian product."
+        )
+
+
+def _read_psi_mu_sharded(
+    dset: h5py.Dataset,
+    band_indices: np.ndarray,
+    mu_per_shard: int,
+    axis: str,
+    mesh_xy: Mesh,
+    dtype: np.dtype = np.complex128,
+) -> jax.Array:
+    local_coords, grid_x, grid_y = _get_local_mesh_coords(mesh_xy)
+    local_x, local_y = _get_local_axis_coords(local_coords)
+    _assert_local_block(local_coords, local_x, local_y)
+    n_rmu = dset.shape[-1]
+
+    if axis == "x":
+        local_axis_coords = local_x
+        n_axis = grid_x
+    elif axis == "y":
+        local_axis_coords = local_y
+        n_axis = grid_y
+    else:
+        raise ValueError("axis must be 'x' or 'y'")
+
+    nk, _, nspinor, _ = dset.shape
+    nb = len(band_indices)
+    local_mu = mu_per_shard * len(local_axis_coords)
+    local_psi = np.zeros((nk, nb, nspinor, local_mu), dtype=dtype)
+
+    for i, coord in enumerate(local_axis_coords):
+        mu_start = coord * mu_per_shard
+        mu_end = min(mu_start + mu_per_shard, n_rmu)
+        if mu_start >= n_rmu:
+            continue
+        slab = dset[:, band_indices, :, mu_start:mu_end]
+        if slab.shape[-1] < mu_per_shard:
+            pad = mu_per_shard - slab.shape[-1]
+            slab = np.pad(slab, ((0, 0), (0, 0), (0, 0), (0, pad)), mode="constant")
+        mu_off = i * mu_per_shard
+        local_psi[:, :, :, mu_off:mu_off + mu_per_shard] = slab
+
+    global_shape = (nk, nb, nspinor, mu_per_shard * n_axis)
+    psi_sharding = NamedSharding(mesh_xy, P(None, None, None, axis))
+    local_psi_jax = jax.device_put(local_psi)
+    psi_global = jax.make_array_from_process_local_data(psi_sharding, local_psi_jax, global_shape)
+    if global_shape[-1] > n_rmu:
+        psi_global = psi_global[..., :n_rmu]
+    return psi_global
+
+
+def _read_vq0_sharded(
+    dset: h5py.Dataset,
+    mu_per_x: int,
+    nu_per_y: int,
+    mesh_xy: Mesh,
+    dtype: np.dtype = np.complex128,
+) -> jax.Array:
+    local_coords, grid_x, grid_y = _get_local_mesh_coords(mesh_xy)
+    local_x, local_y = _get_local_axis_coords(local_coords)
+    _assert_local_block(local_coords, local_x, local_y)
+    n_rmu = dset.shape[6]
+    n_rnu = dset.shape[7]
+
+    local_mu = mu_per_x * len(local_x)
+    local_nu = nu_per_y * len(local_y)
+    local_v = np.zeros((local_mu, local_nu), dtype=dtype)
+
+    for ix, x_coord in enumerate(local_x):
+        mu_start = x_coord * mu_per_x
+        mu_end = min(mu_start + mu_per_x, n_rmu)
+        if mu_start >= n_rmu:
+            continue
+        for iy, y_coord in enumerate(local_y):
+            nu_start = y_coord * nu_per_y
+            nu_end = min(nu_start + nu_per_y, n_rnu)
+            if nu_start >= n_rnu:
+                continue
+            slab = dset[0, 0, 0, 0, 0, 0, mu_start:mu_end, nu_start:nu_end]
+            if slab.shape[0] < mu_per_x or slab.shape[1] < nu_per_y:
+                pad_mu = mu_per_x - slab.shape[0]
+                pad_nu = nu_per_y - slab.shape[1]
+                slab = np.pad(slab, ((0, pad_mu), (0, pad_nu)), mode="constant")
+            mu_off = ix * mu_per_x
+            nu_off = iy * nu_per_y
+            local_v[mu_off:mu_off + mu_per_x, nu_off:nu_off + nu_per_y] = slab
+
+    global_shape = (mu_per_x * grid_x, nu_per_y * grid_y)
+    v_sharding = NamedSharding(mesh_xy, P("x", "y"))
+    local_v_jax = jax.device_put(local_v)
+    v_global = jax.make_array_from_process_local_data(v_sharding, local_v_jax, global_shape)
+    if global_shape[0] > n_rmu or global_shape[1] > n_rnu:
+        v_global = v_global[:n_rmu, :n_rnu]
+    return v_global
+
+
+def _read_wq_sharded(
+    dset: h5py.Dataset,
+    mu_per_x: int,
+    nu_per_y: int,
+    mesh_xy: Mesh,
+    dtype: np.dtype = np.complex128,
+) -> jax.Array:
+    local_coords, grid_x, grid_y = _get_local_mesh_coords(mesh_xy)
+    local_x, local_y = _get_local_axis_coords(local_coords)
+    _assert_local_block(local_coords, local_x, local_y)
+    n_rmu = dset.shape[6]
+    n_rnu = dset.shape[7]
+    nkx, nky, nkz = dset.shape[3:6]
+
+    local_mu = mu_per_x * len(local_x)
+    local_nu = nu_per_y * len(local_y)
+    local_w = np.zeros((local_mu, local_nu, nkx, nky, nkz), dtype=dtype)
+
+    for ix, x_coord in enumerate(local_x):
+        mu_start = x_coord * mu_per_x
+        mu_end = min(mu_start + mu_per_x, n_rmu)
+        if mu_start >= n_rmu:
+            continue
+        for iy, y_coord in enumerate(local_y):
+            nu_start = y_coord * nu_per_y
+            nu_end = min(nu_start + nu_per_y, n_rnu)
+            if nu_start >= n_rnu:
+                continue
+            slab = dset[0, 0, 0, :, :, :, mu_start:mu_end, nu_start:nu_end]
+            slab = np.transpose(slab, (3, 4, 0, 1, 2))
+            if slab.shape[0] < mu_per_x or slab.shape[1] < nu_per_y:
+                pad_mu = mu_per_x - slab.shape[0]
+                pad_nu = nu_per_y - slab.shape[1]
+                slab = np.pad(slab, ((0, pad_mu), (0, pad_nu), (0, 0), (0, 0), (0, 0)), mode="constant")
+            mu_off = ix * mu_per_x
+            nu_off = iy * nu_per_y
+            local_w[mu_off:mu_off + mu_per_x, nu_off:nu_off + nu_per_y, :, :, :] = slab
+
+    global_shape = (mu_per_x * grid_x, nu_per_y * grid_y, nkx, nky, nkz)
+    w_sharding = NamedSharding(mesh_xy, P("x", "y", None, None, None))
+    local_w_jax = jax.device_put(local_w)
+    w_global = jax.make_array_from_process_local_data(w_sharding, local_w_jax, global_shape)
+    if global_shape[0] > n_rmu or global_shape[1] > n_rnu:
+        w_global = w_global[:n_rmu, :n_rnu, :, :, :]
+    return w_global
+
+
+def load_bse_data_from_restart_sharded(
+    restart_file: str,
+    n_val: int = 4,
+    n_cond: int = 4,
+    fermi_energy: float = 0.0,
+    mesh_xy: Optional[Mesh] = None,
+) -> dict:
+    """Load BSE inputs from a COHSEX restart file using sharded HDF5 reads.
+
+    This loader only materializes the local shard per process and returns
+    X- and Y-sharded wavefunctions along the μ-axis.
+    """
+    if mesh_xy is None:
+        mesh_xy = create_mesh_2d()
+
+    with h5py.File(restart_file, "r") as f:
+        vq_dset = f["V_qmunu"]
+        if "W0_qmunu" in f and bool(f["W0_qmunu"].attrs.get("W0_ready", False)):
+            wq_dset = f["W0_qmunu"]
+        else:
+            wq_dset = vq_dset
+        psi_l_dset = f["psi_l"]
+        psi_r_dset = f["psi_r"]
+        enk_l = np.asarray(f["enk_l"][:])
+        enk_r = np.asarray(f["enk_r"][:])
+
+        nkx, nky, nkz = vq_dset.shape[3:6]
+        n_rmu = int(vq_dset.shape[6])
+        n_rnu = int(vq_dset.shape[7])
+        if n_rmu != n_rnu:
+            raise ValueError("Expected square μ/ν dimensions in V_qmunu")
+
+        mean_enk_l = np.mean(enk_l, axis=0)
+        mean_enk_r = np.mean(enk_r, axis=0)
+        val_mask_l = mean_enk_l < fermi_energy
+        cond_mask_r = mean_enk_r > fermi_energy
+        n_val_available = int(np.sum(val_mask_l))
+        n_cond_available = int(np.sum(cond_mask_r))
+        n_val = min(n_val, n_val_available)
+        n_cond = min(n_cond, n_cond_available)
+        if n_val == 0 or n_cond == 0:
+            raise ValueError("No valence or conduction bands found for given Fermi energy")
+        val_indices = np.argsort(np.where(val_mask_l, mean_enk_l, -np.inf))[-n_val:]
+        cond_indices = np.argsort(np.where(cond_mask_r, mean_enk_r, np.inf))[:n_cond]
+
+        eps_v = jnp.asarray(enk_l[:, val_indices])
+        eps_c = jnp.asarray(enk_r[:, cond_indices])
+
+        _, grid_x, grid_y = _get_local_mesh_coords(mesh_xy)
+        mu_per_x = (n_rmu + grid_x - 1) // grid_x
+        nu_per_y = (n_rmu + grid_y - 1) // grid_y
+
+        psi_v_X = _read_psi_mu_sharded(psi_l_dset, val_indices, mu_per_x, "x", mesh_xy)
+        psi_c_X = _read_psi_mu_sharded(psi_r_dset, cond_indices, mu_per_x, "x", mesh_xy)
+        psi_v_Y = jax.lax.with_sharding_constraint(psi_v_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
+        psi_c_Y = jax.lax.with_sharding_constraint(psi_c_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
+
+        V_q0 = _read_vq0_sharded(vq_dset, mu_per_x, nu_per_y, mesh_xy)
+        W_q = _read_wq_sharded(wq_dset, mu_per_x, nu_per_y, mesh_xy)
+
+    return {
+        "psi_c_X": psi_c_X,
+        "psi_c_Y": psi_c_Y,
+        "psi_v_X": psi_v_X,
+        "psi_v_Y": psi_v_Y,
+        "eps_c": eps_c,
+        "eps_v": eps_v,
+        "W_q": W_q,
+        "V_q0": V_q0,
+        "nkx": nkx,
+        "nky": nky,
+        "nkz": nkz,
+        "n_val": n_val,
+        "n_cond": n_cond,
+        "fermi_energy": fermi_energy,
+    }
 
 
 def symmetrize_W_q(
@@ -931,4 +1175,3 @@ if __name__ == "__main__":
     ryd2ev = 13.6056980659
     print(f"Lowest 5 eigenvalues (Ry): {eigenvalues}")
     print(f"Lowest 5 eigenvalues (eV): {eigenvalues * ryd2ev}")
-

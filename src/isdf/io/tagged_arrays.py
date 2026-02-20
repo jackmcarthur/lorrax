@@ -11,7 +11,19 @@ import h5py
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 
-def write_labeled_arrays_to_h5(filename, V_qmunu, psi_l, psi_r, enk_l=None, enk_r=None, S_qmunu=None, V0_noG0_munu=None, G0_mu_nu=None):
+def write_labeled_arrays_to_h5(
+	filename,
+	V_qmunu,
+	psi_l,
+	psi_r,
+	enk_l=None,
+	enk_r=None,
+	S_qmunu=None,
+	V0_noG0_munu=None,
+	G0_mu_nu=None,
+	W0_qmunu=None,
+	init_W0: bool = False,
+):
 	"""
 	Write raw JAX/Numpy arrays to an HDF5 file for restart.
 	Only rank 0 performs the write; arrays are gathered to host first.
@@ -31,6 +43,7 @@ def write_labeled_arrays_to_h5(filename, V_qmunu, psi_l, psi_r, enk_l=None, enk_
 	S_qmunu_h = _to_host(S_qmunu) if S_qmunu is not None else None
 	V0_noG0_h = _to_host(V0_noG0_munu) if V0_noG0_munu is not None else None
 	G0_mu_nu_h = _to_host(G0_mu_nu) if G0_mu_nu is not None else None
+	W0_qmunu_h = _to_host(W0_qmunu) if W0_qmunu is not None else None
 	enk_l_h = getattr(enk_l, 'data', enk_l)
 	enk_r_h = getattr(enk_r, 'data', enk_r)
 	if enk_l_h is not None:
@@ -47,12 +60,42 @@ def write_labeled_arrays_to_h5(filename, V_qmunu, psi_l, psi_r, enk_l=None, enk_
 				f.create_dataset("V0_noG0_munu", data=np.asarray(V0_noG0_h))
 			if G0_mu_nu_h is not None:
 				f.create_dataset("G0_mu_nu", data=np.asarray(G0_mu_nu_h))
+			if W0_qmunu_h is not None:
+				dset = f.create_dataset("W0_qmunu", data=np.asarray(W0_qmunu_h))
+				dset.attrs["W0_ready"] = True
+			elif init_W0:
+				v_shape = np.asarray(V_qmunu_h).shape
+				v_dtype = np.asarray(V_qmunu_h).dtype
+				fill = np.zeros((), dtype=v_dtype)
+				dset = f.create_dataset("W0_qmunu", shape=v_shape, dtype=v_dtype, fillvalue=fill)
+				dset.attrs["W0_ready"] = False
 			f.create_dataset("psi_l", data=np.asarray(psi_l_h))
 			f.create_dataset("psi_r", data=np.asarray(psi_r_h))
 			if enk_l_h is not None:
 				f.create_dataset("enk_l", data=np.asarray(enk_l_h))
 			if enk_r_h is not None:
 				f.create_dataset("enk_r", data=np.asarray(enk_r_h))
+
+
+def write_w0_qmunu_to_h5(filename, W0_qmunu):
+	"""Overwrite or append the W0_qmunu dataset in an existing restart file."""
+	from jax.experimental import multihost_utils as _mh
+
+	def _to_host(a):
+		if isinstance(a, (jax.Array,)):
+			try:
+				return _mh.process_allgather(a, tiled=True)
+			except Exception:
+				return jax.device_get(a)
+		return a
+
+	W0_qmunu_h = _to_host(W0_qmunu)
+	if jax.process_index() == 0:
+		with h5py.File(filename, "a") as f:
+			if "W0_qmunu" in f:
+				del f["W0_qmunu"]
+			dset = f.create_dataset("W0_qmunu", data=np.asarray(W0_qmunu_h))
+			dset.attrs["W0_ready"] = True
 
 
 def read_labeled_arrays_from_h5(filename):
@@ -175,4 +218,3 @@ def save_restart_per_proc(prefix: str, V_qmunu, S_qmunu, psi_l, psi_r, enk_l, en
 			f.create_dataset("enk_l", data=_to_np(getattr(enk_l, 'data', enk_l)))
 		if enk_r is not None:
 			f.create_dataset("enk_r", data=_to_np(getattr(enk_r, 'data', enk_r)))
-

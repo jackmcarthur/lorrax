@@ -73,7 +73,7 @@ mesh_bands = Mesh(np.asarray(_default_devices), ("bands",))
 from ..io import (
     WFNReader, EPSReader,
     write_sigma_to_file, write_eqp_table,
-    write_labeled_arrays_to_h5, read_labeled_arrays_from_h5,
+    write_labeled_arrays_to_h5, write_w0_qmunu_to_h5, read_labeled_arrays_from_h5,
     load_labeled_arrays_from_h5, save_restart_per_proc,
     write_qp_rotations_h5, load_kin_ion_submatrix,
     load_centroids, resolve_input_paths,
@@ -1280,7 +1280,7 @@ def main(argv=None):
 	# Resolve tmp_dir and output path relative to input file directory
 	tmp_dir = os.path.join(input_dir, "tmp")
 	os.makedirs(tmp_dir, exist_ok=True)
-	taggedarray_filename = os.path.join(tmp_dir, f"taggedarrays{_n_rmu}.h5")
+	tensors_filename = os.path.join(tmp_dir, f"isdf_tensors_{_n_rmu}.h5")
 	_print0(f"  ISDF basis: {_n_rmu} centroids")
 	_print0(f"  FFT grid: {wfn.fft_grid[0]}×{wfn.fft_grid[1]}×{wfn.fft_grid[2]}   Cell volume: {wfn.cell_volume:.2f} a.u.³")
 	_print0("")
@@ -1293,7 +1293,7 @@ def main(argv=None):
 	# ============================================================================
 	# MAIN CONTROL FLAGS (from input file):
 	# ============================================================================
-	# restart:     If True, load ISDF vectors and V_qmunu from taggedarrays.h5
+	# restart:     If True, load ISDF vectors and V_qmunu from isdf_tensors_*.h5
 	#              instead of recomputing. Saves ~30 min for large systems.
 	# x_only:      If True, use bare Coulomb V for exchange (no screening).
 	#              Mutually exclusive with do_screened=True.
@@ -1509,7 +1509,7 @@ def main(argv=None):
 			
 			# Persist restart artifacts
 			write_labeled_arrays_to_h5(
-				taggedarray_filename,
+				tensors_filename,
 				V_qmunu,
 				psi_l_full,
 				psir_X,
@@ -1518,8 +1518,9 @@ def main(argv=None):
 				S_qmunu,
 				V0_noG0_munu=v_q0_noG0_munu,
 				G0_mu_nu=G0_mu_nu,
+				init_W0=True,
 			)
-			save_restart_per_proc(os.path.join(tmp_dir, "taggedarrays"), V_qmunu, S_qmunu, psi_l_full, psir_X, enk_l, enk_r, meta, mesh_xy, V0_noG0_munu=v_q0_noG0_munu)
+			save_restart_per_proc(os.path.join(tmp_dir, "isdf_tensors"), V_qmunu, S_qmunu, psi_l_full, psir_X, enk_l, enk_r, meta, mesh_xy, V0_noG0_munu=v_q0_noG0_munu)
 			V_qmunu.block_until_ready()
 			print0("  Chunked ISDF path complete")
 		
@@ -1797,7 +1798,7 @@ def main(argv=None):
 
 			# Persist restart artifacts (store full-sized left/right; trim on load/use)
 			write_labeled_arrays_to_h5(
-				taggedarray_filename,
+				tensors_filename,
 				V_qmunu,
 				psi_l_full,
 				psir_X,
@@ -1806,14 +1807,15 @@ def main(argv=None):
 				S_qmunu,
 				V0_noG0_munu=v_q0_noG0_munu,
 				G0_mu_nu=G0_mu_nu,
+				init_W0=True,
 			)
-			save_restart_per_proc(os.path.join(tmp_dir, "taggedarrays"), V_qmunu, S_qmunu, psi_l_full, psir_X, enk_l, enk_r, meta, mesh_xy, V0_noG0_munu=v_q0_noG0_munu)
+			save_restart_per_proc(os.path.join(tmp_dir, "isdf_tensors"), V_qmunu, S_qmunu, psi_l_full, psir_X, enk_l, enk_r, meta, mesh_xy, V0_noG0_munu=v_q0_noG0_munu)
 			V_qmunu.block_until_ready()
 
 	elif restart and not x_only:
 		with timing.section("cohsex_jax.restart_load") as restart_timer:
 			V_qmunu, S_qmunu, psi_lT, psi_l, psi_r, psi_rT, enk_l, enk_r, v_q0_noG0_munu, G0_mu_nu = load_labeled_arrays_from_h5(
-				taggedarray_filename, mesh_xy
+				tensors_filename, mesh_xy
 			)
 			V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0]
 			# Aliases for self-consistent loop
@@ -1865,7 +1867,7 @@ def main(argv=None):
 	elif restart and x_only:
 		with timing.section("cohsex_jax.restart_load_x_only") as restart_timer:
 			V_qmunu, S_qmunu, psi_lT, psi_l, psi_r, psi_rT, enk_l, enk_r, v_q0_noG0_munu, G0_mu_nu = load_labeled_arrays_from_h5(
-				taggedarray_filename, mesh_xy
+				tensors_filename, mesh_xy
 			)
 			V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0]
 			# Aliases for self-consistent loop
@@ -1912,6 +1914,10 @@ def main(argv=None):
 					chi0 = get_chi0_jax(psi_vT, psi_v, psi_c, psi_cT, enk_v_arr, enk_c_arr, window_pairs, meta, mesh_xy)
 					W_q = get_static_w_q_jax(V_qmunu, chi0, None, meta, mesh_xy)
 					W_q.block_until_ready()
+					if os.path.exists(tensors_filename):
+						W0_qmunu = W_q[..., 0, :, 0, :]
+						W0_qmunu = W0_qmunu[None, None, None, :, :, :, :, :]
+						write_w0_qmunu_to_h5(tensors_filename, W0_qmunu)
 
 	# ============================================================================
 	# HEAD INJECTION: Add the q→0, G=0 Coulomb divergence correction
@@ -2344,7 +2350,7 @@ def main(argv=None):
 		print0(f"  QP energies (eqp1):     {eqp1_written}")
 	if qp_rot_path:
 		print0(f"  QP rotations (h5):      {qp_rot_path}")
-	print0(f"  Restart arrays:         {taggedarray_filename}")
+	print0(f"  Restart arrays:         {tensors_filename}")
 	print0("")
 
 	if jax.process_index() == 0:

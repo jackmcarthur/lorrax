@@ -2,7 +2,7 @@
 
 **Consolidates**: `formalism.md`, `isdf_context.md`, `isdf_spin_galerkin_derivation.md`, `ZETA_FITTING_ALGORITHM.md`, `cohsex_jax_physics.md`
 
-**Status**: Describes current implementation in `src/isdf/common/load_wfns.py`, `src/isdf/gw_isdf/cohsex_jax.py`, `src/isdf/gw_isdf/w_isdf.py` (NUFFT backend branch).
+**Status**: Describes current implementation in `src/isdf/common/load_wfns.py`, `src/isdf/gw_isdf/cohsex_jax.py`, `src/isdf/gw_isdf/w_isdf.py`.
 
 ---
 
@@ -138,8 +138,6 @@ $$C_{q,\nu\mu} = \sum_{\mathbf{R}} e^{i\mathbf{q}\cdot\mathbf{R}} \sum_{s,s'} P^
 $$Z_{q,\nu}(\mathbf{r}) = \sum_{\mathbf{R}} e^{i\mathbf{q}\cdot\mathbf{R}} \sum_{s,s'} P^*_{\mathbf{R},s's}(\mathbf{r}_\nu, \mathbf{r}) \, P_{\mathbf{R},ss'}(\mathbf{r}_\nu, \mathbf{r})$$
 
 **Why FFT convolution?** Direct summation $\sum_{\mathbf{k}, \mathbf{k}'} (\cdots)$ scales as $O(n_k^2)$. Using FFTs to perform the convolution in R-space reduces this to $O(n_k \log n_k)$, making the procedure tractable for large k-grids.
-
-**Noncommensurate q-grids**: The FFT approach naturally allows choosing a **different q-grid** from the wavefunction k-grid. The NUFFT backend (§8) exploits this to use a coarser q-grid for memory savings when $n_q \ll n_k$.
 
 **Implementation**: Compute $P_{\mathbf{k}}$ on k-grid, FFT to R-grid via `jnp.fft.ifftn(..., norm='ortho')`, form spin-traced products, FFT back to q-space. See `compute_CCT_from_left_right()` and `compute_ZCT_from_left_right()` in `load_wfns.py`.
 
@@ -298,7 +296,7 @@ $$V_{q,\mu\nu} = \sum_{\mathbf{G}} \tilde{z}^*_{q,\mu}(\mathbf{G}) \, \tilde{z}_
 
 **Output**: `V_qmunu.h5` with shape $(n_q, n_\mu, n_\mu)$, used as input to GW pipeline.
 
-**Disk bottleneck**: The file `zeta_q.h5` with shape $(n_{qx}, n_{qy}, n_{qz}, n_\mu, n_r)$ is often **10-100 GB** and represents a significant disk storage constraint. For systems with $n_q = 128$, $n_\mu = 40000$, $n_r = 10^6$, this is $\sim$80 GB in complex128 format. This can be reduced by using a coarser q-grid via NUFFT (§8).
+**Disk bottleneck**: The file `zeta_q.h5` with shape $(n_{qx}, n_{qy}, n_{qz}, n_\mu, n_r)$ is often **10-100 GB** and represents a significant disk storage constraint. For systems with $n_q = 128$, $n_\mu = 40000$, $n_r = 10^6$, this is $\sim$80 GB in complex128 format.
 
 **Implementation**: `compute_all_V_q_from_zeta_h5()` in `compute_vcoul.py`.
 
@@ -621,53 +619,13 @@ where $H_{\text{KS}} = K + I + V_H + V_{xc}$ is the Kohn-Sham DFT Hamiltonian.
 
 ---
 
-## 8. NUFFT Backend (Experimental)
-
-### 8.1 Motivation
-
-When $n_q \ll n_k$ (e.g., $6 \times 6 \times 1$ q-grid vs $16 \times 16 \times 1$ k-grid), memory for $C_q, Z_q, V_q$ reduced by factor $\sim (n_k / n_q)$.
-
-**Trade-off**: Non-uniform FFT is slower than uniform FFT (GPU needed for practical use).
-
-### 8.2 Implementation
-
-**q-grid in Meta**:
-
-```python
-@dataclass
-class Meta:
-    nqx, nqy, nqz: int        # q-grid dimensions (may differ from k)
-    use_nufft: bool           # True if q != k
-    qgrid: Array              # (n_q, 3) in crystal [0,1)³
-```
-
-**NUFFT k→R transform**:
-
-```python
-def nufft_k_to_R(P_k, kgrid, qgrid):
-    """Type-1 NUFFT: uniform k → non-uniform q."""
-    from jax_finufft import nufft1
-    k_rad = 2*π * k_crys  # [0,1) → [0,2π)
-    q_rad = 2*π * q_crys
-    return nufft1(P_k, k_rad, q_rad).reshape(qgrid)
-```
-
-**Status**:
-- ✅ Infrastructure (input, Meta, wrappers)
-- ⚠️ CCT/ZCT transforms (stubs raise `NotImplementedError`)
-- ❌ GW pipeline (not updated for $q \neq k$)
-
-**See**: `NUFFT_BACKEND_STATUS.md`, `JAX_FINUFFT_USAGE.md`.
-
----
-
-## 9. File Organization
+## 8. File Organization
 
 ### Core Implementation
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `load_wfns.py` | 1900 | Zeta pipeline: CCT/ZCT, Cholesky, chunking, NUFFT |
+| `load_wfns.py` | 1900 | Zeta pipeline: CCT/ZCT, Cholesky, chunking |
 | `cohsex_jax.py` | 1400 | Main driver: wfn loading, $\Sigma$ calculation |
 | `w_isdf.py` | 350 | $\chi^0$ and $W$ via CTSP, Dyson solve |
 | `cholesky_2d.py` | 600 | 2D blocked Cholesky for sharded CCT |
@@ -683,11 +641,10 @@ def nufft_k_to_R(P_k, kgrid, qgrid):
 | `MEMORY_MODEL.md` | Detailed memory formulas |
 | `CHUNK_BUDGETS.md` | Quick reference constraints |
 | `chi_omega_quadrature.md` | CTSP theory, quadrature derivations |
-| `NUFFT_BACKEND_STATUS.md` | NUFFT status |
 
 ---
 
-## 10. Typical Workflow
+## 9. Typical Workflow
 
 ### Preparation
 
@@ -717,11 +674,10 @@ uv run python -m isdf.gw_isdf.cohsex_jax -i cohsex.in
 
 ---
 
-## 11. Known Issues
+## 10. Known Issues
 
 1. **Dyson solve**: LU for $(1-V\chi^0)^{-1}$ not distributed over $\mu$ (communication bottleneck)
 2. **Self-consistency**: Fixed-point prototype exists but not validated
-3. **NUFFT**: CPU-only too slow; GPU build fails on CUDA 13 (use conda-forge binaries). This is not an active direction at the moment.
 
 ---
 

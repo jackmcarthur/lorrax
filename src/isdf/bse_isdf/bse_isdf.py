@@ -8,7 +8,7 @@ interpolative separable density fitting (ISDF).  The Hamiltonian action is
 where ``D`` is the diagonal term from single particle energies and ``V`` and
 ``W`` are the direct and screened exchange interactions.  For this simplified
 demo both ``V`` and ``W`` are taken from the same ``V_\mu\nu`` array stored in
-``taggedarrays.h5``.  The heavy real-space dimension (``nrmu``) is sharded
+``isdf_tensors_*.h5``.  The heavy real-space dimension (``nrmu``) is sharded
 across devices so the code runs on multiple CPU devices via JAX.
 
 The ``haydock_eig`` routine below is unchanged and provides a Lanczos solver
@@ -61,7 +61,7 @@ device_mesh = Mesh(np.array(jax.devices()[:4]), ('mu',))
 #              ]
 # shapes become: shape N_rnu * Nc * Nk', then N_rnu * Nk
 
-def load_isdf_data(filename: str = "taggedarrays.h5"):
+def load_isdf_data(filename: str = "isdf_tensors.h5"):
     """Load Vmunu and wavefunctions from an HDF5 file into JAX arrays."""
     V_qmunu, psi_l_wfn, psi_r_wfn = read_labeled_arrays_from_h5(filename)
 

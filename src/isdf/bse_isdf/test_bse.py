@@ -3,7 +3,7 @@
 Run with:
     uv run python -m isdf.bse_isdf.test_bse -i cohsex_prod.in
 
-Uses V_q from taggedarrays.h5 as stand-in for W (to be replaced with actual W later).
+Uses W0_qmunu from isdf_tensors_*.h5 when available, otherwise falls back to V_qmunu.
 Tests on a small subset of bands (4 valence, 4 conduction) for fast iteration.
 
 Profiling:
@@ -15,6 +15,7 @@ Profiling:
 """
 from __future__ import annotations
 import argparse
+import glob
 import os
 import sys
 
@@ -47,7 +48,7 @@ def load_bse_data_from_restart(
     """Load BSE data from COHSEX restart file.
     
     Args:
-        restart_file: Path to taggedarrays.h5
+        restart_file: Path to isdf_tensors_*.h5 (fallback: taggedarrays.h5)
         n_val: Number of valence bands (highest occupied)
         n_cond: Number of conduction bands (lowest unoccupied)
         fermi_energy: Fermi energy in Ry. Default 0.0 (DFT referenced to VBM).
@@ -60,6 +61,10 @@ def load_bse_data_from_restart(
     with h5py.File(restart_file, 'r') as f:
         # V_qmunu: (1, 1, 1, nkx, nky, nkz, n_rmu, n_rmu)
         V_qmunu = jnp.asarray(f['V_qmunu'][:])
+        if "W0_qmunu" in f and bool(f["W0_qmunu"].attrs.get("W0_ready", False)):
+            W0_qmunu = jnp.asarray(f["W0_qmunu"][:])
+        else:
+            W0_qmunu = None
         
         # psi_l: (nk, nb_l, nspinor, n_rmu) - left bands
         # psi_r: (nk, nb_r, nspinor, n_rmu) - right bands
@@ -71,6 +76,8 @@ def load_bse_data_from_restart(
         enk_r = jnp.asarray(f['enk_r'][:])
         
     print(f"  V_qmunu shape: {V_qmunu.shape}")
+    if W0_qmunu is not None:
+        print(f"  W0_qmunu shape: {W0_qmunu.shape}")
     print(f"  psi_l shape: {psi_l.shape}, psi_r shape: {psi_r.shape}")
     print(f"  enk_l shape: {enk_l.shape}, enk_r shape: {enk_r.shape}")
     
@@ -136,9 +143,10 @@ def load_bse_data_from_restart(
     V_q0 = V_qmunu[0, 0, 0, 0, 0, 0, :, :]
     print(f"  V_q0 shape: {V_q0.shape}")
     
-    # Get W_q from V_qmunu (using bare V as placeholder until we load actual W)
+    # Get W_q from W0_qmunu if available, else use bare V as placeholder
     # Shape: (n_rmu, n_rmu, nkx, nky, nkz)
-    W_q = V_qmunu[0, 0, 0, :, :, :, :, :].transpose(3, 4, 0, 1, 2)
+    W_src = W0_qmunu if W0_qmunu is not None else V_qmunu
+    W_q = W_src[0, 0, 0, :, :, :, :, :].transpose(3, 4, 0, 1, 2)
     print(f"  W_q shape: {W_q.shape}")
     
     return {
@@ -282,11 +290,14 @@ def find_restart_file(input_file: str) -> str:
     input_dir = os.path.dirname(os.path.abspath(input_file))
     
     # Try common patterns
-    candidates = [
+    candidates = []
+    candidates.extend(sorted(glob.glob(os.path.join(input_dir, 'tmp', 'isdf_tensors_*.h5'))))
+    candidates.extend(sorted(glob.glob(os.path.join(input_dir, 'isdf_tensors_*.h5'))))
+    candidates.extend([
         os.path.join(input_dir, 'tmp', 'taggedarrays600.h5'),
         os.path.join(input_dir, 'tmp', 'taggedarrays.h5'),
         os.path.join(input_dir, 'taggedarrays.h5'),
-    ]
+    ])
     
     for path in candidates:
         if os.path.exists(path):
@@ -369,4 +380,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
-
