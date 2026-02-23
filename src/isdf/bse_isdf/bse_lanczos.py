@@ -240,6 +240,7 @@ def solve_bse(
     block_size: int = 4,
     use_jit_lanczos: bool = True,
     n_reorth: int = 10,
+    include_W: bool = True,
 ) -> Tuple[jax.Array, jax.Array]:
     """Solve BSE for lowest exciton eigenvalues."""
     nk, nc, _, _ = psi_c.shape
@@ -247,11 +248,11 @@ def solve_bse(
     shape = (nc, nv, nk)
     n_flat = nc * nv * nk
 
-    @partial(jax.jit, static_argnames=("nkx", "nky", "nkz"))
-    def _matvec_impl(v, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz):
+    @partial(jax.jit, static_argnames=("nkx", "nky", "nkz", "include_W"))
+    def _matvec_impl(v, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz, include_W):
         X = v.reshape(1, nc, nv, nk)
         HX = apply_bse_hamiltonian_single_device(
-            X, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz
+            X, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz, include_W
         )
         return HX.reshape(-1)
 
@@ -266,11 +267,12 @@ def solve_bse(
         nkx=nkx,
         nky=nky,
         nkz=nkz,
+        include_W=include_W,
     )
 
     matvec_block = partial(
         lambda X: apply_bse_hamiltonian_single_device(
-            X, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz
+            X, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz, include_W
         )
     )
 

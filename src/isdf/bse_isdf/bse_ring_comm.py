@@ -134,7 +134,7 @@ def apply_W_ring(
     py: int,
 ) -> jax.Array:
     nk = nkx * nky * nkz
-    sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=jnp.float64))
+    sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
 
     c_chunk = X.shape[1]
     v_chunk = X.shape[2]
@@ -171,7 +171,7 @@ def apply_V_ring(
     py: int,
 ) -> jax.Array:
     nb_trial = X.shape[0]
-    sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=jnp.float64))
+    sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
 
     c_chunk = X.shape[1]
     v_chunk = X.shape[2]
@@ -280,6 +280,7 @@ def build_bse_ring_matvec(
     nkz: int,
     timed: bool = False,
     low_mem: bool = True,
+    include_W: bool = True,
 ):
     px, py = mesh_xy.devices.shape
     sh = make_bse_shardings(mesh_xy)
@@ -334,7 +335,7 @@ def build_bse_ring_matvec(
         nb_trial = T.shape[0]
         n_rmu_local_X = T.shape[1]
         n_rmu_local_Y = T.shape[2]
-        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=jnp.float64))
+        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=T.real.dtype))
 
         T_k = T.reshape(nb_trial, n_rmu_local_X, n_rmu_local_Y, nspinor, nspinor, nkx, nky, nkz)
         T_R = jnp.fft.ifftn(T_k, axes=(5, 6, 7), norm="ortho")
@@ -365,6 +366,8 @@ def build_bse_ring_matvec(
     def _matvec_impl(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0):
         D_term = apply_D_term(X, eps_c, eps_v)
         V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0)
+        if not include_W:
+            return D_term + V_term
         T = encode_T_ring(X, psi_c_X, psi_v_Y) if low_mem else encode_T_gather(X, psi_c_X, psi_v_Y)
         W_term = apply_W_from_T(T, psi_c_X, psi_v_Y, W_R)
         return D_term + V_term - W_term
@@ -377,6 +380,8 @@ def build_bse_ring_matvec(
             with timing.section("bse_jax.V_term"):
                 V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0)
                 V_term.block_until_ready()
+            if not include_W:
+                return D_term + V_term
             with timing.section("bse_jax.W_term"):
                 T = encode_T_ring(X, psi_c_X, psi_v_Y) if low_mem else encode_T_gather(X, psi_c_X, psi_v_Y)
                 W_term = apply_W_from_T(T, psi_c_X, psi_v_Y, W_R)

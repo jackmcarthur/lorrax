@@ -200,6 +200,7 @@ def _preview_lanczos(
     n_eig: int = 5,
     write_eigs: int | None = None,
     max_lanczos_iter: int | None = None,
+    include_W: bool = True,
 ) -> None:
     restart_file = _find_restart_file(input_file)
     payload = _load_ring_subset(restart_file, n_val, n_cond, 1, 1)
@@ -225,7 +226,7 @@ def _preview_lanczos(
 
     eigenvalues, eigenvectors = solve_bse(
         psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz,
-        n_eig=n_eig, max_iter=max_lanczos_iter,
+        n_eig=n_eig, max_iter=max_lanczos_iter, include_W=include_W,
     )
     ryd2ev = 13.6056980659
     print(f"Lowest {n_eig} eigenvalues (Ry): {eigenvalues}")
@@ -273,9 +274,13 @@ if __name__ == "__main__":
         help="Energy conversion Ry -> eV for FEAST report.",
     )
     parser.add_argument("--feast-ritz-count", type=int, default=4, help="Ritz values per window.")
-    parser.add_argument("--gmres-max-iter", type=int, default=4, help="GMRES iterations per shift.")
+    parser.add_argument("--gmres-max-iter", type=int, default=10, help="GMRES iterations per shift.")
     parser.add_argument("--gmres-tol", type=float, default=1e-2, help="GMRES relative tolerance.")
     parser.add_argument("--gmres-seed", type=int, default=0, help="GMRES random seed.")
+    parser.add_argument("--gmres-fp32", action="store_true",
+                        help="Use FP32 data/GMRES for shifted solves.")
+    parser.add_argument("--rpa", action="store_true",
+                        help="Use RPA kernel (D+V only), skip W0 term entirely.")
     parser.add_argument("--lanczos", action="store_true", help="Run Lanczos preview + timing instead of FEAST.")
     parser.add_argument(
         "--feast-window1",
@@ -354,6 +359,8 @@ if __name__ == "__main__":
             "--n-lanczos", str(args.kpm_n_lanczos),
             "--plot-file", args.kpm_plot_file,
         ]
+        if args.rpa:
+            kpm_argv.append("--rpa")
         if args.kpm_emin_ev is not None:
             kpm_argv += ["--emin-ev", str(args.kpm_emin_ev)]
         if args.kpm_emax_ev is not None:
@@ -397,6 +404,8 @@ if __name__ == "__main__":
                 str(args.gmres_tol),
                 "--gmres-seed",
                 str(args.gmres_seed),
+                *(["--gmres-fp32"] if args.gmres_fp32 else []),
+                *(["--rpa"] if args.rpa else []),
                 *(
                     ["--window1", *args.feast_window1]
                     if args.feast_window1 is not None
@@ -418,6 +427,7 @@ if __name__ == "__main__":
         n_eig=args.n_eig,
         write_eigs=args.write_eigs,
         max_lanczos_iter=args.max_lanczos_iter,
+        include_W=not args.rpa,
     )
 
     ring_matvec_timing(

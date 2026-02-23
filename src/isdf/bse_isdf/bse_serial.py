@@ -46,6 +46,7 @@ def apply_bse_hamiltonian_single_device(
     nkx: int,
     nky: int,
     nkz: int,
+    include_W: bool = True,
 ) -> jax.Array:
     """Single-device BSE Hamiltonian for verification."""
     nk = nkx * nky * nkz
@@ -56,11 +57,14 @@ def apply_bse_hamiltonian_single_device(
     D_term = delta_E * X
 
     M = compute_pair_amplitude(psi_c, psi_v)
-    sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=jnp.float64))
+    sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
 
     S_V = jnp.einsum("kcvN,bcvk->bNk", M, X) / sqrt_nk
     U_V = jnp.einsum("MN,bNk->bMk", V_q0, S_V)
     V_term = jnp.einsum("kcvM,bMk->bcvk", jnp.conj(M), U_V) / sqrt_nk
+
+    if not include_W:
+        return D_term + V_term
 
     R = jnp.einsum("kvsN,bcvk->bcksN", jnp.conj(psi_v), X)
     T = jnp.einsum("kctM,bcksN->bMNtsk", psi_c, R)
@@ -76,7 +80,7 @@ def apply_bse_hamiltonian_single_device(
     return D_term + V_term - W_term
 
 
-@partial(jax.jit, static_argnums=(6, 7, 8))
+@partial(jax.jit, static_argnums=(7, 8, 9, 10))
 def apply_bse_hamiltonian_single_device_jit(
     X: jax.Array,
     psi_c: jax.Array,
@@ -88,7 +92,8 @@ def apply_bse_hamiltonian_single_device_jit(
     nkx: int,
     nky: int,
     nkz: int,
+    include_W: bool = True,
 ) -> jax.Array:
     return apply_bse_hamiltonian_single_device(
-        X, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz
+        X, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz, include_W
     )

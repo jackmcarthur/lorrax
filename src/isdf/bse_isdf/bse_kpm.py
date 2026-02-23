@@ -15,7 +15,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh
 
 from .bse_ring_comm import build_bse_ring_matvec, make_bse_shardings
-from .bse_feast import estimate_spectral_bounds_sharded, _create_mesh_xy
+from .bse_feast import estimate_spectral_bounds_sharded, _create_mesh_xy, _build_gmres_data_fp32
 from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
 import isdf.common.timing as timing
 
@@ -81,8 +81,10 @@ def chebyshev_moments(
     W_R = data["W_R"]
     V_q0 = data["V_q0"]
 
-    e_center_jnp = jnp.float64(e_center)
-    inv_hw = jnp.float64(1.0 / half_width)
+    dtype_real = data["eps_c"].dtype
+    dtype_cplx = jnp.complex64 if dtype_real == jnp.float32 else jnp.complex128
+    e_center_jnp = jnp.asarray(e_center, dtype=dtype_real)
+    inv_hw = jnp.asarray(1.0 / half_width, dtype=dtype_real)
 
     @jax.jit
     def apply_h_tilde(x):
@@ -99,7 +101,7 @@ def chebyshev_moments(
     # Padded bands have psi=0 and eps=0, so H maps them to
     # -e_center/hw * x which is OUTSIDE [-1,1] for BSE spectra.
     # Masking keeps the recurrence stable.
-    mask = jnp.zeros((1, n_cond_pad, n_val_pad, nk), dtype=jnp.float64)
+    mask = jnp.zeros((1, n_cond_pad, n_val_pad, nk), dtype=dtype_real)
     mask = mask.at[:, :n_cond, :n_val, :].set(1.0)
 
     for r in range(n_random):
@@ -107,12 +109,14 @@ def chebyshev_moments(
         key, subkey = jax.random.split(key)
 
         # Rademacher +/-1 random vector (real).
+        two = jnp.asarray(2.0, dtype=dtype_real)
+        one = jnp.asarray(1.0, dtype=dtype_real)
         x_rand = (
-            2.0 * jax.random.bernoulli(
+            two * jax.random.bernoulli(
                 subkey, shape=(1, n_cond_pad, n_val_pad, nk),
-            ).astype(jnp.float64) - 1.0
+            ).astype(dtype_real) - one
         )
-        x_rand = (x_rand * mask).astype(jnp.complex128)
+        x_rand = (x_rand * mask).astype(dtype_cplx)
 
         t_prev = x_rand                     # t_0 = X
         t_curr = apply_h_tilde(x_rand)      # t_1 = H_tilde X
@@ -120,8 +124,9 @@ def chebyshev_moments(
         mu[0] += float(jax.device_get(jnp.vdot(x_rand, t_prev).real))
         mu[1] += float(jax.device_get(jnp.vdot(x_rand, t_curr).real))
 
+        two = jnp.asarray(2.0, dtype=dtype_real)
         for p in range(2, n_moments + 1):
-            t_new = 2.0 * apply_h_tilde(t_curr) - t_prev
+            t_new = two * apply_h_tilde(t_curr) - t_prev
             mu[p] += float(jax.device_get(jnp.vdot(x_rand, t_new).real))
             t_prev = t_curr
             t_curr = t_new
@@ -180,6 +185,85 @@ def reconstruct_dos(
     return rho
 
 
+def partition_windows_equal_b_over_omega(
+    omega_grid_eV: np.ndarray,
+    b_omega_eV: np.ndarray,
+    n_windows: int,
+    ry_to_ev: float = RY_TO_EV,
+    omega_min_eV: float | None = None,
+    omega_max_eV: float | None = None,
+    omega_floor_ry: float | None = None,
+) -> np.ndarray:
+    """Partition the spectrum into equal-mass windows of ∫ B(Ω)/Ω dΩ.
+
+    Parameters
+    ----------
+    omega_grid_eV : ndarray
+        Energy grid in eV (monotone or unordered).
+    b_omega_eV : ndarray
+        B(Ω) on the grid, in units per eV (e.g., DOS from KPM).
+    n_windows : int
+        Number of windows to create.
+    ry_to_ev : float
+        Conversion factor (1 Ry = ry_to_ev eV).
+    omega_min_eV, omega_max_eV : float | None
+        Optional bounds on the grid used for partitioning.
+    omega_floor_ry : float
+        Floor to avoid division by zero in B(Ω)/Ω, in Ry.
+
+    Returns
+    -------
+    windows_ry : ndarray of shape (n_windows, 2)
+        Window bounds [Ω_min, Ω_max] in Rydberg.
+    """
+    if n_windows < 1:
+        raise ValueError("n_windows must be >= 1")
+
+    omega_grid_eV = np.asarray(omega_grid_eV, dtype=float)
+    b_omega_eV = np.asarray(b_omega_eV, dtype=float)
+    if omega_grid_eV.shape != b_omega_eV.shape:
+        raise ValueError("omega_grid_eV and b_omega_eV must have the same shape")
+
+    mask = np.ones_like(omega_grid_eV, dtype=bool)
+    if omega_min_eV is not None:
+        mask &= omega_grid_eV >= omega_min_eV
+    if omega_max_eV is not None:
+        mask &= omega_grid_eV <= omega_max_eV
+    omega_grid_eV = omega_grid_eV[mask]
+    b_omega_eV = b_omega_eV[mask]
+    if omega_grid_eV.size < 2:
+        raise ValueError("energy grid must contain at least two points after masking")
+
+    order = np.argsort(omega_grid_eV)
+    omega_grid_eV = omega_grid_eV[order]
+    b_omega_eV = b_omega_eV[order]
+
+    omega_grid_ry = omega_grid_eV / ry_to_ev
+    b_omega_ry = b_omega_eV * ry_to_ev
+    b_omega_ry = np.maximum(b_omega_ry, 0.0)
+
+    if omega_floor_ry is None:
+        positive = omega_grid_ry[omega_grid_ry > 0]
+        if positive.size > 0:
+            omega_floor_ry = 0.5 * float(np.min(positive))
+        else:
+            omega_floor_ry = 1e-8
+    omega_safe = np.maximum(omega_grid_ry, omega_floor_ry)
+    integrand = b_omega_ry / omega_safe
+
+    d_omega = np.diff(omega_grid_ry)
+    avg = 0.5 * (integrand[1:] + integrand[:-1])
+    cdf = np.concatenate(([0.0], np.cumsum(avg * d_omega)))
+    total = cdf[-1]
+    if total <= 0.0:
+        raise ValueError("non-positive total integral for B(Ω)/Ω; check inputs")
+
+    targets = np.linspace(0.0, total, n_windows + 1)
+    edges = np.interp(targets, cdf, omega_grid_ry)
+
+    return np.column_stack((edges[:-1], edges[1:]))
+
+
 def run_kpm_dos(
     data: dict,
     mesh_xy: Mesh,
@@ -193,16 +277,43 @@ def run_kpm_dos(
     plot_file: str = "bse_dos_kpm.png",
     emin_ev: float | None = None,
     emax_ev: float | None = None,
+    include_W: bool = True,
 ) -> dict:
     """Run KPM DOS calculation: bounds, moments, reconstruction, plot."""
-    matvec = build_bse_ring_matvec(mesh_xy, data["nkx"], data["nky"], data["nkz"])
+    matvec = build_bse_ring_matvec(
+        mesh_xy,
+        data["nkx"],
+        data["nky"],
+        data["nkz"],
+        include_W=include_W,
+    )
 
-    # W_q -> W_R for ring matvec.
-    data["W_R"] = jnp.fft.ifftn(data["W_q"], axes=(2, 3, 4), norm="ortho")
+    data_fp32 = _build_gmres_data_fp32(data)
+    data_fp32.update(
+        {
+            "nkx": data["nkx"],
+            "nky": data["nky"],
+            "nkz": data["nkz"],
+            "n_val": data["n_val"],
+            "n_cond": data["n_cond"],
+            "n_val_pad": data["n_val_pad"],
+            "n_cond_pad": data["n_cond_pad"],
+        }
+    )
+    if include_W:
+        data_fp32["W_R"] = jnp.fft.ifftn(data_fp32["W_q"], axes=(2, 3, 4), norm="ortho")
+    else:
+        data_fp32["W_R"] = data_fp32["W_q"]
 
     # --- Spectral bounds from Lanczos ---
-    print(f"Estimating spectral bounds ({n_lanczos} Lanczos steps)...")
-    bounds = estimate_spectral_bounds_sharded(data, mesh_xy, n_lanczos=n_lanczos)
+    print(f"Estimating spectral bounds (Lanczos min={n_lanczos})...")
+    bounds = estimate_spectral_bounds_sharded(
+        data,
+        mesh_xy,
+        n_lanczos=n_lanczos,
+        n_lanczos_max=max(n_lanczos, 50),
+        include_W=include_W,
+    )
     e_min_ry = bounds["e_min_ry"]
     e_max_ry = bounds["e_max_ry_raw"]
 
@@ -236,7 +347,7 @@ def run_kpm_dos(
     print(f"  Total matvecs: {n_random * n_moments}")
     with timing.section("kpm.moments"):
         mu = chebyshev_moments(
-            matvec, data, e_center, half_width,
+            matvec, data_fp32, e_center, half_width,
             n_moments, n_random, seed,
         )
 
@@ -257,6 +368,12 @@ def run_kpm_dos(
     rho = reconstruct_dos(mu_damped, E_grid, e_center_eV, half_width_eV)
     rho = np.maximum(rho, 0.0)  # clip ringing artefacts near edges
 
+    omega_min_eV = E_grid[1] if E_grid[0] <= 0.0 else E_grid[0]
+    windows_ry = partition_windows_equal_b_over_omega(
+        E_grid, rho, n_windows=10, ry_to_ev=ry_to_ev, omega_min_eV=omega_min_eV,
+    )
+    window_edges_eV = windows_ry.ravel() * ry_to_ev
+
     # --- Plot ---
     import matplotlib
     matplotlib.use("Agg")
@@ -272,6 +389,8 @@ def run_kpm_dos(
     ax.set_xlim(E_min_plot, E_max_plot)
     ax.set_ylim(bottom=0)
     ax.axhline(y=0, color="k", linewidth=0.3)
+    for edge in window_edges_eV:
+        ax.axvline(edge, color="tab:orange", linewidth=0.7, alpha=0.6)
     ax.grid(True, alpha=0.3)
 
     # Moment decay subplot.
@@ -342,6 +461,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--n-energy-pts", type=int, default=2000)
     parser.add_argument("--plot-file", type=str, default="bse_dos_kpm.png")
     parser.add_argument("--ry-to-ev", type=float, default=RY_TO_EV)
+    parser.add_argument("--rpa", action="store_true",
+                        help="Use RPA kernel (D+V only), skip W0 term entirely.")
     args = parser.parse_args(argv)
 
     timing.reset()
@@ -379,6 +500,7 @@ def main(argv: list[str] | None = None) -> None:
             plot_file=args.plot_file,
             emin_ev=args.emin_ev,
             emax_ev=args.emax_ev,
+            include_W=not args.rpa,
         )
 
     timing.report(print_fn=print, title="--- KPM Timing ---")

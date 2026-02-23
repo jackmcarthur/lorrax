@@ -28,9 +28,9 @@ jax.config.update("jax_enable_x64", True)
 RY_TO_EV_DEFAULT = 13.6056980659
 ELLIPSE_GAMMA_FIXED = 0.2
 
-# Cache compiled GMRES kernels by max_iter (per-process).
-_GMRES_SOLVER_CACHE: dict[tuple[int, float], Callable] = {}
-_FEAST_RUNNER_CACHE: dict[tuple[int, int, int, float], Callable] = {}
+# Cache compiled GMRES/FEAST kernels by shape + dtype (per-process).
+_GMRES_SOLVER_CACHE: dict[tuple[int, float, str], Callable] = {}
+_FEAST_RUNNER_CACHE: dict[tuple[int, int, int, float, float, str], Callable] = {}
 
 
 @dataclass(frozen=True)
@@ -71,7 +71,11 @@ def _apply_shifted_matvec(
     return z * x - hx
 
 
-def build_preconditioner_diagonal_sharded(data: dict, mesh_xy: Mesh) -> jax.Array:
+def build_preconditioner_diagonal_sharded(
+    data: dict,
+    mesh_xy: Mesh,
+    include_W: bool = True,
+) -> jax.Array:
     eps_c = data["eps_c"]
     eps_v = data["eps_v"]
     nk = int(data["nkx"] * data["nky"] * data["nkz"])
@@ -88,11 +92,14 @@ def build_preconditioner_diagonal_sharded(data: dict, mesh_xy: Mesh) -> jax.Arra
     S_v = jnp.einsum("MN,kcvN->kcvM", V_q0, M_Y)
     V_diag_kcv = jnp.einsum("kcvM,kcvM->kcv", jnp.conj(M_X), S_v) / nk
 
-    W_q0 = data["W_q"][:, :, 0, 0, 0]
-    rho_c = jnp.einsum("kcsm,kcsm->kcm", jnp.conj(psi_c_X), psi_c_X)
-    rho_v = jnp.einsum("kvsm,kvsm->kvm", jnp.conj(psi_v_Y), psi_v_Y)
-    S_w = jnp.einsum("MN,kvN->kvM", W_q0, rho_v)
-    W_diag_kcv = jnp.einsum("kcm,kvm->kcv", rho_c, S_w) / nk
+    if include_W:
+        W_q0 = data["W_q"][:, :, 0, 0, 0]
+        rho_c = jnp.einsum("kcsm,kcsm->kcm", jnp.conj(psi_c_X), psi_c_X)
+        rho_v = jnp.einsum("kvsm,kvsm->kvm", jnp.conj(psi_v_Y), psi_v_Y)
+        S_w = jnp.einsum("MN,kvN->kvM", W_q0, rho_v)
+        W_diag_kcv = jnp.einsum("kcm,kvm->kcv", rho_c, S_w) / nk
+    else:
+        W_diag_kcv = jnp.zeros_like(V_diag_kcv)
 
     V_diag = V_diag_kcv.transpose(1, 2, 0)
     W_diag = W_diag_kcv.transpose(1, 2, 0)
@@ -108,21 +115,24 @@ def _get_gmres_solver(
     data: dict,
     max_iter: int,
     tol: float,
+    dtype: jnp.dtype,
 ) -> Callable:
     """Return a cached JIT-compiled GMRES solver for this max_iter/tol."""
-    key = (max_iter, float(tol))
+    key = (max_iter, float(tol), str(dtype))
     if key in _GMRES_SOLVER_CACHE:
         return _GMRES_SOLVER_CACHE[key]
 
     def _solve(b, diag_h, z):
-        m_inv = 1.0 / (z - diag_h)
+        one = jnp.asarray(1.0, dtype=b.dtype)
+        m_inv = one / (z - diag_h)
         m_inv = m_inv[None, ...]
 
         x0 = m_inv * b
-        r0 = b - _apply_shifted_matvec(matvec, x0, z, data)
+        r0 = b - _apply_shifted_matvec(matvec, x0, z, data).astype(b.dtype)
         beta = jnp.linalg.norm(r0)
 
-        v0 = jnp.where(beta == 0.0, r0, r0 / beta)
+        zero = jnp.asarray(0.0, dtype=beta.dtype)
+        v0 = jnp.where(beta == zero, r0, r0 / beta)
 
         v_shape = (max_iter + 1,) + b.shape
         z_shape = (max_iter,) + b.shape
@@ -142,7 +152,7 @@ def _get_gmres_solver(
             v_k = V[k]
             z_k = m_inv * v_k
             Z = Z.at[k].set(z_k)
-            w = _apply_shifted_matvec(matvec, z_k, z, data)
+            w = _apply_shifted_matvec(matvec, z_k, z, data).astype(b.dtype)
 
             def arnoldi(i, carry):
                 w_local, H_local = carry
@@ -159,15 +169,19 @@ def _get_gmres_solver(
 
             lhs = H.conj().T @ H
             rhs = H.conj().T @ g
-            jitter = 1e-14 * jnp.trace(lhs).real / jnp.maximum(1.0, lhs.shape[0])
+            jitter_scale = jnp.asarray(1e-14, dtype=lhs.real.dtype)
+            jitter = jitter_scale * jnp.trace(lhs).real / jnp.maximum(
+                jnp.asarray(1.0, dtype=lhs.real.dtype), lhs.shape[0]
+            )
             lhs = lhs + jitter * jnp.eye(lhs.shape[0], dtype=lhs.dtype)
             y = jnp.linalg.solve(lhs, rhs)
             resid = jnp.linalg.norm(g - H @ y)
-            rel = jnp.where(beta == 0.0, 0.0, resid / beta)
+            rel = jnp.where(beta == zero, zero, resid / beta)
 
             return k + 1, rel, V, Z, H, g, y
 
-        init = (0, jnp.inf, V, Z, H, g, y)
+        rel0 = jnp.asarray(jnp.inf, dtype=beta.dtype)
+        init = (0, rel0, V, Z, H, g, y)
         k_final, _, V, Z, H, g, y = jax.lax.while_loop(cond, body, init)
 
         x = x0 + jnp.tensordot(y, Z, axes=(0, 0))
@@ -188,7 +202,7 @@ def gmres_solve_sharded_jit(
     tol: float,
 ) -> tuple[jax.Array, jax.Array]:
     """JIT GMRES with diagonal right-preconditioner and while-loop stopping."""
-    solver = _get_gmres_solver(matvec, data, max_iter, tol)
+    solver = _get_gmres_solver(matvec, data, max_iter, tol, b.dtype)
     return solver(b, diag_h, z)
 
 
@@ -200,16 +214,18 @@ def _get_feast_runner(
     max_iter: int,
     tol: float,
     ry_to_ev: float,
+    dtype: jnp.dtype,
 ) -> Callable:
     """Return a cached JIT FEAST runner for this (n_quad, n_ritz, max_iter, tol)."""
-    key = (n_quad, n_ritz, max_iter, float(tol), float(ry_to_ev))
+    key = (n_quad, n_ritz, max_iter, float(tol), float(ry_to_ev), str(dtype))
     if key in _FEAST_RUNNER_CACHE:
         return _FEAST_RUNNER_CACHE[key]
 
     def _run(X_batch, z_nodes, w_weights, diag_h):
         # X_batch: (n_ritz, 1, nc, nv, nk)
-        filtered = jnp.zeros_like(X_batch, dtype=jnp.complex128)
+        filtered = jnp.zeros_like(X_batch, dtype=X_batch.dtype)
         iters = jnp.zeros((n_ritz, n_quad), dtype=jnp.int32)
+        scale = jnp.asarray(ry_to_ev, dtype=z_nodes.dtype)
 
         def vec_body(i, carry):
             filtered_local, iters_local = carry
@@ -217,16 +233,17 @@ def _get_feast_runner(
 
             def pole_body(j, pole_carry):
                 filt_i, iters_i = pole_carry
-                z = z_nodes[j] / ry_to_ev
-                w = w_weights[j] / ry_to_ev
+                z = z_nodes[j] / scale
+                w = w_weights[j] / scale
                 y, k_used = gmres_solve_sharded_jit(
                     matvec, diag_h, z, x, data, max_iter=max_iter, tol=tol
                 )
-                filt_i = filt_i + 2.0 * jnp.real(w * y)
+                two = jnp.asarray(2.0, dtype=jnp.real(w).dtype)
+                filt_i = filt_i + two * jnp.real(w * y)
                 iters_i = iters_i.at[j].set(k_used)
                 return filt_i, iters_i
 
-            filt_i = jnp.zeros_like(x, dtype=jnp.complex128)
+            filt_i = jnp.zeros_like(x, dtype=x.dtype)
             iters_i = jnp.zeros((n_quad,), dtype=jnp.int32)
             filt_i, iters_i = jax.lax.fori_loop(0, n_quad, pole_body, (filt_i, iters_i))
             filtered_local = filtered_local.at[i].set(filt_i)
@@ -241,64 +258,63 @@ def _get_feast_runner(
     return runner
 
 
+def _cast_with_sharding(x: jax.Array, dtype: jnp.dtype) -> jax.Array:
+    y = x.astype(dtype)
+    sharding = getattr(x, "sharding", None)
+    if sharding is not None:
+        y = jax.lax.with_sharding_constraint(y, sharding)
+    return y
+
+
+def _build_gmres_data_fp32(data: dict) -> dict:
+    return {
+        "psi_c_X": _cast_with_sharding(data["psi_c_X"], jnp.complex64),
+        "psi_c_Y": _cast_with_sharding(data["psi_c_Y"], jnp.complex64),
+        "psi_v_X": _cast_with_sharding(data["psi_v_X"], jnp.complex64),
+        "psi_v_Y": _cast_with_sharding(data["psi_v_Y"], jnp.complex64),
+        "eps_c": _cast_with_sharding(data["eps_c"], jnp.float32),
+        "eps_v": _cast_with_sharding(data["eps_v"], jnp.float32),
+        "V_q0": _cast_with_sharding(data["V_q0"], jnp.complex64),
+        "W_q": _cast_with_sharding(data["W_q"], jnp.complex64),
+    }
+
+
 @dataclass(frozen=True)
 class RitzResult:
-    """Result of a Rayleigh-Ritz extraction with S-eigenvalue filtering."""
-    ritz_evals: np.ndarray      # physical Ritz values (Ry), sorted
-    ritz_coeffs: np.ndarray     # (n_total, n_physical) coefficient matrix for Ritz vectors
-    s_evals: np.ndarray         # all S eigenvalues, sorted ascending
-    rayleigh_quotients: np.ndarray  # per-vector Rayleigh quotients (Ry), sorted
-    n_physical: int             # number of physical Ritz pairs kept
-    n_total: int                # total number of input vectors
-    s_threshold: float          # threshold used for filtering
-
-
-def _solve_reduced_evp(
-    S: jax.Array,
-    H: jax.Array,
-    s_evals: jax.Array,
-    s_evecs: jax.Array,
-    n_keep: int,
-) -> tuple[jax.Array, jax.Array]:
-    """Solve the reduced generalized eigenvalue problem keeping n_keep S-eigenvectors.
-
-    Returns (sorted_eigenvalues, coefficients) where coefficients has shape
-    (n_total, n_keep) — column i gives the linear combination of the original
-    vectors that produces Ritz vector i.
-    """
-    U = s_evecs[:, -n_keep:]          # largest n_keep S eigenvectors
-    s_keep = s_evals[-n_keep:]
-    H_red = U.conj().T @ H @ U
-    D_inv_sqrt = jnp.diag(1.0 / jnp.sqrt(s_keep))
-    A_red = D_inv_sqrt @ H_red @ D_inv_sqrt
-    A_red = 0.5 * (A_red + A_red.conj().T)
-    evals, evecs = jnp.linalg.eigh(A_red)
-    order = jnp.argsort(jnp.real(evals))
-    # Coefficients: ritz_vec_i = sum_j coeffs[j, i] * original_vec_j
-    coeffs = U @ D_inv_sqrt @ evecs[:, order]
-    return jnp.real(evals)[order], coeffs
+    """Result of a Rayleigh-Ritz extraction from a FEAST-filtered subspace."""
+    ritz_evals: np.ndarray          # (n,) Ritz values (Ry), sorted
+    ritz_coeffs: np.ndarray         # (n, n) coefficient matrix for Ritz vectors (columns)
+    s_evals: np.ndarray             # (n,) overlap eigenvalues, sorted ascending
+    rayleigh_quotients: np.ndarray  # (n,) per-vector Rayleigh quotients (Ry), sorted
+    rel_residuals: np.ndarray       # (n,) ||H psi - lambda psi|| / ||psi|| in full space
+    n_total: int                    # number of FEAST vectors in the subspace
+    s_floor: float                  # overlap regularization floor used for whitening
 
 
 def _rayleigh_ritz(
     matvec,
     vectors: list[jax.Array],
     data: dict,
-    s_cutoff: float = 0.01,
+    s_cutoff: float = 1e-6,
 ) -> RitzResult:
-    """Rayleigh-Ritz with S-eigenvalue truncation of spurious directions.
+    """Solve the reduced generalized EVP with overlap regularization.
 
-    Uses a relative cutoff on S eigenvalues to filter spurious directions.
+    We regularize the overlap by clipping overlap eigenvalues below
+    `s_floor = s_cutoff * max(s_evals)` (plus a tiny absolute floor), rather
+    than truncating the subspace dimension. Unphysical eigenpairs are best
+    identified after the fact (e.g. outside the target FEAST window and/or
+    with large full-space residual).
     """
     n = len(vectors)
     if n == 0:
         return RitzResult(
             ritz_evals=np.array([], dtype=np.float64),
-            ritz_coeffs=np.zeros((0, 0), dtype=np.float64),
+            ritz_coeffs=np.zeros((0, 0), dtype=np.complex128),
             s_evals=np.array([], dtype=np.float64),
             rayleigh_quotients=np.array([], dtype=np.float64),
-            n_physical=0,
+            rel_residuals=np.array([], dtype=np.float64),
             n_total=0,
-            s_threshold=0.0,
+            s_floor=0.0,
         )
 
     hv = []
@@ -323,93 +339,66 @@ def _rayleigh_ritz(
     V_flat = V.reshape((n, -1))
     HV_flat = HV.reshape((n, -1))
 
-    S = V_flat.conj() @ V_flat.T
-    H = V_flat.conj() @ HV_flat.T
+    S_dev = V_flat.conj() @ V_flat.T
+    H_dev = V_flat.conj() @ HV_flat.T
+    G_dev = HV_flat.conj() @ HV_flat.T
 
-    S = 0.5 * (S + S.conj().T)
-    H = 0.5 * (H + H.conj().T)
+    S_np = np.asarray(jax.device_get(S_dev))
+    H_np = np.asarray(jax.device_get(H_dev))
+    G_np = np.asarray(jax.device_get(G_dev))
+    S_np = 0.5 * (S_np + S_np.conj().T)
+    H_np = 0.5 * (H_np + H_np.conj().T)
+    G_np = 0.5 * (G_np + G_np.conj().T)
 
-    s_evals, s_evecs = jnp.linalg.eigh(S)
+    s_evals, s_evecs = np.linalg.eigh(S_np)
+    s_evals = s_evals.real
+    s_max = float(np.max(s_evals)) if s_evals.size else 0.0
+    s_floor = max(float(s_cutoff) * s_max, 1e-30)
+    s_clipped = np.maximum(s_evals, s_floor)
 
-    threshold = s_cutoff * jnp.max(s_evals)
-    n_cutoff = jnp.sum(s_evals > threshold)
-    n_physical = int(jax.device_get(jnp.maximum(n_cutoff, 1)))
+    rq = np.real(np.diag(H_np) / np.maximum(np.real(np.diag(S_np)), 1e-30))
+    rq = np.sort(rq)
 
-    # Rayleigh quotients: H_ii / S_ii for each vector (no extra matvecs needed).
-    rq = jnp.real(jnp.diag(H) / jnp.maximum(jnp.real(jnp.diag(S)), 1e-30))
-    rq = np.sort(np.asarray(jax.device_get(rq)))
-
-    s_evals_host = np.asarray(jax.device_get(s_evals))
-    if n_physical == 0 or s_evals_host.max() <= 0:
+    if s_max <= 0.0:
         return RitzResult(
             ritz_evals=np.array([], dtype=np.float64),
-            ritz_coeffs=np.zeros((n, 0), dtype=np.float64),
-            s_evals=s_evals_host,
+            ritz_coeffs=np.zeros((n, 0), dtype=np.complex128),
+            s_evals=s_evals,
             rayleigh_quotients=rq,
-            n_physical=0,
             n_total=n,
-            s_threshold=float(jax.device_get(threshold)),
+            rel_residuals=np.full((0,), np.inf, dtype=np.float64),
+            s_floor=float(s_floor),
         )
 
-    evals, coeffs = _solve_reduced_evp(S, H, s_evals, s_evecs, n_physical)
-    evals_host = np.asarray(jax.device_get(evals))
-    coeffs_host = np.asarray(jax.device_get(coeffs))
+    inv_sqrt = 1.0 / np.sqrt(s_clipped)
+    W = s_evecs @ np.diag(inv_sqrt)  # whitening map: coeffs -> S-normed basis
+    A = W.conj().T @ H_np @ W
+    A = 0.5 * (A + A.conj().T)
+    evals, evecs = np.linalg.eigh(A)
+    order = np.argsort(evals.real)
+    evals = evals.real[order]
+    evecs = evecs[:, order]
+    coeffs = W @ evecs  # (n, n)
+
+    rel_res = np.zeros((n,), dtype=np.float64)
+    for i in range(n):
+        lam = float(evals[i])
+        c = coeffs[:, i]
+        psi2 = np.real(np.vdot(c, S_np @ c))
+        psi2 = max(psi2, 1e-300)
+        r2 = np.real(np.vdot(c, (G_np - 2.0 * lam * H_np + (lam * lam) * S_np) @ c))
+        r2 = max(r2, 0.0)
+        rel_res[i] = math.sqrt(r2 / psi2)
 
     return RitzResult(
-        ritz_evals=evals_host,
-        ritz_coeffs=coeffs_host,
-        s_evals=s_evals_host,
+        ritz_evals=evals,
+        ritz_coeffs=coeffs,
+        s_evals=s_evals,
         rayleigh_quotients=rq,
-        n_physical=n_physical,
         n_total=n,
-        s_threshold=float(jax.device_get(threshold)),
+        rel_residuals=rel_res,
+        s_floor=float(s_floor),
     )
-
-
-def _diagnostic_subspace_stats(
-    matvec,
-    vectors: list[jax.Array],
-    data: dict,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (rayleigh_quotients, S_eigvals, H_eigvals) for diagnostics."""
-    n = len(vectors)
-    S = np.zeros((n, n), dtype=np.complex128)
-    H = np.zeros((n, n), dtype=np.complex128)
-    rq = np.zeros((n,), dtype=np.float64)
-
-    hv = []
-    for v in vectors:
-        hv.append(
-            matvec(
-                v,
-                data["psi_c_X"],
-                data["psi_c_Y"],
-                data["psi_v_X"],
-                data["psi_v_Y"],
-                data["eps_c"],
-                data["eps_v"],
-                data["W_R"],
-                data["V_q0"],
-            )
-        )
-
-    for i in range(n):
-        vi = vectors[i]
-        hi = hv[i]
-        norm = jnp.vdot(vi, vi)
-        rq_i = jnp.vdot(vi, hi) / jnp.maximum(norm, 1e-30)
-        rq[i] = float(jax.device_get(rq_i).real)
-        for j in range(n):
-            S_ij = jnp.vdot(vi, vectors[j])
-            H_ij = jnp.vdot(vi, hv[j])
-            S[i, j] = complex(jax.device_get(S_ij))
-            H[i, j] = complex(jax.device_get(H_ij))
-
-    S = 0.5 * (S + S.conj().T)
-    H = 0.5 * (H + H.conj().T)
-    Se = np.linalg.eigvalsh(S).real
-    He = np.linalg.eigvalsh(H).real
-    return rq, Se, He
 
 
 def _build_ritz_vectors(
@@ -457,21 +446,43 @@ def run_feast_ritz(
     gmres_tol: float,
     seed: int,
     ry_to_ev: float = RY_TO_EV_DEFAULT,
-    s_cutoff: float = 0.01,
+    s_cutoff: float = 1e-6,
     feast_iter: int = 1,
     quadrature: str = "zolotarev",
     lambda_min_eV: float | None = None,
     lambda_max_eV: float | None = None,
     zolotarev_rho_scale: float = 1.0,
     n_quad_schedule: list[int] | None = None,
+    gmres_fp32: bool = False,
+    include_W: bool = True,
 ) -> dict:
-    matvec = build_bse_ring_matvec(mesh_xy, data["nkx"], data["nky"], data["nkz"])
+    matvec = build_bse_ring_matvec(
+        mesh_xy,
+        data["nkx"],
+        data["nky"],
+        data["nkz"],
+        include_W=include_W,
+    )
     sh = make_bse_shardings(mesh_xy)
 
-    # Convert W_q (reciprocal space) to W_R (real space) for the ring matvec.
-    data["W_R"] = jnp.fft.ifftn(data["W_q"], axes=(2, 3, 4), norm="ortho")
+    if include_W:
+        # Convert W_q (reciprocal space) to W_R (real space) for the ring matvec.
+        data["W_R"] = jnp.fft.ifftn(data["W_q"], axes=(2, 3, 4), norm="ortho")
+    else:
+        data["W_R"] = data["W_q"]
 
-    diag_h = build_preconditioner_diagonal_sharded(data, mesh_xy)
+    diag_h = build_preconditioner_diagonal_sharded(data, mesh_xy, include_W=include_W)
+    data_gmres = data
+    diag_h_gmres = diag_h
+    runner_dtype = jnp.complex128
+    if gmres_fp32:
+        data_gmres = _build_gmres_data_fp32(data)
+        if include_W:
+            data_gmres["W_R"] = jnp.fft.ifftn(data_gmres["W_q"], axes=(2, 3, 4), norm="ortho")
+        else:
+            data_gmres["W_R"] = data_gmres["W_q"]
+        diag_h_gmres = _cast_with_sharding(diag_h, jnp.float32)
+        runner_dtype = jnp.complex64
     nk = int(data["nkx"] * data["nky"] * data["nkz"])
     n_cond_pad = int(data["n_cond_pad"])
     n_val_pad = int(data["n_val_pad"])
@@ -491,12 +502,13 @@ def run_feast_ritz(
     for nq in sorted(set(quad_schedule)):
         runner_cache[nq] = _get_feast_runner(
             matvec,
-            data,
+            data_gmres,
             nq,
             n_ritz,
             gmres_max_iter,
             gmres_tol,
             ry_to_ev,
+            runner_dtype,
         )
 
     for window in windows:
@@ -504,10 +516,11 @@ def run_feast_ritz(
         X_list = []
         for _ in range(n_ritz):
             key, subkey = jax.random.split(key)
-            x = jax.random.normal(subkey, (1, n_cond_pad, n_val_pad, nk), dtype=jnp.float64)
+            x_dtype = jnp.float32 if gmres_fp32 else jnp.float64
+            x = jax.random.normal(subkey, (1, n_cond_pad, n_val_pad, nk), dtype=x_dtype)
             x = x / jnp.linalg.norm(x)
             x = jax.lax.with_sharding_constraint(x, sh.X)
-            X_list.append(x.astype(jnp.complex128))
+            X_list.append(x.astype(runner_dtype))
         X_batch = jnp.stack(X_list, axis=0)
 
         ritz_result = None
@@ -531,34 +544,43 @@ def run_feast_ritz(
                 z_nodes, w_weights = feast_ellipse_quadrature(window, n_quad_it, gamma)
             else:
                 raise ValueError(f"Unknown quadrature type: {quadrature!r}")
-            z_jnp = jnp.asarray(z_nodes)
-            w_jnp = jnp.asarray(w_weights)
+            z_dtype = jnp.complex64 if gmres_fp32 else jnp.complex128
+            z_jnp = jnp.asarray(z_nodes, dtype=z_dtype)
+            w_jnp = jnp.asarray(w_weights, dtype=z_dtype)
 
             # --- Filter ---
-            filtered_batch, iters = runner_cache[n_quad_it](X_batch, z_jnp, w_jnp, diag_h)
+            filtered_batch, iters = runner_cache[n_quad_it](X_batch, z_jnp, w_jnp, diag_h_gmres)
 
-            # GMRES iteration summary.
-            iters_host = np.asarray(jax.device_get(iters))
-            for i in range(n_ritz):
-                iters_str = " ".join(f"{iters_host[i, j]}" for j in range(n_quad_it))
-                print(f"    {window.name} vec {i+1}: GMRES iters [{iters_str}]")
-            avg_gmres = float(iters_host.mean())
-            total_gmres = int(iters_host.sum())
-            total_matvecs = total_gmres + n_ritz * n_quad_it  # each GMRES iter + 1 initial per solve
-            print(f"    GMRES avg iters: {avg_gmres:.1f}, total solves: {n_ritz*n_quad_it}, total matvecs: {total_matvecs}")
+            it_sum = int(jax.device_get(jnp.sum(iters)))
+            it_max = int(jax.device_get(jnp.max(iters)))
+            n_solves = n_ritz * n_quad_it
+            total_matvecs = it_sum + n_solves  # 1 matvec per GMRES iter + 1 initial matvec per solve
+            print(
+                f"    GMRES: solves={n_solves}, total_iters={it_sum}, max_iters={it_max}, "
+                f"total_matvecs={total_matvecs}"
+            )
 
             filtered = [filtered_batch[i] for i in range(n_ritz)]
+            if gmres_fp32:
+                filtered = [v.astype(jnp.complex128) for v in filtered]
 
-            # --- Rayleigh-Ritz (verbose only on last iteration) ---
             print(f"  {window.name} Rayleigh-Ritz [{window.a_eV:.2f}, {window.b_eV:.2f}] eV:")
             ritz_result = _rayleigh_ritz(
                 matvec, filtered, data,
                 s_cutoff=s_cutoff,
             )
 
-            # Print Ritz values for this iteration.
-            ev_str = ", ".join(f"{v*ry_to_ev:.6f}" for v in ritz_result.ritz_evals)
-            print(f"    Ritz evals (eV): [{ev_str}]")
+            evals_eV = ritz_result.ritz_evals * ry_to_ev
+            in_window = (evals_eV >= window.a_eV) & (evals_eV <= window.b_eV)
+            n_in = int(np.sum(in_window))
+
+            s_max = float(ritz_result.s_evals.max()) if ritz_result.s_evals.size else 0.0
+            eff_rank = int(np.sum(ritz_result.s_evals >= ritz_result.s_floor)) if s_max > 0 else 0
+            print(f"    overlap: max(S)={s_max:.3e}, s_floor={ritz_result.s_floor:.3e}, eff_rank={eff_rank}/{n_ritz}")
+            print(f"    Ritz values (eV) [{n_in} in-window / {n_ritz} total]:")
+            for i, (ev, rr, ok) in enumerate(zip(evals_eV, ritz_result.rel_residuals, in_window), start=1):
+                tag = "" if ok else " *"
+                print(f"      {i:2d}: {ev:12.6f}   relres={rr:9.2e}{tag}")
 
             # Convergence check: max change from previous iteration.
             if prev_evals is not None:
@@ -571,34 +593,32 @@ def run_feast_ritz(
 
             # --- Prepare starting vectors for next iteration ---
             if not is_last:
-                ritz_vecs = _build_ritz_vectors(filtered, ritz_result.ritz_coeffs, sh.X)
+                # Prefer in-window eigenvectors; fall back to those closest to the window center.
+                if n_in > 0:
+                    choose = np.where(in_window)[0]
+                else:
+                    center = 0.5 * (window.a_eV + window.b_eV)
+                    choose = np.argsort(np.abs(evals_eV - center))
+                choose = choose[: min(len(choose), n_ritz)]
+                coeffs_sel = ritz_result.ritz_coeffs[:, choose]
+                ritz_vecs = _build_ritz_vectors(filtered, coeffs_sel, sh.X)
 
                 # Pad back to n_ritz with random vectors if n_physical < n_ritz.
                 X_next = []
                 for v in ritz_vecs:
-                    X_next.append(v.astype(jnp.complex128))
+                    X_next.append(v.astype(runner_dtype))
                 while len(X_next) < n_ritz:
                     key, subkey = jax.random.split(key)
-                    x = jax.random.normal(subkey, (1, n_cond_pad, n_val_pad, nk), dtype=jnp.float64)
+                    x_dtype = jnp.float32 if gmres_fp32 else jnp.float64
+                    x = jax.random.normal(subkey, (1, n_cond_pad, n_val_pad, nk), dtype=x_dtype)
                     x = x / jnp.linalg.norm(x)
                     x = jax.lax.with_sharding_constraint(x, sh.X)
-                    X_next.append(x.astype(jnp.complex128))
+                    X_next.append(x.astype(runner_dtype))
                 X_batch = jnp.stack(X_next, axis=0)
 
         # Final diagnostics for this window (printed after last iteration).
         assert ritz_result is not None
         results[window.name] = ritz_result
-
-        # S eigenvalue summary.
-        print(f"  S eigenvalues ({ritz_result.n_physical}/{ritz_result.n_total} physical):")
-        for i, s in enumerate(ritz_result.s_evals, start=1):
-            tag = " *" if s > ritz_result.s_threshold else ""
-            print(f"    {i:2d}: {s:.6e}{tag}")
-
-        # Rayleigh quotients.
-        print(f"  Rayleigh quotients (eV):")
-        for i, val in enumerate(ritz_result.rayleigh_quotients, start=1):
-            print(f"    {i:2d}: {val * ry_to_ev:12.6f}")
 
     return results
 
@@ -615,15 +635,26 @@ def estimate_spectral_bounds_sharded(
     data: dict,
     mesh_xy: Mesh,
     n_lanczos: int = 20,
+    n_lanczos_max: int | None = None,
+    emax_rtol: float = 5e-4,
+    emax_atol: float = 0.0,
+    emax_patience: int = 2,
     seed: int = 0,
+    include_W: bool = True,
 ) -> dict:
     """Estimate E_min and E_max (Ry) using diagonal gap and short Lanczos.
 
-    Returns a dict containing the full per-iteration E_max sequence from the
-    Lanczos tridiagonal as a diagnostic for convergence vs. iteration count.
+    Uses an adaptive Lanczos run that stops when the largest Ritz value
+    (of the tridiagonal) converges to within the specified tolerances.
     """
-    eps_c = data["eps_c"]
-    eps_v = data["eps_v"]
+    data_fp32 = _build_gmres_data_fp32(data)
+    if include_W:
+        data_fp32["W_R"] = jnp.fft.ifftn(data_fp32["W_q"], axes=(2, 3, 4), norm="ortho")
+    else:
+        data_fp32["W_R"] = data_fp32["W_q"]
+
+    eps_c = data_fp32["eps_c"]
+    eps_v = data_fp32["eps_v"]
     n_cond = int(data["n_cond"])
     n_val = int(data["n_val"])
 
@@ -638,19 +669,37 @@ def estimate_spectral_bounds_sharded(
     n_val_pad = int(data["n_val_pad"])
 
     sh = make_bse_shardings(mesh_xy)
-    matvec = build_bse_ring_matvec(mesh_xy, data["nkx"], data["nky"], data["nkz"])
+    matvec = build_bse_ring_matvec(
+        mesh_xy,
+        data["nkx"],
+        data["nky"],
+        data["nkz"],
+        include_W=include_W,
+    )
 
     key = jax.random.PRNGKey(seed)
 
     @jax.jit
     def _make_random_vector(key_in):
         k1, k2 = jax.random.split(key_in)
-        q = jax.random.normal(k1, (1, n_cond_pad, n_val_pad, nk), dtype=jnp.float64)
-        q = q + 1j * jax.random.normal(k2, (1, n_cond_pad, n_val_pad, nk), dtype=jnp.float64)
+        q = jax.random.normal(k1, (1, n_cond_pad, n_val_pad, nk), dtype=jnp.float32)
+        q = q + 1j * jax.random.normal(k2, (1, n_cond_pad, n_val_pad, nk), dtype=jnp.float32)
         q = q / jnp.linalg.norm(q)
         return jax.lax.with_sharding_constraint(q, sh.X)
 
-    W_R = jnp.fft.ifftn(data["W_q"], axes=(2, 3, 4), norm="ortho")
+    def _tridiag_emax(alpha_seq: list[float], beta_seq: list[float]) -> float:
+        t_dim = len(alpha_seq)
+        T = np.zeros((t_dim, t_dim), dtype=np.float64)
+        for i, alpha in enumerate(alpha_seq):
+            T[i, i] = alpha
+            if i < t_dim - 1:
+                T[i, i + 1] = beta_seq[i]
+                T[i + 1, i] = beta_seq[i]
+        evals = np.linalg.eigvalsh(T)
+        return float(np.max(evals))
+
+    if n_lanczos_max is None:
+        n_lanczos_max = n_lanczos
 
     q = _make_random_vector(key)
     q_prev = jnp.zeros_like(q)
@@ -658,18 +707,22 @@ def estimate_spectral_bounds_sharded(
 
     alphas: list[float] = []
     betas: list[float] = []
+    emax_seq: list[float] = []
+    converged = False
+    stable = 0
+    prev_emax: float | None = None
 
-    for _ in range(n_lanczos):
+    for _ in range(n_lanczos_max):
         z = matvec(
             q,
-            data["psi_c_X"],
-            data["psi_c_Y"],
-            data["psi_v_X"],
-            data["psi_v_Y"],
+            data_fp32["psi_c_X"],
+            data_fp32["psi_c_Y"],
+            data_fp32["psi_v_X"],
+            data_fp32["psi_v_Y"],
             eps_c,
             eps_v,
-            W_R,
-            data["V_q0"],
+            data_fp32["W_R"],
+            data_fp32["V_q0"],
         )
 
         alpha = jnp.vdot(q, z).real
@@ -681,23 +734,32 @@ def estimate_spectral_bounds_sharded(
         alphas.append(alpha_f)
         betas.append(beta_f)
 
-
         if beta_f == 0.0:
+            converged = True
             break
 
         q_prev = q
         q = z / beta
         beta_prev = beta
 
-    t_dim = len(alphas)
-    T = np.zeros((t_dim, t_dim), dtype=np.float64)
-    for i, alpha in enumerate(alphas):
-        T[i, i] = alpha
-        if i < t_dim - 1:
-            T[i, i + 1] = betas[i]
-            T[i + 1, i] = betas[i]
-    evals = np.linalg.eigvalsh(T)
-    e_max_ry = float(np.max(evals))
+        if len(alphas) >= n_lanczos:
+            emax = _tridiag_emax(alphas, betas)
+            emax_seq.append(emax)
+            if prev_emax is not None:
+                delta = abs(emax - prev_emax)
+                thresh = float(emax_atol) + float(emax_rtol) * abs(emax)
+                if delta <= thresh:
+                    stable += 1
+                else:
+                    stable = 0
+            prev_emax = emax
+            if stable >= emax_patience:
+                converged = True
+                break
+
+    if not emax_seq:
+        emax_seq.append(_tridiag_emax(alphas, betas))
+    e_max_ry = float(emax_seq[-1])
 
     # Count diagonal elements (non-interacting transitions) as a function of energy.
     delta_E = energy_diff_cv_k(eps_c_use, eps_v_use)  # (n_cond, n_val, nk)
@@ -706,7 +768,14 @@ def estimate_spectral_bounds_sharded(
     return {
         "e_min_ry": float(jax.device_get(e_min_ry)),
         "e_max_ry_raw": e_max_ry,
-        "n_lanczos": t_dim,
+        "n_lanczos_used": len(alphas),
+        "n_lanczos_min": int(n_lanczos),
+        "n_lanczos_max": int(n_lanczos_max),
+        "emax_rtol": float(emax_rtol),
+        "emax_atol": float(emax_atol),
+        "emax_patience": int(emax_patience),
+        "emax_converged": bool(converged),
+        "emax_seq": np.array(emax_seq, dtype=np.float64),
         "diag_energies_ry": diag_flat,
     }
 
@@ -862,6 +931,7 @@ def format_feast_report(
     buffer_factor: float,
     windows: Iterable[WindowSpec],
     quad_specs: Iterable[QuadratureSpec],
+    include_W: bool = True,
 ) -> str:
     e_min_ry = bounds["e_min_ry"]
     e_max_ry_raw = bounds["e_max_ry_raw"]
@@ -875,15 +945,19 @@ def format_feast_report(
     lines.append("=" * 60)
     lines.append("FEAST SETUP REPORT")
     lines.append("=" * 60)
+    kernel_name = "BSE (D+V-W)" if include_W else "RPA (D+V)"
     lines.append(f"Backend     : Sharded BSE matvec (px, py = {px}, {py})")
+    lines.append(f"Kernel      : {kernel_name}")
     lines.append(f"Energies    : eps in Ry; reporting in Ry and eV (Ry->eV = {ry_to_ev})")
     lines.append("")
     lines.append("--- Spectral bounds (Lanczos) ---")
-    lines.append(f"Lanczos steps          : {bounds['n_lanczos']}")
+    lines.append(f"Lanczos steps          : {bounds['n_lanczos_used']} (min={bounds['n_lanczos_min']}, max={bounds['n_lanczos_max']})")
     lines.append(f"E_min (diag gap)       : {e_min_ry:10.6f} Ry = {e_min_eV:9.3f} eV")
     lines.append(f"E_max (Lanczos raw)    : {e_max_ry_raw:10.6f} Ry = {e_max_eV_raw:9.3f} eV")
     lines.append(f"Buffer factor          : {buffer_factor:.2f}")
     lines.append(f"E_max (buffered)       : {e_max_ry:10.6f} Ry = {e_max_eV:9.3f} eV")
+    if not bounds.get("emax_converged", True):
+        lines.append(f"WARNING: Lanczos E_max not converged (rtol={bounds['emax_rtol']}, atol={bounds['emax_atol']}).")
     lines.append("")
     lines.append("--- Windows (eV) ---")
     for w in windows:
@@ -945,7 +1019,16 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--n-cond", type=int, default=4)
     parser.add_argument("--px", type=int, default=1)
     parser.add_argument("--py", type=int, default=1)
-    parser.add_argument("--n-lanczos", type=int, default=10)
+    parser.add_argument("--n-lanczos", type=int, default=10,
+                        help="Minimum Lanczos steps for spectral bounds.")
+    parser.add_argument("--n-lanczos-max", type=int, default=50,
+                        help="Maximum Lanczos steps for spectral bounds.")
+    parser.add_argument("--lanczos-rtol", type=float, default=5e-4,
+                        help="Relative convergence tolerance for Lanczos E_max.")
+    parser.add_argument("--lanczos-atol", type=float, default=0.0,
+                        help="Absolute convergence tolerance for Lanczos E_max.")
+    parser.add_argument("--lanczos-patience", type=int, default=2,
+                        help="Consecutive steps meeting tolerance before stopping.")
     parser.add_argument("--buffer", type=float, default=0.05)
     parser.add_argument("--n-quad1", type=int, default=4,
                         help="Quadrature points for FEAST iteration 1.")
@@ -953,16 +1036,24 @@ def main(argv: list[str] | None = None) -> None:
                         help="Quadrature points for FEAST iteration 2+.")
     parser.add_argument("--feast-ritz", action="store_true", help="Run FEAST GMRES + Ritz extraction.")
     parser.add_argument("--feast-ritz-count", type=int, default=4, help="Ritz values per window.")
-    parser.add_argument("--s-cutoff", type=float, default=0.01,
-                        help="S eigenvalue cutoff (relative to max) for filtering spurious Ritz pairs.")
+    parser.add_argument("--rpa", action="store_true",
+                        help="Use RPA kernel (D+V only), skip W0 term entirely.")
+    parser.add_argument(
+        "--s-cutoff",
+        type=float,
+        default=1e-6,
+        help="Overlap regularization floor as a fraction of max(S) (default: 1e-6).",
+    )
     parser.add_argument("--feast-iter", type=int, default=2,
                         help="Number of FEAST subspace iterations (re-filter Ritz vectors).")
     parser.add_argument("--quadrature", type=str, default="ellipse",
                         choices=["zolotarev", "ellipse"],
                         help="Quadrature type for FEAST filter (default: ellipse).")
-    parser.add_argument("--gmres-max-iter", type=int, default=4, help="GMRES iterations per shift.")
+    parser.add_argument("--gmres-max-iter", type=int, default=10, help="GMRES iterations per shift.")
     parser.add_argument("--gmres-tol", type=float, default=1e-2, help="GMRES relative tolerance.")
     parser.add_argument("--gmres-seed", type=int, default=0, help="Random seed for FEAST vectors.")
+    parser.add_argument("--gmres-fp32", action="store_true",
+                        help="Use FP32 data/GMRES for shifted solves.")
     parser.add_argument(
         "--units-ev-per-ry",
         type=float,
@@ -1002,6 +1093,11 @@ def main(argv: list[str] | None = None) -> None:
             data,
             mesh_xy,
             n_lanczos=args.n_lanczos,
+            n_lanczos_max=args.n_lanczos_max,
+            emax_rtol=args.lanczos_rtol,
+            emax_atol=args.lanczos_atol,
+            emax_patience=args.lanczos_patience,
+            include_W=not args.rpa,
         )
 
     e_min_ry = bounds["e_min_ry"]
@@ -1044,6 +1140,7 @@ def main(argv: list[str] | None = None) -> None:
         buffer_factor=1.0 + args.buffer,
         windows=windows,
         quad_specs=quad_specs,
+        include_W=not args.rpa,
     )
     print(report)
 
@@ -1084,11 +1181,21 @@ def main(argv: list[str] | None = None) -> None:
                 lambda_min_eV=e_min_eV,
                 lambda_max_eV=e_max_eV,
                 n_quad_schedule=n_quad_schedule,
+                gmres_fp32=args.gmres_fp32,
+                include_W=not args.rpa,
             )
+        wmap = {w.name: w for w in windows}
         for name, rr in results.items():
-            print(f"\n{name} Ritz values (eV) [{rr.n_physical} physical / {rr.n_total} total]:")
-            for i, val in enumerate(rr.ritz_evals, start=1):
-                print(f"  {i:2d}: {val * args.units_ev_per_ry:12.6f}")
+            w = wmap.get(name)
+            if w is None:
+                continue
+            evals_eV = rr.ritz_evals * args.units_ev_per_ry
+            in_window = (evals_eV >= w.a_eV) & (evals_eV <= w.b_eV)
+            n_in = int(np.sum(in_window))
+            print(f"\n{name} Ritz values (eV) [{n_in} in-window / {rr.n_total} total]:")
+            for i, (ev, ok) in enumerate(zip(evals_eV, in_window), start=1):
+                tag = "" if ok else " *"
+                print(f"  {i:2d}: {ev:12.6f}{tag}")
 
     timing.report(print_fn=print, title="--- Timing ---")
 
