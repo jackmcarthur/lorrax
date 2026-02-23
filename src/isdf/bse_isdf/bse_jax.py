@@ -199,6 +199,7 @@ def _preview_lanczos(
     n_cond: int,
     n_eig: int = 5,
     write_eigs: int | None = None,
+    max_lanczos_iter: int | None = None,
 ) -> None:
     restart_file = _find_restart_file(input_file)
     payload = _load_ring_subset(restart_file, n_val, n_cond, 1, 1)
@@ -212,8 +213,19 @@ def _preview_lanczos(
     nky = payload["nky"]
     nkz = payload["nkz"]
 
+    nk = nkx * nky * nkz
+    nc_actual = psi_c.shape[1]
+    nv_actual = psi_v.shape[1]
+    bse_dim = nc_actual * nv_actual * nk
+    print(f"BSE problem: {nc_actual} cond x {nv_actual} val x {nk} k = {bse_dim} dimension")
+
+    if max_lanczos_iter is None:
+        max_lanczos_iter = max(30, min(200, bse_dim // 2))
+    print(f"Lanczos: {max_lanczos_iter} iterations")
+
     eigenvalues, eigenvectors = solve_bse(
-        psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz, n_eig=n_eig, max_iter=30
+        psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz,
+        n_eig=n_eig, max_iter=max_lanczos_iter,
     )
     ryd2ev = 13.6056980659
     print(f"Lowest {n_eig} eigenvalues (Ry): {eigenvalues}")
@@ -247,6 +259,36 @@ if __name__ == "__main__":
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--n-eig", type=int, default=5)
+    parser.add_argument("--feast-n-lanczos", type=int, default=10, help="Lanczos steps for FEAST bounds.")
+    parser.add_argument("--feast-buffer", type=float, default=0.05, help="Emax buffer fraction for FEAST windows.")
+    parser.add_argument("--feast-n-quad1", type=int, default=4, help="Quadrature points for FEAST iteration 1.")
+    parser.add_argument("--feast-n-quad2", type=int, default=8, help="Quadrature points for FEAST iteration 2+.")
+    parser.add_argument("--feast-quadrature", type=str, default="ellipse",
+                        choices=["zolotarev", "ellipse"],
+                        help="Quadrature type for FEAST filter (default: ellipse).")
+    parser.add_argument(
+        "--feast-units-ev-per-ry",
+        type=float,
+        default=13.6056980659,
+        help="Energy conversion Ry -> eV for FEAST report.",
+    )
+    parser.add_argument("--feast-ritz-count", type=int, default=4, help="Ritz values per window.")
+    parser.add_argument("--gmres-max-iter", type=int, default=4, help="GMRES iterations per shift.")
+    parser.add_argument("--gmres-tol", type=float, default=1e-2, help="GMRES relative tolerance.")
+    parser.add_argument("--gmres-seed", type=int, default=0, help="GMRES random seed.")
+    parser.add_argument("--lanczos", action="store_true", help="Run Lanczos preview + timing instead of FEAST.")
+    parser.add_argument(
+        "--feast-window1",
+        nargs=2,
+        metavar=("A", "B"),
+        help="Override FEAST window 1 bounds in eV (use 'auto' for B).",
+    )
+    parser.add_argument(
+        "--feast-window2",
+        nargs=2,
+        metavar=("A", "B"),
+        help="Override FEAST window 2 bounds in eV (use 'auto' for B).",
+    )
     parser.add_argument(
         "--write-eigs",
         nargs="?",
@@ -254,6 +296,19 @@ if __name__ == "__main__":
         type=int,
         help="Write eigenvectors.h5 (optional N, default: n-eig).",
     )
+    parser.add_argument(
+        "--max-lanczos-iter",
+        type=int,
+        default=None,
+        help="Lanczos iterations for eigensolve (default: auto-scale with problem size).",
+    )
+    parser.add_argument("--kpm-dos", action="store_true", help="Run KPM Chebyshev DOS and exit.")
+    parser.add_argument("--kpm-n-moments", type=int, default=200, help="Chebyshev moments M for KPM.")
+    parser.add_argument("--kpm-n-random", type=int, default=5, help="Stochastic trace vectors R for KPM.")
+    parser.add_argument("--kpm-n-lanczos", type=int, default=100, help="Lanczos steps for KPM spectral bounds.")
+    parser.add_argument("--kpm-emin-ev", type=float, default=None, help="Override KPM E_min (eV).")
+    parser.add_argument("--kpm-emax-ev", type=float, default=None, help="Override KPM E_max (eV).")
+    parser.add_argument("--kpm-plot-file", type=str, default="bse_dos_kpm.png", help="KPM DOS plot output file.")
     parser.add_argument("--ring-test", action="store_true")
     parser.add_argument("--ring-check", action="store_true")
     parser.add_argument("--ring-timing", action="store_true")
@@ -285,7 +340,85 @@ if __name__ == "__main__":
     if args.input is None:
         parser.error("Default run requires -i/--input (use --debug-parallelism for random data).")
 
-    _preview_lanczos(args.input, args.n_val, args.n_cond, n_eig=args.n_eig, write_eigs=args.write_eigs)
+    if args.kpm_dos:
+        from . import bse_kpm
+
+        kpm_argv = [
+            "-i", args.input,
+            "--n-val", str(args.n_val),
+            "--n-cond", str(args.n_cond),
+            "--px", str(args.px),
+            "--py", str(args.py),
+            "--n-moments", str(args.kpm_n_moments),
+            "--n-random", str(args.kpm_n_random),
+            "--n-lanczos", str(args.kpm_n_lanczos),
+            "--plot-file", args.kpm_plot_file,
+        ]
+        if args.kpm_emin_ev is not None:
+            kpm_argv += ["--emin-ev", str(args.kpm_emin_ev)]
+        if args.kpm_emax_ev is not None:
+            kpm_argv += ["--emax-ev", str(args.kpm_emax_ev)]
+        bse_kpm.main(kpm_argv)
+        raise SystemExit(0)
+
+    if not args.lanczos:
+        from . import bse_feast
+
+        bse_feast.main(
+            [
+                "-i",
+                args.input,
+                "--n-val",
+                str(args.n_val),
+                "--n-cond",
+                str(args.n_cond),
+                "--px",
+                str(args.px),
+                "--py",
+                str(args.py),
+                "--n-lanczos",
+                str(args.feast_n_lanczos),
+                "--buffer",
+                str(args.feast_buffer),
+                "--n-quad1",
+                str(args.feast_n_quad1),
+                "--n-quad2",
+                str(args.feast_n_quad2),
+                "--quadrature",
+                args.feast_quadrature,
+                "--units-ev-per-ry",
+                str(args.feast_units_ev_per_ry),
+                "--feast-ritz",
+                "--feast-ritz-count",
+                str(args.feast_ritz_count),
+                "--gmres-max-iter",
+                str(args.gmres_max_iter),
+                "--gmres-tol",
+                str(args.gmres_tol),
+                "--gmres-seed",
+                str(args.gmres_seed),
+                *(
+                    ["--window1", *args.feast_window1]
+                    if args.feast_window1 is not None
+                    else []
+                ),
+                *(
+                    ["--window2", *args.feast_window2]
+                    if args.feast_window2 is not None
+                    else []
+                ),
+            ]
+        )
+        raise SystemExit(0)
+
+    _preview_lanczos(
+        args.input,
+        args.n_val,
+        args.n_cond,
+        n_eig=args.n_eig,
+        write_eigs=args.write_eigs,
+        max_lanczos_iter=args.max_lanczos_iter,
+    )
 
     ring_matvec_timing(
         args.input,

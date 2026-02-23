@@ -331,6 +331,10 @@ def load_bse_data_from_restart_sharded(
         cond_mask_r = mean_enk_r > fermi_energy
         n_val_available = int(np.sum(val_mask_l))
         n_cond_available = int(np.sum(cond_mask_r))
+        if n_val > n_val_available:
+            print(f"Warning: requested {n_val} valence bands but only {n_val_available} available; using {n_val_available}")
+        if n_cond > n_cond_available:
+            print(f"Warning: requested {n_cond} conduction bands but only {n_cond_available} available; using {n_cond_available}")
         n_val = min(n_val, n_val_available)
         n_cond = min(n_cond, n_cond_available)
         if n_val == 0 or n_cond == 0:
@@ -430,8 +434,14 @@ def _load_ring_subset(
     mean_enk_r = jnp.mean(enk_r, axis=0)
     val_mask_l = mean_enk_l < 0.0
     cond_mask_r = mean_enk_r > 0.0
-    n_val = min(n_val, int(jnp.sum(val_mask_l)))
-    n_cond = min(n_cond, int(jnp.sum(cond_mask_r)))
+    n_val_available = int(jnp.sum(val_mask_l))
+    n_cond_available = int(jnp.sum(cond_mask_r))
+    if n_val > n_val_available:
+        print(f"Warning: requested {n_val} valence bands but only {n_val_available} available; using {n_val_available}")
+    if n_cond > n_cond_available:
+        print(f"Warning: requested {n_cond} conduction bands but only {n_cond_available} available; using {n_cond_available}")
+    n_val = min(n_val, n_val_available)
+    n_cond = min(n_cond, n_cond_available)
     val_indices = jnp.argsort(jnp.where(val_mask_l, mean_enk_l, -jnp.inf))[-n_val:]
     cond_indices = jnp.argsort(jnp.where(cond_mask_r, mean_enk_r, jnp.inf))[:n_cond]
 
