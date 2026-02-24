@@ -1,4 +1,5 @@
 import gc
+import os
 import math
 import queue
 import threading
@@ -1012,8 +1013,21 @@ def fit_zeta_chunked_to_h5(
     
     # Setup async writer thread for overlapped I/O
     # This allows GPU computation to continue while HDF5 writes happen in background
-    write_queue = queue.Queue()
+    MAX_WRITE_QUEUE = 2
+    write_queue = queue.Queue(maxsize=MAX_WRITE_QUEUE)
     write_error = [None]  # Mutable container to capture errors from writer thread
+
+    def _get_rss_mb() -> float | None:
+        try:
+            with open("/proc/self/statm", "r") as f:
+                parts = f.readline().split()
+            if len(parts) < 2:
+                return None
+            rss_pages = int(parts[1])
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            return rss_pages * page_size / (1024 * 1024)
+        except Exception:
+            return None
     
     def writer_worker():
         """Background thread that processes HDF5 writes from the queue.
@@ -1031,12 +1045,9 @@ def fit_zeta_chunked_to_h5(
                 # R-chunks are contiguous in r-space, so we can write directly!
                 
                 with h5py.File(output_file, 'a') as f:
-                    for q_flat in range(nq):
-                        qx = q_flat // (nqy * nqz)
-                        qy = (q_flat % (nqy * nqz)) // nqz
-                        qz = q_flat % nqz
-                        # Single contiguous write per q-point!
-                        f['zeta_q'][qx, qy, qz, :, r_start:r_end] = zeta_data[q_flat]
+                    # Vectorized write across all q-points for this r-chunk.
+                    zeta_5d = zeta_data.reshape(nqx, nqy, nqz, n_rmu, r_end - r_start)
+                    f['zeta_q'][:, :, :, :, r_start:r_end] = zeta_5d
                 write_queue.task_done()
         except Exception as e:
             write_error[0] = e
@@ -1054,6 +1065,10 @@ def fit_zeta_chunked_to_h5(
             r_end = min(r_start + chunk_r, n_rtot)
             actual_n_rchunk = r_end - r_start
             print(f"Chunk {chunk_idx+1}/{num_chunks}: r=[{r_start}:{r_end}]")
+            if jax.process_index() == 0:
+                rss_mb = _get_rss_mb()
+                if rss_mb is not None:
+                    print(f"  Host RSS: {rss_mb:.1f} MB (write queue: {write_queue.qsize()}/{MAX_WRITE_QUEUE})")
             
             # 6a. Get psi_nk,a(r_chunk) for FULL band range
             t0 = time.perf_counter()
@@ -1136,7 +1151,15 @@ def fit_zeta_chunked_to_h5(
                     zeta_cpu = np.asarray(zeta_gathered)  # (nq, n_rmu, n_rchunk) on CPU
                     
                     # Queue the write with r-range (r-chunks are contiguous!)
-                    write_queue.put((zeta_cpu, r_start, r_end, chunk_idx))
+                    while True:
+                        try:
+                            write_queue.put((zeta_cpu, r_start, r_end, chunk_idx), timeout=1.0)
+                            break
+                        except queue.Full:
+                            rss_mb = _get_rss_mb()
+                            if rss_mb is not None:
+                                print(f"  Waiting for HDF5 writer... RSS {rss_mb:.1f} MB (queue {write_queue.qsize()}/{MAX_WRITE_QUEUE})")
+                    del zeta_gathered, zeta_cpu
                 else:
                     # Other processes must also participate in the collective gather
                     jax.experimental.multihost_utils.process_allgather(zeta_chunk, tiled=False)
@@ -1144,6 +1167,9 @@ def fit_zeta_chunked_to_h5(
                 # Synchronize across devices (but not waiting for HDF5 write)
                 jax.experimental.multihost_utils.sync_global_devices(f"zeta_chunk_{chunk_idx}")
             t_write_total += time.perf_counter() - t0
+
+            # Free device memory for this chunk early
+            del zeta_chunk
             
     
     t_chunks_total = time.perf_counter() - t_chunk_start

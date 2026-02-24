@@ -69,10 +69,24 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--gmres-tol", type=float, default=1e-2)
     parser.add_argument("--gmres-fp32", action="store_true",
                         help="Use FP32 data/GMRES for shifted solves.")
+    parser.add_argument("--print-residuals", action="store_true",
+                        help="Print relative residuals after each GMRES solve.")
     parser.add_argument("--rpa", action="store_true",
                         help="Use RPA kernel (D+V only), skip W0 term.")
     parser.add_argument("--tda", action="store_true",
                         help="Use TDA (default full non-TDA).")
+    parser.add_argument("--nohead", action="store_true",
+                        help="Use headless V/W0 arrays if present (V_qmunu_nohead, W0_qmunu_nohead).")
+    parser.add_argument("--density-channel", type=str, default="x_plus_y",
+                        choices=("x_plus_y", "rx_plus_rstar_y"),
+                        help="Non-TDA density channel: 'x_plus_y' uses R(X+Y); "
+                             "'rx_plus_rstar_y' uses R X + R* Y.")
+    parser.add_argument("--output-scale", type=float, default=1.0,
+                        help="Scale factor applied to Wc output (default: 1.0).")
+    parser.add_argument("--v-scale", type=float, default=1.0,
+                        help="Scale factor applied to V_q0 (affects RHS and output).")
+    parser.add_argument("--d-only", action="store_true",
+                        help="Disable V/W in the Casida operator (D-only noninteracting check).")
     parser.add_argument("--ry-to-ev", type=float, default=RY_TO_EV_DEFAULT)
     parser.add_argument("--out", type=str, default="Wc_exact.h5")
     args = parser.parse_args(argv)
@@ -88,6 +102,7 @@ def main(argv: list[str] | None = None) -> None:
             n_val=args.n_val,
             n_cond=args.n_cond,
             mesh_xy=mesh_xy,
+            use_nohead=args.nohead,
         )
 
     nkx = int(data["nkx"])
@@ -95,6 +110,9 @@ def main(argv: list[str] | None = None) -> None:
     nkz = int(data["nkz"])
     nk = nkx * nky * nkz
     n_rmu = int(data["V_q0"].shape[0])
+
+    if args.v_scale != 1.0:
+        data["V_q0"] = data["V_q0"] * jnp.asarray(args.v_scale, dtype=data["V_q0"].dtype)
 
     use_tda = args.tda
     include_W = not args.rpa
@@ -104,7 +122,22 @@ def main(argv: list[str] | None = None) -> None:
     else:
         matvec = build_bse_ring_matvec_full(mesh_xy, nkx, nky, nkz, include_W=include_W)
 
-    diag_h = build_preconditioner_diagonal_sharded(data, mesh_xy, include_W=include_W, use_tda=use_tda)
+    if "W_R" not in data:
+        if include_W:
+            data["W_R"] = jnp.fft.ifftn(data["W_q"], axes=(2, 3, 4), norm="ortho")
+        else:
+            # Placeholder to satisfy matvec signature (not used when include_W=False).
+            data["W_R"] = data["W_q"]
+
+    data_op = data
+    if args.d_only:
+        data_op = dict(data)
+        data_op["V_q0"] = jnp.zeros_like(data["V_q0"])
+        if "W_q" in data_op:
+            data_op["W_q"] = jnp.zeros_like(data["W_q"])
+        if "W_R" in data_op:
+            data_op["W_R"] = jnp.zeros_like(data["W_R"])
+    diag_h = build_preconditioner_diagonal_sharded(data_op, mesh_xy, include_W=include_W, use_tda=use_tda)
 
     gen = build_realspace_random_transition_generator(mesh_xy, nkx, nky, nkz,
                                                        int(data["n_cond_pad"]), int(data["n_val_pad"]))
@@ -132,7 +165,9 @@ def main(argv: list[str] | None = None) -> None:
         if use_tda:
             rhs = f.astype(dtype_c)
         else:
-            rhs = jnp.stack([f, f], axis=0).astype(dtype_c)
+            # For the non-TDA Liouvillian S = [[A, B], [-B*, -A*]], the usual
+            # density-coupling RHS for a real density source is [f, -f].
+            rhs = jnp.stack([f, -f], axis=0).astype(dtype_c)
             rhs = jax.lax.with_sharding_constraint(rhs, sh.X_full)
 
         x, _ = gmres_solve_sharded_jit(
@@ -140,19 +175,44 @@ def main(argv: list[str] | None = None) -> None:
             diag_h,
             z,
             rhs,
-            data,
+            data_op,
             max_iter=args.gmres_max_iter,
             tol=args.gmres_tol,
         )
 
-        if use_tda:
-            s = x
-        else:
-            s = x[0] + x[1]
-        s = jax.lax.with_sharding_constraint(s, sh.X)
+        if args.print_residuals:
+            hx = matvec(
+                x,
+                data["psi_c_X"],
+                data["psi_c_Y"],
+                data["psi_v_X"],
+                data["psi_v_Y"],
+                data["eps_c"],
+                data["eps_v"],
+                data["W_R"],
+                data["V_q0"],
+            )
+            r = rhs - (z * x - hx)
+            r_norm = jnp.linalg.norm(r)
+            b_norm = jnp.linalg.norm(rhs)
+            rel = r_norm / (b_norm + jnp.asarray(1e-30, dtype=b_norm.dtype))
+            rel_host, r_host, b_host = map(float, jax.device_get((rel, r_norm, b_norm)))
+            print(f"    residual rel={rel_host:.3e} (||r||={r_host:.3e}, ||b||={b_host:.3e})")
 
-        w_c = snapshot_op(s, data["psi_c_Y"], data["psi_v_Y"], data["V_q0"])
-        w_c_host = np.asarray(jax.device_get(w_c[0]))
+        if use_tda:
+            s = jax.lax.with_sharding_constraint(x, sh.X)
+            w_c = snapshot_op(s, data["psi_c_Y"], data["psi_v_Y"], data["V_q0"])
+        else:
+            X = x[0]
+            Y = x[1]
+            if args.density_channel == "rx_plus_rstar_y":
+                w_x = snapshot_op(X, data["psi_c_Y"], data["psi_v_Y"], data["V_q0"])
+                w_y = snapshot_op(Y, jnp.conj(data["psi_c_Y"]), jnp.conj(data["psi_v_Y"]), data["V_q0"])
+                w_c = w_x + w_y
+            else:
+                s = jax.lax.with_sharding_constraint(X + Y, sh.X)
+                w_c = snapshot_op(s, data["psi_c_Y"], data["psi_v_Y"], data["V_q0"])
+        w_c_host = np.asarray(jax.device_get(w_c[0])) * args.output_scale
         wc_cols.append(w_c_host)
 
     wc_cols = np.stack(wc_cols, axis=0) if wc_cols else np.zeros((0, n_rmu), dtype=np.complex128)
@@ -166,6 +226,8 @@ def main(argv: list[str] | None = None) -> None:
         h5.attrs["gmres_max_iter"] = int(args.gmres_max_iter)
         h5.attrs["gmres_tol"] = float(args.gmres_tol)
         h5.attrs["seed"] = int(args.seed)
+        h5.attrs["density_channel"] = str(args.density_channel)
+        h5.attrs["output_scale"] = float(args.output_scale)
         h5.create_dataset("columns", data=cols.astype(np.int32))
         h5.create_dataset("Wc", data=wc_cols)
 

@@ -1140,6 +1140,8 @@ def main(argv: list[str] | None = None) -> None:
                         help="Use FP32 data/GMRES for shifted solves.")
     parser.add_argument("--tda", action="store_true",
                         help="Use Tamm-Dancoff approximation (TDA). Default is full non-TDA.")
+    parser.add_argument("--nohead", action="store_true",
+                        help="Use headless V/W0 arrays if present (V_qmunu_nohead, W0_qmunu_nohead).")
     parser.add_argument(
         "--units-ev-per-ry",
         type=float,
@@ -1172,6 +1174,7 @@ def main(argv: list[str] | None = None) -> None:
             n_val=args.n_val,
             n_cond=args.n_cond,
             mesh_xy=mesh_xy,
+            use_nohead=args.nohead,
         )
 
     use_tda = args.tda

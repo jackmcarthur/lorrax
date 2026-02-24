@@ -84,7 +84,7 @@ def _ring_sum_valence(
         psi_v_slice = lax.dynamic_slice(
             psi_v_Y, (z, v_start, z, z), (nk, v_chunk, nspinor, nu_local)
         )
-        R = R + jnp.einsum("kv sN,bcvk->bcksN", jnp.conj(psi_v_slice), buf)
+        R = R + jnp.einsum("kvsN,bcvk->bcksN", jnp.conj(psi_v_slice), buf)
         buf = lax.ppermute(buf, axis_name="y", perm=perm)
         return buf, R
 
@@ -179,7 +179,7 @@ def _ring_sum_valence_second(
         psi_v_slice = lax.dynamic_slice(
             psi_v_X, (z, v_start, z, z), (nk, v_chunk, nspinor, mu_local)
         )
-        T = T + jnp.einsum("kvsM,bvksN->bMNtsk", psi_v_slice, buf)
+        T = T + jnp.einsum("kvtM,bvksN->bMNtsk", psi_v_slice, buf)
         buf = lax.ppermute(buf, axis_name="y", perm=perm)
         return buf, T
 
@@ -482,7 +482,12 @@ def build_bse_ring_matvec_full(
     low_mem: bool = True,
     include_W: bool = True,
 ):
-    """Build full (non-TDA) BSE matvec for S = [[A, B], [-B^H, -A^H]]."""
+    """Build full (non-TDA) BSE matvec for S = [[A, B], [-B*, -A*]].
+
+    For complex Bloch/spinor wavefunctions, the bottom blocks are elementwise
+    complex conjugates (not Hermitian adjoints) in the standard non-TDA RPA/BSE
+    Liouvillian formulation.
+    """
     px, py = mesh_xy.devices.shape
     sh = make_bse_shardings(mesh_xy)
     nk = nkx * nky * nkz
@@ -540,7 +545,7 @@ def build_bse_ring_matvec_full(
         X_full_c = lax.all_gather(X, "x", axis=1, tiled=True)
         R = jnp.einsum("kcsN,bcvk->bvksN", jnp.conj(psi_c_Y), X_full_c)
         R_full_v = lax.all_gather(R, "y", axis=1, tiled=True)
-        T = jnp.einsum("kvsM,bvksN->bMNtsk", psi_v_X, R_full_v)
+        T = jnp.einsum("kvtM,bvksN->bMNtsk", psi_v_X, R_full_v)
         return T
 
     encode_T_gather_B = _shard_map_fn(
@@ -642,10 +647,12 @@ def build_bse_ring_matvec_full(
         BY = _apply_B(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0)
         X_out = AX + BY
 
-        # A and B are Hermitian in this formulation; reuse A(Y) and B(X).
-        AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
-        B_dag_X = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0)
-        Y_out = -B_dag_X - AY
+        # Bottom blocks are elementwise conjugates (-B*, -A*), not adjoints.
+        A_star_Y = jnp.conj(
+            _apply_A(jnp.conj(Y), psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
+        )
+        B_star_X = jnp.conj(_apply_B(jnp.conj(X), psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0))
+        Y_out = -B_star_X - A_star_Y
         return jnp.stack([X_out, Y_out], axis=0)
 
     if timed:
@@ -671,9 +678,22 @@ def build_bse_ring_matvec_full(
                 BY.block_until_ready()
             X_out = AX + BY
 
-            AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
-            B_dag_X = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0)
-            Y_out = -B_dag_X - AY
+            with timing.section("bse_jax.bottom_blocks"):
+                A_star_Y = jnp.conj(
+                    _apply_A(
+                        jnp.conj(Y),
+                        psi_c_X,
+                        psi_c_Y,
+                        psi_v_X,
+                        psi_v_Y,
+                        eps_c,
+                        eps_v,
+                        W_R,
+                        V_q0,
+                    )
+                )
+                B_star_X = jnp.conj(_apply_B(jnp.conj(X), psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0))
+                Y_out = -B_star_X - A_star_Y
             return jnp.stack([X_out, Y_out], axis=0)
 
         return _matvec_timed
@@ -888,6 +908,7 @@ def ring_matvec_correctness_check(
     px: int = 2,
     py: int = 2,
     component_check: bool = False,
+    use_nohead: bool = False,
 ) -> None:
     restart_file = _find_restart_file(input_file)
     devices = jax.devices()
@@ -899,7 +920,7 @@ def ring_matvec_correctness_check(
     mesh = Mesh(np.array(devices[:px * py]).reshape(px, py), axis_names=("x", "y"))
     sh = make_bse_shardings(mesh)
 
-    payload = _load_ring_subset(restart_file, n_val, n_cond, px, py)
+    payload = _load_ring_subset(restart_file, n_val, n_cond, px, py, use_nohead=use_nohead)
     psi_c = payload["psi_c"]
     psi_v = payload["psi_v"]
     eps_c = payload["eps_c"]
@@ -986,6 +1007,7 @@ def ring_matvec_timing(
     n_warmup: int = 1,
     component_timing: bool = True,
     low_mem: bool = True,
+    use_nohead: bool = False,
 ) -> None:
     restart_file = _find_restart_file(input_file)
     devices = jax.devices()
@@ -1006,6 +1028,7 @@ def ring_matvec_timing(
             fermi_energy=0.0,
             mesh_xy=mesh,
             pad_bands=True,
+            use_nohead=use_nohead,
         )
         psi_c_X = payload["psi_c_X"]
         psi_c_Y = payload["psi_c_Y"]

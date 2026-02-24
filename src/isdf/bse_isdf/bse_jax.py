@@ -283,6 +283,8 @@ if __name__ == "__main__":
                         help="Use FP32 data/GMRES for shifted solves.")
     parser.add_argument("--tda", action="store_true",
                         help="Use Tamm-Dancoff approximation (TDA). Default is full non-TDA.")
+    parser.add_argument("--nohead", action="store_true",
+                        help="Use headless V/W0 arrays if present (V_qmunu_nohead, W0_qmunu_nohead).")
     parser.add_argument("--rpa", action="store_true",
                         help="Use RPA kernel (D+V only), skip W0 term entirely.")
     parser.add_argument("--bse", action="store_true",
@@ -343,6 +345,7 @@ if __name__ == "__main__":
             args.px,
             args.py,
             args.components,
+            use_nohead=args.nohead,
         )
         raise SystemExit(0)
 
@@ -375,6 +378,8 @@ if __name__ == "__main__":
             kpm_argv.append("--rpa")
         if use_tda:
             kpm_argv.append("--tda")
+        if args.nohead:
+            kpm_argv.append("--nohead")
         if args.kpm_emin_ev is not None:
             kpm_argv += ["--emin-ev", str(args.kpm_emin_ev)]
         if args.kpm_emax_ev is not None:
@@ -422,6 +427,7 @@ if __name__ == "__main__":
                 *(["--gmres-fp32"] if args.gmres_fp32 else []),
                 *(["--rpa"] if use_rpa else []),
                 *(["--tda"] if use_tda else []),
+                *(["--nohead"] if args.nohead else []),
                 "--windows-kpm",
                 "--windows-kpm-count",
                 str(args.kpm_window_count),
@@ -471,4 +477,5 @@ if __name__ == "__main__":
         args.repeat,
         args.warmup,
         True,
+        use_nohead=args.nohead,
     )

@@ -23,6 +23,7 @@ def write_labeled_arrays_to_h5(
 	G0_mu_nu=None,
 	W0_qmunu=None,
 	init_W0: bool = False,
+	band_edges=None,
 ):
 	"""
 	Write raw JAX/Numpy arrays to an HDF5 file for restart.
@@ -75,6 +76,8 @@ def write_labeled_arrays_to_h5(
 				f.create_dataset("enk_l", data=np.asarray(enk_l_h))
 			if enk_r_h is not None:
 				f.create_dataset("enk_r", data=np.asarray(enk_r_h))
+			if band_edges is not None:
+				f.create_dataset("band_edges", data=np.asarray(band_edges, dtype=np.int64))
 
 
 def write_w0_qmunu_to_h5(filename, W0_qmunu):
@@ -96,6 +99,34 @@ def write_w0_qmunu_to_h5(filename, W0_qmunu):
 				del f["W0_qmunu"]
 			dset = f.create_dataset("W0_qmunu", data=np.asarray(W0_qmunu_h))
 			dset.attrs["W0_ready"] = True
+
+
+def write_vw_nohead_to_h5(filename, V_qmunu_nohead=None, W0_qmunu_nohead=None):
+	"""Append headless V_qmunu/W0_qmunu datasets to an existing restart file."""
+	from jax.experimental import multihost_utils as _mh
+
+	def _to_host(a):
+		if isinstance(a, (jax.Array,)):
+			try:
+				return _mh.process_allgather(a, tiled=True)
+			except Exception:
+				return jax.device_get(a)
+		return a
+
+	V_nohead_h = _to_host(V_qmunu_nohead) if V_qmunu_nohead is not None else None
+	W0_nohead_h = _to_host(W0_qmunu_nohead) if W0_qmunu_nohead is not None else None
+
+	if jax.process_index() == 0:
+		with h5py.File(filename, "a") as f:
+			if V_nohead_h is not None:
+				if "V_qmunu_nohead" in f:
+					del f["V_qmunu_nohead"]
+				f.create_dataset("V_qmunu_nohead", data=np.asarray(V_nohead_h))
+			if W0_nohead_h is not None:
+				if "W0_qmunu_nohead" in f:
+					del f["W0_qmunu_nohead"]
+				dset = f.create_dataset("W0_qmunu_nohead", data=np.asarray(W0_nohead_h))
+				dset.attrs["W0_ready"] = True
 
 
 def read_labeled_arrays_from_h5(filename):

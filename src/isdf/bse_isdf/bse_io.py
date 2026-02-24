@@ -304,20 +304,29 @@ def load_bse_data_from_restart_sharded(
     fermi_energy: float = 0.0,
     mesh_xy: Optional[Mesh] = None,
     pad_bands: bool = True,
+    use_nohead: bool = False,
 ) -> dict:
     if mesh_xy is None:
         raise ValueError("mesh_xy is required for sharded load")
 
     with h5py.File(restart_file, "r") as f:
-        vq_dset = f["V_qmunu"]
-        if "W0_qmunu" in f and bool(f["W0_qmunu"].attrs.get("W0_ready", False)):
-            wq_dset = f["W0_qmunu"]
-        else:
-            wq_dset = vq_dset
+        vq_key = "V_qmunu_nohead" if use_nohead and "V_qmunu_nohead" in f else "V_qmunu"
+        if use_nohead and vq_key == "V_qmunu":
+            print("Warning: requested --nohead but V_qmunu_nohead not found; using V_qmunu.")
+        vq_dset = f[vq_key]
+        wq_key = None
+        if use_nohead and "W0_qmunu_nohead" in f and bool(f["W0_qmunu_nohead"].attrs.get("W0_ready", False)):
+            wq_key = "W0_qmunu_nohead"
+        elif "W0_qmunu" in f and bool(f["W0_qmunu"].attrs.get("W0_ready", False)):
+            wq_key = "W0_qmunu"
+        if use_nohead and wq_key is None:
+            print("Warning: requested --nohead but W0_qmunu_nohead not found/ready; using V_qmunu.")
+        wq_dset = f[wq_key] if wq_key is not None else vq_dset
         psi_l_dset = f["psi_l"]
         psi_r_dset = f["psi_r"]
         enk_l = np.asarray(f["enk_l"][:])
         enk_r = np.asarray(f["enk_r"][:])
+        band_edges = np.asarray(f["band_edges"][:]) if "band_edges" in f else None
 
         nkx, nky, nkz = vq_dset.shape[3:6]
         n_rmu = int(vq_dset.shape[6])
@@ -325,22 +334,39 @@ def load_bse_data_from_restart_sharded(
         if n_rmu != n_rnu:
             raise ValueError("Expected square μ/ν dimensions in V_qmunu")
 
-        mean_enk_l = np.mean(enk_l, axis=0)
-        mean_enk_r = np.mean(enk_r, axis=0)
-        val_mask_l = mean_enk_l < fermi_energy
-        cond_mask_r = mean_enk_r > fermi_energy
-        n_val_available = int(np.sum(val_mask_l))
-        n_cond_available = int(np.sum(cond_mask_r))
-        if n_val > n_val_available:
-            print(f"Warning: requested {n_val} valence bands but only {n_val_available} available; using {n_val_available}")
-        if n_cond > n_cond_available:
-            print(f"Warning: requested {n_cond} conduction bands but only {n_cond_available} available; using {n_cond_available}")
-        n_val = min(n_val, n_val_available)
-        n_cond = min(n_cond, n_cond_available)
-        if n_val == 0 or n_cond == 0:
-            raise ValueError("No valence or conduction bands found for given Fermi energy")
-        val_indices = np.argsort(np.where(val_mask_l, mean_enk_l, -np.inf))[-n_val:]
-        cond_indices = np.argsort(np.where(cond_mask_r, mean_enk_r, np.inf))[:n_cond]
+        if band_edges is not None and band_edges.size >= 5:
+            b0, b1, b2, b3, b4 = [int(x) for x in band_edges[:5]]
+            val_all = np.arange(max(b1 - b0, 0), max(b2 - b0, 0), dtype=int)
+            cond_all = np.arange(max(b2 - b1, 0), max(b3 - b1, 0), dtype=int)
+            n_val_available = int(val_all.size)
+            n_cond_available = int(cond_all.size)
+            if n_val > n_val_available:
+                print(f"Warning: requested {n_val} valence bands but only {n_val_available} available; using {n_val_available}")
+            if n_cond > n_cond_available:
+                print(f"Warning: requested {n_cond} conduction bands but only {n_cond_available} available; using {n_cond_available}")
+            n_val = min(n_val, n_val_available)
+            n_cond = min(n_cond, n_cond_available)
+            if n_val == 0 or n_cond == 0:
+                raise ValueError("No valence or conduction bands found in band_edges ranges")
+            val_indices = val_all[-n_val:]
+            cond_indices = cond_all[:n_cond]
+        else:
+            mean_enk_l = np.mean(enk_l, axis=0)
+            mean_enk_r = np.mean(enk_r, axis=0)
+            val_mask_l = mean_enk_l < fermi_energy
+            cond_mask_r = mean_enk_r > fermi_energy
+            n_val_available = int(np.sum(val_mask_l))
+            n_cond_available = int(np.sum(cond_mask_r))
+            if n_val > n_val_available:
+                print(f"Warning: requested {n_val} valence bands but only {n_val_available} available; using {n_val_available}")
+            if n_cond > n_cond_available:
+                print(f"Warning: requested {n_cond} conduction bands but only {n_cond_available} available; using {n_cond_available}")
+            n_val = min(n_val, n_val_available)
+            n_cond = min(n_cond, n_cond_available)
+            if n_val == 0 or n_cond == 0:
+                raise ValueError("No valence or conduction bands found for given Fermi energy")
+            val_indices = np.argsort(np.where(val_mask_l, mean_enk_l, -np.inf))[-n_val:]
+            cond_indices = np.argsort(np.where(cond_mask_r, mean_enk_r, np.inf))[:n_cond]
 
         eps_v = jnp.asarray(enk_l[:, val_indices])
         eps_c = jnp.asarray(enk_r[:, cond_indices])
@@ -412,17 +438,23 @@ def _load_ring_subset(
     n_cond: int,
     px: int,
     py: int,
+    use_nohead: bool = False,
 ) -> dict:
     with h5py.File(restart_file, "r") as f:
-        V_qmunu = jnp.asarray(f["V_qmunu"][:])
-        if "W0_qmunu" in f and bool(f["W0_qmunu"].attrs.get("W0_ready", False)):
+        vq_key = "V_qmunu_nohead" if use_nohead and "V_qmunu_nohead" in f else "V_qmunu"
+        if use_nohead and vq_key == "V_qmunu":
+            print("Warning: requested --nohead but V_qmunu_nohead not found; using V_qmunu.")
+        V_qmunu = jnp.asarray(f[vq_key][:])
+        W0_qmunu = None
+        if use_nohead and "W0_qmunu_nohead" in f and bool(f["W0_qmunu_nohead"].attrs.get("W0_ready", False)):
+            W0_qmunu = jnp.asarray(f["W0_qmunu_nohead"][:])
+        elif "W0_qmunu" in f and bool(f["W0_qmunu"].attrs.get("W0_ready", False)):
             W0_qmunu = jnp.asarray(f["W0_qmunu"][:])
-        else:
-            W0_qmunu = None
         psi_l = jnp.asarray(f["psi_l"][:])
         psi_r = jnp.asarray(f["psi_r"][:])
         enk_l = jnp.asarray(f["enk_l"][:])
         enk_r = jnp.asarray(f["enk_r"][:])
+        band_edges = np.asarray(f["band_edges"][:]) if "band_edges" in f else None
 
     nkx, nky, nkz = V_qmunu.shape[3:6]
     nk = nkx * nky * nkz
@@ -430,20 +462,35 @@ def _load_ring_subset(
     lcm_xy = math.lcm(px, py)
     n_rmu_pad = ((n_rmu + lcm_xy - 1) // lcm_xy) * lcm_xy
 
-    mean_enk_l = jnp.mean(enk_l, axis=0)
-    mean_enk_r = jnp.mean(enk_r, axis=0)
-    val_mask_l = mean_enk_l < 0.0
-    cond_mask_r = mean_enk_r > 0.0
-    n_val_available = int(jnp.sum(val_mask_l))
-    n_cond_available = int(jnp.sum(cond_mask_r))
-    if n_val > n_val_available:
-        print(f"Warning: requested {n_val} valence bands but only {n_val_available} available; using {n_val_available}")
-    if n_cond > n_cond_available:
-        print(f"Warning: requested {n_cond} conduction bands but only {n_cond_available} available; using {n_cond_available}")
-    n_val = min(n_val, n_val_available)
-    n_cond = min(n_cond, n_cond_available)
-    val_indices = jnp.argsort(jnp.where(val_mask_l, mean_enk_l, -jnp.inf))[-n_val:]
-    cond_indices = jnp.argsort(jnp.where(cond_mask_r, mean_enk_r, jnp.inf))[:n_cond]
+    if band_edges is not None and band_edges.size >= 5:
+        b0, b1, b2, b3, b4 = [int(x) for x in band_edges[:5]]
+        val_all = jnp.arange(max(b1 - b0, 0), max(b2 - b0, 0))
+        cond_all = jnp.arange(max(b2 - b1, 0), max(b3 - b1, 0))
+        n_val_available = int(val_all.size)
+        n_cond_available = int(cond_all.size)
+        if n_val > n_val_available:
+            print(f"Warning: requested {n_val} valence bands but only {n_val_available} available; using {n_val_available}")
+        if n_cond > n_cond_available:
+            print(f"Warning: requested {n_cond} conduction bands but only {n_cond_available} available; using {n_cond_available}")
+        n_val = min(n_val, n_val_available)
+        n_cond = min(n_cond, n_cond_available)
+        val_indices = val_all[-n_val:]
+        cond_indices = cond_all[:n_cond]
+    else:
+        mean_enk_l = jnp.mean(enk_l, axis=0)
+        mean_enk_r = jnp.mean(enk_r, axis=0)
+        val_mask_l = mean_enk_l < 0.0
+        cond_mask_r = mean_enk_r > 0.0
+        n_val_available = int(jnp.sum(val_mask_l))
+        n_cond_available = int(jnp.sum(cond_mask_r))
+        if n_val > n_val_available:
+            print(f"Warning: requested {n_val} valence bands but only {n_val_available} available; using {n_val_available}")
+        if n_cond > n_cond_available:
+            print(f"Warning: requested {n_cond} conduction bands but only {n_cond_available} available; using {n_cond_available}")
+        n_val = min(n_val, n_val_available)
+        n_cond = min(n_cond, n_cond_available)
+        val_indices = jnp.argsort(jnp.where(val_mask_l, mean_enk_l, -jnp.inf))[-n_val:]
+        cond_indices = jnp.argsort(jnp.where(cond_mask_r, mean_enk_r, jnp.inf))[:n_cond]
 
     psi_v = psi_l[:, val_indices, :, :]
     psi_c = psi_r[:, cond_indices, :, :]

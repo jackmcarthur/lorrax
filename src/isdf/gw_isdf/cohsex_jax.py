@@ -73,7 +73,7 @@ mesh_bands = Mesh(np.asarray(_default_devices), ("bands",))
 from ..io import (
     WFNReader, EPSReader,
     write_sigma_to_file, write_eqp_table,
-    write_labeled_arrays_to_h5, write_w0_qmunu_to_h5, read_labeled_arrays_from_h5,
+    write_labeled_arrays_to_h5, write_w0_qmunu_to_h5, write_vw_nohead_to_h5, read_labeled_arrays_from_h5,
     load_labeled_arrays_from_h5, save_restart_per_proc,
     write_qp_rotations_h5, load_kin_ion_submatrix,
     load_centroids, resolve_input_paths,
@@ -1315,6 +1315,7 @@ def main(argv=None):
 	restart = params["restart"]       # True: load from h5, False: rebuild ISDF
 	x_only = params["x_only"]         # True: bare exchange only, no screening
 	do_screened = params["do_screened"]  # True: use W, False: use V
+	write_no_head_vw = bool(params.get("write_no_head_vw", False))
 	global bispinor
 	bispinor = params["bispinor"]     # True: 2-component spinors (SOC)
 	
@@ -1512,6 +1513,7 @@ def main(argv=None):
 				V0_noG0_munu=v_q0_noG0_munu,
 				G0_mu_nu=G0_mu_nu,
 				init_W0=True,
+				band_edges=meta.band_edges,
 			)
 			save_restart_per_proc(os.path.join(tmp_dir, "isdf_tensors"), V_qmunu, S_qmunu, psi_l_full, psir_X, enk_l, enk_r, meta, mesh_xy, V0_noG0_munu=v_q0_noG0_munu)
 			V_qmunu.block_until_ready()
@@ -1782,6 +1784,7 @@ def main(argv=None):
 				V0_noG0_munu=v_q0_noG0_munu,
 				G0_mu_nu=G0_mu_nu,
 				init_W0=True,
+				band_edges=meta.band_edges,
 			)
 			save_restart_per_proc(os.path.join(tmp_dir, "isdf_tensors"), V_qmunu, S_qmunu, psi_l_full, psir_X, enk_l, enk_r, meta, mesh_xy, V0_noG0_munu=v_q0_noG0_munu)
 			V_qmunu.block_until_ready()
@@ -1892,10 +1895,14 @@ def main(argv=None):
 						W0_qmunu = W_q[..., 0, :, 0, :]
 						W0_qmunu = W0_qmunu[None, None, None, :, :, :, :, :]
 						write_w0_qmunu_to_h5(tensors_filename, W0_qmunu)
+						if write_no_head_vw:
+							write_vw_nohead_to_h5(tensors_filename, V_qmunu, W0_qmunu)
 
 	# ============================================================================
 	# HEAD INJECTION: Add the q→0, G=0 Coulomb divergence correction
 	# ============================================================================
+	if write_no_head_vw and not do_screened and os.path.exists(tensors_filename):
+		write_vw_nohead_to_h5(tensors_filename, V_qmunu, None)
 	# At q=0, the Coulomb interaction v(q,G) = 4π/|q+G|² diverges as G→0.
 	# We handle this by:
 	#   1. BUILDING V_μν with G=0 ZEROED (done in make_v_munu_kernel)

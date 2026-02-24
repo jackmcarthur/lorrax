@@ -518,6 +518,8 @@ def main(argv: list[str] | None = None) -> None:
                         help="Use RPA kernel (D+V only), skip W0 term entirely.")
     parser.add_argument("--tda", action="store_true",
                         help="Use Tamm-Dancoff approximation (TDA). Default is full non-TDA.")
+    parser.add_argument("--nohead", action="store_true",
+                        help="Use headless V/W0 arrays if present (V_qmunu_nohead, W0_qmunu_nohead).")
     args = parser.parse_args(argv)
 
     timing.reset()
@@ -531,6 +533,7 @@ def main(argv: list[str] | None = None) -> None:
             n_val=args.n_val,
             n_cond=args.n_cond,
             mesh_xy=mesh_xy,
+            use_nohead=args.nohead,
         )
 
     nk = int(data["nkx"] * data["nky"] * data["nkz"])
