@@ -1038,6 +1038,20 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--feast-ritz-count", type=int, default=4, help="Ritz values per window.")
     parser.add_argument("--rpa", action="store_true",
                         help="Use RPA kernel (D+V only), skip W0 term entirely.")
+    parser.add_argument("--windows-kpm", action="store_true",
+                        help="Derive FEAST windows from a KPM DOS partition.")
+    parser.add_argument("--windows-kpm-count", type=int, default=4,
+                        help="Number of KPM-derived windows (default: 4).")
+    parser.add_argument("--kpm-n-moments", type=int, default=100,
+                        help="KPM moments for window estimation.")
+    parser.add_argument("--kpm-n-random", type=int, default=4,
+                        help="KPM random vectors for window estimation.")
+    parser.add_argument("--kpm-seed", type=int, default=0,
+                        help="KPM RNG seed for window estimation.")
+    parser.add_argument("--kpm-n-energy-pts", type=int, default=2000,
+                        help="Energy grid size for KPM DOS.")
+    parser.add_argument("--kpm-n-lanczos", type=int, default=100,
+                        help="Lanczos steps for KPM spectral bounds.")
     parser.add_argument(
         "--s-cutoff",
         type=float,
@@ -1107,7 +1121,31 @@ def main(argv: list[str] | None = None) -> None:
 
     windows = build_default_windows_eV(e_max_eV)
 
-    if args.window1 is not None or args.window2 is not None:
+    if args.windows_kpm:
+        from . import bse_kpm
+
+        with timing.section("feast.kpm_windows"):
+            kpm_result = bse_kpm.run_kpm_dos(
+                data,
+                mesh_xy,
+                n_moments=args.kpm_n_moments,
+                n_random=args.kpm_n_random,
+                seed=args.kpm_seed,
+                n_lanczos=args.kpm_n_lanczos,
+                buffer=args.buffer,
+                ry_to_ev=args.units_ev_per_ry,
+                n_energy_pts=args.kpm_n_energy_pts,
+                plot_file="bse_kpm_windows.png",
+                n_windows=args.windows_kpm_count,
+                emit_outputs=False,
+                include_W=not args.rpa,
+            )
+        windows_ry = kpm_result["windows_ry"]
+        windows = [
+            WindowSpec(f"W{i+1}", float(a * args.units_ev_per_ry), float(b * args.units_ev_per_ry), "KPM-weighted")
+            for i, (a, b) in enumerate(windows_ry)
+        ]
+    elif args.window1 is not None or args.window2 is not None:
         w1_default = (0.0, 2.0)
         w2_default = (2.0, math.nan)
         w1 = _parse_window_arg(args.window1 or [str(w1_default[0]), str(w1_default[1])], w1_default)

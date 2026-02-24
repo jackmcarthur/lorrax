@@ -277,6 +277,8 @@ def run_kpm_dos(
     plot_file: str = "bse_dos_kpm.png",
     emin_ev: float | None = None,
     emax_ev: float | None = None,
+    n_windows: int = 10,
+    emit_outputs: bool = True,
     include_W: bool = True,
 ) -> dict:
     """Run KPM DOS calculation: bounds, moments, reconstruction, plot."""
@@ -369,61 +371,63 @@ def run_kpm_dos(
     rho = np.maximum(rho, 0.0)  # clip ringing artefacts near edges
 
     omega_min_eV = E_grid[1] if E_grid[0] <= 0.0 else E_grid[0]
+    omega_min_eV = max(float(omega_min_eV), float(e_min_ry * ry_to_ev))
     windows_ry = partition_windows_equal_b_over_omega(
-        E_grid, rho, n_windows=10, ry_to_ev=ry_to_ev, omega_min_eV=omega_min_eV,
+        E_grid, rho, n_windows=n_windows, ry_to_ev=ry_to_ev, omega_min_eV=omega_min_eV,
     )
     window_edges_eV = windows_ry.ravel() * ry_to_ev
 
-    # --- Plot ---
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    if emit_outputs:
+        # --- Plot ---
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={"height_ratios": [3, 1]})
+        fig, axes = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={"height_ratios": [3, 1]})
 
-    ax = axes[0]
-    ax.plot(E_grid, rho, "b-", linewidth=0.8)
-    ax.set_xlabel("Energy (eV)")
-    ax.set_ylabel("DOS (states/eV)")
-    ax.set_title(f"BSE Density of States  (KPM, M={n_moments}, R={n_random})")
-    ax.set_xlim(E_min_plot, E_max_plot)
-    ax.set_ylim(bottom=0)
-    ax.axhline(y=0, color="k", linewidth=0.3)
-    for edge in window_edges_eV:
-        ax.axvline(edge, color="tab:orange", linewidth=0.7, alpha=0.6)
-    ax.grid(True, alpha=0.3)
+        ax = axes[0]
+        ax.plot(E_grid, rho, "b-", linewidth=0.8)
+        ax.set_xlabel("Energy (eV)")
+        ax.set_ylabel("DOS (states/eV)")
+        ax.set_title(f"BSE Density of States  (KPM, M={n_moments}, R={n_random})")
+        ax.set_xlim(E_min_plot, E_max_plot)
+        ax.set_ylim(bottom=0)
+        ax.axhline(y=0, color="k", linewidth=0.3)
+        for edge in window_edges_eV:
+            ax.axvline(edge, color="tab:orange", linewidth=0.7, alpha=0.6)
+        ax.grid(True, alpha=0.3)
 
-    # Moment decay subplot.
-    ax2 = axes[1]
-    ax2.semilogy(np.arange(n_moments + 1), np.abs(mu), "k-", linewidth=0.5, label="raw |mu_p|")
-    ax2.semilogy(np.arange(n_moments + 1), np.abs(mu_damped), "r-", linewidth=0.5, label="Jackson |mu_p|")
-    ax2.set_xlabel("Chebyshev order p")
-    ax2.set_ylabel("|mu_p|")
-    ax2.legend(fontsize=8)
-    ax2.grid(True, alpha=0.3)
+        # Moment decay subplot.
+        ax2 = axes[1]
+        ax2.semilogy(np.arange(n_moments + 1), np.abs(mu), "k-", linewidth=0.5, label="raw |mu_p|")
+        ax2.semilogy(np.arange(n_moments + 1), np.abs(mu_damped), "r-", linewidth=0.5, label="Jackson |mu_p|")
+        ax2.set_xlabel("Chebyshev order p")
+        ax2.set_ylabel("|mu_p|")
+        ax2.legend(fontsize=8)
+        ax2.grid(True, alpha=0.3)
 
-    fig.tight_layout()
-    fig.savefig(plot_file, dpi=150)
-    print(f"\nDOS plot saved to {plot_file}")
-    plt.close(fig)
+        fig.tight_layout()
+        fig.savefig(plot_file, dpi=150)
+        print(f"\nDOS plot saved to {plot_file}")
+        plt.close(fig)
 
-    # --- Save data ---
-    npz_file = plot_file.rsplit(".", 1)[0] + ".npz"
-    np.savez(
-        npz_file,
-        mu_raw=mu,
-        mu_damped=mu_damped,
-        jackson_sigma=sigma,
-        E_grid_eV=E_grid,
-        rho=rho,
-        e_center_ry=e_center,
-        half_width_ry=half_width,
-        e_min_ry=e_min_ry,
-        e_max_ry=e_max_ry,
-        n_moments=n_moments,
-        n_random=n_random,
-    )
-    print(f"Moments + DOS data saved to {npz_file}")
+        # --- Save data ---
+        npz_file = plot_file.rsplit(".", 1)[0] + ".npz"
+        np.savez(
+            npz_file,
+            mu_raw=mu,
+            mu_damped=mu_damped,
+            jackson_sigma=sigma,
+            E_grid_eV=E_grid,
+            rho=rho,
+            e_center_ry=e_center,
+            half_width_ry=half_width,
+            e_min_ry=e_min_ry,
+            e_max_ry=e_max_ry,
+            n_moments=n_moments,
+            n_random=n_random,
+        )
+        print(f"Moments + DOS data saved to {npz_file}")
 
     return {
         "mu_raw": mu,
@@ -432,6 +436,8 @@ def run_kpm_dos(
         "rho": rho,
         "e_center_ry": e_center,
         "half_width_ry": half_width,
+        "windows_ry": windows_ry,
+        "window_edges_eV": window_edges_eV,
     }
 
 
@@ -444,9 +450,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--n-cond", type=int, default=4)
     parser.add_argument("--px", type=int, default=1)
     parser.add_argument("--py", type=int, default=1)
-    parser.add_argument("--n-moments", type=int, default=200,
+    parser.add_argument("--n-moments", type=int, default=100,
                         help="Number of Chebyshev moments M (cost: R*M matvecs)")
-    parser.add_argument("--n-random", type=int, default=5,
+    parser.add_argument("--n-random", type=int, default=4,
                         help="Stochastic trace vectors R (5-10 is usually enough)")
     parser.add_argument("--n-lanczos", type=int, default=100,
                         help="Lanczos steps for spectral bounds (default 100; "
@@ -459,6 +465,8 @@ def main(argv: list[str] | None = None) -> None:
                         help="Override E_max in eV (skip Lanczos upper bound)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--n-energy-pts", type=int, default=2000)
+    parser.add_argument("--n-windows", type=int, default=10,
+                        help="Number of DOS-weighted windows to compute.")
     parser.add_argument("--plot-file", type=str, default="bse_dos_kpm.png")
     parser.add_argument("--ry-to-ev", type=float, default=RY_TO_EV)
     parser.add_argument("--rpa", action="store_true",
@@ -500,6 +508,7 @@ def main(argv: list[str] | None = None) -> None:
             plot_file=args.plot_file,
             emin_ev=args.emin_ev,
             emax_ev=args.emax_ev,
+            n_windows=args.n_windows,
             include_W=not args.rpa,
         )
 

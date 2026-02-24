@@ -281,6 +281,10 @@ if __name__ == "__main__":
                         help="Use FP32 data/GMRES for shifted solves.")
     parser.add_argument("--rpa", action="store_true",
                         help="Use RPA kernel (D+V only), skip W0 term entirely.")
+    parser.add_argument("--bse", action="store_true",
+                        help="Use full BSE kernel (D+V-W). Overrides default RPA.")
+    parser.add_argument("--kpm-window-count", type=int, default=4,
+                        help="Number of KPM-derived windows for FEAST.")
     parser.add_argument("--lanczos", action="store_true", help="Run Lanczos preview + timing instead of FEAST.")
     parser.add_argument(
         "--feast-window1",
@@ -308,8 +312,8 @@ if __name__ == "__main__":
         help="Lanczos iterations for eigensolve (default: auto-scale with problem size).",
     )
     parser.add_argument("--kpm-dos", action="store_true", help="Run KPM Chebyshev DOS and exit.")
-    parser.add_argument("--kpm-n-moments", type=int, default=200, help="Chebyshev moments M for KPM.")
-    parser.add_argument("--kpm-n-random", type=int, default=5, help="Stochastic trace vectors R for KPM.")
+    parser.add_argument("--kpm-n-moments", type=int, default=100, help="Chebyshev moments M for KPM.")
+    parser.add_argument("--kpm-n-random", type=int, default=4, help="Stochastic trace vectors R for KPM.")
     parser.add_argument("--kpm-n-lanczos", type=int, default=100, help="Lanczos steps for KPM spectral bounds.")
     parser.add_argument("--kpm-emin-ev", type=float, default=None, help="Override KPM E_min (eV).")
     parser.add_argument("--kpm-emax-ev", type=float, default=None, help="Override KPM E_max (eV).")
@@ -348,6 +352,7 @@ if __name__ == "__main__":
     if args.kpm_dos:
         from . import bse_kpm
 
+        use_rpa = args.rpa or not args.bse
         kpm_argv = [
             "-i", args.input,
             "--n-val", str(args.n_val),
@@ -357,9 +362,10 @@ if __name__ == "__main__":
             "--n-moments", str(args.kpm_n_moments),
             "--n-random", str(args.kpm_n_random),
             "--n-lanczos", str(args.kpm_n_lanczos),
+            "--n-windows", str(args.kpm_window_count),
             "--plot-file", args.kpm_plot_file,
         ]
-        if args.rpa:
+        if use_rpa:
             kpm_argv.append("--rpa")
         if args.kpm_emin_ev is not None:
             kpm_argv += ["--emin-ev", str(args.kpm_emin_ev)]
@@ -371,6 +377,7 @@ if __name__ == "__main__":
     if not args.lanczos:
         from . import bse_feast
 
+        use_rpa = args.rpa or not args.bse
         bse_feast.main(
             [
                 "-i",
@@ -405,7 +412,20 @@ if __name__ == "__main__":
                 "--gmres-seed",
                 str(args.gmres_seed),
                 *(["--gmres-fp32"] if args.gmres_fp32 else []),
-                *(["--rpa"] if args.rpa else []),
+                *(["--rpa"] if use_rpa else []),
+                "--windows-kpm",
+                "--windows-kpm-count",
+                str(args.kpm_window_count),
+                "--kpm-n-moments",
+                str(args.kpm_n_moments),
+                "--kpm-n-random",
+                str(args.kpm_n_random),
+                "--kpm-seed",
+                str(args.gmres_seed),
+                "--kpm-n-energy-pts",
+                "2000",
+                "--kpm-n-lanczos",
+                str(args.kpm_n_lanczos),
                 *(
                     ["--window1", *args.feast_window1]
                     if args.feast_window1 is not None
@@ -427,7 +447,7 @@ if __name__ == "__main__":
         n_eig=args.n_eig,
         write_eigs=args.write_eigs,
         max_lanczos_iter=args.max_lanczos_iter,
-        include_W=not args.rpa,
+        include_W=not (args.rpa or not args.bse),
     )
 
     ring_matvec_timing(
