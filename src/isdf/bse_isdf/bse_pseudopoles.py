@@ -445,6 +445,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--ry-to-ev", type=float, default=RY_TO_EV_DEFAULT)
     parser.add_argument("--rpa", action="store_true", help="Use RPA kernel (D+V only), skip W0 term entirely.")
     parser.add_argument("--tda", action="store_true", help="Use TDA (default full non-TDA).")
+    parser.add_argument("--nohead", action="store_true",
+                        help="Use headless V/W0 arrays if present (V_qmunu_nohead, W0_qmunu_nohead).")
     parser.add_argument("--out", type=str, default="bse_pseudopoles.h5")
     parser.add_argument("--s-cutoff", type=float, default=1e-6,
                         help="Overlap floor for orthonormalization.")
@@ -472,6 +474,7 @@ def main(argv: list[str] | None = None) -> None:
             n_val=args.n_val,
             n_cond=args.n_cond,
             mesh_xy=mesh_xy,
+            use_nohead=args.nohead,
         )
 
     with timing.section("pseudopoles.bounds"):

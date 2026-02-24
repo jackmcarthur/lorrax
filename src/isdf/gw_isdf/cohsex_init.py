@@ -628,6 +628,8 @@ def read_cohsex_input(filename: str) -> dict:
 		# debug_hartree: If True, print diagnostic info for Hartree calculation.
 		# debug_omega:   If set (float, in Ry), compute W(ω) at this frequency
 		#                instead of static W. For testing dynamic screening.
+		# write_no_head_vw: If True, write V_qmunu and W0_qmunu without head
+		#                corrections to the restart HDF5 file for validation.
 		# chunk_size:    Band chunk size for memory-efficient wavefunction loading.
 		#                -1 = no chunking (all bands at once, default)
 		#                 0 = auto (currently 64, TODO: dynamic from available RAM)
@@ -658,6 +660,7 @@ def read_cohsex_input(filename: str) -> dict:
 			"sys_dim": geti("sys_dim", fallback=2),  # 2=slab, 3=bulk
 			"debug_hartree": getb("debug_hartree", fallback=False),
 			"debug_omega": getf("debug_omega", fallback=None),   # test W(ω) at this freq
+			"write_no_head_vw": getb("write_no_head_vw", fallback=False),
 			"chunk_size": geti("chunk_size", fallback=-1),       # band chunk size (-1=all, 0=auto, 1-2048=explicit)
 			"x_chunk_size": geti("x_chunk_size", fallback=0),    # x-axis chunk (0=auto, 1-nx=explicit)
 			"max_wfn_chunk_mb": getf("max_wfn_chunk_mb", fallback=0.0),  # max P_k chunk size in MB (0=use x_chunk_size)
@@ -685,6 +688,7 @@ def read_cohsex_input(filename: str) -> dict:
 			"sys_dim": 2,
 			"debug_hartree": False,
 			"debug_omega": None,
+			"write_no_head_vw": False,
 			"chunk_size": -1,
 			"z_chunk_size": 0,
 			"max_wfn_chunk_mb": 0.0,
