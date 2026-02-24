@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
 
-from .bse_ring_comm import build_bse_ring_matvec, make_bse_shardings
+from .bse_ring_comm import build_bse_ring_matvec, build_bse_ring_matvec_full, make_bse_shardings
 from .bse_feast import estimate_spectral_bounds_sharded, _create_mesh_xy, _build_gmres_data_fp32
 from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
 import isdf.common.timing as timing
@@ -42,6 +42,7 @@ def chebyshev_moments(
     n_moments: int,
     n_random: int,
     seed: int = 0,
+    use_tda: bool = True,
 ) -> np.ndarray:
     """Compute Chebyshev moments mu_0, ..., mu_M via stochastic trace.
 
@@ -71,6 +72,8 @@ def chebyshev_moments(
     n_cond_pad = int(data["n_cond_pad"])
     n_val_pad = int(data["n_val_pad"])
     bse_dim = n_cond * n_val * nk
+    if not use_tda:
+        bse_dim *= 2
 
     psi_c_X = data["psi_c_X"]
     psi_c_Y = data["psi_c_Y"]
@@ -103,6 +106,8 @@ def chebyshev_moments(
     # Masking keeps the recurrence stable.
     mask = jnp.zeros((1, n_cond_pad, n_val_pad, nk), dtype=dtype_real)
     mask = mask.at[:, :n_cond, :n_val, :].set(1.0)
+    if not use_tda:
+        mask = jnp.stack([mask, mask], axis=0)
 
     for r in range(n_random):
         print(f"  Random vector {r + 1}/{n_random}...")
@@ -111,12 +116,27 @@ def chebyshev_moments(
         # Rademacher +/-1 random vector (real).
         two = jnp.asarray(2.0, dtype=dtype_real)
         one = jnp.asarray(1.0, dtype=dtype_real)
-        x_rand = (
-            two * jax.random.bernoulli(
-                subkey, shape=(1, n_cond_pad, n_val_pad, nk),
-            ).astype(dtype_real) - one
-        )
-        x_rand = (x_rand * mask).astype(dtype_cplx)
+        if use_tda:
+            x_rand = (
+                two * jax.random.bernoulli(
+                    subkey, shape=(1, n_cond_pad, n_val_pad, nk),
+                ).astype(dtype_real) - one
+            )
+            x_rand = (x_rand * mask).astype(dtype_cplx)
+        else:
+            subkey_x, subkey_y = jax.random.split(subkey)
+            x0 = (
+                two * jax.random.bernoulli(
+                    subkey_x, shape=(1, n_cond_pad, n_val_pad, nk),
+                ).astype(dtype_real) - one
+            )
+            x1 = (
+                two * jax.random.bernoulli(
+                    subkey_y, shape=(1, n_cond_pad, n_val_pad, nk),
+                ).astype(dtype_real) - one
+            )
+            x_rand = jnp.stack([x0, x1], axis=0)
+            x_rand = (x_rand * mask).astype(dtype_cplx)
 
         t_prev = x_rand                     # t_0 = X
         t_curr = apply_h_tilde(x_rand)      # t_1 = H_tilde X
@@ -280,15 +300,25 @@ def run_kpm_dos(
     n_windows: int = 10,
     emit_outputs: bool = True,
     include_W: bool = True,
+    use_tda: bool = True,
 ) -> dict:
     """Run KPM DOS calculation: bounds, moments, reconstruction, plot."""
-    matvec = build_bse_ring_matvec(
-        mesh_xy,
-        data["nkx"],
-        data["nky"],
-        data["nkz"],
-        include_W=include_W,
-    )
+    if use_tda:
+        matvec = build_bse_ring_matvec(
+            mesh_xy,
+            data["nkx"],
+            data["nky"],
+            data["nkz"],
+            include_W=include_W,
+        )
+    else:
+        matvec = build_bse_ring_matvec_full(
+            mesh_xy,
+            data["nkx"],
+            data["nky"],
+            data["nkz"],
+            include_W=include_W,
+        )
 
     data_fp32 = _build_gmres_data_fp32(data)
     data_fp32.update(
@@ -315,6 +345,7 @@ def run_kpm_dos(
         n_lanczos=n_lanczos,
         n_lanczos_max=max(n_lanczos, 50),
         include_W=include_W,
+        use_tda=use_tda,
     )
     e_min_ry = bounds["e_min_ry"]
     e_max_ry = bounds["e_max_ry_raw"]
@@ -331,13 +362,19 @@ def run_kpm_dos(
         print(f"  E_max (override) = {e_max_ry:.6f} Ry = {emax_ev:.3f} eV")
 
     bandwidth = e_max_ry - e_min_ry
-    e_min_buf = e_min_ry - buffer * bandwidth
-    e_max_buf = e_max_ry + buffer * bandwidth
-    # BSE-TDA eigenvalues are positive; don't go below zero.
-    e_min_buf = max(0.0, e_min_buf)
-
-    e_center = 0.5 * (e_max_buf + e_min_buf)
-    half_width = 0.5 * (e_max_buf - e_min_buf)
+    if use_tda:
+        e_min_buf = e_min_ry - buffer * bandwidth
+        e_max_buf = e_max_ry + buffer * bandwidth
+        # BSE-TDA eigenvalues are positive; don't go below zero.
+        e_min_buf = max(0.0, e_min_buf)
+        e_center = 0.5 * (e_max_buf + e_min_buf)
+        half_width = 0.5 * (e_max_buf - e_min_buf)
+    else:
+        max_abs = max(abs(e_min_ry), abs(e_max_ry))
+        e_max_buf = max_abs * (1.0 + buffer)
+        e_min_buf = -e_max_buf
+        e_center = 0.0
+        half_width = e_max_buf
 
     print(f"  E_min (buffered) = {e_min_buf:.6f} Ry = {e_min_buf * ry_to_ev:.3f} eV")
     print(f"  E_max (buffered) = {e_max_buf:.6f} Ry = {e_max_buf * ry_to_ev:.3f} eV")
@@ -351,6 +388,7 @@ def run_kpm_dos(
         mu = chebyshev_moments(
             matvec, data_fp32, e_center, half_width,
             n_moments, n_random, seed,
+            use_tda=use_tda,
         )
 
     print(f"\n  mu_0 = {mu[0]:.6f}  (should be ~1.0)")
@@ -363,15 +401,22 @@ def run_kpm_dos(
     # --- Reconstruct DOS ---
     e_center_eV = e_center * ry_to_ev
     half_width_eV = half_width * ry_to_ev
-    E_min_plot = max(0, e_min_buf * ry_to_ev - 0.5)
-    E_max_plot = e_max_buf * ry_to_ev + 0.5
+    if use_tda:
+        E_min_plot = max(0, e_min_buf * ry_to_ev - 0.5)
+        E_max_plot = e_max_buf * ry_to_ev + 0.5
+    else:
+        E_min_plot = e_min_buf * ry_to_ev - 0.5
+        E_max_plot = e_max_buf * ry_to_ev + 0.5
     E_grid = np.linspace(E_min_plot, E_max_plot, n_energy_pts)
 
     rho = reconstruct_dos(mu_damped, E_grid, e_center_eV, half_width_eV)
     rho = np.maximum(rho, 0.0)  # clip ringing artefacts near edges
 
-    omega_min_eV = E_grid[1] if E_grid[0] <= 0.0 else E_grid[0]
-    omega_min_eV = max(float(omega_min_eV), float(e_min_ry * ry_to_ev))
+    if use_tda:
+        omega_min_eV = E_grid[1] if E_grid[0] <= 0.0 else E_grid[0]
+        omega_min_eV = max(float(omega_min_eV), float(e_min_ry * ry_to_ev))
+    else:
+        omega_min_eV = max(0.0, float(E_grid[1]))
     windows_ry = partition_windows_equal_b_over_omega(
         E_grid, rho, n_windows=n_windows, ry_to_ev=ry_to_ev, omega_min_eV=omega_min_eV,
     )
@@ -471,6 +516,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--ry-to-ev", type=float, default=RY_TO_EV)
     parser.add_argument("--rpa", action="store_true",
                         help="Use RPA kernel (D+V only), skip W0 term entirely.")
+    parser.add_argument("--tda", action="store_true",
+                        help="Use Tamm-Dancoff approximation (TDA). Default is full non-TDA.")
     args = parser.parse_args(argv)
 
     timing.reset()
@@ -490,6 +537,8 @@ def main(argv: list[str] | None = None) -> None:
     n_c = int(data["n_cond"])
     n_v = int(data["n_val"])
     bse_dim = n_c * n_v * nk
+    if not args.tda:
+        bse_dim *= 2
     print(f"BSE dimension: {n_c} cond x {n_v} val x {nk} k = {bse_dim}")
     print(f"KPM parameters: M={args.n_moments} moments, R={args.n_random} random vectors")
     print(f"Total matvecs: {args.n_random * args.n_moments}")
@@ -510,6 +559,7 @@ def main(argv: list[str] | None = None) -> None:
             emax_ev=args.emax_ev,
             n_windows=args.n_windows,
             include_W=not args.rpa,
+            use_tda=args.tda,
         )
 
     timing.report(print_fn=print, title="--- KPM Timing ---")

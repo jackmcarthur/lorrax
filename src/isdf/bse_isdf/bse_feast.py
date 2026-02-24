@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from .bse_ring_comm import build_bse_ring_matvec, make_bse_shardings
+from .bse_ring_comm import build_bse_ring_matvec, build_bse_ring_matvec_full, make_bse_shardings
 from .bse_preconditioner import energy_diff_cv_k
 import isdf.common.timing as timing
 from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
@@ -75,6 +75,7 @@ def build_preconditioner_diagonal_sharded(
     data: dict,
     mesh_xy: Mesh,
     include_W: bool = True,
+    use_tda: bool = True,
 ) -> jax.Array:
     eps_c = data["eps_c"]
     eps_v = data["eps_v"]
@@ -106,8 +107,13 @@ def build_preconditioner_diagonal_sharded(
     delta_E = energy_diff_cv_k(eps_c, eps_v)
 
     diag_h = delta_E + V_diag - W_diag
-    diag_sharding = NamedSharding(mesh_xy, P("x", "y", None))
-    return jax.lax.with_sharding_constraint(diag_h, diag_sharding)
+    if use_tda:
+        diag_sharding = NamedSharding(mesh_xy, P("x", "y", None))
+        return jax.lax.with_sharding_constraint(diag_h, diag_sharding)
+
+    diag_full = jnp.stack([diag_h, -diag_h], axis=0)[:, None, ...]
+    diag_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y", None))
+    return jax.lax.with_sharding_constraint(diag_full, diag_sharding)
 
 
 def _get_gmres_solver(
@@ -125,7 +131,8 @@ def _get_gmres_solver(
     def _solve(b, diag_h, z):
         one = jnp.asarray(1.0, dtype=b.dtype)
         m_inv = one / (z - diag_h)
-        m_inv = m_inv[None, ...]
+        if m_inv.ndim == b.ndim - 1:
+            m_inv = m_inv[None, ...]
 
         x0 = m_inv * b
         r0 = b - _apply_shifted_matvec(matvec, x0, z, data).astype(b.dtype)
@@ -215,9 +222,10 @@ def _get_feast_runner(
     tol: float,
     ry_to_ev: float,
     dtype: jnp.dtype,
+    use_conjugate_symmetry: bool = True,
 ) -> Callable:
     """Return a cached JIT FEAST runner for this (n_quad, n_ritz, max_iter, tol)."""
-    key = (n_quad, n_ritz, max_iter, float(tol), float(ry_to_ev), str(dtype))
+    key = (n_quad, n_ritz, max_iter, float(tol), float(ry_to_ev), str(dtype), bool(use_conjugate_symmetry))
     if key in _FEAST_RUNNER_CACHE:
         return _FEAST_RUNNER_CACHE[key]
 
@@ -238,8 +246,11 @@ def _get_feast_runner(
                 y, k_used = gmres_solve_sharded_jit(
                     matvec, diag_h, z, x, data, max_iter=max_iter, tol=tol
                 )
-                two = jnp.asarray(2.0, dtype=jnp.real(w).dtype)
-                filt_i = filt_i + two * jnp.real(w * y)
+                if use_conjugate_symmetry:
+                    two = jnp.asarray(2.0, dtype=jnp.real(w).dtype)
+                    filt_i = filt_i + two * jnp.real(w * y)
+                else:
+                    filt_i = filt_i + w * y
                 iters_i = iters_i.at[j].set(k_used)
                 return filt_i, iters_i
 
@@ -296,6 +307,7 @@ def _rayleigh_ritz(
     vectors: list[jax.Array],
     data: dict,
     s_cutoff: float = 1e-6,
+    use_tda: bool = True,
 ) -> RitzResult:
     """Solve the reduced generalized EVP with overlap regularization.
 
@@ -347,8 +359,9 @@ def _rayleigh_ritz(
     H_np = np.asarray(jax.device_get(H_dev))
     G_np = np.asarray(jax.device_get(G_dev))
     S_np = 0.5 * (S_np + S_np.conj().T)
-    H_np = 0.5 * (H_np + H_np.conj().T)
-    G_np = 0.5 * (G_np + G_np.conj().T)
+    if use_tda:
+        H_np = 0.5 * (H_np + H_np.conj().T)
+        G_np = 0.5 * (G_np + G_np.conj().T)
 
     s_evals, s_evecs = np.linalg.eigh(S_np)
     s_evals = s_evals.real
@@ -373,11 +386,18 @@ def _rayleigh_ritz(
     inv_sqrt = 1.0 / np.sqrt(s_clipped)
     W = s_evecs @ np.diag(inv_sqrt)  # whitening map: coeffs -> S-normed basis
     A = W.conj().T @ H_np @ W
-    A = 0.5 * (A + A.conj().T)
-    evals, evecs = np.linalg.eigh(A)
-    order = np.argsort(evals.real)
-    evals = evals.real[order]
-    evecs = evecs[:, order]
+    if use_tda:
+        A = 0.5 * (A + A.conj().T)
+        evals, evecs = np.linalg.eigh(A)
+        order = np.argsort(evals.real)
+        evals = evals.real[order]
+        evecs = evecs[:, order]
+    else:
+        evals, evecs = np.linalg.eig(A)
+        order = np.argsort(evals.real)
+        evals = evals[order]
+        evals = evals.real
+        evecs = evecs[:, order]
     coeffs = W @ evecs  # (n, n)
 
     rel_res = np.zeros((n,), dtype=np.float64)
@@ -405,6 +425,7 @@ def _build_ritz_vectors(
     filtered: list[jax.Array],
     coeffs: np.ndarray,
     sharding,
+    use_tda: bool = True,
 ) -> list[jax.Array]:
     """Reconstruct Ritz vectors from filtered vectors and coefficient matrix.
 
@@ -425,9 +446,12 @@ def _build_ritz_vectors(
     n_physical = coeffs.shape[1]
     ritz_vecs = []
     for i in range(n_physical):
-        c = coeffs[:, i]  # (n_total,) — should be real for TDA-BSE
-        v = sum(float(c[j].real) * filtered[j] for j in range(len(filtered)))
-        v = v.real  # BSE-TDA eigenvectors are real
+        c = coeffs[:, i]
+        if use_tda:
+            v = sum(float(c[j].real) * filtered[j] for j in range(len(filtered)))
+            v = v.real  # BSE-TDA eigenvectors are real
+        else:
+            v = sum(c[j] * filtered[j] for j in range(len(filtered)))
         norm = jnp.linalg.norm(v)
         v = jnp.where(norm > 0, v / norm, v)
         v = jax.lax.with_sharding_constraint(v, sharding)
@@ -455,14 +479,24 @@ def run_feast_ritz(
     n_quad_schedule: list[int] | None = None,
     gmres_fp32: bool = False,
     include_W: bool = True,
+    use_tda: bool = True,
 ) -> dict:
-    matvec = build_bse_ring_matvec(
-        mesh_xy,
-        data["nkx"],
-        data["nky"],
-        data["nkz"],
-        include_W=include_W,
-    )
+    if use_tda:
+        matvec = build_bse_ring_matvec(
+            mesh_xy,
+            data["nkx"],
+            data["nky"],
+            data["nkz"],
+            include_W=include_W,
+        )
+    else:
+        matvec = build_bse_ring_matvec_full(
+            mesh_xy,
+            data["nkx"],
+            data["nky"],
+            data["nkz"],
+            include_W=include_W,
+        )
     sh = make_bse_shardings(mesh_xy)
 
     if include_W:
@@ -471,7 +505,7 @@ def run_feast_ritz(
     else:
         data["W_R"] = data["W_q"]
 
-    diag_h = build_preconditioner_diagonal_sharded(data, mesh_xy, include_W=include_W)
+    diag_h = build_preconditioner_diagonal_sharded(data, mesh_xy, include_W=include_W, use_tda=use_tda)
     data_gmres = data
     diag_h_gmres = diag_h
     runner_dtype = jnp.complex128
@@ -500,15 +534,17 @@ def run_feast_ritz(
 
     runner_cache: dict[int, Callable] = {}
     for nq in sorted(set(quad_schedule)):
-        runner_cache[nq] = _get_feast_runner(
+        n_quad_total = nq if use_tda else 2 * nq
+        runner_cache[n_quad_total] = _get_feast_runner(
             matvec,
             data_gmres,
-            nq,
+            n_quad_total,
             n_ritz,
             gmres_max_iter,
             gmres_tol,
             ry_to_ev,
             runner_dtype,
+            use_conjugate_symmetry=use_tda,
         )
 
     for window in windows:
@@ -517,9 +553,17 @@ def run_feast_ritz(
         for _ in range(n_ritz):
             key, subkey = jax.random.split(key)
             x_dtype = jnp.float32 if gmres_fp32 else jnp.float64
-            x = jax.random.normal(subkey, (1, n_cond_pad, n_val_pad, nk), dtype=x_dtype)
-            x = x / jnp.linalg.norm(x)
-            x = jax.lax.with_sharding_constraint(x, sh.X)
+            if use_tda:
+                x = jax.random.normal(subkey, (1, n_cond_pad, n_val_pad, nk), dtype=x_dtype)
+                x = x / jnp.linalg.norm(x)
+                x = jax.lax.with_sharding_constraint(x, sh.X)
+            else:
+                subkey_x, subkey_y = jax.random.split(subkey)
+                x0 = jax.random.normal(subkey_x, (1, n_cond_pad, n_val_pad, nk), dtype=x_dtype)
+                x1 = jax.random.normal(subkey_y, (1, n_cond_pad, n_val_pad, nk), dtype=x_dtype)
+                x = jnp.stack([x0, x1], axis=0)
+                x = x / jnp.linalg.norm(x)
+                x = jax.lax.with_sharding_constraint(x, sh.X_full)
             X_list.append(x.astype(runner_dtype))
         X_batch = jnp.stack(X_list, axis=0)
 
@@ -529,7 +573,10 @@ def run_feast_ritz(
         for it in range(feast_iter):
             is_last = (it == feast_iter - 1)
             n_quad_it = quad_schedule[it]
-            print(f"\n  {window.name} FEAST iteration {it+1}/{feast_iter} (n_quad={n_quad_it})")
+            if use_tda:
+                print(f"\n  {window.name} FEAST iteration {it+1}/{feast_iter} (n_quad={n_quad_it})")
+            else:
+                print(f"\n  {window.name} FEAST iteration {it+1}/{feast_iter} (n_quad={n_quad_it} x2 full contour)")
 
             if quadrature == "zolotarev":
                 if lambda_min_eV is None or lambda_max_eV is None:
@@ -544,16 +591,20 @@ def run_feast_ritz(
                 z_nodes, w_weights = feast_ellipse_quadrature(window, n_quad_it, gamma)
             else:
                 raise ValueError(f"Unknown quadrature type: {quadrature!r}")
+            if not use_tda:
+                z_nodes = np.concatenate([z_nodes, np.conj(z_nodes)])
+                w_weights = np.concatenate([w_weights, np.conj(w_weights)])
             z_dtype = jnp.complex64 if gmres_fp32 else jnp.complex128
             z_jnp = jnp.asarray(z_nodes, dtype=z_dtype)
             w_jnp = jnp.asarray(w_weights, dtype=z_dtype)
 
             # --- Filter ---
-            filtered_batch, iters = runner_cache[n_quad_it](X_batch, z_jnp, w_jnp, diag_h_gmres)
+            n_quad_total = z_nodes.shape[0]
+            filtered_batch, iters = runner_cache[n_quad_total](X_batch, z_jnp, w_jnp, diag_h_gmres)
 
             it_sum = int(jax.device_get(jnp.sum(iters)))
             it_max = int(jax.device_get(jnp.max(iters)))
-            n_solves = n_ritz * n_quad_it
+            n_solves = n_ritz * n_quad_total
             total_matvecs = it_sum + n_solves  # 1 matvec per GMRES iter + 1 initial matvec per solve
             print(
                 f"    GMRES: solves={n_solves}, total_iters={it_sum}, max_iters={it_max}, "
@@ -568,6 +619,7 @@ def run_feast_ritz(
             ritz_result = _rayleigh_ritz(
                 matvec, filtered, data,
                 s_cutoff=s_cutoff,
+                use_tda=use_tda,
             )
 
             evals_eV = ritz_result.ritz_evals * ry_to_ev
@@ -601,7 +653,7 @@ def run_feast_ritz(
                     choose = np.argsort(np.abs(evals_eV - center))
                 choose = choose[: min(len(choose), n_ritz)]
                 coeffs_sel = ritz_result.ritz_coeffs[:, choose]
-                ritz_vecs = _build_ritz_vectors(filtered, coeffs_sel, sh.X)
+                ritz_vecs = _build_ritz_vectors(filtered, coeffs_sel, sh.X if use_tda else sh.X_full, use_tda=use_tda)
 
                 # Pad back to n_ritz with random vectors if n_physical < n_ritz.
                 X_next = []
@@ -610,9 +662,17 @@ def run_feast_ritz(
                 while len(X_next) < n_ritz:
                     key, subkey = jax.random.split(key)
                     x_dtype = jnp.float32 if gmres_fp32 else jnp.float64
-                    x = jax.random.normal(subkey, (1, n_cond_pad, n_val_pad, nk), dtype=x_dtype)
-                    x = x / jnp.linalg.norm(x)
-                    x = jax.lax.with_sharding_constraint(x, sh.X)
+                    if use_tda:
+                        x = jax.random.normal(subkey, (1, n_cond_pad, n_val_pad, nk), dtype=x_dtype)
+                        x = x / jnp.linalg.norm(x)
+                        x = jax.lax.with_sharding_constraint(x, sh.X)
+                    else:
+                        subkey_x, subkey_y = jax.random.split(subkey)
+                        x0 = jax.random.normal(subkey_x, (1, n_cond_pad, n_val_pad, nk), dtype=x_dtype)
+                        x1 = jax.random.normal(subkey_y, (1, n_cond_pad, n_val_pad, nk), dtype=x_dtype)
+                        x = jnp.stack([x0, x1], axis=0)
+                        x = x / jnp.linalg.norm(x)
+                        x = jax.lax.with_sharding_constraint(x, sh.X_full)
                     X_next.append(x.astype(runner_dtype))
                 X_batch = jnp.stack(X_next, axis=0)
 
@@ -641,6 +701,7 @@ def estimate_spectral_bounds_sharded(
     emax_patience: int = 2,
     seed: int = 0,
     include_W: bool = True,
+    use_tda: bool = True,
 ) -> dict:
     """Estimate E_min and E_max (Ry) using diagonal gap and short Lanczos.
 
@@ -760,10 +821,14 @@ def estimate_spectral_bounds_sharded(
     if not emax_seq:
         emax_seq.append(_tridiag_emax(alphas, betas))
     e_max_ry = float(emax_seq[-1])
+    if not use_tda:
+        e_min_ry = -abs(e_max_ry)
 
     # Count diagonal elements (non-interacting transitions) as a function of energy.
     delta_E = energy_diff_cv_k(eps_c_use, eps_v_use)  # (n_cond, n_val, nk)
     diag_flat = np.asarray(jax.device_get(delta_E.real)).ravel()
+    if not use_tda:
+        diag_flat = np.concatenate([diag_flat, -diag_flat])
 
     return {
         "e_min_ry": float(jax.device_get(e_min_ry)),
@@ -932,6 +997,7 @@ def format_feast_report(
     windows: Iterable[WindowSpec],
     quad_specs: Iterable[QuadratureSpec],
     include_W: bool = True,
+    use_tda: bool = True,
 ) -> str:
     e_min_ry = bounds["e_min_ry"]
     e_max_ry_raw = bounds["e_max_ry_raw"]
@@ -947,7 +1013,8 @@ def format_feast_report(
     lines.append("=" * 60)
     kernel_name = "BSE (D+V-W)" if include_W else "RPA (D+V)"
     lines.append(f"Backend     : Sharded BSE matvec (px, py = {px}, {py})")
-    lines.append(f"Kernel      : {kernel_name}")
+    mode = "TDA" if use_tda else "full (non-TDA)"
+    lines.append(f"Kernel      : {kernel_name}, {mode}")
     lines.append(f"Energies    : eps in Ry; reporting in Ry and eV (Ry->eV = {ry_to_ev})")
     lines.append("")
     lines.append("--- Spectral bounds (Lanczos) ---")
@@ -977,7 +1044,10 @@ def format_feast_report(
             lines.append(f"--- FEAST contour (ellipse, trapezoidal) ---")
             lines.append(f"{spec.window.name}: n_quad = {spec.n_quad}, gamma = {spec.gamma:.3f}")
             lines.append(f"    center={c:.3f} eV, r_x={r_x:.3f} eV, r_y={r_y:.3f} eV")
-        lines.append("    z_j (eV) and w_j (eV)   [upper half-plane]")
+        if use_tda:
+            lines.append("    z_j (eV) and w_j (eV)   [upper half-plane]")
+        else:
+            lines.append("    z_j (eV) and w_j (eV)   [upper half-plane; lower half-plane added]")
         for j, (z, w) in enumerate(zip(spec.z_nodes, spec.w_weights), start=1):
             lines.append(f"    j={j:2d}: z={_format_complex_eV(z)}, w={_format_complex_eV(w)}")
         width = b - a
@@ -1068,6 +1138,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--gmres-seed", type=int, default=0, help="Random seed for FEAST vectors.")
     parser.add_argument("--gmres-fp32", action="store_true",
                         help="Use FP32 data/GMRES for shifted solves.")
+    parser.add_argument("--tda", action="store_true",
+                        help="Use Tamm-Dancoff approximation (TDA). Default is full non-TDA.")
     parser.add_argument(
         "--units-ev-per-ry",
         type=float,
@@ -1102,6 +1174,8 @@ def main(argv: list[str] | None = None) -> None:
             mesh_xy=mesh_xy,
         )
 
+    use_tda = args.tda
+
     with timing.section("feast.lanczos_bounds"):
         bounds = estimate_spectral_bounds_sharded(
             data,
@@ -1112,6 +1186,7 @@ def main(argv: list[str] | None = None) -> None:
             emax_atol=args.lanczos_atol,
             emax_patience=args.lanczos_patience,
             include_W=not args.rpa,
+            use_tda=use_tda,
         )
 
     e_min_ry = bounds["e_min_ry"]
@@ -1139,6 +1214,7 @@ def main(argv: list[str] | None = None) -> None:
                 n_windows=args.windows_kpm_count,
                 emit_outputs=False,
                 include_W=not args.rpa,
+                use_tda=use_tda,
             )
         windows_ry = kpm_result["windows_ry"]
         windows = [
@@ -1179,6 +1255,7 @@ def main(argv: list[str] | None = None) -> None:
         windows=windows,
         quad_specs=quad_specs,
         include_W=not args.rpa,
+        use_tda=use_tda,
     )
     print(report)
 
@@ -1221,6 +1298,7 @@ def main(argv: list[str] | None = None) -> None:
                 n_quad_schedule=n_quad_schedule,
                 gmres_fp32=args.gmres_fp32,
                 include_W=not args.rpa,
+                use_tda=use_tda,
             )
         wmap = {w.name: w for w in windows}
         for name, rr in results.items():

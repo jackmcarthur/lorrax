@@ -1,0 +1,573 @@
+"""FEAST-based pseudopole construction with density-biased random seeds."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterable, Callable
+
+import math
+import numpy as np
+import h5py
+
+import jax
+import jax.numpy as jnp
+from jax.sharding import Mesh
+
+from .bse_feast import (
+    RY_TO_EV_DEFAULT,
+    feast_ellipse_quadrature,
+    feast_zolotarev_quadrature,
+    _get_feast_runner,
+    _build_gmres_data_fp32,
+    _cast_with_sharding,
+    build_preconditioner_diagonal_sharded,
+    estimate_spectral_bounds_sharded,
+    build_default_windows_eV,
+    _parse_window_arg,
+)
+from .bse_ring_comm import (
+    build_bse_ring_matvec,
+    build_bse_ring_matvec_full,
+    build_realspace_random_transition_generator,
+    build_density_snapshot_operator,
+    make_bse_shardings,
+)
+from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
+import isdf.common.timing as timing
+
+jax.config.update("jax_enable_x64", True)
+
+
+@dataclass(frozen=True)
+class WindowSpec:
+    name: str
+    a_eV: float
+    b_eV: float
+    note: str
+
+
+def _orthonormalize(filtered: list[jax.Array], s_cutoff: float) -> tuple[list[jax.Array], np.ndarray, np.ndarray]:
+    """Orthonormalize filtered vectors and return basis + coeffs + overlap eigenvalues."""
+    n = len(filtered)
+    if n == 0:
+        return [], np.zeros((0, 0)), np.zeros((0,))
+
+    V = jnp.stack(filtered, axis=0)
+    V_flat = V.reshape((n, -1))
+    S_dev = V_flat.conj() @ V_flat.T
+    S_np = np.asarray(jax.device_get(S_dev))
+    S_np = 0.5 * (S_np + S_np.conj().T)
+
+    s_evals, s_evecs = np.linalg.eigh(S_np)
+    s_evals = s_evals.real
+    s_max = float(np.max(s_evals)) if s_evals.size else 0.0
+    s_floor = max(float(s_cutoff) * s_max, 1e-30)
+    keep = s_evals >= s_floor
+    if not np.any(keep):
+        return [], np.zeros((n, 0)), s_evals
+
+    coeffs = s_evecs[:, keep] / np.sqrt(s_evals[keep])
+    basis = []
+    for i in range(coeffs.shape[1]):
+        c = coeffs[:, i]
+        v = sum(c[j] * filtered[j] for j in range(n))
+        basis.append(v)
+    return basis, coeffs, s_evals
+
+
+def _build_reduced_h(matvec, basis: list[jax.Array], data: dict, use_tda: bool) -> np.ndarray:
+    """Build reduced H_w = V^H S V in the orthonormal basis."""
+    if not basis:
+        return np.zeros((0, 0), dtype=np.complex128)
+    hv = []
+    for v in basis:
+        hv.append(
+            matvec(
+                v,
+                data["psi_c_X"],
+                data["psi_c_Y"],
+                data["psi_v_X"],
+                data["psi_v_Y"],
+                data["eps_c"],
+                data["eps_v"],
+                data["W_R"],
+                data["V_q0"],
+            )
+        )
+    V = jnp.stack(basis, axis=0)
+    HV = jnp.stack(hv, axis=0)
+    V_flat = V.reshape((len(basis), -1))
+    HV_flat = HV.reshape((len(basis), -1))
+    H_dev = V_flat.conj() @ HV_flat.T
+    H_np = np.asarray(jax.device_get(H_dev))
+    if use_tda:
+        H_np = 0.5 * (H_np + H_np.conj().T)
+    return H_np
+
+
+def _compute_density_snapshots(
+    basis: list[jax.Array],
+    snapshot_op,
+    sh,
+    psi_c_Y: jax.Array,
+    psi_v_Y: jax.Array,
+    V_q0: jax.Array,
+    use_tda: bool,
+) -> np.ndarray:
+    """Compute C_w columns d(mu) for each basis vector."""
+    if not basis:
+        return np.zeros((0, 0), dtype=np.complex128)
+    cols = []
+    for v in basis:
+        if use_tda:
+            s = v
+        else:
+            s = v[0] + v[1]
+        s = jax.lax.with_sharding_constraint(s, sh.X)
+        d_mu = snapshot_op(s, psi_c_Y, psi_v_Y, V_q0)
+        d_mu_host = np.asarray(jax.device_get(d_mu[0]))
+        cols.append(d_mu_host)
+    return np.stack(cols, axis=1)
+
+
+def _feast_filter(
+    X_batch: jax.Array,
+    z_nodes: np.ndarray,
+    w_weights: np.ndarray,
+    matvec,
+    data: dict,
+    diag_h: jax.Array,
+    max_iter: int,
+    tol: float,
+    ry_to_ev: float,
+    gmres_fp32: bool,
+    use_tda: bool,
+) -> tuple[jax.Array, np.ndarray]:
+    n_vec = int(X_batch.shape[0])
+    data_gmres = data
+    diag_h_gmres = diag_h
+    runner_dtype = jnp.complex128
+    if gmres_fp32:
+        data_gmres = _build_gmres_data_fp32(data)
+        if "W_q" in data_gmres:
+            data_gmres["W_R"] = jnp.fft.ifftn(data_gmres["W_q"], axes=(2, 3, 4), norm="ortho")
+        diag_h_gmres = _cast_with_sharding(diag_h, jnp.float32)
+        runner_dtype = jnp.complex64
+
+    z_dtype = jnp.complex64 if gmres_fp32 else jnp.complex128
+    z_jnp = jnp.asarray(z_nodes, dtype=z_dtype)
+    w_jnp = jnp.asarray(w_weights, dtype=z_dtype)
+
+    n_quad = int(z_nodes.shape[0])
+    runner = _get_feast_runner(
+        matvec,
+        data_gmres,
+        n_quad,
+        n_vec,
+        max_iter,
+        tol,
+        ry_to_ev,
+        runner_dtype,
+        use_conjugate_symmetry=use_tda,
+    )
+    filtered, iters = runner(X_batch.astype(runner_dtype), z_jnp, w_jnp, diag_h_gmres)
+    iters_host = np.asarray(jax.device_get(iters))
+    return filtered, iters_host
+
+
+def _create_mesh_xy(px: int, py: int) -> Mesh:
+    devices = jax.devices()
+    n_devices = len(devices)
+    if px * py > n_devices:
+        raise ValueError(f"Requested px*py={px*py} devices, but only {n_devices} available")
+    mesh_devices = np.array(devices[: px * py]).reshape(px, py)
+    return Mesh(mesh_devices, axis_names=("x", "y"))
+
+
+def run_pseudopoles(
+    data: dict,
+    mesh_xy: Mesh,
+    windows: Iterable[WindowSpec],
+    *,
+    m0: int,
+    n_quad: int,
+    p_keep: int,
+    n_tail: int,
+    gmres_max_iter: int,
+    gmres_tol: float,
+    seed: int,
+    ry_to_ev: float,
+    s_cutoff: float,
+    quadrature: str,
+    use_tda: bool,
+    gmres_fp32: bool,
+    include_W: bool,
+) -> dict:
+    if use_tda:
+        matvec = build_bse_ring_matvec(
+            mesh_xy,
+            data["nkx"],
+            data["nky"],
+            data["nkz"],
+            include_W=include_W,
+        )
+    else:
+        matvec = build_bse_ring_matvec_full(
+            mesh_xy,
+            data["nkx"],
+            data["nky"],
+            data["nkz"],
+            include_W=include_W,
+        )
+
+    if include_W:
+        data["W_R"] = jnp.fft.ifftn(data["W_q"], axes=(2, 3, 4), norm="ortho")
+    else:
+        data["W_R"] = data["W_q"]
+
+    diag_h = build_preconditioner_diagonal_sharded(data, mesh_xy, include_W=include_W, use_tda=use_tda)
+
+    sh = make_bse_shardings(mesh_xy)
+    nk = int(data["nkx"] * data["nky"] * data["nkz"])
+    n_cond_pad = int(data["n_cond_pad"])
+    n_val_pad = int(data["n_val_pad"])
+
+    gen = build_realspace_random_transition_generator(
+        mesh_xy,
+        data["nkx"],
+        data["nky"],
+        data["nkz"],
+        n_cond_pad,
+        n_val_pad,
+    )
+    snapshot_op = build_density_snapshot_operator(mesh_xy, data["nkx"], data["nky"], data["nkz"])
+
+    key = jax.random.PRNGKey(seed)
+    rng = np.random.default_rng(seed)
+
+    results = {}
+
+    for window in windows:
+        print(f"\n=== Window {window.name} [{window.a_eV:.3f}, {window.b_eV:.3f}] eV ===")
+        if quadrature == "zolotarev":
+            raise ValueError("Zolotarev quadrature requires spectral bounds; use ellipse here.")
+        z_nodes, w_weights = feast_ellipse_quadrature(window, n_quad, gamma=0.2)
+        if not use_tda:
+            z_nodes = np.concatenate([z_nodes, np.conj(z_nodes)])
+            w_weights = np.concatenate([w_weights, np.conj(w_weights)])
+
+        # --- Step A: density-biased seeds (eta -> V eta -> R^H V eta) ---
+        seeds = []
+        for _ in range(m0):
+            key, subkey = jax.random.split(key)
+            eta = jax.random.normal(
+                subkey,
+                (1, data["psi_v_Y"].shape[-1], nk),
+                dtype=jnp.float32 if gmres_fp32 else jnp.float64,
+            )
+            eta = jax.lax.with_sharding_constraint(eta, sh.S)
+            f = gen(eta, data["psi_c_X"], data["psi_v_X"], data["V_q0"])
+            f = jax.lax.with_sharding_constraint(f, sh.X)
+            if use_tda:
+                phi = f
+            else:
+                phi = jnp.stack([f, f], axis=0)
+                phi = jax.lax.with_sharding_constraint(phi, sh.X_full)
+            seeds.append(phi)
+        X_batch = jnp.stack(seeds, axis=0)
+
+        # --- Step B: FEAST filter ---
+        filtered_batch, iters = _feast_filter(
+            X_batch,
+            z_nodes,
+            w_weights,
+            matvec,
+            data,
+            diag_h,
+            gmres_max_iter,
+            gmres_tol,
+            ry_to_ev,
+            gmres_fp32,
+            use_tda,
+        )
+        filtered = [filtered_batch[i] for i in range(m0)]
+        if gmres_fp32:
+            filtered = [v.astype(jnp.complex128) for v in filtered]
+        it_sum = int(np.sum(iters))
+        n_solves = m0 * int(z_nodes.shape[0])
+        print(f"  FEAST solves={n_solves}, total_iters={it_sum}")
+
+        # --- Step C: Orthonormalize + reduced operator ---
+        basis, coeffs, s_evals = _orthonormalize(filtered, s_cutoff=s_cutoff)
+        if not basis:
+            print("  WARNING: empty filtered subspace after orthonormalization.")
+            results[window.name] = {"omega_bright": np.zeros((0,)), "d_bright": np.zeros((0, 0))}
+            continue
+        print(f"  Basis size: {len(basis)} (from m0={m0})")
+
+        H_w = _build_reduced_h(matvec, basis, data, use_tda=use_tda)
+
+        # --- Step D: Build C_w (density snapshots) ---
+        C_w = _compute_density_snapshots(
+            basis,
+            snapshot_op,
+            sh,
+            data["psi_c_Y"],
+            data["psi_v_Y"],
+            data["V_q0"],
+            use_tda=use_tda,
+        )
+
+        # --- Step E: Brightness eigen-decomp ---
+        G_w = C_w.conj().T @ C_w
+        G_w = 0.5 * (G_w + G_w.conj().T)
+        sigma2, W_w = np.linalg.eigh(G_w)
+        order = np.argsort(sigma2)[::-1]
+        sigma2 = sigma2[order]
+        W_w = W_w[:, order]
+        sigma = np.sqrt(np.maximum(sigma2, 0.0))
+
+        p_use = min(p_keep, W_w.shape[1])
+        Wb = W_w[:, :p_use]
+        Wd = W_w[:, p_use:]
+
+        # --- Step F: Bright pseudopoles ---
+        H_b = Wb.conj().T @ H_w @ Wb
+        evals_b, vecs_b = np.linalg.eig(H_b)
+        order_b = np.argsort(evals_b.real)
+        evals_b = evals_b[order_b]
+        vecs_b = vecs_b[:, order_b]
+        g_b = Wb @ vecs_b
+        d_bright = C_w @ g_b
+
+        # --- Step G: Tail pseudopoles ---
+        omega_tail = np.zeros((0,), dtype=np.complex128)
+        d_tail = np.zeros((0, C_w.shape[0]), dtype=np.complex128)
+        if n_tail > 0 and Wd.size > 0:
+            H_d = Wd.conj().T @ H_w @ Wd
+            d_list = []
+            omega_list = []
+            for _ in range(n_tail):
+                z = rng.normal(size=(Wd.shape[1],)) + 1j * rng.normal(size=(Wd.shape[1],))
+                z = z / np.linalg.norm(z)
+                omega = z.conj().T @ H_d @ z
+                g = Wd @ z
+                d_vec = C_w @ g
+                omega_list.append(omega)
+                d_list.append(d_vec)
+            omega_tail = np.array(omega_list, dtype=np.complex128)
+            d_tail = np.stack(d_list, axis=0)
+
+            B_disc = float(np.sum(sigma2[p_use:])) if sigma2.size > p_use else 0.0
+            B_tail = float(np.sum(np.abs(d_tail) ** 2))
+            if B_disc > 0.0 and B_tail > 0.0:
+                alpha = math.sqrt(B_disc / B_tail)
+                d_tail = d_tail * alpha
+
+        results[window.name] = {
+            "omega_bright": evals_b,
+            "d_bright": d_bright.T,
+            "omega_tail": omega_tail,
+            "d_tail": d_tail,
+            "sigma": sigma,
+            "s_evals": s_evals,
+        }
+
+    return results
+
+
+def write_pseudopoles_h5(
+    output_file: str,
+    windows: Iterable[WindowSpec],
+    results: dict,
+    *,
+    use_tda: bool,
+    include_W: bool,
+    ry_to_ev: float,
+    m0: int,
+    n_quad: int,
+    p_keep: int,
+    n_tail: int,
+    gmres_max_iter: int,
+    gmres_tol: float,
+    seed: int,
+) -> None:
+    with h5py.File(output_file, "w") as h5:
+        h5.attrs["use_tda"] = int(use_tda)
+        h5.attrs["include_W"] = int(include_W)
+        h5.attrs["ry_to_ev"] = float(ry_to_ev)
+        h5.attrs["m0"] = int(m0)
+        h5.attrs["n_quad"] = int(n_quad)
+        h5.attrs["p_keep"] = int(p_keep)
+        h5.attrs["n_tail"] = int(n_tail)
+        h5.attrs["gmres_max_iter"] = int(gmres_max_iter)
+        h5.attrs["gmres_tol"] = float(gmres_tol)
+        h5.attrs["seed"] = int(seed)
+
+        for w in windows:
+            r = results.get(w.name, {})
+            g = h5.create_group(w.name)
+            g.attrs["a_eV"] = float(w.a_eV)
+            g.attrs["b_eV"] = float(w.b_eV)
+            omega_b = np.asarray(r.get("omega_bright", np.zeros((0,), dtype=np.complex128)))
+            omega_t = np.asarray(r.get("omega_tail", np.zeros((0,), dtype=np.complex128)))
+            d_b = np.asarray(r.get("d_bright", np.zeros((0, 0), dtype=np.complex128)))
+            d_t = np.asarray(r.get("d_tail", np.zeros((0, 0), dtype=np.complex128)))
+            sigma = np.asarray(r.get("sigma", np.zeros((0,), dtype=np.float64)))
+            s_evals = np.asarray(r.get("s_evals", np.zeros((0,), dtype=np.float64)))
+
+            g.create_dataset("omega_bright_ry", data=omega_b)
+            g.create_dataset("omega_bright_eV", data=omega_b * ry_to_ev)
+            g.create_dataset("d_bright", data=d_b)
+            g.create_dataset("omega_tail_ry", data=omega_t)
+            g.create_dataset("omega_tail_eV", data=omega_t * ry_to_ev)
+            g.create_dataset("d_tail", data=d_t)
+            g.create_dataset("sigma", data=sigma)
+            g.create_dataset("s_evals", data=s_evals)
+
+
+def main(argv: list[str] | None = None) -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="FEAST pseudopole construction with biased seeds")
+    parser.add_argument("-i", "--input", required=True, help="COHSEX input file")
+    parser.add_argument("--n-val", type=int, default=4)
+    parser.add_argument("--n-cond", type=int, default=4)
+    parser.add_argument("--px", type=int, default=1)
+    parser.add_argument("--py", type=int, default=1)
+    parser.add_argument("--m0", type=int, default=6, help="Biased random seeds per window.")
+    parser.add_argument("--n-quad", type=int, default=8, help="Quadrature points per half contour.")
+    parser.add_argument("--p-keep", type=int, default=4, help="Bright modes retained per window.")
+    parser.add_argument("--n-tail", type=int, default=2, help="Stochastic tail pseudomodes per window.")
+    parser.add_argument("--gmres-max-iter", type=int, default=10)
+    parser.add_argument("--gmres-tol", type=float, default=1e-2)
+    parser.add_argument("--gmres-fp32", action="store_true", help="Use FP32 data/GMRES for shifted solves.")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--ry-to-ev", type=float, default=RY_TO_EV_DEFAULT)
+    parser.add_argument("--rpa", action="store_true", help="Use RPA kernel (D+V only), skip W0 term entirely.")
+    parser.add_argument("--tda", action="store_true", help="Use TDA (default full non-TDA).")
+    parser.add_argument("--out", type=str, default="bse_pseudopoles.h5")
+    parser.add_argument("--s-cutoff", type=float, default=1e-6,
+                        help="Overlap floor for orthonormalization.")
+    parser.add_argument("--windows-kpm", action="store_true",
+                        help="Derive windows from KPM DOS.")
+    parser.add_argument("--windows-kpm-count", type=int, default=4)
+    parser.add_argument("--kpm-n-moments", type=int, default=100)
+    parser.add_argument("--kpm-n-random", type=int, default=4)
+    parser.add_argument("--kpm-seed", type=int, default=0)
+    parser.add_argument("--kpm-n-energy-pts", type=int, default=2000)
+    parser.add_argument("--kpm-n-lanczos", type=int, default=100)
+    parser.add_argument("--buffer", type=float, default=0.05)
+    parser.add_argument("--window1", nargs=2, default=None, metavar=("A", "B"))
+    parser.add_argument("--window2", nargs=2, default=None, metavar=("A", "B"))
+    args = parser.parse_args(argv)
+
+    timing.reset()
+
+    mesh_xy = _create_mesh_xy(args.px, args.py)
+    restart_file = _find_restart_file(args.input)
+
+    with timing.section("pseudopoles.load"):
+        data = load_bse_data_from_restart_sharded(
+            restart_file,
+            n_val=args.n_val,
+            n_cond=args.n_cond,
+            mesh_xy=mesh_xy,
+        )
+
+    with timing.section("pseudopoles.bounds"):
+        bounds = estimate_spectral_bounds_sharded(
+            data,
+            mesh_xy,
+            n_lanczos=args.kpm_n_lanczos,
+            n_lanczos_max=max(args.kpm_n_lanczos, 50),
+            include_W=not args.rpa,
+            use_tda=args.tda,
+        )
+
+    e_min_ry = bounds["e_min_ry"]
+    e_max_ry = bounds["e_max_ry_raw"] * (1.0 + args.buffer)
+    e_min_eV = e_min_ry * args.ry_to_ev
+    e_max_eV = e_max_ry * args.ry_to_ev
+
+    windows = [WindowSpec(w.name, w.a_eV, w.b_eV, w.note) for w in build_default_windows_eV(e_max_eV)]
+    if args.windows_kpm:
+        from . import bse_kpm
+        kpm_result = bse_kpm.run_kpm_dos(
+            data,
+            mesh_xy,
+            n_moments=args.kpm_n_moments,
+            n_random=args.kpm_n_random,
+            seed=args.kpm_seed,
+            n_lanczos=args.kpm_n_lanczos,
+            buffer=args.buffer,
+            ry_to_ev=args.ry_to_ev,
+            n_energy_pts=args.kpm_n_energy_pts,
+            plot_file="bse_kpm_windows.png",
+            n_windows=args.windows_kpm_count,
+            emit_outputs=False,
+            include_W=not args.rpa,
+            use_tda=args.tda,
+        )
+        windows_ry = kpm_result["windows_ry"]
+        windows = [
+            WindowSpec(f"W{i+1}", float(a * args.ry_to_ev), float(b * args.ry_to_ev), "KPM-weighted")
+            for i, (a, b) in enumerate(windows_ry)
+        ]
+    elif args.window1 is not None or args.window2 is not None:
+        w1_default = (0.0, 2.0)
+        w2_default = (2.0, math.nan)
+        w1 = _parse_window_arg(args.window1 or [str(w1_default[0]), str(w1_default[1])], w1_default)
+        w2 = _parse_window_arg(args.window2 or [str(w2_default[0]), "auto"], w2_default)
+        w1_b = e_max_eV if math.isnan(w1[1]) else w1[1]
+        w2_b = e_max_eV if math.isnan(w2[1]) else w2[1]
+        windows = [
+            WindowSpec("W1", float(w1[0]), float(w1_b), "user window"),
+            WindowSpec("W2", float(w2[0]), float(w2_b), "user window"),
+        ]
+
+    print("--- Windows ---")
+    for w in windows:
+        print(f"{w.name}: [{w.a_eV:.3f}, {w.b_eV:.3f}] eV")
+
+    with timing.section("pseudopoles.run"):
+        results = run_pseudopoles(
+            data,
+            mesh_xy,
+            windows,
+            m0=args.m0,
+            n_quad=args.n_quad,
+            p_keep=args.p_keep,
+            n_tail=args.n_tail,
+            gmres_max_iter=args.gmres_max_iter,
+            gmres_tol=args.gmres_tol,
+            seed=args.seed,
+            ry_to_ev=args.ry_to_ev,
+            s_cutoff=args.s_cutoff,
+            quadrature="ellipse",
+            use_tda=args.tda,
+            gmres_fp32=args.gmres_fp32,
+            include_W=not args.rpa,
+        )
+
+    write_pseudopoles_h5(
+        args.out,
+        windows,
+        results,
+        use_tda=args.tda,
+        include_W=not args.rpa,
+        ry_to_ev=args.ry_to_ev,
+        m0=args.m0,
+        n_quad=args.n_quad,
+        p_keep=args.p_keep,
+        n_tail=args.n_tail,
+        gmres_max_iter=args.gmres_max_iter,
+        gmres_tol=args.gmres_tol,
+        seed=args.seed,
+    )
+
+    print(f"\nPseudopoles written to {args.out}")
+    timing.report(print_fn=print, title="--- Timing ---")
+
+
+if __name__ == "__main__":
+    main()

@@ -11,6 +11,7 @@ from jax import lax
 from .bse_ring_comm import (
     apply_bse_hamiltonian_ring,
     build_bse_ring_matvec,
+    build_bse_ring_matvec_full,
     create_mesh_2d,
     make_bse_shardings,
     ring_matvec_correctness_check,
@@ -44,6 +45,7 @@ __all__ = [
     "apply_W",
     "block_lanczos_eig",
     "build_bse_ring_matvec",
+    "build_bse_ring_matvec_full",
     "compute_pair_amplitude",
     "create_mesh_2d",
     "lanczos_eig_jit",
@@ -279,6 +281,8 @@ if __name__ == "__main__":
     parser.add_argument("--gmres-seed", type=int, default=0, help="GMRES random seed.")
     parser.add_argument("--gmres-fp32", action="store_true",
                         help="Use FP32 data/GMRES for shifted solves.")
+    parser.add_argument("--tda", action="store_true",
+                        help="Use Tamm-Dancoff approximation (TDA). Default is full non-TDA.")
     parser.add_argument("--rpa", action="store_true",
                         help="Use RPA kernel (D+V only), skip W0 term entirely.")
     parser.add_argument("--bse", action="store_true",
@@ -349,6 +353,8 @@ if __name__ == "__main__":
     if args.input is None:
         parser.error("Default run requires -i/--input (use --debug-parallelism for random data).")
 
+    use_tda = args.tda
+
     if args.kpm_dos:
         from . import bse_kpm
 
@@ -367,6 +373,8 @@ if __name__ == "__main__":
         ]
         if use_rpa:
             kpm_argv.append("--rpa")
+        if use_tda:
+            kpm_argv.append("--tda")
         if args.kpm_emin_ev is not None:
             kpm_argv += ["--emin-ev", str(args.kpm_emin_ev)]
         if args.kpm_emax_ev is not None:
@@ -413,6 +421,7 @@ if __name__ == "__main__":
                 str(args.gmres_seed),
                 *(["--gmres-fp32"] if args.gmres_fp32 else []),
                 *(["--rpa"] if use_rpa else []),
+                *(["--tda"] if use_tda else []),
                 "--windows-kpm",
                 "--windows-kpm-count",
                 str(args.kpm_window_count),
@@ -439,6 +448,9 @@ if __name__ == "__main__":
             ]
         )
         raise SystemExit(0)
+
+    if not use_tda:
+        raise SystemExit("Lanczos preview currently supports TDA only. Re-run with --tda.")
 
     _preview_lanczos(
         args.input,

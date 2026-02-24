@@ -42,6 +42,7 @@ def create_mesh_2d(devices: Optional[list] = None) -> Mesh:
 def make_bse_shardings(mesh_xy: Mesh) -> SimpleNamespace:
     return SimpleNamespace(
         X=NamedSharding(mesh_xy, P(None, "x", "y", None)),
+        X_full=NamedSharding(mesh_xy, P(None, None, "x", "y", None)),
         psi_x=NamedSharding(mesh_xy, P(None, None, None, "x")),
         psi_y=NamedSharding(mesh_xy, P(None, None, None, "y")),
         V=NamedSharding(mesh_xy, P("x", "y")),
@@ -54,6 +55,7 @@ def make_bse_shardings(mesh_xy: Mesh) -> SimpleNamespace:
         D=NamedSharding(mesh_xy, P(None, "x", "y", None, None)),
         S=NamedSharding(mesh_xy, P(None, "y", None)),
         U_mu=NamedSharding(mesh_xy, P(None, "x", None)),
+        d_mu=NamedSharding(mesh_xy, P(None, "x")),
     )
 
 
@@ -119,6 +121,70 @@ def _ring_sum_conduction(
 
     T0 = lax.pcast(T0, axis_name=("x", "y"), to="varying")
     _, T_total = lax.fori_loop(0, px, step, (R, T0))
+    return T_total
+
+
+def _ring_sum_conduction_first(
+    X: jax.Array,
+    psi_c_Y: jax.Array,
+    c_chunk: int,
+    px: int,
+    nu_local: int,
+) -> jax.Array:
+    """Sum over conduction first: R(v,k,s,nu) = sum_c psi_c^*(nu) X(c,v,k)."""
+    axis_index_x = jnp.asarray(lax.axis_index("x"), dtype=jnp.int32)
+    nk, _, nspinor, _ = psi_c_Y.shape
+    v_chunk = X.shape[2]
+
+    R0 = jnp.zeros((X.shape[0], v_chunk, nk, nspinor, nu_local), dtype=X.dtype)
+    perm = _ring_perm(px)
+
+    def step(i, carry):
+        buf, R = carry
+        origin = (axis_index_x - jnp.asarray(i, dtype=jnp.int32)) % px
+        c_start = origin * jnp.asarray(c_chunk, dtype=jnp.int32)
+        z = jnp.int32(0)
+        psi_c_slice = lax.dynamic_slice(
+            psi_c_Y, (z, c_start, z, z), (nk, c_chunk, nspinor, nu_local)
+        )
+        R = R + jnp.einsum("kcsN,bcvk->bvksN", jnp.conj(psi_c_slice), buf)
+        buf = lax.ppermute(buf, axis_name="x", perm=perm)
+        return buf, R
+
+    R0 = lax.pcast(R0, axis_name=("x", "y"), to="varying")
+    _, R_total = lax.fori_loop(0, px, step, (X, R0))
+    return R_total
+
+
+def _ring_sum_valence_second(
+    R: jax.Array,
+    psi_v_X: jax.Array,
+    v_chunk: int,
+    py: int,
+    mu_local: int,
+) -> jax.Array:
+    """Finish sum over valence: T(mu,nu,t,s,k) = sum_v psi_v(mu) R(v,k,s,nu)."""
+    axis_index_y = jnp.asarray(lax.axis_index("y"), dtype=jnp.int32)
+    nk, _, nspinor, _ = psi_v_X.shape
+    nu_local = R.shape[4]
+
+    T0 = jnp.zeros((R.shape[0], mu_local, nu_local, nspinor, nspinor, nk), dtype=R.dtype)
+    perm = _ring_perm(py)
+
+    def step(i, carry):
+        buf, T = carry
+        origin = (axis_index_y - jnp.asarray(i, dtype=jnp.int32)) % py
+        v_start = origin * jnp.asarray(v_chunk, dtype=jnp.int32)
+        z = jnp.int32(0)
+        psi_v_slice = lax.dynamic_slice(
+            psi_v_X, (z, v_start, z, z), (nk, v_chunk, nspinor, mu_local)
+        )
+        T = T + jnp.einsum("kvsM,bvksN->bMNtsk", psi_v_slice, buf)
+        buf = lax.ppermute(buf, axis_name="y", perm=perm)
+        return buf, T
+
+    T0 = lax.pcast(T0, axis_name=("x", "y"), to="varying")
+    _, T_total = lax.fori_loop(0, py, step, (R, T0))
     return T_total
 
 
@@ -404,6 +470,366 @@ def build_bse_ring_matvec(
             sh.V,
         ),
         out_shardings=sh.X,
+    )
+
+
+def build_bse_ring_matvec_full(
+    mesh_xy: Mesh,
+    nkx: int,
+    nky: int,
+    nkz: int,
+    timed: bool = False,
+    low_mem: bool = True,
+    include_W: bool = True,
+):
+    """Build full (non-TDA) BSE matvec for S = [[A, B], [-B^H, -A^H]]."""
+    px, py = mesh_xy.devices.shape
+    sh = make_bse_shardings(mesh_xy)
+    nk = nkx * nky * nkz
+
+    def _encode_T(X, psi_c_X, psi_v_Y):
+        c_chunk = X.shape[1]
+        v_chunk = X.shape[2]
+        n_rmu_local_X = psi_c_X.shape[-1]
+        n_rmu_local_Y = psi_v_Y.shape[-1]
+        R = _ring_sum_valence(X, psi_v_Y, v_chunk, py, n_rmu_local_Y)
+        T = _ring_sum_conduction(R, psi_c_X, c_chunk, px, n_rmu_local_X)
+        return T
+
+    encode_T_ring = _shard_map_fn(
+        _encode_T,
+        mesh=mesh_xy,
+        in_specs=(P(None, "x", "y", None), P(None, None, None, "x"), P(None, None, None, "y")),
+        out_specs=P(None, "x", "y", None, None, None),
+        axis_names={"x", "y"},
+    )
+
+    def _encode_T_gather(X, psi_c_X, psi_v_Y):
+        X_full_v = lax.all_gather(X, "y", axis=2, tiled=True)
+        R = jnp.einsum("kvsN,bcvk->bcksN", jnp.conj(psi_v_Y), X_full_v)
+        R_full_c = lax.all_gather(R, "x", axis=1, tiled=True)
+        T = jnp.einsum("kctM,bcksN->bMNtsk", psi_c_X, R_full_c)
+        return T
+
+    encode_T_gather = _shard_map_fn(
+        _encode_T_gather,
+        mesh=mesh_xy,
+        in_specs=(P(None, "x", "y", None), P(None, None, None, "x"), P(None, None, None, "y")),
+        out_specs=P(None, "x", "y", None, None, None),
+        axis_names={"x", "y"},
+    )
+
+    def _encode_T_B(X, psi_c_Y, psi_v_X):
+        c_chunk = X.shape[1]
+        v_chunk = X.shape[2]
+        n_rmu_local_X = psi_v_X.shape[-1]
+        n_rmu_local_Y = psi_c_Y.shape[-1]
+        R = _ring_sum_conduction_first(X, psi_c_Y, c_chunk, px, n_rmu_local_Y)
+        T = _ring_sum_valence_second(R, psi_v_X, v_chunk, py, n_rmu_local_X)
+        return T
+
+    encode_T_ring_B = _shard_map_fn(
+        _encode_T_B,
+        mesh=mesh_xy,
+        in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "x")),
+        out_specs=P(None, "x", "y", None, None, None),
+        axis_names={"x", "y"},
+    )
+
+    def _encode_T_B_gather(X, psi_c_Y, psi_v_X):
+        X_full_c = lax.all_gather(X, "x", axis=1, tiled=True)
+        R = jnp.einsum("kcsN,bcvk->bvksN", jnp.conj(psi_c_Y), X_full_c)
+        R_full_v = lax.all_gather(R, "y", axis=1, tiled=True)
+        T = jnp.einsum("kvsM,bvksN->bMNtsk", psi_v_X, R_full_v)
+        return T
+
+    encode_T_gather_B = _shard_map_fn(
+        _encode_T_B_gather,
+        mesh=mesh_xy,
+        in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "x")),
+        out_specs=P(None, "x", "y", None, None, None),
+        axis_names={"x", "y"},
+    )
+
+    def _apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0):
+        return apply_V_ring(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0, nk, px, py)
+
+    apply_V_ring_only = _shard_map_fn(
+        _apply_V_ring_only,
+        mesh=mesh_xy,
+        in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"),
+                  P(None, None, None, "x"), P(None, None, None, "x"), P("x", "y")),
+        out_specs=P(None, "x", "y", None),
+        axis_names={"x", "y"},
+    )
+
+    def _apply_V_ring_B(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0):
+        return apply_V_ring(
+            X,
+            jnp.conj(psi_c_Y),
+            jnp.conj(psi_v_Y),
+            psi_c_X,
+            psi_v_X,
+            V_q0,
+            nk,
+            px,
+            py,
+        )
+
+    apply_V_ring_B = _shard_map_fn(
+        _apply_V_ring_B,
+        mesh=mesh_xy,
+        in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"),
+                  P(None, None, None, "x"), P(None, None, None, "x"), P("x", "y")),
+        out_specs=P(None, "x", "y", None),
+        axis_names={"x", "y"},
+    )
+
+    def _apply_W_from_T(T, psi_c_X, psi_v_Y, W_R):
+        nspinor = psi_c_X.shape[2]
+        nb_trial = T.shape[0]
+        n_rmu_local_X = T.shape[1]
+        n_rmu_local_Y = T.shape[2]
+        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=T.real.dtype))
+
+        T_k = T.reshape(nb_trial, n_rmu_local_X, n_rmu_local_Y, nspinor, nspinor, nkx, nky, nkz)
+        T_R = jnp.fft.ifftn(T_k, axes=(5, 6, 7), norm="ortho")
+        U_R = W_R[None, :, :, None, None, :, :, :] * T_R
+        U_q = jnp.fft.fftn(U_R, axes=(5, 6, 7), norm="ortho")
+        U = U_q.reshape(nb_trial, n_rmu_local_X, n_rmu_local_Y, nspinor, nspinor, nk)
+
+        A = jnp.einsum("kctM,bMNtsk->bcNsk", jnp.conj(psi_c_X), U)
+        WX = jnp.einsum("kvsN,bcNsk->bcvk", psi_v_Y, A)
+        return WX / sqrt_nk
+
+    apply_W_from_T = jax.jit(
+        _apply_W_from_T,
+        in_shardings=(sh.T, sh.psi_x, sh.psi_y, sh.W),
+        out_shardings=sh.X,
+    )
+
+    def _apply_D_term(X, eps_c, eps_v):
+        delta_E = eps_c.T[None, :, None, :] - eps_v.T[None, None, :, :]
+        return delta_E * X
+
+    apply_D_term = jax.jit(
+        _apply_D_term,
+        in_shardings=(sh.X, sh.eps, sh.eps),
+        out_shardings=sh.X,
+    )
+
+    def _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0):
+        D_term = apply_D_term(X, eps_c, eps_v)
+        V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0)
+        if not include_W:
+            return D_term + V_term
+        T = encode_T_ring(X, psi_c_X, psi_v_Y) if low_mem else encode_T_gather(X, psi_c_X, psi_v_Y)
+        W_term = apply_W_from_T(T, psi_c_X, psi_v_Y, W_R)
+        return D_term + V_term - W_term
+
+    def _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0):
+        V_term = apply_V_ring_B(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0)
+        if not include_W:
+            return V_term
+        T = encode_T_ring_B(X, psi_c_Y, psi_v_X) if low_mem else encode_T_gather_B(X, psi_c_Y, psi_v_X)
+        W_term = apply_W_from_T(T, psi_c_X, psi_v_Y, W_R)
+        return V_term - W_term
+
+    def _matvec_impl(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0):
+        X = X_full[0]
+        Y = X_full[1]
+        AX = _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
+        BY = _apply_B(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0)
+        X_out = AX + BY
+
+        # A and B are Hermitian in this formulation; reuse A(Y) and B(X).
+        AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
+        B_dag_X = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0)
+        Y_out = -B_dag_X - AY
+        return jnp.stack([X_out, Y_out], axis=0)
+
+    if timed:
+        def _matvec_timed(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0):
+            X = X_full[0]
+            Y = X_full[1]
+            with timing.section("bse_jax.D_term"):
+                D_term = apply_D_term(X, eps_c, eps_v)
+                D_term.block_until_ready()
+            with timing.section("bse_jax.V_term"):
+                V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0)
+                V_term.block_until_ready()
+            if not include_W:
+                AX = D_term + V_term
+            else:
+                with timing.section("bse_jax.W_term"):
+                    T = encode_T_ring(X, psi_c_X, psi_v_Y) if low_mem else encode_T_gather(X, psi_c_X, psi_v_Y)
+                    W_term = apply_W_from_T(T, psi_c_X, psi_v_Y, W_R)
+                    W_term.block_until_ready()
+                AX = D_term + V_term - W_term
+            with timing.section("bse_jax.B_term"):
+                BY = _apply_B(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0)
+                BY.block_until_ready()
+            X_out = AX + BY
+
+            AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
+            B_dag_X = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0)
+            Y_out = -B_dag_X - AY
+            return jnp.stack([X_out, Y_out], axis=0)
+
+        return _matvec_timed
+
+    return jax.jit(
+        _matvec_impl,
+        in_shardings=(
+            sh.X_full,
+            sh.psi_x,
+            sh.psi_y,
+            sh.psi_x,
+            sh.psi_y,
+            sh.eps,
+            sh.eps,
+            sh.W,
+            sh.V,
+        ),
+        out_shardings=sh.X_full,
+    )
+
+
+def build_realspace_random_transition_generator(
+    mesh_xy: Mesh,
+    nkx: int,
+    nky: int,
+    nkz: int,
+    n_cond_pad: int,
+    n_val_pad: int,
+):
+    """Build a sharded map: r(nu,k) -> V_q0 @ r -> X(c,v,k) (local c/v chunks).
+
+    Assumes r is column-sharded on the Y axis and V_q0 is tiled (x,y).
+    The resulting X is sharded like the BSE matvec (c on x, v on y).
+    """
+    px, py = mesh_xy.devices.shape
+    sh = make_bse_shardings(mesh_xy)
+    nk = nkx * nky * nkz
+
+    if n_cond_pad % px != 0 or n_val_pad % py != 0:
+        raise ValueError("n_cond_pad and n_val_pad must be divisible by px/py")
+
+    c_chunk = n_cond_pad // px
+    v_chunk = n_val_pad // py
+
+    def _map(r, psi_c_X, psi_v_X, V_q0):
+        # r: (batch, nu_local, nk), column-sharded on y.
+        U_partial = jnp.einsum("MN,bNk->bMk", V_q0, r)
+        U = lax.psum(U_partial, axis_name="y")  # (batch, mu_local, nk), sharded on x
+
+        axis_index_x = jnp.asarray(lax.axis_index("x"), dtype=jnp.int32)
+        axis_index_y = jnp.asarray(lax.axis_index("y"), dtype=jnp.int32)
+        c_start = axis_index_x * jnp.asarray(c_chunk, dtype=jnp.int32)
+        v_start = axis_index_y * jnp.asarray(v_chunk, dtype=jnp.int32)
+        z = jnp.int32(0)
+
+        nk_local, _, nspinor, mu_local = psi_c_X.shape
+        psi_c_slice = lax.dynamic_slice(
+            psi_c_X, (z, c_start, z, z), (nk_local, c_chunk, nspinor, mu_local)
+        )
+        psi_v_slice = lax.dynamic_slice(
+            psi_v_X, (z, v_start, z, z), (nk_local, v_chunk, nspinor, mu_local)
+        )
+
+        M_X = jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c_slice), psi_v_slice)
+        X_local = jnp.einsum("kcvM,bMk->bcvk", jnp.conj(M_X), U)
+
+        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X_local.real.dtype))
+        return X_local / sqrt_nk
+
+    return _shard_map_fn(
+        _map,
+        mesh=mesh_xy,
+        in_specs=(P(None, "y", None), P(None, None, None, "x"), P(None, None, None, "x"), P("x", "y")),
+        out_specs=P(None, "x", "y", None),
+        axis_names={"x", "y"},
+    )
+
+
+def build_density_snapshot_operator(
+    mesh_xy: Mesh,
+    nkx: int,
+    nky: int,
+    nkz: int,
+):
+    """Build a sharded map: s(c,v,k) -> d(mu) = V_q0 @ sum_k R s.
+
+    Returns density-space vectors in r_mu (summed over k) sharded on x.
+    """
+    px, py = mesh_xy.devices.shape
+    sh = make_bse_shardings(mesh_xy)
+    nk = nkx * nky * nkz
+
+    def _map(s, psi_c_Y, psi_v_Y, V_q0):
+        nb_trial = s.shape[0]
+        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=s.real.dtype))
+
+        c_chunk = s.shape[1]
+        v_chunk = s.shape[2]
+
+        axis_index_x = jnp.asarray(lax.axis_index("x"), dtype=jnp.int32)
+        axis_index_y = jnp.asarray(lax.axis_index("y"), dtype=jnp.int32)
+
+        nk_local = psi_c_Y.shape[0]
+        nspinor = psi_c_Y.shape[2]
+        nu_local = psi_c_Y.shape[-1]
+
+        c_start_local = axis_index_x * jnp.asarray(c_chunk, dtype=jnp.int32)
+        z = jnp.int32(0)
+        psi_c_slice = lax.dynamic_slice(
+            psi_c_Y, (z, c_start_local, z, z), (nk_local, c_chunk, nspinor, nu_local)
+        )
+
+        A0 = jnp.zeros((nb_trial, c_chunk, nu_local, nk_local), dtype=s.dtype)
+        perm_y = _ring_perm(py)
+
+        def step_y(i, carry):
+            buf, A = carry
+            origin = (axis_index_y - jnp.asarray(i, dtype=jnp.int32)) % py
+            v_start = origin * jnp.asarray(v_chunk, dtype=jnp.int32)
+            psi_v_slice = lax.dynamic_slice(
+                psi_v_Y, (z, v_start, z, z), (nk_local, v_chunk, nspinor, nu_local)
+            )
+            R_v = jnp.einsum("kvsN,bcvk->bcksN", psi_v_slice, buf)
+            A = A + jnp.einsum("kcsN,bcksN->bcNk", jnp.conj(psi_c_slice), R_v)
+            buf = lax.ppermute(buf, axis_name="y", perm=perm_y)
+            return buf, A
+
+        A0 = lax.pcast(A0, axis_name=("x", "y"), to="varying")
+        _, A_local = lax.fori_loop(0, py, step_y, (s, A0))
+
+        S0 = jnp.zeros((nb_trial, nu_local, nk_local), dtype=s.dtype)
+        perm_x = _ring_perm(px)
+
+        def step_x(i, carry):
+            buf, S = carry
+            S = S + jnp.sum(buf, axis=1)
+            buf = lax.ppermute(buf, axis_name="x", perm=perm_x)
+            return buf, S
+
+        S0 = lax.pcast(S0, axis_name=("x", "y"), to="varying")
+        _, S_total = lax.fori_loop(0, px, step_x, (A_local, S0))
+
+        S_total = S_total / sqrt_nk
+
+        U_partial = jnp.einsum("MN,bNk->bMk", V_q0, S_total)
+        U = lax.psum(U_partial, axis_name="y")  # (batch, mu_local, nk)
+
+        d_mu = jnp.sum(U, axis=-1)
+        return d_mu
+
+    return _shard_map_fn(
+        _map,
+        mesh=mesh_xy,
+        in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"), P("x", "y")),
+        out_specs=P(None, "x"),
+        axis_names={"x", "y"},
     )
 
 
