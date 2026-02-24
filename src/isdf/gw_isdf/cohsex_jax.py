@@ -1420,35 +1420,18 @@ def main(argv=None):
 			psi_r_rmu_Y = chunked_result['psi_r_rmu_Y']
 			psi_r_rmuT_X = chunked_result['psi_r_rmuT_X']
 			
-			# Still need to load psi_v, psi_c, psi_coh for chi0 and COH
+			# Derive psi_v, psi_c, psi_coh from existing psi_l, psi_r centroid wfns.
+			# This avoids 3 redundant FFTs to real-space and ~60 GB of unused rtot arrays.
+			# psi_v = (b0, b2) ⊂ psi_l = (b0, b3)
+			# psi_c = (b2, b4) ⊂ psi_r = (b1, b4)
+			# psi_coh = (b0, b4) = concat(psi_v, psi_c) at centroids only
 			with timing.section("cohsex_jax.wavefunction_setup"):
-				# Load VALENCE wavefunctions for chi0 (psi_v)
-				global_psiG_v, nb_v = read_Gvecs_to_devices(wfn, sym, valence_range, meta, bispinor, mesh_xy)
-				psi_v_rtot_Y, psi_v_rmu_Y, psi_v_rmuT_X = get_sharded_wfns(
-					global_psiG_v, sym, meta, centroid_indices, nb_v, False, mesh_xy
-				)
-				psi_v_rtot_Y.block_until_ready(); psi_v_rmu_Y.block_until_ready(); psi_v_rmuT_X.block_until_ready()
-				del global_psiG_v
-				gc.collect()
-				
-				# Load CONDUCTION wavefunctions for chi0 (psi_c)
-				global_psiG_c, nb_c = read_Gvecs_to_devices(wfn, sym, conduction_range, meta, bispinor, mesh_xy)
-				psi_c_rtot_Y, psi_c_rmu_Y, psi_c_rmuT_X = get_sharded_wfns(
-					global_psiG_c, sym, meta, centroid_indices, nb_c, False, mesh_xy
-				)
-				psi_c_rtot_Y.block_until_ready(); psi_c_rmu_Y.block_until_ready(); psi_c_rmuT_X.block_until_ready()
-				del global_psiG_c
-				gc.collect()
-				
-				# Load ALL bands for COH resolution of identity (psi_coh)
-				global_psiG_coh, nb_coh = read_Gvecs_to_devices(wfn, sym, full_band_range, meta, bispinor, mesh_xy)
-				psi_coh_rtot_Y, psi_coh_rmu_Y, psi_coh_rmuT_X = get_sharded_wfns(
-					global_psiG_coh, sym, meta, centroid_indices, nb_coh, False, mesh_xy
-				)
-				psi_coh_rtot_Y.block_until_ready(); psi_coh_rmu_Y.block_until_ready(); psi_coh_rmuT_X.block_until_ready()
-				del global_psiG_coh
-				gc.collect()
-				print0("  Wavefunction loading complete")
+				nb_v = b2 - b0
+				nb_c = b4 - b2
+				psi_v_rmu_Y = psi_l_rmu_Y[:, :nb_v, :, :]
+				psi_c_rmu_Y = psi_r_rmu_Y[:, (b2 - b1):, :, :]
+				psi_coh_rmu_Y = jnp.concatenate([psi_v_rmu_Y, psi_c_rmu_Y], axis=1)
+				print0(f"  Wavefunction slicing complete (reused from ISDF fitting, saved ~{3 * meta.nk_tot * 80 * meta.nspinor * meta.n_rtot * 16 / 1e9:.1f} GB rtot)")
 			
 			# Get energies (still needed for downstream)
 			enk_v, weights_v = get_enk_bandrange(wfn, sym, valence_range, (b1, b2), nspinor=meta.nspinor)
@@ -1564,33 +1547,14 @@ def main(argv=None):
 				del global_psiG_r
 				gc.collect()
 				
-				# Load VALENCE wavefunctions for chi0 (psi_v)
-				global_psiG_v, nb_v = read_Gvecs_to_devices(wfn, sym, valence_range, meta, bispinor, mesh_xy)
-				psi_v_rtot_Y, psi_v_rmu_Y, psi_v_rmuT_X = get_sharded_wfns(
-					global_psiG_v, sym, meta, centroid_indices, nb_v, False, mesh_xy
-				)
-				psi_v_rtot_Y.block_until_ready(); psi_v_rmu_Y.block_until_ready(); psi_v_rmuT_X.block_until_ready()
-				del global_psiG_v
-				gc.collect()
-				
-				# Load CONDUCTION wavefunctions for chi0 (psi_c)
-				global_psiG_c, nb_c = read_Gvecs_to_devices(wfn, sym, conduction_range, meta, bispinor, mesh_xy)
-				psi_c_rtot_Y, psi_c_rmu_Y, psi_c_rmuT_X = get_sharded_wfns(
-					global_psiG_c, sym, meta, centroid_indices, nb_c, False, mesh_xy
-				)
-				psi_c_rtot_Y.block_until_ready(); psi_c_rmu_Y.block_until_ready(); psi_c_rmuT_X.block_until_ready()
-				del global_psiG_c
-				gc.collect()
-				
-				# Load ALL bands for COH resolution of identity (psi_coh)
-				global_psiG_coh, nb_coh = read_Gvecs_to_devices(wfn, sym, full_band_range, meta, bispinor, mesh_xy)
-				psi_coh_rtot_Y, psi_coh_rmu_Y, psi_coh_rmuT_X = get_sharded_wfns(
-					global_psiG_coh, sym, meta, centroid_indices, nb_coh, False, mesh_xy
-				)
-				psi_coh_rtot_Y.block_until_ready(); psi_coh_rmu_Y.block_until_ready(); psi_coh_rmuT_X.block_until_ready()
-				del global_psiG_coh
-				gc.collect()
-				print0("  Wavefunction loading complete")
+				# Derive psi_v, psi_c, psi_coh from existing psi_l, psi_r centroid wfns.
+				# Avoids 3 redundant FFTs and ~60 GB of unused rtot arrays.
+				nb_v = b2 - b0
+				nb_c = b4 - b2
+				psi_v_rmu_Y = psi_l_rmu_Y[:, :nb_v, :, :]
+				psi_c_rmu_Y = psi_r_rmu_Y[:, (b2 - b1):, :, :]
+				psi_coh_rmu_Y = jnp.concatenate([psi_v_rmu_Y, psi_c_rmu_Y], axis=1)
+				print0(f"  Wavefunction slicing complete (reused from ISDF fitting)")
 
 			with timing.section("cohsex_jax.zeta_V_build") as timer_zeta:
 				####################################
@@ -1842,15 +1806,15 @@ def main(argv=None):
 				psi_v_rtot_Y, psi_v_rmu_Y, psi_v_rmuT_X = get_sharded_wfns(
 					global_psiG_v, sym, meta, centroid_indices, nb_v, False, mesh_xy
 				)
-				del global_psiG_v
+				del global_psiG_v, psi_v_rtot_Y
 				gc.collect()
-				
+
 				# Load CONDUCTION wavefunctions for chi0
 				global_psiG_c, nb_c = read_Gvecs_to_devices(wfn, sym, conduction_range, meta, bispinor, mesh_xy)
 				psi_c_rtot_Y, psi_c_rmu_Y, psi_c_rmuT_X = get_sharded_wfns(
 					global_psiG_c, sym, meta, centroid_indices, nb_c, False, mesh_xy
 				)
-				del global_psiG_c
+				del global_psiG_c, psi_c_rtot_Y
 				gc.collect()
 				
 				# Get energies for valence/conduction (pass nspinor for bispinor)

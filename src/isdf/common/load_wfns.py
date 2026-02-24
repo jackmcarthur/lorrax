@@ -321,10 +321,10 @@ def get_sharded_wfns(
 		fy = jnp.arange(fft_grid[1], dtype=jnp.float64)[None, None, :, None] / fft_grid[1]
 		fz = jnp.arange(fft_grid[2], dtype=jnp.float64)[None, None, None, :] / fft_grid[2]
 		
-		# Pre-compute centroid linear indices
-		centroids = jnp.asarray(centroid_indices, dtype=jnp.int32)
+		# Pre-compute centroid linear indices (int64 for XLA compatibility)
+		centroids = jnp.asarray(centroid_indices, dtype=jnp.int64)
 		ny, nz = fft_grid[1], fft_grid[2]
-		centroid_lin = (centroids[:, 0] * (ny * nz) + centroids[:, 1] * nz + centroids[:, 2]).astype(jnp.int32)
+		centroid_lin = (centroids[:, 0] * (ny * nz) + centroids[:, 1] * nz + centroids[:, 2]).astype(jnp.int64)
 		n_rmu = len(centroid_indices)
 
 		@partial(jax.jit,
@@ -355,15 +355,18 @@ def get_sharded_wfns(
 
 			# Flatten spatial dims to rtot
 			psi_rtot = psi_r.reshape(nk_tot, nb_actual, nspinor, -1)
+			
+			# Step 1: Reshard from (b_XY, ns, n_rtot) to (b_X, ns, n_rtot) BEFORE gather
+			# This simplifies XY sharding to just X on bands, preparing for gather
+			psi_rtot = jax.lax.with_sharding_constraint(psi_rtot, x1_4)
 
-			# Centroid gather on axis 3 (spatial) - this axis is replicated so gather is LOCAL
-			# Bands stay sharded on axis 1 throughout, no all-gather needed
+			# Centroid gather on axis 3 (spatial) - now with simpler X-sharding on bands
 			psi_rmu = jnp.take(psi_rtot, centroid_lin, axis=3)
 
 			# Conjugate-transpose to (nk, n_rmu, nb, nspinor) for pair density
 			psi_rmuT = jnp.conj(psi_rmu.transpose(0, 3, 1, 2))  # (nk, n_rmu, nb, ns)
 			
-			# Re-shard results: rtot and rmu to Y, rmuT to X
+			# Step 2: Apply final output shardings
 			psi_rtot = jax.lax.with_sharding_constraint(psi_rtot, y3_4)
 			psi_rmu = jax.lax.with_sharding_constraint(psi_rmu, y3_4)
 			psi_rmuT = jax.lax.with_sharding_constraint(psi_rmuT, x1_4)
@@ -1707,11 +1710,15 @@ def fit_zeta_chunked_to_h5(
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.h5_write"):
                 if jax.process_index() == 0:
-                    # Copy all q-points to CPU at once (faster than one-by-one)
-                    zeta_cpu = np.asarray(zeta_chunk)  # (nq, n_rmu, n_xchunk) on CPU
+                    # Gather the sharded array from all processes to process 0
+                    zeta_gathered = jax.experimental.multihost_utils.process_allgather(zeta_chunk, tiled=False)
+                    zeta_cpu = np.asarray(zeta_gathered)  # (nq, n_rmu, n_xchunk) on CPU
                     
                     # Queue the write with r-range (x-chunks are contiguous in r-space!)
                     write_queue.put((zeta_cpu, r_start, r_end, chunk_idx))
+                else:
+                    # Other processes must also participate in the collective gather
+                    jax.experimental.multihost_utils.process_allgather(zeta_chunk, tiled=False)
                 
                 # Synchronize across devices (but not waiting for HDF5 write)
                 jax.experimental.multihost_utils.sync_global_devices(f"zeta_chunk_{chunk_idx}")
@@ -2316,9 +2323,9 @@ def get_sharded_wfns_centroids(
         kvecs_cached = jnp.asarray(kvecs_frac)
         n_rtot_cached = n_rtot
         
-        # Pre-compute centroid linear indices
-        centroids = jnp.asarray(centroid_indices, dtype=jnp.int32)
-        centroid_lin = (centroids[:, 0] * (ny * nz) + centroids[:, 1] * nz + centroids[:, 2]).astype(jnp.int32)
+        # Pre-compute centroid linear indices (int64 for XLA compatibility)
+        centroids = jnp.asarray(centroid_indices, dtype=jnp.int64)
+        centroid_lin = (centroids[:, 0] * (ny * nz) + centroids[:, 1] * nz + centroids[:, 2]).astype(jnp.int64)
         
         @partial(jax.jit, static_argnames=('nb_static',))
         def _extract_centroids(psi_G, nb_static):
@@ -2342,14 +2349,18 @@ def get_sharded_wfns_centroids(
             # Flatten spatial dims
             psi_rtot = psi_r.reshape(nk_tot, nb_static, nspinor, -1)
             
-            # Gather centroids on axis 3 (spatial) - this axis is replicated so gather is LOCAL
-            # Bands stay sharded on axis 1 throughout, no all-gather of the large array
+            # Step 1: Reshard from (b_XY, ns, n_rtot) to (b_X, ns, n_rtot) BEFORE gather
+            # This simplifies XY sharding to just X on bands, preparing for gather
+            intermediate_X = NamedSharding(mesh_xy, P(None, 'x', None, None))
+            psi_rtot = jax.lax.with_sharding_constraint(psi_rtot, intermediate_X)
+            
+            # Centroid gather on axis 3 (spatial) - now with simpler X-sharding on bands
             psi_rmu = jnp.take(psi_rtot, centroid_lin, axis=3)
             
             # Create psi_rmuT (conjugate transpose for left wfn in pair density)
             psi_rmuT = jnp.conj(psi_rmu.transpose(0, 3, 1, 2))  # (nk, n_rmu, nb, ns)
             
-            # Apply output shardings
+            # Step 2: Apply final output shardings
             psi_rmu = jax.lax.with_sharding_constraint(psi_rmu, out_Y)
             psi_rmuT = jax.lax.with_sharding_constraint(psi_rmuT, out_X)
             

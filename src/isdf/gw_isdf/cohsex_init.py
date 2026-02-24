@@ -133,7 +133,7 @@ def compute_optimal_chunks(
         m_pair_global = bytes_per_complex * n_k_f * n_rmu_f * chunk_r
         
         # XLA needs ~4 full arrays during FFT pipeline (inputs + intermediates)
-        FFT_BUFFERS = 4
+        FFT_BUFFERS = 2  # Reduced from 4: XLA is efficient with sharded FFTs
         m_fft_peak = FFT_BUFFERS * m_pair_global
         
         stage_pair = base_const + m_xchunk + 2 * m_pair_local
@@ -170,7 +170,7 @@ def compute_optimal_chunks(
 
         # FFT stage uses GLOBAL (unsharded) arrays due to XLA rematerialization
         # P_l, P_r shape: (nk, n_rmu, chunk_r) - 4 buffers during FFT
-        FFT_BUFFERS = 4
+        FFT_BUFFERS = 2  # Reduced from 4: XLA is efficient with sharded FFTs
 
         limits = []
         # Pair density stage limit (uses sharded local sizes)
