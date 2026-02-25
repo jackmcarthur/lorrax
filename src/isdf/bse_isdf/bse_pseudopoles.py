@@ -27,8 +27,9 @@ from .bse_feast import (
 from .bse_ring_comm import (
     build_bse_ring_matvec,
     build_bse_ring_matvec_full,
-    build_realspace_random_transition_generator,
     build_density_snapshot_operator,
+    build_density_drive_operators,
+    build_density_readout_operator_full,
     make_bse_shardings,
 )
 from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
@@ -107,25 +108,30 @@ def _build_reduced_h(matvec, basis: list[jax.Array], data: dict, use_tda: bool) 
 def _compute_density_snapshots(
     basis: list[jax.Array],
     snapshot_op,
+    readout_full,
     sh,
     psi_c_Y: jax.Array,
     psi_v_Y: jax.Array,
     V_q0: jax.Array,
     use_tda: bool,
 ) -> np.ndarray:
-    """Compute C_w columns d(mu) for each basis vector."""
+    """Compute C_w columns w(mu)=V(dX+d*Y) for each basis vector.
+
+    This matches the response channel used by `bse_w_exact.py`:
+      - TDA:    w = V(d X)
+      - non-TDA w = V(d X + d* Y)
+    """
     if not basis:
         return np.zeros((0, 0), dtype=np.complex128)
     cols = []
     for v in basis:
         if use_tda:
-            s = v
+            s = jax.lax.with_sharding_constraint(v, sh.X)
+            w_mu = snapshot_op(s, psi_c_Y, psi_v_Y, V_q0)
         else:
-            s = v[0] + v[1]
-        s = jax.lax.with_sharding_constraint(s, sh.X)
-        d_mu = snapshot_op(s, psi_c_Y, psi_v_Y, V_q0)
-        d_mu_host = np.asarray(jax.device_get(d_mu[0]))
-        cols.append(d_mu_host)
+            s_full = jax.lax.with_sharding_constraint(v, sh.X_full)
+            w_mu = readout_full(s_full, psi_c_Y, psi_v_Y, V_q0)
+        cols.append(np.asarray(jax.device_get(w_mu[0])))
     return np.stack(cols, axis=1)
 
 
@@ -202,6 +208,7 @@ def run_pseudopoles(
     gmres_fp32: bool,
     include_W: bool,
 ) -> dict:
+    v_couples_k = bool(not include_W)
     if use_tda:
         matvec = build_bse_ring_matvec(
             mesh_xy,
@@ -209,6 +216,7 @@ def run_pseudopoles(
             data["nky"],
             data["nkz"],
             include_W=include_W,
+            v_couples_k=v_couples_k,
         )
     else:
         matvec = build_bse_ring_matvec_full(
@@ -217,6 +225,7 @@ def run_pseudopoles(
             data["nky"],
             data["nkz"],
             include_W=include_W,
+            v_couples_k=v_couples_k,
         )
 
     if include_W:
@@ -231,15 +240,11 @@ def run_pseudopoles(
     n_cond_pad = int(data["n_cond_pad"])
     n_val_pad = int(data["n_val_pad"])
 
-    gen = build_realspace_random_transition_generator(
-        mesh_xy,
-        data["nkx"],
-        data["nky"],
-        data["nkz"],
-        n_cond_pad,
-        n_val_pad,
+    f_op, fbar_op = build_density_drive_operators(
+        mesh_xy, data["nkx"], data["nky"], data["nkz"], n_cond_pad, n_val_pad
     )
     snapshot_op = build_density_snapshot_operator(mesh_xy, data["nkx"], data["nky"], data["nkz"])
+    readout_full = build_density_readout_operator_full(mesh_xy, data["nkx"], data["nky"], data["nkz"])
 
     key = jax.random.PRNGKey(seed)
     rng = np.random.default_rng(seed)
@@ -255,7 +260,11 @@ def run_pseudopoles(
             z_nodes = np.concatenate([z_nodes, np.conj(z_nodes)])
             w_weights = np.concatenate([w_weights, np.conj(w_weights)])
 
-        # --- Step A: density-biased seeds (eta -> V eta -> R^H V eta) ---
+        # --- Step A: density-biased seeds (eta -> V eta -> [f, -fbar]) ---
+        #
+        # For non-TDA we must use the transpose-coupled vertex in the Y sector:
+        #   rhs = [f, -fbar],  f = d^\dagger (V eta), fbar = d^T (V eta)
+        # (Do not assume fbar == conj(f) for complex Bloch spinors.)
         seeds = []
         for _ in range(m0):
             key, subkey = jax.random.split(key)
@@ -265,12 +274,15 @@ def run_pseudopoles(
                 dtype=jnp.float32 if gmres_fp32 else jnp.float64,
             )
             eta = jax.lax.with_sharding_constraint(eta, sh.S)
-            f = gen(eta, data["psi_c_X"], data["psi_v_X"], data["V_q0"])
-            f = jax.lax.with_sharding_constraint(f, sh.X)
             if use_tda:
-                phi = f
+                f = f_op(eta, data["psi_c_X"], data["psi_v_X"], data["V_q0"])
+                phi = jax.lax.with_sharding_constraint(f, sh.X)
             else:
-                phi = jnp.stack([f, f], axis=0)
+                f = f_op(eta, data["psi_c_X"], data["psi_v_X"], data["V_q0"])
+                f = jax.lax.with_sharding_constraint(f, sh.X)
+                fbar = fbar_op(eta, data["psi_c_X"], data["psi_v_X"], data["V_q0"])
+                fbar = jax.lax.with_sharding_constraint(fbar, sh.X)
+                phi = jnp.stack([f, -fbar], axis=0)
                 phi = jax.lax.with_sharding_constraint(phi, sh.X_full)
             seeds.append(phi)
         X_batch = jnp.stack(seeds, axis=0)
@@ -310,6 +322,7 @@ def run_pseudopoles(
         C_w = _compute_density_snapshots(
             basis,
             snapshot_op,
+            readout_full,
             sh,
             data["psi_c_Y"],
             data["psi_v_Y"],

@@ -140,44 +140,24 @@ For Lanczos, the inner matvec is called ~50-100 times, so compilation cost is am
 
 ### Warm-up
 
-The test script includes warm-up iterations to separate JIT compilation time from execution time:
-```bash
-uv run python -m isdf.bse_isdf.test_bse -i input.in --n-warmup 2 --n-bench 10
-```
+When benchmarking, run once to JIT-compile and again to time steady-state execution.
 
 ---
 
 ## Usage
 
-### Running the Test
+### Running BSE (FEAST Default)
 
 ```bash
 cd /path/to/cohsex_prod
-uv run python -m isdf.bse_isdf.test_bse -i cohsex_prod.in \
-  --n-val 4 --n-cond 4 \
-  --n-eig 10 --max-iter 50 \
-  --write-eigenvectors eigenvectors.h5
+uv run python -m isdf.bse_isdf.bse_jax -i cohsex_prod.in --n-val 4 --n-cond 4
 ```
-
-### Command-Line Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `-i, --input` | (required) | COHSEX input file (for directory context) |
-| `--n-val` | 4 | Number of valence bands |
-| `--n-cond` | 4 | Number of conduction bands |
-| `--n-eig` | 10 | Number of exciton eigenvalues |
-| `--max-iter` | 50 | Maximum Lanczos iterations |
-| `--n-warmup` | 2 | JIT warm-up iterations |
-| `--n-bench` | 10 | Benchmark iterations |
-| `--no-jit-lanczos` | False | Use Python-loop Lanczos instead of JIT |
-| `--write-eigenvectors` | None | Output HDF5 file for eigenvectors |
 
 ### Profiling
 
 Enable JAX profiler tracing:
 ```bash
-ISDF_JAX_PROFILE_DIR=./jax_traces uv run python -m isdf.bse_isdf.test_bse -i input.in
+ISDF_JAX_PROFILE_DIR=./jax_traces uv run python -m isdf.bse_isdf.bse_jax -i input.in --n-val 4 --n-cond 4
 tensorboard --logdir=./jax_traces
 ```
 
@@ -252,10 +232,9 @@ The matvec cost dominates; Lanczos overhead (reorthogonalization, tridiagonal so
 
 | File | Description |
 |------|-------------|
-| `bse_jax.py` | Core BSE matvec and Lanczos implementations |
-| `test_bse.py` | Test script with timing and profiling |
-| `write_eigenvectors.py` | HDF5 output in BerkeleyGW format |
+| `bse_jax.py` | Core BSE entry point (FEAST default) |
+| `bse_io.py` | I/O helpers (including `write_eigenvectors_stream`) |
+| `write_eigenvectors.py` | Standalone HDF5 writer (BerkeleyGW `eigenvectors.h5`) |
 | `eigenvectors.h5.spec` | Format specification for output |
 | `bse_isdf_instructions.md` | Original design notes |
 | `gpt5.2suggestion.md` | Alternative sharding proposals |
-

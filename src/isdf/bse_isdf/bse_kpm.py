@@ -303,6 +303,7 @@ def run_kpm_dos(
     use_tda: bool = True,
 ) -> dict:
     """Run KPM DOS calculation: bounds, moments, reconstruction, plot."""
+    v_couples_k = bool(not include_W)
     if use_tda:
         matvec = build_bse_ring_matvec(
             mesh_xy,
@@ -310,6 +311,7 @@ def run_kpm_dos(
             data["nky"],
             data["nkz"],
             include_W=include_W,
+            v_couples_k=v_couples_k,
         )
     else:
         matvec = build_bse_ring_matvec_full(
@@ -318,6 +320,7 @@ def run_kpm_dos(
             data["nky"],
             data["nkz"],
             include_W=include_W,
+            v_couples_k=v_couples_k,
         )
 
     data_fp32 = _build_gmres_data_fp32(data)
