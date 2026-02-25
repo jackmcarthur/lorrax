@@ -481,6 +481,7 @@ def run_feast_ritz(
     include_W: bool = True,
     use_tda: bool = True,
 ) -> dict:
+    v_couples_k = bool(not include_W)
     if use_tda:
         matvec = build_bse_ring_matvec(
             mesh_xy,
@@ -488,6 +489,7 @@ def run_feast_ritz(
             data["nky"],
             data["nkz"],
             include_W=include_W,
+            v_couples_k=v_couples_k,
         )
     else:
         matvec = build_bse_ring_matvec_full(
@@ -496,6 +498,7 @@ def run_feast_ritz(
             data["nky"],
             data["nkz"],
             include_W=include_W,
+            v_couples_k=v_couples_k,
         )
     sh = make_bse_shardings(mesh_xy)
 
@@ -736,6 +739,7 @@ def estimate_spectral_bounds_sharded(
         data["nky"],
         data["nkz"],
         include_W=include_W,
+        v_couples_k=bool(not include_W),
     )
 
     key = jax.random.PRNGKey(seed)

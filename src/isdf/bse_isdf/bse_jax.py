@@ -1,9 +1,6 @@
 """BSE JAX entry points and CLI wrappers."""
 from __future__ import annotations
 
-import sys
-
-
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -14,9 +11,6 @@ from .bse_ring_comm import (
     build_bse_ring_matvec_full,
     create_mesh_2d,
     make_bse_shardings,
-    ring_matvec_correctness_check,
-    ring_matvec_smoke_test,
-    ring_matvec_timing,
 )
 from .bse_io import _find_restart_file, _load_ring_subset
 from .bse_serial import (
@@ -50,9 +44,6 @@ __all__ = [
     "create_mesh_2d",
     "lanczos_eig_jit",
     "make_bse_shardings",
-    "ring_matvec_correctness_check",
-    "ring_matvec_smoke_test",
-    "ring_matvec_timing",
     "simple_lanczos_eig",
     "solve_bse",
     "symmetrize_W_q",
@@ -155,46 +146,6 @@ def apply_W(
     return WX / sqrt_nk
 
 
-def _main_random_demo() -> None:
-    print("Testing BSE matvec with random data...")
-
-    nk, nc, nv, nspinor, n_rmu = 8, 4, 4, 2, 32
-    nkx, nky, nkz = 2, 2, 2
-
-    key = jax.random.PRNGKey(0)
-    keys = jax.random.split(key, 7)
-
-    psi_c = jax.random.normal(keys[0], (nk, nc, nspinor, n_rmu)) + \
-            1j * jax.random.normal(keys[1], (nk, nc, nspinor, n_rmu))
-    psi_v = jax.random.normal(keys[2], (nk, nv, nspinor, n_rmu)) + \
-            1j * jax.random.normal(keys[3], (nk, nv, nspinor, n_rmu))
-
-    eps_v = jax.random.uniform(keys[4], (nk, nv), minval=-0.5, maxval=-0.1)
-    eps_c = jax.random.uniform(keys[5], (nk, nc), minval=0.1, maxval=0.5)
-
-    W_q = jax.random.normal(keys[6], (n_rmu, n_rmu, nkx, nky, nkz)) * 0.01
-    V_q0 = jnp.eye(n_rmu) * 0.05
-
-    X = jnp.ones((1, nc, nv, nk), dtype=jnp.complex128)
-    X = X / jnp.linalg.norm(X)
-
-    HX = apply_bse_hamiltonian_single_device(
-        X, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz
-    )
-    print(f"Input shape: {X.shape}, Output shape: {HX.shape}")
-    E_expect = jnp.vdot(X.flatten(), HX.flatten()).real
-    ryd2ev = 13.6056980659
-    print(f"Expectation value: {E_expect:.6f} Ry = {E_expect * ryd2ev:.4f} eV")
-
-    print("\nRunning Lanczos solver...")
-    eigenvalues, _ = solve_bse(
-        psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz,
-        n_eig=5, max_iter=30,
-    )
-    print(f"Lowest 5 eigenvalues (Ry): {eigenvalues}")
-    print(f"Lowest 5 eigenvalues (eV): {eigenvalues * ryd2ev}")
-
-
 def _preview_lanczos(
     input_file: str,
     n_val: int,
@@ -259,8 +210,6 @@ if __name__ == "__main__":
     parser.add_argument("--n-cond", type=int, default=4)
     parser.add_argument("--px", type=int, default=1)
     parser.add_argument("--py", type=int, default=1)
-    parser.add_argument("--repeat", type=int, default=5)
-    parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--n-eig", type=int, default=5)
     parser.add_argument("--feast-n-lanczos", type=int, default=10, help="Lanczos steps for FEAST bounds.")
     parser.add_argument("--feast-buffer", type=float, default=0.05, help="Emax buffer fraction for FEAST windows.")
@@ -324,37 +273,10 @@ if __name__ == "__main__":
     parser.add_argument("--kpm-emin-ev", type=float, default=None, help="Override KPM E_min (eV).")
     parser.add_argument("--kpm-emax-ev", type=float, default=None, help="Override KPM E_max (eV).")
     parser.add_argument("--kpm-plot-file", type=str, default="bse_dos_kpm.png", help="KPM DOS plot output file.")
-    parser.add_argument("--ring-test", action="store_true")
-    parser.add_argument("--ring-check", action="store_true")
-    parser.add_argument("--ring-timing", action="store_true")
-    parser.add_argument("--components", action="store_true")
-    parser.add_argument("--debug-parallelism", action="store_true")
     args, _ = parser.parse_known_args()
 
-    if args.ring_test:
-        ring_matvec_smoke_test()
-        raise SystemExit(0)
-
-    if args.ring_check:
-        if args.input is None:
-            parser.error("--ring-check requires -i/--input")
-        ring_matvec_correctness_check(
-            args.input,
-            args.n_val,
-            args.n_cond,
-            args.px,
-            args.py,
-            args.components,
-            use_nohead=args.nohead,
-        )
-        raise SystemExit(0)
-
-    if args.debug_parallelism:
-        _main_random_demo()
-        raise SystemExit(0)
-
     if args.input is None:
-        parser.error("Default run requires -i/--input (use --debug-parallelism for random data).")
+        parser.error("Default run requires -i/--input.")
 
     use_tda = args.tda
 
@@ -466,16 +388,4 @@ if __name__ == "__main__":
         write_eigs=args.write_eigs,
         max_lanczos_iter=args.max_lanczos_iter,
         include_W=not (args.rpa or not args.bse),
-    )
-
-    ring_matvec_timing(
-        args.input,
-        args.n_val,
-        args.n_cond,
-        args.px,
-        args.py,
-        args.repeat,
-        args.warmup,
-        True,
-        use_nohead=args.nohead,
     )
