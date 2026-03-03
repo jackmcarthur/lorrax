@@ -305,6 +305,7 @@ def load_bse_data_from_restart_sharded(
     mesh_xy: Optional[Mesh] = None,
     pad_bands: bool = True,
 ) -> dict:
+    """Load BSE tensors from canonical gw_jax restart state (psi_full_y/enk_full)."""
     if mesh_xy is None:
         raise ValueError("mesh_xy is required for sharded load")
 
@@ -314,10 +315,13 @@ def load_bse_data_from_restart_sharded(
             wq_dset = f["W0_qmunu"]
         else:
             wq_dset = vq_dset
-        psi_l_dset = f["psi_l"]
-        psi_r_dset = f["psi_r"]
-        enk_l = np.asarray(f["enk_l"][:])
-        enk_r = np.asarray(f["enk_r"][:])
+        if "psi_full_y" not in f or "enk_full" not in f:
+            raise ValueError(
+                f"{restart_file} is missing canonical psi_full_y/enk_full datasets. "
+                "Regenerate restart tensors with current gw_jax."
+            )
+        psi_full_dset = f["psi_full_y"]
+        enk_full = np.asarray(f["enk_full"][:])
 
         nkx, nky, nkz = vq_dset.shape[3:6]
         n_rmu = int(vq_dset.shape[6])
@@ -325,12 +329,11 @@ def load_bse_data_from_restart_sharded(
         if n_rmu != n_rnu:
             raise ValueError("Expected square μ/ν dimensions in V_qmunu")
 
-        mean_enk_l = np.mean(enk_l, axis=0)
-        mean_enk_r = np.mean(enk_r, axis=0)
-        val_mask_l = mean_enk_l < fermi_energy
-        cond_mask_r = mean_enk_r > fermi_energy
-        n_val_available = int(np.sum(val_mask_l))
-        n_cond_available = int(np.sum(cond_mask_r))
+        mean_enk_full = np.mean(enk_full, axis=0)
+        val_mask = mean_enk_full < fermi_energy
+        cond_mask = mean_enk_full > fermi_energy
+        n_val_available = int(np.sum(val_mask))
+        n_cond_available = int(np.sum(cond_mask))
         if n_val > n_val_available:
             print(f"Warning: requested {n_val} valence bands but only {n_val_available} available; using {n_val_available}")
         if n_cond > n_cond_available:
@@ -339,11 +342,11 @@ def load_bse_data_from_restart_sharded(
         n_cond = min(n_cond, n_cond_available)
         if n_val == 0 or n_cond == 0:
             raise ValueError("No valence or conduction bands found for given Fermi energy")
-        val_indices = np.argsort(np.where(val_mask_l, mean_enk_l, -np.inf))[-n_val:]
-        cond_indices = np.argsort(np.where(cond_mask_r, mean_enk_r, np.inf))[:n_cond]
+        val_indices = np.argsort(np.where(val_mask, mean_enk_full, -np.inf))[-n_val:]
+        cond_indices = np.argsort(np.where(cond_mask, mean_enk_full, np.inf))[:n_cond]
 
-        eps_v = jnp.asarray(enk_l[:, val_indices])
-        eps_c = jnp.asarray(enk_r[:, cond_indices])
+        eps_v = jnp.asarray(enk_full[:, val_indices])
+        eps_c = jnp.asarray(enk_full[:, cond_indices])
 
         _, grid_x, grid_y = _get_local_mesh_coords(mesh_xy)
         lcm_xy = math.lcm(grid_x, grid_y)
@@ -351,8 +354,8 @@ def load_bse_data_from_restart_sharded(
         mu_per_x = n_rmu_pad // grid_x
         nu_per_y = n_rmu_pad // grid_y
 
-        psi_v_X = _read_psi_mu_sharded(psi_l_dset, val_indices, mu_per_x, "x", mesh_xy, n_rmu_pad, trim=False)
-        psi_c_X = _read_psi_mu_sharded(psi_r_dset, cond_indices, mu_per_x, "x", mesh_xy, n_rmu_pad, trim=False)
+        psi_v_X = _read_psi_mu_sharded(psi_full_dset, val_indices, mu_per_x, "x", mesh_xy, n_rmu_pad, trim=False)
+        psi_c_X = _read_psi_mu_sharded(psi_full_dset, cond_indices, mu_per_x, "x", mesh_xy, n_rmu_pad, trim=False)
 
         if pad_bands:
             psi_v_X, n_val_pad = _pad_axis_to_multiple(psi_v_X, axis=1, multiple=grid_y)
@@ -395,15 +398,10 @@ def _find_restart_file(input_file: str) -> str:
     candidates = []
     candidates.extend(sorted(glob.glob(os.path.join(input_dir, "tmp", "isdf_tensors_*.h5"))))
     candidates.extend(sorted(glob.glob(os.path.join(input_dir, "isdf_tensors_*.h5"))))
-    candidates.extend([
-        os.path.join(input_dir, "tmp", "taggedarrays600.h5"),
-        os.path.join(input_dir, "tmp", "taggedarrays.h5"),
-        os.path.join(input_dir, "taggedarrays.h5"),
-    ])
     for path in candidates:
         if os.path.exists(path):
             return path
-    raise FileNotFoundError(f"Could not find restart file in {input_dir}")
+    raise FileNotFoundError(f"Could not find canonical restart file isdf_tensors_*.h5 in {input_dir}")
 
 
 def _load_ring_subset(
@@ -413,16 +411,20 @@ def _load_ring_subset(
     px: int,
     py: int,
 ) -> dict:
+    """Load a single-device BSE subset from canonical gw_jax restart state."""
     with h5py.File(restart_file, "r") as f:
         V_qmunu = jnp.asarray(f["V_qmunu"][:])
         if "W0_qmunu" in f and bool(f["W0_qmunu"].attrs.get("W0_ready", False)):
             W0_qmunu = jnp.asarray(f["W0_qmunu"][:])
         else:
             W0_qmunu = None
-        psi_l = jnp.asarray(f["psi_l"][:])
-        psi_r = jnp.asarray(f["psi_r"][:])
-        enk_l = jnp.asarray(f["enk_l"][:])
-        enk_r = jnp.asarray(f["enk_r"][:])
+        if "psi_full_y" not in f or "enk_full" not in f:
+            raise ValueError(
+                f"{restart_file} is missing canonical psi_full_y/enk_full datasets. "
+                "Regenerate restart tensors with current gw_jax."
+            )
+        psi_full = jnp.asarray(f["psi_full_y"][:])
+        enk_full = jnp.asarray(f["enk_full"][:])
 
     nkx, nky, nkz = V_qmunu.shape[3:6]
     nk = nkx * nky * nkz
@@ -430,25 +432,24 @@ def _load_ring_subset(
     lcm_xy = math.lcm(px, py)
     n_rmu_pad = ((n_rmu + lcm_xy - 1) // lcm_xy) * lcm_xy
 
-    mean_enk_l = jnp.mean(enk_l, axis=0)
-    mean_enk_r = jnp.mean(enk_r, axis=0)
-    val_mask_l = mean_enk_l < 0.0
-    cond_mask_r = mean_enk_r > 0.0
-    n_val_available = int(jnp.sum(val_mask_l))
-    n_cond_available = int(jnp.sum(cond_mask_r))
+    mean_enk_full = jnp.mean(enk_full, axis=0)
+    val_mask = mean_enk_full < 0.0
+    cond_mask = mean_enk_full > 0.0
+    n_val_available = int(jnp.sum(val_mask))
+    n_cond_available = int(jnp.sum(cond_mask))
     if n_val > n_val_available:
         print(f"Warning: requested {n_val} valence bands but only {n_val_available} available; using {n_val_available}")
     if n_cond > n_cond_available:
         print(f"Warning: requested {n_cond} conduction bands but only {n_cond_available} available; using {n_cond_available}")
     n_val = min(n_val, n_val_available)
     n_cond = min(n_cond, n_cond_available)
-    val_indices = jnp.argsort(jnp.where(val_mask_l, mean_enk_l, -jnp.inf))[-n_val:]
-    cond_indices = jnp.argsort(jnp.where(cond_mask_r, mean_enk_r, jnp.inf))[:n_cond]
+    val_indices = jnp.argsort(jnp.where(val_mask, mean_enk_full, -jnp.inf))[-n_val:]
+    cond_indices = jnp.argsort(jnp.where(cond_mask, mean_enk_full, jnp.inf))[:n_cond]
 
-    psi_v = psi_l[:, val_indices, :, :]
-    psi_c = psi_r[:, cond_indices, :, :]
-    eps_v = enk_l[:, val_indices]
-    eps_c = enk_r[:, cond_indices]
+    psi_v = psi_full[:, val_indices, :, :]
+    psi_c = psi_full[:, cond_indices, :, :]
+    eps_v = enk_full[:, val_indices]
+    eps_c = enk_full[:, cond_indices]
 
     psi_v = _pad_last_axis(psi_v, n_rmu_pad)
     psi_c = _pad_last_axis(psi_c, n_rmu_pad)

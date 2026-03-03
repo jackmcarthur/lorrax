@@ -67,10 +67,9 @@ except RuntimeError as exc:
 		_default_devices = jax.devices("cpu")
 	else:
 		raise
-mesh_bands = Mesh(np.asarray(_default_devices), ("bands",))
 from isdf.io import (
     WFNReader, EPSReader,
-    write_sigma_to_file, write_eqp_table,
+    write_sigma_to_file,
     write_restart_state_to_h5, write_w0_qmunu_to_h5,
     load_restart_state_from_h5, save_restart_state_per_proc,
     write_qp_rotations_h5, load_kin_ion_submatrix,
@@ -102,7 +101,6 @@ from isdf.mixing.acceleration import (
 )
 from isdf.common import Meta
 from isdf.common import jax_profile
-from isdf.common.gamma_matrices import gammas_sparse
 import isdf.common.timing as timing
 import h5py
 import builtins
@@ -318,7 +316,7 @@ def fit_zeta_and_compute_V_q_chunked(
 	# Output path for zeta
 	zeta_h5_path = os.path.join(output_dir, "zeta_q.h5")
 
-	print(f"\n  Chunked ISDF fitting:")
+	print("\n  Chunked ISDF fitting:")
 	print(f"    Band chunks: {band_chunk_size}")
 	print(f"    R chunks:    {chunk_r} (contiguous r-space)")
 	print(f"    Q chunks:    {q_chunk_size}")
@@ -414,7 +412,7 @@ def fit_zeta_and_compute_V_q_chunked(
 	v_q0_noG0_munu = V_qmunu_raw[0, 0, 0, :, :]  # At q=(0,0,0)
 	G0_mu_nu = g0_mu_local[0, 0, 0, :]  # ζ_μ(G=0) at q=0
 	
-	print(f"\n  V_q computed:")
+	print("\n  V_q computed:")
 	print(f"    Shape: {V_qmunu.shape}")
 	print(f"    V_q=0 trace: {jnp.trace(v_q0_noG0_munu).real:.4f}")
 	
@@ -904,8 +902,12 @@ def main(argv=None):
 			psi_lT = jax.lax.with_sharding_constraint(wf_bundle.x(s.l_slice), sh.XT_shard)
 			psi_coh = jax.lax.with_sharding_constraint(wf_bundle.y(s.coh_slice), sh.Y_shard)
 			psi_cohT = jax.lax.with_sharding_constraint(wf_bundle.x(s.coh_slice), sh.XT_shard)
-			psi_proj = jax.lax.with_sharding_constraint(psi_l, sh.X_shard)
-			psi_projT = jax.lax.with_sharding_constraint(psi_lT, sh.YT_shard)
+			psi_proj = jax.lax.with_sharding_constraint(
+				wf_bundle.x(s.l_slice).transpose(0, 3, 1, 2), sh.X_shard
+			)
+			psi_projT = jax.lax.with_sharding_constraint(
+				wf_bundle.y(s.l_slice).transpose(0, 2, 3, 1), sh.YT_shard
+			)
 		return SimpleNamespace(
 			psi_l=psi_l,
 			psi_lT=psi_lT,
@@ -970,7 +972,6 @@ def main(argv=None):
 				# S_qmunu is not currently computed in the chunked zeta pipeline.
 				S_qmunu = None
 				sigma_views = build_sigma_views_from_bundle(wf_bundle)
-				nb_sigma = int(b3 - b0)  # = nelec + ncond (sigma window size)
 			
 			# V_mu_nu is V_qmunu without q indices (for screened interaction calculation)
 			# Extract and transpose to match expected shape: (n_rmu, n_rmu, nkx, nky, nkz)
@@ -1004,7 +1005,7 @@ def main(argv=None):
 			print0("  Chunked ISDF path complete")
 		
 	elif restart and not x_only:
-		with timing.section("gw_jax.restart_load") as restart_timer:
+		with timing.section("gw_jax.restart_load"):
 			V_qmunu, S_qmunu, psi_full_x_restart, psi_full_y_restart, enk_full_restart, v_q0_noG0_munu, G0_mu_nu = load_restart_state_from_h5(
 				tensors_filename, mesh_xy, band_slices=band_slices
 			)
@@ -1015,7 +1016,7 @@ def main(argv=None):
 			sigma_views = build_sigma_views_from_bundle(wf_bundle)
 			print0("  Restart wavefunction bundle reconstructed from canonical psi_full_y.")
 	elif restart and x_only:
-		with timing.section("gw_jax.restart_load_x_only") as restart_timer:
+		with timing.section("gw_jax.restart_load_x_only"):
 			V_qmunu, S_qmunu, psi_full_x_restart, psi_full_y_restart, enk_full_restart, v_q0_noG0_munu, G0_mu_nu = load_restart_state_from_h5(
 				tensors_filename, mesh_xy, band_slices=band_slices
 			)
@@ -1028,7 +1029,7 @@ def main(argv=None):
 
 	# Optionally compute chi0 via JAX for screened interaction if requested
 	if do_screened:
-		with timing.section("gw_jax.chi0_W") as timer_chiw:
+		with timing.section("gw_jax.chi0_W"):
 			with jax_profile.trace_section("chi0_W"):
 				if wf_bundle is None:
 					raise RuntimeError("WavefunctionBundle is not initialized before chi0 evaluation")
@@ -1168,7 +1169,6 @@ def main(argv=None):
 	# Create Gij_static: (nk, nb_sigma, nb_sigma) with diagonal 0:nelec set to 1.0
 	# This is the static COHSEX Green's function (projector onto occupied states)
 	# Sized for psi_l which has bands (b0, b3) = sigma window
-	nband_full = int(b4 - b0)  # All bands from 0 to nband (for COH G_RI)
 	nb_sigma = int(b3 - b0)    # Sigma window size (for SX Green's function + projection)
 	nk = meta.nk_tot
 	

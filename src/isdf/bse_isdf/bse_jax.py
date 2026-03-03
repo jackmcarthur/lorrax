@@ -254,7 +254,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="BSE JAX entry point")
-    parser.add_argument("-i", "--input", help="COHSEX input file (for restart lookup)")
+    parser.add_argument("-i", "--input", help="COHSEX input file (for canonical isdf_tensors_*.h5 lookup)")
     parser.add_argument("--n-val", type=int, default=4)
     parser.add_argument("--n-cond", type=int, default=4)
     parser.add_argument("--px", type=int, default=1)
