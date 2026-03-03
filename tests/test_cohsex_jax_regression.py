@@ -25,7 +25,8 @@ def _gpu_available() -> bool:
 
 
 def _requested_platform() -> str:
-    platform = os.environ.get("ISDF_COHSEX_TEST_PLATFORM", "cpu").strip().lower()
+    # Default to JAX's native backend selection (typically GPU on test nodes).
+    platform = os.environ.get("ISDF_COHSEX_TEST_PLATFORM", "auto").strip().lower()
     valid = {"cpu", "gpu", "cuda", "auto"}
     if platform not in valid:
         raise ValueError(

@@ -647,6 +647,14 @@ def compute_L_q_from_CCT(
     
     Pr = mesh_xy.shape['x']
     Pc = mesh_xy.shape['y']
+
+    # On 1x1 meshes, JAX 0.9 can fail in the shard_map+scan blocked kernel with:
+    # "scan body function carry input and carry output must have equal types ...
+    # varying manual axes do not match". Use dense batched Cholesky in this case.
+    if mesh_xy.devices.size == 1 or (Pr == 1 and Pc == 1):
+        L_q_dense = jnp.linalg.cholesky(C_q)
+        L_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+        return jax.lax.with_sharding_constraint(L_q_dense, L_shard)
     
     if block_size is None:
         block_size, J = compute_block_size_for_2d_cholesky(n_rmu, Pr, Pc)
@@ -1134,6 +1142,13 @@ def fit_zeta_chunked_to_h5(
                     # Gather the sharded array from all processes to process 0
                     zeta_gathered = jax.experimental.multihost_utils.process_allgather(zeta_chunk, tiled=False)
                     zeta_cpu = np.asarray(zeta_gathered)  # (nq, n_rmu, n_rchunk) on CPU
+                    # Some JAX versions return an extra leading host axis.
+                    if zeta_cpu.ndim == 4 and zeta_cpu.shape[0] == 1:
+                        zeta_cpu = zeta_cpu[0]
+                    if zeta_cpu.shape[0] != nq:
+                        raise RuntimeError(
+                            f"Unexpected gathered zeta shape {zeta_cpu.shape}; expected leading nq={nq}"
+                        )
                     
                     # Queue the write with r-range (r-chunks are contiguous!)
                     write_queue.put((zeta_cpu, r_start, r_end, chunk_idx))

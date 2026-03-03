@@ -814,12 +814,19 @@ def fit_zeta_and_compute_V_q_chunked(
 	# Step 1: Fit zeta and write to HDF5
 	with timing.section("cohsex_jax.zeta_fit_chunked"):
 		psi_l_rmu_Y, psi_l_rmuT_X, psi_r_rmu_Y, psi_r_rmuT_X = fit_zeta_chunked_to_h5(
-			wfn, sym, meta, centroid_indices, mesh_xy,
-			zeta_h5_path, band_chunk_size, q_chunk_size, bispinor,
+			wfn=wfn,
+			sym=sym,
+			meta=meta,
+			centroid_indices=centroid_indices,
+			mesh_xy=mesh_xy,
+			chunk_r=chunk_r,
+			output_file=zeta_h5_path,
+			band_chunk_size=band_chunk_size,
+			q_chunk_size=q_chunk_size,
+			bispinor=bispinor,
 			use_gspace_cache=use_gspace_cache,
 			band_range_left=band_range_left,
 			band_range_right=band_range_right,
-			chunk_r=chunk_r,
 		)
 	
 	# Step 2: Compute V_qmunu from zeta
@@ -867,6 +874,8 @@ def fit_zeta_and_compute_V_q_chunked(
 	# g0_mu_all shape: (nqx, nqy, nqz, n_rmu)
 	# g0_mu_all may be sharded across processes; gather before numpy conversion
 	g0_mu_local = jax.experimental.multihost_utils.process_allgather(g0_mu_all)
+	if g0_mu_local.ndim == 5 and g0_mu_local.shape[0] == 1:
+		g0_mu_local = g0_mu_local[0]
 	if jax.process_index() == 0:
 		with h5py.File(zeta_h5_path, 'a') as f:
 			g0_np = np.asarray(g0_mu_local)
