@@ -120,7 +120,7 @@ def read_cohsex_input(filename: str) -> dict:
     We locate the [cohsex] section, strip any embedded K_POINTS {crystal_b}
     block before feeding to ConfigParser, and fall back to sensible defaults
     if the section is missing. This mirrors the robust parser used in
-    `isdf.gw_isdf.cohsex_jax.read_cohsex_input`.
+    `gw_isdf.gw_jax.read_cohsex_input`.
     """
     with open(filename, 'r') as f:
         lines = f.readlines()

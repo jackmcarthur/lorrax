@@ -25,15 +25,15 @@ Generate locally (no server):
 
 ```bash
 uv add pdoc  # once per environment
-uv run -- bash scripts/gen_api_docs.sh
+uv run -- bash docs/gen_api_docs.sh
 ```
 
 Then browse the `.md` files in `docs/api/` in your editor or on GitHub.
 
 ### Key modules
 
-- `src/isdf/gw_isdf/cohsex_jax.py`: COHSEX driver (JAX, sharded)
-- `src/isdf/gw_isdf/w_isdf.py`: static screening and chi0 helpers
+- `src/gw_isdf/gw_jax.py`: COHSEX driver (JAX, sharded)
+- `src/gw_isdf/w_isdf.py`: static screening and chi0 helpers
 - `src/isdf/isdf_init/kmeans_isdf.py`: centroid selection
 - `src/isdf/common/wfnreader.py`: wavefunction I/O
 
@@ -45,14 +45,9 @@ Then browse the `.md` files in `docs/api/` in your editor or on GitHub.
 
 See the root README for full instructions.
 
-### Root scripts for quick runs
+### Quick runs
 
-- Debug (fast, <10s, uses `tests/cohsex_debug`):
-  - `python run_cohsex_jax_debug.py` → JAX pipeline
-  - `python run_cohsex_isdf_debug.py` → legacy ISDF pipeline
-- Prod (minutes on a laptop, uses `tests/cohsex_prod`):
-  - `python run_cohsex_jax_prod.py`
-  - `python run_cohsex_isdf_prod.py`
-
-Pass `--input <file>` to override the default test inputs.
-
+- Regression fixture:
+  - `python -m gw_isdf.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in`
+- Console entry point:
+  - `gw_jax -i tests/regression/cohsex_debug/cohsex_test.in`

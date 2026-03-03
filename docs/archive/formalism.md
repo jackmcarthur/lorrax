@@ -51,7 +51,7 @@ then project back to band space Sigma_kij by contracting with psi. Screened exch
 - Wavefunction FFTs are performed once per window, then reduced to psi(r_mu)
 - q-loops materialize only the minimal data needed (zeta for one q at a time)
 
-For implementation details, see `src/isdf/gw_isdf/cohsex_jax.py` and `src/isdf/gw_isdf/w_isdf.py`.
+For implementation details, see `src/gw_isdf/gw_jax.py` and `src/gw_isdf/w_isdf.py`.
 
 
 

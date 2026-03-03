@@ -19,12 +19,12 @@ the time-dependent COHSEX method for nonequilibrium simulations. The code is hea
 
 The package requires as input the BerkeleyGW format wavefunction files `WFN.h5` and `WFNq.h5`. It is currently only compatible with full-spinor wavefunctions, but it can be used with wavefunction k-grids that are reduced by symmetry using `kgrid.x`, in which case it will make use of a symmetry-reduced q-grid in self-energy matrix element calculations.
 
-The main drivers are located in `src/isdf/`:
-- **GW/COHSEX**: `gw_isdf/cohsex_jax.py` (main driver), `w_isdf.py` (screened interaction)
+The main drivers are located in `src/`:
+- **GW/COHSEX**: `gw_isdf/gw_jax.py` (main driver), `w_isdf.py` (screened interaction)
 - **ISDF initialization**: `isdf_init/kmeans_isdf.py` (k-means clustering for interpolation points)
 - **Wavefunction loading**: `common/load_wfns.py` (FFT transforms, CCT/ZCT fitting)
 
-Available as console commands: `cohsex_isdf`, `kmeans_isdf`, `bse_isdf`.
+Available as console commands: `gw_jax`, `cohsex_isdf` (compatibility alias), `kmeans_isdf`, `bse_isdf`.
 
 ## Documentation Guide
 
@@ -78,8 +78,8 @@ Available as console commands: `cohsex_isdf`, `kmeans_isdf`, `bse_isdf`.
 | **Understanding code structure** | `docs/CODEBASE_COMPREHENSIVE.md` |
 | **Working on zeta fitting** | `docs/PHYSICS_COMPREHENSIVE.md` §4-5, `docs/CODEBASE_COMPREHENSIVE.md` §6, `src/isdf/common/load_wfns.py` |
 | **Debugging memory issues** | `docs/MEMORY_MODEL.md`, `docs/CHUNK_BUDGETS.md` |
-| **Modifying GW self-energy** | `docs/PHYSICS_COMPREHENSIVE.md` §6, `src/isdf/gw_isdf/cohsex_jax.py` |
-| **χ⁰ or W calculations** | `docs/chi_omega_quadrature.md`, `src/isdf/gw_isdf/w_isdf.py` |
+| **Modifying GW self-energy** | `docs/PHYSICS_COMPREHENSIVE.md` §6, `src/gw_isdf/gw_jax.py` |
+| **χ⁰ or W calculations** | `docs/chi_omega_quadrature.md`, `src/gw_isdf/w_isdf.py` |
 | **K-means clustering** | `docs/PHYSICS_COMPREHENSIVE.md` §1.2, `src/isdf/isdf_init/kmeans_isdf.py` |
 | **JAX sharding/chunking** | `docs/PHYSICS_COMPREHENSIVE.md` §5,§7, `src/isdf/common/load_wfns.py` |
 | **Multi-GPU/cluster setup** | `docs/ENVIRONMENT_COMPREHENSIVE.md` §4-5, `docs/advanced/jax_multihost.md` |
@@ -104,7 +104,7 @@ The JAX setup uses only the standard CPU backend.
 To install the Python dependencies use uv/Docker setup.
 
 ### Perlmutter (Shifter) quickstart
-If you're running on NERSC Perlmutter with Shifter, see [`cluster_shifter/README_CLUSTER.md`](cluster_shifter/README_CLUSTER.md) for batch and interactive workflows. The setup uses the NVIDIA JAX container—no venv or extra setup needed.
+If you're running on NERSC Perlmutter with Shifter, see [`cluster_setup/README_CLUSTER.md`](cluster_setup/README_CLUSTER.md) for batch and interactive workflows. The setup uses the NVIDIA JAX container—no venv or extra setup needed.
 
 
 ### Local uv usage
@@ -115,16 +115,17 @@ uv sync --no-install-project --locked
 ```
 Run the code with:
 ```bash
-uv run python cohsex_isdf.py
+uv run python -m gw_isdf.gw_jax -i cohsex.in
 ```
 The provided `Dockerfile` mirrors these steps. If a GPU is available and cupy usage is desired, you can use `uv sync --locked --extra gpu`. *This is not available to LLMs and we will be phasing out cupy for JAX, which is more flexible.*
 
 
 ## Layout
 
-- `src/isdf/` – Python package with all driver routines and utilities.
+- `src/` – Python package roots.
+  - `gw_isdf/` – GW/COHSEX calculations (`gw_jax.py`, `gw_init.py`, `w_isdf.py`, `get_windows.py`).
+- `src/isdf/` – Core ISDF/BSE/IO libraries.
   - `isdf_init/` – k-means point generation and charge density tools.
-  - `gw_isdf/` – GW/COHSEX calculations (`cohsex_jax.py`, `w_isdf.py`, `get_windows.py`).
   - `bse_isdf/` – Bethe-Salpeter driver and notes.
   - `common/` – shared helpers: wavefunction readers (`load_wfns.py`), symmetry maps, FFT/NUFFT wrappers, tagged arrays.
   - `io/` – HDF5 I/O for wavefunctions, centroids, self-energy output.
@@ -139,9 +140,7 @@ The provided `Dockerfile` mirrors these steps. If a GPU is available and cupy us
 - `examples/` – runnable directories for test and production COHSEX setups.
 - `tests/` – small regression tests.
 - `misc/` – larger data files and archived scripts.
-- `cohsex_isdf.py` – wrapper that launches the test example when run directly.
-
-The main drivers are also available as console commands (`cohsex_isdf`, `kmeans_isdf`, `bse_isdf`) once the package is installed.
+The main drivers are available as console commands (`gw_jax`, `cohsex_isdf`, `kmeans_isdf`, `bse_isdf`) once the package is installed.
 
 ## Quick start
 
@@ -159,17 +158,17 @@ export JAX_COMPILATION_CACHE_DIR="$HOME/.cache/jax/isdf_cohsex"
 export JAX_ENABLE_COMPILATION_CACHE=1
 export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0
 export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=0
-uv run -- python -m pytest -q tests/test_cohsex_jax_regression.py -m regression
+uv run -- python -m pytest -q tests/test_gw_jax_regression.py -m regression
 ```
 
 Notes:
 - Regression fixture files live in `tests/regression/cohsex_debug/`.
-- The test runs `python -m isdf.gw_isdf.cohsex_jax -i cohsex_test.in` and compares `eqp_test.dat` to `eqp_ref.dat`.
-- By default the regression runs on CPU for portability (`ISDF_COHSEX_TEST_PLATFORM=cpu`).
-- To request GPU execution, set `ISDF_COHSEX_TEST_PLATFORM=gpu` before running pytest.
+- The test runs `python -m gw_isdf.gw_jax -i cohsex_test.in` and compares `eqp_test.dat` to `eqp_ref.dat`.
+- By default the regression uses JAX auto-selection (`ISDF_COHSEX_TEST_PLATFORM=auto`), which will pick GPU on your test nodes.
+- To force CPU or GPU explicitly, set `ISDF_COHSEX_TEST_PLATFORM=cpu` or `ISDF_COHSEX_TEST_PLATFORM=gpu`.
 
 Run the sample COHSEX calculation:
 
 ```bash
-uv run python cohsex_isdf.py
+uv run gw_jax -i tests/regression/cohsex_debug/cohsex_test.in
 ```

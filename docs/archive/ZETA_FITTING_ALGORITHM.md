@@ -225,4 +225,4 @@ The algorithm was designed around these memory constraints:
 - `load_wfns.py` — Core implementation
 - `cholesky_2d.py` — 2D blocked Cholesky
 - `test_chunked_wfn_loading.py` — Validation tests
-- `cohsex_init.py` — Input parsing and chunk size calculation
+- `gw_init.py` — Input parsing and chunk size calculation

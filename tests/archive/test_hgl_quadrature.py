@@ -13,7 +13,7 @@ sys.path.insert(0, '/home/jackm/projects/isdf_cohsex/src')
 
 def test_hgl_nodes_weights_basic():
     """Test that hgl_nodes_weights returns correct shapes and positive weights."""
-    from isdf.gw_isdf.hgl_quadrature import hgl_nodes_weights
+    from gw_isdf.hgl_quadrature import hgl_nodes_weights
     
     print("\nTest: hgl_nodes_weights basic properties")
     all_pass = True
@@ -41,7 +41,7 @@ def test_hgl_nodes_weights_basic():
 
 def test_hgl_nodes_weights_sum():
     """Test that weights sum to μ_0 = ∫ exp(-τ - τ²/2) dτ."""
-    from isdf.gw_isdf.hgl_quadrature import hgl_nodes_weights
+    from gw_isdf.hgl_quadrature import hgl_nodes_weights
     
     print("\nTest: HGL weights sum to μ_0")
     
@@ -65,7 +65,7 @@ def test_hgl_nodes_weights_sum():
 
 def test_hgl_regularization_function():
     """Test that HGL quadrature approximates F(x) = ∫ sin(xτ) exp(-τ - τ²/2) dτ."""
-    from isdf.gw_isdf.hgl_quadrature import hgl_nodes_weights
+    from gw_isdf.hgl_quadrature import hgl_nodes_weights
     
     print("\nTest: HGL approximates regularization function F(x)")
     
@@ -94,7 +94,7 @@ def test_hgl_regularization_function():
 
 def test_n_tau_hgl_formula():
     """Test that n_tau_hgl returns reasonable values."""
-    from isdf.gw_isdf.hgl_quadrature import n_tau_hgl
+    from gw_isdf.hgl_quadrature import n_tau_hgl
     
     print("\nTest: n_tau_hgl formula")
     
@@ -130,7 +130,7 @@ def test_n_tau_hgl_formula():
 
 def test_window_pair_hgl_fields():
     """Test that WindowPair has HGL fields initialized to None."""
-    from isdf.gw_isdf.get_windows import WindowPair, WindowInfo
+    from gw_isdf.get_windows import WindowPair, WindowInfo
     
     print("\nTest: WindowPair HGL fields initialized correctly")
     
@@ -160,7 +160,7 @@ def test_window_pair_hgl_fields():
 
 def test_window_pair_init_hgl():
     """Test that init_hgl_quadrature populates HGL fields correctly."""
-    from isdf.gw_isdf.get_windows import WindowPair, WindowInfo
+    from gw_isdf.get_windows import WindowPair, WindowInfo
     
     print("\nTest: WindowPair.init_hgl_quadrature()")
     
@@ -202,7 +202,7 @@ def test_window_pair_init_hgl():
 
 def test_window_pair_gamma_equals_z_lm():
     """Verify that gamma for HGL should equal z_lm from GL."""
-    from isdf.gw_isdf.get_windows import WindowPair, WindowInfo
+    from gw_isdf.get_windows import WindowPair, WindowInfo
     
     print("\nTest: gamma = z_lm consistency")
     
@@ -229,7 +229,7 @@ def test_window_pair_gamma_equals_z_lm():
 
 def test_classify_frequencies():
     """Test classify_frequencies correctly partitions ω values."""
-    from isdf.gw_isdf.get_windows import WindowPair, WindowInfo
+    from gw_isdf.get_windows import WindowPair, WindowInfo
     
     print("\nTest: classify_frequencies")
     

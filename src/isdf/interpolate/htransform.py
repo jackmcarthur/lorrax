@@ -523,7 +523,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     log = _make_logger(args.verbose)
 
-    from ..gw_isdf.cohsex_jax import read_cohsex_input
+    from gw_isdf.gw_jax import read_cohsex_input
     params = read_cohsex_input(args.input)
     
     # Override WFN file if provided via CLI

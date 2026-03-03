@@ -10,7 +10,7 @@
 
 **Problem**: Two massive files with too many responsibilities
 - `src/isdf/common/load_wfns.py`: 2796 lines, 39 functions
-- `src/isdf/gw_isdf/cohsex_jax.py`: 2389 lines, 30 functions
+- `src/gw_isdf/gw_jax.py`: 2389 lines, 30 functions
 
 #### Suggested: Split `load_wfns.py` into module package
 
@@ -31,11 +31,11 @@ src/isdf/common/wfn_loading/
 - Easier testing and maintenance
 - Agents can read only relevant modules
 
-#### Suggested: Extract sub-modules from `cohsex_jax.py`
+#### Suggested: Extract sub-modules from `gw_jax.py`
 
 ```
-src/isdf/gw_isdf/
-├── cohsex_jax.py       # Main driver only (~500 lines)
+src/gw_isdf/
+├── gw_jax.py       # Main driver only (~500 lines)
 ├── sigma_compute.py    # get_sigma_static_*, project_potential_to_bands
 ├── qpoint_iteration.py # iter_qpoint_data, build_q_coulomb_cache
 └── preprocessing.py    # preprocess_q_loops
@@ -52,7 +52,7 @@ src/isdf/gw_isdf/
 
 ### Environment Variable Management
 
-**Current issue** (cohsex_jax.py lines 3-13): Module-level side effects
+**Current issue** (gw_jax.py lines 3-13): Module-level side effects
 
 ```python
 # ❌ BAD: Side effects at module import
@@ -74,7 +74,7 @@ def configure_jax_environment(enable_x64=True, platforms="cuda,cpu", ...):
 
 ### Global State Reduction
 
-**Current issue** (cohsex_jax.py line 72): Global mesh makes testing harder
+**Current issue** (gw_jax.py line 72): Global mesh makes testing harder
 
 ```python
 # ❌ BAD: Global mesh
@@ -284,7 +284,7 @@ def compute_CCT(P_k: jax.Array) -> jax.Array:
 
 **Phase 3: Major Refactoring** (~1-2 weeks)
 - Split load_wfns.py into package
-- Refactor cohsex_jax.py sub-modules
+- Refactor gw_jax.py sub-modules
 - Remove global state
 - Add comprehensive test suite
 

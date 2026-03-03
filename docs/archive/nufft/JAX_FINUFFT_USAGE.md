@@ -15,8 +15,8 @@ Added NUFFT support for different k-grid / q-grid dimensions in ISDF fitting:
 Files modified:
 - `src/isdf/common/meta.py` - qgrid/use_nufft properties
 - `src/isdf/common/load_wfns.py` - NUFFT in compute_CCT/ZCT functions
-- `src/isdf/gw_isdf/cohsex_init.py` - q_grid parameter parsing
-- `src/isdf/gw_isdf/cohsex_jax.py` - Meta initialization with q_grid
+- `src/gw_isdf/gw_init.py` - q_grid parameter parsing
+- `src/gw_isdf/gw_jax.py` - Meta initialization with q_grid
 
 ## CUDA 13.0 Build Issues
 
@@ -103,7 +103,7 @@ uv run python test_nufft_speed.py
 
 Full run (not recommended CPU-only):
 ```bash
-uv run python -m isdf.gw_isdf.cohsex_jax -i test_nufft_2x2x1.in
+uv run python -m gw_isdf.gw_jax -i test_nufft_2x2x1.in
 ```
 
 ## Recommendation

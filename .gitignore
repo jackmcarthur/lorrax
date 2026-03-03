@@ -3,6 +3,12 @@
 venv/
 isdfenv/
 native_env/
+.claude/
+
+# local test/build caches
+.pytest_cache/
+.pytest_jax_cache/
+.uv-cache/
 
 # uv caches (if ever created locally)
 uv_cache/
@@ -47,3 +53,11 @@ cluster_shifter/config
 
 # locally generated job scripts
 *.run
+
+# jit cache artifacts
+jit_*
+
+# local artifacts that should not be committed
+*.log
+*.bak
+*.deb

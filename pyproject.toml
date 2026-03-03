@@ -21,7 +21,8 @@ dependencies = [
 ]
 
 [project.scripts]
-cohsex_isdf = "isdf.gw_isdf.cohsex_isdf:main"
+gw_jax = "gw_isdf.gw_jax:main"
+cohsex_isdf = "gw_isdf.gw_jax:main"
 kmeans_isdf = "isdf.isdf_init.kmeans_isdf:main"
 bse_isdf = "isdf.bse_isdf.bse_isdf:main"
 load_psp = "isdf.psp.load_psp:main"
@@ -37,6 +38,7 @@ members = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+norecursedirs = ["archive"]
 markers = [
     "regression: end-to-end physics regression tests with reference files",
     "gpu: tests that require a CUDA-capable JAX backend",

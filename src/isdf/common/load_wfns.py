@@ -416,9 +416,9 @@ _compute_pair_density_cache = {}
 
 
 # ============================================================================
-# Spin-traced pair density (matching cohsex_jax treatment)
+# Spin-traced pair density (matching gw_jax treatment)
 # ============================================================================
-# cohsex_jax traces over spin for ISDF fitting:
+# gw_jax traces over spin for ISDF fitting:
 #   P_k(μ,ν) = Σ_{n,s} ψ*_{n,k,s}(r_μ) × ψ_{n,k,s}(r_ν)
 # This reduces lstsq error by fitting a lower-rank object.
 
@@ -430,7 +430,7 @@ def compute_pair_density_spin_traced(
 	"""
 	Compute spin-traced pair density P_k(μ,ν) = Σ_{n,s} ψ*_{n,k,s}(μ) ψ_{n,k,s}(ν).
 	
-	This matches cohsex_jax spin treatment for ISDF fitting.
+	This matches gw_jax spin treatment for ISDF fitting.
 	
 	Input shapes and shardings:
 		psi_rmuT_X: (nk, n_rmu, nb, ns) with P(None, 'x', None, None)
@@ -474,9 +474,9 @@ _isdf_pipeline_cache = {}
 
 
 # ============================================================================
-# Left/Right CCT and ZCT (matching cohsex_jax physics)
+# Left/Right CCT and ZCT (matching gw_jax physics)
 # ============================================================================
-# cohsex_jax uses separate left and right wavefunctions:
+# gw_jax uses separate left and right wavefunctions:
 #   - Left:  bands 0 to b3 (all occupied + sigma conduction)
 #   - Right: bands 0 to b4 (all occupied + all conduction up to nband)
 #
@@ -496,7 +496,7 @@ def compute_CCT_from_left_right(
 	
 	C_q(μ,ν) = FFT[ conj(IFFT(P_l)) ⊙ IFFT(P_r) ]
 	
-	This matches cohsex_jax physics where left and right have different band ranges.
+	This matches gw_jax physics where left and right have different band ranges.
 	
 	Args:
 		P_l_k: (nk, n_rmu, n_rmu) left pair density, P(None, 'x', 'y')
@@ -532,7 +532,7 @@ def compute_CCT_from_left_right(
 			# Use norm='forward' for BOTH IFFT and FFT to match direct k-sum.
 			# With forward: IFFT is unscaled (sum), FFT divides by N.
 			# Convolution theorem: C_q = FFT(IFFT(A)* ⊙ IFFT(B))
-			# This gives C_q = Σ_k A*_k B_{k+q} (matches cohsex_jax direct sum)
+			# This gives C_q = Σ_k A*_k B_{k+q} (matches gw_jax direct sum)
 			P_l_kt = P_l_3d.transpose(3, 4, 0, 1, 2)
 			P_r_kt = P_r_3d.transpose(3, 4, 0, 1, 2)
 			P_l_Rt = sharded_ifftn(P_l_kt)
@@ -595,7 +595,7 @@ def compute_ZCT_from_left_right_zchunk(
 			
 			# Use norm='forward' for BOTH IFFT and FFT to match direct k-sum.
 			# With forward: IFFT is unscaled (sum), FFT divides by N.
-			# This gives Z_q = Σ_k P_l*_k P_r_{k+q} (matches cohsex_jax)
+			# This gives Z_q = Σ_k P_l*_k P_r_{k+q} (matches gw_jax)
 			P_l_kt = P_l_3d.transpose(3, 4, 0, 1, 2)
 			P_r_kt = P_r_3d.transpose(3, 4, 0, 1, 2)
 			P_l_Rt = sharded_ifftn(P_l_kt)
@@ -873,7 +873,7 @@ def fit_zeta_chunked_to_h5(
     num_chunks = (n_rtot + chunk_r - 1) // chunk_r
     n_rchunk = chunk_r
     
-    # Band ranges for left and right wavefunctions (cohsex_jax convention)
+    # Band ranges for left and right wavefunctions (gw_jax convention)
     # Left:  (b0, b3) = all occupied + sigma conduction
     # Right: (b0, b4) = all occupied + all conduction up to nband
     if band_range_left is None:
@@ -930,7 +930,7 @@ def fit_zeta_chunked_to_h5(
         print(f"  Right wfns: {psi_r_rmu_Y.shape}")
     
     # ========== STEP 2: Compute CCT (C_q) from left/right pair densities ==========
-    # Uses spin-traced pair density matching cohsex_jax physics
+    # Uses spin-traced pair density matching gw_jax physics
     with timing.section("zeta_fit.CCT"):
         print("\nComputing spin-traced pair densities P_l and P_r...")
         P_l_k = compute_pair_density_spin_traced(psi_l_rmuT_X, psi_l_rmu_Y, mesh_xy)

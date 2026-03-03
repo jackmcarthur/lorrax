@@ -20,57 +20,57 @@
 ## 1. Module Structure
 
 ```
-src/isdf/
-├── isdf_init/          # ISDF initialization & k-means clustering
-│   ├── kmeans_isdf.py  # K-means centroid selection (entry point)
-│   └── get_charge_density.py  # Charge density computation
-│
+src/
 ├── gw_isdf/            # GW/COHSEX calculations
-│   ├── cohsex_jax.py   # Main GW driver (entry point)
-│   ├── cohsex_init.py  # Input parsing, chunking strategy
+│   ├── gw_jax.py       # Main GW driver (entry point)
+│   ├── gw_init.py      # Input parsing, chunking strategy
 │   ├── w_isdf.py       # Screened interaction W(iω) via CTSP
+│   ├── w_isdf_dynamic.py# Dynamic W(ω) path
 │   ├── get_windows.py  # Energy window functions
 │   ├── vcoul.py        # Coulomb interaction utilities
-│   └── compute_vcoul.py  # V_q computation from zeta
+│   └── compute_vcoul.py# V_q computation from zeta
 │
-├── bse_isdf/           # Bethe-Salpeter equation (BSE)
-│   ├── bse_isdf.py     # BSE driver (entry point)
-│   └── bse_jax.py      # BSE kernel computation
-│
-├── common/             # Shared utilities & core algorithms
-│   ├── meta.py         # Meta dataclass (system parameters)
-│   ├── load_wfns.py    # Wavefunction loading, FFT, CCT/ZCT fitting [2796 lines]
-│   ├── symmetry_maps.py  # k-point symmetry operations
-│   ├── chi_from_dipole.py  # Dipole-based susceptibility
-│   ├── gamma_matrices.py  # Pauli matrices for spinors
-│   ├── timing.py       # Performance timing utilities
-│   ├── jax_profile.py  # JAX profiling context managers
-│   ├── wfnreader.py    # (DEPRECATED - use io/wfnreader.py)
-│   └── epsreader.py    # (DEPRECATED - use io/epsreader.py)
-│
-├── io/                 # Input/output operations
-│   ├── wfnreader.py    # WFNReader class (HDF5 wavefunction I/O)
-│   ├── epsreader.py    # EPSReader class (dielectric matrix I/O)
-│   ├── centroids.py    # Centroid file I/O
-│   ├── sigma_output.py # Self-energy output (eqp, sigma files)
-│   ├── qp_wfn.py       # Quasiparticle wavefunction I/O
-│   ├── tagged_arrays.py  # HDF5 array I/O with metadata
-│   ├── kin_ion.py      # Kinetic/ionic Hamiltonian I/O
-│   └── paths.py        # Path resolution utilities
-│
-├── mixing/             # Self-consistent GW mixing/acceleration
-│   └── acceleration.py # Anderson mixing, fixed-point acceleration
-│
-├── postprocess/        # Post-processing utilities
-│   └── rotate_wfn_to_qp.py  # Rotate wavefunctions to QP basis
-│
-├── interpolate/        # Hamiltonian interpolation (experimental)
-│   └── htransform.py   # H-matrix interpolation
-│
-└── psp/                # Pseudopotential parsing (UPF, BerkeleyGW)
-    ├── load_psp.py     # BerkeleyGW pseudopotential loader
-    ├── load_upf.py     # UPF pseudopotential parser (entry point)
-    └── upf_model_2_0_1/  # UPF XML schema models (xsdata)
+└── isdf/
+    ├── isdf_init/          # ISDF initialization & k-means clustering
+    │   ├── kmeans_isdf.py  # K-means centroid selection (entry point)
+    │   └── get_charge_density.py  # Charge density computation
+    │
+    ├── bse_isdf/           # Bethe-Salpeter equation (BSE)
+    │   ├── bse_isdf.py     # BSE driver (entry point)
+    │   └── bse_kpm.py      # BSE kernel computation
+    │
+    ├── common/             # Shared utilities & core algorithms
+    │   ├── meta.py         # Meta dataclass (system parameters)
+    │   ├── load_wfns.py    # Wavefunction loading, FFT, CCT/ZCT fitting
+    │   ├── symmetry_maps.py  # k-point symmetry operations
+    │   ├── chi_from_dipole.py  # Dipole-based susceptibility
+    │   ├── gamma_matrices.py  # Pauli matrices for spinors
+    │   ├── timing.py       # Performance timing utilities
+    │   └── jax_profile.py  # JAX profiling context managers
+    │
+    ├── io/                 # Input/output operations
+    │   ├── wfnreader.py    # WFNReader class (HDF5 wavefunction I/O)
+    │   ├── epsreader.py    # EPSReader class (dielectric matrix I/O)
+    │   ├── centroids.py    # Centroid file I/O
+    │   ├── sigma_output.py # Self-energy output (eqp, sigma files)
+    │   ├── qp_wfn.py       # Quasiparticle wavefunction I/O
+    │   ├── tagged_arrays.py  # HDF5 array I/O with metadata
+    │   ├── kin_ion.py      # Kinetic/ionic Hamiltonian I/O
+    │   └── paths.py        # Path resolution utilities
+    │
+    ├── mixing/             # Self-consistent GW mixing/acceleration
+    │   └── acceleration.py # Anderson mixing, fixed-point acceleration
+    │
+    ├── postprocess/        # Post-processing utilities
+    │   └── rotate_wfn_to_qp.py  # Rotate wavefunctions to QP basis
+    │
+    ├── interpolate/        # Hamiltonian interpolation (experimental)
+    │   └── htransform.py   # H-matrix interpolation
+    │
+    └── psp/                # Pseudopotential parsing (UPF, BerkeleyGW)
+        ├── load_psp.py     # BerkeleyGW pseudopotential loader
+        ├── load_upf.py     # UPF pseudopotential parser (entry point)
+        └── upf_model_2_0_1/  # UPF XML schema models (xsdata)
 ```
 
 ### Module Responsibilities
@@ -283,7 +283,7 @@ INPUT FILES
                       │
                       ↓
 ┌───────────────────────────────────────────────────────────┐
-│ STAGE 3: Green's Function & Susceptibility (cohsex_jax.py)│
+│ STAGE 3: Green's Function & Susceptibility (gw_jax.py)│
 │ ────────────────────────────────────────────────────────  │
 │   1. Construct G_R^occ(μ,ν), G_R^all(μ,ν) in R-space     │
 │   2. Compute χ⁰_R(μ,ν,iω) via CTSP quadrature (w_isdf.py)│
@@ -296,7 +296,7 @@ INPUT FILES
                       │
                       ↓
 ┌───────────────────────────────────────────────────────────┐
-│ STAGE 4: Self-Energy (cohsex_jax.py)                      │
+│ STAGE 4: Self-Energy (gw_jax.py)                      │
 │ ────────────────────────────────────────────────────────  │
 │   1. Exchange: Σ^X_R(μ,ν) = -G^occ_R(μ,ν) ∘ W_R(μ,ν)     │
 │   2. COHSEX:   Σ^C_R(μ,ν) = G^all_R(μ,ν) ∘ [W_R - V_R]   │
@@ -437,7 +437,8 @@ sigma_k.h5
 
 ```toml
 [project.scripts]
-cohsex_isdf = "isdf.gw_isdf.cohsex_isdf:main"
+gw_jax = "gw_isdf.gw_jax:main"
+cohsex_isdf = "gw_isdf.gw_jax:main"
 kmeans_isdf = "isdf.isdf_init.kmeans_isdf:main"
 bse_isdf = "isdf.bse_isdf.bse_isdf:main"
 load_psp = "isdf.psp.load_psp:main"
@@ -453,9 +454,9 @@ kmeans_isdf --wfn WFN.h5 --n-centroids 100 --output centroids.h5
 
 #### GW/COHSEX Calculation
 ```bash
-cohsex_isdf --input cohsex.in
+gw_jax --input cohsex.in
 # or equivalently:
-python -m isdf.gw_isdf.cohsex_jax --input cohsex.in
+python -m gw_isdf.gw_jax --input cohsex.in
 ```
 
 #### BSE Calculation (experimental)
@@ -470,7 +471,7 @@ bse_isdf --input bse.in
 ### 6.1 ISDF Fitting Call Stack
 
 ```
-cohsex_jax.main()
+gw_jax.main()
   └─→ fit_zeta_chunked_to_h5()                    [load_wfns.py:1720]
        ├─→ get_sharded_wfns()                     [load_wfns.py:1520]
        │    └─→ read_Gvecs_to_devices()           [load_wfns.py:450]
@@ -479,24 +480,24 @@ cohsex_jax.main()
        │    └─→ (NUFFT or FFT k→R, R→q)
        ├─→ blocked_cholesky_2d()                  [load_wfns.py:1200]
        └─→ compute_ZCT_from_left_right()          [load_wfns.py:950]
-            └─→ solve_zeta_cholesky()             [cohsex_jax.py:172]
+            └─→ solve_zeta_cholesky()             [gw_jax.py:172]
 ```
 
 ### 6.2 Self-Energy Call Stack
 
 ```
-cohsex_jax.main()
-  └─→ compute_sigma_pipeline_jax()                [cohsex_jax.py:1064]
-       ├─→ get_zeta_q_and_v_q_mu_nu()            [cohsex_jax.py:524]
+gw_jax.main()
+  └─→ compute_sigma_pipeline_jax()                [gw_jax.py:1064]
+       ├─→ get_zeta_q_and_v_q_mu_nu()            [gw_jax.py:524]
        │    └─→ compute_all_V_q_from_zeta_h5()   [compute_vcoul.py]
        ├─→ get_chi0_jax()                         [w_isdf.py:150]
        │    └─→ _get_chi_kernel()                 [w_isdf.py:60]
        ├─→ get_static_w_q_jax()                   [w_isdf.py:240]
        │    └─→ (Dyson solve: W = V + V χ W)
-       ├─→ get_sigma_static_mu_nu_jax()           [cohsex_jax.py:941]
+       ├─→ get_sigma_static_mu_nu_jax()           [gw_jax.py:941]
        │    └─→ (Σ^X = -G^occ ∘ W, Σ^C = G^all ∘ (W-V))
-       └─→ get_sigma_static_kij_jax()             [cohsex_jax.py:979]
-            └─→ project_potential_to_bands()      [cohsex_jax.py:1050]
+       └─→ get_sigma_static_kij_jax()             [gw_jax.py:979]
+            └─→ project_potential_to_bands()      [gw_jax.py:1050]
 ```
 
 ---
@@ -505,7 +506,7 @@ cohsex_jax.main()
 
 ### 7.1 Mesh Definition
 
-**Global mesh**: `mesh_bands = Mesh(devices, ("bands",))` (cohsex_jax.py:72)
+**Global mesh**: `mesh_bands = Mesh(devices, ("bands",))` (gw_jax.py:72)
 **2D mesh**: `mesh_xy = Mesh(devices.reshape(Px, Py), ("x", "y"))`
 
 ### 7.2 Sharding Specifications
@@ -530,7 +531,7 @@ def fft_local(x):
     return jnp.fft.fftn(x)  # FFT on local shard only
 ```
 
-**pjit** (cohsex_jax.py): Automatic sharding with named axes
+**pjit** (gw_jax.py): Automatic sharding with named axes
 ```python
 @partial(pjit, in_shardings=NamedSharding(mesh, P('x', 'y')),
                out_shardings=NamedSharding(mesh, P('x', 'y')))
@@ -546,7 +547,7 @@ def matmul_2d(A, B):
 
 | Task | Primary File | Function/Class |
 |------|-------------|----------------|
-| **Parse input file** | `gw_isdf/cohsex_init.py` | `read_cohsex_input()` |
+| **Parse input file** | `gw_isdf/gw_init.py` | `read_cohsex_input()` |
 | **Load wavefunctions** | `common/load_wfns.py` | `get_sharded_wfns()` |
 | **FFT G→r** | `common/load_wfns.py:74` | `shard_map` FFT |
 | **NUFFT k→R** | `common/load_wfns.py:97` | `nufft_k_to_R_batched()` |
@@ -554,14 +555,14 @@ def matmul_2d(A, B):
 | **CCT matrix** | `common/load_wfns.py:850` | `compute_CCT_from_left_right()` |
 | **Cholesky factorization** | `common/load_wfns.py:1200` | `blocked_cholesky_2d()` |
 | **ZCT matrix** | `common/load_wfns.py:950` | `compute_ZCT_from_left_right()` |
-| **Solve for ζ** | `gw_isdf/cohsex_jax.py:172` | `solve_zeta_cholesky()` |
+| **Solve for ζ** | `gw_isdf/gw_jax.py:172` | `solve_zeta_cholesky()` |
 | **Fit zeta (full pipeline)** | `common/load_wfns.py:1720` | `fit_zeta_chunked_to_h5()` |
 | **Compute V_q** | `gw_isdf/compute_vcoul.py` | `compute_all_V_q_from_zeta_h5()` |
 | **χ⁰ kernel** | `gw_isdf/w_isdf.py:60` | `_get_chi_kernel()` |
 | **Dyson solve for W** | `gw_isdf/w_isdf.py:240` | `get_static_w_q_jax()` |
-| **Self-energy Σ** | `gw_isdf/cohsex_jax.py:941` | `get_sigma_static_mu_nu_jax()` |
-| **Project to bands** | `gw_isdf/cohsex_jax.py:1050` | `project_potential_to_bands()` |
-| **Head correction** | `gw_isdf/cohsex_jax.py:1948` | (inline in main loop) |
+| **Self-energy Σ** | `gw_isdf/gw_jax.py:941` | `get_sigma_static_mu_nu_jax()` |
+| **Project to bands** | `gw_isdf/gw_jax.py:1050` | `project_potential_to_bands()` |
+| **Head correction** | `gw_isdf/gw_jax.py:1948` | (inline in main loop) |
 | **Dipole S(ω)** | `common/chi_from_dipole.py` | `compute_S_omega()` |
 | **Write sigma output** | `io/sigma_output.py` | `write_sigma_to_file()` |
 | **Symmetry operations** | `common/symmetry_maps.py` | `SymmetryMaps` class |

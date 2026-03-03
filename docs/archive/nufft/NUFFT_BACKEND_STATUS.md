@@ -9,7 +9,7 @@ Added experimental support for non-uniform FFT (NUFFT) q-grid in ISDF fitting pi
 
 ## What's Implemented ✅
 
-### 1. Input Parameter Parsing (`cohsex_init.py`)
+### 1. Input Parameter Parsing (`gw_init.py`)
 - Added `q_grid` parameter to input file format: `"nqx nqy nqz"` (e.g., `"6 6 1"`)
 - Comprehensive documentation of NUFFT feature in parameter comments
 - Defaults to `None` (standard uniform FFT, q-grid == k-grid)
@@ -43,7 +43,7 @@ Added experimental support for non-uniform FFT (NUFFT) q-grid in ISDF fitting pi
   - Passes `meta` to CCT/ZCT functions
   - Output zeta_q.h5 arrays sized to q-grid
 
-### 5. Main Driver Integration (`cohsex_jax.py`)
+### 5. Main Driver Integration (`gw_jax.py`)
 - Parse `q_grid` from input file
 - Pass to `Meta.from_system()`
 - Use `meta.qgrid` and `meta.nq_tot` for array sizing
@@ -86,7 +86,7 @@ C_q = jnp.fft.fftn(C_R, axes=(0,1,2), norm='forward')  # uniform FFT on q-grid
 ```
 
 ### GW Pipeline Updates
-The chi0/W/sigma pipeline in `cohsex_jax.py` and `w_isdf.py` is **not yet updated** for NUFFT:
+The chi0/W/sigma pipeline in `gw_jax.py` and `w_isdf.py` is **not yet updated** for NUFFT:
 - V_qmunu arrays still assume q-grid == k-grid in many places
 - Coulomb interaction v(q) uses k-grid BZ sampling
 - Screening W(q) computed on k-grid
@@ -122,11 +122,11 @@ Once full NUFFT transforms are implemented:
 ## Code Locations
 
 All changes marked with `[NUFFT BACKEND]` comments:
-- Input parsing: `src/isdf/gw_isdf/cohsex_init.py`
+- Input parsing: `src/gw_isdf/gw_init.py`
 - Meta class: `src/isdf/common/meta.py`
 - NUFFT wrappers: `src/isdf/common/load_wfns.py` (lines ~95-265)
 - Pipeline integration: `src/isdf/common/load_wfns.py` (CCT/ZCT functions)
-- Main driver: `src/isdf/gw_isdf/cohsex_jax.py` (startup section)
+- Main driver: `src/gw_isdf/gw_jax.py` (startup section)
 
 ## Git History
 

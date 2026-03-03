@@ -2,7 +2,7 @@ loaders:
   - type: python
     search_path: [src]
     packages:
-      - isdf.gw_isdf
+      - gw_isdf
       - isdf.common
       - isdf.isdf_init
 

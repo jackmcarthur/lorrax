@@ -2,7 +2,7 @@
 
 **Consolidates**: `formalism.md`, `isdf_context.md`, `isdf_spin_galerkin_derivation.md`, `ZETA_FITTING_ALGORITHM.md`, `cohsex_jax_physics.md`
 
-**Status**: Describes current implementation in `src/isdf/common/load_wfns.py`, `src/isdf/gw_isdf/cohsex_jax.py`, `src/isdf/gw_isdf/w_isdf.py`.
+**Status**: Describes current implementation in `src/isdf/common/load_wfns.py`, `src/gw_isdf/gw_jax.py`, `src/gw_isdf/w_isdf.py`.
 
 ---
 
@@ -379,7 +379,7 @@ for q_start in range(0, n_q, B_q):
 
 $$B_q \leq \frac{M_{\text{budget}} - M_{\text{base}} - 2 \times M_{Z_{\text{col}}}}{16 \times n_\mu^2}$$
 
-**Automatic sizing**: Function `compute_optimal_chunks()` in `cohsex_init.py` solves this constraint system analytically, iteratively reducing chunk sizes until all stages fit.
+**Automatic sizing**: Function `compute_optimal_chunks()` in `gw_init.py` solves this constraint system analytically, iteratively reducing chunk sizes until all stages fit.
 
 **See**: `docs/MEMORY_MODEL.md` and `docs/CHUNK_BUDGETS.md` for detailed formulas.
 
@@ -522,7 +522,7 @@ Solving: $W_{00}(\omega) = \bar{v}_0 / (1 - \bar{v}_0 \chi_{00}(\omega))$.
 
 The full $W$ at $q=0$ includes this head contribution added in the same way as to $V$.
 
-**Implementation**: Head added in `cohsex_jax.py:1948`, dipole $S_{\alpha\beta}$ computed in `chi_from_dipole.py`.
+**Implementation**: Head added in `gw_jax.py:1948`, dipole $S_{\alpha\beta}$ computed in `chi_from_dipole.py`.
 
 ### 6.6 Self-Energy Matrix Elements
 
@@ -566,7 +566,7 @@ temp = einsum('kiaμ, kaμbν -> kibν', ψ.conj(), Σ)  # (k, i, b, ν)
 
 **Output**: Written to `sigma.h5` and `eqp.dat` (quasiparticle energies).
 
-**Implementation**: `get_sigma_x_kij_jax()` in `cohsex_jax.py:804`.
+**Implementation**: `get_sigma_x_kij_jax()` in `gw_jax.py:804`.
 
 ### 6.8 Self-Consistency Loop
 
@@ -583,9 +583,9 @@ where $H_{\text{KS}} = K + I + V_H + V_{xc}$ is the Kohn-Sham DFT Hamiltonian.
 3. Diagonalize $H_{\text{QP}}^{(i)} = H_{\text{KS}} - V_{xc} + \Sigma^{(i)}$ → new $\psi_n^{(i+1)}, E_n^{(i+1)}$
 4. Repeat until $|\!|E^{(i+1)} - E^{(i)}|\!| < \epsilon$
 
-**Current status**: A fixed-point iteration prototype exists in `cohsex_jax.py` using Anderson mixing from `mixing/acceleration.py`, but is **not yet validated**. The code currently performs **one-shot GW** (G₀W₀): compute $\Sigma$ once from DFT wavefunctions without iterating.
+**Current status**: A fixed-point iteration prototype exists in `gw_jax.py` using Anderson mixing from `mixing/acceleration.py`, but is **not yet validated**. The code currently performs **one-shot GW** (G₀W₀): compute $\Sigma$ once from DFT wavefunctions without iterating.
 
-**Implementation**: `cohsex_jax.py:1230` (prototype, disabled by default).
+**Implementation**: `gw_jax.py:1230` (prototype, disabled by default).
 
 ---
 
@@ -626,11 +626,11 @@ where $H_{\text{KS}} = K + I + V_H + V_{xc}$ is the Kohn-Sham DFT Hamiltonian.
 | File | Lines | Purpose |
 |------|-------|---------|
 | `load_wfns.py` | 1900 | Zeta pipeline: CCT/ZCT, Cholesky, chunking |
-| `cohsex_jax.py` | 1400 | Main driver: wfn loading, $\Sigma$ calculation |
+| `gw_jax.py` | 1400 | Main driver: wfn loading, $\Sigma$ calculation |
 | `w_isdf.py` | 350 | $\chi^0$ and $W$ via CTSP, Dyson solve |
 | `cholesky_2d.py` | 600 | 2D blocked Cholesky for sharded CCT |
 | `compute_vcoul.py` | 800 | $V_q$ from zeta HDF5 |
-| `cohsex_init.py` | 650 | Input parsing, automatic chunk sizing |
+| `gw_init.py` | 650 | Input parsing, automatic chunk sizing |
 | `meta.py` | 200 | System metadata (k/q-grids, cell) |
 
 ### Documentation
@@ -655,7 +655,7 @@ where $H_{\text{KS}} = K + I + V_H + V_{xc}$ is the Kohn-Sham DFT Hamiltonian.
 ### Zeta Fitting
 
 ```bash
-uv run python -m isdf.gw_isdf.cohsex_jax -i cohsex.in --fit-zeta-only
+uv run python -m gw_isdf.gw_jax -i cohsex.in --fit-zeta-only
 ```
 
 **Produces**:
@@ -665,7 +665,7 @@ uv run python -m isdf.gw_isdf.cohsex_jax -i cohsex.in --fit-zeta-only
 ### GW Calculation
 
 ```bash
-uv run python -m isdf.gw_isdf.cohsex_jax -i cohsex.in
+uv run python -m gw_isdf.gw_jax -i cohsex.in
 ```
 
 **Uses**: Cached `zeta_q.h5`, `V_qmunu.h5`

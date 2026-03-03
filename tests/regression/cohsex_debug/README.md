@@ -18,7 +18,7 @@ Reference output:
 The pytest regression test executes:
 
 ```bash
-python -m isdf.gw_isdf.cohsex_jax -i cohsex_test.in
+python -m gw_isdf.gw_jax -i cohsex_test.in
 ```
 
 in this directory and compares generated `eqp_test.dat` against `eqp_ref.dat`.

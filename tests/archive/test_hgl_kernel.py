@@ -232,7 +232,7 @@ def test_hgl_chi_omega():
     omega = 0.3  # Test frequency
     
     # HGL nodes/weights (using small number for test)
-    from isdf.gw_isdf.hgl_quadrature import hgl_nodes_weights
+    from gw_isdf.hgl_quadrature import hgl_nodes_weights
     tau_nodes, w_nodes = hgl_nodes_weights(5)
     
     val_mask = np.ones((nk, nv), dtype=bool)
