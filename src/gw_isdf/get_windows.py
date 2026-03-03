@@ -15,9 +15,9 @@ import numpy as np
 from common import symmetry_maps  # imported as requested
 from isdf_io import WFNReader
 from scipy.special import roots_laguerre
-from common.gpu_utils import cp, xp, GPU_AVAILABLE
 import builtins
 import jax
+import jax.numpy as jnp
 
 # Gate prints in this module to rank 0 only
 _def_print = builtins.print
@@ -148,25 +148,22 @@ def compute_dos(wfn_file, n_points=2000):
     # load wavefunction reader
     wfn = WFNReader(wfn_file)
 
-    # flatten all eigen‑energies (shape nkpts × nbands) and move to xp
+    # Flatten all eigen-energies (shape nkpts x nbands) on JAX arrays.
     all_e = wfn.energies.flatten()
-    all_e = xp.asarray(all_e, dtype=float)
+    all_e = jnp.asarray(all_e, dtype=float)
 
-    # set up energy grid on xp
+    # Set up energy grid on JAX.
     e_min, e_max = float(all_e.min()), float(all_e.max())
-    energy_grid = xp.linspace(e_min, e_max, n_points)
+    energy_grid = jnp.linspace(e_min, e_max, n_points)
     dx = 1.1*(energy_grid[1] - energy_grid[0])   # broadening = grid spacing
 
     # Gaussian broadening: sum_i exp[−(E – Ei)^2/(2*dx^2)]/(dx*√(2π))
     eg = energy_grid[None, :]             # shape (1, n_points)
     es = all_e[:, None]                   # shape (n_states, 1)
-    kernel = xp.exp(-(eg - es)**2 / (2*dx*dx))
-    dos = xp.sum(kernel, axis=0) / (dx * xp.sqrt(2*xp.pi))
-
-    # convert back to pure NumPy if we used CuPy
-    if GPU_AVAILABLE:
-        energy_grid = cp.asnumpy(energy_grid)
-        dos = cp.asnumpy(dos)
+    kernel = jnp.exp(-(eg - es)**2 / (2*dx*dx))
+    dos = jnp.sum(kernel, axis=0) / (dx * jnp.sqrt(2*jnp.pi))
+    energy_grid = np.asarray(energy_grid)
+    dos = np.asarray(dos)
 
     efermi = np.amax(wfn.energies[:,:,int(np.sum(wfn.occs[0,0])-1)])
     return energy_grid, dos, efermi

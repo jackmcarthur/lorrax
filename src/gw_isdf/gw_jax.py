@@ -219,6 +219,8 @@ def fit_zeta_and_compute_V_q_chunked(
 	memory_budget_gb: float = 6.0,
 	sys_dim: int = 2,
 	r_chunk_override: int = 0,
+	target_utilization: float = 0.97,
+	zct_stage_cap_gb: float | None = None,
 ):
 	"""
 	Chunked zeta fitting and V_q computation pipeline.
@@ -245,7 +247,9 @@ def fit_zeta_and_compute_V_q_chunked(
 		bispinor: Whether to use bispinor wavefunctions
 		memory_budget_gb: Memory budget per device in GB
 		sys_dim: System dimensionality (2 or 3)
-	r_chunk_override: If > 0, use explicit r-chunk size (flattened xyz index).
+		r_chunk_override: If > 0, use explicit r-chunk size (flattened xyz index).
+		target_utilization: Fraction of memory_budget_gb to target in chunk sizing.
+		zct_stage_cap_gb: Optional soft cap for ZCT stage peak (GB).
 	
 	Returns:
 		Dictionary with:
@@ -286,13 +290,14 @@ def fit_zeta_and_compute_V_q_chunked(
 		fft_grid=meta.fft_grid,
 		n_devices=n_devices,
 		memory_budget_gb=memory_budget_gb,
-		target_utilization=0.85,
+		target_utilization=target_utilization,
 		p_x=p_x,
 		p_y=p_y,
 		n_b_left=band_range_left[1] - band_range_left[0],
 		n_b_right=band_range_right[1] - band_range_right[0],
 		verbose=True,
 		r_chunk_override=r_chunk_override if r_chunk_override > 0 else None,
+		zct_stage_cap_gb=zct_stage_cap_gb,
 	)
 	
 	band_chunk_size = chunks['band_chunk']
@@ -309,7 +314,7 @@ def fit_zeta_and_compute_V_q_chunked(
 		limit_info = mem_est.get('limit_info', {})
 		if limit_info:
 			print("    Chunk limit estimates (r-points):")
-			for key in ("limit_pair", "limit_fft_global", "limit_solve", "limit_default"):
+			for key in ("limit_pair", "limit_fft_global", "limit_fft_soft", "limit_solve", "limit_default"):
 				if key in limit_info:
 					print(f"      {key}: {limit_info[key]:.1f}")
 	
@@ -351,18 +356,32 @@ def fit_zeta_and_compute_V_q_chunked(
 	cell_volume = float(wfn.cell_volume)
 	
 	# V_q memory: zeta_mu(G) + zeta_nu(G) + FFT workspace + V_q block
-	# Available: full budget (no centroids needed, zeta read from H5)
+	# Use memory headroom reported by chunk sizing (centroids remain resident).
 	n_G = meta.n_rtot
 	bytes_per_complex = 16
-	# Use 90% of budget - zeta is streamed from H5, no centroids in memory
-	m_budget_vcoul = memory_budget_gb * 1e9 * 0.90
+	model_budget_vcoul_gb = float(mem_est.get('available_vcoul_gb', memory_budget_gb))
+	runtime_budget_vcoul_gb = model_budget_vcoul_gb
+	try:
+		from common.gpu_utils import get_device_memory_info
+		mem_info_now = get_device_memory_info()
+		runtime_budget_vcoul_gb = min(
+			model_budget_vcoul_gb,
+			float(mem_info_now.get('budget_gb', model_budget_vcoul_gb)),
+		)
+	except Exception:
+		pass
+	m_budget_vcoul = max(0.1, runtime_budget_vcoul_gb) * 1e9
 	# Each mu needs: 2 × n_G × 16 (zeta_mu + zeta_nu for off-diag) + 1 × n_G × 16 (FFT workspace)
 	m_per_mu = 3 * bytes_per_complex * n_G
 	mu_chunk_vcoul = max(1, min(meta.n_rmu, int(m_budget_vcoul / m_per_mu)))
 	q_batch_vcoul = 1
 	n_q_total = n_q
 	if mu_chunk_vcoul >= meta.n_rmu and n_q_total > 1:
-		q_batch_vcoul = min(4, n_q_total)
+		# Single-chunk path may batch q-points; keep this memory-aware.
+		bytes_per_q_batch = 2.0 * bytes_per_complex * meta.n_rmu * n_G
+		q_batch_by_mem = max(1, int(m_budget_vcoul // max(1.0, bytes_per_q_batch)))
+		q_batch_vcoul = max(1, min(4, n_q_total, q_batch_by_mem))
+	print(f"    V_q budget:    {runtime_budget_vcoul_gb:.2f} GB")
 	print(f"    V_q mu chunks: {mu_chunk_vcoul}")
 	if q_batch_vcoul > 1:
 		print(f"    V_q q batches: {q_batch_vcoul}")
@@ -820,11 +839,46 @@ def main(argv=None):
 	
 	# Memory budget for chunked ISDF (0 = auto-detect)
 	memory_per_device_gb = params.get("memory_per_device_gb", 0.0)
-	if memory_per_device_gb <= 0:
+	memory_budget_auto = memory_per_device_gb <= 0
+	mem_info_detect = None
+	from common.gpu_utils import get_device_memory_info
+	if memory_budget_auto:
 		from common.gpu_utils import get_device_memory_gb
 		memory_per_device_gb = get_device_memory_gb()
+		mem_info_detect = get_device_memory_info()
 		if jax.process_index() == 0:
 			print(f"  Auto-detected memory budget: {memory_per_device_gb:.2f} GB/device")
+
+	# Chunking target utilization: leave a small fixed guard band by default.
+	try:
+		chunk_target_utilization = float(os.environ.get("ISDF_CHUNK_TARGET_UTILIZATION", "0.97"))
+	except Exception:
+		chunk_target_utilization = 0.97
+	chunk_target_utilization = max(0.85, min(1.0, chunk_target_utilization))
+	if jax.process_index() == 0:
+		print(f"  Chunk target utilization: {chunk_target_utilization:.2f}")
+
+	# Optional ZCT cap (manual override only; no default empirical fraction).
+	zct_stage_cap_gb = None
+	zct_cap_gb_env = os.environ.get("ISDF_ZCT_STAGE_CAP_GB")
+	zct_cap_frac_env = os.environ.get("ISDF_ZCT_STAGE_CAP_FRAC")
+	if zct_cap_gb_env:
+		try:
+			zct_stage_cap_gb = min(memory_per_device_gb, max(0.0, float(zct_cap_gb_env)))
+		except Exception:
+			zct_stage_cap_gb = None
+	if zct_stage_cap_gb is None and zct_cap_frac_env and jax.default_backend() in ("gpu", "cuda"):
+		mem_info_detect = mem_info_detect or get_device_memory_info()
+		total_gb = float((mem_info_detect or {}).get("total_gb", 0.0))
+		if total_gb > 0:
+			try:
+				zct_cap_frac = float(zct_cap_frac_env)
+			except Exception:
+				zct_cap_frac = 0.0
+			zct_cap_frac = max(0.10, min(0.95, zct_cap_frac))
+			zct_stage_cap_gb = min(memory_per_device_gb, zct_cap_frac * total_gb)
+	if zct_stage_cap_gb is not None and zct_stage_cap_gb > 0 and jax.process_index() == 0:
+		print(f"  Explicit ZCT stage cap: {zct_stage_cap_gb:.2f} GB")
 	
 	# Explicit r_chunk override (0 = auto-compute from memory budget)
 	r_chunk_override = params.get("r_chunk_size", 0)
@@ -935,14 +989,16 @@ def main(argv=None):
 			
 			# Fit zeta and compute V_q using chunked approach
 			with mesh_xy:
-				chunked_result = fit_zeta_and_compute_V_q_chunked(
-					wfn, sym, meta, centroid_indices, mesh_xy,
-					output_dir=tmp_dir,
-					bispinor=bispinor,
-					memory_budget_gb=memory_per_device_gb,
-					sys_dim=sys_dim,
-					r_chunk_override=r_chunk_override,
-				)
+					chunked_result = fit_zeta_and_compute_V_q_chunked(
+						wfn, sym, meta, centroid_indices, mesh_xy,
+						output_dir=tmp_dir,
+						bispinor=bispinor,
+						memory_budget_gb=memory_per_device_gb,
+						sys_dim=sys_dim,
+						r_chunk_override=r_chunk_override,
+						target_utilization=chunk_target_utilization,
+						zct_stage_cap_gb=zct_stage_cap_gb,
+					)
 			
 			# Extract results
 			V_qmunu = chunked_result['V_qmunu']

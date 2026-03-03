@@ -1,7 +1,7 @@
 import numpy as np
-from common.gpu_utils import cp, xp, GPU_AVAILABLE
 import h5py as h5
 import datetime
+import jax.numpy as jnp
 
 # Generating a reliable charge density is the first step toward self-consistent
 # COHSEX iterations.  This routine will later be called repeatedly as the
@@ -25,10 +25,7 @@ def perform_fft_3d(data_1d, gvecs, fft_grid):
     # Create 3D shape tuple from FFTgrid
     shape3d = tuple(int(x) for x in fft_grid)
     
-    if GPU_AVAILABLE:
-        fft_box = cp.zeros(shape3d, dtype=np.complex64)
-    else:
-        fft_box = np.zeros(shape3d, dtype=np.complex64)
+    fft_box = jnp.zeros(shape3d, dtype=jnp.complex64)
 
     
     # Convert G-vectors to positive FFT grid indices all at once
@@ -37,11 +34,10 @@ def perform_fft_3d(data_1d, gvecs, fft_grid):
     iz = gvecs[:, 2] #% shape3d[2]
     
     # Use advanced indexing to assign all values at once
-    fft_box[ix, iy, iz] = data_1d
+    fft_box = fft_box.at[ix, iy, iz].set(data_1d)
     
-    # Perform inverse FFT using CuPy if available, otherwise NumPy
-    # Note: ifftn performs the inverse FFT which is what we want for G-space to real-space
-    fft_result = xp.fft.ifftn(fft_box)
+    # ifftn performs the inverse FFT for G-space to real-space.
+    fft_result = jnp.fft.ifftn(fft_box)
     
     return fft_result
 
@@ -53,11 +49,11 @@ def calculate_charge_density(wfn, sym, nval=None, ncond=None):
     n_sym is done on the GPU since symmetry operations over Gvecs can be parallelized.
     """
 
-    fft_grid = xp.asarray(wfn.fft_grid)
+    fft_grid = jnp.asarray(wfn.fft_grid)
     # Convert fft_grid from numpy array to tuple of integers
     fft_grid_tuple = tuple(int(x) for x in fft_grid) #tuple(2*int(x) for x in fft_grid)
     # NOTE THE TWO! this is zero padding (ecutrho = 4*ecutwfc due to convolution in G-space)
-    charge_density = xp.zeros(fft_grid_tuple, dtype=xp.double)
+    charge_density = jnp.zeros(fft_grid_tuple, dtype=jnp.float64)
     
     # Loop over bands
     nelec = int(np.sum(wfn.occs[0,0]))
@@ -75,32 +71,26 @@ def calculate_charge_density(wfn, sym, nval=None, ncond=None):
         for ik in range(1): # paper suggests only using k0
             # Get G-vectors for this k-point
             gvecs_k = sym.get_gvecs_kfull(wfn, ik)
-            if GPU_AVAILABLE:
-                gvecs_k = cp.asarray(gvecs_k)
+            gvecs_k = jnp.asarray(gvecs_k)
 
             # Get wavefunction coefficients for this k-point and band
             coeffs_kb = sym.get_cnk_fullzone(wfn, ib, ik)
-            if GPU_AVAILABLE:
-                coeffs_kb = cp.asarray(coeffs_kb)
+            coeffs_kb = jnp.asarray(coeffs_kb)
 
             # Transform each spinor component to real space
             for jspinor in range(2):
                 spinor_density = perform_fft_3d(coeffs_kb[jspinor], gvecs_k, fft_grid_tuple)
-                charge_density += (spinor_density*xp.conj(spinor_density)).real
+                charge_density += (spinor_density * jnp.conj(spinor_density)).real
 
     # normalize charge density to n_electrons.
     normrho = np.prod(wfn.fft_grid)#/np.prod(wfn.kgrid)
-    if GPU_AVAILABLE:
-        charge_density = cp.asarray(normrho) * charge_density
-    else:
-        charge_density = normrho * charge_density
+    charge_density = normrho * charge_density
 
     return charge_density
 
 def save_charge_density(charge_density):
     """Save the charge density to an HDF5 file."""
-    # Convert CuPy array to NumPy array
-    charge_density_cpu = charge_density.get()
+    charge_density_cpu = np.asarray(charge_density)
     
     with h5.File('charge_density.h5', 'w') as f:
         f.create_dataset('charge_density', data=charge_density_cpu)
@@ -122,7 +112,7 @@ def analyze_gvectors(gvecs):
 
 if __name__ == "__main__":
     
-    print(f"Beginning charge density calculation. Using {xp.__name__} backend.")
+    print("Beginning charge density calculation. Using jax.numpy backend.")
     nval = 5
     ncond = 5
     print(f"Including {ncond if ncond is not None else 'no'} conduction states and {nval if nval is not None else 'all'} valence states.")
@@ -140,7 +130,7 @@ if __name__ == "__main__":
     # Calculate charge density using the reader
     charge_density = calculate_charge_density(wfn, sym, nval=nval, ncond=ncond)
 
-    print(f"\nTotal electron number: {xp.sum(charge_density)}")
+    print(f"\nTotal electron number: {jnp.sum(charge_density)}")
 
     # Save results
     save_charge_density(charge_density)

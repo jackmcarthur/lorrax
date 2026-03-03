@@ -62,3 +62,8 @@ build = [
     "pybind11>=3.0.0",
     "nanobind>=2.0.0",
 ]
+profile = [
+    "tensorboard>=2.20.0",
+    "tensorboard-plugin-profile>=2.22.0",
+    "xprof>=2.22.0",
+]

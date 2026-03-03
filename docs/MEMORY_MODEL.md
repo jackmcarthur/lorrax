@@ -6,6 +6,19 @@ solver simply enforces those expressions without heuristic percentages.  This
 document lists every stage, the associated arrays, and the formulas that drive
 the automatic sizing in `compute_optimal_chunks`.
 
+For automatic memory detection, `get_device_memory_gb` now uses
+`budget = 0.9 * bytes_available`, with:
+- `bytes_available = bytes_limit - bytes_in_use` from `jax.memory_stats()` when available
+- fallback: `bytes_available = nvidia-smi memory.free`
+
+That detector-side 10% guard band is the only default safety margin; the chunk
+solver default is `target_utilization = 0.97` (configurable via
+`ISDF_CHUNK_TARGET_UTILIZATION`).
+
+The driver no longer applies an implicit ZCT soft cap.  If needed, set one
+explicitly with `ISDF_ZCT_STAGE_CAP_GB` (absolute) or `ISDF_ZCT_STAGE_CAP_FRAC`
+(fraction of total GPU memory).
+
 All sizes below use complex128 storage (`bytes_per_complex = 16`).  Mesh axes
 follow the code: `'x'` shards the μ/centroid axis, `'y'` shards r-chunks, and
 the processor count is `P = p_x * p_y`.
@@ -31,8 +44,8 @@ Typical ranges (from production datasets):
 | **FFT workspace** | `psi_G` + `psi_r` + `phase` | `2*16 n_k (B_b/P) n_s n_r + 16 n_k n_r` |
 | **C_q build** | `P_l`, `P_r`, `C_q` | `M_cct = M_cent + 2*16 n_k (n_rmu/p_x)(n_rmu/p_y) + 16 n_q (n_rmu/p_x)(n_rmu/p_y)` |
 | **Pair density (chunk)** | `psi_xchunk`, `P_l`, `P_r` | `M_pair = base + 16 n_k n_b n_s (B_r/p_y) + 2*16 n_k (n_rmu/p_x)(B_r/p_y)` |
-| **ZCT** | `Z_q` | `M_zct = base + 2*16 n_k (n_rmu/p_x)(B_r/p_y) + 16 n_q (n_rmu/p_x)(B_r/p_y)` |
-| **Solve** | `Z_col`, `zeta`, `L_rep` | `M_solve = base + 2*16 n_q n_rmu (B_r/P) + 16 n_rmu^2 * B_q` |
+| **ZCT** | `P_l`, `P_r`, FFT temps, `Z_q` | `M_zct = base + 4*16 n_k n_rmu B_r + 16 n_q n_rmu B_r` |
+| **Solve** | `Z_col`, triangular-solve temps, `L_q` temp | `M_solve = base + 4*16 n_q n_rmu (B_r/P) + M_L_q` |
 | **V_q compute** | μ/ν chunks in r- and G-space | `M_vq ≈ 3 * 16 * μ_chunk * n_r` |
 
 `base` in the chunk stages is `M_cent + M_L_q + cache`, i.e.
@@ -71,13 +84,13 @@ base + 16 * (B_r / p_y) * [n_k n_b n_s + 2 n_k (n_rmu / p_x)] <= M_budget
 2. **ZCT pipeline**
 
 ```
-base + 16 * (B_r / p_y) * [ (2 n_k + n_q) * (n_rmu / p_x) ] <= M_budget
+base + 16 * B_r * [ (4 n_k + n_q) * n_rmu ] <= M_budget
 ```
 
 3. **Solve (with q_chunk = 1)**
 
 ```
-base + 2 * 16 * n_q * n_rmu * (B_r / P) + 16 * n_rmu^2 <= M_budget
+base + 4 * 16 * n_q * n_rmu * (B_r / P) + M_L_q <= M_budget
 ```
 
 `base = M_cent + M_L_q + cache`.  The analytic upper bounds from these
@@ -143,8 +156,9 @@ memory settings.
 7. **Q-chunk**: With `B_r` fixed, compute the available headroom for replicated
    `L` matrices and choose the largest integer chunk that fits.
 
-8. **μ-chunk (report only)**: Use the formula above with the persistent centroid
-   cost to inform the V_q driver.
+8. **μ-chunk (V_q driver)**: Use the formula above with the persistent centroid
+   cost to size the V_q μ-chunk.  The runtime also clamps this against a fresh
+   `get_device_memory_gb` query and takes the minimum budget.
 
 9. **Instrumentation**: The solver returns a `memory_estimate` dictionary with
    the following keys so the CLI can display a detailed breakdown:
@@ -182,5 +196,17 @@ provides the required gigabytes.  Typical remedies are:
    Increase the μ chunks or disable caching so more memory is available to the
    V_q builder.
 
-The key takeaway: every stage is expressed analytically, so chunk sizing is now
-deterministic and explainable.
+## XProf Workflow
+
+Recommended stack (June 2025 guidance): XProf + TensorBoard memory viewer.
+
+1. Capture:
+`uv run python tools/profile_gw_xprof.py -i <input.in> --workdir <run_dir> --logdir ./profiles/xprof --name <tag>`
+2. Open UI:
+`uv run xprof ./profiles/xprof`
+3. Inspect:
+Memory Viewer tab for `jit__compute_ZCT_LR(...)` and `jit__solve_all_q(...)`.
+
+Recent production traces show `jit__compute_ZCT_LR` peak dominated by five equal
+live buffers (`P_l`, `P_r`, output transpose, and two FFT temporaries), which is
+why the ZCT constraint now uses a `4*n_k + n_q` buffer coefficient.

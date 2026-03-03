@@ -22,19 +22,22 @@ def compute_optimal_chunks(
     fft_grid: tuple[int, int, int],
     n_devices: int,
     memory_budget_gb: float,
-    target_utilization: float = 0.85,
+    target_utilization: float = 0.97,
     p_x: int | None = None,
     p_y: int | None = None,
     verbose: bool = True,
     n_b_left: int | None = None,
     n_b_right: int | None = None,
     r_chunk_override: int | None = None,
+    zct_stage_cap_gb: float | None = None,
 ) -> dict:
     """Derive chunk sizes that saturate (but do not exceed) the memory budget."""
     if memory_budget_gb <= 0:
         raise ValueError("memory_per_device_gb must be > 0 for automatic chunk sizing.")
     if n_devices <= 0:
         raise ValueError("n_devices must be at least 1.")
+    if target_utilization <= 0 or target_utilization > 1.0:
+        raise ValueError("target_utilization must be in (0, 1].")
 
     bytes_per_complex = 16.0
     nx, ny, nz = fft_grid
@@ -58,6 +61,9 @@ def compute_optimal_chunks(
         return value / 1e9
 
     m_budget = memory_budget_gb * 1e9 * target_utilization
+    m_zct_cap = None if zct_stage_cap_gb is None else float(zct_stage_cap_gb) * 1e9
+    if m_zct_cap is not None and m_zct_cap <= 0:
+        m_zct_cap = None
     n_k_f = float(n_k)
     n_s_f = float(n_s)
     n_rmu_f = float(n_rmu)
@@ -104,22 +110,7 @@ def compute_optimal_chunks(
     m_cached_gspace_full = bytes_per_complex * n_k_f * (n_b_full / p) * n_s_f * n_r_f
 
     def compute_chunk_metrics(chunk_r: int, base_const: float) -> tuple[float, str, dict]:
-        """Compute peak memory for each stage given an r-chunk size.
-
-        CRITICAL: The ZCT (FFT cross-correlation) stage causes XLA to create
-        FULL UNSHARDED copies during resharding/FFT operations. The XLA log shows:
-            "[spmd] Involuntary full rematerialization..."
-
-        This means we must budget for the GLOBAL array sizes, not local sharded sizes.
-        compute_ZCT_from_left_right_zchunk does:
-            1. P_l_R = ifftn(P_l)  -- XLA may all-gather to full array
-            2. P_r_R = ifftn(P_r)  -- XLA may all-gather to full array
-            3. Z_R = conj(P_l_R) * P_r_R  -- full array
-            4. Z_q = fftn(Z_R)  -- full array
-
-        Peak observed: ~62GB for (36, 600, 48600) complex128 arrays = 4x 16.8GB
-        This is the FULL global array × 4 intermediate buffers.
-        """
+        """Compute peak memory for each stage given an r-chunk size."""
         cr = float(chunk_r)
         per_y = cr / p_y
 
@@ -129,18 +120,22 @@ def compute_optimal_chunks(
         m_z_local = bytes_per_complex * n_q_f * (n_rmu_f / p_x) * per_y
         m_zcol = bytes_per_complex * n_q_f * n_rmu_f * (cr / p)
 
-        # GLOBAL (unsharded) sizes for FFT stage where XLA rematerializes
-        # P_l, P_r shape: (nk, n_rmu, chunk_r) - FULL, not sharded during FFT
+        # GLOBAL (unsharded) sizes in ZCT/FFT stage where XLA may rematerialize.
+        # P_l and P_r have shape (nk, n_rmu, chunk_r); Z_q has (n_q, n_rmu, chunk_r).
         m_pair_global = bytes_per_complex * n_k_f * n_rmu_f * cr
-
-        # XLA needs ~4 full arrays during FFT pipeline (inputs + intermediates)
-        FFT_BUFFERS = 2  # Reduced from 4: XLA is efficient with sharded FFTs
-        m_fft_peak = FFT_BUFFERS * m_pair_global
+        m_z_global = bytes_per_complex * n_q_f * n_rmu_f * cr
+        # Staged ZCT path (_left_ifft_conj + _right_ifft_mul_fft) reduces peak to
+        # three large live buffers in stage-2:
+        # P_l_Rt, wrapped_transpose(P_r), and fft(P_r).
+        # This corresponds to 2*P(nk, n_rmu, chunk_r) + Z_q(n_q, n_rmu, chunk_r).
+        m_fft_peak = 2.0 * m_pair_global + m_z_global
 
         stage_pair = base_const + m_psi_chunk + 2 * m_pair_local
-        # FFT stage: XLA holds full unsharded arrays during rematerialization
+        # FFT stage: account for global pair-density inputs, FFT temporaries, and Z_q output.
         stage_zct = base_const + m_fft_peak
-        stage_solve = base_const + 2 * m_zcol + bytes_per_complex * (n_rmu_f ** 2)
+        # XProf memory_viewer (jit__solve_all_q) shows ~4*Z_col working set plus
+        # one additional L_q-sized temporary on top of the persistent L_q storage in base_const.
+        stage_solve = base_const + 4 * m_zcol + m_L_q
         peak = max(stage_pair, stage_zct, stage_solve)
         if peak == stage_pair:
             name = 'pair'
@@ -153,12 +148,13 @@ def compute_optimal_chunks(
             'pair_chunk': 2 * m_pair_local,
             'pair_fft_peak': m_fft_peak,
             'pair_global': m_pair_global,
+            'z_global': m_z_global,
             'Z_q': m_z_local,
             'Z_col': m_zcol,
             'stage_pair': stage_pair,
             'stage_zct': stage_zct,
             'stage_solve': stage_solve,
-            'fft_overhead_factor': FFT_BUFFERS,
+            'fft_overhead_factor': (2.0 * n_k_f + n_q_f) / max(1.0, n_k_f),
         }
         return peak, name, info
 
@@ -168,6 +164,9 @@ def compute_optimal_chunks(
         headroom = m_budget - base_const
         if headroom <= bytes_per_complex * (n_rmu_f ** 2):
             return None
+        headroom_zct = None
+        if m_zct_cap is not None:
+            headroom_zct = m_zct_cap - base_const
 
         limit_info = {}
 
@@ -177,8 +176,6 @@ def compute_optimal_chunks(
         else:
             # Auto-compute from memory limits (same logic as old choose_x_chunk,
             # but round only to p_y divisibility, not ny*nz boundaries)
-            FFT_BUFFERS = 2
-
             limits = []
             # Pair density stage limit (uses sharded local sizes)
             denom_pair = n_k_f * n_b_full * n_s_f + 2 * n_k_f * (n_rmu_f / p_x)
@@ -187,16 +184,21 @@ def compute_optimal_chunks(
                 limits.append(limit_pair)
                 limit_info['limit_pair'] = limit_pair
 
-            # ZCT/FFT stage limit - CRITICAL: uses GLOBAL array size
-            denom_fft_global = FFT_BUFFERS * n_k_f * n_rmu_f
+            # ZCT/FFT stage limit for staged 2-kernel path:
+            # 2 * P(nk,n_rmu,chunk_r) + Z_q(n_q,n_rmu,chunk_r)
+            denom_fft_global = (2 * n_k_f + n_q_f) * n_rmu_f
             if denom_fft_global > 0:
                 limit_fft = headroom / (bytes_per_complex * denom_fft_global)
                 limits.append(limit_fft)
                 limit_info['limit_fft_global'] = limit_fft
+                if headroom_zct is not None and headroom_zct > 0:
+                    limit_fft_soft = headroom_zct / (bytes_per_complex * denom_fft_global)
+                    limits.append(limit_fft_soft)
+                    limit_info['limit_fft_soft'] = limit_fft_soft
 
             # Solve stage limit
-            solve_numer = headroom - bytes_per_complex * (n_rmu_f ** 2)
-            denom_solve = 2 * n_q_f * n_rmu_f / p
+            solve_numer = headroom - m_L_q
+            denom_solve = 4 * n_q_f * n_rmu_f / p
             if denom_solve > 0 and solve_numer > 0:
                 limit_solve = solve_numer * p / (bytes_per_complex * denom_solve)
                 limits.append(limit_solve)
@@ -217,7 +219,8 @@ def compute_optimal_chunks(
         # Search downward for a chunk that fits the budget
         while r_chunk_r > 0:
             peak_bytes, stage_name, info = compute_chunk_metrics(r_chunk_r, base_const)
-            if peak_bytes <= m_budget:
+            zct_ok = (m_zct_cap is None) or (info['stage_zct'] <= m_zct_cap)
+            if peak_bytes <= m_budget and zct_ok:
                 x_slices_est = max(1, int(math.ceil(r_chunk_r / float(ny * nz))))
                 return {
                     'x_chunk': x_slices_est,
@@ -279,6 +282,7 @@ def compute_optimal_chunks(
         'pair_density_chunk_gb': to_gb(stage_info['pair_chunk']),
         'pair_fft_peak_gb': to_gb(stage_info['pair_fft_peak']),
         'pair_global_gb': to_gb(stage_info['pair_global']),
+        'Z_q_global_gb': to_gb(stage_info.get('z_global', 0.0)),
         'fft_overhead_factor': stage_info['fft_overhead_factor'],
         'Z_q_gb': to_gb(stage_info['Z_q']),
         'Z_col_gb': to_gb(stage_info['Z_col']),
@@ -301,6 +305,7 @@ def compute_optimal_chunks(
         'centroids_bytes': m_centroids_persist,
         'effective_budget_bytes': m_budget,
         'available_vcoul_gb': to_gb(max(0.0, m_budget - m_centroids_persist)),
+        'zct_stage_cap_gb': to_gb(m_zct_cap) if m_zct_cap is not None else None,
     }
 
     return {
@@ -362,11 +367,12 @@ def print_memory_breakdown(
     print(f"    {'─ STAGE TOTAL':<38} {mem['stage_pair_gb']:>10.3f}")
     
     # ZCT stage
-    fft_factor = int(mem.get('fft_overhead_factor', 4))
+    fft_factor = float(mem.get('fft_overhead_factor', 4.0))
     print(f"\n  {'[Stage: ZCT / FFT pipeline]':<40}")
     print(f"    {'P_l, P_r (local sharded)':<38} {mem['pair_density_chunk_gb']:>10.3f}")
     print(f"    {'P_l, P_r (GLOBAL, XLA remat)':<38} {mem.get('pair_global_gb', 0):>10.3f}")
-    print(f"    {'FFT peak (' + str(fft_factor) + ' × global)':<38} {mem.get('pair_fft_peak_gb', 0):>10.3f}")
+    print(f"    {'Z_q (GLOBAL, XLA remat)':<38} {mem.get('Z_q_global_gb', 0):>10.3f}")
+    print(f"    {'FFT peak (' + str(round(fft_factor, 2)) + ' × pair_global)':<38} {mem.get('pair_fft_peak_gb', 0):>10.3f}")
     print(f"    {'─ STAGE TOTAL':<38} {mem['stage_zct_gb']:>10.3f}")
     
     # Solve
@@ -384,7 +390,7 @@ def print_memory_breakdown(
     limit_info = mem.get('limit_info', {})
     if limit_info:
         print(f"\n  {'CHUNK LIMIT ESTIMATES (r-points)':<40} {'':>12}")
-        for key in ("limit_pair", "limit_fft_global", "limit_solve", "limit_default"):
+        for key in ("limit_pair", "limit_fft_global", "limit_fft_soft", "limit_solve", "limit_default"):
             if key in limit_info:
                 print(f"  {key:<38} {limit_info[key]:>10.1f}")
     print("="*70)

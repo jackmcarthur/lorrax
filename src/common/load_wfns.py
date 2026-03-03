@@ -75,7 +75,14 @@ def compute_block_size_for_2d_cholesky(n_rmu: int, Pr: int, Pc: int) -> tuple[in
 # See: https://docs.jax.dev/en/latest/notebooks/shard_map.html
 # ============================================================================
 
-def make_sharded_ifftn_3d(mesh: Mesh, in_spec: P, out_spec: P, *, norm: str | None = None):
+def make_sharded_ifftn_3d(
+	mesh: Mesh,
+	in_spec: P,
+	out_spec: P,
+	*,
+	norm: str | None = None,
+	axes: tuple[int, int, int] = (-3, -2, -1),
+):
     """
     Uses shard_map to run FFT independently on each device's local data.
     The FFT axes (last 3) must NOT be sharded - only batch dims can be sharded.
@@ -89,18 +96,25 @@ def make_sharded_ifftn_3d(mesh: Mesh, in_spec: P, out_spec: P, *, norm: str | No
     """
     def _local_ifftn(x_local):
         # Each device runs FFT on its local shard independently
-        return jnp.fft.ifftn(x_local, axes=(-3, -2, -1), norm=norm)
+        return jnp.fft.ifftn(x_local, axes=axes, norm=norm)
     
     return shard_map(_local_ifftn, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec)
 
-def make_sharded_fftn_3d(mesh: Mesh, in_spec: P, out_spec: P, *, norm: str | None = None):
+def make_sharded_fftn_3d(
+	mesh: Mesh,
+	in_spec: P,
+	out_spec: P,
+	*,
+	norm: str | None = None,
+	axes: tuple[int, int, int] = (-3, -2, -1),
+):
     """
     shard_map local FFT (forward).
     
     This is the forward-FFT counterpart to make_sharded_ifftn_3d.
     """
     def _local_fftn(x_local):
-        return jnp.fft.fftn(x_local, axes=(-3, -2, -1), norm=norm)
+        return jnp.fft.fftn(x_local, axes=axes, norm=norm)
     
     return shard_map(_local_fftn, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec)
 
@@ -515,11 +529,11 @@ def compute_CCT_from_left_right(
 	if cache_key not in _isdf_pipeline_cache:
 		in_xy = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 		out_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-		# Force local FFTs via shard_map helper by moving k-grid axes to the end.
-		# After transpose(..., 3,4,0,1,2), the sharding lives on the leading (mu, col) axes.
-		fft_in = P('x', 'y', None, None, None)
-		sharded_ifftn = make_sharded_ifftn_3d(mesh_xy, fft_in, fft_in, norm='forward')
-		sharded_fftn = make_sharded_fftn_3d(mesh_xy, fft_in, fft_in, norm='forward')
+		# Keep pair-density in (k, mu, nu) layout (good for einsum/matmul contiguity),
+		# and FFT directly over the leading k-grid axes.
+		fft_in = P(None, None, None, 'x', 'y')
+		sharded_ifftn = make_sharded_ifftn_3d(mesh_xy, fft_in, fft_in, norm='forward', axes=(0, 1, 2))
+		sharded_fftn = make_sharded_fftn_3d(mesh_xy, fft_in, fft_in, norm='forward', axes=(0, 1, 2))
 		
 		@partial(jax.jit, in_shardings=(in_xy, in_xy), out_shardings=out_xy,
 		         static_argnames=('nkx', 'nky', 'nkz'))
@@ -533,17 +547,15 @@ def compute_CCT_from_left_right(
 			# With forward: IFFT is unscaled (sum), FFT divides by N.
 			# Convolution theorem: C_q = FFT(IFFT(A)* ⊙ IFFT(B))
 			# This gives C_q = Σ_k A*_k B_{k+q} (matches gw_jax direct sum)
-			P_l_kt = P_l_3d.transpose(3, 4, 0, 1, 2)
-			P_r_kt = P_r_3d.transpose(3, 4, 0, 1, 2)
-			P_l_Rt = sharded_ifftn(P_l_kt)
-			P_r_Rt = sharded_ifftn(P_r_kt)
+			P_l_Rt = sharded_ifftn(P_l_3d)
+			P_r_Rt = sharded_ifftn(P_r_3d)
 			
 			# Cross-product: C_R = conj(P_l_R) * P_r_R (element-wise)
 			C_Rt = jnp.conj(P_l_Rt) * P_r_Rt
 			
 			# FFT to q-space
 			C_qt = sharded_fftn(C_Rt)
-			return C_qt.transpose(2, 3, 4, 0, 1)
+			return C_qt
 		
 		_isdf_pipeline_cache[cache_key] = _compute_CCT_LR
 	
@@ -563,8 +575,10 @@ def compute_ZCT_from_left_right_zchunk(
 	Z_q(μ,r) = FFT[ conj(IFFT(P_l(μ,r))) ⊙ IFFT(P_r(μ,r)) ]
 	
 	Args:
-		P_l_k_muz: (nk, n_rmu, n_zchunk) left pair density at z-chunk, P(None, 'x', 'y')
-		P_r_k_muz: (nk, n_rmu, n_zchunk) right pair density at z-chunk, P(None, 'x', 'y')
+		P_l_k_muz: (nkx, nky, nkz, n_rmu, n_zchunk) left pair density in k-grid form
+		          with P(None, None, None, 'x', 'y')
+		P_r_k_muz: (nkx, nky, nkz, n_rmu, n_zchunk) right pair density in k-grid form
+		          with P(None, None, None, 'x', 'y')
 		kgrid: (nkx, nky, nkz)
 		mesh_xy: Device mesh
 	
@@ -572,45 +586,44 @@ def compute_ZCT_from_left_right_zchunk(
 		Z_q: (nqx, nqy, nqz, n_rmu, n_zchunk) with P(None, None, None, 'x', 'y')
 	"""
 	nkx, nky, nkz = kgrid
-	nk, n_rmu, n_zchunk = P_l_k_muz.shape
+	n_rmu, n_zchunk = P_l_k_muz.shape[3], P_l_k_muz.shape[4]
+	assert P_l_k_muz.shape[:3] == (nkx, nky, nkz), (
+		f"P_l_k_muz leading k-grid dims {P_l_k_muz.shape[:3]} do not match {kgrid}"
+	)
+	assert P_r_k_muz.shape[:3] == (nkx, nky, nkz), (
+		f"P_r_k_muz leading k-grid dims {P_r_k_muz.shape[:3]} do not match {kgrid}"
+	)
 	
-	cache_key = ('ZCT_LR', id(mesh_xy), nk, n_rmu, n_zchunk, nkx)
+	cache_key = ('ZCT_LR', id(mesh_xy), nkx, nky, nkz, n_rmu, n_zchunk)
 	
 	if cache_key not in _isdf_pipeline_cache:
-		in_xy = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 		out_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-		# Force local FFTs via shard_map helper by moving k-grid axes to the end.
-		# After transpose(..., 3,4,0,1,2), the sharding lives on the leading (mu, col) axes.
-		fft_in = P('x', 'y', None, None, None)
-		sharded_ifftn = make_sharded_ifftn_3d(mesh_xy, fft_in, fft_in, norm='forward')
-		sharded_fftn = make_sharded_fftn_3d(mesh_xy, fft_in, fft_in, norm='forward')
-		
-		@partial(jax.jit, in_shardings=(in_xy, in_xy), out_shardings=out_xy,
-		         static_argnames=('nkx', 'nky', 'nkz'))
-		def _compute_ZCT_LR(P_l: jax.Array, P_r: jax.Array,
-		                    nkx: int, nky: int, nkz: int) -> jax.Array:
-			# Reshape to 3D k-grid
-			P_l_3d = P_l.reshape(nkx, nky, nkz, n_rmu, n_zchunk)
-			P_r_3d = P_r.reshape(nkx, nky, nkz, n_rmu, n_zchunk)
-			
-			# Use norm='forward' for BOTH IFFT and FFT to match direct k-sum.
-			# With forward: IFFT is unscaled (sum), FFT divides by N.
-			# This gives Z_q = Σ_k P_l*_k P_r_{k+q} (matches gw_jax)
-			P_l_kt = P_l_3d.transpose(3, 4, 0, 1, 2)
-			P_r_kt = P_r_3d.transpose(3, 4, 0, 1, 2)
-			P_l_Rt = sharded_ifftn(P_l_kt)
-			P_r_Rt = sharded_ifftn(P_r_kt)
-			
-			# Cross-product
-			Z_Rt = jnp.conj(P_l_Rt) * P_r_Rt
-			
-			# FFT to q-space
-			Z_qt = sharded_fftn(Z_Rt)
-			return Z_qt.transpose(2, 3, 4, 0, 1)
-		
+		# Keep pair-density in (k, mu, z) layout (good for einsum/matmul contiguity),
+		# and FFT directly over the leading k-grid axes.
+		fft_in = P(None, None, None, 'x', 'y')
+		fft_shard = NamedSharding(mesh_xy, fft_in)
+		sharded_ifftn = make_sharded_ifftn_3d(mesh_xy, fft_in, fft_in, norm='forward', axes=(0, 1, 2))
+		sharded_fftn = make_sharded_fftn_3d(mesh_xy, fft_in, fft_in, norm='forward', axes=(0, 1, 2))
+
+		@partial(jax.jit, in_shardings=fft_shard, out_shardings=fft_shard, donate_argnums=(0,))
+		def _left_ifft_conj(P_l_3d: jax.Array) -> jax.Array:
+			# Use norm='forward' to match direct k-sum convention.
+			return jnp.conj(sharded_ifftn(P_l_3d))
+
+		@partial(jax.jit, in_shardings=(fft_shard, fft_shard), out_shardings=out_xy, donate_argnums=(0,))
+		def _right_ifft_mul_fft(P_r_3d: jax.Array, P_l_Rt: jax.Array) -> jax.Array:
+			# Keep R-side intermediate internal to avoid materializing both Rt arrays at API boundary.
+			P_r_Rt = sharded_ifftn(P_r_3d)
+			Z_Rt = P_l_Rt * P_r_Rt
+			return sharded_fftn(Z_Rt)
+
+		def _compute_ZCT_LR(P_l: jax.Array, P_r: jax.Array) -> jax.Array:
+			P_l_Rt = _left_ifft_conj(P_l)
+			return _right_ifft_mul_fft(P_r, P_l_Rt)
+
 		_isdf_pipeline_cache[cache_key] = _compute_ZCT_LR
 	
-	return _isdf_pipeline_cache[cache_key](P_l_k_muz, P_r_k_muz, nkx, nky, nkz)
+	return _isdf_pipeline_cache[cache_key](P_l_k_muz, P_r_k_muz)
 
 
 
@@ -751,11 +764,17 @@ def solve_zeta_from_L_q(
                 return jax.scipy.linalg.solve_triangular(L.conj().T, y, lower=False)
             return jax.vmap(solve_single)(L_batch, Z_batch)
         
-        @jax.jit
+        @partial(jax.jit, donate_argnums=(1,))
         def _solve_all_q(L_q_sharded: jax.Array, Z_col_sharded: jax.Array) -> jax.Array:
             # Reshard Z for column-parallel solve
             Z_col = jax.lax.with_sharding_constraint(Z_col_sharded, z_col_shard)
             
+            # Fast path: solve all q-points in a single batched call, avoiding
+            # zeta_init + dynamic_update buffers.
+            if q_chunk_c >= nq_c:
+                L_full_rep = jax.lax.with_sharding_constraint(L_q_sharded, L_batch_rep_shard)
+                return _sharded_cho_solve_batch(L_full_rep, Z_col)
+
             if q_chunk_c == 1:
                 # Original q-by-q loop (minimum memory)
                 def body(q, zeta_all):
@@ -1104,6 +1123,18 @@ def fit_zeta_chunked_to_h5(
             
             # Free psi_chunk arrays - we have P_k now
             del psi_chunk_Y, psi_l_chunk_Y, psi_r_chunk_Y
+
+            # Reshape to explicit 3D k-grid before ZCT kernels so donation-compatible
+            # stages see consistent input/output ranks and sharding.
+            fft_chunk_shard = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
+            P_l_k_mux = jax.lax.with_sharding_constraint(
+                P_l_k_mux.reshape(nqx, nqy, nqz, n_rmu, actual_n_rchunk),
+                fft_chunk_shard,
+            )
+            P_r_k_mux = jax.lax.with_sharding_constraint(
+                P_r_k_mux.reshape(nqx, nqy, nqz, n_rmu, actual_n_rchunk),
+                fft_chunk_shard,
+            )
             
             # 6c. Compute Z_q via left/right cross-product FFT
             t0 = time.perf_counter()
