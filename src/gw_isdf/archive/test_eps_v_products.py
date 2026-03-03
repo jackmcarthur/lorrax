@@ -23,8 +23,8 @@ import os
 import argparse
 import numpy as np
 
-from isdf.common.wfnreader import WFNReader
-from isdf.common.epsreader import EPSReader
+from common.wfnreader import WFNReader
+from common.epsreader import EPSReader
 
 
 def wrap_points_to_voronoi(randcart: np.ndarray, bvec: np.ndarray, nmax: int = 1) -> np.ndarray:
@@ -72,7 +72,7 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     # Resolve paths
-    from isdf.psp.get_DFT_mtxels import read_cohsex_input
+    from psp.get_DFT_mtxels import read_cohsex_input
     inp_dir = os.path.dirname(os.path.abspath(args.input))
     params = read_cohsex_input(args.input)
     wfn_path = params.get("wfn_file", "WFN.h5")

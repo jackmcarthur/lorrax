@@ -33,7 +33,7 @@ from .bse_ring_comm import (
     make_bse_shardings,
 )
 from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
-import isdf.common.timing as timing
+import common.timing as timing
 
 jax.config.update("jax_enable_x64", True)
 

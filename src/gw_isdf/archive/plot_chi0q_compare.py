@@ -26,11 +26,11 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import os as _os
 _os.environ.setdefault("JAX_ENABLE_X64", "1")
 
-from isdf.common.epsreader import EPSReader
-from isdf.common.wfnreader import WFNReader
-from isdf.common import symmetry_maps
-from isdf.common.chi_from_dipole import read_dipole_h5, compute_S_omega
-from isdf.psp.get_DFT_mtxels import read_cohsex_input  # type: ignore
+from common.epsreader import EPSReader
+from common.wfnreader import WFNReader
+from common import symmetry_maps
+from common.chi_from_dipole import read_dipole_h5, compute_S_omega
+from psp.get_DFT_mtxels import read_cohsex_input  # type: ignore
 
 
 def build_occupations(wfn: WFNReader) -> np.ndarray:

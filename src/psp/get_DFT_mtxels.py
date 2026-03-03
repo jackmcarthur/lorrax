@@ -32,7 +32,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from functools import partial
-# Support both `python -m isdf.psp.get_DFT_mtxels` and direct script execution
+# Support both `python -m psp.get_DFT_mtxels` and direct script execution
 try:
     from .normalize import normalize_dataclass
     from .load_upf import load_upf
@@ -45,16 +45,16 @@ except ImportError:
     import sys as _sys
     from pathlib import Path as _Path
     _sys.path.append(str(_Path(__file__).resolve().parents[2]))  # .../src
-    from isdf.psp.normalize import normalize_dataclass
-    from isdf.psp.load_upf import load_upf
-    from isdf.io import WFNReader
-    from isdf.common import symmetry_maps
-    from isdf.common.load_wfns import read_Gvecs_to_devices
-    from isdf.common import Meta
-from isdf.psp.build_projectors_qe import (
+    from psp.normalize import normalize_dataclass
+    from psp.load_upf import load_upf
+    from isdf_io import WFNReader
+    from common import symmetry_maps
+    from common.load_wfns import read_Gvecs_to_devices
+    from common import Meta
+from psp.build_projectors_qe import (
     build_local_ionic_potential_on_G_total,
 )
-from isdf.psp.projector_pipeline import (
+from psp.projector_pipeline import (
     build_vnl_plan,
     compute_V_NL_k_minimal,
 )
@@ -64,7 +64,7 @@ import h5py
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import isdf.common.timing as timing
+import common.timing as timing
 # Lightweight device report (CPU-only by default)
 try:
     devs = jax.devices()

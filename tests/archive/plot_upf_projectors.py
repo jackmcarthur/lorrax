@@ -23,8 +23,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.special import spherical_jn
 
-from isdf.psp.load_upf import load_upf
-from isdf.psp.normalize import normalize_dataclass
+from psp.load_upf import load_upf
+from psp.normalize import normalize_dataclass
 
 
 def _beta_over_r(beta: np.ndarray, r: np.ndarray) -> np.ndarray:

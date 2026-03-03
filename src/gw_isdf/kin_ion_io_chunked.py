@@ -23,12 +23,12 @@ import jax
 import jax.numpy as jnp
 import h5py
 
-from isdf.io import WFNReader
-from isdf.common import symmetry_maps, Meta
-from isdf.common.load_wfns import load_kpoint_fftbox
-import isdf.common.timing as timing
+from isdf_io import WFNReader
+from common import symmetry_maps, Meta
+from common.load_wfns import load_kpoint_fftbox
+import common.timing as timing
 
-from isdf.psp.get_DFT_mtxels import (
+from psp.get_DFT_mtxels import (
     read_cohsex_input,
     load_pseudopotentials,
     build_atom_pp_assignments,
@@ -36,7 +36,7 @@ from isdf.psp.get_DFT_mtxels import (
     compute_kinetic_k,
     compute_local_V_k,
 )
-from isdf.psp.projector_pipeline import build_vnl_plan, compute_V_NL_k_minimal
+from psp.projector_pipeline import build_vnl_plan, compute_V_NL_k_minimal
 
 
 def _resolve_against(path: str, base_dir: str) -> str:

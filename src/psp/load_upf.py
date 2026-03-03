@@ -28,7 +28,7 @@ def load_upf(upf_path: str | Path):
 		fail_on_unknown_attributes=False,
 	))
 	if version == '2.0.1':
-		from isdf.psp import upf_model_2_0_1 as model
+		from psp import upf_model_2_0_1 as model
 		root_cls = model.Upf
 		# Preprocess: rename PP_BETA.n -> PP_BETA and inject index=n for compatibility
 		try:
@@ -94,7 +94,7 @@ def load_upf(upf_path: str | Path):
 			# Fallback to direct parse if preprocessing fails
 			return parser.from_path(upf_path, root_cls)
 	else:
-		from isdf.psp import upf_model as model
+		from psp import upf_model as model
 		# pick the root (pseudo) class
 		root_cls = None
 		for name, obj in vars(model).items():
@@ -165,7 +165,7 @@ def main(argv=None):
 		return 1
 	obj = load_upf(pseudo_path)
 	if use_numpy:
-		from isdf.psp.normalize import normalize_dataclass
+		from psp.normalize import normalize_dataclass
 		obj = normalize_dataclass(obj)
 	print(f"Loaded: {os.path.basename(pseudo_path)} -> {type(obj).__name__}")
 	# convert D_ij to square array

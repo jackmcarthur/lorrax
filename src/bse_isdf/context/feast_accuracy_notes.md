@@ -72,7 +72,7 @@ includes avg GMRES iterations per window).
 ### Template command
 
 ```bash
-uv run python -m isdf.bse_isdf.bse_feast \
+uv run python -m bse_isdf.bse_feast \
   -i cohsex_prod.in --n-val 4 --n-cond 4 --n-lanczos 30 \
   --feast-ritz \
   --feast-ritz-count {N_RITZ} \

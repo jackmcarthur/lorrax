@@ -4,7 +4,7 @@ Computes Chebyshev moments of the BSE Hamiltonian using stochastic
 trace estimation, applies Jackson damping, and reconstructs the DOS.
 
 Usage:
-    python -m isdf.bse_isdf.bse_kpm -i cohsex.inp --n-val 4 --n-cond 4 --n-moments 200
+    python -m bse_isdf.bse_kpm -i cohsex.inp --n-val 4 --n-cond 4 --n-moments 200
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from jax.sharding import Mesh
 from .bse_ring_comm import build_bse_ring_matvec, build_bse_ring_matvec_full, make_bse_shardings
 from .bse_feast import estimate_spectral_bounds_sharded, _create_mesh_xy, _build_gmres_data_fp32
 from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
-import isdf.common.timing as timing
+import common.timing as timing
 
 jax.config.update("jax_enable_x64", True)
 

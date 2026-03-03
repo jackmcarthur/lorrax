@@ -38,8 +38,8 @@ from functools import partial
 
 print(f"✓ JAX initialized with device: {jax.devices()[0]}")
 
-from ..io import WFNReader
-from ..common import symmetry_maps
+from isdf_io import WFNReader
+from common import symmetry_maps
 
 # matplotlib is optional - only needed for plotting
 try:

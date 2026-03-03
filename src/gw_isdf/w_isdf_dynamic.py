@@ -20,7 +20,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 import numpy as np
 
-from isdf.common import Meta, jax_profile
+from common import Meta, jax_profile
 
 if TYPE_CHECKING:
     from .wavefunction_bundle import WavefunctionBundle

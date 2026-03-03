@@ -37,8 +37,8 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(script_dir)
 sys.path.insert(0, os.path.join(project_root, "src"))
 
-from isdf.common.wfnreader import WFNReader
-from isdf.common.symmetry_maps import SymMaps
+from common.wfnreader import WFNReader
+from common.symmetry_maps import SymMaps
 
 
 def get_psi_and_grad_psi_realspace(wfn, sym, ib, ik_full, fft_grid):

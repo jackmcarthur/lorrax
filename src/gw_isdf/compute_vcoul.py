@@ -28,7 +28,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 from functools import partial
 
-from isdf.common import timing
+from common import timing
 
 
 # ============================================================================

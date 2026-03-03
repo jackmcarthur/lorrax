@@ -6,7 +6,7 @@ This module contains utilities for:
 - Creating WFN_qp.h5 files with updated energies and rotated coefficients
 
 Usage:
-    python -m isdf.postprocess.rotate_wfn_to_qp WFN.h5 qp_wfn_rotations.h5
+    python -m postprocess.rotate_wfn_to_qp WFN.h5 qp_wfn_rotations.h5
 """
 
 __all__ = [

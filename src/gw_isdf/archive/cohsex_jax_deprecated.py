@@ -7,7 +7,7 @@ import argparse
 import configparser
 
 import numpy as np
-from isdf.common.gpu_utils import cp, xp
+from common.gpu_utils import cp, xp
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -17,14 +17,14 @@ from functools import partial
 
 # Global mesh for sharding across bands
 mesh_bands = Mesh(np.asarray(jax.devices()), ("bands",))
-from isdf.common.wfnreader import WFNReader
-from isdf.common.epsreader import EPSReader
-from isdf.common import symmetry_maps
-from isdf.common.tagged_arrays import LabeledArray, WfnArray
+from common.wfnreader import WFNReader
+from common.epsreader import EPSReader
+from common import symmetry_maps
+from common.tagged_arrays import LabeledArray, WfnArray
 from .get_windows import get_window_info
 from .w_isdf import get_chi0, get_static_w_q
-from isdf.common import Meta
-from isdf.common.gamma_matrices import gammas_sparse
+from common import Meta
+from common.gamma_matrices import gammas_sparse
 import h5py
 
 def read_cohsex_input(filename: str) -> dict:

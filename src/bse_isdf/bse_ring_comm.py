@@ -16,7 +16,7 @@ except ImportError:  # pragma: no cover - older JAX
     from jax.experimental import shard_map as _shard_map_mod
     _shard_map_fn = _shard_map_mod.shard_map
 
-import isdf.common.timing as timing
+import common.timing as timing
 from .bse_io import _find_restart_file, _load_ring_subset, load_bse_data_from_restart_sharded
 from .bse_serial import apply_D, apply_bse_hamiltonian_single_device, compute_pair_amplitude
 

@@ -18,7 +18,7 @@ cupy_stub.cuda = types.SimpleNamespace(runtime=types.SimpleNamespace(getDeviceCo
 cupy_stub.complex128 = np.complex128
 sys.modules.setdefault('cupy', cupy_stub)
 
-from isdf.common import wfnreader
+from common import wfnreader
 
 
 def ctsp_chi(A_v, A_c, valence, conduction, z, tau, w, E_gap):

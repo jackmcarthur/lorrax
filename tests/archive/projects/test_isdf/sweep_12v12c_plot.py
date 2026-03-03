@@ -6,7 +6,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from isdf.bse_isdf.pseudopoles_eval import load_pseudopoles, reconstruct_Wc_columns
+from bse_isdf.pseudopoles_eval import load_pseudopoles, reconstruct_Wc_columns
 
 
 def _load_exact(path: str) -> tuple[np.ndarray, np.ndarray, dict]:

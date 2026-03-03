@@ -8,7 +8,7 @@ This version:
 - Uses much less GPU memory for large k-grids
 
 Usage:
-  python -m isdf.psp.get_dipole_mtxels_chunked -i gw.inp --kchunk 16
+  python -m psp.get_dipole_mtxels_chunked -i gw.inp --kchunk 16
 """
 
 import os
@@ -21,9 +21,9 @@ import jax.numpy as jnp
 import h5py
 from pathlib import Path
 
-from ..io import WFNReader
-from ..common import symmetry_maps, Meta
-from ..common.load_wfns import load_kpoint_fftbox
+from isdf_io import WFNReader
+from common import symmetry_maps, Meta
+from common.load_wfns import load_kpoint_fftbox
 from .get_DFT_mtxels import (
     read_cohsex_input,
     load_pseudopotentials,

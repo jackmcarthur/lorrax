@@ -12,7 +12,7 @@ but forces the head and wings at q=0 to zero.
 
 import numpy as np
 
-from isdf.io import EPSReader
+from isdf_io import EPSReader
 
 
 def _fft_integer_axis(n: int) -> np.ndarray:

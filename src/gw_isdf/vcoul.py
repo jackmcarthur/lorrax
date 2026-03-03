@@ -8,7 +8,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from isdf.common import Meta
+from common import Meta
 
 
 

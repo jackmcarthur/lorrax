@@ -19,7 +19,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from .bse_ring_comm import build_bse_ring_matvec, build_bse_ring_matvec_full, make_bse_shardings
 from .bse_preconditioner import energy_diff_cv_k
-import isdf.common.timing as timing
+import common.timing as timing
 from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
 
 jax.config.update("jax_enable_x64", True)

@@ -13,7 +13,7 @@ Key features:
 - Uses lax.map for efficient batched processing over q-points
 
 Usage:
-    from isdf.common.cholesky_2d import cholesky_2d_batched, tiles_to_dense
+    from common.cholesky_2d import cholesky_2d_batched, tiles_to_dense
     
     # Build the batched Cholesky function for your mesh and tile sizes
     chol_fn = cholesky_2d_batched(mesh_2d, J=n//b, b=block_size)

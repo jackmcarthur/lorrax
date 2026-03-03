@@ -15,8 +15,8 @@ os.environ.setdefault("JAX_ENABLE_X64", "true")
 import numpy as np
 import matplotlib.pyplot as plt
 
-from isdf.psp.load_upf import load_upf
-from isdf.psp.normalize import normalize_dataclass
+from psp.load_upf import load_upf
+from psp.normalize import normalize_dataclass
 
 
 def main() -> int:

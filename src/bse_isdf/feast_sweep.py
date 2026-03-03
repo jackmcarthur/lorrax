@@ -5,7 +5,7 @@ then sweeps FEAST parameters (n_quad, gamma, n_ritz, window, feast_iter)
 and reports accuracy vs cost.
 
 Usage:
-    JAX_PLATFORMS=cpu uv run python -m isdf.bse_isdf.feast_sweep \
+    JAX_PLATFORMS=cpu uv run python -m bse_isdf.feast_sweep \
         -i projects/test_isdf/cohsex_test.in --n-val 4 --n-cond 4
 """
 from __future__ import annotations

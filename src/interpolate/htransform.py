@@ -13,10 +13,10 @@ from jax.scipy.special import erf
 from jax.sharding import Mesh
 from jax import lax
 
-from ..io import WFNReader
-from ..common import symmetry_maps
-from ..common import Meta
-from ..common.load_wfns import read_Gvecs_to_devices, get_sharded_wfns, get_enk_bandrange
+from isdf_io import WFNReader
+from common import symmetry_maps
+from common import Meta
+from common.load_wfns import read_Gvecs_to_devices, get_sharded_wfns, get_enk_bandrange
 
 
 def solve_q0_galerkin(

@@ -7,9 +7,9 @@ This creates Figure 3a: convergence comparison of Anderson, CROP, and
 CROP-Anderson on a tridiagonal linear system.
 
 Run with:
-    uv run python -m isdf.mixing.benchmark_synthetic
+    uv run python -m mixing.benchmark_synthetic
     # or
-    uv run python src/isdf/mixing/benchmark_synthetic.py
+    uv run python src/mixing/benchmark_synthetic.py
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 
-from isdf.mixing.acceleration import (
+from mixing.acceleration import (
     anderson_acceleration,
     crop,
     crop_anderson,
@@ -315,4 +315,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

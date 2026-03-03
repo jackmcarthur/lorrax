@@ -23,9 +23,9 @@ import os
 import argparse
 import numpy as np
 
-from isdf.common.wfnreader import WFNReader
-from isdf.common import symmetry_maps
-from isdf.common.epsreader import EPSReader
+from common.wfnreader import WFNReader
+from common import symmetry_maps
+from common.epsreader import EPSReader
 
 
 def wrap_points_to_voronoi(randcart: np.ndarray, bvec: np.ndarray, nmax: int = 1) -> np.ndarray:
@@ -122,7 +122,7 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     # Locate WFN.h5 from input
-    from isdf.psp.get_DFT_mtxels import read_cohsex_input  # reuse robust parser
+    from psp.get_DFT_mtxels import read_cohsex_input  # reuse robust parser
     params = read_cohsex_input(args.input)
     inp_dir = os.path.dirname(os.path.abspath(args.input))
     wfn_path = params.get("wfn_file", "WFN.h5")

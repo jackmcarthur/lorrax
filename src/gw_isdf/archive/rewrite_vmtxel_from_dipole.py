@@ -26,9 +26,9 @@ from pathlib import Path
 import numpy as np
 import h5py
 
-from isdf.common.wfnreader import WFNReader
-from isdf.common import symmetry_maps
-from isdf.psp.get_DFT_mtxels import read_cohsex_input  # for resolving WFN path
+from common.wfnreader import WFNReader
+from common import symmetry_maps
+from psp.get_DFT_mtxels import read_cohsex_input  # for resolving WFN path
 
 
 def _read_pol(h5grp) -> np.ndarray:
@@ -236,7 +236,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description='Rewrite BGW vmtxel.h5 dipole dataset using local dipole.h5 results')
     ap.add_argument('-i', '--input', default='cohsex_test.in', help='cohsex input to locate WFN.h5')
     ap.add_argument('--vmtxel', default='vmtxel.h5', help='Path to source vmtxel.h5')
-    ap.add_argument('--dipole', default='dipole.h5', help='Path to dipole.h5 (from isdf.psp.get_dipole_mtxels)')
+    ap.add_argument('--dipole', default='dipole.h5', help='Path to dipole.h5 (from psp.get_dipole_mtxels)')
     ap.add_argument('--out', default='vmtxel_dip.h5', help='Output HDF5 path with overwritten dipole dataset')
     args = ap.parse_args(argv)
 

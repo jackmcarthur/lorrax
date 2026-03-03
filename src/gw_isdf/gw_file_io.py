@@ -1,9 +1,9 @@
 """Backward compatibility shim for gw_file_io.
 
-All functionality has been moved to isdf.io module.
+All functionality has been moved to io module.
 This file re-exports for backward compatibility.
 """
-from isdf.io import (
+from isdf_io import (
     write_sigma_to_file,
     write_eqp_table,
     write_restart_state_to_h5,

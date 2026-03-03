@@ -4,15 +4,15 @@ import configparser
 
 import numpy as np
 import os
-from isdf.common.gpu_utils import cp, xp
-from isdf.common import Meta
-from isdf.common.wfnreader import WFNReader
-from isdf.common.epsreader import EPSReader
-from isdf.common import symmetry_maps
-from isdf.common.tagged_arrays import LabeledArray, WfnArray
+from common.gpu_utils import cp, xp
+from common import Meta
+from common.wfnreader import WFNReader
+from common.epsreader import EPSReader
+from common import symmetry_maps
+from common.tagged_arrays import LabeledArray, WfnArray
 from .get_windows import get_window_info
 from .w_isdf import get_chi0, get_static_w_q
-from isdf.common.gamma_matrices import gammas_sparse
+from common.gamma_matrices import gammas_sparse
 import h5py
 #import matplotlib.pyplot as plt
 

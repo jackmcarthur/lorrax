@@ -20,7 +20,7 @@ from .bse_ring_comm import (
     make_bse_shardings,
 )
 from .bse_feast import build_preconditioner_diagonal_sharded
-import isdf.common.timing as timing
+import common.timing as timing
 
 jax.config.update("jax_enable_x64", True)
 

@@ -22,10 +22,10 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from ..io import WFNReader
-from ..common import symmetry_maps
-from ..common.load_wfns import read_Gvecs_to_devices
-from ..common import Meta
+from isdf_io import WFNReader
+from common import symmetry_maps
+from common.load_wfns import read_Gvecs_to_devices
+from common import Meta
 from .get_DFT_mtxels import (
     read_cohsex_input,
     load_pseudopotentials,
@@ -34,7 +34,7 @@ from .get_DFT_mtxels import (
     print_atomic_structure,
 )
 
-from isdf.psp.projector_pipeline import (
+from psp.projector_pipeline import (
 	build_vnl_plan,
 	compute_V_NL_velocity_k,
     compute_V_NL_velocity_k_numeric,

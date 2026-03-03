@@ -67,7 +67,7 @@ except RuntimeError as exc:
 		_default_devices = jax.devices("cpu")
 	else:
 		raise
-from isdf.io import (
+from isdf_io import (
     WFNReader, EPSReader,
     write_sigma_to_file,
     write_restart_state_to_h5, write_w0_qmunu_to_h5,
@@ -75,8 +75,8 @@ from isdf.io import (
     write_qp_rotations_h5, load_kin_ion_submatrix,
     load_centroids, resolve_input_paths,
 )
-from isdf.common import symmetry_maps
-from isdf.common.load_wfns import (
+from common import symmetry_maps
+from common.load_wfns import (
     get_enk_bandrange,
     fit_zeta_chunked_to_h5,
 )
@@ -89,19 +89,19 @@ from .w_isdf import (
 	get_w_omega_jax_from_bundle,
 )
 from .vcoul import compute_q0_averages
-from isdf.common.chi_from_dipole import read_dipole_h5, compute_S_omega
+from common.chi_from_dipole import read_dipole_h5, compute_S_omega
 from .gw_init import get_effective_chunk_size, read_cohsex_input
 from .wavefunction_bundle import (
 	BandSlices,
 	build_wavefunction_bundle,
 	build_wavefunction_bundle_from_full,
 )
-from isdf.mixing.acceleration import (
+from mixing.acceleration import (
     rcrop_nojit, hermitian_to_upper_flat, upper_flat_to_hermitian
 )
-from isdf.common import Meta
-from isdf.common import jax_profile
-import isdf.common.timing as timing
+from common import Meta
+from common import jax_profile
+import common.timing as timing
 import h5py
 import builtins
 
@@ -821,7 +821,7 @@ def main(argv=None):
 	# Memory budget for chunked ISDF (0 = auto-detect)
 	memory_per_device_gb = params.get("memory_per_device_gb", 0.0)
 	if memory_per_device_gb <= 0:
-		from isdf.common.gpu_utils import get_device_memory_gb
+		from common.gpu_utils import get_device_memory_gb
 		memory_per_device_gb = get_device_memory_gb()
 		if jax.process_index() == 0:
 			print(f"  Auto-detected memory budget: {memory_per_device_gb:.2f} GB/device")

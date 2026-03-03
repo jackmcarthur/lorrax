@@ -35,9 +35,9 @@ import matplotlib.pyplot as plt
 
 import os as _os
 _os.environ.setdefault("JAX_ENABLE_X64", "1")
-from isdf.common.epsreader import EPSReader
-from isdf.common.wfnreader import WFNReader
-from isdf.common.chi_from_dipole import read_dipole_h5, compute_S_omega
+from common.epsreader import EPSReader
+from common.wfnreader import WFNReader
+from common.chi_from_dipole import read_dipole_h5, compute_S_omega
 
 
 def v2d_trunc_head_from_q(q_crys: np.ndarray, bvec: np.ndarray) -> float:
@@ -79,7 +79,7 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     # Resolve paths
-    from isdf.psp.get_DFT_mtxels import read_cohsex_input
+    from psp.get_DFT_mtxels import read_cohsex_input
     inp_dir = os.path.dirname(os.path.abspath(args.input))
     params = read_cohsex_input(args.input)
     wfn_path = params.get("wfn_file", "WFN.h5")

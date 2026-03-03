@@ -12,8 +12,8 @@ Final outputs retained in memory:
   - V_q(μ,ν): Coulomb matrix (if --compute-vcoul), XY-sharded
 
 Usage:
-    uv run python -m isdf.gw_isdf.test_chunked_wfn_loading -i input.in
-    uv run python -m isdf.gw_isdf.test_chunked_wfn_loading -i input.in --compute-vcoul
+    uv run python -m gw_isdf.test_chunked_wfn_loading -i input.in
+    uv run python -m gw_isdf.test_chunked_wfn_loading -i input.in --compute-vcoul
 """
 import os
 
@@ -416,7 +416,7 @@ def load_wfn_band_chunk_and_sample(
 
 def test_shard_map_fft(mesh_xy):
     """Test shard_map FFT workaround for multi-device CPU/GPU."""
-    from isdf.common.load_wfns import make_sharded_ifftn_3d
+    from common.load_wfns import make_sharded_ifftn_3d
     
     print("\n" + "="*60)
     print("Testing SHARD_MAP FFT (runs on each device independently)")

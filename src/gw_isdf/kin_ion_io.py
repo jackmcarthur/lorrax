@@ -24,14 +24,14 @@ import numpy as np
 import jax
 from jax.sharding import Mesh
 
-from isdf.io import WFNReader
-from isdf.common import symmetry_maps
-from isdf.common import Meta
-from isdf.common.load_wfns import read_Gvecs_to_devices
+from isdf_io import WFNReader
+from common import symmetry_maps
+from common import Meta
+from common.load_wfns import read_Gvecs_to_devices
 
-import isdf.common.timing as timing
+import common.timing as timing
 
-from isdf.psp.get_DFT_mtxels import (
+from psp.get_DFT_mtxels import (
     read_cohsex_input,
     load_pseudopotentials,
     get_kin_ion,

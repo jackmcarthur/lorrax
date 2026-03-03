@@ -1,4 +1,4 @@
-from isdf.psp.upf_model_2_0_1.qe_pp_2_0_1 import (
+from psp.upf_model_2_0_1.qe_pp_2_0_1 import (
     PpAeNlcc,
     PpAeVloc,
     PpAugmentation,
