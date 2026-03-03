@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import math
 from functools import lru_cache, partial
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -20,6 +21,9 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 
 from isdf.common import Meta, jax_profile
+
+if TYPE_CHECKING:
+    from .wavefunction_bundle import WavefunctionBundle
 
 
 # ============================================================================
@@ -684,3 +688,41 @@ def get_w_omega_jax(
     W_omega = w_isdf.get_static_w_q_jax(V_qmunu, chi_omega, S_qmunu, meta, mesh_xy)
     
     return W_omega, chi_omega
+
+
+def get_chi_omega_jax_from_bundle(
+    wf_bundle: "WavefunctionBundle",
+    windows,
+    omega: float,
+    meta: Meta,
+    mesh_xy: Mesh,
+):
+    """Compute dynamic χ(ω) directly from canonical WavefunctionBundle storage."""
+    s = wf_bundle.slices
+    return get_chi_omega_jax(
+        wf_bundle.x(s.v_slice), wf_bundle.y(s.v_slice),
+        wf_bundle.y(s.c_slice), wf_bundle.x(s.c_slice),
+        wf_bundle.enk[:, s.v_slice], wf_bundle.enk[:, s.c_slice],
+        windows, omega, meta, mesh_xy,
+    )
+
+
+def get_w_omega_jax_from_bundle(
+    V_qmunu: jax.Array,
+    wf_bundle: "WavefunctionBundle",
+    windows,
+    omega: float,
+    meta: Meta,
+    mesh_xy: Mesh,
+    S_qmunu: jax.Array | None = None,
+):
+    """Compute dynamic W(ω) from canonical bundle slices."""
+    s = wf_bundle.slices
+    return get_w_omega_jax(
+        V_qmunu,
+        wf_bundle.x(s.v_slice), wf_bundle.y(s.v_slice),
+        wf_bundle.y(s.c_slice), wf_bundle.x(s.c_slice),
+        wf_bundle.enk[:, s.v_slice], wf_bundle.enk[:, s.c_slice],
+        windows, omega, meta, mesh_xy,
+        S_qmunu=S_qmunu,
+    )

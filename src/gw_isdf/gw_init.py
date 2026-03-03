@@ -526,7 +526,6 @@ def read_cohsex_input(filename: str) -> dict:
 			"r_chunk_size": geti("r_chunk_size", fallback=0),    # r-axis chunk (0=auto, >0=explicit)
 			"band_chunk_size": geti("band_chunk_size", fallback=16),  # bands per FFT during r-chunk loop
 			"memory_per_device_gb": getf("memory_per_device_gb", fallback=0.0),  # 0=auto-detect
-			"use_chunked_isdf": getb("use_chunked_isdf", fallback=True),  # chunked (memory-efficient) vs original ISDF
 		}
 	else:
 		# Fallback defaults if no section found
@@ -552,8 +551,7 @@ def read_cohsex_input(filename: str) -> dict:
 			"r_chunk_size": 0,
 			"band_chunk_size": 16,
 			"memory_per_device_gb": 0.0,
-			"use_chunked_isdf": True,
-		}
+			}
 
 	# Parse optional QE-style K_POINTS block: take the number after it, read next that many lines
 	if kp_idx is not None:

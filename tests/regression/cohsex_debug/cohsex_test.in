@@ -10,7 +10,6 @@ nval = 4
 ncond = 4
 nband = 40
 sys_dim = 2
-use_chunked_isdf = true
 
 K_POINTS {crystal_b}
 5

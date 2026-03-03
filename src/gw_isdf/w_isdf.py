@@ -13,6 +13,7 @@ import os
 import math
 from functools import partial
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -24,6 +25,9 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 
 from isdf.common import Meta, jax_profile
+
+if TYPE_CHECKING:
+    from .wavefunction_bundle import WavefunctionBundle
 
 
 # ============================================================================
@@ -446,6 +450,29 @@ def compute_chi0_and_w(
     return chi_q, W_q
 
 
+def get_chi0_jax_from_bundle(
+    wf_bundle: "WavefunctionBundle",
+    windows,
+    meta: Meta,
+    mesh_xy: Mesh | None = None,
+) -> jax.Array:
+    """Compute static χ₀ directly from canonical WavefunctionBundle storage."""
+    if mesh_xy is None:
+        raise ValueError("mesh_xy is required for bundle-based chi0 evaluation")
+
+    s = wf_bundle.slices
+    psi_vTX = wf_bundle.x(s.v_slice)
+    psi_vY = wf_bundle.y(s.v_slice)
+    psi_cX = wf_bundle.y(s.c_slice)
+    psi_cTY = wf_bundle.x(s.c_slice)
+    enk_v = wf_bundle.enk[:, s.v_slice]
+    enk_c = wf_bundle.enk[:, s.c_slice]
+    return compute_chi0(
+        psi_vTX, psi_vY, psi_cX, psi_cTY,
+        enk_v, enk_c, windows, meta, mesh_xy,
+    )
+
+
 # ============================================================================
 # Legacy interface aliases (for backward compatibility)
 # ============================================================================
@@ -474,3 +501,15 @@ def get_chi_omega_jax(*args, **kwargs):
     """Dynamic χ(ω) - delegates to the dynamic implementation."""
     from .w_isdf_dynamic import get_chi_omega_jax as dynamic_chi_omega
     return dynamic_chi_omega(*args, **kwargs)
+
+
+def get_w_omega_jax_from_bundle(*args, **kwargs):
+    """Dynamic W(ω) from canonical WavefunctionBundle."""
+    from .w_isdf_dynamic import get_w_omega_jax_from_bundle as dynamic_w_omega_bundle
+    return dynamic_w_omega_bundle(*args, **kwargs)
+
+
+def get_chi_omega_jax_from_bundle(*args, **kwargs):
+    """Dynamic χ(ω) from canonical WavefunctionBundle."""
+    from .w_isdf_dynamic import get_chi_omega_jax_from_bundle as dynamic_chi_omega_bundle
+    return dynamic_chi_omega_bundle(*args, **kwargs)

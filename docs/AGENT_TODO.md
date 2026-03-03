@@ -37,8 +37,7 @@ src/isdf/common/wfn_loading/
 src/gw_isdf/
 ├── gw_jax.py       # Main driver only (~500 lines)
 ├── sigma_compute.py    # get_sigma_static_*, project_potential_to_bands
-├── qpoint_iteration.py # iter_qpoint_data, build_q_coulomb_cache
-└── preprocessing.py    # preprocess_q_loops
+└── restart_pipeline.py # restart load/validation/stage resume helpers
 ```
 
 **Benefits**:
