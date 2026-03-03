@@ -75,7 +75,7 @@ def compute_block_size_for_2d_cholesky(n_rmu: int, Pr: int, Pc: int) -> tuple[in
 # See: https://docs.jax.dev/en/latest/notebooks/shard_map.html
 # ============================================================================
 
-def make_sharded_ifftn_3d(mesh: Mesh, in_spec: P, out_spec: P):
+def make_sharded_ifftn_3d(mesh: Mesh, in_spec: P, out_spec: P, *, norm: str | None = None):
     """
     Uses shard_map to run FFT independently on each device's local data.
     The FFT axes (last 3) must NOT be sharded - only batch dims can be sharded.
@@ -89,9 +89,34 @@ def make_sharded_ifftn_3d(mesh: Mesh, in_spec: P, out_spec: P):
     """
     def _local_ifftn(x_local):
         # Each device runs FFT on its local shard independently
-        return jnp.fft.ifftn(x_local, axes=(-3, -2, -1))
+        return jnp.fft.ifftn(x_local, axes=(-3, -2, -1), norm=norm)
     
     return shard_map(_local_ifftn, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec)
+
+def make_sharded_fftn_3d(mesh: Mesh, in_spec: P, out_spec: P, *, norm: str | None = None):
+    """
+    shard_map local FFT (forward).
+    
+    This is the forward-FFT counterpart to make_sharded_ifftn_3d.
+    """
+    def _local_fftn(x_local):
+        return jnp.fft.fftn(x_local, axes=(-3, -2, -1), norm=norm)
+    
+    return shard_map(_local_fftn, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec)
+
+
+def load_kpoint_fftbox(wfn, sym, meta, k_idx, nb):
+    """Load a single k-point's wavefunction into the FFT box on GPU.
+
+    Returns jax array of shape (nb, nspinor, nx, ny, nz), ~0.55 GiB for 12x12.
+    """
+    nx, ny, nz = meta.fft_grid
+    band_indices = np.arange(nb)
+    gvecs_k = np.asarray(sym.get_gvecs_kfull(wfn, k_idx))
+    cnk = sym.get_cnk_fullzone_batch(wfn, band_indices, k_idx)
+    psi = np.zeros((nb, meta.nspinor, nx, ny, nz), dtype=np.complex128)
+    psi[:, :meta.nspinor_wfnfile, gvecs_k[:, 0], gvecs_k[:, 1], gvecs_k[:, 2]] = cnk
+    return jnp.asarray(psi)
 
 
 def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, nspinor=2):
@@ -389,110 +414,6 @@ def get_sharded_wfns(
 _compute_pair_density_cache = {}
 
 
-def compute_pair_density_k(
-	psi_rmuT_X: jax.Array,
-	psi_rmu_Y: jax.Array,
-	mesh_xy: Mesh,
-) -> jax.Array:
-	"""
-	Compute pair density P_k,ab(r_mu, r_nu) = sum_n psi*_nk,a(r_mu) * psi_nk,b(r_nu).
-	
-	This function computes the pair density matrix for all k-points at once,
-	with spin indices a,b explicitly tracked (unlike cohsex_jax which traces).
-	
-	The result is sharded with r_mu on X and r_nu on Y, enabling zero-communication
-	contraction from the input wavefunctions.
-	
-	Input shapes and shardings:
-		psi_rmuT_X: (nk, n_rmu, nb, ns) with P(None, 'x', None, None)
-			- This is conj(psi_nk,s(r_mu)) with mu sharded on X
-		psi_rmu_Y: (nk, nb, ns, n_rmu) with P(None, None, None, 'y')
-			- This is psi_nk,s(r_nu) with nu sharded on Y
-	
-	Output:
-		P_k_ab: (nk, ns, ns, n_rmu, n_rmu) with P(None, None, None, 'x', 'y')
-			- P[k, a, b, mu, nu] = sum_n psi*_nk,a(r_mu) * psi_nk,b(r_nu)
-			- mu sharded on X, nu sharded on Y (zero-comm from inputs)
-	
-	Note: This differs from cohsex_jax which computes P_mu,nu = sum_nks for the
-	spin-traced case. Here we keep spin indices explicit for different treatment.
-	"""
-	# Cache key based on shapes and mesh
-	nk, n_rmu, nb, ns = psi_rmuT_X.shape
-	cache_key = (id(mesh_xy), nk, n_rmu, nb, ns)
-	
-	if cache_key not in _compute_pair_density_cache:
-		# Define shardings
-		x1_4 = NamedSharding(mesh_xy, P(None, 'x', None, None))
-		y3_4 = NamedSharding(mesh_xy, P(None, None, None, 'y'))
-		xy_out = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-		
-		@partial(jax.jit, in_shardings=(x1_4, y3_4), out_shardings=xy_out)
-		def _compute_P(psi_L: jax.Array, psi_R: jax.Array) -> jax.Array:
-			"""
-			psi_L: (nk, n_rmu, nb, ns) - conjugated, mu on X
-			psi_R: (nk, nb, ns, n_rmu) - nu on Y
-			
-			Einsum: P[k,a,b,mu,nu] = sum_n psi_L[k,mu,n,a] * psi_R[k,n,b,nu]
-			       'kmna,knbv->kabmv'
-			"""
-			return jnp.einsum('kmna,knbv->kabmv', psi_L, psi_R, optimize=True)
-		
-		_compute_pair_density_cache[cache_key] = _compute_P
-	
-	_compute_P = _compute_pair_density_cache[cache_key]
-	return _compute_P(psi_rmuT_X, psi_rmu_Y)
-
-
-def compute_pair_density_k_zchunk(
-	psi_rmuT_X: jax.Array,
-	psi_zchunk_Y: jax.Array,
-	mesh_xy: Mesh,
-) -> jax.Array:
-	"""
-	Compute pair density P_k,ab(r_mu, r_zchunk) for ZCT accumulation.
-	
-	Same as compute_pair_density_k but with r_zchunk (a z-slice of r_tot) instead
-	of r_nu (centroids). Used for iterating over z-chunks to build ZCT without
-	storing the full psi_nk(r_tot).
-	
-	Input shapes and shardings:
-		psi_rmuT_X: (nk, n_rmu, nb, ns) with P(None, 'x', None, None)
-			- conj(psi_nk,s(r_mu)) with mu sharded on X
-		psi_zchunk_Y: (nk, nb, ns, n_zchunk) with P(None, None, None, 'y')
-			- psi_nk,s(r_zchunk) with zchunk sharded on Y
-	
-	Output:
-		P_k_ab_zchunk: (nk, ns, ns, n_rmu, n_zchunk) with P(None, None, None, 'x', 'y')
-			- P[k, a, b, mu, r] = sum_n psi*_nk,a(r_mu) * psi_nk,b(r_zchunk)
-	"""
-	nk, n_rmu, nb, ns = psi_rmuT_X.shape
-	_, _, _, n_zchunk = psi_zchunk_Y.shape
-	
-	# Different cache key due to different n_zchunk
-	cache_key = ('zchunk', id(mesh_xy), nk, n_rmu, nb, ns, n_zchunk)
-	
-	if cache_key not in _compute_pair_density_cache:
-		x1_4 = NamedSharding(mesh_xy, P(None, 'x', None, None))
-		y3_4 = NamedSharding(mesh_xy, P(None, None, None, 'y'))
-		xy_out = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-		
-		@partial(jax.jit, in_shardings=(x1_4, y3_4), out_shardings=xy_out)
-		def _compute_P_zchunk(psi_L: jax.Array, psi_R: jax.Array) -> jax.Array:
-			"""
-			psi_L: (nk, n_rmu, nb, ns) - conjugated, mu on X
-			psi_R: (nk, nb, ns, n_zchunk) - zchunk on Y
-			
-			Einsum: P[k,a,b,mu,r] = sum_n psi_L[k,mu,n,a] * psi_R[k,n,b,r]
-			       'kmna,knbr->kabmr'
-			"""
-			return jnp.einsum('kmna,knbr->kabmr', psi_L, psi_R, optimize=True)
-		
-		_compute_pair_density_cache[cache_key] = _compute_P_zchunk
-	
-	_compute_P_zchunk = _compute_pair_density_cache[cache_key]
-	return _compute_P_zchunk(psi_rmuT_X, psi_zchunk_Y)
-
 
 # ============================================================================
 # Spin-traced pair density (matching cohsex_jax treatment)
@@ -544,219 +465,12 @@ def compute_pair_density_spin_traced(
 	return _compute_pair_density_cache[cache_key](psi_rmuT_X, psi_rmu_Y)
 
 
-def compute_pair_density_spin_traced_zchunk(
-	psi_rmuT_X: jax.Array,
-	psi_zchunk_Y: jax.Array,
-	mesh_xy: Mesh,
-) -> jax.Array:
-	"""
-	Spin-traced pair density for z-chunk: P_k(μ,r) = Σ_{n,s} ψ*_{n,k,s}(μ) ψ_{n,k,s}(r).
-	
-	Input shapes and shardings:
-		psi_rmuT_X: (nk, n_rmu, nb, ns) with P(None, 'x', None, None)
-		psi_zchunk_Y: (nk, nb, ns, n_zchunk) with P(None, None, None, 'y')
-	
-	Output:
-		P_k_zchunk: (nk, n_rmu, n_zchunk) with P(None, 'x', 'y')
-	"""
-	nk, n_rmu, nb, ns = psi_rmuT_X.shape
-	_, _, _, n_zchunk = psi_zchunk_Y.shape
-	cache_key = ('spin_traced_zchunk', id(mesh_xy), nk, n_rmu, nb, ns, n_zchunk)
-	
-	if cache_key not in _compute_pair_density_cache:
-		x1_4 = NamedSharding(mesh_xy, P(None, 'x', None, None))
-		y3_4 = NamedSharding(mesh_xy, P(None, None, None, 'y'))
-		xy_out = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-		
-		@partial(jax.jit, in_shardings=(x1_4, y3_4), out_shardings=xy_out)
-		def _compute_P_traced_z(psi_L: jax.Array, psi_R: jax.Array) -> jax.Array:
-			return jnp.einsum('kmns,knsr->kmr', psi_L, psi_R, optimize=True)
-		
-		_compute_pair_density_cache[cache_key] = _compute_P_traced_z
-	
-	return _compute_pair_density_cache[cache_key](psi_rmuT_X, psi_zchunk_Y)
-
-
-# ============================================================================
-# Pair density k-space <-> R-space transforms and CCT/ZCT accumulation
-# ============================================================================
 
 # Cache for ISDF pipeline jitted functions
 _isdf_pipeline_cache = {}
 
 
-def pair_density_k_to_R(
-	P_k_ab: jax.Array,
-	kgrid: tuple[int, int, int],
-	mesh_xy: Mesh,
-) -> jax.Array:
-	"""
-	Transform pair density from k-space to R-space via ortho-IFFT.
-	
-	P_k,ab(μ,ν) -> P_R,ab(μ,ν)
-	
-	This is analogous to the G_k -> G_R transform in cohsex_jax/w_isdf.
-	The k-grid is reshaped to 3D and ortho-IFFT is applied along kx,ky,kz.
-	
-	Args:
-		P_k_ab: (nk, ns, ns, n_rmu, n_col) with P(None, None, None, 'x', 'y')
-			where n_col is either n_rmu (for CCT) or n_zchunk (for ZCT)
-		kgrid: (nkx, nky, nkz) k-grid dimensions
-		mesh_xy: Device mesh
-	
-	Returns:
-		P_R_ab: (ns, ns, n_rmu, n_col, nkx, nky, nkz) with P(None, None, 'x', 'y', None, None, None)
-			R-space pair density
-	"""
-	nkx, nky, nkz = kgrid
-	nk, ns1, ns2, n_rmu, n_col = P_k_ab.shape
-	
-	cache_key = ('k_to_R', id(mesh_xy), nk, ns1, n_rmu, n_col, nkx)
-	
-	if cache_key not in _isdf_pipeline_cache:
-		in_shard = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-		out_shard = NamedSharding(mesh_xy, P(None, None, 'x', 'y', None, None, None))
-		
-		@partial(jax.jit, in_shardings=(in_shard,), out_shardings=out_shard,
-		         static_argnames=('nkx', 'nky', 'nkz'))
-		def _k_to_R(P_k: jax.Array, nkx: int, nky: int, nkz: int) -> jax.Array:
-			# Reshape k to 3D grid: (nk, s1, s2, mu, col) -> (nkx, nky, nkz, s1, s2, mu, col)
-			P_k = P_k.reshape(nkx, nky, nkz, ns1, ns2, n_rmu, n_col)
-			# Move spatial indices last for FFT: (s1, s2, mu, col, nkx, nky, nkz)
-			P_k = P_k.transpose(3, 4, 5, 6, 0, 1, 2)
-			# Ortho IFFT along k-grid axes
-			return jnp.fft.ifftn(P_k, axes=(-3, -2, -1), norm='ortho')
-		
-		_isdf_pipeline_cache[cache_key] = _k_to_R
-	
-	return _isdf_pipeline_cache[cache_key](P_k_ab, nkx, nky, nkz)
 
-
-def pair_density_R_to_q(
-	P_R_ab: jax.Array,
-	mesh_xy: Mesh,
-) -> jax.Array:
-	"""
-	Transform pair density from R-space to q-space via ortho-FFT.
-	
-	P_R,ab(μ,col) -> P_q,ab(μ,col)
-	
-	Args:
-		P_R_ab: (ns, ns, n_rmu, n_col, nkx, nky, nkz) with P(None, None, 'x', 'y', None, None, None)
-		mesh_xy: Device mesh
-	
-	Returns:
-		P_q_ab: (nqx, nqy, nqz, ns, ns, n_rmu, n_col) with P(None, None, None, None, None, 'x', 'y')
-	"""
-	ns1, ns2, n_rmu, n_col, nkx, nky, nkz = P_R_ab.shape
-	
-	cache_key = ('R_to_q', id(mesh_xy), ns1, n_rmu, n_col, nkx)
-	
-	if cache_key not in _isdf_pipeline_cache:
-		in_shard = NamedSharding(mesh_xy, P(None, None, 'x', 'y', None, None, None))
-		out_shard = NamedSharding(mesh_xy, P(None, None, None, None, None, 'x', 'y'))
-		
-		@partial(jax.jit, in_shardings=(in_shard,), out_shardings=out_shard)
-		def _R_to_q(P_R: jax.Array) -> jax.Array:
-			# Ortho FFT along R-grid axes (last 3)
-			P_q = jnp.fft.fftn(P_R, axes=(-3, -2, -1), norm='ortho')
-			# Reorder: (s1, s2, mu, col, qx, qy, qz) -> (qx, qy, qz, s1, s2, mu, col)
-			return P_q.transpose(4, 5, 6, 0, 1, 2, 3)
-		
-		_isdf_pipeline_cache[cache_key] = _R_to_q
-	
-	return _isdf_pipeline_cache[cache_key](P_R_ab)
-
-
-def compute_CCT_ZCT_from_pair_density(
-	P_k_mumu: jax.Array,
-	P_k_mu_zchunk: jax.Array,
-	kgrid: tuple[int, int, int],
-	mesh_xy: Mesh,
-) -> tuple[jax.Array, jax.Array]:
-	"""
-	Compute CCT and ZCT matrices via ortho FFT: P_k -> P_R -> C_q/Z_q.
-	Uses Frobenius norm over spin: C_R(μ,ν) = Σ_ab |P_R,ab(μ,ν)|²
-	See docs/isdf_spin_galerkin_derivation.md for derivation.
-	"""
-	nkx, nky, nkz = kgrid
-	nk, ns1, ns2, n_rmu, _ = P_k_mumu.shape
-	_, _, _, _, n_zchunk = P_k_mu_zchunk.shape
-	
-	cache_key = ('CCT_ZCT', id(mesh_xy), nk, ns1, n_rmu, n_zchunk, nkx)
-	
-	if cache_key not in _isdf_pipeline_cache:
-		in_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-		out_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-		
-		@partial(jax.jit, in_shardings=(in_xy, in_xy), out_shardings=(out_xy, out_xy),
-		         static_argnames=('nkx', 'nky', 'nkz'))
-		def _compute_CCT_ZCT(P_mumu: jax.Array, P_mu_z: jax.Array,
-		                     nkx: int, nky: int, nkz: int) -> tuple[jax.Array, jax.Array]:
-			# ---- CCT pathway ----
-			# Input: (nk, ns, ns, n_rmu, n_rmu)
-			# Reshape to expose k-dimensions: (nkx, nky, nkz, ns, ns, n_rmu, n_rmu)
-			P_k_mumu = P_mumu.reshape(nkx, nky, nkz, ns1, ns2, n_rmu, n_rmu)
-			P_R_mumu = jnp.fft.ifftn(P_k_mumu, axes=(0, 1, 2), norm='ortho')
-			# P_R_mumu: (Rx, Ry, Rz, ns, ns, n_rmu, n_rmu)
-			
-			# Frobenius norm squared over spin (axes 3, 4)
-			C_R = jnp.sum(jnp.abs(P_R_mumu) ** 2, axis=(3, 4))
-			C_q = jnp.fft.fftn(C_R, axes=(0, 1, 2), norm='ortho')
-			# C_q: (qx, qy, qz, n_rmu, n_rmu) - already correct!
-			
-			# ---- ZCT pathway ----
-			# Input: (nk, ns, ns, n_rmu, n_zchunk)
-			P_k_muz = P_mu_z.reshape(nkx, nky, nkz, ns1, ns2, n_rmu, n_zchunk)
-			P_R_muz = jnp.fft.ifftn(P_k_muz, axes=(0, 1, 2), norm='ortho')
-			# P_R_muz: (Rx, Ry, Rz, ns, ns, n_rmu, n_zchunk)
-			
-			# Frobenius norm squared over spin (axes 3, 4)
-			Z_R = jnp.sum(jnp.abs(P_R_muz) ** 2, axis=(3, 4))
-			Z_q = jnp.fft.fftn(Z_R, axes=(0, 1, 2), norm='ortho')
-			# Z_q: (qx, qy, qz, n_rmu, n_zchunk) - already correct!
-			
-			return C_q, Z_q
-		
-		_isdf_pipeline_cache[cache_key] = _compute_CCT_ZCT
-	
-	return _isdf_pipeline_cache[cache_key](P_k_mumu, P_k_mu_zchunk, nkx, nky, nkz)
-
-
-def compute_CCT_only(
-	P_k_mumu: jax.Array,
-	kgrid: tuple[int, int, int],
-	mesh_xy: Mesh,
-) -> jax.Array:
-	"""Compute CCT matrix C_q from P_k(μ,μ) via ortho FFT pipeline."""
-	nkx, nky, nkz = kgrid
-	nk, ns1, ns2, n_rmu, _ = P_k_mumu.shape
-	
-	cache_key = ('CCT_only', id(mesh_xy), nk, ns1, n_rmu, nkx)
-	
-	if cache_key not in _isdf_pipeline_cache:
-		in_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-		out_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-		
-		@partial(jax.jit, in_shardings=in_xy, out_shardings=out_xy,
-		         static_argnames=('nkx', 'nky', 'nkz'))
-		def _compute_CCT(P_mumu: jax.Array, nkx: int, nky: int, nkz: int) -> jax.Array:
-			# Input: (nk, ns1, ns2, n_rmu, n_rmu)
-			# Reshape to expose k-dimensions: (nkx, nky, nkz, ns1, ns2, n_rmu, n_rmu)
-			P_k = P_mumu.reshape(nkx, nky, nkz, ns1, ns2, n_rmu, n_rmu)
-			P_R = jnp.fft.ifftn(P_k, axes=(0, 1, 2), norm='ortho')
-			# P_R: (Rx, Ry, Rz, ns1, ns2, n_rmu, n_rmu)
-			
-			# Frobenius norm squared over spin (axes 3, 4 are spin dimensions)
-			C_R = jnp.sum(jnp.abs(P_R) ** 2, axis=(3, 4))
-			C_q = jnp.fft.fftn(C_R, axes=(0, 1, 2), norm='ortho')
-			# C_q: (qx, qy, qz, n_rmu, n_rmu) - already in correct order!
-			
-			return C_q
-		
-		_isdf_pipeline_cache[cache_key] = _compute_CCT
-	
-	return _isdf_pipeline_cache[cache_key](P_k_mumu, nkx, nky, nkz)
 
 
 # ============================================================================
@@ -801,6 +515,11 @@ def compute_CCT_from_left_right(
 	if cache_key not in _isdf_pipeline_cache:
 		in_xy = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 		out_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
+		# Force local FFTs via shard_map helper by moving k-grid axes to the end.
+		# After transpose(..., 3,4,0,1,2), the sharding lives on the leading (mu, col) axes.
+		fft_in = P('x', 'y', None, None, None)
+		sharded_ifftn = make_sharded_ifftn_3d(mesh_xy, fft_in, fft_in, norm='forward')
+		sharded_fftn = make_sharded_fftn_3d(mesh_xy, fft_in, fft_in, norm='forward')
 		
 		@partial(jax.jit, in_shardings=(in_xy, in_xy), out_shardings=out_xy,
 		         static_argnames=('nkx', 'nky', 'nkz'))
@@ -814,49 +533,22 @@ def compute_CCT_from_left_right(
 			# With forward: IFFT is unscaled (sum), FFT divides by N.
 			# Convolution theorem: C_q = FFT(IFFT(A)* ⊙ IFFT(B))
 			# This gives C_q = Σ_k A*_k B_{k+q} (matches cohsex_jax direct sum)
-			P_l_R = jnp.fft.ifftn(P_l_3d, axes=(0, 1, 2), norm='forward')
-			P_r_R = jnp.fft.ifftn(P_r_3d, axes=(0, 1, 2), norm='forward')
+			P_l_kt = P_l_3d.transpose(3, 4, 0, 1, 2)
+			P_r_kt = P_r_3d.transpose(3, 4, 0, 1, 2)
+			P_l_Rt = sharded_ifftn(P_l_kt)
+			P_r_Rt = sharded_ifftn(P_r_kt)
 			
 			# Cross-product: C_R = conj(P_l_R) * P_r_R (element-wise)
-			C_R = jnp.conj(P_l_R) * P_r_R
+			C_Rt = jnp.conj(P_l_Rt) * P_r_Rt
 			
 			# FFT to q-space
-			C_q = jnp.fft.fftn(C_R, axes=(0, 1, 2), norm='forward')
-			return C_q
+			C_qt = sharded_fftn(C_Rt)
+			return C_qt.transpose(2, 3, 4, 0, 1)
 		
 		_isdf_pipeline_cache[cache_key] = _compute_CCT_LR
 	
 	return _isdf_pipeline_cache[cache_key](P_l_k, P_r_k, nkx, nky, nkz)
 
-
-def compute_ZCT_from_left_right(
-	P_l_k_mumu: jax.Array,
-	P_r_k_muz: jax.Array,
-	kgrid: tuple[int, int, int],
-	mesh_xy: Mesh,
-) -> jax.Array:
-	"""
-	Compute ZCT from separate left (at centroids) and right (at z-chunk) pair densities.
-	
-	Z_q(μ,r) = FFT[ conj(IFFT(P_l(μ,μ))) ⊙ IFFT(P_r(μ,r)) ]
-	
-	Wait - this is wrong! For ZCT we need:
-	Z_q(μ,r) = Σ_k exp(iq·k) [Σ_n,s ψ_l,n,k,s(μ)* ψ_l,n,k,s(μ')]  ???
-	
-	Actually looking at cohsex_jax more carefully:
-	P_l = psi_l_rmuT @ psi_l_rtot  -> (n_rmu, n_rtot)
-	P_r = psi_r_rmuT @ psi_r_rtot  -> (n_rmu, n_rtot)
-	ZCT += conj(P_l) * P_r
-	
-	So ZCT uses (μ, r) for BOTH left and right.
-	
-	Args:
-		P_l_k_mumu: Not used - kept for signature compatibility
-		P_r_k_muz: Actually we need P_l(μ,r) and P_r(μ,r) separately!
-	
-	This function needs redesign - see compute_ZCT_from_left_right_zchunk.
-	"""
-	raise NotImplementedError("Use compute_ZCT_from_left_right_zchunk instead")
 
 
 def compute_ZCT_from_left_right_zchunk(
@@ -887,6 +579,11 @@ def compute_ZCT_from_left_right_zchunk(
 	if cache_key not in _isdf_pipeline_cache:
 		in_xy = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 		out_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
+		# Force local FFTs via shard_map helper by moving k-grid axes to the end.
+		# After transpose(..., 3,4,0,1,2), the sharding lives on the leading (mu, col) axes.
+		fft_in = P('x', 'y', None, None, None)
+		sharded_ifftn = make_sharded_ifftn_3d(mesh_xy, fft_in, fft_in, norm='forward')
+		sharded_fftn = make_sharded_fftn_3d(mesh_xy, fft_in, fft_in, norm='forward')
 		
 		@partial(jax.jit, in_shardings=(in_xy, in_xy), out_shardings=out_xy,
 		         static_argnames=('nkx', 'nky', 'nkz'))
@@ -899,238 +596,30 @@ def compute_ZCT_from_left_right_zchunk(
 			# Use norm='forward' for BOTH IFFT and FFT to match direct k-sum.
 			# With forward: IFFT is unscaled (sum), FFT divides by N.
 			# This gives Z_q = Σ_k P_l*_k P_r_{k+q} (matches cohsex_jax)
-			P_l_R = jnp.fft.ifftn(P_l_3d, axes=(0, 1, 2), norm='forward')
-			P_r_R = jnp.fft.ifftn(P_r_3d, axes=(0, 1, 2), norm='forward')
+			P_l_kt = P_l_3d.transpose(3, 4, 0, 1, 2)
+			P_r_kt = P_r_3d.transpose(3, 4, 0, 1, 2)
+			P_l_Rt = sharded_ifftn(P_l_kt)
+			P_r_Rt = sharded_ifftn(P_r_kt)
 			
 			# Cross-product
-			Z_R = jnp.conj(P_l_R) * P_r_R
+			Z_Rt = jnp.conj(P_l_Rt) * P_r_Rt
 			
 			# FFT to q-space
-			Z_q = jnp.fft.fftn(Z_R, axes=(0, 1, 2), norm='forward')
-			return Z_q
+			Z_qt = sharded_fftn(Z_Rt)
+			return Z_qt.transpose(2, 3, 4, 0, 1)
 		
 		_isdf_pipeline_cache[cache_key] = _compute_ZCT_LR
 	
 	return _isdf_pipeline_cache[cache_key](P_l_k_muz, P_r_k_muz, nkx, nky, nkz)
 
 
-# ============================================================================
-# ISDF Zeta Fitting: Cholesky Solve with Optimized Sharding
-# ============================================================================
-# Strategy: "fori_loop + shard_map" (benchmarked as fastest for large n_rmu)
-#
-# Input shardings (from CCT/ZCT pipeline):
-#   C_q: (nq, n_rmu, n_rmu) with P(None, 'x', 'y')  -- flattened q-grid
-#   Z_q: (nq, n_rmu, n_zchunk) with P(None, 'x', 'y')
-#
-# Strategy:
-#   1. Reshard Z_q from P(None, 'x', 'y') to P(None, None, ('x','y'))
-#      -> Z_q(q, μ, rchunk_XY) for column-parallel solve
-#      (Verified: this resharding does NOT trigger XLA rematerialization)
-#
-#   2. For each q in fori_loop:
-#      a. Extract C_q[q] (μ_X, ν_Y) and all-gather to replicated (μ, ν)
-#      b. Cholesky: L = chol(C_q[q]) -- redundant on each device but fast
-#      c. shard_map triangular solve: zeta_q[q] = L^{-H}(L^{-1} Z_q[q])
-#         - L is replicated, Z_q[q] has P(None, ('x','y')) on columns
-#         - Solve is embarrassingly parallel over rchunk columns
-#
-# Output:
-#   zeta_q: (nq, n_rmu, n_zchunk) with P(None, None, ('x','y'))
-#
-# Communication per q:
-#   - C_q all-gather: n_rmu² × 16 bytes
-#   - For n_rmu=10k: 1.6 GB per q (high bandwidth, one collective)
-#
-# Parallelism:
-#   - Solve: each device handles n_zchunk/P columns independently
-#   - FLOPs: n_rmu² × (n_zchunk/P) per device per q
-#
-# For very large n_rmu where replication is infeasible, consider
-# custom blocked Cholesky (test_blocked_cholesky.py), but benchmarks
-# show that Strategy B is 2x faster than q-resharding for n_rmu ≥ 128.
-# ============================================================================
-
-# Cache for solve functions
-_zeta_solve_cache: dict = {}
-
-
-def solve_zeta_q_from_CCT_ZCT(
-    C_q: jax.Array,
-    Z_q: jax.Array,
-    mesh_xy: Mesh,
-) -> jax.Array:
-    """Solve C_q · zeta_q = Z_q via Cholesky, with column-parallel triangular solve."""
-    nq, n_rmu, n_rmu2 = C_q.shape
-    _, _, n_zchunk = Z_q.shape
-    assert n_rmu == n_rmu2, f"C_q must be square, got {n_rmu} x {n_rmu2}"
-    
-    cache_key = ('zeta_solve', id(mesh_xy), nq, n_rmu, n_zchunk)
-    
-    if cache_key not in _zeta_solve_cache:
-        # Define shardings
-        cct_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-        z_col_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
-        c_rep_shard = NamedSharding(mesh_xy, P(None, None))  # Replicated
-        
-        # shard_map for triangular solve with column-sharded Z
-        # L is replicated (full matrix on each device)
-        # Z_cols is local columns (n_rmu, n_zchunk/P)
-        @partial(shard_map, mesh=mesh_xy,
-                 in_specs=(P(None, None), P(None, ('x', 'y'))),
-                 out_specs=P(None, ('x', 'y')))
-        def _sharded_cho_solve(L: jax.Array, Z_cols: jax.Array) -> jax.Array:
-            """Column-parallel Cholesky solve: L L^H zeta = Z => zeta = L^{-H}(L^{-1} Z)"""
-            # Forward: L y = Z
-            y = jax.scipy.linalg.solve_triangular(L, Z_cols, lower=True)
-            # Backward: L^H zeta = y
-            zeta = jax.scipy.linalg.solve_triangular(L.conj().T, y, lower=False)
-            return zeta
-        
-        @jax.jit
-        def _solve_all_q(C_cct: jax.Array, Z_cct: jax.Array) -> jax.Array:
-            """Solve zeta for all q using fori_loop over q-points."""
-            # Reshard Z for column-parallel solve (no rematerialization)
-            Z_col = jax.lax.with_sharding_constraint(Z_cct, z_col_shard)
-            
-            def body(q, zeta_all):
-                # Extract and replicate C_q[q]
-                C_single = C_cct[q]  # (μ_X, ν_Y)
-                C_rep = jax.lax.with_sharding_constraint(C_single, c_rep_shard)
-                
-                # Cholesky factorization (redundant on each device but fast)
-                L = jnp.linalg.cholesky(C_rep)
-                
-                # Extract Z_q[q] (already column-sharded)
-                Z_single = Z_col[q]  # (μ, rchunk_XY)
-                
-                # Sharded triangular solve
-                zeta_q = _sharded_cho_solve(L, Z_single)
-                
-                # Store result
-                return zeta_all.at[q].set(zeta_q)
-            
-            # Initialize output with same sharding as Z_col
-            zeta_init = jnp.zeros_like(Z_col)
-            return jax.lax.fori_loop(0, nq, body, zeta_init)
-        
-        _zeta_solve_cache[cache_key] = _solve_all_q
-    
-    return _zeta_solve_cache[cache_key](C_q, Z_q)
-
 
 # ============================================================================
 # 2D Blocked Cholesky Solver - memory efficient for large n_rmu
 # ============================================================================
 
-# Caches for 2D Cholesky and solve functions
+# Cache for 2D Cholesky functions
 _chol_2d_cache = {}
-_solve_fn_cache = {}
-
-
-def _get_sharded_cho_solve(mesh_xy: Mesh):
-    """Get or create cached shard_map function for column-parallel triangular solve."""
-    cache_key = ('cho_solve', id(mesh_xy))
-    if cache_key not in _solve_fn_cache:
-        @partial(shard_map, mesh=mesh_xy,
-                 in_specs=(P(None, None), P(None, ('x', 'y'))),
-                 out_specs=P(None, ('x', 'y')))
-        def _sharded_cho_solve(L: jax.Array, Z_cols: jax.Array) -> jax.Array:
-            """Column-parallel solve: L L^H zeta = Z => zeta = L^{-H}(L^{-1} Z)"""
-            y = jax.scipy.linalg.solve_triangular(L, Z_cols, lower=True)
-            zeta = jax.scipy.linalg.solve_triangular(L.conj().T, y, lower=False)
-            return zeta
-        _solve_fn_cache[cache_key] = _sharded_cho_solve
-    return _solve_fn_cache[cache_key]
-
-
-def _get_solve_all_q_fn(mesh_xy: Mesh, nq: int):
-    """Get or create cached fori_loop solve function for all q-points."""
-    cache_key = ('solve_all_q', id(mesh_xy), nq)
-    if cache_key not in _solve_fn_cache:
-        L_rep_shard = NamedSharding(mesh_xy, P(None, None))
-        cho_solve = _get_sharded_cho_solve(mesh_xy)
-        
-        @jax.jit
-        def _solve_all_q(L_q_sharded: jax.Array, Z_col_sharded: jax.Array) -> jax.Array:
-            """Solve zeta for all q using fori_loop, all-gathering L[q] one at a time."""
-            def body(q, zeta_all):
-                L_single = L_q_sharded[q]
-                L_rep = jax.lax.with_sharding_constraint(L_single, L_rep_shard)
-                Z_single = Z_col_sharded[q]
-                zeta_q = cho_solve(L_rep, Z_single)
-                return zeta_all.at[q].set(zeta_q)
-            
-            zeta_init = jnp.zeros_like(Z_col_sharded)
-            return jax.lax.fori_loop(0, nq, body, zeta_init)
-        
-        _solve_fn_cache[cache_key] = _solve_all_q
-    return _solve_fn_cache[cache_key]
-
-
-def solve_zeta_q_blocked_2d(
-    C_q: jax.Array,
-    Z_q: jax.Array,
-    mesh_xy: Mesh,
-    block_size: int = None,
-) -> jax.Array:
-    """
-    Solve C_q · zeta_q = Z_q using 2D blocked Cholesky + q-by-q solve.
-    
-    Memory-efficient hybrid approach:
-    1. 2D blocked Cholesky: C_q(μ_X, ν_Y) → L_q(μ_X, ν_Y) distributed
-    2. Loop over q: all-gather L_q[q] to every device (one at a time)
-    3. Triangular solve: with Z_q(μ, rchunk_XY) column-sharded (zero comm)
-    
-    Args:
-        C_q: (nq, n_rmu, n_rmu) CCT matrix, sharded P(None, 'x', 'y')
-        Z_q: (nq, n_rmu, n_zchunk) ZCT matrix, sharded P(None, 'x', 'y')  
-        mesh_xy: 2D device mesh with axes ('x', 'y')
-        block_size: Tile block size for Cholesky. If None, auto-selects
-    
-    Returns:
-        zeta_q: (nq, n_rmu, n_zchunk) solution, sharded P(None, None, ('x','y'))
-    """
-    nq, n_rmu, n_rmu2 = C_q.shape
-    _, _, n_zchunk = Z_q.shape
-    assert n_rmu == n_rmu2, f"C_q must be square, got {n_rmu} x {n_rmu2}"
-    
-    Pr = mesh_xy.shape['x']
-    Pc = mesh_xy.shape['y']
-    
-    if block_size is None:
-        block_size, J = compute_block_size_for_2d_cholesky(n_rmu, Pr, Pc)
-    else:
-        J = n_rmu // block_size
-    
-    # Get or build cached Cholesky function
-    cache_key = ('chol_2d', id(mesh_xy), J, block_size)
-    if cache_key not in _chol_2d_cache:
-        _chol_2d_cache[cache_key] = cholesky_2d_batched(mesh_xy, J, block_size)
-    chol_fn = _chol_2d_cache[cache_key]
-    
-    # Convert C_q to tiles and apply sharding
-    C_q_tiles = dense_to_tiles(C_q, block_size)
-    tiles_shard = NamedSharding(mesh_xy, P(None, 'x', 'y', None, None))
-    C_q_tiles = jax.lax.with_sharding_constraint(C_q_tiles, tiles_shard)
-    
-    # STEP 1: 2D Blocked Cholesky
-    L_q_tiles = chol_fn(C_q_tiles)
-    
-    # Convert to dense, keep sharded P(None, 'x', 'y')
-    L_q_dense = tiles_to_dense(L_q_tiles, block_size)
-    L_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    L_q_dense = jax.lax.with_sharding_constraint(L_q_dense, L_shard)
-    
-    # STEP 2: Reshard Z for column-parallel solve
-    z_col_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
-    Z_col = jax.lax.with_sharding_constraint(Z_q, z_col_shard)
-    
-    # STEP 3: Solve using cached function
-    solve_fn = _get_solve_all_q_fn(mesh_xy, nq)
-    zeta_q = solve_fn(L_q_dense, Z_col)
-    
-    return zeta_q
 
 
 # ============================================================================
@@ -1312,74 +801,13 @@ def solve_zeta_from_L_q(
         return _solve_cache[cache_key](L_q, Z_q)
 
 
-# Cache for ZCT computation function
-_zct_cache = {}
-
-def compute_ZCT_for_zchunk(
-    P_k_mu_zchunk: jax.Array,
-    kgrid: tuple[int, int, int],
-    mesh_xy: Mesh,
-) -> jax.Array:
-    """
-    Compute ZCT matrix for a single z-chunk.
-    
-    Pipeline: P_k,ab(μ,zchunk) -> P_R,ab -> Z_R = Σ_ab|P_R|² -> Z_q
-    
-    Args:
-        P_k_mu_zchunk: (nk, ns, ns, n_rmu, n_zchunk) pair density
-        kgrid: (nkx, nky, nkz)
-        mesh_xy: Device mesh
-    
-    Returns:
-        Z_q: (nqx, nqy, nqz, n_rmu, n_zchunk) with P(None, None, None, 'x', 'y')
-    """
-    nkx, nky, nkz = kgrid
-    nk, ns1, ns2, n_rmu, n_zchunk = P_k_mu_zchunk.shape
-    
-    # Cache key based on shapes
-    cache_key = ('ZCT', id(mesh_xy), kgrid, ns1, ns2, n_rmu, n_zchunk)
-    
-    if cache_key not in _zct_cache:
-        in_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-        out_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-        
-        # Capture shape constants in closure
-        ns1_c, ns2_c, n_rmu_c, n_zchunk_c = ns1, ns2, n_rmu, n_zchunk
-        
-        @partial(jax.jit, in_shardings=in_xy, out_shardings=out_xy,
-                 static_argnames=('nkx', 'nky', 'nkz'))
-        def _compute_ZCT(P_mu_z: jax.Array, nkx: int, nky: int, nkz: int) -> jax.Array:
-            # Input: (nk, ns1, ns2, n_rmu, n_zchunk)
-            # Reshape to expose k-dimensions: (nkx, nky, nkz, ns1, ns2, n_rmu, n_zchunk)
-            P_k = P_mu_z.reshape(nkx, nky, nkz, ns1_c, ns2_c, n_rmu_c, n_zchunk_c)
-            
-            # IFFT over k-dimensions directly - NO TRANSPOSE NEEDED
-            # JAX FFT supports arbitrary axes, avoiding a full copy
-            P_R = jnp.fft.ifftn(P_k, axes=(0, 1, 2), norm='ortho')
-            # P_R: (Rx, Ry, Rz, ns1, ns2, n_rmu, n_zchunk)
-            
-            # Frobenius norm squared over spin (axes 3, 4 are spin dimensions)
-            Z_R = jnp.sum(jnp.abs(P_R) ** 2, axis=(3, 4))
-            # Z_R: (Rx, Ry, Rz, n_rmu, n_zchunk)
-            
-            # FFT over R-dimensions directly - NO TRANSPOSE NEEDED
-            Z_q = jnp.fft.fftn(Z_R, axes=(0, 1, 2), norm='ortho')
-            # Z_q: (qx, qy, qz, n_rmu, n_zchunk) - already in correct order!
-            
-            return Z_q
-        
-        _zct_cache[cache_key] = _compute_ZCT
-    
-    return _zct_cache[cache_key](P_k_mu_zchunk, nkx, nky, nkz)
-
-
 def fit_zeta_chunked_to_h5(
     wfn,
     sym,
     meta: Meta,
     centroid_indices: jax.Array,
     mesh_xy: Mesh,
-    x_chunk_size: int,
+    chunk_r: int,
     output_file: str,
     band_chunk_size: int = 16,
     q_chunk_size: int = 1,
@@ -1389,35 +817,35 @@ def fit_zeta_chunked_to_h5(
     band_range_right: tuple[int, int] | None = None,
 ):
     """
-    Full zeta fitting pipeline with x-chunk loop and HDF5 output.
-    
+    Full zeta fitting pipeline with r-chunk loop and HDF5 output.
+
     Workflow:
     1. Load wavefunctions (band-chunked FFT) for max range
     2. Slice to get left (0:b3) and right (0:b4) views
     3. Compute C_q from spin-traced P_l × P_r via ortho FFT
     4. Compute L_q = chol(C_q) using 2D blocked algorithm
-    5. For each x-chunk:
+    5. For each r-chunk:
        a. Compute psi_nk,a(r_chunk) via FFT
-       b. Compute spin-traced P_l and P_r at x-chunk
+       b. Compute spin-traced P_l and P_r at r-chunk
        c. Compute Z_q via ortho FFT with left/right cross-product
        d. Solve zeta_q = L^{-H}(L^{-1} Z_q) (q-chunked)
        e. Write zeta_q chunk to HDF5
-    
+
     Args:
         wfn: WFNReader object
         sym: SymMaps object
         meta: Meta object with system info
         centroid_indices: ISDF centroid indices
         mesh_xy: 2D device mesh
-        x_chunk_size: Number of x-slices per chunk
+        chunk_r: Number of flattened r-points per chunk
         output_file: Path to output HDF5 file
         band_chunk_size: Bands to process at once when FFTing wavefunctions (with global r)
         q_chunk_size: Q-points to solve C_q @ zeta_q = Z_q simultaneously
         bispinor: Whether to use bispinor wavefunctions
-        use_gspace_cache: If True, cache G-space across x-chunks
+        use_gspace_cache: If True, cache G-space across r-chunks
         band_range_left: (start, end) for left wfns. Default: (b0, b3)
         band_range_right: (start, end) for right wfns. Default: (b0, b4)
-    
+
     Returns:
         psi_l_rmu_Y: Left centroid wfns (nk, nb_l, ns, n_rmu), Y-sharded
         psi_l_rmuT_X: Left conjugated wfns (nk, n_rmu, nb_l, ns), X-sharded
@@ -1434,9 +862,8 @@ def fit_zeta_chunked_to_h5(
     nqx, nqy, nqz = kgrid
     nq = nqx * nqy * nqz
     
-    # Number of x-chunks (x is the slowest-varying index, so x-chunks are contiguous in r)
-    num_x_chunks = (nx + x_chunk_size - 1) // x_chunk_size
-    n_xchunk = x_chunk_size * ny * nz  # Points per full x-chunk (contiguous in r-space!)
+    num_chunks = (n_rtot + chunk_r - 1) // chunk_r
+    n_rchunk = chunk_r
     
     # Band ranges for left and right wavefunctions (cohsex_jax convention)
     # Left:  (b0, b3) = all occupied + sigma conduction
@@ -1455,7 +882,7 @@ def fit_zeta_chunked_to_h5(
     nb_full = band_range_full[1] - band_range_full[0]
     
     print(f"\n{'='*60}")
-    print(f"Zeta fitting: {num_x_chunks} x-chunks, {n_xchunk} points each")
+    print(f"Zeta fitting: {num_chunks} r-chunks, {n_rchunk} points each")
     print(f"  Left bands:  {band_range_left} ({nb_left} bands)")
     print(f"  Right bands: {band_range_right} ({nb_right} bands)")
     print(f"  Full range:  {band_range_full} ({nb_full} bands)")
@@ -1541,28 +968,29 @@ def fit_zeta_chunked_to_h5(
                 'zeta_q',
                 shape=(nqx, nqy, nqz, n_rmu, n_rtot),
                 dtype=np.complex128,
-                chunks=(1, 1, 1, n_rmu, n_xchunk),  # Chunk by x-slice (contiguous in r!)
+                chunks=(1, 1, 1, n_rmu, n_rchunk),  # Chunk by r-slice (contiguous in r!)
             )
             # Store metadata
             f.attrs['n_rmu'] = n_rmu
             f.attrs['n_rtot'] = n_rtot
             f.attrs['fft_grid'] = meta.fft_grid
             f.attrs['kgrid'] = kgrid
-            f.attrs['x_chunk_size'] = x_chunk_size
-            f.attrs['num_x_chunks'] = num_x_chunks
+            f.attrs['chunk_mode'] = 'r'
+            f.attrs['r_chunk_size'] = chunk_r
+            f.attrs['num_r_chunks'] = num_chunks
     
     # Synchronize before writing
     jax.experimental.multihost_utils.sync_global_devices("zeta_h5_create")
     
     # ========== STEP 5: Pre-load G-space for all band chunks (ONCE) ==========
     # This caches the expensive HDF5 read + scatter so we don't repeat it
-    # for each x-chunk. Memory cost depends on band_range_full (can be large).
+    # for each r-chunk. Memory cost depends on band_range_full (can be large).
     kgrid_arr = np.array(meta.kgrid)
     kvecs_frac = sym.kvecs_asints / kgrid_arr[None, :]
     
     if use_gspace_cache:
         with timing.section("zeta_fit.cache_gspace"):
-            print("\nCaching G-space wavefunctions for x-chunk loop...")
+            print("\nCaching G-space wavefunctions for r-chunk loop...")
             # Cache FULL band range (max of left and right)
             cached_gspace = load_gspace_for_bands(
                 wfn, sym, meta, mesh_xy, band_range_full, bispinor, band_chunk_size
@@ -1571,9 +999,9 @@ def fit_zeta_chunked_to_h5(
     else:
         cached_gspace = None
         print("\nG-space caching DISABLED (too large for memory budget)")
-        print("  Will reload from HDF5 each x-chunk (slower)")
+        print("  Will reload from HDF5 each r-chunk (slower)")
     
-    # ========== STEP 6: Loop over x-chunks ==========
+    # ========== STEP 6: Loop over chunks ==========
     # Track timing for summary (manual perf_counter for detailed breakdown)
     t_load_total = 0.0
     t_pair_total = 0.0
@@ -1589,10 +1017,9 @@ def fit_zeta_chunked_to_h5(
     
     def writer_worker():
         """Background thread that processes HDF5 writes from the queue.
-        
-        X-chunking advantage: With r = x*(ny*nz) + y*nz + z, an x-chunk with
-        x in [x_start, x_end) maps to CONTIGUOUS r-indices [x_start*ny*nz, x_end*ny*nz).
-        This enables a single sequential HDF5 write per chunk!
+
+        R-chunking advantage: r-slices are contiguous in the flattened xyz
+        index, enabling a single sequential HDF5 write per chunk.
         """
         try:
             while True:
@@ -1600,8 +1027,8 @@ def fit_zeta_chunked_to_h5(
                 if item is None:  # Poison pill signals shutdown
                     break
                 zeta_data, r_start, r_end, chunk_id = item
-                # zeta_data: (nq, n_rmu, actual_n_xchunk) 
-                # X-chunks are CONTIGUOUS in r-space, so we can write directly!
+                # zeta_data: (nq, n_rmu, actual_n_rchunk)
+                # R-chunks are contiguous in r-space, so we can write directly!
                 
                 with h5py.File(output_file, 'a') as f:
                     for q_flat in range(nq):
@@ -1622,64 +1049,58 @@ def fit_zeta_chunked_to_h5(
         writer_thread.start()
     
     with timing.section("zeta_fit.chunk_loop"):
-        for chunk_idx in range(num_x_chunks):
-            x_start = chunk_idx * x_chunk_size
-            x_end = min(x_start + x_chunk_size, nx)
-            actual_x_size = x_end - x_start
-            actual_n_xchunk = actual_x_size * ny * nz
-            
-            # X-chunks are CONTIGUOUS in r-space: r = x*(ny*nz) + y*nz + z
-            r_start = x_start * ny * nz
-            r_end = x_end * ny * nz
-            
-            print(f"Chunk {chunk_idx+1}/{num_x_chunks}: x=[{x_start}:{x_end}], r=[{r_start}:{r_end}]")
+        for chunk_idx in range(num_chunks):
+            r_start = chunk_idx * chunk_r
+            r_end = min(r_start + chunk_r, n_rtot)
+            actual_n_rchunk = r_end - r_start
+            print(f"Chunk {chunk_idx+1}/{num_chunks}: r=[{r_start}:{r_end}]")
             
             # 6a. Get psi_nk,a(r_chunk) for FULL band range
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.load"):
                 if cached_gspace is not None:
                     # Fast path: FFT only (G-space is cached)
-                    psi_xchunk_full_Y = get_psi_xchunk_from_cached(
+                    psi_chunk_Y = get_psi_rchunk_from_cached(
                         cached_gspace, meta, mesh_xy, band_range_full,
-                        x_start, x_end, kvecs_frac,
+                        r_start, r_end, kvecs_frac,
                         band_chunk_size=band_chunk_size
                     )
                 else:
                     # Slow path: reload from HDF5 each chunk
-                    psi_xchunk_full_Y = get_psi_xchunk(
+                    psi_chunk_Y = get_psi_rchunk(
                         wfn, sym, meta, mesh_xy, band_range_full,
-                        x_start, x_end, bispinor,
+                        r_start, r_end, bispinor,
                         band_chunk_size=band_chunk_size
                     )
-                psi_xchunk_full_Y.block_until_ready()
+                psi_chunk_Y.block_until_ready()
                 
                 # Slice for left and right (same logic as centroids)
-                psi_l_xchunk_Y = psi_xchunk_full_Y[:, l_band_start:l_band_end, :, :]
-                psi_r_xchunk_Y = psi_xchunk_full_Y[:, r_band_start:r_band_end, :, :]
+                psi_l_chunk_Y = psi_chunk_Y[:, l_band_start:l_band_end, :, :]
+                psi_r_chunk_Y = psi_chunk_Y[:, r_band_start:r_band_end, :, :]
             t_load_total += time.perf_counter() - t0
             
             # 6b. Compute spin-traced pair densities for left and right
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.pair_density"):
                 # Left: P_l_k(μ, r) = Σ_{n,s} ψ*_l(μ) ψ_l(r)
-                P_l_k_mux = compute_pair_density_spin_traced_xchunk(
-                    psi_l_rmuT_X, psi_l_xchunk_Y, mesh_xy
+                P_l_k_mux = compute_pair_density_spin_traced(
+                    psi_l_rmuT_X, psi_l_chunk_Y, mesh_xy
                 )
                 # Right: P_r_k(μ, r) = Σ_{n,s} ψ*_r(μ) ψ_r(r)
-                P_r_k_mux = compute_pair_density_spin_traced_xchunk(
-                    psi_r_rmuT_X, psi_r_xchunk_Y, mesh_xy
+                P_r_k_mux = compute_pair_density_spin_traced(
+                    psi_r_rmuT_X, psi_r_chunk_Y, mesh_xy
                 )
                 P_l_k_mux.block_until_ready()
                 P_r_k_mux.block_until_ready()
             t_pair_total += time.perf_counter() - t0
             
-            # Free psi_xchunk arrays - we have P_k now
-            del psi_xchunk_full_Y, psi_l_xchunk_Y, psi_r_xchunk_Y
+            # Free psi_chunk arrays - we have P_k now
+            del psi_chunk_Y, psi_l_chunk_Y, psi_r_chunk_Y
             
             # 6c. Compute Z_q via left/right cross-product FFT
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.ZCT"):
-                Z_q = compute_ZCT_from_left_right_xchunk(
+                Z_q = compute_ZCT_from_left_right_zchunk(
                     P_l_k_mux, P_r_k_mux, kgrid, mesh_xy
                 )
                 Z_q.block_until_ready()
@@ -1687,7 +1108,7 @@ def fit_zeta_chunked_to_h5(
                 # Free P_k arrays - we have Z_q now
                 del P_l_k_mux, P_r_k_mux
                 
-                Z_q_flat = Z_q.reshape(nq, n_rmu, actual_n_xchunk)
+                Z_q_flat = Z_q.reshape(nq, n_rmu, actual_n_rchunk)
                 Z_q_flat = jax.lax.with_sharding_constraint(Z_q_flat, flat_shard)
                 Z_q_flat.block_until_ready()
                 
@@ -1712,9 +1133,9 @@ def fit_zeta_chunked_to_h5(
                 if jax.process_index() == 0:
                     # Gather the sharded array from all processes to process 0
                     zeta_gathered = jax.experimental.multihost_utils.process_allgather(zeta_chunk, tiled=False)
-                    zeta_cpu = np.asarray(zeta_gathered)  # (nq, n_rmu, n_xchunk) on CPU
+                    zeta_cpu = np.asarray(zeta_gathered)  # (nq, n_rmu, n_rchunk) on CPU
                     
-                    # Queue the write with r-range (x-chunks are contiguous in r-space!)
+                    # Queue the write with r-range (r-chunks are contiguous!)
                     write_queue.put((zeta_cpu, r_start, r_end, chunk_idx))
                 else:
                     # Other processes must also participate in the collective gather
@@ -1751,16 +1172,16 @@ def fit_zeta_chunked_to_h5(
     print(f"Zeta fitting complete!")
     print(f"  Shape: ({nqx}, {nqy}, {nqz}, {n_rmu}, {n_rtot})")
     print(f"{'='*60}")
-    print(f"\nTiming Summary ({num_x_chunks} x-chunks):")
+    print(f"\nTiming Summary ({num_chunks} r-chunks):")
     print(f"  {'Phase':<20} {'Total':>10} {'Per-chunk':>12} {'%':>6}")
     print(f"  {'-'*50}")
-    print(f"  {'Load xchunk':<20} {t_load_total:>10.2f}s {t_load_total/num_x_chunks*1000:>10.1f}ms {100*t_load_total/t_chunks_total:>6.1f}%")
-    print(f"  {'Pair density':<20} {t_pair_total:>10.2f}s {t_pair_total/num_x_chunks*1000:>10.1f}ms {100*t_pair_total/t_chunks_total:>6.1f}%")
-    print(f"  {'ZCT (FFT pipeline)':<20} {t_zct_total:>10.2f}s {t_zct_total/num_x_chunks*1000:>10.1f}ms {100*t_zct_total/t_chunks_total:>6.1f}%")
-    print(f"  {'Solve (L^-1 Z)':<20} {t_solve_total:>10.2f}s {t_solve_total/num_x_chunks*1000:>10.1f}ms {100*t_solve_total/t_chunks_total:>6.1f}%")
-    print(f"  {'H5 write':<20} {t_write_total:>10.2f}s {t_write_total/num_x_chunks*1000:>10.1f}ms {100*t_write_total/t_chunks_total:>6.1f}%")
+    print(f"  {'Load chunk':<20} {t_load_total:>10.2f}s {t_load_total/num_chunks*1000:>10.1f}ms {100*t_load_total/t_chunks_total:>6.1f}%")
+    print(f"  {'Pair density':<20} {t_pair_total:>10.2f}s {t_pair_total/num_chunks*1000:>10.1f}ms {100*t_pair_total/t_chunks_total:>6.1f}%")
+    print(f"  {'ZCT (FFT pipeline)':<20} {t_zct_total:>10.2f}s {t_zct_total/num_chunks*1000:>10.1f}ms {100*t_zct_total/t_chunks_total:>6.1f}%")
+    print(f"  {'Solve (L^-1 Z)':<20} {t_solve_total:>10.2f}s {t_solve_total/num_chunks*1000:>10.1f}ms {100*t_solve_total/t_chunks_total:>6.1f}%")
+    print(f"  {'H5 write':<20} {t_write_total:>10.2f}s {t_write_total/num_chunks*1000:>10.1f}ms {100*t_write_total/t_chunks_total:>6.1f}%")
     print(f"  {'-'*50}")
-    print(f"  {'Chunk loop total':<20} {t_chunks_total:>10.2f}s {t_chunks_total/num_x_chunks*1000:>10.1f}ms")
+    print(f"  {'Chunk loop total':<20} {t_chunks_total:>10.2f}s {t_chunks_total/num_chunks*1000:>10.1f}ms")
     print(f"  {'Per r-point':<20} {'':<10} {t_chunks_total/n_rtot*1e6:>10.1f}μs")
     
     # Return left and right centroid wavefunctions (persist for downstream use)
@@ -1808,288 +1229,60 @@ def load_gspace_for_bands(
     return cached_gspace
 
 
-def get_psi_zchunk_from_cached(
-    cached_gspace: list[tuple[jax.Array, tuple[int, int]]],
-    meta, mesh_xy, band_range, z_start, z_end, kvecs_frac,
-    band_chunk_size: int = 16,
-) -> jax.Array:
-    """
-    Extract z-chunk from pre-loaded G-space (FFT only, no HDF5 read).
-    
-    This is the fast path that reuses cached G-space across z-chunk iterations.
-    
-    Args:
-        cached_gspace: Pre-loaded G-space from load_gspace_for_bands()
-        meta: Meta object
-        mesh_xy: Device mesh
-        band_range: (b_start, b_end) - total bands needed
-        z_start, z_end: Z-slice range
-        kvecs_frac: (nk, 3) k-vectors in fractional coordinates
-        band_chunk_size: Bands to FFT at once
-    
-    Returns:
-        psi_zchunk_Y: (nk, nb, ns, n_zchunk) with P(None, None, None, 'y')
-    """
-    nx, ny, nz = meta.fft_grid
-    n_zchunk = nx * ny * (z_end - z_start)
-    b_start, b_end = band_range
-    nb_total = b_end - b_start
-    nk_tot = meta.nk_tot
-    nspinor = meta.nspinor
-    
-    # Output sharding
-    out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
-    
-    # Allocate output array for all bands (z-chunk is small enough)
-    psi_zchunk_all = jnp.zeros((nk_tot, nb_total, nspinor, n_zchunk), dtype=jnp.complex128)
-    psi_zchunk_all = jax.lax.with_sharding_constraint(psi_zchunk_all, out_Y)
-    
-    # Process each cached band chunk - FFT only (no HDF5 read)
-    for bc_idx, (global_psi_Gtot, bc_range) in enumerate(cached_gspace):
-        nb_chunk = bc_range[1] - bc_range[0]
-        
-        # FFT and extract z-slice for this chunk
-        psi_zchunk_chunk = get_sharded_wfns_zchunk_slice(
-            global_psi_Gtot, meta, z_start, z_end, kvecs_frac, mesh_xy, bc_range
-        )
-        
-        # Place into output array at correct band indices
-        local_bc_start = bc_idx * band_chunk_size
-        local_bc_end = local_bc_start + nb_chunk
-        psi_zchunk_all = psi_zchunk_all.at[:, local_bc_start:local_bc_end, :, :].set(psi_zchunk_chunk)
-        
-        # Free FFT output only (keep G-space cached)
-        del psi_zchunk_chunk
-    
-    return psi_zchunk_all
+
+# ============================================================================
+# R-CHUNK EXTRACTION: Contiguous r-space chunking via flattened r-index
+# ============================================================================
+# R-chunking advantage: r in [r_start, r_end) is contiguous in r-space and can
+# be written to HDF5 in a single sequential operation. This allows arbitrary
+# chunk sizes by slicing along the flattened xyz index.
+# ============================================================================
+
+# Cache for rchunk extraction function
+_rchunk_slice_cache = {}
 
 
-def get_psi_zchunk(
-    wfn, sym, meta, mesh_xy, band_range, z_start, z_end, bispinor,
-    band_chunk_size: int = 16,
-) -> jax.Array:
-    """
-    Load and FFT wavefunctions for a specific z-chunk.
-    
-    NOTE: This function reloads G-space from HDF5 each call. For multiple
-    z-chunks, use load_gspace_for_bands() + get_psi_zchunk_from_cached()
-    to avoid redundant HDF5 reads.
-    
-    Uses band chunking to limit memory during FFT step:
-    - Loop over band chunks
-    - FFT each chunk to real-space (the memory bottleneck)
-    - Extract z-slice and accumulate into output array
-    
-    The final psi_zchunk has all bands but only the z-slice, which is
-    small enough to hold in memory for downstream pair density computation.
-    
-    Args:
-        wfn: WFNReader
-        sym: SymMaps
-        meta: Meta object
-        mesh_xy: Device mesh
-        band_range: (b_start, b_end) - total bands needed
-        z_start, z_end: Z-slice range
-        bispinor: Whether to use bispinor
-        band_chunk_size: Bands to FFT at once (memory control for FFT step)
-    
-    Returns:
-        psi_zchunk_Y: (nk, nb, ns, n_zchunk) with P(None, None, None, 'y')
-    """
-    # Get k-vectors from sym (as fractions of kgrid)
-    kgrid = np.array(meta.kgrid)
-    kvecs_frac = sym.kvecs_asints / kgrid[None, :]  # (nk, 3) in fractional coords
-    
-    # Load G-space and extract z-chunk (non-cached path)
-    cached_gspace = load_gspace_for_bands(
-        wfn, sym, meta, mesh_xy, band_range, bispinor, band_chunk_size
-    )
-    
-    result = get_psi_zchunk_from_cached(
-        cached_gspace, meta, mesh_xy, band_range, z_start, z_end, kvecs_frac,
-        band_chunk_size
-    )
-    
-    # Free cached G-space
-    del cached_gspace
-    
-    return result
-
-
-# Cache for zchunk extraction function
-_zchunk_slice_cache = {}
-
-
-def get_sharded_wfns_zchunk_slice(
+def get_sharded_wfns_rchunk_slice(
     global_psi_Gtot: jax.Array,
     meta: Meta,
-    z_start: int,
-    z_end: int,
+    r_start: int,
+    r_end: int,
     kvecs_frac: np.ndarray,
     mesh_xy: Mesh,
     band_range: tuple[int, int],
 ) -> jax.Array:
     """
-    FFT wavefunctions and extract z-chunk via slicing (not gather).
+    FFT wavefunctions and extract r-chunk via flattened r-index slicing.
     
-    Uses z-axis slicing before flattening for better XLA optimization.
-    This avoids the "involuntary full rematerialization" warning that
-    occurs with gather-based resharding.
-    
-    Args:
-        global_psi_Gtot: G-space wfns from read_Gvecs_to_devices
-        meta: Meta object
-        z_start, z_end: Z-slice range [z_start, z_end)
-        kvecs_frac: (nk, 3) k-vectors in fractional coordinates
-        mesh_xy: Device mesh
-        band_range: (b_start, b_end)
-    
-    Returns:
-        psi_zchunk_Y: (nk, nb, ns, n_zchunk) with P(None, None, None, 'y')
-    """
-    nk_tot = meta.nk_tot
-    nspinor = meta.nspinor
-    fft_grid = meta.fft_grid
-    nx, ny, nz = fft_grid
-    z_chunk_size = z_end - z_start
-    n_zchunk = nx * ny * z_chunk_size
-    b_start, b_end = band_range
-    nb = b_end - b_start
-    n_rtot = nx * ny * nz
-    
-    # Cache key - use hash of kvecs since it's constant for a given system
-    kvecs_hash = hash(kvecs_frac.tobytes())
-    cache_key = ('zchunk_slice', id(mesh_xy), nk_tot, nspinor, z_chunk_size, nx, ny, nz, kvecs_hash)
-    
-    if cache_key not in _zchunk_slice_cache:
-        out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
-        
-        sharded_ifftn = make_sharded_ifftn_3d(
-            mesh_xy, 
-            P(None, ('x', 'y'), None, None, None, None),
-            P(None, ('x', 'y'), None, None, None, None)
-        )
-        
-        # Intermediate sharding for staged reshard: gather bands over X first
-        stage1_shard = NamedSharding(mesh_xy, P(None, 'y', None, None))
-        
-        # Pre-compute phase grids and kvecs ONCE in closure (not passed as args)
-        fx_cached = jnp.arange(nx, dtype=jnp.float64)[None, :, None, None] / nx
-        fy_cached = jnp.arange(ny, dtype=jnp.float64)[None, None, :, None] / ny
-        fz_cached = jnp.arange(nz, dtype=jnp.float64)[None, None, None, :] / nz
-        kvecs_cached = jnp.asarray(kvecs_frac)  # Cache kvecs in closure
-        n_rtot_cached = n_rtot
-        
-        # z_chunk_size is static (from cache key), z_start is dynamic
-        z_chunk_size_static = z_chunk_size
-        
-        @partial(jax.jit, static_argnames=('nb_static',))
-        def _extract_zchunk_slice(psi_G, z_start_dyn, nb_static):
-            # FFT to real space: (nk, nb_padded, ns, nx, ny, nz)
-            psi_r = sharded_ifftn(psi_G)
-            
-            # Apply Bloch phase exp(ik·r) - use cached phase grids and kvecs from closure
-            phase_spatial = jnp.exp(
-                2j * jnp.pi * (
-                    kvecs_cached[:, 0:1, None, None] * fx_cached
-                    + kvecs_cached[:, 1:2, None, None] * fy_cached
-                    + kvecs_cached[:, 2:3, None, None] * fz_cached
-                )
-            )
-            psi_r = psi_r * phase_spatial[:, None, None, :, :, :]
-            
-            # Normalize
-            psi_r = psi_r * jnp.sqrt(n_rtot_cached)
-            
-            # Trim bands
-            psi_r = psi_r[:, :nb_static, :, :, :, :]
-            
-            # Slice z-axis with DYNAMIC start, STATIC size
-            # psi_r: (nk, nb, ns, nx, ny, nz) -> (nk, nb, ns, nx, ny, z_chunk)
-            psi_zslice = jax.lax.dynamic_slice(
-                psi_r,
-                (0, 0, 0, 0, 0, z_start_dyn),
-                (nk_tot, nb_static, nspinor, nx, ny, z_chunk_size_static)
-            )
-            
-            # Flatten spatial dims: (nk, nb, ns, nx*ny*z_chunk)
-            psi_zchunk = psi_zslice.reshape(nk_tot, nb_static, nspinor, -1)
-            
-            # STAGED RESHARD to avoid XLA "involuntary full rematerialization":
-            # Direct reshard from P(None, ('x','y'), None, None) → P(None, None, None, 'y')
-            # causes XLA to replicate the entire array before repartitioning.
-            # By breaking into two steps, XLA can use efficient collectives:
-            #
-            # Stage 1: P(None, ('x','y'), None, None) → P(None, 'y', None, None)
-            #          all-gather bands over X axis only
-            psi_zchunk = jax.lax.with_sharding_constraint(psi_zchunk, stage1_shard)
-            
-            # Stage 2: P(None, 'y', None, None) → P(None, None, None, 'y')
-            #          all-gather bands over Y, then slice zchunk for Y position
-            psi_zchunk = jax.lax.with_sharding_constraint(psi_zchunk, out_Y)
-            
-            return psi_zchunk
-        
-        _zchunk_slice_cache[cache_key] = _extract_zchunk_slice
-    
-    # Call cached function - psi_G and z_start are dynamic, nb is static per band chunk
-    return _zchunk_slice_cache[cache_key](global_psi_Gtot, z_start, nb)
-
-
-# ============================================================================
-# X-CHUNK EXTRACTION: Contiguous r-space chunking via x-axis slicing
-# ============================================================================
-# X-chunking advantage: With r = x*(ny*nz) + y*nz + z, an x-chunk with
-# x in [x_start, x_end) maps to CONTIGUOUS r-indices [x_start*ny*nz, x_end*ny*nz).
-# This enables single sequential HDF5 writes instead of strided writes.
-# ============================================================================
-
-# Cache for xchunk extraction function
-_xchunk_slice_cache = {}
-
-
-def get_sharded_wfns_xchunk_slice(
-    global_psi_Gtot: jax.Array,
-    meta: Meta,
-    x_start: int,
-    x_end: int,
-    kvecs_frac: np.ndarray,
-    mesh_xy: Mesh,
-    band_range: tuple[int, int],
-) -> jax.Array:
-    """
-    FFT wavefunctions and extract x-chunk via slicing.
-    
-    X-chunking gives CONTIGUOUS r-indices: slicing x in [x_start, x_end)
-    produces r-indices [x_start*ny*nz, x_end*ny*nz) which can be written
+    R-chunking gives CONTIGUOUS r-indices: slicing r in [r_start, r_end)
+    produces a contiguous block in the flattened xyz order and can be written
     to HDF5 in a single sequential operation.
     
     Args:
         global_psi_Gtot: G-space wfns from read_Gvecs_to_devices
         meta: Meta object
-        x_start, x_end: X-slice range [x_start, x_end)
+        r_start, r_end: R-index range [r_start, r_end)
         kvecs_frac: (nk, 3) k-vectors in fractional coordinates
         mesh_xy: Device mesh
         band_range: (b_start, b_end)
     
     Returns:
-        psi_xchunk_Y: (nk, nb, ns, n_xchunk) with P(None, None, None, 'y')
+        psi_rchunk_Y: (nk, nb, ns, n_rchunk) with P(None, None, None, 'y')
     """
     nk_tot = meta.nk_tot
     nspinor = meta.nspinor
     fft_grid = meta.fft_grid
     nx, ny, nz = fft_grid
-    x_chunk_size = x_end - x_start
-    n_xchunk = x_chunk_size * ny * nz  # CONTIGUOUS in r-space!
+    r_chunk_size = r_end - r_start
     b_start, b_end = band_range
     nb = b_end - b_start
     n_rtot = nx * ny * nz
     
     # Cache key - use hash of kvecs since it's constant for a given system
     kvecs_hash = hash(kvecs_frac.tobytes())
-    cache_key = ('xchunk_slice', id(mesh_xy), nk_tot, nspinor, x_chunk_size, nx, ny, nz, kvecs_hash)
+    cache_key = ('rchunk_slice', id(mesh_xy), nk_tot, nspinor, r_chunk_size, nx, ny, nz, kvecs_hash)
     
-    if cache_key not in _xchunk_slice_cache:
+    if cache_key not in _rchunk_slice_cache:
         out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
         
         sharded_ifftn = make_sharded_ifftn_3d(
@@ -2108,14 +1301,16 @@ def get_sharded_wfns_xchunk_slice(
         kvecs_cached = jnp.asarray(kvecs_frac)
         n_rtot_cached = n_rtot
         
-        # x_chunk_size is static (from cache key), x_start is dynamic
-        x_chunk_size_static = x_chunk_size
+        # r_chunk_size is static (from cache key), r_start is dynamic
+        r_chunk_size_static = r_chunk_size
         
+        band_shard = P(None, ('x', 'y'), None, None)
+
         @partial(jax.jit, static_argnames=('nb_static',))
-        def _extract_xchunk_slice(psi_G, x_start_dyn, nb_static):
+        def _extract_rchunk_slice(psi_G, r_start_dyn, nb_static):
             # FFT to real space: (nk, nb_padded, ns, nx, ny, nz)
             psi_r = sharded_ifftn(psi_G)
-            
+
             # Apply Bloch phase exp(ik·r)
             phase_spatial = jnp.exp(
                 2j * jnp.pi * (
@@ -2125,61 +1320,70 @@ def get_sharded_wfns_xchunk_slice(
                 )
             )
             psi_r = psi_r * phase_spatial[:, None, None, :, :, :]
-            
+
             # Normalize
             psi_r = psi_r * jnp.sqrt(n_rtot_cached)
-            
-            # Trim bands
-            psi_r = psi_r[:, :nb_static, :, :, :, :]
-            
-            # Slice x-axis with DYNAMIC start, STATIC size
-            # psi_r: (nk, nb, ns, nx, ny, nz) -> (nk, nb, ns, x_chunk, ny, nz)
-            psi_xslice = jax.lax.dynamic_slice(
-                psi_r,
-                (0, 0, 0, x_start_dyn, 0, 0),
-                (nk_tot, nb_static, nspinor, x_chunk_size_static, ny, nz)
-            )
-            
-            # Flatten spatial dims: (nk, nb, ns, x_chunk*ny*nz)
-            # This is CONTIGUOUS in r-space since r = x*ny*nz + y*nz + z
-            psi_xchunk = psi_xslice.reshape(nk_tot, nb_static, nspinor, -1)
-            
-            # Staged reshard
-            psi_xchunk = jax.lax.with_sharding_constraint(psi_xchunk, stage1_shard)
-            psi_xchunk = jax.lax.with_sharding_constraint(psi_xchunk, out_Y)
-            
-            return psi_xchunk
+
+            # NOTE: Do NOT trim bands here. psi_r has padded band count
+            # (divisible by mesh size) which shard_map requires. Trim after reshard.
+            nb_padded = psi_r.shape[1]
+
+            # Flatten spatial dims: (nk, nb_padded, ns, nx*ny*nz)
+            psi_flat = psi_r.reshape(nk_tot, nb_padded, nspinor, n_rtot_cached)
+
+            # Local r-slice via shard_map: each device slices its own band
+            # shard WITHOUT triggering an all-gather of all 80 bands.
+            def _local_rslice(psi_local, r_start_arr):
+                return jax.lax.dynamic_slice_in_dim(
+                    psi_local, r_start_arr[0], r_chunk_size_static, axis=3
+                )
+
+            psi_rchunk = shard_map(
+                _local_rslice,
+                mesh=mesh_xy,
+                in_specs=(band_shard, P()),
+                out_specs=band_shard,
+            )(psi_flat, jnp.array([r_start_dyn]))
+            # psi_rchunk: (nk, nb_padded_local, ns, r_chunk_size) per device — small!
+
+            # Staged reshard: now all-gather bands on the SMALL r-chunk array
+            psi_rchunk = jax.lax.with_sharding_constraint(psi_rchunk, stage1_shard)
+            psi_rchunk = jax.lax.with_sharding_constraint(psi_rchunk, out_Y)
+
+            # NOW trim to actual band count (after reshard, bands are replicated)
+            psi_rchunk = psi_rchunk[:, :nb_static, :, :]
+
+            return psi_rchunk
         
-        _xchunk_slice_cache[cache_key] = _extract_xchunk_slice
+        _rchunk_slice_cache[cache_key] = _extract_rchunk_slice
     
-    return _xchunk_slice_cache[cache_key](global_psi_Gtot, x_start, nb)
+    return _rchunk_slice_cache[cache_key](global_psi_Gtot, r_start, nb)
 
 
-def get_psi_xchunk_from_cached(
+def get_psi_rchunk_from_cached(
     cached_gspace: list[tuple[jax.Array, tuple[int, int]]],
-    meta, mesh_xy, band_range, x_start, x_end, kvecs_frac,
+    meta, mesh_xy, band_range, r_start, r_end, kvecs_frac,
     band_chunk_size: int = 16,
 ) -> jax.Array:
     """
-    Extract x-chunk from pre-loaded G-space (FFT only, no HDF5 read).
+    Extract r-chunk from pre-loaded G-space (FFT only, no HDF5 read).
     
-    This is the fast path that reuses cached G-space across x-chunk iterations.
-    X-chunks are contiguous in r-space, enabling efficient HDF5 writes.
+    This is the fast path that reuses cached G-space across r-chunk iterations.
+    R-chunks are contiguous in r-space, enabling efficient HDF5 writes.
     
     Args:
         cached_gspace: Pre-loaded G-space from load_gspace_for_bands()
         meta: Meta object
         mesh_xy: Device mesh
         band_range: (b_start, b_end) - total bands needed
-        x_start, x_end: X-slice range
+        r_start, r_end: R-index range
         kvecs_frac: (nk, 3) k-vectors in fractional coordinates
         band_chunk_size: Bands to FFT at once
     
     Returns:
-        psi_xchunk_Y: (nk, nb, ns, n_xchunk) with P(None, None, None, 'y')
+        psi_rchunk_Y: (nk, nb, ns, n_rchunk) with P(None, None, None, 'y')
     """
-    nx, ny, nz = meta.fft_grid
-    n_xchunk = (x_end - x_start) * ny * nz
+    n_rchunk = r_end - r_start
     b_start, b_end = band_range
     nb_total = b_end - b_start
     nk_tot = meta.nk_tot
@@ -2188,39 +1392,48 @@ def get_psi_xchunk_from_cached(
     # Output sharding
     out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
     
-    # Allocate output array
-    psi_xchunk_all = jnp.zeros((nk_tot, nb_total, nspinor, n_xchunk), dtype=jnp.complex128)
-    psi_xchunk_all = jax.lax.with_sharding_constraint(psi_xchunk_all, out_Y)
+    # Allocate output array for all bands (r-chunk is small enough)
+    psi_rchunk_all = jnp.zeros((nk_tot, nb_total, nspinor, n_rchunk), dtype=jnp.complex128)
+    psi_rchunk_all = jax.lax.with_sharding_constraint(psi_rchunk_all, out_Y)
     
-    # Process each cached band chunk
+    # Process each cached band chunk - FFT only (no HDF5 read)
     for bc_idx, (global_psi_Gtot, bc_range) in enumerate(cached_gspace):
         nb_chunk = bc_range[1] - bc_range[0]
         
-        # FFT and extract x-slice
-        psi_xchunk_chunk = get_sharded_wfns_xchunk_slice(
-            global_psi_Gtot, meta, x_start, x_end, kvecs_frac, mesh_xy, bc_range
+        # FFT and extract r-slice for this chunk
+        psi_rchunk_chunk = get_sharded_wfns_rchunk_slice(
+            global_psi_Gtot, meta, r_start, r_end, kvecs_frac, mesh_xy, bc_range
         )
         
-        # Place into output array
+        # Place into output array at correct band indices
         local_bc_start = bc_idx * band_chunk_size
         local_bc_end = local_bc_start + nb_chunk
-        psi_xchunk_all = psi_xchunk_all.at[:, local_bc_start:local_bc_end, :, :].set(psi_xchunk_chunk)
+        psi_rchunk_all = psi_rchunk_all.at[:, local_bc_start:local_bc_end, :, :].set(psi_rchunk_chunk)
         
-        del psi_xchunk_chunk
+        # Free FFT output only (keep G-space cached)
+        del psi_rchunk_chunk
     
-    return psi_xchunk_all
+    return psi_rchunk_all
 
 
-def get_psi_xchunk(
-    wfn, sym, meta, mesh_xy, band_range, x_start, x_end, bispinor,
+def get_psi_rchunk(
+    wfn, sym, meta, mesh_xy, band_range, r_start, r_end, bispinor,
     band_chunk_size: int = 16,
 ) -> jax.Array:
     """
-    Load and FFT wavefunctions for a specific x-chunk.
+    Load and FFT wavefunctions for a specific r-chunk.
     
     NOTE: This function reloads G-space from HDF5 each call. For multiple
-    x-chunks, use load_gspace_for_bands() + get_psi_xchunk_from_cached()
+    r-chunks, use load_gspace_for_bands() + get_psi_rchunk_from_cached()
     to avoid redundant HDF5 reads.
+    
+    Uses band chunking to limit memory during FFT step:
+    - Loop over band chunks
+    - FFT each chunk to real-space (the memory bottleneck)
+    - Extract r-slice and accumulate into output array
+    
+    The final psi_rchunk has all bands but only the r-slice, which is
+    small enough to hold in memory for downstream pair density computation.
     
     Args:
         wfn: WFNReader
@@ -2228,33 +1441,50 @@ def get_psi_xchunk(
         meta: Meta object
         mesh_xy: Device mesh
         band_range: (b_start, b_end) - total bands needed
-        x_start, x_end: X-slice range
+        r_start, r_end: R-index range
         bispinor: Whether to use bispinor
-        band_chunk_size: Bands to FFT at once
+        band_chunk_size: Bands to FFT at once (memory control for FFT step)
     
     Returns:
-        psi_xchunk_Y: (nk, nb, ns, n_xchunk) with P(None, None, None, 'y')
+        psi_rchunk_Y: (nk, nb, ns, n_rchunk) with P(None, None, None, 'y')
     """
     kgrid = np.array(meta.kgrid)
     kvecs_frac = sym.kvecs_asints / kgrid[None, :]
+    b_start, b_end = band_range
+    nb_total = b_end - b_start
+    nk_tot = meta.nk_tot
+    nspinor = meta.nspinor
+    n_rchunk = r_end - r_start
     
-    cached_gspace = load_gspace_for_bands(
-        wfn, sym, meta, mesh_xy, band_range, bispinor, band_chunk_size
-    )
+    out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
     
-    result = get_psi_xchunk_from_cached(
-        cached_gspace, meta, mesh_xy, band_range, x_start, x_end, kvecs_frac,
-        band_chunk_size
-    )
+    psi_rchunk_all = jnp.zeros((nk_tot, nb_total, nspinor, n_rchunk), dtype=jnp.complex128)
+    psi_rchunk_all = jax.lax.with_sharding_constraint(psi_rchunk_all, out_Y)
     
-    del cached_gspace
-    return result
-
-
-# Aliases for x-chunk pair density and ZCT functions
-# These are generic and work with any chunk shape (z-chunk or x-chunk)
-compute_pair_density_spin_traced_xchunk = compute_pair_density_spin_traced_zchunk
-compute_ZCT_from_left_right_xchunk = compute_ZCT_from_left_right_zchunk
+    # Process bands in chunks
+    num_band_chunks = (nb_total + band_chunk_size - 1) // band_chunk_size
+    for bc_idx in range(num_band_chunks):
+        bc_start = b_start + bc_idx * band_chunk_size
+        bc_end = min(bc_start + band_chunk_size, b_end)
+        bc_range = (bc_start, bc_end)
+        
+        # Load G-space for this band chunk
+        global_psi_Gtot, _ = read_Gvecs_to_devices(wfn, sym, bc_range, meta, bispinor, mesh_xy)
+        
+        # FFT and extract r-slice for this chunk
+        psi_rchunk_chunk = get_sharded_wfns_rchunk_slice(
+            global_psi_Gtot, meta, r_start, r_end, kvecs_frac, mesh_xy, bc_range
+        )
+        
+        # Place into output array at correct band indices
+        local_bc_start = bc_idx * band_chunk_size
+        local_bc_end = local_bc_start + (bc_end - bc_start)
+        psi_rchunk_all = psi_rchunk_all.at[:, local_bc_start:local_bc_end, :, :].set(psi_rchunk_chunk)
+        
+        # Free G-space + FFT output
+        del global_psi_Gtot, psi_rchunk_chunk
+    
+    return psi_rchunk_all
 
 
 # ============================================================================
@@ -2276,7 +1506,7 @@ def get_sharded_wfns_centroids(
     """
     FFT wavefunctions and extract centroids for a single band chunk.
     
-    This is the centroid-extraction counterpart to get_sharded_wfns_zchunk_slice.
+    This is the centroid-extraction counterpart to get_sharded_wfns_rchunk_slice.
     Both use the same caching and staging patterns for memory efficiency.
     
     Args:
@@ -2348,13 +1578,11 @@ def get_sharded_wfns_centroids(
             
             # Flatten spatial dims
             psi_rtot = psi_r.reshape(nk_tot, nb_static, nspinor, -1)
+            # Keep bands sharded on (x,y); avoid resharding a huge (nk,nb,ns,n_rtot) tensor.
+            intermediate_XY = NamedSharding(mesh_xy, P(None, ('x', 'y'), None, None))
+            psi_rtot = jax.lax.with_sharding_constraint(psi_rtot, intermediate_XY)
             
-            # Step 1: Reshard from (b_XY, ns, n_rtot) to (b_X, ns, n_rtot) BEFORE gather
-            # This simplifies XY sharding to just X on bands, preparing for gather
-            intermediate_X = NamedSharding(mesh_xy, P(None, 'x', None, None))
-            psi_rtot = jax.lax.with_sharding_constraint(psi_rtot, intermediate_X)
-            
-            # Centroid gather on axis 3 (spatial) - now with simpler X-sharding on bands
+            # Centroid gather on axis 3 (spatial) while bands remain sharded on (x,y).
             psi_rmu = jnp.take(psi_rtot, centroid_lin, axis=3)
             
             # Create psi_rmuT (conjugate transpose for left wfn in pair density)
@@ -2453,5 +1681,3 @@ def load_centroids_band_chunked(
         del global_psi_Gtot, psi_rmu_chunk, psi_rmuT_chunk
     
     return psi_rmu_all, psi_rmuT_all
-
-

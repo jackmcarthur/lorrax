@@ -20,11 +20,10 @@ import jax
 import jax.numpy as jnp
 import h5py
 from pathlib import Path
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from ..io import WFNReader
 from ..common import symmetry_maps, Meta
-from ..common.load_wfns import read_Gvecs_to_devices
+from ..common.load_wfns import load_kpoint_fftbox
 from .get_DFT_mtxels import (
     read_cohsex_input,
     load_pseudopotentials,
@@ -105,11 +104,7 @@ def main(argv=None):
     print(f"\nCreating system metadata...")
     meta = Meta.from_system(wfn, sym, nval, ncond, nband, 0, bispinor)
     
-    # JAX mesh (simple 1D default)
-    devices = np.array(jax.devices()).reshape(1, -1)
-    mesh_xy = Mesh(devices, ['x', 'y'])
-    
-    print(f"K-points: {sym.nk_tot}, Bands: {nband}, Devices: {devices.size}")
+    print(f"K-points: {sym.nk_tot}, Bands: {nband}, Devices: {jax.device_count()}")
     
     # Load pseudopotentials
     print("\nScanning for pseudopotential files...")
@@ -156,75 +151,55 @@ def main(argv=None):
     dipole = np.zeros((3, nk, nb, nb), dtype=np.complex128)
     deltaE = np.zeros((nk, nb, nb), dtype=np.float64)
     
-    # Process k-points in chunks
-    kchunk_size = args.kchunk
-    num_chunks = (nk + kchunk_size - 1) // kchunk_size
-    
-    print(f"\nProcessing {nk} k-points in {num_chunks} chunks of {kchunk_size}...")
-    
-    for ichunk in range(num_chunks):
-        k_start = ichunk * kchunk_size
-        k_end = min(k_start + kchunk_size, nk)
-        k_actual = k_end - k_start
-        
-        print(f"\n  Chunk {ichunk+1}/{num_chunks}: k={k_start+1}-{k_end}")
-        
-        # Load only this chunk of k-points
-        brange = (0, nband_eff)
-        global_psi_G, _ = read_Gvecs_to_devices(wfn, sym, brange, meta, bispinor, mesh_xy)
-        
-        # Extract only the k-points we need
-        psi_k_chunk = global_psi_G[k_start:k_end, :, :, :, :, :]
-        
-        for i_local in range(k_actual):
-            i_global = k_start + i_local
-            wfn_k = psi_k_chunk[i_local]
-            kpoint = jnp.asarray(sym.unfolded_kpts[i_global], dtype=jnp.float64)
-            Gk_crys, _ = generate_gvectors_k(i_global, sym, wfn, meta)
-            K_crys, K_cart = build_K_vectors(Gk_crys, sym.unfolded_kpts[i_global], bvec_np, blat)
-            
-            # Momentum per component
-            p_cart = compute_p_operator_k(
-                wfn_k, Gk_crys, kpoint,
-                jnp.asarray(wfn.bdot, dtype=jnp.float64),
-                jnp.asarray(bvec_np, dtype=jnp.float64),
-                blat
+    # Process k-points one at a time (per-k loading avoids 74 GiB bulk load)
+    print(f"\nProcessing {nk} k-points individually...")
+
+    energies = np.asarray(wfn.energies)
+
+    for ik in range(nk):
+        if ik % 16 == 0:
+            print(f"  k={ik+1}/{nk}...")
+
+        wfn_k = load_kpoint_fftbox(wfn, sym, meta, ik, nb)
+        kpoint = jnp.asarray(sym.unfolded_kpts[ik], dtype=jnp.float64)
+        Gk_crys, _ = generate_gvectors_k(ik, sym, wfn, meta)
+        K_crys, K_cart = build_K_vectors(Gk_crys, sym.unfolded_kpts[ik], bvec_np, blat)
+
+        # Momentum per component
+        p_cart = compute_p_operator_k(
+            wfn_k, Gk_crys, kpoint,
+            jnp.asarray(wfn.bdot, dtype=jnp.float64),
+            jnp.asarray(bvec_np, dtype=jnp.float64),
+            blat
+        )  # (3, nb, nb)
+
+        # Nonlocal velocity components
+        if args.vnl_mode == "analytic" and plan is not None:
+            vNL_cart = compute_V_NL_velocity_k(
+                wfn_k, Gk_crys,
+                jnp.asarray(K_crys, dtype=jnp.float64),
+                jnp.asarray(K_cart, dtype=jnp.float64),
+                plan,
+                float(wfn.cell_volume),
+                fprime_mode="bessel"
             )  # (3, nb, nb)
-            
-            # Nonlocal velocity components
-            if args.vnl_mode == "analytic" and plan is not None:
-                vNL_cart = compute_V_NL_velocity_k(
-                    wfn_k, Gk_crys,
-                    jnp.asarray(K_crys, dtype=jnp.float64),
-                    jnp.asarray(K_cart, dtype=jnp.float64),
-                    plan,
-                    float(wfn.cell_volume),
-                    fprime_mode="bessel"
-                )  # (3, nb, nb)
-                # Sign convention flip (see original code comment)
-                vNL_cart = -vNL_cart
-            else:
-                vNL_cart = 0.0
-            
-            dipole[:, i_global] = np.asarray(p_cart + vNL_cart)
-            
-            # ΔE matrix for this k from band energies
-            try:
-                k_red = int(sym.irk_to_k_map[i_global])
-            except Exception:
-                k_red = int(i_global)
-            energies = np.asarray(wfn.energies)
-            if energies.ndim >= 3:
-                e_b = np.asarray(energies[0, k_red, :nb], dtype=float)
-            else:
-                e_b = np.asarray(energies[:nb], dtype=float)
-            deltaE[i_global] = e_b[:, None] - e_b[None, :]
-        
-        # Clear GPU memory
-        del psi_k_chunk, global_psi_G
-        jax.clear_caches()
-        
-        print(f"    Completed k={k_start+1}-{k_end}, memory freed")
+            vNL_cart = -vNL_cart
+        else:
+            vNL_cart = 0.0
+
+        dipole[:, ik] = np.asarray(p_cart + vNL_cart)
+
+        # ΔE matrix for this k from band energies
+        try:
+            k_red = int(sym.irk_to_k_map[ik])
+        except Exception:
+            k_red = int(ik)
+        if energies.ndim >= 3:
+            e_b = np.asarray(energies[0, k_red, :nb], dtype=float)
+        else:
+            e_b = np.asarray(energies[:nb], dtype=float)
+        deltaE[ik] = e_b[:, None] - e_b[None, :]
+        del wfn_k
     
     # Write output
     out_path = input_path.parent / "dipole.h5"

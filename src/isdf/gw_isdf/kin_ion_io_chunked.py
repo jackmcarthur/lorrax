@@ -22,11 +22,10 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 import h5py
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from isdf.io import WFNReader
 from isdf.common import symmetry_maps, Meta
-from isdf.common.load_wfns import read_Gvecs_to_devices
+from isdf.common.load_wfns import load_kpoint_fftbox
 import isdf.common.timing as timing
 
 from isdf.psp.get_DFT_mtxels import (
@@ -100,11 +99,8 @@ def main(argv=None):
     meta = Meta.from_system(wfn, sym, nval, ncond, nb_eff, 0, bispinor)
     print(f"Bands: {nb_eff}, FFT grid: {meta.fft_grid}, k-points: {sym.nk_tot}")
     
-    # Device mesh
-    devices = np.asarray(jax.devices())
-    mesh_xy = Mesh(devices.reshape(1, -1), ['x', 'y'])
-    print(f"Devices: {devices.size}")
-    
+    print(f"Devices: {jax.device_count()}")
+
     # Load pseudopotentials
     pseudos = load_pseudopotentials(input_dir)
     if not pseudos:
@@ -153,47 +149,21 @@ def main(argv=None):
     out_path = args.output or os.path.join(input_dir, 'kin_ion.h5')
     kin_ion_all = np.zeros((sym.nk_tot, nb_eff, nb_eff), dtype=np.complex128)
     
-    # Process k-points in chunks
-    kchunk_size = args.kchunk
-    num_chunks = (sym.nk_tot + kchunk_size - 1) // kchunk_size
-    
-    print(f"\nProcessing {sym.nk_tot} k-points in {num_chunks} chunks of {kchunk_size}...")
-    
-    for ichunk in range(num_chunks):
-        k_start = ichunk * kchunk_size
-        k_end = min(k_start + kchunk_size, sym.nk_tot)
-        k_actual = k_end - k_start
-        
-        print(f"\n  Chunk {ichunk+1}/{num_chunks}: k={k_start+1}-{k_end}")
-        
-        # Load only this chunk of k-points
-        # Create a temporary sym object with reduced k-points
-        kpts_chunk = sym.unfolded_kpts[k_start:k_end]
-        
-        with timing.section(f"chunk{ichunk}.load_wfns"):
-            # Load wavefunctions for this k-chunk
-            brange = (0, nb_eff)
-            global_psi_G, _ = read_Gvecs_to_devices(wfn, sym, brange, meta, bispinor, mesh_xy)
-            
-            # Extract only the k-points we need
-            psi_k_chunk = global_psi_G[k_start:k_end, :, :, :, :, :]
-        
-        with timing.section(f"chunk{ichunk}.compute"):
-            for i_local in range(k_actual):
-                i_global = k_start + i_local
-                kvec = sym.unfolded_kpts[i_global]
-                Gk_crys, _ = generate_gvectors_k(i_global, sym, wfn, meta)
-                
-                wfn_k = psi_k_chunk[i_local]  # (nb, nspinor, fft_nx, fft_ny, fft_nz)
-                
-                H_k = get_kin_ion_k(wfn_k, Gk_crys, kvec, plan, pseudos, wfn, meta, species_payload)
-                kin_ion_all[i_global] = np.asarray(H_k)
-        
-        # Clear GPU memory
-        del psi_k_chunk, global_psi_G
-        jax.clear_caches()
-        
-        print(f"    Completed k={k_start+1}-{k_end}, memory freed")
+    # Process k-points one at a time (per-k loading avoids 74 GiB bulk load)
+    print(f"\nProcessing {sym.nk_tot} k-points individually...")
+
+    for ik in range(sym.nk_tot):
+        if ik % 16 == 0:
+            print(f"  k={ik+1}/{sym.nk_tot}...")
+
+        with timing.section(f"k{ik}"):
+            wfn_k = load_kpoint_fftbox(wfn, sym, meta, ik, nb_eff)
+            kvec = sym.unfolded_kpts[ik]
+            Gk_crys, _ = generate_gvectors_k(ik, sym, wfn, meta)
+
+            H_k = get_kin_ion_k(wfn_k, Gk_crys, kvec, plan, pseudos, wfn, meta, species_payload)
+            kin_ion_all[ik] = np.asarray(H_k)
+            del wfn_k
     
     # Write output
     print(f"\nWriting to {out_path}...")

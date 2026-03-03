@@ -28,6 +28,7 @@ def compute_optimal_chunks(
     verbose: bool = True,
     n_b_left: int | None = None,
     n_b_right: int | None = None,
+    r_chunk_override: int | None = None,
 ) -> dict:
     """Derive chunk sizes that saturate (but do not exceed) the memory budget."""
     if memory_budget_gb <= 0:
@@ -102,41 +103,41 @@ def compute_optimal_chunks(
     # Optional G-space cache (sum of all cached band chunks)
     m_cached_gspace_full = bytes_per_complex * n_k_f * (n_b_full / p) * n_s_f * n_r_f
 
-    def compute_chunk_metrics(x_chunk_r: int, base_const: float) -> tuple[float, str, dict]:
-        """Compute peak memory for each stage given an x-chunk size.
-        
-        CRITICAL: The ZCT (FFT cross-correlation) stage causes XLA to create 
+    def compute_chunk_metrics(chunk_r: int, base_const: float) -> tuple[float, str, dict]:
+        """Compute peak memory for each stage given an r-chunk size.
+
+        CRITICAL: The ZCT (FFT cross-correlation) stage causes XLA to create
         FULL UNSHARDED copies during resharding/FFT operations. The XLA log shows:
             "[spmd] Involuntary full rematerialization..."
-        
+
         This means we must budget for the GLOBAL array sizes, not local sharded sizes.
         compute_ZCT_from_left_right_zchunk does:
             1. P_l_R = ifftn(P_l)  -- XLA may all-gather to full array
-            2. P_r_R = ifftn(P_r)  -- XLA may all-gather to full array  
+            2. P_r_R = ifftn(P_r)  -- XLA may all-gather to full array
             3. Z_R = conj(P_l_R) * P_r_R  -- full array
             4. Z_q = fftn(Z_R)  -- full array
-        
+
         Peak observed: ~62GB for (36, 600, 48600) complex128 arrays = 4x 16.8GB
         This is the FULL global array × 4 intermediate buffers.
         """
-        chunk_r = float(x_chunk_r)
-        per_y = chunk_r / p_y
-        
+        cr = float(chunk_r)
+        per_y = cr / p_y
+
         # Sharded local sizes (for stages that work correctly with sharding)
-        m_xchunk = bytes_per_complex * n_k_f * n_b_full * n_s_f * per_y
+        m_psi_chunk = bytes_per_complex * n_k_f * n_b_full * n_s_f * per_y
         m_pair_local = bytes_per_complex * n_k_f * (n_rmu_f / p_x) * per_y
         m_z_local = bytes_per_complex * n_q_f * (n_rmu_f / p_x) * per_y
-        m_zcol = bytes_per_complex * n_q_f * n_rmu_f * (chunk_r / p)
-        
+        m_zcol = bytes_per_complex * n_q_f * n_rmu_f * (cr / p)
+
         # GLOBAL (unsharded) sizes for FFT stage where XLA rematerializes
         # P_l, P_r shape: (nk, n_rmu, chunk_r) - FULL, not sharded during FFT
-        m_pair_global = bytes_per_complex * n_k_f * n_rmu_f * chunk_r
-        
+        m_pair_global = bytes_per_complex * n_k_f * n_rmu_f * cr
+
         # XLA needs ~4 full arrays during FFT pipeline (inputs + intermediates)
         FFT_BUFFERS = 2  # Reduced from 4: XLA is efficient with sharded FFTs
         m_fft_peak = FFT_BUFFERS * m_pair_global
-        
-        stage_pair = base_const + m_xchunk + 2 * m_pair_local
+
+        stage_pair = base_const + m_psi_chunk + 2 * m_pair_local
         # FFT stage: XLA holds full unsharded arrays during rematerialization
         stage_zct = base_const + m_fft_peak
         stage_solve = base_const + 2 * m_zcol + bytes_per_complex * (n_rmu_f ** 2)
@@ -148,8 +149,8 @@ def compute_optimal_chunks(
         else:
             name = 'solve'
         info = {
-            'psi_xchunk': m_xchunk,
-            'pair_xchunk': 2 * m_pair_local,
+            'psi_chunk': m_psi_chunk,
+            'pair_chunk': 2 * m_pair_local,
             'pair_fft_peak': m_fft_peak,
             'pair_global': m_pair_global,
             'Z_q': m_z_local,
@@ -161,77 +162,89 @@ def compute_optimal_chunks(
         }
         return peak, name, info
 
-    def choose_x_chunk(use_cache: bool) -> dict | None:
+    def choose_r_chunk(use_cache: bool, override: int | None = None) -> dict | None:
         m_cache = m_cached_gspace_full if use_cache else 0.0
         base_const = m_centroids_persist + m_L_q + m_cache
         headroom = m_budget - base_const
         if headroom <= bytes_per_complex * (n_rmu_f ** 2):
             return None
 
-        # FFT stage uses GLOBAL (unsharded) arrays due to XLA rematerialization
-        # P_l, P_r shape: (nk, n_rmu, chunk_r) - 4 buffers during FFT
-        FFT_BUFFERS = 2  # Reduced from 4: XLA is efficient with sharded FFTs
+        limit_info = {}
 
-        limits = []
-        # Pair density stage limit (uses sharded local sizes)
-        denom_pair = n_k_f * n_b_full * n_s_f + 2 * n_k_f * (n_rmu_f / p_x)
-        if denom_pair > 0:
-            limits.append(headroom * p_y / (bytes_per_complex * denom_pair))
-        
-        # ZCT/FFT stage limit - CRITICAL: uses GLOBAL array size
-        # XLA rematerializes to full unsharded arrays during FFT
-        # m_fft_peak = FFT_BUFFERS * bytes_per_complex * n_k * n_rmu * chunk_r
-        # Solve for chunk_r: chunk_r <= headroom / (FFT_BUFFERS * bytes_per_complex * n_k * n_rmu)
-        denom_fft_global = FFT_BUFFERS * n_k_f * n_rmu_f
-        if denom_fft_global > 0:
-            limits.append(headroom / (bytes_per_complex * denom_fft_global))
-        
-        # Solve stage limit
-        solve_numer = headroom - bytes_per_complex * (n_rmu_f ** 2)
-        denom_solve = 2 * n_q_f * n_rmu_f / p
-        if denom_solve > 0 and solve_numer > 0:
-            limits.append(solve_numer * p / (bytes_per_complex * denom_solve))
-        if not limits:
-            limits.append(float(n_r))
-        x_chunk_r_guess = min(float(n_r), max(float(ny * nz), min(limits)))
+        if override is not None and override > 0:
+            # Explicit override: use it directly
+            r_chunk_r = min(int(override), int(n_r))
+        else:
+            # Auto-compute from memory limits (same logic as old choose_x_chunk,
+            # but round only to p_y divisibility, not ny*nz boundaries)
+            FFT_BUFFERS = 2
 
-        x_slices = min(nx, max(1, int(x_chunk_r_guess // (ny * nz))))
+            limits = []
+            # Pair density stage limit (uses sharded local sizes)
+            denom_pair = n_k_f * n_b_full * n_s_f + 2 * n_k_f * (n_rmu_f / p_x)
+            if denom_pair > 0:
+                limit_pair = headroom * p_y / (bytes_per_complex * denom_pair)
+                limits.append(limit_pair)
+                limit_info['limit_pair'] = limit_pair
 
-        def make_divisible(val: int) -> int:
-            out = val
-            while out > 1 and (out * ny * nz) % p_y != 0:
-                out -= 1
-            return out
+            # ZCT/FFT stage limit - CRITICAL: uses GLOBAL array size
+            denom_fft_global = FFT_BUFFERS * n_k_f * n_rmu_f
+            if denom_fft_global > 0:
+                limit_fft = headroom / (bytes_per_complex * denom_fft_global)
+                limits.append(limit_fft)
+                limit_info['limit_fft_global'] = limit_fft
 
-        x_slices = make_divisible(x_slices)
-        if x_slices <= 0:
+            # Solve stage limit
+            solve_numer = headroom - bytes_per_complex * (n_rmu_f ** 2)
+            denom_solve = 2 * n_q_f * n_rmu_f / p
+            if denom_solve > 0 and solve_numer > 0:
+                limit_solve = solve_numer * p / (bytes_per_complex * denom_solve)
+                limits.append(limit_solve)
+                limit_info['limit_solve'] = limit_solve
+
+            if not limits:
+                limits.append(float(n_r))
+                limit_info['limit_default'] = float(n_r)
+
+            r_chunk_r = min(int(n_r), max(1, int(min(limits))))
+
+        # Ensure divisibility along mesh Y for sharding on r
+        if p_y > 1 and (r_chunk_r % p_y) != 0:
+            r_chunk_r = r_chunk_r - (r_chunk_r % p_y)
+        if r_chunk_r <= 0:
             return None
 
-        while x_slices > 0:
-            x_chunk_r = x_slices * ny * nz
-            peak_bytes, stage_name, info = compute_chunk_metrics(x_chunk_r, base_const)
+        # Search downward for a chunk that fits the budget
+        while r_chunk_r > 0:
+            peak_bytes, stage_name, info = compute_chunk_metrics(r_chunk_r, base_const)
             if peak_bytes <= m_budget:
+                x_slices_est = max(1, int(math.ceil(r_chunk_r / float(ny * nz))))
                 return {
-                    'x_chunk': x_slices,
-                    'x_chunk_r': x_chunk_r,
+                    'x_chunk': x_slices_est,
+                    'chunk_r': r_chunk_r,
                     'peak_bytes': peak_bytes,
                     'stage_name': stage_name,
                     'stage_info': info,
                     'cache_bytes': m_cache,
                     'base_const': base_const,
+                    'limit_info': limit_info,
                 }
-            x_slices = make_divisible(x_slices - 1)
+            # Step down by p_y to maintain divisibility
+            r_chunk_r -= max(1, p_y)
+            if p_y > 1 and r_chunk_r > 0 and (r_chunk_r % p_y) != 0:
+                r_chunk_r = r_chunk_r - (r_chunk_r % p_y)
         return None
 
-    chunk_result = choose_x_chunk(use_cache=True) or choose_x_chunk(use_cache=False)
+    chunk_result = choose_r_chunk(use_cache=True, override=r_chunk_override) or \
+                   choose_r_chunk(use_cache=False, override=r_chunk_override)
     if chunk_result is None:
         raise ValueError(
-            "Unable to find an x_chunk that fits the memory budget (with or without G-space caching)."
+            "Unable to find an r-chunk that fits the memory budget (with or without G-space caching)."
         )
 
     use_gspace_cache = chunk_result['cache_bytes'] > 0
     x_chunk_slices = chunk_result['x_chunk']
-    x_chunk_r = chunk_result['x_chunk_r']
+    chunk_r = chunk_result['chunk_r']
     stage_info = chunk_result['stage_info']
     peak_chunk_bytes = chunk_result['peak_bytes']
     base_const = chunk_result['base_const']
@@ -262,8 +275,8 @@ def compute_optimal_chunks(
         'peak_fft_gb': to_gb(peak_fft_stage),
         'stage_cct_gb': to_gb(stage_cct),
         'L_q_gb': to_gb(m_L_q),
-        'psi_xchunk_gb': to_gb(stage_info['psi_xchunk']),
-        'pair_density_xchunk_gb': to_gb(stage_info['pair_xchunk']),
+        'psi_chunk_gb': to_gb(stage_info['psi_chunk']),
+        'pair_density_chunk_gb': to_gb(stage_info['pair_chunk']),
         'pair_fft_peak_gb': to_gb(stage_info['pair_fft_peak']),
         'pair_global_gb': to_gb(stage_info['pair_global']),
         'fft_overhead_factor': stage_info['fft_overhead_factor'],
@@ -283,7 +296,8 @@ def compute_optimal_chunks(
         'p_x': p_x,
         'p_y': p_y,
         'n_devices': p,
-        'x_chunk_r': x_chunk_r,
+        'chunk_r': chunk_r,
+        'limit_info': chunk_result.get('limit_info', {}),
         'centroids_bytes': m_centroids_persist,
         'effective_budget_bytes': m_budget,
         'available_vcoul_gb': to_gb(max(0.0, m_budget - m_centroids_persist)),
@@ -292,7 +306,7 @@ def compute_optimal_chunks(
     return {
         'band_chunk': band_chunk,
         'x_chunk': x_chunk_slices,
-        'x_chunk_r': x_chunk_r,
+        'chunk_r': chunk_r,
         'q_chunk': q_chunk,
         'use_gspace_cache': use_gspace_cache,
         'memory_estimate': memory_estimate,
@@ -320,8 +334,8 @@ def print_memory_breakdown(
     print(f"\n  {'Parameter':<25} {'Value':>10} {'Total':>12}")
     print(f"  {'-'*50}")
     print(f"  {'Band chunk':<25} {chunks['band_chunk']:>10d} / {n_b:<5d} bands")
-    print(f"  {'X-chunk (x-slices)':<25} {chunks['x_chunk']:>10d} / {nx:<5d} slices")
-    print(f"  {'X-chunk (r-points)':<25} {chunks['x_chunk_r']:>10d} / {n_r:<5d} points")
+    print(f"  {'R-chunk (r-points)':<25} {chunks['chunk_r']:>10d} / {n_r:<5d} points")
+    print(f"  {'R-chunk (x-slices est)':<25} {chunks['x_chunk']:>10d} / {nx:<5d} slices")
     print(f"  {'Q-chunk':<25} {chunks['q_chunk']:>10d} / {n_q:<5d} q-points")
     
     print(f"\n  {'SIMULTANEOUS ALLOCATIONS':<40} {'Size (GB)':>12}")
@@ -343,20 +357,20 @@ def print_memory_breakdown(
     
     # Pair density stage
     print(f"\n  {'[Stage: Pair density]':<40}")
-    print(f"    {'psi_nk(rchunk) all bands':<38} {mem['psi_xchunk_gb']:>10.3f}")
-    print(f"    {'P_l + P_r (spin-traced)':<38} {mem['pair_density_xchunk_gb']:>10.3f}")
+    print(f"    {'psi_nk(rchunk) all bands':<38} {mem['psi_chunk_gb']:>10.3f}")
+    print(f"    {'P_l + P_r (spin-traced)':<38} {mem['pair_density_chunk_gb']:>10.3f}")
     print(f"    {'─ STAGE TOTAL':<38} {mem['stage_pair_gb']:>10.3f}")
     
     # ZCT stage
     fft_factor = int(mem.get('fft_overhead_factor', 4))
     print(f"\n  {'[Stage: ZCT / FFT pipeline]':<40}")
-    print(f"    {'P_l, P_r (local sharded)':<38} {mem['pair_density_xchunk_gb']:>10.3f}")
+    print(f"    {'P_l, P_r (local sharded)':<38} {mem['pair_density_chunk_gb']:>10.3f}")
     print(f"    {'P_l, P_r (GLOBAL, XLA remat)':<38} {mem.get('pair_global_gb', 0):>10.3f}")
     print(f"    {'FFT peak (' + str(fft_factor) + ' × global)':<38} {mem.get('pair_fft_peak_gb', 0):>10.3f}")
     print(f"    {'─ STAGE TOTAL':<38} {mem['stage_zct_gb']:>10.3f}")
     
     # Solve
-    print(f"\n  {'[Stage: Solve (psi_xchunk deleted)]':<40}")
+    print(f"\n  {'[Stage: Solve (psi_chunk deleted)]':<40}")
     print(f"    {'Z_col (resharded)':<38} {mem['Z_col_gb']:>10.3f}")
     print(f"    {'zeta_q (output)':<38} {mem['zeta_gb']:>10.3f}")
     print(f"    {'L_rep (replicated per q)':<38} {mem['L_rep_per_q_gb']:>10.3f}")
@@ -367,6 +381,12 @@ def print_memory_breakdown(
     print(f"  {'PEAK ('+bottleneck+')':<38} {mem['peak_estimate_gb']:>10.3f} GB")
     print(f"  {'BUDGET':<38} {mem['budget_gb']:>10.3f} GB")
     print(f"  {'UTILIZATION':<38} {mem['utilization_pct']:>10.1f} %")
+    limit_info = mem.get('limit_info', {})
+    if limit_info:
+        print(f"\n  {'CHUNK LIMIT ESTIMATES (r-points)':<40} {'':>12}")
+        for key in ("limit_pair", "limit_fft_global", "limit_solve", "limit_default"):
+            if key in limit_info:
+                print(f"  {key:<38} {limit_info[key]:>10.1f}")
     print("="*70)
 
 
@@ -391,161 +411,6 @@ def get_effective_chunk_size(chunk_size: int) -> int | None:
         return chunk_size
     else:
         raise ValueError(f"chunk_size must be -1, 0, or 1-2048, got {chunk_size}")
-
-
-def get_effective_x_chunk_size(
-    x_chunk_size: int, 
-    fft_grid: tuple, 
-    n_rmu: int, 
-    target_ratio: float = 16.0,
-    mesh_y_size: int = 1,
-    max_wfn_chunk_mb: float = 0.0,
-    nk_tot: int = 1,
-    nspinor: int = 2,
-) -> int:
-    """Compute effective x-axis chunk size for ZCT accumulation.
-    
-    X-chunking advantage: With r = x*(ny*nz) + y*nz + z, an x-chunk with
-    x in [x_start, x_end) maps to CONTIGUOUS r-indices [x_start*ny*nz, x_end*ny*nz).
-    This enables single sequential HDF5 writes instead of strided writes.
-    
-    Priority (highest to lowest):
-    1. max_wfn_chunk_mb > 0: compute x from memory budget for P_k(rmu, rchunk)
-    2. x_chunk_size > 0: use explicit value
-    3. x_chunk_size == 0: auto-compute to target_ratio * n_rmu
-    
-    The P_k,ab(rmu, rchunk) array has shape (nk, ns, ns, n_rmu, n_xchunk) with
-    complex128 dtype (16 bytes). Given a memory budget:
-        max_bytes = max_wfn_chunk_mb * 1e6
-        n_xchunk_max = max_bytes / (nk * ns * ns * n_rmu * 16)
-        x_chunk_size = n_xchunk_max / (ny * nz)
-    
-    Additionally ensures n_xchunk = x * ny * nz is divisible by mesh_y_size.
-    
-    Args:
-        x_chunk_size: Input flag value:
-            0 = auto: choose x such that x*ny*nz ≈ target_ratio * n_rmu
-            1-nx = explicit x-slice count per chunk
-        fft_grid: (nx, ny, nz) FFT grid dimensions
-        n_rmu: Number of ISDF centroids
-        target_ratio: Target ratio of chunk size to n_rmu (default 16.0)
-        mesh_y_size: Number of devices on Y-axis mesh (for divisibility)
-        max_wfn_chunk_mb: Max memory for P_k chunk in MB (0=ignore, use x_chunk_size)
-        nk_tot: Total number of k-points (for memory calculation)
-        nspinor: Number of spinor components (for memory calculation)
-    
-    Returns:
-        Effective x_chunk_size (number of x-slices per chunk)
-    """
-    nx, ny, nz = fft_grid
-    
-    # Priority 1: Memory budget overrides everything
-    if max_wfn_chunk_mb > 0:
-        # P_k,ab(rmu, rchunk) shape: (nk, ns, ns, n_rmu, n_xchunk)
-        # Size in bytes: nk * ns² * n_rmu * n_xchunk * 16
-        max_bytes = max_wfn_chunk_mb * 1e6
-        bytes_per_xpoint = nk_tot * nspinor * nspinor * n_rmu * 16
-        n_xchunk_max = max_bytes / bytes_per_xpoint
-        x_budget = max(1, int(n_xchunk_max / (ny * nz)))
-        
-        # Ensure n_xchunk = x*ny*nz is divisible by mesh_y_size
-        x_opt = None
-        for x_try in range(min(x_budget, nx), 0, -1):
-            if (x_try * ny * nz) % mesh_y_size == 0:
-                x_opt = x_try
-                break
-        
-        if x_opt is None:
-            raise ValueError(
-                f"max_wfn_chunk_mb={max_wfn_chunk_mb} is too small. "
-                f"Smallest valid chunk (x=1) requires {ny*nz*16*nk_tot*nspinor**2*n_rmu/1e6:.1f} MB. "
-                f"Increase max_wfn_chunk_mb or remove it to use auto-sizing."
-            )
-        
-        return x_opt
-    
-    # Priority 2: Explicit x_chunk_size
-    if x_chunk_size > 0:
-        if 1 <= x_chunk_size <= nx:
-            return x_chunk_size
-        else:
-            raise ValueError(f"x_chunk_size must be 1-{nx}, got {x_chunk_size}")
-    
-    # Priority 3: Auto based on target_ratio
-    target_chunk = target_ratio * n_rmu
-    x_opt = max(1, round(target_chunk / (ny * nz)))
-    
-    # Ensure n_xchunk is divisible by mesh_y_size
-    if mesh_y_size > 1:
-        n_xchunk = x_opt * ny * nz
-        remainder = n_xchunk % mesh_y_size
-        if remainder != 0:
-            extra_needed = mesh_y_size - remainder
-            extra_x = (extra_needed + ny * nz - 1) // (ny * nz)
-            x_opt = x_opt + extra_x
-    
-    # Clamp to valid range [1, nx]
-    x_opt = min(x_opt, nx)
-    return x_opt
-
-
-# Keep z-chunk version for backwards compatibility (alias to x-chunk with different axis)
-def get_effective_z_chunk_size(
-    z_chunk_size: int, 
-    fft_grid: tuple, 
-    n_rmu: int, 
-    target_ratio: float = 16.0,
-    mesh_y_size: int = 1,
-    max_wfn_chunk_mb: float = 0.0,
-    nk_tot: int = 1,
-    nspinor: int = 2,
-) -> int:
-    """DEPRECATED: Use get_effective_x_chunk_size instead.
-    
-    Z-chunking produces non-contiguous r-indices requiring strided HDF5 writes.
-    X-chunking produces contiguous r-indices for efficient sequential writes.
-    """
-    nx, ny, nz = fft_grid
-    
-    if max_wfn_chunk_mb > 0:
-        max_bytes = max_wfn_chunk_mb * 1e6
-        bytes_per_zpoint = nk_tot * nspinor * nspinor * n_rmu * 16
-        n_zchunk_max = max_bytes / bytes_per_zpoint
-        z_budget = max(1, int(n_zchunk_max / (nx * ny)))
-        
-        z_opt = None
-        for z_try in range(min(z_budget, nz), 0, -1):
-            if (nx * ny * z_try) % mesh_y_size == 0:
-                z_opt = z_try
-                break
-        
-        if z_opt is None:
-            raise ValueError(
-                f"max_wfn_chunk_mb={max_wfn_chunk_mb} is too small. "
-                f"Smallest valid chunk (z=1) requires {nx*ny*16*nk_tot*nspinor**2*n_rmu/1e6:.1f} MB. "
-                f"Increase max_wfn_chunk_mb or remove it to use auto-sizing."
-            )
-        return z_opt
-    
-    if z_chunk_size > 0:
-        if 1 <= z_chunk_size <= nz:
-            return z_chunk_size
-        else:
-            raise ValueError(f"z_chunk_size must be 1-{nz}, got {z_chunk_size}")
-    
-    target_chunk = target_ratio * n_rmu
-    z_opt = max(1, round(target_chunk / (nx * ny)))
-    
-    if mesh_y_size > 1:
-        n_zchunk = nx * ny * z_opt
-        remainder = n_zchunk % mesh_y_size
-        if remainder != 0:
-            extra_needed = mesh_y_size - remainder
-            extra_z = (extra_needed + nx * ny - 1) // (nx * ny)
-            z_opt = z_opt + extra_z
-    
-    z_opt = min(z_opt, nz)
-    return z_opt
 
 
 def read_cohsex_input(filename: str) -> dict:
@@ -632,10 +497,9 @@ def read_cohsex_input(filename: str) -> dict:
 		#                -1 = no chunking (all bands at once, default)
 		#                 0 = auto (currently 64, TODO: dynamic from available RAM)
 		#                1-2048 = explicit chunk size
-		# x_chunk_size:  X-axis chunk size for ZCT accumulation (contiguous r-space).
-		#                0 = auto (default): choose x such that x*ny*nz ≈ 2*n_rmu
-		#                1-nx = explicit x-slice count per chunk
-		#                X-chunking gives CONTIGUOUS r-indices for efficient HDF5 writes.
+		# r_chunk_size:  R-axis chunk size (flattened xyz index, contiguous in r-space).
+		#                0 = auto (default): auto-compute from memory budget.
+		#                >0 = explicit r-chunk size in r-points.
 		# memory_per_device_gb: Memory budget per device in GB for auto chunk sizing.
 		#                0 = auto-detect (80% of GPU via nvidia-smi, or CPU/n_devices)
 		#                >0 = explicit budget in GB
@@ -659,9 +523,8 @@ def read_cohsex_input(filename: str) -> dict:
 			"debug_hartree": getb("debug_hartree", fallback=False),
 			"debug_omega": getf("debug_omega", fallback=None),   # test W(ω) at this freq
 			"chunk_size": geti("chunk_size", fallback=-1),       # band chunk size (-1=all, 0=auto, 1-2048=explicit)
-			"x_chunk_size": geti("x_chunk_size", fallback=0),    # x-axis chunk (0=auto, 1-nx=explicit)
-			"max_wfn_chunk_mb": getf("max_wfn_chunk_mb", fallback=0.0),  # max P_k chunk size in MB (0=use x_chunk_size)
-			"band_chunk_size": geti("band_chunk_size", fallback=16),  # bands per FFT during x-chunk loop
+			"r_chunk_size": geti("r_chunk_size", fallback=0),    # r-axis chunk (0=auto, >0=explicit)
+			"band_chunk_size": geti("band_chunk_size", fallback=16),  # bands per FFT during r-chunk loop
 			"memory_per_device_gb": getf("memory_per_device_gb", fallback=0.0),  # 0=auto-detect
 			"use_chunked_isdf": getb("use_chunked_isdf", fallback=True),  # chunked (memory-efficient) vs original ISDF
 		}
@@ -686,8 +549,7 @@ def read_cohsex_input(filename: str) -> dict:
 			"debug_hartree": False,
 			"debug_omega": None,
 			"chunk_size": -1,
-			"z_chunk_size": 0,
-			"max_wfn_chunk_mb": 0.0,
+			"r_chunk_size": 0,
 			"band_chunk_size": 16,
 			"memory_per_device_gb": 0.0,
 			"use_chunked_isdf": True,

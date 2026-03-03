@@ -706,7 +706,7 @@ def fit_zeta_and_compute_V_q_chunked(
 	bispinor: bool = False,
 	memory_budget_gb: float = 6.0,
 	sys_dim: int = 2,
-	x_chunk_size_override: int = 0,
+	r_chunk_override: int = 0,
 ):
 	"""
 	Chunked zeta fitting and V_q computation pipeline.
@@ -733,7 +733,7 @@ def fit_zeta_and_compute_V_q_chunked(
 		bispinor: Whether to use bispinor wavefunctions
 		memory_budget_gb: Memory budget per device in GB
 		sys_dim: System dimensionality (2 or 3)
-		x_chunk_size_override: If > 0, use this explicit x-chunk size instead of auto-compute
+	r_chunk_override: If > 0, use explicit r-chunk size (flattened xyz index).
 	
 	Returns:
 		Dictionary with:
@@ -780,26 +780,33 @@ def fit_zeta_and_compute_V_q_chunked(
 		n_b_left=band_range_left[1] - band_range_left[0],
 		n_b_right=band_range_right[1] - band_range_right[0],
 		verbose=True,
+		r_chunk_override=r_chunk_override if r_chunk_override > 0 else None,
 	)
 	
 	band_chunk_size = chunks['band_chunk']
-	x_chunk_size = chunks['x_chunk']
+	chunk_r = chunks['chunk_r']
 	q_chunk_size = chunks['q_chunk']
 	use_gspace_cache = chunks.get('use_gspace_cache', True)
 	mem_est = chunks.get('memory_estimate', {})
-	
-	# Override x_chunk_size if explicitly specified
-	if x_chunk_size_override > 0:
-		nx, ny, nz = meta.fft_grid
-		x_chunk_size = min(x_chunk_size_override, nx)
-		print(f"  NOTE: Using explicit x_chunk_size={x_chunk_size} (override)")
+
+	if jax.process_index() == 0 and mem_est:
+		peak_gb = mem_est.get('peak_estimate_gb', 0.0)
+		budget_gb = mem_est.get('budget_gb', 0.0)
+		bottleneck = mem_est.get('bottleneck', 'unknown')
+		print(f"    Memory estimate: peak {peak_gb:.2f} GB (budget {budget_gb:.2f} GB), bottleneck={bottleneck}")
+		limit_info = mem_est.get('limit_info', {})
+		if limit_info:
+			print("    Chunk limit estimates (r-points):")
+			for key in ("limit_pair", "limit_fft_global", "limit_solve", "limit_default"):
+				if key in limit_info:
+					print(f"      {key}: {limit_info[key]:.1f}")
 	
 	# Output path for zeta
 	zeta_h5_path = os.path.join(output_dir, "zeta_q.h5")
-	
+
 	print(f"\n  Chunked ISDF fitting:")
 	print(f"    Band chunks: {band_chunk_size}")
-	print(f"    X chunks:    {x_chunk_size} (contiguous r-space)")
+	print(f"    R chunks:    {chunk_r} (contiguous r-space)")
 	print(f"    Q chunks:    {q_chunk_size}")
 	print(f"    G-space cache: {'enabled' if use_gspace_cache else 'disabled'}")
 	print(f"    Zeta output: {zeta_h5_path}")
@@ -808,10 +815,11 @@ def fit_zeta_and_compute_V_q_chunked(
 	with timing.section("cohsex_jax.zeta_fit_chunked"):
 		psi_l_rmu_Y, psi_l_rmuT_X, psi_r_rmu_Y, psi_r_rmuT_X = fit_zeta_chunked_to_h5(
 			wfn, sym, meta, centroid_indices, mesh_xy,
-			x_chunk_size, zeta_h5_path, band_chunk_size, q_chunk_size, bispinor,
+			zeta_h5_path, band_chunk_size, q_chunk_size, bispinor,
 			use_gspace_cache=use_gspace_cache,
 			band_range_left=band_range_left,
 			band_range_right=band_range_right,
+			chunk_r=chunk_r,
 		)
 	
 	# Step 2: Compute V_qmunu from zeta
@@ -857,9 +865,11 @@ def fit_zeta_and_compute_V_q_chunked(
 	
 	# Write G0 (ζ_μ(G=0) for each q) to the zeta HDF5 file for restart/reuse
 	# g0_mu_all shape: (nqx, nqy, nqz, n_rmu)
+	# g0_mu_all may be sharded across processes; gather before numpy conversion
+	g0_mu_local = jax.experimental.multihost_utils.process_allgather(g0_mu_all)
 	if jax.process_index() == 0:
 		with h5py.File(zeta_h5_path, 'a') as f:
-			g0_np = np.asarray(g0_mu_all)
+			g0_np = np.asarray(g0_mu_local)
 			if 'g0_mu' in f:
 				del f['g0_mu']  # Overwrite if exists
 			f.create_dataset('g0_mu', data=g0_np)
@@ -879,7 +889,7 @@ def fit_zeta_and_compute_V_q_chunked(
 	
 	# Extract v_q0 (q=0 with G=0 excluded) and G0 (ζ_μ at G=0)
 	v_q0_noG0_munu = V_qmunu_raw[0, 0, 0, :, :]  # At q=(0,0,0)
-	G0_mu_nu = g0_mu_all[0, 0, 0, :]  # ζ_μ(G=0) at q=0
+	G0_mu_nu = g0_mu_local[0, 0, 0, :]  # ζ_μ(G=0) at q=0
 	
 	print(f"\n  V_q computed:")
 	print(f"    Shape: {V_qmunu.shape}")
@@ -1331,8 +1341,8 @@ def main(argv=None):
 		if jax.process_index() == 0:
 			print(f"  Auto-detected memory budget: {memory_per_device_gb:.2f} GB/device")
 	
-	# Explicit x_chunk_size override (0 = auto-compute from memory budget)
-	x_chunk_size_override = params.get("x_chunk_size", 0)
+	# Explicit r_chunk override (0 = auto-compute from memory budget)
+	r_chunk_override = params.get("r_chunk_size", 0)
 	
 	if x_only and do_screened:  # x_only=bare exchange only, do_screened=use W instead of v
 		raise ValueError("x_only and do_screened cannot both be True")
@@ -1408,7 +1418,7 @@ def main(argv=None):
 					bispinor=bispinor,
 					memory_budget_gb=memory_per_device_gb,
 					sys_dim=sys_dim,
-					x_chunk_size_override=x_chunk_size_override,
+					r_chunk_override=r_chunk_override,
 				)
 			
 			# Extract results

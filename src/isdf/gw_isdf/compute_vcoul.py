@@ -646,9 +646,6 @@ def compute_all_V_q_from_zeta_h5(
     # Single JIT point for the batched processor
     _batch_proc = jax.jit(jax.vmap(_single_chunk_proc, in_axes=(0, 0, 0)))
     
-    # Determine if we should use sharded reads
-    use_sharded_io = (mesh_xy is not None and jax.process_count() > 1)
-    
     if single_chunk:
         # Single-chunk path with OVERLAPPED I/O:
         # Read batch N+1 from disk while GPU processes batch N
@@ -694,9 +691,7 @@ def compute_all_V_q_from_zeta_h5(
                 )
                 qvecs.append(qvec_wrapped)
                 
-                # Read directly into pre-allocated array
-                if not use_sharded_io:
-                    zeta_stacked[i] = zeta_dset[qx, qy, qz, :, :]
+                zeta_stacked[i] = zeta_dset[qx, qy, qz, :, :]
             
             return zeta_stacked, qvecs
         
