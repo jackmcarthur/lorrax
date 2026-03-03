@@ -14,7 +14,6 @@ from .epsreader import EPSReader
 from .tagged_arrays import (
     write_labeled_arrays_to_h5,
     write_w0_qmunu_to_h5,
-    write_vw_nohead_to_h5,
     read_labeled_arrays_from_h5,
     load_labeled_arrays_from_h5,
     save_restart_per_proc,

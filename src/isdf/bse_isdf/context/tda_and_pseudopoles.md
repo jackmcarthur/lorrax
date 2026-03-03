@@ -251,10 +251,9 @@ For (j=1..m0):
 3. `f_j[cvk] = sum_mu conj(R^(q)[cvk,r_mu]) * tmp[r_mu]`  (this is (R^\dagger v,\eta)).
 4. Set the augmented seed
    [
-   \Phi^{(j)}_0 = \binom{X_0}{Y_0} = \binom{f_j}{-\,\bar f_j},
+   \Phi^{(j)}_0 = \binom{X_0}{Y_0} = \binom{f_j}{f_j}.
    ]
-   where the antiresonant drive uses the transpose-coupled vertex (\bar f=d^T v\eta) for complex Bloch spinors.
-   This targets modes with large density coupling (large (R X + R^* Y)), which is exactly what feeds (W).
+   This targets modes with large density coupling (large (X+Y)), which is exactly what feeds (W).
 
 ### Step B — FEAST filter into the window
 
@@ -281,11 +280,11 @@ H_w = V_w^\dagger S V_w \in \mathbb C^{m_w\times m_w}.
 ]
 (Compute `SV_w` by applying your augmented matvec (S) to each basis column.)
 
-### Step D — Build the “residue snapshot” matrix once (uses the density channel)
+### Step D — Build the “residue snapshot” matrix once (uses (X+Y))
 
 Split each basis column (V_w[:,j]) into transition blocks:
 [
-V_w[:,j] \equiv \binom{X^{(j)}}{Y^{(j)}}.
+V_w[:,j] \equiv \binom{X^{(j)}}{Y^{(j)}},\qquad s^{(j)} \equiv X^{(j)}+Y^{(j)}.
 ]
 Form the residue snapshot column in density space:
 [
@@ -293,7 +292,7 @@ d^{(j)}[r_\mu]
 ==============
 
 \sum_{\nu} v^{(\mathbf q)}[r_\mu,r_\nu];
-\Big(\sum_{t} R^{(\mathbf q)}[t,r_\nu]\;X^{(j)}[t]\;+\;\sum_{t} R^{(\mathbf q)}[t,r_\nu]^*\;Y^{(j)}[t]\Big).
+\Big(\sum_{t} R^{(\mathbf q)}[t,r_\nu]; s^{(j)}[t]\Big).
 ]
 As a matrix, define
 [
@@ -385,7 +384,7 @@ W_c^{(+)}(\omega;\mathbf q) \approx \sum_{w}\left[
 \right].
 ]
 
-The crucial non-TDA detail is that **every residue is built from (R X + R^* Y)** through `C_w`, i.e. from the density channel that actually screens.
+The crucial non-TDA detail is that **every residue is built from (X+Y)** through `C_w`, i.e. from the density channel that actually screens.
 
 ---
 

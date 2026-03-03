@@ -481,7 +481,6 @@ def run_feast_ritz(
     include_W: bool = True,
     use_tda: bool = True,
 ) -> dict:
-    v_couples_k = bool(not include_W)
     if use_tda:
         matvec = build_bse_ring_matvec(
             mesh_xy,
@@ -489,7 +488,6 @@ def run_feast_ritz(
             data["nky"],
             data["nkz"],
             include_W=include_W,
-            v_couples_k=v_couples_k,
         )
     else:
         matvec = build_bse_ring_matvec_full(
@@ -498,7 +496,6 @@ def run_feast_ritz(
             data["nky"],
             data["nkz"],
             include_W=include_W,
-            v_couples_k=v_couples_k,
         )
     sh = make_bse_shardings(mesh_xy)
 
@@ -739,7 +736,6 @@ def estimate_spectral_bounds_sharded(
         data["nky"],
         data["nkz"],
         include_W=include_W,
-        v_couples_k=bool(not include_W),
     )
 
     key = jax.random.PRNGKey(seed)
@@ -1144,8 +1140,6 @@ def main(argv: list[str] | None = None) -> None:
                         help="Use FP32 data/GMRES for shifted solves.")
     parser.add_argument("--tda", action="store_true",
                         help="Use Tamm-Dancoff approximation (TDA). Default is full non-TDA.")
-    parser.add_argument("--nohead", action="store_true",
-                        help="Use headless V/W0 arrays if present (V_qmunu_nohead, W0_qmunu_nohead).")
     parser.add_argument(
         "--units-ev-per-ry",
         type=float,
@@ -1178,7 +1172,6 @@ def main(argv: list[str] | None = None) -> None:
             n_val=args.n_val,
             n_cond=args.n_cond,
             mesh_xy=mesh_xy,
-            use_nohead=args.nohead,
         )
 
     use_tda = args.tda

@@ -75,6 +75,26 @@ def _orthonormalize(filtered: list[jax.Array], s_cutoff: float) -> tuple[list[ja
     return basis, coeffs, s_evals
 
 
+def _build_j_metric(basis: list[jax.Array]) -> np.ndarray:
+    """Build J-metric matrix J[i,j] = <v_i_X|v_j_X> - <v_i_Y|v_j_Y> for non-TDA.
+
+    For the Casida matrix S = [[A,B],[-B*,-A*]], the correct spectral norm is
+    N_p = psi_p^H J psi_p = ||X_p||^2 - ||Y_p||^2, where J = diag(I, -I).
+    """
+    n = len(basis)
+    if n == 0:
+        return np.zeros((0, 0), dtype=np.complex128)
+    V = jnp.stack(basis, axis=0)
+    # V has shape (n, 2, 1, nc, nv, nk) for non-TDA
+    dim_half = int(np.prod(V.shape[2:]))
+    X = V[:, 0].reshape((n, dim_half))
+    Y = V[:, 1].reshape((n, dim_half))
+    S_XX = X.conj() @ X.T
+    S_YY = Y.conj() @ Y.T
+    J = S_XX - S_YY
+    return np.asarray(jax.device_get(J))
+
+
 def _build_reduced_h(matvec, basis: list[jax.Array], data: dict, use_tda: bool) -> np.ndarray:
     """Build reduced H_w = V^H S V in the orthonormal basis."""
     if not basis:
@@ -349,8 +369,72 @@ def run_pseudopoles(
         order_b = np.argsort(evals_b.real)
         evals_b = evals_b[order_b]
         vecs_b = vecs_b[:, order_b]
+        # Discard Ritz pairs whose eigenvalue falls outside the window.
+        # Imperfect FEAST filtering can leak bright eigenstates from outside
+        # the window, producing spurious Ritz values that massively distort
+        # the pseudopole reconstruction.
+        a_ry = window.a_eV / ry_to_ev
+        b_ry = window.b_eV / ry_to_ev
+        in_window = (evals_b.real >= a_ry) & (evals_b.real <= b_ry)
+        n_discarded = int(np.sum(~in_window))
+        if n_discarded > 0:
+            print(f"  Discarding {n_discarded} out-of-window Ritz value(s):")
+            for idx_d in np.where(~in_window)[0]:
+                print(f"    omega={evals_b[idx_d].real * ry_to_ev:.4f} eV"
+                      f" (window [{window.a_eV:.1f}, {window.b_eV:.1f}])")
+            evals_b = evals_b[in_window]
+            vecs_b = vecs_b[:, in_window]
+
         g_b = Wb @ vecs_b
         d_bright = C_w @ g_b
+
+        # Non-TDA corrections: J-norm + anti-resonant poles.
+        #
+        # The non-Hermitian Casida resolvent has the Lehmann form (see e.g.
+        # Casida 1995, or any linear-response TDDFT reference):
+        #
+        #   chi(z) = sum_s [ F_s F_s† / (z - Omega_s)
+        #                  - F_s* F_s^T / (z + Omega_s) ]
+        #
+        # where F_s = sum_{cv} [X_s^{cv} rho_{cv} + Y_s^{cv} rho*_{cv}].
+        # Note the anti-resonant residue is F_s* F_s^T (NOT F_s F_s†).
+        #
+        # In our eval formula  Wc[mu,nu] = sum_p w_p d_p[mu] conj(d_p[nu]) / (z - omega_p):
+        #   Resonant:      d = F_s,       w = +1, omega = +Omega_s
+        #   Anti-resonant: d = conj(F_s), w = -1, omega = -Omega_s
+        #
+        # This correctly produces:
+        #   w * d[mu] * conj(d[nu]) / (z - omega)
+        #   = (-1) * conj(F[mu]) * F[nu] / (z + Omega)
+        #   = -F* F^T / (z + Omega)    ✓
+        weights_b = np.ones(evals_b.shape[0], dtype=np.float64)
+
+        if not use_tda and len(basis) > 0 and evals_b.size > 0:
+            J_w = _build_j_metric(basis)
+            J_b = Wb.conj().T @ J_w @ Wb
+            j_norms = np.array([
+                vecs_b[:, p].conj() @ J_b @ vecs_b[:, p]
+                for p in range(vecs_b.shape[1])
+            ])
+            j_norms_real = j_norms.real
+
+            n_bad = int(np.sum(j_norms_real <= 0))
+            if n_bad > 0:
+                print(f"  WARNING: {n_bad} Ritz vector(s) with non-positive J-norm")
+            j_floor = 1e-6
+            for p in range(d_bright.shape[1]):
+                if j_norms_real[p] > j_floor:
+                    d_bright[:, p] /= np.sqrt(j_norms_real[p])
+                else:
+                    print(f"    Skipping J-norm for pole {p} (N={j_norms_real[p]:.6e})")
+            print(f"  J-norms: min={j_norms_real.min():.4f}, max={j_norms_real.max():.4f},"
+                  f" mean={j_norms_real.mean():.4f}")
+
+            # Add anti-resonant poles at -Omega_p with weight=-1 and conj(d_p).
+            n_res = evals_b.shape[0]
+            evals_b = np.concatenate([evals_b, -evals_b])
+            d_bright = np.concatenate([d_bright, np.conj(d_bright)], axis=1)
+            weights_b = np.concatenate([np.ones(n_res), -np.ones(n_res)])
 
         # --- Step G: Tail pseudopoles ---
         omega_tail = np.zeros((0,), dtype=np.complex128)
@@ -370,19 +454,34 @@ def run_pseudopoles(
             omega_tail = np.array(omega_list, dtype=np.complex128)
             d_tail = np.stack(d_list, axis=0)
 
+            # Discard tail pseudopoles outside the window
+            tail_in = (omega_tail.real >= a_ry) & (omega_tail.real <= b_ry)
+            n_tail_disc = int(np.sum(~tail_in))
+            if n_tail_disc > 0:
+                print(f"  Discarding {n_tail_disc} out-of-window tail pseudopole(s)")
+                omega_tail = omega_tail[tail_in]
+                d_tail = d_tail[tail_in]
+
             B_disc = float(np.sum(sigma2[p_use:])) if sigma2.size > p_use else 0.0
             B_tail = float(np.sum(np.abs(d_tail) ** 2))
             if B_disc > 0.0 and B_tail > 0.0:
                 alpha = math.sqrt(B_disc / B_tail)
                 d_tail = d_tail * alpha
 
+        weights_tail = np.ones(omega_tail.shape[0], dtype=np.float64)
+        J_w_save = _build_j_metric(basis) if (not use_tda and len(basis) > 0) else np.zeros((0, 0), dtype=np.complex128)
         results[window.name] = {
             "omega_bright": evals_b,
             "d_bright": d_bright.T,
+            "weight_bright": weights_b,
             "omega_tail": omega_tail,
             "d_tail": d_tail,
+            "weight_tail": weights_tail,
             "sigma": sigma,
             "s_evals": s_evals,
+            "H_w": H_w,
+            "C_w": C_w,
+            "J_w": J_w_save,
         }
 
     return results
@@ -425,17 +524,27 @@ def write_pseudopoles_h5(
             omega_t = np.asarray(r.get("omega_tail", np.zeros((0,), dtype=np.complex128)))
             d_b = np.asarray(r.get("d_bright", np.zeros((0, 0), dtype=np.complex128)))
             d_t = np.asarray(r.get("d_tail", np.zeros((0, 0), dtype=np.complex128)))
+            w_b = np.asarray(r.get("weight_bright", np.ones(omega_b.shape[0], dtype=np.float64)))
+            w_t = np.asarray(r.get("weight_tail", np.ones(omega_t.shape[0], dtype=np.float64)))
             sigma = np.asarray(r.get("sigma", np.zeros((0,), dtype=np.float64)))
             s_evals = np.asarray(r.get("s_evals", np.zeros((0,), dtype=np.float64)))
 
             g.create_dataset("omega_bright_ry", data=omega_b)
             g.create_dataset("omega_bright_eV", data=omega_b * ry_to_ev)
             g.create_dataset("d_bright", data=d_b)
+            g.create_dataset("weight_bright", data=w_b)
             g.create_dataset("omega_tail_ry", data=omega_t)
             g.create_dataset("omega_tail_eV", data=omega_t * ry_to_ev)
             g.create_dataset("d_tail", data=d_t)
+            g.create_dataset("weight_tail", data=w_t)
             g.create_dataset("sigma", data=sigma)
             g.create_dataset("s_evals", data=s_evals)
+            H_w = np.asarray(r.get("H_w", np.zeros((0, 0), dtype=np.complex128)))
+            C_w = np.asarray(r.get("C_w", np.zeros((0, 0), dtype=np.complex128)))
+            J_w = np.asarray(r.get("J_w", np.zeros((0, 0), dtype=np.complex128)))
+            g.create_dataset("H_w", data=H_w)
+            g.create_dataset("C_w", data=C_w)
+            g.create_dataset("J_w", data=J_w)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -466,7 +575,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--windows-kpm", action="store_true",
                         help="Derive windows from KPM DOS.")
     parser.add_argument("--windows-kpm-count", type=int, default=4)
-    parser.add_argument("--kpm-n-moments", type=int, default=100)
+    parser.add_argument("--kpm-n-moments", type=int, default=200)
     parser.add_argument("--kpm-n-random", type=int, default=4)
     parser.add_argument("--kpm-seed", type=int, default=0)
     parser.add_argument("--kpm-n-energy-pts", type=int, default=2000)

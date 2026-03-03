@@ -152,6 +152,22 @@ uv pip install -e .
 uv run -- python -m pytest -q
 ```
 
+Run the end-to-end COHSEX regression test:
+
+```bash
+export JAX_COMPILATION_CACHE_DIR="$HOME/.cache/jax/isdf_cohsex"
+export JAX_ENABLE_COMPILATION_CACHE=1
+export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0
+export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=0
+uv run -- python -m pytest -q tests/test_cohsex_jax_regression.py -m regression
+```
+
+Notes:
+- Regression fixture files live in `tests/regression/cohsex_debug/`.
+- The test runs `python -m isdf.gw_isdf.cohsex_jax -i cohsex_test.in` and compares `eqp_test.dat` to `eqp_ref.dat`.
+- By default the regression runs on CPU for portability (`ISDF_COHSEX_TEST_PLATFORM=cpu`).
+- To request GPU execution, set `ISDF_COHSEX_TEST_PLATFORM=gpu` before running pytest.
+
 Run the sample COHSEX calculation:
 
 ```bash

@@ -3,14 +3,26 @@
 This is a lightweight post-processing utility for `bse_pseudopoles.py`.
 
 We interpret the saved pseudopoles as an approximation of the retarded
-correlation screened interaction (in the ISDF/r_mu basis):
+correlation screened interaction (in the ISDF/r_mu basis).
 
-  W_c(omega) ≈ sum_p d_p d_p^H / (omega - Omega_p)
+For TDA:
+  W_c(omega) ≈ sum_s  d_s d_s^H / (omega - Omega_s)
 
-where each residue vector d_p is the *Coulomb-dressed density channel*
+For non-TDA (full Casida / Lehmann representation):
+  W_c(omega) ≈ sum_s [ d_s d_s^H / (omega - Omega_s)
+                      - d_s* d_s^T / (omega + Omega_s) ]
+
+This is implemented via a unified evaluation formula with per-pole weights:
+  W_c[mu,nu] = sum_p  w_p * d_p[mu] * conj(d_p[nu]) / (omega - omega_p)
+
+where non-TDA poles are stored as:
+  Resonant:      omega_p = +Omega_s,  d_p = d_s,       w_p = +1
+  Anti-resonant: omega_p = -Omega_s,  d_p = conj(d_s), w_p = -1
+
+Each residue vector d_s is the *Coulomb-dressed density channel*
 used elsewhere in this repo (see `bse_w_exact.py`):
-  d_p[mu] = (V * (d X + d* Y))[mu]   (non-TDA)
-  d_p[mu] = (V * (d X))[mu]         (TDA)
+  d_s[mu] = (V * (d X + d* Y))[mu]   (non-TDA)
+  d_s[mu] = (V * (d X))[mu]         (TDA)
 
 So the evaluated columns here are directly comparable to:
   - `bse_w_exact.py --write-kind Wc`
@@ -31,6 +43,7 @@ import numpy as np
 class Poles:
     omega_ry: np.ndarray  # (n_poles,)
     d: np.ndarray  # (n_poles, n_mu)
+    weight: np.ndarray  # (n_poles,)  +1 resonant, -1 anti-resonant
 
 
 def _iter_window_groups(h5: h5py.File, windows: Iterable[str] | None) -> list[str]:
@@ -45,34 +58,49 @@ def _iter_window_groups(h5: h5py.File, windows: Iterable[str] | None) -> list[st
 def load_pseudopoles(path: str, *, windows: list[str] | None = None) -> Poles:
     omega_all: list[np.ndarray] = []
     d_all: list[np.ndarray] = []
+    w_all: list[np.ndarray] = []
     with h5py.File(path, "r") as h5:
         for wname in _iter_window_groups(h5, windows):
             g = h5[wname]
 
             omega_b = np.asarray(g.get("omega_bright_ry", np.zeros((0,), dtype=np.complex128)))
             d_b = np.asarray(g.get("d_bright", np.zeros((0, 0), dtype=np.complex128)))
+            w_b = np.asarray(g.get("weight_bright", np.ones(omega_b.size, dtype=np.float64)))
             omega_t = np.asarray(g.get("omega_tail_ry", np.zeros((0,), dtype=np.complex128)))
             d_t = np.asarray(g.get("d_tail", np.zeros((0, 0), dtype=np.complex128)))
+            w_t = np.asarray(g.get("weight_tail", np.ones(omega_t.size, dtype=np.float64)))
 
             if omega_b.size:
                 omega_all.append(omega_b.reshape(-1))
                 d_all.append(d_b.reshape((omega_b.size, -1)))
+                w_all.append(w_b.reshape(-1))
             if omega_t.size:
                 omega_all.append(omega_t.reshape(-1))
                 d_all.append(d_t.reshape((omega_t.size, -1)))
+                w_all.append(w_t.reshape(-1))
 
     if not omega_all:
-        return Poles(omega_ry=np.zeros((0,), dtype=np.complex128), d=np.zeros((0, 0), dtype=np.complex128))
+        return Poles(
+            omega_ry=np.zeros((0,), dtype=np.complex128),
+            d=np.zeros((0, 0), dtype=np.complex128),
+            weight=np.zeros((0,), dtype=np.float64),
+        )
 
     omega = np.concatenate(omega_all, axis=0)
     d = np.concatenate(d_all, axis=0)
-    return Poles(omega_ry=omega, d=d)
+    weight = np.concatenate(w_all, axis=0)
+    return Poles(omega_ry=omega, d=d, weight=weight)
 
 
 def reconstruct_Wc_columns(poles: Poles, *, z_ry: complex, cols: np.ndarray) -> np.ndarray:
-    """Return Wc[:, cols] as row-major columns: shape (n_cols, n_mu)."""
+    """Return Wc[:, cols] as row-major columns: shape (n_cols, n_mu).
+
+    Uses: Wc[mu, nu] = sum_p w_p * d_p[mu] * conj(d_p[nu]) / (z - omega_p)
+    where w_p is +1 for resonant poles and -1 for anti-resonant poles.
+    """
     omega = poles.omega_ry
     d = poles.d
+    w = poles.weight
     if omega.size == 0:
         return np.zeros((int(cols.size), int(d.shape[1]) if d.ndim == 2 else 0), dtype=np.complex128)
     if d.ndim != 2:
@@ -81,11 +109,11 @@ def reconstruct_Wc_columns(poles: Poles, *, z_ry: complex, cols: np.ndarray) -> 
         return np.zeros((0, d.shape[1]), dtype=d.dtype)
 
     denom = (z_ry - omega).astype(np.complex128)  # (n_poles,)
-    weights = 1.0 / denom  # (n_poles,)
+    coeffs = w / denom  # (n_poles,)  -- w_p / (z - omega_p)
 
-    # For each column nu: Wc[:,nu] = sum_p d_p * conj(d_p[nu]) / (z - omega_p).
+    # Wc[:,nu] = sum_p w_p * d_p * conj(d_p[nu]) / (z - omega_p).
     d_conj_cols = d[:, cols].conj()  # (n_poles, n_cols)
-    tmp = d_conj_cols * weights[:, None]  # (n_poles, n_cols)
+    tmp = d_conj_cols * coeffs[:, None]  # (n_poles, n_cols)
     return tmp.T @ d  # (n_cols, n_mu)
 
 

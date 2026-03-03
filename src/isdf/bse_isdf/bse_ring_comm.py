@@ -17,6 +17,8 @@ except ImportError:  # pragma: no cover - older JAX
     _shard_map_fn = _shard_map_mod.shard_map
 
 import isdf.common.timing as timing
+from .bse_io import _find_restart_file, _load_ring_subset, load_bse_data_from_restart_sharded
+from .bse_serial import apply_D, apply_bse_hamiltonian_single_device, compute_pair_amplitude
 
 
 jax.config.update("jax_enable_x64", True)
@@ -82,7 +84,7 @@ def _ring_sum_valence(
         psi_v_slice = lax.dynamic_slice(
             psi_v_Y, (z, v_start, z, z), (nk, v_chunk, nspinor, nu_local)
         )
-        R = R + jnp.einsum("kvsN,bcvk->bcksN", jnp.conj(psi_v_slice), buf)
+        R = R + jnp.einsum("kv sN,bcvk->bcksN", jnp.conj(psi_v_slice), buf)
         buf = lax.ppermute(buf, axis_name="y", perm=perm)
         return buf, R
 
@@ -177,7 +179,7 @@ def _ring_sum_valence_second(
         psi_v_slice = lax.dynamic_slice(
             psi_v_X, (z, v_start, z, z), (nk, v_chunk, nspinor, mu_local)
         )
-        T = T + jnp.einsum("kvtM,bvksN->bMNtsk", psi_v_slice, buf)
+        T = T + jnp.einsum("kvsM,bvksN->bMNtsk", psi_v_slice, buf)
         buf = lax.ppermute(buf, axis_name="y", perm=perm)
         return buf, T
 
@@ -233,8 +235,6 @@ def apply_V_ring(
     nk: int,
     px: int,
     py: int,
-    *,
-    couple_k: bool = False,
 ) -> jax.Array:
     nb_trial = X.shape[0]
     sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
@@ -288,21 +288,8 @@ def apply_V_ring(
 
     S_total = S_total / sqrt_nk
 
-    if couple_k:
-        # Dyson-consistent RPA/Hartree contraction for q=0:
-        #   rho_total[nu] = sum_k rho_k[nu]
-        #   phi[mu]       = V[mu,nu] rho_total[nu]
-        #   (VX)_kcv      = (1/Nk) * d_kcv^† phi
-        #
-        # Our normalization uses sqrt_nk factors so that the overall action
-        # still carries a 1/Nk prefactor when we return VX / sqrt_nk below.
-        S_total = jnp.sum(S_total, axis=-1)  # (batch, nu_local)
-        U_partial = jnp.einsum("MN,bN->bM", V_q0, S_total)  # (batch, mu_local)
-        U = lax.psum(U_partial, axis_name="y")[:, :, None]  # (batch, mu_local, 1) -> broadcast over k
-    else:
-        # BSE-style q=0 exchange contraction (k-diagonal).
-        U_partial = jnp.einsum("MN,bNk->bMk", V_q0, S_total)
-        U = lax.psum(U_partial, axis_name="y")
+    U_partial = jnp.einsum("MN,bNk->bMk", V_q0, S_total)
+    U = lax.psum(U_partial, axis_name="y")
 
     v_start_local = axis_index_y * jnp.asarray(v_chunk, dtype=jnp.int32)
     psi_v_slice_X = lax.dynamic_slice(
@@ -360,8 +347,6 @@ def build_bse_ring_matvec(
     timed: bool = False,
     low_mem: bool = True,
     include_W: bool = True,
-    *,
-    v_couples_k: bool = False,
 ):
     px, py = mesh_xy.devices.shape
     sh = make_bse_shardings(mesh_xy)
@@ -400,18 +385,7 @@ def build_bse_ring_matvec(
     )
 
     def _apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0):
-        return apply_V_ring(
-            X,
-            psi_c_Y,
-            psi_v_Y,
-            psi_c_X,
-            psi_v_X,
-            V_q0,
-            nk,
-            px,
-            py,
-            couple_k=v_couples_k,
-        )
+        return apply_V_ring(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0, nk, px, py)
 
     apply_V_ring_only = _shard_map_fn(
         _apply_V_ring_only,
@@ -507,15 +481,8 @@ def build_bse_ring_matvec_full(
     timed: bool = False,
     low_mem: bool = True,
     include_W: bool = True,
-    *,
-    v_couples_k: bool = False,
 ):
-    """Build full (non-TDA) BSE matvec for S = [[A, B], [-B*, -A*]].
-
-    For complex Bloch/spinor wavefunctions, the bottom blocks are elementwise
-    complex conjugates (not Hermitian adjoints) in the standard non-TDA RPA/BSE
-    Liouvillian formulation.
-    """
+    """Build full (non-TDA) BSE matvec for S = [[A, B], [-B^H, -A^H]]."""
     px, py = mesh_xy.devices.shape
     sh = make_bse_shardings(mesh_xy)
     nk = nkx * nky * nkz
@@ -573,7 +540,7 @@ def build_bse_ring_matvec_full(
         X_full_c = lax.all_gather(X, "x", axis=1, tiled=True)
         R = jnp.einsum("kcsN,bcvk->bvksN", jnp.conj(psi_c_Y), X_full_c)
         R_full_v = lax.all_gather(R, "y", axis=1, tiled=True)
-        T = jnp.einsum("kvtM,bvksN->bMNtsk", psi_v_X, R_full_v)
+        T = jnp.einsum("kvsM,bvksN->bMNtsk", psi_v_X, R_full_v)
         return T
 
     encode_T_gather_B = _shard_map_fn(
@@ -585,18 +552,7 @@ def build_bse_ring_matvec_full(
     )
 
     def _apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0):
-        return apply_V_ring(
-            X,
-            psi_c_Y,
-            psi_v_Y,
-            psi_c_X,
-            psi_v_X,
-            V_q0,
-            nk,
-            px,
-            py,
-            couple_k=v_couples_k,
-        )
+        return apply_V_ring(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0, nk, px, py)
 
     apply_V_ring_only = _shard_map_fn(
         _apply_V_ring_only,
@@ -618,7 +574,6 @@ def build_bse_ring_matvec_full(
             nk,
             px,
             py,
-            couple_k=v_couples_k,
         )
 
     apply_V_ring_B = _shard_map_fn(
@@ -687,12 +642,10 @@ def build_bse_ring_matvec_full(
         BY = _apply_B(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0)
         X_out = AX + BY
 
-        # Bottom blocks are elementwise conjugates (-B*, -A*), not adjoints.
-        A_star_Y = jnp.conj(
-            _apply_A(jnp.conj(Y), psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
-        )
-        B_star_X = jnp.conj(_apply_B(jnp.conj(X), psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0))
-        Y_out = -B_star_X - A_star_Y
+        # A and B are Hermitian in this formulation; reuse A(Y) and B(X).
+        AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
+        B_dag_X = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0)
+        Y_out = -B_dag_X - AY
         return jnp.stack([X_out, Y_out], axis=0)
 
     if timed:
@@ -718,22 +671,9 @@ def build_bse_ring_matvec_full(
                 BY.block_until_ready()
             X_out = AX + BY
 
-            with timing.section("bse_jax.bottom_blocks"):
-                A_star_Y = jnp.conj(
-                    _apply_A(
-                        jnp.conj(Y),
-                        psi_c_X,
-                        psi_c_Y,
-                        psi_v_X,
-                        psi_v_Y,
-                        eps_c,
-                        eps_v,
-                        W_R,
-                        V_q0,
-                    )
-                )
-                B_star_X = jnp.conj(_apply_B(jnp.conj(X), psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0))
-                Y_out = -B_star_X - A_star_Y
+            AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
+            B_dag_X = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0)
+            Y_out = -B_dag_X - AY
             return jnp.stack([X_out, Y_out], axis=0)
 
         return _matvec_timed
@@ -810,59 +750,6 @@ def build_realspace_random_transition_generator(
         out_specs=P(None, "x", "y", None),
         axis_names={"x", "y"},
     )
-
-
-def build_density_drive_operators(
-    mesh_xy: Mesh,
-    nkx: int,
-    nky: int,
-    nkz: int,
-    n_cond_pad: int,
-    n_val_pad: int,
-):
-    """Return callable(s) to build density-driven RHS blocks in transition space.
-
-    Transition vertex (fixed by `build_realspace_random_transition_generator`):
-      d(t,mu) = sum_s conj(psi_c(t,mu)) * psi_v(t,mu)
-
-    For a density-space source g(mu), define u = V g. We need:
-      f    = d^\\dagger u
-      fbar = d^T       u
-
-    For complex Bloch spinors we must not assume fbar == conj(f).
-
-    Implementation detail:
-    `build_realspace_random_transition_generator` computes f by projecting with conj(d).
-    Passing conjugated wavefunctions flips that projection and yields fbar instead.
-    """
-    gen = build_realspace_random_transition_generator(mesh_xy, nkx, nky, nkz, n_cond_pad, n_val_pad)
-
-    def f_op(r, psi_c_X, psi_v_X, V_q0):
-        return gen(r, psi_c_X, psi_v_X, V_q0)
-
-    def fbar_op(r, psi_c_X, psi_v_X, V_q0):
-        return gen(r, jnp.conj(psi_c_X), jnp.conj(psi_v_X), V_q0)
-
-    return f_op, fbar_op
-
-
-def build_density_readout_operator_full(
-    mesh_xy: Mesh,
-    nkx: int,
-    nky: int,
-    nkz: int,
-):
-    """Return a callable to compute w = V (d X + d* Y) from X_full=[X,Y]."""
-    snapshot = build_density_snapshot_operator(mesh_xy, nkx, nky, nkz)
-
-    def _readout(X_full, psi_c_Y, psi_v_Y, V_q0):
-        X = X_full[0]
-        Y = X_full[1]
-        w_x = snapshot(X, psi_c_Y, psi_v_Y, V_q0)
-        w_y = snapshot(Y, jnp.conj(psi_c_Y), jnp.conj(psi_v_Y), V_q0)
-        return w_x + w_y
-
-    return _readout
 
 
 def build_density_snapshot_operator(
@@ -944,3 +831,240 @@ def build_density_snapshot_operator(
         out_specs=P(None, "x"),
         axis_names={"x", "y"},
     )
+
+
+def ring_matvec_smoke_test(px: int = 2, py: int = 2) -> None:
+    devices = jax.devices()
+    if len(devices) < px * py:
+        raise RuntimeError(
+            f"Need {px*py} devices, found {len(devices)}. "
+            "Set XLA_FLAGS=--xla_force_host_platform_device_count=... before running."
+        )
+    mesh = Mesh(np.array(devices[:px * py]).reshape(px, py), axis_names=("x", "y"))
+    sh = make_bse_shardings(mesh)
+
+    nkx, nky, nkz = 2, 2, 1
+    nk = nkx * nky * nkz
+    nc, nv, nspinor, n_rmu = 4 * px, 4 * py, 2, 8 * px * py
+
+    key = jax.random.PRNGKey(0)
+    psi_c = jax.random.normal(key, (nk, nc, nspinor, n_rmu)) + 1j * jax.random.normal(key, (nk, nc, nspinor, n_rmu))
+    psi_v = jax.random.normal(key, (nk, nv, nspinor, n_rmu)) + 1j * jax.random.normal(key, (nk, nv, nspinor, n_rmu))
+    eps_c = jax.random.uniform(key, (nk, nc), minval=0.1, maxval=0.5)
+    eps_v = jax.random.uniform(key, (nk, nv), minval=-0.5, maxval=-0.1)
+    W_q = jax.random.normal(key, (n_rmu, n_rmu, nkx, nky, nkz)) * 0.01
+    V_q0 = jnp.eye(n_rmu) * 0.05
+    X = jax.random.normal(key, (1, nc, nv, nk)) + 1j * jax.random.normal(key, (1, nc, nv, nk))
+
+    with mesh:
+        psi_c_X = jax.lax.with_sharding_constraint(psi_c, sh.psi_x)
+        psi_c_Y = jax.lax.with_sharding_constraint(psi_c, sh.psi_y)
+        psi_v_X = jax.lax.with_sharding_constraint(psi_v, sh.psi_x)
+        psi_v_Y = jax.lax.with_sharding_constraint(psi_v, sh.psi_y)
+        W_q = jax.lax.with_sharding_constraint(W_q, sh.W)
+        V_q0 = jax.lax.with_sharding_constraint(V_q0, sh.V)
+        X = jax.lax.with_sharding_constraint(X, sh.X)
+
+        matvec = build_bse_ring_matvec(mesh, nkx, nky, nkz)
+        W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
+        HX = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
+        HX.block_until_ready()
+
+    print(f"HX sharding: {HX.sharding}")
+    if hasattr(jax.debug, "inspect_array_sharding"):
+        try:
+            jax.debug.inspect_array_sharding(HX, name="HX")
+        except TypeError:
+            try:
+                jax.debug.inspect_array_sharding(HX, callback=lambda *_: None)
+            except TypeError:
+                pass
+
+
+def ring_matvec_correctness_check(
+    input_file: str,
+    n_val: int = 4,
+    n_cond: int = 4,
+    px: int = 2,
+    py: int = 2,
+    component_check: bool = False,
+) -> None:
+    restart_file = _find_restart_file(input_file)
+    devices = jax.devices()
+    if len(devices) < px * py:
+        raise RuntimeError(
+            f"Need {px*py} devices, found {len(devices)}. "
+            "Set XLA_FLAGS=--xla_force_host_platform_device_count=... before running."
+        )
+    mesh = Mesh(np.array(devices[:px * py]).reshape(px, py), axis_names=("x", "y"))
+    sh = make_bse_shardings(mesh)
+
+    payload = _load_ring_subset(restart_file, n_val, n_cond, px, py)
+    psi_c = payload["psi_c"]
+    psi_v = payload["psi_v"]
+    eps_c = payload["eps_c"]
+    eps_v = payload["eps_v"]
+    W_q = payload["W_q"]
+    V_q0 = payload["V_q0"]
+    X = payload["X"]
+    nkx = payload["nkx"]
+    nky = payload["nky"]
+    nkz = payload["nkz"]
+    nk = payload["nk"]
+    n_rmu_pad = payload["n_rmu_pad"]
+
+    HX_ref = apply_bse_hamiltonian_single_device(
+        X, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz
+    )
+
+    with mesh:
+        psi_c_X = jax.lax.with_sharding_constraint(psi_c, sh.psi_x)
+        psi_c_Y = jax.lax.with_sharding_constraint(psi_c, sh.psi_y)
+        psi_v_X = jax.lax.with_sharding_constraint(psi_v, sh.psi_x)
+        psi_v_Y = jax.lax.with_sharding_constraint(psi_v, sh.psi_y)
+        W_q = jax.lax.with_sharding_constraint(W_q, sh.W)
+        V_q0 = jax.lax.with_sharding_constraint(V_q0, sh.V)
+        X = jax.lax.with_sharding_constraint(X, sh.X)
+        W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
+
+        matvec = build_bse_ring_matvec(mesh, nkx, nky, nkz)
+        HX_ring = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
+        HX_ring.block_until_ready()
+
+    HX_ring_host = jax.device_get(HX_ring)
+    diff = jnp.linalg.norm(HX_ring_host - HX_ref) / jnp.maximum(jnp.linalg.norm(HX_ref), 1e-12)
+    print(f"Relative error ||HX_ring - HX_ref||/||HX_ref||: {float(diff):.3e}")
+
+    if component_check:
+        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=jnp.float64))
+        M = compute_pair_amplitude(psi_c, psi_v)
+        D_ref = apply_D(X, eps_c, eps_v)
+        S_V = jnp.einsum("kcvN,bcvk->bNk", M, X) / sqrt_nk
+        U_V = jnp.einsum("MN,bNk->bMk", V_q0, S_V)
+        V_ref = jnp.einsum("kcvM,bMk->bcvk", jnp.conj(M), U_V) / sqrt_nk
+
+        R = jnp.einsum("kvsN,bcvk->bcksN", jnp.conj(psi_v), X)
+        T = jnp.einsum("kctM,bcksN->bMNtsk", psi_c, R)
+        T_k = T.reshape(X.shape[0], n_rmu_pad, n_rmu_pad, psi_c.shape[2], psi_c.shape[2], nkx, nky, nkz)
+        T_R = jnp.fft.ifftn(T_k, axes=(5, 6, 7), norm="ortho")
+        W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
+        U_R = W_R[None, :, :, None, None, :, :, :] * T_R
+        U_q = jnp.fft.fftn(U_R, axes=(5, 6, 7), norm="ortho")
+        U = U_q.reshape(X.shape[0], n_rmu_pad, n_rmu_pad, psi_c.shape[2], psi_c.shape[2], nk)
+        A = jnp.einsum("kctM,bMNtsk->bcNsk", jnp.conj(psi_c), U)
+        W_ref = jnp.einsum("kvsN,bcNsk->bcvk", psi_v, A) / sqrt_nk
+
+        comp_matvec = build_bse_ring_matvec(mesh, nkx, nky, nkz)
+        with mesh:
+            D_ring = apply_D(X, eps_c, eps_v)
+            W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
+            V_ring = comp_matvec(
+                X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c * 0.0, eps_v * 0.0, W_R * 0.0, V_q0
+            )
+            W_ring = comp_matvec(
+                X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c * 0.0, eps_v * 0.0, W_R, V_q0 * 0.0
+            )
+            D_ring.block_until_ready()
+            V_ring.block_until_ready()
+            W_ring.block_until_ready()
+
+        def _rel_err(a, b):
+            return float(jnp.linalg.norm(a - b) / jnp.maximum(jnp.linalg.norm(b), 1e-12))
+
+        print(f"Component error D: { _rel_err(D_ring, D_ref):.3e}")
+        print(f"Component error V: { _rel_err(V_ring, V_ref):.3e}")
+        print(f"Component error W: { _rel_err(-W_ring, W_ref):.3e}")
+
+
+def ring_matvec_timing(
+    input_file: str,
+    n_val: int = 4,
+    n_cond: int = 4,
+    px: int = 2,
+    py: int = 2,
+    n_repeat: int = 5,
+    n_warmup: int = 1,
+    component_timing: bool = True,
+    low_mem: bool = True,
+) -> None:
+    restart_file = _find_restart_file(input_file)
+    devices = jax.devices()
+    if len(devices) < px * py:
+        raise RuntimeError(
+            f"Need {px*py} devices, found {len(devices)}. "
+            "Set XLA_FLAGS=--xla_force_host_platform_device_count=... before running."
+        )
+    mesh = Mesh(np.array(devices[:px * py]).reshape(px, py), axis_names=("x", "y"))
+    sh = make_bse_shardings(mesh)
+
+    timing.reset()
+    with timing.section("bse_jax.restart_load"):
+        payload = load_bse_data_from_restart_sharded(
+            restart_file,
+            n_val=n_val,
+            n_cond=n_cond,
+            fermi_energy=0.0,
+            mesh_xy=mesh,
+            pad_bands=True,
+        )
+        psi_c_X = payload["psi_c_X"]
+        psi_c_Y = payload["psi_c_Y"]
+        psi_v_X = payload["psi_v_X"]
+        psi_v_Y = payload["psi_v_Y"]
+        eps_c = payload["eps_c"]
+        eps_v = payload["eps_v"]
+        W_q = payload["W_q"]
+        V_q0 = payload["V_q0"]
+        nkx = payload["nkx"]
+        nky = payload["nky"]
+        nkz = payload["nkz"]
+        n_cond_pad = payload["n_cond_pad"]
+        n_val_pad = payload["n_val_pad"]
+        nk = nkx * nky * nkz
+        key = jax.random.PRNGKey(0)
+        X = jax.random.normal(key, (1, n_cond_pad, n_val_pad, nk)) + 1j * jax.random.normal(
+            key, (1, n_cond_pad, n_val_pad, nk)
+        )
+
+    with mesh:
+        psi_c_X = jax.lax.with_sharding_constraint(psi_c_X, sh.psi_x)
+        psi_c_Y = jax.lax.with_sharding_constraint(psi_c_Y, sh.psi_y)
+        psi_v_X = jax.lax.with_sharding_constraint(psi_v_X, sh.psi_x)
+        psi_v_Y = jax.lax.with_sharding_constraint(psi_v_Y, sh.psi_y)
+        W_q = jax.lax.with_sharding_constraint(W_q, sh.W)
+        V_q0 = jax.lax.with_sharding_constraint(V_q0, sh.V)
+        X = jax.lax.with_sharding_constraint(X, sh.X)
+
+        matvec = build_bse_ring_matvec(mesh, nkx, nky, nkz, low_mem=low_mem)
+
+        with timing.section("bse_jax.matvec_compile"):
+            W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
+            W_R.block_until_ready()
+            HX = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
+            HX.block_until_ready()
+
+        for _ in range(n_warmup):
+            HX = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
+            HX.block_until_ready()
+
+        with timing.section("bse_jax.matvec_run"):
+            for _ in range(n_repeat):
+                HX = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
+                HX.block_until_ready()
+
+        if component_timing:
+            with timing.section("bse_jax.D_term"):
+                D_ring = apply_D(X, eps_c, eps_v)
+                D_ring.block_until_ready()
+            with timing.section("bse_jax.V_term"):
+                V_ring = matvec(
+                    X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c * 0.0, eps_v * 0.0, W_R * 0.0, V_q0
+                )
+                V_ring.block_until_ready()
+            with timing.section("bse_jax.W_term"):
+                W_ring = matvec(
+                    X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c * 0.0, eps_v * 0.0, W_R, V_q0 * 0.0
+                )
+                W_ring.block_until_ready()
+
+    timing.report(print_fn=print, title="--- Timing ---")

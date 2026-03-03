@@ -37,6 +37,10 @@ members = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "regression: end-to-end physics regression tests with reference files",
+    "gpu: tests that require a CUDA-capable JAX backend",
+]
 
 [dependency-groups]
 dev = [

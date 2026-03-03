@@ -269,7 +269,8 @@ def partition_windows_equal_b_over_omega(
         else:
             omega_floor_ry = 1e-8
     omega_safe = np.maximum(omega_grid_ry, omega_floor_ry)
-    integrand = b_omega_ry / omega_safe
+    # integrand = b_omega_ry / omega_safe  # B(Ω)/Ω weighting
+    integrand = b_omega_ry  # equal-state windows (no 1/Ω)
 
     d_omega = np.diff(omega_grid_ry)
     avg = 0.5 * (integrand[1:] + integrand[:-1])
@@ -419,9 +420,18 @@ def run_kpm_dos(
         omega_min_eV = E_grid[1] if E_grid[0] <= 0.0 else E_grid[0]
         omega_min_eV = max(float(omega_min_eV), float(e_min_ry * ry_to_ev))
     else:
-        omega_min_eV = max(0.0, float(E_grid[1]))
+        # For non-TDA, the spectrum is symmetric (±Ω pairs).  We only window
+        # the positive half.  Cap 1/Ω at 1/(1 eV) so the sub-1eV region has
+        # flat weight, preventing Gibbs ringing near ω=0 from creating
+        # pathologically narrow first windows.
+        omega_min_eV = 0.01  # small positive cutoff
+    omega_floor_ry = None
+    if not use_tda:
+        omega_floor_ry = 1.0 / ry_to_ev  # cap 1/Ω at 1/(1 eV)
+        print(f"  non-TDA: 1/Ω capped at 1/(1 eV) = {1.0/ry_to_ev:.6f} Ry")
     windows_ry = partition_windows_equal_b_over_omega(
-        E_grid, rho, n_windows=n_windows, ry_to_ev=ry_to_ev, omega_min_eV=omega_min_eV,
+        E_grid, rho, n_windows=n_windows, ry_to_ev=ry_to_ev,
+        omega_min_eV=omega_min_eV, omega_floor_ry=omega_floor_ry,
     )
     window_edges_eV = windows_ry.ravel() * ry_to_ev
 
@@ -498,7 +508,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--n-cond", type=int, default=4)
     parser.add_argument("--px", type=int, default=1)
     parser.add_argument("--py", type=int, default=1)
-    parser.add_argument("--n-moments", type=int, default=100,
+    parser.add_argument("--n-moments", type=int, default=200,
                         help="Number of Chebyshev moments M (cost: R*M matvecs)")
     parser.add_argument("--n-random", type=int, default=4,
                         help="Stochastic trace vectors R (5-10 is usually enough)")

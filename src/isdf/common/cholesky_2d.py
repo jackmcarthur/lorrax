@@ -117,19 +117,6 @@ def cholesky_2d_single(mesh: Mesh, J: int, b: int):
             4. Broadcast panel L[:,k] via psum
             5. SYRK: all procs update A[i,j] -= L[i,k] @ L[j,k]^H for i,j>k
     """
-    # Single-device mesh: avoid manual axes entirely.
-    # This sidesteps JAX VMA/scan carry annotations on 1x1 meshes.
-    # TODO(jackm): Hack for JAX 0.9 VMA/scan carry mismatch on 1x1 meshes.
-    # Revisit with a principled pcast/vma fix once upstream behavior stabilizes.
-    if mesh.shape['x'] == 1 and mesh.shape['y'] == 1:
-        @jax.jit
-        def _chol_2d_local_single_device(A_tiles: jax.Array) -> jax.Array:
-            A_dense = tiles_to_dense(A_tiles, b)
-            L_dense = jnp.linalg.cholesky(A_dense)
-            return dense_to_tiles(L_dense, b)
-
-        return _chol_2d_local_single_device
-
     Pr = mesh.shape['x']
     Pc = mesh.shape['y']
     J_row = J // Pr  # local rows per proc
@@ -371,3 +358,4 @@ def cholesky_solve_2d(
     ))(L_dense, Y_dense)
     
     return dense_to_tiles(zeta_dense, b)
+
