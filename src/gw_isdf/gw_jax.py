@@ -221,6 +221,7 @@ def fit_zeta_and_compute_V_q_chunked(
 	r_chunk_override: int = 0,
 	target_utilization: float = 0.97,
 	zct_stage_cap_gb: float | None = None,
+	isdf_pair_mode: str = "spin_traced",
 ):
 	"""
 	Chunked zeta fitting and V_q computation pipeline.
@@ -228,14 +229,9 @@ def fit_zeta_and_compute_V_q_chunked(
 	This replaces the per-q-point zeta fitting in the main loop with a memory-efficient
 	chunked approach that:
 	1. Loads wavefunctions for full band range (b0 to b4)
-	2. Slices for left (b0→b3) and right (b0→b4) with spin-traced pair density
+	2. Slices for left (b0→b3) and right (b1→b4) band windows
 	3. Fits zeta via z-chunked algorithm and writes to HDF5
 	4. Reads zeta back and computes V_qmunu
-	
-	Physics note:
-		Uses spin-traced pair density P_k(μ,ν) = Σ_{n,s} ψ*_{n,k,s}(μ) ψ_{n,k,s}(ν)
-		matching gw_jax convention for ISDF fitting. Different from keeping all
-		spin combinations which would increase lstsq error.
 	
 	Args:
 		wfn: WFNReader object
@@ -250,6 +246,9 @@ def fit_zeta_and_compute_V_q_chunked(
 		r_chunk_override: If > 0, use explicit r-chunk size (flattened xyz index).
 		target_utilization: Fraction of memory_budget_gb to target in chunk sizing.
 		zct_stage_cap_gb: Optional soft cap for ZCT stage peak (GB).
+		isdf_pair_mode: Pair-density pathway for CCT/ZCT:
+			- "spin_traced" (default)
+			- "spin_matrix_frobenius" (explicit spin channels, sum_ab after contraction)
 	
 	Returns:
 		Dictionary with:
@@ -263,6 +262,14 @@ def fit_zeta_and_compute_V_q_chunked(
 		- zeta_h5_path: Path to zeta HDF5 file
 	"""
 	import os
+
+	isdf_pair_mode = str(isdf_pair_mode).strip().lower()
+	if isdf_pair_mode not in ("spin_traced", "spin_matrix_frobenius"):
+		raise ValueError(
+			f"Unknown isdf_pair_mode={isdf_pair_mode!r}. "
+			"Expected 'spin_traced' or 'spin_matrix_frobenius'."
+		)
+	pair_density_channels = 1 if isdf_pair_mode == "spin_traced" else meta.nspinor * meta.nspinor
 	
 	n_devices = jax.device_count()
 	p_x = mesh_xy.devices.shape[0]
@@ -295,6 +302,7 @@ def fit_zeta_and_compute_V_q_chunked(
 		p_y=p_y,
 		n_b_left=band_range_left[1] - band_range_left[0],
 		n_b_right=band_range_right[1] - band_range_right[0],
+		pair_density_channels=pair_density_channels,
 		verbose=True,
 		r_chunk_override=r_chunk_override if r_chunk_override > 0 else None,
 		zct_stage_cap_gb=zct_stage_cap_gb,
@@ -325,6 +333,7 @@ def fit_zeta_and_compute_V_q_chunked(
 	print(f"    Band chunks: {band_chunk_size}")
 	print(f"    R chunks:    {chunk_r} (contiguous r-space)")
 	print(f"    Q chunks:    {q_chunk_size}")
+	print(f"    Pair mode:   {isdf_pair_mode}")
 	print(f"    G-space cache: {'enabled' if use_gspace_cache else 'disabled'}")
 	print(f"    Zeta output: {zeta_h5_path}")
 	
@@ -344,6 +353,7 @@ def fit_zeta_and_compute_V_q_chunked(
 			use_gspace_cache=use_gspace_cache,
 			band_range_left=band_range_left,
 			band_range_right=band_range_right,
+			isdf_pair_mode=isdf_pair_mode,
 		)
 	
 	# Step 2: Compute V_qmunu from zeta
@@ -826,6 +836,12 @@ def main(argv=None):
 	do_screened = params["do_screened"]  # True: use W, False: use V
 	global bispinor
 	bispinor = params["bispinor"]     # True: 2-component spinors (SOC)
+	isdf_pair_mode = str(params.get("isdf_pair_mode", "spin_traced")).strip().lower()
+	if isdf_pair_mode not in ("spin_traced", "spin_matrix_frobenius"):
+		raise ValueError(
+			f"isdf_pair_mode={isdf_pair_mode!r} is invalid. "
+			"Use 'spin_traced' or 'spin_matrix_frobenius'."
+		)
 	
 	# ============================================================================
 	# INTERNAL FEATURE TOGGLES (not exposed in input file):
@@ -857,6 +873,10 @@ def main(argv=None):
 	chunk_target_utilization = max(0.85, min(1.0, chunk_target_utilization))
 	if jax.process_index() == 0:
 		print(f"  Chunk target utilization: {chunk_target_utilization:.2f}")
+		if restart:
+			print(f"  ISDF pair mode: {isdf_pair_mode} (ignored when restart=true)")
+		else:
+			print(f"  ISDF pair mode: {isdf_pair_mode}")
 
 	# Optional ZCT cap (manual override only; no default empirical fraction).
 	zct_stage_cap_gb = None
@@ -982,23 +1002,24 @@ def main(argv=None):
 		# ============================================================================
 			
 		# ============================================================================
-		# CHUNKED ISDF PATH (memory-efficient, spin-traced pair density)
+		# CHUNKED ISDF PATH (memory-efficient; selectable pair-density mode)
 		# ============================================================================
 		if use_chunked_isdf:
 			print0("  Using CHUNKED ISDF fitting (memory-efficient)")
 			
 			# Fit zeta and compute V_q using chunked approach
 			with mesh_xy:
-					chunked_result = fit_zeta_and_compute_V_q_chunked(
-						wfn, sym, meta, centroid_indices, mesh_xy,
-						output_dir=tmp_dir,
-						bispinor=bispinor,
-						memory_budget_gb=memory_per_device_gb,
-						sys_dim=sys_dim,
-						r_chunk_override=r_chunk_override,
-						target_utilization=chunk_target_utilization,
-						zct_stage_cap_gb=zct_stage_cap_gb,
-					)
+				chunked_result = fit_zeta_and_compute_V_q_chunked(
+					wfn, sym, meta, centroid_indices, mesh_xy,
+					output_dir=tmp_dir,
+					bispinor=bispinor,
+					memory_budget_gb=memory_per_device_gb,
+					sys_dim=sys_dim,
+					r_chunk_override=r_chunk_override,
+					target_utilization=chunk_target_utilization,
+					zct_stage_cap_gb=zct_stage_cap_gb,
+					isdf_pair_mode=isdf_pair_mode,
+				)
 			
 			# Extract results
 			V_qmunu = chunked_result['V_qmunu']

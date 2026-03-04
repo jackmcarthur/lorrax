@@ -45,7 +45,7 @@ Typical ranges (from production datasets):
 | **C_q build** | `P_l`, `P_r`, `C_q` | `M_cct = M_cent + 2*16 n_k (n_rmu/p_x)(n_rmu/p_y) + 16 n_q (n_rmu/p_x)(n_rmu/p_y)` |
 | **Pair density (chunk)** | `psi_xchunk`, `P_l`, `P_r` | `M_pair = base + 16 n_k n_b n_s (B_r/p_y) + 2*16 n_k (n_rmu/p_x)(B_r/p_y)` |
 | **ZCT** | `P_l`, `P_r`, FFT temps, `Z_q` | `M_zct = base + 4*16 n_k n_rmu B_r + 16 n_q n_rmu B_r` |
-| **Solve** | `Z_col`, triangular-solve temps, `L_q` temp | `M_solve = base + 4*16 n_q n_rmu (B_r/P) + M_L_q` |
+| **Solve** | `Z_col` input/output, triangular-solve temps, `L_q` temp, replicated `L` panels | `M_solve(B_q) = base + 4*16 n_q n_rmu (B_r/P) + M_L_q + B_q*16 n_rmu^2` |
 | **V_q compute** | μ/ν chunks in r- and G-space | `M_vq ≈ 3 * 16 * μ_chunk * n_r` |
 
 `base` in the chunk stages is `M_cent + M_L_q + cache`, i.e.
@@ -90,7 +90,7 @@ base + 16 * B_r * [ (4 n_k + n_q) * n_rmu ] <= M_budget
 3. **Solve (with q_chunk = 1)**
 
 ```
-base + 4 * 16 * n_q * n_rmu * (B_r / P) + M_L_q <= M_budget
+base + 4 * 16 * n_q * n_rmu * (B_r / P) + M_L_q + 16*n_rmu^2 <= M_budget
 ```
 
 `base = M_cent + M_L_q + cache`.  The analytic upper bounds from these
@@ -101,16 +101,20 @@ until the evaluated stage peaks fall below the budget.  This preserves the
 
 ## Q-Chunk (`B_q`)
 
-With `B_r` fixed, the triangular solve retains `Z_col` and `zeta`
-(`2 * 16 * n_q * n_rmu * (B_r/P)` bytes).  The remaining headroom is available
-for replicated Cholesky panels:
+With `B_r` fixed, the triangular solve baseline contains:
+
+- `Z_col` input/output + triangular-solve temps: `4 * 16 * n_q * n_rmu * (B_r/P)`
+- one local `L_q` temporary: `M_L_q`
+- one replicated `L` panel for `q_chunk=1`: `16*n_rmu^2`
+
+Additional `q_chunk` values add one replicated panel per extra q-point.
+The bound is:
 
 ```
-B_q <= (M_budget - (base + 2 * M_Z_col)) / (16 * n_rmu^2)
+B_q <= 1 + (M_budget - (base + 4*M_Z_col + M_L_q + M_Lrep)) / M_Lrep
 ```
 
-`B_q` is clamped to `[1, n_q]`.  The solver already ensured that the numerator
-is ≥ one `L` matrix when `B_r` was validated, so `B_q=1` is always feasible.
+where `M_Lrep = 16*n_rmu^2`. `B_q` is clamped to `[1, n_q]`.
 
 ## μ-Chunk for `V_q`
 
@@ -166,9 +170,11 @@ memory settings.
    - `centroids_full_gb`, `centroids_gb`, `cached_gspace_gb`
    - `fft_workspace_gb`, `peak_fft_gb`
    - `stage_cct_gb`
-   - `psi_xchunk_gb`, `pair_density_xchunk_gb`
+   - `psi_chunk_gb`, `pair_density_chunk_gb`
+   - `zct_pair_inputs_gb`, `zct_fft_temps_gb`, `zct_output_gb`
    - `Z_q_gb`, `Z_col_gb`, `zeta_gb`, `L_rep_per_q_gb`
-   - `stage_pair_gb`, `stage_zct_gb`, `stage_solve_gb`
+   - `solve_z_io_gb`, `solve_tri_temps_gb`, `solve_l_temp_gb`, `solve_l_rep_gb`
+   - `stage_pair_gb`, `stage_zct_gb`, `stage_solve_gb`, `stage_solve_min_gb`
    - `peak_estimate_gb`, `effective_budget_gb`, `utilization_pct`
    - `centroids_bytes`, `effective_budget_bytes`, `available_vcoul_gb`
 
@@ -207,6 +213,30 @@ Recommended stack (June 2025 guidance): XProf + TensorBoard memory viewer.
 3. Inspect:
 Memory Viewer tab for `jit__compute_ZCT_LR(...)` and `jit__solve_all_q(...)`.
 
-Recent production traces show `jit__compute_ZCT_LR` peak dominated by five equal
-live buffers (`P_l`, `P_r`, output transpose, and two FFT temporaries), which is
-why the ZCT constraint now uses a `4*n_k + n_q` buffer coefficient.
+Recent production traces show:
+
+- `jit__compute_ZCT_LR` peak dominated by five large buffers
+  (`P_l`, `P_r`, two FFT temporaries, and output), which maps to the
+  `4*n_k + n_q` coefficient in the ZCT constraint.
+- `jit__solve_all_q` peak dominated by four `Z_col`-sized buffers plus
+  an additional `L_q`-sized temporary.
+
+## Current Bottleneck and Model Corrections
+
+From the profiled production run
+`profiles/xprof/cohsex_prod-20260303-112900/.../GPUtop.xplane.pb`:
+
+- `jit__compute_ZCT_LR`: `peakHeapMib ~= 1794`
+- `jit__solve_all_q`: `peakHeapMib ~= 1485`
+- `jit__compute_P_traced`: `peakHeapMib ~= 480-493`
+
+So the current bottleneck is the ZCT/solve region, not pair-density build.
+
+Recent model corrections in `compute_optimal_chunks`:
+
+1. ZCT stage coefficient updated from a too-optimistic `2*P + Z` estimate to
+   the XProf-aligned `4*P + Z` live-set model.
+2. Solve stage now explicitly includes replicated `L` panels in both
+   feasibility checks and `q_chunk` sizing.
+3. Breakdown output now reports ZCT and solve sub-components directly
+   (`zct_pair_inputs`, `zct_fft_temps`, `solve_z_io`, `solve_tri_temps`, etc.).

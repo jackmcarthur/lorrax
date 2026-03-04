@@ -28,6 +28,7 @@ def compute_optimal_chunks(
     verbose: bool = True,
     n_b_left: int | None = None,
     n_b_right: int | None = None,
+    pair_density_channels: int = 1,
     r_chunk_override: int | None = None,
     zct_stage_cap_gb: float | None = None,
 ) -> dict:
@@ -38,6 +39,8 @@ def compute_optimal_chunks(
         raise ValueError("n_devices must be at least 1.")
     if target_utilization <= 0 or target_utilization > 1.0:
         raise ValueError("target_utilization must be in (0, 1].")
+    if pair_density_channels < 1:
+        raise ValueError("pair_density_channels must be >= 1.")
 
     bytes_per_complex = 16.0
     nx, ny, nz = fft_grid
@@ -69,6 +72,7 @@ def compute_optimal_chunks(
     n_rmu_f = float(n_rmu)
     n_q_f = float(n_q)
     n_r_f = float(n_r)
+    pair_channels_f = float(pair_density_channels)
 
     # Stage 0: centroid storage
     m_centroids_full = bytes_per_complex * n_k_f * n_s_f * n_rmu_f * n_b_full * (1 / p_y + 1 / p_x)
@@ -97,7 +101,7 @@ def compute_optimal_chunks(
     peak_fft_stage = m_centroids_full + m_fft_workspace
 
     # Stage 2: pair-density build for C_q (before x-chunk loop)
-    m_pair_mumu = bytes_per_complex * n_k_f * (n_rmu_f / p_x) * (n_rmu_f / p_y)
+    m_pair_mumu = pair_channels_f * bytes_per_complex * n_k_f * (n_rmu_f / p_x) * (n_rmu_f / p_y)
     m_C_q = bytes_per_complex * n_q_f * (n_rmu_f / p_x) * (n_rmu_f / p_y)
     stage_cct = m_centroids_persist + 2 * m_pair_mumu + m_C_q
     if stage_cct > m_budget:
@@ -105,6 +109,8 @@ def compute_optimal_chunks(
             f"C_q build requires {to_gb(stage_cct):.2f} GB/device which exceeds the budget. Reduce n_rmu or n_q."
         )
     m_L_q = m_C_q
+    # One fully replicated L matrix (single q) used by triangular solve.
+    l_rep_bytes = bytes_per_complex * (n_rmu_f ** 2)
 
     # Optional G-space cache (sum of all cached band chunks)
     m_cached_gspace_full = bytes_per_complex * n_k_f * (n_b_full / p) * n_s_f * n_r_f
@@ -116,26 +122,37 @@ def compute_optimal_chunks(
 
         # Sharded local sizes (for stages that work correctly with sharding)
         m_psi_chunk = bytes_per_complex * n_k_f * n_b_full * n_s_f * per_y
-        m_pair_local = bytes_per_complex * n_k_f * (n_rmu_f / p_x) * per_y
+        m_pair_local = pair_channels_f * bytes_per_complex * n_k_f * (n_rmu_f / p_x) * per_y
         m_z_local = bytes_per_complex * n_q_f * (n_rmu_f / p_x) * per_y
         m_zcol = bytes_per_complex * n_q_f * n_rmu_f * (cr / p)
 
-        # GLOBAL (unsharded) sizes in ZCT/FFT stage where XLA may rematerialize.
-        # P_l and P_r have shape (nk, n_rmu, chunk_r); Z_q has (n_q, n_rmu, chunk_r).
-        m_pair_global = bytes_per_complex * n_k_f * n_rmu_f * cr
+        # GLOBAL (unsharded) sizes in ZCT/FFT stage where XLA materializes
+        # full pair-density operands and FFT temporaries.
+        # P_l and P_r have shape (nk, spin_channels, n_rmu, chunk_r);
+        # Z_q has (n_q, n_rmu, chunk_r).
+        m_pair_global = pair_channels_f * bytes_per_complex * n_k_f * n_rmu_f * cr
         m_z_global = bytes_per_complex * n_q_f * n_rmu_f * cr
-        # Staged ZCT path (_left_ifft_conj + _right_ifft_mul_fft) reduces peak to
-        # three large live buffers in stage-2:
-        # P_l_Rt, wrapped_transpose(P_r), and fft(P_r).
-        # This corresponds to 2*P(nk, n_rmu, chunk_r) + Z_q(n_q, n_rmu, chunk_r).
-        m_fft_peak = 2.0 * m_pair_global + m_z_global
+        # XProf (jit__compute_ZCT_LR) shows the dominant live set as:
+        #   - pair inputs         : 2 * P
+        #   - FFT temporaries     : 2 * P
+        #   - output (Z_q)        : 1 * Z
+        # giving a stage coefficient of 4*P + Z.
+        m_zct_pair_inputs = 2.0 * m_pair_global
+        m_zct_fft_temps = 2.0 * m_pair_global
+        m_zct_output = m_z_global
+        m_zct_peak = m_zct_pair_inputs + m_zct_fft_temps + m_zct_output
+
+        # Solve stage components.
+        m_solve_z_io = 2.0 * m_zcol
+        m_solve_tri_temps = 2.0 * m_zcol
+        # XProf shows an additional local L_q-sized layout/transposition temp.
+        m_solve_l_temp = m_L_q
+        # q_chunk=1 still replicates one full L matrix.
+        m_solve_l_rep = l_rep_bytes
 
         stage_pair = base_const + m_psi_chunk + 2 * m_pair_local
-        # FFT stage: account for global pair-density inputs, FFT temporaries, and Z_q output.
-        stage_zct = base_const + m_fft_peak
-        # XProf memory_viewer (jit__solve_all_q) shows ~4*Z_col working set plus
-        # one additional L_q-sized temporary on top of the persistent L_q storage in base_const.
-        stage_solve = base_const + 4 * m_zcol + m_L_q
+        stage_zct = base_const + m_zct_peak
+        stage_solve = base_const + m_solve_z_io + m_solve_tri_temps + m_solve_l_temp + m_solve_l_rep
         peak = max(stage_pair, stage_zct, stage_solve)
         if peak == stage_pair:
             name = 'pair'
@@ -146,15 +163,22 @@ def compute_optimal_chunks(
         info = {
             'psi_chunk': m_psi_chunk,
             'pair_chunk': 2 * m_pair_local,
-            'pair_fft_peak': m_fft_peak,
+            'zct_pair_inputs': m_zct_pair_inputs,
+            'zct_fft_temps': m_zct_fft_temps,
+            'zct_output': m_zct_output,
+            'pair_fft_peak': m_zct_peak,
             'pair_global': m_pair_global,
             'z_global': m_z_global,
             'Z_q': m_z_local,
             'Z_col': m_zcol,
+            'solve_z_io': m_solve_z_io,
+            'solve_tri_temps': m_solve_tri_temps,
+            'solve_l_temp': m_solve_l_temp,
+            'solve_l_rep': m_solve_l_rep,
             'stage_pair': stage_pair,
             'stage_zct': stage_zct,
             'stage_solve': stage_solve,
-            'fft_overhead_factor': (2.0 * n_k_f + n_q_f) / max(1.0, n_k_f),
+            'fft_overhead_factor': (4.0 * pair_channels_f * n_k_f + n_q_f) / max(1.0, n_k_f),
         }
         return peak, name, info
 
@@ -178,15 +202,14 @@ def compute_optimal_chunks(
             # but round only to p_y divisibility, not ny*nz boundaries)
             limits = []
             # Pair density stage limit (uses sharded local sizes)
-            denom_pair = n_k_f * n_b_full * n_s_f + 2 * n_k_f * (n_rmu_f / p_x)
+            denom_pair = n_k_f * n_b_full * n_s_f + 2 * pair_channels_f * n_k_f * (n_rmu_f / p_x)
             if denom_pair > 0:
                 limit_pair = headroom * p_y / (bytes_per_complex * denom_pair)
                 limits.append(limit_pair)
                 limit_info['limit_pair'] = limit_pair
 
-            # ZCT/FFT stage limit for staged 2-kernel path:
-            # 2 * P(nk,n_rmu,chunk_r) + Z_q(n_q,n_rmu,chunk_r)
-            denom_fft_global = (2 * n_k_f + n_q_f) * n_rmu_f
+            # ZCT/FFT stage limit from XProf-observed 4*P + Z live set.
+            denom_fft_global = (4 * pair_channels_f * n_k_f + n_q_f) * n_rmu_f
             if denom_fft_global > 0:
                 limit_fft = headroom / (bytes_per_complex * denom_fft_global)
                 limits.append(limit_fft)
@@ -197,7 +220,7 @@ def compute_optimal_chunks(
                     limit_info['limit_fft_soft'] = limit_fft_soft
 
             # Solve stage limit
-            solve_numer = headroom - m_L_q
+            solve_numer = headroom - m_L_q - l_rep_bytes
             denom_solve = 4 * n_q_f * n_rmu_f / p
             if denom_solve > 0 and solve_numer > 0:
                 limit_solve = solve_numer * p / (bytes_per_complex * denom_solve)
@@ -253,16 +276,27 @@ def compute_optimal_chunks(
     base_const = chunk_result['base_const']
 
     m_Z_col = stage_info['Z_col']
-    l_rep_bytes = bytes_per_complex * (n_rmu_f ** 2)
-    base_solve = base_const + 2 * m_Z_col
+    # Base solve footprint for q_chunk=1.
+    base_solve = base_const + 4 * m_Z_col + m_L_q + l_rep_bytes
     available_for_q = max(0.0, m_budget - base_solve)
-    if available_for_q < l_rep_bytes:
+    if available_for_q <= 0:
         q_chunk = 1
     else:
-        q_chunk = max(1, min(n_q, int(available_for_q // l_rep_bytes)))
+        # Additional q-points beyond the first add one replicated L each.
+        q_chunk = max(1, min(n_q, 1 + int(available_for_q // l_rep_bytes)))
+
+    stage_solve_selected = base_const + 4 * m_Z_col + m_L_q + q_chunk * l_rep_bytes
+    peak_chunk_bytes = max(peak_chunk_bytes, stage_solve_selected)
+
+    chunk_stage_peaks = {
+        'pair': stage_info['stage_pair'],
+        'zct': stage_info['stage_zct'],
+        'solve': stage_solve_selected,
+    }
+    chunk_stage_name = max(chunk_stage_peaks, key=chunk_stage_peaks.get)
 
     overall_peak = max(peak_chunk_bytes, peak_fft_stage, m_centroid_copy_peak, stage_cct)
-    bottleneck = chunk_result['stage_name'] if peak_chunk_bytes >= max(peak_fft_stage, m_centroid_copy_peak, stage_cct) else (
+    bottleneck = chunk_stage_name if peak_chunk_bytes >= max(peak_fft_stage, m_centroid_copy_peak, stage_cct) else (
         'fft' if peak_fft_stage >= max(m_centroid_copy_peak, stage_cct) else (
             'centroid_copy' if m_centroid_copy_peak >= stage_cct else 'C_q'
         )
@@ -287,10 +321,18 @@ def compute_optimal_chunks(
         'Z_q_gb': to_gb(stage_info['Z_q']),
         'Z_col_gb': to_gb(stage_info['Z_col']),
         'zeta_gb': to_gb(stage_info['Z_col']),
+        'zct_pair_inputs_gb': to_gb(stage_info.get('zct_pair_inputs', 0.0)),
+        'zct_fft_temps_gb': to_gb(stage_info.get('zct_fft_temps', 0.0)),
+        'zct_output_gb': to_gb(stage_info.get('zct_output', 0.0)),
+        'solve_z_io_gb': to_gb(stage_info.get('solve_z_io', 0.0)),
+        'solve_tri_temps_gb': to_gb(stage_info.get('solve_tri_temps', 0.0)),
+        'solve_l_temp_gb': to_gb(stage_info.get('solve_l_temp', 0.0)),
+        'solve_l_rep_gb': to_gb(q_chunk * l_rep_bytes),
         'L_rep_per_q_gb': to_gb(l_rep_bytes),
         'stage_pair_gb': to_gb(stage_info['stage_pair']),
         'stage_zct_gb': to_gb(stage_info['stage_zct']),
-        'stage_solve_gb': to_gb(stage_info['stage_solve']),
+        'stage_solve_gb': to_gb(stage_solve_selected),
+        'stage_solve_min_gb': to_gb(stage_info['stage_solve']),
         'peak_chunk_gb': to_gb(peak_chunk_bytes),
         'peak_estimate_gb': to_gb(overall_peak),
         'budget_gb': memory_budget_gb,
@@ -300,6 +342,7 @@ def compute_optimal_chunks(
         'p_x': p_x,
         'p_y': p_y,
         'n_devices': p,
+        'pair_density_channels': pair_density_channels,
         'chunk_r': chunk_r,
         'limit_info': chunk_result.get('limit_info', {}),
         'centroids_bytes': m_centroids_persist,
@@ -325,7 +368,7 @@ def print_memory_breakdown(
     fft_grid: tuple[int, int, int],
     memory_source: str = 'auto',
 ) -> None:
-    """Print memory breakdown based on two bottleneck stages."""
+    """Print memory breakdown and stage bottleneck drivers."""
     nx, ny, nz = fft_grid
     mem = chunks['memory_estimate']
     
@@ -335,6 +378,7 @@ def print_memory_breakdown(
     
     print(f"\n  Memory budget: {mem['budget_gb']:.2f} GB/device (source: {memory_source})")
     print(f"  Device mesh: {mem['p_x']} × {mem['p_y']} = {mem['n_devices']} devices")
+    pair_channels = int(mem.get('pair_density_channels', 1))
     
     print(f"\n  {'Parameter':<25} {'Value':>10} {'Total':>12}")
     print(f"  {'-'*50}")
@@ -363,23 +407,27 @@ def print_memory_breakdown(
     # Pair density stage
     print(f"\n  {'[Stage: Pair density]':<40}")
     print(f"    {'psi_nk(rchunk) all bands':<38} {mem['psi_chunk_gb']:>10.3f}")
-    print(f"    {'P_l + P_r (spin-traced)':<38} {mem['pair_density_chunk_gb']:>10.3f}")
+    pair_label = 'P_l + P_r (spin-traced)' if pair_channels == 1 else f'P_l + P_r ({pair_channels} spin channels)'
+    print(f"    {pair_label:<38} {mem['pair_density_chunk_gb']:>10.3f}")
     print(f"    {'─ STAGE TOTAL':<38} {mem['stage_pair_gb']:>10.3f}")
     
     # ZCT stage
     fft_factor = float(mem.get('fft_overhead_factor', 4.0))
     print(f"\n  {'[Stage: ZCT / FFT pipeline]':<40}")
     print(f"    {'P_l, P_r (local sharded)':<38} {mem['pair_density_chunk_gb']:>10.3f}")
-    print(f"    {'P_l, P_r (GLOBAL, XLA remat)':<38} {mem.get('pair_global_gb', 0):>10.3f}")
-    print(f"    {'Z_q (GLOBAL, XLA remat)':<38} {mem.get('Z_q_global_gb', 0):>10.3f}")
-    print(f"    {'FFT peak (' + str(round(fft_factor, 2)) + ' × pair_global)':<38} {mem.get('pair_fft_peak_gb', 0):>10.3f}")
+    print(f"    {'Pair inputs (2×global P)':<38} {mem.get('zct_pair_inputs_gb', 0):>10.3f}")
+    print(f"    {'FFT temporaries (2×global P)':<38} {mem.get('zct_fft_temps_gb', 0):>10.3f}")
+    print(f"    {'Z_q output (global)':<38} {mem.get('zct_output_gb', 0):>10.3f}")
+    print(f"    {'Effective coeff (' + str(round(fft_factor, 2)) + ' × P_global)':<38} {mem.get('pair_fft_peak_gb', 0):>10.3f}")
     print(f"    {'─ STAGE TOTAL':<38} {mem['stage_zct_gb']:>10.3f}")
     
     # Solve
-    print(f"\n  {'[Stage: Solve (psi_chunk deleted)]':<40}")
-    print(f"    {'Z_col (resharded)':<38} {mem['Z_col_gb']:>10.3f}")
-    print(f"    {'zeta_q (output)':<38} {mem['zeta_gb']:>10.3f}")
-    print(f"    {'L_rep (replicated per q)':<38} {mem['L_rep_per_q_gb']:>10.3f}")
+    print(f"\n  {'[Stage: Solve (L^-1 Z)]':<40}")
+    print(f"    {'Z input + output':<38} {mem.get('solve_z_io_gb', 0):>10.3f}")
+    print(f"    {'Triangular-solve temps':<38} {mem.get('solve_tri_temps_gb', 0):>10.3f}")
+    print(f"    {'L_q local temp':<38} {mem.get('solve_l_temp_gb', 0):>10.3f}")
+    print(f"    {'L replication (' + str(chunks['q_chunk']) + '×)':<38} {mem.get('solve_l_rep_gb', 0):>10.3f}")
+    print(f"    {'L_rep (per q)':<38} {mem['L_rep_per_q_gb']:>10.3f}")
     print(f"    {'─ STAGE TOTAL':<38} {mem['stage_solve_gb']:>10.3f}")
     
     print(f"\n  {'-'*54}")
@@ -509,6 +557,9 @@ def read_cohsex_input(filename: str) -> dict:
 		# memory_per_device_gb: Memory budget per device in GB for auto chunk sizing.
 		#                0 = auto-detect (80% of GPU via nvidia-smi, or CPU/n_devices)
 		#                >0 = explicit budget in GB
+		# isdf_pair_mode: ISDF pair-density pathway used in CCT/ZCT:
+		#                'spin_traced' (default) or
+		#                'spin_matrix_frobenius' (keep spin channels, sum_ab after contraction)
 		# ============================================================================
 		params = {
 			"restart": getb("restart", fallback=True),           # load from h5 vs rebuild
@@ -532,6 +583,7 @@ def read_cohsex_input(filename: str) -> dict:
 			"r_chunk_size": geti("r_chunk_size", fallback=0),    # r-axis chunk (0=auto, >0=explicit)
 			"band_chunk_size": geti("band_chunk_size", fallback=16),  # bands per FFT during r-chunk loop
 			"memory_per_device_gb": getf("memory_per_device_gb", fallback=0.0),  # 0=auto-detect
+			"isdf_pair_mode": get("isdf_pair_mode", fallback="spin_traced").strip().lower(),
 		}
 	else:
 		# Fallback defaults if no section found
@@ -557,6 +609,7 @@ def read_cohsex_input(filename: str) -> dict:
 			"r_chunk_size": 0,
 			"band_chunk_size": 16,
 			"memory_per_device_gb": 0.0,
+			"isdf_pair_mode": "spin_traced",
 			}
 
 	# Parse optional QE-style K_POINTS block: take the number after it, read next that many lines
