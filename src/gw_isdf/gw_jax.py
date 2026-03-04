@@ -12,6 +12,7 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
 os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 import argparse
+import time
 
 import numpy as np
 import jax
@@ -131,12 +132,19 @@ def make_shardings(mesh_xy: Mesh) -> SimpleNamespace:
 		out_shard = NamedSharding(mesh_xy, P(None, None, None)),
 	)
 
-def determine_wcoul0(params, input_dir, wfn, sym, meta, print_fn):
-	"""Resolve (v_c0, w_c0) head averages using user preference fallback order."""
+def determine_wcoul0(params, input_dir, wfn, sym, meta, print_fn, omega: float = 0.0):
+	"""Resolve (v_c0, w_c0) head averages using user preference fallback order.
+
+	For ``wcoul0_source='s_tensor'``, this evaluates S(omega) from dipole data.
+	For ``wcoul0_source='epshead'``, only static epshead is available and is used
+	as a fallback even when omega != 0.
+	"""
 	want_source = str(params.get("wcoul0_source", "epshead")).strip().lower()
 	if want_source not in ("epshead", "s_tensor"):
 		print_fn(f"Unknown wcoul0_source={want_source}; defaulting to 'epshead'")
 		want_source = "epshead"
+	omega_val = float(omega)
+	eta = float(params.get("wcoul0_eta", 0.0) or 0.0)
 
 	eps0_path = os.path.join(input_dir, "eps0mat.h5")
 	dipole_path = os.path.join(input_dir, "dipole.h5")
@@ -145,6 +153,10 @@ def determine_wcoul0(params, input_dir, wfn, sym, meta, print_fn):
 		if not os.path.exists(eps0_path):
 			return None
 		try:
+			if abs(omega_val) > 1e-14:
+				print_fn(
+					f"wcoul0_source=epshead is static-only; using epshead(0) for omega={omega_val:.6f} Ry"
+				)
 			eps0 = EPSReader(eps0_path)
 			vc0_mean, wcoul0 = compute_q0_averages(
 				wfn,
@@ -153,14 +165,15 @@ def determine_wcoul0(params, input_dir, wfn, sym, meta, print_fn):
 				S_cart=None,
 			)
 			# Source printed in finite-size corrections section
-			return vc0_mean, wcoul0, "epshead"
+			label = "epshead(0)" if abs(omega_val) > 1e-14 else "epshead"
+			return vc0_mean, wcoul0, label
 		except Exception as exc:  # pragma: no cover - diagnostic path
 			print_fn(f"epshead wcoul0 failed: {exc}")
 			return None
 
 	def from_s_tensor():
 		if not os.path.exists(dipole_path):
-			print_fn(f"dipole.h5 not found at {dipole_path}; cannot build S(0) wcoul0")
+			print_fn(f"dipole.h5 not found at {dipole_path}; cannot build S(omega) wcoul0")
 			return None
 		try:
 			dipole_cart, deltaE = read_dipole_h5(dipole_path)
@@ -170,8 +183,8 @@ def determine_wcoul0(params, input_dir, wfn, sym, meta, print_fn):
 			occ = np.zeros((nk_tot, nb), dtype=float)
 			occ[:, :max(0, min(nelec, nb))] = 1.0
 			f_nk = jnp.asarray(occ, dtype=jnp.float64)
-			omegas = jnp.asarray([0.0], dtype=jnp.float64)
-			S_cart_omega0 = compute_S_omega(
+			omega_grid = jnp.asarray([omega_val], dtype=jnp.float64)
+			S_cart_omega = compute_S_omega(
 				dipole_cart,
 				deltaE,
 				f_nk,
@@ -179,19 +192,23 @@ def determine_wcoul0(params, input_dir, wfn, sym, meta, print_fn):
 				int(sym.nk_tot),
 				int(wfn.nspin),
 				int(wfn.nspinor),
-				omegas,
-				eta=0.0,
+				omega_grid,
+				eta=eta,
 			)[0]
 			vc0_mean, wcoul0 = compute_q0_averages(
 				wfn,
 				jnp.asarray(0.0, dtype=jnp.float64),
 				meta,
-				S_cart=S_cart_omega0,
+				S_cart=S_cart_omega,
 			)
 			# Source printed in finite-size corrections section
-			return vc0_mean, wcoul0, "s_tensor"
+			label = "s_tensor" if abs(omega_val) <= 1e-14 else f"s_tensor(omega={omega_val:.6f} Ry)"
+			return vc0_mean, wcoul0, label
 		except Exception as exc:  # pragma: no cover - diagnostic path
-			print_fn(f"S(0) wcoul0 failed: {exc}")
+			if abs(omega_val) <= 1e-14:
+				print_fn(f"S(0) wcoul0 failed: {exc}")
+			else:
+				print_fn(f"S(omega={omega_val:.6f} Ry) wcoul0 failed: {exc}")
 			return None
 
 	source_order = [want_source] + [s for s in ("epshead", "s_tensor") if s != want_source]
@@ -199,7 +216,7 @@ def determine_wcoul0(params, input_dir, wfn, sym, meta, print_fn):
 		result = from_epshead() if source == "epshead" else from_s_tensor()
 		if result is not None:
 			return result
-	raise RuntimeError("Failed to determine wcoul0: neither eps0mat.h5 epshead nor dipole.h5 S(0) available")
+	raise RuntimeError("Failed to determine wcoul0: neither eps0mat.h5 epshead nor dipole.h5 S(omega) available")
 
 
 # The current implementation focuses on the static COHSEX limit.  Many of the
@@ -1114,29 +1131,53 @@ def main(argv=None):
 				# Compute optimal energy windows for CTSP quadrature
 				window_pairs = get_window_info(epsq, wfn, nband_max=nband)
 			
-				# Check if debug_omega is set for dynamic W(ω) testing
 				debug_omega = params.get("debug_omega", None)
-				if debug_omega is not None:
-					ryd2ev = 13.605693122994
-					omega_ev = debug_omega * ryd2ev
-					print0("")
-					print0(f"  [DEBUG] Dynamic screening at ω = {omega_ev:.4f} eV ({debug_omega:.6f} Ry)")
-					W_q, chi_omega = get_w_omega_jax_from_bundle(
-						V_qmunu,
-						wf_bundle,
-						window_pairs,
-						debug_omega,
-						meta,
-						mesh_xy,
-					)
-					W_q.block_until_ready()
-					chi_max = float(jnp.max(jnp.abs(chi_omega)))
-					print0(f"  [DEBUG] |χ(ω)|_max = {chi_max:.6e}")
+				omega_eval = float(debug_omega) if debug_omega is not None else 0.0
+				ryd2ev = 13.605693122994
+				omega_ev = omega_eval * ryd2ev
+				print0("")
+				if debug_omega is None:
+					print0(f"  Dynamic screening path enabled at ω = 0.0000 eV ({omega_eval:.6f} Ry)")
 				else:
-					# Static case (ω = 0)
-					chi0 = get_chi0_jax_from_bundle(wf_bundle, window_pairs, meta, mesh_xy)
-					W_q = get_static_w_q_jax(V_qmunu, chi0, None, meta, mesh_xy)
-					W_q.block_until_ready()
+					print0(f"  [DEBUG] Dynamic screening at ω = {omega_ev:.4f} eV ({omega_eval:.6f} Ry)")
+
+				t_dyn0 = time.perf_counter()
+				W_q, chi_omega = get_w_omega_jax_from_bundle(
+					V_qmunu,
+					wf_bundle,
+					window_pairs,
+					omega_eval,
+					meta,
+					mesh_xy,
+				)
+				W_q.block_until_ready()
+				chi_omega.block_until_ready()
+				t_dyn = time.perf_counter() - t_dyn0
+				chi_max = float(jnp.max(jnp.abs(chi_omega)))
+				print0(f"  |χ(ω)|_max = {chi_max:.6e}")
+
+				# For ω=0 runs, evaluate the legacy static χ→W path for direct comparison.
+				if abs(omega_eval) <= 1e-14:
+					t_static0 = time.perf_counter()
+					chi0_static = get_chi0_jax_from_bundle(wf_bundle, window_pairs, meta, mesh_xy)
+					W_q_static = get_static_w_q_jax(V_qmunu, chi0_static, meta, mesh_xy)
+					chi0_static.block_until_ready()
+					W_q_static.block_until_ready()
+					t_static = time.perf_counter() - t_static0
+
+					chi_err_abs = float(jnp.max(jnp.abs(chi_omega - chi0_static)))
+					chi_ref = max(float(jnp.max(jnp.abs(chi0_static))), 1e-16)
+					chi_err_rel = chi_err_abs / chi_ref
+					W_err_abs = float(jnp.max(jnp.abs(W_q - W_q_static)))
+					W_ref = max(float(jnp.max(jnp.abs(W_q_static))), 1e-16)
+					W_err_rel = W_err_abs / W_ref
+
+					print0("  χ/W path comparison at ω=0 (dynamic vs static):")
+					print0(f"    dynamic time: {t_dyn:9.3f} s")
+					print0(f"    static time:  {t_static:9.3f} s")
+					print0(f"    χ max abs diff: {chi_err_abs:.6e}, rel diff: {chi_err_rel:.6e}")
+					print0(f"    W max abs diff: {W_err_abs:.6e}, rel diff: {W_err_rel:.6e}")
+
 				if os.path.exists(tensors_filename):
 					W0_qmunu = W_q[..., 0, :, 0, :]
 					W0_qmunu = W0_qmunu[None, None, None, :, :, :, :, :]
@@ -1170,7 +1211,18 @@ def main(argv=None):
 			print0("-" * 72)
 			do_G0 = False  # Skip head corrections this run
 		else:
-			vc0_mean, wcoul0, wcoul0_source = determine_wcoul0(params, input_dir, wfn, sym, meta, print0)
+			head_omega = 0.0
+			if do_screened:
+				head_omega = float(params.get("debug_omega") or 0.0)
+			vc0_mean, wcoul0, wcoul0_source = determine_wcoul0(
+				params,
+				input_dir,
+				wfn,
+				sym,
+				meta,
+				print0,
+				omega=head_omega,
+			)
 			
 			# Print finite-size corrections
 			print0("")
@@ -1181,6 +1233,8 @@ def main(argv=None):
 			vc0_real = float(vc0_mean.real) if hasattr(vc0_mean, 'real') else float(vc0_mean)
 			print0(f"  v(q→0)  = {vc0_real:12.3f} a.u.  (bare Coulomb head)")
 			if do_screened:
+				if abs(head_omega) > 1e-14:
+					print0(f"  Head frequency ω = {head_omega:.6f} Ry")
 				wcoul0_real = float(wcoul0.real) if hasattr(wcoul0, 'real') else float(wcoul0)
 				dW_real = wcoul0_real - vc0_real
 				print0(f"  W(q→0)  = {wcoul0_real:12.3f} a.u.  (screened Coulomb head)")

@@ -37,6 +37,11 @@ Then browse the `.md` files in `docs/api/` in your editor or on GitHub.
 - `src/isdf/isdf_init/kmeans_isdf.py`: centroid selection
 - `src/isdf/common/wfnreader.py`: wavefunction I/O
 
+### Frequency-Integration Docs
+
+- `docs/chi_omega_quadrature.md`: derivations and implementation notes for GL/HGL dynamic chi
+- `docs/FREQ_INTEGRATION_REWRITE_PLAN.md`: rewrite blueprint for a unified chi/sigma frequency-integration engine
+
 ### Getting started
 
 1. Create the environment (uv recommended) and run tests

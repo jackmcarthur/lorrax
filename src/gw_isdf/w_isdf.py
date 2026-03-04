@@ -19,7 +19,6 @@ import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
 from jax.experimental import compilation_cache as jax_compilation_cache
-from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 import numpy as np
@@ -298,13 +297,7 @@ def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int):
     if cache_key in _w_solve_cache:
         return _w_solve_cache[cache_key]
     
-    Pr = mesh_xy.shape['x']
-    Pc = mesh_xy.shape['y']
-    P_total = Pr * Pc
-    
     # Shardings
-    chi_in = NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y'))  # χ input
-    V_in = NamedSharding(mesh_xy, P(None, None, None, None, None, 'x', 'y'))    # V input (same for last 2 dims)
     q_flat_shard = NamedSharding(mesh_xy, P(('x', 'y'), None, None))            # (nq, μ, ν) q-sharded
     W_out = NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y'))   # W output
     rep_shard = NamedSharding(mesh_xy, P(None, None))                           # replicated (μ, ν)
@@ -371,15 +364,14 @@ def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int):
     return _solve_w
 
 
-def get_static_w_q_jax(
+def solve_w_from_chi_q_jax(
     V_qmunu: jax.Array,
     chi_q: jax.Array,
-    S_qmunu: jax.Array | None,
     meta: Meta,
     mesh_xy: Mesh,
 ) -> jax.Array:
     """
-    Compute static W_q = (I - V χ)^{-1} V.
+    Compute screened interaction W_q = (I - V χ)^{-1} V from a precomputed χ(q).
     
     Uses two-stage resharding following load_wfns pattern:
     - χ input: P(None, None, None, None, 'x', None, 'y')
@@ -389,16 +381,12 @@ def get_static_w_q_jax(
     Args:
         V_qmunu: (1, 1, 1, nkx, nky, nkz, n_rmu, n_rmu)
         chi_q:   (nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
-        S_qmunu: overlap matrix (not yet implemented) or None
         meta: Meta with k-grid info
         mesh_xy: 2D device mesh
     
     Returns:
         W_q: (nkx, nky, nkz, 1, n_rmu, 1, n_rmu) with μ_X, ν_Y sharding
     """
-    if S_qmunu is not None:
-        raise NotImplementedError("Whitening (S_qmunu) not yet implemented in refactored W solve")
-    
     nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
     nq = nkx * nky * nkz
     n_rmu = chi_q.shape[4]
@@ -416,6 +404,16 @@ def get_static_w_q_jax(
         W_q = solve_fn(V_qmunu, chi_q, pref)
     
     return W_q
+
+
+def get_static_w_q_jax(
+    V_qmunu: jax.Array,
+    chi_q: jax.Array,
+    meta: Meta,
+    mesh_xy: Mesh,
+) -> jax.Array:
+    """Backward-compatible alias for static W solve from χ(q)."""
+    return solve_w_from_chi_q_jax(V_qmunu, chi_q, meta, mesh_xy)
 
 
 # ============================================================================
@@ -445,7 +443,7 @@ def compute_chi0_and_w(
         enk_v, enk_c, windows, meta, mesh_xy,
     )
     
-    W_q = get_static_w_q_jax(V_qmunu, chi_q, None, meta, mesh_xy)
+    W_q = solve_w_from_chi_q_jax(V_qmunu, chi_q, meta, mesh_xy)
     
     return chi_q, W_q
 
@@ -503,6 +501,12 @@ def get_chi_omega_jax(*args, **kwargs):
     return dynamic_chi_omega(*args, **kwargs)
 
 
+def frequency_integration(*args, **kwargs):
+    """Scalar-ω CTSP frequency integration - delegates to dynamic implementation."""
+    from .w_isdf_dynamic import frequency_integration as dynamic_frequency_integration
+    return dynamic_frequency_integration(*args, **kwargs)
+
+
 def get_w_omega_jax_from_bundle(*args, **kwargs):
     """Dynamic W(ω) from canonical WavefunctionBundle."""
     from .w_isdf_dynamic import get_w_omega_jax_from_bundle as dynamic_w_omega_bundle
@@ -513,3 +517,9 @@ def get_chi_omega_jax_from_bundle(*args, **kwargs):
     """Dynamic χ(ω) from canonical WavefunctionBundle."""
     from .w_isdf_dynamic import get_chi_omega_jax_from_bundle as dynamic_chi_omega_bundle
     return dynamic_chi_omega_bundle(*args, **kwargs)
+
+
+def frequency_integration_from_bundle(*args, **kwargs):
+    """Scalar-ω CTSP frequency integration from canonical WavefunctionBundle."""
+    from .w_isdf_dynamic import frequency_integration_from_bundle as dynamic_frequency_integration_bundle
+    return dynamic_frequency_integration_bundle(*args, **kwargs)

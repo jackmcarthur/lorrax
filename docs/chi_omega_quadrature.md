@@ -216,10 +216,39 @@ $$
 
 ### 8.1 Frequency Batching via Phase Factors
 
-**GL case** (no crossing): The ω-dependence is $e^{-\zeta\omega\tau}$
+**GL case** (no crossing): the ω dependence is branch-dependent, not a single
+universal phase. For each fixed-sign branch $b \in \{\text{anti}, \text{res-low},
+\text{res-high}\}$:
 $$
-\chi^{\mathrm{GL}}(\omega_i) = -2\zeta \sum_u w_u \underbrace{e^{(\zeta E^{(\mathrm{gap})} - 1)\tau_u}}_{\text{ω-indep}} \cdot \underbrace{e^{-\zeta\omega_i\tau_u}}_{\text{phase}[\omega_i, u]} \cdot \underbrace{\tilde{\chi}(\tau_u)}_{\text{tile}}
+\chi_b^{\mathrm{GL}}(\omega_i) = \sum_u c_b(\omega_i,\tau_u)\,\tilde{\chi}_b(\tau_u),
 $$
+with
+$$
+c_b(\omega,\tau) = s_b\,\zeta_b\,w_u\exp\!\left[-\big(\zeta_b\,\Delta_b(\omega)-1\big)\tau\right],
+$$
+where $s_b \in \{+1,-1\}$ and
+$\Delta_b(\omega)\in\{\omega+E^{(\mathrm{gap})},\,E^{(\mathrm{gap})}-\omega,\,\omega-E^{(\mathrm{bw})}\}$.
+
+For the **full** dynamic polarizability, split poles explicitly:
+$$
+\chi(\omega) = \chi^{\mathrm{res}}(\omega) + \chi^{\mathrm{anti}}(\omega),
+$$
+with
+$$
+\chi^{\mathrm{res}}(\omega)\propto \frac{1}{\omega-\Delta E},\qquad
+\chi^{\mathrm{anti}}(\omega)\propto -\frac{1}{\omega+\Delta E}.
+$$
+
+- $\chi^{\mathrm{anti}}$: always GL (denominator positive for $\omega\ge 0$)
+- $\chi^{\mathrm{res}}$: GL for $\omega<E^{(\mathrm{gap})}$ and $\omega>E^{(\mathrm{bw})}$, HGL only in crossing region
+
+For scalar-$\omega$ evaluation, GL quadrature should use branch-local energy intervals:
+- Antiresonant: $[\omega+E^{(\mathrm{gap})},\;\omega+E^{(\mathrm{bw})}]$
+- Resonant low: $[E^{(\mathrm{gap})}-\omega,\;E^{(\mathrm{bw})}-\omega]$
+- Resonant high: $[\omega-E^{(\mathrm{bw})},\;\omega-E^{(\mathrm{gap})}]$
+
+For multi-$\omega$ batching, one must either bucket frequencies so each bucket shares
+one GL grid, or use a conservative shared interval for the whole bucket.
 
 **HGL case** (crossing): Use Euler identity for 2× memory savings:
 $$
@@ -245,55 +274,19 @@ FOR (l,m) in window_pairs:  # OUTERMOST: fixes array shapes
     
     # Slice bands/energies for this window (static shapes within loop)
     E_v, E_c, psi_v, psi_c = slice_window(l, m)
-    ζ = 1/sqrt(E_bw * E_gap)
-    τ, w = roots_laguerre(N_tau)  # or HGL nodes
-    
-    # ===== GL (non-crossing) =====
-    # Precompute ω-independent gap factor: shape (n_tau,)
-    gap_factor = w * exp(-(ζ * E_gap - 1) * τ)
-    
-    # Precompute ω-dependent phase matrix: shape (n_omega, n_tau)
-    phase_GL = exp(-ζ * ω_array[:, None] * τ[None, :])
-    
-    FOR u in range(n_tau):
-        # Build propagators at τ_u (ω-independent)
-        ρ_v = sum_v exp(-ζ*τ[u]*(E_v_max - E_v)) * psi_v @ psi_v.H
-        ρ_c = sum_c exp(-ζ*τ[u]*(E_c - E_c_min)) * psi_c @ psi_c.H
-        
-        # FFT k→R, contract, FFT R→q
-        χ_tile = FFT_Rq(contract(IFFT_kR(ρ_c), IFFT_kR(ρ_v)))
-        
-        # Accumulate ALL ω at once (vectorized over omega axis)
-        chi_accum += (-2*ζ * gap_factor[u] * phase_GL[:, u])[:, None, None, None] * χ_tile
-    
-    # ===== HGL (crossing) =====
-    IF any ω causes crossing in this window:
-        τ_hgl, w_hgl = hgl_nodes(N_hgl)
-        
-        # Precompute sin/cos phase matrix: shape (n_cross_omega, n_tau)
-        sin_phase = sin(γ * ω_cross[:, None] * τ_hgl[None, :])
-        cos_phase = cos(γ * ω_cross[:, None] * τ_hgl[None, :])
-        
-        FOR u in range(n_tau_hgl):
-            # 2 complex propagators via Euler (2× memory savings)
-            G_v = sum_v exp(i*γ*τ[u]*E_v) * psi_v @ psi_v.H
-            G_c = sum_c exp(i*γ*τ[u]*E_c) * psi_c @ psi_c.H
-            
-            # FFT to R-space
-            G_v_R = IFFT_kR(G_v)
-            G_c_mR = FFT_kR(G_c)  # -R for convolution
-            
-            # Products from Hermitian conjugate: (G_c)† G_v = P_+ - i P_×
-            product = contract(conj(G_c_mR), G_v_R)
-            P_plus_q  = FFT_Rq(product.real)
-            P_cross_q = FFT_Rq(-product.imag)
-            
-            # Batch ALL crossing ω (vectorized multiply-add)
-            chi_cross += γ * w_hgl[u] * (
-                cos_phase[:, u, None, None, None] * P_cross_q -
-                sin_phase[:, u, None, None, None] * P_plus_q
-            )
+    # ===== GL/HGL by denominator type =====
+    denom_types = plan_denom_types(ω_array, (l, m))  # anti, res-low, crossing, res-high
 
+    FOR denom in denom_types:
+        τ, w = denom.tau, denom.w
+        FOR u in range(len(τ)):
+            # Build propagator product tile at τ_u (ω-independent)
+            tile = build_integrand_tau(denom, τ[u], psi_v, psi_c, E_v, E_c)
+
+            # Branch-specific ω coefficients + mask
+            coeff = compute_phase_coeff(denom, ω_array, τ[u], w[u]) * denom.omega_mask
+            chi_accum = accumulate_integrand(chi_accum, denom, coeff, tile)
+    
 # Finalize
 chi_accum *= -2 / (sqrt(N_k) * n_spin * n_spinor)
 write_to_file(chi_accum)
@@ -304,8 +297,8 @@ write_to_file(chi_accum)
 | Array | Shape | Notes |
 |-------|-------|-------|
 | `chi_accum` | `(n_ω, nq, nμ, nμ)` | Main accumulator |
-| `phase_GL` | `(n_ω, n_τ)` | Precomputed, reused per window |
-| `sin/cos_phase` | `(n_ω_cross, n_τ_hgl)` | Only for crossing ω |
+| `omega_mask` | `(n_ω,)` per denom bucket | Selects active frequencies per denominator type |
+| `coeff(ω,τ)` | `(n_ω,)` per τ step | Branch-dependent GL/HGL scalar coefficients |
 | `χ_tile` | `(nq, nμ, nμ)` | Temporary per τ, overwritten |
 | `G_v, G_c` | `(k, s, μ, s', μ')` complex | 2 arrays via Euler (not 4 real) |
 | `P_plus, P_cross` | `(nq, nμ, nμ)` | Extracted from `(G^c)† G^v` |
@@ -316,7 +309,7 @@ write_to_file(chi_accum)
 
 2. **Vectorized ω update**: The key line is:
    ```python
-   chi_accum += phase[:, None, None, None] * tile[None, ...]
+   chi_accum += coeff[:, None, None, None] * tile[None, ...]
    ```
    which broadcasts `(n_ω,)` against `(nq, nμ, nμ)` without explicit loop
 
@@ -338,6 +331,10 @@ write_to_file(chi_accum)
 ## 9. Complex Frequencies: z = ω + iη
 
 For contour integration or analytic continuation, we need χ at complex frequencies $z = \omega + i\eta$.
+
+Note: this section uses a simplified phase notation. In the rewrite, apply the same
+DenomType branch split as for real frequencies, then substitute complex `z` into the
+branch-specific coefficients.
 
 ### 9.1 Why It Works
 
@@ -487,6 +484,10 @@ The coefficient $a_1$ vanishes when $\int_0^\infty \tau h(\tau) d\tau / \int_0^\
 ---
 
 ## 11. Implementation: Function Decomposition
+
+This section is an implementation sketch. For new development, treat the
+DenomType planner pattern in Section 8 as the primary algorithm and use this
+section as a naming/template guide.
 
 ### 11.1 Design Principles
 
@@ -785,27 +786,11 @@ def precompute_exp_weights(E: Array, win: WindowQuadrature, is_valence: bool) ->
 
 def precompute_phases(omega: Array, win: WindowQuadrature) -> FrequencyPhases:
     """
-    Classify ω and precompute all phases. Called once per window.
+    Legacy adapter: keep FrequencyPhases API while planner becomes DenomType-based.
+    Called once per window.
     """
-    # Classify: GL if ω outside [E_gap, E_bw], HGL if inside
-    is_gl = (omega.real < win.E_gap) | (omega.real > win.E_bw)
-    is_hgl = ~is_gl
-    
-    gl_idx = jnp.where(is_gl)[0]
-    hgl_idx = jnp.where(is_hgl)[0] if is_hgl.any() else None
-    
-    # GL phases: exp(-ζ(ω - E_gap)τ)
-    omega_gl = omega[is_gl]
-    phase_gl = jnp.exp(-win.zeta * (omega_gl[:, None] - win.E_gap) * win.tau_gl[None, :])
-    
-    # HGL phases: sin/cos(γτω)
-    if hgl_idx is not None:
-        omega_hgl = omega[is_hgl]
-        sin_phase, cos_phase = complex_sincos(win.gamma * omega_hgl[:, None] * win.tau_hgl[None, :])
-    else:
-        sin_phase = cos_phase = None
-    
-    return FrequencyPhases(phase_gl, gl_idx, sin_phase, cos_phase, hgl_idx)
+    buckets = plan_denom_types(omega, win)
+    return collapse_buckets_to_frequency_phases(buckets, win)
 
 
 def complex_sincos(z: Array) -> tuple[Array, Array]:
