@@ -556,6 +556,12 @@ def read_cohsex_input(filename: str) -> dict:
 		# debug_hartree: If True, print diagnostic info for Hartree calculation.
 		# debug_omega:   If set (float, in Ry), compute W(ω) at this frequency
 		#                instead of static W. For testing dynamic screening.
+		# screening_method: Screening backend: 'minimax' (default) or 'ctsp'.
+		# minimax_target_error: Target max error for minimax 1/x approximation.
+		# minimax_max_nodes: Maximum allowed minimax nodes.
+		# ppm_omega_p:   If set (>0, in Ry), extract GN-PPM parameters from
+		#                minimax chi(0) and chi(i*omega_p).
+		# ppm_fallback_omega: Fallback pole value (Ry) for unfulfilled GN modes.
 		# chunk_size:    Band chunk size for memory-efficient wavefunction loading.
 		#                -1 = no chunking (all bands at once, default)
 		#                 0 = auto (currently 64, TODO: dynamic from available RAM)
@@ -588,6 +594,11 @@ def read_cohsex_input(filename: str) -> dict:
 			"sys_dim": geti("sys_dim", fallback=2),  # 2=slab, 3=bulk
 			"debug_hartree": getb("debug_hartree", fallback=False),
 			"debug_omega": getf("debug_omega", fallback=None),   # test W(ω) at this freq
+			"screening_method": get("screening_method", fallback="minimax").strip().lower(),
+			"minimax_target_error": getf("minimax_target_error", fallback=1.0e-6),
+			"minimax_max_nodes": geti("minimax_max_nodes", fallback=64),
+			"ppm_omega_p": getf("ppm_omega_p", fallback=None),
+			"ppm_fallback_omega": getf("ppm_fallback_omega", fallback=1.0),
 			"chunk_size": geti("chunk_size", fallback=-1),       # band chunk size (-1=all, 0=auto, 1-2048=explicit)
 			"r_chunk_size": geti("r_chunk_size", fallback=0),    # r-axis chunk (0=auto, >0=explicit)
 			"band_chunk_size": geti("band_chunk_size", fallback=16),  # bands per FFT during r-chunk loop
@@ -614,6 +625,11 @@ def read_cohsex_input(filename: str) -> dict:
 			"sys_dim": 2,
 			"debug_hartree": False,
 			"debug_omega": None,
+			"screening_method": "minimax",
+			"minimax_target_error": 1.0e-6,
+			"minimax_max_nodes": 64,
+			"ppm_omega_p": None,
+			"ppm_fallback_omega": 1.0,
 			"chunk_size": -1,
 			"r_chunk_size": 0,
 			"band_chunk_size": 16,

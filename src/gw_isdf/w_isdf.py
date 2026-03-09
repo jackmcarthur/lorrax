@@ -24,6 +24,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 
 from common import Meta, jax_profile
+from .minimax_screening import (
+    build_static_minimax_window_pair,
+    extract_gn_ppm_parameters,
+)
 
 if TYPE_CHECKING:
     from .wavefunction_bundle import WavefunctionBundle
@@ -533,14 +537,21 @@ def compute_screening(
     mesh_xy,
     *,
     omega=0.0,
+    screening_method="minimax",
+    minimax_target_error=1.0e-6,
+    minimax_max_nodes=64,
+    ppm_omega_p=None,
+    ppm_fallback_omega=1.0,
     validate_static=True,
     tensors_filename=None,
     print0=print,
 ):
     """Compute screened Coulomb W(ω) from V and wavefunctions.
 
-    Wraps get_w_omega_jax_from_bundle and optionally validates against the
-    legacy static χ→W path at ω=0.
+    Supports two screening paths:
+    - ``screening_method='minimax'`` (default): canonical minimax quadrature
+      from ``docs/minimax.py`` on a single static window.
+    - ``screening_method='ctsp'``: legacy CTSP dynamic path.
 
     Parameters
     ----------
@@ -548,16 +559,27 @@ def compute_screening(
         Bare Coulomb in ISDF basis.
     wf_bundle : WavefunctionBundle
         Canonical wavefunction bundle.
-    window_pairs : list
-        Energy windows for CTSP quadrature.
+    window_pairs : list or None
+        Energy windows for CTSP quadrature. Required only for ``ctsp`` mode.
     meta : Meta
         System metadata.
     mesh_xy : Mesh
         Device mesh.
     omega : float
         Evaluation frequency in Ry (0.0 for static COHSEX).
+    screening_method : {'minimax', 'ctsp'}
+        Select minimax static path or legacy CTSP path.
+    minimax_target_error : float
+        Max 1/x fit error target for canonical minimax quadrature.
+    minimax_max_nodes : int
+        Upper bound for minimax node search.
+    ppm_omega_p : float or None
+        If set in minimax mode, also extract GN-PPM parameters using chi(0)
+        and chi(i*omega_p) built from the same minimax nodes.
+    ppm_fallback_omega : float
+        Fallback Omega value (Ry) for unfulfilled GN modes.
     validate_static : bool
-        If True and omega==0, compare dynamic and static paths.
+        In CTSP mode, if True and omega==0 compare dynamic and static paths.
     tensors_filename : str or None
         If not None and file exists, save W0_qmunu to it.
     print0 : callable
@@ -569,48 +591,126 @@ def compute_screening(
         Screened Coulomb interaction.
     """
     import time
-    import os
-    import jax.numpy as jnp
 
     ryd2ev = 13.605693122994
+    omega = float(omega)
     omega_ev = omega * ryd2ev
+    method = str(screening_method).strip().lower()
+    if method not in {"minimax", "ctsp"}:
+        raise ValueError(f"Unknown screening_method={screening_method!r}; expected 'minimax' or 'ctsp'.")
+
+    if method == "minimax" and abs(omega) > 1.0e-14:
+        raise NotImplementedError(
+            "screening_method='minimax' currently supports only omega=0. "
+            "Use screening_method='ctsp' for finite-frequency screening."
+        )
+
     print0("")
-    if abs(omega) <= 1e-14:
-        print0(f"  Dynamic screening path enabled at ω = 0.0000 eV ({omega:.6f} Ry)")
+    if abs(omega) <= 1e-14 and method == "minimax":
+        print0(f"  Minimax screening path enabled at ω = 0.0000 eV ({omega:.6f} Ry)")
+    elif abs(omega) <= 1e-14:
+        print0(f"  CTSP screening path enabled at ω = 0.0000 eV ({omega:.6f} Ry)")
     else:
-        print0(f"  [DEBUG] Dynamic screening at ω = {omega_ev:.4f} eV ({omega:.6f} Ry)")
+        print0(f"  [DEBUG] CTSP screening at ω = {omega_ev:.4f} eV ({omega:.6f} Ry)")
 
-    t_dyn0 = time.perf_counter()
-    W_q, chi_omega = get_w_omega_jax_from_bundle(
-        V_qmunu, wf_bundle, window_pairs, omega, meta, mesh_xy,
-    )
-    W_q.block_until_ready()
-    chi_omega.block_until_ready()
-    t_dyn = time.perf_counter() - t_dyn0
-    chi_max = float(jnp.max(jnp.abs(chi_omega)))
-    print0(f"  |χ(ω)|_max = {chi_max:.6e}")
+    if method == "minimax":
+        s = wf_bundle.slices
+        psi_vTX = wf_bundle.x(s.v_slice)
+        psi_vY = wf_bundle.y(s.v_slice)
+        psi_cX = wf_bundle.y(s.c_slice)
+        psi_cTY = wf_bundle.x(s.c_slice)
+        enk_v = wf_bundle.enk[:, s.v_slice]
+        enk_c = wf_bundle.enk[:, s.c_slice]
 
-    # Validate dynamic path against legacy static path at ω=0
-    if validate_static and abs(omega) <= 1e-14:
-        t_static0 = time.perf_counter()
-        chi0_static = get_chi0_jax_from_bundle(wf_bundle, window_pairs, meta, mesh_xy)
-        W_q_static = get_static_w_q_jax(V_qmunu, chi0_static, meta, mesh_xy)
-        chi0_static.block_until_ready()
-        W_q_static.block_until_ready()
-        t_static = time.perf_counter() - t_static0
+        windows_minimax, quad = build_static_minimax_window_pair(
+            enk_v,
+            enk_c,
+            target_error=float(minimax_target_error),
+            max_nodes=int(minimax_max_nodes),
+            print_fn=print0,
+        )
 
-        chi_err_abs = float(jnp.max(jnp.abs(chi_omega - chi0_static)))
-        chi_ref = max(float(jnp.max(jnp.abs(chi0_static))), 1e-16)
-        chi_err_rel = chi_err_abs / chi_ref
-        W_err_abs = float(jnp.max(jnp.abs(W_q - W_q_static)))
-        W_ref = max(float(jnp.max(jnp.abs(W_q_static))), 1e-16)
-        W_err_rel = W_err_abs / W_ref
+        t_min0 = time.perf_counter()
+        chi_omega = compute_chi0(
+            psi_vTX,
+            psi_vY,
+            psi_cX,
+            psi_cTY,
+            enk_v,
+            enk_c,
+            windows_minimax,
+            meta,
+            mesh_xy,
+        )
+        W_q = solve_w_from_chi_q_jax(V_qmunu, chi_omega, meta, mesh_xy)
+        chi_omega.block_until_ready()
+        W_q.block_until_ready()
+        t_min = time.perf_counter() - t_min0
+        chi_max = float(jnp.max(jnp.abs(chi_omega)))
+        print0(f"  |χ(0)|_max = {chi_max:.6e}   (minimax, {quad.node_count} nodes)")
+        print0(f"  minimax χ→W time: {t_min:9.3f} s")
 
-        print0("  χ/W path comparison at ω=0 (dynamic vs static):")
-        print0(f"    dynamic time: {t_dyn:9.3f} s")
-        print0(f"    static time:  {t_static:9.3f} s")
-        print0(f"    χ max abs diff: {chi_err_abs:.6e}, rel diff: {chi_err_rel:.6e}")
-        print0(f"    W max abs diff: {W_err_abs:.6e}, rel diff: {W_err_rel:.6e}")
+        if ppm_omega_p is not None:
+            omega_p = float(ppm_omega_p)
+            if omega_p <= 0.0:
+                raise ValueError("ppm_omega_p must be > 0 when GN-PPM extraction is requested.")
+            chi_iwp = compute_chi0(
+                psi_vTX,
+                psi_vY,
+                psi_cX,
+                psi_cTY,
+                enk_v,
+                enk_c,
+                [windows_minimax[0].with_imag_freq_modulation(omega_p)],
+                meta,
+                mesh_xy,
+            )
+            chi_iwp.block_until_ready()
+            ppm = extract_gn_ppm_parameters(
+                V_qmunu,
+                chi_omega,
+                chi_iwp,
+                omega_p=omega_p,
+                fallback_omega=float(ppm_fallback_omega),
+            )
+            print0(
+                "  GN-PPM extracted from minimax chi:"
+                f" ω_p={omega_p:.6f} Ry, unfulfilled={100.0 * ppm.unfulfilled_fraction:.2f}%"
+            )
+    else:
+        if window_pairs is None:
+            raise ValueError("window_pairs are required when screening_method='ctsp'.")
+        t_dyn0 = time.perf_counter()
+        W_q, chi_omega = get_w_omega_jax_from_bundle(
+            V_qmunu, wf_bundle, window_pairs, omega, meta, mesh_xy,
+        )
+        W_q.block_until_ready()
+        chi_omega.block_until_ready()
+        t_dyn = time.perf_counter() - t_dyn0
+        chi_max = float(jnp.max(jnp.abs(chi_omega)))
+        print0(f"  |χ(ω)|_max = {chi_max:.6e}")
+
+        # Validate CTSP dynamic path against legacy static path at ω=0
+        if validate_static and abs(omega) <= 1e-14:
+            t_static0 = time.perf_counter()
+            chi0_static = get_chi0_jax_from_bundle(wf_bundle, window_pairs, meta, mesh_xy)
+            W_q_static = get_static_w_q_jax(V_qmunu, chi0_static, meta, mesh_xy)
+            chi0_static.block_until_ready()
+            W_q_static.block_until_ready()
+            t_static = time.perf_counter() - t_static0
+
+            chi_err_abs = float(jnp.max(jnp.abs(chi_omega - chi0_static)))
+            chi_ref = max(float(jnp.max(jnp.abs(chi0_static))), 1e-16)
+            chi_err_rel = chi_err_abs / chi_ref
+            W_err_abs = float(jnp.max(jnp.abs(W_q - W_q_static)))
+            W_ref = max(float(jnp.max(jnp.abs(W_q_static))), 1e-16)
+            W_err_rel = W_err_abs / W_ref
+
+            print0("  χ/W path comparison at ω=0 (dynamic vs static):")
+            print0(f"    dynamic time: {t_dyn:9.3f} s")
+            print0(f"    static time:  {t_static:9.3f} s")
+            print0(f"    χ max abs diff: {chi_err_abs:.6e}, rel diff: {chi_err_rel:.6e}")
+            print0(f"    W max abs diff: {W_err_abs:.6e}, rel diff: {W_err_rel:.6e}")
 
     if tensors_filename is not None and os.path.exists(tensors_filename):
         from isdf_io import write_w0_qmunu_to_h5

@@ -896,11 +896,19 @@ def main(argv=None):
 	if do_screened:
 		with timing.section("gw_jax.chi0_W"):
 			with jax_profile.trace_section("chi0_W"):
-				window_pairs = get_window_info(epsq, wfn, nband_max=nband)
 				omega_eval = float(params.get("debug_omega") or 0.0)
+				screening_method = str(params.get("screening_method", "minimax")).strip().lower()
+				window_pairs = None
+				if screening_method == "ctsp":
+					window_pairs = get_window_info(epsq, wfn, nband_max=nband)
 				W_q = compute_screening(
 					V_qmunu, wf_bundle, window_pairs, meta, mesh_xy,
 					omega=omega_eval,
+					screening_method=screening_method,
+					minimax_target_error=float(params.get("minimax_target_error", 1.0e-6)),
+					minimax_max_nodes=int(params.get("minimax_max_nodes", 64)),
+					ppm_omega_p=params.get("ppm_omega_p"),
+					ppm_fallback_omega=float(params.get("ppm_fallback_omega", 1.0)),
 					tensors_filename=tensors_filename,
 					print0=print0,
 				)
