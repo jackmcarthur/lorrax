@@ -63,6 +63,60 @@ def write_sigma_to_file(sigma_sx_kij_eV, filename="eqp0.dat", sigma_coh_kij_eV=N
 				f.write(line + "\n")
 
 
+def write_eqp1(
+	eqp1_path,
+	energies_dft_ev,
+	energies_qp_ev,
+	E_oneshot_ev,
+	nkx, nky, nkz,
+	nb_sigma,
+):
+	"""Write eqp1.dat with DFT, one-shot, and QP eigenvalues per k-point.
+
+	Parameters
+	----------
+	eqp1_path : str
+		Output file path.
+	energies_dft_ev : array (nk, nb)
+		DFT eigenvalues in eV.
+	energies_qp_ev : array (nk, nb)
+		QP eigenvalues in eV (from diagonalizing H_DFT + Σ).
+	E_oneshot_ev : array (nk, nb)
+		One-shot diagonal energies in eV.
+	nkx, nky, nkz : int
+		k-grid dimensions.
+	nb_sigma : int
+		Number of bands in sigma window.
+	"""
+	energies_dft_ev = np.asarray(energies_dft_ev, dtype=np.float64)
+	energies_qp_ev = np.asarray(energies_qp_ev, dtype=np.float64)
+	E_oneshot_ev = np.asarray(E_oneshot_ev, dtype=np.float64)
+
+	abs_path = os.path.abspath(eqp1_path)
+	dirname = os.path.dirname(abs_path)
+	if dirname:
+		os.makedirs(dirname, exist_ok=True)
+
+	with open(abs_path, "w") as f:
+		f.write("# kx ky kz nbands\n")
+		f.write("# spin band E_DFT E_oneshot(DFT-basis) E_QP(eigh)\n")
+		ik = 0
+		for ikz in range(nkz):
+			for iky in range(nky):
+				for ikx in range(nkx):
+					kx = ikx / nkx
+					ky = iky / nky
+					kz = ikz / nkz
+					f.write(f"  {kx:.9f}  {ky:.9f}  {kz:.9f}      {nb_sigma}\n")
+					for ib in range(nb_sigma):
+						e_dft = float(energies_dft_ev[ik, ib])
+						e_oneshot = float(E_oneshot_ev[ik, ib])
+						e_qp = float(energies_qp_ev[ik, ib])
+						f.write(f"       1       {ib+1}  {e_dft:14.9f}  {e_oneshot:14.9f}  {e_qp:14.9f}\n")
+					ik += 1
+	return abs_path
+
+
 def write_eqp_table(dft_energies_ev, qp_energies_ev, filename="eqp.dat"):
 	"""Write DFT vs quasiparticle energies per (k,n) in eqp-style text format.
 

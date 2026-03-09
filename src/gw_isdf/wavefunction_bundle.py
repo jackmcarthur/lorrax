@@ -88,34 +88,6 @@ class WavefunctionBundle:
         return self.psi_x[:, :, :, band_slice]
 
 
-@dataclass
-class LegacyWavefunctionViews:
-    """Compatibility views used to keep legacy kernel call signatures stable."""
-
-    psi_v: jax.Array
-    psi_vT: jax.Array
-    psi_c: jax.Array
-    psi_cT: jax.Array
-    psi_l: jax.Array
-    psi_lT: jax.Array
-    psi_l_proj: jax.Array
-    psi_lT_proj: jax.Array
-    psi_l_full: jax.Array
-    psi_lT_full: jax.Array
-    psi_r: jax.Array
-    psi_rT: jax.Array
-    psi_coh: jax.Array
-    psi_cohT: jax.Array
-    enk_v: jax.Array
-    enk_c: jax.Array
-    enk_l: jax.Array
-    enk_r: jax.Array
-    occ_v: jax.Array
-    occ_c: jax.Array
-    occ_l: jax.Array
-    occ_r: jax.Array
-
-
 def _assemble_full_from_left_right(
     psi_l_y: jax.Array,
     psi_r_y: jax.Array | None,
@@ -240,75 +212,35 @@ def build_wavefunction_bundle_from_full(
     )
 
 
-def to_legacy_views(
-    wf: WavefunctionBundle,
-    *,
+def build_sigma_views(
+    wf_bundle: WavefunctionBundle,
     mesh_xy: Mesh,
     sh: SimpleNamespace,
-) -> LegacyWavefunctionViews:
-    """Materialize legacy named views from canonical bundle slices."""
-    s = wf.slices
+) -> SimpleNamespace:
+    """Build sigma-kernel wavefunction views from canonical bundle.
+
+    Returns a namespace with psi_l, psi_lT, psi_coh, psi_cohT, psi_proj, psi_projT
+    ready for the sigma pipeline.
+    """
+    s = wf_bundle.slices
     with mesh_xy:
-        psi_v = jax.lax.with_sharding_constraint(wf.y(s.v_slice), sh.y3_4)
-        psi_vT = jax.lax.with_sharding_constraint(
-            psi_v.transpose(0, 2, 3, 1), sh.x2_4
+        psi_l = jax.lax.with_sharding_constraint(wf_bundle.y(s.l_slice), sh.Y_shard)
+        psi_lT = jax.lax.with_sharding_constraint(wf_bundle.x(s.l_slice), sh.XT_shard)
+        psi_coh = jax.lax.with_sharding_constraint(wf_bundle.y(s.coh_slice), sh.Y_shard)
+        psi_cohT = jax.lax.with_sharding_constraint(wf_bundle.x(s.coh_slice), sh.XT_shard)
+        psi_proj = jax.lax.with_sharding_constraint(
+            wf_bundle.x(s.l_slice).transpose(0, 3, 1, 2), sh.X_shard
         )
-
-        psi_c = jax.lax.with_sharding_constraint(wf.y(s.c_slice), sh.x3_4)
-        psi_cT = jax.lax.with_sharding_constraint(
-            psi_c.transpose(0, 2, 3, 1), sh.y2_4
+        psi_projT = jax.lax.with_sharding_constraint(
+            wf_bundle.y(s.l_slice).transpose(0, 2, 3, 1), sh.YT_shard
         )
-
-        psi_l = jax.lax.with_sharding_constraint(wf.y(s.l_slice), sh.y3_4)
-        psi_lT = jax.lax.with_sharding_constraint(
-            psi_l.transpose(0, 2, 3, 1), sh.x2_4
-        )
-        psi_l_proj = jax.lax.with_sharding_constraint(psi_l, sh.x3_4)
-        psi_lT_proj = jax.lax.with_sharding_constraint(
-            psi_l_proj.transpose(0, 2, 3, 1), sh.y2_4
-        )
-
-        psi_r = jax.lax.with_sharding_constraint(wf.y(s.r_slice), sh.x3_4)
-        psi_rT = jax.lax.with_sharding_constraint(
-            psi_r.transpose(0, 2, 3, 1), sh.y2_4
-        )
-
-        psi_coh = jax.lax.with_sharding_constraint(wf.y(s.coh_slice), sh.y3_4)
-        psi_cohT = jax.lax.with_sharding_constraint(
-            psi_coh.transpose(0, 2, 3, 1), sh.x2_4
-        )
-
-        enk_v = jax.lax.with_sharding_constraint(wf.enk[:, s.v_slice], sh.replicated_2)
-        enk_c = jax.lax.with_sharding_constraint(wf.enk[:, s.c_slice], sh.replicated_2)
-        enk_l = jax.lax.with_sharding_constraint(wf.enk[:, s.l_slice], sh.replicated_2)
-        enk_r = jax.lax.with_sharding_constraint(wf.enk[:, s.r_slice], sh.replicated_2)
-
-        occ_v = jax.lax.with_sharding_constraint(wf.occ[:, s.v_slice], sh.replicated_2)
-        occ_c = jax.lax.with_sharding_constraint(wf.occ[:, s.c_slice], sh.replicated_2)
-        occ_l = jax.lax.with_sharding_constraint(wf.occ[:, s.l_slice], sh.replicated_2)
-        occ_r = jax.lax.with_sharding_constraint(wf.occ[:, s.r_slice], sh.replicated_2)
-
-    return LegacyWavefunctionViews(
-        psi_v=psi_v,
-        psi_vT=psi_vT,
-        psi_c=psi_c,
-        psi_cT=psi_cT,
+    return SimpleNamespace(
         psi_l=psi_l,
         psi_lT=psi_lT,
-        psi_l_proj=psi_l_proj,
-        psi_lT_proj=psi_lT_proj,
-        psi_l_full=psi_l,
-        psi_lT_full=psi_lT,
-        psi_r=psi_r,
-        psi_rT=psi_rT,
         psi_coh=psi_coh,
         psi_cohT=psi_cohT,
-        enk_v=enk_v,
-        enk_c=enk_c,
-        enk_l=enk_l,
-        enk_r=enk_r,
-        occ_v=occ_v,
-        occ_c=occ_c,
-        occ_l=occ_l,
-        occ_r=occ_r,
+        psi_proj=psi_proj,
+        psi_projT=psi_projT,
     )
+
+

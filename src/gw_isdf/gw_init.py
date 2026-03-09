@@ -5,10 +5,19 @@ This module contains functions for:
 - Converting input parameters to effective values
 - Computing band ranges from input parameters
 - Memory-aware chunk size optimization with full communication buffer accounting
+- Runtime configuration resolution (memory budget, chunking, ZCT caps)
+- ISDF fitting / restart orchestration
 """
+import os
 import re
 import configparser
 import math
+from types import SimpleNamespace
+
+import jax
+import jax.numpy as jnp
+
+import common.timing as timing
 
 
 
@@ -656,3 +665,316 @@ def get_bandranges(nv, nc, nband, nelec):
 	n_fullrange = [0, int(nband)]
 	n_valrange = [0, int(nelec)]
 	return nvrange, ncrange, nsigmarange, n_fullrange, n_valrange
+
+
+def resolve_runtime_config(params, rank=0):
+	"""Extract and validate runtime configuration from parsed input params.
+
+	Resolves memory budget (auto-detect or explicit), chunking parameters,
+	ZCT stage cap, and ISDF pair mode. Returns a flat namespace consumed by
+	the driver without further interpretation.
+
+	Parameters
+	----------
+	params : dict
+		Parsed input file parameters (from ``read_cohsex_input``).
+	rank : int
+		MPI / JAX process index (only rank 0 prints).
+
+	Returns
+	-------
+	SimpleNamespace with fields:
+		restart, x_only, do_screened, bispinor, isdf_pair_mode,
+		memory_per_device_gb, chunk_target_utilization, zct_stage_cap_gb,
+		r_chunk_override, do_G0
+	"""
+	restart = params["restart"]
+	x_only = params["x_only"]
+	do_screened = params["do_screened"]
+	bispinor = params["bispinor"]
+
+	isdf_pair_mode = str(params.get("isdf_pair_mode", "spin_traced")).strip().lower()
+	if isdf_pair_mode not in ("spin_traced", "spin_matrix_frobenius"):
+		raise ValueError(
+			f"isdf_pair_mode={isdf_pair_mode!r} is invalid. "
+			"Use 'spin_traced' or 'spin_matrix_frobenius'."
+		)
+
+	if x_only and do_screened:
+		raise ValueError("x_only and do_screened cannot both be True")
+
+	# -- Memory budget -------------------------------------------------------
+	from common.gpu_utils import get_device_memory_info
+	memory_per_device_gb = params.get("memory_per_device_gb", 0.0)
+	memory_budget_auto = memory_per_device_gb <= 0
+	mem_info_detect = None
+	if memory_budget_auto:
+		from common.gpu_utils import get_device_memory_gb
+		memory_per_device_gb = get_device_memory_gb()
+		mem_info_detect = get_device_memory_info()
+		if rank == 0:
+			print(f"  Auto-detected memory budget: {memory_per_device_gb:.2f} GB/device")
+
+	# -- Chunk target utilization ---------------------------------------------
+	try:
+		chunk_target_utilization = float(
+			os.environ.get("ISDF_CHUNK_TARGET_UTILIZATION", "0.97")
+		)
+	except Exception:
+		chunk_target_utilization = 0.97
+	chunk_target_utilization = max(0.85, min(1.0, chunk_target_utilization))
+	if rank == 0:
+		print(f"  Chunk target utilization: {chunk_target_utilization:.2f}")
+		if restart:
+			print(f"  ISDF pair mode: {isdf_pair_mode} (ignored when restart=true)")
+		else:
+			print(f"  ISDF pair mode: {isdf_pair_mode}")
+
+	# -- ZCT stage cap (manual override only) ---------------------------------
+	zct_stage_cap_gb = None
+	zct_cap_gb_env = os.environ.get("ISDF_ZCT_STAGE_CAP_GB")
+	zct_cap_frac_env = os.environ.get("ISDF_ZCT_STAGE_CAP_FRAC")
+	if zct_cap_gb_env:
+		try:
+			zct_stage_cap_gb = min(memory_per_device_gb, max(0.0, float(zct_cap_gb_env)))
+		except Exception:
+			zct_stage_cap_gb = None
+	if zct_stage_cap_gb is None and zct_cap_frac_env and jax.default_backend() in ("gpu", "cuda"):
+		mem_info_detect = mem_info_detect or get_device_memory_info()
+		total_gb = float((mem_info_detect or {}).get("total_gb", 0.0))
+		if total_gb > 0:
+			try:
+				zct_cap_frac = float(zct_cap_frac_env)
+			except Exception:
+				zct_cap_frac = 0.0
+			zct_cap_frac = max(0.10, min(0.95, zct_cap_frac))
+			zct_stage_cap_gb = min(memory_per_device_gb, zct_cap_frac * total_gb)
+	if zct_stage_cap_gb is not None and zct_stage_cap_gb > 0 and rank == 0:
+		print(f"  Explicit ZCT stage cap: {zct_stage_cap_gb:.2f} GB")
+
+	r_chunk_override = params.get("r_chunk_size", 0)
+
+	return SimpleNamespace(
+		restart=restart,
+		x_only=x_only,
+		do_screened=do_screened,
+		bispinor=bispinor,
+		isdf_pair_mode=isdf_pair_mode,
+		memory_per_device_gb=memory_per_device_gb,
+		chunk_target_utilization=chunk_target_utilization,
+		zct_stage_cap_gb=zct_stage_cap_gb,
+		r_chunk_override=r_chunk_override,
+		do_G0=True,
+	)
+
+
+def run_isdf_fitting(
+	*,
+	cfg,
+	wfn,
+	sym,
+	meta,
+	centroid_indices,
+	mesh_xy,
+	tmp_dir,
+	print0,
+):
+	"""Fit ISDF interpolation vectors ζ and compute bare Coulomb V_qmunu.
+
+	Returns
+	-------
+	dict with keys: V_qmunu, v_q0_noG0_munu, G0_mu_nu, psi_l_rmu_Y, psi_r_rmu_Y
+	"""
+	from .gw_jax import fit_zeta_and_compute_V_q_chunked
+
+	print0("  Using CHUNKED ISDF fitting (memory-efficient)")
+
+	with mesh_xy:
+		chunked_result = fit_zeta_and_compute_V_q_chunked(
+			wfn, sym, meta, centroid_indices, mesh_xy,
+			output_dir=tmp_dir,
+			bispinor=cfg.bispinor,
+			memory_budget_gb=cfg.memory_per_device_gb,
+			sys_dim=meta.sys_dim,
+			r_chunk_override=cfg.r_chunk_override,
+			target_utilization=cfg.chunk_target_utilization,
+			zct_stage_cap_gb=cfg.zct_stage_cap_gb,
+			isdf_pair_mode=cfg.isdf_pair_mode,
+		)
+
+	return chunked_result
+
+
+def load_restart_tensors(tensors_filename, mesh_xy, band_slices, print0):
+	"""Load ISDF tensors and wavefunctions from restart h5 file.
+
+	Returns
+	-------
+	dict with keys: V_qmunu, v_q0_noG0_munu, G0_mu_nu, S_qmunu,
+	                psi_full_x, psi_full_y, enk_full
+	"""
+	from isdf_io import load_restart_state_from_h5
+
+	V_qmunu, S_qmunu, psi_full_x, psi_full_y, enk_full, v_q0_noG0_munu, G0_mu_nu = (
+		load_restart_state_from_h5(tensors_filename, mesh_xy, band_slices=band_slices)
+	)
+	print0("  Loaded restart tensors from h5.")
+	return dict(
+		V_qmunu=V_qmunu,
+		S_qmunu=S_qmunu,
+		v_q0_noG0_munu=v_q0_noG0_munu,
+		G0_mu_nu=G0_mu_nu,
+		psi_full_x=psi_full_x,
+		psi_full_y=psi_full_y,
+		enk_full=enk_full,
+	)
+
+
+def build_bundle_and_views(
+	*,
+	wfn,
+	sym,
+	meta,
+	band_slices,
+	mesh_xy,
+	sh,
+	psi_l_y=None,
+	psi_r_y=None,
+	psi_full_y=None,
+	psi_full_x=None,
+	enk_full=None,
+	print0=print,
+):
+	"""Build WavefunctionBundle and sigma views from either ISDF or restart arrays.
+
+	Provide (psi_l_y, psi_r_y) for the ISDF path, or (psi_full_y[, psi_full_x])
+	for the restart path. enk_full is loaded from WFN if not provided.
+	"""
+	from .wavefunction_bundle import (
+		build_wavefunction_bundle,
+		build_wavefunction_bundle_from_full,
+		build_sigma_views,
+	)
+	from common.load_wfns import get_enk_bandrange
+
+	b0, b1, b2, b3, b4 = meta.band_edges
+
+	if enk_full is None:
+		enk_full, _ = get_enk_bandrange(
+			wfn, sym, (b0, b4), (b1, b3), nspinor=meta.nspinor
+		)
+
+	if psi_full_y is not None:
+		wf_bundle = build_wavefunction_bundle_from_full(
+			psi_full_y,
+			psi_full_x=psi_full_x,
+			enk_full=enk_full,
+			slices=band_slices,
+			mesh_xy=mesh_xy,
+			sh=sh,
+			efermi=float(wfn.efermi),
+		)
+	else:
+		wf_bundle = build_wavefunction_bundle(
+			psi_l_y, psi_r_y,
+			enk_full=enk_full,
+			slices=band_slices,
+			mesh_xy=mesh_xy,
+			sh=sh,
+			efermi=float(wfn.efermi),
+		)
+
+	sigma_views = build_sigma_views(wf_bundle, mesh_xy, sh)
+	print0(
+		f"  Wavefunction bundle built (b0:b4={band_slices.nb_full} bands, "
+		"canonical X/Y storage)"
+	)
+	return wf_bundle, sigma_views
+
+
+def prepare_isdf_and_wavefunctions(
+	*,
+	cfg,
+	wfn,
+	sym,
+	meta,
+	centroid_indices,
+	band_slices,
+	mesh_xy,
+	sh,
+	tmp_dir,
+	tensors_filename,
+	print0,
+):
+	"""Run ISDF fitting or load from restart, build wavefunction bundle.
+
+	Returns
+	-------
+	SimpleNamespace with fields:
+		V_qmunu, v_q0_noG0_munu, G0_mu_nu,
+		wf_bundle, sigma_views
+	"""
+	from isdf_io import write_restart_state_to_h5, save_restart_state_per_proc
+
+	if not cfg.restart:
+		# Fit ISDF vectors and compute V_q
+		isdf_result = run_isdf_fitting(
+			cfg=cfg, wfn=wfn, sym=sym, meta=meta,
+			centroid_indices=centroid_indices,
+			mesh_xy=mesh_xy, tmp_dir=tmp_dir, print0=print0,
+		)
+
+		# Build wavefunctions from ISDF centroid projections
+		with timing.section("gw_jax.wavefunction_setup"):
+			wf_bundle, sigma_views = build_bundle_and_views(
+				wfn=wfn, sym=sym, meta=meta,
+				band_slices=band_slices, mesh_xy=mesh_xy, sh=sh,
+				psi_l_y=isdf_result['psi_l_rmu_Y'],
+				psi_r_y=isdf_result['psi_r_rmu_Y'],
+				print0=print0,
+			)
+
+		V_qmunu = isdf_result['V_qmunu']
+		v_q0_noG0_munu = isdf_result['v_q0_noG0_munu']
+		G0_mu_nu = isdf_result['G0_mu_nu']
+
+		# Persist restart artifacts
+		write_restart_state_to_h5(
+			tensors_filename, V_qmunu,
+			wf_bundle.psi_y, wf_bundle.enk, None,
+			V0_noG0_munu=v_q0_noG0_munu, G0_mu_nu=G0_mu_nu, init_W0=True,
+		)
+		save_restart_state_per_proc(
+			os.path.join(tmp_dir, "isdf_tensors"),
+			V_qmunu, None, wf_bundle.psi_y, wf_bundle.enk,
+			meta, mesh_xy, V0_noG0_munu=v_q0_noG0_munu,
+		)
+		V_qmunu.block_until_ready()
+		print0("  Chunked ISDF path complete")
+
+	else:
+		# Load from restart
+		with timing.section("gw_jax.restart_load"):
+			restart = load_restart_tensors(
+				tensors_filename, mesh_xy, band_slices, print0,
+			)
+			wf_bundle, sigma_views = build_bundle_and_views(
+				wfn=wfn, sym=sym, meta=meta,
+				band_slices=band_slices, mesh_xy=mesh_xy, sh=sh,
+				psi_full_y=restart['psi_full_y'],
+				psi_full_x=restart['psi_full_x'],
+				enk_full=restart['enk_full'],
+				print0=print0,
+			)
+
+		V_qmunu = restart['V_qmunu']
+		v_q0_noG0_munu = restart['v_q0_noG0_munu']
+		G0_mu_nu = restart['G0_mu_nu']
+
+	return SimpleNamespace(
+		V_qmunu=V_qmunu,
+		v_q0_noG0_munu=v_q0_noG0_munu,
+		G0_mu_nu=G0_mu_nu,
+		wf_bundle=wf_bundle,
+		sigma_views=sigma_views,
+	)

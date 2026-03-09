@@ -523,3 +523,99 @@ def frequency_integration_from_bundle(*args, **kwargs):
     """Scalar-ω CTSP frequency integration from canonical WavefunctionBundle."""
     from .w_isdf_dynamic import frequency_integration_from_bundle as dynamic_frequency_integration_bundle
     return dynamic_frequency_integration_bundle(*args, **kwargs)
+
+
+def compute_screening(
+    V_qmunu,
+    wf_bundle,
+    window_pairs,
+    meta,
+    mesh_xy,
+    *,
+    omega=0.0,
+    validate_static=True,
+    tensors_filename=None,
+    print0=print,
+):
+    """Compute screened Coulomb W(ω) from V and wavefunctions.
+
+    Wraps get_w_omega_jax_from_bundle and optionally validates against the
+    legacy static χ→W path at ω=0.
+
+    Parameters
+    ----------
+    V_qmunu : jax.Array
+        Bare Coulomb in ISDF basis.
+    wf_bundle : WavefunctionBundle
+        Canonical wavefunction bundle.
+    window_pairs : list
+        Energy windows for CTSP quadrature.
+    meta : Meta
+        System metadata.
+    mesh_xy : Mesh
+        Device mesh.
+    omega : float
+        Evaluation frequency in Ry (0.0 for static COHSEX).
+    validate_static : bool
+        If True and omega==0, compare dynamic and static paths.
+    tensors_filename : str or None
+        If not None and file exists, save W0_qmunu to it.
+    print0 : callable
+        Rank-0 print function.
+
+    Returns
+    -------
+    W_q : jax.Array
+        Screened Coulomb interaction.
+    """
+    import time
+    import os
+    import jax.numpy as jnp
+
+    ryd2ev = 13.605693122994
+    omega_ev = omega * ryd2ev
+    print0("")
+    if abs(omega) <= 1e-14:
+        print0(f"  Dynamic screening path enabled at ω = 0.0000 eV ({omega:.6f} Ry)")
+    else:
+        print0(f"  [DEBUG] Dynamic screening at ω = {omega_ev:.4f} eV ({omega:.6f} Ry)")
+
+    t_dyn0 = time.perf_counter()
+    W_q, chi_omega = get_w_omega_jax_from_bundle(
+        V_qmunu, wf_bundle, window_pairs, omega, meta, mesh_xy,
+    )
+    W_q.block_until_ready()
+    chi_omega.block_until_ready()
+    t_dyn = time.perf_counter() - t_dyn0
+    chi_max = float(jnp.max(jnp.abs(chi_omega)))
+    print0(f"  |χ(ω)|_max = {chi_max:.6e}")
+
+    # Validate dynamic path against legacy static path at ω=0
+    if validate_static and abs(omega) <= 1e-14:
+        t_static0 = time.perf_counter()
+        chi0_static = get_chi0_jax_from_bundle(wf_bundle, window_pairs, meta, mesh_xy)
+        W_q_static = get_static_w_q_jax(V_qmunu, chi0_static, meta, mesh_xy)
+        chi0_static.block_until_ready()
+        W_q_static.block_until_ready()
+        t_static = time.perf_counter() - t_static0
+
+        chi_err_abs = float(jnp.max(jnp.abs(chi_omega - chi0_static)))
+        chi_ref = max(float(jnp.max(jnp.abs(chi0_static))), 1e-16)
+        chi_err_rel = chi_err_abs / chi_ref
+        W_err_abs = float(jnp.max(jnp.abs(W_q - W_q_static)))
+        W_ref = max(float(jnp.max(jnp.abs(W_q_static))), 1e-16)
+        W_err_rel = W_err_abs / W_ref
+
+        print0("  χ/W path comparison at ω=0 (dynamic vs static):")
+        print0(f"    dynamic time: {t_dyn:9.3f} s")
+        print0(f"    static time:  {t_static:9.3f} s")
+        print0(f"    χ max abs diff: {chi_err_abs:.6e}, rel diff: {chi_err_rel:.6e}")
+        print0(f"    W max abs diff: {W_err_abs:.6e}, rel diff: {W_err_rel:.6e}")
+
+    if tensors_filename is not None and os.path.exists(tensors_filename):
+        from isdf_io import write_w0_qmunu_to_h5
+        W0_qmunu = W_q[..., 0, :, 0, :]
+        W0_qmunu = W0_qmunu[None, None, None, :, :, :, :, :]
+        write_w0_qmunu_to_h5(tensors_filename, W0_qmunu)
+
+    return W_q

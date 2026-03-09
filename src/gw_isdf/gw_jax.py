@@ -70,9 +70,7 @@ except RuntimeError as exc:
 		raise
 from isdf_io import (
     WFNReader, EPSReader,
-    write_sigma_to_file,
-    write_restart_state_to_h5, write_w0_qmunu_to_h5,
-    load_restart_state_from_h5, save_restart_state_per_proc,
+    write_sigma_to_file, write_eqp1,
     write_qp_rotations_h5, load_kin_ion_submatrix,
     load_centroids, resolve_input_paths,
 )
@@ -82,16 +80,22 @@ from common.load_wfns import (
     fit_zeta_chunked_to_h5,
 )
 from .compute_vcoul import compute_all_V_q_from_zeta_h5
-from .gw_init import compute_optimal_chunks
+from .gw_init import (
+	compute_optimal_chunks,
+	get_effective_chunk_size,
+	read_cohsex_input,
+	resolve_runtime_config,
+	prepare_isdf_and_wavefunctions,
+)
 from .get_windows import get_window_info
 from .w_isdf import (
 	get_chi0_jax_from_bundle,
 	get_static_w_q_jax,
 	get_w_omega_jax_from_bundle,
+	compute_screening,
 )
 from .vcoul import compute_q0_averages
 from common.chi_from_dipole import read_dipole_h5, compute_S_omega
-from .gw_init import get_effective_chunk_size, read_cohsex_input
 from .wavefunction_bundle import (
 	BandSlices,
 	build_wavefunction_bundle,
@@ -175,41 +179,35 @@ def determine_wcoul0(params, input_dir, wfn, sym, meta, print_fn, omega: float =
 		if not os.path.exists(dipole_path):
 			print_fn(f"dipole.h5 not found at {dipole_path}; cannot build S(omega) wcoul0")
 			return None
-		try:
-			dipole_cart, deltaE = read_dipole_h5(dipole_path)
-			nk_tot = int(sym.nk_tot)
-			nb = int(dipole_cart.shape[2])
-			nelec = int(wfn.nelec)
-			occ = np.zeros((nk_tot, nb), dtype=float)
-			occ[:, :max(0, min(nelec, nb))] = 1.0
-			f_nk = jnp.asarray(occ, dtype=jnp.float64)
-			omega_grid = jnp.asarray([omega_val], dtype=jnp.float64)
-			S_cart_omega = compute_S_omega(
-				dipole_cart,
-				deltaE,
-				f_nk,
-				float(wfn.cell_volume),
-				int(sym.nk_tot),
-				int(wfn.nspin),
-				int(wfn.nspinor),
-				omega_grid,
-				eta=eta,
-			)[0]
-			vc0_mean, wcoul0 = compute_q0_averages(
-				wfn,
-				jnp.asarray(0.0, dtype=jnp.float64),
-				meta,
-				S_cart=S_cart_omega,
-			)
-			# Source printed in finite-size corrections section
-			label = "s_tensor" if abs(omega_val) <= 1e-14 else f"s_tensor(omega={omega_val:.6f} Ry)"
-			return vc0_mean, wcoul0, label
-		except Exception as exc:  # pragma: no cover - diagnostic path
-			if abs(omega_val) <= 1e-14:
-				print_fn(f"S(0) wcoul0 failed: {exc}")
-			else:
-				print_fn(f"S(omega={omega_val:.6f} Ry) wcoul0 failed: {exc}")
-			return None
+		dipole_cart, deltaE = read_dipole_h5(dipole_path)
+		nk_tot = int(sym.nk_tot)
+		nb = int(dipole_cart.shape[2])
+		nelec = int(wfn.nelec)
+		occ = np.zeros((nk_tot, nb), dtype=float)
+		occ[:, :max(0, min(nelec, nb))] = 1.0
+		f_nk = jnp.asarray(occ, dtype=jnp.float64)
+		omega_grid = jnp.asarray([omega_val], dtype=jnp.float64)
+		S_cart_omega = compute_S_omega(
+			dipole_cart,
+			deltaE,
+			f_nk,
+			float(wfn.cell_volume),
+			int(sym.nk_tot),
+			int(wfn.nspin),
+			int(wfn.nspinor),
+			omega_grid,
+			eta=eta,
+		)[0]
+		vc0_mean, wcoul0 = compute_q0_averages(
+			wfn,
+			jnp.asarray(0.0, dtype=jnp.float64),
+			meta,
+			S_cart=S_cart_omega,
+		)
+		# Source printed in finite-size corrections section
+		label = "s_tensor" if abs(omega_val) <= 1e-14 else f"s_tensor(omega={omega_val:.6f} Ry)"
+		return vc0_mean, wcoul0, label
+
 
 	source_order = [want_source] + [s for s in ("epshead", "s_tensor") if s != want_source]
 	for source in source_order:
@@ -217,12 +215,6 @@ def determine_wcoul0(params, input_dir, wfn, sym, meta, print_fn, omega: float =
 		if result is not None:
 			return result
 	raise RuntimeError("Failed to determine wcoul0: neither eps0mat.h5 epshead nor dipole.h5 S(omega) available")
-
-
-# The current implementation focuses on the static COHSEX limit.  Many of the
-# routines below (e.g. chi0 and sigma construction) are written in a style that
-# follows the complex time shredded propagator (CTSP) formulation so that we can
-# later restore full frequency dependence and iterate towards self-consistency.
 
 
 def fit_zeta_and_compute_V_q_chunked(
@@ -574,7 +566,6 @@ def get_sigma_static_kij_jax(psi_sigX, psi_sigTY, sigma_k_munu):
 	left = jnp.einsum('kmsx,ksxty->kmty', jnp.conj(psi_sigX), sigma_k, optimize=True)
 	return jnp.einsum('kmty,ktyn->kmn', left, psi_sigTY, optimize=True)
 
-
 # ================= Hartree helper functions =================
 
 def build_density_from_Gij(psi_rmu, Gij, nk_tot):
@@ -607,7 +598,6 @@ def build_density_from_Gij(psi_rmu, Gij, nk_tot):
 	rho_mu = jnp.real(rho_mu) / jnp.asarray(nk_tot, dtype=jnp.float64)
 	return rho_mu
 
-
 def build_hartree_potential(rho_mu, V0_munu):
 	"""Build Hartree potential at centroids from density.
 	
@@ -621,7 +611,6 @@ def build_hartree_potential(rho_mu, V0_munu):
 		Vrho_mu: (n_rmu,) Hartree potential at centroids
 	"""
 	return jnp.einsum('xy,y->x', V0_munu, rho_mu, optimize=True)
-
 
 def project_potential_to_bands(psi_rmu, Vrho_mu):
 	"""Project local potential to band matrix elements.
@@ -760,7 +749,29 @@ def summarize_hermitian_matrix(name: str, mats: np.ndarray, print_fn=print, warn
 	if name.lower().startswith("hartree") and diag_min < -warn_threshold:
 		print_fn(f"[{name}] warning: min diagonal {diag_min:.4f} < 0.0 (negativity may signal improper G=0 handling)")
 
-def main(argv=None):	
+def print_scf_diagnostics(Gij_final, U_full, nelec, nb_sigma, print_fn=print):
+	"""Print diagnostic checks for SC-COHSEX convergence (Gij, U unitarity)."""
+	Gij_trace = jnp.real(jnp.trace(Gij_final[0]))
+	Gij_diag = jnp.real(jnp.diagonal(Gij_final[0]))
+	print_fn(f"[Diagnostic] Gij_final trace at k=0: {float(Gij_trace):.4f} (should be {nelec})")
+	print_fn(f"[Diagnostic] Gij_final diag[:5] at k=0: {np.array(Gij_diag[:5])}")
+	print_fn(f"[Diagnostic] Gij_final diag sum at k=0: {float(jnp.sum(Gij_diag)):.4f}")
+
+	UdagU = jnp.einsum('kim,kin->kmn', jnp.conj(U_full[0:1]), U_full[0:1])
+	unitarity_err = jnp.max(jnp.abs(UdagU[0] - jnp.eye(nb_sigma)))
+	print_fn(f"[Diagnostic] U unitarity error at k=0: {float(unitarity_err):.2e} (should be ~0)")
+
+	U_diag = jnp.abs(jnp.diagonal(U_full[0]))
+	print_fn(f"[Diagnostic] |U| diagonal[:5] at k=0: {np.array(U_diag[:5])} (should be ~1 if no mixing)")
+	print_fn(f"[Diagnostic] |U| diagonal[25:30] at k=0: {np.array(U_diag[25:30])} (valence-cond boundary)")
+
+	U_col0_abs = jnp.abs(U_full[0, :, 0])
+	top_contrib = jnp.argsort(U_col0_abs)[::-1][:5]
+	print_fn(f"[Diagnostic] Lowest QP state: top DFT contributors = {np.array(top_contrib)}")
+	print_fn(f"[Diagnostic] Lowest QP state: their |U| values = {np.array(U_col0_abs[top_contrib])}")
+
+
+def main(argv=None):
 	global sym
 	argp = argparse.ArgumentParser(description="COHSEX self-energy driver")
 	argp.add_argument(
@@ -832,96 +843,14 @@ def main(argv=None):
 	_print0("")
 
 	# windows for polarizability and sigma
-	# Get window information
 	epsq = 0.01
-	#window_pairs = get_window_info(epsq, wfn)
 
-	# ============================================================================
-	# MAIN CONTROL FLAGS (from input file):
-	# ============================================================================
-	# restart:     If True, load ISDF vectors and V_qmunu from isdf_tensors_*.h5
-	#              instead of recomputing. Saves ~30 min for large systems.
-	# x_only:      If True, use bare Coulomb V for exchange (no screening).
-	#              Mutually exclusive with do_screened=True.
-	# do_screened: If True, build screened Coulomb W = (1-Vχ)⁻¹V and use for Σ_x.
-	#              If False, Σ_x uses bare V. Default=True for full GW/COHSEX.
-	# bispinor:    If True, use 2-component spinor wavefunctions (for SOC).
-	#              If False, scalar or collinear spin. Default=False.
-	# ============================================================================
-	restart = params["restart"]       # True: load from h5, False: rebuild ISDF
-	x_only = params["x_only"]         # True: bare exchange only, no screening
-	do_screened = params["do_screened"]  # True: use W, False: use V
+	# Resolve runtime configuration (memory budget, chunking, control flags)
+	cfg = resolve_runtime_config(params, rank=jax.process_index())
 	global bispinor
-	bispinor = params["bispinor"]     # True: 2-component spinors (SOC)
-	isdf_pair_mode = str(params.get("isdf_pair_mode", "spin_traced")).strip().lower()
-	if isdf_pair_mode not in ("spin_traced", "spin_matrix_frobenius"):
-		raise ValueError(
-			f"isdf_pair_mode={isdf_pair_mode!r} is invalid. "
-			"Use 'spin_traced' or 'spin_matrix_frobenius'."
-		)
-	
-	# ============================================================================
-	# INTERNAL FEATURE TOGGLES (not exposed in input file):
-	# ============================================================================
-	# do_G0: If True, apply head corrections for q→0, G=0 divergence.
-	#        This adds the cell-averaged 8π/q² to V_μν and W_μν via outer product
-	#        of ζ(G=0) vectors. Essential for correct Hartree and long-range physics.
-	# ============================================================================
-	do_G0 = True   # Always True: head corrections are essential
-	use_chunked_isdf = True  # Legacy toggle removed; chunked ISDF is the only supported path.
-	
-	# Memory budget for chunked ISDF (0 = auto-detect)
-	memory_per_device_gb = params.get("memory_per_device_gb", 0.0)
-	memory_budget_auto = memory_per_device_gb <= 0
-	mem_info_detect = None
-	from common.gpu_utils import get_device_memory_info
-	if memory_budget_auto:
-		from common.gpu_utils import get_device_memory_gb
-		memory_per_device_gb = get_device_memory_gb()
-		mem_info_detect = get_device_memory_info()
-		if jax.process_index() == 0:
-			print(f"  Auto-detected memory budget: {memory_per_device_gb:.2f} GB/device")
-
-	# Chunking target utilization: leave a small fixed guard band by default.
-	try:
-		chunk_target_utilization = float(os.environ.get("ISDF_CHUNK_TARGET_UTILIZATION", "0.97"))
-	except Exception:
-		chunk_target_utilization = 0.97
-	chunk_target_utilization = max(0.85, min(1.0, chunk_target_utilization))
-	if jax.process_index() == 0:
-		print(f"  Chunk target utilization: {chunk_target_utilization:.2f}")
-		if restart:
-			print(f"  ISDF pair mode: {isdf_pair_mode} (ignored when restart=true)")
-		else:
-			print(f"  ISDF pair mode: {isdf_pair_mode}")
-
-	# Optional ZCT cap (manual override only; no default empirical fraction).
-	zct_stage_cap_gb = None
-	zct_cap_gb_env = os.environ.get("ISDF_ZCT_STAGE_CAP_GB")
-	zct_cap_frac_env = os.environ.get("ISDF_ZCT_STAGE_CAP_FRAC")
-	if zct_cap_gb_env:
-		try:
-			zct_stage_cap_gb = min(memory_per_device_gb, max(0.0, float(zct_cap_gb_env)))
-		except Exception:
-			zct_stage_cap_gb = None
-	if zct_stage_cap_gb is None and zct_cap_frac_env and jax.default_backend() in ("gpu", "cuda"):
-		mem_info_detect = mem_info_detect or get_device_memory_info()
-		total_gb = float((mem_info_detect or {}).get("total_gb", 0.0))
-		if total_gb > 0:
-			try:
-				zct_cap_frac = float(zct_cap_frac_env)
-			except Exception:
-				zct_cap_frac = 0.0
-			zct_cap_frac = max(0.10, min(0.95, zct_cap_frac))
-			zct_stage_cap_gb = min(memory_per_device_gb, zct_cap_frac * total_gb)
-	if zct_stage_cap_gb is not None and zct_stage_cap_gb > 0 and jax.process_index() == 0:
-		print(f"  Explicit ZCT stage cap: {zct_stage_cap_gb:.2f} GB")
-	
-	# Explicit r_chunk override (0 = auto-compute from memory budget)
-	r_chunk_override = params.get("r_chunk_size", 0)
-	
-	if x_only and do_screened:  # x_only=bare exchange only, do_screened=use W instead of v
-		raise ValueError("x_only and do_screened cannot both be True")
+	bispinor = cfg.bispinor
+	do_screened = cfg.do_screened
+	do_G0 = cfg.do_G0
 
 	meta = Meta.from_system(wfn, sym, nval, ncond, nband, _n_rmu, bispinor)
 	meta.rank = jax.process_index()
@@ -929,259 +858,58 @@ def main(argv=None):
 	meta.sys_dim = sys_dim
 	meta.bispinor = bispinor
 	meta.chunk_size = get_effective_chunk_size(params["chunk_size"])
-	# ============================================================================
-	# BAND EDGE DEFINITIONS (0-indexed):
-	# ============================================================================
-	#   b0 = 0                      : first band (absolute minimum)
-	#   b1 = nelec - nval           : first "active" valence band (lowest in sigma window)
-	#   b2 = nelec                  : VBM+1 = CBM = first conduction band
-	#   b3 = nelec + ncond          : last "active" conduction band + 1 (end of sigma window)
-	#   b4 = nband                  : highest band read (for chi0 sums, etc.)
-	#
-	# EXAMPLE: For nelec=26, nval=26, ncond=14, nband=80:
-	#   b0=0, b1=0, b2=26, b3=40, b4=80
-	#   Valence bands: 0..25 (indices b1..b2-1, all 26 included if nval=nelec)
-	#   Sigma window:  0..39 (indices b1..b3-1, includes nval + ncond = 40 bands)
-	#   Conduction:    26..39 (indices b2..b3-1)
-	#
-	# BAND RANGES (tuples for slicing):
-	#   valence = (b1, b2)           : active valence for sigma (may exclude deep core)
-	#   conduction = (b2, b3)        : active conduction for sigma
-	#   sigma = (b1, b3)             : full sigma window (valence + conduction)
-	#   occupied = (b0, b2)          : ALL occupied bands (for density, including core)
-	#   val_plus_sigma = (b0, b3)    : bands 0..b3-1 (for left wfns in ISDF)
-	#   cond_plus_sigma = (b1, b4)   : bands b1..b4-1 (for right wfns if screened)
-	# ============================================================================
+
 	b0, b1, b2, b3, b4 = meta.band_edges
 	band_slices = BandSlices.from_band_edges(b0, b1, b2, b3, b4)
-	# rank-aware print helper
+
 	def print0(*a, **k):
 		if meta.rank == 0:
 			print(*a, **k)
-	# Shardings from the pre-constructed mesh
+
 	sh = make_shardings(mesh_xy)
-	
+
 	chunk_str = "disabled" if meta.chunk_size is None else str(meta.chunk_size)
 	print0(f"  Band chunk size: {chunk_str}")
 
-	def build_bundle_from_restart_full_arrays(
-		psi_full_y_in: jax.Array,
-		psi_full_x_in: jax.Array | None,
-		enk_full_in: jax.Array | None,
-	):
-		"""Build canonical WavefunctionBundle from full-band restart tensors."""
-		enk_full = enk_full_in
-		if enk_full is None:
-			enk_full, _ = get_enk_bandrange(
-				wfn, sym, (b0, b4), (b1, b3), nspinor=meta.nspinor
-			)
-		return build_wavefunction_bundle_from_full(
-			psi_full_y_in,
-			psi_full_x=psi_full_x_in,
-			enk_full=enk_full,
-			slices=band_slices,
-			mesh_xy=mesh_xy,
-			sh=sh,
-			efermi=float(wfn.efermi),
-		)
-
-	def build_sigma_views_from_bundle(wf_bundle):
-		"""Prepare sigma-kernel wavefunction views directly from canonical bundle."""
-		s = wf_bundle.slices
-		with mesh_xy:
-			psi_l = jax.lax.with_sharding_constraint(wf_bundle.y(s.l_slice), sh.Y_shard)
-			psi_lT = jax.lax.with_sharding_constraint(wf_bundle.x(s.l_slice), sh.XT_shard)
-			psi_coh = jax.lax.with_sharding_constraint(wf_bundle.y(s.coh_slice), sh.Y_shard)
-			psi_cohT = jax.lax.with_sharding_constraint(wf_bundle.x(s.coh_slice), sh.XT_shard)
-			psi_proj = jax.lax.with_sharding_constraint(
-				wf_bundle.x(s.l_slice).transpose(0, 3, 1, 2), sh.X_shard
-			)
-			psi_projT = jax.lax.with_sharding_constraint(
-				wf_bundle.y(s.l_slice).transpose(0, 2, 3, 1), sh.YT_shard
-			)
-		return SimpleNamespace(
-			psi_l=psi_l,
-			psi_lT=psi_lT,
-			psi_coh=psi_coh,
-			psi_cohT=psi_cohT,
-			psi_proj=psi_proj,
-			psi_projT=psi_projT,
-		)
-
-	wf_bundle = None
-	sigma_views = None
-
-	# Initialize timing system
+	# ISDF fitting or restart loading
 	timing.reset()
-	if not restart:
-		# ============================================================================
-		# BAND RANGE DEFINITIONS
-		# ============================================================================
-			
-		# ============================================================================
-		# CHUNKED ISDF PATH (memory-efficient; selectable pair-density mode)
-		# ============================================================================
-		if use_chunked_isdf:
-			print0("  Using CHUNKED ISDF fitting (memory-efficient)")
-			
-			# Fit zeta and compute V_q using chunked approach
-			with mesh_xy:
-				chunked_result = fit_zeta_and_compute_V_q_chunked(
-					wfn, sym, meta, centroid_indices, mesh_xy,
-					output_dir=tmp_dir,
-					bispinor=bispinor,
-					memory_budget_gb=memory_per_device_gb,
-					sys_dim=sys_dim,
-					r_chunk_override=r_chunk_override,
-					target_utilization=chunk_target_utilization,
-					zct_stage_cap_gb=zct_stage_cap_gb,
-					isdf_pair_mode=isdf_pair_mode,
-				)
-			
-			# Extract results
-			V_qmunu = chunked_result['V_qmunu']
-			v_q0_noG0_munu = chunked_result['v_q0_noG0_munu']
-			G0_mu_nu = chunked_result['G0_mu_nu']
-			psi_l_rmu_Y = chunked_result['psi_l_rmu_Y']
-			psi_r_rmu_Y = chunked_result['psi_r_rmu_Y']
-			
-			with timing.section("gw_jax.wavefunction_setup"):
-				enk_full, _ = get_enk_bandrange(
-					wfn, sym, (b0, b4), (b1, b3), nspinor=meta.nspinor
-				)
-				wf_bundle = build_wavefunction_bundle(
-					psi_l_rmu_Y,
-					psi_r_rmu_Y,
-					enk_full=enk_full,
-					slices=band_slices,
-					mesh_xy=mesh_xy,
-					sh=sh,
-					efermi=float(wfn.efermi),
-				)
-				print0(
-					f"  Wavefunction bundle built (b0:b4={band_slices.nb_full} bands, "
-					"canonical X/Y storage)"
-				)
-				
-				# S_qmunu is not currently computed in the chunked zeta pipeline.
-				S_qmunu = None
-				sigma_views = build_sigma_views_from_bundle(wf_bundle)
-			
-			# V_mu_nu is V_qmunu without q indices (for screened interaction calculation)
-			# Extract and transpose to match expected shape: (n_rmu, n_rmu, nkx, nky, nkz)
-			V_mu_nu_raw = jnp.asarray(V_qmunu)[0, 0, 0]  # (nkx, nky, nkz, n_rmu, n_rmu)
-			V_mu_nu = V_mu_nu_raw.transpose(3, 4, 0, 1, 2)  # → (n_rmu, n_rmu, nkx, nky, nkz)
-			with mesh_xy:
-				V_mu_nu = jax.lax.with_sharding_constraint(V_mu_nu, sh.V_shard)
-			
-			# Persist restart artifacts
-			write_restart_state_to_h5(
-				tensors_filename,
-				V_qmunu,
-				wf_bundle.psi_y,
-				wf_bundle.enk,
-				S_qmunu,
-				V0_noG0_munu=v_q0_noG0_munu,
-				G0_mu_nu=G0_mu_nu,
-				init_W0=True,
-			)
-			save_restart_state_per_proc(
-				os.path.join(tmp_dir, "isdf_tensors"),
-				V_qmunu,
-				S_qmunu,
-				wf_bundle.psi_y,
-				wf_bundle.enk,
-				meta,
-				mesh_xy,
-				V0_noG0_munu=v_q0_noG0_munu,
-			)
-			V_qmunu.block_until_ready()
-			print0("  Chunked ISDF path complete")
-		
-	elif restart and not x_only:
-		with timing.section("gw_jax.restart_load"):
-			V_qmunu, S_qmunu, psi_full_x_restart, psi_full_y_restart, enk_full_restart, v_q0_noG0_munu, G0_mu_nu = load_restart_state_from_h5(
-				tensors_filename, mesh_xy, band_slices=band_slices
-			)
-			V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0]
-			wf_bundle = build_bundle_from_restart_full_arrays(
-				psi_full_y_restart, psi_full_x_restart, enk_full_restart
-			)
-			sigma_views = build_sigma_views_from_bundle(wf_bundle)
-			print0("  Restart wavefunction bundle reconstructed from canonical psi_full_y.")
-	elif restart and x_only:
-		with timing.section("gw_jax.restart_load_x_only"):
-			V_qmunu, S_qmunu, psi_full_x_restart, psi_full_y_restart, enk_full_restart, v_q0_noG0_munu, G0_mu_nu = load_restart_state_from_h5(
-				tensors_filename, mesh_xy, band_slices=band_slices
-			)
-			V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0]
-			wf_bundle = build_bundle_from_restart_full_arrays(
-				psi_full_y_restart, psi_full_x_restart, enk_full_restart
-			)
-			sigma_views = build_sigma_views_from_bundle(wf_bundle)
-			print0("  Restart wavefunction bundle reconstructed from canonical psi_full_y.")
+	isdf = prepare_isdf_and_wavefunctions(
+		cfg=cfg,
+		wfn=wfn,
+		sym=sym,
+		meta=meta,
+		centroid_indices=centroid_indices,
+		band_slices=band_slices,
+		mesh_xy=mesh_xy,
+		sh=sh,
+		tmp_dir=tmp_dir,
+		tensors_filename=tensors_filename,
+		print0=print0,
+	)
+	V_qmunu = isdf.V_qmunu
+	v_q0_noG0_munu = isdf.v_q0_noG0_munu
+	G0_mu_nu = isdf.G0_mu_nu
+	wf_bundle = isdf.wf_bundle
+	sigma_views = isdf.sigma_views
 
-	# Optionally compute chi0 via JAX for screened interaction if requested
+	# Compute screened Coulomb W = (1 - Vχ)⁻¹ V
 	if do_screened:
 		with timing.section("gw_jax.chi0_W"):
 			with jax_profile.trace_section("chi0_W"):
-				if wf_bundle is None:
-					raise RuntimeError("WavefunctionBundle is not initialized before chi0 evaluation")
-				
-				# Compute optimal energy windows for CTSP quadrature
 				window_pairs = get_window_info(epsq, wfn, nband_max=nband)
-			
-				debug_omega = params.get("debug_omega", None)
-				omega_eval = float(debug_omega) if debug_omega is not None else 0.0
-				ryd2ev = 13.605693122994
-				omega_ev = omega_eval * ryd2ev
-				print0("")
-				if debug_omega is None:
-					print0(f"  Dynamic screening path enabled at ω = 0.0000 eV ({omega_eval:.6f} Ry)")
-				else:
-					print0(f"  [DEBUG] Dynamic screening at ω = {omega_ev:.4f} eV ({omega_eval:.6f} Ry)")
-
-				t_dyn0 = time.perf_counter()
-				W_q, chi_omega = get_w_omega_jax_from_bundle(
-					V_qmunu,
-					wf_bundle,
-					window_pairs,
-					omega_eval,
-					meta,
-					mesh_xy,
+				omega_eval = float(params.get("debug_omega") or 0.0)
+				W_q = compute_screening(
+					V_qmunu, wf_bundle, window_pairs, meta, mesh_xy,
+					omega=omega_eval,
+					tensors_filename=tensors_filename,
+					print0=print0,
 				)
-				W_q.block_until_ready()
-				chi_omega.block_until_ready()
-				t_dyn = time.perf_counter() - t_dyn0
-				chi_max = float(jnp.max(jnp.abs(chi_omega)))
-				print0(f"  |χ(ω)|_max = {chi_max:.6e}")
 
-				# For ω=0 runs, evaluate the legacy static χ→W path for direct comparison.
-				if abs(omega_eval) <= 1e-14:
-					t_static0 = time.perf_counter()
-					chi0_static = get_chi0_jax_from_bundle(wf_bundle, window_pairs, meta, mesh_xy)
-					W_q_static = get_static_w_q_jax(V_qmunu, chi0_static, meta, mesh_xy)
-					chi0_static.block_until_ready()
-					W_q_static.block_until_ready()
-					t_static = time.perf_counter() - t_static0
-
-					chi_err_abs = float(jnp.max(jnp.abs(chi_omega - chi0_static)))
-					chi_ref = max(float(jnp.max(jnp.abs(chi0_static))), 1e-16)
-					chi_err_rel = chi_err_abs / chi_ref
-					W_err_abs = float(jnp.max(jnp.abs(W_q - W_q_static)))
-					W_ref = max(float(jnp.max(jnp.abs(W_q_static))), 1e-16)
-					W_err_rel = W_err_abs / W_ref
-
-					print0("  χ/W path comparison at ω=0 (dynamic vs static):")
-					print0(f"    dynamic time: {t_dyn:9.3f} s")
-					print0(f"    static time:  {t_static:9.3f} s")
-					print0(f"    χ max abs diff: {chi_err_abs:.6e}, rel diff: {chi_err_rel:.6e}")
-					print0(f"    W max abs diff: {W_err_abs:.6e}, rel diff: {W_err_rel:.6e}")
-
-				if os.path.exists(tensors_filename):
-					W0_qmunu = W_q[..., 0, :, 0, :]
-					W0_qmunu = W0_qmunu[None, None, None, :, :, :, :, :]
-					write_w0_qmunu_to_h5(tensors_filename, W0_qmunu)
+	# Extract V_μν BEFORE head injection: the bare Coulomb used for COH = W - V
+	# must NOT include the G=0 head, matching the DFT convention V_H(G=0) = 0.
+	V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0].transpose(3, 4, 0, 1, 2)
+	with mesh_xy:
+		V_mu_nu = jax.lax.with_sharding_constraint(V_mu_nu, sh.V_shard)
 
 	# ============================================================================
 	# HEAD INJECTION: Add the q→0, G=0 Coulomb divergence correction
@@ -1256,69 +984,25 @@ def main(argv=None):
 			if do_screened:
 				W_q = W_q.at[0, 0, 0, 0, :, 0, :].add((wcoul0 * vol_scale) * outer_u)
 
-	# ============================================================================
-	# EXTRACT BARE V AND SCREENED W INTERACTIONS
-	# ============================================================================
-	# V_qmunu: bare Coulomb, shape [nfreq, npol1, npol2, nkx, nky, nkz, nrmu1, nrmu2]
-	# W_q:     screened Coulomb, shape [nkx, nky, nkz, nfreq, nrmu, npol, nrmu]
-	# We extract the static (freq=0) component and reshape to (nrmu1, nrmu2, nkx, nky, nkz)
-	# ============================================================================
-	# Skip V_mu_nu extraction if already set by chunked path (check shape)
-	need_extract_V = False
-	try:
-		_ = V_mu_nu.shape  # Check if V_mu_nu exists
-		if V_mu_nu.shape != (meta.n_rmu, meta.n_rmu, meta.nkx, meta.nky, meta.nkz):
-			need_extract_V = True
-	except NameError:
-		need_extract_V = True
-	
-	if need_extract_V:
-		V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0]  # (nkx,nky,nkz,nrmu1,nrmu2) from bare V
-		V_mu_nu = V_mu_nu.transpose(3, 4, 0, 1, 2)  # → (nrmu1,nrmu2,nkx,nky,nkz)
-	
-	# Apply sharding to V_mu_nu and W_mu_nu
-	if sh is None and mesh_xy is not None:
-		sh = make_shardings(mesh_xy)
-	
-	with mesh_xy:
-		V_mu_nu = jax.lax.with_sharding_constraint(V_mu_nu, sh.V_shard)
-	
-	if do_screened:  # do_screened=True: use W for exchange
-		W_mu_nu = W_q[:,:,:,0,:,0,:]  # (nkx,nky,nkz,nrmu1,nrmu2) from screened W
-		W_mu_nu = W_mu_nu.transpose(3, 4, 0, 1, 2)  # → (nrmu1,nrmu2,nkx,nky,nkz)
+	# Extract W_μν (includes head) in (n_rmu, n_rmu, nkx, nky, nkz) layout.
+	if do_screened:
+		W_mu_nu = W_q[:,:,:,0,:,0,:].transpose(3, 4, 0, 1, 2)
 		with mesh_xy:
 			W_mu_nu = jax.lax.with_sharding_constraint(W_mu_nu, sh.V_shard)
 	else:
-		W_mu_nu = V_mu_nu  # For bare exchange, W = V (already sharded)
+		W_mu_nu = V_mu_nu
 
-	# All b0:b4 bands are passed to the pipeline for the COH resolution of identity.
-	# The sigma-window projection to nb_sigma is handled inside the pipeline.
-
-	if sh is None and mesh_xy is not None:
-		sh = make_shardings(mesh_xy)
-
-	# Create Gij_static: (nk, nb_sigma, nb_sigma) with diagonal 0:nelec set to 1.0
-	# This is the static COHSEX Green's function (projector onto occupied states)
-	# Sized for psi_l which has bands (b0, b3) = sigma window
-	nb_sigma = int(b3 - b0)    # Sigma window size (for SX Green's function + projection)
+	# Static COHSEX Green's function: G_ij = δ_{ij} f_i (projector onto occupied)
+	nb_sigma = int(b3 - b0)
 	nk = meta.nk_tot
-	
-	# Gij_static sized for psi_l (sigma window), NOT psi_coh (all bands)
-	Gij_static = jnp.zeros((nk, nb_sigma, nb_sigma), dtype=jnp.complex128)
 	nelec = int(wfn.nelec)
-	# Set diagonal elements for occupied bands to 1.0
+	Gij_static = jnp.zeros((nk, nb_sigma, nb_sigma), dtype=jnp.complex128)
 	occ_diag = jnp.arange(min(nelec, nb_sigma))
 	Gij_static = Gij_static.at[:, occ_diag, occ_diag].set(1.0 + 0.0j)
-	# Replicate Gij_static across all devices
 	Gij_shard = NamedSharding(mesh_xy, P(None, None, None))
 	Gij_static = jax.device_put(Gij_static, Gij_shard)
 
-	# Jitted pipeline with explicit shardings along rmu/rnu XY
-	# New signature: psi_l (SX), psi_coh (COH), psi_proj (projection), W, V, V0, Gij
-	# psi_l: (b0, b3) sigma window for SX Green's function + Hartree density
-	# psi_coh: (b0, b4) all bands for COH resolution of identity
-	# psi_proj: same as psi_l for final projection
-	# Returns: (sigma_sx_kij, sigma_coh_kij, hartree_kmn)
+	# JIT-compile and run the Σ_SX + Σ_COH + V_H pipeline
 	pipeline_jit = jax.jit(
 		compute_sigma_pipeline_jax,
 		static_argnames=('nkx', 'nky', 'nkz', 'nk_tot', 'nspinor', 'fft_vol_au', 'bispinor'),
@@ -1331,25 +1015,18 @@ def main(argv=None):
 		),
 		out_shardings=(sh.out_shard, sh.out_shard, sh.out_shard),
 	)
-	if sigma_views is None:
-		raise RuntimeError("Sigma bundle views are not initialized before sigma pipeline")
+
+	fft_vol_au = float(wfn.cell_volume / np.prod(wfn.fft_grid))
 
 	with mesh_xy:
 		with timing.section("gw_jax.pipeline"):
 			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = pipeline_jit(
-				sigma_views.psi_lT,    # psi_l for SX (sigma window, b0..b3)
-				sigma_views.psi_l,
-				sigma_views.psi_cohT,  # psi_coh for COH (all bands, b0..b4)
-				sigma_views.psi_coh,
-				sigma_views.psi_proj,   # psi_proj for projection (X-sharded)
-				sigma_views.psi_projT,  # psi_proj transposed (Y-sharded)
-				W_mu_nu,   # (rmu1, rmu2, nkx, nky, nkz) screened Coulomb
-				V_mu_nu,   # (rmu1, rmu2, nkx, nky, nkz) bare Coulomb
-				v_q0_noG0_munu, # (rmu1, rmu2) sharded over (x,y)
-				Gij_static, # (nk, nb_sigma, nb_sigma) replicated
+				sigma_views.psi_lT, sigma_views.psi_l,
+				sigma_views.psi_cohT, sigma_views.psi_coh,
+				sigma_views.psi_proj, sigma_views.psi_projT,
+				W_mu_nu, V_mu_nu, v_q0_noG0_munu, Gij_static,
 				meta.nkx, meta.nky, meta.nkz, meta.nk_tot, meta.nspinor,
-				float(wfn.cell_volume/np.prod(wfn.fft_grid)),
-				bispinor,  # γ⁰ vertex for 4-component spinors
+				fft_vol_au, bispinor,
 			)
 			sigma_sx_kbar_ij_jax.block_until_ready()
 			sigma_coh_kbar_ij_jax.block_until_ready()
@@ -1405,15 +1082,12 @@ def main(argv=None):
 			# Compute new Σ using original wavefunctions but updated G_ij
 			with mesh_xy:
 				sigma_sx_new, sigma_coh_new, hartree_new = pipeline_jit(
-					sigma_views.psi_lT, sigma_views.psi_l,      # psi_l for SX
-					sigma_views.psi_cohT, sigma_views.psi_coh,  # psi_coh for COH (unchanged, uses G_RI)
-					sigma_views.psi_proj, sigma_views.psi_projT,  # psi_proj for projection (X/Y-sharded)
-					W_mu_nu, V_mu_nu,
-					v_q0_noG0_munu,
-					Gij_new,            # Updated Green's function
+					sigma_views.psi_lT, sigma_views.psi_l,
+					sigma_views.psi_cohT, sigma_views.psi_coh,
+					sigma_views.psi_proj, sigma_views.psi_projT,
+					W_mu_nu, V_mu_nu, v_q0_noG0_munu, Gij_new,
 					meta.nkx, meta.nky, meta.nkz, meta.nk_tot, meta.nspinor,
-					float(wfn.cell_volume/np.prod(wfn.fft_grid)),
-					bispinor,  # γ⁰ vertex for 4-component spinors
+					fft_vol_au, bispinor,
 				)
 			
 			# Combine and extract upper triangle
@@ -1450,30 +1124,8 @@ def main(argv=None):
 		f_occ = (jnp.arange(nb_sigma) < nelec).astype(jnp.float64)
 		Gij_final = jnp.einsum('kim,m,kjm->kij', U_full, f_occ, jnp.conj(U_full), optimize=True)
 		
-		# Diagnostic: check Gij_final properties
-		Gij_trace = jnp.real(jnp.trace(Gij_final[0]))
-		Gij_diag = jnp.real(jnp.diagonal(Gij_final[0]))
-		print(f"[Diagnostic] Gij_final trace at k=0: {float(Gij_trace):.4f} (should be {nelec})")
-		print(f"[Diagnostic] Gij_final diag[:5] at k=0: {np.array(Gij_diag[:5])}")
-		print(f"[Diagnostic] Gij_final diag sum at k=0: {float(jnp.sum(Gij_diag)):.4f}")
-		
-		# Check U unitarity: U† @ U should be identity
-		UdagU = jnp.einsum('kim,kin->kmn', jnp.conj(U_full[0:1]), U_full[0:1])
-		unitarity_err = jnp.max(jnp.abs(UdagU[0] - jnp.eye(nb_sigma)))
-		print(f"[Diagnostic] U unitarity error at k=0: {float(unitarity_err):.2e} (should be ~0)")
-		
-		# Check eigenvector structure: U[i,m] = <i_DFT|m_QP>
-		# For nearly-identity rotation, U[i,i] should be ~1
-		U_diag = jnp.abs(jnp.diagonal(U_full[0]))
-		print(f"[Diagnostic] |U| diagonal[:5] at k=0: {np.array(U_diag[:5])} (should be ~1 if no mixing)")
-		print(f"[Diagnostic] |U| diagonal[25:30] at k=0: {np.array(U_diag[25:30])} (valence-cond boundary)")
-		
-		# First eigenvector (lowest QP state): which DFT bands contribute?
-		U_col0_abs = jnp.abs(U_full[0, :, 0])  # |<i_DFT|0_QP>|
-		top_contrib = jnp.argsort(U_col0_abs)[::-1][:5]  # Top 5 DFT contributors
-		print(f"[Diagnostic] Lowest QP state: top DFT contributors = {np.array(top_contrib)}")
-		print(f"[Diagnostic] Lowest QP state: their |U| values = {np.array(U_col0_abs[top_contrib])}")
-		
+		print_scf_diagnostics(Gij_final, U_full, nelec, nb_sigma, print0)
+
 		with mesh_xy:
 			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = pipeline_jit(
 				sigma_views.psi_lT, sigma_views.psi_l,
@@ -1481,14 +1133,8 @@ def main(argv=None):
 				sigma_views.psi_proj, sigma_views.psi_projT,
 				W_mu_nu, V_mu_nu, v_q0_noG0_munu, Gij_final,
 				meta.nkx, meta.nky, meta.nkz, meta.nk_tot, meta.nspinor,
-				float(wfn.cell_volume/np.prod(wfn.fft_grid)),
+				fft_vol_au, bispinor,
 			)
-		
-		# Diagnostic: check Hartree in DFT basis before rotation
-		hartree_dft_diag = jnp.real(jnp.diagonal(hartree_kbar_ij_jax[0]))
-		hartree_dft_trace = jnp.sum(hartree_dft_diag)
-		print(f"[Diagnostic] Hartree DFT-basis diag[:5] (Ry): {np.array(hartree_dft_diag[:5])}")
-		print(f"[Diagnostic] Hartree DFT-basis trace (Ry): {float(hartree_dft_trace):.4f}")
 	else:
 		# One-shot: diagonalize H = H_DFT + Σ
 		H_qp_mnk = kin_ion_full + sigma_total_full
@@ -1551,40 +1197,20 @@ def main(argv=None):
 			hartree_kij_eV=ryd2ev * hartree_final_host,
 		)
 
-	# Write eqp1.dat-style output for self-consistent runs
+	# Write eqp1.dat for self-consistent runs
 	eqp1_written = None
 	if self_consistent and meta.rank == 0:
-		eqp1_path = os.path.join(input_dir, "eqp1.dat")
-		# Generate full k-mesh in crystal coords
-		nkx, nky, nkz = meta.nkx, meta.nky, meta.nkz
-		
-		# Compute one-shot diagonal: H_QP[n,n] = kin_ion[n,n] + sigma_total[n,n] (DFT basis)
-		# Use INITIAL sigma (before self-consistency) for one-shot
 		sigma_total_initial = sigma_sx_initial + sigma_coh_initial + hartree_initial
-		H_oneshot_diag = np.array(jnp.real(jnp.diagonal(kin_ion_full, axis1=1, axis2=2) + 
-		                                    jnp.diagonal(sigma_total_initial, axis1=1, axis2=2)))
-		E_oneshot_ev = H_oneshot_diag * ryd2ev
-		
-		with open(eqp1_path, "w") as f:
-			f.write("# kx ky kz nbands\n")
-			f.write("# spin band E_DFT E_oneshot(DFT-basis) E_QP(eigh)\n")
-			ik = 0
-			for ikz in range(nkz):
-				for iky in range(nky):
-					for ikx in range(nkx):
-						kx = ikx / nkx
-						ky = iky / nky
-						kz = ikz / nkz
-						f.write(f"  {kx:.9f}  {ky:.9f}  {kz:.9f}      {nb_sigma}\n")
-						for ib in range(nb_sigma):
-							e_dft = float(energies_dft_ev_host[ik, ib])
-							e_oneshot = float(E_oneshot_ev[ik, ib])
-							e_qp = float(energies_qp_ev_host[ik, ib])
-							f.write(f"       1       {ib+1}  {e_dft:14.9f}  {e_oneshot:14.9f}  {e_qp:14.9f}\n")
-						ik += 1
-		eqp1_written = eqp1_path
-	else:
-		eqp1_written = None
+		H_oneshot_diag = np.array(jnp.real(
+			jnp.diagonal(kin_ion_full, axis1=1, axis2=2) +
+			jnp.diagonal(sigma_total_initial, axis1=1, axis2=2)
+		))
+		eqp1_written = write_eqp1(
+			os.path.join(input_dir, "eqp1.dat"),
+			energies_dft_ev_host, energies_qp_ev_host,
+			H_oneshot_diag * ryd2ev,
+			meta.nkx, meta.nky, meta.nkz, nb_sigma,
+		)
 
 	# Write QP rotation matrices and eigenvalues to h5 file
 	if meta.rank == 0:
