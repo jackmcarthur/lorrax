@@ -18,7 +18,7 @@ from .tagged_arrays import (
     load_restart_state_from_h5,
     save_restart_state_per_proc,
 )
-from .sigma_output import write_sigma_to_file, write_eqp_table, write_eqp1
+from .sigma_output import write_sigma_to_file, write_eqp_table, write_eqp1, write_sigma_omega_h5
 from .qp_wfn import write_qp_rotations_h5
 from .kin_ion import load_kin_ion_submatrix
 from .centroids import load_centroids

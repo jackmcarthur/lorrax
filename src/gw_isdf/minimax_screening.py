@@ -96,6 +96,21 @@ class LaplaceMinimaxQuadrature:
 
 
 @dataclass(frozen=True)
+class CrossingMinimaxQuadrature:
+    """Quadrature summary for crossing regularization target on ``[0, A_dim]``."""
+
+    A_dim: float
+    tau: np.ndarray
+    alpha: np.ndarray
+    max_error: float
+    target_kind: str
+
+    @property
+    def node_count(self) -> int:
+        return int(self.tau.shape[0])
+
+
+@dataclass(frozen=True)
 class GodbyNeedsPPM:
     """GN-PPM parameters in ISDF form."""
 
@@ -140,6 +155,41 @@ def _solve_noncrossing_scaled_cached(
     return np.asarray(tau, dtype=np.float64), np.asarray(w, dtype=np.float64), float(err)
 
 
+@lru_cache(maxsize=128)
+def _solve_crossing_scaled_cached(
+    A_key: float,
+    target_key: float,
+    max_nodes: int,
+    eps_q_key: float,
+    target_kind: str,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    A_dim = float(A_key)
+    target = float(target_key)
+    eps_q = float(eps_q_key)
+    docs_mod = _load_docs_minimax_module()
+    if not hasattr(docs_mod, "crossing_grids"):
+        raise AttributeError(
+            "Canonical minimax module is missing crossing_grids(A, eps, ...)."
+        )
+    if target_kind == "hgl":
+        G_func = docs_mod.G_hgl
+        tau_max_func = docs_mod.tau_max_hgl
+    elif target_kind == "fermi":
+        G_func = docs_mod.G_fermi
+        tau_max_func = docs_mod.tau_max_fermi
+    else:
+        raise ValueError(f"Unknown crossing target_kind={target_kind!r}.")
+    tau, w, _n, err = docs_mod.crossing_grids(
+        A_dim,
+        target,
+        G_func,
+        tau_max_func,
+        eps_q=eps_q,
+        N_max=max_nodes,
+    )
+    return np.asarray(tau, dtype=np.float64), np.asarray(w, dtype=np.float64), float(err)
+
+
 def solve_laplace_minimax_interval(
     x_min: float,
     x_max: float,
@@ -174,6 +224,38 @@ def solve_laplace_minimax_interval(
         tau=np.asarray(tau, dtype=np.float64),
         alpha=np.asarray(alpha, dtype=np.float64),
         max_error=float(err_abs),
+    )
+
+
+def solve_phase_minimax_bandwidth(
+    A_dim: float,
+    *,
+    target_error: float = 1.0e-6,
+    max_nodes: int = 500,
+    eps_q: float = 1.0e-3,
+    target_kind: str = "hgl",
+) -> CrossingMinimaxQuadrature:
+    """Fit crossing regularization target on ``[0, A_dim]`` as ``sum alpha_l sin(tau_l u)``."""
+
+    A_dim = max(float(A_dim), 1.0e-12)
+    target_error = max(float(target_error), 1.0e-14)
+    eps_q = max(float(eps_q), 1.0e-12)
+    max_nodes = max(8, int(max_nodes))
+    kind = str(target_kind).strip().lower()
+
+    tau_hat, w_hat, err = _solve_crossing_scaled_cached(
+        round(A_dim, 12),
+        round(target_error, 14),
+        max_nodes,
+        round(eps_q, 12),
+        kind,
+    )
+    return CrossingMinimaxQuadrature(
+        A_dim=A_dim,
+        tau=np.asarray(tau_hat, dtype=np.float64),
+        alpha=np.asarray(w_hat, dtype=np.float64),
+        max_error=float(err),
+        target_kind=kind,
     )
 
 

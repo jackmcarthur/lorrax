@@ -70,7 +70,7 @@ except RuntimeError as exc:
 		raise
 from isdf_io import (
     WFNReader, EPSReader,
-    write_sigma_to_file, write_eqp1,
+    write_sigma_to_file, write_eqp1, write_sigma_omega_h5,
     write_qp_rotations_h5, load_kin_ion_submatrix,
     load_centroids, resolve_input_paths,
 )
@@ -93,6 +93,11 @@ from .w_isdf import (
 	get_static_w_q_jax,
 	get_w_omega_jax_from_bundle,
 	compute_screening,
+)
+from .ppm_sigma import (
+	compute_w0_wiwp_and_ppm_from_minimax,
+	compute_sigma_c_ppm_laplace,
+	compute_sigma_c_ppm_omega_grid,
 )
 from .vcoul import compute_q0_averages
 from common.chi_from_dipole import read_dipole_h5, compute_S_omega
@@ -825,6 +830,7 @@ def main(argv=None):
 	nband = params["nband"]
 	sys_dim = params["sys_dim"]  # 3 for 3D, 2 for 2D
 	self_consistent = bool(params.get("self_consistent", False))
+	use_ppm_sigma = bool(params.get("use_ppm_sigma", False))
 
 	ryd2ev = 13.6056980659
 
@@ -1039,6 +1045,95 @@ def main(argv=None):
 			sigma_sx_kbar_ij_jax.block_until_ready()
 			sigma_coh_kbar_ij_jax.block_until_ready()
 			hartree_kbar_ij_jax.block_until_ready()
+
+	sigma_omega_h5_path = None
+	# Optional: replace static COH with GN-PPM frequency-integrated Sigma^c.
+	if use_ppm_sigma:
+		if not do_screened:
+			raise ValueError("use_ppm_sigma=true requires do_screened=true.")
+		if self_consistent:
+			raise NotImplementedError("use_ppm_sigma is currently supported only for self_consistent=false.")
+		omega_p_ry = float(params.get("ppm_omega_p", 2.0))
+		ppm_target_error = float(params.get("ppm_sigma_target_error", 1.0e-6))
+		ppm_max_nodes = int(params.get("ppm_sigma_max_nodes", 64))
+		ppm_fallback = float(params.get("ppm_fallback_omega", 1.0))
+		omega_min_ev = float(params.get("sigma_omega_min_ev", -5.0))
+		omega_max_ev = float(params.get("sigma_omega_max_ev", 5.0))
+		omega_step_ev = float(params.get("sigma_omega_step_ev", 0.25))
+		sigma_regularization_ev = float(params.get("sigma_regularization_ev", 0.25))
+		sigma_edge_factor = float(params.get("sigma_window_edge_factor", 1.5))
+		if omega_step_ev <= 0.0:
+			raise ValueError("sigma_omega_step_ev must be > 0.")
+		if omega_max_ev < omega_min_ev:
+			raise ValueError("sigma_omega_max_ev must be >= sigma_omega_min_ev.")
+		n_omega = int(np.floor((omega_max_ev - omega_min_ev) / omega_step_ev + 0.5)) + 1
+		omega_grid_ev = omega_min_ev + omega_step_ev * np.arange(n_omega, dtype=np.float64)
+		omega_grid_ry = omega_grid_ev / ryd2ev
+		sigma_regularization_ry = sigma_regularization_ev / ryd2ev
+		print0("")
+		print0("-" * 72)
+		print0("  GN-PPM + FREQUENCY-INTEGRATED SIGMA")
+		print0("-" * 72)
+		with timing.section("gw_jax.ppm_sigma"):
+			ppm = compute_w0_wiwp_and_ppm_from_minimax(
+				V_qmunu,
+				wf_bundle,
+				meta,
+				mesh_xy,
+				omega_p_ry=omega_p_ry,
+				target_error=float(params.get("minimax_target_error", 1.0e-6)),
+				max_nodes=int(params.get("minimax_max_nodes", 64)),
+				fallback_omega=ppm_fallback,
+				print0=print0,
+			)
+			sigma_omega = compute_sigma_c_ppm_omega_grid(
+				psi_coh_rmuT_X=sigma_views.psi_cohT,
+				psi_coh_rmu_Y=sigma_views.psi_coh,
+				psi_proj_rmu_X=sigma_views.psi_proj,
+				psi_proj_rmuT_Y=sigma_views.psi_projT,
+				enk_full=wf_bundle.enk[:, wf_bundle.slices.coh_slice],
+				occ_full=wf_bundle.occ[:, wf_bundle.slices.coh_slice],
+				B_mu_nu=ppm.B_mu_nu,
+				Omega_mu_nu=ppm.Omega_mu_nu,
+				omega_values_ry=omega_grid_ry,
+				nkx=meta.nkx,
+				nky=meta.nky,
+				nkz=meta.nkz,
+				nk_tot=meta.nk_tot,
+				bispinor=bispinor,
+				mesh_xy=mesh_xy,
+				target_error=ppm_target_error,
+				max_nodes=ppm_max_nodes,
+				regularization_width_ry=sigma_regularization_ry,
+				edge_factor=sigma_edge_factor,
+				get_G_mu_nu_fn=get_G_mu_nu_jax,
+				get_G_R_fn=get_G_R_jax,
+				get_sigma_mu_nu_fn=get_sigma_static_mu_nu_jax,
+				get_sigma_kij_fn=get_sigma_static_kij_jax,
+				print0=print0,
+			)
+			sigma_coh_ppm_omega_kij = sigma_omega.sigma_c_kij
+			iw0 = int(np.argmin(np.abs(omega_grid_ry)))
+			sigma_coh_ppm_kij = sigma_coh_ppm_omega_kij[iw0]
+			sigma_coh_ppm_kij.block_until_ready()
+			coh_diff_abs = float(jnp.max(jnp.abs(sigma_coh_ppm_kij - sigma_coh_kbar_ij_jax)))
+			coh_ref = max(float(jnp.max(jnp.abs(sigma_coh_kbar_ij_jax))), 1.0e-16)
+			print0(f"  Replacing static COH with PPM-integrated Σ^c(ω={omega_grid_ry[iw0]:.6f} Ry)")
+			print0(f"  Σ^c difference vs static COH: abs={coh_diff_abs:.6e}, rel={coh_diff_abs / coh_ref:.6e}")
+			sigma_coh_kbar_ij_jax = sigma_coh_ppm_kij
+			sigma_omega_h5_path = params.get("sigma_omega_h5_file", "sigma_mnk.h5")
+			if not os.path.isabs(sigma_omega_h5_path):
+				sigma_omega_h5_path = os.path.join(input_dir, sigma_omega_h5_path)
+			if meta.rank == 0:
+				sigma_total_omega = sigma_coh_ppm_omega_kij + sigma_sx_kbar_ij_jax[None, ...] + hartree_kbar_ij_jax[None, ...]
+				write_sigma_omega_h5(
+					sigma_omega_h5_path,
+					omega_grid_ev,
+					ryd2ev * np.array(sigma_total_omega),
+					sigma_c_kij_ev=ryd2ev * np.array(sigma_coh_ppm_omega_kij),
+					sigma_sx_kij_ev=ryd2ev * np.array(sigma_sx_kbar_ij_jax),
+					hartree_kij_ev=ryd2ev * np.array(hartree_kbar_ij_jax),
+				)
 
 
 	# Initial Σ = SX + COH + Hartree (all three combined for self-consistency)
@@ -1255,6 +1350,8 @@ def main(argv=None):
 	print0("  OUTPUT FILES")
 	print0("-" * 72)
 	print0(f"  Sigma matrix elements:  {params['output_file']}")
+	if sigma_omega_h5_path:
+		print0(f"  Sigma_mnk(ω) h5:        {sigma_omega_h5_path}")
 	if self_consistent:
 		print0(f"  Sigma (SC rotated):     {sc_output_file}")
 	if eqp1_written:

@@ -1,6 +1,7 @@
 """Sigma self-energy output file writers."""
 import os
 import numpy as np
+import h5py
 
 
 def write_sigma_to_file(sigma_sx_kij_eV, filename="eqp0.dat", sigma_coh_kij_eV=None, hartree_kij_eV=None):
@@ -146,5 +147,38 @@ def write_eqp_table(dft_energies_ev, qp_energies_ev, filename="eqp.dat"):
 				e_qp = complex(qp[k, n])
 				f.write(
 					f"n={n:<3} EDFT={e_dft:>9.4f}  EQP={e_qp.real:>9.4f} + {e_qp.imag:>9.4f}i\n"
-				)
+					)
 
+
+def write_sigma_omega_h5(
+	filepath,
+	omega_ev,
+	sigma_total_kij_ev,
+	*,
+	sigma_c_kij_ev=None,
+	sigma_sx_kij_ev=None,
+	hartree_kij_ev=None,
+):
+	"""Write frequency-dependent Sigma_mnk(omega) arrays to HDF5.
+
+	Datasets:
+	  - omega_ev: (n_omega,)
+	  - sigma_total_kij_ev: (n_omega, nk, nb, nb)
+	  - sigma_c_kij_ev (optional): (n_omega, nk, nb, nb)
+	  - sigma_sx_kij_ev (optional): (nk, nb, nb)
+	  - hartree_kij_ev (optional): (nk, nb, nb)
+	"""
+	abs_path = os.path.abspath(filepath)
+	dirname = os.path.dirname(abs_path)
+	if dirname:
+		os.makedirs(dirname, exist_ok=True)
+	with h5py.File(abs_path, "w") as h5:
+		h5.create_dataset("omega_ev", data=np.asarray(omega_ev, dtype=np.float64))
+		h5.create_dataset("sigma_total_kij_ev", data=np.asarray(sigma_total_kij_ev, dtype=np.complex128))
+		if sigma_c_kij_ev is not None:
+			h5.create_dataset("sigma_c_kij_ev", data=np.asarray(sigma_c_kij_ev, dtype=np.complex128))
+		if sigma_sx_kij_ev is not None:
+			h5.create_dataset("sigma_sx_kij_ev", data=np.asarray(sigma_sx_kij_ev, dtype=np.complex128))
+		if hartree_kij_ev is not None:
+			h5.create_dataset("hartree_kij_ev", data=np.asarray(hartree_kij_ev, dtype=np.complex128))
+	return abs_path

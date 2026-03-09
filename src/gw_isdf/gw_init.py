@@ -562,6 +562,16 @@ def read_cohsex_input(filename: str) -> dict:
 		# ppm_omega_p:   If set (>0, in Ry), extract GN-PPM parameters from
 		#                minimax chi(0) and chi(i*omega_p).
 		# ppm_fallback_omega: Fallback pole value (Ry) for unfulfilled GN modes.
+		# use_ppm_sigma: If True, build GN-PPM from W(0),W(iωp) and use
+		#                frequency-integrated Σ^c instead of static COH term.
+		# ppm_sigma_target_error: Minimax target error for Σ^c quadratures.
+		# ppm_sigma_max_nodes: Max minimax nodes for Σ^c quadratures.
+		# sigma_omega_min_ev: Lower bound (eV) of default Sigma_mnk(ω) delivery grid.
+		# sigma_omega_max_ev: Upper bound (eV) of default Sigma_mnk(ω) delivery grid.
+		# sigma_omega_step_ev: Spacing (eV) for default Sigma_mnk(ω) grid.
+		# sigma_regularization_ev: Regularization width ξ (eV) for crossing windows.
+		# sigma_window_edge_factor: Edge factor c_edge in three-window construction.
+		# sigma_omega_h5_file: Output HDF5 path for Sigma_mnk(ω) grid.
 		# chunk_size:    Band chunk size for memory-efficient wavefunction loading.
 		#                -1 = no chunking (all bands at once, default)
 		#                 0 = auto (currently 64, TODO: dynamic from available RAM)
@@ -597,8 +607,17 @@ def read_cohsex_input(filename: str) -> dict:
 			"screening_method": get("screening_method", fallback="minimax").strip().lower(),
 			"minimax_target_error": getf("minimax_target_error", fallback=1.0e-6),
 			"minimax_max_nodes": geti("minimax_max_nodes", fallback=64),
-			"ppm_omega_p": getf("ppm_omega_p", fallback=None),
+			"ppm_omega_p": getf("ppm_omega_p", fallback=2.0),
 			"ppm_fallback_omega": getf("ppm_fallback_omega", fallback=1.0),
+			"use_ppm_sigma": getb("use_ppm_sigma", fallback=False),
+			"ppm_sigma_target_error": getf("ppm_sigma_target_error", fallback=1.0e-6),
+			"ppm_sigma_max_nodes": geti("ppm_sigma_max_nodes", fallback=64),
+			"sigma_omega_min_ev": getf("sigma_omega_min_ev", fallback=-5.0),
+			"sigma_omega_max_ev": getf("sigma_omega_max_ev", fallback=5.0),
+			"sigma_omega_step_ev": getf("sigma_omega_step_ev", fallback=0.25),
+			"sigma_regularization_ev": getf("sigma_regularization_ev", fallback=0.25),
+			"sigma_window_edge_factor": getf("sigma_window_edge_factor", fallback=1.5),
+			"sigma_omega_h5_file": get("sigma_omega_h5_file", fallback="sigma_mnk.h5"),
 			"chunk_size": geti("chunk_size", fallback=-1),       # band chunk size (-1=all, 0=auto, 1-2048=explicit)
 			"r_chunk_size": geti("r_chunk_size", fallback=0),    # r-axis chunk (0=auto, >0=explicit)
 			"band_chunk_size": geti("band_chunk_size", fallback=16),  # bands per FFT during r-chunk loop
@@ -628,12 +647,21 @@ def read_cohsex_input(filename: str) -> dict:
 			"screening_method": "minimax",
 			"minimax_target_error": 1.0e-6,
 			"minimax_max_nodes": 64,
-			"ppm_omega_p": None,
+			"ppm_omega_p": 2.0,
 			"ppm_fallback_omega": 1.0,
-			"chunk_size": -1,
-			"r_chunk_size": 0,
-			"band_chunk_size": 16,
-			"memory_per_device_gb": 0.0,
+				"use_ppm_sigma": False,
+				"ppm_sigma_target_error": 1.0e-6,
+				"ppm_sigma_max_nodes": 64,
+				"sigma_omega_min_ev": -5.0,
+				"sigma_omega_max_ev": 5.0,
+				"sigma_omega_step_ev": 0.25,
+				"sigma_regularization_ev": 0.25,
+				"sigma_window_edge_factor": 1.5,
+				"sigma_omega_h5_file": "sigma_mnk.h5",
+				"chunk_size": -1,
+				"r_chunk_size": 0,
+				"band_chunk_size": 16,
+				"memory_per_device_gb": 0.0,
 			"isdf_pair_mode": "spin_traced",
 			}
 
