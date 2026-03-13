@@ -99,6 +99,11 @@ from .ppm_sigma import (
 	compute_sigma_c_ppm_laplace,
 	compute_sigma_c_ppm_omega_grid,
 )
+from .qsgw_utils import (
+	solve_diagonal_sigma_fixed_point,
+	build_qsgw_sigma_xc,
+	plot_qp_energy_comparison,
+)
 from .vcoul import compute_q0_averages
 from common.chi_from_dipole import read_dipole_h5, compute_S_omega
 from .wavefunction_bundle import (
@@ -893,6 +898,7 @@ def main(argv=None):
 		print0=print0,
 	)
 	V_qmunu = isdf.V_qmunu
+	V_qmunu_nohead = V_qmunu
 	v_q0_noG0_munu = isdf.v_q0_noG0_munu
 	G0_mu_nu = isdf.G0_mu_nu
 	wf_bundle = isdf.wf_bundle
@@ -914,7 +920,7 @@ def main(argv=None):
 					minimax_target_error=float(params.get("minimax_target_error", 1.0e-6)),
 					minimax_max_nodes=int(params.get("minimax_max_nodes", 64)),
 					ppm_omega_p=params.get("ppm_omega_p"),
-					ppm_fallback_omega=float(params.get("ppm_fallback_omega", 1.0)),
+					ppm_fallback_omega=float(params.get("ppm_fallback_omega", 2.0)),
 					tensors_filename=tensors_filename,
 					print0=print0,
 				)
@@ -1047,21 +1053,29 @@ def main(argv=None):
 			hartree_kbar_ij_jax.block_until_ready()
 
 	sigma_omega_h5_path = None
+	sigma_munu_stream_path = None
+	omega_grid_ev = None
+	sigma_xc_omega_kij = None
+	sigma_total_omega_kij = None
 	# Optional: replace static COH with GN-PPM frequency-integrated Sigma^c.
 	if use_ppm_sigma:
 		if not do_screened:
 			raise ValueError("use_ppm_sigma=true requires do_screened=true.")
 		if self_consistent:
 			raise NotImplementedError("use_ppm_sigma is currently supported only for self_consistent=false.")
+		sigma_sx_screened_ref = sigma_sx_kbar_ij_jax
+		sigma_coh_static_ref = sigma_coh_kbar_ij_jax
 		omega_p_ry = float(params.get("ppm_omega_p", 2.0))
 		ppm_target_error = float(params.get("ppm_sigma_target_error", 1.0e-6))
 		ppm_max_nodes = int(params.get("ppm_sigma_max_nodes", 64))
-		ppm_fallback = float(params.get("ppm_fallback_omega", 1.0))
+		ppm_fallback = float(params.get("ppm_fallback_omega", 2.0))
 		omega_min_ev = float(params.get("sigma_omega_min_ev", -5.0))
 		omega_max_ev = float(params.get("sigma_omega_max_ev", 5.0))
 		omega_step_ev = float(params.get("sigma_omega_step_ev", 0.25))
 		sigma_regularization_ev = float(params.get("sigma_regularization_ev", 0.25))
 		sigma_edge_factor = float(params.get("sigma_window_edge_factor", 1.5))
+		sigma_omega_batch_size = int(max(1, params.get("sigma_omega_batch_size", 4)))
+		sigma_munu_h5_path = str(params.get("sigma_munu_h5_file", "") or "").strip()
 		if omega_step_ev <= 0.0:
 			raise ValueError("sigma_omega_step_ev must be > 0.")
 		if omega_max_ev < omega_min_ev:
@@ -1070,13 +1084,15 @@ def main(argv=None):
 		omega_grid_ev = omega_min_ev + omega_step_ev * np.arange(n_omega, dtype=np.float64)
 		omega_grid_ry = omega_grid_ev / ryd2ev
 		sigma_regularization_ry = sigma_regularization_ev / ryd2ev
+		if sigma_munu_h5_path and not os.path.isabs(sigma_munu_h5_path):
+			sigma_munu_h5_path = os.path.join(input_dir, sigma_munu_h5_path)
 		print0("")
 		print0("-" * 72)
 		print0("  GN-PPM + FREQUENCY-INTEGRATED SIGMA")
 		print0("-" * 72)
 		with timing.section("gw_jax.ppm_sigma"):
 			ppm = compute_w0_wiwp_and_ppm_from_minimax(
-				V_qmunu,
+				V_qmunu_nohead,
 				wf_bundle,
 				meta,
 				mesh_xy,
@@ -1095,6 +1111,7 @@ def main(argv=None):
 				occ_full=wf_bundle.occ[:, wf_bundle.slices.coh_slice],
 				B_mu_nu=ppm.B_mu_nu,
 				Omega_mu_nu=ppm.Omega_mu_nu,
+				V_mu_nu=ppm.V_mu_nu,
 				omega_values_ry=omega_grid_ry,
 				nkx=meta.nkx,
 				nky=meta.nky,
@@ -1106,6 +1123,8 @@ def main(argv=None):
 				max_nodes=ppm_max_nodes,
 				regularization_width_ry=sigma_regularization_ry,
 				edge_factor=sigma_edge_factor,
+				omega_batch_size=sigma_omega_batch_size,
+				sigma_munu_h5_path=sigma_munu_h5_path or None,
 				get_G_mu_nu_fn=get_G_mu_nu_jax,
 				get_G_R_fn=get_G_R_jax,
 				get_sigma_mu_nu_fn=get_sigma_static_mu_nu_jax,
@@ -1116,24 +1135,47 @@ def main(argv=None):
 			iw0 = int(np.argmin(np.abs(omega_grid_ry)))
 			sigma_coh_ppm_kij = sigma_coh_ppm_omega_kij[iw0]
 			sigma_coh_ppm_kij.block_until_ready()
-			coh_diff_abs = float(jnp.max(jnp.abs(sigma_coh_ppm_kij - sigma_coh_kbar_ij_jax)))
-			coh_ref = max(float(jnp.max(jnp.abs(sigma_coh_kbar_ij_jax))), 1.0e-16)
-			print0(f"  Replacing static COH with PPM-integrated Σ^c(ω={omega_grid_ry[iw0]:.6f} Ry)")
-			print0(f"  Σ^c difference vs static COH: abs={coh_diff_abs:.6e}, rel={coh_diff_abs / coh_ref:.6e}")
-			sigma_coh_kbar_ij_jax = sigma_coh_ppm_kij
-			sigma_omega_h5_path = params.get("sigma_omega_h5_file", "sigma_mnk.h5")
-			if not os.path.isabs(sigma_omega_h5_path):
-				sigma_omega_h5_path = os.path.join(input_dir, sigma_omega_h5_path)
-			if meta.rank == 0:
-				sigma_total_omega = sigma_coh_ppm_omega_kij + sigma_sx_kbar_ij_jax[None, ...] + hartree_kbar_ij_jax[None, ...]
+
+			# Full-frequency GW uses bare exchange (v), not static screened exchange W(0).
+			with mesh_xy:
+				G_k_static = get_G_mu_nu_jax(sigma_views.psi_lT, sigma_views.psi_l, Gij_static)
+				G_R_static = get_G_R_jax(G_k_static, meta.nkx, meta.nky, meta.nkz)
+				sigma_x_bare_munu = get_sigma_static_mu_nu_jax(G_R_static, V_mu_nu, meta.nk_tot, bispinor=bispinor)
+				sigma_x_bare_kij = get_sigma_static_kij_jax(sigma_views.psi_proj, sigma_views.psi_projT, sigma_x_bare_munu)
+				sigma_x_bare_kij.block_until_ready()
+		coh_diff_abs = float(jnp.max(jnp.abs(sigma_coh_ppm_kij - sigma_coh_kbar_ij_jax)))
+		coh_ref = max(float(jnp.max(jnp.abs(sigma_coh_kbar_ij_jax))), 1.0e-16)
+		sx_diff_abs = float(jnp.max(jnp.abs(sigma_x_bare_kij - sigma_sx_screened_ref)))
+		sx_ref = max(float(jnp.max(jnp.abs(sigma_sx_screened_ref))), 1.0e-16)
+		static_total_ref = sigma_sx_screened_ref + sigma_coh_static_ref
+		gw_total_0 = sigma_x_bare_kij + sigma_coh_ppm_kij
+		total_diff_abs = float(jnp.max(jnp.abs(gw_total_0 - static_total_ref)))
+		total_ref = max(float(jnp.max(jnp.abs(static_total_ref))), 1.0e-16)
+		print0(f"  Replacing static COH with PPM-integrated Σ^c(ω={omega_grid_ry[iw0]:.6f} Ry)")
+		print0(f"  Σ^c difference vs static COH: abs={coh_diff_abs:.6e}, rel={coh_diff_abs / coh_ref:.6e}")
+		print0(f"  Bare Σ^X vs screened Σ^SX: abs={sx_diff_abs:.6e}, rel={sx_diff_abs / sx_ref:.6e}")
+		print0(f"  [Σ^X + Σ^c(0)] vs [Σ^SX + Σ^COH]: abs={total_diff_abs:.6e} Ry ({total_diff_abs * ryd2ev:.6e} eV), rel={total_diff_abs / total_ref:.6e}")
+		sigma_sx_kbar_ij_jax = sigma_x_bare_kij
+		sigma_coh_kbar_ij_jax = sigma_coh_ppm_kij
+		sigma_xc_omega_kij = sigma_sx_kbar_ij_jax[None, ...] + sigma_coh_ppm_omega_kij
+		sigma_total_omega_kij = sigma_xc_omega_kij + hartree_kbar_ij_jax[None, ...]
+		sigma_omega_h5_path = params.get("sigma_omega_h5_file", "sigma_mnk.h5")
+		if not os.path.isabs(sigma_omega_h5_path):
+			sigma_omega_h5_path = os.path.join(input_dir, sigma_omega_h5_path)
+		if meta.rank == 0:
 				write_sigma_omega_h5(
 					sigma_omega_h5_path,
 					omega_grid_ev,
-					ryd2ev * np.array(sigma_total_omega),
+					ryd2ev * np.array(sigma_total_omega_kij),
 					sigma_c_kij_ev=ryd2ev * np.array(sigma_coh_ppm_omega_kij),
 					sigma_sx_kij_ev=ryd2ev * np.array(sigma_sx_kbar_ij_jax),
 					hartree_kij_ev=ryd2ev * np.array(hartree_kbar_ij_jax),
 				)
+				if sigma_omega.sigma_munu_h5_path:
+					sigma_munu_stream_path = sigma_omega.sigma_munu_h5_path
+					with h5py.File(sigma_omega_h5_path, "a") as h5:
+						h5.attrs["sigma_munu_h5_path"] = sigma_omega.sigma_munu_h5_path
+					print0(f"  Streamed Σc(μ,ν,ω):      {sigma_omega.sigma_munu_h5_path}")
 
 
 	# Initial Σ = SX + COH + Hartree (all three combined for self-consistency)
@@ -1149,6 +1191,116 @@ def main(argv=None):
 	kin_ion_path = params["kin_ion_file"]
 	kin_ion_full = load_kin_ion_submatrix(kin_ion_path, qp_band_start, qp_band_stop)
 	nelec = int(wfn.nelec)
+
+	if use_ppm_sigma and (sigma_xc_omega_kij is not None) and (sigma_total_omega_kij is not None):
+		def _gap_k0(E_kn_ev, iv, ic):
+			if iv < 0 or ic < 0:
+				return None
+			if E_kn_ev.shape[1] <= max(iv, ic):
+				return None
+			return float(E_kn_ev[0, ic] - E_kn_ev[0, iv])
+
+		# Compare static COHSEX and dynamic-omega=0 spectra on the same Hamiltonian baseline.
+		H_static_ref = kin_ion_full + sigma_sx_screened_ref + sigma_coh_static_ref + hartree_kbar_ij_jax
+		H_static_ref = 0.5 * (H_static_ref + jnp.conj(jnp.swapaxes(H_static_ref, -1, -2)))
+		E_static_ref, _ = jax.vmap(jnp.linalg.eigh, in_axes=0)(H_static_ref)
+		E_static_ref_ev = np.array(E_static_ref) * ryd2ev
+
+		H_dyn0 = kin_ion_full + sigma_sx_kbar_ij_jax + sigma_coh_kbar_ij_jax + hartree_kbar_ij_jax
+		H_dyn0 = 0.5 * (H_dyn0 + jnp.conj(jnp.swapaxes(H_dyn0, -1, -2)))
+		E_dyn0, _ = jax.vmap(jnp.linalg.eigh, in_axes=0)(H_dyn0)
+		E_dyn0_ev = np.array(E_dyn0) * ryd2ev
+
+		# Diagonal self-consistency for E = diag(kin_ion + V_H) + Re Sigma_xc(E).
+		# Sigma_xc(omega) is computed on an omega grid referenced to E_F, so
+		# solve in the same relative-energy scale (E - E_F), then shift back.
+		h0_diag_ev_abs = np.real(np.diagonal(np.array(kin_ion_full + hartree_kbar_ij_jax), axis1=1, axis2=2)) * ryd2ev
+		sigma_xc_diag_omega_ev = np.real(np.diagonal(np.array(sigma_xc_omega_kij), axis1=2, axis2=3)) * ryd2ev
+		occ_idx = max(0, min(int(nelec) - 1, E_dyn0_ev.shape[1] - 1))
+		efermi_ref_ev = float(np.max(E_dyn0_ev[:, occ_idx]))
+		h0_diag_ev_rel = h0_diag_ev_abs - efermi_ref_ev
+		E_dyn0_rel_ev = E_dyn0_ev - efermi_ref_ev
+		omega_lo = float(np.min(omega_grid_ev))
+		omega_hi = float(np.max(omega_grid_ev))
+		in_omega_grid = (E_dyn0_rel_ev >= omega_lo) & (E_dyn0_rel_ev <= omega_hi)
+		E_diag_sc_rel_ev, conv_mask, n_iter_diag = solve_diagonal_sigma_fixed_point(
+			h0_diag_ev_rel,
+			sigma_xc_diag_omega_ev,
+			np.asarray(omega_grid_ev, dtype=np.float64),
+			max_iter=120,
+			tol_ev=1.0e-7,
+			mixing=0.6,
+		)
+		E_diag_sc_rel_ev = np.where(in_omega_grid, E_diag_sc_rel_ev, E_dyn0_rel_ev)
+		conv_mask = np.asarray(conv_mask, dtype=bool) & np.asarray(in_omega_grid, dtype=bool)
+		E_diag_sc_ev = E_diag_sc_rel_ev + efermi_ref_ev
+		n_in_grid = int(np.count_nonzero(in_omega_grid))
+		conv_frac = float(np.mean(conv_mask[in_omega_grid].astype(np.float64))) if n_in_grid > 0 else 1.0
+
+		iv_edge = int(nelec) - 1
+		ic_edge = int(nelec)
+		gap_static = _gap_k0(E_static_ref_ev, iv_edge, ic_edge)
+		gap_dyn0 = _gap_k0(E_dyn0_ev, iv_edge, ic_edge)
+		gap_diag_sc = _gap_k0(E_diag_sc_ev, iv_edge, ic_edge)
+		if gap_static is not None and gap_dyn0 is not None and gap_diag_sc is not None:
+			print0(
+				f"  Gap@k=0 (E{ic_edge+1}-E{iv_edge+1}): "
+				f"static={gap_static:.6f} eV, omega0={gap_dyn0:.6f} eV, diag-SC={gap_diag_sc:.6f} eV"
+			)
+			print0(f"  Gap shifts: omega0-static={gap_dyn0-gap_static:+.6f} eV, diagSC-static={gap_diag_sc-gap_static:+.6f} eV")
+		print0(
+			"  Diagonal Sigma(E) fixed point: "
+			f"in-grid={n_in_grid}/{in_omega_grid.size}, converged={100.0*conv_frac:.1f}% in-grid states "
+			f"in {n_iter_diag} iterations"
+		)
+
+		# Construct QSGW static Sigma_xc from dynamic Sigma_xc(omega).
+		sigma_xc_qsgw_ev, qsgw_diag = build_qsgw_sigma_xc(
+			ryd2ev * np.array(sigma_xc_omega_kij),
+			np.asarray(omega_grid_ev, dtype=np.float64),
+			E_diag_sc_rel_ev,
+			return_diagnostics=True,
+		)
+		print0(
+			"  QSGW Σ_xc interpolation: "
+			f"clipped={int(qsgw_diag['n_interp_clipped'])}/{int(np.prod(E_diag_sc_rel_ev.shape))} "
+			f"({100.0*qsgw_diag['frac_interp_clipped']:.2f}%) "
+			f"outside [{qsgw_diag['omega_min_ev']:.3f}, {qsgw_diag['omega_max_ev']:.3f}] eV"
+		)
+
+		if meta.rank == 0 and sigma_omega_h5_path:
+			with h5py.File(sigma_omega_h5_path, "a") as h5:
+				if "qp_static_cohsex_ev" in h5:
+					del h5["qp_static_cohsex_ev"]
+				h5.create_dataset("qp_static_cohsex_ev", data=np.asarray(E_static_ref_ev, dtype=np.float64))
+				if "qp_omega0_ev" in h5:
+					del h5["qp_omega0_ev"]
+				h5.create_dataset("qp_omega0_ev", data=np.asarray(E_dyn0_ev, dtype=np.float64))
+				if "qp_diag_self_consistent_ev" in h5:
+					del h5["qp_diag_self_consistent_ev"]
+				h5.create_dataset("qp_diag_self_consistent_ev", data=np.asarray(E_diag_sc_ev, dtype=np.float64))
+				if "sigma_xc_qsgw_kij_ev" in h5:
+					del h5["sigma_xc_qsgw_kij_ev"]
+				h5.create_dataset("sigma_xc_qsgw_kij_ev", data=np.asarray(sigma_xc_qsgw_ev, dtype=np.complex128))
+				if "qsgw_interp_clipped_count" in h5:
+					del h5["qsgw_interp_clipped_count"]
+				h5.create_dataset("qsgw_interp_clipped_count", data=np.asarray(int(qsgw_diag["n_interp_clipped"]), dtype=np.int64))
+				if "qsgw_interp_clipped_fraction" in h5:
+					del h5["qsgw_interp_clipped_fraction"]
+				h5.create_dataset("qsgw_interp_clipped_fraction", data=np.asarray(float(qsgw_diag["frac_interp_clipped"]), dtype=np.float64))
+
+			plot_path = os.path.join(input_dir, "qp_energy_compare.png")
+			try:
+				plot_qp_energy_comparison(
+					plot_path,
+					h0_diag_ev_abs,
+					E_static_ref_ev,
+					E_dyn0_ev,
+					E_diag_sc_ev,
+				)
+				print0(f"  QP energy plot:         {plot_path}")
+			except Exception as exc:
+				print0(f"  WARNING: failed to generate QP plot: {exc}")
 	
 	if self_consistent:
 		# Self-consistent COHSEX: iterate until Σ converges
@@ -1271,9 +1423,15 @@ def main(argv=None):
 		hartree_qp_trace = jnp.sum(hartree_qp_diag)
 		print(f"[Diagnostic] Hartree QP-basis diag[:5] (Ry): {np.array(hartree_qp_diag[:5])}")
 		print(f"[Diagnostic] Hartree QP-basis trace (Ry): {float(hartree_qp_trace):.4f} (should match DFT-basis trace)")
-
 	energies_dft_ev_host = np.array(energies_dft_ev)
 	energies_qp_ev_host = np.array(energies_qp_ev)
+	sx_col_label = "sigSX"
+	corr_col_label = "sigCOH"
+	total_col_label = "sigTOT"
+	if use_ppm_sigma:
+		sx_col_label = "sigX"
+		corr_col_label = "sigCw0"
+		total_col_label = "sigXC"
 
 	# Write PRE-self-consistency sigma to eqp0_noqsym (initial, one-shot values)
 	sigma_sx_initial_host = np.array(sigma_sx_initial)
@@ -1283,6 +1441,9 @@ def main(argv=None):
 		ryd2ev * sigma_sx_initial_host, params["output_file"],
 		sigma_coh_kij_eV=ryd2ev * sigma_coh_initial_host,
 		hartree_kij_eV=ryd2ev * hartree_initial_host,
+		sx_label=sx_col_label,
+		corr_label=corr_col_label,
+		total_label=total_col_label,
 	)
 
 	# Write POST-self-consistency sigma to eqp0_sc (rotated to QP basis)
@@ -1298,6 +1459,9 @@ def main(argv=None):
 			ryd2ev * sigma_sx_final_host, sc_output_file,
 			sigma_coh_kij_eV=ryd2ev * sigma_coh_final_host,
 			hartree_kij_eV=ryd2ev * hartree_final_host,
+			sx_label=sx_col_label,
+			corr_label=corr_col_label,
+			total_label=total_col_label,
 		)
 
 	# Write eqp1.dat for self-consistent runs
@@ -1352,6 +1516,8 @@ def main(argv=None):
 	print0(f"  Sigma matrix elements:  {params['output_file']}")
 	if sigma_omega_h5_path:
 		print0(f"  Sigma_mnk(ω) h5:        {sigma_omega_h5_path}")
+	if sigma_munu_stream_path:
+		print0(f"  Sigma_c(μ,ν,ω) h5:      {sigma_munu_stream_path}")
 	if self_consistent:
 		print0(f"  Sigma (SC rotated):     {sc_output_file}")
 	if eqp1_written:

@@ -4,14 +4,26 @@ import numpy as np
 import h5py
 
 
-def write_sigma_to_file(sigma_sx_kij_eV, filename="eqp0.dat", sigma_coh_kij_eV=None, hartree_kij_eV=None):
-	"""Write COHSEX self-energy components to file.
+def write_sigma_to_file(
+	sigma_sx_kij_eV,
+	filename="eqp0.dat",
+	sigma_coh_kij_eV=None,
+	hartree_kij_eV=None,
+	*,
+	sx_label: str = "sigSX",
+	corr_label: str = "sigCOH",
+	total_label: str = "sigTOT",
+):
+	"""Write self-energy components to file.
 	
 	Args:
-		sigma_sx_kij_eV: Screened exchange self-energy in eV, shape (nk, nb, nb)
+		sigma_sx_kij_eV: Exchange-like self-energy in eV, shape (nk, nb, nb)
 		filename: Output file path
-		sigma_coh_kij_eV: Coulomb hole self-energy in eV, shape (nk, nb, nb)
+		sigma_coh_kij_eV: Correlation-like self-energy in eV, shape (nk, nb, nb)
 		hartree_kij_eV: Hartree matrix elements in eV, shape (nk, nb, nb)
+		sx_label: Text label for first self-energy column
+		corr_label: Text label for second self-energy column
+		total_label: Text label for the sum of first and second columns
 	"""
 	nk, nbands, _ = sigma_sx_kij_eV.shape
 
@@ -23,15 +35,15 @@ def write_sigma_to_file(sigma_sx_kij_eV, filename="eqp0.dat", sigma_coh_kij_eV=N
 
 	with open(abs_path, "w") as f:
 		# Write header with units
-		f.write("# COHSEX output: Sigma_SX (screened exchange), Sigma_COH (Coulomb hole), VH (Hartree) - all in eV\n")
-		f.write("# Sigma_COHSEX = Sigma_SX + Sigma_COH\n")
+		f.write("# Sigma output (all in eV)\n")
+		f.write(f"# {total_label} = {sx_label} + {corr_label}\n")
 		for k in range(nk):
 			f.write(f"\nk-point {k}:\n")
 			f.write("-" * 100 + "\n")
 			for n in range(nbands):
 				sx_re = float(sigma_sx_kij_eV[k, n, n].real)
 				sx_im = float(sigma_sx_kij_eV[k, n, n].imag)
-				line = f"n={n:<3} sigSX={sx_re:>12.6f}"
+				line = f"n={n:<3} {sx_label}={sx_re:>12.6f}"
 				if abs(sx_im) > 1e-10:
 					line += f"+{sx_im:>10.6f}i"
 				else:
@@ -40,7 +52,7 @@ def write_sigma_to_file(sigma_sx_kij_eV, filename="eqp0.dat", sigma_coh_kij_eV=N
 				if sigma_coh_kij_eV is not None:
 					coh_re = float(np.real(sigma_coh_kij_eV[k, n, n]))
 					coh_im = float(np.imag(sigma_coh_kij_eV[k, n, n]))
-					line += f"  sigCOH={coh_re:>12.6f}"
+					line += f"  {corr_label}={coh_re:>12.6f}"
 					if abs(coh_im) > 1e-10:
 						line += f"+{coh_im:>10.6f}i"
 					else:
@@ -48,7 +60,7 @@ def write_sigma_to_file(sigma_sx_kij_eV, filename="eqp0.dat", sigma_coh_kij_eV=N
 					# Total COHSEX
 					total_re = sx_re + coh_re
 					total_im = sx_im + coh_im
-					line += f"  sigTOT={total_re:>12.6f}"
+					line += f"  {total_label}={total_re:>12.6f}"
 					if abs(total_im) > 1e-10:
 						line += f"+{total_im:>10.6f}i"
 					else:

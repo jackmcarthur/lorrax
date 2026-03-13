@@ -10,14 +10,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable
+import os
 
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
+import h5py
 
 from .minimax_screening import (
     build_static_minimax_window_pair,
+    extract_gn_ppm_parameters,
     solve_laplace_minimax_interval,
     solve_phase_minimax_bandwidth,
 )
@@ -31,6 +34,7 @@ class PPMBuildResult:
     Wiwp_q: jax.Array
     B_mu_nu: jax.Array
     Omega_mu_nu: jax.Array
+    V_mu_nu: jax.Array
     unfulfilled_fraction: float
     n_nodes_static: int
 
@@ -40,6 +44,7 @@ class SigmaOmegaResult:
     omega_ry: np.ndarray
     omega_ev: np.ndarray
     sigma_c_kij: jax.Array
+    sigma_munu_h5_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -75,7 +80,7 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     omega_p_ry: float = 2.0,
     target_error: float = 1.0e-6,
     max_nodes: int = 64,
-    fallback_omega: float = 1.0,
+    fallback_omega: float = 2.0,
     print0=print,
 ) -> PPMBuildResult:
     """Build GN-PPM parameters from minimax W(0) and W(i*omega_p)."""
@@ -110,41 +115,32 @@ def compute_w0_wiwp_and_ppm_from_minimax(
         psi_vTX, psi_vY, psi_cX, psi_cTY,
         enk_v, enk_c, [wiw], meta, mesh_xy,
     )
+    # Canonical GN extraction: build poles from Π(0), Π(iωp), not directly from W ratios.
+    # This mirrors the documented formulation and BerkeleyGW-style treatment.
+    ppm = extract_gn_ppm_parameters(
+        V_qmunu,
+        chi0_q,
+        chii_q,
+        omega_p=omega_p_ry,
+        fallback_omega=float(fallback_omega),
+    )
+    unfulfilled = float(ppm.unfulfilled_fraction)
+
     W0_q = w_isdf.solve_w_from_chi_q_jax(V_qmunu, chi0_q, meta, mesh_xy)
     Wiwp_q = w_isdf.solve_w_from_chi_q_jax(V_qmunu, chii_q, meta, mesh_xy)
     W0_q.block_until_ready()
     Wiwp_q.block_until_ready()
 
-    W0_mu = _extract_mu_nu_q_layout(W0_q)
-    Wi_mu = _extract_mu_nu_q_layout(Wiwp_q)
-    V_mu = jnp.asarray(V_qmunu)[0, 0, 0].transpose(3, 4, 0, 1, 2)
+    # Keep GN poles in Π-space. W^c(t) is assembled as V @ Π(t) @ V at each node.
+    V_local = jnp.asarray(V_qmunu)[0, 0, 0].transpose(3, 4, 0, 1, 2)
+    Omega = jnp.asarray(ppm.omega_qmunu).transpose(3, 4, 0, 1, 2)
+    B = jnp.asarray(ppm.b_qmunu).transpose(3, 4, 0, 1, 2)
     mu_shard = _mu_nu_sharding(mesh_xy)
-    with mesh_xy:
-        W0_mu = jax.lax.with_sharding_constraint(W0_mu, mu_shard)
-        Wi_mu = jax.lax.with_sharding_constraint(Wi_mu, mu_shard)
-        V_mu = jax.lax.with_sharding_constraint(V_mu, mu_shard)
-
-    # Correlation-only parts.
-    Wc0 = W0_mu - V_mu
-    Wci = Wi_mu - V_mu
-    with mesh_xy:
-        Wc0 = jax.lax.with_sharding_constraint(Wc0, mu_shard)
-        Wci = jax.lax.with_sharding_constraint(Wci, mu_shard)
-
-    eps = 1.0e-14
-    ratio_raw = jnp.real(Wci / jnp.where(jnp.abs(Wc0) > eps, Wc0, (1.0 + 0.0j)))
-    # For model Xi/X0 = Omega^2/(omega_p^2 + Omega^2), ratio must be in (0,1).
-    good = (ratio_raw > 0.0) & (ratio_raw < 1.0)
-    ratio = jnp.where(good, ratio_raw, 0.5)
-    omega_sq = (ratio / jnp.maximum(1.0 - ratio, eps)) * (omega_p_ry * omega_p_ry)
-    Omega = jnp.sqrt(jnp.maximum(omega_sq, 0.0))
-    Omega = jnp.where(good, Omega, jnp.asarray(fallback_omega, dtype=Omega.dtype))
-    B = -0.5 * Wc0 * Omega
-    unfulfilled = 1.0 - float(jnp.mean(good.astype(jnp.float32)))
 
     with mesh_xy:
         Omega = jax.lax.with_sharding_constraint(Omega, mu_shard)
         B = jax.lax.with_sharding_constraint(B, mu_shard)
+        V_local = jax.lax.with_sharding_constraint(V_local, mu_shard)
 
     print0(
         "  GN-PPM from W(0), W(iωp): "
@@ -156,6 +152,7 @@ def compute_w0_wiwp_and_ppm_from_minimax(
         Wiwp_q=Wiwp_q,
         B_mu_nu=B,
         Omega_mu_nu=Omega,
+        V_mu_nu=V_local,
         unfulfilled_fraction=unfulfilled,
         n_nodes_static=quad.node_count,
     )
@@ -164,15 +161,21 @@ def compute_w0_wiwp_and_ppm_from_minimax(
 def build_ppm_w_time_q(
     B_mu_nu: jax.Array,
     Omega_mu_nu: jax.Array,
+    V_mu_nu: jax.Array,
     t_node: complex,
     mask_B: jax.Array,
     E_ref_B: float,
     mesh_xy: Mesh,
 ) -> jax.Array:
-    """Build masked PPM correlation interaction in q-space at one complex time node."""
+    """Build masked PPM correlation interaction W^c(t)=V Π(t) V in q-space."""
     mu_shard = _mu_nu_sharding(mesh_xy)
     phase = jnp.exp(-1j * (Omega_mu_nu - jnp.asarray(E_ref_B, dtype=jnp.float64)) * t_node)
-    Wc_t = jnp.where(mask_B, B_mu_nu * phase, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
+    pi_t = jnp.where(mask_B, B_mu_nu * phase, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
+    # Convert to q-major for local matrix products on each q-block.
+    v_q = V_mu_nu.transpose(2, 3, 4, 0, 1)
+    pi_q = pi_t.transpose(2, 3, 4, 0, 1)
+    w_q = jnp.einsum("...ab,...bc,...cd->...ad", v_q, pi_q, v_q, optimize=True)
+    Wc_t = w_q.transpose(3, 4, 0, 1, 2)
     with mesh_xy:
         Wc_t = jax.lax.with_sharding_constraint(Wc_t, mu_shard)
     return Wc_t
@@ -309,6 +312,7 @@ def _convolve_sigma_branch(
     base_mask_A: jax.Array,
     B_mu_nu: jax.Array,
     Omega_mu_nu: jax.Array,
+    V_mu_nu: jax.Array,
     base_mask_B: jax.Array,
     kernel_sign: int,
     regularization_width_ry: float,
@@ -328,6 +332,7 @@ def _convolve_sigma_branch(
     get_G_mu_nu_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array],
     get_G_R_fn: Callable[[jax.Array, int, int, int], jax.Array],
     get_sigma_mu_nu_fn: Callable[[jax.Array, jax.Array, int, bool], jax.Array],
+    log_tag: str = "",
     print0=print,
 ) -> tuple[jax.Array, list[_SigmaWindow]]:
     omega_nonneg_ry = np.asarray(omega_nonneg_ry, dtype=np.float64)
@@ -393,7 +398,7 @@ def _convolve_sigma_branch(
             weights_kn = jnp.where(mask_A, phase_A, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
             Gij = eye_nb[None, :, :] * weights_kn[:, :, None]
             G_k = get_G_mu_nu_fn(psi_coh_rmuT_X, psi_coh_rmu_Y, Gij)
-            W_t_q = build_ppm_w_time_q(B_mu_nu, Omega_mu_nu, t_node, mask_B, win.E_ref_B, mesh_xy)
+            W_t_q = build_ppm_w_time_q(B_mu_nu, Omega_mu_nu, V_mu_nu, t_node, mask_B, win.E_ref_B, mesh_xy)
             with mesh_xy:
                 G_R = get_G_R_fn(G_k, nkx, nky, nkz)
                 W_t_q = jax.lax.with_sharding_constraint(W_t_q, mu_shard)
@@ -405,14 +410,15 @@ def _convolve_sigma_branch(
         projected = jnp.imag(acc_win) if win.project == "imag" else jnp.real(acc_win)
         acc_total = acc_total + jnp.asarray(win.prefactor, dtype=jnp.float64) * projected.astype(jnp.complex128)
 
+    tag = f"{log_tag} " if log_tag else ""
     if kernel_sign == +1:
         n_core = sum(1 for w in windows if w.name == "core")
         n_ext = sum(1 for w in windows if w.name in ("a_stripe", "b_slab"))
-        print0(f"  Σ^- windows: core={n_core}, exterior={n_ext}")
+        print0(f"  {tag}Σ^- windows: core={n_core}, exterior={n_ext}")
     else:
         n_tot = len(windows)
         n_nodes = sum(int(w.alpha.shape[0]) for w in windows)
-        print0(f"  Σ^+ windows: count={n_tot}, total nodes={n_nodes}")
+        print0(f"  {tag}Σ^+ windows: count={n_tot}, total nodes={n_nodes}")
     return acc_total, windows
 
 
@@ -426,6 +432,7 @@ def compute_sigma_c_ppm_omega_grid(
     occ_full: jax.Array,
     B_mu_nu: jax.Array,
     Omega_mu_nu: jax.Array,
+    V_mu_nu: jax.Array,
     omega_values_ry: np.ndarray,
     nkx: int,
     nky: int,
@@ -439,6 +446,8 @@ def compute_sigma_c_ppm_omega_grid(
     crossing_eps_q: float = 1.0e-3,
     regularization_width_ry: float = 0.018374661087827496,  # 0.25 eV
     edge_factor: float = 1.5,
+    omega_batch_size: int = 4,
+    sigma_munu_h5_path: str | None = None,
     get_G_mu_nu_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array] | None = None,
     get_G_R_fn: Callable[[jax.Array, int, int, int], jax.Array] | None = None,
     get_sigma_mu_nu_fn: Callable[[jax.Array, jax.Array, int, bool], jax.Array] | None = None,
@@ -455,10 +464,14 @@ def compute_sigma_c_ppm_omega_grid(
     omega_req = np.asarray(omega_values_ry, dtype=np.float64)
     if omega_req.ndim != 1 or omega_req.size == 0:
         raise ValueError("omega_values_ry must be a 1D non-empty array.")
+    omega_batch_size = int(max(1, omega_batch_size))
 
-    omega_nonneg = np.unique(np.abs(omega_req))
-    omega_nonneg.sort()
-    omega_nonneg_j = jnp.asarray(omega_nonneg, dtype=jnp.float64)
+    # Input omega grid is interpreted as relative to E_F (default driver behavior).
+    omega_rel_req = omega_req
+    idx_pos = np.where(omega_rel_req >= 0.0)[0]
+    idx_neg = np.where(omega_rel_req < 0.0)[0]
+    omega_pos = np.asarray(omega_rel_req[idx_pos], dtype=np.float64)
+    omega_neg_abs = np.asarray(-omega_rel_req[idx_neg], dtype=np.float64)
 
     occ_mask = occ_full > 0.5
     efermi = jnp.max(jnp.where(occ_mask, enk_full, -1.0e30))
@@ -476,76 +489,146 @@ def compute_sigma_c_ppm_omega_grid(
         f"{float(np.min(omega_req) * 13.6056980659):.3f} .. {float(np.max(omega_req) * 13.6056980659):.3f} eV, "
         f"Nω={omega_req.size}, ξ={float(regularization_width_ry * 13.6056980659):.3f} eV"
     )
+    print0(f"  Σc(ω) batching: ω-batch={omega_batch_size}")
 
-    sigma_cond_nonneg, _ = _convolve_sigma_branch(
-        omega_nonneg_ry=omega_nonneg,
-        E_A=E_cond,
-        base_mask_A=cond_mask,
-        B_mu_nu=B_corr,
-        Omega_mu_nu=Omega_abs,
-        base_mask_B=B_mask,
-        kernel_sign=+1,
-        regularization_width_ry=regularization_width_ry,
-        edge_factor=edge_factor,
-        target_error=target_error,
-        max_nodes=max_nodes,
-        crossing_eps_q=crossing_eps_q,
-        crossing_max_nodes=crossing_max_nodes,
-        psi_coh_rmuT_X=psi_coh_rmuT_X,
-        psi_coh_rmu_Y=psi_coh_rmu_Y,
-        nkx=nkx,
-        nky=nky,
-        nkz=nkz,
-        nk_tot=nk_tot,
-        bispinor=bispinor,
-        mesh_xy=mesh_xy,
-        get_G_mu_nu_fn=get_G_mu_nu_fn,
-        get_G_R_fn=get_G_R_fn,
-        get_sigma_mu_nu_fn=get_sigma_mu_nu_fn,
-        print0=print0,
-    )
-    sigma_val_nonneg, _ = _convolve_sigma_branch(
-        omega_nonneg_ry=omega_nonneg,
-        E_A=H_val,
-        base_mask_A=val_mask,
-        B_mu_nu=B_corr,
-        Omega_mu_nu=Omega_abs,
-        base_mask_B=B_mask,
-        kernel_sign=-1,
-        regularization_width_ry=regularization_width_ry,
-        edge_factor=edge_factor,
-        target_error=target_error,
-        max_nodes=max_nodes,
-        crossing_eps_q=crossing_eps_q,
-        crossing_max_nodes=crossing_max_nodes,
-        psi_coh_rmuT_X=psi_coh_rmuT_X,
-        psi_coh_rmu_Y=psi_coh_rmu_Y,
-        nkx=nkx,
-        nky=nky,
-        nkz=nkz,
-        nk_tot=nk_tot,
-        bispinor=bispinor,
-        mesh_xy=mesh_xy,
-        get_G_mu_nu_fn=get_G_mu_nu_fn,
-        get_G_R_fn=get_G_R_fn,
-        get_sigma_mu_nu_fn=get_sigma_mu_nu_fn,
-        print0=print0,
-    )
-    sigma_nonneg = sigma_cond_nonneg + sigma_val_nonneg
-    sigma_kij_nonneg = jax.vmap(
-        lambda s_munu: get_sigma_kij_fn(psi_proj_rmu_X, psi_proj_rmuT_Y, s_munu),
-        in_axes=0,
-    )(sigma_nonneg)
+    def _run_sigma_pair(omega_eval: np.ndarray, kernel_cond: int, kernel_val: int, tag: str) -> jax.Array:
+        sigma_cond, _ = _convolve_sigma_branch(
+            omega_nonneg_ry=omega_eval,
+            E_A=E_cond,
+            base_mask_A=cond_mask,
+            B_mu_nu=B_corr,
+            Omega_mu_nu=Omega_abs,
+            V_mu_nu=V_mu_nu,
+            base_mask_B=B_mask,
+            kernel_sign=kernel_cond,
+            regularization_width_ry=regularization_width_ry,
+            edge_factor=edge_factor,
+            target_error=target_error,
+            max_nodes=max_nodes,
+            crossing_eps_q=crossing_eps_q,
+            crossing_max_nodes=crossing_max_nodes,
+            psi_coh_rmuT_X=psi_coh_rmuT_X,
+            psi_coh_rmu_Y=psi_coh_rmu_Y,
+            nkx=nkx,
+            nky=nky,
+            nkz=nkz,
+            nk_tot=nk_tot,
+            bispinor=bispinor,
+            mesh_xy=mesh_xy,
+            get_G_mu_nu_fn=get_G_mu_nu_fn,
+            get_G_R_fn=get_G_R_fn,
+            get_sigma_mu_nu_fn=get_sigma_mu_nu_fn,
+            log_tag=tag,
+            print0=print0,
+        )
+        sigma_val, _ = _convolve_sigma_branch(
+            omega_nonneg_ry=omega_eval,
+            E_A=H_val,
+            base_mask_A=val_mask,
+            B_mu_nu=B_corr,
+            Omega_mu_nu=Omega_abs,
+            V_mu_nu=V_mu_nu,
+            base_mask_B=B_mask,
+            kernel_sign=kernel_val,
+            regularization_width_ry=regularization_width_ry,
+            edge_factor=edge_factor,
+            target_error=target_error,
+            max_nodes=max_nodes,
+            crossing_eps_q=crossing_eps_q,
+            crossing_max_nodes=crossing_max_nodes,
+            psi_coh_rmuT_X=psi_coh_rmuT_X,
+            psi_coh_rmu_Y=psi_coh_rmu_Y,
+            nkx=nkx,
+            nky=nky,
+            nkz=nkz,
+            nk_tot=nk_tot,
+            bispinor=bispinor,
+            mesh_xy=mesh_xy,
+            get_G_mu_nu_fn=get_G_mu_nu_fn,
+            get_G_R_fn=get_G_R_fn,
+            get_sigma_mu_nu_fn=get_sigma_mu_nu_fn,
+            log_tag=tag,
+            print0=print0,
+            )
+        return sigma_cond + sigma_val
 
-    omega_to_idx: dict[float, int] = {float(v): i for i, v in enumerate(omega_nonneg.tolist())}
-    gather_idx = np.asarray([omega_to_idx[float(abs(v))] for v in omega_req], dtype=np.int32)
-    sigma_req = sigma_kij_nonneg[gather_idx]
-    neg_mask = jnp.asarray(omega_req < 0.0)
-    sigma_req = jnp.where(neg_mask[:, None, None, None], jnp.conj(sigma_req), sigma_req)
+    n_omega = int(omega_req.size)
+    nk_proj = int(psi_proj_rmu_X.shape[0])
+    nb_proj = int(psi_proj_rmu_X.shape[1])
+    sigma_kij_host = np.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=np.complex128)
+
+    stream_path = None
+    h5_stream = None
+    dset_sigma_munu = None
+    if sigma_munu_h5_path:
+        if jax.process_count() != 1:
+            print0("  WARNING: sigma_munu_h5_path requested with multi-process JAX; disabling streamed mu-nu dump.")
+        elif jax.process_index() == 0:
+            stream_path = str(sigma_munu_h5_path)
+            stream_dir = os.path.dirname(os.path.abspath(stream_path))
+            if stream_dir:
+                os.makedirs(stream_dir, exist_ok=True)
+            ns = int(psi_coh_rmuT_X.shape[1])
+            n_rmu = int(psi_coh_rmuT_X.shape[2])
+            mu_chunk = max(1, min(32, n_rmu))
+            chunks = (1, ns, mu_chunk, ns, mu_chunk, 1, 1, 1)
+            h5_stream = h5py.File(stream_path, "w")
+            h5_stream.create_dataset("omega_ry", data=np.asarray(omega_req, dtype=np.float64))
+            h5_stream.create_dataset("omega_ev", data=np.asarray(omega_req * 13.6056980659, dtype=np.float64))
+            dset_sigma_munu = h5_stream.create_dataset(
+                "sigma_c_munu_ry",
+                shape=(n_omega, ns, n_rmu, ns, n_rmu, nkx, nky, nkz),
+                dtype=np.complex128,
+                chunks=chunks,
+            )
+            h5_stream.attrs["layout"] = "omega,s1,mu,s2,nu,kx,ky,kz"
+            h5_stream.attrs["note"] = "Streamed in omega batches to avoid full Nw*Nmu^2 GPU residency."
+
+    def _accumulate_batch(global_idx: np.ndarray, sigma_munu_batch: jax.Array) -> None:
+        sigma_kij_batch = jax.vmap(
+            lambda s_munu: get_sigma_kij_fn(psi_proj_rmu_X, psi_proj_rmuT_Y, s_munu),
+            in_axes=0,
+        )(sigma_munu_batch)
+        sigma_kij_host[np.asarray(global_idx, dtype=np.int64)] = np.asarray(
+            jax.device_get(sigma_kij_batch), dtype=np.complex128
+        )
+        if dset_sigma_munu is not None:
+            dset_sigma_munu[np.asarray(global_idx, dtype=np.int64)] = np.asarray(
+                jax.device_get(sigma_munu_batch), dtype=np.complex128
+            )
+
+    try:
+        # ω_rel >= 0: Σ^- gets crossing treatment, Σ^+ sign-definite.
+        if omega_pos.size:
+            for ibeg in range(0, omega_pos.size, omega_batch_size):
+                iend = min(ibeg + omega_batch_size, omega_pos.size)
+                idx_batch = idx_pos[ibeg:iend]
+                omega_batch = omega_rel_req[idx_batch]
+                sigma_batch = _run_sigma_pair(omega_batch, kernel_cond=+1, kernel_val=-1, tag="ω>=E_F")
+                _accumulate_batch(idx_batch, sigma_batch)
+
+        # ω_rel < 0: flip kernels with |ω_rel| (no conjugation shortcut).
+        if omega_neg_abs.size:
+            # For ω_rel = -|ω|:
+            #   1/(ω_rel - S_c) = -1/(|ω| + S_c)  -> -(plus-kernel)
+            #   1/(ω_rel + S_v) = -1/(|ω| - S_v)  -> -(minus-kernel)
+            # so the flipped-kernel result carries an overall minus sign.
+            for ibeg in range(0, omega_neg_abs.size, omega_batch_size):
+                iend = min(ibeg + omega_batch_size, omega_neg_abs.size)
+                idx_batch = idx_neg[ibeg:iend]
+                omega_batch_abs = -omega_rel_req[idx_batch]
+                sigma_batch = -_run_sigma_pair(omega_batch_abs, kernel_cond=-1, kernel_val=+1, tag="ω<E_F")
+                _accumulate_batch(idx_batch, sigma_batch)
+    finally:
+        if h5_stream is not None:
+            h5_stream.close()
+
+    sigma_kij_req = jnp.asarray(sigma_kij_host, dtype=jnp.complex128)
     return SigmaOmegaResult(
         omega_ry=np.asarray(omega_req, dtype=np.float64),
         omega_ev=np.asarray(omega_req * 13.6056980659, dtype=np.float64),
-        sigma_c_kij=sigma_req,
+        sigma_c_kij=sigma_kij_req,
+        sigma_munu_h5_path=stream_path,
     )
 
 
@@ -559,6 +642,7 @@ def compute_sigma_c_ppm_laplace(
     occ_full: jax.Array,
     B_mu_nu: jax.Array,
     Omega_mu_nu: jax.Array,
+    V_mu_nu: jax.Array,
     omega_eval_ry: float,
     nkx: int,
     nky: int,
@@ -584,6 +668,7 @@ def compute_sigma_c_ppm_laplace(
         occ_full=occ_full,
         B_mu_nu=B_mu_nu,
         Omega_mu_nu=Omega_mu_nu,
+        V_mu_nu=V_mu_nu,
         omega_values_ry=np.asarray([float(omega_eval_ry)], dtype=np.float64),
         nkx=nkx,
         nky=nky,

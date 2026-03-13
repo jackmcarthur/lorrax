@@ -568,11 +568,13 @@ def read_cohsex_input(filename: str) -> dict:
 		# ppm_sigma_max_nodes: Max minimax nodes for Σ^c quadratures.
 		# sigma_omega_min_ev: Lower bound (eV) of default Sigma_mnk(ω) delivery grid.
 		# sigma_omega_max_ev: Upper bound (eV) of default Sigma_mnk(ω) delivery grid.
-		# sigma_omega_step_ev: Spacing (eV) for default Sigma_mnk(ω) grid.
-		# sigma_regularization_ev: Regularization width ξ (eV) for crossing windows.
-		# sigma_window_edge_factor: Edge factor c_edge in three-window construction.
-		# sigma_omega_h5_file: Output HDF5 path for Sigma_mnk(ω) grid.
-		# chunk_size:    Band chunk size for memory-efficient wavefunction loading.
+			# sigma_omega_step_ev: Spacing (eV) for default Sigma_mnk(ω) grid.
+			# sigma_regularization_ev: Regularization width ξ (eV) for crossing windows.
+			# sigma_window_edge_factor: Edge factor c_edge in three-window construction.
+			# sigma_omega_h5_file: Output HDF5 path for Sigma_mnk(ω) grid.
+			# sigma_omega_batch_size: Number of ω points per GN-PPM Sigma batch.
+			# sigma_munu_h5_file: Optional HDF5 path to stream Σ^c_{μν}(ω) in small ω batches.
+			# chunk_size:    Band chunk size for memory-efficient wavefunction loading.
 		#                -1 = no chunking (all bands at once, default)
 		#                 0 = auto (currently 64, TODO: dynamic from available RAM)
 		#                1-2048 = explicit chunk size
@@ -608,17 +610,19 @@ def read_cohsex_input(filename: str) -> dict:
 			"minimax_target_error": getf("minimax_target_error", fallback=1.0e-6),
 			"minimax_max_nodes": geti("minimax_max_nodes", fallback=64),
 			"ppm_omega_p": getf("ppm_omega_p", fallback=2.0),
-			"ppm_fallback_omega": getf("ppm_fallback_omega", fallback=1.0),
+			"ppm_fallback_omega": getf("ppm_fallback_omega", fallback=2.0),
 			"use_ppm_sigma": getb("use_ppm_sigma", fallback=False),
 			"ppm_sigma_target_error": getf("ppm_sigma_target_error", fallback=1.0e-6),
 			"ppm_sigma_max_nodes": geti("ppm_sigma_max_nodes", fallback=64),
 			"sigma_omega_min_ev": getf("sigma_omega_min_ev", fallback=-5.0),
 			"sigma_omega_max_ev": getf("sigma_omega_max_ev", fallback=5.0),
-			"sigma_omega_step_ev": getf("sigma_omega_step_ev", fallback=0.25),
-			"sigma_regularization_ev": getf("sigma_regularization_ev", fallback=0.25),
-			"sigma_window_edge_factor": getf("sigma_window_edge_factor", fallback=1.5),
-			"sigma_omega_h5_file": get("sigma_omega_h5_file", fallback="sigma_mnk.h5"),
-			"chunk_size": geti("chunk_size", fallback=-1),       # band chunk size (-1=all, 0=auto, 1-2048=explicit)
+				"sigma_omega_step_ev": getf("sigma_omega_step_ev", fallback=0.25),
+				"sigma_regularization_ev": getf("sigma_regularization_ev", fallback=0.25),
+				"sigma_window_edge_factor": getf("sigma_window_edge_factor", fallback=1.5),
+				"sigma_omega_h5_file": get("sigma_omega_h5_file", fallback="sigma_mnk.h5"),
+				"sigma_omega_batch_size": geti("sigma_omega_batch_size", fallback=4),
+				"sigma_munu_h5_file": get("sigma_munu_h5_file", fallback=""),
+				"chunk_size": geti("chunk_size", fallback=-1),       # band chunk size (-1=all, 0=auto, 1-2048=explicit)
 			"r_chunk_size": geti("r_chunk_size", fallback=0),    # r-axis chunk (0=auto, >0=explicit)
 			"band_chunk_size": geti("band_chunk_size", fallback=16),  # bands per FFT during r-chunk loop
 			"memory_per_device_gb": getf("memory_per_device_gb", fallback=0.0),  # 0=auto-detect
@@ -644,11 +648,11 @@ def read_cohsex_input(filename: str) -> dict:
 			"sys_dim": 2,
 			"debug_hartree": False,
 			"debug_omega": None,
-			"screening_method": "minimax",
-			"minimax_target_error": 1.0e-6,
-			"minimax_max_nodes": 64,
-			"ppm_omega_p": 2.0,
-			"ppm_fallback_omega": 1.0,
+				"screening_method": "minimax",
+				"minimax_target_error": 1.0e-6,
+				"minimax_max_nodes": 64,
+				"ppm_omega_p": 2.0,
+				"ppm_fallback_omega": 2.0,
 				"use_ppm_sigma": False,
 				"ppm_sigma_target_error": 1.0e-6,
 				"ppm_sigma_max_nodes": 64,
@@ -658,11 +662,13 @@ def read_cohsex_input(filename: str) -> dict:
 				"sigma_regularization_ev": 0.25,
 				"sigma_window_edge_factor": 1.5,
 				"sigma_omega_h5_file": "sigma_mnk.h5",
+				"sigma_omega_batch_size": 4,
+				"sigma_munu_h5_file": "",
 				"chunk_size": -1,
 				"r_chunk_size": 0,
 				"band_chunk_size": 16,
 				"memory_per_device_gb": 0.0,
-			"isdf_pair_mode": "spin_traced",
+				"isdf_pair_mode": "spin_traced",
 			}
 
 	# Parse optional QE-style K_POINTS block: take the number after it, read next that many lines

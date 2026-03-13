@@ -541,7 +541,7 @@ def compute_screening(
     minimax_target_error=1.0e-6,
     minimax_max_nodes=64,
     ppm_omega_p=None,
-    ppm_fallback_omega=1.0,
+    ppm_fallback_omega=2.0,
     validate_static=True,
     tensors_filename=None,
     print0=print,

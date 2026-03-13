@@ -319,7 +319,7 @@ def extract_gn_ppm_parameters(
     chi_iwp_q: jax.Array,
     *,
     omega_p: float,
-    fallback_omega: float = 1.0,
+    fallback_omega: float = 2.0,
 ) -> GodbyNeedsPPM:
     """Extract Godby-Needs PPM parameters from chi(0) and chi(i*omega_p)."""
 
@@ -346,16 +346,19 @@ def extract_gn_ppm_parameters(
     for iq in range(n_q):
         A0 = eye - V_flat[iq] @ chi0_flat[iq]
         Ai = eye - V_flat[iq] @ chii_flat[iq]
-        pi0[iq] = np.linalg.solve(A0, chi0_flat[iq])
-        pii[iq] = np.linalg.solve(Ai, chii_flat[iq])
+        # Π = χ (I - Vχ)^-1; use right-side solve via transpose for stability.
+        pi0[iq] = np.linalg.solve(A0.T, chi0_flat[iq].T).T
+        pii[iq] = np.linalg.solve(Ai.T, chii_flat[iq].T).T
 
     denom = pi0 - pii
     safe = np.abs(denom) > 1.0e-14
     ratio = np.zeros_like(pi0.real)
     ratio[safe] = np.real(pii[safe] / denom[safe])
 
-    good = ratio > 0.0
-    omega_vals = np.where(good, omega_p * np.sqrt(ratio), fallback_omega)
+    good = np.isfinite(ratio) & (ratio > 0.0)
+    omega_vals = np.full_like(ratio, fallback_omega, dtype=np.float64)
+    if np.any(good):
+        omega_vals[good] = omega_p * np.sqrt(ratio[good])
     B = -0.5 * pi0 * omega_vals
     unfulfilled_fraction = float(1.0 - np.mean(good.astype(np.float64)))
 
