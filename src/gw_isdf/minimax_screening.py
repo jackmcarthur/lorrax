@@ -117,6 +117,7 @@ class GodbyNeedsPPM:
     omega_p: float
     omega_qmunu: jnp.ndarray
     b_qmunu: jnp.ndarray
+    valid_qmunu: jnp.ndarray
     unfulfilled_fraction: float
 
 
@@ -369,6 +370,7 @@ def extract_gn_ppm_parameters(
         omega_p=omega_p,
         omega_qmunu=jnp.asarray(omega_qmunu),
         b_qmunu=jnp.asarray(B_qmunu),
+        valid_qmunu=jnp.asarray(good.reshape(nkx, nky, nkz, n_rmu, n_rmu)),
         unfulfilled_fraction=unfulfilled_fraction,
     )
 
@@ -415,5 +417,6 @@ def extract_gn_ppm_parameters_from_Wc(
         omega_p=omega_p,
         omega_qmunu=jnp.asarray(omega_qmunu),
         b_qmunu=jnp.asarray(B_qmunu),
+        valid_qmunu=jnp.asarray(good.reshape(nkx, nky, nkz, n_rmu, n_rmu)),
         unfulfilled_fraction=unfulfilled_fraction,
     )

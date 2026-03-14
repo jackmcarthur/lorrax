@@ -172,6 +172,101 @@ def write_eqp_g0w0(
 	return abs_path
 
 
+def write_sigma_freq_debug_table(
+	filepath,
+	*,
+	energies_dft_ev,
+	omega_rel_dft_ev,
+	kin_ion_diag_ev,
+	sigma_sex_static_diag_ev,
+	sigma_coh_static_diag_ev,
+	sigma_x_diag_ev,
+	sigma_c_w0_diag_ev,
+	sigma_c_plus_edft_ev,
+	sigma_c_minus_edft_ev,
+	sigma_c_invalid_static_diag_ev,
+	sigma_c_edft_ev,
+):
+	"""Write per-(k,n) diagonal sigma decomposition used for GN-PPM debugging.
+
+	All arrays are expected with shape (nk, nb). Values are written in eV.
+	"""
+	fields = [
+		np.asarray(energies_dft_ev, dtype=np.float64),
+		np.asarray(omega_rel_dft_ev, dtype=np.float64),
+		np.asarray(kin_ion_diag_ev, dtype=np.complex128),
+		np.asarray(sigma_sex_static_diag_ev, dtype=np.complex128),
+		np.asarray(sigma_coh_static_diag_ev, dtype=np.complex128),
+		np.asarray(sigma_x_diag_ev, dtype=np.complex128),
+		np.asarray(sigma_c_w0_diag_ev, dtype=np.complex128),
+		np.asarray(sigma_c_plus_edft_ev, dtype=np.complex128),
+		np.asarray(sigma_c_minus_edft_ev, dtype=np.complex128),
+		np.asarray(sigma_c_invalid_static_diag_ev, dtype=np.complex128),
+		np.asarray(sigma_c_edft_ev, dtype=np.complex128),
+	]
+	ref_shape = fields[0].shape
+	for arr in fields[1:]:
+		if arr.shape != ref_shape:
+			raise ValueError(f"sigma freq debug shape mismatch: {arr.shape} vs {ref_shape}")
+	nk, nb = ref_shape
+
+	abs_path = os.path.abspath(filepath)
+	dirname = os.path.dirname(abs_path)
+	if dirname:
+		os.makedirs(dirname, exist_ok=True)
+
+	with open(abs_path, "w") as f:
+		sep = "\t\t"
+		col_w = 15
+		cols = [
+			"k",
+			"n",
+			"Edft-Ef",
+			"E_dft",
+			"kin_ion",
+			"sex_0",
+			"coh_0",
+			"x_bare",
+			"sig_c(0)",
+			"sig_c+(w)",
+			"sig_c-(w)",
+			"sig_c_invld(0)",
+			"sig_c(Edft)",
+		]
+		def _h(name: str) -> str:
+			return f"{name:<{col_w}}"
+		def _r(x: float) -> str:
+			if np.isnan(x):
+				return f"{'nan':>{col_w}}"
+			return f"{x:>{col_w}.3f}"
+		def _i(x: int) -> str:
+			return f"{x:>{col_w}d}"
+		f.write("# Sigma frequency debug decomposition (all energies in eV)\n")
+		f.write("# " + sep.join(_h(c) for c in cols) + "\n")
+		for ik in range(nk):
+			f.write(f"\nk-point {ik}:\n")
+			f.write(sep.join(_h(c) for c in cols) + "\n")
+			for ib in range(nb):
+				row = [
+					_i(ik),
+					_i(ib),
+					_r(float(fields[1][ik, ib])),
+					_r(float(fields[0][ik, ib])),
+					_r(float(np.real(fields[2][ik, ib]))),
+					_r(float(np.real(fields[3][ik, ib]))),
+					_r(float(np.real(fields[4][ik, ib]))),
+					_r(float(np.real(fields[5][ik, ib]))),
+					_r(float(np.real(fields[6][ik, ib]))),
+					_r(float(np.real(fields[7][ik, ib]))),
+					_r(float(np.real(fields[8][ik, ib]))),
+					_r(float(np.real(fields[9][ik, ib]))),
+					_r(float(np.real(fields[10][ik, ib]))),
+				]
+				line = sep.join(row)
+				f.write(line + "\n")
+	return abs_path
+
+
 def write_eqp_table(dft_energies_ev, qp_energies_ev, filename="eqp.dat"):
 	"""Write DFT vs quasiparticle energies per (k,n) in eqp-style text format.
 

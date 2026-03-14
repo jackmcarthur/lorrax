@@ -577,6 +577,9 @@ def read_cohsex_input(filename: str) -> dict:
 		# sigma_kij_h5_file: Optional HDF5 path to stream Σ^c_{kij}(ω) in ω-chunks.
 		# ppm_sigma_scale: Optional global scale factor for GN-PPM Σ^c (default 1.0).
 		# ppm_sigma_flip_neg: If True, flip the overall sign of the ω<E_F branch (debug only).
+		# sigma_debug_split_contrib: If True, store Σ^(+) and Σ^(-) separately in sigma_mnk.h5.
+		# fermi_reference: 'vbm' (default) or 'midgap' reference for Σ^c windowing.
+		# sigma_at_dft_extrapolate: If True, clip/extrapolate Σ_c(ω) to match E_DFT outside ω-grid.
 		# sigma_at_dft_energies: Evaluate Σ_c(E_DFT) and Σ_xc(E_DFT) for BGW comparisons.
 		# ppm_sigma_debug_static_norm: Compare PPM Wc(0) static COH vs screened-COH normalization.
 		# sigma_debug_quadrature: Print minimax quadrature error per sigma window.
@@ -632,6 +635,9 @@ def read_cohsex_input(filename: str) -> dict:
 			"sigma_kij_h5_file": get("sigma_kij_h5_file", fallback=""),
 			"ppm_sigma_scale": getf("ppm_sigma_scale", fallback=1.0),
 			"ppm_sigma_flip_neg": getb("ppm_sigma_flip_neg", fallback=False),
+			"sigma_debug_split_contrib": getb("sigma_debug_split_contrib", fallback=False),
+			"fermi_reference": get("fermi_reference", fallback="vbm").strip().lower(),
+			"sigma_at_dft_extrapolate": getb("sigma_at_dft_extrapolate", fallback=False),
 			"sigma_at_dft_energies": getb("sigma_at_dft_energies", fallback=False),
 			"ppm_sigma_debug_static_norm": getb("ppm_sigma_debug_static_norm", fallback=False),
 			"sigma_debug_quadrature": getb("sigma_debug_quadrature", fallback=False),
@@ -681,6 +687,9 @@ def read_cohsex_input(filename: str) -> dict:
 				"sigma_kij_h5_file": "",
 				"ppm_sigma_scale": 1.0,
 				"ppm_sigma_flip_neg": False,
+				"sigma_debug_split_contrib": False,
+				"fermi_reference": "vbm",
+				"sigma_at_dft_extrapolate": False,
 				"sigma_at_dft_energies": False,
 				"ppm_sigma_debug_static_norm": False,
 				"sigma_debug_quadrature": False,

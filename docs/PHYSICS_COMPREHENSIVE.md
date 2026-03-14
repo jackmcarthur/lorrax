@@ -568,6 +568,26 @@ temp = einsum('kiaμ, kaμbν -> kibν', ψ.conj(), Σ)  # (k, i, b, ν)
 
 **Implementation**: `get_sigma_x_kij_jax()` in `gw_jax.py:804`.
 
+**Important frequency-dependent caveat**: for the windowed GN-PPM $\Sigma^c(\omega)$ pipeline, the per-window `Re`/`Im` projection must be taken before band projection. In general,
+
+$$K[\operatorname{Re} X] \neq \operatorname{Re} K[X], \qquad K[\operatorname{Im} X] \neq \operatorname{Im} K[X],$$
+
+for the band-projection map $K[X]_{ij,\mathbf{k}} = \sum_{ab\mu\nu}\psi^*_{i,a}(\mu) X_{\mathbf{k},ab}(\mu,\nu)\psi_{j,b}(\nu)$.
+
+The correct reduced-storage implementation is to contract two band-space channels for each $\tau$ node,
+
+$$S_u^{(R)} = K[\operatorname{Re} X_u], \qquad S_u^{(I)} = K[\operatorname{Im} X_u],$$
+
+and then assemble each frequency point from scalar coefficients. If
+
+$$c_u(\omega)=p_u(\omega)+i q_u(\omega),$$
+
+then
+
+$$K[\operatorname{Re}(c_u X_u)] = p_u S_u^{(R)} - q_u S_u^{(I)}, \qquad K[\operatorname{Im}(c_u X_u)] = p_u S_u^{(I)} + q_u S_u^{(R)}.$$
+
+This preserves the exact window algebra while storing only band-space objects. Taking `Re` or `Im` of an already projected complex $\Sigma_{ij,\mathbf{k}}(\tau)$ is not equivalent in general and can make the answer depend on how contributions are partitioned between windows.
+
 ### 6.8 Self-Consistency Loop
 
 The quasiparticle (QP) Hamiltonian is:

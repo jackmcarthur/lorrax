@@ -159,6 +159,13 @@ Rewrite: $\omega_\text{rel} + (h_v + \Omega) = (h_v + \Omega) - |\omega_\text{re
 - $\Sigma^{(+)}$: minus-kernel in $|\omega_\text{rel}|$ → 3 windows (core has crossing)
 - $\Sigma^{(-)}$: plus-kernel in $|\omega_\text{rel}|$ → single Laplace (always sign-definite, since $|\omega_\text{rel}| + \tilde{E}_c + \Omega > 0$)
 
+In both cases there is an additional overall minus sign relative to the positive-$|\omega_\text{rel}|$ kernel:
+
+$$\omega_\text{rel} - (\tilde{E}_c + \Omega) = -\bigl(|\omega_\text{rel}| + \tilde{E}_c + \Omega\bigr),$$
+$$\omega_\text{rel} + (h_v + \Omega) = -\bigl(|\omega_\text{rel}| - (h_v + \Omega)\bigr).$$
+
+So the $\omega< E_F$ half reuses the positive-$|\omega|$ window machinery, but the final accumulated contribution carries a global `-1` factor.
+
 The structure is perfectly symmetric about $E_F$. The same `convolve_frequencies` machinery handles both halves — it just swaps which term gets the crossing treatment.
 
 ### 5.4 $E_F$ cancellation proof
@@ -180,6 +187,37 @@ In all three cases, $E_F$ drops out of the final physical phase. Only vacuum eig
 1. Coulomb sandwich: $\Sigma^c = v \cdot [\text{accumulated}] \cdot v$.
 2. Add exchange: $\Sigma = \Sigma^x + \Sigma^c(\omega)$.
 3. Band projection: $\Sigma_{ij,\mathbf{k}}(\omega) = \sum_{ab,\mu,\nu} \psi^*_{i,a}(r_\mu)\, \Sigma_{\mathbf{k},ab}(\mu,\nu;\omega)\, \psi_{j,b}(r_\nu)$.
+
+### 5.5a Safe band-space optimization for windowed $\Sigma^c(\omega)$
+
+The window projection (`Re` for Laplace windows, `Im` for crossing windows) must act on the accumulated $\mu\nu$ tensor, not on an already projected band-space tensor:
+
+$$K[X]_{ij,\mathbf{k}} \equiv \sum_{ab,\mu,\nu} \psi^*_{i,a}(r_\mu)\, X_{\mathbf{k},ab}(\mu,\nu)\, \psi_{j,b}(r_\nu)$$
+
+In general,
+
+$$K[\operatorname{Re} X] \neq \operatorname{Re} K[X], \qquad K[\operatorname{Im} X] \neq \operatorname{Im} K[X],$$
+
+because $K[\cdot]$ is complex-linear while $\operatorname{Re}$ and $\operatorname{Im}$ are only real-linear.
+
+The exact reduced-storage optimization is therefore:
+
+1. For each $\tau_u$, build the complex $\mu\nu$ contribution $X_u$ once.
+2. Contract both real channels to bands once:
+   $$S^{(R)}_u \equiv K[\operatorname{Re} X_u], \qquad S^{(I)}_u \equiv K[\operatorname{Im} X_u].$$
+3. Discard $X_u$ in $\mu\nu$ space.
+4. Reconstruct each frequency contribution in band space using the scalar coefficient multiplying $X_u$.
+
+If the full scalar coefficient for node $u$ at frequency $\omega$ is
+
+$$c_u(\omega) = p_u(\omega) + i q_u(\omega),$$
+
+then
+
+$$K[\operatorname{Re}(c_u X_u)] = p_u S^{(R)}_u - q_u S^{(I)}_u,$$
+$$K[\operatorname{Im}(c_u X_u)] = p_u S^{(I)}_u + q_u S^{(R)}_u.$$
+
+This is exact. It avoids storing $\Sigma_{\mathbf{k}}(\mu,\nu,\omega)$ and still avoids an $N_\tau N_\omega$ sequence of $\mu\nu \to ij$ contractions. What is not allowed is to form a single complex $K[X_u]$ and then take `Re`/`Im` of that object afterward.
 
 ### 5.6 Cost
 
