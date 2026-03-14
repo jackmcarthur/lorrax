@@ -26,7 +26,7 @@ import numpy as np
 from common import Meta, jax_profile
 from .minimax_screening import (
     build_static_minimax_window_pair,
-    extract_gn_ppm_parameters,
+    extract_gn_ppm_parameters_from_Wc,
 )
 
 if TYPE_CHECKING:
@@ -666,15 +666,22 @@ def compute_screening(
                 mesh_xy,
             )
             chi_iwp.block_until_ready()
-            ppm = extract_gn_ppm_parameters(
-                V_qmunu,
-                chi_omega,
-                chi_iwp,
+            W_iwp = solve_w_from_chi_q_jax(V_qmunu, chi_iwp, meta, mesh_xy)
+            W_iwp.block_until_ready()
+            # Fit GN-PPM to W^c(0) and W^c(iωp) (no head).
+            nkx, nky, nkz = W_q.shape[0], W_q.shape[1], W_q.shape[2]
+            n_rmu = W_q.shape[4]
+            V_q = V_qmunu[0, 0, 0].reshape(nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
+            Wc0_q = W_q - V_q
+            Wci_q = W_iwp - V_q
+            ppm = extract_gn_ppm_parameters_from_Wc(
+                Wc0_q,
+                Wci_q,
                 omega_p=omega_p,
                 fallback_omega=float(ppm_fallback_omega),
             )
             print0(
-                "  GN-PPM extracted from minimax chi:"
+                "  GN-PPM extracted from minimax W^c:"
                 f" ω_p={omega_p:.6f} Ry, unfulfilled={100.0 * ppm.unfulfilled_fraction:.2f}%"
             )
     else:

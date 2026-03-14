@@ -571,9 +571,16 @@ def read_cohsex_input(filename: str) -> dict:
 			# sigma_omega_step_ev: Spacing (eV) for default Sigma_mnk(ω) grid.
 			# sigma_regularization_ev: Regularization width ξ (eV) for crossing windows.
 			# sigma_window_edge_factor: Edge factor c_edge in three-window construction.
-			# sigma_omega_h5_file: Output HDF5 path for Sigma_mnk(ω) grid.
-			# sigma_omega_batch_size: Number of ω points per GN-PPM Sigma batch.
-			# sigma_munu_h5_file: Optional HDF5 path to stream Σ^c_{μν}(ω) in small ω batches.
+		# sigma_omega_h5_file: Output HDF5 path for Sigma_mnk(ω) grid.
+		# sigma_omega_batch_size: Number of ω points per GN-PPM Sigma batch.
+		# sigma_omega_accumulation: 'kij' (in-memory) or 'kij_stream' (stream Σ_c(kij,ω)).
+		# sigma_kij_h5_file: Optional HDF5 path to stream Σ^c_{kij}(ω) in ω-chunks.
+		# ppm_sigma_scale: Optional global scale factor for GN-PPM Σ^c (default 1.0).
+		# ppm_sigma_flip_neg: If True, flip the overall sign of the ω<E_F branch (debug only).
+		# sigma_at_dft_energies: Evaluate Σ_c(E_DFT) and Σ_xc(E_DFT) for BGW comparisons.
+		# ppm_sigma_debug_static_norm: Compare PPM Wc(0) static COH vs screened-COH normalization.
+		# sigma_debug_quadrature: Print minimax quadrature error per sigma window.
+		# sigma_debug_quadrature_samples: Sample count for quadrature checks.
 			# chunk_size:    Band chunk size for memory-efficient wavefunction loading.
 		#                -1 = no chunking (all bands at once, default)
 		#                 0 = auto (currently 64, TODO: dynamic from available RAM)
@@ -619,10 +626,17 @@ def read_cohsex_input(filename: str) -> dict:
 				"sigma_omega_step_ev": getf("sigma_omega_step_ev", fallback=0.25),
 				"sigma_regularization_ev": getf("sigma_regularization_ev", fallback=0.25),
 				"sigma_window_edge_factor": getf("sigma_window_edge_factor", fallback=1.5),
-				"sigma_omega_h5_file": get("sigma_omega_h5_file", fallback="sigma_mnk.h5"),
-				"sigma_omega_batch_size": geti("sigma_omega_batch_size", fallback=4),
-				"sigma_munu_h5_file": get("sigma_munu_h5_file", fallback=""),
-				"chunk_size": geti("chunk_size", fallback=-1),       # band chunk size (-1=all, 0=auto, 1-2048=explicit)
+			"sigma_omega_h5_file": get("sigma_omega_h5_file", fallback="sigma_mnk.h5"),
+			"sigma_omega_batch_size": geti("sigma_omega_batch_size", fallback=4),
+			"sigma_omega_accumulation": get("sigma_omega_accumulation", fallback="auto"),
+			"sigma_kij_h5_file": get("sigma_kij_h5_file", fallback=""),
+			"ppm_sigma_scale": getf("ppm_sigma_scale", fallback=1.0),
+			"ppm_sigma_flip_neg": getb("ppm_sigma_flip_neg", fallback=False),
+			"sigma_at_dft_energies": getb("sigma_at_dft_energies", fallback=False),
+			"ppm_sigma_debug_static_norm": getb("ppm_sigma_debug_static_norm", fallback=False),
+			"sigma_debug_quadrature": getb("sigma_debug_quadrature", fallback=False),
+			"sigma_debug_quadrature_samples": geti("sigma_debug_quadrature_samples", fallback=200),
+			"chunk_size": geti("chunk_size", fallback=-1),       # band chunk size (-1=all, 0=auto, 1-2048=explicit)
 			"r_chunk_size": geti("r_chunk_size", fallback=0),    # r-axis chunk (0=auto, >0=explicit)
 			"band_chunk_size": geti("band_chunk_size", fallback=16),  # bands per FFT during r-chunk loop
 			"memory_per_device_gb": getf("memory_per_device_gb", fallback=0.0),  # 0=auto-detect
@@ -663,7 +677,14 @@ def read_cohsex_input(filename: str) -> dict:
 				"sigma_window_edge_factor": 1.5,
 				"sigma_omega_h5_file": "sigma_mnk.h5",
 				"sigma_omega_batch_size": 4,
-				"sigma_munu_h5_file": "",
+				"sigma_omega_accumulation": "auto",
+				"sigma_kij_h5_file": "",
+				"ppm_sigma_scale": 1.0,
+				"ppm_sigma_flip_neg": False,
+				"sigma_at_dft_energies": False,
+				"ppm_sigma_debug_static_norm": False,
+				"sigma_debug_quadrature": False,
+				"sigma_debug_quadrature_samples": 200,
 				"chunk_size": -1,
 				"r_chunk_size": 0,
 				"band_chunk_size": 16,

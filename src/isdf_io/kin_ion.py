@@ -1,11 +1,19 @@
-"""Kinetic + ionic Hamiltonian I/O."""
+"""Kinetic + ionic Hamiltonian I/O.
+
+The kin_ion matrix elements correspond to H_DFT - V_xc, i.e. kinetic + ionic
+(local + nonlocal) contributions, with V_xc removed. The Hartree contribution
+is not included unless explicitly added during kin_ion generation.
+"""
 import os
 import h5py
 import jax.numpy as jnp
 
 
 def load_kin_ion_submatrix(h5_path: str, band_start: int, band_stop: int):
-	"""Load sub-block of the kin+ion Hamiltonian for the requested band slice.
+	"""Load sub-block of the kin_ion Hamiltonian for the requested band slice.
+
+	The stored dataset is H_DFT - V_xc (kinetic + ionic; Hartree only if it was
+	added at generation time), so V_xc should not be subtracted again later.
 	
 	Args:
 		h5_path: Path to kin_ion.h5 file
@@ -30,4 +38,3 @@ def load_kin_ion_submatrix(h5_path: str, band_start: int, band_stop: int):
 			)
 		sub = kin_dset[:, band_start:band_stop, band_start:band_stop]
 	return jnp.asarray(sub, dtype=jnp.complex128)
-

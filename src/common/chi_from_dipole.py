@@ -50,7 +50,7 @@ def compute_S_omega(
     pref_c = jnp.asarray(pref, dtype=jnp.complex128)
 
     def S_one(omega_val: jnp.ndarray) -> jnp.ndarray:
-        w_c = jnp.asarray(omega_val, dtype=jnp.float64) + 1j * jnp.asarray(float(eta), dtype=jnp.float64)
+        w_c = jnp.asarray(omega_val, dtype=jnp.complex128) + 1j * jnp.asarray(float(eta), dtype=jnp.float64)
         denom = dE_cv * (w_c * w_c - dE_cv * dE_cv)
         W = jnp.where(jnp.abs(denom) > 1e-16, fv_minus_fc / denom, 0.0 + 0.0j)
         W = pref_c * W
@@ -58,12 +58,11 @@ def compute_S_omega(
 
     if jnp.ndim(omegas) == 0:
         return S_one(omegas)[None, :, :]
-    return jax.vmap(S_one, in_axes=0, out_axes=0)(jnp.asarray(omegas, dtype=jnp.float64))
+    return jax.vmap(S_one, in_axes=0, out_axes=0)(jnp.asarray(omegas, dtype=jnp.complex128))
 
 
 __all__ = [
     "read_dipole_h5",
     "compute_S_omega",
 ]
-
 

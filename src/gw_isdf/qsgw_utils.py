@@ -75,6 +75,9 @@ def build_qsgw_sigma_xc(
     Implements:
       Sigma_xc^QSGW_ij(k) = 1/2 * [ Re Sigma_ij(k, E_i(k)) + Re Sigma_ij(k, E_j(k)) ]
     where Re denotes Hermitian part.
+
+    Note: this uses fixed-point (nonlinear) QP energies when available; we do
+    not apply a linearized Z*(Sigma - V_xc) correction in the QSGW utilities.
     """
     sigma = np.asarray(sigma_xc_omega_kij_ev, dtype=np.complex128)
     omega = np.asarray(omega_ev, dtype=np.float64)

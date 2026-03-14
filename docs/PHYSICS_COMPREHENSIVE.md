@@ -576,6 +576,13 @@ $$H_{\text{QP}} = H_{\text{KS}} - V_{xc} + \Sigma(\omega \approx E_n)$$
 
 where $H_{\text{KS}} = K + I + V_H + V_{xc}$ is the Kohn-Sham DFT Hamiltonian.
 
+**Implementation detail**: the on-disk `kin_ion` matrix elements are
+`H_DFT - V_xc` (kinetic + ionic; Hartree only if explicitly added when the
+`kin_ion` file is generated). Therefore the code should **not** subtract
+$V_{xc}$ a second time; it forms
+
+$$H_{QP} = (H_{DFT} - V_{xc}) + V_H + \Sigma_{xc}(\omega).$$
+
 **Self-consistent GW** iteratively updates $\Sigma$ until wavefunctions and energies converge:
 
 1. Start with DFT $\psi_n^{(0)}, E_n^{(0)}$

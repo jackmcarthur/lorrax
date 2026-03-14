@@ -127,6 +127,48 @@ def write_eqp1(
 						e_qp = float(energies_qp_ev[ik, ib])
 						f.write(f"       1       {ib+1}  {e_dft:14.9f}  {e_oneshot:14.9f}  {e_qp:14.9f}\n")
 					ik += 1
+
+
+def write_eqp_g0w0(
+	eqp_path,
+	energies_dft_ev,
+	g0w0_diag_ev,
+):
+	"""Write E_DFT next to diagonal (H0 + Sigma_xc(E_DFT)) for G0W0 comparisons.
+
+	Parameters
+	----------
+	eqp_path : str
+		Output file path.
+	energies_dft_ev : array (nk, nb)
+		DFT eigenvalues in eV.
+	g0w0_diag_ev : array (nk, nb)
+		Diagonal matrix elements of (kin_ion + V_H + Sigma_xc(E_DFT)) in eV.
+	"""
+	energies_dft_ev = np.asarray(energies_dft_ev, dtype=np.float64)
+	g0w0_diag_ev = np.asarray(g0w0_diag_ev, dtype=np.complex128)
+	if energies_dft_ev.shape != g0w0_diag_ev.shape:
+		raise ValueError(
+			f"Shape mismatch for eqp_g0w0: DFT {energies_dft_ev.shape} vs G0W0 {g0w0_diag_ev.shape}"
+		)
+
+	abs_path = os.path.abspath(eqp_path)
+	dirname = os.path.dirname(abs_path)
+	if dirname:
+		os.makedirs(dirname, exist_ok=True)
+
+	with open(abs_path, "w") as f:
+		f.write("# G0W0 diagonal energies (eV)\n")
+		f.write("# columns: band  E_DFT  Re[H0+Sigma_xc(E_DFT)]  Im[H0+Sigma_xc(E_DFT)]\n")
+		for k in range(energies_dft_ev.shape[0]):
+			f.write(f"\nk-point {k}:\n")
+			f.write("-" * 80 + "\n")
+			for n in range(energies_dft_ev.shape[1]):
+				e_dft = float(energies_dft_ev[k, n])
+				val = complex(g0w0_diag_ev[k, n])
+				f.write(
+					f"n={n:<3}  E_DFT={e_dft:>12.6f}  Re={val.real:>12.6f}  Im={val.imag:>12.6f}\n"
+				)
 	return abs_path
 
 

@@ -2,6 +2,9 @@
 """
 Chunked version of kin_ion_io that processes k-points in batches to avoid OOM.
 
+The resulting kin_ion matrix elements correspond to H_DFT - V_xc (kinetic +
+ionic only). Hartree is excluded here by construction.
+
 This version:
 - Processes k-points in configurable chunks (default: 16 at a time)
 - Writes results incrementally to HDF5
@@ -182,4 +185,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -371,3 +371,49 @@ def extract_gn_ppm_parameters(
         b_qmunu=jnp.asarray(B_qmunu),
         unfulfilled_fraction=unfulfilled_fraction,
     )
+
+
+def extract_gn_ppm_parameters_from_Wc(
+    Wc0_q: jnp.ndarray,
+    Wc_iwp_q: jnp.ndarray,
+    *,
+    omega_p: float,
+    fallback_omega: float = 2.0,
+) -> GodbyNeedsPPM:
+    """Extract GN-PPM parameters from W^c(0) and W^c(i*omega_p)."""
+    omega_p = float(omega_p)
+    fallback_omega = float(fallback_omega)
+    if omega_p <= 0.0:
+        raise ValueError("omega_p must be > 0 for GN-PPM extraction.")
+
+    Wc0 = np.asarray(jax.device_get(Wc0_q), dtype=np.complex128)
+    Wci = np.asarray(jax.device_get(Wc_iwp_q), dtype=np.complex128)
+
+    nkx, nky, nkz = Wc0.shape[0], Wc0.shape[1], Wc0.shape[2]
+    n_q = nkx * nky * nkz
+    n_rmu = Wc0.shape[4]
+
+    Wc0_flat = Wc0[:, :, :, 0, :, 0, :].reshape(n_q, n_rmu, n_rmu)
+    Wci_flat = Wci[:, :, :, 0, :, 0, :].reshape(n_q, n_rmu, n_rmu)
+
+    denom = Wc0_flat - Wci_flat
+    safe = np.abs(denom) > 1.0e-14
+    ratio = np.zeros_like(Wc0_flat.real)
+    ratio[safe] = np.real(Wci_flat[safe] / denom[safe])
+
+    good = np.isfinite(ratio) & (ratio > 0.0)
+    omega_vals = np.full_like(ratio, fallback_omega, dtype=np.float64)
+    if np.any(good):
+        omega_vals[good] = omega_p * np.sqrt(ratio[good])
+    B = -0.5 * Wc0_flat * omega_vals
+    unfulfilled_fraction = float(1.0 - np.mean(good.astype(np.float64)))
+
+    omega_qmunu = omega_vals.reshape(nkx, nky, nkz, n_rmu, n_rmu)
+    B_qmunu = B.reshape(nkx, nky, nkz, n_rmu, n_rmu)
+
+    return GodbyNeedsPPM(
+        omega_p=omega_p,
+        omega_qmunu=jnp.asarray(omega_qmunu),
+        b_qmunu=jnp.asarray(B_qmunu),
+        unfulfilled_fraction=unfulfilled_fraction,
+    )
