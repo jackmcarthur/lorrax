@@ -176,8 +176,19 @@ def compute_V_qfullG_for_q(
 	The head (q+G=0) is set to zero; head averages are injected later.
 	"""
 	bvec = np.asarray(wfn.blat * wfn.bvec, dtype=np.float64)
+	if sys_dim == 0:
+		# 0D cell box truncation: compute v(G) for each G-vector via real-space
+		# Wigner-Seitz truncated 1/r + FFT. See compute_vcoul_0d.py for details.
+		from .compute_vcoul_0d import compute_vcoul_box
+		bdot = np.asarray(wfn.bdot, dtype=np.float64)
+		fft_grid = np.asarray(wfn.fft_grid, dtype=int)
+		gvecs = np.asarray(comps_qG, dtype=int)
+		vcoul_arr = compute_vcoul_box(bdot, fft_grid, gvecs)
+		fact = 1.0 / wfn.cell_volume
+		v_scaled = vcoul_arr * fact
+		return jnp.asarray(v_scaled, dtype=jnp.complex128)
 	if sys_dim == 3:
-		raise NotImplementedError("3D system calculation not yet implemented")
+		raise NotImplementedError("3D bulk system calculation not yet implemented")
 	_ = vc0_mean
 	_ = do_Dmunu
 
@@ -217,7 +228,29 @@ def compute_q0_averages(
 
 	Otherwise, fall back to the historical Ismail–Beigi gamma model using
 	``epshead`` (for continuity with older runs).
+
+	For sys_dim=0 (molecule/box truncation), V(G=0) is finite from the
+	real-space FFT — no miniBZ Monte Carlo is needed.
 	"""
+	sys_dim = getattr(meta, 'sys_dim', 2)
+
+	if sys_dim == 0:
+		# 0D cell-box truncation: V(G=0) is naturally finite from the WS-truncated
+		# FFT. No divergence, no mini-BZ averaging required.
+		from .compute_vcoul_0d import compute_vcoul_box
+		bdot = np.asarray(wfn.bdot, dtype=np.float64)
+		fft_grid = np.asarray(wfn.fft_grid, dtype=int)
+		g0_vec = np.array([[0, 0, 0]], dtype=int)
+		vc0_raw = compute_vcoul_box(bdot, fft_grid, g0_vec)[0]
+		fact = 1.0 / wfn.cell_volume
+		vc0_mean = jnp.asarray(vc0_raw * fact, dtype=jnp.complex128)
+		# BGW convention for box truncation: wcoul0 = vcoul(G=0) directly.
+		# No miniBZ averaging or screening correction is applied to the head;
+		# screening enters only through the body (G,G' != 0) of the dielectric
+		# matrix. See BerkeleyGW Common/vcoul_generator.f90 line 717.
+		wcoul0 = vc0_mean
+		return vc0_mean, wcoul0
+
 	bvec = jnp.asarray(wfn.blat * wfn.bvec, dtype=jnp.float64)
 	zk = jnp.pi / bvec[2, 2]
 

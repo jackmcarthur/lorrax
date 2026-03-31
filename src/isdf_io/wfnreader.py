@@ -33,11 +33,21 @@ class WFNReader:
         self.energies = self._file['mf_header/kpoints/el'][:]
         self.occs = self._file['mf_header/kpoints/occ'][:]
 
-        self.nelec = int(np.sum(self.occs[0,0]))
-        # in-gap chemical potential
-        self.efermi = 0.5 * (np.amin(self.energies[0,:,self.nelec]) - np.amax(self.energies[0,:,self.nelec-1]))
-        self.cbm = np.amax(self.energies[0,:,self.nelec-1])
-        self.vbm = np.amin(self.energies[0,:,self.nelec])
+        # Number of occupied bands (ifmax is 1-based occupied-band index in WFN files).
+        if np.size(self.ifmax) > 0:
+            self.nelec = int(np.max(self.ifmax))
+        else:
+            self.nelec = int(np.sum(self.occs[0, 0] > 0.5))
+
+        nband = int(self.energies.shape[-1])
+        occ_idx = max(0, min(self.nelec - 1, nband - 1))
+        self.vbm = float(np.max(self.energies[:, :, occ_idx]))
+        if occ_idx + 1 < nband:
+            self.cbm = float(np.min(self.energies[:, :, occ_idx + 1]))
+            self.efermi = 0.5 * (self.vbm + self.cbm)
+        else:
+            self.cbm = float(self.vbm)
+            self.efermi = float(self.vbm)
         
         # Gspace group
         self.ng = self._file['mf_header/gspace/ng'][()]

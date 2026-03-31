@@ -13,7 +13,7 @@ import os
 import math
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import jax
 import jax.numpy as jnp
@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 
 _COMPILATION_CACHE_READY = False
 _chi_kernel_cache: dict = {}
+_chi_minimax_kernel_cache: dict = {}
 _w_solve_cache: dict = {}
 
 
@@ -282,6 +283,142 @@ def compute_chi0(
         chi_sum = chi_sum + chi_win
     
     return chi_sum
+
+
+# ============================================================================
+# χ₀ kernel — direct minimax interface (no WindowPair indirection)
+# ============================================================================
+
+def _get_chi_minimax_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
+    """JIT kernel for chi0 from minimax (tau, prefactor) arrays directly."""
+    cache_key = (id(mesh_xy), nkx, nky, nkz)
+    if cache_key in _chi_minimax_kernel_cache:
+        return _chi_minimax_kernel_cache[cache_key]
+
+    psi_XT = NamedSharding(mesh_xy, P(None, None, 'x', None))
+    psi_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+    chi_out = NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y'))
+    chi_R = NamedSharding(mesh_xy, P('x', 'y', None, None, None))
+    G_v = NamedSharding(mesh_xy, P(None, None, 'x', None, 'y'))
+    G_c = NamedSharding(mesh_xy, P(None, None, 'y', None, 'x'))
+
+    @partial(jax.jit, static_argnames=("nkx", "nky", "nkz"))
+    def _chi_kernel(
+        psi_vTX: jax.Array,    # (nk, ns, μ, nb_v)
+        psi_vY: jax.Array,     # (nk, nb_v, ns, μ)
+        psi_cX: jax.Array,     # (nk, nb_c, ns, μ)
+        psi_cTY: jax.Array,    # (nk, ns, μ, nb_c)
+        enk_v: jax.Array,      # (nk, nb_v)
+        enk_c: jax.Array,      # (nk, nb_c)
+        tau_i: jax.Array,      # (ntau,)
+        prefactor_i: jax.Array, # (ntau,) = -2 * alpha * exp(-tau * E_gap)
+        vmax: jax.Array,       # scalar
+        cmin: jax.Array,       # scalar
+        nkx: int, nky: int, nkz: int,
+    ) -> jax.Array:
+        n_rmu = psi_vTX.shape[2]
+        ntau = tau_i.shape[0]
+
+        def empty_chi():
+            chi = jnp.zeros((nkx, nky, nkz, 1, n_rmu, 1, n_rmu), dtype=jnp.complex128)
+            return jax.lax.with_sharding_constraint(chi, chi_out)
+
+        if ntau == 0:
+            return empty_chi()
+
+        def _k_to_R(g_k, flip_sign):
+            g_fft = g_k.reshape(nkx, nky, nkz, *g_k.shape[1:]).transpose(3, 4, 5, 6, 0, 1, 2)
+            return jax.lax.cond(
+                flip_sign,
+                lambda x: jnp.fft.fftn(x, axes=(-3, -2, -1), norm='ortho'),
+                lambda x: jnp.fft.ifftn(x, axes=(-3, -2, -1), norm='ortho'),
+                g_fft,
+            )
+
+        def tau_body(itau, chi_R_acc):
+            tau = tau_i[itau]
+
+            # Valence: exp(-τ(E_vmax - E_v)), always ≥ 0 and decaying
+            exp_v = jnp.exp(-tau * (vmax - enk_v))
+            # Conduction: exp(-τ(E_c - E_cmin)), always ≥ 0 and decaying
+            exp_c = jnp.exp(-tau * (enk_c - cmin))
+
+            Gv_k = jnp.einsum('ksxn,kn,knty->ksxty',
+                               jnp.conj(psi_vTX), exp_v.astype(jnp.complex128), psi_vY,
+                               optimize=True)
+            Gc_k = jnp.einsum('ksxm,km,kmty->ksxty',
+                               jnp.conj(psi_cTY), exp_c.astype(jnp.complex128), psi_cX,
+                               optimize=True)
+
+            Gv_k = jax.lax.with_sharding_constraint(Gv_k, G_v)
+            Gc_k = jax.lax.with_sharding_constraint(Gc_k, G_c)
+
+            Gv_R = _k_to_R(Gv_k, flip_sign=False)
+            Gc_mR = _k_to_R(Gc_k, flip_sign=True)
+
+            chi_tau = jnp.einsum('ambnxyz,bnamxyz->mnxyz', Gc_mR, Gv_R, optimize=True)
+            return chi_R_acc + prefactor_i[itau] * chi_tau
+
+        chi_R_init = jnp.zeros((n_rmu, n_rmu, nkx, nky, nkz), dtype=jnp.complex128)
+        chi_R_init = jax.lax.with_sharding_constraint(chi_R_init, chi_R)
+        chi_R_final = jax.lax.fori_loop(0, ntau, tau_body, chi_R_init)
+
+        chi_q = jnp.fft.fftn(chi_R_final, axes=(-3, -2, -1), norm='ortho')
+        chi_q = chi_q.transpose(2, 3, 4, 0, 1)[:, :, :, None, :, None, :]
+        return jax.lax.with_sharding_constraint(chi_q, chi_out)
+
+    _chi_minimax_kernel_cache[cache_key] = _chi_kernel
+    return _chi_kernel
+
+
+def compute_chi0_minimax(
+    psi_vTX: jax.Array, psi_vY: jax.Array,
+    psi_cX: jax.Array, psi_cTY: jax.Array,
+    enk_v: jax.Array, enk_c: jax.Array,
+    quad, meta, mesh_xy: Mesh,
+    energy_reference: float | None = None,
+) -> jax.Array:
+    """Compute χ₀ from a LaplaceMinimaxQuadrature directly.
+
+    quad.tau and quad.alpha approximate either:
+      1/x  (static)  or  x/(x²+ωp²)  (imaginary-frequency)
+    on [x_min, x_max] where x = E_c - E_v.
+
+    The physical chi0 is:
+      χ₀ = -2 Σ_ℓ α_ℓ Σ_{v,c} |M_vc|² exp(-τ_ℓ (E_c - E_v))
+
+    A uniform energy shift is optional via ``energy_reference`` and is applied
+    to both valence and conduction energies before building the minimax factors.
+    Because only differences enter, this is algebraically invariant; the knob is
+    provided so callers can keep the implementation explicitly aligned with their
+    chosen global zero of energy (e.g. midgap or VBM).
+    """
+    _ensure_compilation_cache()
+
+    nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
+
+    eref = 0.0 if energy_reference is None else float(energy_reference)
+    enk_v_host = np.asarray(jax.device_get(enk_v), dtype=np.float64) - eref
+    enk_c_host = np.asarray(jax.device_get(enk_c), dtype=np.float64) - eref
+    vmax = float(np.max(enk_v_host))
+    cmin = float(np.min(enk_c_host))
+    E_gap = cmin - vmax
+
+    tau = np.asarray(quad.tau, dtype=np.float64)
+    alpha = np.asarray(quad.alpha, dtype=np.float64)
+    prefactor = -2.0 * alpha * np.exp(-tau * E_gap)
+
+    kernel = _get_chi_minimax_kernel(mesh_xy, nkx, nky, nkz)
+    return kernel(
+        psi_vTX, psi_vY, psi_cX, psi_cTY,
+        enk_v - jnp.asarray(eref, dtype=enk_v.dtype),
+        enk_c - jnp.asarray(eref, dtype=enk_c.dtype),
+        jnp.asarray(tau, dtype=jnp.float64),
+        jnp.asarray(prefactor, dtype=jnp.float64),
+        jnp.asarray(vmax, dtype=jnp.float64),
+        jnp.asarray(cmin, dtype=jnp.float64),
+        nkx, nky, nkz,
+    )
 
 
 # ============================================================================
@@ -540,6 +677,8 @@ def compute_screening(
     screening_method="minimax",
     minimax_target_error=1.0e-6,
     minimax_max_nodes=64,
+    minimax_energy_reference="midgap",
+    minimax_energy_reference_fn=None,
     ppm_omega_p=None,
     ppm_fallback_omega=2.0,
     validate_static=True,
@@ -573,6 +712,11 @@ def compute_screening(
         Max 1/x fit error target for canonical minimax quadrature.
     minimax_max_nodes : int
         Upper bound for minimax node search.
+    minimax_energy_reference : {'midgap','vbm','cbm','none'} or float
+        Uniform energy shift reference for minimax χ0/W. This does not change
+        the physical result, but keeps reference conventions explicit.
+    minimax_energy_reference_fn : callable or None
+        Optional override returning the reference energy from (enk_v, enk_c).
     ppm_omega_p : float or None
         If set in minimax mode, also extract GN-PPM parameters using chi(0)
         and chi(i*omega_p) built from the same minimax nodes.
@@ -621,8 +765,14 @@ def compute_screening(
         psi_cTY = wf_bundle.x(s.c_slice)
         enk_v = wf_bundle.enk[:, s.v_slice]
         enk_c = wf_bundle.enk[:, s.c_slice]
+        e_ref = resolve_minimax_energy_reference(
+            enk_v,
+            enk_c,
+            reference=minimax_energy_reference,
+            reference_fn=minimax_energy_reference_fn,
+        )
 
-        windows_minimax, quad = build_static_minimax_window_pair(
+        _windows_minimax, quad = build_static_minimax_window_pair(
             enk_v,
             enk_c,
             target_error=float(minimax_target_error),
@@ -631,16 +781,10 @@ def compute_screening(
         )
 
         t_min0 = time.perf_counter()
-        chi_omega = compute_chi0(
-            psi_vTX,
-            psi_vY,
-            psi_cX,
-            psi_cTY,
-            enk_v,
-            enk_c,
-            windows_minimax,
-            meta,
-            mesh_xy,
+        chi_omega = compute_chi0_minimax(
+            psi_vTX, psi_vY, psi_cX, psi_cTY,
+            enk_v, enk_c, quad, meta, mesh_xy,
+            energy_reference=e_ref,
         )
         W_q = solve_w_from_chi_q_jax(V_qmunu, chi_omega, meta, mesh_xy)
         chi_omega.block_until_ready()
@@ -654,16 +798,25 @@ def compute_screening(
             omega_p = float(ppm_omega_p)
             if omega_p <= 0.0:
                 raise ValueError("ppm_omega_p must be > 0 when GN-PPM extraction is requested.")
-            chi_iwp = compute_chi0(
-                psi_vTX,
-                psi_vY,
-                psi_cX,
-                psi_cTY,
-                enk_v,
-                enk_c,
-                [windows_minimax[0].with_imag_freq_modulation(omega_p)],
-                meta,
-                mesh_xy,
+            # Fresh minimax for chi0(i*omega_p)
+            from .minimax_screening import solve_laplace_minimax_imag_interval
+            quad_imag = solve_laplace_minimax_imag_interval(
+                quad.x_min, quad.x_max, omega_p,
+                target_error=float(minimax_target_error),
+                max_nodes=int(minimax_max_nodes),
+            )
+            R_imag = quad_imag.x_max / quad_imag.x_min
+            omega_hat = omega_p / quad_imag.x_min
+            print0(
+                f"  Minimax imag-freq window (ωp={omega_p:.4f} Ry): "
+                f"x=[{quad_imag.x_min:.6e}, {quad_imag.x_max:.6e}] Ry, "
+                f"R={R_imag:.2f}, ω̂={omega_hat:.2f}, "
+                f"nodes={quad_imag.node_count}, fit_err~{quad_imag.max_error:.3e}"
+            )
+            chi_iwp = compute_chi0_minimax(
+                psi_vTX, psi_vY, psi_cX, psi_cTY,
+                enk_v, enk_c, quad_imag, meta, mesh_xy,
+                energy_reference=e_ref,
             )
             chi_iwp.block_until_ready()
             W_iwp = solve_w_from_chi_q_jax(V_qmunu, chi_iwp, meta, mesh_xy)
@@ -726,3 +879,40 @@ def compute_screening(
         write_w0_qmunu_to_h5(tensors_filename, W0_qmunu)
 
     return W_q
+def resolve_minimax_energy_reference(
+    enk_v: jax.Array,
+    enk_c: jax.Array,
+    *,
+    reference: str | float | int | None = "midgap",
+    reference_fn: Callable[[jax.Array, jax.Array], float] | None = None,
+) -> float:
+    """Resolve the minimax energy reference used to shift band energies.
+
+    This shift is algebraically neutral for χ0/W (only E_c-E_v enters), but
+    exposing it at the top-level minimax pipeline keeps reference conventions
+    explicit and synchronized with sigma paths.
+    """
+    if reference_fn is not None:
+        return float(reference_fn(enk_v, enk_c))
+
+    if reference is None:
+        return 0.0
+    if isinstance(reference, (int, float)):
+        return float(reference)
+
+    ref = str(reference).strip().lower()
+    if ref in ("none", "raw", "zero"):
+        return 0.0
+
+    enk_v_host = np.asarray(jax.device_get(enk_v), dtype=np.float64)
+    enk_c_host = np.asarray(jax.device_get(enk_c), dtype=np.float64)
+    vbm_ref = float(np.max(enk_v_host))
+    cbm_ref = float(np.min(enk_c_host))
+
+    if ref == "midgap":
+        return 0.5 * (vbm_ref + cbm_ref)
+    if ref == "vbm":
+        return vbm_ref
+    if ref == "cbm":
+        return cbm_ref
+    raise ValueError(f"Unknown minimax energy reference '{reference}'. Expected midgap/vbm/cbm/none or float.")

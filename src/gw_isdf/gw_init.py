@@ -551,15 +551,17 @@ def read_cohsex_input(filename: str) -> dict:
 		# ncond:         Number of conduction bands in sigma window. These are the
 		#                lowest unoccupied bands: indices [nelec, nelec+ncond).
 		# nband:         Total bands to load (for chi0, etc.). Usually > nval+ncond.
-		# sys_dim:       Dimensionality: 2=2D (slab with truncated Coulomb),
-		#                3=3D (bulk, not yet implemented). Default=2.
+		# sys_dim:       Dimensionality: 0=0D (molecule, cell box truncation),
+		#                2=2D (slab with truncated Coulomb). Default=2.
 		# debug_hartree: If True, print diagnostic info for Hartree calculation.
 		# debug_omega:   If set (float, in Ry), compute W(ω) at this frequency
 		#                instead of static W. For testing dynamic screening.
 		# screening_method: Screening backend: 'minimax' (default) or 'ctsp'.
-		# minimax_target_error: Target max error for minimax 1/x approximation.
-		# minimax_max_nodes: Maximum allowed minimax nodes.
-		# ppm_omega_p:   If set (>0, in Ry), extract GN-PPM parameters from
+			# minimax_target_error: Target max error for minimax 1/x approximation.
+			# minimax_max_nodes: Maximum allowed minimax nodes.
+			# minimax_energy_reference: uniform shift reference for minimax χ0/W
+			#                ('midgap' default, 'vbm', 'cbm', 'none', or numeric).
+			# ppm_omega_p:   If set (>0, in Ry), extract GN-PPM parameters from
 		#                minimax chi(0) and chi(i*omega_p).
 		# ppm_fallback_omega: Fallback pole value (Ry) for unfulfilled GN modes.
 		# use_ppm_sigma: If True, build GN-PPM from W(0),W(iωp) and use
@@ -578,7 +580,7 @@ def read_cohsex_input(filename: str) -> dict:
 		# ppm_sigma_scale: Optional global scale factor for GN-PPM Σ^c (default 1.0).
 		# ppm_sigma_flip_neg: If True, flip the overall sign of the ω<E_F branch (debug only).
 		# sigma_debug_split_contrib: If True, store Σ^(+) and Σ^(-) separately in sigma_mnk.h5.
-		# fermi_reference: 'vbm' (default) or 'midgap' reference for Σ^c windowing.
+		# fermi_reference: 'midgap' (default) or 'vbm' reference for Σ^c windowing.
 		# sigma_at_dft_extrapolate: If True, clip/extrapolate Σ_c(ω) to match E_DFT outside ω-grid.
 		# sigma_at_dft_energies: Evaluate Σ_c(E_DFT) and Σ_xc(E_DFT) for BGW comparisons.
 		# ppm_sigma_debug_static_norm: Compare PPM Wc(0) static COH vs screened-COH normalization.
@@ -613,13 +615,14 @@ def read_cohsex_input(filename: str) -> dict:
 			"nval": geti("nval", fallback=5),    # valence bands in sigma window
 			"ncond": geti("ncond", fallback=5),  # conduction bands in sigma window
 			"nband": geti("nband", fallback=100), # total bands for chi0/screening
-			"sys_dim": geti("sys_dim", fallback=2),  # 2=slab, 3=bulk
+			"sys_dim": geti("sys_dim", fallback=2),  # 0=molecule/box, 2=slab
 			"debug_hartree": getb("debug_hartree", fallback=False),
 			"debug_omega": getf("debug_omega", fallback=None),   # test W(ω) at this freq
 			"screening_method": get("screening_method", fallback="minimax").strip().lower(),
-			"minimax_target_error": getf("minimax_target_error", fallback=1.0e-6),
-			"minimax_max_nodes": geti("minimax_max_nodes", fallback=64),
-			"ppm_omega_p": getf("ppm_omega_p", fallback=2.0),
+				"minimax_target_error": getf("minimax_target_error", fallback=1.0e-6),
+				"minimax_max_nodes": geti("minimax_max_nodes", fallback=64),
+				"minimax_energy_reference": get("minimax_energy_reference", fallback="midgap").strip().lower(),
+				"ppm_omega_p": getf("ppm_omega_p", fallback=2.0),
 			"ppm_fallback_omega": getf("ppm_fallback_omega", fallback=2.0),
 			"use_ppm_sigma": getb("use_ppm_sigma", fallback=False),
 			"ppm_sigma_target_error": getf("ppm_sigma_target_error", fallback=1.0e-6),
@@ -636,7 +639,7 @@ def read_cohsex_input(filename: str) -> dict:
 			"ppm_sigma_scale": getf("ppm_sigma_scale", fallback=1.0),
 			"ppm_sigma_flip_neg": getb("ppm_sigma_flip_neg", fallback=False),
 			"sigma_debug_split_contrib": getb("sigma_debug_split_contrib", fallback=False),
-			"fermi_reference": get("fermi_reference", fallback="vbm").strip().lower(),
+			"fermi_reference": get("fermi_reference", fallback="midgap").strip().lower(),
 			"sigma_at_dft_extrapolate": getb("sigma_at_dft_extrapolate", fallback=False),
 			"sigma_at_dft_energies": getb("sigma_at_dft_energies", fallback=False),
 			"ppm_sigma_debug_static_norm": getb("ppm_sigma_debug_static_norm", fallback=False),
@@ -669,9 +672,10 @@ def read_cohsex_input(filename: str) -> dict:
 			"debug_hartree": False,
 			"debug_omega": None,
 				"screening_method": "minimax",
-				"minimax_target_error": 1.0e-6,
-				"minimax_max_nodes": 64,
-				"ppm_omega_p": 2.0,
+					"minimax_target_error": 1.0e-6,
+					"minimax_max_nodes": 64,
+					"minimax_energy_reference": "midgap",
+					"ppm_omega_p": 2.0,
 				"ppm_fallback_omega": 2.0,
 				"use_ppm_sigma": False,
 				"ppm_sigma_target_error": 1.0e-6,
@@ -688,7 +692,7 @@ def read_cohsex_input(filename: str) -> dict:
 				"ppm_sigma_scale": 1.0,
 				"ppm_sigma_flip_neg": False,
 				"sigma_debug_split_contrib": False,
-				"fermi_reference": "vbm",
+				"fermi_reference": "midgap",
 				"sigma_at_dft_extrapolate": False,
 				"sigma_at_dft_energies": False,
 				"ppm_sigma_debug_static_norm": False,
@@ -952,7 +956,9 @@ def build_bundle_and_views(
 			slices=band_slices,
 			mesh_xy=mesh_xy,
 			sh=sh,
-			efermi=float(wfn.efermi),
+			# Keep occupied-mask definition consistent with the selected band window.
+			# This avoids dependence on WFN-level chemical potential conventions.
+			efermi=None,
 		)
 	else:
 		wf_bundle = build_wavefunction_bundle(
@@ -961,7 +967,9 @@ def build_bundle_and_views(
 			slices=band_slices,
 			mesh_xy=mesh_xy,
 			sh=sh,
-			efermi=float(wfn.efermi),
+			# Keep occupied-mask definition consistent with the selected band window.
+			# This avoids dependence on WFN-level chemical potential conventions.
+			efermi=None,
 		)
 
 	sigma_views = build_sigma_views(wf_bundle, mesh_xy, sh)

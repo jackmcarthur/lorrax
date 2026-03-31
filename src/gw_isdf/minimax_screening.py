@@ -143,6 +143,28 @@ def _load_docs_minimax_module():
     return mod
 
 
+@lru_cache(maxsize=1)
+def _load_docs_minimax_imag_module():
+    """Load the imaginary-axis minimax module docs/minimax_imaginary_axis.py."""
+    root = Path(__file__).resolve().parents[2]
+    path = root / "docs" / "minimax_imaginary_axis.py"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Imaginary-axis minimax module not found at {path}. "
+            "The GN-PPM path requires docs/minimax_imaginary_axis.py."
+        )
+    spec = importlib.util.spec_from_file_location("isdf_docs_minimax_imag", str(path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load imaginary-axis minimax module from {path}.")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    if not hasattr(mod, "noncrossing_imag_grids"):
+        raise AttributeError(
+            "Imaginary-axis minimax module is missing noncrossing_imag_grids(R, omega_hat, eps, ...)."
+        )
+    return mod
+
+
 @lru_cache(maxsize=64)
 def _solve_noncrossing_scaled_cached(
     logR_key: float,
@@ -153,6 +175,23 @@ def _solve_noncrossing_scaled_cached(
     target = float(target_key)
     docs_mod = _load_docs_minimax_module()
     tau, w, _n, err = docs_mod.noncrossing_grids(R, target, N_start=2, N_max=max_nodes)
+    return np.asarray(tau, dtype=np.float64), np.asarray(w, dtype=np.float64), float(err)
+
+
+@lru_cache(maxsize=64)
+def _solve_noncrossing_imag_scaled_cached(
+    logR_key: float,
+    omega_hat_key: float,
+    target_key: float,
+    max_nodes: int,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    R = float(np.exp(logR_key))
+    omega_hat = float(omega_hat_key)
+    target = float(target_key)
+    docs_mod = _load_docs_minimax_imag_module()
+    tau, w, _n, err = docs_mod.noncrossing_imag_grids(
+        R, omega_hat, target, N_start=2, N_max=max_nodes,
+    )
     return np.asarray(tau, dtype=np.float64), np.asarray(w, dtype=np.float64), float(err)
 
 
@@ -212,6 +251,50 @@ def solve_laplace_minimax_interval(
     tau_hat, w_hat, err_hat = _solve_noncrossing_scaled_cached(
         round(logR_key, 12),
         round(target_key, 14),
+        max_nodes,
+    )
+
+    tau = tau_hat / x_min
+    alpha = w_hat / x_min
+    err_abs = err_hat / x_min
+
+    return LaplaceMinimaxQuadrature(
+        x_min=x_min,
+        x_max=x_max,
+        tau=np.asarray(tau, dtype=np.float64),
+        alpha=np.asarray(alpha, dtype=np.float64),
+        max_error=float(err_abs),
+    )
+
+
+def solve_laplace_minimax_imag_interval(
+    x_min: float,
+    x_max: float,
+    omega_p: float,
+    *,
+    target_error: float = 1.0e-6,
+    max_nodes: int = 64,
+) -> LaplaceMinimaxQuadrature:
+    """Fit ``x/(x^2+omega_p^2) ≈ sum alpha_l exp(-tau_l x)`` on ``[x_min, x_max]``.
+
+    Used for chi0(i*omega_p) where the resonant+antiresonant sum gives
+    2*x/(x^2+omega_p^2) with x = E_c - E_v.
+    """
+
+    x_min = max(float(x_min), _TINY)
+    x_max = max(float(x_max), x_min * (1.0 + 1.0e-9))
+    omega_p = float(omega_p)
+    target_error = max(float(target_error), 1.0e-14)
+    max_nodes = max(4, int(max_nodes))
+
+    R = x_max / x_min
+    omega_hat = omega_p / x_min
+    logR_key = float(np.log(R))
+
+    tau_hat, w_hat, err_hat = _solve_noncrossing_imag_scaled_cached(
+        round(logR_key, 12),
+        round(omega_hat, 12),
+        round(target_error, 14),
         max_nodes,
     )
 
@@ -309,6 +392,69 @@ def build_static_minimax_window_pair(
             "  Minimax static window: "
             f"x=[{quad.x_min:.6e}, {quad.x_max:.6e}] Ry, "
             f"R={R:.2f}, nodes={quad.node_count}, fit_err~{quad.max_error:.3e}"
+        )
+
+    return [pair], quad
+
+
+def build_imag_freq_minimax_window_pair(
+    enk_v: jax.Array,
+    enk_c: jax.Array,
+    omega_p: float,
+    *,
+    target_error: float = 1.0e-6,
+    max_nodes: int = 64,
+    print_fn: Callable[..., None] | None = None,
+) -> tuple[list[MinimaxWindowPair], LaplaceMinimaxQuadrature]:
+    """Build a minimax window pair for chi0(i*omega_p).
+
+    Uses fresh minimax nodes that directly approximate x/(x^2+omega_p^2)
+    on [x_min, x_max] where x = E_c - E_v.  This replaces the incorrect
+    cos-reweighting of static nodes.
+    """
+
+    enk_v_host = np.asarray(jax.device_get(enk_v), dtype=np.float64)
+    enk_c_host = np.asarray(jax.device_get(enk_c), dtype=np.float64)
+    if enk_v_host.size == 0 or enk_c_host.size == 0:
+        raise ValueError("Cannot build minimax window with empty valence/conduction energies.")
+
+    vmin = float(np.min(enk_v_host))
+    vmax = float(np.max(enk_v_host))
+    cmin = float(np.min(enk_c_host))
+    cmax = float(np.max(enk_c_host))
+
+    x_min = max(cmin - vmax, _TINY)
+    x_max = max(cmax - vmin, x_min * (1.0 + 1.0e-9))
+    quad = solve_laplace_minimax_imag_interval(
+        x_min,
+        x_max,
+        float(omega_p),
+        target_error=target_error,
+        max_nodes=max_nodes,
+    )
+
+    # Same compatibility transform as the static case:
+    # w_i = alpha * exp(-tau) so that the chi kernel gives
+    # -2 * alpha * exp(-tau * (E_c - E_v)).
+    w_kernel = quad.alpha * np.exp(-quad.tau)
+    pair = MinimaxWindowPair(
+        val_window=EnergyWindow(start_energy=vmin, end_energy=vmax, index=0, count=1),
+        cond_window=EnergyWindow(start_energy=cmin, end_energy=cmax, index=0, count=1),
+        epsq=float(target_error),
+        tau_i=np.asarray(quad.tau, dtype=np.float64),
+        w_i=np.asarray(w_kernel, dtype=np.float64),
+        z_lm=1.0,
+        alpha_i=np.asarray(quad.alpha, dtype=np.float64),
+    )
+
+    if print_fn is not None:
+        R = quad.x_max / quad.x_min
+        omega_hat = float(omega_p) / quad.x_min
+        print_fn(
+            f"  Minimax imag-freq window (ωp={omega_p:.4f} Ry): "
+            f"x=[{quad.x_min:.6e}, {quad.x_max:.6e}] Ry, "
+            f"R={R:.2f}, ω̂={omega_hat:.2f}, "
+            f"nodes={quad.node_count}, fit_err~{quad.max_error:.3e}"
         )
 
     return [pair], quad

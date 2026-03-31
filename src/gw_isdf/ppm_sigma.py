@@ -23,6 +23,7 @@ from .minimax_screening import (
     extract_gn_ppm_parameters_from_Wc,
     _load_docs_minimax_module,
     solve_laplace_minimax_interval,
+    solve_laplace_minimax_imag_interval,
     solve_phase_minimax_bandwidth,
 )
 from . import w_isdf
@@ -116,6 +117,8 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     omega_p_ry: float = 2.0,
     target_error: float = 1.0e-6,
     max_nodes: int = 64,
+    minimax_energy_reference: str | float | int | None = "midgap",
+    minimax_energy_reference_fn: Callable[[jax.Array, jax.Array], float] | None = None,
     fallback_omega: float = 2.0,
     head_correction_fn: Callable[[jax.Array, jax.Array, complex], tuple[jax.Array, jax.Array]] | None = None,
     print0=print,
@@ -133,24 +136,47 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     psi_cTY = wf_bundle.x(s.c_slice)
     enk_v = wf_bundle.enk[:, s.v_slice]
     enk_c = wf_bundle.enk[:, s.c_slice]
+    e_ref = w_isdf.resolve_minimax_energy_reference(
+        enk_v,
+        enk_c,
+        reference=minimax_energy_reference,
+        reference_fn=minimax_energy_reference_fn,
+    )
 
-    windows_minimax, quad = build_static_minimax_window_pair(
+    _windows_minimax, quad = build_static_minimax_window_pair(
         enk_v,
         enk_c,
         target_error=target_error,
         max_nodes=max_nodes,
         print_fn=print0,
     )
-    w0 = windows_minimax[0]
-    wiw = w0.with_imag_freq_modulation(omega_p_ry)
 
-    chi0_q = w_isdf.compute_chi0(
-        psi_vTX, psi_vY, psi_cX, psi_cTY,
-        enk_v, enk_c, [w0], meta, mesh_xy,
+    # Fresh minimax for chi0(i*omega_p): approximates x/(x^2+omega_p^2)
+    # Fresh minimax for chi0(i*omega_p): approximates x/(x^2+omega_p^2)
+    # directly, instead of cos-reweighting the static nodes (which is wrong).
+    quad_imag = solve_laplace_minimax_imag_interval(
+        quad.x_min, quad.x_max, omega_p_ry,
+        target_error=target_error,
+        max_nodes=max_nodes,
     )
-    chii_q = w_isdf.compute_chi0(
+    R = quad_imag.x_max / quad_imag.x_min
+    omega_hat = omega_p_ry / quad_imag.x_min
+    print0(
+        f"  Minimax imag-freq window (ωp={omega_p_ry:.4f} Ry): "
+        f"x=[{quad_imag.x_min:.6e}, {quad_imag.x_max:.6e}] Ry, "
+        f"R={R:.2f}, ω̂={omega_hat:.2f}, "
+        f"nodes={quad_imag.node_count}, fit_err~{quad_imag.max_error:.3e}"
+    )
+
+    chi0_q = w_isdf.compute_chi0_minimax(
         psi_vTX, psi_vY, psi_cX, psi_cTY,
-        enk_v, enk_c, [wiw], meta, mesh_xy,
+        enk_v, enk_c, quad, meta, mesh_xy,
+        energy_reference=e_ref,
+    )
+    chii_q = w_isdf.compute_chi0_minimax(
+        psi_vTX, psi_vY, psi_cX, psi_cTY,
+        enk_v, enk_c, quad_imag, meta, mesh_xy,
+        energy_reference=e_ref,
     )
     W0_q = w_isdf.solve_w_from_chi_q_jax(V_qmunu, chi0_q, meta, mesh_xy)
     Wiwp_q = w_isdf.solve_w_from_chi_q_jax(V_qmunu, chii_q, meta, mesh_xy)
@@ -165,12 +191,13 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     _summarize_hermitian_qmunu("W(0)", W0_q, print0)
     _summarize_hermitian_qmunu(f"W(iωp={omega_p_ry:.3f} Ry)", Wiwp_q, print0)
 
-    # Build W^c(0) and W^c(iωp) without head: W^c = W - V.
+    # Build W^c = W(with W_head) - V(with V_head).
     nkx, nky, nkz = W0_q.shape[0], W0_q.shape[1], W0_q.shape[2]
     n_rmu = W0_q.shape[4]
     V_q = jnp.asarray(V_head)[0, 0, 0].reshape(nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
     Wc0_q = W0_q - V_q
     Wci_q = Wiwp_q - V_q
+
 
     ppm = extract_gn_ppm_parameters_from_Wc(
         Wc0_q,
@@ -297,7 +324,7 @@ def _build_single_sigma_window(
             E_ref_A=float(np.min(A_vals)),
             E_ref_B=float(np.min(B_vals)),
             omega_sign=int(kernel_sign),
-            project="real",
+            project="full",
             prefactor=float(prefactor),
             x_min=float(x_min),
             x_max=float(x_max),
@@ -364,7 +391,7 @@ def _build_three_sigma_windows(
             q = solve_laplace_minimax_interval(x_min, x_max, target_error=target_error, max_nodes=max_nodes)
             t_nodes = np.asarray(-1j * q.tau, dtype=np.complex128)
             alpha = np.asarray(q.alpha, dtype=np.float64)
-            project = "real"
+            project = "full"
             docs_prefactor = -1.0
 
         windows.append(
@@ -493,7 +520,12 @@ def _convolve_sigma_branch(
             alpha_eff = complex(alpha_node) * np.exp(-1j * (win.E_ref_A + win.E_ref_B) * t_node)
             acc_win = acc_win + jnp.asarray(alpha_eff, dtype=jnp.complex128) * omega_kernel[:, None, None, None, None, None, None, None] * sigma_tau[None, ...]
 
-        projected = jnp.imag(acc_win) if win.project == "imag" else jnp.real(acc_win)
+        if win.project == "full":
+            projected = acc_win
+        elif win.project == "imag":
+            projected = jnp.imag(acc_win)
+        else:
+            projected = jnp.real(acc_win)
         acc_total = acc_total + jnp.asarray(win.prefactor, dtype=jnp.float64) * projected.astype(jnp.complex128)
 
     tag = f"{log_tag} " if log_tag else ""
@@ -709,6 +741,10 @@ def _convolve_sigma_branch_kij(
             sigma_tau_kij_ri = get_sigma_kij_channels_fn(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_tau)
             sigma_tau_kij_re = sigma_tau_kij_ri[0]
             sigma_tau_kij_im = sigma_tau_kij_ri[1]
+            if debug_quadrature:
+                re_mag = float(jnp.max(jnp.abs(sigma_tau_kij_re)))
+                im_mag = float(jnp.max(jnp.abs(sigma_tau_kij_im)))
+                print0(f"  [diag] {log_tag}{win.name}: |K[Re(σ)]|={re_mag:.4e}  |K[Im(σ)]|={im_mag:.4e}")
             alpha_eff = complex(alpha_node) * np.exp(-1j * (win.E_ref_A + win.E_ref_B) * t_node)
             omega_sign = float(win.omega_sign) * float(omega_sign_flip)
             pref = jnp.asarray(win.prefactor * scale, dtype=jnp.float64)
@@ -717,7 +753,11 @@ def _convolve_sigma_branch_kij(
                 coeff = jnp.asarray(alpha_eff, dtype=jnp.complex128) * omega_kernel
                 coeff_re = jnp.real(coeff)[:, None, None, None]
                 coeff_im = jnp.imag(coeff)[:, None, None, None]
-                if win.project == "imag":
+                if win.project == "full":
+                    # Full complex: c * K[σ] = (c_r + i*c_i) * (K[Re(σ)] + i*K[Im(σ)])
+                    sigma_tau_kij_full = sigma_tau_kij_re[None, ...] + 1j * sigma_tau_kij_im[None, ...]
+                    contrib = (coeff_re + 1j * coeff_im) * sigma_tau_kij_full
+                elif win.project == "imag":
                     contrib = coeff_re * sigma_tau_kij_im[None, ...] + coeff_im * sigma_tau_kij_re[None, ...]
                 else:
                     contrib = coeff_re * sigma_tau_kij_re[None, ...] - coeff_im * sigma_tau_kij_im[None, ...]
@@ -732,7 +772,10 @@ def _convolve_sigma_branch_kij(
                     coeff = jnp.asarray(alpha_eff, dtype=jnp.complex128) * omega_kernel_batch
                     coeff_re = jnp.real(coeff)[:, None, None, None]
                     coeff_im = jnp.imag(coeff)[:, None, None, None]
-                    if win.project == "imag":
+                    if win.project == "full":
+                        sigma_tau_kij_full = sigma_tau_kij_re[None, ...] + 1j * sigma_tau_kij_im[None, ...]
+                        batch_proj = (coeff_re + 1j * coeff_im) * sigma_tau_kij_full
+                    elif win.project == "imag":
                         batch_proj = coeff_re * sigma_tau_kij_im[None, ...] + coeff_im * sigma_tau_kij_re[None, ...]
                     else:
                         batch_proj = coeff_re * sigma_tau_kij_re[None, ...] - coeff_im * sigma_tau_kij_im[None, ...]
@@ -789,7 +832,7 @@ def compute_sigma_c_ppm_omega_grid(
     sigma_flip_neg: bool = False,
     invalid_mode: str = "static_limit",
     debug_split_contrib: bool = False,
-    fermi_reference: str = "vbm",
+    fermi_reference: str = "midgap",
     debug_quadrature: bool = False,
     debug_quadrature_samples: int = 200,
     get_G_mu_nu_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array] | None = None,
@@ -926,74 +969,6 @@ def compute_sigma_c_ppm_omega_grid(
         print0(f"  Σc(ω) accumulation: kij (single-pass), est={kij_bytes / (1024**2):.1f} MiB")
     if use_kij_stream:
         print0(f"  Σc(ω) streaming: kij_stream (ω-chunk={omega_batch_size})")
-
-    def _run_sigma_pair(
-        omega_eval: np.ndarray,
-        kernel_cond: int,
-        kernel_val: int,
-        tag: str,
-        omega_flip_cond: int = 1,
-        omega_flip_val: int = 1,
-    ) -> jax.Array:
-        sigma_cond, _ = _convolve_sigma_branch(
-            omega_nonneg_ry=omega_eval,
-            E_A=E_cond,
-            base_mask_A=cond_mask,
-            B_mu_nu=B_corr,
-            Omega_mu_nu=Omega_abs,
-            base_mask_B=B_mask,
-            kernel_sign=kernel_cond,
-            regularization_width_ry=regularization_width_ry,
-            edge_factor=edge_factor,
-            target_error=target_error,
-            max_nodes=max_nodes,
-            crossing_eps_q=crossing_eps_q,
-            crossing_max_nodes=crossing_max_nodes,
-            psi_coh_rmuT_X=psi_coh_rmuT_X,
-            psi_coh_rmu_Y=psi_coh_rmu_Y,
-            nkx=nkx,
-            nky=nky,
-            nkz=nkz,
-            nk_tot=nk_tot,
-            bispinor=bispinor,
-            mesh_xy=mesh_xy,
-            get_G_mu_nu_fn=get_G_mu_nu_fn,
-            get_G_R_fn=get_G_R_fn,
-            get_sigma_mu_nu_fn=get_sigma_mu_nu_fn,
-            omega_sign_flip=omega_flip_cond,
-            log_tag=tag,
-            print0=print0,
-        )
-        sigma_val, _ = _convolve_sigma_branch(
-            omega_nonneg_ry=omega_eval,
-            E_A=H_val,
-            base_mask_A=val_mask,
-            B_mu_nu=B_corr,
-            Omega_mu_nu=Omega_abs,
-            base_mask_B=B_mask,
-            kernel_sign=kernel_val,
-            regularization_width_ry=regularization_width_ry,
-            edge_factor=edge_factor,
-            target_error=target_error,
-            max_nodes=max_nodes,
-            crossing_eps_q=crossing_eps_q,
-            crossing_max_nodes=crossing_max_nodes,
-            psi_coh_rmuT_X=psi_coh_rmuT_X,
-            psi_coh_rmu_Y=psi_coh_rmu_Y,
-            nkx=nkx,
-            nky=nky,
-            nkz=nkz,
-            nk_tot=nk_tot,
-            bispinor=bispinor,
-            mesh_xy=mesh_xy,
-            get_G_mu_nu_fn=get_G_mu_nu_fn,
-            get_G_R_fn=get_G_R_fn,
-            get_sigma_mu_nu_fn=get_sigma_mu_nu_fn,
-            omega_sign_flip=omega_flip_val,
-            log_tag=tag,
-            print0=print0,
-            )
-        return sigma_cond + sigma_val
 
     n_omega = int(omega_req.size)
     sigma_kij_host = None if use_kij_stream else np.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=np.complex128)
@@ -1168,14 +1143,18 @@ def compute_sigma_c_ppm_omega_grid(
                     else:
                         sigma_kij_host[idx_pos] = np.asarray(jax.device_get(sigma_pos), dtype=np.complex128)
 
-            # ω_rel < 0: flip kernels with |ω_rel| (no conjugation shortcut).
+            # ω_rel < 0: evaluate with |ω_rel| and swapped branch kernels.
+            # Keep omega kernel signs unchanged (omega_sign_flip=+1). For w=|ω_rel|:
+            #   D_minus = ω_rel - S_c = -(w + S_c)
+            #   D_plus  = ω_rel + S_v = -(w - S_v)
+            # In this implementation, kernel_sign=+1 realizes 1/(w-S) and
+            # kernel_sign=-1 realizes 1/(w+S), so both routed branches require
+            # the same extra global minus.
             if omega_neg_abs.size:
-                # For ω_rel < 0 both routed denominators carry an extra overall minus:
-                #   Σ^(-): ω_rel - S = -( |ω_rel| + S )
-                #   Σ^(+): ω_rel + S = -( |ω_rel| - S )
-                # The window builders approximate the positive-|ω_rel| kernels, so the
-                # physical Σ_c(ω<0) requires this global -1 factor.
-                neg_scale = -float(sigma_scale) if not sigma_flip_neg else float(sigma_scale)
+                neg_scale = -float(sigma_scale)
+                if sigma_flip_neg:
+                    # Optional debug-only sign flip knob.
+                    neg_scale = float(sigma_scale)
                 sigma_neg = _convolve_kij(
                     omega_neg_abs,
                     idx_neg,
@@ -1183,7 +1162,6 @@ def compute_sigma_c_ppm_omega_grid(
                     kernel_val=+1,
                     tag="ω<E_F",
                     scale=neg_scale,
-                    # For ω<0: flip omega sign ONLY for minus-kernel (crossing) branch.
                     omega_sign_flip_cond=1,
                     omega_sign_flip_val=1,
                 )

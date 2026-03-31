@@ -1,8 +1,22 @@
-# Full-Frequency GW Self-Energy via GN-PPM and Minimax-Windowed CTSP in the ISDF Basis
+Below are **full rewrites** of the two guides so they match **exactly what the current code in `ppm_sigma.py` + `gw_jax.py` does** (as uploaded). I’ve kept sections that were already correct in spirit/notation, but I’ve removed/rewritten anything that no longer matches the implementation (notably: *GN is extracted from* **(W^c)**, and the sigma pipeline **accumulates in band space** before applying (e^{i\omega t})).
 
-## Purpose
+---
 
-Self-contained theoretical reference for computing $\Sigma_{nk}(\omega)$ in $O(N^3)$ via ISDF spatial compression, GN-PPM spectral compression of $W$, and minimax-windowed CTSP for real-axis frequency evaluation. No analytic continuation. Controllable quadrature error.
+# 1) `GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md` (updated to match code)
+
+## Full-Frequency GW Self-Energy via GN-PPM and Minimax-Windowed CTSP in the ISDF Basis
+
+### Purpose
+
+Reference for computing the **correlation self-energy** (\Sigma^c_{kij}(\omega)) using:
+
+1. ISDF compression in real space (collocation points (\mu,\nu))
+2. Minimax-windowed CTSP to compute **(W(0))** and **(W(i\omega_p))**
+3. GN-PPM extracted **elementwise from (W^c)**
+4. Minimax-windowed CTSP to compute (\Sigma^c(\omega)) on a real frequency grid
+5. Accumulation **directly in band space** ((k,i,j)) (no storing (\Sigma(\mu,\nu,\omega)))
+
+No analytic continuation.
 
 ---
 
@@ -10,249 +24,398 @@ Self-contained theoretical reference for computing $\Sigma_{nk}(\omega)$ in $O(N
 
 ### 1.1 Indices
 
-| Symbol | Meaning |
-|--------|---------|
-| $v, c$ | Valence / conduction band |
-| $\mathbf{k}, \mathbf{q}, \mathbf{R}$ | Crystal momentum / transfer / lattice vector |
-| $\mu, \nu, \eta, \zeta$ | ISDF collocation points ($1, \ldots, N_\mu$) |
-| $a, b \in \{\uparrow, \downarrow\}$ | Spinor components |
+| Symbol    | Meaning                                                  |
+| --------- | -------------------------------------------------------- |
+| (v,c)     | valence / conduction band indices                        |
+| (k,q,R)   | crystal momentum / transfer / lattice vector             |
+| (\mu,\nu) | ISDF collocation indices, size (N_\mu)                   |
+| (a,b)     | spinor components                                        |
+| (i,j)     | projected band indices (the (\Sigma_{kij}) output basis) |
 
-### 1.2 Energy referencing
+### 1.2 Energy referencing used by the code
 
-All eigenvalues are stored in the **vacuum reference** as read from DFT: $E_n^\text{vac}$. The Fermi level $E_F$ is a single scalar parameter. Positive-axis values used in the CTSP windowing are:
+* `enk_full` is vacuum-referenced eigenvalues (E^{\rm vac}_{nk}).
+* `occ_full` defines occupied vs unoccupied: `occ_mask = occ_full > 0.5`.
 
-$$\tilde{E}_c = E_c^\text{vac} - E_F \geq 0, \qquad h_v = E_F - E_v^\text{vac} \geq 0, \qquad \Omega_{q,\mu\nu} \geq 0$$
+The sigma code defines a single scalar (E_F) (**vacuum reference**) by:
 
-The self-energy is evaluated at frequencies $\omega^\text{vac}$ (vacuum-referenced), converted internally to $\omega_\text{rel} = \omega^\text{vac} - E_F$.
+* `fermi_reference="vbm"`: (E_F = \max(E^{\rm vac}_{nk};\text{over occ}))
+* `fermi_reference="midgap"`: (E_F = \tfrac12(\text{VBM}+\text{CBM})) if any unoccupied exist, else VBM.
 
-**For self-consistent iterations:** update $E_F$ (and eigenvalues if doing eigenvalue self-consistency). All internal quantities reflow from these. $E_F$ cancels algebraically in every propagator–kernel product (§5.4).
+Then it constructs positive-axis energies used in denominators:
 
-### 1.3 Bloch spinors
+[
+E_c \equiv \max(E^{\rm vac}*{nk}-E_F,,0),\qquad
+h_v \equiv \max(E_F-E^{\rm vac}*{nk},,0),
+]
+and (\Omega_{q,\mu\nu}\ge 0) from GN-PPM.
 
-$$\psi_{n\mathbf{k},a}(\mathbf{r}) = \frac{1}{\sqrt{N_r}} \sum_{\mathbf{G}} c_{n\mathbf{k},a}(\mathbf{G})\, e^{i(\mathbf{k}+\mathbf{G})\cdot\mathbf{r}}$$
+**Important:** the input omega grid `omega_values_ry` is interpreted as **already** (\omega_{\rm rel}) (relative to the chosen (E_F)), and the code splits at (\omega_{\rm rel}=0). It does **not** shift `omega_values_ry` by (E_F).
 
-### 1.4 Lattice Fourier transforms
+### 1.3 Fourier conventions
 
-$$f_{\mathbf{R}} = \frac{1}{\sqrt{N_k}} \sum_{\mathbf{k}} e^{i\mathbf{k}\cdot\mathbf{R}}\, f_{\mathbf{k}} \quad \leftrightarrow \quad f_{\mathbf{k}} = \frac{1}{\sqrt{N_k}} \sum_{\mathbf{R}} e^{-i\mathbf{k}\cdot\mathbf{R}}\, f_{\mathbf{R}}$$
+All FFTs are `norm='ortho'`.
 
-$k \to R$: `ifftn(norm='ortho')`. $R \to k$: `fftn(norm='ortho')`.
-
-### 1.5 Spin structure
-
-$G_{\mathbf{k},ab}(\mu,\nu)$ and $\Sigma_{\mathbf{k},ab}(\mu,\nu)$ carry spin as $2\times 2$ matrices. $\chi^0_q$, $\Pi_q$, $W_q$, $V_q$, $B_q$, $\Omega_q$ are spin-independent (scalar).
-
----
-
-## 2. Self-energy decomposition
-
-### 2.1 Exchange + correlation
-
-$$\Sigma_{\mathbf{k},ab}(\mu,\nu;\omega) = \Sigma^x_{\mathbf{k},ab}(\mu,\nu) + \Sigma^c_{\mathbf{k},ab}(\mu,\nu;\omega)$$
-
-**Exchange** is static, uses bare Coulomb $v$:
-
-$$\Sigma^x_{\mathbf{R},ab}(\mu,\nu) = -G^\text{occ}_{\mathbf{R},ab}(\mu,\nu) \cdot V_{\mathbf{R}}(\mu,\nu)$$
-
-Not part of the CTSP pipeline.
-
-**Correlation** uses $W^c = v\Pi v = W - v$, carries all frequency dependence. Coulomb sandwiching $v(\cdots)v$ applied outside the time loop.
-
-### 2.2 Equivalence of SX+COH and $\Sigma^{(\pm)}$ decompositions
-
-BerkeleyGW (Kim-2020 Eq. 6) computes $\Sigma^c$ via SX + COH. Using the PPM spectral form $W^c(\omega) = \sum_p B^p[(\omega - \omega_p)^{-1} - (\omega + \omega_p)^{-1}]$:
-
-$$\text{SX} = -\sum_v \psi_v\psi_v^* W(\omega - E_v) = -\sum_v \psi_v V\psi_v^* + \sum_{v,p} \frac{\psi_v B^p \psi_v^*}{\omega - E_v + \omega_p} - \sum_{v,p} \frac{\psi_v B^p \psi_v^*}{\omega - E_v - \omega_p}$$
-
-$$\text{COH} = \sum_{n,p} \frac{\psi_n B^p \psi_n^*}{\omega - E_n - \omega_p} = \sum_{v,p} \frac{\psi_v B^p \psi_v^*}{\omega - E_v - \omega_p} + \sum_{c,p} \frac{\psi_c B^p \psi_c^*}{\omega - E_c - \omega_p}$$
-
-The occupied $(\omega - E_v - \omega_p)^{-1}$ terms cancel between SX and COH:
-
-$$\boxed{\Sigma^c = \underbrace{\sum_{v,p} \frac{B^p \psi_v \psi_v^*}{\omega - E_v + \omega_p}}_{\Sigma^{(+)}} + \underbrace{\sum_{c,p} \frac{B^p \psi_c \psi_c^*}{\omega - E_c - \omega_p}}_{\Sigma^{(-)}}}$$
-
-Same total, different grouping: CTSP splits by occupancy; BGW splits by pole origin.
-
-### 2.3 Denominator structure and $\omega$ sign
-
-Using the Fermi-referenced positive-axis values $\tilde{E}_c = E_c - E_F$, $h_v = E_F - E_v$, and $\omega_\text{rel} = \omega - E_F$:
-
-$$\Sigma^{(-)} \text{ denominator:} \quad \omega_\text{rel} - (\tilde{E}_c + \Omega)$$
-$$\Sigma^{(+)} \text{ denominator:} \quad \omega_\text{rel} + (h_v + \Omega)$$
-
-The crossing structure depends on the sign of $\omega_\text{rel}$:
-
-| | $\omega_\text{rel} > 0$ (above $E_F$) | $\omega_\text{rel} < 0$ (below $E_F$) |
-|---|---|---|
-| $\Sigma^{(-)}$: $\omega_\text{rel} - (\tilde{E}_c + \Omega)$ | **Crosses zero** | Always negative → sign-definite |
-| $\Sigma^{(+)}$: $\omega_\text{rel} + (h_v + \Omega)$ | Always positive → sign-definite | **Crosses zero** |
-
-The poles of $\Sigma^{(-)}$ are at $\omega_\text{rel} = \tilde{E}_c + \Omega > 0$, always above $E_F$. The poles of $\Sigma^{(+)}$ are at $\omega_\text{rel} = -(h_v + \Omega) < 0$, always below $E_F$. The window structure is symmetric about $E_F$.
-
-**Consequence:** `convolve_frequencies` handles this by splitting the input $\omega$ array at $E_F$. For $\omega > E_F$: $\Sigma^{(-)}$ gets 3 windows, $\Sigma^{(+)}$ single Laplace. For $\omega < E_F$: vice versa. Each half is a standard non-negative-$\omega_\text{rel}$ problem.
+* (k\to R): `ifftn` on ((nkx,nky,nkz))
+* (R\to k): `fftn` on ((nkx,nky,nkz))
 
 ---
 
-## 3. ISDF basis (summary)
+## 2. Correlation self-energy structure
 
-Spin-traced pair density: $\rho_{mn,\mathbf{k}}(\mathbf{q};\mathbf{r}) \approx \sum_\mu \zeta_{q,\mu}(\mathbf{r})\, \rho_{mn,\mathbf{k}}(\mathbf{q};\mathbf{r}_\mu)$.
+The code implements the standard “(\Sigma^{(+)}+\Sigma^{(-)})” decomposition (equivalent to SX+COH grouping):
 
-Screened interaction: $W = v + v\Pi v$, $\Pi = \chi^0[I - v\chi^0]^{-1}$. All spin-independent.
+[
+\Sigma^c(\omega)=\Sigma^{(+)}(\omega)+\Sigma^{(-)}(\omega),
+]
+with denominators (using the positive-axis values above):
 
----
+[
+\Sigma^{(-)}:\quad \frac{1}{\omega_{\rm rel}-(E_c+\Omega)},
+\qquad
+\Sigma^{(+)}:\quad \frac{1}{\omega_{\rm rel}+(h_v+\Omega)}.
+]
 
-## 4. GN-PPM: spectral compression of $W$ (Phase 1)
+Crossing behavior depends on (\omega_{\rm rel}):
 
-### 4.1 What it does
+| branch                                          | (\omega_{\rm rel}>0)     | (\omega_{\rm rel}<0)     |
+| ----------------------------------------------- | ------------------------ | ------------------------ |
+| (\Sigma^{(-)}): (\omega_{\rm rel}-(E_c+\Omega)) | **can cross**            | sign-definite (negative) |
+| (\Sigma^{(+)}): (\omega_{\rm rel}+(h_v+\Omega)) | sign-definite (positive) | **can cross**            |
 
-Replaces $O(N_t)$ poles of $\Pi$ with one per matrix element:
-
-$$\Pi_{q,\mu\nu}(\omega) \approx \frac{2\, B_{q,\mu\nu}\, \Omega_{q,\mu\nu}}{\omega^2 - \Omega_{q,\mu\nu}^2}$$
-
-### 4.2 Single-window simplification
-
-$\chi^0(0)$ and $\chi^0(i\omega_p)$ are both sign-definite → single Laplace window, $\sim 12$ nodes for $R = E_\text{bw}/E_\text{gap} \sim 30$.
-
-**$\chi^0$ is a transfer-frequency quantity: no $E_F$ enters.** The denominator is $1/(\omega - (E_c - E_v))$ which depends only on eigenvalue differences. Occupancy determines which bands enter, but the quadrature window bounds depend on $\Delta E_\text{gap}$ and $\Delta E_\text{bw}$ — both $E_F$-independent.
-
-At each Laplace node, build conduction and valence propagators, FFT, spin-trace in $R$-space:
-
-$$\tilde{\chi}^0_{\mathbf{R},\mu\nu}(\tau) = \sum_{ab} G^c_{\mathbf{R},ab}(\mu,\nu;\tau) \cdot G^v_{-\mathbf{R},ba}(\nu,\mu;\tau)$$
-
-Both $\chi^0(0)$ and $\chi^0(i\omega_p)$ share the propagator builds — only the scalar weight differs: $\alpha(i\omega_p) = \alpha(0) \cdot e^{-\omega_p \tau}$. Cost $\approx 1\times$ static $\chi^0$.
-
-### 4.3 Extraction
-
-$$\Omega_{q,\mu\nu} = \omega_p \sqrt{\operatorname{Re}\!\left[\frac{\Pi(i\omega_p)}{\Pi(0) - \Pi(i\omega_p)}\right]}, \qquad B_{q,\mu\nu} = -\tfrac{1}{2}\,\Pi(0)\,\Omega$$
-
-Guard: if radicand $< 0$, set $\Omega = 1$ Ha. $\omega_p \sim 0.5$–$1.0$ Ha.
-
-**Output:** $\Omega_{q,\mu\nu} \geq 0$ and $B_{q,\mu\nu}$ for all $q$. PPM time-domain form: $\Pi^\text{PPM}_{q,\mu\nu}(t) = B_{q,\mu\nu}\, e^{-i\Omega_{q,\mu\nu} t}$.
+**Implementation consequence:** the code splits (\omega_{\rm rel}) into (\omega_{\rm rel}\ge 0) and (\omega_{\rm rel}<0), and evaluates the negative half at (|\omega_{\rm rel}|) with a canonical sign convention (see §6.4).
 
 ---
 
-## 5. Phase 2: $\Sigma^c(\omega)$ via CTSP
+## 3. Phase 1: compute (W(0)), (W(i\omega_p)) and extract GN-PPM from (W^c)
 
-### 5.1 Time-domain factorization
+### 3.1 What is computed
 
-At each quadrature node $t$: build band propagator $G(t)$ and PPM propagator $\Pi^\text{PPM}(t)$, FFT to $R$-space, multiply elementwise ($\Pi$ broadcasts over spin), FFT back, accumulate with frequency kernel.
+The function `compute_w0_wiwp_and_ppm_from_minimax(...)` computes:
 
-### 5.2 Window decomposition
+* (W_q(0)) and (W_q(i\omega_p)) in the ISDF basis (layout ((nkx,nky,nkz,1,\mu,1,\nu))).
+* optional finite-size/head correction through the callback `head_correction_fn(V_q, W_q, omega)`.
+* then constructs:
+  [
+  W^c_q(0)=W_q(0)-V_q,\qquad W^c_q(i\omega_p)=W_q(i\omega_p)-V_q
+  ]
+  where (V_q) is the (possibly head-corrected) Coulomb matrix reshaped to match (W_q).
 
-Three rectangles in the positive-axis plane $(A, B)$ with $T = |\omega_\text{rel}|_\text{max} + c_\text{edge}\xi$:
+### 3.2 How (\chi^0(0)) and (\chi^0(i\omega_p)) are computed
 
-| Window | Character |
-|--------|-----------|
-| Core: $A \in [0,T]$, $B \in [0,T]$ | Crossing possible |
-| A-stripe: $A \in [T, A_\text{max}]$, $B \in [0,T]$ | Sign-definite |
-| B-slab: $A \in [0, A_\text{max}]$, $B \in [T, B_\text{max}]$ | Sign-definite |
+1. Build a **single minimax Laplace window** for static screening using:
+   `build_static_minimax_window_pair(enk_v, enk_c, target_error, max_nodes)`
 
-### 5.3 Handling $\omega$ above and below $E_F$
+2. Evaluate (\chi^0_q(0)) and (\chi^0_q(i\omega_p)) by calling `w_isdf.compute_chi0(...)` twice:
 
-`convolve_frequencies` splits the input $\omega$ array at $E_F$ and processes each half independently:
+   * once with the base window `w0`
+   * once with the modulated window `wiw = w0.with_imag_freq_modulation(omega_p_ry)`
 
-**$\omega_\text{rel} > 0$ (above $E_F$):**
-- $\Sigma^{(-)}$: minus-kernel with $\omega_\text{rel} > 0$ → 3 windows (core has crossing)
-- $\Sigma^{(+)}$: plus-kernel → single Laplace (always sign-definite)
+3. Solve the Dyson equation for (W) twice via:
+   `w_isdf.solve_w_from_chi_q_jax(V_qmunu, chi_q, meta, mesh_xy)`.
 
-**$\omega_\text{rel} < 0$ (below $E_F$):**
+### 3.3 GN-PPM model used in the code: **PPM for (W^c)**
 
-Rewrite: $\omega_\text{rel} + (h_v + \Omega) = (h_v + \Omega) - |\omega_\text{rel}|$. This is a minus-kernel with "frequency" $= |\omega_\text{rel}|$ and "sum" $= h_v + \Omega$:
-- $\Sigma^{(+)}$: minus-kernel in $|\omega_\text{rel}|$ → 3 windows (core has crossing)
-- $\Sigma^{(-)}$: plus-kernel in $|\omega_\text{rel}|$ → single Laplace (always sign-definite, since $|\omega_\text{rel}| + \tilde{E}_c + \Omega > 0$)
+The GN extraction is done by `extract_gn_ppm_parameters_from_Wc(Wc0_q, Wci_q, omega_p, fallback_omega)` and returns elementwise (\Omega) and (B) such that:
 
-In both cases there is an additional overall minus sign relative to the positive-$|\omega_\text{rel}|$ kernel:
+[
+W^c_{q,\mu\nu}(\omega)\approx \frac{2,B_{q,\mu\nu},\Omega_{q,\mu\nu}}{\omega^2-\Omega_{q,\mu\nu}^2}.
+]
 
-$$\omega_\text{rel} - (\tilde{E}_c + \Omega) = -\bigl(|\omega_\text{rel}| + \tilde{E}_c + \Omega\bigr),$$
-$$\omega_\text{rel} + (h_v + \Omega) = -\bigl(|\omega_\text{rel}| - (h_v + \Omega)\bigr).$$
+Static identity (what the code checks):
+[
+W^c(0)=-\frac{2B}{\Omega}.
+]
 
-So the $\omega< E_F$ half reuses the positive-$|\omega|$ window machinery, but the final accumulated contribution carries a global `-1` factor.
+Time-domain form used later:
+[
+W^c_{q,\mu\nu}(t) = B_{q,\mu\nu},e^{-i,\Omega_{q,\mu\nu},t}.
+]
 
-The structure is perfectly symmetric about $E_F$. The same `convolve_frequencies` machinery handles both halves — it just swaps which term gets the crossing treatment.
+### 3.4 Valid/invalid GN modes
 
-### 5.4 $E_F$ cancellation proof
+The GN extractor produces:
 
-All propagators use $e^{-i\tilde{E}t}$ with $\tilde{E}$ referenced to $E_F$, but $E_F$ cancels in the product. For $\Sigma^{(-)}$:
+* `valid_mask_mu_nu` and `unfulfilled_fraction` (reported as “unfulfilled=…%”).
 
-$$\underbrace{e^{-i(E_c^\text{vac} - E_c^{\min})t}}_{\text{prop A}} \cdot \underbrace{e^{-i(\Omega - \Omega^{\min})t}}_{\text{prop B}} \cdot \underbrace{e^{-i\bigl((E_c^{\min} - E_F) + \Omega^{\min}\bigr)t}}_{\text{gap phase}} \cdot \underbrace{e^{+i(\omega - E_F)t}}_{\text{freq kernel}} = e^{i(\omega - E_c^\text{vac} - \Omega)t}$$
+Downstream, sigma uses:
 
-For $\Sigma^{(+)}$:
-
-$$\underbrace{e^{-i(E_v^{\max} - E_v^\text{vac})t}}_{\text{prop A}} \cdot \underbrace{e^{-i(\Omega - \Omega^{\min})t}}_{\text{prop B}} \cdot \underbrace{e^{-i\bigl((E_F - E_v^{\max}) + \Omega^{\min}\bigr)t}}_{\text{gap phase}} \cdot \underbrace{e^{-i(\omega - E_F)t}}_{\text{freq kernel}} = e^{-i(\omega - E_v^\text{vac} + \Omega)t}$$
-
-For $\chi^0$ ($E_c$, $h_v$ pairing): $E_F$ cancels between the two axes, giving $e^{i(\omega - E_c^\text{vac} + E_v^\text{vac})t}$.
-
-In all three cases, $E_F$ drops out of the final physical phase. Only vacuum eigenvalues and $\omega^\text{vac}$ survive. This is why `convolve_frequencies` can take $E_F$ as a single parameter and vacuum eigenvalues as-is.
-
-### 5.5 After all windows
-
-1. Coulomb sandwich: $\Sigma^c = v \cdot [\text{accumulated}] \cdot v$.
-2. Add exchange: $\Sigma = \Sigma^x + \Sigma^c(\omega)$.
-3. Band projection: $\Sigma_{ij,\mathbf{k}}(\omega) = \sum_{ab,\mu,\nu} \psi^*_{i,a}(r_\mu)\, \Sigma_{\mathbf{k},ab}(\mu,\nu;\omega)\, \psi_{j,b}(r_\nu)$.
-
-### 5.5a Safe band-space optimization for windowed $\Sigma^c(\omega)$
-
-The window projection (`Re` for Laplace windows, `Im` for crossing windows) must act on the accumulated $\mu\nu$ tensor, not on an already projected band-space tensor:
-
-$$K[X]_{ij,\mathbf{k}} \equiv \sum_{ab,\mu,\nu} \psi^*_{i,a}(r_\mu)\, X_{\mathbf{k},ab}(\mu,\nu)\, \psi_{j,b}(r_\nu)$$
-
-In general,
-
-$$K[\operatorname{Re} X] \neq \operatorname{Re} K[X], \qquad K[\operatorname{Im} X] \neq \operatorname{Im} K[X],$$
-
-because $K[\cdot]$ is complex-linear while $\operatorname{Re}$ and $\operatorname{Im}$ are only real-linear.
-
-The exact reduced-storage optimization is therefore:
-
-1. For each $\tau_u$, build the complex $\mu\nu$ contribution $X_u$ once.
-2. Contract both real channels to bands once:
-   $$S^{(R)}_u \equiv K[\operatorname{Re} X_u], \qquad S^{(I)}_u \equiv K[\operatorname{Im} X_u].$$
-3. Discard $X_u$ in $\mu\nu$ space.
-4. Reconstruct each frequency contribution in band space using the scalar coefficient multiplying $X_u$.
-
-If the full scalar coefficient for node $u$ at frequency $\omega$ is
-
-$$c_u(\omega) = p_u(\omega) + i q_u(\omega),$$
-
-then
-
-$$K[\operatorname{Re}(c_u X_u)] = p_u S^{(R)}_u - q_u S^{(I)}_u,$$
-$$K[\operatorname{Im}(c_u X_u)] = p_u S^{(I)}_u + q_u S^{(R)}_u.$$
-
-This is exact. It avoids storing $\Sigma_{\mathbf{k}}(\mu,\nu,\omega)$ and still avoids an $N_\tau N_\omega$ sequence of $\mu\nu \to ij$ contractions. What is not allowed is to form a single complex $K[X_u]$ and then take `Re`/`Im` of that object afterward.
-
-### 5.6 Cost
-
-Per window, per node: $O(N_k N_\text{band} N_s^2 N_\mu^2)$ (builds) + $O(N_s^2 N_\mu^2 N_k \log N_k)$ (FFTs) + $O(N_R N_s^2 N_\mu^2)$ (multiply). Total: $O(N_k N^3)$.
+* `B_mask = Omega_abs > 1e-14`
+* and if `invalid_mode="static_limit"` then it masks out invalid GN elements: `B_mask &= valid_mask`.
 
 ---
 
-## 6. Pipeline summary
+## 4. Phase 2: (\Sigma^c(\omega)) on a real-frequency grid (minimax CTSP)
 
-**Phase 1** (GN-PPM): Single Laplace window, $\sim 12$ nodes. Build $\chi^0(0)$ and $\chi^0(i\omega_p)$ sharing propagators. Dyson-solve to $\Pi$. Extract $\Omega, B$. No $E_F$ dependence.
+### 4.1 Outputs
 
-**Phase 2** ($\Sigma^c(\omega)$): Split $\omega$ at $E_F$. For each half: conduction term and valence term, one gets 3 windows (crossing), the other gets single Laplace. Accumulate, Coulomb-sandwich, add $\Sigma^x$, project to bands.
+`compute_sigma_c_ppm_omega_grid(...)` returns:
 
-**Self-consistent iteration:** Update $E_F$ and eigenvalues. Repeat Phase 1 + Phase 2. $E_F$ enters only through occupancy masks, positive-axis definitions, and $\omega_\text{rel} = \omega - E_F$ — all centralized in `convolve_frequencies`.
+* `sigma_c_kij(omega)` (either in memory or streamed to H5)
+* optional split contributions: `sigma_c_plus_kij`, `sigma_c_minus_kij`
+* optional static correction for invalid GN modes: `sigma_c_invalid_static_kij`
+
+### 4.2 Accumulation mode (what code actually does)
+
+The code **always** accumulates in band space ((k,i,j)) before applying the (\omega)-kernel:
+
+* The old “(\Sigma_{\mu\nu}(\omega)) to disk” mode is disabled; if you request `sigma_munu_h5_path`, it prints a warning and ignores it.
+
+Modes:
+
+* `omega_accumulation="kij"`: all (\omega) in one pass in memory
+* `omega_accumulation="kij_stream"`: write `sigma_c_kij_ry[omega,k,i,j]` to HDF5 in ω-chunks
+* `omega_accumulation="auto"` selects between them
+
+### 4.3 “Two-channel” accumulation at each time node
+
+At each time node (t), the code computes (\Sigma(t)) in (\mu\nu) and projects to band space **as two real channels**:
+
+* `sigma_tau_kij_re = K[ Re(Σ_tau) ]`
+* `sigma_tau_kij_im = K[ Im(Σ_tau) ]`
+
+Then for each (\omega) it forms a complex scalar coefficient (c(\omega,t)) and mixes the channels to produce either:
+
+* **real-projection windows**: (\Re(c,\Sigma))
+* **imag-projection windows** (HGL core): (\Im(c,\Sigma))
+
+This is done without storing (\Sigma(\omega)) in (\mu\nu).
 
 ---
 
-## 7. Design principles
+## 5. Sigma windowing and quadrature (exactly as in `ppm_sigma.py`)
 
-1. **GN-PPM collapses the pole axis.** $O(N_t)$ poles → one per $(\mu,\nu)$.
-2. **Phase 1 is free.** $\sim 12$ Laplace nodes, single window, shared propagators.
-3. **Minimax sine replaces Golub–Welsch.** $O(A)$ crossing nodes instead of $O(A^2)$.
-4. **Three windows suffice.** Minimal partition separating crossing from non-crossing.
-5. **One builder, one integrator.** Laplace vs. crossing: $t$ imaginary vs. real, one $\operatorname{Im}[\cdots]$ projection.
-6. **$E_F$ is a parameter, not baked in.** Vacuum eigenvalues throughout; $E_F$ cancels algebraically in all products.
-7. **No analytic continuation.** Real-axis $\Sigma^c(\omega)$ directly.
+### 5.1 Kernel sign convention used by the sigma code
+
+In sigma, axis-A energies are either (E_c) or (h_v) and axis-B energies are (\Omega).
+
+* `kernel_sign = +1` means the **minus-kernel** class (can require 3-window crossing treatment when (\omega_{\max}>0)).
+* `kernel_sign = -1` means the **plus-kernel** class (sign-definite; always single Laplace window).
+
+The window builder is called with `omega_nonneg_ry` (always (\ge 0) inside each half-batch).
+
+### 5.2 Single Laplace window (sign-definite)
+
+Built by `_build_single_sigma_window(...)`:
+
+Given masked axis values (A\in E_A), (B\in E_B(=\Omega)):
+
+[
+S_{\min}=\min(A)+\min(B),\qquad S_{\max}=\max(A)+\max(B),
+]
+[
+x_{\min}=\max(S_{\min},10^{-12}),
+]
+[
+x_{\max}=\begin{cases}
+\max(S_{\max}+\omega_{\max}, x_{\min}(1+10^{-9})) & \text{if } \text{kernel_sign}=-1\
+\max(S_{\max}, x_{\min}(1+10^{-9})) & \text{if } \text{kernel_sign}=+1
+\end{cases}
+]
+
+Then:
+
+* `q = solve_laplace_minimax_interval(x_min, x_max, target_error, max_nodes)`
+* `t_nodes = -i * q.tau`
+* `alpha = q.alpha`
+
+Window fields:
+
+* `E_ref_A = min(A_vals)`, `E_ref_B = min(B_vals)`
+* `omega_sign = kernel_sign`
+* `project = "real"`
+
+Prefactor (exactly as code):
+
+* it treats the “docs prefactor” as:
+
+  * `docs_prefactor = -1` if `kernel_sign==+1`, else `+1`
+* but `get_sigma_mu_nu_fn` already includes a global (-1), so it stores:
+  [
+  \texttt{prefactor}=-\texttt{docs_prefactor}
+  ]
+  i.e.
+
+  * `kernel_sign=+1`: prefactor (=+1)
+  * `kernel_sign=-1`: prefactor (=-1)
+
+### 5.3 Three-window scheme (used only for `kernel_sign=+1` and (\omega_{\max}>0))
+
+Built by `_build_three_sigma_windows(...)`:
+
+Parameters:
+[
+\xi=\texttt{regularization_width_ry},\quad z_{\rm edge}=\texttt{edge_factor}\cdot\xi,\quad T=\omega_{\max}+z_{\rm edge}.
+]
+
+Masks (note: **b_slab uses all A**, so the ((A>T,B>T)) corner is included in b_slab):
+
+* core: (A\le T) and (B\le T)
+* a_stripe: (A>T) and (B\le T)
+* b_slab: (A) = full, and (B>T)
+
+For each window, define:
+[
+S_{\min}=\min(A)+\min(B),\qquad S_{\max}=\max(A)+\max(B).
+]
+
+**core**:
+
+* (A_{\rm core}=\max(2T/\xi,10^{-8}))
+* `q_cross = solve_phase_minimax_bandwidth(A_core, target_error, crossing_max_nodes, eps_q=crossing_eps_q, target_kind="hgl")`
+* `t_nodes = q_cross.tau / xi` (real)
+* `alpha = q_cross.alpha / xi` (real)
+* `project="imag"`
+* `omega_sign=+1`
+* docs_prefactor = +1 → stored prefactor = (-1)
+
+**a_stripe and b_slab**:
+[
+x_{\min}=\max(S_{\min}-(T-z_{\rm edge}),\ z_{\rm edge},\ 10^{-12})
+=\max(S_{\min}-\omega_{\max},\ z_{\rm edge},\ 10^{-12})
+]
+[
+x_{\max}=\max(S_{\max}, x_{\min}(1+10^{-9})).
+]
+
+* `q = solve_laplace_minimax_interval(x_min, x_max, ...)`
+* `t_nodes=-i q.tau`
+* `alpha=q.alpha`
+* `project="real"`
+* `omega_sign=+1`
+* docs_prefactor = −1 → stored prefactor = (+1)
 
 ---
 
-## 8. Companion documents
+## 6. Exact sigma evaluation loop (per branch)
 
-| Document | Content |
-|----------|---------|
-| `MINIMAX_CTSP_IMPLEMENTATION.md` | Code-level: `convolve_frequencies`, builders, routing, $E_F$ handling |
-| `PHYSICS_COMPREHENSIVE.md` | ISDF fitting, Galerkin equations, sharding, static COHSEX |
-| `crossing_minimax_overview.md` | Minimax sine-sum algorithm, error scaling |
-| `chi_omega_quadrature.md` | CTSP quadrature, GL/HGL derivations, complex-frequency extension |
-| `GN-PPM_GUIDELINES.md` | GN-PPM in ISDF, $\omega_p$ selection, failure conditions |
+At a given `_SigmaWindow win`, for each time node (t) and weight (\alpha):
+
+1. Build band weights for axis A:
+   [
+   \text{phase}*A = e^{-i (E_A - E^{\rm ref}*A),t},
+   ]
+   masked by `win.mask_A`, and used to construct a diagonal band matrix (G*{knm}) via:
+   [
+   G*{knm} = \delta_{nm},\text{phase}_A(k,n).
+   ]
+
+2. Build (G_k(\mu,\nu)) from the reusable callback:
+
+* `G_k = get_G_mu_nu_fn(psi_coh_rmuT_X, psi_coh_rmu_Y, Gij)`
+
+3. FFT to R:
+
+* `G_R = get_G_R_fn(G_k, nkx,nky,nkz)`
+
+4. Build (W^c_q(t)) from GN PPM:
+   [
+   W^c_{q,\mu\nu}(t)= B_{\mu\nu},e^{-i(\Omega_{\mu\nu}-\Omega^{\rm ref})t},
+   ]
+   masked by `win.mask_B`, implemented by `build_ppm_w_time_q(...)`.
+
+5. Contract to (\Sigma(\mu,\nu;t)):
+
+* `sigma_tau = get_sigma_mu_nu_fn(G_R, W_t_q, nk_tot, bispinor)`
+
+6. Project to band-space channels:
+
+* `sigma_tau_kij_re, sigma_tau_kij_im = get_sigma_kij_channels_fn(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_tau)`
+
+7. Form the scalar coefficient per ((\omega,t)):
+   [
+   c(\omega,t) = \alpha , e^{-i(E^{\rm ref}*A+E^{\rm ref}*B)t},e^{i,\omega*{\rm sign},\omega*{\rm flip},\omega,t}.
+   ]
+
+8. Combine channels depending on `win.project`:
+
+* if `project=="real"` use (\Re(c,\Sigma)):
+  [
+  \Re(c),\Re(\Sigma) - \Im(c),\Im(\Sigma)
+  ]
+* if `project=="imag"` use (\Im(c,\Sigma)):
+  [
+  \Re(c),\Im(\Sigma) + \Im(c),\Re(\Sigma)
+  ]
+
+9. Multiply by `prefactor * scale` and accumulate.
+
+---
+
+## 7. (\omega)-splitting and “canonical” negative-frequency handling (exactly as code)
+
+Let the input grid be `omega_rel_req = omega_values_ry` (already relative to (E_F)). Split:
+
+* `omega_pos = omega_rel_req[omega>=0]`
+* `omega_neg_abs = -omega_rel_req[omega<0]`
+
+Then the code runs two calls:
+
+### 7.1 For (\omega_{\rm rel}\ge 0)
+
+* conduction branch uses `kernel_sign=+1` (3 windows if ω_max>0)
+* valence branch uses `kernel_sign=-1` (single Laplace window)
+* `omega_sign_flip = +1` for both branches
+
+### 7.2 For (\omega_{\rm rel}<0) (canonical map)
+
+Evaluate at (|\omega_{\rm rel}|) with:
+
+* conduction branch `kernel_sign=-1`
+* valence branch `kernel_sign=+1`
+* **and** `omega_sign_flip = -1` for both branches
+
+Additionally:
+
+* `neg_scale = sigma_scale`
+* if `sigma_flip_neg=True`, it flips the entire negative branch sign by setting `neg_scale=-sigma_scale`.
+
+This is exactly what the code currently does.
+
+---
+
+## 8. Invalid GN modes: static-limit correction
+
+If `invalid_mode="static_limit"` and `Wc0_mu_nu` is provided and there are invalid elements:
+
+1. Construct `Wc0_invalid = Wc0_mu_nu` on invalid mask only.
+
+2. Compute two static contractions:
+
+* occupied Green’s function contraction:
+  [
+  \Sigma_{\rm occ} = \Sigma[G^{\rm occ}, W^c_{\rm invalid}(0)]
+  ]
+  (implemented by building `Gij_occ` diagonal with occupied ones)
+
+* identity contraction (RI term):
+  [
+  \Sigma_{\rm RI} = \Sigma[I, W^c_{\rm invalid}(0)]
+  ]
+
+3. Form static COH correction:
+   [
+   \Sigma_{\rm invalid}^{\rm static} = \Sigma_{\rm occ} - \tfrac12 \Sigma_{\rm RI}.
+   ]
+
+4. Add it to **all** (\omega) points (in memory or by adding to each streamed chunk).
+
+---
+
+## 9. Practical parameters that actually exist in code
+
+* GN PPM:
+
+  * `omega_p_ry` default 2.0 Ry
+  * `fallback_omega` passed to GN extractor
+  * head correction applied for ω=0 and ω=iω_p through `apply_head_correction(...)` callback in `gw_jax.py`
+
+* Sigma quadrature:
+
+  * `target_error`, `max_nodes` for Laplace minimax
+  * `regularization_width_ry` (ξ), `edge_factor`, `crossing_eps_q`, `crossing_max_nodes`
+  * `omega_batch_size` for streaming path
+  * `sigma_scale` and debug `sigma_flip_neg`
+
+---
+

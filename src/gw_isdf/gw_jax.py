@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from types import SimpleNamespace
-#jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_enable_x64", True)
 #jax.config.update("jax_platform_name", "cpu")
 
 # Initialize JAX distributed only when running multi-process
@@ -288,6 +288,71 @@ def apply_head_correction(
 	return V_head, W_head
 
 
+def write_w_copies_debug_h5(
+	path,
+	*,
+	W0_screen_q=None,
+	W0_ppm_q=None,
+	Wiwp_ppm_q=None,
+	print_fn=print,
+):
+	"""Write q=0 ISDF W copies and emit compact norm/difference diagnostics."""
+	def _q000_munu(W_q):
+		if W_q is None:
+			return None
+		return np.asarray(jax.device_get(W_q[0, 0, 0, 0, :, 0, :]), dtype=np.complex128)
+
+	W0_screen = _q000_munu(W0_screen_q)
+	W0_ppm = _q000_munu(W0_ppm_q)
+	Wiwp_ppm = _q000_munu(Wiwp_ppm_q)
+
+	def _fnorm(x):
+		return float(np.linalg.norm(x, ord="fro")) if x is not None else None
+
+	norm_screen = _fnorm(W0_screen)
+	norm_ppm0 = _fnorm(W0_ppm)
+	norm_ppmi = _fnorm(Wiwp_ppm)
+
+	diff_abs = None
+	diff_rel = None
+	if (W0_screen is not None) and (W0_ppm is not None):
+		diff_abs = float(np.max(np.abs(W0_screen - W0_ppm)))
+		ref = max(float(np.max(np.abs(W0_screen))), 1.0e-16)
+		diff_rel = diff_abs / ref
+
+	os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+	with h5py.File(path, "w") as h5:
+		if W0_screen is not None:
+			h5.create_dataset("W0_screen_q000_munu", data=W0_screen)
+		if W0_ppm is not None:
+			h5.create_dataset("W0_ppm_q000_munu", data=W0_ppm)
+		if Wiwp_ppm is not None:
+			h5.create_dataset("Wiwp_ppm_q000_munu", data=Wiwp_ppm)
+		if norm_screen is not None:
+			h5.attrs["fro_W0_screen_q000"] = norm_screen
+		if norm_ppm0 is not None:
+			h5.attrs["fro_W0_ppm_q000"] = norm_ppm0
+		if norm_ppmi is not None:
+			h5.attrs["fro_Wiwp_ppm_q000"] = norm_ppmi
+		if diff_abs is not None:
+			h5.attrs["maxabs_W0_screen_minus_ppm_q000"] = diff_abs
+		if diff_rel is not None:
+			h5.attrs["rel_W0_screen_minus_ppm_q000"] = diff_rel
+
+	print_fn(f"  W-copy debug h5:        {path}")
+	if norm_screen is not None:
+		print_fn(f"    ||W0(screen,q=0)||_F = {norm_screen:.10e}")
+	if norm_ppm0 is not None:
+		print_fn(f"    ||W0(ppm,q=0)||_F    = {norm_ppm0:.10e}")
+	if norm_ppmi is not None:
+		print_fn(f"    ||W(iωp,ppm,q=0)||_F = {norm_ppmi:.10e}")
+	if diff_abs is not None:
+		print_fn(
+			f"    max|W0(screen)-W0(ppm)| = {diff_abs:.6e} "
+			f"(rel={diff_rel:.6e})"
+		)
+
+
 def fit_zeta_and_compute_V_q_chunked(
 	wfn,
 	sym,
@@ -489,6 +554,7 @@ def fit_zeta_and_compute_V_q_chunked(
 					mesh_xy=mesh_xy,
 					sys_dim=sys_dim,
 					q_batch_size=q_batch_vcoul if mu_chunk_vcoul >= meta.n_rmu else None,
+					bdot=np.asarray(wfn.bdot, dtype=np.float64) if sys_dim == 0 else None,
 				)
 	
 	# Write G0 (ζ_μ(G=0) for each q) to the zeta HDF5 file for restart/reuse
@@ -929,7 +995,7 @@ def main(argv=None):
 	nval = params["nval"]
 	ncond = params["ncond"]
 	nband = params["nband"]
-	sys_dim = params["sys_dim"]  # 3 for 3D, 2 for 2D
+	sys_dim = params["sys_dim"]  # 0=molecule/box, 2=slab
 	self_consistent = bool(params.get("self_consistent", False))
 	use_ppm_sigma = bool(params.get("use_ppm_sigma", False))
 
@@ -1002,24 +1068,26 @@ def main(argv=None):
 
 	# Compute screened Coulomb W = (1 - Vχ)⁻¹ V
 	if do_screened:
-		with timing.section("gw_jax.chi0_W"):
-			with jax_profile.trace_section("chi0_W"):
-				omega_eval = float(params.get("debug_omega") or 0.0)
-				screening_method = str(params.get("screening_method", "minimax")).strip().lower()
-				window_pairs = None
-				if screening_method == "ctsp":
-					window_pairs = get_window_info(epsq, wfn, nband_max=nband)
-				W_q = compute_screening(
-					V_qmunu, wf_bundle, window_pairs, meta, mesh_xy,
-					omega=omega_eval,
-					screening_method=screening_method,
-					minimax_target_error=float(params.get("minimax_target_error", 1.0e-6)),
-					minimax_max_nodes=int(params.get("minimax_max_nodes", 64)),
-					ppm_omega_p=params.get("ppm_omega_p"),
-					ppm_fallback_omega=float(params.get("ppm_fallback_omega", 2.0)),
-					tensors_filename=tensors_filename,
-					print0=print0,
-				)
+			with timing.section("gw_jax.chi0_W"):
+				with jax_profile.trace_section("chi0_W"):
+					omega_eval = float(params.get("debug_omega") or 0.0)
+					screening_method = str(params.get("screening_method", "minimax")).strip().lower()
+					minimax_energy_reference = params.get("minimax_energy_reference", "midgap")
+					window_pairs = None
+					if screening_method == "ctsp":
+						window_pairs = get_window_info(epsq, wfn, nband_max=nband)
+					W_q = compute_screening(
+						V_qmunu, wf_bundle, window_pairs, meta, mesh_xy,
+						omega=omega_eval,
+						screening_method=screening_method,
+						minimax_target_error=float(params.get("minimax_target_error", 1.0e-6)),
+						minimax_max_nodes=int(params.get("minimax_max_nodes", 64)),
+						minimax_energy_reference=minimax_energy_reference,
+						ppm_omega_p=params.get("ppm_omega_p"),
+						ppm_fallback_omega=float(params.get("ppm_fallback_omega", 2.0)),
+						tensors_filename=tensors_filename,
+						print0=print0,
+					)
 
 	# Extract bare (no-head) V_μν. This is kept for Hartree construction where
 	# the G=0 contribution must remain excluded.
@@ -1162,7 +1230,7 @@ def main(argv=None):
 		ppm_invalid_mode = str(params.get("ppm_invalid_mode", "static_limit")).strip().lower()
 		sigma_debug_split_contrib = bool(params.get("sigma_debug_split_contrib", False))
 		sigma_freq_debug_output = bool(params.get("sigma_freq_debug_output", True))
-		fermi_reference = str(params.get("fermi_reference", "vbm")).strip().lower()
+		fermi_reference = str(params.get("fermi_reference", "midgap")).strip().lower()
 		sigma_at_dft_extrapolate = bool(params.get("sigma_at_dft_extrapolate", False))
 		sigma_at_dft_energies = bool(params.get("sigma_at_dft_energies", False))
 		ppm_sigma_debug_static_norm = bool(params.get("ppm_sigma_debug_static_norm", False))
@@ -1170,9 +1238,13 @@ def main(argv=None):
 		sigma_debug_quadrature_samples = int(params.get("sigma_debug_quadrature_samples", 200))
 		sigma_munu_h5_path = str(params.get("sigma_munu_h5_file", "") or "").strip()
 		sigma_kij_h5_path = str(params.get("sigma_kij_h5_file", "") or "").strip()
+		write_w_copies_debug = bool(params.get("write_w_copies_debug", True))
+		w_copies_debug_file = str(params.get("w_copies_debug_file", "w_copies_debug.h5") or "").strip()
 		sigma_freq_debug_file = str(params.get("sigma_freq_debug_file", "sigma_freq_debug.dat") or "").strip()
 		if sigma_freq_debug_file and (not os.path.isabs(sigma_freq_debug_file)):
 			sigma_freq_debug_file = os.path.join(input_dir, sigma_freq_debug_file)
+		if w_copies_debug_file and (not os.path.isabs(w_copies_debug_file)):
+			w_copies_debug_file = os.path.join(input_dir, w_copies_debug_file)
 		if sigma_freq_debug_output and (not sigma_debug_split_contrib):
 			sigma_debug_split_contrib = True
 			print0("  NOTE: enabling sigma_debug_split_contrib for sigma_freq_debug_output")
@@ -1220,17 +1292,26 @@ def main(argv=None):
 				print_summary=False,
 			)
 			ppm = compute_w0_wiwp_and_ppm_from_minimax(
-				V_qmunu_nohead,
-				wf_bundle,
-				meta,
-				mesh_xy,
-				omega_p_ry=omega_p_ry,
-				target_error=float(params.get("minimax_target_error", 1.0e-6)),
-				max_nodes=int(params.get("minimax_max_nodes", 64)),
-				fallback_omega=ppm_fallback,
-				head_correction_fn=head_correction,
-				print0=print0,
-			)
+					V_qmunu_nohead,
+					wf_bundle,
+					meta,
+					mesh_xy,
+					omega_p_ry=omega_p_ry,
+					target_error=float(params.get("minimax_target_error", 1.0e-6)),
+					max_nodes=int(params.get("minimax_max_nodes", 64)),
+					minimax_energy_reference=params.get("minimax_energy_reference", fermi_reference),
+					fallback_omega=ppm_fallback,
+					head_correction_fn=head_correction,
+					print0=print0,
+				)
+			if meta.rank == 0 and write_w_copies_debug and w_copies_debug_file:
+				write_w_copies_debug_h5(
+					w_copies_debug_file,
+					W0_screen_q=W_q,
+					W0_ppm_q=ppm.W0_q,
+					Wiwp_ppm_q=ppm.Wiwp_q,
+					print_fn=print0,
+				)
 			sigma_omega = compute_sigma_c_ppm_omega_grid(
 				psi_coh_rmuT_X=sigma_views.psi_cohT,
 				psi_coh_rmu_Y=sigma_views.psi_coh,
@@ -1608,7 +1689,7 @@ def main(argv=None):
 		# solve in the same relative-energy scale (E - E_F), then shift back.
 		h0_diag_ev_abs = np.real(np.diagonal(np.array(kin_ion_full + hartree_kbar_ij_jax), axis1=1, axis2=2)) * ryd2ev
 		sigma_xc_diag_omega_ev = np.real(np.diagonal(np.array(sigma_xc_omega_kij), axis1=2, axis2=3)) * ryd2ev
-		occ_idx = max(0, min(int(nelec) - 1, E_dyn0_ev.shape[1] - 1))
+		occ_idx = max(0, min(int(wf_bundle.slices.occ_slice.stop) - 1, E_dyn0_ev.shape[1] - 1))
 		if fermi_reference == "midgap" and (occ_idx + 1) < E_dyn0_ev.shape[1]:
 			vbm_ev = float(np.max(E_dyn0_ev[:, occ_idx]))
 			cbm_ev = float(np.min(E_dyn0_ev[:, occ_idx + 1]))
@@ -1634,8 +1715,8 @@ def main(argv=None):
 		n_in_grid = int(np.count_nonzero(in_omega_grid))
 		conv_frac = float(np.mean(conv_mask[in_omega_grid].astype(np.float64))) if n_in_grid > 0 else 1.0
 
-		iv_edge = int(nelec) - 1
-		ic_edge = int(nelec)
+		iv_edge = int(occ_idx)
+		ic_edge = int(min(occ_idx + 1, E_dyn0_ev.shape[1] - 1))
 		gap_static = _gap_k0(E_static_ref_ev, iv_edge, ic_edge)
 		gap_dyn0 = _gap_k0(E_dyn0_ev, iv_edge, ic_edge)
 		gap_diag_sc = _gap_k0(E_diag_sc_ev, iv_edge, ic_edge)
