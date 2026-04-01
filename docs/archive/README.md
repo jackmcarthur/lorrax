@@ -11,7 +11,7 @@ This folder contains older documentation that has been **superseded** by the com
 | `cohsex_jax_physics.md` | `../PHYSICS_COMPREHENSIVE.md` §6-7 | Verbose, streamlined in comprehensive doc |
 | `ZETA_FITTING_ALGORITHM.md` | `../PHYSICS_COMPREHENSIVE.md` §4-5 | Redundant with comprehensive doc |
 | `isdf_spin_galerkin_derivation.md` | `../PHYSICS_COMPREHENSIVE.md` §3 | CCT/ZCT derivation already included |
-| `ctsp_revised.md` | `../chi_omega_quadrature.md` | Overlaps with chi_omega quadrature notes |
+| `ctsp_revised.md` | `../MINIMAX_QUADRATURE.md` | Overlaps with minimax quadrature reference |
 
 ## Current Documentation
 
@@ -24,8 +24,7 @@ For up-to-date information, see:
 
 ### Specialized Topics
 - **Memory model**: [`../MEMORY_MODEL.md`](../MEMORY_MODEL.md)
-- **Chunk constraints**: [`../CHUNK_BUDGETS.md`](../CHUNK_BUDGETS.md)
-- **CTSP quadrature**: [`../chi_omega_quadrature.md`](../chi_omega_quadrature.md)
+- **CTSP quadrature / minimax**: [`../MINIMAX_QUADRATURE.md`](../MINIMAX_QUADRATURE.md)
 
 ### Other Resources
 - **Advanced topics**: [`../advanced/`](../advanced/)

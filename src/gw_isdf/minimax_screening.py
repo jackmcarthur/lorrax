@@ -10,13 +10,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
 from typing import Callable
 
-import importlib.util
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from common import minimax as _minimax
 
 
 _TINY = 1.0e-12
@@ -121,50 +121,6 @@ class GodbyNeedsPPM:
     unfulfilled_fraction: float
 
 
-@lru_cache(maxsize=1)
-def _load_docs_minimax_module():
-    """Load the canonical docs/minimax.py implementation."""
-    root = Path(__file__).resolve().parents[2]
-    path = root / "docs" / "minimax.py"
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Canonical minimax module not found at {path}. "
-            "The minimax screening path requires docs/minimax.py."
-        )
-    spec = importlib.util.spec_from_file_location("isdf_docs_minimax", str(path))
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to load canonical minimax module from {path}.")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    if not hasattr(mod, "noncrossing_grids"):
-        raise AttributeError(
-            "Canonical minimax module is missing noncrossing_grids(R, eps, ...)."
-        )
-    return mod
-
-
-@lru_cache(maxsize=1)
-def _load_docs_minimax_imag_module():
-    """Load the imaginary-axis minimax module docs/minimax_imaginary_axis.py."""
-    root = Path(__file__).resolve().parents[2]
-    path = root / "docs" / "minimax_imaginary_axis.py"
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Imaginary-axis minimax module not found at {path}. "
-            "The GN-PPM path requires docs/minimax_imaginary_axis.py."
-        )
-    spec = importlib.util.spec_from_file_location("isdf_docs_minimax_imag", str(path))
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to load imaginary-axis minimax module from {path}.")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    if not hasattr(mod, "noncrossing_imag_grids"):
-        raise AttributeError(
-            "Imaginary-axis minimax module is missing noncrossing_imag_grids(R, omega_hat, eps, ...)."
-        )
-    return mod
-
-
 @lru_cache(maxsize=64)
 def _solve_noncrossing_scaled_cached(
     logR_key: float,
@@ -173,8 +129,7 @@ def _solve_noncrossing_scaled_cached(
 ) -> tuple[np.ndarray, np.ndarray, float]:
     R = float(np.exp(logR_key))
     target = float(target_key)
-    docs_mod = _load_docs_minimax_module()
-    tau, w, _n, err = docs_mod.noncrossing_grids(R, target, N_start=2, N_max=max_nodes)
+    tau, w, _n, err = _minimax.noncrossing_grids(R, target, N_start=2, N_max=max_nodes)
     return np.asarray(tau, dtype=np.float64), np.asarray(w, dtype=np.float64), float(err)
 
 
@@ -188,8 +143,7 @@ def _solve_noncrossing_imag_scaled_cached(
     R = float(np.exp(logR_key))
     omega_hat = float(omega_hat_key)
     target = float(target_key)
-    docs_mod = _load_docs_minimax_imag_module()
-    tau, w, _n, err = docs_mod.noncrossing_imag_grids(
+    tau, w, _n, err = _minimax.noncrossing_imag_grids(
         R, omega_hat, target, N_start=2, N_max=max_nodes,
     )
     return np.asarray(tau, dtype=np.float64), np.asarray(w, dtype=np.float64), float(err)
@@ -206,20 +160,15 @@ def _solve_crossing_scaled_cached(
     A_dim = float(A_key)
     target = float(target_key)
     eps_q = float(eps_q_key)
-    docs_mod = _load_docs_minimax_module()
-    if not hasattr(docs_mod, "crossing_grids"):
-        raise AttributeError(
-            "Canonical minimax module is missing crossing_grids(A, eps, ...)."
-        )
     if target_kind == "hgl":
-        G_func = docs_mod.G_hgl
-        tau_max_func = docs_mod.tau_max_hgl
+        G_func = _minimax.G_hgl
+        tau_max_func = _minimax.tau_max_hgl
     elif target_kind == "fermi":
-        G_func = docs_mod.G_fermi
-        tau_max_func = docs_mod.tau_max_fermi
+        G_func = _minimax.G_fermi
+        tau_max_func = _minimax.tau_max_fermi
     else:
         raise ValueError(f"Unknown crossing target_kind={target_kind!r}.")
-    tau, w, _n, err = docs_mod.crossing_grids(
+    tau, w, _n, err = _minimax.crossing_grids(
         A_dim,
         target,
         G_func,

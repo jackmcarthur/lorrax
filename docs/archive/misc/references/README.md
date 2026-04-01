@@ -21,4 +21,4 @@ This folder contains markdown conversions of reference papers and detailed mathe
 
 For actual implementation and usage, see:
 - **Physics/theory**: [`../PHYSICS_COMPREHENSIVE.md`](../PHYSICS_COMPREHENSIVE.md)
-- **CTSP implementation**: [`../chi_omega_quadrature.md`](../chi_omega_quadrature.md)
+- **CTSP implementation**: [`../MINIMAX_QUADRATURE.md`](../MINIMAX_QUADRATURE.md)

@@ -689,7 +689,7 @@ def compute_screening(
 
     Supports two screening paths:
     - ``screening_method='minimax'`` (default): canonical minimax quadrature
-      from ``docs/minimax.py`` on a single static window.
+      from ``common.minimax`` on a single static window.
     - ``screening_method='ctsp'``: legacy CTSP dynamic path.
 
     Parameters

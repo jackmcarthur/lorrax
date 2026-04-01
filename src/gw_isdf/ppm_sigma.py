@@ -18,10 +18,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 import h5py
 
+from common.minimax import G_hgl as _G_hgl, G_fermi as _G_fermi
 from .minimax_screening import (
     build_static_minimax_window_pair,
     extract_gn_ppm_parameters_from_Wc,
-    _load_docs_minimax_module,
     solve_laplace_minimax_interval,
     solve_laplace_minimax_imag_interval,
     solve_phase_minimax_bandwidth,
@@ -120,7 +120,7 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     minimax_energy_reference: str | float | int | None = "midgap",
     minimax_energy_reference_fn: Callable[[jax.Array, jax.Array], float] | None = None,
     fallback_omega: float = 2.0,
-    head_correction_fn: Callable[[jax.Array, jax.Array, complex], tuple[jax.Array, jax.Array]] | None = None,
+    head_correction_fn: Callable[[jax.Array, jax.Array, complex], tuple[jax.Array, jax.Array, dict]] | None = None,
     print0=print,
 ) -> PPMBuildResult:
     """Build GN-PPM parameters from minimax W(0) and W(i*omega_p)."""
@@ -185,16 +185,26 @@ def compute_w0_wiwp_and_ppm_from_minimax(
 
     V_head = V_qmunu
     if head_correction_fn is not None:
-        V_head, W0_q = head_correction_fn(V_qmunu, W0_q, 0.0 + 0.0j)
-        _, Wiwp_q = head_correction_fn(V_qmunu, Wiwp_q, 1j * float(omega_p_ry))
+        V_head, W0_q, h0 = head_correction_fn(V_qmunu, W0_q, 0.0 + 0.0j)
+        _, Wiwp_q, hi = head_correction_fn(V_qmunu, Wiwp_q, 1j * float(omega_p_ry))
+        vc0 = float(h0["vc0"].real)
+        w0 = float(h0["wcoul0"].real)
+        wi = float(hi["wcoul0"].real)
+        print0(f"  PPM finite-size heads:")
+        print0(f"    v(q→0)          = {vc0:12.3f} a.u.")
+        print0(f"    W(q→0, ω=0)     = {w0:12.3f} a.u.")
+        print0(f"    W(q→0, ω=iωp)   = {wi:12.3f} a.u.  [ωp={omega_p_ry:.4f} Ry]")
+        print0(f"    W^c(q→0, ω=0)   = {w0 - vc0:12.3f} a.u.")
+        print0(f"    W^c(q→0, ω=iωp) = {wi - vc0:12.3f} a.u.")
+
+    nkx, nky, nkz = W0_q.shape[0], W0_q.shape[1], W0_q.shape[2]
+    n_rmu = W0_q.shape[4]
+    V_q = jnp.asarray(V_head)[0, 0, 0].reshape(nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
 
     _summarize_hermitian_qmunu("W(0)", W0_q, print0)
     _summarize_hermitian_qmunu(f"W(iωp={omega_p_ry:.3f} Ry)", Wiwp_q, print0)
 
     # Build W^c = W(with W_head) - V(with V_head).
-    nkx, nky, nkz = W0_q.shape[0], W0_q.shape[1], W0_q.shape[2]
-    n_rmu = W0_q.shape[4]
-    V_q = jnp.asarray(V_head)[0, 0, 0].reshape(nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
     Wc0_q = W0_q - V_q
     Wci_q = Wiwp_q - V_q
 
@@ -311,9 +321,7 @@ def _build_single_sigma_window(
         x_max = max(S_max, x_min * (1.0 + 1.0e-9))
     q = solve_laplace_minimax_interval(x_min, x_max, target_error=target_error, max_nodes=max_nodes)
 
-    # get_sigma_mu_nu_fn already includes a global "-1" factor from convolution.
-    docs_prefactor = -1.0 if kernel_sign == +1 else 1.0
-    prefactor = -docs_prefactor
+    prefactor = 1.0 if kernel_sign == +1 else -1.0
     return [
         _SigmaWindow(
             name="single",
@@ -384,7 +392,8 @@ def _build_three_sigma_windows(
             t_nodes = np.asarray(q_cross.tau / xi, dtype=np.complex128)
             alpha = np.asarray(q_cross.alpha / xi, dtype=np.float64)
             project = "imag"
-            docs_prefactor = 1.0
+            # Explicit sign in front of core contribution.
+            prefactor = -1.0
         else:
             x_min = max(S_min - (T - z_edge), z_edge, 1.0e-12)
             x_max = max(S_max, x_min * (1.0 + 1.0e-9))
@@ -392,7 +401,7 @@ def _build_three_sigma_windows(
             t_nodes = np.asarray(-1j * q.tau, dtype=np.complex128)
             alpha = np.asarray(q.alpha, dtype=np.float64)
             project = "full"
-            docs_prefactor = -1.0
+            prefactor = +1.0
 
         windows.append(
             _SigmaWindow(
@@ -405,8 +414,7 @@ def _build_three_sigma_windows(
                 E_ref_B=E_ref_B,
                 omega_sign=+1,
                 project=project,
-                # get_sigma_mu_nu_fn carries an extra global -1.
-                prefactor=float(-docs_prefactor),
+                prefactor=float(prefactor),
                 x_min=float(x_min) if name != "core" else None,
                 x_max=float(x_max) if name != "core" else None,
                 crossing_A=float(A_core) if name == "core" else None,
@@ -638,7 +646,6 @@ def _convolve_sigma_branch_kij(
         return jnp.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), windows
 
     if debug_quadrature:
-        docs_mod = _load_docs_minimax_module()
         nsamp = max(50, int(debug_quadrature_samples))
         for win in windows:
             mask_A = np.asarray(win.mask_A, dtype=bool)
@@ -682,7 +689,7 @@ def _convolve_sigma_branch_kij(
                 approx = np.zeros_like(u_grid)
                 for tau, alpha in zip(tau_orig, alpha_orig):
                     approx += float(alpha) * np.sin(float(tau) * u_grid)
-                target = docs_mod.G_hgl(u_grid) if win.crossing_kind == "hgl" else docs_mod.G_fermi(u_grid)
+                target = _G_hgl(u_grid) if win.crossing_kind == "hgl" else _G_fermi(u_grid)
                 err = np.max(np.abs(target - approx))
                 print0(
                     f"  [quad] {log_tag}{win.name}: nodes={int(win.alpha.shape[0])}, "
@@ -839,6 +846,7 @@ def compute_sigma_c_ppm_omega_grid(
     get_G_R_fn: Callable[[jax.Array, int, int, int], jax.Array] | None = None,
     get_sigma_mu_nu_fn: Callable[[jax.Array, jax.Array, int, bool], jax.Array] | None = None,
     get_sigma_kij_channels_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array] | None = None,
+    ppm_static_cohsex_check: bool = False,
     print0=print,
 ) -> SigmaOmegaResult:
     """Compute frequency-dependent correlation self-energy Σ^c_kij(ω) with GN-PPM windows.
@@ -891,6 +899,20 @@ def compute_sigma_c_ppm_omega_grid(
     B_corr = jnp.asarray(B_mu_nu, dtype=jnp.complex128)
     Omega_abs = jnp.asarray(Omega_abs, dtype=jnp.float64)
     B_mask = Omega_abs > 1.0e-14
+
+    if ppm_static_cohsex_check:
+        # Force static COH limit: E_A = 0 for all bands, omega = [0].
+        # With B/Omega = -Wc0/2, the result should exactly reproduce static COH:
+        #   Sigma_COH = -0.5 * (1/Nk) Sigma_q I_{k-q} * Wc0_q
+        print0("  *** PPM STATIC COHSEX CHECK: zeroing E_cond, H_val, omega=[0] ***")
+        E_cond = jnp.zeros_like(E_cond)
+        H_val = jnp.zeros_like(H_val)
+        omega_req = np.array([0.0], dtype=np.float64)
+        omega_rel_req = omega_req
+        idx_pos = np.array([0], dtype=np.intp)
+        idx_neg = np.array([], dtype=np.intp)
+        omega_pos = np.array([0.0], dtype=np.float64)
+        omega_neg_abs = np.array([], dtype=np.float64)
     invalid_mode = str(invalid_mode).strip().lower()
     if invalid_mode not in ("fixed_2ry", "static_limit"):
         raise ValueError("invalid_mode must be 'fixed_2ry' or 'static_limit'.")
@@ -1151,17 +1173,14 @@ def compute_sigma_c_ppm_omega_grid(
             # kernel_sign=-1 realizes 1/(w+S), so both routed branches require
             # the same extra global minus.
             if omega_neg_abs.size:
-                neg_scale = -float(sigma_scale)
-                if sigma_flip_neg:
-                    # Optional debug-only sign flip knob.
-                    neg_scale = float(sigma_scale)
                 sigma_neg = _convolve_kij(
                     omega_neg_abs,
                     idx_neg,
                     kernel_cond=-1,
                     kernel_val=+1,
                     tag="ω<E_F",
-                    scale=neg_scale,
+                    # Optional debug-only sign flip knob on the ω<E_F block.
+                    scale=(-float(sigma_scale) if not sigma_flip_neg else float(sigma_scale)),
                     omega_sign_flip_cond=1,
                     omega_sign_flip_val=1,
                 )

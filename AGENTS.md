@@ -61,6 +61,7 @@ uvcache/
 ### Coding standards
 - Match existing formatting; prefer explicit, readable code.
 - Do not reformat unrelated lines; keep indentation style consistent with each file.
+- Use NumPy-style docstrings (for pdoc compatibility). Document shapes, units, and shardings for array parameters.
 
 ### Quick FAQ
 - Q: Which envs should exist in the repo?  

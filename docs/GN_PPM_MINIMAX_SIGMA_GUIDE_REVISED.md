@@ -1,10 +1,4 @@
-Below are **full rewrites** of the two guides so they match **exactly what the current code in `ppm_sigma.py` + `gw_jax.py` does** (as uploaded). I’ve kept sections that were already correct in spirit/notation, but I’ve removed/rewritten anything that no longer matches the implementation (notably: *GN is extracted from* **(W^c)**, and the sigma pipeline **accumulates in band space** before applying (e^{i\omega t})).
-
----
-
-# 1) `GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md` (updated to match code)
-
-## Full-Frequency GW Self-Energy via GN-PPM and Minimax-Windowed CTSP in the ISDF Basis
+# Full-Frequency GW Self-Energy via GN-PPM and Minimax-Windowed CTSP in the ISDF Basis
 
 ### Purpose
 
@@ -180,6 +174,31 @@ Then for each (\omega) it forms a complex scalar coefficient (c(\omega,t)) and m
 * **imag-projection windows** (HGL core): (\Im(c,\Sigma))
 
 This is done without storing (\Sigma(\omega)) in (\mu\nu).
+
+---
+
+### 4.4 `_SigmaWindow` dataclass
+
+Each window is represented as:
+
+```python
+@dataclass(frozen=True)
+class _SigmaWindow:
+    name: str
+    t_nodes: np.ndarray     # complex (Laplace: -iτ, core: real)
+    alpha: np.ndarray       # real weights
+    mask_A: np.ndarray      # boolean mask over axis A entries
+    mask_B: np.ndarray      # boolean mask over axis B entries
+    E_ref_A: float          # min axis-A energy in this window
+    E_ref_B: float          # min axis-B energy in this window
+    omega_sign: int
+    project: str            # "real" or "imag"
+    prefactor: float
+    # plus debug metadata: x_min/x_max or crossing_A, T, z_edge
+```
+
+Laplace (sign-definite) windows have `t_nodes = -iτ` (decaying) and `project="real"`.
+Crossing (HGL core) windows have real `t_nodes = τ/ξ` (oscillatory) and `project="imag"`.
 
 ---
 

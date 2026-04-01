@@ -110,11 +110,32 @@ pip install -e .  # Install isdf package
 **NERSC Perlmutter** (recommended for production):
 See [`cluster_setup/README_CLUSTER.md`](../cluster_setup/README_CLUSTER.md)
 
-**Dockerfile** (in repo root):
+**Dockerfiles** (in repo root):
+
+| File | Purpose | Notes |
+|------|---------|-------|
+| `Dockerfile.gpu` | Single-GPU dev image (NVIDIA JAX base) | Venv at `/opt/venv` to avoid bind-mount shadowing |
+| `Dockerfile.cpu` | CPU-only dev image | `jax[cpu]`, FFTW, project deps via uv |
+| `Dockerfile` | Runtime with MPI + parallel HDF5 | MPICH/HDF5 built from source; `.venv` inside repo |
+| `Dockerfile.multigpu` | Multi-GPU runs | Like `Dockerfile` but targeted at multi-GPU |
+
+All Dockerfiles use `uv sync --frozen` for reproducibility. GPU images use `nvcr.io/nvidia/jax` base.
+
+**docker-compose** (`docker-compose.gpu.yaml`):
 ```bash
-docker build -t isdf_gw .
-docker run --gpus all -v $(pwd):/work isdf_gw gw_jax -i /work/cohsex.in
+docker build -t isdf-gpu -f Dockerfile.gpu .
+docker compose -f docker-compose.gpu.yaml up -d
+docker compose -f docker-compose.gpu.yaml exec isdf bash
+# inside container:
+python -c 'import jax; print(jax.devices())'
 ```
+
+The compose service bind-mounts `.:/workspace/ISDF`, mounts CUDA toolkit read-only,
+requests all GPUs, and runs `sleep infinity` for `exec` access.
+
+**Bind-mount model**: The container provides the toolchain (CUDA, NCCL, MPI, HDF5,
+Python deps). Code is bind-mounted to `/workspace/ISDF` — edits are immediate;
+rebuild only when dependencies or system libs change.
 
 ---
 
@@ -556,7 +577,7 @@ jax.profiler.stop_trace()
 
 **See also**:
 - [`docs/MEMORY_MODEL.md`](MEMORY_MODEL.md) — Memory budgets
-- [`docs/CHUNK_BUDGETS.md`](CHUNK_BUDGETS.md) — Chunking constraints
+- [`docs/MEMORY_MODEL.md`](MEMORY_MODEL.md) — Chunking constraints and bottleneck arrays
 - [`docs/advanced/jax_multihost.md`](advanced/jax_multihost.md) — Multi-GPU debugging
 
 ---

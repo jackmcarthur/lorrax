@@ -643,6 +643,7 @@ def read_cohsex_input(filename: str) -> dict:
 			"sigma_at_dft_extrapolate": getb("sigma_at_dft_extrapolate", fallback=False),
 			"sigma_at_dft_energies": getb("sigma_at_dft_energies", fallback=False),
 			"ppm_sigma_debug_static_norm": getb("ppm_sigma_debug_static_norm", fallback=False),
+			"ppm_static_cohsex_check": getb("ppm_static_cohsex_check", fallback=False),
 			"sigma_debug_quadrature": getb("sigma_debug_quadrature", fallback=False),
 			"sigma_debug_quadrature_samples": geti("sigma_debug_quadrature_samples", fallback=200),
 			"chunk_size": geti("chunk_size", fallback=-1),       # band chunk size (-1=all, 0=auto, 1-2048=explicit)

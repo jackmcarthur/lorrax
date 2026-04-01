@@ -151,13 +151,15 @@ def determine_wcoul0(params, input_dir, wfn, sym, meta, print_fn, omega):
 	"""Resolve (v_c0, w_c0) head averages using user preference fallback order.
 
 	For ``wcoul0_source='s_tensor'``, this evaluates S(omega) from dipole data.
+	This is the default because it provides frequency-dependent heads, which
+	is required for correct GN-PPM extraction at omega=0 and omega=i*omega_p.
 	For ``wcoul0_source='epshead'``, only static epshead is available and is used
-	as a fallback even when omega != 0.
+	as a fallback even when omega != 0 (debug only).
 	"""
-	want_source = str(params.get("wcoul0_source", "epshead")).strip().lower()
+	want_source = str(params.get("wcoul0_source", "s_tensor")).strip().lower()
 	if want_source not in ("epshead", "s_tensor"):
-		print_fn(f"Unknown wcoul0_source={want_source}; defaulting to 'epshead'")
-		want_source = "epshead"
+		print_fn(f"Unknown wcoul0_source={want_source}; defaulting to 's_tensor'")
+		want_source = "s_tensor"
 	omega_val = complex(omega)
 	eta = float(params.get("wcoul0_eta", 0.0) or 0.0)
 
@@ -242,7 +244,11 @@ def apply_head_correction(
 	print_fn,
 	print_summary: bool = True,
 ):
-	"""Apply q=0 head correction to V and W at a given (possibly complex) omega."""
+	"""Apply q=0 head correction to V and W at a given (possibly complex) omega.
+
+	Returns (V_headed, W_headed, head_info) where head_info is a dict with
+	scalar head values {vc0, wcoul0, source} for diagnostics.
+	"""
 	if G0_mu_nu is None:
 		if print_summary:
 			print_fn("")
@@ -251,7 +257,7 @@ def apply_head_correction(
 			print_fn("  Skipping head corrections - results may be inaccurate!")
 			print_fn("  Re-run with restart=false to regenerate G0_mu_nu.")
 			print_fn("-" * 72)
-		return V_qmunu_nohead, W_q
+		return V_qmunu_nohead, W_q, {}
 
 	vc0_mean, wcoul0, wcoul0_source = determine_wcoul0(
 		params,
@@ -279,13 +285,19 @@ def apply_head_correction(
 			print_fn(f"  W(q→0)  = {wcoul0_real:12.3f} a.u.  (screened Coulomb head)")
 			print_fn(f"  ΔW      = {dW_real:12.3f} a.u.  (screening correction)")
 
+	head_info = {
+		"vc0": complex(vc0_mean),
+		"wcoul0": complex(wcoul0),
+		"source": wcoul0_source,
+	}
+
 	outer_u = (jnp.conj(G0_mu_nu)[:, None] * G0_mu_nu[None, :])
 	vol_scale = jnp.asarray(1.0 / float(wfn.cell_volume), dtype=jnp.float64)
 	V_head = V_qmunu_nohead.at[0, 0, 0, 0, 0, 0, :, :].add((vc0_mean * vol_scale) * outer_u)
 	if W_q is None:
-		return V_head, None
+		return V_head, None, head_info
 	W_head = W_q.at[0, 0, 0, 0, :, 0, :].add((wcoul0 * vol_scale) * outer_u)
-	return V_head, W_head
+	return V_head, W_head, head_info
 
 
 def write_w_copies_debug_h5(
@@ -1117,7 +1129,7 @@ def main(argv=None):
 		head_omega = 0.0
 		if do_screened:
 			head_omega = params.get("debug_omega") or 0.0
-		V_qmunu, W_q = apply_head_correction(
+		V_qmunu, W_q, _ = apply_head_correction(
 			V_qmunu,
 			W_q if do_screened else None,
 			G0_mu_nu=G0_mu_nu,
@@ -1234,6 +1246,7 @@ def main(argv=None):
 		sigma_at_dft_extrapolate = bool(params.get("sigma_at_dft_extrapolate", False))
 		sigma_at_dft_energies = bool(params.get("sigma_at_dft_energies", False))
 		ppm_sigma_debug_static_norm = bool(params.get("ppm_sigma_debug_static_norm", False))
+		ppm_static_cohsex_check = bool(params.get("ppm_static_cohsex_check", False))
 		sigma_debug_quadrature = bool(params.get("sigma_debug_quadrature", False))
 		sigma_debug_quadrature_samples = int(params.get("sigma_debug_quadrature_samples", 200))
 		sigma_munu_h5_path = str(params.get("sigma_munu_h5_file", "") or "").strip()
@@ -1277,6 +1290,26 @@ def main(argv=None):
 			print0("  NOTE: using midgap reference for Σ^c windowing")
 		if ppm_sigma_flip_neg:
 			print0("  NOTE: debug: flipping sign of ω<E_F Σ^c branch")
+		if do_G0:
+			try:
+				vc0_0, wc0_0, src0 = determine_wcoul0(
+					params, input_dir, wfn, sym, meta, print0, omega=0.0 + 0.0j
+				)
+				vc0_i, wc0_i, srci = determine_wcoul0(
+					params, input_dir, wfn, sym, meta, print0, omega=1j * float(omega_p_ry)
+				)
+				epsh0 = complex(wc0_0) / complex(vc0_0) if abs(complex(vc0_0)) > 1.0e-16 else complex(np.nan, np.nan)
+				epshi = complex(wc0_i) / complex(vc0_i) if abs(complex(vc0_i)) > 1.0e-16 else complex(np.nan, np.nan)
+				print0(
+					f"  epsinv head (ω=0):      {epsh0.real: .6f}{epsh0.imag:+.6e}i"
+					f"  [source={src0}]"
+				)
+				print0(
+					f"  epsinv head (ω=iωp):    {epshi.real: .6f}{epshi.imag:+.6e}i"
+					f"  [ωp={omega_p_ry:.6f} Ry, source={srci}]"
+				)
+			except Exception as exc:
+				print0(f"  epsinv head diagnostics unavailable: {exc}")
 		with timing.section("gw_jax.ppm_sigma"):
 			head_correction = lambda V_q, W_q, omega: apply_head_correction(
 				V_q,
@@ -1349,10 +1382,11 @@ def main(argv=None):
 				get_G_R_fn=get_G_R_jax,
 				get_sigma_mu_nu_fn=get_sigma_static_mu_nu_jax,
 				get_sigma_kij_channels_fn=get_sigma_static_kij_channels_jax,
+				ppm_static_cohsex_check=ppm_static_cohsex_check,
 				print0=print0,
 			)
 			sigma_coh_ppm_omega_kij = sigma_omega.sigma_c_kij
-			iw0 = int(np.argmin(np.abs(omega_grid_ry)))
+			iw0 = 0 if ppm_static_cohsex_check else int(np.argmin(np.abs(omega_grid_ry)))
 			if sigma_coh_ppm_omega_kij is None:
 				if not sigma_omega.sigma_kij_h5_path:
 					raise RuntimeError("PPM Sigma stream requested but no sigma_kij_h5_path provided.")
@@ -1362,6 +1396,40 @@ def main(argv=None):
 			else:
 				sigma_coh_ppm_kij = sigma_coh_ppm_omega_kij[iw0]
 				sigma_coh_ppm_kij.block_until_ready()
+
+			if ppm_static_cohsex_check:
+				# With E=0 and omega=0, the PPM pipeline should give Sigma_cor = SX-X + COH,
+				# NOT just COH. Sigma^c = Sigma_xc - Sigma_X = (SX + COH) - X = (SX-X) + COH.
+				ryd2ev_local = 13.605693122994
+				ppm_diag = np.real(np.diagonal(np.asarray(sigma_coh_ppm_kij), axis1=1, axis2=2)) * ryd2ev_local
+				sx_diag = np.real(np.diagonal(np.asarray(sigma_sx_kbar_ij_jax), axis1=1, axis2=2)) * ryd2ev_local
+				coh_diag = np.real(np.diagonal(np.asarray(sigma_coh_kbar_ij_jax), axis1=1, axis2=2)) * ryd2ev_local
+				# Sigma_X is not computed yet, but we can get it from
+				# the pipeline V tensor: Sigma_X = get_sigma_static(G_occ, V).
+				# For now use a simpler approach: ref = SX + COH - X is Sigma_cor,
+				# but we don't have X yet. Instead use SX-X from (SX - X_from_V):
+				# Actually we already have V_mu_nu_exchange available.
+				with mesh_xy:
+					G_k_chk = get_G_mu_nu_jax(sigma_views.psi_lT, sigma_views.psi_l, Gij_static)
+					G_R_chk = get_G_R_jax(G_k_chk, meta.nkx, meta.nky, meta.nkz)
+					sigma_x_chk = get_sigma_static_mu_nu_jax(G_R_chk, V_mu_nu_exchange, meta.nk_tot, bispinor=bispinor)
+					sigma_x_chk_kij = get_sigma_static_kij_jax(sigma_views.psi_proj, sigma_views.psi_projT, sigma_x_chk)
+				x_diag = np.real(np.diagonal(np.asarray(sigma_x_chk_kij), axis1=1, axis2=2)) * ryd2ev_local
+				# ref = Sigma_cor = (SX - X) + COH
+				ref_cor_diag = (sx_diag - x_diag) + coh_diag
+				diff_diag = ppm_diag - ref_cor_diag
+				print0("  *** PPM STATIC COHSEX CHECK RESULTS (diagonal, eV) ***")
+				print0(f"  max|PPM - Cor|    = {np.max(np.abs(diff_diag)):.6e} eV")
+				print0(f"  mean|PPM - Cor|   = {np.mean(np.abs(diff_diag)):.6e} eV")
+				nb_show = min(6, ppm_diag.shape[1])
+				for ik in range(min(4, ppm_diag.shape[0])):
+					n_occ_show = int(max(0, min(int(wfn.nelec) - int(params.get("band_index_min", 0)), ppm_diag.shape[1])))
+					i_start = max(0, n_occ_show - nb_show // 2)
+					i_end = min(ppm_diag.shape[1], i_start + nb_show)
+					for ib in range(i_start, i_end):
+						p = ppm_diag[ik, ib]
+						r = ref_cor_diag[ik, ib]
+						print0(f"    k={ik} n={ib}: PPM={p:10.4f}  Cor={r:10.4f}  diff={p-r:10.4f}")
 
 			# Full-frequency GW uses bare exchange (v), not static screened exchange W(0).
 			with mesh_xy:

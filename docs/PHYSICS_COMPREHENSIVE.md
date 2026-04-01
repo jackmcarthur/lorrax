@@ -381,7 +381,7 @@ $$B_q \leq \frac{M_{\text{budget}} - M_{\text{base}} - 2 \times M_{Z_{\text{col}
 
 **Automatic sizing**: Function `compute_optimal_chunks()` in `gw_init.py` solves this constraint system analytically, iteratively reducing chunk sizes until all stages fit.
 
-**See**: `docs/MEMORY_MODEL.md` and `docs/CHUNK_BUDGETS.md` for detailed formulas.
+**See**: `docs/MEMORY_MODEL.md` for detailed formulas and bottleneck arrays.
 
 ### 5.4 Key Sharding Techniques
 
@@ -478,7 +478,7 @@ $$\chi^0_{\ell m} = -\frac{2\gamma}{\sqrt{N_k} \, n_{\text{spin}} n_{\text{spino
 
 **Implementation**: Universal chi kernel with energy masking in `_get_chi_kernel()` (`w_isdf.py:60`). Single JIT compilation, window pairs selected via boolean masks.
 
-**Reference**: Kim, Martyna & Ismail-Beigi, PRB 101, 035139 (2020). Full derivation in `docs/chi_omega_quadrature.md`.
+**Reference**: Kim, Martyna & Ismail-Beigi, PRB 101, 035139 (2020). Full derivation in `docs/MINIMAX_QUADRATURE.md`.
 
 ### 6.4 Screened Interaction (Dyson Equation)
 
@@ -665,9 +665,8 @@ $$H_{QP} = (H_{DFT} - V_{xc}) + V_H + \Sigma_{xc}(\omega).$$
 | Doc | Focus |
 |-----|-------|
 | **This file** | Theory + implementation |
-| `MEMORY_MODEL.md` | Detailed memory formulas |
-| `CHUNK_BUDGETS.md` | Quick reference constraints |
-| `chi_omega_quadrature.md` | CTSP theory, quadrature derivations |
+| `MEMORY_MODEL.md` | Detailed memory formulas and bottleneck arrays |
+| `MINIMAX_QUADRATURE.md` | CTSP theory, quadrature derivations, solver methods |
 
 ---
 

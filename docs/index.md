@@ -39,7 +39,7 @@ Then browse the `.md` files in `docs/api/` in your editor or on GitHub.
 
 ### Frequency-Integration Docs
 
-- `docs/chi_omega_quadrature.md`: derivations and implementation notes for GL/HGL dynamic chi
+- `docs/MINIMAX_QUADRATURE.md`: GL/HGL theory, minimax solver methods, and CTSP derivations
 - `docs/FREQ_INTEGRATION_REWRITE_PLAN.md`: rewrite blueprint for a unified chi/sigma frequency-integration engine
 
 ### Getting started
