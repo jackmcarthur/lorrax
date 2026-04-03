@@ -124,8 +124,9 @@ def get_cpu_memory_total() -> float | None:
 def get_device_memory_gb(n_devices: int | None = None) -> float:
     """Get per-device memory budget in GB for JAX computations.
 
-    GPU policy: budget = 0.9 * bytes_available, where
-    bytes_available = bytes_limit - bytes_in_use from jax.memory_stats().
+    GPU policy: budget = 0.9 * bytes_limit from jax.memory_stats().
+    Uses bytes_limit (pool size, constant across ranks) rather than
+    bytes_available (which can vary by rank due to JIT timing).
     """
     # Lazy import to avoid circular dependencies
     try:
@@ -137,13 +138,18 @@ def get_device_memory_gb(n_devices: int | None = None) -> float:
         backend = 'cpu'
         if n_devices is None:
             n_devices = 1
-    
+
     if backend in ('gpu', 'cuda'):
-        _, _, bytes_available = _get_jax_gpu_memory_bytes()
-        if bytes_available is not None:
-            return max(0.1, 0.90 * bytes_available / 1e9)
+        bytes_limit, _, _ = _get_jax_gpu_memory_bytes()
+        if bytes_limit is not None and bytes_limit > 0:
+            return max(0.1, 0.90 * bytes_limit / 1e9)
 
         # Fallback to currently free memory if JAX stats are unavailable.
+        # WARNING: With PREALLOCATE=true, nvidia-smi free memory is AFTER the
+        # BFC pool allocation, so it's much smaller than the actual pool.
+        import sys
+        print(f"  [gpu_utils] WARNING: bytes_limit={bytes_limit}, falling back to nvidia-smi "
+              f"(pid={os.getpid()})", file=sys.stderr, flush=True)
         mem_free_gb = get_gpu_memory_nvidia_smi()
         if mem_free_gb is not None:
             return max(0.1, mem_free_gb * 0.90)

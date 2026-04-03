@@ -8,9 +8,13 @@ import os
 
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
-os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
+# NOTE: XLA_PYTHON_CLIENT_PREALLOCATE and XLA_PYTHON_CLIENT_MEM_FRACTION
+# should be set via environment (e.g. Shifter --env flags).
+# With PREALLOCATE=true, XLA uses a BFC pool which eliminates CUDA fragmentation
+# and gives XLA accurate memory budgets for JIT compilation.
+# Do NOT set XLA_PYTHON_CLIENT_ALLOCATOR=platform here; it overrides the BFC
+# pool and causes XLA to use raw cudaMalloc, leading to fragmentation and
+# incorrect rematerialization budgets.
 import argparse
 import time
 
@@ -483,6 +487,7 @@ def fit_zeta_and_compute_V_q_chunked(
 	band_chunk_size = chunks['band_chunk']
 	chunk_r = chunks['chunk_r']
 	q_chunk_size = chunks['q_chunk']
+	k_chunk_size = chunks.get('k_chunk', 0)
 	use_gspace_cache = chunks.get('use_gspace_cache', True)
 	mem_est = chunks.get('memory_estimate', {})
 
@@ -494,7 +499,7 @@ def fit_zeta_and_compute_V_q_chunked(
 		limit_info = mem_est.get('limit_info', {})
 		if limit_info:
 			print("    Chunk limit estimates (r-points):")
-			for key in ("limit_pair", "limit_fft_global", "limit_fft_soft", "limit_solve", "limit_default"):
+			for key in ("limit_pair", "limit_zct", "limit_zct_soft", "limit_reshard", "limit_solve", "limit_gather", "limit_default"):
 				if key in limit_info:
 					print(f"      {key}: {limit_info[key]:.1f}")
 	
@@ -505,6 +510,8 @@ def fit_zeta_and_compute_V_q_chunked(
 	print(f"    Band chunks: {band_chunk_size}")
 	print(f"    R chunks:    {chunk_r} (contiguous r-space)")
 	print(f"    Q chunks:    {q_chunk_size}")
+	if k_chunk_size > 0 and k_chunk_size < meta.nk_tot:
+		print(f"    K chunks:    {k_chunk_size} (k-batched FFT)")
 	print(f"    Pair mode:   {isdf_pair_mode}")
 	print(f"    G-space cache: {'enabled' if use_gspace_cache else 'disabled'}")
 	print(f"    Zeta output: {zeta_h5_path}")
@@ -521,11 +528,13 @@ def fit_zeta_and_compute_V_q_chunked(
 			output_file=zeta_h5_path,
 			band_chunk_size=band_chunk_size,
 			q_chunk_size=q_chunk_size,
+			q_gather_size=chunks.get('q_gather', 0),
 			bispinor=bispinor,
 			use_gspace_cache=use_gspace_cache,
 			band_range_left=band_range_left,
 			band_range_right=band_range_right,
 			isdf_pair_mode=isdf_pair_mode,
+			k_chunk_size=k_chunk_size,
 		)
 	
 	# Step 2: Compute V_qmunu from zeta
@@ -568,7 +577,7 @@ def fit_zeta_and_compute_V_q_chunked(
 	if q_batch_vcoul > 1:
 		print(f"    V_q q batches: {q_batch_vcoul}")
 	
-	with timing.section("gw_jax.V_q_compute"):
+	with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
 		with h5py.File(zeta_h5_path, 'r') as zeta_h5:
 			with mesh_xy:
 				V_qmunu_raw, g0_mu_all = compute_all_V_q_from_zeta_h5(
@@ -1013,6 +1022,18 @@ def main(argv=None):
 	_print0("=" * 72)
 	_print0(f"  Backend: {current_backend.upper():<8}  Devices: {n_devices}  Mesh: {grid_x}×{grid_y}  Processes: {n_procs}")
 	_print0(f"  Device type: {device_names}")
+	# XLA allocator diagnostics
+	_preallocate = os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE", "unset")
+	_mem_frac = os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION", "unset")
+	_print0(f"  XLA preallocate: {_preallocate}  mem_fraction: {_mem_frac}")
+	try:
+		_stats = jax.devices()[0].memory_stats()
+		if _stats:
+			_bl = _stats.get('bytes_limit', 0) / 1e9
+			_bu = _stats.get('bytes_in_use', 0) / 1e9
+			_print0(f"  XLA pool: limit={_bl:.2f} GB, in_use={_bu:.2f} GB, avail={_bl-_bu:.2f} GB")
+	except Exception:
+		pass
 	_print0("=" * 72)
 	_print0("")
 	

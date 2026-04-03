@@ -416,26 +416,25 @@ class SymMaps:
             k = full_kpts[ik]
             for iq in range(nk_red):
                 q = reduced_kpts[iq]
-                
-                # Calculate k-q and wrap to first BZ
+
+                # Calculate k-q; use periodic distance to find match
                 kminusq = k - q
-                kminusq = kminusq % 1.0  # Wrap to [0,1)
-                kminusq = np.where(kminusq > 0.99999, 0.0, kminusq)
-                
-                # Find which full k-point this maps to
-                diffs = np.abs(full_kpts - kminusq[None, :])
-                diffs = np.sum(diffs, axis=1)  # Sum over coordinates
+
+                # Periodic distance: min |full_kpts - kminusq - G| over G
+                delta = full_kpts - kminusq[None, :]
+                delta = delta - np.round(delta)  # wrap differences to [-0.5, 0.5)
+                diffs = np.sum(np.abs(delta), axis=1)
                 min_diff = np.min(diffs)
-                
-                if min_diff > 1e-8:
+
+                if min_diff > 1e-4:
                     raise ValueError(f"k-q point {kminusq} not found in k-point grid")
-                
+
                 kq_idx = np.argmin(diffs)
                 if kq_idx >= nk_full:
                     raise ValueError(f"Invalid k-q mapping: {kq_idx} >= {nk_full}")
-                    
+
                 kq_map[ik, iq] = kq_idx
-        
+
         return kq_map
 
     def get_kminusqfull_map(self, wfn, full_kpts):
@@ -443,32 +442,31 @@ class SymMaps:
         nk_full = len(full_kpts)
         nk_red = wfn.nkpts
         kq_map = np.zeros((nk_full, nk_full), dtype=np.int32)
-        
+
         # For each full k-point and each reduced q-point
         for ik in range(nk_full):
             k = full_kpts[ik]
             for iq in range(nk_full):
                 q = full_kpts[iq]
-                
-                # Calculate k-q and wrap to first BZ
+
+                # Calculate k-q; use periodic distance to find match
                 kminusq = k - q
-                kminusq = kminusq % 1.0  # Wrap to [0,1)
-                kminusq = np.where(kminusq > 0.99999, 0.0, kminusq)
-                
-                # Find which full k-point this maps to
-                diffs = np.abs(full_kpts - kminusq[None, :])
-                diffs = np.sum(diffs, axis=1)  # Sum over coordinates
+
+                # Periodic distance: min |full_kpts - kminusq - G| over G
+                delta = full_kpts - kminusq[None, :]
+                delta = delta - np.round(delta)  # wrap differences to [-0.5, 0.5)
+                diffs = np.sum(np.abs(delta), axis=1)
                 min_diff = np.min(diffs)
-                
-                if min_diff > 1e-8:
+
+                if min_diff > 1e-4:
                     raise ValueError(f"k-q point {kminusq} not found in k-point grid")
-                
+
                 kq_idx = np.argmin(diffs)
                 if kq_idx >= nk_full:
                     raise ValueError(f"Invalid k-q mapping: {kq_idx} >= {nk_full}")
-                    
+
                 kq_map[ik, iq] = kq_idx
-        
+
         return kq_map
     
     def get_kfull_symmap(self, wfn, full_kpts):

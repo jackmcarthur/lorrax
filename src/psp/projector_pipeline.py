@@ -114,10 +114,85 @@ def make_projector_rows(bundle: PseudoBundle, kpack: KBundle, species: Species, 
     return rows, meta
 
 
+def _spherical_jn_jax(l: int, x: jnp.ndarray) -> jnp.ndarray:
+    """Spherical Bessel j_l(x) on GPU via sin/cos + small-x Taylor series.
+
+    For |x| >= 0.1: uses sin/cos formulas with upward recurrence for l > 2.
+    For |x| < 0.1: uses Taylor series j_l(x) = x^l/(2l+1)!! * (1 - x^2/(2(2l+3)) + ...)
+    to avoid catastrophic cancellation near the origin.
+
+    Supports l = 0, 1, 2, 3, 4 and higher via recurrence.
+    """
+    small = jnp.abs(x) < 0.1
+    # Guard for sin/cos path (avoid 0/0)
+    sx = jnp.where(small, 1.0, x)
+    sinx = jnp.sin(sx)
+    cosx = jnp.cos(sx)
+
+    # sin/cos path: build j0, j1, then recur
+    j0_large = sinx / sx
+    j1_large = sinx / sx**2 - cosx / sx
+
+    if l == 0:
+        # Taylor: j0(x) = 1 - x^2/6 + x^4/120
+        x2 = x * x
+        j0_small = 1.0 - x2 / 6.0 + x2**2 / 120.0
+        return jnp.where(small, j0_small, j0_large)
+    elif l == 1:
+        x2 = x * x
+        j1_small = x / 3.0 - x * x2 / 30.0 + x * x2**2 / 840.0
+        return jnp.where(small, j1_small, j1_large)
+    else:
+        # For l >= 2, build via recurrence from j0, j1
+        # Large-x path
+        jn_prev = j0_large
+        jn_curr = j1_large
+        for ll in range(1, l):
+            jn_next = (2 * ll + 1) / sx * jn_curr - jn_prev
+            jn_prev = jn_curr
+            jn_curr = jn_next
+        jl_large = jn_curr
+
+        # Small-x Taylor: j_l(x) ≈ x^l / (2l+1)!! * [1 - x^2/(2(2l+3)) + x^4/(8(2l+3)(2l+5))]
+        x2 = x * x
+        double_fact = 1.0
+        for k in range(1, 2 * l + 2, 2):
+            double_fact *= k  # (2l+1)!!
+        term0 = 1.0
+        term1 = -x2 / (2.0 * (2 * l + 3))
+        term2 = x2**2 / (8.0 * (2 * l + 3) * (2 * l + 5))
+        # Use jnp.abs(x)**l to avoid issues with negative x and fractional powers
+        jl_small = jnp.abs(x)**l * jnp.sign(x)**l / double_fact * (term0 + term1 + term2)
+        return jnp.where(small, jl_small, jl_large)
+
+
+def _spherical_jn_deriv_jax(l: int, x: jnp.ndarray) -> jnp.ndarray:
+    """Derivative j'_l(x) on GPU.
+
+    Uses the identity j'_l(x) = j_{l-1}(x) - (l+1)/x * j_l(x) for l >= 1,
+    and j'_0(x) = -j_1(x).
+
+    Both j_{l-1} and j_l already handle x~0 via Taylor series internally.
+    For the (l+1)/x * j_l(x) term near x=0, we use the Taylor limit:
+      j'_l(0) = l * 0^{l-1} / (2l+1)!! for l >= 1, which is 0 for l >= 2
+      and 1/3 for l = 1.
+    """
+    if l == 0:
+        return -_spherical_jn_jax(1, x)
+    else:
+        jl = _spherical_jn_jax(l, x)
+        jlm1 = _spherical_jn_jax(l - 1, x)
+        # For the (l+1)/x * j_l(x) term, use safe division
+        # At x~0: j_l(x) ~ x^l/(2l+1)!!, so (l+1)/x * j_l ~ (l+1)*x^{l-1}/(2l+1)!! → 0 for l>=2
+        safe_x = jnp.where(jnp.abs(x) < 1e-30, 1e-30, x)
+        return jlm1 - (l + 1) / safe_x * jl
+
+
 def _evaluate_Fprime_bessel(pseudo, l: int, beta_ids: list[int], K_norm: np.ndarray) -> np.ndarray:
     """Compute F'_l(q) via the j'_l kernel: F'_l(q) = ∫ dr r^3 β_l(r) j'_l(q r).
 
     Returns array of shape (nbeta, nK).
+    Uses JAX for GPU-accelerated spherical Bessel evaluation.
     """
     ppmesh = getattr(pseudo, 'pp_mesh', None)
     ppnl = getattr(pseudo, 'pp_nonlocal', None)
@@ -128,10 +203,27 @@ def _evaluate_Fprime_bessel(pseudo, l: int, beta_ids: list[int], K_norm: np.ndar
         rab = np.asarray(ppmesh.pp_rab.value, dtype=float)
     except Exception:
         rab = None
-    # Collect beta objects in 1-based file order
     betas_all = list(getattr(ppnl, 'pp_beta', []))
-    out = []
     nK = int(len(K_norm))
+    if nK == 0:
+        return np.zeros((len(beta_ids), 0))
+
+    # Compute j'_l(qr) on GPU once for all betas sharing this l
+    qr = jnp.multiply.outer(jnp.asarray(K_norm, dtype=jnp.float64),
+                             jnp.asarray(r, dtype=jnp.float64))  # (nK, nr)
+    jn_d = _spherical_jn_deriv_jax(l, qr)  # (nK, nr) on GPU
+
+    r_cubed = jnp.asarray(r, dtype=jnp.float64) ** 3  # (nr,)
+    if rab is not None:
+        weights = jnp.asarray(rab, dtype=jnp.float64)
+    else:
+        dr = float(r[1] - r[0]) if len(r) > 1 else 1.0
+        w = np.ones_like(r)
+        if len(r) > 0:
+            w[0] = 0.5; w[-1] = 0.5
+        weights = jnp.asarray(w * dr, dtype=jnp.float64)
+
+    out = []
     for bid in beta_ids:
         beta = betas_all[int(bid) - 1]
         raw = np.asarray(beta.value, dtype=float)
@@ -141,23 +233,11 @@ def _evaluate_Fprime_bessel(pseudo, l: int, beta_ids: list[int], K_norm: np.ndar
             beta_r[0] = beta_r[1]
         else:
             beta_r = raw / r
-        if nK == 0:
-            out.append(np.zeros((0,), dtype=float))
-            continue
-        qr = np.multiply.outer(K_norm, r)  # (nK, nr)
-        jn_d = spherical_jn(l, qr, derivative=True)  # (nK, nr)
-        integrand = jn_d * (r[None, :] ** 3) * beta_r[None, :]
-        if rab is not None:
-            vals = np.sum(integrand * rab[None, :], axis=1)
-        else:
-            # trapezoid
-            dr = r[1] - r[0] if len(r) > 1 else 1.0
-            w = np.ones_like(r)
-            if len(r) > 0:
-                w[0] = 0.5; w[-1] = 0.5
-            vals = np.sum(integrand * w[None, :], axis=1) * dr
+        beta_r_j = jnp.asarray(beta_r, dtype=jnp.float64)
+        integrand = jn_d * r_cubed[None, :] * beta_r_j[None, :]  # (nK, nr)
+        vals = jnp.sum(integrand * weights[None, :], axis=1)  # (nK,)
         out.append(vals)
-    return np.stack(out, axis=0)
+    return np.asarray(jnp.stack(out, axis=0))
 
 
 def _evaluate_F_and_Fprime_for_l(

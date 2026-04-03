@@ -653,6 +653,7 @@ def main():
     parser.add_argument("--no-plot", action="store_true", help="Skip plotting")
     parser.add_argument("--plot-zoom", type=float, default=1.0,
                         help="Zoom factor for density in plot (default: 1.0, higher = finer)")
+    parser.add_argument("--no-downsample", action="store_true", help="Use full FFT grid (no zoom)")
     args = parser.parse_args()
     
     N_k = args.N_k
@@ -674,7 +675,7 @@ def main():
     zoom_factors = current_spacing / target_spacing
     
     # Don't upsample tiny grids, and cap zoom to avoid excessive memory
-    if any(wfn.fft_grid < 20):
+    if args.no_downsample or any(wfn.fft_grid < 20):
         zoom_factors = np.ones(3)
     zoom_factors = np.clip(zoom_factors, 0.1, 2.0)  # Reasonable bounds
 
