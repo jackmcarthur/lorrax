@@ -381,7 +381,7 @@ $$B_q \leq \frac{M_{\text{budget}} - M_{\text{base}} - 2 \times M_{Z_{\text{col}
 
 **Automatic sizing**: Function `compute_optimal_chunks()` in `gw_init.py` solves this constraint system analytically, iteratively reducing chunk sizes until all stages fit.
 
-**See**: `docs/MEMORY_MODEL.md` and `docs/CHUNK_BUDGETS.md` for detailed formulas.
+**See**: `docs/MEMORY_MODEL.md` for detailed formulas and bottleneck arrays.
 
 ### 5.4 Key Sharding Techniques
 
@@ -478,7 +478,7 @@ $$\chi^0_{\ell m} = -\frac{2\gamma}{\sqrt{N_k} \, n_{\text{spin}} n_{\text{spino
 
 **Implementation**: Universal chi kernel with energy masking in `_get_chi_kernel()` (`w_isdf.py:60`). Single JIT compilation, window pairs selected via boolean masks.
 
-**Reference**: Kim, Martyna & Ismail-Beigi, PRB 101, 035139 (2020). Full derivation in `docs/chi_omega_quadrature.md`.
+**Reference**: Kim, Martyna & Ismail-Beigi, PRB 101, 035139 (2020). Full derivation in `docs/MINIMAX_QUADRATURE.md`.
 
 ### 6.4 Screened Interaction (Dyson Equation)
 
@@ -568,6 +568,26 @@ temp = einsum('kiaμ, kaμbν -> kibν', ψ.conj(), Σ)  # (k, i, b, ν)
 
 **Implementation**: `get_sigma_x_kij_jax()` in `gw_jax.py:804`.
 
+**Important frequency-dependent caveat**: for the windowed GN-PPM $\Sigma^c(\omega)$ pipeline, the per-window `Re`/`Im` projection must be taken before band projection. In general,
+
+$$K[\operatorname{Re} X] \neq \operatorname{Re} K[X], \qquad K[\operatorname{Im} X] \neq \operatorname{Im} K[X],$$
+
+for the band-projection map $K[X]_{ij,\mathbf{k}} = \sum_{ab\mu\nu}\psi^*_{i,a}(\mu) X_{\mathbf{k},ab}(\mu,\nu)\psi_{j,b}(\nu)$.
+
+The correct reduced-storage implementation is to contract two band-space channels for each $\tau$ node,
+
+$$S_u^{(R)} = K[\operatorname{Re} X_u], \qquad S_u^{(I)} = K[\operatorname{Im} X_u],$$
+
+and then assemble each frequency point from scalar coefficients. If
+
+$$c_u(\omega)=p_u(\omega)+i q_u(\omega),$$
+
+then
+
+$$K[\operatorname{Re}(c_u X_u)] = p_u S_u^{(R)} - q_u S_u^{(I)}, \qquad K[\operatorname{Im}(c_u X_u)] = p_u S_u^{(I)} + q_u S_u^{(R)}.$$
+
+This preserves the exact window algebra while storing only band-space objects. Taking `Re` or `Im` of an already projected complex $\Sigma_{ij,\mathbf{k}}(\tau)$ is not equivalent in general and can make the answer depend on how contributions are partitioned between windows.
+
 ### 6.8 Self-Consistency Loop
 
 The quasiparticle (QP) Hamiltonian is:
@@ -575,6 +595,13 @@ The quasiparticle (QP) Hamiltonian is:
 $$H_{\text{QP}} = H_{\text{KS}} - V_{xc} + \Sigma(\omega \approx E_n)$$
 
 where $H_{\text{KS}} = K + I + V_H + V_{xc}$ is the Kohn-Sham DFT Hamiltonian.
+
+**Implementation detail**: the on-disk `kin_ion` matrix elements are
+`H_DFT - V_xc` (kinetic + ionic; Hartree only if explicitly added when the
+`kin_ion` file is generated). Therefore the code should **not** subtract
+$V_{xc}$ a second time; it forms
+
+$$H_{QP} = (H_{DFT} - V_{xc}) + V_H + \Sigma_{xc}(\omega).$$
 
 **Self-consistent GW** iteratively updates $\Sigma$ until wavefunctions and energies converge:
 
@@ -638,9 +665,8 @@ where $H_{\text{KS}} = K + I + V_H + V_{xc}$ is the Kohn-Sham DFT Hamiltonian.
 | Doc | Focus |
 |-----|-------|
 | **This file** | Theory + implementation |
-| `MEMORY_MODEL.md` | Detailed memory formulas |
-| `CHUNK_BUDGETS.md` | Quick reference constraints |
-| `chi_omega_quadrature.md` | CTSP theory, quadrature derivations |
+| `MEMORY_MODEL.md` | Detailed memory formulas and bottleneck arrays |
+| `MINIMAX_QUADRATURE.md` | CTSP theory, quadrature derivations, solver methods |
 
 ---
 

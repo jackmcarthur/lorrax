@@ -70,6 +70,9 @@ B_b <= ((M_budget - M_full) - phase) * P / (2 * 16 * n_k * n_s * n_r)
 `B_b` is clamped between 1 and `n_b`.  If the numerator becomes negative the
 system physically cannot fit; the solver raises a descriptive error.
 
+Bottleneck arrays: `psi_G` and `psi_r` at `(n_k, B_b/P, n_s, n_r)`, plus
+`phase_spatial` at `(n_k, n_r)` broadcast.
+
 ## R-Chunk (`B_r = x_chunk_r`)
 
 `B_r` is the number of contiguous r-points processed per chunk
@@ -81,17 +84,26 @@ system physically cannot fit; the solver raises a descriptive error.
 base + 16 * (B_r / p_y) * [n_k n_b n_s + 2 n_k (n_rmu / p_x)] <= M_budget
 ```
 
+Bottleneck arrays: `psi_xchunk_Y (n_k, n_b, n_s, B_r/p_y)`,
+`P_l`/`P_r (n_k, n_rmu/p_x, B_r/p_y)`.
+
 2. **ZCT pipeline**
 
 ```
 base + 16 * B_r * [ (4 n_k + n_q) * n_rmu ] <= M_budget
 ```
 
+Bottleneck arrays: `P_l`/`P_r (n_k, n_rmu/p_x, B_r/p_y)`,
+`Z_q (n_q, n_rmu/p_x, B_r/p_y)`.
+
 3. **Solve (with q_chunk = 1)**
 
 ```
 base + 4 * 16 * n_q * n_rmu * (B_r / P) + M_L_q + 16*n_rmu^2 <= M_budget
 ```
+
+Bottleneck arrays: `Z_col`/`zeta (n_q, n_rmu, B_r/P)`,
+`L_rep (n_rmu, n_rmu)` per q during the solve.
 
 `base = M_cent + M_L_q + cache`.  The analytic upper bounds from these
 inequalities provide an initial guess which is then rounded to an integer
@@ -116,6 +128,9 @@ B_q <= 1 + (M_budget - (base + 4*M_Z_col + M_L_q + M_Lrep)) / M_Lrep
 
 where `M_Lrep = 16*n_rmu^2`. `B_q` is clamped to `[1, n_q]`.
 
+Bottleneck arrays: replicated Cholesky panels (`B_q` copies of `(n_rmu, n_rmu)`)
+plus `Z_col`/`zeta` from the x-chunk stage.
+
 ## μ-Chunk for `V_q`
 
 When building `V_q` from the stored zeta HDF5 the code holds
@@ -134,6 +149,10 @@ The “available bytes” are `effective_budget - M_cent`, because the centroids
 remain resident for the rest of the COHSEX calculation.  The CLI now reports
 this chunk alongside the others so users can correlate V_q throughput with
 memory settings.
+
+Bottleneck arrays: `ζ_μ(r)` at `(μ_chunk, n_r)`, `ζ̃_μ(G)` at `(μ_chunk, n_r)`
+after weighting, `ζ̃_ν(G)` for off-diagonal contraction, and temporary
+`V_block (μ_chunk, μ_chunk)` on host.
 
 ## Automatic Sizing Algorithm
 

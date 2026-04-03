@@ -55,6 +55,116 @@ def fft_integer_axes(fft_nx: int, fft_ny: int, fft_nz: int) -> tuple[jax.Array, 
 # Coulomb potential computation (2D truncated)
 # ============================================================================
 
+def compute_sqrt_vcoul_0d(
+    fft_nx: int,
+    fft_ny: int,
+    fft_nz: int,
+    bdot: np.ndarray,
+    cell_volume: float,
+) -> jax.Array:
+    """
+    Compute √v(G) for cell-box-truncated Coulomb (0D/molecule) on the FFT grid.
+
+    Unlike 2D slab truncation (analytic formula), box truncation requires a
+    numerical approach: build 1/r on a denser real-space grid truncated to the
+    Wigner-Seitz cell, FFT to G-space, then sample at the WFN G-vectors.
+    See compute_vcoul_0d.py for the standalone version and detailed derivation.
+
+    Only q=0 is supported (box truncation is undefined for q≠0).
+    The G=0 component is finite (integral of 1/r over the WS cell).
+
+    Parameters
+    ----------
+    fft_nx, fft_ny, fft_nz : int
+        WFN FFT grid dimensions.
+    bdot : (3, 3) float64
+        Reciprocal-space metric matrix in Bohr^-2 (as stored in WFN).
+    cell_volume : float
+        Unit cell volume in Bohr^3.
+
+    Returns
+    -------
+    sqrt_v : (fft_nx, fft_ny, fft_nz) complex128
+        √(v(G) / cell_volume) on the FFT grid, for use in V_μν contraction.
+    """
+    from .compute_vcoul_0d import compute_vcoul_box, _round_up_fft_size, N_IN_BOX, NCELL, TRUNC_SHIFT
+
+    fft_grid = np.array([fft_nx, fft_ny, fft_nz], dtype=int)
+    dkmax = fft_grid * N_IN_BOX
+    dNfft = np.array([_round_up_fft_size(int(g)) for g in dkmax])
+
+    # --- Build real-space metric (same as compute_vcoul_box) ---
+    bdot = np.asarray(bdot, dtype=np.float64)
+    adot = np.linalg.inv(bdot) * (4.0 * np.pi**2)
+    for i in range(3):
+        for j in range(3):
+            adot[i, j] /= dNfft[i] * dNfft[j]
+    scale = 2.0 * np.sqrt(np.linalg.det(adot))
+
+    # --- Build V_trunc(r) on dense grid with WS minimum-image truncation ---
+    replica_offsets = []
+    for l3 in range(-NCELL + 1, NCELL + 1):
+        for l2 in range(-NCELL + 1, NCELL + 1):
+            for l1 in range(-NCELL + 1, NCELL + 1):
+                replica_offsets.append(np.array([
+                    l1 * dNfft[0], l2 * dNfft[1], l3 * dNfft[2],
+                ], dtype=np.float64))
+
+    i1 = np.arange(dNfft[0], dtype=np.float64) + TRUNC_SHIFT
+    i2 = np.arange(dNfft[1], dtype=np.float64) + TRUNC_SHIFT
+    i3 = np.arange(dNfft[2], dtype=np.float64) + TRUNC_SHIFT
+    rr1, rr2, rr3 = np.meshgrid(i1, i2, i3, indexing='ij')
+
+    r_len_sq = np.full(tuple(dNfft), np.inf, dtype=np.float64)
+    for offset in replica_offsets:
+        tt1 = rr1 - offset[0]
+        tt2 = rr2 - offset[1]
+        tt3 = rr3 - offset[2]
+        d_sq = (
+            adot[0, 0] * tt1**2 + adot[1, 1] * tt2**2 + adot[2, 2] * tt3**2
+            + 2.0 * adot[0, 1] * tt1 * tt2
+            + 2.0 * adot[0, 2] * tt1 * tt3
+            + 2.0 * adot[1, 2] * tt2 * tt3
+        )
+        r_len_sq = np.minimum(r_len_sq, d_sq)
+
+    fftbox_r = (scale / np.sqrt(r_len_sq)).astype(np.complex128)
+
+    # --- FFT to G-space (unnormalized, matching BGW convention) ---
+    fftbox_G = np.fft.fftn(fftbox_r)
+
+    # --- Extract onto WFN FFT grid with phase correction ---
+    # The dense grid has dNfft points; the WFN grid has fft_n* points.
+    # For each G in the WFN grid (range [-N/2, N/2-1]), map to the dense
+    # grid index and apply phase to undo the trunc_shift.
+    vcoul_grid = np.zeros((fft_nx, fft_ny, fft_nz), dtype=np.float64)
+
+    for j1_idx in range(fft_nx):
+        j1 = j1_idx if j1_idx <= fft_nx // 2 else j1_idx - fft_nx
+        di1 = j1 if j1 >= 0 else dNfft[0] + j1
+        for j2_idx in range(fft_ny):
+            j2 = j2_idx if j2_idx <= fft_ny // 2 else j2_idx - fft_ny
+            di2 = j2 if j2 >= 0 else dNfft[1] + j2
+            for j3_idx in range(fft_nz):
+                j3 = j3_idx if j3_idx <= fft_nz // 2 else j3_idx - fft_nz
+                di3 = j3 if j3 >= 0 else dNfft[2] + j3
+
+                phase = 2.0 * np.pi * (
+                    j1 * TRUNC_SHIFT / dNfft[0]
+                    + j2 * TRUNC_SHIFT / dNfft[1]
+                    + j3 * TRUNC_SHIFT / dNfft[2]
+                )
+                vtemp = fftbox_G[di1, di2, di3] * complex(np.cos(phase), -np.sin(phase))
+                vcoul_grid[j1_idx, j2_idx, j3_idx] = vtemp.real
+
+    # vcoul_grid is v(G) in Rydberg (same units as 8π/|G|² for untruncated).
+    # The downstream code expects sqrt(v(G) / cell_volume).
+    fact = 1.0 / cell_volume
+    v_scaled = vcoul_grid * fact
+    sqrt_v = np.where(v_scaled > 0.0, np.sqrt(v_scaled), 0.0)
+    return jnp.asarray(sqrt_v, dtype=jnp.complex128)
+
+
 def compute_sqrt_vcoul_2d(
     qvec_wrapped: jax.Array,
     fft_nx: int,
@@ -146,80 +256,100 @@ def make_v_munu_chunked_kernel(
     bvec: np.ndarray,
     cell_volume: float,
     sys_dim: int = 2,
+    bdot: np.ndarray | None = None,
 ):
     """
     Factory for jitted kernels that compute V_q blocks from zeta chunks.
-    
+
     This creates two kernels:
     1. fft_and_weight: zeta_r(B_μ, n_rtot) → zeta_weighted(B_μ, n_G)
     2. contract_block: (zeta_μ, zeta_ν) → V_block(B_μ, B_ν)
-    
+
     Args:
         fft_nx, fft_ny, fft_nz: FFT grid dimensions
         nkx, nky, nkz: k-grid dimensions
         bvec: Reciprocal lattice vectors (3×3)
         cell_volume: Unit cell volume
-        sys_dim: System dimensionality (only 2 supported currently)
-    
+        sys_dim: System dimensionality (0=molecule/box, 2=slab)
+        bdot: Reciprocal metric (3×3) in Bohr^-2; required for sys_dim=0
+
     Returns:
         Namespace with fft_and_weight, contract_block, get_sqrt_v, get_phase kernels
     """
-    if sys_dim != 2:
-        raise NotImplementedError("Chunked V_q currently supports sys_dim == 2 only")
-    
-    cache_key = (fft_nx, fft_ny, fft_nz, nkx, nky, nkz, tuple(bvec.flatten()), cell_volume)
+    if sys_dim not in (0, 2):
+        raise NotImplementedError(f"Chunked V_q supports sys_dim=0 (box) or sys_dim=2 (slab), got {sys_dim}")
+
+    cache_key = (fft_nx, fft_ny, fft_nz, nkx, nky, nkz, tuple(bvec.flatten()), cell_volume, sys_dim)
     if cache_key in _v_munu_kernel_cache:
         return _v_munu_kernel_cache[cache_key]
-    
+
     n_G = fft_nx * fft_ny * fft_nz
-    
+
     # Precompute static grid data
     fx, fy, fz = exp_ikr_fftbox(fft_nx, fft_ny, fft_nz)
-    gx, gy, gz = fft_integer_axes(fft_nx, fft_ny, fft_nz)
-    gx_b, gy_b, gz_b = jnp.broadcast_arrays(gx, gy, gz)
-    gstack = jnp.stack((gx_b, gy_b, gz_b), axis=-1)
-    
-    bvec_j = jnp.asarray(bvec, dtype=jnp.float64)
-    fact = jnp.float64(1.0 / cell_volume)
-    zc = jnp.float64(np.pi / float(bvec[2, 2]))
-    G_cart_base = jnp.einsum('...a,ab->...b', gstack, bvec_j, optimize=True)
-    
+
+    if sys_dim == 0:
+        # 0D cell box truncation: precompute √v on the full FFT grid via
+        # real-space Wigner-Seitz truncation + FFT (no closed-form formula).
+        # Only q=0 is valid; the result is a static array.
+        if bdot is None:
+            raise ValueError("bdot is required for sys_dim=0 (box truncation)")
+        sqrt_v_0d = compute_sqrt_vcoul_0d(fft_nx, fft_ny, fft_nz, bdot, cell_volume)
+
+        @jax.jit
+        def get_sqrt_v_and_phase(qvec_wrapped: jax.Array) -> tuple[jax.Array, jax.Array]:
+            """Return precomputed √v(G) and trivial phase (q must be 0)."""
+            # Phase is 1.0 for q=0
+            phase = jnp.ones((1, fft_nx, fft_ny, fft_nz), dtype=jnp.complex128)
+            return sqrt_v_0d, phase
+    else:
+        # 2D slab truncation: analytic formula, computed per q-point
+        gx, gy, gz = fft_integer_axes(fft_nx, fft_ny, fft_nz)
+        gx_b, gy_b, gz_b = jnp.broadcast_arrays(gx, gy, gz)
+        gstack = jnp.stack((gx_b, gy_b, gz_b), axis=-1)
+
+        bvec_j = jnp.asarray(bvec, dtype=jnp.float64)
+        fact = jnp.float64(1.0 / cell_volume)
+        zc = jnp.float64(np.pi / float(bvec[2, 2]))
+        G_cart_base = jnp.einsum('...a,ab->...b', gstack, bvec_j, optimize=True)
+
     nkx_f = jnp.float64(nkx)
     nky_f = jnp.float64(nky)
     nkz_f = jnp.float64(nkz)
-    
-    @jax.jit
-    def get_sqrt_v_and_phase(qvec_wrapped: jax.Array) -> tuple[jax.Array, jax.Array]:
-        """Compute √v(q+G) and phase for a given q-point."""
-        # Phase factor
-        phase = jnp.exp(-2j * jnp.pi * (
-            qvec_wrapped[0] / nkx_f * fx +
-            qvec_wrapped[1] / nky_f * fy +
-            qvec_wrapped[2] / nkz_f * fz
-        ))
-        
-        # Coulomb potential
-        q_frac = jnp.asarray((
-            qvec_wrapped[0] / nkx_f,
-            qvec_wrapped[1] / nky_f,
-            qvec_wrapped[2] / nkz_f,
-        ), dtype=jnp.float64)
-        q_cart = jnp.einsum('a,ab->b', q_frac, bvec_j, optimize=True).reshape((1, 1, 1, 3))
-        G_cart = G_cart_base + q_cart
-        
-        denom = jnp.sum(G_cart * G_cart, axis=-1)
-        denom_zero = denom < 1e-12
-        denom_safe = jnp.where(denom_zero, 1.0, denom)
-        
-        kxy = jnp.sqrt(G_cart[..., 0]**2 + G_cart[..., 1]**2)
-        kz_arr = G_cart[..., 2]
-        f2d = 1.0 - jnp.exp(-zc * kxy) * jnp.cos(kz_arr * zc)
-        
-        v_reg = (8.0 * jnp.pi / denom_safe) * f2d
-        v_scaled = jnp.where(denom_zero, 0.0, v_reg * fact)
-        sqrt_v = jnp.where(v_scaled > 0.0, jnp.sqrt(v_scaled), 0.0).astype(jnp.complex128)
-        
-        return sqrt_v, phase
+
+    if sys_dim == 2:
+        @jax.jit
+        def get_sqrt_v_and_phase(qvec_wrapped: jax.Array) -> tuple[jax.Array, jax.Array]:
+            """Compute √v(q+G) and phase for a given q-point."""
+            # Phase factor
+            phase = jnp.exp(-2j * jnp.pi * (
+                qvec_wrapped[0] / nkx_f * fx +
+                qvec_wrapped[1] / nky_f * fy +
+                qvec_wrapped[2] / nkz_f * fz
+            ))
+
+            # Coulomb potential
+            q_frac = jnp.asarray((
+                qvec_wrapped[0] / nkx_f,
+                qvec_wrapped[1] / nky_f,
+                qvec_wrapped[2] / nkz_f,
+            ), dtype=jnp.float64)
+            q_cart = jnp.einsum('a,ab->b', q_frac, bvec_j, optimize=True).reshape((1, 1, 1, 3))
+            G_cart = G_cart_base + q_cart
+
+            denom = jnp.sum(G_cart * G_cart, axis=-1)
+            denom_zero = denom < 1e-12
+            denom_safe = jnp.where(denom_zero, 1.0, denom)
+
+            kxy = jnp.sqrt(G_cart[..., 0]**2 + G_cart[..., 1]**2)
+            kz_arr = G_cart[..., 2]
+            f2d = 1.0 - jnp.exp(-zc * kxy) * jnp.cos(kz_arr * zc)
+
+            v_reg = (8.0 * jnp.pi / denom_safe) * f2d
+            v_scaled = jnp.where(denom_zero, 0.0, v_reg * fact)
+            sqrt_v = jnp.where(v_scaled > 0.0, jnp.sqrt(v_scaled), 0.0).astype(jnp.complex128)
+
+            return sqrt_v, phase
     
     # NOTE: These are NOT JIT'd - they're meant to be called from an outer JIT
     # to avoid nested JIT compilation overhead. The outer JIT (_batch_proc or 
@@ -298,6 +428,7 @@ def compute_V_q_from_zeta_h5(
     mu_chunk_size: int = 128,
     mesh_xy: Mesh = None,
     sys_dim: int = 2,
+    bdot: np.ndarray | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """
     Compute V_q(μ, ν) from zeta stored in HDF5 using μ/ν chunking.
@@ -328,7 +459,7 @@ def compute_V_q_from_zeta_h5(
     """
     # Get kernels
     kernels = make_v_munu_chunked_kernel(
-        fft_nx, fft_ny, fft_nz, nkx, nky, nkz, bvec, cell_volume, sys_dim
+        fft_nx, fft_ny, fft_nz, nkx, nky, nkz, bvec, cell_volume, sys_dim, bdot=bdot
     )
     
     # Parse q_idx
@@ -419,10 +550,11 @@ def compute_V_q_from_zeta_array(
     mu_chunk_size: int = 128,
     mesh_xy: Mesh = None,
     sys_dim: int = 2,
+    bdot: np.ndarray | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """
     Compute V_q(μ, ν) from zeta array in memory using μ/ν chunking.
-    
+
     Same as compute_V_q_from_zeta_h5 but takes zeta as a JAX array instead of HDF5.
     Useful for testing or when zeta is already in memory.
     
@@ -436,7 +568,7 @@ def compute_V_q_from_zeta_array(
         g0_mu: (n_rmu,) ζ_μ(G=0) for head corrections
     """
     kernels = make_v_munu_chunked_kernel(
-        fft_nx, fft_ny, fft_nz, nkx, nky, nkz, bvec, cell_volume, sys_dim
+        fft_nx, fft_ny, fft_nz, nkx, nky, nkz, bvec, cell_volume, sys_dim, bdot=bdot
     )
     
     n_rmu, n_rtot = zeta_q.shape
@@ -584,6 +716,7 @@ def compute_all_V_q_from_zeta_h5(
     sys_dim: int = 2,
     q_batch_size: int | None = None,
     verbose: bool = True,
+    bdot: np.ndarray | None = None,
 ) -> jax.Array:
     """
     Compute V_q for all q-points from zeta stored in HDF5.
@@ -621,7 +754,7 @@ def compute_all_V_q_from_zeta_h5(
     
     # Get kernels (cached)
     kernels = make_v_munu_chunked_kernel(
-        fft_nx, fft_ny, fft_nz, nkx, nky, nkz, bvec, cell_volume, sys_dim
+        fft_nx, fft_ny, fft_nz, nkx, nky, nkz, bvec, cell_volume, sys_dim, bdot=bdot
     )
     
     # For single-chunk case, keep on GPU and batch. For multi-chunk, use numpy.
@@ -864,6 +997,7 @@ def make_v_munu_kernel_chunked(
     cell_volume: float,
     sys_dim: int,
     mu_chunk_size: int = 128,
+    bdot: np.ndarray | None = None,
 ):
     """
     Factory for chunked V_q kernel with same signature as gw_jax.make_v_munu_kernel.
@@ -874,7 +1008,7 @@ def make_v_munu_kernel_chunked(
     Drop-in replacement for make_v_munu_kernel when memory is constrained.
     """
     kernels = make_v_munu_chunked_kernel(
-        fft_nx, fft_ny, fft_nz, nkx, nky, nkz, bvec, cell_volume, sys_dim
+        fft_nx, fft_ny, fft_nz, nkx, nky, nkz, bvec, cell_volume, sys_dim, bdot=bdot
     )
     
     def kernel(zeta_q: jax.Array, qvec_wrapped: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -886,6 +1020,7 @@ def make_v_munu_kernel_chunked(
             mu_chunk_size=mu_chunk_size,
             mesh_xy=None,
             sys_dim=sys_dim,
+            bdot=bdot,
         )
-    
+
     return kernel

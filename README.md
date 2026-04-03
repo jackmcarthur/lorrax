@@ -53,9 +53,8 @@ Available as console commands: `gw_jax`, `cohsex_isdf` (compatibility alias), `k
 
 ### Specialized Topics
 
-- **[`docs/MEMORY_MODEL.md`](docs/MEMORY_MODEL.md)** — Memory footprints and GPU/CPU allocation strategy
-- **[`docs/CHUNK_BUDGETS.md`](docs/CHUNK_BUDGETS.md)** — Band/R/q chunking constraints and buffer sizes
-- **[`docs/chi_omega_quadrature.md`](docs/chi_omega_quadrature.md)** — CTSP (Complex-Time Shredded Propagator) quadrature method for χ⁰(iω)
+- **[`docs/MEMORY_MODEL.md`](docs/MEMORY_MODEL.md)** — Memory footprints, GPU/CPU allocation, and chunking constraints
+- **[`docs/MINIMAX_QUADRATURE.md`](docs/MINIMAX_QUADRATURE.md)** — GL/HGL theory, minimax solver methods, and CTSP derivations
 
 ### Experimental/Reference
 
@@ -77,9 +76,9 @@ Available as console commands: `gw_jax`, `cohsex_isdf` (compatibility alias), `k
 | **Setting up environment** | `docs/ENVIRONMENT_COMPREHENSIVE.md` |
 | **Understanding code structure** | `docs/CODEBASE_COMPREHENSIVE.md` |
 | **Working on zeta fitting** | `docs/PHYSICS_COMPREHENSIVE.md` §4-5, `docs/CODEBASE_COMPREHENSIVE.md` §6, `src/isdf/common/load_wfns.py` |
-| **Debugging memory issues** | `docs/MEMORY_MODEL.md`, `docs/CHUNK_BUDGETS.md` |
+| **Debugging memory issues** | `docs/MEMORY_MODEL.md` |
 | **Modifying GW self-energy** | `docs/PHYSICS_COMPREHENSIVE.md` §6, `src/gw_isdf/gw_jax.py` |
-| **χ⁰ or W calculations** | `docs/chi_omega_quadrature.md`, `src/gw_isdf/w_isdf.py` |
+| **χ⁰ or W calculations** | `docs/MINIMAX_QUADRATURE.md`, `src/gw_isdf/w_isdf.py` |
 | **K-means clustering** | `docs/PHYSICS_COMPREHENSIVE.md` §1.2, `src/isdf/isdf_init/kmeans_isdf.py` |
 | **JAX sharding/chunking** | `docs/PHYSICS_COMPREHENSIVE.md` §5,§7, `src/isdf/common/load_wfns.py` |
 | **Multi-GPU/cluster setup** | `docs/ENVIRONMENT_COMPREHENSIVE.md` §4-5, `docs/advanced/jax_multihost.md` |
@@ -132,7 +131,7 @@ The provided `Dockerfile` mirrors these steps. If a GPU is available and cupy us
   - `mixing/` – Self-consistent GW acceleration (Anderson mixing).
 - `docs/` – comprehensive documentation (see Documentation Guide above).
   - Core guides: `PHYSICS_COMPREHENSIVE.md`, `CODEBASE_COMPREHENSIVE.md`, `ENVIRONMENT_COMPREHENSIVE.md`
-  - Specialized: `MEMORY_MODEL.md`, `CHUNK_BUDGETS.md`, `chi_omega_quadrature.md`
+  - Specialized: `MEMORY_MODEL.md`, `MINIMAX_QUADRATURE.md`, `GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md`
   - `archive/` – outdated documentation (superseded, see archive/README.md).
   - `references/` – reference papers (Kim 2020, self-consistent GW).
   - `advanced/` – multi-host JAX, specialized derivations.

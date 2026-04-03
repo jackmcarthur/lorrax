@@ -104,7 +104,7 @@ integrates their product. For sigma in this code path, call it twice and sum:
 
 This section explains the Complex-Time Shredded Propagator (CTSP) method from
 Kim, Martyna & Ismail-Beigi (PRB 101, 035139, 2020). Full derivations are in
-`docs/chi_omega_quadrature.md`.
+`docs/MINIMAX_QUADRATURE.md`.
 
 ### 3.1 The Laplace trick
 
@@ -164,7 +164,7 @@ which satisfies `F(x) -> 1/x + O(1/x^5)` as `|x| -> infinity` (converges faster
 than a Lorentzian's `O(1/x^3)`). The ratio 1/2 in the exponent `tau^2/2` is
 special — any other ratio gives only `O(1/x^3)`.
 
-Grid sizing for HGL is a quadratic in `gamma * E_bw` (see `chi_omega_quadrature.md`
+Grid sizing for HGL is a quadratic in `gamma * E_bw` (see `MINIMAX_QUADRATURE.md`
 Section 3 and Appendix D).
 
 ### 3.4 Euler identity: 2x memory savings for HGL
@@ -646,6 +646,6 @@ The rewrite is complete when:
 ## References
 
 - Kim, Martyna & Ismail-Beigi, PRB 101, 035139 (2020) — CTSP method
-- `docs/chi_omega_quadrature.md` — Full derivation and implementation design
+- `docs/MINIMAX_QUADRATURE.md` — Full derivation and implementation design
 - `src/gw_isdf/get_windows.py` — Existing window optimization
 - `src/gw_isdf/hgl_quadrature.py` — Existing HGL quadrature construction

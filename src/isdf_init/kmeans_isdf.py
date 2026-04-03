@@ -295,8 +295,8 @@ def plot_density_and_centroids(wfn, rho_np, centroids, labels=None):
         density_points[:, 1],
         density_points[:, 2],
         c=np.log(np.abs(density_values) - 0.9 * threshold),
-        cmap="viridis",
-        alpha=0.05,
+        cmap="plasma",
+        alpha=0.09,
         s=20,
         marker="s",
         label="Density",
@@ -651,6 +651,8 @@ def main():
                         help="Number of clusters/sampling points (default: 400)")
     parser.add_argument("--seed", type=int, default=0, help="Random seed (default: 0)")
     parser.add_argument("--no-plot", action="store_true", help="Skip plotting")
+    parser.add_argument("--plot-zoom", type=float, default=1.0,
+                        help="Zoom factor for density in plot (default: 1.0, higher = finer)")
     args = parser.parse_args()
     
     N_k = args.N_k
@@ -675,7 +677,17 @@ def main():
     if any(wfn.fft_grid < 20):
         zoom_factors = np.ones(3)
     zoom_factors = np.clip(zoom_factors, 0.1, 2.0)  # Reasonable bounds
-    
+
+    # Guard: if N_k is a significant fraction of the coarsened grid,
+    # the k-means has too few points to cluster meaningfully and centroids
+    # spread into vacuum. Skip downsampling in this case so the density
+    # contrast is preserved (e.g. molecule in a large box).
+    coarsened_size = int(np.prod(np.round(np.array(charge_density.shape) * zoom_factors)))
+    if N_k > coarsened_size // 10:
+        print(f"N_k={N_k} is >{coarsened_size//10} (10% of coarsened grid {coarsened_size})")
+        print(f"Skipping downsampling to preserve density contrast")
+        zoom_factors = np.ones(3)
+
     print(f"Charge density shape: {charge_density.shape}")
     print(f"Lattice lengths: {lattice_lengths} Å")
     print(f"Current spacing: {current_spacing} Å")
@@ -726,7 +738,11 @@ def main():
     print(f"Saved centroids to centroids_frac_{n_unique}.txt")
 
     if not args.no_plot:
-        plot_density_and_centroids(wfn, rho_np, centroids_snapped)
+        if args.plot_zoom != 1.0:
+            rho_plot = interpolate_density(charge_density, zoom_factors * args.plot_zoom)
+        else:
+            rho_plot = rho_np
+        plot_density_and_centroids(wfn, rho_plot, centroids_snapped)
     return 0
 
 

@@ -180,14 +180,12 @@ def get_small_psi_component(gvecs, kvec, bvec, psi_G):
 	# Note: Not @jax.jit because ngk varies per k-point → recompilation overhead on GPU
 	# possible improvements: do sigma dot v, v = p + [r,V_NL+Sigma], add the DKH4 contribution
 	halfalpha = jnp.complex128(0.00364867628215)  # 1/2 * alpha
-	sigmadotp = jnp.zeros((2, 2, gvecs.shape[0]), dtype=jnp.complex128)
-
 	gvecsk_cart = jnp.matmul(gvecs + kvec, bvec)
 
-	sigmadotp[0, 0, :] = gvecsk_cart[:, 2]
-	sigmadotp[0, 1, :] = gvecsk_cart[:, 0] - 1j * gvecsk_cart[:, 1]
-	sigmadotp[1, 0, :] = gvecsk_cart[:, 0] + 1j * gvecsk_cart[:, 1]
-	sigmadotp[1, 1, :] = -gvecsk_cart[:, 2]
+	sigmadotp = jnp.array([
+		[gvecsk_cart[:, 2], gvecsk_cart[:, 0] - 1j * gvecsk_cart[:, 1]],
+		[gvecsk_cart[:, 0] + 1j * gvecsk_cart[:, 1], -gvecsk_cart[:, 2]],
+	], dtype=jnp.complex128)
 
 	return jnp.multiply(
 		halfalpha, jnp.einsum("ijG,bjG->biG", sigmadotp, psi_G[:, 0:2, :])
@@ -794,7 +792,14 @@ def compute_L_q_from_CCT(
     # "scan body function carry input and carry output must have equal types ...
     # varying manual axes do not match". Use dense batched Cholesky in this case.
     if mesh_xy.devices.size == 1 or (Pr == 1 and Pc == 1):
-        L_q_dense = jnp.linalg.cholesky(C_q)
+        # Regularize C_q: the pair density matrix can be numerically
+        # rank-deficient (more centroids than band pairs), producing
+        # tiny negative eigenvalues that break Cholesky. Add a small
+        # ridge proportional to the trace to ensure positive definiteness.
+        trace_per_q = jnp.trace(C_q, axis1=-2, axis2=-1)
+        ridge = 1e-14 * jnp.abs(trace_per_q)[:, None, None] * jnp.eye(n_rmu)[None, :, :]
+        C_q_reg = C_q + ridge
+        L_q_dense = jnp.linalg.cholesky(C_q_reg)
         L_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
         return jax.lax.with_sharding_constraint(L_q_dense, L_shard)
     
@@ -1332,7 +1337,7 @@ def fit_zeta_chunked_to_h5(
             with timing.section("zeta_fit.chunk.solve"):
                 zeta_chunk = solve_zeta_from_L_q(L_q, Z_q_flat, mesh_xy, q_chunk_size)
                 zeta_chunk.block_until_ready()
-                
+
                 # Free Z_q_flat - we have zeta now
                 del Z_q_flat
             t_solve_total += time.perf_counter() - t0

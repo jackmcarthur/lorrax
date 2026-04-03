@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 Utility to compute and write kin+ion (T + V_loc + V_NL) matrices to kin_ion.h5.
-Optionally adds the valence Hartree contribution when --do-hartree is enabled.
+
+By construction, these matrix elements correspond to H_DFT - V_xc. The
+Hartree term is not included unless --do-hartree is enabled. This keeps the GW
+Hamiltonian in the standard form (H_DFT - V_xc) + V_H + Sigma_xc.
 
 This script loads the wavefunctions, symmetry maps, pseudopotentials, and
 constructs the required sharded wavefunctions before calling:

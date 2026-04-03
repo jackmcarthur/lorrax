@@ -5,10 +5,19 @@ This module contains functions for:
 - Converting input parameters to effective values
 - Computing band ranges from input parameters
 - Memory-aware chunk size optimization with full communication buffer accounting
+- Runtime configuration resolution (memory budget, chunking, ZCT caps)
+- ISDF fitting / restart orchestration
 """
+import os
 import re
 import configparser
 import math
+from types import SimpleNamespace
+
+import jax
+import jax.numpy as jnp
+
+import common.timing as timing
 
 
 
@@ -542,12 +551,42 @@ def read_cohsex_input(filename: str) -> dict:
 		# ncond:         Number of conduction bands in sigma window. These are the
 		#                lowest unoccupied bands: indices [nelec, nelec+ncond).
 		# nband:         Total bands to load (for chi0, etc.). Usually > nval+ncond.
-		# sys_dim:       Dimensionality: 2=2D (slab with truncated Coulomb),
-		#                3=3D (bulk, not yet implemented). Default=2.
+		# sys_dim:       Dimensionality: 0=0D (molecule, cell box truncation),
+		#                2=2D (slab with truncated Coulomb). Default=2.
 		# debug_hartree: If True, print diagnostic info for Hartree calculation.
 		# debug_omega:   If set (float, in Ry), compute W(ω) at this frequency
 		#                instead of static W. For testing dynamic screening.
-		# chunk_size:    Band chunk size for memory-efficient wavefunction loading.
+		# screening_method: Screening backend: 'minimax' (default) or 'ctsp'.
+			# minimax_target_error: Target max error for minimax 1/x approximation.
+			# minimax_max_nodes: Maximum allowed minimax nodes.
+			# minimax_energy_reference: uniform shift reference for minimax χ0/W
+			#                ('midgap' default, 'vbm', 'cbm', 'none', or numeric).
+			# ppm_omega_p:   If set (>0, in Ry), extract GN-PPM parameters from
+		#                minimax chi(0) and chi(i*omega_p).
+		# ppm_fallback_omega: Fallback pole value (Ry) for unfulfilled GN modes.
+		# use_ppm_sigma: If True, build GN-PPM from W(0),W(iωp) and use
+		#                frequency-integrated Σ^c instead of static COH term.
+		# ppm_sigma_target_error: Minimax target error for Σ^c quadratures.
+		# ppm_sigma_max_nodes: Max minimax nodes for Σ^c quadratures.
+		# sigma_omega_min_ev: Lower bound (eV) of default Sigma_mnk(ω) delivery grid.
+		# sigma_omega_max_ev: Upper bound (eV) of default Sigma_mnk(ω) delivery grid.
+			# sigma_omega_step_ev: Spacing (eV) for default Sigma_mnk(ω) grid.
+			# sigma_regularization_ev: Regularization width ξ (eV) for crossing windows.
+			# sigma_window_edge_factor: Edge factor c_edge in three-window construction.
+		# sigma_omega_h5_file: Output HDF5 path for Sigma_mnk(ω) grid.
+		# sigma_omega_batch_size: Number of ω points per GN-PPM Sigma batch.
+		# sigma_omega_accumulation: 'kij' (in-memory) or 'kij_stream' (stream Σ_c(kij,ω)).
+		# sigma_kij_h5_file: Optional HDF5 path to stream Σ^c_{kij}(ω) in ω-chunks.
+		# ppm_sigma_scale: Optional global scale factor for GN-PPM Σ^c (default 1.0).
+		# ppm_sigma_flip_neg: If True, flip the overall sign of the ω<E_F branch (debug only).
+		# sigma_debug_split_contrib: If True, store Σ^(+) and Σ^(-) separately in sigma_mnk.h5.
+		# fermi_reference: 'midgap' (default) or 'vbm' reference for Σ^c windowing.
+		# sigma_at_dft_extrapolate: If True, clip/extrapolate Σ_c(ω) to match E_DFT outside ω-grid.
+		# sigma_at_dft_energies: Evaluate Σ_c(E_DFT) and Σ_xc(E_DFT) for BGW comparisons.
+		# ppm_sigma_debug_static_norm: Compare PPM Wc(0) static COH vs screened-COH normalization.
+		# sigma_debug_quadrature: Print minimax quadrature error per sigma window.
+		# sigma_debug_quadrature_samples: Sample count for quadrature checks.
+			# chunk_size:    Band chunk size for memory-efficient wavefunction loading.
 		#                -1 = no chunking (all bands at once, default)
 		#                 0 = auto (currently 64, TODO: dynamic from available RAM)
 		#                1-2048 = explicit chunk size
@@ -567,6 +606,14 @@ def read_cohsex_input(filename: str) -> dict:
 			"do_screened": getb("do_screened", fallback=True),   # use W instead of V
 			"bispinor": getb("bispinor", fallback=False),        # 2-component spinors
 			"wcoul0_source": get("wcoul0_source", fallback="s_tensor").strip().lower(),
+			# Head overrides: if set, bypass compute_q0_averages and use these
+			# values directly. Units: a.u. (same as FINITE-SIZE CORRECTIONS output).
+			# vhead: bare Coulomb head v(q→0)
+			# whead_0freq: screened Coulomb head W(q→0, ω=0)
+			# whead_imfreq: screened Coulomb head W(q→0, ω=iωp) (PPM only)
+			"vhead": getf("vhead", fallback=None),
+			"whead_0freq": getf("whead_0freq", fallback=None),
+			"whead_imfreq": getf("whead_imfreq", fallback=None),
 			"wfn_file": get("wfn_file", fallback="WFN.h5"),
 			"centroids_file": get("centroids_file", fallback="centroids_frac.txt"),
 			"output_file": get("output_file", fallback="eqp0_noqsym.dat"),
@@ -576,9 +623,37 @@ def read_cohsex_input(filename: str) -> dict:
 			"nval": geti("nval", fallback=5),    # valence bands in sigma window
 			"ncond": geti("ncond", fallback=5),  # conduction bands in sigma window
 			"nband": geti("nband", fallback=100), # total bands for chi0/screening
-			"sys_dim": geti("sys_dim", fallback=2),  # 2=slab, 3=bulk
+			"sys_dim": geti("sys_dim", fallback=2),  # 0=molecule/box, 2=slab
 			"debug_hartree": getb("debug_hartree", fallback=False),
 			"debug_omega": getf("debug_omega", fallback=None),   # test W(ω) at this freq
+			"screening_method": get("screening_method", fallback="minimax").strip().lower(),
+				"minimax_target_error": getf("minimax_target_error", fallback=1.0e-6),
+				"minimax_max_nodes": geti("minimax_max_nodes", fallback=64),
+				"minimax_energy_reference": get("minimax_energy_reference", fallback="midgap").strip().lower(),
+				"ppm_omega_p": getf("ppm_omega_p", fallback=2.0),
+			"ppm_fallback_omega": getf("ppm_fallback_omega", fallback=2.0),
+			"use_ppm_sigma": getb("use_ppm_sigma", fallback=False),
+			"ppm_sigma_target_error": getf("ppm_sigma_target_error", fallback=1.0e-6),
+			"ppm_sigma_max_nodes": geti("ppm_sigma_max_nodes", fallback=64),
+			"sigma_omega_min_ev": getf("sigma_omega_min_ev", fallback=-5.0),
+			"sigma_omega_max_ev": getf("sigma_omega_max_ev", fallback=5.0),
+				"sigma_omega_step_ev": getf("sigma_omega_step_ev", fallback=0.25),
+				"sigma_regularization_ev": getf("sigma_regularization_ev", fallback=0.25),
+				"sigma_window_edge_factor": getf("sigma_window_edge_factor", fallback=1.5),
+			"sigma_omega_h5_file": get("sigma_omega_h5_file", fallback="sigma_mnk.h5"),
+			"sigma_omega_batch_size": geti("sigma_omega_batch_size", fallback=4),
+			"sigma_omega_accumulation": get("sigma_omega_accumulation", fallback="auto"),
+			"sigma_kij_h5_file": get("sigma_kij_h5_file", fallback=""),
+			"ppm_sigma_scale": getf("ppm_sigma_scale", fallback=1.0),
+			"ppm_sigma_flip_neg": getb("ppm_sigma_flip_neg", fallback=False),
+			"sigma_debug_split_contrib": getb("sigma_debug_split_contrib", fallback=False),
+			"fermi_reference": get("fermi_reference", fallback="midgap").strip().lower(),
+			"sigma_at_dft_extrapolate": getb("sigma_at_dft_extrapolate", fallback=False),
+			"sigma_at_dft_energies": getb("sigma_at_dft_energies", fallback=False),
+			"ppm_sigma_debug_static_norm": getb("ppm_sigma_debug_static_norm", fallback=False),
+			"ppm_static_cohsex_check": getb("ppm_static_cohsex_check", fallback=False),
+			"sigma_debug_quadrature": getb("sigma_debug_quadrature", fallback=False),
+			"sigma_debug_quadrature_samples": geti("sigma_debug_quadrature_samples", fallback=200),
 			"chunk_size": geti("chunk_size", fallback=-1),       # band chunk size (-1=all, 0=auto, 1-2048=explicit)
 			"r_chunk_size": geti("r_chunk_size", fallback=0),    # r-axis chunk (0=auto, >0=explicit)
 			"band_chunk_size": geti("band_chunk_size", fallback=16),  # bands per FFT during r-chunk loop
@@ -593,6 +668,9 @@ def read_cohsex_input(filename: str) -> dict:
 			"do_screened": True,
 			"bispinor": False,
 			"wcoul0_source": "s_tensor",
+			"vhead": None,
+			"whead_0freq": None,
+			"whead_imfreq": None,
 			"wfn_file": "WFN.h5",
 			"centroids_file": "centroids_frac.txt",
 			"output_file": "eqp0_noqsym.dat",
@@ -605,11 +683,38 @@ def read_cohsex_input(filename: str) -> dict:
 			"sys_dim": 2,
 			"debug_hartree": False,
 			"debug_omega": None,
-			"chunk_size": -1,
-			"r_chunk_size": 0,
-			"band_chunk_size": 16,
-			"memory_per_device_gb": 0.0,
-			"isdf_pair_mode": "spin_traced",
+				"screening_method": "minimax",
+					"minimax_target_error": 1.0e-6,
+					"minimax_max_nodes": 64,
+					"minimax_energy_reference": "midgap",
+					"ppm_omega_p": 2.0,
+				"ppm_fallback_omega": 2.0,
+				"use_ppm_sigma": False,
+				"ppm_sigma_target_error": 1.0e-6,
+				"ppm_sigma_max_nodes": 64,
+				"sigma_omega_min_ev": -5.0,
+				"sigma_omega_max_ev": 5.0,
+				"sigma_omega_step_ev": 0.25,
+				"sigma_regularization_ev": 0.25,
+				"sigma_window_edge_factor": 1.5,
+				"sigma_omega_h5_file": "sigma_mnk.h5",
+				"sigma_omega_batch_size": 4,
+				"sigma_omega_accumulation": "auto",
+				"sigma_kij_h5_file": "",
+				"ppm_sigma_scale": 1.0,
+				"ppm_sigma_flip_neg": False,
+				"sigma_debug_split_contrib": False,
+				"fermi_reference": "midgap",
+				"sigma_at_dft_extrapolate": False,
+				"sigma_at_dft_energies": False,
+				"ppm_sigma_debug_static_norm": False,
+				"sigma_debug_quadrature": False,
+				"sigma_debug_quadrature_samples": 200,
+				"chunk_size": -1,
+				"r_chunk_size": 0,
+				"band_chunk_size": 16,
+				"memory_per_device_gb": 0.0,
+				"isdf_pair_mode": "spin_traced",
 			}
 
 	# Parse optional QE-style K_POINTS block: take the number after it, read next that many lines
@@ -656,3 +761,320 @@ def get_bandranges(nv, nc, nband, nelec):
 	n_fullrange = [0, int(nband)]
 	n_valrange = [0, int(nelec)]
 	return nvrange, ncrange, nsigmarange, n_fullrange, n_valrange
+
+
+def resolve_runtime_config(params, rank=0):
+	"""Extract and validate runtime configuration from parsed input params.
+
+	Resolves memory budget (auto-detect or explicit), chunking parameters,
+	ZCT stage cap, and ISDF pair mode. Returns a flat namespace consumed by
+	the driver without further interpretation.
+
+	Parameters
+	----------
+	params : dict
+		Parsed input file parameters (from ``read_cohsex_input``).
+	rank : int
+		MPI / JAX process index (only rank 0 prints).
+
+	Returns
+	-------
+	SimpleNamespace with fields:
+		restart, x_only, do_screened, bispinor, isdf_pair_mode,
+		memory_per_device_gb, chunk_target_utilization, zct_stage_cap_gb,
+		r_chunk_override, do_G0
+	"""
+	restart = params["restart"]
+	x_only = params["x_only"]
+	do_screened = params["do_screened"]
+	bispinor = params["bispinor"]
+
+	isdf_pair_mode = str(params.get("isdf_pair_mode", "spin_traced")).strip().lower()
+	if isdf_pair_mode not in ("spin_traced", "spin_matrix_frobenius"):
+		raise ValueError(
+			f"isdf_pair_mode={isdf_pair_mode!r} is invalid. "
+			"Use 'spin_traced' or 'spin_matrix_frobenius'."
+		)
+
+	if x_only and do_screened:
+		raise ValueError("x_only and do_screened cannot both be True")
+
+	# -- Memory budget -------------------------------------------------------
+	from common.gpu_utils import get_device_memory_info
+	memory_per_device_gb = params.get("memory_per_device_gb", 0.0)
+	memory_budget_auto = memory_per_device_gb <= 0
+	mem_info_detect = None
+	if memory_budget_auto:
+		from common.gpu_utils import get_device_memory_gb
+		memory_per_device_gb = get_device_memory_gb()
+		mem_info_detect = get_device_memory_info()
+		if rank == 0:
+			print(f"  Auto-detected memory budget: {memory_per_device_gb:.2f} GB/device")
+
+	# -- Chunk target utilization ---------------------------------------------
+	try:
+		chunk_target_utilization = float(
+			os.environ.get("ISDF_CHUNK_TARGET_UTILIZATION", "0.97")
+		)
+	except Exception:
+		chunk_target_utilization = 0.97
+	chunk_target_utilization = max(0.85, min(1.0, chunk_target_utilization))
+	if rank == 0:
+		print(f"  Chunk target utilization: {chunk_target_utilization:.2f}")
+		if restart:
+			print(f"  ISDF pair mode: {isdf_pair_mode} (ignored when restart=true)")
+		else:
+			print(f"  ISDF pair mode: {isdf_pair_mode}")
+
+	# -- ZCT stage cap (manual override only) ---------------------------------
+	zct_stage_cap_gb = None
+	zct_cap_gb_env = os.environ.get("ISDF_ZCT_STAGE_CAP_GB")
+	zct_cap_frac_env = os.environ.get("ISDF_ZCT_STAGE_CAP_FRAC")
+	if zct_cap_gb_env:
+		try:
+			zct_stage_cap_gb = min(memory_per_device_gb, max(0.0, float(zct_cap_gb_env)))
+		except Exception:
+			zct_stage_cap_gb = None
+	if zct_stage_cap_gb is None and zct_cap_frac_env and jax.default_backend() in ("gpu", "cuda"):
+		mem_info_detect = mem_info_detect or get_device_memory_info()
+		total_gb = float((mem_info_detect or {}).get("total_gb", 0.0))
+		if total_gb > 0:
+			try:
+				zct_cap_frac = float(zct_cap_frac_env)
+			except Exception:
+				zct_cap_frac = 0.0
+			zct_cap_frac = max(0.10, min(0.95, zct_cap_frac))
+			zct_stage_cap_gb = min(memory_per_device_gb, zct_cap_frac * total_gb)
+	if zct_stage_cap_gb is not None and zct_stage_cap_gb > 0 and rank == 0:
+		print(f"  Explicit ZCT stage cap: {zct_stage_cap_gb:.2f} GB")
+
+	r_chunk_override = params.get("r_chunk_size", 0)
+
+	return SimpleNamespace(
+		restart=restart,
+		x_only=x_only,
+		do_screened=do_screened,
+		bispinor=bispinor,
+		isdf_pair_mode=isdf_pair_mode,
+		memory_per_device_gb=memory_per_device_gb,
+		chunk_target_utilization=chunk_target_utilization,
+		zct_stage_cap_gb=zct_stage_cap_gb,
+		r_chunk_override=r_chunk_override,
+		do_G0=True,
+	)
+
+
+def run_isdf_fitting(
+	*,
+	cfg,
+	wfn,
+	sym,
+	meta,
+	centroid_indices,
+	mesh_xy,
+	tmp_dir,
+	print0,
+):
+	"""Fit ISDF interpolation vectors ζ and compute bare Coulomb V_qmunu.
+
+	Returns
+	-------
+	dict with keys: V_qmunu, v_q0_noG0_munu, G0_mu_nu, psi_l_rmu_Y, psi_r_rmu_Y
+	"""
+	from .gw_jax import fit_zeta_and_compute_V_q_chunked
+
+	print0("  Using CHUNKED ISDF fitting (memory-efficient)")
+
+	with mesh_xy:
+		chunked_result = fit_zeta_and_compute_V_q_chunked(
+			wfn, sym, meta, centroid_indices, mesh_xy,
+			output_dir=tmp_dir,
+			bispinor=cfg.bispinor,
+			memory_budget_gb=cfg.memory_per_device_gb,
+			sys_dim=meta.sys_dim,
+			r_chunk_override=cfg.r_chunk_override,
+			target_utilization=cfg.chunk_target_utilization,
+			zct_stage_cap_gb=cfg.zct_stage_cap_gb,
+			isdf_pair_mode=cfg.isdf_pair_mode,
+		)
+
+	return chunked_result
+
+
+def load_restart_tensors(tensors_filename, mesh_xy, band_slices, print0):
+	"""Load ISDF tensors and wavefunctions from restart h5 file.
+
+	Returns
+	-------
+	dict with keys: V_qmunu, v_q0_noG0_munu, G0_mu_nu, S_qmunu,
+	                psi_full_x, psi_full_y, enk_full
+	"""
+	from isdf_io import load_restart_state_from_h5
+
+	V_qmunu, S_qmunu, psi_full_x, psi_full_y, enk_full, v_q0_noG0_munu, G0_mu_nu = (
+		load_restart_state_from_h5(tensors_filename, mesh_xy, band_slices=band_slices)
+	)
+	print0("  Loaded restart tensors from h5.")
+	return dict(
+		V_qmunu=V_qmunu,
+		S_qmunu=S_qmunu,
+		v_q0_noG0_munu=v_q0_noG0_munu,
+		G0_mu_nu=G0_mu_nu,
+		psi_full_x=psi_full_x,
+		psi_full_y=psi_full_y,
+		enk_full=enk_full,
+	)
+
+
+def build_bundle_and_views(
+	*,
+	wfn,
+	sym,
+	meta,
+	band_slices,
+	mesh_xy,
+	sh,
+	psi_l_y=None,
+	psi_r_y=None,
+	psi_full_y=None,
+	psi_full_x=None,
+	enk_full=None,
+	print0=print,
+):
+	"""Build WavefunctionBundle and sigma views from either ISDF or restart arrays.
+
+	Provide (psi_l_y, psi_r_y) for the ISDF path, or (psi_full_y[, psi_full_x])
+	for the restart path. enk_full is loaded from WFN if not provided.
+	"""
+	from .wavefunction_bundle import (
+		build_wavefunction_bundle,
+		build_wavefunction_bundle_from_full,
+		build_sigma_views,
+	)
+	from common.load_wfns import get_enk_bandrange
+
+	b0, b1, b2, b3, b4 = meta.band_edges
+
+	if enk_full is None:
+		enk_full, _ = get_enk_bandrange(
+			wfn, sym, (b0, b4), (b1, b3), nspinor=meta.nspinor
+		)
+
+	if psi_full_y is not None:
+		wf_bundle = build_wavefunction_bundle_from_full(
+			psi_full_y,
+			psi_full_x=psi_full_x,
+			enk_full=enk_full,
+			slices=band_slices,
+			mesh_xy=mesh_xy,
+			sh=sh,
+			# Keep occupied-mask definition consistent with the selected band window.
+			# This avoids dependence on WFN-level chemical potential conventions.
+			efermi=None,
+		)
+	else:
+		wf_bundle = build_wavefunction_bundle(
+			psi_l_y, psi_r_y,
+			enk_full=enk_full,
+			slices=band_slices,
+			mesh_xy=mesh_xy,
+			sh=sh,
+			# Keep occupied-mask definition consistent with the selected band window.
+			# This avoids dependence on WFN-level chemical potential conventions.
+			efermi=None,
+		)
+
+	sigma_views = build_sigma_views(wf_bundle, mesh_xy, sh)
+	print0(
+		f"  Wavefunction bundle built (b0:b4={band_slices.nb_full} bands, "
+		"canonical X/Y storage)"
+	)
+	return wf_bundle, sigma_views
+
+
+def prepare_isdf_and_wavefunctions(
+	*,
+	cfg,
+	wfn,
+	sym,
+	meta,
+	centroid_indices,
+	band_slices,
+	mesh_xy,
+	sh,
+	tmp_dir,
+	tensors_filename,
+	print0,
+):
+	"""Run ISDF fitting or load from restart, build wavefunction bundle.
+
+	Returns
+	-------
+	SimpleNamespace with fields:
+		V_qmunu, v_q0_noG0_munu, G0_mu_nu,
+		wf_bundle, sigma_views
+	"""
+	from isdf_io import write_restart_state_to_h5, save_restart_state_per_proc
+
+	if not cfg.restart:
+		# Fit ISDF vectors and compute V_q
+		isdf_result = run_isdf_fitting(
+			cfg=cfg, wfn=wfn, sym=sym, meta=meta,
+			centroid_indices=centroid_indices,
+			mesh_xy=mesh_xy, tmp_dir=tmp_dir, print0=print0,
+		)
+
+		# Build wavefunctions from ISDF centroid projections
+		with timing.section("gw_jax.wavefunction_setup"):
+			wf_bundle, sigma_views = build_bundle_and_views(
+				wfn=wfn, sym=sym, meta=meta,
+				band_slices=band_slices, mesh_xy=mesh_xy, sh=sh,
+				psi_l_y=isdf_result['psi_l_rmu_Y'],
+				psi_r_y=isdf_result['psi_r_rmu_Y'],
+				print0=print0,
+			)
+
+		V_qmunu = isdf_result['V_qmunu']
+		v_q0_noG0_munu = isdf_result['v_q0_noG0_munu']
+		G0_mu_nu = isdf_result['G0_mu_nu']
+
+		# Persist restart artifacts
+		write_restart_state_to_h5(
+			tensors_filename, V_qmunu,
+			wf_bundle.psi_y, wf_bundle.enk, None,
+			V0_noG0_munu=v_q0_noG0_munu, G0_mu_nu=G0_mu_nu, init_W0=True,
+		)
+		save_restart_state_per_proc(
+			os.path.join(tmp_dir, "isdf_tensors"),
+			V_qmunu, None, wf_bundle.psi_y, wf_bundle.enk,
+			meta, mesh_xy, V0_noG0_munu=v_q0_noG0_munu,
+		)
+		V_qmunu.block_until_ready()
+		print0("  Chunked ISDF path complete")
+
+	else:
+		# Load from restart
+		with timing.section("gw_jax.restart_load"):
+			restart = load_restart_tensors(
+				tensors_filename, mesh_xy, band_slices, print0,
+			)
+			wf_bundle, sigma_views = build_bundle_and_views(
+				wfn=wfn, sym=sym, meta=meta,
+				band_slices=band_slices, mesh_xy=mesh_xy, sh=sh,
+				psi_full_y=restart['psi_full_y'],
+				psi_full_x=restart['psi_full_x'],
+				enk_full=restart['enk_full'],
+				print0=print0,
+			)
+
+		V_qmunu = restart['V_qmunu']
+		v_q0_noG0_munu = restart['v_q0_noG0_munu']
+		G0_mu_nu = restart['G0_mu_nu']
+
+	return SimpleNamespace(
+		V_qmunu=V_qmunu,
+		v_q0_noG0_munu=v_q0_noG0_munu,
+		G0_mu_nu=G0_mu_nu,
+		wf_bundle=wf_bundle,
+		sigma_views=sigma_views,
+	)

@@ -13,7 +13,7 @@ import os
 import math
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import jax
 import jax.numpy as jnp
@@ -24,6 +24,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 
 from common import Meta, jax_profile
+from .minimax_screening import (
+    build_static_minimax_window_pair,
+    extract_gn_ppm_parameters_from_Wc,
+)
 
 if TYPE_CHECKING:
     from .wavefunction_bundle import WavefunctionBundle
@@ -35,6 +39,7 @@ if TYPE_CHECKING:
 
 _COMPILATION_CACHE_READY = False
 _chi_kernel_cache: dict = {}
+_chi_minimax_kernel_cache: dict = {}
 _w_solve_cache: dict = {}
 
 
@@ -281,6 +286,142 @@ def compute_chi0(
 
 
 # ============================================================================
+# χ₀ kernel — direct minimax interface (no WindowPair indirection)
+# ============================================================================
+
+def _get_chi_minimax_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
+    """JIT kernel for chi0 from minimax (tau, prefactor) arrays directly."""
+    cache_key = (id(mesh_xy), nkx, nky, nkz)
+    if cache_key in _chi_minimax_kernel_cache:
+        return _chi_minimax_kernel_cache[cache_key]
+
+    psi_XT = NamedSharding(mesh_xy, P(None, None, 'x', None))
+    psi_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+    chi_out = NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y'))
+    chi_R = NamedSharding(mesh_xy, P('x', 'y', None, None, None))
+    G_v = NamedSharding(mesh_xy, P(None, None, 'x', None, 'y'))
+    G_c = NamedSharding(mesh_xy, P(None, None, 'y', None, 'x'))
+
+    @partial(jax.jit, static_argnames=("nkx", "nky", "nkz"))
+    def _chi_kernel(
+        psi_vTX: jax.Array,    # (nk, ns, μ, nb_v)
+        psi_vY: jax.Array,     # (nk, nb_v, ns, μ)
+        psi_cX: jax.Array,     # (nk, nb_c, ns, μ)
+        psi_cTY: jax.Array,    # (nk, ns, μ, nb_c)
+        enk_v: jax.Array,      # (nk, nb_v)
+        enk_c: jax.Array,      # (nk, nb_c)
+        tau_i: jax.Array,      # (ntau,)
+        prefactor_i: jax.Array, # (ntau,) = -2 * alpha * exp(-tau * E_gap)
+        vmax: jax.Array,       # scalar
+        cmin: jax.Array,       # scalar
+        nkx: int, nky: int, nkz: int,
+    ) -> jax.Array:
+        n_rmu = psi_vTX.shape[2]
+        ntau = tau_i.shape[0]
+
+        def empty_chi():
+            chi = jnp.zeros((nkx, nky, nkz, 1, n_rmu, 1, n_rmu), dtype=jnp.complex128)
+            return jax.lax.with_sharding_constraint(chi, chi_out)
+
+        if ntau == 0:
+            return empty_chi()
+
+        def _k_to_R(g_k, flip_sign):
+            g_fft = g_k.reshape(nkx, nky, nkz, *g_k.shape[1:]).transpose(3, 4, 5, 6, 0, 1, 2)
+            return jax.lax.cond(
+                flip_sign,
+                lambda x: jnp.fft.fftn(x, axes=(-3, -2, -1), norm='ortho'),
+                lambda x: jnp.fft.ifftn(x, axes=(-3, -2, -1), norm='ortho'),
+                g_fft,
+            )
+
+        def tau_body(itau, chi_R_acc):
+            tau = tau_i[itau]
+
+            # Valence: exp(-τ(E_vmax - E_v)), always ≥ 0 and decaying
+            exp_v = jnp.exp(-tau * (vmax - enk_v))
+            # Conduction: exp(-τ(E_c - E_cmin)), always ≥ 0 and decaying
+            exp_c = jnp.exp(-tau * (enk_c - cmin))
+
+            Gv_k = jnp.einsum('ksxn,kn,knty->ksxty',
+                               jnp.conj(psi_vTX), exp_v.astype(jnp.complex128), psi_vY,
+                               optimize=True)
+            Gc_k = jnp.einsum('ksxm,km,kmty->ksxty',
+                               jnp.conj(psi_cTY), exp_c.astype(jnp.complex128), psi_cX,
+                               optimize=True)
+
+            Gv_k = jax.lax.with_sharding_constraint(Gv_k, G_v)
+            Gc_k = jax.lax.with_sharding_constraint(Gc_k, G_c)
+
+            Gv_R = _k_to_R(Gv_k, flip_sign=False)
+            Gc_mR = _k_to_R(Gc_k, flip_sign=True)
+
+            chi_tau = jnp.einsum('ambnxyz,bnamxyz->mnxyz', Gc_mR, Gv_R, optimize=True)
+            return chi_R_acc + prefactor_i[itau] * chi_tau
+
+        chi_R_init = jnp.zeros((n_rmu, n_rmu, nkx, nky, nkz), dtype=jnp.complex128)
+        chi_R_init = jax.lax.with_sharding_constraint(chi_R_init, chi_R)
+        chi_R_final = jax.lax.fori_loop(0, ntau, tau_body, chi_R_init)
+
+        chi_q = jnp.fft.fftn(chi_R_final, axes=(-3, -2, -1), norm='ortho')
+        chi_q = chi_q.transpose(2, 3, 4, 0, 1)[:, :, :, None, :, None, :]
+        return jax.lax.with_sharding_constraint(chi_q, chi_out)
+
+    _chi_minimax_kernel_cache[cache_key] = _chi_kernel
+    return _chi_kernel
+
+
+def compute_chi0_minimax(
+    psi_vTX: jax.Array, psi_vY: jax.Array,
+    psi_cX: jax.Array, psi_cTY: jax.Array,
+    enk_v: jax.Array, enk_c: jax.Array,
+    quad, meta, mesh_xy: Mesh,
+    energy_reference: float | None = None,
+) -> jax.Array:
+    """Compute χ₀ from a LaplaceMinimaxQuadrature directly.
+
+    quad.tau and quad.alpha approximate either:
+      1/x  (static)  or  x/(x²+ωp²)  (imaginary-frequency)
+    on [x_min, x_max] where x = E_c - E_v.
+
+    The physical chi0 is:
+      χ₀ = -2 Σ_ℓ α_ℓ Σ_{v,c} |M_vc|² exp(-τ_ℓ (E_c - E_v))
+
+    A uniform energy shift is optional via ``energy_reference`` and is applied
+    to both valence and conduction energies before building the minimax factors.
+    Because only differences enter, this is algebraically invariant; the knob is
+    provided so callers can keep the implementation explicitly aligned with their
+    chosen global zero of energy (e.g. midgap or VBM).
+    """
+    _ensure_compilation_cache()
+
+    nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
+
+    eref = 0.0 if energy_reference is None else float(energy_reference)
+    enk_v_host = np.asarray(jax.device_get(enk_v), dtype=np.float64) - eref
+    enk_c_host = np.asarray(jax.device_get(enk_c), dtype=np.float64) - eref
+    vmax = float(np.max(enk_v_host))
+    cmin = float(np.min(enk_c_host))
+    E_gap = cmin - vmax
+
+    tau = np.asarray(quad.tau, dtype=np.float64)
+    alpha = np.asarray(quad.alpha, dtype=np.float64)
+    prefactor = -2.0 * alpha * np.exp(-tau * E_gap)
+
+    kernel = _get_chi_minimax_kernel(mesh_xy, nkx, nky, nkz)
+    return kernel(
+        psi_vTX, psi_vY, psi_cX, psi_cTY,
+        enk_v - jnp.asarray(eref, dtype=enk_v.dtype),
+        enk_c - jnp.asarray(eref, dtype=enk_c.dtype),
+        jnp.asarray(tau, dtype=jnp.float64),
+        jnp.asarray(prefactor, dtype=jnp.float64),
+        jnp.asarray(vmax, dtype=jnp.float64),
+        jnp.asarray(cmin, dtype=jnp.float64),
+        nkx, nky, nkz,
+    )
+
+
+# ============================================================================
 # W solve with two-stage resharding (following load_wfns pattern)
 # ============================================================================
 
@@ -523,3 +664,255 @@ def frequency_integration_from_bundle(*args, **kwargs):
     """Scalar-ω CTSP frequency integration from canonical WavefunctionBundle."""
     from .w_isdf_dynamic import frequency_integration_from_bundle as dynamic_frequency_integration_bundle
     return dynamic_frequency_integration_bundle(*args, **kwargs)
+
+
+def compute_screening(
+    V_qmunu,
+    wf_bundle,
+    window_pairs,
+    meta,
+    mesh_xy,
+    *,
+    omega=0.0,
+    screening_method="minimax",
+    minimax_target_error=1.0e-6,
+    minimax_max_nodes=64,
+    minimax_energy_reference="midgap",
+    minimax_energy_reference_fn=None,
+    ppm_omega_p=None,
+    ppm_fallback_omega=2.0,
+    validate_static=True,
+    tensors_filename=None,
+    print0=print,
+):
+    """Compute screened Coulomb W(ω) from V and wavefunctions.
+
+    Supports two screening paths:
+    - ``screening_method='minimax'`` (default): canonical minimax quadrature
+      from ``common.minimax`` on a single static window.
+    - ``screening_method='ctsp'``: legacy CTSP dynamic path.
+
+    Parameters
+    ----------
+    V_qmunu : jax.Array
+        Bare Coulomb in ISDF basis.
+    wf_bundle : WavefunctionBundle
+        Canonical wavefunction bundle.
+    window_pairs : list or None
+        Energy windows for CTSP quadrature. Required only for ``ctsp`` mode.
+    meta : Meta
+        System metadata.
+    mesh_xy : Mesh
+        Device mesh.
+    omega : float
+        Evaluation frequency in Ry (0.0 for static COHSEX).
+    screening_method : {'minimax', 'ctsp'}
+        Select minimax static path or legacy CTSP path.
+    minimax_target_error : float
+        Max 1/x fit error target for canonical minimax quadrature.
+    minimax_max_nodes : int
+        Upper bound for minimax node search.
+    minimax_energy_reference : {'midgap','vbm','cbm','none'} or float
+        Uniform energy shift reference for minimax χ0/W. This does not change
+        the physical result, but keeps reference conventions explicit.
+    minimax_energy_reference_fn : callable or None
+        Optional override returning the reference energy from (enk_v, enk_c).
+    ppm_omega_p : float or None
+        If set in minimax mode, also extract GN-PPM parameters using chi(0)
+        and chi(i*omega_p) built from the same minimax nodes.
+    ppm_fallback_omega : float
+        Fallback Omega value (Ry) for unfulfilled GN modes.
+    validate_static : bool
+        In CTSP mode, if True and omega==0 compare dynamic and static paths.
+    tensors_filename : str or None
+        If not None and file exists, save W0_qmunu to it.
+    print0 : callable
+        Rank-0 print function.
+
+    Returns
+    -------
+    W_q : jax.Array
+        Screened Coulomb interaction.
+    """
+    import time
+
+    ryd2ev = 13.605693122994
+    omega = float(omega)
+    omega_ev = omega * ryd2ev
+    method = str(screening_method).strip().lower()
+    if method not in {"minimax", "ctsp"}:
+        raise ValueError(f"Unknown screening_method={screening_method!r}; expected 'minimax' or 'ctsp'.")
+
+    if method == "minimax" and abs(omega) > 1.0e-14:
+        raise NotImplementedError(
+            "screening_method='minimax' currently supports only omega=0. "
+            "Use screening_method='ctsp' for finite-frequency screening."
+        )
+
+    print0("")
+    if abs(omega) <= 1e-14 and method == "minimax":
+        print0(f"  Minimax screening path enabled at ω = 0.0000 eV ({omega:.6f} Ry)")
+    elif abs(omega) <= 1e-14:
+        print0(f"  CTSP screening path enabled at ω = 0.0000 eV ({omega:.6f} Ry)")
+    else:
+        print0(f"  [DEBUG] CTSP screening at ω = {omega_ev:.4f} eV ({omega:.6f} Ry)")
+
+    if method == "minimax":
+        s = wf_bundle.slices
+        psi_vTX = wf_bundle.x(s.v_slice)
+        psi_vY = wf_bundle.y(s.v_slice)
+        psi_cX = wf_bundle.y(s.c_slice)
+        psi_cTY = wf_bundle.x(s.c_slice)
+        enk_v = wf_bundle.enk[:, s.v_slice]
+        enk_c = wf_bundle.enk[:, s.c_slice]
+        e_ref = resolve_minimax_energy_reference(
+            enk_v,
+            enk_c,
+            reference=minimax_energy_reference,
+            reference_fn=minimax_energy_reference_fn,
+        )
+
+        _windows_minimax, quad = build_static_minimax_window_pair(
+            enk_v,
+            enk_c,
+            target_error=float(minimax_target_error),
+            max_nodes=int(minimax_max_nodes),
+            print_fn=print0,
+        )
+
+        t_min0 = time.perf_counter()
+        chi_omega = compute_chi0_minimax(
+            psi_vTX, psi_vY, psi_cX, psi_cTY,
+            enk_v, enk_c, quad, meta, mesh_xy,
+            energy_reference=e_ref,
+        )
+        W_q = solve_w_from_chi_q_jax(V_qmunu, chi_omega, meta, mesh_xy)
+        chi_omega.block_until_ready()
+        W_q.block_until_ready()
+        t_min = time.perf_counter() - t_min0
+        chi_max = float(jnp.max(jnp.abs(chi_omega)))
+        print0(f"  |χ(0)|_max = {chi_max:.6e}   (minimax, {quad.node_count} nodes)")
+        print0(f"  minimax χ→W time: {t_min:9.3f} s")
+
+        if ppm_omega_p is not None:
+            omega_p = float(ppm_omega_p)
+            if omega_p <= 0.0:
+                raise ValueError("ppm_omega_p must be > 0 when GN-PPM extraction is requested.")
+            # Fresh minimax for chi0(i*omega_p)
+            from .minimax_screening import solve_laplace_minimax_imag_interval
+            quad_imag = solve_laplace_minimax_imag_interval(
+                quad.x_min, quad.x_max, omega_p,
+                target_error=float(minimax_target_error),
+                max_nodes=int(minimax_max_nodes),
+            )
+            R_imag = quad_imag.x_max / quad_imag.x_min
+            omega_hat = omega_p / quad_imag.x_min
+            print0(
+                f"  Minimax imag-freq window (ωp={omega_p:.4f} Ry): "
+                f"x=[{quad_imag.x_min:.6e}, {quad_imag.x_max:.6e}] Ry, "
+                f"R={R_imag:.2f}, ω̂={omega_hat:.2f}, "
+                f"nodes={quad_imag.node_count}, fit_err~{quad_imag.max_error:.3e}"
+            )
+            chi_iwp = compute_chi0_minimax(
+                psi_vTX, psi_vY, psi_cX, psi_cTY,
+                enk_v, enk_c, quad_imag, meta, mesh_xy,
+                energy_reference=e_ref,
+            )
+            chi_iwp.block_until_ready()
+            W_iwp = solve_w_from_chi_q_jax(V_qmunu, chi_iwp, meta, mesh_xy)
+            W_iwp.block_until_ready()
+            # Fit GN-PPM to W^c(0) and W^c(iωp) (no head).
+            nkx, nky, nkz = W_q.shape[0], W_q.shape[1], W_q.shape[2]
+            n_rmu = W_q.shape[4]
+            V_q = V_qmunu[0, 0, 0].reshape(nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
+            Wc0_q = W_q - V_q
+            Wci_q = W_iwp - V_q
+            ppm = extract_gn_ppm_parameters_from_Wc(
+                Wc0_q,
+                Wci_q,
+                omega_p=omega_p,
+                fallback_omega=float(ppm_fallback_omega),
+            )
+            print0(
+                "  GN-PPM extracted from minimax W^c:"
+                f" ω_p={omega_p:.6f} Ry, unfulfilled={100.0 * ppm.unfulfilled_fraction:.2f}%"
+            )
+    else:
+        if window_pairs is None:
+            raise ValueError("window_pairs are required when screening_method='ctsp'.")
+        t_dyn0 = time.perf_counter()
+        W_q, chi_omega = get_w_omega_jax_from_bundle(
+            V_qmunu, wf_bundle, window_pairs, omega, meta, mesh_xy,
+        )
+        W_q.block_until_ready()
+        chi_omega.block_until_ready()
+        t_dyn = time.perf_counter() - t_dyn0
+        chi_max = float(jnp.max(jnp.abs(chi_omega)))
+        print0(f"  |χ(ω)|_max = {chi_max:.6e}")
+
+        # Validate CTSP dynamic path against legacy static path at ω=0
+        if validate_static and abs(omega) <= 1e-14:
+            t_static0 = time.perf_counter()
+            chi0_static = get_chi0_jax_from_bundle(wf_bundle, window_pairs, meta, mesh_xy)
+            W_q_static = get_static_w_q_jax(V_qmunu, chi0_static, meta, mesh_xy)
+            chi0_static.block_until_ready()
+            W_q_static.block_until_ready()
+            t_static = time.perf_counter() - t_static0
+
+            chi_err_abs = float(jnp.max(jnp.abs(chi_omega - chi0_static)))
+            chi_ref = max(float(jnp.max(jnp.abs(chi0_static))), 1e-16)
+            chi_err_rel = chi_err_abs / chi_ref
+            W_err_abs = float(jnp.max(jnp.abs(W_q - W_q_static)))
+            W_ref = max(float(jnp.max(jnp.abs(W_q_static))), 1e-16)
+            W_err_rel = W_err_abs / W_ref
+
+            print0("  χ/W path comparison at ω=0 (dynamic vs static):")
+            print0(f"    dynamic time: {t_dyn:9.3f} s")
+            print0(f"    static time:  {t_static:9.3f} s")
+            print0(f"    χ max abs diff: {chi_err_abs:.6e}, rel diff: {chi_err_rel:.6e}")
+            print0(f"    W max abs diff: {W_err_abs:.6e}, rel diff: {W_err_rel:.6e}")
+
+    if tensors_filename is not None and os.path.exists(tensors_filename):
+        from isdf_io import write_w0_qmunu_to_h5
+        W0_qmunu = W_q[..., 0, :, 0, :]
+        W0_qmunu = W0_qmunu[None, None, None, :, :, :, :, :]
+        write_w0_qmunu_to_h5(tensors_filename, W0_qmunu)
+
+    return W_q
+def resolve_minimax_energy_reference(
+    enk_v: jax.Array,
+    enk_c: jax.Array,
+    *,
+    reference: str | float | int | None = "midgap",
+    reference_fn: Callable[[jax.Array, jax.Array], float] | None = None,
+) -> float:
+    """Resolve the minimax energy reference used to shift band energies.
+
+    This shift is algebraically neutral for χ0/W (only E_c-E_v enters), but
+    exposing it at the top-level minimax pipeline keeps reference conventions
+    explicit and synchronized with sigma paths.
+    """
+    if reference_fn is not None:
+        return float(reference_fn(enk_v, enk_c))
+
+    if reference is None:
+        return 0.0
+    if isinstance(reference, (int, float)):
+        return float(reference)
+
+    ref = str(reference).strip().lower()
+    if ref in ("none", "raw", "zero"):
+        return 0.0
+
+    enk_v_host = np.asarray(jax.device_get(enk_v), dtype=np.float64)
+    enk_c_host = np.asarray(jax.device_get(enk_c), dtype=np.float64)
+    vbm_ref = float(np.max(enk_v_host))
+    cbm_ref = float(np.min(enk_c_host))
+
+    if ref == "midgap":
+        return 0.5 * (vbm_ref + cbm_ref)
+    if ref == "vbm":
+        return vbm_ref
+    if ref == "cbm":
+        return cbm_ref
+    raise ValueError(f"Unknown minimax energy reference '{reference}'. Expected midgap/vbm/cbm/none or float.")
