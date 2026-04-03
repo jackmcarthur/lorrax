@@ -606,6 +606,14 @@ def read_cohsex_input(filename: str) -> dict:
 			"do_screened": getb("do_screened", fallback=True),   # use W instead of V
 			"bispinor": getb("bispinor", fallback=False),        # 2-component spinors
 			"wcoul0_source": get("wcoul0_source", fallback="s_tensor").strip().lower(),
+			# Head overrides: if set, bypass compute_q0_averages and use these
+			# values directly. Units: a.u. (same as FINITE-SIZE CORRECTIONS output).
+			# vhead: bare Coulomb head v(q→0)
+			# whead_0freq: screened Coulomb head W(q→0, ω=0)
+			# whead_imfreq: screened Coulomb head W(q→0, ω=iωp) (PPM only)
+			"vhead": getf("vhead", fallback=None),
+			"whead_0freq": getf("whead_0freq", fallback=None),
+			"whead_imfreq": getf("whead_imfreq", fallback=None),
 			"wfn_file": get("wfn_file", fallback="WFN.h5"),
 			"centroids_file": get("centroids_file", fallback="centroids_frac.txt"),
 			"output_file": get("output_file", fallback="eqp0_noqsym.dat"),
@@ -660,6 +668,9 @@ def read_cohsex_input(filename: str) -> dict:
 			"do_screened": True,
 			"bispinor": False,
 			"wcoul0_source": "s_tensor",
+			"vhead": None,
+			"whead_0freq": None,
+			"whead_imfreq": None,
 			"wfn_file": "WFN.h5",
 			"centroids_file": "centroids_frac.txt",
 			"output_file": "eqp0_noqsym.dat",

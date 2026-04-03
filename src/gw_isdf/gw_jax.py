@@ -259,15 +259,30 @@ def apply_head_correction(
 			print_fn("-" * 72)
 		return V_qmunu_nohead, W_q, {}
 
-	vc0_mean, wcoul0, wcoul0_source = determine_wcoul0(
-		params,
-		input_dir,
-		wfn,
-		sym,
-		meta,
-		print_fn,
-		omega=omega,
-	)
+	# Check for user-provided head overrides.
+	vhead_override = params.get("vhead")
+	omega_val = complex(omega)
+	if abs(omega_val) < 1e-14:
+		whead_override = params.get("whead_0freq")
+	else:
+		whead_override = params.get("whead_imfreq")
+
+	if vhead_override is not None and whead_override is not None:
+		vc0_mean = complex(vhead_override)
+		wcoul0 = complex(whead_override)
+		wcoul0_source = "override"
+		if abs(omega_val) > 1e-14:
+			wcoul0_source = f"override(omega={omega_val} Ry)"
+	else:
+		vc0_mean, wcoul0, wcoul0_source = determine_wcoul0(
+			params,
+			input_dir,
+			wfn,
+			sym,
+			meta,
+			print_fn,
+			omega=omega,
+		)
 
 	if print_summary:
 		print_fn("")
