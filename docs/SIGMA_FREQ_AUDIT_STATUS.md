@@ -48,9 +48,9 @@ Scope: dynamic GN-PPM correlation (`Sigma_cor`) validation across BGW, ISDF SoS,
 
 ### Production minimax pipeline (repo)
 
-- [`src/gw_isdf/gw_jax.py`](/home/jackm/projects/isdf_cohsex/src/gw_isdf/gw_jax.py)
-- [`src/gw_isdf/ppm_sigma.py`](/home/jackm/projects/isdf_cohsex/src/gw_isdf/ppm_sigma.py)
-- [`src/gw_isdf/w_isdf.py`](/home/jackm/projects/isdf_cohsex/src/gw_isdf/w_isdf.py)
+- [`src/gw_isdf/gw_jax.py`](/home/jackm/projects/lorrax/src/gw_isdf/gw_jax.py)
+- [`src/gw_isdf/ppm_sigma.py`](/home/jackm/projects/lorrax/src/gw_isdf/ppm_sigma.py)
+- [`src/gw_isdf/w_isdf.py`](/home/jackm/projects/lorrax/src/gw_isdf/w_isdf.py)
 
 ### ISDF SoS debug / comparison harness (tests_isdf)
 

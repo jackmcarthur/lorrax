@@ -8,7 +8,7 @@ This directory contains scripts for running `cohsex_jax` on NERSC Perlmutter usi
 
 1. Copy the batch script to your run directory:
    ```bash
-   cp $HOME/software/isdf_cohsex/cluster_shifter/run_cohsex.slurm /path/to/your/run_dir/
+   cp $HOME/software/lorrax/cluster_shifter/run_cohsex.slurm /path/to/your/run_dir/
    cd /path/to/your/run_dir/
    ```
 
@@ -32,11 +32,11 @@ This directory contains scripts for running `cohsex_jax` on NERSC Perlmutter usi
    cd /path/to/your/run_dir
    
    # Run cohsex_jax
-   srun -n 4 shifter --module=gpu --env=PYTHONPATH=$HOME/software/isdf_cohsex/src \
+   srun -n 4 shifter --module=gpu --env=PYTHONPATH=$HOME/software/lorrax/src \
        python3 -m gw_isdf.gw_jax -i gw.inp
    
    # Or run any other module (e.g., generate centroids)
-   srun -n 1 shifter --module=gpu --env=PYTHONPATH=$HOME/software/isdf_cohsex/src \
+   srun -n 1 shifter --module=gpu --env=PYTHONPATH=$HOME/software/lorrax/src \
        python3 -m isdf.isdf_init.kmeans_isdf -i gw.inp
    ```
 
@@ -59,7 +59,7 @@ squeue -u $USER
 # Run with explicit --jobid and --image
 srun --jobid=48182279 -n 4 shifter --module=gpu \
     --image=nvcr.io/nvidia/jax:25.04-py3 \
-    --env=PYTHONPATH=$HOME/software/isdf_cohsex/src \
+    --env=PYTHONPATH=$HOME/software/lorrax/src \
     python3 -m gw_isdf.gw_jax -i gw.inp
 ```
 
@@ -73,7 +73,7 @@ For a simpler interactive experience, add this to your `~/.bashrc`:
 isdfrun() {
     local ntasks="${ISDF_NTASKS:-4}"
     srun -n "$ntasks" shifter --module=gpu \
-        --env=PYTHONPATH=$HOME/software/isdf_cohsex/src \
+        --env=PYTHONPATH=$HOME/software/lorrax/src \
         python3 "$@"
 }
 ```

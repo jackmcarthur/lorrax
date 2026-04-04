@@ -140,7 +140,7 @@ misc/quadrature_tests/
 ## Running the Tests
 
 ```bash
-cd isdf_cohsex
+cd lorrax
 source .venv/bin/activate
 
 # GL tests (static polarizability)

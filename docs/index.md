@@ -1,6 +1,6 @@
-## ISDF + GW (COHSEX) Overview
+## LORRAX: Low-scaling Real-space Real-Axis eXcited state package
 
-This repository implements an efficient GW workflow accelerated by Interpolative Separable Density Fitting (ISDF). It reads plane-wave DFT wavefunctions (WFN.h5) and computes quasiparticle corrections in the static COHSEX limit, with a path toward full-frequency GW.
+LORRAX implements an efficient GW workflow accelerated by Interpolative Separable Density Fitting (ISDF). The main GW driver is called GWJAX (`gw_isdf.gw_jax`). It reads plane-wave DFT wavefunctions (WFN.h5) and computes quasiparticle corrections via static COHSEX or GN-PPM (Godby-Needs Generalized Plasmon Pole) frequency dependence.
 
 - **Input**: DFT wavefunctions on a plane-wave grid, symmetry maps, and k-point sampling
 - **Core idea**: Replace dense charge-density products with a compact ISDF basis defined by centroids r_mu

@@ -64,7 +64,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 **Create environment and install dependencies**:
 ```bash
-cd /path/to/isdf_cohsex
+cd /path/to/lorrax
 uv venv
 uv sync --no-install-project --locked
 ```
@@ -227,7 +227,7 @@ print(jax.local_devices()[0].memory_stats())
 ```bash
 salloc -N 1 -C gpu -q interactive -t 01:00:00 -A <account>
 shifter --image=nvcr.io/nvidia/jax:24.04-py3 --module=gpu,nccl bash
-cd /global/cfs/cdirs/<project>/isdf_cohsex
+cd /global/cfs/cdirs/<project>/lorrax
 python -m gw_isdf.gw_jax -i cohsex.in
 ```
 

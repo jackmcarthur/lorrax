@@ -1,142 +1,77 @@
-## Agent Guidelines: Environments, Caches, and Repo Structure
+# LORRAX Agent Guide
 
-### Environment policy (what to keep vs remove)
+**LORRAX** (**Lo**w-scaling **R**eal-space **R**eal-**A**xis e**X**cited state package) —
+JAX-based GW with ISDF compression. The GW driver is called **GWJAX**.
 
-Preferred workflow
-- Keep: devcontainer (and Dockerfile). This is the canonical, reproducible environment.
-- Keep: uv (https://docs.astral.sh/uv/) as the local runner. Prefer `uv run` over activating ad‑hoc virtualenvs.
-- Do NOT commit local virtual environments or build caches.
+You are most likely arriving here from the `lorrax_sandbox` project, where test runs
+and BGW comparisons are organized. This repo contains the source code you may need to
+read or modify. Read this file before touching any source.
 
-Single local env (optional)
-- If you need a local Python environment (outside the devcontainer), use exactly one project-local venv named `.venv` and ignore it in git.
-- Do not keep or create alternative envs like `isdfenv`, `native_env`, or `venv/`.
+## Where things are
 
-Uv caches
-- Let uv use its default global cache location. Do not keep project-local `uv_cache`, `uv-cache`, or `uvcache` directories. These are redundant and may be safely deleted.
+| Path | What | When to read |
+|------|------|-------------|
+| `src/gw_isdf/gw_jax.py` | Main GW driver | Any GW debugging |
+| `src/gw_isdf/ppm_sigma.py` | GN-PPM dynamic self-energy Σ^c(ω) | Frequency-dependent sigma issues |
+| `src/gw_isdf/w_isdf.py` | χ₀ → W screening pipeline | Screening / epsilon issues |
+| `src/gw_isdf/minimax_screening.py` | PPM extraction, minimax window helpers | PPM parameter issues |
+| `src/gw_isdf/gw_init.py` | Input parsing, ISDF fitting, memory model | Input file questions, chunk sizing |
+| `src/gw_isdf/vcoul.py` | Coulomb potential (2D slab, 0D box) | Head corrections, truncation |
+| `src/common/minimax.py` | Minimax quadrature solvers | Quadrature node/weight issues |
+| `src/common/wfnreader.py` | WFN.h5 reader | Wavefunction loading |
+| `src/psp/` | Pseudopotentials, dipole matrix elements | `dipole.h5` or `kin_ion.h5` issues |
+| `src/isdf_init/kmeans_isdf.py` | ISDF centroid generation | Centroid count / quality |
 
-Safe cleanup
-- Preview:
-  - `du -sh isdfenv native_env venv .venv uv_cache uv-cache uvcache 2>/dev/null`
-- Remove (local only):
-  - `rm -rf isdfenv native_env venv .venv uv_cache uv-cache uvcache`
-- If any were accidentally committed:
-  - `git rm -r --cached isdfenv native_env venv .venv uv_cache uv-cache uvcache`
+## Key documentation
 
-Suggested .gitignore entries
-```
-# local envs
-.venv/
-venv/
-isdfenv/
-native_env/
+| Doc | What it covers |
+|-----|---------------|
+| `docs/PHYSICS_COMPREHENSIVE.md` | ISDF theory, GW equations, COHSEX, CTSP formalism |
+| `docs/CODEBASE_COMPREHENSIVE.md` | Module map, data flow, key classes, sharding patterns |
+| `docs/MEMORY_MODEL.md` | Per-stage memory formulas, chunk sizing, bottleneck arrays |
+| `docs/MINIMAX_QUADRATURE.md` | GL/HGL quadrature, error scaling, crossing windows |
+| `docs/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md` | PPM sigma pipeline: phases, windows, evaluation loop |
+| `docs/SIGMA_FREQ_AUDIT_STATUS.md` | Current BGW vs GWJAX comparison status, known offsets |
 
-# uv caches (if ever created locally)
-uv_cache/
-uv-cache/
-uvcache/
-```
-
-### How to run
-- Tests: `uv run -- python -m pytest -q`
-- Example GW/COHSEX run: `uv run python -m gw_isdf.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in`
-- Pseudopotential tools (examples):
-  - Double projectors: `uv run python -m isdf.psp.double_projectors INPUT.upf OUTPUT.upf`
-  - SOC scaling batch: `uv run python -m isdf.psp.scale_soc_batch [--debug] INPUT.upf 0.0 0.5 1.0`
-
-### Repo structure (high-level)
-- `src/` — Python package roots:
-  - `gw_isdf/` — GW/COHSEX drivers (`gw_jax`, `gw_init`, `w_isdf`, window helpers). This is the primary focus for GW-related work.
-- `src/isdf/` — Core ISDF/BSE/IO package code:
-  - `common/` — utilities (`wfnreader`, `epsreader`, `symmetry_maps`, `tagged_arrays`, `gpu_utils`, `gamma_matrices`).
-  - `isdf_init/` — initialization routines (`kmeans_isdf`, `get_charge_density`).
-  - `bse_isdf/` — BSE driver and docs.
-  - `psp/` — pseudopotential tooling (UPF v2.0.1 parsing, doubling, SOC scaling).
-- `examples/` — runnable setups for GW/COHSEX.
-- `tests/` — small regression tests and inputs for QE/SOC checks.
-
-### Notes for agents working on JAX sharding (when relevant)
-- Follow the JAX sharding style guide in the repo rules: no hard-coded mesh sizes; use NamedSharding/PartitionSpec; prefer implicit communication; avoid host-side concatenations.
-- Keep mesh axis names and PartitionSpec conventions consistent across modules.
-
-### Coding standards
-- Match existing formatting; prefer explicit, readable code.
-- Do not reformat unrelated lines; keep indentation style consistent with each file.
-- Use NumPy-style docstrings (for pdoc compatibility). Document shapes, units, and shardings for array parameters.
-
-### Quick FAQ
-- Q: Which envs should exist in the repo?  
-  A: devcontainer; optionally one local `.venv/` that is ignored. Nothing else.
-- Q: Are uv caches in the repo necessary?  
-  A: No; delete project-local uv cache folders and let uv use its global cache.
-- Q: Where do I start for GW debugging?  
-  A: `src/gw_isdf/gw_jax.py` and `src/gw_isdf/w_isdf.py`.
-
-# AGENTS instructions
-
-Use the uv-based environment or the included Dockerfile.
-
-Before committing changes, run:
+## How to run
 
 ```bash
-uv run -- python -m pytest -q
-uv run python -m gw_isdf.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in
+# Tests (~30s, JAX compilation overhead)
+uv run python -m pytest -q
+
+# GW calculation
+uv run python -m gw_isdf.gw_jax -i cohsex.in
+
+# Preprocessing (centroids, dipole, kin+ion)
+uv run python -m isdf_init.kmeans_isdf -i cohsex.in 600
+uv run python -m psp.get_dipole_mtxels -i cohsex.in
+uv run python -m gw_isdf.kin_ion_io -i cohsex.in
 ```
 
-Generated bytecode caches (`__pycache__` directories and `*.pyc` files) must not be committed.
+## Coding standards
 
-## Repository layout
+- Use NumPy-style docstrings. Document shapes, units, and shardings for array parameters.
+- Match existing formatting. Do not reformat unrelated lines.
+- Every function implementing a physics equation should reference what it computes
+  and what BerkeleyGW function it corresponds to.
 
-* `src/` – Python package roots.
-  * `gw_isdf/` – GW/COHSEX calculations (`gw_jax`, `gw_init`, `w_isdf`,
-    window helpers).
-* `src/isdf/` – Core ISDF/BSE/IO library code.
-  * `common/` – utilities such as `wfnreader` (wavefunction I/O), `epsreader`,
-    `symmetry_maps`, `tagged_arrays`, `gpu_utils` and `gamma_matrices`.
-  * `isdf_init/` – initialization routines `kmeans_isdf` and
-    `get_charge_density`.
-  * `bse_isdf/` – BSE driver and documentation.
-* `examples/` – runnable setups for GW/COHSEX.
-* `tests/` – small regression tests.
-* `misc/` – large data files and archived scripts/notebooks.
+### JAX sharding rules
 
-**The most important files for GW calculations are gw_jax.py and w_isdf.py, in the src/gw_isdf directory.**
-**All GW related debugging should start with those two files**
+- Never hard-code mesh shapes. Refer to mesh axes by name (`'x'`, `'y'`).
+- Use `NamedSharding` / `PartitionSpec` for all layouts. No `np.concatenate` or
+  host-side gathers — let XLA handle communication.
+- Structure operations so no array larger than the per-device tile lives in memory.
+  We are memory-constrained.
 
+## Before committing
 
+Run `uv run python -m pytest -q`. Do not commit code that breaks existing tests.
+Do not commit `__pycache__/`, `.venv/`, or `uv_cache/` directories.
 
-##JAX Sharding Style Guide
+## Environment
 
-When parallelizing electronic-structure kernels with JAX, we aim for maximum clarity, minimal temporary buffers, and reliance on JAX’s implicit communication rather than hand-rolled collectives.  Agents should treat each large array as a globally-sharded object whose layout is described with PartitionSpec/NamedSharding and only reshuffled via pjit (or built-in XLA lowering).  All device mesh definitions and axis names must be consistent across the codebase, and no code should assume a fixed number of processes or its arrangement beyond the abstract mesh axes.
+Use `uv` as the package manager. One `.venv/` (gitignored) per machine. No alternative
+envs. Let uv use its global cache — do not create project-local uv cache directories.
 
-In practice, this means:
-
-Never hard-code a specific mesh shape (e.g. “4×4 devices”) into your computational kernels.  Always refer to mesh axes by name and derive local slice sizes from jax.process_count() or mesh.shape.
-
-Avoid any direct use of np.concatenate, vstack, or manual host-side gathers/scatters; instead, express reshaping, padding, or aggregation through pjit or explicit SPMD collectives (lax.psum, all_to_all) that JAX can lower optimally.
-
-Do not write custom block‐matrix loops (e.g. SUMMA) unless there is no alternative: let XLA infer the communication pattern for A @ B on sharded inputs, and only override with explicit collectives when memory constraints demand it.
-
-Load and shard each array in one step: read only your local slice (e.g. with HDF5 slicing), wrap it in a NamedSharding, and then use a noop pjit to reshuffle to any other axis.  Never stage a full array in host memory.
-
-Keep all PartitionSpecs and mesh-axis conventions in a shared module (e.g. berkeleygw.mesh) so that every function uses the same axis names ("bands", "kpoints", "real", etc.).
-
-Document for each kernel:
-
-Which global axes it expects,
-How those axes map to mesh dimensions,
-The per-device local shape,
-Any collectives (psum, all_gather, all_to_all) you’re relying on.
-
-Quick Checklist for New JAX Sharding Code
-
-Mesh-First: Define your device mesh and axis names in a central location.  Always import and reuse these definitions rather than recreating ad hoc meshes.
-
-Partition Spec-Only Reshuffles: Use pjit(in_shardings=…, out_shardings=…) to change layout.  Don’t mix in host-Python slicing or np.concatenate.
-
-Implicit Communication: Write return A @ B on sharded inputs whenever possible.  Only add lax.psum or all_to_all if you’ve measured that implicit lowering blows your memory budget.
-
-Minimal Buffers: *Structure operations so that no array larger than the per-device tile lives in memory, we are in the memory-constrained regime.* If XLA’s lowering creates a too-large buffer, refactor into smaller pjit stages or explicit collectives.
-
-Consistent Axis Names: Use semantic names ("bands", "kpoints", "real", "row", "col") for mesh dims, and reflect them in your PartitionSpec. This makes code self-documenting. The "tagged-array" class that existed prior to JAX implementation contains names of array axes; when upgrading to JAX arrays, retain these names and transposing behavior (which is used because certain operations need to be done over the fastest axis)
-
-By following these standards, future modules will remain readable, robust, and memory-efficient, leveraging JAX’s SPMD compiler to handle the heavy lifting of distributed computation
+On Perlmutter: use Shifter with the NVIDIA JAX container. See
+`cluster_setup/README_CLUSTER.md`.

@@ -62,9 +62,9 @@ sbatch scripts/perlmutter/slurm_shifter_jax.sbatch
 ```
   - Replace `<proj>` and `<subdir>` with your allocation and desired subdirectory.
   - Ensure `/pscratch/sd/<u>/<user>/isdf` exists (create it if needed).
-- If your code currently lives in your home/scratch (e.g., `/global/homes/j/jackm/scratchperl/ISDF_test/isdf_cohsex`), you can test with:
+- If your code currently lives in your home/scratch (e.g., `/global/homes/j/jackm/scratchperl/ISDF_test/lorrax`), you can test with:
 ```bash
-#SBATCH --volume="/global/homes/j/jackm/scratchperl/ISDF_test/isdf_cohsex:/workspace/ISDF" \
+#SBATCH --volume="/global/homes/j/jackm/scratchperl/ISDF_test/lorrax:/workspace/ISDF" \
   --volume="/pscratch/sd/j/jackm/isdf:/workspace/output"
 ```
 
@@ -92,7 +92,7 @@ Use an interactive allocation, then run with either Shifter or your UV venv.
 
 1) Request a GPU node (example: 1 node, 4 GPUs, 30 minutes):
 ```bash
-salloc --nodes 1 --qos interactive -t 00:30:00 --constraint gpu --gpus 4 --image=nvcr.io/nvidia/jax:25.04-py3 --module=gpu,nccl-plugin --account m4598 --volume="/global/homes/j/jackm/scratchperl/ISDF_test/isdf_cohsex:/workspace/ISDF" --volume="/pscratch/sd/j/jackm/isdf:/workspace/output"
+salloc --nodes 1 --qos interactive -t 00:30:00 --constraint gpu --gpus 4 --image=nvcr.io/nvidia/jax:25.04-py3 --module=gpu,nccl-plugin --account m4598 --volume="/global/homes/j/jackm/scratchperl/ISDF_test/lorrax:/workspace/ISDF" --volume="/pscratch/sd/j/jackm/isdf:/workspace/output"
 ```
 (note that pscratch/sd/j/jackm/isdf must already be created)
 2) Inside the allocation, run the code (adjust input path as needed):
@@ -123,7 +123,7 @@ srun -n 4 python3 src/gw_isdf/gw_jax.py -i examples/cohsex_test/cohsex_test.in
 
 ## Custom NVIDIA JAX-based image with uv
 
-You can build a custom image that layers uv + your package on top of NVIDIA's JAX image. A sample `Dockerfile` is provided at the repo root under `ISDF_test/isdf_cohsex/Dockerfile`.
+You can build a custom image that layers uv + your package on top of NVIDIA's JAX image. A sample `Dockerfile` is provided at the repo root under `ISDF_test/lorrax/Dockerfile`.
 
 - This Dockerfile:
   - Uses `nvcr.io/nvidia/jax:25.04-py3` as base (CUDA 12, Python 3.12)
