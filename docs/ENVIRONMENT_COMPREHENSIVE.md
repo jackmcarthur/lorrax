@@ -91,8 +91,8 @@ uv run gw_jax -i cohsex.in
 
 **Installation**:
 ```bash
-conda create -n isdf_gw python=3.12
-conda activate isdf_gw
+conda create -n lorrax python=3.12
+conda activate lorrax
 conda install -c conda-forge jax-finufft cufinufft jax
 pip install h5py scipy matplotlib
 pip install -e .  # Install isdf package

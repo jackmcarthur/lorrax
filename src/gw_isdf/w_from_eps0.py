@@ -6,8 +6,8 @@ Utility to construct W_{mu,nu}(q=0) from a BerkeleyGW eps^{-1} matrix:
     W_{GG'} = eps^{-1}_{GG'} · V_G'   with body-only (G=0 set to 0 and wings zeroed)
     W_{mu,nu} = sum_{GG'} zeta^*_{mu}(G) W_{GG'} zeta_{nu}(G')
 
-This mirrors the mapping and contraction used in the legacy cohsex_isdf path
-but forces the head and wings at q=0 to zero.
+Projects W from the plane-wave (G,G') basis to the ISDF (μ,ν) basis,
+forcing the head and wings at q=0 to zero.
 """
 
 import numpy as np

@@ -326,7 +326,7 @@ def compute_q0_averages(
 		vqc = vq.astype(jnp.complex128)
 		wcoul0 = jnp.mean(vqc / (1.0 - vqc * qSq))
 	else:
-		# epshead-based small-q model consistent with cohsex_isdf
+		# epshead-based small-q model for static head fallback
 		# Calibrate gamma using a tiny q0 in crystal units (e.g., 0.001,0,0)
 		q0_crys = jnp.asarray((0.001, 0.0, 0.0), dtype=jnp.float64)
 		q0_cart = q0_crys @ bvec
