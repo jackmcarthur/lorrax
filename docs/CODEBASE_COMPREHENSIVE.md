@@ -437,11 +437,10 @@ sigma_k.h5
 
 ```toml
 [project.scripts]
-gw_jax = "gw_isdf.gw_jax:main"
 lorrax-gw = "gw_isdf.gw_jax:main"
-kmeans_isdf = "isdf_init.kmeans_isdf:main"
-bse_isdf = "bse_isdf.bse_isdf:main"
-load_psp = "isdf.psp.load_psp:main"
+gw_jax = "gw_isdf.gw_jax:main"
+lorrax-centroids = "isdf_init.kmeans_isdf:main"
+lorrax-bse = "bse_isdf.bse_isdf:main"
 load_upf = "isdf.psp.load_upf:main"
 ```
 
