@@ -5,7 +5,7 @@ JAX-based GW with ISDF compression. The GW driver is called **GWJAX**.
 
 You are most likely arriving here from the `lorrax_sandbox` project, where test runs
 and BGW comparisons are organized. This repo contains the source code you may need to
-read or modify. Read this file before touching any source.
+read or modify. Read this file upon first inspection of the LORRAX source before editing any code.
 
 ## Where things are
 
@@ -36,37 +36,36 @@ read or modify. Read this file before touching any source.
 ## How to run
 
 ```bash
-# Tests (~30s, JAX compilation overhead)
-uv run python -m pytest -q
-
-# GW calculation
-uv run python -m gw_isdf.gw_jax -i cohsex.in
-
 # Preprocessing (centroids, dipole, kin+ion)
 uv run python -m isdf_init.kmeans_isdf -i cohsex.in 600
 uv run python -m psp.get_dipole_mtxels -i cohsex.in
 uv run python -m gw_isdf.kin_ion_io -i cohsex.in
+
+# GW calculation
+uv run python -m gw_isdf.gw_jax -i cohsex.in
+
+
+# Tests (~15s, JAX compilation overhead)
+uv run python -m pytest -q
 ```
 
 ## Coding standards
 
 - Use NumPy-style docstrings. Document shapes, units, and shardings for array parameters.
 - Match existing formatting. Do not reformat unrelated lines.
-- Every function implementing a physics equation should reference what it computes
-  and what BerkeleyGW function it corresponds to.
+- Every function implementing a physics equation should reference what it is computing for human readability standards.
 
 ### JAX sharding rules
 
 - Never hard-code mesh shapes. Refer to mesh axes by name (`'x'`, `'y'`).
-- Use `NamedSharding` / `PartitionSpec` for all layouts. No `np.concatenate` or
-  host-side gathers — let XLA handle communication.
-- Structure operations so no array larger than the per-device tile lives in memory.
-  We are memory-constrained.
+- Use `NamedSharding` / `PartitionSpec` for all layouts. Let XLA handle communication, no `np.concatenate` or
+  host-side gathers.
+- We are very memory constrained and most large arrays can only be stored when tiled over the XY processor grid. Avoid at all costs operations that rematerialize large arrays on subsets of all processors.
 
 ## Before committing
 
-Run `uv run python -m pytest -q`. Do not commit code that breaks existing tests.
-Do not commit `__pycache__/`, `.venv/`, or `uv_cache/` directories.
+Run `uv run python -m pytest -q` after long running branches (5+ small commits); it takes 15 seconds.
+Do not commit `__pycache__/`, `.venv/`, or `uv_cache/`, etc. directories.
 
 ## Environment
 
