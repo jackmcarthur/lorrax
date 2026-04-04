@@ -3,7 +3,7 @@
 All functionality has been moved to io module.
 This file re-exports for backward compatibility.
 """
-from isdf_io import (
+from file_io import (
     write_sigma_to_file,
     write_eqp_table,
     write_restart_state_to_h5,

@@ -11,7 +11,7 @@ This version:
 - Uses much less GPU memory for large k-grids
 
 Usage:
-  python -m gw_isdf.kin_ion_io_chunked -i gw.inp -o kin_ion.h5 --kchunk 16
+  python -m gw.kin_ion_io_chunked -i gw.inp -o kin_ion.h5 --kchunk 16
 """
 
 import os
@@ -26,7 +26,7 @@ import jax
 import jax.numpy as jnp
 import h5py
 
-from isdf_io import WFNReader
+from file_io import WFNReader
 from common import symmetry_maps, Meta
 from common.load_wfns import load_kpoint_fftbox
 import common.timing as timing

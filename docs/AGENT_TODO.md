@@ -10,7 +10,7 @@
 
 **Problem**: Two massive files with too many responsibilities
 - `src/isdf/common/load_wfns.py`: 2796 lines, 39 functions
-- `src/gw_isdf/gw_jax.py`: 2389 lines, 30 functions
+- `src/gw/gw_jax.py`: 2389 lines, 30 functions
 
 #### Suggested: Split `load_wfns.py` into module package
 
@@ -34,7 +34,7 @@ src/isdf/common/wfn_loading/
 #### Suggested: Extract sub-modules from `gw_jax.py`
 
 ```
-src/gw_isdf/
+src/gw/
 ├── gw_jax.py       # Main driver only (~500 lines)
 ├── sigma_compute.py    # get_sigma_static_*, project_potential_to_bands
 └── restart_pipeline.py # restart load/validation/stage resume helpers

@@ -487,18 +487,18 @@ WavefunctionBundle / PlasmonBundle
 
 ### 7.2 Module responsibilities
 
-Implementation location: `src/gw_isdf/freqint/`.
+Implementation location: `src/gw/freqint/`.
 
 | Module | One-sentence role |
 |--------|-------------------|
-| `src/gw_isdf/freqint/types.py` | Defines `PoleBlock`, `DenomType`, `IntegrandTau`, `IntegrationPlan` |
-| `src/gw_isdf/freqint/slicing.py` | Builds PoleBlocks from raw bundles — owns all dynamic slicing and masking |
-| `src/gw_isdf/freqint/planning.py` | Classifies omegas into denom_types per window, builds IntegrationPlan |
-| `src/gw_isdf/freqint/integrands.py` | `build_integrand_tau` — the only function that constructs and contracts propagators |
-| `src/gw_isdf/freqint/engine.py` | `frequency_integration` orchestrator — scan loop, omega batching, accumulation |
-| `src/gw_isdf/freqint/fft_ops.py` | `k_to_R`, `R_to_q` — all reshape/transpose/FFT logic, shard_map switching |
-| `src/gw_isdf/freqint/layouts.py` | All `NamedSharding` / `PartitionSpec` definitions for the integration pipeline |
-| `src/gw_isdf/freqint/api.py` | `chi_from_bundle`, `sigma_from_bundle`, legacy wrappers for `w_isdf_dynamic.py` |
+| `src/gw/freqint/types.py` | Defines `PoleBlock`, `DenomType`, `IntegrandTau`, `IntegrationPlan` |
+| `src/gw/freqint/slicing.py` | Builds PoleBlocks from raw bundles — owns all dynamic slicing and masking |
+| `src/gw/freqint/planning.py` | Classifies omegas into denom_types per window, builds IntegrationPlan |
+| `src/gw/freqint/integrands.py` | `build_integrand_tau` — the only function that constructs and contracts propagators |
+| `src/gw/freqint/engine.py` | `frequency_integration` orchestrator — scan loop, omega batching, accumulation |
+| `src/gw/freqint/fft_ops.py` | `k_to_R`, `R_to_q` — all reshape/transpose/FFT logic, shard_map switching |
+| `src/gw/freqint/layouts.py` | All `NamedSharding` / `PartitionSpec` definitions for the integration pipeline |
+| `src/gw/freqint/api.py` | `chi_from_bundle`, `sigma_from_bundle`, legacy wrappers for `w_isdf_dynamic.py` |
 
 ### 7.3 What NOT to replicate
 
@@ -647,5 +647,5 @@ The rewrite is complete when:
 
 - Kim, Martyna & Ismail-Beigi, PRB 101, 035139 (2020) — CTSP method
 - `docs/MINIMAX_QUADRATURE.md` — Full derivation and implementation design
-- `src/gw_isdf/get_windows.py` — Existing window optimization
-- `src/gw_isdf/hgl_quadrature.py` — Existing HGL quadrature construction
+- `src/gw/get_windows.py` — Existing window optimization
+- `src/gw/hgl_quadrature.py` — Existing HGL quadrature construction

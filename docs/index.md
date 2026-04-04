@@ -1,6 +1,6 @@
 ## LORRAX: Low-scaling Real-space Real-Axis eXcited state package
 
-LORRAX implements an efficient GW workflow accelerated by Interpolative Separable Density Fitting (ISDF). The main GW driver is called GWJAX (`gw_isdf.gw_jax`). It reads plane-wave DFT wavefunctions (WFN.h5) and computes quasiparticle corrections via static COHSEX or GN-PPM (Godby-Needs Generalized Plasmon Pole) frequency dependence.
+LORRAX implements an efficient GW workflow accelerated by Interpolative Separable Density Fitting (ISDF). The main GW driver is called GWJAX (`gw.gw_jax`). It reads plane-wave DFT wavefunctions (WFN.h5) and computes quasiparticle corrections via static COHSEX or GN-PPM (Godby-Needs Generalized Plasmon Pole) frequency dependence.
 
 - **Input**: DFT wavefunctions on a plane-wave grid, symmetry maps, and k-point sampling
 - **Core idea**: Replace dense charge-density products with a compact ISDF basis defined by centroids r_mu
@@ -32,9 +32,9 @@ Then browse the `.md` files in `docs/api/` in your editor or on GitHub.
 
 ### Key modules
 
-- `src/gw_isdf/gw_jax.py`: COHSEX driver (JAX, sharded)
-- `src/gw_isdf/w_isdf.py`: static screening and chi0 helpers
-- `src/isdf/isdf_init/kmeans_isdf.py`: centroid selection
+- `src/gw/gw_jax.py`: COHSEX driver (JAX, sharded)
+- `src/gw/w_isdf.py`: static screening and chi0 helpers
+- `src/isdf/centroid/kmeans_isdf.py`: centroid selection
 - `src/isdf/common/wfnreader.py`: wavefunction I/O
 
 ### Frequency-Integration Docs
@@ -53,6 +53,6 @@ See the root README for full instructions.
 ### Quick runs
 
 - Regression fixture:
-  - `python -m gw_isdf.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in`
+  - `python -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in`
 - Console entry point:
   - `gw_jax -i tests/regression/cohsex_debug/cohsex_test.in`

@@ -5,13 +5,13 @@ Owner: Codex
 Related plan: `docs/FREQ_INTEGRATION_REWRITE_PLAN.md`
 
 ## Scope
-Track implementation progress for the separate frequency-integration pipeline under `src/gw_isdf/freqint/` while keeping legacy dynamic integration available for parity checks.
+Track implementation progress for the separate frequency-integration pipeline under `src/gw/freqint/` while keeping legacy dynamic integration available for parity checks.
 
 ## Completed Stages
 
 ### Stage 1: Package and Data Model
 Delivered:
-- New package: `src/gw_isdf/freqint/`
+- New package: `src/gw/freqint/`
 - Core types in `types.py`:
   - `PoleBlock`, `DenomType`, `WindowExecutionPlan`, `IntegrationPlan`
 - Bundle slicing helpers in `slicing.py`
@@ -28,8 +28,8 @@ Delivered:
 - Preserved negative-frequency handling via post-accumulation conjugation.
 
 Files:
-- `src/gw_isdf/freqint/engine.py`
-- `src/gw_isdf/freqint/integrands.py`
+- `src/gw/freqint/engine.py`
+- `src/gw/freqint/integrands.py`
 
 ### Stage 3: Batched Omega + Tau Scan + Shared Policy
 Delivered:
@@ -44,10 +44,10 @@ Delivered:
 - Set `shared_conservative` as default in `chi_from_bundle(...)` and unified `frequency_integration(...)` API.
 
 Files:
-- `src/gw_isdf/freqint/planning.py`
-- `src/gw_isdf/freqint/integrands.py`
-- `src/gw_isdf/freqint/engine.py`
-- `src/gw_isdf/freqint/api.py`
+- `src/gw/freqint/planning.py`
+- `src/gw/freqint/integrands.py`
+- `src/gw/freqint/engine.py`
+- `src/gw/freqint/api.py`
 
 ## Validation Completed
 - Added parity tests:

@@ -16,7 +16,7 @@ We support the two common BGW HDF5 layouts for dipole:
 2) (npol, ns, nk, mband, nband, flavor=2)    [real/imag split]
 
 Usage:
-  uv run python -m gw_isdf.rewrite_vmtxel_from_dipole \
+  uv run python -m gw.rewrite_vmtxel_from_dipole \
      -i cohsex_test.in --vmtxel vmtxel.h5 --dipole dipole.h5 --out vmtxel_dip.h5
 """
 

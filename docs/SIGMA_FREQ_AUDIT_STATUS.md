@@ -48,9 +48,9 @@ Scope: dynamic GN-PPM correlation (`Sigma_cor`) validation across BGW, ISDF SoS,
 
 ### Production minimax pipeline (repo)
 
-- [`src/gw_isdf/gw_jax.py`](/home/jackm/projects/lorrax/src/gw_isdf/gw_jax.py)
-- [`src/gw_isdf/ppm_sigma.py`](/home/jackm/projects/lorrax/src/gw_isdf/ppm_sigma.py)
-- [`src/gw_isdf/w_isdf.py`](/home/jackm/projects/lorrax/src/gw_isdf/w_isdf.py)
+- [`src/gw/gw_jax.py`](/home/jackm/projects/lorrax/src/gw/gw_jax.py)
+- [`src/gw/ppm_sigma.py`](/home/jackm/projects/lorrax/src/gw/ppm_sigma.py)
+- [`src/gw/w_isdf.py`](/home/jackm/projects/lorrax/src/gw/w_isdf.py)
 
 ### ISDF SoS debug / comparison harness (tests_isdf)
 
@@ -108,7 +108,7 @@ CO (good-agreement baseline):
 
 ```bash
 cd /home/jackm/projects/tests_isdf/jax_co_run40
-uv run python -m gw_isdf.gw_jax -i cohsex_jaxco_m10_10_40b.in
+uv run python -m gw.gw_jax -i cohsex_jaxco_m10_10_40b.in
 uv run python rebuild_cor_vs_bgw_gwjax_m10_10_40b.py
 ```
 
@@ -116,6 +116,6 @@ MoS2 (current mismatch baseline):
 
 ```bash
 cd /home/jackm/projects/tests_isdf/cohsex_prod_run80_compare
-uv run python -m gw_isdf.gw_jax -i cohsex_prod_run80_compare.in
+uv run python -m gw.gw_jax -i cohsex_prod_run80_compare.in
 uv run python plot_gwjax_vs_bgw_sigmaout_compare.py
 ```

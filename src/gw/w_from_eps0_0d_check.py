@@ -54,10 +54,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from gw_isdf.compute_vcoul_0d import compute_vcoul_box
-from gw_isdf.gw_init import read_cohsex_input
-from gw_isdf.vcoul import compute_q0_averages
-from isdf_io import EPSReader, WFNReader, resolve_input_paths
+from gw.compute_vcoul_0d import compute_vcoul_box
+from gw.gw_init import read_cohsex_input
+from gw.vcoul import compute_q0_averages
+from file_io import EPSReader, WFNReader, resolve_input_paths
 
 RYD2EV = 13.6056980659
 

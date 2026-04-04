@@ -47,7 +47,7 @@ except ImportError:
     _sys.path.append(str(_Path(__file__).resolve().parents[2]))  # .../src
     from psp.normalize import normalize_dataclass
     from psp.load_upf import load_upf
-    from isdf_io import WFNReader
+    from file_io import WFNReader
     from common import symmetry_maps
     from common.load_wfns import read_Gvecs_to_devices
     from common import Meta
@@ -120,7 +120,7 @@ def read_cohsex_input(filename: str) -> dict:
     We locate the [cohsex] section, strip any embedded K_POINTS {crystal_b}
     block before feeding to ConfigParser, and fall back to sensible defaults
     if the section is missing. This mirrors the robust parser used in
-    `gw_isdf.gw_jax.read_cohsex_input`.
+    `gw.gw_init.read_cohsex_input`.
     """
     with open(filename, 'r') as f:
         lines = f.readlines()

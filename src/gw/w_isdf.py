@@ -873,7 +873,7 @@ def compute_screening(
             print0(f"    W max abs diff: {W_err_abs:.6e}, rel diff: {W_err_rel:.6e}")
 
     if tensors_filename is not None and os.path.exists(tensors_filename):
-        from isdf_io import write_w0_qmunu_to_h5
+        from file_io import write_w0_qmunu_to_h5
         W0_qmunu = W_q[..., 0, :, 0, :]
         W0_qmunu = W0_qmunu[None, None, None, :, :, :, :, :]
         write_w0_qmunu_to_h5(tensors_filename, W0_qmunu)

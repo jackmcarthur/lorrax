@@ -12,7 +12,7 @@ from jax.scipy import linalg as jsp_linalg
 from jax.scipy.special import erf
 from jax import lax
 
-from isdf_io import WFNReader
+from file_io import WFNReader
 from common import symmetry_maps
 from common import Meta
 from common.load_wfns import get_enk_bandrange
@@ -701,7 +701,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     log = _make_logger(args.verbose)
 
-    from gw_isdf.gw_jax import read_cohsex_input
+    from gw.gw_jax import read_cohsex_input
     params = read_cohsex_input(args.input)
     
     # Override WFN file if provided via CLI

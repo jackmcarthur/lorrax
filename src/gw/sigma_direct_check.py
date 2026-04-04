@@ -65,10 +65,10 @@ import numpy as np
 from common import Meta
 from common import symmetry_maps
 from common.chi_from_dipole import compute_S_omega, read_dipole_h5
-from gw_isdf.gw_init import read_cohsex_input
-from gw_isdf.minimax_screening import extract_gn_ppm_parameters_from_Wc
-from gw_isdf.vcoul import compute_q0_averages
-from isdf_io import EPSReader, WFNReader, resolve_input_paths
+from gw.gw_init import read_cohsex_input
+from gw.minimax_screening import extract_gn_ppm_parameters_from_Wc
+from gw.vcoul import compute_q0_averages
+from file_io import EPSReader, WFNReader, resolve_input_paths
 
 RYD2EV = 13.6056980659
 

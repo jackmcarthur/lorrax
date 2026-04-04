@@ -17,7 +17,7 @@ Inputs
 - WFN.h5 to read reciprocal lattice bvec and cell volume
 
 Usage
-  uv run python -m gw_isdf.plot_whead_vs_model -i cohsex_prod.in \
+  uv run python -m gw.plot_whead_vs_model -i cohsex_prod.in \
       --chi chi0mat.h5 --eps0 eps0mat.h5 --omega-index 0 --out W_head_vs_model.png
 
 Notes

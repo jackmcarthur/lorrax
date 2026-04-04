@@ -12,7 +12,7 @@ constructs the required sharded wavefunctions before calling:
   - write_kin_ion_h5(...)
 
 Usage:
-  python -m gw_isdf.kin_ion_io -i tests/cohsex_debug/cohsex_test.in [-o kin_ion.h5]
+  python -m gw.kin_ion_io -i tests/cohsex_debug/cohsex_test.in [-o kin_ion.h5]
 """
 
 import os
@@ -27,7 +27,7 @@ import numpy as np
 import jax
 from jax.sharding import Mesh
 
-from isdf_io import WFNReader
+from file_io import WFNReader
 from common import symmetry_maps
 from common import Meta
 from common.load_wfns import read_Gvecs_to_devices

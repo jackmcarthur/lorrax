@@ -1,14 +1,14 @@
 """Test BSE matvec with data from COHSEX restart files.
 
 Run with:
-    uv run python -m bse_isdf.test_bse -i cohsex_prod.in
+    uv run python -m bse.test_bse -i cohsex_prod.in
 
 Uses W0_qmunu from isdf_tensors_*.h5 when available, otherwise falls back to V_qmunu.
 Tests on a small subset of bands (4 valence, 4 conduction) for fast iteration.
 
 Profiling:
     # Enable JAX profiler tracing (creates tensorboard-compatible files)
-    ISDF_JAX_PROFILE_DIR=./jax_traces uv run python -m bse_isdf.test_bse -i cohsex_prod.in
+    ISDF_JAX_PROFILE_DIR=./jax_traces uv run python -m bse.test_bse -i cohsex_prod.in
     
     # View with:
     tensorboard --logdir=./jax_traces

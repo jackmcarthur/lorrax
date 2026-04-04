@@ -6,7 +6,7 @@ Test epsilon-v products at q=0 to determine which assembly yields a Hermitian W
 and compare vcoul from eps0mat.h5 to a locally reconstructed 2D-truncated v(G).
 
 Usage:
-  python -m gw_isdf.test_eps_v_products -i cohsex_prod.in --eps0 eps0mat.h5
+  python -m gw.test_eps_v_products -i cohsex_prod.in --eps0 eps0mat.h5
 
 What it prints:
   - Basic shapes and cell volume

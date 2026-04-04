@@ -20,7 +20,7 @@ Available as console commands: `gw_jax`, `lorrax-gw`, `kmeans_isdf`, `bse_isdf`.
 ```bash
 uv sync
 uv run python -m pytest -q                                    # unit tests (~15s)
-uv run python -m gw_isdf.gw_jax -i cohsex.in                  # run GW calculation
+uv run python -m gw.gw_jax -i cohsex.in                  # run GW calculation
 ```
 
 On NERSC Perlmutter: use Shifter with the NVIDIA JAX container. See `cluster_setup/README_CLUSTER.md`.

@@ -7,7 +7,7 @@ import jax.numpy as jnp
 # COHSEX iterations.  This routine will later be called repeatedly as the
 # quasiparticle wavefunctions are updated.
 
-from isdf_io import WFNReader
+from file_io import WFNReader
 from common import symmetry_maps
 
 wfnpath = 'WFN.h5'

@@ -6,7 +6,7 @@ Works with two H5 formats:
      pre-sorted bright poles.
 
 Usage:
-    python -m bse_isdf.pseudopoles_sweep \
+    python -m bse.pseudopoles_sweep \
         --poles bse_pseudopoles.h5 \
         --ref Wc_exact.h5 \
         --omega-ev 0.0 --eta-ev 0.0 \

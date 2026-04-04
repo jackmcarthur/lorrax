@@ -4,7 +4,7 @@ Computes Chebyshev moments of the BSE Hamiltonian using stochastic
 trace estimation, applies Jackson damping, and reconstructs the DOS.
 
 Usage:
-    python -m bse_isdf.bse_kpm -i cohsex.inp --n-val 4 --n-cond 4 --n-moments 200
+    python -m bse.bse_kpm -i cohsex.inp --n-val 4 --n-cond 4 --n-moments 200
 """
 from __future__ import annotations
 

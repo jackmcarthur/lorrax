@@ -76,7 +76,7 @@ source .venv/bin/activate
 
 **Run tools**:
 ```bash
-uv run python -m gw_isdf.gw_jax -i cohsex.in
+uv run python -m gw.gw_jax -i cohsex.in
 # or use console commands directly:
 uv run gw_jax -i cohsex.in
 ```
@@ -191,7 +191,7 @@ devices = jax.devices("cpu")
 ```bash
 # Use only GPU 2 and 3
 export CUDA_VISIBLE_DEVICES=2,3
-python -m gw_isdf.gw_jax -i cohsex.in
+python -m gw.gw_jax -i cohsex.in
 ```
 
 ---
@@ -228,7 +228,7 @@ print(jax.local_devices()[0].memory_stats())
 salloc -N 1 -C gpu -q interactive -t 01:00:00 -A <account>
 shifter --image=nvcr.io/nvidia/jax:24.04-py3 --module=gpu,nccl bash
 cd /global/cfs/cdirs/<project>/lorrax
-python -m gw_isdf.gw_jax -i cohsex.in
+python -m gw.gw_jax -i cohsex.in
 ```
 
 **Batch job** (`submit.sh`):
@@ -243,7 +243,7 @@ python -m gw_isdf.gw_jax -i cohsex.in
 #SBATCH --module=gpu,nccl
 
 export SLURM_CPU_BIND="cores"
-srun shifter python -m gw_isdf.gw_jax -i cohsex.in
+srun shifter python -m gw.gw_jax -i cohsex.in
 ```
 
 Submit:
@@ -274,7 +274,7 @@ export JAX_ENABLE_X64=1
 export JAX_PLATFORMS="cuda,cpu"
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
-python -m gw_isdf.gw_jax -i cohsex.in
+python -m gw.gw_jax -i cohsex.in
 ```
 
 ---
@@ -318,7 +318,7 @@ export JAX_PROCESS_INDEX=0  # Different for each rank
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-task=1
 
-srun python -m gw_isdf.gw_jax -i cohsex.in
+srun python -m gw.gw_jax -i cohsex.in
 ```
 
 **JAX will**:

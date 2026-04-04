@@ -112,7 +112,7 @@ def test_gw_jax_matches_reference():
     else:
         env["PYTHONPATH"] = src_path
 
-    cmd = [sys.executable, "-m", "gw_isdf.gw_jax", "-i", INPUT_FILE.name]
+    cmd = [sys.executable, "-m", "gw.gw_jax", "-i", INPUT_FILE.name]
     result = subprocess.run(
         cmd,
         cwd=CASE_DIR,

@@ -72,7 +72,7 @@ except RuntimeError as exc:
 		_default_devices = jax.devices("cpu")
 	else:
 		raise
-from isdf_io import (
+from file_io import (
     WFNReader, EPSReader,
     write_sigma_to_file, write_eqp1, write_eqp_g0w0, write_sigma_omega_h5,
     write_sigma_freq_debug_table,

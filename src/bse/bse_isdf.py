@@ -1,13 +1,13 @@
 """Deprecated wrapper for the older BSE prototype.
 
-Use bse_isdf.bse_jax for the current JAX implementation.
+Use bse.bse_jax for the current JAX implementation.
 """
 from __future__ import annotations
 
 import warnings
 
 warnings.warn(
-    "bse_isdf.bse_isdf is deprecated; use bse_isdf.bse_jax instead.",
+    "bse.bse_isdf is deprecated; use bse.bse_jax instead.",
     DeprecationWarning,
     stacklevel=2,
 )

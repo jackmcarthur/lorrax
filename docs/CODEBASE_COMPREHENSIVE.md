@@ -21,7 +21,7 @@
 
 ```
 src/
-├── gw_isdf/            # GW/COHSEX calculations
+├── gw/            # GW/COHSEX calculations
 │   ├── gw_jax.py       # Main GW driver (entry point)
 │   ├── gw_init.py      # Input parsing, chunking strategy
 │   ├── w_isdf.py       # Screened interaction W(iω) via CTSP
@@ -34,12 +34,12 @@ src/
 │                            # (useful reference for epsmat→W_μν mapping)
 │
 └── isdf/
-    ├── isdf_init/          # ISDF initialization & k-means clustering
+    ├── centroid/          # ISDF initialization & k-means clustering
     │   ├── kmeans_isdf.py  # K-means centroid selection (entry point)
     │   └── get_charge_density.py  # Charge density computation
     │
-    ├── bse_isdf/           # Bethe-Salpeter equation (BSE)
-    │   ├── bse_isdf.py     # BSE driver (entry point)
+    ├── bse/           # Bethe-Salpeter equation (BSE)
+    │   ├── bse.py     # BSE driver (entry point)
     │   └── bse_kpm.py      # BSE kernel computation
     │
     ├── common/             # Shared utilities & core algorithms
@@ -67,7 +67,7 @@ src/
     ├── postprocess/        # Post-processing utilities
     │   └── rotate_wfn_to_qp.py  # Rotate wavefunctions to QP basis
     │
-    ├── interpolate/        # Hamiltonian interpolation (experimental)
+    ├── bandstructure/        # Hamiltonian interpolation (experimental)
     │   └── htransform.py   # H-matrix interpolation
     │
     └── psp/                # Pseudopotential parsing (UPF, BerkeleyGW)
@@ -80,13 +80,13 @@ src/
 
 | Module | Responsibility |
 |--------|---------------|
-| **isdf_init** | Select interpolation points (centroids) via k-means clustering on charge density |
-| **gw_isdf** | GW/COHSEX self-energy calculations, main computational pipeline |
-| **gw_isdf/archive** | Legacy code. `cohsex_isdf.py` contains the original eps→ISDF W projection pathway: how to map BerkeleyGW's `epsmat.h5`/`eps0mat.h5` dielectric matrices into the ISDF W_μν representation. Useful reference when debugging W projection or the ISDF SoS debug script. |
+| **centroid** | Select interpolation points (centroids) via k-means clustering on charge density |
+| **gw** | GW/COHSEX self-energy calculations, main computational pipeline |
+| **gw/archive** | Legacy code. `cohsex_isdf.py` contains the original eps→ISDF W projection pathway: how to map BerkeleyGW's `epsmat.h5`/`eps0mat.h5` dielectric matrices into the ISDF W_μν representation. Useful reference when debugging W projection or the ISDF SoS debug script. |
 | **common** | Core algorithms: FFT/NUFFT transforms, CCT/ZCT fitting, wavefunction manipulation |
 | **io** | All file I/O: HDF5 wavefunctions, centroids, self-energy output, tagged arrays |
 | **mixing** | Self-consistent GW acceleration (Anderson mixing, DIIS) |
-| **bse_isdf** | Bethe-Salpeter equation for optical spectra (experimental) |
+| **bse** | Bethe-Salpeter equation for optical spectra (experimental) |
 | **postprocess** | Post-GW analysis tools |
 
 ---
@@ -441,10 +441,10 @@ sigma_k.h5
 
 ```toml
 [project.scripts]
-lorrax-gw = "gw_isdf.gw_jax:main"
-gw_jax = "gw_isdf.gw_jax:main"
-lorrax-centroids = "isdf_init.kmeans_isdf:main"
-lorrax-bse = "bse_isdf.bse_isdf:main"
+lorrax-gw = "gw.gw_jax:main"
+gw_jax = "gw.gw_jax:main"
+lorrax-centroids = "centroid.kmeans_isdf:main"
+lorrax-bse = "bse.bse:main"
 load_upf = "isdf.psp.load_upf:main"
 ```
 
@@ -459,12 +459,12 @@ kmeans_isdf --wfn WFN.h5 --n-centroids 100 --output centroids.h5
 ```bash
 gw_jax --input cohsex.in
 # or equivalently:
-python -m gw_isdf.gw_jax --input cohsex.in
+python -m gw.gw_jax --input cohsex.in
 ```
 
 #### BSE Calculation (experimental)
 ```bash
-bse_isdf --input bse.in
+bse --input bse.in
 ```
 
 ---
@@ -550,7 +550,7 @@ def matmul_2d(A, B):
 
 | Task | Primary File | Function/Class |
 |------|-------------|----------------|
-| **Parse input file** | `gw_isdf/gw_init.py` | `read_cohsex_input()` |
+| **Parse input file** | `gw/gw_init.py` | `read_cohsex_input()` |
 | **Load wavefunctions** | `common/load_wfns.py` | `get_sharded_wfns()` |
 | **FFT G→r** | `common/load_wfns.py:74` | `shard_map` FFT |
 | **NUFFT k→R** | `common/load_wfns.py:97` | `nufft_k_to_R_batched()` |
@@ -558,14 +558,14 @@ def matmul_2d(A, B):
 | **CCT matrix** | `common/load_wfns.py:850` | `compute_CCT_from_left_right()` |
 | **Cholesky factorization** | `common/load_wfns.py:1200` | `blocked_cholesky_2d()` |
 | **ZCT matrix** | `common/load_wfns.py:950` | `compute_ZCT_from_left_right()` |
-| **Solve for ζ** | `gw_isdf/gw_jax.py:172` | `solve_zeta_cholesky()` |
+| **Solve for ζ** | `gw/gw_jax.py:172` | `solve_zeta_cholesky()` |
 | **Fit zeta (full pipeline)** | `common/load_wfns.py:1720` | `fit_zeta_chunked_to_h5()` |
-| **Compute V_q** | `gw_isdf/compute_vcoul.py` | `compute_all_V_q_from_zeta_h5()` |
-| **χ⁰ kernel** | `gw_isdf/w_isdf.py:60` | `_get_chi_kernel()` |
-| **Dyson solve for W** | `gw_isdf/w_isdf.py:240` | `get_static_w_q_jax()` |
-| **Self-energy Σ** | `gw_isdf/gw_jax.py:941` | `get_sigma_static_mu_nu_jax()` |
-| **Project to bands** | `gw_isdf/gw_jax.py:1050` | `project_potential_to_bands()` |
-| **Head correction** | `gw_isdf/gw_jax.py:1948` | (inline in main loop) |
+| **Compute V_q** | `gw/compute_vcoul.py` | `compute_all_V_q_from_zeta_h5()` |
+| **χ⁰ kernel** | `gw/w_isdf.py:60` | `_get_chi_kernel()` |
+| **Dyson solve for W** | `gw/w_isdf.py:240` | `get_static_w_q_jax()` |
+| **Self-energy Σ** | `gw/gw_jax.py:941` | `get_sigma_static_mu_nu_jax()` |
+| **Project to bands** | `gw/gw_jax.py:1050` | `project_potential_to_bands()` |
+| **Head correction** | `gw/gw_jax.py:1948` | (inline in main loop) |
 | **Dipole S(ω)** | `common/chi_from_dipole.py` | `compute_S_omega()` |
 | **Write sigma output** | `io/sigma_output.py` | `write_sigma_to_file()` |
 | **Symmetry operations** | `common/symmetry_maps.py` | `SymmetryMaps` class |

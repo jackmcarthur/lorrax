@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import h5py
 from pathlib import Path
 
-from isdf_io import WFNReader
+from file_io import WFNReader
 from common import symmetry_maps, Meta
 from common.load_wfns import load_kpoint_fftbox
 from .get_DFT_mtxels import (

@@ -1132,7 +1132,7 @@ def load_restart_tensors(tensors_filename, mesh_xy, band_slices, print0):
 	dict with keys: V_qmunu, v_q0_noG0_munu, G0_mu_nu, S_qmunu,
 	                psi_full_x, psi_full_y, enk_full
 	"""
-	from isdf_io import load_restart_state_from_h5
+	from file_io import load_restart_state_from_h5
 
 	V_qmunu, S_qmunu, psi_full_x, psi_full_y, enk_full, v_q0_noG0_munu, G0_mu_nu = (
 		load_restart_state_from_h5(tensors_filename, mesh_xy, band_slices=band_slices)
@@ -1237,7 +1237,7 @@ def prepare_isdf_and_wavefunctions(
 		V_qmunu, v_q0_noG0_munu, G0_mu_nu,
 		wf_bundle, sigma_views
 	"""
-	from isdf_io import write_restart_state_to_h5, save_restart_state_per_proc
+	from file_io import write_restart_state_to_h5, save_restart_state_per_proc
 
 	if not cfg.restart:
 		# Fit ISDF vectors and compute V_q

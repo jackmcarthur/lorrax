@@ -2,7 +2,7 @@
 
 **Consolidates**: `formalism.md`, `isdf_context.md`, `isdf_spin_galerkin_derivation.md`, `ZETA_FITTING_ALGORITHM.md`, `cohsex_jax_physics.md`
 
-**Status**: Describes current implementation in `src/isdf/common/load_wfns.py`, `src/gw_isdf/gw_jax.py`, `src/gw_isdf/w_isdf.py`.
+**Status**: Describes current implementation in `src/isdf/common/load_wfns.py`, `src/gw/gw_jax.py`, `src/gw/w_isdf.py`.
 
 ---
 
@@ -48,7 +48,7 @@ This produces centroids concentrated in regions of **high electronic density** (
 Typical ratio: $n_\mu \approx 10 \times n_{\text{bands}}$ for convergence.
 
 **Files**:
-- Generation: `src/isdf/isdf_init/kmeans_isdf.py`
+- Generation: `src/isdf/centroid/kmeans_isdf.py`
 - Storage: `centroids_frac.h5` (fractional coordinates)
 - Loading: `src/isdf/io/centroids.py`
 
@@ -681,7 +681,7 @@ $$H_{QP} = (H_{DFT} - V_{xc}) + V_H + \Sigma_{xc}(\omega).$$
 ### Zeta Fitting
 
 ```bash
-uv run python -m gw_isdf.gw_jax -i cohsex.in --fit-zeta-only
+uv run python -m gw.gw_jax -i cohsex.in --fit-zeta-only
 ```
 
 **Produces**:
@@ -691,7 +691,7 @@ uv run python -m gw_isdf.gw_jax -i cohsex.in --fit-zeta-only
 ### GW Calculation
 
 ```bash
-uv run python -m gw_isdf.gw_jax -i cohsex.in
+uv run python -m gw.gw_jax -i cohsex.in
 ```
 
 **Uses**: Cached `zeta_q.h5`, `V_qmunu.h5`

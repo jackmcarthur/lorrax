@@ -6,7 +6,7 @@ Compare χ_{00}(q, ω) from BGW chi*.h5 (EPSReader) and from the dipole-based
 k·p small-q model on the same axes for the first two frequencies.
 
 Usage
-  uv run python -m gw_isdf.plot_chi0q_compare \
+  uv run python -m gw.plot_chi0q_compare \
       -i cohsex_test.in --chi chi0mat.h5 --dipole dipole.h5 \
       --out chi_compare.png
 

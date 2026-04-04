@@ -21,10 +21,10 @@ dependencies = [
 ]
 
 [project.scripts]
-lorrax-gw = "gw_isdf.gw_jax:main"
-gw_jax = "gw_isdf.gw_jax:main"
-lorrax-centroids = "isdf_init.kmeans_isdf:main"
-lorrax-bse = "bse_isdf.bse_isdf:main"
+lorrax-gw = "gw.gw_jax:main"
+gw_jax = "gw.gw_jax:main"
+lorrax-centroids = "centroid.kmeans_isdf:main"
+lorrax-bse = "bse.bse_isdf:main"
 
 [tool.uv]
 package = true

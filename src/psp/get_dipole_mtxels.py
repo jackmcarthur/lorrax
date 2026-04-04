@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from isdf_io import WFNReader
+from file_io import WFNReader
 from common import symmetry_maps
 from common.load_wfns import read_Gvecs_to_devices
 from common import Meta

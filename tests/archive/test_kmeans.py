@@ -4,7 +4,7 @@ import numpy as np
 import h5py as h5
 from common.gpu_utils import cp
 from common.wfnreader import WFNReader
-from isdf_init.kmeans_isdf import weighted_kmeans_jax
+from centroid.kmeans_isdf import weighted_kmeans_jax
 from misc.test_scripts.kmeans_old import weighted_kmeans_cupy
 
 

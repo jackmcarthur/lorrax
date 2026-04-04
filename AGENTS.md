@@ -11,12 +11,12 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 
 | Path | What | When to read |
 |------|------|-------------|
-| `src/gw_isdf/gw_jax.py` | Main GW driver | Any GW debugging |
-| `src/gw_isdf/ppm_sigma.py` | GN-PPM dynamic self-energy Σ^c(ω) | Frequency-dependent sigma issues |
-| `src/gw_isdf/w_isdf.py` | χ₀ → W screening pipeline | Screening / epsilon issues |
-| `src/gw_isdf/minimax_screening.py` | PPM extraction, minimax window helpers | PPM parameter issues |
-| `src/gw_isdf/gw_init.py` | Input parsing, ISDF fitting, memory model | Input file questions, chunk sizing |
-| `src/gw_isdf/vcoul.py` | Coulomb potential (2D slab, 0D box) | Head corrections, truncation |
+| `src/gw/gw_jax.py` | Main GW driver | Any GW debugging |
+| `src/gw/ppm_sigma.py` | GN-PPM dynamic self-energy Σ^c(ω) | Frequency-dependent sigma issues |
+| `src/gw/w_isdf.py` | χ₀ → W screening pipeline | Screening / epsilon issues |
+| `src/gw/minimax_screening.py` | PPM extraction, minimax window helpers | PPM parameter issues |
+| `src/gw/gw_init.py` | Input parsing, ISDF fitting, memory model | Input file questions, chunk sizing |
+| `src/gw/vcoul.py` | Coulomb potential (2D slab, 0D box) | Head corrections, truncation |
 | `src/common/minimax.py` | Minimax quadrature solvers | Quadrature node/weight issues |
 | `src/common/wfnreader.py` | WFN.h5 reader | Wavefunction loading |
 | `src/psp/` | Pseudopotentials, dipole matrix elements | `dipole.h5` or `kin_ion.h5` issues |
@@ -37,12 +37,12 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 
 ```bash
 # Preprocessing (centroids, dipole, kin+ion)
-uv run python -m isdf_init.kmeans_isdf -i cohsex.in 600
+uv run python -m centroid.kmeans_isdf -i cohsex.in 600
 uv run python -m psp.get_dipole_mtxels -i cohsex.in
-uv run python -m gw_isdf.kin_ion_io -i cohsex.in
+uv run python -m gw.kin_ion_io -i cohsex.in
 
 # GW calculation
-uv run python -m gw_isdf.gw_jax -i cohsex.in
+uv run python -m gw.gw_jax -i cohsex.in
 
 
 # Tests (~15s, JAX compilation overhead)
