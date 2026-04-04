@@ -10,13 +10,167 @@ import jax
 import jax.numpy as jnp
 from jax.scipy import linalg as jsp_linalg
 from jax.scipy.special import erf
-from jax.sharding import Mesh
 from jax import lax
 
 from isdf_io import WFNReader
 from common import symmetry_maps
 from common import Meta
-from common.load_wfns import read_Gvecs_to_devices, get_sharded_wfns, get_enk_bandrange
+from common.load_wfns import get_enk_bandrange
+
+FFT_CHUNK = 25  # bands per FFT batch to limit GPU memory
+
+
+def _ifft_one_kpoint(wfn, sym, k_idx, band_indices, fft_grid):
+    """FFT one k-point to real space, streaming bands in chunks.
+
+    Returns numpy array of shape (nb, nspinor, nr) on CPU.
+    """
+    nb = len(band_indices)
+    nx, ny, nz = fft_grid
+    nr = nx * ny * nz
+    sqrt_nr = np.sqrt(nr)
+    nspinor = 2  # always spinor for CrI3
+
+    # Get rotated G-vectors and coefficients
+    gvecs = sym.get_gvecs_kfull(wfn, k_idx)  # (ngk, 3)
+    gx = gvecs[:, 0] % nx
+    gy = gvecs[:, 1] % ny
+    gz = gvecs[:, 2] % nz
+    cnk_batch = sym.get_cnk_fullzone_batch(wfn, band_indices, k_idx)  # (nb, nspinor, ngk)
+
+    # Bloch phase exp(2πi k·r)
+    kvec = sym.unfolded_kpts[k_idx]
+    fx = np.arange(nx, dtype=np.float64) / nx
+    fy = np.arange(ny, dtype=np.float64) / ny
+    fz = np.arange(nz, dtype=np.float64) / nz
+    phase_3d = np.exp(2j * np.pi * (
+        kvec[0] * fx[:, None, None] +
+        kvec[1] * fy[None, :, None] +
+        kvec[2] * fz[None, None, :]
+    ))  # (nx, ny, nz)
+
+    result = np.zeros((nb, nspinor, nr), dtype=np.complex128)
+    for s in range(0, nb, FFT_CHUNK):
+        e = min(s + FFT_CHUNK, nb)
+        nc = e - s
+        c_grid = np.zeros((nc, nspinor, nx, ny, nz), dtype=np.complex128)
+        for ispin in range(nspinor):
+            c_grid[:, ispin, gx, gy, gz] = cnk_batch[s:e, ispin, :]
+        u = jnp.fft.ifftn(jnp.asarray(c_grid), axes=(2, 3, 4)) * sqrt_nr
+        u = u * jnp.asarray(phase_3d)[None, None, :, :, :]
+        result[s:e] = np.asarray(u.reshape(nc, nspinor, nr))
+        del u, c_grid
+    return result
+
+
+def streaming_galerkin_solve(wfn, sym, band_indices, fft_grid, centroid_indices,
+                             rtol=1e-8, log_fn=None, spatial_chunk=400_000):
+    """Streaming Galerkin projection with CPU storage of psi_r.
+
+    Single pass of FFTs, stores full psi_r on CPU, then streams spatial chunks
+    to GPU for G accumulation. CPU memory ~ nk*nb*nspinor*nr*16 bytes.
+    Returns (S, ctilde) with S = I(rank).
+    """
+    import time
+    if log_fn is None:
+        log_fn = lambda *a, **kw: None
+
+    nk = sym.nk_tot
+    nb = len(band_indices)
+    nx, ny, nz = fft_grid
+    nr = nx * ny * nz
+    nspinor = 2
+    n_total = nspinor * nr  # spinor-folded spatial dimension
+
+    # Compute centroid linear indices
+    ci = np.asarray(centroid_indices)
+    centroid_lin = ci[:, 0] * (ny * nz) + ci[:, 1] * nz + ci[:, 2]
+    n_mu = len(centroid_lin)
+
+    cpu_gb = nk * nb * n_total * 16 / 1e9
+    log_fn(f"  Streaming Galerkin: nk={nk}, nb={nb}, nr={nr}, n_mu={n_mu}")
+    log_fn(f"  CPU storage for psi_r: {cpu_gb:.1f} GB")
+
+    # ── Single FFT pass: extract centroids + store full psi_r on CPU ──
+    t0 = time.time()
+    log_fn(f"  FFT pass: all k-points to real space...")
+    psi_rmu = np.zeros((nk, nb, nspinor, n_mu), dtype=np.complex128)
+    psi_r_cpu = np.zeros((nk, nb, n_total), dtype=np.complex128)
+    for ik in range(nk):
+        tk = time.time()
+        psi_r_k = _ifft_one_kpoint(wfn, sym, ik, band_indices, fft_grid)
+        psi_rmu[ik] = psi_r_k[:, :, centroid_lin]
+        psi_r_cpu[ik] = psi_r_k.reshape(nb, n_total)
+        del psi_r_k
+        if ik == 0 or ik == nk - 1:
+            log_fn(f"    k={ik}/{nk} ({time.time()-tk:.2f}s)")
+    log_fn(f"  FFT pass done in {time.time()-t0:.1f}s")
+
+    # ── SVD on centroid matrix ──
+    psi_mu_flat = jnp.asarray(psi_rmu.reshape(nk * nb, nspinor * n_mu))
+    del psi_rmu
+    log_fn(f"  SVD of ({nk*nb}, {nspinor*n_mu}) centroid matrix...")
+    t1 = time.time()
+    U, s, Vh = jnp.linalg.svd(psi_mu_flat, full_matrices=False)
+    del Vh, psi_mu_flat
+    mask = s > (s.max() * rtol)
+    rank = int(mask.sum())
+    U = U[:, :rank]
+    s = s[:rank]
+    log_fn(f"  SVD rank: {rank}, top σ={float(s[0]):.4f}, bottom σ={float(s[rank-1]):.6f} ({time.time()-t1:.1f}s)")
+
+    coeffs = U * s[None, :]  # (nk*nb, rank)
+
+    # ── G accumulation: stream spatial chunks from CPU ──
+    # Q = diag(1/s) @ U^H @ psi_r  =>  G = Q @ Q^H
+    # Batch all k-points into single matmul per chunk (no Python inner loop).
+    inv_s = np.asarray(1.0 / s)  # (rank,)
+    UH = np.asarray(U.conj().T)  # (rank, nk*nb)
+    del U, s
+    # Pre-upload UH and inv_s to GPU once
+    UH_jax = jnp.asarray(UH)  # (rank, nk*nb)
+    inv_s_jax = jnp.asarray(inv_s)[:, None]  # (rank, 1) for broadcasting
+    del UH
+
+    n_chunks = (n_total + spatial_chunk - 1) // spatial_chunk
+    log_fn(f"  G accumulation: {n_chunks} spatial chunks, rank={rank}...")
+    t2 = time.time()
+
+    G = jnp.zeros((rank, rank), dtype=jnp.complex128)
+    for ic in range(n_chunks):
+        tc = time.time()
+        rs = ic * spatial_chunk
+        re_idx = min(rs + spatial_chunk, n_total)
+        # Gather all k-points into one (nk*nb, chunk) array on CPU, then transfer once
+        psi_chunk = psi_r_cpu[:, :, rs:re_idx].reshape(nk * nb, re_idx - rs)
+        psi_chunk_gpu = jnp.asarray(psi_chunk)  # single H2D transfer
+        del psi_chunk
+        # Single batched matmul: (rank, nk*nb) @ (nk*nb, chunk) = (rank, chunk)
+        Q_chunk = inv_s_jax * (UH_jax @ psi_chunk_gpu)
+        del psi_chunk_gpu
+        G = G + Q_chunk @ Q_chunk.conj().T
+        del Q_chunk
+        jax.block_until_ready(G)
+        log_fn(f"    chunk {ic+1}/{n_chunks} ({time.time()-tc:.1f}s)")
+
+    del UH_jax, inv_s_jax, psi_r_cpu
+    log_fn(f"  G accumulation done in {time.time()-t2:.1f}s")
+
+    # ── Cholesky orthogonalization ──
+    chol = jnp.linalg.cholesky(G)
+    coeffs = coeffs @ chol
+    del G, chol
+
+    S = jnp.eye(rank, dtype=jnp.complex128)
+    ctilde = coeffs.reshape(nk, nb, rank)
+
+    # Orthogonality check at k=0
+    CtC = ctilde[0] @ ctilde[0].conj().T
+    ortho_err = float(jnp.max(jnp.abs(CtC - jnp.eye(nb, dtype=jnp.complex128))))
+    log_fn(f"  ctilde[0] orthogonality error: {ortho_err:.3e}")
+    log_fn(f"  Total Galerkin: {time.time()-t0:.1f}s")
+
+    return S, ctilde
 
 
 def solve_q0_galerkin(
@@ -46,16 +200,17 @@ def solve_q0_galerkin(
     coeffs = U * s
     Q_reduced, *_ = jnp.linalg.lstsq(coeffs, psi_r_state, rcond=rtol)
     G = Q_reduced @ Q_reduced.conj().T
+    G = G + 1e-11 * jnp.eye(G.shape[0], dtype=G.dtype)
     chol = jnp.linalg.cholesky(G)
     Q_reduced = jsp_linalg.solve_triangular(chol, Q_reduced, lower=True)
     coeffs = coeffs @ chol
 
-    # if log_fn is not None:
-    #     residual = jnp.linalg.norm((coeffs @ Q_reduced) - psi_r_state, axis=1)
-    #     log_fn(
-    #         "Galerkin residual min/median/max: "
-    #         f"{float(residual.min()):.3e} / {float(jnp.median(residual)):.3e} / {float(residual.max()):.3e}"
-    #     )
+    if log_fn is not None:
+        residual = jnp.linalg.norm((coeffs @ Q_reduced) - psi_r_state, axis=1)
+        log_fn(
+            "Galerkin residual min/median/max: "
+            f"{float(residual.min()):.3e} / {float(jnp.median(residual)):.3e} / {float(residual.max()):.3e}"
+        )
 
     #Q_full = basis @ Q_reduced # do not uncomment.
     S = Q_reduced @ Q_reduced.conj().T
@@ -63,21 +218,34 @@ def solve_q0_galerkin(
     return  S, ctilde
 
 
-def _f_params_from_energies(enk_nb_nk: jax.Array, top_band_index: int) -> tuple[float, float, float]:
+def _f_params_from_energies(enk_nb_nk: jax.Array, top_band_index: int,
+                            a_band_index: int | None = None) -> tuple[float, float, float]:
+    """Compute f-transform parameters from eigenvalues.
+
+    Parameters
+    ----------
+    top_band_index : int
+        Index of the highest band (sets epsilon0 = max eigenvalue of this band).
+    a_band_index : int or None
+        Index of the band whose bandwidth sets `a = 4 * bandwidth`.
+        If None, defaults to top_band_index (original behavior).
+        Set this to the highest band you want to keep accurately.
+    """
     E_top_k = enk_nb_nk[top_band_index]
-    span_top = jnp.max(E_top_k) - jnp.min(E_top_k)
-    span_total = jnp.max(E_top_k) - jnp.min(enk_nb_nk)
-    a = jnp.maximum(4.0 * (span_top + 1e-14), span_total + 1e-14)
+    shift = float(jnp.max(E_top_k))
+    if a_band_index is None:
+        a_band_index = top_band_index
+    E_a_k = enk_nb_nk[a_band_index]
+    gap = 4.0 * float(jnp.max(E_a_k) - jnp.min(E_a_k) + 1e-14)
     n = 3.0
-    epsilon0 = float(jnp.max(E_top_k))
-    return float(a), float(n), epsilon0
+    return gap, n, shift
 
 
-def _f_eval_piece(x: jax.Array, a: float, n: float) -> jax.Array:
-    a = float(a)
-    n = float(n)
+def fun(a: float, n: float, shift: float, x: jax.Array) -> jax.Array:
+    """Transform function f(x) — matches Fortran fun(). Works in unshifted space."""
+    a = float(a); n = float(n)
     erf_half = erf(n * 0.5)
-    y = x
+    y = x - shift
     cond_left = y <= -a
     cond_mid = jnp.logical_and(y < 0, ~cond_left)
     f_left = y + 0.5 * a
@@ -87,14 +255,15 @@ def _f_eval_piece(x: jax.Array, a: float, n: float) -> jax.Array:
     f_mid = term1 + term2
     f = jnp.where(cond_left, f_left, 0.0)
     f = jnp.where(cond_mid, f_mid, f)
-    return jnp.where(y >= 0, 0.0, f)
+    f = jnp.where(y >= 0, 0.0, f)
+    return jnp.where(f > 0, 0.0, f)
 
 
-def _f_eval_piece_derivative(x: jax.Array, a: float, n: float) -> jax.Array:
-    a = float(a)
-    n = float(n)
+def dfun(a: float, n: float, shift: float, x: jax.Array) -> jax.Array:
+    """Derivative of transform function — matches Fortran dfun()."""
+    a = float(a); n = float(n)
     erf_half = erf(n * 0.5)
-    y = x
+    y = x - shift
     cond_left = y <= -a
     cond_mid = jnp.logical_and(y < 0, ~cond_left)
     df = jnp.zeros_like(y)
@@ -104,27 +273,30 @@ def _f_eval_piece_derivative(x: jax.Array, a: float, n: float) -> jax.Array:
     return jnp.where(y >= 0, 0.0, df)
 
 
-def f_transform_eigs(enk_nb_nk: jax.Array) -> tuple[jax.Array, float, float, float]:
+def f_transform_eigs(enk_nb_nk: jax.Array,
+                     a_band_index: int | None = None) -> tuple[jax.Array, float, float, float]:
+    """Apply f-transform to eigenvalues. Returns (f_eps, a, n, shift)."""
     nb, _ = enk_nb_nk.shape
-    a, n, epsilon0 = _f_params_from_energies(enk_nb_nk, top_band_index=nb - 1)
-    x = enk_nb_nk - epsilon0
-    f_eps = _f_eval_piece(x, a=a, n=n)
-    f_eps = jnp.where(f_eps > 0, 0.0, f_eps)
-    return f_eps, a, n, epsilon0
+    a, n, shift = _f_params_from_energies(enk_nb_nk, top_band_index=nb - 1,
+                                          a_band_index=a_band_index)
+    f_eps = fun(a, n, shift, enk_nb_nk)
+    return f_eps, a, n, shift
 
 
-def f_inv_newton(y: jax.Array, a: float, n: float, max_iter: int = 64) -> jax.Array:
-    f_left = _f_eval_piece(jnp.asarray(-a, dtype=jnp.float64), a, n)
-    y_target = jnp.clip(y, f_left, 0.0)
+def newton_inv(a: float, n: float, shift: float, y: jax.Array,
+               max_iter: int = 50) -> jax.Array:
+    """Newton inversion — matches Fortran newton_inv(). Works in unshifted space."""
+    dxmax = a / 2.0
+    x0 = y + shift  # Fortran initial guess: x = y + s
 
     def body_fun(_, x_curr):
-        res = _f_eval_piece(x_curr, a, n) - y_target
-        df = _f_eval_piece_derivative(x_curr, a, n)
-        step = res / jnp.where(jnp.abs(df) > 1e-12, df, 1.0)
-        x_next = jnp.clip(x_curr - step, -a, 0.0)
-        return x_next
+        res = fun(a, n, shift, x_curr) - y
+        df_val = dfun(a, n, shift, x_curr)
+        dx = jnp.where(jnp.abs(df_val) > 1e-14, -res / df_val, 0.0)
+        dx = jnp.clip(dx, -dxmax, dxmax)
+        return x_curr + dx
 
-    return lax.fori_loop(0, max_iter, body_fun, y_target)
+    return lax.fori_loop(0, max_iter, body_fun, x0)
 
 
 def load_wfns_and_enk_for_sigma(wfn, sym, nval: int, ncond: int, nband: int):
@@ -177,13 +349,6 @@ def generate_kpath_from_qe_segments(params: dict, wfn) -> tuple[jnp.ndarray, np.
         node_indices.append(len(pts_crys) - 1)
     kpoints = np.stack(pts_crys, axis=0)
     return jnp.asarray(kpoints, dtype=jnp.float64), np.asarray(node_indices, dtype=int), labels
-
-
-def _build_trivial_mesh() -> Mesh:
-    devices = np.asarray(jax.devices())
-    if devices.size == 0:
-        raise RuntimeError("No JAX devices available")
-    return Mesh(devices.reshape(1, devices.size), ['x', 'y'])
 
 
 def _load_centroids(centroids_path: str, fft_grid: tuple[int, int, int]) -> np.ndarray:
@@ -318,15 +483,14 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             except Exception as exc:
                 log_fn(f"EQP override skipped for {os.path.basename(eqp_path)}: {exc}")
 
-    mesh = _build_trivial_mesh()
-    bandrange = (int(nsigmarange[0]), int(nsigmarange[1]))
-    global_psiG, nb_actual = read_Gvecs_to_devices(wfn, sym, bandrange, meta, params.get("bispinor", False), mesh)
-    psi_rtot, psi_rmu, psi_rmuT = get_sharded_wfns(global_psiG, sym, meta, centroid_indices, nb_actual, False, mesh)
-    jax.block_until_ready((psi_rtot, psi_rmu))
-    del global_psiG, psi_rmuT
-
-    log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, nb={psi_rmu.shape[1]}, mu={psi_rmu.shape[-1]}")
-    return wfn, sym, meta, psi_rtot, psi_rmu, enk_sigma
+    band_indices = np.arange(int(nsigmarange[0]), int(nsigmarange[1]))
+    fft_grid = tuple(int(x) for x in wfn.fft_grid)
+    S, ctilde = streaming_galerkin_solve(
+        wfn, sym, band_indices, fft_grid, centroid_indices,
+        rtol=1e-8, log_fn=log_fn,
+    )
+    log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, nb={len(band_indices)}, rank={ctilde.shape[2]}")
+    return wfn, sym, meta, S, ctilde, enk_sigma
 
 
 def initialize_kpath(wfn, params):
@@ -343,14 +507,15 @@ def initialize_kpath(wfn, params):
     return kpath_frac, x_path, node_indices, node_labels, gamma_positions
 
 
-def h_transform(meta, psi_rtot, psi_rmu, enk_sigma, wfn, kpath_data, log_fn):
-    S, ctilde = solve_q0_galerkin(psi_rmu, psi_rtot, rtol=1e-8, log_fn=log_fn)
+def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn,
+                a_band_index: int | None = None):
     nk = int(meta.nkx * meta.nky * meta.nkz)
     states = ctilde.shape[1]
     rank = ctilde.shape[2]
 
-    f_eps, a_f, n_f, epsilon0 = f_transform_eigs(enk_sigma)
-    log_fn(f"Transform parameters: a={a_f:.6f}, n={n_f:.2f}, eps0={epsilon0:.6f}")
+    f_eps, a_f, n_f, shift = f_transform_eigs(enk_sigma, a_band_index=a_band_index)
+    log_fn(f"Transform parameters: a={a_f:.6f}, n={n_f:.2f}, shift={shift:.6f}"
+           + (f", a from band {a_band_index}" if a_band_index is not None else ""))
 
     coeffs = ctilde.reshape(nk, states, rank)
     f_eps_ki = jnp.where(f_eps.T > 0, 0.0, f_eps.T)
@@ -365,6 +530,16 @@ def h_transform(meta, psi_rtot, psi_rmu, enk_sigma, wfn, kpath_data, log_fn):
             float(jnp.max(jnp.abs(jnp.imag(fH_k)))),
         )
     )
+
+    # Diagnostic: fH eigenvalues vs expected f(eps) at Γ (k=0)
+    eigs_fHk0 = jnp.sort(jnp.linalg.eigvalsh(fH_k[0]))
+    f_expected_0 = jnp.sort(f_eps[:, 0])
+    fH_eig_err = float(jnp.max(jnp.abs(eigs_fHk0[:states] - f_expected_0)))
+    log_fn(f"fH(k=0) eigenvalue error vs f(eps): {fH_eig_err:.6f} Ry = {fH_eig_err * 13.6057:.3f} eV")
+    log_fn(f"  f(eps) first 5: {np.array(f_expected_0[:5])}")
+    log_fn(f"  fH eig first 5: {np.array(eigs_fHk0[:5])}")
+    log_fn(f"  f(eps) last 5:  {np.array(f_expected_0[-5:])}")
+    log_fn(f"  fH eig last 5:  {np.array(eigs_fHk0[states-5:states])}")
 
     S_sym = (S + S.conj().T) * 0.5
     S_sym += 1e-10 * jnp.mean(jnp.real(jnp.diag(S_sym))) * jnp.eye(rank, dtype=S_sym.dtype)
@@ -419,7 +594,7 @@ def h_transform(meta, psi_rtot, psi_rmu, enk_sigma, wfn, kpath_data, log_fn):
             lambda_q_list.append(batch_eigs)
             jax.block_until_ready(batch_eigs)  # Free memory before next batch
         lambda_q = jnp.concatenate(lambda_q_list, axis=0)
-        energies_on_path = jax.vmap(lambda row: f_inv_newton(row.real, a=a_f, n=n_f) + epsilon0)(lambda_q)
+        energies_on_path = jax.vmap(lambda row: newton_inv(a_f, n_f, shift, row.real))(lambda_q)
         energies_sorted = np.asarray(jnp.sort(energies_on_path, axis=1)[:, :nb_keep])
         # Determine Fermi energy as the maximum along path of the wfn.nelec-th band (1-based -> 0-based)
         fermi_band_idx = int(wfn.nelec) - 1
@@ -520,6 +695,9 @@ def main(argv=None):
     parser.add_argument("--plot", action="store_true", help="Show interpolated band plot")
     parser.add_argument("--eqp-file", default=None, help="Path to EQP/sigX file to override DFT band energies")
     parser.add_argument("--verbose", action="store_true", help="Print diagnostic details")
+    parser.add_argument("--a-band", type=int, default=None,
+                        help="Band index (0-based) whose bandwidth sets 'a'. "
+                             "E.g. nval+ncond_keep-1. Default: top band.")
     args = parser.parse_args(argv)
     log = _make_logger(args.verbose)
 
@@ -531,9 +709,10 @@ def main(argv=None):
         params["wfn_file"] = args.wfn_file
         log(f"Using WFN file from CLI: {args.wfn_file}")
 
-    wfn, sym, meta, psi_rtot, psi_rmu, enk_sigma = initialize_wfns(args.input, params, log, args.eqp_file)
+    wfn, sym, meta, S, ctilde, enk_sigma = initialize_wfns(args.input, params, log, args.eqp_file)
     kpath_data = initialize_kpath(wfn, params)
-    result = h_transform(meta, psi_rtot, psi_rmu, enk_sigma, wfn, kpath_data, log)
+    result = h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log,
+                         a_band_index=args.a_band)
 
     if args.plot:
         plot_bands(result)

@@ -1,8 +1,10 @@
 import gc
 import math
+import os
 import queue
 import threading
 import time
+from types import SimpleNamespace
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -12,6 +14,7 @@ from functools import partial
 
 from . import Meta
 from . import timing
+from common import jax_profile
 from .cholesky_2d import (
     cholesky_2d_batched,
     dense_to_tiles,
@@ -842,43 +845,42 @@ def solve_zeta_from_L_q(
 ) -> jax.Array:
     """
     Solve for zeta_q given pre-computed Cholesky factor L_q.
-    
+
     Uses q-chunked all-gather strategy: gather B_q L matrices at a time,
     then solve all B_q systems in parallel using vmap.
-    
+
     Memory trade-off:
     - q_chunk_size=1: Minimum memory (one L replicated at a time)
     - q_chunk_size=nq: Maximum parallelism (all L replicated)
-    
+
     Args:
         L_q: (nq, n_rmu, n_rmu) Cholesky factor, sharded P(None, 'x', 'y')
         Z_q: (nq, n_rmu, n_zchunk) ZCT matrix, sharded P(None, 'x', 'y')
+             or P(None, None, ('x','y')) if caller already resharded
         mesh_xy: 2D device mesh
         q_chunk_size: Number of q-points to solve simultaneously (default 1)
-    
+
     Returns:
         zeta_q: (nq, n_rmu, n_zchunk) solution, sharded P(None, None, ('x','y'))
     """
     nq, n_rmu, _ = L_q.shape
     _, _, n_zchunk = Z_q.shape
-    
+
     # Compute padding needed for even sharding across all devices
     total_devices = mesh_xy.devices.size
     n_zchunk_padded = ((n_zchunk + total_devices - 1) // total_devices) * total_devices
     needs_padding = n_zchunk_padded != n_zchunk
-    
+
+    z_col_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
+    L_rep_shard = NamedSharding(mesh_xy, P(None, None))
+    L_batch_rep_shard = NamedSharding(mesh_xy, P(None, None, None))  # (B_q, n_rmu, n_rmu)
+    q_batch = min(q_chunk_size, nq)
+    nq_padded = ((nq + q_batch - 1) // q_batch) * q_batch
+
     # Cache key for solve function (includes q_chunk_size and padded size)
     cache_key = ('solve_from_L', id(mesh_xy), nq, n_rmu, n_zchunk_padded, q_chunk_size)
-    
+
     if cache_key not in _solve_cache:
-        # Reshard Z for column-parallel solve
-        z_col_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
-        L_rep_shard = NamedSharding(mesh_xy, P(None, None))
-        L_batch_rep_shard = NamedSharding(mesh_xy, P(None, None, None))  # (B_q, n_rmu, n_rmu)
-        nq_c = nq
-        q_chunk_c = min(q_chunk_size, nq)
-        n_zchunk_c = n_zchunk_padded  # Use padded size
-        
         @partial(shard_map, mesh=mesh_xy,
                  in_specs=(P(None, None), P(None, ('x', 'y'))),
                  out_specs=P(None, ('x', 'y')))
@@ -886,7 +888,7 @@ def solve_zeta_from_L_q(
             y = jax.scipy.linalg.solve_triangular(L, Z_cols, lower=True)
             zeta = jax.scipy.linalg.solve_triangular(L.conj().T, y, lower=False)
             return zeta
-        
+
         # Vectorized solve for a batch of q-points
         @partial(shard_map, mesh=mesh_xy,
                  in_specs=(P(None, None, None), P(None, None, ('x', 'y'))),
@@ -897,69 +899,81 @@ def solve_zeta_from_L_q(
                 y = jax.scipy.linalg.solve_triangular(L, Z, lower=True)
                 return jax.scipy.linalg.solve_triangular(L.conj().T, y, lower=False)
             return jax.vmap(solve_single)(L_batch, Z_batch)
-        
-        @partial(jax.jit, donate_argnums=(1,))
-        def _solve_all_q(L_q_sharded: jax.Array, Z_col_sharded: jax.Array) -> jax.Array:
-            # Reshard Z for column-parallel solve
-            Z_col = jax.lax.with_sharding_constraint(Z_col_sharded, z_col_shard)
-            
-            # Fast path: solve all q-points in a single batched call, avoiding
-            # zeta_init + dynamic_update buffers.
-            if q_chunk_c >= nq_c:
-                L_full_rep = jax.lax.with_sharding_constraint(L_q_sharded, L_batch_rep_shard)
-                return _sharded_cho_solve_batch(L_full_rep, Z_col)
 
-            if q_chunk_c == 1:
-                # Original q-by-q loop (minimum memory)
-                def body(q, zeta_all):
-                    L_single = L_q_sharded[q]
-                    L_rep = jax.lax.with_sharding_constraint(L_single, L_rep_shard)
-                    Z_single = Z_col[q]
-                    zeta_q = _sharded_cho_solve(L_rep, Z_single)
-                    return zeta_all.at[q].set(zeta_q)
-                
-                zeta_init = jnp.zeros_like(Z_col)
-                return jax.lax.fori_loop(0, nq_c, body, zeta_init)
-            else:
-                # Q-chunked: gather B_q L matrices, solve in batch
-                n_q_chunks = (nq_c + q_chunk_c - 1) // q_chunk_c
-                
-                def chunk_body(chunk_idx, zeta_all):
-                    q_start = chunk_idx * q_chunk_c
-                    q_end = jnp.minimum(q_start + q_chunk_c, nq_c)
-                    actual_chunk = q_end - q_start
-                    
-                    # Gather chunk of L matrices (replicate on all devices)
-                    L_chunk = jax.lax.dynamic_slice(
-                        L_q_sharded, (q_start, 0, 0), (q_chunk_c, n_rmu, n_rmu)
-                    )
-                    L_chunk_rep = jax.lax.with_sharding_constraint(L_chunk, L_batch_rep_shard)
-                    
-                    # Get corresponding Z chunk
-                    Z_chunk = jax.lax.dynamic_slice(
-                        Z_col, (q_start, 0, 0), (q_chunk_c, n_rmu, Z_col.shape[2])
-                    )
-                    
-                    # Batched solve
-                    zeta_chunk = _sharded_cho_solve_batch(L_chunk_rep, Z_chunk)
-                    
-                    # Store results
-                    return jax.lax.dynamic_update_slice(zeta_all, zeta_chunk, (q_start, 0, 0))
-                
-                zeta_init = jnp.zeros_like(Z_col)
-                return jax.lax.fori_loop(0, n_q_chunks, chunk_body, zeta_init)
-        
-        _solve_cache[cache_key] = _solve_all_q
-    
+        @partial(jax.jit, donate_argnums=(2,))
+        def _solve_batch_and_update(L_batch_sharded, Z_batch_col, zeta_acc, q_start):
+            """Solve one q-batch and update zeta_acc via dynamic_update_slice.
+            donate_argnums=(2,) donates zeta_acc so XLA reuses its buffer."""
+            L_rep = jax.lax.with_sharding_constraint(L_batch_sharded, L_batch_rep_shard)
+            batch_result = _sharded_cho_solve_batch(L_rep, Z_batch_col)
+            return jax.lax.dynamic_update_slice(zeta_acc, batch_result, (q_start, 0, 0))
+
+        @jax.jit
+        def _solve_all_at_once(L_q_sharded, Z_col):
+            """Fast path: solve all q-points in a single batched call."""
+            L_full_rep = jax.lax.with_sharding_constraint(L_q_sharded, L_batch_rep_shard)
+            return _sharded_cho_solve_batch(L_full_rep, Z_col)
+
+        _solve_cache[cache_key] = SimpleNamespace(
+            solve_batch_and_update=_solve_batch_and_update,
+            solve_all_at_once=_solve_all_at_once,
+            sharded_cho_solve=_sharded_cho_solve,
+            sharded_cho_solve_batch=_sharded_cho_solve_batch,
+        )
+
+    helpers = _solve_cache[cache_key]
+
     # Pad Z if needed (zeros on RHS → zero solution for those columns, harmless)
     if needs_padding:
         pad_width = n_zchunk_padded - n_zchunk
-        Z_q_padded = jnp.pad(Z_q, ((0, 0), (0, 0), (0, pad_width)), mode='constant')
-        result_padded = _solve_cache[cache_key](L_q, Z_q_padded)
-        # Trim back to original size
-        return result_padded[:, :, :n_zchunk]
+        Z_q = jnp.pad(Z_q, ((0, 0), (0, 0), (0, pad_width)), mode='constant')
+
+    # Reshard Z once: P(None, 'x', 'y') → P(None, None, ('x','y'))
+    # If the caller already resharded Z_q (to avoid keeping 3× m_zcol alive
+    # across the solve loop), _reshard_z would redundantly copy the buffer.
+    # Check sharding and skip if already correct.
+    _target_sharding = z_col_shard
+    _already_resharded = (hasattr(Z_q, 'sharding') and
+                          getattr(Z_q.sharding, 'spec', None) == _target_sharding.spec)
+    if _already_resharded:
+        Z_col = Z_q
+        del Z_q
     else:
-        return _solve_cache[cache_key](L_q, Z_q)
+        @jax.jit
+        def _reshard_z(z):
+            return jax.lax.with_sharding_constraint(z, _target_sharding)
+        Z_col = _reshard_z(Z_q)
+        Z_col.block_until_ready()
+        del Z_q
+
+    # Fast path: solve all q-points at once
+    if q_batch >= nq:
+        result = helpers.solve_all_at_once(L_q, Z_col)
+        del Z_col
+        if needs_padding:
+            return result[:, :, :n_zchunk]
+        return result
+
+    # Allocate output buffer
+    zeta = jnp.zeros_like(Z_col)
+
+    # Python loop with async dispatch — each call returns immediately.
+    # The donation chain (output N = input N+1) ensures sequential GPU execution
+    # without explicit block_until_ready. Python dispatch overhead: ~0.3ms × 8 = 2.4ms.
+    # NOTE: scan(unroll=8) was attempted but OOMs — XLA pipelines adjacent unrolled
+    # iterations, keeping 2× preallocated-temp alive (18.9 GB). scan without unroll
+    # triggers SPMD replication of the sharded accumulator (88 GB OOM). fori_loop
+    # has the same WhileOp issue. The Python loop is the only approach that gives
+    # constant DUS offsets AND sequential memory reuse.
+    for q0 in range(0, nq_padded, q_batch):
+        q1 = q0 + q_batch
+        zeta = helpers.solve_batch_and_update(L_q[q0:q1], Z_col[q0:q1], zeta, q0)
+
+    del Z_col
+
+    if needs_padding:
+        return zeta[:, :, :n_zchunk]
+    return zeta
 
 
 def fit_zeta_chunked_to_h5(
@@ -977,6 +991,8 @@ def fit_zeta_chunked_to_h5(
     band_range_left: tuple[int, int] | None = None,
     band_range_right: tuple[int, int] | None = None,
     isdf_pair_mode: str = "spin_traced",
+    k_chunk_size: int = 0,
+    q_gather_size: int = 0,
 ):
     """
     Full zeta fitting pipeline with r-chunk loop and HDF5 output.
@@ -1204,17 +1220,21 @@ def fit_zeta_chunked_to_h5(
                 item = write_queue.get()
                 if item is None:  # Poison pill signals shutdown
                     break
-                zeta_data, r_start, r_end, chunk_id = item
-                # zeta_data: (nq, n_rmu, actual_n_rchunk)
+                # Support both full-q and partial-q (q-chunked gather) formats
+                if len(item) == 6:
+                    zeta_data, r_start, r_end, chunk_id, q_start, q_end = item
+                else:
+                    zeta_data, r_start, r_end, chunk_id = item
+                    q_start, q_end = 0, zeta_data.shape[0]
+                # zeta_data: (n_q_slice, n_rmu, actual_n_rchunk)
                 # R-chunks are contiguous in r-space, so we can write directly!
-                
+
                 with h5py.File(output_file, 'a') as f:
-                    for q_flat in range(nq):
+                    for i, q_flat in enumerate(range(q_start, q_end)):
                         qx = q_flat // (nqy * nqz)
                         qy = (q_flat % (nqy * nqz)) // nqz
                         qz = q_flat % nqz
-                        # Single contiguous write per q-point!
-                        f['zeta_q'][qx, qy, qz, :, r_start:r_end] = zeta_data[q_flat]
+                        f['zeta_q'][qx, qy, qz, :, r_start:r_end] = zeta_data[i]
                 write_queue.task_done()
         except Exception as e:
             write_error[0] = e
@@ -1248,7 +1268,8 @@ def fit_zeta_chunked_to_h5(
                     psi_chunk_Y = get_psi_rchunk(
                         wfn, sym, meta, mesh_xy, band_range_full,
                         r_start, r_end, bispinor,
-                        band_chunk_size=band_chunk_size
+                        band_chunk_size=band_chunk_size,
+                        k_chunk_size=k_chunk_size,
                     )
                 psi_chunk_Y.block_until_ready()
                 
@@ -1278,7 +1299,8 @@ def fit_zeta_chunked_to_h5(
                         psi_r_rmuT_X, psi_r_chunk_Y, mesh_xy
                     )
                 P_l_k_mux.block_until_ready()
-                P_r_k_mux.block_until_ready()
+                # No block_until_ready on P_r — ZCT will consume it asynchronously.
+                # P_l's block_until_ready (above) is needed for del psi_l_chunk_Y.
             t_pair_total += time.perf_counter() - t0
             
             # Free psi_chunk arrays - we have P_k now
@@ -1319,53 +1341,61 @@ def fit_zeta_chunked_to_h5(
                     Z_q = compute_ZCT_from_left_right_zchunk_spin_matrix(
                         P_l_k_mux, P_r_k_mux, kgrid, mesh_xy
                     )
-                Z_q.block_until_ready()
-                
-                # Free P_k arrays - we have Z_q now
+                # No block_until_ready on Z_q — reshape consumes it asynchronously.
+                # P_l/P_r become unreferenced and will be freed by XLA when Z_q
+                # computation completes (they're consumed by the ZCT JIT).
                 del P_l_k_mux, P_r_k_mux
-                
+
                 Z_q_flat = Z_q.reshape(nq, n_rmu, actual_n_rchunk)
+                del Z_q  # free 3D ref; reshape may share buffer
                 Z_q_flat = jax.lax.with_sharding_constraint(Z_q_flat, flat_shard)
-                Z_q_flat.block_until_ready()
-                
-                # Free Z_q (3D) - we have Z_q_flat now
-                del Z_q
+                # No block_until_ready — reshard will consume Z_q_flat asynchronously.
             t_zct_total += time.perf_counter() - t0
             
-            # 6d. Solve zeta_q = L^{-H}(L^{-1} Z_q)
+            # 6d. Reshard Z_q_flat → Z_col, then free Z_q_flat BEFORE the solve
+            # q-loop.  If we pass Z_q_flat into solve_zeta_from_L_q, the caller's
+            # reference survives during the entire solve loop, keeping 3× m_zcol
+            # alive (Z_q_flat + Z_col + zeta) instead of 2× (Z_col + zeta).
+            z_col_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
+            Z_col = jax.lax.with_sharding_constraint(Z_q_flat, z_col_shard)
+            Z_col.block_until_ready()
+            del Z_q_flat
             t0 = time.perf_counter()
-            with timing.section("zeta_fit.chunk.solve"):
-                zeta_chunk = solve_zeta_from_L_q(L_q, Z_q_flat, mesh_xy, q_chunk_size)
-                zeta_chunk.block_until_ready()
-
-                # Free Z_q_flat - we have zeta now
-                del Z_q_flat
+            with timing.section("zeta_fit.chunk.solve"), jax_profile.step_annotation("chunk_solve", step_num=chunk_idx):
+                zeta_chunk = solve_zeta_from_L_q(L_q, Z_col, mesh_xy, q_chunk_size)
+                # No block_until_ready — gather will consume zeta_chunk asynchronously.
+                del Z_col
             t_solve_total += time.perf_counter() - t0
             
-            # 6e. Copy to host and queue async write to HDF5
-            # GPU→CPU copy is fast; actual HDF5 write happens in background thread
+            # 6e. Q-chunked allgather → host copy → async HDF5 write.
+            # The allgather replicates zeta slices: per-device output is
+            # (q_gather, n_rmu, chunk_r) which at large chunk_r can be huge.
+            # Chunking over q keeps each allgather under memory limits.
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.h5_write"):
-                if jax.process_index() == 0:
-                    # Gather the sharded array from all processes to process 0
-                    zeta_gathered = jax.experimental.multihost_utils.process_allgather(zeta_chunk, tiled=False)
-                    zeta_cpu = np.asarray(zeta_gathered)  # (nq, n_rmu, n_rchunk) on CPU
-                    # Some JAX versions return an extra leading host axis.
-                    if zeta_cpu.ndim == 4 and zeta_cpu.shape[0] == 1:
-                        zeta_cpu = zeta_cpu[0]
-                    if zeta_cpu.shape[0] != nq:
-                        raise RuntimeError(
-                            f"Unexpected gathered zeta shape {zeta_cpu.shape}; expected leading nq={nq}"
-                        )
-                    
-                    # Queue the write with r-range (r-chunks are contiguous!)
-                    write_queue.put((zeta_cpu, r_start, r_end, chunk_idx))
+                # Each allgather produces a FULLY REPLICATED output per device:
+                # q_gather × n_rmu × chunk_r × 16 bytes, plus NCCL temp of same size.
+                # Cap to keep replicated output + NCCL under available memory.
+                _bytes_per_q_replicated = 2 * n_rmu * actual_n_rchunk * 16  # output + NCCL
+                _safe_q_gather = max(1, min(nq, int(10 * 1024**3 / max(1, _bytes_per_q_replicated))))
+                if q_gather_size > 0:
+                    _q_gather = min(nq, q_gather_size, _safe_q_gather)
                 else:
-                    # Other processes must also participate in the collective gather
-                    jax.experimental.multihost_utils.process_allgather(zeta_chunk, tiled=False)
-                
-                # Synchronize across devices (but not waiting for HDF5 write)
+                    _q_gather = _safe_q_gather
+
+                for _q0 in range(0, nq, _q_gather):
+                    _q1 = min(_q0 + _q_gather, nq)
+                    _slice = zeta_chunk[_q0:_q1]
+                    _gathered = jax.experimental.multihost_utils.process_allgather(_slice, tiled=False)
+                    if jax.process_index() == 0:
+                        _g = np.asarray(_gathered)
+                        if _g.ndim == 4 and _g.shape[0] == 1:
+                            _g = _g[0]
+                        write_queue.put((_g, r_start, r_end, chunk_idx, _q0, _q1))
+                    del _gathered, _slice
+
                 jax.experimental.multihost_utils.sync_global_devices(f"zeta_chunk_{chunk_idx}")
+                del zeta_chunk  # Free GPU memory before next chunk's FFT stage
             t_write_total += time.perf_counter() - t0
             
     
@@ -1642,6 +1672,7 @@ def get_psi_rchunk_from_cached(
 def get_psi_rchunk(
     wfn, sym, meta, mesh_xy, band_range, r_start, r_end, bispinor,
     band_chunk_size: int = 16,
+    k_chunk_size: int = 0,
 ) -> jax.Array:
     """
     Load and FFT wavefunctions for a specific r-chunk.
@@ -1684,29 +1715,47 @@ def get_psi_rchunk(
     psi_rchunk_all = jnp.zeros((nk_tot, nb_total, nspinor, n_rchunk), dtype=jnp.complex128)
     psi_rchunk_all = jax.lax.with_sharding_constraint(psi_rchunk_all, out_Y)
     
-    # Process bands in chunks
+    # Determine effective k-chunk size
+    nk_batch = nk_tot if k_chunk_size <= 0 else min(k_chunk_size, nk_tot)
+
+    # Process bands in chunks (outer), k-points in batches (inner)
     num_band_chunks = (nb_total + band_chunk_size - 1) // band_chunk_size
     for bc_idx in range(num_band_chunks):
         bc_start = b_start + bc_idx * band_chunk_size
         bc_end = min(bc_start + band_chunk_size, b_end)
         bc_range = (bc_start, bc_end)
-        
-        # Load G-space for this band chunk
+
+        # Load G-space for this band chunk (all k-points)
         global_psi_Gtot, _ = read_Gvecs_to_devices(wfn, sym, bc_range, meta, bispinor, mesh_xy)
-        
-        # FFT and extract r-slice for this chunk
-        psi_rchunk_chunk = get_sharded_wfns_rchunk_slice(
-            global_psi_Gtot, meta, r_start, r_end, kvecs_frac, mesh_xy, bc_range
-        )
-        
-        # Place into output array at correct band indices
-        local_bc_start = bc_idx * band_chunk_size
-        local_bc_end = local_bc_start + (bc_end - bc_start)
-        psi_rchunk_all = psi_rchunk_all.at[:, local_bc_start:local_bc_end, :, :].set(psi_rchunk_chunk)
-        
-        # Free G-space + FFT output
-        del global_psi_Gtot, psi_rchunk_chunk
-    
+
+        if nk_batch >= nk_tot:
+            # No k-batching: FFT all k-points at once
+            psi_rchunk_chunk = get_sharded_wfns_rchunk_slice(
+                global_psi_Gtot, meta, r_start, r_end, kvecs_frac, mesh_xy, bc_range
+            )
+            local_bc_start = bc_idx * band_chunk_size
+            local_bc_end = local_bc_start + (bc_end - bc_start)
+            psi_rchunk_all = psi_rchunk_all.at[:, local_bc_start:local_bc_end, :, :].set(psi_rchunk_chunk)
+            del psi_rchunk_chunk
+        else:
+            # K-batched path: FFT subsets of k-points to limit memory
+            local_bc_start = bc_idx * band_chunk_size
+            nb_chunk = bc_end - bc_start
+            for k0 in range(0, nk_tot, nk_batch):
+                k1 = min(k0 + nk_batch, nk_tot)
+                sub_meta = SimpleNamespace(
+                    nk_tot=k1 - k0, nspinor=nspinor, fft_grid=meta.fft_grid,
+                    n_rtot=meta.n_rtot,
+                )
+                psi_k_chunk = get_sharded_wfns_rchunk_slice(
+                    global_psi_Gtot[k0:k1], sub_meta, r_start, r_end,
+                    kvecs_frac[k0:k1], mesh_xy, bc_range
+                )
+                psi_rchunk_all = psi_rchunk_all.at[k0:k1, local_bc_start:local_bc_start + nb_chunk, :, :].set(psi_k_chunk)
+                del psi_k_chunk
+
+        del global_psi_Gtot
+
     return psi_rchunk_all
 
 
