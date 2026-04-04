@@ -1,10 +1,12 @@
-# LORRAX
+# LORRAX: The LOw-scaling Real-space Real-Axis eXcited state package in BerkeleyGW
 
-**LORRAX** (**Lo**w-scaling **R**eal-space **R**eal-**A**xis e**X**cited state package) is a
-JAX-based package for computing quasiparticle band structures via the GW approximation
-with Interpolative Separable Density Fitting (ISDF). The main GW driver is called
-**GWJAX** (`gw_isdf.gw_jax`).
+The LORRAX code is a new GW-BSE package to be made available in BerkeleyGW in 2026. LORRAX is a JAX multi-GPU(/CPU) implementation of an $O(N^3)$-scaling formalism for the full-frequency (WIP), plasmon-pole (WIP), and static COHSEX self-energies $\Sigma^{GW}$ for one-shot $G_{0}W_{0}$ and quasiparticle-self consistent QSGW calculations. This provides significant speedups, with potential memory tradeoffs, relative to the canonical $O(N^4)$ scaling plane-wave formalism in BerkeleyGW. Iterative diagonalization of the Electron-Hole Bethe-Salpeter Equation Hamiltonian is also under development. LORRAX will shortly contain a novel $O(N^4)$ $QSG\hat{W}$ implementation with ladder vertex corrections in the screened interaction.
 
+Besides these reduced scaling exponents, LORRAX gets its name from: 1.) our real-space framework for evaluating diagrammatic quantities, with the basis size reduced by the interpolative separable density fitting (ISDF) method, and 2.) real-frequency-axis integrations for the GW $\chi(\omega)$ and $\Sigma(\omega)$, avoiding ill-conditioned analytic continuation to recover real-axis quantities as in the majority of $O(N^3)$ scaling GW codes. The real-axis method has greater but comparable cost to imaginary-axis techniques, much improved by our novel real-axis minimax quadrature scheme.
+
+LORRAX is developed primarily by Jack McArthur (myself) and supervised by Prof. Steven Louie at UC Berkeley, under whom the public BerkeleyGW package has been developed and maintained since 2011. Interoperability with the outputs of the BGW executables `epsilon.x`, `sigma.x`, `kernel.x`, and `absorption.x` is an active area of development. We use heavily and are actively expanding the roles of agentic coding platforms in the development of LORRAX, namely Anthropic's Claude Code and OpenAI's Codex. Both have been collaborators of great importance and are owed significant credit for the current state of LORRAX. We continue to explore applications of SOTA long-horizon schemes for scientific codebases, sandboxes for closed-loop development, and hierarchical tools like MCPs, subagents, and so forth.
+
+#### BerkeleyGW-pyISDF
 ### GW, GW Perturbation Theory (GWPT) and Time-Dependent Adiabatic GW (TD-aGW) via ISDF
 
 The Interpolative Separable Density Fitting (ISDF) procedure is a low-rank procedure which allows the large Khatri-Rao pair-product tensor $`M_{mn}(k,q,r)=\psi^*_{mk-q}(r)\psi_{nk}(r)`$ needed in MBPT calculations
@@ -21,6 +23,13 @@ the time-dependent COHSEX method for nonequilibrium simulations. The code is hea
 
 The package requires as input the BerkeleyGW format wavefunction files `WFN.h5` and `WFNq.h5`. It is currently only compatible with full-spinor wavefunctions, but it can be used with wavefunction k-grids that are reduced by symmetry using `kgrid.x`, in which case it will make use of a symmetry-reduced q-grid in self-energy matrix element calculations.
 
+The main drivers are located in `src/`:
+- **GW/COHSEX**: `gw_isdf/gw_jax.py` (main driver), `w_isdf.py` (screened interaction)
+- **ISDF initialization**: `isdf_init/kmeans_isdf.py` (k-means clustering for interpolation points)
+- **Wavefunction loading**: `common/load_wfns.py` (FFT transforms, CCT/ZCT fitting)
+
+Available as console commands: `gw_jax`, `lorrax-gw`, `kmeans_isdf`, `bse_isdf`.
+
 ## Quick start
 
 ```bash
@@ -30,18 +39,6 @@ uv run python -m gw_isdf.gw_jax -i cohsex.in                  # run GW calculati
 ```
 
 On Perlmutter: use Shifter with the NVIDIA JAX container. See `cluster_setup/README_CLUSTER.md`.
-
-## Main entry points
-
-| Command | Module | Purpose |
-|---------|--------|---------|
-| `gw_jax` | `gw_isdf.gw_jax` | GW/COHSEX self-energy |
-| `kmeans_isdf` | `isdf_init.kmeans_isdf` | ISDF centroid generation |
-| — | `psp.get_dipole_mtxels` | Dipole matrix elements for head corrections |
-| — | `gw_isdf.kin_ion_io` | Kinetic + ionic Hamiltonian for QP energies |
-| `bse_isdf` | `bse_isdf.bse_isdf` | Bethe-Salpeter equation (experimental) |
-
-All run via `uv run python -m <module>`.
 
 ## Documentation
 
