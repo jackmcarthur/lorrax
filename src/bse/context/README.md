@@ -142,7 +142,7 @@ For Lanczos, the inner matvec is called ~50-100 times, so compilation cost is am
 
 The test script includes warm-up iterations to separate JIT compilation time from execution time:
 ```bash
-uv run python -m bse_isdf.test_bse -i input.in --n-warmup 2 --n-bench 10
+uv run python -m bse.test_bse -i input.in --n-warmup 2 --n-bench 10
 ```
 
 ---
@@ -153,7 +153,7 @@ uv run python -m bse_isdf.test_bse -i input.in --n-warmup 2 --n-bench 10
 
 ```bash
 cd /path/to/cohsex_prod
-uv run python -m bse_isdf.test_bse -i cohsex_prod.in \
+uv run python -m bse.test_bse -i cohsex_prod.in \
   --n-val 4 --n-cond 4 \
   --n-eig 10 --max-iter 50 \
   --write-eigenvectors eigenvectors.h5
@@ -177,7 +177,7 @@ uv run python -m bse_isdf.test_bse -i cohsex_prod.in \
 
 Enable JAX profiler tracing:
 ```bash
-ISDF_JAX_PROFILE_DIR=./jax_traces uv run python -m bse_isdf.test_bse -i input.in
+ISDF_JAX_PROFILE_DIR=./jax_traces uv run python -m bse.test_bse -i input.in
 tensorboard --logdir=./jax_traces
 ```
 
