@@ -25,10 +25,13 @@ src/
 │   ├── gw_jax.py       # Main GW driver (entry point)
 │   ├── gw_init.py      # Input parsing, chunking strategy
 │   ├── w_isdf.py       # Screened interaction W(iω) via CTSP
-│   ├── w_isdf_dynamic.py# Dynamic W(ω) path
-│   ├── get_windows.py  # Energy window functions
-│   ├── vcoul.py        # Coulomb interaction utilities
-│   └── compute_vcoul.py# V_q computation from zeta
+│   ├── ppm_sigma.py    # GN-PPM dynamic self-energy Σ^c(ω)
+│   ├── minimax_screening.py # PPM extraction, quadrature helpers
+│   ├── vcoul.py        # Coulomb interaction (2D slab, 0D box)
+│   ├── compute_vcoul.py# V_q computation from zeta
+│   └── archive/
+│       └── cohsex_isdf.py  # Legacy driver with eps→ISDF W projection
+│                            # (useful reference for epsmat→W_μν mapping)
 │
 └── isdf/
     ├── isdf_init/          # ISDF initialization & k-means clustering
@@ -79,6 +82,7 @@ src/
 |--------|---------------|
 | **isdf_init** | Select interpolation points (centroids) via k-means clustering on charge density |
 | **gw_isdf** | GW/COHSEX self-energy calculations, main computational pipeline |
+| **gw_isdf/archive** | Legacy code. `cohsex_isdf.py` contains the original eps→ISDF W projection pathway: how to map BerkeleyGW's `epsmat.h5`/`eps0mat.h5` dielectric matrices into the ISDF W_μν representation. Useful reference when debugging W projection or the ISDF SoS debug script. |
 | **common** | Core algorithms: FFT/NUFFT transforms, CCT/ZCT fitting, wavefunction manipulation |
 | **io** | All file I/O: HDF5 wavefunctions, centroids, self-energy output, tagged arrays |
 | **mixing** | Self-consistent GW acceleration (Anderson mixing, DIIS) |
