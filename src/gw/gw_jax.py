@@ -1,12 +1,10 @@
 # Standard Library imports
 import os
-import sys
-
-# When run as `python -m gw.gw_jax`, this module is loaded as __main__.
-# Register it under the package name too so `from .gw_jax import ...` reuses
-# the same module instead of re-executing all module-level code.
-if __name__ == '__main__':
-	sys.modules.setdefault('gw.gw_jax', sys.modules[__name__])
+# Force JAX to create four CPU devices before import
+# os.environ['XLA_FLAGS'] = ' '.join(filter(None, [
+# 	os.environ.get('XLA_FLAGS', ''),
+# 	'--xla_cpu_multi_thread_eigen=true'
+# ]))
 
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
@@ -22,19 +20,14 @@ import time
 
 import numpy as np
 import jax
+import jax.numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from types import SimpleNamespace
+jax.config.update("jax_enable_x64", True)
+#jax.config.update("jax_platform_name", "cpu")
 
-# Initialize JAX distributed BEFORE any config updates or jax.devices() calls.
-# In JAX >= 0.5, jax.config.update can trigger XLA backend initialization,
-# which must happen after jax.distributed.initialize() for multi-process runs.
-# Guard against double-execution (module is both __main__ and gw.gw_jax).
-_distributed_initialized = False
-
+# Initialize JAX distributed only when running multi-process
 def _maybe_init_jax_distributed():
-	global _distributed_initialized
-	if _distributed_initialized:
-		return
-	_distributed_initialized = True
 	proc_count = int(os.environ.get("JAX_PROCESS_COUNT",
 						 os.environ.get("JAX_NUM_PROCESSES",
 						 os.environ.get("SLURM_NTASKS", "1"))))
@@ -68,12 +61,8 @@ def _maybe_init_jax_distributed():
 								   num_processes=proc_count,
 								   process_id=proc_id)
 
+# Global mesh for sharding across bands
 _maybe_init_jax_distributed()
-
-# Now safe to configure JAX and import jax.numpy
-jax.config.update("jax_enable_x64", True)
-import jax.numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 try:
 	_default_devices = jax.devices()
 except RuntimeError as exc:
