@@ -2160,6 +2160,7 @@ def main(argv=None):
 				np.asarray(head_sigma_diag_ev_for_debug, dtype=np.complex128)
 				if head_sigma_diag_ev_for_debug is not None else None
 			),
+			head_applied=apply_head_diag,
 		)
 		print0(f"  Sigma frequency debug:  {debug_path}")
 

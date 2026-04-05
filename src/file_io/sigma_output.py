@@ -187,6 +187,7 @@ def write_sigma_freq_debug_table(
 	sigma_c_invalid_static_diag_ev,
 	sigma_c_edft_ev,
 	sigma_c_head_edft_ev=None,
+	head_applied=False,
 ):
 	"""Write per-(k,n) diagonal sigma decomposition used for GN-PPM debugging.
 
@@ -251,7 +252,10 @@ def write_sigma_freq_debug_table(
 			return f"{x:>{col_w}d}"
 		f.write("# Sigma frequency debug decomposition (all energies in eV)\n")
 		if has_head:
-			f.write("# sig_c(Edft) includes head; sig_c_head shown separately for inspection\n")
+			if head_applied:
+				f.write("# sig_c(Edft) INCLUDES head correction; sig_c_head shown separately\n")
+			else:
+				f.write("# sig_c(Edft) does NOT include head; sig_c_head is diagnostic only\n")
 		f.write("# " + sep.join(_h(c) for c in cols) + "\n")
 		for ik in range(nk):
 			f.write(f"\nk-point {ik}:\n")
