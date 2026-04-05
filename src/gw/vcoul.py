@@ -188,7 +188,7 @@ def compute_V_qfullG_for_q(
 		v_scaled = vcoul_arr * fact
 		return jnp.asarray(v_scaled, dtype=jnp.complex128)
 	if sys_dim == 3:
-		# 3D bulk: untruncated Coulomb v(q+G) = 4π/|q+G|², head set to zero.
+		# 3D bulk: untruncated Coulomb v(q+G) = 8π/|q+G|² (Rydberg units), head = 0.
 		comps_qG = np.asarray(comps_qG, dtype=np.float64)
 		qvec_wrapped = np.asarray(qvec_wrapped, dtype=np.float64)
 		G_cart = (comps_qG + qvec_wrapped) @ bvec  # (nG, 3)
@@ -196,7 +196,7 @@ def compute_V_qfullG_for_q(
 		denom_zero = denom < 1e-12
 
 		denom_safe = np.where(denom_zero, 1.0, denom)
-		v_reg = 4.0 * np.pi / denom_safe
+		v_reg = 8.0 * np.pi / denom_safe
 		fact = np.float64(1.0 / wfn.cell_volume)
 		v_reg_scaled = v_reg * fact
 		v_scaled = np.where(denom_zero, 0.0, v_reg_scaled)
@@ -291,10 +291,10 @@ def compute_q0_averages(
 				wrapped_cart = wrap_points_to_voronoi(randcart, bvec, nmax=1)
 				rq = (randlims @ wrapped_cart.T).T
 				if is_3d:
-					# 3D bulk: sample all 3 q-components, v(q) = 4π/|q|²
+					# 3D bulk: sample all 3 q-components, v(q) = 8π/|q|² (Rydberg)
 					rq2 = rq
 					denom = jnp.einsum("ij,ij->i", rq2, rq2)
-					vq = 4.0 * jnp.pi / denom
+					vq = 8.0 * jnp.pi / denom
 				else:
 					# 2D slab: set qz=0, v(q) with truncation factor
 					rq2 = rq.at[:, 2].set(0.0)
@@ -332,9 +332,9 @@ def compute_q0_averages(
 
 	qcart2 = randqcart
 	if is_3d:
-		# 3D bulk: v(q) = 4π/|q|² (untruncated)
+		# 3D bulk: v(q) = 8π/|q|² (Rydberg units, untruncated)
 		denom = jnp.einsum("ij,ij->i", qcart2, qcart2)
-		vq = 4.0 * jnp.pi / denom
+		vq = 8.0 * jnp.pi / denom
 	else:
 		# 2D truncation: v(q) = 4π/|q|² × 2 × (1 - e^{-zc kxy} cos(qz zc))
 		denom = jnp.einsum("ij,ij->i", qcart2, qcart2)
@@ -357,11 +357,11 @@ def compute_q0_averages(
 		q0_cart = q0_crys @ bvec
 		q0len = jnp.linalg.norm(q0_cart)
 		q0sq = q0len * q0len
-		vc_q0 = 4.0 * jnp.pi / q0sq
+		vc_q0 = 8.0 * jnp.pi / q0sq
 		gamma = (1.0 / jnp.asarray(jnp.real(epshead), dtype=jnp.float64) - 1.0) / (q0sq * vc_q0)
 		# w(q) = v(q) / (1 + v(q) q² gamma) = v(q) / eps_model(q)
 		qsq = jnp.einsum("ij,ij->i", qcart2, qcart2)
-		vq_loc = 4.0 * jnp.pi / qsq
+		vq_loc = 8.0 * jnp.pi / qsq
 		wq = vq_loc / (1.0 + vq_loc * qsq * gamma)
 		wcoul0 = jnp.mean(wq)
 	else:

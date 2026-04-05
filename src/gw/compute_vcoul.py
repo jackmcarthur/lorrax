@@ -342,7 +342,7 @@ def make_v_munu_chunked_kernel(
             denom_zero = denom < 1e-12
             denom_safe = jnp.where(denom_zero, 1.0, denom)
 
-            v_reg = 4.0 * jnp.pi / denom_safe
+            v_reg = 8.0 * jnp.pi / denom_safe  # Rydberg units
             v_scaled = jnp.where(denom_zero, 0.0, v_reg * fact)
             sqrt_v = jnp.where(v_scaled > 0.0, jnp.sqrt(v_scaled), 0.0).astype(jnp.complex128)
 
