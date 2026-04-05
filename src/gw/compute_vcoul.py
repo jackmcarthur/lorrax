@@ -319,9 +319,47 @@ def make_v_munu_chunked_kernel(
     nkz_f = jnp.float64(nkz)
 
     if sys_dim == 3:
+        # Precompute mini-BZ averaged v(q,G=0) for all q-points on the grid.
+        # For 3D bulk, the bare Coulomb 8π/|q|² varies rapidly near Gamma,
+        # so the point value at q differs from the average over the mini-BZ
+        # Voronoi cell. BGW handles this via MC averaging at every q-point
+        # (vcoul_generator with avgcut=∞ for 3D semiconductors).
+        # We replace v(q, G=0) with <v(q+δq, G=0)>_miniBZ for all q≠0.
+        from .vcoul import wrap_points_to_voronoi
+        _nmc = 2**18
+        _rng = np.random.RandomState(42)
+        _randvals = _rng.uniform(0, 1, (_nmc, 3))
+        _randcart = (_randvals @ bvec.T)
+        _wrapped = np.asarray(wrap_points_to_voronoi(
+            jnp.asarray(_randcart), bvec_j, nmax=1))
+        _kgrid_arr = np.array([nkx, nky, nkz], dtype=np.float64)
+        _randlims = bvec.T @ (np.diag(1.0 / _kgrid_arr) @ np.linalg.inv(bvec.T))
+        _dq_cart = (_randlims @ _wrapped.T).T  # (nmc, 3) mini-BZ offsets in Cartesian
+
+        _v_head_avg = np.zeros((nkx, nky, nkz), dtype=np.float64)
+        for qx in range(nkx):
+            for qy in range(nky):
+                for qz in range(nkz):
+                    qw = np.array([qx, qy, qz], dtype=np.float64)
+                    qw = np.where(qw > _kgrid_arr / 2, qw - _kgrid_arr, qw)
+                    q_frac = qw / _kgrid_arr
+                    q_cart = q_frac @ bvec
+                    if np.dot(q_cart, q_cart) < 1e-12:
+                        _v_head_avg[qx, qy, qz] = 0.0  # q=0 head handled separately
+                    else:
+                        shifted = q_cart[None, :] + _dq_cart  # (nmc, 3)
+                        denom = np.sum(shifted**2, axis=1)
+                        _v_head_avg[qx, qy, qz] = np.mean(8.0 * np.pi / denom)
+        _v_head_avg_j = jnp.asarray(_v_head_avg * (1.0 / cell_volume))
+
         @jax.jit
         def get_sqrt_v_and_phase(qvec_wrapped: jax.Array) -> tuple[jax.Array, jax.Array]:
-            """Compute √v(q+G) and phase for 3D bulk (untruncated Coulomb)."""
+            """Compute √v(q+G) and phase for 3D bulk (untruncated Coulomb).
+
+            For G≠0: v = 8π/|q+G|² (point value).
+            For G=0, q≠0: v = <8π/|q+δq|²>_miniBZ (MC averaged over Voronoi cell).
+            For G=0, q=0: v = 0 (head injected separately via rank-1 correction).
+            """
             # Phase factor
             phase = jnp.exp(-2j * jnp.pi * (
                 qvec_wrapped[0] / nkx_f * fx +
@@ -329,7 +367,7 @@ def make_v_munu_chunked_kernel(
                 qvec_wrapped[2] / nkz_f * fz
             ))
 
-            # 3D Coulomb: v(q+G) = 4π/|q+G|², head set to zero
+            # Body: v(q+G) = 8π/|q+G|² for all G
             q_frac = jnp.asarray((
                 qvec_wrapped[0] / nkx_f,
                 qvec_wrapped[1] / nky_f,
@@ -344,6 +382,14 @@ def make_v_munu_chunked_kernel(
 
             v_reg = 8.0 * jnp.pi / denom_safe  # Rydberg units
             v_scaled = jnp.where(denom_zero, 0.0, v_reg * fact)
+
+            # Replace G=0 with mini-BZ averaged value for q≠0
+            qx_idx = jnp.round(qvec_wrapped[0]).astype(jnp.int32) % nkx
+            qy_idx = jnp.round(qvec_wrapped[1]).astype(jnp.int32) % nky
+            qz_idx = jnp.round(qvec_wrapped[2]).astype(jnp.int32) % nkz
+            v_head_mc = _v_head_avg_j[qx_idx, qy_idx, qz_idx]
+            v_scaled = v_scaled.at[0, 0, 0].set(v_head_mc)
+
             sqrt_v = jnp.where(v_scaled > 0.0, jnp.sqrt(v_scaled), 0.0).astype(jnp.complex128)
 
             return sqrt_v, phase
