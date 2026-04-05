@@ -25,7 +25,6 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from jax.experimental.shard_map import shard_map
 from functools import partial
 
 from common import timing
@@ -163,80 +162,6 @@ def compute_sqrt_vcoul_0d(
     v_scaled = vcoul_grid * fact
     sqrt_v = np.where(v_scaled > 0.0, np.sqrt(v_scaled), 0.0)
     return jnp.asarray(sqrt_v, dtype=jnp.complex128)
-
-
-def compute_sqrt_vcoul_2d(
-    qvec_wrapped: jax.Array,
-    fft_nx: int,
-    fft_ny: int,
-    fft_nz: int,
-    nkx: int,
-    nky: int,
-    nkz: int,
-    bvec: np.ndarray,
-    cell_volume: float,
-) -> jax.Array:
-    """
-    Compute √v(q+G) for 2D truncated Coulomb on the FFT grid.
-    
-    Returns:
-        sqrt_v: (fft_nx, fft_ny, fft_nz) array of √v(q+G) values
-    """
-    gx, gy, gz = fft_integer_axes(fft_nx, fft_ny, fft_nz)
-    gx_b, gy_b, gz_b = jnp.broadcast_arrays(gx, gy, gz)
-    gstack = jnp.stack((gx_b, gy_b, gz_b), axis=-1)
-    
-    bvec_j = jnp.asarray(bvec, dtype=jnp.float64)
-    fact = jnp.float64(1.0 / cell_volume)
-    zc = jnp.float64(np.pi / float(bvec[2, 2]))
-    
-    G_cart_base = jnp.einsum('...a,ab->...b', gstack, bvec_j, optimize=True)
-    
-    q_frac = jnp.asarray((
-        qvec_wrapped[0] / float(nkx),
-        qvec_wrapped[1] / float(nky),
-        qvec_wrapped[2] / float(nkz),
-    ), dtype=jnp.float64)
-    q_cart = jnp.einsum('a,ab->b', q_frac, bvec_j, optimize=True).reshape((1, 1, 1, 3))
-    G_cart = G_cart_base + q_cart
-    
-    denom = jnp.sum(G_cart * G_cart, axis=-1)
-    denom_zero = denom < 1e-12
-    denom_safe = jnp.where(denom_zero, 1.0, denom)
-    
-    kxy = jnp.sqrt(G_cart[..., 0]**2 + G_cart[..., 1]**2)
-    kz = G_cart[..., 2]
-    f2d = 1.0 - jnp.exp(-zc * kxy) * jnp.cos(kz * zc)
-    
-    v_reg = (8.0 * jnp.pi / denom_safe) * f2d
-    v_scaled = jnp.where(denom_zero, 0.0, v_reg * fact)
-    sqrt_v = jnp.where(v_scaled > 0.0, jnp.sqrt(v_scaled), 0.0).astype(jnp.complex128)
-    
-    return sqrt_v
-
-
-def compute_phase_q(
-    qvec_wrapped: jax.Array,
-    fft_nx: int,
-    fft_ny: int,
-    fft_nz: int,
-    nkx: int,
-    nky: int,
-    nkz: int,
-) -> jax.Array:
-    """
-    Compute exp(-2πi q·r) phase factor for FFT.
-    
-    Returns:
-        phase: (1, fft_nx, fft_ny, fft_nz) array for broadcasting with zeta
-    """
-    fx, fy, fz = exp_ikr_fftbox(fft_nx, fft_ny, fft_nz)
-    phase = jnp.exp(-2j * jnp.pi * (
-        qvec_wrapped[0] / float(nkx) * fx +
-        qvec_wrapped[1] / float(nky) * fy +
-        qvec_wrapped[2] / float(nkz) * fz
-    ))
-    return phase
 
 
 # ============================================================================
@@ -528,7 +453,7 @@ def compute_V_q_from_zeta_h5(
         cell_volume: Unit cell volume
         mu_chunk_size: Number of μ indices to process at once
         mesh_xy: Optional device mesh for 2D sharding of output
-        sys_dim: System dimensionality (only 2 supported)
+        sys_dim: System dimensionality (0=box, 2=slab, 3=bulk)
     
     Returns:
         V_q: (n_rmu, n_rmu) Coulomb matrix, optionally sharded P('x', 'y')
@@ -648,7 +573,7 @@ def compute_V_q_from_zeta_array(
         fft_nx, fft_ny, fft_nz, nkx, nky, nkz, bvec, cell_volume, sys_dim, bdot=bdot
     )
     
-    n_rmu, n_rtot = zeta_q.shape
+    n_rmu, _ = zeta_q.shape
     n_chunks = (n_rmu + mu_chunk_size - 1) // mu_chunk_size
     
     sqrt_v, phase = kernels.get_sqrt_v_and_phase(qvec_wrapped)
@@ -728,8 +653,6 @@ def read_zeta_q_sharded(
     # Get mesh info
     devices_2d = mesh_xy.devices
     grid_x, grid_y = devices_2d.shape
-    total_devices = grid_x * grid_y
-    
     # Determine which μ indices this process owns
     # Shard μ across the 'x' axis of the mesh
     local_devices = list(jax.local_devices())
@@ -878,8 +801,6 @@ def compute_all_V_q_from_zeta_h5(
         t_h5_read = 0.0
         t_transfer = 0.0
         t_fft_contract = 0.0
-        t_wait_io = 0.0
-        
         def read_batch_from_h5(batch_coords):
             """Read a batch of zeta from H5 (runs in background thread).
             
@@ -1057,47 +978,3 @@ def compute_all_V_q_from_zeta_h5(
         V_qmunu = jax.lax.with_sharding_constraint(V_qmunu, V_shard)
     
     return V_qmunu, g0_mu_all
-
-
-# ============================================================================
-# Compatibility wrapper matching gw_jax.make_v_munu_kernel signature
-# ============================================================================
-
-def make_v_munu_kernel_chunked(
-    fft_nx: int,
-    fft_ny: int,
-    fft_nz: int,
-    nkx: int,
-    nky: int,
-    nkz: int,
-    bvec: np.ndarray,
-    cell_volume: float,
-    sys_dim: int,
-    mu_chunk_size: int = 128,
-    bdot: np.ndarray | None = None,
-):
-    """
-    Factory for chunked V_q kernel with same signature as gw_jax.make_v_munu_kernel.
-    
-    Returns a kernel function that takes (zeta_q, qvec_wrapped) and returns (v_munu, g0_mu),
-    but uses μ-chunking internally for memory efficiency.
-    
-    Drop-in replacement for make_v_munu_kernel when memory is constrained.
-    """
-    kernels = make_v_munu_chunked_kernel(
-        fft_nx, fft_ny, fft_nz, nkx, nky, nkz, bvec, cell_volume, sys_dim, bdot=bdot
-    )
-    
-    def kernel(zeta_q: jax.Array, qvec_wrapped: jax.Array) -> tuple[jax.Array, jax.Array]:
-        return compute_V_q_from_zeta_array(
-            zeta_q, qvec_wrapped,
-            fft_nx, fft_ny, fft_nz,
-            nkx, nky, nkz,
-            bvec, cell_volume,
-            mu_chunk_size=mu_chunk_size,
-            mesh_xy=None,
-            sys_dim=sys_dim,
-            bdot=bdot,
-        )
-
-    return kernel
