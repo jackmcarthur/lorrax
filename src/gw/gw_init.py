@@ -763,9 +763,12 @@ def read_cohsex_input(filename: str) -> dict:
 			return getb(name)
 
 		regenerate_minimax_tables = getb_opt("regenerate_minimax_tables")
-		legacy_use_shipped = getb_opt("use_shipped_minimax_tables")
-		if regenerate_minimax_tables is None and legacy_use_shipped is not None:
-			regenerate_minimax_tables = not legacy_use_shipped
+		legacy_use_shipped_raw = get("use_shipped_minimax_tables", fallback=None)
+		if legacy_use_shipped_raw is not None:
+			raise ValueError(
+				"Input key 'use_shipped_minimax_tables' is no longer supported. "
+				"Use 'regenerate_minimax_tables = true/false' instead."
+			)
 		if regenerate_minimax_tables is None:
 			regenerate_minimax_tables = False
 		# ============================================================================
