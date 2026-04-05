@@ -276,8 +276,8 @@ def make_v_munu_chunked_kernel(
     Returns:
         Namespace with fft_and_weight, contract_block, get_sqrt_v, get_phase kernels
     """
-    if sys_dim not in (0, 2):
-        raise NotImplementedError(f"Chunked V_q supports sys_dim=0 (box) or sys_dim=2 (slab), got {sys_dim}")
+    if sys_dim not in (0, 2, 3):
+        raise NotImplementedError(f"Chunked V_q supports sys_dim=0 (box), 2 (slab), or 3 (bulk), got {sys_dim}")
 
     cache_key = (fft_nx, fft_ny, fft_nz, nkx, nky, nkz, tuple(bvec.flatten()), cell_volume, sys_dim)
     if cache_key in _v_munu_kernel_cache:
@@ -303,21 +303,52 @@ def make_v_munu_chunked_kernel(
             phase = jnp.ones((1, fft_nx, fft_ny, fft_nz), dtype=jnp.complex128)
             return sqrt_v_0d, phase
     else:
-        # 2D slab truncation: analytic formula, computed per q-point
+        # 2D slab or 3D bulk: analytic formula, computed per q-point
         gx, gy, gz = fft_integer_axes(fft_nx, fft_ny, fft_nz)
         gx_b, gy_b, gz_b = jnp.broadcast_arrays(gx, gy, gz)
         gstack = jnp.stack((gx_b, gy_b, gz_b), axis=-1)
 
         bvec_j = jnp.asarray(bvec, dtype=jnp.float64)
         fact = jnp.float64(1.0 / cell_volume)
-        zc = jnp.float64(np.pi / float(bvec[2, 2]))
+        if sys_dim == 2:
+            zc = jnp.float64(np.pi / float(bvec[2, 2]))
         G_cart_base = jnp.einsum('...a,ab->...b', gstack, bvec_j, optimize=True)
 
     nkx_f = jnp.float64(nkx)
     nky_f = jnp.float64(nky)
     nkz_f = jnp.float64(nkz)
 
-    if sys_dim == 2:
+    if sys_dim == 3:
+        @jax.jit
+        def get_sqrt_v_and_phase(qvec_wrapped: jax.Array) -> tuple[jax.Array, jax.Array]:
+            """Compute √v(q+G) and phase for 3D bulk (untruncated Coulomb)."""
+            # Phase factor
+            phase = jnp.exp(-2j * jnp.pi * (
+                qvec_wrapped[0] / nkx_f * fx +
+                qvec_wrapped[1] / nky_f * fy +
+                qvec_wrapped[2] / nkz_f * fz
+            ))
+
+            # 3D Coulomb: v(q+G) = 4π/|q+G|², head set to zero
+            q_frac = jnp.asarray((
+                qvec_wrapped[0] / nkx_f,
+                qvec_wrapped[1] / nky_f,
+                qvec_wrapped[2] / nkz_f,
+            ), dtype=jnp.float64)
+            q_cart = jnp.einsum('a,ab->b', q_frac, bvec_j, optimize=True).reshape((1, 1, 1, 3))
+            G_cart = G_cart_base + q_cart
+
+            denom = jnp.sum(G_cart * G_cart, axis=-1)
+            denom_zero = denom < 1e-12
+            denom_safe = jnp.where(denom_zero, 1.0, denom)
+
+            v_reg = 4.0 * jnp.pi / denom_safe
+            v_scaled = jnp.where(denom_zero, 0.0, v_reg * fact)
+            sqrt_v = jnp.where(v_scaled > 0.0, jnp.sqrt(v_scaled), 0.0).astype(jnp.complex128)
+
+            return sqrt_v, phase
+
+    elif sys_dim == 2:
         @jax.jit
         def get_sqrt_v_and_phase(qvec_wrapped: jax.Array) -> tuple[jax.Array, jax.Array]:
             """Compute √v(q+G) and phase for a given q-point."""

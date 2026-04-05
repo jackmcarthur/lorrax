@@ -188,7 +188,20 @@ def compute_V_qfullG_for_q(
 		v_scaled = vcoul_arr * fact
 		return jnp.asarray(v_scaled, dtype=jnp.complex128)
 	if sys_dim == 3:
-		raise NotImplementedError("3D bulk system calculation not yet implemented")
+		# 3D bulk: untruncated Coulomb v(q+G) = 4π/|q+G|², head set to zero.
+		comps_qG = np.asarray(comps_qG, dtype=np.float64)
+		qvec_wrapped = np.asarray(qvec_wrapped, dtype=np.float64)
+		G_cart = (comps_qG + qvec_wrapped) @ bvec  # (nG, 3)
+		denom = np.sum(G_cart * G_cart, axis=1)
+		denom_zero = denom < 1e-12
+
+		denom_safe = np.where(denom_zero, 1.0, denom)
+		v_reg = 4.0 * np.pi / denom_safe
+		fact = np.float64(1.0 / wfn.cell_volume)
+		v_reg_scaled = v_reg * fact
+		v_scaled = np.where(denom_zero, 0.0, v_reg_scaled)
+		return jnp.asarray(v_scaled, dtype=jnp.complex128)
+
 	_ = vc0_mean
 	_ = do_Dmunu
 
@@ -252,7 +265,8 @@ def compute_q0_averages(
 		return vc0_mean, wcoul0
 
 	bvec = jnp.asarray(wfn.blat * wfn.bvec, dtype=jnp.float64)
-	zk = jnp.pi / bvec[2, 2]
+	is_3d = (sys_dim == 3)
+	zk = jnp.pi / bvec[2, 2] if not is_3d else None
 
 	# Sample points: default Sobol QMC (3D with Owen scrambling), fallback to uniform
 	randlims = bvec.T @ (jnp.diag(1.0 / jnp.asarray((meta.nkx, meta.nky, meta.nkz))) @ jnp.linalg.inv(bvec.T))
@@ -276,14 +290,19 @@ def compute_q0_averages(
 				randcart = (bvec.T @ Uj.T).T
 				wrapped_cart = wrap_points_to_voronoi(randcart, bvec, nmax=1)
 				rq = (randlims @ wrapped_cart.T).T
-				# Set qz=0 for 2D-truncated head, matching historical evaluation
-				rq2 = rq.at[:, 2].set(0.0)
-				# Compute v(q)
-				denom = jnp.einsum("ij,ij->i", rq2, rq2)
-				base = 8.0 * jnp.pi / denom # Ry units (m=1/2)
-				kxy = jnp.linalg.norm(rq2[:, :2], axis=1)
-				f2d = (1.0 - jnp.exp(-jnp.pi / bvec[2, 2] * kxy) * jnp.cos(rq2[:, 2] * jnp.pi / bvec[2, 2]))
-				vq = base * f2d
+				if is_3d:
+					# 3D bulk: sample all 3 q-components, v(q) = 4π/|q|²
+					rq2 = rq
+					denom = jnp.einsum("ij,ij->i", rq2, rq2)
+					vq = 4.0 * jnp.pi / denom
+				else:
+					# 2D slab: set qz=0, v(q) with truncation factor
+					rq2 = rq.at[:, 2].set(0.0)
+					denom = jnp.einsum("ij,ij->i", rq2, rq2)
+					base = 8.0 * jnp.pi / denom
+					kxy = jnp.linalg.norm(rq2[:, :2], axis=1)
+					f2d = (1.0 - jnp.exp(-jnp.pi / bvec[2, 2] * kxy) * jnp.cos(rq2[:, 2] * jnp.pi / bvec[2, 2]))
+					vq = base * f2d
 				means.append(jnp.mean(vq))
 				if S_cart is not None:
 					S = jnp.asarray(S_cart, dtype=jnp.complex128)
@@ -308,26 +327,45 @@ def compute_q0_averages(
 		randcart = (bvec.T @ randvals.T).T
 		wrapped_cart = wrap_points_to_voronoi(randcart, bvec, nmax=1)
 		randqcart = (randlims @ wrapped_cart.T).T
-		randqcart = randqcart.at[:, 2].set(0.0)
-	# 2D truncation: enforce qz=0 for vcoul head sampling (as before)
+		if not is_3d:
+			randqcart = randqcart.at[:, 2].set(0.0)
+
 	qcart2 = randqcart
-	# v(q) = 4π/|q|^2 * 2 * (1 - e^{-zc kxy} * cos(qz zc))
-	denom = jnp.einsum("ij,ij->i", qcart2, qcart2)
-	base = 4.0 * jnp.pi / denom
-	kxy = jnp.linalg.norm(qcart2[:, :2], axis=1)
-	f2d = 2.0 * (1.0 - jnp.exp(-jnp.pi / bvec[2, 2] * kxy) * jnp.cos(qcart2[:, 2] * jnp.pi / bvec[2, 2]))
-	vq = base * f2d
+	if is_3d:
+		# 3D bulk: v(q) = 4π/|q|² (untruncated)
+		denom = jnp.einsum("ij,ij->i", qcart2, qcart2)
+		vq = 4.0 * jnp.pi / denom
+	else:
+		# 2D truncation: v(q) = 4π/|q|² × 2 × (1 - e^{-zc kxy} cos(qz zc))
+		denom = jnp.einsum("ij,ij->i", qcart2, qcart2)
+		base = 4.0 * jnp.pi / denom
+		kxy = jnp.linalg.norm(qcart2[:, :2], axis=1)
+		f2d = 2.0 * (1.0 - jnp.exp(-jnp.pi / bvec[2, 2] * kxy) * jnp.cos(qcart2[:, 2] * jnp.pi / bvec[2, 2]))
+		vq = base * f2d
 	vc0_mean = jnp.mean(vq)
 
 	if S_cart is not None:
-		# Anisotropic wcoul0 on identical samples using S(0) and q with qz=0
+		# Anisotropic wcoul0 on identical samples using S tensor
 		S = jnp.asarray(S_cart, dtype=jnp.complex128)
 		qSq = jnp.einsum('qi,ij,qj->q', qcart2, S, qcart2)
 		vqc = vq.astype(jnp.complex128)
 		wcoul0 = jnp.mean(vqc / (1.0 - vqc * qSq))
+	elif is_3d:
+		# 3D bulk without S_cart: use isotropic screening model
+		# gamma = (1/eps - 1) / (q² v(q)) evaluated at a small q
+		q0_crys = jnp.asarray((0.001, 0.0, 0.0), dtype=jnp.float64)
+		q0_cart = q0_crys @ bvec
+		q0len = jnp.linalg.norm(q0_cart)
+		q0sq = q0len * q0len
+		vc_q0 = 4.0 * jnp.pi / q0sq
+		gamma = (1.0 / jnp.asarray(jnp.real(epshead), dtype=jnp.float64) - 1.0) / (q0sq * vc_q0)
+		# w(q) = v(q) / (1 + v(q) q² gamma) = v(q) / eps_model(q)
+		qsq = jnp.einsum("ij,ij->i", qcart2, qcart2)
+		vq_loc = 4.0 * jnp.pi / qsq
+		wq = vq_loc / (1.0 + vq_loc * qsq * gamma)
+		wcoul0 = jnp.mean(wq)
 	else:
-		# epshead-based small-q model for static head fallback
-		# Calibrate gamma using a tiny q0 in crystal units (e.g., 0.001,0,0)
+		# 2D epshead-based small-q model for static head fallback
 		q0_crys = jnp.asarray((0.001, 0.0, 0.0), dtype=jnp.float64)
 		q0_cart = q0_crys @ bvec
 		q0len = jnp.linalg.norm(q0_cart)
