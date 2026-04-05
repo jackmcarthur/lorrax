@@ -81,10 +81,7 @@ def _mu_nu_sharding(mesh_xy: Mesh) -> NamedSharding:
     # (mu, nu, kx, ky, kz) with mu/nu split across x/y mesh axes.
     return NamedSharding(mesh_xy, P("x", "y", None, None, None))
 
-
-def _extract_mu_nu_q_layout(W_q: jax.Array) -> jax.Array:
-    # (nkx, nky, nkz, 1, mu, 1, nu) -> (mu, nu, nkx, nky, nkz)
-    return W_q[:, :, :, 0, :, 0, :].transpose(3, 4, 0, 1, 2)
+_sigma_tau_channel_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
 
 
 def _summarize_hermitian_qmunu(name: str, W_q: jax.Array, print_fn=print) -> None:
@@ -106,6 +103,137 @@ def _summarize_hermitian_qmunu(name: str, W_q: jax.Array, print_fn=print) -> Non
         f"  [{name}] hermitian residual={herm_resid:.3e} "
         f"max|Im diag|={diag_im:.3e} diag range=[{diag_min:.4e}, {diag_max:.4e}]"
     )
+
+
+def _project_sigma_channels(
+    coeff_re: jax.Array,
+    coeff_im: jax.Array,
+    sigma_tau_kij_re: jax.Array,
+    sigma_tau_kij_im: jax.Array,
+    project_code: jax.Array,
+) -> jax.Array:
+    """Apply one window projection to precomputed real/imag sigma channels."""
+
+    def _full(_):
+        sigma_tau_kij_full = sigma_tau_kij_re[None, ...] + 1j * sigma_tau_kij_im[None, ...]
+        return (coeff_re + 1j * coeff_im) * sigma_tau_kij_full
+
+    def _imag(_):
+        return coeff_re * sigma_tau_kij_im[None, ...] + coeff_im * sigma_tau_kij_re[None, ...]
+
+    def _real(_):
+        return coeff_re * sigma_tau_kij_re[None, ...] - coeff_im * sigma_tau_kij_im[None, ...]
+
+    return jax.lax.switch(project_code, (_full, _imag, _real), operand=None)
+
+
+@jax.jit
+def _accumulate_window_channels_jit(
+    acc_win: jax.Array,
+    sigma_tau_kij_re: jax.Array,
+    sigma_tau_kij_im: jax.Array,
+    omega_vec: jax.Array,
+    t_node: jax.Array,
+    alpha_eff: jax.Array,
+    omega_sign: jax.Array,
+    pref: jax.Array,
+    project_code: jax.Array,
+) -> jax.Array:
+    omega_kernel = jnp.exp(1j * omega_sign * omega_vec * t_node)
+    coeff = alpha_eff * omega_kernel
+    coeff_re = jnp.real(coeff)[:, None, None, None]
+    coeff_im = jnp.imag(coeff)[:, None, None, None]
+    contrib = _project_sigma_channels(
+        coeff_re, coeff_im, sigma_tau_kij_re, sigma_tau_kij_im, project_code
+    )
+    return acc_win + pref * contrib.astype(jnp.complex128)
+
+
+@jax.jit
+def _project_stream_batch_jit(
+    omega_batch: jax.Array,
+    sigma_tau_kij_re: jax.Array,
+    sigma_tau_kij_im: jax.Array,
+    t_node: jax.Array,
+    alpha_eff: jax.Array,
+    omega_sign: jax.Array,
+    pref: jax.Array,
+    project_code: jax.Array,
+) -> jax.Array:
+    omega_kernel = jnp.exp(1j * omega_sign * omega_batch * t_node)
+    coeff = alpha_eff * omega_kernel
+    coeff_re = jnp.real(coeff)[:, None, None, None]
+    coeff_im = jnp.imag(coeff)[:, None, None, None]
+    contrib = _project_sigma_channels(
+        coeff_re, coeff_im, sigma_tau_kij_re, sigma_tau_kij_im, project_code
+    )
+    return pref * contrib.astype(jnp.complex128)
+
+
+def _get_sigma_tau_channel_kernel(
+    *,
+    mesh_xy: Mesh,
+    nkx: int,
+    nky: int,
+    nkz: int,
+    nk_tot: int,
+    bispinor: bool,
+    get_G_mu_nu_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array],
+    get_G_R_fn: Callable[[jax.Array, int, int, int], jax.Array],
+    get_sigma_mu_nu_fn: Callable[[jax.Array, jax.Array, int, bool], jax.Array],
+    get_sigma_kij_channels_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array],
+) -> Callable[..., jax.Array]:
+    """Return a cached JIT kernel for one tau-node sigma-channel build."""
+
+    cache_key = (
+        id(mesh_xy),
+        int(nkx),
+        int(nky),
+        int(nkz),
+        int(nk_tot),
+        bool(bispinor),
+        id(get_G_mu_nu_fn),
+        id(get_G_R_fn),
+        id(get_sigma_mu_nu_fn),
+        id(get_sigma_kij_channels_fn),
+    )
+    if cache_key in _sigma_tau_channel_kernel_cache:
+        return _sigma_tau_channel_kernel_cache[cache_key]
+
+    w_isdf._ensure_compilation_cache()
+    mu_shard = _mu_nu_sharding(mesh_xy)
+
+    @jax.jit
+    def _tau_channel_step(
+        psi_coh_rmuT_X: jax.Array,
+        psi_coh_rmu_Y: jax.Array,
+        psi_proj_rmu_X: jax.Array,
+        psi_proj_rmuT_Y: jax.Array,
+        E_A: jax.Array,
+        mask_A: jax.Array,
+        B_mu_nu: jax.Array,
+        Omega_mu_nu: jax.Array,
+        mask_B: jax.Array,
+        E_ref_A: jax.Array,
+        E_ref_B: jax.Array,
+        t_node: jax.Array,
+        eye_nb: jax.Array,
+    ) -> jax.Array:
+        phase_A = jnp.exp(-1j * (E_A - E_ref_A) * t_node)
+        weights_kn = jnp.where(mask_A, phase_A, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
+        Gij = eye_nb[None, :, :] * weights_kn[:, :, None]
+        G_k = get_G_mu_nu_fn(psi_coh_rmuT_X, psi_coh_rmu_Y, Gij)
+
+        phase_B = jnp.exp(-1j * (Omega_mu_nu - E_ref_B) * t_node)
+        W_t_q = jnp.where(mask_B, B_mu_nu * phase_B, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
+        W_t_q = jax.lax.with_sharding_constraint(W_t_q, mu_shard)
+
+        G_R = get_G_R_fn(G_k, nkx, nky, nkz)
+        sigma_tau = get_sigma_mu_nu_fn(G_R, W_t_q, nk_tot, bispinor)
+        return get_sigma_kij_channels_fn(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_tau)
+
+    _sigma_tau_channel_kernel_cache[cache_key] = _tau_channel_step
+    return _tau_channel_step
 
 
 def compute_w0_wiwp_and_ppm_from_minimax(
@@ -278,24 +406,6 @@ def compute_w0_wiwp_and_ppm_from_minimax(
         w0_ref_norm=w0_ref_norm,
     )
 
-
-def build_ppm_w_time_q(
-    B_mu_nu: jax.Array,
-    Omega_mu_nu: jax.Array,
-    t_node: complex,
-    mask_B: jax.Array,
-    E_ref_B: float,
-    mesh_xy: Mesh,
-) -> jax.Array:
-    """Build masked PPM correlation interaction W^c(t) in q-space."""
-    mu_shard = _mu_nu_sharding(mesh_xy)
-    phase = jnp.exp(-1j * (Omega_mu_nu - jnp.asarray(E_ref_B, dtype=jnp.float64)) * t_node)
-    Wc_t = jnp.where(mask_B, B_mu_nu * phase, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
-    with mesh_xy:
-        Wc_t = jax.lax.with_sharding_constraint(Wc_t, mu_shard)
-    return Wc_t
-
-
 def _build_single_sigma_window(
     *,
     E_A: np.ndarray,
@@ -424,135 +534,6 @@ def _build_three_sigma_windows(
             )
         )
     return windows
-
-
-def _convolve_sigma_branch(
-    *,
-    omega_nonneg_ry: np.ndarray,
-    E_A: jax.Array,
-    base_mask_A: jax.Array,
-    B_mu_nu: jax.Array,
-    Omega_mu_nu: jax.Array,
-    base_mask_B: jax.Array,
-    kernel_sign: int,
-    regularization_width_ry: float,
-    edge_factor: float,
-    target_error: float,
-    max_nodes: int,
-    crossing_eps_q: float,
-    crossing_max_nodes: int,
-    psi_coh_rmuT_X: jax.Array,
-    psi_coh_rmu_Y: jax.Array,
-    nkx: int,
-    nky: int,
-    nkz: int,
-    nk_tot: int,
-    bispinor: bool,
-    mesh_xy: Mesh,
-    get_G_mu_nu_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array],
-    get_G_R_fn: Callable[[jax.Array, int, int, int], jax.Array],
-    get_sigma_mu_nu_fn: Callable[[jax.Array, jax.Array, int, bool], jax.Array],
-    omega_sign_flip: int = 1,
-    log_tag: str = "",
-    print0=print,
-) -> tuple[jax.Array, list[_SigmaWindow]]:
-    omega_nonneg_ry = np.asarray(omega_nonneg_ry, dtype=np.float64)
-    n_omega = int(omega_nonneg_ry.shape[0])
-    if n_omega == 0:
-        shape = (0, psi_coh_rmuT_X.shape[1], psi_coh_rmuT_X.shape[2], psi_coh_rmuT_X.shape[1], psi_coh_rmuT_X.shape[2], nkx, nky, nkz)
-        return jnp.zeros(shape, dtype=jnp.complex128), []
-
-    E_A_host = np.asarray(jax.device_get(E_A), dtype=np.float64)
-    base_A_host = np.asarray(jax.device_get(base_mask_A), dtype=bool)
-    E_B_host = np.asarray(jax.device_get(Omega_mu_nu), dtype=np.float64)
-    base_B_host = np.asarray(jax.device_get(base_mask_B), dtype=bool)
-
-    if kernel_sign == +1 and float(np.max(omega_nonneg_ry)) > 1.0e-14:
-        windows = _build_three_sigma_windows(
-            E_A=E_A_host,
-            E_B=E_B_host,
-            base_mask_A=base_A_host,
-            base_mask_B=base_B_host,
-            omega_nonneg_ry=omega_nonneg_ry,
-            regularization_width_ry=regularization_width_ry,
-            edge_factor=edge_factor,
-            target_error=target_error,
-            max_nodes=max_nodes,
-            crossing_eps_q=crossing_eps_q,
-            crossing_max_nodes=crossing_max_nodes,
-        )
-    else:
-        windows = _build_single_sigma_window(
-            E_A=E_A_host,
-            E_B=E_B_host,
-            base_mask_A=base_A_host,
-            base_mask_B=base_B_host,
-            omega_nonneg_ry=omega_nonneg_ry,
-            kernel_sign=kernel_sign,
-            target_error=target_error,
-            max_nodes=max_nodes,
-        )
-
-    if not windows:
-        shape = (n_omega, psi_coh_rmuT_X.shape[1], psi_coh_rmuT_X.shape[2], psi_coh_rmuT_X.shape[1], psi_coh_rmuT_X.shape[2], nkx, nky, nkz)
-        return jnp.zeros(shape, dtype=jnp.complex128), windows
-
-    eye_nb = jnp.eye(E_A.shape[1], dtype=jnp.complex128)
-    omega_vec = jnp.asarray(omega_nonneg_ry, dtype=jnp.float64)
-    mu_shard = _mu_nu_sharding(mesh_xy)
-    acc_total = jnp.zeros(
-        (n_omega, psi_coh_rmuT_X.shape[1], psi_coh_rmuT_X.shape[2], psi_coh_rmuT_X.shape[1], psi_coh_rmuT_X.shape[2], nkx, nky, nkz),
-        dtype=jnp.complex128,
-    )
-    with mesh_xy:
-        acc_total = jax.lax.with_sharding_constraint(acc_total, P(None, None, "x", None, "y", None, None, None))
-
-    for win in windows:
-        mask_A = jnp.asarray(win.mask_A)
-        mask_B = jnp.asarray(win.mask_B)
-        acc_win = jnp.zeros_like(acc_total)
-        with mesh_xy:
-            acc_win = jax.lax.with_sharding_constraint(acc_win, P(None, None, "x", None, "y", None, None, None))
-
-        for t_node, alpha_node in zip(win.t_nodes, win.alpha):
-            phase_A = jnp.exp(-1j * (E_A - jnp.asarray(win.E_ref_A, dtype=jnp.float64)) * t_node)
-            weights_kn = jnp.where(mask_A, phase_A, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
-            Gij = eye_nb[None, :, :] * weights_kn[:, :, None]
-            G_k = get_G_mu_nu_fn(psi_coh_rmuT_X, psi_coh_rmu_Y, Gij)
-            W_t_q = build_ppm_w_time_q(B_mu_nu, Omega_mu_nu, t_node, mask_B, win.E_ref_B, mesh_xy)
-            with mesh_xy:
-                G_R = get_G_R_fn(G_k, nkx, nky, nkz)
-                W_t_q = jax.lax.with_sharding_constraint(W_t_q, mu_shard)
-                sigma_tau = get_sigma_mu_nu_fn(G_R, W_t_q, nk_tot, bispinor)
-            omega_kernel = jnp.exp(1j * float(win.omega_sign) * float(omega_sign_flip) * omega_vec * t_node)
-            alpha_eff = complex(alpha_node) * np.exp(-1j * (win.E_ref_A + win.E_ref_B) * t_node)
-            acc_win = acc_win + jnp.asarray(alpha_eff, dtype=jnp.complex128) * omega_kernel[:, None, None, None, None, None, None, None] * sigma_tau[None, ...]
-
-        if win.project == "full":
-            projected = acc_win
-        elif win.project == "imag":
-            projected = jnp.imag(acc_win)
-        else:
-            projected = jnp.real(acc_win)
-        acc_total = acc_total + jnp.asarray(win.prefactor, dtype=jnp.float64) * projected.astype(jnp.complex128)
-
-    tag = f"{log_tag} " if log_tag else ""
-    if kernel_sign == +1:
-        n_core = sum(1 for w in windows if w.name == "core")
-        n_ext = sum(1 for w in windows if w.name in ("a_stripe", "b_slab"))
-        print0(f"  {tag}Σ^- windows: core={n_core}, exterior={n_ext}")
-    else:
-        n_tot = len(windows)
-        n_nodes = sum(int(w.alpha.shape[0]) for w in windows)
-        print0(f"  {tag}Σ^+ windows: count={n_tot}, total nodes={n_nodes}")
-    if debug_quadrature:
-        for w in windows:
-            print0(
-                f"  [quad] {tag}{w.name}: nodes={int(w.alpha.shape[0])}, "
-                f"project={w.project}, pref={w.prefactor:+.1f}"
-            )
-    return acc_total, windows
-
 
 def _convolve_sigma_branch_kij(
     *,
@@ -731,105 +712,25 @@ def _convolve_sigma_branch_kij(
 
     eye_nb = jnp.eye(E_A.shape[1], dtype=jnp.complex128)
     omega_vec = jnp.asarray(omega_nonneg_ry, dtype=jnp.float64)
+    tau_channel_step = _get_sigma_tau_channel_kernel(
+        mesh_xy=mesh_xy,
+        nkx=nkx,
+        nky=nky,
+        nkz=nkz,
+        nk_tot=nk_tot,
+        bispinor=bispinor,
+        get_G_mu_nu_fn=get_G_mu_nu_fn,
+        get_G_R_fn=get_G_R_fn,
+        get_sigma_mu_nu_fn=get_sigma_mu_nu_fn,
+        get_sigma_kij_channels_fn=get_sigma_kij_channels_fn,
+    )
     acc_total = None
     if stream_writer is None:
         acc_total = jnp.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128)
 
-    def _apply_projected_channels(
-        coeff_re: jax.Array,
-        coeff_im: jax.Array,
-        sigma_tau_kij_re: jax.Array,
-        sigma_tau_kij_im: jax.Array,
-        project_code: jax.Array,
-    ) -> jax.Array:
-        """Apply a window projection to the real/imag sigma channels."""
-
-        def _full(_):
-            sigma_tau_kij_full = sigma_tau_kij_re[None, ...] + 1j * sigma_tau_kij_im[None, ...]
-            return (coeff_re + 1j * coeff_im) * sigma_tau_kij_full
-
-        def _imag(_):
-            return coeff_re * sigma_tau_kij_im[None, ...] + coeff_im * sigma_tau_kij_re[None, ...]
-
-        def _real(_):
-            return coeff_re * sigma_tau_kij_re[None, ...] - coeff_im * sigma_tau_kij_im[None, ...]
-
-        return jax.lax.switch(project_code, (_full, _imag, _real), operand=None)
-
-    @jax.jit
-    def _tau_channel_step(
-        psi_coh_rmuT_X_j: jax.Array,
-        psi_coh_rmu_Y_j: jax.Array,
-        psi_proj_rmu_X_j: jax.Array,
-        psi_proj_rmuT_Y_j: jax.Array,
-        E_A_j: jax.Array,
-        mask_A_j: jax.Array,
-        B_mu_nu_j: jax.Array,
-        Omega_mu_nu_j: jax.Array,
-        mask_B_j: jax.Array,
-        E_ref_A_j: jax.Array,
-        E_ref_B_j: jax.Array,
-        t_node_j: jax.Array,
-    ) -> jax.Array:
-        """Build one tau-node contribution and project it to band-space channels."""
-
-        phase_A = jnp.exp(-1j * (E_A_j - E_ref_A_j) * t_node_j)
-        weights_kn = jnp.where(mask_A_j, phase_A, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
-        Gij = eye_nb[None, :, :] * weights_kn[:, :, None]
-        G_k = get_G_mu_nu_fn(psi_coh_rmuT_X_j, psi_coh_rmu_Y_j, Gij)
-
-        phase_B = jnp.exp(-1j * (Omega_mu_nu_j - E_ref_B_j) * t_node_j)
-        W_t_q = jnp.where(mask_B_j, B_mu_nu_j * phase_B, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
-        W_t_q = jax.lax.with_sharding_constraint(W_t_q, _mu_nu_sharding(mesh_xy))
-
-        G_R = get_G_R_fn(G_k, nkx, nky, nkz)
-        sigma_tau = get_sigma_mu_nu_fn(G_R, W_t_q, nk_tot, bispinor)
-        return get_sigma_kij_channels_fn(psi_proj_rmu_X_j, psi_proj_rmuT_Y_j, sigma_tau)
-
-    @jax.jit
-    def _accumulate_window_channels(
-        acc_win_j: jax.Array,
-        sigma_tau_kij_re_j: jax.Array,
-        sigma_tau_kij_im_j: jax.Array,
-        omega_vec_j: jax.Array,
-        t_node_j: jax.Array,
-        alpha_eff_j: jax.Array,
-        omega_sign_j: jax.Array,
-        pref_j: jax.Array,
-        project_code_j: jax.Array,
-    ) -> jax.Array:
-        omega_kernel = jnp.exp(1j * omega_sign_j * omega_vec_j * t_node_j)
-        coeff = alpha_eff_j * omega_kernel
-        coeff_re = jnp.real(coeff)[:, None, None, None]
-        coeff_im = jnp.imag(coeff)[:, None, None, None]
-        contrib = _apply_projected_channels(
-            coeff_re, coeff_im, sigma_tau_kij_re_j, sigma_tau_kij_im_j, project_code_j
-        )
-        return acc_win_j + pref_j * contrib.astype(jnp.complex128)
-
-    @jax.jit
-    def _project_stream_batch(
-        omega_batch_j: jax.Array,
-        sigma_tau_kij_re_j: jax.Array,
-        sigma_tau_kij_im_j: jax.Array,
-        t_node_j: jax.Array,
-        alpha_eff_j: jax.Array,
-        omega_sign_j: jax.Array,
-        pref_j: jax.Array,
-        project_code_j: jax.Array,
-    ) -> jax.Array:
-        omega_kernel = jnp.exp(1j * omega_sign_j * omega_batch_j * t_node_j)
-        coeff = alpha_eff_j * omega_kernel
-        coeff_re = jnp.real(coeff)[:, None, None, None]
-        coeff_im = jnp.imag(coeff)[:, None, None, None]
-        contrib = _apply_projected_channels(
-            coeff_re, coeff_im, sigma_tau_kij_re_j, sigma_tau_kij_im_j, project_code_j
-        )
-        return pref_j * contrib.astype(jnp.complex128)
-
     import time as _time
     _prof_enabled = bool(os.environ.get("LORRAX_PROFILE_PPM", ""))
-    _prof_t = {"G_mu_nu": 0.0, "W_t": 0.0, "G_R_sigma": 0.0, "kij_proj": 0.0, "omega_acc": 0.0, "total": 0.0}
+    _prof_t = {"tau_channel": 0.0, "omega_acc": 0.0, "total": 0.0}
     _prof_n = 0
     _prof_total_start = _time.perf_counter()
 
@@ -849,7 +750,7 @@ def _convolve_sigma_branch_kij(
                 _t0 = _time.perf_counter()
             t_node_j = jnp.asarray(t_node, dtype=jnp.complex128)
             with mesh_xy:
-                sigma_tau_kij_ri = _tau_channel_step(
+                sigma_tau_kij_ri = tau_channel_step(
                     psi_coh_rmuT_X,
                     psi_coh_rmu_Y,
                     psi_proj_rmu_X,
@@ -862,6 +763,7 @@ def _convolve_sigma_branch_kij(
                     E_ref_A_j,
                     E_ref_B_j,
                     t_node_j,
+                    eye_nb,
                 )
             sigma_tau_kij_re = sigma_tau_kij_ri[0]
             sigma_tau_kij_im = sigma_tau_kij_ri[1]
@@ -869,10 +771,7 @@ def _convolve_sigma_branch_kij(
                 sigma_tau_kij_re.block_until_ready()
                 sigma_tau_kij_im.block_until_ready()
                 _t1 = _time.perf_counter()
-                _prof_t["G_mu_nu"] += _t1 - _t0
-                _prof_t["W_t"] += 0.0
-                _prof_t["G_R_sigma"] += 0.0
-                _prof_t["kij_proj"] += 0.0
+                _prof_t["tau_channel"] += _t1 - _t0
                 _t4 = _t1
             if debug_quadrature:
                 re_mag = float(jnp.max(jnp.abs(sigma_tau_kij_re)))
@@ -884,7 +783,7 @@ def _convolve_sigma_branch_kij(
             omega_sign_j = jnp.asarray(omega_sign, dtype=jnp.float64)
             pref = jnp.asarray(win.prefactor * scale, dtype=jnp.float64)
             if acc_win is not None:
-                acc_win = _accumulate_window_channels(
+                acc_win = _accumulate_window_channels_jit(
                     acc_win,
                     sigma_tau_kij_re,
                     sigma_tau_kij_im,
@@ -906,7 +805,7 @@ def _convolve_sigma_branch_kij(
                     iend = min(ibeg + int(max(1, omega_batch_size)), n_omega)
                     idx = omega_global_idx[ibeg:iend]
                     omega_batch = omega_vec[ibeg:iend]
-                    batch_proj = _project_stream_batch(
+                    batch_proj = _project_stream_batch_jit(
                         omega_batch,
                         sigma_tau_kij_re,
                         sigma_tau_kij_im,
@@ -925,10 +824,7 @@ def _convolve_sigma_branch_kij(
     _prof_t["total"] = _prof_total_end - _prof_total_start
     if _prof_enabled and _prof_n > 0:
         print0(f"  [PROFILE] {log_tag} tau-node loop: {_prof_n} iterations, {_prof_t['total']:.3f}s total")
-        print0(f"    G_mu_nu:   {_prof_t['G_mu_nu']:8.3f}s ({100*_prof_t['G_mu_nu']/_prof_t['total']:5.1f}%)  avg {_prof_t['G_mu_nu']/_prof_n:.3f}s/iter")
-        print0(f"    W_t:       {_prof_t['W_t']:8.3f}s ({100*_prof_t['W_t']/_prof_t['total']:5.1f}%)  avg {_prof_t['W_t']/_prof_n:.3f}s/iter")
-        print0(f"    G_R+sigma: {_prof_t['G_R_sigma']:8.3f}s ({100*_prof_t['G_R_sigma']/_prof_t['total']:5.1f}%)  avg {_prof_t['G_R_sigma']/_prof_n:.3f}s/iter")
-        print0(f"    kij_proj:  {_prof_t['kij_proj']:8.3f}s ({100*_prof_t['kij_proj']/_prof_t['total']:5.1f}%)  avg {_prof_t['kij_proj']/_prof_n:.3f}s/iter")
+        print0(f"    tau_channel: {_prof_t['tau_channel']:8.3f}s ({100*_prof_t['tau_channel']/_prof_t['total']:5.1f}%)  avg {_prof_t['tau_channel']/_prof_n:.3f}s/iter")
         print0(f"    omega_acc: {_prof_t['omega_acc']:8.3f}s ({100*_prof_t['omega_acc']/_prof_t['total']:5.1f}%)  avg {_prof_t['omega_acc']/_prof_n:.3f}s/iter")
         _overhead = _prof_t['total'] - sum(v for k, v in _prof_t.items() if k != 'total')
         print0(f"    overhead:  {_overhead:8.3f}s ({100*_overhead/_prof_t['total']:5.1f}%)")
