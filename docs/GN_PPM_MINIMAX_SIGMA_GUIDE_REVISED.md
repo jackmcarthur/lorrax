@@ -98,7 +98,7 @@ The function `compute_w0_wiwp_and_ppm_from_minimax(...)` computes:
 ### 3.2 How (\chi^0(0)) and (\chi^0(i\omega_p)) are computed
 
 1. Build a **single minimax Laplace window** for static screening using:
-   `build_static_minimax_window_pair(enk_v, enk_c, target_error, max_nodes)`
+   `build_static_minimax_window_pair(enk_v, enk_c, target_error, max_nodes, use_shipped_tables=...)`
 
 2. Evaluate (\chi^0_q(0)) and (\chi^0_q(i\omega_p)) by calling `w_isdf.compute_chi0(...)` twice:
 
@@ -234,7 +234,7 @@ x_{\max}=\begin{cases}
 
 Then:
 
-* `q = solve_laplace_minimax_interval(x_min, x_max, target_error, max_nodes)`
+* `q = solve_laplace_minimax_interval(x_min, x_max, target_error, max_nodes, use_shipped_tables=...)`
 * `t_nodes = -i * q.tau`
 * `alpha = q.alpha`
 
@@ -281,7 +281,7 @@ S_{\min}=\min(A)+\min(B),\qquad S_{\max}=\max(A)+\max(B).
 **core**:
 
 * (A_{\rm core}=\max(2T/\xi,10^{-8}))
-* `q_cross = solve_phase_minimax_bandwidth(A_core, target_error, crossing_max_nodes, eps_q=crossing_eps_q, target_kind="hgl")`
+* `q_cross = solve_phase_minimax_bandwidth(A_core, target_error, crossing_max_nodes, eps_q=crossing_eps_q, target_kind="hgl", use_shipped_tables=...)`
 * `t_nodes = q_cross.tau / xi` (real)
 * `alpha = q_cross.alpha / xi` (real)
 * `project="imag"`
@@ -297,7 +297,26 @@ x_{\min}=\max(S_{\min}-(T-z_{\rm edge}),\ z_{\rm edge},\ 10^{-12})
 x_{\max}=\max(S_{\max}, x_{\min}(1+10^{-9})).
 ]
 
-* `q = solve_laplace_minimax_interval(x_min, x_max, ...)`
+* `q = solve_laplace_minimax_interval(x_min, x_max, ..., use_shipped_tables=...)`
+
+### 5.4 Optional shipped-table reuse
+
+All of the minimax helper calls above can now reuse bundled quadrature tables through
+the GW input flag:
+
+```ini
+use_shipped_minimax_tables = true
+```
+
+Default remains `false`.
+
+When enabled, screening and sigma window construction first consult
+`src/common/minimax_assets/catalog.json` and load the smallest safe precomputed table:
+- range rounded up
+- error target rounded down to a stricter or equal shipped tolerance
+- `max_nodes` still enforced
+
+If no bundled table matches, the code falls back to the exact cached solver.
 * `t_nodes=-i q.tau`
 * `alpha=q.alpha`
 * `project="real"`
@@ -437,4 +456,3 @@ If `invalid_mode="static_limit"` and `Wc0_mu_nu` is provided and there are inval
   * `sigma_scale` and debug `sigma_flip_neg`
 
 ---
-

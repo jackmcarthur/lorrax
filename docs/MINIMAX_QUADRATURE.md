@@ -4,6 +4,8 @@
 
 Solver implementation: `src/common/minimax.py`
 
+Runtime reuse layer: `src/gw/minimax_screening.py`
+
 ---
 
 ## Quick Reference
@@ -157,6 +159,30 @@ xi_0 = info['xi_0']
 # Imaginary-axis: x/(x²+ω²) ≈ Σ w_l exp(-t_l x)
 tau, w, err = solve_noncrossing_imag(N=11, R=52.0, omega_hat=16.3)
 ```
+
+## 6.1 Shipped quadrature tables
+
+LORRAX can optionally skip runtime minimax tuning and load bundled node/weight tables
+from `src/common/minimax_assets/`.
+
+Enable from the GW input:
+
+```ini
+use_shipped_minimax_tables = true
+```
+
+Default is `false`.
+
+Selection rule at runtime:
+- choose the smallest tabulated range that is greater than or equal to the requested one
+- choose a stricter-or-equal tabulated error bound
+- reject tables whose node count exceeds the caller's `max_nodes`
+
+Current conventions:
+- noncrossing tables are fit on scaled `[1, R]` using absolute `L∞` error in `1/x`
+- crossing tables are fit on `[0, A_dim]` using absolute `L∞` error in the target `G(u)`
+
+This is not a relative-at-endpoint convention.
 
 ---
 

@@ -246,6 +246,7 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     omega_p_ry: float = 2.0,
     target_error: float = 1.0e-6,
     max_nodes: int = 64,
+    use_shipped_minimax_tables: bool = False,
     minimax_energy_reference: str | float | int | None = "midgap",
     minimax_energy_reference_fn: Callable[[jax.Array, jax.Array], float] | None = None,
     fallback_omega: float = 2.0,
@@ -277,6 +278,7 @@ def compute_w0_wiwp_and_ppm_from_minimax(
         enk_c,
         target_error=target_error,
         max_nodes=max_nodes,
+        use_shipped_tables=bool(use_shipped_minimax_tables),
         print_fn=print0,
     )
 
@@ -417,6 +419,7 @@ def _build_single_sigma_window(
     kernel_sign: int,
     target_error: float,
     max_nodes: int,
+    use_shipped_tables: bool,
 ) -> list[_SigmaWindow]:
     A_vals = E_A[base_mask_A]
     B_vals = E_B[base_mask_B]
@@ -430,7 +433,13 @@ def _build_single_sigma_window(
         x_max = max(S_max + omega_max, x_min * (1.0 + 1.0e-9))
     else:
         x_max = max(S_max, x_min * (1.0 + 1.0e-9))
-    q = solve_laplace_minimax_interval(x_min, x_max, target_error=target_error, max_nodes=max_nodes)
+    q = solve_laplace_minimax_interval(
+        x_min,
+        x_max,
+        target_error=target_error,
+        max_nodes=max_nodes,
+        use_shipped_tables=use_shipped_tables,
+    )
 
     prefactor = 1.0 if kernel_sign == +1 else -1.0
     return [
@@ -464,6 +473,7 @@ def _build_three_sigma_windows(
     max_nodes: int,
     crossing_eps_q: float,
     crossing_max_nodes: int,
+    use_shipped_tables: bool,
 ) -> list[_SigmaWindow]:
     omega_max = float(np.max(omega_nonneg_ry)) if omega_nonneg_ry.size else 0.0
     xi = max(float(regularization_width_ry), 1.0e-12)
@@ -499,6 +509,7 @@ def _build_three_sigma_windows(
                 max_nodes=crossing_max_nodes,
                 eps_q=crossing_eps_q,
                 target_kind="hgl",
+                use_shipped_tables=use_shipped_tables,
             )
             t_nodes = np.asarray(q_cross.tau / xi, dtype=np.complex128)
             alpha = np.asarray(q_cross.alpha / xi, dtype=np.float64)
@@ -508,7 +519,13 @@ def _build_three_sigma_windows(
         else:
             x_min = max(S_min - (T - z_edge), z_edge, 1.0e-12)
             x_max = max(S_max, x_min * (1.0 + 1.0e-9))
-            q = solve_laplace_minimax_interval(x_min, x_max, target_error=target_error, max_nodes=max_nodes)
+            q = solve_laplace_minimax_interval(
+                x_min,
+                x_max,
+                target_error=target_error,
+                max_nodes=max_nodes,
+                use_shipped_tables=use_shipped_tables,
+            )
             t_nodes = np.asarray(-1j * q.tau, dtype=np.complex128)
             alpha = np.asarray(q.alpha, dtype=np.float64)
             project = "full"
@@ -576,6 +593,7 @@ def _convolve_sigma_branch_kij(
     debug_quadrature_samples: int = 200,
     efermi_vac: float | None = None,
     axis_kind: str = "",
+    use_shipped_minimax_tables: bool = False,
 ) -> tuple[jax.Array, list[_SigmaWindow]]:
     """Convolve sigma in one pass, accumulating directly in (k,i,j) space.
 
@@ -615,6 +633,7 @@ def _convolve_sigma_branch_kij(
             max_nodes=max_nodes,
             crossing_eps_q=crossing_eps_q,
             crossing_max_nodes=crossing_max_nodes,
+            use_shipped_tables=bool(use_shipped_minimax_tables),
         )
     else:
         windows = _build_single_sigma_window(
@@ -626,6 +645,7 @@ def _convolve_sigma_branch_kij(
             kernel_sign=kernel_sign,
             target_error=target_error,
             max_nodes=max_nodes,
+            use_shipped_tables=bool(use_shipped_minimax_tables),
         )
 
     nk_proj = int(psi_proj_rmu_X.shape[0])
@@ -873,6 +893,7 @@ def compute_sigma_c_ppm_omega_grid(
     mesh_xy: Mesh,
     target_error: float = 1.0e-6,
     max_nodes: int = 64,
+    use_shipped_minimax_tables: bool = False,
     crossing_max_nodes: int = 500,
     crossing_eps_q: float = 1.0e-3,
     regularization_width_ry: float = 0.018374661087827496,  # 0.25 eV
@@ -1127,6 +1148,7 @@ def compute_sigma_c_ppm_omega_grid(
                     max_nodes=max_nodes,
                     crossing_eps_q=crossing_eps_q,
                     crossing_max_nodes=crossing_max_nodes,
+                    use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
                     psi_coh_rmuT_X=psi_coh_rmuT_X,
                     psi_coh_rmu_Y=psi_coh_rmu_Y,
                     psi_proj_rmu_X=psi_proj_rmu_X,
@@ -1167,6 +1189,7 @@ def compute_sigma_c_ppm_omega_grid(
                     max_nodes=max_nodes,
                     crossing_eps_q=crossing_eps_q,
                     crossing_max_nodes=crossing_max_nodes,
+                    use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
                     psi_coh_rmuT_X=psi_coh_rmuT_X,
                     psi_coh_rmu_Y=psi_coh_rmu_Y,
                     psi_proj_rmu_X=psi_proj_rmu_X,

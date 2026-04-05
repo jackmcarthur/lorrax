@@ -26,7 +26,7 @@ src/
 │   ├── gw_init.py      # Input parsing, chunking strategy
 │   ├── w_isdf.py       # Screened interaction W(iω) via CTSP
 │   ├── ppm_sigma.py    # GN-PPM dynamic self-energy Σ^c(ω)
-│   ├── minimax_screening.py # PPM extraction, quadrature helpers
+│   ├── minimax_screening.py # PPM extraction, quadrature helpers, shipped-table lookup
 │   ├── vcoul.py        # Coulomb interaction (2D slab, 0D box)
 │   ├── compute_vcoul.py# V_q computation from zeta
 │   └── archive/
@@ -88,6 +88,25 @@ src/
 | **mixing** | Self-consistent GW acceleration (Anderson mixing, DIIS) |
 | **bse** | Bethe-Salpeter equation for optical spectra (experimental) |
 | **postprocess** | Post-GW analysis tools |
+
+### Shipped minimax assets
+
+Canonical minimax quadratures can optionally be loaded from the bundled asset catalog in
+`src/common/minimax_assets/` instead of being solved at runtime.
+
+Contents:
+- `catalog.json`: machine-readable table descriptor
+- `README.md`: sweep values and error conventions
+- `crossing/*.npz`, `noncrossing/*.npz`: stored node/weight tables
+
+Runtime lookup is implemented in `src/gw/minimax_screening.py` and is opt-in from the
+GW input file:
+
+```ini
+use_shipped_minimax_tables = true
+```
+
+Default is `false`, which preserves the prior exact-solver behavior.
 
 ---
 

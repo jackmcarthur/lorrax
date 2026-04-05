@@ -116,7 +116,13 @@ def test_solve_laplace_minimax_interval_uses_shipped_table_and_rescales(monkeypa
 
     monkeypatch.setattr(ms, "_solve_noncrossing_scaled_cached", _unexpected_solver)
 
-    quad = ms.solve_laplace_minimax_interval(2.0, 20.0, target_error=1.0e-6, max_nodes=64)
+    quad = ms.solve_laplace_minimax_interval(
+        2.0,
+        20.0,
+        target_error=1.0e-6,
+        max_nodes=64,
+        use_shipped_tables=True,
+    )
 
     np.testing.assert_allclose(quad.tau, tau_hat / 2.0)
     np.testing.assert_allclose(quad.alpha, alpha_hat / 2.0)
@@ -147,3 +153,31 @@ def test_solve_phase_minimax_bandwidth_falls_back_when_no_shipped_table(monkeypa
     np.testing.assert_allclose(quad.alpha, alpha_hat)
     assert quad.max_error == err_hat
     assert quad.target_kind == "hgl"
+
+
+def test_solve_laplace_minimax_interval_skips_shipped_lookup_when_disabled(monkeypatch):
+    tau_hat = np.array([0.75, 1.25], dtype=np.float64)
+    alpha_hat = np.array([0.3, 0.4], dtype=np.float64)
+    err_hat = 2.5e-7
+
+    def _unexpected_pick(*args, **kwargs):
+        raise AssertionError("Shipped lookup should stay disabled when use_shipped_tables=False.")
+
+    monkeypatch.setattr(ms, "_pick_shipped_table", _unexpected_pick)
+    monkeypatch.setattr(
+        ms,
+        "_solve_noncrossing_scaled_cached",
+        lambda *args, **kwargs: (tau_hat, alpha_hat, err_hat),
+    )
+
+    quad = ms.solve_laplace_minimax_interval(
+        1.0,
+        10.0,
+        target_error=1.0e-6,
+        max_nodes=64,
+        use_shipped_tables=False,
+    )
+
+    np.testing.assert_allclose(quad.tau, tau_hat)
+    np.testing.assert_allclose(quad.alpha, alpha_hat)
+    assert quad.max_error == err_hat

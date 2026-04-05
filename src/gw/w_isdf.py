@@ -677,6 +677,7 @@ def compute_screening(
     screening_method="minimax",
     minimax_target_error=1.0e-6,
     minimax_max_nodes=64,
+    use_shipped_minimax_tables=False,
     minimax_energy_reference="midgap",
     minimax_energy_reference_fn=None,
     ppm_omega_p=None,
@@ -712,6 +713,9 @@ def compute_screening(
         Max 1/x fit error target for canonical minimax quadrature.
     minimax_max_nodes : int
         Upper bound for minimax node search.
+    use_shipped_minimax_tables : bool
+        If True, allow canonical minimax quadratures to be loaded from the
+        bundled table catalog before falling back to the exact solver.
     minimax_energy_reference : {'midgap','vbm','cbm','none'} or float
         Uniform energy shift reference for minimax χ0/W. This does not change
         the physical result, but keeps reference conventions explicit.
@@ -777,6 +781,7 @@ def compute_screening(
             enk_c,
             target_error=float(minimax_target_error),
             max_nodes=int(minimax_max_nodes),
+            use_shipped_tables=bool(use_shipped_minimax_tables),
             print_fn=print0,
         )
 

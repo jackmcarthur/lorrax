@@ -426,6 +426,7 @@ def solve_laplace_minimax_interval(
     *,
     target_error: float = 1.0e-6,
     max_nodes: int = 64,
+    use_shipped_tables: bool = False,
 ) -> LaplaceMinimaxQuadrature:
     """Fit ``1/x ≈ sum alpha_l exp(-tau_l x)`` on ``[x_min, x_max]``.
 
@@ -447,12 +448,14 @@ def solve_laplace_minimax_interval(
     logR_key = float(np.log(R))
     target_key = float(target_error)
 
-    shipped = _pick_shipped_table(
-        "noncrossing",
-        range_value=R,
-        target_error=target_error,
-        max_nodes=max_nodes,
-    )
+    shipped = None
+    if use_shipped_tables:
+        shipped = _pick_shipped_table(
+            "noncrossing",
+            range_value=R,
+            target_error=target_error,
+            max_nodes=max_nodes,
+        )
     if shipped is not None:
         tau_hat, w_hat, err_hat = shipped
     else:
@@ -526,6 +529,7 @@ def solve_phase_minimax_bandwidth(
     max_nodes: int = 500,
     eps_q: float = 1.0e-3,
     target_kind: str = "hgl",
+    use_shipped_tables: bool = False,
 ) -> CrossingMinimaxQuadrature:
     """Fit crossing regularization target on ``[0, A_dim]`` as ``sum alpha_l sin(tau_l u)``.
 
@@ -542,14 +546,16 @@ def solve_phase_minimax_bandwidth(
     max_nodes = max(8, int(max_nodes))
     kind = str(target_kind).strip().lower()
 
-    shipped = _pick_shipped_table(
-        "crossing",
-        range_value=A_dim,
-        target_error=target_error,
-        max_nodes=max_nodes,
-        target_kind=kind,
-        eps_q=eps_q,
-    )
+    shipped = None
+    if use_shipped_tables:
+        shipped = _pick_shipped_table(
+            "crossing",
+            range_value=A_dim,
+            target_error=target_error,
+            max_nodes=max_nodes,
+            target_kind=kind,
+            eps_q=eps_q,
+        )
     if shipped is not None:
         tau_hat, w_hat, err = shipped
     else:
@@ -575,6 +581,7 @@ def build_static_minimax_window_pair(
     *,
     target_error: float = 1.0e-6,
     max_nodes: int = 64,
+    use_shipped_tables: bool = False,
     print_fn: Callable[..., None] | None = None,
 ) -> tuple[list[MinimaxWindowPair], LaplaceMinimaxQuadrature]:
     """Build one minimax window pair that spans all valence/conduction states."""
@@ -596,6 +603,7 @@ def build_static_minimax_window_pair(
         x_max,
         target_error=target_error,
         max_nodes=max_nodes,
+        use_shipped_tables=use_shipped_tables,
     )
 
     # Compatibility transform for legacy chi kernel:
