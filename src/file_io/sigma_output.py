@@ -186,10 +186,13 @@ def write_sigma_freq_debug_table(
 	sigma_c_minus_edft_ev,
 	sigma_c_invalid_static_diag_ev,
 	sigma_c_edft_ev,
+	sigma_c_head_edft_ev=None,
 ):
 	"""Write per-(k,n) diagonal sigma decomposition used for GN-PPM debugging.
 
 	All arrays are expected with shape (nk, nb). Values are written in eV.
+	sigma_c_head_edft_ev: optional head correction column (separate scalar GN).
+	sig_c(Edft) already includes the head; sig_c_head is for inspection.
 	"""
 	fields = [
 		np.asarray(energies_dft_ev, dtype=np.float64),
@@ -204,6 +207,9 @@ def write_sigma_freq_debug_table(
 		np.asarray(sigma_c_invalid_static_diag_ev, dtype=np.complex128),
 		np.asarray(sigma_c_edft_ev, dtype=np.complex128),
 	]
+	has_head = sigma_c_head_edft_ev is not None
+	if has_head:
+		fields.append(np.asarray(sigma_c_head_edft_ev, dtype=np.complex128))
 	ref_shape = fields[0].shape
 	for arr in fields[1:]:
 		if arr.shape != ref_shape:
@@ -233,6 +239,8 @@ def write_sigma_freq_debug_table(
 			"sig_c_invld(0)",
 			"sig_c(Edft)",
 		]
+		if has_head:
+			cols.append("sig_c_head")
 		def _h(name: str) -> str:
 			return f"{name:<{col_w}}"
 		def _r(x: float) -> str:
@@ -242,6 +250,8 @@ def write_sigma_freq_debug_table(
 		def _i(x: int) -> str:
 			return f"{x:>{col_w}d}"
 		f.write("# Sigma frequency debug decomposition (all energies in eV)\n")
+		if has_head:
+			f.write("# sig_c(Edft) includes head; sig_c_head shown separately for inspection\n")
 		f.write("# " + sep.join(_h(c) for c in cols) + "\n")
 		for ik in range(nk):
 			f.write(f"\nk-point {ik}:\n")
@@ -262,6 +272,8 @@ def write_sigma_freq_debug_table(
 					_r(float(np.real(fields[9][ik, ib]))),
 					_r(float(np.real(fields[10][ik, ib]))),
 				]
+				if has_head:
+					row.append(_r(float(np.real(fields[11][ik, ib]))))
 				line = sep.join(row)
 				f.write(line + "\n")
 	return abs_path

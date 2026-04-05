@@ -123,6 +123,11 @@ from .ppm_sigma import (
 	compute_sigma_c_ppm_laplace,
 	compute_sigma_c_ppm_omega_grid,
 )
+from .head_correction import (
+	fit_head_gn,
+	compute_head_sigma_diagonal,
+	format_head_diagnostics,
+)
 from .qsgw_utils import (
 	solve_diagonal_sigma_fixed_point,
 	build_qsgw_sigma_xc,
@@ -1383,6 +1388,32 @@ def main(argv=None):
 				)
 			_ppm_t1 = _ppm_time.perf_counter()
 			print0(f"  [TIMING] PPM build: {_ppm_t1 - _ppm_t0:.1f}s")
+			# ================================================================
+			# HEAD CORRECTION: Fit scalar GN model for q=0 G=0 head
+			# ================================================================
+			head_gn = None
+			head_sigma_diag_ry = None
+			if ppm.head_info_static is not None and ppm.head_info_imfreq is not None:
+				head_gn = fit_head_gn(
+					vc0=float(ppm.head_info_static["vc0"].real),
+					wcoul0_static=float(ppm.head_info_static["wcoul0"].real),
+					wcoul0_imfreq=float(ppm.head_info_imfreq["wcoul0"].real),
+					omega_p_ry=omega_p_ry,
+				)
+				print0(format_head_diagnostics(head_gn, float(wfn.cell_volume)))
+				# Compute diagonal head correction at DFT eigenvalues.
+				# energies and occ for the sigma window bands.
+				enk_sigma_ry = np.asarray(wf_bundle.enk[:, wf_bundle.slices.coh_slice], dtype=np.float64)
+				occ_sigma = np.asarray(wf_bundle.occ[:, wf_bundle.slices.coh_slice], dtype=np.float64)
+				head_sigma_diag_ry = compute_head_sigma_diagonal(
+					head_gn, enk_sigma_ry, occ_sigma, float(wfn.cell_volume),
+				)
+				head_sigma_diag_ev = head_sigma_diag_ry * ryd2ev
+				print0(
+					f"  Head Σ^c diagonal (eV): min={np.min(head_sigma_diag_ev):.6f}, "
+					f"max={np.max(head_sigma_diag_ev):.6f}"
+				)
+			_ppm_t1 = _ppm_time.perf_counter()
 			if meta.rank == 0 and write_w_copies_debug and w_copies_debug_file:
 				write_w_copies_debug_h5(
 					w_copies_debug_file,
@@ -1621,6 +1652,21 @@ def main(argv=None):
 				else:
 					sigma_c_invalid_static_diag_ev = np.zeros((nk, nb), dtype=np.complex128)
 				sigma_x_diag_ev = np.diagonal(np.asarray(sigma_x_bare_kij), axis1=1, axis2=2) * ryd2ev
+				# Head GN correction: always computed for diagnostics.
+				# Whether it's added to sigma_c depends on apply_head_diagonal.
+				apply_head_diag = bool(params.get("apply_head_diagonal", False))
+				head_sigma_diag_ev_for_debug = None
+				if head_sigma_diag_ry is not None:
+					head_sigma_diag_ev_for_debug = head_sigma_diag_ry[:nk, :nb] * ryd2ev
+					if apply_head_diag:
+						sigma_c_at_dft_ev = sigma_c_at_dft_ev + head_sigma_diag_ev_for_debug
+						print0(f"  Head correction APPLIED to Σ^c(E_DFT): "
+							   f"val={np.mean(np.real(head_sigma_diag_ev_for_debug[:, :n_occ_local])):+.6f} eV, "
+							   f"cond={np.mean(np.real(head_sigma_diag_ev_for_debug[:, n_occ_local:])):+.6f} eV")
+					else:
+						print0(f"  Head correction computed (diagnostic only, set apply_head_diagonal=true to apply): "
+							   f"val={np.mean(np.real(head_sigma_diag_ev_for_debug[:, :n_occ_local])):+.6f} eV, "
+							   f"cond={np.mean(np.real(head_sigma_diag_ev_for_debug[:, n_occ_local:])):+.6f} eV")
 				sigma_xc_at_dft_ev = sigma_x_diag_ev + sigma_c_at_dft_ev
 		coh_diff_abs = float(jnp.max(jnp.abs(sigma_coh_ppm_kij - sigma_coh_kbar_ij_jax)))
 		coh_ref = max(float(jnp.max(jnp.abs(sigma_coh_kbar_ij_jax))), 1.0e-16)
@@ -1636,6 +1682,15 @@ def main(argv=None):
 		print0(f"  [Σ^X + Σ^c(0)] vs [Σ^SX + Σ^COH]: abs={total_diff_abs:.6e} Ry ({total_diff_abs * ryd2ev:.6e} eV), rel={total_diff_abs / total_ref:.6e}")
 		sigma_sx_kbar_ij_jax = sigma_x_bare_kij
 		sigma_coh_kbar_ij_jax = sigma_coh_ppm_kij
+		# Optionally add head diagonal to QP eigenvalue path.
+		if head_sigma_diag_ry is not None and bool(params.get("apply_head_diagonal", False)):
+			nk_h = sigma_coh_kbar_ij_jax.shape[0]
+			nb_h = sigma_coh_kbar_ij_jax.shape[1]
+			head_diag_ry_jnp = jnp.asarray(head_sigma_diag_ry[:nk_h, :nb_h], dtype=jnp.complex128)
+			diag_idx_h = jnp.arange(nb_h)
+			head_matrix_ry = jnp.zeros((nk_h, nb_h, nb_h), dtype=jnp.complex128)
+			head_matrix_ry = head_matrix_ry.at[:, diag_idx_h, diag_idx_h].set(head_diag_ry_jnp)
+			sigma_coh_kbar_ij_jax = sigma_coh_kbar_ij_jax + head_matrix_ry
 		if sigma_coh_ppm_omega_kij is not None:
 			sigma_xc_omega_kij = sigma_sx_kbar_ij_jax[None, ...] + sigma_coh_ppm_omega_kij
 			sigma_total_omega_kij = sigma_xc_omega_kij + hartree_kbar_ij_jax[None, ...]
@@ -2101,6 +2156,10 @@ def main(argv=None):
 			sigma_c_minus_edft_ev=np.asarray(sigma_c_minus_at_dft_ev, dtype=np.complex128),
 			sigma_c_invalid_static_diag_ev=np.asarray(sigma_c_invalid_static_diag_ev, dtype=np.complex128),
 			sigma_c_edft_ev=np.asarray(sigma_c_at_dft_ev, dtype=np.complex128),
+			sigma_c_head_edft_ev=(
+				np.asarray(head_sigma_diag_ev_for_debug, dtype=np.complex128)
+				if head_sigma_diag_ev_for_debug is not None else None
+			),
 		)
 		print0(f"  Sigma frequency debug:  {debug_path}")
 

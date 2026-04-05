@@ -45,6 +45,8 @@ class PPMBuildResult:
     w0_rel_error: float | None = None
     w0_abs_error: float | None = None
     w0_ref_norm: float | None = None
+    head_info_static: dict | None = None
+    head_info_imfreq: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -324,14 +326,22 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     W0_q.block_until_ready()
     Wiwp_q.block_until_ready()
 
-    V_head = V_qmunu
+    # Determine head values but do NOT add them to the ISDF body W or V.
+    # The head is handled as a separate scalar GN channel (diagonal correction).
+    h0_info = None
+    hi_info = None
     if head_correction_fn is not None:
-        V_head, W0_q, h0 = head_correction_fn(V_qmunu, W0_q, 0.0 + 0.0j)
-        _, Wiwp_q, hi = head_correction_fn(V_qmunu, Wiwp_q, 1j * float(omega_p_ry))
+        # Call head_correction_fn to *determine* the scalar head values,
+        # but pass W_q=None so it only computes V_head (needed for bare exchange)
+        # and returns head_info without modifying W.
+        V_head_for_vonly, _, h0 = head_correction_fn(V_qmunu, None, 0.0 + 0.0j)
+        _, _, hi = head_correction_fn(V_qmunu, None, 1j * float(omega_p_ry))
+        h0_info = h0
+        hi_info = hi
         vc0 = float(h0["vc0"].real)
         w0 = float(h0["wcoul0"].real)
         wi = float(hi["wcoul0"].real)
-        print0(f"  PPM finite-size heads:")
+        print0(f"  PPM finite-size heads (separate scalar channel, NOT in ISDF body):")
         print0(f"    v(q→0)          = {vc0:12.3f} a.u.")
         print0(f"    W(q→0, ω=0)     = {w0:12.3f} a.u.")
         print0(f"    W(q→0, ω=iωp)   = {wi:12.3f} a.u.  [ωp={omega_p_ry:.4f} Ry]")
@@ -340,12 +350,13 @@ def compute_w0_wiwp_and_ppm_from_minimax(
 
     nkx, nky, nkz = W0_q.shape[0], W0_q.shape[1], W0_q.shape[2]
     n_rmu = W0_q.shape[4]
-    V_q = jnp.asarray(V_head)[0, 0, 0].reshape(nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
+    # V without head for body W^c extraction
+    V_q = jnp.asarray(V_qmunu)[0, 0, 0].reshape(nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
 
-    _summarize_hermitian_qmunu("W(0)", W0_q, print0)
-    _summarize_hermitian_qmunu(f"W(iωp={omega_p_ry:.3f} Ry)", Wiwp_q, print0)
+    _summarize_hermitian_qmunu("W(0) [no head]", W0_q, print0)
+    _summarize_hermitian_qmunu(f"W(iωp={omega_p_ry:.3f} Ry) [no head]", Wiwp_q, print0)
 
-    # Build W^c = W(with W_head) - V(with V_head).
+    # Build W^c = W(no head) - V(no head).  Head handled separately.
     Wc0_q = W0_q - V_q
     Wci_q = Wiwp_q - V_q
 
@@ -417,6 +428,8 @@ def compute_w0_wiwp_and_ppm_from_minimax(
         w0_rel_error=w0_rel_error,
         w0_abs_error=w0_abs_error,
         w0_ref_norm=w0_ref_norm,
+        head_info_static=h0_info,
+        head_info_imfreq=hi_info,
     )
 
 def _build_single_sigma_window(
