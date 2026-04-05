@@ -103,11 +103,20 @@ from .gw_init import (
 	prepare_isdf_and_wavefunctions,
 )
 from .get_windows import get_window_info
+from .gw_driver_helpers import (
+	build_ppm_sigma_runtime_options,
+	build_screening_setup,
+	maybe_build_ctsp_windows,
+)
 from .w_isdf import (
 	get_chi0_jax_from_bundle,
 	get_static_w_q_jax,
 	get_w_omega_jax_from_bundle,
 	compute_screening,
+)
+from .minimax_config import (
+	minimax_config_from_params,
+	sigma_quadrature_config_from_params,
 )
 from .ppm_sigma import (
 	compute_w0_wiwp_and_ppm_from_minimax,
@@ -1128,23 +1137,22 @@ def main(argv=None):
 	if do_screened:
 			with timing.section("gw_jax.chi0_W"):
 				with jax_profile.trace_section("chi0_W"):
-					omega_eval = float(params.get("debug_omega") or 0.0)
-					screening_method = str(params.get("screening_method", "minimax")).strip().lower()
-					minimax_energy_reference = params.get("minimax_energy_reference", "midgap")
-					use_shipped_minimax_tables = not bool(params.get("regenerate_minimax_tables", False))
-					window_pairs = None
-					if screening_method == "ctsp":
-						window_pairs = get_window_info(epsq, wfn, nband_max=nband)
+					minimax_config = minimax_config_from_params(params)
+					screening_setup = build_screening_setup(params, minimax_config)
+					window_pairs = maybe_build_ctsp_windows(
+						screening_setup,
+						epsq=epsq,
+						wfn=wfn,
+						nband=nband,
+						window_builder=get_window_info,
+					)
 					W_q = compute_screening(
 						V_qmunu, wf_bundle, window_pairs, meta, mesh_xy,
-						omega=omega_eval,
-						screening_method=screening_method,
-						minimax_target_error=float(params.get("minimax_target_error", 1.0e-6)),
-						minimax_max_nodes=int(params.get("minimax_max_nodes", 64)),
-						use_shipped_minimax_tables=use_shipped_minimax_tables,
-						minimax_energy_reference=minimax_energy_reference,
-						ppm_omega_p=params.get("ppm_omega_p"),
-						ppm_fallback_omega=float(params.get("ppm_fallback_omega", 2.0)),
+						omega=screening_setup.omega_eval,
+						screening_method=screening_setup.screening_method,
+						minimax_config=screening_setup.minimax_config,
+						ppm_omega_p=screening_setup.ppm_omega_p,
+						ppm_fallback_omega=screening_setup.ppm_fallback_omega,
 						tensors_filename=tensors_filename,
 						print0=print0,
 					)
@@ -1274,56 +1282,40 @@ def main(argv=None):
 			raise NotImplementedError("use_ppm_sigma is currently supported only for self_consistent=false.")
 		sigma_sx_screened_ref = sigma_sx_kbar_ij_jax
 		sigma_coh_static_ref = sigma_coh_kbar_ij_jax
-		omega_p_ry = float(params.get("ppm_omega_p", 2.0))
-		ppm_target_error = float(params.get("ppm_sigma_target_error", 1.0e-6))
-		ppm_max_nodes = int(params.get("ppm_sigma_max_nodes", 64))
-		ppm_fallback = float(params.get("ppm_fallback_omega", 2.0))
-		omega_min_ev = float(params.get("sigma_omega_min_ev", -5.0))
-		omega_max_ev = float(params.get("sigma_omega_max_ev", 5.0))
-		omega_step_ev = float(params.get("sigma_omega_step_ev", 0.25))
-		sigma_regularization_ev = float(params.get("sigma_regularization_ev", 0.25))
-		sigma_edge_factor = float(params.get("sigma_window_edge_factor", 1.5))
-		sigma_omega_batch_size = int(max(1, params.get("sigma_omega_batch_size", 4)))
-		sigma_omega_accumulation = str(params.get("sigma_omega_accumulation", "auto")).strip().lower()
-		ppm_sigma_scale = float(params.get("ppm_sigma_scale", 1.0))
-		ppm_sigma_flip_neg = bool(params.get("ppm_sigma_flip_neg", False))
-		ppm_invalid_mode = str(params.get("ppm_invalid_mode", "static_limit")).strip().lower()
-		sigma_debug_split_contrib = bool(params.get("sigma_debug_split_contrib", False))
-		sigma_freq_debug_output = bool(params.get("sigma_freq_debug_output", True))
-		fermi_reference = str(params.get("fermi_reference", "midgap")).strip().lower()
-		sigma_at_dft_extrapolate = bool(params.get("sigma_at_dft_extrapolate", False))
-		sigma_at_dft_energies = bool(params.get("sigma_at_dft_energies", False))
-		ppm_sigma_debug_static_norm = bool(params.get("ppm_sigma_debug_static_norm", False))
-		ppm_static_cohsex_check = bool(params.get("ppm_static_cohsex_check", False))
-		sigma_debug_quadrature = bool(params.get("sigma_debug_quadrature", False))
-		sigma_debug_quadrature_samples = int(params.get("sigma_debug_quadrature_samples", 200))
-		sigma_munu_h5_path = str(params.get("sigma_munu_h5_file", "") or "").strip()
-		sigma_kij_h5_path = str(params.get("sigma_kij_h5_file", "") or "").strip()
-		write_w_copies_debug = bool(params.get("write_w_copies_debug", True))
-		w_copies_debug_file = str(params.get("w_copies_debug_file", "w_copies_debug.h5") or "").strip()
-		sigma_freq_debug_file = str(params.get("sigma_freq_debug_file", "sigma_freq_debug.dat") or "").strip()
-		if sigma_freq_debug_file and (not os.path.isabs(sigma_freq_debug_file)):
-			sigma_freq_debug_file = os.path.join(input_dir, sigma_freq_debug_file)
-		if w_copies_debug_file and (not os.path.isabs(w_copies_debug_file)):
-			w_copies_debug_file = os.path.join(input_dir, w_copies_debug_file)
+		minimax_config = minimax_config_from_params(params)
+		sigma_quadrature = sigma_quadrature_config_from_params(params)
+		ppm_options = build_ppm_sigma_runtime_options(params, input_dir=input_dir, ryd2ev=ryd2ev)
+		omega_p_ry = ppm_options.omega_p_ry
+		ppm_fallback = ppm_options.ppm_fallback
+		omega_grid_ev = ppm_options.omega_grid_ev
+		omega_grid_ry = ppm_options.omega_grid_ry
+		sigma_regularization_ry = ppm_options.sigma_regularization_ry
+		sigma_edge_factor = ppm_options.sigma_edge_factor
+		sigma_omega_batch_size = ppm_options.sigma_omega_batch_size
+		sigma_omega_accumulation = ppm_options.sigma_omega_accumulation
+		ppm_sigma_scale = ppm_options.ppm_sigma_scale
+		ppm_sigma_flip_neg = ppm_options.ppm_sigma_flip_neg
+		ppm_invalid_mode = ppm_options.ppm_invalid_mode
+		sigma_debug_split_contrib = ppm_options.sigma_debug_split_contrib
+		sigma_freq_debug_output = ppm_options.sigma_freq_debug_output
+		fermi_reference = ppm_options.fermi_reference
+		sigma_at_dft_extrapolate = ppm_options.sigma_at_dft_extrapolate
+		sigma_at_dft_energies = ppm_options.sigma_at_dft_energies
+		ppm_sigma_debug_static_norm = ppm_options.ppm_sigma_debug_static_norm
+		ppm_static_cohsex_check = ppm_options.ppm_static_cohsex_check
+		sigma_debug_quadrature = ppm_options.sigma_debug_quadrature
+		sigma_debug_quadrature_samples = ppm_options.sigma_debug_quadrature_samples
+		sigma_munu_h5_path = ppm_options.sigma_munu_h5_path
+		sigma_kij_h5_path = ppm_options.sigma_kij_h5_path
+		write_w_copies_debug = ppm_options.write_w_copies_debug
+		w_copies_debug_file = ppm_options.w_copies_debug_file
+		sigma_freq_debug_file = ppm_options.sigma_freq_debug_file
 		if sigma_freq_debug_output and (not sigma_debug_split_contrib):
 			sigma_debug_split_contrib = True
 			print0("  NOTE: enabling sigma_debug_split_contrib for sigma_freq_debug_output")
 		if sigma_freq_debug_output and sigma_omega_accumulation == "kij_stream":
 			sigma_omega_accumulation = "kij"
 			print0("  NOTE: forcing sigma_omega_accumulation='kij' for sigma_freq_debug_output")
-		if omega_step_ev <= 0.0:
-			raise ValueError("sigma_omega_step_ev must be > 0.")
-		if omega_max_ev < omega_min_ev:
-			raise ValueError("sigma_omega_max_ev must be >= sigma_omega_min_ev.")
-		n_omega = int(np.floor((omega_max_ev - omega_min_ev) / omega_step_ev + 0.5)) + 1
-		omega_grid_ev = omega_min_ev + omega_step_ev * np.arange(n_omega, dtype=np.float64)
-		omega_grid_ry = omega_grid_ev / ryd2ev
-		sigma_regularization_ry = sigma_regularization_ev / ryd2ev
-		if sigma_munu_h5_path and not os.path.isabs(sigma_munu_h5_path):
-			sigma_munu_h5_path = os.path.join(input_dir, sigma_munu_h5_path)
-		if sigma_kij_h5_path and not os.path.isabs(sigma_kij_h5_path):
-			sigma_kij_h5_path = os.path.join(input_dir, sigma_kij_h5_path)
 		print0("")
 		print0("-" * 72)
 		print0("  GN-PPM + FREQUENCY-INTEGRATED SIGMA")
@@ -1361,7 +1353,6 @@ def main(argv=None):
 		with timing.section("gw_jax.ppm_sigma"):
 			import time as _ppm_time
 			_ppm_t0 = _ppm_time.perf_counter()
-			use_shipped_minimax_tables = not bool(params.get("regenerate_minimax_tables", False))
 			head_correction = lambda V_q, W_q, omega: apply_head_correction(
 				V_q,
 				W_q,
@@ -1380,11 +1371,12 @@ def main(argv=None):
 					wf_bundle,
 					meta,
 					mesh_xy,
+					minimax_config=minimax_config,
 					omega_p_ry=omega_p_ry,
-					target_error=float(params.get("minimax_target_error", 1.0e-6)),
-					max_nodes=int(params.get("minimax_max_nodes", 64)),
-					use_shipped_minimax_tables=use_shipped_minimax_tables,
-					minimax_energy_reference=params.get("minimax_energy_reference", fermi_reference),
+					minimax_energy_reference=(
+						minimax_config.energy_reference
+						if minimax_config.energy_reference is not None else fermi_reference
+					),
 					fallback_omega=ppm_fallback,
 					head_correction_fn=head_correction,
 					print0=print0,
@@ -1420,9 +1412,7 @@ def main(argv=None):
 					nk_tot=meta.nk_tot,
 					bispinor=bispinor,
 					mesh_xy=mesh_xy,
-					target_error=ppm_target_error,
-					max_nodes=ppm_max_nodes,
-					use_shipped_minimax_tables=use_shipped_minimax_tables,
+					quadrature_config=sigma_quadrature,
 					regularization_width_ry=sigma_regularization_ry,
 					edge_factor=sigma_edge_factor,
 					omega_batch_size=sigma_omega_batch_size,

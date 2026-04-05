@@ -20,6 +20,7 @@ import h5py
 
 from common.minimax import G_hgl as _G_hgl, G_fermi as _G_fermi
 from common import jax_profile
+from .minimax_config import MinimaxConfig, SigmaQuadratureConfig
 from .minimax_screening import (
     build_static_minimax_window_pair,
     extract_gn_ppm_parameters_from_Wc,
@@ -243,6 +244,7 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     meta,
     mesh_xy: Mesh,
     *,
+    minimax_config: MinimaxConfig | None = None,
     omega_p_ry: float = 2.0,
     target_error: float = 1.0e-6,
     max_nodes: int = 64,
@@ -254,6 +256,13 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     print0=print,
 ) -> PPMBuildResult:
     """Build GN-PPM parameters from minimax W(0) and W(i*omega_p)."""
+
+    if minimax_config is not None:
+        target_error = float(minimax_config.target_error)
+        max_nodes = int(minimax_config.max_nodes)
+        use_shipped_minimax_tables = bool(minimax_config.use_shipped_tables)
+        if minimax_energy_reference_fn is None:
+            minimax_energy_reference = minimax_config.energy_reference
 
     omega_p_ry = float(omega_p_ry)
     if omega_p_ry <= 0.0:
@@ -276,6 +285,7 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     _windows_minimax, quad = build_static_minimax_window_pair(
         enk_v,
         enk_c,
+        minimax_config=minimax_config,
         target_error=target_error,
         max_nodes=max_nodes,
         use_shipped_tables=bool(use_shipped_minimax_tables),
@@ -891,6 +901,7 @@ def compute_sigma_c_ppm_omega_grid(
     nk_tot: int,
     bispinor: bool,
     mesh_xy: Mesh,
+    quadrature_config: SigmaQuadratureConfig | None = None,
     target_error: float = 1.0e-6,
     max_nodes: int = 64,
     use_shipped_minimax_tables: bool = True,
@@ -927,6 +938,12 @@ def compute_sigma_c_ppm_omega_grid(
     """
     if None in (get_G_mu_nu_fn, get_G_R_fn, get_sigma_mu_nu_fn, get_sigma_kij_channels_fn):
         raise ValueError("All reusable sigma helper callables must be provided.")
+    if quadrature_config is not None:
+        target_error = float(quadrature_config.target_error)
+        max_nodes = int(quadrature_config.max_nodes)
+        crossing_max_nodes = int(quadrature_config.crossing_max_nodes)
+        crossing_eps_q = float(quadrature_config.crossing_eps_q)
+        use_shipped_minimax_tables = bool(quadrature_config.use_shipped_tables)
     import time as _sgtime
     _sg_t0 = _sgtime.perf_counter()
     _sg_prof = bool(os.environ.get("LORRAX_PROFILE_PPM", ""))

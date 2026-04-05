@@ -22,6 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from common import minimax as _minimax
+from .minimax_config import MinimaxConfig
 
 
 _TINY = 1.0e-12
@@ -579,12 +580,18 @@ def build_static_minimax_window_pair(
     enk_v: jax.Array,
     enk_c: jax.Array,
     *,
+    minimax_config: MinimaxConfig | None = None,
     target_error: float = 1.0e-6,
     max_nodes: int = 64,
     use_shipped_tables: bool = True,
     print_fn: Callable[..., None] | None = None,
 ) -> tuple[list[MinimaxWindowPair], LaplaceMinimaxQuadrature]:
     """Build one minimax window pair that spans all valence/conduction states."""
+
+    if minimax_config is not None:
+        target_error = float(minimax_config.target_error)
+        max_nodes = int(minimax_config.max_nodes)
+        use_shipped_tables = bool(minimax_config.use_shipped_tables)
 
     enk_v_host = np.asarray(jax.device_get(enk_v), dtype=np.float64)
     enk_c_host = np.asarray(jax.device_get(enk_c), dtype=np.float64)

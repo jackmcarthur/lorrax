@@ -24,6 +24,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 
 from common import Meta, jax_profile
+from .minimax_config import MinimaxConfig
 from .minimax_screening import (
     build_static_minimax_window_pair,
     extract_gn_ppm_parameters_from_Wc,
@@ -675,6 +676,7 @@ def compute_screening(
     *,
     omega=0.0,
     screening_method="minimax",
+    minimax_config: MinimaxConfig | None = None,
     minimax_target_error=1.0e-6,
     minimax_max_nodes=64,
     use_shipped_minimax_tables=True,
@@ -709,6 +711,9 @@ def compute_screening(
         Evaluation frequency in Ry (0.0 for static COHSEX).
     screening_method : {'minimax', 'ctsp'}
         Select minimax static path or legacy CTSP path.
+    minimax_config : MinimaxConfig or None
+        Optional shared minimax configuration object. When provided, it overrides
+        the individual minimax scalar arguments below.
     minimax_target_error : float
         Max 1/x fit error target for canonical minimax quadrature.
     minimax_max_nodes : int
@@ -762,6 +767,11 @@ def compute_screening(
         print0(f"  [DEBUG] CTSP screening at ω = {omega_ev:.4f} eV ({omega:.6f} Ry)")
 
     if method == "minimax":
+        if minimax_config is not None:
+            minimax_target_error = float(minimax_config.target_error)
+            minimax_max_nodes = int(minimax_config.max_nodes)
+            use_shipped_minimax_tables = bool(minimax_config.use_shipped_tables)
+            minimax_energy_reference = minimax_config.energy_reference
         s = wf_bundle.slices
         psi_vTX = wf_bundle.x(s.v_slice)
         psi_vY = wf_bundle.y(s.v_slice)
@@ -779,6 +789,7 @@ def compute_screening(
         _windows_minimax, quad = build_static_minimax_window_pair(
             enk_v,
             enk_c,
+            minimax_config=minimax_config,
             target_error=float(minimax_target_error),
             max_nodes=int(minimax_max_nodes),
             use_shipped_tables=bool(use_shipped_minimax_tables),

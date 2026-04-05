@@ -23,7 +23,9 @@
 src/
 ├── gw/            # GW/COHSEX calculations
 │   ├── gw_jax.py       # Main GW driver (entry point)
+│   ├── gw_driver_helpers.py # Driver-side setup helpers for screening/PPM sigma
 │   ├── gw_init.py      # Input parsing, chunking strategy
+│   ├── minimax_config.py # Shared minimax/sigma quadrature config objects
 │   ├── w_isdf.py       # Screened interaction W(iω) via CTSP
 │   ├── ppm_sigma.py    # GN-PPM dynamic self-energy Σ^c(ω)
 │   ├── minimax_screening.py # PPM extraction, quadrature helpers, shipped-table lookup
