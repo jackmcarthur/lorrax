@@ -903,6 +903,7 @@ def read_cohsex_input(filename: str) -> dict:
 			"band_chunk_size": geti("band_chunk_size", fallback=16),  # bands per FFT during r-chunk loop
 			"memory_per_device_gb": getf("memory_per_device_gb", fallback=0.0),  # 0=auto-detect
 			"isdf_pair_mode": get("isdf_pair_mode", fallback="spin_traced").strip().lower(),
+			"apply_head_diagonal": getb("apply_head_diagonal", fallback=False),
 		}
 	else:
 		# Fallback defaults if no section found
