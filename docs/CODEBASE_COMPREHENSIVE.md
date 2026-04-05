@@ -99,14 +99,15 @@ Contents:
 - `README.md`: sweep values and error conventions
 - `crossing/*.npz`, `noncrossing/*.npz`: stored node/weight tables
 
-Runtime lookup is implemented in `src/gw/minimax_screening.py` and is opt-in from the
-GW input file:
+Runtime lookup is implemented in `src/gw/minimax_screening.py` and is controlled from
+the GW input file with a negative-form flag:
 
 ```ini
-use_shipped_minimax_tables = true
+regenerate_minimax_tables = false
 ```
 
-Default is `false`, which preserves the prior exact-solver behavior.
+Default is `false`, which means "reuse shipped tables when available." Setting it to
+`true` forces exact quadrature regeneration.
 
 ---
 

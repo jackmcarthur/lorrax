@@ -755,6 +755,19 @@ def read_cohsex_input(filename: str) -> dict:
 		get = section.get
 		geti = section.getint
 		getf = section.getfloat
+
+		def getb_opt(name):
+			raw = get(name, fallback=None)
+			if raw is None:
+				return None
+			return getb(name)
+
+		regenerate_minimax_tables = getb_opt("regenerate_minimax_tables")
+		legacy_use_shipped = getb_opt("use_shipped_minimax_tables")
+		if regenerate_minimax_tables is None and legacy_use_shipped is not None:
+			regenerate_minimax_tables = not legacy_use_shipped
+		if regenerate_minimax_tables is None:
+			regenerate_minimax_tables = False
 		# ============================================================================
 		# PARAMETER DEFINITIONS:
 		# ============================================================================
@@ -782,9 +795,10 @@ def read_cohsex_input(filename: str) -> dict:
 		# screening_method: Screening backend: 'minimax' (default) or 'ctsp'.
 			# minimax_target_error: Target max error for minimax 1/x approximation.
 			# minimax_max_nodes: Maximum allowed minimax nodes.
-			# use_shipped_minimax_tables: If True, allow minimax helpers to load
-			#                bundled quadrature tables from src/common/minimax_assets
-			#                before falling back to exact solvers. Default=False.
+			# regenerate_minimax_tables: If True, bypass shipped minimax tables and
+			#                rebuild quadratures with the exact solver. Default=False.
+			#                When False, minimax helpers may load bundled tables from
+			#                src/common/minimax_assets before falling back to exact solvers.
 			# minimax_energy_reference: uniform shift reference for minimax χ0/W
 			#                ('midgap' default, 'vbm', 'cbm', 'none', or numeric).
 			# ppm_omega_p:   If set (>0, in Ry), extract GN-PPM parameters from
@@ -855,7 +869,7 @@ def read_cohsex_input(filename: str) -> dict:
 			"screening_method": get("screening_method", fallback="minimax").strip().lower(),
 				"minimax_target_error": getf("minimax_target_error", fallback=1.0e-6),
 				"minimax_max_nodes": geti("minimax_max_nodes", fallback=64),
-				"use_shipped_minimax_tables": getb("use_shipped_minimax_tables", fallback=False),
+				"regenerate_minimax_tables": bool(regenerate_minimax_tables),
 				"minimax_energy_reference": get("minimax_energy_reference", fallback="midgap").strip().lower(),
 				"ppm_omega_p": getf("ppm_omega_p", fallback=2.0),
 			"ppm_fallback_omega": getf("ppm_fallback_omega", fallback=2.0),
@@ -913,7 +927,7 @@ def read_cohsex_input(filename: str) -> dict:
 				"screening_method": "minimax",
 					"minimax_target_error": 1.0e-6,
 					"minimax_max_nodes": 64,
-					"use_shipped_minimax_tables": False,
+					"regenerate_minimax_tables": False,
 					"minimax_energy_reference": "midgap",
 					"ppm_omega_p": 2.0,
 				"ppm_fallback_omega": 2.0,

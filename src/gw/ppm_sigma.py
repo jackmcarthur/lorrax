@@ -246,7 +246,7 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     omega_p_ry: float = 2.0,
     target_error: float = 1.0e-6,
     max_nodes: int = 64,
-    use_shipped_minimax_tables: bool = False,
+    use_shipped_minimax_tables: bool = True,
     minimax_energy_reference: str | float | int | None = "midgap",
     minimax_energy_reference_fn: Callable[[jax.Array, jax.Array], float] | None = None,
     fallback_omega: float = 2.0,
@@ -593,7 +593,7 @@ def _convolve_sigma_branch_kij(
     debug_quadrature_samples: int = 200,
     efermi_vac: float | None = None,
     axis_kind: str = "",
-    use_shipped_minimax_tables: bool = False,
+    use_shipped_minimax_tables: bool = True,
 ) -> tuple[jax.Array, list[_SigmaWindow]]:
     """Convolve sigma in one pass, accumulating directly in (k,i,j) space.
 
@@ -893,7 +893,7 @@ def compute_sigma_c_ppm_omega_grid(
     mesh_xy: Mesh,
     target_error: float = 1.0e-6,
     max_nodes: int = 64,
-    use_shipped_minimax_tables: bool = False,
+    use_shipped_minimax_tables: bool = True,
     crossing_max_nodes: int = 500,
     crossing_eps_q: float = 1.0e-3,
     regularization_width_ry: float = 0.018374661087827496,  # 0.25 eV

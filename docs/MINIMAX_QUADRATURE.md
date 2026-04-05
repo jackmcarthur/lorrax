@@ -168,10 +168,11 @@ from `src/common/minimax_assets/`.
 Enable from the GW input:
 
 ```ini
-use_shipped_minimax_tables = true
+regenerate_minimax_tables = false
 ```
 
-Default is `false`.
+Default is `false`, meaning shipped tables are reused when a safe match exists. Set it
+to `true` to force exact regeneration.
 
 Selection rule at runtime:
 - choose the smallest tabulated range that is greater than or equal to the requested one

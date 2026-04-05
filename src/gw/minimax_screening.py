@@ -426,7 +426,7 @@ def solve_laplace_minimax_interval(
     *,
     target_error: float = 1.0e-6,
     max_nodes: int = 64,
-    use_shipped_tables: bool = False,
+    use_shipped_tables: bool = True,
 ) -> LaplaceMinimaxQuadrature:
     """Fit ``1/x ≈ sum alpha_l exp(-tau_l x)`` on ``[x_min, x_max]``.
 
@@ -529,7 +529,7 @@ def solve_phase_minimax_bandwidth(
     max_nodes: int = 500,
     eps_q: float = 1.0e-3,
     target_kind: str = "hgl",
-    use_shipped_tables: bool = False,
+    use_shipped_tables: bool = True,
 ) -> CrossingMinimaxQuadrature:
     """Fit crossing regularization target on ``[0, A_dim]`` as ``sum alpha_l sin(tau_l u)``.
 
@@ -581,7 +581,7 @@ def build_static_minimax_window_pair(
     *,
     target_error: float = 1.0e-6,
     max_nodes: int = 64,
-    use_shipped_tables: bool = False,
+    use_shipped_tables: bool = True,
     print_fn: Callable[..., None] | None = None,
 ) -> tuple[list[MinimaxWindowPair], LaplaceMinimaxQuadrature]:
     """Build one minimax window pair that spans all valence/conduction states."""

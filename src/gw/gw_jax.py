@@ -1131,6 +1131,7 @@ def main(argv=None):
 					omega_eval = float(params.get("debug_omega") or 0.0)
 					screening_method = str(params.get("screening_method", "minimax")).strip().lower()
 					minimax_energy_reference = params.get("minimax_energy_reference", "midgap")
+					use_shipped_minimax_tables = not bool(params.get("regenerate_minimax_tables", False))
 					window_pairs = None
 					if screening_method == "ctsp":
 						window_pairs = get_window_info(epsq, wfn, nband_max=nband)
@@ -1140,7 +1141,7 @@ def main(argv=None):
 						screening_method=screening_method,
 						minimax_target_error=float(params.get("minimax_target_error", 1.0e-6)),
 						minimax_max_nodes=int(params.get("minimax_max_nodes", 64)),
-						use_shipped_minimax_tables=bool(params.get("use_shipped_minimax_tables", False)),
+						use_shipped_minimax_tables=use_shipped_minimax_tables,
 						minimax_energy_reference=minimax_energy_reference,
 						ppm_omega_p=params.get("ppm_omega_p"),
 						ppm_fallback_omega=float(params.get("ppm_fallback_omega", 2.0)),
@@ -1360,6 +1361,7 @@ def main(argv=None):
 		with timing.section("gw_jax.ppm_sigma"):
 			import time as _ppm_time
 			_ppm_t0 = _ppm_time.perf_counter()
+			use_shipped_minimax_tables = not bool(params.get("regenerate_minimax_tables", False))
 			head_correction = lambda V_q, W_q, omega: apply_head_correction(
 				V_q,
 				W_q,
@@ -1381,7 +1383,7 @@ def main(argv=None):
 					omega_p_ry=omega_p_ry,
 					target_error=float(params.get("minimax_target_error", 1.0e-6)),
 					max_nodes=int(params.get("minimax_max_nodes", 64)),
-					use_shipped_minimax_tables=bool(params.get("use_shipped_minimax_tables", False)),
+					use_shipped_minimax_tables=use_shipped_minimax_tables,
 					minimax_energy_reference=params.get("minimax_energy_reference", fermi_reference),
 					fallback_omega=ppm_fallback,
 					head_correction_fn=head_correction,
@@ -1420,7 +1422,7 @@ def main(argv=None):
 					mesh_xy=mesh_xy,
 					target_error=ppm_target_error,
 					max_nodes=ppm_max_nodes,
-					use_shipped_minimax_tables=bool(params.get("use_shipped_minimax_tables", False)),
+					use_shipped_minimax_tables=use_shipped_minimax_tables,
 					regularization_width_ry=sigma_regularization_ry,
 					edge_factor=sigma_edge_factor,
 					omega_batch_size=sigma_omega_batch_size,

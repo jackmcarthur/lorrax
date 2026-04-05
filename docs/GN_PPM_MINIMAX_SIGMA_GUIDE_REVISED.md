@@ -305,10 +305,11 @@ All of the minimax helper calls above can now reuse bundled quadrature tables th
 the GW input flag:
 
 ```ini
-use_shipped_minimax_tables = true
+regenerate_minimax_tables = false
 ```
 
-Default remains `false`.
+Default remains `false`, meaning the code reuses bundled tables when possible. Setting
+it to `true` forces fresh exact quadrature generation.
 
 When enabled, screening and sigma window construction first consult
 `src/common/minimax_assets/catalog.json` and load the smallest safe precomputed table:

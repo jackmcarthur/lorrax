@@ -677,7 +677,7 @@ def compute_screening(
     screening_method="minimax",
     minimax_target_error=1.0e-6,
     minimax_max_nodes=64,
-    use_shipped_minimax_tables=False,
+    use_shipped_minimax_tables=True,
     minimax_energy_reference="midgap",
     minimax_energy_reference_fn=None,
     ppm_omega_p=None,
