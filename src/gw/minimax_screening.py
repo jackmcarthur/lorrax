@@ -10,6 +10,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import hashlib
+import json
+import os
+from pathlib import Path
 from typing import Callable
 
 import jax
@@ -20,6 +24,70 @@ from common import minimax as _minimax
 
 
 _TINY = 1.0e-12
+
+
+def _minimax_disk_cache_dir() -> Path | None:
+    """Return the persistent minimax cache directory, creating it if needed."""
+
+    if os.environ.get("LORRAX_DISABLE_MINIMAX_DISK_CACHE", "").strip().lower() in {"1", "true", "yes"}:
+        return None
+    cache_dir = os.environ.get("LORRAX_MINIMAX_CACHE_DIR")
+    if not cache_dir:
+        cache_dir = os.path.join(Path.home(), ".cache", "lorrax", "minimax_quadratures")
+    path = Path(cache_dir).expanduser()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _minimax_disk_cache_path(namespace: str, payload: dict[str, object]) -> Path | None:
+    cache_dir = _minimax_disk_cache_dir()
+    if cache_dir is None:
+        return None
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+    return cache_dir / f"{namespace}_{digest}.npz"
+
+
+def _load_minimax_disk_cache(namespace: str, payload: dict[str, object]) -> tuple[np.ndarray, np.ndarray, float] | None:
+    path = _minimax_disk_cache_path(namespace, payload)
+    if path is None or not path.exists():
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            tau = np.asarray(data["tau"], dtype=np.float64)
+            w = np.asarray(data["w"], dtype=np.float64)
+            err = float(data["err"][()])
+        return tau, w, err
+    except Exception:
+        return None
+
+
+def _store_minimax_disk_cache(
+    namespace: str,
+    payload: dict[str, object],
+    tau: np.ndarray,
+    w: np.ndarray,
+    err: float,
+) -> None:
+    path = _minimax_disk_cache_path(namespace, payload)
+    if path is None:
+        return
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    try:
+        with tmp.open("wb") as fh:
+            np.savez_compressed(
+                fh,
+                tau=np.asarray(tau, dtype=np.float64),
+                w=np.asarray(w, dtype=np.float64),
+                err=np.asarray(float(err), dtype=np.float64),
+            )
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
 
 
 @dataclass(frozen=True)
@@ -127,10 +195,23 @@ def _solve_noncrossing_scaled_cached(
     target_key: float,
     max_nodes: int,
 ) -> tuple[np.ndarray, np.ndarray, float]:
+    payload = {
+        "solver": "noncrossing",
+        "logR_key": float(logR_key),
+        "target_key": float(target_key),
+        "max_nodes": int(max_nodes),
+    }
+    cached = _load_minimax_disk_cache("noncrossing", payload)
+    if cached is not None:
+        return cached
     R = float(np.exp(logR_key))
     target = float(target_key)
     tau, w, _n, err = _minimax.noncrossing_grids(R, target, N_start=2, N_max=max_nodes)
-    return np.asarray(tau, dtype=np.float64), np.asarray(w, dtype=np.float64), float(err)
+    tau = np.asarray(tau, dtype=np.float64)
+    w = np.asarray(w, dtype=np.float64)
+    err = float(err)
+    _store_minimax_disk_cache("noncrossing", payload, tau, w, err)
+    return tau, w, err
 
 
 @lru_cache(maxsize=64)
@@ -140,13 +221,27 @@ def _solve_noncrossing_imag_scaled_cached(
     target_key: float,
     max_nodes: int,
 ) -> tuple[np.ndarray, np.ndarray, float]:
+    payload = {
+        "solver": "noncrossing_imag",
+        "logR_key": float(logR_key),
+        "omega_hat_key": float(omega_hat_key),
+        "target_key": float(target_key),
+        "max_nodes": int(max_nodes),
+    }
+    cached = _load_minimax_disk_cache("noncrossing_imag", payload)
+    if cached is not None:
+        return cached
     R = float(np.exp(logR_key))
     omega_hat = float(omega_hat_key)
     target = float(target_key)
     tau, w, _n, err = _minimax.noncrossing_imag_grids(
         R, omega_hat, target, N_start=2, N_max=max_nodes,
     )
-    return np.asarray(tau, dtype=np.float64), np.asarray(w, dtype=np.float64), float(err)
+    tau = np.asarray(tau, dtype=np.float64)
+    w = np.asarray(w, dtype=np.float64)
+    err = float(err)
+    _store_minimax_disk_cache("noncrossing_imag", payload, tau, w, err)
+    return tau, w, err
 
 
 @lru_cache(maxsize=128)
@@ -157,6 +252,17 @@ def _solve_crossing_scaled_cached(
     eps_q_key: float,
     target_kind: str,
 ) -> tuple[np.ndarray, np.ndarray, float]:
+    payload = {
+        "solver": "crossing",
+        "A_key": float(A_key),
+        "target_key": float(target_key),
+        "max_nodes": int(max_nodes),
+        "eps_q_key": float(eps_q_key),
+        "target_kind": str(target_kind),
+    }
+    cached = _load_minimax_disk_cache("crossing", payload)
+    if cached is not None:
+        return cached
     A_dim = float(A_key)
     target = float(target_key)
     eps_q = float(eps_q_key)
@@ -176,7 +282,11 @@ def _solve_crossing_scaled_cached(
         eps_q=eps_q,
         N_max=max_nodes,
     )
-    return np.asarray(tau, dtype=np.float64), np.asarray(w, dtype=np.float64), float(err)
+    tau = np.asarray(tau, dtype=np.float64)
+    w = np.asarray(w, dtype=np.float64)
+    err = float(err)
+    _store_minimax_disk_cache("crossing", payload, tau, w, err)
+    return tau, w, err
 
 
 def solve_laplace_minimax_interval(
