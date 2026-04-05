@@ -309,26 +309,29 @@ INPUT FILES
                       │
                       ↓
 ┌───────────────────────────────────────────────────────────┐
-│ STAGE 3: Green's Function & Susceptibility (gw_jax.py)│
+│ STAGE 3: Screening Setup + Susceptibility              │
 │ ────────────────────────────────────────────────────────  │
-│   1. Construct G_R^occ(μ,ν), G_R^all(μ,ν) in R-space     │
-│   2. Compute χ⁰_R(μ,ν,iω) via CTSP quadrature (w_isdf.py)│
-│   3. FFT R→q: χ⁰_q(μ,ν,iω)                               │
-│   4. Dyson solve: W_q(μ,ν,iω) = V_q + V_q χ⁰_q W_q       │
-│   5. Extract static: W_R(μ,ν) = W_R(μ,ν,ω=0)             │
+│   1. Driver resolves screening setup                    │
+│      (gw_driver_helpers.py + minimax_config.py)         │
+│   2. Compute χ⁰_R(μ,ν,iω) via minimax/CTSP (w_isdf.py)  │
+│   3. FFT R→q: χ⁰_q(μ,ν,iω)                              │
+│   4. Dyson solve: W_q(μ,ν,iω) = V_q + V_q χ⁰_q W_q      │
+│   5. Extract static: W_R(μ,ν) = W_R(μ,ν,ω=0)            │
 └─────────────────────┬─────────────────────────────────────┘
                       ↓
               W_R(μ,ν), V_R(μ,ν)
                       │
                       ↓
 ┌───────────────────────────────────────────────────────────┐
-│ STAGE 4: Self-Energy (gw_jax.py)                      │
+│ STAGE 4: Self-Energy + Optional GN-PPM Sigma             │
 │ ────────────────────────────────────────────────────────  │
-│   1. Exchange: Σ^X_R(μ,ν) = -G^occ_R(μ,ν) ∘ W_R(μ,ν)     │
-│   2. COHSEX:   Σ^C_R(μ,ν) = G^all_R(μ,ν) ∘ [W_R - V_R]   │
-│   3. FFT R→k: Σ_k(μ,ν)                                   │
-│   4. Project to bands: Σ_k,ij = ⟨ψ_ki|Σ_k|ψ_kj⟩          │
-│   5. (Optional) Self-consistency loop (experimental)      │
+│   1. Exchange/COHSEX static pipeline in gw_jax.py        │
+│   2. Optional GN-PPM build from minimax W(0), W(iωp)     │
+│      (ppm_sigma.py + minimax_config.py)                  │
+│   3. Optional Σ^c(ω) windowing and accumulation          │
+│      (ppm_sigma.py + gw_driver_helpers.py)               │
+│   4. FFT/projection to Σ_k,ij                            │
+│   5. (Optional) Self-consistency loop (experimental)     │
 └─────────────────────┬─────────────────────────────────────┘
                       ↓
 OUTPUT FILES
@@ -512,17 +515,19 @@ gw_jax.main()
 
 ```
 gw_jax.main()
-  └─→ compute_sigma_pipeline_jax()                [gw_jax.py:1064]
-       ├─→ get_zeta_q_and_v_q_mu_nu()            [gw_jax.py:524]
-       │    └─→ compute_all_V_q_from_zeta_h5()   [compute_vcoul.py]
-       ├─→ get_chi0_jax()                         [w_isdf.py:150]
-       │    └─→ _get_chi_kernel()                 [w_isdf.py:60]
-       ├─→ get_static_w_q_jax()                   [w_isdf.py:240]
-       │    └─→ (Dyson solve: W = V + V χ W)
-       ├─→ get_sigma_static_mu_nu_jax()           [gw_jax.py:941]
-       │    └─→ (Σ^X = -G^occ ∘ W, Σ^C = G^all ∘ (W-V))
-       └─→ get_sigma_static_kij_jax()             [gw_jax.py:979]
-            └─→ project_potential_to_bands()      [gw_jax.py:1050]
+  ├─→ build_screening_setup()                     [gw_driver_helpers.py]
+  ├─→ maybe_build_ctsp_windows()                 [gw_driver_helpers.py]
+  ├─→ compute_screening()                         [w_isdf.py]
+  │    ├─→ build_static_minimax_window_pair()     [minimax_screening.py]
+  │    └─→ compute_chi0_minimax() / solve_w...    [w_isdf.py]
+  ├─→ compute_sigma_pipeline_jax()                [gw_jax.py]
+  │    ├─→ get_sigma_static_mu_nu_jax()           [gw_jax.py]
+  │    └─→ get_sigma_static_kij_jax()             [gw_jax.py]
+  ├─→ build_ppm_sigma_runtime_options()           [gw_driver_helpers.py]
+  ├─→ compute_w0_wiwp_and_ppm_from_minimax()      [ppm_sigma.py]
+  │    ├─→ build_static_minimax_window_pair()     [minimax_screening.py]
+  │    └─→ extract_gn_ppm_parameters_from_Wc()    [minimax_screening.py]
+  └─→ compute_sigma_c_ppm_omega_grid()            [ppm_sigma.py]
 ```
 
 ---
@@ -573,6 +578,8 @@ def matmul_2d(A, B):
 | Task | Primary File | Function/Class |
 |------|-------------|----------------|
 | **Parse input file** | `gw/gw_init.py` | `read_cohsex_input()` |
+| **Shared minimax config** | `gw/minimax_config.py` | `MinimaxConfig`, `SigmaQuadratureConfig` |
+| **Driver setup helpers** | `gw/gw_driver_helpers.py` | `build_screening_setup()`, `build_ppm_sigma_runtime_options()` |
 | **Load wavefunctions** | `common/load_wfns.py` | `get_sharded_wfns()` |
 | **FFT G→r** | `common/load_wfns.py:74` | `shard_map` FFT |
 | **NUFFT k→R** | `common/load_wfns.py:97` | `nufft_k_to_R_batched()` |
@@ -583,8 +590,11 @@ def matmul_2d(A, B):
 | **Solve for ζ** | `gw/gw_jax.py:172` | `solve_zeta_cholesky()` |
 | **Fit zeta (full pipeline)** | `common/load_wfns.py:1720` | `fit_zeta_chunked_to_h5()` |
 | **Compute V_q** | `gw/compute_vcoul.py` | `compute_all_V_q_from_zeta_h5()` |
+| **Canonical minimax lookup** | `gw/minimax_screening.py` | `build_static_minimax_window_pair()` |
 | **χ⁰ kernel** | `gw/w_isdf.py:60` | `_get_chi_kernel()` |
 | **Dyson solve for W** | `gw/w_isdf.py:240` | `get_static_w_q_jax()` |
+| **PPM build from minimax W** | `gw/ppm_sigma.py` | `compute_w0_wiwp_and_ppm_from_minimax()` |
+| **Σc(ω) GN-PPM path** | `gw/ppm_sigma.py` | `compute_sigma_c_ppm_omega_grid()` |
 | **Self-energy Σ** | `gw/gw_jax.py:941` | `get_sigma_static_mu_nu_jax()` |
 | **Project to bands** | `gw/gw_jax.py:1050` | `project_potential_to_bands()` |
 | **Head correction** | `gw/gw_jax.py:1948` | (inline in main loop) |
