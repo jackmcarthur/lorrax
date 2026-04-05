@@ -26,8 +26,16 @@ from types import SimpleNamespace
 jax.config.update("jax_enable_x64", True)
 #jax.config.update("jax_platform_name", "cpu")
 
-# Initialize JAX distributed only when running multi-process
+# Initialize JAX distributed only when running multi-process.
+# Guard: when run via `python -m gw.gw_jax`, the module executes as __main__
+# first, then gw_init.py re-imports it as gw.gw_jax.  Module-level globals
+# are NOT shared between these two namespace copies, so we use an env-var
+# sentinel that persists across re-imports within the same process.
+_DISTRIBUTED_SENTINEL = "_LORRAX_JAX_DISTRIBUTED_DONE"
+
 def _maybe_init_jax_distributed():
+	if os.environ.get(_DISTRIBUTED_SENTINEL):
+		return
 	proc_count = int(os.environ.get("JAX_PROCESS_COUNT",
 						 os.environ.get("JAX_NUM_PROCESSES",
 						 os.environ.get("SLURM_NTASKS", "1"))))
@@ -35,6 +43,7 @@ def _maybe_init_jax_distributed():
 		# Prefer auto-detection (NERSC pattern): JAX reads SLURM env vars directly
 		try:
 			jax.distributed.initialize()
+			os.environ[_DISTRIBUTED_SENTINEL] = "1"
 			return
 		except Exception:
 			pass
@@ -60,6 +69,7 @@ def _maybe_init_jax_distributed():
 		jax.distributed.initialize(coordinator_address=coord,
 								   num_processes=proc_count,
 								   process_id=proc_id)
+	os.environ[_DISTRIBUTED_SENTINEL] = "1"
 
 # Global mesh for sharding across bands
 _maybe_init_jax_distributed()
@@ -1347,6 +1357,8 @@ def main(argv=None):
 			except Exception as exc:
 				print0(f"  epsinv head diagnostics unavailable: {exc}")
 		with timing.section("gw_jax.ppm_sigma"):
+			import time as _ppm_time
+			_ppm_t0 = _ppm_time.perf_counter()
 			head_correction = lambda V_q, W_q, omega: apply_head_correction(
 				V_q,
 				W_q,
@@ -1373,6 +1385,8 @@ def main(argv=None):
 					head_correction_fn=head_correction,
 					print0=print0,
 				)
+			_ppm_t1 = _ppm_time.perf_counter()
+			print0(f"  [TIMING] PPM build: {_ppm_t1 - _ppm_t0:.1f}s")
 			if meta.rank == 0 and write_w_copies_debug and w_copies_debug_file:
 				write_w_copies_debug_h5(
 					w_copies_debug_file,
@@ -1381,6 +1395,8 @@ def main(argv=None):
 					Wiwp_ppm_q=ppm.Wiwp_q,
 					print_fn=print0,
 				)
+			_ppm_t2 = _ppm_time.perf_counter()
+			print0(f"  [TIMING] W-debug write: {_ppm_t2 - _ppm_t1:.1f}s")
 			sigma_omega = compute_sigma_c_ppm_omega_grid(
 				psi_coh_rmuT_X=sigma_views.psi_cohT,
 				psi_coh_rmu_Y=sigma_views.psi_coh,
@@ -1421,6 +1437,8 @@ def main(argv=None):
 				ppm_static_cohsex_check=ppm_static_cohsex_check,
 				print0=print0,
 			)
+			_ppm_t3 = _ppm_time.perf_counter()
+			print0(f"  [TIMING] compute_sigma_c_ppm_omega_grid: {_ppm_t3 - _ppm_t2:.1f}s")
 			sigma_coh_ppm_omega_kij = sigma_omega.sigma_c_kij
 			iw0 = 0 if ppm_static_cohsex_check else int(np.argmin(np.abs(omega_grid_ry)))
 			if sigma_coh_ppm_omega_kij is None:
