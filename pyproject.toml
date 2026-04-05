@@ -29,6 +29,14 @@ lorrax-bse = "bse.bse_isdf:main"
 [tool.uv]
 package = true
 
+[tool.setuptools.package-data]
+common = [
+    "minimax_assets/*.json",
+    "minimax_assets/*.md",
+    "minimax_assets/crossing/*.npz",
+    "minimax_assets/noncrossing/*.npz",
+]
+
 [tool.uv.workspace]
 members = [
     
