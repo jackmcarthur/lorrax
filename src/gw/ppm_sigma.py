@@ -19,6 +19,7 @@ import numpy as np
 import h5py
 
 from common.minimax import G_hgl as _G_hgl, G_fermi as _G_fermi
+from common import jax_profile
 from .minimax_screening import (
     build_static_minimax_window_pair,
     extract_gn_ppm_parameters_from_Wc,
@@ -734,91 +735,98 @@ def _convolve_sigma_branch_kij(
     _prof_n = 0
     _prof_total_start = _time.perf_counter()
 
-    for win in windows:
-        mask_A = jnp.asarray(win.mask_A)
-        mask_B = jnp.asarray(win.mask_B)
-        E_ref_A_j = jnp.asarray(win.E_ref_A, dtype=jnp.float64)
-        E_ref_B_j = jnp.asarray(win.E_ref_B, dtype=jnp.float64)
-        project_code = {"full": 0, "imag": 1}.get(win.project, 2)
-        project_code_j = jnp.asarray(project_code, dtype=jnp.int32)
-        acc_win = None
-        if acc_total is not None:
-            acc_win = jnp.zeros_like(acc_total)
+    branch_label = log_tag if log_tag else f"kernel_sign={kernel_sign:+d}"
+    with jax_profile.annotation(f"sigma_branch[{branch_label}]"):
+        for win_idx, win in enumerate(windows):
+            with jax_profile.step_annotation(
+                "sigma_window",
+                step_num=win_idx,
+                detail=f"{branch_label}:{win.name}:n{int(win.alpha.shape[0])}",
+            ):
+                mask_A = jnp.asarray(win.mask_A)
+                mask_B = jnp.asarray(win.mask_B)
+                E_ref_A_j = jnp.asarray(win.E_ref_A, dtype=jnp.float64)
+                E_ref_B_j = jnp.asarray(win.E_ref_B, dtype=jnp.float64)
+                project_code = {"full": 0, "imag": 1}.get(win.project, 2)
+                project_code_j = jnp.asarray(project_code, dtype=jnp.int32)
+                acc_win = None
+                if acc_total is not None:
+                    acc_win = jnp.zeros_like(acc_total)
 
-        for t_node, alpha_node in zip(win.t_nodes, win.alpha):
-            if _prof_enabled:
-                _t0 = _time.perf_counter()
-            t_node_j = jnp.asarray(t_node, dtype=jnp.complex128)
-            with mesh_xy:
-                sigma_tau_kij_ri = tau_channel_step(
-                    psi_coh_rmuT_X,
-                    psi_coh_rmu_Y,
-                    psi_proj_rmu_X,
-                    psi_proj_rmuT_Y,
-                    E_A,
-                    mask_A,
-                    B_mu_nu,
-                    Omega_mu_nu,
-                    mask_B,
-                    E_ref_A_j,
-                    E_ref_B_j,
-                    t_node_j,
-                    eye_nb,
-                )
-            sigma_tau_kij_re = sigma_tau_kij_ri[0]
-            sigma_tau_kij_im = sigma_tau_kij_ri[1]
-            if _prof_enabled:
-                sigma_tau_kij_re.block_until_ready()
-                sigma_tau_kij_im.block_until_ready()
-                _t1 = _time.perf_counter()
-                _prof_t["tau_channel"] += _t1 - _t0
-                _t4 = _t1
-            if debug_quadrature:
-                re_mag = float(jnp.max(jnp.abs(sigma_tau_kij_re)))
-                im_mag = float(jnp.max(jnp.abs(sigma_tau_kij_im)))
-                print0(f"  [diag] {log_tag}{win.name}: |K[Re(σ)]|={re_mag:.4e}  |K[Im(σ)]|={im_mag:.4e}")
-            alpha_eff = complex(alpha_node) * np.exp(-1j * (win.E_ref_A + win.E_ref_B) * t_node)
-            omega_sign = float(win.omega_sign) * float(omega_sign_flip)
-            alpha_eff_j = jnp.asarray(alpha_eff, dtype=jnp.complex128)
-            omega_sign_j = jnp.asarray(omega_sign, dtype=jnp.float64)
-            pref = jnp.asarray(win.prefactor * scale, dtype=jnp.float64)
-            if acc_win is not None:
-                acc_win = _accumulate_window_channels_jit(
-                    acc_win,
-                    sigma_tau_kij_re,
-                    sigma_tau_kij_im,
-                    omega_vec,
-                    t_node_j,
-                    alpha_eff_j,
-                    omega_sign_j,
-                    pref,
-                    project_code_j,
-                )
-                if _prof_enabled:
-                    acc_win.block_until_ready()
-                    _t5 = _time.perf_counter()
-                    _prof_t["omega_acc"] += _t5 - _t4
-            _prof_n += 1
-            if acc_win is None:
-                # Stream in omega chunks without repeating τ-node work.
-                for ibeg in range(0, n_omega, int(max(1, omega_batch_size))):
-                    iend = min(ibeg + int(max(1, omega_batch_size)), n_omega)
-                    idx = omega_global_idx[ibeg:iend]
-                    omega_batch = omega_vec[ibeg:iend]
-                    batch_proj = _project_stream_batch_jit(
-                        omega_batch,
-                        sigma_tau_kij_re,
-                        sigma_tau_kij_im,
-                        t_node_j,
-                        alpha_eff_j,
-                        omega_sign_j,
-                        pref,
-                        project_code_j,
-                    )
-                    stream_writer(idx, batch_proj)
+                for t_node, alpha_node in zip(win.t_nodes, win.alpha):
+                    if _prof_enabled:
+                        _t0 = _time.perf_counter()
+                    t_node_j = jnp.asarray(t_node, dtype=jnp.complex128)
+                    with mesh_xy:
+                        sigma_tau_kij_ri = tau_channel_step(
+                            psi_coh_rmuT_X,
+                            psi_coh_rmu_Y,
+                            psi_proj_rmu_X,
+                            psi_proj_rmuT_Y,
+                            E_A,
+                            mask_A,
+                            B_mu_nu,
+                            Omega_mu_nu,
+                            mask_B,
+                            E_ref_A_j,
+                            E_ref_B_j,
+                            t_node_j,
+                            eye_nb,
+                        )
+                    sigma_tau_kij_re = sigma_tau_kij_ri[0]
+                    sigma_tau_kij_im = sigma_tau_kij_ri[1]
+                    if _prof_enabled:
+                        sigma_tau_kij_re.block_until_ready()
+                        sigma_tau_kij_im.block_until_ready()
+                        _t1 = _time.perf_counter()
+                        _prof_t["tau_channel"] += _t1 - _t0
+                        _t4 = _t1
+                    if debug_quadrature:
+                        re_mag = float(jnp.max(jnp.abs(sigma_tau_kij_re)))
+                        im_mag = float(jnp.max(jnp.abs(sigma_tau_kij_im)))
+                        print0(f"  [diag] {log_tag}{win.name}: |K[Re(σ)]|={re_mag:.4e}  |K[Im(σ)]|={im_mag:.4e}")
+                    alpha_eff = complex(alpha_node) * np.exp(-1j * (win.E_ref_A + win.E_ref_B) * t_node)
+                    omega_sign = float(win.omega_sign) * float(omega_sign_flip)
+                    alpha_eff_j = jnp.asarray(alpha_eff, dtype=jnp.complex128)
+                    omega_sign_j = jnp.asarray(omega_sign, dtype=jnp.float64)
+                    pref = jnp.asarray(win.prefactor * scale, dtype=jnp.float64)
+                    if acc_win is not None:
+                        acc_win = _accumulate_window_channels_jit(
+                            acc_win,
+                            sigma_tau_kij_re,
+                            sigma_tau_kij_im,
+                            omega_vec,
+                            t_node_j,
+                            alpha_eff_j,
+                            omega_sign_j,
+                            pref,
+                            project_code_j,
+                        )
+                        if _prof_enabled:
+                            acc_win.block_until_ready()
+                            _t5 = _time.perf_counter()
+                            _prof_t["omega_acc"] += _t5 - _t4
+                    _prof_n += 1
+                    if acc_win is None:
+                        # Stream in omega chunks without repeating τ-node work.
+                        for ibeg in range(0, n_omega, int(max(1, omega_batch_size))):
+                            iend = min(ibeg + int(max(1, omega_batch_size)), n_omega)
+                            idx = omega_global_idx[ibeg:iend]
+                            omega_batch = omega_vec[ibeg:iend]
+                            batch_proj = _project_stream_batch_jit(
+                                omega_batch,
+                                sigma_tau_kij_re,
+                                sigma_tau_kij_im,
+                                t_node_j,
+                                alpha_eff_j,
+                                omega_sign_j,
+                                pref,
+                                project_code_j,
+                            )
+                            stream_writer(idx, batch_proj)
 
-        if acc_win is not None:
-            acc_total = acc_total + acc_win
+                if acc_win is not None:
+                    acc_total = acc_total + acc_win
 
     _prof_total_end = _time.perf_counter()
     _prof_t["total"] = _prof_total_end - _prof_total_start
