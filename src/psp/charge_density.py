@@ -6,12 +6,17 @@ k-weights for multiplicity, then symmetrizes rho(G) by averaging
 over the star of each G-vector (same strategy as QE's sum_band +
 sym_rho).
 
+Also provides grad_rho_sq(r) = |∇ρ|² for GGA functionals and
+build_V_xc for constructing the exchange-correlation potential
+on the real-space grid.
+
 Usage
 -----
-    from psp.charge_density import build_density_from_ibz
+    from psp.charge_density import build_density_from_ibz, compute_grad_rho_sq, build_V_xc
 
     rho_r = build_density_from_ibz(wfn, sym, meta, n_occ)
-    # rho_r: (nx, ny, nz) real-space density in e/bohr^3
+    grad_rho_sq = compute_grad_rho_sq(rho_r, wfn)
+    V_xc_r = build_V_xc(rho_r, grad_rho_sq)
 """
 from __future__ import annotations
 
@@ -165,3 +170,165 @@ def _symmetrise_density(
     rho_r_sym = jnp.real(jnp.fft.ifftn(rho_G_sym))
 
     return rho_r_sym
+
+
+# ---------------------------------------------------------------------------
+# Density gradient for GGA
+# ---------------------------------------------------------------------------
+
+def compute_grad_rho_sq(
+    rho_r: jax.Array,
+    wfn,
+) -> jax.Array:
+    """Compute |∇ρ|² on the real-space grid via G-space derivatives.
+
+    ∂ρ/∂x_i in G-space is i G_cart_i ρ(G).  Transform each component
+    back to real space, then |∇ρ|² = Σ_i (∂ρ/∂x_i)².
+
+    Parameters
+    ----------
+    rho_r : (nx, ny, nz) real-space density
+    wfn : WFNReader (for bvec, blat to get Cartesian G-vectors)
+
+    Returns
+    -------
+    grad_rho_sq : (nx, ny, nz) = |∇ρ(r)|² in (e/bohr^4)²
+    """
+    nx, ny, nz = rho_r.shape
+
+    # G-vectors in crystal coordinates (integers)
+    gx = np.fft.fftfreq(nx, d=1.0 / nx).astype(int)
+    gy = np.fft.fftfreq(ny, d=1.0 / ny).astype(int)
+    gz = np.fft.fftfreq(nz, d=1.0 / nz).astype(int)
+    Gx, Gy, Gz = np.meshgrid(gx, gy, gz, indexing='ij')
+    G_crys = np.stack([Gx, Gy, Gz], axis=-1).astype(float)  # (nx,ny,nz,3)
+
+    # Crystal → Cartesian: G_cart = G_crys @ (2π b / a_lat)
+    # where b = bvec (columns are reciprocal vectors), blat = 2π/alat
+    # In QE convention: G_cart = G_crys @ (blat * bvec^T)
+    bvec = np.asarray(wfn.bvec, dtype=float)
+    blat = float(wfn.blat)
+    B = blat * bvec.T  # (3,3) — same as in dft_operators
+    G_cart = np.einsum('...i,ij->...j', G_crys, B)  # (nx,ny,nz,3)
+    G_cart_j = jnp.asarray(G_cart, dtype=jnp.float64)
+
+    # ρ(G)
+    rho_G = jnp.fft.fftn(rho_r)
+
+    # ∂ρ/∂x_i(r) = IFFT(i G_cart_i ρ(G))
+    grad_rho_sq = jnp.zeros_like(rho_r)
+    for i in range(3):
+        drho_G = 1j * G_cart_j[..., i] * rho_G
+        drho_r = jnp.real(jnp.fft.ifftn(drho_G))
+        grad_rho_sq = grad_rho_sq + drho_r ** 2
+
+    return grad_rho_sq
+
+
+# ---------------------------------------------------------------------------
+# V_xc builder (PBE by default)
+# ---------------------------------------------------------------------------
+
+def build_V_xc(
+    rho_r: jax.Array,
+    wfn,
+    *,
+    grad_rho_sq: jax.Array | None = None,
+    xc_func: str = 'pbe',
+) -> jax.Array:
+    """Build V_xc(r) on the real-space grid.
+
+    For LDA: V_xc = d(ρ ε_xc)/dρ
+    For GGA: V_xc = d(ρ ε_xc)/dρ - 2∇·[d(ρ ε_xc)/d(σ) ∇ρ]
+
+    Parameters
+    ----------
+    rho_r : (nx, ny, nz) electron density [e/bohr³]
+    wfn : WFNReader (for bvec, blat — needed for G-space gradient)
+    grad_rho_sq : |∇ρ|² — computed automatically if None
+    xc_func : 'pbe' (default) or 'lda'
+
+    Returns
+    -------
+    V_xc_r : (nx, ny, nz) exchange-correlation potential [Ry]
+    """
+    if xc_func == 'lda':
+        return _build_V_xc_lda(rho_r)
+    elif xc_func == 'pbe':
+        if grad_rho_sq is None:
+            grad_rho_sq = compute_grad_rho_sq(rho_r, wfn)
+        return _build_V_xc_gga(rho_r, grad_rho_sq, wfn)
+    else:
+        raise ValueError(f"Unknown xc_func: {xc_func}")
+
+
+def _build_V_xc_lda(rho_r: jax.Array) -> jax.Array:
+    """LDA V_xc = d(ρ ε_xc)/dρ, no gradient terms."""
+    from jax_xc_local.pbe import pbe_xc
+    rho_safe = jnp.maximum(rho_r, 1e-30)
+
+    def f_xc(rho_val):
+        return rho_val * pbe_xc(rho_val, 0.0)
+
+    return jax.vmap(jax.grad(f_xc))(rho_safe.ravel()).reshape(rho_r.shape)
+
+
+def _build_V_xc_gga(
+    rho_r: jax.Array,
+    grad_rho_sq: jax.Array,
+    wfn,
+) -> jax.Array:
+    """GGA V_xc via White-Bird functional derivative.
+
+    V_xc(r) = ∂(ρ ε_xc)/∂ρ - 2 ∇·[∂(ρ ε_xc)/∂σ ∇ρ]
+
+    where σ = |∇ρ|².  The divergence term is computed in G-space.
+    """
+    from jax_xc_local.pbe import pbe_xc
+
+    rho_safe = jnp.maximum(rho_r, 1e-30)
+    sigma = jnp.maximum(grad_rho_sq, 0.0)
+
+    # ∂(ρ ε_xc)/∂ρ and ∂(ρ ε_xc)/∂σ at each grid point
+    def f_xc(rho_val, sigma_val):
+        return rho_val * pbe_xc(rho_val, sigma_val)
+
+    df_drho = jax.vmap(jax.grad(f_xc, argnums=0))(
+        rho_safe.ravel(), sigma.ravel()
+    ).reshape(rho_r.shape)
+
+    df_dsigma = jax.vmap(jax.grad(f_xc, argnums=1))(
+        rho_safe.ravel(), sigma.ravel()
+    ).reshape(rho_r.shape)
+
+    # GGA correction: -2 ∇·[df_dsigma ∇ρ]
+    nx, ny, nz = rho_r.shape
+    rho_G = jnp.fft.fftn(rho_r)
+
+    # G-vectors in Cartesian
+    G_cart = _build_G_cart_grid(nx, ny, nz, wfn)
+
+    # ∇ρ(r) components and divergence
+    gga_correction = jnp.zeros_like(rho_r)
+    for i in range(3):
+        drho_ri = jnp.real(jnp.fft.ifftn(1j * G_cart[..., i] * rho_G))
+        h_i = df_dsigma * drho_ri
+        h_i_G = jnp.fft.fftn(h_i)
+        gga_correction = gga_correction + jnp.real(
+            jnp.fft.ifftn(1j * G_cart[..., i] * h_i_G)
+        )
+
+    return df_drho - 2.0 * gga_correction
+
+
+def _build_G_cart_grid(nx, ny, nz, wfn):
+    """Build Cartesian G-vector grid for FFT-based gradients."""
+    gx = np.fft.fftfreq(nx, d=1.0 / nx).astype(int)
+    gy = np.fft.fftfreq(ny, d=1.0 / ny).astype(int)
+    gz = np.fft.fftfreq(nz, d=1.0 / nz).astype(int)
+    Gx, Gy, Gz = np.meshgrid(gx, gy, gz, indexing='ij')
+    G_crys = np.stack([Gx, Gy, Gz], axis=-1).astype(float)
+    bvec = np.asarray(wfn.bvec, dtype=float)
+    B = float(wfn.blat) * bvec.T
+    G_cart = np.einsum('...i,ij->...j', G_crys, B)
+    return jnp.asarray(G_cart, dtype=jnp.float64)
