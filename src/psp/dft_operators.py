@@ -387,23 +387,64 @@ def compute_kin_ion_all(
 ) -> np.ndarray:
     """Compute kin+ion matrix for all k-points.  Returns (nk, nb, nb).
 
-    Uses the fused ``build_matrix_k`` kernel — single JIT dispatch per
-    k-point instead of 3 separate dispatches in the old code.
+    Distributes k-points across available devices (1 k per device),
+    overlapping host-side prep with device execution.
     """
     if nb is None:
         nb = int(meta.b_id_4)
     nk = sym.nk_tot
     nspinor = int(meta.nspinor)
+    devices = jax.devices()
+    n_dev = len(devices)
     kin_ion = np.zeros((nk, nb, nb), dtype=np.complex128)
 
-    for ik in range(nk):
-        with timing.section(f"dft_operators.kin_ion_k{ik}"):
+    if n_dev == 1:
+        # Single device: simple sequential
+        for ik in range(nk):
+            with timing.section(f"dft_operators.kin_ion_k{ik}"):
+                kops = build_kpoint_operators(ik, setup, wfn, sym, meta,
+                                              nspinor=nspinor)
+                wfn_k = load_kpoint_fftbox(wfn, sym, meta, ik, nb)
+                H_k = matrix(wfn_k, kops)
+                kin_ion[ik] = np.asarray(H_k)
+                del wfn_k
+        return kin_ion
+
+    # Multi-device: pre-place all data, then fire all kernels.
+    # Phase 1: build operator data + load wavefunctions + transfer
+    #           to target devices (round-robin).
+    # Phase 2: dispatch all kernels (async, overlapping across devices).
+    # Phase 3: collect results.
+
+    with timing.section("dft_operators.kin_ion.prep"):
+        placed_args = []
+        for ik in range(nk):
+            dev = devices[ik % n_dev]
             kops = build_kpoint_operators(ik, setup, wfn, sym, meta,
                                           nspinor=nspinor)
             wfn_k = load_kpoint_fftbox(wfn, sym, meta, ik, nb)
-            H_k = matrix(wfn_k, kops)
-            kin_ion[ik] = np.asarray(H_k)
+            placed_args.append((
+                jax.device_put(wfn_k, dev),
+                jax.device_put(kops.T_diag, dev),
+                jax.device_put(kops.V_r, dev),
+                jax.device_put(kops.Gx, dev),
+                jax.device_put(kops.Gy, dev),
+                jax.device_put(kops.Gz, dev),
+                tuple(
+                    (jax.device_put(Z, dev), jax.device_put(E, dev))
+                    for Z, E in kops.vnl_projectors
+                ),
+            ))
             del wfn_k
+        jax.block_until_ready([a[0] for a in placed_args])
+
+    with timing.section("dft_operators.kin_ion.compute"):
+        futures = [build_matrix_k(*args) for args in placed_args]
+        # Wait for all kernels to finish before any D2H transfer
+        jax.block_until_ready(futures)
+    with timing.section("dft_operators.kin_ion.collect"):
+        for ik, H_k in enumerate(futures):
+            kin_ion[ik] = np.asarray(H_k)
 
     return kin_ion
 
