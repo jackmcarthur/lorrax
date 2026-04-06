@@ -480,47 +480,66 @@ def _apply_vnl_channel(
 # Top-level matvec
 # ---------------------------------------------------------------------------
 
+@jax.jit
+def _apply_H_k_fused(psi_box, T_diag, V_r, Gx, Gy, Gz, vnl_ZE):
+    """Fused H|psi>: FFT-box in, sparse-G out.  Single JIT dispatch."""
+    psi_G = psi_box[:, :, Gx, Gy, Gz]
+    H_G = T_diag[None, None, :] * psi_G
+    psi_r = jnp.fft.ifftn(psi_box, axes=(-3, -2, -1), norm='ortho')
+    H_G = H_G + jnp.fft.fftn(
+        psi_r * V_r, axes=(-3, -2, -1), norm='ortho'
+    )[:, :, Gx, Gy, Gz]
+    for Z, E in vnl_ZE:
+        proj = jnp.einsum('aqG,vtG->aqtv', jnp.conj(Z), psi_G, optimize=True)
+        d = jnp.einsum('strq,aqtv->arsv', E, proj, optimize=True)
+        H_G = H_G + jnp.einsum('arG,arsv->vsG', Z, d, optimize=True)
+    return H_G
+
+
 def apply_H_k(
     psi: jax.Array,
     kham: KPointHamiltonian,
+    *,
+    output: str = 'sparse',
 ) -> jax.Array:
     """Apply H = T + V_loc + V_NL to trial vectors at one k-point.
 
     Parameters
     ----------
     psi : (nvec, nspinor, nx, ny, nz)
-        Trial vectors in FFT-box representation.  For multi-GPU, shard
-        along axis 0 over a 1-D mesh.
+        Trial vectors in FFT-box representation.
     kham : KPointHamiltonian
         From ``build_kpoint_hamiltonian``.
+    output : 'sparse' (default) or 'box'
+        Return format.  'sparse' returns (nvec, nspinor, nG) in a
+        single fused JIT call (~2.5 ms).  'box' scatters back to
+        the FFT box (~40 ms due to allocation + scatter).
 
     Returns
     -------
-    H_psi : (nvec, nspinor, nx, ny, nz)
-        Result in FFT-box form (nonzero only at valid G-vectors).
+    If output='sparse': (nvec, nspinor, nG) sparse-G coefficients.
+    If output='box':    (nvec, nspinor, nx, ny, nz) FFT-box.
     """
+    if output == 'sparse':
+        return _apply_H_k_fused(
+            psi, kham.T_diag, kham.V_r,
+            kham.Gx, kham.Gy, kham.Gz,
+            tuple(kham.vnl_projectors),
+        )
+
+    # Legacy box output path
     Gx, Gy, Gz = kham.Gx, kham.Gy, kham.Gz
     mask = kham.g_mask
-
-    # -- extract sparse-G coefficients -------------------------------------
-    psi_G = psi[..., Gx, Gy, Gz]                    # (nvec, nspinor, nG)
+    psi_G = psi[..., Gx, Gy, Gz]
     if mask is not None:
         psi_G = psi_G * mask[None, None, :]
-
-    # -- kinetic (diagonal in G) -------------------------------------------
     H_G = _apply_kinetic(psi_G, kham.T_diag)
-
-    # -- local potential (FFT-based) ---------------------------------------
     V_G = _apply_local_V(psi, kham.V_r, Gx, Gy, Gz)
     if mask is not None:
         V_G = V_G * mask[None, None, :]
     H_G = H_G + V_G
-
-    # -- nonlocal KB potential (per species/l channel) ---------------------
     for Z, E in kham.vnl_projectors:
         H_G = H_G + _apply_vnl_channel(psi_G, Z, E)
-
-    # -- scatter back to FFT box -------------------------------------------
     H_psi = jnp.zeros_like(psi)
     return H_psi.at[..., Gx, Gy, Gz].set(H_G)
 
@@ -884,13 +903,12 @@ def validate_against_full_matrix(
 
     H_mat = jnp.asarray(T_mat + V_mat + VNL_mat)
 
-    # -- matvec path --------------------------------------------------------
-    H_psi = apply_H_k(wfn_k, kham)
+    # -- matvec path (sparse-G output) -------------------------------------
+    Gx, Gy, Gz = kham.Gx, kham.Gy, kham.Gz
+    Hpsi_G = apply_H_k(wfn_k, kham)  # (nb, nspinor, nG)
 
     # -- project back: H_check[m,n] = <psi_m|H|psi_n> ----------------------
-    Gx, Gy, Gz = kham.Gx, kham.Gy, kham.Gz
     psi_G = wfn_k[:, :, Gx, Gy, Gz]
-    Hpsi_G = H_psi[:, :, Gx, Gy, Gz]
     H_check = jnp.einsum('msG,nsG->mn', jnp.conj(psi_G), Hpsi_G)
 
     # -- compare ------------------------------------------------------------
@@ -901,25 +919,16 @@ def validate_against_full_matrix(
 
     if verbose:
         # Per-component breakdown
-        T_psi = jnp.zeros_like(wfn_k)
         T_coeffs = _apply_kinetic(psi_G, kham.T_diag)
-        T_psi = T_psi.at[..., Gx, Gy, Gz].set(T_coeffs)
-        T_check = jnp.einsum(
-            'msG,nsG->mn', jnp.conj(psi_G),
-            T_psi[:, :, Gx, Gy, Gz],
-        )
+        T_check = jnp.einsum('msG,nsG->mn', jnp.conj(psi_G), T_coeffs)
 
         V_coeffs = _apply_local_V(wfn_k, kham.V_r, Gx, Gy, Gz)
-        V_check = jnp.einsum(
-            'msG,nsG->mn', jnp.conj(psi_G), V_coeffs,
-        )
+        V_check = jnp.einsum('msG,nsG->mn', jnp.conj(psi_G), V_coeffs)
 
         VNL_coeffs = jnp.zeros_like(psi_G)
         for Z, E in kham.vnl_projectors:
             VNL_coeffs = VNL_coeffs + _apply_vnl_channel(psi_G, Z, E)
-        VNL_check = jnp.einsum(
-            'msG,nsG->mn', jnp.conj(psi_G), VNL_coeffs,
-        )
+        VNL_check = jnp.einsum('msG,nsG->mn', jnp.conj(psi_G), VNL_coeffs)
 
         print(f"    T    max|err| = {float(jnp.max(jnp.abs(T_check - T_mat))):.2e}")
         print(f"    Vloc max|err| = {float(jnp.max(jnp.abs(V_check - V_mat))):.2e}")
