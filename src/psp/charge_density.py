@@ -27,7 +27,6 @@ import jax.numpy as jnp
 from file_io import WFNReader
 from common import symmetry_maps, Meta
 from common.load_wfns import load_kpoint_fftbox
-from scipy.interpolate import InterpolatedUnivariateSpline
 
 
 def build_density_from_ibz(
@@ -248,46 +247,17 @@ def build_core_density(
         rab = np.asarray(mesh.pp_rab.value, dtype=float)
 
         # Fourier transform: ρ_core(G) = (4π/Ω) ∫ r² ρ_core(r) j₀(Gr) dr
-        # At G=0: ρ_core(0) = (4π/Ω) ∫ r² ρ_core(r) dr = Q_core / Ω
-        # For G>0: ρ_core(G) = (4π/Ω) ∫ r² ρ_core(r) sin(Gr)/(Gr) dr
+        # Vectorized over all G-values at once: shape (n_G, n_r)
+        integrand = r ** 2 * rho_c_r * rab  # r² ρ_core(r) dr
 
-        # Build spline of r² ρ_core(r) for integration
-        integrand = r ** 2 * rho_c_r  # r² ρ_core(r)
-        # Integrate: ∫ integrand * sin(Gr)/(Gr) * rab dr
-        # = ∫ integrand * sin(Gr)/(Gr) * dr  (rab = dr for uniform grid, or use rab)
+        G_flat = G_norm.ravel()              # (n_G,)
+        Gr = np.outer(G_flat, r)             # (n_G, n_r)
 
-        # For each |G|, compute the radial integral
-        G_flat = G_norm.ravel()
-        n_G = len(G_flat)
+        # j₀(x) = sin(x)/x, with j₀(0) = 1
+        j0 = np.sinc(Gr / np.pi)            # np.sinc(x) = sin(πx)/(πx)
 
-        # G=0 component
-        Q_core = np.sum(4 * np.pi * integrand * rab)
-        rho_c_G0 = Q_core / vol
-
-        # For G>0: use numpy vectorization
-        # sinc(x) = sin(πx)/(πx), but we need sin(Gr)/(Gr)
-        # Build on a unique-G grid for efficiency
-        G_unique = np.unique(G_flat)
-        G_unique = G_unique[G_unique > 1e-10]  # skip G=0
-
-        # Precompute the integral for each unique |G|
-        rho_c_of_G = {}
-        for Gval in G_unique:
-            Gr = Gval * r
-            # sin(Gr)/(Gr) with safe division at r=0
-            j0 = np.ones_like(Gr)
-            mask = Gr > 1e-12
-            j0[mask] = np.sin(Gr[mask]) / Gr[mask]
-            val = (4 * np.pi / vol) * np.sum(integrand * j0 * rab)
-            rho_c_of_G[Gval] = val
-
-        # Map back to the full G-grid
-        rho_c_G_flat = np.full(n_G, rho_c_G0, dtype=complex)
-        for i, Gval in enumerate(G_flat):
-            if Gval > 1e-10:
-                rho_c_G_flat[i] = rho_c_of_G.get(
-                    G_unique[np.argmin(np.abs(G_unique - Gval))], 0.0
-                )
+        # ρ_core(G) = (4π/Ω) Σ_i integrand_i j₀(G r_i)
+        rho_c_G_flat = (4 * np.pi / vol) * (j0 @ integrand)  # (n_G,)
         rho_c_G_atom = rho_c_G_flat.reshape(nx, ny, nz)
 
         # Structure factor: e^{-2πi G_crys · τ}
