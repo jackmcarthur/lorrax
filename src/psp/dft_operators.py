@@ -33,6 +33,70 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 import common.timing as timing
+
+
+# ---------------------------------------------------------------------------
+# JAX-traceable B-spline evaluation (replaces scipy splev for autodiff)
+# ---------------------------------------------------------------------------
+
+def extract_spline_data(spl) -> tuple[np.ndarray, np.ndarray, int]:
+    """Extract (knots, coeffs, degree) from a scipy spline object.
+
+    Works with InterpolatedUnivariateSpline and any FITPACK-backed
+    scipy spline.  The returned arrays can be passed to ``splev_jax``.
+    """
+    t, c, k = spl._eval_args
+    return np.asarray(t, dtype=np.float64), np.asarray(c, dtype=np.float64), int(k)
+
+
+def _fpbspl_jax(t, x, l, k):
+    """FITPACK fpbspl: k+1 nonzero B-spline basis values at scalar x.
+
+    Implements the de Boor-Cox recurrence bottom-up from degree 0 to k.
+    All loops are over the static degree k (≤5) and unrolled by JIT.
+    """
+    h = jnp.zeros(k + 1)
+    h = h.at[0].set(1.0)
+    for j in range(1, k + 1):
+        hh = h
+        h = h.at[0].set(0.0)
+        for i in range(j):
+            li = l + i + 1
+            lj = l + i + 1 - j
+            f = hh[i] / (t[li] - t[lj])
+            h = h.at[i].add(f * (t[li] - x))
+            h = h.at[i + 1].set(f * (x - t[lj]))
+    return h
+
+
+def _splev_scalar(x, t, c, k):
+    """Evaluate B-spline at a single scalar x."""
+    n = t.shape[0]
+    l = jnp.searchsorted(t, x, side='right') - 1
+    l = jnp.clip(l, k, n - k - 2)
+    h = _fpbspl_jax(t, x, l, k)
+    c_window = jax.lax.dynamic_slice(c, (l - k,), (k + 1,))
+    return jnp.dot(c_window, h)
+
+
+def splev_jax(x, t, c, k=3):
+    """JAX-traceable B-spline evaluation, vectorised over x.
+
+    Drop-in replacement for ``scipy_spline(x)`` that is compatible
+    with ``jax.grad``, ``jax.jacfwd``, and ``jax.jit``.
+
+    Parameters
+    ----------
+    x : (nG,) evaluation points — may be JAX-traced
+    t : (n,) knot vector — concrete (from ``extract_spline_data``)
+    c : (n,) coefficients — concrete
+    k : int, spline degree (default 3, must be static)
+
+    Returns
+    -------
+    (nG,) spline values, same dtype as x
+    """
+    return jax.vmap(lambda xi: _splev_scalar(xi, t, c, k))(x)
 from file_io import WFNReader
 from common import symmetry_maps, Meta
 from common.load_wfns import load_kpoint_fftbox
