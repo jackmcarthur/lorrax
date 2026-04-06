@@ -90,10 +90,8 @@ from file_io import (
     load_centroids, resolve_input_paths,
 )
 from common import symmetry_maps
-from common.load_wfns import (
-    get_enk_bandrange,
-    fit_zeta_chunked_to_h5,
-)
+from common.load_wfns import get_enk_bandrange
+from common.isdf_fitting import fit_zeta_chunked_to_h5
 from .compute_vcoul import compute_all_V_q_from_zeta_h5
 from .gw_init import (
 	compute_optimal_chunks,
