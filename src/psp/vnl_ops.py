@@ -30,7 +30,9 @@ from psp.get_DFT_mtxels import (
     build_atom_pp_assignments,
     generate_gvectors_k,
 )
-from psp.dft_operators import _solid_harmonics_jax
+# Import solid harmonics without circular dependency
+# (dft_operators imports vnl_ops, so we can't import from dft_operators here)
+from psp.solid_harmonics import solid_harmonics_jax as _solid_harmonics_jax
 
 
 # ---------------------------------------------------------------------------

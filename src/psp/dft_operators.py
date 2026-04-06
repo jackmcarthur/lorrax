@@ -256,6 +256,7 @@ from psp.build_projectors_qe import (
     qe_real_sph_harmonics,
 )
 from psp.projector_pipeline import build_vnl_plan
+from psp.solid_harmonics import solid_harmonics_jax as _solid_harmonics_jax
 import psp.vnl_ops as vnl_ops
 
 
@@ -373,60 +374,6 @@ def extract_vnl_channel_data(
                 E=E_j,
             ))
     return channels
-
-
-def _solid_harmonics_jax(l: int, K_cart: jax.Array) -> jax.Array:
-    """Solid harmonics S_lm(x,y,z) = r^l Y_lm(r-hat) in QE convention.
-
-    Pure polynomials in K_cart — no trig, no sqrt, no singularities.
-    Perfectly smooth everywhere including K=0.  Autodiff-friendly.
-
-    Returns (2l+1, nG) matching the QE ordering [m=0, 1c, 1s, 2c, 2s, ...].
-    Supports l = 0, 1, 2, 3.
-    """
-    x = K_cart[:, 0]
-    y = K_cart[:, 1]
-    z = K_cart[:, 2]
-    fpi = 4.0 * jnp.pi
-
-    if l == 0:
-        return jnp.stack([jnp.ones_like(x) / jnp.sqrt(fpi)], axis=0)
-
-    elif l == 1:
-        c = jnp.sqrt(3.0 / fpi)
-        return jnp.stack([c * z, -c * x, -c * y], axis=0)
-
-    elif l == 2:
-        c2 = jnp.sqrt(5.0 / fpi)
-        c2s3 = c2 * jnp.sqrt(3.0)
-        return jnp.stack([
-            c2 / 2.0 * (2 * z**2 - x**2 - y**2),   # m=0
-            -c2s3 * x * z,                            # m=1 cos
-            -c2s3 * y * z,                            # m=1 sin
-            c2s3 / 2.0 * (x**2 - y**2),              # m=2 cos
-            c2s3 * x * y,                             # m=2 sin
-        ], axis=0)
-
-    elif l == 3:
-        c3 = jnp.sqrt(7.0 / fpi)
-        s3 = jnp.sqrt(3.0)
-        s5 = jnp.sqrt(5.0)
-        s6 = jnp.sqrt(6.0)
-        s10 = jnp.sqrt(10.0)
-        s15 = jnp.sqrt(15.0)
-        r2 = x**2 + y**2 + z**2
-        return jnp.stack([
-            c3 / 2.0 * z * (2*z**2 - 3*x**2 - 3*y**2),       # m=0
-            -c3*s6/4.0 * x * (4*z**2 - x**2 - y**2),          # m=1c
-            -c3*s6/4.0 * y * (4*z**2 - x**2 - y**2),          # m=1s
-            c3*s15/2.0 * z * (x**2 - y**2),                    # m=2c
-            c3*s15 * x * y * z,                                 # m=2s
-            -c3*s10/4.0 * x * (x**2 - 3*y**2),                # m=3c
-            -c3*s10/4.0 * y * (3*x**2 - y**2),                # m=3s
-        ], axis=0)
-
-    else:
-        raise NotImplementedError(f"solid_harmonics_jax: l={l} > 3 not implemented")
 
 
 def _build_Z_channel_jax(
