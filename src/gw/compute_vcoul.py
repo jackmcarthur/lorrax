@@ -389,12 +389,41 @@ def make_v_munu_chunked_kernel(
     def fft_and_weight(zeta_r, sqrt_v, phase, B_mu: int):
         """JIT'd wrapper for standalone use."""
         return fft_and_weight_inner(zeta_r, sqrt_v, phase)
-    
+
     @jax.jit
     def contract_block(zeta_mu, zeta_nu):
         """JIT'd wrapper for standalone use."""
         return contract_block_inner(zeta_mu, zeta_nu)
-    
+
+    @jax.jit
+    def fft_weight_contract(zeta_mu_r, zeta_nu_r, sqrt_v, phase):
+        """Fused FFT + weight + contraction for a (mu, nu) block pair.
+        XLA compiles as one kernel — no sync between FFT and contract."""
+        zeta_mu_w, g0_mu = fft_and_weight_inner(zeta_mu_r, sqrt_v, phase)
+        zeta_nu_w, g0_nu = fft_and_weight_inner(zeta_nu_r, sqrt_v, phase)
+        V_ij = contract_block_inner(zeta_mu_w, zeta_nu_w)
+        return V_ij, g0_mu, g0_nu
+
+    @jax.jit
+    def fft_weight_contract_diag(zeta_mu_r, sqrt_v, phase):
+        """Fused FFT + weight + self-contraction for a diagonal block.
+        Single FFT, single contraction — minimal memory."""
+        zeta_mu_w, g0_mu = fft_and_weight_inner(zeta_mu_r, sqrt_v, phase)
+        V_ii = contract_block_inner(zeta_mu_w, zeta_mu_w)
+        return V_ii, g0_mu
+
+    @jax.jit
+    def fft_weight_contract_offdiag(zeta_nu_r, zeta_mu_weighted, sqrt_v, phase):
+        """Fused FFT(nu) + contraction with pre-weighted mu. Avoids re-FFT of mu."""
+        zeta_nu_w, _ = fft_and_weight_inner(zeta_nu_r, sqrt_v, phase)
+        V_ij = contract_block_inner(zeta_mu_weighted, zeta_nu_w)
+        return V_ij
+
+    @partial(jax.jit, static_argnums=(3,))
+    def fft_and_weight_keep(zeta_r, sqrt_v, phase, B_mu: int):
+        """FFT + weight, returning the weighted zeta for reuse in off-diagonal blocks."""
+        return fft_and_weight_inner(zeta_r, sqrt_v, phase)
+
     # Bundle kernels
     from types import SimpleNamespace
     kernels = SimpleNamespace(
@@ -403,6 +432,10 @@ def make_v_munu_chunked_kernel(
         fft_and_weight_inner=fft_and_weight_inner,  # non-JIT'd for nested use
         contract_block=contract_block,  # JIT'd for standalone/chunked use
         contract_block_inner=contract_block_inner,  # non-JIT'd for nested use
+        fft_weight_contract=fft_weight_contract,  # fused off-diagonal
+        fft_weight_contract_diag=fft_weight_contract_diag,  # fused diagonal
+        fft_weight_contract_offdiag=fft_weight_contract_offdiag,  # fused with pre-weighted mu
+        fft_and_weight_keep=fft_and_weight_keep,  # FFT+weight, keep weighted for reuse
         n_G=n_G,
         fft_shape=(fft_nx, fft_ny, fft_nz),
     )
@@ -575,42 +608,47 @@ def compute_V_q_from_zeta_array(
     
     n_rmu, _ = zeta_q.shape
     n_chunks = (n_rmu + mu_chunk_size - 1) // mu_chunk_size
-    
+
     sqrt_v, phase = kernels.get_sqrt_v_and_phase(qvec_wrapped)
-    
-    # Pre-allocate as numpy to avoid .at[].set() overhead
-    V_q_np = np.zeros((n_rmu, n_rmu), dtype=np.complex128)
-    g0_mu_np = np.zeros((n_rmu,), dtype=np.complex128)
-    
+
+    # Accumulate V_q on GPU to avoid device→host syncs in the inner loop.
+    # Use .at[].set() — the overhead is small compared to the FFT+contract.
+    V_q = jnp.zeros((n_rmu, n_rmu), dtype=jnp.complex128)
+    g0_mu = jnp.zeros((n_rmu,), dtype=jnp.complex128)
+
     for i in range(n_chunks):
         mu_i_start = i * mu_chunk_size
         mu_i_end = min(mu_i_start + mu_chunk_size, n_rmu)
-        
-        zeta_mu_r = zeta_q[mu_i_start:mu_i_end, :]
         B_mu = mu_i_end - mu_i_start
-        zeta_mu_weighted, g0_chunk = kernels.fft_and_weight(zeta_mu_r, sqrt_v, phase, B_mu)
-        
-        g0_mu_np[mu_i_start:mu_i_end] = np.asarray(g0_chunk)
-        
+
+        zeta_mu_r = zeta_q[mu_i_start:mu_i_end, :]
+
+        # FFT + weight mu once; reuse for diagonal + all off-diagonal blocks
+        zeta_mu_weighted, g0_chunk = kernels.fft_and_weight_keep(
+            zeta_mu_r, sqrt_v, phase, B_mu)
+        g0_mu = g0_mu.at[mu_i_start:mu_i_end].set(g0_chunk)
+
+        # Diagonal block: self-contraction (no extra FFT needed)
         V_ii = kernels.contract_block(zeta_mu_weighted, zeta_mu_weighted)
-        V_q_np[mu_i_start:mu_i_end, mu_i_start:mu_i_end] = np.asarray(V_ii)
-        
+        V_q = V_q.at[mu_i_start:mu_i_end, mu_i_start:mu_i_end].set(V_ii)
+
         for j in range(i + 1, n_chunks):
             mu_j_start = j * mu_chunk_size
             mu_j_end = min(mu_j_start + mu_chunk_size, n_rmu)
-            
+
             zeta_nu_r = zeta_q[mu_j_start:mu_j_end, :]
-            B_nu = mu_j_end - mu_j_start
-            zeta_nu_weighted, _ = kernels.fft_and_weight(zeta_nu_r, sqrt_v, phase, B_nu)
-            
-            V_ij = kernels.contract_block(zeta_mu_weighted, zeta_nu_weighted)
-            V_ij_np = np.asarray(V_ij)
-            
-            V_q_np[mu_i_start:mu_i_end, mu_j_start:mu_j_end] = V_ij_np
-            V_q_np[mu_j_start:mu_j_end, mu_i_start:mu_i_end] = V_ij_np.conj().T
-    
-    V_q = jnp.asarray(V_q_np)
-    g0_mu_full = jnp.asarray(g0_mu_np)
+
+            # Off-diagonal: fused FFT(nu) + contraction with pre-weighted mu
+            V_ij = kernels.fft_weight_contract_offdiag(
+                zeta_nu_r, zeta_mu_weighted, sqrt_v, phase)
+            V_q = V_q.at[mu_i_start:mu_i_end, mu_j_start:mu_j_end].set(V_ij)
+            V_q = V_q.at[mu_j_start:mu_j_end, mu_i_start:mu_i_end].set(
+                jnp.conj(V_ij).T)
+
+        # zeta_mu_weighted goes out of scope here — XLA can reclaim it
+        del zeta_mu_weighted
+
+    g0_mu_full = g0_mu
     
     if mesh_xy is not None:
         V_shard = NamedSharding(mesh_xy, P('x', 'y'))
