@@ -335,6 +335,12 @@ class SymMaps:
         sigma_z = np.array([[1, 0], [0, -1]], dtype=complex)
         
         for isym, R in enumerate(sym_matrices_cart):
+            # Improper rotations (det < 0) must be converted to proper before
+            # computing the SU(2) spinor matrix. The inversion part maps to
+            # identity in SU(2). Matches BGW Common/spinor_symmetries.f90.
+            if np.linalg.det(R) < 0:
+                R = -R
+
             # Construct the symmetric 4x4 matrix Q
             Q = np.zeros((4, 4))
             Q[0, 0] = R[0, 0] + R[1, 1] + R[2, 2]
