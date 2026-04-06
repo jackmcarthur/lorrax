@@ -621,26 +621,19 @@ def load_centroids_band_chunked(
     n_rmu = len(centroid_indices)
 
     # Auto-detect k_chunk_size from memory budget if not specified.
-    # Memory model for k-chunk sizing.
     #
-    # During _extract_centroids, the per-device peak occurs at the FFT step.
-    # The 3D FFT is done in 3 stages (x→y→z), each needing input + output
-    # buffers. Measured: peak = 4× the psi shard (input + output + 2 FFT
-    # staging buffers). After FFT, the phase multiply adds a 5th copy
-    # briefly, but the FFT staging buffers are freed first, so steady state
-    # is 3× shard. The peak is 4×.
-    #
-    # With band-sharding across n_devices:
-    #   shard = nk_chunk × ceil(nb_chunk / n_devices) × nspinor × n_rtot × 16
-    #   peak_per_device = 4 × shard
+    # Single-GPU: FFT peak is 4× the shard (input + output + 2 staging).
+    # Multi-GPU: collective buffers for the {-,XY,-,-} → {-,-,-,Y} reshard
+    # add ~5× more, giving ~9× total. Measured on Si 4×4×4, 4 A100 GPUs
+    # (see runs/Si/04_si_4x4x4_memory_assay/assay_report.md).
     if k_chunk_size is None:
         n_rtot = meta.fft_grid[0] * meta.fft_grid[1] * meta.fft_grid[2]
-        n_devices = jax.device_count()  # global device count
+        n_devices = jax.device_count()
         nb_chunk = min(band_chunk_size, nb_total)
         bands_per_shard = (nb_chunk + n_devices - 1) // n_devices
 
-        peak_copies = 4  # measured: 4 simultaneous copies during FFT
-        gpu_mem_bytes = 36e9  # A100-40GB minus OS/runtime
+        peak_copies = 4 if n_devices == 1 else 9
+        gpu_mem_bytes = 36e9
         if hasattr(meta, 'memory_per_device_gb') and meta.memory_per_device_gb > 0:
             gpu_mem_bytes = meta.memory_per_device_gb * 1e9
 
