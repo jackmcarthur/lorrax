@@ -36,6 +36,117 @@ import common.timing as timing
 
 
 # ---------------------------------------------------------------------------
+# JAX-traceable real spherical harmonics (replaces qe_real_sph_harmonics)
+# ---------------------------------------------------------------------------
+
+def ylmr2_jax(lmax: int, K_cart: jax.Array) -> jax.Array:
+    """QE-convention real spherical harmonics, vectorised in JAX.
+
+    Replicates QE's ``ylmr2`` subroutine: associated Legendre
+    recurrence in cos(theta) with cos(m*phi)/sin(m*phi) azimuthal
+    part and 4-pi normalisation.
+
+    Autodiff-safe: uses soft regularisation (eps = 1e-30) to avoid
+    NaN gradients from sqrt(0), 1/0, and arctan2(0,0) at K=0.
+
+    Parameters
+    ----------
+    lmax : int — maximum angular momentum (static)
+    K_cart : (nG, 3) — Cartesian K = k+G vectors (traced)
+
+    Returns
+    -------
+    ylm : (nG, (lmax+1)**2) — real harmonics ordered as QE:
+          l=0: [Y_00]
+          l=1: [Y_10, Y_11c, Y_11s]
+          l=2: [Y_20, Y_21c, Y_21s, Y_22c, Y_22s]
+          ...
+    """
+    _EPS2 = 1e-60  # epsilon^2 — negligible vs values, prevents grad NaN
+    fpi = 4.0 * jnp.pi
+    gx = K_cart[:, 0]
+    gy = K_cart[:, 1]
+    gz = K_cart[:, 2]
+    gmod_sq = gx**2 + gy**2 + gz**2
+    # Regularise |K|: add eps^2 to avoid grad(sqrt(0)) = inf
+    gmod = jnp.sqrt(gmod_sq + _EPS2)
+    cost = gz / gmod
+    # sent must vanish at |K|=0 (all l>0 harmonics are zero there).
+    # Physical: sin(theta) = sqrt(gx²+gy²)/|g|. Use this form directly
+    # instead of sqrt(1-cos²θ) which gives 1 at the origin.
+    gperp = jnp.sqrt(gx**2 + gy**2 + _EPS2)
+    sent = gperp / gmod
+    # phi: safe arctan2 — mask inputs at |K|=0 to give phi=0
+    phi = jnp.arctan2(gy * gmod, gx * gmod + _EPS2)
+
+    nG = K_cart.shape[0]
+    lmax2 = (lmax + 1) ** 2
+    # Build the un-normalised ylm array: (nG, lmax2)
+    # Stored flat; arr[l*l + 2*m] for even/odd indexing per QE convention.
+    arr = jnp.zeros((nG, lmax2))
+    arr = arr.at[:, 0].set(1.0)
+    if lmax >= 1:
+        arr = arr.at[:, 1].set(cost)            # l=1, m=0
+        arr = arr.at[:, 3].set(-sent / jnp.sqrt(2.0))  # l=1, m=1 (sin slot)
+
+    for l in range(2, lmax + 1):
+        for m in range(0, l - 1):
+            lm = l * l + 2 * m
+            lm1 = (l - 1) * (l - 1) + 2 * m
+            lm2 = (l - 2) * (l - 2) + 2 * m
+            denom = jnp.sqrt(float(l * l - m * m))
+            arr = arr.at[:, lm].set(
+                cost * (2 * l - 1) * arr[:, lm1] / denom
+                - jnp.sqrt(float((l - 1)**2 - m * m)) * arr[:, lm2] / denom
+            )
+        # m = l-1
+        lm1 = l * l + 2 * (l - 1)
+        lm2 = (l - 1) * (l - 1) + 2 * (l - 1)
+        arr = arr.at[:, lm1].set(
+            cost * jnp.sqrt(float(2 * l - 1)) * arr[:, lm2]
+        )
+        # m = l
+        lm = l * l + 2 * l
+        arr = arr.at[:, lm].set(
+            -(jnp.sqrt(float(2 * l - 1)) / jnp.sqrt(float(2 * l)))
+            * sent * arr[:, lm2]
+        )
+
+    # Normalise and apply azimuthal cos/sin
+    arr = arr.at[:, 0].divide(jnp.sqrt(fpi))
+    for l in range(1, lmax + 1):
+        c = jnp.sqrt((2 * l + 1) / fpi)
+        lm0 = l * l
+        arr = arr.at[:, lm0].multiply(c)
+        for m in range(1, l + 1):
+            cos_idx = l * l + 2 * m - 1
+            sin_idx = l * l + 2 * m
+            val = c * jnp.sqrt(2.0) * arr[:, sin_idx]
+            arr = arr.at[:, cos_idx].set(val * jnp.cos(m * phi))
+            arr = arr.at[:, sin_idx].set(val * jnp.sin(m * phi))
+
+    return arr
+
+
+def real_sph_harmonics_jax(l: int, K_cart: jax.Array) -> jax.Array:
+    """JAX-traceable QE real spherical harmonics for a single l.
+
+    Parameters
+    ----------
+    l : int — angular momentum (static)
+    K_cart : (nG, 3) — Cartesian K vectors (traced)
+
+    Returns
+    -------
+    Y : (2l+1, nG) — real harmonics for this l only
+    """
+    ylm_all = ylmr2_jax(l, K_cart)
+    start = l * l
+    end = (l + 1) * (l + 1)
+    return ylm_all[:, start:end].T
+
+
+# ---------------------------------------------------------------------------
 # JAX-traceable B-spline evaluation (replaces scipy splev for autodiff)
 # ---------------------------------------------------------------------------
 
@@ -114,6 +225,191 @@ from psp.build_projectors_qe import (
     qe_real_sph_harmonics,
 )
 from psp.projector_pipeline import build_vnl_plan
+
+
+# ---------------------------------------------------------------------------
+# Autodiff-compatible V_NL: differentiate through k
+# ---------------------------------------------------------------------------
+
+@dataclass
+class VNLChannelData:
+    """Pre-extracted k-independent data for one (species, l) VNL channel.
+
+    All fields are plain arrays suitable for passing into JIT/autodiff.
+    """
+    tau: jax.Array              # (natoms, 3) atomic positions (crystal)
+    prefactor: float            # 4 pi / sqrt(Omega)
+    l: int                      # angular momentum
+    nbeta: int                  # number of beta projectors for this l
+    spline_t: list[jax.Array]   # [knots_array per beta]
+    spline_c: list[jax.Array]   # [coeffs_array per beta]
+    spline_k: int               # spline degree
+    E: jax.Array                # (nspinor, nspinor, R, R) D-matrix
+
+
+def extract_vnl_channel_data(
+    plan: dict,
+    nspinor: int = 2,
+) -> list[VNLChannelData]:
+    """Extract all VNL channel data from a plan into autodiff-ready form."""
+    channels = []
+    for _key, sp in plan.items():
+        tau = np.asarray(sp['atoms']['tau'], dtype=np.float64)
+        if tau.size == 0:
+            continue
+        if tau.ndim == 1:
+            tau = tau.reshape(1, 3)
+        pref = float(sp['prefactor'])
+        splines = sp['splines']
+
+        for l_key, info in sp['l_channels'].items():
+            l = int(l_key)
+            E_np = info['E']
+            if E_np is None:
+                continue
+            beta_ids = info['beta_ids']
+            if not beta_ids:
+                continue
+
+            spl_t_list, spl_c_list = [], []
+            for bid in beta_ids:
+                spl = splines[(l, int(bid))]
+                t, c, k = extract_spline_data(spl)
+                spl_t_list.append(jnp.asarray(t))
+                spl_c_list.append(jnp.asarray(c))
+
+            E_j = jnp.asarray(E_np, dtype=jnp.complex128)[:nspinor, :nspinor]
+            channels.append(VNLChannelData(
+                tau=jnp.asarray(tau, dtype=jnp.float64),
+                prefactor=pref,
+                l=l,
+                nbeta=len(beta_ids),
+                spline_t=spl_t_list,
+                spline_c=spl_c_list,
+                spline_k=int(k),
+                E=E_j,
+            ))
+    return channels
+
+
+def _build_Z_channel_jax(
+    K_crys: jax.Array,
+    K_cart: jax.Array,
+    ch: VNLChannelData,
+) -> jax.Array:
+    """Build projector matrix Z for one channel.  Pure JAX, k-traceable.
+
+    Parameters
+    ----------
+    K_crys : (nG, 3) — K = k + G in crystal coords (traced through k)
+    K_cart : (nG, 3) — K in Cartesian coords (traced through k)
+    ch : VNLChannelData
+
+    Returns
+    -------
+    Z : (natoms, R, nG) complex128, where R = nbeta * (2l+1)
+    """
+    _EPS = 1e-30
+    nG = K_crys.shape[0]
+    K_norm = jnp.sqrt(jnp.sum(K_cart ** 2, axis=1) + _EPS**2)  # (nG,)
+    l = ch.l
+    msize = 2 * l + 1
+    pref = ch.prefactor
+
+    # Radial form factors via JAX splines
+    F_list = []
+    for ib in range(ch.nbeta):
+        F_list.append(
+            splev_jax(K_norm, ch.spline_t[ib], ch.spline_c[ib], ch.spline_k)
+        )
+    F_bG = jnp.stack(F_list, axis=0)           # (nbeta, nG)
+    radial = pref * (1j) ** l * F_bG            # (nbeta, nG)
+
+    # Real spherical harmonics (JAX)
+    Y = real_sph_harmonics_jax(l, K_cart)       # (msize, nG)
+
+    # Atomic structure factors
+    phase = jnp.exp(
+        -2j * jnp.pi * (K_crys @ ch.tau.T)
+    ).T                                          # (natoms, nG)
+
+    # Z = phase * (radial x Y)
+    Z_bmg = radial[:, None, :] * Y[None, :, :]  # (nbeta, msize, nG)
+    Z_atoms = phase[:, None, None, :] * Z_bmg[None, ...]
+    R = ch.nbeta * msize
+    return Z_atoms.reshape(ch.tau.shape[0], R, nG)
+
+
+def vnl_matrix_at_k(
+    k_crys: jax.Array,
+    psi_G: jax.Array,
+    G_int: jax.Array,
+    B: jax.Array,
+    channels: list[VNLChannelData],
+) -> jax.Array:
+    """V_NL matrix elements as a pure function of k.
+
+    Fully JAX-traceable — ``jax.jacfwd`` w.r.t. ``k_crys`` gives the
+    nonlocal velocity matrix elements (3, nb, nb).
+
+    Parameters
+    ----------
+    k_crys : (3,) — k-point in crystal coordinates (**traced**)
+    psi_G : (nb, nspinor, nG) — wavefunction coefficients at valid G
+    G_int : (nG, 3) — integer G-vectors (crystal)
+    B : (3, 3) — crystal-to-Cartesian matrix (blat * bvec^T)
+    channels : list[VNLChannelData] from ``extract_vnl_channel_data``
+
+    Returns
+    -------
+    V_NL_mn : (nb, nb) complex128
+    """
+    K_crys = G_int.astype(jnp.float64) + k_crys[None, :]  # (nG, 3)
+    K_cart = K_crys @ B                                     # (nG, 3)
+
+    nb = psi_G.shape[0]
+    V_NL = jnp.zeros((nb, nb), dtype=jnp.complex128)
+
+    for ch in channels:
+        Z = _build_Z_channel_jax(K_crys, K_cart, ch)  # (natoms, R, nG)
+        # KB: project, apply D, contract
+        proj = jnp.einsum('aqG,vtG->aqtv', jnp.conj(Z), psi_G, optimize=True)
+        d = jnp.einsum('strq,aqtv->arsv', ch.E, proj, optimize=True)
+        vnl_G = jnp.einsum('arG,arsv->vsG', Z, d, optimize=True)
+        V_NL = V_NL + jnp.einsum(
+            'msG,nsG->mn', jnp.conj(psi_G), vnl_G, optimize=True,
+        )
+
+    return V_NL
+
+
+def vnl_velocity_autodiff(
+    k_crys: jax.Array,
+    psi_G: jax.Array,
+    G_int: jax.Array,
+    B: jax.Array,
+    channels: list[VNLChannelData],
+) -> jax.Array:
+    """Nonlocal velocity matrix: d V_NL / d K_cart_i via forward-mode autodiff.
+
+    Returns (3, nb, nb) — Cartesian (d/dK_cart_i) <m|V_NL|n>.
+
+    This is the nonlocal contribution to the velocity operator
+    v_i = dH/dk_i in Ry atomic units.  The caller adds the local
+    momentum part 2*(k+G)_i to get the full velocity / dipole.
+
+    Note: ``compute_V_NL_velocity_k`` returns the *negative* of this
+    quantity and the dipole code negates it again.  This function
+    returns +dV_NL/dK_cart directly.
+    """
+    # Jacobian in crystal k-coordinates: shape (nb, nb, 3)
+    jac_crys = jax.jacfwd(vnl_matrix_at_k)(
+        k_crys, psi_G, G_int, B, channels,
+    )
+    # Transform to Cartesian:  dV/dK_cart_j = (B^-1)_{ja} dV/dk_crys_a
+    Binv = jnp.linalg.inv(B)
+    jac_cart = jnp.einsum('mna,ja->mnj', jac_crys, Binv)
+    return jnp.transpose(jac_cart, (2, 0, 1))
 
 
 # ---------------------------------------------------------------------------
