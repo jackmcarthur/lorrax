@@ -41,7 +41,7 @@ Typical ranges (from production datasets):
 |-------|---------------------|-------|
 | **Centroid load** | `psi_rmu_Y (n_k, n_b, n_s, n_rmu/p_y)` and `psi_rmuT_X (n_k, n_rmu/p_x, n_b, n_s)` | `M_full = 16 n_k n_s n_rmu n_b (1/p_x + 1/p_y)` |
 | **Centroid copies** | Left+right slices (4 arrays) | `M_cent = 16 n_k n_s n_rmu (n_b^L+n_b^R)(1/p_x+1/p_y)` |
-| **FFT workspace** | `psi_G` + `psi_r` + `phase` | `2*16 n_k (B_b/P) n_s n_r + 16 n_k n_r` |
+| **FFT workspace** | `psi_G` + `psi_r` + 2 FFT staging + `phase` | `4*16 n_k (B_b/P) n_s n_r + 16 n_k n_r` |
 | **C_q build** | `P_l`, `P_r`, `C_q` | `M_cct = M_cent + 2*16 n_k (n_rmu/p_x)(n_rmu/p_y) + 16 n_q (n_rmu/p_x)(n_rmu/p_y)` |
 | **Pair density (chunk)** | `psi_xchunk`, `P_l`, `P_r` | `M_pair = base + 16 n_k n_b n_s (B_r/p_y) + 2*16 n_k (n_rmu/p_x)(B_r/p_y)` |
 | **ZCT** | `P_l`, `P_r`, FFT temps, `Z_q` | `M_zct = base + 4*16 n_k n_rmu B_r + 16 n_q n_rmu B_r` |
@@ -54,24 +54,59 @@ G-space wavefunctions.
 
 ## Band Chunk (`B_b`)
 
-During centroid construction the solver must hold the two union arrays plus the
-FFT workspace.  The constraint is
+During centroid construction the solver must hold the FFT workspace plus the
+persistent centroid arrays. The FFT peak is the dominant cost.
+
+### FFT peak memory (measured)
+
+The 3D `ifftn` is decomposed into three 1D FFTs (x→y→z). At peak, four
+copies of the per-device psi shard coexist:
+
+1. **`psi_G`** (FFT input): `(n_k, B_b/P, n_s, n_r)` — the band-sharded
+   G-space wavefunction being transformed
+2. **`psi_r`** (FFT output): same shape — the real-space result
+3. **FFT staging buffer 1**: same shape — intermediate after the x-FFT
+4. **FFT staging buffer 2**: same shape — intermediate after the y-FFT
+
+After the FFT completes, buffers 3–4 are freed and the phase multiply
+allocates a fifth copy briefly (but by then the staging buffers are gone,
+so the steady state is 3 copies). The peak is therefore **4×** the shard:
 
 ```
-M_full + phase + 2 * 16 * n_k * (B_b / P) * n_s * n_r <= M_budget
+M_fft_peak = 4 * 16 * n_k * (B_b / P) * n_s * n_r + 16 * n_k * n_r
+```
+
+The second term is `phase_spatial` at `(n_k, n_r)`, replicated on all
+devices. For most systems this is <1% of the first term.
+
+**Measured validation** (each in a fresh process, 1 GPU):
+
+| System | Shard (GB) | Peak (GB) | Ratio | 4× pred | Error |
+|--------|-----------|-----------|-------|---------|-------|
+| Si 24³, nk=64, nb=60 | 1.699 | 6.795 | 4.00× | 6.809 | 0.2% |
+| 48³, nk=1, nb=80 | 0.283 | 1.132 | 4.00× | 1.134 | 0.2% |
+| MoS2 24×24×80, nk=1, nb=160 | 0.236 | 1.074 | 4.55× | 0.944 | 14% |
+| Si 24³, nk=216, nb=10 | 0.956 | 4.059 | 4.25× | 3.870 | 5% |
+
+The 4× model is exact for large shards (>0.3 GB). For small shards,
+a fixed overhead of ~0.03–0.1 GB adds ~10–15% above the 4× prediction.
+This overhead comes from the cuFFT plan cache, the phase array broadcast,
+and JIT compilation metadata.
+
+### Band chunk constraint
+
+```
+M_full + 4 * 16 * n_k * (B_b / P) * n_s * n_r + 16 * n_k * n_r <= M_budget
 ```
 
 so
 
 ```
-B_b <= ((M_budget - M_full) - phase) * P / (2 * 16 * n_k * n_s * n_r)
+B_b <= ((M_budget - M_full) - phase) * P / (4 * 16 * n_k * n_s * n_r)
 ```
 
-`B_b` is clamped between 1 and `n_b`.  If the numerator becomes negative the
+`B_b` is clamped between 1 and `n_b`. If the numerator becomes negative the
 system physically cannot fit; the solver raises a descriptive error.
-
-Bottleneck arrays: `psi_G` and `psi_r` at `(n_k, B_b/P, n_s, n_r)`, plus
-`phase_spatial` at `(n_k, n_r)` broadcast.
 
 ## R-Chunk (`B_r = x_chunk_r`)
 
@@ -151,8 +186,9 @@ this chunk alongside the others so users can correlate V_q throughput with
 memory settings.
 
 Bottleneck arrays: `ζ_μ(r)` at `(μ_chunk, n_r)`, `ζ̃_μ(G)` at `(μ_chunk, n_r)`
-after weighting, `ζ̃_ν(G)` for off-diagonal contraction, and temporary
-`V_block (μ_chunk, μ_chunk)` on host.
+after weighting, `ζ̃_ν(G)` for off-diagonal contraction, and `V_q` accumulator
+at `(n_rmu, n_rmu)` on GPU. The accumulation is done entirely on GPU via
+`.at[].set()` — no device→host sync per block (as of commit `b0e0f41`).
 
 ## Automatic Sizing Algorithm
 
