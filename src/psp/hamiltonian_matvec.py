@@ -22,27 +22,46 @@ The local-potential identity can be verified by expanding the existing
 full-matrix code in get_DFT_mtxels.py:  the product of its internal
 scale, deltaV, fft_norm, and sqrt(1/Omega) factors is exactly 1.
 
-Multi-GPU
----------
+Multi-GPU (1-D mesh)
+--------------------
 Shard trial vectors along axis 0 (nvec) over a 1-D JAX device mesh.
 Each H|psi> is independent per vector; no inter-device communication.
 
-Usage
------
+Usage (single k-point)::
+
     setup = build_hamiltonian_setup(wfn, sym, meta, pseudos)
     kham  = build_kpoint_hamiltonian(k_idx, setup, wfn, sym, meta)
     Hpsi  = apply_H_k(psi, kham)       # psi: (nvec, nspinor, nx, ny, nz)
 
-    # Multi-GPU:
-    mesh = create_mesh()
-    psi  = shard_trial_vectors(psi, mesh)
-    Hpsi = apply_H_k(psi, kham)        # automatically parallelised
+Multi-GPU (2-D mesh, all k-points)
+-----------------------------------
+Use a 2-D device mesh ('k', 'g'):
+
+  * **k-axis** — batches over k-points (independent, no communication).
+  * **g-axis** — shards G-vectors within each k-point.
+
+Parallelism by operator:
+
+  * T:     diagonal in G — trivially local on each g-device.
+  * V_loc: each g-device rematerialises the full FFT (allgather psi along
+           g, do IFFT * V_r * FFT, keep local g-shard of the result).
+  * V_NL:  projection Z^dag psi sums over G → GSPMD inserts allreduce.
+           E (D-matrix) is replicated.  Unprojection Z d is local.
+
+Usage (batched)::
+
+    setup = build_hamiltonian_setup(wfn, sym, meta, pseudos)
+    mesh  = create_mesh_2d()          # e.g. (4, 4) on 16 GPUs
+    bham  = build_batched_hamiltonian(setup, wfn, sym, meta, mesh)
+    Hpsi  = apply_H_batched(psi_G, bham, mesh)
+    # psi_G : (nk, nvec, nspinor, nG_max)  sharded P('k', None, None, 'g')
 """
 from __future__ import annotations
 
 import os
 import argparse
-from dataclasses import dataclass
+import functools
+from dataclasses import dataclass, field
 
 import numpy as np
 import jax
@@ -525,6 +544,298 @@ def shard_trial_vectors(
     return jax.lax.with_sharding_constraint(psi, spec)
 
 
+# ===========================================================================
+# 2-D mesh:  batched over k-points, G-vectors sharded
+# ===========================================================================
+
+@dataclass
+class BatchedKHamiltonian:
+    """All k-points padded to nG_max and stacked for 2-D mesh execution.
+
+    Intended shardings on a Mesh(devices, ('k', 'g')):
+
+    ========== ============================  ========================
+    field      shape                         PartitionSpec
+    ========== ============================  ========================
+    T_diag     (nk, nG_max)                  P('k', 'g')
+    Gx/Gy/Gz  (nk, nG_max)  int32           P('k', 'g')
+    g_mask     (nk, nG_max)                  P('k', 'g')
+    V_r        (nx, ny, nz)                  replicated
+    vnl_Z      list of (nk, na, R, nG_max)   P('k', None, None, 'g')
+    vnl_E      list of (ns, ns, R, R)        replicated
+    ========== ============================  ========================
+    """
+    T_diag: jax.Array
+    Gx: jax.Array
+    Gy: jax.Array
+    Gz: jax.Array
+    g_mask: jax.Array
+    V_r: jax.Array
+    vnl_Z: list[jax.Array]
+    vnl_E: list[jax.Array]
+    fft_grid: tuple[int, int, int]
+    nk: int
+    nG_max: int
+
+
+# -- builder ---------------------------------------------------------------
+
+def build_batched_hamiltonian(
+    setup: HamiltonianSetup,
+    wfn: WFNReader,
+    sym: symmetry_maps.SymMaps,
+    meta: Meta,
+    mesh: Mesh | None = None,
+    nspinor: int | None = None,
+) -> BatchedKHamiltonian:
+    """Stack all k-point Hamiltonians into padded batched arrays.
+
+    Optionally applies sharding constraints according to a 2-D *mesh*
+    with axes ``('k', 'g')``.
+    """
+    if nspinor is None:
+        nspinor = int(meta.nspinor)
+    nk = sym.nk_tot
+
+    # -- build per-k data and determine nG_max ------------------------------
+    khams = []
+    for ik in range(nk):
+        khams.append(build_kpoint_hamiltonian(ik, setup, wfn, sym, meta,
+                                              nspinor=nspinor))
+    nG_raw = max(kh.nG for kh in khams)
+
+    # -- round nk and nG_max up for divisibility by mesh axes ---------------
+    if mesh is not None:
+        nk_dev = mesh.shape['k']
+        ng_dev = mesh.shape['g']
+    else:
+        nk_dev = ng_dev = 1
+    nk_padded = int(np.ceil(nk / nk_dev)) * nk_dev
+    nG_max = int(np.ceil(nG_raw / ng_dev)) * ng_dev
+
+    # -- pad and stack scalars / G-indices ----------------------------------
+    T_np = np.zeros((nk_padded, nG_max), dtype=np.float64)
+    Gx_np = np.zeros((nk_padded, nG_max), dtype=np.int32)
+    Gy_np = np.zeros((nk_padded, nG_max), dtype=np.int32)
+    Gz_np = np.zeros((nk_padded, nG_max), dtype=np.int32)
+    mask_np = np.zeros((nk_padded, nG_max), dtype=np.float64)
+
+    for ik, kh in enumerate(khams):
+        n = kh.nG
+        T_np[ik, :n] = np.asarray(kh.T_diag)
+        Gx_np[ik, :n] = np.asarray(kh.Gx)
+        Gy_np[ik, :n] = np.asarray(kh.Gy)
+        Gz_np[ik, :n] = np.asarray(kh.Gz)
+        mask_np[ik, :n] = 1.0
+
+    # -- stack VNL Z across k-points ----------------------------------------
+    # Channel structure is identical for every k (same species/l set),
+    # only the numerical values of Z differ because K = k + G changes.
+    n_channels = len(khams[0].vnl_projectors)
+    vnl_Z_list: list[jax.Array] = []
+    vnl_E_list: list[jax.Array] = []
+
+    for c in range(n_channels):
+        _, E_c = khams[0].vnl_projectors[c]
+        vnl_E_list.append(E_c)
+        # Stack Z for this channel across k-points (+ k-padding)
+        Z_ref, _ = khams[0].vnl_projectors[c]
+        na, R, _ = Z_ref.shape
+        Z_per_k = []
+        for ik in range(nk_padded):
+            if ik < nk:
+                Z_k, _ = khams[ik].vnl_projectors[c]
+                nG_k = Z_k.shape[-1]
+                if nG_k < nG_max:
+                    Z_k = jnp.pad(Z_k, ((0, 0), (0, 0), (0, nG_max - nG_k)))
+            else:
+                Z_k = jnp.zeros((na, R, nG_max), dtype=jnp.complex128)
+            Z_per_k.append(Z_k)
+        vnl_Z_list.append(jnp.stack(Z_per_k, axis=0))
+
+    # -- convert to JAX arrays, optionally shard ----------------------------
+    T = jnp.asarray(T_np)
+    Gx = jnp.asarray(Gx_np)
+    Gy = jnp.asarray(Gy_np)
+    Gz = jnp.asarray(Gz_np)
+    g_mask = jnp.asarray(mask_np)
+
+    if mesh is not None:
+        kg = NamedSharding(mesh, P('k', 'g'))
+        rep = NamedSharding(mesh, P(None, None, None))
+        T = jax.device_put(T, kg)
+        Gx = jax.device_put(Gx, kg)
+        Gy = jax.device_put(Gy, kg)
+        Gz = jax.device_put(Gz, kg)
+        g_mask = jax.device_put(g_mask, kg)
+        setup_V_r = jax.device_put(setup.V_r, rep)
+        z_spec = NamedSharding(mesh, P('k', None, None, 'g'))
+        vnl_Z_list = [jax.device_put(z, z_spec) for z in vnl_Z_list]
+    else:
+        setup_V_r = setup.V_r
+
+    return BatchedKHamiltonian(
+        T_diag=T,
+        Gx=Gx, Gy=Gy, Gz=Gz,
+        g_mask=g_mask,
+        V_r=setup_V_r,
+        vnl_Z=vnl_Z_list,
+        vnl_E=vnl_E_list,
+        fft_grid=setup.fft_grid,
+        nk=nk,       # real k-count (before padding)
+        nG_max=nG_max,
+    )
+
+
+# -- 2-D mesh helpers ------------------------------------------------------
+
+def create_mesh_2d(
+    nk_devices: int | None = None,
+    ng_devices: int | None = None,
+) -> Mesh:
+    """Create a 2-D device mesh with axes ``('k', 'g')``.
+
+    If neither dimension is specified, defaults to (n_devices, 1) — pure
+    k-batching with no G-sharding — which is a safe fallback.
+    """
+    devices = np.array(jax.devices())
+    n = len(devices)
+    if nk_devices is not None and ng_devices is not None:
+        if nk_devices * ng_devices != n:
+            raise ValueError(
+                f"nk*ng ({nk_devices}*{ng_devices}) != {n} devices"
+            )
+    elif nk_devices is not None:
+        ng_devices = n // nk_devices
+    elif ng_devices is not None:
+        nk_devices = n // ng_devices
+    else:
+        nk_devices, ng_devices = n, 1
+    return Mesh(devices.reshape(nk_devices, ng_devices), ('k', 'g'))
+
+
+# -- per-k V_loc kernel (vmapped over k) -----------------------------------
+
+def _vloc_single_k(
+    psi_g: jax.Array,
+    gx: jax.Array,
+    gy: jax.Array,
+    gz: jax.Array,
+    mask: jax.Array,
+    V_r: jax.Array,
+) -> jax.Array:
+    """V_loc|psi> for one k-point in sparse-G.
+
+    psi_g : (nvec, nspinor, nG_max)
+    gx,gy,gz : (nG_max,) int32
+    mask : (nG_max,)
+    V_r : (nx, ny, nz)
+
+    Returns (nvec, nspinor, nG_max)
+    """
+    nvec, nspinor, _ = psi_g.shape
+    nx, ny, nz = V_r.shape
+    psi_masked = psi_g * mask[None, None, :]
+    # Scatter into FFT box — use .add() not .set() because padded
+    # G-indices (all zeros) would alias the real G=0 entry with .set().
+    # Since padding values are zero (via mask), .add() is correct.
+    psi_box = jnp.zeros((nvec, nspinor, nx, ny, nz), dtype=psi_g.dtype)
+    psi_box = psi_box.at[:, :, gx, gy, gz].add(psi_masked)
+    # IFFT -> V*psi -> FFT
+    psi_r = jnp.fft.ifftn(psi_box, axes=(-3, -2, -1), norm='ortho')
+    phi_box = jnp.fft.fftn(psi_r * V_r, axes=(-3, -2, -1), norm='ortho')
+    return phi_box[:, :, gx, gy, gz] * mask[None, None, :]
+
+
+# -- batched apply ----------------------------------------------------------
+
+def apply_H_batched(
+    psi_G: jax.Array,
+    bham: BatchedKHamiltonian,
+    mesh: Mesh,
+) -> jax.Array:
+    """Apply H for all k-points on a 2-D (k, g) device mesh.
+
+    Parameters
+    ----------
+    psi_G : (nk, nvec, nspinor, nG_max)
+        Trial vectors in sparse-G, sharded as P('k', None, None, 'g').
+    bham : BatchedKHamiltonian
+    mesh : 2-D Mesh with axes ('k', 'g').
+
+    Returns
+    -------
+    H_psi_G : (nk, nvec, nspinor, nG_max)
+        Same sharding as input.
+    """
+    # Sharding specs — captured as constants inside the JIT closure.
+    kg = NamedSharding(mesh, P('k', None, None, 'g'))
+    k_only = NamedSharding(mesh, P('k', None, None, None))
+    kg_2d = NamedSharding(mesh, P('k', 'g'))
+    k_2d = NamedSharding(mesh, P('k', None))
+
+    # Freeze the VNL channel list into a tuple so JIT treats each
+    # element as a separate traced leaf (the loop is unrolled at trace).
+    vnl_Z = tuple(bham.vnl_Z)
+    vnl_E = tuple(bham.vnl_E)
+
+    @functools.partial(jax.jit, static_argnames=('fft_grid',))
+    def _core(psi_G, T_diag, Gx, Gy, Gz, g_mask, V_r, vnl_Z, vnl_E,
+              fft_grid):
+        mask = g_mask                                    # (nk, nG_max)
+        psi = psi_G * mask[:, None, None, :]             # zero padding
+
+        # ── kinetic: diagonal, G-local ────────────────────────────────
+        H_G = T_diag[:, None, None, :] * psi
+
+        # ── V_loc: rematerialise FFT on every g-device ────────────────
+        #
+        # Force psi and G-indices to be replicated along the g-axis so
+        # that each g-device has the complete data needed for the FFT.
+        # After the FFT the result is re-sharded along g.
+        psi_rep = jax.lax.with_sharding_constraint(psi, k_only)
+        Gx_rep = jax.lax.with_sharding_constraint(Gx, k_2d)
+        Gy_rep = jax.lax.with_sharding_constraint(Gy, k_2d)
+        Gz_rep = jax.lax.with_sharding_constraint(Gz, k_2d)
+        mask_rep = jax.lax.with_sharding_constraint(mask, k_2d)
+
+        V_G = jax.vmap(
+            _vloc_single_k, in_axes=(0, 0, 0, 0, 0, None)
+        )(psi_rep, Gx_rep, Gy_rep, Gz_rep, mask_rep, V_r)
+
+        V_G = jax.lax.with_sharding_constraint(V_G, kg)
+        H_G = H_G + V_G
+
+        # ── V_NL: project (allreduce over g), unproject (g-local) ─────
+        #
+        # The einsum Z^dag psi sums over G.  With G sharded, GSPMD
+        # automatically inserts an allreduce.  The E matrix (D block) is
+        # replicated.  The unproject Z d is local to each g-shard.
+        for Z_k, E_c in zip(vnl_Z, vnl_E):
+            # Z_k: (nk, natoms, R, nG_max) — P('k', None, None, 'g')
+            # psi:  (nk, nvec, nspinor, nG_max) — P('k', None, None, 'g')
+            # Project
+            proj = jnp.einsum(
+                'kaqG,kvtG->kaqtv', jnp.conj(Z_k), psi, optimize=True,
+            )  # (nk, na, R, ns, nv) — G contracted → replicated along g
+            # Apply D
+            d = jnp.einsum(
+                'strq,kaqtv->karsv', E_c, proj, optimize=True,
+            )  # replicated along g
+            # Unproject
+            vnl_G = jnp.einsum(
+                'karG,karsv->kvsG', Z_k, d, optimize=True,
+            )  # (nk, nv, ns, nG_max) — G-sharded again
+            H_G = H_G + vnl_G
+
+        return H_G * mask[:, None, None, :]
+
+    return _core(
+        psi_G, bham.T_diag, bham.Gx, bham.Gy, bham.Gz, bham.g_mask,
+        bham.V_r, vnl_Z, vnl_E, bham.fft_grid,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Validation against full-matrix code
 # ---------------------------------------------------------------------------
@@ -634,6 +945,18 @@ def main(argv=None):
     argp.add_argument(
         "--all-k", action="store_true", help="validate all k-points"
     )
+    argp.add_argument(
+        "--batched", action="store_true",
+        help="validate batched 2-D mesh path (all k at once)",
+    )
+    argp.add_argument(
+        "--nk-devices", type=int, default=None,
+        help="k-axis size for 2-D mesh (default: all devices on k)",
+    )
+    argp.add_argument(
+        "--ng-devices", type=int, default=None,
+        help="g-axis size for 2-D mesh (default: 1)",
+    )
     args = argp.parse_args(argv)
 
     timing.reset()
@@ -705,6 +1028,80 @@ def main(argv=None):
     dt = (time.perf_counter() - t0) / n_iter
     print(f"\nBenchmark (k={k_idx}, {nb} vectors): "
           f"{dt * 1e3:.2f} ms/apply  ({n_iter} iters)")
+
+    # -- batched 2-D mesh validation ------------------------------------------
+    if args.batched:
+        print("\n" + "=" * 60)
+        print("Batched 2-D mesh validation")
+        print("=" * 60)
+        mesh2d = create_mesh_2d(args.nk_devices, args.ng_devices)
+        print(f"  Mesh: {mesh2d.shape}  axes={mesh2d.axis_names}")
+
+        with timing.section("build_batched"):
+            bham = build_batched_hamiltonian(setup, wfn, sym, meta, mesh2d)
+        print(f"  nk={bham.nk}, nG_max={bham.nG_max}, "
+              f"VNL channels={len(bham.vnl_Z)}")
+
+        # Build batched psi_G from individual k-point wavefunctions
+        nk_padded = bham.T_diag.shape[0]  # includes k-padding
+        psi_all = np.zeros(
+            (nk_padded, nb, meta.nspinor, bham.nG_max),
+            dtype=np.complex128,
+        )
+        for ik in range(sym.nk_tot):
+            wfn_k = load_kpoint_fftbox(wfn, sym, meta, ik, nb)
+            Gk_crys, _ = generate_gvectors_k(ik, sym, wfn, meta)
+            Gk_np = np.asarray(Gk_crys, dtype=int)
+            gx = Gk_np[:, 0]; gy = Gk_np[:, 1]; gz = Gk_np[:, 2]
+            psi_all[ik, :, :, :len(gx)] = np.asarray(
+                wfn_k[:, :, gx, gy, gz]
+            )
+        psi_j = jax.device_put(
+            jnp.asarray(psi_all),
+            NamedSharding(mesh2d, P('k', None, None, 'g')),
+        )
+
+        # Apply batched
+        with timing.section("apply_batched"):
+            H_psi_batched = apply_H_batched(psi_j, bham, mesh2d)
+            jax.block_until_ready(H_psi_batched)
+
+        # Compare against per-k results
+        batched_pass = True
+        for ik in range(sym.nk_tot):
+            kham = build_kpoint_hamiltonian(ik, setup, wfn, sym, meta)
+            wfn_k = load_kpoint_fftbox(wfn, sym, meta, ik, nb)
+            H_psi_ref = apply_H_k(wfn_k, kham)
+
+            # Extract reference in sparse-G
+            Gx_k, Gy_k, Gz_k = kham.Gx, kham.Gy, kham.Gz
+            ref_G = H_psi_ref[:, :, Gx_k, Gy_k, Gz_k]
+
+            # Extract batched result (first nG entries, rest is padding)
+            nG = kham.nG
+            bat_G = np.asarray(H_psi_batched[ik, :, :, :nG])
+            ref_np = np.asarray(ref_G)
+
+            err = float(np.max(np.abs(bat_G - ref_np)))
+            ok = err < 1e-8
+            batched_pass = batched_pass and ok
+            status = "PASS" if ok else "FAIL"
+            print(f"  k={ik}: {status}  max|err|={err:.2e}")
+
+        all_pass = all_pass and batched_pass
+
+        # Benchmark batched
+        _ = apply_H_batched(psi_j, bham, mesh2d)
+        jax.block_until_ready(_)
+        import time as _time
+        n_iter_b = 20
+        t0 = _time.perf_counter()
+        for _ in range(n_iter_b):
+            H_b = apply_H_batched(psi_j, bham, mesh2d)
+            jax.block_until_ready(H_b)
+        dt_b = (_time.perf_counter() - t0) / n_iter_b
+        print(f"\n  Batched apply (all {bham.nk} k, {nb} vecs): "
+              f"{dt_b * 1e3:.2f} ms/call  ({n_iter_b} iters)")
 
     timing.report(title="\n--- Timing (seconds) ---")
     return 0 if all_pass else 1
