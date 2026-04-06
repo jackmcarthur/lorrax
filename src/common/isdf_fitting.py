@@ -25,11 +25,34 @@ from .fft_helpers import (
     compute_block_size_for_2d_cholesky,
 )
 from .load_wfns import (
-    load_gspace_for_bands,
+    read_Gvecs_to_devices,
     get_psi_rchunk_from_cached,
     get_psi_rchunk,
     load_centroids_band_chunked,
 )
+
+
+def load_gspace_for_bands(
+    wfn, sym, meta, mesh_xy, band_range, bispinor,
+    band_chunk_size: int = 16,
+) -> list[tuple[jax.Array, tuple[int, int]]]:
+    """Load G-space wavefunctions for all band chunks ONCE.
+
+    Caches the expensive HDF5 read + scatter so it can be reused across
+    multiple r-chunk iterations. Returns a list of (psi_Gtot, band_range)
+    tuples, one per band chunk.
+    """
+    b_start, b_end = band_range
+    nb_total = b_end - b_start
+    num_band_chunks = (nb_total + band_chunk_size - 1) // band_chunk_size
+    cached_gspace = []
+    for bc_idx in range(num_band_chunks):
+        bc_start = b_start + bc_idx * band_chunk_size
+        bc_end = min(bc_start + band_chunk_size, b_end)
+        bc_range = (bc_start, bc_end)
+        global_psi_Gtot, _ = read_Gvecs_to_devices(wfn, sym, bc_range, meta, bispinor, mesh_xy)
+        cached_gspace.append((global_psi_Gtot, bc_range))
+    return cached_gspace
 
 
 # ============================================================================

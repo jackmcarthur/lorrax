@@ -1,6 +1,5 @@
 import gc
 import time
-from types import SimpleNamespace
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -86,22 +85,7 @@ def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, nspinor=2):
     return enk, jnp.repeat(weights_full, repeats=nspinor, axis=1)
 
 
-def get_small_psi_component(gvecs, kvec, bvec, psi_G):
-    # TODO: move to common/bispinor_init.py
-    # get alpha/2 (sigma dot (k+G)) psi_nk(G) for bispinor functionality (single k at a time).
-    # Note: Not @jax.jit because ngk varies per k-point → recompilation overhead on GPU
-    # possible improvements: do sigma dot v, v = p + [r,V_NL+Sigma], add the DKH4 contribution
-    halfalpha = jnp.complex128(0.00364867628215)  # 1/2 * alpha
-    gvecsk_cart = jnp.matmul(gvecs + kvec, bvec)
-
-    sigmadotp = jnp.array([
-        [gvecsk_cart[:, 2], gvecsk_cart[:, 0] - 1j * gvecsk_cart[:, 1]],
-        [gvecsk_cart[:, 0] + 1j * gvecsk_cart[:, 1], -gvecsk_cart[:, 2]],
-    ], dtype=jnp.complex128)
-
-    return jnp.multiply(
-        halfalpha, jnp.einsum("ijG,bjG->biG", sigmadotp, psi_G[:, 0:2, :])
-    )
+from .bispinor_init import get_small_psi_component  # noqa: F401 — re-export for callers
 
 
 def read_Gvecs_to_devices(
@@ -234,44 +218,6 @@ def read_Gvecs_to_devices(
     return global_psi_Gtot, nb
 
 
-def load_gspace_for_bands(
-    wfn, sym, meta, mesh_xy, band_range, bispinor,
-    band_chunk_size: int = 16,
-) -> list[tuple[jax.Array, tuple[int, int]]]:
-    """
-    Load G-space wavefunctions for all band chunks ONCE.
-    
-    This caches the expensive HDF5 read + scatter operation so it can be
-    reused across multiple z-chunk iterations. Memory cost is ~0.5-1 GB
-    for typical systems (nk * nb * ns * fft_grid * 16 bytes).
-    
-    Args:
-        wfn: WFNReader
-        sym: SymMaps
-        meta: Meta object
-        mesh_xy: Device mesh
-        band_range: (b_start, b_end) - total bands needed
-        bispinor: Whether to use bispinor
-        band_chunk_size: Bands to process at once
-    
-    Returns:
-        List of (global_psi_Gtot, bc_range) for each band chunk
-    """
-    b_start, b_end = band_range
-    nb_total = b_end - b_start
-    num_band_chunks = (nb_total + band_chunk_size - 1) // band_chunk_size
-    
-    cached_gspace = []
-    for bc_idx in range(num_band_chunks):
-        bc_start = b_start + bc_idx * band_chunk_size
-        bc_end = min(bc_start + band_chunk_size, b_end)
-        bc_range = (bc_start, bc_end)
-        
-        # Load G-space for this band chunk
-        global_psi_Gtot, _ = read_Gvecs_to_devices(wfn, sym, bc_range, meta, bispinor, mesh_xy)
-        cached_gspace.append((global_psi_Gtot, bc_range))
-    
-    return cached_gspace
 
 
 
@@ -410,6 +356,7 @@ def get_psi_rchunk(
     band_chunk_size: int = 16,
     k_chunk_size: int = 0,
     cached_gspace: list[tuple[jax.Array, tuple[int, int]]] | None = None,
+    kvecs_frac: np.ndarray | None = None,
 ) -> jax.Array:
     """
     Extract an r-chunk of wavefunctions in real space.
@@ -428,12 +375,15 @@ def get_psi_rchunk(
         band_chunk_size: Bands to FFT at once
         k_chunk_size: K-points per batch (0 = all at once)
         cached_gspace: Pre-loaded G-space from load_gspace_for_bands()
+        kvecs_frac: (nk, 3) k-vectors in fractional coords. If None,
+            computed from sym.kvecs_asints / meta.kgrid.
 
     Returns:
         psi_rchunk_Y: (nk, nb, ns, n_rchunk) with P(None, None, None, 'y')
     """
-    kgrid = np.array(meta.kgrid)
-    kvecs_frac = sym.kvecs_asints / kgrid[None, :]
+    if kvecs_frac is None:
+        kgrid = np.array(meta.kgrid)
+        kvecs_frac = sym.kvecs_asints / kgrid[None, :]
     b_start, b_end = band_range
     nb_total = b_end - b_start
     nk_tot = meta.nk_tot
@@ -475,9 +425,7 @@ def get_psi_rchunk(
                 nb_chunk = bc_end - bc_start
                 for k0 in range(0, nk_tot, nk_batch):
                     k1 = min(k0 + nk_batch, nk_tot)
-                    sub_meta = SimpleNamespace(
-                        nk_tot=k1 - k0, nspinor=nspinor, fft_grid=meta.fft_grid,
-                        n_rtot=meta.n_rtot)
+                    sub_meta = _make_kchunk_meta(meta, k0, k1)
                     psi_k_chunk = get_sharded_wfns_rchunk_slice(
                         global_psi_Gtot[k0:k1], sub_meta, r_start, r_end,
                         kvecs_frac[k0:k1], mesh_xy, bc_range)
@@ -493,16 +441,12 @@ def get_psi_rchunk_from_cached(
     cached_gspace, meta, mesh_xy, band_range, r_start, r_end, kvecs_frac,
     band_chunk_size: int = 16,
 ) -> jax.Array:
-    """Deprecated: use get_psi_rchunk(cached_gspace=...) instead."""
-    # Need a dummy sym for kvecs_frac — but the cached path doesn't use sym/wfn.
-    # Create a minimal namespace with kvecs_asints derived from kvecs_frac.
-    kgrid = np.array(meta.kgrid)
-    dummy_sym = SimpleNamespace(kvecs_asints=(kvecs_frac * kgrid[None, :]).astype(np.int32))
+    """Deprecated: use get_psi_rchunk(cached_gspace=..., kvecs_frac=...) instead."""
     return get_psi_rchunk(
-        wfn=None, sym=dummy_sym, meta=meta, mesh_xy=mesh_xy,
+        wfn=None, sym=None, meta=meta, mesh_xy=mesh_xy,
         band_range=band_range, r_start=r_start, r_end=r_end,
         bispinor=False, band_chunk_size=band_chunk_size,
-        cached_gspace=cached_gspace)
+        cached_gspace=cached_gspace, kvecs_frac=kvecs_frac)
 
 
 # ============================================================================
