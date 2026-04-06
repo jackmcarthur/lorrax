@@ -552,13 +552,25 @@ def get_sharded_wfns_centroids(
             psi_rtot = jax.lax.with_sharding_constraint(psi_rtot, intermediate_XY)
             
             # Centroid gather on axis 3 (spatial) while bands remain sharded on (x,y).
-            psi_rmu = jnp.take(psi_rtot, centroid_lin, axis=3)
-            
-            # Create psi_rmuT (conjugate transpose for left wfn in pair density)
-            psi_rmuT = jnp.conj(psi_rmu.transpose(0, 3, 1, 2))  # (nk, n_rmu, nb, ns)
-            
-            # Step 2: Apply final output shardings
+            # Wrap in checkpoint to prevent XLA from rematerializing the FFT pipeline
+            # when it needs to reshard the output. Without this, XLA sees the gather's
+            # output sharding is incompatible with the input and recomputes everything
+            # from psi_G to produce psi_rtot in the target layout — OOMing on large grids.
+            @jax.checkpoint
+            def _gather_centroids(psi_flat):
+                return jnp.take(psi_flat, centroid_lin, axis=3)
+            psi_rmu = _gather_centroids(psi_rtot)
+            # psi_rmu: (nk, nb, ns, n_rmu) sharded {-, XY, -, -}
+
+            # Two-step reshard: {-,XY,-,-} → {-,Y,-,-} → {-,-,-,Y}
+            # Step 1: all-gather along X (collect band shards from X-axis devices)
+            stage_Y = NamedSharding(mesh_xy, P(None, 'y', None, None))
+            psi_rmu = jax.lax.with_sharding_constraint(psi_rmu, stage_Y)
+            # Step 2: all-to-all along Y (swap bands for centroids)
             psi_rmu = jax.lax.with_sharding_constraint(psi_rmu, out_Y)
+
+            # Conjugate-transpose for pair density: (nk, n_rmu, nb, ns)
+            psi_rmuT = jnp.conj(psi_rmu.transpose(0, 3, 1, 2))
             psi_rmuT = jax.lax.with_sharding_constraint(psi_rmuT, out_X)
             
             return psi_rmu, psi_rmuT
