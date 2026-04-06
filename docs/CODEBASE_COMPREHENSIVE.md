@@ -243,22 +243,35 @@ class EPSReader:
 
 ---
 
-### 2.4 `SymmetryMaps` (src/isdf/common/symmetry_maps.py)
+### 2.4 `SymMaps` (src/common/symmetry_maps.py)
 
-**Purpose**: Handle k-point symmetry operations, map k→k', unfold symmetry-reduced grids
+**Purpose**: Unfold IBZ k-points to full BZ using crystal symmetries, rotate
+wavefunctions, and provide k↔q mappings for the screening calculation.
 
 **Key methods**:
 ```python
-class SymmetryMaps:
-    def __init__(self, crys, wfn, wfnq=None):
-        """Initialize from crystal structure and wavefunction files."""
+class SymMaps:
+    def __init__(self, wfn: WFNReader):
+        """Initialize from WFN.h5 reader. Reads symmetry ops, builds full BZ
+        mesh, computes IBZ→full mappings and spinor rotation matrices.
+        Handles both spatial (ntran) and time-reversal symmetries."""
 
-    def get_k_mapping(self) -> dict:
-        """Map each k-point to symmetry-equivalent k' in irreducible zone."""
+    def get_gvecs_kfull(self, wfn, nk) -> np.ndarray:
+        """Rotated G-vectors for full BZ k-point nk. Shape (ngk, 3)."""
 
-    def unfold_kgrid(self, data_irr: np.ndarray) -> np.ndarray:
-        """Unfold data from irreducible to full k-grid."""
+    def get_cnk_fullzone(self, wfn, nb, nk) -> np.ndarray:
+        """Rotated wavefunction coefficients at full BZ k-point nk.
+        Applies G-vector rotation, spinor rotation (U_spinor), and
+        complex conjugation for time-reversal ops. Shape (2, ngk)."""
+
+    def get_cnk_fullzone_batch(self, wfn, band_indices, nk) -> np.ndarray:
+        """Vectorized version for multiple bands. Shape (nb, 2, ngk)."""
 ```
+
+**Spinor rotation**: `get_spinor_rotations()` converts Cartesian rotation
+matrices to SU(2) via the Markley quaternion algorithm. Improper rotations
+(det < 0) are negated to proper before conversion, matching BGW's
+`spinor_symmetries.f90` convention (inversion → identity in SU(2)).
 
 ---
 
@@ -600,7 +613,7 @@ def matmul_2d(A, B):
 | **Head correction** | `gw/gw_jax.py:1948` | (inline in main loop) |
 | **Dipole S(ω)** | `common/chi_from_dipole.py` | `compute_S_omega()` |
 | **Write sigma output** | `io/sigma_output.py` | `write_sigma_to_file()` |
-| **Symmetry operations** | `common/symmetry_maps.py` | `SymmetryMaps` class |
+| **Symmetry operations** | `common/symmetry_maps.py` | `SymMaps` class |
 
 ---
 
