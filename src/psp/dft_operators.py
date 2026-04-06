@@ -256,6 +256,7 @@ from psp.build_projectors_qe import (
     qe_real_sph_harmonics,
 )
 from psp.projector_pipeline import build_vnl_plan
+import psp.vnl_ops as vnl_ops
 
 
 # ---------------------------------------------------------------------------
@@ -873,6 +874,7 @@ class OperatorSetup:
     """K-point-independent operator data.  Built once, shared across k."""
     V_r: jax.Array                  # (nx, ny, nz) V_loc [+V_H] [Ry]
     vnl_plan: dict
+    vnl_setup: object               # vnl_ops.VNLSetup (dense VNL backend)
     assignments: list
     species_payload: list
     bdot: np.ndarray                # (3,3)
@@ -889,7 +891,9 @@ class KPointOperators:
     Gy: jax.Array                   # (nG,) int32
     Gz: jax.Array                   # (nG,) int32
     V_r: jax.Array                  # shared ref to OperatorSetup.V_r
-    vnl_projectors: list[tuple[jax.Array, jax.Array]]  # [(Z, E), ...]
+    # Dense VNL from vnl_ops
+    vnl_Z: jax.Array                # (total_R, nG)
+    vnl_E: jax.Array                # (nspinor, nspinor, total_R, total_R)
     nG: int
     fft_grid: tuple[int, int, int]
 
@@ -977,9 +981,14 @@ def build_operator_setup(
         pseudos, assignments, float(wfn.cell_volume), float(q_max)
     )
 
+    # Dense VNL backend (vnl_ops)
+    vsetup = vnl_ops.build_vnl_setup(wfn, sym, meta, pseudos,
+                                     nspinor=int(meta.nspinor))
+
     return OperatorSetup(
         V_r=V_r,
         vnl_plan=vnl_plan,
+        vnl_setup=vsetup,
         assignments=assignments,
         species_payload=species_payload,
         bdot=np.asarray(wfn.bdot, dtype=float),
@@ -997,7 +1006,7 @@ def build_kpoint_operators(
     meta: Meta,
     nspinor: int | None = None,
 ) -> KPointOperators:
-    """Build per-k data: kinetic diagonal and VNL projectors Z."""
+    """Build per-k data: kinetic diagonal and dense VNL projectors."""
     if nspinor is None:
         nspinor = int(meta.nspinor)
 
@@ -1017,70 +1026,15 @@ def build_kpoint_operators(
         dtype=jnp.float64,
     )
 
-    K_cart = K_crys @ setup.B
-    K_norm = np.sqrt(np.sum(K_cart**2, axis=1))
-    K_crys_j = jnp.asarray(K_crys, dtype=jnp.float64)
-
-    vnl_projectors: list[tuple[jax.Array, jax.Array]] = []
-    Y_cache: dict[int, jax.Array] = {}
-
-    for _key, sp in setup.vnl_plan.items():
-        tau = np.asarray(sp['atoms']['tau'], dtype=float)
-        if tau.size == 0:
-            continue
-        if tau.ndim == 1:
-            tau = tau.reshape(1, 3)
-        natoms = tau.shape[0]
-        pref = float(sp['prefactor'])
-        splines = sp['splines']
-
-        tau_j = jnp.asarray(tau, dtype=jnp.float64)
-        phase = jnp.exp(
-            -2j * jnp.pi * (K_crys_j @ tau_j.T)
-        ).T
-
-        for l_key, info in sp['l_channels'].items():
-            l = int(l_key)
-            E_np = info['E']
-            if E_np is None:
-                continue
-            beta_ids = info['beta_ids']
-            if not beta_ids:
-                continue
-            nbeta = len(beta_ids)
-            msize = 2 * l + 1
-
-            F_bG = np.stack(
-                [splines[(l, int(bid))](K_norm) for bid in beta_ids],
-                axis=0,
-            )
-            radial = jnp.asarray(
-                pref * (1j) ** l * F_bG, dtype=jnp.complex128,
-            )
-
-            if l not in Y_cache:
-                Y_cache[l] = jnp.asarray(
-                    qe_real_sph_harmonics(l, K_cart), dtype=jnp.complex128,
-                )
-            Y = Y_cache[l]
-
-            Z_bmg = radial[:, None, :] * Y[None, :, :]
-            Z_atoms = phase[:, None, None, :] * Z_bmg[None, ...]
-            R = nbeta * msize
-            Z_flat = Z_atoms.reshape(natoms, R, nG)
-
-            E_j = info.get('E_j')
-            if E_j is None:
-                E_j = jnp.asarray(E_np, dtype=jnp.complex128)
-            E_j = E_j[:nspinor, :nspinor]
-
-            vnl_projectors.append((Z_flat, E_j))
+    # Dense VNL via vnl_ops
+    kdata = vnl_ops.build_vnl_kdata(k_idx, setup.vnl_setup, wfn, sym, meta)
 
     return KPointOperators(
         T_diag=T_diag,
         Gx=Gx, Gy=Gy, Gz=Gz,
         V_r=setup.V_r,
-        vnl_projectors=vnl_projectors,
+        vnl_Z=kdata.Z,
+        vnl_E=kdata.E_super,
         nG=nG,
         fft_grid=setup.fft_grid,
     )
@@ -1091,8 +1045,10 @@ def build_kpoint_operators(
 # ---------------------------------------------------------------------------
 
 @jax.jit
-def apply_H_k(psi_box, T_diag, V_r, Gx, Gy, Gz, vnl_ZE):
+def apply_H_k(psi_box, T_diag, V_r, Gx, Gy, Gz, vnl_Z, vnl_E):
     """Fused H|psi>: FFT-box in, sparse-G out.  Single JIT dispatch.
+
+    Uses dense VNL from vnl_ops (single einsum, no channel loop).
 
     Parameters
     ----------
@@ -1100,42 +1056,37 @@ def apply_H_k(psi_box, T_diag, V_r, Gx, Gy, Gz, vnl_ZE):
     T_diag  : (nG,) — kinetic diagonal
     V_r     : (nx, ny, nz) — real-space local potential
     Gx,Gy,Gz : (nG,) int32 — G-vector FFT-box indices
-    vnl_ZE  : tuple of (Z, E) per VNL channel
+    vnl_Z   : (total_R, nG) — dense VNL projector from vnl_ops
+    vnl_E   : (nspinor, nspinor, total_R, total_R) — block-diag D matrix
 
     Returns
     -------
     H_psi_G : (nvec, nspinor, nG) — sparse-G
     """
     psi_G = psi_box[:, :, Gx, Gy, Gz]
+    # T
     H_G = T_diag[None, None, :] * psi_G
+    # V_loc
     psi_r = jnp.fft.ifftn(psi_box, axes=(-3, -2, -1), norm='ortho')
     H_G = H_G + jnp.fft.fftn(
         psi_r * V_r, axes=(-3, -2, -1), norm='ortho'
     )[:, :, Gx, Gy, Gz]
-    for Z, E in vnl_ZE:
-        proj = jnp.einsum('aqG,vtG->aqtv', jnp.conj(Z), psi_G, optimize=True)
-        d = jnp.einsum('strq,aqtv->arsv', E, proj, optimize=True)
-        H_G = H_G + jnp.einsum('arG,arsv->vsG', Z, d, optimize=True)
+    # V_NL (dense, no loop)
+    P = jnp.einsum('RG,vsG->Rsv', jnp.conj(vnl_Z), psi_G, optimize=True)
+    D = jnp.einsum('stRQ,Qtv->Rsv', vnl_E, P, optimize=True)
+    H_G = H_G + jnp.einsum('RG,Rsv->vsG', vnl_Z, D, optimize=True)
     return H_G
 
 
 @jax.jit
-def build_matrix_k(psi_box, T_diag, V_r, Gx, Gy, Gz, vnl_ZE):
+def build_matrix_k(psi_box, T_diag, V_r, Gx, Gy, Gz, vnl_Z, vnl_E):
     """Fused H matrix elements: <m|H|n> for all bands at one k-point.
 
-    Same physics as apply_H_k, but contracts to (nb, nb) instead of
-    returning sparse-G.  Single JIT dispatch.
+    Uses dense VNL from vnl_ops (single einsum, no channel loop).
 
-    Parameters
-    ----------
-    psi_box : (nb, nspinor, nx, ny, nz) — wavefunctions
-    (other args: same as apply_H_k)
-
-    Returns
-    -------
-    H_mn : (nb, nb) complex128
+    Returns (nb, nb) complex128.
     """
-    psi_G = psi_box[:, :, Gx, Gy, Gz]            # (nb, ns, nG)
+    psi_G = psi_box[:, :, Gx, Gy, Gz]
 
     # T
     H_mn = jnp.einsum(
@@ -1152,14 +1103,8 @@ def build_matrix_k(psi_box, T_diag, V_r, Gx, Gy, Gz, vnl_ZE):
         'msG,nsG->mn', jnp.conj(psi_G), Vpsi_G, optimize=True,
     )
 
-    # V_NL
-    for Z, E in vnl_ZE:
-        proj = jnp.einsum('aqG,vtG->aqtv', jnp.conj(Z), psi_G, optimize=True)
-        d = jnp.einsum('strq,aqtv->arsv', E, proj, optimize=True)
-        vnl_G = jnp.einsum('arG,arsv->vsG', Z, d, optimize=True)
-        H_mn = H_mn + jnp.einsum(
-            'msG,nsG->mn', jnp.conj(psi_G), vnl_G, optimize=True,
-        )
+    # V_NL (dense, no loop)
+    H_mn = H_mn + vnl_ops.vnl_matrix(psi_G, vnl_Z, vnl_E)
 
     return H_mn
 
@@ -1173,7 +1118,7 @@ def apply(psi_box: jax.Array, kops: KPointOperators) -> jax.Array:
     return apply_H_k(
         psi_box, kops.T_diag, kops.V_r,
         kops.Gx, kops.Gy, kops.Gz,
-        tuple(kops.vnl_projectors),
+        kops.vnl_Z, kops.vnl_E,
     )
 
 
@@ -1182,7 +1127,7 @@ def matrix(psi_box: jax.Array, kops: KPointOperators) -> jax.Array:
     return build_matrix_k(
         psi_box, kops.T_diag, kops.V_r,
         kops.Gx, kops.Gy, kops.Gz,
-        tuple(kops.vnl_projectors),
+        kops.vnl_Z, kops.vnl_E,
     )
 
 
@@ -1242,10 +1187,8 @@ def compute_kin_ion_all(
                 jax.device_put(kops.Gx, dev),
                 jax.device_put(kops.Gy, dev),
                 jax.device_put(kops.Gz, dev),
-                tuple(
-                    (jax.device_put(Z, dev), jax.device_put(E, dev))
-                    for Z, E in kops.vnl_projectors
-                ),
+                jax.device_put(kops.vnl_Z, dev),
+                jax.device_put(kops.vnl_E, dev),
             ))
             del wfn_k
         jax.block_until_ready([a[0] for a in placed_args])
