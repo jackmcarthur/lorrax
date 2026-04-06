@@ -327,20 +327,19 @@ def get_sharded_wfns_rchunk_slice(
             )(psi_flat, jnp.array([r_start_dyn]))
             return psi_rchunk
 
-        # Two-step reshard shardings: distribute r FIRST, then gather bands.
-        # Direct {-,XY,-,-} → {-,X,-,Y} makes XLA all-gather bands first
-        # (creating a 6.5 GB intermediate with full r on each device).
-        # Instead: {-,XY,-,-} → {-,XY,-,Y} → {-,X,-,Y}
-        _stage_XYrY = NamedSharding(mesh_xy, P(None, ('x', 'y'), None, 'y'))
-        _final_XrY = NamedSharding(mesh_xy, P(None, 'x', None, 'y'))
+        # Reshard {-,XY,-,-} → {-,-,-,Y}: requires all-gather of bands.
+        # The intermediate (nb_pad/p_y bands × full r_chunk) is the binding
+        # memory constraint. The chunk solver must account for this when
+        # sizing r_chunk. Using a separate JIT prevents XLA from
+        # rematerializing the FFT during the reshard.
+        _final_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+        _stage_Y = NamedSharding(mesh_xy, P(None, 'y', None, None))
 
         @jax.jit
         def _reshard_rchunk(psi_rchunk):
-            """Reshard r-chunk: {-,XY,-,-} → {-,XY,-,Y} → {-,X,-,Y}.
-            Step 1 distributes r to Y (local slice, no communication).
-            Step 2 all-gathers bands along Y (small: nb_pad/p_y per device)."""
-            psi_rchunk = jax.lax.with_sharding_constraint(psi_rchunk, _stage_XYrY)
-            psi_rchunk = jax.lax.with_sharding_constraint(psi_rchunk, _final_XrY)
+            """Reshard r-chunk: {-,XY,-,-} → {-,Y,-,-} → {-,-,-,Y}."""
+            psi_rchunk = jax.lax.with_sharding_constraint(psi_rchunk, _stage_Y)
+            psi_rchunk = jax.lax.with_sharding_constraint(psi_rchunk, _final_Y)
             return psi_rchunk
 
         def _extract_rchunk_slice(psi_G, r_start_dyn, nb_static):
