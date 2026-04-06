@@ -501,24 +501,94 @@ class SymMaps:
         
         return kfull_symmap
 
+    def _get_symmetry_context(self, nk):
+        """Return the symmetry data used to unfold a full-zone k-point."""
+        sym_idx = int(self.irk_sym_map[nk])
+        kbar_idx = int(self.irk_to_k_map[nk])
+        sym_krep = np.asarray(self.sym_mats_k[sym_idx], dtype=np.int32)
+        return sym_idx, kbar_idx, sym_krep
+
+    def _get_umklapp_vector(self, wfn, nk, sym_idx, kbar_idx, sym_krep):
+        """Return BGW's kg0 for the selected full-zone k-point.
+
+        BGW defines the integer umklapp vector kg0 through
+            k_full = S k_irred + kg0 .
+        We use the same convention here so that the associated
+        non-symmorphic phase matches Common/gmap.f90.
+        """
+        if sym_idx >= len(self.sym_matrices):
+            q_full = np.asarray(sym_krep @ wfn.kpoints[kbar_idx], dtype=np.float64)
+            q_inzone = q_full % 1.0
+            q_inzone[q_inzone > 0.9999] = 0.0
+            return (q_inzone - q_full).astype(np.int32)
+
+        k_full = np.asarray(self.unfolded_kpts[nk], dtype=np.float64)
+        skbar = np.asarray(sym_krep @ wfn.kpoints[kbar_idx], dtype=np.float64)
+        kg0 = np.rint(k_full - skbar).astype(np.int32)
+
+        if not np.allclose(skbar + kg0, k_full, atol=1e-6):
+            raise ValueError(
+                f"Failed to determine symmetry umklapp for nk={nk}: "
+                f"k_full={k_full}, S*kbar={skbar}, kg0={kg0}"
+            )
+        return kg0
+
+    def _get_fractional_translation_phase(
+        self,
+        wfn,
+        nk,
+        sym_idx,
+        kbar_idx,
+        sym_krep,
+        k_gvecs=None,
+    ):
+        """Return BGW-style non-symmorphic phase factors for unfolded coeffs.
+
+        For ordinary WFN unfolding, BGW multiplies each coefficient by
+            exp[-i (G_target + kg0) · tau]
+        where tau is stored in the WFN header as ``tnp`` and ``kg0`` is the
+        symmetry umklapp taking ``S kbar`` back into the target first-BZ k.
+
+        Since
+            G_target = S G_source - kg0 ,
+        the phase can be evaluated equivalently as
+            exp[-i (S G_source) · tau] .
+        This is the form used below because LORRAX reads coefficients on the
+        source irreducible-zone G-list before rotating them into the full zone.
+        """
+        if sym_idx >= len(self.sym_matrices):
+            return None
+
+        tau = np.asarray(wfn.translations[sym_idx], dtype=np.float64)
+        if not np.any(np.abs(tau) > 1e-12):
+            return None
+
+        if k_gvecs is None:
+            k_gvecs = wfn.get_gvec_nk(kbar_idx)
+
+        # Keep the BGW kg0 convention explicit in this path as a guardrail for
+        # the phase algebra, even though it cancels in the final expression.
+        _ = self._get_umklapp_vector(wfn, nk, sym_idx, kbar_idx, sym_krep)
+
+        rotated_source_g = np.einsum(
+            'ij,gj->gi',
+            sym_krep,
+            np.asarray(k_gvecs, dtype=np.int32),
+        )
+        phase_arg = np.asarray(rotated_source_g, dtype=np.float64) @ tau
+        return np.exp(-1j * phase_arg)
+
     def get_gvecs_kfull(self,wfn,nk):
         # nb: band index
         # nk: index of k in sym.unfolded_kpts
         # relationship: u_n(kbar{S|tau}) (G) = u_nkbar(G{S|tau} - G_S), apparently..
         # (S.T@G = G@S)
 
-        sym_idx = self.irk_sym_map[nk]
-        kbar_idx = self.irk_to_k_map[nk]
-        sym_krep = self.sym_mats_k[sym_idx] # note we apply with no changes
+        sym_idx, kbar_idx, sym_krep = self._get_symmetry_context(nk)
         
         #wfn_kG = wfn.get_cnk(kbar_idx,nb)
         k_gvecs = wfn.get_gvec_nk(kbar_idx)
-
-        q_full = sym_krep @ wfn.kpoints[kbar_idx] #+ 0.001
-        q_inzone = q_full%1.0
-        q_inzone[q_inzone>0.9999] = 0.0
-        Gkk = q_inzone - q_full
-        Gkk = Gkk.astype(int) 
+        Gkk = self._get_umklapp_vector(wfn, nk, sym_idx, kbar_idx, sym_krep)
 
         k_gvecs_rot = np.einsum('ij,kj->ki', sym_krep.astype(np.int32), k_gvecs) # kgrid.x says sym 9 maps k to kbar
         k_gvecs_rot -= Gkk
@@ -529,10 +599,9 @@ class SymMaps:
         return k_gvecs_rot
     
     def get_cnk_fullzone(self,wfn,nb,nk):
-        sym_idx = self.irk_sym_map[nk]
-        kbar_idx = self.irk_to_k_map[nk]
-        sym_krep = self.sym_mats_k[sym_idx] # note we apply with no changes
+        sym_idx, kbar_idx, sym_krep = self._get_symmetry_context(nk)
 
+        k_gvecs = None
         wfn_kG = wfn.get_cnk(kbar_idx,nb)
         
         # For time-reversal symmetries (sym_idx >= ntran), apply complex conjugation
@@ -540,6 +609,17 @@ class SymMaps:
         ntran = len(self.sym_matrices)  # Number of spatial symmetries
         if sym_idx >= ntran:
             wfn_kG = np.conj(wfn_kG)
+        else:
+            phase = self._get_fractional_translation_phase(
+                wfn,
+                nk,
+                sym_idx,
+                kbar_idx,
+                sym_krep,
+                k_gvecs=k_gvecs,
+            )
+            if phase is not None:
+                wfn_kG = wfn_kG * phase[None, :]
         
         wfn_kG = np.einsum('jk,kl->jl', self.U_spinor[sym_idx], wfn_kG)
         return wfn_kG
@@ -555,8 +635,7 @@ class SymMaps:
         Returns:
             np.ndarray: Rotated coefficients of shape (nb, 2, ngk)
         """
-        sym_idx = self.irk_sym_map[nk]
-        kbar_idx = self.irk_to_k_map[nk]
+        sym_idx, kbar_idx, sym_krep = self._get_symmetry_context(nk)
         
         # Batch read from WFN: (nb, 2, ngk)
         cnk_batch = wfn.get_cnk_batch(kbar_idx, band_indices)
@@ -565,6 +644,16 @@ class SymMaps:
         ntran = len(self.sym_matrices)
         if sym_idx >= ntran:
             cnk_batch = np.conj(cnk_batch)
+        else:
+            phase = self._get_fractional_translation_phase(
+                wfn,
+                nk,
+                sym_idx,
+                kbar_idx,
+                sym_krep,
+            )
+            if phase is not None:
+                cnk_batch = cnk_batch * phase[None, None, :]
         
         # Vectorized spinor rotation: U[j,k] @ cnk[n,k,l] -> result[n,j,l]
         # U_spinor is (2, 2), cnk_batch is (nb, 2, ngk)
