@@ -298,11 +298,11 @@ def get_sharded_wfns_rchunk_slice(
         band_shard = P(None, ('x', 'y'), None, None)
 
         @partial(jax.jit, static_argnames=('nb_static',))
-        def _extract_rchunk_slice(psi_G, r_start_dyn, nb_static):
-            # FFT to real space: (nk, nb_padded, ns, nx, ny, nz)
+        def _fft_and_rslice(psi_G, r_start_dyn, nb_static):
+            """FFT + phase + r-slice. Returns band-sharded r-chunk.
+            Resharding happens in a SEPARATE call to prevent XLA from
+            rematerializing the FFT to satisfy the output layout."""
             psi_r = sharded_ifftn(psi_G)
-
-            # Apply Bloch phase exp(ik·r)
             phase_spatial = jnp.exp(
                 2j * jnp.pi * (
                     kvecs_cached[:, 0:1, None, None] * fx_cached
@@ -311,49 +311,38 @@ def get_sharded_wfns_rchunk_slice(
                 )
             )
             psi_r = psi_r * phase_spatial[:, None, None, :, :, :]
-
-            # Normalize
             psi_r = psi_r * jnp.sqrt(n_rtot_cached)
 
-            # NOTE: Do NOT trim bands here. psi_r has padded band count
-            # (divisible by mesh size) which shard_map requires. Trim after reshard.
+            # Keep padded band count (divisible by mesh size)
             nb_padded = psi_r.shape[1]
-
-            # Flatten spatial dims: (nk, nb_padded, ns, nx*ny*nz)
             psi_flat = psi_r.reshape(nk_tot, nb_padded, nspinor, n_rtot_cached)
 
-            # Local r-slice via shard_map: each device slices its own band
-            # shard WITHOUT triggering an all-gather of all 80 bands.
+            # Local r-slice via shard_map
             def _local_rslice(psi_local, r_start_arr):
                 return jax.lax.dynamic_slice_in_dim(
-                    psi_local, r_start_arr[0], r_chunk_size_static, axis=3
-                )
-
+                    psi_local, r_start_arr[0], r_chunk_size_static, axis=3)
             psi_rchunk = shard_map(
-                _local_rslice,
-                mesh=mesh_xy,
-                in_specs=(band_shard, P()),
-                out_specs=band_shard,
+                _local_rslice, mesh=mesh_xy,
+                in_specs=(band_shard, P()), out_specs=band_shard,
             )(psi_flat, jnp.array([r_start_dyn]))
-            # psi_rchunk: (nk, nb_padded_local, ns, r_chunk_size) per device — small!
+            return psi_rchunk
 
-            # Reshard: {-,XY,-,-} → {-,X,-,Y}
-            # All-to-all along Y: swap Y's band shards for r-chunk shards.
-            # Bands remain X-sharded — the downstream pair density einsum
-            # contracts over bands with an all-reduce along X, so bands
-            # don't need to be replicated. This avoids the expensive
-            # all-gather of bands that would create a nb×r_chunk buffer.
-            # Per-device: nk × (nb_pad/p_x) × ns × (r_chunk/p_y) — fits.
-            psi_rchunk = jax.lax.with_sharding_constraint(
+        @jax.jit
+        def _reshard_rchunk(psi_rchunk):
+            """Reshard r-chunk from {-,XY,-,-} to {-,X,-,Y}.
+            Separate JIT so XLA can't rematerialize back through the FFT."""
+            return jax.lax.with_sharding_constraint(
                 psi_rchunk, NamedSharding(mesh_xy, P(None, 'x', None, 'y')))
 
-            # NOW trim to actual band count (bands are replicated after reshard)
+        def _extract_rchunk_slice(psi_G, r_start_dyn, nb_static):
+            psi_rchunk = _fft_and_rslice(psi_G, r_start_dyn, nb_static)
+            psi_rchunk = _reshard_rchunk(psi_rchunk)
+            # Trim to actual band count outside the resharding JIT
             psi_rchunk = psi_rchunk[:, :nb_static, :, :]
-
             return psi_rchunk
-        
+
         _rchunk_slice_cache[cache_key] = _extract_rchunk_slice
-    
+
     return _rchunk_slice_cache[cache_key](global_psi_Gtot, r_start, nb)
 
 
