@@ -192,10 +192,14 @@ def _splev_scalar(x, t, c, k):
 
 
 def splev_jax(x, t, c, k=3):
-    """JAX-traceable B-spline evaluation, vectorised over x.
+    """JAX-traceable B-spline evaluation, batched over x.
 
     Drop-in replacement for ``scipy_spline(x)`` that is compatible
     with ``jax.grad``, ``jax.jacfwd``, and ``jax.jit``.
+
+    Uses a fully vectorised implementation (no vmap) that processes
+    all evaluation points simultaneously.  Much faster than the
+    per-scalar vmap under ``jacfwd``.
 
     Parameters
     ----------
@@ -208,7 +212,33 @@ def splev_jax(x, t, c, k=3):
     -------
     (nG,) spline values, same dtype as x
     """
-    return jax.vmap(lambda xi: _splev_scalar(xi, t, c, k))(x)
+    n = t.shape[0]
+    # Find knot intervals: l in [k, n-k-2]
+    l = jnp.searchsorted(t, x, side='right') - 1      # (nG,)
+    l = jnp.clip(l, k, n - k - 2)
+
+    # Batched de Boor-Cox recurrence: h has shape (nG, k+1)
+    nG = x.shape[0]
+    h = jnp.zeros((nG, k + 1))
+    h = h.at[:, 0].set(1.0)
+    for j in range(1, k + 1):
+        hh = h
+        h = h.at[:, 0].set(0.0)
+        for i in range(j):
+            li = l + i + 1              # (nG,)
+            lj = l + i + 1 - j          # (nG,)
+            t_li = t[li]                 # (nG,) — fancy indexing
+            t_lj = t[lj]                 # (nG,)
+            f = hh[:, i] / (t_li - t_lj)
+            h = h.at[:, i].add(f * (t_li - x))
+            h = h.at[:, i + 1].set(f * (x - t_lj))
+
+    # Dot with coefficient window: S(x) = sum_{i=0}^{k} c[l-k+i] * h[i]
+    # Build coefficient windows for all points at once
+    offsets = l - k                                    # (nG,)
+    idx = offsets[:, None] + jnp.arange(k + 1)[None, :]  # (nG, k+1)
+    c_win = c[idx]                                     # (nG, k+1)
+    return jnp.sum(c_win * h, axis=1)
 from file_io import WFNReader
 from common import symmetry_maps, Meta
 from common.load_wfns import load_kpoint_fftbox
@@ -245,27 +275,25 @@ class VNLChannelData:
     spline_t: list[jax.Array]   # [knots_array per beta]  — F_l(q) spline
     spline_c: list[jax.Array]   # [coeffs_array per beta]
     spline_k: int               # spline degree
-    # G_l(q) = F_l(q)/q^l splines — smooth at q=0, used by solid-harmonic
-    # autodiff path to avoid catastrophic cancellation in F_l(q)/q^l.
+    # G_l(q) = F_l(q)/q^l splines — smooth at q=0, for solid-harmonic path
     reduced_spline_t: list[jax.Array]   # [knots per beta]
     reduced_spline_c: list[jax.Array]   # [coeffs per beta]
+    # G'_l(q) derivative splines — precomputed for fast custom_jvp
+    reduced_deriv_t: list[jax.Array]    # [knots per beta]
+    reduced_deriv_c: list[jax.Array]    # [coeffs per beta]
+    reduced_deriv_k: int                # degree of derivative spline (k-1)
     E: jax.Array                # (nspinor, nspinor, R, R) D-matrix
 
 
 def _build_reduced_spline(spl, l: int):
-    """Build G_l(q) = F_l(q)/q^l spline from an F_l(q) spline.
+    """Build G_l(q) = F_l(q)/q^l spline AND its derivative G'_l spline.
 
     G_l is smooth at q=0 (since F_l ~ q^l for small q).
-    The q=0 value is computed via L'Hopital / Taylor of the
-    underlying radial integral.
+    Returns ((t_G, c_G, k_G), (t_Gp, c_Gp, k_Gp)).
     """
     from scipy.interpolate import InterpolatedUnivariateSpline
     t_F, c_F, k_F = spl._eval_args
     q_max = float(t_F[-1])
-    # Evaluate F_l on a fine grid.  Use extra density near q=0 where
-    # G_l = F_l/q^l needs good derivative accuracy for Gamma-point
-    # autodiff.  A uniform grid with many points works; the spline
-    # construction is a one-time setup cost.
     n_pts = max(50000, len(t_F) * 10)
     q_grid = np.linspace(0, q_max, n_pts)
     F_vals = np.asarray(spl(q_grid), dtype=np.float64)
@@ -274,11 +302,11 @@ def _build_reduced_spline(spl, l: int):
     else:
         G_vals = np.empty_like(F_vals)
         G_vals[1:] = F_vals[1:] / q_grid[1:] ** l
-        # q=0: use limit.  F_l(q) ~ a*q^l for small q, so G_l(0) = a.
-        # Approximate: G_l(0) ≈ F_l(dq)/dq^l for smallest nonzero dq.
         G_vals[0] = F_vals[1] / q_grid[1] ** l
-    spl_G = InterpolatedUnivariateSpline(q_grid, G_vals, k=min(k_F, 3))
-    return extract_spline_data(spl_G)
+    deg = min(k_F, 3)
+    spl_G = InterpolatedUnivariateSpline(q_grid, G_vals, k=deg)
+    spl_Gp = spl_G.derivative()
+    return extract_spline_data(spl_G), extract_spline_data(spl_Gp)
 
 
 def extract_vnl_channel_data(
@@ -312,15 +340,20 @@ def extract_vnl_channel_data(
 
             spl_t_list, spl_c_list = [], []
             red_t_list, red_c_list = [], []
+            rdd_t_list, rdd_c_list = [], []
+            deriv_k = None
             for bid in beta_ids:
                 spl = splines[(l, int(bid))]
                 t, c, k = extract_spline_data(spl)
                 spl_t_list.append(jnp.asarray(t))
                 spl_c_list.append(jnp.asarray(c))
-                # Reduced spline G_l = F_l / q^l
-                t_r, c_r, _ = _build_reduced_spline(spl, l)
+                # Reduced spline G_l = F_l / q^l + derivative G'_l
+                (t_r, c_r, _), (t_d, c_d, k_d) = _build_reduced_spline(spl, l)
                 red_t_list.append(jnp.asarray(t_r))
                 red_c_list.append(jnp.asarray(c_r))
+                rdd_t_list.append(jnp.asarray(t_d))
+                rdd_c_list.append(jnp.asarray(c_d))
+                deriv_k = int(k_d)
 
             E_j = jnp.asarray(E_np, dtype=jnp.complex128)[:nspinor, :nspinor]
             channels.append(VNLChannelData(
@@ -333,6 +366,9 @@ def extract_vnl_channel_data(
                 spline_k=int(k),
                 reduced_spline_t=red_t_list,
                 reduced_spline_c=red_c_list,
+                reduced_deriv_t=rdd_t_list,
+                reduced_deriv_c=rdd_c_list,
+                reduced_deriv_k=deriv_k if deriv_k is not None else max(0, int(k) - 1),
                 E=E_j,
             ))
     return channels
@@ -453,12 +489,16 @@ def _radial_times_solid_harm(K_cart, ch, pref):
         K_cart,
         tuple(ch.reduced_spline_t),
         tuple(ch.reduced_spline_c),
+        tuple(ch.reduced_deriv_t),
+        tuple(ch.reduced_deriv_c),
         pref, l, nbeta, ch.spline_k,
     )
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(1, 2, 3, 4, 5, 6))
-def _radial_times_solid_harm_impl(K_cart, spl_t, spl_c, pref, l, nbeta, spl_k):
+@functools.partial(jax.custom_jvp, nondiff_argnums=(1, 2, 3, 4, 5, 6, 7, 8))
+def _radial_times_solid_harm_impl(
+    K_cart, spl_t, spl_c, spl_dt, spl_dc, pref, l, nbeta, spl_k,
+):
     _EPS2 = 1e-60
     K_sq = jnp.sum(K_cart ** 2, axis=1)
     q = jnp.sqrt(K_sq + _EPS2)
@@ -470,40 +510,39 @@ def _radial_times_solid_harm_impl(K_cart, spl_t, spl_c, pref, l, nbeta, spl_k):
 
 @_radial_times_solid_harm_impl.defjvp
 def _radial_times_solid_harm_jvp(
-    spl_t, spl_c, pref, l, nbeta, spl_k,
+    spl_t, spl_c, spl_dt, spl_dc, pref, l, nbeta, spl_k,
     primals, tangents,
 ):
     """Stable JVP for G_l(|K|) * S_lm(K).
 
     d/dK [G_l(q) S_lm(K)] = G'_l(q) (K.dK)/q S_lm + G_l(q) dS_lm
 
-    At K=0: (K.dK)/q = 0 (stable: numerator is zero, denominator is
-    eps).  dS_lm/dK_i is a polynomial derivative (constant for l=1,
-    linear for l=2).  No inf*0, no cancellation.
+    At K=0: (K.dK)/q = 0 (stable).  dS_lm/dK = polynomial gradient.
+    G'_l(q) is evaluated via a **precomputed derivative spline** — no
+    autodiff through the B-spline evaluation.
     """
     (K_cart,) = primals
     (dK_cart,) = tangents
     _EPS2 = 1e-60
+    deriv_k = max(0, spl_k - 1)
 
     K_sq = jnp.sum(K_cart ** 2, axis=1)
     q = jnp.sqrt(K_sq + _EPS2)
 
-    # G_l(q) and G'_l(q) via spline
+    # G_l(q) from reduced spline, G'_l(q) from precomputed derivative spline
     G_list, Gp_list = [], []
     for ib in range(nbeta):
         G_list.append(splev_jax(q, spl_t[ib], spl_c[ib], spl_k))
-        Gp_list.append(jax.vmap(
-            jax.grad(lambda qi, t=spl_t[ib], c=spl_c[ib]: _splev_scalar(qi, t, c, spl_k))
-        )(q))
+        Gp_list.append(splev_jax(q, spl_dt[ib], spl_dc[ib], deriv_k))
     G_bG = jnp.stack(G_list, axis=0)
     Gp_bG = jnp.stack(Gp_list, axis=0)
     S = _solid_harmonics_jax(l, K_cart)
 
     primal_out = pref * (1j) ** l * G_bG[:, None, :] * S[None, :, :]
 
-    # Radial tangent: G'(q) * (K.dK)/q — numerically stable at K=0
+    # Radial tangent: G'(q) * (K.dK)/q — stable at K=0
     K_dot_dK = jnp.sum(K_cart * dK_cart, axis=1)
-    dq = K_dot_dK / q            # = (K.dK)/sqrt(K²+eps²) → 0 at K=0
+    dq = K_dot_dK / q
     dG = Gp_bG * dq[None, :]
 
     # Angular tangent: dS via JVP of the polynomial
@@ -560,6 +599,128 @@ def vnl_matrix_at_k(
     return V_NL
 
 
+def build_Z_and_dZ(
+    k_crys: jax.Array,
+    G_int: jax.Array,
+    B: jax.Array,
+    channels: list[VNLChannelData],
+) -> list[tuple[jax.Array, jax.Array, jax.Array]]:
+    """Precompute VNL projectors Z and their Cartesian k-derivatives dZ.
+
+    Returns one (Z, dZ, E) per channel where:
+      Z  : (natoms, R, nG) complex128
+      dZ : (3, natoms, R, nG) complex128 — d/dK_cart_j
+      E  : (nspinor, nspinor, R, R) complex128
+
+    Uses solid harmonics + reduced radial splines for correct derivatives
+    at K=0 (Gamma point).
+    """
+    _EPS2 = 1e-60
+    K_crys = G_int.astype(jnp.float64) + k_crys[None, :]
+    K_cart = K_crys @ B
+    Binv = jnp.linalg.inv(B)
+    K_sq = jnp.sum(K_cart ** 2, axis=1)
+    q = jnp.sqrt(K_sq + _EPS2)
+
+    result = []
+    for ch in channels:
+        l = ch.l
+        pref = ch.prefactor
+        natoms = ch.tau.shape[0]
+        msize = 2 * l + 1
+
+        # G_l(q), G'_l(q) from precomputed splines
+        G_list, Gp_list = [], []
+        for ib in range(ch.nbeta):
+            G_list.append(splev_jax(q, ch.reduced_spline_t[ib],
+                                    ch.reduced_spline_c[ib], ch.spline_k))
+            Gp_list.append(splev_jax(q, ch.reduced_deriv_t[ib],
+                                     ch.reduced_deriv_c[ib], ch.reduced_deriv_k))
+        G_bG = jnp.stack(G_list, axis=0)       # (nbeta, nG)
+        Gp_bG = jnp.stack(Gp_list, axis=0)     # (nbeta, nG)
+
+        # Solid harmonics and their Cartesian gradients
+        S = _solid_harmonics_jax(l, K_cart)     # (msize, nG)
+        # dS/dK_cart_j: evaluate for each Cartesian direction
+        dS_list = []
+        for j in range(3):
+            ej = jnp.zeros((K_cart.shape[0], 3)).at[:, j].set(1.0)
+            _, dS_j = jax.jvp(
+                lambda K: _solid_harmonics_jax(l, K), (K_cart,), (ej,)
+            )
+            dS_list.append(dS_j)
+        dS = jnp.stack(dS_list, axis=0)         # (3, msize, nG)
+
+        # Phases and phase derivatives
+        tau_j = ch.tau
+        phase = jnp.exp(-2j * jnp.pi * (K_crys @ tau_j.T)).T  # (natoms, nG)
+        # dphase/dK_cart_j = -2πi Σ_α (B^{-1})_{αj} τ_α * phase
+        # τ is in crystal coords; B^{-1} converts K_cart derivative to K_crys
+        tau_cart_eff = tau_j @ Binv.T            # (natoms, 3) effective for Cartesian deriv
+        # dphase/dK_cart_j = -2πi τ_cart_eff_j * phase
+        dphase = -2j * jnp.pi * tau_cart_eff[:, :, None] * phase[:, None, :]  # (natoms, 3, nG)
+
+        # Z = pref (i)^l G_l S phase  → (natoms, nbeta, msize, nG)
+        c_il = pref * (1j) ** l
+        radS = G_bG[:, None, :] * S[None, :, :]           # (nbeta, msize, nG)
+        Z_atoms = c_il * phase[:, None, None, :] * radS[None, ...]  # (na, nb, ms, nG)
+
+        # dZ/dK_cart_j = pref (i)^l [G' K_j/q S phase + G dS_j phase + G S dphase_j]
+        K_over_q = K_cart / q[:, None]                     # (nG, 3) — stable at K=0
+        # Term 1: radial derivative
+        drad = Gp_bG[:, None, :] * K_over_q.T[None, :, :]  # (nbeta, 3, nG) — G' K_j/q per beta
+        term1 = drad[:, :, None, :] * S[None, None, :, :]   # (nbeta, 3, msize, nG)
+        # Term 2: angular derivative
+        term2 = G_bG[:, None, None, :] * dS[None, :, :, :]  # (nbeta, 3, msize, nG)
+        # Term 3: phase derivative
+        dZ_core = c_il * (term1 + term2)                     # (nbeta, 3, msize, nG)
+        dZ_from_core = phase[:, None, None, None, :] * dZ_core[None, ...]  # (na, nb, 3, ms, nG)
+        dZ_from_phase = c_il * radS[None, :, None, :, :] * dphase[:, None, :, None, :]
+        dZ_full = dZ_from_core + dZ_from_phase               # (na, nb, 3, ms, nG)
+
+        R = ch.nbeta * msize
+        Z_flat = Z_atoms.reshape(natoms, R, K_cart.shape[0])
+        # dZ: (3, natoms, R, nG) — rearrange axes
+        dZ_flat = dZ_full.transpose(2, 0, 1, 3, 4).reshape(3, natoms, R, K_cart.shape[0])
+
+        result.append((Z_flat, dZ_flat, ch.E))
+
+    return result
+
+
+def vnl_velocity_from_dZ(
+    psi_G: jax.Array,
+    Z_dZ_E: list[tuple[jax.Array, jax.Array, jax.Array]],
+) -> jax.Array:
+    """Nonlocal velocity from precomputed Z and dZ.
+
+    Returns (3, nb, nb) = -(dZ† E Z + Z† E dZ) contracted with psi.
+
+    Parameters
+    ----------
+    psi_G : (nb, nspinor, nG)
+    Z_dZ_E : list of (Z, dZ, E) from ``build_Z_and_dZ``
+    """
+    nb = psi_G.shape[0]
+    v = jnp.zeros((3, nb, nb), dtype=jnp.complex128)
+    for Z, dZ, E in Z_dZ_E:
+        # P = Z†ψ, dP = dZ†ψ
+        P = jnp.einsum('arG,vtG->artv', jnp.conj(Z), psi_G, optimize=True)
+        D = jnp.einsum('strq,aqtv->arsv', E, P, optimize=True)
+        # term1: <m| dZ E Z† |n>
+        for j in range(3):
+            dP_j = jnp.einsum('arG,vtG->artv', jnp.conj(dZ[j]), psi_G, optimize=True)
+            dD_j = jnp.einsum('strq,aqtv->arsv', E, dP_j, optimize=True)
+            # dZ† E Z† psi contracted with psi*
+            vnl_G = jnp.einsum('arG,arsv->vsG', Z, dD_j, optimize=True)
+            t1 = jnp.einsum('msG,nsG->mn', jnp.conj(psi_G), vnl_G, optimize=True)
+            # Z† E dZ† psi contracted with psi*
+            vnl_G2 = jnp.einsum('arG,arsv->vsG', dZ[j], D, optimize=True)
+            t2 = jnp.einsum('msG,nsG->mn', jnp.conj(psi_G), vnl_G2, optimize=True)
+            v = v.at[j].add(t1 + t2)
+    return v
+
+
 def vnl_velocity_autodiff(
     k_crys: jax.Array,
     psi_G: jax.Array,
@@ -587,6 +748,120 @@ def vnl_velocity_autodiff(
     Binv = jnp.linalg.inv(B)
     jac_cart = jnp.einsum('mna,ja->mnj', jac_crys, Binv)
     return jnp.transpose(jac_cart, (2, 0, 1))
+
+
+# ---------------------------------------------------------------------------
+# Momentum matrix elements (local part of velocity)
+# ---------------------------------------------------------------------------
+
+@jax.jit
+def momentum_matrix_k(psi_G, G_int, k_crys, B):
+    """Local momentum matrix: 2*(k+G)_cart_i * <m|G><G|n>.
+
+    Returns (3, nb, nb) — the kinetic contribution to the velocity
+    operator dT/dk_i = 2*(k+G)_i in Ry units.
+
+    Parameters
+    ----------
+    psi_G : (nb, nspinor, nG) — sparse-G coefficients
+    G_int : (nG, 3) int — G-vectors (crystal)
+    k_crys : (3,) — k-point (crystal)
+    B : (3, 3) — crystal-to-Cartesian transformation
+    """
+    K_crys = G_int.astype(jnp.float64) + k_crys[None, :]
+    K_cart = K_crys @ B                          # (nG, 3)
+    # p_i[m,n] = 2 * Σ_{s,G} conj(ψ_m[s,G]) K_cart[G,i] ψ_n[s,G]
+    p = 2.0 * jnp.einsum(
+        'msG,Gi,nsG->imn', jnp.conj(psi_G), K_cart, psi_G, optimize=True,
+    )
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Full velocity / dipole matrix (momentum + VNL)
+# ---------------------------------------------------------------------------
+
+def velocity_matrix_k(
+    psi_G: jax.Array,
+    G_int: jax.Array,
+    k_crys: jax.Array,
+    B: jax.Array,
+    channels: list[VNLChannelData],
+    *,
+    Z_dZ_E: list | None = None,
+) -> jax.Array:
+    """Full velocity matrix: v_i = dH/dk_i = 2(k+G)_i + dV_NL/dk_i.
+
+    Returns (3, nb, nb).
+
+    Parameters
+    ----------
+    Z_dZ_E : optional precomputed (Z, dZ, E) from ``build_Z_and_dZ``.
+        If not provided, built on the fly.
+    """
+    p = momentum_matrix_k(psi_G, G_int, k_crys, B)
+    if Z_dZ_E is None:
+        Z_dZ_E = build_Z_and_dZ(k_crys, G_int, B, channels)
+    vNL = vnl_velocity_from_dZ(psi_G, Z_dZ_E)
+    return p + vNL
+
+
+def compute_dipole_all(
+    wfn: WFNReader,
+    sym,
+    meta: Meta,
+    setup: OperatorSetup,
+    nb: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute velocity/dipole matrix elements for all k-points.
+
+    Returns
+    -------
+    dipole : (3, nk, nb, nb) complex128 — velocity matrix elements
+    deltaE : (nk, nb, nb) float64 — energy differences E_m - E_n
+    """
+    if nb is None:
+        nb = int(meta.b_id_4)
+    nk = sym.nk_tot
+    nspinor = int(meta.nspinor)
+
+    channels = extract_vnl_channel_data(setup.vnl_plan, nspinor=nspinor)
+    B_j = jnp.asarray(setup.B, dtype=jnp.float64)
+
+    dipole = np.zeros((3, nk, nb, nb), dtype=np.complex128)
+    deltaE = np.zeros((nk, nb, nb), dtype=np.float64)
+    energies = np.asarray(wfn.energies)
+
+    for ik in range(nk):
+        with timing.section(f"dft_operators.dipole_k{ik}"):
+            wfn_k = load_kpoint_fftbox(wfn, sym, meta, ik, nb)
+            Gk_crys, _ = generate_gvectors_k(ik, sym, wfn, meta)
+            kvec = np.asarray(sym.unfolded_kpts[ik], dtype=float)
+            Gx = np.asarray(Gk_crys)[:, 0]
+            Gy = np.asarray(Gk_crys)[:, 1]
+            Gz = np.asarray(Gk_crys)[:, 2]
+            psi_G = wfn_k[:, :, Gx, Gy, Gz]
+            G_int = jnp.asarray(np.asarray(Gk_crys, dtype=int), dtype=jnp.int32)
+            k_j = jnp.asarray(kvec, dtype=jnp.float64)
+
+            Z_dZ_E = build_Z_and_dZ(k_j, G_int, B_j, channels)
+            v = velocity_matrix_k(psi_G, G_int, k_j, B_j, channels,
+                                  Z_dZ_E=Z_dZ_E)
+            dipole[:, ik] = np.asarray(v)
+
+            # Energy differences
+            try:
+                k_red = int(sym.irk_to_k_map[ik])
+            except Exception:
+                k_red = int(ik)
+            if energies.ndim >= 3:
+                e_b = np.asarray(energies[0, k_red, :nb], dtype=float)
+            else:
+                e_b = np.asarray(energies[:nb], dtype=float)
+            deltaE[ik] = e_b[:, None] - e_b[None, :]
+            del wfn_k
+
+    return dipole, deltaE
 
 
 # ---------------------------------------------------------------------------
