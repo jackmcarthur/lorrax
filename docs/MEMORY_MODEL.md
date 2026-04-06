@@ -111,9 +111,31 @@ system physically cannot fit; the solver raises a descriptive error.
 ## R-Chunk (`B_r = x_chunk_r`)
 
 `B_r` is the number of contiguous r-points processed per chunk
-(`x_chunk * ny * nz`).  Three independent constraints must hold:
+(`x_chunk * ny * nz`).  Four independent constraints must hold:
 
-1. **Pair density build**
+1. **R-chunk wavefunction reshard**
+
+Before the pair density, the r-chunk wavefunctions must be resharded from
+band-sharded `{-, XY, -, -}` (output of the FFT) to `{-, -, -, Y}` (input
+for pair density). The reshard goes `{-, XY, -, -}` → `{-, Y, -, -}` →
+`{-, -, -, Y}` via all-gather along X then all-to-all along Y.
+
+The binding intermediate is at the `{-, Y, -, -}` stage, where each device
+holds `ceil(nb_pad / p_y)` bands with the full r-chunk (not yet Y-sharded):
+
+```
+M_reshard = 16 * n_k * ceil(nb_pad / p_y) * n_s * B_r
+```
+
+This is the largest single buffer during the r-chunk pipeline and often
+the binding constraint for `B_r`. For Si 10×10×10 on a 4×4 mesh with
+`B_r = 12672`: `M_reshard = 16 × 1000 × 16 × 2 × 12672 = 6.5 GB`.
+
+The reshard is executed in a separate JIT from the FFT to prevent XLA's
+SPMD partitioner from rematerializing the FFT output to satisfy the
+output sharding (which would require 22+ GB on a single device).
+
+2. **Pair density build**
 
 ```
 base + 16 * (B_r / p_y) * [n_k n_b n_s + 2 n_k (n_rmu / p_x)] <= M_budget
@@ -122,7 +144,7 @@ base + 16 * (B_r / p_y) * [n_k n_b n_s + 2 n_k (n_rmu / p_x)] <= M_budget
 Bottleneck arrays: `psi_xchunk_Y (n_k, n_b, n_s, B_r/p_y)`,
 `P_l`/`P_r (n_k, n_rmu/p_x, B_r/p_y)`.
 
-2. **ZCT pipeline**
+3. **ZCT pipeline**
 
 ```
 base + 16 * B_r * [ (4 n_k + n_q) * n_rmu ] <= M_budget
@@ -131,7 +153,7 @@ base + 16 * B_r * [ (4 n_k + n_q) * n_rmu ] <= M_budget
 Bottleneck arrays: `P_l`/`P_r (n_k, n_rmu/p_x, B_r/p_y)`,
 `Z_q (n_q, n_rmu/p_x, B_r/p_y)`.
 
-3. **Solve (with q_chunk = 1)**
+4. **Solve (with q_chunk = 1)**
 
 ```
 base + 4 * 16 * n_q * n_rmu * (B_r / P) + M_L_q + 16*n_rmu^2 <= M_budget
