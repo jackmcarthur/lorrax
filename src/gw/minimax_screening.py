@@ -19,6 +19,7 @@ from typing import Callable
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import multihost_utils as _mh
 import numpy as np
 
 from common import minimax as _minimax
@@ -26,6 +27,14 @@ from .minimax_config import MinimaxConfig
 
 
 _TINY = 1.0e-12
+
+
+def _to_host_np(a, dtype=np.complex128):
+    """Gather a (possibly sharded) JAX array to host as a NumPy array."""
+    try:
+        return np.asarray(_mh.process_allgather(a, tiled=True), dtype=dtype)
+    except Exception:
+        return np.asarray(jax.device_get(a), dtype=dtype)
 
 
 def _minimax_disk_cache_dir() -> Path | None:
@@ -716,9 +725,9 @@ def extract_gn_ppm_parameters(
     if omega_p <= 0.0:
         raise ValueError("omega_p must be > 0 for GN-PPM extraction.")
 
-    V = np.asarray(jax.device_get(V_qmunu), dtype=np.complex128)
-    chi0 = np.asarray(jax.device_get(chi0_q), dtype=np.complex128)
-    chii = np.asarray(jax.device_get(chi_iwp_q), dtype=np.complex128)
+    V = _to_host_np(V_qmunu)
+    chi0 = _to_host_np(chi0_q)
+    chii = _to_host_np(chi_iwp_q)
 
     nkx, nky, nkz = chi0.shape[0], chi0.shape[1], chi0.shape[2]
     n_q = nkx * nky * nkz
@@ -775,8 +784,8 @@ def extract_gn_ppm_parameters_from_Wc(
     if omega_p <= 0.0:
         raise ValueError("omega_p must be > 0 for GN-PPM extraction.")
 
-    Wc0 = np.asarray(jax.device_get(Wc0_q), dtype=np.complex128)
-    Wci = np.asarray(jax.device_get(Wc_iwp_q), dtype=np.complex128)
+    Wc0 = _to_host_np(Wc0_q)
+    Wci = _to_host_np(Wc_iwp_q)
 
     nkx, nky, nkz = Wc0.shape[0], Wc0.shape[1], Wc0.shape[2]
     n_q = nkx * nky * nkz
