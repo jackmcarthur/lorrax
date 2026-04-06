@@ -282,8 +282,12 @@ def get_sharded_wfns_rchunk_slice(
             P(None, ('x', 'y'), None, None, None, None)
         )
         
-        # Intermediate sharding for staged reshard
-        stage1_shard = NamedSharding(mesh_xy, P(None, 'y', None, None))
+        # Intermediate sharding for staged reshard.
+        # The r-chunk is small (typically 1000-14000 points), so replicating
+        # it across all devices is cheap. Going {-,XY,-,-} → replicated →
+        # {-,-,-,Y} avoids the problematic direct XY→Y transition that causes
+        # XLA to rematerialize the full pre-slice tensor.
+        replicated_shard = NamedSharding(mesh_xy, P(None, None, None, None))
         
         # Pre-compute phase grids and kvecs ONCE in closure
         fx_cached = jnp.arange(nx, dtype=jnp.float64)[None, :, None, None] / nx
@@ -337,8 +341,11 @@ def get_sharded_wfns_rchunk_slice(
             )(psi_flat, jnp.array([r_start_dyn]))
             # psi_rchunk: (nk, nb_padded_local, ns, r_chunk_size) per device — small!
 
-            # Staged reshard: now all-gather bands on the SMALL r-chunk array
-            psi_rchunk = jax.lax.with_sharding_constraint(psi_rchunk, stage1_shard)
+            # Staged reshard: all-gather bands on the SMALL r-chunk array,
+            # then redistribute r-points to Y.
+            # Step 1: replicate (all-gather on XY band axis → every device has all bands)
+            psi_rchunk = jax.lax.with_sharding_constraint(psi_rchunk, replicated_shard)
+            # Step 2: shard r-chunk on Y (scatter — each device keeps 1/p_y of r-points)
             psi_rchunk = jax.lax.with_sharding_constraint(psi_rchunk, out_Y)
 
             # NOW trim to actual band count (after reshard, bands are replicated)

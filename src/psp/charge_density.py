@@ -27,6 +27,7 @@ import jax.numpy as jnp
 from file_io import WFNReader
 from common import symmetry_maps, Meta
 from common.load_wfns import load_kpoint_fftbox
+from scipy.interpolate import InterpolatedUnivariateSpline
 
 
 def build_density_from_ibz(
@@ -175,6 +176,147 @@ def _symmetrise_density(
 # ---------------------------------------------------------------------------
 # Density gradient for GGA
 # ---------------------------------------------------------------------------
+
+def build_core_density(
+    wfn,
+    pseudos: dict,
+    meta,
+) -> jax.Array:
+    """Build NLCC core charge density ρ_core(r) on the FFT grid.
+
+    Fourier transforms the radial core charge from the UPF file onto
+    the PW FFT grid with atomic structure factors, just like V_loc.
+
+    Returns zeros if no pseudopotential has core_correction=True.
+
+    Parameters
+    ----------
+    wfn : WFNReader
+    pseudos : dict from load_pseudopotentials
+    meta : Meta
+
+    Returns
+    -------
+    rho_core_r : (nx, ny, nz) float64 — core density on FFT grid
+                 same units/normalization as valence density
+    """
+    nx, ny, nz = meta.fft_grid
+    vol = float(wfn.cell_volume)
+
+    # G-vectors on the FFT grid
+    gx = np.fft.fftfreq(nx, d=1.0 / nx).astype(int)
+    gy = np.fft.fftfreq(ny, d=1.0 / ny).astype(int)
+    gz = np.fft.fftfreq(nz, d=1.0 / nz).astype(int)
+    Gx, Gy, Gz = np.meshgrid(gx, gy, gz, indexing='ij')
+    G_crys = np.stack([Gx, Gy, Gz], axis=-1).astype(float)
+    bvec = np.asarray(wfn.bvec, dtype=float)
+    B = float(wfn.blat) * bvec.T
+    G_cart = np.einsum('...i,ij->...j', G_crys, B)
+    G_norm = np.sqrt(np.sum(G_cart ** 2, axis=-1))  # (nx, ny, nz)
+
+    atom_pos = np.asarray(wfn.atom_crys, dtype=float)   # (nat, 3) crystal
+    atom_types = np.asarray(wfn.atom_types, dtype=int)
+
+    # Build element→pseudo mapping by matching Z
+    from psp.get_DFT_mtxels import _symbol_to_Z
+    z_to_pseudo = {}
+    for elem, pseudo in pseudos.items():
+        z = _symbol_to_Z(elem)
+        if z is not None:
+            z_to_pseudo[z] = pseudo
+
+    rho_core_G = np.zeros((nx, ny, nz), dtype=complex)
+    N = nx * ny * nz
+
+    for iat in range(len(atom_pos)):
+        z_atom = int(atom_types[iat])
+        pseudo = z_to_pseudo.get(z_atom)
+        if pseudo is None:
+            continue
+        hdr = getattr(pseudo, 'pp_header', None)
+        cc = getattr(hdr, 'core_correction', None) if hdr else None
+        if cc is None or str(cc) != 'UpfLogical.T':
+            continue
+        nlcc = getattr(pseudo, 'pp_nlcc', None)
+        if nlcc is None:
+            continue
+
+        # Radial core charge: ρ_core(r) on radial grid
+        rho_c_r = np.asarray(nlcc.value, dtype=float)
+        mesh = pseudo.pp_mesh
+        r = np.asarray(mesh.pp_r.value, dtype=float)
+        rab = np.asarray(mesh.pp_rab.value, dtype=float)
+
+        # Fourier transform: ρ_core(G) = (4π/Ω) ∫ r² ρ_core(r) j₀(Gr) dr
+        # At G=0: ρ_core(0) = (4π/Ω) ∫ r² ρ_core(r) dr = Q_core / Ω
+        # For G>0: ρ_core(G) = (4π/Ω) ∫ r² ρ_core(r) sin(Gr)/(Gr) dr
+
+        # Build spline of r² ρ_core(r) for integration
+        integrand = r ** 2 * rho_c_r  # r² ρ_core(r)
+        # Integrate: ∫ integrand * sin(Gr)/(Gr) * rab dr
+        # = ∫ integrand * sin(Gr)/(Gr) * dr  (rab = dr for uniform grid, or use rab)
+
+        # For each |G|, compute the radial integral
+        G_flat = G_norm.ravel()
+        n_G = len(G_flat)
+
+        # G=0 component
+        Q_core = np.sum(4 * np.pi * integrand * rab)
+        rho_c_G0 = Q_core / vol
+
+        # For G>0: use numpy vectorization
+        # sinc(x) = sin(πx)/(πx), but we need sin(Gr)/(Gr)
+        # Build on a unique-G grid for efficiency
+        G_unique = np.unique(G_flat)
+        G_unique = G_unique[G_unique > 1e-10]  # skip G=0
+
+        # Precompute the integral for each unique |G|
+        rho_c_of_G = {}
+        for Gval in G_unique:
+            Gr = Gval * r
+            # sin(Gr)/(Gr) with safe division at r=0
+            j0 = np.ones_like(Gr)
+            mask = Gr > 1e-12
+            j0[mask] = np.sin(Gr[mask]) / Gr[mask]
+            val = (4 * np.pi / vol) * np.sum(integrand * j0 * rab)
+            rho_c_of_G[Gval] = val
+
+        # Map back to the full G-grid
+        rho_c_G_flat = np.full(n_G, rho_c_G0, dtype=complex)
+        for i, Gval in enumerate(G_flat):
+            if Gval > 1e-10:
+                rho_c_G_flat[i] = rho_c_of_G.get(
+                    G_unique[np.argmin(np.abs(G_unique - Gval))], 0.0
+                )
+        rho_c_G_atom = rho_c_G_flat.reshape(nx, ny, nz)
+
+        # Structure factor: e^{-2πi G_crys · τ}
+        tau = atom_pos[iat]
+        phase = np.exp(-2j * np.pi * (
+            Gx * tau[0] + Gy * tau[1] + Gz * tau[2]
+        ))
+
+        rho_core_G += rho_c_G_atom * phase
+
+    # IFFT to real space — match the normalization of compute_valence_density
+    # rho_core_G is the continuous FT: ρ(G) = (1/Ω) ∫ ρ(r) e^{-iGr} d³r
+    # To get rho on the FFT grid: rho_grid = N * IFFT(rho_G_continuous)
+    # With ortho IFFT: rho_grid = sqrt(N) * IFFT_ortho(rho_G_continuous)
+    # But we need rho_grid in the same convention as compute_valence_density:
+    #   rho_cvd has sum(rho) * vol/N = nelec
+    # Our ρ(G=0) = Q_core/Ω, and IFFT should give rho_grid = ρ(G=0) * N (unnorm)
+    #   → rho_grid(uniform) = Q_core/Ω * N = Q_core * N/Ω
+    #   → sum(rho_grid) * Ω/N = Q_core ✓ (matches CVD convention)
+
+    # Use standard (unnormalized) IFFT: rho_grid = N * IFFT(rho_G)
+    rho_core_r = np.real(np.fft.ifftn(rho_core_G)) * N
+
+    integral = float(np.sum(rho_core_r)) * vol / N
+    print(f"  Core density integral: {integral:.4f} e "
+          f"(from NLCC, {len(atom_pos)} atoms)")
+
+    return jnp.asarray(rho_core_r, dtype=jnp.float64)
+
 
 def compute_grad_rho_sq(
     rho_r: jax.Array,
