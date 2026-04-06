@@ -526,12 +526,17 @@ def get_sharded_wfns_centroids(
         centroids = jnp.asarray(centroid_indices, dtype=jnp.int64)
         centroid_lin = (centroids[:, 0] * (ny * nz) + centroids[:, 1] * nz + centroids[:, 2]).astype(jnp.int64)
         
-        @partial(jax.jit, static_argnames=('nb_static',))
-        def _extract_centroids(psi_G, nb_static):
-            # FFT to real space
+        # The band axis is padded to be divisible by p_x*p_y for the FFT.
+        # Keep the padded count through the gather and reshard — trimming
+        # to the actual band count happens OUTSIDE the JIT. If we trim
+        # inside, the non-divisible band count causes XLA to rematerialize
+        # the FFT to satisfy the output sharding.
+        stage_Y_4d = NamedSharding(mesh_xy, P(None, 'y', None, None))
+
+        @jax.jit
+        def _fft_gather_reshard(psi_G):
+            """FFT → phase → gather centroids → reshard. Keeps padded bands."""
             psi_r = sharded_ifftn(psi_G)
-            
-            # Apply Bloch phase
             phase_spatial = jnp.exp(
                 2j * jnp.pi * (
                     kvecs_cached[:, 0:1, None, None] * fx_cached
@@ -540,43 +545,36 @@ def get_sharded_wfns_centroids(
                 )
             )
             psi_r = psi_r * phase_spatial[:, None, None, :, :, :]
-            
-            # Normalize and trim bands
             psi_r = psi_r * jnp.sqrt(n_rtot_cached)
-            psi_r = psi_r[:, :nb_static, :, :, :, :]
-            
-            # Flatten spatial dims
-            psi_rtot = psi_r.reshape(nk_tot, nb_static, nspinor, -1)
-            # Keep bands sharded on (x,y); avoid resharding a huge (nk,nb,ns,n_rtot) tensor.
-            intermediate_XY = NamedSharding(mesh_xy, P(None, ('x', 'y'), None, None))
-            psi_rtot = jax.lax.with_sharding_constraint(psi_rtot, intermediate_XY)
-            
-            # Centroid gather on axis 3 (spatial) while bands remain sharded on (x,y).
-            # Wrap in checkpoint to prevent XLA from rematerializing the FFT pipeline
-            # when it needs to reshard the output. Without this, XLA sees the gather's
-            # output sharding is incompatible with the input and recomputes everything
-            # from psi_G to produce psi_rtot in the target layout — OOMing on large grids.
-            @jax.checkpoint
-            def _gather_centroids(psi_flat):
-                return jnp.take(psi_flat, centroid_lin, axis=3)
-            psi_rmu = _gather_centroids(psi_rtot)
-            # psi_rmu: (nk, nb, ns, n_rmu) sharded {-, XY, -, -}
+            # Do NOT trim bands here — keep padded count for clean sharding.
+            nb_padded = psi_r.shape[1]
 
-            # Two-step reshard: {-,XY,-,-} → {-,Y,-,-} → {-,-,-,Y}
-            # Step 1: all-gather along X (collect band shards from X-axis devices)
-            stage_Y = NamedSharding(mesh_xy, P(None, 'y', None, None))
-            psi_rmu = jax.lax.with_sharding_constraint(psi_rmu, stage_Y)
-            # Step 2: all-to-all along Y (swap bands for centroids)
+            # Flatten spatial dims and gather centroids
+            psi_rtot = psi_r.reshape(nk_tot, nb_padded, nspinor, -1)
+            psi_rmu = jnp.take(psi_rtot, centroid_lin, axis=3)
+            # psi_rmu: (nk, nb_padded, ns, n_rmu) sharded {-, XY, -, -}
+
+            # Two-step reshard on the PADDED array (divisible by both p_x and p_y):
+            # Step 1: {-,XY,-,-} → {-,Y,-,-} (all-gather along X)
+            psi_rmu = jax.lax.with_sharding_constraint(psi_rmu, stage_Y_4d)
+            # Step 2: {-,Y,-,-} → {-,-,-,Y} (all-to-all along Y)
             psi_rmu = jax.lax.with_sharding_constraint(psi_rmu, out_Y)
 
-            # Conjugate-transpose for pair density: (nk, n_rmu, nb, ns)
+            # Conjugate-transpose for pair density
             psi_rmuT = jnp.conj(psi_rmu.transpose(0, 3, 1, 2))
             psi_rmuT = jax.lax.with_sharding_constraint(psi_rmuT, out_X)
-            
+
             return psi_rmu, psi_rmuT
-        
+
+        def _extract_centroids(psi_G, nb_actual):
+            psi_rmu, psi_rmuT = _fft_gather_reshard(psi_G)
+            # Trim to actual band count OUTSIDE the JIT
+            psi_rmu = psi_rmu[:, :nb_actual, :, :]
+            psi_rmuT = psi_rmuT[:, :, :nb_actual, :]
+            return psi_rmu, psi_rmuT
+
         _centroid_extract_cache[cache_key] = _extract_centroids
-    
+
     return _centroid_extract_cache[cache_key](global_psi_Gtot, nb)
 
 
