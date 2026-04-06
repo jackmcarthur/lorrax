@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import argparse
+import functools
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -241,17 +242,55 @@ class VNLChannelData:
     prefactor: float            # 4 pi / sqrt(Omega)
     l: int                      # angular momentum
     nbeta: int                  # number of beta projectors for this l
-    spline_t: list[jax.Array]   # [knots_array per beta]
+    spline_t: list[jax.Array]   # [knots_array per beta]  — F_l(q) spline
     spline_c: list[jax.Array]   # [coeffs_array per beta]
     spline_k: int               # spline degree
+    # G_l(q) = F_l(q)/q^l splines — smooth at q=0, used by solid-harmonic
+    # autodiff path to avoid catastrophic cancellation in F_l(q)/q^l.
+    reduced_spline_t: list[jax.Array]   # [knots per beta]
+    reduced_spline_c: list[jax.Array]   # [coeffs per beta]
     E: jax.Array                # (nspinor, nspinor, R, R) D-matrix
+
+
+def _build_reduced_spline(spl, l: int):
+    """Build G_l(q) = F_l(q)/q^l spline from an F_l(q) spline.
+
+    G_l is smooth at q=0 (since F_l ~ q^l for small q).
+    The q=0 value is computed via L'Hopital / Taylor of the
+    underlying radial integral.
+    """
+    from scipy.interpolate import InterpolatedUnivariateSpline
+    t_F, c_F, k_F = spl._eval_args
+    q_max = float(t_F[-1])
+    # Evaluate F_l on a fine grid.  Use extra density near q=0 where
+    # G_l = F_l/q^l needs good derivative accuracy for Gamma-point
+    # autodiff.  A uniform grid with many points works; the spline
+    # construction is a one-time setup cost.
+    n_pts = max(50000, len(t_F) * 10)
+    q_grid = np.linspace(0, q_max, n_pts)
+    F_vals = np.asarray(spl(q_grid), dtype=np.float64)
+    if l == 0:
+        G_vals = F_vals
+    else:
+        G_vals = np.empty_like(F_vals)
+        G_vals[1:] = F_vals[1:] / q_grid[1:] ** l
+        # q=0: use limit.  F_l(q) ~ a*q^l for small q, so G_l(0) = a.
+        # Approximate: G_l(0) ≈ F_l(dq)/dq^l for smallest nonzero dq.
+        G_vals[0] = F_vals[1] / q_grid[1] ** l
+    spl_G = InterpolatedUnivariateSpline(q_grid, G_vals, k=min(k_F, 3))
+    return extract_spline_data(spl_G)
 
 
 def extract_vnl_channel_data(
     plan: dict,
     nspinor: int = 2,
 ) -> list[VNLChannelData]:
-    """Extract all VNL channel data from a plan into autodiff-ready form."""
+    """Extract all VNL channel data from a plan into autodiff-ready form.
+
+    For each (l, beta), also precomputes the *reduced* radial spline
+    G_l(q) = F_l(q)/q^l which is smooth at q=0 and avoids catastrophic
+    cancellation when autodiff-ed through the solid-harmonic path.
+    """
     channels = []
     for _key, sp in plan.items():
         tau = np.asarray(sp['atoms']['tau'], dtype=np.float64)
@@ -272,11 +311,16 @@ def extract_vnl_channel_data(
                 continue
 
             spl_t_list, spl_c_list = [], []
+            red_t_list, red_c_list = [], []
             for bid in beta_ids:
                 spl = splines[(l, int(bid))]
                 t, c, k = extract_spline_data(spl)
                 spl_t_list.append(jnp.asarray(t))
                 spl_c_list.append(jnp.asarray(c))
+                # Reduced spline G_l = F_l / q^l
+                t_r, c_r, _ = _build_reduced_spline(spl, l)
+                red_t_list.append(jnp.asarray(t_r))
+                red_c_list.append(jnp.asarray(c_r))
 
             E_j = jnp.asarray(E_np, dtype=jnp.complex128)[:nspinor, :nspinor]
             channels.append(VNLChannelData(
@@ -287,9 +331,65 @@ def extract_vnl_channel_data(
                 spline_t=spl_t_list,
                 spline_c=spl_c_list,
                 spline_k=int(k),
+                reduced_spline_t=red_t_list,
+                reduced_spline_c=red_c_list,
                 E=E_j,
             ))
     return channels
+
+
+def _solid_harmonics_jax(l: int, K_cart: jax.Array) -> jax.Array:
+    """Solid harmonics S_lm(x,y,z) = r^l Y_lm(r-hat) in QE convention.
+
+    Pure polynomials in K_cart — no trig, no sqrt, no singularities.
+    Perfectly smooth everywhere including K=0.  Autodiff-friendly.
+
+    Returns (2l+1, nG) matching the QE ordering [m=0, 1c, 1s, 2c, 2s, ...].
+    Supports l = 0, 1, 2, 3.
+    """
+    x = K_cart[:, 0]
+    y = K_cart[:, 1]
+    z = K_cart[:, 2]
+    fpi = 4.0 * jnp.pi
+
+    if l == 0:
+        return jnp.stack([jnp.ones_like(x) / jnp.sqrt(fpi)], axis=0)
+
+    elif l == 1:
+        c = jnp.sqrt(3.0 / fpi)
+        return jnp.stack([c * z, -c * x, -c * y], axis=0)
+
+    elif l == 2:
+        c2 = jnp.sqrt(5.0 / fpi)
+        c2s3 = c2 * jnp.sqrt(3.0)
+        return jnp.stack([
+            c2 / 2.0 * (2 * z**2 - x**2 - y**2),   # m=0
+            -c2s3 * x * z,                            # m=1 cos
+            -c2s3 * y * z,                            # m=1 sin
+            c2s3 / 2.0 * (x**2 - y**2),              # m=2 cos
+            c2s3 * x * y,                             # m=2 sin
+        ], axis=0)
+
+    elif l == 3:
+        c3 = jnp.sqrt(7.0 / fpi)
+        s3 = jnp.sqrt(3.0)
+        s5 = jnp.sqrt(5.0)
+        s6 = jnp.sqrt(6.0)
+        s10 = jnp.sqrt(10.0)
+        s15 = jnp.sqrt(15.0)
+        r2 = x**2 + y**2 + z**2
+        return jnp.stack([
+            c3 / 2.0 * z * (2*z**2 - 3*x**2 - 3*y**2),       # m=0
+            -c3*s6/4.0 * x * (4*z**2 - x**2 - y**2),          # m=1c
+            -c3*s6/4.0 * y * (4*z**2 - x**2 - y**2),          # m=1s
+            c3*s15/2.0 * z * (x**2 - y**2),                    # m=2c
+            c3*s15 * x * y * z,                                 # m=2s
+            -c3*s10/4.0 * x * (x**2 - 3*y**2),                # m=3c
+            -c3*s10/4.0 * y * (3*x**2 - y**2),                # m=3s
+        ], axis=0)
+
+    else:
+        raise NotImplementedError(f"solid_harmonics_jax: l={l} > 3 not implemented")
 
 
 def _build_Z_channel_jax(
@@ -298,6 +398,14 @@ def _build_Z_channel_jax(
     ch: VNLChannelData,
 ) -> jax.Array:
     """Build projector matrix Z for one channel.  Pure JAX, k-traceable.
+
+    Uses the solid-harmonic factorisation:
+
+        Z = pref (i)^l  [F_l(q)/q^l]  S_lm(K_x,K_y,K_z)  exp(-2pi i K.tau)
+
+    where S_lm are solid harmonics (Cartesian polynomials) and
+    F_l(q)/q^l is smooth at q=0 (since F_l(q) ~ q^l for small q).
+    This avoids all angle-based singularities at K=0.
 
     Parameters
     ----------
@@ -309,35 +417,104 @@ def _build_Z_channel_jax(
     -------
     Z : (natoms, R, nG) complex128, where R = nbeta * (2l+1)
     """
-    _EPS = 1e-30
     nG = K_crys.shape[0]
-    K_norm = jnp.sqrt(jnp.sum(K_cart ** 2, axis=1) + _EPS**2)  # (nG,)
     l = ch.l
-    msize = 2 * l + 1
     pref = ch.prefactor
 
-    # Radial form factors via JAX splines
-    F_list = []
-    for ib in range(ch.nbeta):
-        F_list.append(
-            splev_jax(K_norm, ch.spline_t[ib], ch.spline_c[ib], ch.spline_k)
-        )
-    F_bG = jnp.stack(F_list, axis=0)           # (nbeta, nG)
-    radial = pref * (1j) ** l * F_bG            # (nbeta, nG)
-
-    # Real spherical harmonics (JAX)
-    Y = real_sph_harmonics_jax(l, K_cart)       # (msize, nG)
+    # ── radial × angular via custom JVP ───────────────────────────
+    # G_l(|K|) * S_lm(K) is smooth at K=0, but naive autodiff through
+    # sqrt(K��K) produces catastrophic cancellation.  We provide the
+    # analytically stable JVP via @custom_jvp.
+    radial_times_S = _radial_times_solid_harm(K_cart, ch, pref)
+    # radial_times_S: (nbeta, msize, nG) complex128
 
     # Atomic structure factors
     phase = jnp.exp(
         -2j * jnp.pi * (K_crys @ ch.tau.T)
-    ).T                                          # (natoms, nG)
+    ).T                                           # (natoms, nG)
 
-    # Z = phase * (radial x Y)
-    Z_bmg = radial[:, None, :] * Y[None, :, :]  # (nbeta, msize, nG)
-    Z_atoms = phase[:, None, None, :] * Z_bmg[None, ...]
-    R = ch.nbeta * msize
+    # Z = phase * radial_times_S
+    Z_atoms = phase[:, None, None, :] * radial_times_S[None, ...]
+    R = ch.nbeta * (2 * l + 1)
     return Z_atoms.reshape(ch.tau.shape[0], R, nG)
+
+
+def _radial_times_solid_harm(K_cart, ch, pref):
+    """Compute pref * (i)^l * G_l(|K|) * S_lm(K_cart).
+
+    Delegates to ``_radial_times_solid_harm_impl`` which has a
+    ``@custom_jvp`` providing an analytically stable tangent at K=0.
+    """
+    # Pack spline data as a flat tuple of arrays for the custom_jvp
+    # boundary (custom_jvp requires array-typed primals).
+    l = ch.l
+    nbeta = ch.nbeta
+    return _radial_times_solid_harm_impl(
+        K_cart,
+        tuple(ch.reduced_spline_t),
+        tuple(ch.reduced_spline_c),
+        pref, l, nbeta, ch.spline_k,
+    )
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(1, 2, 3, 4, 5, 6))
+def _radial_times_solid_harm_impl(K_cart, spl_t, spl_c, pref, l, nbeta, spl_k):
+    _EPS2 = 1e-60
+    K_sq = jnp.sum(K_cart ** 2, axis=1)
+    q = jnp.sqrt(K_sq + _EPS2)
+    G_list = [splev_jax(q, spl_t[ib], spl_c[ib], spl_k) for ib in range(nbeta)]
+    G_bG = jnp.stack(G_list, axis=0)
+    S = _solid_harmonics_jax(l, K_cart)
+    return pref * (1j) ** l * G_bG[:, None, :] * S[None, :, :]
+
+
+@_radial_times_solid_harm_impl.defjvp
+def _radial_times_solid_harm_jvp(
+    spl_t, spl_c, pref, l, nbeta, spl_k,
+    primals, tangents,
+):
+    """Stable JVP for G_l(|K|) * S_lm(K).
+
+    d/dK [G_l(q) S_lm(K)] = G'_l(q) (K.dK)/q S_lm + G_l(q) dS_lm
+
+    At K=0: (K.dK)/q = 0 (stable: numerator is zero, denominator is
+    eps).  dS_lm/dK_i is a polynomial derivative (constant for l=1,
+    linear for l=2).  No inf*0, no cancellation.
+    """
+    (K_cart,) = primals
+    (dK_cart,) = tangents
+    _EPS2 = 1e-60
+
+    K_sq = jnp.sum(K_cart ** 2, axis=1)
+    q = jnp.sqrt(K_sq + _EPS2)
+
+    # G_l(q) and G'_l(q) via spline
+    G_list, Gp_list = [], []
+    for ib in range(nbeta):
+        G_list.append(splev_jax(q, spl_t[ib], spl_c[ib], spl_k))
+        Gp_list.append(jax.vmap(
+            jax.grad(lambda qi, t=spl_t[ib], c=spl_c[ib]: _splev_scalar(qi, t, c, spl_k))
+        )(q))
+    G_bG = jnp.stack(G_list, axis=0)
+    Gp_bG = jnp.stack(Gp_list, axis=0)
+    S = _solid_harmonics_jax(l, K_cart)
+
+    primal_out = pref * (1j) ** l * G_bG[:, None, :] * S[None, :, :]
+
+    # Radial tangent: G'(q) * (K.dK)/q — numerically stable at K=0
+    K_dot_dK = jnp.sum(K_cart * dK_cart, axis=1)
+    dq = K_dot_dK / q            # = (K.dK)/sqrt(K²+eps²) → 0 at K=0
+    dG = Gp_bG * dq[None, :]
+
+    # Angular tangent: dS via JVP of the polynomial
+    _, dS = jax.jvp(
+        lambda K: _solid_harmonics_jax(l, K), (K_cart,), (dK_cart,)
+    )
+
+    tangent_out = pref * (1j) ** l * (
+        dG[:, None, :] * S[None, :, :] + G_bG[:, None, :] * dS[None, :, :]
+    )
+    return primal_out, tangent_out
 
 
 def vnl_matrix_at_k(
