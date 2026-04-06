@@ -608,22 +608,31 @@ def load_centroids_band_chunked(
     n_rmu = len(centroid_indices)
 
     # Auto-detect k_chunk_size from memory budget if not specified.
-    # The FFT box per k-point per band chunk is:
-    #   nk * nb_chunk * nspinor * n_rtot * 16 bytes
-    # The XLA execution buffer is roughly 3-4x the input size.
-    # Target: keep the FFT box + execution buffer under memory_per_device_gb.
+    # Memory model for k-chunk sizing.
+    #
+    # During _extract_centroids, the per-device peak occurs at the FFT step.
+    # The 3D FFT is done in 3 stages (x→y→z), each needing input + output
+    # buffers. Measured: peak = 4× the psi shard (input + output + 2 FFT
+    # staging buffers). After FFT, the phase multiply adds a 5th copy
+    # briefly, but the FFT staging buffers are freed first, so steady state
+    # is 3× shard. The peak is 4×.
+    #
+    # With band-sharding across n_devices:
+    #   shard = nk_chunk × ceil(nb_chunk / n_devices) × nspinor × n_rtot × 16
+    #   peak_per_device = 4 × shard
     if k_chunk_size is None:
         n_rtot = meta.fft_grid[0] * meta.fft_grid[1] * meta.fft_grid[2]
-        n_devices = len(jax.devices())
-        # Per-device memory for FFT box: (nk * band_chunk * nspinor * n_rtot * 16) / n_devices
-        # XLA needs ~4x for intermediates (FFT buffers, phase, gather)
-        xla_factor = 4.0
-        mem_budget_bytes = meta.memory_per_device_gb * 1e9 if hasattr(meta, 'memory_per_device_gb') and meta.memory_per_device_gb > 0 else 28e9
-        per_k_per_band = nspinor * n_rtot * 16 * xla_factor / n_devices
-        max_kb = mem_budget_bytes / per_k_per_band
-        # k_chunk * band_chunk must fit
-        effective_chunk = int(max_kb / min(band_chunk_size, nb_total))
-        k_chunk_size = max(1, min(effective_chunk, nk_tot))
+        n_devices = jax.device_count()  # global device count
+        nb_chunk = min(band_chunk_size, nb_total)
+        bands_per_shard = (nb_chunk + n_devices - 1) // n_devices
+
+        peak_copies = 4  # measured: 4 simultaneous copies during FFT
+        gpu_mem_bytes = 36e9  # A100-40GB minus OS/runtime
+        if hasattr(meta, 'memory_per_device_gb') and meta.memory_per_device_gb > 0:
+            gpu_mem_bytes = meta.memory_per_device_gb * 1e9
+
+        per_k_bytes = bands_per_shard * nspinor * n_rtot * 16 * peak_copies
+        k_chunk_size = max(1, min(int(gpu_mem_bytes / per_k_bytes), nk_tot))
 
     k_chunk_size = min(k_chunk_size, nk_tot)
     num_k_chunks = (nk_tot + k_chunk_size - 1) // k_chunk_size
