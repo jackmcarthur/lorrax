@@ -337,13 +337,15 @@ def get_sharded_wfns_rchunk_slice(
             )(psi_flat, jnp.array([r_start_dyn]))
             # psi_rchunk: (nk, nb_padded_local, ns, r_chunk_size) per device — small!
 
-            # Two-step reshard: {-,XY,-,-} → {-,Y,-,-} → {-,-,-,Y}
-            # Keep padded band count (divisible by p_x*p_y) through both steps.
-            # Step 1: all-gather along X (collect band shards from X-axis devices)
-            stage_Y = NamedSharding(mesh_xy, P(None, 'y', None, None))
-            psi_rchunk = jax.lax.with_sharding_constraint(psi_rchunk, stage_Y)
-            # Step 2: all-to-all along Y (swap bands for r-points)
-            psi_rchunk = jax.lax.with_sharding_constraint(psi_rchunk, out_Y)
+            # Reshard: {-,XY,-,-} → {-,X,-,Y}
+            # All-to-all along Y: swap Y's band shards for r-chunk shards.
+            # Bands remain X-sharded — the downstream pair density einsum
+            # contracts over bands with an all-reduce along X, so bands
+            # don't need to be replicated. This avoids the expensive
+            # all-gather of bands that would create a nb×r_chunk buffer.
+            # Per-device: nk × (nb_pad/p_x) × ns × (r_chunk/p_y) — fits.
+            psi_rchunk = jax.lax.with_sharding_constraint(
+                psi_rchunk, NamedSharding(mesh_xy, P(None, 'x', None, 'y')))
 
             # NOW trim to actual band count (bands are replicated after reshard)
             psi_rchunk = psi_rchunk[:, :nb_static, :, :]
