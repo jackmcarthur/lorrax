@@ -22,6 +22,20 @@ from .cholesky_2d import (
 )
 
 
+def _make_kchunk_meta(meta: Meta, kc_start: int, kc_end: int):
+    """Create a shallow copy of Meta with nk_tot adjusted for a k-chunk.
+
+    The returned object shares all attributes with the original except
+    nk_tot, which is set to the chunk size. This lets read_Gvecs_to_devices
+    and get_sharded_wfns_centroids process a subset of k-points using the
+    same code paths.
+    """
+    from copy import copy
+    meta_chunk = copy(meta)
+    meta_chunk.nk_tot = kc_end - kc_start
+    return meta_chunk
+
+
 def compute_block_size_for_2d_cholesky(n_rmu: int, Pr: int, Pc: int) -> tuple[int, int]:
     """
     Compute block size for 2D blocked Cholesky that satisfies distribution constraints.
@@ -196,11 +210,18 @@ def get_small_psi_component(gvecs, kvec, bvec, psi_G):
 
 
 def read_Gvecs_to_devices(
-	wfn, sym, bandrange, meta: Meta, bispinor: bool, mesh_xy: Mesh
+	wfn, sym, bandrange, meta: Meta, bispinor: bool, mesh_xy: Mesh,
+	k_range: tuple[int, int] | None = None,
 ):
 	"""
-	Non-jitted: load cnk(G) for all k-points and (padded) band shards into a global
+	Non-jitted: load cnk(G) for k-points and (padded) band shards into a global
 	sharded G-space FFT box over a 2D mesh ['x','y'] along the band axis.
+
+	Args:
+		k_range: Optional (kc_start, kc_end) to load only a subset of k-points.
+			When set, meta.nk_tot should match the chunk size (kc_end - kc_start).
+			SymMaps operations use the original full-BZ indices offset by kc_start.
+
 	Returns the global sharded array global_psi_Gtot and nb_actual.
 	"""
 	nb = bandrange[1] - bandrange[0]
@@ -222,9 +243,12 @@ def read_Gvecs_to_devices(
 	local_coords = [local_coords[i] for i in order]
 	n_local_shards = len(local_coords)
 
-	# Local buffer for all k-points and this process's band shards (G-space)
+	# Local buffer for k-points in range and this process's band shards (G-space)
+	kc_start_alloc = k_range[0] if k_range is not None else 0
+	kc_end_alloc = k_range[1] if k_range is not None else sym.nk_tot
+	nk_alloc = kc_end_alloc - kc_start_alloc
 	psi_Gtot_local = np.zeros(
-		(meta.nk_tot, n_local_shards * bands_per_shard, meta.nspinor, *meta.fft_grid),
+		(nk_alloc, n_local_shards * bands_per_shard, meta.nspinor, *meta.fft_grid),
 		dtype=np.complex128,
 	)
 
@@ -252,35 +276,40 @@ def read_Gvecs_to_devices(
 		local_band_indices = np.array(local_band_indices, dtype=np.int64)
 		n_owned = len(owned_band_indices)
 
-	# Load G-coefficients for all k-points
+	# Determine k-point range
+	kc_start = k_range[0] if k_range is not None else 0
+	kc_end = k_range[1] if k_range is not None else sym.nk_tot
+	nk_chunk = kc_end - kc_start
+
+	# Load G-coefficients for k-points in range
 	# Phase 1: HDF5 reads (inherently serial) - collect all data
 	with timing.section("load_wfns.k_loop"):
-		# Pre-compute ngk and max for padding
-		ngk_all = np.array([int(wfn.ngk[sym.irk_to_k_map[k]]) for k in range(sym.nk_tot)])
+		# Pre-compute ngk and max for padding (use full-BZ indices for SymMaps)
+		ngk_all = np.array([int(wfn.ngk[sym.irk_to_k_map[kc_start + k]]) for k in range(nk_chunk)])
 		max_ngk = int(ngk_all.max())
-		
+
 		# Pre-allocate padded arrays for batched scatter
 		n_local_bands = n_local_shards * bands_per_shard
-		psi_Gspace_all = np.zeros((sym.nk_tot, n_local_bands, meta.nspinor, max_ngk), dtype=np.complex128)
-		gvecs_all = np.zeros((sym.nk_tot, max_ngk, 3), dtype=np.int32)
-		
-		for k_idx in range(sym.nk_tot):
-			k_red = sym.irk_to_k_map[k_idx]
+		psi_Gspace_all = np.zeros((nk_chunk, n_local_bands, meta.nspinor, max_ngk), dtype=np.complex128)
+		gvecs_all = np.zeros((nk_chunk, max_ngk, 3), dtype=np.int32)
+
+		for k_local in range(nk_chunk):
+			k_idx = kc_start + k_local  # full-BZ index for SymMaps
 			gvecs_k_rot = np.asarray(sym.get_gvecs_kfull(wfn, k_idx))
-			ngk = ngk_all[k_idx]
+			ngk = ngk_all[k_local]
 			
 			# Store G-vectors (padded)
-			gvecs_all[k_idx, :ngk, :] = gvecs_k_rot
-			
+			gvecs_all[k_local, :ngk, :] = gvecs_k_rot
+
 			# Batch read and rotate all owned bands at once
 			if n_owned > 0:
 				cnk_batch = sym.get_cnk_fullzone_batch(wfn, owned_band_indices, k_idx)
-				psi_Gspace_all[k_idx, local_band_indices, 0:meta.nspinor_wfnfile, :ngk] = cnk_batch
-			
+				psi_Gspace_all[k_local, local_band_indices, 0:meta.nspinor_wfnfile, :ngk] = cnk_batch
+
 			# Expand to 4 components if requested
 			if bispinor:
-				psi_Gspace_local = psi_Gspace_all[k_idx, :, :, :ngk]
-				psi_Gspace_all[k_idx, :, 2:4, :ngk] = np.asarray(get_small_psi_component(
+				psi_Gspace_local = psi_Gspace_all[k_local, :, :, :ngk]
+				psi_Gspace_all[k_local, :, 2:4, :ngk] = np.asarray(get_small_psi_component(
 					jnp.asarray(gvecs_k_rot),
 					jnp.asarray(sym.unfolded_kpts[k_idx], dtype=jnp.float64),
 					jnp.asarray(wfn.bvec, dtype=jnp.float64),
@@ -290,16 +319,16 @@ def read_Gvecs_to_devices(
 	# Phase 2: Scatter to FFT box (NumPy advanced indexing)
 	# Note: JAX scatter is slower due to immutability overhead in loop
 	with timing.section("load_wfns.scatter"):
-		for k_idx in range(sym.nk_tot):
-			ngk = ngk_all[k_idx]
-			gvecs_k = gvecs_all[k_idx, :ngk]
-			psi_k = psi_Gspace_all[k_idx, :, :, :ngk]
+		for k_local in range(nk_chunk):
+			ngk = ngk_all[k_local]
+			gvecs_k = gvecs_all[k_local, :ngk]
+			psi_k = psi_Gspace_all[k_local, :, :, :ngk]
 			# Scatter: psi_Gtot_local[k, :, :, gx, gy, gz] = psi_k.T
-			psi_Gtot_local[k_idx, :, :, gvecs_k[:, 0], gvecs_k[:, 1], gvecs_k[:, 2]] = np.transpose(psi_k, (2, 0, 1))
+			psi_Gtot_local[k_local, :, :, gvecs_k[:, 0], gvecs_k[:, 1], gvecs_k[:, 2]] = np.transpose(psi_k, (2, 0, 1))
 
 	# Promote local buffer to a global sharded JAX array over bands across both [x,y]
 	with timing.section("load_wfns.make_global_array"):
-		global_shape = (meta.nk_tot, total_bands_padded, meta.nspinor, *meta.fft_grid)
+		global_shape = (nk_chunk, total_bands_padded, meta.nspinor, *meta.fft_grid)
 		band_sharding = NamedSharding(mesh_xy, P(None, ('x', 'y'), None, None, None, None))
 		# Use device_put for faster host-to-device transfer (9x faster than jnp.asarray)
 		psi_local_jax = jax.device_put(psi_Gtot_local)
@@ -1880,15 +1909,20 @@ def load_centroids_band_chunked(
     mesh_xy: Mesh,
     band_range: tuple[int, int],
     band_chunk_size: int = 64,
+    k_chunk_size: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """
-    Load centroid-sampled wavefunctions using band chunking.
-    
-    Memory-safe version that loops over band chunks to avoid OOM
-    when loading all bands at once for FFT.
-    
-    This is the unified band-chunked backend used by fit_zeta_chunked_to_h5.
-    
+    Load centroid-sampled wavefunctions using band AND k-point chunking.
+
+    Memory-safe version that loops over band chunks (and optionally k-point
+    chunks) to avoid OOM when loading all bands/k-points at once for FFT.
+
+    The FFT box array psi_Gtot_local has shape (nk, nb, nspinor, *fft_grid)
+    and scales as O(nk * nb * n_rtot). For large k-grids (e.g. 10x10x10 =
+    1000 k-points), this exceeds GPU memory. K-chunking processes a subset
+    of k-points at a time, accumulating only the centroid-space outputs
+    (which are O(nk * nb * n_rmu) — much smaller since n_rmu << n_rtot).
+
     Args:
         wfn: WFNReader
         sym: SymMaps
@@ -1898,7 +1932,10 @@ def load_centroids_band_chunked(
         mesh_xy: Device mesh
         band_range: (b_start, b_end)
         band_chunk_size: Bands to FFT at once (memory control)
-    
+        k_chunk_size: K-points to FFT at once (None = all at once).
+            When set, processes k-points in batches to control the size
+            of the FFT box array (the dominant memory bottleneck).
+
     Returns:
         psi_rmu_Y: (nk, nb, ns, n_rmu) with P(None, None, None, 'y')
         psi_rmuT_X: (nk, n_rmu, nb, ns) with P(None, 'x', None, None)
@@ -1908,48 +1945,95 @@ def load_centroids_band_chunked(
     nk_tot = meta.nk_tot
     nspinor = meta.nspinor
     n_rmu = len(centroid_indices)
-    
+
+    # Auto-detect k_chunk_size from memory budget if not specified.
+    # The FFT box per k-point per band chunk is:
+    #   nk * nb_chunk * nspinor * n_rtot * 16 bytes
+    # The XLA execution buffer is roughly 3-4x the input size.
+    # Target: keep the FFT box + execution buffer under memory_per_device_gb.
+    if k_chunk_size is None:
+        n_rtot = meta.fft_grid[0] * meta.fft_grid[1] * meta.fft_grid[2]
+        n_devices = len(jax.devices())
+        # Per-device memory for FFT box: (nk * band_chunk * nspinor * n_rtot * 16) / n_devices
+        # XLA needs ~4x for intermediates (FFT buffers, phase, gather)
+        xla_factor = 4.0
+        mem_budget_bytes = meta.memory_per_device_gb * 1e9 if hasattr(meta, 'memory_per_device_gb') and meta.memory_per_device_gb > 0 else 28e9
+        per_k_per_band = nspinor * n_rtot * 16 * xla_factor / n_devices
+        max_kb = mem_budget_bytes / per_k_per_band
+        # k_chunk * band_chunk must fit
+        effective_chunk = int(max_kb / min(band_chunk_size, nb_total))
+        k_chunk_size = max(1, min(effective_chunk, nk_tot))
+
+    k_chunk_size = min(k_chunk_size, nk_tot)
+    num_k_chunks = (nk_tot + k_chunk_size - 1) // k_chunk_size
+    needs_k_chunking = num_k_chunks > 1
+
+    if needs_k_chunking:
+        print(f"  K-point chunking: {num_k_chunks} chunks of {k_chunk_size} "
+              f"(total {nk_tot} k-points)")
+
     # Get k-vectors
     kgrid = np.array(meta.kgrid)
     kvecs_frac = sym.kvecs_asints / kgrid[None, :]
-    
+
     # Output shardings
     out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
     out_X = NamedSharding(mesh_xy, P(None, 'x', None, None))
-    
-    # Allocate output arrays for all bands
-    # psi_rmu: (nk, nb, ns, n_rmu), psi_rmuT: (nk, n_rmu, nb, ns) for pair density
+
+    # Allocate output arrays for all bands and k-points
     psi_rmu_all = jnp.zeros((nk_tot, nb_total, nspinor, n_rmu), dtype=jnp.complex128)
     psi_rmuT_all = jnp.zeros((nk_tot, n_rmu, nb_total, nspinor), dtype=jnp.complex128)
     psi_rmu_all = jax.lax.with_sharding_constraint(psi_rmu_all, out_Y)
     psi_rmuT_all = jax.lax.with_sharding_constraint(psi_rmuT_all, out_X)
-    
+
     # Process bands in chunks
     num_band_chunks = (nb_total + band_chunk_size - 1) // band_chunk_size
-    
+
     for bc_idx in range(num_band_chunks):
         bc_start = b_start + bc_idx * band_chunk_size
         bc_end = min(bc_start + band_chunk_size, b_end)
         bc_range = (bc_start, bc_end)
         nb_chunk = bc_end - bc_start
-        
-        # Load G-space for this band chunk
-        global_psi_Gtot, _ = read_Gvecs_to_devices(wfn, sym, bc_range, meta, bispinor, mesh_xy)
-        
-        # FFT and extract centroids for this chunk
-        psi_rmu_chunk, psi_rmuT_chunk = get_sharded_wfns_centroids(
-            global_psi_Gtot, meta, centroid_indices, kvecs_frac, mesh_xy, bc_range
-        )
-        
-        # Place into output arrays
-        # psi_rmu_chunk: (nk, nb_chunk, ns, n_rmu)
-        # psi_rmuT_chunk: (nk, n_rmu, nb_chunk, ns)
         local_bc_start = bc_idx * band_chunk_size
         local_bc_end = local_bc_start + nb_chunk
-        psi_rmu_all = psi_rmu_all.at[:, local_bc_start:local_bc_end, :, :].set(psi_rmu_chunk)
-        psi_rmuT_all = psi_rmuT_all.at[:, :, local_bc_start:local_bc_end, :].set(psi_rmuT_chunk)
-        
-        # Free memory
-        del global_psi_Gtot, psi_rmu_chunk, psi_rmuT_chunk
+
+        if not needs_k_chunking:
+            # Original path: load all k-points at once
+            global_psi_Gtot, _ = read_Gvecs_to_devices(
+                wfn, sym, bc_range, meta, bispinor, mesh_xy)
+            psi_rmu_chunk, psi_rmuT_chunk = get_sharded_wfns_centroids(
+                global_psi_Gtot, meta, centroid_indices, kvecs_frac, mesh_xy, bc_range)
+            psi_rmu_all = psi_rmu_all.at[:, local_bc_start:local_bc_end, :, :].set(psi_rmu_chunk)
+            psi_rmuT_all = psi_rmuT_all.at[:, :, local_bc_start:local_bc_end, :].set(psi_rmuT_chunk)
+            del global_psi_Gtot, psi_rmu_chunk, psi_rmuT_chunk
+        else:
+            # K-chunked path: process k-points in batches
+            for kc_idx in range(num_k_chunks):
+                kc_start = kc_idx * k_chunk_size
+                kc_end = min(kc_start + k_chunk_size, nk_tot)
+                nk_chunk = kc_end - kc_start
+
+                # Create a temporary Meta-like object with the k-chunk's nk_tot
+                # so that read_Gvecs_to_devices and get_sharded_wfns_centroids
+                # operate on the chunk only.
+                meta_kchunk = _make_kchunk_meta(meta, kc_start, kc_end)
+                kvecs_frac_chunk = kvecs_frac[kc_start:kc_end]
+
+                # Load G-space for this k-chunk × band-chunk
+                global_psi_Gtot, _ = read_Gvecs_to_devices(
+                    wfn, sym, bc_range, meta_kchunk, bispinor, mesh_xy,
+                    k_range=(kc_start, kc_end))
+
+                # FFT and extract centroids
+                psi_rmu_kchunk, psi_rmuT_kchunk = get_sharded_wfns_centroids(
+                    global_psi_Gtot, meta_kchunk, centroid_indices,
+                    kvecs_frac_chunk, mesh_xy, bc_range)
+
+                # Accumulate into full output
+                psi_rmu_all = psi_rmu_all.at[kc_start:kc_end, local_bc_start:local_bc_end, :, :].set(psi_rmu_kchunk)
+                psi_rmuT_all = psi_rmuT_all.at[kc_start:kc_end, :, local_bc_start:local_bc_end, :].set(psi_rmuT_kchunk)
+
+                del global_psi_Gtot, psi_rmu_kchunk, psi_rmuT_kchunk
+                gc.collect()
     
     return psi_rmu_all, psi_rmuT_all
