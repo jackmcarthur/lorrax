@@ -205,14 +205,20 @@ def read_Gvecs_to_devices(
             # Scatter: psi_Gtot_local[k, :, :, gx, gy, gz] = psi_k.T
             psi_Gtot_local[k_local, :, :, gvecs_k[:, 0], gvecs_k[:, 1], gvecs_k[:, 2]] = np.transpose(psi_k, (2, 0, 1))
 
-    # Promote local buffer to a global sharded JAX array over bands across both [x,y]
+    # Promote local buffer to a global sharded JAX array over bands across both [x,y].
+    # Use make_array_from_callback to send each shard directly to its target device
+    # from host memory — avoids materializing the full array on GPU 0 first, which
+    # OOMs for large k-grids (e.g., 10×10×10 = 26.5 GB FFT box).
     with timing.section("load_wfns.make_global_array"):
         global_shape = (nk_chunk, total_bands_padded, meta.nspinor, *meta.fft_grid)
         band_sharding = NamedSharding(mesh_xy, P(None, ('x', 'y'), None, None, None, None))
-        # Use device_put for faster host-to-device transfer (9x faster than jnp.asarray)
-        psi_local_jax = jax.device_put(psi_Gtot_local)
-        global_psi_Gtot = jax.make_array_from_process_local_data(
-            band_sharding, psi_local_jax, global_shape
+
+        def _shard_callback(shard_index):
+            """Return the NumPy slice for a specific shard from host memory."""
+            return psi_Gtot_local[shard_index]
+
+        global_psi_Gtot = jax.make_array_from_callback(
+            global_shape, band_sharding, _shard_callback
         )
 
     return global_psi_Gtot, nb
@@ -614,14 +620,16 @@ def load_centroids_band_chunked(
     # Target: keep the FFT box + execution buffer under memory_per_device_gb.
     if k_chunk_size is None:
         n_rtot = meta.fft_grid[0] * meta.fft_grid[1] * meta.fft_grid[2]
-        n_devices = len(jax.devices())
-        # Per-device memory for FFT box: (nk * band_chunk * nspinor * n_rtot * 16) / n_devices
-        # XLA needs ~4x for intermediates (FFT buffers, phase, gather)
-        xla_factor = 4.0
-        mem_budget_bytes = meta.memory_per_device_gb * 1e9 if hasattr(meta, 'memory_per_device_gb') and meta.memory_per_device_gb > 0 else 28e9
-        per_k_per_band = nspinor * n_rtot * 16 * xla_factor / n_devices
-        max_kb = mem_budget_bytes / per_k_per_band
-        # k_chunk * band_chunk must fit
+        # The FFT box array psi_Gtot is created on ONE GPU via device_put
+        # before being sharded. The full nk_chunk * nb_chunk array must fit
+        # on a single device. XLA also needs ~4x for execution buffers
+        # (FFT intermediates, phase arrays, centroid gather, resharding).
+        xla_factor = 6.0  # conservative: XLA needs ~4-6x input for FFT+phase+gather
+        gpu_mem_bytes = 36e9  # A100-40GB minus runtime overhead
+        if hasattr(meta, 'memory_per_device_gb') and meta.memory_per_device_gb > 0:
+            gpu_mem_bytes = meta.memory_per_device_gb * 1e9
+        per_k_per_band = nspinor * n_rtot * 16 * xla_factor  # NOT divided by n_devices
+        max_kb = gpu_mem_bytes / per_k_per_band
         effective_chunk = int(max_kb / min(band_chunk_size, nb_total))
         k_chunk_size = max(1, min(effective_chunk, nk_tot))
 
@@ -630,8 +638,9 @@ def load_centroids_band_chunked(
     needs_k_chunking = num_k_chunks > 1
 
     if needs_k_chunking:
-        print(f"  K-point chunking: {num_k_chunks} chunks of {k_chunk_size} "
-              f"(total {nk_tot} k-points)")
+        fft_box_gb = k_chunk_size * min(band_chunk_size, nb_total) * nspinor * n_rtot * 16 / 1e9
+        print(f"  K-point chunking: {k_chunk_size} k-pts/chunk × {num_k_chunks} chunks "
+              f"({nk_tot} total), FFT box {fft_box_gb:.1f} GB/chunk")
 
     # Get k-vectors
     kgrid = np.array(meta.kgrid)
