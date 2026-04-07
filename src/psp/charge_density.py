@@ -285,49 +285,75 @@ def build_core_density(
     print(f"  Core density integral: {integral:.4f} e "
           f"(from NLCC, {len(atom_pos)} atoms)")
 
-    return jnp.asarray(rho_core_r, dtype=jnp.float64)
+    # Also store the precise G-space coefficients for gradient computation.
+    # rho_core_G here is the continuous FT: ρ_core(G) = (4π/Ω) ∫ r² ρ j₀ dr.
+    # To match the convention of jnp.fft.fftn(rho_core_r) = rho_core_G * N,
+    # scale by N so that FFT(IFFT(x)) round-trips correctly.
+    rho_core_G_scaled = jnp.asarray(rho_core_G * N, dtype=jnp.complex128)
+
+    return jnp.asarray(rho_core_r, dtype=jnp.float64), rho_core_G_scaled
 
 
 def compute_grad_rho_sq(
     rho_r: jax.Array,
     wfn,
+    *,
+    rhog_core: jax.Array | None = None,
 ) -> jax.Array:
     """Compute |∇ρ|² on the real-space grid via G-space derivatives.
 
-    ∂ρ/∂x_i in G-space is i G_cart_i ρ(G).  Transform each component
-    back to real space, then |∇ρ|² = Σ_i (∂ρ/∂x_i)².
+    If rho_r = ρ_val + ρ_core (total density on real-space grid) and
+    rhog_core is provided, the gradient is computed as:
+
+        ∇ρ_total = IFFT(iG × [FFT(ρ_val_r) + ρ_core_G])
+
+    This avoids aliasing the sharp core charge peak through the
+    real-space grid, matching QE's gradcorr approach.
 
     Parameters
     ----------
-    rho_r : (nx, ny, nz) real-space density
-    wfn : WFNReader (for bvec, blat to get Cartesian G-vectors)
+    rho_r : (nx, ny, nz) real-space density (ρ_val+ρ_core, or ρ_val alone)
+    wfn : WFNReader (for bvec, blat)
+    rhog_core : (nx, ny, nz) complex — precise G-space core charge
+        from build_core_density.  If provided, the gradient uses
+        FFT(rho_r - IFFT(rhog_core)) + rhog_core in G-space, which
+        is equivalent to FFT(rho_val) + rhog_core.
 
     Returns
     -------
-    grad_rho_sq : (nx, ny, nz) = |∇ρ(r)|² in (e/bohr^4)²
+    grad_rho_sq : (nx, ny, nz) = |∇ρ(r)|²
     """
     nx, ny, nz = rho_r.shape
+    G_cart_j = _build_G_cart_grid(nx, ny, nz, wfn)
 
-    # G-vectors in crystal coordinates (integers)
-    gx = np.fft.fftfreq(nx, d=1.0 / nx).astype(int)
-    gy = np.fft.fftfreq(ny, d=1.0 / ny).astype(int)
-    gz = np.fft.fftfreq(nz, d=1.0 / nz).astype(int)
-    Gx, Gy, Gz = np.meshgrid(gx, gy, gz, indexing='ij')
-    G_crys = np.stack([Gx, Gy, Gz], axis=-1).astype(float)  # (nx,ny,nz,3)
+    # Build the G-space density for gradient computation.
+    # If rhog_core is provided, use it directly (precise) instead of
+    # the FFT of the gridded core charge (aliased).
+    if rhog_core is not None:
+        # rho_r contains ρ_val + ρ_core on the grid.
+        # Recover ρ_val on the grid: ρ_val_r = ρ_total_r - IFFT(rhog_core)/...
+        # Simpler: FFT(ρ_total_r) already has the aliased core.
+        # Replace with: FFT(ρ_val_r) + rhog_core_precise
+        # ρ_val_r = ρ_total_r - ρ_core_r_gridded
+        # FFT(ρ_val_r) = FFT(ρ_total_r) - FFT(ρ_core_r_gridded)
+        # We want: FFT(ρ_val_r) + rhog_core = FFT(ρ_total_r) - FFT(ρ_core_gridded) + rhog_core
+        # = FFT(ρ_total_r) + (rhog_core - FFT(ρ_core_gridded))
+        # The correction is: rhog_core - FFT(IFFT(rhog_core))
+        # But IFFT then FFT is identity, so FFT(ρ_core_gridded) = rhog_core
+        # if the grid resolves it... which it doesn't (that's the whole point).
+        #
+        # The right approach: pass ρ_val_r separately.
+        # But we don't have it separately here.
+        #
+        # Alternative: just compute grad from ρ_val's FFT + rhog_core directly.
+        # We need ρ_val_r. Since rho_r = ρ_val_r + ρ_core_r_gridded,
+        # and ρ_core_r_gridded = real(IFFT(rhog_core)):
+        rho_core_gridded = jnp.real(jnp.fft.ifftn(rhog_core))
+        rho_val_r = rho_r - rho_core_gridded
+        rho_G = jnp.fft.fftn(rho_val_r) + rhog_core
+    else:
+        rho_G = jnp.fft.fftn(rho_r)
 
-    # Crystal → Cartesian: G_cart = G_crys @ (2π b / a_lat)
-    # where b = bvec (columns are reciprocal vectors), blat = 2π/alat
-    # In QE convention: G_cart = G_crys @ (blat * bvec^T)
-    bvec = np.asarray(wfn.bvec, dtype=float)
-    blat = float(wfn.blat)
-    B = blat * bvec.T  # (3,3) — same as in dft_operators
-    G_cart = np.einsum('...i,ij->...j', G_crys, B)  # (nx,ny,nz,3)
-    G_cart_j = jnp.asarray(G_cart, dtype=jnp.float64)
-
-    # ρ(G)
-    rho_G = jnp.fft.fftn(rho_r)
-
-    # ∂ρ/∂x_i(r) = IFFT(i G_cart_i ρ(G))
     grad_rho_sq = jnp.zeros_like(rho_r)
     for i in range(3):
         drho_G = 1j * G_cart_j[..., i] * rho_G
@@ -346,6 +372,7 @@ def build_V_xc(
     wfn,
     *,
     grad_rho_sq: jax.Array | None = None,
+    rhog_core: jax.Array | None = None,
     xc_func: str = 'pbe',
 ) -> jax.Array:
     """Build V_xc(r) on the real-space grid.
@@ -355,9 +382,13 @@ def build_V_xc(
 
     Parameters
     ----------
-    rho_r : (nx, ny, nz) electron density [e/bohr³]
-    wfn : WFNReader (for bvec, blat — needed for G-space gradient)
+    rho_r : (nx, ny, nz) total density (ρ_val + ρ_core) [e/bohr³]
+    wfn : WFNReader (for bvec, blat)
     grad_rho_sq : |∇ρ|² — computed automatically if None
+    rhog_core : (nx, ny, nz) complex — G-space core charge from
+        build_core_density (second return value).  If provided, used
+        for precise gradient computation (avoids real-space aliasing
+        of sharp core charge peaks).
     xc_func : 'pbe' (default) or 'lda'
 
     Returns
@@ -368,8 +399,8 @@ def build_V_xc(
         return _build_V_xc_lda(rho_r)
     elif xc_func == 'pbe':
         if grad_rho_sq is None:
-            grad_rho_sq = compute_grad_rho_sq(rho_r, wfn)
-        return _build_V_xc_gga(rho_r, grad_rho_sq, wfn)
+            grad_rho_sq = compute_grad_rho_sq(rho_r, wfn, rhog_core=rhog_core)
+        return _build_V_xc_gga(rho_r, grad_rho_sq, wfn, rhog_core=rhog_core)
     else:
         raise ValueError(f"Unknown xc_func: {xc_func}")
 
@@ -389,19 +420,22 @@ def _build_V_xc_gga(
     rho_r: jax.Array,
     grad_rho_sq: jax.Array,
     wfn,
+    *,
+    rhog_core: jax.Array | None = None,
 ) -> jax.Array:
     """GGA V_xc via White-Bird functional derivative.
 
     V_xc(r) = ∂(ρ ε_xc)/∂ρ - 2 ∇·[∂(ρ ε_xc)/∂σ ∇ρ]
 
     where σ = |∇ρ|².  The divergence term is computed in G-space.
+    If rhog_core is provided, uses precise G-space core charge for
+    the gradient (matches QE's gradcorr approach).
     """
     from jax_xc_local.pbe import pbe_xc
 
     rho_safe = jnp.maximum(rho_r, 1e-30)
     sigma = jnp.maximum(grad_rho_sq, 0.0)
 
-    # ∂(ρ ε_xc)/∂ρ and ∂(ρ ε_xc)/∂σ at each grid point
     def f_xc(rho_val, sigma_val):
         return rho_val * pbe_xc(rho_val, sigma_val)
 
@@ -414,13 +448,17 @@ def _build_V_xc_gga(
     ).reshape(rho_r.shape)
 
     # GGA correction: -2 ∇·[df_dsigma ∇ρ]
+    # Use the same G-space density as in compute_grad_rho_sq
     nx, ny, nz = rho_r.shape
-    rho_G = jnp.fft.fftn(rho_r)
-
-    # G-vectors in Cartesian
     G_cart = _build_G_cart_grid(nx, ny, nz, wfn)
 
-    # ∇ρ(r) components and divergence
+    if rhog_core is not None:
+        rho_core_gridded = jnp.real(jnp.fft.ifftn(rhog_core))
+        rho_val_r = rho_r - rho_core_gridded
+        rho_G = jnp.fft.fftn(rho_val_r) + rhog_core
+    else:
+        rho_G = jnp.fft.fftn(rho_r)
+
     gga_correction = jnp.zeros_like(rho_r)
     for i in range(3):
         drho_ri = jnp.real(jnp.fft.ifftn(1j * G_cart[..., i] * rho_G))
