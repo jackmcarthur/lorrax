@@ -247,17 +247,32 @@ def build_core_density(
         rab = np.asarray(mesh.pp_rab.value, dtype=float)
 
         # Fourier transform: ρ_core(G) = (4π/Ω) ∫ r² ρ_core(r) j₀(Gr) dr
-        # Vectorized over all G-values at once: shape (n_G, n_r)
-        integrand = r ** 2 * rho_c_r * rab  # r² ρ_core(r) dr
-
+        # Uses Simpson's rule for the radial integral (matching QE's
+        # init_tab_rhc), which is O(h⁴) vs trapezoidal O(h²).
         G_flat = G_norm.ravel()              # (n_G,)
         Gr = np.outer(G_flat, r)             # (n_G, n_r)
 
         # j₀(x) = sin(x)/x, with j₀(0) = 1
         j0 = np.sinc(Gr / np.pi)            # np.sinc(x) = sin(πx)/(πx)
 
-        # ρ_core(G) = (4π/Ω) Σ_i integrand_i j₀(G r_i)
-        rho_c_G_flat = (4 * np.pi / vol) * (j0 @ integrand)  # (n_G,)
+        # Integrand without rab: f(r_i) = r² ρ_core(r) j₀(Gr)
+        # For each G: result = simpson_integrate(f * j0_row, rab)
+        f_base = r ** 2 * rho_c_r            # (n_r,)
+        f_full = j0 * f_base[None, :]        # (n_G, n_r)
+
+        # Simpson's rule with non-uniform grid (QE convention):
+        # ∫ f dr ≈ Σ_i w_i f(r_i) rab_i, where w follows 1/3, 4/3, 2/3...
+        n_r = len(r)
+        w = np.ones(n_r)
+        w[0] = 1.0 / 3.0
+        for i in range(1, n_r - 1, 2):
+            w[i] = 4.0 / 3.0
+        for i in range(2, n_r - 1, 2):
+            w[i] = 2.0 / 3.0
+        w[n_r - 1] = 1.0 / 3.0
+        simpson_weights = w * rab  # (n_r,)
+
+        rho_c_G_flat = (4 * np.pi / vol) * (f_full @ simpson_weights)
         rho_c_G_atom = rho_c_G_flat.reshape(nx, ny, nz)
 
         # Structure factor: e^{-2πi G_crys · τ}
