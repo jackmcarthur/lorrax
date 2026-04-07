@@ -1,5 +1,31 @@
 # Memory Model and Chunk Size Optimization
 
+> **REVALIDATION IN PROGRESS (2026-04-06)**
+>
+> The formulas in this document have known gaps:
+>
+> 1. **All multi-GPU measurements were single-process** (`srun -n 1`), which
+>    does not reflect production execution (1 process per GPU). NCCL buffer
+>    costs and XLA scheduling differ between the two modes. The "4x shard"
+>    FFT model is validated for single-GPU only; the multi-GPU coefficients
+>    (including the "9x" finding in the assay report) are artifacts of the
+>    wrong execution mode and must be re-measured.
+>
+> 2. **Stages 3-7 (pair density, ZCT, solve, gather) have no sweep data.**
+>    The formulas below are analytic upper bounds adjusted after a single
+>    XProf observation. They have never been validated across a parameter
+>    sweep.
+>
+> 3. **No XProf buffer-level attribution** has been done for the load_wfns
+>    or reshard stages. The decompositions in `detailed_buffer_inventory.md`
+>    are inferred from `memory_stats()` deltas, not from HLO buffer listings.
+>
+> A systematic revalidation using XProf memory_viewer in multi-process mode
+> is underway. See `reports/memory_model_assay_2026-04-06/report.md` for the
+> plan and status. The formulas below remain the best available model but
+> should not be trusted for memory-tight configurations (e.g. 10x10x10 Si
+> on 16 GPUs) until revalidation is complete.
+
 The zeta-fitting pipeline allocates tensors in clearly defined stages.  Each
 stage has a closed-form expression for its per-device footprint; the chunk
 solver simply enforces those expressions without heuristic percentages.  This

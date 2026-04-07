@@ -25,8 +25,10 @@ def _mem_report(label):
     s = jax.local_devices()[0].memory_stats()
     u = s.get('bytes_in_use', 0) / 1e9
     p = s.get('peak_bytes_in_use', 0) / 1e9
+    lim = s.get('bytes_limit', 0) / 1e9
     if jax.process_index() == 0:
-        print(f'  [MEM {label}] used={u:.3f} peak={p:.3f} GB', flush=True)
+        print(f'  [MEM isdf | {label}] used={u:.3f} peak={p:.3f} limit={lim:.1f} GB',
+              flush=True)
 from common import jax_profile
 from .cholesky_2d import (
     cholesky_2d_batched,
@@ -602,19 +604,14 @@ def solve_zeta_from_L_q(
 
     # Allocate output buffer
     zeta = jnp.zeros_like(Z_col)
+    _mem_report(f"solve: before q-loop (q_batch={q_batch}, nq={nq})")
 
-    # Python loop with async dispatch — each call returns immediately.
-    # The donation chain (output N = input N+1) ensures sequential GPU execution
-    # without explicit block_until_ready. Python dispatch overhead: ~0.3ms × 8 = 2.4ms.
-    # NOTE: scan(unroll=8) was attempted but OOMs — XLA pipelines adjacent unrolled
-    # iterations, keeping 2× preallocated-temp alive (18.9 GB). scan without unroll
-    # triggers SPMD replication of the sharded accumulator (88 GB OOM). fori_loop
-    # has the same WhileOp issue. The Python loop is the only approach that gives
-    # constant DUS offsets AND sequential memory reuse.
     for q0 in range(0, nq_padded, q_batch):
         q1 = q0 + q_batch
         zeta = helpers.solve_batch_and_update(L_q[q0:q1], Z_col[q0:q1], zeta, q0)
 
+    zeta.block_until_ready()
+    _mem_report(f"solve: after q-loop")
     del Z_col
 
     if needs_padding:
@@ -722,6 +719,8 @@ def fit_zeta_chunked_to_h5(
     print(f"Output: {output_file}")
     print(f"{'='*60}")
 
+    _mem_report("before ISDF fitting")
+
     # ========== STEP 1: Load wavefunctions at centroids (band-chunked) ==========
     # Load full range, then slice for left and right
     with timing.section("zeta_fit.load_wfns"):
@@ -753,6 +752,7 @@ def fit_zeta_chunked_to_h5(
 
         print(f"  Left wfns:  {psi_l_rmu_Y.shape}")
         print(f"  Right wfns: {psi_r_rmu_Y.shape}")
+    _mem_report("after centroid load + slice")
 
     # ========== STEP 2: Compute CCT (C_q) from left/right pair densities ==========
     with timing.section("zeta_fit.CCT"):
@@ -783,6 +783,8 @@ def fit_zeta_chunked_to_h5(
         flat_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
         C_q_flat = jax.lax.with_sharding_constraint(C_q_flat, flat_shard)
 
+    _mem_report("after CCT")
+
     # ========== STEP 3: Compute L_q = chol(C_q) once ==========
     with timing.section("zeta_fit.cholesky"):
         print("\nComputing L_q = chol(C_q) using 2D blocked algorithm...")
@@ -790,13 +792,14 @@ def fit_zeta_chunked_to_h5(
         L_q.block_until_ready()
         print(f"  L_q shape: {L_q.shape}")
 
+    _mem_report("after cholesky (before del C_q)")
+
     # Free C_q to reclaim GPU memory before z-chunk loop
-    # (P_k_mumu was already deleted above)
-    # This is critical for fitting within memory budget
     del C_q, C_q_flat
-    # Force garbage collection and JAX device memory cleanup
     gc.collect()
-    jax.clear_caches()  # Clear JAX function caches that may hold array refs
+    jax.clear_caches()
+
+    _mem_report("after cholesky + del C_q")
 
     # ========== STEP 4: Create HDF5 file ==========
     # Only rank 0 creates the file structure
@@ -831,7 +834,6 @@ def fit_zeta_chunked_to_h5(
     if use_gspace_cache:
         with timing.section("zeta_fit.cache_gspace"):
             print("\nCaching G-space wavefunctions for r-chunk loop...")
-            # Cache FULL band range (max of left and right)
             cached_gspace = load_gspace_for_bands(
                 wfn, sym, meta, mesh_xy, band_range_full, bispinor, band_chunk_size
             )
@@ -840,6 +842,8 @@ def fit_zeta_chunked_to_h5(
         cached_gspace = None
         print("\nG-space caching DISABLED (too large for memory budget)")
         print("  Will reload from HDF5 each r-chunk (slower)")
+
+    _mem_report("after G-cache load (before chunk loop)")
 
     # ========== STEP 6: Loop over chunks ==========
     # Track timing for summary (manual perf_counter for detailed breakdown)
@@ -899,18 +903,18 @@ def fit_zeta_chunked_to_h5(
             actual_n_rchunk = r_end - r_start
             print(f"Chunk {chunk_idx+1}/{num_chunks}: r=[{r_start}:{r_end}]")
 
+            _mem_report(f"chunk[{chunk_idx}]: start")
+
             # 6a. Get psi_nk,a(r_chunk) for FULL band range
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.load"):
                 if cached_gspace is not None:
-                    # Fast path: FFT only (G-space is cached)
                     psi_chunk_Y = get_psi_rchunk_from_cached(
                         cached_gspace, meta, mesh_xy, band_range_full,
                         r_start, r_end, kvecs_frac,
                         band_chunk_size=band_chunk_size
                     )
                 else:
-                    # Slow path: reload from HDF5 each chunk
                     psi_chunk_Y = get_psi_rchunk(
                         wfn, sym, meta, mesh_xy, band_range_full,
                         r_start, r_end, bispinor,
@@ -923,6 +927,7 @@ def fit_zeta_chunked_to_h5(
                 psi_l_chunk_Y = psi_chunk_Y[:, l_band_start:l_band_end, :, :]
                 psi_r_chunk_Y = psi_chunk_Y[:, r_band_start:r_band_end, :, :]
             t_load_total += time.perf_counter() - t0
+            _mem_report(f"chunk[{chunk_idx}]: after load (6a)")
 
             # 6b. Compute left/right pair densities
             t0 = time.perf_counter()
@@ -948,6 +953,8 @@ def fit_zeta_chunked_to_h5(
                 # No block_until_ready on P_r — ZCT will consume it asynchronously.
                 # P_l's block_until_ready (above) is needed for del psi_l_chunk_Y.
             t_pair_total += time.perf_counter() - t0
+
+            _mem_report(f"chunk[{chunk_idx}]: after pair density (6b)")
 
             # Free psi_chunk arrays - we have P_k now
             del psi_chunk_Y, psi_l_chunk_Y, psi_r_chunk_Y
@@ -993,10 +1000,10 @@ def fit_zeta_chunked_to_h5(
                 del P_l_k_mux, P_r_k_mux
 
                 Z_q_flat = Z_q.reshape(nq, n_rmu, actual_n_rchunk)
-                del Z_q  # free 3D ref; reshape may share buffer
+                del Z_q
                 Z_q_flat = jax.lax.with_sharding_constraint(Z_q_flat, flat_shard)
-                # No block_until_ready — reshard will consume Z_q_flat asynchronously.
             t_zct_total += time.perf_counter() - t0
+            _mem_report(f"chunk[{chunk_idx}]: after ZCT (6c)")
 
             # 6d. Reshard Z_q_flat → Z_col, then free Z_q_flat BEFORE the solve
             # q-loop.  If we pass Z_q_flat into solve_zeta_from_L_q, the caller's
@@ -1006,12 +1013,14 @@ def fit_zeta_chunked_to_h5(
             Z_col = jax.lax.with_sharding_constraint(Z_q_flat, z_col_shard)
             Z_col.block_until_ready()
             del Z_q_flat
+            _mem_report(f"chunk[{chunk_idx}]: after reshard Z (6d)")
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.solve"), jax_profile.step_annotation("chunk_solve", step_num=chunk_idx):
                 zeta_chunk = solve_zeta_from_L_q(L_q, Z_col, mesh_xy, q_chunk_size)
-                # No block_until_ready — gather will consume zeta_chunk asynchronously.
+                zeta_chunk.block_until_ready()
                 del Z_col
             t_solve_total += time.perf_counter() - t0
+            _mem_report(f"chunk[{chunk_idx}]: after solve (6e)")
 
             # 6e. Q-chunked allgather → host copy → async HDF5 write.
             # The allgather replicates zeta slices: per-device output is
@@ -1041,8 +1050,9 @@ def fit_zeta_chunked_to_h5(
                     del _gathered, _slice
 
                 jax.experimental.multihost_utils.sync_global_devices(f"zeta_chunk_{chunk_idx}")
-                del zeta_chunk  # Free GPU memory before next chunk's FFT stage
+                del zeta_chunk
             t_write_total += time.perf_counter() - t0
+            _mem_report(f"chunk[{chunk_idx}]: after gather+write (6f)")
 
 
     t_chunks_total = time.perf_counter() - t_chunk_start
@@ -1063,6 +1073,9 @@ def fit_zeta_chunked_to_h5(
     # Free cached G-space now that chunk loop is done
     if cached_gspace is not None:
         del cached_gspace
+    gc.collect()
+
+    _mem_report("ISDF fitting complete")
 
     # Print summary
     print()  # Clear the \r line

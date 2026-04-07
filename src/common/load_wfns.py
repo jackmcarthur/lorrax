@@ -1,4 +1,5 @@
 import gc
+import os
 import time
 import numpy as np
 import jax
@@ -9,6 +10,21 @@ from functools import partial
 
 from . import Meta
 from . import timing
+
+_MEM_PROFILE = bool(os.environ.get("LORRAX_MEM_PROFILE", ""))
+
+
+def _mem_report(label):
+    """Print per-device memory if LORRAX_MEM_PROFILE is set. Zero cost otherwise."""
+    if not _MEM_PROFILE:
+        return
+    gc.collect()
+    s = jax.local_devices()[0].memory_stats()
+    u = s.get('bytes_in_use', 0) / 1e9
+    p = s.get('peak_bytes_in_use', 0) / 1e9
+    if jax.process_index() == 0:
+        print(f'  [MEM load_wfns | {label}] used={u:.3f} peak={p:.3f} GB',
+              flush=True)
 from .fft_helpers import (
     make_sharded_ifftn_3d,
     make_sharded_fftn_3d,
@@ -399,12 +415,16 @@ def get_psi_rchunk(
 
     nk_batch = nk_tot if k_chunk_size <= 0 else min(k_chunk_size, nk_tot)
 
+    _mem_report(f"rchunk: before extraction r=[{r_start}:{r_end}]")
+
     if cached_gspace is not None:
         # Fast path: reuse pre-loaded G-space (no HDF5 reads)
         for bc_idx, (global_psi_Gtot, bc_range) in enumerate(cached_gspace):
             nb_chunk = bc_range[1] - bc_range[0]
             psi_rchunk_chunk = get_sharded_wfns_rchunk_slice(
                 global_psi_Gtot, meta, r_start, r_end, kvecs_frac, mesh_xy, bc_range)
+            psi_rchunk_chunk.block_until_ready()
+            _mem_report(f"rchunk: bc[{bc_idx}] after FFT+reshard")
             local_bc_start = bc_idx * band_chunk_size
             psi_rchunk_all = psi_rchunk_all.at[:, local_bc_start:local_bc_start + nb_chunk, :, :].set(psi_rchunk_chunk)
             del psi_rchunk_chunk
@@ -656,11 +676,15 @@ def load_centroids_band_chunked(
     out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
     out_X = NamedSharding(mesh_xy, P(None, 'x', None, None))
 
+    _mem_report("centroid_load: before output alloc")
+
     # Allocate output arrays for all bands and k-points
     psi_rmu_all = jnp.zeros((nk_tot, nb_total, nspinor, n_rmu), dtype=jnp.complex128)
     psi_rmuT_all = jnp.zeros((nk_tot, n_rmu, nb_total, nspinor), dtype=jnp.complex128)
     psi_rmu_all = jax.lax.with_sharding_constraint(psi_rmu_all, out_Y)
     psi_rmuT_all = jax.lax.with_sharding_constraint(psi_rmuT_all, out_X)
+
+    _mem_report("centroid_load: after output alloc")
 
     # Process bands in chunks
     num_band_chunks = (nb_total + band_chunk_size - 1) // band_chunk_size
@@ -677,11 +701,15 @@ def load_centroids_band_chunked(
             # Original path: load all k-points at once
             global_psi_Gtot, _ = read_Gvecs_to_devices(
                 wfn, sym, bc_range, meta, bispinor, mesh_xy)
+            _mem_report(f"centroid_load: bc[{bc_idx}] after read_Gvecs")
             psi_rmu_chunk, psi_rmuT_chunk = get_sharded_wfns_centroids(
                 global_psi_Gtot, meta, centroid_indices, kvecs_frac, mesh_xy, bc_range)
+            psi_rmu_chunk.block_until_ready()
+            _mem_report(f"centroid_load: bc[{bc_idx}] after FFT+extract")
             psi_rmu_all = psi_rmu_all.at[:, local_bc_start:local_bc_end, :, :].set(psi_rmu_chunk)
             psi_rmuT_all = psi_rmuT_all.at[:, :, local_bc_start:local_bc_end, :].set(psi_rmuT_chunk)
             del global_psi_Gtot, psi_rmu_chunk, psi_rmuT_chunk
+            _mem_report(f"centroid_load: bc[{bc_idx}] after accumulate+del")
         else:
             # K-chunked path: process k-points in batches
             for kc_idx in range(num_k_chunks):
@@ -689,27 +717,26 @@ def load_centroids_band_chunked(
                 kc_end = min(kc_start + k_chunk_size, nk_tot)
                 nk_chunk = kc_end - kc_start
 
-                # Create a temporary Meta-like object with the k-chunk's nk_tot
-                # so that read_Gvecs_to_devices and get_sharded_wfns_centroids
-                # operate on the chunk only.
                 meta_kchunk = _make_kchunk_meta(meta, kc_start, kc_end)
                 kvecs_frac_chunk = kvecs_frac[kc_start:kc_end]
 
-                # Load G-space for this k-chunk × band-chunk
                 global_psi_Gtot, _ = read_Gvecs_to_devices(
                     wfn, sym, bc_range, meta_kchunk, bispinor, mesh_xy,
                     k_range=(kc_start, kc_end))
+                _mem_report(f"centroid_load: bc[{bc_idx}] kc[{kc_idx}] after read_Gvecs")
 
-                # FFT and extract centroids
                 psi_rmu_kchunk, psi_rmuT_kchunk = get_sharded_wfns_centroids(
                     global_psi_Gtot, meta_kchunk, centroid_indices,
                     kvecs_frac_chunk, mesh_xy, bc_range)
+                psi_rmu_kchunk.block_until_ready()
+                _mem_report(f"centroid_load: bc[{bc_idx}] kc[{kc_idx}] after FFT+extract")
 
-                # Accumulate into full output
                 psi_rmu_all = psi_rmu_all.at[kc_start:kc_end, local_bc_start:local_bc_end, :, :].set(psi_rmu_kchunk)
                 psi_rmuT_all = psi_rmuT_all.at[kc_start:kc_end, :, local_bc_start:local_bc_end, :].set(psi_rmuT_kchunk)
 
                 del global_psi_Gtot, psi_rmu_kchunk, psi_rmuT_kchunk
                 gc.collect()
-    
+                _mem_report(f"centroid_load: bc[{bc_idx}] kc[{kc_idx}] after del")
+
+    _mem_report("centroid_load: complete")
     return psi_rmu_all, psi_rmuT_all
