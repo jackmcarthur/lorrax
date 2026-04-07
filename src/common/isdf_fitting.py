@@ -1,4 +1,5 @@
 import gc
+import os
 import queue
 import threading
 import time
@@ -13,6 +14,19 @@ from jax.experimental.shard_map import shard_map
 
 from . import Meta
 from . import timing
+
+_MEM_PROFILE = bool(os.environ.get("LORRAX_MEM_PROFILE", ""))
+
+def _mem_report(label):
+    """Print per-device memory if LORRAX_MEM_PROFILE is set. Zero cost otherwise."""
+    if not _MEM_PROFILE:
+        return
+    gc.collect()
+    s = jax.local_devices()[0].memory_stats()
+    u = s.get('bytes_in_use', 0) / 1e9
+    p = s.get('peak_bytes_in_use', 0) / 1e9
+    if jax.process_index() == 0:
+        print(f'  [MEM {label}] used={u:.3f} peak={p:.3f} GB', flush=True)
 from common import jax_profile
 from .cholesky_2d import (
     cholesky_2d_batched,
