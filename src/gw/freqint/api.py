@@ -13,7 +13,7 @@ def chi_from_bundle(
     policy: str = "shared_conservative",
     return_plan: bool = False,
 ):
-    """Public chi API for the separate freqint pipeline."""
+    """Public chi API for the archived separate freqint pipeline."""
     return execute_chi_from_bundle(
         wf_bundle=wf_bundle,
         windows=windows,
@@ -43,7 +43,7 @@ def frequency_integration(
     policy: str = "shared_conservative",
     return_plan: bool = False,
 ):
-    """Unified entrypoint for chi/sigma modes."""
+    """Unified entrypoint for the archived chi/sigma freqint modes."""
     if mode == "chi":
         return chi_from_bundle(
             wf_bundle=wf_bundle,

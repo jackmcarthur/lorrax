@@ -4,8 +4,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from .. import w_isdf_dynamic as legacy_dynamic
-from . import integrands
+from ..archive import integrands
+from ..archive import w_isdf_dynamic as legacy_dynamic
 from .planning import build_chi_integration_plan
 from .types import IntegrationPlan
 

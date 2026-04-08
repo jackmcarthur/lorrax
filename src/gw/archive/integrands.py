@@ -3,7 +3,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-from .. import w_isdf_dynamic as legacy_dynamic
+from . import w_isdf_dynamic as legacy_dynamic
 
 
 def _k_to_R(g_k: jax.Array, *, nkx: int, nky: int, nkz: int, flip_sign: bool) -> jax.Array:

@@ -7,7 +7,7 @@ Streamlined pipeline for COHSEX:
 - χ computed with P(..., μ_X, ..., ν_Y) sharding
 - V, χ resharded to P(q_XY, μ, ν) for Dyson solve
 
-For dynamic W(ω) with window-specific kernels, see w_isdf_dynamic.py.
+For legacy dynamic W(ω) with window-specific kernels, see archive/w_isdf_dynamic.py.
 """
 import os
 import math
@@ -670,37 +670,37 @@ def get_chi0_jax(
 # Re-export legacy functions for W(ω)
 def get_w_omega_jax(*args, **kwargs):
     """Dynamic W(ω) - delegates to the dynamic implementation."""
-    from .w_isdf_dynamic import get_w_omega_jax as dynamic_w_omega
+    from .archive.w_isdf_dynamic import get_w_omega_jax as dynamic_w_omega
     return dynamic_w_omega(*args, **kwargs)
 
 
 def get_chi_omega_jax(*args, **kwargs):
     """Dynamic χ(ω) - delegates to the dynamic implementation."""
-    from .w_isdf_dynamic import get_chi_omega_jax as dynamic_chi_omega
+    from .archive.w_isdf_dynamic import get_chi_omega_jax as dynamic_chi_omega
     return dynamic_chi_omega(*args, **kwargs)
 
 
 def frequency_integration(*args, **kwargs):
     """Scalar-ω CTSP frequency integration - delegates to dynamic implementation."""
-    from .w_isdf_dynamic import frequency_integration as dynamic_frequency_integration
+    from .archive.w_isdf_dynamic import frequency_integration as dynamic_frequency_integration
     return dynamic_frequency_integration(*args, **kwargs)
 
 
 def get_w_omega_jax_from_bundle(*args, **kwargs):
     """Dynamic W(ω) from canonical WavefunctionBundle."""
-    from .w_isdf_dynamic import get_w_omega_jax_from_bundle as dynamic_w_omega_bundle
+    from .archive.w_isdf_dynamic import get_w_omega_jax_from_bundle as dynamic_w_omega_bundle
     return dynamic_w_omega_bundle(*args, **kwargs)
 
 
 def get_chi_omega_jax_from_bundle(*args, **kwargs):
     """Dynamic χ(ω) from canonical WavefunctionBundle."""
-    from .w_isdf_dynamic import get_chi_omega_jax_from_bundle as dynamic_chi_omega_bundle
+    from .archive.w_isdf_dynamic import get_chi_omega_jax_from_bundle as dynamic_chi_omega_bundle
     return dynamic_chi_omega_bundle(*args, **kwargs)
 
 
 def frequency_integration_from_bundle(*args, **kwargs):
     """Scalar-ω CTSP frequency integration from canonical WavefunctionBundle."""
-    from .w_isdf_dynamic import frequency_integration_from_bundle as dynamic_frequency_integration_bundle
+    from .archive.w_isdf_dynamic import frequency_integration_from_bundle as dynamic_frequency_integration_bundle
     return dynamic_frequency_integration_bundle(*args, **kwargs)
 
 

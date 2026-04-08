@@ -1,4 +1,4 @@
-"""Separate frequency-integration pipeline (staged rewrite)."""
+"""Separate frequency-integration pipeline kept for archived experimentation."""
 
 from .api import chi_from_bundle, frequency_integration, sigma_from_bundle
 from .engine import execute_chi_from_bundle, plan_chi_from_bundle

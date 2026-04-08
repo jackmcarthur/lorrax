@@ -916,7 +916,7 @@ def get_w_omega_jax(
     windows, omega: float, meta: Meta, mesh_xy: Mesh,
 ):
     """Compute W(ω) = V / (1 - V χ(ω)) for a single frequency."""
-    from . import w_isdf  # Import the main module for W solve
+    from .. import w_isdf  # Import the main module for W solve
     
     omega_abs = abs(omega)
     enk_v_host = np.asarray(jax.device_get(enk_v))
