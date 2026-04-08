@@ -83,13 +83,24 @@ def _mu_nu_sharding(mesh_xy: Mesh) -> NamedSharding:
     # (mu, nu, kx, ky, kz) with mu/nu split across x/y mesh axes.
     return NamedSharding(mesh_xy, P("x", "y", None, None, None))
 
+def _to_host_np(a, dtype=np.complex128, *, tiled: bool = False):
+    """Gather a possibly sharded array to host without assuming single-process JAX."""
+    try:
+        return np.asarray(
+            jax.experimental.multihost_utils.process_allgather(a, tiled=tiled),
+            dtype=dtype,
+        )
+    except Exception:
+        return np.asarray(jax.device_get(a), dtype=dtype)
+
 _sigma_tau_channel_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
+_sigma_channel_pipeline_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
 
 
 def _summarize_hermitian_qmunu(name: str, W_q: jax.Array, print_fn=print) -> None:
     """Emit Hermiticity diagnostics for W_q with layout (kx,ky,kz,1,mu,1,nu)."""
     try:
-        W_host = np.asarray(jax.experimental.multihost_utils.process_allgather(W_q, tiled=False), dtype=np.complex128)
+        W_host = _to_host_np(W_q, dtype=np.complex128, tiled=False)
     except Exception:
         return
     if W_host.ndim != 7:
@@ -172,6 +183,102 @@ def _project_stream_batch_jit(
     return pref * contrib.astype(jnp.complex128)
 
 
+def _get_sigma_channel_pipeline(
+    *,
+    mesh_xy: Mesh,
+    nkx: int,
+    nky: int,
+    nkz: int,
+    nk_tot: int,
+    bispinor: bool,
+    get_G_mu_nu_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array],
+    get_sigma_kij_channels_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array],
+) -> Callable[..., jax.Array]:
+    """Return a staged sigma-channel pipeline with eager shard_map FFTs."""
+
+    pipeline_key = (
+        id(mesh_xy),
+        int(nkx),
+        int(nky),
+        int(nkz),
+        int(nk_tot),
+        bool(bispinor),
+        id(get_G_mu_nu_fn),
+        id(get_sigma_kij_channels_fn),
+    )
+    if pipeline_key in _sigma_channel_pipeline_cache:
+        return _sigma_channel_pipeline_cache[pipeline_key]
+
+    from common.fft_helpers import make_sharded_fftn_3d, make_sharded_ifftn_3d
+
+    w_isdf._ensure_compilation_cache()
+    mu_shard = _mu_nu_sharding(mesh_xy)
+    sigma_7d_shard = NamedSharding(mesh_xy, P(None, "x", None, "y", None, None, None))
+    sigma_7d_spec = P(None, "x", None, "y", None, None, None)
+    sharded_ifftn_7d = make_sharded_ifftn_3d(
+        mesh_xy, sigma_7d_spec, sigma_7d_spec, norm="ortho", axes=(-3, -2, -1)
+    )
+    sharded_fftn_7d = make_sharded_fftn_3d(
+        mesh_xy, sigma_7d_spec, sigma_7d_spec, norm="ortho", axes=(-3, -2, -1)
+    )
+    nk_scale = jnp.asarray(-1.0 / np.sqrt(float(nk_tot)), dtype=jnp.float64)
+
+    @jax.jit
+    def _build_G_7d(
+        psi_coh_rmuT_X: jax.Array,
+        psi_coh_rmu_Y: jax.Array,
+        Gij: jax.Array,
+    ) -> jax.Array:
+        G_k = get_G_mu_nu_fn(psi_coh_rmuT_X, psi_coh_rmu_Y, Gij)
+        G_7d = G_k.transpose(1, 2, 3, 4, 0).reshape(
+            G_k.shape[1], G_k.shape[2], G_k.shape[3], G_k.shape[4], nkx, nky, nkz
+        )
+        return jax.lax.with_sharding_constraint(G_7d, sigma_7d_shard)
+
+    @jax.jit
+    def _expand_W_7d(W_q: jax.Array) -> jax.Array:
+        W_q = jax.lax.with_sharding_constraint(W_q, mu_shard)
+        W_7d = W_q[None, :, None, :, :, :, :]
+        return jax.lax.with_sharding_constraint(W_7d, sigma_7d_shard)
+
+    @jax.jit
+    def _build_sigma_R(G_R: jax.Array, W_R: jax.Array) -> jax.Array:
+        if bispinor:
+            gamma0_diag = jnp.array([1.0, 1.0, -1.0, -1.0], dtype=jnp.float64)
+            gamma0_vertex = gamma0_diag[:, None] * gamma0_diag[None, :]
+            gamma0_vertex = gamma0_vertex[:, None, :, None, None, None, None]
+            G_R = G_R * gamma0_vertex
+        sigma_R = G_R * W_R * nk_scale
+        return jax.lax.with_sharding_constraint(sigma_R, sigma_7d_shard)
+
+    @jax.jit
+    def _project_channels(
+        psi_proj_rmu_X: jax.Array,
+        psi_proj_rmuT_Y: jax.Array,
+        sigma_k: jax.Array,
+    ) -> jax.Array:
+        return get_sigma_kij_channels_fn(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_k)
+
+    def _sigma_channel_pipeline(
+        psi_coh_rmuT_X: jax.Array,
+        psi_coh_rmu_Y: jax.Array,
+        psi_proj_rmu_X: jax.Array,
+        psi_proj_rmuT_Y: jax.Array,
+        Gij: jax.Array,
+        W_q: jax.Array,
+    ) -> jax.Array:
+        G_7d = _build_G_7d(psi_coh_rmuT_X, psi_coh_rmu_Y, Gij)
+        W_7d = _expand_W_7d(W_q)
+        G_R = sharded_ifftn_7d(G_7d)
+        W_R = sharded_ifftn_7d(W_7d)
+        sigma_R = _build_sigma_R(G_R, W_R)
+        sigma_k = sharded_fftn_7d(sigma_R)
+        return _project_channels(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_k)
+
+    _sigma_channel_pipeline_cache[pipeline_key] = _sigma_channel_pipeline
+    return _sigma_channel_pipeline
+
+
 def _get_sigma_tau_channel_kernel(
     *,
     mesh_xy: Mesh,
@@ -185,7 +292,18 @@ def _get_sigma_tau_channel_kernel(
     get_sigma_mu_nu_fn: Callable[[jax.Array, jax.Array, int, bool], jax.Array],
     get_sigma_kij_channels_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array],
 ) -> Callable[..., jax.Array]:
-    """Return a cached JIT kernel for one tau-node sigma-channel build."""
+    """Return a cached staged tau-node sigma builder.
+
+    The chi0 path only scales once shard-mapped FFTs are kept outside any
+    enclosing JIT. The PPM sigma path must follow the same pattern:
+
+      1. small JIT to build Gij and W_q(tau)
+      2. eager shard_map FFTs on G and W
+      3. small JIT to multiply/project
+
+    Tracing the shard_map FFTs under this tau-node JIT reintroduces the same
+    16-GPU compilation hang that screening already fixed.
+    """
 
     cache_key = (
         id(mesh_xy),
@@ -202,10 +320,45 @@ def _get_sigma_tau_channel_kernel(
     if cache_key in _sigma_tau_channel_kernel_cache:
         return _sigma_tau_channel_kernel_cache[cache_key]
 
+    # Intentionally unused here: the staged kernel below rebuilds the sigma
+    # FFT path locally so shard_map remains eager rather than being traced
+    # under a larger JIT via these callbacks.
+    del get_G_R_fn, get_sigma_mu_nu_fn
+
     w_isdf._ensure_compilation_cache()
     mu_shard = _mu_nu_sharding(mesh_xy)
+    sigma_channel_pipeline = _get_sigma_channel_pipeline(
+        mesh_xy=mesh_xy,
+        nkx=nkx,
+        nky=nky,
+        nkz=nkz,
+        nk_tot=nk_tot,
+        bispinor=bispinor,
+        get_G_mu_nu_fn=get_G_mu_nu_fn,
+        get_sigma_kij_channels_fn=get_sigma_kij_channels_fn,
+    )
 
     @jax.jit
+    def _build_tau_operands(
+        E_A: jax.Array,
+        mask_A: jax.Array,
+        B_mu_nu: jax.Array,
+        Omega_mu_nu: jax.Array,
+        mask_B: jax.Array,
+        E_ref_A: jax.Array,
+        E_ref_B: jax.Array,
+        t_node: jax.Array,
+        eye_nb: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        phase_A = jnp.exp(-1j * (E_A - E_ref_A) * t_node)
+        weights_kn = jnp.where(mask_A, phase_A, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
+        Gij = eye_nb[None, :, :] * weights_kn[:, :, None]
+
+        phase_B = jnp.exp(-1j * (Omega_mu_nu - E_ref_B) * t_node)
+        W_t_q = jnp.where(mask_B, B_mu_nu * phase_B, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
+        W_t_q = jax.lax.with_sharding_constraint(W_t_q, mu_shard)
+        return Gij, W_t_q
+
     def _tau_channel_step(
         psi_coh_rmuT_X: jax.Array,
         psi_coh_rmu_Y: jax.Array,
@@ -221,18 +374,25 @@ def _get_sigma_tau_channel_kernel(
         t_node: jax.Array,
         eye_nb: jax.Array,
     ) -> jax.Array:
-        phase_A = jnp.exp(-1j * (E_A - E_ref_A) * t_node)
-        weights_kn = jnp.where(mask_A, phase_A, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
-        Gij = eye_nb[None, :, :] * weights_kn[:, :, None]
-        G_k = get_G_mu_nu_fn(psi_coh_rmuT_X, psi_coh_rmu_Y, Gij)
-
-        phase_B = jnp.exp(-1j * (Omega_mu_nu - E_ref_B) * t_node)
-        W_t_q = jnp.where(mask_B, B_mu_nu * phase_B, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
-        W_t_q = jax.lax.with_sharding_constraint(W_t_q, mu_shard)
-
-        G_R = get_G_R_fn(G_k, nkx, nky, nkz)
-        sigma_tau = get_sigma_mu_nu_fn(G_R, W_t_q, nk_tot, bispinor)
-        return get_sigma_kij_channels_fn(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_tau)
+        Gij, W_t_q = _build_tau_operands(
+            E_A,
+            mask_A,
+            B_mu_nu,
+            Omega_mu_nu,
+            mask_B,
+            E_ref_A,
+            E_ref_B,
+            t_node,
+            eye_nb,
+        )
+        return sigma_channel_pipeline(
+            psi_coh_rmuT_X,
+            psi_coh_rmu_Y,
+            psi_proj_rmu_X,
+            psi_proj_rmuT_Y,
+            Gij,
+            W_t_q,
+        )
 
     _sigma_tau_channel_kernel_cache[cache_key] = _tau_channel_step
     return _tau_channel_step
@@ -622,10 +782,10 @@ def _convolve_sigma_branch_kij(
         nb_proj = int(psi_proj_rmu_X.shape[1])
         return jnp.zeros((0, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), []
 
-    E_A_host = np.asarray(jax.experimental.multihost_utils.process_allgather(E_A, tiled=False), dtype=np.float64)
-    base_A_host = np.asarray(jax.device_get(base_mask_A), dtype=bool)
-    E_B_host = np.asarray(jax.device_get(Omega_mu_nu), dtype=np.float64)
-    base_B_host = np.asarray(jax.device_get(base_mask_B), dtype=bool)
+    E_A_host = _to_host_np(E_A, dtype=np.float64, tiled=False)
+    base_A_host = _to_host_np(base_mask_A, dtype=bool, tiled=False)
+    E_B_host = _to_host_np(Omega_mu_nu, dtype=np.float64, tiled=False)
+    base_B_host = _to_host_np(base_mask_B, dtype=bool, tiled=False)
     if _bprof:
         _b1 = _btime.perf_counter()
         print0(f"  [TIMING-BRANCH] {log_tag} device_get pre-loop: {_b1-_b0:.3f}s")
@@ -1008,9 +1168,8 @@ def compute_sigma_c_ppm_omega_grid(
     else:
         valid_mask = jnp.asarray(valid_mask_mu_nu, dtype=bool)
     invalid_mask = B_mask & (~valid_mask)
-    _gather = jax.experimental.multihost_utils.process_allgather
-    b_total_mask_host = np.asarray(_gather(B_mask | invalid_mask, tiled=False), dtype=bool)
-    invalid_mask_host = np.asarray(_gather(invalid_mask, tiled=False), dtype=bool)
+    b_total_mask_host = _to_host_np(B_mask | invalid_mask, dtype=bool, tiled=False)
+    invalid_mask_host = _to_host_np(invalid_mask, dtype=bool, tiled=False)
     if invalid_mode == "static_limit":
         B_mask = B_mask & valid_mask
 
@@ -1036,8 +1195,9 @@ def compute_sigma_c_ppm_omega_grid(
         else:
             ev_min = float("nan")
             ev_max = float("nan")
-        omega_mask = np.asarray(B_mask, dtype=bool)
-        omega_vals = np.asarray(Omega_abs[omega_mask], dtype=np.float64)
+        omega_mask = _to_host_np(B_mask, dtype=bool, tiled=False)
+        omega_abs_host = _to_host_np(Omega_abs, dtype=np.float64, tiled=False)
+        omega_vals = np.asarray(omega_abs_host[omega_mask], dtype=np.float64)
         if omega_vals.size:
             om_min = float(np.min(omega_vals))
             om_max = float(np.max(omega_vals))
@@ -1133,6 +1293,17 @@ def compute_sigma_c_ppm_omega_grid(
 
     try:
         if use_kij_accum or use_kij_stream:
+            sigma_channel_pipeline = _get_sigma_channel_pipeline(
+                mesh_xy=mesh_xy,
+                nkx=nkx,
+                nky=nky,
+                nkz=nkz,
+                nk_tot=nk_tot,
+                bispinor=bispinor,
+                get_G_mu_nu_fn=get_G_mu_nu_fn,
+                get_sigma_kij_channels_fn=get_sigma_kij_channels_fn,
+            )
+
             def _accumulate_kij_stream(global_idx: np.ndarray, contrib_batch: jax.Array) -> None:
                 if dset_sigma_kij is None:
                     return
@@ -1319,23 +1490,25 @@ def compute_sigma_c_ppm_omega_grid(
                     optimize=True,
                 )
                 with mesh_xy:
-                    G_occ_k = get_G_mu_nu_fn(psi_coh_rmuT_X, psi_coh_rmu_Y, Gij_occ)
-                    G_occ_R = get_G_R_fn(G_occ_k, nkx, nky, nkz)
-                    sigma_occ_munu = get_sigma_mu_nu_fn(G_occ_R, Wc0_invalid, nk_tot, bispinor)
-                sigma_occ_kij = get_sigma_kij_channels_fn(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_occ_munu)[0]
-
-                with mesh_xy:
-                    G_RI_k = get_G_mu_nu_fn(
+                    sigma_occ_kij = sigma_channel_pipeline(
                         psi_coh_rmuT_X,
                         psi_coh_rmu_Y,
+                        psi_proj_rmu_X,
+                        psi_proj_rmuT_Y,
+                        Gij_occ,
+                        Wc0_invalid,
+                    )[0]
+                    sigma_ri_kij = sigma_channel_pipeline(
+                        psi_coh_rmuT_X,
+                        psi_coh_rmu_Y,
+                        psi_proj_rmu_X,
+                        psi_proj_rmuT_Y,
                         jnp.broadcast_to(
                             jnp.eye(int(occ_mask.shape[1]), dtype=jnp.complex128)[None, :, :],
                             (nk, int(occ_mask.shape[1]), int(occ_mask.shape[1])),
                         ),
-                    )
-                    G_RI_R = get_G_R_fn(G_RI_k, nkx, nky, nkz)
-                    sigma_ri_munu = get_sigma_mu_nu_fn(G_RI_R, Wc0_invalid, nk_tot, bispinor)
-                sigma_ri_kij = get_sigma_kij_channels_fn(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_ri_munu)[0]
+                        Wc0_invalid,
+                    )[0]
 
                 sigma_invalid_static = sigma_occ_kij - 0.5 * sigma_ri_kij
                 sigma_invalid_static_host = np.asarray(jax.device_get(sigma_invalid_static), dtype=np.complex128)
