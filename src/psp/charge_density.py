@@ -448,19 +448,45 @@ def _build_V_xc_gga(
     """
     from jax_xc_local.pbe import pbe_xc
 
-    rho_safe = jnp.maximum(rho_r, 1e-30)
+    # QE thresholds: LDA evaluated for rho > 1e-10, GGA correction
+    # evaluated only for rho > 1e-6 and |grad rho|^2 > 1e-10.
+    # Below the GGA threshold, V_xc = LDA only.
+    RHO_THRESH_LDA = 1e-10
+    RHO_THRESH_GGA = 1e-6
+    GRHO_THRESH_GGA = 1e-10
+
+    rho_safe = jnp.maximum(rho_r, RHO_THRESH_LDA)
     sigma = jnp.maximum(grad_rho_sq, 0.0)
 
+    # Full PBE functional derivative (LDA + GGA together)
     def f_xc(rho_val, sigma_val):
         return rho_val * pbe_xc(rho_val, sigma_val)
 
-    df_drho = jax.vmap(jax.grad(f_xc, argnums=0))(
+    # LDA part: evaluate at sigma=0
+    def f_xc_lda(rho_val):
+        return rho_val * pbe_xc(rho_val, 0.0)
+
+    # LDA V_xc everywhere
+    df_drho_lda = jax.vmap(jax.grad(f_xc_lda))(
+        rho_safe.ravel()
+    ).reshape(rho_r.shape)
+
+    # GGA derivatives (full PBE)
+    df_drho_full = jax.vmap(jax.grad(f_xc, argnums=0))(
         rho_safe.ravel(), sigma.ravel()
     ).reshape(rho_r.shape)
 
     df_dsigma = jax.vmap(jax.grad(f_xc, argnums=1))(
         rho_safe.ravel(), sigma.ravel()
     ).reshape(rho_r.shape)
+
+    # GGA correction = full - LDA, applied only where rho > GGA threshold
+    gga_mask = (rho_r > RHO_THRESH_GGA) & (grad_rho_sq > GRHO_THRESH_GGA)
+    df_drho_gga_corr = jnp.where(gga_mask, df_drho_full - df_drho_lda, 0.0)
+    df_dsigma = jnp.where(gga_mask, df_dsigma, 0.0)
+
+    # Total: LDA everywhere + GGA correction where above threshold
+    df_drho = df_drho_lda + df_drho_gga_corr
 
     # GGA correction: -2 ∇·[df_dsigma ∇ρ]
     # Use the same G-space density as in compute_grad_rho_sq

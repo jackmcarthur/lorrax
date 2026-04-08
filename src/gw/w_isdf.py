@@ -509,6 +509,16 @@ def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int):
         chi_flat = jax.lax.with_sharding_constraint(chi_flat, rep_3d)
         chi_flat = jax.lax.with_sharding_constraint(chi_flat, q_flat_shard)
 
+        # Pad to multiple of total devices for clean shard_map
+        total_devices = mesh_xy.devices.size
+        nq_padded = ((nq_local + total_devices - 1) // total_devices) * total_devices
+        pad_amount = nq_padded - nq_local
+        if pad_amount > 0:
+            V_flat = jnp.pad(V_flat, ((0, pad_amount), (0, 0), (0, 0)))
+            chi_flat = jnp.pad(chi_flat, ((0, pad_amount), (0, 0), (0, 0)))
+            V_flat = jax.lax.with_sharding_constraint(V_flat, q_flat_shard)
+            chi_flat = jax.lax.with_sharding_constraint(chi_flat, q_flat_shard)
+
         # Each device solves its local q-shard independently (no communication)
         def _local_solve(V_local, chi_local):
             """Solve W = (I - V χ)^{-1} V for each local q-point."""
@@ -525,7 +535,9 @@ def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int):
             in_specs=(q_spec, q_spec), out_specs=q_spec,
         )(V_flat, chi_flat)
 
-        # Reshape back
+        # Remove padding and reshape back
+        if pad_amount > 0:
+            W_flat = W_flat[:nq_local]
         W_flat = jax.lax.with_sharding_constraint(W_flat, rep_3d)
         W_kqmn = W_flat.reshape(nkx, nky, nkz, n, n)
         W_out_arr = W_kqmn[:, :, :, None, :, None, :]
