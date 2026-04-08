@@ -1230,21 +1230,39 @@ def main(argv=None):
 	Gij_shard = NamedSharding(mesh_xy, P(None, None, None))
 	Gij_static = jax.device_put(Gij_static, Gij_shard)
 
-	# Create shard_map FFT helpers for sigma G_R and sigma_k FFTs.
-	# These must be called OUTSIDE @jax.jit (shard_map inside JIT hangs on 16+ GPUs).
+	# Shard_map FFT helpers for G(k→R) and Σ(R→k) inside the sigma pipeline.
+	# These are shard_map closures passed INTO the JIT'd pipeline.
+	# shard_map inside @jax.jit works for chi0 on 16 GPUs; test for sigma too.
 	from common.fft_helpers import make_sharded_ifftn_3d, make_sharded_fftn_3d
 	_G_spec = P(None, 'x', None, 'y', None, None, None)
 	_sharded_ifftn_G = make_sharded_ifftn_3d(mesh_xy, _G_spec, _G_spec, norm='ortho', axes=(4, 5, 6))
 	_sharded_fftn_G = make_sharded_fftn_3d(mesh_xy, _G_spec, _G_spec, norm='ortho', axes=(4, 5, 6))
 
-	# DON'T jax.jit the pipeline — call it directly so shard_map FFTs work eagerly.
-	# The individual einsums inside are traced and compiled on-the-fly by JAX.
-	def pipeline_fn(*args, **kwargs):
+	# JIT the pipeline with shard_map FFTs passed as closure-captured helpers.
+	def pipeline_fn(
+		psi_lT, psi_l, psi_cohT, psi_coh, psi_proj, psi_projT,
+		W, V, V0, Gij,
+		nkx, nky, nkz, nk_tot, nspinor, fft_vol_au, bispinor,
+	):
 		return compute_sigma_pipeline_jax(
-			*args, **kwargs,
+			psi_lT, psi_l, psi_cohT, psi_coh, psi_proj, psi_projT,
+			W, V, V0, Gij,
+			nkx, nky, nkz, nk_tot, nspinor, fft_vol_au, bispinor,
 			sharded_ifftn=_sharded_ifftn_G,
 			sharded_fftn=_sharded_fftn_G,
 		)
+	pipeline_fn = jax.jit(
+		pipeline_fn,
+		static_argnames=('nkx', 'nky', 'nkz', 'nk_tot', 'nspinor', 'fft_vol_au', 'bispinor'),
+		in_shardings=(
+			sh.XT_shard, sh.Y_shard,
+			sh.XT_shard, sh.Y_shard,
+			sh.X_shard, sh.YT_shard,
+			sh.V_shard, sh.V_shard,
+			sh.xy_shard, Gij_shard,
+		),
+		out_shardings=(sh.out_shard, sh.out_shard, sh.out_shard),
+	)
 
 	fft_vol_au = float(wfn.cell_volume / np.prod(wfn.fft_grid))
 
