@@ -89,7 +89,7 @@ _sigma_tau_channel_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Arra
 def _summarize_hermitian_qmunu(name: str, W_q: jax.Array, print_fn=print) -> None:
     """Emit Hermiticity diagnostics for W_q with layout (kx,ky,kz,1,mu,1,nu)."""
     try:
-        W_host = np.asarray(jax.device_get(W_q), dtype=np.complex128)
+        W_host = np.asarray(jax.experimental.multihost_utils.process_allgather(W_q, tiled=False), dtype=np.complex128)
     except Exception:
         return
     if W_host.ndim != 7:
@@ -622,7 +622,7 @@ def _convolve_sigma_branch_kij(
         nb_proj = int(psi_proj_rmu_X.shape[1])
         return jnp.zeros((0, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), []
 
-    E_A_host = np.asarray(jax.device_get(E_A), dtype=np.float64)
+    E_A_host = np.asarray(jax.experimental.multihost_utils.process_allgather(E_A, tiled=False), dtype=np.float64)
     base_A_host = np.asarray(jax.device_get(base_mask_A), dtype=bool)
     E_B_host = np.asarray(jax.device_get(Omega_mu_nu), dtype=np.float64)
     base_B_host = np.asarray(jax.device_get(base_mask_B), dtype=bool)
@@ -1008,8 +1008,9 @@ def compute_sigma_c_ppm_omega_grid(
     else:
         valid_mask = jnp.asarray(valid_mask_mu_nu, dtype=bool)
     invalid_mask = B_mask & (~valid_mask)
-    b_total_mask_host = np.asarray(B_mask | invalid_mask, dtype=bool)
-    invalid_mask_host = np.asarray(invalid_mask, dtype=bool)
+    _gather = jax.experimental.multihost_utils.process_allgather
+    b_total_mask_host = np.asarray(_gather(B_mask | invalid_mask, tiled=False), dtype=bool)
+    invalid_mask_host = np.asarray(_gather(invalid_mask, tiled=False), dtype=bool)
     if invalid_mode == "static_limit":
         B_mask = B_mask & valid_mask
 
