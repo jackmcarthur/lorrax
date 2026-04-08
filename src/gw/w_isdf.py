@@ -328,13 +328,13 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
     sharded_fftn_chi = make_sharded_fftn_3d(mesh_xy, chi_R_spec, chi_R_spec,
                                              norm='ortho', axes=(-3, -2, -1))
 
-    # Phase 1: JIT'd einsum + reshape + transpose (no FFT inside JIT)
-    @partial(jax.jit, static_argnames=("nkx", "nky", "nkz"))
-    def _build_G(
+    # Phase 1: JIT'd einsum only. Reshape/transpose done eagerly in Python
+    # to avoid SPMD partitioner compilation hangs on 16+ GPUs.
+    @jax.jit
+    def _build_G_k(
         psi_vTX, psi_vY, psi_cX, psi_cTY,
         enk_v, enk_c,
         tau_scalar, vmax, cmin,
-        nkx: int, nky: int, nkz: int,
     ):
         exp_v = jnp.exp(-tau_scalar * (vmax - enk_v))
         exp_c = jnp.exp(-tau_scalar * (enk_c - cmin))
@@ -346,15 +346,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
                            jnp.conj(psi_cTY), exp_c.astype(jnp.complex128), psi_cX,
                            optimize=True)
 
-        Gv_k = jax.lax.with_sharding_constraint(Gv_k, G_v_5d)
-        Gc_k = jax.lax.with_sharding_constraint(Gc_k, G_c_5d)
-
-        Gv_7 = jax.lax.with_sharding_constraint(
-            Gv_k.reshape(nkx, nky, nkz, *Gv_k.shape[1:]), G_v_7d)
-        Gc_7 = jax.lax.with_sharding_constraint(
-            Gc_k.reshape(nkx, nky, nkz, *Gc_k.shape[1:]), G_c_7d)
-
-        return Gv_7.transpose(3, 4, 5, 6, 0, 1, 2), Gc_7.transpose(3, 4, 5, 6, 0, 1, 2)
+        return Gv_k, Gc_k
 
     # Phase 3: JIT'd contraction + accumulation (no FFT inside JIT)
     @partial(jax.jit, donate_argnums=(0,))
@@ -391,13 +383,17 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
         chi_R_acc = jax.make_array_from_callback(chi_R_shape, chi_R_shard, _chi_zeros)
 
         for itau in range(ntau):
-            # Phase 1: JIT'd einsum (output: transposed G_v, G_c)
-            Gv_t, Gc_t = _build_G(
+            # Phase 1: JIT'd einsum only
+            Gv_k, Gc_k = _build_G_k(
                 psi_vTX, psi_vY, psi_cX, psi_cTY,
                 enk_v, enk_c,
                 tau_i[itau], vmax, cmin,
-                nkx, nky, nkz,
             )
+
+            # Reshape + transpose in Python (avoids SPMD partitioner issues)
+            Gv_t = Gv_k.reshape(nkx, nky, nkz, *Gv_k.shape[1:]).transpose(3, 4, 5, 6, 0, 1, 2)
+            Gc_t = Gc_k.reshape(nkx, nky, nkz, *Gc_k.shape[1:]).transpose(3, 4, 5, 6, 0, 1, 2)
+            del Gv_k, Gc_k
 
             # Phase 2: EAGER shard_map FFT (physically local, no JIT)
             Gv_R = sharded_ifftn_Gv(Gv_t)
