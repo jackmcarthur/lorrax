@@ -471,80 +471,68 @@ def compute_chi0_minimax(
 
 def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int):
     """
-    Get or create W solve function with two-stage resharding.
-    
-    Strategy (from load_wfns):
-    1. Reshard V, χ from P(..., μ_X, ..., ν_Y) to P((q_XY), μ, ν) for q-parallel solve
-    2. fori_loop over q with replicated (μ, ν) solve per q
+    Get or create W solve function with q-parallel shard_map.
+
+    Strategy:
+    1. Reshard V, χ from P(..., μ_X, ..., ν_Y) to P((q_XY), μ, ν)
+    2. shard_map: each device solves ONLY its local q-points via fori_loop
     3. Reshard W back to P(..., μ_X, ..., ν_Y)
+
+    The old code used a global fori_loop over all nq on every device,
+    all-gathering each (μ,ν) slice — 16× redundant work on 16 GPUs.
     """
+    from jax.experimental.shard_map import shard_map
+
     cache_key = (id(mesh_xy), nq, n_rmu)
     if cache_key in _w_solve_cache:
         return _w_solve_cache[cache_key]
-    
-    # Shardings
-    q_flat_shard = NamedSharding(mesh_xy, P(('x', 'y'), None, None))            # (nq, μ, ν) q-sharded
-    W_out = NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y'))   # W output
-    rep_shard = NamedSharding(mesh_xy, P(None, None))                           # replicated (μ, ν)
-    rep_3d = NamedSharding(mesh_xy, P(None, None, None))                        # replicated (nq, μ, ν)
+
+    q_flat_shard = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
+    W_out = NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y'))
+    rep_3d = NamedSharding(mesh_xy, P(None, None, None))
+
+    q_spec = P(('x', 'y'), None, None)
 
     @jax.jit
     def _solve_w(V_q: jax.Array, chi_q: jax.Array, pref: jax.Array) -> jax.Array:
-        """
-        Solve W = V (I - V χ)^{-1} = (I - V χ)^{-1} V via LU per q.
-
-        Three-stage resharding to avoid XLA involuntary rematerialization:
-        1. χ, V: P(..., μ_X, ν_Y) → replicated → P(q_XY, μ, ν)
-        2. Solve per q with replicated matrices
-        3. W: P(q_XY, μ, ν) → replicated → P(..., μ_X, ν_Y)
-        """
-        # Extract shapes
         nkx, nky, nkz = chi_q.shape[0], chi_q.shape[1], chi_q.shape[2]
         nq_local = nkx * nky * nkz
-        n = chi_q.shape[4]  # n_rmu
+        n = chi_q.shape[4]
 
-        # Flatten V: (1, 1, 1, nkx, nky, nkz, μ, ν) → (nq, μ, ν)
-        # Two-stage resharding: first replicate, then shard on q
+        # Flatten and reshard to q-parallel
         V_flat = V_q[0, 0, 0].reshape(nq_local, n, n)
         V_flat = jax.lax.with_sharding_constraint(V_flat, rep_3d)
         V_flat = jax.lax.with_sharding_constraint(V_flat, q_flat_shard)
 
-        # Flatten χ: (nkx, nky, nkz, 1, μ, 1, ν) → (nq, μ, ν)
         chi_flat = chi_q[:, :, :, 0, :, 0, :].reshape(nq_local, n, n)
         chi_flat = pref * chi_flat
         chi_flat = jax.lax.with_sharding_constraint(chi_flat, rep_3d)
         chi_flat = jax.lax.with_sharding_constraint(chi_flat, q_flat_shard)
 
-        # fori_loop over q with replicated solve
-        def solve_body(iq, W_acc):
-            # All-gather V[iq] and chi[iq] to replicated
-            V_iq = jax.lax.with_sharding_constraint(V_flat[iq], rep_shard)
-            chi_iq = jax.lax.with_sharding_constraint(chi_flat[iq], rep_shard)
+        # Each device solves its local q-shard independently (no communication)
+        def _local_solve(V_local, chi_local):
+            """Solve W = (I - V χ)^{-1} V for each local q-point."""
+            nq_dev = V_local.shape[0]
+            def solve_one(iq, W_acc):
+                A = jnp.eye(n, dtype=V_local.dtype) - V_local[iq] @ chi_local[iq]
+                lu, piv = jsp_linalg.lu_factor(A)
+                W_iq = jsp_linalg.lu_solve((lu, piv), V_local[iq])
+                return W_acc.at[iq].set(W_iq)
+            return jax.lax.fori_loop(0, nq_dev, solve_one, jnp.zeros_like(V_local))
 
-            # Build A = I - V χ
-            I = jnp.eye(n, dtype=V_iq.dtype)
-            A = I - V_iq @ chi_iq
+        W_flat = shard_map(
+            _local_solve, mesh=mesh_xy,
+            in_specs=(q_spec, q_spec), out_specs=q_spec,
+        )(V_flat, chi_flat)
 
-            # Solve A W = V via LU
-            lu, piv = jsp_linalg.lu_factor(A)
-            W_iq = jsp_linalg.lu_solve((lu, piv), V_iq)
-
-            return W_acc.at[iq].set(W_iq)
-
-        # Initialize output with same sharding
-        W_flat = jnp.zeros_like(V_flat)
-        W_flat = jax.lax.with_sharding_constraint(W_flat, q_flat_shard)
-        W_flat = jax.lax.fori_loop(0, nq_local, solve_body, W_flat)
-
-        # Reshape back: (nq, μ, ν) → (nkx, nky, nkz, 1, μ, 1, ν)
-        # Two-stage resharding: first replicate, then apply output sharding
+        # Reshape back
         W_flat = jax.lax.with_sharding_constraint(W_flat, rep_3d)
         W_kqmn = W_flat.reshape(nkx, nky, nkz, n, n)
         W_out_arr = W_kqmn[:, :, :, None, :, None, :]
         W_out_arr = jax.lax.with_sharding_constraint(W_out_arr, W_out)
 
         return W_out_arr
-    
+
     _w_solve_cache[cache_key] = _solve_w
     return _solve_w
 
