@@ -348,7 +348,10 @@ def write_w_copies_debug_h5(
 	def _q000_munu(W_q):
 		if W_q is None:
 			return None
-		return np.asarray(jax.device_get(W_q[0, 0, 0, 0, :, 0, :]), dtype=np.complex128)
+		# Use process_allgather for multi-process compatibility
+		slc = W_q[0, 0, 0, 0, :, 0, :]
+		slc = jax.experimental.multihost_utils.process_allgather(slc, tiled=False)
+		return np.asarray(slc, dtype=np.complex128)
 
 	W0_screen = _q000_munu(W0_screen_q)
 	W0_ppm = _q000_munu(W0_ppm_q)
