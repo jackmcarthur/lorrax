@@ -194,7 +194,7 @@ def _get_sigma_channel_pipeline(
     get_G_mu_nu_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array],
     get_sigma_kij_channels_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array],
 ) -> Callable[..., jax.Array]:
-    """Return a staged sigma-channel pipeline with eager shard_map FFTs."""
+    """Return a jit-compatible sigma-channel pipeline with device-local FFTs."""
 
     pipeline_key = (
         id(mesh_xy),
@@ -209,16 +209,19 @@ def _get_sigma_channel_pipeline(
     if pipeline_key in _sigma_channel_pipeline_cache:
         return _sigma_channel_pipeline_cache[pipeline_key]
 
-    from common.fft_helpers import make_sharded_fftn_3d, make_sharded_ifftn_3d
+    from common.fft_helpers import (
+        make_jittable_local_fftn_3d,
+        make_jittable_local_ifftn_3d,
+    )
 
     w_isdf._ensure_compilation_cache()
     mu_shard = _mu_nu_sharding(mesh_xy)
     sigma_7d_shard = NamedSharding(mesh_xy, P(None, "x", None, "y", None, None, None))
     sigma_7d_spec = P(None, "x", None, "y", None, None, None)
-    sharded_ifftn_7d = make_sharded_ifftn_3d(
+    local_ifftn_7d = make_jittable_local_ifftn_3d(
         mesh_xy, sigma_7d_spec, sigma_7d_spec, norm="ortho", axes=(-3, -2, -1)
     )
-    sharded_fftn_7d = make_sharded_fftn_3d(
+    local_fftn_7d = make_jittable_local_fftn_3d(
         mesh_xy, sigma_7d_spec, sigma_7d_spec, norm="ortho", axes=(-3, -2, -1)
     )
     nk_scale = jnp.asarray(-1.0 / np.sqrt(float(nk_tot)), dtype=jnp.float64)
@@ -259,6 +262,7 @@ def _get_sigma_channel_pipeline(
     ) -> jax.Array:
         return get_sigma_kij_channels_fn(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_k)
 
+    @jax.jit
     def _sigma_channel_pipeline(
         psi_coh_rmuT_X: jax.Array,
         psi_coh_rmu_Y: jax.Array,
@@ -269,10 +273,10 @@ def _get_sigma_channel_pipeline(
     ) -> jax.Array:
         G_7d = _build_G_7d(psi_coh_rmuT_X, psi_coh_rmu_Y, Gij)
         W_7d = _expand_W_7d(W_q)
-        G_R = sharded_ifftn_7d(G_7d)
-        W_R = sharded_ifftn_7d(W_7d)
+        G_R = local_ifftn_7d(G_7d)
+        W_R = local_ifftn_7d(W_7d)
         sigma_R = _build_sigma_R(G_R, W_R)
-        sigma_k = sharded_fftn_7d(sigma_R)
+        sigma_k = local_fftn_7d(sigma_R)
         return _project_channels(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_k)
 
     _sigma_channel_pipeline_cache[pipeline_key] = _sigma_channel_pipeline
@@ -292,18 +296,7 @@ def _get_sigma_tau_channel_kernel(
     get_sigma_mu_nu_fn: Callable[[jax.Array, jax.Array, int, bool], jax.Array],
     get_sigma_kij_channels_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array],
 ) -> Callable[..., jax.Array]:
-    """Return a cached staged tau-node sigma builder.
-
-    The chi0 path only scales once shard-mapped FFTs are kept outside any
-    enclosing JIT. The PPM sigma path must follow the same pattern:
-
-      1. small JIT to build Gij and W_q(tau)
-      2. eager shard_map FFTs on G and W
-      3. small JIT to multiply/project
-
-    Tracing the shard_map FFTs under this tau-node JIT reintroduces the same
-    16-GPU compilation hang that screening already fixed.
-    """
+    """Return a cached tau-node sigma builder with jittable local FFTs."""
 
     cache_key = (
         id(mesh_xy),
@@ -318,9 +311,8 @@ def _get_sigma_tau_channel_kernel(
     if cache_key in _sigma_tau_channel_kernel_cache:
         return _sigma_tau_channel_kernel_cache[cache_key]
 
-    # Intentionally unused here: the staged kernel below rebuilds the sigma
-    # FFT path locally so shard_map remains eager rather than being traced
-    # under a larger JIT via these callbacks.
+    # Intentionally unused here: the tau-node path reconstructs the sigma FFT
+    # pipeline directly from get_G_mu_nu / projection helpers.
     del get_G_R_fn, get_sigma_mu_nu_fn
 
     w_isdf._ensure_compilation_cache()
@@ -357,6 +349,7 @@ def _get_sigma_tau_channel_kernel(
         W_t_q = jax.lax.with_sharding_constraint(W_t_q, mu_shard)
         return Gij, W_t_q
 
+    @jax.jit
     def _tau_channel_step(
         psi_coh_rmuT_X: jax.Array,
         psi_coh_rmu_Y: jax.Array,
@@ -1220,8 +1213,8 @@ def compute_sigma_c_ppm_omega_grid(
     else:
         valid_mask = jnp.asarray(valid_mask_mu_nu, dtype=bool)
     invalid_mask = B_mask & (~valid_mask)
-    b_total_mask_host = _to_host_np(B_mask | invalid_mask, dtype=bool, tiled=False)
-    invalid_mask_host = _to_host_np(invalid_mask, dtype=bool, tiled=False)
+    n_total_modes = int(np.asarray(jax.device_get(jnp.sum(B_mask, dtype=jnp.int64)), dtype=np.int64))
+    n_invalid = int(np.asarray(jax.device_get(jnp.sum(invalid_mask, dtype=jnp.int64)), dtype=np.int64))
     if invalid_mode == "static_limit":
         B_mask = B_mask & valid_mask
 
@@ -1232,39 +1225,46 @@ def compute_sigma_c_ppm_omega_grid(
         f"Nω={omega_req.size}, Δω={omega_step_ev:.3f} eV, ξ={float(regularization_width_ry * 13.6056980659):.3f} eV"
     )
     if print0 is not None:
-        occ_mask_host = _to_host_np(occ_mask, dtype=bool, tiled=False)
-        unocc_mask_host = _to_host_np(unocc_mask, dtype=bool, tiled=False)
-        enk_host = _to_host_np(enk_full, dtype=np.float64, tiled=False)
-        if np.any(unocc_mask_host):
-            ec_min = float(np.min(enk_host[unocc_mask_host]))
-            ec_max = float(np.max(enk_host[unocc_mask_host]))
+        if _sg_prof:
+            _sg_diag0 = _sgtime.perf_counter()
+            print0("  [TIMING-SIG] post-grid diag: reducing occupied / unoccupied windows on device")
+        if bool(np.asarray(jax.device_get(jnp.any(unocc_mask)), dtype=bool)):
+            ec_min = float(np.asarray(jax.device_get(jnp.min(jnp.where(unocc_mask, enk_full, jnp.inf))), dtype=np.float64))
+            ec_max = float(np.asarray(jax.device_get(jnp.max(jnp.where(unocc_mask, enk_full, -jnp.inf))), dtype=np.float64))
         else:
             ec_min = float("nan")
             ec_max = float("nan")
-        if np.any(occ_mask_host):
-            ev_min = float(np.min(enk_host[occ_mask_host]))
-            ev_max = float(np.max(enk_host[occ_mask_host]))
+        if bool(np.asarray(jax.device_get(jnp.any(occ_mask)), dtype=bool)):
+            ev_min = float(np.asarray(jax.device_get(jnp.min(jnp.where(occ_mask, enk_full, jnp.inf))), dtype=np.float64))
+            ev_max = float(np.asarray(jax.device_get(jnp.max(jnp.where(occ_mask, enk_full, -jnp.inf))), dtype=np.float64))
         else:
             ev_min = float("nan")
             ev_max = float("nan")
-        omega_mask = _to_host_np(B_mask, dtype=bool, tiled=False)
-        omega_abs_host = _to_host_np(Omega_abs, dtype=np.float64, tiled=False)
-        omega_vals = np.asarray(omega_abs_host[omega_mask], dtype=np.float64)
-        if omega_vals.size:
-            om_min = float(np.min(omega_vals))
-            om_max = float(np.max(omega_vals))
+        if _sg_prof:
+            _sg_diag1 = _sgtime.perf_counter()
+            print0(f"  [TIMING-SIG] post-grid diag energy summary built in {_sg_diag1 - _sg_diag0:.3f}s")
+            print0("  [TIMING-SIG] post-grid diag: reducing omega abs on device")
+        if n_total_modes:
+            omega_min_dev = jnp.min(jnp.where(B_mask, Omega_abs, jnp.inf))
+            omega_max_dev = jnp.max(jnp.where(B_mask, Omega_abs, -jnp.inf))
+            om_min = float(np.asarray(jax.device_get(omega_min_dev), dtype=np.float64))
+            om_max = float(np.asarray(jax.device_get(omega_max_dev), dtype=np.float64))
         else:
             om_min = float("nan")
             om_max = float("nan")
+        if _sg_prof:
+            _sg_diag4 = _sgtime.perf_counter()
+            print0(f"  [TIMING-SIG] post-grid diag omega summary built in {_sg_diag4 - _sg_diag1:.3f}s")
+        if _sg_prof:
+            _sg_diag6 = _sgtime.perf_counter()
+            print0(f"  [TIMING-SIG] post-grid diag summary built in {_sg_diag6 - _sg_diag4:.3f}s")
         print0(
             "  Σc(ω) axes (vacuum): "
             f"Ev=[{ev_min:.6e},{ev_max:.6e}] Ry, "
             f"Ec=[{ec_min:.6e},{ec_max:.6e}] Ry, "
             f"Omega=[{om_min:.6e},{om_max:.6e}] Ry"
         )
-        n_invalid = int(np.sum(invalid_mask_host, dtype=np.int64))
         if n_invalid:
-            n_total_modes = int(np.sum(b_total_mask_host, dtype=np.int64))
             print0(
                 f"  GN invalid modes: {n_invalid}/{n_total_modes} "
                 f"({100.0 * n_invalid / max(n_total_modes, 1):.2f}%), "
@@ -1547,7 +1547,7 @@ def compute_sigma_c_ppm_omega_grid(
             if _sg_prof:
                 _sg_t_conv_end = _sgtime.perf_counter()
                 print0(f"  [TIMING-SIG] convolution total: {_sg_t_conv_end - _sg_t_conv_start:.1f}s")
-            if invalid_mode == "static_limit" and Wc0_mu_nu is not None and np.any(invalid_mask_host):
+            if invalid_mode == "static_limit" and Wc0_mu_nu is not None and n_invalid > 0:
                 Wc0_invalid = jnp.where(
                     invalid_mask,
                     jnp.asarray(Wc0_mu_nu, dtype=jnp.complex128),

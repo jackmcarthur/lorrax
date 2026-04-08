@@ -1712,123 +1712,127 @@ def main(argv=None):
 			sigma_omega_h5_path = params.get("sigma_omega_h5_file", "sigma_mnk.h5")
 			if not os.path.isabs(sigma_omega_h5_path):
 				sigma_omega_h5_path = os.path.join(input_dir, sigma_omega_h5_path)
-			if meta.rank == 0:
-				if sigma_coh_ppm_omega_kij is not None:
-					write_sigma_omega_h5(
-						sigma_omega_h5_path,
-						omega_grid_ev,
-						ryd2ev * np.array(sigma_total_omega_kij),
-						sigma_c_kij_ev=ryd2ev * np.array(sigma_coh_ppm_omega_kij),
-						sigma_sx_kij_ev=ryd2ev * np.array(sigma_sx_kbar_ij_jax),
-						hartree_kij_ev=ryd2ev * np.array(hartree_kbar_ij_jax),
-					)
-				if (
-					sigma_omega.sigma_c_plus_kij is not None
-					or sigma_omega.sigma_c_minus_kij is not None
-					or sigma_omega.sigma_c_invalid_static_kij is not None
-				):
-					with h5py.File(sigma_omega_h5_path, "a") as h5_split:
-						if sigma_omega.sigma_c_plus_kij is not None:
-							if "sigma_c_plus_kij_ev" in h5_split:
-								del h5_split["sigma_c_plus_kij_ev"]
-							h5_split.create_dataset(
-								"sigma_c_plus_kij_ev",
-								data=ryd2ev * np.array(sigma_omega.sigma_c_plus_kij),
-							)
-						if sigma_omega.sigma_c_minus_kij is not None:
-							if "sigma_c_minus_kij_ev" in h5_split:
-								del h5_split["sigma_c_minus_kij_ev"]
-							h5_split.create_dataset(
-								"sigma_c_minus_kij_ev",
-								data=ryd2ev * np.array(sigma_omega.sigma_c_minus_kij),
-							)
-						if sigma_omega.sigma_c_invalid_static_kij is not None:
-							if "sigma_c_invalid_static_kij_ev" in h5_split:
-								del h5_split["sigma_c_invalid_static_kij_ev"]
-							h5_split.create_dataset(
-								"sigma_c_invalid_static_kij_ev",
-								data=ryd2ev * np.array(sigma_omega.sigma_c_invalid_static_kij),
-							)
-				# Recompute Sigma_c(E_DFT) from the written sigma_c_kij_ev payload so
-				# eqp0_noqsym_w.dat and sigma_mnk.h5 cannot diverge.
-				if sigma_c_at_dft_ev is not None:
-					with h5py.File(sigma_omega_h5_path, "a") as h5:
-						if "sigma_c_kij_ev" not in h5:
-							raise RuntimeError(
-								f"{sigma_omega_h5_path} missing sigma_c_kij_ev; cannot evaluate Sigma_c(E_DFT)."
-							)
-							sigma_c_diag_omega_ev_file = np.diagonal(
-								np.asarray(h5["sigma_c_kij_ev"], dtype=np.complex128), axis1=2, axis2=3
-							)
-							nk = sigma_c_diag_omega_ev_file.shape[1]
-							nb = sigma_c_diag_omega_ev_file.shape[2]
-							sigma_c_at_dft_from_file = np.zeros((nk, nb), dtype=np.complex128)
-							for ik in range(nk):
-								for ib in range(nb):
-									sigma_c_at_dft_from_file[ik, ib] = _interp_complex_on_grid(
-										omega_grid_ev,
-										sigma_c_diag_omega_ev_file[:, ik, ib],
-										omega_dft_rel_ev[ik, ib],
+				if meta.rank == 0:
+					if sigma_coh_ppm_omega_kij is not None:
+						write_sigma_omega_h5(
+							sigma_omega_h5_path,
+							omega_grid_ev,
+							ryd2ev * np.array(sigma_total_omega_kij),
+							sigma_c_kij_ev=ryd2ev * np.array(sigma_coh_ppm_omega_kij),
+							sigma_sx_kij_ev=ryd2ev * np.array(sigma_sx_kbar_ij_jax),
+							hartree_kij_ev=ryd2ev * np.array(hartree_kbar_ij_jax),
+						)
+						if (
+							sigma_omega.sigma_c_plus_kij is not None
+							or sigma_omega.sigma_c_minus_kij is not None
+							or sigma_omega.sigma_c_invalid_static_kij is not None
+						):
+							with h5py.File(sigma_omega_h5_path, "a") as h5_split:
+								if sigma_omega.sigma_c_plus_kij is not None:
+									if "sigma_c_plus_kij_ev" in h5_split:
+										del h5_split["sigma_c_plus_kij_ev"]
+									h5_split.create_dataset(
+										"sigma_c_plus_kij_ev",
+										data=ryd2ev * np.array(sigma_omega.sigma_c_plus_kij),
 									)
-							sigma_x_diag_ev = np.diagonal(np.asarray(sigma_x_bare_kij), axis1=1, axis2=2) * ryd2ev
-							sigma_c_at_dft_ev = sigma_c_at_dft_from_file
-							sigma_xc_at_dft_ev = sigma_x_diag_ev + sigma_c_at_dft_ev
-							if "omega_dft_rel_ev" in h5:
-								del h5["omega_dft_rel_ev"]
-							if "sigma_c_at_dft_ev" in h5:
-								del h5["sigma_c_at_dft_ev"]
-							if "sigma_xc_at_dft_ev" in h5:
-								del h5["sigma_xc_at_dft_ev"]
-							h5.create_dataset("omega_dft_rel_ev", data=np.asarray(omega_dft_rel_ev, dtype=np.float64))
-							h5.create_dataset("sigma_c_at_dft_ev", data=np.asarray(sigma_c_at_dft_ev, dtype=np.complex128))
-							h5.create_dataset("sigma_xc_at_dft_ev", data=np.asarray(sigma_xc_at_dft_ev, dtype=np.complex128))
-							h5.attrs["sigma_at_dft_energies"] = True
-							h5.attrs["fermi_reference"] = str(fermi_reference)
-							h5.attrs["efermi_dft_ev"] = float(efermi_dft_ev)
-							h5.attrs["vbm_dft_ev"] = float(vbm_dft_ev)
-							h5.attrs["cbm_dft_ev"] = float(cbm_dft_ev) if cbm_dft_ev is not None else np.nan
-						in_grid = (
-							(np.asarray(omega_dft_rel_ev) >= float(np.min(omega_grid_ev))) &
-							(np.asarray(omega_dft_rel_ev) <= float(np.max(omega_grid_ev)))
-						)
-					n_in = int(np.count_nonzero(in_grid))
-					n_tot = int(in_grid.size)
-					print0(
-						f"  Sigma(E_DFT) in-grid states: {n_in}/{n_tot} "
-						f"within [{float(np.min(omega_grid_ev)):.3f}, {float(np.max(omega_grid_ev)):.3f}] eV"
-					)
-			else:
-					# Stream Σ_c(kij,ω) from disk to avoid holding full Nω in memory.
-					with h5py.File(sigma_omega.sigma_kij_h5_path, "r") as h5_in:
-						dset_c = h5_in["sigma_c_kij_ry"]
-					n_omega = int(dset_c.shape[0])
-					nk = int(dset_c.shape[1])
-					nb = int(dset_c.shape[2])
-					o_chunks = max(1, min(sigma_omega_batch_size, n_omega))
-					chunks = (o_chunks, max(1, min(4, nk)), nb, nb)
-					with h5py.File(sigma_omega_h5_path, "w") as h5_out:
-						h5_out.create_dataset("omega_ev", data=np.asarray(omega_grid_ev, dtype=np.float64))
-						dset_total = h5_out.create_dataset(
-							"sigma_total_kij_ev",
-							shape=dset_c.shape,
-							dtype=np.complex128,
-							chunks=chunks,
-						)
-						dset_c_ev = h5_out.create_dataset(
-							"sigma_c_kij_ev",
-							shape=dset_c.shape,
-							dtype=np.complex128,
-							chunks=chunks,
-						)
-						h5_out.create_dataset("sigma_sx_kij_ev", data=ryd2ev * np.array(sigma_sx_kbar_ij_jax))
-						h5_out.create_dataset("hartree_kij_ev", data=ryd2ev * np.array(hartree_kbar_ij_jax))
-						for ibeg in range(0, n_omega, o_chunks):
-							iend = min(ibeg + o_chunks, n_omega)
-							idx = slice(ibeg, iend)
-							sigma_c_ev = ryd2ev * np.array(dset_c[idx], dtype=np.complex128)
-							dset_c_ev[idx] = sigma_c_ev
-							sigma_total_ev = sigma_c_ev + ryd2ev * np.array(sigma_sx_kbar_ij_jax)[None, ...] + ryd2ev * np.array(hartree_kbar_ij_jax)[None, ...]
-							dset_total[idx] = sigma_total_ev
+								if sigma_omega.sigma_c_minus_kij is not None:
+									if "sigma_c_minus_kij_ev" in h5_split:
+										del h5_split["sigma_c_minus_kij_ev"]
+									h5_split.create_dataset(
+										"sigma_c_minus_kij_ev",
+										data=ryd2ev * np.array(sigma_omega.sigma_c_minus_kij),
+									)
+								if sigma_omega.sigma_c_invalid_static_kij is not None:
+									if "sigma_c_invalid_static_kij_ev" in h5_split:
+										del h5_split["sigma_c_invalid_static_kij_ev"]
+									h5_split.create_dataset(
+										"sigma_c_invalid_static_kij_ev",
+										data=ryd2ev * np.array(sigma_omega.sigma_c_invalid_static_kij),
+									)
+						# Recompute Sigma_c(E_DFT) from the written sigma_c_kij_ev payload so
+						# eqp0_noqsym_w.dat and sigma_mnk.h5 cannot diverge.
+						if sigma_c_at_dft_ev is not None:
+							with h5py.File(sigma_omega_h5_path, "a") as h5:
+								if "sigma_c_kij_ev" not in h5:
+									raise RuntimeError(
+										f"{sigma_omega_h5_path} missing sigma_c_kij_ev; cannot evaluate Sigma_c(E_DFT)."
+									)
+								sigma_c_diag_omega_ev_file = np.diagonal(
+									np.asarray(h5["sigma_c_kij_ev"], dtype=np.complex128), axis1=2, axis2=3
+								)
+								nk = sigma_c_diag_omega_ev_file.shape[1]
+								nb = sigma_c_diag_omega_ev_file.shape[2]
+								sigma_c_at_dft_from_file = np.zeros((nk, nb), dtype=np.complex128)
+								for ik in range(nk):
+									for ib in range(nb):
+										sigma_c_at_dft_from_file[ik, ib] = _interp_complex_on_grid(
+											omega_grid_ev,
+											sigma_c_diag_omega_ev_file[:, ik, ib],
+											omega_dft_rel_ev[ik, ib],
+										)
+								sigma_x_diag_ev = np.diagonal(np.asarray(sigma_x_bare_kij), axis1=1, axis2=2) * ryd2ev
+								sigma_c_at_dft_ev = sigma_c_at_dft_from_file
+								sigma_xc_at_dft_ev = sigma_x_diag_ev + sigma_c_at_dft_ev
+								if "omega_dft_rel_ev" in h5:
+									del h5["omega_dft_rel_ev"]
+								if "sigma_c_at_dft_ev" in h5:
+									del h5["sigma_c_at_dft_ev"]
+								if "sigma_xc_at_dft_ev" in h5:
+									del h5["sigma_xc_at_dft_ev"]
+								h5.create_dataset("omega_dft_rel_ev", data=np.asarray(omega_dft_rel_ev, dtype=np.float64))
+								h5.create_dataset("sigma_c_at_dft_ev", data=np.asarray(sigma_c_at_dft_ev, dtype=np.complex128))
+								h5.create_dataset("sigma_xc_at_dft_ev", data=np.asarray(sigma_xc_at_dft_ev, dtype=np.complex128))
+								h5.attrs["sigma_at_dft_energies"] = True
+								h5.attrs["fermi_reference"] = str(fermi_reference)
+								h5.attrs["efermi_dft_ev"] = float(efermi_dft_ev)
+								h5.attrs["vbm_dft_ev"] = float(vbm_dft_ev)
+								h5.attrs["cbm_dft_ev"] = float(cbm_dft_ev) if cbm_dft_ev is not None else np.nan
+							in_grid = (
+								(np.asarray(omega_dft_rel_ev) >= float(np.min(omega_grid_ev))) &
+								(np.asarray(omega_dft_rel_ev) <= float(np.max(omega_grid_ev)))
+							)
+							n_in = int(np.count_nonzero(in_grid))
+							n_tot = int(in_grid.size)
+							print0(
+								f"  Sigma(E_DFT) in-grid states: {n_in}/{n_tot} "
+								f"within [{float(np.min(omega_grid_ev)):.3f}, {float(np.max(omega_grid_ev)):.3f}] eV"
+							)
+					elif sigma_omega.sigma_kij_h5_path:
+						# Stream Σ_c(kij,ω) from disk to avoid holding full Nω in memory.
+						with h5py.File(sigma_omega.sigma_kij_h5_path, "r") as h5_in:
+							dset_c = h5_in["sigma_c_kij_ry"]
+							n_omega = int(dset_c.shape[0])
+							nk = int(dset_c.shape[1])
+							nb = int(dset_c.shape[2])
+							o_chunks = max(1, min(sigma_omega_batch_size, n_omega))
+							chunks = (o_chunks, max(1, min(4, nk)), nb, nb)
+							with h5py.File(sigma_omega_h5_path, "w") as h5_out:
+								h5_out.create_dataset("omega_ev", data=np.asarray(omega_grid_ev, dtype=np.float64))
+								dset_total = h5_out.create_dataset(
+									"sigma_total_kij_ev",
+									shape=dset_c.shape,
+									dtype=np.complex128,
+									chunks=chunks,
+								)
+								dset_c_ev = h5_out.create_dataset(
+									"sigma_c_kij_ev",
+									shape=dset_c.shape,
+									dtype=np.complex128,
+									chunks=chunks,
+								)
+								h5_out.create_dataset("sigma_sx_kij_ev", data=ryd2ev * np.array(sigma_sx_kbar_ij_jax))
+								h5_out.create_dataset("hartree_kij_ev", data=ryd2ev * np.array(hartree_kbar_ij_jax))
+								for ibeg in range(0, n_omega, o_chunks):
+									iend = min(ibeg + o_chunks, n_omega)
+									idx = slice(ibeg, iend)
+									sigma_c_ev = ryd2ev * np.array(dset_c[idx], dtype=np.complex128)
+									dset_c_ev[idx] = sigma_c_ev
+									sigma_total_ev = (
+										sigma_c_ev
+										+ ryd2ev * np.array(sigma_sx_kbar_ij_jax)[None, ...]
+										+ ryd2ev * np.array(hartree_kbar_ij_jax)[None, ...]
+									)
+									dset_total[idx] = sigma_total_ev
 			if sigma_omega.sigma_munu_h5_path:
 				sigma_munu_stream_path = sigma_omega.sigma_munu_h5_path
 				with h5py.File(sigma_omega_h5_path, "a") as h5:

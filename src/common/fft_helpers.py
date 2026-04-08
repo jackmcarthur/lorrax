@@ -1,8 +1,8 @@
 import math
-from functools import partial
 
 import jax.numpy as jnp
-from jax.sharding import Mesh, PartitionSpec as P
+from jax.experimental.custom_partitioning import custom_partitioning
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 
 
@@ -61,6 +61,143 @@ def compute_block_size_for_2d_cholesky(n_rmu: int, Pr: int, Pc: int) -> tuple[in
 # shard_map based FFT - runs FFT independently on each device's local data
 # See: https://docs.jax.dev/en/latest/notebooks/shard_map.html
 # ============================================================================
+
+
+def _normalize_local_fft_axes(rank: int, axes: tuple[int, ...]) -> tuple[int, ...]:
+    normalized = tuple(ax if ax >= 0 else rank + ax for ax in axes)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"FFT axes must be unique, got {axes}.")
+    if any(ax < 0 or ax >= rank for ax in normalized):
+        raise ValueError(f"FFT axes {axes} out of bounds for rank-{rank} array.")
+    return normalized
+
+
+def _validate_local_fft_specs(in_spec: P, out_spec: P, axes: tuple[int, ...]) -> tuple[int, ...]:
+    in_axes = tuple(in_spec)
+    out_axes = tuple(out_spec)
+    if len(in_axes) != len(out_axes):
+        raise ValueError(
+            f"Input/output PartitionSpecs must have the same rank, got {in_spec} and {out_spec}."
+        )
+    fft_axes = _normalize_local_fft_axes(len(in_axes), axes)
+    for ax in fft_axes:
+        if in_axes[ax] is not None or out_axes[ax] is not None:
+            raise ValueError(
+                "Jittable local FFT helpers require every transformed axis to be replicated. "
+                f"Axis {ax} is sharded in in_spec={in_spec}, out_spec={out_spec}."
+            )
+    return fft_axes
+
+
+def _make_jittable_local_fft(
+    mesh: Mesh,
+    in_spec: P,
+    out_spec: P,
+    *,
+    fft_kind: str,
+    norm: str | None,
+    axes: tuple[int, ...],
+):
+    """Return a jit-compatible FFT that preserves sharding on replicated FFT axes."""
+
+    del mesh  # The active mesh is supplied to the partition callback during tracing.
+    fft_axes = _validate_local_fft_specs(in_spec, out_spec, axes)
+    if fft_kind not in ("ifftn", "fftn"):
+        raise ValueError(f"Unsupported fft_kind={fft_kind!r}")
+
+    def _make_axis_wrapper(axis: int):
+        def fft_impl(x):
+            n_axis = x.shape[axis]
+            if fft_kind == "ifftn":
+                raw = jnp.conj(jnp.fft.fft(jnp.conj(x), axis=axis))
+                if norm in (None, "backward"):
+                    return raw / float(n_axis)
+                if norm == "ortho":
+                    return raw / jnp.sqrt(float(n_axis))
+                if norm == "forward":
+                    return raw
+            else:
+                raw = jnp.fft.fft(x, axis=axis)
+                if norm in (None, "backward"):
+                    return raw
+                if norm == "ortho":
+                    return raw / jnp.sqrt(float(n_axis))
+                if norm == "forward":
+                    return raw / float(n_axis)
+            raise ValueError(f"Unsupported FFT norm={norm!r}")
+
+        @custom_partitioning
+        def _local_fft_axis(x):
+            return fft_impl(x)
+
+        def _partition(mesh_arg: Mesh, arg_shapes, result_shape):
+            del arg_shapes, result_shape
+            return (
+                mesh_arg,
+                fft_impl,
+                NamedSharding(mesh_arg, out_spec),
+                (NamedSharding(mesh_arg, in_spec),),
+            )
+
+        def _infer(mesh_arg: Mesh, arg_shapes, result_shape):
+            del arg_shapes, result_shape
+            return NamedSharding(mesh_arg, out_spec)
+
+        _local_fft_axis.def_partition(
+            infer_sharding_from_operands=_infer,
+            partition=_partition,
+            sharding_rule="...i -> ...i",
+        )
+        return _local_fft_axis
+
+    axis_wrappers = [_make_axis_wrapper(axis) for axis in fft_axes]
+
+    def _local_fft(x):
+        for fft_axis in axis_wrappers:
+            x = fft_axis(x)
+        return x
+
+    return _local_fft
+
+
+def make_jittable_local_ifftn_3d(
+    mesh: Mesh,
+    in_spec: P,
+    out_spec: P,
+    *,
+    norm: str | None = None,
+    axes: tuple[int, int, int] = (-3, -2, -1),
+):
+    """Create a jit-compatible local IFFT over replicated FFT axes."""
+
+    return _make_jittable_local_fft(
+        mesh,
+        in_spec,
+        out_spec,
+        fft_kind="ifftn",
+        norm=norm,
+        axes=axes,
+    )
+
+
+def make_jittable_local_fftn_3d(
+    mesh: Mesh,
+    in_spec: P,
+    out_spec: P,
+    *,
+    norm: str | None = None,
+    axes: tuple[int, int, int] = (-3, -2, -1),
+):
+    """Create a jit-compatible local FFT over replicated FFT axes."""
+
+    return _make_jittable_local_fft(
+        mesh,
+        in_spec,
+        out_spec,
+        fft_kind="fftn",
+        norm=norm,
+        axes=axes,
+    )
 
 def make_sharded_ifftn_3d(
 	mesh: Mesh,

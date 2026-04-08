@@ -112,7 +112,7 @@ def build_ppm_sigma_runtime_options(params: dict, *, input_dir: str, ryd2ev: flo
     sigma_debug_quadrature_samples = int(params.get("sigma_debug_quadrature_samples", 200))
     sigma_munu_h5_path = str(params.get("sigma_munu_h5_file", "") or "").strip()
     sigma_kij_h5_path = str(params.get("sigma_kij_h5_file", "") or "").strip()
-    write_w_copies_debug = bool(params.get("write_w_copies_debug", True))
+    write_w_copies_debug = bool(params.get("write_w_copies_debug", False))
     w_copies_debug_file = str(params.get("w_copies_debug_file", "w_copies_debug.h5") or "").strip()
     sigma_freq_debug_file = str(params.get("sigma_freq_debug_file", "sigma_freq_debug.dat") or "").strip()
 
