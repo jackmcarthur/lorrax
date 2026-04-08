@@ -363,9 +363,9 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
         return chi_R_acc + prefactor_scalar * chi_tau
 
     @jax.jit
-    def _chi_R_to_q(chi_R_final):
-        chi_q = sharded_fftn_chi(chi_R_final)
-        chi_q = chi_q.transpose(2, 3, 4, 0, 1)[:, :, :, None, :, None, :]
+    def _chi_R_reshape(chi_R_q):
+        """Reshape chi from (μ,ν,nkx,nky,nkz) → (nkx,nky,nkz,1,μ,1,ν)."""
+        chi_q = chi_R_q.transpose(2, 3, 4, 0, 1)[:, :, :, None, :, None, :]
         return jax.lax.with_sharding_constraint(chi_q, chi_out)
 
     def _chi_kernel(
@@ -409,7 +409,9 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
                 chi_R_acc, Gv_R, Gc_mR, prefactor_i[itau])
             del Gv_R, Gc_mR
 
-        return _chi_R_to_q(chi_R_acc)
+        # Final R→q FFT: eager shard_map, then JIT'd reshape
+        chi_R_q = sharded_fftn_chi(chi_R_acc)
+        return _chi_R_reshape(chi_R_q)
 
     _chi_minimax_kernel_cache[cache_key] = _chi_kernel
     return _chi_kernel
