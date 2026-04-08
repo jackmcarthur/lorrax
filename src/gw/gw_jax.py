@@ -1233,39 +1233,77 @@ def main(argv=None):
 	Gij_shard = NamedSharding(mesh_xy, P(None, None, None))
 	Gij_static = jax.device_put(Gij_static, Gij_shard)
 
-	# Shard_map FFT helpers for G(k→R) and Σ(R→k) inside the sigma pipeline.
-	# These are shard_map closures passed INTO the JIT'd pipeline.
-	# shard_map inside @jax.jit works for chi0 on 16 GPUs; test for sigma too.
+	# Shard_map FFT helpers for G(k→R) and Σ(R→k).
+	# Called EAGERLY between small JIT'd phases — large JIT graphs with
+	# shard_map hang during SPMD compilation on 16+ GPUs.
 	from common.fft_helpers import make_sharded_ifftn_3d, make_sharded_fftn_3d
 	_G_spec = P(None, 'x', None, 'y', None, None, None)
 	_sharded_ifftn_G = make_sharded_ifftn_3d(mesh_xy, _G_spec, _G_spec, norm='ortho', axes=(4, 5, 6))
 	_sharded_fftn_G = make_sharded_fftn_3d(mesh_xy, _G_spec, _G_spec, norm='ortho', axes=(4, 5, 6))
 
-	# JIT the pipeline with shard_map FFTs passed as closure-captured helpers.
+	nkx_s, nky_s, nkz_s = meta.nkx, meta.nky, meta.nkz
+
+	# Small JIT'd phases for the split sigma pipeline
+	@jax.jit
+	def _build_G_k_jit(psi_XT, psi_Y, Gij):
+		G_k = get_G_mu_nu_jax(psi_XT, psi_Y, Gij)
+		G_7d = G_k.transpose(1,2,3,4,0).reshape(
+			G_k.shape[1], G_k.shape[2], G_k.shape[3], G_k.shape[4], nkx_s, nky_s, nkz_s)
+		return jax.lax.with_sharding_constraint(G_7d, P(None, 'x', None, 'y', None, None, None))
+
+	@jax.jit
+	def _build_GRI_k_jit(psi_XT, psi_Y):
+		G_k = get_G_mu_nu_RI(psi_XT, psi_Y)
+		G_7d = G_k.transpose(1,2,3,4,0).reshape(
+			G_k.shape[1], G_k.shape[2], G_k.shape[3], G_k.shape[4], nkx_s, nky_s, nkz_s)
+		return jax.lax.with_sharding_constraint(G_7d, P(None, 'x', None, 'y', None, None, None))
+
+	@jax.jit
+	def _sigma_R_jit(G_R, W_or_V, nk_tot):
+		V_R = W_or_V[None, :, None, :, :, :, :]
+		V_R_fft = jnp.fft.ifftn(V_R, axes=(4,5,6), norm='ortho')
+		sigma_R = G_R * V_R_fft * (-1.0 / jnp.sqrt(nk_tot))
+		return jax.lax.with_sharding_constraint(sigma_R, P(None, 'x', None, 'y', None, None, None))
+
+	@jax.jit
+	def _project_jit(psi_X, psi_TY, sigma_k):
+		return get_sigma_static_kij_jax(psi_X, psi_TY, sigma_k)
+
+	@jax.jit
+	def _hartree_jit(psi_Y, Gij, V0, psi_X, nk_tot):
+		rho = build_density_from_Gij(psi_Y, Gij, nk_tot)
+		Vrho = build_hartree_potential(rho, V0)
+		return project_potential_to_bands(psi_X, Vrho)
+
+	@jax.jit
+	def _sub(a, b):
+		return a - b
+
 	def pipeline_fn(
 		psi_lT, psi_l, psi_cohT, psi_coh, psi_proj, psi_projT,
 		W, V, V0, Gij,
 		nkx, nky, nkz, nk_tot, nspinor, fft_vol_au, bispinor,
 	):
-		return compute_sigma_pipeline_jax(
-			psi_lT, psi_l, psi_cohT, psi_coh, psi_proj, psi_projT,
-			W, V, V0, Gij,
-			nkx, nky, nkz, nk_tot, nspinor, fft_vol_au, bispinor,
-			sharded_ifftn=_sharded_ifftn_G,
-			sharded_fftn=_sharded_fftn_G,
-		)
-	pipeline_fn = jax.jit(
-		pipeline_fn,
-		static_argnames=('nkx', 'nky', 'nkz', 'nk_tot', 'nspinor', 'fft_vol_au', 'bispinor'),
-		in_shardings=(
-			sh.XT_shard, sh.Y_shard,
-			sh.XT_shard, sh.Y_shard,
-			sh.X_shard, sh.YT_shard,
-			sh.V_shard, sh.V_shard,
-			sh.xy_shard, Gij_shard,
-		),
-		out_shardings=(sh.out_shard, sh.out_shard, sh.out_shard),
-	)
+		"""Split sigma: small JITs + eager shard_map FFTs between phases."""
+		# SX
+		G_7d = _build_G_k_jit(psi_lT, psi_l, Gij)
+		G_R = _sharded_ifftn_G(G_7d); del G_7d
+		sigma_sx_R = _sigma_R_jit(G_R, W, nk_tot); del G_R
+		sigma_sx_k = _sharded_fftn_G(sigma_sx_R); del sigma_sx_R
+		sigma_sx_kij = _project_jit(psi_proj, psi_projT, sigma_sx_k); del sigma_sx_k
+
+		# COH
+		G_7d = _build_GRI_k_jit(psi_cohT, psi_coh)
+		G_RI_R = _sharded_ifftn_G(G_7d); del G_7d
+		WmV = _sub(W, V)
+		sigma_coh_R = _sigma_R_jit(G_RI_R, WmV, nk_tot); del G_RI_R, WmV
+		sigma_coh_k = _sharded_fftn_G(sigma_coh_R); del sigma_coh_R
+		sigma_coh_kij = -0.5 * _project_jit(psi_proj, psi_projT, sigma_coh_k); del sigma_coh_k
+
+		# Hartree
+		hartree_kmn = _hartree_jit(psi_l, Gij, V0, psi_proj, nk_tot)
+
+		return sigma_sx_kij, sigma_coh_kij, hartree_kmn
 
 	fft_vol_au = float(wfn.cell_volume / np.prod(wfn.fft_grid))
 
