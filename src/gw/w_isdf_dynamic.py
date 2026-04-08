@@ -75,6 +75,12 @@ def _register_mesh_shardings(mesh_xy: Mesh | None) -> str | int:
             "chiR": NamedSharding(mesh_xy, P('x', 'y', None, None, None)),
             "gv": NamedSharding(mesh_xy, P(None, None, 'x', None, 'y')),
             "gc": NamedSharding(mesh_xy, P(None, None, 'y', None, 'x')),
+            # 7D shardings after k-grid reshape: (nkx,nky,nkz, ns,μ,ns,ν)
+            "gv_7d": NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y')),
+            "gc_7d": NamedSharding(mesh_xy, P(None, None, None, None, 'y', None, 'x')),
+            # Transposed shardings: (ns,μ,ns,ν, nkx,nky,nkz)
+            "gv_t": NamedSharding(mesh_xy, P(None, 'x', None, 'y', None, None, None)),
+            "gc_t": NamedSharding(mesh_xy, P(None, 'y', None, 'x', None, None, None)),
         }
     return key
 
@@ -221,6 +227,10 @@ def _get_chi_kernel_windowed(mesh_key, nkx: int, nky: int, nkz: int, max_val_len
     chiR_shard = shards["chiR"]
     gv_shard = shards["gv"]
     gc_shard = shards["gc"]
+    gv_7d_shard = shards["gv_7d"]
+    gc_7d_shard = shards["gc_7d"]
+    gv_t_shard = shards["gv_t"]
+    gc_t_shard = shards["gc_t"]
 
     @partial(
         jax.jit,
@@ -263,13 +273,21 @@ def _get_chi_kernel_windowed(mesh_key, nkx: int, nky: int, nkz: int, max_val_len
 
         quad_w = -2.0 * z_lm * w_i * jnp.exp(-(z_lm * (cmin - vmax) - 1.0) * tau_i)
 
-        def _k_to_R(g_k: jax.Array, flip_sign: bool) -> jax.Array:
-            g_fft = g_k.reshape(nkx, nky, nkz, *g_k.shape[1:]).transpose(3, 4, 5, 6, 0, 1, 2)
+        def _k_to_R(g_k: jax.Array, flip_sign: bool, is_gv: bool = True) -> jax.Array:
+            """k→R FFT with sharding constraints. See CHANGELOG 2026-04-07.
+            NOTE: constraints inside fori_loop may be ignored by XLA;
+            convert to Python loop for large-scale multi-GPU runs."""
+            s7 = gv_7d_shard if is_gv else gc_7d_shard
+            st = gv_t_shard if is_gv else gc_t_shard
+            g_7d = g_k.reshape(nkx, nky, nkz, *g_k.shape[1:])
+            g_7d = jax.lax.with_sharding_constraint(g_7d, s7)
+            g_t = g_7d.transpose(3, 4, 5, 6, 0, 1, 2)
+            g_t = jax.lax.with_sharding_constraint(g_t, st)
             return jax.lax.cond(
                 flip_sign,
                 lambda x: jnp.fft.fftn(x, axes=(-3, -2, -1), norm='ortho'),
                 lambda x: jnp.fft.ifftn(x, axes=(-3, -2, -1), norm='ortho'),
-                g_fft,
+                g_t,
             )
 
         def tau_body(itau, chi_R_acc):
@@ -282,8 +300,8 @@ def _get_chi_kernel_windowed(mesh_key, nkx: int, nky: int, nkz: int, max_val_len
             Gc_k = jnp.einsum('ksxm,km,kmty->ksxty', jnp.conj(psi_cTY_win), w_c, psi_cX_win, optimize=True)
             Gv_k = jax.lax.with_sharding_constraint(Gv_k, gv_shard)
             Gc_k = jax.lax.with_sharding_constraint(Gc_k, gc_shard)
-            Gv_R = _k_to_R(Gv_k, flip_sign=False)
-            Gc_R = _k_to_R(Gc_k, flip_sign=True)
+            Gv_R = _k_to_R(Gv_k, flip_sign=False, is_gv=True)
+            Gc_R = _k_to_R(Gc_k, flip_sign=True, is_gv=False)
             chi_tau = jnp.einsum('ambnxyz, bnamxyz-> mnxyz', Gc_R, Gv_R, optimize=True)
             return chi_R_acc + quad_w[itau] * chi_tau
 
@@ -315,6 +333,10 @@ def _get_chi_hgl_kernel(mesh_key, nkx: int, nky: int, nkz: int, max_val_len: int
     chiR_shard = shards["chiR"]
     gv_shard = shards["gv"]
     gc_shard = shards["gc"]
+    gv_7d_shard = shards["gv_7d"]
+    gc_7d_shard = shards["gc_7d"]
+    gv_t_shard = shards["gv_t"]
+    gc_t_shard = shards["gc_t"]
 
     @partial(
         jax.jit,
@@ -354,13 +376,21 @@ def _get_chi_hgl_kernel(mesh_key, nkx: int, nky: int, nkz: int, max_val_len: int
         val_mask_complex = val_mask.astype(jnp.complex128)
         cond_mask_complex = cond_mask.astype(jnp.complex128)
 
-        def _k_to_R(g_k: jax.Array, flip_sign: bool) -> jax.Array:
-            g_fft = g_k.reshape(nkx, nky, nkz, *g_k.shape[1:]).transpose(3, 4, 5, 6, 0, 1, 2)
+        def _k_to_R(g_k: jax.Array, flip_sign: bool, is_gv: bool = True) -> jax.Array:
+            """k→R FFT with sharding constraints. See CHANGELOG 2026-04-07.
+            NOTE: constraints inside fori_loop may be ignored by XLA;
+            convert to Python loop for large-scale multi-GPU runs."""
+            s7 = gv_7d_shard if is_gv else gc_7d_shard
+            st = gv_t_shard if is_gv else gc_t_shard
+            g_7d = g_k.reshape(nkx, nky, nkz, *g_k.shape[1:])
+            g_7d = jax.lax.with_sharding_constraint(g_7d, s7)
+            g_t = g_7d.transpose(3, 4, 5, 6, 0, 1, 2)
+            g_t = jax.lax.with_sharding_constraint(g_t, st)
             return jax.lax.cond(
                 flip_sign,
                 lambda x: jnp.fft.fftn(x, axes=(-3, -2, -1), norm='ortho'),
                 lambda x: jnp.fft.ifftn(x, axes=(-3, -2, -1), norm='ortho'),
-                g_fft,
+                g_t,
             )
 
         phase_v = jnp.exp(1j * gamma * tau * enk_v_win) * val_mask_complex
@@ -369,8 +399,8 @@ def _get_chi_hgl_kernel(mesh_key, nkx: int, nky: int, nkz: int, max_val_len: int
         Gc_k = jnp.einsum('ksxm,km,kmty->ksxty', jnp.conj(psi_cTY_win), phase_c, psi_cX_win, optimize=True)
         Gv_k = jax.lax.with_sharding_constraint(Gv_k, gv_shard)
         Gc_k = jax.lax.with_sharding_constraint(Gc_k, gc_shard)
-        Gv_R = _k_to_R(Gv_k, flip_sign=False)
-        Gc_mR = _k_to_R(Gc_k, flip_sign=True)
+        Gv_R = _k_to_R(Gv_k, flip_sign=False, is_gv=True)
+        Gc_mR = _k_to_R(Gc_k, flip_sign=True, is_gv=False)
         product_R = jnp.einsum('ambnxyz, bnamxyz-> mnxyz', jnp.conj(Gc_mR), Gv_R, optimize=True)
         P_plus_R = product_R.real
         P_cross_R = -product_R.imag
@@ -401,6 +431,10 @@ def _get_chi_omega_gl_kernel(mesh_key, nkx: int, nky: int, nkz: int, max_val_len
     chiR_shard = shards["chiR"]
     gv_shard = shards["gv"]
     gc_shard = shards["gc"]
+    gv_7d_shard = shards["gv_7d"]
+    gc_7d_shard = shards["gc_7d"]
+    gv_t_shard = shards["gv_t"]
+    gc_t_shard = shards["gc_t"]
 
     @partial(
         jax.jit,
@@ -447,13 +481,21 @@ def _get_chi_omega_gl_kernel(mesh_key, nkx: int, nky: int, nkz: int, max_val_len
         E_gap_eff = E_gap + omega_shift_sign * omega
         quad_w = overall_sign * gamma * w_i * jnp.exp(-(gamma * E_gap_eff - 1.0) * tau_i)
 
-        def _k_to_R(g_k: jax.Array, flip_sign: bool) -> jax.Array:
-            g_fft = g_k.reshape(nkx, nky, nkz, *g_k.shape[1:]).transpose(3, 4, 5, 6, 0, 1, 2)
+        def _k_to_R(g_k: jax.Array, flip_sign: bool, is_gv: bool = True) -> jax.Array:
+            """k→R FFT with sharding constraints. See CHANGELOG 2026-04-07.
+            NOTE: constraints inside fori_loop may be ignored by XLA;
+            convert to Python loop for large-scale multi-GPU runs."""
+            s7 = gv_7d_shard if is_gv else gc_7d_shard
+            st = gv_t_shard if is_gv else gc_t_shard
+            g_7d = g_k.reshape(nkx, nky, nkz, *g_k.shape[1:])
+            g_7d = jax.lax.with_sharding_constraint(g_7d, s7)
+            g_t = g_7d.transpose(3, 4, 5, 6, 0, 1, 2)
+            g_t = jax.lax.with_sharding_constraint(g_t, st)
             return jax.lax.cond(
                 flip_sign,
                 lambda x: jnp.fft.fftn(x, axes=(-3, -2, -1), norm='ortho'),
                 lambda x: jnp.fft.ifftn(x, axes=(-3, -2, -1), norm='ortho'),
-                g_fft,
+                g_t,
             )
 
         def tau_body(itau, chi_R_acc):
@@ -466,8 +508,8 @@ def _get_chi_omega_gl_kernel(mesh_key, nkx: int, nky: int, nkz: int, max_val_len
             Gc_k = jnp.einsum('ksxm,km,kmty->ksxty', jnp.conj(psi_cTY_win), w_c, psi_cX_win, optimize=True)
             Gv_k = jax.lax.with_sharding_constraint(Gv_k, gv_shard)
             Gc_k = jax.lax.with_sharding_constraint(Gc_k, gc_shard)
-            Gv_R = _k_to_R(Gv_k, flip_sign=False)
-            Gc_R = _k_to_R(Gc_k, flip_sign=True)
+            Gv_R = _k_to_R(Gv_k, flip_sign=False, is_gv=True)
+            Gc_R = _k_to_R(Gc_k, flip_sign=True, is_gv=False)
             chi_tau = jnp.einsum('ambnxyz, bnamxyz-> mnxyz', Gc_R, Gv_R, optimize=True)
             return chi_R_acc + quad_w[itau] * chi_tau
 
@@ -499,6 +541,10 @@ def _get_chi_omega_gl_reverse_kernel(mesh_key, nkx: int, nky: int, nkz: int, max
     chiR_shard = shards["chiR"]
     gv_shard = shards["gv"]
     gc_shard = shards["gc"]
+    gv_7d_shard = shards["gv_7d"]
+    gc_7d_shard = shards["gc_7d"]
+    gv_t_shard = shards["gv_t"]
+    gc_t_shard = shards["gc_t"]
 
     @partial(
         jax.jit,
@@ -543,13 +589,21 @@ def _get_chi_omega_gl_reverse_kernel(mesh_key, nkx: int, nky: int, nkz: int, max
         E_bw = cmax - vmin
         quad_w = gamma * w_i * jnp.exp(-(gamma * (omega - E_bw) - 1.0) * tau_i)
 
-        def _k_to_R(g_k: jax.Array, flip_sign: bool) -> jax.Array:
-            g_fft = g_k.reshape(nkx, nky, nkz, *g_k.shape[1:]).transpose(3, 4, 5, 6, 0, 1, 2)
+        def _k_to_R(g_k: jax.Array, flip_sign: bool, is_gv: bool = True) -> jax.Array:
+            """k→R FFT with sharding constraints. See CHANGELOG 2026-04-07.
+            NOTE: constraints inside fori_loop may be ignored by XLA;
+            convert to Python loop for large-scale multi-GPU runs."""
+            s7 = gv_7d_shard if is_gv else gc_7d_shard
+            st = gv_t_shard if is_gv else gc_t_shard
+            g_7d = g_k.reshape(nkx, nky, nkz, *g_k.shape[1:])
+            g_7d = jax.lax.with_sharding_constraint(g_7d, s7)
+            g_t = g_7d.transpose(3, 4, 5, 6, 0, 1, 2)
+            g_t = jax.lax.with_sharding_constraint(g_t, st)
             return jax.lax.cond(
                 flip_sign,
                 lambda x: jnp.fft.fftn(x, axes=(-3, -2, -1), norm='ortho'),
                 lambda x: jnp.fft.ifftn(x, axes=(-3, -2, -1), norm='ortho'),
-                g_fft,
+                g_t,
             )
 
         def tau_body(itau, chi_R_acc):
@@ -562,8 +616,8 @@ def _get_chi_omega_gl_reverse_kernel(mesh_key, nkx: int, nky: int, nkz: int, max
             Gc_k = jnp.einsum('ksxm,km,kmty->ksxty', jnp.conj(psi_cTY_win), w_c, psi_cX_win, optimize=True)
             Gv_k = jax.lax.with_sharding_constraint(Gv_k, gv_shard)
             Gc_k = jax.lax.with_sharding_constraint(Gc_k, gc_shard)
-            Gv_R = _k_to_R(Gv_k, flip_sign=False)
-            Gc_R = _k_to_R(Gc_k, flip_sign=True)
+            Gv_R = _k_to_R(Gv_k, flip_sign=False, is_gv=True)
+            Gc_R = _k_to_R(Gc_k, flip_sign=True, is_gv=False)
             chi_tau = jnp.einsum('ambnxyz, bnamxyz-> mnxyz', Gc_R, Gv_R, optimize=True)
             return chi_R_acc + quad_w[itau] * chi_tau
 
