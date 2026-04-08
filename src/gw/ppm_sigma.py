@@ -313,8 +313,6 @@ def _get_sigma_tau_channel_kernel(
         int(nk_tot),
         bool(bispinor),
         id(get_G_mu_nu_fn),
-        id(get_G_R_fn),
-        id(get_sigma_mu_nu_fn),
         id(get_sigma_kij_channels_fn),
     )
     if cache_key in _sigma_tau_channel_kernel_cache:
@@ -823,6 +821,14 @@ def _convolve_sigma_branch_kij(
     if not windows:
         return jnp.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), windows
 
+    if _bprof:
+        n_nodes_total = int(sum(int(win.alpha.shape[0]) for win in windows))
+        print0(
+            f"  [TIMING-BRANCH] {log_tag} windows built: "
+            f"count={len(windows)}, total_nodes={n_nodes_total}, "
+            f"kernel_sign={kernel_sign:+d}, axis={axis_kind or 'unknown'}"
+        )
+
     if debug_quadrature:
         nsamp = max(50, int(debug_quadrature_samples))
         for win in windows:
@@ -924,6 +930,9 @@ def _convolve_sigma_branch_kij(
     _prof_t = {"tau_channel": 0.0, "omega_acc": 0.0, "total": 0.0}
     _prof_n = 0
     _prof_total_start = _time.perf_counter()
+    _first_tau_traced = False
+    _first_tau_logged = False
+    _first_omega_logged = False
 
     branch_label = log_tag if log_tag else f"kernel_sign={kernel_sign:+d}"
     with jax_profile.annotation(f"sigma_branch[{branch_label}]"):
@@ -943,26 +952,53 @@ def _convolve_sigma_branch_kij(
                 if acc_total is not None:
                     acc_win = jnp.zeros_like(acc_total)
 
-                for t_node, alpha_node in zip(win.t_nodes, win.alpha):
+                for tau_idx, (t_node, alpha_node) in enumerate(zip(win.t_nodes, win.alpha)):
                     if _prof_enabled:
                         _t0 = _time.perf_counter()
+                        if not _first_tau_logged:
+                            print0(
+                                f"  [TIMING-BRANCH] {log_tag} first tau start: "
+                                f"window={win.name}, tau_idx={tau_idx}, "
+                                f"nodes={int(win.alpha.shape[0])}, project={win.project}"
+                            )
+                            _first_tau_logged = True
                     t_node_j = jnp.asarray(t_node, dtype=jnp.complex128)
-                    with mesh_xy:
-                        sigma_tau_kij_ri = tau_channel_step(
-                            psi_coh_rmuT_X,
-                            psi_coh_rmu_Y,
-                            psi_proj_rmu_X,
-                            psi_proj_rmuT_Y,
-                            E_A,
-                            mask_A,
-                            B_mu_nu,
-                            Omega_mu_nu,
-                            mask_B,
-                            E_ref_A_j,
-                            E_ref_B_j,
-                            t_node_j,
-                            eye_nb,
-                        )
+                    if _prof_enabled and not _first_tau_traced:
+                        with jax_profile.trace_section("ppm_sigma_first_tau"):
+                            with mesh_xy:
+                                sigma_tau_kij_ri = tau_channel_step(
+                                    psi_coh_rmuT_X,
+                                    psi_coh_rmu_Y,
+                                    psi_proj_rmu_X,
+                                    psi_proj_rmuT_Y,
+                                    E_A,
+                                    mask_A,
+                                    B_mu_nu,
+                                    Omega_mu_nu,
+                                    mask_B,
+                                    E_ref_A_j,
+                                    E_ref_B_j,
+                                    t_node_j,
+                                    eye_nb,
+                                )
+                        _first_tau_traced = True
+                    else:
+                        with mesh_xy:
+                            sigma_tau_kij_ri = tau_channel_step(
+                                psi_coh_rmuT_X,
+                                psi_coh_rmu_Y,
+                                psi_proj_rmu_X,
+                                psi_proj_rmuT_Y,
+                                E_A,
+                                mask_A,
+                                B_mu_nu,
+                                Omega_mu_nu,
+                                mask_B,
+                                E_ref_A_j,
+                                E_ref_B_j,
+                                t_node_j,
+                                eye_nb,
+                            )
                     sigma_tau_kij_re = sigma_tau_kij_ri[0]
                     sigma_tau_kij_im = sigma_tau_kij_ri[1]
                     if _prof_enabled:
@@ -971,6 +1007,11 @@ def _convolve_sigma_branch_kij(
                         _t1 = _time.perf_counter()
                         _prof_t["tau_channel"] += _t1 - _t0
                         _t4 = _t1
+                        if _prof_n == 0:
+                            print0(
+                                f"  [TIMING-BRANCH] {log_tag} first tau returned: "
+                                f"{_t1 - _t0:.3f}s"
+                            )
                     if debug_quadrature:
                         re_mag = float(jnp.max(jnp.abs(sigma_tau_kij_re)))
                         im_mag = float(jnp.max(jnp.abs(sigma_tau_kij_im)))
@@ -981,6 +1022,11 @@ def _convolve_sigma_branch_kij(
                     omega_sign_j = jnp.asarray(omega_sign, dtype=jnp.float64)
                     pref = jnp.asarray(win.prefactor * scale, dtype=jnp.float64)
                     if acc_win is not None:
+                        if _prof_enabled and not _first_omega_logged:
+                            print0(
+                                f"  [TIMING-BRANCH] {log_tag} first omega_acc start: "
+                                f"window={win.name}, tau_idx={tau_idx}, Nω={n_omega}"
+                            )
                         acc_win = _accumulate_window_channels_jit(
                             acc_win,
                             sigma_tau_kij_re,
@@ -996,6 +1042,12 @@ def _convolve_sigma_branch_kij(
                             acc_win.block_until_ready()
                             _t5 = _time.perf_counter()
                             _prof_t["omega_acc"] += _t5 - _t4
+                            if not _first_omega_logged:
+                                print0(
+                                    f"  [TIMING-BRANCH] {log_tag} first omega_acc returned: "
+                                    f"{_t5 - _t4:.3f}s"
+                                )
+                                _first_omega_logged = True
                     _prof_n += 1
                     if acc_win is None:
                         # Stream in omega chunks without repeating τ-node work.
@@ -1096,8 +1148,8 @@ def compute_sigma_c_ppm_omega_grid(
     ``omega_accumulation='kij_stream'`` and provide ``sigma_kij_h5_path`` to
     stream Σ_kij(ω) to disk in ω-chunks.
     """
-    if None in (get_G_mu_nu_fn, get_G_R_fn, get_sigma_mu_nu_fn, get_sigma_kij_channels_fn):
-        raise ValueError("All reusable sigma helper callables must be provided.")
+    if None in (get_G_mu_nu_fn, get_sigma_kij_channels_fn):
+        raise ValueError("get_G_mu_nu_fn and get_sigma_kij_channels_fn must be provided.")
     if quadrature_config is not None:
         target_error = float(quadrature_config.target_error)
         max_nodes = int(quadrature_config.max_nodes)
@@ -1180,9 +1232,9 @@ def compute_sigma_c_ppm_omega_grid(
         f"Nω={omega_req.size}, Δω={omega_step_ev:.3f} eV, ξ={float(regularization_width_ry * 13.6056980659):.3f} eV"
     )
     if print0 is not None:
-        occ_mask_host = np.asarray(occ_mask, dtype=bool)
-        unocc_mask_host = np.asarray(unocc_mask, dtype=bool)
-        enk_host = np.asarray(enk_full, dtype=np.float64)
+        occ_mask_host = _to_host_np(occ_mask, dtype=bool, tiled=False)
+        unocc_mask_host = _to_host_np(unocc_mask, dtype=bool, tiled=False)
+        enk_host = _to_host_np(enk_full, dtype=np.float64, tiled=False)
         if np.any(unocc_mask_host):
             ec_min = float(np.min(enk_host[unocc_mask_host]))
             ec_max = float(np.max(enk_host[unocc_mask_host]))
@@ -1322,6 +1374,12 @@ def compute_sigma_c_ppm_omega_grid(
                 omega_sign_flip_cond: int = 1,
                 omega_sign_flip_val: int = 1,
             ) -> jax.Array | None:
+                if _sg_prof:
+                    print0(
+                        f"  [TIMING-SIG] entering _convolve_kij[{tag}]: "
+                        f"Nω={int(omega_eval.size)}, cond_sign={kernel_cond:+d}, val_sign={kernel_val:+d}"
+                    )
+                    _sg_t_cond0 = _sgtime.perf_counter()
                 sigma_cond, _ = _convolve_sigma_branch_kij(
                     omega_nonneg_ry=omega_eval,
                     omega_global_idx=omega_idx,
@@ -1363,6 +1421,13 @@ def compute_sigma_c_ppm_omega_grid(
                     efermi_vac=float(efermi),
                     axis_kind="cond",
                 )
+                if _sg_prof:
+                    _sg_t_cond1 = _sgtime.perf_counter()
+                    print0(
+                        f"  [TIMING-SIG] _convolve_kij[{tag}] cond branch returned: "
+                        f"{_sg_t_cond1 - _sg_t_cond0:.3f}s"
+                    )
+                    _sg_t_val0 = _sgtime.perf_counter()
                 sigma_val, _ = _convolve_sigma_branch_kij(
                     omega_nonneg_ry=omega_eval,
                     omega_global_idx=omega_idx,
@@ -1404,6 +1469,12 @@ def compute_sigma_c_ppm_omega_grid(
                     efermi_vac=float(efermi),
                     axis_kind="val",
                 )
+                if _sg_prof:
+                    _sg_t_val1 = _sgtime.perf_counter()
+                    print0(
+                        f"  [TIMING-SIG] _convolve_kij[{tag}] val branch returned: "
+                        f"{_sg_t_val1 - _sg_t_val0:.3f}s"
+                    )
                 if use_kij_stream:
                     return None
                 if debug_split_contrib:
