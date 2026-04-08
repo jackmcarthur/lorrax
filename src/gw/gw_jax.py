@@ -1149,12 +1149,18 @@ def main(argv=None):
 						nband=nband,
 						window_builder=get_window_info,
 					)
+					# In the normal minimax + PPM-sigma workflow, screening only needs
+					# the static W(q). The dynamic W(iωp) / GN-PPM fit is recomputed in
+					# ppm_sigma.py, so skip the redundant imag-frequency continuation here.
+					screening_ppm_omega_p = screening_setup.ppm_omega_p
+					if use_ppm_sigma and screening_setup.screening_method == "minimax":
+						screening_ppm_omega_p = None
 					W_q = compute_screening(
 						V_qmunu, wf_bundle, window_pairs, meta, mesh_xy,
 						omega=screening_setup.omega_eval,
 						screening_method=screening_setup.screening_method,
 						minimax_config=screening_setup.minimax_config,
-						ppm_omega_p=screening_setup.ppm_omega_p,
+						ppm_omega_p=screening_ppm_omega_p,
 						ppm_fallback_omega=screening_setup.ppm_fallback_omega,
 						tensors_filename=tensors_filename,
 						print0=print0,
