@@ -694,49 +694,44 @@ def get_G_mu_nu_RI(psi_vTX, psi_vY):
 	G_k = jnp.einsum('ksxn,knty->ksxty', psi_vTX, jnp.conj(psi_vY), optimize=True)
 	return G_k
 
-def get_G_R_jax(G_k, nkx, nky, nkz):
-	"""Pure: (nk, s1,rmu1,s2,rmu2) -> (s1,rmu1,s2,rmu2,nkx,nky,nkz)."""
+def get_G_R_jax(G_k, nkx, nky, nkz, sharded_ifftn=None):
+	"""(nk, s1,rmu1,s2,rmu2) -> (s1,rmu1,s2,rmu2,nkx,nky,nkz).
+
+	If sharded_ifftn is provided, uses it for the FFT (shard_map, local).
+	Otherwise falls back to bare jnp.fft (works on 1 GPU, OOMs on 16).
+	"""
 	G_k = G_k.transpose(1, 2, 3, 4, 0)
-	G_k = G_k.reshape(*G_k.shape[:4], nkx, nky, nkz)  # (s1,rmu1,s2,rmu2,nkx,nky,nkz)
+	G_k = G_k.reshape(*G_k.shape[:4], nkx, nky, nkz)
 	G_k = jax.lax.with_sharding_constraint(G_k, P(None, 'x', None, 'y', None, None, None))
+	if sharded_ifftn is not None:
+		return sharded_ifftn(G_k)
 	return jnp.fft.ifftn(G_k, axes=(4,5,6), norm='ortho')
 
-def get_sigma_static_mu_nu_jax(G_R, V_mu_nu, nk_tot, bispinor=False):
-	"""Compute sigma in (s1,rmu1,s2,rmu2,nkx,nky,nkz) basis via convolution in real space.
-	
-	For nspinor=2: Σ_ab(μ,ν,R) = G_ab(μ,ν,R) * V(μ,ν,R)
-	
-	For nspinor=4 (bispinor): Uses γ⁰ Coulomb vertex:
-		Σ_ab = γ⁰_aa γ⁰_bb G_ab V
-	where γ⁰ = diag(1,1,-1,-1) in the Dirac representation.
-	This gives sign_a × sign_b × G_ab × V where sign=[1,1,-1,-1].
-	Large-large and small-small blocks get +1, cross terms get -1.
-	
-	Args:
-		G_R: (nspinor, rmu1, nspinor, rmu2, nkx, nky, nkz) Green's function in real space
-		V_mu_nu: (rmu1, rmu2, nkx, nky, nkz) Coulomb interaction
-		nk_tot: Total number of k-points for normalization
-		bispinor: If True, apply γ⁰ vertex factors for 4-component spinors
-		
-	Returns:
-		sigma_k: Same shape as G_R, self-energy in k-space
+def get_sigma_static_mu_nu_jax(G_R, V_mu_nu, nk_tot, bispinor=False,
+                               sharded_ifftn=None, sharded_fftn=None):
+	"""Compute sigma in (s1,rmu1,s2,rmu2,nkx,nky,nkz) basis via convolution.
+
+	If sharded_ifftn/sharded_fftn provided, uses them for V and sigma FFTs.
 	"""
 	V_R = V_mu_nu[None, :, None, :, :, :, :]
 	V_R = jnp.array(V_R, copy=True)
-	
-	# For bispinor case, apply γ⁰ vertex: Σ_ab = γ⁰_aa γ⁰_bb G_ab V
-	# γ⁰ = diag(1,1,-1,-1), so sign_a * sign_b gives the prefactor
+
 	if bispinor:
-		# sign[a] * sign[b] for 4-component spinors: [1,1,-1,-1]
 		gamma0_diag = jnp.array([1.0, 1.0, -1.0, -1.0], dtype=jnp.float64)
-		# Outer product gives sign_a * sign_b matrix of shape (4, 4)
-		gamma0_vertex = gamma0_diag[:, None] * gamma0_diag[None, :]  # (4,4)
-		# Broadcast to G_R shape: (s1, 1, s2, 1, 1, 1, 1)
+		gamma0_vertex = gamma0_diag[:, None] * gamma0_diag[None, :]
 		gamma0_vertex = gamma0_vertex[:, None, :, None, None, None, None]
 		G_R = G_R * gamma0_vertex
-	
-	sigma_R = G_R * jnp.fft.ifftn(V_R, axes=(4,5,6), norm='ortho') * (-1.0 / jnp.sqrt(nk_tot))
+
+	if sharded_ifftn is not None:
+		V_R_fft = sharded_ifftn(V_R)
+	else:
+		V_R_fft = jnp.fft.ifftn(V_R, axes=(4,5,6), norm='ortho')
+
+	sigma_R = G_R * V_R_fft * (-1.0 / jnp.sqrt(nk_tot))
 	sigma_R = jax.lax.with_sharding_constraint(sigma_R, P(None, 'x', None, 'y', None, None, None))
+
+	if sharded_fftn is not None:
+		return sharded_fftn(sigma_R)
 	return jnp.fft.fftn(sigma_R, axes=(4,5,6), norm='ortho')
 
 def get_sigma_static_kij_jax(psi_sigX, psi_sigTY, sigma_k_munu):
@@ -874,6 +869,8 @@ def compute_sigma_pipeline_jax(
 	nspinor: int,
 	fft_vol_au: float,
 	bispinor: bool = False,
+	sharded_ifftn=None,
+	sharded_fftn=None,
 ):
 	"""
 	Pure JAX pipeline: compute static COHSEX self-energy components and Hartree.
@@ -929,10 +926,10 @@ def compute_sigma_pipeline_jax(
 	# Gij_static is sized for psi_l bands (nb_sigma x nb_sigma)
 	G_k = get_G_mu_nu_jax(psi_l_rmuT_X, psi_l_rmu_Y, Gij_static)  # (nk,spin,μ,spin,ν)
 	# G_μν(R): FFT to real-space lattice vectors R
-	G_R = get_G_R_jax(G_k, nkx, nky, nkz)
+	G_R = get_G_R_jax(G_k, nkx, nky, nkz, sharded_ifftn=sharded_ifftn)
 	# Σ_sx_μν(k): screened exchange via ISDF
 	# For bispinor: applies γ⁰ vertex factors to Coulomb interaction
-	sigma_sx_k_munu = get_sigma_static_mu_nu_jax(G_R, W_mu_nu, nk_tot, bispinor=bispinor)
+	sigma_sx_k_munu = get_sigma_static_mu_nu_jax(G_R, W_mu_nu, nk_tot, bispinor=bispinor, sharded_ifftn=sharded_ifftn, sharded_fftn=sharded_fftn)
 	# Σ_sx_ij(k): project to SIGMA WINDOW bands using psi_proj
 	sigma_sx_kij = get_sigma_static_kij_jax(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_sx_k_munu)
 
@@ -941,7 +938,7 @@ def compute_sigma_pipeline_jax(
 	# Use psi_coh which has all bands (b0, b4)
 	G_RI_k = get_G_mu_nu_RI(psi_coh_rmuT_X, psi_coh_rmu_Y)  # (nk,spin,μ,spin,ν)
 	# G_RI_μν(R): FFT to real-space lattice vectors R
-	G_RI_R = get_G_R_jax(G_RI_k, nkx, nky, nkz)
+	G_RI_R = get_G_R_jax(G_RI_k, nkx, nky, nkz, sharded_ifftn=sharded_ifftn)
 	# Σ_coh_μν(k): Coulomb hole via (W - V)
 	# BerkeleyGW uses [ε⁻¹_{GG'} - δ_{GG'}] v(q+G') = (W - V), NOT (V - W)
 	# See bgw_src/Sigma/mtxel_cor.f90 lines 604-607
@@ -951,7 +948,7 @@ def compute_sigma_pipeline_jax(
 	# vs line 1648: if (flag_occ) asxtemp_loc = asxtemp_loc - aqsn_Ieps
 	W_minus_V = W_mu_nu - V_mu_nu
 	# For bispinor: applies γ⁰ vertex factors to Coulomb interaction
-	sigma_coh_k_munu = get_sigma_static_mu_nu_jax(G_RI_R, W_minus_V, nk_tot, bispinor=bispinor)
+	sigma_coh_k_munu = get_sigma_static_mu_nu_jax(G_RI_R, W_minus_V, nk_tot, bispinor=bispinor, sharded_ifftn=sharded_ifftn, sharded_fftn=sharded_fftn)
 	# Σ_coh_ij(k): project to SIGMA WINDOW bands using psi_proj
 	# Apply the 0.5 factor for COH and the overall minus sign
 	sigma_coh_kij = -0.5 * get_sigma_static_kij_jax(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_coh_k_munu)
@@ -1233,25 +1230,27 @@ def main(argv=None):
 	Gij_shard = NamedSharding(mesh_xy, P(None, None, None))
 	Gij_static = jax.device_put(Gij_static, Gij_shard)
 
-	# JIT-compile and run the Σ_SX + Σ_COH + V_H pipeline
-	pipeline_jit = jax.jit(
-		compute_sigma_pipeline_jax,
-		static_argnames=('nkx', 'nky', 'nkz', 'nk_tot', 'nspinor', 'fft_vol_au', 'bispinor'),
-		in_shardings=(
-			sh.XT_shard, sh.Y_shard,     # psi_l for SX
-			sh.XT_shard, sh.Y_shard,     # psi_coh for COH
-			sh.X_shard, sh.YT_shard,     # psi_proj for projection
-			sh.V_shard, sh.V_shard,      # W_mu_nu, V_mu_nu
-			sh.xy_shard, Gij_shard,      # V0_munu, Gij_static
-		),
-		out_shardings=(sh.out_shard, sh.out_shard, sh.out_shard),
-	)
+	# Create shard_map FFT helpers for sigma G_R and sigma_k FFTs.
+	# These must be called OUTSIDE @jax.jit (shard_map inside JIT hangs on 16+ GPUs).
+	from common.fft_helpers import make_sharded_ifftn_3d, make_sharded_fftn_3d
+	_G_spec = P(None, 'x', None, 'y', None, None, None)
+	_sharded_ifftn_G = make_sharded_ifftn_3d(mesh_xy, _G_spec, _G_spec, norm='ortho', axes=(4, 5, 6))
+	_sharded_fftn_G = make_sharded_fftn_3d(mesh_xy, _G_spec, _G_spec, norm='ortho', axes=(4, 5, 6))
+
+	# DON'T jax.jit the pipeline — call it directly so shard_map FFTs work eagerly.
+	# The individual einsums inside are traced and compiled on-the-fly by JAX.
+	def pipeline_fn(*args, **kwargs):
+		return compute_sigma_pipeline_jax(
+			*args, **kwargs,
+			sharded_ifftn=_sharded_ifftn_G,
+			sharded_fftn=_sharded_fftn_G,
+		)
 
 	fft_vol_au = float(wfn.cell_volume / np.prod(wfn.fft_grid))
 
 	with mesh_xy:
 		with timing.section("gw_jax.pipeline"):
-			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = pipeline_jit(
+			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = pipeline_fn(
 				sigma_views.psi_lT, sigma_views.psi_l,
 				sigma_views.psi_cohT, sigma_views.psi_coh,
 				sigma_views.psi_proj, sigma_views.psi_projT,
@@ -1935,7 +1934,7 @@ def main(argv=None):
 			
 			# Compute new Σ using original wavefunctions but updated G_ij
 			with mesh_xy:
-				sigma_sx_new, sigma_coh_new, hartree_new = pipeline_jit(
+				sigma_sx_new, sigma_coh_new, hartree_new = pipeline_fn(
 					sigma_views.psi_lT, sigma_views.psi_l,
 					sigma_views.psi_cohT, sigma_views.psi_coh,
 					sigma_views.psi_proj, sigma_views.psi_projT,
@@ -1981,7 +1980,7 @@ def main(argv=None):
 		print_scf_diagnostics(Gij_final, U_full, nelec, nb_sigma, print0)
 
 		with mesh_xy:
-			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = pipeline_jit(
+			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = pipeline_fn(
 				sigma_views.psi_lT, sigma_views.psi_l,
 				sigma_views.psi_cohT, sigma_views.psi_coh,
 				sigma_views.psi_proj, sigma_views.psi_projT,
