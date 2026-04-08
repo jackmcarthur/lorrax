@@ -65,12 +65,18 @@ class _SigmaWindow:
     t_nodes: np.ndarray
     alpha: np.ndarray
     mask_A: np.ndarray
-    mask_B: np.ndarray
+    mask_B: np.ndarray | None
     E_ref_A: float
     E_ref_B: float
     omega_sign: int
     project: str
     prefactor: float
+    mask_B_mode: str = "explicit"
+    mask_B_threshold: float | None = None
+    mask_B_count: int | None = None
+    mask_B_total: int | None = None
+    mask_B_min: float | None = None
+    mask_B_max: float | None = None
     x_min: float | None = None
     x_max: float | None = None
     crossing_A: float | None = None
@@ -93,25 +99,68 @@ def _to_host_np(a, dtype=np.complex128, *, tiled: bool = False):
     except Exception:
         return np.asarray(jax.device_get(a), dtype=dtype)
 
+
+def _to_host_scalar(a, dtype=float):
+    """Fetch one replicated scalar to host, tolerating multihost arrays."""
+
+    np_dtype = np.dtype(dtype)
+    gathered = _to_host_np(jnp.asarray(a), dtype=np_dtype, tiled=False)
+    return dtype(np.asarray(gathered).reshape(-1)[0])
+
+
+def _masked_stats_device(values: jax.Array, mask: jax.Array) -> tuple[int, int, float | None, float | None]:
+    """Return total size, masked count, and masked min/max using only scalar host fetches."""
+
+    total = int(np.prod(values.shape))
+    count = int(_to_host_scalar(jnp.sum(mask, dtype=jnp.int64), int))
+    if count == 0:
+        return total, 0, None, None
+    min_val = float(_to_host_scalar(jnp.min(jnp.where(mask, values, jnp.inf)), float))
+    max_val = float(_to_host_scalar(jnp.max(jnp.where(mask, values, -jnp.inf)), float))
+    return total, count, min_val, max_val
+
+
+def _materialize_window_mask_B(
+    window: _SigmaWindow,
+    *,
+    base_mask_B: jax.Array,
+    Omega_mu_nu: jax.Array,
+) -> jax.Array:
+    """Build one window's B-side selector lazily on device."""
+
+    mode = str(window.mask_B_mode)
+    if mode == "explicit":
+        if window.mask_B is None:
+            raise ValueError("window.mask_B must be provided when mask_B_mode='explicit'.")
+        return jnp.asarray(window.mask_B, dtype=bool)
+    if mode == "all":
+        return jnp.asarray(base_mask_B, dtype=bool)
+    threshold = jnp.asarray(window.mask_B_threshold, dtype=Omega_mu_nu.dtype)
+    if mode == "le_t":
+        return jnp.asarray(base_mask_B, dtype=bool) & (Omega_mu_nu <= threshold)
+    if mode == "gt_t":
+        return jnp.asarray(base_mask_B, dtype=bool) & (Omega_mu_nu > threshold)
+    raise ValueError(f"Unknown mask_B_mode={mode!r}")
+
 _sigma_tau_channel_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
 _sigma_channel_pipeline_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
 
 
 def _summarize_hermitian_qmunu(name: str, W_q: jax.Array, print_fn=print) -> None:
     """Emit Hermiticity diagnostics for W_q with layout (kx,ky,kz,1,mu,1,nu)."""
-    try:
-        W_host = _to_host_np(W_q, dtype=np.complex128, tiled=False)
-    except Exception:
+    if W_q.ndim != 7:
+        print_fn(f"[{name}] unexpected shape {W_q.shape}; expected (nkx,nky,nkz,1,mu,1,nu)")
         return
-    if W_host.ndim != 7:
-        print_fn(f"[{name}] unexpected shape {W_host.shape}; expected (nkx,nky,nkz,1,mu,1,nu)")
-        return
-    W_flat = W_host[:, :, :, 0, :, 0, :].reshape(-1, W_host.shape[4], W_host.shape[6])
-    herm_resid = float(np.max(np.abs(W_flat - np.conj(np.swapaxes(W_flat, -2, -1)))))
-    diag = np.diagonal(W_flat, axis1=-2, axis2=-1)
-    diag_im = float(np.max(np.abs(np.imag(diag))))
-    diag_min = float(np.min(np.real(diag)))
-    diag_max = float(np.max(np.real(diag)))
+    W_munu = jnp.asarray(W_q[:, :, :, 0, :, 0, :], dtype=jnp.complex128)
+    herm_resid = _to_host_scalar(
+        jnp.max(jnp.abs(W_munu - jnp.swapaxes(jnp.conj(W_munu), -2, -1))),
+        float,
+    )
+    diag = jnp.diagonal(W_munu, axis1=-2, axis2=-1)
+    diag_im = _to_host_scalar(jnp.max(jnp.abs(jnp.imag(diag))), float)
+    diag_real = jnp.real(diag)
+    diag_min = _to_host_scalar(jnp.min(diag_real), float)
+    diag_max = _to_host_scalar(jnp.max(diag_real), float)
     print_fn(
         f"  [{name}] hermitian residual={herm_resid:.3e} "
         f"max|Im diag|={diag_im:.3e} diag range=[{diag_min:.4e}, {diag_max:.4e}]"
@@ -573,9 +622,11 @@ def compute_w0_wiwp_and_ppm_from_minimax(
 def _build_single_sigma_window(
     *,
     E_A: np.ndarray,
-    E_B: np.ndarray,
     base_mask_A: np.ndarray,
-    base_mask_B: np.ndarray,
+    mask_B_total: int,
+    mask_B_count: int,
+    mask_B_min: float | None,
+    mask_B_max: float | None,
     omega_nonneg_ry: np.ndarray,
     kernel_sign: int,
     target_error: float,
@@ -583,11 +634,10 @@ def _build_single_sigma_window(
     use_shipped_tables: bool,
 ) -> list[_SigmaWindow]:
     A_vals = E_A[base_mask_A]
-    B_vals = E_B[base_mask_B]
-    if A_vals.size == 0 or B_vals.size == 0:
+    if A_vals.size == 0 or mask_B_count == 0 or mask_B_min is None or mask_B_max is None:
         return []
-    S_min = float(np.min(A_vals) + np.min(B_vals))
-    S_max = float(np.max(A_vals) + np.max(B_vals))
+    S_min = float(np.min(A_vals) + mask_B_min)
+    S_max = float(np.max(A_vals) + mask_B_max)
     omega_max = float(np.max(omega_nonneg_ry)) if omega_nonneg_ry.size else 0.0
     x_min = max(S_min, 1.0e-12)
     if kernel_sign == -1:
@@ -609,12 +659,17 @@ def _build_single_sigma_window(
             t_nodes=np.asarray(-1j * q.tau, dtype=np.complex128),
             alpha=np.asarray(q.alpha, dtype=np.float64),
             mask_A=np.asarray(base_mask_A, dtype=bool),
-            mask_B=np.asarray(base_mask_B, dtype=bool),
+            mask_B=None,
             E_ref_A=float(np.min(A_vals)),
-            E_ref_B=float(np.min(B_vals)),
+            E_ref_B=float(mask_B_min),
             omega_sign=int(kernel_sign),
             project="full",
             prefactor=float(prefactor),
+            mask_B_mode="all",
+            mask_B_total=int(mask_B_total),
+            mask_B_count=int(mask_B_count),
+            mask_B_min=float(mask_B_min),
+            mask_B_max=float(mask_B_max),
             x_min=float(x_min),
             x_max=float(x_max),
         )
@@ -624,9 +679,15 @@ def _build_single_sigma_window(
 def _build_three_sigma_windows(
     *,
     E_A: np.ndarray,
-    E_B: np.ndarray,
     base_mask_A: np.ndarray,
-    base_mask_B: np.ndarray,
+    mask_B_total: int,
+    mask_B_all_count: int,
+    mask_B_le_count: int,
+    mask_B_le_min: float | None,
+    mask_B_le_max: float | None,
+    mask_B_gt_count: int,
+    mask_B_gt_min: float | None,
+    mask_B_gt_max: float | None,
     omega_nonneg_ry: np.ndarray,
     regularization_width_ry: float,
     edge_factor: float,
@@ -645,22 +706,30 @@ def _build_three_sigma_windows(
     for name in ("core", "a_stripe", "b_slab"):
         if name == "core":
             mA = base_mask_A & (E_A <= T)
-            mB = base_mask_B & (E_B <= T)
+            mask_B_mode = "le_t"
+            count_B = mask_B_le_count
+            B_min = mask_B_le_min
+            B_max = mask_B_le_max
         elif name == "a_stripe":
             mA = base_mask_A & (E_A > T)
-            mB = base_mask_B & (E_B <= T)
+            mask_B_mode = "le_t"
+            count_B = mask_B_le_count
+            B_min = mask_B_le_min
+            B_max = mask_B_le_max
         else:
             mA = base_mask_A
-            mB = base_mask_B & (E_B > T)
-        if not np.any(mA) or not np.any(mB):
+            mask_B_mode = "gt_t"
+            count_B = mask_B_gt_count
+            B_min = mask_B_gt_min
+            B_max = mask_B_gt_max
+        if not np.any(mA) or count_B == 0 or B_min is None or B_max is None:
             continue
 
         A_vals = E_A[mA]
-        B_vals = E_B[mB]
-        S_min = float(np.min(A_vals) + np.min(B_vals))
-        S_max = float(np.max(A_vals) + np.max(B_vals))
+        S_min = float(np.min(A_vals) + B_min)
+        S_max = float(np.max(A_vals) + B_max)
         E_ref_A = float(np.min(A_vals))
-        E_ref_B = float(np.min(B_vals))
+        E_ref_B = float(B_min)
 
         if name == "core":
             A_core = max(2.0 * T / xi, 1.0e-8)
@@ -698,12 +767,18 @@ def _build_three_sigma_windows(
                 t_nodes=t_nodes,
                 alpha=alpha,
                 mask_A=np.asarray(mA, dtype=bool),
-                mask_B=np.asarray(mB, dtype=bool),
+                mask_B=None,
                 E_ref_A=E_ref_A,
                 E_ref_B=E_ref_B,
                 omega_sign=+1,
                 project=project,
                 prefactor=float(prefactor),
+                mask_B_mode=mask_B_mode,
+                mask_B_threshold=float(T),
+                mask_B_total=int(mask_B_total),
+                mask_B_count=int(count_B),
+                mask_B_min=float(B_min),
+                mask_B_max=float(B_max),
                 x_min=float(x_min) if name != "core" else None,
                 x_max=float(x_max) if name != "core" else None,
                 crossing_A=float(A_core) if name == "core" else None,
@@ -775,18 +850,33 @@ def _convolve_sigma_branch_kij(
 
     E_A_host = _to_host_np(E_A, dtype=np.float64, tiled=False)
     base_A_host = _to_host_np(base_mask_A, dtype=bool, tiled=False)
-    E_B_host = _to_host_np(Omega_mu_nu, dtype=np.float64, tiled=False)
-    base_B_host = _to_host_np(base_mask_B, dtype=bool, tiled=False)
     if _bprof:
         _b1 = _btime.perf_counter()
         print0(f"  [TIMING-BRANCH] {log_tag} device_get pre-loop: {_b1-_b0:.3f}s")
 
+    mask_B_total, mask_B_all_count, mask_B_all_min, mask_B_all_max = _masked_stats_device(
+        Omega_mu_nu, base_mask_B
+    )
     if kernel_sign == +1 and float(np.max(omega_nonneg_ry)) > 1.0e-14:
+        omega_max = float(np.max(omega_nonneg_ry))
+        xi = max(float(regularization_width_ry), 1.0e-12)
+        z_edge = float(edge_factor) * xi
+        T = omega_max + z_edge
+        le_mask_B = base_mask_B & (Omega_mu_nu <= T)
+        gt_mask_B = base_mask_B & (Omega_mu_nu > T)
+        _, mask_B_le_count, mask_B_le_min, mask_B_le_max = _masked_stats_device(Omega_mu_nu, le_mask_B)
+        _, mask_B_gt_count, mask_B_gt_min, mask_B_gt_max = _masked_stats_device(Omega_mu_nu, gt_mask_B)
         windows = _build_three_sigma_windows(
             E_A=E_A_host,
-            E_B=E_B_host,
             base_mask_A=base_A_host,
-            base_mask_B=base_B_host,
+            mask_B_total=mask_B_total,
+            mask_B_all_count=mask_B_all_count,
+            mask_B_le_count=mask_B_le_count,
+            mask_B_le_min=mask_B_le_min,
+            mask_B_le_max=mask_B_le_max,
+            mask_B_gt_count=mask_B_gt_count,
+            mask_B_gt_min=mask_B_gt_min,
+            mask_B_gt_max=mask_B_gt_max,
             omega_nonneg_ry=omega_nonneg_ry,
             regularization_width_ry=regularization_width_ry,
             edge_factor=edge_factor,
@@ -799,9 +889,11 @@ def _convolve_sigma_branch_kij(
     else:
         windows = _build_single_sigma_window(
             E_A=E_A_host,
-            E_B=E_B_host,
             base_mask_A=base_A_host,
-            base_mask_B=base_B_host,
+            mask_B_total=mask_B_total,
+            mask_B_count=mask_B_all_count,
+            mask_B_min=mask_B_all_min,
+            mask_B_max=mask_B_all_max,
             omega_nonneg_ry=omega_nonneg_ry,
             kernel_sign=kernel_sign,
             target_error=target_error,
@@ -826,11 +918,10 @@ def _convolve_sigma_branch_kij(
         nsamp = max(50, int(debug_quadrature_samples))
         for win in windows:
             mask_A = np.asarray(win.mask_A, dtype=bool)
-            mask_B = np.asarray(win.mask_B, dtype=bool)
             count_A = int(np.sum(mask_A))
-            count_B = int(np.sum(mask_B))
             total_A = int(mask_A.size)
-            total_B = int(mask_B.size)
+            count_B = int(win.mask_B_count or 0)
+            total_B = int(win.mask_B_total or mask_B_total)
             nband = None
             if mask_A.ndim == 2:
                 nband = int(np.sum(np.any(mask_A, axis=0)))
@@ -841,13 +932,8 @@ def _convolve_sigma_branch_kij(
             else:
                 A_min = None
                 A_max = None
-            if count_B > 0:
-                B_vals = np.asarray(E_B_host[mask_B], dtype=np.float64)
-                B_min = float(np.min(B_vals))
-                B_max = float(np.max(B_vals))
-            else:
-                B_min = None
-                B_max = None
+            B_min = win.mask_B_min
+            B_max = win.mask_B_max
             if win.x_min is not None and win.x_max is not None:
                 x_grid = np.exp(np.linspace(np.log(win.x_min), np.log(win.x_max), nsamp))
                 approx = np.zeros_like(x_grid)
@@ -936,7 +1022,11 @@ def _convolve_sigma_branch_kij(
                 detail=f"{branch_label}:{win.name}:n{int(win.alpha.shape[0])}",
             ):
                 mask_A = jnp.asarray(win.mask_A)
-                mask_B = jnp.asarray(win.mask_B)
+                mask_B = _materialize_window_mask_B(
+                    win,
+                    base_mask_B=base_mask_B,
+                    Omega_mu_nu=Omega_mu_nu,
+                )
                 E_ref_A_j = jnp.asarray(win.E_ref_A, dtype=jnp.float64)
                 E_ref_B_j = jnp.asarray(win.E_ref_B, dtype=jnp.float64)
                 project_code = {"full": 0, "imag": 1}.get(win.project, 2)

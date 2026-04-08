@@ -784,35 +784,23 @@ def extract_gn_ppm_parameters_from_Wc(
     if omega_p <= 0.0:
         raise ValueError("omega_p must be > 0 for GN-PPM extraction.")
 
-    Wc0 = _to_host_np(Wc0_q)
-    Wci = _to_host_np(Wc_iwp_q)
+    Wc0 = jnp.asarray(Wc0_q[:, :, :, 0, :, 0, :], dtype=jnp.complex128)
+    Wci = jnp.asarray(Wc_iwp_q[:, :, :, 0, :, 0, :], dtype=jnp.complex128)
 
-    nkx, nky, nkz = Wc0.shape[0], Wc0.shape[1], Wc0.shape[2]
-    n_q = nkx * nky * nkz
-    n_rmu = Wc0.shape[4]
+    denom = Wc0 - Wci
+    safe = jnp.abs(denom) > 1.0e-14
+    ratio = jnp.where(safe, jnp.real(Wci / denom), jnp.asarray(0.0, dtype=jnp.float64))
+    good = jnp.isfinite(ratio) & (ratio > 0.0)
 
-    Wc0_flat = Wc0[:, :, :, 0, :, 0, :].reshape(n_q, n_rmu, n_rmu)
-    Wci_flat = Wci[:, :, :, 0, :, 0, :].reshape(n_q, n_rmu, n_rmu)
-
-    denom = Wc0_flat - Wci_flat
-    safe = np.abs(denom) > 1.0e-14
-    ratio = np.zeros_like(Wc0_flat.real)
-    ratio[safe] = np.real(Wci_flat[safe] / denom[safe])
-
-    good = np.isfinite(ratio) & (ratio > 0.0)
-    omega_vals = np.full_like(ratio, fallback_omega, dtype=np.float64)
-    if np.any(good):
-        omega_vals[good] = omega_p * np.sqrt(ratio[good])
-    B = -0.5 * Wc0_flat * omega_vals
-    unfulfilled_fraction = float(1.0 - np.mean(good.astype(np.float64)))
-
-    omega_qmunu = omega_vals.reshape(nkx, nky, nkz, n_rmu, n_rmu)
-    B_qmunu = B.reshape(nkx, nky, nkz, n_rmu, n_rmu)
+    fallback = jnp.asarray(fallback_omega, dtype=jnp.float64)
+    omega_vals = jnp.where(good, omega_p * jnp.sqrt(ratio), fallback)
+    B = -0.5 * Wc0 * omega_vals.astype(jnp.complex128)
+    unfulfilled_fraction = float(1.0 - np.asarray(jax.device_get(jnp.mean(good.astype(jnp.float64))), dtype=np.float64))
 
     return GodbyNeedsPPM(
         omega_p=omega_p,
-        omega_qmunu=jnp.asarray(omega_qmunu),
-        b_qmunu=jnp.asarray(B_qmunu),
-        valid_qmunu=jnp.asarray(good.reshape(nkx, nky, nkz, n_rmu, n_rmu)),
+        omega_qmunu=omega_vals,
+        b_qmunu=B,
+        valid_qmunu=good,
         unfulfilled_fraction=unfulfilled_fraction,
     )
