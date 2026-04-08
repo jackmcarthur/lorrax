@@ -328,13 +328,16 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
     sharded_fftn_chi = make_sharded_fftn_3d(mesh_xy, chi_R_spec, chi_R_spec,
                                              norm='ortho', axes=(-3, -2, -1))
 
-    # Phase 1: JIT'd einsum only. Reshape/transpose done eagerly in Python
-    # to avoid SPMD partitioner compilation hangs on 16+ GPUs.
-    @jax.jit
-    def _build_G_k(
+    # Full tau step inside one JIT: einsum + reshape + shard_map FFT + contract.
+    # shard_map inside @jax.jit works in load_wfns.py on 16 GPUs.
+    @partial(jax.jit, donate_argnums=(6,), static_argnames=("nkx", "nky", "nkz"))
+    def _tau_step(
         psi_vTX, psi_vY, psi_cX, psi_cTY,
         enk_v, enk_c,
-        tau_scalar, vmax, cmin,
+        chi_R_acc,
+        tau_scalar, prefactor_scalar,
+        vmax, cmin,
+        nkx: int, nky: int, nkz: int,
     ):
         exp_v = jnp.exp(-tau_scalar * (vmax - enk_v))
         exp_c = jnp.exp(-tau_scalar * (enk_c - cmin))
@@ -346,7 +349,17 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
                            jnp.conj(psi_cTY), exp_c.astype(jnp.complex128), psi_cX,
                            optimize=True)
 
-        return Gv_k, Gc_k
+        Gv_k = jax.lax.with_sharding_constraint(Gv_k, G_v_5d)
+        Gc_k = jax.lax.with_sharding_constraint(Gc_k, G_c_5d)
+
+        # Reshape + transpose + shard_map FFT (all inside JIT)
+        Gv_7 = Gv_k.reshape(nkx, nky, nkz, *Gv_k.shape[1:])
+        Gc_7 = Gc_k.reshape(nkx, nky, nkz, *Gc_k.shape[1:])
+        Gv_R = sharded_ifftn_Gv(Gv_7.transpose(3, 4, 5, 6, 0, 1, 2))
+        Gc_mR = sharded_fftn_Gc(Gc_7.transpose(3, 4, 5, 6, 0, 1, 2))
+
+        chi_tau = jnp.einsum('ambnxyz,bnamxyz->mnxyz', Gc_mR, Gv_R, optimize=True)
+        return chi_R_acc + prefactor_scalar * chi_tau
 
     # Phase 3: JIT'd contraction + accumulation (no FFT inside JIT)
     @partial(jax.jit, donate_argnums=(0,))
@@ -355,9 +368,10 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
         return chi_R_acc + prefactor_scalar * chi_tau
 
     @jax.jit
-    def _chi_R_reshape(chi_R_q):
-        """Reshape chi from (μ,ν,nkx,nky,nkz) → (nkx,nky,nkz,1,μ,1,ν)."""
-        chi_q = chi_R_q.transpose(2, 3, 4, 0, 1)[:, :, :, None, :, None, :]
+    def _chi_R_to_q(chi_R_final):
+        """R→q FFT + reshape."""
+        chi_q = sharded_fftn_chi(chi_R_final)
+        chi_q = chi_q.transpose(2, 3, 4, 0, 1)[:, :, :, None, :, None, :]
         return jax.lax.with_sharding_constraint(chi_q, chi_out)
 
     def _chi_kernel(
@@ -383,31 +397,16 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
         chi_R_acc = jax.make_array_from_callback(chi_R_shape, chi_R_shard, _chi_zeros)
 
         for itau in range(ntau):
-            # Phase 1: JIT'd einsum only
-            Gv_k, Gc_k = _build_G_k(
+            chi_R_acc = _tau_step(
                 psi_vTX, psi_vY, psi_cX, psi_cTY,
                 enk_v, enk_c,
-                tau_i[itau], vmax, cmin,
+                chi_R_acc,
+                tau_i[itau], prefactor_i[itau],
+                vmax, cmin,
+                nkx, nky, nkz,
             )
 
-            # Reshape + transpose in Python (avoids SPMD partitioner issues)
-            Gv_t = Gv_k.reshape(nkx, nky, nkz, *Gv_k.shape[1:]).transpose(3, 4, 5, 6, 0, 1, 2)
-            Gc_t = Gc_k.reshape(nkx, nky, nkz, *Gc_k.shape[1:]).transpose(3, 4, 5, 6, 0, 1, 2)
-            del Gv_k, Gc_k
-
-            # Phase 2: EAGER shard_map FFT (physically local, no JIT)
-            Gv_R = sharded_ifftn_Gv(Gv_t)
-            Gc_mR = sharded_fftn_Gc(Gc_t)
-            del Gv_t, Gc_t
-
-            # Phase 3: JIT'd contraction + accumulation
-            chi_R_acc = _contract_and_accumulate(
-                chi_R_acc, Gv_R, Gc_mR, prefactor_i[itau])
-            del Gv_R, Gc_mR
-
-        # Final R→q FFT: eager shard_map, then JIT'd reshape
-        chi_R_q = sharded_fftn_chi(chi_R_acc)
-        return _chi_R_reshape(chi_R_q)
+        return _chi_R_to_q(chi_R_acc)
 
     _chi_minimax_kernel_cache[cache_key] = _chi_kernel
     return _chi_kernel
