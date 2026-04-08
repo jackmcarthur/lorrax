@@ -638,7 +638,12 @@ def fit_zeta_and_compute_V_q_chunked(
 	
 	# Extract v_q0 (q=0 with G=0 excluded) and G0 (ζ_μ at G=0)
 	v_q0_noG0_munu = V_qmunu_raw[0, 0, 0, :, :]  # At q=(0,0,0)
-	G0_mu_nu = g0_mu_local[0, 0, 0, :]  # ζ_μ(G=0) at q=0
+	# G0 = ζ_μ(G=0) at q=0. g0_mu_local may be 3D or 4D depending on
+	# how process_allgather handled the leading dimension. Extract q=(0,0,0).
+	_g0 = g0_mu_local
+	while _g0.ndim > 1:
+		_g0 = _g0[0]
+	G0_mu_nu = _g0  # (n_rmu,)
 	
 	print("\n  V_q computed:")
 	print(f"    Shape: {V_qmunu.shape}")

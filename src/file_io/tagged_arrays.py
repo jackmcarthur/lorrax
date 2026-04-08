@@ -122,10 +122,11 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None):
     if V0_noG0_munu is not None:
         V0_noG0_munu = jax.lax.with_sharding_constraint(V0_noG0_munu, NamedSharding(mesh_xy, P("x", "y")))
     if G0_mu_nu is not None:
-        if G0_mu_nu.ndim == 1:
-            G0_mu_nu = jax.lax.with_sharding_constraint(G0_mu_nu, NamedSharding(mesh_xy, P("y")))
-        else:
-            G0_mu_nu = jax.lax.with_sharding_constraint(G0_mu_nu, NamedSharding(mesh_xy, P("x", "y")))
+        # G0 should be (n_rmu,) for head corrections. If stored as 2D
+        # (e.g. (nqz, n_rmu) from an old code version), extract q=0 row.
+        if G0_mu_nu.ndim > 1:
+            G0_mu_nu = G0_mu_nu[0]
+        G0_mu_nu = jax.lax.with_sharding_constraint(G0_mu_nu, NamedSharding(mesh_xy, P("y")))
 
     psi_full_y = jax.lax.with_sharding_constraint(psi_full_y_raw, y3_4)
     psi_full_x = jax.lax.with_sharding_constraint(psi_full_y.transpose(0, 2, 3, 1), x2_4)
