@@ -10,8 +10,7 @@ from functools import partial
 from . import Meta
 from . import timing
 from .fft_helpers import (
-    make_sharded_ifftn_3d,
-    make_sharded_fftn_3d,
+    make_jittable_local_ifftn_3d,
 )
 
 
@@ -276,7 +275,7 @@ def get_sharded_wfns_rchunk_slice(
     if cache_key not in _rchunk_slice_cache:
         out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
         
-        sharded_ifftn = make_sharded_ifftn_3d(
+        local_ifftn = make_jittable_local_ifftn_3d(
             mesh_xy, 
             P(None, ('x', 'y'), None, None, None, None),
             P(None, ('x', 'y'), None, None, None, None)
@@ -302,7 +301,7 @@ def get_sharded_wfns_rchunk_slice(
             """FFT + phase + r-slice. Returns band-sharded r-chunk.
             Resharding happens in a SEPARATE call to prevent XLA from
             rematerializing the FFT to satisfy the output layout."""
-            psi_r = sharded_ifftn(psi_G)
+            psi_r = local_ifftn(psi_G)
             phase_spatial = jnp.exp(
                 2j * jnp.pi * (
                     kvecs_cached[:, 0:1, None, None] * fx_cached
@@ -505,7 +504,7 @@ def get_sharded_wfns_centroids(
         out_X = NamedSharding(mesh_xy, P(None, 'x', None, None))
         null_4 = NamedSharding(mesh_xy, P(None, None, None, None))
         
-        sharded_ifftn = make_sharded_ifftn_3d(
+        local_ifftn = make_jittable_local_ifftn_3d(
             mesh_xy,
             P(None, ('x', 'y'), None, None, None, None),
             P(None, ('x', 'y'), None, None, None, None)
@@ -532,7 +531,7 @@ def get_sharded_wfns_centroids(
         @jax.jit
         def _fft_gather_reshard(psi_G):
             """FFT → phase → gather centroids → reshard. Keeps padded bands."""
-            psi_r = sharded_ifftn(psi_G)
+            psi_r = local_ifftn(psi_G)
             phase_spatial = jnp.exp(
                 2j * jnp.pi * (
                     kvecs_cached[:, 0:1, None, None] * fx_cached

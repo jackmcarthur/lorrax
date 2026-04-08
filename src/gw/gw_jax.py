@@ -1233,13 +1233,14 @@ def main(argv=None):
 	Gij_shard = NamedSharding(mesh_xy, P(None, None, None))
 	Gij_static = jax.device_put(Gij_static, Gij_shard)
 
-	# Shard_map FFT helpers for G(k→R) and Σ(R→k).
-	# Called EAGERLY between small JIT'd phases — large JIT graphs with
-	# shard_map hang during SPMD compilation on 16+ GPUs.
-	from common.fft_helpers import make_sharded_ifftn_3d, make_sharded_fftn_3d
+	# Device-local FFT helpers for the replicated k-grid axes.
+	from common.fft_helpers import (
+		make_jittable_local_fftn_3d,
+		make_jittable_local_ifftn_3d,
+	)
 	_G_spec = P(None, 'x', None, 'y', None, None, None)
-	_sharded_ifftn_G = make_sharded_ifftn_3d(mesh_xy, _G_spec, _G_spec, norm='ortho', axes=(4, 5, 6))
-	_sharded_fftn_G = make_sharded_fftn_3d(mesh_xy, _G_spec, _G_spec, norm='ortho', axes=(4, 5, 6))
+	_local_ifftn_G = make_jittable_local_ifftn_3d(mesh_xy, _G_spec, _G_spec, norm='ortho', axes=(4, 5, 6))
+	_local_fftn_G = make_jittable_local_fftn_3d(mesh_xy, _G_spec, _G_spec, norm='ortho', axes=(4, 5, 6))
 
 	# NamedSharding objects for sigma (matching chi0 pattern — bare P() may
 	# not resolve correctly on multi-node without explicit mesh reference)
@@ -1247,26 +1248,24 @@ def main(argv=None):
 
 	nkx_s, nky_s, nkz_s = int(meta.nkx), int(meta.nky), int(meta.nkz)
 
-	# Small JIT'd phases (matching chi0 _build_G pattern: static_argnames for k-grid)
-	from functools import partial as _partial
-	@_partial(jax.jit, static_argnames=("nkx", "nky", "nkz"))
-	def _build_G_k_jit(psi_XT, psi_Y, Gij, nkx: int, nky: int, nkz: int):
+	@jax.jit
+	def _build_G_k_jit(psi_XT, psi_Y, Gij):
 		G_k = get_G_mu_nu_jax(psi_XT, psi_Y, Gij)
 		G_7d = G_k.transpose(1,2,3,4,0).reshape(
-			G_k.shape[1], G_k.shape[2], G_k.shape[3], G_k.shape[4], nkx, nky, nkz)
+			G_k.shape[1], G_k.shape[2], G_k.shape[3], G_k.shape[4], nkx_s, nky_s, nkz_s)
 		return jax.lax.with_sharding_constraint(G_7d, _G_7d_shard)
 
-	@_partial(jax.jit, static_argnames=("nkx", "nky", "nkz"))
-	def _build_GRI_k_jit(psi_XT, psi_Y, nkx: int, nky: int, nkz: int):
+	@jax.jit
+	def _build_GRI_k_jit(psi_XT, psi_Y):
 		G_k = get_G_mu_nu_RI(psi_XT, psi_Y)
 		G_7d = G_k.transpose(1,2,3,4,0).reshape(
-			G_k.shape[1], G_k.shape[2], G_k.shape[3], G_k.shape[4], nkx, nky, nkz)
+			G_k.shape[1], G_k.shape[2], G_k.shape[3], G_k.shape[4], nkx_s, nky_s, nkz_s)
 		return jax.lax.with_sharding_constraint(G_7d, _G_7d_shard)
 
 	@jax.jit
 	def _sigma_R_jit(G_R, W_or_V, nk_tot):
 		V_R = W_or_V[None, :, None, :, :, :, :]
-		V_R_fft = jnp.fft.ifftn(V_R, axes=(4,5,6), norm='ortho')
+		V_R_fft = _local_ifftn_G(V_R)
 		sigma_R = G_R * V_R_fft * (-1.0 / jnp.sqrt(nk_tot))
 		return jax.lax.with_sharding_constraint(sigma_R, _G_7d_shard)
 
@@ -1284,31 +1283,39 @@ def main(argv=None):
 	def _sub(a, b):
 		return a - b
 
+	@jax.jit
+	def _sx_branch_jit(psi_lT, psi_l, psi_proj, psi_projT, Gij, W, nk_tot):
+		G_7d = _build_G_k_jit(psi_lT, psi_l, Gij)
+		G_R = _local_ifftn_G(G_7d)
+		sigma_sx_R = _sigma_R_jit(G_R, W, nk_tot)
+		sigma_sx_k = _local_fftn_G(sigma_sx_R)
+		return _project_jit(psi_proj, psi_projT, sigma_sx_k)
+
+	@jax.jit
+	def _coh_branch_jit(psi_cohT, psi_coh, psi_proj, psi_projT, W, V, nk_tot):
+		G_7d = _build_GRI_k_jit(psi_cohT, psi_coh)
+		G_RI_R = _local_ifftn_G(G_7d)
+		WmV = _sub(W, V)
+		sigma_coh_R = _sigma_R_jit(G_RI_R, WmV, nk_tot)
+		sigma_coh_k = _local_fftn_G(sigma_coh_R)
+		return -0.5 * _project_jit(psi_proj, psi_projT, sigma_coh_k)
+
 	def pipeline_fn(
 		psi_lT, psi_l, psi_cohT, psi_coh, psi_proj, psi_projT,
 		W, V, V0, Gij,
 		nkx, nky, nkz, nk_tot, nspinor, fft_vol_au, bispinor,
 	):
-		"""Split sigma: small JITs + eager shard_map FFTs between phases."""
+		"""Static sigma pipeline with local FFTs preserved under jit."""
 		# Free memory from chi0/W/PPM before sigma compilation
 		import gc as _gc
 		_gc.collect()
 		# jax.clear_caches()  # too aggressive, may cause recompilation cascade
 
 		# SX
-		G_7d = _build_G_k_jit(psi_lT, psi_l, Gij, nkx_s, nky_s, nkz_s)
-		G_R = _sharded_ifftn_G(G_7d); del G_7d
-		sigma_sx_R = _sigma_R_jit(G_R, W, nk_tot); del G_R
-		sigma_sx_k = _sharded_fftn_G(sigma_sx_R); del sigma_sx_R
-		sigma_sx_kij = _project_jit(psi_proj, psi_projT, sigma_sx_k); del sigma_sx_k
+		sigma_sx_kij = _sx_branch_jit(psi_lT, psi_l, psi_proj, psi_projT, Gij, W, nk_tot)
 
 		# COH
-		G_7d = _build_GRI_k_jit(psi_cohT, psi_coh, nkx_s, nky_s, nkz_s)
-		G_RI_R = _sharded_ifftn_G(G_7d); del G_7d
-		WmV = _sub(W, V)
-		sigma_coh_R = _sigma_R_jit(G_RI_R, WmV, nk_tot); del G_RI_R, WmV
-		sigma_coh_k = _sharded_fftn_G(sigma_coh_R); del sigma_coh_R
-		sigma_coh_kij = -0.5 * _project_jit(psi_proj, psi_projT, sigma_coh_k); del sigma_coh_k
+		sigma_coh_kij = _coh_branch_jit(psi_cohT, psi_coh, psi_proj, psi_projT, W, V, nk_tot)
 
 		# Hartree
 		hartree_kmn = _hartree_jit(psi_l, Gij, V0, psi_proj, nk_tot)

@@ -291,19 +291,11 @@ def compute_chi0(
 # ============================================================================
 
 def _get_chi_minimax_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
-    """Build chi0 kernel with Python tau loop and eager shard_map FFTs.
-
-    MEMORY-CRITICAL: shard_map inside @jax.jit hangs on multi-node (16+ GPUs).
-    Solution: split the tau step into three phases:
-      1. @jax.jit: einsum to build G_v(k), G_c(k) + reshape + transpose
-      2. EAGER (Python level): shard_map FFT (physically local, no JIT)
-      3. @jax.jit: contract G_v(R) × G_c(-R) → χ(R) + accumulate
-
-    The shard_map FFT called eagerly works because it's not inside any JIT —
-    it physically breaks the sharded array into per-device local pieces,
-    FFTs each locally, and reassembles. XLA never sees the global array.
-    """
-    from common.fft_helpers import make_sharded_fftn_3d, make_sharded_ifftn_3d
+    """Build chi0 kernel with jittable device-local FFTs on replicated k axes."""
+    from common.fft_helpers import (
+        make_jittable_local_fftn_3d,
+        make_jittable_local_ifftn_3d,
+    )
 
     cache_key = (id(mesh_xy), nkx, nky, nkz)
     if cache_key in _chi_minimax_kernel_cache:
@@ -316,19 +308,20 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
     G_v_7d = NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y'))
     G_c_7d = NamedSharding(mesh_xy, P(None, None, None, None, 'y', None, 'x'))
 
-    # Eager shard_map FFTs (called OUTSIDE JIT — this is the key).
     G_v_t_spec = P(None, 'x', None, 'y', None, None, None)
     G_c_t_spec = P(None, 'y', None, 'x', None, None, None)
     chi_R_spec = P('x', 'y', None, None, None)
 
-    sharded_ifftn_Gv = make_sharded_ifftn_3d(mesh_xy, G_v_t_spec, G_v_t_spec,
-                                              norm='ortho', axes=(-3, -2, -1))
-    sharded_fftn_Gc = make_sharded_fftn_3d(mesh_xy, G_c_t_spec, G_c_t_spec,
-                                            norm='ortho', axes=(-3, -2, -1))
-    sharded_fftn_chi = make_sharded_fftn_3d(mesh_xy, chi_R_spec, chi_R_spec,
-                                             norm='ortho', axes=(-3, -2, -1))
+    local_ifftn_Gv = make_jittable_local_ifftn_3d(
+        mesh_xy, G_v_t_spec, G_v_t_spec, norm='ortho', axes=(-3, -2, -1)
+    )
+    local_fftn_Gc = make_jittable_local_fftn_3d(
+        mesh_xy, G_c_t_spec, G_c_t_spec, norm='ortho', axes=(-3, -2, -1)
+    )
+    local_fftn_chi = make_jittable_local_fftn_3d(
+        mesh_xy, chi_R_spec, chi_R_spec, norm='ortho', axes=(-3, -2, -1)
+    )
 
-    # Phase 1: JIT'd einsum + reshape + transpose (no FFT inside JIT)
     @partial(jax.jit, static_argnames=("nkx", "nky", "nkz"))
     def _build_G(
         psi_vTX, psi_vY, psi_cX, psi_cTY,
@@ -356,15 +349,27 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
 
         return Gv_7.transpose(3, 4, 5, 6, 0, 1, 2), Gc_7.transpose(3, 4, 5, 6, 0, 1, 2)
 
-    # Phase 3: JIT'd contraction + accumulation (no FFT inside JIT)
     @partial(jax.jit, donate_argnums=(0,))
-    def _contract_and_accumulate(chi_R_acc, Gv_R, Gc_mR, prefactor_scalar):
+    def _tau_step(
+        chi_R_acc,
+        psi_vTX, psi_vY, psi_cX, psi_cTY,
+        enk_v, enk_c,
+        tau_scalar, prefactor_scalar, vmax, cmin,
+    ):
+        Gv_t, Gc_t = _build_G(
+            psi_vTX, psi_vY, psi_cX, psi_cTY,
+            enk_v, enk_c,
+            tau_scalar, vmax, cmin,
+            nkx, nky, nkz,
+        )
+        Gv_R = local_ifftn_Gv(Gv_t)
+        Gc_mR = local_fftn_Gc(Gc_t)
         chi_tau = jnp.einsum('ambnxyz,bnamxyz->mnxyz', Gc_mR, Gv_R, optimize=True)
         return chi_R_acc + prefactor_scalar * chi_tau
 
     @jax.jit
     def _chi_R_to_q(chi_R_final):
-        chi_q = sharded_fftn_chi(chi_R_final)
+        chi_q = local_fftn_chi(chi_R_final)
         chi_q = chi_q.transpose(2, 3, 4, 0, 1)[:, :, :, None, :, None, :]
         return jax.lax.with_sharding_constraint(chi_q, chi_out)
 
@@ -391,23 +396,12 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
         chi_R_acc = jax.make_array_from_callback(chi_R_shape, chi_R_shard, _chi_zeros)
 
         for itau in range(ntau):
-            # Phase 1: JIT'd einsum (output: transposed G_v, G_c)
-            Gv_t, Gc_t = _build_G(
+            chi_R_acc = _tau_step(
+                chi_R_acc,
                 psi_vTX, psi_vY, psi_cX, psi_cTY,
                 enk_v, enk_c,
-                tau_i[itau], vmax, cmin,
-                nkx, nky, nkz,
+                tau_i[itau], prefactor_i[itau], vmax, cmin,
             )
-
-            # Phase 2: EAGER shard_map FFT (physically local, no JIT)
-            Gv_R = sharded_ifftn_Gv(Gv_t)
-            Gc_mR = sharded_fftn_Gc(Gc_t)
-            del Gv_t, Gc_t
-
-            # Phase 3: JIT'd contraction + accumulation
-            chi_R_acc = _contract_and_accumulate(
-                chi_R_acc, Gv_R, Gc_mR, prefactor_i[itau])
-            del Gv_R, Gc_mR
 
         return _chi_R_to_q(chi_R_acc)
 

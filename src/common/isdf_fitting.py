@@ -34,8 +34,8 @@ from .cholesky_2d import (
     tiles_to_dense,
 )
 from .fft_helpers import (
-    make_sharded_ifftn_3d,
-    make_sharded_fftn_3d,
+    make_jittable_local_ifftn_3d,
+    make_jittable_local_fftn_3d,
     compute_block_size_for_2d_cholesky,
 )
 from .load_wfns import (
@@ -213,8 +213,8 @@ def compute_CCT_from_left_right(
 		# Keep pair-density in (k, mu, nu) layout (good for einsum/matmul contiguity),
 		# and FFT directly over the leading k-grid axes.
 		fft_in = P(None, None, None, 'x', 'y')
-		sharded_ifftn = make_sharded_ifftn_3d(mesh_xy, fft_in, fft_in, norm='forward', axes=(0, 1, 2))
-		sharded_fftn = make_sharded_fftn_3d(mesh_xy, fft_in, fft_in, norm='forward', axes=(0, 1, 2))
+		local_ifftn = make_jittable_local_ifftn_3d(mesh_xy, fft_in, fft_in, norm='forward', axes=(0, 1, 2))
+		local_fftn = make_jittable_local_fftn_3d(mesh_xy, fft_in, fft_in, norm='forward', axes=(0, 1, 2))
 
 		@partial(jax.jit, in_shardings=(in_xy, in_xy), out_shardings=out_xy,
 		         static_argnames=('nkx', 'nky', 'nkz'))
@@ -228,14 +228,14 @@ def compute_CCT_from_left_right(
 			# With forward: IFFT is unscaled (sum), FFT divides by N.
 			# Convolution theorem: C_q = FFT(IFFT(A)* ⊙ IFFT(B))
 			# This gives C_q = Σ_k A*_k B_{k+q} (matches gw_jax direct sum)
-			P_l_Rt = sharded_ifftn(P_l_3d)
-			P_r_Rt = sharded_ifftn(P_r_3d)
+			P_l_Rt = local_ifftn(P_l_3d)
+			P_r_Rt = local_ifftn(P_r_3d)
 
 			# Cross-product: C_R = conj(P_l_R) * P_r_R (element-wise)
 			C_Rt = jnp.conj(P_l_Rt) * P_r_Rt
 
 			# FFT to q-space
-			C_qt = sharded_fftn(C_Rt)
+			C_qt = local_fftn(C_Rt)
 			return C_qt
 
 		_isdf_pipeline_cache[cache_key] = _compute_CCT_LR
@@ -266,8 +266,8 @@ def compute_CCT_from_left_right_spin_matrix(
 		out_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
 		fft_spin = P(None, None, None, None, None, 'x', 'y')
 		fft_scalar = P(None, None, None, 'x', 'y')
-		sharded_ifftn_spin = make_sharded_ifftn_3d(mesh_xy, fft_spin, fft_spin, norm='forward', axes=(0, 1, 2))
-		sharded_fftn_scalar = make_sharded_fftn_3d(mesh_xy, fft_scalar, fft_scalar, norm='forward', axes=(0, 1, 2))
+		local_ifftn_spin = make_jittable_local_ifftn_3d(mesh_xy, fft_spin, fft_spin, norm='forward', axes=(0, 1, 2))
+		local_fftn_scalar = make_jittable_local_fftn_3d(mesh_xy, fft_scalar, fft_scalar, norm='forward', axes=(0, 1, 2))
 
 		@partial(jax.jit, in_shardings=(in_xy, in_xy), out_shardings=out_xy,
 		         static_argnames=('nkx', 'nky', 'nkz'))
@@ -275,10 +275,10 @@ def compute_CCT_from_left_right_spin_matrix(
 		                         nkx: int, nky: int, nkz: int) -> jax.Array:
 			P_l_3d = P_l.reshape(nkx, nky, nkz, ns1, ns2, n_rmu, n_rmu)
 			P_r_3d = P_r.reshape(nkx, nky, nkz, ns1, ns2, n_rmu, n_rmu)
-			P_l_Rt = sharded_ifftn_spin(P_l_3d)
-			P_r_Rt = sharded_ifftn_spin(P_r_3d)
+			P_l_Rt = local_ifftn_spin(P_l_3d)
+			P_r_Rt = local_ifftn_spin(P_r_3d)
 			C_Rt = jnp.sum(jnp.conj(P_l_Rt) * P_r_Rt, axis=(3, 4))
-			return sharded_fftn_scalar(C_Rt)
+			return local_fftn_scalar(C_Rt)
 
 		_isdf_pipeline_cache[cache_key] = _compute_CCT_LR_spin
 
@@ -324,20 +324,20 @@ def compute_ZCT_from_left_right_zchunk(
 		# and FFT directly over the leading k-grid axes.
 		fft_in = P(None, None, None, 'x', 'y')
 		fft_shard = NamedSharding(mesh_xy, fft_in)
-		sharded_ifftn = make_sharded_ifftn_3d(mesh_xy, fft_in, fft_in, norm='forward', axes=(0, 1, 2))
-		sharded_fftn = make_sharded_fftn_3d(mesh_xy, fft_in, fft_in, norm='forward', axes=(0, 1, 2))
+		local_ifftn = make_jittable_local_ifftn_3d(mesh_xy, fft_in, fft_in, norm='forward', axes=(0, 1, 2))
+		local_fftn = make_jittable_local_fftn_3d(mesh_xy, fft_in, fft_in, norm='forward', axes=(0, 1, 2))
 
 		@partial(jax.jit, in_shardings=fft_shard, out_shardings=fft_shard, donate_argnums=(0,))
 		def _left_ifft_conj(P_l_3d: jax.Array) -> jax.Array:
 			# Use norm='forward' to match direct k-sum convention.
-			return jnp.conj(sharded_ifftn(P_l_3d))
+			return jnp.conj(local_ifftn(P_l_3d))
 
 		@partial(jax.jit, in_shardings=(fft_shard, fft_shard), out_shardings=out_xy, donate_argnums=(0,))
 		def _right_ifft_mul_fft(P_r_3d: jax.Array, P_l_Rt: jax.Array) -> jax.Array:
 			# Keep R-side intermediate internal to avoid materializing both Rt arrays at API boundary.
-			P_r_Rt = sharded_ifftn(P_r_3d)
+			P_r_Rt = local_ifftn(P_r_3d)
 			Z_Rt = P_l_Rt * P_r_Rt
-			return sharded_fftn(Z_Rt)
+			return local_fftn(Z_Rt)
 
 		def _compute_ZCT_LR(P_l: jax.Array, P_r: jax.Array) -> jax.Array:
 			P_l_Rt = _left_ifft_conj(P_l)
@@ -380,18 +380,18 @@ def compute_ZCT_from_left_right_zchunk_spin_matrix(
 		fft_scalar = P(None, None, None, 'x', 'y')
 		fft_shard_spin = NamedSharding(mesh_xy, fft_spin)
 		out_xy = NamedSharding(mesh_xy, fft_scalar)
-		sharded_ifftn_spin = make_sharded_ifftn_3d(mesh_xy, fft_spin, fft_spin, norm='forward', axes=(0, 1, 2))
-		sharded_fftn_scalar = make_sharded_fftn_3d(mesh_xy, fft_scalar, fft_scalar, norm='forward', axes=(0, 1, 2))
+		local_ifftn_spin = make_jittable_local_ifftn_3d(mesh_xy, fft_spin, fft_spin, norm='forward', axes=(0, 1, 2))
+		local_fftn_scalar = make_jittable_local_fftn_3d(mesh_xy, fft_scalar, fft_scalar, norm='forward', axes=(0, 1, 2))
 
 		@partial(jax.jit, in_shardings=fft_shard_spin, out_shardings=fft_shard_spin, donate_argnums=(0,))
 		def _left_ifft_conj(P_l_3d: jax.Array) -> jax.Array:
-			return jnp.conj(sharded_ifftn_spin(P_l_3d))
+			return jnp.conj(local_ifftn_spin(P_l_3d))
 
 		@partial(jax.jit, in_shardings=(fft_shard_spin, fft_shard_spin), out_shardings=out_xy, donate_argnums=(0,))
 		def _right_ifft_contract_fft(P_r_3d: jax.Array, P_l_Rt: jax.Array) -> jax.Array:
-			P_r_Rt = sharded_ifftn_spin(P_r_3d)
+			P_r_Rt = local_ifftn_spin(P_r_3d)
 			Z_Rt = jnp.sum(P_l_Rt * P_r_Rt, axis=(3, 4))
-			return sharded_fftn_scalar(Z_Rt)
+			return local_fftn_scalar(Z_Rt)
 
 		def _compute_ZCT_LR_spin(P_l: jax.Array, P_r: jax.Array) -> jax.Array:
 			P_l_Rt = _left_ifft_conj(P_l)
