@@ -23,7 +23,7 @@ from common import jax_profile
 from .minimax_config import MinimaxConfig, SigmaQuadratureConfig
 from .minimax_screening import (
     build_static_minimax_window_pair,
-    extract_gn_ppm_parameters_from_Wc,
+    fit_gn_ppm_from_wc_pair,
     solve_laplace_minimax_interval,
     solve_laplace_minimax_imag_interval,
     solve_phase_minimax_bandwidth,
@@ -141,6 +141,15 @@ def _materialize_window_mask_B(
     if mode == "gt_t":
         return jnp.asarray(base_mask_B, dtype=bool) & (Omega_mu_nu > threshold)
     raise ValueError(f"Unknown mask_B_mode={mode!r}")
+
+
+def _qmunu_to_munu_local(arr_qmunu: jax.Array, *, mesh_xy: Mesh) -> jax.Array:
+    """Transpose ``(nkx,nky,nkz,mu,nu) -> (mu,nu,nkx,nky,nkz)`` and keep mu/nu tiled."""
+
+    mu_shard = _mu_nu_sharding(mesh_xy)
+    with mesh_xy:
+        arr_munu = jnp.asarray(arr_qmunu).transpose(3, 4, 0, 1, 2)
+        return jax.lax.with_sharding_constraint(arr_munu, mu_shard)
 
 _sigma_tau_channel_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
 _sigma_channel_pipeline_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
@@ -550,26 +559,20 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     Wci_q = Wiwp_q - V_q
 
 
-    ppm = extract_gn_ppm_parameters_from_Wc(
-        Wc0_q,
-        Wci_q,
-        omega_p=omega_p_ry,
+    Wc0_qmunu = Wc0_q[:, :, :, 0, :, 0, :]
+    Wci_qmunu = Wci_q[:, :, :, 0, :, 0, :]
+    omega_qmunu, b_qmunu, valid_qmunu, unfulfilled = fit_gn_ppm_from_wc_pair(
+        Wc0_qmunu,
+        Wci_qmunu,
+        1j * complex(omega_p_ry),
         fallback_omega=float(fallback_omega),
     )
-    unfulfilled = float(ppm.unfulfilled_fraction)
 
     # GN poles are for W^c, so W^c(t) is a direct exponential sum.
-    Omega = jnp.asarray(ppm.omega_qmunu).transpose(3, 4, 0, 1, 2)
-    B = jnp.asarray(ppm.b_qmunu).transpose(3, 4, 0, 1, 2)
-    valid_mask = jnp.asarray(ppm.valid_qmunu).transpose(3, 4, 0, 1, 2)
-    Wc0_mu_nu = Wc0_q[:, :, :, 0, :, 0, :].transpose(3, 4, 0, 1, 2)
-    mu_shard = _mu_nu_sharding(mesh_xy)
-
-    with mesh_xy:
-        Omega = jax.lax.with_sharding_constraint(Omega, mu_shard)
-        B = jax.lax.with_sharding_constraint(B, mu_shard)
-        valid_mask = jax.lax.with_sharding_constraint(valid_mask, mu_shard)
-        Wc0_mu_nu = jax.lax.with_sharding_constraint(Wc0_mu_nu, mu_shard)
+    Omega = _qmunu_to_munu_local(omega_qmunu, mesh_xy=mesh_xy)
+    B = _qmunu_to_munu_local(b_qmunu, mesh_xy=mesh_xy)
+    valid_mask = _qmunu_to_munu_local(valid_qmunu, mesh_xy=mesh_xy)
+    Wc0_mu_nu = _qmunu_to_munu_local(Wc0_qmunu, mesh_xy=mesh_xy)
 
     # PPM consistency check: W^c(0) ≈ ± 2 B / Omega (elementwise).
     w0_rel_error = None

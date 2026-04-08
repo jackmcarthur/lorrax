@@ -330,6 +330,60 @@ class GodbyNeedsPPM:
     unfulfilled_fraction: float
 
 
+def fit_gn_ppm_from_wc_pair(
+    Wc0_qmunu: jax.Array,
+    Wc_probe_qmunu: jax.Array,
+    probe_omega: complex,
+    *,
+    fallback_omega: float,
+) -> tuple[jax.Array, jax.Array, jax.Array, float]:
+    """Fit GN-PPM pole data elementwise on an already-sharded ``(q,mu,nu)`` tensor pair.
+
+    Parameters
+    ----------
+    Wc0_qmunu
+        ``W^c(0)`` in shape ``(nkx,nky,nkz,n_rmu,n_rmu)``.
+    Wc_probe_qmunu
+        ``W^c(z_probe)`` in the same shape/sharding as ``Wc0_qmunu``.
+    probe_omega
+        Complex probe frequency ``z_probe`` in Ry. For the standard GN fit this is
+        purely imaginary, e.g. ``2j``.
+    fallback_omega
+        Positive real fallback pole in Ry for entries that do not produce a valid
+        positive-real ``Omega^2`` estimate.
+
+    Returns
+    -------
+    omega_qmunu, B_qmunu, valid_qmunu, unfulfilled_fraction
+        Elementwise GN-PPM parameters in the same ``(nkx,nky,nkz,n_rmu,n_rmu)``
+        layout. The fit is pure local algebra: no host gathers and no communication
+        beyond whatever sharding is already attached to the inputs.
+    """
+
+    Wc0 = jnp.asarray(Wc0_qmunu, dtype=jnp.complex128)
+    Wc_probe = jnp.asarray(Wc_probe_qmunu, dtype=jnp.complex128)
+    z_probe = jnp.asarray(probe_omega, dtype=jnp.complex128)
+
+    denom = Wc0 - Wc_probe
+    safe = jnp.abs(denom) > 1.0e-14
+    ratio = jnp.where(safe, Wc_probe / denom, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
+    omega_sq = -(z_probe * z_probe) * ratio
+    omega_sq_re = jnp.real(omega_sq)
+    good = (
+        safe
+        & jnp.isfinite(omega_sq_re)
+        & (omega_sq_re > 0.0)
+    )
+
+    fallback = jnp.asarray(fallback_omega, dtype=jnp.float64)
+    omega_vals = jnp.where(good, jnp.sqrt(omega_sq_re), fallback)
+    B_vals = -0.5 * Wc0 * omega_vals.astype(jnp.complex128)
+    unfulfilled_fraction = float(
+        1.0 - np.asarray(jax.device_get(jnp.mean(good.astype(jnp.float64))), dtype=np.float64)
+    )
+    return omega_vals, B_vals, good, unfulfilled_fraction
+
+
 @lru_cache(maxsize=64)
 def _solve_noncrossing_scaled_cached(
     logR_key: float,
@@ -786,16 +840,12 @@ def extract_gn_ppm_parameters_from_Wc(
 
     Wc0 = jnp.asarray(Wc0_q[:, :, :, 0, :, 0, :], dtype=jnp.complex128)
     Wci = jnp.asarray(Wc_iwp_q[:, :, :, 0, :, 0, :], dtype=jnp.complex128)
-
-    denom = Wc0 - Wci
-    safe = jnp.abs(denom) > 1.0e-14
-    ratio = jnp.where(safe, jnp.real(Wci / denom), jnp.asarray(0.0, dtype=jnp.float64))
-    good = jnp.isfinite(ratio) & (ratio > 0.0)
-
-    fallback = jnp.asarray(fallback_omega, dtype=jnp.float64)
-    omega_vals = jnp.where(good, omega_p * jnp.sqrt(ratio), fallback)
-    B = -0.5 * Wc0 * omega_vals.astype(jnp.complex128)
-    unfulfilled_fraction = float(1.0 - np.asarray(jax.device_get(jnp.mean(good.astype(jnp.float64))), dtype=np.float64))
+    omega_vals, B, good, unfulfilled_fraction = fit_gn_ppm_from_wc_pair(
+        Wc0,
+        Wci,
+        1j * omega_p,
+        fallback_omega=fallback_omega,
+    )
 
     return GodbyNeedsPPM(
         omega_p=omega_p,

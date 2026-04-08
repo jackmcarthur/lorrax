@@ -2112,45 +2112,53 @@ def main(argv=None):
 
 	# Keep eqp0_noqsym_w.dat consistent with sigma_mnk.h5 by reloading Sigma_c(E_DFT)
 	# from the written HDF5 payload when available.
-		if use_ppm_sigma and sigma_c_at_dft_ev is not None and meta.rank == 0 and sigma_omega_h5_path and os.path.exists(sigma_omega_h5_path):
-			try:
-				with h5py.File(sigma_omega_h5_path, "r") as h5:
-					if "sigma_c_at_dft_ev" in h5:
-						sigma_c_at_dft_ev = np.asarray(h5["sigma_c_at_dft_ev"], dtype=np.complex128)
-					if "omega_dft_rel_ev" in h5 and efermi_dft_ev is not None:
-						omega_dft_rel_file = np.asarray(h5["omega_dft_rel_ev"], dtype=np.float64)
-						omega_dft_rel_expected = np.asarray(energies_dft_ev_host, dtype=np.float64) - float(efermi_dft_ev)
-						max_omega_ref_err = float(np.max(np.abs(omega_dft_rel_file - omega_dft_rel_expected)))
-						if max_omega_ref_err > 1.0e-8:
-							raise RuntimeError(
-								f"{sigma_omega_h5_path} stores omega_dft_rel_ev inconsistent with the active "
-								f"WFN/band window: max|Δ|={max_omega_ref_err:.6e} eV"
-							)
-			except RuntimeError:
-				raise
-			except Exception as exc:
-				print0(f"  WARNING: failed to reload sigma_c_at_dft_ev from {sigma_omega_h5_path}: {exc}")
+	if (
+		use_ppm_sigma
+		and sigma_c_at_dft_ev is not None
+		and meta.rank == 0
+		and sigma_omega_h5_path
+		and os.path.exists(sigma_omega_h5_path)
+	):
+		try:
+			with h5py.File(sigma_omega_h5_path, "r") as h5:
+				if "sigma_c_at_dft_ev" in h5:
+					sigma_c_at_dft_ev = np.asarray(h5["sigma_c_at_dft_ev"], dtype=np.complex128)
+				if "omega_dft_rel_ev" in h5 and efermi_dft_ev is not None:
+					omega_dft_rel_file = np.asarray(h5["omega_dft_rel_ev"], dtype=np.float64)
+					omega_dft_rel_expected = np.asarray(energies_dft_ev_host, dtype=np.float64) - float(efermi_dft_ev)
+					max_omega_ref_err = float(np.max(np.abs(omega_dft_rel_file - omega_dft_rel_expected)))
+					if max_omega_ref_err > 1.0e-8:
+						raise RuntimeError(
+							f"{sigma_omega_h5_path} stores omega_dft_rel_ev inconsistent with the active "
+							f"WFN/band window: max|Δ|={max_omega_ref_err:.6e} eV"
+						)
+		except RuntimeError:
+			raise
+		except Exception as exc:
+			print0(f"  WARNING: failed to reload sigma_c_at_dft_ev from {sigma_omega_h5_path}: {exc}")
 
-	# Write PRE-self-consistency sigma to eqp0_noqsym (initial, one-shot values)
-	sigma_sx_initial_host = np.array(sigma_sx_initial)
-	if use_ppm_sigma and sigma_c_at_dft_ev is not None:
-		# Expand diagonal Sigma_c(E_DFT) to (nk, nb, nb) for output formatting.
-		sigma_c_diag_ev = np.array(sigma_c_at_dft_ev)
-		nk, nb = sigma_c_diag_ev.shape
-		sigma_coh_initial_host = np.zeros((nk, nb, nb), dtype=np.complex128)
-		for ik in range(nk):
-			sigma_coh_initial_host[ik].flat[:: nb + 1] = sigma_c_diag_ev[ik]
-	else:
-		sigma_coh_initial_host = np.array(sigma_coh_initial)
-	hartree_initial_host = np.array(hartree_initial)
-	write_sigma_to_file(
-		ryd2ev * sigma_sx_initial_host, params["output_file"],
-		sigma_coh_kij_eV=(sigma_coh_initial_host if (use_ppm_sigma and sigma_c_at_dft_ev is not None) else ryd2ev * sigma_coh_initial_host),
-		hartree_kij_eV=ryd2ev * hartree_initial_host,
-		sx_label=sx_col_label,
-		corr_label=corr_col_label,
-		total_label=total_col_label,
-	)
+	# Write PRE-self-consistency sigma to eqp0_noqsym (initial, one-shot values).
+	# Only rank 0 should touch the shared text outputs.
+	if meta.rank == 0:
+		sigma_sx_initial_host = np.array(sigma_sx_initial)
+		if use_ppm_sigma and sigma_c_at_dft_ev is not None:
+			# Expand diagonal Sigma_c(E_DFT) to (nk, nb, nb) for output formatting.
+			sigma_c_diag_ev = np.array(sigma_c_at_dft_ev)
+			nk, nb = sigma_c_diag_ev.shape
+			sigma_coh_initial_host = np.zeros((nk, nb, nb), dtype=np.complex128)
+			for ik in range(nk):
+				sigma_coh_initial_host[ik].flat[:: nb + 1] = sigma_c_diag_ev[ik]
+		else:
+			sigma_coh_initial_host = np.array(sigma_coh_initial)
+		hartree_initial_host = np.array(hartree_initial)
+		write_sigma_to_file(
+			ryd2ev * sigma_sx_initial_host, params["output_file"],
+			sigma_coh_kij_eV=(sigma_coh_initial_host if (use_ppm_sigma and sigma_c_at_dft_ev is not None) else ryd2ev * sigma_coh_initial_host),
+			hartree_kij_eV=ryd2ev * hartree_initial_host,
+			sx_label=sx_col_label,
+			corr_label=corr_col_label,
+			total_label=total_col_label,
+		)
 	if (
 		meta.rank == 0
 		and use_ppm_sigma
@@ -2185,23 +2193,23 @@ def main(argv=None):
 		)
 		print0(f"  Sigma frequency debug:  {debug_path}")
 
-	# Write POST-self-consistency sigma to eqp0_sc (rotated to QP basis)
-	sc_output_file = None
-	if self_consistent:
-		sigma_sx_final_host = np.array(sigma_sx_qp)
-		sigma_coh_final_host = np.array(sigma_coh_qp)
-		hartree_final_host = np.array(hartree_qp)
-		sc_output_file = params["output_file"].replace("eqp0", "eqp0_sc").replace(".dat", "_sc.dat")
-		if sc_output_file == params["output_file"]:
-			sc_output_file = params["output_file"].replace(".dat", "_sc.dat")
-		write_sigma_to_file(
-			ryd2ev * sigma_sx_final_host, sc_output_file,
-			sigma_coh_kij_eV=ryd2ev * sigma_coh_final_host,
-			hartree_kij_eV=ryd2ev * hartree_final_host,
-			sx_label=sx_col_label,
-			corr_label=corr_col_label,
-			total_label=total_col_label,
-		)
+		# Write POST-self-consistency sigma to eqp0_sc (rotated to QP basis)
+		sc_output_file = None
+		if self_consistent and meta.rank == 0:
+			sigma_sx_final_host = np.array(sigma_sx_qp)
+			sigma_coh_final_host = np.array(sigma_coh_qp)
+			hartree_final_host = np.array(hartree_qp)
+			sc_output_file = params["output_file"].replace("eqp0", "eqp0_sc").replace(".dat", "_sc.dat")
+			if sc_output_file == params["output_file"]:
+				sc_output_file = params["output_file"].replace(".dat", "_sc.dat")
+			write_sigma_to_file(
+				ryd2ev * sigma_sx_final_host, sc_output_file,
+				sigma_coh_kij_eV=ryd2ev * sigma_coh_final_host,
+				hartree_kij_eV=ryd2ev * hartree_final_host,
+				sx_label=sx_col_label,
+				corr_label=corr_col_label,
+				total_label=total_col_label,
+			)
 
 	# Write eqp1.dat for self-consistent runs
 	eqp1_written = None
