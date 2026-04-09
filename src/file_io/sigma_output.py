@@ -299,14 +299,63 @@ def write_eqp_table(dft_energies_ev, qp_energies_ev, filename="eqp.dat"):
 					)
 
 
+def write_chunked_complex_dataset_h5(
+	filepath,
+	dataset_name,
+	values,
+	*,
+	mode: str = "a",
+	k_chunk_size: int = 16,
+):
+	"""Write a 3D/4D complex dataset to HDF5 in k-chunks."""
+	abs_path = os.path.abspath(filepath)
+	dirname = os.path.dirname(abs_path)
+	if dirname:
+		os.makedirs(dirname, exist_ok=True)
+
+	shape = tuple(values.shape)
+	k_chunk = max(1, int(k_chunk_size))
+
+	with h5py.File(abs_path, mode) as h5:
+		if dataset_name in h5:
+			del h5[dataset_name]
+		if len(shape) == 4:
+			n_omega, nk, nb, nb2 = shape
+			dset = h5.create_dataset(
+				dataset_name,
+				shape=shape,
+				dtype=np.complex128,
+				chunks=(n_omega, min(k_chunk, nk), nb, nb2),
+			)
+			for k0 in range(0, nk, k_chunk):
+				k1 = min(k0 + k_chunk, nk)
+				dset[:, k0:k1, :, :] = np.asarray(values[:, k0:k1, :, :], dtype=np.complex128)
+		elif len(shape) == 3:
+			nk, nb, nb2 = shape
+			dset = h5.create_dataset(
+				dataset_name,
+				shape=shape,
+				dtype=np.complex128,
+				chunks=(min(k_chunk, nk), nb, nb2),
+			)
+			for k0 in range(0, nk, k_chunk):
+				k1 = min(k0 + k_chunk, nk)
+				dset[k0:k1, :, :] = np.asarray(values[k0:k1, :, :], dtype=np.complex128)
+		else:
+			h5.create_dataset(dataset_name, data=np.asarray(values, dtype=np.complex128))
+
+	return abs_path
+
+
 def write_sigma_omega_h5(
 	filepath,
 	omega_ev,
-	sigma_total_kij_ev,
+	sigma_total_kij_ev=None,
 	*,
 	sigma_c_kij_ev=None,
 	sigma_sx_kij_ev=None,
 	hartree_kij_ev=None,
+	k_chunk_size: int = 16,
 ):
 	"""Write frequency-dependent Sigma_mnk(omega) arrays to HDF5.
 
@@ -321,13 +370,66 @@ def write_sigma_omega_h5(
 	dirname = os.path.dirname(abs_path)
 	if dirname:
 		os.makedirs(dirname, exist_ok=True)
+
+	if sigma_total_kij_ev is None and sigma_c_kij_ev is None:
+		raise ValueError("write_sigma_omega_h5 requires sigma_total_kij_ev or sigma_c_kij_ev.")
+
+	if sigma_total_kij_ev is not None:
+		shape_ref = tuple(sigma_total_kij_ev.shape)
+	else:
+		shape_ref = tuple(sigma_c_kij_ev.shape)
+	if len(shape_ref) != 4:
+		raise ValueError("dynamic sigma tensors must have shape (n_omega, nk, nb, nb).")
+	n_omega, nk, nb, nb2 = shape_ref
+	if nb != nb2:
+		raise ValueError("dynamic sigma tensors must be square in band indices.")
+
+	k_chunk = max(1, int(k_chunk_size))
 	with h5py.File(abs_path, "w") as h5:
 		h5.create_dataset("omega_ev", data=np.asarray(omega_ev, dtype=np.float64))
-		h5.create_dataset("sigma_total_kij_ev", data=np.asarray(sigma_total_kij_ev, dtype=np.complex128))
+		dset_total = h5.create_dataset(
+			"sigma_total_kij_ev",
+			shape=shape_ref,
+			dtype=np.complex128,
+			chunks=(n_omega, min(k_chunk, nk), nb, nb2),
+		)
+		dset_c = None
 		if sigma_c_kij_ev is not None:
-			h5.create_dataset("sigma_c_kij_ev", data=np.asarray(sigma_c_kij_ev, dtype=np.complex128))
-		if sigma_sx_kij_ev is not None:
-			h5.create_dataset("sigma_sx_kij_ev", data=np.asarray(sigma_sx_kij_ev, dtype=np.complex128))
-		if hartree_kij_ev is not None:
-			h5.create_dataset("hartree_kij_ev", data=np.asarray(hartree_kij_ev, dtype=np.complex128))
+			dset_c = h5.create_dataset(
+				"sigma_c_kij_ev",
+				shape=shape_ref,
+				dtype=np.complex128,
+				chunks=(n_omega, min(k_chunk, nk), nb, nb2),
+			)
+
+		for k0 in range(0, nk, k_chunk):
+			k1 = min(k0 + k_chunk, nk)
+			if sigma_total_kij_ev is not None:
+				total_chunk = np.asarray(sigma_total_kij_ev[:, k0:k1, :, :], dtype=np.complex128)
+			else:
+				total_chunk = np.asarray(sigma_c_kij_ev[:, k0:k1, :, :], dtype=np.complex128)
+				if sigma_sx_kij_ev is not None:
+					total_chunk = total_chunk + np.asarray(sigma_sx_kij_ev[k0:k1, :, :], dtype=np.complex128)[None, ...]
+				if hartree_kij_ev is not None:
+					total_chunk = total_chunk + np.asarray(hartree_kij_ev[k0:k1, :, :], dtype=np.complex128)[None, ...]
+			dset_total[:, k0:k1, :, :] = total_chunk
+			if dset_c is not None:
+				dset_c[:, k0:k1, :, :] = np.asarray(sigma_c_kij_ev[:, k0:k1, :, :], dtype=np.complex128)
+
+	if sigma_sx_kij_ev is not None:
+		write_chunked_complex_dataset_h5(
+			abs_path,
+			"sigma_sx_kij_ev",
+			sigma_sx_kij_ev,
+			mode="a",
+			k_chunk_size=k_chunk,
+		)
+	if hartree_kij_ev is not None:
+		write_chunked_complex_dataset_h5(
+			abs_path,
+			"hartree_kij_ev",
+			hartree_kij_ev,
+			mode="a",
+			k_chunk_size=k_chunk,
+		)
 	return abs_path

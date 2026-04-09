@@ -37,6 +37,15 @@ def _to_host_np(a, dtype=np.complex128):
         return np.asarray(jax.device_get(a), dtype=dtype)
 
 
+def _scalar_to_host_float(a) -> float:
+    """Fetch a scalar JAX value in a multihost-safe way."""
+
+    if jax.process_count() > 1:
+        gathered = np.asarray(_mh.process_allgather(jnp.asarray(a), tiled=False), dtype=np.float64)
+        return float(gathered.reshape(-1)[0])
+    return float(np.asarray(jax.device_get(a), dtype=np.float64))
+
+
 def _minimax_disk_cache_dir() -> Path | None:
     """Return the persistent minimax cache directory, creating it if needed."""
 
@@ -378,9 +387,7 @@ def fit_gn_ppm_from_wc_pair(
     fallback = jnp.asarray(fallback_omega, dtype=jnp.float64)
     omega_vals = jnp.where(good, jnp.sqrt(omega_sq_re), fallback)
     B_vals = -0.5 * Wc0 * omega_vals.astype(jnp.complex128)
-    unfulfilled_fraction = float(
-        1.0 - np.asarray(jax.device_get(jnp.mean(good.astype(jnp.float64))), dtype=np.float64)
-    )
+    unfulfilled_fraction = 1.0 - _scalar_to_host_float(jnp.mean(good.astype(jnp.float64)))
     return omega_vals, B_vals, good, unfulfilled_fraction
 
 

@@ -465,6 +465,7 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     print0=print,
 ) -> PPMBuildResult:
     """Build GN-PPM parameters from minimax W(0) and W(i*omega_p)."""
+    import time as _ppm_time
 
     if minimax_config is not None:
         target_error = float(minimax_config.target_error)
@@ -518,20 +519,30 @@ def compute_w0_wiwp_and_ppm_from_minimax(
         f"nodes={quad_imag.node_count}, fit_err~{quad_imag.max_error:.3e}"
     )
 
+    _t_chi0 = _ppm_time.perf_counter()
     chi0_q = w_isdf.compute_chi0_minimax(
         psi_vTX, psi_vY, psi_cX, psi_cTY,
         enk_v, enk_c, quad, meta, mesh_xy,
         energy_reference=e_ref,
     )
+    chi0_q.block_until_ready()
+    print0(f"  [TIMING-PPM] chi(0): {_ppm_time.perf_counter() - _t_chi0:.3f}s")
+    _t_chii = _ppm_time.perf_counter()
     chii_q = w_isdf.compute_chi0_minimax(
         psi_vTX, psi_vY, psi_cX, psi_cTY,
         enk_v, enk_c, quad_imag, meta, mesh_xy,
         energy_reference=e_ref,
     )
+    chii_q.block_until_ready()
+    print0(f"  [TIMING-PPM] chi(iωp): {_ppm_time.perf_counter() - _t_chii:.3f}s")
+    _t_w0 = _ppm_time.perf_counter()
     W0_q = w_isdf.solve_w_from_chi_q_jax(V_qmunu, chi0_q, meta, mesh_xy)
-    Wiwp_q = w_isdf.solve_w_from_chi_q_jax(V_qmunu, chii_q, meta, mesh_xy)
     W0_q.block_until_ready()
+    print0(f"  [TIMING-PPM] W(0): {_ppm_time.perf_counter() - _t_w0:.3f}s")
+    _t_wi = _ppm_time.perf_counter()
+    Wiwp_q = w_isdf.solve_w_from_chi_q_jax(V_qmunu, chii_q, meta, mesh_xy)
     Wiwp_q.block_until_ready()
+    print0(f"  [TIMING-PPM] W(iωp): {_ppm_time.perf_counter() - _t_wi:.3f}s")
 
     V_head = V_qmunu
     if head_correction_fn is not None:
@@ -561,18 +572,22 @@ def compute_w0_wiwp_and_ppm_from_minimax(
 
     Wc0_qmunu = Wc0_q[:, :, :, 0, :, 0, :]
     Wci_qmunu = Wci_q[:, :, :, 0, :, 0, :]
+    _t_fit = _ppm_time.perf_counter()
     omega_qmunu, b_qmunu, valid_qmunu, unfulfilled = fit_gn_ppm_from_wc_pair(
         Wc0_qmunu,
         Wci_qmunu,
         1j * complex(omega_p_ry),
         fallback_omega=float(fallback_omega),
     )
+    print0(f"  [TIMING-PPM] GN fit: {_ppm_time.perf_counter() - _t_fit:.3f}s")
 
     # GN poles are for W^c, so W^c(t) is a direct exponential sum.
+    _t_layout = _ppm_time.perf_counter()
     Omega = _qmunu_to_munu_local(omega_qmunu, mesh_xy=mesh_xy)
     B = _qmunu_to_munu_local(b_qmunu, mesh_xy=mesh_xy)
     valid_mask = _qmunu_to_munu_local(valid_qmunu, mesh_xy=mesh_xy)
     Wc0_mu_nu = _qmunu_to_munu_local(Wc0_qmunu, mesh_xy=mesh_xy)
+    print0(f"  [TIMING-PPM] q->mu,nu layout: {_ppm_time.perf_counter() - _t_layout:.3f}s")
 
     # PPM consistency check: W^c(0) ≈ ± 2 B / Omega (elementwise).
     w0_rel_error = None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import h5py
 import numpy as np
 
 
@@ -91,33 +92,37 @@ def build_qsgw_sigma_xc(
         raise ValueError(f"qp_energies_kn_ev must have shape ({nk}, {nb}).")
 
     sigma_qsgw = np.zeros((nk, nb, nb), dtype=np.complex128)
-    clipped = 0
 
-    def _interp_matrix_on_grid(values_omega_kij: np.ndarray, x_ev: float) -> np.ndarray:
-        nonlocal clipped
-        x_lo = float(omega[0])
-        x_hi = float(omega[-1])
-        x_clamped = float(np.clip(float(x_ev), x_lo, x_hi))
-        if x_clamped != float(x_ev):
-            clipped += 1
-        val_re = np.empty((nb, nb), dtype=np.float64)
-        val_im = np.empty((nb, nb), dtype=np.float64)
-        for i in range(nb):
-            for j in range(nb):
-                val_re[i, j] = np.interp(x_clamped, omega, np.real(values_omega_kij[:, i, j]))
-                val_im[i, j] = np.interp(x_clamped, omega, np.imag(values_omega_kij[:, i, j]))
-        return val_re + 1j * val_im
+    omega_lo = float(omega[0])
+    omega_hi = float(omega[-1])
+    E_clamped = np.clip(E, omega_lo, omega_hi)
+    clipped = int(np.count_nonzero(E_clamped != E))
 
     for ik in range(nk):
         # "Re" in QSGW corresponds to the Hermitian part of Sigma(omega).
         sigma_h_omega = 0.5 * (sigma[:, ik] + np.conj(np.swapaxes(sigma[:, ik], -1, -2)))
-        sigma_eval = []
-        for i in range(nb):
-            Ei = float(E[ik, i])
-            sigma_eval.append(_interp_matrix_on_grid(sigma_h_omega, Ei))
-        for i in range(nb):
-            for j in range(nb):
-                sigma_qsgw[ik, i, j] = 0.5 * (sigma_eval[i][i, j] + sigma_eval[j][i, j])
+
+        # Interpolate the full Hermitian matrix at each quasiparticle energy E_i(k).
+        e_eval = E_clamped[ik]
+        idx_hi = np.searchsorted(omega, e_eval, side="left")
+        idx_hi = np.clip(idx_hi, 1, n_omega - 1)
+        idx_lo = idx_hi - 1
+        omega_lo_i = omega[idx_lo]
+        omega_hi_i = omega[idx_hi]
+        denom = np.where(omega_hi_i > omega_lo_i, omega_hi_i - omega_lo_i, 1.0)
+        weight_hi = (e_eval - omega_lo_i) / denom
+        weight_lo = 1.0 - weight_hi
+
+        sigma_eval = (
+            weight_lo[:, None, None] * sigma_h_omega[idx_lo, :, :]
+            + weight_hi[:, None, None] * sigma_h_omega[idx_hi, :, :]
+        )
+
+        # A[i,j] = Sigma_ij(E_i), B[i,j] = Sigma_ij(E_j)
+        band_idx = np.arange(nb)
+        A = sigma_eval[band_idx, band_idx, :]
+        B = sigma_eval[band_idx, :, band_idx].T
+        sigma_qsgw[ik] = 0.5 * (A + B)
 
     # Enforce exact Hermiticity against interpolation noise.
     sigma_qsgw = 0.5 * (sigma_qsgw + np.conj(np.swapaxes(sigma_qsgw, -1, -2)))
@@ -131,6 +136,163 @@ def build_qsgw_sigma_xc(
         }
         return sigma_qsgw, diagnostics
     return sigma_qsgw
+
+
+def load_sigma_xc_diag_from_h5(
+    sigma_h5_path: str,
+    sigma_sx_kij_ev: np.ndarray,
+    *,
+    sigma_c_dataset: str = "sigma_c_kij_ev",
+    k_chunk_size: int = 16,
+    band_block_size: int = 128,
+) -> np.ndarray:
+    """Load diagonal Sigma_xc(omega,k,n) from HDF5 without materializing the full matrix."""
+
+    sigma_sx_diag_ev = np.diagonal(np.asarray(sigma_sx_kij_ev, dtype=np.complex128), axis1=1, axis2=2)
+
+    with h5py.File(sigma_h5_path, "r") as h5:
+        dset_c = h5[sigma_c_dataset]
+        n_omega, nk, nb, nb2 = dset_c.shape
+        if nb != nb2:
+            raise ValueError(f"{sigma_c_dataset} must be square in band indices.")
+        if sigma_sx_diag_ev.shape != (nk, nb):
+            raise ValueError(
+                f"sigma_sx_kij_ev diagonal shape {sigma_sx_diag_ev.shape} incompatible with HDF5 shape {(nk, nb)}"
+            )
+
+        sigma_xc_diag_ev = np.empty((n_omega, nk, nb), dtype=np.complex128)
+        k_chunk = max(1, int(k_chunk_size))
+        b_chunk = max(1, int(band_block_size))
+
+        for k0 in range(0, nk, k_chunk):
+            k1 = min(k0 + k_chunk, nk)
+            for b0 in range(0, nb, b_chunk):
+                b1 = min(b0 + b_chunk, nb)
+                block = np.asarray(dset_c[:, k0:k1, b0:b1, b0:b1], dtype=np.complex128)
+                sigma_c_diag = np.diagonal(block, axis1=2, axis2=3)
+                sigma_xc_diag_ev[:, k0:k1, b0:b1] = sigma_c_diag + sigma_sx_diag_ev[None, k0:k1, b0:b1]
+
+    return sigma_xc_diag_ev
+
+
+def _interp_rows_on_grid(values_omega_ij: np.ndarray, eval_ev: np.ndarray, omega_ev: np.ndarray) -> np.ndarray:
+    """Interpolate rows of a frequency-dependent matrix block at row-specific energies.
+
+    Parameters
+    ----------
+    values_omega_ij
+        Shape (n_omega, n_row, n_col).
+    eval_ev
+        Shape (n_row,), evaluation energy for each row.
+    omega_ev
+        Monotonic frequency grid.
+    """
+    eval_ev = np.asarray(eval_ev, dtype=np.float64)
+    idx_hi = np.searchsorted(omega_ev, eval_ev, side="left")
+    idx_hi = np.clip(idx_hi, 1, len(omega_ev) - 1)
+    idx_lo = idx_hi - 1
+    omega_lo = omega_ev[idx_lo]
+    omega_hi = omega_ev[idx_hi]
+    denom = np.where(omega_hi > omega_lo, omega_hi - omega_lo, 1.0)
+    weight_hi = (eval_ev - omega_lo) / denom
+    weight_lo = 1.0 - weight_hi
+    row_idx = np.arange(values_omega_ij.shape[1])
+    return (
+        weight_lo[:, None] * values_omega_ij[idx_lo, row_idx, :]
+        + weight_hi[:, None] * values_omega_ij[idx_hi, row_idx, :]
+    )
+
+
+def build_qsgw_sigma_xc_from_h5(
+    sigma_h5_path: str,
+    sigma_sx_kij_ev: np.ndarray,
+    omega_ev: np.ndarray,
+    qp_energies_kn_ev: np.ndarray,
+    *,
+    sigma_c_dataset: str = "sigma_c_kij_ev",
+    output_dataset: str = "sigma_xc_qsgw_kij_ev",
+    k_chunk_size: int = 1,
+    band_block_size: int = 128,
+) -> dict[str, float]:
+    """Build static Hermitian QSGW Sigma_xc directly from chunked HDF5 reads.
+
+    This avoids materializing the full dynamic `(omega,k,m,n)` tensor on host memory.
+    """
+
+    sigma_sx = np.asarray(sigma_sx_kij_ev, dtype=np.complex128)
+    omega = np.asarray(omega_ev, dtype=np.float64)
+    E = np.asarray(qp_energies_kn_ev, dtype=np.float64)
+    if sigma_sx.ndim != 3:
+        raise ValueError("sigma_sx_kij_ev must have shape (nk, nb, nb).")
+
+    nk, nb, nb2 = sigma_sx.shape
+    if nb != nb2:
+        raise ValueError("sigma_sx_kij_ev must be square in band indices.")
+    if E.shape != (nk, nb):
+        raise ValueError(f"qp_energies_kn_ev must have shape ({nk}, {nb}).")
+
+    omega_lo = float(omega[0])
+    omega_hi = float(omega[-1])
+    E_clamped = np.clip(E, omega_lo, omega_hi)
+    clipped = int(np.count_nonzero(E_clamped != E))
+
+    with h5py.File(sigma_h5_path, "a") as h5:
+        dset_c = h5[sigma_c_dataset]
+        n_omega, nk_h5, nb_h5, nb2_h5 = dset_c.shape
+        if (nk_h5, nb_h5, nb2_h5) != (nk, nb, nb):
+            raise ValueError(
+                f"{sigma_c_dataset} shape {(nk_h5, nb_h5, nb2_h5)} incompatible with sigma_sx {sigma_sx.shape}"
+            )
+        if output_dataset in h5:
+            del h5[output_dataset]
+        dset_out = h5.create_dataset(
+            output_dataset,
+            shape=(nk, nb, nb),
+            dtype=np.complex128,
+            chunks=(max(1, min(int(k_chunk_size), nk)), max(1, min(int(band_block_size), nb)), max(1, min(int(band_block_size), nb))),
+        )
+
+        k_chunk = max(1, int(k_chunk_size))
+        b_chunk = max(1, int(band_block_size))
+
+        for k0 in range(0, nk, k_chunk):
+            k1 = min(k0 + k_chunk, nk)
+            for i0 in range(0, nb, b_chunk):
+                i1 = min(i0 + b_chunk, nb)
+                for j0 in range(0, nb, b_chunk):
+                    j1 = min(j0 + b_chunk, nb)
+                    block_c_ij = np.asarray(dset_c[:, k0:k1, i0:i1, j0:j1], dtype=np.complex128)
+                    block_x_ij = sigma_sx[k0:k1, i0:i1, j0:j1][None, ...]
+                    block_xc_ij = block_c_ij + block_x_ij
+                    if i0 == j0:
+                        block_h_ij = 0.5 * (
+                            block_xc_ij + np.conj(np.swapaxes(block_xc_ij, -1, -2))
+                        )
+                    else:
+                        block_c_ji = np.asarray(dset_c[:, k0:k1, j0:j1, i0:i1], dtype=np.complex128)
+                        block_x_ji = sigma_sx[k0:k1, j0:j1, i0:i1][None, ...]
+                        block_xc_ji = block_c_ji + block_x_ji
+                        block_h_ij = 0.5 * (
+                            block_xc_ij + np.conj(np.swapaxes(block_xc_ji, -1, -2))
+                        )
+
+                    out_block = np.empty((k1 - k0, i1 - i0, j1 - j0), dtype=np.complex128)
+                    for kk in range(k1 - k0):
+                        eval_rows = E_clamped[k0 + kk, i0:i1]
+                        eval_cols = E_clamped[k0 + kk, j0:j1]
+                        sigma_h_omega = block_h_ij[:, kk, :, :]
+                        row_eval = _interp_rows_on_grid(sigma_h_omega, eval_rows, omega)
+                        col_eval = _interp_rows_on_grid(np.swapaxes(sigma_h_omega, 1, 2), eval_cols, omega).T
+                        out_block[kk] = 0.5 * (row_eval + col_eval)
+                    dset_out[k0:k1, i0:i1, j0:j1] = out_block
+
+    total_evals = float(nk * nb)
+    return {
+        "n_interp_clipped": float(clipped),
+        "frac_interp_clipped": (float(clipped) / total_evals) if total_evals > 0 else 0.0,
+        "omega_min_ev": omega_lo,
+        "omega_max_ev": omega_hi,
+    }
 
 
 def plot_qp_energy_comparison(

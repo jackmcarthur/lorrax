@@ -54,23 +54,48 @@ class SymMaps:
             self.R_cart = self.R_grid.astype(float)
             self.U_spinor = np.eye(2, dtype=complex)[None, :, :]
 
-            # k−q maps on the unfolded (which equals reduced) grid
-            self.kq_map = self.get_kminusq_map(wfn, self.unfolded_kpts)
-            self.kqfull_map = self.get_kminusqfull_map(wfn, self.unfolded_kpts)
+            # Build direct integer-grid lookup for the identity/no-symmetry case.
+            kgrid = np.asarray(wfn.kgrid, dtype=np.int32)
+            shift = np.asarray(getattr(wfn, "shift", (0.0, 0.0, 0.0)), dtype=np.float64)
+            shift_frac = shift / kgrid.astype(np.float64)
+            kpts_wrapped = np.mod(self.unfolded_kpts - shift_frac[None, :], 1.0)
+            self.kvecs_asints = np.mod(
+                np.rint(kpts_wrapped * kgrid[None, :]).astype(np.int32),
+                kgrid[None, :],
+            )
+
+            lookup = -np.ones(tuple(int(x) for x in kgrid), dtype=np.int32)
+            lookup[
+                self.kvecs_asints[:, 0],
+                self.kvecs_asints[:, 1],
+                self.kvecs_asints[:, 2],
+            ] = np.arange(self.unfolded_kpts.shape[0], dtype=np.int32)
+
+            # k−q maps on the unfolded (which equals reduced) grid.
+            # Use direct modular arithmetic instead of the generic O(nk^3) search path.
+            kminusq_mod = np.mod(
+                self.kvecs_asints[:, None, :] - self.kvecs_asints[None, :, :],
+                kgrid[None, None, :],
+            )
+            self.kqfull_map = lookup[
+                kminusq_mod[:, :, 0],
+                kminusq_mod[:, :, 1],
+                kminusq_mod[:, :, 2],
+            ]
+            self.kq_map = self.kqfull_map.copy()
             self.kfull_symmap = np.zeros((self.nk_tot, 1), dtype=np.int32)
 
-            # Integer k-grid vectors and q enumerations
-            kx, ky, kz = np.meshgrid(np.arange(wfn.kgrid[0]),
-                            np.arange(wfn.kgrid[1]),
-                            np.arange(wfn.kgrid[2]),
-                            indexing='ij')
-            self.kvecs_asints = np.stack([kx.flatten(), ky.flatten(), kz.flatten()], axis=1)
+            # Integer q enumerations for k' - k outside the first BZ.
             qpt_vecs = self.kvecs_asints[:, None, :] - self.kvecs_asints[None, :, :]
-            self.all_unfolded_qpts = np.unique(qpt_vecs.reshape(-1, 3), axis=0)
-            self.all_unfolded_qpt_ids = np.zeros((len(self.kvecs_asints), len(self.kvecs_asints)), dtype=np.int32)
-            for i, q in enumerate(self.all_unfolded_qpts):
-                mask = (qpt_vecs == q).all(axis=2)
-                self.all_unfolded_qpt_ids[mask] = i
+            self.all_unfolded_qpts, inverse = np.unique(
+                qpt_vecs.reshape(-1, 3),
+                axis=0,
+                return_inverse=True,
+            )
+            self.all_unfolded_qpt_ids = inverse.reshape(
+                self.kvecs_asints.shape[0],
+                self.kvecs_asints.shape[0],
+            ).astype(np.int32)
             return
 
         self.sym_matrices = wfn.sym_matrices[:wfn.ntran] # these apply to real space coords as sym_matrices[i] @ [rx,ry,rz]
