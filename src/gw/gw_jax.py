@@ -1384,6 +1384,7 @@ def main(argv=None):
 					),
 					fallback_omega=ppm_fallback,
 					head_correction_fn=head_correction,
+					debug_head_only_w=bool(params.get("debug_head_only_w", False)),
 					print0=print0,
 				)
 			_ppm_t1 = _ppm_time.perf_counter()

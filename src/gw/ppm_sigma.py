@@ -255,6 +255,7 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     minimax_energy_reference_fn: Callable[[jax.Array, jax.Array], float] | None = None,
     fallback_omega: float = 2.0,
     head_correction_fn: Callable[[jax.Array, jax.Array, complex], tuple[jax.Array, jax.Array, dict]] | None = None,
+    debug_head_only_w: bool = False,
     print0=print,
 ) -> PPMBuildResult:
     """Build GN-PPM parameters from minimax W(0) and W(i*omega_p)."""
@@ -350,15 +351,31 @@ def compute_w0_wiwp_and_ppm_from_minimax(
 
     nkx, nky, nkz = W0_q.shape[0], W0_q.shape[1], W0_q.shape[2]
     n_rmu = W0_q.shape[4]
-    # V without head for body W^c extraction
-    V_q = jnp.asarray(V_qmunu)[0, 0, 0].reshape(nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
 
-    _summarize_hermitian_qmunu("W(0) [no head]", W0_q, print0)
-    _summarize_hermitian_qmunu(f"W(iωp={omega_p_ry:.3f} Ry) [no head]", Wiwp_q, print0)
-
-    # Build W^c = W(no head) - V(no head).  Head handled separately.
-    Wc0_q = W0_q - V_q
-    Wci_q = Wiwp_q - V_q
+    if debug_head_only_w and head_correction_fn is not None:
+        # TEST MODE: zero the body, add only the head to W and V.
+        # This isolates the head's contribution through the full PPM pipeline
+        # so we can compare it to the analytic scalar GN head correction.
+        print0("  *** DEBUG: head-only W mode — body zeroed, only head rank-1 in W ***")
+        W0_zero = jnp.zeros_like(W0_q)
+        Wiwp_zero = jnp.zeros_like(Wiwp_q)
+        V_zero = jnp.zeros_like(V_qmunu)
+        # Add head to zeroed W and V via the existing head_correction_fn
+        V_headed_0, W0_headed, _ = head_correction_fn(V_zero, W0_zero, 0.0 + 0.0j)
+        V_headed_i, Wiwp_headed, _ = head_correction_fn(V_zero, Wiwp_zero, 1j * float(omega_p_ry))
+        V_q = jnp.asarray(V_headed_0)[0, 0, 0].reshape(nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
+        Wc0_q = W0_headed - V_q
+        V_q_i = jnp.asarray(V_headed_i)[0, 0, 0].reshape(nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
+        Wci_q = Wiwp_headed - V_q_i
+        _summarize_hermitian_qmunu("W(0) [HEAD ONLY]", W0_headed, print0)
+        _summarize_hermitian_qmunu(f"W(iωp) [HEAD ONLY]", Wiwp_headed, print0)
+    else:
+        # Normal path: V without head for body W^c extraction
+        V_q = jnp.asarray(V_qmunu)[0, 0, 0].reshape(nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
+        _summarize_hermitian_qmunu("W(0) [no head]", W0_q, print0)
+        _summarize_hermitian_qmunu(f"W(iωp={omega_p_ry:.3f} Ry) [no head]", Wiwp_q, print0)
+        Wc0_q = W0_q - V_q
+        Wci_q = Wiwp_q - V_q
 
 
     ppm = extract_gn_ppm_parameters_from_Wc(
