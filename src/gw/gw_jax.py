@@ -1197,6 +1197,7 @@ def main(argv=None):
 	with mesh_xy:
 		V_mu_nu_nohead = jax.lax.with_sharding_constraint(V_mu_nu_nohead, sh.V_shard)
 	V_mu_nu_headed = None
+	static_head_terms = None
 
 	# ============================================================================
 	# HEAD INJECTION: Add the q→0, G=0 Coulomb divergence correction
@@ -1215,7 +1216,7 @@ def main(argv=None):
 	#   - Σ_x and static COH use headed V_μν (consistent with W - V subtraction).
 	#   - Hartree uses v_q0_noG0_munu (no-head) because V_H(G=0) is excluded.
 	# ============================================================================
-	if do_G0:  # do_G0=True: apply head corrections
+	if do_G0 and use_ppm_sigma:  # dynamic path keeps the older headed V/W treatment
 		head_omega = 0.0
 		if do_screened:
 			head_omega = params.get("debug_omega") or 0.0
@@ -1236,6 +1237,42 @@ def main(argv=None):
 		V_mu_nu_headed = jnp.asarray(V_qmunu)[0, 0, 0].transpose(3, 4, 0, 1, 2)
 		with mesh_xy:
 			V_mu_nu_headed = jax.lax.with_sharding_constraint(V_mu_nu_headed, sh.V_shard)
+	elif do_G0:
+		# For static COHSEX, add the q=0 head exactly in band space rather than
+		# approximating it via a rank-1 ISDF correction in μν.
+		from .head_correction import compute_static_head_terms, format_static_head_diagnostics
+		vc0_static, wcoul0_static, source_static = determine_wcoul0(
+			params,
+			input_dir,
+			wfn,
+			sym,
+			meta,
+			print0,
+			omega=0.0 + 0.0j,
+		)
+		print0("")
+		print0("-" * 72)
+		print0("  FINITE-SIZE CORRECTIONS")
+		print0("-" * 72)
+		print0(f"  Head source: {source_static}")
+		print0(f"  v(q→0)  = {float(complex(vc0_static).real):12.3f} a.u.  (bare Coulomb head)")
+		if do_screened:
+			print0(f"  W(q→0)  = {float(complex(wcoul0_static).real):12.3f} a.u.  (screened Coulomb head)")
+			print0(
+				f"  ΔW      = {float((complex(wcoul0_static) - complex(vc0_static)).real):12.3f} a.u.  "
+				"(screening correction)"
+			)
+		band_ids = np.arange(int(b0), int(b3), dtype=np.int32)
+		occ_mask_static = band_ids < int(wfn.nelec)
+		static_head_terms = compute_static_head_terms(
+			vc0=complex(vc0_static),
+			wcoul0_static=complex(wcoul0_static),
+			occ=occ_mask_static,
+			cell_volume=float(wfn.cell_volume),
+			nk_tot=int(meta.nk_tot),
+			source=source_static,
+		)
+		print0(format_static_head_diagnostics(static_head_terms))
 
 	# Canonical V tensors for downstream terms.
 	# - V_mu_nu_exchange: bare-exchange kernel (headed by default).
@@ -1353,6 +1390,19 @@ def main(argv=None):
 
 		return sigma_sx_kij, sigma_coh_kij, hartree_kmn
 
+	def _apply_static_head_terms(sigma_sx_kij, sigma_coh_kij):
+		if static_head_terms is None:
+			return sigma_sx_kij, sigma_coh_kij
+		from .head_correction import static_head_terms_to_kij
+		sx_head, coh_head = static_head_terms_to_kij(
+			static_head_terms,
+			nk_tot=meta.nk_tot,
+			do_screened=do_screened,
+		)
+		sx_head = jax.device_put(sx_head, Gij_shard)
+		coh_head = jax.device_put(coh_head, Gij_shard)
+		return sigma_sx_kij + sx_head, sigma_coh_kij + coh_head
+
 	fft_vol_au = float(wfn.cell_volume / np.prod(wfn.fft_grid))
 
 	with mesh_xy:
@@ -1364,6 +1414,10 @@ def main(argv=None):
 				W_mu_nu, V_mu_nu_for_coh, v_q0_noG0_munu, Gij_static,
 				meta.nkx, meta.nky, meta.nkz, meta.nk_tot, meta.nspinor,
 				fft_vol_au, bispinor,
+			)
+			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax = _apply_static_head_terms(
+				sigma_sx_kbar_ij_jax,
+				sigma_coh_kbar_ij_jax,
 			)
 			sigma_sx_kbar_ij_jax.block_until_ready()
 			sigma_coh_kbar_ij_jax.block_until_ready()
@@ -2084,6 +2138,7 @@ def main(argv=None):
 					meta.nkx, meta.nky, meta.nkz, meta.nk_tot, meta.nspinor,
 					fft_vol_au, bispinor,
 				)
+			sigma_sx_new, sigma_coh_new = _apply_static_head_terms(sigma_sx_new, sigma_coh_new)
 			
 			# Combine and extract upper triangle
 			sigma_new = sigma_sx_new + sigma_coh_new + hartree_new
@@ -2130,6 +2185,10 @@ def main(argv=None):
 				meta.nkx, meta.nky, meta.nkz, meta.nk_tot, meta.nspinor,
 				fft_vol_au, bispinor,
 			)
+		sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax = _apply_static_head_terms(
+			sigma_sx_kbar_ij_jax,
+			sigma_coh_kbar_ij_jax,
+		)
 	else:
 		# One-shot: diagonalize H = (H_DFT - V_xc) + V_H + Σ_xc
 		H_qp_mnk = kin_ion_full + sigma_total_full
