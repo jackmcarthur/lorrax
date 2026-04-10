@@ -2,6 +2,7 @@ import numpy as np
 
 from gw.head_correction import (
     compute_static_head_terms,
+    resolve_head_override,
     static_head_terms_to_kij,
 )
 
@@ -55,3 +56,23 @@ def test_static_head_terms_to_kij_broadcasts_diagonal_heads():
     np.testing.assert_allclose(np.asarray(sx_kij), np.broadcast_to(expected_sx, (3, 3, 3)))
     np.testing.assert_allclose(np.asarray(x_kij), np.broadcast_to(expected_x, (3, 3, 3)))
     np.testing.assert_allclose(np.asarray(coh_kij), np.broadcast_to(expected_coh, (3, 3, 3)))
+
+
+def test_resolve_head_override_uses_frequency_specific_whead():
+    params = {
+        "vhead": 100.0,
+        "whead_0freq": 25.0,
+        "whead_imfreq": 40.0,
+    }
+
+    static = resolve_head_override(params, 0.0 + 0.0j)
+    imag = resolve_head_override(params, 1j * 2.0)
+
+    assert static is not None
+    assert imag is not None
+    assert static.vc0 == complex(100.0)
+    assert static.wcoul0 == complex(25.0)
+    assert static.source == "override"
+    assert imag.vc0 == complex(100.0)
+    assert imag.wcoul0 == complex(40.0)
+    assert "override(" in imag.source

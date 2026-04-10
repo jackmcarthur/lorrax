@@ -83,7 +83,7 @@ except RuntimeError as exc:
 	else:
 		raise
 from file_io import (
-    WFNReader, EPSReader,
+    WFNReader,
     write_sigma_to_file, write_eqp1, write_eqp_g0w0, write_sigma_omega_h5,
     write_chunked_complex_dataset_h5,
     write_sigma_freq_debug_table,
@@ -129,8 +129,16 @@ from .qsgw_utils import (
 	build_qsgw_sigma_xc_from_h5,
 	plot_qp_energy_comparison,
 )
-from .vcoul import compute_q0_averages
-from common.chi_from_dipole import read_dipole_h5, compute_S_omega
+from .head_correction import (
+	compute_static_head_terms_from_sample,
+	fit_head_gn_from_samples,
+	format_head_diagnostics,
+	format_head_pair_diagnostics,
+	format_head_sample_diagnostics,
+	format_static_head_diagnostics,
+	resolve_head_sample,
+	static_head_terms_to_kij,
+)
 from .wavefunction_bundle import (
 	BandSlices,
 	build_wavefunction_bundle,
@@ -170,174 +178,6 @@ def make_shardings(mesh_xy: Mesh) -> SimpleNamespace:
 		V_shard = NamedSharding(mesh_xy, P('x', 'y', None, None, None)),
 		out_shard = NamedSharding(mesh_xy, P(None, None, None)),
 	)
-
-def determine_wcoul0(params, input_dir, wfn, sym, meta, print_fn, omega):
-	"""Resolve (v_c0, w_c0) head averages using user preference fallback order.
-
-	For ``wcoul0_source='s_tensor'``, this evaluates S(omega) from dipole data.
-	This is the default because it provides frequency-dependent heads, which
-	is required for correct GN-PPM extraction at omega=0 and omega=i*omega_p.
-	For ``wcoul0_source='epshead'``, only static epshead is available and is used
-	as a fallback even when omega != 0 (debug only).
-	"""
-	want_source = str(params.get("wcoul0_source", "s_tensor")).strip().lower()
-	if want_source not in ("epshead", "s_tensor"):
-		print_fn(f"Unknown wcoul0_source={want_source}; defaulting to 's_tensor'")
-		want_source = "s_tensor"
-	omega_val = complex(omega)
-	eta = float(params.get("wcoul0_eta", 0.0) or 0.0)
-
-	eps0_path = os.path.join(input_dir, "eps0mat.h5")
-	dipole_path = os.path.join(input_dir, "dipole.h5")
-
-	def from_epshead():
-		if not os.path.exists(eps0_path):
-			return None
-		try:
-			if abs(omega_val) > 1e-14:
-				print_fn(
-					f"wcoul0_source=epshead is static-only; using epshead(0) for omega={omega_val} Ry"
-				)
-			eps0 = EPSReader(eps0_path)
-			vc0_mean, wcoul0 = compute_q0_averages(
-				wfn,
-				jnp.asarray(eps0.epshead, dtype=jnp.complex128),
-				meta,
-				S_cart=None,
-			)
-			# Source printed in finite-size corrections section
-			label = "epshead(0)" if abs(omega_val) > 1e-14 else "epshead"
-			return vc0_mean, wcoul0, label
-		except Exception as exc:  # pragma: no cover - diagnostic path
-			print_fn(f"epshead wcoul0 failed: {exc}")
-			return None
-
-	def from_s_tensor():
-		if not os.path.exists(dipole_path):
-			print_fn(f"dipole.h5 not found at {dipole_path}; cannot build S(omega) wcoul0")
-			return None
-		dipole_cart, deltaE = read_dipole_h5(dipole_path)
-		nk_tot = int(sym.nk_tot)
-		nb = int(dipole_cart.shape[2])
-		nelec = int(wfn.nelec)
-		occ = np.zeros((nk_tot, nb), dtype=float)
-		occ[:, :max(0, min(nelec, nb))] = 1.0
-		f_nk = jnp.asarray(occ, dtype=jnp.float64)
-		omega_grid = jnp.asarray([omega_val], dtype=jnp.complex128)
-		S_cart_omega = compute_S_omega(
-			dipole_cart,
-			deltaE,
-			f_nk,
-			float(wfn.cell_volume),
-			int(sym.nk_tot),
-			int(wfn.nspin),
-			int(wfn.nspinor),
-			omega_grid,
-			eta=eta,
-		)[0]
-		vc0_mean, wcoul0 = compute_q0_averages(
-			wfn,
-			jnp.asarray(0.0, dtype=jnp.float64),
-			meta,
-			S_cart=S_cart_omega,
-		)
-		# Source printed in finite-size corrections section
-		label = "s_tensor" if abs(omega_val) <= 1e-14 else f"s_tensor(omega={omega_val} Ry)"
-		return vc0_mean, wcoul0, label
-
-
-	source_order = [want_source] + [s for s in ("epshead", "s_tensor") if s != want_source]
-	for source in source_order:
-		result = from_epshead() if source == "epshead" else from_s_tensor()
-		if result is not None:
-			return result
-	raise RuntimeError("Failed to determine wcoul0: neither eps0mat.h5 epshead nor dipole.h5 S(omega) available")
-
-
-def apply_head_correction(
-	V_qmunu_nohead,
-	W_q,
-	*,
-	G0_mu_nu,
-	wfn,
-	sym,
-	meta,
-	params,
-	input_dir,
-	omega,
-	print_fn,
-	print_summary: bool = True,
-):
-	"""Apply q=0 head correction to V and W at a given (possibly complex) omega.
-
-	Returns (V_headed, W_headed, head_info) where head_info is a dict with
-	scalar head values {vc0, wcoul0, source} for diagnostics.
-	"""
-	if G0_mu_nu is None:
-		if print_summary:
-			print_fn("")
-			print_fn("-" * 72)
-			print_fn("  WARNING: G0_mu_nu not available (missing from restart file?)")
-			print_fn("  Skipping head corrections - results may be inaccurate!")
-			print_fn("  Re-run with restart=false to regenerate G0_mu_nu.")
-			print_fn("-" * 72)
-		return V_qmunu_nohead, W_q, {}
-
-	# Check for user-provided head overrides.
-	vhead_override = params.get("vhead")
-	omega_val = complex(omega)
-	if abs(omega_val) < 1e-14:
-		whead_override = params.get("whead_0freq")
-	else:
-		whead_override = params.get("whead_imfreq")
-
-	if vhead_override is not None and whead_override is not None:
-		vc0_mean = complex(vhead_override)
-		wcoul0 = complex(whead_override)
-		wcoul0_source = "override"
-		if abs(omega_val) > 1e-14:
-			wcoul0_source = f"override(omega={omega_val} Ry)"
-	else:
-		vc0_mean, wcoul0, wcoul0_source = determine_wcoul0(
-			params,
-			input_dir,
-			wfn,
-			sym,
-			meta,
-			print_fn,
-			omega=omega,
-		)
-
-	if print_summary:
-		print_fn("")
-		print_fn("-" * 72)
-		print_fn("  FINITE-SIZE CORRECTIONS")
-		print_fn("-" * 72)
-		print_fn(f"  Head source: {wcoul0_source}")
-		vc0_real = float(vc0_mean.real) if hasattr(vc0_mean, 'real') else float(vc0_mean)
-		print_fn(f"  v(q→0)  = {vc0_real:12.3f} a.u.  (bare Coulomb head)")
-		if W_q is not None:
-			if abs(omega) > 1e-14:
-				print_fn(f"  Head frequency ω = {omega} Ry")
-			wcoul0_real = float(wcoul0.real) if hasattr(wcoul0, 'real') else float(wcoul0)
-			dW_real = wcoul0_real - vc0_real
-			print_fn(f"  W(q→0)  = {wcoul0_real:12.3f} a.u.  (screened Coulomb head)")
-			print_fn(f"  ΔW      = {dW_real:12.3f} a.u.  (screening correction)")
-
-	head_info = {
-		"vc0": complex(vc0_mean),
-		"wcoul0": complex(wcoul0),
-		"source": wcoul0_source,
-	}
-
-	outer_u = (jnp.conj(G0_mu_nu)[:, None] * G0_mu_nu[None, :])
-	vol_scale = jnp.asarray(1.0 / float(wfn.cell_volume), dtype=jnp.float64)
-	V_head = V_qmunu_nohead.at[0, 0, 0, 0, 0, 0, :, :].add((vc0_mean * vol_scale) * outer_u)
-	if W_q is None:
-		return V_head, None, head_info
-	W_head = W_q.at[0, 0, 0, 0, :, 0, :].add((wcoul0 * vol_scale) * outer_u)
-	return V_head, W_head, head_info
-
 
 def write_w_copies_debug_h5(
 	path,
@@ -455,7 +295,7 @@ def fit_zeta_and_compute_V_q_chunked(
 		Dictionary with:
 		- V_qmunu: (1, npol, npol, nkx, nky, nkz, n_rmu, n_rmu) Coulomb matrix
 		- v_q0_noG0_munu: (n_rmu, n_rmu) V_q at q=0 with G=0 excluded
-		- G0_mu_nu: (n_rmu,) ζ_μ(G=0) for head corrections
+		- G0_mu_nu: (n_rmu,) ζ_μ(G=0) saved for restart/debug diagnostics
 		- psi_l_rmu_Y: Left centroid wfns, Y-sharded
 		- psi_l_rmuT_X: Left conjugated wfns, X-sharded  
 		- psi_r_rmu_Y: Right centroid wfns, Y-sharded
@@ -927,7 +767,7 @@ def compute_sigma_pipeline_jax(
 		<m|V_H|n>_k = Σ_μ,s ψ*_mk(r_μ) [Vρ]_μ ψ_nk(r_μ)  [project to sigma bands]
 	
 	Key: V0_munu is V(q=0) with G=0 component EXCLUDED (to avoid divergence).
-	     The G=0 piece is added back via the head correction in the main pipeline.
+	     Active q=0 head physics is handled separately from the ISDF μν tensors.
 	"""
 	# psi_l: sigma window (b0, b3) for SX Green's function + Hartree density
 	# psi_coh: all bands (b0, b4) for COH resolution of identity
@@ -1157,7 +997,9 @@ def main(argv=None):
 	V_qmunu = isdf.V_qmunu
 	V_qmunu_nohead = V_qmunu
 	v_q0_noG0_munu = isdf.v_q0_noG0_munu
-	G0_mu_nu = isdf.G0_mu_nu
+	# Retained in restart payloads for diagnostics / external checks, but no longer
+	# used in the active q=0 head treatment.
+	_ = isdf.G0_mu_nu
 	wf_bundle = isdf.wf_bundle
 	sigma_views = isdf.sigma_views
 
@@ -1196,52 +1038,23 @@ def main(argv=None):
 	V_mu_nu_nohead = jnp.asarray(V_qmunu)[0, 0, 0].transpose(3, 4, 0, 1, 2)
 	with mesh_xy:
 		V_mu_nu_nohead = jax.lax.with_sharding_constraint(V_mu_nu_nohead, sh.V_shard)
-	V_mu_nu_headed = None
 	static_head_terms = None
 
 	# ============================================================================
-	# HEAD INJECTION: Add the q→0, G=0 Coulomb divergence correction
+	# q→0 head handling
 	# ============================================================================
-	# At q=0, the Coulomb interaction v(q,G) = 4π/|q+G|² diverges as G→0.
-	# We handle this by:
-	#   1. BUILDING V_μν with G=0 ZEROED (done in make_v_munu_kernel)
-	#   2. ADDING BACK the cell-averaged head: ⟨v(q→0,G=0)⟩ = vc0_mean
+	# The active driver no longer injects the q=0 head into ISDF μν tensors via
+	# the old rank-1 G0 projector. All physical head handling now happens through:
+	#   - exact band-diagonal static terms for COHSEX
+	#   - scalar head samples / fits for GN-PPM diagnostics and future dynamic use
 	#
-	# The head is added as a rank-1 correction in the μν basis:
-	#   V_μν ← V_μν + (vc0_mean / Ω) × ζ*_μ(0) ⊗ ζ_ν(0)
-	#
-	# where ζ_μ(0) = G0_mu_nu is the G=0 component of the ISDF vectors.
-	#
-	# IMPORTANT:
-	#   - Σ_x and static COH use headed V_μν (consistent with W - V subtraction).
-	#   - Hartree uses v_q0_noG0_munu (no-head) because V_H(G=0) is excluded.
+	# The saved G0_mu_nu restart vector remains useful for debugging and external
+	# analysis, but it is no longer part of the active GWJAX self-energy path.
 	# ============================================================================
-	if do_G0 and use_ppm_sigma:  # dynamic path keeps the older headed V/W treatment
-		head_omega = 0.0
-		if do_screened:
-			head_omega = params.get("debug_omega") or 0.0
-		V_qmunu, W_q, _ = apply_head_correction(
-			V_qmunu,
-			W_q if do_screened else None,
-			G0_mu_nu=G0_mu_nu,
-			wfn=wfn,
-			sym=sym,
-			meta=meta,
-			params=params,
-			input_dir=input_dir,
-			omega=head_omega,
-			print_fn=print0,
-			print_summary=True,
-		)
-		# Extract head-corrected V_μν for bare exchange (Σ_x).
-		V_mu_nu_headed = jnp.asarray(V_qmunu)[0, 0, 0].transpose(3, 4, 0, 1, 2)
-		with mesh_xy:
-			V_mu_nu_headed = jax.lax.with_sharding_constraint(V_mu_nu_headed, sh.V_shard)
-	elif do_G0:
+	if do_G0 and not use_ppm_sigma:
 		# For static COHSEX, add the q=0 head exactly in band space rather than
-		# approximating it via a rank-1 ISDF correction in μν.
-		from .head_correction import compute_static_head_terms, format_static_head_diagnostics
-		vc0_static, wcoul0_static, source_static = determine_wcoul0(
+		# approximating it through any μν-space head injection.
+		head_static = resolve_head_sample(
 			params,
 			input_dir,
 			wfn,
@@ -1250,37 +1063,22 @@ def main(argv=None):
 			print0,
 			omega=0.0 + 0.0j,
 		)
-		print0("")
-		print0("-" * 72)
-		print0("  FINITE-SIZE CORRECTIONS")
-		print0("-" * 72)
-		print0(f"  Head source: {source_static}")
-		print0(f"  v(q→0)  = {float(complex(vc0_static).real):12.3f} a.u.  (bare Coulomb head)")
-		if do_screened:
-			print0(f"  W(q→0)  = {float(complex(wcoul0_static).real):12.3f} a.u.  (screened Coulomb head)")
-			print0(
-				f"  ΔW      = {float((complex(wcoul0_static) - complex(vc0_static)).real):12.3f} a.u.  "
-				"(screening correction)"
-			)
+		print0(format_head_sample_diagnostics(head_static, include_screened=do_screened))
 		band_ids = np.arange(int(b0), int(b3), dtype=np.int32)
 		occ_mask_static = band_ids < int(wfn.nelec)
-		static_head_terms = compute_static_head_terms(
-			vc0=complex(vc0_static),
-			wcoul0_static=complex(wcoul0_static),
+		static_head_terms = compute_static_head_terms_from_sample(
+			head_static,
 			occ=occ_mask_static,
 			cell_volume=float(wfn.cell_volume),
 			nk_tot=int(meta.nk_tot),
-			source=source_static,
 		)
 		print0(format_static_head_diagnostics(static_head_terms))
 
 	# Canonical V tensors for downstream terms.
-	# - V_mu_nu_exchange: bare-exchange kernel (headed by default).
-	# - V_mu_nu_for_coh: V in static COH subtraction (headed to match W).
-	if V_mu_nu_headed is None:
-		V_mu_nu_headed = V_mu_nu_nohead
-	V_mu_nu_exchange = V_mu_nu_headed
-	V_mu_nu_for_coh = V_mu_nu_headed
+	# The ISDF body path remains headless; any q=0 head contribution is handled
+	# separately in band space through the exact static terms above.
+	V_mu_nu_exchange = V_mu_nu_nohead
+	V_mu_nu_for_coh = V_mu_nu_nohead
 
 	# Extract W_μν in (n_rmu, n_rmu, nkx, nky, nkz) layout.
 	# For do_screened=false, SX should reduce to bare exchange with headed V.
@@ -1393,12 +1191,13 @@ def main(argv=None):
 	def _apply_static_head_terms(sigma_sx_kij, sigma_coh_kij):
 		if static_head_terms is None:
 			return sigma_sx_kij, sigma_coh_kij
-		from .head_correction import static_head_terms_to_kij
 		sx_head, coh_head = static_head_terms_to_kij(
 			static_head_terms,
 			nk_tot=meta.nk_tot,
 			do_screened=do_screened,
 		)
+		if not do_screened:
+			coh_head = jnp.zeros_like(coh_head)
 		sx_head = jax.device_put(sx_head, Gij_shard)
 		coh_head = jax.device_put(coh_head, Gij_shard)
 		return sigma_sx_kij + sx_head, sigma_coh_kij + coh_head
@@ -1493,21 +1292,21 @@ def main(argv=None):
 			print0("  NOTE: debug: flipping sign of ω<E_F Σ^c branch")
 		if do_G0:
 			try:
-				vc0_0, wc0_0, src0 = determine_wcoul0(
+				head_0 = resolve_head_sample(
 					params, input_dir, wfn, sym, meta, print0, omega=0.0 + 0.0j
 				)
-				vc0_i, wc0_i, srci = determine_wcoul0(
+				head_i = resolve_head_sample(
 					params, input_dir, wfn, sym, meta, print0, omega=1j * float(omega_p_ry)
 				)
-				epsh0 = complex(wc0_0) / complex(vc0_0) if abs(complex(vc0_0)) > 1.0e-16 else complex(np.nan, np.nan)
-				epshi = complex(wc0_i) / complex(vc0_i) if abs(complex(vc0_i)) > 1.0e-16 else complex(np.nan, np.nan)
+				epsh0 = head_0.wcoul0 / head_0.vc0 if abs(head_0.vc0) > 1.0e-16 else complex(np.nan, np.nan)
+				epshi = head_i.wcoul0 / head_i.vc0 if abs(head_i.vc0) > 1.0e-16 else complex(np.nan, np.nan)
 				print0(
 					f"  epsinv head (ω=0):      {epsh0.real: .6f}{epsh0.imag:+.6e}i"
-					f"  [source={src0}]"
+					f"  [source={head_0.source}]"
 				)
 				print0(
 					f"  epsinv head (ω=iωp):    {epshi.real: .6f}{epshi.imag:+.6e}i"
-					f"  [ωp={omega_p_ry:.6f} Ry, source={srci}]"
+					f"  [ωp={omega_p_ry:.6f} Ry, source={head_i.source}]"
 				)
 			except Exception as exc:
 				print0(f"  epsinv head diagnostics unavailable: {exc}")
@@ -1517,20 +1316,19 @@ def main(argv=None):
 			# Keep the q=0 head out of the ISDF body PPM fit. The scalar head is
 			# better treated as a separate diagnostic channel than injected into
 			# W^c before pole extraction.
-			from .head_correction import fit_head_gn, format_head_diagnostics
 			if do_G0:
-				vc0_ppm, wcoul0_ppm, _ = determine_wcoul0(
+				head_0 = resolve_head_sample(
 					params, input_dir, wfn, sym, meta, print0, omega=0.0 + 0.0j
 				)
-				_, wcoul0_iwp, _ = determine_wcoul0(
+				head_i = resolve_head_sample(
 					params, input_dir, wfn, sym, meta, print0, omega=1j * float(omega_p_ry)
 				)
-				head_gn = fit_head_gn(
-					vc0=float(complex(vc0_ppm).real),
-					wcoul0_static=float(complex(wcoul0_ppm).real),
-					wcoul0_imfreq=float(complex(wcoul0_iwp).real),
+				head_gn = fit_head_gn_from_samples(
+					head_0,
+					head_i,
 					omega_p_ry=omega_p_ry,
 				)
+				print0(format_head_pair_diagnostics(head_0, head_i))
 				print0(format_head_diagnostics(head_gn, float(wfn.cell_volume)))
 			else:
 				head_gn = None
@@ -1546,7 +1344,6 @@ def main(argv=None):
 					if minimax_config.energy_reference is not None else fermi_reference
 				),
 				fallback_omega=ppm_fallback,
-				head_correction_fn=None,
 				print0=print0,
 			)
 			_ppm_t1 = _ppm_time.perf_counter()

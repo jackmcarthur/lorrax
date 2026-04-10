@@ -1,17 +1,35 @@
-"""Scalar GN-PPM head correction for the q=0, G=G'=0 Coulomb head.
+"""Helpers for the q=0, G=G'=0 Coulomb head.
 
-In plane waves, rho^{mn}_{q=0}(G=0) = delta_{mn}, so the head of W^c
-contributes only to diagonal self-energy elements. ISDF cannot represent
-this exactly, so we handle it as a separate scalar diagnostic channel
-outside the ISDF body path.
+The modern GWJAX paths keep the head separate from the ISDF body tensors:
+
+- Dynamic GN-PPM uses scalar head samples ``(v_h, W_h(0), W_h(iω_p))``.
+- Static COHSEX uses exact band-diagonal head shifts for ``Σ^X``, ``Σ^SX``,
+  ``Σ^(SX-X)``, and ``Σ^COH``.
+
+This module centralizes:
+
+- head source resolution (`override`, `epshead`, `s_tensor`)
+- scalar GN-PPM head fitting
+- exact static COHSEX head terms
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 
 import numpy as np
 import jax.numpy as jnp
+
+
+@dataclass(frozen=True)
+class HeadSample:
+    """Resolved q=0 Coulomb head sample at one frequency."""
+
+    vc0: complex
+    wcoul0: complex
+    source: str
+    omega: complex
 
 
 @dataclass(frozen=True)
@@ -57,6 +75,165 @@ def _representative_entry(diag: jnp.ndarray) -> complex:
     idx = int(nz[0]) if nz.size else 0
     return complex(arr[idx])
 
+
+def resolve_head_override(params, omega) -> HeadSample | None:
+    """Return explicit head overrides when both v and W are provided."""
+
+    omega_val = complex(omega)
+    vhead_override = params.get("vhead")
+    w_key = "whead_0freq" if abs(omega_val) <= 1.0e-14 else "whead_imfreq"
+    whead_override = params.get(w_key)
+    if vhead_override is None or whead_override is None:
+        return None
+    source = "override" if abs(omega_val) <= 1.0e-14 else f"override(omega={omega_val} Ry)"
+    return HeadSample(
+        vc0=complex(vhead_override),
+        wcoul0=complex(whead_override),
+        source=source,
+        omega=omega_val,
+    )
+
+
+def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> HeadSample:
+    """Resolve a q=0 head sample using overrides and configured source order."""
+
+    override = resolve_head_override(params, omega)
+    if override is not None:
+        return override
+
+    want_source = str(params.get("wcoul0_source", "s_tensor")).strip().lower()
+    if want_source not in ("epshead", "s_tensor"):
+        print_fn(f"Unknown wcoul0_source={want_source}; defaulting to 's_tensor'")
+        want_source = "s_tensor"
+
+    omega_val = complex(omega)
+    eta = float(params.get("wcoul0_eta", 0.0) or 0.0)
+    eps0_path = os.path.join(input_dir, "eps0mat.h5")
+    dipole_path = os.path.join(input_dir, "dipole.h5")
+
+    def from_epshead() -> HeadSample | None:
+        if not os.path.exists(eps0_path):
+            return None
+        try:
+            if abs(omega_val) > 1.0e-14:
+                print_fn(
+                    f"wcoul0_source=epshead is static-only; using epshead(0) for omega={omega_val} Ry"
+                )
+            from file_io.epsmat_reader import EPSReader
+            from gw.vcoul import compute_q0_averages
+
+            eps0 = EPSReader(eps0_path)
+            vc0_mean, wcoul0 = compute_q0_averages(
+                wfn,
+                jnp.asarray(eps0.epshead, dtype=jnp.complex128),
+                meta,
+                S_cart=None,
+            )
+            source = "epshead(0)" if abs(omega_val) > 1.0e-14 else "epshead"
+            return HeadSample(
+                vc0=complex(vc0_mean),
+                wcoul0=complex(wcoul0),
+                source=source,
+                omega=omega_val,
+            )
+        except Exception as exc:  # pragma: no cover - diagnostic path
+            print_fn(f"epshead wcoul0 failed: {exc}")
+            return None
+
+    def from_s_tensor() -> HeadSample | None:
+        if not os.path.exists(dipole_path):
+            print_fn(f"dipole.h5 not found at {dipole_path}; cannot build S(omega) wcoul0")
+            return None
+        from common.chi_from_dipole import read_dipole_h5, compute_S_omega
+        from gw.vcoul import compute_q0_averages
+
+        dipole_cart, deltaE = read_dipole_h5(dipole_path)
+        nk_tot = int(sym.nk_tot)
+        nb = int(dipole_cart.shape[2])
+        nelec = int(wfn.nelec)
+        occ = np.zeros((nk_tot, nb), dtype=float)
+        occ[:, :max(0, min(nelec, nb))] = 1.0
+        f_nk = jnp.asarray(occ, dtype=jnp.float64)
+        omega_grid = jnp.asarray([omega_val], dtype=jnp.complex128)
+        S_cart_omega = compute_S_omega(
+            dipole_cart,
+            deltaE,
+            f_nk,
+            float(wfn.cell_volume),
+            int(sym.nk_tot),
+            int(wfn.nspin),
+            int(wfn.nspinor),
+            omega_grid,
+            eta=eta,
+        )[0]
+        vc0_mean, wcoul0 = compute_q0_averages(
+            wfn,
+            jnp.asarray(0.0, dtype=jnp.float64),
+            meta,
+            S_cart=S_cart_omega,
+        )
+        source = "s_tensor" if abs(omega_val) <= 1.0e-14 else f"s_tensor(omega={omega_val} Ry)"
+        return HeadSample(
+            vc0=complex(vc0_mean),
+            wcoul0=complex(wcoul0),
+            source=source,
+            omega=omega_val,
+        )
+
+    source_order = [want_source] + [s for s in ("epshead", "s_tensor") if s != want_source]
+    for source in source_order:
+        result = from_epshead() if source == "epshead" else from_s_tensor()
+        if result is not None:
+            return result
+
+    raise RuntimeError(
+        "Failed to resolve q=0 Coulomb head: neither explicit overrides nor supported sources are available."
+    )
+
+
+def format_head_sample_diagnostics(head: HeadSample, *, include_screened: bool = True) -> str:
+    """Return a compact diagnostic summary for one resolved head sample."""
+
+    lines = [
+        "",
+        "-" * 72,
+        "  FINITE-SIZE CORRECTIONS",
+        "-" * 72,
+        f"  Head source: {head.source}",
+        f"  v(q→0)  = {head.vc0.real:12.3f} a.u.  (bare Coulomb head)",
+    ]
+    if include_screened:
+        if abs(head.omega) > 1.0e-14:
+            lines.append(f"  Head frequency ω = {head.omega} Ry")
+        lines.append(f"  W(q→0)  = {head.wcoul0.real:12.3f} a.u.  (screened Coulomb head)")
+        lines.append(
+            f"  ΔW      = {(head.wcoul0.real - head.vc0.real):12.3f} a.u.  (screening correction)"
+        )
+    return "\n".join(lines)
+
+
+def format_head_pair_diagnostics(head_static: HeadSample, head_imag: HeadSample) -> str:
+    """Return a compact summary of static and imaginary-frequency head samples."""
+
+    lines = [
+        "",
+        "-" * 72,
+        "  FINITE-SIZE CORRECTIONS",
+        "-" * 72,
+        f"  Head source (ω=0):    {head_static.source}",
+        f"  Head source (ω=iωp):  {head_imag.source}",
+        f"  v(q→0)               = {head_static.vc0.real:12.3f} a.u.  (bare Coulomb head)",
+        f"  W(q→0, ω=0)          = {head_static.wcoul0.real:12.3f} a.u.",
+        f"  W(q→0, ω=iωp)        = {head_imag.wcoul0.real:12.3f} a.u.  [ω={head_imag.omega} Ry]",
+        f"  W^c(q→0, ω=0)        = {(head_static.wcoul0.real - head_static.vc0.real):12.3f} a.u.",
+        f"  W^c(q→0, ω=iωp)      = {(head_imag.wcoul0.real - head_imag.vc0.real):12.3f} a.u.",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Dynamic GN-PPM scalar head
+# ---------------------------------------------------------------------------
 
 def fit_head_gn(
     vc0: float,
@@ -114,8 +291,28 @@ def fit_head_gn(
     )
 
 
+def fit_head_gn_from_samples(
+    head_static: HeadSample,
+    head_imag: HeadSample,
+    *,
+    omega_p_ry: float,
+) -> HeadGNParams:
+    """Fit the scalar GN head from resolved static and imaginary-frequency samples."""
+
+    return fit_head_gn(
+        vc0=float(head_static.vc0.real),
+        wcoul0_static=float(head_static.wcoul0.real),
+        wcoul0_imfreq=float(head_imag.wcoul0.real),
+        omega_p_ry=omega_p_ry,
+    )
+
+
 _RY2EV = 13.6056980659
 
+
+# ---------------------------------------------------------------------------
+# Exact static COHSEX head
+# ---------------------------------------------------------------------------
 
 def compute_static_head_terms(
     *,
@@ -173,6 +370,25 @@ def compute_static_head_terms(
         wcoul0=complex(wcoul0_static),
         wc_head_0=complex(wcoul0_static) - complex(vc0),
         source=source,
+    )
+
+
+def compute_static_head_terms_from_sample(
+    head: HeadSample,
+    *,
+    occ: np.ndarray | jnp.ndarray,
+    cell_volume: float,
+    nk_tot: int,
+) -> StaticHeadTerms:
+    """Build exact static COHSEX head terms from a resolved head sample."""
+
+    return compute_static_head_terms(
+        vc0=head.vc0,
+        wcoul0_static=head.wcoul0,
+        occ=occ,
+        cell_volume=cell_volume,
+        nk_tot=nk_tot,
+        source=head.source,
     )
 
 

@@ -461,7 +461,6 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     minimax_energy_reference: str | float | int | None = "midgap",
     minimax_energy_reference_fn: Callable[[jax.Array, jax.Array], float] | None = None,
     fallback_omega: float = 2.0,
-    head_correction_fn: Callable[[jax.Array, jax.Array, complex], tuple[jax.Array, jax.Array, dict]] | None = None,
     print0=print,
 ) -> PPMBuildResult:
     """Build GN-PPM parameters from minimax W(0) and W(i*omega_p)."""
@@ -544,23 +543,9 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     Wiwp_q.block_until_ready()
     print0(f"  [TIMING-PPM] W(iωp): {_ppm_time.perf_counter() - _t_wi:.3f}s")
 
-    V_head = V_qmunu
-    if head_correction_fn is not None:
-        V_head, W0_q, h0 = head_correction_fn(V_qmunu, W0_q, 0.0 + 0.0j)
-        _, Wiwp_q, hi = head_correction_fn(V_qmunu, Wiwp_q, 1j * float(omega_p_ry))
-        vc0 = float(h0["vc0"].real)
-        w0 = float(h0["wcoul0"].real)
-        wi = float(hi["wcoul0"].real)
-        print0(f"  PPM finite-size heads:")
-        print0(f"    v(q→0)          = {vc0:12.3f} a.u.")
-        print0(f"    W(q→0, ω=0)     = {w0:12.3f} a.u.")
-        print0(f"    W(q→0, ω=iωp)   = {wi:12.3f} a.u.  [ωp={omega_p_ry:.4f} Ry]")
-        print0(f"    W^c(q→0, ω=0)   = {w0 - vc0:12.3f} a.u.")
-        print0(f"    W^c(q→0, ω=iωp) = {wi - vc0:12.3f} a.u.")
-
     nkx, nky, nkz = W0_q.shape[0], W0_q.shape[1], W0_q.shape[2]
     n_rmu = W0_q.shape[4]
-    V_q = jnp.asarray(V_head)[0, 0, 0].reshape(nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
+    V_q = jnp.asarray(V_qmunu)[0, 0, 0].reshape(nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
 
     _summarize_hermitian_qmunu("W(0)", W0_q, print0)
     _summarize_hermitian_qmunu(f"W(iωp={omega_p_ry:.3f} Ry)", Wiwp_q, print0)
