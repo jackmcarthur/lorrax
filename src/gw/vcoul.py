@@ -231,7 +231,7 @@ def compute_q0_averages(
 	S_cart: jnp.ndarray | None = None,
 	nsamples: int = 2**18,
 	method: str = "sobol",
-	qmc_reps: int = 1,
+	qmc_reps: int = 10,
 ):
 	"""Compute q=0 averages (vc0_mean, wcoul0) on the same Monte Carlo points.
 

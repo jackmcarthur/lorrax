@@ -857,6 +857,9 @@ def read_cohsex_input(filename: str) -> dict:
 			"vhead": getf("vhead", fallback=None),
 			"whead_0freq": getf("whead_0freq", fallback=None),
 			"whead_imfreq": getf("whead_imfreq", fallback=None),
+			"do_G0": getb("do_G0", fallback=True),
+			"mc_average_vcoul_body": getb("mc_average_vcoul_body", fallback=True),
+			"bare_coulomb_cutoff": getf("bare_coulomb_cutoff", fallback=None),
 			"wfn_file": get("wfn_file", fallback="WFN.h5"),
 			"centroids_file": get("centroids_file", fallback="centroids_frac.txt"),
 			"output_file": get("output_file", fallback="eqp0_noqsym.dat"),
@@ -915,6 +918,9 @@ def read_cohsex_input(filename: str) -> dict:
 			"vhead": None,
 			"whead_0freq": None,
 			"whead_imfreq": None,
+			"do_G0": True,
+			"mc_average_vcoul_body": True,
+			"bare_coulomb_cutoff": None,
 			"wfn_file": "WFN.h5",
 			"centroids_file": "centroids_frac.txt",
 			"output_file": "eqp0_noqsym.dat",
@@ -1105,7 +1111,9 @@ def resolve_runtime_config(params, rank=0):
 		chunk_target_utilization=chunk_target_utilization,
 		zct_stage_cap_gb=zct_stage_cap_gb,
 		r_chunk_override=r_chunk_override,
-		do_G0=True,
+		do_G0=params.get("do_G0", True),
+		mc_average_vcoul_body=params.get("mc_average_vcoul_body", True),
+		bare_coulomb_cutoff=params.get("bare_coulomb_cutoff", None),
 	)
 
 
@@ -1141,6 +1149,8 @@ def run_isdf_fitting(
 			target_utilization=cfg.chunk_target_utilization,
 			zct_stage_cap_gb=cfg.zct_stage_cap_gb,
 			isdf_pair_mode=cfg.isdf_pair_mode,
+			mc_average_vcoul_body=cfg.mc_average_vcoul_body,
+			bare_coulomb_cutoff=getattr(cfg, 'bare_coulomb_cutoff', None),
 		)
 
 	return chunked_result

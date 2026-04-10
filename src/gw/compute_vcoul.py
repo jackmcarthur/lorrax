@@ -182,11 +182,16 @@ def make_v_munu_chunked_kernel(
     cell_volume: float,
     sys_dim: int = 2,
     bdot: np.ndarray | None = None,
+    mc_average_vcoul_body: bool = True,
+    vcoul_cutoff_ry: float | None = None,
 ):
     """
     Factory for jitted kernels that compute V_q blocks from zeta chunks.
 
     This creates two kernels:
+
+    vcoul_cutoff_ry: If set, zero v(q+G) for |q+G|² > cutoff (in Ry).
+        Use to match BGW's bare_coulomb_cutoff (default: ecutwfc).
     1. fft_and_weight: zeta_r(B_μ, n_rtot) → zeta_weighted(B_μ, n_G)
     2. contract_block: (zeta_μ, zeta_ν) → V_block(B_μ, B_ν)
 
@@ -309,11 +314,16 @@ def make_v_munu_chunked_kernel(
             v_scaled = jnp.where(denom_zero, 0.0, v_reg * fact)
 
             # Replace G=0 with mini-BZ averaged value for q≠0
-            qx_idx = jnp.round(qvec_wrapped[0]).astype(jnp.int32) % nkx
-            qy_idx = jnp.round(qvec_wrapped[1]).astype(jnp.int32) % nky
-            qz_idx = jnp.round(qvec_wrapped[2]).astype(jnp.int32) % nkz
-            v_head_mc = _v_head_avg_j[qx_idx, qy_idx, qz_idx]
-            v_scaled = v_scaled.at[0, 0, 0].set(v_head_mc)
+            if mc_average_vcoul_body:
+                qx_idx = jnp.round(qvec_wrapped[0]).astype(jnp.int32) % nkx
+                qy_idx = jnp.round(qvec_wrapped[1]).astype(jnp.int32) % nky
+                qz_idx = jnp.round(qvec_wrapped[2]).astype(jnp.int32) % nkz
+                v_head_mc = _v_head_avg_j[qx_idx, qy_idx, qz_idx]
+                v_scaled = v_scaled.at[0, 0, 0].set(v_head_mc)
+
+            # Optional G-vector cutoff (match BGW bare_coulomb_cutoff)
+            if vcoul_cutoff_ry is not None:
+                v_scaled = jnp.where(denom > vcoul_cutoff_ry, 0.0, v_scaled)
 
             sqrt_v = jnp.where(v_scaled > 0.0, jnp.sqrt(v_scaled), 0.0).astype(jnp.complex128)
 
@@ -349,10 +359,13 @@ def make_v_munu_chunked_kernel(
 
             v_reg = (8.0 * jnp.pi / denom_safe) * f2d
             v_scaled = jnp.where(denom_zero, 0.0, v_reg * fact)
+            # Optional G-vector cutoff (match BGW bare_coulomb_cutoff)
+            if vcoul_cutoff_ry is not None:
+                v_scaled = jnp.where(denom > vcoul_cutoff_ry, 0.0, v_scaled)
             sqrt_v = jnp.where(v_scaled > 0.0, jnp.sqrt(v_scaled), 0.0).astype(jnp.complex128)
 
             return sqrt_v, phase
-    
+
     # NOTE: These are NOT JIT'd - they're meant to be called from an outer JIT
     # to avoid nested JIT compilation overhead. The outer JIT (_batch_proc or 
     # the chunked loop) compiles everything together.
@@ -464,10 +477,12 @@ def compute_V_q_from_zeta_h5(
     mesh_xy: Mesh = None,
     sys_dim: int = 2,
     bdot: np.ndarray | None = None,
+    mc_average_vcoul_body: bool = True,
+    bare_coulomb_cutoff: float | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """
     Compute V_q(μ, ν) from zeta stored in HDF5 using μ/ν chunking.
-    
+
     V_q(μ, ν) = Σ_G ζ̃*_μ(G) ζ̃_ν(G)
     
     where ζ̃_μ(G) = √v(q+G) × FFT[phase_q(r) × ζ_μ(r)]
@@ -494,7 +509,9 @@ def compute_V_q_from_zeta_h5(
     """
     # Get kernels
     kernels = make_v_munu_chunked_kernel(
-        fft_nx, fft_ny, fft_nz, nkx, nky, nkz, bvec, cell_volume, sys_dim, bdot=bdot
+        fft_nx, fft_ny, fft_nz, nkx, nky, nkz, bvec, cell_volume, sys_dim, bdot=bdot,
+        mc_average_vcoul_body=mc_average_vcoul_body,
+        vcoul_cutoff_ry=bare_coulomb_cutoff,
     )
     
     # Parse q_idx
@@ -586,6 +603,8 @@ def compute_V_q_from_zeta_array(
     mesh_xy: Mesh = None,
     sys_dim: int = 2,
     bdot: np.ndarray | None = None,
+    mc_average_vcoul_body: bool = True,
+    bare_coulomb_cutoff: float | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """
     Compute V_q(μ, ν) from zeta array in memory using μ/ν chunking.
@@ -603,9 +622,11 @@ def compute_V_q_from_zeta_array(
         g0_mu: (n_rmu,) ζ_μ(G=0) for head corrections
     """
     kernels = make_v_munu_chunked_kernel(
-        fft_nx, fft_ny, fft_nz, nkx, nky, nkz, bvec, cell_volume, sys_dim, bdot=bdot
+        fft_nx, fft_ny, fft_nz, nkx, nky, nkz, bvec, cell_volume, sys_dim, bdot=bdot,
+        mc_average_vcoul_body=mc_average_vcoul_body,
+        vcoul_cutoff_ry=bare_coulomb_cutoff,
     )
-    
+
     n_rmu, _ = zeta_q.shape
     n_chunks = (n_rmu + mu_chunk_size - 1) // mu_chunk_size
 
@@ -755,10 +776,12 @@ def compute_all_V_q_from_zeta_h5(
     q_batch_size: int | None = None,
     verbose: bool = True,
     bdot: np.ndarray | None = None,
+    mc_average_vcoul_body: bool = True,
+    bare_coulomb_cutoff: float | None = None,
 ) -> jax.Array:
     """
     Compute V_q for all q-points from zeta stored in HDF5.
-    
+
     Loops over all q-points, computing V_q using μ-chunking for each. When the
     μ chunks already cover the full set (single chunk), q-points can be batched
     to reuse the FFT and contraction kernels.
@@ -792,9 +815,11 @@ def compute_all_V_q_from_zeta_h5(
     
     # Get kernels (cached)
     kernels = make_v_munu_chunked_kernel(
-        fft_nx, fft_ny, fft_nz, nkx, nky, nkz, bvec, cell_volume, sys_dim, bdot=bdot
+        fft_nx, fft_ny, fft_nz, nkx, nky, nkz, bvec, cell_volume, sys_dim, bdot=bdot,
+        mc_average_vcoul_body=mc_average_vcoul_body,
+        vcoul_cutoff_ry=bare_coulomb_cutoff,
     )
-    
+
     # For single-chunk case, keep on GPU and batch. For multi-chunk, use numpy.
     single_chunk = (n_chunks == 1)
     effective_q_batch = 1

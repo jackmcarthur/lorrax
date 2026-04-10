@@ -421,10 +421,12 @@ def fit_zeta_and_compute_V_q_chunked(
 	target_utilization: float = 0.97,
 	zct_stage_cap_gb: float | None = None,
 	isdf_pair_mode: str = "spin_traced",
+	mc_average_vcoul_body: bool = True,
+	bare_coulomb_cutoff: float | None = None,
 ):
 	"""
 	Chunked zeta fitting and V_q computation pipeline.
-	
+
 	This replaces the per-q-point zeta fitting in the main loop with a memory-efficient
 	chunked approach that:
 	1. Loads wavefunctions for full band range (b0 to b4)
@@ -599,6 +601,8 @@ def fit_zeta_and_compute_V_q_chunked(
 	print(f"    V_q mu chunks: {mu_chunk_vcoul}")
 	if q_batch_vcoul > 1:
 		print(f"    V_q q batches: {q_batch_vcoul}")
+	if bare_coulomb_cutoff is not None:
+		print(f"    V_q bare cutoff: {bare_coulomb_cutoff:.1f} Ry")
 	
 	with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
 		with h5py.File(zeta_h5_path, 'r') as zeta_h5:
@@ -614,6 +618,8 @@ def fit_zeta_and_compute_V_q_chunked(
 					sys_dim=sys_dim,
 					q_batch_size=q_batch_vcoul if mu_chunk_vcoul >= meta.n_rmu else None,
 					bdot=np.asarray(wfn.bdot, dtype=np.float64) if sys_dim == 0 else None,
+					mc_average_vcoul_body=mc_average_vcoul_body,
+					bare_coulomb_cutoff=bare_coulomb_cutoff,
 				)
 	
 	# Write G0 (ζ_μ(G=0) for each q) to the zeta HDF5 file for restart/reuse
@@ -1454,19 +1460,26 @@ def main(argv=None):
 		with timing.section("gw_jax.ppm_sigma"):
 			import time as _ppm_time
 			_ppm_t0 = _ppm_time.perf_counter()
-			head_correction = lambda V_q, W_q, omega: apply_head_correction(
-				V_q,
-				W_q,
-				G0_mu_nu=G0_mu_nu,
-				wfn=wfn,
-				sym=sym,
-				meta=meta,
-				params=params,
-				input_dir=input_dir,
-				omega=omega,
-				print_fn=print0,
-				print_summary=False,
-			)
+			# Keep the q=0 head out of the ISDF body PPM fit. The scalar head is
+			# better treated as a separate diagnostic channel than injected into
+			# W^c before pole extraction.
+			from .head_correction import fit_head_gn, format_head_diagnostics
+			if do_G0:
+				vc0_ppm, wcoul0_ppm, _ = determine_wcoul0(
+					params, input_dir, wfn, sym, meta, print0, omega=0.0 + 0.0j
+				)
+				_, wcoul0_iwp, _ = determine_wcoul0(
+					params, input_dir, wfn, sym, meta, print0, omega=1j * float(omega_p_ry)
+				)
+				head_gn = fit_head_gn(
+					vc0=float(complex(vc0_ppm).real),
+					wcoul0_static=float(complex(wcoul0_ppm).real),
+					wcoul0_imfreq=float(complex(wcoul0_iwp).real),
+					omega_p_ry=omega_p_ry,
+				)
+				print0(format_head_diagnostics(head_gn, float(wfn.cell_volume)))
+			else:
+				head_gn = None
 			ppm = compute_w0_wiwp_and_ppm_from_minimax(
 				V_qmunu_nohead,
 				wf_bundle,
@@ -1479,7 +1492,7 @@ def main(argv=None):
 					if minimax_config.energy_reference is not None else fermi_reference
 				),
 				fallback_omega=ppm_fallback,
-				head_correction_fn=head_correction,
+				head_correction_fn=None,
 				print0=print0,
 			)
 			_ppm_t1 = _ppm_time.perf_counter()

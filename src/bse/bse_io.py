@@ -393,6 +393,123 @@ def load_bse_data_from_restart_sharded(
     }
 
 
+def read_bgw_eqp(eqp_file: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Read a BerkeleyGW ``eqp1.dat`` file."""
+
+    kpts = []
+    e_dft_blocks = []
+    e_qp_blocks = []
+
+    with open(eqp_file) as f:
+        while True:
+            header = f.readline()
+            if not header.strip():
+                break
+            parts = header.split()
+            if len(parts) < 4:
+                break
+            kx, ky, kz = float(parts[0]), float(parts[1]), float(parts[2])
+            n_bands = int(parts[3])
+            kpts.append([kx, ky, kz])
+
+            e_dft_k = []
+            e_qp_k = []
+            for _ in range(n_bands):
+                cols = f.readline().split()
+                e_dft_k.append(float(cols[2]))
+                e_qp_k.append(float(cols[3]))
+            e_dft_blocks.append(e_dft_k)
+            e_qp_blocks.append(e_qp_k)
+
+    kpts_ibz = np.array(kpts)
+    max_band = max(len(b) for b in e_dft_blocks)
+    n_kpts = len(kpts)
+    e_dft_ibz = np.full((n_kpts, max_band), np.nan)
+    e_qp_ibz = np.full((n_kpts, max_band), np.nan)
+    for i in range(n_kpts):
+        nb = len(e_dft_blocks[i])
+        e_dft_ibz[i, :nb] = e_dft_blocks[i]
+        e_qp_ibz[i, :nb] = e_qp_blocks[i]
+    return kpts_ibz, e_dft_ibz, e_qp_ibz
+
+
+def _parse_wfn_path(input_file: str) -> str:
+    """Extract ``wfn_file`` from ``cohsex.in`` and resolve relative paths."""
+
+    input_dir = os.path.dirname(os.path.abspath(input_file))
+    wfn_file = "WFN.h5"
+    with open(input_file) as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, _, val = stripped.partition("=")
+            if key.strip() == "wfn_file":
+                wfn_file = val.strip()
+                break
+    if not os.path.isabs(wfn_file):
+        wfn_file = os.path.join(input_dir, wfn_file)
+    return wfn_file
+
+
+def apply_eqp_corrections(
+    enk_full: np.ndarray,
+    eqp_file: str,
+    input_file: Optional[str] = None,
+    ry_to_ev: float = 13.6056980659,
+) -> np.ndarray:
+    """Apply BGW ``eqp1.dat`` corrections to full-BZ DFT eigenvalues."""
+
+    _kpts_ibz, e_dft_ibz, e_qp_ibz = read_bgw_eqp(eqp_file)
+    nk_ibz, nb_eqp = e_dft_ibz.shape
+    nk_full, nb_full = enk_full.shape
+    enk_qp = enk_full.copy()
+
+    if input_file is not None:
+        from common.wfnreader import WFNReader
+        from common.symmetry_maps import SymMaps
+
+        wfn_path = _parse_wfn_path(input_file)
+        wfn = WFNReader(wfn_path)
+        sym = SymMaps(wfn)
+        assert sym.nk_tot == nk_full
+        assert nk_ibz == sym.nk_red
+
+        for ik_full in range(nk_full):
+            ik_ibz = sym.irk_to_k_map[ik_full]
+            for ib in range(min(nb_eqp, nb_full)):
+                if not np.isnan(e_qp_ibz[ik_ibz, ib]):
+                    enk_qp[ik_full, ib] = e_qp_ibz[ik_ibz, ib] / ry_to_ev
+    else:
+        enk_full_ev = enk_full * ry_to_ev
+        tol_ev = 0.01
+        matched = np.zeros(nk_full, dtype=bool)
+        for ik_full in range(nk_full):
+            best_ibz = -1
+            best_err = np.inf
+            for ik_ibz in range(nk_ibz):
+                n_compare = min(nb_eqp, nb_full)
+                mask = ~np.isnan(e_dft_ibz[ik_ibz, :n_compare])
+                if not np.any(mask):
+                    continue
+                err = np.max(
+                    np.abs(
+                        enk_full_ev[ik_full, :n_compare][mask]
+                        - e_dft_ibz[ik_ibz, :n_compare][mask]
+                    )
+                )
+                if err < best_err:
+                    best_err = err
+                    best_ibz = ik_ibz
+            if best_ibz >= 0 and best_err < tol_ev:
+                matched[ik_full] = True
+                for ib in range(min(nb_eqp, nb_full)):
+                    if not np.isnan(e_qp_ibz[best_ibz, ib]):
+                        enk_qp[ik_full, ib] = e_qp_ibz[best_ibz, ib] / ry_to_ev
+
+    return enk_qp
+
+
 def _find_restart_file(input_file: str) -> str:
     input_dir = os.path.dirname(os.path.abspath(input_file))
     candidates = []
@@ -410,6 +527,9 @@ def _load_ring_subset(
     n_cond: int,
     px: int,
     py: int,
+    eqp_file: Optional[str] = None,
+    n_occ: Optional[int] = None,
+    input_file: Optional[str] = None,
 ) -> dict:
     """Load a single-device BSE subset from canonical gw_jax restart state."""
     with h5py.File(restart_file, "r") as f:
@@ -424,7 +544,12 @@ def _load_ring_subset(
                 "Regenerate restart tensors with current gw_jax."
             )
         psi_full = jnp.asarray(f["psi_full_y"][:])
-        enk_full = jnp.asarray(f["enk_full"][:])
+        enk_full_np = np.asarray(f["enk_full"][:])
+
+    if eqp_file is not None:
+        enk_full_np = apply_eqp_corrections(enk_full_np, eqp_file, input_file=input_file)
+
+    enk_full = jnp.asarray(enk_full_np)
 
     nkx, nky, nkz = V_qmunu.shape[3:6]
     nk = nkx * nky * nkz
@@ -432,19 +557,23 @@ def _load_ring_subset(
     lcm_xy = math.lcm(px, py)
     n_rmu_pad = ((n_rmu + lcm_xy - 1) // lcm_xy) * lcm_xy
 
-    mean_enk_full = jnp.mean(enk_full, axis=0)
-    val_mask = mean_enk_full < 0.0
-    cond_mask = mean_enk_full > 0.0
-    n_val_available = int(jnp.sum(val_mask))
-    n_cond_available = int(jnp.sum(cond_mask))
+    n_bands_total = enk_full.shape[1]
+    if n_occ is not None:
+        n_val_available = n_occ
+        n_cond_available = n_bands_total - n_occ
+    else:
+        mean_enk_full = jnp.mean(enk_full, axis=0)
+        n_val_available = int(jnp.sum(mean_enk_full < 0.0))
+        n_cond_available = int(jnp.sum(mean_enk_full > 0.0))
+        n_occ = n_val_available
     if n_val > n_val_available:
         print(f"Warning: requested {n_val} valence bands but only {n_val_available} available; using {n_val_available}")
     if n_cond > n_cond_available:
         print(f"Warning: requested {n_cond} conduction bands but only {n_cond_available} available; using {n_cond_available}")
     n_val = min(n_val, n_val_available)
     n_cond = min(n_cond, n_cond_available)
-    val_indices = jnp.argsort(jnp.where(val_mask, mean_enk_full, -jnp.inf))[-n_val:]
-    cond_indices = jnp.argsort(jnp.where(cond_mask, mean_enk_full, jnp.inf))[:n_cond]
+    val_indices = jnp.arange(n_occ - n_val, n_occ)
+    cond_indices = jnp.arange(n_occ, n_occ + n_cond)
 
     psi_v = psi_full[:, val_indices, :, :]
     psi_c = psi_full[:, cond_indices, :, :]

@@ -297,6 +297,7 @@ class SymMaps:
     def find_symmetry_ops_simple(self, wfn, kpoint_map, full_kpts):
         irk_to_k_map = np.zeros(full_kpts.shape[0], dtype=np.int32)
         irk_sym_map = np.zeros(full_kpts.shape[0], dtype=np.int32)
+        ntran = len(self.sym_matrices)
         # all symmetries applied to the irr k-points: shape (nkbar, nsym, 3)
         Skbar = np.einsum('ijk,lk->lij', self.sym_mats_k, wfn.kpoints)
         Skbar = Skbar % 1.0
@@ -311,6 +312,16 @@ class SymMaps:
                 if len(matches) > 0:
                     irk_to_k_map[ikfull] = ikbar
                     irk_sym_map[ikfull] = matches[0]
+
+        n_tr = int(np.sum(irk_sym_map >= ntran))
+        if n_tr > 0:
+            import warnings
+            warnings.warn(
+                f"SymMaps: {n_tr}/{len(full_kpts)} full-BZ k-points require "
+                f"time-reversal symmetry for unfolding. Non-symmorphic phases "
+                f"are NOT applied for these k-points. Use noinv=.true. in QE "
+                f"to avoid this."
+            )
 
         return irk_to_k_map, irk_sym_map
 

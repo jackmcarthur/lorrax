@@ -203,9 +203,20 @@ def _preview_lanczos(
     write_eigs: int | None = None,
     max_lanczos_iter: int | None = None,
     include_W: bool = True,
+    eqp_file: str | None = None,
+    n_occ: int | None = None,
 ) -> None:
     restart_file = _find_restart_file(input_file)
-    payload = _load_ring_subset(restart_file, n_val, n_cond, 1, 1)
+    payload = _load_ring_subset(
+        restart_file,
+        n_val,
+        n_cond,
+        1,
+        1,
+        eqp_file=eqp_file,
+        n_occ=n_occ,
+        input_file=input_file,
+    )
     psi_c = payload["psi_c"]
     psi_v = payload["psi_v"]
     eps_c = payload["eps_c"]
@@ -322,6 +333,8 @@ if __name__ == "__main__":
     parser.add_argument("--kpm-emin-ev", type=float, default=None, help="Override KPM E_min (eV).")
     parser.add_argument("--kpm-emax-ev", type=float, default=None, help="Override KPM E_max (eV).")
     parser.add_argument("--kpm-plot-file", type=str, default="bse_dos_kpm.png", help="KPM DOS plot output file.")
+    parser.add_argument("--eqp", type=str, default=None, help="Path to BGW eqp1.dat for QP corrections.")
+    parser.add_argument("--n-occ", type=int, default=None, help="Number of occupied bands.")
     parser.add_argument("--ring-test", action="store_true")
     parser.add_argument("--ring-check", action="store_true")
     parser.add_argument("--ring-timing", action="store_true")
@@ -460,7 +473,10 @@ if __name__ == "__main__":
         write_eigs=args.write_eigs,
         max_lanczos_iter=args.max_lanczos_iter,
         include_W=not (args.rpa or not args.bse),
+        eqp_file=args.eqp,
+        n_occ=args.n_occ,
     )
+    raise SystemExit(0)
 
     ring_matvec_timing(
         args.input,
