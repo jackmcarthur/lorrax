@@ -873,7 +873,7 @@ def compute_screening(
                 f"nodes={quad_imag.node_count}, fit_err~{quad_imag.max_error:.3e}"
             )
             chi_iwp = compute_chi0_minimax(
-                psi_val_xn, psi_val_yr, psi_cond_xn, psi_cond_yr,
+                psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
                 enk_v, enk_c, quad_imag, meta, mesh_xy,
                 energy_reference=e_ref,
             )
