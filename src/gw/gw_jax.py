@@ -456,8 +456,6 @@ def build_hartree(psi_yr, psi_xr, Gij, V0, nk_tot):
 	Vrho = jnp.einsum('xy,y->x', V0, rho, optimize=True)
 	return jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_xr), Vrho, psi_xr, optimize=True)
 
-# Backward-compat alias (used as callback in ppm_sigma)
-get_sigma_static_kij_channels_jax = project_to_bands_ri
 
 def print_scf_diagnostics(Gij_final, U_full, nelec, nb_sigma, print_fn=print):
 	"""Print diagnostic checks for SC-COHSEX convergence (Gij, U unitarity)."""
@@ -892,7 +890,7 @@ def main(argv=None):
 						G_k.shape[1], G_k.shape[2], G_k.shape[3], G_k.shape[4], nkx, nky, nkz)),
 				get_sigma_mu_nu_fn=lambda G_R, V, nk, bisp=False: _fftn(
 					G_R * _ifftn(V[None, :, None, :, :, :, :]) * (-1.0 / jnp.sqrt(nk))),
-				get_sigma_kij_channels_fn=get_sigma_static_kij_channels_jax,
+				get_sigma_kij_channels_fn=project_to_bands_ri,
 				print0=print0,
 			)
 			_ppm_t2 = _ppm_time.perf_counter()

@@ -256,7 +256,7 @@ class EnergyWindow:
 
 @dataclass
 class MinimaxWindowPair:
-    """Single-window quadrature container matching the legacy window API."""
+    """Minimax quadrature for a single valence-conduction window pair."""
 
     val_window: EnergyWindow
     cond_window: EnergyWindow
@@ -265,17 +265,6 @@ class MinimaxWindowPair:
     w_i: np.ndarray
     z_lm: float
     alpha_i: np.ndarray
-
-    # Kept for compatibility with dynamic code paths that may touch these attrs.
-    val_band_start: np.ndarray | None = None
-    val_band_len: np.ndarray | None = None
-    val_band_offset: np.ndarray | None = None
-    cond_band_start: np.ndarray | None = None
-    cond_band_len: np.ndarray | None = None
-    cond_band_offset: np.ndarray | None = None
-    max_val_len: int = 0
-    max_cond_len: int = 0
-    _has_band_ranges: bool = False
 
     def with_imag_freq_modulation(self, omega_imag: float) -> "MinimaxWindowPair":
         """Return a copy whose kernel weights include ``cos(omega_imag * tau)``.
@@ -683,9 +672,7 @@ def build_static_minimax_window_pair(
         use_shipped_tables=use_shipped_tables,
     )
 
-    # Compatibility transform for legacy chi kernel:
-    # with z_lm=1, passing w_i = alpha_i * exp(-tau_i) yields
-    # total coefficient -2 * alpha_i * exp(-tau_i * DeltaE).
+    # w_i = alpha_i * exp(-tau_i) so the chi kernel weight is -2 * w_i * exp(-tau_i * ΔE).
     w_kernel = quad.alpha * np.exp(-quad.tau)
     pair = MinimaxWindowPair(
         val_window=EnergyWindow(start_energy=vmin, end_energy=vmax, index=0, count=1),
@@ -744,7 +731,7 @@ def build_imag_freq_minimax_window_pair(
         max_nodes=max_nodes,
     )
 
-    # Same compatibility transform as the static case:
+    # Same w_i = alpha_i * exp(-tau_i) transform as the static case:
     # w_i = alpha * exp(-tau) so that the chi kernel gives
     # -2 * alpha * exp(-tau * (E_c - E_v)).
     w_kernel = quad.alpha * np.exp(-quad.tau)

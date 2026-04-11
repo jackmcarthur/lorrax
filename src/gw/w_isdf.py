@@ -7,13 +7,13 @@ Streamlined pipeline for COHSEX:
 - χ computed with P(..., μ_X, ..., ν_Y) sharding
 - V, χ resharded to P(q_XY, μ, ν) for Dyson solve
 
-For legacy dynamic W(ω) with window-specific kernels, see archive/w_isdf_dynamic.py.
+Static χ₀ and W computation using ISDF + minimax quadrature.
 """
 import os
 import math
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
@@ -29,9 +29,6 @@ from .minimax_screening import (
     build_static_minimax_window_pair,
     extract_gn_ppm_parameters_from_Wc,
 )
-
-if TYPE_CHECKING:
-    from .wavefunction_bundle import Wavefunctions
 
 
 # ============================================================================
@@ -77,9 +74,6 @@ def _get_chi_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
     if cache_key in _chi_kernel_cache:
         return _chi_kernel_cache[cache_key]
     
-    # Define shardings
-    psi_XT = NamedSharding(mesh_xy, P(None, None, 'x', None))   # (nk, ns, μ_X, nb)
-    psi_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))    # (nk, nb, ns, μ_Y)
     chi_out = NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y'))
     chi_R = NamedSharding(mesh_xy, P('x', 'y', None, None, None))
     G_v = NamedSharding(mesh_xy, P(None, None, 'x', None, 'y'))  # (nk, ns, μ_X, ns, μ_Y)
@@ -210,9 +204,6 @@ def compute_chi0(
     _ensure_compilation_cache()
     
     nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
-    nk = psi_val_xn.shape[0]
-    nb_v = enk_v.shape[1]
-    nb_c = enk_c.shape[1]
     n_rmu = psi_val_xn.shape[2]
     
     # Get energies on host for mask computation
@@ -619,7 +610,7 @@ def compute_screening(
         reference=minimax_config.energy_reference,
     )
 
-    _windows_minimax, quad = build_static_minimax_window_pair(
+    _, quad = build_static_minimax_window_pair(
         enk_v, enk_c,
         minimax_config=minimax_config,
         target_error=float(minimax_config.target_error),
