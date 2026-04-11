@@ -478,12 +478,12 @@ def compute_w0_wiwp_and_ppm_from_minimax(
         raise ValueError("omega_p_ry must be > 0.")
 
     s = wf_bundle.slices
-    psi_vTX = wf_bundle.x(s.v_slice)
-    psi_vY = wf_bundle.y(s.v_slice)
-    psi_cX = wf_bundle.y(s.c_slice)
-    psi_cTY = wf_bundle.x(s.c_slice)
-    enk_v = wf_bundle.enk[:, s.v_slice]
-    enk_c = wf_bundle.enk[:, s.c_slice]
+    psi_val_xn = wf_bundle.xn(s.val)
+    psi_val_yr = wf_bundle.yr(s.val)
+    psi_cond_xn = wf_bundle.xn(s.cond)
+    psi_cond_yr = wf_bundle.yr(s.cond)
+    enk_v = wf_bundle.enk[:, s.val]
+    enk_c = wf_bundle.enk[:, s.cond]
     e_ref = w_isdf.resolve_minimax_energy_reference(
         enk_v,
         enk_c,
@@ -519,8 +519,10 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     )
 
     _t_chi0 = _ppm_time.perf_counter()
+    # chi0 kernel has historical naming inversion for conduction args:
+    # "psi_cX" expects yr, "psi_cTY" expects xn. Pass (yr, xn) for conduction.
     chi0_q = w_isdf.compute_chi0_minimax(
-        psi_vTX, psi_vY, psi_cX, psi_cTY,
+        psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
         enk_v, enk_c, quad, meta, mesh_xy,
         energy_reference=e_ref,
     )
@@ -528,7 +530,7 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     print0(f"  [TIMING-PPM] chi(0): {_ppm_time.perf_counter() - _t_chi0:.3f}s")
     _t_chii = _ppm_time.perf_counter()
     chii_q = w_isdf.compute_chi0_minimax(
-        psi_vTX, psi_vY, psi_cX, psi_cTY,
+        psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
         enk_v, enk_c, quad_imag, meta, mesh_xy,
         energy_reference=e_ref,
     )

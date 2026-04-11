@@ -638,14 +638,18 @@ def get_chi0_jax_from_bundle(
         raise ValueError("mesh_xy is required for bundle-based chi0 evaluation")
 
     s = wf_bundle.slices
-    psi_vTX = wf_bundle.x(s.v_slice)
-    psi_vY = wf_bundle.y(s.v_slice)
-    psi_cX = wf_bundle.y(s.c_slice)
-    psi_cTY = wf_bundle.x(s.c_slice)
-    enk_v = wf_bundle.enk[:, s.v_slice]
-    enk_c = wf_bundle.enk[:, s.c_slice]
+    # G construction uses (xn, yr) pair for both valence and conduction.
+    # The chi0 kernel signature has a historical naming inversion for conduction:
+    # parameter "psi_cX" expects yr layout, "psi_cTY" expects xn layout.
+    # We pass (yr, xn) for conduction to match this convention.
+    psi_val_xn = wf_bundle.xn(s.val)
+    psi_val_yr = wf_bundle.yr(s.val)
+    psi_cond_xn = wf_bundle.xn(s.cond)
+    psi_cond_yr = wf_bundle.yr(s.cond)
+    enk_v = wf_bundle.enk[:, s.val]
+    enk_c = wf_bundle.enk[:, s.cond]
     return compute_chi0(
-        psi_vTX, psi_vY, psi_cX, psi_cTY,
+        psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
         enk_v, enk_c, windows, meta, mesh_xy,
     )
 
@@ -810,12 +814,14 @@ def compute_screening(
             use_shipped_minimax_tables = bool(minimax_config.use_shipped_tables)
             minimax_energy_reference = minimax_config.energy_reference
         s = wf_bundle.slices
-        psi_vTX = wf_bundle.x(s.v_slice)
-        psi_vY = wf_bundle.y(s.v_slice)
-        psi_cX = wf_bundle.y(s.c_slice)
-        psi_cTY = wf_bundle.x(s.c_slice)
-        enk_v = wf_bundle.enk[:, s.v_slice]
-        enk_c = wf_bundle.enk[:, s.c_slice]
+        psi_val_xn = wf_bundle.xn(s.val)
+        psi_val_yr = wf_bundle.yr(s.val)
+        psi_cond_xn = wf_bundle.xn(s.cond)
+        psi_cond_yr = wf_bundle.yr(s.cond)
+        enk_v = wf_bundle.enk[:, s.val]
+        enk_c = wf_bundle.enk[:, s.cond]
+        # chi0 kernel has historical naming inversion for conduction args:
+        # "psi_cX" expects yr, "psi_cTY" expects xn.
         e_ref = resolve_minimax_energy_reference(
             enk_v,
             enk_c,
@@ -835,7 +841,7 @@ def compute_screening(
 
         t_min0 = time.perf_counter()
         chi_omega = compute_chi0_minimax(
-            psi_vTX, psi_vY, psi_cX, psi_cTY,
+            psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
             enk_v, enk_c, quad, meta, mesh_xy,
             energy_reference=e_ref,
         )
@@ -867,7 +873,7 @@ def compute_screening(
                 f"nodes={quad_imag.node_count}, fit_err~{quad_imag.max_error:.3e}"
             )
             chi_iwp = compute_chi0_minimax(
-                psi_vTX, psi_vY, psi_cX, psi_cTY,
+                psi_val_xn, psi_val_yr, psi_cond_xn, psi_cond_yr,
                 enk_v, enk_c, quad_imag, meta, mesh_xy,
                 energy_reference=e_ref,
             )

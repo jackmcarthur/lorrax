@@ -21,8 +21,8 @@ def _normalize_omega_input(omega) -> tuple[np.ndarray, bool]:
 
 def _ensure_window_band_ranges_for_bundle(wf_bundle, windows) -> None:
     s = wf_bundle.slices
-    enk_v_host = np.asarray(jax.device_get(wf_bundle.enk[:, s.v_slice]))
-    enk_c_host = np.asarray(jax.device_get(wf_bundle.enk[:, s.c_slice]))
+    enk_v_host = np.asarray(jax.device_get(wf_bundle.enk[:, s.val]))
+    enk_c_host = np.asarray(jax.device_get(wf_bundle.enk[:, s.cond]))
     for win in windows:
         if getattr(win, "_has_band_ranges", False):
             continue
@@ -39,12 +39,12 @@ def _compute_window_denom(
     nkz: int,
 ):
     s = wf_bundle.slices
-    psi_vTX = wf_bundle.x(s.v_slice)
-    psi_vY = wf_bundle.y(s.v_slice)
-    psi_cX = wf_bundle.y(s.c_slice)
-    psi_cTY = wf_bundle.x(s.c_slice)
-    enk_v = wf_bundle.enk[:, s.v_slice]
-    enk_c = wf_bundle.enk[:, s.c_slice]
+    psi_val_xn = wf_bundle.xn(s.val)
+    psi_val_yr = wf_bundle.yr(s.val)
+    psi_cond_xn = wf_bundle.xn(s.cond)
+    psi_cond_yr = wf_bundle.yr(s.cond)
+    enk_v = wf_bundle.enk[:, s.val]
+    enk_c = wf_bundle.enk[:, s.cond]
 
     val_start = jnp.asarray(win.val_band_start, dtype=jnp.int32)
     cond_start = jnp.asarray(win.cond_band_start, dtype=jnp.int32)
@@ -55,10 +55,10 @@ def _compute_window_denom(
     omega_values = jnp.asarray(denom.omega_values, dtype=jnp.float64)
 
     kwargs = dict(
-        psi_vTX=psi_vTX,
-        psi_vY=psi_vY,
-        psi_cX=psi_cX,
-        psi_cTY=psi_cTY,
+        psi_vTX=psi_val_xn,
+        psi_vY=psi_val_yr,
+        psi_cX=psi_cond_yr,
+        psi_cTY=psi_cond_xn,
         enk_v=enk_v,
         enk_c=enk_c,
         val_start=val_start,

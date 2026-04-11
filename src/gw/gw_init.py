@@ -1188,7 +1188,7 @@ def build_bundle_and_views(
 	meta,
 	band_slices,
 	mesh_xy,
-	sh,
+	sh=None,
 	psi_l_y=None,
 	psi_r_y=None,
 	psi_full_y=None,
@@ -1196,14 +1196,17 @@ def build_bundle_and_views(
 	enk_full=None,
 	print0=print,
 ):
-	"""Build WavefunctionBundle and sigma views from either ISDF or restart arrays.
+	"""Build Wavefunctions bundle from either ISDF or restart arrays.
 
 	Provide (psi_l_y, psi_r_y) for the ISDF path, or (psi_full_y[, psi_full_x])
 	for the restart path. enk_full is loaded from WFN if not provided.
+
+	Returns (wf_bundle, sigma_views) for backward compatibility, where
+	sigma_views is a legacy shim that delegates to wf_bundle.xn/xr/yr/yn.
 	"""
 	from .wavefunction_bundle import (
-		build_wavefunction_bundle,
-		build_wavefunction_bundle_from_full,
+		build_wavefunctions,
+		build_wavefunctions_from_full,
 		build_sigma_views,
 	)
 	from common.load_wfns import get_enk_bandrange
@@ -1216,33 +1219,27 @@ def build_bundle_and_views(
 		)
 
 	if psi_full_y is not None:
-		wf_bundle = build_wavefunction_bundle_from_full(
+		wf_bundle = build_wavefunctions_from_full(
 			psi_full_y,
-			psi_full_x=psi_full_x,
+			psi_xn_full=psi_full_x,
 			enk_full=enk_full,
 			slices=band_slices,
 			mesh_xy=mesh_xy,
-			sh=sh,
-			# Keep occupied-mask definition consistent with the selected band window.
-			# This avoids dependence on WFN-level chemical potential conventions.
 			efermi=None,
 		)
 	else:
-		wf_bundle = build_wavefunction_bundle(
+		wf_bundle = build_wavefunctions(
 			psi_l_y, psi_r_y,
 			enk_full=enk_full,
 			slices=band_slices,
 			mesh_xy=mesh_xy,
-			sh=sh,
-			# Keep occupied-mask definition consistent with the selected band window.
-			# This avoids dependence on WFN-level chemical potential conventions.
 			efermi=None,
 		)
 
 	sigma_views = build_sigma_views(wf_bundle, mesh_xy, sh)
 	print0(
-		f"  Wavefunction bundle built (b0:b4={band_slices.nb_full} bands, "
-		"canonical X/Y storage)"
+		f"  Wavefunctions built (b0:b4={band_slices.nb_full} bands, "
+		f"4 sharded copies: xn/xr/yr/yn)"
 	)
 	return wf_bundle, sigma_views
 
@@ -1293,15 +1290,15 @@ def prepare_isdf_and_wavefunctions(
 		v_q0_noG0_munu = isdf_result['v_q0_noG0_munu']
 		G0_mu_nu = isdf_result['G0_mu_nu']
 
-		# Persist restart artifacts
+		# Persist restart artifacts (save yr copy — the canonical serialisation layout)
 		write_restart_state_to_h5(
 			tensors_filename, V_qmunu,
-			wf_bundle.psi_y, wf_bundle.enk, None,
+			wf_bundle.psi_yr, wf_bundle.enk, None,
 			V0_noG0_munu=v_q0_noG0_munu, G0_mu_nu=G0_mu_nu, init_W0=True,
 		)
 		save_restart_state_per_proc(
 			os.path.join(tmp_dir, "isdf_tensors"),
-			V_qmunu, None, wf_bundle.psi_y, wf_bundle.enk,
+			V_qmunu, None, wf_bundle.psi_yr, wf_bundle.enk,
 			meta, mesh_xy, V0_noG0_munu=v_q0_noG0_munu,
 		)
 		V_qmunu.block_until_ready()

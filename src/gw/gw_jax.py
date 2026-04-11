@@ -139,11 +139,7 @@ from .head_correction import (
 	resolve_head_sample,
 	static_head_terms_to_kij,
 )
-from .wavefunction_bundle import (
-	BandSlices,
-	build_wavefunction_bundle,
-	build_wavefunction_bundle_from_full,
-)
+from .wavefunction_bundle import BandSlices, Wavefunctions
 from mixing.acceleration import (
     rcrop_nojit, hermitian_to_upper_flat, upper_flat_to_hermitian
 )
@@ -515,36 +511,40 @@ def fit_zeta_and_compute_V_q_chunked(
 
 # ================= JAX-sharded Sigma pipeline =================
 
-def get_G_mu_nu_jax(psi_vTX, psi_vY, Gij_static):
-	"""Pure: psi_* (nk, nb, nspinor, n_rmu), Gij_static (nk,nb,nb) -> G_k (nk, nspinor, n_rmu, nspinor, n_rmu).
-	
-	Computes G_μν(k) = Σ_ij ψ*_ik(r_μ) G_ijk ψ_jk(r_ν)
-	
-	Zero-comm contraction when left is X-sharded on rmu and right is Y-sharded on rmu.
-	Gij_static should be initialized as zeros with diagonal 0:nelec set to 1.0+0.j
-	for the static COHSEX Green's function (identity on occupied states).
-	"""
-		
-	# G[k,s,x,t,y] = Σ_ij ψ*_ik(s,x) G_ijk ψ_jk(t,y)
-	# psi_vTX: (k, spinor, rmu, band) = 'ksxi'
-	# Gij: (k, band_i, band_j) = 'kij'  
-	# conj(psi_vY): (k, band, spinor, rmu) = 'kjty'
-	G_k = jnp.einsum('ksxi,kij,kjty->ksxty', psi_vTX, Gij_static, jnp.conj(psi_vY), optimize=True)
-	return G_k
+def build_G_munu(psi_xn, psi_yr, Gij):
+	"""Build the ISDF Green's function G_μν(k) = Σ_ij ψ*_ik(μ) G_ij(k) ψ_jk(ν).
 
-def get_G_mu_nu_RI(psi_vTX, psi_vY):
-	"""Pure: psi_* (nk, nb, nspinor, n_rmu) -> G_k (nk, nspinor, n_rmu, nspinor, n_rmu).
-	
-	Computes G_μν(k) = Σ_n ψ*_nk(r_μ) ψ_nk(r_ν) for ALL bands (no occupation weighting).
-	
-	This is the "resolution of identity" style sum used for the Coulomb hole term.
-	Zero-comm contraction when left is X-sharded on rmu and right is Y-sharded on rmu.
+	Args:
+		psi_xn: (nk, s, μ_X, n) — bands fast, μ on X.  Conjugated internally.
+		psi_yr: (nk, n, s, μ_Y) — centroids fast, μ on Y.  Conjugated internally.
+		Gij:    (nk, n, n) — band-space Green's function / projector.
+
+	Returns:
+		G_k: (nk, s, μ_X, s, μ_Y) — ISDF Green's function, μ distributed (X, Y).
+
+	Spins are NOT contracted; the output carries both spinor indices.
+	Zero-communication contraction when μ_X and μ_Y live on different mesh axes.
 	"""
-	# G[k,s,x,t,y] = Σ_n ψ*_nk(s,x) ψ_nk(t,y)
-	# psi_vTX: (k, spinor, rmu, band) = 'ksxn'
-	# conj(psi_vY): (k, band, spinor, rmu) = 'knty'
-	G_k = jnp.einsum('ksxn,knty->ksxty', psi_vTX, jnp.conj(psi_vY), optimize=True)
-	return G_k
+	return jnp.einsum('ksxi,kij,kjty->ksxty', psi_xn, Gij, jnp.conj(psi_yr), optimize=True)
+
+def build_G_munu_ri(psi_xn, psi_yr):
+	"""Resolution-of-identity Green's function G_μν(k) = Σ_n ψ*_nk(μ) ψ_nk(ν).
+
+	Sums over ALL bands with unit weight (no occupation projector).
+	Used for the Coulomb-hole self-energy term.
+
+	Args:
+		psi_xn: (nk, s, μ_X, n) — bands fast, μ on X.
+		psi_yr: (nk, n, s, μ_Y) — centroids fast, μ on Y.
+
+	Returns:
+		G_k: (nk, s, μ_X, s, μ_Y).
+	"""
+	return jnp.einsum('ksxn,knty->ksxty', psi_xn, jnp.conj(psi_yr), optimize=True)
+
+# Backward-compatibility aliases
+get_G_mu_nu_jax = build_G_munu
+get_G_mu_nu_RI = build_G_munu_ri
 
 def get_G_R_jax(G_k, nkx, nky, nkz, sharded_ifftn=None):
 	"""(nk, s1,rmu1,s2,rmu2) -> (s1,rmu1,s2,rmu2,nkx,nky,nkz).
@@ -586,27 +586,30 @@ def get_sigma_static_mu_nu_jax(G_R, V_mu_nu, nk_tot, bispinor=False,
 		return sharded_fftn(sigma_R)
 	return jnp.fft.fftn(sigma_R, axes=(4,5,6), norm='ortho')
 
-def get_sigma_static_kij_jax(psi_sigX, psi_sigTY, sigma_k_munu):
-	"""Project self-energy from (spinor,rmu) basis to band basis.
-	
-	Computes: Σ_mn(k) = Σ_{s,t,μ,ν} ψ*_ms(k,μ) Σ_st(k,μ,ν) ψ_nt(k,ν)
-	
-	Works for both 2-component (Pauli) and 4-component (bispinor) wavefunctions.
-	The spinor contraction sums over all spinor components (s,t indices).
-	
+def project_sigma_to_bands(psi_xr, psi_yn, sigma_k_munu):
+	"""Project self-energy from ISDF (s,μ) basis to band basis.
+
+	Σ_mn(k) = Σ_{s,t,μ,ν} ψ*_m(s,μ_X) Σ(s,μ_X,t,ν_Y) ψ_n(t,ν_Y)
+
+	Both spinor indices (s, t) and both centroid indices (μ, ν) are contracted.
+	The (s,μ) pairs are contiguous in memory for both psi_xr and psi_yn.
+
 	Args:
-		psi_sigX: (nk, nb, nspinor, rmu) wavefunctions
-		psi_sigTY: (nk, nspinor, rmu, nb) transposed wavefunctions
-		sigma_k_munu: (nspinor, rmu1, nspinor, rmu2, nkx, nky, nkz) self-energy
-		
+		psi_xr: (nk, nb, s, μ_X) — centroids fast, μ on X.  Conjugated internally.
+		psi_yn: (nk, s, μ_Y, nb) — bands fast, μ on Y.
+		sigma_k_munu: (s, μ, s, μ, nkx, nky, nkz) — ISDF self-energy.
+
 	Returns:
-		sigma_kij: (nk, nb, nb) band-space self-energy matrix
+		sigma_kij: (nk, nb, nb) — band-space self-energy matrix.
 	"""
 	nkx, nky, nkz = sigma_k_munu.shape[-3:]
 	nk = nkx * nky * nkz
-	sigma_k = sigma_k_munu.transpose(4, 5, 6, 0, 1, 2, 3).reshape(nk, *sigma_k_munu.shape[:4]) # (nk,s1,rmu1,s2,rmu2)
-	left = jnp.einsum('kmsx,ksxty->kmty', jnp.conj(psi_sigX), sigma_k, optimize=True)
-	return jnp.einsum('kmty,ktyn->kmn', left, psi_sigTY, optimize=True)
+	sigma_k = sigma_k_munu.transpose(4, 5, 6, 0, 1, 2, 3).reshape(nk, *sigma_k_munu.shape[:4])
+	left = jnp.einsum('kmsx,ksxty->kmty', jnp.conj(psi_xr), sigma_k, optimize=True)
+	return jnp.einsum('kmty,ktyn->kmn', left, psi_yn, optimize=True)
+
+# Backward-compatibility alias
+get_sigma_static_kij_jax = project_sigma_to_bands
 
 
 def get_sigma_static_kij_channels_jax(psi_sigX, psi_sigTY, sigma_k_munu):
@@ -643,65 +646,44 @@ def get_sigma_static_kij_channels_jax(psi_sigX, psi_sigTY, sigma_k_munu):
 	left = jnp.einsum('kmsx,cksxty->ckmty', jnp.conj(psi_sigX), sigma_k_ri, optimize=True)
 	return jnp.einsum('ckmty,ktyn->ckmn', left, psi_sigTY, optimize=True).astype(jnp.complex128)
 
-# ================= Hartree helper functions =================
+# ================= Hartree =================
 
-def build_density_from_Gij(psi_rmu, Gij, nk_tot):
-	"""Build charge density at centroids from wavefunctions and Green's function.
-	
-	ρ_μ = (1/Nk) Σ_k Σ_{ij} G_ij(k) ψ*_ik(r_μ) ψ_jk(r_μ)
-	
-	For diagonal Gij (initial), this reduces to Σ_n f_n |ψ_n|².
-	For Gij = U @ diag(f) @ U† (self-consistent), this correctly computes
-	the density from the QP Green's function in the DFT basis.
-	
+def build_density_from_Gij(psi_yr, Gij, nk_tot):
+	"""Charge density at centroids: ρ_μ = (1/Nk) Σ_{k,ij,s} G_ij ψ*_i(s,μ) ψ_j(s,μ).
+
+	Spinor index is contracted (spin-traced).  Uses psi_yr because μ
+	appears twice — the contraction is local on Y.
+
 	Args:
-		psi_rmu: (nk, nb, nspinor, n_rmu) wavefunctions at centroids
-		Gij: (nk, nb, nb) Green's function matrix (FULL matrix, not just diagonal)
-		nk_tot: Total number of k-points for BZ averaging
-		
+		psi_yr: (nk, n, s, μ_Y) — centroids fast, μ on Y.
+		Gij:    (nk, n, n) — Green's function / occupation projector.
+		nk_tot: total k-points for BZ averaging.
+
 	Returns:
-		rho_mu: (n_rmu,) density at centroids
+		rho_mu: (μ,) charge density at centroid positions.
 	"""
-	# psi_rmu: (nk, nb, ns, rmu)
-	# Gij: (nk, ni, nj)
-	# rho_μ = Σ_k Σ_{ij} Σ_s G_ij ψ*_is(μ) ψ_js(μ)
-	# Contract: 'kij,kismu,kjsmu->mu' but need real part
-	# Build ψ*_i ψ_j first: (nk, ni, nj, ns, rmu)
-	psi_conj = jnp.conj(psi_rmu)  # (nk, nb, ns, rmu)
-	# ψ*_i(μ) ψ_j(μ) summed over spinor
-	psi_ij = jnp.einsum('kisx,kjsx->kijx', psi_conj, psi_rmu, optimize=True)  # (nk, ni, nj, rmu)
-	# Contract with Gij and sum over k, i, j
+	psi_ij = jnp.einsum('kisx,kjsx->kijx', jnp.conj(psi_yr), psi_yr, optimize=True)
 	rho_mu = jnp.einsum('kij,kijx->x', Gij, psi_ij, optimize=True)
 	rho_mu = jnp.real(rho_mu) / jnp.asarray(nk_tot, dtype=jnp.float64)
 	return rho_mu
 
 def build_hartree_potential(rho_mu, V0_munu):
-	"""Build Hartree potential at centroids from density.
-	
-	[Vρ]_μ = Σ_ν V0_μν ρ_ν
-	
-	Args:
-		rho_mu: (n_rmu,) density at centroids
-		V0_munu: (n_rmu, n_rmu) bare Coulomb at q=0 (G=0 excluded)
-		
-	Returns:
-		Vrho_mu: (n_rmu,) Hartree potential at centroids
-	"""
+	"""Hartree potential at centroids: [Vρ]_μ = Σ_ν V0(μ,ν) ρ_ν."""
 	return jnp.einsum('xy,y->x', V0_munu, rho_mu, optimize=True)
 
-def project_potential_to_bands(psi_rmu, Vrho_mu):
-	"""Project local potential to band matrix elements.
-	
-	V_mn(k) = Σ_μ,s ψ*_mk(r_μ) V_μ ψ_nk(r_μ)
-	
+def project_potential_to_bands(psi_xr, Vrho_mu):
+	"""Project local potential to bands: ⟨m|V|n⟩ = Σ_{s,μ} ψ*_m(s,μ) V(μ) ψ_n(s,μ).
+
+	Uses psi_xr (centroids fast, μ on X) — same copy as Σ projection LHS.
+
 	Args:
-		psi_rmu: (nk, nb, nspinor, n_rmu) wavefunctions at centroids
-		Vrho_mu: (n_rmu,) potential at centroids
-		
+		psi_xr: (nk, n, s, μ_X) — centroids fast, μ on X.
+		Vrho_mu: (μ,) potential at centroids.
+
 	Returns:
-		V_kmn: (nk, nb, nb) potential matrix elements
+		V_kmn: (nk, nb, nb) potential matrix elements.
 	"""
-	return jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_rmu), Vrho_mu, psi_rmu, optimize=True)
+	return jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_xr), Vrho_mu, psi_xr, optimize=True)
 
 def compute_sigma_pipeline_jax(
 	psi_l_rmuT_X,
@@ -1000,7 +982,9 @@ def main(argv=None):
 	# Retained in restart payloads for diagnostics / external checks, but no longer
 	# used in the active q=0 head treatment.
 	_ = isdf.G0_mu_nu
-	wf_bundle = isdf.wf_bundle
+	wfns = isdf.wf_bundle
+	s = wfns.slices
+	# Legacy alias kept until all sigma_views references are removed
 	sigma_views = isdf.sigma_views
 
 	# Compute screened Coulomb W = (1 - Vχ)⁻¹ V
@@ -1023,7 +1007,7 @@ def main(argv=None):
 					if use_ppm_sigma and screening_setup.screening_method == "minimax":
 						screening_ppm_omega_p = None
 					W_q = compute_screening(
-						V_qmunu, wf_bundle, window_pairs, meta, mesh_xy,
+						V_qmunu, wfns, window_pairs, meta, mesh_xy,
 						omega=screening_setup.omega_eval,
 						screening_method=screening_setup.screening_method,
 						minimax_config=screening_setup.minimax_config,
@@ -1115,15 +1099,15 @@ def main(argv=None):
 	nkx_s, nky_s, nkz_s = int(meta.nkx), int(meta.nky), int(meta.nkz)
 
 	@jax.jit
-	def _build_G_k_jit(psi_XT, psi_Y, Gij):
-		G_k = get_G_mu_nu_jax(psi_XT, psi_Y, Gij)
+	def _build_G_7d_jit(psi_xn, psi_yr, Gij):
+		G_k = build_G_munu(psi_xn, psi_yr, Gij)
 		G_7d = G_k.transpose(1,2,3,4,0).reshape(
 			G_k.shape[1], G_k.shape[2], G_k.shape[3], G_k.shape[4], nkx_s, nky_s, nkz_s)
 		return jax.lax.with_sharding_constraint(G_7d, _G_7d_shard)
 
 	@jax.jit
-	def _build_GRI_k_jit(psi_XT, psi_Y):
-		G_k = get_G_mu_nu_RI(psi_XT, psi_Y)
+	def _build_GRI_7d_jit(psi_xn, psi_yr):
+		G_k = build_G_munu_ri(psi_xn, psi_yr)
 		G_7d = G_k.transpose(1,2,3,4,0).reshape(
 			G_k.shape[1], G_k.shape[2], G_k.shape[3], G_k.shape[4], nkx_s, nky_s, nkz_s)
 		return jax.lax.with_sharding_constraint(G_7d, _G_7d_shard)
@@ -1136,55 +1120,53 @@ def main(argv=None):
 		return jax.lax.with_sharding_constraint(sigma_R, _G_7d_shard)
 
 	@jax.jit
-	def _project_jit(psi_X, psi_TY, sigma_k):
-		return get_sigma_static_kij_jax(psi_X, psi_TY, sigma_k)
+	def _project_jit(psi_xr, psi_yn, sigma_k):
+		return project_sigma_to_bands(psi_xr, psi_yn, sigma_k)
 
 	@jax.jit
-	def _hartree_jit(psi_Y, Gij, V0, psi_X, nk_tot):
-		rho = build_density_from_Gij(psi_Y, Gij, nk_tot)
+	def _hartree_jit(psi_yr, Gij, V0, psi_xr, nk_tot):
+		rho = build_density_from_Gij(psi_yr, Gij, nk_tot)
 		Vrho = build_hartree_potential(rho, V0)
-		return project_potential_to_bands(psi_X, Vrho)
+		return project_potential_to_bands(psi_xr, Vrho)
 
 	@jax.jit
-	def _sub(a, b):
-		return a - b
-
-	@jax.jit
-	def _sx_branch_jit(psi_lT, psi_l, psi_proj, psi_projT, Gij, W, nk_tot):
-		G_7d = _build_G_k_jit(psi_lT, psi_l, Gij)
+	def _sx_branch_jit(psi_xn_sig, psi_yr_sig, psi_xr_sig, psi_yn_sig, Gij, W, nk_tot):
+		G_7d = _build_G_7d_jit(psi_xn_sig, psi_yr_sig, Gij)
 		G_R = _local_ifftn_G(G_7d)
 		sigma_sx_R = _sigma_R_jit(G_R, W, nk_tot)
 		sigma_sx_k = _local_fftn_G(sigma_sx_R)
-		return _project_jit(psi_proj, psi_projT, sigma_sx_k)
+		return _project_jit(psi_xr_sig, psi_yn_sig, sigma_sx_k)
 
 	@jax.jit
-	def _coh_branch_jit(psi_cohT, psi_coh, psi_proj, psi_projT, W, V, nk_tot):
-		G_7d = _build_GRI_k_jit(psi_cohT, psi_coh)
+	def _coh_branch_jit(psi_xn_full, psi_yr_full, psi_xr_sig, psi_yn_sig, W, V, nk_tot):
+		G_7d = _build_GRI_7d_jit(psi_xn_full, psi_yr_full)
 		G_RI_R = _local_ifftn_G(G_7d)
-		WmV = _sub(W, V)
+		WmV = W - V
 		sigma_coh_R = _sigma_R_jit(G_RI_R, WmV, nk_tot)
 		sigma_coh_k = _local_fftn_G(sigma_coh_R)
-		return -0.5 * _project_jit(psi_proj, psi_projT, sigma_coh_k)
+		return -0.5 * _project_jit(psi_xr_sig, psi_yn_sig, sigma_coh_k)
 
-	def pipeline_fn(
-		psi_lT, psi_l, psi_cohT, psi_coh, psi_proj, psi_projT,
-		W, V, V0, Gij,
-		nkx, nky, nkz, nk_tot, nspinor, fft_vol_au, bispinor,
-	):
-		"""Static sigma pipeline with local FFTs preserved under jit."""
-		# Free memory from chi0/W/PPM before sigma compilation
+	def static_sigma_pipeline(wfns, W, V, V0, Gij):
+		"""Compute static COHSEX Σ_SX, Σ_COH, V_H from Wavefunctions bundle."""
 		import gc as _gc
 		_gc.collect()
-		# jax.clear_caches()  # too aggressive, may cause recompilation cascade
 
-		# SX
-		sigma_sx_kij = _sx_branch_jit(psi_lT, psi_l, psi_proj, psi_projT, Gij, W, nk_tot)
+		s = wfns.slices
+		nk_tot = meta.nk_tot
 
-		# COH
-		sigma_coh_kij = _coh_branch_jit(psi_cohT, psi_coh, psi_proj, psi_projT, W, V, nk_tot)
+		sigma_sx_kij = _sx_branch_jit(
+			wfns.xn(s.sigma), wfns.yr(s.sigma),
+			wfns.xr(s.sigma), wfns.yn(s.sigma),
+			Gij, W, nk_tot)
 
-		# Hartree
-		hartree_kmn = _hartree_jit(psi_l, Gij, V0, psi_proj, nk_tot)
+		sigma_coh_kij = _coh_branch_jit(
+			wfns.xn(s.full), wfns.yr(s.full),
+			wfns.xr(s.sigma), wfns.yn(s.sigma),
+			W, V, nk_tot)
+
+		hartree_kmn = _hartree_jit(
+			wfns.yr(s.sigma), Gij, V0,
+			wfns.xr(s.sigma), nk_tot)
 
 		return sigma_sx_kij, sigma_coh_kij, hartree_kmn
 
@@ -1206,14 +1188,8 @@ def main(argv=None):
 
 	with mesh_xy:
 		with timing.section("gw_jax.pipeline"):
-			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = pipeline_fn(
-				sigma_views.psi_lT, sigma_views.psi_l,
-				sigma_views.psi_cohT, sigma_views.psi_coh,
-				sigma_views.psi_proj, sigma_views.psi_projT,
-				W_mu_nu, V_mu_nu_for_coh, v_q0_noG0_munu, Gij_static,
-				meta.nkx, meta.nky, meta.nkz, meta.nk_tot, meta.nspinor,
-				fft_vol_au, bispinor,
-			)
+			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = \
+				static_sigma_pipeline(wfns, W_mu_nu, V_mu_nu_for_coh, v_q0_noG0_munu, Gij_static)
 			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax = _apply_static_head_terms(
 				sigma_sx_kbar_ij_jax,
 				sigma_coh_kbar_ij_jax,
@@ -1334,7 +1310,7 @@ def main(argv=None):
 				head_gn = None
 			ppm = compute_w0_wiwp_and_ppm_from_minimax(
 				V_qmunu_nohead,
-				wf_bundle,
+				wfns,
 				meta,
 				mesh_xy,
 				minimax_config=minimax_config,
@@ -1362,10 +1338,8 @@ def main(argv=None):
 			def _build_sigma_x_bare_kij():
 				with mesh_xy:
 					sigma_x_bare_kij_local = _sx_branch_jit(
-						sigma_views.psi_lT,
-						sigma_views.psi_l,
-						sigma_views.psi_proj,
-						sigma_views.psi_projT,
+						wfns.xn(s.sigma), wfns.yr(s.sigma),
+						wfns.xr(s.sigma), wfns.yn(s.sigma),
 						Gij_static,
 						V_mu_nu_exchange,
 						meta.nk_tot,
@@ -1374,12 +1348,12 @@ def main(argv=None):
 				return sigma_x_bare_kij_local
 
 			sigma_omega = compute_sigma_c_ppm_omega_grid(
-				psi_coh_rmuT_X=sigma_views.psi_cohT,
-				psi_coh_rmu_Y=sigma_views.psi_coh,
-				psi_proj_rmu_X=sigma_views.psi_proj,
-				psi_proj_rmuT_Y=sigma_views.psi_projT,
-				enk_full=wf_bundle.enk[:, wf_bundle.slices.coh_slice],
-				occ_full=wf_bundle.occ[:, wf_bundle.slices.coh_slice],
+				psi_coh_rmuT_X=wfns.xn(s.full),
+				psi_coh_rmu_Y=wfns.yr(s.full),
+				psi_proj_rmu_X=wfns.xr(s.sigma),
+				psi_proj_rmuT_Y=wfns.yn(s.sigma),
+				enk_full=wfns.enk[:, s.full],
+				occ_full=wfns.occ[:, s.full],
 				B_mu_nu=ppm.B_mu_nu,
 				Omega_mu_nu=ppm.Omega_mu_nu,
 				Wc0_mu_nu=ppm.Wc0_mu_nu,
@@ -1479,10 +1453,8 @@ def main(argv=None):
 					)
 					Wc0_mu_nu = jax.lax.with_sharding_constraint(Wc0_mu_nu, sh.V_shard)
 					sigma_coh_ppm_w0_kij = _coh_branch_jit(
-						sigma_views.psi_cohT,
-						sigma_views.psi_coh,
-						sigma_views.psi_proj,
-						sigma_views.psi_projT,
+						wfns.xn(s.full), wfns.yr(s.full),
+						wfns.xr(s.sigma), wfns.yn(s.sigma),
 						Wc0_mu_nu + V_mu_nu_for_coh,
 						V_mu_nu_for_coh,
 						meta.nk_tot,
@@ -1806,7 +1778,7 @@ def main(argv=None):
 				sigma_sx_host_ev,
 			)
 		)
-		occ_idx = max(0, min(int(wf_bundle.slices.occ_slice.stop) - 1, E_dyn0_ev.shape[1] - 1))
+		occ_idx = max(0, min(int(s.occ.stop) - 1, E_dyn0_ev.shape[1] - 1))
 		if fermi_reference == "midgap" and (occ_idx + 1) < E_dyn0_ev.shape[1]:
 			vbm_ev = float(np.max(E_dyn0_ev[:, occ_idx]))
 			cbm_ev = float(np.min(E_dyn0_ev[:, occ_idx + 1]))
@@ -1927,14 +1899,8 @@ def main(argv=None):
 			
 			# Compute new Σ using original wavefunctions but updated G_ij
 			with mesh_xy:
-				sigma_sx_new, sigma_coh_new, hartree_new = pipeline_fn(
-					sigma_views.psi_lT, sigma_views.psi_l,
-					sigma_views.psi_cohT, sigma_views.psi_coh,
-					sigma_views.psi_proj, sigma_views.psi_projT,
-					W_mu_nu, V_mu_nu_for_coh, v_q0_noG0_munu, Gij_new,
-					meta.nkx, meta.nky, meta.nkz, meta.nk_tot, meta.nspinor,
-					fft_vol_au, bispinor,
-				)
+				sigma_sx_new, sigma_coh_new, hartree_new = \
+					static_sigma_pipeline(wfns, W_mu_nu, V_mu_nu_for_coh, v_q0_noG0_munu, Gij_new)
 			sigma_sx_new, sigma_coh_new = _apply_static_head_terms(sigma_sx_new, sigma_coh_new)
 			
 			# Combine and extract upper triangle
@@ -1974,14 +1940,8 @@ def main(argv=None):
 		print_scf_diagnostics(Gij_final, U_full, nelec, nb_sigma, print0)
 
 		with mesh_xy:
-			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = pipeline_fn(
-				sigma_views.psi_lT, sigma_views.psi_l,
-				sigma_views.psi_cohT, sigma_views.psi_coh,
-				sigma_views.psi_proj, sigma_views.psi_projT,
-				W_mu_nu, V_mu_nu_for_coh, v_q0_noG0_munu, Gij_final,
-				meta.nkx, meta.nky, meta.nkz, meta.nk_tot, meta.nspinor,
-				fft_vol_au, bispinor,
-			)
+			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = \
+				static_sigma_pipeline(wfns, W_mu_nu, V_mu_nu_for_coh, v_q0_noG0_munu, Gij_final)
 		sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax = _apply_static_head_terms(
 			sigma_sx_kbar_ij_jax,
 			sigma_coh_kbar_ij_jax,
