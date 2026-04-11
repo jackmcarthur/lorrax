@@ -534,59 +534,51 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     )
     chii_q.block_until_ready()
     print0(f"  [TIMING-PPM] chi(iωp): {_ppm_time.perf_counter() - _t_chii:.3f}s")
+    # Flatten V for Dyson solve — all arrays flat-q (nq, μ, μ)
+    V_flat = jnp.asarray(V_qmunu)[0, 0, 0].reshape(-1, V_qmunu.shape[-2], V_qmunu.shape[-1])
+
     _t_w0 = _ppm_time.perf_counter()
-    W0_q = w_isdf.solve_w_from_chi_q_jax(V_qmunu, chi0_q, meta, mesh_xy)
+    W0_q = w_isdf.solve_w_from_chi_q_jax(V_flat, chi0_q, meta, mesh_xy)
     W0_q.block_until_ready()
     print0(f"  [TIMING-PPM] W(0): {_ppm_time.perf_counter() - _t_w0:.3f}s")
     _t_wi = _ppm_time.perf_counter()
-    Wiwp_q = w_isdf.solve_w_from_chi_q_jax(V_qmunu, chii_q, meta, mesh_xy)
+    Wiwp_q = w_isdf.solve_w_from_chi_q_jax(V_flat, chii_q, meta, mesh_xy)
     Wiwp_q.block_until_ready()
     print0(f"  [TIMING-PPM] W(iωp): {_ppm_time.perf_counter() - _t_wi:.3f}s")
 
-    nkx, nky, nkz = W0_q.shape[0], W0_q.shape[1], W0_q.shape[2]
-    n_rmu = W0_q.shape[4]
-    V_q = jnp.asarray(V_qmunu)[0, 0, 0].reshape(nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
+    n_rmu = W0_q.shape[1]
 
-    _summarize_hermitian_qmunu("W(0)", W0_q, print0)
-    _summarize_hermitian_qmunu(f"W(iωp={omega_p_ry:.3f} Ry)", Wiwp_q, print0)
+    # W^c = W - V, all flat-q (nq, μ, μ)
+    Wc0_q = W0_q - V_flat
+    Wci_q = Wiwp_q - V_flat
 
-    # Build W^c = W(with W_head) - V(with V_head).
-    Wc0_q = W0_q - V_q
-    Wci_q = Wiwp_q - V_q
-
-
-    Wc0_qmunu = Wc0_q[:, :, :, 0, :, 0, :]
-    Wci_qmunu = Wci_q[:, :, :, 0, :, 0, :]
     _t_fit = _ppm_time.perf_counter()
     omega_qmunu, b_qmunu, valid_qmunu, unfulfilled = fit_gn_ppm_from_wc_pair(
-        Wc0_qmunu,
-        Wci_qmunu,
-        1j * complex(omega_p_ry),
-        fallback_omega=float(fallback_omega),
-    )
+        Wc0_q, Wci_q, 1j * complex(omega_p_ry), fallback_omega=float(fallback_omega))
     print0(f"  [TIMING-PPM] GN fit: {_ppm_time.perf_counter() - _t_fit:.3f}s")
 
-    # GN poles are for W^c, so W^c(t) is a direct exponential sum.
+    # Transpose PPM params from (nq, μ, μ) to (μ, μ, nq) for sigma pipeline
     _t_layout = _ppm_time.perf_counter()
-    Omega = _qmunu_to_munu_local(omega_qmunu, mesh_xy=mesh_xy)
-    B = _qmunu_to_munu_local(b_qmunu, mesh_xy=mesh_xy)
-    valid_mask = _qmunu_to_munu_local(valid_qmunu, mesh_xy=mesh_xy)
-    Wc0_mu_nu = _qmunu_to_munu_local(Wc0_qmunu, mesh_xy=mesh_xy)
+    _to_munu = lambda x: jax.lax.with_sharding_constraint(
+        jnp.asarray(x).transpose(1, 2, 0),
+        NamedSharding(mesh_xy, P('x', 'y', None)))
+    Omega = _to_munu(omega_qmunu)
+    B = _to_munu(b_qmunu)
+    valid_mask = _to_munu(valid_qmunu)
+    Wc0_mu_nu = _to_munu(Wc0_q)
     print0(f"  [TIMING-PPM] q->mu,nu layout: {_ppm_time.perf_counter() - _t_layout:.3f}s")
 
-    # PPM consistency check: W^c(0) ≈ ± 2 B / Omega (elementwise).
+    # PPM consistency check: W^c(0) ≈ ± 2 B / Omega
     w0_rel_error = None
     w0_abs_error = None
     w0_ref_norm = None
     w0_rel_error_neg = None
     try:
-        w0_target = Wc0_q[:, :, :, 0, :, 0, :].transpose(3, 4, 0, 1, 2)
+        w0_target = Wc0_mu_nu
         w0_pred = jnp.where(Omega != 0.0, (2.0 * B) / Omega, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
         w0_pred_neg = -w0_pred
-        diff = w0_pred - w0_target
-        diff_neg = w0_pred_neg - w0_target
-        w0_abs_error = float(jnp.max(jnp.abs(diff)))
-        w0_abs_error_neg = float(jnp.max(jnp.abs(diff_neg)))
+        w0_abs_error = float(jnp.max(jnp.abs(w0_pred - w0_target)))
+        w0_abs_error_neg = float(jnp.max(jnp.abs(w0_pred_neg - w0_target)))
         w0_ref_norm = float(jnp.max(jnp.abs(Wc0_q)))
         w0_rel_error = w0_abs_error / max(w0_ref_norm, 1.0e-16)
         w0_rel_error_neg = w0_abs_error_neg / max(w0_ref_norm, 1.0e-16)
