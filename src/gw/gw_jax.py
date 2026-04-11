@@ -102,7 +102,6 @@ from .qsgw_utils import (
 	solve_diagonal_sigma_fixed_point,
 	load_sigma_xc_diag_from_h5,
 	build_qsgw_sigma_xc_from_h5,
-	plot_qp_energy_comparison,
 )
 from .head_correction import (
 	compute_static_head_terms_from_sample,
@@ -775,7 +774,6 @@ def main(argv=None):
 			hartree_kbar_ij_jax.block_until_ready()
 
 	sigma_omega_h5_path = None
-	sigma_munu_stream_path = None
 	sigma_c_at_dft_ev = None
 	sigma_xc_at_dft_ev = None
 	sigma_c_plus_at_dft_ev = None
@@ -877,7 +875,6 @@ def main(argv=None):
 				edge_factor=opts.sigma_edge_factor,
 				omega_batch_size=opts.sigma_omega_batch_size,
 				omega_accumulation=opts.sigma_omega_accumulation,
-				sigma_munu_h5_path=opts.sigma_munu_h5_path or None,
 				sigma_kij_h5_path=opts.sigma_kij_h5_path or None,
 				invalid_mode=opts.ppm_invalid_mode,
 				debug_split_contrib=opts.sigma_debug_split_contrib,
@@ -1151,11 +1148,6 @@ def main(argv=None):
 							)
 							dset_total[idx] = sigma_total_ev
 
-			if sigma_omega.sigma_munu_h5_path:
-				sigma_munu_stream_path = sigma_omega.sigma_munu_h5_path
-				with h5py.File(sigma_omega_h5_path, "a") as h5:
-					h5.attrs["sigma_munu_h5_path"] = sigma_omega.sigma_munu_h5_path
-				print0(f"  Streamed Σc(μ,ν,ω):      {sigma_omega.sigma_munu_h5_path}")
 
 
 	# Initial Σ = SX + COH + Hartree (all three combined for self-consistency)
@@ -1277,18 +1269,6 @@ def main(argv=None):
 				del h5["qsgw_interp_clipped_fraction"]
 			h5.create_dataset("qsgw_interp_clipped_fraction", data=np.asarray(float(qsgw_diag["frac_interp_clipped"]), dtype=np.float64))
 
-		plot_path = os.path.join(input_dir, "qp_energy_compare.png")
-		try:
-			plot_qp_energy_comparison(
-				plot_path,
-				h0_diag_ev_abs,
-				E_static_ref_ev,
-				E_dyn0_ev,
-				E_diag_sc_ev,
-			)
-			print0(f"  QP energy plot:         {plot_path}")
-		except Exception as exc:
-			print0(f"  WARNING: failed to generate QP plot: {exc}")
 	
 	if self_consistent:
 		# Self-consistent COHSEX: iterate until Σ converges
@@ -1574,8 +1554,6 @@ def main(argv=None):
 	print0(f"  Sigma matrix elements:  {params['output_file']}")
 	if sigma_omega_h5_path:
 		print0(f"  Sigma_mnk(ω) h5:        {sigma_omega_h5_path}")
-	if sigma_munu_stream_path:
-		print0(f"  Sigma_c(μ,ν,ω) h5:      {sigma_munu_stream_path}")
 	if self_consistent:
 		print0(f"  Sigma (SC rotated):     {sc_output_file}")
 	if eqp1_written:
