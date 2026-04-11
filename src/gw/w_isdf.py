@@ -87,10 +87,10 @@ def _get_chi_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
     
     @partial(jax.jit, static_argnames=("nkx", "nky", "nkz"))
     def _chi_kernel(
-        psi_vTX: jax.Array,    # (nk, ns, μ, nb_v) valence, μ sharded X
-        psi_vY: jax.Array,     # (nk, nb_v, ns, μ) valence, μ sharded Y
-        psi_cX: jax.Array,     # (nk, nb_c, ns, μ) conduction, μ sharded X
-        psi_cTY: jax.Array,    # (nk, ns, μ, nb_c) conduction, μ sharded Y
+        psi_val_xn: jax.Array,     # (nk, ns, μ_X, nb_v) valence, bands fast, μ on X
+        psi_val_yr: jax.Array,     # (nk, nb_v, ns, μ_Y) valence, centroids fast, μ on Y
+        psi_cond_yr: jax.Array,    # (nk, nb_c, ns, μ_Y) conduction, centroids fast, μ on Y
+        psi_cond_xn: jax.Array,    # (nk, ns, μ_X, nb_c) conduction, bands fast, μ on X
         enk_v: jax.Array,      # (nk, nb_v)
         enk_c: jax.Array,      # (nk, nb_c)
         val_mask: jax.Array,   # (nk, nb_v) True if band in window
@@ -103,7 +103,7 @@ def _get_chi_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
         nkx: int, nky: int, nkz: int,
     ) -> jax.Array:
         """Compute static χ₀ with energy masking."""
-        n_rmu = psi_vTX.shape[2]
+        n_rmu = psi_val_xn.shape[2]
         ntau = tau_i.shape[0]
         
         # Handle empty case
@@ -143,13 +143,11 @@ def _get_chi_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
             exp_c_raw = jnp.exp(-z_lm * tau * delta_c)
             exp_c = jnp.where(cond_mask, exp_c_raw, jnp.zeros_like(exp_c_raw))  # (nk, nb_c) complex
             
-            # G_v(k) = Σ_n exp_v[n] |ψ_v^n⟩⟨ψ_v^n|
-            # psi_vTX: (nk, ns, μ, nb_v), psi_vY: (nk, nb_v, ns, μ)
-            Gv_k = jnp.einsum('ksxn,kn,knty->ksxty', jnp.conj(psi_vTX), exp_v.astype(jnp.complex128), psi_vY, optimize=True)
-            
-            # G_c(k) = Σ_m exp_c[m] |ψ_c^m⟩⟨ψ_c^m|
-            # Note: for conduction, psi_cX: (nk, nb_c, ns, μ), psi_cTY: (nk, ns, μ, nb_c)
-            Gc_k = jnp.einsum('ksxm,km,kmty->ksxty', jnp.conj(psi_cTY), exp_c.astype(jnp.complex128), psi_cX, optimize=True)
+            # G_v(k) = Σ_n exp_v[n] |ψ_v^n⟩⟨ψ_v^n|  (xn conj side, yr direct side)
+            Gv_k = jnp.einsum('ksxn,kn,knty->ksxty', jnp.conj(psi_val_xn), exp_v.astype(jnp.complex128), psi_val_yr, optimize=True)
+
+            # G_c(k) = Σ_m exp_c[m] |ψ_c^m⟩⟨ψ_c^m|  (xn conj side, yr direct side)
+            Gc_k = jnp.einsum('ksxm,km,kmty->ksxty', jnp.conj(psi_cond_xn), exp_c.astype(jnp.complex128), psi_cond_yr, optimize=True)
             
             # Apply sharding constraints
             Gv_k = jax.lax.with_sharding_constraint(Gv_k, G_v)
@@ -185,8 +183,8 @@ def _get_chi_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
 
 
 def compute_chi0(
-    psi_vTX: jax.Array, psi_vY: jax.Array,
-    psi_cX: jax.Array, psi_cTY: jax.Array,
+    psi_val_xn: jax.Array, psi_val_yr: jax.Array,
+    psi_cond_yr: jax.Array, psi_cond_xn: jax.Array,
     enk_v: jax.Array, enk_c: jax.Array,
     windows, meta: Meta, mesh_xy: Mesh,
 ) -> jax.Array:
@@ -196,10 +194,10 @@ def compute_chi0(
     Uses a single universal kernel with energy masking - no per-window JIT.
     
     Args:
-        psi_vTX: (nk, ns, μ, nb_v) valence, μ sharded on X axis
-        psi_vY:  (nk, nb_v, ns, μ) valence, μ sharded on Y axis
-        psi_cX:  (nk, nb_c, ns, μ) conduction, μ sharded on X axis
-        psi_cTY: (nk, ns, μ, nb_c) conduction, μ sharded on Y axis
+        psi_val_xn:  (nk, ns, μ_X, nb_v) valence, bands fast, μ on X
+        psi_val_yr:  (nk, nb_v, ns, μ_Y) valence, centroids fast, μ on Y
+        psi_cond_yr: (nk, nb_c, ns, μ_Y) conduction, centroids fast, μ on Y
+        psi_cond_xn: (nk, ns, μ_X, nb_c) conduction, bands fast, μ on X
         enk_v: (nk, nb_v) valence energies
         enk_c: (nk, nb_c) conduction energies
         windows: list of WindowPair objects
@@ -212,10 +210,10 @@ def compute_chi0(
     _ensure_compilation_cache()
     
     nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
-    nk = psi_vTX.shape[0]
+    nk = psi_val_xn.shape[0]
     nb_v = enk_v.shape[1]
     nb_c = enk_c.shape[1]
-    n_rmu = psi_vTX.shape[2]
+    n_rmu = psi_val_xn.shape[2]
     
     # Get energies on host for mask computation
     enk_v_host = np.asarray(jax.device_get(enk_v))
@@ -273,7 +271,7 @@ def compute_chi0(
         
         with jax_profile.annotation(f"chi0_window"):
             chi_win = kernel(
-                psi_vTX, psi_vY, psi_cX, psi_cTY,
+                psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
                 enk_v, enk_c,
                 val_mask_jax, cond_mask_jax,
                 vmax_j, cmin_j,
@@ -324,7 +322,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
 
     @partial(jax.jit, static_argnames=("nkx", "nky", "nkz"))
     def _build_G(
-        psi_vTX, psi_vY, psi_cX, psi_cTY,
+        psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
         enk_v, enk_c,
         tau_scalar, vmax, cmin,
         nkx: int, nky: int, nkz: int,
@@ -333,10 +331,10 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
         exp_c = jnp.exp(-tau_scalar * (enk_c - cmin))
 
         Gv_k = jnp.einsum('ksxn,kn,knty->ksxty',
-                           jnp.conj(psi_vTX), exp_v.astype(jnp.complex128), psi_vY,
+                           jnp.conj(psi_val_xn), exp_v.astype(jnp.complex128), psi_val_yr,
                            optimize=True)
         Gc_k = jnp.einsum('ksxm,km,kmty->ksxty',
-                           jnp.conj(psi_cTY), exp_c.astype(jnp.complex128), psi_cX,
+                           jnp.conj(psi_cond_xn), exp_c.astype(jnp.complex128), psi_cond_yr,
                            optimize=True)
 
         Gv_k = jax.lax.with_sharding_constraint(Gv_k, G_v_5d)
@@ -352,12 +350,12 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
     @partial(jax.jit, donate_argnums=(0,))
     def _tau_step(
         chi_R_acc,
-        psi_vTX, psi_vY, psi_cX, psi_cTY,
+        psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
         enk_v, enk_c,
         tau_scalar, prefactor_scalar, vmax, cmin,
     ):
         Gv_t, Gc_t = _build_G(
-            psi_vTX, psi_vY, psi_cX, psi_cTY,
+            psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
             enk_v, enk_c,
             tau_scalar, vmax, cmin,
             nkx, nky, nkz,
@@ -374,13 +372,13 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
         return jax.lax.with_sharding_constraint(chi_q, chi_out)
 
     def _chi_kernel(
-        psi_vTX, psi_vY, psi_cX, psi_cTY,
+        psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
         enk_v, enk_c,
         tau_i, prefactor_i,
         vmax, cmin,
         nkx, nky, nkz,
     ):
-        n_rmu = psi_vTX.shape[2]
+        n_rmu = psi_val_xn.shape[2]
         ntau = len(tau_i)
 
         if ntau == 0:
@@ -398,7 +396,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
         for itau in range(ntau):
             chi_R_acc = _tau_step(
                 chi_R_acc,
-                psi_vTX, psi_vY, psi_cX, psi_cTY,
+                psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
                 enk_v, enk_c,
                 tau_i[itau], prefactor_i[itau], vmax, cmin,
             )
@@ -410,8 +408,8 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
 
 
 def compute_chi0_minimax(
-    psi_vTX: jax.Array, psi_vY: jax.Array,
-    psi_cX: jax.Array, psi_cTY: jax.Array,
+    psi_val_xn: jax.Array, psi_val_yr: jax.Array,
+    psi_cond_yr: jax.Array, psi_cond_xn: jax.Array,
     enk_v: jax.Array, enk_c: jax.Array,
     quad, meta, mesh_xy: Mesh,
     energy_reference: float | None = None,
@@ -448,7 +446,7 @@ def compute_chi0_minimax(
 
     kernel = _get_chi_minimax_kernel(mesh_xy, nkx, nky, nkz)
     return kernel(
-        psi_vTX, psi_vY, psi_cX, psi_cTY,
+        psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
         enk_v - jnp.asarray(eref, dtype=enk_v.dtype),
         enk_c - jnp.asarray(eref, dtype=enk_c.dtype),
         jnp.asarray(tau, dtype=jnp.float64),
@@ -601,8 +599,8 @@ def get_static_w_q_jax(
 
 def compute_chi0_and_w(
     V_qmunu: jax.Array,
-    psi_vTX: jax.Array, psi_vY: jax.Array,
-    psi_cX: jax.Array, psi_cTY: jax.Array,
+    psi_val_xn: jax.Array, psi_val_yr: jax.Array,
+    psi_cond_yr: jax.Array, psi_cond_xn: jax.Array,
     enk_v: jax.Array, enk_c: jax.Array,
     windows, meta: Meta, mesh_xy: Mesh,
 ) -> tuple[jax.Array, jax.Array]:
@@ -618,7 +616,7 @@ def compute_chi0_and_w(
         W_q:   (nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
     """
     chi_q = compute_chi0(
-        psi_vTX, psi_vY, psi_cX, psi_cTY,
+        psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
         enk_v, enk_c, windows, meta, mesh_xy,
     )
     
@@ -639,9 +637,7 @@ def get_chi0_jax_from_bundle(
 
     s = wf_bundle.slices
     # G construction uses (xn, yr) pair for both valence and conduction.
-    # The chi0 kernel signature has a historical naming inversion for conduction:
-    # parameter "psi_cX" expects yr layout, "psi_cTY" expects xn layout.
-    # We pass (yr, xn) for conduction to match this convention.
+    # Both valence and conduction G construction use the (xn, yr) pair.
     psi_val_xn = wf_bundle.xn(s.val)
     psi_val_yr = wf_bundle.yr(s.val)
     psi_cond_xn = wf_bundle.xn(s.cond)
@@ -659,14 +655,14 @@ def get_chi0_jax_from_bundle(
 # ============================================================================
 
 def get_chi0_jax(
-    psi_vTX: jax.Array, psi_vY: jax.Array,
-    psi_cX: jax.Array, psi_cTY: jax.Array,
+    psi_val_xn: jax.Array, psi_val_yr: jax.Array,
+    psi_cond_yr: jax.Array, psi_cond_xn: jax.Array,
     enk_v: jax.Array, enk_c: jax.Array,
     windows, meta: Meta, mesh_xy: Mesh | None = None,
 ) -> jax.Array:
     """Compute static χ₀ (alias for compute_chi0)."""
     return compute_chi0(
-        psi_vTX, psi_vY, psi_cX, psi_cTY,
+        psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
         enk_v, enk_c, windows, meta, mesh_xy,
     )
 
@@ -820,8 +816,6 @@ def compute_screening(
         psi_cond_yr = wf_bundle.yr(s.cond)
         enk_v = wf_bundle.enk[:, s.val]
         enk_c = wf_bundle.enk[:, s.cond]
-        # chi0 kernel has historical naming inversion for conduction args:
-        # "psi_cX" expects yr, "psi_cTY" expects xn.
         e_ref = resolve_minimax_energy_reference(
             enk_v,
             enk_c,

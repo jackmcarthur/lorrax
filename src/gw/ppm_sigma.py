@@ -519,8 +519,6 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     )
 
     _t_chi0 = _ppm_time.perf_counter()
-    # chi0 kernel has historical naming inversion for conduction args:
-    # "psi_cX" expects yr, "psi_cTY" expects xn. Pass (yr, xn) for conduction.
     chi0_q = w_isdf.compute_chi0_minimax(
         psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
         enk_v, enk_c, quad, meta, mesh_xy,
@@ -1195,12 +1193,13 @@ def compute_sigma_c_ppm_omega_grid(
     Wc0_mu_nu: jax.Array | None = None,
     valid_mask_mu_nu: jax.Array | None = None,
     omega_values_ry: np.ndarray,
-    nkx: int,
-    nky: int,
-    nkz: int,
-    nk_tot: int,
-    bispinor: bool,
-    mesh_xy: Mesh,
+    meta=None,
+    nkx: int | None = None,
+    nky: int | None = None,
+    nkz: int | None = None,
+    nk_tot: int | None = None,
+    bispinor: bool | None = None,
+    mesh_xy: Mesh = None,
     quadrature_config: SigmaQuadratureConfig | None = None,
     target_error: float = 1.0e-6,
     max_nodes: int = 64,
@@ -1238,6 +1237,17 @@ def compute_sigma_c_ppm_omega_grid(
     """
     if None in (get_G_mu_nu_fn, get_sigma_kij_channels_fn):
         raise ValueError("get_G_mu_nu_fn and get_sigma_kij_channels_fn must be provided.")
+    # Extract static system parameters from meta when available.
+    if meta is not None:
+        nkx = int(meta.nkx) if nkx is None else nkx
+        nky = int(meta.nky) if nky is None else nky
+        nkz = int(meta.nkz) if nkz is None else nkz
+        nk_tot = int(meta.nk_tot) if nk_tot is None else nk_tot
+        bispinor = bool(meta.bispinor) if bispinor is None else bispinor
+        if mesh_xy is None:
+            raise ValueError("mesh_xy is required")
+    if None in (nkx, nky, nkz, nk_tot, bispinor):
+        raise ValueError("Either meta or explicit (nkx, nky, nkz, nk_tot, bispinor) must be provided.")
     if quadrature_config is not None:
         target_error = float(quadrature_config.target_error)
         max_nodes = int(quadrature_config.max_nodes)
@@ -1724,12 +1734,13 @@ def compute_sigma_c_ppm_laplace(
     B_mu_nu: jax.Array,
     Omega_mu_nu: jax.Array,
     omega_eval_ry: float,
-    nkx: int,
-    nky: int,
-    nkz: int,
-    nk_tot: int,
-    bispinor: bool,
-    mesh_xy: Mesh,
+    meta=None,
+    nkx: int | None = None,
+    nky: int | None = None,
+    nkz: int | None = None,
+    nk_tot: int | None = None,
+    bispinor: bool | None = None,
+    mesh_xy: Mesh = None,
     target_error: float = 1.0e-6,
     max_nodes: int = 64,
     sigma_scale: float = 1.0,
@@ -1751,6 +1762,7 @@ def compute_sigma_c_ppm_laplace(
         B_mu_nu=B_mu_nu,
         Omega_mu_nu=Omega_mu_nu,
         omega_values_ry=np.asarray([float(omega_eval_ry)], dtype=np.float64),
+        meta=meta,
         nkx=nkx,
         nky=nky,
         nkz=nkz,
