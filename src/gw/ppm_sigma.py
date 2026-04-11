@@ -143,37 +143,8 @@ def _materialize_window_mask_B(
     raise ValueError(f"Unknown mask_B_mode={mode!r}")
 
 
-def _qmunu_to_munu_local(arr_qmunu: jax.Array, *, mesh_xy: Mesh) -> jax.Array:
-    """Transpose ``(nkx,nky,nkz,mu,nu) -> (mu,nu,nkx,nky,nkz)`` and keep mu/nu tiled."""
-
-    mu_shard = _mu_nu_sharding(mesh_xy)
-    with mesh_xy:
-        arr_munu = jnp.asarray(arr_qmunu).transpose(3, 4, 0, 1, 2)
-        return jax.lax.with_sharding_constraint(arr_munu, mu_shard)
-
 _sigma_tau_channel_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
 _sigma_channel_pipeline_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
-
-
-def _summarize_hermitian_qmunu(name: str, W_q: jax.Array, print_fn=print) -> None:
-    """Emit Hermiticity diagnostics for W_q with layout (kx,ky,kz,1,mu,1,nu)."""
-    if W_q.ndim != 7:
-        print_fn(f"[{name}] unexpected shape {W_q.shape}; expected (nkx,nky,nkz,1,mu,1,nu)")
-        return
-    W_munu = jnp.asarray(W_q[:, :, :, 0, :, 0, :], dtype=jnp.complex128)
-    herm_resid = _to_host_scalar(
-        jnp.max(jnp.abs(W_munu - jnp.swapaxes(jnp.conj(W_munu), -2, -1))),
-        float,
-    )
-    diag = jnp.diagonal(W_munu, axis1=-2, axis2=-1)
-    diag_im = _to_host_scalar(jnp.max(jnp.abs(jnp.imag(diag))), float)
-    diag_real = jnp.real(diag)
-    diag_min = _to_host_scalar(jnp.min(diag_real), float)
-    diag_max = _to_host_scalar(jnp.max(diag_real), float)
-    print_fn(
-        f"  [{name}] hermitian residual={herm_resid:.3e} "
-        f"max|Im diag|={diag_im:.3e} diag range=[{diag_min:.4e}, {diag_max:.4e}]"
-    )
 
 
 def _project_sigma_channels(

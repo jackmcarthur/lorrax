@@ -9,7 +9,6 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from types import SimpleNamespace
 jax.config.update("jax_enable_x64", True)
 
 # Initialize JAX distributed only when running multi-process.
@@ -123,31 +122,6 @@ import common.timing as timing
 import h5py
 import builtins
 
-
-def make_shardings(mesh_xy: Mesh) -> SimpleNamespace:
-	"""Centralize all NamedSharding declarations used in this file."""
-	return SimpleNamespace(
-		# General 2D shardings
-		xy_shard = NamedSharding(mesh_xy, P('x', 'y')),
-		replicated_2 = NamedSharding(mesh_xy, P(None, None)),
-		y_shard_vec = NamedSharding(mesh_xy, P('y')),
-		xy0_2 = NamedSharding(mesh_xy, P(('x','y'), None)),
-		x0y1_2 = NamedSharding(mesh_xy, P('x','y')),
-		# Multi-dim array shardings
-		x6y7_8 = NamedSharding(mesh_xy, P(None, None, None, None, None, None, 'x', 'y')),
-		x3y4_5 = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y')),
-		y3_4 = NamedSharding(mesh_xy, P(None, None, None, 'y')),
-		x3_4 = NamedSharding(mesh_xy, P(None, None, None, 'x')),
-		y2_4 = NamedSharding(mesh_xy, P(None, None, 'y', None)),
-		x2_4 = NamedSharding(mesh_xy, P(None, None, 'x', None)),
-		# Pipeline shardings
-		XT_shard = NamedSharding(mesh_xy, P(None, None, 'x', None)),
-		Y_shard = NamedSharding(mesh_xy, P(None, None, None, 'y')),
-		X_shard = NamedSharding(mesh_xy, P(None, None, None, 'x')),
-		YT_shard = NamedSharding(mesh_xy, P(None, None, 'y', None)),
-		V_shard = NamedSharding(mesh_xy, P('x', 'y', None, None, None)),
-		out_shard = NamedSharding(mesh_xy, P(None, None, None)),
-	)
 
 def fit_zeta_and_compute_V_q_chunked(
 	wfn,
@@ -626,8 +600,6 @@ def main(argv=None):
 		if meta.rank == 0:
 			k.setdefault("flush", True)
 			print(*a, **k)
-
-	sh = make_shardings(mesh_xy)
 
 	chunk_str = "disabled" if meta.chunk_size is None else str(meta.chunk_size)
 	print0(f"  Band chunk size: {chunk_str}")

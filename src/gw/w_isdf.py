@@ -1,13 +1,7 @@
-"""
-Static χ₀ and W computation with JAX.
+"""Static χ₀ and W computation using ISDF + minimax quadrature.
 
-Streamlined pipeline for COHSEX:
-- Single universal chi kernel with energy masking (no per-window JIT recompilation)
-- Two-stage resharding for W solve following load_wfns pattern
-- χ computed with P(..., μ_X, ..., ν_Y) sharding
-- V, χ resharded to P(q_XY, μ, ν) for Dyson solve
-
-Static χ₀ and W computation using ISDF + minimax quadrature.
+All inter-function arrays use flat k/q indices: chi(nq, μ, μ), V(nq, μ, μ), W(nq, μ, μ).
+The 3D k-grid only appears inside FFT helpers.
 """
 import os
 import math
