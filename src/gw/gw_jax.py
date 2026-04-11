@@ -616,6 +616,40 @@ def print_scf_diagnostics(Gij_final, U_full, nelec, nb_sigma, print_fn=print):
 	print_fn(f"[Diagnostic] Lowest QP state: their |U| values = {np.array(U_col0_abs[top_contrib])}")
 
 
+def _build_interaction_tensors(V_qmunu, W_q, meta, mesh_xy, sh, wfn):
+	"""Extract V_μν (5D), W_μν (5D), and static Gij occupation projector."""
+	V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0].transpose(3, 4, 0, 1, 2)
+	with mesh_xy:
+		V_mu_nu = jax.lax.with_sharding_constraint(V_mu_nu, sh.V_shard)
+	if W_q is not None:
+		W_mu_nu = W_q[:,:,:,0,:,0,:].transpose(3, 4, 0, 1, 2)
+		with mesh_xy:
+			W_mu_nu = jax.lax.with_sharding_constraint(W_mu_nu, sh.V_shard)
+	else:
+		W_mu_nu = V_mu_nu
+	b0, _, _, b3, _ = meta.band_edges
+	nb_sigma = int(b3 - b0)
+	nk = int(meta.nk_tot)
+	nelec = int(wfn.nelec)
+	Gij = jnp.zeros((nk, nb_sigma, nb_sigma), dtype=jnp.complex128)
+	occ_diag = jnp.arange(min(nelec, nb_sigma))
+	Gij = Gij.at[:, occ_diag, occ_diag].set(1.0 + 0.0j)
+	Gij = jax.device_put(Gij, NamedSharding(mesh_xy, P(None, None, None)))
+	return V_mu_nu, W_mu_nu, Gij
+
+
+def _compute_static_head(params, input_dir, wfn, sym, meta, do_screened, print0):
+	"""Resolve q→0 head sample and compute exact band-diagonal head terms."""
+	head = resolve_head_sample(params, input_dir, wfn, sym, meta, print0, omega=0.0+0.0j)
+	print0(format_head_sample_diagnostics(head, include_screened=do_screened))
+	b0, _, _, b3, _ = meta.band_edges
+	occ_mask = np.arange(int(b0), int(b3), dtype=np.int32) < int(wfn.nelec)
+	terms = compute_static_head_terms_from_sample(
+		head, occ=occ_mask, cell_volume=float(wfn.cell_volume), nk_tot=int(meta.nk_tot))
+	print0(format_static_head_diagnostics(terms))
+	return terms
+
+
 def main(argv=None):
 	global sym
 	argp = argparse.ArgumentParser(description="COHSEX self-energy driver")
@@ -781,71 +815,19 @@ def main(argv=None):
 						print0=print0,
 					)
 
-	# Extract bare (no-head) V_μν. This is kept for Hartree construction where
-	# the G=0 contribution must remain excluded.
-	V_mu_nu_nohead = jnp.asarray(V_qmunu)[0, 0, 0].transpose(3, 4, 0, 1, 2)
-	with mesh_xy:
-		V_mu_nu_nohead = jax.lax.with_sharding_constraint(V_mu_nu_nohead, sh.V_shard)
+	# Extract interaction tensors and build occupation projector
+	V_mu_nu, W_mu_nu, Gij_static = _build_interaction_tensors(
+		V_qmunu, W_q if do_screened else None, meta, mesh_xy, sh, wfn)
+
+	# q→0 head correction (exact band-diagonal terms for static COHSEX)
 	static_head_terms = None
-
-	# ============================================================================
-	# q→0 head handling
-	# ============================================================================
-	# The active driver no longer injects the q=0 head into ISDF μν tensors via
-	# the old rank-1 G0 projector. All physical head handling now happens through:
-	#   - exact band-diagonal static terms for COHSEX
-	#   - scalar head samples / fits for GN-PPM diagnostics and future dynamic use
-	#
-	# The saved G0_mu_nu restart vector remains useful for debugging and external
-	# analysis, but it is no longer part of the active GWJAX self-energy path.
-	# ============================================================================
 	if do_G0 and not use_ppm_sigma:
-		# For static COHSEX, add the q=0 head exactly in band space rather than
-		# approximating it through any μν-space head injection.
-		head_static = resolve_head_sample(
-			params,
-			input_dir,
-			wfn,
-			sym,
-			meta,
-			print0,
-			omega=0.0 + 0.0j,
-		)
-		print0(format_head_sample_diagnostics(head_static, include_screened=do_screened))
-		band_ids = np.arange(int(b0), int(b3), dtype=np.int32)
-		occ_mask_static = band_ids < int(wfn.nelec)
-		static_head_terms = compute_static_head_terms_from_sample(
-			head_static,
-			occ=occ_mask_static,
-			cell_volume=float(wfn.cell_volume),
-			nk_tot=int(meta.nk_tot),
-		)
-		print0(format_static_head_diagnostics(static_head_terms))
+		static_head_terms = _compute_static_head(
+			params, input_dir, wfn, sym, meta, do_screened, print0)
 
-	# Canonical V tensors for downstream terms.
-	# The ISDF body path remains headless; any q=0 head contribution is handled
-	# separately in band space through the exact static terms above.
-	V_mu_nu_exchange = V_mu_nu_nohead
-	V_mu_nu_for_coh = V_mu_nu_nohead
-
-	# Extract W_μν in (n_rmu, n_rmu, nkx, nky, nkz) layout.
-	# For do_screened=false, SX should reduce to bare exchange with headed V.
-	if do_screened:
-		W_mu_nu = W_q[:,:,:,0,:,0,:].transpose(3, 4, 0, 1, 2)
-		with mesh_xy:
-			W_mu_nu = jax.lax.with_sharding_constraint(W_mu_nu, sh.V_shard)
-	else:
-		W_mu_nu = V_mu_nu_exchange
-
-	# Static COHSEX Green's function: G_ij = δ_{ij} f_i (projector onto occupied)
 	nb_sigma = int(b3 - b0)
-	nk = meta.nk_tot
 	nelec = int(wfn.nelec)
-	Gij_static = jnp.zeros((nk, nb_sigma, nb_sigma), dtype=jnp.complex128)
-	occ_diag = jnp.arange(min(nelec, nb_sigma))
-	Gij_static = Gij_static.at[:, occ_diag, occ_diag].set(1.0 + 0.0j)
 	Gij_shard = NamedSharding(mesh_xy, P(None, None, None))
-	Gij_static = jax.device_put(Gij_static, Gij_shard)
 
 	# Device-local FFT helpers for the replicated k-grid axes.
 	from common.fft_helpers import (
@@ -930,7 +912,7 @@ def main(argv=None):
 	with mesh_xy:
 		with timing.section("gw_jax.pipeline"):
 			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = \
-				compute_static_sigma(wfns, W_mu_nu, V_mu_nu_for_coh, v_q0_noG0_munu, Gij_static)
+				compute_static_sigma(wfns, W_mu_nu, V_mu_nu, v_q0_noG0_munu, Gij_static)
 			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax = _apply_static_head_terms(
 				sigma_sx_kbar_ij_jax,
 				sigma_coh_kbar_ij_jax,
@@ -1018,7 +1000,7 @@ def main(argv=None):
 
 			def _build_sigma_x_bare_kij():
 				with mesh_xy:
-					result = compute_sigma_sx(wfns, Gij_static, V_mu_nu_exchange)
+					result = compute_sigma_sx(wfns, Gij_static, V_mu_nu)
 				result.block_until_ready()
 				return result
 
@@ -1500,7 +1482,7 @@ def main(argv=None):
 			# Compute new Σ using original wavefunctions but updated G_ij
 			with mesh_xy:
 				sigma_sx_new, sigma_coh_new, hartree_new = \
-					compute_static_sigma(wfns, W_mu_nu, V_mu_nu_for_coh, v_q0_noG0_munu, Gij_new)
+					compute_static_sigma(wfns, W_mu_nu, V_mu_nu, v_q0_noG0_munu, Gij_new)
 			sigma_sx_new, sigma_coh_new = _apply_static_head_terms(sigma_sx_new, sigma_coh_new)
 			
 			# Combine and extract upper triangle
@@ -1541,7 +1523,7 @@ def main(argv=None):
 
 		with mesh_xy:
 			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = \
-				compute_static_sigma(wfns, W_mu_nu, V_mu_nu_for_coh, v_q0_noG0_munu, Gij_final)
+				compute_static_sigma(wfns, W_mu_nu, V_mu_nu, v_q0_noG0_munu, Gij_final)
 		sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax = _apply_static_head_terms(
 			sigma_sx_kbar_ij_jax,
 			sigma_coh_kbar_ij_jax,
