@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
-from typing import Callable
 
 import numpy as np
 
@@ -63,21 +62,6 @@ def build_screening_setup(params: dict, minimax_config: MinimaxConfig) -> Screen
         ppm_omega_p=params.get("ppm_omega_p"),
         ppm_fallback_omega=float(params.get("ppm_fallback_omega", 2.0)),
     )
-
-
-def maybe_build_ctsp_windows(
-    setup: ScreeningSetup,
-    *,
-    epsq: float,
-    wfn,
-    nband: int,
-    window_builder: Callable[..., object],
-):
-    """Return CTSP windows only when the screening mode actually needs them."""
-
-    if setup.screening_method != "ctsp":
-        return None
-    return window_builder(epsq, wfn, nband_max=nband)
 
 
 def _resolve_input_path(input_dir: str, path: str) -> str:

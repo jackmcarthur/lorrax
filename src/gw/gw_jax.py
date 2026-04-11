@@ -88,11 +88,9 @@ from .gw_init import (
 	resolve_runtime_config,
 	prepare_isdf_and_wavefunctions,
 )
-from .get_windows import get_window_info
 from .gw_driver_helpers import (
 	build_ppm_sigma_runtime_options,
 	build_screening_setup,
-	maybe_build_ctsp_windows,
 )
 from .w_isdf import compute_screening
 from .minimax_config import (
@@ -713,9 +711,6 @@ def main(argv=None):
 	_print0(f"  FFT grid: {wfn.fft_grid[0]}×{wfn.fft_grid[1]}×{wfn.fft_grid[2]}   Cell volume: {wfn.cell_volume:.2f} a.u.³")
 	_print0("")
 
-	# windows for polarizability and sigma
-	epsq = 0.01
-
 	# Resolve runtime configuration (memory budget, chunking, control flags)
 	_t_cfg = _boot_time.perf_counter()
 	cfg = resolve_runtime_config(params, rank=jax.process_index())
@@ -774,23 +769,11 @@ def main(argv=None):
 				with jax_profile.trace_section("chi0_W"):
 					minimax_config = minimax_config_from_params(params)
 					screening_setup = build_screening_setup(params, minimax_config)
-					window_pairs = maybe_build_ctsp_windows(
-						screening_setup,
-						epsq=epsq,
-						wfn=wfn,
-						nband=nband,
-						window_builder=get_window_info,
-					)
-					# In the normal minimax + PPM-sigma workflow, screening only needs
-					# the static W(q). The dynamic W(iωp) / GN-PPM fit is recomputed in
-					# ppm_sigma.py, so skip the redundant imag-frequency continuation here.
 					screening_ppm_omega_p = screening_setup.ppm_omega_p
-					if use_ppm_sigma and screening_setup.screening_method == "minimax":
+					if use_ppm_sigma:
 						screening_ppm_omega_p = None
 					W_q = compute_screening(
-						V_qmunu, wfns, window_pairs, meta, mesh_xy,
-						omega=screening_setup.omega_eval,
-						screening_method=screening_setup.screening_method,
+						V_qmunu, wfns, meta, mesh_xy,
 						minimax_config=screening_setup.minimax_config,
 						ppm_omega_p=screening_ppm_omega_p,
 						ppm_fallback_omega=screening_setup.ppm_fallback_omega,

@@ -10,7 +10,7 @@ nval = 4
 ncond = 4
 nband = 40
 sys_dim = 2
-screening_method = ctsp
+screening_method = minimax
 
 K_POINTS {crystal_b}
 5

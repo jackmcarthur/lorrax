@@ -583,352 +583,104 @@ def solve_w_from_chi_q_jax(
     return W_q
 
 
-def get_static_w_q_jax(
-    V_qmunu: jax.Array,
-    chi_q: jax.Array,
-    meta: Meta,
-    mesh_xy: Mesh,
-) -> jax.Array:
-    """Backward-compatible alias for static W solve from χ(q)."""
-    return solve_w_from_chi_q_jax(V_qmunu, chi_q, meta, mesh_xy)
+def compute_screening(
+    V_qmunu,
+    wf_bundle,
+    meta,
+    mesh_xy,
+    *,
+    minimax_config: MinimaxConfig | None = None,
+    ppm_omega_p=None,
+    ppm_fallback_omega=2.0,
+    tensors_filename=None,
+    print0=print,
+):
+    """Compute static screened Coulomb W via minimax quadrature.
 
-
-# ============================================================================
-# Combined χ₀ → W pipeline
-# ============================================================================
-
-def compute_chi0_and_w(
-    V_qmunu: jax.Array,
-    psi_val_xn: jax.Array, psi_val_yr: jax.Array,
-    psi_cond_yr: jax.Array, psi_cond_xn: jax.Array,
-    enk_v: jax.Array, enk_c: jax.Array,
-    windows, meta: Meta, mesh_xy: Mesh,
-) -> tuple[jax.Array, jax.Array]:
+    Optionally also extracts GN-PPM parameters if ppm_omega_p is set.
     """
-    Compute static χ₀ and screened interaction W.
-    
-    Streamlined pipeline:
-    1. χ₀(q) via universal kernel with energy masking
-    2. W(q) via two-stage resharding + Dyson solve
-    
-    Returns:
-        chi_q: (nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
-        W_q:   (nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
-    """
-    chi_q = compute_chi0(
-        psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
-        enk_v, enk_c, windows, meta, mesh_xy,
-    )
-    
-    W_q = solve_w_from_chi_q_jax(V_qmunu, chi_q, meta, mesh_xy)
-    
-    return chi_q, W_q
+    import time
 
+    if minimax_config is None:
+        raise ValueError("minimax_config is required.")
 
-def get_chi0_jax_from_bundle(
-    wf_bundle: "Wavefunctions",
-    windows,
-    meta: Meta,
-    mesh_xy: Mesh | None = None,
-) -> jax.Array:
-    """Compute static χ₀ directly from canonical Wavefunctions storage."""
-    if mesh_xy is None:
-        raise ValueError("mesh_xy is required for bundle-based chi0 evaluation")
+    print0("")
+    print0(f"  Minimax screening path enabled at ω = 0.0000 eV (0.000000 Ry)")
 
     s = wf_bundle.slices
-    # G construction uses (xn, yr) pair for both valence and conduction.
-    # Both valence and conduction G construction use the (xn, yr) pair.
     psi_val_xn = wf_bundle.xn(s.val)
     psi_val_yr = wf_bundle.yr(s.val)
     psi_cond_xn = wf_bundle.xn(s.cond)
     psi_cond_yr = wf_bundle.yr(s.cond)
     enk_v = wf_bundle.enk[:, s.val]
     enk_c = wf_bundle.enk[:, s.cond]
-    return compute_chi0(
-        psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
-        enk_v, enk_c, windows, meta, mesh_xy,
+    e_ref = resolve_minimax_energy_reference(
+        enk_v, enk_c,
+        reference=minimax_config.energy_reference,
     )
 
-
-# ============================================================================
-# Legacy interface aliases (for backward compatibility)
-# ============================================================================
-
-def get_chi0_jax(
-    psi_val_xn: jax.Array, psi_val_yr: jax.Array,
-    psi_cond_yr: jax.Array, psi_cond_xn: jax.Array,
-    enk_v: jax.Array, enk_c: jax.Array,
-    windows, meta: Meta, mesh_xy: Mesh | None = None,
-) -> jax.Array:
-    """Compute static χ₀ (alias for compute_chi0)."""
-    return compute_chi0(
-        psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
-        enk_v, enk_c, windows, meta, mesh_xy,
+    _windows_minimax, quad = build_static_minimax_window_pair(
+        enk_v, enk_c,
+        minimax_config=minimax_config,
+        target_error=float(minimax_config.target_error),
+        max_nodes=int(minimax_config.max_nodes),
+        use_shipped_tables=bool(minimax_config.use_shipped_tables),
+        print_fn=print0,
     )
 
+    t_min0 = time.perf_counter()
+    chi_omega = compute_chi0_minimax(
+        psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
+        enk_v, enk_c, quad, meta, mesh_xy,
+        energy_reference=e_ref,
+    )
+    W_q = solve_w_from_chi_q_jax(V_qmunu, chi_omega, meta, mesh_xy)
+    chi_omega.block_until_ready()
+    W_q.block_until_ready()
+    t_min = time.perf_counter() - t_min0
+    chi_max = float(jnp.max(jnp.abs(chi_omega)))
+    print0(f"  |χ(0)|_max = {chi_max:.6e}   (minimax, {quad.node_count} nodes)")
+    print0(f"  minimax χ→W time: {t_min:9.3f} s")
 
-# Re-export legacy functions for W(ω)
-def get_w_omega_jax(*args, **kwargs):
-    """Dynamic W(ω) - delegates to the dynamic implementation."""
-    from .archive.w_isdf_dynamic import get_w_omega_jax as dynamic_w_omega
-    return dynamic_w_omega(*args, **kwargs)
-
-
-def get_chi_omega_jax(*args, **kwargs):
-    """Dynamic χ(ω) - delegates to the dynamic implementation."""
-    from .archive.w_isdf_dynamic import get_chi_omega_jax as dynamic_chi_omega
-    return dynamic_chi_omega(*args, **kwargs)
-
-
-def frequency_integration(*args, **kwargs):
-    """Scalar-ω CTSP frequency integration - delegates to dynamic implementation."""
-    from .archive.w_isdf_dynamic import frequency_integration as dynamic_frequency_integration
-    return dynamic_frequency_integration(*args, **kwargs)
-
-
-def get_w_omega_jax_from_bundle(*args, **kwargs):
-    """Dynamic W(ω) from canonical Wavefunctions."""
-    from .archive.w_isdf_dynamic import get_w_omega_jax_from_bundle as dynamic_w_omega_bundle
-    return dynamic_w_omega_bundle(*args, **kwargs)
-
-
-def get_chi_omega_jax_from_bundle(*args, **kwargs):
-    """Dynamic χ(ω) from canonical Wavefunctions."""
-    from .archive.w_isdf_dynamic import get_chi_omega_jax_from_bundle as dynamic_chi_omega_bundle
-    return dynamic_chi_omega_bundle(*args, **kwargs)
-
-
-def frequency_integration_from_bundle(*args, **kwargs):
-    """Scalar-ω CTSP frequency integration from canonical Wavefunctions."""
-    from .archive.w_isdf_dynamic import frequency_integration_from_bundle as dynamic_frequency_integration_bundle
-    return dynamic_frequency_integration_bundle(*args, **kwargs)
-
-
-def compute_screening(
-    V_qmunu,
-    wf_bundle,
-    window_pairs,
-    meta,
-    mesh_xy,
-    *,
-    omega=0.0,
-    screening_method="minimax",
-    minimax_config: MinimaxConfig | None = None,
-    minimax_target_error=1.0e-6,
-    minimax_max_nodes=64,
-    use_shipped_minimax_tables=True,
-    minimax_energy_reference="midgap",
-    minimax_energy_reference_fn=None,
-    ppm_omega_p=None,
-    ppm_fallback_omega=2.0,
-    validate_static=True,
-    tensors_filename=None,
-    print0=print,
-):
-    """Compute screened Coulomb W(ω) from V and wavefunctions.
-
-    Supports two screening paths:
-    - ``screening_method='minimax'`` (default): canonical minimax quadrature
-      from ``common.minimax`` on a single static window.
-    - ``screening_method='ctsp'``: legacy CTSP dynamic path.
-
-    Parameters
-    ----------
-    V_qmunu : jax.Array
-        Bare Coulomb in ISDF basis.
-    wf_bundle : Wavefunctions
-        Canonical wavefunction bundle.
-    window_pairs : list or None
-        Energy windows for CTSP quadrature. Required only for ``ctsp`` mode.
-    meta : Meta
-        System metadata.
-    mesh_xy : Mesh
-        Device mesh.
-    omega : float
-        Evaluation frequency in Ry (0.0 for static COHSEX).
-    screening_method : {'minimax', 'ctsp'}
-        Select minimax static path or legacy CTSP path.
-    minimax_config : MinimaxConfig or None
-        Optional shared minimax configuration object. When provided, it overrides
-        the individual minimax scalar arguments below.
-    minimax_target_error : float
-        Max 1/x fit error target for canonical minimax quadrature.
-    minimax_max_nodes : int
-        Upper bound for minimax node search.
-    use_shipped_minimax_tables : bool
-        If True, allow canonical minimax quadratures to be loaded from the
-        bundled table catalog before falling back to the exact solver.
-    minimax_energy_reference : {'midgap','vbm','cbm','none'} or float
-        Uniform energy shift reference for minimax χ0/W. This does not change
-        the physical result, but keeps reference conventions explicit.
-    minimax_energy_reference_fn : callable or None
-        Optional override returning the reference energy from (enk_v, enk_c).
-    ppm_omega_p : float or None
-        If set in minimax mode, also extract GN-PPM parameters using chi(0)
-        and chi(i*omega_p) built from the same minimax nodes.
-    ppm_fallback_omega : float
-        Fallback Omega value (Ry) for unfulfilled GN modes.
-    validate_static : bool
-        In CTSP mode, if True and omega==0 compare dynamic and static paths.
-    tensors_filename : str or None
-        If not None and file exists, save W0_qmunu to it.
-    print0 : callable
-        Rank-0 print function.
-
-    Returns
-    -------
-    W_q : jax.Array
-        Screened Coulomb interaction.
-    """
-    import time
-
-    ryd2ev = 13.605693122994
-    omega = float(omega)
-    omega_ev = omega * ryd2ev
-    method = str(screening_method).strip().lower()
-    if method not in {"minimax", "ctsp"}:
-        raise ValueError(f"Unknown screening_method={screening_method!r}; expected 'minimax' or 'ctsp'.")
-
-    if method == "minimax" and abs(omega) > 1.0e-14:
-        raise NotImplementedError(
-            "screening_method='minimax' currently supports only omega=0. "
-            "Use screening_method='ctsp' for finite-frequency screening."
+    if ppm_omega_p is not None:
+        omega_p = float(ppm_omega_p)
+        if omega_p <= 0.0:
+            raise ValueError("ppm_omega_p must be > 0 when GN-PPM extraction is requested.")
+        from .minimax_screening import solve_laplace_minimax_imag_interval
+        quad_imag = solve_laplace_minimax_imag_interval(
+            quad.x_min, quad.x_max, omega_p,
+            target_error=float(minimax_config.target_error),
+            max_nodes=int(minimax_config.max_nodes),
         )
-
-    print0("")
-    if abs(omega) <= 1e-14 and method == "minimax":
-        print0(f"  Minimax screening path enabled at ω = 0.0000 eV ({omega:.6f} Ry)")
-    elif abs(omega) <= 1e-14:
-        print0(f"  CTSP screening path enabled at ω = 0.0000 eV ({omega:.6f} Ry)")
-    else:
-        print0(f"  [DEBUG] CTSP screening at ω = {omega_ev:.4f} eV ({omega:.6f} Ry)")
-
-    if method == "minimax":
-        if minimax_config is not None:
-            minimax_target_error = float(minimax_config.target_error)
-            minimax_max_nodes = int(minimax_config.max_nodes)
-            use_shipped_minimax_tables = bool(minimax_config.use_shipped_tables)
-            minimax_energy_reference = minimax_config.energy_reference
-        s = wf_bundle.slices
-        psi_val_xn = wf_bundle.xn(s.val)
-        psi_val_yr = wf_bundle.yr(s.val)
-        psi_cond_xn = wf_bundle.xn(s.cond)
-        psi_cond_yr = wf_bundle.yr(s.cond)
-        enk_v = wf_bundle.enk[:, s.val]
-        enk_c = wf_bundle.enk[:, s.cond]
-        e_ref = resolve_minimax_energy_reference(
-            enk_v,
-            enk_c,
-            reference=minimax_energy_reference,
-            reference_fn=minimax_energy_reference_fn,
+        print0(
+            f"  Minimax imag-freq window (ωp={omega_p:.4f} Ry): "
+            f"x=[{quad_imag.x_min:.6e}, {quad_imag.x_max:.6e}] Ry, "
+            f"R={quad_imag.x_max / quad_imag.x_min:.2f}, "
+            f"nodes={quad_imag.node_count}, fit_err~{quad_imag.max_error:.3e}"
         )
-
-        _windows_minimax, quad = build_static_minimax_window_pair(
-            enk_v,
-            enk_c,
-            minimax_config=minimax_config,
-            target_error=float(minimax_target_error),
-            max_nodes=int(minimax_max_nodes),
-            use_shipped_tables=bool(use_shipped_minimax_tables),
-            print_fn=print0,
-        )
-
-        t_min0 = time.perf_counter()
-        chi_omega = compute_chi0_minimax(
+        chi_iwp = compute_chi0_minimax(
             psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
-            enk_v, enk_c, quad, meta, mesh_xy,
+            enk_v, enk_c, quad_imag, meta, mesh_xy,
             energy_reference=e_ref,
         )
-        W_q = solve_w_from_chi_q_jax(V_qmunu, chi_omega, meta, mesh_xy)
-        chi_omega.block_until_ready()
-        W_q.block_until_ready()
-        t_min = time.perf_counter() - t_min0
-        chi_max = float(jnp.max(jnp.abs(chi_omega)))
-        print0(f"  |χ(0)|_max = {chi_max:.6e}   (minimax, {quad.node_count} nodes)")
-        print0(f"  minimax χ→W time: {t_min:9.3f} s")
-
-        if ppm_omega_p is not None:
-            omega_p = float(ppm_omega_p)
-            if omega_p <= 0.0:
-                raise ValueError("ppm_omega_p must be > 0 when GN-PPM extraction is requested.")
-            # Fresh minimax for chi0(i*omega_p)
-            from .minimax_screening import solve_laplace_minimax_imag_interval
-            quad_imag = solve_laplace_minimax_imag_interval(
-                quad.x_min, quad.x_max, omega_p,
-                target_error=float(minimax_target_error),
-                max_nodes=int(minimax_max_nodes),
-            )
-            R_imag = quad_imag.x_max / quad_imag.x_min
-            omega_hat = omega_p / quad_imag.x_min
-            print0(
-                f"  Minimax imag-freq window (ωp={omega_p:.4f} Ry): "
-                f"x=[{quad_imag.x_min:.6e}, {quad_imag.x_max:.6e}] Ry, "
-                f"R={R_imag:.2f}, ω̂={omega_hat:.2f}, "
-                f"nodes={quad_imag.node_count}, fit_err~{quad_imag.max_error:.3e}"
-            )
-            chi_iwp = compute_chi0_minimax(
-                psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
-                enk_v, enk_c, quad_imag, meta, mesh_xy,
-                energy_reference=e_ref,
-            )
-            chi_iwp.block_until_ready()
-            W_iwp = solve_w_from_chi_q_jax(V_qmunu, chi_iwp, meta, mesh_xy)
-            W_iwp.block_until_ready()
-            # Fit GN-PPM to W^c(0) and W^c(iωp) (no head).
-            nkx, nky, nkz = W_q.shape[0], W_q.shape[1], W_q.shape[2]
-            n_rmu = W_q.shape[4]
-            V_q = V_qmunu[0, 0, 0].reshape(nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
-            Wc0_q = W_q - V_q
-            Wci_q = W_iwp - V_q
-            ppm = extract_gn_ppm_parameters_from_Wc(
-                Wc0_q,
-                Wci_q,
-                omega_p=omega_p,
-                fallback_omega=float(ppm_fallback_omega),
-            )
-            print0(
-                "  GN-PPM extracted from minimax W^c:"
-                f" ω_p={omega_p:.6f} Ry, unfulfilled={100.0 * ppm.unfulfilled_fraction:.2f}%"
-            )
-    else:
-        if window_pairs is None:
-            raise ValueError("window_pairs are required when screening_method='ctsp'.")
-        t_dyn0 = time.perf_counter()
-        W_q, chi_omega = get_w_omega_jax_from_bundle(
-            V_qmunu, wf_bundle, window_pairs, omega, meta, mesh_xy,
+        chi_iwp.block_until_ready()
+        W_iwp = solve_w_from_chi_q_jax(V_qmunu, chi_iwp, meta, mesh_xy)
+        W_iwp.block_until_ready()
+        nkx, nky, nkz = W_q.shape[0], W_q.shape[1], W_q.shape[2]
+        n_rmu = W_q.shape[4]
+        V_q = V_qmunu[0, 0, 0].reshape(nkx, nky, nkz, 1, n_rmu, 1, n_rmu)
+        ppm = extract_gn_ppm_parameters_from_Wc(
+            W_q - V_q, W_iwp - V_q,
+            omega_p=omega_p, fallback_omega=float(ppm_fallback_omega),
         )
-        W_q.block_until_ready()
-        chi_omega.block_until_ready()
-        t_dyn = time.perf_counter() - t_dyn0
-        chi_max = float(jnp.max(jnp.abs(chi_omega)))
-        print0(f"  |χ(ω)|_max = {chi_max:.6e}")
-
-        # Validate CTSP dynamic path against legacy static path at ω=0
-        if validate_static and abs(omega) <= 1e-14:
-            t_static0 = time.perf_counter()
-            chi0_static = get_chi0_jax_from_bundle(wf_bundle, window_pairs, meta, mesh_xy)
-            W_q_static = get_static_w_q_jax(V_qmunu, chi0_static, meta, mesh_xy)
-            chi0_static.block_until_ready()
-            W_q_static.block_until_ready()
-            t_static = time.perf_counter() - t_static0
-
-            chi_err_abs = float(jnp.max(jnp.abs(chi_omega - chi0_static)))
-            chi_ref = max(float(jnp.max(jnp.abs(chi0_static))), 1e-16)
-            chi_err_rel = chi_err_abs / chi_ref
-            W_err_abs = float(jnp.max(jnp.abs(W_q - W_q_static)))
-            W_ref = max(float(jnp.max(jnp.abs(W_q_static))), 1e-16)
-            W_err_rel = W_err_abs / W_ref
-
-            print0("  χ/W path comparison at ω=0 (dynamic vs static):")
-            print0(f"    dynamic time: {t_dyn:9.3f} s")
-            print0(f"    static time:  {t_static:9.3f} s")
-            print0(f"    χ max abs diff: {chi_err_abs:.6e}, rel diff: {chi_err_rel:.6e}")
-            print0(f"    W max abs diff: {W_err_abs:.6e}, rel diff: {W_err_rel:.6e}")
+        print0(
+            f"  GN-PPM extracted from minimax W^c:"
+            f" ω_p={omega_p:.6f} Ry, unfulfilled={100.0 * ppm.unfulfilled_fraction:.2f}%"
+        )
 
     if tensors_filename is not None and os.path.exists(tensors_filename):
         from file_io import write_w0_qmunu_to_h5
-        W0_qmunu = W_q[..., 0, :, 0, :]
-        W0_qmunu = W0_qmunu[None, None, None, :, :, :, :, :]
+        W0_qmunu = W_q[..., 0, :, 0, :][None, None, None, :, :, :, :, :]
         write_w0_qmunu_to_h5(tensors_filename, W0_qmunu)
 
     return W_q
