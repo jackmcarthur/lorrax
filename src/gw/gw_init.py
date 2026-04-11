@@ -795,7 +795,7 @@ def read_cohsex_input(filename: str) -> dict:
 		# debug_hartree: If True, print diagnostic info for Hartree calculation.
 		# debug_omega:   If set (float, in Ry), compute W(ω) at this frequency
 		#                instead of static W. For testing dynamic screening.
-		# screening_method: Screening backend: 'minimax' (default) or 'ctsp'.
+		# screening_method: Screening backend (minimax).
 			# minimax_target_error: Target max error for minimax 1/x approximation.
 			# minimax_max_nodes: Maximum allowed minimax nodes.
 			# regenerate_minimax_tables: If True, bypass shipped minimax tables and
