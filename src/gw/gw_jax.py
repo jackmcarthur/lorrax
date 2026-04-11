@@ -478,13 +478,13 @@ def print_scf_diagnostics(Gij_final, U_full, nelec, nb_sigma, print_fn=print):
 	print_fn(f"[Diagnostic] Lowest QP state: their |U| values = {np.array(U_col0_abs[top_contrib])}")
 
 
-def _extract_flat_k(V_qmunu, W_q, meta, mesh_xy, wfn):
-	"""Extract V(nk,μ,μ), W(nk,μ,μ) with flat k-index, and Gij occupation projector."""
-	# V_qmunu has shape (1, 1, 1, nkx, nky, nkz, μ, μ) from ISDF; strip polarization dims.
+def _extract_flat_k(V_qmunu, W_flat, meta, mesh_xy, wfn):
+	"""Extract V(nk,μ,μ) from ISDF V_qmunu, and Gij occupation projector.
+
+	W_flat is already flat-q (nq, μ, μ) from compute_screening, or None.
+	"""
 	V_flat = jnp.asarray(V_qmunu)[0, 0, 0].reshape(-1, V_qmunu.shape[-2], V_qmunu.shape[-1])
-	if W_q is not None:
-		W_flat = W_q[:,:,:,0,:,0,:].reshape(-1, W_q.shape[4], W_q.shape[6])
-	else:
+	if W_flat is None:
 		W_flat = V_flat
 	# Gij = diag(1,...,1,0,...,0) — occupation projector
 	b0, _, _, b3, _ = meta.band_edges

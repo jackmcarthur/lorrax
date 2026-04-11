@@ -826,14 +826,22 @@ def extract_gn_ppm_parameters_from_Wc(
     omega_p: float,
     fallback_omega: float = 2.0,
 ) -> GodbyNeedsPPM:
-    """Extract GN-PPM parameters from W^c(0) and W^c(i*omega_p)."""
+    """Extract GN-PPM parameters from W^c(0) and W^c(i*omega_p).
+
+    Accepts flat-q (nq, μ, μ) or 7D (nkx, nky, nkz, 1, μ, 1, μ).
+    """
     omega_p = float(omega_p)
     fallback_omega = float(fallback_omega)
     if omega_p <= 0.0:
         raise ValueError("omega_p must be > 0 for GN-PPM extraction.")
 
-    Wc0 = jnp.asarray(Wc0_q[:, :, :, 0, :, 0, :], dtype=jnp.complex128)
-    Wci = jnp.asarray(Wc_iwp_q[:, :, :, 0, :, 0, :], dtype=jnp.complex128)
+    # Accept flat-q (nq, μ, μ) or 7D (nkx, nky, nkz, 1, μ, 1, μ)
+    if Wc0_q.ndim == 3:
+        Wc0 = jnp.asarray(Wc0_q, dtype=jnp.complex128)
+        Wci = jnp.asarray(Wc_iwp_q, dtype=jnp.complex128)
+    else:
+        Wc0 = jnp.asarray(Wc0_q[:, :, :, 0, :, 0, :], dtype=jnp.complex128)
+        Wci = jnp.asarray(Wc_iwp_q[:, :, :, 0, :, 0, :], dtype=jnp.complex128)
     omega_vals, B, good, unfulfilled_fraction = fit_gn_ppm_from_wc_pair(
         Wc0,
         Wci,
