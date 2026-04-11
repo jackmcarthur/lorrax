@@ -660,39 +660,52 @@ def main(argv=None):
 	kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
 	_nk_tot = int(meta.nk_tot)
 
-	# FFT helpers: flat-k ↔ real-space lattice.  Only place 3D k-grid appears.
+	# FFT helpers: flat-k-first ↔ flat-R-first.  All k→3D reshaping is internal.
+	# Two pairs: one for G-shaped (nk, s, μ, s, μ), one for V-shaped (nk, μ, μ).
 	from common.fft_helpers import make_jittable_local_fftn_3d, make_jittable_local_ifftn_3d
-	_7d_spec = P(None, 'x', None, 'y', None, None, None)
-	_7d_shard = NamedSharding(mesh_xy, _7d_spec)
-	_ifftn = make_jittable_local_ifftn_3d(mesh_xy, _7d_spec, _7d_spec, norm='ortho', axes=(4, 5, 6))
-	_fftn = make_jittable_local_fftn_3d(mesh_xy, _7d_spec, _7d_spec, norm='ortho', axes=(4, 5, 6))
+	_nk = kgrid[0] * kgrid[1] * kgrid[2]
+
+	_G_7d_spec = P(None, None, None, None, 'x', None, 'y')  # (kx,ky,kz, s,μ_X, s,μ_Y)
+	_G_7d_shard = NamedSharding(mesh_xy, _G_7d_spec)
+	_G_ifftn = make_jittable_local_ifftn_3d(mesh_xy, _G_7d_spec, _G_7d_spec, norm='ortho', axes=(0, 1, 2))
+	_G_fftn = make_jittable_local_fftn_3d(mesh_xy, _G_7d_spec, _G_7d_spec, norm='ortho', axes=(0, 1, 2))
+
+	_V_5d_spec = P(None, None, None, 'x', 'y')  # (kx,ky,kz, μ_X, μ_Y)
+	_V_5d_shard = NamedSharding(mesh_xy, _V_5d_spec)
+	_V_ifftn = make_jittable_local_ifftn_3d(mesh_xy, _V_5d_spec, _V_5d_spec, norm='ortho', axes=(0, 1, 2))
 
 	@jax.jit
-	def _to_R(x_k):
-		"""Flat-k (nk, a, b, c, d) → 7D (a, b, c, d, kx, ky, kz) → IFFT → R-space."""
-		x_7d = x_k.transpose(1, 2, 3, 4, 0).reshape(
-			x_k.shape[1], x_k.shape[2], x_k.shape[3], x_k.shape[4], *kgrid)
-		return _ifftn(jax.lax.with_sharding_constraint(x_7d, _7d_shard))
+	def _G_to_R(G_k):
+		"""G(nk, s, μ, s, μ) → IFFT → G(nR, s, μ, s, μ).  k-first in, R-first out."""
+		G_7d = jax.lax.with_sharding_constraint(
+			G_k.reshape(*kgrid, *G_k.shape[1:]), _G_7d_shard)
+		G_R = _G_ifftn(G_7d)
+		return G_R.reshape(_nk, *G_R.shape[3:])
 
 	@jax.jit
-	def _to_k(x_R):
-		"""R-space (a, b, c, d, Rx, Ry, Rz) → FFT → reshape to flat-k (nk, a, b, c, d)."""
-		x_7d = _fftn(jax.lax.with_sharding_constraint(x_R, _7d_shard))
-		nk = x_7d.shape[4] * x_7d.shape[5] * x_7d.shape[6]
-		return x_7d.reshape(*x_7d.shape[:4], nk).transpose(4, 0, 1, 2, 3)
+	def _G_to_k(G_R):
+		"""G(nR, s, μ, s, μ) → FFT → G(nk, s, μ, s, μ).  R-first in, k-first out."""
+		G_7d = jax.lax.with_sharding_constraint(
+			G_R.reshape(*kgrid, *G_R.shape[1:]), _G_7d_shard)
+		G_k = _G_fftn(G_7d)
+		return G_k.reshape(_nk, *G_k.shape[3:])
 
 	@jax.jit
-	def _convolve(G_k, V_k, prefactor):
-		"""Σ(k) = prefactor · FFT[ G(R) · IFFT[V](R) / √Nk ].  All flat-k."""
-		G_R = _to_R(G_k)
-		V_R = _ifftn(V_k[None, :, None, :, :, :, :])
+	def _V_to_R(V_k):
+		"""V(nk, μ, μ) → IFFT → V(nR, μ, μ).  k-first in, R-first out."""
+		V_5d = jax.lax.with_sharding_constraint(
+			V_k.reshape(*kgrid, *V_k.shape[1:]), _V_5d_shard)
+		V_R = _V_ifftn(V_5d)
+		return V_R.reshape(_nk, *V_R.shape[3:])
+
+	@jax.jit
+	def _convolve(G_k, V_flat, prefactor):
+		"""Σ(k) = prefactor · FFT[ G(R) · V(R) / √Nk ].  All flat-k-first."""
+		G_R = _G_to_R(G_k)
+		# Broadcast V(nR, μ, μ) → (nR, 1, μ, 1, μ) to match G(nR, s, μ, s, μ)
+		V_R = _V_to_R(V_flat)[:, None, :, None, :]
 		sigma_R = G_R * V_R * (-1.0 / jnp.sqrt(_nk_tot))
-		return prefactor * _to_k(sigma_R)
-
-	@jax.jit
-	def _V_to_7d(V_flat):
-		"""V(nk, μ, μ) → (μ, μ, kx, ky, kz) for FFT."""
-		return V_flat.transpose(1, 2, 0).reshape(V_flat.shape[1], V_flat.shape[2], *kgrid)
+		return prefactor * _G_to_k(sigma_R)
 
 	# ---- Static COHSEX sigma ----
 	# Σ_SX(k) = -1  · ⟨m| FFT[G_occ(R) · W(R)/√Nk] |n⟩     (screened exchange)
@@ -703,14 +716,14 @@ def main(argv=None):
 	def compute_sigma_sx(wfns, Gij, W):
 		s = wfns.slices
 		G_k = build_G_occ(wfns.xn(s.sigma), wfns.yr(s.sigma), Gij)
-		sigma_k = _convolve(G_k, _V_to_7d(W), 1.0)
+		sigma_k = _convolve(G_k, W, 1.0)
 		return project_to_bands(wfns.xr(s.sigma), wfns.yn(s.sigma), sigma_k)
 
 	@jax.jit
 	def compute_sigma_coh(wfns, W, V):
 		s = wfns.slices
 		G_k = build_G_ri(wfns.xn(s.full), wfns.yr(s.full))
-		sigma_k = _convolve(G_k, _V_to_7d(W) - _V_to_7d(V), -0.5)
+		sigma_k = _convolve(G_k, W - V, -0.5)
 		return project_to_bands(wfns.xr(s.sigma), wfns.yn(s.sigma), sigma_k)
 
 	@jax.jit
@@ -854,11 +867,8 @@ def main(argv=None):
 				debug_quadrature=opts.sigma_debug_quadrature,
 				debug_quadrature_samples=opts.sigma_debug_quadrature_samples,
 				get_G_mu_nu_fn=build_G_occ,
-				get_G_R_fn=lambda G_k, nkx, nky, nkz: _ifftn(
-					G_k.transpose(1,2,3,4,0).reshape(
-						G_k.shape[1], G_k.shape[2], G_k.shape[3], G_k.shape[4], nkx, nky, nkz)),
-				get_sigma_mu_nu_fn=lambda G_R, V, nk, bisp=False: _fftn(
-					G_R * _ifftn(V[None, :, None, :, :, :, :]) * (-1.0 / jnp.sqrt(nk))),
+				get_G_R_fn=None,        # unused (ppm_sigma has its own FFT pipeline)
+				get_sigma_mu_nu_fn=None, # unused
 				get_sigma_kij_channels_fn=project_to_bands_ri,
 				print0=print0,
 			)

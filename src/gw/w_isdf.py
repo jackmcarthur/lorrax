@@ -65,25 +65,27 @@ def _get_chi_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
         return _chi_kernel_cache[cache_key]
 
     nk = nkx * nky * nkz
-    # Shardings: G is 7D (s, μ, s, μ, kx, ky, kz), chi_R is (μ, μ, Rx, Ry, Rz)
-    G_7d_shard = NamedSharding(mesh_xy, P(None, 'x', None, 'y', None, None, None))
-    chi_R_shard = NamedSharding(mesh_xy, P('x', 'y', None, None, None))
+    # k-first shardings: G is (kx,ky,kz, s,μ,s,μ), chi_R is (Rx,Ry,Rz, μ,μ)
+    G_7d_shard = NamedSharding(mesh_xy, P(None, None, None, None, 'x', None, 'y'))
+    chi_R_shard = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
 
     def _G_flat_to_R(g_k, use_fft):
-        """G(nk, s, μ, s, μ) → reshape → FFT/IFFT → G(s, μ, s, μ, Rx, Ry, Rz)."""
-        g_7d = g_k.transpose(1, 2, 3, 4, 0).reshape(
-            g_k.shape[1], g_k.shape[2], g_k.shape[3], g_k.shape[4], nkx, nky, nkz)
-        g_7d = jax.lax.with_sharding_constraint(g_7d, G_7d_shard)
-        return jax.lax.cond(
+        """G(nk, s, μ, s, μ) → reshape k-first → FFT/IFFT → G(nR, s, μ, s, μ)."""
+        g_7d = jax.lax.with_sharding_constraint(
+            g_k.reshape(nkx, nky, nkz, *g_k.shape[1:]), G_7d_shard)
+        g_7d = jax.lax.cond(
             use_fft,
-            lambda x: jnp.fft.fftn(x, axes=(-3, -2, -1), norm='ortho'),
-            lambda x: jnp.fft.ifftn(x, axes=(-3, -2, -1), norm='ortho'),
+            lambda x: jnp.fft.fftn(x, axes=(0, 1, 2), norm='ortho'),
+            lambda x: jnp.fft.ifftn(x, axes=(0, 1, 2), norm='ortho'),
             g_7d)
+        return g_7d.reshape(nk, *g_7d.shape[3:])
 
     def _chi_R_to_flat_q(chi_R):
-        """χ(μ, μ, Rx, Ry, Rz) → FFT → flatten → χ(nq, μ, μ)."""
-        chi_q = jnp.fft.fftn(chi_R, axes=(-3, -2, -1), norm='ortho')
-        return chi_q.transpose(2, 3, 4, 0, 1).reshape(nk, chi_R.shape[0], chi_R.shape[1])
+        """χ(nR, μ, μ) → reshape k-first → FFT → flatten → χ(nq, μ, μ)."""
+        chi_5d = jax.lax.with_sharding_constraint(
+            chi_R.reshape(nkx, nky, nkz, chi_R.shape[1], chi_R.shape[2]), chi_R_shard)
+        chi_q = jnp.fft.fftn(chi_5d, axes=(0, 1, 2), norm='ortho')
+        return chi_q.reshape(nk, chi_R.shape[1], chi_R.shape[2])
 
     @jax.jit
     def _chi_kernel(
@@ -114,11 +116,11 @@ def _get_chi_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
             Gc_mR = _G_flat_to_R(Gc_k, True)    # FFT → G_c(-R)
 
             # χ(R,μ,ν) = Σ_{s,s'} G_c(-R,s',ν,s,μ) · G_v(R,s,μ,s',ν)
-            chi_tau = jnp.einsum('ambnxyz,bnamxyz->mnxyz', Gc_mR, Gv_R, optimize=True)
+            # G shapes: (nR, s, μ, s, μ) — R is leading index (batch dim)
+            chi_tau = jnp.einsum('Rambn,Rbnam->Rmn', Gc_mR, Gv_R, optimize=True)
             return chi_R_acc + quad_w[itau] * chi_tau
 
-        chi_R_init = jax.lax.with_sharding_constraint(
-            jnp.zeros((n_rmu, n_rmu, nkx, nky, nkz), dtype=jnp.complex128), chi_R_shard)
+        chi_R_init = jnp.zeros((nk, n_rmu, n_rmu), dtype=jnp.complex128)
         chi_R = jax.lax.fori_loop(0, ntau, tau_body, chi_R_init)
         return _chi_R_to_flat_q(chi_R)
 
@@ -230,24 +232,20 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 
-    chi_R_shard = NamedSharding(mesh_xy, P('x', 'y', None, None, None))
-    G_v_7d_shard = NamedSharding(mesh_xy, P(None, 'x', None, 'y', None, None, None))
-    G_c_7d_shard = NamedSharding(mesh_xy, P(None, 'y', None, 'x', None, None, None))
-    G_v_7d_spec = P(None, 'x', None, 'y', None, None, None)
-    G_c_7d_spec = P(None, 'y', None, 'x', None, None, None)
-    chi_R_spec = P('x', 'y', None, None, None)
+    # k-first shardings for device-local FFTs
+    G_v_7d_spec = P(None, None, None, None, 'x', None, 'y')  # (kx,ky,kz, s,μ_X,s,μ_Y)
+    G_c_7d_spec = P(None, None, None, None, 'y', None, 'x')
+    chi_R_spec = P(None, None, None, 'x', 'y')               # (Rx,Ry,Rz, μ_X,μ_Y)
+    G_v_7d_shard = NamedSharding(mesh_xy, G_v_7d_spec)
+    G_c_7d_shard = NamedSharding(mesh_xy, G_c_7d_spec)
+    chi_R_shard = NamedSharding(mesh_xy, chi_R_spec)
 
     local_ifftn_Gv = make_jittable_local_ifftn_3d(
-        mesh_xy, G_v_7d_spec, G_v_7d_spec, norm='ortho', axes=(-3, -2, -1))
+        mesh_xy, G_v_7d_spec, G_v_7d_spec, norm='ortho', axes=(0, 1, 2))
     local_fftn_Gc = make_jittable_local_fftn_3d(
-        mesh_xy, G_c_7d_spec, G_c_7d_spec, norm='ortho', axes=(-3, -2, -1))
+        mesh_xy, G_c_7d_spec, G_c_7d_spec, norm='ortho', axes=(0, 1, 2))
     local_fftn_chi = make_jittable_local_fftn_3d(
-        mesh_xy, chi_R_spec, chi_R_spec, norm='ortho', axes=(-3, -2, -1))
-
-    def _G_flat_to_7d(G_k):
-        """G(nk, s, μ, s, μ) → (s, μ, s, μ, kx, ky, kz) for FFT."""
-        return G_k.transpose(1, 2, 3, 4, 0).reshape(
-            G_k.shape[1], G_k.shape[2], G_k.shape[3], G_k.shape[4], nkx, nky, nkz)
+        mesh_xy, chi_R_spec, chi_R_spec, norm='ortho', axes=(0, 1, 2))
 
     @jax.jit
     def _build_G(psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
@@ -258,8 +256,11 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
             jnp.conj(psi_val_xn), exp_v.astype(jnp.complex128), psi_val_yr, optimize=True)
         Gc_k = jnp.einsum('ksxm,km,kmty->ksxty',
             jnp.conj(psi_cond_xn), exp_c.astype(jnp.complex128), psi_cond_yr, optimize=True)
-        Gv_7 = jax.lax.with_sharding_constraint(_G_flat_to_7d(Gv_k), G_v_7d_shard)
-        Gc_7 = jax.lax.with_sharding_constraint(_G_flat_to_7d(Gc_k), G_c_7d_shard)
+        # Reshape flat-k to k-first 7D for FFT
+        Gv_7 = jax.lax.with_sharding_constraint(
+            Gv_k.reshape(nkx, nky, nkz, *Gv_k.shape[1:]), G_v_7d_shard)
+        Gc_7 = jax.lax.with_sharding_constraint(
+            Gc_k.reshape(nkx, nky, nkz, *Gc_k.shape[1:]), G_c_7d_shard)
         return Gv_7, Gc_7
 
     @partial(jax.jit, donate_argnums=(0,))
@@ -267,16 +268,20 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
                   enk_v, enk_c, tau_scalar, prefactor_scalar, vmax, cmin):
         Gv_7, Gc_7 = _build_G(psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
                                enk_v, enk_c, tau_scalar, vmax, cmin)
-        Gv_R = local_ifftn_Gv(Gv_7)
-        Gc_mR = local_fftn_Gc(Gc_7)
-        chi_tau = jnp.einsum('ambnxyz,bnamxyz->mnxyz', Gc_mR, Gv_R, optimize=True)
+        Gv_R = local_ifftn_Gv(Gv_7)    # (Rx,Ry,Rz, s,μ,s,μ)
+        Gc_mR = local_fftn_Gc(Gc_7)     # (Rx,Ry,Rz, s,μ,s,μ)
+        # chi(R,μ,ν) = Σ_{s,s'} Gc(-R) · Gv(R) — R indices are leading (batch)
+        chi_tau = jnp.einsum('Rambn,Rbnam->Rmn', Gc_mR.reshape(nk, *Gc_mR.shape[3:]),
+                             Gv_R.reshape(nk, *Gv_R.shape[3:]), optimize=True)
         return chi_R_acc + prefactor_scalar * chi_tau
 
     @jax.jit
     def _chi_R_to_flat_q(chi_R):
-        """χ(μ, μ, Rx, Ry, Rz) → FFT → flatten → χ(nq, μ, μ)."""
-        chi_q_7d = local_fftn_chi(chi_R)
-        return chi_q_7d.transpose(2, 3, 4, 0, 1).reshape(nk, chi_R.shape[0], chi_R.shape[1])
+        """χ(nR, μ, μ) → reshape k-first → FFT → flatten → χ(nq, μ, μ)."""
+        chi_5d = jax.lax.with_sharding_constraint(
+            chi_R.reshape(nkx, nky, nkz, chi_R.shape[1], chi_R.shape[2]), chi_R_shard)
+        chi_q = local_fftn_chi(chi_5d)
+        return chi_q.reshape(nk, chi_R.shape[1], chi_R.shape[2])
 
     def _chi_kernel(psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
                     enk_v, enk_c, tau_i, prefactor_i, vmax, cmin):
@@ -285,12 +290,14 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
         if ntau == 0:
             return jnp.zeros((nk, n_rmu, n_rmu), dtype=jnp.complex128)
 
-        chi_R_shape = (n_rmu, n_rmu, nkx, nky, nkz)
+        # Accumulator: flat-R (nR, μ, μ) — sharded via callback
+        chi_R_shape = (nk, n_rmu, n_rmu)
         def _chi_zeros(idx):
             sh = tuple((s.stop - s.start) if s.stop is not None else d
                        for s, d in zip(idx, chi_R_shape))
             return np.zeros(sh, dtype=np.complex128)
-        chi_R_acc = jax.make_array_from_callback(chi_R_shape, chi_R_shard, _chi_zeros)
+        chi_R_shard_flat = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
+        chi_R_acc = jax.make_array_from_callback(chi_R_shape, chi_R_shard_flat, _chi_zeros)
 
         for itau in range(ntau):
             chi_R_acc = _tau_step(
