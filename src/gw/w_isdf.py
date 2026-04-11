@@ -31,7 +31,7 @@ from .minimax_screening import (
 )
 
 if TYPE_CHECKING:
-    from .wavefunction_bundle import WavefunctionBundle
+    from .wavefunction_bundle import Wavefunctions
 
 
 # ============================================================================
@@ -626,12 +626,12 @@ def compute_chi0_and_w(
 
 
 def get_chi0_jax_from_bundle(
-    wf_bundle: "WavefunctionBundle",
+    wf_bundle: "Wavefunctions",
     windows,
     meta: Meta,
     mesh_xy: Mesh | None = None,
 ) -> jax.Array:
-    """Compute static χ₀ directly from canonical WavefunctionBundle storage."""
+    """Compute static χ₀ directly from canonical Wavefunctions storage."""
     if mesh_xy is None:
         raise ValueError("mesh_xy is required for bundle-based chi0 evaluation")
 
@@ -687,19 +687,19 @@ def frequency_integration(*args, **kwargs):
 
 
 def get_w_omega_jax_from_bundle(*args, **kwargs):
-    """Dynamic W(ω) from canonical WavefunctionBundle."""
+    """Dynamic W(ω) from canonical Wavefunctions."""
     from .archive.w_isdf_dynamic import get_w_omega_jax_from_bundle as dynamic_w_omega_bundle
     return dynamic_w_omega_bundle(*args, **kwargs)
 
 
 def get_chi_omega_jax_from_bundle(*args, **kwargs):
-    """Dynamic χ(ω) from canonical WavefunctionBundle."""
+    """Dynamic χ(ω) from canonical Wavefunctions."""
     from .archive.w_isdf_dynamic import get_chi_omega_jax_from_bundle as dynamic_chi_omega_bundle
     return dynamic_chi_omega_bundle(*args, **kwargs)
 
 
 def frequency_integration_from_bundle(*args, **kwargs):
-    """Scalar-ω CTSP frequency integration from canonical WavefunctionBundle."""
+    """Scalar-ω CTSP frequency integration from canonical Wavefunctions."""
     from .archive.w_isdf_dynamic import frequency_integration_from_bundle as dynamic_frequency_integration_bundle
     return dynamic_frequency_integration_bundle(*args, **kwargs)
 
@@ -736,7 +736,7 @@ def compute_screening(
     ----------
     V_qmunu : jax.Array
         Bare Coulomb in ISDF basis.
-    wf_bundle : WavefunctionBundle
+    wf_bundle : Wavefunctions
         Canonical wavefunction bundle.
     window_pairs : list or None
         Energy windows for CTSP quadrature. Required only for ``ctsp`` mode.

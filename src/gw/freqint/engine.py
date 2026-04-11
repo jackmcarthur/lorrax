@@ -144,7 +144,7 @@ def execute_chi_from_bundle(
     _ensure_window_band_ranges_for_bundle(wf_bundle, windows)
 
     nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
-    nrmu = int(wf_bundle.psi_x.shape[2])
+    nrmu = int(wf_bundle.psi_xn.shape[2])
     chi_total = jnp.zeros((omega_arr.shape[0], nkx, nky, nkz, 1, nrmu, 1, nrmu), dtype=jnp.complex128)
 
     for wplan in plan.window_plans:

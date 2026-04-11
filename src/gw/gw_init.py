@@ -1181,67 +1181,47 @@ def load_restart_tensors(tensors_filename, mesh_xy, band_slices, print0):
 	)
 
 
-def build_bundle_and_views(
+def build_bundle(
 	*,
 	wfn,
 	sym,
 	meta,
 	band_slices,
 	mesh_xy,
-	sh=None,
 	psi_l_y=None,
 	psi_r_y=None,
 	psi_full_y=None,
 	psi_full_x=None,
 	enk_full=None,
 	print0=print,
+	**_ignored,
 ):
-	"""Build Wavefunctions bundle from either ISDF or restart arrays.
-
-	Provide (psi_l_y, psi_r_y) for the ISDF path, or (psi_full_y[, psi_full_x])
-	for the restart path. enk_full is loaded from WFN if not provided.
-
-	Returns (wf_bundle, sigma_views) for backward compatibility, where
-	sigma_views is a legacy shim that delegates to wf_bundle.xn/xr/yr/yn.
-	"""
-	from .wavefunction_bundle import (
-		build_wavefunctions,
-		build_wavefunctions_from_full,
-		build_sigma_views,
-	)
+	"""Build Wavefunctions bundle from either ISDF or restart arrays."""
+	from .wavefunction_bundle import build_wavefunctions, build_wavefunctions_from_full
 	from common.load_wfns import get_enk_bandrange
 
 	b0, b1, b2, b3, b4 = meta.band_edges
-
 	if enk_full is None:
 		enk_full, _ = get_enk_bandrange(
 			wfn, sym, (b0, b4), (b1, b3), nspinor=meta.nspinor
 		)
 
 	if psi_full_y is not None:
-		wf_bundle = build_wavefunctions_from_full(
-			psi_full_y,
-			psi_xn_full=psi_full_x,
-			enk_full=enk_full,
-			slices=band_slices,
-			mesh_xy=mesh_xy,
-			efermi=None,
+		wfns = build_wavefunctions_from_full(
+			psi_full_y, psi_xn_full=psi_full_x,
+			enk_full=enk_full, slices=band_slices, mesh_xy=mesh_xy,
 		)
 	else:
-		wf_bundle = build_wavefunctions(
+		wfns = build_wavefunctions(
 			psi_l_y, psi_r_y,
-			enk_full=enk_full,
-			slices=band_slices,
-			mesh_xy=mesh_xy,
-			efermi=None,
+			enk_full=enk_full, slices=band_slices, mesh_xy=mesh_xy,
 		)
 
-	sigma_views = build_sigma_views(wf_bundle, mesh_xy, sh)
 	print0(
 		f"  Wavefunctions built (b0:b4={band_slices.nb_full} bands, "
 		f"4 sharded copies: xn/xr/yr/yn)"
 	)
-	return wf_bundle, sigma_views
+	return wfns
 
 
 def prepare_isdf_and_wavefunctions(
@@ -1253,34 +1233,28 @@ def prepare_isdf_and_wavefunctions(
 	centroid_indices,
 	band_slices,
 	mesh_xy,
-	sh,
 	tmp_dir,
 	tensors_filename,
 	print0,
+	**_ignored,
 ):
 	"""Run ISDF fitting or load from restart, build wavefunction bundle.
 
-	Returns
-	-------
-	SimpleNamespace with fields:
-		V_qmunu, v_q0_noG0_munu, G0_mu_nu,
-		wf_bundle, sigma_views
+	Returns SimpleNamespace with: V_qmunu, v_q0_noG0_munu, G0_mu_nu, wf_bundle.
 	"""
 	from file_io import write_restart_state_to_h5, save_restart_state_per_proc
 
 	if not cfg.restart:
-		# Fit ISDF vectors and compute V_q
 		isdf_result = run_isdf_fitting(
 			cfg=cfg, wfn=wfn, sym=sym, meta=meta,
 			centroid_indices=centroid_indices,
 			mesh_xy=mesh_xy, tmp_dir=tmp_dir, print0=print0,
 		)
 
-		# Build wavefunctions from ISDF centroid projections
 		with timing.section("gw_jax.wavefunction_setup"):
-			wf_bundle, sigma_views = build_bundle_and_views(
+			wfns = build_bundle(
 				wfn=wfn, sym=sym, meta=meta,
-				band_slices=band_slices, mesh_xy=mesh_xy, sh=sh,
+				band_slices=band_slices, mesh_xy=mesh_xy,
 				psi_l_y=isdf_result['psi_l_rmu_Y'],
 				psi_r_y=isdf_result['psi_r_rmu_Y'],
 				print0=print0,
@@ -1290,29 +1264,27 @@ def prepare_isdf_and_wavefunctions(
 		v_q0_noG0_munu = isdf_result['v_q0_noG0_munu']
 		G0_mu_nu = isdf_result['G0_mu_nu']
 
-		# Persist restart artifacts (save yr copy — the canonical serialisation layout)
 		write_restart_state_to_h5(
 			tensors_filename, V_qmunu,
-			wf_bundle.psi_yr, wf_bundle.enk, None,
+			wfns.psi_yr, wfns.enk, None,
 			V0_noG0_munu=v_q0_noG0_munu, G0_mu_nu=G0_mu_nu, init_W0=True,
 		)
 		save_restart_state_per_proc(
 			os.path.join(tmp_dir, "isdf_tensors"),
-			V_qmunu, None, wf_bundle.psi_yr, wf_bundle.enk,
+			V_qmunu, None, wfns.psi_yr, wfns.enk,
 			meta, mesh_xy, V0_noG0_munu=v_q0_noG0_munu,
 		)
 		V_qmunu.block_until_ready()
 		print0("  Chunked ISDF path complete")
 
 	else:
-		# Load from restart
 		with timing.section("gw_jax.restart_load"):
 			restart = load_restart_tensors(
 				tensors_filename, mesh_xy, band_slices, print0,
 			)
-			wf_bundle, sigma_views = build_bundle_and_views(
+			wfns = build_bundle(
 				wfn=wfn, sym=sym, meta=meta,
-				band_slices=band_slices, mesh_xy=mesh_xy, sh=sh,
+				band_slices=band_slices, mesh_xy=mesh_xy,
 				psi_full_y=restart['psi_full_y'],
 				psi_full_x=restart['psi_full_x'],
 				enk_full=restart['enk_full'],
@@ -1327,6 +1299,5 @@ def prepare_isdf_and_wavefunctions(
 		V_qmunu=V_qmunu,
 		v_q0_noG0_munu=v_q0_noG0_munu,
 		G0_mu_nu=G0_mu_nu,
-		wf_bundle=wf_bundle,
-		sigma_views=sigma_views,
+		wf_bundle=wfns,
 	)

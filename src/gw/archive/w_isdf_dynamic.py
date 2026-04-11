@@ -949,9 +949,9 @@ def get_chi_omega_jax_from_bundle(
     """Compute dynamic χ(ω) directly from canonical WavefunctionBundle storage."""
     s = wf_bundle.slices
     return get_chi_omega_jax(
-        wf_bundle.x(s.v_slice), wf_bundle.y(s.v_slice),
-        wf_bundle.y(s.c_slice), wf_bundle.x(s.c_slice),
-        wf_bundle.enk[:, s.v_slice], wf_bundle.enk[:, s.c_slice],
+        wf_bundle.xn(s.val), wf_bundle.yr(s.val),
+        wf_bundle.yr(s.cond), wf_bundle.xn(s.cond),
+        wf_bundle.enk[:, s.val], wf_bundle.enk[:, s.cond],
         windows, omega, meta, mesh_xy,
     )
 
@@ -966,9 +966,9 @@ def frequency_integration_from_bundle(
     """Bundle-based wrapper for scalar-ω frequency integration."""
     s = wf_bundle.slices
     return frequency_integration(
-        wf_bundle.x(s.v_slice), wf_bundle.y(s.v_slice),
-        wf_bundle.y(s.c_slice), wf_bundle.x(s.c_slice),
-        wf_bundle.enk[:, s.v_slice], wf_bundle.enk[:, s.c_slice],
+        wf_bundle.xn(s.val), wf_bundle.yr(s.val),
+        wf_bundle.yr(s.cond), wf_bundle.xn(s.cond),
+        wf_bundle.enk[:, s.val], wf_bundle.enk[:, s.cond],
         windows, omega, meta, mesh_xy,
     )
 
@@ -985,8 +985,8 @@ def get_w_omega_jax_from_bundle(
     s = wf_bundle.slices
     return get_w_omega_jax(
         V_qmunu,
-        wf_bundle.x(s.v_slice), wf_bundle.y(s.v_slice),
-        wf_bundle.y(s.c_slice), wf_bundle.x(s.c_slice),
-        wf_bundle.enk[:, s.v_slice], wf_bundle.enk[:, s.c_slice],
+        wf_bundle.xn(s.val), wf_bundle.yr(s.val),
+        wf_bundle.yr(s.cond), wf_bundle.xn(s.cond),
+        wf_bundle.enk[:, s.val], wf_bundle.enk[:, s.cond],
         windows, omega, meta, mesh_xy,
     )

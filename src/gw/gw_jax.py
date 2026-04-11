@@ -824,7 +824,6 @@ def main(argv=None):
 		centroid_indices=centroid_indices,
 		band_slices=band_slices,
 		mesh_xy=mesh_xy,
-		sh=sh,
 		tmp_dir=tmp_dir,
 		tensors_filename=tensors_filename,
 		print0=print0,
@@ -833,13 +832,9 @@ def main(argv=None):
 	V_qmunu = isdf.V_qmunu
 	V_qmunu_nohead = V_qmunu
 	v_q0_noG0_munu = isdf.v_q0_noG0_munu
-	# Retained in restart payloads for diagnostics / external checks, but no longer
-	# used in the active q=0 head treatment.
 	_ = isdf.G0_mu_nu
 	wfns = isdf.wf_bundle
 	s = wfns.slices
-	# Legacy alias kept until all sigma_views references are removed
-	sigma_views = isdf.sigma_views
 
 	# Compute screened Coulomb W = (1 - Vχ)⁻¹ V
 	if do_screened:
