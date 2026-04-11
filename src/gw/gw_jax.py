@@ -860,58 +860,56 @@ def main(argv=None):
 	# not resolve correctly on multi-node without explicit mesh reference)
 	_G_7d_shard = NamedSharding(mesh_xy, P(None, 'x', None, 'y', None, None, None))
 
-	# Static system constants closed over by JIT functions below.
-	# These are compile-time constants — JAX folds them during tracing.
+	# Compile-time constants for JIT closures.
 	_nkx, _nky, _nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
 	_nk_tot = int(meta.nk_tot)
 	_inv_sqrt_nk = -1.0 / jnp.sqrt(_nk_tot)
 
 	@jax.jit
-	def _G_to_7d(G_k):
-		"""Reshape (nk, s, μ, s, μ) → (s, μ, s, μ, nkx, nky, nkz) for FFT."""
+	def _G_k_to_R(G_k):
+		"""G(nk,s,μ,s,μ) → IFFT → G(s,μ,s,μ,Rx,Ry,Rz)."""
 		G_7d = G_k.transpose(1,2,3,4,0).reshape(
 			G_k.shape[1], G_k.shape[2], G_k.shape[3], G_k.shape[4], _nkx, _nky, _nkz)
-		return jax.lax.with_sharding_constraint(G_7d, _G_7d_shard)
+		G_7d = jax.lax.with_sharding_constraint(G_7d, _G_7d_shard)
+		return _local_ifftn_G(G_7d)
 
 	@jax.jit
-	def _convolve_R(G_R, W_or_V):
-		"""Convolve G(R) with interaction in real space: Σ(R) = G(R) * V(R) / √Nk."""
-		V_R = _local_ifftn_G(W_or_V[None, :, None, :, :, :, :])
+	def _convolve_sigma(G_R, W_5d):
+		"""Σ(k) = FFT[ G(R) · IFFT[W](R) / √Nk ]."""
+		V_R = _local_ifftn_G(W_5d[None, :, None, :, :, :, :])
 		sigma_R = G_R * V_R * _inv_sqrt_nk
-		return jax.lax.with_sharding_constraint(sigma_R, _G_7d_shard)
+		sigma_R = jax.lax.with_sharding_constraint(sigma_R, _G_7d_shard)
+		return _local_fftn_G(sigma_R)
 
 	@jax.jit
-	def _sx_branch_jit(psi_xn_sig, psi_yr_sig, psi_xr_sig, psi_yn_sig, Gij, W):
-		G_R = _local_ifftn_G(_G_to_7d(build_G_munu(psi_xn_sig, psi_yr_sig, Gij)))
-		sigma_sx_k = _local_fftn_G(_convolve_R(G_R, W))
-		return project_sigma_to_bands(psi_xr_sig, psi_yn_sig, sigma_sx_k)
-
-	@jax.jit
-	def _coh_branch_jit(psi_xn_full, psi_yr_full, psi_xr_sig, psi_yn_sig, W, V):
-		G_RI_R = _local_ifftn_G(_G_to_7d(build_G_munu_ri(psi_xn_full, psi_yr_full)))
-		sigma_coh_k = _local_fftn_G(_convolve_R(G_RI_R, W - V))
-		return -0.5 * project_sigma_to_bands(psi_xr_sig, psi_yn_sig, sigma_coh_k)
-
-	@jax.jit
-	def _hartree_jit(psi_yr, Gij, V0, psi_xr):
-		rho = build_density_from_Gij(psi_yr, Gij, _nk_tot)
-		return project_potential_to_bands(psi_xr, build_hartree_potential(rho, V0))
-
-	def static_sigma_pipeline(wfns, W, V, V0, Gij):
-		"""Compute static COHSEX Σ_SX, Σ_COH, V_H from Wavefunctions bundle."""
-		import gc as _gc
-		_gc.collect()
-
+	def compute_sigma_sx(wfns, Gij, W):
+		"""Screened exchange: Σ_SX = -G·W projected to bands."""
 		s = wfns.slices
-		xn_sig, yr_sig = wfns.xn(s.sigma), wfns.yr(s.sigma)
-		xr_sig, yn_sig = wfns.xr(s.sigma), wfns.yn(s.sigma)
+		G_R = _G_k_to_R(build_G_munu(wfns.xn(s.sigma), wfns.yr(s.sigma), Gij))
+		sigma_k = _convolve_sigma(G_R, W)
+		return project_sigma_to_bands(wfns.xr(s.sigma), wfns.yn(s.sigma), sigma_k)
 
-		sigma_sx_kij = _sx_branch_jit(xn_sig, yr_sig, xr_sig, yn_sig, Gij, W)
-		sigma_coh_kij = _coh_branch_jit(
-			wfns.xn(s.full), wfns.yr(s.full), xr_sig, yn_sig, W, V)
-		hartree_kmn = _hartree_jit(yr_sig, Gij, V0, xr_sig)
+	@jax.jit
+	def compute_sigma_coh(wfns, W, V):
+		"""Coulomb hole: Σ_COH = -½ G_RI · (W-V) projected to bands."""
+		s = wfns.slices
+		G_RI_R = _G_k_to_R(build_G_munu_ri(wfns.xn(s.full), wfns.yr(s.full)))
+		sigma_k = _convolve_sigma(G_RI_R, W - V)
+		return -0.5 * project_sigma_to_bands(wfns.xr(s.sigma), wfns.yn(s.sigma), sigma_k)
 
-		return sigma_sx_kij, sigma_coh_kij, hartree_kmn
+	@jax.jit
+	def compute_hartree(wfns, Gij, V0):
+		"""Hartree: V_H = V₀ · ρ projected to bands."""
+		s = wfns.slices
+		rho = build_density_from_Gij(wfns.yr(s.sigma), Gij, _nk_tot)
+		return project_potential_to_bands(wfns.xr(s.sigma), build_hartree_potential(rho, V0))
+
+	def compute_static_sigma(wfns, W, V, V0, Gij):
+		"""Full static COHSEX: Σ_SX + Σ_COH + V_H."""
+		import gc; gc.collect()
+		return (compute_sigma_sx(wfns, Gij, W),
+				compute_sigma_coh(wfns, W, V),
+				compute_hartree(wfns, Gij, V0))
 
 	def _apply_static_head_terms(sigma_sx_kij, sigma_coh_kij):
 		if static_head_terms is None:
@@ -932,7 +930,7 @@ def main(argv=None):
 	with mesh_xy:
 		with timing.section("gw_jax.pipeline"):
 			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = \
-				static_sigma_pipeline(wfns, W_mu_nu, V_mu_nu_for_coh, v_q0_noG0_munu, Gij_static)
+				compute_static_sigma(wfns, W_mu_nu, V_mu_nu_for_coh, v_q0_noG0_munu, Gij_static)
 			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax = _apply_static_head_terms(
 				sigma_sx_kbar_ij_jax,
 				sigma_coh_kbar_ij_jax,
@@ -1020,13 +1018,9 @@ def main(argv=None):
 
 			def _build_sigma_x_bare_kij():
 				with mesh_xy:
-					sigma_x_bare_kij_local = _sx_branch_jit(
-						wfns.xn(s.sigma), wfns.yr(s.sigma),
-						wfns.xr(s.sigma), wfns.yn(s.sigma),
-						Gij_static, V_mu_nu_exchange,
-					)
-				sigma_x_bare_kij_local.block_until_ready()
-				return sigma_x_bare_kij_local
+					result = compute_sigma_sx(wfns, Gij_static, V_mu_nu_exchange)
+				result.block_until_ready()
+				return result
 
 			sigma_omega = compute_sigma_c_ppm_omega_grid(
 				psi_coh_rmuT_X=wfns.xn(s.full),
@@ -1506,7 +1500,7 @@ def main(argv=None):
 			# Compute new Σ using original wavefunctions but updated G_ij
 			with mesh_xy:
 				sigma_sx_new, sigma_coh_new, hartree_new = \
-					static_sigma_pipeline(wfns, W_mu_nu, V_mu_nu_for_coh, v_q0_noG0_munu, Gij_new)
+					compute_static_sigma(wfns, W_mu_nu, V_mu_nu_for_coh, v_q0_noG0_munu, Gij_new)
 			sigma_sx_new, sigma_coh_new = _apply_static_head_terms(sigma_sx_new, sigma_coh_new)
 			
 			# Combine and extract upper triangle
@@ -1547,7 +1541,7 @@ def main(argv=None):
 
 		with mesh_xy:
 			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = \
-				static_sigma_pipeline(wfns, W_mu_nu, V_mu_nu_for_coh, v_q0_noG0_munu, Gij_final)
+				compute_static_sigma(wfns, W_mu_nu, V_mu_nu_for_coh, v_q0_noG0_munu, Gij_final)
 		sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax = _apply_static_head_terms(
 			sigma_sx_kbar_ij_jax,
 			sigma_coh_kbar_ij_jax,

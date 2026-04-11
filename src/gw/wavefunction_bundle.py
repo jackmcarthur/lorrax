@@ -109,6 +109,15 @@ class Wavefunctions:
         return self.psi_yn[:, :, :, bands]
 
 
+# Register as JAX pytree so Wavefunctions can be passed to @jax.jit functions.
+# Array fields are traced; slices (static metadata) are compile-time constants.
+jax.tree_util.register_dataclass(
+    Wavefunctions,
+    data_fields=['psi_xn', 'psi_xr', 'psi_yr', 'psi_yn', 'enk', 'occ'],
+    meta_fields=['slices'],
+)
+
+
 # ---------------------------------------------------------------------------
 # Construction
 # ---------------------------------------------------------------------------
