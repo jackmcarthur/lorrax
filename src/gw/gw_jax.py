@@ -4,7 +4,6 @@ os.environ.setdefault("JAX_ENABLE_X64", "1")
 os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
 
 import argparse
-import time
 
 import numpy as np
 import jax
@@ -58,15 +57,13 @@ def _maybe_init_jax_distributed():
 								   process_id=proc_id)
 	os.environ[_DISTRIBUTED_SENTINEL] = "1"
 
-# Global mesh for sharding across bands
 _maybe_init_jax_distributed()
 try:
-	_default_devices = jax.devices()
+	jax.devices()
 except RuntimeError as exc:
 	if "Unknown backend: 'gpu'" in str(exc):
 		os.environ.pop("JAX_PLATFORM_NAME", None)
 		os.environ["JAX_PLATFORMS"] = "cpu"
-		_default_devices = jax.devices("cpu")
 	else:
 		raise
 from file_io import (
@@ -99,12 +96,10 @@ from .minimax_config import (
 )
 from .ppm_sigma import (
 	compute_w0_wiwp_and_ppm_from_minimax,
-	compute_sigma_c_ppm_laplace,
 	compute_sigma_c_ppm_omega_grid,
 )
 from .qsgw_utils import (
 	solve_diagonal_sigma_fixed_point,
-	build_qsgw_sigma_xc,
 	load_sigma_xc_diag_from_h5,
 	build_qsgw_sigma_xc_from_h5,
 	plot_qp_energy_comparison,
@@ -119,7 +114,7 @@ from .head_correction import (
 	resolve_head_sample,
 	static_head_terms_to_kij,
 )
-from .wavefunction_bundle import BandSlices, Wavefunctions
+from .wavefunction_bundle import BandSlices
 from mixing.acceleration import (
     rcrop_nojit, hermitian_to_upper_flat, upper_flat_to_hermitian
 )
@@ -421,178 +416,48 @@ def fit_zeta_and_compute_V_q_chunked(
 	}
 
 
-# ================= JAX-sharded Sigma pipeline =================
+# ================= ISDF sigma pipeline =================
+#
+# All tensors use a FLAT k-index: G(nk, s, μ, s, μ), V(nk, μ, μ), Σ(nk, s, μ, s, μ).
+# The 3D k-grid (nkx, nky, nkz) only appears inside the FFT helpers.
+#
+# Sigma computation for a given (G, interaction) pair:
+#   G_R  = IFFT_k→R[ G(k) ]                  real-space Green's function
+#   Σ(k) = FFT_R→k[ G(R) · IFFT[V](R) ]     convolution theorem
+#   Σ_mn = ⟨m| Σ(k) |n⟩                      project to band basis
+#
+# SX  uses G = Σ_n f_n |ψ_n⟩⟨ψ_n| (occupied),  interaction = W,   prefactor = -1
+# COH uses G = Σ_n     |ψ_n⟩⟨ψ_n| (all bands),  interaction = W-V, prefactor = -½
 
-def build_G_munu(psi_xn, psi_yr, Gij):
-	"""Build the ISDF Green's function G_μν(k) = Σ_ij ψ*_ik(μ) G_ij(k) ψ_jk(ν).
-
-	Args:
-		psi_xn: (nk, s, μ_X, n) — bands fast, μ on X.  Conjugated internally.
-		psi_yr: (nk, n, s, μ_Y) — centroids fast, μ on Y.  Conjugated internally.
-		Gij:    (nk, n, n) — band-space Green's function / projector.
-
-	Returns:
-		G_k: (nk, s, μ_X, s, μ_Y) — ISDF Green's function, μ distributed (X, Y).
-
-	Spins are NOT contracted; the output carries both spinor indices.
-	Zero-communication contraction when μ_X and μ_Y live on different mesh axes.
-	"""
+def build_G_occ(psi_xn, psi_yr, Gij):
+	"""G_μν(k) = Σ_ij ψ*_i(μ) G_ij ψ_j(ν).  Shape: (nk, s, μ_X, s, μ_Y)."""
 	return jnp.einsum('ksxi,kij,kjty->ksxty', psi_xn, Gij, jnp.conj(psi_yr), optimize=True)
 
-def build_G_munu_ri(psi_xn, psi_yr):
-	"""Resolution-of-identity Green's function G_μν(k) = Σ_n ψ*_nk(μ) ψ_nk(ν).
-
-	Sums over ALL bands with unit weight (no occupation projector).
-	Used for the Coulomb-hole self-energy term.
-
-	Args:
-		psi_xn: (nk, s, μ_X, n) — bands fast, μ on X.
-		psi_yr: (nk, n, s, μ_Y) — centroids fast, μ on Y.
-
-	Returns:
-		G_k: (nk, s, μ_X, s, μ_Y).
-	"""
+def build_G_ri(psi_xn, psi_yr):
+	"""G_μν(k) = Σ_n ψ*_n(μ) ψ_n(ν) (all bands, unit weight).  Shape: (nk, s, μ_X, s, μ_Y)."""
 	return jnp.einsum('ksxn,knty->ksxty', psi_xn, jnp.conj(psi_yr), optimize=True)
 
-# Backward-compatibility alias (used as callback in ppm_sigma)
-get_G_mu_nu_jax = build_G_munu
-
-def get_G_R_jax(G_k, nkx, nky, nkz, sharded_ifftn=None):
-	"""(nk, s1,rmu1,s2,rmu2) -> (s1,rmu1,s2,rmu2,nkx,nky,nkz).
-
-	If sharded_ifftn is provided, uses it for the FFT (shard_map, local).
-	Otherwise falls back to bare jnp.fft (works on 1 GPU, OOMs on 16).
-	"""
-	G_k = G_k.transpose(1, 2, 3, 4, 0)
-	G_k = G_k.reshape(*G_k.shape[:4], nkx, nky, nkz)
-	G_k = jax.lax.with_sharding_constraint(G_k, P(None, 'x', None, 'y', None, None, None))
-	if sharded_ifftn is not None:
-		return sharded_ifftn(G_k)
-	return jnp.fft.ifftn(G_k, axes=(4,5,6), norm='ortho')
-
-def get_sigma_static_mu_nu_jax(G_R, V_mu_nu, nk_tot, bispinor=False,
-                               sharded_ifftn=None, sharded_fftn=None):
-	"""Compute sigma in (s1,rmu1,s2,rmu2,nkx,nky,nkz) basis via convolution.
-
-	If sharded_ifftn/sharded_fftn provided, uses them for V and sigma FFTs.
-	"""
-	V_R = V_mu_nu[None, :, None, :, :, :, :]
-	V_R = jnp.array(V_R, copy=True)
-
-	if bispinor:
-		gamma0_diag = jnp.array([1.0, 1.0, -1.0, -1.0], dtype=jnp.float64)
-		gamma0_vertex = gamma0_diag[:, None] * gamma0_diag[None, :]
-		gamma0_vertex = gamma0_vertex[:, None, :, None, None, None, None]
-		G_R = G_R * gamma0_vertex
-
-	if sharded_ifftn is not None:
-		V_R_fft = sharded_ifftn(V_R)
-	else:
-		V_R_fft = jnp.fft.ifftn(V_R, axes=(4,5,6), norm='ortho')
-
-	sigma_R = G_R * V_R_fft * (-1.0 / jnp.sqrt(nk_tot))
-	sigma_R = jax.lax.with_sharding_constraint(sigma_R, P(None, 'x', None, 'y', None, None, None))
-
-	if sharded_fftn is not None:
-		return sharded_fftn(sigma_R)
-	return jnp.fft.fftn(sigma_R, axes=(4,5,6), norm='ortho')
-
-def project_sigma_to_bands(psi_xr, psi_yn, sigma_k_munu):
-	"""Project self-energy from ISDF (s,μ) basis to band basis.
-
-	Σ_mn(k) = Σ_{s,t,μ,ν} ψ*_m(s,μ_X) Σ(s,μ_X,t,ν_Y) ψ_n(t,ν_Y)
-
-	Both spinor indices (s, t) and both centroid indices (μ, ν) are contracted.
-	The (s,μ) pairs are contiguous in memory for both psi_xr and psi_yn.
-
-	Args:
-		psi_xr: (nk, nb, s, μ_X) — centroids fast, μ on X.  Conjugated internally.
-		psi_yn: (nk, s, μ_Y, nb) — bands fast, μ on Y.
-		sigma_k_munu: (s, μ, s, μ, nkx, nky, nkz) — ISDF self-energy.
-
-	Returns:
-		sigma_kij: (nk, nb, nb) — band-space self-energy matrix.
-	"""
-	nkx, nky, nkz = sigma_k_munu.shape[-3:]
-	nk = nkx * nky * nkz
-	sigma_k = sigma_k_munu.transpose(4, 5, 6, 0, 1, 2, 3).reshape(nk, *sigma_k_munu.shape[:4])
+def project_to_bands(psi_xr, psi_yn, sigma_k):
+	"""Σ_mn(k) = Σ_{s,μ} ψ*_m(s,μ) Σ(s,μ,s,μ,k) ψ_n(s,μ).  Shape: (nk, nb, nb)."""
 	left = jnp.einsum('kmsx,ksxty->kmty', jnp.conj(psi_xr), sigma_k, optimize=True)
 	return jnp.einsum('kmty,ktyn->kmn', left, psi_yn, optimize=True)
 
+def project_to_bands_ri(psi_xr, psi_yn, sigma_k):
+	"""Like project_to_bands but returns (2, nk, nb, nb) with [Re, Im] channels."""
+	sigma_ri = jnp.stack((jnp.real(sigma_k), jnp.imag(sigma_k)), axis=0)
+	left = jnp.einsum('kmsx,cksxty->ckmty', jnp.conj(psi_xr), sigma_ri, optimize=True)
+	return jnp.einsum('ckmty,ktyn->ckmn', left, psi_yn, optimize=True).astype(jnp.complex128)
 
-
-def get_sigma_static_kij_channels_jax(psi_sigX, psi_sigTY, sigma_k_munu):
-	"""Project Re/Im sigma channels from (spinor,rmu) basis to band basis.
-
-	For a complex sigma tensor X in the centroid basis, this returns the two
-	band-space channels needed for exact window projection without storing
-	Σ_k(μ,ν,ω):
-
-	  channel 0: K[Re X]
-	  channel 1: K[Im X]
-
-	where K[.] denotes the band projection map. These two channels are
-	sufficient to reconstruct K[Re(cX)] or K[Im(cX)] for any complex scalar c.
-
-	Args:
-		psi_sigX: (nk, nb, nspinor, rmu) wavefunctions
-		psi_sigTY: (nk, nspinor, rmu, nb) transposed wavefunctions
-		sigma_k_munu: (nspinor, rmu1, nspinor, rmu2, nkx, nky, nkz) self-energy
-
-	Returns:
-		sigma_kij_ri: (2, nk, nb, nb) with channels [K[Re X], K[Im X]]
-	"""
-	nkx, nky, nkz = sigma_k_munu.shape[-3:]
-	nk = nkx * nky * nkz
-	sigma_k = sigma_k_munu.transpose(4, 5, 6, 0, 1, 2, 3).reshape(nk, *sigma_k_munu.shape[:4]) # (nk,s1,rmu1,s2,rmu2)
-	sigma_k_ri = jnp.stack(
-		(
-			jnp.real(sigma_k),
-			jnp.imag(sigma_k),
-		),
-		axis=0,
-	)
-	left = jnp.einsum('kmsx,cksxty->ckmty', jnp.conj(psi_sigX), sigma_k_ri, optimize=True)
-	return jnp.einsum('ckmty,ktyn->ckmn', left, psi_sigTY, optimize=True).astype(jnp.complex128)
-
-# ================= Hartree =================
-
-def build_density_from_Gij(psi_yr, Gij, nk_tot):
-	"""Charge density at centroids: ρ_μ = (1/Nk) Σ_{k,ij,s} G_ij ψ*_i(s,μ) ψ_j(s,μ).
-
-	Spinor index is contracted (spin-traced).  Uses psi_yr because μ
-	appears twice — the contraction is local on Y.
-
-	Args:
-		psi_yr: (nk, n, s, μ_Y) — centroids fast, μ on Y.
-		Gij:    (nk, n, n) — Green's function / occupation projector.
-		nk_tot: total k-points for BZ averaging.
-
-	Returns:
-		rho_mu: (μ,) charge density at centroid positions.
-	"""
+def build_hartree(psi_yr, psi_xr, Gij, V0, nk_tot):
+	"""V_H(m,n,k) from density ρ_μ = (1/Nk) Tr[G · ψ*ψ] and bare Coulomb V₀."""
 	psi_ij = jnp.einsum('kisx,kjsx->kijx', jnp.conj(psi_yr), psi_yr, optimize=True)
-	rho_mu = jnp.einsum('kij,kijx->x', Gij, psi_ij, optimize=True)
-	rho_mu = jnp.real(rho_mu) / jnp.asarray(nk_tot, dtype=jnp.float64)
-	return rho_mu
+	rho = jnp.real(jnp.einsum('kij,kijx->x', Gij, psi_ij, optimize=True))
+	rho = rho / jnp.asarray(nk_tot, dtype=jnp.float64)
+	Vrho = jnp.einsum('xy,y->x', V0, rho, optimize=True)
+	return jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_xr), Vrho, psi_xr, optimize=True)
 
-def build_hartree_potential(rho_mu, V0_munu):
-	"""Hartree potential at centroids: [Vρ]_μ = Σ_ν V0(μ,ν) ρ_ν."""
-	return jnp.einsum('xy,y->x', V0_munu, rho_mu, optimize=True)
-
-def project_potential_to_bands(psi_xr, Vrho_mu):
-	"""Project local potential to bands: ⟨m|V|n⟩ = Σ_{s,μ} ψ*_m(s,μ) V(μ) ψ_n(s,μ).
-
-	Uses psi_xr (centroids fast, μ on X) — same copy as Σ projection LHS.
-
-	Args:
-		psi_xr: (nk, n, s, μ_X) — centroids fast, μ on X.
-		Vrho_mu: (μ,) potential at centroids.
-
-	Returns:
-		V_kmn: (nk, nb, nb) potential matrix elements.
-	"""
-	return jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_xr), Vrho_mu, psi_xr, optimize=True)
+# Backward-compat alias (used as callback in ppm_sigma)
+get_sigma_static_kij_channels_jax = project_to_bands_ri
 
 def print_scf_diagnostics(Gij_final, U_full, nelec, nb_sigma, print_fn=print):
 	"""Print diagnostic checks for SC-COHSEX convergence (Gij, U unitarity)."""
@@ -616,26 +481,22 @@ def print_scf_diagnostics(Gij_final, U_full, nelec, nb_sigma, print_fn=print):
 	print_fn(f"[Diagnostic] Lowest QP state: their |U| values = {np.array(U_col0_abs[top_contrib])}")
 
 
-def _build_interaction_tensors(V_qmunu, W_q, meta, mesh_xy, sh, wfn):
-	"""Extract V_μν (5D), W_μν (5D), and static Gij occupation projector."""
-	V_mu_nu = jnp.asarray(V_qmunu)[0, 0, 0].transpose(3, 4, 0, 1, 2)
-	with mesh_xy:
-		V_mu_nu = jax.lax.with_sharding_constraint(V_mu_nu, sh.V_shard)
+def _extract_flat_k(V_qmunu, W_q, meta, mesh_xy, wfn):
+	"""Extract V(nk,μ,μ), W(nk,μ,μ) with flat k-index, and Gij occupation projector."""
+	# V_qmunu has shape (1, 1, 1, nkx, nky, nkz, μ, μ) from ISDF; strip polarization dims.
+	V_flat = jnp.asarray(V_qmunu)[0, 0, 0].reshape(-1, V_qmunu.shape[-2], V_qmunu.shape[-1])
 	if W_q is not None:
-		W_mu_nu = W_q[:,:,:,0,:,0,:].transpose(3, 4, 0, 1, 2)
-		with mesh_xy:
-			W_mu_nu = jax.lax.with_sharding_constraint(W_mu_nu, sh.V_shard)
+		W_flat = W_q[:,:,:,0,:,0,:].reshape(-1, W_q.shape[4], W_q.shape[6])
 	else:
-		W_mu_nu = V_mu_nu
+		W_flat = V_flat
+	# Gij = diag(1,...,1,0,...,0) — occupation projector
 	b0, _, _, b3, _ = meta.band_edges
-	nb_sigma = int(b3 - b0)
-	nk = int(meta.nk_tot)
-	nelec = int(wfn.nelec)
+	nb_sigma, nk, nelec = int(b3 - b0), int(meta.nk_tot), int(wfn.nelec)
 	Gij = jnp.zeros((nk, nb_sigma, nb_sigma), dtype=jnp.complex128)
-	occ_diag = jnp.arange(min(nelec, nb_sigma))
-	Gij = Gij.at[:, occ_diag, occ_diag].set(1.0 + 0.0j)
+	Gij = Gij.at[:, :min(nelec, nb_sigma), :min(nelec, nb_sigma)].set(
+		jnp.eye(min(nelec, nb_sigma), dtype=jnp.complex128))
 	Gij = jax.device_put(Gij, NamedSharding(mesh_xy, P(None, None, None)))
-	return V_mu_nu, W_mu_nu, Gij
+	return V_flat, W_flat, Gij
 
 
 def _compute_static_head(params, input_dir, wfn, sym, meta, do_screened, print0):
@@ -735,7 +596,7 @@ def main(argv=None):
 	
 	# Load centroids
 	_t_cent = _boot_time.perf_counter()
-	centroids_frac, centroid_indices, _n_rmu = load_centroids(params["centroids_file"], wfn.fft_grid)
+	_, centroid_indices, _n_rmu = load_centroids(params["centroids_file"], wfn.fft_grid)
 	_print0(f"  [TIMING-BOOT] load_centroids: {_boot_time.perf_counter() - _t_cent:.3f}s")
 	# Resolve tmp_dir and output path relative to input file directory
 	tmp_dir = os.path.join(input_dir, "tmp")
@@ -816,8 +677,8 @@ def main(argv=None):
 					)
 
 	# Extract interaction tensors and build occupation projector
-	V_mu_nu, W_mu_nu, Gij_static = _build_interaction_tensors(
-		V_qmunu, W_q if do_screened else None, meta, mesh_xy, sh, wfn)
+	V_flat, W_flat, Gij_static = _extract_flat_k(
+		V_qmunu, W_q if do_screened else None, meta, mesh_xy, wfn)
 
 	# q→0 head correction (exact band-diagonal terms for static COHSEX)
 	static_head_terms = None
@@ -827,96 +688,90 @@ def main(argv=None):
 
 	nb_sigma = int(b3 - b0)
 	nelec = int(wfn.nelec)
-	Gij_shard = NamedSharding(mesh_xy, P(None, None, None))
-
-	# Device-local FFT helpers for the replicated k-grid axes.
-	from common.fft_helpers import (
-		make_jittable_local_fftn_3d,
-		make_jittable_local_ifftn_3d,
-	)
-	_G_spec = P(None, 'x', None, 'y', None, None, None)
-	_local_ifftn_G = make_jittable_local_ifftn_3d(mesh_xy, _G_spec, _G_spec, norm='ortho', axes=(4, 5, 6))
-	_local_fftn_G = make_jittable_local_fftn_3d(mesh_xy, _G_spec, _G_spec, norm='ortho', axes=(4, 5, 6))
-
-	# NamedSharding objects for sigma (matching chi0 pattern — bare P() may
-	# not resolve correctly on multi-node without explicit mesh reference)
-	_G_7d_shard = NamedSharding(mesh_xy, P(None, 'x', None, 'y', None, None, None))
-
-	# Compile-time constants for JIT closures.
-	_nkx, _nky, _nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
+	kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
 	_nk_tot = int(meta.nk_tot)
-	_inv_sqrt_nk = -1.0 / jnp.sqrt(_nk_tot)
+
+	# FFT helpers: flat-k ↔ real-space lattice.  Only place 3D k-grid appears.
+	from common.fft_helpers import make_jittable_local_fftn_3d, make_jittable_local_ifftn_3d
+	_7d_spec = P(None, 'x', None, 'y', None, None, None)
+	_7d_shard = NamedSharding(mesh_xy, _7d_spec)
+	_ifftn = make_jittable_local_ifftn_3d(mesh_xy, _7d_spec, _7d_spec, norm='ortho', axes=(4, 5, 6))
+	_fftn = make_jittable_local_fftn_3d(mesh_xy, _7d_spec, _7d_spec, norm='ortho', axes=(4, 5, 6))
 
 	@jax.jit
-	def _G_k_to_R(G_k):
-		"""G(nk,s,μ,s,μ) → IFFT → G(s,μ,s,μ,Rx,Ry,Rz)."""
-		G_7d = G_k.transpose(1,2,3,4,0).reshape(
-			G_k.shape[1], G_k.shape[2], G_k.shape[3], G_k.shape[4], _nkx, _nky, _nkz)
-		G_7d = jax.lax.with_sharding_constraint(G_7d, _G_7d_shard)
-		return _local_ifftn_G(G_7d)
+	def _to_R(x_k):
+		"""Flat-k (nk, a, b, c, d) → 7D (a, b, c, d, kx, ky, kz) → IFFT → R-space."""
+		x_7d = x_k.transpose(1, 2, 3, 4, 0).reshape(
+			x_k.shape[1], x_k.shape[2], x_k.shape[3], x_k.shape[4], *kgrid)
+		return _ifftn(jax.lax.with_sharding_constraint(x_7d, _7d_shard))
 
 	@jax.jit
-	def _convolve_sigma(G_R, W_5d):
-		"""Σ(k) = FFT[ G(R) · IFFT[W](R) / √Nk ]."""
-		V_R = _local_ifftn_G(W_5d[None, :, None, :, :, :, :])
-		sigma_R = G_R * V_R * _inv_sqrt_nk
-		sigma_R = jax.lax.with_sharding_constraint(sigma_R, _G_7d_shard)
-		return _local_fftn_G(sigma_R)
+	def _to_k(x_R):
+		"""R-space (a, b, c, d, Rx, Ry, Rz) → FFT → reshape to flat-k (nk, a, b, c, d)."""
+		x_7d = _fftn(jax.lax.with_sharding_constraint(x_R, _7d_shard))
+		nk = x_7d.shape[4] * x_7d.shape[5] * x_7d.shape[6]
+		return x_7d.reshape(*x_7d.shape[:4], nk).transpose(4, 0, 1, 2, 3)
+
+	@jax.jit
+	def _convolve(G_k, V_k, prefactor):
+		"""Σ(k) = prefactor · FFT[ G(R) · IFFT[V](R) / √Nk ].  All flat-k."""
+		G_R = _to_R(G_k)
+		V_R = _ifftn(V_k[None, :, None, :, :, :, :])
+		sigma_R = G_R * V_R * (-1.0 / jnp.sqrt(_nk_tot))
+		return prefactor * _to_k(sigma_R)
+
+	@jax.jit
+	def _V_to_7d(V_flat):
+		"""V(nk, μ, μ) → (μ, μ, kx, ky, kz) for FFT."""
+		return V_flat.transpose(1, 2, 0).reshape(V_flat.shape[1], V_flat.shape[2], *kgrid)
+
+	# ---- Static COHSEX sigma ----
+	# Σ_SX(k) = -1  · ⟨m| FFT[G_occ(R) · W(R)/√Nk] |n⟩     (screened exchange)
+	# Σ_COH(k) = -½ · ⟨m| FFT[G_RI(R) · (W-V)(R)/√Nk] |n⟩   (Coulomb hole)
+	# V_H(m,n,k) = ⟨m| V₀·ρ |n⟩                               (Hartree)
 
 	@jax.jit
 	def compute_sigma_sx(wfns, Gij, W):
-		"""Screened exchange: Σ_SX = -G·W projected to bands."""
 		s = wfns.slices
-		G_R = _G_k_to_R(build_G_munu(wfns.xn(s.sigma), wfns.yr(s.sigma), Gij))
-		sigma_k = _convolve_sigma(G_R, W)
-		return project_sigma_to_bands(wfns.xr(s.sigma), wfns.yn(s.sigma), sigma_k)
+		G_k = build_G_occ(wfns.xn(s.sigma), wfns.yr(s.sigma), Gij)
+		sigma_k = _convolve(G_k, _V_to_7d(W), 1.0)
+		return project_to_bands(wfns.xr(s.sigma), wfns.yn(s.sigma), sigma_k)
 
 	@jax.jit
 	def compute_sigma_coh(wfns, W, V):
-		"""Coulomb hole: Σ_COH = -½ G_RI · (W-V) projected to bands."""
 		s = wfns.slices
-		G_RI_R = _G_k_to_R(build_G_munu_ri(wfns.xn(s.full), wfns.yr(s.full)))
-		sigma_k = _convolve_sigma(G_RI_R, W - V)
-		return -0.5 * project_sigma_to_bands(wfns.xr(s.sigma), wfns.yn(s.sigma), sigma_k)
+		G_k = build_G_ri(wfns.xn(s.full), wfns.yr(s.full))
+		sigma_k = _convolve(G_k, _V_to_7d(W) - _V_to_7d(V), -0.5)
+		return project_to_bands(wfns.xr(s.sigma), wfns.yn(s.sigma), sigma_k)
 
 	@jax.jit
 	def compute_hartree(wfns, Gij, V0):
-		"""Hartree: V_H = V₀ · ρ projected to bands."""
 		s = wfns.slices
-		rho = build_density_from_Gij(wfns.yr(s.sigma), Gij, _nk_tot)
-		return project_potential_to_bands(wfns.xr(s.sigma), build_hartree_potential(rho, V0))
+		return build_hartree(wfns.yr(s.sigma), wfns.xr(s.sigma), Gij, V0, _nk_tot)
 
 	def compute_static_sigma(wfns, W, V, V0, Gij):
-		"""Full static COHSEX: Σ_SX + Σ_COH + V_H."""
 		import gc; gc.collect()
 		return (compute_sigma_sx(wfns, Gij, W),
 				compute_sigma_coh(wfns, W, V),
 				compute_hartree(wfns, Gij, V0))
 
-	def _apply_static_head_terms(sigma_sx_kij, sigma_coh_kij):
+	def _apply_head(sigma_sx, sigma_coh):
 		if static_head_terms is None:
-			return sigma_sx_kij, sigma_coh_kij
-		sx_head, coh_head = static_head_terms_to_kij(
-			static_head_terms,
-			nk_tot=meta.nk_tot,
-			do_screened=do_screened,
-		)
+			return sigma_sx, sigma_coh
+		sx_h, coh_h = static_head_terms_to_kij(
+			static_head_terms, nk_tot=meta.nk_tot, do_screened=do_screened)
 		if not do_screened:
-			coh_head = jnp.zeros_like(coh_head)
-		sx_head = jax.device_put(sx_head, Gij_shard)
-		coh_head = jax.device_put(coh_head, Gij_shard)
-		return sigma_sx_kij + sx_head, sigma_coh_kij + coh_head
+			coh_h = jnp.zeros_like(coh_h)
+		rep = NamedSharding(mesh_xy, P(None, None, None))
+		return sigma_sx + jax.device_put(sx_h, rep), sigma_coh + jax.device_put(coh_h, rep)
 
-	fft_vol_au = float(wfn.cell_volume / np.prod(wfn.fft_grid))
-
+	# ---- Execute static COHSEX ----
 	with mesh_xy:
 		with timing.section("gw_jax.pipeline"):
 			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = \
-				compute_static_sigma(wfns, W_mu_nu, V_mu_nu, v_q0_noG0_munu, Gij_static)
-			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax = _apply_static_head_terms(
-				sigma_sx_kbar_ij_jax,
-				sigma_coh_kbar_ij_jax,
-			)
+				compute_static_sigma(wfns, W_flat, V_flat, v_q0_noG0_munu, Gij_static)
+			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax = _apply_head(
+				sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax)
 			sigma_sx_kbar_ij_jax.block_until_ready()
 			sigma_coh_kbar_ij_jax.block_until_ready()
 			hartree_kbar_ij_jax.block_until_ready()
@@ -1000,7 +855,7 @@ def main(argv=None):
 
 			def _build_sigma_x_bare_kij():
 				with mesh_xy:
-					result = compute_sigma_sx(wfns, Gij_static, V_mu_nu)
+					result = compute_sigma_sx(wfns, Gij_static, V_flat)
 				result.block_until_ready()
 				return result
 
@@ -1031,22 +886,12 @@ def main(argv=None):
 				fermi_reference=opts.fermi_reference,
 				debug_quadrature=opts.sigma_debug_quadrature,
 				debug_quadrature_samples=opts.sigma_debug_quadrature_samples,
-				get_G_mu_nu_fn=get_G_mu_nu_jax,
-				get_G_R_fn=lambda G_k, nkx, nky, nkz: get_G_R_jax(
-					G_k,
-					nkx,
-					nky,
-					nkz,
-					sharded_ifftn=_local_ifftn_G,
-				),
-				get_sigma_mu_nu_fn=lambda G_R, V, nk, bisp=False: get_sigma_static_mu_nu_jax(
-					G_R,
-					V,
-					nk,
-					bisp,
-					sharded_ifftn=_local_ifftn_G,
-					sharded_fftn=_local_fftn_G,
-				),
+				get_G_mu_nu_fn=build_G_occ,
+				get_G_R_fn=lambda G_k, nkx, nky, nkz: _ifftn(
+					G_k.transpose(1,2,3,4,0).reshape(
+						G_k.shape[1], G_k.shape[2], G_k.shape[3], G_k.shape[4], nkx, nky, nkz)),
+				get_sigma_mu_nu_fn=lambda G_R, V, nk, bisp=False: _fftn(
+					G_R * _ifftn(V[None, :, None, :, :, :, :]) * (-1.0 / jnp.sqrt(nk))),
 				get_sigma_kij_channels_fn=get_sigma_static_kij_channels_jax,
 				print0=print0,
 			)
@@ -1482,7 +1327,7 @@ def main(argv=None):
 			# Compute new Σ using original wavefunctions but updated G_ij
 			with mesh_xy:
 				sigma_sx_new, sigma_coh_new, hartree_new = \
-					compute_static_sigma(wfns, W_mu_nu, V_mu_nu, v_q0_noG0_munu, Gij_new)
+					compute_static_sigma(wfns, W_flat, V_flat, v_q0_noG0_munu, Gij_new)
 			sigma_sx_new, sigma_coh_new = _apply_static_head_terms(sigma_sx_new, sigma_coh_new)
 			
 			# Combine and extract upper triangle
@@ -1523,7 +1368,7 @@ def main(argv=None):
 
 		with mesh_xy:
 			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = \
-				compute_static_sigma(wfns, W_mu_nu, V_mu_nu, v_q0_noG0_munu, Gij_final)
+				compute_static_sigma(wfns, W_flat, V_flat, v_q0_noG0_munu, Gij_final)
 		sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax = _apply_static_head_terms(
 			sigma_sx_kbar_ij_jax,
 			sigma_coh_kbar_ij_jax,
