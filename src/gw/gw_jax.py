@@ -157,74 +157,6 @@ def make_shardings(mesh_xy: Mesh) -> SimpleNamespace:
 		out_shard = NamedSharding(mesh_xy, P(None, None, None)),
 	)
 
-def write_w_copies_debug_h5(
-	path,
-	*,
-	W0_screen_q=None,
-	W0_ppm_q=None,
-	Wiwp_ppm_q=None,
-	print_fn=print,
-):
-	"""Write q=0 ISDF W copies and emit compact norm/difference diagnostics."""
-	def _q000_munu(W_q):
-		if W_q is None:
-			return None
-		# Use process_allgather for multi-process compatibility
-		slc = W_q[0, 0, 0, 0, :, 0, :]
-		slc = jax.experimental.multihost_utils.process_allgather(slc, tiled=False)
-		return np.asarray(slc, dtype=np.complex128)
-
-	W0_screen = _q000_munu(W0_screen_q)
-	W0_ppm = _q000_munu(W0_ppm_q)
-	Wiwp_ppm = _q000_munu(Wiwp_ppm_q)
-
-	def _fnorm(x):
-		return float(np.linalg.norm(x, ord="fro")) if x is not None else None
-
-	norm_screen = _fnorm(W0_screen)
-	norm_ppm0 = _fnorm(W0_ppm)
-	norm_ppmi = _fnorm(Wiwp_ppm)
-
-	diff_abs = None
-	diff_rel = None
-	if (W0_screen is not None) and (W0_ppm is not None):
-		diff_abs = float(np.max(np.abs(W0_screen - W0_ppm)))
-		ref = max(float(np.max(np.abs(W0_screen))), 1.0e-16)
-		diff_rel = diff_abs / ref
-
-	os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-	with h5py.File(path, "w") as h5:
-		if W0_screen is not None:
-			h5.create_dataset("W0_screen_q000_munu", data=W0_screen)
-		if W0_ppm is not None:
-			h5.create_dataset("W0_ppm_q000_munu", data=W0_ppm)
-		if Wiwp_ppm is not None:
-			h5.create_dataset("Wiwp_ppm_q000_munu", data=Wiwp_ppm)
-		if norm_screen is not None:
-			h5.attrs["fro_W0_screen_q000"] = norm_screen
-		if norm_ppm0 is not None:
-			h5.attrs["fro_W0_ppm_q000"] = norm_ppm0
-		if norm_ppmi is not None:
-			h5.attrs["fro_Wiwp_ppm_q000"] = norm_ppmi
-		if diff_abs is not None:
-			h5.attrs["maxabs_W0_screen_minus_ppm_q000"] = diff_abs
-		if diff_rel is not None:
-			h5.attrs["rel_W0_screen_minus_ppm_q000"] = diff_rel
-
-	print_fn(f"  W-copy debug h5:        {path}")
-	if norm_screen is not None:
-		print_fn(f"    ||W0(screen,q=0)||_F = {norm_screen:.10e}")
-	if norm_ppm0 is not None:
-		print_fn(f"    ||W0(ppm,q=0)||_F    = {norm_ppm0:.10e}")
-	if norm_ppmi is not None:
-		print_fn(f"    ||W(iωp,ppm,q=0)||_F = {norm_ppmi:.10e}")
-	if diff_abs is not None:
-		print_fn(
-			f"    max|W0(screen)-W0(ppm)| = {diff_abs:.6e} "
-			f"(rel={diff_rel:.6e})"
-		)
-
-
 def fit_zeta_and_compute_V_q_chunked(
 	wfn,
 	sym,
@@ -1028,7 +960,6 @@ def main(argv=None):
 
 	sigma_omega_h5_path = None
 	sigma_munu_stream_path = None
-	omega_grid_ev = None
 	sigma_c_at_dft_ev = None
 	sigma_xc_at_dft_ev = None
 	sigma_c_plus_at_dft_ev = None
@@ -1048,72 +979,23 @@ def main(argv=None):
 		sigma_coh_static_ref = sigma_coh_kbar_ij_jax
 		minimax_config = minimax_config_from_params(params)
 		sigma_quadrature = sigma_quadrature_config_from_params(params)
-		ppm_options = build_ppm_sigma_runtime_options(params, input_dir=input_dir, ryd2ev=ryd2ev)
-		omega_p_ry = ppm_options.omega_p_ry
-		ppm_fallback = ppm_options.ppm_fallback
-		omega_grid_ev = ppm_options.omega_grid_ev
-		omega_grid_ry = ppm_options.omega_grid_ry
-		sigma_regularization_ry = ppm_options.sigma_regularization_ry
-		sigma_edge_factor = ppm_options.sigma_edge_factor
-		sigma_omega_batch_size = ppm_options.sigma_omega_batch_size
-		sigma_omega_accumulation = ppm_options.sigma_omega_accumulation
-		ppm_sigma_scale = ppm_options.ppm_sigma_scale
-		ppm_sigma_flip_neg = ppm_options.ppm_sigma_flip_neg
-		ppm_invalid_mode = ppm_options.ppm_invalid_mode
-		sigma_debug_split_contrib = ppm_options.sigma_debug_split_contrib
-		sigma_freq_debug_output = ppm_options.sigma_freq_debug_output
-		fermi_reference = ppm_options.fermi_reference
-		sigma_at_dft_extrapolate = ppm_options.sigma_at_dft_extrapolate
-		sigma_at_dft_energies = ppm_options.sigma_at_dft_energies
-		ppm_sigma_debug_static_norm = ppm_options.ppm_sigma_debug_static_norm
-		ppm_static_cohsex_check = ppm_options.ppm_static_cohsex_check
-		sigma_debug_quadrature = ppm_options.sigma_debug_quadrature
-		sigma_debug_quadrature_samples = ppm_options.sigma_debug_quadrature_samples
-		sigma_munu_h5_path = ppm_options.sigma_munu_h5_path
-		sigma_kij_h5_path = ppm_options.sigma_kij_h5_path
-		write_w_copies_debug = ppm_options.write_w_copies_debug
-		w_copies_debug_file = ppm_options.w_copies_debug_file
-		sigma_freq_debug_file = ppm_options.sigma_freq_debug_file
-		if sigma_freq_debug_output and (not sigma_debug_split_contrib):
-			sigma_debug_split_contrib = True
+		opts = build_ppm_sigma_runtime_options(params, input_dir=input_dir, ryd2ev=ryd2ev)
+		if opts.sigma_freq_debug_output and (not opts.sigma_debug_split_contrib):
+			opts.sigma_debug_split_contrib = True
 			print0("  NOTE: enabling sigma_debug_split_contrib for sigma_freq_debug_output")
-		if sigma_freq_debug_output and sigma_omega_accumulation == "kij_stream":
-			sigma_omega_accumulation = "kij"
+		if opts.sigma_freq_debug_output and opts.sigma_omega_accumulation == "kij_stream":
+			opts.sigma_omega_accumulation = "kij"
 			print0("  NOTE: forcing sigma_omega_accumulation='kij' for sigma_freq_debug_output")
 		print0("")
 		print0("-" * 72)
 		print0("  GN-PPM + FREQUENCY-INTEGRATED SIGMA")
 		print0("-" * 72)
-		if abs(ppm_sigma_scale - 1.0) > 1.0e-12:
-			print0(f"  NOTE: applying GN-PPM Σ^c scale factor = {ppm_sigma_scale:.6g}")
-		if ppm_invalid_mode != "static_limit":
-			print0(f"  NOTE: GN invalid-mode policy = {ppm_invalid_mode}")
-		if fermi_reference not in ("vbm", "midgap"):
+		if opts.ppm_invalid_mode != "static_limit":
+			print0(f"  NOTE: GN invalid-mode policy = {opts.ppm_invalid_mode}")
+		if opts.fermi_reference not in ("vbm", "midgap"):
 			raise ValueError("fermi_reference must be 'vbm' or 'midgap'.")
-		if fermi_reference == "midgap":
+		if opts.fermi_reference == "midgap":
 			print0("  NOTE: using midgap reference for Σ^c windowing")
-		if ppm_sigma_flip_neg:
-			print0("  NOTE: debug: flipping sign of ω<E_F Σ^c branch")
-		if do_G0:
-			try:
-				head_0 = resolve_head_sample(
-					params, input_dir, wfn, sym, meta, print0, omega=0.0 + 0.0j
-				)
-				head_i = resolve_head_sample(
-					params, input_dir, wfn, sym, meta, print0, omega=1j * float(omega_p_ry)
-				)
-				epsh0 = head_0.wcoul0 / head_0.vc0 if abs(head_0.vc0) > 1.0e-16 else complex(np.nan, np.nan)
-				epshi = head_i.wcoul0 / head_i.vc0 if abs(head_i.vc0) > 1.0e-16 else complex(np.nan, np.nan)
-				print0(
-					f"  epsinv head (ω=0):      {epsh0.real: .6f}{epsh0.imag:+.6e}i"
-					f"  [source={head_0.source}]"
-				)
-				print0(
-					f"  epsinv head (ω=iωp):    {epshi.real: .6f}{epshi.imag:+.6e}i"
-					f"  [ωp={omega_p_ry:.6f} Ry, source={head_i.source}]"
-				)
-			except Exception as exc:
-				print0(f"  epsinv head diagnostics unavailable: {exc}")
 		with timing.section("gw_jax.ppm_sigma"):
 			import time as _ppm_time
 			_ppm_t0 = _ppm_time.perf_counter()
@@ -1125,12 +1007,12 @@ def main(argv=None):
 					params, input_dir, wfn, sym, meta, print0, omega=0.0 + 0.0j
 				)
 				head_i = resolve_head_sample(
-					params, input_dir, wfn, sym, meta, print0, omega=1j * float(omega_p_ry)
+					params, input_dir, wfn, sym, meta, print0, omega=1j * float(opts.omega_p_ry)
 				)
 				head_gn = fit_head_gn_from_samples(
 					head_0,
 					head_i,
-					omega_p_ry=omega_p_ry,
+					omega_p_ry=opts.omega_p_ry,
 				)
 				print0(format_head_pair_diagnostics(head_0, head_i))
 				print0(format_head_diagnostics(head_gn, float(wfn.cell_volume)))
@@ -1142,26 +1024,16 @@ def main(argv=None):
 				meta,
 				mesh_xy,
 				minimax_config=minimax_config,
-				omega_p_ry=omega_p_ry,
+				omega_p_ry=opts.omega_p_ry,
 				minimax_energy_reference=(
 					minimax_config.energy_reference
-					if minimax_config.energy_reference is not None else fermi_reference
+					if minimax_config.energy_reference is not None else opts.fermi_reference
 				),
-				fallback_omega=ppm_fallback,
+				fallback_omega=opts.ppm_fallback,
 				print0=print0,
 			)
 			_ppm_t1 = _ppm_time.perf_counter()
 			print0(f"  [TIMING] PPM build: {_ppm_t1 - _ppm_t0:.1f}s")
-			if meta.rank == 0 and write_w_copies_debug and w_copies_debug_file:
-				write_w_copies_debug_h5(
-					w_copies_debug_file,
-					W0_screen_q=W_q,
-					W0_ppm_q=ppm.W0_q,
-					Wiwp_ppm_q=ppm.Wiwp_q,
-					print_fn=print0,
-				)
-			_ppm_t2 = _ppm_time.perf_counter()
-			print0(f"  [TIMING] W-debug write: {_ppm_t2 - _ppm_t1:.1f}s")
 
 			def _build_sigma_x_bare_kij():
 				with mesh_xy:
@@ -1184,24 +1056,22 @@ def main(argv=None):
 				Omega_mu_nu=ppm.Omega_mu_nu,
 				Wc0_mu_nu=ppm.Wc0_mu_nu,
 				valid_mask_mu_nu=ppm.valid_mask_mu_nu,
-				omega_values_ry=omega_grid_ry,
+				omega_values_ry=opts.omega_grid_ry,
 				meta=meta,
 				bispinor=bispinor,
 				mesh_xy=mesh_xy,
 				quadrature_config=sigma_quadrature,
-				regularization_width_ry=sigma_regularization_ry,
-				edge_factor=sigma_edge_factor,
-				omega_batch_size=sigma_omega_batch_size,
-				omega_accumulation=sigma_omega_accumulation,
-				sigma_munu_h5_path=sigma_munu_h5_path or None,
-				sigma_kij_h5_path=sigma_kij_h5_path or None,
-				sigma_scale=ppm_sigma_scale,
-				sigma_flip_neg=ppm_sigma_flip_neg,
-				invalid_mode=ppm_invalid_mode,
-				debug_split_contrib=sigma_debug_split_contrib,
-				fermi_reference=fermi_reference,
-				debug_quadrature=sigma_debug_quadrature,
-				debug_quadrature_samples=sigma_debug_quadrature_samples,
+				regularization_width_ry=opts.sigma_regularization_ry,
+				edge_factor=opts.sigma_edge_factor,
+				omega_batch_size=opts.sigma_omega_batch_size,
+				omega_accumulation=opts.sigma_omega_accumulation,
+				sigma_munu_h5_path=opts.sigma_munu_h5_path or None,
+				sigma_kij_h5_path=opts.sigma_kij_h5_path or None,
+				invalid_mode=opts.ppm_invalid_mode,
+				debug_split_contrib=opts.sigma_debug_split_contrib,
+				fermi_reference=opts.fermi_reference,
+				debug_quadrature=opts.sigma_debug_quadrature,
+				debug_quadrature_samples=opts.sigma_debug_quadrature_samples,
 				get_G_mu_nu_fn=get_G_mu_nu_jax,
 				get_G_R_fn=lambda G_k, nkx, nky, nkz: get_G_R_jax(
 					G_k,
@@ -1219,13 +1089,12 @@ def main(argv=None):
 					sharded_fftn=_local_fftn_G,
 				),
 				get_sigma_kij_channels_fn=get_sigma_static_kij_channels_jax,
-				ppm_static_cohsex_check=ppm_static_cohsex_check,
 				print0=print0,
 			)
-			_ppm_t3 = _ppm_time.perf_counter()
-			print0(f"  [TIMING] compute_sigma_c_ppm_omega_grid: {_ppm_t3 - _ppm_t2:.1f}s")
+			_ppm_t2 = _ppm_time.perf_counter()
+			print0(f"  [TIMING] compute_sigma_c_ppm_omega_grid: {_ppm_t2 - _ppm_t1:.1f}s")
 			sigma_coh_ppm_omega_kij = sigma_omega.sigma_c_kij
-			iw0 = 0 if ppm_static_cohsex_check else int(np.argmin(np.abs(omega_grid_ry)))
+			iw0 = int(np.argmin(np.abs(opts.omega_grid_ry)))
 			if sigma_coh_ppm_omega_kij is None:
 				if not sigma_omega.sigma_kij_h5_path:
 					raise RuntimeError("PPM Sigma stream requested but no sigma_kij_h5_path provided.")
@@ -1237,73 +1106,6 @@ def main(argv=None):
 				sigma_coh_ppm_kij.block_until_ready()
 
 			sigma_x_bare_kij = _build_sigma_x_bare_kij()
-
-			if ppm_static_cohsex_check:
-				# With E=0 and omega=0, the PPM pipeline should give Sigma_cor = SX-X + COH,
-				# NOT just COH. Sigma^c = Sigma_xc - Sigma_X = (SX + COH) - X = (SX-X) + COH.
-				ryd2ev_local = 13.605693122994
-				ppm_diag = np.real(np.diagonal(np.asarray(sigma_coh_ppm_kij), axis1=1, axis2=2)) * ryd2ev_local
-				sx_diag = np.real(np.diagonal(np.asarray(sigma_sx_kbar_ij_jax), axis1=1, axis2=2)) * ryd2ev_local
-				coh_diag = np.real(np.diagonal(np.asarray(sigma_coh_kbar_ij_jax), axis1=1, axis2=2)) * ryd2ev_local
-				x_diag = np.real(np.diagonal(np.asarray(sigma_x_bare_kij), axis1=1, axis2=2)) * ryd2ev_local
-				ref_cor_diag = (sx_diag - x_diag) + coh_diag
-				diff_diag = ppm_diag - ref_cor_diag
-				print0("  *** PPM STATIC COHSEX CHECK RESULTS (diagonal, eV) ***")
-				print0(f"  max|PPM - Cor|    = {np.max(np.abs(diff_diag)):.6e} eV")
-				print0(f"  mean|PPM - Cor|   = {np.mean(np.abs(diff_diag)):.6e} eV")
-				nb_show = min(6, ppm_diag.shape[1])
-				for ik in range(min(4, ppm_diag.shape[0])):
-					n_occ_show = int(
-						max(
-							0,
-							min(int(wfn.nelec) - int(params.get("band_index_min", 0)), ppm_diag.shape[1]),
-						)
-					)
-					i_start = max(0, n_occ_show - nb_show // 2)
-					i_end = min(ppm_diag.shape[1], i_start + nb_show)
-					for ib in range(i_start, i_end):
-						p = ppm_diag[ik, ib]
-						r = ref_cor_diag[ik, ib]
-						print0(f"    k={ik} n={ib}: PPM={p:10.4f}  Cor={r:10.4f}  diff={p-r:10.4f}")
-
-			if ppm_sigma_debug_static_norm:
-				# Static-COH normalization check using W^c(0) from PPM: W^c(0) = -2 B / Omega.
-				with mesh_xy:
-					Wc0_mu_nu = jnp.where(
-						ppm.Omega_mu_nu != 0.0,
-						(-2.0 * ppm.B_mu_nu) / ppm.Omega_mu_nu,
-						jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
-					)
-					Wc0_mu_nu = jax.lax.with_sharding_constraint(Wc0_mu_nu, sh.V_shard)
-					sigma_coh_ppm_w0_kij = _coh_branch_jit(
-						wfns.xn(s.full), wfns.yr(s.full),
-						wfns.xr(s.sigma), wfns.yn(s.sigma),
-						Wc0_mu_nu + V_mu_nu_for_coh, V_mu_nu_for_coh,
-					)
-				sigma_coh_ppm_w0_kij.block_until_ready()
-				diff_w0_abs = float(jnp.max(jnp.abs(sigma_coh_ppm_w0_kij - sigma_coh_kbar_ij_jax)))
-				ref_w0 = max(float(jnp.max(jnp.abs(sigma_coh_kbar_ij_jax))), 1.0e-16)
-				diff_dyn_abs = float(jnp.max(jnp.abs(sigma_coh_ppm_kij - sigma_coh_ppm_w0_kij)))
-				ref_dyn = max(float(jnp.max(jnp.abs(sigma_coh_ppm_w0_kij))), 1.0e-16)
-				print0(
-					f"  PPM static-COH check (Wc0): abs={diff_w0_abs:.6e}, rel={diff_w0_abs / ref_w0:.6e}"
-				)
-				print0(
-					f"  PPM dynamic vs Wc0 COH: abs={diff_dyn_abs:.6e}, rel={diff_dyn_abs / ref_dyn:.6e}"
-				)
-				w0_diag = np.real(np.diagonal(np.array(sigma_coh_ppm_w0_kij), axis1=1, axis2=2))
-				dyn_diag = np.real(np.diagonal(np.array(sigma_coh_ppm_kij), axis1=1, axis2=2))
-				mask = np.abs(w0_diag) > 1.0e-8
-				if np.any(mask):
-					ratio = dyn_diag[mask] / w0_diag[mask]
-					diff_dyn_diag = np.max(np.abs(dyn_diag - w0_diag))
-					ref_dyn_diag = max(float(np.max(np.abs(w0_diag))), 1.0e-16)
-					print0(
-						f"  PPM dyn/Wc0 COH diag ratio: median={np.median(ratio):.3f}, mean={np.mean(ratio):.3f}"
-					)
-					print0(
-						f"  PPM dynamic vs Wc0 COH (diag): abs={diff_dyn_diag:.6e}, rel={diff_dyn_diag / ref_dyn_diag:.6e}"
-					)
 
 			if meta.rank == 0:
 				# Evaluate Sigma_c(E_DFT) and Sigma_xc(E_DFT) for BGW comparisons and eqp_g0w0 output.
@@ -1320,7 +1122,7 @@ def main(argv=None):
 					vbm_ev = float(np.max(energies_dft_ev[:, :n_occ_local]))
 				else:
 					vbm_ev = float(np.max(energies_dft_ev))
-				if fermi_reference == "midgap" and n_occ_local < energies_dft_ev.shape[1]:
+				if opts.fermi_reference == "midgap" and n_occ_local < energies_dft_ev.shape[1]:
 					cbm_ev = float(np.min(energies_dft_ev[:, n_occ_local:]))
 					efermi_dft_ev = 0.5 * (vbm_ev + cbm_ev)
 				else:
@@ -1329,7 +1131,7 @@ def main(argv=None):
 				vbm_dft_ev = vbm_ev
 				cbm_dft_ev = cbm_ev
 				omega_dft_rel_ev = energies_dft_ev - efermi_dft_ev
-				if fermi_reference == "midgap" and cbm_dft_ev is not None:
+				if opts.fermi_reference == "midgap" and cbm_dft_ev is not None:
 					print0(
 						f"  Sigma(E_DFT) reference: E_F(midgap)={efermi_dft_ev:.6f} eV "
 						f"from VBM={vbm_dft_ev:.6f} eV, CBM={cbm_dft_ev:.6f} eV"
@@ -1341,7 +1143,7 @@ def main(argv=None):
 					)
 
 				def _interp_complex_on_grid(omega_ev, values_omega, x_ev):
-					if (x_ev < float(omega_ev[0]) or x_ev > float(omega_ev[-1])) and (not sigma_at_dft_extrapolate):
+					if (x_ev < float(omega_ev[0]) or x_ev > float(omega_ev[-1])) and (not opts.sigma_at_dft_extrapolate):
 						return complex(np.nan, np.nan)
 					xr = float(np.clip(x_ev, float(omega_ev[0]), float(omega_ev[-1])))
 					v_re = np.interp(xr, omega_ev, np.real(values_omega))
@@ -1357,7 +1159,7 @@ def main(argv=None):
 						nk = int(dset_c.shape[1])
 						nb = int(dset_c.shape[2])
 						sigma_c_diag_omega_ev = np.zeros((n_omega, nk, nb), dtype=np.complex128)
-						o_chunks = max(1, min(sigma_omega_batch_size, n_omega))
+						o_chunks = max(1, min(opts.sigma_omega_batch_size, n_omega))
 						for ibeg in range(0, n_omega, o_chunks):
 							iend = min(ibeg + o_chunks, n_omega)
 							block = np.asarray(dset_c[ibeg:iend], dtype=np.complex128) * ryd2ev
@@ -1373,7 +1175,7 @@ def main(argv=None):
 				for ik in range(nk):
 					for ib in range(nb):
 						sigma_c_at_dft_ev[ik, ib] = _interp_complex_on_grid(
-							omega_grid_ev, sigma_c_diag_omega_ev[:, ik, ib], omega_dft_rel_ev[ik, ib]
+							opts.omega_grid_ev, sigma_c_diag_omega_ev[:, ik, ib], omega_dft_rel_ev[ik, ib]
 						)
 				sigma_c_plus_at_dft_ev = np.full((nk, nb), np.nan + 1j * np.nan, dtype=np.complex128)
 				sigma_c_minus_at_dft_ev = np.full((nk, nb), np.nan + 1j * np.nan, dtype=np.complex128)
@@ -1384,7 +1186,7 @@ def main(argv=None):
 					for ik in range(nk):
 						for ib in range(nb):
 							sigma_c_plus_at_dft_ev[ik, ib] = _interp_complex_on_grid(
-								omega_grid_ev, sigma_c_plus_diag_omega_ev[:, ik, ib], omega_dft_rel_ev[ik, ib]
+								opts.omega_grid_ev, sigma_c_plus_diag_omega_ev[:, ik, ib], omega_dft_rel_ev[ik, ib]
 							)
 				if sigma_omega.sigma_c_minus_kij is not None:
 					sigma_c_minus_diag_omega_ev = np.diagonal(
@@ -1393,7 +1195,7 @@ def main(argv=None):
 					for ik in range(nk):
 						for ib in range(nb):
 							sigma_c_minus_at_dft_ev[ik, ib] = _interp_complex_on_grid(
-								omega_grid_ev, sigma_c_minus_diag_omega_ev[:, ik, ib], omega_dft_rel_ev[ik, ib]
+								opts.omega_grid_ev, sigma_c_minus_diag_omega_ev[:, ik, ib], omega_dft_rel_ev[ik, ib]
 							)
 				if sigma_omega.sigma_c_invalid_static_kij is not None:
 					sigma_c_invalid_static_diag_ev = np.diagonal(
@@ -1412,7 +1214,7 @@ def main(argv=None):
 			gw_total_0 = sigma_x_bare_kij + sigma_coh_ppm_kij
 			total_diff_abs = float(jnp.max(jnp.abs(gw_total_0 - static_total_ref)))
 			total_ref = max(float(jnp.max(jnp.abs(static_total_ref))), 1.0e-16)
-			print0(f"  Replacing static COH with PPM-integrated Σ^c(ω={omega_grid_ry[iw0]:.6f} Ry)")
+			print0(f"  Replacing static COH with PPM-integrated Σ^c(ω={opts.omega_grid_ry[iw0]:.6f} Ry)")
 			print0(f"  Σ^c difference vs static COH: abs={coh_diff_abs:.6e}, rel={coh_diff_abs / coh_ref:.6e}")
 			print0(f"  Bare Σ^X vs screened Σ^SX: abs={sx_diff_abs:.6e}, rel={sx_diff_abs / sx_ref:.6e}")
 			print0(
@@ -1430,7 +1232,7 @@ def main(argv=None):
 				if meta.rank == 0:
 					write_sigma_omega_h5(
 						sigma_omega_h5_path,
-						omega_grid_ev,
+						opts.omega_grid_ev,
 						None,
 						sigma_c_kij_ev=ryd2ev * sigma_coh_ppm_omega_kij,
 						sigma_sx_kij_ev=ryd2ev * sigma_sx_kbar_ij_jax,
@@ -1479,7 +1281,7 @@ def main(argv=None):
 							for ik in range(nk):
 								for ib in range(nb):
 									sigma_c_at_dft_from_file[ik, ib] = _interp_complex_on_grid(
-										omega_grid_ev,
+										opts.omega_grid_ev,
 										sigma_c_diag_omega_ev_file[:, ik, ib],
 										omega_dft_rel_ev[ik, ib],
 									)
@@ -1496,19 +1298,19 @@ def main(argv=None):
 							h5.create_dataset("sigma_c_at_dft_ev", data=np.asarray(sigma_c_at_dft_ev, dtype=np.complex128))
 							h5.create_dataset("sigma_xc_at_dft_ev", data=np.asarray(sigma_xc_at_dft_ev, dtype=np.complex128))
 							h5.attrs["sigma_at_dft_energies"] = True
-							h5.attrs["fermi_reference"] = str(fermi_reference)
+							h5.attrs["fermi_reference"] = str(opts.fermi_reference)
 							h5.attrs["efermi_dft_ev"] = float(efermi_dft_ev)
 							h5.attrs["vbm_dft_ev"] = float(vbm_dft_ev)
 							h5.attrs["cbm_dft_ev"] = float(cbm_dft_ev) if cbm_dft_ev is not None else np.nan
 						in_grid = (
-							(np.asarray(omega_dft_rel_ev) >= float(np.min(omega_grid_ev)))
-							& (np.asarray(omega_dft_rel_ev) <= float(np.max(omega_grid_ev)))
+							(np.asarray(omega_dft_rel_ev) >= float(np.min(opts.omega_grid_ev)))
+							& (np.asarray(omega_dft_rel_ev) <= float(np.max(opts.omega_grid_ev)))
 						)
 						n_in = int(np.count_nonzero(in_grid))
 						n_tot = int(in_grid.size)
 						print0(
 							f"  Sigma(E_DFT) in-grid states: {n_in}/{n_tot} "
-							f"within [{float(np.min(omega_grid_ev)):.3f}, {float(np.max(omega_grid_ev)):.3f}] eV"
+							f"within [{float(np.min(opts.omega_grid_ev)):.3f}, {float(np.max(opts.omega_grid_ev)):.3f}] eV"
 						)
 			elif sigma_omega.sigma_kij_h5_path and meta.rank == 0:
 				# Stream Σ_c(kij,ω) from disk to avoid holding full Nω in memory.
@@ -1517,10 +1319,10 @@ def main(argv=None):
 					n_omega = int(dset_c.shape[0])
 					nk = int(dset_c.shape[1])
 					nb = int(dset_c.shape[2])
-					o_chunks = max(1, min(sigma_omega_batch_size, n_omega))
+					o_chunks = max(1, min(opts.sigma_omega_batch_size, n_omega))
 					chunks = (o_chunks, max(1, min(4, nk)), nb, nb)
 					with h5py.File(sigma_omega_h5_path, "w") as h5_out:
-						h5_out.create_dataset("omega_ev", data=np.asarray(omega_grid_ev, dtype=np.float64))
+						h5_out.create_dataset("omega_ev", data=np.asarray(opts.omega_grid_ev, dtype=np.float64))
 						dset_total = h5_out.create_dataset(
 							"sigma_total_kij_ev",
 							shape=dset_c.shape,
@@ -1600,7 +1402,7 @@ def main(argv=None):
 			)
 		)
 		occ_idx = max(0, min(int(s.occ.stop) - 1, E_dyn0_ev.shape[1] - 1))
-		if fermi_reference == "midgap" and (occ_idx + 1) < E_dyn0_ev.shape[1]:
+		if opts.fermi_reference == "midgap" and (occ_idx + 1) < E_dyn0_ev.shape[1]:
 			vbm_ev = float(np.max(E_dyn0_ev[:, occ_idx]))
 			cbm_ev = float(np.min(E_dyn0_ev[:, occ_idx + 1]))
 			efermi_ref_ev = 0.5 * (vbm_ev + cbm_ev)
@@ -1608,13 +1410,13 @@ def main(argv=None):
 			efermi_ref_ev = float(np.max(E_dyn0_ev[:, occ_idx]))
 		h0_diag_ev_rel = h0_diag_ev_abs - efermi_ref_ev
 		E_dyn0_rel_ev = E_dyn0_ev - efermi_ref_ev
-		omega_lo = float(np.min(omega_grid_ev))
-		omega_hi = float(np.max(omega_grid_ev))
+		omega_lo = float(np.min(opts.omega_grid_ev))
+		omega_hi = float(np.max(opts.omega_grid_ev))
 		in_omega_grid = (E_dyn0_rel_ev >= omega_lo) & (E_dyn0_rel_ev <= omega_hi)
 		E_diag_sc_rel_ev, conv_mask, n_iter_diag = solve_diagonal_sigma_fixed_point(
 			h0_diag_ev_rel,
 			sigma_xc_diag_omega_ev,
-			np.asarray(omega_grid_ev, dtype=np.float64),
+			np.asarray(opts.omega_grid_ev, dtype=np.float64),
 			max_iter=120,
 			tol_ev=1.0e-7,
 			mixing=0.6,
@@ -1646,7 +1448,7 @@ def main(argv=None):
 		qsgw_diag = build_qsgw_sigma_xc_from_h5(
 			sigma_omega_h5_path,
 			sigma_sx_host_ev,
-			np.asarray(omega_grid_ev, dtype=np.float64),
+			np.asarray(opts.omega_grid_ev, dtype=np.float64),
 			E_diag_sc_rel_ev,
 		)
 		print0(
@@ -1862,7 +1664,7 @@ def main(argv=None):
 	if (
 		meta.rank == 0
 		and use_ppm_sigma
-		and sigma_freq_debug_output
+		and opts.sigma_freq_debug_output
 		and sigma_c_at_dft_ev is not None
 		and omega_dft_rel_ev is not None
 	):
@@ -1878,7 +1680,7 @@ def main(argv=None):
 		if sigma_c_invalid_static_diag_ev is None:
 			sigma_c_invalid_static_diag_ev = np.zeros_like(sigma_c_at_dft_ev, dtype=np.complex128)
 		debug_path = write_sigma_freq_debug_table(
-			sigma_freq_debug_file,
+			opts.sigma_freq_debug_file,
 			energies_dft_ev=np.asarray(energies_dft_ev_host, dtype=np.float64),
 			omega_rel_dft_ev=np.asarray(omega_dft_rel_ev, dtype=np.float64),
 			kin_ion_diag_ev=kin_ion_diag_ev,
