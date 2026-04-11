@@ -1,20 +1,8 @@
-# Standard Library imports
 import os
-# Force JAX to create four CPU devices before import
-# os.environ['XLA_FLAGS'] = ' '.join(filter(None, [
-# 	os.environ.get('XLA_FLAGS', ''),
-# 	'--xla_cpu_multi_thread_eigen=true'
-# ]))
 
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
-# NOTE: XLA_PYTHON_CLIENT_PREALLOCATE and XLA_PYTHON_CLIENT_MEM_FRACTION
-# should be set via environment (e.g. Shifter --env flags).
-# With PREALLOCATE=true, XLA uses a BFC pool which eliminates CUDA fragmentation
-# and gives XLA accurate memory budgets for JIT compilation.
-# Do NOT set XLA_PYTHON_CLIENT_ALLOCATOR=platform here; it overrides the BFC
-# pool and causes XLA to use raw cudaMalloc, leading to fragmentation and
-# incorrect rematerialization budgets.
+
 import argparse
 import time
 
@@ -24,7 +12,6 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from types import SimpleNamespace
 jax.config.update("jax_enable_x64", True)
-#jax.config.update("jax_platform_name", "cpu")
 
 # Initialize JAX distributed only when running multi-process.
 # Guard: when run via `python -m gw.gw_jax`, the module executes as __main__
@@ -107,12 +94,7 @@ from .gw_driver_helpers import (
 	build_screening_setup,
 	maybe_build_ctsp_windows,
 )
-from .w_isdf import (
-	get_chi0_jax_from_bundle,
-	get_static_w_q_jax,
-	get_w_omega_jax_from_bundle,
-	compute_screening,
-)
+from .w_isdf import compute_screening
 from .minimax_config import (
 	minimax_config_from_params,
 	sigma_quadrature_config_from_params,
@@ -542,9 +524,8 @@ def build_G_munu_ri(psi_xn, psi_yr):
 	"""
 	return jnp.einsum('ksxn,knty->ksxty', psi_xn, jnp.conj(psi_yr), optimize=True)
 
-# Backward-compatibility aliases
+# Backward-compatibility alias (used as callback in ppm_sigma)
 get_G_mu_nu_jax = build_G_munu
-get_G_mu_nu_RI = build_G_munu_ri
 
 def get_G_R_jax(G_k, nkx, nky, nkz, sharded_ifftn=None):
 	"""(nk, s1,rmu1,s2,rmu2) -> (s1,rmu1,s2,rmu2,nkx,nky,nkz).
@@ -608,8 +589,6 @@ def project_sigma_to_bands(psi_xr, psi_yn, sigma_k_munu):
 	left = jnp.einsum('kmsx,ksxty->kmty', jnp.conj(psi_xr), sigma_k, optimize=True)
 	return jnp.einsum('kmty,ktyn->kmn', left, psi_yn, optimize=True)
 
-# Backward-compatibility alias
-get_sigma_static_kij_jax = project_sigma_to_bands
 
 
 def get_sigma_static_kij_channels_jax(psi_sigX, psi_sigTY, sigma_k_munu):
@@ -684,131 +663,6 @@ def project_potential_to_bands(psi_xr, Vrho_mu):
 		V_kmn: (nk, nb, nb) potential matrix elements.
 	"""
 	return jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_xr), Vrho_mu, psi_xr, optimize=True)
-
-def compute_sigma_pipeline_jax(
-	psi_l_rmuT_X,
-	psi_l_rmu_Y,
-	psi_coh_rmuT_X,
-	psi_coh_rmu_Y,
-	psi_proj_rmu_X,
-	psi_proj_rmuT_Y,
-	W_mu_nu,
-	V_mu_nu,
-	V0_munu,
-	Gij_static,
-	nkx: int,
-	nky: int,
-	nkz: int,
-	nk_tot: int,
-	nspinor: int,
-	fft_vol_au: float,
-	bispinor: bool = False,
-	sharded_ifftn=None,
-	sharded_fftn=None,
-):
-	"""
-	Pure JAX pipeline: compute static COHSEX self-energy components and Hartree.
-	
-	Returns:
-		sigma_sx_kij: (nk, nb_sigma, nb_sigma) complex - screened exchange self-energy
-		sigma_coh_kij: (nk, nb_sigma, nb_sigma) complex - Coulomb hole self-energy
-		hartree_kmn: (nk, nb_sigma, nb_sigma) complex - Hartree matrix elements
-	
-	Wavefunctions:
-		psi_l: sigma window bands (b0, b3) for SX Green's function + Hartree density
-		       shape (nk, nb_sigma, nspinor, n_rmu)
-		psi_coh: ALL bands (b0, b4) for COH resolution of identity
-		         shape (nk, nband_full, nspinor, n_rmu)
-		psi_proj: sigma window bands (b0, b3) for final projection <m|Σ|n>
-		          shape (nk, nb_sigma, nspinor, n_rmu)
-	
-	Gij_static:
-		Static Green's function matrix in band space, shape (nk, nb_sigma, nb_sigma).
-		For COHSEX: zeros with diagonal 0:nelec set to 1.0+0.j (projector onto occupied).
-		Must match psi_l band range.
-	
-	W_mu_nu:
-		Screened Coulomb interaction, shape (nrmu1, nrmu2, nkx, nky, nkz).
-		Same shardings as V_mu_nu.
-	
-	SCREENED EXCHANGE (Σ_sx):
-		G_μν(k) = Σ_ij ψ*_ik(r_μ) G_ijk ψ_jk(r_ν)  [Green's function from Gij_static]
-		G_μν(R) = FFT[ G_μν(k) ]                    [to real-space lattice]
-		Σ_sx_μν(k) = (1/N_k) Σ_R G_μν(R) W_μν(R)   [screened exchange in ISDF basis]
-		Σ_sx_ij(k) = Σ_μν ψ*_i(r_μ) Σ_μν ψ_j(r_ν)  [project to sigma bands]
-	
-	COULOMB HOLE (Σ_coh):
-		G_RI_μν(k) = Σ_n ψ*_nk(r_μ) ψ_nk(r_ν)      [RI sum over ALL nband bands]
-		G_RI_μν(R) = FFT[ G_RI_μν(k) ]              [to real-space lattice]
-		Σ_coh_μν(k) = (1/N_k) Σ_R G_RI_μν(R) [V_μν(R) - W_μν(R)]
-		Σ_coh_ij(k) = Σ_μν ψ*_i(r_μ) Σ_μν ψ_j(r_ν) [project to sigma bands]
-	
-	HARTREE (V_H):
-		ρ_μ = (1/N_k) Σ_k,n,s f_n |ψ_nk(r_μ)|²   [density, weighted by Gij diagonal]
-		[Vρ]_μ = Σ_ν V0_μν ρ_ν                    [Hartree potential at centroids]
-		<m|V_H|n>_k = Σ_μ,s ψ*_mk(r_μ) [Vρ]_μ ψ_nk(r_μ)  [project to sigma bands]
-	
-	Key: V0_munu is V(q=0) with G=0 component EXCLUDED (to avoid divergence).
-	     Active q=0 head physics is handled separately from the ISDF μν tensors.
-	"""
-	# psi_l: sigma window (b0, b3) for SX Green's function + Hartree density
-	# psi_coh: all bands (b0, b4) for COH resolution of identity
-	# psi_proj: sigma window (b0, b3) for final projection <m|Σ|n>
-	
-	# ========== SCREENED EXCHANGE SELF-ENERGY (Σ_sx) ==========
-	# G_μν(k): Green's function in ISDF basis, built via Gij_static projector
-	# Gij_static is sized for psi_l bands (nb_sigma x nb_sigma)
-	G_k = get_G_mu_nu_jax(psi_l_rmuT_X, psi_l_rmu_Y, Gij_static)  # (nk,spin,μ,spin,ν)
-	# G_μν(R): FFT to real-space lattice vectors R
-	G_R = get_G_R_jax(G_k, nkx, nky, nkz, sharded_ifftn=sharded_ifftn)
-	# Σ_sx_μν(k): screened exchange via ISDF
-	# For bispinor: applies γ⁰ vertex factors to Coulomb interaction
-	sigma_sx_k_munu = get_sigma_static_mu_nu_jax(G_R, W_mu_nu, nk_tot, bispinor=bispinor, sharded_ifftn=sharded_ifftn, sharded_fftn=sharded_fftn)
-	# Σ_sx_ij(k): project to SIGMA WINDOW bands using psi_proj
-	sigma_sx_kij = get_sigma_static_kij_jax(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_sx_k_munu)
-
-	# ========== COULOMB HOLE SELF-ENERGY (Σ_coh) ==========
-	# G_RI_μν(k): resolution of identity sum over ALL bands (no occupation weighting)
-	# Use psi_coh which has all bands (b0, b4)
-	G_RI_k = get_G_mu_nu_RI(psi_coh_rmuT_X, psi_coh_rmu_Y)  # (nk,spin,μ,spin,ν)
-	# G_RI_μν(R): FFT to real-space lattice vectors R
-	G_RI_R = get_G_R_jax(G_RI_k, nkx, nky, nkz, sharded_ifftn=sharded_ifftn)
-	# Σ_coh_μν(k): Coulomb hole via (W - V)
-	# BerkeleyGW uses [ε⁻¹_{GG'} - δ_{GG'}] v(q+G') = (W - V), NOT (V - W)
-	# See bgw_src/Sigma/mtxel_cor.f90 lines 604-607
-	# 
-	# IMPORTANT: CH has a factor of 1/2 that SX does not have!
-	# See mtxel_cor.f90 line 1646: achtemp_loc = achtemp_loc + 0.5d0*aqsn_Ieps
-	# vs line 1648: if (flag_occ) asxtemp_loc = asxtemp_loc - aqsn_Ieps
-	W_minus_V = W_mu_nu - V_mu_nu
-	# For bispinor: applies γ⁰ vertex factors to Coulomb interaction
-	sigma_coh_k_munu = get_sigma_static_mu_nu_jax(G_RI_R, W_minus_V, nk_tot, bispinor=bispinor, sharded_ifftn=sharded_ifftn, sharded_fftn=sharded_fftn)
-	# Σ_coh_ij(k): project to SIGMA WINDOW bands using psi_proj
-	# Apply the 0.5 factor for COH and the overall minus sign
-	sigma_coh_kij = -0.5 * get_sigma_static_kij_jax(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_coh_k_munu)
-
-	# ========== HARTREE MATRIX ELEMENTS ==========
-	# Uses Gij_static diagonal for occupation weights
-	rho_mu = build_density_from_Gij(psi_l_rmu_Y, Gij_static, nk_tot)
-	Vrho_mu = build_hartree_potential(rho_mu, V0_munu)
-	hartree_kmn = project_potential_to_bands(psi_proj_rmu_X, Vrho_mu)
-	
-	return sigma_sx_kij, sigma_coh_kij, hartree_kmn
-
-
-def summarize_hermitian_matrix(name: str, mats: np.ndarray, print_fn=print, warn_threshold: float = 1e-6):
-	"""Emit diagnostics for a batch of Hermitian matrices shaped (nk, nb, nb)."""
-	if mats.ndim != 3:
-		print_fn(f"[{name}] unexpected shape {mats.shape}; expected (nk, nb, nb)")
-		return
-	herm_resid = np.max(np.abs(mats - np.conj(np.swapaxes(mats, -2, -1))))
-	diag = np.diagonal(mats, axis1=-2, axis2=-1)
-	diag_im = np.max(np.abs(np.imag(diag)))
-	diag_min = float(np.min(np.real(diag)))
-	diag_max = float(np.max(np.real(diag)))
-	print_fn(f"[{name}] hermitian residual={herm_resid:.3e} max|Im diag|={diag_im:.3e} diag range=[{diag_min:.4f}, {diag_max:.4f}]")
-	if name.lower().startswith("hartree") and diag_min < -warn_threshold:
-		print_fn(f"[{name}] warning: min diagonal {diag_min:.4f} < 0.0 (negativity may signal improper G=0 handling)")
 
 def print_scf_diagnostics(Gij_final, U_full, nelec, nb_sigma, print_fn=print):
 	"""Print diagnostic checks for SC-COHSEX convergence (Gij, U unitarity)."""
@@ -1096,55 +950,42 @@ def main(argv=None):
 	# not resolve correctly on multi-node without explicit mesh reference)
 	_G_7d_shard = NamedSharding(mesh_xy, P(None, 'x', None, 'y', None, None, None))
 
-	nkx_s, nky_s, nkz_s = int(meta.nkx), int(meta.nky), int(meta.nkz)
+	# Static system constants closed over by JIT functions below.
+	# These are compile-time constants — JAX folds them during tracing.
+	_nkx, _nky, _nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
+	_nk_tot = int(meta.nk_tot)
+	_inv_sqrt_nk = -1.0 / jnp.sqrt(_nk_tot)
 
 	@jax.jit
-	def _build_G_7d_jit(psi_xn, psi_yr, Gij):
-		G_k = build_G_munu(psi_xn, psi_yr, Gij)
+	def _G_to_7d(G_k):
+		"""Reshape (nk, s, μ, s, μ) → (s, μ, s, μ, nkx, nky, nkz) for FFT."""
 		G_7d = G_k.transpose(1,2,3,4,0).reshape(
-			G_k.shape[1], G_k.shape[2], G_k.shape[3], G_k.shape[4], nkx_s, nky_s, nkz_s)
+			G_k.shape[1], G_k.shape[2], G_k.shape[3], G_k.shape[4], _nkx, _nky, _nkz)
 		return jax.lax.with_sharding_constraint(G_7d, _G_7d_shard)
 
 	@jax.jit
-	def _build_GRI_7d_jit(psi_xn, psi_yr):
-		G_k = build_G_munu_ri(psi_xn, psi_yr)
-		G_7d = G_k.transpose(1,2,3,4,0).reshape(
-			G_k.shape[1], G_k.shape[2], G_k.shape[3], G_k.shape[4], nkx_s, nky_s, nkz_s)
-		return jax.lax.with_sharding_constraint(G_7d, _G_7d_shard)
-
-	@jax.jit
-	def _sigma_R_jit(G_R, W_or_V, nk_tot):
-		V_R = W_or_V[None, :, None, :, :, :, :]
-		V_R_fft = _local_ifftn_G(V_R)
-		sigma_R = G_R * V_R_fft * (-1.0 / jnp.sqrt(nk_tot))
+	def _convolve_R(G_R, W_or_V):
+		"""Convolve G(R) with interaction in real space: Σ(R) = G(R) * V(R) / √Nk."""
+		V_R = _local_ifftn_G(W_or_V[None, :, None, :, :, :, :])
+		sigma_R = G_R * V_R * _inv_sqrt_nk
 		return jax.lax.with_sharding_constraint(sigma_R, _G_7d_shard)
 
 	@jax.jit
-	def _project_jit(psi_xr, psi_yn, sigma_k):
-		return project_sigma_to_bands(psi_xr, psi_yn, sigma_k)
+	def _sx_branch_jit(psi_xn_sig, psi_yr_sig, psi_xr_sig, psi_yn_sig, Gij, W):
+		G_R = _local_ifftn_G(_G_to_7d(build_G_munu(psi_xn_sig, psi_yr_sig, Gij)))
+		sigma_sx_k = _local_fftn_G(_convolve_R(G_R, W))
+		return project_sigma_to_bands(psi_xr_sig, psi_yn_sig, sigma_sx_k)
 
 	@jax.jit
-	def _hartree_jit(psi_yr, Gij, V0, psi_xr, nk_tot):
-		rho = build_density_from_Gij(psi_yr, Gij, nk_tot)
-		Vrho = build_hartree_potential(rho, V0)
-		return project_potential_to_bands(psi_xr, Vrho)
+	def _coh_branch_jit(psi_xn_full, psi_yr_full, psi_xr_sig, psi_yn_sig, W, V):
+		G_RI_R = _local_ifftn_G(_G_to_7d(build_G_munu_ri(psi_xn_full, psi_yr_full)))
+		sigma_coh_k = _local_fftn_G(_convolve_R(G_RI_R, W - V))
+		return -0.5 * project_sigma_to_bands(psi_xr_sig, psi_yn_sig, sigma_coh_k)
 
 	@jax.jit
-	def _sx_branch_jit(psi_xn_sig, psi_yr_sig, psi_xr_sig, psi_yn_sig, Gij, W, nk_tot):
-		G_7d = _build_G_7d_jit(psi_xn_sig, psi_yr_sig, Gij)
-		G_R = _local_ifftn_G(G_7d)
-		sigma_sx_R = _sigma_R_jit(G_R, W, nk_tot)
-		sigma_sx_k = _local_fftn_G(sigma_sx_R)
-		return _project_jit(psi_xr_sig, psi_yn_sig, sigma_sx_k)
-
-	@jax.jit
-	def _coh_branch_jit(psi_xn_full, psi_yr_full, psi_xr_sig, psi_yn_sig, W, V, nk_tot):
-		G_7d = _build_GRI_7d_jit(psi_xn_full, psi_yr_full)
-		G_RI_R = _local_ifftn_G(G_7d)
-		WmV = W - V
-		sigma_coh_R = _sigma_R_jit(G_RI_R, WmV, nk_tot)
-		sigma_coh_k = _local_fftn_G(sigma_coh_R)
-		return -0.5 * _project_jit(psi_xr_sig, psi_yn_sig, sigma_coh_k)
+	def _hartree_jit(psi_yr, Gij, V0, psi_xr):
+		rho = build_density_from_Gij(psi_yr, Gij, _nk_tot)
+		return project_potential_to_bands(psi_xr, build_hartree_potential(rho, V0))
 
 	def static_sigma_pipeline(wfns, W, V, V0, Gij):
 		"""Compute static COHSEX Σ_SX, Σ_COH, V_H from Wavefunctions bundle."""
@@ -1152,21 +993,13 @@ def main(argv=None):
 		_gc.collect()
 
 		s = wfns.slices
-		nk_tot = meta.nk_tot
+		xn_sig, yr_sig = wfns.xn(s.sigma), wfns.yr(s.sigma)
+		xr_sig, yn_sig = wfns.xr(s.sigma), wfns.yn(s.sigma)
 
-		sigma_sx_kij = _sx_branch_jit(
-			wfns.xn(s.sigma), wfns.yr(s.sigma),
-			wfns.xr(s.sigma), wfns.yn(s.sigma),
-			Gij, W, nk_tot)
-
+		sigma_sx_kij = _sx_branch_jit(xn_sig, yr_sig, xr_sig, yn_sig, Gij, W)
 		sigma_coh_kij = _coh_branch_jit(
-			wfns.xn(s.full), wfns.yr(s.full),
-			wfns.xr(s.sigma), wfns.yn(s.sigma),
-			W, V, nk_tot)
-
-		hartree_kmn = _hartree_jit(
-			wfns.yr(s.sigma), Gij, V0,
-			wfns.xr(s.sigma), nk_tot)
+			wfns.xn(s.full), wfns.yr(s.full), xr_sig, yn_sig, W, V)
+		hartree_kmn = _hartree_jit(yr_sig, Gij, V0, xr_sig)
 
 		return sigma_sx_kij, sigma_coh_kij, hartree_kmn
 
@@ -1340,9 +1173,7 @@ def main(argv=None):
 					sigma_x_bare_kij_local = _sx_branch_jit(
 						wfns.xn(s.sigma), wfns.yr(s.sigma),
 						wfns.xr(s.sigma), wfns.yn(s.sigma),
-						Gij_static,
-						V_mu_nu_exchange,
-						meta.nk_tot,
+						Gij_static, V_mu_nu_exchange,
 					)
 				sigma_x_bare_kij_local.block_until_ready()
 				return sigma_x_bare_kij_local
@@ -1455,9 +1286,7 @@ def main(argv=None):
 					sigma_coh_ppm_w0_kij = _coh_branch_jit(
 						wfns.xn(s.full), wfns.yr(s.full),
 						wfns.xr(s.sigma), wfns.yn(s.sigma),
-						Wc0_mu_nu + V_mu_nu_for_coh,
-						V_mu_nu_for_coh,
-						meta.nk_tot,
+						Wc0_mu_nu + V_mu_nu_for_coh, V_mu_nu_for_coh,
 					)
 				sigma_coh_ppm_w0_kij.block_until_ready()
 				diff_w0_abs = float(jnp.max(jnp.abs(sigma_coh_ppm_w0_kij - sigma_coh_kbar_ij_jax)))
@@ -2167,5 +1996,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-	#jax.distributed.initialize()
 	raise SystemExit(main())
