@@ -660,52 +660,33 @@ def main(argv=None):
 	kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
 	_nk_tot = int(meta.nk_tot)
 
-	# FFT helpers: flat-k-first ↔ flat-R-first.  All k→3D reshaping is internal.
-	# Two pairs: one for G-shaped (nk, s, μ, s, μ), one for V-shaped (nk, μ, μ).
+	# FFT helpers: flat-k ↔ flat-R.  Callers pass flat arrays, never see 3D k-grid.
 	from common.fft_helpers import make_jittable_local_fftn_3d, make_jittable_local_ifftn_3d
-	_nk = kgrid[0] * kgrid[1] * kgrid[2]
 
-	_G_7d_spec = P(None, None, None, None, 'x', None, 'y')  # (kx,ky,kz, s,μ_X, s,μ_Y)
-	_G_7d_shard = NamedSharding(mesh_xy, _G_7d_spec)
-	_G_ifftn = make_jittable_local_ifftn_3d(mesh_xy, _G_7d_spec, _G_7d_spec, norm='ortho', axes=(0, 1, 2))
-	_G_fftn = make_jittable_local_fftn_3d(mesh_xy, _G_7d_spec, _G_7d_spec, norm='ortho', axes=(0, 1, 2))
+	def _make_fft_pair(spec):
+		"""Build IFFT/FFT pair that accept flat-k-first and return flat-R/k-first."""
+		shard = NamedSharding(mesh_xy, spec)
+		raw_ifftn = make_jittable_local_ifftn_3d(mesh_xy, spec, spec, norm='ortho', axes=(0, 1, 2))
+		raw_fftn = make_jittable_local_fftn_3d(mesh_xy, spec, spec, norm='ortho', axes=(0, 1, 2))
+		@jax.jit
+		def ifftn(x_k):
+			x_3d = jax.lax.with_sharding_constraint(x_k.reshape(*kgrid, *x_k.shape[1:]), shard)
+			return raw_ifftn(x_3d).reshape(_nk_tot, *x_k.shape[1:])
+		@jax.jit
+		def fftn(x_R):
+			x_3d = jax.lax.with_sharding_constraint(x_R.reshape(*kgrid, *x_R.shape[1:]), shard)
+			return raw_fftn(x_3d).reshape(_nk_tot, *x_R.shape[1:])
+		return ifftn, fftn
 
-	_V_5d_spec = P(None, None, None, 'x', 'y')  # (kx,ky,kz, μ_X, μ_Y)
-	_V_5d_shard = NamedSharding(mesh_xy, _V_5d_spec)
-	_V_ifftn = make_jittable_local_ifftn_3d(mesh_xy, _V_5d_spec, _V_5d_spec, norm='ortho', axes=(0, 1, 2))
-
-	@jax.jit
-	def _G_to_R(G_k):
-		"""G(nk, s, μ, s, μ) → IFFT → G(nR, s, μ, s, μ).  k-first in, R-first out."""
-		G_7d = jax.lax.with_sharding_constraint(
-			G_k.reshape(*kgrid, *G_k.shape[1:]), _G_7d_shard)
-		G_R = _G_ifftn(G_7d)
-		return G_R.reshape(_nk, *G_R.shape[3:])
-
-	@jax.jit
-	def _G_to_k(G_R):
-		"""G(nR, s, μ, s, μ) → FFT → G(nk, s, μ, s, μ).  R-first in, k-first out."""
-		G_7d = jax.lax.with_sharding_constraint(
-			G_R.reshape(*kgrid, *G_R.shape[1:]), _G_7d_shard)
-		G_k = _G_fftn(G_7d)
-		return G_k.reshape(_nk, *G_k.shape[3:])
-
-	@jax.jit
-	def _V_to_R(V_k):
-		"""V(nk, μ, μ) → IFFT → V(nR, μ, μ).  k-first in, R-first out."""
-		V_5d = jax.lax.with_sharding_constraint(
-			V_k.reshape(*kgrid, *V_k.shape[1:]), _V_5d_shard)
-		V_R = _V_ifftn(V_5d)
-		return V_R.reshape(_nk, *V_R.shape[3:])
+	_G_ifftn, _G_fftn = _make_fft_pair(P(None, None, None, None, 'x', None, 'y'))
+	_V_ifftn, _ = _make_fft_pair(P(None, None, None, 'x', 'y'))
 
 	@jax.jit
 	def _convolve(G_k, V_flat, prefactor):
 		"""Σ(k) = prefactor · FFT[ G(R) · V(R) / √Nk ].  All flat-k-first."""
-		G_R = _G_to_R(G_k)
-		# Broadcast V(nR, μ, μ) → (nR, 1, μ, 1, μ) to match G(nR, s, μ, s, μ)
-		V_R = _V_to_R(V_flat)[:, None, :, None, :]
-		sigma_R = G_R * V_R * (-1.0 / jnp.sqrt(_nk_tot))
-		return prefactor * _G_to_k(sigma_R)
+		G_R = _G_ifftn(G_k)
+		V_R = _V_ifftn(V_flat)[:, None, :, None, :]  # broadcast (nR,μ,μ) → (nR,1,μ,1,μ)
+		return prefactor * _G_fftn(G_R * V_R * (-1.0 / jnp.sqrt(_nk_tot)))
 
 	# ---- Static COHSEX sigma ----
 	# Σ_SX(k) = -1  · ⟨m| FFT[G_occ(R) · W(R)/√Nk] |n⟩     (screened exchange)
