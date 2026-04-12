@@ -892,14 +892,16 @@ def fit_zeta_chunked_to_h5(
         writer_thread = threading.Thread(target=writer_worker, daemon=True)
         writer_thread.start()
 
-    # Peak GPU memory tracker — sample after each block_until_ready
+    # Peak GPU memory tracker — sample current bytes_in_use after each block_until_ready.
+    # Uses bytes_in_use (instantaneous) not peak_bytes_in_use (all-time max since JAX start),
+    # so we capture the actual per-stage peak within the chunk loop.
     _peak_bytes = 0
     def _track_peak():
         nonlocal _peak_bytes
         try:
             stats = jax.devices()[0].memory_stats()
             if stats:
-                _peak_bytes = max(_peak_bytes, stats.get('peak_bytes_in_use', 0))
+                _peak_bytes = max(_peak_bytes, stats.get('bytes_in_use', 0))
         except Exception:
             pass
 
