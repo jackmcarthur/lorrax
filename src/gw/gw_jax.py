@@ -98,6 +98,7 @@ from .ppm_sigma import (
 	compute_sigma_c_ppm_omega_grid,
 )
 from .qsgw_utils import (
+	print_scf_diagnostics,
 	solve_diagonal_sigma_fixed_point,
 	load_sigma_xc_diag_from_h5,
 	build_qsgw_sigma_xc_from_h5,
@@ -417,28 +418,6 @@ def _hartree(wfns, Gij, V0, nk_tot):
 # Callback for ppm_sigma (builds occupation-weighted G)
 build_G_occ = lambda psi_xn, psi_yr, Gij: jnp.einsum(
 	'ksxi,kij,kjty->ksxty', psi_xn, Gij, jnp.conj(psi_yr), optimize=True)
-
-def print_scf_diagnostics(Gij_final, U_full, nelec, nb_sigma, print_fn=print):
-	"""Print diagnostic checks for SC-COHSEX convergence (Gij, U unitarity)."""
-	Gij_trace = jnp.real(jnp.trace(Gij_final[0]))
-	Gij_diag = jnp.real(jnp.diagonal(Gij_final[0]))
-	print_fn(f"[Diagnostic] Gij_final trace at k=0: {float(Gij_trace):.4f} (should be {nelec})")
-	print_fn(f"[Diagnostic] Gij_final diag[:5] at k=0: {np.array(Gij_diag[:5])}")
-	print_fn(f"[Diagnostic] Gij_final diag sum at k=0: {float(jnp.sum(Gij_diag)):.4f}")
-
-	UdagU = jnp.einsum('kim,kin->kmn', jnp.conj(U_full[0:1]), U_full[0:1])
-	unitarity_err = jnp.max(jnp.abs(UdagU[0] - jnp.eye(nb_sigma)))
-	print_fn(f"[Diagnostic] U unitarity error at k=0: {float(unitarity_err):.2e} (should be ~0)")
-
-	U_diag = jnp.abs(jnp.diagonal(U_full[0]))
-	print_fn(f"[Diagnostic] |U| diagonal[:5] at k=0: {np.array(U_diag[:5])} (should be ~1 if no mixing)")
-	print_fn(f"[Diagnostic] |U| diagonal[25:30] at k=0: {np.array(U_diag[25:30])} (valence-cond boundary)")
-
-	U_col0_abs = jnp.abs(U_full[0, :, 0])
-	top_contrib = jnp.argsort(U_col0_abs)[::-1][:5]
-	print_fn(f"[Diagnostic] Lowest QP state: top DFT contributors = {np.array(top_contrib)}")
-	print_fn(f"[Diagnostic] Lowest QP state: their |U| values = {np.array(U_col0_abs[top_contrib])}")
-
 
 def _extract_flat_k(V_qmunu, W_flat, meta, mesh_xy, wfn):
 	"""Extract V(nk,μ,μ) from ISDF V_qmunu, and Gij occupation projector.
