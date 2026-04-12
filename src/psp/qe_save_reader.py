@@ -5,7 +5,7 @@ Constructs a lightweight object with the same attribute names as WFNReader,
 so it can be passed to dft_operators, vnl_ops, charge_density, etc.
 
 Required files in the .save directory:
-  data-file-schema.xml   — crystal structure, electronic parameters
+  data-file-schema.xml   — crystal structure, symmetries, parameters
   charge-density.hdf5    — valence charge density ρ(G)
 
 Usage
@@ -13,15 +13,8 @@ Usage
     from psp.qe_save_reader import CrystalData
 
     crystal = CrystalData.from_qe_save("silicon.save")
-
-    # Build Hamiltonian (duck-types as WFNReader for structure queries):
-    H_k = setup_H_k_from_kvec(kvec, V_scf, vnl_setup, crystal, meta)
-
-    # Load the SCF charge density:
-    rho_r, rho_G = crystal.load_charge_density()
-
-    # Cross-check against WFN.h5 (optional):
-    crystal.validate_against_wfn(wfn)
+    kpts, weights = crystal.build_kgrid()  # Gamma-centred IBZ
+    H_k = setup_H_k_from_kvec(kpts[0], V_scf, vnl_setup, crystal, meta)
 """
 from __future__ import annotations
 
@@ -35,7 +28,7 @@ import h5py
 
 
 # ---------------------------------------------------------------------------
-# Periodic table (Z ≤ 86, covers all common pseudopotentials)
+# Periodic table (Z ≤ 86)
 # ---------------------------------------------------------------------------
 
 _SYMBOL_TO_Z = {}
@@ -55,20 +48,15 @@ for _z, _sym in enumerate(_ELEMENTS, start=1):
 # ---------------------------------------------------------------------------
 
 def _text(root: ET.Element, tag: str) -> str | None:
-    """First element text matching *tag* (namespace-agnostic)."""
     for e in root.iter():
         if e.tag.split("}")[-1] == tag and e.text:
             return e.text.strip()
     return None
 
-
 def _all(root: ET.Element, tag: str) -> list[ET.Element]:
-    """All elements matching *tag* (namespace-agnostic)."""
     return [e for e in root.iter() if e.tag.split("}")[-1] == tag]
 
-
 def _vec(text: str) -> np.ndarray:
-    """Parse a whitespace-separated vector of floats."""
     return np.array([float(x) for x in text.split()])
 
 
@@ -78,23 +66,25 @@ def _vec(text: str) -> np.ndarray:
 
 @dataclass
 class CrystalData:
-    """Crystal structure and parameters — duck-types as WFNReader.
+    """Crystal structure, symmetries, and parameters — duck-types as WFNReader."""
 
-    Attributes match the names consumed by dft_operators, vnl_ops,
-    charge_density, operator_checks, and Meta.from_system.
-    """
     # ── Lattice ──
-    alat: float                     # |a₁| [bohr]
-    blat: float                     # 2π / alat [bohr⁻¹]
+    alat: float
+    blat: float
     avec: np.ndarray                # (3,3) lattice vectors / alat
     bvec: np.ndarray                # (3,3) reciprocal vectors / blat
     bdot: np.ndarray                # (3,3) reciprocal metric [bohr⁻²]
-    cell_volume: float              # Ω [bohr³]
+    cell_volume: float
 
     # ── Atoms ──
     nat: int
     atom_crys: np.ndarray           # (nat, 3) crystal coordinates
     atom_types: np.ndarray          # (nat,) atomic numbers
+
+    # ── Symmetry (duck-types WFNReader for SymMaps) ──
+    ntran: int                      # number of symmetry operations
+    sym_matrices: np.ndarray        # (ntran, 3, 3) int — rotation matrices (crystal coords)
+    translations: np.ndarray        # (ntran, 3) float — fractional translations × 2π (BGW convention)
 
     # ── Electronic / grid ──
     nelec: float
@@ -105,7 +95,7 @@ class CrystalData:
     fft_grid: tuple[int, int, int]
     nbands: int
     nkpts: int
-    kgrid: np.ndarray               # (3,) int
+    kgrid: np.ndarray               # (3,) int — Monkhorst-Pack dimensions
 
     # ── Private ──
     _save_dir: str = ""
@@ -121,7 +111,7 @@ class CrystalData:
 
         root = ET.parse(xml_path).getroot()
 
-        # ── lattice (bohr) ──
+        # ── lattice ──
         a1, a2, a3 = _vec(_text(root, "a1")), _vec(_text(root, "a2")), _vec(_text(root, "a3"))
         avec_bohr = np.array([a1, a2, a3])
         alat = float(np.linalg.norm(a1))
@@ -138,6 +128,27 @@ class CrystalData:
         atom_crys = np.array([avec_inv @ _vec(a.text) for a in atoms])
         atom_types = np.array([_SYMBOL_TO_Z[a.attrib["name"]] for a in atoms], dtype=np.int32)
 
+        # ── symmetry operations ──
+        sym_elems = _all(root, "symmetry")
+        rotations, frac_trans = [], []
+        for sym in sym_elems:
+            rot_elem = [c for c in sym if c.tag.split("}")[-1] == "rotation"]
+            ft_elem = [c for c in sym if c.tag.split("}")[-1] == "fractional_translation"]
+            if not rot_elem:
+                continue
+            R = _vec(rot_elem[0].text).reshape(3, 3)
+            rotations.append(np.round(R).astype(int))
+            tau = _vec(ft_elem[0].text) if ft_elem else np.zeros(3)
+            # Convert from crystal coords to BGW convention (× 2π)
+            frac_trans.append(tau * 2.0 * np.pi)
+
+        ntran = len(rotations)
+        # Pad to 48 (WFNReader convention: always 48 slots)
+        sym_matrices = np.zeros((48, 3, 3), dtype=np.int32)
+        translations = np.zeros((48, 3), dtype=np.float64)
+        sym_matrices[:ntran] = np.array(rotations)
+        translations[:ntran] = np.array(frac_trans)
+
         # ── electronic ──
         nelec = float(_text(root, "nelec"))
         noncolin = _text(root, "noncolin") == "true"
@@ -145,7 +156,7 @@ class CrystalData:
         nspinor = 2 if noncolin else 1
         nspin = 2 if (lsda and not noncolin) else 1
 
-        ecutwfc = 2.0 * float(_text(root, "ecutwfc"))   # Ha → Ry
+        ecutwfc = 2.0 * float(_text(root, "ecutwfc"))
         ecutrho = 2.0 * float(_text(root, "ecutrho"))
 
         fg = _all(root, "fft_grid")[0].attrib
@@ -162,18 +173,41 @@ class CrystalData:
             alat=alat, blat=blat, avec=avec, bvec=bvec, bdot=bdot,
             cell_volume=cell_volume, nat=nat,
             atom_crys=atom_crys, atom_types=atom_types,
+            ntran=ntran, sym_matrices=sym_matrices, translations=translations,
             nelec=nelec, nspin=nspin, nspinor=nspinor,
             ecutwfc=ecutwfc, ecutrho=ecutrho, fft_grid=fft_grid,
             nbands=nbands, nkpts=0, kgrid=kgrid, _save_dir=save_dir,
         )
 
     # ------------------------------------------------------------------
-    def load_charge_density(self) -> tuple[np.ndarray, np.ndarray]:
-        """Read ρ_val from ``charge-density.hdf5``.
+    def build_kgrid(
+        self,
+        nk: np.ndarray | tuple[int, int, int] = (4, 4, 4),
+        time_reversal: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Generate a Gamma-centred Monkhorst-Pack grid, reduced to the IBZ.
 
-        Returns ``(rho_r, rho_G)`` where rho_r is the real-space density
-        on the FFT grid and rho_G is the G-space array (unnormalized FFT).
+        Reproduces QE's ``kpoint_grid.f90`` algorithm exactly: same
+        enumeration order, forward-only equivalence marking, and optional
+        time-reversal symmetry.
+
+        Parameters
+        ----------
+        nk : (3,) int — grid dimensions (e.g. (4, 4, 4))
+        time_reversal : bool — apply k ↔ −k (True unless magnetic)
+
+        Returns
+        -------
+        kpoints : (n_ibz, 3) float64 — IBZ k-points in crystal coordinates
+        weights : (n_ibz,) float64 — weights summing to 1
         """
+        nk = np.asarray(nk, dtype=int)
+        return _reduce_mp_to_ibz(nk, self.sym_matrices[:self.ntran],
+                                  time_reversal=time_reversal)
+
+    # ------------------------------------------------------------------
+    def load_charge_density(self) -> tuple[np.ndarray, np.ndarray]:
+        """Read ρ_val from ``charge-density.hdf5``."""
         cd_path = os.path.join(self._save_dir, "charge-density.hdf5")
         if not os.path.isfile(cd_path):
             raise FileNotFoundError(cd_path)
@@ -182,14 +216,11 @@ class CrystalData:
         N = nx * ny * nz
 
         with h5py.File(cd_path, "r") as f:
-            miller = f["MillerIndices"][:]    # (nG, 3) int
-            rho_ri = f["rhotot_g"][:]         # (2*nG,) interleaved re/im
+            miller = f["MillerIndices"][:]
+            rho_ri = f["rhotot_g"][:]
 
-        # Scatter G-space coefficients onto FFT grid (vectorized)
         rho_G = np.zeros((nx, ny, nz), dtype=np.complex128)
-        ix = miller[:, 0] % nx
-        iy = miller[:, 1] % ny
-        iz = miller[:, 2] % nz
+        ix, iy, iz = miller[:, 0] % nx, miller[:, 1] % ny, miller[:, 2] % nz
         rho_G[ix, iy, iz] = rho_ri[0::2] + 1j * rho_ri[1::2]
 
         rho_r = np.real(np.fft.ifftn(rho_G)) * N
@@ -201,8 +232,7 @@ class CrystalData:
         def _chk(name, a, b, tol=atol):
             err = float(np.max(np.abs(np.asarray(a, dtype=float)
                                       - np.asarray(b, dtype=float))))
-            assert err < tol, (
-                f"{name}: max|Δ| = {err:.2e} (tol {tol:.0e})")
+            assert err < tol, f"{name}: max|Δ| = {err:.2e} (tol {tol:.0e})"
 
         _chk("alat", self.alat, wfn.alat)
         _chk("blat", self.blat, wfn.blat)
@@ -215,4 +245,86 @@ class CrystalData:
         _chk("nelec", self.nelec, wfn.nelec, tol=0.5)
         _chk("nspinor", self.nspinor, wfn.nspinor, tol=0.5)
         _chk("fft_grid", self.fft_grid, wfn.fft_grid, tol=0.5)
+        _chk("ntran", self.ntran, wfn.ntran, tol=0.5)
+        _chk("sym_matrices", self.sym_matrices[:self.ntran],
+             wfn.sym_matrices[:wfn.ntran], tol=0.5)
         print("validate_against_wfn: all checks passed")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Monkhorst-Pack grid + IBZ reduction
+# ═══════════════════════════════════════════════════════════════════════
+
+def _reduce_mp_to_ibz(
+    nk: np.ndarray,
+    sym_matrices: np.ndarray,
+    time_reversal: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Gamma-centred MP grid reduced to IBZ (reproduces QE kpoint_grid.f90).
+
+    Algorithm:
+      1. Enumerate grid with direction 3 cycling fastest (QE loop order)
+      2. For each k, apply all symmetries S (and optionally -S for TR)
+      3. Forward-only equivalence: mark n_equiv > nk as equivalent
+      4. Extract IBZ in discovery order with accumulated weights
+    """
+    nk1, nk2, nk3 = int(nk[0]), int(nk[1]), int(nk[2])
+    nkr = nk1 * nk2 * nk3
+    nsym = sym_matrices.shape[0]
+    _EPS = 1e-5
+
+    # Phase 1: full grid in crystal coords (QE loop order)
+    xkg = np.empty((nkr, 3))
+    for i in range(nk1):
+        for j in range(nk2):
+            for k in range(nk3):
+                n = k + j * nk3 + i * nk2 * nk3
+                xkg[n] = [i / nk1, j / nk2, k / nk3]
+
+    # Phase 2: forward-only equivalence marking
+    equiv = np.arange(nkr, dtype=int)
+    wkk = np.ones(nkr)
+
+    for nk_idx in range(nkr):
+        if equiv[nk_idx] != nk_idx:
+            continue
+        for ns in range(nsym):
+            xkr = sym_matrices[ns] @ xkg[nk_idx]
+            xkr -= np.round(xkr)
+
+            variants = [xkr.copy()]
+            if time_reversal:
+                neg = -xkr.copy()
+                neg -= np.round(neg)
+                variants.append(neg)
+
+            for xk_test in variants:
+                xx = xk_test[0] * nk1
+                yy = xk_test[1] * nk2
+                zz = xk_test[2] * nk3
+                if (abs(xx - round(xx)) > _EPS or
+                    abs(yy - round(yy)) > _EPS or
+                    abs(zz - round(zz)) > _EPS):
+                    continue
+                i = round(xx) % nk1
+                j = round(yy) % nk2
+                k = round(zz) % nk3
+                n_eq = k + j * nk3 + i * nk2 * nk3
+                if n_eq > nk_idx and equiv[n_eq] == n_eq:
+                    equiv[n_eq] = nk_idx
+                    wkk[nk_idx] += 1.0
+
+    # Phase 3: extract IBZ in discovery order
+    ibz_k, ibz_w = [], []
+    for nk_idx in range(nkr):
+        if equiv[nk_idx] == nk_idx:
+            kpt = xkg[nk_idx] - np.round(xkg[nk_idx])
+            ibz_k.append(kpt)
+            ibz_w.append(wkk[nk_idx])
+
+    kpoints = np.array(ibz_k)
+    weights = np.array(ibz_w)
+    weights /= weights.sum()
+    return kpoints, weights
+
+
