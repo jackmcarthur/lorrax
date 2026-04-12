@@ -231,13 +231,11 @@ def main(argv=None):
 		cell_volume=wfn.cell_volume, print_fn=_print0,
 	)
 
-	global bispinor
-	bispinor = config.bispinor
-	meta = Meta.from_system(wfn, sym, config.nval, config.ncond, config.nband, _n_rmu, bispinor)
+	meta = Meta.from_system(wfn, sym, config.nval, config.ncond, config.nband, _n_rmu, config.bispinor)
 	meta.rank = jax.process_index()
 	meta.n_proc = jax.process_count()
 	meta.sys_dim = config.sys_dim
-	meta.bispinor = bispinor
+	meta.bispinor = config.bispinor
 	meta.chunk_size = get_effective_chunk_size(config.chunk_size)
 
 	band_slices = BandSlices.from_band_edges(*meta.band_edges)
