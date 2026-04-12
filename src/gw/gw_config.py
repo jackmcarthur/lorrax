@@ -10,7 +10,9 @@ PPMSigmaRuntimeOptions) are constructed on demand via properties.
 
 from __future__ import annotations
 
+import configparser
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -97,6 +99,136 @@ _DEFAULTS = {
     "w_copies_debug_file": "",
     "sigma_freq_debug_file": "sigma_freq_debug.dat",
 }
+
+# Keys whose string values should be lowercased and stripped
+_NORMALIZE_STR = {
+    "wcoul0_source", "screening_method", "minimax_energy_reference",
+    "sigma_omega_accumulation", "fermi_reference", "isdf_pair_mode",
+    "ppm_invalid_mode",
+}
+
+
+# ---------------------------------------------------------------------------
+#  Input file parser
+# ---------------------------------------------------------------------------
+
+def read_lorrax_input(filename: str) -> dict:
+    """Parse a LORRAX input file ([cohsex] section) into a params dict.
+
+    Handles the QE-style K_POINTS block and strips it before INI parsing.
+    All keys use ``_DEFAULTS`` for fallback values — no duplicate definitions.
+    """
+    with open(filename, 'r') as f:
+        lines = f.readlines()
+
+    # Locate [cohsex] section
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip().lower().startswith('[cohsex]'):
+            start = i
+            break
+    if start is None:
+        for i, line in enumerate(lines):
+            if re.match(r"\s*\[.*\]", line):
+                start = i
+                break
+    end = len(lines)
+
+    # Locate optional K_POINTS block
+    kp_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().lower().startswith("k_points"):
+            kp_idx = i
+            break
+    kp_end = None
+    if kp_idx is not None and kp_idx + 1 < len(lines):
+        try:
+            seg_count = int(lines[kp_idx + 1].strip().split()[0])
+        except Exception:
+            seg_count = 0
+        kp_end = min(len(lines), kp_idx + 2 + max(seg_count, 0))
+
+    if start is not None:
+        for j in range(start + 1, len(lines)):
+            if re.match(r"\s*\[.*\]", lines[j]):
+                end = j
+                break
+        # Strip K_POINTS from INI text
+        if kp_idx is not None and start <= kp_idx < end:
+            section_lines = lines[start:kp_idx] + lines[(kp_end or kp_idx + 1):end]
+        else:
+            section_lines = lines[start:end]
+
+        parser = configparser.ConfigParser()
+        parser.read_string(''.join(section_lines))
+        section = parser["cohsex"] if "cohsex" in parser else parser[parser.sections()[0]]
+
+        # Legacy key check
+        if section.get("use_shipped_minimax_tables", fallback=None) is not None:
+            raise ValueError(
+                "Input key 'use_shipped_minimax_tables' is no longer supported. "
+                "Use 'regenerate_minimax_tables = true/false' instead.")
+
+        # Build params from _DEFAULTS, overriding with parsed values
+        params = {}
+        for key, default in _DEFAULTS.items():
+            raw = section.get(key, fallback=None)
+            if raw is None:
+                params[key] = default
+            elif isinstance(default, bool):
+                params[key] = section.getboolean(key)
+            elif isinstance(default, int):
+                params[key] = section.getint(key)
+            elif isinstance(default, float):
+                params[key] = section.getfloat(key)
+            elif default is None:
+                # Nullable float (vhead, whead_0freq, etc.)
+                params[key] = section.getfloat(key, fallback=None)
+            else:
+                params[key] = str(raw)
+            if key in _NORMALIZE_STR and isinstance(params[key], str):
+                params[key] = params[key].strip().lower()
+    else:
+        params = dict(_DEFAULTS)
+
+    # Parse optional QE K_POINTS block
+    if kp_idx is not None:
+        j = kp_idx + 1
+        try:
+            nseg = int(lines[j].strip().split()[0])
+        except Exception:
+            nseg = 0
+        segments = []
+        for k in range(nseg):
+            row_idx = j + 1 + k
+            if row_idx >= len(lines):
+                break
+            row_full = lines[row_idx].rstrip('\n')
+            label = None
+            for marker in ('#', '!', ';'):
+                if marker in row_full:
+                    label = row_full.split(marker, 1)[1].strip() or None
+                    row_full = row_full.split(marker, 1)[0]
+                    break
+            row = row_full.strip()
+            if not row:
+                continue
+            parts = row.split()
+            if len(parts) < 3:
+                continue
+            segments.append({
+                "k": [float(parts[0]), float(parts[1]), float(parts[2])],
+                "n": int(parts[3]) if len(parts) >= 4 else 1,
+                "label": label,
+            })
+        if segments:
+            params["kpoints_crystal_b"] = {"segments": segments}
+
+    return params
+
+
+# Backward-compatible alias
+read_cohsex_input = read_lorrax_input
 
 
 # ---------------------------------------------------------------------------
@@ -259,10 +391,9 @@ class LorraxConfig:
         This replaces read_cohsex_input + resolve_runtime_config + path
         resolution in a single call.
         """
-        from .gw_init import read_cohsex_input
         from file_io import resolve_input_paths
 
-        params = read_cohsex_input(filename)
+        params = read_lorrax_input(filename)
         input_dir = os.path.dirname(os.path.abspath(filename))
         resolve_input_paths(params, input_dir)
 
