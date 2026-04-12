@@ -224,12 +224,17 @@ def davidson_k(
     for it in range(1, max_iter + 1):
         m = V.shape[0]
 
-        # ── projected Hamiltonian ──
-        Theta = _gram(V, W)
-        Theta = 0.5 * (Theta + Theta.conj().T)
+        # ── projected Hamiltonian and overlap ──
+        Hc = _gram(V, W)
+        Sc = _gram(V, V)
+        Hc = 0.5 * (Hc + Hc.conj().T)
+        Sc = 0.5 * (Sc + Sc.conj().T)
 
-        # ── Rayleigh-Ritz ──
-        eigvals, C = jnp.linalg.eigh(Theta)
+        # ── Rayleigh-Ritz: generalized eigenproblem Hc v = e Sc v ──
+        from scipy.linalg import eigh as _scipy_eigh
+        eigvals, C = _scipy_eigh(np.asarray(Hc), np.asarray(Sc))
+        eigvals = jnp.asarray(eigvals)
+        C = jnp.asarray(C)
         Lambda = eigvals[:n_tgt]
         C_N = C[:, :n_tgt]
 
@@ -290,19 +295,10 @@ def davidson_k(
         # ── precondition: QE diagonal g_psi ──
         P = _precondition(R_act, h_diag, Lambda[active])
 
-        # ── orthogonalise against subspace (QE: two-pass Gram-Schmidt) ──
-        for _pass in range(n_ortho):
-            overlap = _gram(V, P)
-            P = P - jnp.einsum('mn,msG->nsG', overlap, V, optimize=True)
-
-        # ── normalize each vector individually (QE convention) ──
-        # Drop vectors with norm below threshold instead of
-        # eigendecomposition (which amplifies noise in degenerate directions)
+        # ── normalize each vector (QE convention: no orthogonalization
+        #    against V — the generalized eigenproblem handles overlap) ──
         norms = jnp.sqrt(_gram_diag(P))
-        keep = []
-        for n in range(b_act):
-            if float(norms[n]) > tau_dep:
-                keep.append(n)
+        keep = [n for n in range(b_act) if float(norms[n]) > tau_dep]
         if len(keep) == 0:
             if verbose:
                 print(f"  iter {it}: restart (candidate block dependent)")
@@ -310,7 +306,6 @@ def davidson_k(
             continue
         keep_idx = jnp.array(keep)
         P = P[keep_idx] / norms[keep_idx, None, None]
-        bp = len(keep)
 
         # ── expand subspace ──
         HP = apply_H(P)
