@@ -802,9 +802,9 @@ def main(argv=None):
 			f = (jnp.arange(meta.nb_sigma) < meta.nelec).astype(jnp.float64)
 			Gij_new = jnp.einsum('kim,m,kjm->kij', U, f, jnp.conj(U), optimize=True)
 			with mesh_xy:
-				sx_new = sigma_sx(wfns, Gij_new, W)
-				coh_new = sigma_coh(wfns, W, V)
-				h_new = hartree(wfns, Gij_new, V)
+				sx_new = sigma_sx(wfns, Gij_new, W_q)
+				coh_new = sigma_coh(wfns, W_q, V_q)
+				h_new = hartree(wfns, Gij_new, V_q)
 			sx_new, coh_new = _add_head(sx_new, coh_new)
 			return hermitian_to_upper_flat(sx_new + coh_new + h_new).flatten()
 
@@ -822,9 +822,9 @@ def main(argv=None):
 		Gij_final = jnp.einsum('kim,m,kjm->kij', U_full, f, jnp.conj(U_full), optimize=True)
 		print_scf_diagnostics(Gij_final, U_full, meta.nelec, meta.nb_sigma, print0)
 		with mesh_xy:
-			sig_sx  = sigma_sx(wfns, Gij_final, W)
-			sig_coh = sigma_coh(wfns, W, V)
-			sig_h   = hartree(wfns, Gij_final, V)
+			sig_sx  = sigma_sx(wfns, Gij_final, W_q)
+			sig_coh = sigma_coh(wfns, W_q, V_q)
+			sig_h   = hartree(wfns, Gij_final, V_q)
 		sig_sx, sig_coh = _add_head(sig_sx, sig_coh)
 	else:
 		H = 0.5 * ((kin_ion + sigma_total) + jnp.conj(jnp.swapaxes(kin_ion + sigma_total, -1, -2)))
