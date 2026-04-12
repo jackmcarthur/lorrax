@@ -144,6 +144,21 @@ def _build_initial_subspace(apply_H, T_diag, nG, nspinor, n_tgt, verbose=True):
 #  Davidson solver
 # ═══════════════════════════════════════════════════════════════════════
 
+def warmup_jit(nG: int, nspinor: int, n_tgt: int, m_max: int | None = None):
+    """Pre-compile _subspace_step at all subspace sizes.
+
+    Call once before the k-point loop to front-load JIT compilation.
+    Costs ~2s total, eliminates all recompilation during Davidson.
+    """
+    if m_max is None:
+        m_max = 4 * n_tgt
+    h = jnp.zeros(nG, dtype=jnp.float64)
+    for m in range(n_tgt, m_max + n_tgt, n_tgt):
+        V = jnp.zeros((min(m, m_max), nspinor, nG), dtype=jnp.complex128)
+        HV = jnp.zeros_like(V)
+        _subspace_step(V, HV, h, n_tgt)
+
+
 def davidson_k(
     apply_H,
     *,
@@ -224,15 +239,15 @@ def davidson_k(
                 print(f"  Converged all {n_tgt} bands in {it} iterations.")
             return eigenvalues, np.asarray(X)
 
-        # ── select unconverged roots ──
-        active = jnp.array([i for i in range(n_tgt) if not conv[i]])
-        P_act = P[active]
+        # ── apply_H to all n_tgt corrections (fixed batch size) ──
+        HP = apply_H(P)
 
-        # ── GPU: apply_H to corrections ──
-        HP = apply_H(P_act)
-
-        # ── expand subspace ──
-        V = jnp.concatenate([V, P_act], axis=0)
+        # ── expand subspace with all n_tgt vectors ──
+        # Converged bands add zero corrections (from the preconditioner:
+        # their residuals are ~0), which don't affect the Gram matrices.
+        # Keeping the block size fixed ensures m grows in steps of n_tgt,
+        # matching the warmup shapes exactly.
+        V = jnp.concatenate([V, P], axis=0)
         HV = jnp.concatenate([HV, HP], axis=0)
 
         # ── restart if subspace too large ──
