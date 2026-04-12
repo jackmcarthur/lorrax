@@ -836,12 +836,23 @@ def get_kin_ion(
     species_payload=None,
     include_hartree: bool = False,
     nb_limit: int | None = None,
+    sys_dim: int = 3,
 ):
     """Return kinetic + ionic (+ optional Hartree) matrices for all k-points: shape (nk, nb, nb).
 
     When `include_hartree` is True the valence Hartree potential V_H is
     constructed from the occupied states and added to the returned matrices.
+
+    Parameters
+    ----------
+    sys_dim : int
+        System dimensionality (0, 2, or 3).  Controls Coulomb truncation
+        for V_loc: ``truncation_2d=True`` only when ``sys_dim == 2``.
     """
+    from psp.operator_checks import validate_operator_inputs
+    ctx = validate_operator_inputs(
+        pseudos=pseudos, wfn=wfn, sys_dim=sys_dim, caller="get_kin_ion",
+    )
     # Reshard to ensure k is sharded across mesh as in main flow
     k_xy_shard = NamedSharding(mesh_xy, P(('x','y'), None, None, None, None, None))
     wfn_k_sharded = jax.lax.with_sharding_constraint(global_psi_G, k_xy_shard)
@@ -945,7 +956,7 @@ def get_kin_ion(
             cell_volume=float(wfn.cell_volume),
             bvec=np.asarray(wfn.bvec, dtype=float),
             blat=float(wfn.blat),
-            truncation_2d=True,  # Match QE's assume_isolated='2D' behavior
+            truncation_2d=ctx.truncation_2d,
         )
         V_loc_r = jnp.asarray(V_loc_r, dtype=jnp.float64)
         # Avoid forcing device sync here; leave compute lazy
