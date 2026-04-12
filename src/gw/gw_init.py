@@ -1,12 +1,8 @@
-"""Input file parsing and preprocessing for COHSEX calculations.
+"""ISDF fitting orchestration and memory-aware chunk sizing for LORRAX GW.
 
-This module contains functions for:
-- Reading and parsing the cohsex input file
-- Converting input parameters to effective values
-- Computing band ranges from input parameters
-- Memory-aware chunk size optimization with full communication buffer accounting
-- Runtime configuration resolution (memory budget, chunking, ZCT caps)
-- ISDF fitting / restart orchestration
+  compute_optimal_chunks — per-device memory model for the 6-stage ISDF pipeline
+  fit_zeta / compute_V_q / build_wavefunction_bundle — pipeline steps
+  prepare_isdf_and_wavefunctions — top-level orchestrator called by main()
 """
 import os
 import math
@@ -14,8 +10,11 @@ from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+import h5py
 
 import common.timing as timing
+from common import jax_profile
 
 
 
@@ -241,33 +240,25 @@ def compute_optimal_chunks(
 
 
 def get_effective_chunk_size(chunk_size: int) -> int | None:
-    """Convert chunk_size input flag to actual chunk size.
-    
-    Args:
-        chunk_size: Input flag value:
-            -1 = no chunking (return None, all bands at once)
-             0 = auto (TODO: compute from available RAM; currently 64)
-            1-2048 = explicit chunk size
-    
-    Returns:
-        Effective chunk size as int, or None for no chunking.
-    """
+    """Convert chunk_size flag: -1=None (all bands), 0=auto (64), 1-2048=explicit."""
     if chunk_size == -1:
         return None
-    elif chunk_size == 0:
-        # TODO: replace 64 with dynamic value based on available RAM
+    if chunk_size == 0:
         return 64
-    elif 1 <= chunk_size <= 2048:
+    if 1 <= chunk_size <= 2048:
         return chunk_size
-    else:
-        raise ValueError(f"chunk_size must be -1, 0, or 1-2048, got {chunk_size}")
+    raise ValueError(f"chunk_size must be -1, 0, or 1-2048, got {chunk_size}")
 
 
-from .gw_config import read_lorrax_input, read_cohsex_input  # noqa: F401 — public API
+# Backward-compatible re-exports
+from .gw_config import read_lorrax_input, read_cohsex_input  # noqa: F401
 
 
 def get_bandranges(nv, nc, nband, nelec):
-	r"""Return ranges of bands necessary for \sigma_{X,SX,COH}"""
+	r"""Return ranges of bands necessary for \sigma_{X,SX,COH}.
+
+	Legacy helper used by psp/get_DFT_mtxels.py.  GW code uses BandSlices instead.
+	"""
 	nvrange = [int(nelec - nv), int(nelec)]
 	ncrange = [int(nelec), int(nelec + nc)]
 	nsigmarange = [int(nelec - nv), int(nelec + nc)]
@@ -276,27 +267,20 @@ def get_bandranges(nv, nc, nband, nelec):
 	return nvrange, ncrange, nsigmarange, n_fullrange, n_valrange
 
 
-
-def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, tmp_dir, print_fn=print):
+def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir, print_fn=print):
 	"""Fit ISDF interpolation vectors ζ and write to HDF5.
 
-	Returns (zeta_h5_path, psi_l_yr, psi_r_yr) where:
-	  - zeta_h5_path: path to the zeta HDF5 file
-	  - psi_l_yr:  left centroid wfns  (nk, nb_l, ns, n_rmu), Y-sharded
-	  - psi_r_yr:  right centroid wfns (nk, nb_r, ns, n_rmu), Y-sharded
+	Returns (zeta_h5_path, psi_l_yr, psi_r_yr, mem_est).
 	"""
 	from common.isdf_fitting import fit_zeta_chunked_to_h5
-	import numpy as np
 
-	b0, b1, b2, b3, b4 = meta.band_edges
-	band_range_left = (b0, b3)
-	band_range_right = (b1, b4)
+	# ISDF left/right band windows (pair density needs asymmetric ranges)
+	band_range_left = (band_slices.b0, band_slices.b3)   # all val + sigma cond
+	band_range_right = (band_slices.b1, band_slices.b4)   # sigma val + all cond
 
-	isdf_pair_mode = str(cfg.isdf_pair_mode).strip().lower()
-	pair_channels = 1 if isdf_pair_mode == "spin_traced" else meta.nspinor ** 2
-
+	pair_channels = 1 if cfg.isdf_pair_mode == "spin_traced" else meta.nspinor ** 2
 	chunks = compute_optimal_chunks(
-		n_k=meta.nk_tot, n_b=b4 - b0, n_s=meta.nspinor,
+		n_k=meta.nk_tot, n_b=band_slices.nb_full, n_s=meta.nspinor,
 		n_rmu=meta.n_rmu, n_r=meta.n_rtot, n_q=meta.nk_tot,
 		fft_grid=meta.fft_grid, n_devices=jax.device_count(),
 		memory_budget_gb=cfg.memory_per_device_gb,
@@ -311,10 +295,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, tmp_dir, print_fn=p
 
 	mem_est = chunks.get('memory_estimate', {})
 	if jax.process_index() == 0 and mem_est:
-		peak = mem_est.get('peak_estimate_gb', 0.0)
-		budget = mem_est.get('budget_gb', 0.0)
-		bottleneck = mem_est.get('bottleneck', 'unknown')
-		print_fn(f"    Memory estimate: peak {peak:.2f} GB (budget {budget:.2f} GB), bottleneck={bottleneck}")
+		print_fn(f"    Memory estimate: peak {mem_est['peak_estimate_gb']:.2f} GB "
+		         f"(budget {mem_est['budget_gb']:.2f} GB), bottleneck={mem_est['bottleneck']}")
 		stages = mem_est.get('limit_info', {})
 		if stages:
 			print_fn(f"    Per-stage: " + "  ".join(f"{k}={v:.2f}" for k, v in stages.items()) + " GB")
@@ -324,7 +306,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, tmp_dir, print_fn=p
 	print_fn(f"    Band chunks: {chunks['band_chunk']}")
 	print_fn(f"    R chunks:    {chunks['chunk_r']} (contiguous r-space)")
 	print_fn(f"    Q chunks:    {chunks['q_chunk']}")
-	print_fn(f"    Pair mode:   {isdf_pair_mode}")
+	print_fn(f"    Pair mode:   {cfg.isdf_pair_mode}")
 	print_fn(f"    Zeta output: {zeta_h5_path}")
 
 	with timing.section("gw_jax.zeta_fit_chunked"):
@@ -339,7 +321,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, tmp_dir, print_fn=p
 			use_gspace_cache=chunks.get('use_gspace_cache', True),
 			band_range_left=band_range_left,
 			band_range_right=band_range_right,
-			isdf_pair_mode=isdf_pair_mode,
+			isdf_pair_mode=cfg.isdf_pair_mode,
 			k_chunk_size=chunks.get('k_chunk', 0),
 		)
 
@@ -355,23 +337,18 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, tmp_dir, print_fn=p
 def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print):
 	"""Compute bare Coulomb V_qmunu from zeta HDF5 and write G0 back.
 
-	Returns (V_qmunu, G0) where:
-	  - V_qmunu: (1, npol, npol, nkx, nky, nkz, n_rmu, n_rmu)
-	  - G0: (n_rmu,) ζ_μ(G=0) at q=0
+	Returns (V_qmunu, G0) where V_qmunu has shape (1, npol, npol, nkx, nky, nkz, μ, μ)
+	and G0 is (n_rmu,) ζ_μ(G=0) at q=0.
 	"""
 	from .compute_vcoul import compute_all_V_q_from_zeta_h5
-	from common import jax_profile
-	import numpy as np
-	import h5py
 
-	# Filesystem sync before reading
 	if jax.process_index() == 0:
 		os.sync()
 	jax.experimental.multihost_utils.sync_global_devices("zeta_flush")
 
 	bvec = np.asarray(wfn.blat * wfn.bvec, dtype=np.float64)
 
-	# Memory budget for V_q computation
+	# V_q memory model: 2 zeta reads + 1 FFT workspace = 3× (μ × n_G × 16 bytes)
 	if mem_est is None:
 		mem_est = {}
 	budget_gb = float(mem_est.get('available_vcoul_gb', cfg.memory_per_device_gb))
@@ -380,22 +357,18 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		budget_gb = min(budget_gb, float(get_device_memory_info().get('budget_gb', budget_gb)))
 	except Exception:
 		pass
-
-	n_G = meta.n_rtot
 	m_budget = max(0.1, budget_gb) * 1e9
-	m_per_mu = 3 * 16 * n_G  # 2 zeta + 1 FFT workspace, complex128
+	m_per_mu = 3 * 16 * meta.n_rtot
 	mu_chunk = max(1, min(meta.n_rmu, int(m_budget / m_per_mu)))
 	q_batch = 1
 	if mu_chunk >= meta.n_rmu and meta.nk_tot > 1:
-		bytes_per_q = 2.0 * 16 * meta.n_rmu * n_G
-		q_batch = max(1, min(4, meta.nk_tot, int(m_budget // max(1.0, bytes_per_q))))
+		q_batch = max(1, min(4, meta.nk_tot, int(m_budget // max(1.0, 2.0 * 16 * meta.n_rmu * meta.n_rtot))))
 	print_fn(f"    V_q budget:    {budget_gb:.2f} GB")
 	print_fn(f"    V_q mu chunks: {mu_chunk}")
 	if q_batch > 1:
 		print_fn(f"    V_q q batches: {q_batch}")
-	bare_cutoff = getattr(cfg, 'bare_coulomb_cutoff', None)
-	if bare_cutoff is not None:
-		print_fn(f"    V_q bare cutoff: {bare_cutoff:.1f} Ry")
+	if cfg.bare_coulomb_cutoff is not None:
+		print_fn(f"    V_q bare cutoff: {cfg.bare_coulomb_cutoff:.1f} Ry")
 
 	with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
 		with h5py.File(zeta_h5_path, 'r') as zeta_h5:
@@ -408,10 +381,10 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 					q_batch_size=q_batch if mu_chunk >= meta.n_rmu else None,
 					bdot=np.asarray(wfn.bdot, dtype=np.float64) if meta.sys_dim == 0 else None,
 					mc_average_vcoul_body=cfg.mc_average_vcoul_body,
-					bare_coulomb_cutoff=bare_cutoff,
+					bare_coulomb_cutoff=cfg.bare_coulomb_cutoff,
 				)
 
-	# Write G0 = ζ_μ(G=0) at q=0 back to zeta file
+	# Write G0 = ζ_μ(G=0) at q=0 back to zeta file for restart
 	G0_gathered = jax.experimental.multihost_utils.process_allgather(G0_all)
 	if G0_gathered.ndim == 5 and G0_gathered.shape[0] == 1:
 		G0_gathered = G0_gathered[0]
@@ -422,13 +395,11 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 			f.create_dataset('g0_mu', data=np.asarray(G0_gathered))
 	jax.experimental.multihost_utils.sync_global_devices("g0_write")
 
-	# Reshape to (1, npol, npol, nkx, nky, nkz, n_rmu, n_rmu)
+	# Add polarization axes: (nkx, nky, nkz, μ, μ) → (1, npol, npol, nkx, nky, nkz, μ, μ)
 	nkx, nky, nkz = meta.kgrid
 	V_qmunu = jnp.array(jnp.broadcast_to(
-		V_q_raw[None, None, None, :, :, :, :, :],
-		(1, meta.npol, meta.npol, nkx, nky, nkz, meta.n_rmu, meta.n_rmu)))
+		V_q_raw[None, None, None], (1, meta.npol, meta.npol, nkx, nky, nkz, meta.n_rmu, meta.n_rmu)))
 
-	# G0 at q=0
 	G0 = G0_gathered
 	while G0.ndim > 1:
 		G0 = G0[0]
@@ -436,7 +407,6 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	print_fn(f"\n  V_q computed:")
 	print_fn(f"    Shape: {V_qmunu.shape}")
 	print_fn(f"    V_q=0 trace: {jnp.trace(V_q_raw[0, 0, 0]).real:.4f}")
-
 	return V_qmunu, G0
 
 
@@ -446,18 +416,14 @@ def build_wavefunction_bundle(
 	psi_full_yr=None, psi_full_xn=None,
 	enk_full=None, print_fn=print,
 ):
-	"""Build Wavefunctions bundle from either ISDF or restart arrays.
-
-	Fresh ISDF: pass psi_l_yr + psi_r_yr (left/right halves assembled internally).
-	Restart:    pass psi_full_yr (+ optional psi_full_xn to skip resharding).
-	"""
+	"""Build 4-copy Wavefunctions bundle from ISDF (psi_l/r_yr) or restart (psi_full_yr)."""
 	from .wavefunction_bundle import build_wavefunctions, build_wavefunctions_from_full
 	from common.load_wfns import get_enk_bandrange
 
-	b0, b1, b2, b3, b4 = meta.band_edges
 	if enk_full is None:
 		enk_full, _ = get_enk_bandrange(
-			wfn, sym, (b0, b4), (b1, b3), nspinor=meta.nspinor)
+			wfn, sym, (band_slices.b0, band_slices.b4),
+			(band_slices.b1, band_slices.b3), nspinor=meta.nspinor)
 
 	if psi_full_yr is not None:
 		wfns = build_wavefunctions_from_full(
@@ -477,46 +443,35 @@ def prepare_isdf_and_wavefunctions(
 	*, cfg, wfn, sym, meta, centroid_indices, band_slices,
 	mesh_xy, tmp_dir, tensors_filename, print0, **_ignored,
 ):
-	"""Run ISDF fitting (or load restart), build wavefunction bundle.
-
-	Pipeline:
-	  1. fit_zeta       → ζ(q) to H5, centroid wavefunctions
-	  2. compute_V_q    → bare Coulomb V_qmunu from ζ(q)
-	  3. build_wavefunction_bundle → 4-copy sharded Wavefunctions
+	"""ISDF pipeline: fit_zeta → compute_V_q → build_wavefunction_bundle.
 
 	Returns SimpleNamespace(V_qmunu, wf_bundle).
 	"""
 	from file_io import write_restart_state_to_h5, save_restart_state_per_proc
 
 	if not cfg.restart:
-		# --- ISDF fitting ---
 		with mesh_xy:
 			zeta_path, psi_l_yr, psi_r_yr, mem_est = fit_zeta(
 				wfn, sym, meta, centroid_indices, mesh_xy,
-				cfg, tmp_dir, print_fn=print0)
-
+				cfg, band_slices, tmp_dir, print_fn=print0)
 			V_qmunu, G0 = compute_V_q(
 				zeta_path, wfn, meta, mesh_xy, cfg,
 				mem_est=mem_est, print_fn=print0)
 
-		# --- Wavefunction bundle ---
 		with timing.section("gw_jax.wavefunction_setup"):
 			wfns = build_wavefunction_bundle(
 				wfn, sym, meta, band_slices, mesh_xy,
 				psi_l_yr=psi_l_yr, psi_r_yr=psi_r_yr, print_fn=print0)
 
-		# --- Restart checkpoint ---
 		write_restart_state_to_h5(
 			tensors_filename, V_qmunu,
-			wfns.psi_yr, wfns.enk, None,
-			G0_mu_nu=G0, init_W0=True)
+			wfns.psi_yr, wfns.enk, None, G0_mu_nu=G0, init_W0=True)
 		save_restart_state_per_proc(
 			os.path.join(tmp_dir, "isdf_tensors"),
 			V_qmunu, None, wfns.psi_yr, wfns.enk, meta, mesh_xy)
 		V_qmunu.block_until_ready()
 		print0("  Chunked ISDF path complete")
 	else:
-		# --- Restart from H5 ---
 		from file_io import load_restart_state_from_h5
 		with timing.section("gw_jax.restart_load"):
 			V_qmunu, _S, psi_full_xn, psi_full_yr, enk_full, _V0, _G0 = (
