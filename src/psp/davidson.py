@@ -110,20 +110,19 @@ def _build_initial_subspace(apply_H, T_diag, nG, nspinor, n_tgt, verbose=True):
     """Lowest-|k+G|² plane waves → H projection → rotate → n_tgt vectors."""
     n_pw = min(2 * n_tgt, nG)
     n_basis = min(n_pw * nspinor, nG * nspinor)
-    order = np.argsort(np.asarray(T_diag))
 
-    basis = []
-    for s in range(nspinor):
-        for ig in range(n_pw):
-            v = jnp.zeros((nspinor, nG), dtype=jnp.complex128)
-            v = v.at[s, order[ig]].set(1.0)
-            basis.append(v)
-            if len(basis) >= n_basis:
-                break
-        if len(basis) >= n_basis:
-            break
+    # Sort G-vectors by |k+G|², skipping padding (T_diag ≥ 1e10)
+    T_np = np.asarray(T_diag)
+    order = np.argsort(T_np)
 
-    V_pw = jnp.stack(basis, axis=0)
+    # Build basis vectorized: one-hot in (spinor, G) space
+    # rows[i] = spinor index, cols[i] = G index for the i-th basis vector
+    rows = np.repeat(np.arange(nspinor), n_pw)[:n_basis]
+    cols = np.tile(order[:n_pw], nspinor)[:n_basis]
+    V_pw = np.zeros((n_basis, nspinor, nG), dtype=np.complex128)
+    V_pw[np.arange(n_basis), rows, cols] = 1.0
+    V_pw = jnp.asarray(V_pw)
+
     HV_pw = apply_H(V_pw)
 
     Hc = jnp.einsum('msG,nsG->mn', jnp.conj(V_pw), HV_pw, optimize=True)
