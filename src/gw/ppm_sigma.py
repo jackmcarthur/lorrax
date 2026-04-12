@@ -42,47 +42,31 @@ class PPMBuildResult:
     valid_mask_mu_nu: jax.Array
     unfulfilled_fraction: float
     n_nodes_static: int
-    w0_rel_error: float | None = None
-    w0_abs_error: float | None = None
-    w0_ref_norm: float | None = None
 
 
 @dataclass(frozen=True)
 class SigmaOmegaResult:
     omega_ry: np.ndarray
     omega_ev: np.ndarray
-    sigma_c_kij: jax.Array | None
-    sigma_c_plus_kij: jax.Array | None = None
-    sigma_c_minus_kij: jax.Array | None = None
-    sigma_c_invalid_static_kij: jax.Array | None = None
-    sigma_munu_h5_path: str | None = None
-    sigma_kij_h5_path: str | None = None
+    sigma_c_kij: jax.Array | None      # (n_omega, nk, nb, nb) or None if streamed
+    sigma_kij_h5_path: str | None = None  # path to streamed h5 if applicable
 
 
 @dataclass(frozen=True)
 class _SigmaWindow:
     name: str
-    t_nodes: np.ndarray
-    alpha: np.ndarray
-    mask_A: np.ndarray
-    mask_B: np.ndarray | None
-    E_ref_A: float
-    E_ref_B: float
-    omega_sign: int
-    project: str
-    prefactor: float
-    mask_B_mode: str = "explicit"
-    mask_B_threshold: float | None = None
-    mask_B_count: int | None = None
-    mask_B_total: int | None = None
-    mask_B_min: float | None = None
-    mask_B_max: float | None = None
-    x_min: float | None = None
-    x_max: float | None = None
-    crossing_A: float | None = None
-    crossing_kind: str | None = None
-    t_cut: float | None = None
-    z_edge: float | None = None
+    t_nodes: np.ndarray        # (n_tau,) minimax quadrature nodes
+    alpha: np.ndarray           # (n_tau,) minimax quadrature weights
+    mask_A: np.ndarray          # (nk, nb) band mask for A channel
+    mask_B: np.ndarray | None   # (nk, nb) band mask for B channel
+    E_ref_A: float              # energy reference for A channel phases
+    E_ref_B: float              # energy reference for B channel phases
+    omega_sign: int             # +1 or -1 for frequency sign convention
+    project: str                # "full", "real", or "imag"
+    prefactor: float            # overall sign/scale prefactor
+    mask_B_mode: str = "explicit"     # how to build mask_B: "explicit", "all", "le_t", "gt_t"
+    mask_B_threshold: float | None = None  # threshold for le_t/gt_t modes
+    crossing_kind: str | None = None  # "hgl" for crossing windows
 
 
 def _mu_nu_sharding(mesh_xy: Mesh) -> NamedSharding:
@@ -486,37 +470,7 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     Wc0_mu_nu = _to_munu(Wc0_q)
     print0(f"  [TIMING-PPM] q->mu,nu layout: {_ppm_time.perf_counter() - _t_layout:.3f}s")
 
-    # PPM consistency check: W^c(0) ≈ ± 2 B / Omega
-    w0_rel_error = None
-    w0_abs_error = None
-    w0_ref_norm = None
-    w0_rel_error_neg = None
-    try:
-        w0_target = Wc0_mu_nu
-        w0_pred = jnp.where(Omega != 0.0, (2.0 * B) / Omega, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
-        w0_pred_neg = -w0_pred
-        w0_abs_error = float(jnp.max(jnp.abs(w0_pred - w0_target)))
-        w0_abs_error_neg = float(jnp.max(jnp.abs(w0_pred_neg - w0_target)))
-        w0_ref_norm = float(jnp.max(jnp.abs(Wc0_q)))
-        w0_rel_error = w0_abs_error / max(w0_ref_norm, 1.0e-16)
-        w0_rel_error_neg = w0_abs_error_neg / max(w0_ref_norm, 1.0e-16)
-    except Exception:
-        pass
-
-    print0(
-        "  GN-PPM from W^c(0), W^c(iωp): "
-        f"ωp={omega_p_ry:.6f} Ry, unfulfilled={100.0 * unfulfilled:.2f}%"
-    )
-    if w0_rel_error is not None:
-        print0(
-            f"  PPM W^c(0) check (+2B/Ω): max|Δ|={w0_abs_error:.3e}, "
-            f"rel={w0_rel_error:.3e} (ref max|W^c(0)|={w0_ref_norm:.3e})"
-        )
-    if w0_rel_error_neg is not None:
-        print0(
-            f"  PPM W^c(0) check (-2B/Ω): max|Δ|={w0_abs_error_neg:.3e}, "
-            f"rel={w0_rel_error_neg:.3e}"
-        )
+    print0(f"  GN-PPM: ωp={omega_p_ry:.6f} Ry, unfulfilled={100.0 * unfulfilled:.2f}%")
     return PPMBuildResult(
         omega_p=omega_p_ry,
         W0_q=W0_q,
@@ -527,9 +481,6 @@ def compute_w0_wiwp_and_ppm_from_minimax(
         valid_mask_mu_nu=valid_mask,
         unfulfilled_fraction=unfulfilled,
         n_nodes_static=quad.node_count,
-        w0_rel_error=w0_rel_error,
-        w0_abs_error=w0_abs_error,
-        w0_ref_norm=w0_ref_norm,
     )
 
 def _build_single_sigma_window(
@@ -579,12 +530,6 @@ def _build_single_sigma_window(
             project="full",
             prefactor=float(prefactor),
             mask_B_mode="all",
-            mask_B_total=int(mask_B_total),
-            mask_B_count=int(mask_B_count),
-            mask_B_min=float(mask_B_min),
-            mask_B_max=float(mask_B_max),
-            x_min=float(x_min),
-            x_max=float(x_max),
         )
     ]
 
@@ -688,16 +633,7 @@ def _build_three_sigma_windows(
                 prefactor=float(prefactor),
                 mask_B_mode=mask_B_mode,
                 mask_B_threshold=float(T),
-                mask_B_total=int(mask_B_total),
-                mask_B_count=int(count_B),
-                mask_B_min=float(B_min),
-                mask_B_max=float(B_max),
-                x_min=float(x_min) if name != "core" else None,
-                x_max=float(x_max) if name != "core" else None,
-                crossing_A=float(A_core) if name == "core" else None,
                 crossing_kind="hgl" if name == "core" else None,
-                t_cut=float(T),
-                z_edge=float(z_edge),
             )
         )
     return windows
@@ -776,7 +712,6 @@ def _convolve_sigma_branch_kij(
         windows = _build_three_sigma_windows(
             E_A=E_A_host,
             base_mask_A=base_A_host,
-            mask_B_total=mask_B_total,
             mask_B_all_count=mask_B_all_count,
             mask_B_le_count=mask_B_le_count,
             mask_B_le_min=mask_B_le_min,
@@ -797,10 +732,6 @@ def _convolve_sigma_branch_kij(
         windows = _build_single_sigma_window(
             E_A=E_A_host,
             base_mask_A=base_A_host,
-            mask_B_total=mask_B_total,
-            mask_B_count=mask_B_all_count,
-            mask_B_min=mask_B_all_min,
-            mask_B_max=mask_B_all_max,
             omega_nonneg_ry=omega_nonneg_ry,
             kernel_sign=kernel_sign,
             target_error=target_error,
@@ -1057,9 +988,6 @@ def compute_sigma_c_ppm_omega_grid(
     fermi_reference = getattr(ppm_options, 'fermi_reference', 'midgap')
 
     # Internal callback aliases
-    sigma_scale = 1.0
-    sigma_flip_neg = False
-    debug_split_contrib = False
     import time as _sgtime
     _sg_t0 = _sgtime.perf_counter()
     _sg_prof = bool(os.environ.get("LORRAX_PROFILE_PPM", ""))
@@ -1178,11 +1106,6 @@ def compute_sigma_c_ppm_omega_grid(
         print0("  WARNING: omega_accumulation=kij_stream without sigma_kij_h5_path; falling back to kij.")
         use_kij_stream = False
         use_kij_accum = True
-    if debug_split_contrib and use_kij_stream:
-        print0("  WARNING: sigma_debug_split_contrib requires in-memory kij accumulation; disabling split.")
-        debug_split_contrib = False
-    if sigma_munu_h5_path:
-        print0("  NOTE: sigma_munu_h5_path requested; mu-nu streaming is independent of kij accumulation.")
     if use_kij_accum:
         print0(f"  Σc(ω) accumulation: kij (single-pass), est={kij_bytes / (1024**2):.1f} MiB")
     if use_kij_stream:
@@ -1190,19 +1113,10 @@ def compute_sigma_c_ppm_omega_grid(
 
     n_omega = int(omega_req.size)
     sigma_kij_host = None if use_kij_stream else np.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=np.complex128)
-    sigma_plus_host = None
-    sigma_minus_host = None
-    sigma_invalid_static_host = None
-    if debug_split_contrib and not use_kij_stream:
-        sigma_plus_host = np.zeros_like(sigma_kij_host)
-        sigma_minus_host = np.zeros_like(sigma_kij_host)
 
     stream_path = None
     h5_stream = None
     dset_sigma_munu = None
-    if sigma_munu_h5_path:
-        print0("  WARNING: sigma_munu_h5_path ignored; Σ(ω) now accumulates in band space before exp(iωt).")
-        sigma_munu_h5_path = None
 
     kij_stream_path = None
     h5_kij = None
@@ -1359,7 +1273,6 @@ def compute_sigma_c_ppm_omega_grid(
                     )
                 if use_kij_stream:
                     return None
-                if debug_split_contrib:
                     return sigma_cond, sigma_val
                 return sigma_cond + sigma_val
             if _sg_prof:
@@ -1374,7 +1287,7 @@ def compute_sigma_c_ppm_omega_grid(
                     kernel_cond=+1,
                     kernel_val=-1,
                     tag="ω>=E_F",
-                    scale=float(sigma_scale),
+                    scale=1.0,
                     omega_sign_flip_cond=1,
                     omega_sign_flip_val=1,
                 )
@@ -1382,15 +1295,7 @@ def compute_sigma_c_ppm_omega_grid(
                     _sg_te = _sgtime.perf_counter()
                     print0(f"  [TIMING-SIG] convolve_kij(pos) returned: {_sg_te - _sg_ts:.1f}s")
                 if sigma_pos is not None:
-                    if debug_split_contrib:
-                        sigma_cond, sigma_val = sigma_pos
-                        sigma_kij_host[idx_pos] = np.asarray(jax.device_get(sigma_cond + sigma_val), dtype=np.complex128)
-                        if _sg_prof: print0(f"  [TIMING-SIG] device_get(pos kij): {_sgtime.perf_counter() - _sg_te:.1f}s")
-                        sigma_minus_host[idx_pos] = np.asarray(jax.device_get(sigma_cond), dtype=np.complex128)
-                        sigma_plus_host[idx_pos] = np.asarray(jax.device_get(sigma_val), dtype=np.complex128)
-                        if _sg_prof: print0(f"  [TIMING-SIG] device_get(pos split): {_sgtime.perf_counter() - _sg_te:.1f}s")
-                    else:
-                        sigma_kij_host[idx_pos] = np.asarray(jax.device_get(sigma_pos), dtype=np.complex128)
+                    sigma_kij_host[idx_pos] = np.asarray(jax.device_get(sigma_pos), dtype=np.complex128)
 
             if _sg_prof: _sg_ts2 = _sgtime.perf_counter()
             # ω_rel < 0: evaluate with |ω_rel| and swapped branch kernels.
@@ -1408,7 +1313,7 @@ def compute_sigma_c_ppm_omega_grid(
                     kernel_val=+1,
                     tag="ω<E_F",
                     # Optional debug-only sign flip knob on the ω<E_F block.
-                    scale=(-float(sigma_scale) if not sigma_flip_neg else float(sigma_scale)),
+                    scale=-1.0,
                     omega_sign_flip_cond=1,
                     omega_sign_flip_val=1,
                 )
@@ -1416,67 +1321,11 @@ def compute_sigma_c_ppm_omega_grid(
                     _sg_te2 = _sgtime.perf_counter()
                     print0(f"  [TIMING-SIG] convolve_kij(neg) returned: {_sg_te2 - _sg_ts2:.1f}s")
                 if sigma_neg is not None:
-                    if debug_split_contrib:
-                        sigma_cond, sigma_val = sigma_neg
-                        sigma_kij_host[idx_neg] = np.asarray(jax.device_get(sigma_cond + sigma_val), dtype=np.complex128)
-                        if _sg_prof: print0(f"  [TIMING-SIG] device_get(neg kij): {_sgtime.perf_counter() - _sg_te2:.1f}s")
-                        sigma_minus_host[idx_neg] = np.asarray(jax.device_get(sigma_cond), dtype=np.complex128)
-                        sigma_plus_host[idx_neg] = np.asarray(jax.device_get(sigma_val), dtype=np.complex128)
-                        if _sg_prof: print0(f"  [TIMING-SIG] device_get(neg split): {_sgtime.perf_counter() - _sg_te2:.1f}s")
-                    else:
-                        sigma_kij_host[idx_neg] = np.asarray(jax.device_get(sigma_neg), dtype=np.complex128)
+                    sigma_kij_host[idx_neg] = np.asarray(jax.device_get(sigma_neg), dtype=np.complex128)
 
             if _sg_prof:
                 _sg_t_conv_end = _sgtime.perf_counter()
                 print0(f"  [TIMING-SIG] convolution total: {_sg_t_conv_end - _sg_t_conv_start:.1f}s")
-            if invalid_mode == "static_limit" and Wc0_mu_nu is not None and n_invalid > 0:
-                Wc0_invalid = jnp.where(
-                    invalid_mask,
-                    jnp.asarray(Wc0_mu_nu, dtype=jnp.complex128),
-                    jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
-                )
-                occ_diag = jnp.where(occ_mask, 1.0 + 0.0j, 0.0 + 0.0j)
-                Gij_occ = jnp.einsum(
-                    "kn,nm->knm",
-                    occ_diag.astype(jnp.complex128),
-                    jnp.eye(int(occ_mask.shape[1]), dtype=jnp.complex128),
-                    optimize=True,
-                )
-                with mesh_xy:
-                    sigma_occ_kij = sigma_channel_pipeline(
-                        psi_coh_rmuT_X,
-                        psi_coh_rmu_Y,
-                        psi_proj_rmu_X,
-                        psi_proj_rmuT_Y,
-                        Gij_occ,
-                        Wc0_invalid,
-                    )[0]
-                    sigma_ri_kij = sigma_channel_pipeline(
-                        psi_coh_rmuT_X,
-                        psi_coh_rmu_Y,
-                        psi_proj_rmu_X,
-                        psi_proj_rmuT_Y,
-                        jnp.broadcast_to(
-                            jnp.eye(int(occ_mask.shape[1]), dtype=jnp.complex128)[None, :, :],
-                            (nk, int(occ_mask.shape[1]), int(occ_mask.shape[1])),
-                        ),
-                        Wc0_invalid,
-                    )[0]
-
-                sigma_invalid_static = sigma_occ_kij - 0.5 * sigma_ri_kij
-                sigma_invalid_static_host = np.asarray(jax.device_get(sigma_invalid_static), dtype=np.complex128)
-                print0(
-                    f"  GN invalid-mode static correction: max|Σ|="
-                    f"{float(np.max(np.abs(sigma_invalid_static_host))):.6e} Ry"
-                )
-                if use_kij_stream and sigma_kij_h5_path:
-                    with h5py.File(sigma_kij_h5_path, "r+") as h5_add:
-                        dset = h5_add["sigma_c_kij_ry"]
-                        for ibeg in range(0, n_omega, int(max(1, omega_batch_size))):
-                            iend = min(ibeg + int(max(1, omega_batch_size)), n_omega)
-                            dset[ibeg:iend] = dset[ibeg:iend] + sigma_invalid_static_host[None, ...]
-                else:
-                    sigma_kij_host = sigma_kij_host + sigma_invalid_static_host[None, ...]
         else:
             raise RuntimeError("Internal error: no valid Σc(ω) accumulation path selected.")
     finally:
@@ -1486,16 +1335,10 @@ def compute_sigma_c_ppm_omega_grid(
             h5_kij.close()
 
     sigma_kij_req = None if sigma_kij_host is None else jnp.asarray(sigma_kij_host, dtype=jnp.complex128)
-    sigma_plus_req = None if sigma_plus_host is None else jnp.asarray(sigma_plus_host, dtype=jnp.complex128)
-    sigma_minus_req = None if sigma_minus_host is None else jnp.asarray(sigma_minus_host, dtype=jnp.complex128)
     return SigmaOmegaResult(
         omega_ry=np.asarray(omega_req, dtype=np.float64),
         omega_ev=np.asarray(omega_req * 13.6056980659, dtype=np.float64),
         sigma_c_kij=sigma_kij_req,
-        sigma_c_plus_kij=sigma_plus_req,
-        sigma_c_minus_kij=sigma_minus_req,
-        sigma_c_invalid_static_kij=(None if sigma_invalid_static_host is None else jnp.asarray(sigma_invalid_static_host, dtype=jnp.complex128)),
-        sigma_munu_h5_path=stream_path,
         sigma_kij_h5_path=kij_stream_path,
     )
 
