@@ -72,6 +72,9 @@ class HamiltonianK:
     vnl_Z: jax.Array                # (total_R, nG) complex128
     vnl_E: jax.Array                # (nspinor, nspinor, total_R, total_R) complex128
 
+    # Preconditioner diagonal (for Davidson): h_diag = T + v_of_0 + V_NL_diag
+    h_diag: jax.Array               # (nG,) float64 — QE's g_psi convention
+
     nG: int
     fft_grid: tuple[int, int, int]
 
@@ -203,6 +206,50 @@ def build_vnl_kdata(
     return kdata.Z, kdata.E_super
 
 
+def build_h_diag(
+    T_diag: jax.Array,
+    V_loc_r: jax.Array,
+    vnl_Z: jax.Array,
+    vnl_E: jax.Array,
+) -> jax.Array:
+    """Hamiltonian diagonal for the Davidson preconditioner (QE convention).
+
+    h_diag(G) = |k+G|² + V_loc(G=0) + V_NL_diag(G)
+
+    - V_loc(G=0) = mean(V_loc_r): the G=0 Fourier component of the local
+      ionic potential.  This is the `v_of_0` in QE's `setlocal.f90`.
+      V_H and V_xc are NOT included (V_H(G=0)=0 by convention;
+      V_xc(G=0) is small and not included in QE's h_diag).
+
+    - V_NL_diag(G) = Σ_R |Z(R,G)|² E(R,R): the diagonal of the KB
+      nonlocal potential in the plane-wave basis.
+
+    Parameters
+    ----------
+    T_diag : (nG,) — |k+G|²
+    V_loc_r : (nx, ny, nz) — ionic local potential (NOT V_scf)
+    vnl_Z : (total_R, nG) — KB projectors
+    vnl_E : (nspinor, nspinor, total_R, total_R) — D-matrix
+    """
+    v_of_0 = jnp.mean(V_loc_r)
+
+    # V_NL diagonal: sum over spinor channels and projectors
+    # ⟨G,s|V_NL|G,s⟩ = Σ_{R,Q} conj(Z[R,G]) E[s,s,R,Q] Z[Q,G]
+    # For the diagonal, sum over s:
+    nspinor = vnl_E.shape[0]
+    vnl_diag = jnp.zeros(T_diag.shape[0], dtype=jnp.float64)
+    for s in range(nspinor):
+        # E_ss[R,Q] = vnl_E[s,s,R,Q]
+        E_ss = vnl_E[s, s]  # (total_R, total_R)
+        # Σ_R,Q conj(Z[R,G]) E_ss[R,Q] Z[Q,G]
+        EZ = E_ss @ vnl_Z  # (total_R, nG)
+        vnl_diag = vnl_diag + jnp.real(
+            jnp.sum(jnp.conj(vnl_Z) * EZ, axis=0)
+        )
+
+    return T_diag + v_of_0 + vnl_diag
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Setup: build HamiltonianK for one k-point
 # ═══════════════════════════════════════════════════════════════════════
@@ -214,6 +261,7 @@ def setup_H_k(
     wfn,
     sym,
     meta,
+    V_loc_r: jax.Array | None = None,
 ) -> HamiltonianK:
     """Assemble all per-k Hamiltonian data (SymMaps path).
 
@@ -223,9 +271,13 @@ def setup_H_k(
     V_scf : (nx, ny, nz) — V_loc + V_H + V_xc, from build_V_scf
     vnl_setup : from vnl_ops.build_vnl_setup (k-independent, built once)
     wfn, sym, meta : standard LORRAX objects
+    V_loc_r : (nx, ny, nz) — ionic local potential alone, for h_diag.
+        If None, h_diag falls back to T_diag only.
     """
     T_diag, Gx, Gy, Gz = build_T_diag(k_idx, wfn, sym, meta)
     vnl_Z, vnl_E = build_vnl_kdata(k_idx, vnl_setup, wfn, sym, meta)
+    h_diag = (build_h_diag(T_diag, V_loc_r, vnl_Z, vnl_E)
+              if V_loc_r is not None else T_diag)
 
     return HamiltonianK(
         T_diag=T_diag,
@@ -233,6 +285,7 @@ def setup_H_k(
         Gx=Gx, Gy=Gy, Gz=Gz,
         vnl_Z=vnl_Z,
         vnl_E=vnl_E,
+        h_diag=h_diag,
         nG=int(Gx.shape[0]),
         fft_grid=tuple(int(x) for x in meta.fft_grid),
     )
@@ -244,6 +297,7 @@ def setup_H_k_from_kvec(
     vnl_setup,
     crystal,
     meta,
+    V_loc_r: jax.Array | None = None,
 ) -> HamiltonianK:
     """Assemble per-k Hamiltonian data (standalone, no SymMaps / WFN.h5).
 
@@ -254,14 +308,15 @@ def setup_H_k_from_kvec(
     vnl_setup : from vnl_ops.build_vnl_setup
     crystal : CrystalData or any object with bdot, ecutwfc, fft_grid
     meta : Meta object (for nspinor)
+    V_loc_r : (nx, ny, nz) — ionic local potential alone, for h_diag.
     """
     import psp.vnl_ops as vnl_ops
 
     T_diag, Gx, Gy, Gz = build_T_diag_from_kvec(kvec, crystal)
-
-    # Recover integer G-vectors from the Gx/Gy/Gz indices for VNL
     Gk_int = np.stack([np.asarray(Gx), np.asarray(Gy), np.asarray(Gz)], axis=-1)
     kdata = vnl_ops.build_vnl_kdata_from_kvec(kvec, Gk_int, vnl_setup)
+    h_diag = (build_h_diag(T_diag, V_loc_r, kdata.Z, kdata.E_super)
+              if V_loc_r is not None else T_diag)
 
     return HamiltonianK(
         T_diag=T_diag,
@@ -269,6 +324,7 @@ def setup_H_k_from_kvec(
         Gx=Gx, Gy=Gy, Gz=Gz,
         vnl_Z=kdata.Z,
         vnl_E=kdata.E_super,
+        h_diag=h_diag,
         nG=int(Gx.shape[0]),
         fft_grid=tuple(int(x) for x in crystal.fft_grid),
     )
