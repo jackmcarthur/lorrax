@@ -92,17 +92,19 @@ def _get_chi_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
         E_gap = cmin - vmax
         quad_w = -2.0 * z_lm * w_i * jnp.exp(-(z_lm * E_gap - 1.0) * tau_i)
 
+        from .greens_function_kernel import build_G as _build_G
+
         def tau_body(itau, chi_R_acc):
             tau = tau_i[itau]
-            exp_v = jnp.where(val_mask,
+            phases_v = jnp.where(val_mask,
                 jnp.exp(-z_lm * tau * (vmax - enk_v)), jnp.zeros_like(enk_v))
-            exp_c = jnp.where(cond_mask,
+            phases_c = jnp.where(cond_mask,
                 jnp.exp(-z_lm * tau * (enk_c - cmin)), jnp.zeros_like(enk_c))
 
-            Gv_k = jnp.einsum('ksxn,kn,knty->ksxty',
-                jnp.conj(psi_val_xn), exp_v.astype(jnp.complex128), psi_val_yr, optimize=True)
-            Gc_k = jnp.einsum('ksxm,km,kmty->ksxty',
-                jnp.conj(psi_cond_xn), exp_c.astype(jnp.complex128), psi_cond_yr, optimize=True)
+            # conj() because build_G conjugates psi_yr (ν side) but chi0 needs
+            # conjugation on psi_xn (μ side). For real phases, conj(G) = G†.
+            Gv_k = jnp.conj(_build_G(psi_val_xn, psi_val_yr, phases=phases_v))
+            Gc_k = jnp.conj(_build_G(psi_cond_xn, psi_cond_yr, phases=phases_c))
 
             Gv_R = _G_ifftn(Gv_k)   # G_v(+R)
             Gc_mR = _G_fftn(Gc_k)    # G_c(-R)
@@ -248,15 +250,15 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
         return _raw_fftn_chi(jax.lax.with_sharding_constraint(
             c_R.reshape(nkx, nky, nkz, *c_R.shape[1:]), _chi_shard)).reshape(nk, *c_R.shape[1:])
 
+    from .greens_function_kernel import build_G as _build_G_mm
+
     @jax.jit
     def _build_G(psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
                  enk_v, enk_c, tau_scalar, vmax, cmin):
-        exp_v = jnp.exp(-tau_scalar * (vmax - enk_v))
-        exp_c = jnp.exp(-tau_scalar * (enk_c - cmin))
-        Gv_k = jnp.einsum('ksxn,kn,knty->ksxty',
-            jnp.conj(psi_val_xn), exp_v.astype(jnp.complex128), psi_val_yr, optimize=True)
-        Gc_k = jnp.einsum('ksxm,km,kmty->ksxty',
-            jnp.conj(psi_cond_xn), exp_c.astype(jnp.complex128), psi_cond_yr, optimize=True)
+        phases_v = jnp.exp(-tau_scalar * (vmax - enk_v))
+        phases_c = jnp.exp(-tau_scalar * (enk_c - cmin))
+        Gv_k = jnp.conj(_build_G_mm(psi_val_xn, psi_val_yr, phases=phases_v))
+        Gc_k = jnp.conj(_build_G_mm(psi_cond_xn, psi_cond_yr, phases=phases_c))
         return Gv_k, Gc_k
 
     @partial(jax.jit, donate_argnums=(0,))

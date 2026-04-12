@@ -261,7 +261,8 @@ def _get_sigma_channel_pipeline(
         psi_coh_rmu_Y: jax.Array,
         Gij: jax.Array,
     ) -> jax.Array:
-        G_k = get_G_mu_nu_fn(psi_coh_rmuT_X, psi_coh_rmu_Y, Gij)
+        from .greens_function_kernel import build_G
+        G_k = build_G(psi_coh_rmuT_X, psi_coh_rmu_Y, Gij=Gij)
         G_7d = G_k.transpose(1, 2, 3, 4, 0).reshape(
             G_k.shape[1], G_k.shape[2], G_k.shape[3], G_k.shape[4], nkx, nky, nkz
         )
@@ -1057,15 +1058,14 @@ def compute_sigma_c_ppm_omega_grid(
     ppm_options,
     *,
     sigma_window_quad: SigmaQuadratureConfig | None = None,
-    get_G_fn=None,
     get_project_ri_fn=None,
     print0=print,
     # Legacy kwargs accepted but ignored for backward compat during migration:
     **_legacy_kwargs,
 ) -> SigmaOmegaResult:
     """Compute Σ^c_kij(ω) via GN-PPM windowed minimax integration."""
-    if get_G_fn is None or get_project_ri_fn is None:
-        raise ValueError("get_G_fn and get_project_ri_fn must be provided.")
+    if get_project_ri_fn is None:
+        raise ValueError("get_project_ri_fn must be provided.")
 
     # Unpack from bundles
     s = wfns.slices
@@ -1105,8 +1105,9 @@ def compute_sigma_c_ppm_omega_grid(
     sigma_kij_h5_path = getattr(ppm_options, 'sigma_kij_h5_path', None)
     fermi_reference = getattr(ppm_options, 'fermi_reference', 'midgap')
 
-    # Rename callbacks for internal use
-    get_G_mu_nu_fn = get_G_fn
+    # Internal callback aliases
+    from .greens_function_kernel import build_G as _build_G_module
+    get_G_mu_nu_fn = _build_G_module  # used for cache key stability
     get_sigma_kij_channels_fn = get_project_ri_fn
     sigma_scale = 1.0
     sigma_flip_neg = False

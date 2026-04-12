@@ -409,9 +409,7 @@ def _hartree(wfns, Gij, V, nk_tot):
 	Vrho = jnp.einsum('xy,y->x', V[0], rho / jnp.asarray(nk_tot, dtype=jnp.float64), optimize=True)
 	return jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_xr), Vrho, psi_xr, optimize=True)
 
-# Callback for ppm_sigma (builds occupation-weighted G)
-build_G_occ = lambda psi_xn, psi_yr, Gij: jnp.einsum(
-	'ksxi,kij,kjty->ksxty', psi_xn, Gij, jnp.conj(psi_yr), optimize=True)
+from .greens_function_kernel import build_G
 
 def _flatten_V_W(V_qmunu, W_q, meta):
 	"""Flatten V_qmunu → V(nk,μ,μ) and W_q → W(nk,μ,μ).  W_q=None → W=V."""
@@ -643,15 +641,13 @@ def main(argv=None):
 	@jax.jit
 	def sigma_sx(wfns, Gij, W):
 		s = wfns.slices
-		G_occ = jnp.einsum('ksxi,kij,kjty->ksxty',
-			wfns.xn(s.sigma), Gij, jnp.conj(wfns.yr(s.sigma)), optimize=True)
+		G_occ = build_G(wfns.xn(s.sigma), wfns.yr(s.sigma), Gij=Gij)
 		return _project(wfns.xr(s.sigma), wfns.yn(s.sigma), _convolve(G_occ, W, 1.0))
 
 	@jax.jit
 	def sigma_coh(wfns, W, V):
 		s = wfns.slices
-		G_ri = jnp.einsum('ksxn,knty->ksxty',
-			wfns.xn(s.full), jnp.conj(wfns.yr(s.full)), optimize=True)
+		G_ri = build_G(wfns.xn(s.full), wfns.yr(s.full))
 		return _project(wfns.xr(s.sigma), wfns.yn(s.sigma), _convolve(G_ri, W - V, -0.5))
 
 	@jax.jit
@@ -720,7 +716,6 @@ def main(argv=None):
 			sigma_omega = compute_sigma_c_ppm_omega_grid(
 				wfns, ppm, meta, mesh_xy, ppm_options,
 				sigma_window_quad=sigma_window_quad,
-				get_G_fn=build_G_occ,
 				get_project_ri_fn=_project_ri,
 				print0=print0,
 			)
