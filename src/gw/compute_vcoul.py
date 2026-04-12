@@ -919,6 +919,9 @@ def compute_all_V_q_from_zeta_h5(
             )
         
         from common.progress import LoopProgress
+        if verbose:
+            print(f"  V_q: {nq_total} q-points, batch={effective_q_batch}, "
+                  f"mu={n_rmu} (single chunk), overlapped H5 I/O")
         vq_progress = LoopProgress(
             nq_total, print, title="V_q computation",
             item_name="q-point", max_updates=min(nq_total, 20))
@@ -977,6 +980,8 @@ def compute_all_V_q_from_zeta_h5(
         g0_mu_np = np.zeros((nkx, nky, nkz, n_rmu), dtype=np.complex128)
         
         from common.progress import LoopProgress
+        if verbose:
+            print(f"  V_q: {nq_total} q-points, {n_chunks} mu-chunks of {mu_chunk_size}")
         vq_progress = LoopProgress(
             nq_total, print, title="V_q computation",
             item_name="q-point", max_updates=min(nq_total, 20))

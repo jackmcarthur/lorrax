@@ -714,14 +714,9 @@ def fit_zeta_chunked_to_h5(
     nb_right = band_range_right[1] - band_range_right[0]
     nb_full = band_range_full[1] - band_range_full[0]
 
-    print(f"\n{'='*60}")
-    print(f"Zeta fitting: {num_chunks} r-chunks, {n_rchunk} points each")
-    print(f"  Left bands:  {band_range_left} ({nb_left} bands)")
-    print(f"  Right bands: {band_range_right} ({nb_right} bands)")
-    print(f"  Full range:  {band_range_full} ({nb_full} bands)")
-    print(f"  Pair mode:   {isdf_pair_mode}")
-    print(f"Output: {output_file}")
-    print(f"{'='*60}")
+    print(f"\n  Zeta fitting: {num_chunks} r-chunks x {n_rchunk} r-points, "
+          f"{nb_full} bands ({nb_left} left + {nb_right} right), {isdf_pair_mode}")
+    print(f"  Output: {output_file}")
 
     # ========== STEP 1: Load wavefunctions at centroids (band-chunked) ==========
     # Load full range, then slice for left and right
@@ -757,21 +752,18 @@ def fit_zeta_chunked_to_h5(
 
     # ========== STEP 2: Compute CCT (C_q) from left/right pair densities ==========
     with timing.section("zeta_fit.CCT"):
+        print(f"  Computing pair densities P_l, P_r ({isdf_pair_mode})")
         if isdf_pair_mode == "spin_traced":
-            print("\nComputing spin-traced pair densities P_l and P_r...")
             P_l_k = compute_pair_density_spin_traced(psi_l_rmuT_X, psi_l_rmu_Y, mesh_xy)
             P_r_k = compute_pair_density_spin_traced(psi_r_rmuT_X, psi_r_rmu_Y, mesh_xy)
             P_l_k.block_until_ready()
             P_r_k.block_until_ready()
-            print("Computing C_q from left/right cross-product...")
             C_q = compute_CCT_from_left_right(P_l_k, P_r_k, kgrid, mesh_xy)
         else:
-            print("\nComputing spin-matrix pair densities P_l,ab and P_r,ab...")
             P_l_k = compute_pair_density_spin_matrix(psi_l_rmuT_X, psi_l_rmu_Y, mesh_xy)
             P_r_k = compute_pair_density_spin_matrix(psi_r_rmuT_X, psi_r_rmu_Y, mesh_xy)
             P_l_k.block_until_ready()
             P_r_k.block_until_ready()
-            print("Computing C_q from spin-channel-contracted left/right cross-product...")
             C_q = compute_CCT_from_left_right_spin_matrix(P_l_k, P_r_k, kgrid, mesh_xy)
         C_q.block_until_ready()
         # C_q: (nqx, nqy, nqz, n_rmu, n_rmu)
@@ -786,10 +778,10 @@ def fit_zeta_chunked_to_h5(
 
     # ========== STEP 3: Compute L_q = chol(C_q) once ==========
     with timing.section("zeta_fit.cholesky"):
-        print("\nComputing L_q = chol(C_q) using 2D blocked algorithm...")
+        print(f"  Computing L_q = chol(C_q)")
         L_q = compute_L_q_from_CCT(C_q_flat, mesh_xy)
         L_q.block_until_ready()
-        print(f"  L_q shape: {L_q.shape}")
+        print(f"  L_q: {L_q.shape}")
 
     # Free C_q to reclaim GPU memory before z-chunk loop
     # (P_k_mumu was already deleted above)
@@ -831,16 +823,14 @@ def fit_zeta_chunked_to_h5(
 
     if use_gspace_cache:
         with timing.section("zeta_fit.cache_gspace"):
-            print("\nCaching G-space wavefunctions for r-chunk loop...")
-            # Cache FULL band range (max of left and right)
+            print(f"  Caching G-space wavefunctions for r-chunk loop")
             cached_gspace = load_gspace_for_bands(
                 wfn, sym, meta, mesh_xy, band_range_full, bispinor, band_chunk_size
             )
-            print(f"  Cached {len(cached_gspace)} band chunks (sharded across devices)")
+            print(f"  G-space cache: {len(cached_gspace)} band chunks")
     else:
         cached_gspace = None
-        print("\nG-space caching DISABLED (too large for memory budget)")
-        print("  Will reload from HDF5 each r-chunk (slower)")
+        print("  G-space cache: disabled (exceeds memory budget)")
 
     # ========== STEP 6: Loop over chunks ==========
     # Track timing for summary (manual perf_counter for detailed breakdown)
@@ -1088,24 +1078,12 @@ def fit_zeta_chunked_to_h5(
     if cached_gspace is not None:
         del cached_gspace
 
-    # Print summary
-    print()  # Clear the \r line
-    print(f"\nWritten to {output_file}")
-    print(f"{'='*60}")
-    print(f"Zeta fitting complete!")
-    print(f"  Shape: ({nqx}, {nqy}, {nqz}, {n_rmu}, {n_rtot})")
-    print(f"{'='*60}")
-    print(f"\nTiming Summary ({num_chunks} r-chunks):")
-    print(f"  {'Phase':<20} {'Total':>10} {'Per-chunk':>12} {'%':>6}")
-    print(f"  {'-'*50}")
-    print(f"  {'Load chunk':<20} {t_load_total:>10.2f}s {t_load_total/num_chunks*1000:>10.1f}ms {100*t_load_total/t_chunks_total:>6.1f}%")
-    print(f"  {'Pair density':<20} {t_pair_total:>10.2f}s {t_pair_total/num_chunks*1000:>10.1f}ms {100*t_pair_total/t_chunks_total:>6.1f}%")
-    print(f"  {'ZCT (FFT pipeline)':<20} {t_zct_total:>10.2f}s {t_zct_total/num_chunks*1000:>10.1f}ms {100*t_zct_total/t_chunks_total:>6.1f}%")
-    print(f"  {'Solve (L^-1 Z)':<20} {t_solve_total:>10.2f}s {t_solve_total/num_chunks*1000:>10.1f}ms {100*t_solve_total/t_chunks_total:>6.1f}%")
-    print(f"  {'H5 write':<20} {t_write_total:>10.2f}s {t_write_total/num_chunks*1000:>10.1f}ms {100*t_write_total/t_chunks_total:>6.1f}%")
-    print(f"  {'-'*50}")
-    print(f"  {'Chunk loop total':<20} {t_chunks_total:>10.2f}s {t_chunks_total/num_chunks*1000:>10.1f}ms")
-    print(f"  {'Per r-point':<20} {'':<10} {t_chunks_total/n_rtot*1e6:>10.1f}us")
+    # Per-stage timing breakdown
+    print(f"  Zeta output: {output_file}  shape: ({nqx},{nqy},{nqz},{n_rmu},{n_rtot})")
+    print(f"  Timing ({num_chunks} r-chunks, {t_chunks_total:.1f}s total):")
+    for label, t in [("load", t_load_total), ("pair", t_pair_total),
+                     ("ZCT", t_zct_total), ("solve", t_solve_total), ("H5", t_write_total)]:
+        print(f"    {label:<6} {t:6.2f}s  {100*t/t_chunks_total:4.1f}%")
 
     # Return left/right centroid wavefunctions + peak memory high-water mark.
     return psi_l_rmu_Y, psi_r_rmu_Y, psi_l_rmuT_X, psi_r_rmuT_X, _peak_bytes
