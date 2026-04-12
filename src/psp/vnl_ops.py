@@ -244,11 +244,37 @@ def build_vnl_kdata(
     *,
     compute_dZ: bool = False,
 ) -> VNLKData:
-    """Build dense Z [and dZ] for one k-point."""
-    nspinor = setup.nspinor
+    """Build dense Z [and dZ] for one k-point (SymMaps path)."""
     Gk_crys, _ = generate_gvectors_k(k_idx, sym, wfn, meta)
-    Gk_np = np.asarray(Gk_crys, dtype=int)
     kvec = np.asarray(sym.unfolded_kpts[k_idx], dtype=float)
+    return _build_vnl_kdata_core(kvec, np.asarray(Gk_crys, dtype=int),
+                                  setup, compute_dZ=compute_dZ)
+
+
+def build_vnl_kdata_from_kvec(
+    kvec: np.ndarray,
+    Gk_int: np.ndarray,
+    setup: VNLSetup,
+    crystal=None,
+    meta=None,
+    *,
+    compute_dZ: bool = False,
+) -> VNLKData:
+    """Build dense Z [and dZ] from explicit k-vector + G-list (no SymMaps)."""
+    return _build_vnl_kdata_core(np.asarray(kvec, dtype=float),
+                                  np.asarray(Gk_int, dtype=int),
+                                  setup, compute_dZ=compute_dZ)
+
+
+def _build_vnl_kdata_core(
+    kvec: np.ndarray,
+    Gk_np: np.ndarray,
+    setup: VNLSetup,
+    *,
+    compute_dZ: bool = False,
+) -> VNLKData:
+    """Core: build dense VNL projectors from k-vector + G-vectors."""
+    nspinor = setup.nspinor
     nG = Gk_np.shape[0]
 
     K_crys = jnp.asarray(Gk_np, dtype=jnp.float64) + jnp.asarray(kvec)[None, :]

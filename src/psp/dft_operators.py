@@ -89,28 +89,71 @@ def build_T_diag(
     sym,
     meta,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Kinetic diagonal |k+G|² and G-vector FFT-box indices.
+    """Kinetic diagonal |k+G|² and G-vector FFT-box indices (SymMaps path).
 
     Returns (T_diag, Gx, Gy, Gz) where T_diag is (nG,) float64 in Ry
     and Gx, Gy, Gz are (nG,) int32 FFT-box indices.
     """
-    from psp.get_DFT_mtxels import generate_gvectors_k
-
-    Gk_crys, _ = generate_gvectors_k(k_idx, sym, wfn, meta)
-    Gk_np = np.asarray(Gk_crys, dtype=int)
     kvec = np.asarray(sym.unfolded_kpts[k_idx], dtype=float)
+    from psp.get_DFT_mtxels import generate_gvectors_k
+    Gk_crys, _ = generate_gvectors_k(k_idx, sym, wfn, meta)
+    return _T_diag_from_G(np.asarray(Gk_crys, dtype=int), kvec, wfn.bdot)
 
-    Gx = jnp.asarray(Gk_np[:, 0], dtype=jnp.int32)
-    Gy = jnp.asarray(Gk_np[:, 1], dtype=jnp.int32)
-    Gz = jnp.asarray(Gk_np[:, 2], dtype=jnp.int32)
 
-    bdot = np.asarray(wfn.bdot, dtype=float)
-    K_crys = np.asarray(Gk_np, dtype=float) + kvec[None, :]
+def build_T_diag_from_kvec(
+    kvec: np.ndarray,
+    crystal,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Kinetic diagonal |k+G|² and G-vector indices (standalone, no SymMaps).
+
+    Generates the PW sphere {G : |k+G|² ≤ ecutwfc} from the cutoff and
+    reciprocal metric.  Use this for self-consistent DFT (Davidson) where
+    SymMaps / WFN.h5 are not available.
+
+    Parameters
+    ----------
+    kvec : (3,) — k-point in crystal coordinates
+    crystal : CrystalData or WFNReader — needs bdot, ecutwfc, fft_grid
+    """
+    kvec = np.asarray(kvec, dtype=float)
+    bdot = np.asarray(crystal.bdot, dtype=float)
+    nx, ny, nz = crystal.fft_grid
+
+    gx = np.fft.fftfreq(nx, d=1.0 / nx).astype(int)
+    gy = np.fft.fftfreq(ny, d=1.0 / ny).astype(int)
+    gz = np.fft.fftfreq(nz, d=1.0 / nz).astype(int)
+    Gx, Gy, Gz = np.meshgrid(gx, gy, gz, indexing="ij")
+    G_all = np.stack([Gx.ravel(), Gy.ravel(), Gz.ravel()], axis=-1)
+
+    KG = G_all.astype(float) + kvec[None, :]
+    KG_sq = np.einsum("gi,ij,gj->g", KG, bdot, KG)
+    mask = KG_sq <= crystal.ecutwfc
+    Gk = G_all[mask]
+
+    # Sort by |k+G|² (matches QE's convention at Gamma; convenient for
+    # any k-point even though QE's ordering isn't strictly sorted for k≠0)
+    order = np.argsort(KG_sq[mask])
+    Gk = Gk[order]
+
+    return _T_diag_from_G(Gk, kvec, bdot)
+
+
+def _T_diag_from_G(
+    Gk_int: np.ndarray,
+    kvec: np.ndarray,
+    bdot: np.ndarray,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Common core: G-vectors + k-vector + metric → (T_diag, Gx, Gy, Gz)."""
+    Gx = jnp.asarray(Gk_int[:, 0], dtype=jnp.int32)
+    Gy = jnp.asarray(Gk_int[:, 1], dtype=jnp.int32)
+    Gz = jnp.asarray(Gk_int[:, 2], dtype=jnp.int32)
+
+    bdot = np.asarray(bdot, dtype=float)
+    K_crys = np.asarray(Gk_int, dtype=float) + np.asarray(kvec, dtype=float)[None, :]
     T_diag = jnp.asarray(
-        np.einsum('gi,ij,gj->g', K_crys, bdot, K_crys),
+        np.einsum("gi,ij,gj->g", K_crys, bdot, K_crys),
         dtype=jnp.float64,
     )
-
     return T_diag, Gx, Gy, Gz
 
 
@@ -172,7 +215,7 @@ def setup_H_k(
     sym,
     meta,
 ) -> HamiltonianK:
-    """Assemble all per-k Hamiltonian data.
+    """Assemble all per-k Hamiltonian data (SymMaps path).
 
     Parameters
     ----------
@@ -192,6 +235,42 @@ def setup_H_k(
         vnl_E=vnl_E,
         nG=int(Gx.shape[0]),
         fft_grid=tuple(int(x) for x in meta.fft_grid),
+    )
+
+
+def setup_H_k_from_kvec(
+    kvec: np.ndarray,
+    V_scf: jax.Array,
+    vnl_setup,
+    crystal,
+    meta,
+) -> HamiltonianK:
+    """Assemble per-k Hamiltonian data (standalone, no SymMaps / WFN.h5).
+
+    Parameters
+    ----------
+    kvec : (3,) — k-point in crystal coordinates
+    V_scf : (nx, ny, nz) — combined local potential
+    vnl_setup : from vnl_ops.build_vnl_setup
+    crystal : CrystalData or any object with bdot, ecutwfc, fft_grid
+    meta : Meta object (for nspinor)
+    """
+    import psp.vnl_ops as vnl_ops
+
+    T_diag, Gx, Gy, Gz = build_T_diag_from_kvec(kvec, crystal)
+
+    # Recover integer G-vectors from the Gx/Gy/Gz indices for VNL
+    Gk_int = np.stack([np.asarray(Gx), np.asarray(Gy), np.asarray(Gz)], axis=-1)
+    kdata = vnl_ops.build_vnl_kdata_from_kvec(kvec, Gk_int, vnl_setup)
+
+    return HamiltonianK(
+        T_diag=T_diag,
+        V_scf=V_scf,
+        Gx=Gx, Gy=Gy, Gz=Gz,
+        vnl_Z=kdata.Z,
+        vnl_E=kdata.E_super,
+        nG=int(Gx.shape[0]),
+        fft_grid=tuple(int(x) for x in crystal.fft_grid),
     )
 
 
