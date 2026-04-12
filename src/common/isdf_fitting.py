@@ -674,10 +674,10 @@ def fit_zeta_chunked_to_h5(
             "spin_matrix_frobenius": Keep spin channels P_ab and contract sum_ab after FFT
 
     Returns:
-        psi_l_rmu_Y: Left centroid wfns (nk, nb_l, ns, n_rmu), Y-sharded
-        psi_l_rmuT_X: Left conjugated wfns (nk, n_rmu, nb_l, ns), X-sharded
-        psi_r_rmu_Y: Right centroid wfns (nk, nb_r, ns, n_rmu), Y-sharded
-        psi_r_rmuT_X: Right conjugated wfns (nk, n_rmu, nb_r, ns), X-sharded
+        psi_l_yr:  Left centroid wfns  (nk, nb_l, ns, n_rmu), Y-sharded
+        psi_r_yr:  Right centroid wfns (nk, nb_r, ns, n_rmu), Y-sharded
+        psi_l_xn:  Left centroid wfns  (nk, ns, n_rmu, nb_l), X-sharded
+        psi_r_xn:  Right centroid wfns (nk, ns, n_rmu, nb_r), X-sharded
     """
     import h5py
 
@@ -1083,6 +1083,7 @@ def fit_zeta_chunked_to_h5(
     print(f"  {'Chunk loop total':<20} {t_chunks_total:>10.2f}s {t_chunks_total/num_chunks*1000:>10.1f}ms")
     print(f"  {'Per r-point':<20} {'':<10} {t_chunks_total/n_rtot*1e6:>10.1f}us")
 
-    # Return left and right centroid wavefunctions (persist for downstream use)
-    # Note: full arrays were already deleted after slicing in STEP 1
-    return psi_l_rmu_Y, psi_l_rmuT_X, psi_r_rmu_Y, psi_r_rmuT_X
+    # Return left/right centroid wavefunctions in both layouts.
+    # yr layout: (nk, nb, ns, n_rmu) — used to assemble the full-band array
+    # xn layout: (nk, ns, n_rmu, nb) — already X-sharded, avoids redundant reshard
+    return psi_l_rmu_Y, psi_r_rmu_Y, psi_l_rmuT_X, psi_r_rmuT_X
