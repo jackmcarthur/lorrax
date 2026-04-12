@@ -674,10 +674,11 @@ def fit_zeta_chunked_to_h5(
             "spin_matrix_frobenius": Keep spin channels P_ab and contract sum_ab after FFT
 
     Returns:
-        psi_l_yr:  Left centroid wfns  (nk, nb_l, ns, n_rmu), Y-sharded
-        psi_r_yr:  Right centroid wfns (nk, nb_r, ns, n_rmu), Y-sharded
-        psi_l_xn:  Left centroid wfns  (nk, ns, n_rmu, nb_l), X-sharded
-        psi_r_xn:  Right centroid wfns (nk, ns, n_rmu, nb_r), X-sharded
+        psi_l_yr:    Left centroid wfns  (nk, nb_l, ns, n_rmu), Y-sharded
+        psi_r_yr:    Right centroid wfns (nk, nb_r, ns, n_rmu), Y-sharded
+        psi_l_xn:    Left centroid wfns  (nk, ns, n_rmu, nb_l), X-sharded
+        psi_r_xn:    Right centroid wfns (nk, ns, n_rmu, nb_r), X-sharded
+        peak_bytes:  GPU high-water mark (peak_bytes_in_use) during chunk loop
     """
     import h5py
 
@@ -1099,10 +1100,6 @@ def fit_zeta_chunked_to_h5(
     print(f"  {'-'*50}")
     print(f"  {'Chunk loop total':<20} {t_chunks_total:>10.2f}s {t_chunks_total/num_chunks*1000:>10.1f}ms")
     print(f"  {'Per r-point':<20} {'':<10} {t_chunks_total/n_rtot*1e6:>10.1f}us")
-    if _peak_bytes > 0:
-        print(f"  {'Peak GPU memory':<20} {_peak_bytes/1e9:>10.2f} GB")
 
-    # Return left/right centroid wavefunctions in both layouts.
-    # yr layout: (nk, nb, ns, n_rmu) — used to assemble the full-band array
-    # xn layout: (nk, ns, n_rmu, nb) — already X-sharded, avoids redundant reshard
-    return psi_l_rmu_Y, psi_r_rmu_Y, psi_l_rmuT_X, psi_r_rmuT_X
+    # Return left/right centroid wavefunctions + peak memory high-water mark.
+    return psi_l_rmu_Y, psi_r_rmu_Y, psi_l_rmuT_X, psi_r_rmuT_X, _peak_bytes

@@ -353,7 +353,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, tmp_dir, print_fn=p
 	print_fn(f"    Zeta output: {zeta_h5_path}")
 
 	with timing.section("gw_jax.zeta_fit_chunked"):
-		psi_l_yr, psi_r_yr, _psi_l_xn, _psi_r_xn = fit_zeta_chunked_to_h5(
+		psi_l_yr, psi_r_yr, _psi_l_xn, _psi_r_xn, peak_bytes = fit_zeta_chunked_to_h5(
 			wfn=wfn, sym=sym, meta=meta,
 			centroid_indices=centroid_indices, mesh_xy=mesh_xy,
 			chunk_r=chunks['chunk_r'], output_file=zeta_h5_path,
@@ -367,6 +367,12 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, tmp_dir, print_fn=p
 			isdf_pair_mode=isdf_pair_mode,
 			k_chunk_size=chunks.get('k_chunk', 0),
 		)
+
+	budget_gb = mem_est.get('budget_gb', cfg.memory_per_device_gb)
+	if peak_bytes > 0:
+		peak_gb = peak_bytes / 1e9
+		print_fn(f"    GPU high-water mark: {peak_gb:.2f} GB / {budget_gb:.2f} GB budget "
+		         f"({100 * peak_gb / budget_gb:.0f}%)")
 
 	return zeta_h5_path, psi_l_yr, psi_r_yr, mem_est
 
