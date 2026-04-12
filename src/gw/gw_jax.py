@@ -708,78 +708,48 @@ def main(argv=None):
 	efermi_dft_ev = None
 	vbm_dft_ev = None
 	cbm_dft_ev = None
-	# Optional: replace static COH with GN-PPM frequency-integrated Sigma^c.
+	# ---- GN-PPM: replace static COH with frequency-integrated Σ^c ----
 	if use_ppm_sigma:
 		if not do_screened:
 			raise ValueError("use_ppm_sigma=true requires do_screened=true.")
 		if self_consistent:
-			raise NotImplementedError("use_ppm_sigma is currently supported only for self_consistent=false.")
-		sig_sx_static_ref = sig_sx
-		sig_coh_static_ref = sig_coh
+			raise NotImplementedError("use_ppm_sigma not supported with self_consistent.")
+		sig_sx_static_ref, sig_coh_static_ref = sig_sx, sig_coh
 		minimax_config = minimax_config_from_params(params)
 		sigma_quadrature = sigma_quadrature_config_from_params(params)
 		opts = build_ppm_sigma_runtime_options(params, input_dir=input_dir, ryd2ev=ryd2ev)
-		if opts.sigma_freq_debug_output and (not opts.sigma_debug_split_contrib):
-			opts.sigma_debug_split_contrib = True
-			print0("  NOTE: enabling sigma_debug_split_contrib for sigma_freq_debug_output")
-		if opts.sigma_freq_debug_output and opts.sigma_omega_accumulation == "kij_stream":
-			opts.sigma_omega_accumulation = "kij"
-			print0("  NOTE: forcing sigma_omega_accumulation='kij' for sigma_freq_debug_output")
-		print0("")
-		print0("-" * 72)
-		print0("  GN-PPM + FREQUENCY-INTEGRATED SIGMA")
-		print0("-" * 72)
-		if opts.ppm_invalid_mode != "static_limit":
-			print0(f"  NOTE: GN invalid-mode policy = {opts.ppm_invalid_mode}")
 		if opts.fermi_reference not in ("vbm", "midgap"):
 			raise ValueError("fermi_reference must be 'vbm' or 'midgap'.")
-		if opts.fermi_reference == "midgap":
-			print0("  NOTE: using midgap reference for Σ^c windowing")
+		print0("\n" + "-" * 72 + "\n  GN-PPM + FREQUENCY-INTEGRATED SIGMA\n" + "-" * 72)
+
 		with timing.section("gw_jax.ppm_sigma"):
-			import time as _ppm_time
-			_ppm_t0 = _ppm_time.perf_counter()
-			# Keep the q=0 head out of the ISDF body PPM fit. The scalar head is
-			# better treated as a separate diagnostic channel than injected into
-			# W^c before pole extraction.
+			# Head fitting (diagnostic only — not injected into ISDF body)
+			head_gn = None
 			if do_G0:
-				head_0 = resolve_head_sample(
-					params, input_dir, wfn, sym, meta, print0, omega=0.0 + 0.0j
-				)
-				head_i = resolve_head_sample(
-					params, input_dir, wfn, sym, meta, print0, omega=1j * float(opts.omega_p_ry)
-				)
-				head_gn = fit_head_gn_from_samples(
-					head_0,
-					head_i,
-					omega_p_ry=opts.omega_p_ry,
-				)
+				head_0 = resolve_head_sample(params, input_dir, wfn, sym, meta, print0, omega=0.0+0.0j)
+				head_i = resolve_head_sample(params, input_dir, wfn, sym, meta, print0,
+					omega=1j * float(opts.omega_p_ry))
+				head_gn = fit_head_gn_from_samples(head_0, head_i, omega_p_ry=opts.omega_p_ry)
 				print0(format_head_pair_diagnostics(head_0, head_i))
 				print0(format_head_diagnostics(head_gn, meta.cell_volume))
-			else:
-				head_gn = None
+
+			# Build PPM poles from minimax W(0) and W(iωp)
+			import time as _ppm_time
+			_ppm_t0 = _ppm_time.perf_counter()
+			eref = minimax_config.energy_reference or opts.fermi_reference
 			ppm = compute_w0_wiwp_and_ppm_from_minimax(
-				V_qmunu_nohead,
-				wfns,
-				meta,
-				mesh_xy,
-				minimax_config=minimax_config,
-				omega_p_ry=opts.omega_p_ry,
-				minimax_energy_reference=(
-					minimax_config.energy_reference
-					if minimax_config.energy_reference is not None else opts.fermi_reference
-				),
-				fallback_omega=opts.ppm_fallback,
-				print0=print0,
-			)
-			_ppm_t1 = _ppm_time.perf_counter()
-			print0(f"  [TIMING] PPM build: {_ppm_t1 - _ppm_t0:.1f}s")
+				V_qmunu_nohead, wfns, meta, mesh_xy,
+				minimax_config=minimax_config, omega_p_ry=opts.omega_p_ry,
+				minimax_energy_reference=eref, fallback_omega=opts.ppm_fallback,
+				print0=print0)
+			print0(f"  [TIMING] PPM build: {_ppm_time.perf_counter() - _ppm_t0:.1f}s")
 
-			def _build_sigma_x_bare_kij():
-				with mesh_xy:
-					result = sigma_sx(wfns, Gij_static, V_flat)
-				result.block_until_ready()
-				return result
+			# Bare exchange Σ_X (needed for Σ^c = Σ_xc - Σ_X)
+			with mesh_xy:
+				sig_x_bare = sigma_sx(wfns, Gij_static, V_flat)
+			sig_x_bare.block_until_ready()
 
+			# Frequency-integrated Σ^c(ω)
 			sigma_omega = compute_sigma_c_ppm_omega_grid(
 				psi_coh_rmuT_X=wfns.xn(s.full),
 				psi_coh_rmu_Y=wfns.yr(s.full),
@@ -792,28 +762,19 @@ def main(argv=None):
 				Wc0_mu_nu=ppm.Wc0_mu_nu,
 				valid_mask_mu_nu=ppm.valid_mask_mu_nu,
 				omega_values_ry=opts.omega_grid_ry,
-				meta=meta,
-				bispinor=bispinor,
-				mesh_xy=mesh_xy,
+				meta=meta, bispinor=bispinor, mesh_xy=mesh_xy,
 				quadrature_config=sigma_quadrature,
 				regularization_width_ry=opts.sigma_regularization_ry,
 				edge_factor=opts.sigma_edge_factor,
 				omega_batch_size=opts.sigma_omega_batch_size,
 				omega_accumulation=opts.sigma_omega_accumulation,
 				sigma_kij_h5_path=opts.sigma_kij_h5_path or None,
-				invalid_mode=opts.ppm_invalid_mode,
-				debug_split_contrib=opts.sigma_debug_split_contrib,
 				fermi_reference=opts.fermi_reference,
-				debug_quadrature=opts.sigma_debug_quadrature,
-				debug_quadrature_samples=opts.sigma_debug_quadrature_samples,
 				get_G_mu_nu_fn=build_G_occ,
-				get_G_R_fn=None,        # unused (ppm_sigma has its own FFT pipeline)
-				get_sigma_mu_nu_fn=None, # unused
 				get_sigma_kij_channels_fn=_project_ri,
 				print0=print0,
 			)
-			_ppm_t2 = _ppm_time.perf_counter()
-			print0(f"  [TIMING] compute_sigma_c_ppm_omega_grid: {_ppm_t2 - _ppm_t1:.1f}s")
+			print0(f"  [TIMING] Σ^c(ω): {_ppm_time.perf_counter() - _ppm_t0:.1f}s")
 			sigma_coh_ppm_omega_kij = sigma_omega.sigma_c_kij
 			iw0 = int(np.argmin(np.abs(opts.omega_grid_ry)))
 			if sigma_coh_ppm_omega_kij is None:
@@ -826,8 +787,7 @@ def main(argv=None):
 				sigma_coh_ppm_kij = sigma_coh_ppm_omega_kij[iw0]
 				sigma_coh_ppm_kij.block_until_ready()
 
-			sigma_x_bare_kij = _build_sigma_x_bare_kij()
-
+			
 			if meta.rank == 0:
 				# Evaluate Sigma_c(E_DFT) and Sigma_xc(E_DFT) for BGW comparisons and eqp_g0w0 output.
 				energies_full_dft, _ = get_enk_bandrange(
@@ -924,15 +884,15 @@ def main(argv=None):
 					) * ryd2ev
 				else:
 					sigma_c_invalid_static_diag_ev = np.zeros((nk, nb), dtype=np.complex128)
-				sigma_x_diag_ev = np.diagonal(np.asarray(sigma_x_bare_kij), axis1=1, axis2=2) * ryd2ev
+				sigma_x_diag_ev = np.diagonal(np.asarray(sig_x_bare), axis1=1, axis2=2) * ryd2ev
 				sigma_xc_at_dft_ev = sigma_x_diag_ev + sigma_c_at_dft_ev
 
 			coh_diff_abs = float(jnp.max(jnp.abs(sigma_coh_ppm_kij - sig_coh)))
 			coh_ref = max(float(jnp.max(jnp.abs(sig_coh))), 1.0e-16)
-			sx_diff_abs = float(jnp.max(jnp.abs(sigma_x_bare_kij - sig_sx_static_ref)))
+			sx_diff_abs = float(jnp.max(jnp.abs(sig_x_bare - sig_sx_static_ref)))
 			sx_ref = max(float(jnp.max(jnp.abs(sig_sx_static_ref))), 1.0e-16)
 			static_total_ref = sig_sx_static_ref + sig_coh_static_ref
-			gw_total_0 = sigma_x_bare_kij + sigma_coh_ppm_kij
+			gw_total_0 = sig_x_bare + sigma_coh_ppm_kij
 			total_diff_abs = float(jnp.max(jnp.abs(gw_total_0 - static_total_ref)))
 			total_ref = max(float(jnp.max(jnp.abs(static_total_ref))), 1.0e-16)
 			print0(f"  Replacing static COH with PPM-integrated Σ^c(ω={opts.omega_grid_ry[iw0]:.6f} Ry)")
@@ -942,7 +902,7 @@ def main(argv=None):
 				f"  [Σ^X + Σ^c(0)] vs [Σ^SX + Σ^COH]: abs={total_diff_abs:.6e} Ry "
 				f"({total_diff_abs * ryd2ev:.6e} eV), rel={total_diff_abs / total_ref:.6e}"
 			)
-			sig_sx = sigma_x_bare_kij
+			sig_sx = sig_x_bare
 			sig_coh = sigma_coh_ppm_kij
 
 			sigma_omega_h5_path = params.get("sigma_omega_h5_file", "sigma_mnk.h5")
@@ -1006,7 +966,7 @@ def main(argv=None):
 										sigma_c_diag_omega_ev_file[:, ik, ib],
 										omega_dft_rel_ev[ik, ib],
 									)
-							sigma_x_diag_ev = np.diagonal(np.asarray(sigma_x_bare_kij), axis1=1, axis2=2) * ryd2ev
+							sigma_x_diag_ev = np.diagonal(np.asarray(sig_x_bare), axis1=1, axis2=2) * ryd2ev
 							sigma_c_at_dft_ev = sigma_c_at_dft_from_file
 							sigma_xc_at_dft_ev = sigma_x_diag_ev + sigma_c_at_dft_ev
 							if "omega_dft_rel_ev" in h5:
@@ -1372,7 +1332,7 @@ def main(argv=None):
 		kin_ion_diag_ev = np.diagonal(np.asarray(kin_ion_full), axis1=1, axis2=2) * ryd2ev
 		sex_static_diag_ev = np.diagonal(np.asarray(sig_sx_static_ref), axis1=1, axis2=2) * ryd2ev
 		coh_static_diag_ev = np.diagonal(np.asarray(sig_coh_static_ref), axis1=1, axis2=2) * ryd2ev
-		x_diag_ev = np.diagonal(np.asarray(sigma_x_bare_kij), axis1=1, axis2=2) * ryd2ev
+		x_diag_ev = np.diagonal(np.asarray(sig_x_bare), axis1=1, axis2=2) * ryd2ev
 		sigma_c_w0_diag_ev = np.diagonal(np.asarray(sigma_coh_ppm_kij), axis1=1, axis2=2) * ryd2ev
 		if sigma_c_plus_at_dft_ev is None:
 			sigma_c_plus_at_dft_ev = np.full_like(sigma_c_at_dft_ev, np.nan + 1j * np.nan, dtype=np.complex128)
