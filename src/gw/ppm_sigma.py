@@ -320,29 +320,17 @@ def _get_sigma_tau_channel_kernel(
     nkz: int,
     nk_tot: int,
     bispinor: bool,
-    get_G_mu_nu_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array],
-    get_G_R_fn: Callable[[jax.Array, int, int, int], jax.Array],
-    get_sigma_mu_nu_fn: Callable[[jax.Array, jax.Array, int, bool], jax.Array],
-    get_sigma_kij_channels_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array],
+    get_G_mu_nu_fn,
+    get_sigma_kij_channels_fn,
 ) -> Callable[..., jax.Array]:
     """Return a cached tau-node sigma builder with jittable local FFTs."""
 
     cache_key = (
-        id(mesh_xy),
-        int(nkx),
-        int(nky),
-        int(nkz),
-        int(nk_tot),
-        bool(bispinor),
-        id(get_G_mu_nu_fn),
-        id(get_sigma_kij_channels_fn),
+        id(mesh_xy), nkx, nky, nkz, nk_tot, bispinor,
+        id(get_G_mu_nu_fn), id(get_sigma_kij_channels_fn),
     )
     if cache_key in _sigma_tau_channel_kernel_cache:
         return _sigma_tau_channel_kernel_cache[cache_key]
-
-    # Intentionally unused here: the tau-node path reconstructs the sigma FFT
-    # pipeline directly from get_G_mu_nu / projection helpers.
-    del get_G_R_fn, get_sigma_mu_nu_fn
 
     w_isdf._ensure_compilation_cache()
     mu_shard = _mu_nu_sharding(mesh_xy)
@@ -782,8 +770,6 @@ def _convolve_sigma_branch_kij(
     bispinor: bool,
     mesh_xy: Mesh,
     get_G_mu_nu_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array],
-    get_G_R_fn: Callable[[jax.Array, int, int, int], jax.Array],
-    get_sigma_mu_nu_fn: Callable[[jax.Array, jax.Array, int, bool], jax.Array],
     get_sigma_kij_channels_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array],
     omega_sign_flip: int = 1,
     log_tag: str = "",
@@ -791,8 +777,6 @@ def _convolve_sigma_branch_kij(
     omega_batch_size: int = 4,
     stream_writer: Callable[[np.ndarray, jax.Array], None] | None = None,
     scale: float = 1.0,
-    debug_quadrature: bool = False,
-    debug_quadrature_samples: int = 200,
     efermi_vac: float | None = None,
     axis_kind: str = "",
     use_shipped_minimax_tables: bool = True,
@@ -880,78 +864,6 @@ def _convolve_sigma_branch_kij(
             f"kernel_sign={kernel_sign:+d}, axis={axis_kind or 'unknown'}"
         )
 
-    if debug_quadrature:
-        nsamp = max(50, int(debug_quadrature_samples))
-        for win in windows:
-            mask_A = np.asarray(win.mask_A, dtype=bool)
-            count_A = int(np.sum(mask_A))
-            total_A = int(mask_A.size)
-            count_B = int(win.mask_B_count or 0)
-            total_B = int(win.mask_B_total or mask_B_total)
-            nband = None
-            if mask_A.ndim == 2:
-                nband = int(np.sum(np.any(mask_A, axis=0)))
-            if count_A > 0:
-                A_vals = np.asarray(E_A_host[mask_A], dtype=np.float64)
-                A_min = float(np.min(A_vals))
-                A_max = float(np.max(A_vals))
-            else:
-                A_min = None
-                A_max = None
-            B_min = win.mask_B_min
-            B_max = win.mask_B_max
-            if win.x_min is not None and win.x_max is not None:
-                x_grid = np.exp(np.linspace(np.log(win.x_min), np.log(win.x_max), nsamp))
-                approx = np.zeros_like(x_grid)
-                for tau, alpha in zip(win.t_nodes, win.alpha):
-                    tau_l = float(np.abs(np.imag(tau)))
-                    approx += float(alpha) * np.exp(-tau_l * x_grid)
-                err = np.max(np.abs(1.0 / x_grid - approx))
-                print0(
-                    f"  [quad] {log_tag}{win.name}: nodes={int(win.alpha.shape[0])}, "
-                    f"max|1/x-approx|={err:.3e} on [{win.x_min:.3e}, {win.x_max:.3e}]"
-                )
-            elif win.crossing_A is not None:
-                u_grid = np.linspace(0.0, float(win.crossing_A), nsamp)
-                tau_orig = np.asarray(np.real(win.t_nodes), dtype=np.float64) * float(regularization_width_ry)
-                alpha_orig = np.asarray(win.alpha, dtype=np.float64) * float(regularization_width_ry)
-                approx = np.zeros_like(u_grid)
-                for tau, alpha in zip(tau_orig, alpha_orig):
-                    approx += float(alpha) * np.sin(float(tau) * u_grid)
-                target = _G_hgl(u_grid) if win.crossing_kind == "hgl" else _G_fermi(u_grid)
-                err = np.max(np.abs(target - approx))
-                print0(
-                    f"  [quad] {log_tag}{win.name}: nodes={int(win.alpha.shape[0])}, "
-                    f"max|G-approx|={err:.3e} on [0, {win.crossing_A:.3e}]"
-                )
-            band_note = f", bands={nband}" if nband is not None else ""
-            if A_min is not None and B_min is not None:
-                print0(
-                    f"  [mask] {log_tag}{win.name}: A={count_A}/{total_A}{band_note} "
-                    f"[{A_min:.3e},{A_max:.3e}] "
-                    f"B={count_B}/{total_B} [{B_min:.3e},{B_max:.3e}]"
-                )
-            else:
-                print0(
-                    f"  [mask] {log_tag}{win.name}: A={count_A}/{total_A}{band_note} "
-                    f"B={count_B}/{total_B}"
-                )
-            if efermi_vac is not None and A_min is not None:
-                if axis_kind == "cond":
-                    ec_min = A_min + float(efermi_vac)
-                    ec_max = A_max + float(efermi_vac)
-                    print0(
-                        f"  [mask] {log_tag}{win.name}: Ec_vac [{ec_min:.3e},{ec_max:.3e}]"
-                    )
-                elif axis_kind == "val":
-                    ev_min = float(efermi_vac) - A_max
-                    ev_max = float(efermi_vac) - A_min
-                    print0(
-                        f"  [mask] {log_tag}{win.name}: Ev_vac [{ev_min:.3e},{ev_max:.3e}]"
-                    )
-            if win.t_cut is not None:
-                print0(f"  [mask] {log_tag}{win.name}: T={win.t_cut:.3e}, z_edge={float(win.z_edge):.3e}")
-
     eye_nb = jnp.eye(E_A.shape[1], dtype=jnp.complex128)
     omega_vec = jnp.asarray(omega_nonneg_ry, dtype=jnp.float64)
     tau_channel_step = _get_sigma_tau_channel_kernel(
@@ -962,8 +874,6 @@ def _convolve_sigma_branch_kij(
         nk_tot=nk_tot,
         bispinor=bispinor,
         get_G_mu_nu_fn=get_G_mu_nu_fn,
-        get_G_R_fn=get_G_R_fn,
-        get_sigma_mu_nu_fn=get_sigma_mu_nu_fn,
         get_sigma_kij_channels_fn=get_sigma_kij_channels_fn,
     )
     acc_total = None
@@ -1061,10 +971,6 @@ def _convolve_sigma_branch_kij(
                                 f"  [TIMING-BRANCH] {log_tag} first tau returned: "
                                 f"{_t1 - _t0:.3f}s"
                             )
-                    if debug_quadrature:
-                        re_mag = float(jnp.max(jnp.abs(sigma_tau_kij_re)))
-                        im_mag = float(jnp.max(jnp.abs(sigma_tau_kij_im)))
-                        print0(f"  [diag] {log_tag}{win.name}: |K[Re(σ)]|={re_mag:.4e}  |K[Im(σ)]|={im_mag:.4e}")
                     alpha_eff = complex(alpha_node) * np.exp(-1j * (win.E_ref_A + win.E_ref_B) * t_node)
                     omega_sign = float(win.omega_sign) * float(omega_sign_flip)
                     alpha_eff_j = jnp.asarray(alpha_eff, dtype=jnp.complex128)
@@ -1248,22 +1154,7 @@ def compute_sigma_c_ppm_omega_grid(
     Omega_abs = jnp.asarray(Omega_abs, dtype=jnp.float64)
     B_mask = Omega_abs > 1.0e-14
 
-    if ppm_static_cohsex_check:
-        # Force static COH limit: E_A = 0 for all bands, omega = [0].
-        # With B/Omega = -Wc0/2, the result should exactly reproduce static COH:
-        #   Sigma_COH = -0.5 * (1/Nk) Sigma_q I_{k-q} * Wc0_q
-        print0("  *** PPM STATIC COHSEX CHECK: zeroing E_cond, H_val, omega=[0] ***")
-        E_cond = jnp.zeros_like(E_cond)
-        H_val = jnp.zeros_like(H_val)
-        omega_req = np.array([0.0], dtype=np.float64)
-        omega_rel_req = omega_req
-        idx_pos = np.array([0], dtype=np.intp)
-        idx_neg = np.array([], dtype=np.intp)
-        omega_pos = np.array([0.0], dtype=np.float64)
-        omega_neg_abs = np.array([], dtype=np.float64)
-    invalid_mode = str(invalid_mode).strip().lower()
-    if invalid_mode not in ("fixed_2ry", "static_limit"):
-        raise ValueError("invalid_mode must be 'fixed_2ry' or 'static_limit'.")
+    invalid_mode = "static_limit"
     if valid_mask_mu_nu is None:
         valid_mask = jnp.ones_like(B_mask, dtype=bool)
     else:
@@ -1463,8 +1354,6 @@ def compute_sigma_c_ppm_omega_grid(
                     bispinor=bispinor,
                     mesh_xy=mesh_xy,
                     get_G_mu_nu_fn=get_G_mu_nu_fn,
-                    get_G_R_fn=get_G_R_fn,
-                    get_sigma_mu_nu_fn=get_sigma_mu_nu_fn,
                     get_sigma_kij_channels_fn=get_sigma_kij_channels_fn,
                     omega_sign_flip=omega_sign_flip_cond,
                     log_tag=tag,
@@ -1472,8 +1361,6 @@ def compute_sigma_c_ppm_omega_grid(
                     omega_batch_size=omega_batch_size,
                     stream_writer=_accumulate_kij_stream if use_kij_stream else None,
                     scale=scale,
-                    debug_quadrature=debug_quadrature,
-                    debug_quadrature_samples=debug_quadrature_samples,
                     efermi_vac=float(efermi),
                     axis_kind="cond",
                 )
@@ -1511,8 +1398,6 @@ def compute_sigma_c_ppm_omega_grid(
                     bispinor=bispinor,
                     mesh_xy=mesh_xy,
                     get_G_mu_nu_fn=get_G_mu_nu_fn,
-                    get_G_R_fn=get_G_R_fn,
-                    get_sigma_mu_nu_fn=get_sigma_mu_nu_fn,
                     get_sigma_kij_channels_fn=get_sigma_kij_channels_fn,
                     omega_sign_flip=omega_sign_flip_val,
                     log_tag=tag,
@@ -1520,8 +1405,6 @@ def compute_sigma_c_ppm_omega_grid(
                     omega_batch_size=omega_batch_size,
                     stream_writer=_accumulate_kij_stream if use_kij_stream else None,
                     scale=scale,
-                    debug_quadrature=debug_quadrature,
-                    debug_quadrature_samples=debug_quadrature_samples,
                     efermi_vac=float(efermi),
                     axis_kind="val",
                 )
