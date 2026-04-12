@@ -1,20 +1,21 @@
 """
 psp/davidson.py — Block Davidson eigensolver for plane-wave DFT.
 
-Finds the lowest n_tgt eigenvalues of H_k using iterative subspace
-expansion with a diagonal preconditioner (QE's g_psi convention).
+Finds the lowest n_tgt eigenvalues of H at a single k-point.
 
-The default initial guess uses the lowest-|k+G|² plane waves, rotated
-by a subspace diagonalization of H in that basis.  This mirrors QE's
-init_wfc → rotate_wfc pipeline and works without atomic wavefunctions.
+The algorithm follows QE's cegterg:
+  - Subspace expansion with preconditioned residuals
+  - Generalized eigenproblem Hc v = ε Sc v (non-orthogonal basis)
+  - Thick restart to Ritz vectors when subspace exceeds m_max
+  - Diagonal preconditioner: g(G) = 1 / (h_diag(G) - ε)
 
 Usage
 -----
     from psp.davidson import davidson_k
 
     eigenvalues, eigenvectors = davidson_k(
-        apply_H=lambda psi: ...,   # H|ψ⟩ matvec
-        T_diag=H_k.T_diag,
+        apply_H=lambda psi: ...,
+        h_diag=H_k.h_diag,
         nG=H_k.nG,
         nspinor=2,
         n_tgt=n_bands,
@@ -25,40 +26,45 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import numpy as np
+from scipy.linalg import eigh as scipy_eigh
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Initial guess: low-G plane waves → subspace rotation
-# ═══════════════════════════════════════════════════════════════════════
+#  Linear algebra helpers
+# ═══════════════���═══════════════════════════════════════════════════════
 
-def _build_initial_guess(
+def _gram(A: jax.Array, B: jax.Array) -> jax.Array:
+    """⟨A|B⟩ Gram matrix.  (m, nspinor, nG) × (n, ...) → (m, n)."""
+    return jnp.einsum('msG,nsG->mn', jnp.conj(A), B, optimize=True)
+
+
+def _norms(A: jax.Array) -> jax.Array:
+    """Per-vector norms.  (m, nspinor, nG) → (m,)."""
+    return jnp.sqrt(jnp.sum(jnp.abs(A) ** 2, axis=(1, 2)))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Initial guess
+# ═══���════════════════════════════════════════════════���══════════════════
+
+def _build_initial_subspace(
     apply_H,
     T_diag: jax.Array,
     nG: int,
     nspinor: int,
     n_tgt: int,
-    n_basis: int | None = None,
     verbose: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
-    """Build initial subspace from lowest-|k+G|² plane waves.
+    """Lowest-|k+G|² plane waves → H projection → rotate → n_tgt vectors.
 
-    1. Select n_basis plane waves with smallest T_diag (= |k+G|²).
-    2. Build H in that basis via apply_H.
-    3. Diagonalize → take lowest n_tgt eigenvectors.
-
-    Returns (V, W) where V is (n_tgt, nspinor, nG) orthonormal
-    and W = H V.
+    Returns (V, HV) where V is (n_tgt, nspinor, nG).
     """
-    if n_basis is None:
-        # Use 2× the target, capped by nG (for each spinor component)
-        n_basis = min(2 * n_tgt, nG * nspinor)
-
-    # Select G-indices with smallest |k+G|²
+    # 4× oversampling: enough for mRy-level initial accuracy
+    n_pw = min(2 * n_tgt, nG)
+    n_basis = min(n_pw * nspinor, nG * nspinor)
     order = np.argsort(np.asarray(T_diag))
-    n_pw = min(n_basis // nspinor, nG)  # plane waves per spinor
 
-    # Build sparse-G basis: one plane wave per basis vector
-    # For nspinor=2: first n_pw vectors have spinor-up, next n_pw spinor-down
+    # One plane wave per basis vector, cycling spinor channels
     basis = []
     for s in range(nspinor):
         for ig in range(n_pw):
@@ -70,189 +76,133 @@ def _build_initial_guess(
         if len(basis) >= n_basis:
             break
 
-    V_pw = jnp.stack(basis, axis=0)  # (n_basis, nspinor, nG)
-    n_actual = V_pw.shape[0]
+    V_pw = jnp.stack(basis, axis=0)
+    HV_pw = apply_H(V_pw)
 
-    if verbose:
-        print(f"  Initial guess: {n_actual} plane waves, "
-              f"T range [{float(T_diag[order[0]]):.3f}, "
-              f"{float(T_diag[order[min(n_pw-1, nG-1)]]):.3f}] Ry")
+    # Diagonalize H in the PW basis, take lowest n_tgt
+    Hc = jnp.einsum('msG,nsG->mn', jnp.conj(V_pw), HV_pw, optimize=True)
+    Hc = 0.5 * (Hc + Hc.conj().T)
+    eigvals, C = jnp.linalg.eigh(Hc)
+    C_low = C[:, :n_tgt]
 
-    # Apply H to the plane-wave basis
-    W_pw = apply_H(V_pw)
-
-    # Project: H_mn = <V_pw|W_pw>
-    H_small = jnp.einsum('msG,nsG->mn', jnp.conj(V_pw), W_pw, optimize=True)
-    H_small = 0.5 * (H_small + H_small.conj().T)
-
-    # Diagonalize — keep ALL vectors as the initial subspace.
-    # Davidson needs room to expand; starting with exactly n_tgt
-    # leaves no orthogonal directions for the residuals.
-    eigvals, C = jnp.linalg.eigh(H_small)
-
-    # Rotate back to sparse-G (full rotated basis)
-    V = jnp.einsum('ij,isG->jsG', C, V_pw, optimize=True)
-    W = jnp.einsum('ij,isG->jsG', C, W_pw, optimize=True)
+    V = jnp.einsum('ij,isG->jsG', C_low, V_pw, optimize=True)
+    HV = jnp.einsum('ij,isG->jsG', C_low, HV_pw, optimize=True)
 
     if verbose:
         eigs = np.asarray(eigvals[:n_tgt])
-        print(f"  Subspace rotation: eig range [{eigs[0]:.4f}, {eigs[-1]:.4f}] Ry"
-              f" (kept {n_actual} basis vectors)")
+        print(f"  Initial guess: {V_pw.shape[0]} PWs → {n_tgt} vectors, "
+              f"eig [{eigs[0]:.4f}, {eigs[-1]:.4f}] Ry")
 
-    return V, W
+    return V, HV
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  Preconditioner: QE's g_psi (diagonal)
-# ═══════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════���═════════════════════════════
+#  Preconditioner
+# ════════════════════════��══════════════════════════════════════════════
 
 def _precondition(
     R: jax.Array,
     h_diag: jax.Array,
     eigenvalues: jax.Array,
 ) -> jax.Array:
-    """QE-style diagonal preconditioner: ψ'(G) = ψ(G) / (h_diag(G) − ε).
+    """Diagonal preconditioner: R(G) / (h_diag(G) − ε).
 
-    h_diag should include the local potential average:
-        h_diag(G) = |k+G|² + V_scf(G=0)
-    so the denominator is never near zero for the lowest bands.
-
-    R          : (b, nspinor, nG) residuals
-    h_diag     : (nG,) Hamiltonian diagonal approximation
-    eigenvalues: (b,) current eigenvalue estimates
+    h_diag = |k+G|² + V_loc(G=0) + V_NL_diag(G)  (QE's convention).
+    Clamps small denominators to ±0.01 Ry.
     """
-    eps = 1e-2
+    _EPS = 1e-2
     denom = h_diag[None, None, :] - eigenvalues[:, None, None]
-    denom = jnp.where(jnp.abs(denom) < eps, jnp.sign(denom) * eps, denom)
-    denom = jnp.where(denom == 0.0, eps, denom)
+    denom = jnp.where(jnp.abs(denom) < _EPS, jnp.sign(denom) * _EPS, denom)
+    denom = jnp.where(denom == 0.0, _EPS, denom)
     return R / denom
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  Gram matrix and orthonormalization
-# ═══════════════════════════════════════════════════════════════════════
-
-def _gram(A: jax.Array, B: jax.Array) -> jax.Array:
-    """⟨A|B⟩ Gram matrix. (m, nspinor, nG) × (n, nspinor, nG) → (m, n)."""
-    return jnp.einsum('msG,nsG->mn', jnp.conj(A), B, optimize=True)
-
-
-def _gram_diag(A: jax.Array) -> jax.Array:
-    """Squared norms per vector. Returns (m,)."""
-    return jnp.sum(jnp.abs(A) ** 2, axis=(1, 2))
-
-
-def _orthonormalise(V: jax.Array, tau_dep: float = 1e-12):
-    """Orthonormalise via overlap eigendecomposition. Returns (V_ortho, rank)."""
-    S = _gram(V, V)
-    S = 0.5 * (S + S.conj().T)
-    eigvals, U = jnp.linalg.eigh(S)
-    mask = eigvals > tau_dep
-    rank = int(jnp.sum(mask))
-    inv_sqrt = jnp.where(mask, 1.0 / jnp.sqrt(jnp.maximum(eigvals, tau_dep)), 0.0)
-    V_ortho = jnp.einsum('vsG,ij,j->isG', V, U, inv_sqrt, optimize=True)
-    return V_ortho[:rank], rank
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  Davidson iteration
-# ═══════════════════════════════════════════════════════════════════════
+# ══════════════════════════���════════════════════════════════════════════
+#  Davidson solver
+# ═════════════════════��══════════════════════════════════���══════════════
 
 def davidson_k(
     apply_H,
-    T_diag: jax.Array,
+    *,
+    h_diag: jax.Array,
     nG: int,
     nspinor: int,
     n_tgt: int,
-    *,
-    h_diag: jax.Array | None = None,
-    block_size: int = 16,
+    T_diag: jax.Array | None = None,
     m_max: int | None = None,
     max_iter: int = 100,
     tol: float = 1e-8,
-    tau_dep: float = 1e-12,
-    n_ortho: int = 2,
     X0: jax.Array | None = None,
     verbose: bool = True,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Block Davidson eigensolver for one k-point.
 
     Parameters
     ----------
-    apply_H : callable
-        H|ψ⟩ matvec.  (m, nspinor, nG) → (m, nspinor, nG).
-    T_diag : (nG,) |k+G|² diagonal.
+    apply_H : (m, nspinor, nG) → (m, nspinor, nG)
+        H|ψ⟩ matvec in sparse-G representation.
+    h_diag : (nG,)
+        Hamiltonian diagonal for preconditioner.
+        Build with ``dft_operators.build_h_diag``.
     nG, nspinor : basis dimensions.
     n_tgt : number of lowest eigenvalues to converge.
-    h_diag : (nG,) Hamiltonian diagonal for preconditioner.
-        Should be |k+G|² + V_loc(G=0) + V_NL_diag(G) (QE convention).
-        If None, falls back to T_diag (kinetic only — less stable).
-    X0 : optional (n, nspinor, nG) initial guess.
-        If None, builds from lowest-G plane waves + subspace rotation.
+    T_diag : (nG,) |k+G|², needed only for initial guess (ignored if X0 given).
+    m_max : max subspace dimension before restart (default 4 × n_tgt).
+    X0 : (n, nspinor, nG) initial guess, or None for PW subspace rotation.
 
     Returns
     -------
-    eigenvalues : (n_tgt,) Ry, ascending.
+    eigenvalues : (n_tgt,) in Ry.
     eigenvectors : (n_tgt, nspinor, nG) sparse-G.
     """
     if m_max is None:
-        m_max = max(n_tgt + 3 * min(block_size, n_tgt),
-                    6 * n_tgt)  # room for initial basis + expansion
-    b = min(block_size, n_tgt)
+        m_max = 4 * n_tgt
 
-    if h_diag is None:
-        h_diag = T_diag
-
-    # ── initial guess ──
+    # ── initial subspace ──
     if X0 is not None:
         V = jnp.asarray(X0[:n_tgt], dtype=jnp.complex128)
-        V, rank = _orthonormalise(V, tau_dep)
-        W = apply_H(V)
+        HV = apply_H(V)
     else:
-        # Use enough plane waves that the subspace diag gives ~mRy accuracy.
-        # For typical PW DFT, ~30× n_tgt is sufficient; cap at all PWs.
-        n_basis = min(max(30 * n_tgt, 200), nG * nspinor)
-        V, W = _build_initial_guess(apply_H, T_diag, nG, nspinor, n_tgt,
-                                     n_basis=n_basis, verbose=verbose)
+        if T_diag is None:
+            raise ValueError("T_diag required for default initial guess (or provide X0)")
+        V, HV = _build_initial_subspace(apply_H, T_diag, nG, nspinor, n_tgt,
+                                         verbose=verbose)
 
     if verbose:
-        print(f"Davidson: n_tgt={n_tgt}, nG={nG}, nspinor={nspinor}, "
-              f"block={b}, m_max={m_max}")
+        print(f"Davidson: n_tgt={n_tgt}, nG={nG}, m_max={m_max}")
 
     eigenvalues = None
 
     for it in range(1, max_iter + 1):
         m = V.shape[0]
 
-        # ── projected Hamiltonian and overlap ──
-        Hc = _gram(V, W)
+        # ── projected generalized eigenproblem: Hc v = ε Sc v ─���
+        Hc = _gram(V, HV)
         Sc = _gram(V, V)
         Hc = 0.5 * (Hc + Hc.conj().T)
         Sc = 0.5 * (Sc + Sc.conj().T)
 
-        # ── Rayleigh-Ritz: generalized eigenproblem Hc v = e Sc v ──
-        from scipy.linalg import eigh as _scipy_eigh
-        eigvals, C = _scipy_eigh(np.asarray(Hc), np.asarray(Sc))
-        eigvals = jnp.asarray(eigvals)
-        C = jnp.asarray(C)
-        Lambda = eigvals[:n_tgt]
-        C_N = C[:, :n_tgt]
+        eig_all, C_all = scipy_eigh(np.asarray(Hc), np.asarray(Sc))
+        eig_all = jnp.asarray(eig_all)
+        C_all = jnp.asarray(C_all)
 
-        # ── Ritz vectors and H-images ──
+        Lambda = eig_all[:n_tgt]
+        C_N = C_all[:, :n_tgt]
+
+        # ── Ritz vectors ──
         X = jnp.einsum('mn,msG->nsG', C_N, V, optimize=True)
-        HX = jnp.einsum('mn,msG->nsG', C_N, W, optimize=True)
+        HX = jnp.einsum('mn,msG->nsG', C_N, HV, optimize=True)
 
-        # ── residuals ──
+        # ── residuals: R = H|X⟩ − ε|X⟩ ──
         R = HX - X * Lambda[:, None, None]
-        res_norms = jnp.sqrt(_gram_diag(R))
+        res = _norms(R)
 
-        # ── convergence ──
+        # ── convergence check ──
         rel_tol = tol * jnp.maximum(1.0, jnp.abs(Lambda))
-        converged = res_norms < rel_tol
-        conv_np = np.asarray(converged)
+        conv = np.asarray(res < rel_tol)
         n_conv = 0
         for i in range(n_tgt):
-            if conv_np[i]:
+            if conv[i]:
                 n_conv = i + 1
             else:
                 break
@@ -262,8 +212,7 @@ def davidson_k(
             print(f"  iter {it:3d}: m={m:3d}  "
                   f"eig[0]={float(Lambda[0]):12.6f}  "
                   f"eig[{n_tgt-1}]={float(Lambda[n_tgt-1]):12.6f}  "
-                  f"res=[{float(jnp.min(res_norms)):.1e},"
-                  f"{float(jnp.max(res_norms)):.1e}]  "
+                  f"res=[{float(jnp.min(res)):.1e},{float(jnp.max(res)):.1e}]  "
                   f"conv={n_conv}/{n_tgt}")
 
         if n_conv == n_tgt:
@@ -271,52 +220,29 @@ def davidson_k(
                 print(f"  Converged all {n_tgt} bands in {it} iterations.")
             return eigenvalues, np.asarray(X)
 
-        # ── active block (unconverged roots with non-trivial residual) ──
-        # Only expand roots whose residual is large enough to produce a
-        # useful correction.  Nearly-converged roots add only noise after
-        # orthogonalisation, which contaminates the subspace with zero-
-        # eigenvalue vectors.
-        expansion_floor = max(tol * 100, 1e-4)
-        active = []
-        for i in range(n_tgt):
-            if not conv_np[i] and float(res_norms[i]) > expansion_floor:
-                active.append(i)
-            if len(active) >= b:
-                break
-        if len(active) == 0:
-            # All residuals below floor — just tighten via Rayleigh-Ritz
-            # by expanding with the worst residual only
-            worst = int(np.argmax(np.asarray(res_norms[:n_tgt])))
-            active = [worst]
-        b_act = len(active)
-        active = jnp.array(active)
-        R_act = R[active]
+        # ── select unconverged roots for expansion ──
+        active = [i for i in range(n_tgt) if not conv[i]]
+        R_act = R[jnp.array(active)]
 
-        # ── precondition: QE diagonal g_psi ──
-        P = _precondition(R_act, h_diag, Lambda[active])
-
-        # ── normalize each vector (QE convention: no orthogonalization
-        #    against V — the generalized eigenproblem handles overlap) ──
-        norms = jnp.sqrt(_gram_diag(P))
-        keep = [n for n in range(b_act) if float(norms[n]) > tau_dep]
+        # ── precondition + normalize ──
+        P = _precondition(R_act, h_diag, Lambda[jnp.array(active)])
+        norms_P = _norms(P)
+        keep = [i for i in range(len(active)) if float(norms_P[i]) > 1e-12]
         if len(keep) == 0:
-            if verbose:
-                print(f"  iter {it}: restart (candidate block dependent)")
-            V, W = X, HX
+            V, HV = X, HX
             continue
-        keep_idx = jnp.array(keep)
-        P = P[keep_idx] / norms[keep_idx, None, None]
+        P = P[jnp.array(keep)] / norms_P[jnp.array(keep), None, None]
 
         # ── expand subspace ──
         HP = apply_H(P)
         V = jnp.concatenate([V, P], axis=0)
-        W = jnp.concatenate([W, HP], axis=0)
+        HV = jnp.concatenate([HV, HP], axis=0)
 
         # ── restart if subspace too large ──
         if V.shape[0] > m_max:
             if verbose:
                 print(f"  iter {it}: restart (m={V.shape[0]} > m_max={m_max})")
-            V, W = X, HX
+            V, HV = X, HX
 
     if verbose:
         print(f"  WARNING: did not converge in {max_iter} iterations. "
