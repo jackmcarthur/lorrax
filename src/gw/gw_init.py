@@ -30,21 +30,29 @@ def compute_optimal_chunks(
     r_chunk_override: int | None = None,
     zct_stage_cap_gb: float | None = None,
 ) -> dict:
-    """Derive ISDF chunk sizes that saturate (but do not exceed) the memory budget.
+    """Derive ISDF chunk sizes that fit within the per-device memory budget.
 
-    Models 6 pipeline stages, each calibrated against XLA HLO profiling
-    on CrI3 (16-GPU, 75×75×200 grid):
+    The ISDF r-chunk loop has 6 stages, each with cost linear in chunk_r (cr):
 
-      FFT:     3× (input + output + cuFFT scratch)
-      Pair:    ψ(r_chunk) + P_l + P_r
-      ZCT:     4× pair data (P_r alive + 3× left IFFT JIT)
-      Reshard: 4× m_zcol (input + output + 2× NCCL temp)
-      Solve:   2×Z_col + per-q (Z_slice + L_rep + L_allgather + 2×trsm + Z_T)
-      Gather:  Z_col + per-q (input + output + NCCL)
+        stage_cost(cr) = base + αᵢ·cr + cᵢ
 
-    The r-chunk is found by downward search from n_r, evaluating
-    _stage_peaks at each candidate.  No separate analytical limits —
-    the search IS the single source of truth for the memory model.
+    where base = centroids + L_q + optional G-space cache (persistent arrays),
+    αᵢ is the per-cr byte coefficient, and cᵢ is the cr-independent overhead.
+    The optimal cr is min over stages of (headroom − cᵢ) / αᵢ — one division
+    per stage, no iterative search.
+
+    The 6 stages and their XLA HLO-calibrated multipliers (CrI3, 16 GPUs):
+
+        FFT:     ψ(r_chunk) accumulator + 3× per-k FFT transient (cuFFT)
+        Pair:    ψ(r_chunk) + 2× pair density P(nk, μ, cr)
+        ZCT:     4× pair data  (P_r alive outside JIT + 3× donated left IFFT)
+        Reshard: 4× Z_col      (input + output + 2× NCCL all-to-all temp)
+        Solve:   2× Z_col + per-q (2× Z_slice + L_rep + 3× L_full)
+        Gather:  Z_col + per-q (input/p + 2× replicated output incl. NCCL)
+
+    Sharding: centroids and pair densities shard on (p_x, p_y).  Z_col and
+    solve arrays shard on p = p_x·p_y combined.  The α coefficients encode
+    the per-device sizes after sharding.
     """
     if memory_budget_gb <= 0:
         raise ValueError("memory_per_device_gb must be > 0.")
@@ -65,7 +73,7 @@ def compute_optimal_chunks(
         p_x, p_y = sq, p // sq
 
     def _mem(*dims, shard=1):
-        """Bytes for a complex128 array with given dimensions, divided by shard."""
+        """complex128 array bytes: 16 · ∏(dims) / shard."""
         result = B
         for d in dims:
             result *= d
@@ -74,7 +82,9 @@ def compute_optimal_chunks(
     m_budget = memory_budget_gb * 1e9 * target_utilization
     m_zct_cap = float(zct_stage_cap_gb) * 1e9 if zct_stage_cap_gb and zct_stage_cap_gb > 0 else None
 
-    # ---- Persistent arrays ----
+    # ---- Persistent arrays (always resident during chunk loop) ----
+    # Centroids: left/right × X-sharded + Y-sharded copies.
+    # "full" = during initial load (all nb bands); "persist" = after slicing to nb_l + nb_r.
     m_centroids_full = _mem(nk, ns, mu, nb, shard=p_y) + _mem(nk, ns, mu, nb, shard=p_x)
     m_centroids = _mem(nk, ns, mu, nb_l + nb_r, shard=p_y) + _mem(nk, ns, mu, nb_l + nb_r, shard=p_x)
     if m_centroids_full + m_centroids > m_budget:
@@ -82,7 +92,9 @@ def compute_optimal_chunks(
             f"Centroid storage requires {(m_centroids_full + m_centroids)/1e9:.2f} GB/device "
             f"but only {memory_budget_gb:.2f} GB allocated.")
 
-    # ---- Band-chunked FFT (centroid extraction) ----
+    # ---- Band-chunked FFT (centroid extraction, runs before chunk loop) ----
+    # ψ(G) → IFFT → ψ(r): 3× buffer (input + output + cuFFT scratch) + phase array.
+    # Bands are sharded across all p devices; bpd = ceil(band_chunk / p).
     FFT_COPIES = 3
     m_phase = _mem(nk, nr)
     headroom_fft = m_budget - m_centroids_full
@@ -91,35 +103,32 @@ def compute_optimal_chunks(
     one_band = FFT_COPIES * _mem(nk, ns, nr)
     bpd_max = max(1, int((headroom_fft - m_phase) / one_band))
     band_chunk = min(nb, bpd_max * p)
-    bpd = max(1, -(-band_chunk // p))  # ceil div (matches read_Gvecs_to_devices)
+    bpd = max(1, -(-band_chunk // p))  # ceil div matching read_Gvecs_to_devices
     peak_fft_stage = m_centroids_full + FFT_COPIES * _mem(nk, bpd, ns, nr) + m_phase
 
-    # ---- C_q build (pair density + Cholesky) ----
-    m_pair_mumu = _mem(pc, nk, mu, mu, shard=p_x * p_y)
-    m_C_q = _mem(nq, mu, mu, shard=p_x * p_y)
-    stage_cct = m_centroids + 2 * m_pair_mumu + m_C_q
+    # ---- C_q build (pair density → C_q → L_q, runs before chunk loop) ----
+    stage_cct = m_centroids + 2 * _mem(pc, nk, mu, mu, shard=p_x * p_y) + _mem(nq, mu, mu, shard=p_x * p_y)
     if stage_cct > m_budget:
         raise ValueError(f"C_q build requires {stage_cct/1e9:.2f} GB/device — exceeds budget.")
-    m_L_q = m_C_q
+    m_L_q = _mem(nq, mu, mu, shard=p_x * p_y)  # L_q persists; same size as C_q
 
-    # ---- G-space cache (optional) ----
+    # ---- G-space cache: stores ψ(G) for all bands to avoid re-reading H5 per chunk ----
     m_gspace_cache = _mem(nk, nb, ns, nr, shard=p)
 
-    # ---- Per-cr cost coefficients (single source of truth for the memory model) ----
-    #
-    # Every stage cost is:  base + αᵢ·cr + cᵢ   (linear in cr)
-    # so max_cr for stage i = (headroom - cᵢ) / αᵢ
-    #
-    # Coefficients α (bytes per unit cr) and c (cr-independent bytes):
-    α_psi     = _mem(nk, nb, ns, shard=p_y)           # ψ(r_chunk) output buffer
-    α_pair    = _mem(pc, nk, mu, shard=p_x * p_y)     # one P_l or P_r chunk
-    α_zcol    = _mem(nq, mu, shard=p)                  # Z_col per cr
-    α_z_slice = _mem(mu, shard=p)                      # Z_slice or Z_transpose per cr
-    α_gather  = _mem(mu, shard=p) + 2 * _mem(mu)       # input(sharded) + output + NCCL
-    c_solve   = _mem(mu, mu, shard=p_x * p_x) + 3 * _mem(mu, mu)  # L_rep + 3×(μ²)
+    # ======================================================================
+    # Per-cr cost coefficients α (bytes per unit chunk_r on one device).
+    # Every chunk-loop stage cost is:  base + αᵢ·cr [+ cᵢ]
+    # The optimal cr = min over i of (headroom − cᵢ) / αᵢ.
+    # ======================================================================
+    α_psi     = _mem(nk, nb, ns, shard=p_y)        # ψ(r_chunk) output accumulator
+    α_pair    = _mem(pc, nk, mu, shard=p_x * p_y)  # one pair density P(nk, μ, cr)
+    α_zcol    = _mem(nq, mu, shard=p)               # Z_col column slice
+    α_z_slice = _mem(mu, shard=p)                   # per-q Z_slice or Z_transpose
+    α_gather  = _mem(mu, shard=p) + 2 * _mem(mu)    # sharded input + replicated output + NCCL
+    c_solve   = _mem(mu, mu, shard=p_x * p_x) + 3 * _mem(mu, mu)  # L_rep(sharded) + 3×L_full(μ²)
 
     def _max_cr(headroom, fft_cost_per_k):
-        """Max chunk_r per stage via direct inversion: cr_i = (headroom - cᵢ) / αᵢ."""
+        """Invert each stage's linear cost to get max feasible cr per stage."""
         limits = {
             'fft':     (headroom - fft_cost_per_k) / α_psi if α_psi > 0 else nr,
             'pair':    headroom / (α_psi + 2 * α_pair) if (α_psi + 2 * α_pair) > 0 else nr,
@@ -128,67 +137,58 @@ def compute_optimal_chunks(
             'solve':   (headroom - c_solve) / (2 * α_zcol + 2 * α_z_slice) if (2 * α_zcol + 2 * α_z_slice) > 0 else nr,
             'gather':  headroom / (α_zcol + α_gather) if (α_zcol + α_gather) > 0 else nr,
         }
-        if m_zct_cap is not None:
-            zct_headroom = m_zct_cap - (m_budget - headroom)  # base is budget - headroom
-            if α_pair > 0 and zct_headroom > 0:
+        # Optional soft cap on ZCT stage (env var override for tight-memory systems)
+        if m_zct_cap is not None and α_pair > 0:
+            zct_headroom = m_zct_cap - (m_budget - headroom)
+            if zct_headroom > 0:
                 limits['zct'] = min(limits['zct'], zct_headroom / (4 * α_pair))
         return limits
 
     def _eval_stages(cr, base, fft_cost_per_k):
-        """Evaluate all stage costs at a specific cr.  Returns full result dict."""
+        """Forward-evaluate all stage costs at a given cr (algebraic inverse of _max_cr)."""
         m_zcol = α_zcol * cr
         m_solve_per_q = 2 * α_z_slice * cr + c_solve
         m_gather_per_q = α_gather * cr
-
         stages = {
             'fft':     base + α_psi * cr + fft_cost_per_k,
-            'pair':    base + α_psi * cr + 2 * α_pair * cr,
+            'pair':    base + (α_psi + 2 * α_pair) * cr,
             'zct':     base + 4 * α_pair * cr,
             'reshard': base + 4 * m_zcol,
             'solve':   base + 2 * m_zcol + m_solve_per_q,
             'gather':  base + m_zcol + m_gather_per_q,
         }
-        peak = max(stages.values())
-        bottleneck = max(stages, key=stages.get)
-
-        # k_batch: how many k-points fit in FFT headroom (throughput only)
+        # k_batch: fill remaining FFT headroom for throughput (does not affect cr choice)
         fft_head = m_budget - base - α_psi * cr
         k_batch = 1
         if fft_cost_per_k > 0 and fft_head > fft_cost_per_k:
             k_batch = min(int(nk), max(1, int(fft_head * 0.5 / fft_cost_per_k)))
-
-        return {
-            'chunk_r': int(cr), 'peak': peak, 'bottleneck': bottleneck,
-            'stages': stages, 'base': base,
-            'zcol': m_zcol, 'solve_per_q': m_solve_per_q,
-            'gather_per_q': m_gather_per_q, 'k_batch': k_batch,
-        }
+        return stages, m_zcol, m_solve_per_q, m_gather_per_q, k_batch
 
     def _find_r_chunk(use_cache, fft_cost_per_k, override=None):
-        """Find optimal chunk_r by direct formula, then round to device-divisible."""
+        """Compute optimal cr from direct formula, round down to p-divisible."""
         base = m_centroids + m_L_q + (m_gspace_cache if use_cache else 0.0)
         headroom = m_budget - base
         if headroom <= c_solve:
             return None
-
         if override and override > 0:
             cr = min(int(override), int(nr))
         else:
-            limits = _max_cr(headroom, fft_cost_per_k)
-            cr = min(int(nr), max(0, int(min(limits.values()))))
-
-        # Round down to device-divisible
-        pt = p_x * p_y
+            cr = min(int(nr), max(0, int(min(_max_cr(headroom, fft_cost_per_k).values()))))
+        pt = p_x * p_y  # cr must be divisible by total device count for solve sharding
         if pt > 1 and cr > 0:
             cr -= cr % pt
         if cr <= 0:
             return None
+        stages, m_zcol, m_spq, m_gpq, k_batch = _eval_stages(cr, base, fft_cost_per_k)
+        return {
+            'chunk_r': cr, 'peak': max(stages.values()),
+            'bottleneck': max(stages, key=stages.get), 'stages': stages,
+            'base': base, 'zcol': m_zcol, 'solve_per_q': m_spq,
+            'gather_per_q': m_gpq, 'k_batch': k_batch,
+            'cache_bytes': m_gspace_cache if use_cache else 0.0,
+        }
 
-        result = _eval_stages(cr, base, fft_cost_per_k)
-        result['cache_bytes'] = m_gspace_cache if use_cache else 0.0
-        return result
-
-    # ---- Main: try with cache, then without, reducing band_chunk if needed ----
+    # ---- Solve for chunk sizes: try cache→no-cache, halving band_chunk if needed ----
     fft_per_k = FFT_COPIES * _mem(bpd, ns, nr) + _mem(nr)
     result = _find_r_chunk(True, fft_per_k, r_chunk_override) or \
              _find_r_chunk(False, fft_per_k, r_chunk_override)
@@ -205,20 +205,19 @@ def compute_optimal_chunks(
     if result is None:
         raise ValueError("Unable to find r-chunk that fits the memory budget.")
 
-    # ---- Derive q_chunk and q_gather from the same linear model ----
+    # ---- q_chunk (solve) and q_gather (H5 write): same linear model, different base ----
     base, m_zcol = result['base'], result['zcol']
     avail_solve = max(0.0, m_budget - base - 2 * m_zcol)
     q_chunk = max(1, min(n_q, int(avail_solve / result['solve_per_q']))) if result['solve_per_q'] > 0 else 1
     avail_gather = max(0.0, m_budget - base - m_zcol)
     q_gather = max(1, min(n_q, int(avail_gather / result['gather_per_q']))) if result['gather_per_q'] > 0 else n_q
 
-    # ---- Overall peak (including pre-chunk stages) ----
+    # ---- Overall peak across all stages (chunk loop + pre-loop) ----
     overall_peak = max(
         result['peak'],
         base + 2 * m_zcol + q_chunk * result['solve_per_q'],
         base + m_zcol + q_gather * result['gather_per_q'],
         peak_fft_stage, m_centroids_full + m_centroids, stage_cct)
-    bottleneck = result['bottleneck']
 
     k_chunk = result['k_batch']
     if k_chunk < int(n_k) and verbose:
@@ -234,7 +233,7 @@ def compute_optimal_chunks(
         'memory_estimate': {
             'peak_estimate_gb': overall_peak / 1e9,
             'budget_gb': memory_budget_gb,
-            'bottleneck': bottleneck,
+            'bottleneck': result['bottleneck'],
             'available_vcoul_gb': max(0.0, m_budget - m_centroids) / 1e9,
             'limit_info': {k: v / 1e9 for k, v in result['stages'].items()},
         },
