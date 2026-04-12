@@ -720,32 +720,15 @@ def main(argv=None):
 
 			# Frequency-integrated Σ^c(ω)
 			sigma_omega = compute_sigma_c_ppm_omega_grid(
-				psi_coh_rmuT_X=wfns.xn(s.full),
-				psi_coh_rmu_Y=wfns.yr(s.full),
-				psi_proj_rmu_X=wfns.xr(s.sigma),
-				psi_proj_rmuT_Y=wfns.yn(s.sigma),
-				enk_full=wfns.enk[:, s.full],
-				occ_full=wfns.occ[:, s.full],
-				B_mu_nu=ppm.B_mu_nu,
-				Omega_mu_nu=ppm.Omega_mu_nu,
-				Wc0_mu_nu=ppm.Wc0_mu_nu,
-				valid_mask_mu_nu=ppm.valid_mask_mu_nu,
-				omega_values_ry=ppm_options.omega_grid_ry,
-				meta=meta, bispinor=bispinor, mesh_xy=mesh_xy,
-				quadrature_config=sigma_window_quad,
-				regularization_width_ry=ppm_options.sigma_regularization_ry,
-				edge_factor=ppm_options.sigma_edge_factor,
-				omega_batch_size=ppm_options.sigma_omega_batch_size,
-				omega_accumulation=ppm_options.sigma_omega_accumulation,
-				sigma_kij_h5_path=ppm_options.sigma_kij_h5_path or None,
-				fermi_reference=ppm_options.fermi_reference,
-				get_G_mu_nu_fn=build_G_occ,
-				get_sigma_kij_channels_fn=_project_ri,
+				wfns, ppm, meta, mesh_xy, ppm_options,
+				sigma_window_quad=sigma_window_quad,
+				get_G_fn=build_G_occ,
+				get_project_ri_fn=_project_ri,
 				print0=print0,
 			)
 			sigma_c_omega = sigma_omega.sigma_c_kij  # (n_omega, nk, nb, nb) or None if streamed
 
-			# Evaluate Σ_c at DFT energies (midgap Fermi reference)
+			# Evaluate Σ_c at DFT energies
 			sigma_c_at_dft_ev = None
 			sigma_xc_at_dft_ev = None
 			omega_dft_rel_ev = None

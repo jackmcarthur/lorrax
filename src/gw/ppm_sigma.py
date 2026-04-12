@@ -1144,79 +1144,67 @@ def _convolve_sigma_branch_kij(
 
 
 def compute_sigma_c_ppm_omega_grid(
+    wfns,
+    ppm,
+    meta,
+    mesh_xy: Mesh,
+    ppm_options,
     *,
-    psi_coh_rmuT_X: jax.Array,
-    psi_coh_rmu_Y: jax.Array,
-    psi_proj_rmu_X: jax.Array,
-    psi_proj_rmuT_Y: jax.Array,
-    enk_full: jax.Array,
-    occ_full: jax.Array,
-    B_mu_nu: jax.Array,
-    Omega_mu_nu: jax.Array,
-    Wc0_mu_nu: jax.Array | None = None,
-    valid_mask_mu_nu: jax.Array | None = None,
-    omega_values_ry: np.ndarray,
-    meta=None,
-    nkx: int | None = None,
-    nky: int | None = None,
-    nkz: int | None = None,
-    nk_tot: int | None = None,
-    bispinor: bool | None = None,
-    mesh_xy: Mesh = None,
-    quadrature_config: SigmaQuadratureConfig | None = None,
-    target_error: float = 1.0e-6,
-    max_nodes: int = 64,
-    use_shipped_minimax_tables: bool = True,
-    crossing_max_nodes: int = 500,
-    crossing_eps_q: float = 1.0e-3,
-    regularization_width_ry: float = 0.018374661087827496,  # 0.25 eV
-    edge_factor: float = 1.5,
-    omega_batch_size: int = 4,
-    omega_accumulation: str = "auto",
-    sigma_munu_h5_path: str | None = None,
-    sigma_kij_h5_path: str | None = None,
-    sigma_scale: float = 1.0,
-    sigma_flip_neg: bool = False,
-    invalid_mode: str = "static_limit",
-    debug_split_contrib: bool = False,
-    fermi_reference: str = "midgap",
-    debug_quadrature: bool = False,
-    debug_quadrature_samples: int = 200,
-    get_G_mu_nu_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array] | None = None,
-    get_G_R_fn: Callable[[jax.Array, int, int, int], jax.Array] | None = None,
-    get_sigma_mu_nu_fn: Callable[[jax.Array, jax.Array, int, bool], jax.Array] | None = None,
-    get_sigma_kij_channels_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array] | None = None,
-    ppm_static_cohsex_check: bool = False,
+    sigma_window_quad: SigmaQuadratureConfig | None = None,
+    get_G_fn=None,
+    get_project_ri_fn=None,
     print0=print,
+    # Legacy kwargs accepted but ignored for backward compat during migration:
+    **_legacy_kwargs,
 ) -> SigmaOmegaResult:
-    """Compute frequency-dependent correlation self-energy Σ^c_kij(ω) with GN-PPM windows.
+    """Compute Σ^c_kij(ω) via GN-PPM windowed minimax integration."""
+    if get_G_fn is None or get_project_ri_fn is None:
+        raise ValueError("get_G_fn and get_project_ri_fn must be provided.")
 
-    Notes
-    -----
-    To avoid repeating τ-node work, Σ(t) is always contracted to band space
-    before applying exp(iωt). When memory is constrained, set
-    ``omega_accumulation='kij_stream'`` and provide ``sigma_kij_h5_path`` to
-    stream Σ_kij(ω) to disk in ω-chunks.
-    """
-    if None in (get_G_mu_nu_fn, get_sigma_kij_channels_fn):
-        raise ValueError("get_G_mu_nu_fn and get_sigma_kij_channels_fn must be provided.")
-    # Extract static system parameters from meta when available.
-    if meta is not None:
-        nkx = int(meta.nkx) if nkx is None else nkx
-        nky = int(meta.nky) if nky is None else nky
-        nkz = int(meta.nkz) if nkz is None else nkz
-        nk_tot = int(meta.nk_tot) if nk_tot is None else nk_tot
-        bispinor = bool(meta.bispinor) if bispinor is None else bispinor
-        if mesh_xy is None:
-            raise ValueError("mesh_xy is required")
-    if None in (nkx, nky, nkz, nk_tot, bispinor):
-        raise ValueError("Either meta or explicit (nkx, nky, nkz, nk_tot, bispinor) must be provided.")
+    # Unpack from bundles
+    s = wfns.slices
+    psi_coh_rmuT_X = wfns.xn(s.full)
+    psi_coh_rmu_Y = wfns.yr(s.full)
+    psi_proj_rmu_X = wfns.xr(s.sigma)
+    psi_proj_rmuT_Y = wfns.yn(s.sigma)
+    enk_full = wfns.enk[:, s.full]
+    occ_full = wfns.occ[:, s.full]
+    B_mu_nu = ppm.B_mu_nu
+    Omega_mu_nu = ppm.Omega_mu_nu
+    Wc0_mu_nu = getattr(ppm, 'Wc0_mu_nu', None)
+    valid_mask_mu_nu = getattr(ppm, 'valid_mask_mu_nu', None)
+    omega_values_ry = ppm_options.omega_grid_ry
+
+    nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
+    nk_tot = int(meta.nk_tot)
+    bispinor = bool(meta.bispinor)
+
+    # Quadrature config
+    quadrature_config = sigma_window_quad
     if quadrature_config is not None:
         target_error = float(quadrature_config.target_error)
         max_nodes = int(quadrature_config.max_nodes)
         crossing_max_nodes = int(quadrature_config.crossing_max_nodes)
         crossing_eps_q = float(quadrature_config.crossing_eps_q)
         use_shipped_minimax_tables = bool(quadrature_config.use_shipped_tables)
+    else:
+        target_error, max_nodes = 1e-6, 64
+        crossing_max_nodes, crossing_eps_q = 500, 1e-3
+        use_shipped_minimax_tables = True
+
+    regularization_width_ry = getattr(ppm_options, 'sigma_regularization_ry', 0.018374661087827496)
+    edge_factor = getattr(ppm_options, 'sigma_edge_factor', 1.5)
+    omega_batch_size = getattr(ppm_options, 'sigma_omega_batch_size', 4)
+    omega_accumulation = getattr(ppm_options, 'sigma_omega_accumulation', 'auto')
+    sigma_kij_h5_path = getattr(ppm_options, 'sigma_kij_h5_path', None)
+    fermi_reference = getattr(ppm_options, 'fermi_reference', 'midgap')
+
+    # Rename callbacks for internal use
+    get_G_mu_nu_fn = get_G_fn
+    get_sigma_kij_channels_fn = get_project_ri_fn
+    sigma_scale = 1.0
+    sigma_flip_neg = False
+    debug_split_contrib = False
     import time as _sgtime
     _sg_t0 = _sgtime.perf_counter()
     _sg_prof = bool(os.environ.get("LORRAX_PROFILE_PPM", ""))
@@ -1686,60 +1674,3 @@ def compute_sigma_c_ppm_omega_grid(
     )
 
 
-def compute_sigma_c_ppm_laplace(
-    *,
-    psi_coh_rmuT_X: jax.Array,
-    psi_coh_rmu_Y: jax.Array,
-    psi_proj_rmu_X: jax.Array,
-    psi_proj_rmuT_Y: jax.Array,
-    enk_full: jax.Array,
-    occ_full: jax.Array,
-    B_mu_nu: jax.Array,
-    Omega_mu_nu: jax.Array,
-    omega_eval_ry: float,
-    meta=None,
-    nkx: int | None = None,
-    nky: int | None = None,
-    nkz: int | None = None,
-    nk_tot: int | None = None,
-    bispinor: bool | None = None,
-    mesh_xy: Mesh = None,
-    target_error: float = 1.0e-6,
-    max_nodes: int = 64,
-    sigma_scale: float = 1.0,
-    sigma_flip_neg: bool = False,
-    get_G_mu_nu_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array] | None = None,
-    get_G_R_fn: Callable[[jax.Array, int, int, int], jax.Array] | None = None,
-    get_sigma_mu_nu_fn: Callable[[jax.Array, jax.Array, int, bool], jax.Array] | None = None,
-    get_sigma_kij_channels_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array] | None = None,
-    print0=print,
-) -> jax.Array:
-    """Compatibility wrapper returning Σ^c_kij at one target frequency."""
-    out = compute_sigma_c_ppm_omega_grid(
-        psi_coh_rmuT_X=psi_coh_rmuT_X,
-        psi_coh_rmu_Y=psi_coh_rmu_Y,
-        psi_proj_rmu_X=psi_proj_rmu_X,
-        psi_proj_rmuT_Y=psi_proj_rmuT_Y,
-        enk_full=enk_full,
-        occ_full=occ_full,
-        B_mu_nu=B_mu_nu,
-        Omega_mu_nu=Omega_mu_nu,
-        omega_values_ry=np.asarray([float(omega_eval_ry)], dtype=np.float64),
-        meta=meta,
-        nkx=nkx,
-        nky=nky,
-        nkz=nkz,
-        nk_tot=nk_tot,
-        bispinor=bispinor,
-        mesh_xy=mesh_xy,
-        target_error=target_error,
-        max_nodes=max_nodes,
-        sigma_scale=sigma_scale,
-        sigma_flip_neg=sigma_flip_neg,
-        get_G_mu_nu_fn=get_G_mu_nu_fn,
-        get_G_R_fn=get_G_R_fn,
-        get_sigma_mu_nu_fn=get_sigma_mu_nu_fn,
-        get_sigma_kij_channels_fn=get_sigma_kij_channels_fn,
-        print0=print0,
-    )
-    return out.sigma_c_kij[0]
