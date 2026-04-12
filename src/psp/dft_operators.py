@@ -73,9 +73,12 @@ class HamiltonianK:
     vnl_E: jax.Array                # (nspinor, nspinor, total_R, total_R) complex128
 
     # Preconditioner diagonal (for Davidson): h_diag = T + v_of_0 + V_NL_diag
-    h_diag: jax.Array               # (nG,) float64 — QE's g_psi convention
+    h_diag: jax.Array               # (nG_padded,) float64 — QE's g_psi convention
 
-    nG: int
+    # G-vector mask: True for valid, False for padding
+    mask: jax.Array                  # (nG_padded,) bool
+
+    nG: int                          # actual (unpadded) count
     fft_grid: tuple[int, int, int]
 
 
@@ -278,6 +281,7 @@ def setup_H_k(
     vnl_Z, vnl_E = build_vnl_kdata(k_idx, vnl_setup, wfn, sym, meta)
     h_diag = (build_h_diag(T_diag, V_loc_r, vnl_Z, vnl_E)
               if V_loc_r is not None else T_diag)
+    nG = int(Gx.shape[0])
 
     return HamiltonianK(
         T_diag=T_diag,
@@ -286,7 +290,8 @@ def setup_H_k(
         vnl_Z=vnl_Z,
         vnl_E=vnl_E,
         h_diag=h_diag,
-        nG=int(Gx.shape[0]),
+        mask=jnp.ones(nG, dtype=jnp.bool_),
+        nG=nG,
         fft_grid=tuple(int(x) for x in meta.fft_grid),
     )
 
@@ -298,6 +303,7 @@ def setup_H_k_from_kvec(
     crystal,
     meta,
     V_loc_r: jax.Array | None = None,
+    ngkmax: int | None = None,
 ) -> HamiltonianK:
     """Assemble per-k Hamiltonian data (standalone, no SymMaps / WFN.h5).
 
@@ -309,23 +315,44 @@ def setup_H_k_from_kvec(
     crystal : CrystalData or any object with bdot, ecutwfc, fft_grid
     meta : Meta object (for nspinor)
     V_loc_r : (nx, ny, nz) — ionic local potential alone, for h_diag.
+    ngkmax : int, optional — pad all arrays to this size for uniform JIT.
+        If None, no padding (arrays have natural nG length).
     """
     import psp.vnl_ops as vnl_ops
 
     T_diag, Gx, Gy, Gz = build_T_diag_from_kvec(kvec, crystal)
+    nG_actual = int(Gx.shape[0])
     Gk_int = np.stack([np.asarray(Gx), np.asarray(Gy), np.asarray(Gz)], axis=-1)
     kdata = vnl_ops.build_vnl_kdata_from_kvec(kvec, Gk_int, vnl_setup)
     h_diag = (build_h_diag(T_diag, V_loc_r, kdata.Z, kdata.E_super)
               if V_loc_r is not None else T_diag)
 
+    mask = jnp.ones(nG_actual, dtype=jnp.bool_)
+
+    # Pad to ngkmax if requested (uniform shapes for JIT reuse)
+    if ngkmax is not None and ngkmax > nG_actual:
+        pad = ngkmax - nG_actual
+        T_diag = jnp.pad(T_diag, (0, pad), constant_values=1e10)
+        h_diag = jnp.pad(h_diag, (0, pad), constant_values=1e10)
+        Gx = jnp.pad(Gx, (0, pad), constant_values=0)
+        Gy = jnp.pad(Gy, (0, pad), constant_values=0)
+        Gz = jnp.pad(Gz, (0, pad), constant_values=0)
+        vnl_Z = jnp.pad(kdata.Z, ((0, 0), (0, pad)), constant_values=0.0)
+        vnl_E = kdata.E_super
+        mask = jnp.concatenate([mask, jnp.zeros(pad, dtype=jnp.bool_)])
+    else:
+        vnl_Z = kdata.Z
+        vnl_E = kdata.E_super
+
     return HamiltonianK(
         T_diag=T_diag,
         V_scf=V_scf,
         Gx=Gx, Gy=Gy, Gz=Gz,
-        vnl_Z=kdata.Z,
-        vnl_E=kdata.E_super,
+        vnl_Z=vnl_Z,
+        vnl_E=vnl_E,
         h_diag=h_diag,
-        nG=int(Gx.shape[0]),
+        mask=mask,
+        nG=nG_actual,
         fft_grid=tuple(int(x) for x in crystal.fft_grid),
     )
 
@@ -335,26 +362,30 @@ def setup_H_k_from_kvec(
 # ═══════════════════════════════════════════════════════════════════════
 
 @functools.partial(jax.jit, donate_argnums=(0,))
-def apply_H_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E):
+def apply_H_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
     """H|ψ⟩ = (T + V_scf + V_NL)|ψ⟩.  Single fused JIT dispatch.
 
     The input psi_box is **donated** (its buffer is reused by XLA).
     After this call the caller must not read psi_box.
 
+    Padding G-vectors (where mask=False) are zeroed in the output.
+
     Parameters
     ----------
-    psi_box  : (nvec, nspinor, nx, ny, nz) complex128 — FFT-box wavefunctions
-    T_diag   : (nG,) float64          — |k+G|²
-    V_scf    : (nx, ny, nz) float64   — V_loc + V_H + V_xc
-    Gx,Gy,Gz : (nG,) int32            — G-vector FFT-box indices
-    vnl_Z    : (total_R, nG) complex128 — KB projectors (all channels dense)
-    vnl_E    : (nspinor, nspinor, total_R, total_R) complex128 — D-matrix
+    psi_box  : (nvec, nspinor, nx, ny, nz) complex128
+    T_diag   : (nG_padded,) float64
+    V_scf    : (nx, ny, nz) float64
+    Gx,Gy,Gz : (nG_padded,) int32
+    vnl_Z    : (total_R, nG_padded) complex128
+    vnl_E    : (nspinor, nspinor, total_R, total_R) complex128
+    mask     : (nG_padded,) bool — True for valid G-vectors
 
     Returns
     -------
-    H_psi : (nvec, nspinor, nG) complex128 — result in sparse-G
+    H_psi : (nvec, nspinor, nG_padded) complex128 — sparse-G (padding zeroed)
     """
-    psi_G = psi_box[:, :, Gx, Gy, Gz]
+    mask_f = mask[None, None, :].astype(psi_box.dtype)
+    psi_G = psi_box[:, :, Gx, Gy, Gz] * mask_f
 
     # ── T: kinetic energy (diagonal in G-space) ──────────────────────
     H_G = T_diag[None, None, :] * psi_G
@@ -363,12 +394,12 @@ def apply_H_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E):
     psi_r = jnp.fft.ifftn(psi_box, axes=(-3, -2, -1), norm='ortho')
     H_G = H_G + jnp.fft.fftn(
         psi_r * V_scf, axes=(-3, -2, -1), norm='ortho'
-    )[:, :, Gx, Gy, Gz]
+    )[:, :, Gx, Gy, Gz] * mask_f
 
     # ── V_NL: Kleinman–Bylander (project → D → unproject) ───────────
     P = jnp.einsum('RG,vsG->Rsv', jnp.conj(vnl_Z), psi_G, optimize=True)
     D = jnp.einsum('stRQ,Qtv->Rsv', vnl_E, P, optimize=True)
-    H_G = H_G + jnp.einsum('RG,Rsv->vsG', vnl_Z, D, optimize=True)
+    H_G = H_G + jnp.einsum('RG,Rsv->vsG', vnl_Z, D, optimize=True) * mask_f
 
     return H_G
 
@@ -378,19 +409,17 @@ def apply(psi_box: jax.Array, H_k: HamiltonianK) -> jax.Array:
     return apply_H_k(
         psi_box, H_k.T_diag, H_k.V_scf,
         H_k.Gx, H_k.Gy, H_k.Gz,
-        H_k.vnl_Z, H_k.vnl_E,
+        H_k.vnl_Z, H_k.vnl_E, H_k.mask,
     )
 
 
 @jax.jit
-def build_matrix_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E):
-    """Full ⟨m|H|n⟩ matrix at one k-point.
-
-    Same arguments as apply_H_k.  Returns (nb, nb) complex128.
-    """
+def build_matrix_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
+    """Full ⟨m|H|n⟩ matrix at one k-point.  Returns (nb, nb) complex128."""
     import psp.vnl_ops as vnl_ops
 
-    psi_G = psi_box[:, :, Gx, Gy, Gz]
+    mask_f = mask[None, None, :].astype(psi_box.dtype)
+    psi_G = psi_box[:, :, Gx, Gy, Gz] * mask_f
 
     # T
     H_mn = jnp.einsum(
@@ -402,7 +431,7 @@ def build_matrix_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E):
     psi_r = jnp.fft.ifftn(psi_box, axes=(-3, -2, -1), norm='ortho')
     Vpsi_G = jnp.fft.fftn(
         psi_r * V_scf, axes=(-3, -2, -1), norm='ortho'
-    )[:, :, Gx, Gy, Gz]
+    )[:, :, Gx, Gy, Gz] * mask_f
     H_mn = H_mn + jnp.einsum(
         'msG,nsG->mn', jnp.conj(psi_G), Vpsi_G, optimize=True,
     )
@@ -418,7 +447,7 @@ def matrix(psi_box: jax.Array, H_k: HamiltonianK) -> jax.Array:
     return build_matrix_k(
         psi_box, H_k.T_diag, H_k.V_scf,
         H_k.Gx, H_k.Gy, H_k.Gz,
-        H_k.vnl_Z, H_k.vnl_E,
+        H_k.vnl_Z, H_k.vnl_E, H_k.mask,
     )
 
 
