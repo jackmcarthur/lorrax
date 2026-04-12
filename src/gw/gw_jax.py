@@ -389,46 +389,34 @@ def fit_zeta_and_compute_V_q_chunked(
 	}
 
 
-# ================= ISDF sigma pipeline =================
+# ================= ISDF sigma =================
 #
-# All tensors use a FLAT k-index: G(nk, s, μ, s, μ), V(nk, μ, μ), Σ(nk, s, μ, s, μ).
-# The 3D k-grid (nkx, nky, nkz) only appears inside the FFT helpers.
-#
-# Sigma computation for a given (G, interaction) pair:
-#   G_R  = IFFT_k→R[ G(k) ]                  real-space Green's function
-#   Σ(k) = FFT_R→k[ G(R) · IFFT[V](R) ]     convolution theorem
-#   Σ_mn = ⟨m| Σ(k) |n⟩                      project to band basis
-#
-# SX  uses G = Σ_n f_n |ψ_n⟩⟨ψ_n| (occupied),  interaction = W,   prefactor = -1
-# COH uses G = Σ_n     |ψ_n⟩⟨ψ_n| (all bands),  interaction = W-V, prefactor = -½
+# Sigma_SX  = -project[ FFT[ G_occ(R) * W(R) / sqrt(Nk) ] ]
+# Sigma_COH = +project[ FFT[ G_RI(R) * (W-V)(R) / (2*sqrt(Nk)) ] ]
+# V_H       = project[ V0 * rho ]
 
-def build_G_occ(psi_xn, psi_yr, Gij):
-	"""G_μν(k) = Σ_ij ψ*_i(μ) G_ij ψ_j(ν).  Shape: (nk, s, μ_X, s, μ_Y)."""
-	return jnp.einsum('ksxi,kij,kjty->ksxty', psi_xn, Gij, jnp.conj(psi_yr), optimize=True)
-
-def build_G_ri(psi_xn, psi_yr):
-	"""G_μν(k) = Σ_n ψ*_n(μ) ψ_n(ν) (all bands, unit weight).  Shape: (nk, s, μ_X, s, μ_Y)."""
-	return jnp.einsum('ksxn,knty->ksxty', psi_xn, jnp.conj(psi_yr), optimize=True)
-
-def project_to_bands(psi_xr, psi_yn, sigma_k):
-	"""Σ_mn(k) = Σ_{s,μ} ψ*_m(s,μ) Σ(s,μ,s,μ,k) ψ_n(s,μ).  Shape: (nk, nb, nb)."""
+def _project(psi_xr, psi_yn, sigma_k):
+	"""Sigma(nk, s, mu, s, mu) -> Sigma(nk, m, n) in band basis."""
 	left = jnp.einsum('kmsx,ksxty->kmty', jnp.conj(psi_xr), sigma_k, optimize=True)
 	return jnp.einsum('kmty,ktyn->kmn', left, psi_yn, optimize=True)
 
-def project_to_bands_ri(psi_xr, psi_yn, sigma_k):
-	"""Like project_to_bands but returns (2, nk, nb, nb) with [Re, Im] channels."""
+def _project_ri(psi_xr, psi_yn, sigma_k):
+	"""Like _project but returns (2, nk, m, n) with [Re, Im] channels."""
 	sigma_ri = jnp.stack((jnp.real(sigma_k), jnp.imag(sigma_k)), axis=0)
 	left = jnp.einsum('kmsx,cksxty->ckmty', jnp.conj(psi_xr), sigma_ri, optimize=True)
 	return jnp.einsum('ckmty,ktyn->ckmn', left, psi_yn, optimize=True).astype(jnp.complex128)
 
-def build_hartree(psi_yr, psi_xr, Gij, V0, nk_tot):
-	"""V_H(m,n,k) from density ρ_μ = (1/Nk) Tr[G · ψ*ψ] and bare Coulomb V₀."""
-	psi_ij = jnp.einsum('kisx,kjsx->kijx', jnp.conj(psi_yr), psi_yr, optimize=True)
-	rho = jnp.real(jnp.einsum('kij,kijx->x', Gij, psi_ij, optimize=True))
-	rho = rho / jnp.asarray(nk_tot, dtype=jnp.float64)
-	Vrho = jnp.einsum('xy,y->x', V0, rho, optimize=True)
+def _hartree(wfns, Gij, V0, nk_tot):
+	"""V_H(m,n,k) = <m| V0 * rho |n> where rho = (1/Nk) Tr[G * psi*psi]."""
+	s = wfns.slices
+	psi_yr, psi_xr = wfns.yr(s.sigma), wfns.xr(s.sigma)
+	rho = jnp.real(jnp.einsum('kisx,kjsx,kij->x', jnp.conj(psi_yr), psi_yr, Gij, optimize=True))
+	Vrho = jnp.einsum('xy,y->x', V0, rho / jnp.asarray(nk_tot, dtype=jnp.float64), optimize=True)
 	return jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_xr), Vrho, psi_xr, optimize=True)
 
+# Callback for ppm_sigma (builds occupation-weighted G)
+build_G_occ = lambda psi_xn, psi_yr, Gij: jnp.einsum(
+	'ksxi,kij,kjty->ksxty', psi_xn, Gij, jnp.conj(psi_yr), optimize=True)
 
 def print_scf_diagnostics(Gij_final, U_full, nelec, nb_sigma, print_fn=print):
 	"""Print diagnostic checks for SC-COHSEX convergence (Gij, U unitarity)."""
@@ -681,63 +669,55 @@ def main(argv=None):
 	_G_ifftn, _G_fftn = _make_fft_pair(P(None, None, None, None, 'x', None, 'y'))
 	_V_ifftn, _ = _make_fft_pair(P(None, None, None, 'x', 'y'))
 
+	_inv_sqrt_nk = -1.0 / jnp.sqrt(_nk_tot)
+
 	@jax.jit
 	def _convolve(G_k, V_flat, prefactor):
-		"""Σ(k) = prefactor · FFT[ G(R) · V(R) / √Nk ].  All flat-k-first."""
 		G_R = _G_ifftn(G_k)
-		V_R = _V_ifftn(V_flat)[:, None, :, None, :]  # broadcast (nR,μ,μ) → (nR,1,μ,1,μ)
-		return prefactor * _G_fftn(G_R * V_R * (-1.0 / jnp.sqrt(_nk_tot)))
+		V_R = _V_ifftn(V_flat)[:, None, :, None, :]
+		return prefactor * _G_fftn(G_R * V_R * _inv_sqrt_nk)
 
-	# ---- Static COHSEX sigma ----
-	# Σ_SX(k) = -1  · ⟨m| FFT[G_occ(R) · W(R)/√Nk] |n⟩     (screened exchange)
-	# Σ_COH(k) = -½ · ⟨m| FFT[G_RI(R) · (W-V)(R)/√Nk] |n⟩   (Coulomb hole)
-	# V_H(m,n,k) = ⟨m| V₀·ρ |n⟩                               (Hartree)
+	# ---- Static COHSEX: Σ_SX, Σ_COH, V_H ----
 
 	@jax.jit
-	def compute_sigma_sx(wfns, Gij, W):
+	def sigma_sx(wfns, Gij, W):
 		s = wfns.slices
-		G_k = build_G_occ(wfns.xn(s.sigma), wfns.yr(s.sigma), Gij)
-		sigma_k = _convolve(G_k, W, 1.0)
-		return project_to_bands(wfns.xr(s.sigma), wfns.yn(s.sigma), sigma_k)
+		G_occ = jnp.einsum('ksxi,kij,kjty->ksxty',
+			wfns.xn(s.sigma), Gij, jnp.conj(wfns.yr(s.sigma)), optimize=True)
+		return _project(wfns.xr(s.sigma), wfns.yn(s.sigma), _convolve(G_occ, W, 1.0))
 
 	@jax.jit
-	def compute_sigma_coh(wfns, W, V):
+	def sigma_coh(wfns, W, V):
 		s = wfns.slices
-		G_k = build_G_ri(wfns.xn(s.full), wfns.yr(s.full))
-		sigma_k = _convolve(G_k, W - V, -0.5)
-		return project_to_bands(wfns.xr(s.sigma), wfns.yn(s.sigma), sigma_k)
+		G_ri = jnp.einsum('ksxn,knty->ksxty',
+			wfns.xn(s.full), jnp.conj(wfns.yr(s.full)), optimize=True)
+		return _project(wfns.xr(s.sigma), wfns.yn(s.sigma), _convolve(G_ri, W - V, -0.5))
 
 	@jax.jit
-	def compute_hartree(wfns, Gij, V0):
-		s = wfns.slices
-		return build_hartree(wfns.yr(s.sigma), wfns.xr(s.sigma), Gij, V0, _nk_tot)
+	def hartree(wfns, Gij, V0):
+		return _hartree(wfns, Gij, V0, _nk_tot)
 
-	def compute_static_sigma(wfns, W, V, V0, Gij):
-		import gc; gc.collect()
-		return (compute_sigma_sx(wfns, Gij, W),
-				compute_sigma_coh(wfns, W, V),
-				compute_hartree(wfns, Gij, V0))
-
-	def _apply_head(sigma_sx, sigma_coh):
+	def _add_head(sig_sx, sig_coh):
 		if static_head_terms is None:
-			return sigma_sx, sigma_coh
+			return sig_sx, sig_coh
 		sx_h, coh_h = static_head_terms_to_kij(
 			static_head_terms, nk_tot=meta.nk_tot, do_screened=do_screened)
 		if not do_screened:
 			coh_h = jnp.zeros_like(coh_h)
 		rep = NamedSharding(mesh_xy, P(None, None, None))
-		return sigma_sx + jax.device_put(sx_h, rep), sigma_coh + jax.device_put(coh_h, rep)
+		return sig_sx + jax.device_put(sx_h, rep), sig_coh + jax.device_put(coh_h, rep)
 
 	# ---- Execute static COHSEX ----
+	import gc; gc.collect()
 	with mesh_xy:
-		with timing.section("gw_jax.pipeline"):
-			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = \
-				compute_static_sigma(wfns, W_flat, V_flat, v_q0_noG0_munu, Gij_static)
-			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax = _apply_head(
-				sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax)
-			sigma_sx_kbar_ij_jax.block_until_ready()
-			sigma_coh_kbar_ij_jax.block_until_ready()
-			hartree_kbar_ij_jax.block_until_ready()
+		with timing.section("gw_jax.sigma"):
+			sig_sx  = sigma_sx(wfns, Gij_static, W_flat)
+			sig_coh = sigma_coh(wfns, W_flat, V_flat)
+			sig_h   = hartree(wfns, Gij_static, v_q0_noG0_munu)
+			sig_sx, sig_coh = _add_head(sig_sx, sig_coh)
+			sig_sx.block_until_ready()
+			sig_coh.block_until_ready()
+			sig_h.block_until_ready()
 
 	sigma_omega_h5_path = None
 	sigma_c_at_dft_ev = None
@@ -755,8 +735,8 @@ def main(argv=None):
 			raise ValueError("use_ppm_sigma=true requires do_screened=true.")
 		if self_consistent:
 			raise NotImplementedError("use_ppm_sigma is currently supported only for self_consistent=false.")
-		sigma_sx_screened_ref = sigma_sx_kbar_ij_jax
-		sigma_coh_static_ref = sigma_coh_kbar_ij_jax
+		sig_sx_static_ref = sig_sx
+		sig_coh_static_ref = sig_coh
 		minimax_config = minimax_config_from_params(params)
 		sigma_quadrature = sigma_quadrature_config_from_params(params)
 		opts = build_ppm_sigma_runtime_options(params, input_dir=input_dir, ryd2ev=ryd2ev)
@@ -817,7 +797,7 @@ def main(argv=None):
 
 			def _build_sigma_x_bare_kij():
 				with mesh_xy:
-					result = compute_sigma_sx(wfns, Gij_static, V_flat)
+					result = sigma_sx(wfns, Gij_static, V_flat)
 				result.block_until_ready()
 				return result
 
@@ -968,11 +948,11 @@ def main(argv=None):
 				sigma_x_diag_ev = np.diagonal(np.asarray(sigma_x_bare_kij), axis1=1, axis2=2) * ryd2ev
 				sigma_xc_at_dft_ev = sigma_x_diag_ev + sigma_c_at_dft_ev
 
-			coh_diff_abs = float(jnp.max(jnp.abs(sigma_coh_ppm_kij - sigma_coh_kbar_ij_jax)))
-			coh_ref = max(float(jnp.max(jnp.abs(sigma_coh_kbar_ij_jax))), 1.0e-16)
-			sx_diff_abs = float(jnp.max(jnp.abs(sigma_x_bare_kij - sigma_sx_screened_ref)))
-			sx_ref = max(float(jnp.max(jnp.abs(sigma_sx_screened_ref))), 1.0e-16)
-			static_total_ref = sigma_sx_screened_ref + sigma_coh_static_ref
+			coh_diff_abs = float(jnp.max(jnp.abs(sigma_coh_ppm_kij - sig_coh)))
+			coh_ref = max(float(jnp.max(jnp.abs(sig_coh))), 1.0e-16)
+			sx_diff_abs = float(jnp.max(jnp.abs(sigma_x_bare_kij - sig_sx_static_ref)))
+			sx_ref = max(float(jnp.max(jnp.abs(sig_sx_static_ref))), 1.0e-16)
+			static_total_ref = sig_sx_static_ref + sig_coh_static_ref
 			gw_total_0 = sigma_x_bare_kij + sigma_coh_ppm_kij
 			total_diff_abs = float(jnp.max(jnp.abs(gw_total_0 - static_total_ref)))
 			total_ref = max(float(jnp.max(jnp.abs(static_total_ref))), 1.0e-16)
@@ -983,8 +963,8 @@ def main(argv=None):
 				f"  [Σ^X + Σ^c(0)] vs [Σ^SX + Σ^COH]: abs={total_diff_abs:.6e} Ry "
 				f"({total_diff_abs * ryd2ev:.6e} eV), rel={total_diff_abs / total_ref:.6e}"
 			)
-			sigma_sx_kbar_ij_jax = sigma_x_bare_kij
-			sigma_coh_kbar_ij_jax = sigma_coh_ppm_kij
+			sig_sx = sigma_x_bare_kij
+			sig_coh = sigma_coh_ppm_kij
 
 			sigma_omega_h5_path = params.get("sigma_omega_h5_file", "sigma_mnk.h5")
 			if not os.path.isabs(sigma_omega_h5_path):
@@ -997,8 +977,8 @@ def main(argv=None):
 						opts.omega_grid_ev,
 						None,
 						sigma_c_kij_ev=ryd2ev * sigma_coh_ppm_omega_kij,
-						sigma_sx_kij_ev=ryd2ev * sigma_sx_kbar_ij_jax,
-						hartree_kij_ev=ryd2ev * hartree_kbar_ij_jax,
+						sigma_sx_kij_ev=ryd2ev * sig_sx,
+						hartree_kij_ev=ryd2ev * sig_h,
 					)
 					if (
 						sigma_omega.sigma_c_plus_kij is not None
@@ -1097,8 +1077,8 @@ def main(argv=None):
 							dtype=np.complex128,
 							chunks=chunks,
 						)
-						h5_out.create_dataset("sigma_sx_kij_ev", data=ryd2ev * np.array(sigma_sx_kbar_ij_jax))
-						h5_out.create_dataset("hartree_kij_ev", data=ryd2ev * np.array(hartree_kbar_ij_jax))
+						h5_out.create_dataset("sigma_sx_kij_ev", data=ryd2ev * np.array(sig_sx))
+						h5_out.create_dataset("hartree_kij_ev", data=ryd2ev * np.array(sig_h))
 						for ibeg in range(0, n_omega, o_chunks):
 							iend = min(ibeg + o_chunks, n_omega)
 							idx = slice(ibeg, iend)
@@ -1106,20 +1086,20 @@ def main(argv=None):
 							dset_c_ev[idx] = sigma_c_ev
 							sigma_total_ev = (
 								sigma_c_ev
-								+ ryd2ev * np.array(sigma_sx_kbar_ij_jax)[None, ...]
-								+ ryd2ev * np.array(hartree_kbar_ij_jax)[None, ...]
+								+ ryd2ev * np.array(sig_sx)[None, ...]
+								+ ryd2ev * np.array(sig_h)[None, ...]
 							)
 							dset_total[idx] = sigma_total_ev
 
 
 
 	# Initial Σ = SX + COH + Hartree (all three combined for self-consistency)
-	sigma_total_full = sigma_sx_kbar_ij_jax + sigma_coh_kbar_ij_jax + hartree_kbar_ij_jax
+	sigma_total_full = sig_sx + sig_coh + sig_h
 	
 	# Save INITIAL sigma for one-shot diagnostic (before self-consistency changes them)
-	sigma_sx_initial = sigma_sx_kbar_ij_jax
-	sigma_coh_initial = sigma_coh_kbar_ij_jax
-	hartree_initial = hartree_kbar_ij_jax
+	sigma_sx_initial = sig_sx
+	sigma_coh_initial = sig_coh
+	hartree_initial = sig_h
 
 	qp_band_start = int(b0)
 	qp_band_stop = int(b3)
@@ -1139,19 +1119,19 @@ def main(argv=None):
 			return float(E_kn_ev[0, ic] - E_kn_ev[0, iv])
 
 		# Compare static COHSEX and dynamic-omega=0 spectra on the same Hamiltonian baseline.
-		H_static_ref = np.array(kin_ion_full + sigma_sx_screened_ref + sigma_coh_static_ref + hartree_kbar_ij_jax)
+		H_static_ref = np.array(kin_ion_full + sig_sx_static_ref + sig_coh_static_ref + sig_h)
 		H_static_ref = 0.5 * (H_static_ref + np.conj(np.swapaxes(H_static_ref, -1, -2)))
 		E_static_ref_ev = np.linalg.eigvalsh(H_static_ref) * ryd2ev
 
-		H_dyn0 = np.array(kin_ion_full + sigma_sx_kbar_ij_jax + sigma_coh_kbar_ij_jax + hartree_kbar_ij_jax)
+		H_dyn0 = np.array(kin_ion_full + sig_sx + sig_coh + sig_h)
 		H_dyn0 = 0.5 * (H_dyn0 + np.conj(np.swapaxes(H_dyn0, -1, -2)))
 		E_dyn0_ev = np.linalg.eigvalsh(H_dyn0) * ryd2ev
 
 		# Diagonal self-consistency for E = diag(kin_ion + V_H) + Re Sigma_xc(E).
 		# Sigma_xc(omega) is computed on an omega grid referenced to E_F, so
 		# solve in the same relative-energy scale (E - E_F), then shift back.
-		h0_diag_ev_abs = np.real(np.diagonal(np.array(kin_ion_full + hartree_kbar_ij_jax), axis1=1, axis2=2)) * ryd2ev
-		sigma_sx_host_ev = ryd2ev * np.array(sigma_sx_kbar_ij_jax)
+		h0_diag_ev_abs = np.real(np.diagonal(np.array(kin_ion_full + sig_h), axis1=1, axis2=2)) * ryd2ev
+		sigma_sx_host_ev = ryd2ev * np.array(sig_sx)
 		sigma_xc_diag_omega_ev = np.real(
 			load_sigma_xc_diag_from_h5(
 				sigma_omega_h5_path,
@@ -1267,9 +1247,10 @@ def main(argv=None):
 			
 			# Compute new Σ using original wavefunctions but updated G_ij
 			with mesh_xy:
-				sigma_sx_new, sigma_coh_new, hartree_new = \
-					compute_static_sigma(wfns, W_flat, V_flat, v_q0_noG0_munu, Gij_new)
-			sigma_sx_new, sigma_coh_new = _apply_static_head_terms(sigma_sx_new, sigma_coh_new)
+				sigma_sx_new = sigma_sx(wfns, Gij_new, W_flat)
+				sigma_coh_new = sigma_coh(wfns, W_flat, V_flat)
+				hartree_new = hartree(wfns, Gij_new, v_q0_noG0_munu)
+			sigma_sx_new, sigma_coh_new = _add_head(sigma_sx_new, sigma_coh_new)
 			
 			# Combine and extract upper triangle
 			sigma_new = sigma_sx_new + sigma_coh_new + hartree_new
@@ -1308,12 +1289,10 @@ def main(argv=None):
 		print_scf_diagnostics(Gij_final, U_full, nelec, nb_sigma, print0)
 
 		with mesh_xy:
-			sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax, hartree_kbar_ij_jax = \
-				compute_static_sigma(wfns, W_flat, V_flat, v_q0_noG0_munu, Gij_final)
-		sigma_sx_kbar_ij_jax, sigma_coh_kbar_ij_jax = _apply_static_head_terms(
-			sigma_sx_kbar_ij_jax,
-			sigma_coh_kbar_ij_jax,
-		)
+			sig_sx  = sigma_sx(wfns, Gij_final, W_flat)
+			sig_coh = sigma_coh(wfns, W_flat, V_flat)
+			sig_h   = hartree(wfns, Gij_final, v_q0_noG0_munu)
+		sig_sx, sig_coh = _add_head(sig_sx, sig_coh)
 	else:
 		# One-shot: diagonalize H = (H_DFT - V_xc) + V_H + Σ_xc
 		H_qp_mnk = kin_ion_full + sigma_total_full
@@ -1337,9 +1316,9 @@ def main(argv=None):
 		# sigma_qp = U† @ sigma @ U → output (nk, m, n) in QP basis
 		return jnp.einsum('kim,kij,kjn->kmn', jnp.conj(U), sigma_dft, U, optimize=True)
 	
-	sigma_sx_qp = rotate_to_qp_basis(sigma_sx_kbar_ij_jax, U_full)
-	sigma_coh_qp = rotate_to_qp_basis(sigma_coh_kbar_ij_jax, U_full)
-	hartree_qp = rotate_to_qp_basis(hartree_kbar_ij_jax, U_full)
+	sigma_sx_qp = rotate_to_qp_basis(sig_sx, U_full)
+	sigma_coh_qp = rotate_to_qp_basis(sig_coh, U_full)
+	hartree_qp = rotate_to_qp_basis(sig_h, U_full)
 	
 	# Diagnostic: check trace preservation after rotation
 	if self_consistent:
@@ -1414,8 +1393,8 @@ def main(argv=None):
 		and omega_dft_rel_ev is not None
 	):
 		kin_ion_diag_ev = np.diagonal(np.asarray(kin_ion_full), axis1=1, axis2=2) * ryd2ev
-		sex_static_diag_ev = np.diagonal(np.asarray(sigma_sx_screened_ref), axis1=1, axis2=2) * ryd2ev
-		coh_static_diag_ev = np.diagonal(np.asarray(sigma_coh_static_ref), axis1=1, axis2=2) * ryd2ev
+		sex_static_diag_ev = np.diagonal(np.asarray(sig_sx_static_ref), axis1=1, axis2=2) * ryd2ev
+		coh_static_diag_ev = np.diagonal(np.asarray(sig_coh_static_ref), axis1=1, axis2=2) * ryd2ev
 		x_diag_ev = np.diagonal(np.asarray(sigma_x_bare_kij), axis1=1, axis2=2) * ryd2ev
 		sigma_c_w0_diag_ev = np.diagonal(np.asarray(sigma_coh_ppm_kij), axis1=1, axis2=2) * ryd2ev
 		if sigma_c_plus_at_dft_ev is None:
@@ -1474,7 +1453,7 @@ def main(argv=None):
 		)
 	elif (not self_consistent) and meta.rank == 0 and (sigma_xc_at_dft_ev is not None):
 		# G0W0 comparison: evaluate diagonal (H0 + Sigma_xc(E_DFT)) next to E_DFT.
-		h0_diag_ev_abs = np.real(np.diagonal(np.array(kin_ion_full + hartree_kbar_ij_jax), axis1=1, axis2=2)) * ryd2ev
+		h0_diag_ev_abs = np.real(np.diagonal(np.array(kin_ion_full + sig_h), axis1=1, axis2=2)) * ryd2ev
 		g0w0_diag_ev = h0_diag_ev_abs + sigma_xc_at_dft_ev
 		eqp_g0w0_path = os.path.join(input_dir, "eqp_g0w0.dat")
 		write_eqp_g0w0(eqp_g0w0_path, energies_dft_ev_host, g0w0_diag_ev)
