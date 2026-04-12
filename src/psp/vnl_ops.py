@@ -92,13 +92,24 @@ class VNLKData:
 # ---------------------------------------------------------------------------
 
 def build_vnl_setup(
-    wfn, sym, meta, pseudos,
+    wfn, sym=None, meta=None, pseudos=None,
     n_q: int = 50000,
     nspinor: int | None = None,
+    q_max: float | None = None,
 ) -> VNLSetup:
-    """Build k-independent VNL data: radial tables, channel metadata."""
+    """Build k-independent VNL data: radial tables, channel metadata.
+
+    Parameters
+    ----------
+    wfn : WFNReader or CrystalData (needs atom_crys, bvec, blat, cell_volume)
+    sym : SymMaps, optional — used to determine q_max if not provided.
+    meta : Meta, optional — used with sym for q_max scan.
+    pseudos : dict — element → UPF
+    q_max : float, optional — if provided, skip the k-point scan for q_max.
+        Use this when SymMaps is not available (standalone Davidson path).
+    """
     if nspinor is None:
-        nspinor = int(meta.nspinor)
+        nspinor = int(meta.nspinor) if meta is not None else int(wfn.nspinor)
 
     atom_pos = jnp.asarray(wfn.atom_crys, dtype=jnp.float64)
     atom_types = jnp.asarray(wfn.atom_types, dtype=jnp.int32)
@@ -110,14 +121,17 @@ def build_vnl_setup(
     prefactor = (4.0 * np.pi) / np.sqrt(cell_volume)
 
     # Determine q_max
-    q_max = 0.0
-    for ik in range(sym.nk_tot):
-        Gk, _ = generate_gvectors_k(ik, sym, wfn, meta)
-        kvec = np.asarray(sym.unfolded_kpts[ik], dtype=float)
-        K_cart = (np.asarray(Gk, dtype=float) + kvec[None, :]) @ B
-        qk = np.sqrt(np.sum(K_cart ** 2, axis=1))
-        if qk.size:
-            q_max = max(q_max, float(np.max(qk)))
+    if q_max is None:
+        if sym is None:
+            raise ValueError("Either q_max or (sym, meta) required for build_vnl_setup")
+        q_max = 0.0
+        for ik in range(sym.nk_tot):
+            Gk, _ = generate_gvectors_k(ik, sym, wfn, meta)
+            kvec = np.asarray(sym.unfolded_kpts[ik], dtype=float)
+            K_cart = (np.asarray(Gk, dtype=float) + kvec[None, :]) @ B
+            qk = np.sqrt(np.sum(K_cart ** 2, axis=1))
+            if qk.size:
+                q_max = max(q_max, float(np.max(qk)))
     q_max *= 1.01  # small margin
 
     dq = q_max / (n_q - 1)
