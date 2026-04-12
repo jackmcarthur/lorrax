@@ -66,10 +66,8 @@ except RuntimeError as exc:
 	else:
 		raise
 from file_io import (
-    WFNReader,
-    write_sigma_to_file, write_eqp_g0w0, write_sigma_omega_h5,
-    write_qp_rotations_h5, load_kin_ion_submatrix,
-    load_centroids, resolve_input_paths,
+    WFNReader, write_sigma_omega_h5,
+    load_kin_ion_submatrix, load_centroids, resolve_input_paths,
 )
 from common import symmetry_maps
 from common.load_wfns import get_enk_bandrange
@@ -464,26 +462,12 @@ def main(argv=None):
 	devices_2d = np.array(jax.devices()).reshape(grid_x, grid_y)
 	mesh_xy = Mesh(devices_2d, ['x', 'y'])
 	
-	_print0("")
-	_print0("=" * 72)
-	_print0("  COHSEX-JAX: Self-Energy Calculation")
-	_print0("=" * 72)
-	_print0(f"  Backend: {current_backend.upper():<8}  Devices: {n_devices}  Mesh: {grid_x}×{grid_y}  Processes: {n_procs}")
-	_print0(f"  Device type: {device_names}")
-	# XLA allocator diagnostics
-	_preallocate = os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE", "unset")
-	_mem_frac = os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION", "unset")
-	_print0(f"  XLA preallocate: {_preallocate}  mem_fraction: {_mem_frac}")
-	try:
-		_stats = jax.devices()[0].memory_stats()
-		if _stats:
-			_bl = _stats.get('bytes_limit', 0) / 1e9
-			_bu = _stats.get('bytes_in_use', 0) / 1e9
-			_print0(f"  XLA pool: limit={_bl:.2f} GB, in_use={_bu:.2f} GB, avail={_bl-_bu:.2f} GB")
-	except Exception:
-		pass
-	_print0("=" * 72)
-	_print0("")
+	from .gw_output import print_banner, print_system_summary, write_results, GWResults
+	print_banner(
+		backend=current_backend, n_devices=n_devices,
+		grid_x=grid_x, grid_y=grid_y, n_procs=n_procs,
+		device_kind=device_names, print_fn=_print0,
+	)
 	
 	# Resolve relative paths against the input file's directory
 	input_dir = os.path.dirname(os.path.abspath(args.input))
@@ -517,9 +501,10 @@ def main(argv=None):
 	tmp_dir = os.path.join(input_dir, "tmp")
 	os.makedirs(tmp_dir, exist_ok=True)
 	tensors_filename = os.path.join(tmp_dir, f"isdf_tensors_{_n_rmu}.h5")
-	_print0(f"  ISDF basis: {_n_rmu} centroids")
-	_print0(f"  FFT grid: {wfn.fft_grid[0]}×{wfn.fft_grid[1]}×{wfn.fft_grid[2]}   Cell volume: {wfn.cell_volume:.2f} a.u.³")
-	_print0("")
+	print_system_summary(
+		n_rmu=_n_rmu, fft_grid=wfn.fft_grid,
+		cell_volume=wfn.cell_volume, print_fn=_print0,
+	)
 
 	# Resolve runtime configuration (memory budget, chunking, control flags)
 	_t_cfg = _boot_time.perf_counter()
@@ -849,44 +834,35 @@ def main(argv=None):
 	# ---- DFT and QP energies ----
 	b0, b3 = meta.band_edges[0], meta.band_edges[3]
 	enk_dft, _ = get_enk_bandrange(wfn, sym, (b0, b3), (b0, b3), nspinor=meta.nspinor)
-	E_dft_ev = np.array(enk_dft) * ryd2ev
-	E_qp_ev = np.array(E_full) * ryd2ev
 
 	# ---- Output ----
+	results = GWResults(
+		sig_sx=np.array(sig_sx),
+		sig_coh=np.array(sig_coh),
+		sig_h=np.array(sig_h),
+		E_qp_ry=np.array(E_full),
+		U_qp=np.array(U_full),
+		E_dft_ry=np.array(enk_dft),
+		kin_ion_ry=np.array(kin_ion),
+		band_start=b0,
+		band_stop=b3,
+		use_ppm=use_ppm_sigma,
+		self_consistent=self_consistent,
+		sigma_xc_at_dft_ev=sigma_xc_at_dft_ev,
+		sigma_omega_h5_path=sigma_omega_h5_path,
+		tensors_filename=tensors_filename,
+	)
 	if meta.rank == 0:
-		# eqp0.dat — main QP output
-		write_sigma_to_file(
-			ryd2ev * np.array(sig_sx), params["output_file"],
-			sigma_coh_kij_eV=ryd2ev * np.array(sig_coh),
-			hartree_kij_eV=ryd2ev * np.array(sig_h),
-			sx_label="sigX" if use_ppm_sigma else "sigSX",
-			corr_label="sigC" if use_ppm_sigma else "sigCOH",
-			total_label="sigXC" if use_ppm_sigma else "sigTOT",
-		)
-
-		# G0W0 diagonal: E_QP = diag(H0 + Σ_xc(E_DFT))
-		if not self_consistent and sigma_xc_at_dft_ev is not None:
-			h0_diag = np.real(np.diagonal(np.array(kin_ion + sig_h), axis1=1, axis2=2)) * ryd2ev
-			write_eqp_g0w0(os.path.join(input_dir, "eqp_g0w0.dat"), E_dft_ev, h0_diag + sigma_xc_at_dft_ev)
-			print0(f"  G0W0 diag (E_DFT):     {os.path.join(input_dir, 'eqp_g0w0.dat')}")
-
-		# QP rotation matrices
-		write_qp_rotations_h5(
-			os.path.join(input_dir, "qp_wfn_rotations.h5"),
-			U_mnk=np.array(U_full),
-			E_qp_nk=np.array(E_full) / 2.0,
-			band_start=b0, band_stop=b3,
+		write_results(
+			results,
+			output_file=params["output_file"],
+			input_dir=input_dir,
 			kpoints_crys=np.array(sym.unfolded_kpts, dtype=np.float64),
-			nkx=meta.nkx, nky=meta.nky, nkz=meta.nkz,
+			kgrid=(meta.nkx, meta.nky, meta.nkz),
 			kpoints_reduced=np.array(wfn.kpoints, dtype=np.float64),
 			kirr_to_kfull=np.array(sym.kirr_fullids, dtype=np.int32),
+			print_fn=print0,
 		)
-
-	print0(f"\n  Output: {params['output_file']}")
-	if sigma_omega_h5_path:
-		print0(f"  Sigma(ω): {sigma_omega_h5_path}")
-	print0(f"  Restart:  {tensors_filename}")
-	print0("")
 	if jax.process_index() == 0:
 		timing.report(print_fn=print0, title="--- Timing ---")
 
