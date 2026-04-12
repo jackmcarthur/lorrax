@@ -86,7 +86,7 @@ from .w_isdf import (
 	build_imag_quadrature,
 	compute_chi0,
 	flatten_V_qmunu,
-	solve_w_from_chi_q_jax,
+	solve_w,
 )
 from .minimax_config import (
 	minimax_config_from_params,
@@ -393,12 +393,12 @@ def fit_zeta_and_compute_V_q_chunked(
 
 from .projection_kernel import project as _project
 
-def _hartree(wfns, Gij, V, nk_tot):
-	"""V_H(m,n,k) = <m| V(q=0,noG0) * rho |n>.  V is flat-k (nk,μ,μ); uses V[0]."""
+def _hartree(wfns, Gij, V_q, nk_tot):
+	"""V_H(m,n,k) = <m| V(q=0,noG0) * rho |n>.  V_q is flat-k (nk,μ,μ); uses V_q[0]."""
 	s = wfns.slices
 	psi_yr, psi_xr = wfns.yr(s.sigma), wfns.xr(s.sigma)
 	rho = jnp.real(jnp.einsum('kisx,kjsx,kij->x', jnp.conj(psi_yr), psi_yr, Gij, optimize=True))
-	Vrho = jnp.einsum('xy,y->x', V[0], rho / jnp.asarray(nk_tot, dtype=jnp.float64), optimize=True)
+	Vrho = jnp.einsum('xy,y->x', V_q[0], rho / jnp.asarray(nk_tot, dtype=jnp.float64), optimize=True)
 	return jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_xr), Vrho, psi_xr, optimize=True)
 
 from .greens_function_kernel import build_G
@@ -560,13 +560,14 @@ def main(argv=None):
 			with jax_profile.trace_section("chi0_W"):
 				quad, e_ref = build_static_quadrature(wfns, minimax_config, print_fn=print0)
 				chi0_q = compute_chi0(wfns, quad, meta, mesh_xy, energy_reference=e_ref)
-				W_q = solve_w_from_chi_q_jax(V_q, chi0_q, meta, mesh_xy)
+				W_q = solve_w(V_q, chi0_q, meta, mesh_xy)
 				chi0_q.block_until_ready()
 				W_q.block_until_ready()
 				print0(f"  |χ(0)|_max = {float(jnp.max(jnp.abs(chi0_q))):.6e}  "
 				       f"(minimax, {quad.node_count} nodes)")
 
-	V, W = V_q, (W_q if do_screened else V_q)
+	if not do_screened:
+		W_q = V_q  # unscreened: W = V
 	Gij = _build_Gij(meta, mesh_xy)
 
 	# q→0 head correction (exact band-diagonal terms for static COHSEX)
@@ -602,28 +603,28 @@ def main(argv=None):
 	_inv_sqrt_nk = -1.0 / jnp.sqrt(_nk_tot)
 
 	@jax.jit
-	def _convolve(G_k, V, prefactor):
+	def _convolve(G_k, V_or_W, prefactor):
 		G_R = _G_ifftn(G_k)
-		V_R = _V_ifftn(V)[:, None, :, None, :]
+		V_R = _V_ifftn(V_or_W)[:, None, :, None, :]
 		return prefactor * _G_fftn(G_R * V_R * _inv_sqrt_nk)
 
 	# ---- Static COHSEX: Σ_SX, Σ_COH, V_H ----
 
 	@jax.jit
-	def sigma_sx(wfns, Gij, W):
+	def sigma_sx(wfns, Gij, W_q):
 		s = wfns.slices
 		G_occ = build_G(wfns.xn(s.sigma), wfns.yr(s.sigma), Gij=Gij)
-		return _project(wfns.xr(s.sigma), wfns.yn(s.sigma), _convolve(G_occ, W, 1.0))
+		return _project(wfns.xr(s.sigma), wfns.yn(s.sigma), _convolve(G_occ, W_q, 1.0))
 
 	@jax.jit
-	def sigma_coh(wfns, W, V):
+	def sigma_coh(wfns, W_q, V_q):
 		s = wfns.slices
 		G_ri = build_G(wfns.xn(s.full), wfns.yr(s.full))
-		return _project(wfns.xr(s.sigma), wfns.yn(s.sigma), _convolve(G_ri, W - V, -0.5))
+		return _project(wfns.xr(s.sigma), wfns.yn(s.sigma), _convolve(G_ri, W_q - V_q, -0.5))
 
 	@jax.jit
-	def hartree(wfns, Gij, V):
-		return _hartree(wfns, Gij, V, _nk_tot)
+	def hartree(wfns, Gij, V_q):
+		return _hartree(wfns, Gij, V_q, _nk_tot)
 
 	def _add_head(sig_sx, sig_coh):
 		if static_head_terms is None:
@@ -639,19 +640,19 @@ def main(argv=None):
 	import gc; gc.collect()
 	with mesh_xy:
 		with timing.section("gw_jax.sigma"):
-			sig_sx  = sigma_sx(wfns, Gij, W)
-			sig_coh = sigma_coh(wfns, W, V)
-			sig_h   = hartree(wfns, Gij, V)
+			sig_sx  = sigma_sx(wfns, Gij, W_q)
+			sig_coh = sigma_coh(wfns, W_q, V_q)
+			sig_h   = hartree(wfns, Gij, V_q)
 
 			sig_sx, sig_coh = _add_head(sig_sx, sig_coh)
-			
+
 			sig_sx.block_until_ready()
 			sig_coh.block_until_ready()
 			sig_h.block_until_ready()
 
 	# Bare exchange Σ_X (used for both COHSEX comparison and PPM Σ^c = Σ_xc - Σ_X)
 	with mesh_xy:
-		sig_x = sigma_sx(wfns, Gij, V)
+		sig_x = sigma_sx(wfns, Gij, V_q)
 	sig_x.block_until_ready()
 
 	# ---- GN-PPM: replace static COH with frequency-integrated Σ^c ----
@@ -677,7 +678,7 @@ def main(argv=None):
 			quad_imag = build_imag_quadrature(
 				quad, ppm_options.omega_p_ry, minimax_config, print_fn=print0)
 			chi0_imag = compute_chi0(wfns, quad_imag, meta, mesh_xy, energy_reference=e_ref)
-			Wiwp_q = solve_w_from_chi_q_jax(V_q, chi0_imag, meta, mesh_xy)
+			Wiwp_q = solve_w(V_q, chi0_imag, meta, mesh_xy)
 			chi0_imag.block_until_ready()
 			Wiwp_q.block_until_ready()
 
@@ -690,7 +691,7 @@ def main(argv=None):
 			sigma_omega = compute_sigma_c_ppm_omega_grid(
 				wfns, ppm, meta, mesh_xy, ppm_options,
 				sigma_window_quad=sigma_window_quad,
-				print0=print0,
+				print_fn=print0,
 			)
 			sigma_c_omega = sigma_omega.sigma_c_kij  # (n_omega, nk, nb, nb) or None if streamed
 

@@ -399,27 +399,24 @@ def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int):
     return _solve_w
 
 
-def solve_w_from_chi_q_jax(
-    V_qmunu: jax.Array,
-    chi_q: jax.Array,
-    meta: Meta,
-    mesh_xy: Mesh,
-) -> jax.Array:
-    """
-    Compute screened interaction W_q = (I - V χ)^{-1} V from a precomputed χ(q).
-    
-    Uses two-stage resharding following load_wfns pattern:
-    All arrays flat-q: V(nq, μ, μ), chi(nq, μ, μ) → W(nq, μ, μ).
+def solve_w(V_q, chi0_q, meta, mesh_xy):
+    """W(q) = (I − V χ₀)⁻¹ V  via q-parallel Dyson solve.
+
+    All arrays flat-q: V(nq, μ, μ), χ₀(nq, μ, μ) → W(nq, μ, μ).
     """
     nq = int(meta.nk_tot)
-    n_rmu = chi_q.shape[1]
+    n_rmu = chi0_q.shape[1]
     nspin = max(1, int(getattr(meta, 'nspin', 1)))
     nspinor = max(1, int(getattr(meta, 'nspinor', 1)))
     pref = jnp.asarray(2.0 / (math.sqrt(float(max(1, nq))) * float(nspin) * float(nspinor)),
                         dtype=jnp.complex128)
     solve_fn = _get_w_solve_fn(mesh_xy, nq, n_rmu)
     with jax_profile.annotation("W_solve"):
-        return solve_fn(V_qmunu, chi_q, pref)
+        return solve_fn(V_q, chi0_q, pref)
+
+
+# Backward-compatible alias
+solve_w_from_chi_q_jax = solve_w
 
 
 def compute_screening(

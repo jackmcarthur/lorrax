@@ -369,7 +369,7 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     minimax_energy_reference: str | float | int | None = "midgap",
     minimax_energy_reference_fn: Callable[[jax.Array, jax.Array], float] | None = None,
     fallback_omega: float = 2.0,
-    print0=print,
+    print_fn=print,
 ) -> PPMBuildResult:
     """Build GN-PPM parameters from minimax W(0) and W(i*omega_p)."""
     import time as _t
@@ -404,7 +404,7 @@ def compute_w0_wiwp_and_ppm_from_minimax(
         target_error=target_error,
         max_nodes=max_nodes,
         use_shipped_tables=bool(use_shipped_minimax_tables),
-        print_fn=print0,
+        print_fn=print_fn,
     )
 
     # Minimax for chi0(i*omega_p): approximates x/(x^2+omega_p^2)
@@ -414,7 +414,7 @@ def compute_w0_wiwp_and_ppm_from_minimax(
         max_nodes=max_nodes,
     )
     R = quad_imag.x_max / quad_imag.x_min
-    print0(
+    print_fn(
         f"  PPM imag-freq window (ωp={omega_p_ry:.4f} Ry): "
         f"R={R:.1f}, nodes={quad_imag.node_count}, err~{quad_imag.max_error:.1e}"
     )
@@ -458,11 +458,11 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     B = jax.lax.with_sharding_constraint(jnp.asarray(b_qmunu), q_shard)
     valid_mask = jax.lax.with_sharding_constraint(jnp.asarray(valid_qmunu), q_shard)
 
-    print0(
+    print_fn(
         f"  PPM build: χ(0)={t1-t0:.2f}s  χ(iωp)={t2-t1:.2f}s  "
         f"W(0)={t3-t2:.2f}s  W(iωp)={t4-t3:.2f}s  GN-fit={t5-t4:.2f}s"
     )
-    print0(f"  GN-PPM: ωp={omega_p_ry:.4f} Ry, unfulfilled={100.0 * unfulfilled:.2f}%")
+    print_fn(f"  GN-PPM: ωp={omega_p_ry:.4f} Ry, unfulfilled={100.0 * unfulfilled:.2f}%")
 
     return PPMBuildResult(
         omega_p=omega_p_ry,
@@ -655,7 +655,7 @@ def _convolve_sigma_branch_kij(
     meta,
     omega_sign_flip: int = 1,
     log_tag: str = "",
-    print0=print,
+    print_fn=print,
     omega_batch_size: int = 4,
     stream_writer: Callable[[np.ndarray, jax.Array], None] | None = None,
     scale: float = 1.0,
@@ -734,7 +734,7 @@ def _convolve_sigma_branch_kij(
     for win in windows:
         A_vals = E_A_host[win.mask_A]
         kind = "crossing" if win.crossing_kind else "Laplace"
-        print0(
+        print_fn(
             f"    {log_tag} window \"{win.name}\" ({kind}): "
             f"{int(win.alpha.shape[0])} nodes, err<{target_error:.0e}, "
             f"E_A=[{float(np.min(A_vals)):.4f}, {float(np.max(A_vals)):.4f}] Ry, "
@@ -823,7 +823,7 @@ def compute_sigma_c_ppm_omega_grid(
     ppm_options,
     *,
     sigma_window_quad: SigmaQuadratureConfig | None = None,
-    print0=print,
+    print_fn=print,
 ) -> SigmaOmegaResult:
     """Compute Σ^c_kij(ω) via GN-PPM windowed minimax integration."""
 
@@ -909,14 +909,14 @@ def compute_sigma_c_ppm_omega_grid(
 
     ryd2ev = 13.6056980659
     omega_step_ev = float(omega_req[1] - omega_req[0]) * ryd2ev if omega_req.size > 1 else 0.0
-    print0(
+    print_fn(
         f"  Σc(ω) grid: "
         f"{float(np.min(omega_req)) * ryd2ev:.3f}..{float(np.max(omega_req)) * ryd2ev:.3f} eV, "
         f"Nω={omega_req.size}, Δω={omega_step_ev:.3f} eV, "
         f"ξ={float(regularization_width_ry) * ryd2ev:.3f} eV"
     )
     if n_invalid:
-        print0(
+        print_fn(
             f"  GN invalid modes: {n_invalid}/{n_total_modes} "
             f"({100.0 * n_invalid / max(n_total_modes, 1):.2f}%)"
         )
@@ -990,7 +990,7 @@ def compute_sigma_c_ppm_omega_grid(
             wfns=wfns,
             mesh_xy=mesh_xy,
             meta=meta,
-            print0=print0,
+            print_fn=print_fn,
             omega_batch_size=omega_batch_size,
             stream_writer=_accumulate_kij_stream if use_kij_stream else None,
             use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
