@@ -414,8 +414,8 @@ def main(argv=None):
 			efermi_dft_ev = None
 			if meta.rank == 0:
 				enk_dft, _ = get_enk_bandrange(wfn, sym,
-					(meta.band_edges[0], meta.band_edges[3]),
-					(meta.band_edges[0], meta.band_edges[3]), nspinor=meta.nspinor)
+					band_slices.sigma_range,
+					band_slices.sigma_range, nspinor=meta.nspinor)
 				enk_dft_ev = np.asarray(enk_dft) * ryd2ev
 				n_occ = min(meta.nelec, enk_dft_ev.shape[1])
 				vbm_ev = float(np.max(enk_dft_ev[:, :n_occ]))
@@ -473,7 +473,7 @@ def main(argv=None):
 
 	# ---- QP Hamiltonian: H_QP = (H_DFT - V_xc) + V_H + Σ_xc ----
 	sigma_total = sig_sx + sig_coh + sig_h
-	kin_ion = load_kin_ion_submatrix(config.kin_ion_file, meta.band_edges[0], meta.band_edges[3])
+	kin_ion = load_kin_ion_submatrix(config.kin_ion_file, band_slices.b0, band_slices.b3)
 
 	# PPM diagonal self-consistency and QSGW (rank 0 only)
 	if config.use_ppm_sigma and meta.rank == 0 and sigma_omega_h5_path and os.path.exists(sigma_omega_h5_path):
@@ -543,8 +543,8 @@ def main(argv=None):
 		E_full, U_full = jax.vmap(jnp.linalg.eigh, in_axes=0)(H)
 
 	# ---- DFT and QP energies ----
-	b0, b3 = meta.band_edges[0], meta.band_edges[3]
-	enk_dft, _ = get_enk_bandrange(wfn, sym, (b0, b3), (b0, b3), nspinor=meta.nspinor)
+	enk_dft, _ = get_enk_bandrange(wfn, sym,
+		band_slices.sigma_range, band_slices.sigma_range, nspinor=meta.nspinor)
 
 	# ---- Output ----
 	results = GWResults(
@@ -555,8 +555,8 @@ def main(argv=None):
 		U_qp=np.array(U_full),
 		E_dft_ry=np.array(enk_dft),
 		kin_ion_ry=np.array(kin_ion),
-		band_start=b0,
-		band_stop=b3,
+		band_start=band_slices.b0,
+		band_stop=band_slices.b3,
 		use_ppm=config.use_ppm_sigma,
 		self_consistent=config.self_consistent,
 		sigma_xc_at_dft_ev=sigma_xc_at_dft_ev,
@@ -569,7 +569,7 @@ def main(argv=None):
 			output_file=config.output_file,
 			input_dir=input_dir,
 			kpoints_crys=np.array(sym.unfolded_kpts, dtype=np.float64),
-			kgrid=(meta.nkx, meta.nky, meta.nkz),
+			kgrid=meta.kgrid,
 			kpoints_reduced=np.array(wfn.kpoints, dtype=np.float64),
 			kirr_to_kfull=np.array(sym.kirr_fullids, dtype=np.int32),
 			print_fn=print0,

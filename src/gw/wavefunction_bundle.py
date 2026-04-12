@@ -70,6 +70,16 @@ class BandSlices:
     def nb_sigma(self) -> int:
         return self.b3 - self.b0
 
+    @property
+    def sigma_range(self) -> tuple[int, int]:
+        """Global (start, end) for sigma band window: (b0, b3)."""
+        return (self.b0, self.b3)
+
+    @property
+    def full_range(self) -> tuple[int, int]:
+        """Global (start, end) for full band window: (b0, b4)."""
+        return (self.b0, self.b4)
+
 
 # ---------------------------------------------------------------------------
 # Sharding specs for the four copies (2-D mesh with axes 'x', 'y').

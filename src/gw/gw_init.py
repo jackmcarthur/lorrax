@@ -412,7 +412,7 @@ def build_wavefunction_bundle(
 
 	if enk_full is None:
 		enk_full, _ = get_enk_bandrange(
-			wfn, sym, (band_slices.b0, band_slices.b4),
+			wfn, sym, band_slices.full_range,
 			(band_slices.b1, band_slices.b3), nspinor=meta.nspinor)
 
 	if psi_full_yr is not None:
