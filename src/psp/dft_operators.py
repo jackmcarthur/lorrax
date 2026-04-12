@@ -163,6 +163,82 @@ def _T_diag_from_G(
     return T_diag, Gx, Gy, Gz
 
 
+@jax.jit
+def compute_V_H_and_V_xc(
+    rho_val: jax.Array,
+    rho_core: jax.Array,
+    rhog_core: jax.Array,
+    G_cart: jax.Array,
+    bdot: jax.Array,
+    bvec: jax.Array,
+    blat: float,
+) -> tuple[jax.Array, jax.Array]:
+    """Compute V_H and V_xc in a single JIT.  ~1 ms after compilation.
+
+    Parameters
+    ----------
+    rho_val : (nx, ny, nz) valence density
+    rho_core, rhog_core : NLCC core density (real + G-space)
+    G_cart : (nx, ny, nz, 3) Cartesian G-vectors (from charge_density.build_G_cart)
+    bdot, bvec : reciprocal metric and vectors
+    blat : reciprocal lattice constant
+
+    Returns (V_H_r, V_xc_r) both (nx, ny, nz) in Ry.
+    """
+    from jax_xc_local.pbe import pbe_xc
+    from psp.get_DFT_mtxels import poisson_potential_from_rhoG
+
+    # ── V_H via Poisson ──
+    rho_G_ortho = jnp.fft.fftn(rho_val, norm='ortho')
+    V_H_r = jnp.real(poisson_potential_from_rhoG(
+        rho_G_ortho, bdot, bvec, blat, truncation_2d=False))
+
+    # ── V_xc (PBE GGA) ──
+    rho_total = rho_val + rho_core
+    rho_safe = jnp.maximum(rho_total, 1e-10)
+
+    # Gradient |∇ρ|² with precise G-space core charge
+    rho_core_gridded = jnp.real(jnp.fft.ifftn(rhog_core))
+    rho_val_only = rho_total - rho_core_gridded
+    rho_G_total = jnp.fft.fftn(rho_val_only) + rhog_core
+
+    grad_rho_sq = jnp.zeros_like(rho_total)
+    for i in range(3):
+        drho = jnp.real(jnp.fft.ifftn(1j * G_cart[..., i] * rho_G_total))
+        grad_rho_sq = grad_rho_sq + drho ** 2
+
+    sigma = jnp.maximum(grad_rho_sq, 0.0)
+
+    # PBE functional derivatives via autodiff
+    def f_xc(rho, sig):
+        return rho * pbe_xc(rho, sig)
+    def f_xc_lda(rho):
+        return rho * pbe_xc(rho, 0.0)
+
+    flat_rho = rho_safe.ravel()
+    flat_sig = sigma.ravel()
+    shape = rho_total.shape
+
+    df_drho_lda = jax.vmap(jax.grad(f_xc_lda))(flat_rho).reshape(shape)
+    df_drho_full = jax.vmap(jax.grad(f_xc, argnums=0))(flat_rho, flat_sig).reshape(shape)
+    df_dsigma = jax.vmap(jax.grad(f_xc, argnums=1))(flat_rho, flat_sig).reshape(shape)
+
+    gga_mask = (rho_total > 1e-6) & (grad_rho_sq > 1e-10)
+    df_drho = df_drho_lda + jnp.where(gga_mask, df_drho_full - df_drho_lda, 0.0)
+    df_dsigma = jnp.where(gga_mask, df_dsigma, 0.0)
+
+    # GGA divergence: -2 ∇·[df/dσ ∇ρ]
+    gga_corr = jnp.zeros_like(rho_total)
+    for i in range(3):
+        drho_ri = jnp.real(jnp.fft.ifftn(1j * G_cart[..., i] * rho_G_total))
+        h_i_G = jnp.fft.fftn(df_dsigma * drho_ri)
+        gga_corr = gga_corr + jnp.real(
+            jnp.fft.ifftn(1j * G_cart[..., i] * h_i_G))
+
+    V_xc_r = df_drho - 2.0 * gga_corr
+    return V_H_r, V_xc_r
+
+
 def build_V_scf(
     V_loc_r: jax.Array,
     V_H_r: jax.Array | None = None,

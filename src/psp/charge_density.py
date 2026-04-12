@@ -514,12 +514,21 @@ def _build_V_xc_gga(
 
 def _build_G_cart_grid(nx, ny, nz, wfn):
     """Build Cartesian G-vector grid for FFT-based gradients."""
+    bvec = np.asarray(wfn.bvec, dtype=float)
+    B = float(wfn.blat) * bvec.T
+    return build_G_cart(nx, ny, nz, B)
+
+
+def build_G_cart(nx: int, ny: int, nz: int, B: np.ndarray) -> jax.Array:
+    """Cartesian G-vector grid from FFT frequencies and lattice matrix B.
+
+    Returns (nx, ny, nz, 3) float64.  Pure numpy, call once and pass
+    to JIT'd functions.
+    """
     gx = np.fft.fftfreq(nx, d=1.0 / nx).astype(int)
     gy = np.fft.fftfreq(ny, d=1.0 / ny).astype(int)
     gz = np.fft.fftfreq(nz, d=1.0 / nz).astype(int)
     Gx, Gy, Gz = np.meshgrid(gx, gy, gz, indexing='ij')
     G_crys = np.stack([Gx, Gy, Gz], axis=-1).astype(float)
-    bvec = np.asarray(wfn.bvec, dtype=float)
-    B = float(wfn.blat) * bvec.T
     G_cart = np.einsum('...i,ij->...j', G_crys, B)
     return jnp.asarray(G_cart, dtype=jnp.float64)
