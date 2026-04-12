@@ -80,17 +80,20 @@ from .gw_init import (
 	resolve_runtime_config,
 	prepare_isdf_and_wavefunctions,
 )
-from .gw_driver_helpers import (
-	build_ppm_sigma_runtime_options,
-	build_screening_setup,
+from .gw_driver_helpers import build_ppm_sigma_runtime_options
+from .w_isdf import (
+	build_static_quadrature,
+	build_imag_quadrature,
+	compute_chi0,
+	flatten_V_qmunu,
+	solve_w_from_chi_q_jax,
 )
-from .w_isdf import compute_screening
 from .minimax_config import (
 	minimax_config_from_params,
 	sigma_quadrature_config_from_params,
 )
 from .ppm_sigma import (
-	compute_w0_wiwp_and_ppm_from_minimax,
+	fit_gn_ppm,
 	compute_sigma_c_ppm_omega_grid,
 )
 from .qsgw_utils import (
@@ -400,10 +403,6 @@ def _hartree(wfns, Gij, V, nk_tot):
 
 from .greens_function_kernel import build_G
 
-def _flatten_V_W(V_qmunu, W_q, meta):
-	"""Flatten V_qmunu → V(nk,μ,μ) and W_q → W(nk,μ,μ).  W_q=None → W=V."""
-	V = jnp.asarray(V_qmunu)[0, 0, 0].reshape(-1, V_qmunu.shape[-2], V_qmunu.shape[-1])
-	return V, (V if W_q is None else W_q)
 
 def _build_Gij(meta, mesh_xy):
 	"""Occupation projector G_ij = diag(1,...,1,0,...,0) for sigma bands."""
@@ -553,25 +552,21 @@ def main(argv=None):
 	wfns = isdf.wf_bundle
 	s = wfns.slices
 
-	# Compute screened Coulomb W = (1 - Vχ)⁻¹ V
+	# --- Screening: χ₀ → W = (1 − Vχ)⁻¹ V ---
+	V_q = flatten_V_qmunu(V_qmunu)
+	minimax_config = minimax_config_from_params(params)
 	if do_screened:
-			with timing.section("gw_jax.chi0_W"):
-				with jax_profile.trace_section("chi0_W"):
-					minimax_config = minimax_config_from_params(params)
-					screening_setup = build_screening_setup(params, minimax_config)
-					screening_ppm_omega_p = screening_setup.ppm_omega_p
-					if use_ppm_sigma:
-						screening_ppm_omega_p = None
-					W_q = compute_screening(
-						V_qmunu, wfns, meta, mesh_xy,
-						minimax_config=screening_setup.minimax_config,
-						ppm_omega_p=screening_ppm_omega_p,
-						ppm_fallback_omega=screening_setup.ppm_fallback_omega,
-						tensors_filename=tensors_filename,
-						print0=print0,
-					)
+		with timing.section("gw_jax.chi0_W"):
+			with jax_profile.trace_section("chi0_W"):
+				quad, e_ref = build_static_quadrature(wfns, minimax_config, print_fn=print0)
+				chi0_q = compute_chi0(wfns, quad, meta, mesh_xy, energy_reference=e_ref)
+				W_q = solve_w_from_chi_q_jax(V_q, chi0_q, meta, mesh_xy)
+				chi0_q.block_until_ready()
+				W_q.block_until_ready()
+				print0(f"  |χ(0)|_max = {float(jnp.max(jnp.abs(chi0_q))):.6e}  "
+				       f"(minimax, {quad.node_count} nodes)")
 
-	V, W = _flatten_V_W(V_qmunu, W_q if do_screened else None, meta)
+	V, W = V_q, (W_q if do_screened else V_q)
 	Gij = _build_Gij(meta, mesh_xy)
 
 	# q→0 head correction (exact band-diagonal terms for static COHSEX)
@@ -670,23 +665,26 @@ def main(argv=None):
 			raise ValueError("use_ppm_sigma=true requires do_screened=true.")
 		if self_consistent:
 			raise NotImplementedError("use_ppm_sigma not supported with self_consistent.")
-		
-		laplace_quad = minimax_config_from_params(params)
+
 		sigma_window_quad = sigma_quadrature_config_from_params(params)
-		
 		ppm_options = build_ppm_sigma_runtime_options(params, input_dir=input_dir, ryd2ev=ryd2ev)
 		if ppm_options.fermi_reference not in ("vbm", "midgap"):
 			raise ValueError("fermi_reference must be 'vbm' or 'midgap'.")
 		print0("\n" + "-" * 72 + "\n  GN-PPM + FREQUENCY-INTEGRATED SIGMA\n" + "-" * 72)
 
 		with timing.section("gw_jax.ppm_sigma"):
-			# Build PPM poles from minimax W(0) and W(iωp)
-			eref = laplace_quad.energy_reference or ppm_options.fermi_reference
-			ppm = compute_w0_wiwp_and_ppm_from_minimax(
-				V_qmunu, wfns, meta, mesh_xy,
-				minimax_config=laplace_quad, omega_p_ry=ppm_options.omega_p_ry,
-				minimax_energy_reference=eref, fallback_omega=ppm_options.ppm_fallback,
-				print0=print0)
+			# χ₀(iωp) → W(iωp) → GN-PPM pole fit
+			quad_imag = build_imag_quadrature(
+				quad, ppm_options.omega_p_ry, minimax_config, print_fn=print0)
+			chi0_imag = compute_chi0(wfns, quad_imag, meta, mesh_xy, energy_reference=e_ref)
+			Wiwp_q = solve_w_from_chi_q_jax(V_q, chi0_imag, meta, mesh_xy)
+			chi0_imag.block_until_ready()
+			Wiwp_q.block_until_ready()
+
+			ppm = fit_gn_ppm(
+				W_q, Wiwp_q, V_q, ppm_options.omega_p_ry, mesh_xy,
+				fallback_omega=ppm_options.ppm_fallback,
+				n_nodes_static=quad.node_count, print_fn=print0)
 
 			# Frequency-integrated Σ^c(ω)
 			sigma_omega = compute_sigma_c_ppm_omega_grid(

@@ -554,3 +554,62 @@ def resolve_minimax_energy_reference(
     if ref == "cbm":
         return cbm_ref
     raise ValueError(f"Unknown minimax energy reference '{reference}'. Expected midgap/vbm/cbm/none or float.")
+
+
+# ---------------------------------------------------------------------------
+#  Top-level screening helpers (used directly by gw_jax.main)
+# ---------------------------------------------------------------------------
+
+def flatten_V_qmunu(V_qmunu):
+    """Strip (1,npol,npol) leading axes and flatten k-grid → flat-q (nq, μ, μ)."""
+    return jnp.asarray(V_qmunu)[0, 0, 0].reshape(-1, V_qmunu.shape[-2], V_qmunu.shape[-1])
+
+
+def build_static_quadrature(wfns, minimax_config, *, print_fn=None):
+    """Build static minimax quadrature and energy reference from wavefunction bundle.
+
+    Returns (quad, e_ref) where quad is a LaplaceMinimaxQuadrature for 1/x
+    on the band-energy interval, and e_ref is the global energy zero.
+    """
+    s = wfns.slices
+    enk_v = wfns.enk[:, s.val]
+    enk_c = wfns.enk[:, s.cond]
+    e_ref = resolve_minimax_energy_reference(
+        enk_v, enk_c, reference=minimax_config.energy_reference)
+    _, quad = build_static_minimax_window_pair(
+        enk_v, enk_c, minimax_config=minimax_config, print_fn=print_fn)
+    return quad, e_ref
+
+
+def build_imag_quadrature(quad, omega_p, minimax_config, *, print_fn=None):
+    """Build imaginary-frequency minimax quadrature for x/(x²+ωp²).
+
+    Uses the same energy interval as the static quadrature.
+    """
+    from .minimax_screening import solve_laplace_minimax_imag_interval
+    quad_imag = solve_laplace_minimax_imag_interval(
+        quad.x_min, quad.x_max, float(omega_p),
+        target_error=float(minimax_config.target_error),
+        max_nodes=int(minimax_config.max_nodes),
+    )
+    if print_fn is not None:
+        R = quad_imag.x_max / quad_imag.x_min
+        print_fn(
+            f"  PPM imag-freq quadrature (ωp={float(omega_p):.4f} Ry): "
+            f"R={R:.1f}, nodes={quad_imag.node_count}, err~{quad_imag.max_error:.1e}")
+    return quad_imag
+
+
+def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
+    """Compute χ₀(q) from wavefunction bundle and minimax quadrature.
+
+    Returns flat-q array (nq, μ, μ).  Thin wrapper around compute_chi0_minimax.
+    """
+    s = wfns.slices
+    return compute_chi0_minimax(
+        wfns.xn(s.val), wfns.yr(s.val),
+        wfns.yr(s.cond), wfns.xn(s.cond),
+        wfns.enk[:, s.val], wfns.enk[:, s.cond],
+        quad, meta, mesh_xy, energy_reference=energy_reference,
+    )
+

@@ -308,6 +308,53 @@ def _get_sigma_tau_channel_kernel(
 #  PPM construction
 # ---------------------------------------------------------------------------
 
+def fit_gn_ppm(
+    W0_q: jax.Array,
+    Wiwp_q: jax.Array,
+    V_q: jax.Array,
+    omega_p: float,
+    mesh_xy: Mesh,
+    *,
+    fallback_omega: float = 2.0,
+    n_nodes_static: int = 0,
+    print_fn=None,
+) -> PPMBuildResult:
+    """Fit GN-PPM pole parameters from precomputed W(0) and W(iωp).
+
+    All input arrays are flat-q (nq, μ, μ).  Returns PPMBuildResult with
+    B_q, Omega_q, valid_mask_q sharded as P(None, 'x', 'y').
+    """
+    import time as _t
+    omega_p = float(omega_p)
+    t0 = _t.perf_counter()
+
+    Wc0_q = W0_q - V_q
+    Wci_q = Wiwp_q - V_q
+    omega_qmunu, b_qmunu, valid_qmunu, unfulfilled = fit_gn_ppm_from_wc_pair(
+        Wc0_q, Wci_q, 1j * complex(omega_p), fallback_omega=float(fallback_omega))
+
+    q_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    Omega = jax.lax.with_sharding_constraint(jnp.asarray(omega_qmunu), q_shard)
+    B = jax.lax.with_sharding_constraint(jnp.asarray(b_qmunu), q_shard)
+    valid_mask = jax.lax.with_sharding_constraint(jnp.asarray(valid_qmunu), q_shard)
+    t1 = _t.perf_counter()
+
+    if print_fn is not None:
+        print_fn(f"  GN-PPM fit: {t1-t0:.2f}s, ωp={omega_p:.4f} Ry, "
+                 f"unfulfilled={100.0 * unfulfilled:.2f}%")
+
+    return PPMBuildResult(
+        omega_p=omega_p,
+        W0_q=W0_q,
+        Wiwp_q=Wiwp_q,
+        B_q=B,
+        Omega_q=Omega,
+        valid_mask_q=valid_mask,
+        unfulfilled_fraction=unfulfilled,
+        n_nodes_static=n_nodes_static,
+    )
+
+
 def compute_w0_wiwp_and_ppm_from_minimax(
     V_qmunu: jax.Array,
     wf_bundle,
