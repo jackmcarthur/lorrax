@@ -284,7 +284,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
                        for s, d in zip(idx, chi_R_shape))
             return np.zeros(sh, dtype=np.complex128)
         chi_R_acc = jax.make_array_from_callback(
-            chi_R_shape, NamedSharding(mesh_xy, P(('x', 'y'), None, None)), _chi_zeros)
+            chi_R_shape, NamedSharding(mesh_xy, P(None, 'x', 'y')), _chi_zeros)
 
         for itau in range(ntau):
             chi_R_acc = _tau_step(
@@ -367,21 +367,16 @@ def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int):
         n = V_flat.shape[1]
         chi_scaled = pref * chi_flat
 
-        # Reshard to q-parallel
-        V_q = jax.lax.with_sharding_constraint(
-            jax.lax.with_sharding_constraint(V_flat, rep_3d), q_shard)
-        chi_q = jax.lax.with_sharding_constraint(
-            jax.lax.with_sharding_constraint(chi_scaled, rep_3d), q_shard)
-
-        # Pad to device count for clean shard_map
+        # Pad to device count then reshard to q-parallel
         total_devices = mesh_xy.devices.size
         nq_padded = ((nq_local + total_devices - 1) // total_devices) * total_devices
         pad = nq_padded - nq_local
-        if pad > 0:
-            V_q = jax.lax.with_sharding_constraint(
-                jnp.pad(V_q, ((0, pad), (0, 0), (0, 0))), q_shard)
-            chi_q = jax.lax.with_sharding_constraint(
-                jnp.pad(chi_q, ((0, pad), (0, 0), (0, 0))), q_shard)
+        V_padded = jnp.pad(V_flat, ((0, pad), (0, 0), (0, 0))) if pad > 0 else V_flat
+        chi_padded = jnp.pad(chi_scaled, ((0, pad), (0, 0), (0, 0))) if pad > 0 else chi_scaled
+        V_q = jax.lax.with_sharding_constraint(
+            jax.lax.with_sharding_constraint(V_padded, rep_3d), q_shard)
+        chi_q = jax.lax.with_sharding_constraint(
+            jax.lax.with_sharding_constraint(chi_padded, rep_3d), q_shard)
 
         def _local_solve(V_local, chi_local):
             nq_dev = V_local.shape[0]
