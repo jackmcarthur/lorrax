@@ -220,14 +220,12 @@ def _get_sigma_channel_pipeline(
     nkz: int,
     nk_tot: int,
     bispinor: bool,
-    get_sigma_kij_channels_fn,
 ) -> Callable[..., jax.Array]:
     """Return a jit-compatible sigma-channel pipeline with device-local FFTs."""
 
     pipeline_key = (
         id(mesh_xy),
         nkx, nky, nkz, nk_tot, bispinor,
-        id(get_sigma_kij_channels_fn),
     )
     if pipeline_key in _sigma_channel_pipeline_cache:
         return _sigma_channel_pipeline_cache[pipeline_key]
@@ -238,69 +236,40 @@ def _get_sigma_channel_pipeline(
     )
 
     w_isdf._ensure_compilation_cache()
-    mu_shard = _mu_nu_sharding(mesh_xy)
-    sigma_7d_shard = NamedSharding(mesh_xy, P(None, "x", None, "y", None, None, None))
-    sigma_7d_spec = P(None, "x", None, "y", None, None, None)
-    local_ifftn_7d = make_jittable_local_ifftn_3d(
-        mesh_xy, sigma_7d_spec, sigma_7d_spec, norm="ortho", axes=(-3, -2, -1)
-    )
-    local_fftn_7d = make_jittable_local_fftn_3d(
-        mesh_xy, sigma_7d_spec, sigma_7d_spec, norm="ortho", axes=(-3, -2, -1)
-    )
-    nk_scale = jnp.asarray(-1.0 / np.sqrt(float(nk_tot)), dtype=jnp.float64)
+    # Flat-k FFT helpers (same pattern as gw_jax.py)
+    _G_spec = P(None, None, None, None, 'x', None, 'y')  # (kx,ky,kz, s,μ_X,s,μ_Y)
+    _V_spec = P(None, None, None, 'x', 'y')               # (kx,ky,kz, μ_X,μ_Y)
+    _G_shard = NamedSharding(mesh_xy, _G_spec)
+    _V_shard = NamedSharding(mesh_xy, _V_spec)
+    _G_ifftn = make_jittable_local_ifftn_3d(mesh_xy, _G_spec, _G_spec, norm='ortho', axes=(0, 1, 2))
+    _G_fftn = make_jittable_local_fftn_3d(mesh_xy, _G_spec, _G_spec, norm='ortho', axes=(0, 1, 2))
+    _V_ifftn = make_jittable_local_ifftn_3d(mesh_xy, _V_spec, _V_spec, norm='ortho', axes=(0, 1, 2))
+    nk = nkx * nky * nkz
+    inv_sqrt_nk = -1.0 / np.sqrt(float(nk_tot))
 
-    @jax.jit
-    def _build_G_7d(
-        psi_coh_rmuT_X: jax.Array,
-        psi_coh_rmu_Y: jax.Array,
-        Gij: jax.Array,
-    ) -> jax.Array:
-        from .greens_function_kernel import build_G
-        G_k = build_G(psi_coh_rmuT_X, psi_coh_rmu_Y, Gij=Gij)
-        G_7d = G_k.transpose(1, 2, 3, 4, 0).reshape(
-            G_k.shape[1], G_k.shape[2], G_k.shape[3], G_k.shape[4], nkx, nky, nkz
-        )
-        return jax.lax.with_sharding_constraint(G_7d, sigma_7d_shard)
+    def _fft_flat_G(x_k, fft_fn):
+        x_3d = jax.lax.with_sharding_constraint(x_k.reshape(nkx, nky, nkz, *x_k.shape[1:]), _G_shard)
+        return fft_fn(x_3d).reshape(nk, *x_k.shape[1:])
 
-    @jax.jit
-    def _expand_W_7d(W_q: jax.Array) -> jax.Array:
-        W_q = jax.lax.with_sharding_constraint(W_q, mu_shard)
-        W_7d = W_q[None, :, None, :, :, :, :]
-        return jax.lax.with_sharding_constraint(W_7d, sigma_7d_shard)
+    def _fft_flat_V(x_k):
+        x_3d = jax.lax.with_sharding_constraint(x_k.reshape(nkx, nky, nkz, *x_k.shape[1:]), _V_shard)
+        return _V_ifftn(x_3d).reshape(nk, *x_k.shape[1:])
 
-    @jax.jit
-    def _build_sigma_R(G_R: jax.Array, W_R: jax.Array) -> jax.Array:
-        if bispinor:
-            gamma0_diag = jnp.array([1.0, 1.0, -1.0, -1.0], dtype=jnp.float64)
-            gamma0_vertex = gamma0_diag[:, None] * gamma0_diag[None, :]
-            gamma0_vertex = gamma0_vertex[:, None, :, None, None, None, None]
-            G_R = G_R * gamma0_vertex
-        sigma_R = G_R * W_R * nk_scale
-        return jax.lax.with_sharding_constraint(sigma_R, sigma_7d_shard)
-
-    @jax.jit
-    def _project_channels(
-        psi_proj_rmu_X: jax.Array,
-        psi_proj_rmuT_Y: jax.Array,
-        sigma_k: jax.Array,
-    ) -> jax.Array:
-        return get_sigma_kij_channels_fn(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_k)
+    from .greens_function_kernel import build_G as _build_G
+    from .projection_kernel import project_ri as _project_channels
 
     @jax.jit
     def _sigma_channel_pipeline(
-        psi_coh_rmuT_X: jax.Array,
-        psi_coh_rmu_Y: jax.Array,
-        psi_proj_rmu_X: jax.Array,
-        psi_proj_rmuT_Y: jax.Array,
-        Gij: jax.Array,
-        W_q: jax.Array,
-    ) -> jax.Array:
-        G_7d = _build_G_7d(psi_coh_rmuT_X, psi_coh_rmu_Y, Gij)
-        W_7d = _expand_W_7d(W_q)
-        G_R = local_ifftn_7d(G_7d)
-        W_R = local_ifftn_7d(W_7d)
-        sigma_R = _build_sigma_R(G_R, W_R)
-        sigma_k = local_fftn_7d(sigma_R)
+        psi_coh_rmuT_X, psi_coh_rmu_Y, psi_proj_rmu_X, psi_proj_rmuT_Y,
+        Gij, W_q,
+    ):
+        """Σ_kij = project[ FFT[ G(R) · W(R) / √Nk ] ].  All flat-k."""
+        G_k = _build_G(psi_coh_rmuT_X, psi_coh_rmu_Y, Gij=Gij)
+        G_R = _fft_flat_G(G_k, _G_ifftn)
+        # W_q is (μ, μ, nk) from PPM; transpose to (nk, μ, μ) for flat-k FFT
+        W_flat = W_q.transpose(2, 0, 1) if W_q.ndim == 3 else W_q
+        V_R = _fft_flat_V(W_flat)[:, None, :, None, :]  # broadcast to G shape
+        sigma_k = _fft_flat_G(G_R * V_R * inv_sqrt_nk, _G_fftn)
         return _project_channels(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_k)
 
     _sigma_channel_pipeline_cache[pipeline_key] = _sigma_channel_pipeline
@@ -315,13 +284,11 @@ def _get_sigma_tau_channel_kernel(
     nkz: int,
     nk_tot: int,
     bispinor: bool,
-    get_sigma_kij_channels_fn,
 ) -> Callable[..., jax.Array]:
     """Return a cached tau-node sigma builder with jittable local FFTs."""
 
     cache_key = (
         id(mesh_xy), nkx, nky, nkz, nk_tot, bispinor,
-        id(get_sigma_kij_channels_fn),
     )
     if cache_key in _sigma_tau_channel_kernel_cache:
         return _sigma_tau_channel_kernel_cache[cache_key]
@@ -335,7 +302,6 @@ def _get_sigma_tau_channel_kernel(
         nkz=nkz,
         nk_tot=nk_tot,
         bispinor=bispinor,
-        get_sigma_kij_channels_fn=get_sigma_kij_channels_fn,
     )
 
     @jax.jit
@@ -762,7 +728,6 @@ def _convolve_sigma_branch_kij(
     nk_tot: int,
     bispinor: bool,
     mesh_xy: Mesh,
-    get_sigma_kij_channels_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array],
     omega_sign_flip: int = 1,
     log_tag: str = "",
     print0=print,
@@ -865,7 +830,6 @@ def _convolve_sigma_branch_kij(
         nkz=nkz,
         nk_tot=nk_tot,
         bispinor=bispinor,
-        get_sigma_kij_channels_fn=get_sigma_kij_channels_fn,
     )
     acc_total = None
     if stream_writer is None:
@@ -1048,14 +1012,11 @@ def compute_sigma_c_ppm_omega_grid(
     ppm_options,
     *,
     sigma_window_quad: SigmaQuadratureConfig | None = None,
-    get_project_ri_fn=None,
     print0=print,
     # Legacy kwargs accepted but ignored for backward compat during migration:
     **_legacy_kwargs,
 ) -> SigmaOmegaResult:
     """Compute Σ^c_kij(ω) via GN-PPM windowed minimax integration."""
-    if get_project_ri_fn is None:
-        raise ValueError("get_project_ri_fn must be provided.")
 
     # Unpack from bundles
     s = wfns.slices
@@ -1096,7 +1057,6 @@ def compute_sigma_c_ppm_omega_grid(
     fermi_reference = getattr(ppm_options, 'fermi_reference', 'midgap')
 
     # Internal callback aliases
-    get_sigma_kij_channels_fn = get_project_ri_fn
     sigma_scale = 1.0
     sigma_flip_neg = False
     debug_split_contrib = False
@@ -1288,7 +1248,6 @@ def compute_sigma_c_ppm_omega_grid(
                 nkz=nkz,
                 nk_tot=nk_tot,
                 bispinor=bispinor,
-                get_sigma_kij_channels_fn=get_sigma_kij_channels_fn,
             )
 
             def _accumulate_kij_stream(global_idx: np.ndarray, contrib_batch: jax.Array) -> None:
@@ -1341,7 +1300,6 @@ def compute_sigma_c_ppm_omega_grid(
                     nk_tot=nk_tot,
                     bispinor=bispinor,
                     mesh_xy=mesh_xy,
-                    get_sigma_kij_channels_fn=get_sigma_kij_channels_fn,
                     omega_sign_flip=omega_sign_flip_cond,
                     log_tag=tag,
                     print0=print0,
@@ -1384,7 +1342,6 @@ def compute_sigma_c_ppm_omega_grid(
                     nk_tot=nk_tot,
                     bispinor=bispinor,
                     mesh_xy=mesh_xy,
-                    get_sigma_kij_channels_fn=get_sigma_kij_channels_fn,
                     omega_sign_flip=omega_sign_flip_val,
                     log_tag=tag,
                     print0=print0,

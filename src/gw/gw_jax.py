@@ -390,16 +390,7 @@ def fit_zeta_and_compute_V_q_chunked(
 # Sigma_COH = +project[ FFT[ G_RI(R) * (W-V)(R) / (2*sqrt(Nk)) ] ]
 # V_H       = project[ V0 * rho ]
 
-def _project(psi_xr, psi_yn, sigma_k):
-	"""Sigma(nk, s, mu, s, mu) -> Sigma(nk, m, n) in band basis."""
-	left = jnp.einsum('kmsx,ksxty->kmty', jnp.conj(psi_xr), sigma_k, optimize=True)
-	return jnp.einsum('kmty,ktyn->kmn', left, psi_yn, optimize=True)
-
-def _project_ri(psi_xr, psi_yn, sigma_k):
-	"""Like _project but returns (2, nk, m, n) with [Re, Im] channels."""
-	sigma_ri = jnp.stack((jnp.real(sigma_k), jnp.imag(sigma_k)), axis=0)
-	left = jnp.einsum('kmsx,cksxty->ckmty', jnp.conj(psi_xr), sigma_ri, optimize=True)
-	return jnp.einsum('ckmty,ktyn->ckmn', left, psi_yn, optimize=True).astype(jnp.complex128)
+from .projection_kernel import project as _project
 
 def _hartree(wfns, Gij, V, nk_tot):
 	"""V_H(m,n,k) = <m| V(q=0,noG0) * rho |n>.  V is flat-k (nk,μ,μ); uses V[0]."""
@@ -716,7 +707,6 @@ def main(argv=None):
 			sigma_omega = compute_sigma_c_ppm_omega_grid(
 				wfns, ppm, meta, mesh_xy, ppm_options,
 				sigma_window_quad=sigma_window_quad,
-				get_project_ri_fn=_project_ri,
 				print0=print0,
 			)
 			sigma_c_omega = sigma_omega.sigma_c_kij  # (n_omega, nk, nb, nb) or None if streamed
