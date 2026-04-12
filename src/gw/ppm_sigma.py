@@ -220,19 +220,13 @@ def _get_sigma_channel_pipeline(
     nkz: int,
     nk_tot: int,
     bispinor: bool,
-    get_G_mu_nu_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array],
-    get_sigma_kij_channels_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array],
+    get_sigma_kij_channels_fn,
 ) -> Callable[..., jax.Array]:
     """Return a jit-compatible sigma-channel pipeline with device-local FFTs."""
 
     pipeline_key = (
         id(mesh_xy),
-        int(nkx),
-        int(nky),
-        int(nkz),
-        int(nk_tot),
-        bool(bispinor),
-        id(get_G_mu_nu_fn),
+        nkx, nky, nkz, nk_tot, bispinor,
         id(get_sigma_kij_channels_fn),
     )
     if pipeline_key in _sigma_channel_pipeline_cache:
@@ -321,14 +315,13 @@ def _get_sigma_tau_channel_kernel(
     nkz: int,
     nk_tot: int,
     bispinor: bool,
-    get_G_mu_nu_fn,
     get_sigma_kij_channels_fn,
 ) -> Callable[..., jax.Array]:
     """Return a cached tau-node sigma builder with jittable local FFTs."""
 
     cache_key = (
         id(mesh_xy), nkx, nky, nkz, nk_tot, bispinor,
-        id(get_G_mu_nu_fn), id(get_sigma_kij_channels_fn),
+        id(get_sigma_kij_channels_fn),
     )
     if cache_key in _sigma_tau_channel_kernel_cache:
         return _sigma_tau_channel_kernel_cache[cache_key]
@@ -342,7 +335,6 @@ def _get_sigma_tau_channel_kernel(
         nkz=nkz,
         nk_tot=nk_tot,
         bispinor=bispinor,
-        get_G_mu_nu_fn=get_G_mu_nu_fn,
         get_sigma_kij_channels_fn=get_sigma_kij_channels_fn,
     )
 
@@ -770,7 +762,6 @@ def _convolve_sigma_branch_kij(
     nk_tot: int,
     bispinor: bool,
     mesh_xy: Mesh,
-    get_G_mu_nu_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array],
     get_sigma_kij_channels_fn: Callable[[jax.Array, jax.Array, jax.Array], jax.Array],
     omega_sign_flip: int = 1,
     log_tag: str = "",
@@ -874,7 +865,6 @@ def _convolve_sigma_branch_kij(
         nkz=nkz,
         nk_tot=nk_tot,
         bispinor=bispinor,
-        get_G_mu_nu_fn=get_G_mu_nu_fn,
         get_sigma_kij_channels_fn=get_sigma_kij_channels_fn,
     )
     acc_total = None
@@ -1106,8 +1096,6 @@ def compute_sigma_c_ppm_omega_grid(
     fermi_reference = getattr(ppm_options, 'fermi_reference', 'midgap')
 
     # Internal callback aliases
-    from .greens_function_kernel import build_G as _build_G_module
-    get_G_mu_nu_fn = _build_G_module  # used for cache key stability
     get_sigma_kij_channels_fn = get_project_ri_fn
     sigma_scale = 1.0
     sigma_flip_neg = False
@@ -1300,7 +1288,6 @@ def compute_sigma_c_ppm_omega_grid(
                 nkz=nkz,
                 nk_tot=nk_tot,
                 bispinor=bispinor,
-                get_G_mu_nu_fn=get_G_mu_nu_fn,
                 get_sigma_kij_channels_fn=get_sigma_kij_channels_fn,
             )
 
@@ -1354,7 +1341,6 @@ def compute_sigma_c_ppm_omega_grid(
                     nk_tot=nk_tot,
                     bispinor=bispinor,
                     mesh_xy=mesh_xy,
-                    get_G_mu_nu_fn=get_G_mu_nu_fn,
                     get_sigma_kij_channels_fn=get_sigma_kij_channels_fn,
                     omega_sign_flip=omega_sign_flip_cond,
                     log_tag=tag,
@@ -1398,7 +1384,6 @@ def compute_sigma_c_ppm_omega_grid(
                     nk_tot=nk_tot,
                     bispinor=bispinor,
                     mesh_xy=mesh_xy,
-                    get_G_mu_nu_fn=get_G_mu_nu_fn,
                     get_sigma_kij_channels_fn=get_sigma_kij_channels_fn,
                     omega_sign_flip=omega_sign_flip_val,
                     log_tag=tag,
