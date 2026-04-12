@@ -67,14 +67,13 @@ except RuntimeError as exc:
 		raise
 from file_io import (
     WFNReader, write_sigma_omega_h5,
-    load_kin_ion_submatrix, load_centroids, resolve_input_paths,
+    load_kin_ion_submatrix, load_centroids,
 )
 from common import symmetry_maps
 from common.load_wfns import get_enk_bandrange
+from .gw_config import LorraxConfig
 from .gw_init import (
 	get_effective_chunk_size,
-	read_cohsex_input,
-	resolve_runtime_config,
 	prepare_isdf_and_wavefunctions,
 )
 from .gw_driver_helpers import build_ppm_sigma_runtime_options
@@ -84,10 +83,6 @@ from .w_isdf import (
 	compute_chi0,
 	flatten_V_qmunu,
 	solve_w,
-)
-from .minimax_config import (
-	minimax_config_from_params,
-	sigma_quadrature_config_from_params,
 )
 from .ppm_sigma import (
 	fit_gn_ppm,
@@ -145,9 +140,17 @@ def _build_Gij(meta, mesh_xy):
 	return jax.device_put(Gij, NamedSharding(mesh_xy, P(None, None, None)))
 
 
-def _compute_static_head(params, input_dir, wfn, sym, meta, do_screened, print0):
+def _compute_static_head(config, input_dir, wfn, sym, meta, do_screened, print0):
 	"""Resolve q→0 head and compute exact band-diagonal head terms for COHSEX."""
-	head = resolve_head_sample(params, input_dir, wfn, sym, meta, print0, omega=0.0+0.0j)
+	# resolve_head_sample expects a dict-like interface for params
+	head_params = {
+		"wcoul0_source": config.wcoul0_source,
+		"wcoul0_eta": config.wcoul0_eta,
+		"vhead": config.vhead,
+		"whead_0freq": config.whead_0freq,
+		"whead_imfreq": config.whead_imfreq,
+	}
+	head = resolve_head_sample(head_params, input_dir, wfn, sym, meta, print0, omega=0.0+0.0j)
 	print0(format_head_sample_diagnostics(head, include_screened=do_screened))
 	occ_mask = np.arange(meta.nb_sigma, dtype=np.int32) < meta.nelec
 	terms = compute_static_head_terms_from_sample(
@@ -175,17 +178,21 @@ def main(argv=None):
 			_orig_print(*a, **k)
 	builtins.print = _print0
  
-	params = read_cohsex_input(args.input)
-	
 	# ========================================================================
-	# INITIALIZATION - Build device mesh early for banner
+	# CONFIGURATION
+	# ========================================================================
+	config = LorraxConfig.from_input_file(args.input, print_fn=_print0)
+	input_dir = config.input_dir
+	ryd2ev = 13.6056980659
+
+	# ========================================================================
+	# INITIALIZATION
 	# ========================================================================
 	current_backend = jax.default_backend()
 	n_devices = len(jax.devices())
 	n_procs = jax.process_count()
 	device_names = jax.devices()[0].device_kind if n_devices > 0 else "unknown"
-	
-	# Construct device mesh early so we can report it in the banner
+
 	total_devices = jax.process_count() * jax.local_device_count()
 	grid_x = int(np.sqrt(total_devices))
 	while total_devices % grid_x != 0:
@@ -193,25 +200,13 @@ def main(argv=None):
 	grid_y = total_devices // grid_x
 	devices_2d = np.array(jax.devices()).reshape(grid_x, grid_y)
 	mesh_xy = Mesh(devices_2d, ['x', 'y'])
-	
+
 	from .gw_output import print_banner, print_system_summary, write_results, GWResults
 	print_banner(
 		backend=current_backend, n_devices=n_devices,
 		grid_x=grid_x, grid_y=grid_y, n_procs=n_procs,
 		device_kind=device_names, print_fn=_print0,
 	)
-	
-	# Resolve relative paths against the input file's directory
-	input_dir = os.path.dirname(os.path.abspath(args.input))
-	resolve_input_paths(params, input_dir)
-	nval = params["nval"]
-	ncond = params["ncond"]
-	nband = params["nband"]
-	sys_dim = params["sys_dim"]  # 0=molecule/box, 2=slab
-	self_consistent = bool(params.get("self_consistent", False))
-	use_ppm_sigma = bool(params.get("use_ppm_sigma", False))
-
-	ryd2ev = 13.6056980659
 
 	import time as _boot_time
 	_t_boot = _boot_time.perf_counter()
@@ -219,17 +214,15 @@ def main(argv=None):
 
 	global wfn
 	_t_wfn = _boot_time.perf_counter()
-	wfn = WFNReader(params["wfn_file"])
+	wfn = WFNReader(config.wfn_file)
 	_print0(f"  [TIMING-BOOT] WFNReader: {_boot_time.perf_counter() - _t_wfn:.3f}s")
 	_t_sym = _boot_time.perf_counter()
 	sym = symmetry_maps.SymMaps(wfn)
 	_print0(f"  [TIMING-BOOT] SymMaps: {_boot_time.perf_counter() - _t_sym:.3f}s")
-	
-	# Load centroids
+
 	_t_cent = _boot_time.perf_counter()
-	_, centroid_indices, _n_rmu = load_centroids(params["centroids_file"], wfn.fft_grid)
+	_, centroid_indices, _n_rmu = load_centroids(config.centroids_file, wfn.fft_grid)
 	_print0(f"  [TIMING-BOOT] load_centroids: {_boot_time.perf_counter() - _t_cent:.3f}s")
-	# Resolve tmp_dir and output path relative to input file directory
 	tmp_dir = os.path.join(input_dir, "tmp")
 	os.makedirs(tmp_dir, exist_ok=True)
 	tensors_filename = os.path.join(tmp_dir, f"isdf_tensors_{_n_rmu}.h5")
@@ -238,38 +231,27 @@ def main(argv=None):
 		cell_volume=wfn.cell_volume, print_fn=_print0,
 	)
 
-	# Resolve runtime configuration (memory budget, chunking, control flags)
-	_t_cfg = _boot_time.perf_counter()
-	cfg = resolve_runtime_config(params, rank=jax.process_index())
-	_print0(f"  [TIMING-BOOT] runtime_config: {_boot_time.perf_counter() - _t_cfg:.3f}s")
 	global bispinor
-	bispinor = cfg.bispinor
-	do_screened = cfg.do_screened
-	do_G0 = cfg.do_G0
-
-	meta = Meta.from_system(wfn, sym, nval, ncond, nband, _n_rmu, bispinor)
+	bispinor = config.bispinor
+	meta = Meta.from_system(wfn, sym, config.nval, config.ncond, config.nband, _n_rmu, bispinor)
 	meta.rank = jax.process_index()
 	meta.n_proc = jax.process_count()
-	meta.sys_dim = sys_dim
+	meta.sys_dim = config.sys_dim
 	meta.bispinor = bispinor
-	meta.chunk_size = get_effective_chunk_size(params["chunk_size"])
+	meta.chunk_size = get_effective_chunk_size(config.chunk_size)
 
-	b0, b1, b2, b3, b4 = meta.band_edges
-	band_slices = BandSlices.from_band_edges(b0, b1, b2, b3, b4)
+	band_slices = BandSlices.from_band_edges(*meta.band_edges)
 
 	def print0(*a, **k):
 		if meta.rank == 0:
 			k.setdefault("flush", True)
 			print(*a, **k)
 
-	chunk_str = "disabled" if meta.chunk_size is None else str(meta.chunk_size)
-	print0(f"  Band chunk size: {chunk_str}")
-
 	# ISDF fitting or restart loading
 	timing.reset()
 	_t_isdf = _boot_time.perf_counter()
 	isdf = prepare_isdf_and_wavefunctions(
-		cfg=cfg,
+		cfg=config,
 		wfn=wfn,
 		sym=sym,
 		meta=meta,
@@ -283,15 +265,13 @@ def main(argv=None):
 	print0(f"  [TIMING-BOOT] prepare_isdf_and_wavefunctions: {_boot_time.perf_counter() - _t_isdf:.3f}s")
 	V_qmunu = isdf.V_qmunu
 	wfns = isdf.wf_bundle
-	s = wfns.slices
 
 	# --- Screening: χ₀ → W = (1 − Vχ)⁻¹ V ---
 	V_q = flatten_V_qmunu(V_qmunu)
-	minimax_config = minimax_config_from_params(params)
-	if do_screened:
+	if config.do_screened:
 		with timing.section("gw_jax.chi0_W"):
 			with jax_profile.trace_section("chi0_W"):
-				quad, e_ref = build_static_quadrature(wfns, minimax_config, print_fn=print0)
+				quad, e_ref = build_static_quadrature(wfns, config.minimax_config, print_fn=print0)
 				chi0_q = compute_chi0(wfns, quad, meta, mesh_xy, energy_reference=e_ref)
 				W_q = solve_w(V_q, chi0_q, meta, mesh_xy)
 				chi0_q.block_until_ready()
@@ -299,15 +279,15 @@ def main(argv=None):
 				print0(f"  |χ(0)|_max = {float(jnp.max(jnp.abs(chi0_q))):.6e}  "
 				       f"(minimax, {quad.node_count} nodes)")
 
-	if not do_screened:
+	if not config.do_screened:
 		W_q = V_q  # unscreened: W = V
 	Gij = _build_Gij(meta, mesh_xy)
 
 	# q→0 head correction (exact band-diagonal terms for static COHSEX)
 	static_head_terms = None
-	if do_G0 and not use_ppm_sigma:
+	if config.do_G0 and not config.use_ppm_sigma:
 		static_head_terms = _compute_static_head(
-			params, input_dir, wfn, sym, meta, do_screened, print0)
+			config, input_dir, wfn, sym, meta, config.do_screened, print0)
 
 	kgrid = meta.kgrid
 	_nk_tot = int(meta.nk_tot)
@@ -363,8 +343,8 @@ def main(argv=None):
 		if static_head_terms is None:
 			return sig_sx, sig_coh
 		sx_h, coh_h = static_head_terms_to_kij(
-			static_head_terms, nk_tot=meta.nk_tot, do_screened=do_screened)
-		if not do_screened:
+			static_head_terms, nk_tot=meta.nk_tot, do_screened=config.do_screened)
+		if not config.do_screened:
 			coh_h = jnp.zeros_like(coh_h)
 		rep = NamedSharding(mesh_xy, P(None, None, None))
 		return sig_sx + jax.device_put(sx_h, rep), sig_coh + jax.device_put(coh_h, rep)
@@ -394,36 +374,33 @@ def main(argv=None):
 	sigma_xc_at_dft_ev = None
 	omega_dft_rel_ev = None
 	efermi_dft_ev = None
-	if use_ppm_sigma:
-		if not do_screened:
+	if config.use_ppm_sigma:
+		if not config.do_screened:
 			raise ValueError("use_ppm_sigma=true requires do_screened=true.")
-		if self_consistent:
+		if config.self_consistent:
 			raise NotImplementedError("use_ppm_sigma not supported with self_consistent.")
 
-		sigma_window_quad = sigma_quadrature_config_from_params(params)
-		ppm_options = build_ppm_sigma_runtime_options(params, input_dir=input_dir, ryd2ev=ryd2ev)
-		if ppm_options.fermi_reference not in ("vbm", "midgap"):
-			raise ValueError("fermi_reference must be 'vbm' or 'midgap'.")
+		ppm_options = build_ppm_sigma_runtime_options(config, input_dir=input_dir, ryd2ev=ryd2ev)
 		print0("\n" + "-" * 72 + "\n  GN-PPM + FREQUENCY-INTEGRATED SIGMA\n" + "-" * 72)
 
 		with timing.section("gw_jax.ppm_sigma"):
 			# χ₀(iωp) → W(iωp) → GN-PPM pole fit
 			quad_imag = build_imag_quadrature(
-				quad, ppm_options.omega_p_ry, minimax_config, print_fn=print0)
+				quad, config.ppm_omega_p, config.minimax_config, print_fn=print0)
 			chi0_imag = compute_chi0(wfns, quad_imag, meta, mesh_xy, energy_reference=e_ref)
 			Wiwp_q = solve_w(V_q, chi0_imag, meta, mesh_xy)
 			chi0_imag.block_until_ready()
 			Wiwp_q.block_until_ready()
 
 			ppm = fit_gn_ppm(
-				W_q, Wiwp_q, V_q, ppm_options.omega_p_ry, mesh_xy,
-				fallback_omega=ppm_options.ppm_fallback,
+				W_q, Wiwp_q, V_q, config.ppm_omega_p, mesh_xy,
+				fallback_omega=config.ppm_fallback_omega,
 				n_nodes_static=quad.node_count, print_fn=print0)
 
 			# Frequency-integrated Σ^c(ω)
 			sigma_omega = compute_sigma_c_ppm_omega_grid(
 				wfns, ppm, meta, mesh_xy, ppm_options,
-				sigma_window_quad=sigma_window_quad,
+				sigma_window_quad=config.sigma_quadrature_config,
 				print_fn=print0,
 			)
 			sigma_c_omega = sigma_omega.sigma_c_kij  # (n_omega, nk, nb, nb) or None if streamed
@@ -467,7 +444,7 @@ def main(argv=None):
 			# the full Σ_c(ω) is in sigma_c_omega / sigma_omega_h5
 
 			# Write sigma_mnk.h5
-			sigma_omega_h5_path = params.get("sigma_omega_h5_file", "sigma_mnk.h5")
+			sigma_omega_h5_path = config.sigma_omega_h5_file
 			if not os.path.isabs(sigma_omega_h5_path):
 				sigma_omega_h5_path = os.path.join(input_dir, sigma_omega_h5_path)
 			if meta.rank == 0:
@@ -494,10 +471,10 @@ def main(argv=None):
 
 	# ---- QP Hamiltonian: H_QP = (H_DFT - V_xc) + V_H + Σ_xc ----
 	sigma_total = sig_sx + sig_coh + sig_h
-	kin_ion = load_kin_ion_submatrix(params["kin_ion_file"], meta.band_edges[0], meta.band_edges[3])
+	kin_ion = load_kin_ion_submatrix(config.kin_ion_file, meta.band_edges[0], meta.band_edges[3])
 
 	# PPM diagonal self-consistency and QSGW (rank 0 only)
-	if use_ppm_sigma and meta.rank == 0 and sigma_omega_h5_path and os.path.exists(sigma_omega_h5_path):
+	if config.use_ppm_sigma and meta.rank == 0 and sigma_omega_h5_path and os.path.exists(sigma_omega_h5_path):
 		H_qp = np.array(kin_ion + sigma_total)
 		H_qp = 0.5 * (H_qp + np.conj(np.swapaxes(H_qp, -1, -2)))
 		E_qp_ev = np.linalg.eigvalsh(H_qp) * ryd2ev
@@ -522,7 +499,7 @@ def main(argv=None):
 		print0(f"  QSGW: {int(qsgw['n_interp_clipped'])} clipped "
 			f"({100*qsgw['frac_interp_clipped']:.1f}%)")
 
-	if self_consistent:
+	if config.self_consistent:
 		# SC-COHSEX iteration
 		n_upper = meta.nb_sigma * (meta.nb_sigma + 1) // 2
 		nk = meta.nk_tot
@@ -578,8 +555,8 @@ def main(argv=None):
 		kin_ion_ry=np.array(kin_ion),
 		band_start=b0,
 		band_stop=b3,
-		use_ppm=use_ppm_sigma,
-		self_consistent=self_consistent,
+		use_ppm=config.use_ppm_sigma,
+		self_consistent=config.self_consistent,
 		sigma_xc_at_dft_ev=sigma_xc_at_dft_ev,
 		sigma_omega_h5_path=sigma_omega_h5_path,
 		tensors_filename=tensors_filename,
@@ -587,7 +564,7 @@ def main(argv=None):
 	if meta.rank == 0:
 		write_results(
 			results,
-			output_file=params["output_file"],
+			output_file=config.output_file,
 			input_dir=input_dir,
 			kpoints_crys=np.array(sym.unfolded_kpts, dtype=np.float64),
 			kgrid=(meta.nkx, meta.nky, meta.nkz),

@@ -44,35 +44,41 @@ def _resolve_input_path(input_dir: str, path: str) -> str:
     return path
 
 
-def build_ppm_sigma_runtime_options(params: dict, *, input_dir: str, ryd2ev: float) -> PPMSigmaRuntimeOptions:
-    """Resolve and validate PPM sigma runtime options from parsed input parameters."""
+def build_ppm_sigma_runtime_options(config, *, input_dir: str, ryd2ev: float) -> PPMSigmaRuntimeOptions:
+    """Build PPM sigma runtime options from LorraxConfig (or legacy params dict)."""
 
-    omega_p_ry = float(params.get("ppm_omega_p", 2.0))
-    ppm_fallback = float(params.get("ppm_fallback_omega", 2.0))
-    omega_min_ev = float(params.get("sigma_omega_min_ev", -5.0))
-    omega_max_ev = float(params.get("sigma_omega_max_ev", 5.0))
-    omega_step_ev = float(params.get("sigma_omega_step_ev", 0.25))
-    sigma_regularization_ev = float(params.get("sigma_regularization_ev", 0.25))
-    sigma_edge_factor = float(params.get("sigma_window_edge_factor", 1.5))
-    sigma_omega_batch_size = int(max(1, params.get("sigma_omega_batch_size", 4)))
-    sigma_omega_accumulation = str(params.get("sigma_omega_accumulation", "auto")).strip().lower()
-    ppm_sigma_scale = float(params.get("ppm_sigma_scale", 1.0))
-    ppm_sigma_flip_neg = bool(params.get("ppm_sigma_flip_neg", False))
-    ppm_invalid_mode = str(params.get("ppm_invalid_mode", "static_limit")).strip().lower()
-    sigma_debug_split_contrib = bool(params.get("sigma_debug_split_contrib", False))
-    sigma_freq_debug_output = bool(params.get("sigma_freq_debug_output", True))
-    fermi_reference = str(params.get("fermi_reference", "midgap")).strip().lower()
-    sigma_at_dft_extrapolate = bool(params.get("sigma_at_dft_extrapolate", False))
-    sigma_at_dft_energies = bool(params.get("sigma_at_dft_energies", False))
-    ppm_sigma_debug_static_norm = bool(params.get("ppm_sigma_debug_static_norm", False))
-    ppm_static_cohsex_check = bool(params.get("ppm_static_cohsex_check", False))
-    sigma_debug_quadrature = bool(params.get("sigma_debug_quadrature", False))
-    sigma_debug_quadrature_samples = int(params.get("sigma_debug_quadrature_samples", 200))
-    sigma_munu_h5_path = str(params.get("sigma_munu_h5_file", "") or "").strip()
-    sigma_kij_h5_path = str(params.get("sigma_kij_h5_file", "") or "").strip()
-    write_w_copies_debug = bool(params.get("write_w_copies_debug", False))
-    w_copies_debug_file = str(params.get("w_copies_debug_file", "w_copies_debug.h5") or "").strip()
-    sigma_freq_debug_file = str(params.get("sigma_freq_debug_file", "sigma_freq_debug.dat") or "").strip()
+    def _g(key, default=None):
+        """Get from config object (attribute) or dict (key)."""
+        if isinstance(config, dict):
+            return config.get(key, default)
+        return getattr(config, key, default)
+
+    omega_p_ry = float(_g("ppm_omega_p", 2.0))
+    ppm_fallback = float(_g("ppm_fallback_omega", 2.0))
+    omega_min_ev = float(_g("sigma_omega_min_ev", -5.0))
+    omega_max_ev = float(_g("sigma_omega_max_ev", 5.0))
+    omega_step_ev = float(_g("sigma_omega_step_ev", 0.25))
+    sigma_regularization_ev = float(_g("sigma_regularization_ev", 0.25))
+    sigma_edge_factor = float(_g("sigma_window_edge_factor", 1.5))
+    sigma_omega_batch_size = int(max(1, _g("sigma_omega_batch_size", 4)))
+    sigma_omega_accumulation = str(_g("sigma_omega_accumulation", "auto")).strip().lower()
+    ppm_sigma_scale = float(_g("ppm_sigma_scale", 1.0))
+    ppm_sigma_flip_neg = bool(_g("ppm_sigma_flip_neg", False))
+    ppm_invalid_mode = str(_g("ppm_invalid_mode", "static_limit")).strip().lower()
+    sigma_debug_split_contrib = bool(_g("sigma_debug_split_contrib", False))
+    sigma_freq_debug_output = bool(_g("sigma_freq_debug_output", True))
+    fermi_reference = str(_g("fermi_reference", "midgap")).strip().lower()
+    sigma_at_dft_extrapolate = bool(_g("sigma_at_dft_extrapolate", False))
+    sigma_at_dft_energies = bool(_g("sigma_at_dft_energies", False))
+    ppm_sigma_debug_static_norm = bool(_g("ppm_sigma_debug_static_norm", False))
+    ppm_static_cohsex_check = bool(_g("ppm_static_cohsex_check", False))
+    sigma_debug_quadrature = bool(_g("sigma_debug_quadrature", False))
+    sigma_debug_quadrature_samples = int(_g("sigma_debug_quadrature_samples", 200))
+    sigma_munu_h5_path = str(_g("sigma_munu_h5_file", "") or "").strip()
+    sigma_kij_h5_path = str(_g("sigma_kij_h5_file", "") or "").strip()
+    write_w_copies_debug = bool(_g("write_w_copies_debug", False))
+    w_copies_debug_file = str(_g("w_copies_debug_file", "w_copies_debug.h5") or "").strip()
+    sigma_freq_debug_file = str(_g("sigma_freq_debug_file", "sigma_freq_debug.dat") or "").strip()
 
     if omega_step_ev <= 0.0:
         raise ValueError("sigma_omega_step_ev must be > 0.")
