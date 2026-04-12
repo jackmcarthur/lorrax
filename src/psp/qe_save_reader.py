@@ -1,34 +1,32 @@
 """
 psp/qe_save_reader.py — Read crystal structure from a QE .save directory.
 
-Constructs a lightweight object with the same attributes as WFNReader,
+Constructs a lightweight object with the same attribute names as WFNReader,
 so it can be passed to dft_operators, vnl_ops, charge_density, etc.
-without any changes to those modules.
 
 Required files in the .save directory:
-  data-file-schema.xml   — crystal structure, parameters
+  data-file-schema.xml   — crystal structure, electronic parameters
   charge-density.hdf5    — valence charge density ρ(G)
 
 Usage
 -----
     from psp.qe_save_reader import CrystalData
 
-    # From a QE .save directory:
     crystal = CrystalData.from_qe_save("silicon.save")
 
-    # Interchangeable with WFNReader for Hamiltonian construction:
-    setup = build_operator_setup(crystal, sym, meta, pseudos)
+    # Build Hamiltonian (duck-types as WFNReader for structure queries):
+    H_k = setup_H_k_from_kvec(kvec, V_scf, vnl_setup, crystal, meta)
 
-    # Access the SCF charge density:
-    rho_G, miller = crystal.load_charge_density()
+    # Load the SCF charge density:
+    rho_r, rho_G = crystal.load_charge_density()
 
-    # Validate against a WFN.h5 (optional, for debugging):
+    # Cross-check against WFN.h5 (optional):
     crystal.validate_against_wfn(wfn)
 """
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
@@ -36,311 +34,185 @@ import numpy as np
 import h5py
 
 
-# Element symbol → atomic number (covers Z ≤ 118)
-_SYMBOL_TO_Z = {
-    "H": 1, "He": 2, "Li": 3, "Be": 4, "B": 5, "C": 6, "N": 7, "O": 8,
-    "F": 9, "Ne": 10, "Na": 11, "Mg": 12, "Al": 13, "Si": 14, "P": 15,
-    "S": 16, "Cl": 17, "Ar": 18, "K": 19, "Ca": 20, "Sc": 21, "Ti": 22,
-    "V": 23, "Cr": 24, "Mn": 25, "Fe": 26, "Co": 27, "Ni": 28, "Cu": 29,
-    "Zn": 30, "Ga": 31, "Ge": 32, "As": 33, "Se": 34, "Br": 35, "Mo": 42,
-    "W": 74,
-}
+# ---------------------------------------------------------------------------
+# Periodic table (Z ≤ 86, covers all common pseudopotentials)
+# ---------------------------------------------------------------------------
+
+_SYMBOL_TO_Z = {}
+_ELEMENTS = (
+    "H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca "
+    "Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br Kr Rb Sr "
+    "Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba "
+    "La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W "
+    "Re Os Ir Pt Au Hg Tl Pb Bi Po At Rn"
+).split()
+for _z, _sym in enumerate(_ELEMENTS, start=1):
+    _SYMBOL_TO_Z[_sym] = _z
 
 
-def _find_ns(root: ET.Element) -> str:
-    """Extract the XML namespace from the root tag."""
-    tag = root.tag
-    if tag.startswith("{"):
-        return tag.split("}")[0] + "}"
-    return ""
+# ---------------------------------------------------------------------------
+# XML helpers
+# ---------------------------------------------------------------------------
 
-
-def _find_text(root: ET.Element, local_tag: str) -> str | None:
-    """Find the first element matching local_tag (ignoring namespace) and return its text."""
-    for elem in root.iter():
-        if elem.tag.split("}")[-1] == local_tag and elem.text:
-            return elem.text.strip()
+def _text(root: ET.Element, tag: str) -> str | None:
+    """First element text matching *tag* (namespace-agnostic)."""
+    for e in root.iter():
+        if e.tag.split("}")[-1] == tag and e.text:
+            return e.text.strip()
     return None
 
 
-def _find_all(root: ET.Element, local_tag: str):
-    """Find all elements matching local_tag (ignoring namespace)."""
-    return [e for e in root.iter() if e.tag.split("}")[-1] == local_tag]
+def _all(root: ET.Element, tag: str) -> list[ET.Element]:
+    """All elements matching *tag* (namespace-agnostic)."""
+    return [e for e in root.iter() if e.tag.split("}")[-1] == tag]
 
 
-def _parse_vector(text: str) -> np.ndarray:
+def _vec(text: str) -> np.ndarray:
     """Parse a whitespace-separated vector of floats."""
     return np.array([float(x) for x in text.split()])
 
 
+# ---------------------------------------------------------------------------
+# CrystalData
+# ---------------------------------------------------------------------------
+
 @dataclass
 class CrystalData:
-    """Crystal structure and metadata, compatible with WFNReader's interface.
+    """Crystal structure and parameters — duck-types as WFNReader.
 
-    Every attribute used by dft_operators, vnl_ops, charge_density, and
-    Meta.from_system is present with matching names and conventions.
+    Attributes match the names consumed by dft_operators, vnl_ops,
+    charge_density, operator_checks, and Meta.from_system.
     """
-    # Lattice (same conventions as WFN.h5)
-    alat: float                    # lattice constant [bohr]
-    blat: float                    # 2π/alat [1/bohr]
-    avec: np.ndarray               # (3,3) lattice vectors / alat (dimensionless)
-    bvec: np.ndarray               # (3,3) reciprocal vectors / blat (dimensionless)
-    adot: np.ndarray               # (3,3) real-space metric (alat² units)
-    bdot: np.ndarray               # (3,3) reciprocal metric (blat² units)
-    cell_volume: float             # Ω [bohr³]
+    # ── Lattice ──
+    alat: float                     # |a₁| [bohr]
+    blat: float                     # 2π / alat [bohr⁻¹]
+    avec: np.ndarray                # (3,3) lattice vectors / alat
+    bvec: np.ndarray                # (3,3) reciprocal vectors / blat
+    bdot: np.ndarray                # (3,3) reciprocal metric [bohr⁻²]
+    cell_volume: float              # Ω [bohr³]
 
-    # Atoms
+    # ── Atoms ──
     nat: int
-    atom_crys: np.ndarray          # (nat, 3) fractional coordinates
-    atom_types: np.ndarray         # (nat,) atomic numbers (Z)
+    atom_crys: np.ndarray           # (nat, 3) crystal coordinates
+    atom_types: np.ndarray          # (nat,) atomic numbers
 
-    # Electronic structure parameters
+    # ── Electronic / grid ──
     nelec: float
     nspin: int
     nspinor: int
-    ecutwfc: float                 # Ry
-    ecutrho: float                 # Ry
+    ecutwfc: float                  # [Ry]
+    ecutrho: float                  # [Ry]
     fft_grid: tuple[int, int, int]
     nbands: int
-    nkpts: int                     # not meaningful without WFN; set to 0
+    nkpts: int
+    kgrid: np.ndarray               # (3,) int
 
-    # k-grid (for Meta.from_system)
-    kgrid: np.ndarray              # (3,) int
-
-    # Compatibility: SymMaps.get_gvecs_kfull calls wfn.get_gvec_nk
-    _gvec_cache: dict = field(default_factory=dict, repr=False)
-
-    # Source directory
+    # ── Private ──
     _save_dir: str = ""
 
-    def get_gvec_nk(self, k_idx: int, kvec: np.ndarray | None = None) -> np.ndarray:
-        """G-vectors for k-point k_idx satisfying |k+G|² ≤ ecutwfc.
-
-        Same interface as WFNReader.get_gvec_nk.  Computes the PW sphere
-        analytically from the cutoff and reciprocal metric.
-
-        Parameters
-        ----------
-        k_idx : int — k-point index (used as cache key).
-        kvec : (3,) float, optional — k-point in crystal coords.
-            If None, uses k=(0,0,0).  The caller (SymMaps.get_gvecs_kfull)
-            passes the IBZ k-vector; for standalone use, pass explicitly.
-
-        Returns (nG, 3) integer G-vectors in crystal coordinates.
-        """
-        if k_idx in self._gvec_cache:
-            return self._gvec_cache[k_idx]
-
-        if kvec is None:
-            kvec = np.zeros(3)
-        kvec = np.asarray(kvec, dtype=float)
-
-        nx, ny, nz = self.fft_grid
-        gx = np.fft.fftfreq(nx, d=1.0 / nx).astype(int)
-        gy = np.fft.fftfreq(ny, d=1.0 / ny).astype(int)
-        gz = np.fft.fftfreq(nz, d=1.0 / nz).astype(int)
-        Gx, Gy, Gz = np.meshgrid(gx, gy, gz, indexing="ij")
-        G_all = np.stack([Gx.ravel(), Gy.ravel(), Gz.ravel()], axis=-1)
-
-        # |k+G|² = (k+G)^T bdot (k+G)
-        KG = G_all.astype(float) + kvec[None, :]
-        KG_sq = np.einsum("gi,ij,gj->g", KG, self.bdot, KG)
-        mask = KG_sq <= self.ecutwfc
-        result = G_all[mask]
-
-        self._gvec_cache[k_idx] = result
-        return result
-
+    # ------------------------------------------------------------------
     @classmethod
     def from_qe_save(cls, save_dir: str) -> CrystalData:
-        """Read from a QE ``*.save`` directory.
-
-        Parameters
-        ----------
-        save_dir : path to the ``.save`` directory containing
-            ``data-file-schema.xml`` and ``charge-density.hdf5``.
-        """
+        """Parse ``data-file-schema.xml`` from a QE ``.save`` directory."""
         save_dir = str(Path(save_dir).resolve())
         xml_path = os.path.join(save_dir, "data-file-schema.xml")
         if not os.path.isfile(xml_path):
-            raise FileNotFoundError(f"Not found: {xml_path}")
+            raise FileNotFoundError(xml_path)
 
-        tree = ET.parse(xml_path)
-        root = tree.getroot()
+        root = ET.parse(xml_path).getroot()
 
-        # ── lattice vectors (bohr) ────────────────────────────────────
-        a1 = _parse_vector(_find_text(root, "a1"))
-        a2 = _parse_vector(_find_text(root, "a2"))
-        a3 = _parse_vector(_find_text(root, "a3"))
-        avec_bohr = np.array([a1, a2, a3])  # rows = lattice vectors
-
+        # ── lattice (bohr) ──
+        a1, a2, a3 = _vec(_text(root, "a1")), _vec(_text(root, "a2")), _vec(_text(root, "a3"))
+        avec_bohr = np.array([a1, a2, a3])
         alat = float(np.linalg.norm(a1))
         blat = 2.0 * np.pi / alat
-
-        # WFN.h5 convention: avec stored as avec_bohr / alat
         avec = avec_bohr / alat
-
-        # reciprocal vectors (QE stores in 2π/alat units, same as WFN.h5)
-        b1 = _parse_vector(_find_text(root, "b1"))
-        b2 = _parse_vector(_find_text(root, "b2"))
-        b3 = _parse_vector(_find_text(root, "b3"))
-        bvec = np.array([b1, b2, b3])
-
-        # metrics
-        adot = avec.T @ avec * alat ** 2
+        bvec = np.array([_vec(_text(root, f"b{i}")) for i in (1, 2, 3)])
         bdot = bvec.T @ bvec * blat ** 2
         cell_volume = abs(np.dot(a1, np.cross(a2, a3)))
 
-        # ── atoms ─────────────────────────────────────────────────────
-        # nat is an attribute on <atomic_structure>, not a text element
-        at_struct = _find_all(root, "atomic_structure")[0]
-        nat_xml = int(at_struct.attrib["nat"])
-
-        atom_elems = _find_all(root, "atom")
-        # Take the first occurrence of each atom (XML may duplicate input/output)
-        atom_elems = atom_elems[:nat_xml]
-
+        # ── atoms ──
+        nat = int(_all(root, "atomic_structure")[0].attrib["nat"])
+        atoms = _all(root, "atom")[:nat]
         avec_inv = np.linalg.inv(avec_bohr)
-        positions_crys = []
-        atomic_numbers = []
-        for atom in atom_elems:
-            name = atom.attrib["name"]
-            pos_cart = _parse_vector(atom.text)
-            pos_crys = avec_inv @ pos_cart
-            positions_crys.append(pos_crys)
-            z = _SYMBOL_TO_Z.get(name)
-            if z is None:
-                raise ValueError(f"Unknown element symbol: {name}")
-            atomic_numbers.append(z)
+        atom_crys = np.array([avec_inv @ _vec(a.text) for a in atoms])
+        atom_types = np.array([_SYMBOL_TO_Z[a.attrib["name"]] for a in atoms], dtype=np.int32)
 
-        atom_crys = np.array(positions_crys, dtype=np.float64)
-        atom_types = np.array(atomic_numbers, dtype=np.int32)
+        # ── electronic ──
+        nelec = float(_text(root, "nelec"))
+        noncolin = _text(root, "noncolin") == "true"
+        lsda = _text(root, "lsda") == "true"
+        nspinor = 2 if noncolin else 1
+        nspin = 2 if (lsda and not noncolin) else 1
 
-        # ── electronic parameters ─────────────────────────────────────
-        nelec = float(_find_text(root, "nelec"))
-        noncolin = _find_text(root, "noncolin") == "true"
-        spinorbit = _find_text(root, "spinorbit") == "true"
-        lsda = _find_text(root, "lsda") == "true"
+        ecutwfc = 2.0 * float(_text(root, "ecutwfc"))   # Ha → Ry
+        ecutrho = 2.0 * float(_text(root, "ecutrho"))
 
-        if noncolin:
-            nspinor = 2
-            nspin = 1    # QE uses nspin=4 internally, but WFN.h5 stores 1
-        elif lsda:
-            nspinor = 1
-            nspin = 2
-        else:
-            nspinor = 1
-            nspin = 1
+        fg = _all(root, "fft_grid")[0].attrib
+        fft_grid = (int(fg["nr1"]), int(fg["nr2"]), int(fg["nr3"]))
 
-        ecutwfc_ha = float(_find_text(root, "ecutwfc"))
-        ecutrho_ha = float(_find_text(root, "ecutrho"))
-        ecutwfc = 2.0 * ecutwfc_ha  # Ha → Ry
-        ecutrho = 2.0 * ecutrho_ha
+        nbnd = _text(root, "nbnd")
+        nbands = int(nbnd) if nbnd else 0
 
-        # FFT grid
-        fft_elem = _find_all(root, "fft_grid")[0]
-        fft_grid = (
-            int(fft_elem.attrib["nr1"]),
-            int(fft_elem.attrib["nr2"]),
-            int(fft_elem.attrib["nr3"]),
-        )
-
-        nbnd_text = _find_text(root, "nbnd")
-        nbands = int(nbnd_text) if nbnd_text else 0
-
-        # k-grid (from monkhorst_pack if present, else zeros)
-        mp = _find_all(root, "monkhorst_pack")
-        if mp:
-            kgrid = np.array([
-                int(mp[0].attrib.get("nk1", 1)),
-                int(mp[0].attrib.get("nk2", 1)),
-                int(mp[0].attrib.get("nk3", 1)),
-            ], dtype=np.int32)
-        else:
-            kgrid = np.zeros(3, dtype=np.int32)
+        mp = _all(root, "monkhorst_pack")
+        kgrid = (np.array([int(mp[0].attrib.get(f"nk{i}", 1)) for i in (1, 2, 3)],
+                          dtype=np.int32) if mp else np.zeros(3, dtype=np.int32))
 
         return cls(
-            alat=alat,
-            blat=blat,
-            avec=avec,
-            bvec=bvec,
-            adot=adot,
-            bdot=bdot,
-            cell_volume=cell_volume,
-            nat=nat_xml,
-            atom_crys=atom_crys,
-            atom_types=atom_types,
-            nelec=nelec,
-            nspin=nspin,
-            nspinor=nspinor,
-            ecutwfc=ecutwfc,
-            ecutrho=ecutrho,
-            fft_grid=fft_grid,
-            nbands=nbands,
-            nkpts=0,
-            kgrid=kgrid,
-            _save_dir=save_dir,
+            alat=alat, blat=blat, avec=avec, bvec=bvec, bdot=bdot,
+            cell_volume=cell_volume, nat=nat,
+            atom_crys=atom_crys, atom_types=atom_types,
+            nelec=nelec, nspin=nspin, nspinor=nspinor,
+            ecutwfc=ecutwfc, ecutrho=ecutrho, fft_grid=fft_grid,
+            nbands=nbands, nkpts=0, kgrid=kgrid, _save_dir=save_dir,
         )
 
-    # ── charge density ────────────────────────────────────────────────
-
+    # ------------------------------------------------------------------
     def load_charge_density(self) -> tuple[np.ndarray, np.ndarray]:
-        """Read ρ_val(G) from charge-density.hdf5.
+        """Read ρ_val from ``charge-density.hdf5``.
 
-        Returns
-        -------
-        rho_r : (nx, ny, nz) float64 — valence density on FFT grid [e/bohr³]
-        rho_G_complex : (nx, ny, nz) complex128 — G-space coefficients
-            (unnormalized FFT convention: rho_G[0,0,0] = N_el * N/Ω)
+        Returns ``(rho_r, rho_G)`` where rho_r is the real-space density
+        on the FFT grid and rho_G is the G-space array (unnormalized FFT).
         """
         cd_path = os.path.join(self._save_dir, "charge-density.hdf5")
         if not os.path.isfile(cd_path):
-            raise FileNotFoundError(f"Not found: {cd_path}")
+            raise FileNotFoundError(cd_path)
 
         nx, ny, nz = self.fft_grid
         N = nx * ny * nz
 
         with h5py.File(cd_path, "r") as f:
-            miller = f["MillerIndices"][:]      # (nG, 3) int
-            rhotot_g = f["rhotot_g"][:]         # (2*nG,) interleaved re/im
+            miller = f["MillerIndices"][:]    # (nG, 3) int
+            rho_ri = f["rhotot_g"][:]         # (2*nG,) interleaved re/im
 
+        # Scatter G-space coefficients onto FFT grid (vectorized)
         rho_G = np.zeros((nx, ny, nz), dtype=np.complex128)
-        for ig in range(miller.shape[0]):
-            gx, gy, gz = miller[ig]
-            rho_G[gx % nx, gy % ny, gz % nz] = (
-                rhotot_g[2 * ig] + 1j * rhotot_g[2 * ig + 1]
-            )
+        ix = miller[:, 0] % nx
+        iy = miller[:, 1] % ny
+        iz = miller[:, 2] % nz
+        rho_G[ix, iy, iz] = rho_ri[0::2] + 1j * rho_ri[1::2]
 
         rho_r = np.real(np.fft.ifftn(rho_G)) * N
         return rho_r, rho_G
 
-    # ── validation against WFN.h5 ────────────────────────────────────
-
+    # ------------------------------------------------------------------
     def validate_against_wfn(self, wfn, atol: float = 1e-6) -> None:
-        """Check that this CrystalData matches a WFNReader.
-
-        Raises AssertionError with a descriptive message on mismatch.
-        """
-        def _check(name, mine, theirs, tol=atol):
-            mine = np.asarray(mine, dtype=float)
-            theirs = np.asarray(theirs, dtype=float)
-            err = np.max(np.abs(mine - theirs))
+        """Assert all structural fields match a WFNReader."""
+        def _chk(name, a, b, tol=atol):
+            err = float(np.max(np.abs(np.asarray(a, dtype=float)
+                                      - np.asarray(b, dtype=float))))
             assert err < tol, (
-                f"{name} mismatch: max|Δ| = {err:.2e} (tol {tol:.0e})\n"
-                f"  QE save: {mine.ravel()[:6]}\n"
-                f"  WFN.h5:  {theirs.ravel()[:6]}"
-            )
+                f"{name}: max|Δ| = {err:.2e} (tol {tol:.0e})")
 
-        _check("alat", self.alat, wfn.alat)
-        _check("blat", self.blat, wfn.blat)
-        _check("cell_volume", self.cell_volume, wfn.cell_volume)
-        _check("avec", self.avec, wfn.avec)
-        _check("bvec", self.bvec, wfn.bvec)
-        _check("bdot", self.bdot, wfn.bdot)
-        _check("atom_crys", self.atom_crys, wfn.atom_crys)
-        _check("atom_types", self.atom_types, wfn.atom_types, tol=0.5)
-        _check("nelec", self.nelec, wfn.nelec, tol=0.5)
-        _check("nspinor", self.nspinor, wfn.nspinor, tol=0.5)
-        _check("fft_grid", self.fft_grid, wfn.fft_grid, tol=0.5)
-
-        print(f"validate_against_wfn: all checks passed")
+        _chk("alat", self.alat, wfn.alat)
+        _chk("blat", self.blat, wfn.blat)
+        _chk("cell_volume", self.cell_volume, wfn.cell_volume)
+        _chk("avec", self.avec, wfn.avec)
+        _chk("bvec", self.bvec, wfn.bvec)
+        _chk("bdot", self.bdot, wfn.bdot)
+        _chk("atom_crys", self.atom_crys, wfn.atom_crys)
+        _chk("atom_types", self.atom_types, wfn.atom_types, tol=0.5)
+        _chk("nelec", self.nelec, wfn.nelec, tol=0.5)
+        _chk("nspinor", self.nspinor, wfn.nspinor, tol=0.5)
+        _chk("fft_grid", self.fft_grid, wfn.fft_grid, tol=0.5)
+        print("validate_against_wfn: all checks passed")
