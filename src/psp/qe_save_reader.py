@@ -140,7 +140,8 @@ class CrystalData:
             rotations.append(np.round(R).astype(int))
             tau = (_vec(children["fractional_translation"].text)
                    if "fractional_translation" in children else np.zeros(3))
-            frac_trans.append(tau * 2.0 * np.pi)  # BGW convention
+            # BGW convention: opposite sign from QE XML, × 2π
+            frac_trans.append(-tau * 2.0 * np.pi)
             # QE marks operations that include time reversal
             info = children.get("info")
             tr = (info is not None and info.attrib.get("time_reversal") == "true")
