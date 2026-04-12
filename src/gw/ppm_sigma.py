@@ -632,6 +632,12 @@ def _convolve_sigma_branch_kij(
         acc_total = jnp.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128)
 
     branch_label = log_tag if log_tag else f"kernel_sign={kernel_sign:+d}"
+    total_tau_nodes = sum(int(win.alpha.shape[0]) for win in windows)
+    from common.progress import LoopProgress
+    progress = LoopProgress(
+        total_tau_nodes, print_fn, title=f"sigma[{branch_label}]",
+        item_name="tau node", max_updates=10)
+
     with jax_profile.annotation(f"sigma_branch[{branch_label}]"):
         for win_idx, win in enumerate(windows):
             with jax_profile.step_annotation(
@@ -658,6 +664,8 @@ def _convolve_sigma_branch_kij(
                             E_A, mask_A, B_q, Omega_q, mask_B,
                             E_ref_A_j, E_ref_B_j, t_node_j, eye_nb,
                         )
+                    sigma_tau_kij_ri[0].block_until_ready()
+                    progress.step()
                     sigma_tau_kij_re = sigma_tau_kij_ri[0]
                     sigma_tau_kij_im = sigma_tau_kij_ri[1]
                     alpha_eff = complex(alpha_node) * np.exp(-1j * (win.E_ref_A + win.E_ref_B) * t_node)
@@ -685,6 +693,8 @@ def _convolve_sigma_branch_kij(
 
                 if acc_win is not None:
                     acc_total = acc_total + acc_win
+
+    progress.finish()
 
     if acc_total is None:
         return jnp.zeros((0, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), windows
