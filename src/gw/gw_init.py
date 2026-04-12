@@ -32,15 +32,19 @@ def compute_optimal_chunks(
 ) -> dict:
     """Derive ISDF chunk sizes that saturate (but do not exceed) the memory budget.
 
-    Models 6 pipeline stages (FFT, pair density, ZCT, reshard, solve, gather),
-    each calibrated against XLA HLO profiling on CrI3 (16-GPU, 75×75×200 grid).
+    Models 6 pipeline stages, each calibrated against XLA HLO profiling
+    on CrI3 (16-GPU, 75×75×200 grid):
 
-    Memory multipliers:
-      - FFT:     3× (input + output + cuFFT scratch, donated)
-      - ZCT:     4× pair data (P_r alive + 3× left IFFT JIT)
-      - Reshard: 4× m_zcol (input + output + 2× NCCL temp)
-      - Solve:   Z_col(donated) + per-q (Z_slice + L_rep + L_allgather + 2×trsm + Z_T)
-      - Gather:  zeta(sharded) + per-q (input + output + NCCL)
+      FFT:     3× (input + output + cuFFT scratch)
+      Pair:    ψ(r_chunk) + P_l + P_r
+      ZCT:     4× pair data (P_r alive + 3× left IFFT JIT)
+      Reshard: 4× m_zcol (input + output + 2× NCCL temp)
+      Solve:   2×Z_col + per-q (Z_slice + L_rep + L_allgather + 2×trsm + Z_T)
+      Gather:  Z_col + per-q (input + output + NCCL)
+
+    The r-chunk is found by downward search from n_r, evaluating
+    _stage_peaks at each candidate.  No separate analytical limits —
+    the search IS the single source of truth for the memory model.
     """
     if memory_budget_gb <= 0:
         raise ValueError("memory_per_device_gb must be > 0.")
@@ -67,13 +71,6 @@ def compute_optimal_chunks(
             result *= d
         return result / shard
 
-    def _limit(headroom, *dims, shard=1):
-        """Max chunk_r such that _mem(*dims, chunk_r, shard=shard) ≤ headroom."""
-        denom = B
-        for d in dims:
-            denom *= d
-        return headroom * shard / denom if denom > 0 else nr
-
     m_budget = memory_budget_gb * 1e9 * target_utilization
     m_zct_cap = float(zct_stage_cap_gb) * 1e9 if zct_stage_cap_gb and zct_stage_cap_gb > 0 else None
 
@@ -95,8 +92,7 @@ def compute_optimal_chunks(
     bpd_max = max(1, int((headroom_fft - m_phase) / one_band))
     band_chunk = min(nb, bpd_max * p)
     bpd = max(1, -(-band_chunk // p))  # ceil div (matches read_Gvecs_to_devices)
-    m_fft_workspace = FFT_COPIES * _mem(nk, bpd, ns, nr) + m_phase
-    peak_fft_stage = m_centroids_full + m_fft_workspace
+    peak_fft_stage = m_centroids_full + FFT_COPIES * _mem(nk, bpd, ns, nr) + m_phase
 
     # ---- C_q build (pair density + Cholesky) ----
     m_pair_mumu = _mem(pc, nk, mu, mu, shard=p_x * p_y)
@@ -109,149 +105,109 @@ def compute_optimal_chunks(
     # ---- G-space cache (optional) ----
     m_gspace_cache = _mem(nk, nb, ns, nr, shard=p)
 
-    # ---- Per-k FFT cost (for k_batch sizing) ----
-    per_k_fft = FFT_COPIES * _mem(bpd, ns, nr) + _mem(nr)
+    # ---- Stage peak calculator (single source of truth for the memory model) ----
+    def _stage_peaks(cr, base, fft_cost_per_k):
+        """Per-stage peak memory at a given r-chunk size.
 
-    # ---- Stage peak calculator ----
-    def _stage_peaks(cr, base):
-        """Compute per-stage peak memory for a given r-chunk size and base cost."""
-        # FFT: psi_rchunk output + 1 k-batch FFT transient
+        Every stage cost is base + f(cr).  This function defines the model;
+        the search loop and q_chunk/q_gather sizing all derive from it.
+        """
         m_psi = _mem(nk, nb, ns, cr, shard=p_y)
-        s_fft = base + m_psi + per_k_fft
-
-        # Pair density: psi_chunk + P_l + P_r
-        s_pair = base + m_psi + 2 * _mem(pc, nk, mu, cr, shard=p_x * p_y)
-
-        # ZCT: P_r alive during left IFFT (1×) + left IFFT JIT (3×) = 4× pair data
-        s_zct = base + 4.0 * _mem(pc, nk, mu, cr, shard=p_x * p_y)
-
-        # Reshard: input + output + 2× NCCL temp = 4× m_zcol
+        m_pair = _mem(pc, nk, mu, cr, shard=p_x * p_y)
         m_zcol = _mem(nq, mu, cr, shard=p)
-        s_reshard = base + 4.0 * m_zcol
-
-        # Solve (q_chunk=1): Z_col + zeta (2× m_zcol) + per-q arrays
         m_solve_per_q = (
-            _mem(mu, cr, shard=p)              # Z_slice
-            + _mem(mu, mu, shard=p_x * p_x)    # L_rep (sharded)
-            + 3 * _mem(mu, mu)                  # L_allgather + trsm_fwd + trsm_bwd
-            + _mem(cr, mu, shard=p)             # Z_transpose
+            2 * _mem(mu, cr, shard=p)           # Z_slice + Z_transpose
+            + _mem(mu, mu, shard=p_x * p_x)     # L_rep (sharded)
+            + 3 * _mem(mu, mu)                   # L_allgather + trsm_fwd + trsm_bwd
         )
-        s_solve = base + 2 * m_zcol + m_solve_per_q
-
-        # Gather (q_gather=1): zeta(sharded) + input + output + NCCL
         m_gather_per_q = _mem(mu, cr, shard=p) + 2 * _mem(mu, cr)
-        s_gather = base + m_zcol + m_gather_per_q
 
-        stages = {'fft': s_fft, 'pair': s_pair, 'zct': s_zct,
-                  'reshard': s_reshard, 'solve': s_solve, 'gather': s_gather}
-        peak = max(stages.values())
-        name = max(stages, key=stages.get)
-
-        # k_batch: how many k-points fit in FFT headroom (throughput, not feasibility)
-        fft_head = m_budget - base - m_psi
-        k_batch = min(nk, max(1.0, float(int(fft_head * 0.5 / per_k_fft)))) if per_k_fft > 0 and fft_head > per_k_fft else 1.0
-
-        return peak, name, {
-            'zcol': m_zcol, 'solve_per_q': m_solve_per_q,
-            'gather_per_q': m_gather_per_q, 'k_batch': int(k_batch),
-            'stages': stages,
+        stages = {
+            'fft':     base + m_psi + fft_cost_per_k,
+            'pair':    base + m_psi + 2 * m_pair,
+            'zct':     base + 4 * m_pair,
+            'reshard': base + 4 * m_zcol,
+            'solve':   base + 2 * m_zcol + m_solve_per_q,
+            'gather':  base + m_zcol + m_gather_per_q,
         }
 
-    # ---- R-chunk search ----
-    def _find_r_chunk(use_cache, override=None):
-        m_cache = m_gspace_cache if use_cache else 0.0
-        base = m_centroids + m_L_q + m_cache
-        headroom = m_budget - base
-        if headroom <= _mem(mu, mu):
+        # k_batch: how many k-points fit in FFT headroom (throughput only)
+        fft_head = m_budget - base - m_psi
+        k_batch = 1
+        if fft_cost_per_k > 0 and fft_head > fft_cost_per_k:
+            k_batch = min(int(nk), max(1, int(fft_head * 0.5 / fft_cost_per_k)))
+
+        return stages, m_zcol, m_solve_per_q, m_gather_per_q, k_batch
+
+    # ---- R-chunk search (downward from n_r, pure arithmetic) ----
+    def _find_r_chunk(use_cache, fft_cost_per_k, override=None):
+        base = m_centroids + m_L_q + (m_gspace_cache if use_cache else 0.0)
+        if m_budget - base <= _mem(mu, mu):
             return None
-        headroom_zct = (m_zct_cap - base) if m_zct_cap is not None else None
 
-        if override and override > 0:
-            cr = min(int(override), int(nr))
-        else:
-            # Analytical limits per stage (max cr that fits)
-            limits = {}
-            fft_head = headroom - per_k_fft
-            if fft_head > 0:
-                limits['limit_fft'] = _limit(fft_head, nk, nb, ns, shard=p_y)
-            limits['limit_pair'] = _limit(headroom, nk, nb, ns, shard=p_y) if nk * nb * ns > 0 else nr
-            # Pair uses psi + 2×P; combined denominator:
-            denom_pair = nk * nb * ns + 2 * pc * nk * (mu / p_x)
-            limits['limit_pair'] = headroom * p_y / (B * denom_pair) if denom_pair > 0 else nr
-            limits['limit_zct'] = _limit(headroom, 4.0 * pc * nk * (mu / p_x), shard=p_y)
-            if headroom_zct is not None and headroom_zct > 0:
-                limits['limit_zct_soft'] = _limit(headroom_zct, 4.0 * pc * nk * (mu / p_x), shard=p_y)
-            limits['limit_reshard'] = _limit(headroom, 4.0 * nq * mu, shard=p)
-            # Solve: subtract R-independent cost, then limit on R-dependent terms
-            solve_const = _mem((mu / p_x) ** 2) + 3 * _mem(mu, mu)
-            solve_head = headroom - solve_const
-            if solve_head > 0:
-                limits['limit_solve'] = _limit(solve_head, (2.0 * nq + 2.0) * mu, shard=p)
-            limits['limit_gather'] = _limit(headroom, mu * (nq / p + 1.0 / p + 2.0))
-
-            cr = min(int(nr), max(1, int(min(limits.values())))) if limits else int(nr)
-
-        # Round down to device-divisible
+        cr = min(int(override), int(nr)) if override and override > 0 else int(nr)
         pt = p_x * p_y
-        if pt > 1 and cr % pt != 0:
-            cr -= cr % pt
+        cr = cr - (cr % pt) if pt > 1 and cr % pt != 0 else cr
         if cr <= 0:
             return None
 
-        # Search downward for feasible chunk
         while cr > 0:
-            peak, name, info = _stage_peaks(cr, base)
-            zct_ok = m_zct_cap is None or info['stages']['zct'] <= m_zct_cap
+            stages, m_zcol, m_solve_pq, m_gather_pq, k_batch = _stage_peaks(cr, base, fft_cost_per_k)
+            peak = max(stages.values())
+            zct_ok = m_zct_cap is None or stages['zct'] <= m_zct_cap
             if peak <= m_budget and zct_ok:
-                return {'chunk_r': cr, 'peak': peak, 'name': name, 'info': info,
-                        'cache_bytes': m_cache, 'base': base,
-                        'limit_info': limits if not (override and override > 0) else {}}
+                bottleneck = max(stages, key=stages.get)
+                return {
+                    'chunk_r': cr, 'peak': peak, 'bottleneck': bottleneck,
+                    'stages': stages, 'base': base,
+                    'zcol': m_zcol, 'solve_per_q': m_solve_pq,
+                    'gather_per_q': m_gather_pq, 'k_batch': k_batch,
+                    'cache_bytes': m_gspace_cache if use_cache else 0.0,
+                }
             cr -= max(1, pt)
             if pt > 1 and cr > 0 and cr % pt != 0:
                 cr -= cr % pt
         return None
 
     # ---- Main search: try with cache, then without, reducing band_chunk if needed ----
-    result = _find_r_chunk(True, r_chunk_override) or _find_r_chunk(False, r_chunk_override)
+    fft_per_k = FFT_COPIES * _mem(bpd, ns, nr) + _mem(nr)
+    result = _find_r_chunk(True, fft_per_k, r_chunk_override) or \
+             _find_r_chunk(False, fft_per_k, r_chunk_override)
     while result is None and bpd > 1:
         bpd = max(1, bpd // 2)
         band_chunk = min(nb, bpd * p)
         bpd = max(1, -(-band_chunk // p))
-        per_k_fft = FFT_COPIES * _mem(bpd, ns, nr) + _mem(nr)
-        m_fft_workspace = FFT_COPIES * _mem(nk, bpd, ns, nr) + m_phase
-        peak_fft_stage = m_centroids_full + m_fft_workspace
+        fft_per_k = FFT_COPIES * _mem(bpd, ns, nr) + _mem(nr)
+        peak_fft_stage = m_centroids_full + FFT_COPIES * _mem(nk, bpd, ns, nr) + m_phase
         if verbose:
             print(f"    Reducing band_chunk to {band_chunk} (bands/device={bpd})")
-        result = _find_r_chunk(True, r_chunk_override) or _find_r_chunk(False, r_chunk_override)
+        result = _find_r_chunk(True, fft_per_k, r_chunk_override) or \
+                 _find_r_chunk(False, fft_per_k, r_chunk_override)
     if result is None:
         raise ValueError("Unable to find r-chunk that fits the memory budget.")
 
-    chunk_r = result['chunk_r']
-    info = result['info']
+    # ---- Derive q_chunk (solve) and q_gather (HDF5 write) from same model ----
     base = result['base']
-
-    # ---- Derive q_chunk (solve) and q_gather (HDF5 write) ----
-    m_zcol = info['zcol']
+    m_zcol = result['zcol']
     avail_solve = max(0.0, m_budget - base - 2 * m_zcol)
-    q_chunk = max(1, min(n_q, int(avail_solve / info['solve_per_q']))) if info['solve_per_q'] > 0 else 1
-
+    q_chunk = max(1, min(n_q, int(avail_solve / result['solve_per_q']))) if result['solve_per_q'] > 0 else 1
     avail_gather = max(0.0, m_budget - base - m_zcol)
-    q_gather = max(1, min(n_q, int(avail_gather / info['gather_per_q']))) if info['gather_per_q'] > 0 else n_q
+    q_gather = max(1, min(n_q, int(avail_gather / result['gather_per_q']))) if result['gather_per_q'] > 0 else n_q
 
-    # ---- Overall peak ----
-    overall_peak = max(result['peak'],
-                       base + 2 * m_zcol + q_chunk * info['solve_per_q'],
-                       base + m_zcol + q_gather * info['gather_per_q'],
-                       peak_fft_stage, m_centroids_full + m_centroids, stage_cct)
-    bottleneck = result['name']
+    # ---- Overall peak (including pre-chunk stages) ----
+    overall_peak = max(
+        result['peak'],
+        base + 2 * m_zcol + q_chunk * result['solve_per_q'],
+        base + m_zcol + q_gather * result['gather_per_q'],
+        peak_fft_stage, m_centroids_full + m_centroids, stage_cct)
 
-    k_chunk = info['k_batch']
+    k_chunk = result['k_batch']
     if k_chunk < int(n_k) and verbose:
         print(f"    K-point chunking: {k_chunk} k-pts per FFT batch (total {int(n_k)})")
 
     return {
         'band_chunk': band_chunk,
-        'chunk_r': chunk_r,
+        'chunk_r': result['chunk_r'],
         'q_chunk': q_chunk,
         'q_gather': q_gather,
         'k_chunk': k_chunk,
@@ -259,9 +215,9 @@ def compute_optimal_chunks(
         'memory_estimate': {
             'peak_estimate_gb': overall_peak / 1e9,
             'budget_gb': memory_budget_gb,
-            'bottleneck': bottleneck,
+            'bottleneck': result['bottleneck'],
             'available_vcoul_gb': max(0.0, m_budget - m_centroids) / 1e9,
-            'limit_info': result.get('limit_info', {}),
+            'limit_info': {k: v / 1e9 for k, v in result['stages'].items()},
         },
     }
 
@@ -341,8 +297,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, tmp_dir, print_fn=p
 		budget = mem_est.get('budget_gb', 0.0)
 		bottleneck = mem_est.get('bottleneck', 'unknown')
 		print_fn(f"    Memory estimate: peak {peak:.2f} GB (budget {budget:.2f} GB), bottleneck={bottleneck}")
-		for key, val in mem_est.get('limit_info', {}).items():
-			print_fn(f"      {key}: {val:.1f}")
+		stages = mem_est.get('limit_info', {})
+		if stages:
+			print_fn(f"    Per-stage: " + "  ".join(f"{k}={v:.2f}" for k, v in stages.items()) + " GB")
 
 	zeta_h5_path = os.path.join(tmp_dir, "zeta_q.h5")
 	print_fn(f"\n  Chunked ISDF fitting:")
