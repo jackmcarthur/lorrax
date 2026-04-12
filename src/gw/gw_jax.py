@@ -132,6 +132,15 @@ def _hartree(wfns, Gij, V_q, nk_tot):
 from .greens_function_kernel import build_G
 
 
+def _build_mesh():
+	"""Construct 2D device mesh with most-square factorization."""
+	total = jax.process_count() * jax.local_device_count()
+	gx = int(np.sqrt(total))
+	while gx > 1 and total % gx != 0:
+		gx -= 1
+	return Mesh(np.array(jax.devices()).reshape(gx, total // gx), ['x', 'y'])
+
+
 def _build_Gij(meta, mesh_xy):
 	"""Occupation projector G_ij = diag(1,...,1,0,...,0) for sigma bands."""
 	nocc = min(meta.nelec, meta.nb_sigma)
@@ -193,13 +202,8 @@ def main(argv=None):
 	n_procs = jax.process_count()
 	device_names = jax.devices()[0].device_kind if n_devices > 0 else "unknown"
 
-	total_devices = jax.process_count() * jax.local_device_count()
-	grid_x = int(np.sqrt(total_devices))
-	while total_devices % grid_x != 0:
-		grid_x -= 1
-	grid_y = total_devices // grid_x
-	devices_2d = np.array(jax.devices()).reshape(grid_x, grid_y)
-	mesh_xy = Mesh(devices_2d, ['x', 'y'])
+	mesh_xy = _build_mesh()
+	grid_x, grid_y = mesh_xy.devices.shape
 
 	from .gw_output import print_banner, print_system_summary, write_results, GWResults
 	print_banner(

@@ -19,10 +19,8 @@ from common import jax_profile
 
 
 def compute_optimal_chunks(
-    n_k: int, n_b: int, n_s: int, n_rmu: int, n_r: int, n_q: int,
-    fft_grid: tuple[int, int, int], n_devices: int, memory_budget_gb: float,
+    meta, mesh_xy, memory_budget_gb: float,
     target_utilization: float = 0.97,
-    p_x: int | None = None, p_y: int | None = None,
     verbose: bool = True,
     n_b_left: int | None = None, n_b_right: int | None = None,
     pair_density_channels: int = 1,
@@ -31,6 +29,7 @@ def compute_optimal_chunks(
 ) -> dict:
     """Derive ISDF chunk sizes that fit within the per-device memory budget.
 
+    System dimensions come from meta; device grid from mesh_xy.
     The ISDF r-chunk loop has 6 stages, each with cost linear in chunk_r (cr):
 
         stage_cost(cr) = base + αᵢ·cr + cᵢ
@@ -57,19 +56,14 @@ def compute_optimal_chunks(
         raise ValueError("memory_per_device_gb must be > 0.")
 
     B = 16.0  # bytes per complex128
-    nx, ny, nz = fft_grid
-    p = max(1, int(n_devices))
-    nb = int(n_b)
+    p_x, p_y = mesh_xy.devices.shape
+    p = p_x * p_y
+    nb = meta.band_edges[4] - meta.band_edges[0]  # b4 - b0
     nb_l = int(n_b_left) if n_b_left is not None else nb
     nb_r = int(n_b_right) if n_b_right is not None else nb
-    nk, ns, mu, nq, nr = float(n_k), float(n_s), float(n_rmu), float(n_q), float(n_r)
+    nk, ns, mu, nq, nr = float(meta.nk_tot), float(meta.nspinor), float(meta.n_rmu), float(meta.nk_tot), float(meta.n_rtot)
+    nx, ny, nz = meta.fft_grid
     pc = float(pair_density_channels)
-
-    if p_x is None or p_y is None:
-        sq = int(math.sqrt(p))
-        while sq > 1 and p % sq != 0:
-            sq -= 1
-        p_x, p_y = sq, p // sq
 
     def _mem(*dims, shard=1):
         """complex128 array bytes: 16 · ∏(dims) / shard."""
@@ -207,9 +201,9 @@ def compute_optimal_chunks(
     # ---- q_chunk (solve) and q_gather (H5 write): same linear model, different base ----
     base, m_zcol = result['base'], result['zcol']
     avail_solve = max(0.0, m_budget - base - 2 * m_zcol)
-    q_chunk = max(1, min(n_q, int(avail_solve / result['solve_per_q']))) if result['solve_per_q'] > 0 else 1
+    q_chunk = max(1, min(int(nq), int(avail_solve / result['solve_per_q']))) if result['solve_per_q'] > 0 else 1
     avail_gather = max(0.0, m_budget - base - m_zcol)
-    q_gather = max(1, min(n_q, int(avail_gather / result['gather_per_q']))) if result['gather_per_q'] > 0 else n_q
+    q_gather = max(1, min(int(nq), int(avail_gather / result['gather_per_q']))) if result['gather_per_q'] > 0 else int(nq)
 
     # ---- Overall peak across all stages (chunk loop + pre-loop) ----
     overall_peak = max(
@@ -219,8 +213,8 @@ def compute_optimal_chunks(
         peak_fft_stage, m_centroids_full + m_centroids, stage_cct)
 
     k_chunk = result['k_batch']
-    if k_chunk < int(n_k) and verbose:
-        print(f"    K-point chunking: {k_chunk} k-pts per FFT batch (total {int(n_k)})")
+    if k_chunk < int(nk) and verbose:
+        print(f"    K-point chunking: {k_chunk} k-pts per FFT batch (total {int(nk)})")
 
     return {
         'band_chunk': band_chunk,
@@ -278,17 +272,13 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	band_range_left = (band_slices.b0, band_slices.b3)   # all val + sigma cond
 	band_range_right = (band_slices.b1, band_slices.b4)   # sigma val + all cond
 
-	pair_channels = 1 if cfg.isdf_pair_mode == "spin_traced" else meta.nspinor ** 2
 	chunks = compute_optimal_chunks(
-		n_k=meta.nk_tot, n_b=band_slices.nb_full, n_s=meta.nspinor,
-		n_rmu=meta.n_rmu, n_r=meta.n_rtot, n_q=meta.nk_tot,
-		fft_grid=meta.fft_grid, n_devices=jax.device_count(),
+		meta, mesh_xy,
 		memory_budget_gb=cfg.memory_per_device_gb,
 		target_utilization=cfg.chunk_target_utilization,
-		p_x=mesh_xy.devices.shape[0], p_y=mesh_xy.devices.shape[1],
 		n_b_left=band_range_left[1] - band_range_left[0],
 		n_b_right=band_range_right[1] - band_range_right[0],
-		pair_density_channels=pair_channels, verbose=True,
+		pair_density_channels=1 if cfg.isdf_pair_mode == "spin_traced" else meta.nspinor ** 2,
 		r_chunk_override=cfg.r_chunk_override if cfg.r_chunk_override > 0 else None,
 		zct_stage_cap_gb=cfg.zct_stage_cap_gb,
 	)
