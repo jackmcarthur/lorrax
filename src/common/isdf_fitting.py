@@ -906,12 +906,16 @@ def fit_zeta_chunked_to_h5(
         except Exception:
             pass
 
+    from common.progress import LoopProgress
+    r_progress = LoopProgress(
+        num_chunks, print, title="zeta fitting",
+        item_name="r-chunk", max_updates=min(num_chunks, 20))
+
     with timing.section("zeta_fit.chunk_loop"):
         for chunk_idx in range(num_chunks):
             r_start = chunk_idx * chunk_r
             r_end = min(r_start + chunk_r, n_rtot)
             actual_n_rchunk = r_end - r_start
-            print(f"Chunk {chunk_idx+1}/{num_chunks}: r=[{r_start}:{r_end}]")
 
             # 6a. Get psi_nk,a(r_chunk) for FULL band range
             t0 = time.perf_counter()
@@ -1061,9 +1065,11 @@ def fit_zeta_chunked_to_h5(
                 jax.experimental.multihost_utils.sync_global_devices(f"zeta_chunk_{chunk_idx}")
                 del zeta_chunk  # Free GPU memory before next chunk's FFT stage
             t_write_total += time.perf_counter() - t0
+            r_progress.step()
 
 
     t_chunks_total = time.perf_counter() - t_chunk_start
+    r_progress.finish()
 
     # Wait for all async writes to complete
     if jax.process_index() == 0 and writer_thread is not None:

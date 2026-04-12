@@ -918,16 +918,18 @@ def compute_all_V_q_from_zeta_h5(
                 jnp.stack(phase_batch, axis=0),
             )
         
+        from common.progress import LoopProgress
+        vq_progress = LoopProgress(
+            nq_total, print, title="V_q computation",
+            item_name="q-point", max_updates=min(nq_total, 20))
+
         with timing.section("compute_all_V_q"):
             with ThreadPoolExecutor(max_workers=1) as executor:
                 # Submit first batch read
                 pending_future = executor.submit(read_batch_from_h5, batches[0])
-                
+
                 for batch_idx, batch in enumerate(batches):
                     actual_batch_size = len(batch)
-                    if verbose:
-                        qb = ', '.join(f"({qx},{qy},{qz})" for (qx, qy, qz) in batch)
-                        print(f"  q-points {batch_idx*effective_q_batch+1}-{batch_idx*effective_q_batch+actual_batch_size} / {nq_total}: {qb}")
                     
                     # Wait for current batch I/O to complete
                     _t0 = time.perf_counter()
@@ -953,10 +955,9 @@ def compute_all_V_q_from_zeta_h5(
                     _t0 = time.perf_counter()
                     V_batch, g0_batch = _batch_proc(zeta_batch_arr, sqrt_batch_arr, phase_batch_arr)
                     V_batch.block_until_ready()
-                    _dt = time.perf_counter() - _t0
-                    t_fft_contract += _dt
-                    if verbose:
-                        print(f"    batch FFT+contract: {_dt:.3f}s ({actual_batch_size} q's)")
+                    t_fft_contract += time.perf_counter() - _t0
+                    for _ in range(actual_batch_size):
+                        vq_progress.step()
                     
                     # Only keep actual results (trim padding)
                     V_qmunu_list.append(V_batch[:actual_batch_size])
@@ -965,11 +966,8 @@ def compute_all_V_q_from_zeta_h5(
                     # Free intermediate GPU arrays
                     del zeta_batch_arr, sqrt_batch_arr, phase_batch_arr
         
-        print(f"    V_q timing breakdown (overlapped I/O):")
-        print(f"      H5 read (waited): {t_h5_read:.3f}s")
-        print(f"      GPU transfer:     {t_transfer:.3f}s")
-        print(f"      FFT+contract:     {t_fft_contract:.3f}s")
-        
+        vq_progress.finish()
+
         V_qmunu = jnp.concatenate(V_qmunu_list, axis=0).reshape(nkx, nky, nkz, n_rmu, n_rmu)
         g0_mu_all = jnp.concatenate(g0_mu_list, axis=0).reshape(nkx, nky, nkz, n_rmu)
     
@@ -978,12 +976,15 @@ def compute_all_V_q_from_zeta_h5(
         V_qmunu_np = np.zeros((nkx, nky, nkz, n_rmu, n_rmu), dtype=np.complex128)
         g0_mu_np = np.zeros((nkx, nky, nkz, n_rmu), dtype=np.complex128)
         
+        from common.progress import LoopProgress
+        vq_progress = LoopProgress(
+            nq_total, print, title="V_q computation",
+            item_name="q-point", max_updates=min(nq_total, 20))
+
         with timing.section("compute_all_V_q"):
             for qx in range(nkx):
                 for qy in range(nky):
                     for qz in range(nkz):
-                        q_flat = qx * nky * nkz + qy * nkz + qz
-                        
                         qvec_nonneg = np.array([qx, qy, qz], dtype=np.float64)
                         kgrid_arr = np.array([nkx, nky, nkz], dtype=np.float64)
                         qvec_wrapped = np.where(
@@ -992,9 +993,6 @@ def compute_all_V_q_from_zeta_h5(
                             qvec_nonneg
                         )
                         qvec_wrapped_jax = jnp.asarray(qvec_wrapped)
-                        
-                        if verbose:
-                            print(f"  q-point {q_flat+1}/{nq_total}: q=({qx},{qy},{qz})")
                         
                         sqrt_v, phase = kernels.get_sqrt_v_and_phase(qvec_wrapped_jax)
                         V_q_local = np.zeros((n_rmu, n_rmu), dtype=np.complex128)
@@ -1028,10 +1026,9 @@ def compute_all_V_q_from_zeta_h5(
                                 V_q_local[mu_j_start:mu_j_end, mu_i_start:mu_i_end] = V_ij_np.conj().T
                         
                         V_qmunu_np[qx, qy, qz, :, :] = V_q_local
-            
-            if verbose:
-                print()
-        
+                        vq_progress.step()
+
+        vq_progress.finish()
         V_qmunu = jnp.asarray(V_qmunu_np)
         g0_mu_all = jnp.asarray(g0_mu_np)
     
