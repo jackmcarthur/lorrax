@@ -19,6 +19,7 @@ class Meta:
     b_id_3: int
     b_id_4: int
     fft_grid: tuple
+    cell_volume: float
     n_rtot: int
     n_rmu: int
     npol: int
@@ -35,7 +36,8 @@ class Meta:
     n_rmu_jax: int
 
     def __post_init__(self):
-        # Cache commonly reused grid/band descriptors to avoid ad-hoc rebuilds elsewhere.
+        self.nelec = self.b_id_2
+        self.nb_sigma = self.b_id_3 - self.b_id_0
         self.kgrid = (self.nkx, self.nky, self.nkz)
         self.kgrid_np = np.asarray(self.kgrid, dtype=np.int32)
         self.kgrid_jax = jnp.asarray(self.kgrid_np)
@@ -87,6 +89,7 @@ class Meta:
         b_id_3 = int(wfn.nelec + ncond)
         b_id_4 = int(nband)
         fft_grid = tuple(int(x) for x in wfn.fft_grid)
+        cell_volume = float(wfn.cell_volume)
         n_rtot = int(np.prod(fft_grid))
         nspin = int(wfn.nspin)
         nspinor_wfnfile = int(wfn.nspinor)
@@ -106,6 +109,7 @@ class Meta:
             b_id_3,
             b_id_4,
             fft_grid,
+            cell_volume,
             n_rtot,
             n_rmu,
             npol,

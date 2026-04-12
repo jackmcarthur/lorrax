@@ -285,7 +285,7 @@ def fit_zeta_and_compute_V_q_chunked(
 	jax.experimental.multihost_utils.sync_global_devices("zeta_flush")
 	
 	bvec = np.asarray(wfn.blat * wfn.bvec, dtype=np.float64)
-	cell_volume = float(wfn.cell_volume)
+	cell_volume = meta.cell_volume
 	
 	# V_q memory: zeta_mu(G) + zeta_nu(G) + FFT workspace + V_q block
 	# Use memory headroom reported by chunk sizing (centroids remain resident).
@@ -450,10 +450,10 @@ def _extract_flat_k(V_qmunu, W_flat, meta, mesh_xy, wfn):
 		W_flat = V_flat
 	# Gij = diag(1,...,1,0,...,0) — occupation projector
 	b0, _, _, b3, _ = meta.band_edges
-	nb_sigma, nk, nelec = int(b3 - b0), int(meta.nk_tot), int(wfn.nelec)
-	Gij = jnp.zeros((nk, nb_sigma, nb_sigma), dtype=jnp.complex128)
-	Gij = Gij.at[:, :min(nelec, nb_sigma), :min(nelec, nb_sigma)].set(
-		jnp.eye(min(nelec, nb_sigma), dtype=jnp.complex128))
+	nk = meta.nk_tot
+	nocc = min(meta.nelec, meta.nb_sigma)
+	Gij = jnp.zeros((nk, meta.nb_sigma, meta.nb_sigma), dtype=jnp.complex128)
+	Gij = Gij.at[:, :nocc, :nocc].set(jnp.eye(nocc, dtype=jnp.complex128))
 	Gij = jax.device_put(Gij, NamedSharding(mesh_xy, P(None, None, None)))
 	return V_flat, W_flat, Gij
 
@@ -463,9 +463,9 @@ def _compute_static_head(params, input_dir, wfn, sym, meta, do_screened, print0)
 	head = resolve_head_sample(params, input_dir, wfn, sym, meta, print0, omega=0.0+0.0j)
 	print0(format_head_sample_diagnostics(head, include_screened=do_screened))
 	b0, _, _, b3, _ = meta.band_edges
-	occ_mask = np.arange(int(b0), int(b3), dtype=np.int32) < int(wfn.nelec)
+	occ_mask = np.arange(int(b0), int(b3), dtype=np.int32) < meta.nelec
 	terms = compute_static_head_terms_from_sample(
-		head, occ=occ_mask, cell_volume=float(wfn.cell_volume), nk_tot=int(meta.nk_tot))
+		head, occ=occ_mask, cell_volume=meta.cell_volume, nk_tot=int(meta.nk_tot))
 	print0(format_static_head_diagnostics(terms))
 	return terms
 
@@ -643,9 +643,7 @@ def main(argv=None):
 		static_head_terms = _compute_static_head(
 			params, input_dir, wfn, sym, meta, do_screened, print0)
 
-	nb_sigma = int(b3 - b0)
-	nelec = int(wfn.nelec)
-	kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+	kgrid = meta.kgrid
 	_nk_tot = int(meta.nk_tot)
 
 	# FFT helpers: flat-k ↔ flat-R.  Callers pass flat arrays, never see 3D k-grid.
@@ -714,7 +712,9 @@ def main(argv=None):
 			sig_sx  = sigma_sx(wfns, Gij_static, W_flat)
 			sig_coh = sigma_coh(wfns, W_flat, V_flat)
 			sig_h   = hartree(wfns, Gij_static, v_q0_noG0_munu)
+
 			sig_sx, sig_coh = _add_head(sig_sx, sig_coh)
+			
 			sig_sx.block_until_ready()
 			sig_coh.block_until_ready()
 			sig_h.block_until_ready()
@@ -775,7 +775,7 @@ def main(argv=None):
 					omega_p_ry=opts.omega_p_ry,
 				)
 				print0(format_head_pair_diagnostics(head_0, head_i))
-				print0(format_head_diagnostics(head_gn, float(wfn.cell_volume)))
+				print0(format_head_diagnostics(head_gn, meta.cell_volume))
 			else:
 				head_gn = None
 			ppm = compute_w0_wiwp_and_ppm_from_minimax(
@@ -830,7 +830,7 @@ def main(argv=None):
 				get_G_mu_nu_fn=build_G_occ,
 				get_G_R_fn=None,        # unused (ppm_sigma has its own FFT pipeline)
 				get_sigma_mu_nu_fn=None, # unused
-				get_sigma_kij_channels_fn=project_to_bands_ri,
+				get_sigma_kij_channels_fn=_project_ri,
 				print0=print0,
 			)
 			_ppm_t2 = _ppm_time.perf_counter()
@@ -1108,8 +1108,6 @@ def main(argv=None):
 	# NOTE: kin_ion stores H_DFT - V_xc (and typically excludes V_H unless kin_ion_io was run with --do-hartree).
 	# This keeps the QP Hamiltonian in the standard GW form:
 	#   H_QP = (H_DFT - V_xc) + V_H + Sigma_xc(omega).
-	nelec = int(wfn.nelec)
-
 	if use_ppm_sigma and meta.rank == 0 and sigma_omega_h5_path and os.path.exists(sigma_omega_h5_path):
 		def _gap_k0(E_kn_ev, iv, ic):
 			if iv < 0 or ic < 0:
@@ -1242,7 +1240,7 @@ def main(argv=None):
 			
 			# Build G_ij = U @ diag(f) @ U† (projector onto occupied states)
 			# f = [1,1,...,1,0,0,...,0] with nelec ones
-			f_occ = (jnp.arange(nb_sigma) < nelec).astype(jnp.float64)
+			f_occ = (jnp.arange(meta.nb_sigma) < meta.nelec).astype(jnp.float64)
 			Gij_new = jnp.einsum('kim,m,kjm->kij', U_full, f_occ, jnp.conj(U_full), optimize=True)
 			
 			# Compute new Σ using original wavefunctions but updated G_ij
@@ -1275,7 +1273,7 @@ def main(argv=None):
 		
 		# Restore final Σ
 		sigma_final = result.x.reshape(nk, n_upper)
-		sigma_total_full = upper_flat_to_hermitian(sigma_final, nb_sigma)
+		sigma_total_full = upper_flat_to_hermitian(sigma_final, meta.nb_sigma)
 		
 		# Final diagonalization
 		H_qp_mnk = kin_ion_full + sigma_total_full
@@ -1283,10 +1281,10 @@ def main(argv=None):
 		E_full, U_full = jax.vmap(jnp.linalg.eigh, in_axes=0)(H_qp_mnk)
 		
 		# Get final components for output
-		f_occ = (jnp.arange(nb_sigma) < nelec).astype(jnp.float64)
+		f_occ = (jnp.arange(meta.nb_sigma) < meta.nelec).astype(jnp.float64)
 		Gij_final = jnp.einsum('kim,m,kjm->kij', U_full, f_occ, jnp.conj(U_full), optimize=True)
 		
-		print_scf_diagnostics(Gij_final, U_full, nelec, nb_sigma, print0)
+		print_scf_diagnostics(Gij_final, U_full, meta.nelec, meta.nb_sigma, print0)
 
 		with mesh_xy:
 			sig_sx  = sigma_sx(wfns, Gij_final, W_flat)
@@ -1449,7 +1447,7 @@ def main(argv=None):
 			os.path.join(input_dir, "eqp1.dat"),
 			energies_dft_ev_host, energies_qp_ev_host,
 			H_oneshot_diag * ryd2ev,
-			meta.nkx, meta.nky, meta.nkz, nb_sigma,
+			meta.nkx, meta.nky, meta.nkz, meta.nb_sigma,
 		)
 	elif (not self_consistent) and meta.rank == 0 and (sigma_xc_at_dft_ev is not None):
 		# G0W0 comparison: evaluate diagonal (H0 + Sigma_xc(E_DFT)) next to E_DFT.
