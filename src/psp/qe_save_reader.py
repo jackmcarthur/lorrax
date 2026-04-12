@@ -85,6 +85,7 @@ class CrystalData:
     ntran: int                      # number of symmetry operations
     sym_matrices: np.ndarray        # (ntran, 3, 3) int — rotation matrices (crystal coords)
     translations: np.ndarray        # (ntran, 3) float — fractional translations × 2π (BGW convention)
+    sym_time_rev: np.ndarray        # (ntran,) bool — True if operation includes time reversal
 
     # ── Electronic / grid ──
     nelec: float
@@ -130,24 +131,29 @@ class CrystalData:
 
         # ── symmetry operations ──
         sym_elems = _all(root, "symmetry")
-        rotations, frac_trans = [], []
-        for sym in sym_elems:
-            rot_elem = [c for c in sym if c.tag.split("}")[-1] == "rotation"]
-            ft_elem = [c for c in sym if c.tag.split("}")[-1] == "fractional_translation"]
-            if not rot_elem:
+        rotations, frac_trans, has_time_rev = [], [], []
+        for sym_elem in sym_elems:
+            children = {c.tag.split("}")[-1]: c for c in sym_elem}
+            if "rotation" not in children:
                 continue
-            R = _vec(rot_elem[0].text).reshape(3, 3)
+            R = _vec(children["rotation"].text).reshape(3, 3)
             rotations.append(np.round(R).astype(int))
-            tau = _vec(ft_elem[0].text) if ft_elem else np.zeros(3)
-            # Convert from crystal coords to BGW convention (× 2π)
-            frac_trans.append(tau * 2.0 * np.pi)
+            tau = (_vec(children["fractional_translation"].text)
+                   if "fractional_translation" in children else np.zeros(3))
+            frac_trans.append(tau * 2.0 * np.pi)  # BGW convention
+            # QE marks operations that include time reversal
+            info = children.get("info")
+            tr = (info is not None and info.attrib.get("time_reversal") == "true")
+            has_time_rev.append(tr)
 
         ntran = len(rotations)
         # Pad to 48 (WFNReader convention: always 48 slots)
         sym_matrices = np.zeros((48, 3, 3), dtype=np.int32)
         translations = np.zeros((48, 3), dtype=np.float64)
+        sym_time_rev = np.zeros(48, dtype=bool)
         sym_matrices[:ntran] = np.array(rotations)
         translations[:ntran] = np.array(frac_trans)
+        sym_time_rev[:ntran] = np.array(has_time_rev)
 
         # ── electronic ──
         nelec = float(_text(root, "nelec"))
@@ -174,6 +180,7 @@ class CrystalData:
             cell_volume=cell_volume, nat=nat,
             atom_crys=atom_crys, atom_types=atom_types,
             ntran=ntran, sym_matrices=sym_matrices, translations=translations,
+            sym_time_rev=sym_time_rev,
             nelec=nelec, nspin=nspin, nspinor=nspinor,
             ecutwfc=ecutwfc, ecutrho=ecutrho, fft_grid=fft_grid,
             nbands=nbands, nkpts=0, kgrid=kgrid, _save_dir=save_dir,
@@ -183,18 +190,28 @@ class CrystalData:
     def build_kgrid(
         self,
         nk: np.ndarray | tuple[int, int, int] = (4, 4, 4),
-        time_reversal: bool = True,
+        *,
+        nosym: bool = False,
+        noinv: bool = False,
+        no_t_rev: bool = False,
+        force_symmorphic: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Generate a Gamma-centred Monkhorst-Pack grid, reduced to the IBZ.
 
-        Reproduces QE's ``kpoint_grid.f90`` algorithm exactly: same
-        enumeration order, forward-only equivalence marking, and optional
-        time-reversal symmetry.
+        Matches QE's ``kpoint_grid.f90`` algorithm with the same symmetry
+        flags as ``pw.x``:
 
         Parameters
         ----------
-        nk : (3,) int — grid dimensions (e.g. (4, 4, 4))
-        time_reversal : bool — apply k ↔ −k (True unless magnetic)
+        nk : (3,) int — grid dimensions
+        nosym : bool — disable all spatial symmetries.  The grid is still
+            folded by time reversal (k ↔ −k) unless noinv is also True.
+        noinv : bool — disable k ↔ −k (time reversal) in grid reduction.
+        no_t_rev : bool — disable symmetry operations that include time
+            reversal (rotation + TR).  For non-magnetic systems this has
+            no effect since all operations are purely spatial.
+        force_symmorphic : bool — drop operations with nonzero fractional
+            translation (glide planes, screw axes).
 
         Returns
         -------
@@ -202,8 +219,33 @@ class CrystalData:
         weights : (n_ibz,) float64 — weights summing to 1
         """
         nk = np.asarray(nk, dtype=int)
-        return _reduce_mp_to_ibz(nk, self.sym_matrices[:self.ntran],
-                                  time_reversal=time_reversal)
+        sym = self.sym_matrices[:self.ntran].copy()
+        tau = self.translations[:self.ntran].copy()
+
+        t_rev = self.sym_time_rev[:self.ntran].copy()
+
+        if nosym:
+            # Identity only
+            sym = sym[:1]
+        else:
+            keep = np.ones(len(sym), dtype=bool)
+
+            if force_symmorphic:
+                # Drop operations with nonzero fractional translation
+                for i in range(len(sym)):
+                    if not np.allclose(tau[i], 0.0, atol=1e-8):
+                        keep[i] = False
+
+            if no_t_rev:
+                # Drop operations that are rotation + time reversal
+                for i in range(len(sym)):
+                    if t_rev[i]:
+                        keep[i] = False
+
+            sym = sym[keep]
+
+        time_reversal = not noinv
+        return _reduce_mp_to_ibz(nk, sym, time_reversal=time_reversal)
 
     # ------------------------------------------------------------------
     def load_charge_density(self) -> tuple[np.ndarray, np.ndarray]:
