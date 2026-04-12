@@ -1,9 +1,9 @@
 """GN-PPM construction from W(0), W(i*omega_p) and sigma_c frequency integration.
 
-This module is designed to reuse the existing GW helpers rather than duplicate
-FFT/projection logic:
-  - chi/W evaluation reuses ``w_isdf.compute_chi0`` and ``w_isdf.solve_w_from_chi_q_jax``.
-  - sigma projection/convolution reuses callables supplied by ``gw_jax``.
+This module reuses existing GW helpers:
+  - chi/W evaluation: w_isdf.compute_chi0 and w_isdf.solve_w_from_chi_q_jax
+  - G builder: greens_function_kernel.build_G
+  - band projection: projection_kernel.project_ri
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 import h5py
 
-from common.minimax import G_hgl as _G_hgl, G_fermi as _G_fermi
 from common import jax_profile
 from .minimax_config import MinimaxConfig, SigmaQuadratureConfig
 from .minimax_screening import (
@@ -34,12 +33,11 @@ from . import w_isdf
 @dataclass(frozen=True)
 class PPMBuildResult:
     omega_p: float
-    W0_q: jax.Array
-    Wiwp_q: jax.Array
-    Wc0_mu_nu: jax.Array
-    B_mu_nu: jax.Array
-    Omega_mu_nu: jax.Array
-    valid_mask_mu_nu: jax.Array
+    W0_q: jax.Array           # (nq, μ, μ) flat-q
+    Wiwp_q: jax.Array         # (nq, μ, μ) flat-q
+    B_q: jax.Array            # (nq, μ, μ) PPM amplitude
+    Omega_q: jax.Array        # (nq, μ, μ) PPM pole frequency
+    valid_mask_q: jax.Array   # (nq, μ, μ)
     unfulfilled_fraction: float
     n_nodes_static: int
 
@@ -49,32 +47,28 @@ class SigmaOmegaResult:
     omega_ry: np.ndarray
     omega_ev: np.ndarray
     sigma_c_kij: jax.Array | None      # (n_omega, nk, nb, nb) or None if streamed
-    sigma_kij_h5_path: str | None = None  # path to streamed h5 if applicable
+    sigma_kij_h5_path: str | None = None
 
 
 @dataclass(frozen=True)
 class _SigmaWindow:
     name: str
-    t_nodes: np.ndarray        # (n_tau,) minimax quadrature nodes
-    alpha: np.ndarray           # (n_tau,) minimax quadrature weights
-    mask_A: np.ndarray          # (nk, nb) band mask for A channel
-    mask_B: np.ndarray | None   # (nk, nb) band mask for B channel
-    E_ref_A: float              # energy reference for A channel phases
-    E_ref_B: float              # energy reference for B channel phases
-    omega_sign: int             # +1 or -1 for frequency sign convention
-    project: str                # "full", "real", or "imag"
-    prefactor: float            # overall sign/scale prefactor
-    mask_B_mode: str = "explicit"     # how to build mask_B: "explicit", "all", "le_t", "gt_t"
-    mask_B_threshold: float | None = None  # threshold for le_t/gt_t modes
-    crossing_kind: str | None = None  # "hgl" for crossing windows
+    t_nodes: np.ndarray        # (n_tau,)
+    alpha: np.ndarray          # (n_tau,)
+    mask_A: np.ndarray         # (nk, nb)
+    mask_B: np.ndarray | None  # (nk, nb)
+    E_ref_A: float
+    E_ref_B: float
+    omega_sign: int
+    project: str               # "full", "real", or "imag"
+    prefactor: float
+    mask_B_mode: str = "explicit"
+    mask_B_threshold: float | None = None
+    crossing_kind: str | None = None
 
-
-def _mu_nu_sharding(mesh_xy: Mesh) -> NamedSharding:
-    # (mu, nu, kx, ky, kz) with mu/nu split across x/y mesh axes.
-    return NamedSharding(mesh_xy, P("x", "y", None, None, None))
 
 def _to_host_np(a, dtype=np.complex128, *, tiled: bool = False):
-    """Gather a possibly sharded array to host without assuming single-process JAX."""
+    """Gather a possibly sharded array to host."""
     try:
         return np.asarray(
             jax.experimental.multihost_utils.process_allgather(a, tiled=tiled),
@@ -85,16 +79,13 @@ def _to_host_np(a, dtype=np.complex128, *, tiled: bool = False):
 
 
 def _to_host_scalar(a, dtype=float):
-    """Fetch one replicated scalar to host, tolerating multihost arrays."""
-
     np_dtype = np.dtype(dtype)
     gathered = _to_host_np(jnp.asarray(a), dtype=np_dtype, tiled=False)
     return dtype(np.asarray(gathered).reshape(-1)[0])
 
 
 def _masked_stats_device(values: jax.Array, mask: jax.Array) -> tuple[int, int, float | None, float | None]:
-    """Return total size, masked count, and masked min/max using only scalar host fetches."""
-
+    """Return total size, masked count, and masked min/max."""
     total = int(np.prod(values.shape))
     count = int(_to_host_scalar(jnp.sum(mask, dtype=jnp.int64), int))
     if count == 0:
@@ -108,10 +99,9 @@ def _materialize_window_mask_B(
     window: _SigmaWindow,
     *,
     base_mask_B: jax.Array,
-    Omega_mu_nu: jax.Array,
+    Omega_q: jax.Array,
 ) -> jax.Array:
     """Build one window's B-side selector lazily on device."""
-
     mode = str(window.mask_B_mode)
     if mode == "explicit":
         if window.mask_B is None:
@@ -119,11 +109,11 @@ def _materialize_window_mask_B(
         return jnp.asarray(window.mask_B, dtype=bool)
     if mode == "all":
         return jnp.asarray(base_mask_B, dtype=bool)
-    threshold = jnp.asarray(window.mask_B_threshold, dtype=Omega_mu_nu.dtype)
+    threshold = jnp.asarray(window.mask_B_threshold, dtype=Omega_q.dtype)
     if mode == "le_t":
-        return jnp.asarray(base_mask_B, dtype=bool) & (Omega_mu_nu <= threshold)
+        return jnp.asarray(base_mask_B, dtype=bool) & (Omega_q <= threshold)
     if mode == "gt_t":
-        return jnp.asarray(base_mask_B, dtype=bool) & (Omega_mu_nu > threshold)
+        return jnp.asarray(base_mask_B, dtype=bool) & (Omega_q > threshold)
     raise ValueError(f"Unknown mask_B_mode={mode!r}")
 
 
@@ -141,8 +131,8 @@ def _project_sigma_channels(
     """Apply one window projection to precomputed real/imag sigma channels."""
 
     def _full(_):
-        sigma_tau_kij_full = sigma_tau_kij_re[None, ...] + 1j * sigma_tau_kij_im[None, ...]
-        return (coeff_re + 1j * coeff_im) * sigma_tau_kij_full
+        sigma_full = sigma_tau_kij_re[None, ...] + 1j * sigma_tau_kij_im[None, ...]
+        return (coeff_re + 1j * coeff_im) * sigma_full
 
     def _imag(_):
         return coeff_re * sigma_tau_kij_im[None, ...] + coeff_im * sigma_tau_kij_re[None, ...]
@@ -207,10 +197,7 @@ def _get_sigma_channel_pipeline(
 ) -> Callable[..., jax.Array]:
     """Return a jit-compatible sigma-channel pipeline with device-local FFTs."""
 
-    pipeline_key = (
-        id(mesh_xy),
-        nkx, nky, nkz, nk_tot, bispinor,
-    )
+    pipeline_key = (id(mesh_xy), nkx, nky, nkz, nk_tot, bispinor)
     if pipeline_key in _sigma_channel_pipeline_cache:
         return _sigma_channel_pipeline_cache[pipeline_key]
 
@@ -220,9 +207,8 @@ def _get_sigma_channel_pipeline(
     )
 
     w_isdf._ensure_compilation_cache()
-    # Flat-k FFT helpers (same pattern as gw_jax.py)
-    _G_spec = P(None, None, None, None, 'x', None, 'y')  # (kx,ky,kz, s,μ_X,s,μ_Y)
-    _V_spec = P(None, None, None, 'x', 'y')               # (kx,ky,kz, μ_X,μ_Y)
+    _G_spec = P(None, None, None, None, 'x', None, 'y')
+    _V_spec = P(None, None, None, 'x', 'y')
     _G_shard = NamedSharding(mesh_xy, _G_spec)
     _V_shard = NamedSharding(mesh_xy, _V_spec)
     _G_ifftn = make_jittable_local_ifftn_3d(mesh_xy, _G_spec, _G_spec, norm='ortho', axes=(0, 1, 2))
@@ -247,12 +233,13 @@ def _get_sigma_channel_pipeline(
         psi_coh_rmuT_X, psi_coh_rmu_Y, psi_proj_rmu_X, psi_proj_rmuT_Y,
         Gij, W_q,
     ):
-        """Σ_kij = project[ FFT[ G(R) · W(R) / √Nk ] ].  All flat-k."""
+        """Σ_kij = project[ FFT[ G(R) · W(R) / √Nk ] ].  All flat-k.
+
+        W_q is (nq, μ, μ) flat-q — same layout as all other flat-k arrays.
+        """
         G_k = _build_G(psi_coh_rmuT_X, psi_coh_rmu_Y, Gij=Gij)
         G_R = _fft_flat_G(G_k, _G_ifftn)
-        # W_q is (μ, μ, nk) from PPM; transpose to (nk, μ, μ) for flat-k FFT
-        W_flat = W_q.transpose(2, 0, 1) if W_q.ndim == 3 else W_q
-        V_R = _fft_flat_V(W_flat)[:, None, :, None, :]  # broadcast to G shape
+        V_R = _fft_flat_V(W_q)[:, None, :, None, :]  # (nk,1,μ,1,μ) broadcast to G shape
         sigma_k = _fft_flat_G(G_R * V_R * inv_sqrt_nk, _G_fftn)
         return _project_channels(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_k)
 
@@ -271,83 +258,55 @@ def _get_sigma_tau_channel_kernel(
 ) -> Callable[..., jax.Array]:
     """Return a cached tau-node sigma builder with jittable local FFTs."""
 
-    cache_key = (
-        id(mesh_xy), nkx, nky, nkz, nk_tot, bispinor,
-    )
+    cache_key = (id(mesh_xy), nkx, nky, nkz, nk_tot, bispinor)
     if cache_key in _sigma_tau_channel_kernel_cache:
         return _sigma_tau_channel_kernel_cache[cache_key]
 
     w_isdf._ensure_compilation_cache()
-    mu_shard = _mu_nu_sharding(mesh_xy)
+    q_mu_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     sigma_channel_pipeline = _get_sigma_channel_pipeline(
-        mesh_xy=mesh_xy,
-        nkx=nkx,
-        nky=nky,
-        nkz=nkz,
-        nk_tot=nk_tot,
-        bispinor=bispinor,
+        mesh_xy=mesh_xy, nkx=nkx, nky=nky, nkz=nkz,
+        nk_tot=nk_tot, bispinor=bispinor,
     )
 
     @jax.jit
     def _build_tau_operands(
-        E_A: jax.Array,
-        mask_A: jax.Array,
-        B_mu_nu: jax.Array,
-        Omega_mu_nu: jax.Array,
-        mask_B: jax.Array,
-        E_ref_A: jax.Array,
-        E_ref_B: jax.Array,
-        t_node: jax.Array,
-        eye_nb: jax.Array,
-    ) -> tuple[jax.Array, jax.Array]:
+        E_A, mask_A, B_q, Omega_q, mask_B,
+        E_ref_A, E_ref_B, t_node, eye_nb,
+    ):
         phase_A = jnp.exp(-1j * (E_A - E_ref_A) * t_node)
         weights_kn = jnp.where(mask_A, phase_A, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
         Gij = eye_nb[None, :, :] * weights_kn[:, :, None]
 
-        phase_B = jnp.exp(-1j * (Omega_mu_nu - E_ref_B) * t_node)
-        W_t_q = jnp.where(mask_B, B_mu_nu * phase_B, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
-        W_t_q = jax.lax.with_sharding_constraint(W_t_q, mu_shard)
+        phase_B = jnp.exp(-1j * (Omega_q - E_ref_B) * t_node)
+        W_t_q = jnp.where(mask_B, B_q * phase_B, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
+        W_t_q = jax.lax.with_sharding_constraint(W_t_q, q_mu_shard)
         return Gij, W_t_q
 
     @jax.jit
     def _tau_channel_step(
-        psi_coh_rmuT_X: jax.Array,
-        psi_coh_rmu_Y: jax.Array,
-        psi_proj_rmu_X: jax.Array,
-        psi_proj_rmuT_Y: jax.Array,
-        E_A: jax.Array,
-        mask_A: jax.Array,
-        B_mu_nu: jax.Array,
-        Omega_mu_nu: jax.Array,
-        mask_B: jax.Array,
-        E_ref_A: jax.Array,
-        E_ref_B: jax.Array,
-        t_node: jax.Array,
-        eye_nb: jax.Array,
-    ) -> jax.Array:
+        psi_coh_rmuT_X, psi_coh_rmu_Y,
+        psi_proj_rmu_X, psi_proj_rmuT_Y,
+        E_A, mask_A, B_q, Omega_q, mask_B,
+        E_ref_A, E_ref_B, t_node, eye_nb,
+    ):
         Gij, W_t_q = _build_tau_operands(
-            E_A,
-            mask_A,
-            B_mu_nu,
-            Omega_mu_nu,
-            mask_B,
-            E_ref_A,
-            E_ref_B,
-            t_node,
-            eye_nb,
+            E_A, mask_A, B_q, Omega_q, mask_B,
+            E_ref_A, E_ref_B, t_node, eye_nb,
         )
         return sigma_channel_pipeline(
-            psi_coh_rmuT_X,
-            psi_coh_rmu_Y,
-            psi_proj_rmu_X,
-            psi_proj_rmuT_Y,
-            Gij,
-            W_t_q,
+            psi_coh_rmuT_X, psi_coh_rmu_Y,
+            psi_proj_rmu_X, psi_proj_rmuT_Y,
+            Gij, W_t_q,
         )
 
     _sigma_tau_channel_kernel_cache[cache_key] = _tau_channel_step
     return _tau_channel_step
 
+
+# ---------------------------------------------------------------------------
+#  PPM construction
+# ---------------------------------------------------------------------------
 
 def compute_w0_wiwp_and_ppm_from_minimax(
     V_qmunu: jax.Array,
@@ -366,7 +325,7 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     print0=print,
 ) -> PPMBuildResult:
     """Build GN-PPM parameters from minimax W(0) and W(i*omega_p)."""
-    import time as _ppm_time
+    import time as _t
 
     if minimax_config is not None:
         target_error = float(minimax_config.target_error)
@@ -387,15 +346,13 @@ def compute_w0_wiwp_and_ppm_from_minimax(
     enk_v = wf_bundle.enk[:, s.val]
     enk_c = wf_bundle.enk[:, s.cond]
     e_ref = w_isdf.resolve_minimax_energy_reference(
-        enk_v,
-        enk_c,
+        enk_v, enk_c,
         reference=minimax_energy_reference,
         reference_fn=minimax_energy_reference_fn,
     )
 
     _windows_minimax, quad = build_static_minimax_window_pair(
-        enk_v,
-        enk_c,
+        enk_v, enk_c,
         minimax_config=minimax_config,
         target_error=target_error,
         max_nodes=max_nodes,
@@ -403,91 +360,83 @@ def compute_w0_wiwp_and_ppm_from_minimax(
         print_fn=print0,
     )
 
-    # Fresh minimax for chi0(i*omega_p): approximates x/(x^2+omega_p^2)
-    # Fresh minimax for chi0(i*omega_p): approximates x/(x^2+omega_p^2)
-    # directly, instead of cos-reweighting the static nodes (which is wrong).
+    # Minimax for chi0(i*omega_p): approximates x/(x^2+omega_p^2)
     quad_imag = solve_laplace_minimax_imag_interval(
         quad.x_min, quad.x_max, omega_p_ry,
         target_error=target_error,
         max_nodes=max_nodes,
     )
     R = quad_imag.x_max / quad_imag.x_min
-    omega_hat = omega_p_ry / quad_imag.x_min
     print0(
-        f"  Minimax imag-freq window (ωp={omega_p_ry:.4f} Ry): "
-        f"x=[{quad_imag.x_min:.6e}, {quad_imag.x_max:.6e}] Ry, "
-        f"R={R:.2f}, ω̂={omega_hat:.2f}, "
-        f"nodes={quad_imag.node_count}, fit_err~{quad_imag.max_error:.3e}"
+        f"  PPM imag-freq window (ωp={omega_p_ry:.4f} Ry): "
+        f"R={R:.1f}, nodes={quad_imag.node_count}, err~{quad_imag.max_error:.1e}"
     )
 
-    _t_chi0 = _ppm_time.perf_counter()
+    t0 = _t.perf_counter()
     chi0_q = w_isdf.compute_chi0_minimax(
         psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
         enk_v, enk_c, quad, meta, mesh_xy,
         energy_reference=e_ref,
     )
     chi0_q.block_until_ready()
-    print0(f"  [TIMING-PPM] chi(0): {_ppm_time.perf_counter() - _t_chi0:.3f}s")
-    _t_chii = _ppm_time.perf_counter()
+    t1 = _t.perf_counter()
     chii_q = w_isdf.compute_chi0_minimax(
         psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
         enk_v, enk_c, quad_imag, meta, mesh_xy,
         energy_reference=e_ref,
     )
     chii_q.block_until_ready()
-    print0(f"  [TIMING-PPM] chi(iωp): {_ppm_time.perf_counter() - _t_chii:.3f}s")
-    # Flatten V for Dyson solve — all arrays flat-q (nq, μ, μ)
+    t2 = _t.perf_counter()
+
+    # All arrays flat-q (nq, μ, μ)
     V_flat = jnp.asarray(V_qmunu)[0, 0, 0].reshape(-1, V_qmunu.shape[-2], V_qmunu.shape[-1])
 
-    _t_w0 = _ppm_time.perf_counter()
     W0_q = w_isdf.solve_w_from_chi_q_jax(V_flat, chi0_q, meta, mesh_xy)
     W0_q.block_until_ready()
-    print0(f"  [TIMING-PPM] W(0): {_ppm_time.perf_counter() - _t_w0:.3f}s")
-    _t_wi = _ppm_time.perf_counter()
+    t3 = _t.perf_counter()
     Wiwp_q = w_isdf.solve_w_from_chi_q_jax(V_flat, chii_q, meta, mesh_xy)
     Wiwp_q.block_until_ready()
-    print0(f"  [TIMING-PPM] W(iωp): {_ppm_time.perf_counter() - _t_wi:.3f}s")
+    t4 = _t.perf_counter()
 
-    n_rmu = W0_q.shape[1]
-
-    # W^c = W - V, all flat-q (nq, μ, μ)
     Wc0_q = W0_q - V_flat
     Wci_q = Wiwp_q - V_flat
 
-    _t_fit = _ppm_time.perf_counter()
     omega_qmunu, b_qmunu, valid_qmunu, unfulfilled = fit_gn_ppm_from_wc_pair(
         Wc0_q, Wci_q, 1j * complex(omega_p_ry), fallback_omega=float(fallback_omega))
-    print0(f"  [TIMING-PPM] GN fit: {_ppm_time.perf_counter() - _t_fit:.3f}s")
+    t5 = _t.perf_counter()
 
-    # Transpose PPM params from (nq, μ, μ) to (μ, μ, nq) for sigma pipeline
-    _t_layout = _ppm_time.perf_counter()
-    _to_munu = lambda x: jax.lax.with_sharding_constraint(
-        jnp.asarray(x).transpose(1, 2, 0),
-        NamedSharding(mesh_xy, P('x', 'y', None)))
-    Omega = _to_munu(omega_qmunu)
-    B = _to_munu(b_qmunu)
-    valid_mask = _to_munu(valid_qmunu)
-    Wc0_mu_nu = _to_munu(Wc0_q)
-    print0(f"  [TIMING-PPM] q->mu,nu layout: {_ppm_time.perf_counter() - _t_layout:.3f}s")
+    # Shard PPM arrays as flat-q (nq, μ, μ) — no transpose needed
+    q_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    Omega = jax.lax.with_sharding_constraint(jnp.asarray(omega_qmunu), q_shard)
+    B = jax.lax.with_sharding_constraint(jnp.asarray(b_qmunu), q_shard)
+    valid_mask = jax.lax.with_sharding_constraint(jnp.asarray(valid_qmunu), q_shard)
 
-    print0(f"  GN-PPM: ωp={omega_p_ry:.6f} Ry, unfulfilled={100.0 * unfulfilled:.2f}%")
+    print0(
+        f"  PPM build: χ(0)={t1-t0:.2f}s  χ(iωp)={t2-t1:.2f}s  "
+        f"W(0)={t3-t2:.2f}s  W(iωp)={t4-t3:.2f}s  GN-fit={t5-t4:.2f}s"
+    )
+    print0(f"  GN-PPM: ωp={omega_p_ry:.4f} Ry, unfulfilled={100.0 * unfulfilled:.2f}%")
+
     return PPMBuildResult(
         omega_p=omega_p_ry,
         W0_q=W0_q,
         Wiwp_q=Wiwp_q,
-        Wc0_mu_nu=Wc0_mu_nu,
-        B_mu_nu=B,
-        Omega_mu_nu=Omega,
-        valid_mask_mu_nu=valid_mask,
+        B_q=B,
+        Omega_q=Omega,
+        valid_mask_q=valid_mask,
         unfulfilled_fraction=unfulfilled,
         n_nodes_static=quad.node_count,
     )
+
+
+# ---------------------------------------------------------------------------
+#  Minimax window construction
+# ---------------------------------------------------------------------------
 
 def _build_single_sigma_window(
     *,
     E_A: np.ndarray,
     base_mask_A: np.ndarray,
-    mask_B_total: int,
     mask_B_count: int,
     mask_B_min: float | None,
     mask_B_max: float | None,
@@ -509,13 +458,11 @@ def _build_single_sigma_window(
     else:
         x_max = max(S_max, x_min * (1.0 + 1.0e-9))
     q = solve_laplace_minimax_interval(
-        x_min,
-        x_max,
+        x_min, x_max,
         target_error=target_error,
         max_nodes=max_nodes,
         use_shipped_tables=use_shipped_tables,
     )
-
     prefactor = 1.0 if kernel_sign == +1 else -1.0
     return [
         _SigmaWindow(
@@ -538,7 +485,6 @@ def _build_three_sigma_windows(
     *,
     E_A: np.ndarray,
     base_mask_A: np.ndarray,
-    mask_B_total: int,
     mask_B_all_count: int,
     mask_B_le_count: int,
     mask_B_le_min: float | None,
@@ -584,8 +530,6 @@ def _build_three_sigma_windows(
             continue
 
         A_vals = E_A[mA]
-        S_min = float(np.min(A_vals) + B_min)
-        S_max = float(np.max(A_vals) + B_max)
         E_ref_A = float(np.min(A_vals))
         E_ref_B = float(B_min)
 
@@ -602,14 +546,14 @@ def _build_three_sigma_windows(
             t_nodes = np.asarray(q_cross.tau / xi, dtype=np.complex128)
             alpha = np.asarray(q_cross.alpha / xi, dtype=np.float64)
             project = "imag"
-            # Explicit sign in front of core contribution.
             prefactor = -1.0
         else:
+            S_min = float(np.min(A_vals) + B_min)
+            S_max = float(np.max(A_vals) + B_max)
             x_min = max(S_min - (T - z_edge), z_edge, 1.0e-12)
             x_max = max(S_max, x_min * (1.0 + 1.0e-9))
             q = solve_laplace_minimax_interval(
-                x_min,
-                x_max,
+                x_min, x_max,
                 target_error=target_error,
                 max_nodes=max_nodes,
                 use_shipped_tables=use_shipped_tables,
@@ -638,14 +582,19 @@ def _build_three_sigma_windows(
         )
     return windows
 
+
+# ---------------------------------------------------------------------------
+#  Sigma convolution
+# ---------------------------------------------------------------------------
+
 def _convolve_sigma_branch_kij(
     *,
     omega_nonneg_ry: np.ndarray,
     omega_global_idx: np.ndarray,
     E_A: jax.Array,
     base_mask_A: jax.Array,
-    B_mu_nu: jax.Array,
-    Omega_mu_nu: jax.Array,
+    B_q: jax.Array,
+    Omega_q: jax.Array,
     base_mask_B: jax.Array,
     kernel_sign: int,
     regularization_width_ry: float,
@@ -654,61 +603,50 @@ def _convolve_sigma_branch_kij(
     max_nodes: int,
     crossing_eps_q: float,
     crossing_max_nodes: int,
-    psi_coh_rmuT_X: jax.Array,
-    psi_coh_rmu_Y: jax.Array,
-    psi_proj_rmu_X: jax.Array,
-    psi_proj_rmuT_Y: jax.Array,
-    nkx: int,
-    nky: int,
-    nkz: int,
-    nk_tot: int,
-    bispinor: bool,
+    wfns,
     mesh_xy: Mesh,
+    meta,
     omega_sign_flip: int = 1,
     log_tag: str = "",
     print0=print,
     omega_batch_size: int = 4,
     stream_writer: Callable[[np.ndarray, jax.Array], None] | None = None,
     scale: float = 1.0,
-    efermi_vac: float | None = None,
-    axis_kind: str = "",
     use_shipped_minimax_tables: bool = True,
 ) -> tuple[jax.Array, list[_SigmaWindow]]:
-    """Convolve sigma in one pass, accumulating directly in (k,i,j) space.
+    """Convolve sigma for one branch (cond or val), accumulating in (k,i,j) space."""
 
-    The exact reduced-storage path contracts each complex τ-node contribution
-    to two band-space channels [K[Re X_tau], K[Im X_tau]] and then mixes those
-    channels with scalar frequency coefficients. This preserves the required
-    per-window Re/Im projection without storing Σ_k(μ,ν,ω).
-    """
-    import time as _btime
-    _bprof = bool(os.environ.get("LORRAX_PROFILE_PPM", ""))
-    _b0 = _btime.perf_counter()
     omega_nonneg_ry = np.asarray(omega_nonneg_ry, dtype=np.float64)
     n_omega = int(omega_nonneg_ry.shape[0])
+    s = wfns.slices
+    nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
+    nk_tot = int(meta.nk_tot)
+    bispinor = bool(meta.bispinor)
+    psi_coh_rmuT_X = wfns.xn(s.full)
+    psi_coh_rmu_Y = wfns.yr(s.full)
+    psi_proj_rmu_X = wfns.xr(s.sigma)
+    psi_proj_rmuT_Y = wfns.yn(s.sigma)
+    nk_proj = int(psi_proj_rmu_X.shape[0])
+    nb_proj = int(psi_proj_rmu_X.shape[1])
+
     if n_omega == 0:
-        nk_proj = int(psi_proj_rmu_X.shape[0])
-        nb_proj = int(psi_proj_rmu_X.shape[1])
         return jnp.zeros((0, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), []
 
     E_A_host = _to_host_np(E_A, dtype=np.float64, tiled=False)
     base_A_host = _to_host_np(base_mask_A, dtype=bool, tiled=False)
-    if _bprof:
-        _b1 = _btime.perf_counter()
-        print0(f"  [TIMING-BRANCH] {log_tag} device_get pre-loop: {_b1-_b0:.3f}s")
 
-    mask_B_total, mask_B_all_count, mask_B_all_min, mask_B_all_max = _masked_stats_device(
-        Omega_mu_nu, base_mask_B
+    _, mask_B_all_count, mask_B_all_min, mask_B_all_max = _masked_stats_device(
+        Omega_q, base_mask_B
     )
     if kernel_sign == +1 and float(np.max(omega_nonneg_ry)) > 1.0e-14:
         omega_max = float(np.max(omega_nonneg_ry))
         xi = max(float(regularization_width_ry), 1.0e-12)
         z_edge = float(edge_factor) * xi
         T = omega_max + z_edge
-        le_mask_B = base_mask_B & (Omega_mu_nu <= T)
-        gt_mask_B = base_mask_B & (Omega_mu_nu > T)
-        _, mask_B_le_count, mask_B_le_min, mask_B_le_max = _masked_stats_device(Omega_mu_nu, le_mask_B)
-        _, mask_B_gt_count, mask_B_gt_min, mask_B_gt_max = _masked_stats_device(Omega_mu_nu, gt_mask_B)
+        le_mask_B = base_mask_B & (Omega_q <= T)
+        gt_mask_B = base_mask_B & (Omega_q > T)
+        _, mask_B_le_count, mask_B_le_min, mask_B_le_max = _masked_stats_device(Omega_q, le_mask_B)
+        _, mask_B_gt_count, mask_B_gt_min, mask_B_gt_max = _masked_stats_device(Omega_q, gt_mask_B)
         windows = _build_three_sigma_windows(
             E_A=E_A_host,
             base_mask_A=base_A_host,
@@ -732,6 +670,9 @@ def _convolve_sigma_branch_kij(
         windows = _build_single_sigma_window(
             E_A=E_A_host,
             base_mask_A=base_A_host,
+            mask_B_count=mask_B_all_count,
+            mask_B_min=mask_B_all_min,
+            mask_B_max=mask_B_all_max,
             omega_nonneg_ry=omega_nonneg_ry,
             kernel_sign=kernel_sign,
             target_error=target_error,
@@ -739,41 +680,29 @@ def _convolve_sigma_branch_kij(
             use_shipped_tables=bool(use_shipped_minimax_tables),
         )
 
-    nk_proj = int(psi_proj_rmu_X.shape[0])
-    nb_proj = int(psi_proj_rmu_X.shape[1])
     if not windows:
         return jnp.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), windows
 
-    if _bprof:
-        n_nodes_total = int(sum(int(win.alpha.shape[0]) for win in windows))
+    # Per-window summary
+    for win in windows:
+        A_vals = E_A_host[win.mask_A]
+        kind = "crossing" if win.crossing_kind else "Laplace"
         print0(
-            f"  [TIMING-BRANCH] {log_tag} windows built: "
-            f"count={len(windows)}, total_nodes={n_nodes_total}, "
-            f"kernel_sign={kernel_sign:+d}, axis={axis_kind or 'unknown'}"
+            f"    {log_tag} window \"{win.name}\" ({kind}): "
+            f"{int(win.alpha.shape[0])} nodes, err<{target_error:.0e}, "
+            f"E_A=[{float(np.min(A_vals)):.4f}, {float(np.max(A_vals)):.4f}] Ry, "
+            f"project={win.project}"
         )
 
     eye_nb = jnp.eye(E_A.shape[1], dtype=jnp.complex128)
     omega_vec = jnp.asarray(omega_nonneg_ry, dtype=jnp.float64)
     tau_channel_step = _get_sigma_tau_channel_kernel(
-        mesh_xy=mesh_xy,
-        nkx=nkx,
-        nky=nky,
-        nkz=nkz,
-        nk_tot=nk_tot,
-        bispinor=bispinor,
+        mesh_xy=mesh_xy, nkx=nkx, nky=nky, nkz=nkz,
+        nk_tot=nk_tot, bispinor=bispinor,
     )
     acc_total = None
     if stream_writer is None:
         acc_total = jnp.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128)
-
-    import time as _time
-    _prof_enabled = bool(os.environ.get("LORRAX_PROFILE_PPM", ""))
-    _prof_t = {"tau_channel": 0.0, "omega_acc": 0.0, "total": 0.0}
-    _prof_n = 0
-    _prof_total_start = _time.perf_counter()
-    _first_tau_traced = False
-    _first_tau_logged = False
-    _first_omega_logged = False
 
     branch_label = log_tag if log_tag else f"kernel_sign={kernel_sign:+d}"
     with jax_profile.annotation(f"sigma_branch[{branch_label}]"):
@@ -785,155 +714,59 @@ def _convolve_sigma_branch_kij(
             ):
                 mask_A = jnp.asarray(win.mask_A)
                 mask_B = _materialize_window_mask_B(
-                    win,
-                    base_mask_B=base_mask_B,
-                    Omega_mu_nu=Omega_mu_nu,
+                    win, base_mask_B=base_mask_B, Omega_q=Omega_q,
                 )
                 E_ref_A_j = jnp.asarray(win.E_ref_A, dtype=jnp.float64)
                 E_ref_B_j = jnp.asarray(win.E_ref_B, dtype=jnp.float64)
                 project_code = {"full": 0, "imag": 1}.get(win.project, 2)
                 project_code_j = jnp.asarray(project_code, dtype=jnp.int32)
-                acc_win = None
-                if acc_total is not None:
-                    acc_win = jnp.zeros_like(acc_total)
+                acc_win = jnp.zeros_like(acc_total) if acc_total is not None else None
 
-                for tau_idx, (t_node, alpha_node) in enumerate(zip(win.t_nodes, win.alpha)):
-                    if _prof_enabled:
-                        _t0 = _time.perf_counter()
-                        if not _first_tau_logged:
-                            print0(
-                                f"  [TIMING-BRANCH] {log_tag} first tau start: "
-                                f"window={win.name}, tau_idx={tau_idx}, "
-                                f"nodes={int(win.alpha.shape[0])}, project={win.project}"
-                            )
-                            _first_tau_logged = True
+                for t_node, alpha_node in zip(win.t_nodes, win.alpha):
                     t_node_j = jnp.asarray(t_node, dtype=jnp.complex128)
-                    if _prof_enabled and not _first_tau_traced:
-                        with jax_profile.trace_section("ppm_sigma_first_tau"):
-                            with mesh_xy:
-                                sigma_tau_kij_ri = tau_channel_step(
-                                    psi_coh_rmuT_X,
-                                    psi_coh_rmu_Y,
-                                    psi_proj_rmu_X,
-                                    psi_proj_rmuT_Y,
-                                    E_A,
-                                    mask_A,
-                                    B_mu_nu,
-                                    Omega_mu_nu,
-                                    mask_B,
-                                    E_ref_A_j,
-                                    E_ref_B_j,
-                                    t_node_j,
-                                    eye_nb,
-                                )
-                        _first_tau_traced = True
-                    else:
-                        with mesh_xy:
-                            sigma_tau_kij_ri = tau_channel_step(
-                                psi_coh_rmuT_X,
-                                psi_coh_rmu_Y,
-                                psi_proj_rmu_X,
-                                psi_proj_rmuT_Y,
-                                E_A,
-                                mask_A,
-                                B_mu_nu,
-                                Omega_mu_nu,
-                                mask_B,
-                                E_ref_A_j,
-                                E_ref_B_j,
-                                t_node_j,
-                                eye_nb,
-                            )
+                    with mesh_xy:
+                        sigma_tau_kij_ri = tau_channel_step(
+                            psi_coh_rmuT_X, psi_coh_rmu_Y,
+                            psi_proj_rmu_X, psi_proj_rmuT_Y,
+                            E_A, mask_A, B_q, Omega_q, mask_B,
+                            E_ref_A_j, E_ref_B_j, t_node_j, eye_nb,
+                        )
                     sigma_tau_kij_re = sigma_tau_kij_ri[0]
                     sigma_tau_kij_im = sigma_tau_kij_ri[1]
-                    if _prof_enabled:
-                        sigma_tau_kij_re.block_until_ready()
-                        sigma_tau_kij_im.block_until_ready()
-                        _t1 = _time.perf_counter()
-                        _prof_t["tau_channel"] += _t1 - _t0
-                        _t4 = _t1
-                        if _prof_n == 0:
-                            print0(
-                                f"  [TIMING-BRANCH] {log_tag} first tau returned: "
-                                f"{_t1 - _t0:.3f}s"
-                            )
                     alpha_eff = complex(alpha_node) * np.exp(-1j * (win.E_ref_A + win.E_ref_B) * t_node)
                     omega_sign = float(win.omega_sign) * float(omega_sign_flip)
                     alpha_eff_j = jnp.asarray(alpha_eff, dtype=jnp.complex128)
                     omega_sign_j = jnp.asarray(omega_sign, dtype=jnp.float64)
                     pref = jnp.asarray(win.prefactor * scale, dtype=jnp.float64)
                     if acc_win is not None:
-                        if _prof_enabled and not _first_omega_logged:
-                            print0(
-                                f"  [TIMING-BRANCH] {log_tag} first omega_acc start: "
-                                f"window={win.name}, tau_idx={tau_idx}, Nω={n_omega}"
-                            )
                         acc_win = _accumulate_window_channels_jit(
-                            acc_win,
-                            sigma_tau_kij_re,
-                            sigma_tau_kij_im,
-                            omega_vec,
-                            t_node_j,
-                            alpha_eff_j,
-                            omega_sign_j,
-                            pref,
-                            project_code_j,
+                            acc_win, sigma_tau_kij_re, sigma_tau_kij_im,
+                            omega_vec, t_node_j, alpha_eff_j,
+                            omega_sign_j, pref, project_code_j,
                         )
-                        if _prof_enabled:
-                            acc_win.block_until_ready()
-                            _t5 = _time.perf_counter()
-                            _prof_t["omega_acc"] += _t5 - _t4
-                            if not _first_omega_logged:
-                                print0(
-                                    f"  [TIMING-BRANCH] {log_tag} first omega_acc returned: "
-                                    f"{_t5 - _t4:.3f}s"
-                                )
-                                _first_omega_logged = True
-                    _prof_n += 1
-                    if acc_win is None:
-                        # Stream in omega chunks without repeating τ-node work.
+                    else:
                         for ibeg in range(0, n_omega, int(max(1, omega_batch_size))):
                             iend = min(ibeg + int(max(1, omega_batch_size)), n_omega)
                             idx = omega_global_idx[ibeg:iend]
                             omega_batch = omega_vec[ibeg:iend]
                             batch_proj = _project_stream_batch_jit(
-                                omega_batch,
-                                sigma_tau_kij_re,
-                                sigma_tau_kij_im,
-                                t_node_j,
-                                alpha_eff_j,
-                                omega_sign_j,
-                                pref,
-                                project_code_j,
+                                omega_batch, sigma_tau_kij_re, sigma_tau_kij_im,
+                                t_node_j, alpha_eff_j, omega_sign_j,
+                                pref, project_code_j,
                             )
                             stream_writer(idx, batch_proj)
 
                 if acc_win is not None:
                     acc_total = acc_total + acc_win
 
-    _prof_total_end = _time.perf_counter()
-    _prof_t["total"] = _prof_total_end - _prof_total_start
-    if _prof_enabled and _prof_n > 0:
-        print0(f"  [PROFILE] {log_tag} tau-node loop: {_prof_n} iterations, {_prof_t['total']:.3f}s total")
-        print0(f"    tau_channel: {_prof_t['tau_channel']:8.3f}s ({100*_prof_t['tau_channel']/_prof_t['total']:5.1f}%)  avg {_prof_t['tau_channel']/_prof_n:.3f}s/iter")
-        print0(f"    omega_acc: {_prof_t['omega_acc']:8.3f}s ({100*_prof_t['omega_acc']/_prof_t['total']:5.1f}%)  avg {_prof_t['omega_acc']/_prof_n:.3f}s/iter")
-        _overhead = _prof_t['total'] - sum(v for k, v in _prof_t.items() if k != 'total')
-        print0(f"    overhead:  {_overhead:8.3f}s ({100*_overhead/_prof_t['total']:5.1f}%)")
-
-    tag = f"{log_tag} " if log_tag else ""
-    if kernel_sign == +1:
-        n_core = sum(1 for w in windows if w.name == "core")
-        n_ext = sum(1 for w in windows if w.name in ("a_stripe", "b_slab"))
-        print0(f"  {tag}Σ^- windows: core={n_core}, exterior={n_ext}")
-    else:
-        n_tot = len(windows)
-        n_nodes = sum(int(w.alpha.shape[0]) for w in windows)
-        print0(f"  {tag}Σ^+ windows: count={n_tot}, total nodes={n_nodes}")
     if acc_total is None:
-        # Nothing accumulated in-memory for streaming path.
         return jnp.zeros((0, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), windows
     return acc_total, windows
 
+
+# ---------------------------------------------------------------------------
+#  Top-level sigma driver
+# ---------------------------------------------------------------------------
 
 def compute_sigma_c_ppm_omega_grid(
     wfns,
@@ -944,37 +777,28 @@ def compute_sigma_c_ppm_omega_grid(
     *,
     sigma_window_quad: SigmaQuadratureConfig | None = None,
     print0=print,
-    # Legacy kwargs accepted but ignored for backward compat during migration:
-    **_legacy_kwargs,
 ) -> SigmaOmegaResult:
     """Compute Σ^c_kij(ω) via GN-PPM windowed minimax integration."""
 
-    # Unpack from bundles
     s = wfns.slices
-    psi_coh_rmuT_X = wfns.xn(s.full)
-    psi_coh_rmu_Y = wfns.yr(s.full)
     psi_proj_rmu_X = wfns.xr(s.sigma)
-    psi_proj_rmuT_Y = wfns.yn(s.sigma)
     enk_full = wfns.enk[:, s.full]
     occ_full = wfns.occ[:, s.full]
-    B_mu_nu = ppm.B_mu_nu
-    Omega_mu_nu = ppm.Omega_mu_nu
-    Wc0_mu_nu = getattr(ppm, 'Wc0_mu_nu', None)
-    valid_mask_mu_nu = getattr(ppm, 'valid_mask_mu_nu', None)
+    B_q = ppm.B_q
+    Omega_q = ppm.Omega_q
+    valid_mask_q = getattr(ppm, 'valid_mask_q', None)
     omega_values_ry = ppm_options.omega_grid_ry
 
     nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
-    nk_tot = int(meta.nk_tot)
-    bispinor = bool(meta.bispinor)
+    nk = int(nkx * nky * nkz)
 
     # Quadrature config
-    quadrature_config = sigma_window_quad
-    if quadrature_config is not None:
-        target_error = float(quadrature_config.target_error)
-        max_nodes = int(quadrature_config.max_nodes)
-        crossing_max_nodes = int(quadrature_config.crossing_max_nodes)
-        crossing_eps_q = float(quadrature_config.crossing_eps_q)
-        use_shipped_minimax_tables = bool(quadrature_config.use_shipped_tables)
+    if sigma_window_quad is not None:
+        target_error = float(sigma_window_quad.target_error)
+        max_nodes = int(sigma_window_quad.max_nodes)
+        crossing_max_nodes = int(sigma_window_quad.crossing_max_nodes)
+        crossing_eps_q = float(sigma_window_quad.crossing_eps_q)
+        use_shipped_minimax_tables = bool(sigma_window_quad.use_shipped_tables)
     else:
         target_error, max_nodes = 1e-6, 64
         crossing_max_nodes, crossing_eps_q = 500, 1e-3
@@ -987,11 +811,6 @@ def compute_sigma_c_ppm_omega_grid(
     sigma_kij_h5_path = getattr(ppm_options, 'sigma_kij_h5_path', None)
     fermi_reference = getattr(ppm_options, 'fermi_reference', 'midgap')
 
-    # Internal callback aliases
-    import time as _sgtime
-    _sg_t0 = _sgtime.perf_counter()
-    _sg_prof = bool(os.environ.get("LORRAX_PROFILE_PPM", ""))
-    nk = int(nkx * nky * nkz)
     if nk != int(enk_full.shape[0]):
         raise ValueError(f"enk_full shape mismatch: expected first dim {nk}, got {enk_full.shape[0]}")
 
@@ -1003,13 +822,13 @@ def compute_sigma_c_ppm_omega_grid(
     if omega_accumulation not in ("auto", "kij", "kij_stream"):
         raise ValueError("omega_accumulation must be one of: auto, kij, kij_stream.")
 
-    # Input omega grid is interpreted as relative to E_F (default driver behavior).
-    omega_rel_req = omega_req
-    idx_pos = np.where(omega_rel_req >= 0.0)[0]
-    idx_neg = np.where(omega_rel_req < 0.0)[0]
-    omega_pos = np.asarray(omega_rel_req[idx_pos], dtype=np.float64)
-    omega_neg_abs = np.asarray(-omega_rel_req[idx_neg], dtype=np.float64)
+    # Split omega grid into positive and negative relative to Fermi level
+    idx_pos = np.where(omega_req >= 0.0)[0]
+    idx_neg = np.where(omega_req < 0.0)[0]
+    omega_pos = np.asarray(omega_req[idx_pos], dtype=np.float64)
+    omega_neg_abs = np.asarray(-omega_req[idx_neg], dtype=np.float64)
 
+    # Fermi reference and band masks
     fermi_reference = str(fermi_reference).strip().lower()
     if fermi_reference not in ("vbm", "midgap"):
         raise ValueError("fermi_reference must be 'vbm' or 'midgap'.")
@@ -1026,74 +845,36 @@ def compute_sigma_c_ppm_omega_grid(
     H_val = jnp.maximum(efermi - enk_full, 0.0)
     cond_mask = ~occ_mask
     val_mask = occ_mask
-    Omega_abs = jnp.maximum(jnp.real(Omega_mu_nu), 0.0)
-    B_corr = jnp.asarray(B_mu_nu, dtype=jnp.complex128)
-    Omega_abs = jnp.asarray(Omega_abs, dtype=jnp.float64)
+
+    # PPM mode masking
+    Omega_abs = jnp.maximum(jnp.real(Omega_q), 0.0).astype(jnp.float64)
+    B_corr = jnp.asarray(B_q, dtype=jnp.complex128)
     B_mask = Omega_abs > 1.0e-14
 
-    invalid_mode = "static_limit"
-    if valid_mask_mu_nu is None:
+    if valid_mask_q is None:
         valid_mask = jnp.ones_like(B_mask, dtype=bool)
     else:
-        valid_mask = jnp.asarray(valid_mask_mu_nu, dtype=bool)
+        valid_mask = jnp.asarray(valid_mask_q, dtype=bool)
     invalid_mask = B_mask & (~valid_mask)
     n_total_modes = int(np.asarray(jax.device_get(jnp.sum(B_mask, dtype=jnp.int64)), dtype=np.int64))
     n_invalid = int(np.asarray(jax.device_get(jnp.sum(invalid_mask, dtype=jnp.int64)), dtype=np.int64))
-    if invalid_mode == "static_limit":
-        B_mask = B_mask & valid_mask
+    B_mask = B_mask & valid_mask
 
-    omega_step_ev = float(omega_req[1] - omega_req[0]) * 13.6056980659 if omega_req.size > 1 else 0.0
+    ryd2ev = 13.6056980659
+    omega_step_ev = float(omega_req[1] - omega_req[0]) * ryd2ev if omega_req.size > 1 else 0.0
     print0(
-        "  Σc(ω) grid: "
-        f"{float(np.min(omega_req) * 13.6056980659):.3f} .. {float(np.max(omega_req) * 13.6056980659):.3f} eV, "
-        f"Nω={omega_req.size}, Δω={omega_step_ev:.3f} eV, ξ={float(regularization_width_ry * 13.6056980659):.3f} eV"
+        f"  Σc(ω) grid: "
+        f"{float(np.min(omega_req)) * ryd2ev:.3f}..{float(np.max(omega_req)) * ryd2ev:.3f} eV, "
+        f"Nω={omega_req.size}, Δω={omega_step_ev:.3f} eV, "
+        f"ξ={float(regularization_width_ry) * ryd2ev:.3f} eV"
     )
-    if print0 is not None:
-        if _sg_prof:
-            _sg_diag0 = _sgtime.perf_counter()
-            print0("  [TIMING-SIG] post-grid diag: reducing occupied / unoccupied windows on device")
-        if bool(np.asarray(jax.device_get(jnp.any(unocc_mask)), dtype=bool)):
-            ec_min = float(np.asarray(jax.device_get(jnp.min(jnp.where(unocc_mask, enk_full, jnp.inf))), dtype=np.float64))
-            ec_max = float(np.asarray(jax.device_get(jnp.max(jnp.where(unocc_mask, enk_full, -jnp.inf))), dtype=np.float64))
-        else:
-            ec_min = float("nan")
-            ec_max = float("nan")
-        if bool(np.asarray(jax.device_get(jnp.any(occ_mask)), dtype=bool)):
-            ev_min = float(np.asarray(jax.device_get(jnp.min(jnp.where(occ_mask, enk_full, jnp.inf))), dtype=np.float64))
-            ev_max = float(np.asarray(jax.device_get(jnp.max(jnp.where(occ_mask, enk_full, -jnp.inf))), dtype=np.float64))
-        else:
-            ev_min = float("nan")
-            ev_max = float("nan")
-        if _sg_prof:
-            _sg_diag1 = _sgtime.perf_counter()
-            print0(f"  [TIMING-SIG] post-grid diag energy summary built in {_sg_diag1 - _sg_diag0:.3f}s")
-            print0("  [TIMING-SIG] post-grid diag: reducing omega abs on device")
-        if n_total_modes:
-            omega_min_dev = jnp.min(jnp.where(B_mask, Omega_abs, jnp.inf))
-            omega_max_dev = jnp.max(jnp.where(B_mask, Omega_abs, -jnp.inf))
-            om_min = float(np.asarray(jax.device_get(omega_min_dev), dtype=np.float64))
-            om_max = float(np.asarray(jax.device_get(omega_max_dev), dtype=np.float64))
-        else:
-            om_min = float("nan")
-            om_max = float("nan")
-        if _sg_prof:
-            _sg_diag4 = _sgtime.perf_counter()
-            print0(f"  [TIMING-SIG] post-grid diag omega summary built in {_sg_diag4 - _sg_diag1:.3f}s")
-        if _sg_prof:
-            _sg_diag6 = _sgtime.perf_counter()
-            print0(f"  [TIMING-SIG] post-grid diag summary built in {_sg_diag6 - _sg_diag4:.3f}s")
+    if n_invalid:
         print0(
-            "  Σc(ω) axes (vacuum): "
-            f"Ev=[{ev_min:.6e},{ev_max:.6e}] Ry, "
-            f"Ec=[{ec_min:.6e},{ec_max:.6e}] Ry, "
-            f"Omega=[{om_min:.6e},{om_max:.6e}] Ry"
+            f"  GN invalid modes: {n_invalid}/{n_total_modes} "
+            f"({100.0 * n_invalid / max(n_total_modes, 1):.2f}%)"
         )
-        if n_invalid:
-            print0(
-                f"  GN invalid modes: {n_invalid}/{n_total_modes} "
-                f"({100.0 * n_invalid / max(n_total_modes, 1):.2f}%), "
-                f"policy={invalid_mode}"
-            )
+
+    # Accumulation mode
     nk_proj = int(psi_proj_rmu_X.shape[0])
     nb_proj = int(psi_proj_rmu_X.shape[1])
     kij_bytes = float(omega_req.size * nk_proj * nb_proj * nb_proj * 16)
@@ -1103,27 +884,18 @@ def compute_sigma_c_ppm_omega_grid(
         use_kij_accum = (sigma_kij_h5_path is None) and (kij_bytes <= 0.5 * 1024**3)
         use_kij_stream = not use_kij_accum
     if use_kij_stream and not sigma_kij_h5_path:
-        print0("  WARNING: omega_accumulation=kij_stream without sigma_kij_h5_path; falling back to kij.")
         use_kij_stream = False
         use_kij_accum = True
-    if use_kij_accum:
-        print0(f"  Σc(ω) accumulation: kij (single-pass), est={kij_bytes / (1024**2):.1f} MiB")
-    if use_kij_stream:
-        print0(f"  Σc(ω) streaming: kij_stream (ω-chunk={omega_batch_size})")
 
     n_omega = int(omega_req.size)
     sigma_kij_host = None if use_kij_stream else np.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=np.complex128)
 
-    stream_path = None
-    h5_stream = None
-    dset_sigma_munu = None
-
+    # H5 streaming setup
     kij_stream_path = None
     h5_kij = None
     dset_sigma_kij = None
     if use_kij_stream and sigma_kij_h5_path:
         if jax.process_count() != 1:
-            print0("  WARNING: sigma_kij_h5_path requested with multi-process JAX; disabling kij streaming.")
             use_kij_stream = False
             use_kij_accum = True
             sigma_kij_host = np.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=np.complex128)
@@ -1134,212 +906,93 @@ def compute_sigma_c_ppm_omega_grid(
                 os.makedirs(kij_dir, exist_ok=True)
             k_chunks = max(1, min(4, nk_proj))
             o_chunks = max(1, min(omega_batch_size, n_omega))
-            chunks = (o_chunks, k_chunks, nb_proj, nb_proj)
             h5_kij = h5py.File(kij_stream_path, "w")
             h5_kij.create_dataset("omega_ry", data=np.asarray(omega_req, dtype=np.float64))
-            h5_kij.create_dataset("omega_ev", data=np.asarray(omega_req * 13.6056980659, dtype=np.float64))
+            h5_kij.create_dataset("omega_ev", data=np.asarray(omega_req * ryd2ev, dtype=np.float64))
             dset_sigma_kij = h5_kij.create_dataset(
                 "sigma_c_kij_ry",
                 shape=(n_omega, nk_proj, nb_proj, nb_proj),
                 dtype=np.complex128,
-                chunks=chunks,
+                chunks=(o_chunks, k_chunks, nb_proj, nb_proj),
                 fillvalue=0.0,
             )
             h5_kij.attrs["layout"] = "omega,k,i,j"
-            h5_kij.attrs["note"] = "Σ_c(kij,ω) streamed in ω-chunks; τ-node work is not repeated."
-
-
-    if _sg_prof:
-        _sg_t_setup = _sgtime.perf_counter()
-        print0(f"  [TIMING-SIG] setup: {_sg_t_setup - _sg_t0:.1f}s")
 
     try:
-        if use_kij_accum or use_kij_stream:
-            sigma_channel_pipeline = _get_sigma_channel_pipeline(
-                mesh_xy=mesh_xy,
-                nkx=nkx,
-                nky=nky,
-                nkz=nkz,
-                nk_tot=nk_tot,
-                bispinor=bispinor,
-            )
-
-            def _accumulate_kij_stream(global_idx: np.ndarray, contrib_batch: jax.Array) -> None:
-                if dset_sigma_kij is None:
-                    return
-                idx = np.asarray(global_idx, dtype=np.int64)
-                buf = dset_sigma_kij[idx]
-                buf = buf + np.asarray(jax.device_get(contrib_batch), dtype=np.complex128)
-                dset_sigma_kij[idx] = buf
-
-            def _convolve_kij(
-                omega_eval: np.ndarray,
-                omega_idx: np.ndarray,
-                kernel_cond: int,
-                kernel_val: int,
-                tag: str,
-                scale: float = 1.0,
-                omega_sign_flip_cond: int = 1,
-                omega_sign_flip_val: int = 1,
-            ) -> jax.Array | None:
-                if _sg_prof:
-                    print0(
-                        f"  [TIMING-SIG] entering _convolve_kij[{tag}]: "
-                        f"Nω={int(omega_eval.size)}, cond_sign={kernel_cond:+d}, val_sign={kernel_val:+d}"
-                    )
-                    _sg_t_cond0 = _sgtime.perf_counter()
-                sigma_cond, _ = _convolve_sigma_branch_kij(
-                    omega_nonneg_ry=omega_eval,
-                    omega_global_idx=omega_idx,
-                    E_A=E_cond,
-                    base_mask_A=cond_mask,
-                    B_mu_nu=B_corr,
-                    Omega_mu_nu=Omega_abs,
-                    base_mask_B=B_mask,
-                    kernel_sign=kernel_cond,
-                    regularization_width_ry=regularization_width_ry,
-                    edge_factor=edge_factor,
-                    target_error=target_error,
-                    max_nodes=max_nodes,
-                    crossing_eps_q=crossing_eps_q,
-                    crossing_max_nodes=crossing_max_nodes,
-                    use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
-                    psi_coh_rmuT_X=psi_coh_rmuT_X,
-                    psi_coh_rmu_Y=psi_coh_rmu_Y,
-                    psi_proj_rmu_X=psi_proj_rmu_X,
-                    psi_proj_rmuT_Y=psi_proj_rmuT_Y,
-                    nkx=nkx,
-                    nky=nky,
-                    nkz=nkz,
-                    nk_tot=nk_tot,
-                    bispinor=bispinor,
-                    mesh_xy=mesh_xy,
-                    omega_sign_flip=omega_sign_flip_cond,
-                    log_tag=tag,
-                    print0=print0,
-                    omega_batch_size=omega_batch_size,
-                    stream_writer=_accumulate_kij_stream if use_kij_stream else None,
-                    scale=scale,
-                    efermi_vac=float(efermi),
-                    axis_kind="cond",
-                )
-                if _sg_prof:
-                    _sg_t_cond1 = _sgtime.perf_counter()
-                    print0(
-                        f"  [TIMING-SIG] _convolve_kij[{tag}] cond branch returned: "
-                        f"{_sg_t_cond1 - _sg_t_cond0:.3f}s"
-                    )
-                    _sg_t_val0 = _sgtime.perf_counter()
-                sigma_val, _ = _convolve_sigma_branch_kij(
-                    omega_nonneg_ry=omega_eval,
-                    omega_global_idx=omega_idx,
-                    E_A=H_val,
-                    base_mask_A=val_mask,
-                    B_mu_nu=B_corr,
-                    Omega_mu_nu=Omega_abs,
-                    base_mask_B=B_mask,
-                    kernel_sign=kernel_val,
-                    regularization_width_ry=regularization_width_ry,
-                    edge_factor=edge_factor,
-                    target_error=target_error,
-                    max_nodes=max_nodes,
-                    crossing_eps_q=crossing_eps_q,
-                    crossing_max_nodes=crossing_max_nodes,
-                    use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
-                    psi_coh_rmuT_X=psi_coh_rmuT_X,
-                    psi_coh_rmu_Y=psi_coh_rmu_Y,
-                    psi_proj_rmu_X=psi_proj_rmu_X,
-                    psi_proj_rmuT_Y=psi_proj_rmuT_Y,
-                    nkx=nkx,
-                    nky=nky,
-                    nkz=nkz,
-                    nk_tot=nk_tot,
-                    bispinor=bispinor,
-                    mesh_xy=mesh_xy,
-                    omega_sign_flip=omega_sign_flip_val,
-                    log_tag=tag,
-                    print0=print0,
-                    omega_batch_size=omega_batch_size,
-                    stream_writer=_accumulate_kij_stream if use_kij_stream else None,
-                    scale=scale,
-                    efermi_vac=float(efermi),
-                    axis_kind="val",
-                )
-                if _sg_prof:
-                    _sg_t_val1 = _sgtime.perf_counter()
-                    print0(
-                        f"  [TIMING-SIG] _convolve_kij[{tag}] val branch returned: "
-                        f"{_sg_t_val1 - _sg_t_val0:.3f}s"
-                    )
-                if use_kij_stream:
-                    return None
-                    return sigma_cond, sigma_val
-                return sigma_cond + sigma_val
-            if _sg_prof:
-                _sg_t_conv_start = _sgtime.perf_counter()
-                print0(f"  [TIMING-SIG] pre-convolution: {_sg_t_conv_start - _sg_t0:.1f}s")
-            # ω_rel >= 0: Σ^- gets crossing treatment, Σ^+ sign-definite.
-            if _sg_prof: _sg_ts = _sgtime.perf_counter()
-            if omega_pos.size:
-                sigma_pos = _convolve_kij(
-                    omega_pos,
-                    idx_pos,
-                    kernel_cond=+1,
-                    kernel_val=-1,
-                    tag="ω>=E_F",
-                    scale=1.0,
-                    omega_sign_flip_cond=1,
-                    omega_sign_flip_val=1,
-                )
-                if _sg_prof:
-                    _sg_te = _sgtime.perf_counter()
-                    print0(f"  [TIMING-SIG] convolve_kij(pos) returned: {_sg_te - _sg_ts:.1f}s")
-                if sigma_pos is not None:
-                    sigma_kij_host[idx_pos] = np.asarray(jax.device_get(sigma_pos), dtype=np.complex128)
-
-            if _sg_prof: _sg_ts2 = _sgtime.perf_counter()
-            # ω_rel < 0: evaluate with |ω_rel| and swapped branch kernels.
-            # Keep omega kernel signs unchanged (omega_sign_flip=+1). For w=|ω_rel|:
-            #   D_minus = ω_rel - S_c = -(w + S_c)
-            #   D_plus  = ω_rel + S_v = -(w - S_v)
-            # In this implementation, kernel_sign=+1 realizes 1/(w-S) and
-            # kernel_sign=-1 realizes 1/(w+S), so both routed branches require
-            # the same extra global minus.
-            if omega_neg_abs.size:
-                sigma_neg = _convolve_kij(
-                    omega_neg_abs,
-                    idx_neg,
-                    kernel_cond=-1,
-                    kernel_val=+1,
-                    tag="ω<E_F",
-                    # Optional debug-only sign flip knob on the ω<E_F block.
-                    scale=-1.0,
-                    omega_sign_flip_cond=1,
-                    omega_sign_flip_val=1,
-                )
-                if _sg_prof:
-                    _sg_te2 = _sgtime.perf_counter()
-                    print0(f"  [TIMING-SIG] convolve_kij(neg) returned: {_sg_te2 - _sg_ts2:.1f}s")
-                if sigma_neg is not None:
-                    sigma_kij_host[idx_neg] = np.asarray(jax.device_get(sigma_neg), dtype=np.complex128)
-
-            if _sg_prof:
-                _sg_t_conv_end = _sgtime.perf_counter()
-                print0(f"  [TIMING-SIG] convolution total: {_sg_t_conv_end - _sg_t_conv_start:.1f}s")
-        else:
+        if not (use_kij_accum or use_kij_stream):
             raise RuntimeError("Internal error: no valid Σc(ω) accumulation path selected.")
+
+        def _accumulate_kij_stream(global_idx: np.ndarray, contrib_batch: jax.Array) -> None:
+            if dset_sigma_kij is None:
+                return
+            idx = np.asarray(global_idx, dtype=np.int64)
+            buf = dset_sigma_kij[idx]
+            buf = buf + np.asarray(jax.device_get(contrib_batch), dtype=np.complex128)
+            dset_sigma_kij[idx] = buf
+
+        common_branch_kwargs = dict(
+            B_q=B_corr,
+            Omega_q=Omega_abs,
+            base_mask_B=B_mask,
+            regularization_width_ry=regularization_width_ry,
+            edge_factor=edge_factor,
+            target_error=target_error,
+            max_nodes=max_nodes,
+            crossing_eps_q=crossing_eps_q,
+            crossing_max_nodes=crossing_max_nodes,
+            wfns=wfns,
+            mesh_xy=mesh_xy,
+            meta=meta,
+            print0=print0,
+            omega_batch_size=omega_batch_size,
+            stream_writer=_accumulate_kij_stream if use_kij_stream else None,
+            use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
+        )
+
+        # ω_rel >= 0: Σ^- (crossing) for cond, Σ^+ (sign-definite) for val
+        if omega_pos.size:
+            sigma_cond_pos, _ = _convolve_sigma_branch_kij(
+                omega_nonneg_ry=omega_pos, omega_global_idx=idx_pos,
+                E_A=E_cond, base_mask_A=cond_mask, kernel_sign=+1,
+                omega_sign_flip=1, log_tag="ω≥E_F cond", scale=1.0,
+                **common_branch_kwargs,
+            )
+            sigma_val_pos, _ = _convolve_sigma_branch_kij(
+                omega_nonneg_ry=omega_pos, omega_global_idx=idx_pos,
+                E_A=H_val, base_mask_A=val_mask, kernel_sign=-1,
+                omega_sign_flip=1, log_tag="ω≥E_F val", scale=1.0,
+                **common_branch_kwargs,
+            )
+            if not use_kij_stream:
+                sigma_kij_host[idx_pos] = np.asarray(
+                    jax.device_get(sigma_cond_pos + sigma_val_pos), dtype=np.complex128)
+
+        # ω_rel < 0: evaluate with |ω_rel| and swapped branch kernels, global -1 scale
+        if omega_neg_abs.size:
+            sigma_cond_neg, _ = _convolve_sigma_branch_kij(
+                omega_nonneg_ry=omega_neg_abs, omega_global_idx=idx_neg,
+                E_A=E_cond, base_mask_A=cond_mask, kernel_sign=-1,
+                omega_sign_flip=1, log_tag="ω<E_F cond", scale=-1.0,
+                **common_branch_kwargs,
+            )
+            sigma_val_neg, _ = _convolve_sigma_branch_kij(
+                omega_nonneg_ry=omega_neg_abs, omega_global_idx=idx_neg,
+                E_A=H_val, base_mask_A=val_mask, kernel_sign=+1,
+                omega_sign_flip=1, log_tag="ω<E_F val", scale=-1.0,
+                **common_branch_kwargs,
+            )
+            if not use_kij_stream:
+                sigma_kij_host[idx_neg] = np.asarray(
+                    jax.device_get(sigma_cond_neg + sigma_val_neg), dtype=np.complex128)
     finally:
-        if h5_stream is not None:
-            h5_stream.close()
         if h5_kij is not None:
             h5_kij.close()
 
+    ryd2ev = 13.6056980659
     sigma_kij_req = None if sigma_kij_host is None else jnp.asarray(sigma_kij_host, dtype=jnp.complex128)
     return SigmaOmegaResult(
         omega_ry=np.asarray(omega_req, dtype=np.float64),
-        omega_ev=np.asarray(omega_req * 13.6056980659, dtype=np.float64),
+        omega_ev=np.asarray(omega_req * ryd2ev, dtype=np.float64),
         sigma_c_kij=sigma_kij_req,
         sigma_kij_h5_path=kij_stream_path,
     )
-
-
