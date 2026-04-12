@@ -1261,18 +1261,17 @@ def prepare_isdf_and_wavefunctions(
 			)
 
 		V_qmunu = isdf_result['V_qmunu']
-		v_q0_noG0_munu = isdf_result['v_q0_noG0_munu']
-		G0_mu_nu = isdf_result['G0_mu_nu']
 
 		write_restart_state_to_h5(
 			tensors_filename, V_qmunu,
 			wfns.psi_yr, wfns.enk, None,
-			V0_noG0_munu=v_q0_noG0_munu, G0_mu_nu=G0_mu_nu, init_W0=True,
+			V0_noG0_munu=isdf_result['v_q0_noG0_munu'],
+			G0_mu_nu=isdf_result['G0_mu_nu'], init_W0=True,
 		)
 		save_restart_state_per_proc(
 			os.path.join(tmp_dir, "isdf_tensors"),
 			V_qmunu, None, wfns.psi_yr, wfns.enk,
-			meta, mesh_xy, V0_noG0_munu=v_q0_noG0_munu,
+			meta, mesh_xy, V0_noG0_munu=isdf_result['v_q0_noG0_munu'],
 		)
 		V_qmunu.block_until_ready()
 		print0("  Chunked ISDF path complete")
@@ -1292,12 +1291,8 @@ def prepare_isdf_and_wavefunctions(
 			)
 
 		V_qmunu = restart['V_qmunu']
-		v_q0_noG0_munu = restart['v_q0_noG0_munu']
-		G0_mu_nu = restart['G0_mu_nu']
 
 	return SimpleNamespace(
 		V_qmunu=V_qmunu,
-		v_q0_noG0_munu=v_q0_noG0_munu,
-		G0_mu_nu=G0_mu_nu,
 		wf_bundle=wfns,
 	)
