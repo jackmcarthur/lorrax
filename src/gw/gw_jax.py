@@ -700,8 +700,10 @@ def main(argv=None):
 			raise ValueError("use_ppm_sigma=true requires do_screened=true.")
 		if self_consistent:
 			raise NotImplementedError("use_ppm_sigma not supported with self_consistent.")
+		
 		laplace_quad = minimax_config_from_params(params)
 		sigma_window_quad = sigma_quadrature_config_from_params(params)
+		
 		ppm_options = build_ppm_sigma_runtime_options(params, input_dir=input_dir, ryd2ev=ryd2ev)
 		if ppm_options.fermi_reference not in ("vbm", "midgap"):
 			raise ValueError("fermi_reference must be 'vbm' or 'midgap'.")
@@ -741,262 +743,71 @@ def main(argv=None):
 				get_sigma_kij_channels_fn=_project_ri,
 				print0=print0,
 			)
-			sigma_coh_ppm_omega_kij = sigma_omega.sigma_c_kij
-			iw0 = int(np.argmin(np.abs(ppm_options.omega_grid_ry)))
-			if sigma_coh_ppm_omega_kij is None:
-				if not sigma_omega.sigma_kij_h5_path:
-					raise RuntimeError("PPM Sigma stream requested but no sigma_kij_h5_path provided.")
-				with h5py.File(sigma_omega.sigma_kij_h5_path, "r") as h5:
-					sigma_coh_ppm_kij = jnp.asarray(h5["sigma_c_kij_ry"][iw0], dtype=jnp.complex128)
-				print0("  NOTE: Σ_c(kij,ω) streamed to disk; skipping in-memory QSGW/diag-SC diagnostics.")
-			else:
-				sigma_coh_ppm_kij = sigma_coh_ppm_omega_kij[iw0]
-				sigma_coh_ppm_kij.block_until_ready()
+			sigma_c_omega = sigma_omega.sigma_c_kij  # (n_omega, nk, nb, nb) or None if streamed
 
-			
+			# Evaluate Σ_c at DFT energies (midgap Fermi reference)
+			sigma_c_at_dft_ev = None
+			sigma_xc_at_dft_ev = None
+			omega_dft_rel_ev = None
+			efermi_dft_ev = None
 			if meta.rank == 0:
-				# Evaluate Sigma_c(E_DFT) and Sigma_xc(E_DFT) for BGW comparisons and eqp_g0w0 output.
-				energies_full_dft, _ = get_enk_bandrange(
-					wfn, sym, (b0, b3), (b0, b3),
-					nspinor=meta.nspinor,
-				)
-				energies_dft_ev = np.asarray(energies_full_dft) * ryd2ev
-				# Derive the occupied count directly from the sigma-window band edges
-				# instead of relying on an auxiliary occupancy array. This keeps the
-				# E_DFT interpolation reference aligned with the local sigma window.
-				n_occ_local = int(max(0, min(b2 - b0, energies_dft_ev.shape[1])))
-				if n_occ_local > 0:
-					vbm_ev = float(np.max(energies_dft_ev[:, :n_occ_local]))
-				else:
-					vbm_ev = float(np.max(energies_dft_ev))
-				if ppm_options.fermi_reference == "midgap" and n_occ_local < energies_dft_ev.shape[1]:
-					cbm_ev = float(np.min(energies_dft_ev[:, n_occ_local:]))
-					efermi_dft_ev = 0.5 * (vbm_ev + cbm_ev)
-				else:
-					cbm_ev = None
-					efermi_dft_ev = vbm_ev
-				vbm_dft_ev = vbm_ev
-				cbm_dft_ev = cbm_ev
-				omega_dft_rel_ev = energies_dft_ev - efermi_dft_ev
-				if ppm_options.fermi_reference == "midgap" and cbm_dft_ev is not None:
-					print0(
-						f"  Sigma(E_DFT) reference: E_F(midgap)={efermi_dft_ev:.6f} eV "
-						f"from VBM={vbm_dft_ev:.6f} eV, CBM={cbm_dft_ev:.6f} eV"
-					)
-				else:
-					print0(
-						f"  Sigma(E_DFT) reference: E_F(VBM)={efermi_dft_ev:.6f} eV "
-						f"from VBM={vbm_dft_ev:.6f} eV"
-					)
+				enk_dft, _ = get_enk_bandrange(wfn, sym,
+					(meta.band_edges[0], meta.band_edges[3]),
+					(meta.band_edges[0], meta.band_edges[3]), nspinor=meta.nspinor)
+				enk_dft_ev = np.asarray(enk_dft) * ryd2ev
+				n_occ = min(meta.nelec, enk_dft_ev.shape[1])
+				vbm_ev = float(np.max(enk_dft_ev[:, :n_occ]))
+				cbm_ev = float(np.min(enk_dft_ev[:, n_occ:])) if n_occ < enk_dft_ev.shape[1] else vbm_ev
+				efermi_dft_ev = 0.5 * (vbm_ev + cbm_ev)
+				omega_dft_rel_ev = enk_dft_ev - efermi_dft_ev
+				print0(f"  E_F(midgap) = {efermi_dft_ev:.6f} eV  (VBM={vbm_ev:.6f}, CBM={cbm_ev:.6f})")
 
-				def _interp_complex_on_grid(omega_ev, values_omega, x_ev):
-					if (x_ev < float(omega_ev[0]) or x_ev > float(omega_ev[-1])) and (not ppm_options.sigma_at_dft_extrapolate):
-						return complex(np.nan, np.nan)
-					xr = float(np.clip(x_ev, float(omega_ev[0]), float(omega_ev[-1])))
-					v_re = np.interp(xr, omega_ev, np.real(values_omega))
-					v_im = np.interp(xr, omega_ev, np.imag(values_omega))
-					return complex(v_re, v_im)
-
-				if sigma_coh_ppm_omega_kij is None:
-					if not sigma_omega.sigma_kij_h5_path:
-						raise RuntimeError("Σ_c(ω) is streamed without sigma_kij_h5_path; cannot evaluate Sigma_c(E_DFT).")
+				# Interpolate diagonal Σ_c(ω) at each DFT energy
+				omega_ev = np.asarray(ppm_options.omega_grid_ev, dtype=np.float64)
+				if sigma_c_omega is not None:
+					sig_c_diag = np.diagonal(np.asarray(sigma_c_omega), axis1=2, axis2=3) * ryd2ev
+				else:
 					with h5py.File(sigma_omega.sigma_kij_h5_path, "r") as h5:
-						dset_c = h5["sigma_c_kij_ry"]
-						n_omega = int(dset_c.shape[0])
-						nk = int(dset_c.shape[1])
-						nb = int(dset_c.shape[2])
-						sigma_c_diag_omega_ev = np.zeros((n_omega, nk, nb), dtype=np.complex128)
-						o_chunks = max(1, min(ppm_options.sigma_omega_batch_size, n_omega))
-						for ibeg in range(0, n_omega, o_chunks):
-							iend = min(ibeg + o_chunks, n_omega)
-							block = np.asarray(dset_c[ibeg:iend], dtype=np.complex128) * ryd2ev
-							sigma_c_diag_omega_ev[ibeg:iend] = np.diagonal(block, axis1=2, axis2=3)
-				else:
-					sigma_c_diag_omega_ev = np.diagonal(
-						np.asarray(sigma_coh_ppm_omega_kij, dtype=np.complex128), axis1=2, axis2=3
-					) * ryd2ev
+						sig_c_diag = np.diagonal(
+							np.asarray(h5["sigma_c_kij_ry"], dtype=np.complex128), axis1=2, axis2=3) * ryd2ev
+				nk, nb = sig_c_diag.shape[1], sig_c_diag.shape[2]
+				sigma_c_at_dft_ev = np.array([
+					[complex(np.interp(omega_dft_rel_ev[ik, ib], omega_ev, np.real(sig_c_diag[:, ik, ib])),
+					         np.interp(omega_dft_rel_ev[ik, ib], omega_ev, np.imag(sig_c_diag[:, ik, ib])))
+					 for ib in range(nb)] for ik in range(nk)], dtype=np.complex128)
+				sig_x_diag_ev = np.diagonal(np.asarray(sig_x), axis1=1, axis2=2) * ryd2ev
+				sigma_xc_at_dft_ev = sig_x_diag_ev + sigma_c_at_dft_ev
 
-				nk = sigma_c_diag_omega_ev.shape[1]
-				nb = sigma_c_diag_omega_ev.shape[2]
-				sigma_c_at_dft_ev = np.zeros((nk, nb), dtype=np.complex128)
-				for ik in range(nk):
-					for ib in range(nb):
-						sigma_c_at_dft_ev[ik, ib] = _interp_complex_on_grid(
-							ppm_options.omega_grid_ev, sigma_c_diag_omega_ev[:, ik, ib], omega_dft_rel_ev[ik, ib]
-						)
-				sigma_c_plus_at_dft_ev = np.full((nk, nb), np.nan + 1j * np.nan, dtype=np.complex128)
-				sigma_c_minus_at_dft_ev = np.full((nk, nb), np.nan + 1j * np.nan, dtype=np.complex128)
-				if sigma_omega.sigma_c_plus_kij is not None:
-					sigma_c_plus_diag_omega_ev = np.diagonal(
-						np.asarray(sigma_omega.sigma_c_plus_kij, dtype=np.complex128), axis1=2, axis2=3
-					) * ryd2ev
-					for ik in range(nk):
-						for ib in range(nb):
-							sigma_c_plus_at_dft_ev[ik, ib] = _interp_complex_on_grid(
-								ppm_options.omega_grid_ev, sigma_c_plus_diag_omega_ev[:, ik, ib], omega_dft_rel_ev[ik, ib]
-							)
-				if sigma_omega.sigma_c_minus_kij is not None:
-					sigma_c_minus_diag_omega_ev = np.diagonal(
-						np.asarray(sigma_omega.sigma_c_minus_kij, dtype=np.complex128), axis1=2, axis2=3
-					) * ryd2ev
-					for ik in range(nk):
-						for ib in range(nb):
-							sigma_c_minus_at_dft_ev[ik, ib] = _interp_complex_on_grid(
-								ppm_options.omega_grid_ev, sigma_c_minus_diag_omega_ev[:, ik, ib], omega_dft_rel_ev[ik, ib]
-							)
-				if sigma_omega.sigma_c_invalid_static_kij is not None:
-					sigma_c_invalid_static_diag_ev = np.diagonal(
-						np.asarray(sigma_omega.sigma_c_invalid_static_kij, dtype=np.complex128), axis1=1, axis2=2
-					) * ryd2ev
-				else:
-					sigma_c_invalid_static_diag_ev = np.zeros((nk, nb), dtype=np.complex128)
-				sigma_x_diag_ev = np.diagonal(np.asarray(sig_x), axis1=1, axis2=2) * ryd2ev
-				sigma_xc_at_dft_ev = sigma_x_diag_ev + sigma_c_at_dft_ev
-
-			coh_diff_abs = float(jnp.max(jnp.abs(sigma_coh_ppm_kij - sig_coh)))
-			coh_ref = max(float(jnp.max(jnp.abs(sig_coh))), 1.0e-16)
-			sx_diff_abs = float(jnp.max(jnp.abs(sig_x - sig_sx)))
-			sx_ref = max(float(jnp.max(jnp.abs(sig_sx))), 1.0e-16)
-			static_total_ref = sig_sx + sig_coh
-			gw_total_0 = sig_x + sigma_coh_ppm_kij
-			total_diff_abs = float(jnp.max(jnp.abs(gw_total_0 - static_total_ref)))
-			total_ref = max(float(jnp.max(jnp.abs(static_total_ref))), 1.0e-16)
-			print0(f"  Replacing static COH with PPM-integrated Σ^c(ω={ppm_options.omega_grid_ry[iw0]:.6f} Ry)")
-			print0(f"  Σ^c difference vs static COH: abs={coh_diff_abs:.6e}, rel={coh_diff_abs / coh_ref:.6e}")
-			print0(f"  Bare Σ^X vs screened Σ^SX: abs={sx_diff_abs:.6e}, rel={sx_diff_abs / sx_ref:.6e}")
-			print0(
-				f"  [Σ^X + Σ^c(0)] vs [Σ^SX + Σ^COH]: abs={total_diff_abs:.6e} Ry "
-				f"({total_diff_abs * ryd2ev:.6e} eV), rel={total_diff_abs / total_ref:.6e}"
-			)
+			# Replace static COHSEX with PPM results
 			sig_sx = sig_x
-			sig_coh = sigma_coh_ppm_kij
+			# sig_coh is replaced by a diagonal Σ_c(E_DFT) matrix for output;
+			# the full Σ_c(ω) is in sigma_c_omega / sigma_omega_h5
 
+			# Write sigma_mnk.h5
 			sigma_omega_h5_path = params.get("sigma_omega_h5_file", "sigma_mnk.h5")
 			if not os.path.isabs(sigma_omega_h5_path):
 				sigma_omega_h5_path = os.path.join(input_dir, sigma_omega_h5_path)
-
-			if sigma_coh_ppm_omega_kij is not None:
-				if meta.rank == 0:
+			if meta.rank == 0:
+				if sigma_c_omega is not None:
 					write_sigma_omega_h5(
-						sigma_omega_h5_path,
-						ppm_options.omega_grid_ev,
-						None,
-						sigma_c_kij_ev=ryd2ev * sigma_coh_ppm_omega_kij,
+						sigma_omega_h5_path, ppm_options.omega_grid_ev, None,
+						sigma_c_kij_ev=ryd2ev * sigma_c_omega,
 						sigma_sx_kij_ev=ryd2ev * sig_sx,
-						hartree_kij_ev=ryd2ev * sig_h,
-					)
-					if (
-						sigma_omega.sigma_c_plus_kij is not None
-						or sigma_omega.sigma_c_minus_kij is not None
-						or sigma_omega.sigma_c_invalid_static_kij is not None
-					):
-						if sigma_omega.sigma_c_plus_kij is not None:
-							write_chunked_complex_dataset_h5(
-								sigma_omega_h5_path,
-								"sigma_c_plus_kij_ev",
-								ryd2ev * sigma_omega.sigma_c_plus_kij,
-								mode="a",
-							)
-						if sigma_omega.sigma_c_minus_kij is not None:
-							write_chunked_complex_dataset_h5(
-								sigma_omega_h5_path,
-								"sigma_c_minus_kij_ev",
-								ryd2ev * sigma_omega.sigma_c_minus_kij,
-								mode="a",
-							)
-						if sigma_omega.sigma_c_invalid_static_kij is not None:
-							write_chunked_complex_dataset_h5(
-								sigma_omega_h5_path,
-								"sigma_c_invalid_static_kij_ev",
-								ryd2ev * sigma_omega.sigma_c_invalid_static_kij,
-								mode="a",
-							)
-					# Recompute Sigma_c(E_DFT) from the written sigma_c_kij_ev payload so
-					# eqp0_noqsym_w.dat and sigma_mnk.h5 cannot diverge.
-					if sigma_c_at_dft_ev is not None:
-						with h5py.File(sigma_omega_h5_path, "a") as h5:
-							if "sigma_c_kij_ev" not in h5:
-								raise RuntimeError(
-									f"{sigma_omega_h5_path} missing sigma_c_kij_ev; cannot evaluate Sigma_c(E_DFT)."
-								)
-							sigma_c_diag_omega_ev_file = np.diagonal(
-								np.asarray(h5["sigma_c_kij_ev"], dtype=np.complex128), axis1=2, axis2=3
-							)
-							nk = sigma_c_diag_omega_ev_file.shape[1]
-							nb = sigma_c_diag_omega_ev_file.shape[2]
-							sigma_c_at_dft_from_file = np.zeros((nk, nb), dtype=np.complex128)
-							for ik in range(nk):
-								for ib in range(nb):
-									sigma_c_at_dft_from_file[ik, ib] = _interp_complex_on_grid(
-										ppm_options.omega_grid_ev,
-										sigma_c_diag_omega_ev_file[:, ik, ib],
-										omega_dft_rel_ev[ik, ib],
-									)
-							sigma_x_diag_ev = np.diagonal(np.asarray(sig_x), axis1=1, axis2=2) * ryd2ev
-							sigma_c_at_dft_ev = sigma_c_at_dft_from_file
-							sigma_xc_at_dft_ev = sigma_x_diag_ev + sigma_c_at_dft_ev
-							if "omega_dft_rel_ev" in h5:
-								del h5["omega_dft_rel_ev"]
-							if "sigma_c_at_dft_ev" in h5:
-								del h5["sigma_c_at_dft_ev"]
-							if "sigma_xc_at_dft_ev" in h5:
-								del h5["sigma_xc_at_dft_ev"]
-							h5.create_dataset("omega_dft_rel_ev", data=np.asarray(omega_dft_rel_ev, dtype=np.float64))
-							h5.create_dataset("sigma_c_at_dft_ev", data=np.asarray(sigma_c_at_dft_ev, dtype=np.complex128))
-							h5.create_dataset("sigma_xc_at_dft_ev", data=np.asarray(sigma_xc_at_dft_ev, dtype=np.complex128))
-							h5.attrs["sigma_at_dft_energies"] = True
-							h5.attrs["fermi_reference"] = str(ppm_options.fermi_reference)
-							h5.attrs["efermi_dft_ev"] = float(efermi_dft_ev)
-							h5.attrs["vbm_dft_ev"] = float(vbm_dft_ev)
-							h5.attrs["cbm_dft_ev"] = float(cbm_dft_ev) if cbm_dft_ev is not None else np.nan
-						in_grid = (
-							(np.asarray(omega_dft_rel_ev) >= float(np.min(ppm_options.omega_grid_ev)))
-							& (np.asarray(omega_dft_rel_ev) <= float(np.max(ppm_options.omega_grid_ev)))
-						)
-						n_in = int(np.count_nonzero(in_grid))
-						n_tot = int(in_grid.size)
-						print0(
-							f"  Sigma(E_DFT) in-grid states: {n_in}/{n_tot} "
-							f"within [{float(np.min(ppm_options.omega_grid_ev)):.3f}, {float(np.max(ppm_options.omega_grid_ev)):.3f}] eV"
-						)
-			elif sigma_omega.sigma_kij_h5_path and meta.rank == 0:
-				# Stream Σ_c(kij,ω) from disk to avoid holding full Nω in memory.
-				with h5py.File(sigma_omega.sigma_kij_h5_path, "r") as h5_in:
-					dset_c = h5_in["sigma_c_kij_ry"]
-					n_omega = int(dset_c.shape[0])
-					nk = int(dset_c.shape[1])
-					nb = int(dset_c.shape[2])
-					o_chunks = max(1, min(ppm_options.sigma_omega_batch_size, n_omega))
-					chunks = (o_chunks, max(1, min(4, nk)), nb, nb)
-					with h5py.File(sigma_omega_h5_path, "w") as h5_out:
-						h5_out.create_dataset("omega_ev", data=np.asarray(ppm_options.omega_grid_ev, dtype=np.float64))
-						dset_total = h5_out.create_dataset(
-							"sigma_total_kij_ev",
-							shape=dset_c.shape,
-							dtype=np.complex128,
-							chunks=chunks,
-						)
-						dset_c_ev = h5_out.create_dataset(
-							"sigma_c_kij_ev",
-							shape=dset_c.shape,
-							dtype=np.complex128,
-							chunks=chunks,
-						)
-						h5_out.create_dataset("sigma_sx_kij_ev", data=ryd2ev * np.array(sig_sx))
-						h5_out.create_dataset("hartree_kij_ev", data=ryd2ev * np.array(sig_h))
-						for ibeg in range(0, n_omega, o_chunks):
-							iend = min(ibeg + o_chunks, n_omega)
-							idx = slice(ibeg, iend)
-							sigma_c_ev = ryd2ev * np.array(dset_c[idx], dtype=np.complex128)
-							dset_c_ev[idx] = sigma_c_ev
-							sigma_total_ev = (
-								sigma_c_ev
-								+ ryd2ev * np.array(sig_sx)[None, ...]
-								+ ryd2ev * np.array(sig_h)[None, ...]
-							)
-							dset_total[idx] = sigma_total_ev
-
-
+						hartree_kij_ev=ryd2ev * sig_h)
+				elif sigma_omega.sigma_kij_h5_path:
+					with h5py.File(sigma_omega.sigma_kij_h5_path, "r") as h5_in:
+						dset_c = h5_in["sigma_c_kij_ry"]
+						n_omega, nk, nb = dset_c.shape[0], dset_c.shape[1], dset_c.shape[2]
+						batch = max(1, min(ppm_options.sigma_omega_batch_size, n_omega))
+						with h5py.File(sigma_omega_h5_path, "w") as h5_out:
+							h5_out.create_dataset("omega_ev", data=np.asarray(ppm_options.omega_grid_ev, dtype=np.float64))
+							dset_out = h5_out.create_dataset("sigma_c_kij_ev",
+								shape=dset_c.shape, dtype=np.complex128, chunks=(batch, max(1, min(4, nk)), nb, nb))
+							h5_out.create_dataset("sigma_sx_kij_ev", data=ryd2ev * np.array(sig_sx))
+							h5_out.create_dataset("hartree_kij_ev", data=ryd2ev * np.array(sig_h))
+							for ibeg in range(0, n_omega, batch):
+								dset_out[ibeg:min(ibeg+batch, n_omega)] = \
+									ryd2ev * np.array(dset_c[ibeg:min(ibeg+batch, n_omega)], dtype=np.complex128)
 
 	# Initial Σ = SX + COH + Hartree (all three combined for self-consistency)
 	sigma_total_full = sig_sx + sig_coh + sig_h
