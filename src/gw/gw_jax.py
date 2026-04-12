@@ -377,7 +377,6 @@ def fit_zeta_and_compute_V_q_chunked(
 	
 	return {
 		'V_qmunu': V_qmunu,
-		'v_q0_noG0_munu': V,
 		'G0_mu_nu': G0_mu_nu,
 		'psi_l_rmu_Y': psi_l_rmu_Y,
 		'psi_l_rmuT_X': psi_l_rmuT_X,

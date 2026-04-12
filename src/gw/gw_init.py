@@ -1132,7 +1132,7 @@ def run_isdf_fitting(
 
 	Returns
 	-------
-	dict with keys: V_qmunu, v_q0_noG0_munu, G0_mu_nu, psi_l_rmu_Y, psi_r_rmu_Y
+	dict with keys: V_qmunu, psi_l_rmu_Y, psi_r_rmu_Y, G0_mu_nu
 	"""
 	from .gw_jax import fit_zeta_and_compute_V_q_chunked
 
@@ -1157,24 +1157,15 @@ def run_isdf_fitting(
 
 
 def load_restart_tensors(tensors_filename, mesh_xy, band_slices, print0):
-	"""Load ISDF tensors and wavefunctions from restart h5 file.
-
-	Returns
-	-------
-	dict with keys: V_qmunu, v_q0_noG0_munu, G0_mu_nu, S_qmunu,
-	                psi_full_x, psi_full_y, enk_full
-	"""
+	"""Load ISDF tensors and wavefunctions from restart h5 file."""
 	from file_io import load_restart_state_from_h5
 
-	V_qmunu, S_qmunu, psi_full_x, psi_full_y, enk_full, v_q0_noG0_munu, G0_mu_nu = (
+	V_qmunu, _S, psi_full_x, psi_full_y, enk_full, _V0, _G0 = (
 		load_restart_state_from_h5(tensors_filename, mesh_xy, band_slices=band_slices)
 	)
 	print0("  Loaded restart tensors from h5.")
 	return dict(
 		V_qmunu=V_qmunu,
-		S_qmunu=S_qmunu,
-		v_q0_noG0_munu=v_q0_noG0_munu,
-		G0_mu_nu=G0_mu_nu,
 		psi_full_x=psi_full_x,
 		psi_full_y=psi_full_y,
 		enk_full=enk_full,
@@ -1240,7 +1231,7 @@ def prepare_isdf_and_wavefunctions(
 ):
 	"""Run ISDF fitting or load from restart, build wavefunction bundle.
 
-	Returns SimpleNamespace with: V_qmunu, v_q0_noG0_munu, G0_mu_nu, wf_bundle.
+	Returns SimpleNamespace with: V_qmunu, wf_bundle.
 	"""
 	from file_io import write_restart_state_to_h5, save_restart_state_per_proc
 
@@ -1265,13 +1256,12 @@ def prepare_isdf_and_wavefunctions(
 		write_restart_state_to_h5(
 			tensors_filename, V_qmunu,
 			wfns.psi_yr, wfns.enk, None,
-			V0_noG0_munu=isdf_result['v_q0_noG0_munu'],
-			G0_mu_nu=isdf_result['G0_mu_nu'], init_W0=True,
+			G0_mu_nu=isdf_result.get('G0_mu_nu'), init_W0=True,
 		)
 		save_restart_state_per_proc(
 			os.path.join(tmp_dir, "isdf_tensors"),
 			V_qmunu, None, wfns.psi_yr, wfns.enk,
-			meta, mesh_xy, V0_noG0_munu=isdf_result['v_q0_noG0_munu'],
+			meta, mesh_xy,
 		)
 		V_qmunu.block_until_ready()
 		print0("  Chunked ISDF path complete")
