@@ -857,9 +857,22 @@ def build_operator_setup(
     *,
     include_hartree: bool = False,
     global_psi_G: jax.Array | None = None,
-    truncation_2d: bool = True,
+    truncation_2d: bool | None = None,
+    sys_dim: int = 3,
 ) -> OperatorSetup:
-    """Precompute k-independent data: V_loc, VNL plan, optional V_H."""
+    """Precompute k-independent data: V_loc, VNL plan, optional V_H.
+
+    Parameters
+    ----------
+    truncation_2d : bool or None
+        If None (default), derived from sys_dim: True when sys_dim==2.
+        Explicit True/False overrides sys_dim.
+    sys_dim : int
+        System dimensionality (0, 2, or 3).  Only used when
+        truncation_2d is None.
+    """
+    if truncation_2d is None:
+        truncation_2d = (sys_dim == 2)
     atom_pos = jnp.asarray(wfn.atom_crys, dtype=jnp.float64)
     atom_types = jnp.asarray(wfn.atom_types, dtype=jnp.int32)
     assignments = build_atom_pp_assignments(atom_pos, atom_types, pseudos)
