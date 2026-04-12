@@ -582,99 +582,6 @@ def compute_optimal_chunks(
         'memory_estimate': memory_estimate,
     }
 
-def print_memory_breakdown(
-    chunks: dict,
-    n_b: int,
-    n_r: int,
-    n_q: int,
-    fft_grid: tuple[int, int, int],
-    memory_source: str = 'auto',
-) -> None:
-    """Print memory breakdown and stage bottleneck drivers."""
-    nx, ny, nz = fft_grid
-    mem = chunks['memory_estimate']
-    
-    print("\n" + "="*70)
-    print("  MEMORY-OPTIMIZED CHUNK SIZES")
-    print("="*70)
-    
-    print(f"\n  Memory budget: {mem['budget_gb']:.2f} GB/device (source: {memory_source})")
-    print(f"  Device mesh: {mem['p_x']} × {mem['p_y']} = {mem['n_devices']} devices")
-    pair_channels = int(mem.get('pair_density_channels', 1))
-    
-    print(f"\n  {'Parameter':<25} {'Value':>10} {'Total':>12}")
-    print(f"  {'-'*50}")
-    print(f"  {'Band chunk':<25} {chunks['band_chunk']:>10d} / {n_b:<5d} bands")
-    print(f"  {'R-chunk (r-points)':<25} {chunks['chunk_r']:>10d} / {n_r:<5d} points")
-    print(f"  {'R-chunk (x-slices est)':<25} {chunks['x_chunk']:>10d} / {nx:<5d} slices")
-    print(f"  {'Q-chunk':<25} {chunks['q_chunk']:>10d} / {n_q:<5d} q-points")
-    if chunks.get('k_chunk', 0) > 0:
-        print(f"  {'K-batch (FFT)':<25} {chunks['k_chunk']:>10d}")
-
-    
-    print(f"\n  {'SIMULTANEOUS ALLOCATIONS':<40} {'Size (GB)':>12}")
-    print(f"  {'-'*54}")
-    
-    # Persistent arrays
-    print(f"  {'[Persistent]':<40}")
-    print(f"    {'Centroid union (load stage)':<38} {mem['centroids_full_gb']:>10.3f}")
-    print(f"    {'Centroids (4 arrays: l/r × X/Y)':<38} {mem['centroids_gb']:>10.3f}")
-    if mem.get('use_gspace_cache', False):
-        print(f"    {'G-space cache':<38} {mem['cached_gspace_gb']:>10.3f}")
-    else:
-        print(f"    {'G-space cache':<38} {'(disabled)'}")
-    print(f"    {'L_q (Cholesky factor)':<38} {mem['L_q_gb']:>10.3f}")
-    
-    # CCT stage
-    print(f"\n  {'[Stage: C_q build]':<40}")
-    print(f"    {'Pair densities + C_q':<38} {mem['stage_cct_gb']:>10.3f}")
-    
-    # Pair density stage
-    print(f"\n  {'[Stage: Pair density]':<40}")
-    print(f"    {'psi_nk(rchunk) all bands':<38} {mem['psi_chunk_gb']:>10.3f}")
-    pair_label = 'P_l + P_r (spin-traced)' if pair_channels == 1 else f'P_l + P_r ({pair_channels} spin channels)'
-    print(f"    {pair_label:<38} {mem['pair_density_chunk_gb']:>10.3f}")
-    print(f"    {'─ STAGE TOTAL':<38} {mem['stage_pair_gb']:>10.3f}")
-    
-    # ZCT stage
-    print(f"\n  {'[Stage: ZCT / FFT pipeline (per-device)]':<40}")
-    print(f"    {'P_r alive during left IFFT':<38} {mem.get('zct_peer_alive_gb', 0):>10.3f}")
-    print(f"    {'left IFFT JIT (donated+2 scratch)':<38} {mem.get('zct_left_ifft_gb', 0):>10.3f}")
-    print(f"    {'ZCT transient total':<38} {mem.get('zct_peak_gb', 0):>10.3f}")
-    print(f"    {'─ STAGE TOTAL':<38} {mem['stage_zct_gb']:>10.3f}")
-
-    # Reshard
-    print(f"\n  {'[Stage: Reshard Z (all-to-all)]':<40}")
-    print(f"    {'Z_local+Z_col+2×NCCL':<38} {mem.get('reshard_total_gb', 0):>10.3f}")
-    print(f"    {'─ STAGE TOTAL':<38} {mem.get('stage_reshard_gb', 0):>10.3f}")
-
-    # Solve
-    print(f"\n  {'[Stage: Solve (L^-1 Z)]':<40}")
-    print(f"    {'Z_col (donated, 1×)':<38} {mem.get('solve_z_col_gb', 0):>10.3f}")
-    print(f"    {'per-q cost (×{0})'.format(chunks['q_chunk']):<38} {mem.get('solve_per_q_gb', 0):>10.3f}")
-    print(f"    {'q_chunk × per_q':<38} {mem.get('solve_total_q_gb', 0):>10.3f}")
-    print(f"    {'─ STAGE TOTAL':<38} {mem['stage_solve_gb']:>10.3f}")
-
-    # Gather
-    q_gather = mem.get('q_gather', '?')
-    print(f"\n  {'[Stage: Gather (HDF5 write-back)]':<40}")
-    print(f"    {'zeta (sharded)':<38} {mem.get('Z_col_gb', 0):>10.3f}")
-    print(f"    {'allgather (' + str(q_gather) + ' q-pts)':<38} {mem.get('gather_total_gb', 0):>10.3f}")
-    print(f"    {'─ STAGE TOTAL':<38} {mem.get('stage_gather_gb', 0):>10.3f}")
-    
-    print(f"\n  {'-'*54}")
-    bottleneck = mem.get('bottleneck', 'pair')
-    print(f"  {'PEAK ('+bottleneck+')':<38} {mem['peak_estimate_gb']:>10.3f} GB")
-    print(f"  {'BUDGET':<38} {mem['budget_gb']:>10.3f} GB")
-    print(f"  {'UTILIZATION':<38} {mem['utilization_pct']:>10.1f} %")
-    limit_info = mem.get('limit_info', {})
-    if limit_info:
-        print(f"\n  {'CHUNK LIMIT ESTIMATES (r-points)':<40} {'':>12}")
-        for key in ("limit_fft", "limit_pair", "limit_zct", "limit_zct_soft", "limit_reshard", "limit_solve", "limit_gather", "limit_default"):
-            if key in limit_info:
-                print(f"  {key:<38} {limit_info[key]:>10.1f}")
-    print("="*70)
-
 
 def get_effective_chunk_size(chunk_size: int) -> int | None:
     """Convert chunk_size input flag to actual chunk size.
@@ -1233,7 +1140,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
 		with h5py.File(zeta_h5_path, 'r') as zeta_h5:
 			with mesh_xy:
-				V_qmunu_raw, g0_mu_all = compute_all_V_q_from_zeta_h5(
+				V_q_raw, G0_all = compute_all_V_q_from_zeta_h5(
 					zeta_h5, kgrid=meta.kgrid, fft_grid=meta.fft_grid,
 					bvec=bvec, cell_volume=meta.cell_volume,
 					mu_chunk_size=mu_chunk, mesh_xy=mesh_xy,
@@ -1245,47 +1152,32 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 				)
 
 	# Write G0 = ζ_μ(G=0) at q=0 back to zeta file
-	g0_local = jax.experimental.multihost_utils.process_allgather(g0_mu_all)
-	if g0_local.ndim == 5 and g0_local.shape[0] == 1:
-		g0_local = g0_local[0]
+	G0_gathered = jax.experimental.multihost_utils.process_allgather(G0_all)
+	if G0_gathered.ndim == 5 and G0_gathered.shape[0] == 1:
+		G0_gathered = G0_gathered[0]
 	if jax.process_index() == 0:
 		with h5py.File(zeta_h5_path, 'a') as f:
-			g0_np = np.asarray(g0_local)
 			if 'g0_mu' in f:
 				del f['g0_mu']
-			f.create_dataset('g0_mu', data=g0_np)
+			f.create_dataset('g0_mu', data=np.asarray(G0_gathered))
 	jax.experimental.multihost_utils.sync_global_devices("g0_write")
 
 	# Reshape to (1, npol, npol, nkx, nky, nkz, n_rmu, n_rmu)
 	nkx, nky, nkz = meta.kgrid
-	V_qmunu = jnp.broadcast_to(
-		V_qmunu_raw[None, None, None, :, :, :, :, :],
-		(1, meta.npol, meta.npol, nkx, nky, nkz, meta.n_rmu, meta.n_rmu),
-	)
-	V_qmunu = jnp.array(V_qmunu)  # force copy (avoid broadcast issues)
+	V_qmunu = jnp.array(jnp.broadcast_to(
+		V_q_raw[None, None, None, :, :, :, :, :],
+		(1, meta.npol, meta.npol, nkx, nky, nkz, meta.n_rmu, meta.n_rmu)))
 
-	# Extract G0 at q=0
-	_g0 = g0_local
-	while _g0.ndim > 1:
-		_g0 = _g0[0]
-	G0 = _g0
+	# G0 at q=0
+	G0 = G0_gathered
+	while G0.ndim > 1:
+		G0 = G0[0]
 
 	print_fn(f"\n  V_q computed:")
 	print_fn(f"    Shape: {V_qmunu.shape}")
-	print_fn(f"    V_q=0 trace: {jnp.trace(V_qmunu_raw[0, 0, 0]).real:.4f}")
+	print_fn(f"    V_q=0 trace: {jnp.trace(V_q_raw[0, 0, 0]).real:.4f}")
 
 	return V_qmunu, G0
-
-
-def _load_restart(tensors_filename, mesh_xy, band_slices, print_fn):
-	"""Load ISDF tensors and wavefunctions from restart H5 file."""
-	from file_io import load_restart_state_from_h5
-
-	V_qmunu, _S, psi_full_x, psi_full_y, enk_full, _V0, _G0 = (
-		load_restart_state_from_h5(tensors_filename, mesh_xy, band_slices=band_slices)
-	)
-	print_fn("  Loaded restart tensors from H5.")
-	return V_qmunu, psi_full_y, psi_full_x, enk_full
 
 
 def build_wavefunction_bundle(
@@ -1365,9 +1257,11 @@ def prepare_isdf_and_wavefunctions(
 		print0("  Chunked ISDF path complete")
 	else:
 		# --- Restart from H5 ---
+		from file_io import load_restart_state_from_h5
 		with timing.section("gw_jax.restart_load"):
-			V_qmunu, psi_full_yr, psi_full_xn, enk_full = _load_restart(
-				tensors_filename, mesh_xy, band_slices, print0)
+			V_qmunu, _S, psi_full_xn, psi_full_yr, enk_full, _V0, _G0 = (
+				load_restart_state_from_h5(tensors_filename, mesh_xy, band_slices=band_slices))
+			print0("  Loaded restart tensors from H5.")
 			wfns = build_wavefunction_bundle(
 				wfn, sym, meta, band_slices, mesh_xy,
 				psi_full_yr=psi_full_yr, psi_full_xn=psi_full_xn,

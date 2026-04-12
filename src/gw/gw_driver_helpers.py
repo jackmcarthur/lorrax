@@ -7,20 +7,6 @@ import os
 
 import numpy as np
 
-from .minimax_config import MinimaxConfig
-
-
-@dataclass(frozen=True)
-class ScreeningSetup:
-    """Resolved screening setup passed from the GW driver into the screening backend."""
-
-    omega_eval: float
-    screening_method: str
-    minimax_config: MinimaxConfig
-    ppm_omega_p: float | None
-    ppm_fallback_omega: float
-
-
 @dataclass(frozen=True)
 class PPMSigmaRuntimeOptions:
     """Resolved PPM sigma options parsed once in the GW driver."""
@@ -50,18 +36,6 @@ class PPMSigmaRuntimeOptions:
     write_w_copies_debug: bool
     w_copies_debug_file: str
     sigma_freq_debug_file: str
-
-
-def build_screening_setup(params: dict, minimax_config: MinimaxConfig) -> ScreeningSetup:
-    """Collect the screening-related driver inputs in one place."""
-
-    return ScreeningSetup(
-        omega_eval=float(params.get("debug_omega") or 0.0),
-        screening_method=str(params.get("screening_method", "minimax")).strip().lower(),
-        minimax_config=minimax_config,
-        ppm_omega_p=params.get("ppm_omega_p"),
-        ppm_fallback_omega=float(params.get("ppm_fallback_omega", 2.0)),
-    )
 
 
 def _resolve_input_path(input_dir: str, path: str) -> str:
