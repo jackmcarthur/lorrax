@@ -892,6 +892,17 @@ def fit_zeta_chunked_to_h5(
         writer_thread = threading.Thread(target=writer_worker, daemon=True)
         writer_thread.start()
 
+    # Peak GPU memory tracker — sample after each block_until_ready
+    _peak_bytes = 0
+    def _track_peak():
+        nonlocal _peak_bytes
+        try:
+            stats = jax.devices()[0].memory_stats()
+            if stats:
+                _peak_bytes = max(_peak_bytes, stats.get('peak_bytes_in_use', 0))
+        except Exception:
+            pass
+
     with timing.section("zeta_fit.chunk_loop"):
         for chunk_idx in range(num_chunks):
             r_start = chunk_idx * chunk_r
@@ -918,6 +929,7 @@ def fit_zeta_chunked_to_h5(
                         k_chunk_size=k_chunk_size,
                     )
                 psi_chunk_Y.block_until_ready()
+                _track_peak()
 
                 # Slice for left and right (same logic as centroids)
                 psi_l_chunk_Y = psi_chunk_Y[:, l_band_start:l_band_end, :, :]
@@ -945,6 +957,7 @@ def fit_zeta_chunked_to_h5(
                         psi_r_rmuT_X, psi_r_chunk_Y, mesh_xy
                     )
                 P_l_k_mux.block_until_ready()
+                _track_peak()
                 # No block_until_ready on P_r — ZCT will consume it asynchronously.
                 # P_l's block_until_ready (above) is needed for del psi_l_chunk_Y.
             t_pair_total += time.perf_counter() - t0
@@ -1005,11 +1018,13 @@ def fit_zeta_chunked_to_h5(
             z_col_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
             Z_col = jax.lax.with_sharding_constraint(Z_q_flat, z_col_shard)
             Z_col.block_until_ready()
+            _track_peak()
             del Z_q_flat
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.solve"), jax_profile.step_annotation("chunk_solve", step_num=chunk_idx):
                 zeta_chunk = solve_zeta_from_L_q(L_q, Z_col, mesh_xy, q_chunk_size)
-                # No block_until_ready — gather will consume zeta_chunk asynchronously.
+                zeta_chunk.block_until_ready()
+                _track_peak()
                 del Z_col
             t_solve_total += time.perf_counter() - t0
 
@@ -1082,6 +1097,8 @@ def fit_zeta_chunked_to_h5(
     print(f"  {'-'*50}")
     print(f"  {'Chunk loop total':<20} {t_chunks_total:>10.2f}s {t_chunks_total/num_chunks*1000:>10.1f}ms")
     print(f"  {'Per r-point':<20} {'':<10} {t_chunks_total/n_rtot*1e6:>10.1f}us")
+    if _peak_bytes > 0:
+        print(f"  {'Peak GPU memory':<20} {_peak_bytes/1e9:>10.2f} GB")
 
     # Return left/right centroid wavefunctions in both layouts.
     # yr layout: (nk, nb, ns, n_rmu) — used to assemble the full-band array
