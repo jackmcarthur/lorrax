@@ -546,50 +546,11 @@ def matrix(psi_box: jax.Array, H_k: HamiltonianK) -> jax.Array:
 #   vnl_matrix_at_k        — k-traceable V_NL for custom autodiff chains
 
 from psp.solid_harmonics import solid_harmonics_jax as _solid_harmonics_jax
-
-
-# --- B-spline evaluator (JAX-traceable) ----------------------------------
-
-def extract_spline_data(spl) -> tuple[np.ndarray, np.ndarray, int]:
-    """Extract (t, c, k) from a scipy spline."""
-    t, c, k = spl._eval_args
-    return np.asarray(t), np.asarray(c), int(k)
-
-
-def _fpbspl_jax(t, x, l, k):
-    h = jnp.zeros(20)
-    hh = jnp.zeros(20)
-    h = h.at[0].set(1.0)
-    for j in range(1, k + 1):
-        hh = hh.at[:j].set(h[:j])
-        h = h.at[0].set(0.0)
-        for i in range(j):
-            li = l + i
-            f = hh[i] / (t[li + 1] - t[li + 1 - j])
-            h = h.at[i].set(h[i] + f * (t[li + 1] - x))
-            h = h.at[i + 1].set(f * (x - t[li + 1 - j]))
-    return h
-
-
-def _splev_scalar(x, t, c, k):
-    n = len(t) - k - 1
-    l = k
-    while l < n and t[l + 1] <= x:
-        l += 1
-    h = _fpbspl_jax(t, x, l, k)
-    sp = 0.0
-    for j in range(k + 1):
-        sp += c[l - k + j] * h[j]
-    return sp
-
-
-def splev_jax(x, t, c, k=3):
-    """JAX B-spline evaluator.  Vectorised, autodiff-safe."""
-    t_j = jnp.asarray(t, dtype=jnp.float64)
-    c_j = jnp.asarray(c, dtype=jnp.float64)
-    return jax.vmap(lambda xi: _splev_scalar(xi, t_j, c_j, k))(
-        jnp.asarray(x, dtype=jnp.float64).ravel()
-    ).reshape(x.shape)
+from psp.radial_jax import (
+    RadialTable,
+    differentiate_uniform_table,
+    interp_uniform_jax,
+)
 
 
 # --- VNL channel data (k-independent, for autodiff path) -----------------
@@ -604,35 +565,24 @@ class VNLChannelData:
     prefactor: float            # 4π / √Ω
     l: int
     nbeta: int
-    spline_t: list[jax.Array]   # radial form factor F_l(q) spline knots
-    spline_c: list[jax.Array]   # coefficients
-    spline_k: int               # spline degree
-    reduced_spline_t: list[jax.Array]   # G_l(q) = F_l(q)/q^l — smooth at q=0
-    reduced_spline_c: list[jax.Array]
-    reduced_deriv_t: list[jax.Array]    # G'_l(q) derivative spline
-    reduced_deriv_c: list[jax.Array]
-    reduced_deriv_k: int
+    q0: float
+    dq: float
+    reduced_tables: tuple[np.ndarray, ...]    # G_l(q) = F_l(q) / q^l
+    reduced_dtables: tuple[np.ndarray, ...]   # d/dq of reduced_tables
     E: jax.Array                # (nspinor, nspinor, R, R) D-matrix
 
 
-def _build_reduced_spline(spl, l: int):
-    """G_l(q) = F_l(q)/q^l spline and its derivative G'_l."""
-    from scipy.interpolate import InterpolatedUnivariateSpline
-    t_F, c_F, k_F = spl._eval_args
-    q_max = float(t_F[-1])
-    n_pts = max(50000, len(t_F) * 10)
-    q_grid = np.linspace(0, q_max, n_pts)
-    F_vals = np.asarray(spl(q_grid), dtype=np.float64)
+def _build_reduced_tables(tab: RadialTable, l: int) -> tuple[np.ndarray, np.ndarray]:
+    """Reduced radial table G_l(q) = F_l(q)/q^l and its q-derivative."""
+    F_vals = np.asarray(tab.values, dtype=np.float64)
+    q_grid = tab.q0 + tab.dq * np.arange(F_vals.size, dtype=np.float64)
     if l == 0:
-        G_vals = F_vals
+        G_vals = F_vals.copy()
     else:
         G_vals = np.empty_like(F_vals)
         G_vals[1:] = F_vals[1:] / q_grid[1:] ** l
         G_vals[0] = F_vals[1] / q_grid[1] ** l
-    deg = min(k_F, 3)
-    spl_G = InterpolatedUnivariateSpline(q_grid, G_vals, k=deg)
-    spl_Gp = spl_G.derivative()
-    return extract_spline_data(spl_G), extract_spline_data(spl_Gp)
+    return G_vals, differentiate_uniform_table(G_vals, tab.dq)
 
 
 def extract_vnl_channel_data(
@@ -659,30 +609,30 @@ def extract_vnl_channel_data(
             if not beta_ids:
                 continue
 
-            spl_t_list, spl_c_list = [], []
-            red_t_list, red_c_list = [], []
-            rdd_t_list, rdd_c_list = [], []
-            deriv_k = None
+            q0 = None
+            dq = None
+            red_tables = []
+            red_dtables = []
             for bid in beta_ids:
-                spl = splines[(l, int(bid))]
-                t, c, k = extract_spline_data(spl)
-                spl_t_list.append(jnp.asarray(t))
-                spl_c_list.append(jnp.asarray(c))
-                (t_r, c_r, _), (t_d, c_d, k_d) = _build_reduced_spline(spl, l)
-                red_t_list.append(jnp.asarray(t_r))
-                red_c_list.append(jnp.asarray(c_r))
-                rdd_t_list.append(jnp.asarray(t_d))
-                rdd_c_list.append(jnp.asarray(c_d))
-                deriv_k = int(k_d)
+                tab = splines[(l, int(bid))]
+                if not isinstance(tab, RadialTable):
+                    raise TypeError("Expected RadialTable in projector plan")
+                q0 = float(tab.q0) if q0 is None else q0
+                dq = float(tab.dq) if dq is None else dq
+                G_vals, Gp_vals = _build_reduced_tables(tab, l)
+                red_tables.append(G_vals)
+                red_dtables.append(Gp_vals)
 
             E_j = jnp.asarray(E_np, dtype=jnp.complex128)[:nspinor, :nspinor]
             channels.append(VNLChannelData(
                 tau=jnp.asarray(tau, dtype=jnp.float64),
-                prefactor=pref, l=l, nbeta=len(beta_ids),
-                spline_t=spl_t_list, spline_c=spl_c_list, spline_k=int(k),
-                reduced_spline_t=red_t_list, reduced_spline_c=red_c_list,
-                reduced_deriv_t=rdd_t_list, reduced_deriv_c=rdd_c_list,
-                reduced_deriv_k=deriv_k if deriv_k is not None else max(0, int(k) - 1),
+                prefactor=pref,
+                l=l,
+                nbeta=len(beta_ids),
+                q0=0.0 if q0 is None else q0,
+                dq=1.0 if dq is None else dq,
+                reduced_tables=tuple(red_tables),
+                reduced_dtables=tuple(red_dtables),
                 E=E_j,
             ))
     return channels
@@ -707,20 +657,24 @@ def _build_Z_channel_jax(K_crys, K_cart, ch):
 def _radial_times_solid_harm(K_cart, ch, pref):
     return _radial_times_solid_harm_impl(
         K_cart,
-        tuple(ch.reduced_spline_t), tuple(ch.reduced_spline_c),
-        tuple(ch.reduced_deriv_t), tuple(ch.reduced_deriv_c),
-        pref, ch.l, ch.nbeta, ch.spline_k,
+        tuple(ch.reduced_tables),
+        tuple(ch.reduced_dtables),
+        ch.q0,
+        ch.dq,
+        pref,
+        ch.l,
+        ch.nbeta,
     )
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(1, 2, 3, 4, 5, 6, 7, 8))
+@functools.partial(jax.custom_jvp, nondiff_argnums=(1, 2, 3, 4, 5, 6, 7))
 def _radial_times_solid_harm_impl(
-    K_cart, spl_t, spl_c, spl_dt, spl_dc, pref, l, nbeta, spl_k,
+    K_cart, tables, dtables, q0, dq, pref, l, nbeta,
 ):
     _EPS2 = 1e-60
     q = jnp.sqrt(jnp.sum(K_cart ** 2, axis=1) + _EPS2)
     G_bG = jnp.stack(
-        [splev_jax(q, spl_t[ib], spl_c[ib], spl_k) for ib in range(nbeta)],
+        [interp_uniform_jax(q, q0, dq, jnp.asarray(tables[ib], dtype=jnp.float64)) for ib in range(nbeta)],
     )
     S = _solid_harmonics_jax(l, K_cart)
     return pref * (1j) ** l * G_bG[:, None, :] * S[None, :, :]
@@ -728,22 +682,21 @@ def _radial_times_solid_harm_impl(
 
 @_radial_times_solid_harm_impl.defjvp
 def _radial_times_solid_harm_jvp(
-    spl_t, spl_c, spl_dt, spl_dc, pref, l, nbeta, spl_k,
+    tables, dtables, q0, dq, pref, l, nbeta,
     primals, tangents,
 ):
-    """Stable JVP: G'_l from precomputed derivative spline, no autodiff
+    """Stable JVP: G'_l from precomputed derivative table, no autodiff
     through sqrt(K²) which would give NaN at K=0."""
     (K_cart,) = primals
     (dK_cart,) = tangents
     _EPS2 = 1e-60
-    deriv_k = max(0, spl_k - 1)
 
     K_sq = jnp.sum(K_cart ** 2, axis=1)
     q = jnp.sqrt(K_sq + _EPS2)
     G_list, Gp_list = [], []
     for ib in range(nbeta):
-        G_list.append(splev_jax(q, spl_t[ib], spl_c[ib], spl_k))
-        Gp_list.append(splev_jax(q, spl_dt[ib], spl_dc[ib], deriv_k))
+        G_list.append(interp_uniform_jax(q, q0, dq, jnp.asarray(tables[ib], dtype=jnp.float64)))
+        Gp_list.append(interp_uniform_jax(q, q0, dq, jnp.asarray(dtables[ib], dtype=jnp.float64)))
     G_bG = jnp.stack(G_list)
     Gp_bG = jnp.stack(Gp_list)
     S = _solid_harmonics_jax(l, K_cart)
@@ -804,11 +757,11 @@ def build_Z_and_dZ(k_crys, G_int, B, channels):
         msize = 2 * l + 1
 
         G_bG = jnp.stack([
-            splev_jax(q, ch.reduced_spline_t[ib], ch.reduced_spline_c[ib], ch.spline_k)
+            interp_uniform_jax(q, ch.q0, ch.dq, jnp.asarray(ch.reduced_tables[ib], dtype=jnp.float64))
             for ib in range(ch.nbeta)
         ])
         Gp_bG = jnp.stack([
-            splev_jax(q, ch.reduced_deriv_t[ib], ch.reduced_deriv_c[ib], ch.reduced_deriv_k)
+            interp_uniform_jax(q, ch.q0, ch.dq, jnp.asarray(ch.reduced_dtables[ib], dtype=jnp.float64))
             for ib in range(ch.nbeta)
         ])
         S = _solid_harmonics_jax(l, K_cart)

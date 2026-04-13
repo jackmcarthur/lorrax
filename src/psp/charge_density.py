@@ -27,6 +27,7 @@ import jax.numpy as jnp
 from file_io import WFNReader
 from common import symmetry_maps, Meta
 from common.load_wfns import load_kpoint_fftbox
+from psp.radial_jax import radial_weights, spherical_hankel_table_jax
 
 
 def build_density_from_ibz(
@@ -246,33 +247,19 @@ def build_core_density(
         r = np.asarray(mesh.pp_r.value, dtype=float)
         rab = np.asarray(mesh.pp_rab.value, dtype=float)
 
-        # Fourier transform: ρ_core(G) = (4π/Ω) ∫ r² ρ_core(r) j₀(Gr) dr
-        # Uses Simpson's rule for the radial integral (matching QE's
-        # init_tab_rhc), which is O(h⁴) vs trapezoidal O(h²).
+        # Fourier transform: ρ_core(G) = (4π/Ω) ∫ r² ρ_core(r) j₀(Gr) dr.
+        # Use the shared JAX radial backend with QE-style Simpson×rab weights.
         G_flat = G_norm.ravel()              # (n_G,)
-        Gr = np.outer(G_flat, r)             # (n_G, n_r)
-
-        # j₀(x) = sin(x)/x, with j₀(0) = 1
-        j0 = np.sinc(Gr / np.pi)            # np.sinc(x) = sin(πx)/(πx)
-
-        # Integrand without rab: f(r_i) = r² ρ_core(r) j₀(Gr)
-        # For each G: result = simpson_integrate(f * j0_row, rab)
-        f_base = r ** 2 * rho_c_r            # (n_r,)
-        f_full = j0 * f_base[None, :]        # (n_G, n_r)
-
-        # Simpson's rule with non-uniform grid (QE convention):
-        # ∫ f dr ≈ Σ_i w_i f(r_i) rab_i, where w follows 1/3, 4/3, 2/3...
-        n_r = len(r)
-        w = np.ones(n_r)
-        w[0] = 1.0 / 3.0
-        for i in range(1, n_r - 1, 2):
-            w[i] = 4.0 / 3.0
-        for i in range(2, n_r - 1, 2):
-            w[i] = 2.0 / 3.0
-        w[n_r - 1] = 1.0 / 3.0
-        simpson_weights = w * rab  # (n_r,)
-
-        rho_c_G_flat = (4 * np.pi / vol) * (f_full @ simpson_weights)
+        simpson_weights = radial_weights(r, rab, scheme="simpson_rab")
+        rho_c_G_flat = (4 * np.pi / vol) * np.asarray(
+            spherical_hankel_table_jax(
+                0,
+                jnp.asarray(r, dtype=jnp.float64),
+                jnp.asarray(rho_c_r, dtype=jnp.float64),
+                jnp.asarray(G_flat, dtype=jnp.float64),
+                jnp.asarray(simpson_weights, dtype=jnp.float64),
+            )
+        )
         rho_c_G_atom = rho_c_G_flat.reshape(nx, ny, nz)
 
         # Structure factor: e^{-2πi G_crys · τ}

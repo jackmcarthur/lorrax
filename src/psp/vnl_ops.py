@@ -7,9 +7,9 @@ projector matrix Z of shape (total_R, nG).  E is a block-diagonal
 then a single set of einsums with no Python loops.
 
 Radial form factors use table lookup on a uniform q-grid (linear
-interpolation) instead of per-scalar B-spline evaluation.  This is
-~100x faster than splev_jax for vectorised q arrays and still has
-negligible error with a 50k-point table (spacing ~1e-4).
+interpolation) instead of spline evaluation. This keeps the production
+path in a single JAX/table architecture and is still accurate with a
+50k-point table (spacing ~1e-4).
 
 Solid harmonics (Cartesian polynomials) replace angular Y_lm for
 autodiff-safe behaviour at K=0.
@@ -22,13 +22,17 @@ import jax
 import jax.numpy as jnp
 
 from psp.build_projectors_qe import (
-    build_local_ionic_potential_on_G_total,
-    precompute_projector_splines,
     build_E_blocks_full,
 )
 from psp.get_DFT_mtxels import (
     build_atom_pp_assignments,
     generate_gvectors_k,
+)
+from psp.radial_jax import (
+    differentiate_uniform_table,
+    make_projector_table,
+    make_uniform_q_grid,
+    radial_weights,
 )
 # Import solid harmonics without circular dependency
 # (dft_operators imports vnl_ops, so we can't import from dft_operators here)
@@ -120,22 +124,25 @@ def build_vnl_setup(
     cell_volume = float(wfn.cell_volume)
     prefactor = (4.0 * np.pi) / np.sqrt(cell_volume)
 
-    # Determine q_max
+    # Determine q_max. For PW spheres this is already bounded by ecutwfc.
     if q_max is None:
-        if sym is None:
-            raise ValueError("Either q_max or (sym, meta) required for build_vnl_setup")
-        q_max = 0.0
-        for ik in range(sym.nk_tot):
-            Gk, _ = generate_gvectors_k(ik, sym, wfn, meta)
-            kvec = np.asarray(sym.unfolded_kpts[ik], dtype=float)
-            K_cart = (np.asarray(Gk, dtype=float) + kvec[None, :]) @ B
-            qk = np.sqrt(np.sum(K_cart ** 2, axis=1))
-            if qk.size:
-                q_max = max(q_max, float(np.max(qk)))
+        if hasattr(wfn, "ecutwfc"):
+            q_max = float(np.sqrt(float(wfn.ecutwfc)))
+        else:
+            if sym is None:
+                raise ValueError("Either q_max or (sym, meta) required for build_vnl_setup")
+            q_max = 0.0
+            for ik in range(sym.nk_tot):
+                Gk, _ = generate_gvectors_k(ik, sym, wfn, meta)
+                kvec = np.asarray(sym.unfolded_kpts[ik], dtype=float)
+                K_cart = (np.asarray(Gk, dtype=float) + kvec[None, :]) @ B
+                qk = np.sqrt(np.sum(K_cart ** 2, axis=1))
+                if qk.size:
+                    q_max = max(q_max, float(np.max(qk)))
     q_max *= 1.01  # small margin
 
     dq = q_max / (n_q - 1)
-    q_grid = np.linspace(0, q_max, n_q)
+    q_grid = make_uniform_q_grid(q_max, n_q)
 
     # Group atoms by pseudopotential
     species_map: dict[int, dict] = {}
@@ -162,7 +169,16 @@ def build_vnl_setup(
         natoms = tau.shape[0]
 
         E_blocks = build_E_blocks_full(pseudo)
-        splines = precompute_projector_splines(pseudo, cell_volume, q_max)
+        ppmesh = getattr(pseudo, 'pp_mesh', None)
+        ppnl = getattr(pseudo, 'pp_nonlocal', None)
+        if ppmesh is None or ppnl is None:
+            continue
+        r = np.asarray(ppmesh.pp_r.value, dtype=float)
+        try:
+            rab = np.asarray(ppmesh.pp_rab.value, dtype=float)
+        except Exception:
+            rab = None
+        weights = radial_weights(r, rab, scheme="rab")
 
         # Enumerate l-channels
         betas = list(getattr(getattr(pseudo, 'pp_nonlocal', None), 'pp_beta', []))
@@ -181,12 +197,15 @@ def build_vnl_setup(
 
             # Evaluate F_l(q) splines on uniform grid → build G_l = F_l/q^l
             for bid in beta_ids:
-                spl = splines.get((l, bid))
-                if spl is None:
-                    G_rows.append(np.zeros(n_q))
-                    Gp_rows.append(np.zeros(n_q))
-                    continue
-                F_vals = np.asarray(spl(q_grid), dtype=np.float64)
+                beta = betas[int(bid) - 1]
+                raw_beta = np.asarray(beta.value, dtype=float)
+                if r[0] == 0.0 and len(r) > 1:
+                    beta_r = np.empty_like(r)
+                    beta_r[1:] = raw_beta[1:] / r[1:]
+                    beta_r[0] = beta_r[1]
+                else:
+                    beta_r = raw_beta / r
+                F_vals = make_projector_table(l, r, beta_r, q_grid, weights).values
                 if l == 0:
                     G_vals = F_vals.copy()
                 else:
@@ -194,11 +213,7 @@ def build_vnl_setup(
                     G_vals[1:] = F_vals[1:] / q_grid[1:] ** l
                     G_vals[0] = F_vals[1] / q_grid[1] ** l  # limit
 
-                # G'_l via finite difference on the G_l values (2nd order)
-                Gp_vals = np.empty(n_q, dtype=np.float64)
-                Gp_vals[1:-1] = (G_vals[2:] - G_vals[:-2]) / (2 * dq)
-                Gp_vals[0] = (G_vals[1] - G_vals[0]) / dq
-                Gp_vals[-1] = (G_vals[-1] - G_vals[-2]) / dq
+                Gp_vals = differentiate_uniform_table(G_vals, dq)
 
                 G_rows.append(G_vals)
                 Gp_rows.append(Gp_vals)

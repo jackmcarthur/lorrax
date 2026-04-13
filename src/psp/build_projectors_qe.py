@@ -23,8 +23,15 @@ import os
 import numpy as np
 from typing import Dict, Tuple, List, Sequence, Mapping
 
-from scipy.special import spherical_jn, erf
-from scipy.interpolate import InterpolatedUnivariateSpline
+import jax.numpy as jnp
+
+from .radial_jax import (
+    RadialTable,
+    make_local_sr_table,
+    make_projector_table,
+    make_uniform_q_grid,
+    radial_weights,
+)
 
 # Self-contained: provide local implementations of helpers previously imported
 
@@ -330,20 +337,15 @@ def _spherical_hankel_transform_l(l: int,
                                   beta_r: np.ndarray,
                                   q: np.ndarray,
                                   rab: np.ndarray | None = None) -> np.ndarray:
-    r = np.asarray(r, dtype=float)
-    beta_r = np.asarray(beta_r, dtype=float)
-    q = np.asarray(q, dtype=float)
-    qr = np.multiply.outer(q, r)
-    j_l = spherical_jn(l, qr)
-    integrand = (r**2)[None, :] * beta_r[None, :] * j_l
-    if rab is not None:
-        w = np.asarray(rab, dtype=float)[None, :]
-        return np.sum(integrand * w, axis=1)
-    dr = r[1] - r[0]
-    weights = np.ones_like(r)
-    weights[0] = 0.5
-    weights[-1] = 0.5
-    return np.sum(integrand * weights[None, :], axis=1) * dr
+    q_grid = np.asarray(q, dtype=np.float64)
+    weights = radial_weights(np.asarray(r, dtype=float), rab, scheme='rab')
+    return make_projector_table(
+        int(l),
+        np.asarray(r, dtype=float),
+        np.asarray(beta_r, dtype=float),
+        q_grid,
+        weights,
+    ).values
 
 
 def spherical_hankel_transform_l_np(l: int,
@@ -369,20 +371,14 @@ def _fourier_transform_vloc_qe(
     erf-subtracted integrand and re-adding the analytic tail in G space.
     """
 
-    r = np.asarray(r, dtype=float)
-    vloc_r = np.asarray(vloc_r, dtype=float)
-    q_grid = np.asarray(q_grid, dtype=float)
-    e2 = 2.0  # atomic Ry units
-    # QE convention: build a short-range real-space potential by ADDING
-    # Z*e2*erf(r)/r to vloc(r), then transform. This matches upflib/vloc_mod:
-    # aux(r) = (r*vloc(r) + Z*e2*erf(r)) * sin(qr)/q
-    with np.errstate(divide='ignore', invalid='ignore'):
-        sr_beta = vloc_r + z_valence * e2 * np.where(r > 0, erf(r) / r, 2.0/np.sqrt(np.pi))
-    # Use the same core radial transform as projectors (no 4π/Ω here)
-    short = spherical_hankel_transform_l_np(0, r, sr_beta, q_grid, rab)
-    # Do NOT re-add the long-range analytic piece here; it is evaluated
-    # explicitly on the FFT grid from rho_ion(G) for numerical accuracy.
-    return short
+    weights = radial_weights(np.asarray(r, dtype=float), rab, scheme='rab')
+    return make_local_sr_table(
+        np.asarray(r, dtype=float),
+        np.asarray(vloc_r, dtype=float),
+        float(z_valence),
+        np.asarray(q_grid, dtype=float),
+        weights,
+    ).values
 
 
 def _form_factors_qe(pseudo, K_norm: np.ndarray, cell_volume: float) -> Dict[Tuple[int, int], np.ndarray]:
@@ -401,7 +397,8 @@ def _form_factors_qe(pseudo, K_norm: np.ndarray, cell_volume: float) -> Dict[Tup
     K_norm = np.asarray(K_norm, dtype=float)
     qmax = float(np.max(K_norm)) if K_norm.size > 0 else 0.0
     q_points = max(1024, 2 * len(r))
-    q_grid = np.linspace(0.0, max(qmax, 1e-8), q_points)
+    q_grid = make_uniform_q_grid(qmax, q_points)
+    weights = radial_weights(r, rab, scheme='rab')
     result: Dict[Tuple[int, int], np.ndarray] = {}
     for idx, beta in enumerate(betas, start=1):
         l = int(getattr(beta, 'lll', getattr(beta, 'angular_momentum', 0)))
@@ -412,10 +409,8 @@ def _form_factors_qe(pseudo, K_norm: np.ndarray, cell_volume: float) -> Dict[Tup
             beta_r[0] = beta_r[1]
         else:
             beta_r = raw_beta / r
-        F_q = _spherical_hankel_transform_l(l, r, beta_r, q_grid, rab)
-        spl = InterpolatedUnivariateSpline(q_grid, F_q, k=3, ext=1)
-        F_on_K = spl(K_norm)
-        result[(l, idx)] = F_on_K
+        tab = make_projector_table(l, r, beta_r, q_grid, weights)
+        result[(l, idx)] = tab(K_norm)
     return result
 
 
@@ -435,7 +430,7 @@ def build_local_ionic_potential_on_G_total(
     bvec: np.ndarray | None = None,
     blat: float | None = None,
     truncation_2d: bool = False,
-) -> np.ndarray:
+) -> jax.Array:
     """Simplified builder: return total V_loc(r) on the provided FFT grid (Ry).
 
     - Builds SR in G with QE's SR integrand (adds Z e2 erf(r)/r) and alpha‑Z at G=0.
@@ -494,10 +489,10 @@ def build_local_ionic_potential_on_G_total(
         Zval = float(getattr(pseudo.pp_header, 'z_valence', 0.0))
 
         q_points = max(2048, 2 * len(r))
-        q_grid = np.linspace(0.0, max(float(np.max(q_flat)), 1e-8), q_points)
+        q_grid = make_uniform_q_grid(float(np.max(q_flat)), q_points)
         V_q_sr = _fourier_transform_vloc_qe(r, rab, v_r, q_grid, Zval, cell_volume)
-        spl = InterpolatedUnivariateSpline(q_grid, V_q_sr, k=3, ext=1)
-        V_sr_on_flat = (sqrtN * (4.0 * np.pi) * inv_omega) * spl(q_flat)
+        tab = RadialTable(q0=float(q_grid[0]), dq=float(q_grid[1] - q_grid[0]), values=V_q_sr)
+        V_sr_on_flat = (sqrtN * (4.0 * np.pi) * inv_omega) * tab(q_flat)
         V_sr_on_grid = V_sr_on_flat.reshape((nx, ny, nz))
 
         # Alpha‑Z at G=0
@@ -564,8 +559,8 @@ def build_local_ionic_potential_on_G_total(
 
     # Total to real
     V_tot = Vloc_G_sr + Vloc_G_lr
-    V_r = np.real(np.fft.ifftn(V_tot, norm='ortho'))
-    return V_r.astype(float)
+    V_r = jnp.real(jnp.fft.ifftn(jnp.asarray(V_tot), norm='ortho'))
+    return jnp.asarray(V_r, dtype=jnp.float64)
 
 # --------------------------
 # α^{σ,ℓ,j} (Clebsch–Gordan) and U^{σ,ℓ,j}
@@ -775,7 +770,7 @@ def compute_type_projectors_real(
     K_cart_total: np.ndarray,
     cell_volume: float,
     Y_real_by_l_pre: Dict[int, np.ndarray] | None = None,
-    F_splines: Dict[Tuple[int, int], InterpolatedUnivariateSpline] | None = None,
+    F_splines: Dict[Tuple[int, int], RadialTable] | None = None,
     K_norm_in: np.ndarray | None = None,
 ):
     """Compute QE real-harmonic projector rows with structure factors.
@@ -853,10 +848,11 @@ def precompute_projector_splines(
     cell_volume: float,
     q_max: float,
     q_points: int | None = None,
-) -> Dict[Tuple[int, int], InterpolatedUnivariateSpline]:
-    """Precompute radial form-factor splines F_l(q) for all beta channels of a pseudo.
+) -> Dict[Tuple[int, int], RadialTable]:
+    """Precompute uniformly tabulated projector form factors F_l(q).
 
-    Returns dict keyed by (l, beta_index) mapping to InterpolatedUnivariateSpline.
+    Returns dict keyed by ``(l, beta_index)`` mapping to ``RadialTable``.
+    The function name is kept for compatibility with older callers.
     """
     ppmesh = getattr(pseudo, 'pp_mesh', None)
     ppnl = getattr(pseudo, 'pp_nonlocal', None)
@@ -872,8 +868,9 @@ def precompute_projector_splines(
         return {}
     if q_points is None:
         q_points = max(2048, 2 * len(r))
-    q_grid = np.linspace(0.0, max(float(q_max), 1e-8), q_points)
-    splines: Dict[Tuple[int, int], InterpolatedUnivariateSpline] = {}
+    q_grid = make_uniform_q_grid(float(q_max), q_points)
+    weights = radial_weights(r, rab, scheme='rab')
+    splines: Dict[Tuple[int, int], RadialTable] = {}
     for idx, beta in enumerate(betas, start=1):
         l = int(getattr(beta, 'lll', getattr(beta, 'angular_momentum', 0)))
         raw_beta = np.asarray(beta.value, dtype=float)
@@ -883,9 +880,7 @@ def precompute_projector_splines(
             beta_r[0] = beta_r[1]
         else:
             beta_r = raw_beta / r
-        F_q = spherical_hankel_transform_l_np(l, r, beta_r, q_grid, rab)
-        spl = InterpolatedUnivariateSpline(q_grid, F_q, k=3, ext=1)
-        splines[(l, idx)] = spl
+        splines[(l, idx)] = make_projector_table(l, r, beta_r, q_grid, weights)
     return splines
 
 
