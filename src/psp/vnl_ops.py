@@ -24,10 +24,6 @@ import jax.numpy as jnp
 from psp.build_projectors_qe import (
     build_E_blocks_full,
 )
-from psp.get_DFT_mtxels import (
-    build_atom_pp_assignments,
-    generate_gvectors_k,
-)
 from psp.radial_jax import (
     differentiate_uniform_table,
     make_projector_table,
@@ -114,6 +110,8 @@ def build_vnl_setup(
     """
     if nspinor is None:
         nspinor = int(meta.nspinor) if meta is not None else int(wfn.nspinor)
+
+    from psp.get_DFT_mtxels import build_atom_pp_assignments
 
     atom_pos = jnp.asarray(wfn.atom_crys, dtype=jnp.float64)
     atom_types = jnp.asarray(wfn.atom_types, dtype=jnp.int32)
@@ -225,8 +223,12 @@ def build_vnl_setup(
             ))
             beta_idx += nbeta
 
-    G_table = jnp.asarray(np.stack(G_rows, axis=0), dtype=jnp.float64)
-    Gp_table = jnp.asarray(np.stack(Gp_rows, axis=0), dtype=jnp.float64)
+    if G_rows:
+        G_table = jnp.asarray(np.stack(G_rows, axis=0), dtype=jnp.float64)
+        Gp_table = jnp.asarray(np.stack(Gp_rows, axis=0), dtype=jnp.float64)
+    else:
+        G_table = jnp.zeros((0, n_q), dtype=jnp.float64)
+        Gp_table = jnp.zeros((0, n_q), dtype=jnp.float64)
 
     total_R = sum(ch.R * ch.natoms for ch in channels)
 
@@ -274,6 +276,8 @@ def build_vnl_kdata(
     compute_dZ: bool = False,
 ) -> VNLKData:
     """Build dense Z [and dZ] for one k-point (SymMaps path)."""
+    from psp.get_DFT_mtxels import generate_gvectors_k
+
     Gk_crys, _ = generate_gvectors_k(k_idx, sym, wfn, meta)
     kvec = np.asarray(sym.unfolded_kpts[k_idx], dtype=float)
     return _build_vnl_kdata_core(kvec, np.asarray(Gk_crys, dtype=int),
@@ -395,22 +399,26 @@ def _build_vnl_kdata_core(
             dZ_flat = dZ_total.transpose(1, 0, 2, 3, 4).reshape(3, natoms * R, nG)
             dZ_blocks.append(dZ_flat)
 
-    # Concatenate all channels
-    Z = jnp.concatenate(Z_blocks, axis=0)                  # (total_R, nG)
+    if Z_blocks:
+        Z = jnp.concatenate(Z_blocks, axis=0)                  # (total_R, nG)
 
-    # Assemble block-diagonal E_super
-    E_super = np.zeros((nspinor, nspinor, setup.total_R, setup.total_R),
-                       dtype=np.complex128)
-    offset = 0
-    for E_big in E_blocks_diag:
-        r = E_big.shape[2]
-        E_super[:, :, offset:offset+r, offset:offset+r] = E_big
-        offset += r
-    E_super_j = jnp.asarray(E_super, dtype=jnp.complex128)
+        # Assemble block-diagonal E_super
+        E_super = np.zeros((nspinor, nspinor, setup.total_R, setup.total_R),
+                           dtype=np.complex128)
+        offset = 0
+        for E_big in E_blocks_diag:
+            r = E_big.shape[2]
+            E_super[:, :, offset:offset+r, offset:offset+r] = E_big
+            offset += r
+        E_super_j = jnp.asarray(E_super, dtype=jnp.complex128)
 
-    dZ_j = None
-    if compute_dZ and dZ_blocks:
-        dZ_j = jnp.concatenate(dZ_blocks, axis=1)         # (3, total_R, nG)
+        dZ_j = None
+        if compute_dZ and dZ_blocks:
+            dZ_j = jnp.concatenate(dZ_blocks, axis=1)         # (3, total_R, nG)
+    else:
+        Z = jnp.zeros((0, nG), dtype=jnp.complex128)
+        E_super_j = jnp.zeros((nspinor, nspinor, 0, 0), dtype=jnp.complex128)
+        dZ_j = (jnp.zeros((3, 0, nG), dtype=jnp.complex128) if compute_dZ else None)
 
     return VNLKData(
         Z=Z, E_super=E_super_j, nG=nG,

@@ -35,15 +35,16 @@ from psp.get_DFT_mtxels import (
     compute_kinetic_k,
     compute_local_V_k,
 )
-from psp.projector_pipeline import build_vnl_plan, compute_V_NL_k_minimal
+from psp.dft_operators import vnl_matrix_from_kdata
 from psp.operator_checks import validate_operator_inputs
+import psp.vnl_ops as vnl_ops
 
 
 def _resolve_against(path: str, base_dir: str) -> str:
     return path if os.path.isabs(path) else os.path.join(base_dir, path)
 
 
-def get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, plan, wfn, g_mask=None):
+def get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, vnl_setup, wfn, g_mask=None):
     """Compute T + V_loc + V_NL for a single k-point.
 
     Parameters
@@ -52,7 +53,7 @@ def get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, plan, wfn, g_mask=None):
     Gk_crys : (nG, 3) int — G-vector indices for this k
     kvec : (3,) float — k-point in crystal coords
     V_loc_r : (nx, ny, nz) — local ionic potential on FFT grid
-    plan : VNL plan from build_vnl_plan (or None to skip V_NL)
+    vnl_setup : VNLSetup from vnl_ops.build_vnl_setup (or None to skip V_NL)
     wfn : WFNReader (for bdot, bvec, blat, cell_volume)
     g_mask : (nG,) float or None — mask for padded G-vectors
     """
@@ -63,15 +64,13 @@ def get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, plan, wfn, g_mask=None):
     )
 
     V_NL_k = 0.0
-    if plan is not None:
-        bvec_np = np.asarray(wfn.bvec, dtype=float).T
-        B = float(wfn.blat) * bvec_np.T
-        K_crys = np.asarray(Gk_crys, dtype=float) + np.asarray(kvec, dtype=float)[None, :]
-        K_cart = K_crys @ B
-        V_NL_k = compute_V_NL_k_minimal(
-            wfn_k, Gk_crys, K_crys, K_cart, plan,
-            float(wfn.cell_volume), g_mask=g_mask,
+    if vnl_setup is not None:
+        kdata = vnl_ops.build_vnl_kdata_from_kvec(
+            np.asarray(kvec, dtype=float),
+            np.asarray(Gk_crys, dtype=int),
+            vnl_setup,
         )
+        V_NL_k = vnl_matrix_from_kdata(wfn_k, Gk_crys, kdata)
 
     return T_k + V_loc_k + V_NL_k
 
@@ -175,23 +174,16 @@ def main(argv=None):
         )
         V_loc_r = jnp.asarray(V_loc_r, dtype=jnp.float64)
 
-    # ---- compute q_max for V_NL plan ----
-    bvec_np = np.asarray(wfn.bvec, dtype=float).T
-    B = float(wfn.blat) * bvec_np.T
-    q_max = 0.0
-    for ik in range(sym.nk_tot):
-        Gk_crys, _ = generate_gvectors_k(ik, sym, wfn, meta)
-        Gk = np.asarray(Gk_crys, dtype=float)
-        kvec = np.asarray(sym.unfolded_kpts[ik], dtype=float)
-        K_cart = (Gk + kvec[None, :]) @ B
-        K_norm = np.sqrt(np.sum(K_cart ** 2, axis=1))
-        if K_norm.size:
-            q_max = max(q_max, float(np.max(K_norm)))
-
-    plan = None
-    if assignments and pseudos:
-        print("Building V_NL plan...")
-        plan = build_vnl_plan(pseudos, assignments, wfn.cell_volume, q_max)
+    vnl_setup = None
+    if pseudos:
+        print("Building unified V_NL setup...")
+        vnl_setup = vnl_ops.build_vnl_setup(
+            wfn,
+            sym,
+            meta,
+            pseudos,
+            nspinor=int(meta.nspinor),
+        )
 
     # ---- compute kin+ion per k-point ----
     out_path = args.output or os.path.join(input_dir, "kin_ion.h5")
@@ -207,7 +199,7 @@ def main(argv=None):
             kvec = sym.unfolded_kpts[ik]
             Gk_crys, _ = generate_gvectors_k(ik, sym, wfn, meta)
 
-            H_k = get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, plan, wfn)
+            H_k = get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, vnl_setup, wfn)
             kin_ion_all[ik] = np.asarray(H_k)
             del wfn_k
 

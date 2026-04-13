@@ -290,6 +290,51 @@ def build_vnl_kdata(
     return kdata.Z, kdata.E_super
 
 
+@jax.jit
+def gather_psi_G(psi_box, Gx, Gy, Gz, mask=None):
+    """Gather sparse plane-wave coefficients from the FFT box.
+
+    Parameters
+    ----------
+    psi_box : (nb, nspinor, nx, ny, nz) complex128
+    Gx, Gy, Gz : (nG,) int32 FFT-box indices
+    mask : (nG,) bool or float, optional
+
+    Returns
+    -------
+    psi_G : (nb, nspinor, nG) complex128
+    """
+    psi_G = psi_box[:, :, Gx, Gy, Gz]
+    if mask is None:
+        return psi_G
+    mask_f = jnp.asarray(mask, dtype=psi_G.dtype)[None, None, :]
+    return psi_G * mask_f
+
+
+def gather_psi_G_from_crys(psi_box, Gk_crys, mask=None):
+    """Convenience wrapper around ``gather_psi_G`` for an integer G-list."""
+    G_int = jnp.asarray(Gk_crys, dtype=jnp.int32)
+    return gather_psi_G(psi_box, G_int[:, 0], G_int[:, 1], G_int[:, 2], mask)
+
+
+def vnl_matrix_from_kdata(psi_box, Gk_crys, kdata, mask=None):
+    """Convenience: <m|V_NL|n> from FFT-box states and prebuilt VNL k-data."""
+    import psp.vnl_ops as vnl_ops
+
+    psi_G = gather_psi_G_from_crys(psi_box, Gk_crys, mask)
+    return vnl_ops.vnl_matrix(psi_G, kdata.Z, kdata.E_super)
+
+
+def vnl_velocity_from_kdata(psi_box, Gk_crys, kdata, mask=None):
+    """Convenience: dV_NL/dK_cart from FFT-box states and prebuilt VNL k-data."""
+    import psp.vnl_ops as vnl_ops
+
+    if kdata.dZ is None:
+        raise ValueError("kdata.dZ is required for vnl_velocity_from_kdata")
+    psi_G = gather_psi_G_from_crys(psi_box, Gk_crys, mask)
+    return vnl_ops.vnl_velocity_matrix(psi_G, kdata.Z, kdata.dZ, kdata.E_super)
+
+
 def build_h_diag(
     T_diag: jax.Array,
     V_loc_r: jax.Array,

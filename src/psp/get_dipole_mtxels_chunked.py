@@ -27,22 +27,10 @@ from common.load_wfns import load_kpoint_fftbox
 from .get_DFT_mtxels import (
     read_cohsex_input,
     load_pseudopotentials,
-    build_atom_pp_assignments,
     generate_gvectors_k,
 )
-from .projector_pipeline import (
-    build_vnl_plan,
-    compute_V_NL_velocity_k,
-)
-
-
-def build_K_vectors(Gk_crys, kpoint_crys, bvec, blat):
-    """Build K = k + G vectors in crystal and Cartesian coordinates."""
-    k_crys = np.asarray(kpoint_crys, dtype=float)
-    K_crys = np.asarray(Gk_crys, dtype=float) + k_crys[None, :]
-    B = float(blat) * np.asarray(bvec, dtype=float).T
-    K_cart = K_crys @ B.T
-    return K_crys, K_cart
+from .dft_operators import gather_psi_G_from_crys, momentum_matrix_k
+import psp.vnl_ops as vnl_ops
 
 
 def compute_p_operator_k(wfn_k, Gk_crys, kpoint_crys, bdot, bvec, blat):
@@ -51,25 +39,35 @@ def compute_p_operator_k(wfn_k, Gk_crys, kpoint_crys, bdot, bvec, blat):
     Returns array of shape (3, nb, nb) for components x,y,z.
     p_i = sum_G (k+G)_cart[i] c*_mk(G) c_nk(G)
     """
-    nb, nspinor = int(wfn_k.shape[0]), int(wfn_k.shape[1])
-    Gx = jnp.asarray(Gk_crys[:, 0], dtype=jnp.int32)
-    Gy = jnp.asarray(Gk_crys[:, 1], dtype=jnp.int32)
-    Gz = jnp.asarray(Gk_crys[:, 2], dtype=jnp.int32)
-    C_bsg = wfn_k[:, :, Gx, Gy, Gz]  # (nb, nspinor, nG)
-    
+    psi_G = gather_psi_G_from_crys(wfn_k, Gk_crys)
+    G_int = jnp.asarray(Gk_crys, dtype=jnp.int32)
     k_crys = jnp.asarray(kpoint_crys, dtype=jnp.float64)
-    K_crys = jnp.asarray(Gk_crys, dtype=jnp.float64) + k_crys[None, :]
     B = jnp.asarray(bvec, dtype=jnp.float64) * float(blat)
-    K_cart = K_crys @ B  # (nG, 3)
-    
-    p_mn = []
-    for i in range(3):
-        K_i = K_cart[:, i]
-        weighted = C_bsg * K_i[None, None, :]
-        p_i = jnp.einsum('msg,nsg->mn', jnp.conj(C_bsg), weighted, optimize=True)
-        p_mn.append(p_i)
-    
-    return 2 * jnp.stack(p_mn, axis=0)
+    return momentum_matrix_k(psi_G, G_int, k_crys, B)
+
+
+def compute_vnl_velocity_cart(wfn_k, Gk_crys, kpoint_crys, vnl_setup):
+    """Return dV_NL/dK_cart using the unified JAX VNL path."""
+    kdata = vnl_ops.build_vnl_kdata_from_kvec(
+        np.asarray(kpoint_crys, dtype=float),
+        np.asarray(Gk_crys, dtype=int),
+        vnl_setup,
+        compute_dZ=True,
+    )
+    psi_G = gather_psi_G_from_crys(wfn_k, Gk_crys)
+    return vnl_ops.vnl_velocity_matrix(psi_G, kdata.Z, kdata.dZ, kdata.E_super)
+
+
+def compute_vnl_matrix_from_setup(wfn_k, Gk_crys, kpoint_crys, vnl_setup):
+    """Return <m|V_NL(k)|n> using the unified JAX VNL path."""
+    kdata = vnl_ops.build_vnl_kdata_from_kvec(
+        np.asarray(kpoint_crys, dtype=float),
+        np.asarray(Gk_crys, dtype=int),
+        vnl_setup,
+        compute_dZ=False,
+    )
+    psi_G = gather_psi_G_from_crys(wfn_k, Gk_crys)
+    return vnl_ops.vnl_matrix(psi_G, kdata.Z, kdata.E_super)
 
 
 def main(argv=None):
@@ -110,39 +108,15 @@ def main(argv=None):
     print("\nScanning for pseudopotential files...")
     pseudos = load_pseudopotentials(str(input_path.parent))
     
-    # Structure setup
-    assignments = build_atom_pp_assignments(
-        jnp.asarray(wfn.atom_crys, dtype=jnp.float64),
-        jnp.asarray(wfn.atom_types, dtype=jnp.int32),
-        pseudos
+    # Build unified V_NL setup once; the custom table/JVP plumbing stays centralized here.
+    print("Building unified V_NL setup...")
+    vnl_setup = vnl_ops.build_vnl_setup(
+        wfn,
+        sym,
+        meta,
+        pseudos,
+        nspinor=int(meta.nspinor),
     )
-    
-    # Species payload for nonlocal projectors
-    species_payload = []
-    for ap in assignments:
-        if ap.pseudo is None:
-            continue
-        if not any(id(ap.pseudo) == id(p) for p, _ in species_payload):
-            positions = np.asarray([a.position for a in assignments if id(a.pseudo) == id(ap.pseudo)], dtype=float)
-            species_payload.append((ap.pseudo, positions))
-    
-    # Compute q_max for projector plan
-    bvec_np = np.asarray(wfn.bvec, dtype=float)
-    blat = float(wfn.blat)
-    B = blat * bvec_np
-    q_max = 0.0
-    for ik in range(sym.nk_tot):
-        Gk_crys, _ = generate_gvectors_k(ik, sym, wfn, meta)
-        K_crys, K_cart = build_K_vectors(Gk_crys, sym.unfolded_kpts[ik], bvec_np, blat)
-        K_norm = np.sqrt(np.sum(K_cart**2, axis=1))
-        if K_norm.size:
-            q_max = max(q_max, float(np.max(K_norm)))
-    
-    # Build V_NL plan
-    plan = None
-    if assignments and pseudos:
-        print("Building V_NL plan...")
-        plan = build_vnl_plan(pseudos, assignments, wfn.cell_volume, q_max)
     
     # Prepare output arrays
     nk = sym.nk_tot
@@ -163,29 +137,36 @@ def main(argv=None):
         wfn_k = load_kpoint_fftbox(wfn, sym, meta, ik, nb)
         kpoint = jnp.asarray(sym.unfolded_kpts[ik], dtype=jnp.float64)
         Gk_crys, _ = generate_gvectors_k(ik, sym, wfn, meta)
-        K_crys, K_cart = build_K_vectors(Gk_crys, sym.unfolded_kpts[ik], bvec_np, blat)
-
         # Momentum per component
         p_cart = compute_p_operator_k(
             wfn_k, Gk_crys, kpoint,
             jnp.asarray(wfn.bdot, dtype=jnp.float64),
-            jnp.asarray(bvec_np, dtype=jnp.float64),
-            blat
+            jnp.asarray(wfn.bvec, dtype=jnp.float64),
+            float(wfn.blat),
         )  # (3, nb, nb)
 
         # Nonlocal velocity components
-        if args.vnl_mode == "analytic" and plan is not None:
-            vNL_cart = compute_V_NL_velocity_k(
-                wfn_k, Gk_crys,
-                jnp.asarray(K_crys, dtype=jnp.float64),
-                jnp.asarray(K_cart, dtype=jnp.float64),
-                plan,
-                float(wfn.cell_volume),
-                fprime_mode="bessel"
-            )  # (3, nb, nb)
+        if args.vnl_mode == "analytic":
+            vNL_cart = compute_vnl_velocity_cart(wfn_k, Gk_crys, kpoint, vnl_setup)
             vNL_cart = -vNL_cart
         else:
-            vNL_cart = 0.0
+            B = np.asarray(wfn.bvec, dtype=float) * float(wfn.blat)
+            Binv = np.linalg.inv(B)
+            vNL_cart = np.zeros((3, nb, nb), dtype=np.complex128)
+            K_cart_this = (np.asarray(Gk_crys, dtype=float) + np.asarray(kpoint, dtype=float)[None, :]) @ B
+            K_med = float(np.median(np.linalg.norm(K_cart_this, axis=1))) if K_cart_this.size else 1.0
+            h_base = 1e-5 * max(K_med, 1.0)
+            for ic in range(3):
+                delta = np.zeros((3,), dtype=float)
+                delta[ic] = h_base
+                delta_crys = delta @ Binv
+                vp = compute_vnl_matrix_from_setup(
+                    wfn_k, Gk_crys, np.asarray(kpoint, dtype=float) + delta_crys, vnl_setup,
+                )
+                vm = compute_vnl_matrix_from_setup(
+                    wfn_k, Gk_crys, np.asarray(kpoint, dtype=float) - delta_crys, vnl_setup,
+                )
+                vNL_cart[ic] = - (vp - vm) / (2.0 * h_base)
 
         dipole[:, ik] = np.asarray(p_cart + vNL_cart)
 
@@ -220,4 +201,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

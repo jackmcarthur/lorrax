@@ -1,0 +1,747 @@
+from __future__ import annotations
+
+import numpy as np
+import jax
+import jax.numpy as jnp
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
+from .build_projectors_qe import (
+    build_E_blocks_full,
+    precompute_projector_tables,
+    qe_real_sph_harmonics,
+    qe_real_sph_harmonics_with_grad,
+    compute_type_projectors_real,
+)
+from .radial_jax import spherical_jn_deriv_jax as _spherical_jn_deriv_jax
+from .radial_jax import spherical_jn_jax as _spherical_jn_jax
+
+
+@jax.jit
+def _accumulate_species_channel(
+    C_bsg: jax.Array,
+    radial_j: jax.Array,
+    Y_j: jax.Array,
+    phase_j: jax.Array,
+    E_l: jax.Array,
+) -> jax.Array:
+    """Contract one species/ℓ contribution over all atoms at once."""
+    Z_bmg = radial_j[:, None, :] * Y_j[None, :, :]
+    Z_atoms = phase_j[:, None, None, :] * Z_bmg[None, :, :, :]  # (natoms, nbeta, msize, nG)
+    natoms = Z_atoms.shape[0]
+    R = Z_bmg.shape[0] * Z_bmg.shape[1]
+    Z_atoms = Z_atoms.reshape(natoms, R, C_bsg.shape[-1])
+    P_atoms = jnp.einsum('arg,bsg->arsb', jnp.conj(Z_atoms), C_bsg, optimize=True)
+    Delta_atoms = jnp.einsum('arsi, strq, aqtj -> aij', jnp.conj(P_atoms), E_l, P_atoms, optimize=True)
+    return jnp.sum(Delta_atoms, axis=0)
+
+
+@dataclass
+class Species:
+    pseudo: object
+    atom_indices: List[int]
+    atom_tau: List[np.ndarray]
+
+
+@dataclass
+class PseudoBundle:
+    E_blocks: Dict[int, np.ndarray]
+    radial_tables: Dict[Tuple[int, int], object]
+    lmax: int
+
+
+@dataclass
+class KBundle:
+    K_cart: np.ndarray
+    K_norm: np.ndarray
+
+
+def group_assignments_by_pseudo(assignments) -> List[Species]:
+    by_key: Dict[int, Dict[str, object]] = {}
+    for ap in assignments:
+        pseudo = ap.pseudo
+        if pseudo is None:
+            continue
+        key = id(pseudo)
+        entry = by_key.setdefault(key, {"pseudo": pseudo, "atom_indices": [], "atom_tau": []})
+        entry["atom_indices"].append(int(ap.index))
+        entry["atom_tau"].append(np.asarray(ap.position, dtype=float))
+    return [Species(pseudo=v["pseudo"], atom_indices=v["atom_indices"], atom_tau=v["atom_tau"]) for v in by_key.values()]
+
+
+def _infer_lmax_from_pseudo(pseudo) -> int:
+    ppnl = getattr(pseudo, 'pp_nonlocal', None)
+    betas = list(getattr(ppnl, 'pp_beta', [])) if ppnl is not None else []
+    if not betas:
+        return 0
+    return max(int(getattr(beta, 'lll', getattr(beta, 'angular_momentum', 0))) for beta in betas)
+
+
+def prepare_pseudo_bundle(pseudo, cell_volume: float, q_max: float) -> PseudoBundle:
+    E_blocks = build_E_blocks_full(pseudo)
+    radial_tables = precompute_projector_tables(pseudo, float(cell_volume), float(q_max))
+    lmax = _infer_lmax_from_pseudo(pseudo)
+    return PseudoBundle(E_blocks=E_blocks, radial_tables=radial_tables, lmax=int(lmax))
+
+
+def prepare_pseudo_cache(species_list: List[Species], cell_volume: float, q_max: float) -> Dict[int, PseudoBundle]:
+    cache: Dict[int, PseudoBundle] = {}
+    for sp in species_list:
+        key = id(sp.pseudo)
+        if key not in cache:
+            cache[key] = prepare_pseudo_bundle(sp.pseudo, cell_volume, q_max)
+    return cache
+
+
+def prepare_k_bundle(K_cart: np.ndarray) -> KBundle:
+    K_cart = np.asarray(K_cart, dtype=float)
+    K_norm = np.sqrt(np.sum(K_cart ** 2, axis=1)) if K_cart.size else np.zeros((0,), dtype=float)
+    return KBundle(K_cart=K_cart, K_norm=K_norm)
+
+
+def make_projector_rows(bundle: PseudoBundle, kpack: KBundle, species: Species, K_crys: np.ndarray, cell_volume: float):
+    Y_real_by_l = {l: qe_real_sph_harmonics(l, np.asarray(kpack.K_cart)) for l in range(bundle.lmax + 1)}
+    rows, meta = compute_type_projectors_real(
+        pseudo=species.pseudo,
+        atom_indices=species.atom_indices,
+        atom_tau=species.atom_tau,
+        K_crys_total=np.asarray(K_crys),
+        K_cart_total=np.asarray(kpack.K_cart),
+        cell_volume=float(cell_volume),
+        Y_real_by_l_pre=Y_real_by_l,
+        F_splines=bundle.radial_tables,
+        K_norm_in=np.asarray(kpack.K_norm),
+    )
+    return rows, meta
+
+
+def _evaluate_Fprime_bessel(pseudo, l: int, beta_ids: list[int], K_norm: np.ndarray) -> np.ndarray:
+    """Compute F'_l(q) via the j'_l kernel: F'_l(q) = ∫ dr r^3 β_l(r) j'_l(q r).
+
+    Returns array of shape (nbeta, nK).
+    Uses JAX for GPU-accelerated spherical Bessel evaluation.
+    """
+    ppmesh = getattr(pseudo, 'pp_mesh', None)
+    ppnl = getattr(pseudo, 'pp_nonlocal', None)
+    if ppmesh is None or ppnl is None or len(beta_ids) == 0:
+        return np.zeros((len(beta_ids), len(K_norm)))
+    r = np.asarray(ppmesh.pp_r.value, dtype=float)
+    try:
+        rab = np.asarray(ppmesh.pp_rab.value, dtype=float)
+    except Exception:
+        rab = None
+    betas_all = list(getattr(ppnl, 'pp_beta', []))
+    nK = int(len(K_norm))
+    if nK == 0:
+        return np.zeros((len(beta_ids), 0))
+
+    # Compute j'_l(qr) on GPU once for all betas sharing this l
+    qr = jnp.multiply.outer(jnp.asarray(K_norm, dtype=jnp.float64),
+                             jnp.asarray(r, dtype=jnp.float64))  # (nK, nr)
+    jn_d = _spherical_jn_deriv_jax(l, qr)  # (nK, nr) on GPU
+
+    r_cubed = jnp.asarray(r, dtype=jnp.float64) ** 3  # (nr,)
+    if rab is not None:
+        weights = jnp.asarray(rab, dtype=jnp.float64)
+    else:
+        dr = float(r[1] - r[0]) if len(r) > 1 else 1.0
+        w = np.ones_like(r)
+        if len(r) > 0:
+            w[0] = 0.5; w[-1] = 0.5
+        weights = jnp.asarray(w * dr, dtype=jnp.float64)
+
+    out = []
+    for bid in beta_ids:
+        beta = betas_all[int(bid) - 1]
+        raw = np.asarray(beta.value, dtype=float)
+        if r[0] == 0.0 and len(r) > 1:
+            beta_r = np.empty_like(r)
+            beta_r[1:] = raw[1:] / r[1:]
+            beta_r[0] = beta_r[1]
+        else:
+            beta_r = raw / r
+        beta_r_j = jnp.asarray(beta_r, dtype=jnp.float64)
+        integrand = jn_d * r_cubed[None, :] * beta_r_j[None, :]  # (nK, nr)
+        vals = jnp.sum(integrand * weights[None, :], axis=1)  # (nK,)
+        out.append(vals)
+    return np.asarray(jnp.stack(out, axis=0))
+
+
+def _evaluate_F_and_Fprime_for_l(
+    radial_tables: Dict[Tuple[int, int], object],
+    d_spl_cache: Dict[Tuple[int, int], object],
+    l: int,
+    beta_ids: list[int],
+    K_norm: np.ndarray,
+    pseudo=None,
+    fprime_mode: str = 'table',
+) -> tuple[np.ndarray, np.ndarray]:
+    if K_norm.size == 0:
+        return np.zeros((len(beta_ids), 0)), np.zeros((len(beta_ids), 0))
+    F_list = []
+    if fprime_mode == 'bessel' and (pseudo is not None):
+        Fp_mat = _evaluate_Fprime_bessel(pseudo, int(l), beta_ids, np.asarray(K_norm, dtype=float))
+    else:
+        Fp_mat = None
+    Fp_list = []
+    for bid_idx, bid in enumerate(beta_ids):
+        tab = radial_tables.get((int(l), int(bid)))
+        if tab is None:
+            F_list.append(np.zeros_like(K_norm))
+            Fp_list.append(np.zeros_like(K_norm))
+            continue
+        Fv = tab(K_norm)
+        if Fp_mat is not None:
+            Fpv = Fp_mat[bid_idx, :]
+        else:
+            dtab = d_spl_cache.get((int(l), int(bid)))
+            if dtab is None:
+                dtab = tab.derivative(1)
+                d_spl_cache[(int(l), int(bid))] = dtab
+            Fpv = dtab(K_norm)
+        F_list.append(Fv)
+        Fp_list.append(Fpv)
+    return np.stack(F_list, axis=0), np.stack(Fp_list, axis=0)
+
+
+def build_beta_rows_with_grad(
+    wfn_k: jax.Array,
+    Gk_crys: np.ndarray,
+    K_crys: np.ndarray,
+    K_cart: np.ndarray,
+    plan: Dict[int, Dict[str, object]],
+    cell_volume: float,
+) -> tuple[np.ndarray, np.ndarray, list[dict]]:
+    """Return (Z_rows, gradZ_rows, meta) for all species/atoms and ℓ.
+
+    Shapes:
+      - Z_rows: (total_R, nG)
+      - gradZ_rows: (3, total_R, nG)
+    """
+    K_cart_np = np.asarray(K_cart, dtype=float)
+    K_crys_np = np.asarray(K_crys, dtype=float)
+    K_norm = np.sqrt(np.sum(K_cart_np ** 2, axis=1)) if K_cart_np.size else np.zeros((0,), dtype=float)
+
+    Z_rows: list[np.ndarray] = []
+    dZ_rows_xyz: list[np.ndarray] = []
+    dZ_rows_rad: list[np.ndarray] = []
+    dZ_rows_ang: list[np.ndarray] = []
+    meta_all: list[dict] = []
+
+    d_spl_cache: Dict[Tuple[int, int], object] = {}
+
+    for key, sp in plan.items():
+        tau = np.asarray(sp['atoms']['tau'], dtype=float)
+        if tau.size == 0:
+            continue
+        pref = float(sp['prefactor'])
+        radial_tables = sp['radial_tables']
+
+        for l, info in sp['l_channels'].items():
+            beta_ids = info['beta_ids']
+            if not beta_ids:
+                continue
+            msize = 2 * int(l) + 1
+
+            F_bG, Fp_bG = _evaluate_F_and_Fprime_for_l(radial_tables, d_spl_cache, int(l), beta_ids, K_norm, pseudo=sp['pseudo'], fprime_mode=sp.get('fprime_mode', 'table'))
+            radial = pref * (1j) ** int(l) * F_bG  # (nbeta, nG), A(q) = F(q)
+            radial_p = pref * (1j) ** int(l) * Fp_bG  # (nbeta, nG), A'(q) = F'(q)
+
+            Y_real, gradY_cart = qe_real_sph_harmonics_with_grad(int(l), K_cart_np)  # (msize,nG), (3,msize,nG)
+
+            # e_r (3,nG)
+            q = K_norm
+            q_safe = np.where(q > 0, q, 1e-12)
+            er = (K_cart_np / q_safe[:, None]).T
+
+            if tau.ndim == 1:
+                tau = tau.reshape(1, 3)
+            phase = np.exp(-2j * np.pi * (K_crys_np @ tau.T)).T  # (natoms, nG)
+
+            nbeta = len(beta_ids)
+            R = nbeta * msize
+
+            # Build β and ∇β per atom
+            for a in range(phase.shape[0]):
+                ph = phase[a, :][None, None, :]  # (1,1,nG)
+                Z_bmg = radial[:, None, :] * Y_real[None, :, :] * ph  # (nbeta,msize,nG)
+                Z_block = Z_bmg.reshape((R, K_cart_np.shape[0]))
+
+                # grad_radial for β(K)=F_l(q)Y: F'_l(q) Y e_r
+                base_rad = (radial_p[:, None, :] * Y_real[None, :, :])  # (nbeta,msize,nG)
+                grad_rad = er[:, None, None, :] * base_rad[None, :, :, :]  # (3,nbeta,msize,nG)
+
+                # grad_angular: (3,nbeta,msize,nG) = (radial / q) * gradY_cart
+                base_ang = (radial[:, None, :] / q_safe[None, None, :])  # (nbeta,1,nG)
+                grad_ang = base_ang[None, :, :, :] * gradY_cart[:, None, :, :]  # (3,nbeta,msize,nG)
+
+                # Combine, apply phase already included in Z_bmg (phase derivative cancels in ∇q+∇q′)
+                grad_total = (grad_rad + grad_ang) * ph  # (3,nbeta,msize,nG)
+                grad_block = grad_total.reshape((3, R, K_cart_np.shape[0]))
+                grad_block_rad = (grad_rad * ph).reshape((3, R, K_cart_np.shape[0]))
+                grad_block_ang = (grad_ang * ph).reshape((3, R, K_cart_np.shape[0]))
+
+                Z_rows.append(Z_block)
+                dZ_rows_xyz.append(grad_block)
+                dZ_rows_rad.append(grad_block_rad)
+                dZ_rows_ang.append(grad_block_ang)
+                meta_all.append({'pseudo_key': key, 'atom_index': a, 'l': int(l), 'beta_ids': list(beta_ids)})
+
+    if Z_rows:
+        Z_cat = np.vstack(Z_rows).astype(np.complex128, copy=False)
+        dZ_cat = np.concatenate(dZ_rows_xyz, axis=1).astype(np.complex128, copy=False)
+        dZ_rad = np.concatenate(dZ_rows_rad, axis=1).astype(np.complex128, copy=False)
+        dZ_ang = np.concatenate(dZ_rows_ang, axis=1).astype(np.complex128, copy=False)
+    else:
+        nG = K_cart_np.shape[0]
+        Z_cat = np.zeros((0, nG), dtype=np.complex128)
+        dZ_cat = np.zeros((3, 0, nG), dtype=np.complex128)
+        dZ_rad = np.zeros_like(dZ_cat)
+        dZ_ang = np.zeros_like(dZ_cat)
+    # Attach components for optional consumers via attributes
+    try:
+        Z_cat._dZ_rad = dZ_rad  # type: ignore[attr-defined]
+        Z_cat._dZ_ang = dZ_ang  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return Z_cat, dZ_cat, meta_all
+
+
+def build_beta_rows_with_grad_components(
+    wfn_k: jax.Array,
+    Gk_crys: np.ndarray,
+    K_crys: np.ndarray,
+    K_cart: np.ndarray,
+    plan: Dict[int, Dict[str, object]],
+    cell_volume: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[dict]]:
+    """Like build_beta_rows_with_grad, but also returns radial and angular parts.
+
+    Returns (Z_rows, dZ_total, dZ_radial, dZ_angular, meta).
+    Shapes:
+      - Z_rows: (R_total, nG)
+      - dZ_*: (3, R_total, nG)
+    """
+    K_cart_np = np.asarray(K_cart, dtype=float)
+    K_crys_np = np.asarray(K_crys, dtype=float)
+    K_norm = np.sqrt(np.sum(K_cart_np ** 2, axis=1)) if K_cart_np.size else np.zeros((0,), dtype=float)
+
+    Z_rows: list[np.ndarray] = []
+    dZ_rows_xyz: list[np.ndarray] = []
+    dZ_rows_rad: list[np.ndarray] = []
+    dZ_rows_ang: list[np.ndarray] = []
+    meta_all: list[dict] = []
+
+    d_spl_cache: Dict[Tuple[int, int], object] = {}
+
+    for key, sp in plan.items():
+        tau = np.asarray(sp['atoms']['tau'], dtype=float)
+        if tau.size == 0:
+            continue
+        pref = float(sp['prefactor'])
+        radial_tables = sp['radial_tables']
+
+        for l, info in sp['l_channels'].items():
+            beta_ids = info['beta_ids']
+            if not beta_ids:
+                continue
+            msize = 2 * int(l) + 1
+
+            F_bG, Fp_bG = _evaluate_F_and_Fprime_for_l(radial_tables, d_spl_cache, int(l), beta_ids, K_norm)
+            radial = pref * (1j) ** int(l) * F_bG  # (nbeta, nG)
+            radial_p = pref * (1j) ** int(l) * Fp_bG  # (nbeta, nG)
+
+            Y_real, gradY_cart = qe_real_sph_harmonics_with_grad(int(l), K_cart_np)  # (msize,nG), (3,msize,nG)
+
+            # e_r (3,nG)
+            q = K_norm
+            q_safe = np.where(q > 0, q, 1.0)
+            er = (K_cart_np / q_safe[:, None]).T
+
+            if tau.ndim == 1:
+                tau = tau.reshape(1, 3)
+            phase = np.exp(-2j * np.pi * (K_crys_np @ tau.T)).T  # (natoms, nG)
+
+            nbeta = len(beta_ids)
+            R = nbeta * msize
+
+            for a in range(phase.shape[0]):
+                ph = phase[a, :][None, None, :]  # (1,1,nG)
+                Z_bmg = radial[:, None, :] * Y_real[None, :, :] * ph  # (nbeta,msize,nG)
+                Z_block = Z_bmg.reshape((R, K_cart_np.shape[0]))
+
+                base_rad = ((radial_p[:, None, :] + (int(l) * radial[:, None, :] / q_safe[None, None, :])) * Y_real[None, :, :])  # (nbeta,msize,nG)
+                grad_rad = er[:, None, None, :] * base_rad[None, :, :, :]  # (3,nbeta,msize,nG)
+
+                base_ang = (radial[:, None, :] / q_safe[None, None, :])  # (nbeta,1,nG)
+                grad_ang = base_ang[None, :, :, :] * gradY_cart[:, None, :, :]  # (3,nbeta,msize,nG)
+
+                grad_total = (grad_rad + grad_ang) * ph  # (3,nbeta,msize,nG)
+                dZ_block = grad_total.reshape((3, R, K_cart_np.shape[0]))
+                dZ_block_rad = (grad_rad * ph).reshape((3, R, K_cart_np.shape[0]))
+                dZ_block_ang = (grad_ang * ph).reshape((3, R, K_cart_np.shape[0]))
+
+                Z_rows.append(Z_block)
+                dZ_rows_xyz.append(dZ_block)
+                dZ_rows_rad.append(dZ_block_rad)
+                dZ_rows_ang.append(dZ_block_ang)
+                meta_all.append({'pseudo_key': key, 'atom_index': a, 'l': int(l), 'beta_ids': list(beta_ids)})
+
+    if Z_rows:
+        Z_cat = np.vstack(Z_rows).astype(np.complex128, copy=False)
+        dZ_cat = np.concatenate(dZ_rows_xyz, axis=1).astype(np.complex128, copy=False)
+        dZ_rad = np.concatenate(dZ_rows_rad, axis=1).astype(np.complex128, copy=False)
+        dZ_ang = np.concatenate(dZ_rows_ang, axis=1).astype(np.complex128, copy=False)
+    else:
+        nG = K_cart_np.shape[0]
+        Z_cat = np.zeros((0, nG), dtype=np.complex128)
+        dZ_cat = np.zeros((3, 0, nG), dtype=np.complex128)
+        dZ_rad = np.zeros_like(dZ_cat)
+        dZ_ang = np.zeros_like(dZ_cat)
+
+    return Z_cat, dZ_cat, dZ_rad, dZ_ang, meta_all
+
+
+def compute_V_NL_velocity_k(
+    wfn_k: jax.Array,
+    Gk_crys: np.ndarray,
+    K_crys: np.ndarray,
+    K_cart: np.ndarray,
+    plan: Dict[int, Dict[str, object]],
+    cell_volume: float,
+    fprime_mode: str = 'bessel',
+) -> jax.Array:
+    """Compute i [r_i, V_NL] matrix components for i=x,y,z.
+
+    Returns array of shape (3, nb, nb). Uses β and ∇β assembled by
+    build_beta_rows_with_grad, contracting against E blocks per ℓ/species.
+    """
+    nb, nspinor = int(wfn_k.shape[0]), int(wfn_k.shape[1])
+    if wfn_k.ndim == 3:
+        # Already (nb, nspinor, nG)
+        C_bsg = jnp.asarray(wfn_k)
+    else:
+        Gx = jnp.asarray(Gk_crys[:, 0], dtype=jnp.int32)
+        Gy = jnp.asarray(Gk_crys[:, 1], dtype=jnp.int32)
+        Gz = jnp.asarray(Gk_crys[:, 2], dtype=jnp.int32)
+        C_bsg = wfn_k[:, :, Gx, Gy, Gz]  # (nb, nspinor, nG)
+
+    # Ensure plan entries carry fprime_mode for derivative evaluation
+    for key in plan.keys():
+        plan[key]['fprime_mode'] = fprime_mode
+    Z_rows, dZ_rows, meta = build_beta_rows_with_grad(wfn_k, Gk_crys, K_crys, K_cart, plan, cell_volume)
+    nG = C_bsg.shape[-1]
+    if Z_rows.shape[-1] != nG:
+        raise RuntimeError("Projector rows nG mismatch")
+
+    vNL = jnp.zeros((3, nb, nb), dtype=jnp.complex128)
+
+    offset = 0
+    for entry in meta:
+        key = entry['pseudo_key']
+        l = int(entry['l'])
+        beta_ids = list(entry['beta_ids'])
+        msize = 2 * l + 1
+        R = len(beta_ids) * msize
+        Z_block = Z_rows[offset:offset + R, :]  # (R, nG)
+        dZ_block = dZ_rows[:, offset:offset + R, :]  # (3, R, nG)
+        offset += R
+
+        E_l_np = plan[key]['l_channels'].get(l, {}).get('E')
+        if E_l_np is None:
+            continue
+        E_l = jnp.asarray(E_l_np, dtype=jnp.complex128)  # (2,2,Rl,Rl)
+
+        # P(r,s,j) = Σ_g Z*(r,g) C(j,s,g); dP_i(r,s,j) = Σ_g (dZ_i)*(r,g) C(j,s,g)
+        P = jnp.einsum('rg,bsg->rsb', jnp.conj(Z_block), C_bsg, optimize=True)       # (R,2,nb)
+        dP = jnp.einsum('irg,bsg->irsb', jnp.conj(dZ_block), C_bsg, optimize=True)   # (3,R,2,nb)
+
+        # In Ry atomic units (ħ=1, m=1/2): v^NL_i = (i/ħ)[V_NL, r_i] = - (∇_{q_i} + ∇_{q'_i}) V_NL
+        # term1 + term2 evaluates (∇_q + ∇_{q'}) V_NL contracted with states; apply a minus sign, no extra i.
+        term1 = jnp.einsum('irsn, strq, qtm -> inm', jnp.conj(dP), E_l, P, optimize=True)
+        term2 = jnp.einsum('rsn, strq, iqtm -> inm', jnp.conj(P), E_l, dP, optimize=True)
+        vNL = vNL - (term1 + term2)
+
+    return vNL
+
+__all__ = [
+    "Species",
+    "PseudoBundle",
+    "KBundle",
+    "group_assignments_by_pseudo",
+    "prepare_pseudo_bundle",
+    "prepare_pseudo_cache",
+    "prepare_k_bundle",
+    "make_projector_rows",
+    "build_vnl_plan",
+    "compute_V_NL_k_minimal",
+    "build_beta_rows_with_grad",
+    "compute_V_NL_velocity_k",
+    "compute_V_NL_velocity_k_numeric",
+]
+
+
+def build_vnl_plan(pseudos: Dict[str, object], assignments, cell_volume: float, q_max: float):
+    """Return a minimal per-species, per-ℓ plan with E blocks and radial tables.
+
+    Plan structure:
+      plan = {
+        id(pseudo): {
+          'pseudo': pseudo,
+          'atoms': { 'indices': [..], 'tau': np.ndarray(natoms,3) },
+          'prefactor': 4π/√Ω,
+          'l_channels': {
+              ℓ: {
+                  'E': np.ndarray((2,2,Rℓ,Rℓ)),
+                  'beta_ids': [idx1, idx2, ...],   # 1-based per UPF order
+              }
+          },
+          'radial_tables': { (ℓ, idx) -> RadialTable },
+        }
+      }
+    """
+    # Group atoms by pseudo
+    species: Dict[int, Dict[str, object]] = {}
+    for ap in assignments:
+        if ap.pseudo is None:
+            continue
+        key = id(ap.pseudo)
+        ent = species.setdefault(key, {
+            'pseudo': ap.pseudo,
+            'indices': [],
+            'tau': [],
+        })
+        ent['indices'].append(int(ap.index))
+        ent['tau'].append(np.asarray(ap.position, dtype=float))
+
+    plan: Dict[int, Dict[str, object]] = {}
+    prefactor = (4.0 * np.pi) / float(np.sqrt(cell_volume))
+    for key, ent in species.items():
+        pseudo = ent['pseudo']
+        E_blocks = build_E_blocks_full(pseudo)  # dict ℓ -> (2,2,Rℓ,Rℓ)
+        radial_tables = precompute_projector_tables(pseudo, float(cell_volume), float(q_max))
+        # Map betas per ℓ in file order
+        l_channels: Dict[int, Dict[str, object]] = {}
+        betas = list(getattr(getattr(pseudo, 'pp_nonlocal', None), 'pp_beta', []))
+        per_l: Dict[int, List[int]] = {}
+        for idx, beta in enumerate(betas, start=1):
+            l = int(getattr(beta, 'lll', getattr(beta, 'angular_momentum', 0)))
+            per_l.setdefault(l, []).append(idx)
+        for l, beta_ids in per_l.items():
+            Eb = E_blocks.get(int(l))
+            l_channels[int(l)] = {
+                'E': Eb,
+                'E_j': (jnp.asarray(Eb, dtype=jnp.complex128) if Eb is not None else None),
+                'beta_ids': list(beta_ids),
+            }
+        plan[key] = {
+            'pseudo': pseudo,
+            'atoms': {
+                'indices': np.asarray(ent['indices'], dtype=int),
+                'tau': np.asarray(ent['tau'], dtype=float) if ent['tau'] else np.zeros((0, 3), dtype=float),
+            },
+            'prefactor': prefactor,
+            'l_channels': l_channels,
+            'radial_tables': radial_tables,
+        }
+    return plan
+
+
+def compute_V_NL_k_minimal(
+    wfn_k: jax.Array,
+    Gk_crys: np.ndarray,
+    K_crys: np.ndarray,
+    K_cart: np.ndarray,
+    plan: Dict[int, Dict[str, object]],
+    cell_volume: float,
+    g_mask: jax.Array | None = None,
+) -> jax.Array:
+    """Vectorized minimal V_NL(k) using prebuilt plan.
+
+    Steps per ℓ:
+      - Evaluate F_ℓ,β(|K|) via radial tables and form radial = (4π/√Ω)(i)^ℓ F.
+      - Build Y'_{ℓm}(K) once per ℓ; multiply radial and structure phases per atom.
+      - Stack rows in beta-major, m-slot order to match E_ℓ layout.
+      - Contract: P = Z^†·C, then Δ_ℓ = Σσσ' P^†_σ E^{σσ'}_ℓ P_{σ'}.
+    """
+    nb, nspinor = int(wfn_k.shape[0]), int(wfn_k.shape[1])
+    if getattr(wfn_k, 'ndim', 0) == 3:
+        C_bsg = jnp.asarray(wfn_k)
+        nG = C_bsg.shape[-1]
+    else:
+        Gx = jnp.asarray(Gk_crys[:, 0], dtype=jnp.int32)
+        Gy = jnp.asarray(Gk_crys[:, 1], dtype=jnp.int32)
+        Gz = jnp.asarray(Gk_crys[:, 2], dtype=jnp.int32)
+        C_bsg = wfn_k[:, :, Gx, Gy, Gz]  # (nb, nspinor, nG)
+        nG = C_bsg.shape[-1]
+    nG = C_bsg.shape[-1]
+
+    K_cart_np = np.asarray(K_cart, dtype=float)
+    K_crys_np = np.asarray(K_crys, dtype=float)
+    K_cart_j = jnp.asarray(K_cart_np, dtype=jnp.float64)
+    K_crys_j = jnp.asarray(K_crys_np, dtype=jnp.float64)
+    K_norm = np.sqrt(np.sum(K_cart_np ** 2, axis=1)) if K_cart_np.size else np.zeros((0,), dtype=float)
+
+    V_NL_k = jnp.zeros((nb, nb), dtype=jnp.complex128)
+    if nG == 0:
+        return V_NL_k
+
+    # Cache Y_ℓm(K) once per ℓ for this k-point to reuse across species
+    Y_cache: Dict[int, jax.Array] = {}
+
+    for key, sp in plan.items():
+        tau = np.asarray(sp['atoms']['tau'], dtype=float)
+        if tau.size == 0:
+            continue
+        indices = np.asarray(sp['atoms']['indices'], dtype=int)
+        pref = float(sp['prefactor'])
+        radial_tables = sp['radial_tables']
+
+        # Precompute phases once per species (independent of ℓ)
+        if tau.ndim == 1:
+            tau = tau.reshape(1, 3)
+        tau_j_all = jnp.asarray(tau, dtype=jnp.float64)
+        phase_all = jnp.exp(-2j * jnp.pi * (K_crys_j @ tau_j_all.T))  # (nG, natoms)
+        phase_all = jnp.transpose(phase_all)  # (natoms, nG)
+
+        for l, info in sp['l_channels'].items():
+            E_l_np = info['E']
+            if E_l_np is None:
+                continue
+            beta_ids = info['beta_ids']
+            if not beta_ids:
+                continue
+            msize = 2 * int(l) + 1
+
+            # F_ℓ,β(|K|) for all beta in this ℓ
+            if nG == 0:
+                continue
+            F_bG = np.stack([radial_tables[(int(l), int(bid))](K_norm) for bid in beta_ids], axis=0)
+            radial = pref * (1j) ** int(l) * F_bG  # (nbeta, nG)
+            radial_j = jnp.asarray(radial, dtype=jnp.complex128)
+
+            # Y'_{ℓm}(K) and phases per atom
+            Y_j = Y_cache.get(int(l))
+            if Y_j is None:
+                Y_real = qe_real_sph_harmonics(int(l), K_cart_np)  # (msize, nG) np
+                Y_j = jnp.asarray(Y_real, dtype=jnp.complex128)
+                Y_cache[int(l)] = Y_j
+
+            # Reuse per-species phases across ℓ
+            phase_j = phase_all
+            if phase_j.shape[0] == 0:
+                continue
+
+            E_l = info.get('E_j')
+            if E_l is None:
+                E_l = jnp.asarray(E_l_np, dtype=jnp.complex128)  # (2,2,R,R)
+
+            if g_mask is not None:
+                g_mask_j = jnp.asarray(g_mask, dtype=jnp.complex128)
+                radial_eff = radial_j * g_mask_j[None, :]
+            else:
+                radial_eff = radial_j
+
+            Delta_l = _accumulate_species_channel(C_bsg, radial_eff, Y_j, phase_j, E_l)
+            V_NL_k = V_NL_k + Delta_l
+
+    return V_NL_k
+
+
+def compute_V_NL_velocity_k_numeric(
+    wfn_k: jax.Array,
+    Gk_crys: np.ndarray,
+    K_crys: np.ndarray,
+    K_cart: np.ndarray,
+    plan: Dict[int, Dict[str, object]],
+    cell_volume: float,
+    h: float = 1e-5,
+) -> jax.Array:
+    """Finite-difference nonlocal velocity v^NL via Z(K±δ) (no state derivatives).
+
+    For each Cartesian axis i, forms K± = K ± δ e_i (in Cartesian), recomputes Z,
+    and evaluates v_i = - [ conj(dZ_i) E Z + conj(Z) E dZ_i ] contracted with C.
+
+    Returns: (3, nb, nb)
+    """
+    import numpy as _np
+
+    nb, nspinor = int(wfn_k.shape[0]), int(wfn_k.shape[1])
+    if getattr(wfn_k, 'ndim', 0) == 3:
+        C_bsg = jnp.asarray(wfn_k)
+        nG = int(C_bsg.shape[-1])
+    else:
+        Gx = jnp.asarray(Gk_crys[:, 0], dtype=jnp.int32)
+        Gy = jnp.asarray(Gk_crys[:, 1], dtype=jnp.int32)
+        Gz = jnp.asarray(Gk_crys[:, 2], dtype=jnp.int32)
+        C_bsg = wfn_k[:, :, Gx, Gy, Gz]  # (nb, nspinor, nG)
+        nG = int(C_bsg.shape[-1])
+
+    # Base Z for reference and E blocks iterator
+    Z0, _, meta = build_beta_rows_with_grad(wfn_k, Gk_crys, K_crys, K_cart, plan, cell_volume)
+    if int(Z0.shape[-1]) != nG:
+        raise RuntimeError("Projector rows nG mismatch (numeric vel)")
+
+    # Recover B and its inverse to map δ_cart -> δ_crys
+    K_crys_np = _np.asarray(K_crys, dtype=float)
+    K_cart_np = _np.asarray(K_cart, dtype=float)
+    B, *_ = _np.linalg.lstsq(K_crys_np, K_cart_np, rcond=None)
+    Binv = _np.linalg.inv(B)
+
+    vNL = jnp.zeros((3, nb, nb), dtype=jnp.complex128)
+
+    for ic in range(3):
+        # Central difference with Richardson extrapolation for stability
+        h1 = float(h)
+        h2 = 0.5 * h1
+
+        # Step h1
+        d_cart1 = _np.zeros((3,), dtype=float); d_cart1[ic] = h1
+        d_crys1 = d_cart1 @ Binv
+        Kp1_crys = K_crys_np + d_crys1[None, :]
+        Km1_crys = K_crys_np - d_crys1[None, :]
+        Kp1_cart = Kp1_crys @ B
+        Km1_cart = Km1_crys @ B
+        Zp1, _, _ = build_beta_rows_with_grad(wfn_k, Gk_crys, Kp1_crys, Kp1_cart, plan, cell_volume)
+        Zm1, _, _ = build_beta_rows_with_grad(wfn_k, Gk_crys, Km1_crys, Km1_cart, plan, cell_volume)
+        dZ1 = (Zp1 - Zm1) / (2.0 * h1)  # (R, nG)
+
+        # Step h2
+        d_cart2 = _np.zeros((3,), dtype=float); d_cart2[ic] = h2
+        d_crys2 = d_cart2 @ Binv
+        Kp2_crys = K_crys_np + d_crys2[None, :]
+        Km2_crys = K_crys_np - d_crys2[None, :]
+        Kp2_cart = Kp2_crys @ B
+        Km2_cart = Km2_crys @ B
+        Zp2, _, _ = build_beta_rows_with_grad(wfn_k, Gk_crys, Kp2_crys, Kp2_cart, plan, cell_volume)
+        Zm2, _, _ = build_beta_rows_with_grad(wfn_k, Gk_crys, Km2_crys, Km2_cart, plan, cell_volume)
+        dZ2 = (Zp2 - Zm2) / (2.0 * h2)
+
+        # Richardson extrapolation (O(h^2) -> O(h^4))
+        dZ = (4.0 * dZ2 - dZ1) / 3.0
+
+        offset = 0
+        acc = jnp.zeros((nb, nb), dtype=jnp.complex128)
+        for entry in meta:
+            key = entry['pseudo_key']
+            l = int(entry['l'])
+            beta_ids = list(entry['beta_ids'])
+            msize = 2 * l + 1
+            R = len(beta_ids) * msize
+            Z_block = Z0[offset:offset + R, :]  # (R, nG)
+            dZ_block = dZ[offset:offset + R, :]  # (R, nG)
+            offset += R
+            E_l_np = plan[key]['l_channels'].get(l, {}).get('E')
+            if E_l_np is None:
+                continue
+            E_l = jnp.asarray(E_l_np, dtype=jnp.complex128)  # (2,2,R,R)
+
+            P = jnp.einsum('rg,bsg->rsb', jnp.conj(Z_block), C_bsg, optimize=True)       # (R,2,nb)
+            dP = jnp.einsum('rg,bsg->rsb', jnp.conj(dZ_block), C_bsg, optimize=True)     # (R,2,nb)
+            term1 = jnp.einsum('rsn, strq, qtm -> nm', jnp.conj(dP), E_l, P, optimize=True)
+            term2 = jnp.einsum('rsn, strq, qtm -> nm', jnp.conj(P), E_l, dP, optimize=True)
+            acc = acc - (term1 + term2)
+
+        vNL = vNL.at[ic].set(acc)
+
+    return vNL

@@ -20,6 +20,21 @@ QE `.save/data-file-schema.xml` + `charge-density.hdf5` + pseudopotentials.
 | `vnl_ops.py` | 444 | Dense VNL backend: table-lookup radial form factors, single Z matrix per k |
 | `build_projectors_qe.py` | 908 | V_loc builder (FT of local PP), PP loading, projector splines |
 | `solid_harmonics.py` | ~100 | Cartesian solid harmonics S_lm, autodiff-safe at K=0 |
+| `archive/` | legacy | Archived CPU-heavy compatibility helpers (`build_projectors.py`, `projector_pipeline.py`) |
+
+## 2026-04-13 migration update
+
+- Active preprocessing callers now share the same VNL backend:
+  `get_dipole_mtxels.py`, `get_dipole_mtxels_chunked.py`,
+  `get_DFT_mtxels.py`, and `gw/kin_ion_io_chunked.py` now build one
+  `vnl_ops.build_vnl_setup(...)` and then use per-k
+  `build_vnl_kdata_from_kvec(...)` + dense JAX contractions.
+- The custom JAX radial machinery remains centralized.  Uniform radial tables,
+  custom interpolation/JVP handling, and the stable spherical-Bessel path all
+  stay in `radial_jax.py` / `vnl_ops.py`; the caller scripts no longer carry a
+  parallel CPU execution architecture.
+- The old NumPy-heavy compatibility modules are archived under `psp/archive/`
+  so the active tree is easier to read and trace.
 
 ## Bugs found and fixed (this session)
 
@@ -132,8 +147,9 @@ cd $LORRAX && uv run python -m pytest -q   # 13 tests, ~13s
 1. **ρ_core (1.9s)**: numpy Simpson's rule radial FT. Could be vectorized
    with JAX or precomputed as a lookup table (like vnl_ops does for VNL).
 2. **V_loc (0.5s)**: numpy FT of local PP. Same opportunity as ρ_core.
-3. **VNL setup (2s)**: builds radial tables on CPU. The table construction
-   itself is fast; the q_max scan iterates over all k-points.
+3. **VNL setup**: WFN-based callers now skip the old host-side q_max scan by
+   using `wfn.ecutwfc` in `vnl_ops.build_vnl_setup(...)`.  Remaining cost is
+   the one-time radial-table build itself.
 4. **JIT warmup (6.8s)**: XLA compilation of complex128 linalg kernels.
    Irreducible — only way to reduce is smaller m_max or float32.
 5. **_subspace_step Cholesky (1.7 ms)**: dominates the 1.4 ms iteration.

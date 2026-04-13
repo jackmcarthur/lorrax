@@ -54,12 +54,10 @@ except ImportError:
 from psp.build_projectors_qe import (
     build_local_ionic_potential_on_G_total,
 )
-from psp.projector_pipeline import (
-    build_vnl_plan,
-    compute_V_NL_k_minimal,
-)
+from psp.dft_operators import vnl_matrix_from_kdata
 from dataclasses import dataclass
 import h5py
+import psp.vnl_ops as vnl_ops
 
 import matplotlib
 matplotlib.use('Agg')
@@ -610,8 +608,8 @@ def _compute_local_V_k_jit(
     V_loc = jnp.einsum('bsg,nsg->bn', jnp.conj(psi_coeffs), vpsi, optimize=True)
     return V_loc * jnp.sqrt(1.0 / volume)
 
-    # Legacy implementation removed in favor of minimal vectorized pipeline
-    raise NotImplementedError("compute_V_NL_k legacy path removed; use compute_V_NL_k_minimal via ISDF_USE_MINIMAL_VNL=1 or call projector_pipeline directly.")
+    # Legacy implementation removed in favor of unified vnl_ops / dft_operators path.
+    raise NotImplementedError("compute_V_NL_k legacy path removed; use vnl_ops.build_vnl_kdata_from_kvec plus dft_operators.vnl_matrix_from_kdata.")
 
 
 @timing.timed("psp.get_DFT_mtxels.get_H_matrix_elements", watch=True)
@@ -677,58 +675,39 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valr
     # Precompute G and K scaffolding for all k-points
     print("  Precomputing G and K scaffolding for all k-points...")
     Gk_crys_all: list[jnp.ndarray] = []
-    K_crys_all: list[jnp.ndarray] = []
-    K_cart_all: list[jnp.ndarray] = []
-    K_norm_all: list[np.ndarray] = []
-    bvec_np = np.asarray(wfn.bvec, dtype=float).T
-    B = float(wfn.blat) * bvec_np.T
     for i in range(sym.nk_tot):
         Gk_crys_i, _ = generate_gvectors_k(i, sym, wfn, meta)
-        Gk = np.asarray(Gk_crys_i, dtype=float)
-        kvec = np.asarray(sym.unfolded_kpts[i], dtype=float)
-        Kc = Gk + kvec[None, :]
-        Kcart = Kc @ B
-        Knorm = np.sqrt(np.sum(Kcart**2, axis=1))
         Gk_crys_all.append(jnp.asarray(Gk_crys_i, dtype=jnp.int32))
-        K_crys_all.append(jnp.asarray(Kc, dtype=jnp.float64))
-        K_cart_all.append(jnp.asarray(Kcart, dtype=jnp.float64))
-        K_norm_all.append(Knorm)
-    print("  Done precomputing G/K.")
+    print("  Done precomputing G scaffolding.")
 
-    # Determine q_max across all k and build per-pseudo cache once
-    q_max = 0.0
+    # Build fixed-size G pads for the local terms and a unified VNL setup once.
     nG_list: list[int] = []
-    for Knorm in K_norm_all:
-        if Knorm.size:
-            q_max = max(q_max, float(np.max(Knorm)))
-        nG_list.append(int(Knorm.shape[0]))
+    for Gk_crys_i in Gk_crys_all:
+        nG_list.append(int(Gk_crys_i.shape[0]))
     nG_max = max(nG_list) if nG_list else 0
     Gk_crys_pad: list[jnp.ndarray] = []
-    K_crys_pad: list[jnp.ndarray] = []
-    K_cart_pad: list[jnp.ndarray] = []
     G_mask: list[jnp.ndarray] = []
     for i in range(sym.nk_tot):
         Gcur = jnp.asarray(Gk_crys_all[i], dtype=jnp.int32)
-        Kc = jnp.asarray(K_crys_all[i], dtype=jnp.float64)
-        Kt = jnp.asarray(K_cart_all[i], dtype=jnp.float64)
         nG = int(Gcur.shape[0])
         if nG < nG_max:
             pad = nG_max - nG
             Gpad = jnp.pad(Gcur, ((0, pad), (0, 0)))
-            Kcpad = jnp.pad(Kc, ((0, pad), (0, 0)))
-            Ktpad = jnp.pad(Kt, ((0, pad), (0, 0)))
             mask = jnp.concatenate(
                 [jnp.ones((nG,), dtype=jnp.float64), jnp.zeros((pad,), dtype=jnp.float64)]
             )
         else:
-            Gpad, Kcpad, Ktpad = Gcur, Kc, Kt
+            Gpad = Gcur
             mask = jnp.ones((nG_max,), dtype=jnp.float64)
         Gk_crys_pad.append(Gpad)
-        K_crys_pad.append(Kcpad)
-        K_cart_pad.append(Ktpad)
         G_mask.append(mask)
-    # Build minimal VNL plan once for all k
-    plan = build_vnl_plan(pseudos, assignments, float(wfn.cell_volume), float(q_max))
+    vnl_setup = vnl_ops.build_vnl_setup(
+        wfn,
+        sym,
+        meta,
+        pseudos,
+        nspinor=int(meta.nspinor),
+    )
     
     # 3. Compute valence charge density from occupied states
     V_H_r = None
@@ -772,9 +751,6 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valr
     )
     V_loc_r = jnp.asarray(V_loc_r, dtype=jnp.float64)
 
-    # Build minimal plan once
-    plan = build_vnl_plan(pseudos, assignments, float(wfn.cell_volume), float(q_max))
-
     # 4. Execute DFT Hamiltonian calculation over k-points using precomputed G-vectors
     print("\n  Building H(k) on first k-point for debug...")
     H_list = []
@@ -783,24 +759,18 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valr
         wfn_k = wfn_k_sharded[i]  # (nb, nspinor, nx, ny, nz)
         kpoint = kpoints[i]
         Gk_crys = Gk_crys_pad[i]
-        K_crys = K_crys_pad[i]
-        K_cart = K_cart_pad[i]
 
         T_k = compute_kinetic_k(
             wfn_k, Gk_crys, kpoint, bdot_j
         )
         V_ion_k = compute_local_V_k(wfn_k, Gk_crys, V_loc_r, wfn.cell_volume, G_mask[i])
         V_H_k = compute_local_V_k(wfn_k, Gk_crys, V_H_r, wfn.cell_volume, G_mask[i])
-        # Minimal, vectorized V_NL(k)
-        V_NL_k = compute_V_NL_k_minimal(
-            wfn_k,
-            Gk_crys,
-            K_crys,
-            K_cart,
-            plan,
-            float(wfn.cell_volume),
-            G_mask[i],
+        kdata = vnl_ops.build_vnl_kdata_from_kvec(
+            np.asarray(kpoint, dtype=float),
+            np.asarray(Gk_crys_all[i], dtype=int),
+            vnl_setup,
         )
+        V_NL_k = vnl_matrix_from_kdata(wfn_k, Gk_crys_all[i], kdata)
 
         # Temporary debug prints: first 4x4 blocks (2 decimals, scientific)
         # (per-matrix debug prints removed)
@@ -881,62 +851,44 @@ def get_kin_ion(
             ]
         timer_struct.watch(assignments, species_payload)
 
-    # Precompute K scaffolding identical to the main flow (no refactor)
+    # Precompute G scaffolding once; unified VNL setup reconstructs per-k K on device.
     with timing.section("psp.get_DFT_mtxels.get_kin_ion.k_scaffolding") as timer_kprep:
         Gk_crys_all: list[jnp.ndarray] = []
-        K_crys_all: list[jnp.ndarray] = []
-        K_cart_all: list[jnp.ndarray] = []
-        K_norm_all: list[np.ndarray] = []
-        bvec_np = np.asarray(wfn.bvec, dtype=float).T
-        B = float(wfn.blat) * bvec_np.T
         for i in range(sym.nk_tot):
             Gk_crys_i, _ = generate_gvectors_k(i, sym, wfn, meta)
-            Gk = np.asarray(Gk_crys_i, dtype=float)
-            kvec = np.asarray(sym.unfolded_kpts[i], dtype=float)
-            Kc = Gk + kvec[None, :]
-            Kcart = Kc @ B
-            Knorm = np.sqrt(np.sum(Kcart**2, axis=1))
             Gk_crys_all.append(jnp.asarray(Gk_crys_i, dtype=jnp.int32))
-            K_crys_all.append(jnp.asarray(Kc, dtype=jnp.float64))
-            K_cart_all.append(jnp.asarray(Kcart, dtype=jnp.float64))
-            K_norm_all.append(Knorm)
-        timer_kprep.watch(Gk_crys_all, K_crys_all, K_cart_all)
+        timer_kprep.watch(Gk_crys_all)
 
-    # q_max across all k for plan construction, and build fixed-size G/K pads
-    q_max = 0.0
+    # Build fixed-size G pads for local terms, and one shared VNL setup.
     nG_list = []
-    for Knorm in K_norm_all:
-        if Knorm.size:
-            q_max = max(q_max, float(np.max(Knorm)))
-        nG_list.append(int(Knorm.shape[0]))
+    for Gk_crys_i in Gk_crys_all:
+        nG_list.append(int(Gk_crys_i.shape[0]))
 
     nG_max = max(nG_list) if nG_list else 0
     Gk_crys_pad: list[jnp.ndarray] = []
-    K_crys_pad: list[jnp.ndarray] = []
-    K_cart_pad: list[jnp.ndarray] = []
     G_mask: list[jnp.ndarray] = []
     for i in range(sym.nk_tot):
         Gcur = jnp.asarray(Gk_crys_all[i], dtype=jnp.int32)
-        Kc = jnp.asarray(K_crys_all[i], dtype=jnp.float64)
-        Kt = jnp.asarray(K_cart_all[i], dtype=jnp.float64)
         nG = int(Gcur.shape[0])
         if nG < nG_max:
             pad = nG_max - nG
             Gpad = jnp.pad(Gcur, ((0, pad), (0, 0)))
-            Kcpad = jnp.pad(Kc, ((0, pad), (0, 0)))
-            Ktpad = jnp.pad(Kt, ((0, pad), (0, 0)))
             mask = jnp.concatenate([jnp.ones((nG,), dtype=jnp.float64), jnp.zeros((pad,), dtype=jnp.float64)])
         else:
-            Gpad, Kcpad, Ktpad = Gcur, Kc, Kt
+            Gpad = Gcur
             mask = jnp.ones((nG_max,), dtype=jnp.float64)
         Gk_crys_pad.append(Gpad)
-        K_crys_pad.append(Kcpad)
-        K_cart_pad.append(Ktpad)
         G_mask.append(mask)
 
-    # Build minimal VNL plan once for all k
+    # Build unified VNL setup once for all k.
     with timing.section("psp.get_DFT_mtxels.get_kin_ion.plan_build"):
-        plan = build_vnl_plan(pseudos, assignments, float(wfn.cell_volume), float(q_max))
+        vnl_setup = vnl_ops.build_vnl_setup(
+            wfn,
+            sym,
+            meta,
+            pseudos,
+            nspinor=int(meta.nspinor),
+        )
 
     # Build V_loc on 2x grid once
     with timing.section("psp.get_DFT_mtxels.get_kin_ion.build_V_loc") as timer_vloc:
@@ -997,15 +949,12 @@ def get_kin_ion(
             with timing.section("psp.get_DFT_mtxels.get_kin_ion.compute_V_loc"):
                 V_ion_k = compute_local_V_k(wfn_k, Gk_crys, V_loc_r, wfn.cell_volume, G_mask[i])
             with timing.section("psp.get_DFT_mtxels.get_kin_ion.compute_V_NL"):
-                V_NL_k = compute_V_NL_k_minimal(
-                    wfn_k,
-                    Gk_crys,
-                    K_crys_pad[i],
-                    K_cart_pad[i],
-                    plan,
-                    float(wfn.cell_volume),
-                    G_mask[i],
+                kdata = vnl_ops.build_vnl_kdata_from_kvec(
+                    np.asarray(kpoint, dtype=float),
+                    np.asarray(Gk_crys_all[i], dtype=int),
+                    vnl_setup,
                 )
+                V_NL_k = vnl_matrix_from_kdata(wfn_k, Gk_crys_all[i], kdata)
             total_k = T_k + V_ion_k + V_NL_k
             if include_hartree:
                 with timing.section("psp.get_DFT_mtxels.get_kin_ion.compute_V_H"):
