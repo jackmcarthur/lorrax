@@ -118,6 +118,14 @@ def print_banner(
     print_fn("")
 
 
+def print_section(title: str, print_fn=print):
+    """Print a section divider: ---- TITLE ----"""
+    print_fn("")
+    print_fn("-" * 72)
+    print_fn(f"  {title}")
+    print_fn("-" * 72)
+
+
 def print_system_summary(
     n_rmu: int,
     fft_grid: tuple[int, int, int],

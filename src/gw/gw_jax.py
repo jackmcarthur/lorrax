@@ -179,18 +179,18 @@ def main(argv=None):
 	)
 	args = argp.parse_args(argv)
 	
-	# Gate prints to rank 0 during main
+	# Gate prints to rank 0
 	_orig_print = builtins.print
-	def _print0(*a, **k):
+	def print0(*a, **k):
 		if jax.process_index() == 0:
 			k.setdefault("flush", True)
 			_orig_print(*a, **k)
-	builtins.print = _print0
+	builtins.print = print0
  
 	# ========================================================================
 	# CONFIGURATION
 	# ========================================================================
-	config = LorraxConfig.from_input_file(args.input, print_fn=_print0)
+	config = LorraxConfig.from_input_file(args.input, print_fn=print0)
 	input_dir = config.input_dir
 	ryd2ev = 13.6056980659
 
@@ -205,34 +205,23 @@ def main(argv=None):
 	mesh_xy = _build_mesh()
 	grid_x, grid_y = mesh_xy.devices.shape
 
-	from .gw_output import print_banner, print_system_summary, write_results, GWResults
+	from .gw_output import print_banner, print_section, print_system_summary, write_results, GWResults
 	print_banner(
 		backend=current_backend, n_devices=n_devices,
 		grid_x=grid_x, grid_y=grid_y, n_procs=n_procs,
-		device_kind=device_names, print_fn=_print0,
+		device_kind=device_names, print_fn=print0,
 	)
 
-	import time as _boot_time
-	_t_boot = _boot_time.perf_counter()
-	_print0(f"  [TIMING-BOOT] input parsed: {_boot_time.perf_counter() - _t_boot:.3f}s")
-
 	global wfn
-	_t_wfn = _boot_time.perf_counter()
 	wfn = WFNReader(config.wfn_file)
-	_print0(f"  [TIMING-BOOT] WFNReader: {_boot_time.perf_counter() - _t_wfn:.3f}s")
-	_t_sym = _boot_time.perf_counter()
 	sym = symmetry_maps.SymMaps(wfn)
-	_print0(f"  [TIMING-BOOT] SymMaps: {_boot_time.perf_counter() - _t_sym:.3f}s")
-
-	_t_cent = _boot_time.perf_counter()
 	_, centroid_indices, _n_rmu = load_centroids(config.centroids_file, wfn.fft_grid)
-	_print0(f"  [TIMING-BOOT] load_centroids: {_boot_time.perf_counter() - _t_cent:.3f}s")
 	tmp_dir = os.path.join(input_dir, "tmp")
 	os.makedirs(tmp_dir, exist_ok=True)
 	tensors_filename = os.path.join(tmp_dir, f"isdf_tensors_{_n_rmu}.h5")
 	print_system_summary(
 		n_rmu=_n_rmu, fft_grid=wfn.fft_grid,
-		cell_volume=wfn.cell_volume, print_fn=_print0,
+		cell_volume=wfn.cell_volume, print_fn=print0,
 	)
 
 	meta = Meta.from_system(wfn, sym, config.nval, config.ncond, config.nband, _n_rmu, config.bispinor)
@@ -244,14 +233,8 @@ def main(argv=None):
 
 	band_slices = BandSlices.from_band_edges(*meta.band_edges)
 
-	def print0(*a, **k):
-		if meta.rank == 0:
-			k.setdefault("flush", True)
-			print(*a, **k)
-
 	# ISDF fitting or restart loading
 	timing.reset()
-	_t_isdf = _boot_time.perf_counter()
 	isdf = prepare_isdf_and_wavefunctions(
 		cfg=config,
 		wfn=wfn,
@@ -264,7 +247,6 @@ def main(argv=None):
 		tensors_filename=tensors_filename,
 		print0=print0,
 	)
-	print0(f"  [TIMING-BOOT] prepare_isdf_and_wavefunctions: {_boot_time.perf_counter() - _t_isdf:.3f}s")
 	V_qmunu = isdf.V_qmunu
 	wfns = isdf.wf_bundle
 
@@ -383,7 +365,7 @@ def main(argv=None):
 			raise NotImplementedError("use_ppm_sigma not supported with self_consistent.")
 
 		ppm_options = build_ppm_sigma_runtime_options(config, input_dir=input_dir, ryd2ev=ryd2ev)
-		print0("\n" + "-" * 72 + "\n  GN-PPM + FREQUENCY-INTEGRATED SIGMA\n" + "-" * 72)
+		print_section("GN-PPM + FREQUENCY-INTEGRATED SIGMA", print0)
 
 		with timing.section("gw_jax.ppm_sigma"):
 			# χ₀(iωp) → W(iωp) → GN-PPM pole fit
