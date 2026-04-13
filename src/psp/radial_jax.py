@@ -159,42 +159,64 @@ def interp_uniform_jax(
 
 
 def spherical_jn_jax(l: int, x: jax.Array) -> jax.Array:
-    """Spherical Bessel j_l(x), stable near x=0."""
+    """Spherical Bessel j_l(x) via Miller's backward recurrence.
+
+    Forward recurrence is unstable for l >= 2 at large x (mixes in
+    neumann functions).  Miller's algorithm recurs downward from a
+    high l_start, producing unnormalized j_l, then rescales using
+    the known j_0 = sin(x)/x.
+    """
     small = jnp.abs(x) < 0.1
     sx = jnp.where(small, 1.0, x)
     sinx = jnp.sin(sx)
     cosx = jnp.cos(sx)
 
-    j0_large = sinx / sx
-    j1_large = sinx / sx**2 - cosx / sx
+    j0_exact = sinx / sx
 
     if l == 0:
         x2 = x * x
         j0_small = 1.0 - x2 / 6.0 + x2**2 / 120.0
-        return jnp.where(small, j0_small, j0_large)
+        return jnp.where(small, j0_small, j0_exact)
 
     if l == 1:
+        j1_large = sinx / sx**2 - cosx / sx
         x2 = x * x
         j1_small = x / 3.0 - x * x2 / 30.0 + x * x2**2 / 840.0
         return jnp.where(small, j1_small, j1_large)
 
-    jn_prev = j0_large
-    jn_curr = j1_large
-    for ll in range(1, l):
-        jn_next = (2 * ll + 1) / sx * jn_curr - jn_prev
-        jn_prev = jn_curr
-        jn_curr = jn_next
-    jl_large = jn_curr
+    # Miller's backward recurrence for l >= 2
+    # Start high: j_{N+1}=0, j_N=1, recur j_{n-1} = (2n+1)/x j_n - j_{n+1}
+    # Normalize via j_0 = sin(x)/x
+    # l_start must be >> x for stability. Standard: l_start ≈ x_max + 10√x_max + l.
+    # We don't know x_max at trace time, so use a safe static bound.
+    # For ecutwfc=25 Ry, max |k+G|≈5, max r≈10 bohr → max qr≈50.
+    # l_start = 80 covers qr up to ~60 with margin.
+    l_start = max(l + 30, 80)
+    jn_hi = jnp.zeros_like(sx)   # j_{n+1}
+    jn_lo = jnp.ones_like(sx)    # j_n
 
+    jl_unnorm = jnp.zeros_like(sx)
+    for n in range(l_start, 0, -1):
+        # compute j_{n-1} from j_n and j_{n+1}
+        jn_prev = (2 * n + 1) / sx * jn_lo - jn_hi
+        jn_hi = jn_lo
+        jn_lo = jn_prev
+        if n - 1 == l:
+            jl_unnorm = jn_lo
+
+    # jn_lo is now unnormalized j_0
+    scale = j0_exact / jn_lo
+    jl_large = jl_unnorm * scale
+
+    # Small-x Taylor: j_l(x) ≈ x^l / (2l+1)!! [1 - x²/(2(2l+3)) + ...]
     x2 = x * x
     double_fact = 1.0
     for k in range(1, 2 * l + 2, 2):
         double_fact *= k
     jl_small = (
-        jnp.abs(x) ** l
-        * jnp.sign(x) ** l
-        / double_fact
-        * (1.0 - x2 / (2.0 * (2 * l + 3)) + x2**2 / (8.0 * (2 * l + 3) * (2 * l + 5)))
+        jnp.abs(x) ** l / double_fact
+        * (1.0 - x2 / (2.0 * (2 * l + 3))
+           + x2**2 / (8.0 * (2 * l + 3) * (2 * l + 5)))
     )
     return jnp.where(small, jl_small, jl_large)
 
