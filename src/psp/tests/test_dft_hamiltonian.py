@@ -121,8 +121,10 @@ def main():
     # ── VNL setup ──
     sym = symmetry_maps.SymMaps(wfn)
     meta = Meta.from_system(wfn, sym, n_occ, nb - n_occ, nb, 0, bispinor=False)
+    # Pass wfn (not crystal) because build_vnl_setup needs get_gvec_nk
+    # for the q_max scan over all k-points via SymMaps.
     vnl_setup = vnl_ops.build_vnl_setup(
-        crystal, sym, meta, pseudos, nspinor=crystal.nspinor,
+        wfn, sym, meta, pseudos, nspinor=crystal.nspinor,
     )
 
     # ── Load full-BZ wavefunctions ──
