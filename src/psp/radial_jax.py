@@ -184,27 +184,24 @@ def spherical_jn_jax(l: int, x: jax.Array) -> jax.Array:
         j1_small = x / 3.0 - x * x2 / 30.0 + x * x2**2 / 840.0
         return jnp.where(small, j1_small, j1_large)
 
-    # Miller's backward recurrence for l >= 2
-    # Start high: j_{N+1}=0, j_N=1, recur j_{n-1} = (2n+1)/x j_n - j_{n+1}
-    # Normalize via j_0 = sin(x)/x
-    # l_start must be >> x for stability. Standard: l_start ≈ x_max + 10√x_max + l.
-    # We don't know x_max at trace time, so use a safe static bound.
-    # For ecutwfc=25 Ry, max |k+G|≈5, max r≈10 bohr → max qr≈50.
-    # l_start = 80 covers qr up to ~60 with margin.
+    # Miller's backward recurrence for l >= 2, using lax.fori_loop
+    # to avoid unrolling 80 iterations into the XLA graph.
+    # Recurrence: j_{n-1} = (2n+1)/x j_n - j_{n+1}, downward from l_start to 0.
+    # Capture j_l during the sweep, normalize at the end via j_0 = sin(x)/x.
     l_start = max(l + 30, 80)
-    jn_hi = jnp.zeros_like(sx)   # j_{n+1}
-    jn_lo = jnp.ones_like(sx)    # j_n
 
-    jl_unnorm = jnp.zeros_like(sx)
-    for n in range(l_start, 0, -1):
-        # compute j_{n-1} from j_n and j_{n+1}
+    def _miller_body(step, carry):
+        # step counts 0..l_start-1; actual n = l_start - step
+        jn_lo, jn_hi, jl_unnorm = carry
+        n = l_start - step
         jn_prev = (2 * n + 1) / sx * jn_lo - jn_hi
-        jn_hi = jn_lo
-        jn_lo = jn_prev
-        if n - 1 == l:
-            jl_unnorm = jn_lo
+        # Capture j_l when we reach n-1 == l
+        jl_unnorm = jnp.where(n - 1 == l, jn_prev, jl_unnorm)
+        return (jn_prev, jn_lo, jl_unnorm)
 
-    # jn_lo is now unnormalized j_0
+    init = (jnp.ones_like(sx), jnp.zeros_like(sx), jnp.zeros_like(sx))
+    jn_lo, _, jl_unnorm = jax.lax.fori_loop(0, l_start, _miller_body, init)
+
     scale = j0_exact / jn_lo
     jl_large = jl_unnorm * scale
 
