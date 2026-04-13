@@ -62,18 +62,45 @@ Total:    26.2s
 
 ## How to test
 
-```bash
-# From the sandbox, Si 4×4×4:
-cd runs/Si/04_si_4x4x4_davidson/00_davidson
-PYTHONPATH=".../lorrax_bse/src:$SITE:$SANDBOX/sources" \
-JAX_ENABLE_X64=1 HDF5_USE_FILE_LOCKING=FALSE \
-python3 -u run_nscf.py \
-    --save ../../00_si_4x4x4_60band/qe/scf/silicon.save \
-    --nk 4 4 4 --nbands 12
+### Eigenvalue validation (0.0 mRy target)
 
-# Quick eigenvalue validation (compare with QE):
-# Uses build_matrix_k with QE SCF density → eig should match to 0.001 mRy.
-# See the inline test scripts at the end of this session's conversation.
+The canonical test is `psp/tests/test_dft_hamiltonian.py`.  It builds
+H from a QE .save directory, diagonalizes in the NSCF wavefunction basis,
+and compares eigenvalues at all IBZ k-points.  Self-contained, no stale
+scripts.
+
+```bash
+# From anywhere with access to the Si data (e.g. Perlmutter):
+SITE=$HOME/scratchperl/.isdf/isdf_venvs/isdf_site
+LORRAX=/global/u2/j/jackm/software/lorrax_bse
+SIDIR=/pscratch/sd/j/jackm/lorrax_sandbox_fresh/runs/Si/00_si_4x4x4_60band
+
+cd $SIDIR
+PYTHONPATH="$LORRAX/src:$SITE" \
+JAX_ENABLE_X64=1 HDF5_USE_FILE_LOCKING=FALSE \
+XLA_PYTHON_CLIENT_PREALLOCATE=false \
+python3 -u -m psp.tests.test_dft_hamiltonian \
+    --save qe/scf/silicon.save \
+    --pseudo_dir qe/scf \
+    --wfn qe/nscf/WFN.h5
+
+# Expected output: "PASS: all k-points match QE to < 0.01 mRy"
+```
+
+### Critical detail: k-point indexing
+
+`load_kpoint_fftbox(ik)` treats `ik` as an UNFOLDED index (0..63), not an
+IBZ index (0..7).  For k=0,1,2 these happen to coincide, but for k>=3
+they diverge.  The test uses `read_Gvecs_to_devices` to load all 64
+full-BZ wavefunctions, then indexes by `ibz_map[i_ibz]` → unfolded index.
+This is the ONLY correct way to compare with WFN.h5 eigenvalues at k>=3.
+
+Using `load_kpoint_fftbox(i_ibz)` directly gives ~1-5 mRy errors at k>=3
+because wavefunctions and operators are at different k-points.
+
+### Regression test (existing)
+```bash
+cd $LORRAX && uv run python -m pytest -q   # 13 tests, ~13s
 ```
 
 ## Key design decisions pressed in review
