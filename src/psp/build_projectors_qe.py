@@ -843,7 +843,7 @@ def compute_type_projectors_real(
     return projector_array, meta
 
 
-def precompute_projector_splines(
+def precompute_projector_tables(
     pseudo,
     cell_volume: float,
     q_max: float,
@@ -870,7 +870,7 @@ def precompute_projector_splines(
         q_points = max(2048, 2 * len(r))
     q_grid = make_uniform_q_grid(float(q_max), q_points)
     weights = radial_weights(r, rab, scheme='rab')
-    splines: Dict[Tuple[int, int], RadialTable] = {}
+    tables: Dict[Tuple[int, int], RadialTable] = {}
     for idx, beta in enumerate(betas, start=1):
         l = int(getattr(beta, 'lll', getattr(beta, 'angular_momentum', 0)))
         raw_beta = np.asarray(beta.value, dtype=float)
@@ -880,8 +880,18 @@ def precompute_projector_splines(
             beta_r[0] = beta_r[1]
         else:
             beta_r = raw_beta / r
-        splines[(l, idx)] = make_projector_table(l, r, beta_r, q_grid, weights)
-    return splines
+        tables[(l, idx)] = make_projector_table(l, r, beta_r, q_grid, weights)
+    return tables
+
+
+def precompute_projector_splines(
+    pseudo,
+    cell_volume: float,
+    q_max: float,
+    q_points: int | None = None,
+) -> Dict[Tuple[int, int], RadialTable]:
+    """Compatibility wrapper returning radial tables, not SciPy splines."""
+    return precompute_projector_tables(pseudo, cell_volume, q_max, q_points)
 
 
 __all__ = [
@@ -898,6 +908,7 @@ __all__ = [
     "real_harmonic_slot",
     "build_E_blocks_full",
     "compute_type_projectors_real",
+    "precompute_projector_tables",
     "precompute_projector_splines",
     "build_local_ionic_potential_on_G_total",
 ]

@@ -8,7 +8,7 @@ from typing import Dict, List, Tuple
 
 from .build_projectors_qe import (
     build_E_blocks_full,
-    precompute_projector_splines,
+    precompute_projector_tables,
     qe_real_sph_harmonics,
     qe_real_sph_harmonics_with_grad,
     compute_type_projectors_real,
@@ -46,7 +46,7 @@ class Species:
 @dataclass
 class PseudoBundle:
     E_blocks: Dict[int, np.ndarray]
-    F_splines: Dict[Tuple[int, int], object]
+    radial_tables: Dict[Tuple[int, int], object]
     lmax: int
 
 
@@ -79,9 +79,9 @@ def _infer_lmax_from_pseudo(pseudo) -> int:
 
 def prepare_pseudo_bundle(pseudo, cell_volume: float, q_max: float) -> PseudoBundle:
     E_blocks = build_E_blocks_full(pseudo)
-    F_splines = precompute_projector_splines(pseudo, float(cell_volume), float(q_max))
+    radial_tables = precompute_projector_tables(pseudo, float(cell_volume), float(q_max))
     lmax = _infer_lmax_from_pseudo(pseudo)
-    return PseudoBundle(E_blocks=E_blocks, F_splines=F_splines, lmax=int(lmax))
+    return PseudoBundle(E_blocks=E_blocks, radial_tables=radial_tables, lmax=int(lmax))
 
 
 def prepare_pseudo_cache(species_list: List[Species], cell_volume: float, q_max: float) -> Dict[int, PseudoBundle]:
@@ -109,7 +109,7 @@ def make_projector_rows(bundle: PseudoBundle, kpack: KBundle, species: Species, 
         K_cart_total=np.asarray(kpack.K_cart),
         cell_volume=float(cell_volume),
         Y_real_by_l_pre=Y_real_by_l,
-        F_splines=bundle.F_splines,
+        F_splines=bundle.radial_tables,
         K_norm_in=np.asarray(kpack.K_norm),
     )
     return rows, meta
@@ -168,13 +168,13 @@ def _evaluate_Fprime_bessel(pseudo, l: int, beta_ids: list[int], K_norm: np.ndar
 
 
 def _evaluate_F_and_Fprime_for_l(
-    splines: Dict[Tuple[int, int], object],
+    radial_tables: Dict[Tuple[int, int], object],
     d_spl_cache: Dict[Tuple[int, int], object],
     l: int,
     beta_ids: list[int],
     K_norm: np.ndarray,
     pseudo=None,
-    fprime_mode: str = 'spline',
+    fprime_mode: str = 'table',
 ) -> tuple[np.ndarray, np.ndarray]:
     if K_norm.size == 0:
         return np.zeros((len(beta_ids), 0)), np.zeros((len(beta_ids), 0))
@@ -185,20 +185,20 @@ def _evaluate_F_and_Fprime_for_l(
         Fp_mat = None
     Fp_list = []
     for bid_idx, bid in enumerate(beta_ids):
-        spl = splines.get((int(l), int(bid)))
-        if spl is None:
+        tab = radial_tables.get((int(l), int(bid)))
+        if tab is None:
             F_list.append(np.zeros_like(K_norm))
             Fp_list.append(np.zeros_like(K_norm))
             continue
-        Fv = spl(K_norm)
+        Fv = tab(K_norm)
         if Fp_mat is not None:
             Fpv = Fp_mat[bid_idx, :]
         else:
-            dspl = d_spl_cache.get((int(l), int(bid)))
-            if dspl is None:
-                dspl = spl.derivative(1)
-                d_spl_cache[(int(l), int(bid))] = dspl
-            Fpv = dspl(K_norm)
+            dtab = d_spl_cache.get((int(l), int(bid)))
+            if dtab is None:
+                dtab = tab.derivative(1)
+                d_spl_cache[(int(l), int(bid))] = dtab
+            Fpv = dtab(K_norm)
         F_list.append(Fv)
         Fp_list.append(Fpv)
     return np.stack(F_list, axis=0), np.stack(Fp_list, axis=0)
@@ -235,7 +235,7 @@ def build_beta_rows_with_grad(
         if tau.size == 0:
             continue
         pref = float(sp['prefactor'])
-        splines = sp['splines']
+        radial_tables = sp['radial_tables']
 
         for l, info in sp['l_channels'].items():
             beta_ids = info['beta_ids']
@@ -243,7 +243,7 @@ def build_beta_rows_with_grad(
                 continue
             msize = 2 * int(l) + 1
 
-            F_bG, Fp_bG = _evaluate_F_and_Fprime_for_l(splines, d_spl_cache, int(l), beta_ids, K_norm, pseudo=sp['pseudo'], fprime_mode=sp.get('fprime_mode', 'spline'))
+            F_bG, Fp_bG = _evaluate_F_and_Fprime_for_l(radial_tables, d_spl_cache, int(l), beta_ids, K_norm, pseudo=sp['pseudo'], fprime_mode=sp.get('fprime_mode', 'table'))
             radial = pref * (1j) ** int(l) * F_bG  # (nbeta, nG), A(q) = F(q)
             radial_p = pref * (1j) ** int(l) * Fp_bG  # (nbeta, nG), A'(q) = F'(q)
 
@@ -339,7 +339,7 @@ def build_beta_rows_with_grad_components(
         if tau.size == 0:
             continue
         pref = float(sp['prefactor'])
-        splines = sp['splines']
+        radial_tables = sp['radial_tables']
 
         for l, info in sp['l_channels'].items():
             beta_ids = info['beta_ids']
@@ -347,7 +347,7 @@ def build_beta_rows_with_grad_components(
                 continue
             msize = 2 * int(l) + 1
 
-            F_bG, Fp_bG = _evaluate_F_and_Fprime_for_l(splines, d_spl_cache, int(l), beta_ids, K_norm)
+            F_bG, Fp_bG = _evaluate_F_and_Fprime_for_l(radial_tables, d_spl_cache, int(l), beta_ids, K_norm)
             radial = pref * (1j) ** int(l) * F_bG  # (nbeta, nG)
             radial_p = pref * (1j) ** int(l) * Fp_bG  # (nbeta, nG)
 
@@ -482,7 +482,7 @@ __all__ = [
 
 
 def build_vnl_plan(pseudos: Dict[str, object], assignments, cell_volume: float, q_max: float):
-    """Return a minimal per-species, per-ℓ plan with E blocks and radial splines.
+    """Return a minimal per-species, per-ℓ plan with E blocks and radial tables.
 
     Plan structure:
       plan = {
@@ -496,7 +496,7 @@ def build_vnl_plan(pseudos: Dict[str, object], assignments, cell_volume: float, 
                   'beta_ids': [idx1, idx2, ...],   # 1-based per UPF order
               }
           },
-          'splines': { (ℓ, idx) -> spline },
+          'radial_tables': { (ℓ, idx) -> RadialTable },
         }
       }
     """
@@ -519,7 +519,7 @@ def build_vnl_plan(pseudos: Dict[str, object], assignments, cell_volume: float, 
     for key, ent in species.items():
         pseudo = ent['pseudo']
         E_blocks = build_E_blocks_full(pseudo)  # dict ℓ -> (2,2,Rℓ,Rℓ)
-        splines = precompute_projector_splines(pseudo, float(cell_volume), float(q_max))
+        radial_tables = precompute_projector_tables(pseudo, float(cell_volume), float(q_max))
         # Map betas per ℓ in file order
         l_channels: Dict[int, Dict[str, object]] = {}
         betas = list(getattr(getattr(pseudo, 'pp_nonlocal', None), 'pp_beta', []))
@@ -542,7 +542,7 @@ def build_vnl_plan(pseudos: Dict[str, object], assignments, cell_volume: float, 
             },
             'prefactor': prefactor,
             'l_channels': l_channels,
-            'splines': splines,
+            'radial_tables': radial_tables,
         }
     return plan
 
@@ -559,7 +559,7 @@ def compute_V_NL_k_minimal(
     """Vectorized minimal V_NL(k) using prebuilt plan.
 
     Steps per ℓ:
-      - Evaluate F_ℓ,β(|K|) via splines and form radial = (4π/√Ω)(i)^ℓ F.
+      - Evaluate F_ℓ,β(|K|) via radial tables and form radial = (4π/√Ω)(i)^ℓ F.
       - Build Y'_{ℓm}(K) once per ℓ; multiply radial and structure phases per atom.
       - Stack rows in beta-major, m-slot order to match E_ℓ layout.
       - Contract: P = Z^†·C, then Δ_ℓ = Σσσ' P^†_σ E^{σσ'}_ℓ P_{σ'}.
@@ -595,7 +595,7 @@ def compute_V_NL_k_minimal(
             continue
         indices = np.asarray(sp['atoms']['indices'], dtype=int)
         pref = float(sp['prefactor'])
-        splines = sp['splines']
+        radial_tables = sp['radial_tables']
 
         # Precompute phases once per species (independent of ℓ)
         if tau.ndim == 1:
@@ -616,7 +616,7 @@ def compute_V_NL_k_minimal(
             # F_ℓ,β(|K|) for all beta in this ℓ
             if nG == 0:
                 continue
-            F_bG = np.stack([splines[(int(l), int(bid))](K_norm) for bid in beta_ids], axis=0)
+            F_bG = np.stack([radial_tables[(int(l), int(bid))](K_norm) for bid in beta_ids], axis=0)
             radial = pref * (1j) ** int(l) * F_bG  # (nbeta, nG)
             radial_j = jnp.asarray(radial, dtype=jnp.complex128)
 

@@ -598,7 +598,7 @@ def extract_vnl_channel_data(
         if tau.ndim == 1:
             tau = tau.reshape(1, 3)
         pref = float(sp['prefactor'])
-        splines = sp['splines']
+        radial_tables = sp['radial_tables']
 
         for l_key, info in sp['l_channels'].items():
             l = int(l_key)
@@ -614,7 +614,7 @@ def extract_vnl_channel_data(
             red_tables = []
             red_dtables = []
             for bid in beta_ids:
-                tab = splines[(l, int(bid))]
+                tab = radial_tables[(l, int(bid))]
                 if not isinstance(tab, RadialTable):
                     raise TypeError("Expected RadialTable in projector plan")
                 q0 = float(tab.q0) if q0 is None else q0
