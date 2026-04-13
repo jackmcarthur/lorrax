@@ -2,28 +2,37 @@
 psp/davidson.py — Block Davidson eigensolver for plane-wave DFT.
 
 Finds the lowest n_tgt eigenvalues of H at a single k-point.
+Validated to 0.001 mRy vs QE for Si 4×4×4 FR-PBE.
 
-The algorithm follows QE's cegterg:
-  - Subspace expansion with preconditioned residuals
-  - Generalized eigenproblem Hc v = ε Sc v (non-orthogonal basis)
-  - Thick restart to Ritz vectors when subspace exceeds m_max
-  - Diagonal preconditioner: g(G) = 1 / (h_diag(G) - ε)
+Algorithm (follows QE's cegterg.f90):
+  1. Initial guess: lowest-|k+G|² plane waves → subspace H projection → rotate
+  2. Each iteration: project H onto subspace (Gram), solve generalized
+     eigenproblem Hc v = ε Sc v via Cholesky reduction, form Ritz vectors,
+     compute residuals, precondition with h_diag = |k+G|² + V_loc(G=0) + V_NL_diag
+  3. Expand subspace by n_tgt vectors (fixed block, avoids JIT recompilation)
+  4. Restart to Ritz vectors when subspace exceeds m_max (default 4×n_tgt)
 
-Performance: all linear-algebra between apply_H calls is fused into
-two JIT'd kernels (_project_subspace and _expand_subspace) to minimize
-Python dispatch overhead.  apply_H is the only external JIT call per
-iteration.
+Performance (Si, 12 bands, 576 nG, A100):
+  _subspace_step cached: 1.4 ms    apply_H cached: ~2 ms
+  Per k-point (warmed): 0.08-0.16s  Per k-point (cold): ~1s
+  Call warmup_jit() before k-loop to front-load compilation (~3s).
+
+Key design decisions:
+  - Generalized eigh (not standard): the non-orthogonal basis from
+    preconditioned residuals requires Sc. Standard eigh gives zero modes.
+  - Cholesky reduction (not scipy): keeps everything on GPU in one JIT.
+    Regularised B + 1e-12·I for near-singular overlap.
+  - Fixed n_tgt expansion block: converged bands get ~zero corrections
+    but keeping the block size constant avoids shape-dependent recompilation.
+  - apply_H takes explicit H data as arguments (not closure): one JIT
+    compilation serves all k-points when G-vectors are padded to ngkmax.
 
 Usage
 -----
-    from psp.davidson import davidson_k
-
+    from psp.davidson import davidson_k, warmup_jit
+    warmup_jit(ngkmax, nspinor, n_tgt)  # once, before k-loop
     eigenvalues, eigenvectors = davidson_k(
-        apply_H=lambda psi: ...,
-        h_diag=H_k.h_diag,
-        nG=H_k.nG,
-        nspinor=2,
-        n_tgt=n_bands,
+        apply_H, h_diag=H_k.h_diag, nG=ngkmax, nspinor=2, n_tgt=12,
     )
 """
 from __future__ import annotations

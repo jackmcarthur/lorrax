@@ -1,37 +1,42 @@
 """
 psp/dft_operators.py — Plane-wave DFT Hamiltonian: build, apply, differentiate.
 
-This module owns the canonical implementations of:
+Canonical module for all DFT Hamiltonian operations.  Other modules
+(kin_ion_io_chunked, get_dipole_mtxels, davidson) should call these
+functions rather than reimplementing operator construction.
 
-  apply_H_k       — single fused JIT for H|ψ⟩ = (T + V_scf + V_NL)|ψ⟩
-  build_matrix_k   — full ⟨m|H|n⟩ matrix at one k-point
-  setup_H_k        — precompute all per-k arrays for the above
-  velocity_matrix_k — dH/dk for optical matrix elements (autodiff V_NL)
+Public API (Hamiltonian construction + application):
+  HamiltonianK         — per-k data: T_diag, V_scf, G-indices, VNL Z/E, h_diag, mask
+  setup_H_k            — build HamiltonianK from SymMaps path (GW pipeline)
+  setup_H_k_from_kvec  — build HamiltonianK from k-vector (standalone/Davidson)
+  apply_H_k            — fused JIT H|ψ⟩, psi_box donated; 2 ms on A100 for Si
+  build_matrix_k       — full ⟨m|H|n⟩ matrix
 
-Every other module that needs DFT operator functionality should call these
-functions rather than reimplementing the physics.
+Public API (per-component builders):
+  build_T_diag          — |k+G|² + G-indices from SymMaps
+  build_T_diag_from_kvec — same from explicit k-vector + ecutwfc (no SymMaps)
+  build_V_scf           — combine V_loc + V_H + V_xc into one array
+  compute_V_H_and_V_xc  — @jax.jit: V_H (Poisson) + V_xc (PBE GGA) in 1.2 ms cached
+  build_h_diag          — preconditioner diagonal: T + V_loc(G=0) + V_NL_diag
+  build_vnl_kdata       — dense VNL projectors (Z, E) from vnl_ops
 
-V_scf
------
-V_scf(r) = V_loc(r) + V_H(r) + V_xc(r) is the self-consistent local
-potential — everything that acts as a real-space multiply.  The caller
-constructs V_scf once (k-independent) and passes it in.  The separation
-into V_loc, V_H, V_xc is the caller's responsibility; this module treats
-them as a single (nx, ny, nz) array.
+Public API (velocity / dipole, autodiff through V_NL):
+  vnl_matrix_at_k       — V_NL as pure function of k (jax.jacfwd-able)
+  velocity_matrix_k     — dH/dk = 2(k+G) + dV_NL/dk
+  compute_dipole_all    — batch velocity matrix elements for all k-points
 
-Normalization
--------------
-All operators use the convention:
+V_scf = V_loc + V_H + V_xc is a single (nx,ny,nz) real-space potential.
+The caller builds it from charge_density.py (V_xc, V_H) and
+build_projectors_qe.py (V_loc), then passes it to setup_H_k*.
 
-    ⟨m|O|n⟩ = Σ_{s,G} conj(ψ_m[s,G]) · (O ψ)_n[s,G]
+Normalization: ⟨m|O|n⟩ = Σ_{s,G} conj(ψ_m[s,G]) · (O ψ)_n[s,G].
+No volume prefactors.  Ortho-FFT convention for local potentials:
+(V ψ)_G = FFT_ortho(V(r) · IFFT_ortho(ψ_box))_G.
 
-with no volume prefactors.  Wavefunctions are stored in the ortho-FFT box:
-ψ_box(G) such that Σ_G |ψ_box(G)|² = 1.  The real-space representation is
-ψ(r) = IFFT_ortho(ψ_box).  Local potentials V(r) act by:
-
-    (V ψ)_G = FFT_ortho(V(r) · IFFT_ortho(ψ_box))_G
-
-which is exact on the FFT grid with no extra scale factors.
+ngkmax padding: setup_H_k_from_kvec accepts ngkmax to pad all arrays
+to uniform size.  Combined with warmup_jit() from davidson.py, this
+ensures one JIT compilation serves all k-points.  Mask field on
+HamiltonianK zeros padding in apply_H_k and build_matrix_k.
 """
 from __future__ import annotations
 

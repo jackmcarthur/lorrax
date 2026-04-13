@@ -1,20 +1,37 @@
 """
 psp/qe_save_reader.py — Read crystal structure from a QE .save directory.
 
-Constructs a lightweight object with the same attribute names as WFNReader,
-so it can be passed to dft_operators, vnl_ops, charge_density, etc.
+CrystalData duck-types as WFNReader for structure queries: bdot, bvec,
+blat, alat, cell_volume, atom_crys, atom_types, nelec, nspinor, nspin,
+ecutwfc, ecutrho, fft_grid, kgrid, nbands, ntran, sym_matrices, translations.
+
+Does NOT provide wavefunction data (get_cnk, get_gvec_nk, kpoints), so
+it cannot be used with SymMaps or the GW pipeline.  Designed for the
+standalone DFT path: CrystalData → setup_H_k_from_kvec → Davidson.
 
 Required files in the .save directory:
-  data-file-schema.xml   — crystal structure, symmetries, parameters
-  charge-density.hdf5    — valence charge density ρ(G)
+  data-file-schema.xml   — crystal structure, symmetry ops, electronic params
+  charge-density.hdf5    — valence charge density ρ(G) (NLCC excluded)
+
+Key methods:
+  from_qe_save(save_dir) — parse XML, extract 48 symmetry ops with translations
+  build_kgrid(nk, nosym, noinv, no_t_rev, force_symmorphic) — MP grid → IBZ
+  load_charge_density()  — ρ_val(r) on FFT grid from HDF5
+  validate_against_wfn(wfn) — cross-check all fields vs WFNReader
+
+The IBZ reduction reproduces QE's kpoint_grid.f90: same enumeration order
+(dir 3 fastest), forward-only equivalence, optional time reversal.
+Translation convention: stored as τ_crys × (−2π) to match BGW's tnp.
+Note: 24/48 non-symmorphic translations have a sign mismatch vs pw2bgw;
+rotation matrices match exactly.
 
 Usage
 -----
-    from psp.qe_save_reader import CrystalData
-
     crystal = CrystalData.from_qe_save("silicon.save")
-    kpts, weights = crystal.build_kgrid()  # Gamma-centred IBZ
-    H_k = setup_H_k_from_kvec(kpts[0], V_scf, vnl_setup, crystal, meta)
+    kpts, weights = crystal.build_kgrid(nk=(6,6,6))
+    V_scf = build_V_scf(V_loc, V_H, V_xc)
+    H_k = setup_H_k_from_kvec(kpts[0], V_scf, vnl_setup, crystal, meta,
+                                V_loc_r=V_loc, ngkmax=ngkmax)
 """
 from __future__ import annotations
 
