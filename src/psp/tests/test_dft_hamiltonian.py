@@ -122,7 +122,7 @@ def main():
     sym = symmetry_maps.SymMaps(wfn)
     meta = Meta.from_system(wfn, sym, n_occ, nb - n_occ, nb, 0, bispinor=False)
     vnl_setup = vnl_ops.build_vnl_setup(
-        crystal, sym, meta, pseudos, nspinor=crystal.nspinor,
+        wfn, sym, meta, pseudos, nspinor=crystal.nspinor,
     )
 
     # ── Load full-BZ wavefunctions ──
