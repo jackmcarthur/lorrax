@@ -136,14 +136,15 @@ class CrystalData:
         blat = 2.0 * np.pi / alat
         avec = avec_bohr / alat
         bvec = np.array([_vec(_text(root, f"b{i}")) for i in (1, 2, 3)])
-        bdot = bvec.T @ bvec * blat ** 2
+        bdot = bvec @ bvec.T * blat ** 2
         cell_volume = abs(np.dot(a1, np.cross(a2, a3)))
 
         # ── atoms ──
         nat = int(_all(root, "atomic_structure")[0].attrib["nat"])
         atoms = _all(root, "atom")[:nat]
-        avec_inv = np.linalg.inv(avec_bohr)
-        atom_crys = np.array([avec_inv @ _vec(a.text) for a in atoms])
+        # Crystal coords: pos_bohr = avec_bohr.T @ τ_crys, so τ_crys = inv(avec_bohr.T) @ pos
+        avec_inv_T = np.linalg.inv(avec_bohr.T)
+        atom_crys = np.array([avec_inv_T @ _vec(a.text) for a in atoms])
         atom_types = np.array([_SYMBOL_TO_Z[a.attrib["name"]] for a in atoms], dtype=np.int32)
 
         # ── symmetry operations ──

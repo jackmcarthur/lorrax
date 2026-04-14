@@ -163,7 +163,7 @@ class WFNWriter:
 
         # crystal
         apos = crystal.atom_crys @ crystal.avec
-        adot = crystal.avec.T @ crystal.avec * crystal.alat ** 2
+        adot = crystal.avec @ crystal.avec.T * crystal.alat ** 2
         recvol = (2.0 * np.pi) ** 3 / crystal.cell_volume
         cr = "mf_header/crystal/"
         f.create_dataset(cr + "celvol", data=float(crystal.cell_volume))

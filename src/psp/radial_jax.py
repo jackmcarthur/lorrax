@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.scipy.special import erf
+from scipy.special import erf as scipy_erf
 
 
 @dataclass(frozen=True)
@@ -315,7 +316,7 @@ def make_local_sr_table(
     with np.errstate(divide="ignore", invalid="ignore"):
         sr = v_np + z_valence * 2.0 * np.where(
             r_np > 0.0,
-            np.asarray(erf(jnp.asarray(r_np))) / r_np,
+            scipy_erf(r_np) / r_np,
             2.0 / np.sqrt(np.pi),
         )
     values = _spherical_hankel_table_np(0, r_np, sr, np.asarray(q_grid), weights)
