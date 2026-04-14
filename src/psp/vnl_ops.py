@@ -47,28 +47,29 @@ class ChannelMeta:
 class VNLSetup:
     """K-independent VNL data.  Built once from pseudopotentials.
 
-    Radial form factors are stored as tables on a uniform q-grid,
-    enabling O(1) batched lookup instead of per-scalar B-spline
-    evaluation.
+    Radial form factors are stored as tables on a uniform q-grid.
+    Per-row metadata (beta_idx, l, m, tau) is pre-flattened so the
+    per-k Z assembly is a single vectorized operation — no loops.
     """
     channels: list[ChannelMeta]
-    # Radial tables on uniform q-grid
-    dq: float                       # grid spacing
-    n_q: int                        # number of grid points
+    dq: float
+    n_q: int
     q_max: float
-    G_table: jax.Array              # (total_nbeta, n_q)  G_l(q) = F_l(q)/q^l
-    Gp_table: jax.Array             # (total_nbeta, n_q)  G'_l(q)
+    G_table: jax.Array              # (total_nbeta, n_q)
+    Gp_table: jax.Array             # (total_nbeta, n_q)
     prefactor: float                # 4π/√Ω
-    # Structure
     B: np.ndarray                   # (3,3) crystal→Cartesian
     cell_volume: float
-    # Block sizes for E assembly
     total_R: int
     nspinor: int
-    # Pre-built E_super (k-independent, computed once at setup)
     E_super: jax.Array | None = None  # (nspinor, nspinor, total_R, total_R)
-    # Maximum l across all channels (for pre-computing solid harmonics)
     l_max: int = 0
+    # ── Pre-flattened per-row metadata for vectorized Z assembly ──
+    # Each row r of Z(total_R, nG) is: c_il * G[beta_idx[r], q] * S[l[r], m[r], G] * phase[tau[r], G]
+    row_beta_idx: jax.Array | None = None  # (total_R,) int — which G_table row
+    row_l: jax.Array | None = None         # (total_R,) int — angular momentum
+    row_m: jax.Array | None = None         # (total_R,) int — m index into S_all[l]
+    row_tau: jax.Array | None = None       # (total_R, 3) float — atom position (crystal)
 
 
 @dataclass
@@ -187,7 +188,29 @@ def build_vnl_setup(
     total_R = sum(ch.R * ch.natoms for ch in channels)
     l_max = max((ch.l for ch in channels), default=0)
 
-    # Pre-build E_super (k-independent block-diagonal D-matrix)
+    # ── Pre-flatten per-row metadata for vectorized Z assembly ──
+    # Each row of Z corresponds to one (atom, beta, m) combination.
+    # Flatten ALL channels into (total_R,) index arrays.
+    row_beta_idx = []
+    row_l = []
+    row_m = []
+    row_tau = []
+
+    for ch in channels:
+        for a in range(ch.natoms):
+            for ib in range(ch.nbeta):
+                for im in range(ch.msize):
+                    row_beta_idx.append(ch.beta_table_start + ib)
+                    row_l.append(ch.l)
+                    row_m.append(im)
+                    row_tau.append(ch.tau[a])
+
+    row_beta_idx_j = jnp.asarray(row_beta_idx, dtype=jnp.int32)
+    row_l_j = jnp.asarray(row_l, dtype=jnp.int32)
+    row_m_j = jnp.asarray(row_m, dtype=jnp.int32)
+    row_tau_j = jnp.asarray(np.array(row_tau), dtype=jnp.float64)
+
+    # ── Pre-build E_super (k-independent block-diagonal D-matrix) ──
     E_super = np.zeros((nspinor, nspinor, total_R, total_R), dtype=np.complex128)
     offset = 0
     for ch in channels:
@@ -206,6 +229,8 @@ def build_vnl_setup(
         B=B, cell_volume=cell_volume,
         total_R=total_R, nspinor=nspinor,
         E_super=E_super_j, l_max=l_max,
+        row_beta_idx=row_beta_idx_j,
+        row_l=row_l_j, row_m=row_m_j, row_tau=row_tau_j,
     )
 
 
@@ -273,10 +298,11 @@ def _build_vnl_kdata_core(
     *,
     compute_dZ: bool = False,
 ) -> VNLKData:
-    """Build dense VNL projectors Z from k-vector + G-vectors.
+    """Build dense VNL projectors Z — fully vectorized, no Python loops.
 
-    Uses pre-computed all_solid_harmonics (no per-l Python branching)
-    and pre-built E_super (no per-k D-matrix assembly).
+    Z[r, G] = c_il * G_beta(q) * S_lm(K) * exp(-2πi K·τ)
+
+    All per-row metadata (beta_idx, l, m, tau) was pre-flattened at setup time.
     """
     from psp.radial.solid_harmonics import all_solid_harmonics
 
@@ -286,35 +312,26 @@ def _build_vnl_kdata_core(
     K_cart = K_crys @ B_j
     q = jnp.sqrt(jnp.sum(K_cart ** 2, axis=1) + 1e-60)
 
-    # All radial form factors at once
-    G_all = _table_interp(q, setup.dq, setup.G_table)
-    Gp_all = _table_interp(q, setup.dq, setup.Gp_table)
+    # Radial form factors: evaluate all betas at all G-vectors
+    G_all = _table_interp(q, setup.dq, setup.G_table)    # (total_nbeta, nG)
 
-    # All solid harmonics at once — no per-l branching
+    # Solid harmonics: all l in one call
     S_all = all_solid_harmonics(K_cart, l_max=setup.l_max)  # (l_max+1, 2*l_max+1, nG)
 
-    # Build Z by concatenating channel blocks (still a Python loop over channels,
-    # but now the body is pure JAX array ops with no JIT-breaking branching)
-    Z_blocks = []
-    for ch in setup.channels:
-        l, nbeta, R = ch.l, ch.nbeta, ch.R
-        tau_j = jnp.asarray(ch.tau, dtype=jnp.float64)
-        c_il = setup.prefactor * (1j) ** l
+    # ── Vectorized Z assembly — one operation, no loops ──
+    # Each row r: Z[r] = c_il[r] * G[beta_idx[r], :] * S[l[r], m[r], :] * phase[r, :]
+    G_r = G_all[setup.row_beta_idx]                        # (total_R, nG)
+    S_r = S_all[setup.row_l, setup.row_m]                  # (total_R, nG)
+    phase_r = jnp.exp(-2j * jnp.pi * (K_crys @ setup.row_tau.T)).T  # (total_R, nG)
+    c_il_r = setup.prefactor * (1j) ** setup.row_l         # (total_R,)
 
-        G_bG = G_all[ch.beta_table_start:ch.beta_table_start + nbeta]  # (nbeta, nG)
-        S = S_all[l, :2*l+1]                                           # (msize, nG)
-        phase = jnp.exp(-2j * jnp.pi * (K_crys @ tau_j.T)).T          # (natoms, nG)
+    Z = c_il_r[:, None] * G_r * S_r * phase_r             # (total_R, nG)
 
-        radS = G_bG[:, None, :] * S[None, :, :]                        # (nbeta, msize, nG)
-        Z_per_atom = c_il * phase[:, None, None, :] * radS[None, :]     # (natoms, nbeta, msize, nG)
-        Z_blocks.append(Z_per_atom.reshape(ch.natoms * R, nG))
-
-    Z = jnp.concatenate(Z_blocks, axis=0) if Z_blocks else jnp.zeros((0, nG), dtype=jnp.complex128)
-
-    # dZ for velocity (uses pre-computed harmonics + JVP)
+    # dZ for velocity (optional — still uses per-channel JVP, TODO: vectorize)
     dZ_j = None
     if compute_dZ:
         K_over_q = K_cart / q[:, None]
+        Gp_all = _table_interp(q, setup.dq, setup.Gp_table)
         dZ_blocks = []
         for ch in setup.channels:
             l, nbeta, R = ch.l, ch.nbeta, ch.R
@@ -326,23 +343,20 @@ def _build_vnl_kdata_core(
             S = S_all[l, :2*l+1]
             phase = jnp.exp(-2j * jnp.pi * (K_crys @ tau_j.T)).T
 
-            # dS/dK via JVP on solid harmonics
             dS = jnp.stack([
                 jax.jvp(lambda K: _solid_harmonics_jax(l, K),
                         (K_cart,), (jnp.zeros((nG, 3)).at[:, j].set(1.0),))[1]
                 for j in range(3)
-            ], axis=0)  # (3, msize, nG)
+            ], axis=0)
 
             Binv = jnp.linalg.inv(B_j)
             dphase = -2j * jnp.pi * (tau_j @ Binv.T)[:, :, None] * phase[:, None, :]
-
             drad = Gp_bG[None, :, :] * K_over_q.T[:, None, :]
             core = drad[:, :, None, :] * S[None, None, :, :] + G_bG[None, :, None, :] * dS[:, None, :, :]
             dZ_core = c_il * phase[:, None, None, None, :] * core[None, :]
             radS = G_bG[:, None, :] * S[None, :, :]
             dZ_phase = c_il * radS[None, None, :, :, :] * dphase[:, :, None, None, :]
             dZ_blocks.append((dZ_core + dZ_phase).transpose(1, 0, 2, 3, 4).reshape(3, ch.natoms * R, nG))
-
         dZ_j = jnp.concatenate(dZ_blocks, axis=1) if dZ_blocks else None
 
     return VNLKData(
