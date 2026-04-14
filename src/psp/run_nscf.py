@@ -34,7 +34,7 @@ from psp.dft_operators import (
     setup_H_k_from_kvec, apply_H_k,
 )
 from psp.davidson import davidson_k, warmup_jit
-from psp.wfn_writer import write_wfn_h5
+from psp.wfn_writer import WFNWriter
 import psp.vnl_ops as vnl_ops
 
 
@@ -194,25 +194,29 @@ def run_nscf(
     if verbose:
         print(f"  JIT warmup: {time.perf_counter()-t0:.2f}s")
 
-    # ── Davidson at each k-point ──
-    eigenvalues = np.zeros((nk, nbnd))
+    # ── Pre-compute per-k G-vectors in QE order ──
     gvecs_per_k = []
-    coeffs_per_k = []
+    for ik in range(nk):
+        Gk_qe, _ = select_gvecs_for_k(kpoints[ik], G_master, bdot, crystal.ecutwfc)
+        gvecs_per_k.append(Gk_qe)
+
+    # ── Open WFN.h5 for streaming writes ──
+    writer = WFNWriter(output_path, crystal, kpoints, weights, kgrid, nbnd,
+                        gvecs_per_k, nosym=True)
+
+    # ── Davidson at each k-point — write coefficients as each finishes ──
+    eigenvalues = np.zeros((nk, nbnd))
 
     t_dav_start = time.perf_counter()
     for ik in range(nk):
         t0 = time.perf_counter()
-
-        # G-vectors in QE master order
-        Gk_qe, _ = select_gvecs_for_k(kpoints[ik], G_master, bdot, crystal.ecutwfc)
+        Gk_qe = gvecs_per_k[ik]
         ngk = Gk_qe.shape[0]
-        gvecs_per_k.append(Gk_qe)
 
-        # Build H_k with ngkmax padding (using master-ordered G-vectors)
+        # Build H_k with ngkmax padding
         H_k = setup_H_k_from_kvec(kpoints[ik], V_scf, vnl_setup, crystal, None,
                                     V_loc_r=V_loc_r, ngkmax=ngkmax)
 
-        # apply_H closure (reuses single JIT trace)
         def apply_H(psi_G, _H=H_k):
             return _apply_H_sparse(psi_G, _H.T_diag, _H.V_scf,
                                     _H.Gx, _H.Gy, _H.Gz,
@@ -225,58 +229,35 @@ def run_nscf(
 
         eigenvalues[ik] = evals
 
-        # Reorder eigenvectors from Davidson's |k+G|²-sorted G-vectors
-        # to QE master-ordered G-vectors for WFN.h5
-        evecs_np = np.asarray(evecs)  # (nbnd, nspinor, ngkmax) padded
-
-        # Davidson's G-vectors (|k+G|² sorted, padded to ngkmax)
-        Gx_dav = np.asarray(H_k.Gx)
-        Gy_dav = np.asarray(H_k.Gy)
-        Gz_dav = np.asarray(H_k.Gz)
+        # Reorder eigenvectors: Davidson's |k+G|²-sorted → QE master order
+        evecs_np = np.asarray(evecs)  # (nbnd, nspinor, ngkmax)
         mask_dav = np.asarray(H_k.mask)
+        nG_actual = int(mask_dav.sum())
+        Gx_dav = np.asarray(H_k.Gx)[:nG_actual]
+        Gy_dav = np.asarray(H_k.Gy)[:nG_actual]
+        Gz_dav = np.asarray(H_k.Gz)[:nG_actual]
 
-        # Build mapping: for each QE G-vector, find its index in Davidson's list
-        # Both are subsets of the FFT grid, so match by Miller indices
-        dav_gvecs = np.stack([Gx_dav[mask_dav], Gy_dav[mask_dav], Gz_dav[mask_dav]], axis=-1)
-        # Create a dict: (gx,gy,gz) → index in Davidson's unpadded list
-        dav_map = {}
-        for i in range(dav_gvecs.shape[0]):
-            dav_map[tuple(dav_gvecs[i])] = i
+        # Map (gx,gy,gz) → Davidson index
+        dav_gvecs = np.stack([Gx_dav, Gy_dav, Gz_dav], axis=-1)
+        dav_map = {tuple(dav_gvecs[i]): i for i in range(nG_actual)}
 
-        # Reorder: for each QE G-vector, pick the coefficient from Davidson
-        coeffs_k = np.zeros((nbnd, nspinor, ngk), dtype=np.complex128)
-        evecs_unpadded = evecs_np[:, :, :sum(mask_dav)]  # strip padding
-        for ig in range(ngk):
-            key = tuple(Gk_qe[ig])
-            if key in dav_map:
-                coeffs_k[:, :, ig] = evecs_unpadded[:, :, dav_map[key]]
+        # Reindex to QE order
+        reorder = np.array([dav_map[tuple(Gk_qe[ig])] for ig in range(ngk)])
+        coeffs_k = evecs_np[:, :, reorder]
 
-        coeffs_per_k.append(coeffs_k)
+        # Stream-write this k-point immediately
+        writer.write_k(ik, evals, coeffs_k)
 
         dt = time.perf_counter() - t0
         if verbose and (ik < 3 or ik == nk - 1 or (ik + 1) % 16 == 0):
             print(f"  k={ik:3d}/{nk}: {dt:.3f}s  evals[0]={evals[0]:.6f} Ry")
 
+    writer.close()
+
     t_dav = time.perf_counter() - t_dav_start
     if verbose:
-        print(f"  Davidson total: {t_dav:.2f}s ({t_dav/nk:.3f}s/k)")
-
-    # ── Write WFN.h5 ──
-    t0 = time.perf_counter()
-    write_wfn_h5(
-        output_path,
-        crystal=crystal,
-        kpoints=kpoints,
-        weights=weights,
-        kgrid=kgrid,
-        eigenvalues=eigenvalues,
-        gvecs_per_k=gvecs_per_k,
-        coeffs_per_k=coeffs_per_k,
-        nosym=True,
-    )
-    if verbose:
-        print(f"  WFN.h5 written: {time.perf_counter()-t0:.2f}s → {output_path}")
-        print(f"  Total NSCF: {time.perf_counter()-t_start:.2f}s")
+        print(f"  Davidson + write: {t_dav:.2f}s ({t_dav/nk:.3f}s/k)")
+        print(f"  Total NSCF: {time.perf_counter()-t_start:.2f}s → {output_path}")
 
     return eigenvalues
 
