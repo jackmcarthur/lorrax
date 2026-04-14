@@ -708,8 +708,8 @@ def matrix(psi_box: jax.Array, H_k: HamiltonianK) -> jax.Array:
 #   vnl_velocity_from_dZ   — precomputed Z and dZ (fast for repeated use)
 #   vnl_matrix_at_k        — k-traceable V_NL for custom autodiff chains
 
-from psp.solid_harmonics import solid_harmonics_jax as _solid_harmonics_jax
-from psp.radial_jax import (
+from psp.radial.solid_harmonics import solid_harmonics_jax as _solid_harmonics_jax
+from psp.radial.radial_jax import (
     RadialTable,
     differentiate_uniform_table,
     interp_uniform_jax,

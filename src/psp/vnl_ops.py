@@ -21,10 +21,10 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from psp.build_projectors_qe import (
+from psp.radial.build_projectors_qe import (
     build_E_blocks_full,
 )
-from psp.radial_jax import (
+from psp.radial.radial_jax import (
     differentiate_uniform_table,
     make_projector_table,
     make_uniform_q_grid,
@@ -32,7 +32,7 @@ from psp.radial_jax import (
 )
 # Import solid harmonics without circular dependency
 # (dft_operators imports vnl_ops, so we can't import from dft_operators here)
-from psp.solid_harmonics import solid_harmonics_jax as _solid_harmonics_jax
+from psp.radial.solid_harmonics import solid_harmonics_jax as _solid_harmonics_jax
 
 
 # ---------------------------------------------------------------------------

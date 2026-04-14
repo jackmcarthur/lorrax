@@ -46,8 +46,8 @@ def load_pseudopotentials(work_dir: str = ".") -> dict:
 
     Returns dict mapping element symbol → parsed UPF object.
     """
-    from psp.load_upf import load_upf
-    from psp.normalize import normalize_dataclass
+    from psp.upf.load_upf import load_upf
+    from psp.upf.normalize import normalize_dataclass
 
     upf_files = glob.glob(os.path.join(work_dir, "*.upf"))
     if not upf_files:

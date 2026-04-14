@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from psp.radial_jax import (
+from psp.radial.radial_jax import (
     RadialTable,
     interp_uniform_jax,
     make_core_charge_table,

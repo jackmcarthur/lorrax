@@ -45,13 +45,13 @@ except ImportError:
     import sys as _sys
     from pathlib import Path as _Path
     _sys.path.append(str(_Path(__file__).resolve().parents[2]))  # .../src
-    from psp.normalize import normalize_dataclass
-    from psp.load_upf import load_upf
+    from psp.upf.normalize import normalize_dataclass
+    from psp.upf.load_upf import load_upf
     from file_io import WFNReader
     from common import symmetry_maps
     from common.load_wfns import read_Gvecs_to_devices
     from common import Meta
-from psp.build_projectors_qe import (
+from psp.radial.build_projectors_qe import (
     build_local_ionic_potential_on_G_total,
 )
 from psp.dft_operators import vnl_matrix_from_kdata
