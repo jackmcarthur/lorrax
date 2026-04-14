@@ -98,19 +98,21 @@ def write_wfn_h5(
         n_occ_k = int(np.sum(occupations[ik] > 0.5))
         ifmax[0, ik] = n_occ_k
 
-    # Full G-space: all G-vectors within the FFT grid
+    # Charge-density G-space: G-vectors with |G|² ≤ ecutrho, sorted by |G|²
     nx, ny, nz = crystal.fft_grid
     gx = np.fft.fftfreq(nx, d=1.0 / nx).astype(int)
     gy = np.fft.fftfreq(ny, d=1.0 / ny).astype(int)
     gz = np.fft.fftfreq(nz, d=1.0 / nz).astype(int)
     Gx, Gy, Gz = np.meshgrid(gx, gy, gz, indexing='ij')
     gspace_components = np.stack([Gx.ravel(), Gy.ravel(), Gz.ravel()], axis=-1)
-    # Sort by |G|² (QE convention for the charge density G-space)
     bdot = np.asarray(crystal.bdot, dtype=float)
     G2 = np.einsum('gi,ij,gj->g', gspace_components.astype(float), bdot,
                     gspace_components.astype(float))
-    order = np.argsort(G2)
-    gspace_components = gspace_components[order].astype(np.int32)
+    # Filter by ecutrho and sort by |G|² (QE/BGW convention)
+    ecutrho = float(crystal.ecutrho)
+    rho_mask = G2 <= ecutrho
+    order = np.argsort(G2[rho_mask])
+    gspace_components = gspace_components[rho_mask][order].astype(np.int32)
     ng = gspace_components.shape[0]
 
     # Eigenvalues: spec says (mnband, nrk, nspin)
