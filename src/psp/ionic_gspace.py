@@ -136,7 +136,7 @@ def build_fft_G_data(fft_grid, bvec, blat):
     Gx, Gy, Gz = np.meshgrid(gx, gy, gz, indexing="ij")
     G_crys_flat = np.stack([Gx.ravel(), Gy.ravel(), Gz.ravel()], axis=-1).astype(np.float64)
 
-    B = float(blat) * np.asarray(bvec, dtype=np.float64).T          # (3,3)
+    B = float(blat) * np.asarray(bvec, dtype=np.float64)             # (3,3) rows = b_i
     G_cart_flat = G_crys_flat @ B                                     # (N, 3)
     G_norm_flat = np.sqrt(np.sum(G_cart_flat ** 2, axis=-1))          # (N,)
     return G_crys_flat, G_norm_flat
@@ -354,7 +354,7 @@ def build_ionic_and_core(
 
     # 2D truncation
     if truncation_2d:
-        B = blat * bvec.T
+        B = blat * bvec                 # rows = b_i
         G_cart_flat = G_crys_flat @ B
         Gxy = jnp.sqrt(G_cart_flat[:, 0] ** 2 + G_cart_flat[:, 1] ** 2)
         lz = np.pi / B[2, 2]

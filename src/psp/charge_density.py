@@ -214,7 +214,7 @@ def build_core_density(
     Gx, Gy, Gz = np.meshgrid(gx, gy, gz, indexing='ij')
     G_crys = np.stack([Gx, Gy, Gz], axis=-1).astype(float)
     bvec = np.asarray(wfn.bvec, dtype=float)
-    B = float(wfn.blat) * bvec.T
+    B = float(wfn.blat) * bvec                      # rows = b_i in bohr⁻¹
     G_cart = np.einsum('...i,ij->...j', G_crys, B)
     G_norm = np.sqrt(np.sum(G_cart ** 2, axis=-1))  # (nx, ny, nz)
 
@@ -502,7 +502,7 @@ def _build_V_xc_gga(
 def _build_G_cart_grid(nx, ny, nz, wfn):
     """Build Cartesian G-vector grid for FFT-based gradients."""
     bvec = np.asarray(wfn.bvec, dtype=float)
-    B = float(wfn.blat) * bvec.T
+    B = float(wfn.blat) * bvec              # rows = b_i in bohr⁻¹
     return build_G_cart(nx, ny, nz, B)
 
 
