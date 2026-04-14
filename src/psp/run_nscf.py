@@ -1,9 +1,8 @@
 """psp/run_nscf.py — NSCF driver: QE .save → Davidson → WFN.h5.
 
-Reads QE .save (crystal + charge density), builds the DFT Hamiltonian,
-solves for eigenvalues at all k-points via Davidson, writes BGW-compatible WFN.h5.
-
-2D Coulomb truncation is auto-detected from QE's assume_isolated setting.
+Reads QE .save, builds the DFT Hamiltonian, solves for eigenvalues at all
+k-points via Davidson, writes BGW-compatible WFN.h5.
+2D Coulomb truncation is auto-detected from QE's assume_isolated.
 
 Usage:
     module load lorrax
@@ -15,7 +14,6 @@ import os
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 
 import argparse
-import functools
 import time
 
 import numpy as np
@@ -25,10 +23,9 @@ import jax.numpy as jnp
 from file_io import CrystalData, WFNWriter
 from psp.pseudos import load_pseudopotentials
 from psp.ionic_gspace import build_ionic_and_core
-from psp.dft_operators import (
-    build_G_cart, compute_V_H_and_V_xc, build_V_scf,
-    setup_H_k_from_kvec, apply_H_k,
-)
+from psp.dft_operators import build_G_cart, compute_V_H_and_V_xc, build_V_scf
+from psp.h_dft import setup_H_k_from_kvec, make_apply_H
+from psp.dft_precond import make_dft_preconditioner, make_pw_init
 from psp.gvec_utils import (
     build_master_gvec_list, select_gvecs_for_k,
     compute_ngkmax, reorder_to_qe,
@@ -36,23 +33,6 @@ from psp.gvec_utils import (
 from solvers.davidson import davidson, warmup_davidson_jit
 import psp.vnl_ops as vnl_ops
 
-
-# ---------------------------------------------------------------------------
-# Sparse-G H|ψ⟩ wrapper
-# ---------------------------------------------------------------------------
-
-@functools.partial(jax.jit, static_argnames=("_nx", "_ny", "_nz"))
-def _apply_H_sparse(psi_G, T, V, Gx, Gy, Gz, Z, E, mask, _nx, _ny, _nz):
-    """Sparse-G → sparse-G H|ψ⟩.  Single JIT trace for all k-points."""
-    mask_f = mask[None, None, :].astype(psi_G.dtype)
-    psi_box = jnp.zeros((*psi_G.shape[:2], _nx, _ny, _nz), dtype=psi_G.dtype)
-    psi_box = psi_box.at[:, :, Gx, Gy, Gz].add(psi_G * mask_f)
-    return apply_H_k(psi_box, T, V, Gx, Gy, Gz, Z, E, mask)
-
-
-# ---------------------------------------------------------------------------
-# NSCF driver
-# ---------------------------------------------------------------------------
 
 def run_nscf(
     crystal: CrystalData,
@@ -70,7 +50,6 @@ def run_nscf(
     truncation_2d = crystal.assume_isolated == "2D"
     fft_grid = crystal.fft_grid
     nspinor = crystal.nspinor
-    _nx, _ny, _nz = int(fft_grid[0]), int(fft_grid[1]), int(fft_grid[2])
     t0 = time.perf_counter()
 
     if verbose:
@@ -82,10 +61,9 @@ def run_nscf(
     # ── k-independent potential ─────────────────────────────────
     V_loc, rho_core, rho_core_G = build_ionic_and_core(
         crystal, pseudos, fft_grid, truncation_2d=truncation_2d)
-
     rho_val = jnp.asarray(crystal.load_charge_density()[0], dtype=jnp.float64)
-
-    G_cart = build_G_cart(_nx, _ny, _nz,
+    nx, ny, nz = int(fft_grid[0]), int(fft_grid[1]), int(fft_grid[2])
+    G_cart = build_G_cart(nx, ny, nz,
                           float(crystal.blat) * np.asarray(crystal.bvec, dtype=float))
     V_H, V_xc = compute_V_H_and_V_xc(
         rho_val, rho_core, rho_core_G, G_cart,
@@ -93,7 +71,6 @@ def run_nscf(
         jnp.asarray(crystal.bvec, dtype=jnp.float64), crystal.blat,
         truncation_2d=truncation_2d)
     V_scf = build_V_scf(V_loc, V_H, V_xc)
-
     vnl_setup = vnl_ops.build_vnl_setup(
         crystal, pseudos=pseudos, nspinor=nspinor,
         q_max=float(np.sqrt(float(crystal.ecutwfc))) * 1.01)
@@ -121,13 +98,11 @@ def run_nscf(
 
     # ── JIT warmup ──────────────────────────────────────────────
     t1 = time.perf_counter()
-    warmup_davidson_jit(ngkmax, nspinor, nbnd)
+    warmup_davidson_jit(nbnd, ngkmax, nspinor)
     H_k0 = setup_H_k_from_kvec(kpoints[0], V_scf, vnl_setup, crystal, None,
                                  V_loc_r=V_loc, ngkmax=ngkmax)
-    dummy = jnp.zeros((1, nspinor, ngkmax), dtype=jnp.complex128)
-    _apply_H_sparse(dummy, H_k0.T_diag, H_k0.V_scf,
-                    H_k0.Gx, H_k0.Gy, H_k0.Gz,
-                    H_k0.vnl_Z, H_k0.vnl_E, H_k0.mask, _nx, _ny, _nz)
+    apply_H0 = make_apply_H(H_k0)
+    apply_H0(jnp.zeros((1, nspinor, ngkmax), dtype=jnp.complex128))  # trace
     if verbose:
         print(f"  JIT warmup: {time.perf_counter()-t1:.2f}s")
 
@@ -143,16 +118,13 @@ def run_nscf(
         tk = time.perf_counter()
         H_k = setup_H_k_from_kvec(kpoints[ik], V_scf, vnl_setup, crystal, None,
                                     V_loc_r=V_loc, ngkmax=ngkmax)
-
-        def apply_H(psi_G, _H=H_k):
-            return _apply_H_sparse(psi_G, _H.T_diag, _H.V_scf,
-                                    _H.Gx, _H.Gy, _H.Gz,
-                                    _H.vnl_Z, _H.vnl_E, _H.mask,
-                                    _nx, _ny, _nz)
+        apply_H = make_apply_H(H_k)
+        precond = make_dft_preconditioner(H_k.h_diag)
+        init = make_pw_init(H_k.T_diag, nspinor, verbose=False)
 
         evals, evecs = davidson(
-            apply_H, h_diag=H_k.h_diag, dim=ngkmax, n_channels=nspinor,
-            n_eig=nbnd, diag_for_init=H_k.T_diag, verbose=False, tol=tol)
+            apply_H, n_eig=nbnd, precond_fn=precond, init_fn=init,
+            verbose=False, tol=tol)
 
         eigenvalues[ik] = evals
         writer.write_k(ik, evals, reorder_to_qe(np.asarray(evecs), H_k, gvecs_per_k[ik]))
@@ -168,10 +140,6 @@ def run_nscf(
         print(f"  Total NSCF: {time.perf_counter()-t0:.2f}s → {output_path}")
     return eigenvalues
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="LORRAX NSCF: Davidson → WFN.h5")
