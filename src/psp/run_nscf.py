@@ -102,7 +102,11 @@ def run_nscf(
     H_k0 = setup_H_k_from_kvec(kpoints[0], V_scf, vnl_setup, crystal, None,
                                  V_loc_r=V_loc, ngkmax=ngkmax)
     apply_H0 = make_apply_H(H_k0)
-    apply_H0(jnp.zeros((1, nspinor, ngkmax), dtype=jnp.complex128))  # trace
+    # Trace _apply_H_sparse at all batch sizes Davidson will use
+    m_max = 4 * nbnd
+    for m in range(nbnd, m_max + nbnd, nbnd):
+        batch = min(m, m_max)
+        apply_H0(jnp.zeros((batch, nspinor, ngkmax), dtype=jnp.complex128))
     if verbose:
         print(f"  JIT warmup: {time.perf_counter()-t1:.2f}s")
 
