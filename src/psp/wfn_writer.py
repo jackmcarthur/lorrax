@@ -40,6 +40,7 @@ def write_wfn_h5(
     *,
     occupations: np.ndarray | None = None,
     shift: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    nosym: bool = False,
 ) -> None:
     """Write a complete WFN.h5 file.
 
@@ -98,21 +99,23 @@ def write_wfn_h5(
         n_occ_k = int(np.sum(occupations[ik] > 0.5))
         ifmax[0, ik] = n_occ_k
 
-    # Charge-density G-space: G-vectors with |G|² ≤ ecutrho, sorted by |G|²
-    nx, ny, nz = crystal.fft_grid
-    gx = np.fft.fftfreq(nx, d=1.0 / nx).astype(int)
-    gy = np.fft.fftfreq(ny, d=1.0 / ny).astype(int)
-    gz = np.fft.fftfreq(nz, d=1.0 / nz).astype(int)
+    # Charge-density G-space in QE convention:
+    # Range [-N//2+1, N//2], filtered by |G|² ≤ ecutrho,
+    # sorted by (|G|², g1, g2, g3) — matches QE ggen.f90 + hpsort_eps.
+    nx, ny, nz = int(crystal.fft_grid[0]), int(crystal.fft_grid[1]), int(crystal.fft_grid[2])
+    gx = np.arange(-nx // 2 + 1, nx // 2 + 1)
+    gy = np.arange(-ny // 2 + 1, ny // 2 + 1)
+    gz = np.arange(-nz // 2 + 1, nz // 2 + 1)
     Gx, Gy, Gz = np.meshgrid(gx, gy, gz, indexing='ij')
-    gspace_components = np.stack([Gx.ravel(), Gy.ravel(), Gz.ravel()], axis=-1)
+    gspace_components = np.stack([Gx.ravel(), Gy.ravel(), Gz.ravel()], axis=-1).astype(np.int32)
     bdot = np.asarray(crystal.bdot, dtype=float)
     G2 = np.einsum('gi,ij,gj->g', gspace_components.astype(float), bdot,
                     gspace_components.astype(float))
-    # Filter by ecutrho and sort by |G|² (QE/BGW convention)
-    ecutrho = float(crystal.ecutrho)
-    rho_mask = G2 <= ecutrho
-    order = np.argsort(G2[rho_mask])
-    gspace_components = gspace_components[rho_mask][order].astype(np.int32)
+    rho_mask = G2 <= float(crystal.ecutrho)
+    G_f, G2_f = gspace_components[rho_mask], G2[rho_mask]
+    G2_int = np.round(G2_f * 1e8).astype(np.int64)
+    order = np.lexsort((G_f[:, 2], G_f[:, 1], G_f[:, 0], G2_int))
+    gspace_components = G_f[order]
     ng = gspace_components.shape[0]
 
     # Eigenvalues: spec says (mnband, nrk, nspin)
@@ -166,10 +169,20 @@ def write_wfn_h5(
 
         # symmetry group
         sy = 'mf_header/symmetry/'
-        f.create_dataset(sy + 'ntran', data=crystal.ntran)
-        f.create_dataset(sy + 'cell_symmetry', data=0)  # 0 = cubic
-        f.create_dataset(sy + 'mtrx', data=crystal.sym_matrices)
-        f.create_dataset(sy + 'tnp', data=crystal.translations)
+        if nosym:
+            # QE nosym convention: ntran=1, identity only, rest zero-padded
+            mtrx_out = np.zeros((48, 3, 3), dtype=np.int32)
+            mtrx_out[0] = np.eye(3, dtype=np.int32)
+            tnp_out = np.zeros((48, 3), dtype=np.float64)
+            f.create_dataset(sy + 'ntran', data=1)
+            f.create_dataset(sy + 'cell_symmetry', data=0)
+            f.create_dataset(sy + 'mtrx', data=mtrx_out)
+            f.create_dataset(sy + 'tnp', data=tnp_out)
+        else:
+            f.create_dataset(sy + 'ntran', data=crystal.ntran)
+            f.create_dataset(sy + 'cell_symmetry', data=0)
+            f.create_dataset(sy + 'mtrx', data=crystal.sym_matrices)
+            f.create_dataset(sy + 'tnp', data=crystal.translations)
 
         # crystal group
         cr = 'mf_header/crystal/'

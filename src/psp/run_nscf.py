@@ -43,21 +43,32 @@ import psp.vnl_ops as vnl_ops
 # ---------------------------------------------------------------------------
 
 def build_master_gvec_list(crystal):
-    """Build the master G-vector list sorted by |G|² (QE convention).
+    """Build the master G-vector list in QE convention.
+
+    QE ordering: sorted by (|G|², g₁, g₂, g₃) — |G|² primary (with
+    eps8 tolerance for shell grouping), lexicographic secondary.
+    Range per axis: [-N//2+1, N//2] (matches QE ggen.f90).
 
     Returns (G_master, G2_master) where G_master is (ng, 3) int and
-    G2_master is (ng,) float.
+    G2_master is (ng,) float — filtered to |G|² ≤ ecutrho.
     """
-    nx, ny, nz = crystal.fft_grid
-    gx = np.fft.fftfreq(int(nx), d=1.0 / int(nx)).astype(int)
-    gy = np.fft.fftfreq(int(ny), d=1.0 / int(ny)).astype(int)
-    gz = np.fft.fftfreq(int(nz), d=1.0 / int(nz)).astype(int)
+    nx, ny, nz = int(crystal.fft_grid[0]), int(crystal.fft_grid[1]), int(crystal.fft_grid[2])
+    gx = np.arange(-nx // 2 + 1, nx // 2 + 1)
+    gy = np.arange(-ny // 2 + 1, ny // 2 + 1)
+    gz = np.arange(-nz // 2 + 1, nz // 2 + 1)
     Gx, Gy, Gz = np.meshgrid(gx, gy, gz, indexing="ij")
-    G_all = np.stack([Gx.ravel(), Gy.ravel(), Gz.ravel()], axis=-1)
+    G_all = np.stack([Gx.ravel(), Gy.ravel(), Gz.ravel()], axis=-1).astype(np.int32)
     bdot = np.asarray(crystal.bdot, dtype=float)
     G2 = np.einsum("gi,ij,gj->g", G_all.astype(float), bdot, G_all.astype(float))
-    order = np.argsort(G2)
-    return G_all[order].astype(np.int32), G2[order]
+
+    # Filter by ecutrho (charge density cutoff)
+    mask = G2 <= float(crystal.ecutrho)
+    G_f, G2_f = G_all[mask], G2[mask]
+
+    # Sort: primary |G|² (discretized to avoid float issues), secondary lexicographic
+    G2_int = np.round(G2_f * 1e8).astype(np.int64)
+    order = np.lexsort((G_f[:, 2], G_f[:, 1], G_f[:, 0], G2_int))
+    return G_f[order], G2_f[order]
 
 
 def select_gvecs_for_k(kvec, G_master, bdot, ecutwfc):
@@ -261,6 +272,7 @@ def run_nscf(
         eigenvalues=eigenvalues,
         gvecs_per_k=gvecs_per_k,
         coeffs_per_k=coeffs_per_k,
+        nosym=True,
     )
     if verbose:
         print(f"  WFN.h5 written: {time.perf_counter()-t0:.2f}s → {output_path}")
