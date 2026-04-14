@@ -202,169 +202,82 @@ def build_ionic_and_core(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Build V_loc(r) and ρ_core(r) from pseudopotentials on the FFT grid.
 
-    Unified pipeline: all species share one JIT-compiled accumulation.
-
-    Parameters
-    ----------
-    wfn : WFNReader or CrystalData
-    pseudos : dict[str, UPF]
-    fft_grid : (nx, ny, nz)
-    truncation_2d : apply 2D Coulomb truncation to V_loc LR
-    n_q : table grid size (shared for V_loc^SR + NLCC + VNL)
-
-    Returns
-    -------
-    V_loc_r : (nx, ny, nz) float64 — local ionic potential in real space (Ry)
-    rho_core_r : (nx, ny, nz) float64 — NLCC core density on FFT grid
-    rho_core_G : (nx, ny, nz) complex128 — scaled G-space core density
+    Returns (V_loc_r, rho_core_r, rho_core_G_scaled).
     """
+    from psp.species import extract_species, build_atom_species_map
+    from psp.radial_tables import build_all_tables, alpha_z
+
     nx, ny, nz = int(fft_grid[0]), int(fft_grid[1]), int(fft_grid[2])
     N = nx * ny * nz
     vol = float(wfn.cell_volume)
     bvec = np.asarray(wfn.bvec, dtype=np.float64)
     blat = float(wfn.blat)
 
-    # ── G-grid data ──
+    # ── G-grid ──
     G_crys_flat, G_norm_flat = build_fft_G_data(fft_grid, bvec, blat)
     q_max = float(np.max(G_norm_flat))
-    q_grid = make_uniform_q_grid(q_max, n_q)
-    q0 = float(q_grid[0])
-    dq = float(q_grid[1] - q_grid[0])
 
-    # ── Extract species data and build atom→species mapping ──
-    species_data = _extract_species_radial_data(pseudos, vol)
-    from psp.pseudos import symbol_to_Z as _symbol_to_Z
-    z_to_species_idx = {}
-    for i, sd in enumerate(species_data):
-        z = _symbol_to_Z(sd["elem"])
-        if z is not None:
-            z_to_species_idx[z] = i
+    # ── Species data + radial tables (all CPU, one pass) ──
+    species_list = extract_species(pseudos, nspinor=int(getattr(wfn, 'nspinor', 2)))
+    tables = build_all_tables(species_list, q_max, n_q)
+    species_natoms, species_tau, max_atoms = build_atom_species_map(wfn, species_list)
+    n_sp = len(species_list)
+    q0, dq = 0.0, tables["dq"]
 
-    atom_pos = np.asarray(wfn.atom_crys, dtype=np.float64)
-    atom_types = np.asarray(wfn.atom_types, dtype=int)
+    # Alpha-Z: override vloc table at q=0 for QE-compatible G=0
+    if not truncation_2d:
+        for i, sp in enumerate(species_list):
+            az = alpha_z(sp, vol)
+            tables["vloc"][i, 0] = az * vol / (4.0 * np.pi)
 
-    # Group atoms by species
-    n_species = len(species_data)
-    atoms_per_species = [[] for _ in range(n_species)]
-    for iat in range(len(atom_pos)):
-        sp_idx = z_to_species_idx.get(int(atom_types[iat]))
-        if sp_idx is not None:
-            atoms_per_species[sp_idx].append(atom_pos[iat])
-
-    max_atoms = max((len(a) for a in atoms_per_species), default=1)
-    max_atoms = max(max_atoms, 1)
-
-    # Pad atom positions → (n_species, max_atoms, 3)
-    species_tau = np.zeros((n_species, max_atoms, 3), dtype=np.float64)
-    species_natoms = np.zeros(n_species, dtype=np.int32)
-    for i, ats in enumerate(atoms_per_species):
-        n = len(ats)
-        species_natoms[i] = n
-        for j in range(n):
-            species_tau[i, j] = ats[j]
-
-    # ── Hankel-transform all l=0 radial functions ──
-    # V_loc^SR and NLCC tables, stacked for unified accumulation
-    vloc_tables = np.zeros((n_species, n_q), dtype=np.float64)
-    nlcc_tables = np.zeros((n_species, n_q), dtype=np.float64)
-    has_vloc = np.zeros(n_species, dtype=bool)
-    has_nlcc = np.zeros(n_species, dtype=bool)
-
-    for i, sd in enumerate(species_data):
-        r, rab = sd["r"], sd["rab"]
-        weights_rab = radial_weights(r, rab, scheme="rab")
-        weights_simp = radial_weights(r, rab, scheme="simpson_rab")
-
-        if sd["has_vloc"]:
-            tab = make_local_sr_table(r, sd["vloc_r"], sd["z_valence"], q_grid, weights_rab)
-            vloc_tables[i] = tab.values
-            has_vloc[i] = True
-
-            # Alpha-Z: override q=0 entry so accumulator handles G=0 correctly.
-            # In the old code, V_sr_on_grid[0,0,0] = sqrtN * alphaZ was set BEFORE
-            # multiplication by structure factor. We achieve the same by setting
-            # table[0] = alphaZ * vol / (4π) so that pf * table[0] = sqrtN * alphaZ.
-            if not truncation_2d:
-                e2 = 2.0
-                z_val = sd["z_valence"]
-                if rab is not None:
-                    integrand = r * (r * sd["vloc_r"] + z_val * e2)
-                    alphaZ = (4.0 * np.pi) * np.sum(integrand * rab) / vol
-                else:
-                    dr = float(r[1] - r[0]) if len(r) > 1 else 1.0
-                    integrand = r * (r * sd["vloc_r"] + z_val * e2)
-                    w = np.ones_like(r); w[0] = 0.5; w[-1] = 0.5
-                    alphaZ = (4.0 * np.pi) * np.sum(integrand * w) * dr / vol
-                # pf = sqrtN * 4π / vol, so table[0] = alphaZ * vol / (4π)
-                # gives pf * table[0] = sqrtN * alphaZ  ✓
-                vloc_tables[i, 0] = alphaZ * vol / (4.0 * np.pi)
-
-        if sd["has_nlcc"]:
-            tab = make_core_charge_table(r, sd["rho_core_r"], q_grid, weights_simp)
-            nlcc_tables[i] = tab.values
-            has_nlcc[i] = True
-
-    # ── Move to JAX and run the jitted pipeline ──
+    # ── Ship to GPU ──
     G_crys_j = jnp.asarray(G_crys_flat, dtype=jnp.float64)
     G_norm_j = jnp.asarray(G_norm_flat, dtype=jnp.float64)
-    sp_tau_j = jnp.asarray(species_tau, dtype=jnp.float64)
-    sp_nat_j = jnp.asarray(species_natoms, dtype=jnp.int32)
-
-    # Structure factors: S_s(G) = Σ_a e^{-2πi G·τ_a}  (shared by V_loc and NLCC)
-    S_species = species_structure_factors(sp_tau_j, sp_nat_j, G_crys_j, max_atoms)
+    S_species = species_structure_factors(
+        jnp.asarray(species_tau, dtype=jnp.float64),
+        jnp.asarray(species_natoms, dtype=jnp.int32),
+        G_crys_j, max_atoms)
 
     # ── NLCC accumulation ──
     nlcc_pf = jnp.asarray(
-        np.where(has_nlcc, 4.0 * np.pi / vol, 0.0), dtype=jnp.float64
-    )
+        np.where(tables["has_nlcc"], 4.0 * np.pi / vol, 0.0), dtype=jnp.float64)
     rho_core_G_flat = accumulate_species_on_G(
-        jnp.asarray(nlcc_tables), nlcc_pf, S_species, G_norm_j, q0, dq,
-    )
+        jnp.asarray(tables["nlcc"]), nlcc_pf, S_species, G_norm_j, q0, dq)
     rho_core_G = rho_core_G_flat.reshape(nx, ny, nz)
     rho_core_r = jnp.real(jnp.fft.ifftn(rho_core_G)) * N
 
-    integral = float(jnp.sum(rho_core_r)) * vol / N
-    print(f"  Core density integral: {integral:.4f} e "
-          f"(from NLCC, {int(np.sum(species_natoms[has_nlcc]))} atoms)")
+    n_nlcc_atoms = int(np.sum(species_natoms[tables["has_nlcc"]]))
+    print(f"  Core density integral: {float(jnp.sum(rho_core_r)) * vol / N:.4f} e "
+          f"(from NLCC, {n_nlcc_atoms} atoms)")
 
-    # Scaled G-space coefficients for GGA gradient computation
     rho_core_G_scaled = rho_core_G * N
 
-    # ── V_loc^SR accumulation ──
+    # ── V_loc short-range accumulation ──
     sqrtN = np.sqrt(float(N))
-    vloc_sr_pf = jnp.asarray(
-        np.where(has_vloc, sqrtN * 4.0 * np.pi / vol, 0.0), dtype=jnp.float64
-    )
+    vloc_pf = jnp.asarray(
+        np.where(tables["has_vloc"], sqrtN * 4.0 * np.pi / vol, 0.0), dtype=jnp.float64)
     Vloc_sr_G_flat = accumulate_species_on_G(
-        jnp.asarray(vloc_tables), vloc_sr_pf, S_species, G_norm_j, q0, dq,
-    )
+        jnp.asarray(tables["vloc"]), vloc_pf, S_species, G_norm_j, q0, dq)
 
-    # ── V_loc long-range Coulomb tail: -4πe²Z / G² × exp(-G²/4) × S ──
+    # ── V_loc long-range Coulomb tail ──
     G2_flat = G_norm_j ** 2
     G2_safe = jnp.where(G2_flat == 0.0, 1.0, G2_flat)
-    e2 = 2.0
+    z_vals = jnp.asarray([sp.z_valence for sp in species_list], dtype=jnp.float64)
+    rho_ion_G = -jnp.sum(z_vals[:, None] * S_species, axis=0)
 
-    # Ion charge density in G-space: ρ_ion(G) = -Σ_s Z_s S_s(G)
-    z_vals = jnp.asarray([sd["z_valence"] for sd in species_data], dtype=jnp.float64)
-    rho_ion_G_flat = -jnp.sum(z_vals[:, None] * S_species, axis=0)
+    Vloc_lr_G_flat = (sqrtN * 4.0 * np.pi * 2.0 / vol) * (
+        rho_ion_G / G2_safe * jnp.exp(-0.25 * G2_flat))
 
-    Vloc_lr_G_flat = (sqrtN * 4.0 * np.pi * e2 / vol) * (
-        rho_ion_G_flat / G2_safe * jnp.exp(-0.25 * G2_flat)
-    )
-
-    # 2D truncation
     if truncation_2d:
-        B = blat * bvec                 # rows = b_i
+        B = blat * bvec
         G_cart_flat = G_crys_flat @ B
         Gxy = jnp.sqrt(G_cart_flat[:, 0] ** 2 + G_cart_flat[:, 1] ** 2)
         lz = np.pi / B[2, 2]
         cutoff = 1.0 - jnp.exp(-Gxy * lz) * jnp.cos(G_cart_flat[:, 2] * lz)
-        cutoff = jnp.where(G2_flat == 0.0, 0.0, cutoff)
-        Vloc_lr_G_flat = Vloc_lr_G_flat * cutoff
+        Vloc_lr_G_flat = Vloc_lr_G_flat * jnp.where(G2_flat == 0.0, 0.0, cutoff)
 
-    Vloc_lr_G_flat = Vloc_lr_G_flat.at[0].set(0.0)   # G=0 handled by alpha-Z
+    Vloc_lr_G_flat = Vloc_lr_G_flat.at[0].set(0.0)
 
-    # Total V_loc: IFFT to real space (ortho convention)
     V_tot_G = (Vloc_sr_G_flat + Vloc_lr_G_flat).reshape(nx, ny, nz)
     V_loc_r = jnp.real(jnp.fft.ifftn(V_tot_G, norm="ortho"))
 

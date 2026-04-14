@@ -286,58 +286,27 @@ def compute_V_H_and_V_xc(
     *,
     truncation_2d: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
-    """Compute V_H and V_xc in a single JIT.
+    """Compute V_H and V_xc.  Returns (V_H_r, V_xc_r) both (nx, ny, nz) in Ry.
 
-    Compiles in ~1.5s on A100, cached calls ~2 ms.
-    The autodiff uses grad(sum(ρ ε_xc)) which traces ONE scalar backward
-    pass over the full grid (no vmap unrolling).
-
-    Returns (V_H_r, V_xc_r) both (nx, ny, nz) in Ry.
+    Uses PBE by default.  For a different functional, call compute_V_xc
+    from psp.xc directly.
     """
-    from jax_xc_local.pbe import pbe_xc
+    from psp.xc import compute_V_xc, pbe_functional
 
     # ── V_H via Poisson ──
     rho_G_ortho = jnp.fft.fftn(rho_val, norm='ortho')
     V_H_r = jnp.real(poisson_potential_from_rhoG(
         rho_G_ortho, bdot, bvec, blat, truncation_2d=truncation_2d))
 
-    # ── V_xc (PBE GGA) ──
+    # ── V_xc ──
     rho_total = rho_val + rho_core
-    rho_safe = jnp.maximum(rho_total, 1e-10)
-
-    # Gradient |∇ρ|² with precise G-space core charge
+    # Precise G-space total density (analytic core + FFT valence)
     rho_core_gridded = jnp.real(jnp.fft.ifftn(rhog_core))
     rho_G_total = jnp.fft.fftn(rho_total - rho_core_gridded) + rhog_core
 
-    grad_rho_sq = jnp.zeros_like(rho_total)
-    for i in range(3):
-        drho = jnp.real(jnp.fft.ifftn(1j * G_cart[..., i] * rho_G_total))
-        grad_rho_sq = grad_rho_sq + drho ** 2
-    sigma = jnp.maximum(grad_rho_sq, 0.0)
+    xc_fn, level = pbe_functional()
+    V_xc_r = compute_V_xc(rho_total, rho_G_total, G_cart, xc_fn, level)
 
-    # PBE functional derivatives: grad(sum(ρ ε_xc)) w.r.t. ρ and σ arrays
-    def E_xc_lda(rho):
-        return jnp.sum(rho * pbe_xc(rho, jnp.zeros_like(rho)))
-    def E_xc_full(rho, sig):
-        return jnp.sum(rho * pbe_xc(rho, sig))
-
-    df_drho_lda = jax.grad(E_xc_lda)(rho_safe)
-    df_drho_full = jax.grad(E_xc_full, argnums=0)(rho_safe, sigma)
-    df_dsigma = jax.grad(E_xc_full, argnums=1)(rho_safe, sigma)
-
-    gga_mask = (rho_total > 1e-6) & (grad_rho_sq > 1e-10)
-    df_drho = df_drho_lda + jnp.where(gga_mask, df_drho_full - df_drho_lda, 0.0)
-    df_dsigma = jnp.where(gga_mask, df_dsigma, 0.0)
-
-    # GGA divergence: -2 ∇·[df/dσ ∇ρ]
-    gga_corr = jnp.zeros_like(rho_total)
-    for i in range(3):
-        drho_ri = jnp.real(jnp.fft.ifftn(1j * G_cart[..., i] * rho_G_total))
-        h_i_G = jnp.fft.fftn(df_dsigma * drho_ri)
-        gga_corr = gga_corr + jnp.real(
-            jnp.fft.ifftn(1j * G_cart[..., i] * h_i_G))
-
-    V_xc_r = df_drho - 2.0 * gga_corr
     return V_H_r, V_xc_r
 
 
