@@ -26,13 +26,9 @@ from file_io import WFNReader
 from common import symmetry_maps
 from common.load_wfns import read_Gvecs_to_devices
 from common import Meta
-from .get_DFT_mtxels import (
-    read_cohsex_input,
-    load_pseudopotentials,
-    generate_gvectors_k,
-    print_atomic_structure,
-)
-from psp.dft_operators import gather_psi_G_from_crys, momentum_matrix_k
+from psp.get_DFT_mtxels import read_cohsex_input
+from psp.pseudos import load_pseudopotentials, print_atomic_structure
+from psp.dft_operators import generate_gvectors_k, gather_psi_G_from_crys, momentum_matrix_k
 import psp.vnl_ops as vnl_ops
 import h5py
 # --------------------------

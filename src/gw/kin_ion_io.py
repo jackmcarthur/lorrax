@@ -34,12 +34,8 @@ from common.load_wfns import read_Gvecs_to_devices
 
 import common.timing as timing
 
-from psp.get_DFT_mtxels import (
-    read_cohsex_input,
-    load_pseudopotentials,
-    get_kin_ion,
-    write_kin_ion_h5,
-)
+from psp.pseudos import load_pseudopotentials
+from psp.get_DFT_mtxels import read_cohsex_input, get_kin_ion, write_kin_ion_h5
 
 
 def _resolve_against(path: str, base_dir: str) -> str:

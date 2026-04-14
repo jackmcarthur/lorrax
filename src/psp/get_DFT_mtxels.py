@@ -59,9 +59,6 @@ from dataclasses import dataclass
 import h5py
 import psp.vnl_ops as vnl_ops
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 import common.timing as timing
 # Lightweight device report (CPU-only by default)
 try:
@@ -776,11 +773,6 @@ def main(argv=None):
         default="tests/cohsex_debug/cohsex_test.in",
         help="Input file",
     )
-    argp.add_argument(
-        "--debug-offdiag",
-        action="store_true",
-        help="Write off-diagonal matrix elements and compare with BerkeleyGW reference files",
-    )
     args = argp.parse_args(argv)
     
     timing.reset()
@@ -831,17 +823,13 @@ def main(argv=None):
     print(f"  FFT grid: {meta.fft_grid}")
     print(f"  Spinor components: {meta.nspinor}")
 
-    # If ecutrho provided, compute and attach an FFT grid for rho on the WFN object
+    # If ecutrho provided, attach the rho FFT grid on the WFN object
     ecutrho_eV = params.get("ecutrho_eV", None)
     if ecutrho_eV is not None:
-        try:
-            ecutrho_ry = float(ecutrho_eV) # should be in Ry oops
-            nx_rho, ny_rho, nz_rho = compute_fft_grid_from_ecutrho(np.asarray(wfn.bdot, dtype=float), 4*ecutrho_ry)
-            # Attach to wfn for downstream routines (compute_valence_density)
-            setattr(wfn, 'grid_rho', (int(nx_rho), int(ny_rho), int(nz_rho)))
-            print(f"  Using ecutrho = {ecutrho_ry:.3f} Ry; rho grid = {wfn.grid_rho}")
-        except Exception as e:
-            print(f"  Warning: failed to compute rho grid from ecutrho ({e}); falling back to 2x wavefunction grid")
+        ecutrho_ry = float(ecutrho_eV)  # field is actually Ry despite the name
+        # Use 2× wavefunction grid as default rho grid
+        setattr(wfn, 'grid_rho', tuple(2 * n for n in meta.fft_grid))
+        print(f"  Using ecutrho = {ecutrho_ry:.3f} Ry; rho grid = {wfn.grid_rho}")
     
     # Set up JAX device mesh
     total_devices = jax.process_count() * jax.local_device_count()
@@ -962,43 +950,6 @@ def main(argv=None):
 
             # Vloc-only fit removed per user request
             
-            # Debug off-diagonal output if requested
-            if args.debug_offdiag:
-                print("\n  === Off-diagonal debug output ===")
-                kpt0 = np.array([0.0, 0.0, 0.0])  # k=0
-                
-                # K+I+H+NL matrix (what BGW calls "kih")
-                KIH_NL = T0 + VI0 + VH0 + VNL0
-                kih_path = os.path.join(input_dir, 'kih_offdiag_ours.dat')
-                write_offdiag_debug(KIH_NL, kpt0, kih_path, label="K+I+H+NL")
-                
-                # Compare with BGW reference if it exists
-                bgw_kih = os.path.join(input_dir, 'kih_offdiag_bgw.dat')
-                compare_with_bgw_offdiag(KIH_NL, bgw_kih, label="K+I+H+NL")
-                
-                # Also output just K+I+NL (kin_ion without Hartree) for comparison
-                KI_NL = T0 + VI0 + VNL0
-                kinl_path = os.path.join(input_dir, 'ki_nl_offdiag_ours.dat')
-                write_offdiag_debug(KI_NL, kpt0, kinl_path, label="K+I+NL (no Hartree)")
-                
-                # V_xc can be inferred as -(kin_ion + V_H) off-diagonal in DFT eigenbasis
-                # But we'd need DFT eigenvalues to compute this properly
-                # For now, just note that V_xc_off = -(K+I+H+NL)_off would be the comparison
-                print(f"\n  Note: In DFT eigenbasis, V_xc_off = -(K+I+H)_off (ignoring V_NL contribution)")
-                print(f"  To compare with vxc_offdiag_bgw.dat, check that our -(K+I+H+NL) matches their V_xc")
-                
-                # Try to compare with BGW V_xc
-                bgw_vxc = os.path.join(input_dir, 'vxc_offdiag_bgw.dat')
-                if os.path.exists(bgw_vxc):
-                    print(f"\n  Comparing -our(K+I+H+NL) with BGW V_xc:")
-                    # Negate our matrix for comparison (V_xc = -KIH in DFT basis)
-                    # But wait - this isn't quite right. In DFT eigenbasis:
-                    # H_DFT = diag(E) => (K+I+H+Vxc) = diag(E)
-                    # => (K+I+H)_off = -Vxc_off
-                    # So Vxc_off = -(K+I+H)_off (but K+I+H doesn't include V_NL in usual definition)
-                    # Let me just compare the off-diagonal magnitudes
-                    compare_with_bgw_offdiag(-KIH_NL, bgw_vxc, label="-our(K+I+H+NL) vs BGW V_xc")
-                    
     except Exception as e:
         print(f"Warning: failed to write k=0 diagonals ({e})")
 

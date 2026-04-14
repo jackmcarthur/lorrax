@@ -111,7 +111,7 @@ def build_vnl_setup(
     if nspinor is None:
         nspinor = int(meta.nspinor) if meta is not None else int(wfn.nspinor)
 
-    from psp.get_DFT_mtxels import build_atom_pp_assignments
+    from psp.pseudos import build_atom_pp_assignments
 
     atom_pos = jnp.asarray(wfn.atom_crys, dtype=jnp.float64)
     atom_types = jnp.asarray(wfn.atom_types, dtype=jnp.int32)
@@ -276,7 +276,7 @@ def build_vnl_kdata(
     compute_dZ: bool = False,
 ) -> VNLKData:
     """Build dense Z [and dZ] for one k-point (SymMaps path)."""
-    from psp.get_DFT_mtxels import generate_gvectors_k
+    from psp.dft_operators import generate_gvectors_k
 
     Gk_crys, _ = generate_gvectors_k(k_idx, sym, wfn, meta)
     kvec = np.asarray(sym.unfolded_kpts[k_idx], dtype=float)

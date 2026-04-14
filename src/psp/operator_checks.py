@@ -83,7 +83,7 @@ def validate_operator_inputs(
     atom_types = np.asarray(wfn.atom_types, dtype=int)
     unique_z = set(int(z) for z in atom_types)
 
-    from psp.get_DFT_mtxels import _symbol_to_Z
+    from psp.pseudos import symbol_to_Z as _symbol_to_Z
 
     covered_z = set()
     for elem in pseudos:

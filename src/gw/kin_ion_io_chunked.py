@@ -26,16 +26,10 @@ from common import symmetry_maps, Meta
 from common.load_wfns import load_kpoint_fftbox
 import common.timing as timing
 
-from psp.get_DFT_mtxels import (
-    read_cohsex_input,
-    load_pseudopotentials,
-    build_atom_pp_assignments,
-    build_local_ionic_potential_on_G_total,
-    generate_gvectors_k,
-    compute_kinetic_k,
-    compute_local_V_k,
-)
-from psp.dft_operators import vnl_matrix_from_kdata
+from psp.pseudos import load_pseudopotentials, build_atom_pp_assignments
+from psp.dft_operators import generate_gvectors_k, vnl_matrix_from_kdata
+from psp.radial.build_projectors_qe import build_local_ionic_potential_on_G_total
+from psp.get_DFT_mtxels import read_cohsex_input, compute_kinetic_k, compute_local_V_k
 from psp.operator_checks import validate_operator_inputs
 import psp.vnl_ops as vnl_ops
 
