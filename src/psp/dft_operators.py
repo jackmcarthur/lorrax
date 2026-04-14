@@ -88,6 +88,62 @@ class HamiltonianK:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  Poisson solver
+# ═══════════════════════════════════════════════════════════════════════
+
+def poisson_potential_from_rhoG(
+    rho_G: jnp.ndarray,
+    bdot: jnp.ndarray,
+    bvec: jnp.ndarray | None = None,
+    blat: float | None = None,
+    truncation_2d: bool = True,
+) -> jnp.ndarray:
+    """Solve Poisson equation: V(G) = 8π ρ(G) / |G|² (G≠0), V(G=0) = 0.
+
+    If truncation_2d=True, applies Ismail-Beigi 2D slab truncation:
+        v_2D(G) = v_3D(G) × (1 − e^{−|G_xy|·L_z/2} · cos(G_z·L_z/2))
+    """
+    nx2, ny2, nz2 = rho_G.shape
+    fx = jnp.fft.fftfreq(nx2) * nx2
+    fy = jnp.fft.fftfreq(ny2) * ny2
+    fz = jnp.fft.fftfreq(nz2) * nz2
+
+    M = jnp.asarray(bdot, dtype=jnp.float64)
+    ix, iy, iz = fx[:, None, None], fy[None, :, None], fz[None, None, :]
+    G2 = (M[0, 0] * ix * ix + M[1, 1] * iy * iy + M[2, 2] * iz * iz
+          + 2 * M[0, 1] * ix * iy + 2 * M[0, 2] * ix * iz + 2 * M[1, 2] * iy * iz)
+    zero_mask = ((jnp.arange(nx2)[:, None, None] == 0)
+                 & (jnp.arange(ny2)[None, :, None] == 0)
+                 & (jnp.arange(nz2)[None, None, :] == 0))
+    G2_safe = jnp.where(zero_mask, 1.0, G2)
+
+    V_G = 8.0 * jnp.pi * rho_G / G2_safe
+
+    if truncation_2d and bvec is not None and blat is not None:
+        B = jnp.asarray(bvec, dtype=jnp.float64) * float(blat)
+        Gx_c = ix * B[0, 0] + iy * B[1, 0] + iz * B[2, 0]
+        Gy_c = ix * B[0, 1] + iy * B[1, 1] + iz * B[2, 1]
+        Gz_c = ix * B[0, 2] + iy * B[1, 2] + iz * B[2, 2]
+        zc = jnp.pi / B[2, 2]
+        kxy = jnp.sqrt(Gx_c ** 2 + Gy_c ** 2)
+        f2d = 1.0 - jnp.exp(-zc * kxy) * jnp.cos(Gz_c * zc)
+        V_G = V_G * jnp.where(zero_mask, 0.0, f2d)
+
+    V_G = V_G.at[0, 0, 0].set(0.0)
+    return jnp.real(jnp.fft.ifftn(V_G, norm='ortho'))
+
+
+def generate_gvectors_k(kpoint_idx, sym, wfn, meta):
+    """G-vectors for one k-point via SymMaps (GW path).
+
+    Returns (Gk_crys, kpoint_crys): (nG, 3) int and (3,) float.
+    """
+    kpoint_crys = jnp.asarray(sym.unfolded_kpts[kpoint_idx], dtype=jnp.float64)
+    Gk_crys = sym.get_gvecs_kfull(wfn, kpoint_idx)
+    return Gk_crys, kpoint_crys
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  G-vector utilities
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -156,7 +212,7 @@ def build_T_diag(
     and Gx, Gy, Gz are (nG,) int32 FFT-box indices.
     """
     kvec = np.asarray(sym.unfolded_kpts[k_idx], dtype=float)
-    from psp.get_DFT_mtxels import generate_gvectors_k
+
     Gk_crys, _ = generate_gvectors_k(k_idx, sym, wfn, meta)
     return _T_diag_from_G(np.asarray(Gk_crys, dtype=int), kvec, wfn.bdot)
 
@@ -239,7 +295,6 @@ def compute_V_H_and_V_xc(
     Returns (V_H_r, V_xc_r) both (nx, ny, nz) in Ry.
     """
     from jax_xc_local.pbe import pbe_xc
-    from psp.get_DFT_mtxels import poisson_potential_from_rhoG
 
     # ── V_H via Poisson ──
     rho_G_ortho = jnp.fft.fftn(rho_val, norm='ortho')
@@ -964,7 +1019,7 @@ def compute_dipole_all(wfn, sym, meta, vnl_plan, B, nb=None):
       dipole : (3, nk, nb, nb) complex128
       deltaE : (nk, nb, nb) float64
     """
-    from psp.get_DFT_mtxels import generate_gvectors_k
+
     from common.load_wfns import load_kpoint_fftbox
 
     if nb is None:
