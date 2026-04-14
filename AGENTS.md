@@ -73,4 +73,4 @@ Use `uv` as the package manager. One `.venv/` (gitignored) per machine. No alter
 envs. Let uv use its global cache — do not create project-local uv cache directories.
 
 On Perlmutter: use Shifter with the NVIDIA JAX container. See
-`cluster_setup/README_CLUSTER.md`.
+`config/README.md`.
