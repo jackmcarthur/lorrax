@@ -22,15 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from psp.radial.radial_jax import (
-    RadialTable,
-    interp_uniform_jax,
-    make_core_charge_table,
-    make_local_sr_table,
-    make_uniform_q_grid,
-    radial_weights,
-    spherical_hankel_table_jax,
-)
+from psp.radial.radial_jax import interp_uniform_jax
 
 # ---------------------------------------------------------------------------
 # Primitive 1: species structure factors via lax.scan over atoms
@@ -140,52 +132,6 @@ def build_fft_G_data(fft_grid, bvec, blat):
     G_cart_flat = G_crys_flat @ B                                     # (N, 3)
     G_norm_flat = np.sqrt(np.sum(G_cart_flat ** 2, axis=-1))          # (N,)
     return G_crys_flat, G_norm_flat
-
-
-# ---------------------------------------------------------------------------
-# Radial data extraction (host-side, called once per species)
-# ---------------------------------------------------------------------------
-
-def _extract_species_radial_data(pseudos, cell_volume):
-    """Extract V_loc^SR and NLCC radial integrands from pseudos.
-
-    Returns lists of (r, f_r, weights, z_valence, has_nlcc, rho_core_r)
-    per species, plus species_key→index mapping.
-    """
-    from jax.scipy.special import erf as jax_erf
-
-    species_data = []
-    for elem, pseudo in pseudos.items():
-        ppmesh = getattr(pseudo, "pp_mesh", None)
-        if ppmesh is None:
-            continue
-        r = np.asarray(ppmesh.pp_r.value, dtype=np.float64)
-        try:
-            rab = np.asarray(ppmesh.pp_rab.value, dtype=np.float64)
-        except Exception:
-            rab = None
-
-        z_val = float(getattr(getattr(pseudo, "pp_header", None), "z_valence", 0.0))
-
-        # V_loc short-range integrand
-        vloc_raw = getattr(getattr(pseudo, "pp_local", None), "value", None)
-        has_vloc = vloc_raw is not None
-        vloc_r = np.asarray(vloc_raw, dtype=np.float64) if has_vloc else np.zeros_like(r)
-
-        # NLCC core charge
-        hdr = getattr(pseudo, "pp_header", None)
-        cc = getattr(hdr, "core_correction", None)
-        has_nlcc = cc is not None and str(cc) == "UpfLogical.T"
-        nlcc_obj = getattr(pseudo, "pp_nlcc", None)
-        rho_core_r = (np.asarray(nlcc_obj.value, dtype=np.float64)
-                      if has_nlcc and nlcc_obj is not None else np.zeros_like(r))
-
-        species_data.append(dict(
-            elem=elem, pseudo=pseudo, r=r, rab=rab,
-            z_valence=z_val, vloc_r=vloc_r, has_vloc=has_vloc,
-            rho_core_r=rho_core_r, has_nlcc=has_nlcc,
-        ))
-    return species_data
 
 
 # ---------------------------------------------------------------------------
