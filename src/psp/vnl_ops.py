@@ -65,6 +65,10 @@ class VNLSetup:
     # Block sizes for E assembly
     total_R: int
     nspinor: int
+    # Pre-built E_super (k-independent, computed once at setup)
+    E_super: jax.Array | None = None  # (nspinor, nspinor, total_R, total_R)
+    # Maximum l across all channels (for pre-computing solid harmonics)
+    l_max: int = 0
 
 
 @dataclass
@@ -181,6 +185,18 @@ def build_vnl_setup(
     G_table = jnp.asarray(np.stack(G_rows), dtype=jnp.float64) if G_rows else jnp.zeros((0, n_q), dtype=jnp.float64)
     Gp_table = jnp.asarray(np.stack(Gp_rows), dtype=jnp.float64) if Gp_rows else jnp.zeros((0, n_q), dtype=jnp.float64)
     total_R = sum(ch.R * ch.natoms for ch in channels)
+    l_max = max((ch.l for ch in channels), default=0)
+
+    # Pre-build E_super (k-independent block-diagonal D-matrix)
+    E_super = np.zeros((nspinor, nspinor, total_R, total_R), dtype=np.complex128)
+    offset = 0
+    for ch in channels:
+        E_np = ch.E[:nspinor, :nspinor]
+        R = ch.R
+        for a in range(ch.natoms):
+            E_super[:, :, offset:offset+R, offset:offset+R] = E_np
+            offset += R
+    E_super_j = jnp.asarray(E_super, dtype=jnp.complex128)
 
     return VNLSetup(
         channels=channels,
@@ -189,6 +205,7 @@ def build_vnl_setup(
         prefactor=prefactor,
         B=B, cell_volume=cell_volume,
         total_R=total_R, nspinor=nspinor,
+        E_super=E_super_j, l_max=l_max,
     )
 
 
@@ -256,122 +273,80 @@ def _build_vnl_kdata_core(
     *,
     compute_dZ: bool = False,
 ) -> VNLKData:
-    """Core: build dense VNL projectors from k-vector + G-vectors."""
-    nspinor = setup.nspinor
-    nG = Gk_np.shape[0]
+    """Build dense VNL projectors Z from k-vector + G-vectors.
 
+    Uses pre-computed all_solid_harmonics (no per-l Python branching)
+    and pre-built E_super (no per-k D-matrix assembly).
+    """
+    from psp.radial.solid_harmonics import all_solid_harmonics
+
+    nG = Gk_np.shape[0]
     K_crys = jnp.asarray(Gk_np, dtype=jnp.float64) + jnp.asarray(kvec)[None, :]
     B_j = jnp.asarray(setup.B, dtype=jnp.float64)
     K_cart = K_crys @ B_j
+    q = jnp.sqrt(jnp.sum(K_cart ** 2, axis=1) + 1e-60)
 
-    _EPS2 = 1e-60
-    K_sq = jnp.sum(K_cart ** 2, axis=1)
-    q = jnp.sqrt(K_sq + _EPS2)     # (nG,) — safe at K=0
+    # All radial form factors at once
+    G_all = _table_interp(q, setup.dq, setup.G_table)
+    Gp_all = _table_interp(q, setup.dq, setup.Gp_table)
 
-    # Evaluate ALL radial form factors at once via table lookup
-    G_all = _table_interp(q, setup.dq, setup.G_table)    # (total_nbeta, nG)
-    Gp_all = _table_interp(q, setup.dq, setup.Gp_table)  # (total_nbeta, nG)
+    # All solid harmonics at once — no per-l branching
+    S_all = all_solid_harmonics(K_cart, l_max=setup.l_max)  # (l_max+1, 2*l_max+1, nG)
 
-    # K/q for radial derivative direction (stable at K=0)
-    K_over_q = K_cart / q[:, None]   # (nG, 3)
-
-    # Build dense Z, E_super, and optionally dZ
+    # Build Z by concatenating channel blocks (still a Python loop over channels,
+    # but now the body is pure JAX array ops with no JIT-breaking branching)
     Z_blocks = []
-    dZ_blocks = []  # list of (3, R_block, nG)
-    E_blocks_diag = []
-
     for ch in setup.channels:
-        l = ch.l
-        msize = ch.msize
-        nbeta = ch.nbeta
-        R = ch.R
+        l, nbeta, R = ch.l, ch.nbeta, ch.R
         tau_j = jnp.asarray(ch.tau, dtype=jnp.float64)
-        natoms = ch.natoms
         c_il = setup.prefactor * (1j) ** l
 
-        # Radial: (nbeta, nG)
-        b0 = ch.beta_table_start
-        G_bG = G_all[b0:b0 + nbeta]
-        Gp_bG = Gp_all[b0:b0 + nbeta]
+        G_bG = G_all[ch.beta_table_start:ch.beta_table_start + nbeta]  # (nbeta, nG)
+        S = S_all[l, :2*l+1]                                           # (msize, nG)
+        phase = jnp.exp(-2j * jnp.pi * (K_crys @ tau_j.T)).T          # (natoms, nG)
 
-        # Solid harmonics: (msize, nG), polynomial
-        S = _solid_harmonics_jax(l, K_cart)
+        radS = G_bG[:, None, :] * S[None, :, :]                        # (nbeta, msize, nG)
+        Z_per_atom = c_il * phase[:, None, None, :] * radS[None, :]     # (natoms, nbeta, msize, nG)
+        Z_blocks.append(Z_per_atom.reshape(ch.natoms * R, nG))
 
-        # Phases per atom: (natoms, nG)
-        phase = jnp.exp(-2j * jnp.pi * (K_crys @ tau_j.T)).T
+    Z = jnp.concatenate(Z_blocks, axis=0) if Z_blocks else jnp.zeros((0, nG), dtype=jnp.complex128)
 
-        # Z per atom: c_il * G_bG * S * phase → (natoms, nbeta, msize, nG)
-        radS = G_bG[:, None, :] * S[None, :, :]          # (nbeta, msize, nG)
-        Z_per_atom = c_il * phase[:, None, None, :] * radS[None, :]
-        Z_flat = Z_per_atom.reshape(natoms * R, nG)       # (natoms*R, nG)
-        Z_blocks.append(Z_flat)
+    # dZ for velocity (uses pre-computed harmonics + JVP)
+    dZ_j = None
+    if compute_dZ:
+        K_over_q = K_cart / q[:, None]
+        dZ_blocks = []
+        for ch in setup.channels:
+            l, nbeta, R = ch.l, ch.nbeta, ch.R
+            tau_j = jnp.asarray(ch.tau, dtype=jnp.float64)
+            c_il = setup.prefactor * (1j) ** l
 
-        # E: replicate per atom → block-diagonal
-        E_np = ch.E[:nspinor, :nspinor]                   # (ns, ns, R, R)
-        # Build block-diag: (ns, ns, natoms*R, natoms*R)
-        E_big = np.zeros((nspinor, nspinor, natoms * R, natoms * R),
-                         dtype=np.complex128)
-        for a in range(natoms):
-            s = a * R
-            E_big[:, :, s:s+R, s:s+R] = E_np
-        E_blocks_diag.append(E_big)
+            G_bG = G_all[ch.beta_table_start:ch.beta_table_start + nbeta]
+            Gp_bG = Gp_all[ch.beta_table_start:ch.beta_table_start + nbeta]
+            S = S_all[l, :2*l+1]
+            phase = jnp.exp(-2j * jnp.pi * (K_crys @ tau_j.T)).T
 
-        if compute_dZ:
-            # dS/dK_cart: (3, msize, nG)
-            dS_list = []
-            for j in range(3):
-                ej = jnp.zeros((nG, 3)).at[:, j].set(1.0)
-                _, dS_j = jax.jvp(
-                    lambda K: _solid_harmonics_jax(l, K), (K_cart,), (ej,)
-                )
-                dS_list.append(dS_j)
-            dS = jnp.stack(dS_list, axis=0)               # (3, msize, nG)
+            # dS/dK via JVP on solid harmonics
+            dS = jnp.stack([
+                jax.jvp(lambda K: _solid_harmonics_jax(l, K),
+                        (K_cart,), (jnp.zeros((nG, 3)).at[:, j].set(1.0),))[1]
+                for j in range(3)
+            ], axis=0)  # (3, msize, nG)
 
-            # dphase/dK_cart_j: -2πi (B^{-1})^T tau . e_j * phase
             Binv = jnp.linalg.inv(B_j)
-            tau_cart_eff = tau_j @ Binv.T                  # (natoms, 3)
-            dphase = -2j * jnp.pi * tau_cart_eff[:, :, None] * phase[:, None, :]
-            # dphase: (natoms, 3, nG)
+            dphase = -2j * jnp.pi * (tau_j @ Binv.T)[:, :, None] * phase[:, None, :]
 
-            # dZ/dK_j = c_il * [G'(q) K_j/q S + G dS_j] * phase + c_il * G S * dphase_j
-            # Radial derivative: Gp_bG (nbeta, nG), K_over_q.T (3, nG)
-            # drad: (3, nbeta, nG) = G'(q) * K_j/q
             drad = Gp_bG[None, :, :] * K_over_q.T[:, None, :]
-            # Core: (3, nbeta, msize, nG) = drad*S + G*dS
-            core = drad[:, :, None, :] * S[None, None, :, :]
-            core = core + G_bG[None, :, None, :] * dS[:, None, :, :]
-            # Apply c_il and phase: (natoms, 3, nbeta, msize, nG)
-            dZ_core = c_il * phase[:, None, None, None, :] * core[None, :, :, :, :]
-            # Phase derivative term: (natoms, 3, nbeta, msize, nG)
+            core = drad[:, :, None, :] * S[None, None, :, :] + G_bG[None, :, None, :] * dS[:, None, :, :]
+            dZ_core = c_il * phase[:, None, None, None, :] * core[None, :]
+            radS = G_bG[:, None, :] * S[None, :, :]
             dZ_phase = c_il * radS[None, None, :, :, :] * dphase[:, :, None, None, :]
-            dZ_total = dZ_core + dZ_phase
-            # Reshape: (3, natoms*R, nG)
-            dZ_flat = dZ_total.transpose(1, 0, 2, 3, 4).reshape(3, natoms * R, nG)
-            dZ_blocks.append(dZ_flat)
+            dZ_blocks.append((dZ_core + dZ_phase).transpose(1, 0, 2, 3, 4).reshape(3, ch.natoms * R, nG))
 
-    if Z_blocks:
-        Z = jnp.concatenate(Z_blocks, axis=0)                  # (total_R, nG)
-
-        # Assemble block-diagonal E_super
-        E_super = np.zeros((nspinor, nspinor, setup.total_R, setup.total_R),
-                           dtype=np.complex128)
-        offset = 0
-        for E_big in E_blocks_diag:
-            r = E_big.shape[2]
-            E_super[:, :, offset:offset+r, offset:offset+r] = E_big
-            offset += r
-        E_super_j = jnp.asarray(E_super, dtype=jnp.complex128)
-
-        dZ_j = None
-        if compute_dZ and dZ_blocks:
-            dZ_j = jnp.concatenate(dZ_blocks, axis=1)         # (3, total_R, nG)
-    else:
-        Z = jnp.zeros((0, nG), dtype=jnp.complex128)
-        E_super_j = jnp.zeros((nspinor, nspinor, 0, 0), dtype=jnp.complex128)
-        dZ_j = (jnp.zeros((3, 0, nG), dtype=jnp.complex128) if compute_dZ else None)
+        dZ_j = jnp.concatenate(dZ_blocks, axis=1) if dZ_blocks else None
 
     return VNLKData(
-        Z=Z, E_super=E_super_j, nG=nG,
+        Z=Z, E_super=setup.E_super, nG=nG,
         total_R=setup.total_R, dZ=dZ_j,
     )
 
