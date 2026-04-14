@@ -265,6 +265,31 @@ def spherical_hankel_table_batch_jax(
     return jnp.einsum("qr,fr,r->fq", base, f_br, r * r, optimize=True)
 
 
+def _spherical_hankel_table_np(
+    l: int,
+    r: np.ndarray,
+    f_r: np.ndarray,
+    q: np.ndarray,
+    weights: np.ndarray,
+) -> np.ndarray:
+    """CPU-only Hankel transform: ∫ dr r² f(r) j_l(qr) w(r).
+
+    Uses scipy.special.spherical_jn — no JIT compilation overhead.
+    Preferred for one-time table construction at setup.
+    """
+    from scipy.special import spherical_jn as _scipy_jn
+
+    r = np.asarray(r, dtype=np.float64)
+    f_r = np.asarray(f_r, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+
+    qr = q[:, None] * r[None, :]                         # (n_q, n_r)
+    j_l = _scipy_jn(l, qr)                               # (n_q, n_r)
+    integrand = j_l * (r * r * f_r)[None, :] * weights[None, :]
+    return np.sum(integrand, axis=1)                      # (n_q,)
+
+
 def make_projector_table(
     l: int,
     r: np.ndarray,
@@ -273,15 +298,7 @@ def make_projector_table(
     weights: np.ndarray,
 ) -> RadialTable:
     """F_l(q) table for one beta projector."""
-    values = np.asarray(
-        spherical_hankel_table_jax(
-            l,
-            jnp.asarray(r, dtype=jnp.float64),
-            jnp.asarray(beta_r, dtype=jnp.float64),
-            jnp.asarray(q_grid, dtype=jnp.float64),
-            jnp.asarray(weights, dtype=jnp.float64),
-        )
-    )
+    values = _spherical_hankel_table_np(l, r, beta_r, q_grid, weights)
     return RadialTable(q0=float(q_grid[0]), dq=float(q_grid[1] - q_grid[0]), values=values)
 
 
@@ -301,15 +318,7 @@ def make_local_sr_table(
             np.asarray(erf(jnp.asarray(r_np))) / r_np,
             2.0 / np.sqrt(np.pi),
         )
-    values = np.asarray(
-        spherical_hankel_table_jax(
-            0,
-            jnp.asarray(r_np, dtype=jnp.float64),
-            jnp.asarray(sr, dtype=jnp.float64),
-            jnp.asarray(q_grid, dtype=jnp.float64),
-            jnp.asarray(weights, dtype=jnp.float64),
-        )
-    )
+    values = _spherical_hankel_table_np(0, r_np, sr, np.asarray(q_grid), weights)
     return RadialTable(q0=float(q_grid[0]), dq=float(q_grid[1] - q_grid[0]), values=values)
 
 
@@ -320,20 +329,13 @@ def make_core_charge_table(
     weights: np.ndarray,
 ) -> RadialTable:
     """NLCC/core-charge l=0 transform table."""
-    values = np.asarray(
-        spherical_hankel_table_jax(
-            0,
-            jnp.asarray(r, dtype=jnp.float64),
-            jnp.asarray(rho_core_r, dtype=jnp.float64),
-            jnp.asarray(q_grid, dtype=jnp.float64),
-            jnp.asarray(weights, dtype=jnp.float64),
-        )
-    )
+    values = _spherical_hankel_table_np(0, r, rho_core_r, np.asarray(q_grid), weights)
     return RadialTable(q0=float(q_grid[0]), dq=float(q_grid[1] - q_grid[0]), values=values)
 
 
 __all__ = [
     "RadialTable",
+    "_spherical_hankel_table_np",
     "differentiate_uniform_table",
     "interp_uniform_jax",
     "interp_uniform_np",

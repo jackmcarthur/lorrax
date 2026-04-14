@@ -23,7 +23,7 @@ uv run python -m pytest -q                                    # unit tests (~15s
 uv run python -m gw.gw_jax -i cohsex.in                  # run GW calculation
 ```
 
-On NERSC Perlmutter: use Shifter with the NVIDIA JAX container. See `cluster_setup/README_CLUSTER.md`.
+On NERSC Perlmutter: `module load lorrax` then use `lxrun` / `lxpre`. See [`config/README.md`](config/README.md).
 
 ## Documentation
 

@@ -108,7 +108,7 @@ pip install -e .  # Install isdf package
 ### 2.3 Docker/Shifter (HPC Clusters)
 
 **NERSC Perlmutter** (recommended for production):
-See [`cluster_setup/README_CLUSTER.md`](../cluster_setup/README_CLUSTER.md)
+See [`config/README.md`](../config/README.md)
 
 **Dockerfiles** (in repo root):
 

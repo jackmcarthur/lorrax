@@ -93,7 +93,7 @@ class VNLKData:
 
 def build_vnl_setup(
     wfn, sym=None, meta=None, pseudos=None,
-    n_q: int = 50000,
+    n_q: int = 4000,
     nspinor: int | None = None,
     q_max: float | None = None,
 ) -> VNLSetup:

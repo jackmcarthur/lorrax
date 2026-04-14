@@ -27,7 +27,11 @@ import jax.numpy as jnp
 from file_io import WFNReader
 from common import symmetry_maps, Meta
 from common.load_wfns import load_kpoint_fftbox
-from psp.radial_jax import radial_weights, spherical_hankel_table_jax
+from psp.radial_jax import (
+    radial_weights,
+    make_core_charge_table,
+    make_uniform_q_grid,
+)
 
 
 def build_density_from_ibz(
@@ -247,19 +251,15 @@ def build_core_density(
         r = np.asarray(mesh.pp_r.value, dtype=float)
         rab = np.asarray(mesh.pp_rab.value, dtype=float)
 
-        # Fourier transform: ρ_core(G) = (4π/Ω) ∫ r² ρ_core(r) j₀(Gr) dr.
-        # Use the shared JAX radial backend with QE-style Simpson×rab weights.
+        # Fourier transform via tabulate-then-interpolate (same as V_loc).
+        # Tabulate on a small uniform q-grid, then interpolate to all G-vectors.
+        # This avoids building a (n_G, n_r) matrix inside JIT.
         G_flat = G_norm.ravel()              # (n_G,)
         simpson_weights = radial_weights(r, rab, scheme="simpson_rab")
-        rho_c_G_flat = (4 * np.pi / vol) * np.asarray(
-            spherical_hankel_table_jax(
-                0,
-                jnp.asarray(r, dtype=jnp.float64),
-                jnp.asarray(rho_c_r, dtype=jnp.float64),
-                jnp.asarray(G_flat, dtype=jnp.float64),
-                jnp.asarray(simpson_weights, dtype=jnp.float64),
-            )
-        )
+        n_q = max(2048, 2 * len(r))
+        q_grid = make_uniform_q_grid(float(np.max(G_flat)), n_q)
+        tab = make_core_charge_table(r, rho_c_r, q_grid, simpson_weights)
+        rho_c_G_flat = (4 * np.pi / vol) * tab(G_flat)
         rho_c_G_atom = rho_c_G_flat.reshape(nx, ny, nz)
 
         # Structure factor: e^{-2πi G_crys · τ}
