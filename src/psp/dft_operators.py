@@ -94,6 +94,38 @@ class HamiltonianK:
 # Each function constructs one piece of the Hamiltonian.
 # They are called by setup_H_k and also available individually.
 
+def compute_ngkmax(kpoints, bdot, ecutwfc, fft_grid):
+    """Maximum number of G-vectors across all k-points.
+
+    Pure integer counting — no large arrays stored.  Use this once at
+    startup so every ``setup_H_k_from_kvec`` call can pad to the same
+    ``ngkmax``, giving one JIT compilation for all k-points.
+
+    Parameters
+    ----------
+    kpoints : (nk, 3) — k-points in crystal coordinates
+    bdot : (3,3) — reciprocal metric in bohr⁻²
+    ecutwfc : float — PW cutoff (Ry)
+    fft_grid : (nx, ny, nz)
+    """
+    kpoints = np.asarray(kpoints, dtype=np.float64)
+    bdot = np.asarray(bdot, dtype=np.float64)
+    nx, ny, nz = int(fft_grid[0]), int(fft_grid[1]), int(fft_grid[2])
+
+    gx = np.fft.fftfreq(nx, d=1.0 / nx).astype(int)
+    gy = np.fft.fftfreq(ny, d=1.0 / ny).astype(int)
+    gz = np.fft.fftfreq(nz, d=1.0 / nz).astype(int)
+    Gx, Gy, Gz = np.meshgrid(gx, gy, gz, indexing="ij")
+    G_all = np.stack([Gx.ravel(), Gy.ravel(), Gz.ravel()], axis=-1).astype(np.float64)
+
+    ngk_max = 0
+    for ik in range(len(kpoints)):
+        KG = G_all + kpoints[ik][None, :]
+        KG_sq = np.einsum("gi,ij,gj->g", KG, bdot, KG)
+        ngk_max = max(ngk_max, int(np.sum(KG_sq <= ecutwfc)))
+    return ngk_max
+
+
 def build_T_diag(
     k_idx: int,
     wfn,
@@ -381,6 +413,7 @@ def setup_H_k(
     sym,
     meta,
     V_loc_r: jax.Array | None = None,
+    ngkmax: int | None = None,
 ) -> HamiltonianK:
     """Assemble all per-k Hamiltonian data (SymMaps path).
 
@@ -392,22 +425,42 @@ def setup_H_k(
     wfn, sym, meta : standard LORRAX objects
     V_loc_r : (nx, ny, nz) — ionic local potential alone, for h_diag.
         If None, h_diag falls back to T_diag only.
+    ngkmax : int, optional — pad all arrays to this size for uniform JIT.
+        Compute once via ``compute_ngkmax`` and pass to every k-point.
     """
     T_diag, Gx, Gy, Gz = build_T_diag(k_idx, wfn, sym, meta)
-    vnl_Z, vnl_E = build_vnl_kdata(k_idx, vnl_setup, wfn, sym, meta)
-    h_diag = (build_h_diag(T_diag, V_loc_r, vnl_Z, vnl_E)
+    nG_actual = int(Gx.shape[0])
+
+    # Pad G-vectors BEFORE building VNL so _table_interp sees uniform shapes
+    if ngkmax is not None and ngkmax > nG_actual:
+        pad = ngkmax - nG_actual
+        T_diag = jnp.pad(T_diag, (0, pad), constant_values=1e10)
+        Gx = jnp.pad(Gx, (0, pad), constant_values=0)
+        Gy = jnp.pad(Gy, (0, pad), constant_values=0)
+        Gz = jnp.pad(Gz, (0, pad), constant_values=0)
+        mask = jnp.concatenate([jnp.ones(nG_actual, dtype=jnp.bool_),
+                                jnp.zeros(pad, dtype=jnp.bool_)])
+    else:
+        mask = jnp.ones(nG_actual, dtype=jnp.bool_)
+
+    # Build VNL at padded size — one JIT trace for all k-points
+    Gk_int = np.stack([np.asarray(Gx), np.asarray(Gy), np.asarray(Gz)], axis=-1)
+    kvec = np.asarray(sym.unfolded_kpts[k_idx], dtype=float)
+    import psp.vnl_ops as vnl_ops
+    kdata = vnl_ops.build_vnl_kdata_from_kvec(kvec, Gk_int, vnl_setup)
+
+    h_diag = (build_h_diag(T_diag, V_loc_r, kdata.Z, kdata.E_super)
               if V_loc_r is not None else T_diag)
-    nG = int(Gx.shape[0])
 
     return HamiltonianK(
         T_diag=T_diag,
         V_scf=V_scf,
         Gx=Gx, Gy=Gy, Gz=Gz,
-        vnl_Z=vnl_Z,
-        vnl_E=vnl_E,
+        vnl_Z=kdata.Z,
+        vnl_E=kdata.E_super,
         h_diag=h_diag,
-        mask=jnp.ones(nG, dtype=jnp.bool_),
-        nG=nG,
+        mask=mask,
+        nG=nG_actual,
         fft_grid=tuple(int(x) for x in meta.fft_grid),
     )
 
