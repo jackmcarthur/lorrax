@@ -22,7 +22,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from psp.qe_save_reader import CrystalData
+from file_io import CrystalData, WFNWriter
 from psp.pseudos import load_pseudopotentials
 from psp.ionic_gspace import build_ionic_and_core
 from psp.dft_operators import (
@@ -33,8 +33,7 @@ from psp.gvec_utils import (
     build_master_gvec_list, select_gvecs_for_k,
     compute_ngkmax, reorder_to_qe,
 )
-from psp.davidson import davidson_k, warmup_jit
-from psp.wfn_writer import WFNWriter
+from solvers.davidson import davidson, warmup_davidson_jit
 import psp.vnl_ops as vnl_ops
 
 
@@ -122,7 +121,7 @@ def run_nscf(
 
     # ── JIT warmup ──────────────────────────────────────────────
     t1 = time.perf_counter()
-    warmup_jit(ngkmax, nspinor, nbnd)
+    warmup_davidson_jit(ngkmax, nspinor, nbnd)
     H_k0 = setup_H_k_from_kvec(kpoints[0], V_scf, vnl_setup, crystal, None,
                                  V_loc_r=V_loc, ngkmax=ngkmax)
     dummy = jnp.zeros((1, nspinor, ngkmax), dtype=jnp.complex128)
@@ -151,9 +150,9 @@ def run_nscf(
                                     _H.vnl_Z, _H.vnl_E, _H.mask,
                                     _nx, _ny, _nz)
 
-        evals, evecs = davidson_k(
-            apply_H, h_diag=H_k.h_diag, nG=ngkmax, nspinor=nspinor,
-            n_tgt=nbnd, T_diag=H_k.T_diag, verbose=False, tol=tol)
+        evals, evecs = davidson(
+            apply_H, h_diag=H_k.h_diag, dim=ngkmax, n_channels=nspinor,
+            n_eig=nbnd, diag_for_init=H_k.T_diag, verbose=False, tol=tol)
 
         eigenvalues[ik] = evals
         writer.write_k(ik, evals, reorder_to_qe(np.asarray(evecs), H_k, gvecs_per_k[ik]))
