@@ -25,9 +25,8 @@ import jax.numpy as jnp
 from psp.qe_save_reader import CrystalData
 from psp.pseudos import load_pseudopotentials
 from psp.ionic_gspace import build_ionic_and_core
-from psp.charge_density import build_G_cart
 from psp.dft_operators import (
-    compute_V_H_and_V_xc, build_V_scf,
+    build_G_cart, compute_V_H_and_V_xc, build_V_scf,
     setup_H_k_from_kvec, apply_H_k,
 )
 from psp.gvec_utils import (

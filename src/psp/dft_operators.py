@@ -88,6 +88,24 @@ class HamiltonianK:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  G-vector utilities
+# ═══════════════════════════════════════════════════════════════════════
+
+def build_G_cart(nx: int, ny: int, nz: int, B: np.ndarray) -> jax.Array:
+    """Cartesian G-vector grid from FFT frequencies and lattice matrix B.
+
+    B = blat * bvec (rows = reciprocal lattice vectors in bohr⁻¹).
+    Returns (nx, ny, nz, 3) float64.
+    """
+    gx = np.fft.fftfreq(nx, d=1.0 / nx).astype(int)
+    gy = np.fft.fftfreq(ny, d=1.0 / ny).astype(int)
+    gz = np.fft.fftfreq(nz, d=1.0 / nz).astype(int)
+    Gx, Gy, Gz = np.meshgrid(gx, gy, gz, indexing='ij')
+    G_crys = np.stack([Gx, Gy, Gz], axis=-1).astype(float)
+    return jnp.asarray(np.einsum('...i,ij->...j', G_crys, B), dtype=jnp.float64)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  Per-component builders
 # ═══════════════════════════════════════════════════════════════════════
 #
