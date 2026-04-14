@@ -114,6 +114,7 @@ class CrystalData:
     nbands: int
     nkpts: int
     kgrid: np.ndarray               # (3,) int — Monkhorst-Pack dimensions
+    assume_isolated: str            # "none" | "2D" (from QE assume_isolated)
 
     # ── Private ──
     _save_dir: str = ""
@@ -194,6 +195,14 @@ class CrystalData:
         kgrid = (np.array([int(mp[0].attrib.get(f"nk{i}", 1)) for i in (1, 2, 3)],
                           dtype=np.int32) if mp else np.zeros(3, dtype=np.int32))
 
+        # ── assume_isolated ──
+        iso_text = _text(root, "assume_isolated")
+        assume_isolated = iso_text.strip() if iso_text and iso_text.strip() else "none"
+        if assume_isolated not in ("none", "2D"):
+            raise ValueError(
+                f"Unsupported assume_isolated='{assume_isolated}' in QE .save. "
+                f"LORRAX supports: 'none', '2D'")
+
         return cls(
             alat=alat, blat=blat, avec=avec, bvec=bvec, bdot=bdot,
             cell_volume=cell_volume, nat=nat,
@@ -202,7 +211,8 @@ class CrystalData:
             sym_time_rev=sym_time_rev,
             nelec=nelec, nspin=nspin, nspinor=nspinor,
             ecutwfc=ecutwfc, ecutrho=ecutrho, fft_grid=fft_grid,
-            nbands=nbands, nkpts=0, kgrid=kgrid, _save_dir=save_dir,
+            nbands=nbands, nkpts=0, kgrid=kgrid,
+            assume_isolated=assume_isolated, _save_dir=save_dir,
         )
 
     # ------------------------------------------------------------------

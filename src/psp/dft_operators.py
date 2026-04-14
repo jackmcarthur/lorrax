@@ -200,7 +200,7 @@ def _T_diag_from_G(
     return T_diag, Gx, Gy, Gz
 
 
-@jax.jit
+@functools.partial(jax.jit, static_argnames=("truncation_2d", "blat"))
 def compute_V_H_and_V_xc(
     rho_val: jax.Array,
     rho_core: jax.Array,
@@ -209,6 +209,8 @@ def compute_V_H_and_V_xc(
     bdot: jax.Array,
     bvec: jax.Array,
     blat: float,
+    *,
+    truncation_2d: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Compute V_H and V_xc in a single JIT.
 
@@ -224,7 +226,7 @@ def compute_V_H_and_V_xc(
     # ── V_H via Poisson ──
     rho_G_ortho = jnp.fft.fftn(rho_val, norm='ortho')
     V_H_r = jnp.real(poisson_potential_from_rhoG(
-        rho_G_ortho, bdot, bvec, blat, truncation_2d=False))
+        rho_G_ortho, bdot, bvec, blat, truncation_2d=truncation_2d))
 
     # ── V_xc (PBE GGA) ──
     rho_total = rho_val + rho_core

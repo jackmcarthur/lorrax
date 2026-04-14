@@ -109,7 +109,6 @@ def run_nscf(
     nbnd: int,
     output_path: str = "WFN.h5",
     *,
-    truncation_2d: bool = False,
     tol: float = 1e-8,
     verbose: bool = True,
     kpoints_override: np.ndarray | None = None,
@@ -117,16 +116,9 @@ def run_nscf(
 ):
     """Run NSCF calculation: build potentials, solve Davidson, write WFN.h5.
 
-    Parameters
-    ----------
-    crystal : CrystalData from QE .save directory
-    pseudos : dict from load_pseudopotentials
-    kgrid : (nkx, nky, nkz) Monkhorst-Pack grid
-    nbnd : number of bands to compute
-    output_path : WFN.h5 output file
-    truncation_2d : use 2D Coulomb truncation for V_loc
-    tol : Davidson convergence tolerance
+    2D Coulomb truncation is auto-detected from crystal.assume_isolated.
     """
+    truncation_2d = crystal.assume_isolated == "2D"
     fft_grid = crystal.fft_grid
     nspinor = crystal.nspinor
     _nx, _ny, _nz = int(fft_grid[0]), int(fft_grid[1]), int(fft_grid[2])
@@ -134,6 +126,8 @@ def run_nscf(
 
     if verbose:
         print(f"NSCF: {nbnd} bands, kgrid={kgrid}, fft={fft_grid}, nspinor={nspinor}")
+        if truncation_2d:
+            print(f"  2D Coulomb truncation (from assume_isolated='2D')")
         print(f"  GPUs: {len(jax.devices())}")
 
     # ── Build potentials ──
@@ -147,7 +141,8 @@ def run_nscf(
     V_H_r, V_xc_r = compute_V_H_and_V_xc(
         rho_val, rho_core_r, rho_core_G, G_cart,
         jnp.asarray(crystal.bdot, dtype=jnp.float64),
-        jnp.asarray(crystal.bvec, dtype=jnp.float64), crystal.blat)
+        jnp.asarray(crystal.bvec, dtype=jnp.float64), crystal.blat,
+        truncation_2d=truncation_2d)
     V_scf = build_V_scf(V_loc_r, V_H_r, V_xc_r)
     jax.block_until_ready(V_scf)
     if verbose:
@@ -269,7 +264,6 @@ def main():
     parser.add_argument("--nbnd", type=int, default=100, help="Number of bands")
     parser.add_argument("--nk", type=int, nargs=3, default=[4, 4, 4], help="K-grid dimensions")
     parser.add_argument("-o", "--output", default="WFN.h5", help="Output WFN.h5 path")
-    parser.add_argument("--sys_dim", type=int, default=3, help="System dimension (2 or 3)")
     parser.add_argument("--tol", type=float, default=1e-8, help="Davidson convergence tolerance")
     parser.add_argument("--ref_wfn", default=None, help="Reference WFN.h5 to read k-points from (for validation)")
     args = parser.parse_args()
@@ -278,7 +272,6 @@ def main():
     crystal = CrystalData.from_qe_save(args.save)
     pseudos = load_pseudopotentials(pseudo_dir)
 
-    # Read k-points from reference WFN if provided (ensures same ordering)
     kpoints_override = None
     weights_override = None
     if args.ref_wfn:
@@ -292,7 +285,6 @@ def main():
         kgrid=tuple(args.nk),
         nbnd=args.nbnd,
         output_path=args.output,
-        truncation_2d=(args.sys_dim == 2),
         tol=args.tol,
         kpoints_override=kpoints_override,
         weights_override=weights_override,
