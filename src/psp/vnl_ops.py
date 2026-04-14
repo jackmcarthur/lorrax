@@ -21,17 +21,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from psp.radial.build_projectors_qe import (
-    build_E_blocks_full,
-)
-from psp.radial.radial_jax import (
-    differentiate_uniform_table,
-    make_projector_table,
-    make_uniform_q_grid,
-    radial_weights,
-)
-# Import solid harmonics without circular dependency
-# (dft_operators imports vnl_ops, so we can't import from dft_operators here)
+from psp.radial.build_projectors_qe import build_E_blocks_full
+from psp.radial.radial_jax import differentiate_uniform_table
 from psp.radial.solid_harmonics import solid_harmonics_jax as _solid_harmonics_jax
 
 
@@ -106,29 +97,23 @@ def build_vnl_setup(
     meta : Meta, optional — used with sym for q_max scan.
     pseudos : dict — element → UPF
     q_max : float, optional — if provided, skip the k-point scan for q_max.
-        Use this when SymMaps is not available (standalone Davidson path).
     """
+    from psp.species import extract_species, build_atom_species_map
+    from psp.radial_tables import build_all_tables
+
     if nspinor is None:
         nspinor = int(meta.nspinor) if meta is not None else int(wfn.nspinor)
 
-    from psp.pseudos import build_atom_pp_assignments
-
-    atom_pos = jnp.asarray(wfn.atom_crys, dtype=jnp.float64)
-    atom_types = jnp.asarray(wfn.atom_types, dtype=jnp.int32)
-    assignments = build_atom_pp_assignments(atom_pos, atom_types, pseudos)
-
-    bvec_np = np.asarray(wfn.bvec, dtype=float).T
-    B = float(wfn.blat) * bvec_np.T
+    B = float(wfn.blat) * np.asarray(wfn.bvec, dtype=float)
     cell_volume = float(wfn.cell_volume)
     prefactor = (4.0 * np.pi) / np.sqrt(cell_volume)
 
-    # Determine q_max. For PW spheres this is already bounded by ecutwfc.
+    # Determine q_max
     if q_max is None:
         if hasattr(wfn, "ecutwfc"):
             q_max = float(np.sqrt(float(wfn.ecutwfc)))
         else:
-            if sym is None:
-                raise ValueError("Either q_max or (sym, meta) required for build_vnl_setup")
+            from psp.dft_operators import generate_gvectors_k
             q_max = 0.0
             for ik in range(sym.nk_tot):
                 Gk, _ = generate_gvectors_k(ik, sym, wfn, meta)
@@ -137,84 +122,54 @@ def build_vnl_setup(
                 qk = np.sqrt(np.sum(K_cart ** 2, axis=1))
                 if qk.size:
                     q_max = max(q_max, float(np.max(qk)))
-    q_max *= 1.01  # small margin
+    q_max *= 1.01
 
-    dq = q_max / (n_q - 1)
-    q_grid = make_uniform_q_grid(q_max, n_q)
+    # Extract species data and projector tables
+    species_list = extract_species(pseudos, nspinor=nspinor)
+    tables = build_all_tables(species_list, q_max, n_q)
+    species_natoms, species_tau, _ = build_atom_species_map(wfn, species_list)
+    q_grid = tables["q"]
+    dq = tables["dq"]
 
-    # Group atoms by pseudopotential
-    species_map: dict[int, dict] = {}
-    for ap in assignments:
-        if ap.pseudo is None:
-            continue
-        key = id(ap.pseudo)
-        ent = species_map.setdefault(key, {
-            'pseudo': ap.pseudo, 'positions': [],
-        })
-        ent['positions'].append(np.asarray(ap.position, dtype=float))
-
-    # Build channels and radial tables
+    # Build channels and G_l/G'_l tables from species projectors
     channels: list[ChannelMeta] = []
     G_rows: list[np.ndarray] = []
     Gp_rows: list[np.ndarray] = []
     beta_idx = 0
 
-    for key, ent in species_map.items():
-        pseudo = ent['pseudo']
-        tau = np.asarray(ent['positions'], dtype=float)
-        if tau.ndim == 1:
-            tau = tau.reshape(1, 3)
-        natoms = tau.shape[0]
-
-        E_blocks = build_E_blocks_full(pseudo)
-        ppmesh = getattr(pseudo, 'pp_mesh', None)
-        ppnl = getattr(pseudo, 'pp_nonlocal', None)
-        if ppmesh is None or ppnl is None:
+    for isp, sp in enumerate(species_list):
+        natoms = int(species_natoms[isp])
+        if natoms == 0:
             continue
-        r = np.asarray(ppmesh.pp_r.value, dtype=float)
-        try:
-            rab = np.asarray(ppmesh.pp_rab.value, dtype=float)
-        except Exception:
-            rab = None
-        weights = radial_weights(r, rab, scheme="rab")
+        tau = species_tau[isp, :natoms]
 
-        # Enumerate l-channels
-        betas = list(getattr(getattr(pseudo, 'pp_nonlocal', None), 'pp_beta', []))
+        E_blocks = build_E_blocks_full(pseudos[sp.element])
+
+        # Group projectors by l
         per_l: dict[int, list[int]] = {}
-        for idx, beta in enumerate(betas, start=1):
-            l = int(getattr(beta, 'lll', getattr(beta, 'angular_momentum', 0)))
-            per_l.setdefault(l, []).append(idx)
+        for ip in range(sp.n_proj):
+            l = int(sp.proj_l[ip])
+            per_l.setdefault(l, []).append(ip)
 
-        for l, beta_ids in per_l.items():
+        for l, proj_ids in per_l.items():
             E_np = E_blocks.get(l)
             if E_np is None:
                 continue
-            nbeta = len(beta_ids)
+            nbeta = len(proj_ids)
             msize = 2 * l + 1
             R = nbeta * msize
 
-            # Evaluate F_l(q) splines on uniform grid → build G_l = F_l/q^l
-            for bid in beta_ids:
-                beta = betas[int(bid) - 1]
-                raw_beta = np.asarray(beta.value, dtype=float)
-                if r[0] == 0.0 and len(r) > 1:
-                    beta_r = np.empty_like(r)
-                    beta_r[1:] = raw_beta[1:] / r[1:]
-                    beta_r[0] = beta_r[1]
-                else:
-                    beta_r = raw_beta / r
-                F_vals = make_projector_table(l, r, beta_r, q_grid, weights).values
+            # F_l(q) from pre-built tables → G_l = F_l/q^l, then differentiate
+            for ip in proj_ids:
+                F_vals = tables["proj_tables"][isp][ip]
                 if l == 0:
                     G_vals = F_vals.copy()
                 else:
                     G_vals = np.empty(n_q, dtype=np.float64)
                     G_vals[1:] = F_vals[1:] / q_grid[1:] ** l
-                    G_vals[0] = F_vals[1] / q_grid[1] ** l  # limit
-
-                Gp_vals = differentiate_uniform_table(G_vals, dq)
-
+                    G_vals[0] = F_vals[1] / q_grid[1] ** l
                 G_rows.append(G_vals)
-                Gp_rows.append(Gp_vals)
+                Gp_rows.append(differentiate_uniform_table(G_vals, dq))
 
             channels.append(ChannelMeta(
                 l=l, nbeta=nbeta, msize=msize, R=R,
@@ -223,13 +178,8 @@ def build_vnl_setup(
             ))
             beta_idx += nbeta
 
-    if G_rows:
-        G_table = jnp.asarray(np.stack(G_rows, axis=0), dtype=jnp.float64)
-        Gp_table = jnp.asarray(np.stack(Gp_rows, axis=0), dtype=jnp.float64)
-    else:
-        G_table = jnp.zeros((0, n_q), dtype=jnp.float64)
-        Gp_table = jnp.zeros((0, n_q), dtype=jnp.float64)
-
+    G_table = jnp.asarray(np.stack(G_rows), dtype=jnp.float64) if G_rows else jnp.zeros((0, n_q), dtype=jnp.float64)
+    Gp_table = jnp.asarray(np.stack(Gp_rows), dtype=jnp.float64) if Gp_rows else jnp.zeros((0, n_q), dtype=jnp.float64)
     total_R = sum(ch.R * ch.natoms for ch in channels)
 
     return VNLSetup(
