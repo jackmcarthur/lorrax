@@ -197,101 +197,14 @@ def get_bandranges(nv, nc, nband, nelec):
     return nvrange, ncrange, nsigmarange, n_fullrange, n_valrange
 
 
-def load_pseudopotentials(work_dir="."):
-    """Load all UPF pseudopotential files found in the working directory.
-    
-    Args:
-        work_dir (str): Directory to search for *.upf files
-        
-    Returns:
-        dict: Dictionary mapping atom types to loaded pseudopotential objects
-    """
-    upf_files = glob.glob(os.path.join(work_dir, "*.upf"))
-    if not upf_files:
-        print(f"No pseudopotentials (*.upf) found in {work_dir}")
-        return {}
-    
-    pseudos = {}
-    for upf_file in upf_files:
-        try:
-            pseudo = load_upf(upf_file)
-            # Normalize numeric string fields (e.g., radial arrays) to numpy arrays
-            pseudo = normalize_dataclass(pseudo)
-            # Attach source path for concise later reporting
-            setattr(pseudo, "_source_path", upf_file)
-            # Extract element name from pseudopotential
-            element = pseudo.pp_header.element.strip()
-            pseudos[element] = pseudo
-        except Exception as e:
-            print(f"Warning: failed to load {os.path.basename(upf_file)}: {e}")
-            continue
-            
-    return pseudos
-
-
-def _periodic_table_symbols() -> list[str]:
-    # Ordered list of element symbols; index+1 gives atomic number Z
-    return (
-        "H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br Kr "
-        "Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu "
-        "Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po At Rn Fr Ra Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr Rf Db Sg "
-        "Bh Hs Mt Ds Rg Cn Fl Lv Ts Og"
-    ).split()
-
-
-def _symbol_to_Z(symbol: str) -> int | None:
-    try:
-        return _periodic_table_symbols().index(symbol.capitalize()) + 1
-    except ValueError:
-        return None
-
-
-@dataclass
-class AtomPP:
-    index: int
-    atomic_number: int
-    element: str
-    position: jnp.ndarray
-    pseudo: object | None
-
-
-def build_atom_pp_assignments(atom_positions: jnp.ndarray, atom_types: jnp.ndarray, pseudos: dict) -> list[AtomPP]:
-    # Build Z->pseudo map from loaded UPFs using element symbol in header
-    z_to_pseudo: dict[int, object] = {}
-    for element, pseudo in pseudos.items():
-        Z = _symbol_to_Z(element)
-        if Z is not None:
-            z_to_pseudo[Z] = pseudo
-
-    assignments: list[AtomPP] = []
-    for i in range(atom_positions.shape[0]):
-        Z = int(atom_types[i])
-        pseudo = z_to_pseudo.get(Z, None)
-        # Infer element symbol from pseudo if present, otherwise unknown
-        if pseudo is not None:
-            elem = getattr(pseudo.pp_header, 'element', str(Z))
-        else:
-            elem = str(Z)
-        assignments.append(AtomPP(index=i, atomic_number=Z, element=str(elem), position=atom_positions[i], pseudo=pseudo))
-    return assignments
-
-
-def print_atomic_structure(wfn, pseudos):
-    """Concise structure summary and a compact pseudopotential table."""
-    print()
-    print(f"Structure: nat={wfn.nat}, volume={wfn.cell_volume:.6f} Bohr^3, alat={wfn.alat:.6f} Bohr")
-    if not pseudos:
-        print("Pseudopotentials: none found")
-        return
-    # Compact table: Element  Z_val  n_proj  file
-    print("Pseudopotentials:")
-    print(f"  {'Elem':<6} {'Z_val':>5} {'n_proj':>6}  file")
-    for element, pseudo in pseudos.items():
-        n_proj = pseudo.pp_header.number_of_proj
-        z_val = pseudo.pp_header.z_valence
-    fname = os.path.basename(getattr(pseudo, '_source_path', ''))
-    print(f"  {element:<6} {z_val:>5} {n_proj:>6}  {fname}")
-    print()
+# ── Re-exports from psp.pseudos (canonical location) ──
+from psp.pseudos import (                              # noqa: F401
+    load_pseudopotentials,
+    symbol_to_Z as _symbol_to_Z,
+    AtomPP,
+    build_atom_pp_assignments,
+    print_atomic_structure,
+)
 
 
 def compute_valence_density(wfn_k, sym, wfn):

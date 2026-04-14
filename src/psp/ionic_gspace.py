@@ -233,7 +233,7 @@ def build_ionic_and_core(
 
     # ── Extract species data and build atom→species mapping ──
     species_data = _extract_species_radial_data(pseudos, vol)
-    from psp.get_DFT_mtxels import _symbol_to_Z
+    from psp.pseudos import symbol_to_Z as _symbol_to_Z
     z_to_species_idx = {}
     for i, sd in enumerate(species_data):
         z = _symbol_to_Z(sd["elem"])

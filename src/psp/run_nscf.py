@@ -26,7 +26,7 @@ import jax
 import jax.numpy as jnp
 
 from psp.qe_save_reader import CrystalData
-from psp.get_DFT_mtxels import load_pseudopotentials
+from psp.pseudos import load_pseudopotentials
 from psp.ionic_gspace import build_ionic_and_core
 from psp.charge_density import build_G_cart
 from psp.dft_operators import (
