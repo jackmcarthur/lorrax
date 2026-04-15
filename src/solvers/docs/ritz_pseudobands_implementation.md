@@ -1,6 +1,28 @@
-# Implementation guide: matrix-free Chebyshev–Jackson pseudobands
+# Implementation guide: hybrid stochastic + CJ-Ritz pseudobands
 
 Everything below is per k-point; add a leading $N_k$ axis to all per-k arrays, and $\mathtt{vmap}$/$\mathtt{pmap}$ over k. The construction is written for the conduction sector above $E_F$. The valence sector is identical applied to $-H$ with energies reflected about $E_F$.
+
+## Overview
+
+The spectrum is partitioned into three regions:
+
+```
+  ┌────────────────┬──────────────────────┬───────────────────────────┐
+  │   Protected    │     Stochastic       │        CJ-Ritz           │
+  │   (Davidson)   │  (random-phase from  │   (Chebyshev-Jackson     │
+  │   weight = 1   │   exact eigenstates) │    filtered Galerkin)     │
+  │                │   weight = √(n/k)    │   weight = √(n_eff/k)    │
+  ├────────────────┼──────────────────────┼───────────────────────────┤
+  E_min        E_cross              E_det_max + margin           E_max
+```
+
+- **Protected**: Davidson eigenstates below the first window boundary, included as-is with weight 1. These are the states of interest for QP properties plus enough conduction bands for accurate exchange.
+
+- **Stochastic**: Low-energy windows where the CJ filter cannot resolve the narrow spectral features. Uses random-phase linear combinations of exact eigenstates from extended Davidson (Eq. 5 of Altman et al.). Requires running Davidson deeper than the protected region to provide eigenstates for the transition zone.
+
+- **CJ-Ritz**: High-energy windows where the CJ filter is reliable. Uses the Chebyshev-Jackson filtered Galerkin-Ritz extraction (§4–6 below).
+
+The transition from stochastic to CJ is determined automatically: any window containing ≥1 Davidson eigenstate uses stochastic construction; the rest use CJ-Ritz.
 
 ## 1. Inputs and notation
 
@@ -10,12 +32,12 @@ User-supplied scalars:
 - $k$: Galerkin block size per window. Default $6$.
 - $M_{\max}$: Chebyshev order cap. Default $1500$.
 - $C_m$: filter sharpness constant. Default $1.0$ (corresponds to magnification $m \approx 3$).
-- $N_{\text{KPM}}$: KPM moment count. Default $4000$.
-- $N_z$: KPM trace probes. Default $40$.
+- $N_{\text{KPM}}$: KPM moment count. Default $500$.
+- $N_z$: KPM trace probes. Default $10$.
 
 User-supplied arrays from the Davidson stage:
 
-- $\Phi_{\text{det}} \in \mathbb{C}^{N_G \times N_{\text{det}}}$: deterministic eigenvectors (orthonormal) covering $[E_F, E_{\text{cross}}]$.
+- $\Phi_{\text{det}} \in \mathbb{C}^{N_G \times N_{\text{det}}}$: deterministic eigenvectors. Should extend well past $\epsilon_{\text{cross}}$ to cover the stochastic transition zone (typically $1.5$–$2\times$ the number of protected bands).
 - $E_{\text{det}} \in \mathbb{R}^{N_{\text{det}}}$: their eigenvalues.
 - $\mathtt{H}: \mathbb{C}^{N_G \times m} \to \mathbb{C}^{N_G \times m}$: matrix-free Hamiltonian application to a block of $m$ vectors.
 
@@ -45,11 +67,13 @@ New arrays: $\mu \in \mathbb{R}^{N_{\text{KPM}}}$, $\tilde\rho_{\text{grid}} \in
 
 ## 3. Window partitioning
 
-Compute the crossover energy
+Compute the CJ filter resolution and crossover energy:
 $$
-\epsilon_{\text{cross}} = \frac{C_m\pi B}{\mathcal F\, M_{\max}}.
+\delta E_{\text{CJ}} = \frac{\pi B}{M_{\max}}, \qquad
+\epsilon_{\text{cross}} = \frac{C_m\, \delta E_{\text{CJ}}}{\mathcal F}.
 $$
-The Davidson region must satisfy $\max(E_{\text{det}}) - E_F \ge \epsilon_{\text{cross}}$; if not, extend the Davidson run before invoking this routine.
+
+The window start $E_{\text{start}}$ is set to $E_F + \epsilon_{\text{cross}}$. This defines the first window boundary and the edge of the protected region.
 
 ### DOS-weighted partition (default)
 
@@ -88,6 +112,29 @@ Force $\epsilon_{N_S} = E_{\max} - E_F$. Window $j \in \{1,\ldots,N_S\}$ is $[\e
 Convert to rescaled boundaries: $\tilde\epsilon_j = \tilde E(E_F + \epsilon_j)$.
 
 New arrays: $\epsilon_{\text{bnd}} \in \mathbb{R}^{N_S+1}$, $\tilde\epsilon_{\text{bnd}} \in \mathbb{R}^{N_S+1}$.
+
+## 3b. Window classification: stochastic vs CJ
+
+After window boundaries are determined, classify each window by whether exact eigenstates from Davidson are available:
+
+```python
+for j in range(N_S):
+    n_det_in_window = count(E_det in [boundary[j], boundary[j+1]))
+    if n_det_in_window >= 1:
+        mode[j] = "stochastic"  # use exact eigenstates
+    else:
+        mode[j] = "CJ"          # use Chebyshev filter
+```
+
+This classification is the key difference from the original all-CJ scheme. The CJ filter has resolution $\delta E_{\text{CJ}} = \pi B / M_{\max}$; narrow windows near the conduction edge where the DOS is sparse will have Gibbs-ringing leakage that dominates the filtered vectors. Using exact eigenstates for those windows entirely bypasses the filter resolution limit.
+
+The deterministic bands are split into:
+- **Protected** ($N_{\text{prot}}$ bands): eigenvalues below $E_{\text{start}}$, included in the output as-is with weight 1.0.
+- **Available**: eigenvalues above $E_{\text{start}}$, consumed by stochastic pseudoband construction. NOT included as-is in the output (they are compressed into $k$ pseudobands per window with weight $\sqrt{n/k}$).
+
+This ensures no double-counting: each eigenstate appears either as a protected band OR as part of a stochastic pseudoband, never both.
+
+$N_{\text{prot}}$ is fixed at the value from $k=0$ and reused for all k-points to ensure consistent band count in WFN.h5.
 
 ## 4. Chebyshev–Jackson boundary-filter coefficients
 
@@ -140,15 +187,44 @@ and discard $\{A_j\}$.
 
 Total filter cost: exactly $M_{\max}$ block-matvecs of width $k$, regardless of $N_S$.
 
+Note: the telescoping filter computes ALL $N_S$ windows at once. For stochastic windows the filtered blocks $Y_j$ are simply discarded — a small waste of computation but the cost is dominated by the shared recurrence regardless.
+
 New arrays during recurrence: $A \in \mathbb{C}^{(N_S+1) \times N_G \times k}$, $T_{n-1}, T_{n-2} \in \mathbb{C}^{N_G \times k}$, $\Omega \in \mathbb{C}^{N_G \times k}$. After: $Y \in \mathbb{C}^{N_S \times N_G \times k}$.
 
-## 6. Per-window Galerkin–Ritz extraction
+## 6a. Stochastic windows: random-phase pseudobands from exact eigenstates
 
-For each window $j = 1, \ldots, N_S$ (process in ascending order — needed for §7):
+For each stochastic window $j$ (those containing $\ge 1$ Davidson eigenstate):
 
-**Deflate against the deterministic manifold:**
+Let $\{\phi_n\}_{n \in S_j}$ be the $n_j$ Davidson eigenstates with eigenvalues in $[\epsilon_{j-1}, \epsilon_j]$, and $E_{S_j}$ their eigenvalues. Construct $k$ pseudobands as random-phase linear combinations (Altman Eq. 5):
+$$
+\left|\xi_{j,\alpha}\right\rangle = \frac{1}{\sqrt{n_j}} \sum_{n \in S_j} e^{i\theta_{\alpha,n}} \left|\phi_n\right\rangle, \qquad \alpha = 1, \ldots, k,
+$$
+with $\theta_{\alpha,n} \sim \text{Uniform}[0, 2\pi)$ drawn independently.
+
+Each pseudoband has unit norm (in expectation). The pseudo-energy is $\bar E_{S_j} = \frac{1}{n_j}\sum_{n \in S_j} E_n$.
+
+The spectral weight is $\sqrt{n_j / k}$, absorbed into the wavefunction:
+$$
+|\tilde\xi_{j,\alpha}\rangle = \sqrt{n_j/k}\; |\xi_{j,\alpha}\rangle.
+$$
+
+**Key properties:**
+- Cross-window orthogonality: $\langle \xi_{j,\alpha} | \xi_{j',\beta} \rangle = 0$ in expectation for $j \neq j'$ (eigenstates from different windows are orthogonal), and $\mathcal{O}(1/\sqrt{n_j})$ for same-window pairs $\alpha \neq \beta$.
+- Works even when $n_j < k$: the $k$ pseudobands span an $n_j$-dimensional subspace, but the total weight $k \cdot (n_j/k) = n_j$ is correct regardless.
+- No matvecs required — purely algebraic construction from known eigenstates.
+
+## 6b. CJ-Ritz windows: Galerkin extraction from filtered blocks
+
+For each CJ window $j$ (those with no Davidson eigenstates), process in ascending order:
+
+**Deflate against ALL deterministic bands** (protected + available):
 $$
 Y_j \leftarrow Y_j - \Phi_{\text{det}}\bigl(\Phi_{\text{det}}^\dagger Y_j\bigr).
+$$
+
+**Cross-window orthogonalization (§7):** deflate against $Q_{j-1}$ from the previous CJ window:
+$$
+Y_j \leftarrow Y_j - Q_{j-1}\bigl(Q_{j-1}^\dagger Y_j\bigr).
 $$
 
 **Economy QR:** $Y_j = Q_j R_j$, with $Q_j \in \mathbb{C}^{N_G \times k}$ orthonormal and $R_j \in \mathbb{C}^{k \times k}$.
@@ -164,42 +240,31 @@ $$
 \tilde H_j = S_j\,\mathrm{diag}(\theta_j)\,S_j^\dagger, \qquad S_j \in \mathbb{C}^{k \times k},\;\theta_j \in \mathbb{R}^k.
 $$
 
+**Ritz eigenvalue sanity check:** if any $\theta_{j,\alpha}$ falls more than $\delta E_{\text{CJ}}$ outside the window $[\epsilon_{j-1}, \epsilon_j]$, the CJ filter has failed for this window (typically a spectral gap or insufficient resolution). Set the window weight to zero — these pseudobands carry no spectral weight and do not contribute to GW sums.
+
 **Form Ritz pseudobands:**
 $$
 \Xi_j = Q_j\, S_j \;\in\; \mathbb{C}^{N_G \times k}.
 $$
 
-**Compute window weight from the KPM DOS** (using the Jackson-smoothed bandpass envelope, not the hard window):
+**Window weight from the KPM DOS:**
 $$
-n_j^{\text{eff}} \;=\; \int \tilde\rho(E)\, w_j(E)^2\, dE,
+n_j^{\text{eff}} \;=\; \dim \cdot \int_{w_j} \tilde\rho(E)\, dE,
 $$
-evaluated on $E_{\text{grid}}$ via trapezoidal quadrature, where $w_j(E)$ is reconstructed by summing the telescoped coefficients $c_n^{w_j}$ against $T_n(\tilde E(E))$:
+where the integral is over the window and $\tilde\rho$ is normalized to integrate to 1 (probability density). Each Ritz pseudoband carries weight $\sqrt{n_j^{\text{eff}}/k}$, absorbed into the wavefunction:
 $$
-w_j(E) \;=\; \sum_{n=0}^{M_{\max}-1} c_n^{w_j}\, T_n(\tilde E(E)).
+|\tilde\xi_{j,\alpha}\rangle \;=\; \sqrt{n_j^{\text{eff}}/k}\;\, |\Xi_{j,\alpha}\rangle, \qquad \alpha = 1, \ldots, k.
 $$
-(This is a one-time cost per window, $\mathcal O(N_{\text{grid}} M_{\max})$, dominated by the recurrence on the $E$-grid which is shared across all windows; precompute $T_n(\tilde E_{\text{grid}}) \in \mathbb{R}^{N_{\text{grid}} \times M_{\max}}$ once before the window loop.)
-
-Each Ritz pseudoband carries weight $\sqrt{n_j^{\text{eff}}/k}$, absorbed into the wavefunction so the pseudobands are non-unit-normalized in the Jornada convention:
-$$
-|\tilde\xi_{j,\alpha}\rangle \;=\; \sqrt{n_j^{\text{eff}}/k}\;\, |\Xi_{j,\alpha}\rangle, \qquad \alpha = 1, \ldots, k,
-$$
-with assigned pseudo-energy $\theta_{j,\alpha}$.
 
 New arrays per window: $Q_j \in \mathbb{C}^{N_G \times k}$, $\tilde H_j \in \mathbb{C}^{k \times k}$, $S_j \in \mathbb{C}^{k\times k}$, $\theta_j \in \mathbb{R}^k$, $\Xi_j \in \mathbb{C}^{N_G\times k}$, $n_j^{\text{eff}} \in \mathbb{R}$.
 
-Precomputed once: $T_{\text{grid}} \in \mathbb{R}^{N_{\text{grid}}\times M_{\max}}$.
+## 7. Cross-window orthogonalization (CJ windows only)
 
-## 7. Cross-window orthogonalization
+The Jackson smoothing leaks each $w_j$ slightly into $[\epsilon_{j-2}, \epsilon_{j-1}]$ and $[\epsilon_j, \epsilon_{j+1}]$. The leakage at the lower boundary is the only one that matters during sequential processing (the upper-boundary leakage will be projected out when the next window is processed). One pass of block Gram–Schmidt against the immediately preceding CJ window's Ritz block kills it.
 
-The Jackson smoothing leaks each $w_j$ slightly into $[\epsilon_{j-2}, \epsilon_{j-1}]$ and $[\epsilon_j, \epsilon_{j+1}]$. The leakage at the lower boundary is the only one that matters during sequential processing (the upper-boundary leakage will be projected out when the next window is processed). One pass of block Gram–Schmidt against the immediately preceding window's Ritz block kills it.
+Stochastic windows do not participate in cross-window orthogonalization — their pseudobands are orthogonal to all other windows by construction (different eigenstates).
 
-Modify the per-window loop of §6: between QR and Galerkin, after deflating $Y_j$ against $\Phi_{\text{det}}$, also deflate against $Q_{j-1}$:
-$$
-Y_j \leftarrow Y_j - Q_{j-1}\bigl(Q_{j-1}^\dagger Y_j\bigr),
-$$
-then re-orthonormalize via a second QR if $\|R_j^{\text{new}}\|/\|R_j^{\text{old}}\| < 10^{-10}$ (catches near-rank-deficient cases). For $j = 1$, $Q_0$ is empty and the step is skipped.
-
-This adds $\mathcal O(k^2 N_G)$ per window, negligible against the filter cost. Storing $Q_{j-1}$ between iterations keeps the working memory bounded by $\mathcal O(k N_G)$ above the $A_j$ accumulators.
+This adds $\mathcal O(k^2 N_G)$ per CJ window, negligible against the filter cost. Storing $Q_{j-1}$ between iterations keeps the working memory bounded by $\mathcal O(k N_G)$ above the $A_j$ accumulators.
 
 The leading consistency check after all windows are processed:
 $$
@@ -209,13 +274,28 @@ to relative tolerance $10^{-3}$. A larger discrepancy indicates Jackson leakage 
 
 ## Output assembly
 
-Concatenate the deterministic Davidson bands and the Ritz pseudobands:
+Concatenate the protected Davidson bands and all pseudobands (stochastic + CJ):
 $$
-\Phi_{\text{out}} = [\Phi_{\text{det}}\;\;|\;\;\sqrt{n_1^{\text{eff}}/k}\,\Xi_1\;\;|\;\;\cdots\;\;|\;\;\sqrt{n_{N_S}^{\text{eff}}/k}\,\Xi_{N_S}] \in \mathbb{C}^{N_G \times (N_{\text{det}} + N_S k)},
+\Phi_{\text{out}} = [\Phi_{\text{prot}}\;\;|\;\;\tilde\xi_{1}\;\;|\;\;\cdots\;\;|\;\;\tilde\xi_{N_S}] \in \mathbb{C}^{N_G \times (N_{\text{prot}} + N_S k)},
 $$
 $$
-E_{\text{out}} = [E_{\text{det}}\;\;|\;\;\theta_1\;\;|\;\;\cdots\;\;|\;\;\theta_{N_S}] \in \mathbb{R}^{N_{\text{det}} + N_S k}.
+E_{\text{out}} = [E_{\text{prot}}\;\;|\;\;\bar E_1 \text{ or } \theta_1\;\;|\;\;\cdots\;\;|\;\;\bar E_{N_S} \text{ or } \theta_{N_S}] \in \mathbb{R}^{N_{\text{prot}} + N_S k},
 $$
+where pseudo-energies are $\bar E_{S_j}$ (mean eigenvalue) for stochastic windows and $\theta_j$ (Ritz eigenvalues) for CJ windows.
+
+Note: $N_{\text{prot}} \le N_{\text{det}}$ since det bands above $E_{\text{start}}$ are consumed by the stochastic construction. $N_{\text{prot}}$ is determined at $k=0$ and fixed for all k-points for WFN format consistency.
+
 This is the drop-in replacement for a Berkeley-GW-style wavefunction file: the GW code consumes it as a list of bands without modification, with the non-unit norm of the pseudoband wavefunctions encoding their spectral weight.
 
 For the valence sector, run the entire procedure on $-H$ with $E_F$ unchanged and energies negated, then concatenate the resulting valence pseudobands at the bottom of the output band list with their original (un-negated) energies.
+
+## Zero-weight band handling
+
+Pseudobands with zero weight (from CJ-0 windows or empty stochastic windows) have all-zero coefficients in the WFN. Downstream ISDF fitting and centroid selection must guard against division by zero when normalizing by band norms:
+- `WFNReader.band_norms`: clamp zero norms to 1.0 (not a small epsilon like 1e-30, which amplifies noise to infinity).
+- `isdf_fitting`: replace zero norms with 1.0 via `jnp.where` before dividing.
+- `get_charge_density`: skip zero-norm bands in the density loop.
+
+## Diagnostic: `dos_cjwindows.py`
+
+The script `scripts/dos_cjwindows.py` plots the KPM DOS (top panel) and all $N_S$ CJ window indicator functions (bottom panel), color-coded by stochastic vs CJ mode, with the protected region shaded. The CJ indicators are reconstructed analytically from boundary coefficients — no matvecs needed beyond the initial DOS computation. Their sum should equal 1 across the window region (partition of unity).
