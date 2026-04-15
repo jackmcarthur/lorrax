@@ -153,48 +153,54 @@ def _galerkin_ritz(
     Y_j: jax.Array,
     Phi_det: jax.Array | None,
     Q_prev: jax.Array | None,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Extract Ritz vectors from a filtered block.
+    rank_tol: float = 1e-3,
+) -> tuple[jax.Array, jax.Array, jax.Array, int]:
+    """Extract Ritz vectors from a filtered block with rank truncation.
 
-    Parameters
-    ----------
-    apply_H : (k, dim) → (k, dim)
-    Y_j : (k, dim) — filtered block for this window
-    Phi_det : (n_det, dim) or None — deterministic eigenvectors to deflate
-    Q_prev : (k, dim) or None — previous window's Q for cross-window orthogonalization
+    SVD-truncates the filtered block to its effective rank before the
+    Galerkin step.  This prevents noise singular vectors from producing
+    spurious Ritz vectors that leak into neighboring windows.
 
     Returns
     -------
-    Xi : (k, dim) — Ritz pseudoband vectors (orthonormal)
-    theta : (k,) — Ritz eigenvalues
-    Q : (k, dim) — orthonormal basis (for next window's deflation)
+    Xi : (r, dim) — Ritz pseudoband vectors (r ≤ k, orthonormal)
+    theta : (r,) — Ritz eigenvalues
+    Q : (r, dim) — orthonormal basis (for next window's deflation)
+    r : effective rank
     """
+    k = Y_j.shape[0]
+
     # Deflate against deterministic manifold
     if Phi_det is not None and Phi_det.shape[0] > 0:
         overlap = jnp.einsum('nd,kd->nk', jnp.conj(Phi_det), Y_j)
         Y_j = Y_j - jnp.einsum('nk,nd->kd', overlap, Phi_det)
 
-    # Cross-window orthogonalization (§7)
+    # Cross-window orthogonalization
     if Q_prev is not None:
         overlap = jnp.einsum('pd,kd->pk', jnp.conj(Q_prev), Y_j)
         Y_j = Y_j - jnp.einsum('pk,pd->kd', overlap, Q_prev)
 
-    # Economy QR
-    Q, R = jnp.linalg.qr(Y_j.T)  # Q: (dim, k), R: (k, k)
-    Q = Q.T  # (k, dim) — orthonormal rows
+    # SVD to find effective rank
+    U, sigma, Vh = jnp.linalg.svd(Y_j, full_matrices=False)  # U: (k,k), sigma: (k,), Vh: (k,dim)
+    sigma_np = np.asarray(sigma)
+    r = int(np.sum(sigma_np > rank_tol * sigma_np[0]))
+    r = max(r, 1)  # at least 1
+
+    # Truncate to effective rank
+    Q = Vh[:r]  # (r, dim) — orthonormal rows from significant singular vectors
 
     # Galerkin matrix: H_proj = Q† H Q
-    HQ = apply_H(Q)  # (k, dim)
+    HQ = apply_H(Q)  # (r, dim)
     H_proj = jnp.einsum('kd,ld->kl', jnp.conj(Q), HQ)
-    H_proj = 0.5 * (H_proj + H_proj.conj().T)  # enforce Hermitian
+    H_proj = 0.5 * (H_proj + H_proj.conj().T)
 
-    # Diagonalize k×k matrix
+    # Diagonalize r×r matrix
     theta, S = jnp.linalg.eigh(H_proj)
 
     # Ritz vectors
-    Xi = jnp.einsum('kl,kd->ld', S.T, Q)  # (k, dim)
+    Xi = jnp.einsum('kl,kd->ld', S.T, Q)  # (r, dim)
 
-    return Xi, theta, Q
+    return Xi, theta, Q, r
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -326,47 +332,31 @@ def ritz_pseudobands(
     weight_list = []
     Q_prev = None
 
+    n_pseudo_total = 0
     for j in range(N_S):
         Y_j = jnp.asarray(Y_all[j], dtype=jnp.complex128)
-        Xi_j, theta_j, Q_j = _galerkin_ritz(apply_H_block, Y_j, Phi_det_j, Q_prev)
+        Xi_j, theta_j, Q_j, r_j = _galerkin_ritz(apply_H_block, Y_j, Phi_det_j, Q_prev)
 
-        Xi_list.append(np.asarray(Xi_j))     # unit-normalized Ritz vectors
-        theta_list.append(np.asarray(theta_j))
-        weight_list.append(np.full(k, np.sqrt(max(n_eff[j], 0.0) / k)))
+        Xi_np = np.asarray(Xi_j)[:r_j]
+        theta_np = np.asarray(theta_j)[:r_j]
+        # Weight per pseudoband: sqrt(n_eff / r_j) — distribute weight among
+        # the actual number of Ritz vectors, not the requested k
+        w_j = np.sqrt(max(n_eff[j], 0.0) / max(r_j, 1))
+
+        Xi_list.append(Xi_np * w_j)
+        theta_list.append(theta_np)
+        weight_list.append(np.full(r_j, w_j))
+        n_pseudo_total += r_j
 
         Q_prev = Q_j
 
         if verbose and (j < 3 or j == N_S - 1 or (j + 1) % 10 == 0):
-            print(f"    window {j+1}/{N_S}: n_eff={n_eff[j]:.1f}, "
-                  f"θ=[{float(theta_j[0]):.4f}, {float(theta_j[-1]):.4f}]")
+            print(f"    window {j+1}/{N_S}: n_eff={n_eff[j]:.1f}, rank={r_j}/{k}, "
+                  f"θ=[{theta_np[0]:.4f}, {theta_np[-1]:.4f}]")
 
-    # ── Global orthogonalization ──
-    # The CJ Jackson smoothing creates ~14% analytical overlap between adjacent
-    # windows, which amplifies to ~65% in Ritz vectors after Galerkin rotation.
-    # A global QR on the concatenated set guarantees mutual orthogonality.
+    # ── Output assembly ──
     if Xi_list:
-        Xi_cat = np.concatenate(Xi_list, axis=0)  # (N_S*k, dim)
-
-        # Also deflate against deterministic bands
-        if n_det > 0:
-            Phi_det_np = np.asarray(Phi_det)
-            overlap = Xi_cat @ Phi_det_np.conj().T  # (N_S*k, n_det)
-            Xi_cat = Xi_cat - overlap @ Phi_det_np
-
-        # Global economy QR
-        Q_global, R_global = np.linalg.qr(Xi_cat.T, mode='reduced')  # Q: (dim, N_S*k)
-        Xi_cat = Q_global.T  # (N_S*k, dim) — orthonormal rows
-
-        if verbose:
-            print(f"  Global orthogonalization: {Xi_cat.shape[0]} vectors")
-
-        # Split back into per-window blocks and apply weights
-        Phi_pseudo_list = []
-        for j in range(N_S):
-            i0, i1 = j * k, (j + 1) * k
-            Phi_pseudo_list.append(Xi_cat[i0:i1] * weight_list[j][:, None])
-
-        Phi_pseudo = np.concatenate(Phi_pseudo_list, axis=0)
+        Phi_pseudo = np.concatenate(Xi_list, axis=0)
         E_pseudo = np.concatenate(theta_list)
         w_pseudo = np.concatenate(weight_list)
     else:
@@ -380,11 +370,11 @@ def ritz_pseudobands(
 
     if verbose:
         total_eff = float(np.sum(n_eff))
-        print(f"  Total: {n_det} det + {N_S * k} pseudo = {Phi_out.shape[0]} bands "
+        print(f"  Total: {n_det} det + {n_pseudo_total} pseudo = {Phi_out.shape[0]} bands "
               f"(Σ n_eff = {total_eff:.1f})")
 
     return PseudobandsResult(
         Phi_out=Phi_out, E_out=E_out, weights=weights,
-        n_det=n_det, n_pseudo=N_S * k, n_windows=N_S,
+        n_det=n_det, n_pseudo=n_pseudo_total, n_windows=N_S,
         dos=dos, windows=win_part,
     )
