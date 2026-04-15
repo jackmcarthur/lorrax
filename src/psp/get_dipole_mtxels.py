@@ -63,6 +63,10 @@ def compute_vnl_matrix_from_setup(
 		compute_dZ=False,
 	)
 	psi_G = gather_psi_G_from_crys(wfn_k, Gk_crys)
+	# Slice to physical spinor components for bispinor wavefunctions
+	nspinor_E = kdata.E_super.shape[0]
+	if psi_G.shape[1] > nspinor_E:
+		psi_G = psi_G[:, :nspinor_E, :]
 	return vnl_ops.vnl_matrix(psi_G, kdata.Z, kdata.E_super)
 
 
@@ -80,6 +84,10 @@ def compute_vnl_velocity_cart(
 		compute_dZ=True,
 	)
 	psi_G = gather_psi_G_from_crys(wfn_k, Gk_crys)
+	# Slice to physical spinor components for bispinor wavefunctions
+	nspinor_E = kdata.E_super.shape[0]
+	if psi_G.shape[1] > nspinor_E:
+		psi_G = psi_G[:, :nspinor_E, :]
 	return vnl_ops.vnl_velocity_matrix(psi_G, kdata.Z, kdata.dZ, kdata.E_super)
 
 
@@ -185,6 +193,14 @@ def main(argv=None):
 
 	print("\nScanning for pseudopotential files...")
 	pseudos = load_pseudopotentials(str(input_path.parent))
+	if not pseudos:
+		# Also try the QE subdirectory (common sandbox layout)
+		for fallback in [str(input_path.parent / '..' / 'qe' / 'scf'),
+						 str(input_path.parent / '..' / 'qe' / 'nscf')]:
+			pseudos = load_pseudopotentials(fallback)
+			if pseudos:
+				print(f"Found pseudopotentials in {fallback}")
+				break
 
 	# Structure summary (reuse DFT helper)
 	print_atomic_structure(wfn, pseudos)
@@ -201,7 +217,7 @@ def main(argv=None):
 		sym,
 		meta,
 		pseudos,
-		nspinor=int(meta.nspinor),
+		nspinor=int(wfn.nspinor),
 	)
 
 	# Reshard wavefunctions over mesh

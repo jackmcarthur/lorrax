@@ -176,7 +176,7 @@ def main(argv=None):
             sym,
             meta,
             pseudos,
-            nspinor=int(meta.nspinor),
+            nspinor=int(wfn.nspinor),
         )
 
     # ---- compute kin+ion per k-point ----

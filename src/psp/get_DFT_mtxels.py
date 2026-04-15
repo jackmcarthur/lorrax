@@ -491,9 +491,9 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valr
         sym,
         meta,
         pseudos,
-        nspinor=int(meta.nspinor),
+        nspinor=int(wfn.nspinor),
     )
-    
+
     # 3. Compute valence charge density from occupied states
     V_H_r = None
     rho_valence = None
@@ -672,7 +672,7 @@ def get_kin_ion(
             sym,
             meta,
             pseudos,
-            nspinor=int(meta.nspinor),
+            nspinor=int(wfn.nspinor),
         )
 
     # Build V_loc on 2x grid once

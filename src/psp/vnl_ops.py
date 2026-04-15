@@ -208,7 +208,8 @@ def build_vnl_setup(
     row_beta_idx_j = jnp.asarray(row_beta_idx, dtype=jnp.int32)
     row_l_j = jnp.asarray(row_l, dtype=jnp.int32)
     row_m_j = jnp.asarray(row_m, dtype=jnp.int32)
-    row_tau_j = jnp.asarray(np.array(row_tau), dtype=jnp.float64)
+    row_tau_np = np.array(row_tau, dtype=np.float64).reshape(-1, 3) if row_tau else np.zeros((0, 3), dtype=np.float64)
+    row_tau_j = jnp.asarray(row_tau_np, dtype=jnp.float64)
 
     # ── Pre-build E_super (k-independent block-diagonal D-matrix) ──
     E_super = np.zeros((nspinor, nspinor, total_R, total_R), dtype=np.complex128)

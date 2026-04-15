@@ -388,6 +388,11 @@ def vnl_matrix_from_kdata(psi_box, Gk_crys, kdata, mask=None):
     import psp.vnl_ops as vnl_ops
 
     psi_G = gather_psi_G_from_crys(psi_box, Gk_crys, mask)
+    # Slice to physical spinor components if bispinor wavefunctions have
+    # more spinor components than the E_super block-diagonal (e.g. 4 vs 2).
+    nspinor_E = kdata.E_super.shape[0]
+    if psi_G.shape[1] > nspinor_E:
+        psi_G = psi_G[:, :nspinor_E, :]
     return vnl_ops.vnl_matrix(psi_G, kdata.Z, kdata.E_super)
 
 
@@ -398,6 +403,11 @@ def vnl_velocity_from_kdata(psi_box, Gk_crys, kdata, mask=None):
     if kdata.dZ is None:
         raise ValueError("kdata.dZ is required for vnl_velocity_from_kdata")
     psi_G = gather_psi_G_from_crys(psi_box, Gk_crys, mask)
+    # Slice to physical spinor components if bispinor wavefunctions have
+    # more spinor components than the E_super block-diagonal (e.g. 4 vs 2).
+    nspinor_E = kdata.E_super.shape[0]
+    if psi_G.shape[1] > nspinor_E:
+        psi_G = psi_G[:, :nspinor_E, :]
     return vnl_ops.vnl_velocity_matrix(psi_G, kdata.Z, kdata.dZ, kdata.E_super)
 
 
