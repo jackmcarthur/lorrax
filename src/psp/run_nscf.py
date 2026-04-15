@@ -106,6 +106,31 @@ def _setup_kgrid(crystal, kgrid, nosym, kpoints_override, weights_override, verb
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  Pseudobands helpers
+# ═══════════════════════════════════════════════════════════════════════
+
+def _make_flat_matvec(apply_H_batched, nspinor, ngkmax):
+    """Wrap batched (batch, nspinor, dim) matvec → flat (nspinor*dim,) → same."""
+    def apply_H_flat(x):
+        return apply_H_batched(x.reshape(1, nspinor, ngkmax)).reshape(-1)
+    return apply_H_flat
+
+
+def _write_pb_k(writer, ik, pb_result, H_k, gvecs_qe, nspinor, ngkmax):
+    """Write one k-point's pseudobands to WFN.h5.
+
+    Reshapes flat (n_total, nspinor*ngkmax) → (n_total, nspinor, ngkmax),
+    reorders to QE G-vector convention, and writes eigenvalues + coefficients.
+    """
+    n_total = pb_result.Phi_out.shape[0]
+    # Reshape flat → (n_total, nspinor, ngkmax)
+    evecs_3d = pb_result.Phi_out.reshape(n_total, nspinor, ngkmax)
+    # Reorder G-vectors from |k+G|²-sorted (Davidson) to QE master order
+    coeffs_qe = reorder_to_qe(evecs_3d, H_k, gvecs_qe)
+    writer.write_k(ik, pb_result.E_out, coeffs_qe)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  Main driver
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -287,45 +312,59 @@ def run_nscf(
                   f"{pb_n_windows} windows) ──")
 
         pb_output = os.path.splitext(output_path)[0] + "_pseudobands.h5"
+        dim_flat = nspinor * ngkmax
         t_pb = time.perf_counter()
 
-        for ik in range(nk):
+        # Run k=0 first to determine total band count
+        H_k0 = setup_H_k_from_kvec(kpoints[0], V_scf, vnl_setup, crystal, None,
+                                     V_loc_r=V_loc, ngkmax=ngkmax)
+        apply_H0_flat = _make_flat_matvec(make_apply_H(H_k0), nspinor, ngkmax)
+        Phi_det_0 = all_evecs[0].reshape(nbnd, -1)
+        E_det_0 = eigenvalues[0, :nbnd] if eigenvalues.ndim == 2 else eigenvalues[:nbnd]
+
+        pb0 = ritz_pseudobands(
+            apply_H0_flat, dim=dim_flat,
+            Phi_det=Phi_det_0, E_det=E_det_0, E_fermi=0.0,
+            k=pb_k, M_max=pb_M_max, F=pb_F,
+            n_windows_target=pb_n_windows,
+            verbose=verbose, seed=0)
+
+        n_total = pb0.Phi_out.shape[0]
+        if verbose:
+            print(f"  Total bands per k: {pb0.n_det} det + {pb0.n_pseudo} pseudo = {n_total}")
+
+        # Open WFN_pseudobands.h5 with the total band count
+        pb_writer = WFNWriter(pb_output, crystal, kpoints, weights, kgrid, n_total,
+                               gvecs_per_k, nosym=nosym)
+
+        # Write k=0 (already computed)
+        _write_pb_k(pb_writer, 0, pb0, H_k0, gvecs_per_k[0], nspinor, ngkmax)
+
+        # Remaining k-points
+        for ik in range(1, nk):
             tk = time.perf_counter()
             H_k = setup_H_k_from_kvec(kpoints[ik], V_scf, vnl_setup, crystal, None,
                                         V_loc_r=V_loc, ngkmax=ngkmax)
-            apply_H = make_apply_H(H_k)
+            apply_H_flat = _make_flat_matvec(make_apply_H(H_k), nspinor, ngkmax)
+            Phi_det_k = all_evecs[ik].reshape(nbnd, -1)
+            E_det_k = eigenvalues[ik, :nbnd] if eigenvalues.ndim == 2 else eigenvalues[:nbnd]
 
-            # Flatten apply_H for pseudobands: (dim,) → (dim,) not (batch, nch, dim)
-            def apply_H_flat(x):
-                # Reshape flat → (1, nspinor, ngkmax), apply, flatten back
-                x_3d = x.reshape(1, nspinor, ngkmax)
-                return apply_H(x_3d).reshape(-1)
-
-            dim_flat = nspinor * ngkmax
-            Phi_det = all_evecs[ik].reshape(nbnd, -1)  # (nbnd, nspinor*ngkmax)
-            E_det = eigenvalues[ik, :nbnd] if eigenvalues.ndim == 2 else eigenvalues[:nbnd]
-
-            pb_result = ritz_pseudobands(
+            pb_k = ritz_pseudobands(
                 apply_H_flat, dim=dim_flat,
-                Phi_det=Phi_det, E_det=E_det,
-                E_fermi=0.0,
+                Phi_det=Phi_det_k, E_det=E_det_k, E_fermi=0.0,
                 k=pb_k, M_max=pb_M_max, F=pb_F,
                 n_windows_target=pb_n_windows,
-                verbose=(verbose and ik == 0),
-                seed=ik,
-            )
+                dos_result=pb0.dos,  # reuse KPM DOS from k=0
+                verbose=False, seed=ik)
 
-            if verbose and (ik < 2 or ik == nk - 1):
-                print(f"  k={ik:3d}/{nk}: {pb_result.n_det} det + {pb_result.n_pseudo} pseudo "
-                      f"= {pb_result.Phi_out.shape[0]} bands, "
-                      f"{time.perf_counter()-tk:.1f}s")
+            _write_pb_k(pb_writer, ik, pb_k, H_k, gvecs_per_k[ik], nspinor, ngkmax)
 
-            # TODO: write pseudobands to WFN_pseudobands.h5
-            # Need to extend WFNWriter to handle variable band counts per k
-            # and non-unit-normalized coefficients.
+            if verbose and (ik < 3 or ik == nk - 1 or (ik + 1) % 16 == 0):
+                print(f"  k={ik:3d}/{nk}: {time.perf_counter()-tk:.1f}s")
 
+        pb_writer.close()
         if verbose:
-            print(f"  Pseudobands: {time.perf_counter()-t_pb:.1f}s total")
+            print(f"  Pseudobands: {time.perf_counter()-t_pb:.1f}s → {pb_output}")
 
     if verbose:
         print(f"\nTotal NSCF: {time.perf_counter()-t_start:.1f}s")
