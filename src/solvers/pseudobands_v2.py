@@ -666,6 +666,10 @@ def ritz_pseudobands_v2(
                 b_hi_r * dos.half_width + dos.center,
                 dos.center, dos.half_width, M_max)
 
+            # n_eff from DOS integral over the CJ window indicator
+            n_eff_j = float(np.trapezoid(w_E * np.maximum(dos.rho, 0), dos.E_grid)) * dim
+
+            # Try Gauss quadrature from shifted moments
             e_mid = 0.5 * (e_lo + e_hi)
             e_span = max(e_hi - e_lo, 1e-6)
             moments = _compute_window_moments(
@@ -673,11 +677,16 @@ def ritz_pseudobands_v2(
                 E_shift=e_mid, E_scale=e_span)
             moments *= dim
             nodes, gauss_w = _gauss_from_moments(moments, k)
-            nodes = nodes * e_span + e_mid  # unshift
-            bad = np.isnan(nodes) | np.isnan(gauss_w)
+            nodes = nodes * e_span + e_mid
+
+            # Validate: all nodes must be within [e_lo - margin, e_hi + margin]
+            margin = 0.2 * e_span
+            bad = (np.isnan(nodes) | np.isnan(gauss_w)
+                   | (nodes < e_lo - margin) | (nodes > e_hi + margin))
             if np.any(bad):
-                nodes[bad] = e_mid
-                gauss_w[bad] = 0.0
+                # Gauss failed — fall back to Ritz eigenvalues + uniform weight
+                nodes = np.sort(np.real(theta_ritz))
+                gauss_w = np.full(k, n_eff_j / k)
             mode = "CJ"
 
         # Sort Ritz and Gauss ascending, pair by order
