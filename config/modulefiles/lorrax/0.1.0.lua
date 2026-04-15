@@ -24,6 +24,10 @@ Examples:
   lxrun python3 -u -m gw.gw_jax -i cohsex.in           # 4-GPU GW
   LORRAX_NGPU=1 lxrun python3 -u -m gw.gw_jax -i ...   # 1-GPU GW
   lxpre cohsex.in 640                                   # all preprocessing
+
+NOTE: Always use lxrun to run LORRAX code on Perlmutter. Do NOT use bare
+"python" or "python3" — the module configures a Shifter container, not the
+host Python. For local development without Shifter, use "uv run" instead.
 ]])
 
 whatis("Name:        LORRAX")
@@ -46,6 +50,7 @@ end
 
 local lorrax_src  = pathJoin(lorrax_root, "src")
 local lorrax_site = "@LORRAX_SITE@"   -- patched by install.sh
+local lorrax_deps = "@LORRAX_DEPS@"   -- patched by install.sh (extra PYTHONPATH entries)
 local image       = "@LORRAX_IMAGE@"  -- patched by install.sh
 
 -- =========================================================================
@@ -68,11 +73,17 @@ setenv("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 --  Shifter base command (assembled once, reused by shell functions)
 -- =========================================================================
 
+-- Build PYTHONPATH: lorrax src + site-packages + optional extra deps
+local pypath = lorrax_src .. ":" .. lorrax_site
+if lorrax_deps ~= "" then
+    pypath = pypath .. ":" .. lorrax_deps
+end
+
 local shifter_base = table.concat({
     "shifter",
     "--module=gpu",
     "--image=" .. image,
-    "--env=PYTHONPATH=" .. lorrax_src .. ":" .. lorrax_site,
+    "--env=PYTHONPATH=" .. pypath,
     "--env=HDF5_USE_FILE_LOCKING=FALSE",
     "--env=XLA_PYTHON_CLIENT_MEM_FRACTION=0.95",
     "--env=TF_GPU_ALLOCATOR=cuda_malloc_async",

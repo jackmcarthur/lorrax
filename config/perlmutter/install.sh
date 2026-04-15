@@ -54,6 +54,7 @@ fi
 
 MODULEFILE_DIR="${LORRAX_MODULEFILE_DIR:-$HOME/modulefiles}"
 IMAGE="${LORRAX_IMAGE:-nvcr.io/nvidia/jax:25.04-py3}"
+DEPS="${LORRAX_DEPS:-}"
 
 # --- Install modulefile ---
 SRC_MODULE="$CONFIG_DIR/modulefiles/lorrax/0.1.0.lua"
@@ -70,11 +71,13 @@ echo "  Target:  $DST_MODULE"
 sed \
     -e "s|@LORRAX_ROOT@|$LORRAX_INSTALL_ROOT|g" \
     -e "s|@LORRAX_SITE@|$LORRAX_SITE_PACKAGES|g" \
+    -e "s|@LORRAX_DEPS@|$DEPS|g" \
     -e "s|@LORRAX_IMAGE@|$IMAGE|g" \
     "$SRC_MODULE" > "$DST_MODULE"
 
 echo "  Patched: LORRAX_ROOT  = $LORRAX_INSTALL_ROOT"
 echo "  Patched: LORRAX_SITE  = $LORRAX_SITE_PACKAGES"
+echo "  Patched: LORRAX_DEPS  = ${DEPS:-(none)}"
 echo "  Patched: LORRAX_IMAGE = $IMAGE"
 
 # --- Add module use to bashrc ---

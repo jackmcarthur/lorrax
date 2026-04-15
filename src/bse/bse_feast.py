@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from solvers.quadrature import feast_ellipse_quadrature as _feast_ellipse_quadrature_generic
 from .bse_ring_comm import build_bse_ring_matvec, build_bse_ring_matvec_full, make_bse_shardings
 from .bse_preconditioner import energy_diff_cv_k
 import common.timing as timing
@@ -966,21 +967,10 @@ def feast_ellipse_quadrature(
     n_quad: int,
     gamma: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    a = window.a_eV
-    b = window.b_eV
-    c = 0.5 * (a + b)
-    r_x = 0.5 * (b - a)
-    r_y = gamma * r_x
-
-    thetas = np.array([
-        math.pi * (2 * j - 1) / (2 * n_quad) for j in range(1, n_quad + 1)
-    ])
-
-    z = c + r_x * np.cos(thetas) + 1j * r_y * np.sin(thetas)
-    # Upper-half contour weights include the 1/(2πi) factor and Δθ=π/n_quad:
-    # w_j = (1/(2 n_quad i)) dz/dθ = (1/(2 n_quad)) (r_y cosθ + i r_x sinθ)
-    w = (1.0 / (2.0 * n_quad)) * (r_y * np.cos(thetas) + 1j * r_x * np.sin(thetas))
-    return z.astype(np.complex128), w.astype(np.complex128)
+    """BSE-facing wrapper: converts WindowSpec to (center, half_width)."""
+    center = 0.5 * (window.a_eV + window.b_eV)
+    half_width = 0.5 * (window.b_eV - window.a_eV)
+    return _feast_ellipse_quadrature_generic(center, half_width, n_quad, gamma)
 
 
 def _format_complex_eV(z: complex) -> str:

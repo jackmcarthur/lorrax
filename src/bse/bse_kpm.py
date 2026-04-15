@@ -3,6 +3,10 @@
 Computes Chebyshev moments of the BSE Hamiltonian using stochastic
 trace estimation, applies Jackson damping, and reconstructs the DOS.
 
+The generic Chebyshev algorithms live in solvers.chebyshev.  This module
+builds BSE-specific matvecs and random vector generators, then delegates
+to the solver.
+
 Usage:
     python -m bse.bse_kpm -i cohsex.inp --n-val 4 --n-cond 4 --n-moments 200
 """
@@ -14,6 +18,12 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
 
+from solvers.chebyshev import (
+    jackson_coefficients,
+    chebyshev_moments,
+    reconstruct_dos,
+    partition_windows,
+)
 from .bse_ring_comm import build_bse_ring_matvec, build_bse_ring_matvec_full, make_bse_shardings
 from .bse_feast import estimate_spectral_bounds_sharded, _create_mesh_xy, _build_gmres_data_fp32
 from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
@@ -24,57 +34,12 @@ jax.config.update("jax_enable_x64", True)
 RY_TO_EV = 13.6056980659
 
 
-def jackson_coefficients(M: int) -> np.ndarray:
-    """Jackson damping coefficients sigma_p^{(J)} for p = 0, ..., M."""
-    p = np.arange(M + 1)
-    sigma = (
-        (M - p + 1) * np.cos(np.pi * p / (M + 1))
-        + np.sin(np.pi * p / (M + 1)) / np.tan(np.pi / (M + 1))
-    ) / (M + 1)
-    return sigma
+def make_bse_h_tilde(matvec, data, e_center, half_width):
+    """Return a @jax.jit'd rescaled BSE matvec: H_tilde x = (Hx - center*x) / half_width.
 
-
-def chebyshev_moments(
-    matvec,
-    data: dict,
-    e_center: float,
-    half_width: float,
-    n_moments: int,
-    n_random: int,
-    seed: int = 0,
-    use_tda: bool = True,
-) -> np.ndarray:
-    """Compute Chebyshev moments mu_0, ..., mu_M via stochastic trace.
-
-    Parameters
-    ----------
-    matvec : callable
-        Sharded BSE ring matvec.
-    data : dict
-        BSE data dict with W_R already computed.
-    e_center, half_width : float
-        Rescaling parameters (Rydbergs): H_tilde = (H - e_center) / half_width.
-    n_moments : int
-        Number of Chebyshev moments M (computes mu_0 through mu_M).
-    n_random : int
-        Number of stochastic random vectors R.
-    seed : int
-        Random seed.
-
-    Returns
-    -------
-    mu : ndarray of shape (n_moments + 1,)
-        Raw (undamped) Chebyshev moments.
+    Binds BSE arrays from *data* into the closure so the returned callable
+    has signature (x,) -> H_tilde x with no dict access at call time.
     """
-    nk = int(data["nkx"] * data["nky"] * data["nkz"])
-    n_cond = int(data["n_cond"])
-    n_val = int(data["n_val"])
-    n_cond_pad = int(data["n_cond_pad"])
-    n_val_pad = int(data["n_val_pad"])
-    bse_dim = n_cond * n_val * nk
-    if not use_tda:
-        bse_dim *= 2
-
     psi_c_X = data["psi_c_X"]
     psi_c_Y = data["psi_c_Y"]
     psi_v_X = data["psi_v_X"]
@@ -84,205 +49,53 @@ def chebyshev_moments(
     W_R = data["W_R"]
     V_q0 = data["V_q0"]
 
-    dtype_real = data["eps_c"].dtype
-    dtype_cplx = jnp.complex64 if dtype_real == jnp.float32 else jnp.complex128
+    dtype_real = eps_c.dtype
     e_center_jnp = jnp.asarray(e_center, dtype=dtype_real)
     inv_hw = jnp.asarray(1.0 / half_width, dtype=dtype_real)
 
     @jax.jit
     def apply_h_tilde(x):
-        hx = matvec(
-            x, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-            eps_c, eps_v, W_R, V_q0,
-        )
+        hx = matvec(x, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0)
         return (hx - e_center_jnp * x) * inv_hw
 
-    key = jax.random.PRNGKey(seed)
-    mu = np.zeros(n_moments + 1)
+    return apply_h_tilde
 
-    # Mask: only put random entries in physical (non-padded) bands.
-    # Padded bands have psi=0 and eps=0, so H maps them to
-    # -e_center/hw * x which is OUTSIDE [-1,1] for BSE spectra.
-    # Masking keeps the recurrence stable.
+
+def make_bse_random_vector(data, use_tda):
+    """Return a callable (key,) -> x_random that generates masked Rademacher vectors.
+
+    Resolves TDA/non-TDA branching at factory time so the returned function
+    has no Python-level conditionals (clean for tracing).
+    """
+    nk = int(data["nkx"] * data["nky"] * data["nkz"])
+    n_cond = int(data["n_cond"])
+    n_val = int(data["n_val"])
+    n_cond_pad = int(data["n_cond_pad"])
+    n_val_pad = int(data["n_val_pad"])
+
+    dtype_real = data["eps_c"].dtype
+    dtype_cplx = jnp.complex64 if dtype_real == jnp.float32 else jnp.complex128
+
     mask = jnp.zeros((1, n_cond_pad, n_val_pad, nk), dtype=dtype_real)
     mask = mask.at[:, :n_cond, :n_val, :].set(1.0)
-    if not use_tda:
-        mask = jnp.stack([mask, mask], axis=0)
 
-    for r in range(n_random):
-        print(f"  Random vector {r + 1}/{n_random}...")
-        key, subkey = jax.random.split(key)
+    shape_1 = (1, n_cond_pad, n_val_pad, nk)
 
-        # Rademacher +/-1 random vector (real).
-        two = jnp.asarray(2.0, dtype=dtype_real)
-        one = jnp.asarray(1.0, dtype=dtype_real)
-        if use_tda:
-            x_rand = (
-                two * jax.random.bernoulli(
-                    subkey, shape=(1, n_cond_pad, n_val_pad, nk),
-                ).astype(dtype_real) - one
-            )
-            x_rand = (x_rand * mask).astype(dtype_cplx)
-        else:
-            subkey_x, subkey_y = jax.random.split(subkey)
-            x0 = (
-                two * jax.random.bernoulli(
-                    subkey_x, shape=(1, n_cond_pad, n_val_pad, nk),
-                ).astype(dtype_real) - one
-            )
-            x1 = (
-                two * jax.random.bernoulli(
-                    subkey_y, shape=(1, n_cond_pad, n_val_pad, nk),
-                ).astype(dtype_real) - one
-            )
-            x_rand = jnp.stack([x0, x1], axis=0)
-            x_rand = (x_rand * mask).astype(dtype_cplx)
+    if use_tda:
+        def fn(key):
+            x = 2.0 * jax.random.bernoulli(key, shape=shape_1).astype(dtype_real) - 1.0
+            return (x * mask).astype(dtype_cplx)
+    else:
+        mask_full = jnp.stack([mask, mask], axis=0)
 
-        t_prev = x_rand                     # t_0 = X
-        t_curr = apply_h_tilde(x_rand)      # t_1 = H_tilde X
+        def fn(key):
+            k_x, k_y = jax.random.split(key)
+            x0 = 2.0 * jax.random.bernoulli(k_x, shape=shape_1).astype(dtype_real) - 1.0
+            x1 = 2.0 * jax.random.bernoulli(k_y, shape=shape_1).astype(dtype_real) - 1.0
+            x = jnp.stack([x0, x1], axis=0)
+            return (x * mask_full).astype(dtype_cplx)
 
-        mu[0] += float(jax.device_get(jnp.vdot(x_rand, t_prev).real))
-        mu[1] += float(jax.device_get(jnp.vdot(x_rand, t_curr).real))
-
-        two = jnp.asarray(2.0, dtype=dtype_real)
-        for p in range(2, n_moments + 1):
-            t_new = two * apply_h_tilde(t_curr) - t_prev
-            mu[p] += float(jax.device_get(jnp.vdot(x_rand, t_new).real))
-            t_prev = t_curr
-            t_curr = t_new
-
-            if p % 50 == 0:
-                print(f"    moment {p}/{n_moments}")
-
-    mu /= n_random * bse_dim
-    return mu
-
-
-def reconstruct_dos(
-    mu: np.ndarray,
-    E_grid_eV: np.ndarray,
-    e_center_eV: float,
-    half_width_eV: float,
-) -> np.ndarray:
-    """Reconstruct DOS on a physical energy grid.
-
-    Uses the correct normalization:
-        rho(E) = [mu_0 + 2 sum_{p=1}^M mu_p T_p(e)] / (pi * hw * sqrt(1 - e^2))
-    where e = (E - e_center) / hw.  Integrates to 1 over the spectrum.
-
-    Parameters
-    ----------
-    mu : ndarray
-        (Jackson-damped) Chebyshev moments, length M+1.
-    E_grid_eV : ndarray
-        Energy grid in eV.
-    e_center_eV, half_width_eV : float
-        Rescaling center and half-width in eV.
-
-    Returns
-    -------
-    rho : ndarray
-        DOS in units of states/eV.
-    """
-    E_tilde = (E_grid_eV - e_center_eV) / half_width_eV
-    E_tilde = np.clip(E_tilde, -1 + 1e-10, 1 - 1e-10)
-
-    M = len(mu) - 1
-
-    # Chebyshev sum via recurrence on scalars.
-    T_prev = np.ones_like(E_tilde)   # T_0(e) = 1
-    T_curr = E_tilde.copy()          # T_1(e) = e
-
-    cheb_sum = mu[0] * T_prev + 2.0 * mu[1] * T_curr
-
-    for p in range(2, M + 1):
-        T_new = 2.0 * E_tilde * T_curr - T_prev
-        cheb_sum += 2.0 * mu[p] * T_new
-        T_prev = T_curr
-        T_curr = T_new
-
-    rho = cheb_sum / (np.pi * half_width_eV * np.sqrt(1 - E_tilde**2))
-    return rho
-
-
-def partition_windows_equal_b_over_omega(
-    omega_grid_eV: np.ndarray,
-    b_omega_eV: np.ndarray,
-    n_windows: int,
-    ry_to_ev: float = RY_TO_EV,
-    omega_min_eV: float | None = None,
-    omega_max_eV: float | None = None,
-    omega_floor_ry: float | None = None,
-) -> np.ndarray:
-    """Partition the spectrum into equal-mass windows of ∫ B(Ω)/Ω dΩ.
-
-    Parameters
-    ----------
-    omega_grid_eV : ndarray
-        Energy grid in eV (monotone or unordered).
-    b_omega_eV : ndarray
-        B(Ω) on the grid, in units per eV (e.g., DOS from KPM).
-    n_windows : int
-        Number of windows to create.
-    ry_to_ev : float
-        Conversion factor (1 Ry = ry_to_ev eV).
-    omega_min_eV, omega_max_eV : float | None
-        Optional bounds on the grid used for partitioning.
-    omega_floor_ry : float
-        Floor to avoid division by zero in B(Ω)/Ω, in Ry.
-
-    Returns
-    -------
-    windows_ry : ndarray of shape (n_windows, 2)
-        Window bounds [Ω_min, Ω_max] in Rydberg.
-    """
-    if n_windows < 1:
-        raise ValueError("n_windows must be >= 1")
-
-    omega_grid_eV = np.asarray(omega_grid_eV, dtype=float)
-    b_omega_eV = np.asarray(b_omega_eV, dtype=float)
-    if omega_grid_eV.shape != b_omega_eV.shape:
-        raise ValueError("omega_grid_eV and b_omega_eV must have the same shape")
-
-    mask = np.ones_like(omega_grid_eV, dtype=bool)
-    if omega_min_eV is not None:
-        mask &= omega_grid_eV >= omega_min_eV
-    if omega_max_eV is not None:
-        mask &= omega_grid_eV <= omega_max_eV
-    omega_grid_eV = omega_grid_eV[mask]
-    b_omega_eV = b_omega_eV[mask]
-    if omega_grid_eV.size < 2:
-        raise ValueError("energy grid must contain at least two points after masking")
-
-    order = np.argsort(omega_grid_eV)
-    omega_grid_eV = omega_grid_eV[order]
-    b_omega_eV = b_omega_eV[order]
-
-    omega_grid_ry = omega_grid_eV / ry_to_ev
-    b_omega_ry = b_omega_eV * ry_to_ev
-    b_omega_ry = np.maximum(b_omega_ry, 0.0)
-
-    if omega_floor_ry is None:
-        positive = omega_grid_ry[omega_grid_ry > 0]
-        if positive.size > 0:
-            omega_floor_ry = 0.5 * float(np.min(positive))
-        else:
-            omega_floor_ry = 1e-8
-    omega_safe = np.maximum(omega_grid_ry, omega_floor_ry)
-    # integrand = b_omega_ry / omega_safe  # B(Ω)/Ω weighting
-    integrand = b_omega_ry  # equal-state windows (no 1/Ω)
-
-    d_omega = np.diff(omega_grid_ry)
-    avg = 0.5 * (integrand[1:] + integrand[:-1])
-    cdf = np.concatenate(([0.0], np.cumsum(avg * d_omega)))
-    total = cdf[-1]
-    if total <= 0.0:
-        raise ValueError("non-positive total integral for B(Ω)/Ω; check inputs")
-
-    targets = np.linspace(0.0, total, n_windows + 1)
-    edges = np.interp(targets, cdf, omega_grid_ry)
-
-    return np.column_stack((edges[:-1], edges[1:]))
+    return fn
 
 
 def run_kpm_dos(
@@ -385,14 +198,29 @@ def run_kpm_dos(
     print(f"  Center = {e_center:.6f} Ry = {e_center * ry_to_ev:.3f} eV")
     print(f"  Half-width = {half_width:.6f} Ry = {half_width * ry_to_ev:.3f} eV")
 
-    # --- Chebyshev moments ---
+    # --- Build BSE-specific callables ---
+    apply_h_tilde = make_bse_h_tilde(matvec, data_fp32, e_center, half_width)
+    random_vector_fn = make_bse_random_vector(data_fp32, use_tda)
+
+    nk = int(data["nkx"] * data["nky"] * data["nkz"])
+    n_cond = int(data["n_cond"])
+    n_val = int(data["n_val"])
+    bse_dim = n_cond * n_val * nk
+    if not use_tda:
+        bse_dim *= 2
+
+    # --- Chebyshev moments (generic solver) ---
     print(f"\nComputing {n_moments} Chebyshev moments with {n_random} random vectors...")
     print(f"  Total matvecs: {n_random * n_moments}")
     with timing.section("kpm.moments"):
         mu = chebyshev_moments(
-            matvec, data_fp32, e_center, half_width,
-            n_moments, n_random, seed,
-            use_tda=use_tda,
+            apply_h_tilde,
+            bse_dim,
+            n_moments,
+            n_random,
+            seed=seed,
+            dtype_real=data_fp32["eps_c"].dtype,
+            make_random_vector=random_vector_fn,
         )
 
     print(f"\n  mu_0 = {mu[0]:.6f}  (should be ~1.0)")
@@ -420,19 +248,12 @@ def run_kpm_dos(
         omega_min_eV = E_grid[1] if E_grid[0] <= 0.0 else E_grid[0]
         omega_min_eV = max(float(omega_min_eV), float(e_min_ry * ry_to_ev))
     else:
-        # For non-TDA, the spectrum is symmetric (±Ω pairs).  We only window
-        # the positive half.  Cap 1/Ω at 1/(1 eV) so the sub-1eV region has
-        # flat weight, preventing Gibbs ringing near ω=0 from creating
-        # pathologically narrow first windows.
-        omega_min_eV = 0.01  # small positive cutoff
-    omega_floor_ry = None
-    if not use_tda:
-        omega_floor_ry = 1.0 / ry_to_ev  # cap 1/Ω at 1/(1 eV)
-        print(f"  non-TDA: 1/Ω capped at 1/(1 eV) = {1.0/ry_to_ev:.6f} Ry")
-    windows_ry = partition_windows_equal_b_over_omega(
-        E_grid, rho, n_windows=n_windows, ry_to_ev=ry_to_ev,
-        omega_min_eV=omega_min_eV, omega_floor_ry=omega_floor_ry,
-    )
+        omega_min_eV = 0.01
+
+    windows_ry = partition_windows(
+        E_grid, rho, n_windows=n_windows,
+        energy_min=omega_min_eV,
+    ) / ry_to_ev
     window_edges_eV = windows_ry.ravel() * ry_to_ev
 
     if emit_outputs:

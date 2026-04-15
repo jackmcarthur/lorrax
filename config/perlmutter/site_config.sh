@@ -22,6 +22,13 @@ LORRAX_INSTALL_ROOT=""
 #
 LORRAX_SITE_PACKAGES="$HOME/scratchperl/.isdf/isdf_venvs/isdf_site"
 
+# Extra PYTHONPATH entries for the Shifter container (colon-separated).
+# Use this for dependencies that live outside of LORRAX src/ and site-packages.
+# Example: jax_xc_local lives at <sandbox>/sources/jax_xc_local/ (a symlink),
+# so we add <sandbox>/sources/ to make `import jax_xc_local` work.
+# Leave empty if no extra deps are needed.
+LORRAX_DEPS="/pscratch/sd/j/jackm/lorrax_sandbox/sources"
+
 # Shifter container image (NVIDIA JAX with CUDA 12, Python 3.12)
 LORRAX_IMAGE="nvcr.io/nvidia/jax:25.04-py3"
 
