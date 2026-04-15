@@ -231,23 +231,40 @@ def _compute_window_moments(
     rho: np.ndarray,
     w_j: np.ndarray,
     n_moments: int,
+    E_shift: float = 0.0,
+    E_scale: float = 1.0,
 ) -> np.ndarray:
-    """Compute power moments m_n = ∫ E^n w_j(E) ρ(E) dE on the grid."""
-    integrand_base = w_j * np.maximum(rho, 0.0)
+    """Compute power moments m_n = ∫ x^n w_j(E) ρ(E) dE where x = (E - shift)/scale.
+
+    Clips to the window support (|w_j| > 1e-6) to avoid pollution from
+    high-order monomials far outside the window.
+    """
+    # Restrict to window support
+    support = np.abs(w_j) > 1e-6
+    if not np.any(support):
+        return np.zeros(n_moments)
+    E_s = E_grid[support]
+    w_s = w_j[support]
+    rho_s = np.maximum(rho[support], 0.0)
+    x = (E_s - E_shift) / E_scale
+    integrand_base = w_s * rho_s
     moments = np.zeros(n_moments)
     for n in range(n_moments):
-        moments[n] = float(np.trapezoid(integrand_base * E_grid**n, E_grid))
+        moments[n] = float(np.trapezoid(integrand_base * x**n, E_s))
     return moments
 
 
 def _compute_window_moments_discrete(
     E_eig: np.ndarray,
     n_moments: int,
+    E_shift: float = 0.0,
+    E_scale: float = 1.0,
 ) -> np.ndarray:
-    """Exact power moments from discrete eigenvalues: m_n = Σ_i E_i^n."""
+    """Power moments from discrete eigenvalues in shifted/scaled coords."""
+    x = (E_eig - E_shift) / E_scale
     moments = np.zeros(n_moments)
     for n in range(n_moments):
-        moments[n] = float(np.sum(E_eig**n))
+        moments[n] = float(np.sum(x**n))
     return moments
 
 
@@ -271,13 +288,14 @@ def _cj_window_on_grid(
     T = np.cos(ns[:, None] * arccos_e[None, :])  # (M, n_grid)
 
     result = np.zeros(len(E_grid))
-    for b in [b_hi, b_lo]:
-        b_clip = np.clip(b, -1.0, 1.0)
+    for b_abs in [b_hi, b_lo]:
+        # Rescale boundary to [-1, 1]
+        b = np.clip((b_abs - center) / half_width, -1.0, 1.0)
         gamma = np.zeros(M_max)
-        gamma[0] = 1.0 - np.arccos(b_clip) / np.pi
-        gamma[1:] = -2.0 / (np.pi * ns[1:]) * np.sin(ns[1:] * np.arccos(b_clip))
+        gamma[0] = 1.0 - np.arccos(b) / np.pi
+        gamma[1:] = -2.0 / (np.pi * ns[1:]) * np.sin(ns[1:] * np.arccos(b))
         step = (gamma * g) @ T
-        if b == b_hi:
+        if b_abs == b_hi:
             result += step
         else:
             result -= step
@@ -446,6 +464,7 @@ def ritz_pseudobands_v2(
     n_windows_target: int = 40,
     dos_result: DOSResult | None = None,
     n_prot_override: int | None = None,
+    boundaries_override: np.ndarray | None = None,
     seed: int = 0,
     verbose: bool = True,
 ) -> PseudobandsResult:
@@ -518,10 +537,13 @@ def ritz_pseudobands_v2(
         print(f"  Protected: {n_protected} bands (E < {E_start:.4f} Ry)")
         print(f"  Available: {len(E_avail)} bands up to {E_dav_max:.4f} Ry")
 
-    # Place windows with n_min floor
-    boundaries = _place_windows_v2(
-        dos.E_grid, dos.rho, E_start, dos.E_max,
-        n_windows_target=n_windows_target, n_min=k, dim=dim)
+    # Place windows with n_min floor (or use override from k=0)
+    if boundaries_override is not None:
+        boundaries = boundaries_override
+    else:
+        boundaries = _place_windows_v2(
+            dos.E_grid, dos.rho, E_start, dos.E_max,
+            n_windows_target=n_windows_target, n_min=k, dim=dim)
     N_S = len(boundaries) - 1
 
     if verbose:
@@ -604,21 +626,29 @@ def ritz_pseudobands_v2(
             Xi_j, theta_ritz = _galerkin_ritz_dav(
                 Phi_avail[idx], E_avail[idx], k, subkey)
 
-            # Gauss quadrature from discrete eigenvalues
-            if n_in > 0:
-                moments = _compute_window_moments_discrete(E_avail[idx], 2 * k)
-                nodes, gauss_w = _gauss_from_moments(moments, min(k, n_in))
+            # For Davidson windows, we HAVE the exact eigenvalues — use them
+            # directly rather than going through moment → Gauss reconstruction.
+            # If n_in ≤ k: each eigenstate gets its own node with weight 1.
+            # If n_in > k: Gauss quadrature compresses n_in poles into k nodes.
+            if n_in <= k:
+                nodes = np.full(k, 0.5 * (e_lo + e_hi))
+                gauss_w = np.zeros(k)
+                nodes[:n_in] = E_avail[idx]
+                gauss_w[:n_in] = 1.0  # each eigenstate = 1 state
+            elif n_in > 0:
+                e_mid = 0.5 * (e_lo + e_hi)
+                e_span = max(e_hi - e_lo, 1e-6)
+                moments = _compute_window_moments_discrete(
+                    E_avail[idx], 2 * k, E_shift=e_mid, E_scale=e_span)
+                nodes, gauss_w = _gauss_from_moments(moments, k)
+                nodes = nodes * e_span + e_mid  # unshift
+                bad = np.isnan(nodes) | np.isnan(gauss_w)
+                if np.any(bad):
+                    nodes[bad] = e_mid
+                    gauss_w[bad] = 0.0
             else:
                 nodes = np.full(k, 0.5 * (e_lo + e_hi))
                 gauss_w = np.zeros(k)
-
-            # Pad if n_in < k
-            if len(nodes) < k:
-                nodes_full = np.full(k, 0.5 * (e_lo + e_hi))
-                gauss_w_full = np.zeros(k)
-                nodes_full[:len(nodes)] = nodes
-                gauss_w_full[:len(gauss_w)] = gauss_w
-                nodes, gauss_w = nodes_full, gauss_w_full
 
             mode = "dav"
         else:
@@ -636,10 +666,18 @@ def ritz_pseudobands_v2(
                 b_hi_r * dos.half_width + dos.center,
                 dos.center, dos.half_width, M_max)
 
-            moments = _compute_window_moments(dos.E_grid, dos.rho, w_E, 2 * k)
-            # Scale by dim (DOS normalized to integrate to 1)
+            e_mid = 0.5 * (e_lo + e_hi)
+            e_span = max(e_hi - e_lo, 1e-6)
+            moments = _compute_window_moments(
+                dos.E_grid, dos.rho, w_E, 2 * k,
+                E_shift=e_mid, E_scale=e_span)
             moments *= dim
             nodes, gauss_w = _gauss_from_moments(moments, k)
+            nodes = nodes * e_span + e_mid  # unshift
+            bad = np.isnan(nodes) | np.isnan(gauss_w)
+            if np.any(bad):
+                nodes[bad] = e_mid
+                gauss_w[bad] = 0.0
             mode = "CJ"
 
         # Sort Ritz and Gauss ascending, pair by order

@@ -373,6 +373,7 @@ def run_nscf(
                     n_windows_target=pb_n_windows,
                     dos_result=pb0.dos,
                     n_prot_override=n_prot_k0,
+                    boundaries_override=pb0.windows,
                     verbose=False, seed=ik)
             else:
                 pb_ik = _pb_func(
