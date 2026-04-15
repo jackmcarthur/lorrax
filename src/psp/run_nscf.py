@@ -349,15 +349,15 @@ def run_nscf(
             Phi_det_k = all_evecs[ik].reshape(nbnd, -1)
             E_det_k = eigenvalues[ik, :nbnd] if eigenvalues.ndim == 2 else eigenvalues[:nbnd]
 
-            pb_k = ritz_pseudobands(
+            pb_ik = ritz_pseudobands(
                 apply_H_flat, dim=dim_flat,
                 Phi_det=Phi_det_k, E_det=E_det_k, E_fermi=0.0,
                 k=pb_k, M_max=pb_M_max, F=pb_F,
                 n_windows_target=pb_n_windows,
-                dos_result=pb0.dos,  # reuse KPM DOS from k=0
+                dos_result=pb0.dos,
                 verbose=False, seed=ik)
 
-            _write_pb_k(pb_writer, ik, pb_k, H_k, gvecs_per_k[ik], nspinor, ngkmax)
+            _write_pb_k(pb_writer, ik, pb_ik, H_k, gvecs_per_k[ik], nspinor, ngkmax)
 
             if verbose and (ik < 3 or ik == nk - 1 or (ik + 1) % 16 == 0):
                 print(f"  k={ik:3d}/{nk}: {time.perf_counter()-tk:.1f}s")
