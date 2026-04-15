@@ -9,6 +9,7 @@ from solvers.chebyshev import (
     partition_windows,
 )
 from solvers.dos import compute_dos, estimate_spectrum, dos_weighted_windows, geometric_windows, DOSResult
+from solvers.pseudobands import ritz_pseudobands, PseudobandsResult
 from solvers.quadrature import feast_ellipse_quadrature
 
 __all__ = [
@@ -27,5 +28,7 @@ __all__ = [
     "dos_weighted_windows",
     "geometric_windows",
     "DOSResult",
+    "ritz_pseudobands",
+    "PseudobandsResult",
     "feast_ellipse_quadrature",
 ]
