@@ -352,6 +352,11 @@ def main(argv=None):
 		sig_x = sigma_sx(wfns, Gij, V_q)
 	sig_x.block_until_ready()
 
+	# Print bare Σ_X diagonal for ISDF quality assessment
+	sig_x_diag = np.real(np.diagonal(np.asarray(sig_x), axis1=1, axis2=2)) * ryd2ev
+	print0(f"  Bare Σ_X diagonal (eV), k=0: "
+	       + "  ".join(f"{sig_x_diag[0, i]:.4f}" for i in range(min(8, sig_x_diag.shape[1]))))
+
 	# ---- GN-PPM: replace static COH with frequency-integrated Σ^c ----
 	sigma_omega_h5_path = None
 	sigma_c_at_dft_ev = None
