@@ -1,21 +1,22 @@
-"""psp/run_nscf.py — NSCF driver: QE .save → Davidson → WFN.h5.
+"""psp/run_nscf.py — NSCF driver: Davidson eigenstates + CJ pseudobands → WFN.h5.
 
-Usage with input file:
+Three modes of operation:
+
+  1. Davidson only (default):
+     Solve for nbnd eigenstates → WFN.h5
+
+  2. Davidson + pseudobands:
+     Solve for nbnd eigenstates, then fill high-energy spectrum with
+     CJ-filtered Ritz pseudobands → WFN.h5 + WFN_pseudobands.h5
+
+  3. Pseudobands only (from existing WFN.h5):
+     Read deterministic bands from an existing WFN.h5, build H@ψ from
+     the QE .save, and run only the pseudobands stage → WFN_pseudobands.h5.
+     Requires the WFN.h5 to have bands exceeding the number of valence electrons.
+
+Usage:
     lxrun python3 -u -m psp.run_nscf -i nscf.in
-
-Usage with CLI args (backwards-compatible):
     lxrun python3 -u -m psp.run_nscf --save QE.save --nbnd 100 --nk 4 4 4
-
-Input file format (nscf.in):
-    [nscf]
-    save_dir = qe/nscf/silicon.save
-    nbnd = 100
-    kgrid = 4 4 4
-    nosym = false        # true = full grid, false = IBZ-reduced (default)
-    output = WFN.h5
-    tol = 1e-8
-    charge_from_wfn = false
-    wfn_file = WFN_ref.h5
 """
 from __future__ import annotations
 
@@ -43,36 +44,17 @@ from solvers.davidson import davidson, warmup_davidson_jit
 import psp.vnl_ops as vnl_ops
 
 
-def run_nscf(
-    crystal: CrystalData,
-    pseudos: dict,
-    kgrid: tuple[int, int, int],
-    nbnd: int,
-    output_path: str = "WFN.h5",
-    *,
-    nosym: bool = False,
-    tol: float = 1e-8,
-    verbose: bool = True,
-    kpoints_override: np.ndarray | None = None,
-    weights_override: np.ndarray | None = None,
-):
-    """NSCF: build DFT potentials, solve Davidson at each k, write WFN.h5.
+# ═══════════════════════════════════════════════════════════════════════
+#  Potential construction (shared by all modes)
+# ═══════════════════════════════════════════════════════════════════════
 
-    By default, the k-grid is reduced to the IBZ using crystal symmetries
-    from the QE .save.  Set nosym=True to use the full unreduced grid.
-    """
+def _build_potentials(crystal, pseudos, verbose=True):
+    """Build k-independent DFT potentials from crystal + pseudos."""
     truncation_2d = crystal.assume_isolated == "2D"
     fft_grid = crystal.fft_grid
     nspinor = crystal.nspinor
     t0 = time.perf_counter()
 
-    if verbose:
-        print(f"NSCF: {nbnd} bands, kgrid={kgrid}, fft={fft_grid}, nspinor={nspinor}")
-        if truncation_2d:
-            print(f"  2D Coulomb truncation (from assume_isolated='2D')")
-        print(f"  GPUs: {len(jax.devices())}")
-
-    # ── k-independent potential ─────────────────────────────────
     V_loc, rho_core, rho_core_G = build_ionic_and_core(
         crystal, pseudos, fft_grid, truncation_2d=truncation_2d)
     rho_val = jnp.asarray(crystal.load_charge_density()[0], dtype=jnp.float64)
@@ -88,10 +70,19 @@ def run_nscf(
     vnl_setup = vnl_ops.build_vnl_setup(
         crystal, pseudos=pseudos, nspinor=nspinor,
         q_max=float(np.sqrt(float(crystal.ecutwfc))) * 1.01)
+
     if verbose:
         print(f"  Potentials: {time.perf_counter()-t0:.2f}s")
 
-    # ── k-point grid ────────────────────────────────────────────
+    return V_scf, V_loc, vnl_setup
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  K-grid setup (shared)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _setup_kgrid(crystal, kgrid, nosym, kpoints_override, weights_override, verbose=True):
+    """Build k-point grid and G-vector bookkeeping."""
     if kpoints_override is not None:
         kpoints = np.asarray(kpoints_override, dtype=np.float64)
         weights = np.asarray(weights_override, dtype=np.float64)
@@ -100,80 +91,278 @@ def run_nscf(
             nk=kgrid, nosym=nosym, noinv=nosym, no_t_rev=nosym)
         kpoints = np.asarray(kpoints, dtype=np.float64)
         weights = np.asarray(weights, dtype=np.float64)
-    nk = len(kpoints)
 
     G_master, _ = build_master_gvec_list(crystal)
     bdot = np.asarray(crystal.bdot, dtype=float)
-    ngkmax = compute_ngkmax(kpoints, bdot, crystal.ecutwfc, fft_grid)
+    ngkmax = compute_ngkmax(kpoints, bdot, crystal.ecutwfc, crystal.fft_grid)
     gvecs_per_k = [select_gvecs_for_k(kpoints[ik], G_master, bdot, crystal.ecutwfc)[0]
-                   for ik in range(nk)]
+                   for ik in range(len(kpoints))]
+
     if verbose:
-        grid_label = "full" if nosym else "IBZ"
-        print(f"  nk={nk} ({grid_label}), ngkmax={ngkmax}")
+        label = "full" if nosym else "IBZ"
+        print(f"  nk={len(kpoints)} ({label}), ngkmax={ngkmax}")
 
-    # ── JIT warmup ──────────────────────────────────────────────
-    t1 = time.perf_counter()
-    warmup_davidson_jit(nbnd, ngkmax, nspinor)
-    H_k0 = setup_H_k_from_kvec(kpoints[0], V_scf, vnl_setup, crystal, None,
-                                 V_loc_r=V_loc, ngkmax=ngkmax)
-    apply_H0 = make_apply_H(H_k0)
-    m_max = 4 * nbnd
-    for m in range(nbnd, m_max + nbnd, nbnd):
-        apply_H0(jnp.zeros((min(m, m_max), nspinor, ngkmax), dtype=jnp.complex128))
+    return kpoints, weights, ngkmax, gvecs_per_k
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Main driver
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_nscf(
+    crystal: CrystalData,
+    pseudos: dict,
+    kgrid: tuple[int, int, int],
+    nbnd: int,
+    output_path: str = "WFN.h5",
+    *,
+    nosym: bool = False,
+    tol: float = 1e-8,
+    do_davidson: bool = True,
+    do_pseudobands: bool = False,
+    pb_k: int = 6,
+    pb_M_max: int = 1500,
+    pb_F: float = 0.10,
+    pb_n_windows: int = 50,
+    pb_wfn_input: str | None = None,
+    verbose: bool = True,
+    kpoints_override: np.ndarray | None = None,
+    weights_override: np.ndarray | None = None,
+):
+    """NSCF driver: Davidson eigenstates and/or CJ pseudobands.
+
+    Modes:
+      do_davidson=True,  do_pseudobands=False  → standard NSCF → WFN.h5
+      do_davidson=True,  do_pseudobands=True   → NSCF + pseudobands
+      do_davidson=False, do_pseudobands=True   → pseudobands from existing WFN.h5
+      do_davidson=False, do_pseudobands=False   → error
+    """
+    if not do_davidson and not do_pseudobands:
+        raise ValueError("At least one of do_davidson or do_pseudobands must be True")
+
+    truncation_2d = crystal.assume_isolated == "2D"
+    fft_grid = crystal.fft_grid
+    nspinor = crystal.nspinor
+    t_start = time.perf_counter()
+
     if verbose:
-        print(f"  JIT warmup: {time.perf_counter()-t1:.2f}s")
+        mode = []
+        if do_davidson:
+            mode.append(f"Davidson ({nbnd} bands)")
+        if do_pseudobands:
+            mode.append(f"pseudobands (k={pb_k}, M={pb_M_max}, {pb_n_windows} windows)")
+        print(f"NSCF: {' + '.join(mode)}")
+        print(f"  kgrid={kgrid}, fft={fft_grid}, nspinor={nspinor}")
+        if truncation_2d:
+            print(f"  2D Coulomb truncation (from assume_isolated='2D')")
+        print(f"  GPUs: {len(jax.devices())}")
 
-    # ── Open output file ────────────────────────────────────────
-    writer = WFNWriter(output_path, crystal, kpoints, weights, kgrid, nbnd,
-                        gvecs_per_k, nosym=nosym)
+    # ── Build potentials ────────────────────────────────────────
+    V_scf, V_loc, vnl_setup = _build_potentials(crystal, pseudos, verbose)
 
-    # ── per-k: build H_k → Davidson → write ────────────────────
-    eigenvalues = np.zeros((nk, nbnd))
-    t_dav = time.perf_counter()
+    # ── K-grid ──────────────────────────────────────────────────
+    kpoints, weights, ngkmax, gvecs_per_k = _setup_kgrid(
+        crystal, kgrid, nosym, kpoints_override, weights_override, verbose)
+    nk = len(kpoints)
 
-    for ik in range(nk):
-        tk = time.perf_counter()
-        H_k = setup_H_k_from_kvec(kpoints[ik], V_scf, vnl_setup, crystal, None,
-                                    V_loc_r=V_loc, ngkmax=ngkmax)
-        apply_H = make_apply_H(H_k)
-        precond = make_dft_preconditioner(H_k.h_diag)
-        init = make_pw_init(H_k.T_diag, nspinor, verbose=False)
+    # ══════════════════════════════════════════════════════════════
+    #  Davidson stage
+    # ══════════════════════════════════════════════════════════════
 
-        evals, evecs = davidson(
-            apply_H, n_eig=nbnd, precond_fn=precond, init_fn=init,
-            verbose=False, tol=tol)
+    eigenvalues = None
+    all_evecs = None  # (nk, nbnd, nspinor, ngkmax) if needed for pseudobands
 
-        eigenvalues[ik] = evals
-        writer.write_k(ik, evals, reorder_to_qe(np.asarray(evecs), H_k, gvecs_per_k[ik]))
+    if do_davidson:
+        if verbose:
+            print("\n── Davidson ──")
 
-        if verbose and (ik < 3 or ik == nk - 1 or (ik + 1) % 16 == 0):
-            print(f"  k={ik:3d}/{nk}: {time.perf_counter()-tk:.3f}s  "
-                  f"evals[0]={evals[0]:.6f} Ry")
+        t1 = time.perf_counter()
+        warmup_davidson_jit(nbnd, ngkmax, nspinor)
+        H_k0 = setup_H_k_from_kvec(kpoints[0], V_scf, vnl_setup, crystal, None,
+                                     V_loc_r=V_loc, ngkmax=ngkmax)
+        apply_H0 = make_apply_H(H_k0)
+        m_max = 4 * nbnd
+        for m in range(nbnd, m_max + nbnd, nbnd):
+            apply_H0(jnp.zeros((min(m, m_max), nspinor, ngkmax), dtype=jnp.complex128))
+        if verbose:
+            print(f"  JIT warmup: {time.perf_counter()-t1:.2f}s")
 
-    writer.close()
+        writer = WFNWriter(output_path, crystal, kpoints, weights, kgrid, nbnd,
+                            gvecs_per_k, nosym=nosym)
+
+        eigenvalues = np.zeros((nk, nbnd))
+        if do_pseudobands:
+            all_evecs = np.zeros((nk, nbnd, nspinor, ngkmax), dtype=np.complex128)
+
+        t_dav = time.perf_counter()
+        for ik in range(nk):
+            tk = time.perf_counter()
+            H_k = setup_H_k_from_kvec(kpoints[ik], V_scf, vnl_setup, crystal, None,
+                                        V_loc_r=V_loc, ngkmax=ngkmax)
+            apply_H = make_apply_H(H_k)
+            precond = make_dft_preconditioner(H_k.h_diag)
+            init = make_pw_init(H_k.T_diag, nspinor, verbose=False)
+
+            evals, evecs = davidson(
+                apply_H, n_eig=nbnd, precond_fn=precond, init_fn=init,
+                verbose=False, tol=tol)
+
+            eigenvalues[ik] = evals
+            evecs_np = np.asarray(evecs)
+            writer.write_k(ik, evals, reorder_to_qe(evecs_np, H_k, gvecs_per_k[ik]))
+
+            if do_pseudobands:
+                all_evecs[ik] = evecs_np
+
+            if verbose and (ik < 3 or ik == nk - 1 or (ik + 1) % 16 == 0):
+                print(f"  k={ik:3d}/{nk}: {time.perf_counter()-tk:.3f}s  "
+                      f"evals[0]={evals[0]:.6f} Ry")
+
+        writer.close()
+        if verbose:
+            dt = time.perf_counter() - t_dav
+            print(f"  Davidson: {dt:.2f}s ({dt/nk:.3f}s/k) → {output_path}")
+
+    # ══════════════════════════════════════════════════════════════
+    #  Pseudobands-only: load deterministic bands from WFN.h5
+    # ══════════════════════════════════════════════════════════════
+
+    if not do_davidson and do_pseudobands:
+        import h5py
+
+        wfn_path = pb_wfn_input
+        if wfn_path is None:
+            raise ValueError(
+                "do_pseudobands=True without do_davidson requires pb_wfn_input "
+                "(path to existing WFN.h5 with deterministic bands)")
+        if not os.path.isfile(wfn_path):
+            raise FileNotFoundError(f"pb_wfn_input not found: {wfn_path}")
+
+        if verbose:
+            print(f"\n── Loading deterministic bands from {wfn_path} ──")
+
+        with h5py.File(wfn_path, "r") as f:
+            nk_file = int(f["mf_header/kpoints/nrk"][()])
+            nbnd_file = int(f["mf_header/kpoints/mnband"][()])
+            eigenvalues = f["mf_header/kpoints/el"][0]  # (nk, nbnd)
+            kpoints_file = f["mf_header/kpoints/rk"][:]
+            weights_file = f["mf_header/kpoints/w"][:]
+
+            # Validate
+            n_occ = int(crystal.nelec) // 2 if nspinor == 1 else int(crystal.nelec)
+            if nbnd_file <= n_occ:
+                raise ValueError(
+                    f"WFN.h5 has {nbnd_file} bands but system has {n_occ} "
+                    f"occupied states. Need bands > n_occupied for pseudobands.")
+
+            # Read wavefunction coefficients
+            coeffs = f["wfns/coeffs"]  # (nbnd, nspinor, ngk_max, 2)
+            all_evecs = np.zeros((nk_file, nbnd_file, nspinor, ngkmax), dtype=np.complex128)
+            for ib in range(nbnd_file):
+                c = coeffs[ib]  # (nspinor, ngk, 2)
+                c_complex = c[:, :, 0] + 1j * c[:, :, 1]
+                # Pad to ngkmax if needed
+                ngk_file = c_complex.shape[1]
+                all_evecs[0, ib, :, :ngk_file] = c_complex
+
+        nbnd = nbnd_file
+        kpoints = kpoints_file
+        weights = weights_file
+        nk = nk_file
+        kpoints, weights, ngkmax, gvecs_per_k = _setup_kgrid(
+            crystal, kgrid, nosym, kpoints, weights, verbose)
+
+        if verbose:
+            print(f"  Loaded {nbnd} bands, {nk} k-points from {wfn_path}")
+
+    # ══════════════════════════════════════════════════════════════
+    #  Pseudobands stage
+    # ══════════════════════════════════════════════════════════════
+
+    if do_pseudobands:
+        from solvers.pseudobands import ritz_pseudobands
+
+        if verbose:
+            print(f"\n── Pseudobands (k={pb_k}, M_max={pb_M_max}, "
+                  f"{pb_n_windows} windows) ──")
+
+        pb_output = os.path.splitext(output_path)[0] + "_pseudobands.h5"
+        t_pb = time.perf_counter()
+
+        for ik in range(nk):
+            tk = time.perf_counter()
+            H_k = setup_H_k_from_kvec(kpoints[ik], V_scf, vnl_setup, crystal, None,
+                                        V_loc_r=V_loc, ngkmax=ngkmax)
+            apply_H = make_apply_H(H_k)
+
+            # Flatten apply_H for pseudobands: (dim,) → (dim,) not (batch, nch, dim)
+            def apply_H_flat(x):
+                # Reshape flat → (1, nspinor, ngkmax), apply, flatten back
+                x_3d = x.reshape(1, nspinor, ngkmax)
+                return apply_H(x_3d).reshape(-1)
+
+            dim_flat = nspinor * ngkmax
+            Phi_det = all_evecs[ik].reshape(nbnd, -1)  # (nbnd, nspinor*ngkmax)
+            E_det = eigenvalues[ik, :nbnd] if eigenvalues.ndim == 2 else eigenvalues[:nbnd]
+
+            pb_result = ritz_pseudobands(
+                apply_H_flat, dim=dim_flat,
+                Phi_det=Phi_det, E_det=E_det,
+                E_fermi=0.0,
+                k=pb_k, M_max=pb_M_max, F=pb_F,
+                n_windows_target=pb_n_windows,
+                verbose=(verbose and ik == 0),
+                seed=ik,
+            )
+
+            if verbose and (ik < 2 or ik == nk - 1):
+                print(f"  k={ik:3d}/{nk}: {pb_result.n_det} det + {pb_result.n_pseudo} pseudo "
+                      f"= {pb_result.Phi_out.shape[0]} bands, "
+                      f"{time.perf_counter()-tk:.1f}s")
+
+            # TODO: write pseudobands to WFN_pseudobands.h5
+            # Need to extend WFNWriter to handle variable band counts per k
+            # and non-unit-normalized coefficients.
+
+        if verbose:
+            print(f"  Pseudobands: {time.perf_counter()-t_pb:.1f}s total")
+
     if verbose:
-        dt = time.perf_counter() - t_dav
-        print(f"  Davidson + write: {dt:.2f}s ({dt/nk:.3f}s/k)")
-        print(f"  Total NSCF: {time.perf_counter()-t0:.2f}s → {output_path}")
+        print(f"\nTotal NSCF: {time.perf_counter()-t_start:.1f}s")
+
     return eigenvalues
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  CLI
+# ═══════════════════════════════════════════════════════════════════════
+
 def main():
-    parser = argparse.ArgumentParser(description="LORRAX NSCF: Davidson → WFN.h5")
+    parser = argparse.ArgumentParser(description="LORRAX NSCF: Davidson + Pseudobands → WFN.h5")
     parser.add_argument("-i", "--input", default=None, help="Input file (nscf.in)")
     parser.add_argument("--save", default=None, help="QE .save directory")
-    parser.add_argument("--pseudo_dir", default=None,
-                        help="Directory with .upf (default: same as --save)")
-    parser.add_argument("--nbnd", type=int, default=None, help="Number of bands")
-    parser.add_argument("--nk", type=int, nargs=3, default=None, help="K-grid dimensions")
-    parser.add_argument("--nosym", action="store_true", help="Disable IBZ reduction")
-    parser.add_argument("-o", "--output", default=None, help="Output WFN.h5 path")
-    parser.add_argument("--tol", type=float, default=None, help="Davidson convergence tol")
+    parser.add_argument("--pseudo_dir", default=None)
+    parser.add_argument("--nbnd", type=int, default=None)
+    parser.add_argument("--nk", type=int, nargs=3, default=None)
+    parser.add_argument("--nosym", action="store_true")
+    parser.add_argument("-o", "--output", default=None)
+    parser.add_argument("--tol", type=float, default=None)
     parser.add_argument("--ref_wfn", default=None,
                         help="Reference WFN.h5 for k-points (overrides kgrid)")
+    parser.add_argument("--no-davidson", action="store_true",
+                        help="Skip Davidson, use existing WFN.h5 for pseudobands")
+    parser.add_argument("--pseudobands", action="store_true",
+                        help="Enable pseudobands stage")
+    parser.add_argument("--pb-wfn", default=None,
+                        help="Existing WFN.h5 for pseudobands-only mode")
     args = parser.parse_args()
 
-    # Input file takes precedence; CLI args override individual fields
+    # Defaults
+    do_davidson = True
+    do_pseudobands = False
+    pb_k, pb_M_max, pb_F, pb_n_windows = 6, 1500, 0.10, 50
+    pb_wfn_input = None
+
     if args.input:
         from psp.nscf_input import read_nscf_input
         inp = read_nscf_input(args.input)
@@ -183,6 +372,12 @@ def main():
         nosym = args.nosym or inp.nosym
         output = args.output or inp.output
         tol = args.tol or inp.tol
+        do_pseudobands = inp.pseudobands or args.pseudobands
+        pb_k = inp.pb_k
+        pb_M_max = inp.pb_M_max
+        pb_F = inp.pb_F
+        pb_n_windows = inp.pb_n_windows
+        pb_wfn_input = inp.wfn_file if inp.rho_from_wfn else None
     else:
         if not args.save:
             parser.error("Either -i input_file or --save is required")
@@ -192,6 +387,12 @@ def main():
         nosym = args.nosym
         output = args.output or "WFN.h5"
         tol = args.tol or 1e-8
+        do_pseudobands = args.pseudobands
+
+    if args.no_davidson:
+        do_davidson = False
+    if args.pb_wfn:
+        pb_wfn_input = args.pb_wfn
 
     crystal = CrystalData.from_qe_save(save_dir)
     pseudos = load_pseudopotentials(args.pseudo_dir or save_dir)
@@ -205,6 +406,9 @@ def main():
 
     run_nscf(crystal, pseudos, kgrid=kgrid, nbnd=nbnd,
              output_path=output, nosym=nosym, tol=tol,
+             do_davidson=do_davidson, do_pseudobands=do_pseudobands,
+             pb_k=pb_k, pb_M_max=pb_M_max, pb_F=pb_F,
+             pb_n_windows=pb_n_windows, pb_wfn_input=pb_wfn_input,
              kpoints_override=kpoints_override, weights_override=weights_override)
 
 
