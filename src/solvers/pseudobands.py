@@ -289,15 +289,14 @@ def ritz_pseudobands(
     E_det = np.asarray(E_det)
     n_det = Phi_det.shape[0]
 
-    # Flat matvec for KPM (unbatched)
-    def apply_H_flat(x):
-        return apply_H(x[None, :])[0]
+    # apply_H is (dim,) → (dim,). Block version for filter/Ritz via vmap.
+    apply_H_block = jax.vmap(apply_H)  # (k, dim) → (k, dim)
 
     # ── §2: KPM DOS ──
     if dos_result is None:
         if verbose:
             print("Pseudobands: computing KPM DOS...")
-        dos = compute_dos(apply_H_flat, dim, n_moments=n_kpm_moments,
+        dos = compute_dos(apply_H, dim, n_moments=n_kpm_moments,
                           n_random=n_kpm_random, seed=seed, verbose=verbose)
     else:
         dos = dos_result
@@ -346,7 +345,7 @@ def ritz_pseudobands(
     Omega = Omega + 0j  # complex
 
     coeffs_j = jnp.asarray(coeffs, dtype=jnp.float64)
-    Y_all = _telescoping_filter(apply_H, Omega, coeffs_j,
+    Y_all = _telescoping_filter(apply_H_block, Omega, coeffs_j,
                                  dos.center, dos.half_width, M_max)
     Y_all = np.asarray(Y_all)  # (N_S, k, dim)
 
@@ -364,7 +363,7 @@ def ritz_pseudobands(
 
     for j in range(N_S):
         Y_j = jnp.asarray(Y_all[j], dtype=jnp.complex128)
-        Xi_j, theta_j, Q_j = _galerkin_ritz(apply_H, Y_j, Phi_det_j, Q_prev)
+        Xi_j, theta_j, Q_j = _galerkin_ritz(apply_H_block, Y_j, Phi_det_j, Q_prev)
 
         Xi_np = np.asarray(Xi_j)
         theta_np = np.asarray(theta_j)
