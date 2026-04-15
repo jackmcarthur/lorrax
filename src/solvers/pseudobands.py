@@ -330,23 +330,43 @@ def ritz_pseudobands(
         Y_j = jnp.asarray(Y_all[j], dtype=jnp.complex128)
         Xi_j, theta_j, Q_j = _galerkin_ritz(apply_H_block, Y_j, Phi_det_j, Q_prev)
 
-        Xi_np = np.asarray(Xi_j)
-        theta_np = np.asarray(theta_j)
-        w_j = np.sqrt(max(n_eff[j], 0.0) / k)
-
-        Xi_list.append(Xi_np * w_j)  # weight absorbed into wavefunction
-        theta_list.append(theta_np)
-        weight_list.append(np.full(k, w_j))
+        Xi_list.append(np.asarray(Xi_j))     # unit-normalized Ritz vectors
+        theta_list.append(np.asarray(theta_j))
+        weight_list.append(np.full(k, np.sqrt(max(n_eff[j], 0.0) / k)))
 
         Q_prev = Q_j
 
         if verbose and (j < 3 or j == N_S - 1 or (j + 1) % 10 == 0):
             print(f"    window {j+1}/{N_S}: n_eff={n_eff[j]:.1f}, "
-                  f"θ=[{theta_np[0]:.4f}, {theta_np[-1]:.4f}]")
+                  f"θ=[{float(theta_j[0]):.4f}, {float(theta_j[-1]):.4f}]")
 
-    # ── Output assembly ──
+    # ── Global orthogonalization ──
+    # The CJ Jackson smoothing creates ~14% analytical overlap between adjacent
+    # windows, which amplifies to ~65% in Ritz vectors after Galerkin rotation.
+    # A global QR on the concatenated set guarantees mutual orthogonality.
     if Xi_list:
-        Phi_pseudo = np.concatenate(Xi_list, axis=0)
+        Xi_cat = np.concatenate(Xi_list, axis=0)  # (N_S*k, dim)
+
+        # Also deflate against deterministic bands
+        if n_det > 0:
+            Phi_det_np = np.asarray(Phi_det)
+            overlap = Xi_cat @ Phi_det_np.conj().T  # (N_S*k, n_det)
+            Xi_cat = Xi_cat - overlap @ Phi_det_np
+
+        # Global economy QR
+        Q_global, R_global = np.linalg.qr(Xi_cat.T, mode='reduced')  # Q: (dim, N_S*k)
+        Xi_cat = Q_global.T  # (N_S*k, dim) — orthonormal rows
+
+        if verbose:
+            print(f"  Global orthogonalization: {Xi_cat.shape[0]} vectors")
+
+        # Split back into per-window blocks and apply weights
+        Phi_pseudo_list = []
+        for j in range(N_S):
+            i0, i1 = j * k, (j + 1) * k
+            Phi_pseudo_list.append(Xi_cat[i0:i1] * weight_list[j][:, None])
+
+        Phi_pseudo = np.concatenate(Phi_pseudo_list, axis=0)
         E_pseudo = np.concatenate(theta_list)
         w_pseudo = np.concatenate(weight_list)
     else:
