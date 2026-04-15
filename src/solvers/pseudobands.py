@@ -1,14 +1,13 @@
 """
-solvers/pseudobands.py — Matrix-free Ritz pseudobands via Chebyshev-Jackson filtering.
+solvers/pseudobands.py — Hybrid pseudobands: stochastic + CJ-Ritz.
 
-Replaces explicit diagonalization (BGW Parabands) with a matrix-free procedure:
-  1. KPM DOS → spectrum bounds + window partition  (solvers.dos)
-  2. CJ boundary filters → telescoping recurrence  (one pass of M_max matvecs)
-  3. Per-window Galerkin-Ritz → pseudoband vectors  (k×k dense eigh per window)
-
-Output: deterministic eigenstates (from Davidson) + weighted Ritz pseudobands,
-drop-in compatible with BGW/LORRAX GW codes. Pseudobands carry non-unit norm
-encoding their spectral weight.
+Three regions:
+  1. Protected eigenstates (from Davidson): weight 1.0, passed through as-is.
+  2. Stochastic pseudobands: random-phase linear combinations of exact
+     eigenstates within each window. Used for windows where the CJ filter
+     can't resolve (near the conduction edge / det band max).
+  3. CJ-Ritz pseudobands: Chebyshev-Jackson filtered Ritz vectors for
+     high-energy windows where the filter is reliable.
 
 Physics-agnostic — works for H_DFT, H_BSE, or any Hermitian operator.
 
@@ -21,9 +20,9 @@ Usage
         Phi_det=davidson_evecs, E_det=davidson_evals,
         E_fermi=0.0,
     )
-    # result.Phi_out: (n_det + N_S*k, dim) — all bands
-    # result.E_out:   (n_det + N_S*k,) — eigenvalues/pseudo-energies
-    # result.weights: (n_det + N_S*k,) — 1.0 for det, sqrt(n_eff/k) for pseudo
+    # result.Phi_out: (n_protected + N_S*k, dim) — protected + pseudobands
+    # result.E_out:   matching eigenvalues/pseudo-energies
+    # result.weights: 1.0 for protected, sqrt(n_eff/k) for pseudo
 """
 from __future__ import annotations
 
@@ -35,7 +34,10 @@ import jax
 import jax.numpy as jnp
 
 from solvers.chebyshev import jackson_coefficients
-from solvers.dos import compute_dos, dos_weighted_windows, geometric_windows, compute_window_partition, DOSResult, WindowPartition
+from solvers.dos import (
+    compute_dos, dos_weighted_windows, geometric_windows,
+    compute_window_partition, DOSResult, WindowPartition,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -45,14 +47,16 @@ from solvers.dos import compute_dos, dos_weighted_windows, geometric_windows, co
 @dataclass
 class PseudobandsResult:
     """Output of ritz_pseudobands."""
-    Phi_out: np.ndarray     # (n_total, dim) — deterministic + pseudoband vectors
+    Phi_out: np.ndarray     # (n_total, dim) — protected + pseudoband vectors
     E_out: np.ndarray       # (n_total,) — eigenvalues / pseudo-energies
-    weights: np.ndarray     # (n_total,) — 1.0 for det, sqrt(n_eff/k) for pseudo
-    n_det: int              # number of deterministic bands
+    weights: np.ndarray     # (n_total,) — 1.0 for protected, sqrt(n/k) for pseudo
+    n_det: int              # number of protected (deterministic) bands
     n_pseudo: int           # number of pseudobands
     n_windows: int          # number of spectral windows
+    n_stochastic: int       # number of stochastic windows (from exact eigenstates)
+    n_cj: int               # number of CJ-Ritz windows
     dos: DOSResult          # the KPM DOS used for partitioning
-    windows: WindowPartition | None = None  # per-window state counts
+    windows: WindowPartition | None = None
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -116,9 +120,6 @@ def _telescoping_filter(
     -------
     Y : (N_S, k, dim) — per-window filtered blocks (telescoped)
     """
-    n_bounds = coeffs.shape[0]
-    k, dim = Omega.shape
-
     def apply_H_tilde(x):
         return (apply_H(x) - center * x) / half_width
 
@@ -142,6 +143,51 @@ def _telescoping_filter(
     # Telescope: Y_j = A_j - A_{j-1}
     Y = A[1:] - A[:-1]  # (N_S, k, dim)
     return Y
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Stochastic pseudobands from exact eigenstates
+# ═══════════════════════════════════════════════════════════════════════
+
+def _stochastic_pseudobands(
+    Phi_window: np.ndarray,
+    E_window: np.ndarray,
+    k: int,
+    key: jax.Array,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Construct k pseudobands from n exact eigenstates via random phases.
+
+    Each pseudoband is a random linear combination:
+        ξ_α = (1/√n) Σ_{i=1}^{n} exp(i·θ_{α,i}) · ψ_i
+
+    Cross-window overlap cancels in expectation because eigenstates from
+    different windows are orthogonal.
+
+    Parameters
+    ----------
+    Phi_window : (n, dim) — exact eigenstates in this window
+    E_window : (n,) — their eigenvalues
+    k : number of pseudobands to construct
+    key : JAX random key
+
+    Returns
+    -------
+    Xi : (k, dim) — pseudoband vectors (unit norm)
+    E_pseudo : (k,) — pseudo-energies (mean eigenvalue per pseudoband)
+    """
+    n, dim = Phi_window.shape
+    # Random phases: each pseudoband gets n independent uniform phases
+    phases = jax.random.uniform(key, (k, n), minval=0.0, maxval=2.0 * np.pi)
+    coeffs = jnp.exp(1j * phases) / jnp.sqrt(n)  # (k, n)
+
+    # Linear combination
+    Xi = jnp.dot(coeffs, jnp.asarray(Phi_window, dtype=jnp.complex128))  # (k, dim)
+    Xi = np.asarray(Xi)
+
+    # Pseudo-energies: <ξ|H|ξ> = (1/n) Σ_i E_i (all cross-terms cancel)
+    E_pseudo = np.full(k, np.mean(E_window))
+
+    return Xi, E_pseudo
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -216,26 +262,29 @@ def ritz_pseudobands(
     n_kpm_random: int = 10,
     n_windows_target: int | None = None,
     dos_result: DOSResult | None = None,
+    n_protected: int | None = None,
     seed: int = 0,
     verbose: bool = True,
 ) -> PseudobandsResult:
-    """Matrix-free Ritz pseudobands via Chebyshev-Jackson filtering.
+    """Hybrid pseudobands: stochastic (low-energy) + CJ-Ritz (high-energy).
 
     Parameters
     ----------
-    apply_H : (batch, dim) → (batch, dim) — Hermitian block matvec
+    apply_H : (dim,) → (dim,) — Hermitian matvec (vmapped internally)
     dim : vector dimension
-    Phi_det : (n_det, dim) — Davidson eigenvectors (protected region)
+    Phi_det : (n_det, dim) — Davidson eigenvectors
     E_det : (n_det,) — their eigenvalues
     E_fermi : Fermi energy (default 0)
-    F : window ratio (for geometric fallback or crossover energy)
-    k : Galerkin block size per window
+    F : window ratio (crossover energy formula)
+    k : block size per window (pseudobands per window)
     M_max : Chebyshev order cap
     C_m : filter sharpness constant
     n_kpm_moments : KPM moment count for DOS
     n_kpm_random : KPM trace probes
     n_windows_target : target number of windows (sets tau by bisection)
     dos_result : pre-computed DOSResult (skips KPM if provided)
+    n_protected : fixed count of protected det bands (for WFN consistency
+        across k-points). If None, determined from eigenvalues at this k.
     seed : random seed
     verbose : print progress
 
@@ -250,8 +299,7 @@ def ritz_pseudobands(
     E_det = np.asarray(E_det)
     n_det = Phi_det.shape[0]
 
-    # apply_H is (dim,) → (dim,). Block version for filter/Ritz via vmap.
-    apply_H_block = jax.vmap(apply_H)  # (k, dim) → (k, dim)
+    apply_H_block = jax.vmap(apply_H)
 
     # ── §2: KPM DOS ──
     if dos_result is None:
@@ -266,16 +314,12 @@ def ritz_pseudobands(
     E_max = dos.E_max
 
     # ── §3: Window partition ──
-    eps_cross = C_m * np.pi * B / (F * M_max)
+    cj_resolution = np.pi * B / M_max
+    eps_cross = C_m * cj_resolution / F
     if verbose:
+        print(f"  CJ resolution: π·B/M = {cj_resolution:.4f} Ry")
         print(f"  Crossover energy: ε_cross = {eps_cross:.4f} "
               f"(E_F + ε_cross = {E_fermi + eps_cross:.4f})")
-
-    # Check Davidson coverage
-    if n_det > 0 and np.max(E_det) - E_fermi < eps_cross:
-        print(f"  WARNING: Davidson region ends at {np.max(E_det):.4f} "
-              f"but ε_cross = {E_fermi + eps_cross:.4f}. "
-              f"Extend Davidson to cover the crossover energy.")
 
     E_cross_abs = E_fermi + eps_cross
     E_max_abs = E_max
@@ -286,62 +330,142 @@ def ritz_pseudobands(
             galerkin_order=1, n_windows_target=n_windows_target)
     else:
         boundaries = geometric_windows(eps_cross, E_max - E_fermi, F)
-        boundaries = boundaries + E_fermi  # convert to absolute
+        boundaries = boundaries + E_fermi
 
     N_S = len(boundaries) - 1
+
+    # ── Classify det bands: protected vs available for stochastic ──
+    # Protected: det bands below the first window boundary (kept as-is)
+    # Available: det bands within the window region (used for stochastic PB)
+    E_window_start = boundaries[0]
+    protected_mask = E_det < E_window_start
+    n_prot_auto = int(np.sum(protected_mask))
+
+    if n_protected is None:
+        n_protected = n_prot_auto
+    else:
+        # Use the fixed count. Sort by energy and take the first n_protected
+        # as protected, rest as available — ensures consistent band count
+        # across k-points even when eigenvalue distributions differ.
+        sort_idx = np.argsort(E_det)
+        protected_mask = np.zeros(n_det, dtype=bool)
+        protected_mask[sort_idx[:n_protected]] = True
+
+    Phi_protected = Phi_det[protected_mask]
+    E_protected = E_det[protected_mask]
+
+    available_mask = ~protected_mask
+    Phi_available = Phi_det[available_mask]
+    E_available = E_det[available_mask]
+
     if verbose:
+        print(f"  Det bands: {n_protected} protected (E < {E_window_start:.4f}), "
+              f"{int(np.sum(available_mask))} available for stochastic")
         print(f"  {N_S} spectral windows from {boundaries[0]:.4f} to {boundaries[-1]:.4f}")
+        widths = np.diff(boundaries)
+        print(f"  Window widths: min={widths.min():.4f}, max={widths.max():.4f}, "
+              f"first 3: [{', '.join(f'{w:.4f}' for w in widths[:3])}]")
 
-    # Rescaled boundaries
-    tilde_eps = (boundaries - dos.center) / dos.half_width
+    # ── Classify windows: stochastic vs CJ ──
+    # Stochastic: window has ≥1 det eigenstate → random-phase construction.
+    # CJ-Ritz: no det eigenstates → use Chebyshev filter.
+    # Works even when n_det_in_window < k: the k pseudobands are random
+    # combinations of n_states eigenstates, with weight sqrt(n_states/k).
+    window_is_stochastic = np.zeros(N_S, dtype=bool)
+    window_det_indices = []
+    for j in range(N_S):
+        in_win = (E_available >= boundaries[j]) & (E_available < boundaries[j + 1])
+        indices = np.where(in_win)[0]
+        window_det_indices.append(indices)
+        if len(indices) >= 1:
+            window_is_stochastic[j] = True
 
-    # ── §4: Filter coefficients ──
-    coeffs = _boundary_coefficients(tilde_eps, M_max)
+    n_stochastic = int(np.sum(window_is_stochastic))
+    n_cj = N_S - n_stochastic
 
-    # ── §5: Telescoping recurrence ──
     if verbose:
-        print(f"  Running {M_max} Chebyshev iterations (block size {k})...")
-    key = jax.random.PRNGKey(seed + 42)
-    Omega = jax.random.normal(key, (k, dim), dtype=jnp.float64)
-    Omega = Omega + 0j  # complex
+        print(f"  Window classification: {n_stochastic} stochastic, {n_cj} CJ-Ritz")
 
-    coeffs_j = jnp.asarray(coeffs, dtype=jnp.float64)
-    Y_all = _telescoping_filter(apply_H_block, Omega, coeffs_j,
-                                 dos.center, dos.half_width, M_max)
-    Y_all = np.asarray(Y_all)  # (N_S, k, dim)
+    # ── Stochastic windows: build from exact eigenstates ──
+    # ── CJ windows: need the telescoping filter ──
 
-    if verbose:
-        print(f"  Filtered blocks: {Y_all.shape}")
+    # Only run the CJ filter if there are CJ windows
+    cj_indices = np.where(~window_is_stochastic)[0]
+    Y_cj = None
+    if n_cj > 0:
+        # Build CJ filter for the CJ windows only.
+        # The telescoping filter computes ALL N_S windows at once (they share
+        # the Chebyshev recurrence), so we compute them all and pick the CJ ones.
+        tilde_eps = (boundaries - dos.center) / dos.half_width
+        coeffs = _boundary_coefficients(tilde_eps, M_max)
 
-    # ── §6-7: Per-window Galerkin-Ritz + cross-window orthogonalization ──
-    Phi_det_j = jnp.asarray(Phi_det, dtype=jnp.complex128) if n_det > 0 else None
-    # Window weights from DOS — computed once, no CJ envelope reconstruction.
-    # KPM DOS is normalized to integrate to 1 (probability density).
-    # Scale by dim to get actual state counts.
+        if verbose:
+            print(f"  Running {M_max} Chebyshev iterations (block size {k})...")
+        key = jax.random.PRNGKey(seed + 42)
+        Omega = jax.random.normal(key, (k, dim), dtype=jnp.float64)
+        Omega = Omega + 0j
+
+        coeffs_j = jnp.asarray(coeffs, dtype=jnp.float64)
+        Y_all = _telescoping_filter(apply_H_block, Omega, coeffs_j,
+                                     dos.center, dos.half_width, M_max)
+        Y_all = np.asarray(Y_all)  # (N_S, k, dim)
+
+        if verbose:
+            print(f"  Filtered blocks: {Y_all.shape}")
+
+    # ── Window weights from DOS ──
     win_part = compute_window_partition(dos, boundaries)
     n_eff = win_part.n_eff * dim
+
+    # ── Per-window construction ──
+    # ALL det bands are used for CJ deflation (both protected and available)
+    Phi_all_det_j = jnp.asarray(Phi_det, dtype=jnp.complex128) if n_det > 0 else None
 
     Xi_list = []
     theta_list = []
     weight_list = []
     Q_prev = None
+    rng = jax.random.PRNGKey(seed + 100)
 
     for j in range(N_S):
-        Y_j = jnp.asarray(Y_all[j], dtype=jnp.complex128)
-        Xi_j, theta_j, Q_j = _galerkin_ritz(apply_H_block, Y_j, Phi_det_j, Q_prev)
+        e_lo, e_hi = boundaries[j], boundaries[j + 1]
 
-        Xi_np = np.asarray(Xi_j)
-        theta_np = np.asarray(theta_j)
-        w_j = np.sqrt(max(n_eff[j], 0.0) / k)
+        if window_is_stochastic[j]:
+            # ── Stochastic: random-phase combination of exact eigenstates ──
+            idx = window_det_indices[j]
+            rng, subkey = jax.random.split(rng)
+            Xi_np, theta_np = _stochastic_pseudobands(
+                Phi_available[idx], E_available[idx], k, subkey)
+            # Weight: det eigenstates in window count, not DOS integral
+            n_states = len(idx)
+            w_j = np.sqrt(n_states / k)
+            mode = "stoch"
+        else:
+            # ── CJ-Ritz ──
+            Y_j = jnp.asarray(Y_all[j], dtype=jnp.complex128)
+            Xi_j, theta_j, Q_j = _galerkin_ritz(
+                apply_H_block, Y_j, Phi_all_det_j, Q_prev)
+            Xi_np = np.asarray(Xi_j)
+            theta_np = np.asarray(theta_j)
+            # Check if Ritz eigenvalues leak outside the window — if so,
+            # the CJ filter failed (typically near-edge windows in a
+            # spectral gap). Zero the weight to avoid polluting the sum.
+            outside = (theta_np < e_lo - cj_resolution) | (theta_np > e_hi + cj_resolution)
+            if np.any(outside):
+                w_j = 0.0
+                mode = "CJ-0"
+            else:
+                w_j = np.sqrt(max(n_eff[j], 0.0) / k)
+                mode = "CJ"
+            Q_prev = Q_j
 
-        Xi_list.append(Xi_np * w_j)  # weight absorbed into wavefunction
+        Xi_list.append(Xi_np * w_j)
         theta_list.append(theta_np)
         weight_list.append(np.full(k, w_j))
 
-        Q_prev = Q_j
-
-        if verbose and (j < 3 or j == N_S - 1 or (j + 1) % 10 == 0):
-            print(f"    window {j+1}/{N_S}: n_eff={n_eff[j]:.1f}, "
+        if verbose and (j < 5 or j == N_S - 1 or (j + 1) % 10 == 0):
+            print(f"    window {j+1}/{N_S} [{mode:5s}]: [{e_lo:.2f},{e_hi:.2f}] "
+                  f"n_eff={n_eff[j]:.1f}, w={w_j:.3f}, "
                   f"θ=[{theta_np[0]:.4f}, {theta_np[-1]:.4f}]")
 
     # ── Output assembly ──
@@ -354,17 +478,21 @@ def ritz_pseudobands(
         E_pseudo = np.array([], dtype=np.float64)
         w_pseudo = np.array([], dtype=np.float64)
 
-    Phi_out = np.concatenate([Phi_det, Phi_pseudo], axis=0)
-    E_out = np.concatenate([E_det, E_pseudo])
-    weights = np.concatenate([np.ones(n_det), w_pseudo])
+    # Protected det bands + all pseudobands (stochastic + CJ)
+    Phi_out = np.concatenate([Phi_protected, Phi_pseudo], axis=0)
+    E_out = np.concatenate([E_protected, E_pseudo])
+    weights = np.concatenate([np.ones(n_protected), w_pseudo])
 
     if verbose:
         total_eff = float(np.sum(n_eff))
-        print(f"  Total: {n_det} det + {N_S * k} pseudo = {Phi_out.shape[0]} bands "
-              f"(Σ n_eff = {total_eff:.1f})")
+        n_pseudo_total = N_S * k
+        print(f"  Total: {n_protected} protected + {n_pseudo_total} pseudo "
+              f"({n_stochastic * k} stochastic + {n_cj * k} CJ) "
+              f"= {Phi_out.shape[0]} bands (Σ n_eff = {total_eff:.1f})")
 
     return PseudobandsResult(
         Phi_out=Phi_out, E_out=E_out, weights=weights,
-        n_det=n_det, n_pseudo=N_S * k, n_windows=N_S,
+        n_det=n_protected, n_pseudo=N_S * k, n_windows=N_S,
+        n_stochastic=n_stochastic, n_cj=n_cj,
         dos=dos, windows=win_part,
     )

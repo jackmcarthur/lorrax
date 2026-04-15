@@ -757,13 +757,20 @@ def fit_zeta_chunked_to_h5(
         if band_norms is not None:
             norms_l = jnp.asarray(band_norms[band_range_left[0]:band_range_left[1]])
             norms_r = jnp.asarray(band_norms[band_range_right[0]:band_range_right[1]])
+            # Replace zero norms with 1.0 to avoid division by zero.
+            # Zero-norm bands have all-zero coefficients, so dividing by 1
+            # leaves them as zero (contributing nothing to pair densities).
+            norms_l = jnp.where(norms_l > 0, norms_l, 1.0)
+            norms_r = jnp.where(norms_r > 0, norms_r, 1.0)
             # psi shapes: Y=(nk, nb, ns, n_rmu), X=(nk, n_rmu, nb, ns)
             psi_l_rmu_Y_fit = psi_l_rmu_Y / norms_l[None, :, None, None]
             psi_l_rmuT_X_fit = psi_l_rmuT_X / norms_l[None, None, :, None]
             psi_r_rmu_Y_fit = psi_r_rmu_Y / norms_r[None, :, None, None]
             psi_r_rmuT_X_fit = psi_r_rmuT_X / norms_r[None, None, :, None]
-            print(f"  Pseudobands normalization: {int(np.sum(band_norms > 1.01))} "
-                  f"bands with norm > 1")
+            n_weighted = int(np.sum(band_norms > 1.01))
+            n_zero = int(np.sum(band_norms < 1e-10))
+            print(f"  Pseudobands normalization: {n_weighted} weighted, "
+                  f"{n_zero} zero-weight (skipped)")
         else:
             psi_l_rmu_Y_fit = psi_l_rmu_Y
             psi_l_rmuT_X_fit = psi_l_rmuT_X

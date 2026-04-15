@@ -73,7 +73,8 @@ def calculate_charge_density(wfn, sym, nval=None, ncond=None):
 
             # Normalize: divide out pseudoband weight so all bands
             # contribute equally to the spatial density for centroids
-            coeffs_kb = coeffs_kb / band_norms[ib]
+            if band_norms[ib] > 0:
+                coeffs_kb = coeffs_kb / band_norms[ib]
 
             for jspinor in range(2):
                 spinor_density = perform_fft_3d(coeffs_kb[jspinor], gvecs_k, fft_grid_tuple)

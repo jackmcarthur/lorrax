@@ -97,7 +97,9 @@ class WFNReader:
         self.band_norms = np.sqrt(
             np.sum(c0[:, :, :, 0]**2 + c0[:, :, :, 1]**2, axis=(1, 2))
         )  # (nbands,)
-        self.band_norms = np.maximum(self.band_norms, 1e-30)
+        # Clamp zero norms to 1.0 so division is a no-op for zero-weight bands
+        # (their coefficients are already zero, so /1.0 keeps them zero).
+        self.band_norms = np.where(self.band_norms > 0.5, self.band_norms, 1.0)
 
     def __del__(self):
         f = getattr(self, "_file", None)

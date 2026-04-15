@@ -355,6 +355,7 @@ def run_nscf(
                 k=pb_k, M_max=pb_M_max, F=pb_F,
                 n_windows_target=pb_n_windows,
                 dos_result=pb0.dos,
+                n_protected=pb0.n_det,
                 verbose=False, seed=ik)
 
             _write_pb_k(pb_writer, ik, pb_ik, H_k, gvecs_per_k[ik], nspinor, ngkmax)
