@@ -35,7 +35,7 @@ import jax
 import jax.numpy as jnp
 
 from solvers.chebyshev import jackson_coefficients
-from solvers.dos import compute_dos, dos_weighted_windows, geometric_windows, DOSResult
+from solvers.dos import compute_dos, dos_weighted_windows, geometric_windows, compute_window_partition, DOSResult, WindowPartition
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -52,6 +52,7 @@ class PseudobandsResult:
     n_pseudo: int           # number of pseudobands
     n_windows: int          # number of spectral windows
     dos: DOSResult          # the KPM DOS used for partitioning
+    windows: WindowPartition | None = None  # per-window state counts
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -197,46 +198,6 @@ def _galerkin_ritz(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  §6 continued: window weight from KPM DOS
-# ═══════════════════════════════════════════════════════════════════════
-
-def _window_weights(
-    dos: DOSResult,
-    boundaries: np.ndarray,
-    coeffs: np.ndarray,
-    M_max: int,
-) -> np.ndarray:
-    """Compute effective state count n_j^eff per window from the KPM DOS.
-
-    Uses the Jackson-smoothed bandpass envelope w_j(E)² weighted by ρ(E).
-
-    Returns (N_S,) array of n_j^eff.
-    """
-    E_grid = dos.E_grid
-    E_tilde = (E_grid - dos.center) / dos.half_width
-    E_tilde = np.clip(E_tilde, -1 + 1e-10, 1 - 1e-10)
-    n_grid = len(E_grid)
-    N_S = len(boundaries) - 1
-
-    # Precompute Chebyshev polynomials on the energy grid
-    T = np.zeros((M_max, n_grid))
-    T[0] = 1.0
-    if M_max > 1:
-        T[1] = E_tilde
-    for n in range(2, M_max):
-        T[n] = 2.0 * E_tilde * T[n-1] - T[n-2]
-
-    # Compute bandpass envelope w_j(E) = C_j(E) - C_{j-1}(E)
-    n_eff = np.zeros(N_S)
-    for j in range(N_S):
-        w_coeffs = coeffs[j+1] - coeffs[j]  # telescoped coefficients
-        w_j = np.einsum('n,ng->g', w_coeffs, T)  # (n_grid,)
-        n_eff[j] = float(np.trapezoid(dos.rho * w_j**2, E_grid))
-
-    return np.maximum(n_eff, 0.0)
-
-
-# ═══════════════════════════════════════════════════════════════════════
 #  Top-level: ritz_pseudobands
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -354,7 +315,11 @@ def ritz_pseudobands(
 
     # ── §6-7: Per-window Galerkin-Ritz + cross-window orthogonalization ──
     Phi_det_j = jnp.asarray(Phi_det, dtype=jnp.complex128) if n_det > 0 else None
-    n_eff = _window_weights(dos, boundaries, coeffs, M_max)
+    # Window weights from DOS — computed once, no CJ envelope reconstruction.
+    # KPM DOS is normalized to integrate to 1 (probability density).
+    # Scale by dim to get actual state counts.
+    win_part = compute_window_partition(dos, boundaries)
+    n_eff = win_part.n_eff * dim
 
     Xi_list = []
     theta_list = []
@@ -401,5 +366,5 @@ def ritz_pseudobands(
     return PseudobandsResult(
         Phi_out=Phi_out, E_out=E_out, weights=weights,
         n_det=n_det, n_pseudo=N_S * k, n_windows=N_S,
-        dos=dos,
+        dos=dos, windows=win_part,
     )

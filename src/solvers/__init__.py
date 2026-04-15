@@ -8,7 +8,7 @@ from solvers.chebyshev import (
     reconstruct_dos,
     partition_windows,
 )
-from solvers.dos import compute_dos, estimate_spectrum, dos_weighted_windows, geometric_windows, DOSResult
+from solvers.dos import compute_dos, estimate_spectrum, dos_weighted_windows, geometric_windows, compute_window_partition, DOSResult, WindowPartition
 from solvers.pseudobands import ritz_pseudobands, PseudobandsResult
 from solvers.quadrature import feast_ellipse_quadrature
 

@@ -295,6 +295,52 @@ def dos_weighted_windows(
     return _place_windows(tau_mid)
 
 
+@dataclass
+class WindowPartition:
+    """Window boundaries + per-window state counts from the DOS."""
+    boundaries: np.ndarray   # (N_S+1,) window boundary energies
+    n_eff: np.ndarray        # (N_S,) effective state count per window
+    E_mean: np.ndarray       # (N_S,) mean energy per window
+    N_S: int                 # number of windows
+
+
+def compute_window_partition(
+    dos: DOSResult,
+    boundaries: np.ndarray,
+) -> WindowPartition:
+    """Compute per-window state counts and mean energies from the KPM DOS.
+
+    n_eff_j = ∫_{ε_{j-1}}^{ε_j} ρ(E) dE  — total states in window j.
+    E_mean_j = ∫ E ρ(E) dE / n_eff_j      — mean energy in window j.
+
+    Call this once at partition time. Downstream (pseudobands) just reads
+    the pre-computed n_eff — no redundant DOS integration.
+    """
+    N_S = len(boundaries) - 1
+    n_eff = np.zeros(N_S)
+    E_mean = np.zeros(N_S)
+
+    E_grid = dos.E_grid
+    rho = np.maximum(dos.rho, 0.0)
+
+    for j in range(N_S):
+        mask = (E_grid >= boundaries[j]) & (E_grid < boundaries[j + 1])
+        if np.sum(mask) < 2:
+            n_eff[j] = 0.0
+            E_mean[j] = 0.5 * (boundaries[j] + boundaries[j + 1])
+            continue
+        E_win = E_grid[mask]
+        rho_win = rho[mask]
+        n_eff[j] = float(np.trapezoid(rho_win, E_win))
+        if n_eff[j] > 0:
+            E_mean[j] = float(np.trapezoid(rho_win * E_win, E_win)) / n_eff[j]
+        else:
+            E_mean[j] = 0.5 * (boundaries[j] + boundaries[j + 1])
+
+    return WindowPartition(
+        boundaries=boundaries, n_eff=n_eff, E_mean=E_mean, N_S=N_S)
+
+
 def geometric_windows(
     E_cross: float,
     E_max: float,
