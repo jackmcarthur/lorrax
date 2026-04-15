@@ -43,41 +43,38 @@ def perform_fft_3d(data_1d, gvecs, fft_grid):
 
 def calculate_charge_density(wfn, sym, nval=None, ncond=None):
     """
-    Calculate charge density in real space from wavefunctions using WFNReader: goes over all occupied states c_nk(G),
-    FFTs them to c_nk(R) (using GPU acceleration when available), squares and sums to get rho(R).
-    k-point symmetries are used. The loop order is (nband, nk_irr, n_sym).
-    n_sym is done on the GPU since symmetry operations over Gvecs can be parallelized.
+    Calculate charge density in real space from wavefunctions.
+
+    For pseudobands (non-unit norm), coefficients are divided by their
+    G-space norm so all bands contribute equally to the spatial density.
+    This prevents pseudobands from dominating centroid selection.
     """
 
-    fft_grid = jnp.asarray(wfn.fft_grid)
-    # Convert fft_grid from numpy array to tuple of integers
-    fft_grid_tuple = tuple(int(x) for x in fft_grid) #tuple(2*int(x) for x in fft_grid)
-    # NOTE THE TWO! this is zero padding (ecutrho = 4*ecutwfc due to convolution in G-space)
+    fft_grid_tuple = tuple(int(x) for x in wfn.fft_grid)
     charge_density = jnp.zeros(fft_grid_tuple, dtype=jnp.float64)
-    
-    # Loop over bands
-    nelec = int(np.sum(wfn.occs[0,0]))
+
+    nelec = int(np.sum(wfn.occs[0, 0]))
     if ncond is None and nval is None:
-        bandrange = range(nelec) # 0 to nelec-1
+        bandrange = range(nelec)
     elif ncond is not None and nval is None:
-        bandrange = range(nelec + ncond) # 0 to nelec+ncond-1
+        bandrange = range(nelec + ncond)
     elif ncond is None and nval is not None:
-        bandrange = range(nelec-nval, nelec) # nelec-nval to nelec-1
-    elif ncond is not None and nval is not None:
-        bandrange = range(nelec-nval, nelec+ncond)
+        bandrange = range(nelec - nval, nelec)
+    else:
+        bandrange = range(nelec - nval, nelec + ncond)
 
-    for ib in bandrange:  # Using first k-point's occupations
-        # Loop over k-points
-        for ik in range(1): # paper suggests only using k0
-            # Get G-vectors for this k-point
-            gvecs_k = sym.get_gvecs_kfull(wfn, ik)
-            gvecs_k = jnp.asarray(gvecs_k)
+    # Band norms from G-space (1.0 for deterministic, >1 for pseudobands)
+    band_norms = getattr(wfn, 'band_norms', np.ones(wfn.nbands))
 
-            # Get wavefunction coefficients for this k-point and band
-            coeffs_kb = sym.get_cnk_fullzone(wfn, ib, ik)
-            coeffs_kb = jnp.asarray(coeffs_kb)
+    for ib in bandrange:
+        for ik in range(1):  # k0 only for centroid selection
+            gvecs_k = jnp.asarray(sym.get_gvecs_kfull(wfn, ik))
+            coeffs_kb = jnp.asarray(sym.get_cnk_fullzone(wfn, ib, ik))
 
-            # Transform each spinor component to real space
+            # Normalize: divide out pseudoband weight so all bands
+            # contribute equally to the spatial density for centroids
+            coeffs_kb = coeffs_kb / band_norms[ib]
+
             for jspinor in range(2):
                 spinor_density = perform_fft_3d(coeffs_kb[jspinor], gvecs_k, fft_grid_tuple)
                 charge_density += (spinor_density * jnp.conj(spinor_density)).real

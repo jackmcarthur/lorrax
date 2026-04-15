@@ -88,6 +88,17 @@ class WFNReader:
         for ik in range(1, self.nkpts):
             self.kpt_starts[ik] = self.kpt_starts[ik-1] + self.ngk[ik-1]
 
+        # Band norms from G-space coefficients: ||c_n||² = Σ_{s,G} |c_{n,s}(G)|²
+        # For deterministic bands: ~1.0.  For pseudobands: sqrt(n_eff/k).
+        # Computed at k=0; consistent across k-points for uniform grids.
+        start0 = int(self.kpt_starts[0])
+        end0 = start0 + int(self.ngk[0])
+        c0 = self.coeffs[:, :, start0:end0, :]  # (nbands, nspinor, ngk0, 2)
+        self.band_norms = np.sqrt(
+            np.sum(c0[:, :, :, 0]**2 + c0[:, :, :, 1]**2, axis=(1, 2))
+        )  # (nbands,)
+        self.band_norms = np.maximum(self.band_norms, 1e-30)
+
     def __del__(self):
         f = getattr(self, "_file", None)
         if f is not None:

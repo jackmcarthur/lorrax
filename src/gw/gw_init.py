@@ -299,6 +299,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	print_fn(f"    Pair mode:   {cfg.isdf_pair_mode}")
 	print_fn(f"    Zeta output: {zeta_h5_path}")
 
+	# Band norms for pseudobands normalization (1.0 for deterministic bands)
+	_band_norms = getattr(wfn, 'band_norms', None)
+
 	with timing.section("gw_jax.zeta_fit_chunked"):
 		psi_l_yr, psi_r_yr, _psi_l_xn, _psi_r_xn, peak_bytes = fit_zeta_chunked_to_h5(
 			wfn=wfn, sym=sym, meta=meta,
@@ -313,6 +316,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			band_range_right=band_range_right,
 			isdf_pair_mode=cfg.isdf_pair_mode,
 			k_chunk_size=chunks.get('k_chunk', 0),
+			band_norms=_band_norms,
 		)
 
 	budget_gb = mem_est.get('budget_gb', cfg.memory_per_device_gb)

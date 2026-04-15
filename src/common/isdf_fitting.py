@@ -639,6 +639,7 @@ def fit_zeta_chunked_to_h5(
     isdf_pair_mode: str = "spin_traced",
     k_chunk_size: int = 0,
     q_gather_size: int = 0,
+    band_norms: np.ndarray | None = None,
 ):
     """
     Full zeta fitting pipeline with r-chunk loop and HDF5 output.
@@ -750,12 +751,32 @@ def fit_zeta_chunked_to_h5(
         print(f"  Left wfns:  {psi_l_rmu_Y.shape}")
         print(f"  Right wfns: {psi_r_rmu_Y.shape}")
 
+        # For pseudobands: normalize wavefunctions for ISDF fitting so all
+        # bands contribute equally to the pair density. The original weighted
+        # versions are kept for the returned psi_yr (GW matrix elements).
+        if band_norms is not None:
+            norms_l = jnp.asarray(band_norms[band_range_left[0]:band_range_left[1]])
+            norms_r = jnp.asarray(band_norms[band_range_right[0]:band_range_right[1]])
+            # psi shapes: Y=(nk, nb, ns, n_rmu), X=(nk, n_rmu, nb, ns)
+            psi_l_rmu_Y_fit = psi_l_rmu_Y / norms_l[None, :, None, None]
+            psi_l_rmuT_X_fit = psi_l_rmuT_X / norms_l[None, None, :, None]
+            psi_r_rmu_Y_fit = psi_r_rmu_Y / norms_r[None, :, None, None]
+            psi_r_rmuT_X_fit = psi_r_rmuT_X / norms_r[None, None, :, None]
+            print(f"  Pseudobands normalization: {int(np.sum(band_norms > 1.01))} "
+                  f"bands with norm > 1")
+        else:
+            psi_l_rmu_Y_fit = psi_l_rmu_Y
+            psi_l_rmuT_X_fit = psi_l_rmuT_X
+            psi_r_rmu_Y_fit = psi_r_rmu_Y
+            psi_r_rmuT_X_fit = psi_r_rmuT_X
+
     # ========== STEP 2: Compute CCT (C_q) from left/right pair densities ==========
+    # Uses normalized copies for fitting (equal-weight pair densities)
     with timing.section("zeta_fit.CCT"):
         print(f"  Computing pair densities P_l, P_r ({isdf_pair_mode})")
         if isdf_pair_mode == "spin_traced":
-            P_l_k = compute_pair_density_spin_traced(psi_l_rmuT_X, psi_l_rmu_Y, mesh_xy)
-            P_r_k = compute_pair_density_spin_traced(psi_r_rmuT_X, psi_r_rmu_Y, mesh_xy)
+            P_l_k = compute_pair_density_spin_traced(psi_l_rmuT_X_fit, psi_l_rmu_Y_fit, mesh_xy)
+            P_r_k = compute_pair_density_spin_traced(psi_r_rmuT_X_fit, psi_r_rmu_Y_fit, mesh_xy)
             P_l_k.block_until_ready()
             P_r_k.block_until_ready()
             C_q = compute_CCT_from_left_right(P_l_k, P_r_k, kgrid, mesh_xy)
@@ -931,27 +952,30 @@ def fit_zeta_chunked_to_h5(
                 # Slice for left and right (same logic as centroids)
                 psi_l_chunk_Y = psi_chunk_Y[:, l_band_start:l_band_end, :, :]
                 psi_r_chunk_Y = psi_chunk_Y[:, r_band_start:r_band_end, :, :]
+
+                # Normalize r-chunk wavefunctions for ISDF fitting (pseudobands)
+                if band_norms is not None:
+                    psi_l_chunk_Y = psi_l_chunk_Y / norms_l[None, :, None, None]
+                    psi_r_chunk_Y = psi_r_chunk_Y / norms_r[None, :, None, None]
             t_load_total += time.perf_counter() - t0
 
-            # 6b. Compute left/right pair densities
+            # 6b. Compute left/right pair densities (unit-normalized for fitting)
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.pair_density"):
                 if isdf_pair_mode == "spin_traced":
-                    # Left: P_l_k(μ, r) = Σ_{n,s} ψ*_l(μ) ψ_l(r)
                     P_l_k_mux = compute_pair_density_spin_traced(
-                        psi_l_rmuT_X, psi_l_chunk_Y, mesh_xy
+                        psi_l_rmuT_X_fit, psi_l_chunk_Y, mesh_xy
                     )
-                    # Right: P_r_k(μ, r) = Σ_{n,s} ψ*_r(μ) ψ_r(r)
                     P_r_k_mux = compute_pair_density_spin_traced(
-                        psi_r_rmuT_X, psi_r_chunk_Y, mesh_xy
+                        psi_r_rmuT_X_fit, psi_r_chunk_Y, mesh_xy
                     )
                 else:
                     # Keep spin channels explicit and contract only after IFFT.
                     P_l_k_mux = compute_pair_density_spin_matrix(
-                        psi_l_rmuT_X, psi_l_chunk_Y, mesh_xy
+                        psi_l_rmuT_X_fit, psi_l_chunk_Y, mesh_xy
                     )
                     P_r_k_mux = compute_pair_density_spin_matrix(
-                        psi_r_rmuT_X, psi_r_chunk_Y, mesh_xy
+                        psi_r_rmuT_X_fit, psi_r_chunk_Y, mesh_xy
                     )
                 P_l_k_mux.block_until_ready()
                 _track_peak()
