@@ -8,7 +8,7 @@ from solvers.chebyshev import (
     reconstruct_dos,
     partition_windows,
 )
-from solvers.dos import compute_dos, estimate_spectrum, geometric_windows, DOSResult
+from solvers.dos import compute_dos, estimate_spectrum, dos_weighted_windows, geometric_windows, DOSResult
 from solvers.quadrature import feast_ellipse_quadrature
 
 __all__ = [
@@ -24,6 +24,7 @@ __all__ = [
     "partition_windows",
     "compute_dos",
     "estimate_spectrum",
+    "dos_weighted_windows",
     "geometric_windows",
     "DOSResult",
     "feast_ellipse_quadrature",

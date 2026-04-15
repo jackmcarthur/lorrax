@@ -188,6 +188,113 @@ def compute_dos(
     )
 
 
+def dos_weighted_windows(
+    E_grid: np.ndarray,
+    rho: np.ndarray,
+    E_cross: float,
+    E_max: float,
+    *,
+    galerkin_order: int = 1,
+    tau: float | None = None,
+    n_windows_target: int | None = None,
+) -> np.ndarray:
+    """DOS-weighted window partition for pseudobands.
+
+    Places window boundaries so each window contributes roughly equal
+    error to χ⁰, using the actual KPM density of states rather than
+    the free-electron √E assumption.
+
+    The per-window error bound (from Altman SI Eq. S36, generalized
+    to Galerkin block order k) scales as:
+
+        n_j^eff · σ_j^{2k} / ε̄_j^{2k+1} = τ  (constant across windows)
+
+    where n_j^eff = ∫ ρ(E) dE over window j, σ_j ≈ Δ_j/√12 is the
+    energy spread, and ε̄_j is the window center (from E_F).
+
+    Parameters
+    ----------
+    E_grid : (n_grid,) energy grid (absolute energies, not relative to E_F)
+    rho : (n_grid,) DOS on that grid (states per unit energy)
+    E_cross : float — lower boundary (absolute energy, = E_F + ε_cross)
+    E_max : float — upper boundary
+    galerkin_order : int — Ritz block order k (1 = single-pole, higher = moment-matched)
+    tau : float, optional — error tolerance per window. If None, set via n_windows_target.
+    n_windows_target : int, optional — target number of windows (sets tau by bisection).
+        One of tau or n_windows_target must be provided.
+
+    Returns
+    -------
+    boundaries : (N_S+1,) array of window boundary energies.
+    """
+    # Sort and clip to [E_cross, E_max]
+    order = np.argsort(E_grid)
+    E_sorted = E_grid[order]
+    rho_sorted = np.maximum(rho[order], 0.0)
+
+    mask = (E_sorted >= E_cross) & (E_sorted <= E_max)
+    E_s = E_sorted[mask]
+    rho_s = rho_sorted[mask]
+    if len(E_s) < 2:
+        return np.array([E_cross, E_max])
+
+    # Cumulative state count N(E) = ∫_{E_cross}^{E} ρ dE'
+    dE = np.diff(E_s)
+    rho_avg = 0.5 * (rho_s[1:] + rho_s[:-1])
+    cdf = np.concatenate(([0.0], np.cumsum(rho_avg * dE)))
+
+    k = galerkin_order
+
+    def _place_windows(tau_val):
+        """Walk up the CDF placing boundaries at equal-error intervals."""
+        bounds = [E_cross]
+        while bounds[-1] < E_max - 1e-12:
+            e_lo = bounds[-1]
+            # Binary search for e_hi such that the error metric = tau_val
+            lo_idx = np.searchsorted(E_s, e_lo)
+            best_hi = E_max
+            for trial in np.linspace(e_lo + (E_max - e_lo) * 0.001, E_max, 500):
+                hi_idx = np.searchsorted(E_s, trial)
+                if hi_idx <= lo_idx:
+                    continue
+                n_eff = np.interp(trial, E_s, cdf) - np.interp(e_lo, E_s, cdf)
+                delta = trial - e_lo
+                eps_bar = 0.5 * (trial + e_lo) - E_cross + E_cross  # center from E_F=0 proxy
+                # Use center of window as ε̄ (distance from Fermi level)
+                # For conduction: ε̄ ≈ (e_lo + trial) / 2 measured from E_F
+                # We use E_cross as proxy for E_F offset since E_cross = E_F + ε_cross
+                sigma_approx = delta / np.sqrt(12.0)
+                metric = n_eff * sigma_approx ** (2 * k) / max(eps_bar, 1e-30) ** (2 * k + 1)
+                if metric >= tau_val:
+                    best_hi = trial
+                    break
+            bounds.append(min(best_hi, E_max))
+            if best_hi >= E_max:
+                break
+        bounds[-1] = E_max
+        return np.array(bounds)
+
+    if tau is not None:
+        return _place_windows(tau)
+
+    if n_windows_target is None:
+        raise ValueError("Provide either tau or n_windows_target")
+
+    # Binary search for tau that gives the target window count
+    tau_lo, tau_hi = 1e-30, 1e10
+    for _ in range(50):
+        tau_mid = np.sqrt(tau_lo * tau_hi)  # geometric mean for log-scale search
+        bounds = _place_windows(tau_mid)
+        n_w = len(bounds) - 1
+        if n_w > n_windows_target:
+            tau_lo = tau_mid  # too many windows → increase tau (less strict)
+        else:
+            tau_hi = tau_mid
+        if abs(n_w - n_windows_target) <= 1:
+            break
+    return _place_windows(tau_mid)
+
+
 def geometric_windows(
     E_cross: float,
     E_max: float,
@@ -195,8 +302,8 @@ def geometric_windows(
 ) -> np.ndarray:
     """Geometric window partition: ε_j = (1+F)^j · ε_cross.
 
-    Returns (N_S+1,) array of boundary energies (measured from E_F=0),
-    starting at E_cross and ending at E_max.
+    Simple heuristic from Altman et al. — assumes free-electron DOS.
+    Prefer dos_weighted_windows when the actual KPM DOS is available.
     """
     boundaries = [E_cross]
     while boundaries[-1] < E_max:
