@@ -231,7 +231,7 @@ def _window_weights(
     for j in range(N_S):
         w_coeffs = coeffs[j+1] - coeffs[j]  # telescoped coefficients
         w_j = np.einsum('n,ng->g', w_coeffs, T)  # (n_grid,)
-        n_eff[j] = float(np.trapz(dos.rho * w_j**2, E_grid))
+        n_eff[j] = float(np.trapezoid(dos.rho * w_j**2, E_grid))
 
     return np.maximum(n_eff, 0.0)
 

@@ -175,7 +175,7 @@ def compute_dos(
     rho = reconstruct_dos(mu_damped, E_grid, center, half_width)
 
     if verbose:
-        total_states = float(np.trapz(rho, E_grid))
+        total_states = float(np.trapezoid(rho, E_grid))
         print(f"  DOS integral: {total_states:.1f} states "
               f"(dim={dim})")
 
