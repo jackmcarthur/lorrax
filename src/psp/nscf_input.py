@@ -38,10 +38,12 @@ class NSCFInput:
     wfn_file: str = ""
     # Pseudobands
     pseudobands: bool = False
+    pb_version: int = 2
     pb_k: int = 6
     pb_M_max: int = 1500
     pb_F: float = 0.10
     pb_n_windows: int = 50
+    pb_n_prot: int = 0  # 0 = auto from crossover energy
 
 
 def read_nscf_input(filename: str) -> NSCFInput:
@@ -71,4 +73,6 @@ def read_nscf_input(filename: str) -> NSCFInput:
         pb_M_max=sec.getint("pb_M_max", 1500),
         pb_F=sec.getfloat("pb_F", 0.10),
         pb_n_windows=sec.getint("pb_n_windows", 50),
+        pb_version=sec.getint("pb_version", 2),
+        pb_n_prot=sec.getint("pb_n_prot", 0),
     )

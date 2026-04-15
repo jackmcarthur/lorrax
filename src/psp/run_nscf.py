@@ -145,10 +145,12 @@ def run_nscf(
     tol: float = 1e-8,
     do_davidson: bool = True,
     do_pseudobands: bool = False,
+    pb_version: int = 2,
     pb_k: int = 6,
     pb_M_max: int = 1500,
     pb_F: float = 0.10,
     pb_n_windows: int = 50,
+    pb_n_prot: int | None = None,
     pb_wfn_input: str | None = None,
     verbose: bool = True,
     kpoints_override: np.ndarray | None = None,
@@ -305,10 +307,13 @@ def run_nscf(
     # ══════════════════════════════════════════════════════════════
 
     if do_pseudobands:
-        from solvers.pseudobands import ritz_pseudobands
+        if pb_version == 2:
+            from solvers.pseudobands_v2 import ritz_pseudobands_v2 as _pb_func
+        else:
+            from solvers.pseudobands import ritz_pseudobands as _pb_func
 
         if verbose:
-            print(f"\n── Pseudobands (k={pb_k}, M_max={pb_M_max}, "
+            print(f"\n── Pseudobands v{pb_version} (k={pb_k}, M_max={pb_M_max}, "
                   f"{pb_n_windows} windows) ──")
 
         pb_output = os.path.splitext(output_path)[0] + "_pseudobands.h5"
@@ -319,19 +324,29 @@ def run_nscf(
         H_k0 = setup_H_k_from_kvec(kpoints[0], V_scf, vnl_setup, crystal, None,
                                      V_loc_r=V_loc, ngkmax=ngkmax)
         apply_H0_flat = _make_flat_matvec(make_apply_H(H_k0), nspinor, ngkmax)
-        Phi_det_0 = all_evecs[0].reshape(nbnd, -1)
-        E_det_0 = eigenvalues[0, :nbnd] if eigenvalues.ndim == 2 else eigenvalues[:nbnd]
+        Phi_dav_0 = all_evecs[0].reshape(nbnd, -1)
+        E_dav_0 = eigenvalues[0, :nbnd] if eigenvalues.ndim == 2 else eigenvalues[:nbnd]
 
-        pb0 = ritz_pseudobands(
-            apply_H0_flat, dim=dim_flat,
-            Phi_det=Phi_det_0, E_det=E_det_0, E_fermi=0.0,
-            k=pb_k, M_max=pb_M_max, F=pb_F,
-            n_windows_target=pb_n_windows,
-            verbose=verbose, seed=0)
+        if pb_version == 2:
+            pb0 = _pb_func(
+                apply_H0_flat, dim=dim_flat,
+                Phi_dav=Phi_dav_0, E_dav=E_dav_0, E_fermi=0.0,
+                k=pb_k, M_max=pb_M_max, F=pb_F,
+                n_prot=pb_n_prot,
+                n_windows_target=pb_n_windows,
+                verbose=verbose, seed=0)
+        else:
+            pb0 = _pb_func(
+                apply_H0_flat, dim=dim_flat,
+                Phi_det=Phi_dav_0, E_det=E_dav_0, E_fermi=0.0,
+                k=pb_k, M_max=pb_M_max, F=pb_F,
+                n_windows_target=pb_n_windows,
+                verbose=verbose, seed=0)
 
         n_total = pb0.Phi_out.shape[0]
+        n_prot_k0 = pb0.n_prot if pb_version == 2 else pb0.n_det
         if verbose:
-            print(f"  Total bands per k: {pb0.n_det} det + {pb0.n_pseudo} pseudo = {n_total}")
+            print(f"  Total bands per k: {n_prot_k0} prot + {pb0.n_pseudo} pseudo = {n_total}")
 
         # Open WFN_pseudobands.h5 with the total band count
         pb_writer = WFNWriter(pb_output, crystal, kpoints, weights, kgrid, n_total,
@@ -346,17 +361,28 @@ def run_nscf(
             H_k = setup_H_k_from_kvec(kpoints[ik], V_scf, vnl_setup, crystal, None,
                                         V_loc_r=V_loc, ngkmax=ngkmax)
             apply_H_flat = _make_flat_matvec(make_apply_H(H_k), nspinor, ngkmax)
-            Phi_det_k = all_evecs[ik].reshape(nbnd, -1)
-            E_det_k = eigenvalues[ik, :nbnd] if eigenvalues.ndim == 2 else eigenvalues[:nbnd]
+            Phi_dav_k = all_evecs[ik].reshape(nbnd, -1)
+            E_dav_k = eigenvalues[ik, :nbnd] if eigenvalues.ndim == 2 else eigenvalues[:nbnd]
 
-            pb_ik = ritz_pseudobands(
-                apply_H_flat, dim=dim_flat,
-                Phi_det=Phi_det_k, E_det=E_det_k, E_fermi=0.0,
-                k=pb_k, M_max=pb_M_max, F=pb_F,
-                n_windows_target=pb_n_windows,
-                dos_result=pb0.dos,
-                n_protected=pb0.n_det,
-                verbose=False, seed=ik)
+            if pb_version == 2:
+                pb_ik = _pb_func(
+                    apply_H_flat, dim=dim_flat,
+                    Phi_dav=Phi_dav_k, E_dav=E_dav_k, E_fermi=0.0,
+                    k=pb_k, M_max=pb_M_max, F=pb_F,
+                    n_prot=pb_n_prot,
+                    n_windows_target=pb_n_windows,
+                    dos_result=pb0.dos,
+                    n_prot_override=n_prot_k0,
+                    verbose=False, seed=ik)
+            else:
+                pb_ik = _pb_func(
+                    apply_H_flat, dim=dim_flat,
+                    Phi_det=Phi_dav_k, E_det=E_dav_k, E_fermi=0.0,
+                    k=pb_k, M_max=pb_M_max, F=pb_F,
+                    n_windows_target=pb_n_windows,
+                    dos_result=pb0.dos,
+                    n_protected=n_prot_k0,
+                    verbose=False, seed=ik)
 
             _write_pb_k(pb_writer, ik, pb_ik, H_k, gvecs_per_k[ik], nspinor, ngkmax)
 
@@ -400,7 +426,8 @@ def main():
     # Defaults
     do_davidson = True
     do_pseudobands = False
-    pb_k, pb_M_max, pb_F, pb_n_windows = 6, 1500, 0.10, 50
+    pb_version, pb_k, pb_M_max, pb_F, pb_n_windows = 2, 6, 1500, 0.10, 50
+    pb_n_prot = None
     pb_wfn_input = None
 
     if args.input:
@@ -413,10 +440,12 @@ def main():
         output = args.output or inp.output
         tol = args.tol or inp.tol
         do_pseudobands = inp.pseudobands or args.pseudobands
+        pb_version = inp.pb_version
         pb_k = inp.pb_k
         pb_M_max = inp.pb_M_max
         pb_F = inp.pb_F
         pb_n_windows = inp.pb_n_windows
+        pb_n_prot = inp.pb_n_prot if inp.pb_n_prot > 0 else None
         pb_wfn_input = inp.wfn_file if inp.rho_from_wfn else None
     else:
         if not args.save:
@@ -447,8 +476,9 @@ def main():
     run_nscf(crystal, pseudos, kgrid=kgrid, nbnd=nbnd,
              output_path=output, nosym=nosym, tol=tol,
              do_davidson=do_davidson, do_pseudobands=do_pseudobands,
-             pb_k=pb_k, pb_M_max=pb_M_max, pb_F=pb_F,
-             pb_n_windows=pb_n_windows, pb_wfn_input=pb_wfn_input,
+             pb_version=pb_version, pb_k=pb_k, pb_M_max=pb_M_max, pb_F=pb_F,
+             pb_n_windows=pb_n_windows, pb_n_prot=pb_n_prot,
+             pb_wfn_input=pb_wfn_input,
              kpoints_override=kpoints_override, weights_override=weights_override)
 
 
