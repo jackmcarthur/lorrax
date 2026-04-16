@@ -112,7 +112,12 @@ class SymMaps:
 
         # Keep an explicit alias for callers/debugging: this array is already
         # indexed by full-grid k-point and stores the matching irreducible-k id.
-        self.kpoint_map_ibz_ids = self.kpoint_map_irrbz_ids(wfn, self.unfolded_kpts)
+        self.kpoint_map_ibz_ids = np.asarray(self.kpoint_map, dtype=np.int32)
+        if np.any(self.kpoint_map_ibz_ids < 0) or np.any(self.kpoint_map_ibz_ids >= wfn.nkpts):
+            raise ValueError(
+                "kpoint_map contains entries outside the irreducible-k range: "
+                f"[0, {wfn.nkpts})"
+            )
 
         self.irk_to_k_map, self.irk_sym_map = self.find_symmetry_ops_simple(wfn, self.kpoint_map, self.unfolded_kpts)
         
@@ -206,10 +211,35 @@ class SymMaps:
         
         return symmats, symmatskvecs
 
+    @staticmethod
+    def _wrap_to_bz(kpts):
+        """Wrap crystal-coordinate vectors into the first Brillouin zone."""
+        wrapped = np.mod(np.asarray(kpts, dtype=np.float64), 1.0)
+        wrapped[wrapped > 0.99999] = 0.0
+        return wrapped
+
+    @staticmethod
+    def _periodic_delta(points, target):
+        """Return shortest-image fractional-coordinate differences."""
+        delta = np.asarray(points, dtype=np.float64) - np.asarray(target, dtype=np.float64)[None, :]
+        return delta - np.round(delta)
+
+    def _generate_uniform_full_kpoints(self, wfn):
+        """Return the full uniform crystal-coordinate k-grid implied by the WFN metadata."""
+        kx = np.linspace(0, 1, wfn.kgrid[0], endpoint=False)
+        ky = np.linspace(0, 1, wfn.kgrid[1], endpoint=False)
+        kz = np.linspace(0, 1, wfn.kgrid[2], endpoint=False)
+
+        kx += wfn.shift[0] / wfn.kgrid[0]
+        ky += wfn.shift[1] / wfn.kgrid[1]
+        kz += wfn.shift[2] / wfn.kgrid[2]
+
+        kpts_mesh = np.meshgrid(kx, ky, kz, indexing='ij')
+        return self._wrap_to_bz(np.stack([k.flatten() for k in kpts_mesh]).T)
+
     def create_kpoint_symmetry_map(self, wfn):
         """
-        Read k-point mapping from kgrid.log file.
-        Converts from 1-based to 0-based indexing for kpts.
+        Build the map from each full-grid k-point to its irreducible-k partner.
         
         Args:
             wfn (WfnReader): WFN reader object
@@ -220,19 +250,8 @@ class SymMaps:
                   matching irreducible-k index in ``wfn.kpoints``
                 - full_kpoints: Array of all k-points in the full grid
         """
-        # Generate full k-point grid
-        kx = np.linspace(0, 1, wfn.kgrid[0], endpoint=False)
-        ky = np.linspace(0, 1, wfn.kgrid[1], endpoint=False)
-        kz = np.linspace(0, 1, wfn.kgrid[2], endpoint=False)
-        
-        # Apply shift
-        kx += wfn.shift[0]/wfn.kgrid[0]
-        ky += wfn.shift[1]/wfn.kgrid[1]
-        kz += wfn.shift[2]/wfn.kgrid[2]
-        
-        # Create full k-point grid
-        kpts_mesh = np.meshgrid(kx, ky, kz, indexing='ij')
-        full_kpoints = np.stack([k.flatten() for k in kpts_mesh]).T
+        full_kpoints = self._generate_uniform_full_kpoints(wfn)
+        irr_kpts = self._wrap_to_bz(wfn.kpoints)
 
         # Map each full k-point to its irreducible representative.
         kpoint_map = np.zeros(len(full_kpoints), dtype=np.int32)
@@ -242,17 +261,10 @@ class SymMaps:
             k_found = False
             for sym_idx, sym_mat in enumerate(self.sym_mats_k):
                 # Apply symmetry operation to k-point
-                k_transformed = sym_mat @ full_kpoints[kfull_idx]
-                # Wrap to first BZ
-                k_transformed = k_transformed % 1.0
-                # Replace values close to 1 with 0
-                k_transformed[k_transformed > 0.999] = 0.0
+                k_transformed = self._wrap_to_bz(sym_mat @ full_kpoints[kfull_idx])
                 
                 # Check if transformed k-point matches any k-point in wfn.kpoints
-                for irk_idx, k in enumerate(wfn.kpoints):
-                    # Wrap irreducible k-point to [0,1) for comparison
-                    k_wrapped = k % 1.0
-                    k_wrapped[k_wrapped > 0.999] = 0.0
+                for irk_idx, k_wrapped in enumerate(irr_kpts):
                     if np.allclose(k_transformed, k_wrapped, atol=1e-6):
                         kpoint_map[kfull_idx] = irk_idx
                         k_found = True
@@ -265,10 +277,7 @@ class SymMaps:
                 # Fallback: find nearest irreducible k-point and use identity
                 # This handles cases where WFN symmetry data is incomplete
                 kfull = full_kpoints[kfull_idx]
-                dists = np.array([np.min([np.linalg.norm(kfull - k), 
-                                          np.linalg.norm(kfull - k + 1),
-                                          np.linalg.norm(kfull - k - 1)])
-                                  for k in wfn.kpoints])
+                dists = np.linalg.norm(self._periodic_delta(irr_kpts, kfull), axis=1)
                 nearest_irr = np.argmin(dists)
                 kpoint_map[kfull_idx] = nearest_irr
                 unmatched_kpts.append((kfull_idx, full_kpoints[kfull_idx], nearest_irr))
@@ -280,25 +289,15 @@ class SymMaps:
                          f"Using identity fallback. First unmatched: {unmatched_kpts[0][1]}")
         
         return kpoint_map, full_kpoints
-    
-    def kpoint_map_irrbz_ids(self, wfn, full_kpts):
-        del full_kpts  # kpoint_map already stores irreducible-k ids directly
-        kpoint_map_irrbz_ids = np.asarray(self.kpoint_map, dtype=np.int32)
-        if np.any(kpoint_map_irrbz_ids < 0) or np.any(kpoint_map_irrbz_ids >= wfn.nkpts):
-            raise ValueError(
-                "kpoint_map contains entries outside the irreducible-k range: "
-                f"[0, {wfn.nkpts})"
-            )
-        return kpoint_map_irrbz_ids
         
     def find_symmetry_ops_simple(self, wfn, kpoint_map, full_kpts):
+        del kpoint_map  # kept in signature for compatibility with older callers
         irk_to_k_map = np.zeros(full_kpts.shape[0], dtype=np.int32)
         irk_sym_map = np.zeros(full_kpts.shape[0], dtype=np.int32)
         ntran = len(self.sym_matrices)
         # all symmetries applied to the irr k-points: shape (nkbar, nsym, 3)
         Skbar = np.einsum('ijk,lk->lij', self.sym_mats_k, wfn.kpoints)
-        Skbar = Skbar % 1.0
-        Skbar = np.where(Skbar > 0.99999, 0.0, Skbar)
+        Skbar = self._wrap_to_bz(Skbar)
 
         # find the symmetry operations that map the irr k-points to the full k-points
         for ikfull, kfull in enumerate(full_kpts):
@@ -321,6 +320,70 @@ class SymMaps:
             )
 
         return irk_to_k_map, irk_sym_map
+
+    def validate_atomic_symmetries(self, wfn, tol=1e-6):
+        """Return a list of failures for spatial symmetries acting on atoms."""
+        atom_crys = np.asarray(wfn.atom_crys, dtype=np.float64)
+        atom_types = np.asarray(wfn.atom_types)
+        failures = []
+
+        for sym_idx in range(int(wfn.ntran)):
+            rot = np.asarray(np.linalg.inv(wfn.sym_matrices[sym_idx]), dtype=np.int32)
+            tau = np.asarray(wfn.translations[sym_idx], dtype=np.float64) / (2.0 * np.pi)
+            available = list(range(len(atom_crys)))
+
+            for atom_idx, pos in enumerate(atom_crys):
+                transformed = self._wrap_to_bz(rot @ pos + tau)
+                same_species = [j for j in available if atom_types[j] == atom_types[atom_idx]]
+                if not same_species:
+                    failures.append(
+                        f"sym {sym_idx}: atom {atom_idx} has no same-species candidates"
+                    )
+                    break
+
+                candidates = atom_crys[same_species]
+                metric = np.max(np.abs(self._periodic_delta(candidates, transformed)), axis=1)
+                best = int(np.argmin(metric))
+                if metric[best] > tol:
+                    failures.append(
+                        f"sym {sym_idx}: atom {atom_idx} maps to {transformed.tolist()} "
+                        "with no unique same-species match"
+                    )
+                    break
+                available.remove(same_species[best])
+
+        return failures
+
+    def validate_kgrid_unfolding(self, wfn, tol=1e-6):
+        """Return a list of failures for full-grid k-point unfolding."""
+        failures = []
+        full_grid = self._generate_uniform_full_kpoints(wfn)
+        if full_grid.shape != self.unfolded_kpts.shape:
+            return [
+                f"full-grid size mismatch: generated {full_grid.shape[0]} points, "
+                f"SymMaps has {self.unfolded_kpts.shape[0]}"
+            ]
+
+        for ik, k_full in enumerate(full_grid):
+            metric = np.max(np.abs(self._periodic_delta(self.unfolded_kpts, k_full)), axis=1)
+            ik_full = int(np.argmin(metric))
+            if metric[ik_full] > tol:
+                failures.append(
+                    f"uniform-grid point {ik} {k_full.tolist()} missing from SymMaps.unfolded_kpts"
+                )
+                continue
+
+            ik_irr = int(self.irk_to_k_map[ik_full])
+            sym_idx = int(self.irk_sym_map[ik_full])
+            sym_krep = np.asarray(self.sym_mats_k[sym_idx], dtype=np.int32)
+            kg0 = self._get_umklapp_vector(wfn, ik_full, sym_idx, ik_irr, sym_krep)
+            mapped = sym_krep @ np.asarray(wfn.kpoints[ik_irr], dtype=np.float64) + kg0
+            if np.max(np.abs(mapped - self.unfolded_kpts[ik_full])) > tol:
+                failures.append(
+                    f"ik_full={ik_full}: S*k_irr + kg0 does not reproduce full k-point"
+                )
+
+        return failures
 
     def syms_crystal_to_cartesian(self, wfn):
         """
