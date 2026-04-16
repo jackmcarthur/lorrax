@@ -39,6 +39,16 @@ static ffi::Error cross_stream_wait(cudaStream_t waiter, cudaStream_t signaller)
 // Core solve, templated on dtype.  T_A is the matrix element type (F64 or C128),
 // T_D is the eigenvalue type (F64 for both — cusolverMp returns real evs even
 // for complex Hermitian input).
+// LORRAX_FFI_PROFILE=1 turns on per-phase CUDA-event timing in the FFI
+// handler.  Writes one line per solve to stderr from rank 0.
+static inline bool profile_enabled() {
+    static const bool v = [] {
+        const char* e = std::getenv("LORRAX_FFI_PROFILE");
+        return e != nullptr && *e == '1';
+    }();
+    return v;
+}
+
 template <cudaDataType_t CudaType, typename T_A>
 static ffi::Error syevd_impl(
     cudaStream_t xla_stream,
@@ -47,9 +57,22 @@ static ffi::Error syevd_impl(
     LorraxCusolverMpCtx* ctx,
     bool compute_evecs)
 {
+    const bool prof = profile_enabled();
+    // 6 events: start, after-cross-wait, after-desc, after-bufferSize,
+    // after-solve, after-final-sync.  Record on ctx->stream so they
+    // serialise with cuSOLVERMp work.
+    cudaEvent_t ev[6];
+    if (prof) {
+        for (int i = 0; i < 6; ++i) {
+            LORRAX_CUDA_CHECK(cudaEventCreate(&ev[i]));
+        }
+        LORRAX_CUDA_CHECK(cudaEventRecord(ev[0], ctx->stream));
+    }
+
     // --- make ctx's stream wait for XLA's producers ------------------------
     auto e1 = cross_stream_wait(ctx->stream, xla_stream);
     if (!e1.success()) return e1;
+    if (prof) LORRAX_CUDA_CHECK(cudaEventRecord(ev[1], ctx->stream));
 
     // --- per-call matrix descriptors --------------------------------------
     // ia = ja = iq = jq = 1 (offsets, base-1 per ScaLAPACK convention).
@@ -68,6 +91,7 @@ static ffi::Error syevd_impl(
         cusolverMpCreateMatrixDesc(&descQ, ctx->grid, CudaType,
                                    n, n, mb, nb, 0, 0, llda),
         CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(Q)");
+    if (prof) LORRAX_CUDA_CHECK(cudaEventRecord(ev[2], ctx->stream));
 
     // compz is declared as char* in cusolverMp.h (not const); its log path
     // prints with %s and reads past a single-byte stack variable.  Give it
@@ -110,6 +134,7 @@ static ffi::Error syevd_impl(
 
     // --- reset d_info -----------------------------------------------------
     LORRAX_CUDA_CHECK(cudaMemsetAsync(ctx->d_info, 0, sizeof(int), ctx->stream));
+    if (prof) LORRAX_CUDA_CHECK(cudaEventRecord(ev[3], ctx->stream));
 
     // --- solve ------------------------------------------------------------
     mp_st = cusolverMpSyevd(
@@ -121,6 +146,8 @@ static ffi::Error syevd_impl(
         ctx->d_workspace, ctx->d_workspace_bytes,
         ctx->h_workspace, ctx->h_workspace_bytes,
         ctx->d_info);
+
+    if (prof) LORRAX_CUDA_CHECK(cudaEventRecord(ev[4], ctx->stream));
 
     cusolverMpDestroyMatrixDesc(descA);
     cusolverMpDestroyMatrixDesc(descQ);
@@ -140,6 +167,30 @@ static ffi::Error syevd_impl(
     // --- XLA's stream must wait on ctx work before downstream ops ---------
     auto e2 = cross_stream_wait(xla_stream, ctx->stream);
     if (!e2.success()) return e2;
+    if (prof) LORRAX_CUDA_CHECK(cudaEventRecord(ev[5], ctx->stream));
+
+    if (prof) {
+        // Synchronize once at the end to get valid timings, then emit the
+        // breakdown.  Rank != 0 is suppressed to keep stderr readable.
+        LORRAX_CUDA_CHECK(cudaEventSynchronize(ev[5]));
+        float t_cross_wait = 0, t_desc = 0, t_bufsz = 0, t_solve = 0, t_tail = 0;
+        cudaEventElapsedTime(&t_cross_wait, ev[0], ev[1]);
+        cudaEventElapsedTime(&t_desc,       ev[1], ev[2]);
+        cudaEventElapsedTime(&t_bufsz,      ev[2], ev[3]);
+        cudaEventElapsedTime(&t_solve,      ev[3], ev[4]);
+        cudaEventElapsedTime(&t_tail,       ev[4], ev[5]);
+        if (ctx->rank == 0) {
+            std::fprintf(stderr,
+                "[lorrax.ffi.prof] n=%ld mb=%ld nb=%ld  "
+                "cross-wait=%.2f ms  desc=%.2f ms  "
+                "bufferSize=%.2f ms  syevd=%.2f ms  tail=%.2f ms  "
+                "TOTAL(events)=%.2f ms\n",
+                (long)n, (long)mb, (long)nb,
+                t_cross_wait, t_desc, t_bufsz, t_solve, t_tail,
+                t_cross_wait + t_desc + t_bufsz + t_solve + t_tail);
+        }
+        for (int i = 0; i < 6; ++i) cudaEventDestroy(ev[i]);
+    }
 
     return ffi::Error::Success();
 }

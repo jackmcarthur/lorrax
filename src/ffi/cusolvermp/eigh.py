@@ -74,6 +74,7 @@ def distributed_eigh(
     mesh: Mesh,
     compute_evecs: bool = True,
     col_major: bool = True,
+    block_size: int | None = None,
 ) -> Tuple[jax.Array, jax.Array]:
     """Distributed Hermitian eigendecomposition via cuSOLVERMp.
 
@@ -110,18 +111,18 @@ def distributed_eigh(
         raise ValueError(
             f"n={n} must divide evenly by mesh shape ({p},{q}) in this "
             f"iteration (single-tile-per-rank).")
-    # cuSOLVERMp is documented to require the block size to divide the
-    # matrix evenly and to be "reasonable" (typically 32-256).  We set
-    # mb = nb = min(n/p, n/q, 32) so the block layout degenerates to JAX's
-    # block sharding when n == 32 * max(p,q) — the common case.
-    # TODO: support larger block sizes once the divide-by-zero inside
-    # cusolverMpSyevd_bufferSize with mb = n/p is understood.
-    mb = min(n // p, 32)
-    nb = min(n // q, 32)
-    if n % (mb * p) != 0 or n % (nb * q) != 0:
-        raise ValueError(
-            f"distributed_eigh: n={n} must be divisible by mb*p={mb*p} "
-            f"and nb*q={nb*q}.  Current mb=nb={mb}.")
+    # Block sizes for cuSOLVERMp's 2D block-cyclic distribution.  We default
+    # to mb = n/p and nb = n/q so each process owns a single contiguous
+    # tile — this is the one layout where JAX's block sharding
+    # (NamedSharding(P('x','y'))) coincides exactly with cuSOLVERMp's
+    # expected on-device layout, no repacking needed.
+    #
+    # Callers can override with explicit block_size for experimentation,
+    # but the data layout will no longer match block-cyclic; correctness
+    # of eigenvalues survives by permutation-similarity but eigenvectors
+    # will be permuted.
+    mb = n // p if block_size is None else block_size
+    nb = n // q if block_size is None else block_size
 
     # Ensure the shared library is loaded and targets registered.
     get_lib()
