@@ -69,6 +69,18 @@ endif()
 find_library(CUDART_LIBRARY cudart
     PATHS "${CUDA_TOOLKIT_ROOT}/lib64" "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/lib"
     NO_DEFAULT_PATH)
+find_library(CUSOLVER_LIBRARY cusolver
+    PATHS "${CUDA_TOOLKIT_ROOT}/lib64" "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/lib"
+    NO_DEFAULT_PATH)
+if(NOT CUSOLVER_LIBRARY)
+    message(FATAL_ERROR "libcusolver (single-GPU) not found")
+endif()
+find_library(CUSOLVERMG_LIBRARY cusolverMg
+    PATHS "${CUDA_TOOLKIT_ROOT}/lib64" "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/lib"
+    NO_DEFAULT_PATH)
+if(NOT CUSOLVERMG_LIBRARY)
+    message(FATAL_ERROR "libcusolverMg (multi-GPU single-process) not found")
+endif()
 find_library(NCCL_LIBRARY nccl
     PATHS "/lib/x86_64-linux-gnu" "/usr/lib/x86_64-linux-gnu"
           "${NVHPC_ROOT}/comm_libs/${NVHPC_CUDA_SUBDIR}/nccl/lib"
@@ -87,6 +99,7 @@ set(LORRAX_FFI_SOURCES
     api.cc
     ../../cusolvermp/cpp/context.cc
     ../../cusolvermp/cpp/eigh_ffi.cc
+    ../../cusolvermg/cpp/eigh_mg_ffi.cc
 )
 
 add_library(lorrax_ffi SHARED ${LORRAX_FFI_SOURCES})
@@ -113,6 +126,8 @@ target_link_libraries(lorrax_ffi PRIVATE
     "${CUSOLVERMP_LIBDIR}/libcusolverMp.so"
     "${NCCL_LIBRARY}"
     "${CUDART_LIBRARY}"
+    "${CUSOLVER_LIBRARY}"
+    "${CUSOLVERMG_LIBRARY}"
 )
 
 target_compile_options(lorrax_ffi PRIVATE

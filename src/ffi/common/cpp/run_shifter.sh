@@ -19,6 +19,10 @@ set -euo pipefail
 NVHPC_HOST="${LORRAX_FFI_NVHPC_DIR:-/pscratch/sd/j/jackm/lorrax_nvhpc}"
 IMAGE="${LORRAX_FFI_IMAGE:-nvcr.io/nvidia/jax:25.04-py3}"
 NGPU="${LORRAX_NGPU:-1}"
+# LORRAX_NTASKS controls the # of srun tasks.  For multi-process JAX
+# (cusolverMp) it should equal NGPU (1 rank per GPU).  For single-process
+# multi-GPU (cusolverMg), set LORRAX_NTASKS=1 LORRAX_NGPU=4.
+NTASKS="${LORRAX_NTASKS:-${NGPU}}"
 
 if [[ ! -d "${NVHPC_HOST}" ]]; then
     echo "run_shifter.sh: staged NVHPC dir ${NVHPC_HOST} does not exist."
@@ -52,7 +56,7 @@ SHIFTER_ARGS=(
 
 if [[ -n "${SLURM_JOBID:-}" && -z "${SLURM_STEP_ID:-}" ]]; then
     jobflag="--jobid=${SLURM_JOBID}"
-    exec srun "${jobflag}" --gres=gpu:"${NGPU}" -N 1 -n "${NGPU}" \
+    exec srun "${jobflag}" --gres=gpu:"${NGPU}" -N 1 -n "${NTASKS}" \
         "${SHIFTER_ARGS[@]}" "$@"
 else
     exec "${SHIFTER_ARGS[@]}" "$@"

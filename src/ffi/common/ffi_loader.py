@@ -38,6 +38,7 @@ _LIB: Optional[ctypes.CDLL] = None
 _FFI_TARGET_SYMBOLS = {
     "lorrax_cusolvermp_eigh_f64":  "EighF64",
     "lorrax_cusolvermp_eigh_c128": "EighC128",
+    "lorrax_cusolvermg_eigh_f64":  "EighMgF64",
 }
 
 # Error buffer size for the lrx_ wrappers.
