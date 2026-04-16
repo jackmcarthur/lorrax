@@ -30,6 +30,55 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+
+# ── Multi-process bootstrap ────────────────────────────────────────────
+# run_nscf is embarrassingly k-parallel: each k-point is an independent
+# Davidson diagonalization. Under SLURM (multiple srun tasks), we initialize
+# jax.distributed so every process sees exactly one GPU, then stride
+# k-points over ranks. Same pattern as gw.gw_jax._maybe_init_jax_distributed.
+_DISTRIBUTED_SENTINEL = "_LORRAX_JAX_DISTRIBUTED_DONE"
+
+
+def _maybe_init_jax_distributed() -> None:
+    if os.environ.get(_DISTRIBUTED_SENTINEL):
+        return
+    proc_count = int(
+        os.environ.get("JAX_PROCESS_COUNT",
+        os.environ.get("JAX_NUM_PROCESSES",
+        os.environ.get("SLURM_NTASKS", "1"))))
+    if proc_count > 1:
+        try:
+            jax.distributed.initialize()
+            os.environ[_DISTRIBUTED_SENTINEL] = "1"
+            return
+        except Exception:
+            pass
+        coord = os.environ.get("JAX_COORDINATOR_ADDRESS")
+        if coord is None:
+            import subprocess
+            nodelist = os.environ.get("SLURM_NODELIST")
+            if nodelist:
+                try:
+                    result = subprocess.run(
+                        ["scontrol", "show", "hostnames", nodelist],
+                        capture_output=True, text=True, check=True)
+                    coord = f"{result.stdout.strip().splitlines()[0]}:12355"
+                except Exception:
+                    pass
+            if coord is None:
+                host = (os.environ.get("SLURMD_NODENAME") or
+                        os.environ.get("HOSTNAME") or "localhost")
+                coord = f"{host}:12355"
+        proc_id = int(os.environ.get("JAX_PROCESS_INDEX",
+                                     os.environ.get("SLURM_PROCID", "0")))
+        jax.distributed.initialize(coordinator_address=coord,
+                                   num_processes=proc_count,
+                                   process_id=proc_id)
+    os.environ[_DISTRIBUTED_SENTINEL] = "1"
+
+
+_maybe_init_jax_distributed()
+
 from file_io import CrystalData, WFNWriter
 from psp.pseudos import load_pseudopotentials
 from psp.ionic_gspace import build_ionic_and_core
@@ -172,6 +221,7 @@ def run_nscf(
     nspinor = crystal.nspinor
     t_start = time.perf_counter()
 
+    verbose = verbose and jax.process_index() == 0
     if verbose:
         mode = []
         if do_davidson:
@@ -182,7 +232,7 @@ def run_nscf(
         print(f"  kgrid={kgrid}, fft={fft_grid}, nspinor={nspinor}")
         if truncation_2d:
             print(f"  2D Coulomb truncation (from assume_isolated='2D')")
-        print(f"  GPUs: {len(jax.devices())}")
+        print(f"  GPUs: {len(jax.devices())}  (processes: {jax.process_count()})")
 
     # ── Build potentials ────────────────────────────────────────
     V_scf, V_loc, vnl_setup = _build_potentials(crystal, pseudos, verbose)
@@ -214,15 +264,21 @@ def run_nscf(
         if verbose:
             print(f"  JIT warmup: {time.perf_counter()-t1:.2f}s")
 
-        writer = WFNWriter(output_path, crystal, kpoints, weights, kgrid, nbnd,
-                            gvecs_per_k, nosym=nosym)
+        rank = jax.process_index()
+        n_proc = jax.process_count()
 
         eigenvalues = np.zeros((nk, nbnd))
+        # Per-rank evecs buffer (QE-ordered, padded to ngkmax). Zero on ranks
+        # that don't own a given ik; the final reduction is a sum, which is
+        # safe because each ik has exactly one owner.
+        local_coeffs = np.zeros((nk, nbnd, nspinor, ngkmax), dtype=np.complex128)
         if do_pseudobands:
             all_evecs = np.zeros((nk, nbnd, nspinor, ngkmax), dtype=np.complex128)
 
         t_dav = time.perf_counter()
         for ik in range(nk):
+            if ik % n_proc != rank:
+                continue
             tk = time.perf_counter()
             H_k = setup_H_k_from_kvec(kpoints[ik], V_scf, vnl_setup, crystal, None,
                                         V_loc_r=V_loc, ngkmax=ngkmax)
@@ -236,19 +292,51 @@ def run_nscf(
 
             eigenvalues[ik] = evals
             evecs_np = np.asarray(evecs)
-            writer.write_k(ik, evals, reorder_to_qe(evecs_np, H_k, gvecs_per_k[ik]))
+            qe_evecs = reorder_to_qe(evecs_np, H_k, gvecs_per_k[ik])
+            # Pad/copy into the fixed (nbnd, nspinor, ngkmax) slot
+            ng_k = qe_evecs.shape[-1]
+            local_coeffs[ik, :, :, :ng_k] = qe_evecs
 
             if do_pseudobands:
                 all_evecs[ik] = evecs_np
 
             if verbose and (ik < 3 or ik == nk - 1 or (ik + 1) % 16 == 0):
-                print(f"  k={ik:3d}/{nk}: {time.perf_counter()-tk:.3f}s  "
-                      f"evals[0]={evals[0]:.6f} Ry")
+                print(f"  [rank {rank}] k={ik:3d}/{nk}: "
+                      f"{time.perf_counter()-tk:.3f}s  evals[0]={evals[0]:.6f} Ry")
 
-        writer.close()
-        if verbose:
+        # Gather evals + evecs across processes. Each ik has one owner (sum
+        # reduction over the zero-initialised buffers gives the right answer).
+        if n_proc > 1:
+            from jax.experimental import multihost_utils as _mh
+            eigenvalues = np.asarray(
+                _mh.process_allgather(jnp.asarray(eigenvalues), tiled=False)
+            ).reshape(n_proc, nk, nbnd).sum(axis=0)
+            local_coeffs = np.asarray(
+                _mh.process_allgather(jnp.asarray(local_coeffs), tiled=False)
+            ).reshape(n_proc, nk, nbnd, nspinor, ngkmax).sum(axis=0)
+            if do_pseudobands:
+                all_evecs = np.asarray(
+                    _mh.process_allgather(jnp.asarray(all_evecs), tiled=False)
+                ).reshape(n_proc, nk, nbnd, nspinor, ngkmax).sum(axis=0)
+            _mh.sync_global_devices("run_nscf_kloop_done")
+
+        # Only rank 0 writes the WFN.h5 file; H5 is not parallel-writable here.
+        if rank == 0:
+            writer = WFNWriter(output_path, crystal, kpoints, weights, kgrid,
+                                nbnd, gvecs_per_k, nosym=nosym)
+            for ik in range(nk):
+                ng_k = gvecs_per_k[ik].shape[0]
+                writer.write_k(ik, eigenvalues[ik],
+                               local_coeffs[ik, :, :, :ng_k])
+            writer.close()
+        if n_proc > 1:
+            from jax.experimental import multihost_utils as _mh
+            _mh.sync_global_devices("run_nscf_wfn_written")
+
+        if verbose and rank == 0:
             dt = time.perf_counter() - t_dav
-            print(f"  Davidson: {dt:.2f}s ({dt/nk:.3f}s/k) → {output_path}")
+            print(f"  Davidson: {dt:.2f}s ({dt/nk:.3f}s/k, "
+                  f"{n_proc} rank{'s' if n_proc>1 else ''}) → {output_path}")
 
     # ══════════════════════════════════════════════════════════════
     #  Pseudobands-only: load deterministic bands from WFN.h5
