@@ -110,7 +110,8 @@ class SymMaps:
         # get the list of full zone k-points and the map from k_full to k_irr
         self.kpoint_map, self.unfolded_kpts = self.create_kpoint_symmetry_map(wfn)
 
-        # change the map from "k_full points indexed by full grid position" to "k_full points indexed by irr. k-point position"
+        # Keep an explicit alias for callers/debugging: this array is already
+        # indexed by full-grid k-point and stores the matching irreducible-k id.
         self.kpoint_map_ibz_ids = self.kpoint_map_irrbz_ids(wfn, self.unfolded_kpts)
 
         self.irk_to_k_map, self.irk_sym_map = self.find_symmetry_ops_simple(wfn, self.kpoint_map, self.unfolded_kpts)
@@ -215,12 +216,10 @@ class SymMaps:
             
         Returns:
             tuple: (kpoint_map, full_kpoints)
-                - kpoint_map: Array mapping each k-point to its irreducible k-point (full zone)
+                - kpoint_map: Array mapping each full-grid k-point to the
+                  matching irreducible-k index in ``wfn.kpoints``
                 - full_kpoints: Array of all k-points in the full grid
         """
-        kpoint_map = []
-        parsing = False
-        
         # Generate full k-point grid
         kx = np.linspace(0, 1, wfn.kgrid[0], endpoint=False)
         ky = np.linspace(0, 1, wfn.kgrid[1], endpoint=False)
@@ -235,13 +234,13 @@ class SymMaps:
         kpts_mesh = np.meshgrid(kx, ky, kz, indexing='ij')
         full_kpoints = np.stack([k.flatten() for k in kpts_mesh]).T
 
-        # Map each full k-point to its symmetry operation
+        # Map each full k-point to its irreducible representative.
         kpoint_map = np.zeros(len(full_kpoints), dtype=np.int32)
         unmatched_kpts = []
         
         for kfull_idx in range(len(full_kpoints)):
             k_found = False
-            for i, sym_mat in enumerate(self.sym_mats_k):
+            for sym_idx, sym_mat in enumerate(self.sym_mats_k):
                 # Apply symmetry operation to k-point
                 k_transformed = sym_mat @ full_kpoints[kfull_idx]
                 # Wrap to first BZ
@@ -250,12 +249,12 @@ class SymMaps:
                 k_transformed[k_transformed > 0.999] = 0.0
                 
                 # Check if transformed k-point matches any k-point in wfn.kpoints
-                for j, k in enumerate(wfn.kpoints):
+                for irk_idx, k in enumerate(wfn.kpoints):
                     # Wrap irreducible k-point to [0,1) for comparison
                     k_wrapped = k % 1.0
                     k_wrapped[k_wrapped > 0.999] = 0.0
                     if np.allclose(k_transformed, k_wrapped, atol=1e-6):
-                        kpoint_map[kfull_idx] = i
+                        kpoint_map[kfull_idx] = irk_idx
                         k_found = True
                         break
                 
@@ -271,7 +270,7 @@ class SymMaps:
                                           np.linalg.norm(kfull - k - 1)])
                                   for k in wfn.kpoints])
                 nearest_irr = np.argmin(dists)
-                kpoint_map[kfull_idx] = 0  # identity symmetry
+                kpoint_map[kfull_idx] = nearest_irr
                 unmatched_kpts.append((kfull_idx, full_kpoints[kfull_idx], nearest_irr))
         
         if unmatched_kpts:
@@ -283,15 +282,13 @@ class SymMaps:
         return kpoint_map, full_kpoints
     
     def kpoint_map_irrbz_ids(self, wfn, full_kpts):
-        irr_kpts = wfn.kpoints
-
-        kpoint_map_irrbz_ids = np.zeros_like(self.kpoint_map)
-        for i, idx in enumerate(self.kpoint_map):
-            target_kpt = full_kpts[idx]  # Get the k-point this maps to
-            # Find this k-point's index in irr_kpts
-            irr_idx = np.argmin(np.sum(np.abs(irr_kpts - target_kpt), axis=1))
-            kpoint_map_irrbz_ids[i] = irr_idx
-
+        del full_kpts  # kpoint_map already stores irreducible-k ids directly
+        kpoint_map_irrbz_ids = np.asarray(self.kpoint_map, dtype=np.int32)
+        if np.any(kpoint_map_irrbz_ids < 0) or np.any(kpoint_map_irrbz_ids >= wfn.nkpts):
+            raise ValueError(
+                "kpoint_map contains entries outside the irreducible-k range: "
+                f"[0, {wfn.nkpts})"
+            )
         return kpoint_map_irrbz_ids
         
     def find_symmetry_ops_simple(self, wfn, kpoint_map, full_kpts):
