@@ -78,8 +78,16 @@ def shard_matrix(A: np.ndarray, mesh: Mesh) -> jax.Array:
 
 
 def gather_to_numpy(x: jax.Array) -> np.ndarray:
-    # jax.device_get on a sharded array materialises globally on the host.
-    return np.asarray(jax.device_get(x))
+    """Global gather of a (possibly) multi-process sharded jax.Array.
+
+    For replicated arrays ``jax.device_get`` works, but for a
+    ``P('x','y')``-sharded array in a multi-process job each process can
+    only see its own local shard — we must go through
+    ``multihost_utils.process_allgather`` to stitch the full logical
+    array together on every process.
+    """
+    from jax.experimental import multihost_utils
+    return np.asarray(multihost_utils.process_allgather(x, tiled=True))
 
 
 # ===========================================================================

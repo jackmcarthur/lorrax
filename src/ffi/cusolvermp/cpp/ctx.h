@@ -4,9 +4,20 @@
 #include <cstddef>
 #include <cuda_runtime.h>
 #include <nccl.h>
+#include <cal.h>
 #include <cusolverMp.h>
 
 namespace lorrax_ffi::cusolvermp {
+
+// "Shim" struct passed through CAL's user-data slot to our three allgather
+// callbacks.  Lives for the lifetime of the LorraxCusolverMpCtx.
+struct CalNcclShim {
+    ncclComm_t    nccl_comm  = nullptr;
+    cudaStream_t  stream     = nullptr;
+    // Scratch device buffer reused across allgathers; grown on demand.
+    void*         d_scratch       = nullptr;
+    size_t        d_scratch_bytes = 0;
+};
 
 struct LorraxCusolverMpCtx {
     // identity
@@ -20,7 +31,9 @@ struct LorraxCusolverMpCtx {
     ncclComm_t          nccl_comm  = nullptr;
     cudaStream_t        stream     = nullptr;
     cusolverMpHandle_t  handle     = nullptr;
+    cal_comm_t          cal_comm   = nullptr;   // our CAL wrapper over NCCL
     cusolverMpGrid_t    grid       = nullptr;
+    CalNcclShim         shim{};                 // stable address — CAL holds a ptr
 
     // per-call scratch reused across invocations
     void*   d_workspace       = nullptr;
