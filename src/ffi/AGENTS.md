@@ -1,18 +1,19 @@
 # `src/ffi/` — JAX Foreign Function Interface bridge
 
 Scaffolding for calling compiled (C/C++/CUDA) libraries from JAX via the
-XLA FFI.  Currently targets NVIDIA multi-GPU linear algebra.
-
-Two variants are wired in:
+XLA FFI.  Current targets — both **working** on 1 node × 4×A100 (NERSC
+Perlmutter):
 
 | Subpackage | Library | Process model | Status |
 |---|---|---|---|
-| `ffi.cusolvermg` | **cuSOLVERMg** (single-process, multi-GPU) | 1 Python proc × N GPUs | **Working** — F64 eigh validated at n=128 and n=2048 on 4×A100 |
-| `ffi.cusolvermp` | **cuSOLVERMp** (multi-process, multi-GPU/multi-node) | 1 Python proc per GPU | **WIP** — builds, NCCL bootstrap works, but `cusolverMpSyevd_bufferSize` traps (see "Open issue" below) |
+| `ffi.cusolvermp` | **cuSOLVERMp** (multi-process, multi-GPU / multi-node) | 1 Python proc per GPU | F64 + C128 validated at n=128 |
+| `ffi.cusolvermg` | **cuSOLVERMg** (single-process, multi-GPU, in-container) | 1 Python proc × N GPUs | F64 validated at n∈{128, 2048} |
 
-The cuSOLVERMg path is the recommended entry point for new callers on a
-single node.  cuSOLVERMp will be unblocked once the ncclComm ↔ cal_comm
-plumbing is sorted out.
+Multi-process via NCCL is the real scaffold — the same build + loader +
+bootstrap pattern is how ELPA (or any MPI-or-NCCL distributed solver)
+would plug in.  The single-process Mg path is kept around as the
+simplest callable entry point for small jobs where distributed setup
+would be overkill.
 
 ## Layout
 
@@ -27,33 +28,33 @@ ffi/
 │       ├── run_shifter.sh     launches Shifter w/ bind-mounts the build needs
 │       ├── xla_ffi_glue.h     CUDA / CUSOLVER error-checking macros
 │       └── api.cc             extern "C" ABI (context create/destroy, etc.)
-├── cusolvermg/                ← the working path
-│   ├── __init__.py            public: eigh_mg
-│   ├── eigh.py                Python wrapper (single-process, jit)
+├── cusolvermp/
+│   ├── __init__.py            public: distributed_eigh
+│   ├── context.py             Python singleton (NCCL bootstrap via KV store)
+│   ├── eigh.py                shard_map wrapper
 │   └── cpp/
-│       └── eigh_mg_ffi.cc     XLA_FFI_DEFINE_HANDLER_SYMBOL(EighMgF64)
-└── cusolvermp/                ← WIP (see Open issue below)
-    ├── __init__.py            public: distributed_eigh
-    ├── context.py             Python singleton (NCCL bootstrap via KV store)
-    ├── eigh.py                shard_map wrapper
+│       ├── ctx.h              Ctx + CalNcclShim
+│       ├── context.cc         cal_comm_create with NCCL-backed allgather
+│       └── eigh_ffi.cc        XLA_FFI_DEFINE_HANDLER_SYMBOL(Eigh{F64,C128})
+└── cusolvermg/
+    ├── __init__.py            public: eigh_mg
+    ├── eigh.py                single-process jit wrapper
     └── cpp/
-        ├── ctx.h
-        ├── context.cc         cusolverMpCreate / Grid / ncclCommInitRank
-        └── eigh_ffi.cc        XLA_FFI_DEFINE_HANDLER_SYMBOL(Eigh{F64,C128})
+        └── eigh_mg_ffi.cc     XLA_FFI_DEFINE_HANDLER_SYMBOL(EighMgF64)
 ```
 
 ## Dependencies
 
 - **Container**: `nvcr.io/nvidia/jax:25.04-py3` (CUDA 12.9, JAX 0.5.3.dev,
   NCCL 2.26, `libcusolver*`, `libcusolverMg*`, `libucc` all in-container).
-- **NVIDIA HPC SDK** (for cuSOLVERMp ONLY — the Mg path needs nothing
-  outside the container): `/opt/nvidia/hpc_sdk/Linux_x86_64/25.5/`
-  on NERSC, staged to `/pscratch/.../lorrax_nvhpc` and bind-mounted
-  into Shifter at `/lorrax_nvhpc`.
+- **NVIDIA HPC SDK** (for cuSOLVERMp; the Mg path needs nothing
+  outside the container): `/opt/nvidia/hpc_sdk/Linux_x86_64/25.5/` on
+  NERSC, staged to `/pscratch/.../lorrax_nvhpc` and bind-mounted into
+  Shifter at `/lorrax_nvhpc`.
 - **No Python build-system deps**: no pybind/nanobind/scikit-build.
-  The `.so` is plain C ABI, loaded at runtime via `ctypes.CDLL`.
+  The `.so` is plain C ABI loaded at runtime via `ctypes.CDLL`.
 
-## Bind-mount of HPC SDK (only needed for the cuSOLVERMp path)
+## Bind-mount of HPC SDK (only for the cuSOLVERMp path)
 
 Shifter forbids `/opt/nvidia` as a bind source.  Stage the minimum
 subset:
@@ -71,9 +72,8 @@ cp -a /opt/nvidia/hpc_sdk/Linux_x86_64/25.5/comm_libs/12.9/nccl/include/nccl.h \
 ```
 
 `run_shifter.sh` bind-mounts `$LORRAX_FFI_NVHPC_DIR` (default
-`/pscratch/sd/j/jackm/lorrax_nvhpc`) to `/lorrax_nvhpc` inside the
-container and sets `LD_LIBRARY_PATH` so `libcusolverMp.so` and
-`libcal.so` resolve at load time.
+`/pscratch/sd/j/jackm/lorrax_nvhpc`) to `/lorrax_nvhpc` and bakes an
+rpath so `libcusolverMp.so` / `libcal.so` resolve automatically.
 
 ## Build
 
@@ -85,66 +85,81 @@ src/ffi/common/cpp/run_shifter.sh bash src/ffi/common/cpp/build.sh
 
 Output: `src/ffi/common/cpp/build/liblorrax_ffi.so`.
 
-## Run the cusolverMg test (the working path)
+## Run the cuSOLVERMp test (multi-process)
 
 ```bash
-# single process, 4 GPUs visible
+LORRAX_NGPU=4 src/ffi/common/cpp/run_shifter.sh env \
+    CUSOLVERMP_FORCE_NCCL=1 \
+    XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 \
+    XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    python3 -u -m common.cusolvermp_eigh_test --grid 2 2
+```
+
+Required env vars:
+
+| Var | Why |
+|---|---|
+| `CUSOLVERMP_FORCE_NCCL=1` | Route libcal's runtime collectives through NCCL instead of UCC.  Without it cuSOLVERMp tries UCC → InfiniBand → fails on many sites. |
+| `XLA_PYTHON_CLIENT_MEM_FRACTION=0.5` | Leave headroom for cuSOLVERMp + libcal workspace.  LORRAX's module default of 0.95 starves the solver. |
+| `XLA_PYTHON_CLIENT_PREALLOCATE=false` | Allocate on demand so the above reservation isn't burned up front. |
+
+Validated (n=128, 1 node × 4×A100, 2×2 grid):
+- F64 symmetric : max |evals−ref| = 9.1e-13
+- C128 Hermitian: max |evals−ref| = 5.7e-13
+
+## Run the cuSOLVERMg test (single-process)
+
+```bash
 LORRAX_NGPU=4 LORRAX_NTASKS=1 \
     src/ffi/common/cpp/run_shifter.sh \
     python3 -u -m common.cusolvermg_eigh_test
 ```
 
-Validated results on 1 node × 4 A100:
-- n=128 , tile=32  → max |evals-ref| = 9.1e-13, wall = 57 ms
-- n=2048, tile=256 → max |evals-ref| = 2.2e-11, wall = 509 ms
+Validated (F64):
+- n=128,  tile=32  → max |evals-ref| = 9.1e-13, 57 ms (post-warmup)
+- n=2048, tile=256 → max |evals-ref| = 2.2e-11, 509 ms
 
-Eigenvector residuals `‖A q_i − λ_i q_i‖∞` ≈ 7e-14 (F64) in the
-row-vector view (cuSOLVERMg writes column-major; JAX reads row-major;
-for A = A^T they match by transposition).
+## How the cuSOLVERMp NCCL bootstrap works (summary)
 
-## Run the cusolverMp test (currently WIP)
+1. Python: rank 0 fills a 128-byte `ncclUniqueId` via our `lrx_*` C API.
+2. Python: **all ranks** broadcast the bytes via
+   `jax.distributed.global_state.client.key_value_set/blocking_key_value_get`
+   (which uses JAX's already-live KV store — avoids the
+   `multihost_utils.broadcast_one_to_all` gotcha that promotes `uint8`
+   → `uint64` under `jax_enable_x64=True`).
+3. Python: calls our `lrx_create_cusolvermp_context(...)` ctypes
+   function.  In C++:
+   - `ncclCommInitRank` → full NCCL communicator.
+   - `cal_comm_create(params, &cal_comm)` with callbacks
+     (`allgather`, `req_test`, `req_free`) that route via
+     `ncclAllGather` on our private CUDA stream.  This is NVIDIA's
+     documented non-MPI CAL bootstrap.
+   - `cusolverMpCreate` → handle tied to our stream.
+   - `cusolverMpCreateDeviceGrid(handle, cal_comm, p, q, …)` → grid.
+4. FFI handler per solve: creates matrix descriptors, runs
+   `cusolverMpSyevd_bufferSize` + `cusolverMpSyevd`, done.
 
-See the 2026-04-16 report for context; this path builds fine but
-`cusolverMpSyevd_bufferSize` traps SIGFPE (divide-by-zero) deep inside
-the library regardless of `mb ∈ {32, 64}`, `compz ∈ {N, V}`, or
-`CUSOLVERMP_FORCE_NCCL=1`.
-
-## Open issue — cuSOLVERMp
-
-Suspected cause: the NVIDIA `mp_syevd.c` sample passes `ncclComm_t`
-directly to `cusolverMpCreateDeviceGrid` (which expects `cal_comm_t`);
-C's lax pointer conversion makes this compile silently.  The sample runs
-**under MPI**, so libcal's internal MPI-based initialization path is
-live and presumably intercepts the ncclComm correctly.  Our LORRAX FFI
-process uses `jax.distributed` + direct NCCL (no MPI), so the CAL layer
-never sees MPI and misreads the comm — `cal_comm_get_size` returns 0 and
-bufferSize divides by zero.
-
-Follow-up options:
-1. Link + call `MPI_Init` from the FFI handle-creation path (the
-   container has OpenMPI at `/opt/hpcx/ompi/`).
-2. Use `cal_comm_create` with an NCCL-backed allgather callback, which
-   is the documented CAL-without-MPI path.
-3. Upgrade to NVHPC 25.9 (cuSOLVERMp 0.7.0.0) in a CUDA 13 container
-   (`nvcr.io/nvidia/jax:25.08-py3`) to pick up any NCCL-direct fixes.
-
-## Adding a new FFI target
+## Adding a new FFI target (e.g. ELPA)
 
 1. Create `src/ffi/<lib>/cpp/<feature>_ffi.cc` with
    `XLA_FFI_DEFINE_HANDLER_SYMBOL(<Name>, <Host>, <Bind>)`.
 2. Append the `.cc` to `LORRAX_FFI_SOURCES` in
-   `common/cpp/CMakeLists.txt`.
-3. Add an entry to `_FFI_TARGET_SYMBOLS` in `common/ffi_loader.py`.
-4. Write a Python wrapper `src/ffi/<lib>/<feature>.py` that calls
-   `get_lib()` then `jax.ffi.ffi_call(<target_name>, …)`.
-5. Rebuild: `bash src/ffi/common/cpp/build.sh`.
+   `common/cpp/CMakeLists.txt`; add `-l<lib>` to target_link_libraries.
+3. Add `"lorrax_<lib>_<feature>": "<Name>"` to
+   `_FFI_TARGET_SYMBOLS` in `common/ffi_loader.py`.
+4. If the library needs its own communicator (ELPA needs an MPI
+   communicator, say), reuse the `ncclUniqueId` bootstrap pattern in
+   `cusolvermp/context.py` with the library's own unique-id broadcast
+   primitive.
+5. Write a Python wrapper `src/ffi/<lib>/<feature>.py` that calls
+   `get_lib()` → gets the context → wraps `jax.ffi.ffi_call` in a
+   `shard_map` with the appropriate `PartitionSpec`.
+6. Rebuild: `bash src/ffi/common/cpp/build.sh`.
 
 ## Non-goals (this iteration)
 
 - Autodiff / custom_vjp.
-- Complex Hermitian in the Mg path (wired but not validated; the type
-  dispatch in `eigh_mg_ffi.cc` currently only implements F64).
-- Multi-node (cuSOLVERMg is single-node; cuSOLVERMp can do it once the
-  bufferSize issue is resolved).
-- Automatic row-major ↔ column-major layout conversion.  Users of
-  `eigh_mg` read the eigenvectors in row-major view (see test).
+- Multi-node (the NCCL bootstrap is multi-node-ready but untested
+  there; on Perlmutter this needs NCCL_IB / OFI config).
+- `input_output_aliases` into/out of `ffi_call` — would donate the
+  input buffer to the output and eliminate a copy.
