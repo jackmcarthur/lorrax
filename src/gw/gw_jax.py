@@ -352,6 +352,13 @@ def main(argv=None):
 		sig_x = sigma_sx(wfns, Gij, V_q)
 	sig_x.block_until_ready()
 
+	# Add bare-exchange head correction (q→0 contribution)
+	if static_head_terms is not None:
+		x_head, _ = static_head_terms_to_kij(
+			static_head_terms, nk_tot=meta.nk_tot, do_screened=False)
+		rep = NamedSharding(mesh_xy, P(None, None, None))
+		sig_x = sig_x + jax.device_put(x_head, rep)
+
 	# Print bare Σ_X diagonal for ISDF quality assessment
 	sig_x_diag = np.real(np.diagonal(np.asarray(sig_x), axis1=1, axis2=2)) * ryd2ev
 	print0(f"  Bare Σ_X diagonal (eV), k=0: "
