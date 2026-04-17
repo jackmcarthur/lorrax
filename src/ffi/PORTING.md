@@ -154,7 +154,7 @@ HDF5 / MPI-IO.  Two stacks are supported, selected via
 
 - **HDF5**: conda-forge `hdf5-1.14.6-mpi_openmpi_*.conda`,
   staged at `/pscratch/sd/$USER/lorrax_phdf5_openmpi/stage/`.
-  Regenerate with `~/software/lorrax_phdf5_openmpi/rebuild_stage.sh`.
+  Regenerate with [`src/ffi/phdf5/scripts/stage_openmpi.sh`](phdf5/scripts/stage_openmpi.sh).
 - **MPI**: the JAX container's bundled HPC-X OpenMPI at
   `/opt/hpcx/ompi`, satisfying `libmpi.so.40`.
 - **Shifter modules**: `--module=gpu` only.
@@ -166,7 +166,7 @@ HDF5 / MPI-IO.  Two stacks are supported, selected via
 
 - **HDF5**: a copy of the host's `cray-hdf5-parallel` module, staged
   at `/pscratch/sd/$USER/lorrax_phdf5_cray/stage/`.  Regenerate with
-  `~/software/lorrax_phdf5_cray/rebuild_stage.sh`.
+  [`src/ffi/phdf5/scripts/stage_cray.sh`](phdf5/scripts/stage_cray.sh).
 - **MPI**: Cray MPICH via `shifter --module=mpich`, which bind-mounts
   MPICH-ABI `libmpi.so.12` + PMI / libfabric at
   `/opt/udiImage/modules/mpich/`.  A shim symlink in the stage
@@ -193,12 +193,17 @@ HDF5 / MPI-IO.  Two stacks are supported, selected via
 1. Build or identify a parallel-HDF5 install.  If it's OpenMPI-linked,
    follow Option A; if MPICH-ABI-linked, Option B.
 2. Stage it into the cluster's equivalent of `/pscratch` (any path
-   your container runtime will bind-mount).
+   your container runtime will bind-mount).  Start by copying the
+   appropriate script from [`phdf5/scripts/`](phdf5/scripts/) and
+   editing: the URL list for OpenMPI (different conda-forge build for
+   your MPI version) or the `CRAY_HDF5_PATH` / shim SONAMEs for
+   MPICH-ABI.
 3. Set `LORRAX_FFI_PHDF5_DIR` to the stage.  Set
    `LORRAX_PHDF5_MPI_STACK` to match.
 4. If the HDF5 `libhdf5.so` NEEDs a compiler-specific libmpi SONAME,
    add a shim symlink in the stage `lib/` → the runtime `libmpi`
-   available inside the container.
+   available inside the container (see `stage_cray.sh` for the
+   pattern).
 
 ### Tunable env vars at `open_file` time
 
