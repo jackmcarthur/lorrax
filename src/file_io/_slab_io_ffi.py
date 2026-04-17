@@ -24,19 +24,25 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 # of ffi.phdf5 would break users who don't build the FFI .so.
 
 
-def _sharding_to_axis_for_dim(sharding: NamedSharding) -> tuple[int, ...]:
+def _sharding_to_axis_for_dim(
+    sharding: NamedSharding, ndim: int,
+) -> tuple[int, ...]:
     """For a NamedSharding over a Mesh, return a per-dim mesh-axis index
-    (or -1 for replicated).  Only supports single-axis-per-dim layouts;
-    raises if a dim is sharded over multiple mesh axes.
+    (or -1 for replicated).  Length always equals ``ndim``.
 
-    The mesh axis index is the position of the axis name in
-    ``mesh.axis_names`` (row-major flatten of the rank id uses this
-    ordering).
+    JAX canonicalises ``PartitionSpec(None, None)`` -> ``PartitionSpec()``
+    for fully replicated arrays, and in general pads / truncates trailing
+    Nones — so we iterate by the array's ndim and treat missing entries
+    as replicated.
+
+    Only supports single-axis-per-dim layouts; raises if a dim is
+    sharded over multiple mesh axes.
     """
     axis_names = list(sharding.mesh.axis_names)
-    spec = sharding.spec
-    out = []
-    for i, s in enumerate(spec):
+    spec = list(sharding.spec)
+    out: list[int] = []
+    for i in range(ndim):
+        s = spec[i] if i < len(spec) else None
         if s is None:
             out.append(-1)
         elif isinstance(s, str):
@@ -156,7 +162,7 @@ class _FfiBackend:
         if not isinstance(A.sharding, NamedSharding) or A.sharding.mesh is not self.mesh:
             A = jax.device_put(A, _replicated_sharding(self.mesh, A.ndim))
 
-        axis_for_dim = _sharding_to_axis_for_dim(A.sharding)
+        axis_for_dim = _sharding_to_axis_for_dim(A.sharding, A.ndim)
         off = tuple(offset) if offset is not None else tuple([0] * A.ndim)
         gshape = tuple(global_shape) if global_shape is not None else tuple(A.shape)
 
@@ -213,7 +219,7 @@ class _FfiBackend:
         if partition_spec is None:
             partition_spec = P(*([None] * len(shape)))
         sharding = NamedSharding(mesh, partition_spec)
-        axis_for_dim = _sharding_to_axis_for_dim(sharding)
+        axis_for_dim = _sharding_to_axis_for_dim(sharding, len(shape))
         mesh_shape = tuple(mesh.shape[ax] for ax in mesh.axis_names)
 
         # Per-rank output shape: global shape / mesh_shape[axis] per sharded dim.

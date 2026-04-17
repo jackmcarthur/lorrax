@@ -14,6 +14,7 @@ from __future__ import annotations
 from functools import partial
 from typing import Sequence
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.experimental.shard_map import shard_map
@@ -47,9 +48,9 @@ def ffi_write_call(
         A_local,
         ctx_handle=int(ctx_handle),
         ds_id=int(ds_id),
-        offset_base=tuple(int(x) for x in offset_base),
-        mesh_shape=tuple(int(x) for x in mesh_shape),
-        axis_for_dim=tuple(int(x) for x in axis_for_dim),
+        offset_base=np.asarray(offset_base, dtype=np.int64),
+        mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
+        axis_for_dim=np.asarray(axis_for_dim, dtype=np.int64),
     )
 
 
