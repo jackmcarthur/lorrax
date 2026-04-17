@@ -437,12 +437,14 @@ def run_nscf(
         if verbose:
             print(f"  Total bands per k: {n_prot_k0} prot + {pb0.n_pseudo} pseudo = {n_total}")
 
-        # Open WFN_pseudobands.h5 with the total band count
-        pb_writer = WFNWriter(pb_output, crystal, kpoints, weights, kgrid, n_total,
-                               gvecs_per_k, nosym=nosym)
-
-        # Write k=0 (already computed)
-        _write_pb_k(pb_writer, 0, pb0, H_k0, gvecs_per_k[0], nspinor, ngkmax)
+        # Open WFN_pseudobands.h5 on rank 0 only (H5 single-writer).
+        pb_rank = jax.process_index()
+        pb_writer = None
+        if pb_rank == 0:
+            pb_writer = WFNWriter(pb_output, crystal, kpoints, weights, kgrid, n_total,
+                                   gvecs_per_k, nosym=nosym)
+            # Write k=0 (already computed)
+            _write_pb_k(pb_writer, 0, pb0, H_k0, gvecs_per_k[0], nspinor, ngkmax)
 
         # Remaining k-points
         for ik in range(1, nk):
@@ -474,12 +476,14 @@ def run_nscf(
                     n_protected=n_prot_k0,
                     verbose=False, seed=ik + pb_seed * 10000)
 
-            _write_pb_k(pb_writer, ik, pb_ik, H_k, gvecs_per_k[ik], nspinor, ngkmax)
+            if pb_rank == 0:
+                _write_pb_k(pb_writer, ik, pb_ik, H_k, gvecs_per_k[ik], nspinor, ngkmax)
 
             if verbose and (ik < 3 or ik == nk - 1 or (ik + 1) % 16 == 0):
                 print(f"  k={ik:3d}/{nk}: {time.perf_counter()-tk:.1f}s")
 
-        pb_writer.close()
+        if pb_writer is not None:
+            pb_writer.close()
         if verbose:
             print(f"  Pseudobands: {time.perf_counter()-t_pb:.1f}s → {pb_output}")
 
