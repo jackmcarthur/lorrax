@@ -255,33 +255,43 @@ if(NOT HDF5_IS_PARALLEL)
 endif()
 message(STATUS "HDF5: ${HDF5_VERSION} at ${HDF5_INCLUDE_DIRS} (parallel)")
 
-# MPI — we do NOT use find_package(MPI) here because the NVIDIA JAX
-# container ships HPC-X OpenMPI at /opt/hpcx/ompi, so mpicc would point
-# at OpenMPI and pull in the wrong ABI.  Instead we expect the stage
-# dir (or any cray-hdf5-parallel module equivalent) to ship MPICH
-# headers (mpi.h, mpio.h) alongside HDF5 headers.  At runtime, libmpi
-# is provided by Shifter's --module=mpich bind-mount
-# (/opt/udiImage/modules/mpich/libmpi.so.12); we locate it at link
-# time via LORRAX_MPICH_LIB_DIR (defaulted to that same path).
-find_path(LORRAX_MPI_INCLUDE_DIR mpi.h
-    HINTS "${HDF5_INCLUDE_DIRS}"
-    NO_DEFAULT_PATH)
-if(NOT LORRAX_MPI_INCLUDE_DIR)
-    message(FATAL_ERROR
-        "mpi.h not found alongside HDF5 headers (${HDF5_INCLUDE_DIRS}).\n"
-        "The phdf5 stage must include MPICH headers.  Run the\n"
-        "rebuild_stage.sh helper or stage them manually.")
+# MPI — we do NOT use find_package(MPI) because the NVIDIA JAX
+# container ships HPC-X OpenMPI at /opt/hpcx/ompi, so mpicc would be
+# OpenMPI regardless of which MPI ABI the staged HDF5 was built
+# against.  run_shifter.sh picks a stack (LORRAX_PHDF5_MPI_STACK =
+# openmpi | mpich) and exports LORRAX_MPI_INCLUDE_DIR + LORRAX_MPICH_LIB_DIR
+# pointing at the right paths inside the container.  Either env var
+# can also be set directly (-DLORRAX_MPI_INCLUDE_DIR=, etc.).
+if(NOT DEFINED LORRAX_MPI_INCLUDE_DIR AND DEFINED ENV{LORRAX_MPI_INCLUDE_DIR})
+    set(LORRAX_MPI_INCLUDE_DIR "$ENV{LORRAX_MPI_INCLUDE_DIR}" CACHE PATH "MPI header dir")
 endif()
-set(LORRAX_MPICH_LIB_DIR "/opt/udiImage/modules/mpich" CACHE PATH
-    "Runtime dir containing libmpi.so.12 (MPICH ABI)")
+if(NOT DEFINED LORRAX_MPI_INCLUDE_DIR)
+    # Last-ditch: look for mpi.h next to HDF5 headers (Cray stage layout).
+    find_path(LORRAX_MPI_INCLUDE_DIR mpi.h
+        HINTS "${HDF5_INCLUDE_DIRS}" "/opt/hpcx/ompi/include"
+        NO_DEFAULT_PATH)
+endif()
+if(NOT LORRAX_MPI_INCLUDE_DIR OR NOT EXISTS "${LORRAX_MPI_INCLUDE_DIR}/mpi.h")
+    message(FATAL_ERROR
+        "mpi.h not found.  Set LORRAX_MPI_INCLUDE_DIR (run_shifter.sh "
+        "does this automatically via LORRAX_PHDF5_MPI_STACK).")
+endif()
+
+if(NOT DEFINED LORRAX_MPICH_LIB_DIR AND DEFINED ENV{LORRAX_MPICH_LIB_DIR})
+    set(LORRAX_MPICH_LIB_DIR "$ENV{LORRAX_MPICH_LIB_DIR}" CACHE PATH "MPI runtime lib dir")
+endif()
+if(NOT DEFINED LORRAX_MPICH_LIB_DIR)
+    # Default chases the OpenMPI path (verified default) so bare cmake
+    # runs inside a shifter-gpu container still find something.
+    set(LORRAX_MPICH_LIB_DIR "/opt/hpcx/ompi/lib" CACHE PATH "MPI runtime lib dir")
+endif()
 find_library(LORRAX_MPI_LIBRARY
     NAMES mpi
     HINTS "${LORRAX_MPICH_LIB_DIR}"
     NO_DEFAULT_PATH)
 if(NOT LORRAX_MPI_LIBRARY)
     message(FATAL_ERROR
-        "libmpi not found in ${LORRAX_MPICH_LIB_DIR}.\n"
-        "Are you running inside shifter --module=mpich?")
+        "libmpi not found in ${LORRAX_MPICH_LIB_DIR}.")
 endif()
 message(STATUS "MPI:  include=${LORRAX_MPI_INCLUDE_DIR} lib=${LORRAX_MPI_LIBRARY}")
 

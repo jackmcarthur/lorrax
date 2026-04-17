@@ -143,54 +143,62 @@ to `/lorrax_nvhpc` inside the container.
   or `NCCL_NET_PLUGIN=ofi` on Perlmutter).  Not validated in this
   iteration.
 
-## phdf5 stack (Cray MPICH + cray-hdf5-parallel)
+## phdf5 — choose your MPI stack
 
 The `ffi.phdf5` handler writes sharded JAX arrays through parallel
-HDF5 / MPI-IO.  The default stack on Perlmutter:
+HDF5 / MPI-IO.  Two stacks are supported, selected via
+`LORRAX_PHDF5_MPI_STACK={openmpi,mpich}` (see
+[run_shifter.sh](common/cpp/run_shifter.sh)).
 
-- **HDF5**: a copy of the host's `cray-hdf5-parallel` module, kept
-  under `/pscratch/sd/$USER/lorrax_phdf5_cray/stage/` (NERSC Shifter
-  won't bind-mount from `$HOME`).  Regenerate with
+### Option A — OpenMPI (default, verified)
+
+- **HDF5**: conda-forge `hdf5-1.14.6-mpi_openmpi_*.conda`,
+  staged at `/pscratch/sd/$USER/lorrax_phdf5_openmpi/stage/`.
+  Regenerate with `~/software/lorrax_phdf5_openmpi/rebuild_stage.sh`.
+- **MPI**: the JAX container's bundled HPC-X OpenMPI at
+  `/opt/hpcx/ompi`, satisfying `libmpi.so.40`.
+- **Shifter modules**: `--module=gpu` only.
+- **Slurm PMI**: `--mpi=pmix`.
+- **Performance** (4 nodes / 16 GPUs, 4.29 GB C128):
+  `4.08 GB/s` — `8.02×` over `multihost_utils.process_allgather + rank-0 h5py`.
+
+### Option B — Cray MPICH / cray-hdf5-parallel (opt-in, unstable)
+
+- **HDF5**: a copy of the host's `cray-hdf5-parallel` module, staged
+  at `/pscratch/sd/$USER/lorrax_phdf5_cray/stage/`.  Regenerate with
   `~/software/lorrax_phdf5_cray/rebuild_stage.sh`.
 - **MPI**: Cray MPICH via `shifter --module=mpich`, which bind-mounts
   MPICH-ABI `libmpi.so.12` + PMI / libfabric at
-  `/opt/udiImage/modules/mpich/`.
-- **Bridging shim**: one symlink in the stage's `lib/` dir maps the
-  host HDF5's hard-coded `libmpi_gnu_123.so.12` NEEDED onto the generic
-  MPICH-ABI `libmpi.so.12` — ABI is compatible, name isn't.
-
-Measured on a 4-node / 16-GPU alloc, n=16384 C128 (4.29 GB global):
-
-    FFI   mean:  ~1300 ms  ( ~3.2 GB/s)
-    Gather    :  ~7900 ms  ( ~0.5 GB/s)
-    speedup   :  6-7× over gather-to-rank-0
-
-**Known trade-off**: a prior conda-forge-OpenMPI build of HDF5 1.14
-delivered ~4.45 GB/s (see bench's module docstring for the exact
-numbers).  The OpenMPI path wins by ~25 % because OpenMPI's ROMIO
-honours `cb_nodes=world_size`; Cray MPICH's ADIO driver silently
-ignores that hint and picks its own aggregator layout.  We accept
-the regression in exchange for the standard, portable
-cray-hdf5-parallel-module pattern, which works on every DOE Cray
-cluster and doesn't require rebuilding HDF5 from source.
+  `/opt/udiImage/modules/mpich/`.  A shim symlink in the stage
+  (`libmpi_gnu_123.so.12 → /opt/udiImage/modules/mpich/libmpi.so.12`)
+  bridges Cray-PE's compiler-specific SONAME onto the generic MPICH-ABI
+  runtime that shifter provides.
+- **Shifter modules**: `--module=gpu,mpich`.
+- **Slurm PMI**: `--mpi=pmi2` (Cray MPICH native).
+- **Performance**: _unstable_.  Best observed was `~3.2 GB/s` at one
+  point but we have been unable to reproduce it on different
+  allocations.  Large collective writes crash with `Out of memory in
+  ad_cray_write_coll.c:669` regardless of `cb_buffer_size`,
+  `cb_nodes`, or stripe settings, and `cray_cb_write_lock_mode=2`
+  (Lustre Lock-Ahead) triggers a different internal assertion failure
+  in `ADIOI_CRAY_Calc_aggregator_pfl`.  The 4-GPU single-node
+  round-trip test does pass.
+- **Why keep it**: the stack itself is portable across DOE Cray
+  systems, and the instability may be resolvable by a NERSC support
+  ticket (opening one is advised before relying on this path).
+  Useful as a reference implementation + A/B comparison.
 
 ### Porting to a non-Cray cluster
 
-1. Build or identify a parallel-HDF5 install on the host (any
-   `hdf5-parallel` / `hdf5-openmpi` module works).
-2. Copy its `bin/include/lib/` into a `/pscratch`-equivalent path
-   the cluster's container runtime is willing to bind-mount.  The
-   `rebuild_stage.sh` helper does this for cray-hdf5-parallel; adapt
-   it to your module's layout.
-3. If HDF5's `libhdf5.so` NEEDS a compiler-specific libmpi SONAME
-   (Cray-PE convention), add a symlink in the stage `lib/` pointing
-   at the runtime `libmpi` available inside the container.
-4. Point `LORRAX_FFI_PHDF5_DIR` at your stage dir.
-5. For MPICH-ABI MPIs (Cray, MPICH, MVAPICH, Intel MPI) use the
-   equivalent of `--module=mpich`; for OpenMPI-ABI HDF5 you'll need
-   `libmpi.so.40` instead (a separate, earlier variant of this
-   stack, reachable via git history on branch
-   `agent/ffi-phdf5-bench`).
+1. Build or identify a parallel-HDF5 install.  If it's OpenMPI-linked,
+   follow Option A; if MPICH-ABI-linked, Option B.
+2. Stage it into the cluster's equivalent of `/pscratch` (any path
+   your container runtime will bind-mount).
+3. Set `LORRAX_FFI_PHDF5_DIR` to the stage.  Set
+   `LORRAX_PHDF5_MPI_STACK` to match.
+4. If the HDF5 `libhdf5.so` NEEDs a compiler-specific libmpi SONAME,
+   add a shim symlink in the stage `lib/` → the runtime `libmpi`
+   available inside the container.
 
 ### Tunable env vars at `open_file` time
 

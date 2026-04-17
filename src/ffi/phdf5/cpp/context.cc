@@ -151,15 +151,21 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
     // the empirical bandwidth curve at 16 ranks.
     const char* cb_buf = std::getenv("LORRAX_PHDF5_CB_BUFFER_SIZE");
     info_set("cb_buffer_size", cb_buf && *cb_buf ? cb_buf : "67108864");
-    // Aggregator count.  Intentionally left to the MPI-IO driver's own
-    // heuristic.  In testing, OpenMPI/ROMIO needed cb_nodes=world_size
-    // to hit peak bandwidth, while Cray MPICH's ADIO driver ignores
-    // cb_nodes and auto-sizes aggregators from striping_factor (and
-    // silently misbehaves if we try to override).  Users who want to
-    // A/B-test can set LORRAX_PHDF5_CB_NODES (ROMIO form) or
-    // LORRAX_PHDF5_CB_PER_NODE (Cray MPICH form; becomes "*:N").
+    // Aggregator count.  OpenMPI/ROMIO honours `cb_nodes` and needs it
+    // at ~world_size to hit peak bandwidth (4.4 GB/s vs 0.85 with the
+    // default heuristic on Perlmutter).  Cray MPICH ignores this hint
+    // and picks its own aggregator layout internally, so setting it
+    // does no harm on that stack.  LORRAX_PHDF5_CB_NODES overrides
+    // explicitly; LORRAX_PHDF5_CB_PER_NODE is the Cray-form override
+    // (becomes cb_config_list="*:N").
     const char* cb_nodes = std::getenv("LORRAX_PHDF5_CB_NODES");
-    if (cb_nodes && *cb_nodes) info_set("cb_nodes", cb_nodes);
+    if (cb_nodes && *cb_nodes) {
+        info_set("cb_nodes", cb_nodes);
+    } else {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%d", world_size);
+        info_set("cb_nodes", buf);
+    }
     const char* cb_per_node = std::getenv("LORRAX_PHDF5_CB_PER_NODE");
     if (cb_per_node && *cb_per_node) {
         std::string v = std::string("*:") + cb_per_node;

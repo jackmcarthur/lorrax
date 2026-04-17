@@ -15,24 +15,18 @@ bandwidth (GB/s) of the sharded matrix through the write path.
 
 Numbers recorded on a 4-node / 16-GPU Perlmutter alloc, n=16384 C128
 (4.29 GB global), with the defaults baked into ``ffi.phdf5/ctx.cc``
-(cb_buffer_size=64M, striping_factor=16, striping_unit=4M,
-fill_time=NEVER, alloc_time=EARLY, libver=LATEST):
+(cb_nodes=world_size, cb_buffer_size=64M, striping_factor=16,
+striping_unit=4M, fill_time=NEVER, alloc_time=EARLY, libver=LATEST):
 
-  Cray MPICH + cray-hdf5-parallel 1.12 (current default):
-    FFI   mean:  1376 ms   ( 3.12 GB/s)
-    Gather mean: 7893 ms   ( 0.54 GB/s)
-    FFI speedup: 5.74x
-
-  OpenMPI + conda-forge HDF5 1.14 (prior, reachable via git history):
-    FFI   mean:   964 ms   ( 4.45 GB/s)
-    Gather mean: 7738 ms   ( 0.56 GB/s)
+  OpenMPI + conda-forge HDF5 1.14 (default; LORRAX_PHDF5_MPI_STACK=openmpi):
+    FFI   mean:  1052 ms   ( 4.08 GB/s)
+    Gather mean: 8434 ms   ( 0.51 GB/s)
     FFI speedup: 8.02x
 
-Trade-off: Cray MPICH gives up ~25 % bandwidth here vs the tuned
-OpenMPI path (its ADIO driver ignores cb_nodes and picks its own
-aggregator layout) but buys us the standard cray-hdf5-parallel
-module + MPICH-ABI-compatible path, which is portable across DOE
-Cray systems.
+  Cray MPICH + cray-hdf5-parallel 1.12 (opt-in via MPI_STACK=mpich):
+    unstable — see src/ffi/PORTING.md.  Large collective writes
+    currently crash in ad_cray_write_coll.c:669 on fresh allocs.
+    4-GPU round-trip passes.
 
 Usage (inside a 4-node / 16-GPU interactive alloc):
 
