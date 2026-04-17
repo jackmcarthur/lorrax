@@ -155,7 +155,7 @@ set_shell_function("lxpre", [[
 
     echo "=== [2/3] Dipole matrix elements ==="
     $run1 ]] .. shifter_base .. [[ \
-        python3 -u -m psp.get_dipole_mtxels_chunked -i "$abs_input" \
+        python3 -u -m psp.get_dipole_mtxels -i "$abs_input" \
         || { echo "FAILED: dipole matrix elements"; return 1; }
 
     echo "=== [3/3] Kinetic + ionic Hamiltonian ==="
