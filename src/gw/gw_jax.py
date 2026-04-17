@@ -250,13 +250,13 @@ def main(argv=None):
 		       f"G counts per q: {[len(g) for g in _bgw_table.G_miller_per_q]}")
 		_cell_vol = float(wfn.cell_volume)
 		_fft_grid = tuple(int(x) for x in wfn.fft_grid)
-		# Use WFN symmetries (point-group ops on fractional q) to find
-		# BGW-equivalent q-points that BGW deduplicates.
-		_sym_mats = np.asarray(wfn.sym_matrices, dtype=np.float64)
+		# Reciprocal-space symmetry operators (same convention as
+		# SymMaps.sym_mats_k, which acts on fractional k/G vectors).
+		_sym_mats_k = np.asarray(sym.sym_mats_k, dtype=np.int32)
 		def bgw_v_grid_fn(q_frac_tuple):
 			return fill_v_grid_for_q(
 				_bgw_table, q_frac_tuple, _fft_grid, _cell_vol,
-				sym_matrices=_sym_mats)
+				sym_mats_k=_sym_mats_k)
 
 	# ISDF fitting or restart loading
 	timing.reset()

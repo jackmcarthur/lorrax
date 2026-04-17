@@ -30,120 +30,86 @@ class BGWVcoulTable:
     G_miller_per_q: list
     vcoul_per_q: list
 
-    def find_q_index(self, q_frac, tol: float = 1e-4, sym_matrices=None) -> tuple[int, np.ndarray | None]:
-        """Return the index of the q-point matching q_frac.
+    def find_q_index(self, q_frac, tol: float = 1e-4, sym_mats_k=None) -> tuple[int, np.ndarray, np.ndarray]:
+        """Find stored q_table symmetry-equivalent to q_frac.
 
-        BGW deduplicates q-points by symmetry, so LORRAX q-points that are
-        symmetry-equivalent to a stored q-point need to be matched via the
-        crystal symmetry.
+        Uses BGW/LORRAX's `k_full = S · k_bar + kg0` convention (see
+        symmetry_maps.SymMaps._get_umklapp_vector).  Here the role of
+        "full" is played by q_frac (what LORRAX asks for) and "bar" by
+        q_table (what BGW stored).
 
         Parameters
         ----------
-        q_frac : (3,) fractional coords
+        q_frac : (3,) fractional coords of the requested q-point
         tol : match tolerance
-        sym_matrices : optional (nsym, 3, 3) array of crystal symmetry
-            matrices acting on fractional q.  If None, only direct and
-            BZ-shifted matches are tried.
+        sym_mats_k : optional (nsym, 3, 3) reciprocal-space symmetry
+            matrices (LORRAX's `sym_mats_k`).  If None, only direct
+            matches are tried.
 
         Returns
         -------
-        (iq, Sym) : index into table, and the symmetry matrix such that
-            S @ q_frac ≡ q_table[iq] (mod BZ).  Sym is None if no symmetry
-            was needed (direct match).
+        (iq, S_k, kg0) : index into the table, the reciprocal-space
+            symmetry matrix, and the integer umklapp vector such that
+                q_frac = S_k · q_table[iq] + kg0.
+            For a direct match, S_k is the identity and kg0 = q_frac - q_table.
         """
         q = np.asarray(q_frac, dtype=np.float64)
+        eye = np.eye(3, dtype=np.int32)
 
-        def _match_mod_bz(q_try):
-            qw = np.mod(q_try + 0.5, 1.0) - 0.5
-            for i, qf in enumerate(self.q_fracs):
-                qfw = np.mod(qf + 0.5, 1.0) - 0.5
-                if np.all(np.abs(qw - qfw) < tol):
-                    return i
-            return -1
+        def _umklapp(q_target, q_source):
+            """BGW kg0 convention: q_target = q_source + kg0."""
+            diff = q_target - q_source
+            diff_int = np.rint(diff)
+            if np.all(np.abs(diff - diff_int) < tol):
+                return diff_int.astype(np.int32)
+            return None
 
-        # 1. direct match
-        idx = _match_mod_bz(q)
-        if idx >= 0:
-            return idx, None
+        # 1. Direct match: q_in = q_tbl + kg0
+        for i, qf in enumerate(self.q_fracs):
+            kg0 = _umklapp(q, qf)
+            if kg0 is not None:
+                return i, eye, kg0
 
-        # 2. time reversal (q → -q)
-        idx = _match_mod_bz(-q)
-        if idx >= 0:
-            return idx, -np.eye(3)
+        # 2. Crystal symmetries: q_in = S_k · q_tbl + kg0
+        if sym_mats_k is not None:
+            for S_k in np.asarray(sym_mats_k):
+                for i, qf in enumerate(self.q_fracs):
+                    kg0 = _umklapp(q, S_k @ qf)
+                    if kg0 is not None:
+                        return i, np.rint(S_k).astype(np.int32), kg0
 
-        # 3. crystal symmetries.
-        # BGW's mtrx acts on real-space fractional vectors (preserves adot).
-        # For reciprocal-space q the corresponding operator is S.T
-        # (preserves bdot in LORRAX convention).
-        if sym_matrices is not None:
-            for S in np.asarray(sym_matrices):
-                S_recip = S.T
-                q_sym = S_recip @ q
-                idx = _match_mod_bz(q_sym)
-                if idx >= 0:
-                    return idx, S_recip
-
-        raise ValueError(f"No BGW q-point matches {q_frac} (after TR + symmetry search)")
+        raise ValueError(f"No BGW q-point matches {q_frac} (after symmetry search)")
 
 
 def read_bgw_vcoul(path: str) -> BGWVcoulTable:
     """Parse a BGW vcoul text file.
 
-    Returns a BGWVcoulTable with one entry per *unique* q-point (BGW's
-    Sigma writes each q multiple times when sigma is evaluated at
-    multiple k-points).  q-points that appear more than once must carry
-    identical (G, vcoul) pairs; repeated blocks are deduplicated.
+    Returns a BGWVcoulTable with one entry per *unique* q-point (BGW
+    re-emits each q once per (q, k) combination; repeated contiguous
+    blocks for the same q are deduplicated).
     """
     arr = np.loadtxt(path)
     q_all = arr[:, 0:3]
     G_all = arr[:, 3:6].astype(np.int32)
     v_all = arr[:, 6]
 
-    # Group by unique q-points (wrap to [0,1) for comparison)
-    q_wrapped = np.mod(q_all, 1.0)
-    # Round to 8 decimals so "identical" q's with float noise group together
-    q_key = np.round(q_wrapped * 1e8).astype(np.int64)
+    # Round q's to 8 decimals so floating-point noise groups together
+    q_key_all = np.round(np.mod(q_all, 1.0) * 1e8).astype(np.int64)
 
-    q_fracs = []
-    G_miller_per_q = []
-    vcoul_per_q = []
-    seen_keys = {}  # q_key_tuple -> index in output lists
-
-    for i in range(arr.shape[0]):
-        key = tuple(q_key[i])
-        if key not in seen_keys:
-            seen_keys[key] = len(q_fracs)
-            q_fracs.append(q_wrapped[i].copy())
-            G_miller_per_q.append([G_all[i]])
-            vcoul_per_q.append([v_all[i]])
-        else:
-            # Duplicate q-block; skip (BGW re-emits the same q, G, vcoul)
-            pass
-
-    # After the first unique pass we only captured one entry per q — but
-    # the full block follows contiguously. Walk again and append.
-    q_fracs = []
-    G_miller_per_q = []
-    vcoul_per_q = []
+    q_fracs, G_miller_per_q, vcoul_per_q = [], [], []
     seen_keys = {}
     i = 0
     while i < arr.shape[0]:
-        key = tuple(q_key[i])
+        key = tuple(q_key_all[i])
+        block_end = i
+        while block_end < arr.shape[0] and tuple(q_key_all[block_end]) == key:
+            block_end += 1
         if key not in seen_keys:
-            G_buf = []
-            v_buf = []
-            while i < arr.shape[0] and tuple(q_key[i]) == key:
-                G_buf.append(G_all[i])
-                v_buf.append(v_all[i])
-                i += 1
             seen_keys[key] = len(q_fracs)
             q_fracs.append(np.asarray(key, dtype=np.float64) / 1e8)
-            G_miller_per_q.append(np.asarray(G_buf, dtype=np.int32))
-            vcoul_per_q.append(np.asarray(v_buf, dtype=np.float64))
-        else:
-            # Duplicate q block (same key already captured); skip it
-            while i < arr.shape[0] and tuple(q_key[i]) == key:
-                i += 1
+            G_miller_per_q.append(np.asarray(G_all[i:block_end], dtype=np.int32))
+            vcoul_per_q.append(np.asarray(v_all[i:block_end], dtype=np.float64))
+        i = block_end
 
     return BGWVcoulTable(
         q_fracs=np.asarray(q_fracs, dtype=np.float64),
@@ -158,7 +124,7 @@ def fill_v_grid_for_q(
     fft_grid,
     cell_volume: float,
     tol: float = 1e-4,
-    sym_matrices=None,
+    sym_mats_k=None,
 ) -> np.ndarray:
     """Build a single q-point's v(q+G) array on the LORRAX FFT grid.
 
@@ -185,21 +151,17 @@ def fill_v_grid_for_q(
     fft_nx, fft_ny, fft_nz = int(fft_grid[0]), int(fft_grid[1]), int(fft_grid[2])
     v_scaled = np.zeros((fft_nx, fft_ny, fft_nz), dtype=np.float64)
 
-    iq, S = table.find_q_index(q_frac, tol=tol, sym_matrices=sym_matrices)
+    iq, S_k, kg0 = table.find_q_index(q_frac, tol=tol, sym_mats_k=sym_mats_k)
     G_miller = table.G_miller_per_q[iq]
     vcoul = table.vcoul_per_q[iq]
 
-    # If we matched via a symmetry S (so S·q_input ≡ q_table[iq]), we need
-    # to map G-vectors in the LORRAX q_input frame back via S^{-1}:
-    # v(q+G) at input frame = v(S·q + S·G) at table frame, so for each
-    # G_miller stored under the table q we look up, the corresponding
-    # input-frame G is S^{-1} · G_table.  Since sym ops on q are integer
-    # reciprocal-lattice matrices, S and S^{-1} preserve the integer grid.
-    if S is not None:
-        S_inv = np.linalg.inv(np.asarray(S, dtype=np.float64))
-        G_input = np.rint(G_miller.astype(float) @ S_inv.T).astype(np.int32)
-    else:
-        G_input = G_miller
+    # Map G-vectors using the same integer formula as
+    # common/symmetry_maps.py:get_gvecs_kfull (lines 689-690):
+    #     G_full = sym_krep @ G_irr - kg0
+    # Here q_frac plays the role of k_full, q_table plays k_bar, and kg0
+    # satisfies q_frac = S_k @ q_table + kg0.  Both S_k and kg0 are
+    # integer-valued so the transform preserves the FFT grid.
+    G_input = np.einsum('ij,gj->gi', S_k.astype(np.int32), G_miller) - kg0[None, :]
 
     # Wrap Miller indices into FFT grid
     gx = np.mod(G_input[:, 0], fft_nx)
