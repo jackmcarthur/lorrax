@@ -13,15 +13,13 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 #  else well-known paths.  See src/ffi/PORTING.md for per-cluster notes.
 # ----------------------------------------------------------------------------
 set(NVHPC_ROOT "" CACHE PATH
-    "Explicit NVHPC root (contains math_libs/<cuda>/targets/.../include/cusolverMp.h).  "
-    "Leave empty to autodetect from NVHPC_ROOT / HPCSDK_ROOT env vars and standard paths.")
+    "Explicit NVHPC root (leave empty to autodetect from env vars and standard paths)")
 set(NVHPC_CUDA_SUBDIR "" CACHE STRING
-    "CUDA minor version string inside NVHPC math_libs (e.g. 12.9).  "
-    "Leave empty to autodetect the newest present.")
+    "CUDA minor version string inside NVHPC math_libs (e.g. 12.9); empty = newest present")
 set(CUSOLVERMP_INCLUDE_DIR "" CACHE PATH
-    "Alternative: explicit directory containing cusolverMp.h + cal.h.")
+    "Alternative: explicit directory containing cusolverMp.h + cal.h")
 set(CUSOLVERMP_LIB_DIR "" CACHE PATH
-    "Alternative: explicit directory containing libcusolverMp.so + libcal.so.")
+    "Alternative: explicit directory containing libcusolverMp.so + libcal.so")
 
 # -- (a) user-provided explicit paths win -----------------------------------
 if(CUSOLVERMP_INCLUDE_DIR AND CUSOLVERMP_LIB_DIR)

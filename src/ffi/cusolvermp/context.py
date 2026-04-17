@@ -26,10 +26,10 @@ from typing import Dict, Tuple
 
 import jax
 import numpy as np
-from jax.experimental import multihost_utils
 from jax.sharding import Mesh
 
 from ..common import ffi_loader
+from ..common.broadcast import broadcast_bytes
 
 __all__ = ["get_or_init_context", "MeshKey"]
 
@@ -52,43 +52,12 @@ def _mesh_key(mesh: Mesh, col_major: bool) -> MeshKey:
 
 
 def _broadcast_unique_id(size_bytes: int) -> np.ndarray:
-    """Broadcast an ncclUniqueId from rank 0 to all JAX processes.
-
-    Returns a numpy array of shape (size_bytes,) dtype=uint8 with rank 0's
-    fresh unique id replicated everywhere.
-
-    Uses JAX distributed's KV store (via the runtime client) for true
-    byte-accurate broadcast.  We cannot use
-    ``multihost_utils.broadcast_one_to_all`` because under
-    ``jax_enable_x64=True`` it silently promotes ``uint8`` inputs to
-    ``uint64``, corrupting the opaque 128-byte ncclUniqueId payload.
-    """
+    """Broadcast an ncclUniqueId from rank 0 to all JAX processes."""
     ffi_loader.get_lib()
-    rank = jax.process_index()
-    world = jax.process_count()
     buf = np.zeros(size_bytes, dtype=np.uint8)
-
-    if rank == 0:
+    if int(jax.process_index()) == 0:
         ffi_loader.fill_nccl_unique_id(int(buf.ctypes.data))
-
-    if world == 1:
-        return buf
-
-    # Use the distributed runtime client's key-value store for a
-    # byte-exact broadcast.  Keys are opaque strings; we encode the payload
-    # hex-encoded so the KV store never sees non-printable bytes.
-    from jax._src.distributed import global_state
-    client = global_state.client
-    key = "lorrax_ffi/cusolvermp/nccl_unique_id/v0"
-    if rank == 0:
-        client.key_value_set(key, buf.tobytes().hex())
-    # All ranks (including 0) read back — this also synchronises.
-    payload_hex = client.blocking_key_value_get(key, 60_000)  # timeout_ms
-    payload = bytes.fromhex(payload_hex)
-    assert len(payload) == size_bytes, (
-        f"ncclUniqueId broadcast returned {len(payload)} bytes, "
-        f"expected {size_bytes}")
-    return np.frombuffer(payload, dtype=np.uint8).copy()
+    return broadcast_bytes(buf, key="lorrax_ffi/cusolvermp/nccl_unique_id/v0")
 
 
 def _make_ctx(mesh: Mesh, col_major: bool) -> int:

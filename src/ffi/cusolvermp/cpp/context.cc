@@ -15,7 +15,7 @@
 #include <cal.h>
 #include <cusolverMp.h>
 
-#include "../../common/cpp/xla_ffi_glue.h"
+#include "../../common/cpp/ffi_helpers.h"
 #include "ctx.h"
 
 namespace lorrax_ffi::cusolvermp {

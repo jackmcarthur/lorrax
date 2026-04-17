@@ -26,7 +26,7 @@ ffi/
 │       ├── CMakeLists.txt     one build producing liblorrax_ffi.so
 │       ├── build.sh           thin wrapper (run inside Shifter)
 │       ├── run_shifter.sh     launches Shifter w/ bind-mounts the build needs
-│       ├── xla_ffi_glue.h     CUDA / CUSOLVER error-checking macros
+│       ├── ffi_helpers.h      error-propagation macros (FFI_RETURN_IF_ERROR, LORRAX_*_CHECK)
 │       └── api.cc             extern "C" ABI (context create/destroy, etc.)
 ├── cusolvermp/
 │   ├── __init__.py            public: distributed_eigh

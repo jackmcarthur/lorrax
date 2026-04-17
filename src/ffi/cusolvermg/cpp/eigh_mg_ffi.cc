@@ -31,7 +31,7 @@
 
 #include "xla/ffi/api/ffi.h"
 
-#include "../../common/cpp/xla_ffi_glue.h"
+#include "../../common/cpp/ffi_helpers.h"
 
 namespace lorrax_ffi {
 namespace cusolvermg {

@@ -17,6 +17,16 @@ namespace lorrax_ffi {
 
 namespace ffi = ::xla::ffi;
 
+// Format a cudaError_t as an FFI Internal error (for paths that can't
+// use the LORRAX_CUDA_CHECK macro because they need to branch on the
+// specific error before returning, e.g. tolerating PeerAccessAlreadyEnabled).
+inline ffi::Error cuda_error(const char* expr, cudaError_t status) {
+    std::ostringstream os;
+    os << "CUDA error (" << expr << "): "
+       << cudaGetErrorName(status) << " — " << cudaGetErrorString(status);
+    return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+}
+
 // If the expression evaluates to a non-success ffi::Error, return it.
 #define FFI_RETURN_IF_ERROR(...)                       \
     do {                                               \
@@ -26,7 +36,7 @@ namespace ffi = ::xla::ffi;
 
 // CUDA runtime call returning cudaSuccess on OK.  Returns an FFI error
 // (not throwing) so callers can use it inside handler functions.
-#define LORRAX_CUDA_CHECK_FFI(expr)                                       \
+#define LORRAX_CUDA_CHECK(expr)                                       \
     do {                                                                  \
         cudaError_t _st = (expr);                                         \
         if (_st != cudaSuccess) {                                         \
@@ -41,7 +51,7 @@ namespace ffi = ::xla::ffi;
 
 // Generic library-status check.  SUCCESS is the value that means OK,
 // `lib` a short descriptive label (e.g. "cusolverMp").
-#define LORRAX_LIB_CHECK_FFI(expr, SUCCESS, lib)                          \
+#define LORRAX_LIB_CHECK(expr, SUCCESS, lib)                          \
     do {                                                                  \
         auto _st = (expr);                                                \
         if (_st != (SUCCESS)) {                                           \
