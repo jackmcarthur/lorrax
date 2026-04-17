@@ -205,14 +205,20 @@ def pbc_distance_sq_single(
     Returns:
         distances_sq: (P,) squared distances to the centroid
     """
-    # Fractional displacement: shape (P, 3)
-    delta_frac = positions_frac - centroid_frac[None, :]
-    
-    # Minimal image convention
-    delta_frac = delta_frac - jnp.round(delta_frac)
-    
-    # Squared distance: d² = df @ G @ df^T for each point
-    distances_sq = jnp.einsum('pi,ij,pj->p', delta_frac, metric_tensor, delta_frac)
+    # Per-axis PBC-wrapped displacement, each shape (P,). Matches the
+    # fused-quadratic-form style used inside ``assign_labels_chunked`` —
+    # no einsum → no K=3 GEMM with 50 % occupancy. Important because this
+    # function is called N_c times inside the ``kmeans_pp_init`` fori_loop.
+    dx = positions_frac[:, 0] - centroid_frac[0]
+    dx = dx - jnp.round(dx)
+    dy = positions_frac[:, 1] - centroid_frac[1]
+    dy = dy - jnp.round(dy)
+    dz = positions_frac[:, 2] - centroid_frac[2]
+    dz = dz - jnp.round(dz)
+    G = metric_tensor
+    distances_sq = (G[0, 0] * dx + G[0, 1] * dy + G[0, 2] * dz) * dx \
+                 + (G[0, 1] * dx + G[1, 1] * dy + G[1, 2] * dz) * dy \
+                 + (G[0, 2] * dx + G[1, 2] * dy + G[2, 2] * dz) * dz
     
     return distances_sq
 
