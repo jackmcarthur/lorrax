@@ -68,8 +68,8 @@ def calculate_charge_density(wfn, sym, nval=None, ncond=None):
 
     for ib in bandrange:
         for ik in range(1):  # k0 only for centroid selection
-            gvecs_k = jnp.asarray(sym.get_gvecs_kfull(wfn, ik))
-            coeffs_kb = jnp.asarray(sym.get_cnk_fullzone(wfn, ib, ik))
+            gvecs_k = jnp.asarray(wfn.get_gvecs_kfull(sym, ik))
+            coeffs_kb = jnp.asarray(wfn.get_cnk_fullzone(sym, ik, ib))
 
             # Normalize: divide out pseudoband weight so all bands
             # contribute equally to the spatial density for centroids

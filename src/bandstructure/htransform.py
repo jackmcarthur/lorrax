@@ -32,11 +32,11 @@ def _ifft_one_kpoint(wfn, sym, k_idx, band_indices, fft_grid):
     nspinor = 2  # always spinor for CrI3
 
     # Get rotated G-vectors and coefficients
-    gvecs = sym.get_gvecs_kfull(wfn, k_idx)  # (ngk, 3)
+    gvecs = wfn.get_gvecs_kfull(sym, k_idx)  # (ngk, 3)
     gx = gvecs[:, 0] % nx
     gy = gvecs[:, 1] % ny
     gz = gvecs[:, 2] % nz
-    cnk_batch = sym.get_cnk_fullzone_batch(wfn, band_indices, k_idx)  # (nb, nspinor, ngk)
+    cnk_batch = wfn.get_cnk_fullzone_batch(sym, k_idx, band_indices)  # (nb, nspinor, ngk)
 
     # Bloch phase exp(2πi k·r)
     kvec = sym.unfolded_kpts[k_idx]

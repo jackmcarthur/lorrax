@@ -35,8 +35,8 @@ def load_kpoint_fftbox(wfn, sym, meta, k_idx, nb):
     """
     nx, ny, nz = meta.fft_grid
     band_indices = np.arange(nb)
-    gvecs_k = np.asarray(sym.get_gvecs_kfull(wfn, k_idx))
-    cnk = sym.get_cnk_fullzone_batch(wfn, band_indices, k_idx)
+    gvecs_k = np.asarray(wfn.get_gvecs_kfull(sym, k_idx))
+    cnk = wfn.get_cnk_fullzone_batch(sym, k_idx, band_indices)
     psi = np.zeros((nb, meta.nspinor, nx, ny, nz), dtype=np.complex128)
     psi[:, :meta.nspinor_wfnfile, gvecs_k[:, 0], gvecs_k[:, 1], gvecs_k[:, 2]] = cnk
     return jnp.asarray(psi)
@@ -173,7 +173,7 @@ def read_Gvecs_to_devices(
 
         for k_local in range(nk_chunk):
             k_idx = kc_start + k_local  # full-BZ index for SymMaps
-            gvecs_k_rot = np.asarray(sym.get_gvecs_kfull(wfn, k_idx))
+            gvecs_k_rot = np.asarray(wfn.get_gvecs_kfull(sym, k_idx))
             ngk = ngk_all[k_local]
             
             # Store G-vectors (padded)
@@ -181,7 +181,7 @@ def read_Gvecs_to_devices(
 
             # Batch read and rotate all owned bands at once
             if n_owned > 0:
-                cnk_batch = sym.get_cnk_fullzone_batch(wfn, owned_band_indices, k_idx)
+                cnk_batch = wfn.get_cnk_fullzone_batch(sym, k_idx, owned_band_indices)
                 psi_Gspace_all[k_local, local_band_indices, 0:meta.nspinor_wfnfile, :ngk] = cnk_batch
 
             # Expand to 4 components if requested

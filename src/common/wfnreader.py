@@ -97,14 +97,21 @@ class WFNReader:
                 pass
 
     def get_cnk(self, ik, ib):
-        """Get complex coefficients for both spinor components of a wavefunction.
-        
+        """Get raw irreducible-zone coefficients for one band at one k-point.
+
         Args:
-            ik (int): k-point index
+            ik (int): Irreducible-zone k-point index stored in the WFN file
             ib (int): band index
-            
+
         Returns:
-            np.ndarray: Complex coefficients array of shape (2, ngk[ik]) for both spinor components
+            np.ndarray: Complex coefficients of shape (2, ngk[ik])
+
+        Notes:
+            This returns the coefficients exactly as stored in ``WFN.h5``.
+            It does not apply symmetry unfolding, fractional-translation
+            phases, spinor rotations, or time-reversal conjugation.  Call
+            ``get_cnk_fullzone`` when pairing coefficients with full-BZ
+            G-vectors from ``get_gvecs_kfull``.
         """
         start = self.kpt_starts[ik]
         end = start + self.ngk[ik]
@@ -115,14 +122,19 @@ class WFNReader:
         return cnk
 
     def get_cnk_batch(self, ik, band_indices):
-        """Get complex coefficients for multiple bands at once (vectorized).
-        
+        """Get raw irreducible-zone coefficients for multiple bands.
+
         Args:
-            ik (int): k-point index
+            ik (int): Irreducible-zone k-point index stored in the WFN file
             band_indices: array-like of band indices
-            
+
         Returns:
             np.ndarray: Complex coefficients of shape (nb, 2, ngk[ik])
+
+        Notes:
+            This is the batched analogue of ``get_cnk`` and has the same
+            symmetry caveat: the returned coefficients are still on the raw
+            irreducible-zone G-list with no non-symmorphic phase applied.
         """
         start = self.kpt_starts[ik]
         end = start + self.ngk[ik]
@@ -132,11 +144,11 @@ class WFNReader:
         return raw[..., 0] + 1j * raw[..., 1]  # (nb, 2, ngk)
     
     def get_gvec_nk(self, ik):
-        """Get G-vectors for a specific k-point.
-        
+        """Get the raw irreducible-zone G-list for one stored k-point.
+
         Args:
-            ik (int): k-point index
-            
+            ik (int): Irreducible-zone k-point index stored in the WFN file
+
         Returns:
             np.ndarray: G-vectors array of shape (ngk[ik], 3) in Fortran order,
                        where each row is a G-vector [Gx, Gy, Gz]
@@ -154,6 +166,30 @@ class WFNReader:
         
         # Return in shape (ngk[ik], 3) in Fortran order
         return gvecs
+
+    def get_gvecs_kfull(self, sym, ik_full):
+        """Return full-BZ G-vectors for ``ik_full`` via ``SymMaps``.
+
+        This applies only the integer rotation+umklapp needed to align the
+        unfolded G-list with the target full-zone k-point.  Fractional
+        translations do not modify the integer G-indices themselves; the
+        corresponding non-symmorphic phase is applied by
+        ``get_cnk_fullzone`` / ``get_cnk_fullzone_batch``.
+        """
+        return sym.get_gvecs_kfull(self, ik_full)
+
+    def get_cnk_fullzone(self, sym, ik_full, ib):
+        """Return phase-correct unfolded coefficients for one full-BZ k-point.
+
+        Delegating through ``SymMaps`` keeps the coefficients consistent with
+        ``get_gvecs_kfull`` by applying any non-symmorphic fractional
+        translation phase, spinor rotation, and time-reversal conjugation.
+        """
+        return sym.get_cnk_fullzone(self, ib, ik_full)
+
+    def get_cnk_fullzone_batch(self, sym, ik_full, band_indices):
+        """Return phase-correct unfolded coefficients for multiple bands."""
+        return sym.get_cnk_fullzone_batch(self, band_indices, ik_full)
     
     def get_syms_from_kgridlog(self,kgridfname):
         matrices = [np.eye(3, dtype=np.int32)]

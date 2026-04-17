@@ -1,6 +1,7 @@
 import numpy as np
 
 from src.common.symmetry_maps import SymMaps
+from src.common.wfnreader import WFNReader
 
 
 class _FakeWFN:
@@ -43,6 +44,11 @@ class _FakeWFN:
     def get_cnk_batch(self, ik, band_indices):
         assert ik == 0
         return self._coeffs[np.asarray(band_indices, dtype=np.int64)]
+
+
+class _WrapperWFN(_FakeWFN, WFNReader):
+    """Test double exposing the real WFNReader wrapper methods."""
+    pass
 
 
 def _make_symmaps():
@@ -101,3 +107,25 @@ def test_get_cnk_fullzone_matches_batch_path():
     scalar = sym.get_cnk_fullzone(wfn, 1, 0)
     batch = sym.get_cnk_fullzone_batch(wfn, np.asarray([1]), 0)[0]
     np.testing.assert_allclose(scalar, batch, rtol=0.0, atol=1e-12)
+
+
+def test_wfnreader_fullzone_wrappers_delegate_to_symmaps():
+    wfn = _WrapperWFN()
+    sym = _make_symmaps()
+
+    np.testing.assert_array_equal(
+        wfn.get_gvecs_kfull(sym, 0),
+        sym.get_gvecs_kfull(wfn, 0),
+    )
+    np.testing.assert_allclose(
+        wfn.get_cnk_fullzone(sym, 0, 1),
+        sym.get_cnk_fullzone(wfn, 1, 0),
+        rtol=0.0,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        wfn.get_cnk_fullzone_batch(sym, 0, np.asarray([0, 1])),
+        sym.get_cnk_fullzone_batch(wfn, np.asarray([0, 1]), 0),
+        rtol=0.0,
+        atol=1e-12,
+    )
