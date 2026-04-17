@@ -231,6 +231,34 @@ if(NOT NCCL_LIBRARY)
 endif()
 
 # ----------------------------------------------------------------------------
+#  Parallel HDF5 + MPI — for the ffi.phdf5 subpackage.
+# ----------------------------------------------------------------------------
+# Default stage dir (bind-mounted by run_shifter.sh).  Callers can
+# override with -DHDF5_ROOT=... or $HDF5_ROOT / $HDF5_DIR env vars,
+# which CMake's find_package(HDF5) honours natively.
+if(NOT DEFINED HDF5_ROOT AND NOT DEFINED ENV{HDF5_ROOT} AND NOT DEFINED ENV{HDF5_DIR})
+    if(IS_DIRECTORY "/lorrax_phdf5/lib")
+        set(HDF5_ROOT "/lorrax_phdf5" CACHE PATH
+            "Root of parallel HDF5 install (bind-mounted stage by default)")
+        message(STATUS "HDF5: using bind-mounted stage at /lorrax_phdf5")
+    endif()
+endif()
+
+set(HDF5_PREFER_PARALLEL ON)
+find_package(HDF5 COMPONENTS C REQUIRED)
+if(NOT HDF5_IS_PARALLEL)
+    message(FATAL_ERROR
+        "HDF5 found at ${HDF5_INCLUDE_DIRS} is NOT built with MPI-IO.\n"
+        "Load a parallel module (cray-hdf5-parallel, hdf5/1.14-openmpi, ...)\n"
+        "or set HDF5_ROOT / -DHDF5_DIR=... to a parallel install.\n"
+        "See src/ffi/PORTING.md for per-cluster notes.")
+endif()
+message(STATUS "HDF5: ${HDF5_VERSION} at ${HDF5_INCLUDE_DIRS} (parallel)")
+
+find_package(MPI REQUIRED COMPONENTS C)
+message(STATUS "MPI:  ${MPI_C_COMPILER} / ${MPI_C_LIBRARIES}")
+
+# ----------------------------------------------------------------------------
 # Build lorrax_ffi.so
 # ----------------------------------------------------------------------------
 set(LORRAX_FFI_SOURCES
@@ -238,6 +266,8 @@ set(LORRAX_FFI_SOURCES
     ../../cusolvermp/cpp/context.cc
     ../../cusolvermp/cpp/eigh_ffi.cc
     ../../cusolvermg/cpp/eigh_mg_ffi.cc
+    ../../phdf5/cpp/context.cc
+    ../../phdf5/cpp/write_ffi.cc
 )
 
 add_library(lorrax_ffi SHARED ${LORRAX_FFI_SOURCES})
@@ -248,7 +278,7 @@ set_target_properties(lorrax_ffi PROPERTIES
     # RPATH points at the NVHPC directory so the runtime linker finds
     # libcusolverMp.so and libcal.so without LD_LIBRARY_PATH.
     BUILD_WITH_INSTALL_RPATH ON
-    INSTALL_RPATH "${CUSOLVERMP_LIBDIR};${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/lib64"
+    INSTALL_RPATH "${CUSOLVERMP_LIBDIR};${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/lib64;/lorrax_phdf5/lib"
 )
 
 target_include_directories(lorrax_ffi PRIVATE
@@ -256,6 +286,8 @@ target_include_directories(lorrax_ffi PRIVATE
     "${CUSOLVERMP_INCLUDE}"
     "${NCCL_INCLUDE}"
     "${CUDA_TOOLKIT_ROOT}/include"
+    "${HDF5_INCLUDE_DIRS}"
+    "${MPI_C_INCLUDE_DIRS}"
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../.."
 )
@@ -266,6 +298,8 @@ target_link_libraries(lorrax_ffi PRIVATE
     "${CUDART_LIBRARY}"
     "${CUSOLVER_LIBRARY}"
     "${CUSOLVERMG_LIBRARY}"
+    ${HDF5_LIBRARIES}
+    MPI::MPI_C
 )
 
 target_compile_options(lorrax_ffi PRIVATE
@@ -276,3 +310,5 @@ message(STATUS "lorrax_ffi will link:")
 message(STATUS "  cuSOLVERMp = ${CUSOLVERMP_LIBDIR}/libcusolverMp.so")
 message(STATUS "  NCCL       = ${NCCL_LIBRARY}")
 message(STATUS "  CUDART     = ${CUDART_LIBRARY}")
+message(STATUS "  HDF5       = ${HDF5_LIBRARIES}")
+message(STATUS "  MPI        = ${MPI_C_LIBRARIES}")

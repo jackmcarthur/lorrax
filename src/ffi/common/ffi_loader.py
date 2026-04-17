@@ -40,6 +40,7 @@ _FFI_TARGET_SYMBOLS = {
     # done inside the .so based on the input buffer's element type.
     "lorrax_cusolvermp_eigh":      "EighMpFfi",
     "lorrax_cusolvermg_eigh_f64":  "EighMgF64",
+    "lorrax_phdf5_write":          "PhdfWriteFfi",
 }
 
 # Error buffer size for the lrx_ wrappers.
@@ -118,6 +119,29 @@ def _set_argtypes(lib: ctypes.CDLL) -> None:
         ctypes.POINTER(ctypes.c_int),
     ]
     lib.lrx_version_info.restype = ctypes.c_int
+
+    # phdf5 lifecycle
+    lib.lrx_phdf5_open.argtypes = [
+        ctypes.c_char_p,                     # path
+        ctypes.c_int, ctypes.c_int,          # p, q
+        ctypes.c_int, ctypes.c_int,          # rank, world_size
+        ctypes.c_int,                        # mode_flag
+        ctypes.POINTER(ctypes.c_int64),      # ctx_out
+        ctypes.c_char_p, ctypes.c_int,       # err_out, err_cap
+    ]
+    lib.lrx_phdf5_open.restype = ctypes.c_int
+    lib.lrx_phdf5_close.argtypes = [ctypes.c_int64]
+    lib.lrx_phdf5_close.restype  = None
+
+    lib.lrx_phdf5_ensure_dataset.argtypes = [
+        ctypes.c_int64,                      # ctx_handle
+        ctypes.c_char_p,                     # ds_name
+        ctypes.c_int64, ctypes.c_int64,      # n_rows, n_cols
+        ctypes.c_int,                        # dtype_tag
+        ctypes.POINTER(ctypes.c_int64),      # ds_id_out (hid_t)
+        ctypes.c_char_p, ctypes.c_int,       # err_out, err_cap
+    ]
+    lib.lrx_phdf5_ensure_dataset.restype = ctypes.c_int
 
 
 def _register_ffi_targets(lib: ctypes.CDLL) -> None:
@@ -202,3 +226,59 @@ def version_info() -> dict:
     nccl = ctypes.c_int(0)
     lib.lrx_version_info(ctypes.byref(rt), ctypes.byref(drv), ctypes.byref(nccl))
     return {"cuda_runtime": rt.value, "cuda_driver": drv.value, "nccl": nccl.value}
+
+
+# ---- phdf5 ----------------------------------------------------------------
+def phdf5_open(path: str, p: int, q: int, rank: int, world_size: int,
+               mode_flag: int) -> int:
+    """Collective open/create of a parallel-HDF5 file.
+
+    mode_flag: 0 = truncate ('w'), 1 = append-or-create ('a'), 2 = read-only ('r').
+    """
+    lib = get_lib()
+    ctx_out = ctypes.c_int64(0)
+    err = ctypes.create_string_buffer(_ERR_CAP)
+    rc = lib.lrx_phdf5_open(
+        path.encode("utf-8"),
+        int(p), int(q), int(rank), int(world_size), int(mode_flag),
+        ctypes.byref(ctx_out),
+        err, _ERR_CAP,
+    )
+    _check_err(rc, err)
+    return int(ctx_out.value)
+
+
+def phdf5_close(ctx_handle: int) -> None:
+    get_lib().lrx_phdf5_close(int(ctx_handle))
+
+
+# Mapping from numpy/jax dtype to the integer tag matching xla::ffi::DataType.
+_DTYPE_TAG = {
+    "float32":   1,
+    "float64":   2,
+    "int32":     3,
+    "int64":     4,
+    "complex64": 5,
+    "complex128": 6,
+}
+
+
+def phdf5_ensure_dataset(ctx_handle: int, ds_name: str,
+                         n_rows: int, n_cols: int,
+                         dtype_name: str) -> int:
+    """Collective create/open of an HDF5 dataset.  Returns hid_t as int64."""
+    if dtype_name not in _DTYPE_TAG:
+        raise ValueError(f"phdf5_ensure_dataset: unsupported dtype {dtype_name}")
+    lib = get_lib()
+    ds_id_out = ctypes.c_int64(0)
+    err = ctypes.create_string_buffer(_ERR_CAP)
+    rc = lib.lrx_phdf5_ensure_dataset(
+        int(ctx_handle),
+        ds_name.encode("utf-8"),
+        int(n_rows), int(n_cols),
+        _DTYPE_TAG[dtype_name],
+        ctypes.byref(ds_id_out),
+        err, _ERR_CAP,
+    )
+    _check_err(rc, err)
+    return int(ds_id_out.value)
