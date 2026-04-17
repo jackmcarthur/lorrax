@@ -740,6 +740,7 @@ def weighted_kmeans_jax(
     tolerance: float = 5e-3,
     seed: int = 0,
     mesh: Mesh | None = None,
+    force_shard: bool = False,
 ) -> tuple:
     """
     Density-weighted k-means clustering with periodic boundary conditions.
@@ -811,22 +812,29 @@ def weighted_kmeans_jax(
     # actual shard compute, so sharding makes things slower. Profile data on
     # Si 4×4×4 (P=110k, 4 GPUs) showed ~4.2 ms max allreduce vs sub-ms local
     # compute, and the sharded run was ~2 s slower overall. Rule of thumb:
-    # only shard when each device gets at least ~1e5 points.
+    # only shard when each device gets at least ~1e5 points. Pass
+    # ``force_shard=True`` to bypass this heuristic (e.g. for benchmarking,
+    # or when N_c is large enough that Lloyd compute dominates allreduce
+    # latency even with small per-shard P).
     _P_PER_SHARD_MIN = 100_000
     sharded_step = None
     if mesh is not None:
         per_shard = n_points // mesh.shape['x']
-        if per_shard < _P_PER_SHARD_MIN:
-            print(f"[weighted_kmeans_jax] P/{mesh.shape['x']} = {per_shard} "
-                  f"< {_P_PER_SHARD_MIN}; falling back to single-device "
-                  f"(collective latency would dominate)")
-            mesh = None
-        elif n_points % mesh.shape['x'] != 0:
+        if n_points % mesh.shape['x'] != 0:
             raise ValueError(
                 f"n_points={n_points} must be divisible by mesh x-axis "
                 f"size {mesh.shape['x']} for even P-sharding"
             )
+        if per_shard < _P_PER_SHARD_MIN and not force_shard:
+            print(f"[weighted_kmeans_jax] P/{mesh.shape['x']} = {per_shard} "
+                  f"< {_P_PER_SHARD_MIN}; falling back to single-device "
+                  f"(collective latency would dominate). Pass force_shard=True "
+                  f"to override.")
+            mesh = None
         else:
+            if force_shard and per_shard < _P_PER_SHARD_MIN:
+                print(f"[weighted_kmeans_jax] P/{mesh.shape['x']} = {per_shard} "
+                      f"< {_P_PER_SHARD_MIN}, but force_shard=True — using mesh anyway.")
             sharded_step = make_sharded_kmeans_update(mesh, N_c, c_block=c_block)
     
     # =========================================================================
@@ -1056,6 +1064,12 @@ def main():
     parser.add_argument("--shard", action="store_true",
                         help="Use multi-device P-sharded Lloyd step (mesh 'x' "
                              "over all visible jax.devices()).")
+    parser.add_argument("--force-shard", action="store_true",
+                        help="With --shard, override the per-shard-P auto-gate "
+                             "and run the shard_map step even when P/n_dev is "
+                             "below the latency-amortization threshold. Useful "
+                             "for benchmarking or when N_c is large enough "
+                             "that Lloyd compute beats allreduce latency.")
     args = parser.parse_args()
     
     N_c = args.N_c
@@ -1120,7 +1134,8 @@ def main():
             print(f"Sharded Lloyd step: mesh axis 'x' of size {len(devices)}")
 
     _, centroids_jax, _, _ = weighted_kmeans_jax(
-        avec_jax, rho_jax, N_c=N_c, seed=args.seed, mesh=mesh
+        avec_jax, rho_jax, N_c=N_c, seed=args.seed, mesh=mesh,
+        force_shard=args.force_shard,
     )
 
     centroids_frac = np.array(centroids_jax)
