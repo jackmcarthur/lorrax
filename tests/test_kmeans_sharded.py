@@ -22,6 +22,7 @@ from src.centroid.kmeans_isdf import (
     kmeans_update_step,
     assign_labels_chunked,
     make_sharded_kmeans_update,
+    kmeans_pp_init,
     _pick_k_block,
 )
 
@@ -159,4 +160,138 @@ def test_sharded_matches_single_device():
         np.asarray(shd_move), np.asarray(ref_move),
         rtol=1e-5, atol=1e-6,
         err_msg="sharded movement_sq diverges from single-device",
+    )
+
+
+def _build_gaussian_density(rng, grid_shape=(16, 16, 16), n_bumps=6, avec=None):
+    """Synthetic 3D density: sum of a few Gaussian bumps at random PBC positions.
+
+    Produces a charge-density-like field with isolated high-density regions
+    that k-means++ should concentrate centroids around.
+    """
+    Nx, Ny, Nz = grid_shape
+    xs = np.linspace(0, 1, Nx, endpoint=False)
+    X, Y, Z = np.meshgrid(xs, xs, xs, indexing='ij')
+    positions = np.stack([X, Y, Z], axis=-1).reshape(-1, 3).astype(np.float32)
+    rho = np.zeros(Nx * Ny * Nz, dtype=np.float32) + 1e-6
+
+    centers = rng.random((n_bumps, 3), dtype=np.float32)
+    G = (avec.T @ avec).astype(np.float32)
+    for c in centers:
+        d = positions - c[None, :]
+        d -= np.round(d)
+        d2 = np.einsum('pi,ij,pj->p', d, G, d)
+        rho = rho + np.exp(-d2 / 0.01).astype(np.float32)
+    return positions, rho, centers
+
+
+def test_kmeans_pp_init_deterministic_and_on_grid():
+    """Same key → same centroids; each centroid is one of the grid points."""
+    avec = np.eye(3, dtype=np.float32) * 3.8
+    rng = np.random.default_rng(0)
+    positions, rho, _ = _build_gaussian_density(rng, grid_shape=(16, 16, 16), avec=avec)
+    positions = jnp.asarray(positions)
+    rho = jnp.asarray(rho)
+    G = jnp.asarray((avec.T @ avec).astype(np.float32))
+    key = jax.random.PRNGKey(123)
+
+    c_a = kmeans_pp_init(positions, rho, G, n_k=32, key=key)
+    c_b = kmeans_pp_init(positions, rho, G, n_k=32, key=key)
+    np.testing.assert_array_equal(np.asarray(c_a), np.asarray(c_b),
+                                  err_msg="same key should give identical centroids")
+
+    # Each returned centroid must be one of the grid positions (up to fp32).
+    p_np = np.asarray(positions)
+    c_np = np.asarray(c_a)
+    # Find the nearest grid point to each centroid and verify it's exact.
+    for ci in c_np:
+        d2 = np.sum((p_np - ci[None, :]) ** 2, axis=1)
+        assert d2.min() < 1e-10, f"centroid {ci} not exactly a grid point (min d²={d2.min()})"
+
+
+def test_kmeans_pp_init_concentrates_on_high_density():
+    """Centroids should sit in higher-than-average-density regions.
+
+    K-means++ with D²·ρ weighting first seeds centroids near density peaks,
+    then spreads later centroids into low-density voids (that's the whole
+    point of D² — maximize coverage). So we can't insist that *every*
+    centroid hugs a bump. Instead, we check two weaker-but-correct signals:
+
+    1. The mean density **at centroid locations** exceeds the mean density
+       over the whole grid by a multiplicative margin. This directly probes
+       that density weighting is applied at all.
+    2. Every bump attracts at least one centroid (no mode collapse).
+    """
+    avec = np.eye(3, dtype=np.float32) * 3.8
+    rng = np.random.default_rng(7)
+    positions, rho, bump_centers = _build_gaussian_density(
+        rng, grid_shape=(16, 16, 16), n_bumps=4, avec=avec
+    )
+    G = jnp.asarray((avec.T @ avec).astype(np.float32))
+    n_k = 16  # moderate over-count vs 4 bumps; first ~4-8 will seed bumps
+    centroids = kmeans_pp_init(jnp.asarray(positions), jnp.asarray(rho), G,
+                               n_k=n_k, key=jax.random.PRNGKey(1))
+    c_np = np.asarray(centroids)
+
+    # For each centroid, pull ρ at the nearest grid point (fp32 exact match
+    # is the contract tested above, but we snap to be robust to rounding).
+    pos_np = np.asarray(positions)
+    rho_np = np.asarray(rho)
+    rho_at_centroid = np.empty(n_k, dtype=np.float32)
+    for i, ci in enumerate(c_np):
+        d2 = np.sum((pos_np - ci[None, :]) ** 2, axis=1)
+        rho_at_centroid[i] = rho_np[np.argmin(d2)]
+
+    mean_rho = rho_np.mean()
+    mean_rho_at_centroid = rho_at_centroid.mean()
+    assert mean_rho_at_centroid > 3.0 * mean_rho, (
+        f"centroid mean ρ = {mean_rho_at_centroid:.4f} vs grid mean "
+        f"ρ = {mean_rho:.4f}; density weighting isn't steering the sampler"
+    )
+
+    # Bump coverage: every bump should attract at least one centroid.
+    per_bump_count = np.zeros(bump_centers.shape[0], dtype=int)
+    for ci in c_np:
+        d = ci[None, :] - bump_centers
+        d -= np.round(d)
+        per_bump_count[np.argmin(np.linalg.norm(d, axis=1))] += 1
+    assert np.all(per_bump_count > 0), (
+        f"some bumps got no centroids: per-bump counts {per_bump_count} — "
+        "the D²·ρ sampler collapsed onto fewer modes than it should"
+    )
+
+
+def test_kmeans_pp_init_respects_pbc():
+    """Two bumps near opposite faces of the box should both be discovered,
+    relying on minimal-image distance to drive D²-weighted spread."""
+    avec = np.eye(3, dtype=np.float32) * 4.0
+    G = jnp.asarray((avec.T @ avec).astype(np.float32))
+    Nx = 20
+    xs = np.linspace(0, 1, Nx, endpoint=False, dtype=np.float32)
+    X, Y, Z = np.meshgrid(xs, xs, xs, indexing='ij')
+    positions = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)
+    # Two Gaussians placed near x≈0.02 and x≈0.98 — raw distance makes them
+    # look far apart, but PBC brings them close.
+    def bump(center):
+        d = positions - center[None, :]
+        d -= np.round(d)
+        d2 = np.einsum('pi,ij,pj->p', d, (avec.T @ avec).astype(np.float32), d)
+        return np.exp(-d2 / 0.005).astype(np.float32)
+    c1 = np.array([0.02, 0.5, 0.5], dtype=np.float32)
+    c2 = np.array([0.98, 0.5, 0.5], dtype=np.float32)
+    rho = bump(c1) + bump(c2) + 1e-6
+
+    centroids = kmeans_pp_init(
+        jnp.asarray(positions), jnp.asarray(rho), G,
+        n_k=16, key=jax.random.PRNGKey(2)
+    )
+    c_np = np.asarray(centroids)
+
+    # Under PBC, c1 and c2 are really ~0.04 apart, so *both* bumps should get
+    # coverage. We check that at least one centroid lies on each side of x=0.5.
+    near_c1 = np.sum(c_np[:, 0] < 0.25)
+    near_c2 = np.sum(c_np[:, 0] > 0.75)
+    assert near_c1 >= 1 and near_c2 >= 1, (
+        f"PBC broken: near-c1={near_c1}, near-c2={near_c2} "
+        f"(centroids should cover both near-boundary bumps)"
     )

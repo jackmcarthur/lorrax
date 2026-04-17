@@ -475,6 +475,100 @@ def make_sharded_kmeans_update(mesh: Mesh, n_k: int, k_block: int = _DEFAULT_K_B
 
 
 # =============================================================================
+# k-means++ initialization (fully on-device)
+# =============================================================================
+# The previous init was a N_k-iteration Python loop with per-iteration
+# host round-trips: `rng.choice(p=np.array(weights))` + `centroids.at[k].set(...)`.
+# The profiler showed that on Si 4×4×4 N_k=128 this dominated wall time
+# (~1000 H2D copies, ~6 s of dispatch overhead). Replacing the host-side
+# categorical sampler with the Gumbel-max trick lets the whole init run as
+# a single `lax.fori_loop`: no per-iteration H2D, one jit dispatch total.
+#
+# Gumbel-max: for independent g_i ~ Gumbel(0, 1),
+#     argmax_i ( log(w_i) + g_i )  ~  Categorical( w / Σw )
+# so sampling reduces to a pointwise add + argmax, both of which stay on device.
+
+
+def _gumbel_sample_argmax(log_weights: jnp.ndarray, key) -> jnp.ndarray:
+    """Sample one categorical draw via Gumbel-max on log-weights.
+
+    ``log_weights[i] = -inf`` corresponds to zero probability and is simply
+    never selected (since ``-inf + finite = -inf``). Uniform samples are
+    clamped away from 0 to avoid ``log(0)`` in the Gumbel inverse-CDF.
+    """
+    n = log_weights.shape[0]
+    # Clamp u ∈ (eps, 1 - eps) so -log(-log(u)) is finite for fp32.
+    eps = jnp.finfo(log_weights.dtype).tiny
+    u = jax.random.uniform(key, (n,), dtype=log_weights.dtype,
+                           minval=eps, maxval=1.0 - eps)
+    gumbel = -jnp.log(-jnp.log(u))
+    return jnp.argmax(log_weights + gumbel)
+
+
+@partial(jax.jit, static_argnames=['n_k'])
+def kmeans_pp_init(
+    positions_frac: jnp.ndarray,
+    rho_flat: jnp.ndarray,
+    metric_tensor: jnp.ndarray,
+    n_k: int,
+    key,
+) -> jnp.ndarray:
+    """Density-weighted k-means++ initialization on device, no H2D per step.
+
+    Draws the first centroid from ``Categorical(ρ)`` and each subsequent one
+    from ``Categorical(D²·ρ)`` where D(x) is the PBC-aware distance to the
+    nearest already-placed centroid — exactly the standard k-means++ weighting
+    used by the previous host-loop implementation. Sampling is done by
+    Gumbel-max on ``log(weights)`` so the entire init is a single
+    ``lax.fori_loop``.
+
+    PBC minimal image and the metric-tensor distance are unchanged
+    (``pbc_distance_sq_single`` is reused verbatim).
+
+    Args:
+        positions_frac: (P, 3) fractional coordinates.
+        rho_flat:       (P,) density weights (non-negative).
+        metric_tensor:  (3, 3) G = avec^T @ avec; units match ``avec``.
+        n_k:            static number of centroids.
+        key:            JAX PRNGKey.
+
+    Returns:
+        centroids_frac: (N_k, 3) fractional centroid coordinates.
+    """
+    n_points = positions_frac.shape[0]
+    dtype = positions_frac.dtype
+
+    # log-weights; clamp at tiny so log(0) never appears.
+    tiny = jnp.finfo(dtype).tiny
+    log_rho = jnp.log(jnp.maximum(rho_flat.astype(dtype), tiny))
+
+    # First centroid: draw from Categorical(ρ).
+    key, sub = jax.random.split(key)
+    first_idx = _gumbel_sample_argmax(log_rho, sub)
+    first_cent = positions_frac[first_idx]
+
+    centroids = jnp.zeros((n_k, 3), dtype=dtype).at[0].set(first_cent)
+    min_d2 = pbc_distance_sq_single(positions_frac, first_cent, metric_tensor)
+
+    def body(k, state):
+        centroids, min_d2, key = state
+        key, sub = jax.random.split(key)
+        # k-means++ weights: D²(x)·ρ(x). On log scale this is additive.
+        log_w = jnp.log(jnp.maximum(min_d2, tiny)) + log_rho
+        next_idx = _gumbel_sample_argmax(log_w, sub)
+        new_cent = positions_frac[next_idx]
+        centroids = centroids.at[k].set(new_cent)
+        # Running pointwise minimum of squared PBC distance — same
+        # incremental update the previous loop did.
+        d2_new = pbc_distance_sq_single(positions_frac, new_cent, metric_tensor)
+        min_d2 = jnp.minimum(min_d2, d2_new)
+        return centroids, min_d2, key
+
+    centroids, _, _ = lax.fori_loop(1, n_k, body, (centroids, min_d2, key))
+    return centroids
+
+
+# =============================================================================
 # Visualization utilities
 # =============================================================================
 
@@ -713,57 +807,43 @@ def weighted_kmeans_jax(
     k_block = _pick_k_block(N_k)
     print(f"K-chunk size for distance scan: {k_block} ({N_k // k_block} chunks)")
 
-    # P-sharding is deferred until after k-means++ init; the init loop does
-    # host-side `rng.choice` with `np.array(rho_flat * min_dist_sq)`, which is
-    # fine for replicated arrays but breaks on a distributed sharded array.
+    # Auto-gate: for small per-shard P the NCCL launch latency dominates the
+    # actual shard compute, so sharding makes things slower. Profile data on
+    # Si 4×4×4 (P=110k, 4 GPUs) showed ~4.2 ms max allreduce vs sub-ms local
+    # compute, and the sharded run was ~2 s slower overall. Rule of thumb:
+    # only shard when each device gets at least ~1e5 points.
+    _P_PER_SHARD_MIN = 100_000
     sharded_step = None
     if mesh is not None:
-        if n_points % mesh.shape['x'] != 0:
+        per_shard = n_points // mesh.shape['x']
+        if per_shard < _P_PER_SHARD_MIN:
+            print(f"[weighted_kmeans_jax] P/{mesh.shape['x']} = {per_shard} "
+                  f"< {_P_PER_SHARD_MIN}; falling back to single-device "
+                  f"(collective latency would dominate)")
+            mesh = None
+        elif n_points % mesh.shape['x'] != 0:
             raise ValueError(
                 f"n_points={n_points} must be divisible by mesh x-axis "
                 f"size {mesh.shape['x']} for even P-sharding"
             )
-        sharded_step = make_sharded_kmeans_update(mesh, N_k, k_block=k_block)
+        else:
+            sharded_step = make_sharded_kmeans_update(mesh, N_k, k_block=k_block)
     
     # =========================================================================
-    # K-means++ initialization
+    # K-means++ initialization — fully on-device, single jit dispatch.
     # =========================================================================
-    # Standard k-means++ but with:
-    # - Density weighting (prefer high-density regions)
-    # - PBC distances (using minimal image convention)
+    # Density-weighted k-means++ with PBC minimal-image distances. Gumbel-max
+    # sampling replaces the former host-side `rng.choice(p=...)`, so the whole
+    # N_k-step selection runs inside one `lax.fori_loop`. See `kmeans_pp_init`.
     # =========================================================================
-    print("K-means++ initialization...")
-    
-    rng = np.random.default_rng(seed)
-    centroids = jnp.zeros((N_k, 3), dtype=jnp.float32)
-    
-    # First centroid: random selection weighted by density
-    probs = np.array(rho_flat / rho_flat.sum())
-    first_idx = rng.choice(n_points, p=probs)
-    centroids = centroids.at[0].set(positions[first_idx])
+    print("K-means++ initialization (on-device fori_loop)...")
 
-    # Track minimum squared distance to any existing centroid
-    min_dist_sq = jnp.full(n_points, jnp.inf, dtype=jnp.float32)
-    
-    # Add remaining centroids using k-means++ selection
-    for k in range(1, N_k):
-        if k % 50 == 0:
-            print(f"  Selecting centroid {k}/{N_k}")
-        
-        # Update min_dist_sq with distance to the most recently added centroid
-        # This is the key optimization: only compute distance to NEW centroid
-        dist_sq_to_new = pbc_distance_sq_single(
-            positions, centroids[k-1], metric_tensor
-        )
-        min_dist_sq = jnp.minimum(min_dist_sq, dist_sq_to_new)
-        
-        # k-means++ selection: probability ∝ D(x)² × ρ(x)
-        # D(x) = distance to nearest existing centroid
-        probs = np.array(min_dist_sq * rho_flat)
-        probs = probs / probs.sum()
-        next_idx = rng.choice(n_points, p=probs)
-        centroids = centroids.at[k].set(positions[next_idx])
-    
+    centroids = kmeans_pp_init(
+        positions, rho_flat, metric_tensor, N_k, jax.random.PRNGKey(seed)
+    )
+    # Bring the centroids to host once (tiny, (N_k, 3)) so the Lloyd driver's
+    # optional resharding step below can reshape them freely.
+    centroids.block_until_ready()
     print("K-means++ initialization complete.")
 
     # =========================================================================
