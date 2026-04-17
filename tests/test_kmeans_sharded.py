@@ -2,7 +2,7 @@
 
 Covers:
 
-* ``kmeans_update_step`` (refactored: segment_sum + K-chunked scan) agrees
+* ``kmeans_update_step`` (refactored: segment_sum + C-chunked scan) agrees
   with a brute-force reference implementation bit-for-bit in single precision.
 * The PBC minimal-image / metric-tensor behavior is unchanged across:
   axis-aligned boxes, a tilted FCC-like cell, and deliberately skewed cells.
@@ -23,21 +23,21 @@ from src.centroid.kmeans_isdf import (
     assign_labels_chunked,
     make_sharded_kmeans_update,
     kmeans_pp_init,
-    _pick_k_block,
+    _pick_c_block,
 )
 
 
-def _naive_update_step(positions, centroids, rho, G, n_k):
-    """Reference implementation (materializes (P, K, 3) — not for production).
+def _naive_update_step(positions, centroids, rho, G, n_c):
+    """Reference implementation (materializes (P, C, 3) — not for production).
 
     This is the mathematically identical form of the original kmeans
     update step: full pairwise PBC distances, one-hot mask weighted mean.
     """
     delta = positions[:, None, :] - centroids[None, :, :]
     delta = delta - jnp.round(delta)
-    d = jnp.einsum('pki,ij,pkj->pk', delta, G, delta)
+    d = jnp.einsum('pci,ij,pcj->pc', delta, G, delta)
     labels = jnp.argmin(d, axis=1)
-    mask = jax.nn.one_hot(labels, n_k, dtype=rho.dtype)
+    mask = jax.nn.one_hot(labels, n_c, dtype=rho.dtype)
     weights = mask * rho[:, None]
     weighted_delta = weights[:, :, None] * delta
     sum_wd = jnp.sum(weighted_delta, axis=0)
@@ -46,14 +46,14 @@ def _naive_update_step(positions, centroids, rho, G, n_k):
     new_cent = (centroids + avg) % 1.0
     move = new_cent - centroids
     move = move - jnp.round(move)
-    move_sq = jnp.einsum('ki,ij,kj->k', move, G, move)
+    move_sq = jnp.einsum('ci,ij,cj->c', move, G, move)
     return new_cent, move_sq, labels
 
 
-def _random_inputs(seed: int, p: int, k: int, avec: np.ndarray):
+def _random_inputs(seed: int, p: int, n_c: int, avec: np.ndarray):
     rng = np.random.default_rng(seed)
     positions = jnp.asarray(rng.random((p, 3), dtype=np.float32))
-    centroids = jnp.asarray(rng.random((k, 3), dtype=np.float32))
+    centroids = jnp.asarray(rng.random((n_c, 3), dtype=np.float32))
     rho = jnp.asarray(rng.random((p,), dtype=np.float32) + 1e-3)
     G = jnp.asarray((avec.T @ avec).astype(np.float32))
     return positions, centroids, rho, G
@@ -74,15 +74,15 @@ def _random_inputs(seed: int, p: int, k: int, avec: np.ndarray):
     ],
 )
 def test_refactored_matches_naive(avec_name, avec):
-    """Refactored chunked update_step == naive (P,K,3) reference.
+    """Refactored chunked update_step == naive (P,C,3) reference.
 
-    Uses sizes friendly to the default k_block (64 % 16 == 0).
+    Uses sizes friendly to the default c_block (64 % 16 == 0).
     """
-    p, k = 5_000, 64
-    positions, centroids, rho, G = _random_inputs(seed=0, p=p, k=k, avec=avec)
-    k_block = _pick_k_block(k)
-    new_a, move_a, labels_a = kmeans_update_step(positions, centroids, rho, G, k, k_block)
-    new_b, move_b, labels_b = _naive_update_step(positions, centroids, rho, G, k)
+    p, n_c = 5_000, 64
+    positions, centroids, rho, G = _random_inputs(seed=0, p=p, n_c=n_c, avec=avec)
+    c_block = _pick_c_block(n_c)
+    new_a, move_a, labels_a = kmeans_update_step(positions, centroids, rho, G, n_c, c_block)
+    new_b, move_b, labels_b = _naive_update_step(positions, centroids, rho, G, n_c)
 
     np.testing.assert_array_equal(np.asarray(labels_a), np.asarray(labels_b),
                                   err_msg=f"[{avec_name}] labels differ")
@@ -111,7 +111,7 @@ def test_assign_labels_chunked_handles_pbc_across_boundary():
          [0.01, 0.5, 0.5]],  # padding dup: also wrapped
         dtype=jnp.float32,
     )
-    labels = assign_labels_chunked(positions, centroids, G, n_k=4, k_block=2)
+    labels = assign_labels_chunked(positions, centroids, G, n_c=4, c_block=2)
     # Expected: centroid 0 wins (ties with centroid 3 on distance, argmin picks lowest).
     assert int(labels[0]) == 0
 
@@ -122,18 +122,18 @@ def test_sharded_matches_single_device():
     """Sharded Lloyd step == single-device Lloyd step, same inputs."""
     devices = jax.devices()
     n_dev = len(devices)
-    # Pick sizes divisible by device count and by k_block.
-    p, k = 4 * 1024, 32
+    # Pick sizes divisible by device count and by c_block.
+    p, n_c = 4 * 1024, 32
     assert p % n_dev == 0
     avec = np.array([[2.715, 2.715, 0.0],
                      [0.0, 2.715, 2.715],
                      [2.715, 0.0, 2.715]], dtype=np.float32)
-    positions, centroids, rho, G = _random_inputs(seed=7, p=p, k=k, avec=avec)
-    k_block = _pick_k_block(k)
+    positions, centroids, rho, G = _random_inputs(seed=7, p=p, n_c=n_c, avec=avec)
+    c_block = _pick_c_block(n_c)
 
     # Single-device reference.
     ref_new, ref_move, ref_labels = kmeans_update_step(
-        positions, centroids, rho, G, k, k_block
+        positions, centroids, rho, G, n_c, c_block
     )
 
     # Sharded path on all visible devices.
@@ -142,7 +142,7 @@ def test_sharded_matches_single_device():
     rho_s = jax.device_put(rho, NamedSharding(mesh, PartitionSpec('x')))
     cent_s = jax.device_put(centroids, NamedSharding(mesh, PartitionSpec()))
     G_s = jax.device_put(G, NamedSharding(mesh, PartitionSpec()))
-    sharded_step = make_sharded_kmeans_update(mesh, k, k_block=k_block)
+    sharded_step = make_sharded_kmeans_update(mesh, n_c, c_block=c_block)
     shd_new, shd_move, shd_labels = sharded_step(pos_s, cent_s, rho_s, G_s)
 
     # Replicated outputs must match exactly; labels are sharded on 'x' so the
@@ -195,8 +195,8 @@ def test_kmeans_pp_init_deterministic_and_on_grid():
     G = jnp.asarray((avec.T @ avec).astype(np.float32))
     key = jax.random.PRNGKey(123)
 
-    c_a = kmeans_pp_init(positions, rho, G, n_k=32, key=key)
-    c_b = kmeans_pp_init(positions, rho, G, n_k=32, key=key)
+    c_a = kmeans_pp_init(positions, rho, G, n_c=32, key=key)
+    c_b = kmeans_pp_init(positions, rho, G, n_c=32, key=key)
     np.testing.assert_array_equal(np.asarray(c_a), np.asarray(c_b),
                                   err_msg="same key should give identical centroids")
 
@@ -228,16 +228,16 @@ def test_kmeans_pp_init_concentrates_on_high_density():
         rng, grid_shape=(16, 16, 16), n_bumps=4, avec=avec
     )
     G = jnp.asarray((avec.T @ avec).astype(np.float32))
-    n_k = 16  # moderate over-count vs 4 bumps; first ~4-8 will seed bumps
+    n_c = 16  # moderate over-count vs 4 bumps; first ~4-8 will seed bumps
     centroids = kmeans_pp_init(jnp.asarray(positions), jnp.asarray(rho), G,
-                               n_k=n_k, key=jax.random.PRNGKey(1))
+                               n_c=n_c, key=jax.random.PRNGKey(1))
     c_np = np.asarray(centroids)
 
     # For each centroid, pull ρ at the nearest grid point (fp32 exact match
     # is the contract tested above, but we snap to be robust to rounding).
     pos_np = np.asarray(positions)
     rho_np = np.asarray(rho)
-    rho_at_centroid = np.empty(n_k, dtype=np.float32)
+    rho_at_centroid = np.empty(n_c, dtype=np.float32)
     for i, ci in enumerate(c_np):
         d2 = np.sum((pos_np - ci[None, :]) ** 2, axis=1)
         rho_at_centroid[i] = rho_np[np.argmin(d2)]
@@ -283,7 +283,7 @@ def test_kmeans_pp_init_respects_pbc():
 
     centroids = kmeans_pp_init(
         jnp.asarray(positions), jnp.asarray(rho), G,
-        n_k=16, key=jax.random.PRNGKey(2)
+        n_c=16, key=jax.random.PRNGKey(2)
     )
     c_np = np.asarray(centroids)
 
