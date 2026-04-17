@@ -421,9 +421,13 @@ def _place_windows_v2(
                 delta = trial - e_lo
                 eps_bar = 0.5 * (trial + e_lo)
                 sigma = delta / np.sqrt(12.0)
-                # Multi-pole Gauss-quadrature error bound for k nodes.
-                # The k=1 limit σ²/ε³ made windows much narrower than needed.
-                metric = n_eff * sigma**(2 * k) / max(eps_bar, 1e-30)**(2 * k + 1)
+                # Conservative effective-k=2 error metric σ⁴/ε⁵.  The full
+                # σ^(2k)/ε^(2k+1) bound assumes Gauss-optimal poles, which
+                # we don't have (Ritz + uniform weights in CJ windows after
+                # the empirical rollback in d1466ad).  σ⁴/ε⁵ still lets
+                # windows be wider than the single-pole σ²/ε³ limit, but
+                # doesn't overcommit on accuracy we can't deliver.
+                metric = n_eff * sigma**4 / max(eps_bar, 1e-30)**5
 
                 if metric >= tau_val and n_eff >= n_min:
                     best_hi = trial
