@@ -290,6 +290,33 @@ hid_t ensure_dataset(PhdfCtx* ctx, const std::string& ds_name,
     return dset;
 }
 
+// -----------------------------------------------------------------
+//  open_dataset_ro — collective, called from Python before any
+//  read_sharded_slab.  Pure H5Dopen (no create); caches the hid_t
+//  on ctx->open_datasets so repeat calls are cheap.
+// -----------------------------------------------------------------
+hid_t open_dataset_ro(PhdfCtx* ctx, const std::string& ds_name) {
+    {
+        std::lock_guard<std::mutex> g(ctx->datasets_mu);
+        auto it = ctx->open_datasets.find(ds_name);
+        if (it != ctx->open_datasets.end() && it->second >= 0) {
+            return it->second;
+        }
+    }
+
+    hid_t dset = H5Dopen(ctx->file_id, ds_name.c_str(), H5P_DEFAULT);
+    if (dset < 0) {
+        throw std::runtime_error(
+            "phdf5 open_dataset_ro: H5Dopen failed for '" + ds_name + "'");
+    }
+
+    {
+        std::lock_guard<std::mutex> g(ctx->datasets_mu);
+        ctx->open_datasets[ds_name] = dset;
+    }
+    return dset;
+}
+
 void close_ctx(PhdfCtx* ctx) {
     if (!ctx) return;
 

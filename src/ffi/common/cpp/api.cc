@@ -38,6 +38,7 @@ namespace lorrax_ffi::phdf5 {
     void     close_ctx(PhdfCtx* ctx);
     hid_t    ensure_dataset(PhdfCtx* ctx, const std::string& ds_name,
                             int64_t n_rows, int64_t n_cols, int dtype_tag);
+    hid_t    open_dataset_ro(PhdfCtx* ctx, const std::string& ds_name);
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +163,27 @@ int lrx_phdf5_ensure_dataset(
         hid_t ds = lorrax_ffi::phdf5::ensure_dataset(
             reinterpret_cast<lorrax_ffi::phdf5::PhdfCtx*>(ctx_handle),
             std::string(ds_name), n_rows, n_cols, dtype_tag);
+        *ds_id_out = (int64_t)ds;
+        return 0;
+    } catch (const std::exception& e) {
+        if (err_out && err_cap > 0) snprintf(err_out, err_cap, "%s", e.what());
+        return 1;
+    }
+}
+
+// Collective H5Dopen (read-only semantics; no create).  All ranks must
+// call concurrently.  Returns 0 on success and writes the hid_t to
+// *ds_id_out; sets err_out and returns 1 on failure.
+int lrx_phdf5_open_dataset_ro(
+    int64_t ctx_handle,
+    const char* ds_name,
+    int64_t* ds_id_out,
+    char* err_out, int err_cap)
+{
+    try {
+        hid_t ds = lorrax_ffi::phdf5::open_dataset_ro(
+            reinterpret_cast<lorrax_ffi::phdf5::PhdfCtx*>(ctx_handle),
+            std::string(ds_name));
         *ds_id_out = (int64_t)ds;
         return 0;
     } catch (const std::exception& e) {

@@ -41,6 +41,7 @@ _FFI_TARGET_SYMBOLS = {
     "lorrax_cusolvermp_eigh":      "EighMpFfi",
     "lorrax_cusolvermg_eigh_f64":  "EighMgF64",
     "lorrax_phdf5_write":          "PhdfWriteFfi",
+    "lorrax_phdf5_read":           "PhdfReadFfi",
 }
 
 # Error buffer size for the lrx_ wrappers.
@@ -142,6 +143,14 @@ def _set_argtypes(lib: ctypes.CDLL) -> None:
         ctypes.c_char_p, ctypes.c_int,       # err_out, err_cap
     ]
     lib.lrx_phdf5_ensure_dataset.restype = ctypes.c_int
+
+    lib.lrx_phdf5_open_dataset_ro.argtypes = [
+        ctypes.c_int64,                      # ctx_handle
+        ctypes.c_char_p,                     # ds_name
+        ctypes.POINTER(ctypes.c_int64),      # ds_id_out (hid_t)
+        ctypes.c_char_p, ctypes.c_int,       # err_out, err_cap
+    ]
+    lib.lrx_phdf5_open_dataset_ro.restype = ctypes.c_int
 
 
 def _register_ffi_targets(lib: ctypes.CDLL) -> None:
@@ -277,6 +286,21 @@ def phdf5_ensure_dataset(ctx_handle: int, ds_name: str,
         ds_name.encode("utf-8"),
         int(n_rows), int(n_cols),
         _DTYPE_TAG[dtype_name],
+        ctypes.byref(ds_id_out),
+        err, _ERR_CAP,
+    )
+    _check_err(rc, err)
+    return int(ds_id_out.value)
+
+
+def phdf5_open_dataset_ro(ctx_handle: int, ds_name: str) -> int:
+    """Collective H5Dopen of an existing dataset.  Returns hid_t as int64."""
+    lib = get_lib()
+    ds_id_out = ctypes.c_int64(0)
+    err = ctypes.create_string_buffer(_ERR_CAP)
+    rc = lib.lrx_phdf5_open_dataset_ro(
+        int(ctx_handle),
+        ds_name.encode("utf-8"),
         ctypes.byref(ds_id_out),
         err, _ERR_CAP,
     )

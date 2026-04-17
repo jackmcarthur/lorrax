@@ -305,6 +305,7 @@ set(LORRAX_FFI_SOURCES
     ../../cusolvermg/cpp/eigh_mg_ffi.cc
     ../../phdf5/cpp/context.cc
     ../../phdf5/cpp/write_ffi.cc
+    ../../phdf5/cpp/read_ffi.cc
 )
 
 add_library(lorrax_ffi SHARED ${LORRAX_FFI_SOURCES})
