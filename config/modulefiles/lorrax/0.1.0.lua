@@ -34,6 +34,12 @@ whatis("Name:        LORRAX")
 whatis("Version:     0.1.0")
 whatis("Description: JAX-based GW with ISDF compression (Shifter container)")
 
+-- Multiple LORRAX checkouts can coexist under different module names
+-- (e.g. lorrax_A, lorrax_B, lorrax_C). The family() directive makes Lmod
+-- auto-swap them: loading lorrax_B in a shell that already has lorrax_A
+-- unloads A first, so LORRAX_ROOT / lxrun never point at a mixed state.
+family("lorrax")
+
 -- =========================================================================
 --  Paths
 -- =========================================================================

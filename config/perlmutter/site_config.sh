@@ -36,3 +36,10 @@ LORRAX_IMAGE="nvcr.io/nvidia/jax:25.04-py3"
 # Personal: $HOME/modulefiles    (only you can `module load lorrax`)
 # Shared:   /global/common/software/<project>/modulefiles
 LORRAX_MODULEFILE_DIR="$HOME/modulefiles"
+
+# Module name. Defaults to "lorrax". Override at install time to keep
+# multiple LORRAX checkouts side-by-side (e.g. "lorrax_A"/"_B"/"_C"):
+#   LORRAX_MODULE_NAME=lorrax_A bash .../lorrax_A/config/perlmutter/install.sh
+# family("lorrax") in the modulefile makes variants swap automatically —
+# loading lorrax_B in a shell that has lorrax_A loaded unloads A first.
+: "${LORRAX_MODULE_NAME:=lorrax}"

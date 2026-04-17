@@ -17,6 +17,13 @@ set -euo pipefail
 #   Edit site_config.sh to set LORRAX_MODULEFILE_DIR to a shared path,
 #   e.g. /global/common/software/m2651/modulefiles
 #   Then have users add:  module use /global/common/software/m2651/modulefiles
+#
+# For multiple LORRAX checkouts (parallel A/B/C agent sessions):
+#   Run install.sh once per checkout, passing a variant name:
+#     LORRAX_MODULE_NAME=lorrax_A bash /path/to/lorrax_A/config/perlmutter/install.sh
+#     LORRAX_MODULE_NAME=lorrax_B bash /path/to/lorrax_B/config/perlmutter/install.sh
+#   family("lorrax") in the modulefile makes them mutually exclusive, so
+#   `module load lorrax_B` auto-swaps out lorrax_A in the same shell.
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -55,10 +62,11 @@ fi
 MODULEFILE_DIR="${LORRAX_MODULEFILE_DIR:-$HOME/modulefiles}"
 IMAGE="${LORRAX_IMAGE:-nvcr.io/nvidia/jax:25.04-py3}"
 DEPS="${LORRAX_DEPS:-}"
+MODULE_NAME="${LORRAX_MODULE_NAME:-lorrax}"
 
 # --- Install modulefile ---
 SRC_MODULE="$CONFIG_DIR/modulefiles/lorrax/0.1.0.lua"
-DST_DIR="$MODULEFILE_DIR/lorrax"
+DST_DIR="$MODULEFILE_DIR/$MODULE_NAME"
 DST_MODULE="$DST_DIR/0.1.0.lua"
 
 mkdir -p "$DST_DIR"
@@ -79,6 +87,7 @@ echo "  Patched: LORRAX_ROOT  = $LORRAX_INSTALL_ROOT"
 echo "  Patched: LORRAX_SITE  = $LORRAX_SITE_PACKAGES"
 echo "  Patched: LORRAX_DEPS  = ${DEPS:-(none)}"
 echo "  Patched: LORRAX_IMAGE = $IMAGE"
+echo "  Module name: $MODULE_NAME  (load with: module load $MODULE_NAME)"
 
 # --- Add module use to bashrc ---
 BASHRC="$HOME/.bashrc"
@@ -97,8 +106,8 @@ fi
 echo ""
 echo "Installation complete. To use:"
 echo "  source ~/.bashrc       # or start a new shell"
-echo "  module load lorrax"
-echo "  module help lorrax"
+echo "  module load $MODULE_NAME"
+echo "  module help $MODULE_NAME"
 echo ""
 echo "Quick test (requires a SLURM GPU allocation):"
 echo "  lxrun python3 -u -c \"import jax; print(jax.devices())\""

@@ -73,6 +73,22 @@ sbatch $LORRAX_ROOT/config/perlmutter/run_gw.slurm
 **Exported variables** for scripting:
 `LORRAX_ROOT`, `LORRAX_SRC`, `LORRAX_SITE`, `LORRAX_IMAGE`, `LORRAX_SHIFTER`.
 
+## Multiple parallel checkouts (A/B/C agent sessions)
+
+To run several LORRAX checkouts side-by-side, install each with a distinct
+module name:
+
+```bash
+LORRAX_MODULE_NAME=lorrax_A bash /path/to/lorrax_A/config/perlmutter/install.sh
+LORRAX_MODULE_NAME=lorrax_B bash /path/to/lorrax_B/config/perlmutter/install.sh
+LORRAX_MODULE_NAME=lorrax_C bash /path/to/lorrax_C/config/perlmutter/install.sh
+```
+
+`family("lorrax")` in the modulefile makes variants mutually exclusive
+within a single shell: `module load lorrax_B` auto-swaps `lorrax_A` out.
+Across separate shells each variant is fully independent (own
+`LORRAX_ROOT`, own `lxrun`, own `SLURM_JOBID` from `lxalloc`).
+
 ## Shared group installation
 
 Install once to a shared path so all group members can `module load lorrax`:
