@@ -20,10 +20,12 @@ NVHPC_HOST="${LORRAX_FFI_NVHPC_DIR:-/pscratch/sd/j/jackm/lorrax_nvhpc}"
 PHDF5_HOST="${LORRAX_FFI_PHDF5_DIR:-/pscratch/sd/j/jackm/lorrax_phdf5/stage}"
 IMAGE="${LORRAX_FFI_IMAGE:-nvcr.io/nvidia/jax:25.04-py3}"
 NGPU="${LORRAX_NGPU:-1}"
-# LORRAX_NTASKS controls the # of srun tasks.  For multi-process JAX
-# (cusolverMp) it should equal NGPU (1 rank per GPU).  For single-process
-# multi-GPU (cusolverMg), set LORRAX_NTASKS=1 LORRAX_NGPU=4.
+# LORRAX_NTASKS = total ranks across the whole job (world_size).
+# LORRAX_NNODES = # of nodes (4 GPUs per Perlmutter node).  For multi-
+# process single-node JAX default NNODES=1 and NTASKS=NGPU.  For 16-GPU
+# 4-node jobs use LORRAX_NNODES=4 LORRAX_NGPU=4 LORRAX_NTASKS=16.
 NTASKS="${LORRAX_NTASKS:-${NGPU}}"
+NNODES="${LORRAX_NNODES:-1}"
 
 if [[ ! -d "${NVHPC_HOST}" ]]; then
     echo "run_shifter.sh: staged NVHPC dir ${NVHPC_HOST} does not exist."
@@ -71,7 +73,7 @@ if [[ -n "${SLURM_JOBID:-}" && -z "${SLURM_STEP_ID:-}" ]]; then
     # Perlmutter's Slurm ships pmix_v4).  Without this, OpenMPI's PMI
     # client can't reach Slurm's PMI server and MPI_Init fails.
     exec srun "${jobflag}" --mpi=pmix \
-        --gres=gpu:"${NGPU}" -N 1 -n "${NTASKS}" \
+        --gres=gpu:"${NGPU}" -N "${NNODES}" -n "${NTASKS}" \
         "${SHIFTER_ARGS[@]}" "$@"
 else
     exec "${SHIFTER_ARGS[@]}" "$@"

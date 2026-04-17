@@ -16,6 +16,7 @@
 #include <hdf5.h>
 
 #include "ctx.h"
+#include "phdf5_interface.h"
 
 namespace lorrax_ffi::phdf5 {
 
@@ -178,36 +179,6 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
 //  any write_sharded_slab.  Creates the dataset if it doesn't exist,
 //  opens it if it does.  Returns the cached hid_t on ctx->open_datasets.
 // -----------------------------------------------------------------
-// dtype_tag values mirror xla::ffi::DataType small-int constants —
-// kept local to avoid pulling in XLA FFI here just for a switch.
-static hid_t h5_native_for_tag(int dtype_tag) {
-    switch (dtype_tag) {
-        case 1:  return H5T_NATIVE_FLOAT;    // F32
-        case 2:  return H5T_NATIVE_DOUBLE;   // F64
-        case 3:  return H5T_NATIVE_INT32;    // S32
-        case 4:  return H5T_NATIVE_INT64;    // S64
-        case 5: {                             // C64 — compound {r, i} : float
-            static hid_t t = []() {
-                hid_t id = H5Tcreate(H5T_COMPOUND, 2 * sizeof(float));
-                H5Tinsert(id, "r", 0,             H5T_NATIVE_FLOAT);
-                H5Tinsert(id, "i", sizeof(float), H5T_NATIVE_FLOAT);
-                return id;
-            }();
-            return t;
-        }
-        case 6: {                             // C128 — compound {r, i} : double
-            static hid_t t = []() {
-                hid_t id = H5Tcreate(H5T_COMPOUND, 2 * sizeof(double));
-                H5Tinsert(id, "r", 0,              H5T_NATIVE_DOUBLE);
-                H5Tinsert(id, "i", sizeof(double), H5T_NATIVE_DOUBLE);
-                return id;
-            }();
-            return t;
-        }
-        default: return H5I_INVALID_HID;
-    }
-}
-
 hid_t ensure_dataset(PhdfCtx* ctx, const std::string& ds_name,
                      int64_t n_rows, int64_t n_cols, int dtype_tag) {
     {
@@ -218,7 +189,7 @@ hid_t ensure_dataset(PhdfCtx* ctx, const std::string& ds_name,
         }
     }
 
-    hid_t native = h5_native_for_tag(dtype_tag);
+    hid_t native = dt::h5_native_for_tag(dtype_tag);
     if (native < 0) {
         throw std::runtime_error("phdf5 ensure_dataset: unsupported dtype_tag " +
                                  std::to_string(dtype_tag));

@@ -31,40 +31,15 @@
 
 #include "../../common/cpp/ffi_helpers.h"
 #include "ctx.h"
+#include "phdf5_interface.h"
 
 namespace lorrax_ffi::phdf5 {
 
 namespace ffi = ::xla::ffi;
 
-// ---- dtype → native HDF5 type --------------------------------------------
-template <typename T> inline hid_t h5_native_type();
-template <> inline hid_t h5_native_type<float>()                { return H5T_NATIVE_FLOAT;  }
-template <> inline hid_t h5_native_type<double>()               { return H5T_NATIVE_DOUBLE; }
-template <> inline hid_t h5_native_type<int32_t>()              { return H5T_NATIVE_INT32;  }
-template <> inline hid_t h5_native_type<int64_t>()              { return H5T_NATIVE_INT64;  }
-// Complex numbers: HDF5 has no native complex; we encode as a compound
-// {re, im} of double for C128 / float for C64.  Compound ids are cached
-// once per ctx (keyed by dtype tag).
-static hid_t make_complex128_type() {
-    hid_t t = H5Tcreate(H5T_COMPOUND, sizeof(std::complex<double>));
-    H5Tinsert(t, "r", 0,               H5T_NATIVE_DOUBLE);
-    H5Tinsert(t, "i", sizeof(double),  H5T_NATIVE_DOUBLE);
-    return t;
-}
-static hid_t make_complex64_type() {
-    hid_t t = H5Tcreate(H5T_COMPOUND, sizeof(std::complex<float>));
-    H5Tinsert(t, "r", 0,              H5T_NATIVE_FLOAT);
-    H5Tinsert(t, "i", sizeof(float),  H5T_NATIVE_FLOAT);
-    return t;
-}
-template <> inline hid_t h5_native_type<std::complex<double>>() {
-    static const hid_t id = make_complex128_type();   // leaks on process exit, fine
-    return id;
-}
-template <> inline hid_t h5_native_type<std::complex<float>>() {
-    static const hid_t id = make_complex64_type();
-    return id;
-}
+// Per-dtype helpers live in phdf5_interface.h — h5_native_type<T>(),
+// complex64_type(), complex128_type().  Pulled into this TU via the
+// include above; call as dt::h5_native_type<T>().
 
 // ---- Impl ----------------------------------------------------------------
 // ds_id is the hid_t of a dataset previously created via
@@ -122,7 +97,7 @@ static ffi::Error WriteImpl(
     // (6) dataset was created Python-side via lrx_phdf5_ensure_dataset;
     // we just use the hid_t.  Validate it's still live.
     hid_t dset = ds_id;
-    hid_t native_type = h5_native_type<T>();
+    hid_t native_type = dt::h5_native_type<T>();
     if (dset < 0 || H5Iis_valid(dset) <= 0) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
             "phdf5 write: ds_id is invalid (register via "
