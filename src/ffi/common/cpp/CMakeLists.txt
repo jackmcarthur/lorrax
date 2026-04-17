@@ -21,13 +21,19 @@ set(CUSOLVERMP_INCLUDE_DIR "" CACHE PATH
 set(CUSOLVERMP_LIB_DIR "" CACHE PATH
     "Alternative: explicit directory containing libcusolverMp.so + libcal.so")
 
-# -- (a) user-provided explicit paths win -----------------------------------
+# Autodetection ladder — first match wins:
+#   (a) explicit CUSOLVERMP_{INCLUDE,LIB}_DIR                (override)
+#   (b) explicit NVHPC_ROOT
+#   (c) $NVHPC_ROOT / $HPCSDK_ROOT / $NVHPC_SDK_PATH env vars
+#   (d) /opt/nvidia/hpc_sdk/... or /lorrax_nvhpc/...
+#   (e) CUDA Toolkit layout (CUDA 12.8+ standalone cuda-cusolvermp-12-X pkg)
+
 if(CUSOLVERMP_INCLUDE_DIR AND CUSOLVERMP_LIB_DIR)
     set(CUSOLVERMP_INCLUDE "${CUSOLVERMP_INCLUDE_DIR}")
     set(CUSOLVERMP_LIBDIR  "${CUSOLVERMP_LIB_DIR}")
     message(STATUS "cuSOLVERMp: using explicit paths from CUSOLVERMP_{INCLUDE,LIB}_DIR")
 else()
-    # -- (b) pick an NVHPC root, preferring the explicit one, else env vars -
+    # (b, c) env vars
     if(NOT NVHPC_ROOT)
         foreach(_envvar NVHPC_ROOT HPCSDK_ROOT NVHPC_SDK_PATH)
             if(DEFINED ENV{${_envvar}} AND IS_DIRECTORY "$ENV{${_envvar}}")
@@ -38,7 +44,7 @@ else()
         endforeach()
     endif()
 
-    # -- (c) fall back to common install locations -------------------------
+    # (d) common NVHPC install locations
     if(NOT NVHPC_ROOT)
         file(GLOB _nvhpc_candidates
             "/opt/nvidia/hpc_sdk/Linux_x86_64/*"
@@ -54,36 +60,53 @@ else()
         endforeach()
     endif()
 
-    if(NOT NVHPC_ROOT)
+    if(NVHPC_ROOT)
+        # Pick CUDA subdir under NVHPC_ROOT (newest present with cusolverMp.h)
+        if(NOT NVHPC_CUDA_SUBDIR)
+            file(GLOB _cuda_vers RELATIVE "${NVHPC_ROOT}/math_libs" "${NVHPC_ROOT}/math_libs/*")
+            list(SORT _cuda_vers ORDER DESCENDING)
+            foreach(_v ${_cuda_vers})
+                if(EXISTS "${NVHPC_ROOT}/math_libs/${_v}/targets/x86_64-linux/include/cusolverMp.h")
+                    set(NVHPC_CUDA_SUBDIR "${_v}")
+                    message(STATUS "cuSOLVERMp: CUDA subdir autodetected = ${NVHPC_CUDA_SUBDIR}")
+                    break()
+                endif()
+            endforeach()
+        endif()
+        if(NOT NVHPC_CUDA_SUBDIR)
+            message(FATAL_ERROR
+                "cuSOLVERMp: no usable CUDA subdir found under ${NVHPC_ROOT}/math_libs/")
+        endif()
+        set(CUSOLVERMP_INCLUDE
+            "${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/targets/x86_64-linux/include")
+        set(CUSOLVERMP_LIBDIR
+            "${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/lib64")
+    else()
+        # (e) CUDA Toolkit layout — CUDA 12.8+ ships `cuda-cusolvermp-12-X`
+        # as a standalone package that installs into the toolkit tree
+        # right next to the single-GPU cuSOLVER.
+        foreach(_cuda_root "/usr/local/cuda" "/usr/local/cuda-12.9"
+                          "/usr/local/cuda-12.8")
+            set(_inc "${_cuda_root}/targets/x86_64-linux/include/cusolverMp.h")
+            set(_lib "${_cuda_root}/targets/x86_64-linux/lib/libcusolverMp.so")
+            if(EXISTS "${_inc}" AND EXISTS "${_lib}")
+                set(CUSOLVERMP_INCLUDE "${_cuda_root}/targets/x86_64-linux/include")
+                set(CUSOLVERMP_LIBDIR  "${_cuda_root}/targets/x86_64-linux/lib")
+                message(STATUS "cuSOLVERMp: found alongside CUDA Toolkit at ${_cuda_root}")
+                break()
+            endif()
+        endforeach()
+    endif()
+
+    if(NOT CUSOLVERMP_INCLUDE OR NOT CUSOLVERMP_LIBDIR)
         message(FATAL_ERROR
             "cusolverMp.h not found.  Pass one of:\n"
             "  -DNVHPC_ROOT=<dir with math_libs/>\n"
             "  -DCUSOLVERMP_INCLUDE_DIR=<dir with cusolverMp.h> "
             "-DCUSOLVERMP_LIB_DIR=<dir with libcusolverMp.so>\n"
-            "or set $NVHPC_ROOT / $HPCSDK_ROOT.  See src/ffi/PORTING.md.")
+            "or set \$NVHPC_ROOT / \$HPCSDK_ROOT, or install "
+            "cuda-cusolvermp-12-X.  See src/ffi/PORTING.md.")
     endif()
-
-    # -- (d) pick the CUDA subdir (autodetect newest if unspecified) -------
-    if(NOT NVHPC_CUDA_SUBDIR)
-        file(GLOB _cuda_vers RELATIVE "${NVHPC_ROOT}/math_libs" "${NVHPC_ROOT}/math_libs/*")
-        list(SORT _cuda_vers ORDER DESCENDING)
-        foreach(_v ${_cuda_vers})
-            if(EXISTS "${NVHPC_ROOT}/math_libs/${_v}/targets/x86_64-linux/include/cusolverMp.h")
-                set(NVHPC_CUDA_SUBDIR "${_v}")
-                message(STATUS "cuSOLVERMp: CUDA subdir autodetected = ${NVHPC_CUDA_SUBDIR}")
-                break()
-            endif()
-        endforeach()
-    endif()
-    if(NOT NVHPC_CUDA_SUBDIR)
-        message(FATAL_ERROR
-            "cuSOLVERMp: no usable CUDA subdir found under ${NVHPC_ROOT}/math_libs/")
-    endif()
-
-    set(CUSOLVERMP_INCLUDE
-        "${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/targets/x86_64-linux/include")
-    set(CUSOLVERMP_LIBDIR
-        "${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/lib64")
 endif()
 
 if(NOT EXISTS "${CUSOLVERMP_INCLUDE}/cusolverMp.h")
@@ -122,6 +145,53 @@ if(NOT EXISTS "${CUDA_TOOLKIT_ROOT}/include/cuda_runtime.h")
     message(FATAL_ERROR
         "cuda_runtime.h not at ${CUDA_TOOLKIT_ROOT}/include/. "
         "Set -DCUDA_TOOLKIT_ROOT if building outside the NVIDIA JAX container.")
+endif()
+
+# ----------------------------------------------------------------------------
+#  ABI sanity check: CUDA toolkit (the one JAX links against at runtime)
+#  must be compatible with the CUDA subdir under NVHPC where we found
+#  cusolverMp.  Major version mismatch → guaranteed ABI breakage.  Minor
+#  mismatch → usually OK within 12.X, but worth a warning.
+# ----------------------------------------------------------------------------
+if(EXISTS "${CUDA_TOOLKIT_ROOT}/version.json")
+    file(READ "${CUDA_TOOLKIT_ROOT}/version.json" _cuda_ver_json)
+    string(REGEX MATCH "\"cuda\"[^{]*{[^\"]*\"version\"[ :]*\"([0-9]+\\.[0-9]+)" _ _cuda_ver_json)
+    if(CMAKE_MATCH_1)
+        set(TOOLKIT_CUDA_VERSION "${CMAKE_MATCH_1}")
+    endif()
+endif()
+if(NOT TOOLKIT_CUDA_VERSION AND EXISTS "${CUDA_TOOLKIT_ROOT}/bin/nvcc")
+    execute_process(COMMAND "${CUDA_TOOLKIT_ROOT}/bin/nvcc" --version
+                    OUTPUT_VARIABLE _nvcc_out OUTPUT_STRIP_TRAILING_WHITESPACE)
+    string(REGEX MATCH "release ([0-9]+\\.[0-9]+)" _ "${_nvcc_out}")
+    if(CMAKE_MATCH_1)
+        set(TOOLKIT_CUDA_VERSION "${CMAKE_MATCH_1}")
+    endif()
+endif()
+
+if(TOOLKIT_CUDA_VERSION AND NVHPC_CUDA_SUBDIR)
+    string(REGEX MATCH "^([0-9]+)\\.([0-9]+)" _ "${TOOLKIT_CUDA_VERSION}")
+    set(_tk_major "${CMAKE_MATCH_1}")
+    set(_tk_minor "${CMAKE_MATCH_2}")
+    string(REGEX MATCH "^([0-9]+)\\.([0-9]+)" _ "${NVHPC_CUDA_SUBDIR}")
+    set(_hp_major "${CMAKE_MATCH_1}")
+    set(_hp_minor "${CMAKE_MATCH_2}")
+    if(_tk_major AND _hp_major AND NOT "${_tk_major}" STREQUAL "${_hp_major}")
+        message(FATAL_ERROR
+            "CUDA major-version mismatch:\n"
+            "  toolkit (${CUDA_TOOLKIT_ROOT}) = ${TOOLKIT_CUDA_VERSION}\n"
+            "  NVHPC math_libs subdir        = ${NVHPC_CUDA_SUBDIR}\n"
+            "libcusolverMp.so is ABI-incompatible across CUDA major "
+            "versions.  Use an NVHPC install built against CUDA "
+            "${_tk_major}.x, or bump the container's CUDA.")
+    elseif(_tk_minor AND _hp_minor AND NOT "${_tk_minor}" STREQUAL "${_hp_minor}")
+        message(WARNING
+            "CUDA minor-version mismatch — toolkit ${TOOLKIT_CUDA_VERSION} "
+            "vs NVHPC math_libs ${NVHPC_CUDA_SUBDIR}.  Usually OK within "
+            "12.X (forward compatibility), but test before shipping.")
+    endif()
+    message(STATUS "CUDA toolkit version: ${TOOLKIT_CUDA_VERSION} "
+                   "(NVHPC math_libs: ${NVHPC_CUDA_SUBDIR}) — compatible")
 endif()
 
 set(NCCL_INCLUDE "/usr/include" CACHE PATH "Directory containing nccl.h")
