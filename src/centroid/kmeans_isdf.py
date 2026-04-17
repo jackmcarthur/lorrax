@@ -26,6 +26,7 @@ For non-orthogonal cells, this approximation works well when the cell is "not to
 For highly skewed cells, one should check neighboring images explicitly.
 """
 
+import os
 import numpy as np
 
 from jax import config
@@ -34,9 +35,62 @@ config.update("jax_enable_x64", True)
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax.sharding import Mesh, PartitionSpec, NamedSharding
+from jax.experimental.shard_map import shard_map
 from functools import partial
 
-print(f"✓ JAX initialized with device: {jax.devices()[0]}")
+
+# Multi-process bootstrap. When launched under `srun -n N>1` each rank is a
+# separate Python process with its own local GPU; `jax.distributed.initialize()`
+# stitches them into one multi-host JAX job so `jax.devices()` returns all N
+# GPUs and we can build a single `Mesh` spanning them. Matches the pattern in
+# ``psp/run_nscf.py`` and ``gw/gw_jax.py``.
+_DISTRIBUTED_SENTINEL = "_LORRAX_KMEANS_DISTRIBUTED_DONE"
+
+
+def _maybe_init_jax_distributed() -> None:
+    if os.environ.get(_DISTRIBUTED_SENTINEL):
+        return
+    proc_count = int(
+        os.environ.get("JAX_PROCESS_COUNT",
+        os.environ.get("JAX_NUM_PROCESSES",
+        os.environ.get("SLURM_NTASKS", "1"))))
+    if proc_count > 1:
+        try:
+            jax.distributed.initialize()
+            os.environ[_DISTRIBUTED_SENTINEL] = "1"
+            return
+        except Exception:
+            pass
+        coord = os.environ.get("JAX_COORDINATOR_ADDRESS")
+        if coord is None:
+            import subprocess
+            nodelist = os.environ.get("SLURM_NODELIST")
+            if nodelist:
+                try:
+                    result = subprocess.run(
+                        ["scontrol", "show", "hostnames", nodelist],
+                        capture_output=True, text=True, check=True)
+                    coord = f"{result.stdout.strip().splitlines()[0]}:12355"
+                except Exception:
+                    pass
+            if coord is None:
+                host = (os.environ.get("SLURMD_NODENAME") or
+                        os.environ.get("HOSTNAME") or "localhost")
+                coord = f"{host}:12355"
+        proc_id = int(os.environ.get("JAX_PROCESS_INDEX",
+                                     os.environ.get("SLURM_PROCID", "0")))
+        jax.distributed.initialize(coordinator_address=coord,
+                                   num_processes=proc_count,
+                                   process_id=proc_id)
+    os.environ[_DISTRIBUTED_SENTINEL] = "1"
+
+
+_maybe_init_jax_distributed()
+
+print(f"✓ JAX initialized: {len(jax.devices())} device(s) "
+      f"(local: {len(jax.local_devices())}, proc {jax.process_index()}/"
+      f"{jax.process_count()})")
 
 from file_io import WFNReader
 from common import symmetry_maps
@@ -163,78 +217,261 @@ def pbc_distance_sq_single(
     return distances_sq
 
 
-@partial(jax.jit, static_argnames=['n_k'])
+# Default K-block size for the chunked PBC distance pass. Chosen so that for
+# typical P ~ 10^5-10^6 and float32 the peak (P, K_BLOCK, 3) tensor stays under
+# ~100 MB (e.g. 1e6 * 32 * 3 * 4 B ≈ 380 MB; 1e5 * 32 * 3 * 4 B ≈ 40 MB).
+_DEFAULT_K_BLOCK = 32
+
+
+@partial(jax.jit, static_argnames=['n_k', 'k_block'])
+def assign_labels_chunked(
+    positions_frac: jnp.ndarray,
+    centroids_frac: jnp.ndarray,
+    metric_tensor: jnp.ndarray,
+    n_k: int,
+    k_block: int = _DEFAULT_K_BLOCK,
+) -> jnp.ndarray:
+    """Nearest-centroid assignment via a K-chunked scan.
+
+    Computes ``argmin_k d²(pos_p, cent_k)`` without ever materializing the full
+    (P, K, 3) PBC displacement tensor. Inside the scan we hold at most a
+    (P, k_block, 3) slab. PBC minimal image + metric tensor are unchanged.
+
+    Args:
+        positions_frac: (P, 3) fractional grid-point coordinates.
+        centroids_frac: (K, 3) fractional centroid coordinates. K must be
+            divisible by ``k_block`` (pad the caller side if not).
+        metric_tensor: (3, 3) G = avec^T @ avec, in whatever units ``avec`` has.
+        n_k: Static K (equals ``centroids_frac.shape[0]``).
+        k_block: Static K-chunk size. Peak tensor inside the scan is
+            (P, k_block, 3).
+
+    Returns:
+        labels: (P,) int32 cluster assignment.
+    """
+    n_chunks = n_k // k_block
+    centroids_blocked = centroids_frac.reshape(n_chunks, k_block, 3)
+
+    # scan carry dtypes must be invariant across iterations; argmin's output
+    # dtype depends on whether jax_enable_x64 is on, so we cast explicitly.
+    idx_dtype = jnp.int32
+    dist_dtype = metric_tensor.dtype
+
+    def body(carry, cent_chunk):
+        best_d, best_k, chunk_idx = carry
+        # (P, k_block, 3) — the only large intermediate.
+        delta = positions_frac[:, None, :] - cent_chunk[None, :, :]
+        delta = delta - jnp.round(delta)
+        d_chunk = jnp.einsum('pki,ij,pkj->pk', delta, metric_tensor, delta)  # (P, k_block)
+        # Sentinel for padded centroids: caller may pad with NaN positions to
+        # make K divisible by k_block. NaN distances must never win argmin.
+        d_chunk = jnp.where(jnp.isnan(d_chunk), jnp.inf, d_chunk)
+        local_k = jnp.argmin(d_chunk, axis=1).astype(idx_dtype)                # (P,)
+        local_d = jnp.take_along_axis(d_chunk, local_k[:, None], axis=1)[:, 0] # (P,)
+        global_k = (chunk_idx * k_block + local_k).astype(idx_dtype)
+        better = local_d < best_d
+        best_d = jnp.where(better, local_d, best_d).astype(dist_dtype)
+        best_k = jnp.where(better, global_k, best_k).astype(idx_dtype)
+        return (best_d, best_k, chunk_idx + 1), None
+
+    init = (
+        jnp.full((positions_frac.shape[0],), jnp.inf, dtype=dist_dtype),
+        jnp.zeros((positions_frac.shape[0],), dtype=idx_dtype),
+        jnp.asarray(0, dtype=idx_dtype),
+    )
+    (_, labels, _), _ = lax.scan(body, init, centroids_blocked)
+    return labels
+
+
+def _local_update_accumulators(
+    positions_frac: jnp.ndarray,
+    centroids_frac: jnp.ndarray,
+    rho_flat: jnp.ndarray,
+    labels: jnp.ndarray,
+    n_k: int,
+):
+    """Given labels, compute the per-centroid weighted-displacement sums.
+
+    Avoids the (P, K, 3) tensor entirely: gathers the assigned centroid for
+    each point (P, 3), computes a single PBC-wrapped displacement (P, 3), and
+    uses ``segment_sum`` to reduce P → K. Memory is O(P + K), not O(P·K).
+
+    The PBC minimal image is applied to ``pos - cent[label]`` and only that,
+    which matches the original algorithm because ``mask[p, k] = (labels[p]==k)``
+    zeroed out every column except the assigned one anyway.
+    """
+    assigned_cent = centroids_frac[labels]                       # (P, 3)
+    delta = positions_frac - assigned_cent                        # (P, 3)
+    delta = delta - jnp.round(delta)                              # (P, 3) PBC
+    weighted_delta = rho_flat[:, None] * delta                    # (P, 3)
+    sum_weighted_delta = jax.ops.segment_sum(
+        weighted_delta, labels, num_segments=n_k
+    )                                                             # (K, 3)
+    sum_weights = jax.ops.segment_sum(
+        rho_flat, labels, num_segments=n_k
+    )                                                             # (K,)
+    return sum_weighted_delta, sum_weights
+
+
+def _finalize_update(
+    centroids_frac: jnp.ndarray,
+    sum_weighted_delta: jnp.ndarray,
+    sum_weights: jnp.ndarray,
+    metric_tensor: jnp.ndarray,
+):
+    """Turn (sum_weighted_delta, sum_weights) into new centroids + movement."""
+    avg_delta = jnp.where(
+        sum_weights[:, None] > 0,
+        sum_weighted_delta / jnp.maximum(sum_weights[:, None], 1e-10),
+        0.0,
+    )
+    new_centroids_frac = (centroids_frac + avg_delta) % 1.0
+    movement_frac = new_centroids_frac - centroids_frac
+    movement_frac = movement_frac - jnp.round(movement_frac)
+    movement_sq = jnp.einsum('ki,ij,kj->k', movement_frac, metric_tensor, movement_frac)
+    return new_centroids_frac, movement_sq
+
+
+@partial(jax.jit, static_argnames=['n_k', 'k_block'])
 def kmeans_update_step(
     positions_frac: jnp.ndarray,
     centroids_frac: jnp.ndarray,
     rho_flat: jnp.ndarray,
     metric_tensor: jnp.ndarray,
-    n_k: int
+    n_k: int,
+    k_block: int = _DEFAULT_K_BLOCK,
 ) -> tuple:
     """Single k-means update step: assign labels and compute new centroids.
-    
+
     This is the core k-means iteration, JIT-compiled for speed:
-        1. Compute all pairwise PBC distances
-        2. Assign each point to nearest centroid
-        3. Compute weighted mean of assigned points (in wrapped coordinates)
-        4. Update centroid positions
-    
-    The weighted mean is computed in *displacement space* relative to the current
-    centroid, using PBC-wrapped displacements. This ensures the centroid moves
-    towards its assigned points correctly even when points wrap around boundaries.
-    
+        1. Assign each point to nearest centroid (K-chunked PBC distance scan)
+        2. For each point, compute PBC-wrapped displacement to its assigned centroid
+        3. ``segment_sum`` over labels → (K, 3) accumulator
+        4. Update centroid positions, wrap to [0, 1), compute PBC-wrapped movement
+
+    The weighted mean is computed in *displacement space* relative to the
+    current centroid, using PBC-wrapped displacements. This ensures the
+    centroid moves towards its assigned points correctly even when points
+    wrap around boundaries. Mathematically equivalent to the one-hot-mask form
+    ``mask[p,k]·(pos_p - cent_k)``, since the mask zeroes all columns except
+    the assigned one.
+
+    Peak memory is (P, k_block, 3) inside the distance scan and (P, 3) for
+    the mean-update — no (P, K, 3) tensor is ever materialized.
+
     Args:
-        positions_frac: (P, 3) fractional coordinates of grid points
-        centroids_frac: (K, 3) fractional coordinates of centroids
-        rho_flat: (P,) charge density weights
-        metric_tensor: (3, 3) G = avec^T @ avec
-        n_k: Number of clusters (must match centroids_frac.shape[0])
-        
+        positions_frac: (P, 3) fractional coordinates of grid points.
+        centroids_frac: (K, 3) fractional coordinates of centroids. K must be
+            divisible by ``k_block``; the caller pads if needed.
+        rho_flat: (P,) charge density weights.
+        metric_tensor: (3, 3) G = avec^T @ avec. Distances come out in the
+            same units ``avec`` has (Å² if avec is in Å, alat² if in alat, etc.).
+        n_k: Number of clusters (must match centroids_frac.shape[0]).
+        k_block: Static K-chunk size for the distance scan.
+
     Returns:
-        new_centroids_frac: (K, 3) updated centroid positions
-        movement_sq: (K,) squared movement of each centroid (for convergence check)
-        labels: (P,) cluster assignment for each point
+        new_centroids_frac: (K, 3) updated centroid positions.
+        movement_sq: (K,) squared centroid movement (for convergence check).
+        labels: (P,) cluster assignment for each point.
     """
-    # Step 1: Compute all pairwise squared distances with PBC
-    distances_sq = pbc_distance_sq_batch(positions_frac, centroids_frac, metric_tensor)
-    
-    # Step 2: Assign each point to nearest centroid
-    # (squared distance preserves ordering, so argmin is the same)
-    labels = jnp.argmin(distances_sq, axis=1)  # (P,)
-    
-    # Step 3: Compute weighted centroid updates
-    # One-hot encode labels for masking: (P, K)
-    mask = jax.nn.one_hot(labels, n_k, dtype=rho_flat.dtype)
-    
-    # Compute PBC-wrapped displacements from each point to each centroid
-    delta_frac = positions_frac[:, None, :] - centroids_frac[None, :, :]
-    delta_frac = delta_frac - jnp.round(delta_frac)  # (P, K, 3)
-    
-    # Weight displacements by density and assignment mask
-    weights = mask * rho_flat[:, None]  # (P, K)
-    weighted_delta = weights[:, :, None] * delta_frac  # (P, K, 3)
-    
-    # Sum weighted displacements and total weights per centroid
-    sum_weighted_delta = jnp.sum(weighted_delta, axis=0)  # (K, 3)
-    sum_weights = jnp.sum(weights, axis=0)  # (K,)
-    
-    # Compute average displacement (avoid division by zero)
-    # For centroids with no assigned points, keep position unchanged
-    avg_delta = jnp.where(
-        sum_weights[:, None] > 0,
-        sum_weighted_delta / jnp.maximum(sum_weights[:, None], 1e-10),
-        0.0
+    labels = assign_labels_chunked(
+        positions_frac, centroids_frac, metric_tensor, n_k, k_block=k_block
     )
-    
-    # Step 4: Update centroid positions and wrap to [0, 1)
-    new_centroids_frac = (centroids_frac + avg_delta) % 1.0
-    
-    # Compute movement for convergence check (with PBC!)
-    movement_frac = new_centroids_frac - centroids_frac
-    movement_frac = movement_frac - jnp.round(movement_frac)  # PBC wrap the movement
-    movement_sq = jnp.einsum('ki,ij,kj->k', movement_frac, metric_tensor, movement_frac)
-    
+    sum_weighted_delta, sum_weights = _local_update_accumulators(
+        positions_frac, centroids_frac, rho_flat, labels, n_k
+    )
+    new_centroids_frac, movement_sq = _finalize_update(
+        centroids_frac, sum_weighted_delta, sum_weights, metric_tensor
+    )
     return new_centroids_frac, movement_sq, labels
+
+
+# =============================================================================
+# Multi-device sharded kmeans step
+# =============================================================================
+# Shard the grid-point axis P across a 1D device mesh named 'x'. Centroids (K, 3),
+# the metric tensor, and the final updates are replicated. Inside each shard we
+# run the same local computation as the single-device path; the only cross-device
+# communication is a `psum` on the (K, 3) weighted-sum and (K,) weight accumulators,
+# one collective per iteration. This is the pattern the user asked for: "centroids
+# replicated, distance + assignment parallelized along P".
+
+def _kmeans_update_step_sharded_impl(
+    positions_frac,
+    centroids_frac,
+    rho_flat,
+    metric_tensor,
+    n_k: int,
+    k_block: int,
+):
+    """Per-shard body for `kmeans_update_step_sharded`. See that function.
+
+    Runs inside `shard_map` with P sharded along axis 'x'. Each device sees
+    only its P_local slice; the two `psum` collectives combine the per-shard
+    `segment_sum` accumulators into globally correct (K, 3) / (K,) tensors.
+    """
+    # Per-shard local label assignment (P_local, 3) × replicated (K, 3) → (P_local,)
+    local_labels = assign_labels_chunked(
+        positions_frac, centroids_frac, metric_tensor, n_k, k_block=k_block
+    )
+    # Per-shard weighted-sum accumulators, then cross-device reduction.
+    local_wsum, local_w = _local_update_accumulators(
+        positions_frac, centroids_frac, rho_flat, local_labels, n_k
+    )
+    sum_weighted_delta = lax.psum(local_wsum, axis_name='x')      # (K, 3) replicated
+    sum_weights = lax.psum(local_w, axis_name='x')                # (K,) replicated
+    new_centroids_frac, movement_sq = _finalize_update(
+        centroids_frac, sum_weighted_delta, sum_weights, metric_tensor
+    )
+    return new_centroids_frac, movement_sq, local_labels
+
+
+def make_sharded_kmeans_update(mesh: Mesh, n_k: int, k_block: int = _DEFAULT_K_BLOCK):
+    """Build a sharded `kmeans_update_step` bound to a device mesh.
+
+    The returned callable expects:
+      * positions_frac, rho_flat sharded along ``mesh['x']`` on the P axis.
+      * centroids_frac, metric_tensor replicated.
+
+    and returns:
+      * new_centroids_frac, movement_sq replicated (identical on every device).
+      * labels sharded along ``mesh['x']`` on the P axis (each device sees its
+        local slice, matching the input sharding).
+
+    We use ``shard_map`` so the single ``lax.psum`` inside the body is explicit
+    and the compiler has complete freedom to fuse the local work.
+
+    Args:
+        mesh: 1-axis device mesh, axis name must be 'x'.
+        n_k: Static number of centroids (must match centroids_frac.shape[0]).
+        k_block: Static K-chunk size.
+    """
+    if 'x' not in mesh.axis_names:
+        raise ValueError(f"Mesh must have an 'x' axis, got {mesh.axis_names}")
+
+    in_specs = (
+        PartitionSpec('x', None),   # positions_frac (P, 3) sharded on P
+        PartitionSpec(None, None),  # centroids_frac (K, 3) replicated
+        PartitionSpec('x'),         # rho_flat (P,) sharded on P
+        PartitionSpec(None, None),  # metric_tensor (3, 3) replicated
+    )
+    out_specs = (
+        PartitionSpec(None, None),  # new_centroids replicated
+        PartitionSpec(None),        # movement_sq replicated
+        PartitionSpec('x'),         # labels sharded on P
+    )
+
+    @partial(jax.jit, static_argnames=())
+    def step(positions_frac, centroids_frac, rho_flat, metric_tensor):
+        return shard_map(
+            lambda p, c, r, g: _kmeans_update_step_sharded_impl(p, c, r, g, n_k, k_block),
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_rep=False,
+        )(positions_frac, centroids_frac, rho_flat, metric_tensor)
+
+    return step
 
 
 # =============================================================================
@@ -371,6 +608,36 @@ def plot_density_and_centroids(wfn, rho_np, centroids, labels=None):
 # Main k-means implementation (Pure JAX)
 # =============================================================================
 
+def _pick_k_block(n_k: int, preferred: int = _DEFAULT_K_BLOCK) -> int:
+    """Pick the largest divisor of ``n_k`` that is ≤ ``preferred``.
+
+    The chunked distance scan requires ``n_k % k_block == 0``. Rather than
+    padding with sentinels (which works but costs a little memory), we prefer
+    to pick the biggest divisor that fits under the preferred bound. Falls
+    back to 1 for unfriendly values of ``n_k`` (e.g. primes).
+    """
+    for b in range(min(preferred, n_k), 0, -1):
+        if n_k % b == 0:
+            return b
+    return 1
+
+
+def _pad_centroids(centroids: jnp.ndarray, n_padded: int) -> jnp.ndarray:
+    """Pad centroids with NaN rows up to ``n_padded`` total.
+
+    NaN positions produce NaN distances in the scan body, which are sanitized
+    to +inf before argmin, so padded rows never win. Padded rows also never
+    get assigned any points (labels cap at the real range), so their
+    ``segment_sum`` bucket is 0 and their updated position is NaN — the caller
+    discards those trailing rows.
+    """
+    n_real = centroids.shape[0]
+    if n_padded == n_real:
+        return centroids
+    pad = jnp.full((n_padded - n_real, 3), jnp.nan, dtype=centroids.dtype)
+    return jnp.concatenate([centroids, pad], axis=0)
+
+
 def weighted_kmeans_jax(
     avec: jnp.ndarray,
     rho_jax: jnp.ndarray,
@@ -378,41 +645,55 @@ def weighted_kmeans_jax(
     max_steps: int = 200,
     tolerance: float = 5e-3,
     seed: int = 0,
+    mesh: Mesh | None = None,
 ) -> tuple:
     """
     Density-weighted k-means clustering with periodic boundary conditions.
-    
+
     Uses k-means++ initialization for better initial centroid placement,
     then iterates Lloyd's algorithm until convergence.
-    
+
     Key features:
-    - Minimal image convention for PBC (considers all 27 neighboring cells)
-    - Metric tensor for efficient squared distance computation
-    - JIT-compiled inner loop for speed
-    - Weighted by charge density (centroids concentrate in high-density regions)
-    
+    - Minimal image convention for PBC (considers all 27 neighboring cells).
+    - Metric tensor for efficient squared distance computation; the tensor
+      carries whatever units ``avec`` has, so pass avec in the physical length
+      unit you want the tolerance/movement to be in (typically Å).
+    - Lloyd's iteration is JIT-compiled and uses ``segment_sum`` for the
+      weighted-mean step — the (P, K, 3) displacement tensor is never
+      materialized.
+    - K-chunked distance scan bounds peak memory to (P, k_block, 3).
+    - If ``mesh`` is provided (1-axis mesh named 'x' over the available
+      devices), the Lloyd step runs via ``shard_map``: P is sharded on 'x',
+      centroids are replicated, and one ``psum`` per step combines the
+      per-shard (K, 3) weighted-sum accumulators. Centroids stay
+      bit-identical across devices.
+
     Args:
-        avec: (3, 3) lattice vectors (rows are a1, a2, a3 in Cartesian coords)
-        rho_jax: (Nx, Ny, Nz) charge density on real-space grid
-        N_k: Number of cluster centroids (ISDF sampling points)
-        max_steps: Maximum k-means iterations
-        tolerance: Convergence tolerance for centroid movement (Angstroms)
-        seed: Random seed for reproducibility
-        
+        avec: (3, 3) lattice vectors (rows are a1, a2, a3). Units determine
+            the units of the reported movement / the tolerance; for physical
+            Angstrom tolerance pass avec in Å.
+        rho_jax: (Nx, Ny, Nz) charge density on real-space grid.
+        N_k: Number of cluster centroids (ISDF sampling points).
+        max_steps: Maximum k-means iterations.
+        tolerance: Convergence tolerance for centroid movement, in the same
+            units as ``avec`` (Å if avec is Å).
+        seed: Random seed for reproducibility.
+        mesh: Optional 1-axis device mesh named 'x' for multi-GPU Lloyd.
+
     Returns:
-        labels: (P,) cluster assignment for each grid point
-        centroids: (N_k, 3) final centroid positions in fractional coordinates
-        history: (N_k, max_steps) z-coordinate history (for debugging)
-        steps_taken: Number of iterations until convergence
+        labels: (P,) cluster assignment for each grid point.
+        centroids: (N_k, 3) final centroid positions in fractional coordinates.
+        history: (N_k, max_steps) z-coordinate history (for debugging).
+        steps_taken: Number of iterations until convergence.
     """
-    print(f"Starting weighted k-means with {N_k} clusters...")
-    
-    # Precompute metric tensor: G = avec^T @ avec
-    # This allows d² = df @ G @ df without Cartesian conversion
+    print(f"Starting weighted k-means with {N_k} clusters "
+          f"(mesh={'x=' + str(mesh.shape['x']) if mesh is not None else 'single-device'})...")
+
+    # Precompute metric tensor: G = avec^T @ avec. Distances inherit avec's units.
     metric_tensor = jnp.array(avec.T @ avec, dtype=jnp.float32)
-    tolerance_sq = tolerance ** 2  # Compare squared distances for efficiency
-    
-    # Build grid of fractional positions (float32 to match centroids dtype)
+    tolerance_sq = tolerance ** 2  # Compare squared distances for efficiency.
+
+    # Build grid of fractional positions (float32 to match centroids dtype).
     grid_x, grid_y, grid_z = rho_jax.shape
     X, Y, Z = jnp.meshgrid(
         jnp.linspace(0, 1, grid_x, endpoint=False, dtype=jnp.float32),
@@ -423,8 +704,26 @@ def weighted_kmeans_jax(
     positions = jnp.stack((X, Y, Z), axis=-1).reshape(-1, 3)
     rho_flat = rho_jax.reshape(-1).astype(jnp.float32)
     n_points = positions.shape[0]
-    
+
     print(f"Grid size: {grid_x}x{grid_y}x{grid_z} = {n_points} points")
+
+    # Pick k_block as the largest divisor of N_k that is ≤ _DEFAULT_K_BLOCK,
+    # so the chunked scan needs no padding. (Padding path works, but divisors
+    # are cleaner and equally fast.)
+    k_block = _pick_k_block(N_k)
+    print(f"K-chunk size for distance scan: {k_block} ({N_k // k_block} chunks)")
+
+    # P-sharding is deferred until after k-means++ init; the init loop does
+    # host-side `rng.choice` with `np.array(rho_flat * min_dist_sq)`, which is
+    # fine for replicated arrays but breaks on a distributed sharded array.
+    sharded_step = None
+    if mesh is not None:
+        if n_points % mesh.shape['x'] != 0:
+            raise ValueError(
+                f"n_points={n_points} must be divisible by mesh x-axis "
+                f"size {mesh.shape['x']} for even P-sharding"
+            )
+        sharded_step = make_sharded_kmeans_update(mesh, N_k, k_block=k_block)
     
     # =========================================================================
     # K-means++ initialization
@@ -466,33 +765,46 @@ def weighted_kmeans_jax(
         centroids = centroids.at[k].set(positions[next_idx])
     
     print("K-means++ initialization complete.")
-    
+
     # =========================================================================
     # Lloyd's algorithm (iterative refinement)
     # =========================================================================
     print("Starting k-means iterations...")
 
-    history = jnp.zeros((N_k, max_steps), dtype=jnp.float32)
+    # Per-step z-coord history. Use a host-side numpy array so we don't
+    # incur one JAX .at[].set() per iteration inside the Python loop.
+    history = np.zeros((N_k, max_steps), dtype=np.float32)
     steps_taken = max_steps
-    
+
+    if mesh is not None:
+        # Move inputs to the distributed layout now that k-means++ init is done.
+        pos_sharding = NamedSharding(mesh, PartitionSpec('x', None))
+        rho_sharding = NamedSharding(mesh, PartitionSpec('x'))
+        rep_sharding = NamedSharding(mesh, PartitionSpec())
+        positions = jax.device_put(positions, pos_sharding)
+        rho_flat = jax.device_put(rho_flat, rho_sharding)
+        metric_tensor = jax.device_put(metric_tensor, rep_sharding)
+        centroids = jax.device_put(centroids, rep_sharding)
+
     for step in range(max_steps):
-        # JIT-compiled update step
-        new_centroids, movement_sq, labels = kmeans_update_step(
-            positions, centroids, rho_flat, metric_tensor, N_k
-        )
-        
-        # Record z-components for debugging/visualization
-        history = history.at[:, step].set(new_centroids[:, 2])
-        
-        # Check convergence: all centroids moved less than tolerance
+        if mesh is not None:
+            new_centroids, movement_sq, labels = sharded_step(
+                positions, centroids, rho_flat, metric_tensor
+            )
+        else:
+            new_centroids, movement_sq, labels = kmeans_update_step(
+                positions, centroids, rho_flat, metric_tensor, N_k, k_block
+            )
+
+        history[:, step] = np.asarray(new_centroids[:, 2])
         max_movement_sq = float(jnp.max(movement_sq))
-        
+
         if step % 20 == 0:
-            print(f"  Step {step}: max movement = {np.sqrt(max_movement_sq):.6f} Å")
-        
+            print(f"  Step {step}: max movement = {np.sqrt(max_movement_sq):.6f} (avec units)")
+
         if max_movement_sq < tolerance_sq:
             print(f"Converged in {step + 1} steps "
-                  f"(max movement = {np.sqrt(max_movement_sq):.6f} Å)")
+                  f"(max movement = {np.sqrt(max_movement_sq):.6f} (avec units))")
             steps_taken = step + 1
             centroids = new_centroids
             break
@@ -500,10 +812,11 @@ def weighted_kmeans_jax(
         centroids = new_centroids
     else:
         print(f"Reached max steps ({max_steps}) without full convergence")
-    
-    # Final label assignment
-    distances_sq = pbc_distance_sq_batch(positions, centroids, metric_tensor)
-    labels = jnp.argmin(distances_sq, axis=1)
+
+    # Final label assignment (uses the same K-chunked scan, no (P,K,3) tensor).
+    labels = assign_labels_chunked(
+        positions, centroids, metric_tensor, N_k, k_block=k_block
+    )
 
     return labels, centroids, history, steps_taken
 
@@ -644,6 +957,12 @@ def ensure_unique_centroids(
 # Main entry point
 # =============================================================================
 
+# WFN.h5 convention: ``wfn.alat`` is in Bohr, ``wfn.avec`` rows are unitless
+# (components of the primitive vectors in units of alat). Multiplying by
+# ``alat * BOHR_TO_ANG`` converts avec rows to Å.
+BOHR_TO_ANG = 0.529177210544
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Weighted k-means for ISDF sampling points")
@@ -654,6 +973,9 @@ def main():
     parser.add_argument("--plot-zoom", type=float, default=1.0,
                         help="Zoom factor for density in plot (default: 1.0, higher = finer)")
     parser.add_argument("--no-downsample", action="store_true", help="Use full FFT grid (no zoom)")
+    parser.add_argument("--shard", action="store_true",
+                        help="Use multi-device P-sharded Lloyd step (mesh 'x' "
+                             "over all visible jax.devices()).")
     args = parser.parse_args()
     
     N_k = args.N_k
@@ -663,14 +985,21 @@ def main():
     sym = symmetry_maps.SymMaps(wfn)
 
     charge_density = calculate_charge_density(wfn, sym)
-    
+
+    # BGW WFN.h5 stores ``avec`` in units of alat (so rows are typically
+    # unit-length) and ``alat`` in Bohr. Convert once to Å and use those
+    # Å-basis lattice vectors throughout: this makes ``lattice_lengths``,
+    # ``target_spacing``, the kmeans tolerance, and the printed movement all
+    # in the same consistent physical unit.
+    avec_ang = np.asarray(wfn.avec) * float(wfn.alat) * BOHR_TO_ANG  # (3, 3) in Å
+
     # Resize grid to target spacing of ~0.13 Å (gives ~10 points per 1.3 Å core region)
     # For each direction i:
     #   current_spacing = |a_i| / N_i
     #   zoom_factor = current_spacing / target_spacing
     # scipy.ndimage.zoom: new_N = old_N * zoom_factor
     target_spacing = 0.13 * 0.52  # Angstroms
-    lattice_lengths = np.linalg.norm(wfn.avec, axis=1)  # |a1|, |a2|, |a3|
+    lattice_lengths = np.linalg.norm(avec_ang, axis=1)  # |a1|, |a2|, |a3| in Å
     current_spacing = lattice_lengths / np.array(charge_density.shape)
     zoom_factors = current_spacing / target_spacing
     
@@ -696,13 +1025,22 @@ def main():
     print(f"Zoom factors: {zoom_factors}")
     rho_np = interpolate_density(charge_density, zoom_factors)
     rho_np_cpu = np.asarray(rho_np)
-    avec_np_cpu = np.asarray(wfn.avec)
 
     rho_jax = jnp.asarray(rho_np_cpu, dtype=jnp.float32)
-    avec_jax = jnp.asarray(avec_np_cpu, dtype=jnp.float32)
+    avec_jax = jnp.asarray(avec_ang, dtype=jnp.float32)
+
+    mesh = None
+    if args.shard:
+        devices = jax.devices()
+        if len(devices) < 2:
+            print(f"--shard requested but only {len(devices)} JAX device(s) "
+                  "visible; running single-device.")
+        else:
+            mesh = Mesh(np.asarray(devices), ('x',))
+            print(f"Sharded Lloyd step: mesh axis 'x' of size {len(devices)}")
 
     _, centroids_jax, _, _ = weighted_kmeans_jax(
-        avec_jax, rho_jax, N_k=N_k, seed=args.seed
+        avec_jax, rho_jax, N_k=N_k, seed=args.seed, mesh=mesh
     )
 
     centroids_frac = np.array(centroids_jax)
