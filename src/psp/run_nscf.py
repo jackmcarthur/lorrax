@@ -201,6 +201,7 @@ def run_nscf(
     pb_n_windows: int = 50,
     pb_n_prot: int | None = None,
     pb_wfn_input: str | None = None,
+    pb_seed: int = 0,
     verbose: bool = True,
     kpoints_override: np.ndarray | None = None,
     weights_override: np.ndarray | None = None,
@@ -422,26 +423,28 @@ def run_nscf(
                 k=pb_k, M_max=pb_M_max, F=pb_F,
                 n_prot=pb_n_prot,
                 n_windows_target=pb_n_windows,
-                verbose=verbose, seed=0)
+                verbose=verbose, seed=pb_seed)
         else:
             pb0 = _pb_func(
                 apply_H0_flat, dim=dim_flat,
                 Phi_det=Phi_dav_0, E_det=E_dav_0, E_fermi=0.0,
                 k=pb_k, M_max=pb_M_max, F=pb_F,
                 n_windows_target=pb_n_windows,
-                verbose=verbose, seed=0)
+                verbose=verbose, seed=pb_seed)
 
         n_total = pb0.Phi_out.shape[0]
         n_prot_k0 = pb0.n_prot if pb_version == 2 else pb0.n_det
         if verbose:
             print(f"  Total bands per k: {n_prot_k0} prot + {pb0.n_pseudo} pseudo = {n_total}")
 
-        # Open WFN_pseudobands.h5 with the total band count
-        pb_writer = WFNWriter(pb_output, crystal, kpoints, weights, kgrid, n_total,
-                               gvecs_per_k, nosym=nosym)
-
-        # Write k=0 (already computed)
-        _write_pb_k(pb_writer, 0, pb0, H_k0, gvecs_per_k[0], nspinor, ngkmax)
+        # Open WFN_pseudobands.h5 on rank 0 only (H5 single-writer).
+        pb_rank = jax.process_index()
+        pb_writer = None
+        if pb_rank == 0:
+            pb_writer = WFNWriter(pb_output, crystal, kpoints, weights, kgrid, n_total,
+                                   gvecs_per_k, nosym=nosym)
+            # Write k=0 (already computed)
+            _write_pb_k(pb_writer, 0, pb0, H_k0, gvecs_per_k[0], nspinor, ngkmax)
 
         # Remaining k-points
         for ik in range(1, nk):
@@ -462,7 +465,7 @@ def run_nscf(
                     dos_result=pb0.dos,
                     n_prot_override=n_prot_k0,
                     boundaries_override=pb0.windows,
-                    verbose=False, seed=ik)
+                    verbose=False, seed=ik + pb_seed * 10000)
             else:
                 pb_ik = _pb_func(
                     apply_H_flat, dim=dim_flat,
@@ -471,14 +474,16 @@ def run_nscf(
                     n_windows_target=pb_n_windows,
                     dos_result=pb0.dos,
                     n_protected=n_prot_k0,
-                    verbose=False, seed=ik)
+                    verbose=False, seed=ik + pb_seed * 10000)
 
-            _write_pb_k(pb_writer, ik, pb_ik, H_k, gvecs_per_k[ik], nspinor, ngkmax)
+            if pb_rank == 0:
+                _write_pb_k(pb_writer, ik, pb_ik, H_k, gvecs_per_k[ik], nspinor, ngkmax)
 
             if verbose and (ik < 3 or ik == nk - 1 or (ik + 1) % 16 == 0):
                 print(f"  k={ik:3d}/{nk}: {time.perf_counter()-tk:.1f}s")
 
-        pb_writer.close()
+        if pb_writer is not None:
+            pb_writer.close()
         if verbose:
             print(f"  Pseudobands: {time.perf_counter()-t_pb:.1f}s → {pb_output}")
 
@@ -510,6 +515,8 @@ def main():
                         help="Enable pseudobands stage")
     parser.add_argument("--pb-wfn", default=None,
                         help="Existing WFN.h5 for pseudobands-only mode")
+    parser.add_argument("--pb-seed", type=int, default=0,
+                        help="Pseudobands RNG seed (for averaging stochastic noise)")
     args = parser.parse_args()
 
     # Defaults
@@ -568,6 +575,7 @@ def main():
              pb_version=pb_version, pb_k=pb_k, pb_M_max=pb_M_max, pb_F=pb_F,
              pb_n_windows=pb_n_windows, pb_n_prot=pb_n_prot,
              pb_wfn_input=pb_wfn_input,
+             pb_seed=args.pb_seed,
              kpoints_override=kpoints_override, weights_override=weights_override)
 
 

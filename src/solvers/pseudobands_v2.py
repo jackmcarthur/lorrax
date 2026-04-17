@@ -695,6 +695,17 @@ def ritz_pseudobands_v2(
         nodes_sorted = nodes[gauss_order]
         weights_sorted = np.sqrt(np.maximum(gauss_w[gauss_order], 0.0))
 
+        # Universal rule: drop windows carrying less than half a state.
+        # Zero coefficients + energies at window midpoint keeps downstream
+        # cmin/vmax computations well-behaved (no phantom eigenvalues).
+        n_eff_total = float(np.sum(gauss_w))
+        if n_eff_total < 0.5:
+            Xi_sorted = np.zeros_like(Xi_sorted)
+            nodes_sorted = np.full(k, 0.5 * (e_lo + e_hi), dtype=np.float64)
+            weights_sorted = np.zeros(k, dtype=np.float64)
+            if verbose and (j < 5 or j == N_S - 1 or (j + 1) % 10 == 0):
+                mode = "empty"
+
         # Absorb weight into wavefunction
         Xi_list.append(Xi_sorted * weights_sorted[:, None])
         E_list.append(nodes_sorted)

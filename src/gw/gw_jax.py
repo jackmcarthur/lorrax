@@ -233,6 +233,43 @@ def main(argv=None):
 
 	band_slices = BandSlices.from_band_edges(*meta.band_edges)
 
+	# Optional BGW vcoul override: use BGW's MC-averaged v(q+G) for all G
+	# (LORRAX's internal mc_average_vcoul_body only averages G=0).  This is
+	# purely diagnostic — enables bit-reproducible BGW comparisons.
+	bgw_v_grid_fn = None
+	if config.use_bgw_vcoul:
+		if config.bgw_vcoul_file is None:
+			raise ValueError("use_bgw_vcoul=true requires bgw_vcoul_file to be set")
+		from file_io import read_bgw_vcoul, fill_v_grid_for_q
+		bgw_path = config.bgw_vcoul_file
+		if not os.path.isabs(bgw_path):
+			bgw_path = os.path.join(input_dir, bgw_path)
+		print0(f"  BGW vcoul override: loading {bgw_path}")
+		_bgw_table = read_bgw_vcoul(bgw_path)
+		print0(f"    {_bgw_table.q_fracs.shape[0]} unique q-points, "
+		       f"G counts per q: {[len(g) for g in _bgw_table.G_miller_per_q]}")
+		_cell_vol = float(wfn.cell_volume)
+		_fft_grid = tuple(int(x) for x in wfn.fft_grid)
+		# Reciprocal-space symmetry operators.  BGW's vcoul file only stores
+		# unique IBZ q's; mapping LORRAX's full-BZ q to those requires the
+		# full crystal sym group.  A nosym WFN stores only identity in
+		# mf_header/symmetry/mtrx, so allow pulling the 48 ops from an aux
+		# sym-reduced WFN when provided (bgw_vcoul_sym_wfn).
+		if config.bgw_vcoul_sym_wfn:
+			aux_path = config.bgw_vcoul_sym_wfn
+			if not os.path.isabs(aux_path):
+				aux_path = os.path.join(input_dir, aux_path)
+			with h5py.File(aux_path, "r") as _fsym:
+				_sym_real = np.asarray(_fsym["mf_header/symmetry/mtrx"][:], dtype=np.int32)
+			print0(f"    crystal sym ops loaded from {aux_path}: {_sym_real.shape[0]}")
+			_sym_mats_k = _sym_real.transpose(0, 2, 1).copy()
+		else:
+			_sym_mats_k = np.asarray(sym.sym_mats_k, dtype=np.int32)
+		def bgw_v_grid_fn(q_frac_tuple):
+			return fill_v_grid_for_q(
+				_bgw_table, q_frac_tuple, _fft_grid, _cell_vol,
+				sym_mats_k=_sym_mats_k)
+
 	# ISDF fitting or restart loading
 	timing.reset()
 	isdf = prepare_isdf_and_wavefunctions(
@@ -246,6 +283,7 @@ def main(argv=None):
 		tmp_dir=tmp_dir,
 		tensors_filename=tensors_filename,
 		print0=print0,
+		bgw_v_grid_fn=bgw_v_grid_fn,
 	)
 	V_qmunu = isdf.V_qmunu
 	wfns = isdf.wf_bundle

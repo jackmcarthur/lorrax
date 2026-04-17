@@ -1,3 +1,13 @@
+# TODO(fractional translations): the per-k readers here (``get_cnk``,
+# ``get_cnk_batch``, ``get_gvec_nk``) return raw irreducible-zone data
+# with no unfolding, rotation, or τ phase applied.  All symmetry unfolding
+# (including the non-symmorphic fractional-translation phase and spinor
+# rotation) lives in ``common.symmetry_maps.SymMaps.get_cnk_fullzone``;
+# G-vectors are unfolded by ``SymMaps.get_gvecs_kfull`` which intentionally
+# omits τ because scalar functions of |q+G| don't need it.  If future
+# callers combine raw coefficients with unfolded G-indices directly (i.e.
+# not via ``get_cnk_fullzone``), the fractional-translation phase must be
+# threaded in explicitly to stay consistent with BGW/gmap.f90.
 import h5py as h5
 import numpy as np
 

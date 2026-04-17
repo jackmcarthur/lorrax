@@ -143,8 +143,94 @@ to `/lorrax_nvhpc` inside the container.
   or `NCCL_NET_PLUGIN=ofi` on Perlmutter).  Not validated in this
   iteration.
 
+## phdf5 — choose your MPI stack
+
+The `ffi.phdf5` handler writes sharded JAX arrays through parallel
+HDF5 / MPI-IO.  Two stacks are supported, selected via
+`LORRAX_PHDF5_MPI_STACK={openmpi,mpich}` (see
+[run_shifter.sh](common/cpp/run_shifter.sh)).
+
+### Option A — OpenMPI (default, verified)
+
+- **HDF5**: conda-forge `hdf5-1.14.6-mpi_openmpi_*.conda`,
+  staged at `/pscratch/sd/$USER/lorrax_phdf5_openmpi/stage/`.
+  Regenerate with `~/software/lorrax_phdf5_openmpi/rebuild_stage.sh`.
+- **MPI**: the JAX container's bundled HPC-X OpenMPI at
+  `/opt/hpcx/ompi`, satisfying `libmpi.so.40`.
+- **Shifter modules**: `--module=gpu` only.
+- **Slurm PMI**: `--mpi=pmix`.
+- **Performance** (4 nodes / 16 GPUs, 4.29 GB C128):
+  `4.08 GB/s` — `8.02×` over `multihost_utils.process_allgather + rank-0 h5py`.
+
+### Option B — Cray MPICH / cray-hdf5-parallel (opt-in, unstable)
+
+- **HDF5**: a copy of the host's `cray-hdf5-parallel` module, staged
+  at `/pscratch/sd/$USER/lorrax_phdf5_cray/stage/`.  Regenerate with
+  `~/software/lorrax_phdf5_cray/rebuild_stage.sh`.
+- **MPI**: Cray MPICH via `shifter --module=mpich`, which bind-mounts
+  MPICH-ABI `libmpi.so.12` + PMI / libfabric at
+  `/opt/udiImage/modules/mpich/`.  A shim symlink in the stage
+  (`libmpi_gnu_123.so.12 → /opt/udiImage/modules/mpich/libmpi.so.12`)
+  bridges Cray-PE's compiler-specific SONAME onto the generic MPICH-ABI
+  runtime that shifter provides.
+- **Shifter modules**: `--module=gpu,mpich`.
+- **Slurm PMI**: `--mpi=pmi2` (Cray MPICH native).
+- **Performance**: _unstable_.  Best observed was `~3.2 GB/s` at one
+  point but we have been unable to reproduce it on different
+  allocations.  Large collective writes crash with `Out of memory in
+  ad_cray_write_coll.c:669` regardless of `cb_buffer_size`,
+  `cb_nodes`, or stripe settings, and `cray_cb_write_lock_mode=2`
+  (Lustre Lock-Ahead) triggers a different internal assertion failure
+  in `ADIOI_CRAY_Calc_aggregator_pfl`.  The 4-GPU single-node
+  round-trip test does pass.
+- **Why keep it**: the stack itself is portable across DOE Cray
+  systems, and the instability may be resolvable by a NERSC support
+  ticket (opening one is advised before relying on this path).
+  Useful as a reference implementation + A/B comparison.
+
+### Porting to a non-Cray cluster
+
+1. Build or identify a parallel-HDF5 install.  If it's OpenMPI-linked,
+   follow Option A; if MPICH-ABI-linked, Option B.
+2. Stage it into the cluster's equivalent of `/pscratch` (any path
+   your container runtime will bind-mount).
+3. Set `LORRAX_FFI_PHDF5_DIR` to the stage.  Set
+   `LORRAX_PHDF5_MPI_STACK` to match.
+4. If the HDF5 `libhdf5.so` NEEDs a compiler-specific libmpi SONAME,
+   add a shim symlink in the stage `lib/` → the runtime `libmpi`
+   available inside the container.
+
+### Tunable env vars at `open_file` time
+
+| env var                         | default      | effect                          |
+|---------------------------------|--------------|---------------------------------|
+| `LORRAX_PHDF5_CB_WRITE`         | `enable`     | ROMIO collective buffering.     |
+| `LORRAX_PHDF5_CB_BUFFER_SIZE`   | `67108864`   | per-aggregator cb buffer (bytes). |
+| `LORRAX_PHDF5_CB_NODES`         | _unset_      | ROMIO aggregator count hint.    |
+| `LORRAX_PHDF5_CB_PER_NODE`      | _unset_      | Cray MPICH: aggregators/node (→ `cb_config_list=*:N`). |
+| `LORRAX_PHDF5_STRIPE_COUNT`     | `16`         | Lustre striping_factor.         |
+| `LORRAX_PHDF5_STRIPE_SIZE`      | `4194304`    | Lustre striping_unit (bytes).   |
+| `LORRAX_PHDF5_ALIGN_MB`         | `4`          | `H5Pset_alignment` threshold.   |
+| `LORRAX_PHDF5_INDEPENDENT`      | `0`          | 1 → H5FD_MPIO_INDEPENDENT.      |
+| `LORRAX_PHDF5_NO_COLL_META`     | `0`          | 1 → disable collective metadata. |
+
+Baked-in DCPL: `H5D_FILL_TIME_NEVER` + `H5D_ALLOC_TIME_EARLY`
+(avoids the default zero-fill that would double the IO), plus
+`H5F_LIBVER_LATEST` for modern file format.
+
+For much larger writes (> 10 GB) bump `STRIPE_COUNT` to 32–64; for
+small writes (< 100 MB), drop `CB_BUFFER_SIZE` to ~8 MiB.
+
+If the enclosing directory was created with `lfs setstripe`, the
+`striping_factor`/`striping_unit` hints are no-ops (the directory's
+layout wins).  The MPI-Info hints set the layout at file-creation
+time when the directory has no explicit stripe policy.
+
 ## Reference
 
 - NVIDIA cuSOLVERMp install: https://docs.nvidia.com/cuda/cusolvermp/
 - NVIDIA HPC SDK download: https://developer.nvidia.com/hpc-sdk
 - JAX FFI: https://jax.readthedocs.io/en/latest/ffi.html
+- NERSC parallel HDF5 tuning: https://docs.nersc.gov/performance/io/library/
+- ROMIO hints: https://wordpress.cels.anl.gov/romio/2008/09/26/system-hints/
+- NERSC Shifter mpich module: https://docs.nersc.gov/development/shifter/how-to-use/

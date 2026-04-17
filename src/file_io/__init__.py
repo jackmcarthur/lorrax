@@ -35,3 +35,4 @@ from .qp_wfn import write_qp_rotations_h5
 from .kin_ion import load_kin_ion_submatrix
 from .centroids import load_centroids
 from .paths import resolve_input_paths
+from .read_bgw_vcoul import read_bgw_vcoul, fill_v_grid_for_q, BGWVcoulTable
