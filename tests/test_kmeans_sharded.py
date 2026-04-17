@@ -295,3 +295,109 @@ def test_kmeans_pp_init_respects_pbc():
         f"PBC broken: near-c1={near_c1}, near-c2={near_c2} "
         f"(centroids should cover both near-boundary bumps)"
     )
+
+
+def test_assign_labels_chunked_padding_for_nondivisible_n_c():
+    """c_block no longer has to divide n_c; NaN-padded scan body handles it.
+
+    Verifies that ``assign_labels_chunked`` with c_block=32, n_c=50 (which
+    does not divide c_block) produces the same labels as c_block=50 (a
+    divisor). Also confirms labels stay in [0, n_c) — the NaN-padded
+    sentinel rows never win argmin.
+    """
+    avec = np.eye(3, dtype=np.float32) * 3.8
+    G = jnp.asarray((avec.T @ avec).astype(np.float32))
+    rng = np.random.default_rng(42)
+    pos = jnp.asarray(rng.random((1024, 3), dtype=np.float32))
+    cent = jnp.asarray(rng.random((50, 3), dtype=np.float32))
+
+    labels_pad = assign_labels_chunked(pos, cent, G, n_c=50, c_block=32)
+    labels_div = assign_labels_chunked(pos, cent, G, n_c=50, c_block=50)
+
+    np.testing.assert_array_equal(
+        np.asarray(labels_pad), np.asarray(labels_div),
+        err_msg="c_block-padded scan should match divisor-aligned scan",
+    )
+    assert int(np.asarray(labels_pad).max()) < 50, (
+        "labels escaped into padded-centroid range"
+    )
+
+
+def test_pbc_distance_scan_matches_naive_fcc():
+    """Fused quadratic form in ``assign_labels_chunked`` == full (P,C,3) naive.
+
+    Regression for the explicit-quadratic-form rewrite of the distance
+    computation in the scan body (no einsum/GEMM). A PBC-respecting naive
+    reference that materializes the full (P, C, 3) delta tensor should
+    agree with the scan on both labels and their distances, including on
+    a non-diagonal metric tensor (FCC, where cross terms G_ij ≠ 0 matter).
+    """
+    avec = np.array([[2.715, 2.715, 0.0],
+                     [0.0, 2.715, 2.715],
+                     [2.715, 0.0, 2.715]], dtype=np.float32)
+    G = jnp.asarray((avec.T @ avec).astype(np.float32))
+    rng = np.random.default_rng(1)
+    pos = jnp.asarray(rng.random((2048, 3), dtype=np.float32))
+    cent = jnp.asarray(rng.random((100, 3), dtype=np.float32))
+
+    # Naive reference: full (P, C, 3) delta + einsum. Same PBC, same metric.
+    delta = pos[:, None, :] - cent[None, :, :]
+    delta = delta - jnp.round(delta)
+    d_ref = jnp.einsum('pci,ij,pcj->pc', delta, G, delta)
+    labels_ref = jnp.argmin(d_ref, axis=1).astype(jnp.int32)
+
+    labels_scan = assign_labels_chunked(pos, cent, G, n_c=100, c_block=32)
+
+    np.testing.assert_array_equal(
+        np.asarray(labels_scan), np.asarray(labels_ref),
+        err_msg="fused-quadratic-form scan labels differ from naive einsum",
+    )
+
+
+@pytest.mark.skipif(len(jax.devices()) < 2,
+                    reason="Sharded path requires ≥2 JAX devices.")
+def test_sharded_trajectory_matches_single_device():
+    """Sharded Lloyd step, iterated, tracks the single-device trajectory.
+
+    The earlier single-step equivalence test (``test_sharded_matches_single_device``)
+    only checks one iteration. Floating-point reduction order differs
+    between ``segment_sum`` on one device vs ``segment_sum + psum`` across
+    shards, so over many iterations the trajectories can drift apart. This
+    test runs 10 Lloyd iterations both ways and asserts centroids stay
+    within a tight tolerance — enough to catch a real divergence (e.g. a
+    reduction sign error) but loose enough to tolerate fp32 reordering.
+    """
+    devices = jax.devices()
+    n_dev = len(devices)
+    p, n_c = 4 * 1024, 32
+    assert p % n_dev == 0
+    avec = np.array([[2.715, 2.715, 0.0],
+                     [0.0, 2.715, 2.715],
+                     [2.715, 0.0, 2.715]], dtype=np.float32)
+    positions, centroids, rho, G = _random_inputs(seed=11, p=p, n_c=n_c, avec=avec)
+    c_block = _pick_c_block(n_c)
+
+    # Single-device reference: 10 Lloyd iterations.
+    cent_ref = centroids
+    for _ in range(10):
+        cent_ref, _, _ = kmeans_update_step(positions, cent_ref, rho, G, n_c, c_block)
+
+    # Sharded path, same 10 iterations.
+    mesh = Mesh(np.asarray(devices), ('x',))
+    pos_s = jax.device_put(positions, NamedSharding(mesh, PartitionSpec('x', None)))
+    rho_s = jax.device_put(rho, NamedSharding(mesh, PartitionSpec('x')))
+    rep = NamedSharding(mesh, PartitionSpec())
+    cent_s = jax.device_put(centroids, rep)
+    G_s = jax.device_put(G, rep)
+    sharded_step = make_sharded_kmeans_update(mesh, n_c, c_block=c_block)
+    for _ in range(10):
+        cent_s, _, _ = sharded_step(pos_s, cent_s, rho_s, G_s)
+
+    # fp32 reduction-order drift over 10 iters on 4k points ≲ 1e-4 in frac
+    # coords — looser than the 1e-5 single-step tolerance but still tight
+    # enough to fail on any algorithmic divergence.
+    np.testing.assert_allclose(
+        np.asarray(cent_s), np.asarray(cent_ref),
+        rtol=1e-4, atol=1e-4,
+        err_msg="sharded trajectory diverged from single-device after 10 iters",
+    )

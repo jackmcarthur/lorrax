@@ -249,7 +249,16 @@ def assign_labels_chunked(
     Returns:
         labels: (P,) int32 cluster assignment.
     """
-    n_chunks = n_c // c_block
+    # Pad centroids to a multiple of c_block with NaN rows. NaN-in → NaN-out
+    # in the quadratic form below, sanitized to +inf before argmin so they
+    # never win. This lets c_block stay at the CUDA-friendly default (32)
+    # regardless of whether N_c is divisible — and avoids the old fallback
+    # to a tiny c_block (e.g. c_block=25 at N_c=2000 gave 50 % SM occupancy).
+    n_chunks = (n_c + c_block - 1) // c_block
+    n_c_padded = n_chunks * c_block
+    if n_c_padded != n_c:
+        pad = jnp.full((n_c_padded - n_c, 3), jnp.nan, dtype=centroids_frac.dtype)
+        centroids_frac = jnp.concatenate([centroids_frac, pad], axis=0)
     centroids_blocked = centroids_frac.reshape(n_chunks, c_block, 3)
 
     # scan carry dtypes must be invariant across iterations; argmin's output
@@ -257,14 +266,34 @@ def assign_labels_chunked(
     idx_dtype = jnp.int32
     dist_dtype = metric_tensor.dtype
 
+    # Pre-extract metric-tensor scalar entries so the scan body becomes a pure
+    # pipeline of element-wise ops (no einsum → no (P·c_block)×3 GEMM). On Si
+    # at N_c=2000 the einsum path compiled to `ampere_sgemm_32x128_nn` at 50 %
+    # SM occupancy (K=3 is a terrible GEMM inner dim); this form fuses the
+    # subtract → round → quadratic-form → reduce into a single elementwise
+    # kernel with ~3× better occupancy and no (P, c_block, 3) remat.
+    G = metric_tensor
+    g00, g01, g02 = G[0, 0], G[0, 1], G[0, 2]
+    g11, g12, g22 = G[1, 1], G[1, 2], G[2, 2]
+
     def body(carry, cent_chunk):
         best_d, best_c, chunk_idx = carry
-        # (P, c_block, 3) — the only large intermediate.
-        delta = positions_frac[:, None, :] - cent_chunk[None, :, :]
-        delta = delta - jnp.round(delta)
-        d_chunk = jnp.einsum('pci,ij,pcj->pc', delta, metric_tensor, delta)  # (P, c_block)
-        # Sentinel for padded centroids: caller may pad with NaN positions to
-        # make C divisible by c_block. NaN distances must never win argmin.
+        # Per-axis PBC-wrapped displacement — 3 separate (P, c_block) tensors,
+        # never a (P, c_block, 3) buffer. XLA fuses subtract + round + the
+        # quadratic form below into one elementwise kernel.
+        dx = positions_frac[:, None, 0] - cent_chunk[None, :, 0]
+        dx = dx - jnp.round(dx)
+        dy = positions_frac[:, None, 1] - cent_chunk[None, :, 1]
+        dy = dy - jnp.round(dy)
+        dz = positions_frac[:, None, 2] - cent_chunk[None, :, 2]
+        dz = dz - jnp.round(dz)
+        # d² = δᵀ G δ for symmetric G:
+        #    = G₀₀ dx² + G₁₁ dy² + G₂₂ dz²
+        #      + 2 (G₀₁ dx·dy + G₀₂ dx·dz + G₁₂ dy·dz)
+        d_chunk = (g00 * dx + g01 * dy + g02 * dz) * dx \
+                + (g01 * dx + g11 * dy + g12 * dz) * dy \
+                + (g02 * dx + g12 * dy + g22 * dz) * dz
+        # NaN sentinel for padded centroids: NaN-in produces NaN-out here.
         d_chunk = jnp.where(jnp.isnan(d_chunk), jnp.inf, d_chunk)
         local_c = jnp.argmin(d_chunk, axis=1).astype(idx_dtype)                # (P,)
         local_d = jnp.take_along_axis(d_chunk, local_c[:, None], axis=1)[:, 0] # (P,)
@@ -703,17 +732,16 @@ def plot_density_and_centroids(wfn, rho_np, centroids, labels=None):
 # =============================================================================
 
 def _pick_c_block(n_c: int, preferred: int = _DEFAULT_C_BLOCK) -> int:
-    """Pick the largest divisor of ``n_c`` that is ≤ ``preferred``.
+    """Pick the C-chunk size for ``assign_labels_chunked``.
 
-    The chunked distance scan requires ``n_c % c_block == 0``. Rather than
-    padding with sentinels (which works but costs a little memory), we prefer
-    to pick the biggest divisor that fits under the preferred bound. Falls
-    back to 1 for unfriendly values of ``n_c`` (e.g. primes).
+    Returns ``min(preferred, n_c)``. The scan pads centroids to the next
+    multiple of ``c_block`` with NaN rows (handled inside the scan body), so
+    we no longer need ``c_block`` to divide ``n_c``. Keeping ``c_block`` at
+    the default (32) regardless of N_c keeps GEMM tiles a reasonable size
+    on the GPU — the previous divisor-based pick dropped to c_block=25 at
+    N_c=2000 (80 chunks, 50 % SM occupancy) which was unnecessarily small.
     """
-    for b in range(min(preferred, n_c), 0, -1):
-        if n_c % b == 0:
-            return b
-    return 1
+    return min(preferred, n_c)
 
 
 def _pad_centroids(centroids: jnp.ndarray, n_padded: int) -> jnp.ndarray:
@@ -806,7 +834,10 @@ def weighted_kmeans_jax(
     # so the chunked scan needs no padding. (Padding path works, but divisors
     # are cleaner and equally fast.)
     c_block = _pick_c_block(N_c)
-    print(f"C-chunk size for distance scan: {c_block} ({N_c // c_block} chunks)")
+    _n_chunks_scan = (N_c + c_block - 1) // c_block
+    _pad = _n_chunks_scan * c_block - N_c
+    print(f"C-chunk size for distance scan: {c_block} ({_n_chunks_scan} chunks"
+          f"{f', padded with {_pad} NaN sentinels' if _pad else ''})")
 
     # Auto-gate: for small per-shard P the NCCL launch latency dominates the
     # actual shard compute, so sharding makes things slower. Profile data on
@@ -859,9 +890,16 @@ def weighted_kmeans_jax(
     # =========================================================================
     print("Starting k-means iterations...")
 
-    # Per-step z-coord history. Use a host-side numpy array so we don't
-    # incur one JAX .at[].set() per iteration inside the Python loop.
-    history = np.zeros((N_c, max_steps), dtype=np.float32)
+    # ``history`` is a debug aid — an (N_c, max_steps) record of each
+    # centroid's z-coordinate trajectory. The previous implementation updated
+    # it every step via ``history[:, step] = np.asarray(new_centroids[:, 2])``,
+    # which forced a device→host copy per Lloyd iteration. No caller uses the
+    # return value (main() destructures as ``_, centroids, _, _``), so we've
+    # returned an empty placeholder here; flip ``_TRACK_HISTORY = True`` to
+    # turn it back on when debugging.
+    _TRACK_HISTORY = False
+    history = (np.zeros((N_c, max_steps), dtype=np.float32)
+               if _TRACK_HISTORY else np.zeros((N_c, 0), dtype=np.float32))
     steps_taken = max_steps
 
     if mesh is not None:
@@ -884,7 +922,8 @@ def weighted_kmeans_jax(
                 positions, centroids, rho_flat, metric_tensor, N_c, c_block
             )
 
-        history[:, step] = np.asarray(new_centroids[:, 2])
+        if _TRACK_HISTORY:
+            history[:, step] = np.asarray(new_centroids[:, 2])
         max_movement_sq = float(jnp.max(movement_sq))
 
         if step % 20 == 0:
