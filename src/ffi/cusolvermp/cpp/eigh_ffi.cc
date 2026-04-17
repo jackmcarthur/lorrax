@@ -1,46 +1,47 @@
-// eigh_ffi.cc — XLA FFI handlers for cusolverMpSyevd (real F64 + complex C128).
+// eigh_ffi.cc — XLA FFI handler for cusolverMpSyevd (Hermitian / real-symm
+//                eigensolver across a 2-D process grid).
 //
-// The handler assumes the input buffer is already the local shard of a
-// 2-D block-cyclic distribution with mbA=nbA and a single tile per process
-// (so that JAX's NamedSharding(P('x','y')) block layout coincides with
-// block-cyclic).  The Python wrapper enforces `mb = n/p`, `nb = n/q`.
+// Structure (mirrors jaxlib/gpu/solver_kernels_ffi.cc):
+//
+//   EighImpl<T>       — does the actual cuSOLVERMp dance for one scalar type
+//   EighDispatch      — shape/dtype validation + dtype switch
+//   XLA_FFI_DEFINE_HANDLER_SYMBOL(EighMpFfi, EighDispatch, Bind()...)
+//
+// Patterns adopted from jaxlib:
+//   - ffi::ScratchAllocator for per-call device workspace (so we don't
+//     fight XLA's MEM_FRACTION preallocation)
+//   - FFI_RETURN_IF_ERROR / LORRAX_*_CHECK_FFI for one-line error paths
+//   - per-dtype cusolvermp::mp::{SyevdBufferSize,Syevd}<T> shims
+//
+// LORRAX-specific pieces that stay on the Ctx (not scratch):
+//   - cusolverMpHandle_t / cal_comm_t / cusolverMpGrid_t  (one-time setup)
+//   - host-side workspace buffer (cuSOLVERMp needs a host malloc; XLA's
+//     scratch allocator is device-only)
+//   - d_info (tiny; allocated once on ctx)
+//   - NCCL scratch in the CAL→NCCL shim (lives outside any FFI call)
 
+#include <complex>
 #include <cstdint>
-#include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <sstream>
 
 #include <cuda_runtime.h>
-#include <nccl.h>
 #include <cusolverMp.h>
 
 #include "xla/ffi/api/ffi.h"
 
-#include "../../common/cpp/xla_ffi_glue.h"
+#include "../../common/cpp/ffi_helpers.h"
+#include "cusolvermp_interface.h"
 #include "ctx.h"
 
 namespace lorrax_ffi::cusolvermp {
 
-namespace ffi = xla::ffi;
+namespace ffi = ::xla::ffi;
 
-// Cross-stream synchronisation: the XLA-provided stream produced the
-// input buffer; the ctx stream is what cusolverMp uses.  We need
-// (a) ctx stream to wait on XLA's work before Syevd, and
-// (b) XLA's stream to wait on ctx's work before reading the outputs.
-// We use CUDA events for a low-overhead one-way sync.
-static ffi::Error cross_stream_wait(cudaStream_t waiter, cudaStream_t signaller) {
-    cudaEvent_t ev;
-    LORRAX_CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
-    LORRAX_CUDA_CHECK(cudaEventRecord(ev, signaller));
-    LORRAX_CUDA_CHECK(cudaStreamWaitEvent(waiter, ev, 0));
-    LORRAX_CUDA_CHECK(cudaEventDestroy(ev));
-    return ffi::Error::Success();
-}
-
-// Core solve, templated on dtype.  T_A is the matrix element type (F64 or C128),
-// T_D is the eigenvalue type (F64 for both — cusolverMp returns real evs even
-// for complex Hermitian input).
-// LORRAX_FFI_PROFILE=1 turns on per-phase CUDA-event timing in the FFI
-// handler.  Writes one line per solve to stderr from rank 0.
+// ---------------------------------------------------------------------------
+//  Profile switch
+// ---------------------------------------------------------------------------
 static inline bool profile_enabled() {
     static const bool v = [] {
         const char* e = std::getenv("LORRAX_FFI_PROFILE");
@@ -49,72 +50,69 @@ static inline bool profile_enabled() {
     return v;
 }
 
-template <cudaDataType_t CudaType, typename T_A>
-static ffi::Error syevd_impl(
-    cudaStream_t xla_stream,
-    const T_A* d_A_in, T_A* d_Q_out, double* d_D_out,
+// ---------------------------------------------------------------------------
+//  Cross-stream join.  XLA's stream produced the input; our ctx stream is
+//  what cusolverMp uses.  Record an event on one side, wait on the other
+//  — no host-level cudaStreamSynchronize needed in the hot path.
+// ---------------------------------------------------------------------------
+static ffi::Error cross_stream_wait(cudaStream_t waiter,
+                                    cudaStream_t signaller) {
+    cudaEvent_t ev;
+    LORRAX_CUDA_CHECK_FFI(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+    LORRAX_CUDA_CHECK_FFI(cudaEventRecord(ev, signaller));
+    LORRAX_CUDA_CHECK_FFI(cudaStreamWaitEvent(waiter, ev, 0));
+    LORRAX_CUDA_CHECK_FFI(cudaEventDestroy(ev));
+    return ffi::Error::Success();
+}
+
+// ---------------------------------------------------------------------------
+//  Impl — the actual cuSOLVERMp solve for one scalar type.
+// ---------------------------------------------------------------------------
+template <typename T>
+static ffi::Error EighImpl(
     int64_t n, int64_t mb, int64_t nb,
+    bool compute_evecs,
+    cudaStream_t xla_stream,
+    ffi::ScratchAllocator& scratch,
     LorraxCusolverMpCtx* ctx,
-    bool compute_evecs)
+    const T* d_A,
+    mp::RealOf_t<T>* d_W,
+    T* d_Q)
 {
     const bool prof = profile_enabled();
-    // 6 events: start, after-cross-wait, after-desc, after-bufferSize,
-    // after-solve, after-final-sync.  Record on ctx->stream so they
-    // serialise with cuSOLVERMp work.
     cudaEvent_t ev[6];
     if (prof) {
-        for (int i = 0; i < 6; ++i) {
-            LORRAX_CUDA_CHECK(cudaEventCreate(&ev[i]));
-        }
-        LORRAX_CUDA_CHECK(cudaEventRecord(ev[0], ctx->stream));
+        for (int i = 0; i < 6; ++i)
+            LORRAX_CUDA_CHECK_FFI(cudaEventCreate(&ev[i]));
+        LORRAX_CUDA_CHECK_FFI(cudaEventRecord(ev[0], ctx->stream));
     }
 
-    // --- make ctx's stream wait for XLA's producers ------------------------
-    auto e1 = cross_stream_wait(ctx->stream, xla_stream);
-    if (!e1.success()) return e1;
-    if (prof) LORRAX_CUDA_CHECK(cudaEventRecord(ev[1], ctx->stream));
+    FFI_RETURN_IF_ERROR(cross_stream_wait(ctx->stream, xla_stream));
+    if (prof) LORRAX_CUDA_CHECK_FFI(cudaEventRecord(ev[1], ctx->stream));
 
-    // --- per-call matrix descriptors --------------------------------------
-    // ia = ja = iq = jq = 1 (offsets, base-1 per ScaLAPACK convention).
-    // Global rows/cols = n.  Local leading dim = n / p (block case).
-    int64_t llda = (n + ctx->p - 1) / ctx->p;   // ceil; exact for n % p == 0
-
+    const int64_t llda = (n + ctx->p - 1) / ctx->p;   // = n/p when exact
     cusolverMpMatrixDescriptor_t descA = nullptr, descQ = nullptr;
-    LORRAX_LIB_CHECK(
-        cusolverMpCreateMatrixDesc(&descA, ctx->grid, CudaType,
-                                   /*M=*/n, /*N=*/n,
-                                   /*MB=*/mb, /*NB=*/nb,
-                                   /*RSRC=*/0, /*CSRC=*/0,
-                                   /*LLDA=*/llda),
+    LORRAX_LIB_CHECK_FFI(
+        cusolverMpCreateMatrixDesc(&descA, ctx->grid,
+                                   mp::CudaDataTypeOf<T>::value,
+                                   n, n, mb, nb, 0, 0, llda),
         CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(A)");
-    LORRAX_LIB_CHECK(
-        cusolverMpCreateMatrixDesc(&descQ, ctx->grid, CudaType,
+    LORRAX_LIB_CHECK_FFI(
+        cusolverMpCreateMatrixDesc(&descQ, ctx->grid,
+                                   mp::CudaDataTypeOf<T>::value,
                                    n, n, mb, nb, 0, 0, llda),
         CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(Q)");
-    if (prof) LORRAX_CUDA_CHECK(cudaEventRecord(ev[2], ctx->stream));
+    if (prof) LORRAX_CUDA_CHECK_FFI(cudaEventRecord(ev[2], ctx->stream));
 
-    // compz is declared as char* in cusolverMp.h (not const); its log path
-    // prints with %s and reads past a single-byte stack variable.  Give it
-    // a proper 2-byte null-terminated buffer to avoid the log UB and any
-    // internal string dispatch.
-    char compz_buf[2];
-    compz_buf[0] = compute_evecs ? 'V' : 'N';
-    compz_buf[1] = '\0';
-    char* compz = compz_buf;
-    size_t d_ws = 0, h_ws = 0;
+    const char jobz = compute_evecs ? 'V' : 'N';
+    size_t d_ws_bytes = 0, h_ws_bytes = 0;
 
-    // Cast to void* for cusolverMp API (it takes untyped pointers).
-    void* A_ptr = const_cast<void*>(static_cast<const void*>(d_A_in));
-    void* Q_ptr = static_cast<void*>(d_Q_out);
-    void* D_ptr = static_cast<void*>(d_D_out);
-
-    // --- workspace query --------------------------------------------------
-    auto mp_st = cusolverMpSyevd_bufferSize(
-        ctx->handle, compz, CUBLAS_FILL_MODE_LOWER, n,
-        A_ptr, /*ia=*/1, /*ja=*/1, descA,
-        D_ptr,
-        Q_ptr, /*iq=*/1, /*jq=*/1, descQ,
-        CudaType, &d_ws, &h_ws);
+    cusolverStatus_t mp_st = mp::SyevdBufferSize<T>(
+        ctx->handle, jobz, CUBLAS_FILL_MODE_LOWER, n,
+        d_A, 1, 1, descA,
+        d_W,
+        d_Q, 1, 1, descQ,
+        &d_ws_bytes, &h_ws_bytes);
     if (mp_st != CUSOLVER_STATUS_SUCCESS) {
         cusolverMpDestroyMatrixDesc(descA);
         cusolverMpDestroyMatrixDesc(descQ);
@@ -122,32 +120,51 @@ static ffi::Error syevd_impl(
         os << "cusolverMpSyevd_bufferSize failed: status=" << (int)mp_st;
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
+    if (prof) LORRAX_CUDA_CHECK_FFI(cudaEventRecord(ev[3], ctx->stream));
 
-    // --- (re-)allocate workspace on ctx ------------------------------------
-    try {
-        ensure_workspace(ctx, d_ws, h_ws);
-    } catch (const std::exception& e) {
+    // Device workspace from XLA's scratch pool — plays nice with
+    // MEM_FRACTION reservation (cusolverMp's own libcal/UCC internals
+    // still do their own cudaMalloc, so MEM_FRACTION=0.5 remains needed
+    // until/unless that's fixed upstream; this at least keeps OUR
+    // workspace from double-dipping).
+    auto ws_opt = scratch.Allocate(d_ws_bytes);
+    if (!ws_opt.has_value()) {
         cusolverMpDestroyMatrixDesc(descA);
         cusolverMpDestroyMatrixDesc(descQ);
-        return ffi::Error(ffi::ErrorCode::kInternal, e.what());
+        std::ostringstream os;
+        os << "eigh: XLA scratch allocator failed to provide "
+           << d_ws_bytes << " bytes";
+        return ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str());
+    }
+    void* d_workspace = *ws_opt;
+
+    // Host workspace stays on Ctx (scratch is device-only).
+    if (h_ws_bytes > ctx->h_workspace_bytes) {
+        if (ctx->h_workspace) std::free(ctx->h_workspace);
+        ctx->h_workspace = std::malloc(h_ws_bytes);
+        if (!ctx->h_workspace) {
+            cusolverMpDestroyMatrixDesc(descA);
+            cusolverMpDestroyMatrixDesc(descQ);
+            return ffi::Error(ffi::ErrorCode::kInternal,
+                              "malloc(host_workspace) failed");
+        }
+        ctx->h_workspace_bytes = h_ws_bytes;
     }
 
-    // --- reset d_info -----------------------------------------------------
-    LORRAX_CUDA_CHECK(cudaMemsetAsync(ctx->d_info, 0, sizeof(int), ctx->stream));
-    if (prof) LORRAX_CUDA_CHECK(cudaEventRecord(ev[3], ctx->stream));
+    LORRAX_CUDA_CHECK_FFI(
+        cudaMemsetAsync(ctx->d_info, 0, sizeof(int), ctx->stream));
 
-    // --- solve ------------------------------------------------------------
-    mp_st = cusolverMpSyevd(
-        ctx->handle, compz, CUBLAS_FILL_MODE_LOWER, n,
-        A_ptr, 1, 1, descA,
-        D_ptr,
-        Q_ptr, 1, 1, descQ,
-        CudaType,
-        ctx->d_workspace, ctx->d_workspace_bytes,
-        ctx->h_workspace, ctx->h_workspace_bytes,
+    // cuSOLVERMp overwrites A's tile (Householder tridiagonalisation);
+    // const-cast once at the call site.
+    mp_st = mp::Syevd<T>(
+        ctx->handle, jobz, CUBLAS_FILL_MODE_LOWER, n,
+        const_cast<T*>(d_A), 1, 1, descA,
+        d_W,
+        d_Q, 1, 1, descQ,
+        d_workspace, d_ws_bytes,
+        ctx->h_workspace, h_ws_bytes,
         ctx->d_info);
-
-    if (prof) LORRAX_CUDA_CHECK(cudaEventRecord(ev[4], ctx->stream));
+    if (prof) LORRAX_CUDA_CHECK_FFI(cudaEventRecord(ev[4], ctx->stream));
 
     cusolverMpDestroyMatrixDesc(descA);
     cusolverMpDestroyMatrixDesc(descQ);
@@ -158,36 +175,26 @@ static ffi::Error syevd_impl(
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
 
-    // Copy d_info to host async to log any positive return.  We allow
-    // execution to continue; only hard cusolverStatus_t failures above
-    // raise to the Python side.  (Matches the sample: info != 0 would
-    // indicate convergence issues, not a fatal API error.)
-    // Skipped — cusolverStat != SUCCESS already covers API failures.
-
-    // --- XLA's stream must wait on ctx work before downstream ops ---------
-    auto e2 = cross_stream_wait(xla_stream, ctx->stream);
-    if (!e2.success()) return e2;
-    if (prof) LORRAX_CUDA_CHECK(cudaEventRecord(ev[5], ctx->stream));
+    FFI_RETURN_IF_ERROR(cross_stream_wait(xla_stream, ctx->stream));
+    if (prof) LORRAX_CUDA_CHECK_FFI(cudaEventRecord(ev[5], ctx->stream));
 
     if (prof) {
-        // Synchronize once at the end to get valid timings, then emit the
-        // breakdown.  Rank != 0 is suppressed to keep stderr readable.
-        LORRAX_CUDA_CHECK(cudaEventSynchronize(ev[5]));
-        float t_cross_wait = 0, t_desc = 0, t_bufsz = 0, t_solve = 0, t_tail = 0;
-        cudaEventElapsedTime(&t_cross_wait, ev[0], ev[1]);
-        cudaEventElapsedTime(&t_desc,       ev[1], ev[2]);
-        cudaEventElapsedTime(&t_bufsz,      ev[2], ev[3]);
-        cudaEventElapsedTime(&t_solve,      ev[3], ev[4]);
-        cudaEventElapsedTime(&t_tail,       ev[4], ev[5]);
+        LORRAX_CUDA_CHECK_FFI(cudaEventSynchronize(ev[5]));
+        float ts[5];
+        cudaEventElapsedTime(&ts[0], ev[0], ev[1]);
+        cudaEventElapsedTime(&ts[1], ev[1], ev[2]);
+        cudaEventElapsedTime(&ts[2], ev[2], ev[3]);
+        cudaEventElapsedTime(&ts[3], ev[3], ev[4]);
+        cudaEventElapsedTime(&ts[4], ev[4], ev[5]);
         if (ctx->rank == 0) {
             std::fprintf(stderr,
-                "[lorrax.ffi.prof] n=%ld mb=%ld nb=%ld  "
+                "[lorrax.ffi.prof] eigh n=%ld mb=%ld nb=%ld  "
                 "cross-wait=%.2f ms  desc=%.2f ms  "
                 "bufferSize=%.2f ms  syevd=%.2f ms  tail=%.2f ms  "
                 "TOTAL(events)=%.2f ms\n",
                 (long)n, (long)mb, (long)nb,
-                t_cross_wait, t_desc, t_bufsz, t_solve, t_tail,
-                t_cross_wait + t_desc + t_bufsz + t_solve + t_tail);
+                ts[0], ts[1], ts[2], ts[3], ts[4],
+                ts[0] + ts[1] + ts[2] + ts[3] + ts[4]);
         }
         for (int i = 0; i < 6; ++i) cudaEventDestroy(ev[i]);
     }
@@ -195,82 +202,80 @@ static ffi::Error syevd_impl(
     return ffi::Error::Success();
 }
 
-// ===========================================================================
-//  Handler definitions
-// ===========================================================================
-// ffi::BufferR2 = rank-2 buffer.  The XLA compiler may pass rank-0/1/2
-// buffers depending on how the Python wrapper was written — we use
-// `AnyBuffer` to stay flexible and pull shape + dtype at runtime.
-
-static ffi::Error EighF64Host(
+// ---------------------------------------------------------------------------
+//  Dispatch — validates shapes, looks up Ctx, switches on dtype.
+// ---------------------------------------------------------------------------
+static ffi::Error EighDispatch(
     cudaStream_t stream,
-    ffi::Buffer<ffi::DataType::F64> A,
-    ffi::Result<ffi::Buffer<ffi::DataType::F64>> evals,
-    ffi::Result<ffi::Buffer<ffi::DataType::F64>> Q,
+    ffi::ScratchAllocator scratch,
+    ffi::AnyBuffer A,
+    ffi::Result<ffi::AnyBuffer> W_out,
+    ffi::Result<ffi::AnyBuffer> Q_out,
     int64_t n, int64_t mb, int64_t nb,
     int64_t ctx_handle, bool compute_evecs)
 {
     auto* ctx = reinterpret_cast<LorraxCusolverMpCtx*>(ctx_handle);
     if (ctx == nullptr) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                          "EighF64: ctx_handle is null (did you init the "
-                          "cusolvermp context on this process?)");
+                          "eigh: ctx_handle is null (context not initialized "
+                          "on this process?)");
     }
-    return syevd_impl<CUDA_R_64F, double>(
-        stream,
-        A.typed_data(), Q->typed_data(), evals->typed_data(),
-        n, mb, nb, ctx, compute_evecs);
-}
 
-static ffi::Error EighC128Host(
-    cudaStream_t stream,
-    ffi::Buffer<ffi::DataType::C128> A,
-    ffi::Result<ffi::Buffer<ffi::DataType::F64>>  evals,
-    ffi::Result<ffi::Buffer<ffi::DataType::C128>> Q,
-    int64_t n, int64_t mb, int64_t nb,
-    int64_t ctx_handle, bool compute_evecs)
-{
-    auto* ctx = reinterpret_cast<LorraxCusolverMpCtx*>(ctx_handle);
-    if (ctx == nullptr) {
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                          "EighC128: ctx_handle is null.");
+    const auto dtype = A.element_type();
+    if (Q_out->element_type() != dtype) {
+        return ffi::Error(
+            ffi::ErrorCode::kInvalidArgument,
+            "eigh: output Q and input A must have matching element type");
     }
-    // The C128 element type in xla::ffi is std::complex<double>; cuSOLVERMp
-    // takes void* so the actual struct layout must match cuDoubleComplex
-    // (which it does: {double x,y}).
-    return syevd_impl<CUDA_C_64F, std::complex<double>>(
-        stream,
-        A.typed_data(), Q->typed_data(), evals->typed_data(),
-        n, mb, nb, ctx, compute_evecs);
+    if (W_out->element_type() != ffi::DataType::F64) {
+        return ffi::Error(
+            ffi::ErrorCode::kInvalidArgument,
+            "eigh: eigenvalue output W must be F64 (cuSOLVERMp convention)");
+    }
+
+    // Shape checks are light — Python side enforces the hard invariants
+    // (n % p == 0, square matrix, correct mesh axes).  If a caller ever
+    // violates this we'll get a cuSOLVERMp status error below, which is
+    // still actionable.
+
+    switch (dtype) {
+        case ffi::DataType::F64:
+            return EighImpl<double>(
+                n, mb, nb, compute_evecs, stream, scratch, ctx,
+                static_cast<const double*>(A.untyped_data()),
+                static_cast<double*>(W_out->untyped_data()),
+                static_cast<double*>(Q_out->untyped_data()));
+        case ffi::DataType::C128:
+            using C128 = std::complex<double>;
+            return EighImpl<C128>(
+                n, mb, nb, compute_evecs, stream, scratch, ctx,
+                static_cast<const C128*>(A.untyped_data()),
+                static_cast<double*>(W_out->untyped_data()),
+                static_cast<C128*>(Q_out->untyped_data()));
+        default: {
+            std::ostringstream os;
+            os << "eigh: unsupported dtype " << static_cast<int>(dtype)
+               << " (supported: F64, C128)";
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+        }
+    }
 }
-
-// ===========================================================================
-//  XLA_FFI_DEFINE_HANDLER_SYMBOL — exported C symbols
-// ===========================================================================
-XLA_FFI_DEFINE_HANDLER_SYMBOL(
-    EighF64, EighF64Host,
-    ffi::Ffi::Bind()
-        .Ctx<ffi::PlatformStream<cudaStream_t>>()
-        .Arg<ffi::Buffer<ffi::DataType::F64>>()                // A_local
-        .Ret<ffi::Buffer<ffi::DataType::F64>>()                // evals
-        .Ret<ffi::Buffer<ffi::DataType::F64>>()                // Q_local
-        .Attr<int64_t>("n")
-        .Attr<int64_t>("mb")
-        .Attr<int64_t>("nb")
-        .Attr<int64_t>("ctx_handle")
-        .Attr<bool>("compute_evecs"));
-
-XLA_FFI_DEFINE_HANDLER_SYMBOL(
-    EighC128, EighC128Host,
-    ffi::Ffi::Bind()
-        .Ctx<ffi::PlatformStream<cudaStream_t>>()
-        .Arg<ffi::Buffer<ffi::DataType::C128>>()
-        .Ret<ffi::Buffer<ffi::DataType::F64>>()                // evals (real)
-        .Ret<ffi::Buffer<ffi::DataType::C128>>()               // Q_local
-        .Attr<int64_t>("n")
-        .Attr<int64_t>("mb")
-        .Attr<int64_t>("nb")
-        .Attr<int64_t>("ctx_handle")
-        .Attr<bool>("compute_evecs"));
 
 }  // namespace lorrax_ffi::cusolvermp
+
+// ---------------------------------------------------------------------------
+//  FFI binding.
+// ---------------------------------------------------------------------------
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    EighMpFfi, lorrax_ffi::cusolvermp::EighDispatch,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<xla::ffi::ScratchAllocator>()
+        .Arg<xla::ffi::AnyBuffer>()              // A
+        .Ret<xla::ffi::AnyBuffer>()              // W (evals)
+        .Ret<xla::ffi::AnyBuffer>()              // Q (evecs)
+        .Attr<int64_t>("n")
+        .Attr<int64_t>("mb")
+        .Attr<int64_t>("nb")
+        .Attr<int64_t>("ctx_handle")
+        .Attr<bool>("compute_evecs"));

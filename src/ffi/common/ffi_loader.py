@@ -36,8 +36,9 @@ _LIB: Optional[ctypes.CDLL] = None
 
 # Symbols the XLA FFI side exports (plain C via XLA_FFI_DEFINE_HANDLER_SYMBOL).
 _FFI_TARGET_SYMBOLS = {
-    "lorrax_cusolvermp_eigh_f64":  "EighF64",
-    "lorrax_cusolvermp_eigh_c128": "EighC128",
+    # One handler per routine covers all supported dtypes — dispatch is
+    # done inside the .so based on the input buffer's element type.
+    "lorrax_cusolvermp_eigh":      "EighMpFfi",
     "lorrax_cusolvermg_eigh_f64":  "EighMgF64",
 }
 

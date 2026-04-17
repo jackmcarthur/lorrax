@@ -87,11 +87,13 @@ Output: `src/ffi/common/cpp/build/liblorrax_ffi.so`.
 
 ## Run the cuSOLVERMp test (multi-process)
 
+Recommended — uses CUDA's async mempool so JAX and libcal share VRAM
+and you can keep `MEM_FRACTION` at its default (0.95):
+
 ```bash
 LORRAX_NGPU=4 src/ffi/common/cpp/run_shifter.sh env \
     CUSOLVERMP_FORCE_NCCL=1 \
-    XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 \
-    XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async \
     python3 -u -m common.cusolvermp_eigh_test --grid 2 2
 ```
 
@@ -100,8 +102,27 @@ Required env vars:
 | Var | Why |
 |---|---|
 | `CUSOLVERMP_FORCE_NCCL=1` | Route libcal's runtime collectives through NCCL instead of UCC.  Without it cuSOLVERMp tries UCC → InfiniBand → fails on many sites. |
-| `XLA_PYTHON_CLIENT_MEM_FRACTION=0.5` | Leave headroom for cuSOLVERMp + libcal workspace.  LORRAX's module default of 0.95 starves the solver. |
-| `XLA_PYTHON_CLIENT_PREALLOCATE=false` | Allocate on demand so the above reservation isn't burned up front. |
+| `XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async` | Use CUDA's async mempool so JAX and libcal's internal `cudaMalloc` share VRAM.  Without it JAX's default BFC pool is invisible to `cudaMalloc` and libcal hits OOM at `MEM_FRACTION=0.95` even though most of VRAM is actually free. |
+
+Our own workspace (the ~1 GB cusolverMp device workspace returned by
+`bufferSize`) goes through XLA's `ffi::ScratchAllocator` — so it draws
+from JAX's pool directly regardless of allocator choice.  The
+`cuda_async` setting only matters because **libcal's internal scratch
+buffers** bypass our allocator and go to raw `cudaMalloc`.
+
+### Legacy workaround
+
+Before the allocator switch, we used the BFC default and reserved
+headroom for libcal:
+
+```bash
+CUSOLVERMP_FORCE_NCCL=1 \
+    XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 \
+    XLA_PYTHON_CLIENT_PREALLOCATE=false
+```
+
+This still works but wastes ~50 % of VRAM that JAX can't touch.
+Prefer the `cuda_async` recipe above.
 
 Validated (n=128, 1 node × 4×A100, 2×2 grid):
 - F64 symmetric : max |evals−ref| = 9.1e-13
