@@ -678,21 +678,22 @@ def ritz_pseudobands_v2(
             # overcounts transition-zone mass where adjacent windows overlap.
             n_eff_j = float(np.trapezoid(w_E**2 * np.maximum(dos.rho, 0), dos.E_grid)) * dim
 
-            # Gauss quadrature from shifted moments: optimal k-point rule for
-            # integrating any smooth f(E) against w_j(E)² ρ(E).  Nodes and
-            # weights come from the spectral measure itself, so they're
-            # independent of the Chebyshev random draw (unlike Ritz energies).
-            # Pass w_E² as the weight since the POU construction captures
-            # ∫ w_j² ρ dE, not ∫ w_j ρ dE.
+            # Gauss quadrature weights from shifted moments.  Use weights
+            # (from spectral measure w_j² ρ) but keep Ritz eigenvalues as
+            # node energies: the Ritz vector ξ_i physically lives at energy
+            # ⟨ξ_i|H|ξ_i⟩ = θ_i, and using a different energy (x_i from
+            # pure DOS Gauss quadrature) for the same wavefunction gives
+            # an inconsistent Laplace weight that amplifies stochastic
+            # noise substantially (verified empirically: Gauss nodes
+            # gave ~240 meV std vs ~7 meV std for Ritz nodes at V2 150win).
             e_mid = 0.5 * (e_lo + e_hi)
             e_span = max(e_hi - e_lo, 1e-6)
             moments = _compute_window_moments(
                 dos.E_grid, dos.rho, w_E**2, 2 * k,
                 E_shift=e_mid, E_scale=e_span)
             moments *= dim
-            nodes, gauss_w = _gauss_from_moments(moments, k)
-            nodes = nodes * e_span + e_mid
-
+            _, gauss_w = _gauss_from_moments(moments, k)
+            nodes = np.sort(np.real(theta_ritz))
             mode = "CJ"
 
         # Sort Ritz and Gauss ascending, pair by order
