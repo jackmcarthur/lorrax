@@ -8,25 +8,95 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# NVHPC root holding cuSOLVERMp + libcal.  Bind-mounted into Shifter at
-# runtime; resolvable at build time from the same path.  The default is
-# overridden via -DNVHPC_ROOT=... in build.sh.
-set(NVHPC_ROOT "/opt/nvidia/hpc_sdk/Linux_x86_64/25.5" CACHE PATH
-    "Directory containing math_libs/<cuda>/targets/.../include/cusolverMp.h")
-set(NVHPC_CUDA_SUBDIR "12.9" CACHE STRING
-    "CUDA minor version string inside NVHPC math_libs")
+# ----------------------------------------------------------------------------
+#  Locate cuSOLVERMp + libcal.  BGW-style: prefer -D options, else env vars,
+#  else well-known paths.  See src/ffi/PORTING.md for per-cluster notes.
+# ----------------------------------------------------------------------------
+set(NVHPC_ROOT "" CACHE PATH
+    "Explicit NVHPC root (contains math_libs/<cuda>/targets/.../include/cusolverMp.h).  "
+    "Leave empty to autodetect from NVHPC_ROOT / HPCSDK_ROOT env vars and standard paths.")
+set(NVHPC_CUDA_SUBDIR "" CACHE STRING
+    "CUDA minor version string inside NVHPC math_libs (e.g. 12.9).  "
+    "Leave empty to autodetect the newest present.")
+set(CUSOLVERMP_INCLUDE_DIR "" CACHE PATH
+    "Alternative: explicit directory containing cusolverMp.h + cal.h.")
+set(CUSOLVERMP_LIB_DIR "" CACHE PATH
+    "Alternative: explicit directory containing libcusolverMp.so + libcal.so.")
 
-set(CUSOLVERMP_INCLUDE
-    "${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/targets/x86_64-linux/include")
-set(CUSOLVERMP_LIBDIR
-    "${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/lib64")
+# -- (a) user-provided explicit paths win -----------------------------------
+if(CUSOLVERMP_INCLUDE_DIR AND CUSOLVERMP_LIB_DIR)
+    set(CUSOLVERMP_INCLUDE "${CUSOLVERMP_INCLUDE_DIR}")
+    set(CUSOLVERMP_LIBDIR  "${CUSOLVERMP_LIB_DIR}")
+    message(STATUS "cuSOLVERMp: using explicit paths from CUSOLVERMP_{INCLUDE,LIB}_DIR")
+else()
+    # -- (b) pick an NVHPC root, preferring the explicit one, else env vars -
+    if(NOT NVHPC_ROOT)
+        foreach(_envvar NVHPC_ROOT HPCSDK_ROOT NVHPC_SDK_PATH)
+            if(DEFINED ENV{${_envvar}} AND IS_DIRECTORY "$ENV{${_envvar}}")
+                set(NVHPC_ROOT "$ENV{${_envvar}}")
+                message(STATUS "cuSOLVERMp: NVHPC_ROOT from \$${_envvar} = ${NVHPC_ROOT}")
+                break()
+            endif()
+        endforeach()
+    endif()
+
+    # -- (c) fall back to common install locations -------------------------
+    if(NOT NVHPC_ROOT)
+        file(GLOB _nvhpc_candidates
+            "/opt/nvidia/hpc_sdk/Linux_x86_64/*"
+            "/lorrax_nvhpc/*"                        # Shifter bind-mount target
+            "/usr/local/nvhpc/Linux_x86_64/*")
+        list(SORT _nvhpc_candidates ORDER DESCENDING)  # newest first
+        foreach(_c ${_nvhpc_candidates})
+            if(EXISTS "${_c}/math_libs")
+                set(NVHPC_ROOT "${_c}")
+                message(STATUS "cuSOLVERMp: NVHPC_ROOT autodetected = ${NVHPC_ROOT}")
+                break()
+            endif()
+        endforeach()
+    endif()
+
+    if(NOT NVHPC_ROOT)
+        message(FATAL_ERROR
+            "cusolverMp.h not found.  Pass one of:\n"
+            "  -DNVHPC_ROOT=<dir with math_libs/>\n"
+            "  -DCUSOLVERMP_INCLUDE_DIR=<dir with cusolverMp.h> "
+            "-DCUSOLVERMP_LIB_DIR=<dir with libcusolverMp.so>\n"
+            "or set $NVHPC_ROOT / $HPCSDK_ROOT.  See src/ffi/PORTING.md.")
+    endif()
+
+    # -- (d) pick the CUDA subdir (autodetect newest if unspecified) -------
+    if(NOT NVHPC_CUDA_SUBDIR)
+        file(GLOB _cuda_vers RELATIVE "${NVHPC_ROOT}/math_libs" "${NVHPC_ROOT}/math_libs/*")
+        list(SORT _cuda_vers ORDER DESCENDING)
+        foreach(_v ${_cuda_vers})
+            if(EXISTS "${NVHPC_ROOT}/math_libs/${_v}/targets/x86_64-linux/include/cusolverMp.h")
+                set(NVHPC_CUDA_SUBDIR "${_v}")
+                message(STATUS "cuSOLVERMp: CUDA subdir autodetected = ${NVHPC_CUDA_SUBDIR}")
+                break()
+            endif()
+        endforeach()
+    endif()
+    if(NOT NVHPC_CUDA_SUBDIR)
+        message(FATAL_ERROR
+            "cuSOLVERMp: no usable CUDA subdir found under ${NVHPC_ROOT}/math_libs/")
+    endif()
+
+    set(CUSOLVERMP_INCLUDE
+        "${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/targets/x86_64-linux/include")
+    set(CUSOLVERMP_LIBDIR
+        "${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/lib64")
+endif()
 
 if(NOT EXISTS "${CUSOLVERMP_INCLUDE}/cusolverMp.h")
     message(FATAL_ERROR
-        "cusolverMp.h not found at ${CUSOLVERMP_INCLUDE}/. "
-        "Pass -DNVHPC_ROOT=<host_path_inside_container> to point at an "
-        "NVHPC install.  On Perlmutter bind-mount /opt/nvidia/hpc_sdk/... "
-        "into the Shifter container first.")
+        "cusolverMp.h not found at ${CUSOLVERMP_INCLUDE}/.\n"
+        "See src/ffi/PORTING.md for where cuSOLVERMp usually lives and how "
+        "to point the build at it on a new cluster.")
+endif()
+if(NOT EXISTS "${CUSOLVERMP_LIBDIR}/libcusolverMp.so")
+    message(FATAL_ERROR
+        "libcusolverMp.so not found at ${CUSOLVERMP_LIBDIR}/.")
 endif()
 
 # ----------------------------------------------------------------------------
