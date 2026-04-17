@@ -57,6 +57,10 @@ _DEFAULTS = {
     # BGW vcoul override (for diagnostic BGW-vs-LORRAX comparison)
     "use_bgw_vcoul": False,
     "bgw_vcoul_file": "",
+    # Aux WFN for pulling the 48-op crystal symmetry group when the main
+    # WFN is nosym (its mf_header/symmetry/mtrx is truncated to identity).
+    # Used only to fold LORRAX full-BZ q's onto BGW's IBZ q-list.
+    "bgw_vcoul_sym_wfn": "",
     # Coulomb head
     "wcoul0_source": "s_tensor",
     "wcoul0_eta": 0.0,
@@ -284,6 +288,7 @@ class LorraxConfig:
     bare_coulomb_cutoff: float | None
     use_bgw_vcoul: bool
     bgw_vcoul_file: str | None
+    bgw_vcoul_sym_wfn: str | None
 
     # --- Coulomb head ---
     wcoul0_source: str
@@ -481,6 +486,7 @@ class LorraxConfig:
             bare_coulomb_cutoff=_get("bare_coulomb_cutoff"),
             use_bgw_vcoul=bool(_get("use_bgw_vcoul")),
             bgw_vcoul_file=(str(_get("bgw_vcoul_file")) or None),
+            bgw_vcoul_sym_wfn=(str(_get("bgw_vcoul_sym_wfn")) or None),
             # Coulomb head
             wcoul0_source=str(_get("wcoul0_source")).strip().lower(),
             wcoul0_eta=float(_get("wcoul0_eta") or 0.0),

@@ -250,9 +250,21 @@ def main(argv=None):
 		       f"G counts per q: {[len(g) for g in _bgw_table.G_miller_per_q]}")
 		_cell_vol = float(wfn.cell_volume)
 		_fft_grid = tuple(int(x) for x in wfn.fft_grid)
-		# Reciprocal-space symmetry operators (same convention as
-		# SymMaps.sym_mats_k, which acts on fractional k/G vectors).
-		_sym_mats_k = np.asarray(sym.sym_mats_k, dtype=np.int32)
+		# Reciprocal-space symmetry operators.  BGW's vcoul file only stores
+		# unique IBZ q's; mapping LORRAX's full-BZ q to those requires the
+		# full crystal sym group.  A nosym WFN stores only identity in
+		# mf_header/symmetry/mtrx, so allow pulling the 48 ops from an aux
+		# sym-reduced WFN when provided (bgw_vcoul_sym_wfn).
+		if config.bgw_vcoul_sym_wfn:
+			aux_path = config.bgw_vcoul_sym_wfn
+			if not os.path.isabs(aux_path):
+				aux_path = os.path.join(input_dir, aux_path)
+			with h5py.File(aux_path, "r") as _fsym:
+				_sym_real = np.asarray(_fsym["mf_header/symmetry/mtrx"][:], dtype=np.int32)
+			print0(f"    crystal sym ops loaded from {aux_path}: {_sym_real.shape[0]}")
+			_sym_mats_k = _sym_real.transpose(0, 2, 1).copy()
+		else:
+			_sym_mats_k = np.asarray(sym.sym_mats_k, dtype=np.int32)
 		def bgw_v_grid_fn(q_frac_tuple):
 			return fill_v_grid_for_q(
 				_bgw_table, q_frac_tuple, _fft_grid, _cell_vol,
