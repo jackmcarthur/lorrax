@@ -10,6 +10,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <cuda_runtime.h>
 #include <mpi.h>
@@ -248,7 +249,7 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
 //  opens it if it does.  Returns the cached hid_t on ctx->open_datasets.
 // -----------------------------------------------------------------
 hid_t ensure_dataset(PhdfCtx* ctx, const std::string& ds_name,
-                     int64_t n_rows, int64_t n_cols, int dtype_tag) {
+                     const int64_t* shape, int ndim, int dtype_tag) {
     {
         std::lock_guard<std::mutex> g(ctx->datasets_mu);
         auto it = ctx->open_datasets.find(ds_name);
@@ -262,14 +263,18 @@ hid_t ensure_dataset(PhdfCtx* ctx, const std::string& ds_name,
         throw std::runtime_error("phdf5 ensure_dataset: unsupported dtype_tag " +
                                  std::to_string(dtype_tag));
     }
+    if (ndim <= 0) {
+        throw std::runtime_error("phdf5 ensure_dataset: ndim must be >= 1");
+    }
 
     hid_t dset = -1;
     H5E_BEGIN_TRY {
         dset = H5Dopen(ctx->file_id, ds_name.c_str(), H5P_DEFAULT);
     } H5E_END_TRY;
     if (dset < 0) {
-        hsize_t dims[2] = { (hsize_t)n_rows, (hsize_t)n_cols };
-        hid_t filespace = H5Screate_simple(2, dims, nullptr);
+        std::vector<hsize_t> dims((size_t)ndim);
+        for (int i = 0; i < ndim; ++i) dims[i] = (hsize_t)shape[i];
+        hid_t filespace = H5Screate_simple(ndim, dims.data(), nullptr);
         if (filespace < 0) {
             throw std::runtime_error(
                 "phdf5 ensure_dataset: H5Screate_simple failed for '" + ds_name + "'");

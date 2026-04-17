@@ -33,17 +33,33 @@ def _barrier(tag: str) -> None:
 
 
 def _to_host(A: Any) -> np.ndarray:
-    """Fully-replicated host array for A, regardless of sharding.
+    """Fully-replicated host ndarray for A, regardless of sharding.
 
-    `process_allgather(tiled=False)` replicates each process's view of
-    the array across all processes, then we take rank 0's copy via
-    `np.asarray`.  For already-replicated / host arrays this is cheap;
-    for sharded JAX arrays it's the implicit allgather.
+    For numpy / already-replicated inputs this is a cheap cast.  For
+    sharded JAX arrays it's ``process_allgather(tiled=False)`` followed
+    by ``device_get`` and, if the gather added a leading process-axis
+    (``ndim == A.ndim + 1``), collapsing by taking the rank-0 copy —
+    all processes see identical data so any index works.
     """
     if isinstance(A, np.ndarray):
         return A
+    if jax.process_count() == 1:
+        return np.asarray(jax.device_get(A))
     gathered = multihost_utils.process_allgather(A, tiled=False)
-    return np.asarray(jax.device_get(gathered))
+    host = np.asarray(jax.device_get(gathered))
+    try:
+        expected = tuple(int(d) for d in A.shape)
+    except Exception:
+        expected = None
+    if expected is not None and host.shape != expected:
+        # tiled=False commonly returns (world, *A.shape); flatten.
+        if host.ndim == len(expected) + 1 and host.shape[1:] == expected:
+            host = host[0]
+        else:
+            raise RuntimeError(
+                f"_to_host: unexpected gather shape {host.shape} for "
+                f"A.shape={expected}")
+    return host
 
 
 class _AllgatherBackend:
@@ -92,16 +108,19 @@ class _AllgatherBackend:
     def write_attr(self, name: str, value) -> None:
         """Write a small rank-0-only dataset (no allgather).
 
-        For scalars / small metadata like ``omega_ev``: the caller has
-        either a host numpy array or a replicated JAX array; we skip
-        the allgather and store directly.
+        For scalars / small metadata like ``omega_ev``: either host
+        numpy / python scalars / replicated JAX arrays — we skip the
+        allgather and store directly.
         """
         if _rank0() and self._file is not None:
             if name in self._file:
                 del self._file[name]
-            host = value
-            if not isinstance(host, np.ndarray):
-                host = np.asarray(jax.device_get(host)) if not isinstance(host, (int, float, complex, list, tuple)) else np.asarray(host)
+            if isinstance(value, np.ndarray):
+                host = value
+            elif isinstance(value, (int, float, complex, list, tuple)):
+                host = np.asarray(value)
+            else:
+                host = np.asarray(jax.device_get(value))
             self._file.create_dataset(name, data=host)
         _barrier(f"slab_io_write_attr/{name}")
 

@@ -81,6 +81,11 @@ class _FfiBackend:
         self.mode = mode
         self.fh: int = self._open_file(path, mesh=mesh, mode=mode)
         self._ds_ids: dict[str, int] = {}
+        # write_attr needs plain h5py (the FFI doesn't expose a
+        # collective attr-write path), so we defer attr writes to
+        # close() — concurrent h5py + MPI-IO on the same file would
+        # corrupt HDF5 metadata.
+        self._deferred_attrs: list[tuple[str, object]] = []
 
     # ------------------------------------------------------------------
     def create_dataset(
@@ -93,50 +98,31 @@ class _FfiBackend:
         attrs: dict | None = None,
     ) -> None:
         ds_id = self._loader.phdf5_ensure_dataset(
-            self.fh, name,
-            # phdf5_ensure_dataset currently takes n_rows + n_cols; for
-            # N-D we degrade to whatever it already does (creates with
-            # the dtype we pass; shape comes from first write).  When
-            # we extend to N-D dataset-create, this grows to take full
-            # shape+chunks.  For now the FFI create-on-first-write
-            # semantics cover 2-D; we rely on the allgather backend for
-            # > 2-D create-with-chunks (see slab_io.py dispatch).
-            int(shape[0]) if len(shape) >= 1 else 1,
-            int(shape[1]) if len(shape) >= 2 else 1,
+            self.fh, name, tuple(int(s) for s in shape),
             str(jnp.dtype(dtype).name),
         )
         self._ds_ids[name] = ds_id
-        # TODO(phdf5): chunks + attrs via a new ctypes entry; meanwhile
-        # these get set by the allgather backend on create, or ignored.
+        # chunks + attrs are runtime-set on the underlying H5 dataset.
+        # The FFI backend doesn't yet expose a collective "set chunks"
+        # after H5Dcreate (it would need a new ctypes entry and some
+        # care around MPI-IO dataset transfer property lists).  The
+        # caller's `chunks=` argument is a hint for the writer; when the
+        # dataset is created by the FFI path the H5 library picks
+        # contiguous layout + the FAPL-level alignment set in ctx
+        # init.  For v1 this matches the OpenMPI-stack perf ceiling;
+        # user can pre-create with h5py + chunks if needed.
         if chunks is not None or attrs is not None:
             import warnings
             warnings.warn(
                 "FFI backend: chunks/attrs on create_dataset currently no-op; "
-                "use allgather backend to set them, or ensure the dataset "
-                "already exists with the desired chunking before writing.")
+                "pre-create with h5py if you need explicit chunking or attrs.")
 
     # ------------------------------------------------------------------
     def write_attr(self, name: str, value) -> None:
-        # FFI backend has no native small-metadata path; fall back to
-        # rank-0 h5py tacked onto the same file.  Safe because
-        # lrx_phdf5_open left the MPI-IO FAPL in charge, but we still
-        # need to avoid collisions with MPI-IO's own locks.  The cheap
-        # fix: open with h5py in append mode on rank 0 only, write,
-        # close — mirrors the allgather backend's write_attr.
-        import h5py
-        if jax.process_index() == 0:
-            with h5py.File(self.path, "a") as h5:
-                if name in h5:
-                    del h5[name]
-                import numpy as np
-                h5.create_dataset(
-                    name, data=np.asarray(jax.device_get(value))
-                    if not isinstance(value, np.ndarray) else value,
-                )
-        try:
-            multihost_utils.sync_global_devices(f"slab_io_ffi_attr/{name}")
-        except Exception:
-            pass
+        # Deferred to close() to avoid interleaving rank-0 h5py with
+        # active MPI-IO on the same file.  Small arrays only; this is
+        # not meant for large data.
+        self._deferred_attrs.append((name, value))
 
     # ------------------------------------------------------------------
     def _ds_id(self, name: str, readonly: bool = False) -> int:
@@ -174,18 +160,13 @@ class _FfiBackend:
         off = tuple(offset) if offset is not None else tuple([0] * A.ndim)
         gshape = tuple(global_shape) if global_shape is not None else tuple(A.shape)
 
-        # Ensure the dataset exists with the right shape.  The FFI's
-        # phdf5_ensure_dataset currently only takes (n_rows, n_cols) —
-        # see TODO in create_dataset.  For N-D datasets we require the
-        # dataset to have been created already (either by a prior call
-        # or by the caller with h5py).  This is a known v1 limitation.
+        # Ensure the dataset exists; create_dataset may or may not have
+        # been called — this handles the single-shot `write_slab` case
+        # by ensuring with the caller-provided global_shape (default =
+        # A.shape when writing a whole dataset).
         if name not in self._ds_ids:
-            # Will fail on N-D create; we expect create_dataset to have
-            # been called (or this is 2-D).  Retry logic kept simple.
             ds_id = self._loader.phdf5_ensure_dataset(
-                self.fh, name,
-                int(gshape[0]) if len(gshape) >= 1 else 1,
-                int(gshape[1]) if len(gshape) >= 2 else 1,
+                self.fh, name, tuple(int(s) for s in gshape),
                 str(jnp.dtype(A.dtype).name),
             )
             self._ds_ids[name] = ds_id
@@ -290,3 +271,23 @@ class _FfiBackend:
         if self.fh:
             self._close_file(self.fh)
             self.fh = 0
+        # Now that MPI-IO has released the file, rank 0 can safely
+        # reopen with h5py to tack on any deferred small-metadata
+        # datasets (omega_ev and friends).
+        if self._deferred_attrs:
+            import h5py
+            import numpy as np
+            if jax.process_index() == 0:
+                with h5py.File(self.path, "a") as h5:
+                    for name, value in self._deferred_attrs:
+                        if name in h5:
+                            del h5[name]
+                        host = value
+                        if not isinstance(host, np.ndarray):
+                            host = np.asarray(jax.device_get(host))
+                        h5.create_dataset(name, data=host)
+            try:
+                multihost_utils.sync_global_devices("slab_io_ffi_close_attrs")
+            except Exception:
+                pass
+            self._deferred_attrs = []

@@ -79,7 +79,7 @@ def write_sharded_slab(
     get_lib()
 
     ds_id = ffi_loader.phdf5_ensure_dataset(
-        fh, ds_name, int(n_rows), int(n_cols),
+        fh, ds_name, (int(n_rows), int(n_cols)),
         str(jnp.dtype(A.dtype).name))
 
     def _per_rank(A_local):

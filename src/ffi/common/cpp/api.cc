@@ -37,7 +37,7 @@ namespace lorrax_ffi::phdf5 {
                       int rank, int world_size, int mode_flag);
     void     close_ctx(PhdfCtx* ctx);
     hid_t    ensure_dataset(PhdfCtx* ctx, const std::string& ds_name,
-                            int64_t n_rows, int64_t n_cols, int dtype_tag);
+                            const int64_t* shape, int ndim, int dtype_tag);
     hid_t    open_dataset_ro(PhdfCtx* ctx, const std::string& ds_name);
 }
 
@@ -148,13 +148,14 @@ void lrx_phdf5_close(int64_t ctx_handle) {
 }
 
 // Collective H5Dcreate/H5Dopen.  All ranks must call concurrently.
-// dtype_tag: 1=F32 2=F64 3=S32 4=S64 5=C64 6=C128 (matches xla::ffi::DataType).
-// Returns 0 on success and writes the hid_t to *ds_id_out; sets err_out and
-// returns 1 on failure.
+// shape[ndim] is the N-D dataset shape; ndim >= 1.  dtype_tag: 1=F32
+// 2=F64 3=S32 4=S64 5=C64 6=C128 (matches xla::ffi::DataType).
+// Returns 0 on success and writes the hid_t to *ds_id_out; sets err_out
+// and returns 1 on failure.
 int lrx_phdf5_ensure_dataset(
     int64_t ctx_handle,
     const char* ds_name,
-    int64_t n_rows, int64_t n_cols,
+    const int64_t* shape, int ndim,
     int dtype_tag,
     int64_t* ds_id_out,
     char* err_out, int err_cap)
@@ -162,7 +163,7 @@ int lrx_phdf5_ensure_dataset(
     try {
         hid_t ds = lorrax_ffi::phdf5::ensure_dataset(
             reinterpret_cast<lorrax_ffi::phdf5::PhdfCtx*>(ctx_handle),
-            std::string(ds_name), n_rows, n_cols, dtype_tag);
+            std::string(ds_name), shape, ndim, dtype_tag);
         *ds_id_out = (int64_t)ds;
         return 0;
     } catch (const std::exception& e) {

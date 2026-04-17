@@ -137,7 +137,8 @@ def _set_argtypes(lib: ctypes.CDLL) -> None:
     lib.lrx_phdf5_ensure_dataset.argtypes = [
         ctypes.c_int64,                      # ctx_handle
         ctypes.c_char_p,                     # ds_name
-        ctypes.c_int64, ctypes.c_int64,      # n_rows, n_cols
+        ctypes.POINTER(ctypes.c_int64),      # shape[] (N ints)
+        ctypes.c_int,                        # ndim
         ctypes.c_int,                        # dtype_tag
         ctypes.POINTER(ctypes.c_int64),      # ds_id_out (hid_t)
         ctypes.c_char_p, ctypes.c_int,       # err_out, err_cap
@@ -273,18 +274,25 @@ _DTYPE_TAG = {
 
 
 def phdf5_ensure_dataset(ctx_handle: int, ds_name: str,
-                         n_rows: int, n_cols: int,
-                         dtype_name: str) -> int:
-    """Collective create/open of an HDF5 dataset.  Returns hid_t as int64."""
+                         shape, dtype_name: str) -> int:
+    """Collective create/open of an N-D HDF5 dataset.  Returns hid_t as int64.
+
+    ``shape`` is any sequence of non-negative ints (tuple, list, numpy array).
+    """
     if dtype_name not in _DTYPE_TAG:
         raise ValueError(f"phdf5_ensure_dataset: unsupported dtype {dtype_name}")
+    shape = tuple(int(s) for s in shape)
+    if not shape:
+        raise ValueError("phdf5_ensure_dataset: shape must be non-empty")
     lib = get_lib()
+    ShapeArr = ctypes.c_int64 * len(shape)
+    shape_buf = ShapeArr(*shape)
     ds_id_out = ctypes.c_int64(0)
     err = ctypes.create_string_buffer(_ERR_CAP)
     rc = lib.lrx_phdf5_ensure_dataset(
         int(ctx_handle),
         ds_name.encode("utf-8"),
-        int(n_rows), int(n_cols),
+        shape_buf, int(len(shape)),
         _DTYPE_TAG[dtype_name],
         ctypes.byref(ds_id_out),
         err, _ERR_CAP,
