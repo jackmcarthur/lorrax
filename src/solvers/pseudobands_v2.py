@@ -678,22 +678,17 @@ def ritz_pseudobands_v2(
             # overcounts transition-zone mass where adjacent windows overlap.
             n_eff_j = float(np.trapezoid(w_E**2 * np.maximum(dos.rho, 0), dos.E_grid)) * dim
 
-            # Gauss quadrature weights from shifted moments.  Use weights
-            # (from spectral measure w_j² ρ) but keep Ritz eigenvalues as
-            # node energies: the Ritz vector ξ_i physically lives at energy
-            # ⟨ξ_i|H|ξ_i⟩ = θ_i, and using a different energy (x_i from
-            # pure DOS Gauss quadrature) for the same wavefunction gives
-            # an inconsistent Laplace weight that amplifies stochastic
-            # noise substantially (verified empirically: Gauss nodes
-            # gave ~240 meV std vs ~7 meV std for Ritz nodes at V2 150win).
-            e_mid = 0.5 * (e_lo + e_hi)
-            e_span = max(e_hi - e_lo, 1e-6)
-            moments = _compute_window_moments(
-                dos.E_grid, dos.rho, w_E**2, 2 * k,
-                E_shift=e_mid, E_scale=e_span)
-            moments *= dim
-            _, gauss_w = _gauss_from_moments(moments, k)
+            # Use Ritz eigenvalues as node energies (variational consistency)
+            # and uniform weights n_eff/k (DOS total mass distributed evenly
+            # across the k pseudobands in the window).  Gauss-quadrature
+            # weights were tried but rejected: for small k (=2) in narrow
+            # high-E windows, the Gauss rule can assign very unbalanced
+            # weights (seen 14× ratio within a single window), which
+            # amplifies the per-seed stochastic noise of the dominant
+            # Ritz vector by the ratio squared — drove 240 meV std at
+            # V2 150win vs 7 meV for V1 150win with uniform weights.
             nodes = np.sort(np.real(theta_ritz))
+            gauss_w = np.full(k, n_eff_j / k, dtype=np.float64)
             mode = "CJ"
 
         # Sort Ritz and Gauss ascending, pair by order
