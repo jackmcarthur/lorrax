@@ -429,6 +429,7 @@ def ritz_pseudobands(
 
     for j in range(N_S):
         e_lo, e_hi = boundaries[j], boundaries[j + 1]
+        mid = 0.5 * (e_lo + e_hi)
 
         if window_is_stochastic[j]:
             # ── Stochastic: random-phase combination of exact eigenstates ──
@@ -436,7 +437,6 @@ def ritz_pseudobands(
             rng, subkey = jax.random.split(rng)
             Xi_np, theta_np = _stochastic_pseudobands(
                 Phi_available[idx], E_available[idx], k, subkey)
-            # Weight: det eigenstates in window count, not DOS integral
             n_states = len(idx)
             w_j = np.sqrt(n_states / k)
             mode = "stoch"
@@ -447,9 +447,6 @@ def ritz_pseudobands(
                 apply_H_block, Y_j, Phi_all_det_j, Q_prev)
             Xi_np = np.asarray(Xi_j)
             theta_np = np.asarray(theta_j)
-            # Check if Ritz eigenvalues leak outside the window — if so,
-            # the CJ filter failed (typically near-edge windows in a
-            # spectral gap). Zero the weight to avoid polluting the sum.
             outside = (theta_np < e_lo - cj_resolution) | (theta_np > e_hi + cj_resolution)
             if np.any(outside):
                 w_j = 0.0
@@ -458,6 +455,18 @@ def ritz_pseudobands(
                 w_j = np.sqrt(max(n_eff[j], 0.0) / k)
                 mode = "CJ"
             Q_prev = Q_j
+
+        # Universal rule: drop windows carrying less than half a state.
+        # Covers CJ-Ritz leak (CJ-0) and any stochastic/CJ window whose
+        # DOS integral is below threshold.  Zero coefficients + energy
+        # at window midpoint keeps the WFN physically consistent and
+        # prevents the stored θ from corrupting cmin downstream.
+        if n_eff[j] < 0.5 or w_j == 0.0:
+            Xi_np = np.zeros_like(Xi_np)
+            theta_np = np.full(k, mid, dtype=np.float64)
+            w_j = 0.0
+            if mode != "CJ-0":
+                mode = "empty"
 
         Xi_list.append(Xi_np * w_j)
         theta_list.append(theta_np)

@@ -751,17 +751,17 @@ def fit_zeta_chunked_to_h5(
         print(f"  Left wfns:  {psi_l_rmu_Y.shape}")
         print(f"  Right wfns: {psi_r_rmu_Y.shape}")
 
-        # For pseudobands: normalize wavefunctions for ISDF fitting so all
-        # bands contribute equally to the pair density. The original weighted
-        # versions are kept for the returned psi_yr (GW matrix elements).
+        # For pseudobands: normalize wavefunctions for ISDF fitting.
+        # Divisor is max(1, w_n) — we never amplify a stored state (so
+        # low-weight pseudobands retain their sub-unit norm in the fit,
+        # preserving DOS weighting), and high-weight pseudobands are
+        # brought back down to unit so they don't dominate.  Zero-norm
+        # pseudobands (empty/dropped windows) stay zero via the floor.
         if band_norms is not None:
             norms_l = jnp.asarray(band_norms[band_range_left[0]:band_range_left[1]])
             norms_r = jnp.asarray(band_norms[band_range_right[0]:band_range_right[1]])
-            # Replace zero norms with 1.0 to avoid division by zero.
-            # Zero-norm bands have all-zero coefficients, so dividing by 1
-            # leaves them as zero (contributing nothing to pair densities).
-            norms_l = jnp.where(norms_l > 0, norms_l, 1.0)
-            norms_r = jnp.where(norms_r > 0, norms_r, 1.0)
+            norms_l = jnp.maximum(norms_l, 1.0)
+            norms_r = jnp.maximum(norms_r, 1.0)
             # psi shapes: Y=(nk, nb, ns, n_rmu), X=(nk, n_rmu, nb, ns)
             psi_l_rmu_Y_fit = psi_l_rmu_Y / norms_l[None, :, None, None]
             psi_l_rmuT_X_fit = psi_l_rmuT_X / norms_l[None, None, :, None]
