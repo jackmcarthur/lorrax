@@ -61,3 +61,18 @@ jit_*
 *.log
 *.bak
 *.deb
+
+# ---------------------------------------------------------------------------
+# src/ffi/ — C++/CUDA FFI build tree
+# ---------------------------------------------------------------------------
+# The generic `build/` above already catches src/ffi/*/cpp/build/, but
+# restate explicitly for the FFI subtree and cover IDE / clangd artifacts
+# that commonly appear next to the CMakeLists.txt.
+src/ffi/**/cpp/build/
+src/ffi/**/*.so
+src/ffi/**/*.o
+src/ffi/**/compile_commands.json
+src/ffi/**/.cache/
+src/ffi/**/CMakeCache.txt
+src/ffi/**/CMakeFiles/
+src/ffi/**/cmake_install.cmake
