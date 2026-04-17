@@ -233,6 +233,31 @@ def main(argv=None):
 
 	band_slices = BandSlices.from_band_edges(*meta.band_edges)
 
+	# Optional BGW vcoul override: use BGW's MC-averaged v(q+G) for all G
+	# (LORRAX's internal mc_average_vcoul_body only averages G=0).  This is
+	# purely diagnostic — enables bit-reproducible BGW comparisons.
+	bgw_v_grid_fn = None
+	if config.use_bgw_vcoul:
+		if config.bgw_vcoul_file is None:
+			raise ValueError("use_bgw_vcoul=true requires bgw_vcoul_file to be set")
+		from file_io import read_bgw_vcoul, fill_v_grid_for_q
+		bgw_path = config.bgw_vcoul_file
+		if not os.path.isabs(bgw_path):
+			bgw_path = os.path.join(input_dir, bgw_path)
+		print0(f"  BGW vcoul override: loading {bgw_path}")
+		_bgw_table = read_bgw_vcoul(bgw_path)
+		print0(f"    {_bgw_table.q_fracs.shape[0]} unique q-points, "
+		       f"G counts per q: {[len(g) for g in _bgw_table.G_miller_per_q]}")
+		_cell_vol = float(wfn.cell_volume)
+		_fft_grid = tuple(int(x) for x in wfn.fft_grid)
+		# Use WFN symmetries (point-group ops on fractional q) to find
+		# BGW-equivalent q-points that BGW deduplicates.
+		_sym_mats = np.asarray(wfn.sym_matrices, dtype=np.float64)
+		def bgw_v_grid_fn(q_frac_tuple):
+			return fill_v_grid_for_q(
+				_bgw_table, q_frac_tuple, _fft_grid, _cell_vol,
+				sym_matrices=_sym_mats)
+
 	# ISDF fitting or restart loading
 	timing.reset()
 	isdf = prepare_isdf_and_wavefunctions(
@@ -246,6 +271,7 @@ def main(argv=None):
 		tmp_dir=tmp_dir,
 		tensors_filename=tensors_filename,
 		print0=print0,
+		bgw_v_grid_fn=bgw_v_grid_fn,
 	)
 	V_qmunu = isdf.V_qmunu
 	wfns = isdf.wf_bundle

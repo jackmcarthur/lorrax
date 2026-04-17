@@ -778,7 +778,15 @@ def compute_all_V_q_from_zeta_h5(
     bdot: np.ndarray | None = None,
     mc_average_vcoul_body: bool = True,
     bare_coulomb_cutoff: float | None = None,
+    bgw_v_grid_fn=None,
 ) -> jax.Array:
+    """
+    bgw_v_grid_fn : callable(q_frac_wrapped_tuple) -> (fft_nx, fft_ny, fft_nz) ndarray
+        If provided, the returned per-q v_scaled grid replaces the
+        point/MC-at-G=0 computation.  G=(0,0,0) is expected to be zero
+        (head handled separately).  Used to inject BGW's MC-averaged
+        vcoul values for bit-reproducible BGW comparison.
+    """
     """
     Compute V_q for all q-points from zeta stored in HDF5.
 
@@ -897,6 +905,20 @@ def compute_all_V_q_from_zeta_h5(
             for qvec_wrapped in qvec_list:
                 qvec_wrapped_jax = jnp.asarray(qvec_wrapped)
                 sqrt_v, phase = kernels.get_sqrt_v_and_phase(qvec_wrapped_jax)
+                if bgw_v_grid_fn is not None:
+                    # Overlay BGW's MC-averaged v(q+G) onto LORRAX's native
+                    # v(q+G).  Only G-vectors that BGW wrote (typically 2-3%
+                    # fewer than LORRAX's cutoff set) get overwritten; the
+                    # rest keep LORRAX's point value.
+                    kgrid_a = np.array([nkx, nky, nkz], dtype=np.float64)
+                    q_frac = np.asarray(qvec_wrapped, dtype=np.float64) / kgrid_a
+                    q_frac = np.mod(q_frac, 1.0)
+                    v_scaled_bgw = np.asarray(bgw_v_grid_fn(tuple(q_frac)))
+                    mask = v_scaled_bgw != 0.0
+                    sqrt_v_native = np.asarray(sqrt_v)
+                    sqrt_v_bgw = np.sqrt(np.maximum(v_scaled_bgw, 0.0))
+                    sqrt_v_over = np.where(mask, sqrt_v_bgw, sqrt_v_native.real).astype(np.complex128)
+                    sqrt_v = jnp.asarray(sqrt_v_over)
                 sqrt_batch.append(sqrt_v)
                 phase_batch.append(phase)
             
@@ -998,8 +1020,17 @@ def compute_all_V_q_from_zeta_h5(
                             qvec_nonneg
                         )
                         qvec_wrapped_jax = jnp.asarray(qvec_wrapped)
-                        
+
                         sqrt_v, phase = kernels.get_sqrt_v_and_phase(qvec_wrapped_jax)
+                        if bgw_v_grid_fn is not None:
+                            q_frac = np.asarray(qvec_wrapped, dtype=np.float64) / kgrid_arr
+                            q_frac = np.mod(q_frac, 1.0)
+                            v_scaled_bgw = np.asarray(bgw_v_grid_fn(tuple(q_frac)))
+                            mask = v_scaled_bgw != 0.0
+                            sqrt_v_native = np.asarray(sqrt_v)
+                            sqrt_v_bgw = np.sqrt(np.maximum(v_scaled_bgw, 0.0))
+                            sqrt_v_over = np.where(mask, sqrt_v_bgw, sqrt_v_native.real).astype(np.complex128)
+                            sqrt_v = jnp.asarray(sqrt_v_over)
                         V_q_local = np.zeros((n_rmu, n_rmu), dtype=np.complex128)
                         
                         for i in range(n_chunks):

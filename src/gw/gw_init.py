@@ -328,7 +328,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	return zeta_h5_path, psi_l_yr, psi_r_yr, mem_est
 
 
-def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print):
+def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None):
 	"""Compute bare Coulomb V_qmunu from zeta HDF5 and write G0 back.
 
 	Returns (V_qmunu, G0) where V_qmunu has shape (1, npol, npol, nkx, nky, nkz, μ, μ)
@@ -376,6 +376,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 					bdot=np.asarray(wfn.bdot, dtype=np.float64) if meta.sys_dim == 0 else None,
 					mc_average_vcoul_body=cfg.mc_average_vcoul_body,
 					bare_coulomb_cutoff=cfg.bare_coulomb_cutoff,
+					bgw_v_grid_fn=bgw_v_grid_fn,
 				)
 
 	# Write G0 = ζ_μ(G=0) at q=0 back to zeta file for restart
@@ -435,7 +436,7 @@ def build_wavefunction_bundle(
 
 def prepare_isdf_and_wavefunctions(
 	*, cfg, wfn, sym, meta, centroid_indices, band_slices,
-	mesh_xy, tmp_dir, tensors_filename, print0, **_ignored,
+	mesh_xy, tmp_dir, tensors_filename, print0, bgw_v_grid_fn=None, **_ignored,
 ):
 	"""ISDF pipeline: fit_zeta → compute_V_q → build_wavefunction_bundle.
 
@@ -450,7 +451,8 @@ def prepare_isdf_and_wavefunctions(
 				cfg, band_slices, tmp_dir, print_fn=print0)
 			V_qmunu, G0 = compute_V_q(
 				zeta_path, wfn, meta, mesh_xy, cfg,
-				mem_est=mem_est, print_fn=print0)
+				mem_est=mem_est, print_fn=print0,
+				bgw_v_grid_fn=bgw_v_grid_fn)
 
 		with timing.section("gw_jax.wavefunction_setup"):
 			wfns = build_wavefunction_bundle(

@@ -54,6 +54,9 @@ _DEFAULTS = {
     "isdf_pair_mode": "spin_traced",
     "mc_average_vcoul_body": True,
     "bare_coulomb_cutoff": None,
+    # BGW vcoul override (for diagnostic BGW-vs-LORRAX comparison)
+    "use_bgw_vcoul": False,
+    "bgw_vcoul_file": "",
     # Coulomb head
     "wcoul0_source": "s_tensor",
     "wcoul0_eta": 0.0,
@@ -279,6 +282,8 @@ class LorraxConfig:
     isdf_pair_mode: str
     mc_average_vcoul_body: bool
     bare_coulomb_cutoff: float | None
+    use_bgw_vcoul: bool
+    bgw_vcoul_file: str | None
 
     # --- Coulomb head ---
     wcoul0_source: str
@@ -474,6 +479,8 @@ class LorraxConfig:
             isdf_pair_mode=isdf_pair_mode,
             mc_average_vcoul_body=bool(_get("mc_average_vcoul_body")),
             bare_coulomb_cutoff=_get("bare_coulomb_cutoff"),
+            use_bgw_vcoul=bool(_get("use_bgw_vcoul")),
+            bgw_vcoul_file=(str(_get("bgw_vcoul_file")) or None),
             # Coulomb head
             wcoul0_source=str(_get("wcoul0_source")).strip().lower(),
             wcoul0_eta=float(_get("wcoul0_eta") or 0.0),
