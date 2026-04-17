@@ -1,3 +1,12 @@
+# TODO(fractional translations): ``get_gvecs_kfull`` applies only the
+# integer rotation+umklapp part (S·G − kg0) — no τ phase.  That is
+# correct when the G-list is consumed by scalar functions of |q+G| (e.g.
+# v(q+G) in file_io/read_bgw_vcoul.fill_v_grid_for_q).  Any routine that
+# pairs these G-indices with wavefunction coefficients must pick them
+# up via ``get_cnk_fullzone`` (or reapply the τ phase + spinor rotation
+# + time-reversal conjugation it performs).  If we add new callers that
+# touch coefficients without going through ``get_cnk_fullzone``, the
+# fractional-translation phase has to be threaded in explicitly.
 import numpy as np
 import jax.numpy as jnp
 from .wfnreader import WFNReader
