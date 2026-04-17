@@ -1,23 +1,15 @@
-"""Read-sharded-slab FFI wrapper.
+"""Sharded-slab FFI reader — thin shard_map wrapper around PhdfReadFfi.
 
-Inside ``shard_map(in_specs=(), out_specs=P('x','y'))``, each process
-reads its local hyperslab of the dataset via ``H5Dread`` into a pinned
-host buffer, then H2D-memcpies it into the XLA-owned device output
-buffer.  The host thread blocks for the duration of the read; the
-CUDA device stream keeps running previously-queued ops.
+Preferred public entry point is :mod:`file_io.slab_io`, which
+dispatches between allgather-broadcast-from-rank-0 (default) and this
+FFI backend.
 
-Usage::
-
-    A = read_sharded_slab(fh, "eigenvectors",
-                           global_shape=(n, n),
-                           dtype=jnp.complex128,
-                           mesh=mesh)
-
-Only one read is physically in flight at a time (shared pinned host
-buffer), but JAX's async dispatch overlaps the read with device
-compute queued before it — same "async-enough" story as the writer.
+The underlying C++ handler is N-D and derives per-rank hyperslab
+offsets from ``ctx->rank`` + mesh_shape / axis_for_dim attrs.
 """
 from __future__ import annotations
+
+from typing import Sequence
 
 import jax
 import jax.numpy as jnp
@@ -28,9 +20,32 @@ from ..common import ffi_loader
 from ..common.ffi_loader import get_lib
 from .context import validate_mesh_2d
 
-__all__ = ["read_sharded_slab"]
+__all__ = ["read_sharded_slab", "ffi_read_call"]
 
 _FFI_TARGET = "lorrax_phdf5_read"
+
+
+def ffi_read_call(
+    out_struct: jax.ShapeDtypeStruct,
+    *,
+    ctx_handle: int,
+    ds_id: int,
+    offset_base: Sequence[int],
+    mesh_shape: Sequence[int],
+    axis_for_dim: Sequence[int],
+) -> jax.Array:
+    """Low-level FFI call.  Returns the rank-local shard (N-D).
+
+    Attrs match the N-D C++ contract; caller computes them.  Use
+    inside a ``shard_map`` body with ``in_specs=()``.
+    """
+    return jax.ffi.ffi_call(_FFI_TARGET, out_struct)(
+        ctx_handle=int(ctx_handle),
+        ds_id=int(ds_id),
+        offset_base=tuple(int(x) for x in offset_base),
+        mesh_shape=tuple(int(x) for x in mesh_shape),
+        axis_for_dim=tuple(int(x) for x in axis_for_dim),
+    )
 
 
 def read_sharded_slab(
@@ -41,30 +56,7 @@ def read_sharded_slab(
     dtype,
     mesh: Mesh,
 ) -> jax.Array:
-    """Read a 2-D HDF5 dataset into a ``P('x','y')``-sharded JAX array.
-
-    Parameters
-    ----------
-    fh
-        Handle returned by :func:`open_file` (file must be opened
-        ``mode='r'`` or ``'a'``).
-    ds_name
-        HDF5 path of the existing dataset to read.
-    global_shape
-        Tuple ``(n_rows, n_cols)`` — must equal the dataset's on-disk
-        shape and be evenly divisible by the mesh.
-    dtype
-        Element dtype (``jnp.dtype`` or anything ``jnp.dtype(...)``
-        accepts).  Must match the dataset's native type.
-    mesh
-        2-D mesh labelled ``('x','y')``.
-
-    Returns
-    -------
-    jax.Array
-        Globally shaped ``(n_rows, n_cols)``, sharded ``P('x','y')``
-        across ``mesh``.
-    """
+    """Read a 2-D dataset into a P('x','y')-sharded JAX array."""
     p, q = validate_mesh_2d(mesh)
     n_rows, n_cols = int(global_shape[0]), int(global_shape[1])
     if n_rows % p or n_cols % q:
@@ -72,26 +64,22 @@ def read_sharded_slab(
             f"global shape ({n_rows},{n_cols}) must divide mesh ({p},{q})")
     get_lib()
 
-    # Collective H5Dopen on host before entering shard_map.  Returns a
-    # hid_t that the FFI reuses via an int64 attr.
     ds_id = ffi_loader.phdf5_open_dataset_ro(fh, ds_name)
-
     local_shape = (n_rows // p, n_cols // q)
-    dtype = jnp.dtype(dtype)
-    out_spec = jax.ShapeDtypeStruct(local_shape, dtype)
+    out_struct = jax.ShapeDtypeStruct(local_shape, jnp.dtype(dtype))
 
     def _per_rank():
-        return jax.ffi.ffi_call(_FFI_TARGET, out_spec)(
+        return ffi_read_call(
+            out_struct,
             ctx_handle=int(fh),
             ds_id=int(ds_id),
-            n_rows=n_rows,
-            n_cols=n_cols,
+            offset_base=(0, 0),
+            mesh_shape=(p, q),
+            axis_for_dim=(0, 1),
         )
 
     return shard_map(
-        _per_rank,
-        mesh=mesh,
-        in_specs=(),
-        out_specs=P("x", "y"),
+        _per_rank, mesh=mesh,
+        in_specs=(), out_specs=P("x", "y"),
         check_rep=False,
     )()

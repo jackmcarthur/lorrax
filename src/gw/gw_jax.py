@@ -481,14 +481,17 @@ def main(argv=None):
 			sigma_omega_h5_path = config.sigma_omega_h5_file
 			if not os.path.isabs(sigma_omega_h5_path):
 				sigma_omega_h5_path = os.path.join(input_dir, sigma_omega_h5_path)
-			if meta.rank == 0:
-				if sigma_c_omega is not None:
-					write_sigma_omega_h5(
-						sigma_omega_h5_path, ppm_options.omega_grid_ev, None,
-						sigma_c_kij_ev=ryd2ev * sigma_c_omega,
-						sigma_sx_kij_ev=ryd2ev * sig_sx,
-						hartree_kij_ev=ryd2ev * sig_h)
-				elif sigma_omega.sigma_kij_h5_path:
+			# SlabIO handles rank-0 dispatch internally; both backends
+			# need all ranks to enter, so no `if meta.rank == 0:` guard.
+			if sigma_c_omega is not None:
+				write_sigma_omega_h5(
+					sigma_omega_h5_path, ppm_options.omega_grid_ev, None,
+					sigma_c_kij_ev=ryd2ev * sigma_c_omega,
+					sigma_sx_kij_ev=ryd2ev * sig_sx,
+					hartree_kij_ev=ryd2ev * sig_h,
+					mesh=mesh_xy,
+					use_ffi_io=getattr(config, "use_ffi_io", False))
+			elif meta.rank == 0 and sigma_omega.sigma_kij_h5_path:
 					with h5py.File(sigma_omega.sigma_kij_h5_path, "r") as h5_in:
 						dset_c = h5_in["sigma_c_kij_ry"]
 						n_omega, nk, nb = dset_c.shape[0], dset_c.shape[1], dset_c.shape[2]

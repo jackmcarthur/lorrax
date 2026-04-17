@@ -45,6 +45,10 @@ _DEFAULTS = {
     "do_G0": True,
     "self_consistent": False,
     "use_ppm_sigma": False,
+    # I/O backend: True routes big sigma/zeta writes through the
+    # parallel-HDF5 FFI (collective MPI-IO); False (default) keeps
+    # the historical process_allgather + rank-0 h5py path.
+    "use_ffi_io": False,
     # Memory / chunking
     "memory_per_device_gb": 0.0,  # 0 = auto-detect
     "chunk_size": -1,
@@ -273,6 +277,7 @@ class LorraxConfig:
     do_G0: bool
     self_consistent: bool
     use_ppm_sigma: bool
+    use_ffi_io: bool
 
     # --- Memory / chunking (resolved at construction) ---
     memory_per_device_gb: float
@@ -473,6 +478,7 @@ class LorraxConfig:
             do_G0=bool(_get("do_G0")),
             self_consistent=bool(_get("self_consistent")),
             use_ppm_sigma=bool(_get("use_ppm_sigma")),
+            use_ffi_io=bool(_get("use_ffi_io")),
             # Memory / chunking
             memory_per_device_gb=memory_per_device_gb,
             chunk_target_utilization=chunk_utilization,
