@@ -255,8 +255,35 @@ if(NOT HDF5_IS_PARALLEL)
 endif()
 message(STATUS "HDF5: ${HDF5_VERSION} at ${HDF5_INCLUDE_DIRS} (parallel)")
 
-find_package(MPI REQUIRED COMPONENTS C)
-message(STATUS "MPI:  ${MPI_C_COMPILER} / ${MPI_C_LIBRARIES}")
+# MPI — we do NOT use find_package(MPI) here because the NVIDIA JAX
+# container ships HPC-X OpenMPI at /opt/hpcx/ompi, so mpicc would point
+# at OpenMPI and pull in the wrong ABI.  Instead we expect the stage
+# dir (or any cray-hdf5-parallel module equivalent) to ship MPICH
+# headers (mpi.h, mpio.h) alongside HDF5 headers.  At runtime, libmpi
+# is provided by Shifter's --module=mpich bind-mount
+# (/opt/udiImage/modules/mpich/libmpi.so.12); we locate it at link
+# time via LORRAX_MPICH_LIB_DIR (defaulted to that same path).
+find_path(LORRAX_MPI_INCLUDE_DIR mpi.h
+    HINTS "${HDF5_INCLUDE_DIRS}"
+    NO_DEFAULT_PATH)
+if(NOT LORRAX_MPI_INCLUDE_DIR)
+    message(FATAL_ERROR
+        "mpi.h not found alongside HDF5 headers (${HDF5_INCLUDE_DIRS}).\n"
+        "The phdf5 stage must include MPICH headers.  Run the\n"
+        "rebuild_stage.sh helper or stage them manually.")
+endif()
+set(LORRAX_MPICH_LIB_DIR "/opt/udiImage/modules/mpich" CACHE PATH
+    "Runtime dir containing libmpi.so.12 (MPICH ABI)")
+find_library(LORRAX_MPI_LIBRARY
+    NAMES mpi
+    HINTS "${LORRAX_MPICH_LIB_DIR}"
+    NO_DEFAULT_PATH)
+if(NOT LORRAX_MPI_LIBRARY)
+    message(FATAL_ERROR
+        "libmpi not found in ${LORRAX_MPICH_LIB_DIR}.\n"
+        "Are you running inside shifter --module=mpich?")
+endif()
+message(STATUS "MPI:  include=${LORRAX_MPI_INCLUDE_DIR} lib=${LORRAX_MPI_LIBRARY}")
 
 # ----------------------------------------------------------------------------
 # Build lorrax_ffi.so
@@ -287,7 +314,7 @@ target_include_directories(lorrax_ffi PRIVATE
     "${NCCL_INCLUDE}"
     "${CUDA_TOOLKIT_ROOT}/include"
     "${HDF5_INCLUDE_DIRS}"
-    "${MPI_C_INCLUDE_DIRS}"
+    "${LORRAX_MPI_INCLUDE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../.."
 )
@@ -299,7 +326,7 @@ target_link_libraries(lorrax_ffi PRIVATE
     "${CUSOLVER_LIBRARY}"
     "${CUSOLVERMG_LIBRARY}"
     ${HDF5_LIBRARIES}
-    MPI::MPI_C
+    "${LORRAX_MPI_LIBRARY}"
 )
 
 target_compile_options(lorrax_ffi PRIVATE
@@ -311,4 +338,4 @@ message(STATUS "  cuSOLVERMp = ${CUSOLVERMP_LIBDIR}/libcusolverMp.so")
 message(STATUS "  NCCL       = ${NCCL_LIBRARY}")
 message(STATUS "  CUDART     = ${CUDART_LIBRARY}")
 message(STATUS "  HDF5       = ${HDF5_LIBRARIES}")
-message(STATUS "  MPI        = ${MPI_C_LIBRARIES}")
+message(STATUS "  MPI        = ${LORRAX_MPI_LIBRARY}")

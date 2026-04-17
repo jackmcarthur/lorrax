@@ -143,21 +143,63 @@ to `/lorrax_nvhpc` inside the container.
   or `NCCL_NET_PLUGIN=ofi` on Perlmutter).  Not validated in this
   iteration.
 
-## phdf5 tuning
+## phdf5 stack (Cray MPICH + cray-hdf5-parallel)
 
 The `ffi.phdf5` handler writes sharded JAX arrays through parallel
-HDF5 / MPI-IO.  Out-of-the-box defaults (set in
-`ffi/phdf5/cpp/context.cc`) are tuned for Perlmutter pscratch at ~16
-ranks and deliver ~4.5 GB/s on a 4 GB C128 matrix — an 8× speedup
-over the `process_allgather` + rank-0 h5py path that the same write
-used to use.  All defaults are overridable via env at `open_file`
-time:
+HDF5 / MPI-IO.  The default stack on Perlmutter:
+
+- **HDF5**: a copy of the host's `cray-hdf5-parallel` module, kept
+  under `/pscratch/sd/$USER/lorrax_phdf5_cray/stage/` (NERSC Shifter
+  won't bind-mount from `$HOME`).  Regenerate with
+  `~/software/lorrax_phdf5_cray/rebuild_stage.sh`.
+- **MPI**: Cray MPICH via `shifter --module=mpich`, which bind-mounts
+  MPICH-ABI `libmpi.so.12` + PMI / libfabric at
+  `/opt/udiImage/modules/mpich/`.
+- **Bridging shim**: one symlink in the stage's `lib/` dir maps the
+  host HDF5's hard-coded `libmpi_gnu_123.so.12` NEEDED onto the generic
+  MPICH-ABI `libmpi.so.12` — ABI is compatible, name isn't.
+
+Measured on a 4-node / 16-GPU alloc, n=16384 C128 (4.29 GB global):
+
+    FFI   mean:  ~1300 ms  ( ~3.2 GB/s)
+    Gather    :  ~7900 ms  ( ~0.5 GB/s)
+    speedup   :  6-7× over gather-to-rank-0
+
+**Known trade-off**: a prior conda-forge-OpenMPI build of HDF5 1.14
+delivered ~4.45 GB/s (see bench's module docstring for the exact
+numbers).  The OpenMPI path wins by ~25 % because OpenMPI's ROMIO
+honours `cb_nodes=world_size`; Cray MPICH's ADIO driver silently
+ignores that hint and picks its own aggregator layout.  We accept
+the regression in exchange for the standard, portable
+cray-hdf5-parallel-module pattern, which works on every DOE Cray
+cluster and doesn't require rebuilding HDF5 from source.
+
+### Porting to a non-Cray cluster
+
+1. Build or identify a parallel-HDF5 install on the host (any
+   `hdf5-parallel` / `hdf5-openmpi` module works).
+2. Copy its `bin/include/lib/` into a `/pscratch`-equivalent path
+   the cluster's container runtime is willing to bind-mount.  The
+   `rebuild_stage.sh` helper does this for cray-hdf5-parallel; adapt
+   it to your module's layout.
+3. If HDF5's `libhdf5.so` NEEDS a compiler-specific libmpi SONAME
+   (Cray-PE convention), add a symlink in the stage `lib/` pointing
+   at the runtime `libmpi` available inside the container.
+4. Point `LORRAX_FFI_PHDF5_DIR` at your stage dir.
+5. For MPICH-ABI MPIs (Cray, MPICH, MVAPICH, Intel MPI) use the
+   equivalent of `--module=mpich`; for OpenMPI-ABI HDF5 you'll need
+   `libmpi.so.40` instead (a separate, earlier variant of this
+   stack, reachable via git history on branch
+   `agent/ffi-phdf5-bench`).
+
+### Tunable env vars at `open_file` time
 
 | env var                         | default      | effect                          |
 |---------------------------------|--------------|---------------------------------|
 | `LORRAX_PHDF5_CB_WRITE`         | `enable`     | ROMIO collective buffering.     |
 | `LORRAX_PHDF5_CB_BUFFER_SIZE`   | `67108864`   | per-aggregator cb buffer (bytes). |
-| `LORRAX_PHDF5_CB_NODES`         | `world_size` | # ROMIO aggregators (1/rank).   |
+| `LORRAX_PHDF5_CB_NODES`         | _unset_      | ROMIO aggregator count hint.    |
+| `LORRAX_PHDF5_CB_PER_NODE`      | _unset_      | Cray MPICH: aggregators/node (→ `cb_config_list=*:N`). |
 | `LORRAX_PHDF5_STRIPE_COUNT`     | `16`         | Lustre striping_factor.         |
 | `LORRAX_PHDF5_STRIPE_SIZE`      | `4194304`    | Lustre striping_unit (bytes).   |
 | `LORRAX_PHDF5_ALIGN_MB`         | `4`          | `H5Pset_alignment` threshold.   |
@@ -168,15 +210,13 @@ Baked-in DCPL: `H5D_FILL_TIME_NEVER` + `H5D_ALLOC_TIME_EARLY`
 (avoids the default zero-fill that would double the IO), plus
 `H5F_LIBVER_LATEST` for modern file format.
 
-For much larger writes (> 10 GB) you may want to bump
-`STRIPE_COUNT` to 32–64.  For much smaller writes
-(< 100 MB), drop `CB_BUFFER_SIZE` to 16 MiB and
-`STRIPE_COUNT` to `world_size / 2`.
+For much larger writes (> 10 GB) bump `STRIPE_COUNT` to 32–64; for
+small writes (< 100 MB), drop `CB_BUFFER_SIZE` to ~8 MiB.
 
 If the enclosing directory was created with `lfs setstripe`, the
 `striping_factor`/`striping_unit` hints are no-ops (the directory's
-layout wins).  In practice just letting the MPI-Info hints set the
-layout at file-creation time is simpler.
+layout wins).  The MPI-Info hints set the layout at file-creation
+time when the directory has no explicit stripe policy.
 
 ## Reference
 
@@ -185,3 +225,4 @@ layout at file-creation time is simpler.
 - JAX FFI: https://jax.readthedocs.io/en/latest/ffi.html
 - NERSC parallel HDF5 tuning: https://docs.nersc.gov/performance/io/library/
 - ROMIO hints: https://wordpress.cels.anl.gov/romio/2008/09/26/system-hints/
+- NERSC Shifter mpich module: https://docs.nersc.gov/development/shifter/how-to-use/

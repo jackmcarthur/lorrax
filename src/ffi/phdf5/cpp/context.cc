@@ -151,16 +151,19 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
     // the empirical bandwidth curve at 16 ranks.
     const char* cb_buf = std::getenv("LORRAX_PHDF5_CB_BUFFER_SIZE");
     info_set("cb_buffer_size", cb_buf && *cb_buf ? cb_buf : "67108864");
-    // cb_nodes: number of collective aggregators.  ROMIO's default heuristic
-    // picks too few on Perlmutter; setting it equal to world_size (one
-    // aggregator per rank) was ~3x faster in our sweep.
+    // Aggregator count.  Intentionally left to the MPI-IO driver's own
+    // heuristic.  In testing, OpenMPI/ROMIO needed cb_nodes=world_size
+    // to hit peak bandwidth, while Cray MPICH's ADIO driver ignores
+    // cb_nodes and auto-sizes aggregators from striping_factor (and
+    // silently misbehaves if we try to override).  Users who want to
+    // A/B-test can set LORRAX_PHDF5_CB_NODES (ROMIO form) or
+    // LORRAX_PHDF5_CB_PER_NODE (Cray MPICH form; becomes "*:N").
     const char* cb_nodes = std::getenv("LORRAX_PHDF5_CB_NODES");
-    if (cb_nodes && *cb_nodes) {
-        info_set("cb_nodes", cb_nodes);
-    } else {
-        char buf[16];
-        std::snprintf(buf, sizeof(buf), "%d", world_size);
-        info_set("cb_nodes", buf);
+    if (cb_nodes && *cb_nodes) info_set("cb_nodes", cb_nodes);
+    const char* cb_per_node = std::getenv("LORRAX_PHDF5_CB_PER_NODE");
+    if (cb_per_node && *cb_per_node) {
+        std::string v = std::string("*:") + cb_per_node;
+        info_set("cb_config_list", v.c_str());
     }
     // striping_factor / striping_unit: MPI-IO's way to request a Lustre
     // stripe layout when it creates the file.  Default 16 x 4 MiB was the

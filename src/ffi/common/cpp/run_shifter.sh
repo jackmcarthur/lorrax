@@ -17,7 +17,15 @@
 set -euo pipefail
 
 NVHPC_HOST="${LORRAX_FFI_NVHPC_DIR:-/pscratch/sd/j/jackm/lorrax_nvhpc}"
-PHDF5_HOST="${LORRAX_FFI_PHDF5_DIR:-/pscratch/sd/j/jackm/lorrax_phdf5/stage}"
+# phdf5 stage: a copy of the cluster's cray-hdf5-parallel (or equivalent
+# parallel-HDF5) module, kept on /pscratch so Shifter is willing to
+# bind-mount it (NERSC's udiRoot.conf won't accept --volume sources
+# under /global/homes).  Regenerate with
+#   ~/software/lorrax_phdf5_cray/rebuild_stage.sh
+# The stage only needs to contain {bin,include,lib} + a shim symlink
+# libmpi_gnu_*.so.12 -> /opt/udiImage/modules/mpich/libmpi.so.12 so
+# the host HDF5's NEEDED libmpi resolves to the shifter mpich module.
+PHDF5_HOST="${LORRAX_FFI_PHDF5_DIR:-/pscratch/sd/j/jackm/lorrax_phdf5_cray/stage}"
 IMAGE="${LORRAX_FFI_IMAGE:-nvcr.io/nvidia/jax:25.04-py3}"
 NGPU="${LORRAX_NGPU:-1}"
 # LORRAX_NTASKS = total ranks across the whole job (world_size).
@@ -55,24 +63,33 @@ if [[ -d "${PHDF5_HOST}" ]]; then
 fi
 
 SHIFTER_ARGS=(
-    shifter --module=gpu --image="${IMAGE}"
+    # --module=mpich bind-mounts Cray MPICH (MPICH-ABI libmpi.so.12 + PMI
+    # + libfabric + libcxi deps) at /opt/udiImage/modules/mpich.  This is
+    # what lets the bind-mounted cray-hdf5-parallel load inside the JAX
+    # container and also gives us Cray's Lustre-aware collective buffering
+    # for H5Dwrite.  --module=gpu bind-mounts libcuda / NCCL user-space.
+    shifter --module=gpu,mpich --image="${IMAGE}"
     "${VOL_FLAGS[@]}"
     --env=PYTHONPATH="${PYPATH}"
     --env=HDF5_USE_FILE_LOCKING=FALSE
     --env=XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
     --env=TF_GPU_ALLOCATOR=cuda_malloc_async
-    # Library search order: phdf5 stage first (so libhdf5 finds its
-    # libsz/libaec bundled alongside), then NVHPC (cusolverMp), then
-    # container's OpenMPI (satisfies libmpi.so.40 NEEDED in libhdf5.so).
-    --env=LD_LIBRARY_PATH=/lorrax_phdf5/lib:/lorrax_nvhpc/25.5_cuda12.9/math_libs/12.9/lib64:/opt/hpcx/ompi/lib
+    # Library search order: phdf5 stage first (so the staged cray
+    # libhdf5 is found + its shim symlink for libmpi_gnu_*.so.12 resolves
+    # back to the shifter mpich module's libmpi.so.12).  Then NVHPC
+    # (cusolverMp).  Then the shifter mpich module's own paths, which
+    # the module's siteEnvPrepend already adds, but we list them here
+    # too in case the caller overrides LD_LIBRARY_PATH elsewhere.
+    --env=LD_LIBRARY_PATH=/lorrax_phdf5/lib:/lorrax_nvhpc/25.5_cuda12.9/math_libs/12.9/lib64:/opt/udiImage/modules/mpich:/opt/udiImage/modules/mpich/dep
 )
 
 if [[ -n "${SLURM_JOBID:-}" && -z "${SLURM_STEP_ID:-}" ]]; then
     jobflag="--jobid=${SLURM_JOBID}"
-    # --mpi=pmix lets the container's OpenMPI bootstrap via PMIx (NERSC
-    # Perlmutter's Slurm ships pmix_v4).  Without this, OpenMPI's PMI
-    # client can't reach Slurm's PMI server and MPI_Init fails.
-    exec srun "${jobflag}" --mpi=pmix \
+    # Cray MPICH (from shifter --module=mpich) bootstraps via PMI2, not
+    # PMIx.  The shifter mpich module bind-mounts libpmi / libpmi2 from
+    # the Cray PE; NERSC's Slurm on Perlmutter supports pmi2 natively.
+    : "${LORRAX_MPI_TYPE:=pmi2}"
+    exec srun "${jobflag}" --mpi="${LORRAX_MPI_TYPE}" \
         --gres=gpu:"${NGPU}" -N "${NNODES}" -n "${NTASKS}" \
         "${SHIFTER_ARGS[@]}" "$@"
 else
