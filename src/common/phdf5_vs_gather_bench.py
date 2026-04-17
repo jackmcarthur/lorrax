@@ -13,6 +13,15 @@ matrix, then write it two ways:
 Times each variant ITERS times, reports mean wall time plus effective
 bandwidth (GB/s) of the sharded matrix through the write path.
 
+Numbers recorded on a 4-node / 16-GPU Perlmutter alloc, n=16384 C128
+(4.29 GB global), with the defaults baked into ``ffi.phdf5/ctx.cc``
+(cb_nodes=world_size, cb_buffer_size=64M, striping_factor=16,
+striping_unit=4M, fill_time=NEVER, alloc_time=EARLY):
+
+    FFI   mean:   964 ms   ( 4.45 GB/s)
+    Gather mean: 7738 ms   ( 0.56 GB/s)
+    FFI speedup: 8.02x
+
 Usage (inside a 4-node / 16-GPU interactive alloc):
 
     LORRAX_NNODES=4 LORRAX_NGPU=4 LORRAX_NTASKS=16 \\

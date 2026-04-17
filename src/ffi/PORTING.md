@@ -143,8 +143,45 @@ to `/lorrax_nvhpc` inside the container.
   or `NCCL_NET_PLUGIN=ofi` on Perlmutter).  Not validated in this
   iteration.
 
+## phdf5 tuning
+
+The `ffi.phdf5` handler writes sharded JAX arrays through parallel
+HDF5 / MPI-IO.  Out-of-the-box defaults (set in
+`ffi/phdf5/cpp/context.cc`) are tuned for Perlmutter pscratch at ~16
+ranks and deliver ~4.5 GB/s on a 4 GB C128 matrix — an 8× speedup
+over the `process_allgather` + rank-0 h5py path that the same write
+used to use.  All defaults are overridable via env at `open_file`
+time:
+
+| env var                         | default      | effect                          |
+|---------------------------------|--------------|---------------------------------|
+| `LORRAX_PHDF5_CB_WRITE`         | `enable`     | ROMIO collective buffering.     |
+| `LORRAX_PHDF5_CB_BUFFER_SIZE`   | `67108864`   | per-aggregator cb buffer (bytes). |
+| `LORRAX_PHDF5_CB_NODES`         | `world_size` | # ROMIO aggregators (1/rank).   |
+| `LORRAX_PHDF5_STRIPE_COUNT`     | `16`         | Lustre striping_factor.         |
+| `LORRAX_PHDF5_STRIPE_SIZE`      | `4194304`    | Lustre striping_unit (bytes).   |
+| `LORRAX_PHDF5_ALIGN_MB`         | `4`          | `H5Pset_alignment` threshold.   |
+| `LORRAX_PHDF5_INDEPENDENT`      | `0`          | 1 → H5FD_MPIO_INDEPENDENT.      |
+| `LORRAX_PHDF5_NO_COLL_META`     | `0`          | 1 → disable collective metadata. |
+
+Baked-in DCPL: `H5D_FILL_TIME_NEVER` + `H5D_ALLOC_TIME_EARLY`
+(avoids the default zero-fill that would double the IO), plus
+`H5F_LIBVER_LATEST` for modern file format.
+
+For much larger writes (> 10 GB) you may want to bump
+`STRIPE_COUNT` to 32–64.  For much smaller writes
+(< 100 MB), drop `CB_BUFFER_SIZE` to 16 MiB and
+`STRIPE_COUNT` to `world_size / 2`.
+
+If the enclosing directory was created with `lfs setstripe`, the
+`striping_factor`/`striping_unit` hints are no-ops (the directory's
+layout wins).  In practice just letting the MPI-Info hints set the
+layout at file-creation time is simpler.
+
 ## Reference
 
 - NVIDIA cuSOLVERMp install: https://docs.nvidia.com/cuda/cusolvermp/
 - NVIDIA HPC SDK download: https://developer.nvidia.com/hpc-sdk
 - JAX FFI: https://jax.readthedocs.io/en/latest/ffi.html
+- NERSC parallel HDF5 tuning: https://docs.nersc.gov/performance/io/library/
+- ROMIO hints: https://wordpress.cels.anl.gov/romio/2008/09/26/system-hints/

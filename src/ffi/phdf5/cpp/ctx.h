@@ -33,6 +33,7 @@ struct PhdfCtx {
     hid_t    fcpl_id         = H5I_INVALID_HID;
     hid_t    dxpl_coll       = H5I_INVALID_HID;  // H5FD_MPIO_COLLECTIVE
     hid_t    dxpl_indep      = H5I_INVALID_HID;  // H5FD_MPIO_INDEPENDENT
+    hid_t    dcpl_id         = H5I_INVALID_HID;  // fill=NEVER, alloc=EARLY, chunked layout
 
     // Cache of open datasets, keyed by HDF5 path ("ds_name" or
     // "/group/ds_name").  H5Dcreate on first write, H5Dopen on re-open.
