@@ -371,6 +371,89 @@ def _accumulate_tau_into_window(
     )
 
 
+def _make_project_ri_reduce_scatter(mesh_xy: Mesh) -> Callable[..., jax.Array]:
+    """Build a shard_map'd ψ* σ ψ that reduce-scatters the output.
+
+    Drop-in replacement for ``projection_kernel.project_ri`` at the tail of
+    ``_sigma_channel_pipeline``.  Preserves the math exactly:
+
+        Σ_mn(k) = Σ_{s, μ} Σ_{s', μ'}  ψ*_m(k, s, μ) · σ(k, s, μ, s', μ')
+                                        · ψ_n(k, s', μ')
+
+    Input sharding (global → per-rank):
+        ψ_xr  P(None, None, None, 'x')       (nk, m, s, μ_X)
+        σ     P(None, None, 'x', None, 'y')  (nk, s, μ_X, s', μ_Y)
+        ψ_yn  P(None, None, 'y', None)       (nk, s', μ_Y, n)
+
+    Output sharding:
+        P(None, None, 'x', 'y')              (c=2, nk, m_X, n_Y)
+
+    Comms inside:  the two implicit psums of the original einsum
+        psum(x)       over the μ_X contraction axis
+        psum(y)       over the μ_Y contraction axis
+    become:
+        psum_scatter(x, scatter_dim=m)   — reduces μ_X AND scatters m on x
+        psum_scatter(y, scatter_dim=n)   — reduces μ_Y AND scatters n on y
+
+    Same NCCL byte volume as the original pair of psums (on-ring LL128), but
+    the output is sharded (m_X, n_Y) so every downstream coeff·σ multiply
+    stays local — which is the whole point.
+
+    Requires m % p_x == 0 and n % p_y == 0.  Padding at the caller is the
+    cleanest place to handle non-divisibility (TODO when we hit that).
+    """
+    from jax.experimental.shard_map import shard_map
+
+    in_specs = (
+        P(None, None, None, 'x'),        # psi_xr  : (nk, m, s, μ_X)
+        P(None, None, 'x', None, 'y'),   # sigma_k : (nk, s, μ_X, s', μ_Y)
+        P(None, None, 'y', None),        # psi_yn  : (nk, s', μ_Y, n)
+    )
+    out_specs = P(None, None, 'x', 'y')  # sigma_ri : (c=2, nk, m_X, n_Y)
+
+    def _local(psi_xr_local, sigma_k_local, psi_yn_local):
+        # Stack re/im channels.  Each rank sees only its local (μ_X, μ_Y) tile
+        # of sigma_k, so the stack is cheap local work.
+        sigma_ri = jnp.stack(
+            (jnp.real(sigma_k_local), jnp.imag(sigma_k_local)), axis=0)
+
+        # First einsum: contract local s and local μ_X ("x" axis) slot.
+        # Each x-rank computes a partial over its own μ_X chunk.  m and μ_Y
+        # are still full on this rank.
+        # Shapes: 'kmsx' × 'cksxty' -> 'ckmty'
+        #   psi_xr_local: (nk, m, s, μ/p_x)
+        #   sigma_ri:     (c, nk, s, μ/p_x, s', μ/p_y)
+        #   →             (c, nk, m, s', μ/p_y)   — partial along μ_X
+        left_partial = jnp.einsum(
+            'kmsx,cksxty->ckmty', jnp.conj(psi_xr_local), sigma_ri,
+            optimize=True)
+
+        # psum_scatter(x, scatter_dim=m=2): sum over x, scatter m across x.
+        # Output shape per-rank: (c, nk, m/p_x, s', μ/p_y).
+        left_rs = jax.lax.psum_scatter(
+            left_partial, 'x', scatter_dimension=2, tiled=True)
+
+        # Second einsum: contract local s' and local μ_Y.  n is still full.
+        # Shapes: 'ckmty' × 'ktyn' -> 'ckmn'
+        #   left_rs:      (c, nk, m/p_x, s', μ/p_y)
+        #   psi_yn_local: (nk, s', μ/p_y, n)
+        #   →             (c, nk, m/p_x, n)  — partial along μ_Y
+        result_partial = jnp.einsum(
+            'ckmty,ktyn->ckmn', left_rs, psi_yn_local,
+            optimize=True)
+
+        # psum_scatter(y, scatter_dim=n=3): sum over y, scatter n across y.
+        # Output per-rank: (c, nk, m/p_x, n/p_y).  This is what the global
+        # out_spec P(None, None, 'x', 'y') demands.
+        return jax.lax.psum_scatter(
+            result_partial, 'y', scatter_dimension=3, tiled=True
+        ).astype(jnp.complex128)
+
+    return shard_map(_local, mesh=mesh_xy,
+                     in_specs=in_specs, out_specs=out_specs,
+                     check_rep=False)
+
+
 def _get_sigma_channel_pipeline(
     *,
     mesh_xy: Mesh,
@@ -380,7 +463,12 @@ def _get_sigma_channel_pipeline(
     nk_tot: int,
     bispinor: bool,
 ) -> Callable[..., jax.Array]:
-    """Return a jit-compatible sigma-channel pipeline with device-local FFTs."""
+    """Return a jit-compatible sigma-channel pipeline with device-local FFTs.
+
+    The tail project (ψ* σ ψ → Σ_mn) uses the reduce-scatter variant so the
+    emitted σ^τ is sharded (m_X, n_Y) — matching what
+    _ReduceScatterGpuAccumulator expects without any downstream reshuffle.
+    """
 
     pipeline_key = (id(mesh_xy), nkx, nky, nkz, nk_tot, bispinor)
     if pipeline_key in _sigma_channel_pipeline_cache:
@@ -411,22 +499,24 @@ def _get_sigma_channel_pipeline(
         return _V_ifftn(x_3d).reshape(nk, *x_k.shape[1:])
 
     from .greens_function_kernel import build_G as _build_G
-    from .projection_kernel import project_ri as _project_channels
+
+    _project_ri_rs = _make_project_ri_reduce_scatter(mesh_xy)
 
     @jax.jit
     def _sigma_channel_pipeline(
         psi_coh_rmuT_X, psi_coh_rmu_Y, psi_proj_rmu_X, psi_proj_rmuT_Y,
         Gij, W_q,
     ):
-        """Σ_kij = project[ FFT[ G(R) · W(R) / √Nk ] ].  All flat-k.
+        """Σ_kij = project_rs[ FFT[ G(R) · W(R) / √Nk ] ].  All flat-k.
 
         W_q is (nq, μ, μ) flat-q — same layout as all other flat-k arrays.
+        Output (Σ_ri) emerges (m_X, n_Y)-sharded from the final shard_map.
         """
         G_k = _build_G(psi_coh_rmuT_X, psi_coh_rmu_Y, Gij=Gij)
         G_R = _fft_flat_G(G_k, _G_ifftn)
         V_R = _fft_flat_V(W_q)[:, None, :, None, :]  # (nk,1,μ,1,μ) broadcast to G shape
         sigma_k = _fft_flat_G(G_R * V_R * inv_sqrt_nk, _G_fftn)
-        return _project_channels(psi_proj_rmu_X, psi_proj_rmuT_Y, sigma_k)
+        return _project_ri_rs(psi_proj_rmu_X, sigma_k, psi_proj_rmuT_Y)
 
     _sigma_channel_pipeline_cache[pipeline_key] = _sigma_channel_pipeline
     return _sigma_channel_pipeline
@@ -836,17 +926,15 @@ class _ReduceScatterGpuAccumulator(_SigmaAccumulator):
                 t_node_j, alpha_eff_j, omega_sign_j, pref_j, project_code_j,
                 *, omega_global_idx=None):
         assert self._win_acc is not None
-        # Restamp σ^τ as (k, m_X, n_Y) sharded.  TODO: make upstream emit
-        # this layout directly via shard_map + psum_scatter (see module
-        # comment above) so this constraint becomes a no-op.
-        sigma_re = jax.lax.with_sharding_constraint(sigma_re, self._tau_sharding)
-        sigma_im = jax.lax.with_sharding_constraint(sigma_im, self._tau_sharding)
+        # σ^τ arrives already (k, m_X, n_Y)-sharded from the shard_map'd
+        # project inside _sigma_channel_pipeline.  The ω-kernel multiply and
+        # add therefore touch only each rank's local (m/p_x, n/p_y) block.
         self._win_acc = _accumulate_tau_into_window(
             self._win_acc, sigma_re, sigma_im, omega_vec,
             t_node_j, alpha_eff_j, omega_sign_j, pref_j, project_code_j,
         )
         # Pin the running buffer's sharding so XLA doesn't replicate it
-        # between adds — cheap, and matters when we switch to real RS upstream.
+        # between adds.
         self._win_acc = jax.lax.with_sharding_constraint(
             self._win_acc, self._sharding)
 
@@ -1085,12 +1173,19 @@ def _integrate_tau_windows_for_branch(
                         # so carrying complex through the FFT stack would double
                         # HBM and collective traffic for no benefit.  See
                         # _combine_coeff_with_sigma_tau for the recombination.
-                        sigma_tau_kij_re, sigma_tau_kij_im = tau_channel_step(
+                        #
+                        # NB: sigma_tau_ri is (2, nk, m_X, n_Y) sharded under the
+                        # reduce-scatter project — tuple-unpacking (a, b = arr)
+                        # would assert is_fully_addressable in multi-process mode,
+                        # so index explicitly.
+                        sigma_tau_ri = tau_channel_step(
                             psi_coh_rmuT_X, psi_coh_rmu_Y,
                             psi_proj_rmu_X, psi_proj_rmuT_Y,
                             E_A, mask_A, B_q, Omega_q, mask_B,
                             E_ref_A_j, E_ref_B_j, t_node_j, eye_nb,
                         )
+                        sigma_tau_kij_re = sigma_tau_ri[0]
+                        sigma_tau_kij_im = sigma_tau_ri[1]
                     sigma_tau_kij_re.block_until_ready()
                     progress.step()
 
