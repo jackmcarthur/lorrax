@@ -55,33 +55,42 @@ def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, nspinor=2):
     Returns:
         enk: jax.Array of shape (nk_full, nb)
         weights: jax.Array of shape (nk_full, nb * nspinor) with simple val/cond weights
-    """
-    # Energies are stored on irreducible k; expand to full k using mapping
-    nb = int(bandrange[1] - bandrange[0])
-    en_irk = jnp.asarray(wfn.energies[0, :, bandrange[0] : bandrange[1]])
-    # Arrange as (nk_full, nb) to keep nk as first dim for consistency
-    enk = en_irk[sym.irk_to_k_map, :]
 
-    # Build simple least-squares weights following sigma window heuristic
-    sigma_start, sigma_end = int(sigma_bandrange[0]), int(sigma_bandrange[1])
-    enk_sigma_start = max(sigma_start - int(bandrange[0]), 0)
-    enk_sigma_end = min(sigma_end - int(bandrange[0]), nb)
-    energies_sym = jnp.asarray(wfn.energies[0, :, :])  # (nk_sym, nband_total)
-    energies_full = energies_sym[sym.irk_to_k_map, :]   # (nk_full, nband_total)
-    energies_sigma = energies_full[:, sigma_start:sigma_end]
-    E_min = jnp.min(energies_sigma)
-    E_max = jnp.max(energies_sigma)
-    # Determine valence vs conduction relative to Fermi level
-    mask_val = enk <= wfn.efermi
-    val_weights = 1.0 / jnp.sqrt(jnp.maximum(E_max - enk, 1e-12))
-    cond_weights = 1.0 / jnp.sqrt(jnp.maximum(enk - E_min, 1e-12))
-    weights_full = jnp.where(mask_val, val_weights, cond_weights)
-    # Normalize and set sigma subwindow weights to 1.0
-    wmax = jnp.max(weights_full)
-    weights_full = jnp.where(wmax > 0, weights_full / wmax, weights_full)
-    weights_full = weights_full.at[:, enk_sigma_start:enk_sigma_end].set(1.0)
-    # Repeat weights for each spinor component (2 for Pauli, 4 for bispinor)
-    return enk, jnp.repeat(weights_full, repeats=nspinor, axis=1)
+    Implementation note: everything here operates on tiny host-side arrays
+    (nk × nb ~ a few thousand doubles).  Using numpy instead of jnp avoids
+    emitting one pjit per primitive at trace time — previously ~8 cache
+    misses per call.  The final two arrays are moved to device at return.
+    """
+    # Energies are stored on irreducible k; expand to full k using mapping.
+    band_lo = int(bandrange[0])
+    band_hi = int(bandrange[1])
+    nb = band_hi - band_lo
+    irk_to_k = np.asarray(sym.irk_to_k_map)
+    en_irk = np.asarray(wfn.energies[0, :, band_lo:band_hi], dtype=np.float64)
+    enk = en_irk[irk_to_k, :]                                   # (nk_full, nb)
+
+    # Weighting heuristic: 1/sqrt(Ec - E) for conduction, 1/sqrt(E - Ev) for
+    # valence, capped and normalized; sigma band window set to exactly 1.
+    sigma_lo = int(sigma_bandrange[0])
+    sigma_hi = int(sigma_bandrange[1])
+    enk_sigma_lo = max(sigma_lo - band_lo, 0)
+    enk_sigma_hi = min(sigma_hi - band_lo, nb)
+    energies_full = np.asarray(wfn.energies[0, :, :], dtype=np.float64)[irk_to_k, :]
+    energies_sigma = energies_full[:, sigma_lo:sigma_hi]
+    E_min = float(energies_sigma.min())
+    E_max = float(energies_sigma.max())
+    efermi = float(wfn.efermi)
+
+    val_weights = 1.0 / np.sqrt(np.maximum(E_max - enk, 1e-12))
+    cond_weights = 1.0 / np.sqrt(np.maximum(enk - E_min, 1e-12))
+    weights = np.where(enk <= efermi, val_weights, cond_weights)
+    wmax = weights.max()
+    if wmax > 0:
+        weights = weights / wmax
+    weights[:, enk_sigma_lo:enk_sigma_hi] = 1.0
+    weights = np.repeat(weights, repeats=nspinor, axis=1)
+
+    return jnp.asarray(enk), jnp.asarray(weights)
 
 
 from .bispinor_init import get_small_psi_component  # noqa: F401 — re-export for callers
