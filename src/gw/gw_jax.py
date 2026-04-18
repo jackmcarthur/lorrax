@@ -144,9 +144,13 @@ def _build_mesh():
 def _build_Gij(meta, mesh_xy):
 	"""Occupation projector G_ij = diag(1,...,1,0,...,0) for sigma bands.
 
-	Built in numpy — 8 jnp primitives (zeros/eye/scatter/convert) had been
-	firing as standalone pjits at trace time; all that work is sub-ms host
-	arithmetic on a (nk, nb, nb) matrix.
+	─ NOTE TO FUTURE EDITORS — THE numpy USAGE BELOW IS INTENTIONAL ─
+	(nk, nb_sigma, nb_sigma) is a tiny host-side matrix (<1 MiB in
+	every realistic case).  The all-``jnp`` version fired 8 standalone
+	pjits per call (zeros, eye, dynamic_slice, scatter, convert) for
+	zero runtime benefit.  Commit 7781b80 (2026-04-18) converted to
+	numpy; the ``device_put`` at the end places it on the mesh.
+	DO NOT "fix" back to ``jnp``.
 	"""
 	nocc = min(meta.nelec, meta.nb_sigma)
 	Gij = np.zeros((meta.nk_tot, meta.nb_sigma, meta.nb_sigma), dtype=np.complex128)

@@ -56,10 +56,19 @@ def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, nspinor=2):
         enk: jax.Array of shape (nk_full, nb)
         weights: jax.Array of shape (nk_full, nb * nspinor) with simple val/cond weights
 
-    Implementation note: everything here operates on tiny host-side arrays
-    (nk × nb ~ a few thousand doubles).  Using numpy instead of jnp avoids
-    emitting one pjit per primitive at trace time — previously ~8 cache
-    misses per call.  The final two arrays are moved to device at return.
+    ────────────────────────────────────────────────────────────────────────
+    NOTE TO FUTURE EDITORS — THE numpy USAGE BELOW IS INTENTIONAL.
+    ────────────────────────────────────────────────────────────────────────
+    Everything in this function operates on tiny host-side arrays
+    (nk × nb ~ a few thousand doubles).  Using ``jnp`` would force each
+    reduction/where/repeat to be dispatched as its own pjit at trace time
+    — ~16 standalone pjit compilations per run, for zero runtime benefit
+    (the arithmetic is ms-scale on host).  Rewriting to ``jnp`` reverses
+    a deliberate compile-cache trim (commit 31b5961, 2026-04-18).
+
+    Only cast to ``jax.Array`` at return so the caller gets the pytree
+    type it expects.  Do NOT "fix" this back to ``jnp``.
+    ────────────────────────────────────────────────────────────────────────
     """
     # Energies are stored on irreducible k; expand to full k using mapping.
     band_lo = int(bandrange[0])

@@ -167,10 +167,16 @@ def _build_four_copies(psi_yr_full, mesh_xy):
 def _build_occ(enk_full, slices, efermi):
     """Build occupation array (nk, nb_full), float64 in {0.0, 1.0}.
 
-    Host-side: enk_full is tiny (nk × nb, usually < 10K doubles) so the
-    D2H cost is trivial compared to the 8 pjit compiles the all-jnp
-    version emitted at trace time.  Returns a jax.Array; the caller
-    applies sharding constraints.
+    ─ NOTE TO FUTURE EDITORS — THE numpy USAGE BELOW IS INTENTIONAL ─
+    ``enk_full`` is tiny (nk × nb, usually < 10K doubles).  The original
+    all-``jnp`` version did ``jnp.zeros_like(sharded_input) .at[].set``,
+    which not only emitted 8 standalone pjits at trace time but also
+    had a **non-trivial runtime cost** tied to the cross-device
+    scatter — the ``wavefunction_setup`` timing section dropped
+    1.79 s → 0.18 s when this function was converted (commit 7781b80,
+    2026-04-18).  The D2H on ``enk_full`` is sub-ms, numpy arithmetic
+    is immediate, and the ``jnp.asarray`` at the end is a cheap H2D of
+    a small replicated array.  DO NOT "fix" back to ``jnp``.
     """
     enk_host = np.asarray(enk_full)
     if efermi is None:

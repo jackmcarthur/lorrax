@@ -37,9 +37,12 @@ from common import timing
 def exp_ikr_fftbox(fft_nx: int, fft_ny: int, fft_nz: int) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Return fractional coordinate grids for constructing exp(ik·r) on the FFT box.
 
-    Tiny host-side shape builders: numpy first, jax.Array only at return.
-    Previously each jnp.arange/reshape emitted a standalone pjit at trace
-    time (~3 cache misses per call).
+    ─ NOTE TO FUTURE EDITORS — THE numpy USAGE BELOW IS INTENTIONAL ─
+    Tiny host-side shape builders (fft_n* is typically 20-200).  Using
+    ``jnp.arange`` + ``jnp.reshape`` fired 3 standalone pjit compiles
+    per call with zero runtime benefit.  Commit bbff26f (2026-04-18)
+    switched to numpy; promoted to ``jax.Array`` only at return.
+    DO NOT "fix" back to ``jnp``.
     """
     fx = np.arange(fft_nx, dtype=np.float64)[None, :, None, None] / float(fft_nx)
     fy = np.arange(fft_ny, dtype=np.float64)[None, None, :, None] / float(fft_ny)
@@ -50,8 +53,11 @@ def exp_ikr_fftbox(fft_nx: int, fft_ny: int, fft_nz: int) -> tuple[jax.Array, ja
 def fft_integer_axes(fft_nx: int, fft_ny: int, fft_nz: int) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Return integer FFT frequency grids in numpy.fft.fftfreq order.
 
-    Host-side: numpy.fft.fftfreq + reshape, promoted to JAX only at return.
-    Saves ~7 cache misses per call vs the all-jnp formulation.
+    ─ NOTE TO FUTURE EDITORS — THE numpy USAGE BELOW IS INTENTIONAL ─
+    Host-side tiny-grid shape helper.  ``jnp.fft.fftfreq`` + reshape +
+    astype each fire their own pjit at trace time — ~7 cache misses per
+    call.  Commit bbff26f (2026-04-18) converted to numpy with the JAX
+    cast deferred to return.  DO NOT "fix" back to ``jnp``.
     """
     gx = (np.fft.fftfreq(fft_nx) * fft_nx).astype(np.float64).reshape(fft_nx, 1, 1)
     gy = (np.fft.fftfreq(fft_ny) * fft_ny).astype(np.float64).reshape(1, fft_ny, 1)
