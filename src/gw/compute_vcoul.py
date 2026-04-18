@@ -523,47 +523,48 @@ def compute_V_q_from_zeta_h5(
         qy = (q_idx % (nqy * nqz)) // nqz
         qz = q_idx % nqz
     
-    # Get zeta shape
+    # Get zeta shape (flat-q dataset: (nq, n_rmu, n_rtot))
     zeta_dset = zeta_h5['zeta_q']
-    n_rmu = zeta_dset.shape[3]
-    
+    n_rmu = zeta_dset.shape[1]
+    q_flat = qx * (nqy * nqz) + qy * nqz + qz
+
     n_chunks = (n_rmu + mu_chunk_size - 1) // mu_chunk_size
-    
+
     # Precompute √v and phase for this q (JITted)
     sqrt_v, phase = kernels.get_sqrt_v_and_phase(qvec_wrapped)
-    
+
     # Pre-allocate output as numpy, fill blocks, convert to JAX at end
     # This avoids O(n²) JAX array copies from .at[].set() in loop
     V_q_np = np.zeros((n_rmu, n_rmu), dtype=np.complex128)
     g0_mu_np = np.zeros((n_rmu,), dtype=np.complex128)
-    
+
     # Process μ-chunks (outer loop)
     for i in range(n_chunks):
         mu_i_start = i * mu_chunk_size
         mu_i_end = min(mu_i_start + mu_chunk_size, n_rmu)
-        
+
         # Load from HDF5 (CPU) then transfer to device
-        zeta_mu_r_np = zeta_dset[qx, qy, qz, mu_i_start:mu_i_end, :]
+        zeta_mu_r_np = zeta_dset[q_flat, mu_i_start:mu_i_end, :]
         zeta_mu_r = jnp.asarray(zeta_mu_r_np)
-        
+
         # FFT and weight (JITted) - also returns G=0 component
         B_mu = mu_i_end - mu_i_start
         zeta_mu_weighted, g0_chunk = kernels.fft_and_weight(zeta_mu_r, sqrt_v, phase, B_mu)
-        
+
         # Store G=0 for head corrections
         g0_mu_np[mu_i_start:mu_i_end] = np.asarray(g0_chunk)
-        
+
         # Diagonal block: V[μ_i, μ_i] (JITted contraction)
         V_ii = kernels.contract_block(zeta_mu_weighted, zeta_mu_weighted)
         V_q_np[mu_i_start:mu_i_end, mu_i_start:mu_i_end] = np.asarray(V_ii)
-        
+
         # Off-diagonal blocks (upper triangle only)
         for j in range(i + 1, n_chunks):
             mu_j_start = j * mu_chunk_size
             mu_j_end = min(mu_j_start + mu_chunk_size, n_rmu)
-            
+
             # Load and FFT ν-chunk
-            zeta_nu_r_np = zeta_dset[qx, qy, qz, mu_j_start:mu_j_end, :]
+            zeta_nu_r_np = zeta_dset[q_flat, mu_j_start:mu_j_end, :]
             zeta_nu_r = jnp.asarray(zeta_nu_r_np)
             B_nu = mu_j_end - mu_j_start
             zeta_nu_weighted, _ = kernels.fft_and_weight(zeta_nu_r, sqrt_v, phase, B_nu)
@@ -707,8 +708,8 @@ def read_zeta_q_sharded(
     Returns:
         zeta_q: (n_rmu, n_rtot) array sharded along μ axis
     """
-    zeta_dset = zeta_h5['zeta_q']
-    
+    zeta_dset = zeta_h5['zeta_q']  # flat-q: (nq, n_rmu, n_rtot)
+
     # Get mesh info
     devices_2d = mesh_xy.devices
     grid_x, grid_y = devices_2d.shape
@@ -716,13 +717,21 @@ def read_zeta_q_sharded(
     # Shard μ across the 'x' axis of the mesh
     local_devices = list(jax.local_devices())
     local_coords = [tuple(np.argwhere(np.asarray(devices_2d) == d)[0]) for d in local_devices]
-    
+
     # Get unique x-coordinates (rows) owned by this process
     local_x_coords = sorted(set(coord[0] for coord in local_coords))
-    
+
     # μ indices per x-shard
     mu_per_x = (n_rmu + grid_x - 1) // grid_x
-    
+
+    # Determine nq from dataset shape; derive q_flat from (qx, qy, qz).
+    # Caller passes nqx/nqy/nqz implicitly via those indices.
+    nqy_nqz = zeta_dset.shape[0]  # unused — but q_flat needs kgrid info
+    # We use the fact that q_flat = qx*nqy*nqz + qy*nqz + qz requires
+    # knowing nqy and nqz; those aren't dataset-derivable.  This legacy
+    # helper has no live callers; leaving q_flat=0 for the stub.
+    q_flat = 0  # TODO: accept nqy/nqz as args if this helper is revived
+
     # Read only μ indices for x-coordinates this process owns
     local_zeta_chunks = []
     for x_coord in local_x_coords:
@@ -730,7 +739,7 @@ def read_zeta_q_sharded(
         mu_end = min(mu_start + mu_per_x, n_rmu)
         if mu_start < n_rmu:
             # Read this μ-chunk from HDF5
-            chunk = zeta_dset[qx, qy, qz, mu_start:mu_end, :]
+            chunk = zeta_dset[q_flat, mu_start:mu_end, :]
             # Pad if needed for uniform shard sizes
             if chunk.shape[0] < mu_per_x:
                 pad_size = mu_per_x - chunk.shape[0]
@@ -797,7 +806,8 @@ def compute_all_V_q_from_zeta_h5(
     to reuse the FFT and contraction kernels.
     
     Args:
-        zeta_h5: Open HDF5 file containing 'zeta_q' with shape (nqx, nqy, nqz, n_rmu, n_rtot)
+        zeta_io: SlabIO handle to a file containing 'zeta_q' with
+            flat-q shape (nq, n_rmu, n_rtot), q_flat = qx*nqy*nqz + qy*nqz + qz
         kgrid: (nkx, nky, nkz) k-point grid dimensions
         fft_grid: (fft_nx, fft_ny, fft_nz) FFT grid dimensions
         bvec: Reciprocal lattice vectors (3×3)
@@ -899,14 +909,15 @@ def compute_all_V_q_from_zeta_h5(
                 )
                 qvecs.append(qvec_wrapped)
                 
+                q_flat = qx * (nky * nkz) + qy * nkz + qz
                 arr = zeta_io.read_slab(
                     'zeta_q',
-                    shape=(1, 1, 1, n_rmu, n_rtot),
+                    shape=(1, n_rmu, n_rtot),
                     dtype=np.complex128,
-                    offset=(qx, qy, qz, 0, 0),
+                    offset=(q_flat, 0, 0),
                     as_numpy=True,
                 )
-                zeta_stacked[i] = arr[0, 0, 0]
+                zeta_stacked[i] = arr[0]
             
             return zeta_stacked, qvecs
         
@@ -1050,13 +1061,14 @@ def compute_all_V_q_from_zeta_h5(
                             mu_i_start = i * mu_chunk_size
                             mu_i_end = min(mu_i_start + mu_chunk_size, n_rmu)
                             
+                            q_flat = qx * (nky * nkz) + qy * nkz + qz
                             _arr = zeta_io.read_slab(
                                 'zeta_q',
-                                shape=(1, 1, 1, mu_i_end - mu_i_start, n_rtot),
+                                shape=(1, mu_i_end - mu_i_start, n_rtot),
                                 dtype=np.complex128,
-                                offset=(qx, qy, qz, mu_i_start, 0),
+                                offset=(q_flat, mu_i_start, 0),
                                 as_numpy=True)
-                            zeta_mu_r_np = _arr[0, 0, 0]
+                            zeta_mu_r_np = _arr[0]
                             zeta_mu_r = jnp.asarray(zeta_mu_r_np)
                             B_mu_i = mu_i_end - mu_i_start
                             zeta_mu_weighted, g0_chunk = kernels.fft_and_weight(zeta_mu_r, sqrt_v, phase, B_mu_i)
@@ -1072,11 +1084,11 @@ def compute_all_V_q_from_zeta_h5(
 
                                 _arr = zeta_io.read_slab(
                                     'zeta_q',
-                                    shape=(1, 1, 1, mu_j_end - mu_j_start, n_rtot),
+                                    shape=(1, mu_j_end - mu_j_start, n_rtot),
                                     dtype=np.complex128,
-                                    offset=(qx, qy, qz, mu_j_start, 0),
+                                    offset=(q_flat, mu_j_start, 0),
                                     as_numpy=True)
-                                zeta_nu_r_np = _arr[0, 0, 0]
+                                zeta_nu_r_np = _arr[0]
                                 zeta_nu_r = jnp.asarray(zeta_nu_r_np)
                                 B_mu_j = mu_j_end - mu_j_start
                                 zeta_nu_weighted, _ = kernels.fft_and_weight(zeta_nu_r, sqrt_v, phase, B_mu_j)

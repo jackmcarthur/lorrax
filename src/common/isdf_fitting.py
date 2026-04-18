@@ -821,16 +821,18 @@ def fit_zeta_chunked_to_h5(
     jax.clear_caches()  # Clear JAX function caches that may hold array refs
 
     # ========== STEP 4: Create HDF5 file ==========
-    # Use SlabIO to create+pre-size the dataset with chunking, then
-    # close so the allgather-path writer_worker can own the file.  FFI
-    # path reopens zeta_io in 'a' mode just before the chunk loop.
+    # zeta_q is stored flat-q: shape (nq, n_rmu, n_rtot) with
+    # q_flat = qx*nqy*nqz + qy*nqz + qz.  Flat-q is the ongoing
+    # convention across LORRAX; see file_io.slab_io docs.  Chunk by
+    # single-q r-slice so per-q reads stay contiguous.
     from file_io.slab_io import SlabIO
+    nq = nqx * nqy * nqz
     with SlabIO(output_file, mode='w', mesh=mesh_xy, use_ffi_io=use_ffi_io) as _zeta_create_io:
         _zeta_create_io.create_dataset(
             'zeta_q',
-            shape=(nqx, nqy, nqz, n_rmu, n_rtot),
+            shape=(nq, n_rmu, n_rtot),
             dtype=np.complex128,
-            chunks=(1, 1, 1, n_rmu, n_rchunk),
+            chunks=(1, n_rmu, n_rchunk),
         )
     # Informational file-level attrs dropped (unused anywhere).
     zeta_io = None
@@ -883,13 +885,11 @@ def fit_zeta_chunked_to_h5(
                 if item is None:
                     break
                 zeta_data, r_start, r_end, chunk_id, q_start, q_end = item
-                # zeta_data: (n_q_slice, n_rmu, actual_n_rchunk), host numpy
+                # zeta_data: (n_q_slice, n_rmu, actual_n_rchunk), host numpy.
+                # Flat-q dataset: write each per-q slab at [q_flat, :, r].
                 with h5py.File(output_file, 'a') as f:
                     for i, q_flat in enumerate(range(q_start, q_end)):
-                        qx = q_flat // (nqy * nqz)
-                        qy = (q_flat % (nqy * nqz)) // nqz
-                        qz = q_flat % nqz
-                        f['zeta_q'][qx, qy, qz, :, r_start:r_end] = zeta_data[i]
+                        f['zeta_q'][q_flat, :, r_start:r_end] = zeta_data[i]
                 write_queue.task_done()
         except Exception as e:
             write_error[0] = e
@@ -1062,22 +1062,15 @@ def fit_zeta_chunked_to_h5(
                     _q_gather = _safe_q_gather
 
                 if use_ffi_io:
-                    # FFI path: reshape zeta_chunk (nq, n_rmu, chunk_r) ->
-                    # (nqx, nqy, nqz, n_rmu, chunk_r) so we can write the
-                    # entire chunk in ONE collective hyperslab call at
-                    # offset (0, 0, 0, 0, r_start), instead of nq
-                    # separate per-q calls.  On a 4-GPU single-node Si
-                    # run this cuts 64 collective-MPI-IO calls per chunk
-                    # down to one and saves several seconds.  Sharding
-                    # propagates cleanly: the axis 0 split over a
-                    # replicated axis is a pure reshape (no shuffle).
-                    _reshaped = zeta_chunk.reshape(
-                        nqx, nqy, nqz, n_rmu, actual_n_rchunk)
+                    # FFI path: zeta_chunk is (nq, n_rmu, chunk_r) and
+                    # the file dataset is flat-q (nq, n_rmu, n_rtot), so
+                    # one collective write per r-chunk at offset
+                    # (0, 0, r_start) covers the whole chunk with no
+                    # reshape needed.
                     zeta_io.write_slab(
-                        'zeta_q', _reshaped,
-                        offset=(0, 0, 0, 0, r_start),
-                        global_shape=(nqx, nqy, nqz, n_rmu, n_rtot))
-                    del _reshaped
+                        'zeta_q', zeta_chunk,
+                        offset=(0, 0, r_start),
+                        global_shape=(nq, n_rmu, n_rtot))
                 else:
                     # Allgather path: gather once per q-chunk on every rank,
                     # queue the per-q hyperslab writes on rank 0's background
