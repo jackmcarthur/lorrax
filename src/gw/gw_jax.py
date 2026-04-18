@@ -523,9 +523,14 @@ def main(argv=None):
 		sigma_xc_diag = np.real(load_sigma_xc_diag_from_h5(sigma_omega_h5_path, ryd2ev * np.array(sig_sx)))
 		E_sc, conv, n_iter = solve_diagonal_sigma_fixed_point(
 			h0_diag_ev - efermi, sigma_xc_diag, omega_ev, max_iter=120, tol_ev=1e-7, mixing=0.6)
-		# In-grid test is on Fermi-referenced QP energy (eV vs eV).
+		# In-grid test is against DFT energy (the Sigma(omega) grid is indexed
+		# by omega = E - E_F and is only meaningful where E_DFT lies inside it).
+		# QP eigenvalues from H_qp diagonalization are unreliable here because
+		# pseudobands' non-unit-norm coefficients give eigvalsh(H_qp) garbage
+		# values for the compressed high-energy states.
+		E_dft_rel_ev = np.asarray(omega_dft_rel_ev, dtype=np.float64)
 		E_qp_rel_ev = E_qp_ev - efermi
-		in_grid = (E_qp_rel_ev >= omega_ev[0]) & (E_qp_rel_ev <= omega_ev[-1])
+		in_grid = (E_dft_rel_ev >= omega_ev[0]) & (E_dft_rel_ev <= omega_ev[-1])
 		n_in = int(np.count_nonzero(in_grid))
 
 		if config.sigma_at_dft_extrapolate and np.any(in_grid) and np.any(~in_grid):
@@ -533,7 +538,6 @@ def main(argv=None):
 			# slopes/intercepts for valence and conduction.  Out-of-grid bands
 			# get E_QP = E_DFT + (α·E_DFT + β) using the fitted line.
 			from .scissor import fit_scissor
-			E_dft_rel_ev = np.asarray(omega_dft_rel_ev, dtype=np.float64)
 			nb_sc = E_sc.shape[1]
 			occ_mask_kn = (np.arange(nb_sc)[None, :] < meta.nelec)
 			occ_mask_kn = np.broadcast_to(occ_mask_kn, E_sc.shape).astype(bool)
