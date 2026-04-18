@@ -50,7 +50,7 @@ def ffi_write_call(
     Use inside a ``shard_map`` body.
     """
     token_spec = jax.ShapeDtypeStruct((1,), jnp.int32)
-    return jax.ffi.ffi_call(_FFI_TARGET, token_spec)(
+    return jax.ffi.ffi_call(_FFI_TARGET, token_spec, has_side_effect=True)(
         A_local,
         ctx_handle=int(ctx_handle),
         ds_id=int(ds_id),

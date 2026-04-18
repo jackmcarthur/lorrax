@@ -17,13 +17,55 @@
 // mesh_shape, then advancing offset_base along every sharded dim.  This
 // matches jax.sharding.NamedSharding(P(...)) on a Mesh with the given
 // `mesh_shape`, for any subset of dims being replicated vs sharded.
+//
+// ─── Async handler + Python worker thread ─────────────────────────────
+// This handler returns an ``ffi::Future`` rather than ``ffi::Error``.
+// XLA detects the async return type via ``ResultEncoding<stage, Future>``
+// template specialization (xla/ffi/api/ffi.h:1239), creates an
+// XLA_FFI_Future, and hands it back to the runtime.
+//
+// Measured 2026-04-18: ffi::Future on its own does NOT release the
+// Python main thread.  ``jit(ffi_call)(A)`` blocks Python until the
+// Future is marked Available, i.e. until ``H5Dwrite`` completes on the
+// writer thread below (350ms observed with a 300ms artificial sleep
+// after SetAvailable — see report.md in
+// reports/session_2026-04-18_async_probe/).  ffi::Future only helps
+// overlap downstream XLA ops; Python dispatch is still serialized.
+//
+// To actually free the Python main thread, ``_slab_io_ffi.py`` adds a
+// second layer of async: a Python-level worker thread that owns the
+// ``jit(ffi_call)(A).block_until_ready()`` call in FIFO order.  Main
+// thread enqueues onto that Python queue and returns in ~0.2ms.
+//
+// What this C++ file still buys us:
+//  - The writer thread + task queue serialise ``H5Dwrite`` across
+//    ranks in dispatch order, which is the MPI-IO collective
+//    rendezvous requirement.  Without that, per-call detached threads
+//    could let OS scheduling reorder H5Dwrites between ranks.
+//  - Per-call pinned buffer (``cudaMallocHost``) allows consecutive
+//    async dispatches to not race on a shared ``ctx->pinned_buf``.
+//    cudaMallocHost is ~17ms per 67 MB shard — a pool would be nice.
+//
+// Work split:
+//  - XLA executor thread (fast path, ~17ms): cudaMallocHost, kick
+//    cudaMemcpyAsync D2H on ctx->stream, cross-stream-wait so XLA's
+//    output buffer donation is safe, record a CUDA event that fires
+//    when the D2H finishes, enqueue a task on the writer thread,
+//    return the Future.
+//  - Writer thread (slow path, one per ctx): pops next task, does
+//    cudaEventSynchronize for D2H, then H5Dwrite MPI-IO collective,
+//    cleanup, promise.SetAvailable().
 
+#include <chrono>
 #include <complex>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -53,86 +95,78 @@ static std::vector<int64_t> unravel_rank(
     return coord;
 }
 
-// ---- Impl ----------------------------------------------------------------
-template <typename T>
-static ffi::Error WriteImpl(
-    cudaStream_t xla_stream,
+// Run H5Dwrite on a detached worker thread after the D2H completes.
+// Owns: ev_done (destroyed here), pinned_buf (cudaFreeHost'd here).
+// The XLA Promise is moved in; SetAvailable/SetError signals the
+// runtime that the Future is ready and downstream ops can proceed.
+static void async_worker(
     PhdfCtx* ctx,
-    const T* d_src,
-    const std::vector<hsize_t>& offset,
-    const std::vector<hsize_t>& count,
-    hid_t ds_id)
+    hid_t ds_id,
+    hid_t native_type,
+    std::vector<hsize_t> offset,
+    std::vector<hsize_t> count,
+    void* pinned_buf,
+    cudaEvent_t ev_done,
+    ffi::Promise promise)
 {
-    const int rank = (int)offset.size();
-    size_t n_local_elts = 1;
-    for (auto c : count) n_local_elts *= (size_t)c;
-    const size_t bytes = n_local_elts * sizeof(T);
-
-    if (!ensure_pinned(ctx, bytes)) {
+    // Wait for the D2H to land in pinned_buf.  cudaEventSynchronize
+    // blocks THIS (worker) thread, not the XLA executor, not Python.
+    cudaError_t ce = cudaEventSynchronize(ev_done);
+    cudaEventDestroy(ev_done);
+    if (ce != cudaSuccess) {
+        cudaFreeHost(pinned_buf);
         std::ostringstream os;
-        os << "phdf5 write: cudaMallocHost(" << bytes << ") failed";
-        return ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str());
+        os << "phdf5 async write: cudaEventSynchronize failed: "
+           << cudaGetErrorString(ce);
+        promise.SetError(ffi::Error(ffi::ErrorCode::kInternal, os.str()));
+        return;
     }
 
-    cudaEvent_t ev_prod;
-    LORRAX_CUDA_CHECK(cudaEventCreateWithFlags(&ev_prod, cudaEventDisableTiming));
-    LORRAX_CUDA_CHECK(cudaEventRecord(ev_prod, xla_stream));
-    LORRAX_CUDA_CHECK(cudaStreamWaitEvent(ctx->stream, ev_prod, 0));
-    LORRAX_CUDA_CHECK(cudaEventDestroy(ev_prod));
-
-    LORRAX_CUDA_CHECK(cudaMemcpyAsync(ctx->pinned_buf, d_src, bytes,
-                                      cudaMemcpyDeviceToHost, ctx->stream));
-
-    cudaEvent_t ev_done;
-    LORRAX_CUDA_CHECK(cudaEventCreateWithFlags(&ev_done, cudaEventDisableTiming));
-    LORRAX_CUDA_CHECK(cudaEventRecord(ev_done, ctx->stream));
-    LORRAX_CUDA_CHECK(cudaStreamWaitEvent(xla_stream, ev_done, 0));
-    LORRAX_CUDA_CHECK(cudaEventSynchronize(ev_done));
-    LORRAX_CUDA_CHECK(cudaEventDestroy(ev_done));
-
-    hid_t dset = ds_id;
-    hid_t native_type = dt::h5_native_type<T>();
-    if (dset < 0 || H5Iis_valid(dset) <= 0) {
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-            "phdf5 write: ds_id is invalid");
-    }
-
-    hid_t filespace = H5Dget_space(dset);
+    const int rank = (int)offset.size();
+    hid_t filespace = H5Dget_space(ds_id);
     if (filespace < 0) {
-        return ffi::Error(ffi::ErrorCode::kInternal,
-                          "phdf5 write: H5Dget_space failed");
+        cudaFreeHost(pinned_buf);
+        promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
+                          "phdf5 async write: H5Dget_space failed"));
+        return;
     }
     if (H5Sselect_hyperslab(filespace, H5S_SELECT_SET,
                              offset.data(), nullptr,
                              count.data(),  nullptr) < 0) {
         H5Sclose(filespace);
-        return ffi::Error(ffi::ErrorCode::kInternal,
-                          "phdf5 write: H5Sselect_hyperslab failed");
+        cudaFreeHost(pinned_buf);
+        promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
+                          "phdf5 async write: H5Sselect_hyperslab failed"));
+        return;
     }
     hid_t memspace = H5Screate_simple(rank, count.data(), nullptr);
     if (memspace < 0) {
         H5Sclose(filespace);
-        return ffi::Error(ffi::ErrorCode::kInternal,
-                          "phdf5 write: H5Screate_simple(memspace) failed");
+        cudaFreeHost(pinned_buf);
+        promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
+                          "phdf5 async write: H5Screate_simple(memspace) failed"));
+        return;
     }
 
     hid_t dxpl = ctx->use_collective ? ctx->dxpl_coll : ctx->dxpl_indep;
-    herr_t st = H5Dwrite(dset, native_type, memspace, filespace, dxpl,
-                         ctx->pinned_buf);
+    herr_t st = H5Dwrite(ds_id, native_type, memspace, filespace, dxpl,
+                         pinned_buf);
 
     H5Sclose(memspace);
     H5Sclose(filespace);
+    cudaFreeHost(pinned_buf);
 
     if (st < 0) {
-        return ffi::Error(ffi::ErrorCode::kInternal,
-                          "phdf5 write: H5Dwrite failed");
+        promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
+                          "phdf5 async write: H5Dwrite failed"));
+        return;
     }
-    return ffi::Error::Success();
+    promise.SetAvailable();
 }
 
 // ---- Dispatch ------------------------------------------------------------
-static ffi::Error WriteDispatch(
-    cudaStream_t stream,
+static ffi::Future WriteDispatch(
+    cudaStream_t xla_stream,
     ffi::AnyBuffer A,
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> token_out,
     int64_t ctx_handle,
@@ -142,10 +176,17 @@ static ffi::Error WriteDispatch(
     ffi::Span<const int64_t> axis_count_per_dim,
     ffi::Span<const int64_t> axis_flat)
 {
+    auto fail = [](ffi::Error err) {
+        ffi::Promise p;
+        ffi::Future f(p);
+        p.SetError(std::move(err));
+        return f;
+    };
+
     auto* ctx = reinterpret_cast<PhdfCtx*>(ctx_handle);
     if (!ctx) {
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                          "phdf5 write: ctx_handle is null");
+        return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                               "phdf5 write: ctx_handle is null"));
     }
 
     const auto dims = A.dimensions();
@@ -155,7 +196,7 @@ static ffi::Error WriteDispatch(
         os << "phdf5 write: rank mismatch  A.ndim=" << N
            << " offset_base.size=" << offset_base.size()
            << " axis_count_per_dim.size=" << axis_count_per_dim.size();
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+        return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str()));
     }
 
     std::vector<int64_t> coord = unravel_rank(ctx->rank, mesh_shape);
@@ -175,7 +216,7 @@ static ffi::Error WriteDispatch(
                 std::ostringstream os;
                 os << "phdf5 write: bad axis " << ax
                    << " at dim " << d << " axis " << k;
-                return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+                return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str()));
             }
             rank_coord += coord[ax] * stride_acc;
             stride_acc *= mesh_shape[ax];
@@ -184,39 +225,133 @@ static ffi::Error WriteDispatch(
         flat_idx += (size_t)na;
     }
 
+    // Element size + HDF5 native type per dtype (we don't dispatch by
+    // template since the async body is dtype-agnostic — H5Dwrite takes
+    // native_type and a void*).
+    size_t elt_bytes = 0;
+    hid_t native_type = H5I_INVALID_HID;
     const auto dtype = A.element_type();
     switch (dtype) {
         case ffi::DataType::F32:
-            return WriteImpl<float>(stream, ctx,
-                static_cast<const float*>(A.untyped_data()),
-                offset, count, (hid_t)ds_id);
+            elt_bytes = sizeof(float);
+            native_type = dt::h5_native_type<float>();
+            break;
         case ffi::DataType::F64:
-            return WriteImpl<double>(stream, ctx,
-                static_cast<const double*>(A.untyped_data()),
-                offset, count, (hid_t)ds_id);
+            elt_bytes = sizeof(double);
+            native_type = dt::h5_native_type<double>();
+            break;
         case ffi::DataType::S32:
-            return WriteImpl<int32_t>(stream, ctx,
-                static_cast<const int32_t*>(A.untyped_data()),
-                offset, count, (hid_t)ds_id);
+            elt_bytes = sizeof(int32_t);
+            native_type = dt::h5_native_type<int32_t>();
+            break;
         case ffi::DataType::S64:
-            return WriteImpl<int64_t>(stream, ctx,
-                static_cast<const int64_t*>(A.untyped_data()),
-                offset, count, (hid_t)ds_id);
+            elt_bytes = sizeof(int64_t);
+            native_type = dt::h5_native_type<int64_t>();
+            break;
         case ffi::DataType::C64:
-            return WriteImpl<std::complex<float>>(stream, ctx,
-                static_cast<const std::complex<float>*>(A.untyped_data()),
-                offset, count, (hid_t)ds_id);
+            elt_bytes = sizeof(std::complex<float>);
+            native_type = dt::h5_native_type<std::complex<float>>();
+            break;
         case ffi::DataType::C128:
-            return WriteImpl<std::complex<double>>(stream, ctx,
-                static_cast<const std::complex<double>*>(A.untyped_data()),
-                offset, count, (hid_t)ds_id);
+            elt_bytes = sizeof(std::complex<double>);
+            native_type = dt::h5_native_type<std::complex<double>>();
+            break;
         default: {
             std::ostringstream os;
             os << "phdf5 write: unsupported dtype " << static_cast<int>(dtype);
-            return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+            return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str()));
         }
     }
+
+    hid_t dset = (hid_t)ds_id;
+    if (dset < 0 || H5Iis_valid(dset) <= 0) {
+        return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                               "phdf5 write: ds_id is invalid"));
+    }
+
+    size_t n_local_elts = 1;
+    for (auto c : count) n_local_elts *= (size_t)c;
+    const size_t bytes = n_local_elts * elt_bytes;
+
+    // Per-call pinned buffer: dedicated to THIS write, freed in worker
+    // after H5Dwrite.  Isolates consecutive async dispatches from each
+    // other on ctx->stream.
+    void* pinned_buf = nullptr;
+    cudaError_t ce = cudaMallocHost(&pinned_buf, bytes);
+    if (ce != cudaSuccess) {
+        std::ostringstream os;
+        os << "phdf5 write: cudaMallocHost(" << bytes << ") failed: "
+           << cudaGetErrorString(ce);
+        return fail(ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str()));
+    }
+
+    // Wait on the input buffer being ready (xla_stream ordering).
+    cudaEvent_t ev_prod;
+    if (cudaEventCreateWithFlags(&ev_prod, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventRecord(ev_prod, xla_stream) != cudaSuccess ||
+        cudaStreamWaitEvent(ctx->stream, ev_prod, 0) != cudaSuccess) {
+        cudaFreeHost(pinned_buf);
+        return fail(ffi::Error(ffi::ErrorCode::kInternal,
+                               "phdf5 write: event setup (producer) failed"));
+    }
+    cudaEventDestroy(ev_prod);
+
+    // Kick the D2H onto ctx->stream.  Returns immediately to us; the
+    // actual copy runs on the CUDA stream.
+    ce = cudaMemcpyAsync(pinned_buf, A.untyped_data(), bytes,
+                         cudaMemcpyDeviceToHost, ctx->stream);
+    if (ce != cudaSuccess) {
+        cudaFreeHost(pinned_buf);
+        std::ostringstream os;
+        os << "phdf5 write: cudaMemcpyAsync D2H failed: "
+           << cudaGetErrorString(ce);
+        return fail(ffi::Error(ffi::ErrorCode::kInternal, os.str()));
+    }
+
+    // Event that fires when the D2H finishes (worker waits on this).
+    cudaEvent_t ev_done;
+    if (cudaEventCreateWithFlags(&ev_done, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventRecord(ev_done, ctx->stream) != cudaSuccess) {
+        cudaFreeHost(pinned_buf);
+        return fail(ffi::Error(ffi::ErrorCode::kInternal,
+                               "phdf5 write: event setup (consumer) failed"));
+    }
+
+    // Cross-stream wait so XLA's stream also observes the D2H
+    // completion.  This is what lets XLA reuse / donate A safely after
+    // we return the Future.
+    if (cudaStreamWaitEvent(xla_stream, ev_done, 0) != cudaSuccess) {
+        cudaEventDestroy(ev_done);
+        cudaFreeHost(pinned_buf);
+        return fail(ffi::Error(ffi::ErrorCode::kInternal,
+                               "phdf5 write: cudaStreamWaitEvent(xla) failed"));
+    }
+
+    // Standard Promise/Future handshake: construct promise, construct
+    // future from it (one-shot), then move promise into the task
+    // closure.  The task runs on ctx->writer_thread in FIFO order.
+    ffi::Promise promise;
+    ffi::Future future(promise);
+
+    auto task = [ctx, dset, native_type,
+                 offset = std::move(offset),
+                 count  = std::move(count),
+                 pinned_buf, ev_done,
+                 promise = std::move(promise)]() mutable
+    {
+        async_worker(ctx, dset, native_type,
+                     std::move(offset), std::move(count),
+                     pinned_buf, ev_done, std::move(promise));
+    };
+
+    {
+        std::lock_guard<std::mutex> lk(ctx->queue_mu);
+        ctx->task_queue.emplace_back(std::move(task));
+    }
+    ctx->queue_cv.notify_one();
+
     (void)token_out;
+    return future;
 }
 
 }  // namespace lorrax_ffi::phdf5

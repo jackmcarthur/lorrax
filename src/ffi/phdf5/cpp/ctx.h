@@ -7,9 +7,13 @@
 
 #pragma once
 
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
+#include <functional>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 #include <cuda_runtime.h>
@@ -40,11 +44,28 @@ struct PhdfCtx {
     std::unordered_map<std::string, hid_t> open_datasets;
     std::mutex                             datasets_mu;
 
-    // Staging — one reusable pinned host buffer.  Writes are synchronous
-    // (block-per-call), so no pool is needed.  Grown on demand.
+    // Staging — private CUDA stream for D2H copies.  The pinned host
+    // buffers are allocated per-call (see write_ffi.cc) so consecutive
+    // async dispatches don't race on a shared buffer; fields below
+    // survive as a no-op fallback for any future sync code path.
     cudaStream_t stream              = nullptr;
     void*        pinned_buf          = nullptr;
     size_t       pinned_capacity     = 0;
+
+    // ─── Async-write worker ─────────────────────────────────────────
+    // Single dedicated thread drains ``task_queue`` in FIFO order.
+    // Every XLA-FFI-dispatched ``write_slab`` enqueues one task; the
+    // worker runs the H5Dwrite MPI-IO collective.  One thread per ctx
+    // (not per call) guarantees writes rendezvous in the same order
+    // on every rank, which is the MPI-IO collective correctness
+    // requirement.  (With detached per-call threads, OS scheduling
+    // could reorder task execution between ranks and deadlock the
+    // collective.)
+    std::thread                       writer_thread;
+    std::mutex                        queue_mu;
+    std::condition_variable           queue_cv;
+    std::deque<std::function<void()>> task_queue;
+    bool                              shutdown_flag = false;
 
     // Tuning flags, read from env at open time.
     bool   use_collective    = true;

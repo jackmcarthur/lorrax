@@ -44,9 +44,13 @@ static void ensure_mpi_initialized() {
     MPI_Initialized(&inited);
     if (inited) return;
     int provided = 0;
-    // MPI_THREAD_MULTIPLE is the strictest level — safer for coexisting
-    // with XLA's thread pool.  Some MPIs fall back to a weaker level;
-    // we accept whatever we get for now.
+    // MPI_THREAD_MULTIPLE is required: the dedicated writer thread
+    // (ctx->writer_thread, started in open_ctx) calls H5Dwrite which
+    // internally drives MPI-IO collectives concurrently with any
+    // main-thread MPI calls.  We accept whatever level we get and
+    // assume MULTIPLE (required for the parallel-HDF5 build + OpenMPI
+    // stack on Perlmutter); running on a weaker-threaded MPI would
+    // silently corrupt MPI state.
     MPI_Init_thread(nullptr, nullptr, MPI_THREAD_MULTIPLE, &provided);
     // Do NOT register MPI_Finalize via atexit — HDF5 calls MPI at its
     // own destructors; ordering is fragile.  Our close_file path calls
@@ -240,6 +244,23 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
     throw_if_cuda(cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking),
                   "cudaStreamCreate(phdf5 ctx)");
 
+    // --- start dedicated writer thread (FIFO task queue) ---
+    ctx->writer_thread = std::thread([ctx]() {
+        for (;;) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lk(ctx->queue_mu);
+                ctx->queue_cv.wait(lk, [&]{
+                    return ctx->shutdown_flag || !ctx->task_queue.empty();
+                });
+                if (ctx->task_queue.empty()) return;
+                task = std::move(ctx->task_queue.front());
+                ctx->task_queue.pop_front();
+            }
+            task();
+        }
+    });
+
     return ctx;
 }
 
@@ -324,6 +345,20 @@ hid_t open_dataset_ro(PhdfCtx* ctx, const std::string& ds_name) {
 
 void close_ctx(PhdfCtx* ctx) {
     if (!ctx) return;
+
+    // Drain and stop the writer thread first — any pending H5Dwrite
+    // must complete before we H5Dclose/H5Fclose below.  Setting
+    // shutdown_flag with the queue non-empty still exits the loop
+    // cleanly after remaining tasks run because the loop only checks
+    // for shutdown when the queue is empty.
+    if (ctx->writer_thread.joinable()) {
+        {
+            std::lock_guard<std::mutex> lk(ctx->queue_mu);
+            ctx->shutdown_flag = true;
+        }
+        ctx->queue_cv.notify_all();
+        ctx->writer_thread.join();
+    }
 
     // Close cached datasets first (so their metadata flushes into file).
     {

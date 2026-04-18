@@ -330,6 +330,8 @@ target_include_directories(lorrax_ffi PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../.."
 )
 
+find_package(Threads REQUIRED)
+
 target_link_libraries(lorrax_ffi PRIVATE
     "${CUSOLVERMP_LIBDIR}/libcusolverMp.so"
     "${NCCL_LIBRARY}"
@@ -338,6 +340,7 @@ target_link_libraries(lorrax_ffi PRIVATE
     "${CUSOLVERMG_LIBRARY}"
     ${HDF5_LIBRARIES}
     "${LORRAX_MPI_LIBRARY}"
+    Threads::Threads
 )
 
 target_compile_options(lorrax_ffi PRIVATE

@@ -12,6 +12,8 @@ sharded dim.  See ``ffi/phdf5/cpp/write_ffi.cc`` for the C++ side.
 """
 from __future__ import annotations
 
+import queue
+import threading
 from typing import Sequence
 
 import jax
@@ -97,14 +99,30 @@ class _FfiBackend:
         # close() — concurrent h5py + MPI-IO on the same file would
         # corrupt HDF5 metadata.
         self._deferred_attrs: list[tuple[str, object]] = []
-        # Hook for future async writes: the day H5Dwrite becomes
-        # non-blocking (libh5async VOL or XLA async FFI trait), each
-        # write_slab call will park its XLA future here and close()
-        # will drain the list before releasing the MPI-IO handle.
-        # Today every entry is already materialised by the time it
-        # lands in the list, so the drain is a no-op — see the
-        # "Async-write status" comment in write_slab() below.
-        self._pending_tokens: list = []
+        # Python-level async writer.  ``write_slab`` enqueues a callable
+        # here; ``_dispatch_worker`` pops it and calls
+        # ``jax.jit(shard_map(_per_rank))(A).block_until_ready()``.
+        # Rationale: XLA's ``ffi::Future`` async mechanism registers the
+        # Future with XLA's scheduler but still blocks the caller
+        # (Python main thread) of ``jit(...)(A)`` until the Future
+        # resolves — i.e. until ``H5Dwrite`` completes.  By doing the
+        # jit on a dedicated Python worker thread, we leave the main
+        # Python thread free to build the next chunk while the current
+        # one is still writing.  One worker per backend (FIFO) ensures
+        # every rank dispatches in the same order, which is the MPI-IO
+        # collective rendezvous requirement.  See
+        # ``reports/session_2026-04-18_async_probe/report.md``.
+        self._dispatch_queue: queue.Queue = queue.Queue()
+        self._dispatch_pending: int = 0          # protected by _pending_mu
+        self._pending_mu = threading.Lock()
+        self._pending_cv = threading.Condition(self._pending_mu)
+        self._dispatch_error: BaseException | None = None
+        self._dispatch_worker = threading.Thread(
+            target=self._dispatch_loop,
+            name=f"phdf5-dispatch-{path}",
+            daemon=True,
+        )
+        self._dispatch_worker.start()
 
     # ------------------------------------------------------------------
     def create_dataset(
@@ -142,6 +160,42 @@ class _FfiBackend:
         # active MPI-IO on the same file.  Small arrays only; this is
         # not meant for large data.
         self._deferred_attrs.append((name, value))
+
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    def _dispatch_loop(self) -> None:
+        """Drain ``_dispatch_queue`` in FIFO order.
+
+        Each queue entry is a callable ``() -> None`` that performs the
+        jit dispatch + block_until_ready.  We catch and stash any
+        exception so the main thread can re-raise it on the next
+        enqueue or at close() time, rather than silently losing it.
+        """
+        while True:
+            task = self._dispatch_queue.get()
+            if task is None:
+                # Shutdown sentinel; enqueued by close().
+                return
+            try:
+                task()
+            except BaseException as exc:  # noqa: BLE001
+                with self._pending_cv:
+                    if self._dispatch_error is None:
+                        self._dispatch_error = exc
+            finally:
+                with self._pending_cv:
+                    self._dispatch_pending -= 1
+                    self._pending_cv.notify_all()
+
+    def _drain_pending(self) -> None:
+        """Block main thread until all queued tasks finish."""
+        with self._pending_cv:
+            while self._dispatch_pending > 0:
+                self._pending_cv.wait()
+        if self._dispatch_error is not None:
+            err = self._dispatch_error
+            self._dispatch_error = None
+            raise err
 
     # ------------------------------------------------------------------
     def _ds_id(self, name: str, readonly: bool = False) -> int:
@@ -203,48 +257,28 @@ class _FfiBackend:
                 axis_flat=axis_flat,
             )
 
-        # ───── Async-write status (measured 2026-04-18 w/ MoS2 3x3, 4 GPU) ─────
-        # Empirically, ``shard_map(_per_rank)(A)`` — with or without an
-        # outer ``jax.jit`` wrapper, and with or without caching the
-        # dispatcher — blocks the main Python thread for the full
-        # H5Dwrite duration (~800ms for a 270-MB-per-rank chunk at
-        # MoS2 3x3 scale).  The per-chunk ``zeta_fit.chunk.h5_write``
-        # timing section therefore reports ~= N_chunks × H5Dwrite time,
-        # not a handful of milliseconds as the earlier docstring
-        # claimed.
+        # Enqueue the jit dispatch onto the Python worker thread.  Main
+        # thread returns immediately; the worker thread calls
+        # jit(shard_map(_per_rank))(A).block_until_ready() in FIFO order.
         #
-        # Root cause (hypothesis, not yet confirmed): XLA's host
-        # executor serializes FFI calls on a single thread, and the
-        # H5Dwrite FFI handler blocks that thread for the whole MPI-IO
-        # collective.  Subsequent dispatches back-pressure onto the
-        # main Python thread.  Caching the jit helps with compile
-        # overhead (~50ms saved on repeat shapes) but not with dispatch
-        # blocking.
-        #
-        # To actually get async writes, we'd need ONE of:
-        #   (a) an async-vol-enabled HDF5 + H5Dwrite_async under the
-        #       FFI handler (libh5async — a dep we deliberately skipped)
-        #   (b) dispatching the FFI call from a Python worker thread
-        #       (risky: all ranks must enter the MPI-IO collective
-        #       from the SAME logical point, and bg threads on only
-        #       some ranks deadlock — see compute_vcoul.py V_q-read
-        #       bisect, same failure mode)
-        #   (c) XLA FFI "async" trait support (not exposed in the
-        #       stable ``jax.ffi.register_ffi_target`` API as of JAX
-        #       0.6; available via ``XLA_FFI_HANDLER_TRAITS_COMMAND_
-        #       BUFFER_COMPATIBLE`` at the C++ level but requires
-        #       rewiring ``write_ffi.cc``'s handler to return an
-        #       ``XLA_FFI_Future`` instead of blocking)
-        #
-        # _pending_tokens + close()-time drain is still correct (it's
-        # a no-op when dispatch is already synchronous); keep it so
-        # the hook is in place the day (a) or (c) lands.
-        tok = shard_map(
+        # We hold a reference to A inside the closure so XLA's backing
+        # buffer isn't GC'd before H5Dwrite reads it.  After
+        # block_until_ready returns, A goes out of scope and the
+        # buffer is released.
+        sm = shard_map(
             _per_rank, mesh=self.mesh,
             in_specs=in_specs, out_specs=P(),
             check_rep=False,
-        )(A)
-        self._pending_tokens.append(tok)
+        )
+        jitted = jax.jit(sm)
+
+        def _task():
+            tok = jitted(A)
+            tok.block_until_ready()
+
+        with self._pending_cv:
+            self._dispatch_pending += 1
+        self._dispatch_queue.put(_task)
 
     # ------------------------------------------------------------------
     def read_slab(
@@ -333,15 +367,14 @@ class _FfiBackend:
 
     # ------------------------------------------------------------------
     def close(self) -> None:
-        # Drain pending write futures before closing the MPI-IO handle,
-        # otherwise XLA may still have outstanding FFI calls referencing
-        # ctx_handle at teardown time.
-        for tok in self._pending_tokens:
-            try:
-                tok.block_until_ready()
-            except Exception:
-                pass
-        self._pending_tokens = []
+        # Drain pending writes on the Python worker thread, then stop
+        # the worker, THEN close the MPI-IO handle.  Order matters:
+        # close_ctx() in C++ also drains its own task queue, but an
+        # in-flight Python-side jit dispatch could still be holding a
+        # reference to ctx_handle when we call close_file below.
+        self._drain_pending()
+        self._dispatch_queue.put(None)          # shutdown sentinel
+        self._dispatch_worker.join()
         if self.fh:
             self._close_file(self.fh)
             self.fh = 0
