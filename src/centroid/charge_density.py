@@ -89,11 +89,17 @@ def _load_wfn_k_fftbox_ibz(wfn: WFNReader, n_val: int) -> jnp.ndarray:
     band_indices = np.arange(n_val)
 
     # Pre-allocate one host buffer; fill in a Python k-loop (nk_irr is small).
+    # Note: numpy fancy-indexing with three index arrays + two slice axes
+    # moves the "advanced" axis to the FRONT, so ``psi[ik, :, :, Gx, Gy, Gz]``
+    # has target shape ``(ngk, n_val, nspinor)``. We transpose ``cnk`` from
+    # ``(n_val, nspinor, ngk)`` to match.
     psi = np.zeros((wfn.nkpts, n_val, nspinor, nx, ny, nz), dtype=np.complex128)
     for ik in range(wfn.nkpts):
         gvecs_k = np.asarray(wfn.get_gvec_nk(ik))                      # (ngk, 3)
         cnk = wfn.get_cnk_batch(ik, band_indices)                      # (n_val, nspinor, ngk)
-        psi[ik, :, :, gvecs_k[:, 0], gvecs_k[:, 1], gvecs_k[:, 2]] = cnk
+        psi[ik, :, :, gvecs_k[:, 0], gvecs_k[:, 1], gvecs_k[:, 2]] = (
+            np.asarray(cnk).transpose(2, 0, 1)
+        )
     return jnp.asarray(psi)
 
 
