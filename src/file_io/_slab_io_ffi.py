@@ -97,6 +97,10 @@ class _FfiBackend:
         # close() — concurrent h5py + MPI-IO on the same file would
         # corrupt HDF5 metadata.
         self._deferred_attrs: list[tuple[str, object]] = []
+        # Pending write tokens — write_slab returns immediately and
+        # parks the XLA future here; close() drains the list before
+        # releasing the MPI-IO handle.
+        self._pending_tokens: list = []
 
     # ------------------------------------------------------------------
     def create_dataset(
@@ -195,11 +199,19 @@ class _FfiBackend:
                 axis_flat=axis_flat,
             )
 
-        shard_map(
+        # Non-blocking dispatch: XLA queues the FFI call and returns a
+        # future immediately.  Main thread moves on to build the next
+        # chunk while H5Dwrite blocks a background executor thread;
+        # the CUDA stream is unaffected (see ffi/phdf5/cpp/write_ffi.cc
+        # for the stream-wait-event handshake).  close() drains all
+        # pending futures via block_until_ready before releasing the
+        # MPI-IO file handle.
+        tok = shard_map(
             _per_rank, mesh=self.mesh,
             in_specs=in_specs, out_specs=P(),
             check_rep=False,
-        )(A).block_until_ready()
+        )(A)
+        self._pending_tokens.append(tok)
 
     # ------------------------------------------------------------------
     def read_slab(
@@ -288,6 +300,15 @@ class _FfiBackend:
 
     # ------------------------------------------------------------------
     def close(self) -> None:
+        # Drain pending write futures before closing the MPI-IO handle,
+        # otherwise XLA may still have outstanding FFI calls referencing
+        # ctx_handle at teardown time.
+        for tok in self._pending_tokens:
+            try:
+                tok.block_until_ready()
+            except Exception:
+                pass
+        self._pending_tokens = []
         if self.fh:
             self._close_file(self.fh)
             self.fh = 0
