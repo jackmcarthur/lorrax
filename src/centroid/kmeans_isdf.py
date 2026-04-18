@@ -120,7 +120,7 @@ except ImportError:
 
 from scipy.ndimage import zoom
 
-from .get_charge_density import calculate_charge_density
+from .charge_density import get_charge_density
 
 
 # =============================================================================
@@ -1041,15 +1041,32 @@ def main():
                              "below the latency-amortization threshold. Useful "
                              "for benchmarking or when N_c is large enough "
                              "that Lloyd compute beats allreduce latency.")
+    parser.add_argument("--rho-source", choices=("auto", "qe_save", "wfn_ibz"),
+                        default="auto",
+                        help="Which ρ(r) provider to use for centroid selection. "
+                             "'qe_save' reads QE's fully-symmetrized "
+                             "charge-density.hdf5 (fastest, correct symmetry); "
+                             "'wfn_ibz' sums |ψ_nk|² over IBZ k-points from "
+                             "WFN.h5 (cheaper than full-BZ unfold, but not "
+                             "point-group symmetrized). 'auto' prefers qe_save "
+                             "when a *.save dir is findable, else wfn_ibz.")
+    parser.add_argument("--qe-save", type=str, default=None,
+                        help="Explicit path to a QE <prefix>.save directory for "
+                             "--rho-source=qe_save / auto. If omitted, a few "
+                             "conventional sandbox locations are probed.")
     args = parser.parse_args()
-    
+
     N_c = args.N_c
     print(f"Using N_c = {N_c} clusters")
-    
+
     wfn = WFNReader("WFN.h5")
     sym = symmetry_maps.SymMaps(wfn)
 
-    charge_density = calculate_charge_density(wfn, sym)
+    charge_density = get_charge_density(
+        wfn=wfn, sym=sym,
+        source=args.rho_source,
+        save_dir=args.qe_save,
+    )
 
     # BGW WFN.h5 stores avec in units of alat (rows unit-length) and alat
     # in Bohr. Convert once to Å so lattice lengths, the kmeans tolerance,
