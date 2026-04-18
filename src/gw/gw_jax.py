@@ -432,11 +432,28 @@ def main(argv=None):
 				n_nodes_static=quad.node_count, print_fn=print0)
 
 			# Frequency-integrated Σ^c(ω)
-			sigma_omega = compute_sigma_c_ppm_omega_grid(
-				wfns, ppm, meta, mesh_xy, ppm_options,
-				sigma_window_quad=config.sigma_quadrature_config,
-				print_fn=print0,
-			)
+			# Temporary profiling hooks: pf.region + pre/post snapshots bracket the sigma PPM call
+			try:
+				import sys as _sys
+				_sys.path.insert(0, "/pscratch/sd/j/jackm/lorrax_sandbox/scripts/profiling")
+				import pf as _pf
+				_pf_art = os.environ.get("PF_ARTIFACTS_DIR", "profile")
+				_pf.snapshot_memory(f"{_pf_art}/memprof/sigma_ppm_pre.prof", label="sigma_ppm_pre")
+			except Exception as _e:
+				_pf = None
+				print0(f"  [pf] profiling hooks unavailable: {_e}")
+			_cm = _pf.region("sigma_ppm") if _pf is not None else timing.section("sigma_ppm_body")
+			with _cm:
+				sigma_omega = compute_sigma_c_ppm_omega_grid(
+					wfns, ppm, meta, mesh_xy, ppm_options,
+					sigma_window_quad=config.sigma_quadrature_config,
+					print_fn=print0,
+				)
+			if _pf is not None:
+				try:
+					_pf.snapshot_memory(f"{_pf_art}/memprof/sigma_ppm_post.prof", label="sigma_ppm_post")
+				except Exception:
+					pass
 			sigma_c_omega = sigma_omega.sigma_c_kij  # (n_omega, nk, nb, nb) or None if streamed
 
 			# Evaluate Σ_c at DFT energies
