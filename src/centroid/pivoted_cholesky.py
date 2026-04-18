@@ -89,8 +89,10 @@ def gather_wfn_at_candidates(
         band_start, band_end: half-open band range [band_start, band_end).
 
     Returns:
-        psi_cand: (nkpts, band_end - band_start, nspinor, M) complex64
-            ψ_{n,k}(r̃_a), one slab per IBZ k-point.
+        psi_cand: (nkpts, band_end - band_start, nspinor, M) complex128
+            ψ_{n,k}(r̃_a), one slab per IBZ k-point. Kept in complex128 so
+            the downstream Gram + pivoted-Cholesky select operate in fp64
+            throughout (matches the gw_jax data path's precision).
     """
     del sym  # reserved; see docstring
     nx, ny, nz = (int(x) for x in wfn.fft_grid)
@@ -102,9 +104,9 @@ def gather_wfn_at_candidates(
     iy = np.asarray(cand_idx[:, 1], dtype=np.int64) % ny
     iz = np.asarray(cand_idx[:, 2], dtype=np.int64) % nz
 
-    # IFFT scale: pick same convention as get_DFT_mtxels.compute_valence_density
-    # (norm='ortho') so that |ψ|² integrates to 1 per orbital.
-    psi_out = np.zeros((wfn.nkpts, nb, nspinor, M), dtype=np.complex64)
+    # IFFT in complex128, host-stage in complex128 — no fp32 downcast on
+    # the way to the device. Matches load_wfns' precision.
+    psi_out = np.zeros((wfn.nkpts, nb, nspinor, M), dtype=np.complex128)
     for ik in range(wfn.nkpts):
         gvecs_k = np.asarray(wfn.get_gvec_nk(ik))  # (ngk, 3)
         cnk = wfn.get_cnk_batch(ik, band_indices)  # (nb, nspinor, ngk)
@@ -112,7 +114,7 @@ def gather_wfn_at_candidates(
         box = np.zeros((nb, nspinor, nx, ny, nz), dtype=np.complex128)
         box[:, :, gvecs_k[:, 0], gvecs_k[:, 1], gvecs_k[:, 2]] = cnk
         psi_r = np.fft.ifftn(box, axes=(-3, -2, -1), norm='ortho')
-        psi_out[ik] = psi_r[..., ix, iy, iz].astype(np.complex64)
+        psi_out[ik] = psi_r[..., ix, iy, iz]
     return jnp.asarray(psi_out)
 
 
@@ -401,7 +403,7 @@ def prune_candidates_by_pivoted_cholesky(
                       np.ones(wfn.nkpts, dtype=np.float64) / wfn.nkpts)
         else:
             kw_arr = np.asarray(k_weights, dtype=np.float64)
-        kw_j = jnp.asarray(kw_arr, dtype=jnp.float32)
+        kw_j = jnp.asarray(kw_arr, dtype=jnp.float64)
 
     if verbose:
         if is_2d_mesh:
@@ -946,8 +948,8 @@ def build_gram_q0_via_loadwfns(
         bispinor=bispinor,
     )
 
-    # Uniform k-weights for full-BZ unfold.
-    kw = jnp.ones((sym.nk_tot,), dtype=jnp.float32) / float(sym.nk_tot)
+    # Uniform k-weights for full-BZ unfold (fp64 to match load_wfns precision).
+    kw = jnp.ones((sym.nk_tot,), dtype=jnp.float64) / float(sym.nk_tot)
 
     # Full-BZ fractional k-vectors, as load_wfns expects.
     kgrid = np.asarray(wfn.kgrid, dtype=np.float64)

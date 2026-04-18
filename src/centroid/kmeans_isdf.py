@@ -777,19 +777,24 @@ def weighted_kmeans_jax(
           f"(mesh={'|'.join(str(a) + '=' + str(mesh.shape[a]) for a in (mesh_axis if isinstance(mesh_axis, tuple) else (mesh_axis,))) if mesh is not None else 'single-device'})...")
 
     # Precompute metric tensor: G = avec^T @ avec. Distances inherit avec's units.
-    metric_tensor = jnp.array(avec.T @ avec, dtype=jnp.float32)
+    # fp64 throughout: kmeans positions are < 1 in magnitude (fractional
+    # coords) so fp32 has only ~7 digits of precision near the cell origin —
+    # adequate for clustering a 24³ grid but limits convergence tolerance and
+    # propagates into downstream pivoted-Cholesky if any kmeans output feeds
+    # the wfn-loading layer (which is fp64 throughout). Standardize on fp64.
+    metric_tensor = jnp.array(avec.T @ avec, dtype=jnp.float64)
     tolerance_sq = tolerance ** 2  # Compare squared distances for efficiency.
 
-    # Build grid of fractional positions (float32 to match centroids dtype).
+    # Build grid of fractional positions (fp64 to match metric_tensor).
     grid_x, grid_y, grid_z = rho_jax.shape
     X, Y, Z = jnp.meshgrid(
-        jnp.linspace(0, 1, grid_x, endpoint=False, dtype=jnp.float32),
-        jnp.linspace(0, 1, grid_y, endpoint=False, dtype=jnp.float32),
-        jnp.linspace(0, 1, grid_z, endpoint=False, dtype=jnp.float32),
+        jnp.linspace(0, 1, grid_x, endpoint=False, dtype=jnp.float64),
+        jnp.linspace(0, 1, grid_y, endpoint=False, dtype=jnp.float64),
+        jnp.linspace(0, 1, grid_z, endpoint=False, dtype=jnp.float64),
         indexing="ij",
     )
     positions = jnp.stack((X, Y, Z), axis=-1).reshape(-1, 3)
-    rho_flat = rho_jax.reshape(-1).astype(jnp.float32)
+    rho_flat = rho_jax.reshape(-1).astype(jnp.float64)
     n_points = positions.shape[0]
 
     print(f"Grid size: {grid_x}x{grid_y}x{grid_z} = {n_points} points")
@@ -865,8 +870,8 @@ def weighted_kmeans_jax(
     # returned an empty placeholder here; flip ``_TRACK_HISTORY = True`` to
     # turn it back on when debugging.
     _TRACK_HISTORY = False
-    history = (np.zeros((N_c, max_steps), dtype=np.float32)
-               if _TRACK_HISTORY else np.zeros((N_c, 0), dtype=np.float32))
+    history = (np.zeros((N_c, max_steps), dtype=np.float64)
+               if _TRACK_HISTORY else np.zeros((N_c, 0), dtype=np.float64))
     steps_taken = max_steps
 
     if mesh is not None:
@@ -1145,8 +1150,8 @@ def main():
     print(f"Lattice lengths: {lattice_lengths} Å "
           f"(spacing: {lattice_lengths / np.array(charge_density.shape)} Å)")
 
-    rho_jax = jnp.asarray(charge_density, dtype=jnp.float32)
-    avec_jax = jnp.asarray(avec_ang, dtype=jnp.float32)
+    rho_jax = jnp.asarray(charge_density, dtype=jnp.float64)
+    avec_jax = jnp.asarray(avec_ang, dtype=jnp.float64)
 
     # Sharding: build a 2-D mesh ('x','y') whenever possible. This is the
     # same mesh shape used by the gw_jax ISDF pipeline, which lets the
