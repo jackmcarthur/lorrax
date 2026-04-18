@@ -97,9 +97,13 @@ class _FfiBackend:
         # close() — concurrent h5py + MPI-IO on the same file would
         # corrupt HDF5 metadata.
         self._deferred_attrs: list[tuple[str, object]] = []
-        # Pending write tokens — write_slab returns immediately and
-        # parks the XLA future here; close() drains the list before
-        # releasing the MPI-IO handle.
+        # Hook for future async writes: the day H5Dwrite becomes
+        # non-blocking (libh5async VOL or XLA async FFI trait), each
+        # write_slab call will park its XLA future here and close()
+        # will drain the list before releasing the MPI-IO handle.
+        # Today every entry is already materialised by the time it
+        # lands in the list, so the drain is a no-op — see the
+        # "Async-write status" comment in write_slab() below.
         self._pending_tokens: list = []
 
     # ------------------------------------------------------------------
@@ -199,13 +203,42 @@ class _FfiBackend:
                 axis_flat=axis_flat,
             )
 
-        # Non-blocking dispatch: XLA queues the FFI call and returns a
-        # future immediately.  Main thread moves on to build the next
-        # chunk while H5Dwrite blocks a background executor thread;
-        # the CUDA stream is unaffected (see ffi/phdf5/cpp/write_ffi.cc
-        # for the stream-wait-event handshake).  close() drains all
-        # pending futures via block_until_ready before releasing the
-        # MPI-IO file handle.
+        # ───── Async-write status (measured 2026-04-18 w/ MoS2 3x3, 4 GPU) ─────
+        # Empirically, ``shard_map(_per_rank)(A)`` — with or without an
+        # outer ``jax.jit`` wrapper, and with or without caching the
+        # dispatcher — blocks the main Python thread for the full
+        # H5Dwrite duration (~800ms for a 270-MB-per-rank chunk at
+        # MoS2 3x3 scale).  The per-chunk ``zeta_fit.chunk.h5_write``
+        # timing section therefore reports ~= N_chunks × H5Dwrite time,
+        # not a handful of milliseconds as the earlier docstring
+        # claimed.
+        #
+        # Root cause (hypothesis, not yet confirmed): XLA's host
+        # executor serializes FFI calls on a single thread, and the
+        # H5Dwrite FFI handler blocks that thread for the whole MPI-IO
+        # collective.  Subsequent dispatches back-pressure onto the
+        # main Python thread.  Caching the jit helps with compile
+        # overhead (~50ms saved on repeat shapes) but not with dispatch
+        # blocking.
+        #
+        # To actually get async writes, we'd need ONE of:
+        #   (a) an async-vol-enabled HDF5 + H5Dwrite_async under the
+        #       FFI handler (libh5async — a dep we deliberately skipped)
+        #   (b) dispatching the FFI call from a Python worker thread
+        #       (risky: all ranks must enter the MPI-IO collective
+        #       from the SAME logical point, and bg threads on only
+        #       some ranks deadlock — see compute_vcoul.py V_q-read
+        #       bisect, same failure mode)
+        #   (c) XLA FFI "async" trait support (not exposed in the
+        #       stable ``jax.ffi.register_ffi_target`` API as of JAX
+        #       0.6; available via ``XLA_FFI_HANDLER_TRAITS_COMMAND_
+        #       BUFFER_COMPATIBLE`` at the C++ level but requires
+        #       rewiring ``write_ffi.cc``'s handler to return an
+        #       ``XLA_FFI_Future`` instead of blocking)
+        #
+        # _pending_tokens + close()-time drain is still correct (it's
+        # a no-op when dispatch is already synchronous); keep it so
+        # the hook is in place the day (a) or (c) lands.
         tok = shard_map(
             _per_rank, mesh=self.mesh,
             in_specs=in_specs, out_specs=P(),
