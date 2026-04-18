@@ -232,6 +232,12 @@ def pivoted_cholesky_select(
         rank: int32 scalar — how many pivots were actually taken.
         d_final: (M,) real — residual Schur-complement diagonal at end;
             +inf sentinels (inactive rows) are returned as 0.
+        d_taken: (k_keep,) real — pivot value (residual diagonal) at the
+            moment each pivot was accepted, in pivot order. Entries past
+            ``rank`` are 0. Useful for diagnosing whether the chosen
+            ``k_keep`` is too small (last entry still ≫ tol_rel × d0max
+            ⇒ stopping early would have been premature) or too large
+            (last entries near zero ⇒ already extracting noise).
     """
     M = G.shape[0]
     real_dtype = G.real.dtype
@@ -247,11 +253,12 @@ def pivoted_cholesky_select(
     active0 = jnp.ones((M,), dtype=bool)
     done0 = jnp.array(False)
     rank0 = jnp.array(0, dtype=jnp.int32)
+    d_taken0 = jnp.zeros((k_keep,), dtype=real_dtype)
 
     col_ids = jnp.arange(k_keep)
 
     def body_fun(j, carry):
-        d, L, piv, active, done, rank = carry
+        d, L, piv, active, done, rank, d_taken = carry
 
         # Step 1: pick the pivot = row with the largest residual diagonal
         # among the still-active rows.
@@ -282,6 +289,10 @@ def pivoted_cholesky_select(
         oldcol = L[:, j]
         L = L.at[:, j].set(jnp.where(take, newcol, oldcol))
         piv = piv.at[j].set(jnp.where(take, p.astype(jnp.int32), piv[j]))
+        # Record the pivot value as picked (or leave the slot at 0 if no-op).
+        d_taken = d_taken.at[j].set(
+            jnp.where(take, pivot_val.astype(real_dtype), d_taken[j])
+        )
 
         # Step 4: Schur-complement update of the residual diagonal.
         #   d_new[i] = d[i] - |L[i, j]|²
@@ -297,15 +308,15 @@ def pivoted_cholesky_select(
         done = done | (~take)
         rank = rank + take.astype(jnp.int32)
 
-        return d, L, piv, active, done, rank
+        return d, L, piv, active, done, rank, d_taken
 
-    d, L, piv, active, done, rank = lax.fori_loop(
-        0, k_keep, body_fun, (d0, L0, piv0, active0, done0, rank0)
+    d, L, piv, active, done, rank, d_taken = lax.fori_loop(
+        0, k_keep, body_fun, (d0, L0, piv0, active0, done0, rank0, d_taken0)
     )
     del active, done
 
     d_final = jnp.where(jnp.isfinite(d), d, 0.0)
-    return piv, L, rank, d_final
+    return piv, L, rank, d_final, d_taken
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -324,6 +335,7 @@ def prune_candidates_by_pivoted_cholesky(
     k_weights: np.ndarray | None = None,
     tol_rel: float = 1e-10,
     verbose: bool = True,
+    mesh: Mesh | None = None,
 ) -> tuple[np.ndarray, int, jnp.ndarray, jnp.ndarray]:
     """Full q=0 pruning pipeline: gather → Gram → pivoted Cholesky → pivots.
 
@@ -387,7 +399,25 @@ def prune_candidates_by_pivoted_cholesky(
     phi_flat = _fold_spin_into_band(phi)
     psi_flat = _fold_spin_into_band(psi)
 
-    G = build_candidate_gram_q0(phi_flat, psi_flat, k_weights=kw_j)
+    # Sharded path: row-shard G and L across mesh 'x'. Requires M divisible
+    # by n_dev — gate and fall back to single-device if the condition isn't
+    # met (keeps the CLI behaviour predictable).
+    if mesh is not None:
+        n_dev = mesh.shape['x']
+        if M % n_dev != 0:
+            if verbose:
+                print(f"[pivoted_cholesky] M={M} not divisible by mesh 'x' "
+                      f"size {n_dev}; falling back to single-device.")
+            mesh = None
+        elif verbose:
+            print(f"[pivoted_cholesky] sharded build+select on mesh 'x' "
+                  f"of size {n_dev}")
+
+    if mesh is not None:
+        gram_step = make_sharded_gram_q0(mesh, M, enforce_hermitian=True)
+        G = gram_step(phi_flat, psi_flat, kw_j)
+    else:
+        G = build_candidate_gram_q0(phi_flat, psi_flat, k_weights=kw_j)
     G.block_until_ready()
 
     if verbose:
@@ -395,18 +425,47 @@ def prune_candidates_by_pivoted_cholesky(
         print(f"[pivoted_cholesky] G built, shape={G.shape}, "
               f"diag range [{diag.min():.3e}, {diag.max():.3e}]")
 
-    piv, L, rank, d_final = pivoted_cholesky_select(
-        G, n_keep, tol_rel=tol_rel, tol_abs=0.0
-    )
+    if mesh is not None:
+        select_step = make_sharded_pivoted_cholesky_select(
+            mesh, M, n_keep, tol_rel=tol_rel, tol_abs=0.0,
+        )
+        piv, L, rank, d_final, d_taken = select_step(G)
+    else:
+        piv, L, rank, d_final, d_taken = pivoted_cholesky_select(
+            G, n_keep, tol_rel=tol_rel, tol_abs=0.0
+        )
     del L  # only useful if the caller needs the Cholesky factor
     rank = int(rank)
     piv_np = np.asarray(piv)
+    d_taken_np = np.asarray(d_taken)
 
     if verbose:
         d_np = np.asarray(d_final)
-        print(f"[pivoted_cholesky] rank={rank}/{n_keep}, "
-              f"residual diag at exit: max={d_np.max():.3e}, "
-              f"mean_inactive={d_np[d_np > 0].mean() if np.any(d_np > 0) else 0.0:.3e}")
+        leftover_max = float(d_np.max()) if d_np.size else 0.0
+        leftover_mean = float(d_np[d_np > 0].mean()) if np.any(d_np > 0) else 0.0
+        # Pivot-decay summary: first/last picked, and a couple of percentile
+        # checkpoints. The right diagnostic is whether the LAST picked pivot
+        # is much bigger than the biggest leftover (leftover_max). If yes,
+        # we cut at a meaningful drop. If no, k_keep was about right or too
+        # large.
+        first = float(d_taken_np[0]) if rank > 0 else 0.0
+        last = float(d_taken_np[rank - 1]) if rank > 0 else 0.0
+        mid = float(d_taken_np[rank // 2]) if rank > 0 else 0.0
+        print(f"[pivoted_cholesky] rank={rank}/{n_keep}")
+        print(f"[pivoted_cholesky] picked-pivot residuals: "
+              f"first={first:.3e}, mid={mid:.3e}, last={last:.3e}")
+        print(f"[pivoted_cholesky] leftover residuals: "
+              f"max={leftover_max:.3e}, mean(>0)={leftover_mean:.3e}")
+        if last > 0 and leftover_max > 0:
+            ratio = last / leftover_max
+            if ratio < 2:
+                print(f"  ⚠ last picked / biggest leftover = {ratio:.2f}: "
+                      f"k_keep cuts in a region where picked and leftover "
+                      f"residuals are similar — try increasing k_keep or "
+                      f"shrinking the candidate pool.")
+            elif ratio > 100:
+                print(f"  ℹ last picked / biggest leftover = {ratio:.1f}×: "
+                      f"clear cutoff; could likely lower k_keep.")
         if rank < n_keep:
             print(f"  ⚠ rank-deficient ({rank} < {n_keep}): either the "
                   f"candidate pool is too small, or tol_rel={tol_rel} cut "
@@ -415,7 +474,7 @@ def prune_candidates_by_pivoted_cholesky(
     # piv may contain -1 past rank; slice.
     keep_piv = piv_np[:rank]
     keep_idx = np.asarray(cand_idx)[keep_piv]
-    return keep_idx, rank, G, d_final
+    return keep_idx, rank, G, d_final, d_taken_np
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -538,5 +597,197 @@ def make_sharded_gram_q0(
                 G_full, NamedSharding(mesh, row_shard),
             )
         return G_sharded
+
+    return step
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Multi-device — sharded pivoted-Cholesky select
+# ═══════════════════════════════════════════════════════════════════════
+# Companion to ``make_sharded_gram_q0``. Consumes a row-sharded
+# G ∈ ℂ^(M×M) on a 1-D mesh 'x' (sharded on axis 0) and runs the same
+# greedy pivoted-Cholesky select as the single-device version. Sharded
+# along M: each device owns (M_slab, M) of G and (M_slab, k_keep) of L.
+#
+# Collectives per iteration (one per Lloyd-like step):
+#
+#   pmax(local_pv, 'x')       — 1 scalar: finds the global pivot value
+#   pmax(-winner_p, 'x')      — 1 int32:  breaks ties by lowest device idx
+#   psum(local_Lp, 'x')       — (k_keep,) array: broadcasts L[p, :] from
+#                                its owning shard to every device
+#
+# Total comm per iter: O(k_keep). Total over k_keep iters: O(k_keep²).
+# Matmul/Schur update are local — each device does L_slab @ (scalar)
+# + elementwise ops on (M_slab,)- and (M_slab, k_keep)-shaped arrays.
+#
+# Column access `G[:, global_p]`: because G is ROW-sharded, each device's
+# local slab already contains its portion of column p — no collective.
+# This is why row-sharding is preferred over column-sharding for this
+# algorithm.
+
+
+def make_sharded_pivoted_cholesky_select(
+    mesh: Mesh,
+    M: int,
+    k_keep: int,
+    *,
+    tol_rel: float = 1e-10,
+    tol_abs: float = 0.0,
+):
+    """Build a jitted sharded pivoted-Cholesky select closure over ``mesh``.
+
+    The returned function signature matches ``pivoted_cholesky_select``
+    up to sharding: it takes a row-sharded ``G`` and returns piv (replicated),
+    L (row-sharded same as G), rank (replicated), d_final (row-sharded),
+    d_taken (replicated).
+
+    Args:
+        mesh: 1-axis device mesh named 'x'. ``M`` must be divisible by
+            ``mesh.shape['x']``.
+        M: total candidate count. Static.
+        k_keep: target pivot count. Static.
+        tol_rel, tol_abs: stopping tolerances; see
+            ``pivoted_cholesky_select`` for semantics. Static.
+
+    Returns:
+        A callable ``(G_row_sharded,) -> (piv, L, rank, d_final, d_taken)``.
+    """
+    if 'x' not in mesh.axis_names:
+        raise ValueError(f"mesh must have an 'x' axis, got {mesh.axis_names}")
+    n_dev = mesh.shape['x']
+    if M % n_dev != 0:
+        raise ValueError(f"M={M} must be divisible by mesh 'x' size {n_dev}")
+    M_slab = M // n_dev
+
+    row_shard = PartitionSpec('x', None)
+    row_shard_1d = PartitionSpec('x')
+    rep = PartitionSpec()
+
+    in_specs = (row_shard,)
+    out_specs = (rep, row_shard, rep, row_shard_1d, rep)
+
+    @partial(jax.jit, static_argnames=())
+    def step(G):
+        def body_local(G_slab):
+            # G_slab: (M_slab, M) on each device.
+            real_dtype = G_slab.real.dtype
+            eps = jnp.finfo(real_dtype).eps
+            minus_inf = jnp.array(-jnp.inf, dtype=real_dtype)
+            my_idx = lax.axis_index('x')
+
+            # Initial local diagonal: each device owns rows
+            # [my_idx*M_slab, (my_idx+1)*M_slab), and the diagonal of G
+            # falls at column index = row index. So
+            #   G_slab[i, my_idx*M_slab + i]  for  i = 0..M_slab-1
+            # extracts the local diagonal.
+            my_offset = my_idx * M_slab
+            col_ids_local = my_offset + jnp.arange(M_slab)
+            local_diag = jnp.real(
+                G_slab[jnp.arange(M_slab), col_ids_local]
+            )
+            local_diag = jnp.maximum(local_diag, 0.0)
+
+            # d0max is a global statistic — reduce across shards.
+            d0max = lax.pmax(jnp.max(local_diag), axis_name='x')
+
+            L_slab = jnp.zeros((M_slab, k_keep), dtype=G_slab.dtype)
+            piv = -jnp.ones((k_keep,), dtype=jnp.int32)
+            d_slab = local_diag
+            active_slab = jnp.ones((M_slab,), dtype=bool)
+            done = jnp.array(False)
+            rank = jnp.array(0, dtype=jnp.int32)
+            d_taken = jnp.zeros((k_keep,), dtype=real_dtype)
+            col_ids_k = jnp.arange(k_keep)
+
+            def body(j, carry):
+                d, L, piv, active, done, rank, d_taken = carry
+
+                # Step 1: pick the global pivot.
+                # Per-device argmax over active rows.
+                masked_d = jnp.where(active, d, minus_inf)
+                local_p_idx = jnp.argmax(masked_d)                   # [0, M_slab)
+                local_pv = masked_d[local_p_idx]                     # scalar
+                local_global_p = (my_idx * M_slab + local_p_idx).astype(jnp.int32)
+
+                # Reduce to find the global pivot value.
+                global_pv = lax.pmax(local_pv, 'x')
+                # Tie-break: among devices that match the global max, take
+                # the one with the smallest global_p. Non-winners contribute
+                # a sentinel (INT_MAX) so the min is over just the winners.
+                i_am_winner = local_pv >= global_pv
+                winner_p = jnp.where(
+                    i_am_winner, local_global_p, jnp.int32(2**30)
+                )
+                global_p = -lax.pmax(-winner_p, 'x')                 # min over winners
+                pivot_val = global_pv
+
+                take = (~done) & (pivot_val > tol_abs) & (pivot_val > tol_rel * d0max)
+
+                # Step 2: compute the new Cholesky column, L[:, j].
+                # gcol: column p of G. Each device's local rows of that
+                # column are already in G_slab — column access from a
+                # row-sharded matrix is collective-free.
+                gcol_slab = G_slab[:, global_p]                       # (M_slab,)
+
+                # L[p, :]: broadcast from the owning shard via psum-with-mask.
+                pivot_owner_dev = global_p // M_slab
+                my_has_p = (pivot_owner_dev == my_idx)
+                local_p_rel = global_p - my_idx * M_slab
+                safe_idx = jnp.clip(local_p_rel, 0, M_slab - 1)
+                local_Lp = L[safe_idx, :]                             # (k_keep,) — may be wrong on non-owners
+                local_Lp = jnp.where(
+                    my_has_p, local_Lp, jnp.zeros_like(local_Lp)
+                )
+                L_p = lax.psum(local_Lp, 'x')                         # (k_keep,) replicated
+
+                prev_mask = (col_ids_k < j).astype(G_slab.dtype)
+                corr_slab = L @ (jnp.conj(L_p) * prev_mask)           # (M_slab,)
+
+                denom = jnp.where(take, jnp.sqrt(jnp.maximum(pivot_val, eps)), 1.0)
+                newcol = (gcol_slab - corr_slab) / denom              # (M_slab,)
+                newcol = jnp.where(take, newcol, jnp.zeros_like(newcol))
+                # Numerical cleanup of the pivot entry (only on owner).
+                fix_row_mask = my_has_p & (jnp.arange(M_slab) == local_p_rel)
+                newcol = jnp.where(
+                    fix_row_mask & take, denom.astype(G_slab.dtype), newcol
+                )
+
+                # Step 3: write the new column locally. Piv and d_taken
+                # are replicated — every device writes the same value.
+                oldcol = L[:, j]
+                L = L.at[:, j].set(jnp.where(take, newcol, oldcol))
+                piv = piv.at[j].set(
+                    jnp.where(take, global_p, piv[j])
+                )
+                d_taken = d_taken.at[j].set(
+                    jnp.where(take, pivot_val, d_taken[j])
+                )
+
+                # Step 4: Schur-complement update of local d.
+                d_new = jnp.maximum(d - jnp.abs(newcol) ** 2, 0.0)
+                pivot_row_mask = my_has_p & (jnp.arange(M_slab) == local_p_rel)
+                active = active & ~(take & pivot_row_mask)
+                d = jnp.where(
+                    take & pivot_row_mask, minus_inf,
+                    jnp.where(take, d_new, d)
+                )
+
+                done = done | (~take)
+                rank = rank + take.astype(jnp.int32)
+
+                return d, L, piv, active, done, rank, d_taken
+
+            d_final, L_out, piv_out, active_out, done_out, rank_out, d_taken_out = \
+                lax.fori_loop(0, k_keep, body,
+                              (d_slab, L_slab, piv, active_slab, done, rank, d_taken))
+            del active_out, done_out
+
+            d_final = jnp.where(jnp.isfinite(d_final), d_final, 0.0)
+            return piv_out, L_out, rank_out, d_final, d_taken_out
+
+        return shard_map(
+            body_local, mesh=mesh, in_specs=in_specs, out_specs=out_specs,
+            check_rep=False,
+        )(G)
 
     return step

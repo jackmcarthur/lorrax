@@ -101,7 +101,7 @@ def test_pivoted_cholesky_reconstructs_G():
     G = (A @ A.conj().T + 0.1 * np.eye(M)).astype(np.complex64)
     G = 0.5 * (G + G.conj().T)
 
-    piv, L, rank, d_final = pivoted_cholesky_select(jnp.asarray(G), k_keep=M, tol_rel=0.0)
+    piv, L, rank, d_final, d_taken = pivoted_cholesky_select(jnp.asarray(G), k_keep=M, tol_rel=0.0)
     L = np.asarray(L)
     rank = int(rank)
     assert rank == M, f"expected full rank {M}, got {rank}"
@@ -137,7 +137,7 @@ def test_pivoted_cholesky_rank_deficient():
     G = (A @ A.conj().T).astype(np.complex64)
     G = 0.5 * (G + G.conj().T)
 
-    piv, L, rank, d_final = pivoted_cholesky_select(
+    piv, L, rank, d_final, d_taken = pivoted_cholesky_select(
         jnp.asarray(G), k_keep=M, tol_rel=1e-6
     )
     rank = int(rank)
@@ -173,7 +173,7 @@ def test_pivoted_cholesky_residual_diagonal_nonincreasing():
 
     d_prev = np.maximum(np.diag(G).real, 0.0)
     for k_keep in range(1, 9):
-        _, _, _, d_final = pivoted_cholesky_select(G_j, k_keep=k_keep, tol_rel=0.0)
+        _, _, _, d_final, _ = pivoted_cholesky_select(G_j, k_keep=k_keep, tol_rel=0.0)
         d = np.asarray(d_final)
         # Allow a tiny positive slop for fp32 noise.
         diff = d - d_prev
@@ -201,7 +201,7 @@ def test_end_to_end_via_wrapper_pipeline_shapes():
     assert G.shape == (M, M)
 
     n_keep = 32
-    piv, L, rank, d_final = pivoted_cholesky_select(G, k_keep=n_keep, tol_rel=1e-10)
+    piv, L, rank, d_final, d_taken = pivoted_cholesky_select(G, k_keep=n_keep, tol_rel=1e-10)
     assert piv.shape == (n_keep,)
     assert L.shape == (M, n_keep)
     assert d_final.shape == (M,)
@@ -217,7 +217,7 @@ def test_end_to_end_via_wrapper_pipeline_shapes():
 # Sharded Gram build (WIP: select still single-device)
 # ═══════════════════════════════════════════════════════════════════════
 
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from src.centroid.pivoted_cholesky import make_sharded_gram_q0
 
 
@@ -256,4 +256,131 @@ def test_sharded_gram_matches_single_device():
     np.testing.assert_allclose(
         G_out, G_ref, atol=3e-3 * scale, rtol=3e-3,
         err_msg="sharded Gram diverges from single-device beyond TF32 tolerance",
+    )
+
+
+def test_d_taken_trace_monotone_and_matches_classical():
+    """d_taken: pivot value at the moment each pivot was accepted.
+
+    Two invariants:
+      (1) d_taken is non-increasing across pivot order — the greedy
+          algorithm picks the largest residual diagonal each time, and
+          subsequent pivots draw from the decreasing Schur complement.
+      (2) d_taken[0] == max(diag(G)) within fp tolerance — the first
+          pivot is, by definition, the largest diagonal entry of G.
+    """
+    rng = np.random.default_rng(123)
+    M = 32
+    # Rank-deficient so the decay is pronounced.
+    A = (rng.standard_normal((M, 8)) + 1j * rng.standard_normal((M, 8))).astype(np.complex64)
+    G = (A @ A.conj().T + 1e-4 * np.eye(M)).astype(np.complex64)
+    G = 0.5 * (G + G.conj().T)
+
+    piv, L, rank, d_final, d_taken = pivoted_cholesky_select(
+        jnp.asarray(G), k_keep=M, tol_rel=0.0
+    )
+    rank = int(rank)
+    d_taken_np = np.asarray(d_taken)
+
+    # Invariant 1: non-increasing over accepted pivots.
+    taken_accepted = d_taken_np[:rank]
+    diffs = np.diff(taken_accepted)
+    assert np.max(diffs) <= 1e-5 * taken_accepted[0], (
+        f"d_taken increased between pivots; max positive diff = "
+        f"{np.max(diffs):.3e}, first pivot = {taken_accepted[0]:.3e}"
+    )
+
+    # Invariant 2: d_taken[0] == max(diag(G)).
+    max_diag = float(np.max(np.real(np.diag(G))))
+    assert abs(float(d_taken_np[0]) - max_diag) / max_diag < 1e-5, (
+        f"first d_taken = {float(d_taken_np[0]):.3e} vs max diag = "
+        f"{max_diag:.3e}"
+    )
+
+    # After rank, d_taken entries are 0 (masked no-op iterations).
+    if rank < M:
+        np.testing.assert_array_equal(
+            d_taken_np[rank:], np.zeros(M - rank, dtype=d_taken_np.dtype),
+            err_msg="d_taken entries past rank should be exactly 0"
+        )
+
+
+@pytest.mark.skipif(len(jax.devices()) < 2,
+                    reason="Sharded select requires ≥2 JAX devices.")
+def test_sharded_select_matches_single_device():
+    """Sharded pivoted_cholesky_select == single-device, piv-order + residuals.
+
+    Exact pivot-by-pivot agreement isn't guaranteed across floating-point
+    reduction orders (TF32 matmul inside the correction step, plus
+    psum/pmax collectives can reorder additions), so we check:
+
+      * the pivot sets are equal as sets,
+      * rank is identical,
+      * picked-pivot residuals (d_taken) agree to TF32 tolerance,
+      * leftover residuals (d_final, where > 0) agree to TF32 tolerance.
+
+    Note that gathering the sharded outputs into numpy pulls across
+    devices automatically — JAX's global array is a view over per-shard
+    buffers.
+    """
+    from src.centroid.pivoted_cholesky import (
+        make_sharded_pivoted_cholesky_select,
+    )
+    devices = jax.devices()
+    n_dev = len(devices)
+
+    # Pick M divisible by n_dev, small enough to keep the test cheap.
+    rng = np.random.default_rng(21)
+    M = 16 * n_dev   # e.g. 64 on 4 devices
+    k_keep = M // 2
+    # Build a well-conditioned Hermitian PSD matrix.
+    A = (rng.standard_normal((M, M)) + 1j * rng.standard_normal((M, M))).astype(np.complex64)
+    G = (A @ A.conj().T + 0.05 * np.eye(M)).astype(np.complex64)
+    G = 0.5 * (G + G.conj().T)
+    G_j = jnp.asarray(G)
+
+    # Single-device reference.
+    piv_ref, L_ref, rank_ref, d_ref, d_taken_ref = pivoted_cholesky_select(
+        G_j, k_keep=k_keep, tol_rel=0.0
+    )
+
+    # Sharded path.
+    mesh = Mesh(np.asarray(devices), ('x',))
+    sharded_step = make_sharded_pivoted_cholesky_select(
+        mesh, M, k_keep, tol_rel=0.0
+    )
+    G_sharded = jax.device_put(
+        G_j, NamedSharding(mesh, PartitionSpec('x', None)),
+    )
+    piv_s, L_s, rank_s, d_s, d_taken_s = sharded_step(G_sharded)
+
+    piv_ref_np = np.asarray(piv_ref)
+    piv_s_np = np.asarray(piv_s)
+    rank_ref = int(rank_ref)
+    rank_s = int(rank_s)
+
+    assert rank_s == rank_ref, f"rank differs: sharded {rank_s} vs ref {rank_ref}"
+
+    # Same set of accepted pivots (order may differ under TF32 / tie-break).
+    assert set(piv_ref_np[:rank_ref].tolist()) == set(piv_s_np[:rank_s].tolist()), (
+        f"pivot SETS differ\n  ref: {sorted(piv_ref_np[:rank_ref].tolist())}\n"
+        f"  shard: {sorted(piv_s_np[:rank_s].tolist())}"
+    )
+
+    # d_taken agrees up to TF32 tolerance. Since pivot order may differ,
+    # compare sorted.
+    scale = max(float(np.max(np.asarray(d_taken_ref))), 1e-12)
+    np.testing.assert_allclose(
+        np.sort(np.asarray(d_taken_s)[:rank_s])[::-1],
+        np.sort(np.asarray(d_taken_ref)[:rank_ref])[::-1],
+        atol=5e-3 * scale, rtol=5e-3,
+        err_msg="d_taken (pivot residuals) diverge beyond TF32 tolerance",
+    )
+
+    # Leftover residuals agree on position.
+    d_s_np = np.asarray(d_s)
+    d_ref_np = np.asarray(d_ref)
+    np.testing.assert_allclose(
+        d_s_np, d_ref_np, atol=5e-3 * scale, rtol=5e-3,
+        err_msg="leftover d_final diverges beyond TF32 tolerance",
     )

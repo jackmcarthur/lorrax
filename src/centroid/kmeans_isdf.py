@@ -1160,12 +1160,15 @@ def main():
         from .pivoted_cholesky import prune_candidates_by_pivoted_cholesky
         print(f"\nPivoted-Cholesky pruning: {n_unique} candidates → "
               f"{N_c} final centroids...")
-        keep_idx, rank, _G, _d_final = prune_candidates_by_pivoted_cholesky(
+        # Reuse the same mesh (if any) built for the kmeans Lloyd step —
+        # --shard/--force-shard apply to the Gram build + select too.
+        keep_idx, rank, _G, _d_final, _d_taken = prune_candidates_by_pivoted_cholesky(
             wfn, sym, centroid_indices,
             n_keep=N_c,
             n_val=args.prune_n_val,
             n_cond=args.prune_n_cond,
             tol_rel=args.prune_tol,
+            mesh=mesh if args.force_shard else None,
         )
         centroid_indices = np.asarray(keep_idx, dtype=np.int64)
         fft_grid = np.asarray(wfn.fft_grid)
