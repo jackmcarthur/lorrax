@@ -959,7 +959,7 @@ class _BufferedGpuAccumulator(_SigmaAccumulator):
 #          is (m_chunk, n_full) before RS rather than (m_full, n_full).
 #          Default chunk = 1 output tile (m_chunk = m/p).
 #      (3) Stage many τ on GPU before flush in the FFI-backed variant
-#          (_ReduceScatterFfiAccumulator), using SlabIO.write_slab for the
+#          (_CollectiveFlushSlabIoAccumulator), using SlabIO.write_slab for the
 #          collective parallel-HDF5 flush at window boundaries.
 # ---------------------------------------------------------------------------
 
@@ -1039,7 +1039,7 @@ class _StreamedH5Accumulator(_SigmaAccumulator):
     this class is agnostic to the storage (rank-0 h5py, SlabIO, …).
 
     Note on the FFI flush path (future work, comment-only here): a third
-    accumulator — _ReduceScatterFfiAccumulator — would keep the running Σ
+    accumulator — _CollectiveFlushSlabIoAccumulator — would keep the running Σ
     sharded (m_X, n_Y) on GPU like _ReduceScatterGpuAccumulator, stack many
     τ contributions per window without flushing, and at end_window() issue
     a single collective parallel-HDF5 write via SlabIO.write_slab against
