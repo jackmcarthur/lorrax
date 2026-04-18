@@ -358,6 +358,20 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	q_batch = 1
 	if mu_chunk >= meta.n_rmu and meta.nk_tot > 1:
 		q_batch = max(1, min(4, meta.nk_tot, int(m_budget // max(1.0, 2.0 * 16 * meta.n_rmu * meta.n_rtot))))
+
+	# get_device_memory_info reports this rank's free HBM, which can
+	# differ across ranks (pool fragmentation, non-symmetric allocations
+	# before this point) → mu_chunk + q_batch can diverge across ranks.
+	# compute_all_V_q_from_zeta_h5 then branches on (n_chunks == 1) at
+	# line ~884; divergent branches across ranks deadlock on the first
+	# collective inside one branch (observed 2026-04-18 w/ FFI read).
+	# Fix: broadcast rank 0's numbers to every rank so they agree.
+	if jax.process_count() > 1:
+		_mq = jnp.asarray([int(mu_chunk), int(q_batch)], dtype=jnp.int64)
+		_mq = jax.experimental.multihost_utils.broadcast_one_to_all(_mq)
+		mu_chunk = int(jax.device_get(_mq)[0])
+		q_batch = int(jax.device_get(_mq)[1])
+
 	print_fn(f"    V_q budget:    {budget_gb:.2f} GB")
 	print_fn(f"    V_q mu chunks: {mu_chunk}")
 	if q_batch > 1:
