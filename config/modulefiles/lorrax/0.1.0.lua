@@ -25,6 +25,16 @@ Examples:
   LORRAX_NGPU=1 lxrun python3 -u -m gw.gw_jax -i ...   # 1-GPU GW
   lxpre cohsex.in 640                                   # all preprocessing
 
+FFI staged deps (cuSOLVERMp / parallel HDF5) are bind-mounted into the
+container automatically.  Host paths (override before `module load` to
+change):
+    LORRAX_FFI_NVHPC_DIR=/pscratch/sd/$U0/$U/lorrax_nvhpc    → /lorrax_nvhpc
+    LORRAX_FFI_PHDF5_DIR=/pscratch/sd/$U0/$U/lorrax_phdf5_openmpi/stage
+                                                             → /lorrax_phdf5
+To exercise the FFI path (use_ffi_io=true, cusolvermp eigh, …), enable
+PMIx via `LORRAX_MPI_TYPE=pmix` (default: no --mpi flag on srun):
+    LORRAX_MPI_TYPE=pmix LORRAX_NGPU=4 lxrun python3 -u -m common.phdf5_write_test
+
 NOTE: Always use lxrun to run LORRAX code on Perlmutter. Do NOT use bare
 "python" or "python3" — the module configures a Shifter container, not the
 host Python. For local development without Shifter, use "uv run" instead.

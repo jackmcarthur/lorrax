@@ -71,7 +71,51 @@ sbatch $LORRAX_ROOT/config/perlmutter/run_gw.slurm
 | `lxpre <input> <N>` | Run all 3 preprocessing steps (single-GPU each) |
 
 **Exported variables** for scripting:
-`LORRAX_ROOT`, `LORRAX_SRC`, `LORRAX_SITE`, `LORRAX_IMAGE`, `LORRAX_SHIFTER`.
+`LORRAX_ROOT`, `LORRAX_SRC`, `LORRAX_SITE`, `LORRAX_IMAGE`, `LORRAX_SHIFTER`,
+`LORRAX_FFI_NVHPC_HOST`, `LORRAX_FFI_PHDF5_HOST`.
+
+### FFI staged-deps bind-mounts inside `lxrun`
+
+`shifter_base` bind-mounts the staged NVHPC (cuSOLVERMp, libcal) and
+parallel-HDF5 (MPI-IO, linked against the container's HPC-X OpenMPI)
+trees into the container at stable paths, and adds
+`LD_LIBRARY_PATH` so the loader finds them.  End users don't have to
+set anything for this — it happens automatically on `module load`.
+
+| Host path (override) | Container mount | Contents |
+|---|---|---|
+| `$LORRAX_FFI_NVHPC_DIR` *(default `/pscratch/sd/${U:0:1}/${U}/lorrax_nvhpc`)* | `/lorrax_nvhpc` | NVHPC 25.5 subset: `libcusolverMp.so.0`, `libcal`, cuSOLVERMp + NCCL headers |
+| `$LORRAX_FFI_PHDF5_DIR` *(default `/pscratch/sd/${U:0:1}/${U}/lorrax_phdf5_openmpi/stage`)* | `/lorrax_phdf5` | conda-forge HDF5 1.14 built against the container's HPC-X OpenMPI (libmpi.so.40) |
+
+Container-side `LD_LIBRARY_PATH` set to:
+```
+/lorrax_phdf5/lib : /lorrax_nvhpc/25.5_cuda12.9/math_libs/12.9/lib64 : /opt/hpcx/ompi/lib
+```
+
+**Staging**: run the one-time scripts under `src/ffi/`:
+```bash
+src/ffi/cusolvermp/scripts/stage_nvhpc.sh      # ~100 MB
+src/ffi/phdf5/scripts/stage_openmpi.sh         #  ~40 MB
+```
+
+**Running FFI workloads** (`use_ffi_io=true`, `cusolvermp` eigh, etc.) —
+opt in with `LORRAX_MPI_TYPE=pmix` so `srun` bootstraps PMIx for the
+container's OpenMPI:
+
+```bash
+LORRAX_MPI_TYPE=pmix LORRAX_NGPU=4 lxrun python3 -u -m common.phdf5_write_test
+LORRAX_MPI_TYPE=pmix LORRAX_NGPU=4 lxrun env CUSOLVERMP_FORCE_NCCL=1 \
+    XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async \
+    python3 -u -m common.cusolvermp_eigh_test --grid 2 2
+```
+
+`--mpi=pmix` is **off by default** because unconditionally enabling it
+was observed to hang some non-FFI workloads after the first NCCL
+collective.  Setting `LORRAX_MPI_TYPE=none` explicitly disables it.
+
+If you need a different staging path or a non-default container image,
+set `LORRAX_FFI_NVHPC_DIR` / `LORRAX_FFI_PHDF5_DIR` *before* loading
+the module (they're read at module-load time, not per-call).
 
 ## Multiple parallel checkouts (A/B/C agent sessions)
 
