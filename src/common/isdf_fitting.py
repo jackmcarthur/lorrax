@@ -1062,28 +1062,22 @@ def fit_zeta_chunked_to_h5(
                     _q_gather = _safe_q_gather
 
                 if use_ffi_io:
-                    # FFI path: zeta_chunk has shape (nq, n_rmu, chunk_r);
-                    # each rank writes its own hyperslab into
-                    # zeta_q[qx, qy, qz, :, r_start:r_end] directly from
-                    # the sharded JAX array.  We reshape the per-q slice
-                    # from (n_rmu, chunk_r) to (1, 1, 1, n_rmu, chunk_r)
-                    # so ndim matches the dataset; the trailing axes
-                    # carry the sharding and the singleton axes are
-                    # replicated (axis_count_per_dim[d] == 0).
-                    for _q0 in range(0, nq, _q_gather):
-                        _q1 = min(_q0 + _q_gather, nq)
-                        _slice = zeta_chunk[_q0:_q1]
-                        for i in range(_q1 - _q0):
-                            q_flat = _q0 + i
-                            qx = q_flat // (nqy * nqz)
-                            qy = (q_flat % (nqy * nqz)) // nqz
-                            qz = q_flat % nqz
-                            _one = _slice[i][None, None, None, :, :]
-                            zeta_io.write_slab(
-                                'zeta_q', _one,
-                                offset=(qx, qy, qz, 0, r_start),
-                                global_shape=(nqx, nqy, nqz, n_rmu, n_rtot))
-                        del _slice
+                    # FFI path: reshape zeta_chunk (nq, n_rmu, chunk_r) ->
+                    # (nqx, nqy, nqz, n_rmu, chunk_r) so we can write the
+                    # entire chunk in ONE collective hyperslab call at
+                    # offset (0, 0, 0, 0, r_start), instead of nq
+                    # separate per-q calls.  On a 4-GPU single-node Si
+                    # run this cuts 64 collective-MPI-IO calls per chunk
+                    # down to one and saves several seconds.  Sharding
+                    # propagates cleanly: the axis 0 split over a
+                    # replicated axis is a pure reshape (no shuffle).
+                    _reshaped = zeta_chunk.reshape(
+                        nqx, nqy, nqz, n_rmu, actual_n_rchunk)
+                    zeta_io.write_slab(
+                        'zeta_q', _reshaped,
+                        offset=(0, 0, 0, 0, r_start),
+                        global_shape=(nqx, nqy, nqz, n_rmu, n_rtot))
+                    del _reshaped
                 else:
                     # Allgather path: gather once per q-chunk on every rank,
                     # queue the per-q hyperslab writes on rank 0's background
