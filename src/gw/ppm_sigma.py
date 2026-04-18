@@ -582,8 +582,194 @@ def _build_three_sigma_windows(
 
 
 # ---------------------------------------------------------------------------
-#  Sigma convolution
+#  Sigma convolution — split into (a) host-side window construction and
+#  (b) device-side tau loop.  The two halves have no shared state beyond
+#  the window list itself, so they're easy to test independently and
+#  trivial to reuse when the tau integration changes.
 # ---------------------------------------------------------------------------
+
+def _build_windows_for_branch(
+    *,
+    omega_nonneg_ry: np.ndarray,
+    E_A: jax.Array,
+    base_mask_A: jax.Array,
+    Omega_q: jax.Array,
+    base_mask_B: jax.Array,
+    kernel_sign: int,
+    regularization_width_ry: float,
+    edge_factor: float,
+    target_error: float,
+    max_nodes: int,
+    crossing_eps_q: float,
+    crossing_max_nodes: int,
+    use_shipped_minimax_tables: bool,
+    log_tag: str,
+    print_fn,
+) -> list[_SigmaWindow]:
+    """Host-side window construction for a single branch.
+
+    Gathers E_A and base_mask_A to host, computes masked B-side stats, and
+    picks either a single-Laplace window (kernel_sign=-1 or small ω) or the
+    three-window crossing+stripe+slab decomposition (kernel_sign=+1 with
+    non-trivial ω range).  Prints a one-line summary per returned window.
+    """
+    if omega_nonneg_ry.size == 0:
+        return []
+
+    E_A_host = _to_host_np(E_A, dtype=np.float64, tiled=False)
+    base_A_host = _to_host_np(base_mask_A, dtype=bool, tiled=False)
+
+    _, mask_B_all_count, mask_B_all_min, mask_B_all_max = _masked_stats_device(
+        Omega_q, base_mask_B)
+
+    omega_max = float(np.max(omega_nonneg_ry))
+    if kernel_sign == +1 and omega_max > 1.0e-14:
+        xi = max(float(regularization_width_ry), 1.0e-12)
+        T = omega_max + float(edge_factor) * xi
+        _, mask_B_le_count, mask_B_le_min, mask_B_le_max = _masked_stats_device(
+            Omega_q, base_mask_B & (Omega_q <= T))
+        _, mask_B_gt_count, mask_B_gt_min, mask_B_gt_max = _masked_stats_device(
+            Omega_q, base_mask_B & (Omega_q > T))
+        windows = _build_three_sigma_windows(
+            E_A=E_A_host, base_mask_A=base_A_host,
+            mask_B_all_count=mask_B_all_count,
+            mask_B_le_count=mask_B_le_count,
+            mask_B_le_min=mask_B_le_min, mask_B_le_max=mask_B_le_max,
+            mask_B_gt_count=mask_B_gt_count,
+            mask_B_gt_min=mask_B_gt_min, mask_B_gt_max=mask_B_gt_max,
+            omega_nonneg_ry=omega_nonneg_ry,
+            regularization_width_ry=regularization_width_ry,
+            edge_factor=edge_factor,
+            target_error=target_error, max_nodes=max_nodes,
+            crossing_eps_q=crossing_eps_q,
+            crossing_max_nodes=crossing_max_nodes,
+            use_shipped_tables=bool(use_shipped_minimax_tables),
+        )
+    else:
+        windows = _build_single_sigma_window(
+            E_A=E_A_host, base_mask_A=base_A_host,
+            mask_B_count=mask_B_all_count,
+            mask_B_min=mask_B_all_min, mask_B_max=mask_B_all_max,
+            omega_nonneg_ry=omega_nonneg_ry,
+            kernel_sign=kernel_sign,
+            target_error=target_error, max_nodes=max_nodes,
+            use_shipped_tables=bool(use_shipped_minimax_tables),
+        )
+
+    for win in windows:
+        A_vals = E_A_host[win.mask_A]
+        kind = "crossing" if win.crossing_kind else "Laplace"
+        print_fn(
+            f"    {log_tag} window \"{win.name}\" ({kind}): "
+            f"{int(win.alpha.shape[0])} nodes, err<{target_error:.0e}, "
+            f"E_A=[{float(np.min(A_vals)):.4f}, {float(np.max(A_vals)):.4f}] Ry, "
+            f"project={win.project}"
+        )
+    return windows
+
+
+def _integrate_tau_windows_for_branch(
+    *,
+    windows: list[_SigmaWindow],
+    omega_vec: jax.Array,
+    omega_global_idx: np.ndarray,
+    E_A: jax.Array,
+    B_q: jax.Array,
+    Omega_q: jax.Array,
+    base_mask_B: jax.Array,
+    psi_coh_rmuT_X: jax.Array,
+    psi_coh_rmu_Y: jax.Array,
+    psi_proj_rmu_X: jax.Array,
+    psi_proj_rmuT_Y: jax.Array,
+    eye_nb: jax.Array,
+    tau_channel_step: Callable[..., jax.Array],
+    mesh_xy: Mesh,
+    omega_sign_flip: int,
+    scale: float,
+    stream_writer: Callable[[np.ndarray, jax.Array], None] | None,
+    omega_batch_size: int,
+    log_tag: str,
+    print_fn,
+) -> jax.Array | None:
+    """Run the per-tau kernel across ``windows`` and project onto ω.
+
+    If ``stream_writer`` is None: returns the (n_ω, nk, nb, nb) accumulator
+    on device.  Else: pushes each (tau_node × ω_batch) contribution through
+    ``stream_writer(idx, batch)`` and returns None.
+    """
+    from common.progress import LoopProgress
+
+    n_omega = int(omega_vec.shape[0])
+    nk_proj = int(psi_proj_rmu_X.shape[0])
+    nb_proj = int(psi_proj_rmu_X.shape[1])
+    acc_total = (
+        None if stream_writer is not None
+        else jnp.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128)
+    )
+
+    branch_label = log_tag if log_tag else "sigma"
+    total_tau_nodes = sum(int(win.alpha.shape[0]) for win in windows)
+    progress = LoopProgress(
+        total_tau_nodes, print_fn, title=f"sigma[{branch_label}]",
+        item_name="tau node", max_updates=10)
+
+    with jax_profile.annotation(f"sigma_branch[{branch_label}]"):
+        for win_idx, win in enumerate(windows):
+            with jax_profile.step_annotation(
+                "sigma_window", step_num=win_idx,
+                detail=f"{branch_label}:{win.name}:n{int(win.alpha.shape[0])}",
+            ):
+                mask_A = jnp.asarray(win.mask_A)
+                mask_B = _materialize_window_mask_B(
+                    win, base_mask_B=base_mask_B, Omega_q=Omega_q)
+                E_ref_A_j = jnp.asarray(win.E_ref_A, dtype=jnp.float64)
+                E_ref_B_j = jnp.asarray(win.E_ref_B, dtype=jnp.float64)
+                project_code_j = jnp.asarray(
+                    {"full": 0, "imag": 1}.get(win.project, 2), dtype=jnp.int32)
+                acc_win = jnp.zeros_like(acc_total) if acc_total is not None else None
+
+                for t_node, alpha_node in zip(win.t_nodes, win.alpha):
+                    t_node_j = jnp.asarray(t_node, dtype=jnp.complex128)
+                    with mesh_xy:
+                        sigma_tau_kij_re, sigma_tau_kij_im = tau_channel_step(
+                            psi_coh_rmuT_X, psi_coh_rmu_Y,
+                            psi_proj_rmu_X, psi_proj_rmuT_Y,
+                            E_A, mask_A, B_q, Omega_q, mask_B,
+                            E_ref_A_j, E_ref_B_j, t_node_j, eye_nb,
+                        )
+                    sigma_tau_kij_re.block_until_ready()
+                    progress.step()
+
+                    alpha_eff = complex(alpha_node) * np.exp(
+                        -1j * (win.E_ref_A + win.E_ref_B) * t_node)
+                    alpha_eff_j = jnp.asarray(alpha_eff, dtype=jnp.complex128)
+                    omega_sign_j = jnp.asarray(
+                        float(win.omega_sign) * float(omega_sign_flip), dtype=jnp.float64)
+                    pref_j = jnp.asarray(win.prefactor * scale, dtype=jnp.float64)
+
+                    if acc_win is not None:
+                        acc_win = _accumulate_tau_into_window(
+                            acc_win, sigma_tau_kij_re, sigma_tau_kij_im,
+                            omega_vec, t_node_j, alpha_eff_j,
+                            omega_sign_j, pref_j, project_code_j,
+                        )
+                    else:
+                        for ibeg in range(0, n_omega, omega_batch_size):
+                            iend = min(ibeg + omega_batch_size, n_omega)
+                            batch_proj = _project_tau_onto_omega(
+                                sigma_tau_kij_re, sigma_tau_kij_im,
+                                omega_vec[ibeg:iend],
+                                t_node_j, alpha_eff_j, omega_sign_j,
+                                pref_j, project_code_j,
+                            )
+                            stream_writer(omega_global_idx[ibeg:iend], batch_proj)
+
+                if acc_win is not None:
+                    acc_total = acc_total + acc_win
+
+    progress.finish()
+    return acc_total
+
 
 def _convolve_sigma_branch_kij(
     *,
@@ -612,14 +798,16 @@ def _convolve_sigma_branch_kij(
     scale: float = 1.0,
     use_shipped_minimax_tables: bool = True,
 ) -> tuple[jax.Array, list[_SigmaWindow]]:
-    """Convolve sigma for one branch (cond or val), accumulating in (k,i,j) space."""
+    """Orchestrator for one branch (cond or val × pos or neg ω half).
 
+    Reads as a physics outline:
+        windows = _build_windows_for_branch(...)          # host
+        acc     = _integrate_tau_windows_for_branch(...)  # device
+    """
     omega_nonneg_ry = np.asarray(omega_nonneg_ry, dtype=np.float64)
     n_omega = int(omega_nonneg_ry.shape[0])
+
     s = wfns.slices
-    nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
-    nk_tot = int(meta.nk_tot)
-    bispinor = bool(meta.bispinor)
     psi_coh_rmuT_X = wfns.xn(s.full)
     psi_coh_rmu_Y = wfns.yr(s.full)
     psi_proj_rmu_X = wfns.xr(s.sigma)
@@ -630,142 +818,41 @@ def _convolve_sigma_branch_kij(
     if n_omega == 0:
         return jnp.zeros((0, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), []
 
-    E_A_host = _to_host_np(E_A, dtype=np.float64, tiled=False)
-    base_A_host = _to_host_np(base_mask_A, dtype=bool, tiled=False)
-
-    _, mask_B_all_count, mask_B_all_min, mask_B_all_max = _masked_stats_device(
-        Omega_q, base_mask_B
+    windows = _build_windows_for_branch(
+        omega_nonneg_ry=omega_nonneg_ry,
+        E_A=E_A, base_mask_A=base_mask_A,
+        Omega_q=Omega_q, base_mask_B=base_mask_B,
+        kernel_sign=kernel_sign,
+        regularization_width_ry=regularization_width_ry,
+        edge_factor=edge_factor,
+        target_error=target_error, max_nodes=max_nodes,
+        crossing_eps_q=crossing_eps_q, crossing_max_nodes=crossing_max_nodes,
+        use_shipped_minimax_tables=use_shipped_minimax_tables,
+        log_tag=log_tag, print_fn=print_fn,
     )
-    if kernel_sign == +1 and float(np.max(omega_nonneg_ry)) > 1.0e-14:
-        omega_max = float(np.max(omega_nonneg_ry))
-        xi = max(float(regularization_width_ry), 1.0e-12)
-        z_edge = float(edge_factor) * xi
-        T = omega_max + z_edge
-        le_mask_B = base_mask_B & (Omega_q <= T)
-        gt_mask_B = base_mask_B & (Omega_q > T)
-        _, mask_B_le_count, mask_B_le_min, mask_B_le_max = _masked_stats_device(Omega_q, le_mask_B)
-        _, mask_B_gt_count, mask_B_gt_min, mask_B_gt_max = _masked_stats_device(Omega_q, gt_mask_B)
-        windows = _build_three_sigma_windows(
-            E_A=E_A_host,
-            base_mask_A=base_A_host,
-            mask_B_all_count=mask_B_all_count,
-            mask_B_le_count=mask_B_le_count,
-            mask_B_le_min=mask_B_le_min,
-            mask_B_le_max=mask_B_le_max,
-            mask_B_gt_count=mask_B_gt_count,
-            mask_B_gt_min=mask_B_gt_min,
-            mask_B_gt_max=mask_B_gt_max,
-            omega_nonneg_ry=omega_nonneg_ry,
-            regularization_width_ry=regularization_width_ry,
-            edge_factor=edge_factor,
-            target_error=target_error,
-            max_nodes=max_nodes,
-            crossing_eps_q=crossing_eps_q,
-            crossing_max_nodes=crossing_max_nodes,
-            use_shipped_tables=bool(use_shipped_minimax_tables),
-        )
-    else:
-        windows = _build_single_sigma_window(
-            E_A=E_A_host,
-            base_mask_A=base_A_host,
-            mask_B_count=mask_B_all_count,
-            mask_B_min=mask_B_all_min,
-            mask_B_max=mask_B_all_max,
-            omega_nonneg_ry=omega_nonneg_ry,
-            kernel_sign=kernel_sign,
-            target_error=target_error,
-            max_nodes=max_nodes,
-            use_shipped_tables=bool(use_shipped_minimax_tables),
-        )
-
     if not windows:
-        return jnp.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), windows
+        return jnp.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), []
 
-    # Per-window summary
-    for win in windows:
-        A_vals = E_A_host[win.mask_A]
-        kind = "crossing" if win.crossing_kind else "Laplace"
-        print_fn(
-            f"    {log_tag} window \"{win.name}\" ({kind}): "
-            f"{int(win.alpha.shape[0])} nodes, err<{target_error:.0e}, "
-            f"E_A=[{float(np.min(A_vals)):.4f}, {float(np.max(A_vals)):.4f}] Ry, "
-            f"project={win.project}"
-        )
-
-    eye_nb = jnp.eye(E_A.shape[1], dtype=jnp.complex128)
     omega_vec = jnp.asarray(omega_nonneg_ry, dtype=jnp.float64)
+    eye_nb = jnp.eye(E_A.shape[1], dtype=jnp.complex128)
     tau_channel_step = _get_sigma_tau_channel_kernel(
-        mesh_xy=mesh_xy, nkx=nkx, nky=nky, nkz=nkz,
-        nk_tot=nk_tot, bispinor=bispinor,
+        mesh_xy=mesh_xy,
+        nkx=int(meta.nkx), nky=int(meta.nky), nkz=int(meta.nkz),
+        nk_tot=int(meta.nk_tot), bispinor=bool(meta.bispinor),
     )
-    acc_total = None
-    if stream_writer is None:
-        acc_total = jnp.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128)
 
-    branch_label = log_tag if log_tag else f"kernel_sign={kernel_sign:+d}"
-    total_tau_nodes = sum(int(win.alpha.shape[0]) for win in windows)
-    from common.progress import LoopProgress
-    progress = LoopProgress(
-        total_tau_nodes, print_fn, title=f"sigma[{branch_label}]",
-        item_name="tau node", max_updates=10)
-
-    with jax_profile.annotation(f"sigma_branch[{branch_label}]"):
-        for win_idx, win in enumerate(windows):
-            with jax_profile.step_annotation(
-                "sigma_window",
-                step_num=win_idx,
-                detail=f"{branch_label}:{win.name}:n{int(win.alpha.shape[0])}",
-            ):
-                mask_A = jnp.asarray(win.mask_A)
-                mask_B = _materialize_window_mask_B(
-                    win, base_mask_B=base_mask_B, Omega_q=Omega_q,
-                )
-                E_ref_A_j = jnp.asarray(win.E_ref_A, dtype=jnp.float64)
-                E_ref_B_j = jnp.asarray(win.E_ref_B, dtype=jnp.float64)
-                project_code = {"full": 0, "imag": 1}.get(win.project, 2)
-                project_code_j = jnp.asarray(project_code, dtype=jnp.int32)
-                acc_win = jnp.zeros_like(acc_total) if acc_total is not None else None
-
-                for t_node, alpha_node in zip(win.t_nodes, win.alpha):
-                    t_node_j = jnp.asarray(t_node, dtype=jnp.complex128)
-                    with mesh_xy:
-                        sigma_tau_kij_ri = tau_channel_step(
-                            psi_coh_rmuT_X, psi_coh_rmu_Y,
-                            psi_proj_rmu_X, psi_proj_rmuT_Y,
-                            E_A, mask_A, B_q, Omega_q, mask_B,
-                            E_ref_A_j, E_ref_B_j, t_node_j, eye_nb,
-                        )
-                    sigma_tau_kij_ri[0].block_until_ready()
-                    progress.step()
-                    sigma_tau_kij_re = sigma_tau_kij_ri[0]
-                    sigma_tau_kij_im = sigma_tau_kij_ri[1]
-                    alpha_eff = complex(alpha_node) * np.exp(-1j * (win.E_ref_A + win.E_ref_B) * t_node)
-                    omega_sign = float(win.omega_sign) * float(omega_sign_flip)
-                    alpha_eff_j = jnp.asarray(alpha_eff, dtype=jnp.complex128)
-                    omega_sign_j = jnp.asarray(omega_sign, dtype=jnp.float64)
-                    pref = jnp.asarray(win.prefactor * scale, dtype=jnp.float64)
-                    if acc_win is not None:
-                        acc_win = _accumulate_tau_into_window(
-                            acc_win, sigma_tau_kij_re, sigma_tau_kij_im,
-                            omega_vec, t_node_j, alpha_eff_j,
-                            omega_sign_j, pref, project_code_j,
-                        )
-                    else:
-                        for ibeg in range(0, n_omega, int(max(1, omega_batch_size))):
-                            iend = min(ibeg + int(max(1, omega_batch_size)), n_omega)
-                            idx = omega_global_idx[ibeg:iend]
-                            batch_proj = _project_tau_onto_omega(
-                                sigma_tau_kij_re, sigma_tau_kij_im,
-                                omega_vec[ibeg:iend],
-                                t_node_j, alpha_eff_j, omega_sign_j,
-                                pref, project_code_j,
-                            )
-                            stream_writer(idx, batch_proj)
-
-                if acc_win is not None:
-                    acc_total = acc_total + acc_win
-
-    progress.finish()
+    acc_total = _integrate_tau_windows_for_branch(
+        windows=windows, omega_vec=omega_vec, omega_global_idx=omega_global_idx,
+        E_A=E_A, B_q=B_q, Omega_q=Omega_q, base_mask_B=base_mask_B,
+        psi_coh_rmuT_X=psi_coh_rmuT_X, psi_coh_rmu_Y=psi_coh_rmu_Y,
+        psi_proj_rmu_X=psi_proj_rmu_X, psi_proj_rmuT_Y=psi_proj_rmuT_Y,
+        eye_nb=eye_nb, tau_channel_step=tau_channel_step,
+        mesh_xy=mesh_xy,
+        omega_sign_flip=omega_sign_flip, scale=scale,
+        stream_writer=stream_writer,
+        omega_batch_size=int(max(1, omega_batch_size)),
+        log_tag=log_tag, print_fn=print_fn,
+    )
 
     if acc_total is None:
         return jnp.zeros((0, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), windows
