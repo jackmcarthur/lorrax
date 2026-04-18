@@ -751,11 +751,131 @@ class _BufferedGpuAccumulator(_SigmaAccumulator):
         return self.total
 
 
+# ---------------------------------------------------------------------------
+#  Reduce-scatter accumulator — scaffolding for the Σ_c(ω, k, m_X, n_Y) path.
+#
+#  Design intent (scaling target: n_rmu ≈ 10·n_b, n_k × n_b² ~ single-GPU HBM):
+#
+#      Σ_c(ω, k, m, n) lives on-GPU sharded (m on mesh.x, n on mesh.y) so
+#      every rank holds only (n_ω, n_k, n_b/p, n_b/p).  This is ~100× smaller
+#      than Σ_μν(k, q), which stays block-sharded (μ_X, ν_Y) upstream and
+#      never materializes replicated.  There is thus HBM headroom for many
+#      τ contributions to stack before a flush — we exploit that here.
+#
+#  Communication algorithm (the one to implement; not yet wired):
+#
+#      σ^τ   = project_ri(ψ, σ_k, ψ)           # currently: einsums auto-psum
+#                                               # over x AND y, σ^τ replicated
+#
+#      σ^τ_sharded = shard_map(local_project)  # TODO — replaces project_ri
+#          partial[c, k, m, n] = local einsum on rank's (μ_X, ν_Y) block
+#          partial = psum_scatter(partial, 'x', m_axis, tiled=True)
+#          partial = psum_scatter(partial, 'y', n_axis, tiled=True)
+#                                               # → (c, k, m/p, n/p) per rank
+#
+#      Σ[ω, k, m_X, n_Y] += coeff[ω, None, None, None] * σ^τ_sharded[None, k, m_X, n_Y]
+#
+#      For τ-batching (also not yet wired): stack n_batch tau nodes into a
+#      leading axis and use jax.lax.scan over the batch inside a single jit.
+#
+#  What this class does TODAY:
+#
+#      * Allocates Σ with the target sharding P(None, None, 'x', 'y').
+#      * Places an explicit with_sharding_constraint on σ^τ before the add
+#        — XLA re-plans the layout of the replicated σ^τ into the sharded
+#        shape, but no reduce-scatter happens here yet (the upstream
+#        project_ri still full-psums).
+#      * Accumulates via _accumulate_tau_into_window which already broadcasts
+#        the ω-coefficient along replicated ω, with sharded (m, n) downstream
+#        — the arithmetic is local per-rank once σ^τ is sharded.
+#
+#  What still needs doing for real comm savings:
+#
+#      (1) Replace _sigma_channel_pipeline's final project_ri call with a
+#          shard_map'd variant that emits σ^τ already sharded (m_X, n_Y).
+#          That is the only change that actually drops bytes on the wire.
+#      (2) Add m-chunking at this accumulator's add_tau entrance so partial
+#          is (m_chunk, n_full) before RS rather than (m_full, n_full).
+#          Default chunk = 1 output tile (m_chunk = m/p).
+#      (3) Stage many τ on GPU before flush in the FFI-backed variant
+#          (_ReduceScatterFfiAccumulator), using SlabIO.write_slab for the
+#          collective parallel-HDF5 flush at window boundaries.
+# ---------------------------------------------------------------------------
+
+
+class _ReduceScatterGpuAccumulator(_SigmaAccumulator):
+    """Σ_c(ω, k, m, n) sharded (m_X, n_Y) on GPU — scaffolding.
+
+    Same external interface as _BufferedGpuAccumulator; differs in that:
+
+        * its running buffers live at NamedSharding(mesh, P(None, None, 'x', 'y'))
+        * σ^τ is restamped via with_sharding_constraint before the add,
+          so downstream arithmetic on each rank touches only the local shard
+        * the add closure is factored so a future lax.scan over a τ-batch
+          can replace the per-tau Python call without changing the caller
+
+    At n_b = 80 on a 2×2 mesh the per-rank buffer is 40×40×n_ω×n_k ≈ 1.2 MiB
+    vs the replicated 4.8 MiB — negligible here, but the sharding-preserving
+    arithmetic is the load-bearing piece at 1500+ bands.
+    """
+
+    def __init__(self, shape: tuple[int, int, int, int], mesh_xy: Mesh):
+        self._sharding = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
+        self._tau_sharding = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+        # Allocate already-sharded.  jax.lax.with_sharding_constraint requires
+        # a trace context; jax.device_put is the equivalent for eager setup.
+        self.total = jax.device_put(
+            jnp.zeros(shape, dtype=jnp.complex128), self._sharding)
+        self._win_acc: jax.Array | None = None
+
+    def begin_window(self) -> None:
+        self._win_acc = jax.device_put(
+            jnp.zeros_like(self.total), self._sharding)
+
+    def add_tau(self, sigma_re, sigma_im, omega_vec,
+                t_node_j, alpha_eff_j, omega_sign_j, pref_j, project_code_j,
+                *, omega_global_idx=None):
+        assert self._win_acc is not None
+        # Restamp σ^τ as (k, m_X, n_Y) sharded.  TODO: make upstream emit
+        # this layout directly via shard_map + psum_scatter (see module
+        # comment above) so this constraint becomes a no-op.
+        sigma_re = jax.lax.with_sharding_constraint(sigma_re, self._tau_sharding)
+        sigma_im = jax.lax.with_sharding_constraint(sigma_im, self._tau_sharding)
+        self._win_acc = _accumulate_tau_into_window(
+            self._win_acc, sigma_re, sigma_im, omega_vec,
+            t_node_j, alpha_eff_j, omega_sign_j, pref_j, project_code_j,
+        )
+        # Pin the running buffer's sharding so XLA doesn't replicate it
+        # between adds — cheap, and matters when we switch to real RS upstream.
+        self._win_acc = jax.lax.with_sharding_constraint(
+            self._win_acc, self._sharding)
+
+    def end_window(self) -> None:
+        assert self._win_acc is not None
+        self.total = jax.lax.with_sharding_constraint(
+            self.total + self._win_acc, self._sharding)
+        self._win_acc = None
+
+    def finalize(self) -> jax.Array:
+        return self.total
+
+
 class _StreamedH5Accumulator(_SigmaAccumulator):
     """Project each tau contribution in ω-batches and hand to a writer callable.
 
     The writer is expected to read-modify-write the backing HDF5 dataset;
     this class is agnostic to the storage (rank-0 h5py, SlabIO, …).
+
+    Note on the FFI flush path (future work, comment-only here): a third
+    accumulator — _ReduceScatterFfiAccumulator — would keep the running Σ
+    sharded (m_X, n_Y) on GPU like _ReduceScatterGpuAccumulator, stack many
+    τ contributions per window without flushing, and at end_window() issue
+    a single collective parallel-HDF5 write via SlabIO.write_slab against
+    a pre-opened zarr-style (n_ω, n_k, m, n) dataset.  This removes the
+    per-τ read-modify-write roundtrip that makes _StreamedH5Accumulator
+    catastrophic at multi-process scale.  Implement when the upstream
+    reduce-scatter project lands (without it, there's no point — σ^τ is
+    still gathered on every rank).
     """
     def __init__(self, writer: Callable[[np.ndarray, jax.Array], None],
                  *, omega_global_idx: np.ndarray, omega_batch_size: int):
@@ -898,6 +1018,37 @@ def _integrate_tau_windows_for_branch(
 
     Whether the result lands on GPU or disk is the accumulator's concern,
     not this loop's — see _BufferedGpuAccumulator / _StreamedH5Accumulator.
+
+    Future τ-batching hook (NOT yet wired — left for the shard_map refactor):
+
+        The per-τ python loop below serializes on a block_until_ready after
+        each tau_channel_step call, so XLA cannot fuse across τ.  With the
+        reduce-scatter upstream in place, tau_channel_step's output becomes
+        small enough that we can:
+
+            t_nodes_j = jnp.asarray(win.t_nodes, dtype=jnp.complex128)   # (n_τ,)
+            alphas_j  = jnp.asarray(win.alpha,   dtype=jnp.float64)      # (n_τ,)
+
+            @jax.jit
+            def _scan_body(acc, tau_ctx):
+                t_j, a_j = tau_ctx
+                sigma_re, sigma_im = tau_channel_step(..., t_j, ...)
+                acc = _accumulate_tau_into_window(
+                    acc, sigma_re, sigma_im, ω_vec, t_j, a_j, ...)
+                return acc, None
+
+            win_acc, _ = jax.lax.scan(_scan_body, zeros, (t_nodes_j, alphas_j))
+
+        That collapses N_τ jit dispatches into 1 compile, one NCCL fence per
+        window instead of per τ, and lets XLA schedule the D2H overlap of
+        subsequent windows.  Only safe once σ^τ is shard-scatter'd — today a
+        scan over replicated σ^τ would blow up HBM because all τ contribs
+        would coexist during the scan trace.
+
+    m-chunking hook for the accumulator (also NOT wired): add_tau's
+    ``omega_global_idx`` slot is currently unused by _ReduceScatterGpuAccumulator
+    but is a natural place to pass an m-chunk selector; default (None) is
+    one m-strip per x-rank (= m/p).  Wire when upstream RS lands.
     """
     from common.progress import LoopProgress
 
@@ -1034,8 +1185,16 @@ def _run_sigma_branch(
     )
 
     if stream_writer is None:
-        accumulator: _SigmaAccumulator = _BufferedGpuAccumulator(
-            shape=(n_omega, nk_proj, nb_proj, nb_proj))
+        # Prefer the reduce-scatter-shaped accumulator: keeps the running Σ
+        # (m_X, n_Y) sharded so arithmetic is local per-rank.  See the
+        # _ReduceScatterGpuAccumulator module comment for what's wired today
+        # (layout-only) vs what still needs the shard_map refactor upstream
+        # (actual byte-level comm savings).  This is a drop-in replacement
+        # at the accumulator boundary.
+        accumulator: _SigmaAccumulator = _ReduceScatterGpuAccumulator(
+            shape=(n_omega, nk_proj, nb_proj, nb_proj),
+            mesh_xy=mesh_xy,
+        )
     else:
         accumulator = _StreamedH5Accumulator(
             writer=stream_writer,
@@ -1272,9 +1431,12 @@ def compute_sigma_c_ppm_omega_grid(
             per_half[key] = (per_half[key] + sigma_kij) if key in per_half else sigma_kij
 
         if not use_kij_stream:
+            # _ReduceScatterGpuAccumulator returns Σ sharded (m_X, n_Y), so the
+            # host copy needs a cross-process gather rather than jax.device_get.
+            # _to_host_np falls back to device_get for single-process / replicated.
             for key, total in per_half.items():
                 idx = np.asarray(key, dtype=np.int64)
-                sigma_kij_host[idx] = np.asarray(jax.device_get(total), dtype=np.complex128)
+                sigma_kij_host[idx] = _to_host_np(total, dtype=np.complex128, tiled=False)
     finally:
         if h5_kij is not None:
             h5_kij.close()
