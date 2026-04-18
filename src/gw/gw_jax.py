@@ -523,9 +523,29 @@ def main(argv=None):
 		sigma_xc_diag = np.real(load_sigma_xc_diag_from_h5(sigma_omega_h5_path, ryd2ev * np.array(sig_sx)))
 		E_sc, conv, n_iter = solve_diagonal_sigma_fixed_point(
 			h0_diag_ev - efermi, sigma_xc_diag, omega_ev, max_iter=120, tol_ev=1e-7, mixing=0.6)
-		in_grid = (E_qp_ev * ryd2ev - efermi >= omega_ev[0]) & (E_qp_ev * ryd2ev - efermi <= omega_ev[-1])
-		E_sc = np.where(in_grid, E_sc, E_qp_ev - efermi) + efermi
+		# In-grid test is on Fermi-referenced QP energy (eV vs eV).
+		E_qp_rel_ev = E_qp_ev - efermi
+		in_grid = (E_qp_rel_ev >= omega_ev[0]) & (E_qp_rel_ev <= omega_ev[-1])
 		n_in = int(np.count_nonzero(in_grid))
+
+		if config.sigma_at_dft_extrapolate and np.any(in_grid) and np.any(~in_grid):
+			# Scissor: ΔE_n = E_QP_n − E_DFT_n fit against E_DFT, separate
+			# slopes/intercepts for valence and conduction.  Out-of-grid bands
+			# get E_QP = E_DFT + (α·E_DFT + β) using the fitted line.
+			from .scissor import fit_scissor
+			E_dft_rel_ev = np.asarray(omega_dft_rel_ev, dtype=np.float64)
+			nb_sc = E_sc.shape[1]
+			occ_mask_kn = (np.arange(nb_sc)[None, :] < meta.nelec)
+			occ_mask_kn = np.broadcast_to(occ_mask_kn, E_sc.shape).astype(bool)
+			delta_e_measured = np.real(E_sc - E_dft_rel_ev)
+			fit = fit_scissor(E_dft_rel_ev, delta_e_measured,
+							  valence_mask_kn=occ_mask_kn,
+							  fit_mask_kn=in_grid)
+			print0(f"  Scissor fit: {fit.summary()}")
+			extrap_rel = E_dft_rel_ev + fit.predict(E_dft_rel_ev, occ_mask_kn)
+			E_sc = np.where(in_grid, E_sc, extrap_rel) + efermi
+		else:
+			E_sc = np.where(in_grid, E_sc, E_qp_rel_ev) + efermi
 		print0(f"  Diagonal SC: {n_in}/{in_grid.size} states in grid, {n_iter} iterations")
 
 		qsgw = build_qsgw_sigma_xc_from_h5(sigma_omega_h5_path,
