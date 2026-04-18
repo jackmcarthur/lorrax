@@ -1,9 +1,51 @@
-"""GN-PPM construction from W(0), W(i*omega_p) and sigma_c frequency integration.
+"""GN-PPM construction from W(0), W(iω_p) and Σ_c(ω) frequency integration.
 
-This module reuses existing GW helpers:
-  - chi/W evaluation: w_isdf.compute_chi0 and w_isdf.solve_w_from_chi_q_jax
-  - G builder: greens_function_kernel.build_G
-  - band projection: projection_kernel.project_ri
+What this module computes
+-------------------------
+
+    Σ^c_nm(k, ω) = Σ_{branches} Σ_{windows} Σ_τ  α(τ) · e^{i·ω_sign·ω·τ}
+                                                 · project[ σ^τ_nmk(τ) ]
+                                                 · pref · scale
+
+Per branch the τ nodes are placed by a minimax quadrature chosen from the
+range of E_A = E_c − E_F (cond) or E_F − E_v (val) and the PPM pole
+frequencies Ω_q.  Each τ node fires one sharded GPU kernel (σ^τ) that
+evaluates the single-tau integrand:
+
+    σ^τ_nmk(τ) = project[ FFT[ G(τ) · W(τ) / √N_k ] ]
+    G(τ)       = diag[ e^{-i(E_A - E_ref_A)·τ} ] · mask_A           (A = val or cond)
+    W(τ)       = Σ_μν  B_q · e^{-i(Ω_q - E_ref_B)·τ}  · mask_B      (PPM pole sum)
+
+The ω-dependence is *linear* in τ (only the exp(iω·τ) kernel involves ω),
+so every τ contribution contributes to all ω in one shot.
+
+Branch decomposition
+--------------------
+
+Four branches span ω ∈ ℝ:
+
+    (+ω, cond, kernel_sign=+1, scale=+1)   standard Laplace on E_A = E_c - E_F
+    (+ω, val,  kernel_sign=-1, scale=+1)   sign-flipped kernel for H_val = E_F - E_v
+    (-ω, cond, kernel_sign=-1, scale=-1)   evaluated at |ω|, symmetry factor -1
+    (-ω, val,  kernel_sign=+1, scale=-1)   evaluated at |ω|, symmetry factor -1
+
+Within each +ω branch the conduction kernel factors through a three-window
+decomposition (Laplace core + crossing stripe + tail slab) when the ω range
+is non-trivial; val and -ω branches use a single Laplace window.
+
+File layout
+-----------
+
+    data classes               PPMBuildResult / SigmaOmegaResult / _SigmaWindow / _SigmaPhysicsState / _SigmaBranch
+    leaf jits (physics)        _prepare_sigma_state · _project_tau_onto_omega · _accumulate_tau_into_window
+    cached kernel factories    _get_sigma_channel_pipeline · _get_sigma_tau_channel_kernel
+    PPM fit                    fit_gn_ppm
+    host-side window build     _build_single_sigma_window · _build_three_sigma_windows
+    accumulators               _SigmaAccumulator protocol
+                               _BufferedGpuAccumulator · _StreamedH5Accumulator
+    branch orchestration       _build_windows_for_branch (host) · _integrate_tau_windows_for_branch (device)
+                               _run_sigma_branch (thin orchestrator)
+    top-level driver           compute_sigma_c_ppm_omega_grid
 """
 
 from __future__ import annotations
@@ -60,11 +102,69 @@ class _SigmaWindow:
     E_ref_A: float
     E_ref_B: float
     omega_sign: int
-    project: str               # "full", "real", or "imag"
+    project: str               # "full" (Laplace) or "imag" (crossing)
     prefactor: float
     mask_B_mode: str = "explicit"
     mask_B_threshold: float | None = None
     crossing_kind: str | None = None
+
+
+# ---------------------------------------------------------------------------
+#  Branch enumeration — the four (ω sign × cond/val) calls that together
+#  sum to Σ_c(ω).  Split into a NamedTuple so every caller sees the same
+#  physics labeling without copy-pasted kwargs.
+# ---------------------------------------------------------------------------
+
+class _SigmaBranch(NamedTuple):
+    """One branch of the Σ_c(ω) sum.  Four branches cover ω ∈ ℝ."""
+    tag: str                    # human label ("ω≥E_F cond" etc.) — drives progress output
+    E_A: jax.Array              # (nk, nb) energy-above-Fermi for A-space (E_cond or H_val)
+    base_mask_A: jax.Array      # (nk, nb) bool — which bands in A-space contribute
+    kernel_sign: int            # +1 (Laplace on E_A ≥ 0)  /  -1 (sign-flipped kernel)
+    omega_sign_flip: int        # always +1 in current scheme (kept for generality)
+    scale: float                # global prefactor from ω ↔ -ω symmetry (±1)
+    omega_abs: np.ndarray       # non-negative ω values to evaluate at (|ω_rel|)
+    omega_idx: np.ndarray       # global ω indices these map into
+
+
+def _iter_branches(
+    *,
+    omega_pos: np.ndarray, idx_pos: np.ndarray,
+    omega_neg_abs: np.ndarray, idx_neg: np.ndarray,
+    E_cond: jax.Array, H_val: jax.Array,
+    cond_mask: jax.Array, val_mask: jax.Array,
+) -> list[_SigmaBranch]:
+    """Enumerate the 4 branches, skipping empty ω halves.
+
+    Why the flipped signs?
+
+        +ω  half:  Σ_c is a Laplace transform on E_A = E_c - E_F  (kernel_sign=+1).
+                   For the val space, E_A = E_F - E_v ≥ 0 but the kernel picks up
+                   the opposite sign so kernel_sign=-1 on the val side.
+        -ω  half:  evaluate at |ω| and exploit Σ_c(-ω) = -[Σ_c(ω)]^* for the same
+                   (E_A, mask) structure.  This means scale=-1 globally and
+                   kernel_sign swaps between cond and val relative to the +ω half.
+    """
+    branches: list[_SigmaBranch] = []
+    if omega_pos.size:
+        branches += [
+            _SigmaBranch(tag="ω≥E_F cond", E_A=E_cond, base_mask_A=cond_mask,
+                         kernel_sign=+1, omega_sign_flip=1, scale=+1.0,
+                         omega_abs=omega_pos, omega_idx=idx_pos),
+            _SigmaBranch(tag="ω≥E_F val",  E_A=H_val,  base_mask_A=val_mask,
+                         kernel_sign=-1, omega_sign_flip=1, scale=+1.0,
+                         omega_abs=omega_pos, omega_idx=idx_pos),
+        ]
+    if omega_neg_abs.size:
+        branches += [
+            _SigmaBranch(tag="ω<E_F cond", E_A=E_cond, base_mask_A=cond_mask,
+                         kernel_sign=-1, omega_sign_flip=1, scale=-1.0,
+                         omega_abs=omega_neg_abs, omega_idx=idx_neg),
+            _SigmaBranch(tag="ω<E_F val",  E_A=H_val,  base_mask_A=val_mask,
+                         kernel_sign=+1, omega_sign_flip=1, scale=-1.0,
+                         omega_abs=omega_neg_abs, omega_idx=idx_neg),
+        ]
+    return branches
 
 
 def _to_host_np(a, dtype=np.complex128, *, tiled: bool = False):
@@ -186,14 +286,30 @@ def _prepare_sigma_state(
     )
 
 
-def _project_sigma_channels(
+def _combine_coeff_with_sigma_tau(
     coeff_re: jax.Array,
     coeff_im: jax.Array,
     sigma_tau_kij_re: jax.Array,
     sigma_tau_kij_im: jax.Array,
     project_code: jax.Array,
 ) -> jax.Array:
-    """Apply one window projection to precomputed real/imag sigma channels."""
+    """Multiply ω-kernel coefficient by σ^τ, keeping only the physical piece.
+
+    σ^τ is carried as a real/imag pair because the crossing window's HGL
+    quadrature needs only Im[ coeff·σ^τ ] — carrying complex σ^τ through
+    the FFT pipeline would double memory for no benefit.  The window sets
+    ``project_code`` via ``_SigmaWindow.project``:
+
+        code=0 ("full")  Laplace window (stripe, slab, single) — keep the
+                         full complex product  (coeff_re + i·coeff_im) · (σ_re + i·σ_im).
+        code=1 ("imag")  Crossing window      — keep only  Im[coeff·σ]
+                                              = coeff_re·σ_im + coeff_im·σ_re.
+
+    The historical "real" code path (Re[coeff·σ]) is unused by every current
+    window builder.  lax.switch is retained with a 2-way dispatch so that
+    the generated HLO matches the previous "full" / "imag" lowering exactly
+    and no minimax-table consumer gets a silent behavior change.
+    """
 
     def _full(_):
         sigma_full = sigma_tau_kij_re[None, ...] + 1j * sigma_tau_kij_im[None, ...]
@@ -202,10 +318,7 @@ def _project_sigma_channels(
     def _imag(_):
         return coeff_re * sigma_tau_kij_im[None, ...] + coeff_im * sigma_tau_kij_re[None, ...]
 
-    def _real(_):
-        return coeff_re * sigma_tau_kij_re[None, ...] - coeff_im * sigma_tau_kij_im[None, ...]
-
-    return jax.lax.switch(project_code, (_full, _imag, _real), operand=None)
+    return jax.lax.switch(project_code, (_full, _imag), operand=None)
 
 
 @jax.jit
@@ -224,15 +337,16 @@ def _project_tau_onto_omega(
     Returns the single-tau contribution at every ω in ``omega_vec``:
         contrib[ω, k, i, j] = pref · α_eff · exp(i·sign·ω·t) · P(σ_re, σ_im)
 
-    where P selects {full, imag, real} via ``project_code``.  Callers either
-    accumulate the result on-GPU (+=) or write it to disk — this kernel is
-    agnostic to the consumer.
+    where P selects {full, imag} via ``project_code`` — see
+    ``_combine_coeff_with_sigma_tau`` for why σ^τ is kept as a (re, im) pair.
+    Callers either accumulate the result on-GPU (+=) or write it to disk —
+    this kernel is agnostic to the consumer.
     """
     omega_kernel = jnp.exp(1j * omega_sign * omega_vec * t_node)
     coeff = alpha_eff * omega_kernel
     coeff_re = jnp.real(coeff)[:, None, None, None]
     coeff_im = jnp.imag(coeff)[:, None, None, None]
-    contrib = _project_sigma_channels(
+    contrib = _combine_coeff_with_sigma_tau(
         coeff_re, coeff_im, sigma_tau_kij_re, sigma_tau_kij_im, project_code
     )
     return pref * contrib.astype(jnp.complex128)
@@ -804,13 +918,22 @@ def _integrate_tau_windows_for_branch(
                     win, base_mask_B=base_mask_B, Omega_q=Omega_q)
                 E_ref_A_j = jnp.asarray(win.E_ref_A, dtype=jnp.float64)
                 E_ref_B_j = jnp.asarray(win.E_ref_B, dtype=jnp.float64)
+                if win.project not in ("full", "imag"):
+                    raise ValueError(
+                        f"Unknown window projection {win.project!r}; "
+                        f"expected 'full' (Laplace) or 'imag' (crossing).")
                 project_code_j = jnp.asarray(
-                    {"full": 0, "imag": 1}.get(win.project, 2), dtype=jnp.int32)
+                    {"full": 0, "imag": 1}[win.project], dtype=jnp.int32)
 
                 accumulator.begin_window()
                 for t_node, alpha_node in zip(win.t_nodes, win.alpha):
                     t_node_j = jnp.asarray(t_node, dtype=jnp.complex128)
                     with mesh_xy:
+                        # σ^τ is returned as a real/imag pair rather than complex:
+                        # the crossing window's HGL quadrature keeps only Im[coeff·σ],
+                        # so carrying complex through the FFT stack would double
+                        # HBM and collective traffic for no benefit.  See
+                        # _combine_coeff_with_sigma_tau for the recombination.
                         sigma_tau_kij_re, sigma_tau_kij_im = tau_channel_step(
                             psi_coh_rmuT_X, psi_coh_rmu_Y,
                             psi_proj_rmu_X, psi_proj_rmuT_Y,
@@ -820,6 +943,9 @@ def _integrate_tau_windows_for_branch(
                     sigma_tau_kij_re.block_until_ready()
                     progress.step()
 
+                    # α_eff = α(τ) · exp[-i·(E_ref_A + E_ref_B)·τ]  — the minimax
+                    # quadrature weight for this τ node, phase-shifted so the
+                    # Laplace transform kernel sees E_A and Ω_q as ≥ 0 arguments.
                     alpha_eff = complex(alpha_node) * np.exp(
                         -1j * (win.E_ref_A + win.E_ref_B) * t_node)
                     alpha_eff_j = jnp.asarray(alpha_eff, dtype=jnp.complex128)
@@ -837,7 +963,7 @@ def _integrate_tau_windows_for_branch(
     progress.finish()
 
 
-def _convolve_sigma_branch_kij(
+def _run_sigma_branch(
     *,
     omega_nonneg_ry: np.ndarray,
     omega_global_idx: np.ndarray,
@@ -1122,37 +1248,27 @@ def compute_sigma_c_ppm_omega_grid(
             use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
         )
 
-        # Four branches: (ω sign) × (cond/val).  For ω_rel<0 we evaluate with
-        # |ω_rel| and swap kernel_sign between cond/val, with a global -1 scale.
-        # A tuple-of-dicts drives the loop so the physics reads in one place.
-        branches = []
-        if omega_pos.size:
-            branches += [
-                dict(E_A=E_cond, mask=cond_mask, kernel_sign=+1, scale=+1.0,
-                     omega_abs=omega_pos, omega_idx=idx_pos, tag="ω≥E_F cond"),
-                dict(E_A=H_val,  mask=val_mask,  kernel_sign=-1, scale=+1.0,
-                     omega_abs=omega_pos, omega_idx=idx_pos, tag="ω≥E_F val"),
-            ]
-        if omega_neg_abs.size:
-            branches += [
-                dict(E_A=E_cond, mask=cond_mask, kernel_sign=-1, scale=-1.0,
-                     omega_abs=omega_neg_abs, omega_idx=idx_neg, tag="ω<E_F cond"),
-                dict(E_A=H_val,  mask=val_mask,  kernel_sign=+1, scale=-1.0,
-                     omega_abs=omega_neg_abs, omega_idx=idx_neg, tag="ω<E_F val"),
-            ]
+        # Enumerate the 4 branches (ω sign × cond/val), skipping empty ω halves.
+        # See _iter_branches for the sign/scale convention derivation.
+        branches = _iter_branches(
+            omega_pos=omega_pos, idx_pos=idx_pos,
+            omega_neg_abs=omega_neg_abs, idx_neg=idx_neg,
+            E_cond=E_cond, H_val=H_val,
+            cond_mask=cond_mask, val_mask=val_mask,
+        )
 
-        # Pair the branches that share the same ω-half, summing cond+val per half
-        # before gathering to host (matches original ordering to stay bit-identical).
+        # Sum cond+val per ω-half before gathering to host.  Preserves the
+        # original traversal order so reduction ordering stays bit-identical.
         per_half: dict[tuple, jax.Array] = {}
         for br in branches:
-            sigma_kij, _ = _convolve_sigma_branch_kij(
-                omega_nonneg_ry=br["omega_abs"], omega_global_idx=br["omega_idx"],
-                E_A=br["E_A"], base_mask_A=br["mask"],
-                kernel_sign=br["kernel_sign"], omega_sign_flip=1,
-                log_tag=br["tag"], scale=br["scale"],
+            sigma_kij, _ = _run_sigma_branch(
+                omega_nonneg_ry=br.omega_abs, omega_global_idx=br.omega_idx,
+                E_A=br.E_A, base_mask_A=br.base_mask_A,
+                kernel_sign=br.kernel_sign, omega_sign_flip=br.omega_sign_flip,
+                log_tag=br.tag, scale=br.scale,
                 **common_branch_kwargs,
             )
-            key = tuple(br["omega_idx"].tolist())
+            key = tuple(br.omega_idx.tolist())
             per_half[key] = (per_half[key] + sigma_kij) if key in per_half else sigma_kij
 
         if not use_kij_stream:
