@@ -363,12 +363,15 @@ def prune_candidates_by_pivoted_cholesky(
     *,
     n_val: int | None = None,
     n_cond: int | None = None,
+    band_range_left: tuple[int, int] | None = None,
+    band_range_right: tuple[int, int] | None = None,
+    band_norms: np.ndarray | None = None,
     k_weights: np.ndarray | None = None,
     tol_rel: float = 1e-10,
     verbose: bool = True,
     mesh: Mesh | None = None,
     bispinor: bool = False,
-) -> tuple[np.ndarray, int, jnp.ndarray, jnp.ndarray]:
+) -> tuple[np.ndarray, int, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Full q=0 pruning pipeline: gather → Gram → pivoted Cholesky → pivots.
 
     Suggested oversampling per the md: ``cand_idx.shape[0] ≈ 1.5 · n_keep``
@@ -381,11 +384,20 @@ def prune_candidates_by_pivoted_cholesky(
         cand_idx: (M, 3) int32 FFT-grid indices of candidate points. M is
             the oversampled count.
         n_keep: target number of pruned points (N_μ).
-        n_val: number of valence bands to include. Defaults to
-            ``wfn.nelec`` (one band per occupied spinor state).
-        n_cond: number of conduction bands above N_val to include.
-            Defaults to ``min(n_val, wfn.nbands - wfn.nelec)`` — a sensible
-            matched window; pass an explicit value for production runs.
+        n_val: number of valence bands for the legacy v × c Gram.
+            Used only if ``band_range_left`` is not given.
+        n_cond: number of conduction bands above n_val for the legacy
+            v × c Gram.
+        band_range_left: explicit left window ``(b_start, b_end)``. In
+            the gw_jax / ISDF convention this is ``(b0, b3)`` =
+            "all val + sigma cond". Overrides (n_val, n_cond).
+        band_range_right: explicit right window ``(b_start, b_end)``.
+            In the gw_jax convention this is ``(b1, b4)`` = "sigma val +
+            all cond". Overrides (n_val, n_cond).
+        band_norms: optional (nbands,) pseudoband norms (e.g.
+            ``wfn.band_norms``). Applied as ``ψ /= max(norm, 1.0)`` on
+            both left and right windows before the pair density — same
+            clamp recipe as ``isdf_fitting.fit_zeta_chunked_to_h5``.
         k_weights: optional (nkpts,) real weights. Defaults to
             ``wfn.kweights`` if present else uniform.
         tol_rel: relative tolerance for pivot acceptance (see
@@ -401,15 +413,46 @@ def prune_candidates_by_pivoted_cholesky(
         d_final: (M,) real final Schur-complement residual diagonal.
     """
     M = int(cand_idx.shape[0])
-    if n_val is None:
-        n_val = int(wfn.nelec)
     n_tot = int(wfn.nbands)
-    if n_cond is None:
-        n_cond = min(n_val, n_tot - n_val)
-    if n_val + n_cond > n_tot:
-        raise ValueError(
-            f"wfn.nbands={n_tot} < n_val + n_cond = {n_val} + {n_cond}"
-        )
+    asymmetric = (band_range_left is not None and band_range_right is not None)
+
+    if not asymmetric:
+        # Legacy (n_val, n_cond) path — left = (0, n_val), right = (n_val, n_val + n_cond).
+        if n_val is None:
+            n_val = int(wfn.nelec)
+        if n_cond is None:
+            n_cond = min(n_val, n_tot - n_val)
+        if n_val + n_cond > n_tot:
+            raise ValueError(
+                f"wfn.nbands={n_tot} < n_val + n_cond = {n_val} + {n_cond}"
+            )
+        max_band = int(n_val) + int(n_cond)
+    else:
+        if band_range_left[1] > n_tot or band_range_right[1] > n_tot:
+            raise ValueError(
+                f"wfn.nbands={n_tot} < max(left={band_range_left[1]}, "
+                f"right={band_range_right[1]})"
+            )
+        max_band = max(int(band_range_left[1]), int(band_range_right[1]))
+
+    # Plane-wave-basis sanity check. For centroid pruning to be
+    # meaningful, the pair-product space must be significantly smaller
+    # than the full plane-wave basis; once we include > 50 % of the
+    # available PW degrees of freedom, the candidate-vs-grid distinction
+    # blurs and the user should be pruning the real-space grid directly.
+    ngk_max = int(np.max(wfn.ngk)) if hasattr(wfn, 'ngk') else None
+    nspinor = int(wfn.nspinor)
+    if ngk_max is not None:
+        npw_basis = ngk_max * nspinor  # size of the plane-wave basis per k
+        if max_band > 0.5 * npw_basis:
+            raise ValueError(
+                f"Requested band window touches band {max_band}, which "
+                f"exceeds 50 % of the plane-wave basis size "
+                f"({0.5 * npw_basis:.0f} = 0.5 · ngk_max · nspinor = "
+                f"0.5 · {ngk_max} · {nspinor}). Centroid pruning is "
+                f"ill-posed in this regime — prune on the full real-space "
+                f"grid directly instead."
+            )
 
     # Decide which pipeline to use based on the mesh shape:
     #   • 2-D mesh with both 'x' and 'y'  → load_wfns-based pipeline:
@@ -435,15 +478,26 @@ def prune_candidates_by_pivoted_cholesky(
         kw_j = jnp.asarray(kw_arr, dtype=jnp.float64)
 
     if verbose:
+        if asymmetric:
+            window_tag = (f"left={band_range_left}, right={band_range_right}, "
+                          f"norms={'on' if band_norms is not None else 'off'}")
+        else:
+            window_tag = f"n_val={n_val}, n_cond={n_cond}"
         if is_2d_mesh:
             print(f"[pivoted_cholesky] M={M} candidates, n_keep={n_keep}, "
-                  f"n_val={n_val}, n_cond={n_cond}, nk_tot={sym.nk_tot} "
+                  f"{window_tag}, nk_tot={sym.nk_tot} "
                   f"(full-BZ via load_wfns on mesh "
                   f"x={mesh.shape['x']}, y={mesh.shape['y']})")
         else:
             print(f"[pivoted_cholesky] M={M} candidates, n_keep={n_keep}, "
-                  f"n_val={n_val}, n_cond={n_cond}, nk_irr={wfn.nkpts} "
+                  f"{window_tag}, nk_irr={wfn.nkpts} "
                   f"(IBZ via host-gather)")
+
+    if asymmetric and not is_2d_mesh:
+        raise NotImplementedError(
+            "Explicit (band_range_left, band_range_right) requires the "
+            "2-D load_wfns pipeline; pass a 2-D mesh."
+        )
 
     if is_2d_mesh:
         # --- 2-D pipeline: full-BZ load_wfns + gw_jax pair-density helpers ---
@@ -451,6 +505,9 @@ def prune_candidates_by_pivoted_cholesky(
             wfn, sym, jnp.asarray(cand_idx),
             n_val=n_val, n_cond=n_cond,
             mesh_xy=mesh, bispinor=bispinor, verbose=verbose,
+            band_range_left=band_range_left,
+            band_range_right=band_range_right,
+            band_norms=band_norms,
         )
         # Reshard the Gram output ('x','y') → combined-axis row shard
         # (('x','y'), None) so the existing sharded select has its
@@ -947,30 +1004,47 @@ def build_gram_q0_via_loadwfns(
     wfn: WFNReader,
     sym: symmetry_maps.SymMaps,
     cand_idx: jnp.ndarray,
-    n_val: int,
-    n_cond: int,
-    mesh_xy: Mesh,
+    n_val: int | None = None,
+    n_cond: int | None = None,
+    mesh_xy: Mesh | None = None,
     *,
     bispinor: bool = False,
     verbose: bool = True,
+    band_range_left: tuple[int, int] | None = None,
+    band_range_right: tuple[int, int] | None = None,
+    band_norms: np.ndarray | None = None,
 ) -> jnp.ndarray:
     """Build the q=0 candidate Gram on a 2-D mesh using gw_jax's data path.
 
-    Full-BZ unfold: calls ``load_wfns.read_Gvecs_to_devices`` for the
-    valence window and again for the conduction window, feeds both
-    through ``get_sharded_wfns_centroids`` at the supplied candidate
-    indices, builds sharded pair densities via
-    ``compute_pair_density_spin_traced``, and combines them with the
-    q=0 sum via ``compute_gram_q0_from_left_right``. k-weights are
-    uniform 1 / nk_tot because we've unfolded.
+    Two call modes:
+
+    * Simple ``(n_val, n_cond)`` (legacy): left window = ``(0, n_val)``,
+      right window = ``(n_val, n_val + n_cond)``. This is the literal
+      valence × conduction pair-product Gram used in the original assay.
+
+    * Explicit ``(band_range_left, band_range_right)`` (gw_jax / ISDF
+      convention): left = ``(b0, b3)`` = "all val + sigma cond", right =
+      ``(b1, b4)`` = "sigma val + all cond". Matches the windowing used
+      by ``gw_init.fit_zeta`` → ``isdf_fitting.fit_zeta_chunked_to_h5``.
+      Passing ``band_norms`` additionally applies the pseudoband
+      normalization ``ψ /= max(norm, 1.0)`` on both left and right
+      (same clamp recipe as ``isdf_fitting.py:838-847``).
+
+    Full-BZ unfold: one ``load_wfns.read_Gvecs_to_devices`` per window,
+    ``get_sharded_wfns_centroids`` at the candidate indices, sharded
+    pair densities via ``compute_pair_density_spin_traced``, combined
+    with the q=0 sum via ``compute_gram_q0_from_left_right``. k-weights
+    are uniform ``1 / nk_tot`` because we've unfolded.
 
     Args:
         wfn: open WFNReader.
         sym: matching SymMaps.
         cand_idx: (M, 3) int32 FFT-grid indices of candidate points.
             Must be a ``jnp.ndarray`` (will be ``jnp.asarray``-ed if not).
-        n_val: number of valence bands.
-        n_cond: number of conduction bands above n_val.
+        n_val: valence-window size for the legacy mode (see above).
+            Required when ``band_range_left`` is not given.
+        n_cond: conduction-window size for the legacy mode. Required
+            when ``band_range_left`` is not given.
         mesh_xy: 2-D device mesh with axes ``'x'`` and ``'y'``. (Other
             axis names work too, as long as both are present; the pair
             density / Gram helpers hard-code the axis names ``'x'`` and
@@ -978,6 +1052,14 @@ def build_gram_q0_via_loadwfns(
         bispinor: if True, upcast the spin structure to 4 components
             (matches gw_jax's bispinor mode). Default False.
         verbose: print progress lines.
+        band_range_left: optional explicit left window (start, end).
+            When given, takes precedence over (n_val, n_cond).
+        band_range_right: optional explicit right window.
+        band_norms: optional (nbands,) array of band norms
+            (``wfn.band_norms``) for pseudoband reweighting. When given,
+            applied to both left and right ψ via
+            ``ψ /= max(norm_slice, 1.0)`` before the pair-density
+            einsum.
 
     Returns:
         G: (M, M) complex, sharded ``P('x','y')`` on the mesh — ready to
@@ -996,51 +1078,103 @@ def build_gram_q0_via_loadwfns(
         compute_gram_q0_from_left_right,
     )
 
+    # Resolve windows.
+    if band_range_left is None or band_range_right is None:
+        if n_val is None or n_cond is None:
+            raise ValueError(
+                "Must supply either (n_val, n_cond) or "
+                "(band_range_left, band_range_right)"
+            )
+        left_range = (0, int(n_val))
+        right_range = (int(n_val), int(n_val) + int(n_cond))
+    else:
+        left_range = (int(band_range_left[0]), int(band_range_left[1]))
+        right_range = (int(band_range_right[0]), int(band_range_right[1]))
+
+    nb_left = left_range[1] - left_range[0]
+    nb_right = right_range[1] - right_range[0]
+    if nb_left <= 0 or nb_right <= 0:
+        raise ValueError(
+            f"Empty band window: left={left_range} right={right_range}"
+        )
+
+    # Meta's nband must cover whichever of left/right reaches higher.
+    max_band = max(left_range[1], right_range[1])
+    # Keep Meta.b0..b4 consistent with the *legacy* nval/ncond semantics
+    # when the caller passed those; otherwise use (max_band, max_band) so
+    # the metadata bounds don't constrain anything downstream.
+    meta_nval = int(n_val) if n_val is not None else nb_left
+    meta_ncond = int(n_cond) if n_cond is not None else max(1, max_band - meta_nval)
+
     M = int(cand_idx.shape[0])
     cand_idx = jnp.asarray(cand_idx, dtype=jnp.int64)
 
-    # Build Meta using the full-BZ nk_tot (load_wfns unfolds).
     meta = Meta.from_system(
         wfn, sym,
-        nval=n_val, ncond=n_cond,
-        nband=n_val + n_cond,
+        nval=meta_nval, ncond=meta_ncond,
+        nband=max_band,
         n_rmu=M,
         bispinor=bispinor,
     )
 
-    # Uniform k-weights for full-BZ unfold (fp64 to match load_wfns precision).
     kw = jnp.ones((sym.nk_tot,), dtype=jnp.float64) / float(sym.nk_tot)
-
-    # Full-BZ fractional k-vectors, as load_wfns expects.
     kgrid = np.asarray(wfn.kgrid, dtype=np.float64)
     kvecs_frac = np.asarray(sym.kvecs_asints) / kgrid[None, :]
 
+    # Optional pseudoband norms — same clamp recipe as isdf_fitting.
+    if band_norms is not None:
+        band_norms_np = np.asarray(band_norms, dtype=np.float64)
+        if band_norms_np.shape[0] < max_band:
+            raise ValueError(
+                f"band_norms has {band_norms_np.shape[0]} entries but "
+                f"the left/right windows touch band {max_band}"
+            )
+        norms_l = np.maximum(
+            band_norms_np[left_range[0]:left_range[1]], 1.0,
+        )
+        norms_r = np.maximum(
+            band_norms_np[right_range[0]:right_range[1]], 1.0,
+        )
+        norms_l_j = jnp.asarray(norms_l, dtype=jnp.float64)
+        norms_r_j = jnp.asarray(norms_r, dtype=jnp.float64)
+    else:
+        norms_l_j = None
+        norms_r_j = None
+
     if verbose:
         print(f"[pivoted_cholesky] 2-D Gram build via load_wfns: "
-              f"nk_tot={sym.nk_tot}, nband_val={n_val}, nband_cond={n_cond}, "
-              f"M={M}")
+              f"nk_tot={sym.nk_tot}, left={left_range} (nb={nb_left}), "
+              f"right={right_range} (nb={nb_right}), M={M}, "
+              f"norms={'on' if band_norms is not None else 'off'}")
 
-    # ---- Valence window ----
-    psi_G_val, _ = read_Gvecs_to_devices(
-        wfn, sym, (0, n_val), meta, bispinor, mesh_xy,
+    # ---- Left window ----
+    psi_G_l, _ = read_Gvecs_to_devices(
+        wfn, sym, left_range, meta, bispinor, mesh_xy,
     )
-    phi_rmu_Y, phi_rmuT_X = get_sharded_wfns_centroids(
-        psi_G_val, meta, cand_idx, kvecs_frac, mesh_xy, (0, n_val),
+    psi_l_rmu_Y, psi_l_rmuT_X = get_sharded_wfns_centroids(
+        psi_G_l, meta, cand_idx, kvecs_frac, mesh_xy, left_range,
     )
-    P_v_k = compute_pair_density_spin_traced(phi_rmuT_X, phi_rmu_Y, mesh_xy)
-    del psi_G_val, phi_rmu_Y, phi_rmuT_X
+    if norms_l_j is not None:
+        # Y shape (nk, nb, ns, n_rmu); X shape (nk, n_rmu, nb, ns)
+        psi_l_rmu_Y = psi_l_rmu_Y / norms_l_j[None, :, None, None]
+        psi_l_rmuT_X = psi_l_rmuT_X / norms_l_j[None, None, :, None]
+    P_l_k = compute_pair_density_spin_traced(psi_l_rmuT_X, psi_l_rmu_Y, mesh_xy)
+    del psi_G_l, psi_l_rmu_Y, psi_l_rmuT_X
 
-    # ---- Conduction window ----
-    psi_G_cond, _ = read_Gvecs_to_devices(
-        wfn, sym, (n_val, n_val + n_cond), meta, bispinor, mesh_xy,
+    # ---- Right window ----
+    psi_G_r, _ = read_Gvecs_to_devices(
+        wfn, sym, right_range, meta, bispinor, mesh_xy,
     )
-    psi_rmu_Y, psi_rmuT_X = get_sharded_wfns_centroids(
-        psi_G_cond, meta, cand_idx, kvecs_frac, mesh_xy, (n_val, n_val + n_cond),
+    psi_r_rmu_Y, psi_r_rmuT_X = get_sharded_wfns_centroids(
+        psi_G_r, meta, cand_idx, kvecs_frac, mesh_xy, right_range,
     )
-    P_c_k = compute_pair_density_spin_traced(psi_rmuT_X, psi_rmu_Y, mesh_xy)
-    del psi_G_cond, psi_rmu_Y, psi_rmuT_X
+    if norms_r_j is not None:
+        psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
+        psi_r_rmuT_X = psi_r_rmuT_X / norms_r_j[None, None, :, None]
+    P_r_k = compute_pair_density_spin_traced(psi_r_rmuT_X, psi_r_rmu_Y, mesh_xy)
+    del psi_G_r, psi_r_rmu_Y, psi_r_rmuT_X
 
-    # ---- q=0 Gram: sum_k w_k · conj(P_v_k) · P_c_k ----
-    G = compute_gram_q0_from_left_right(P_v_k, P_c_k, kw, mesh_xy)
+    # ---- q=0 Gram: sum_k w_k · conj(P_l_k) · P_r_k ----
+    G = compute_gram_q0_from_left_right(P_l_k, P_r_k, kw, mesh_xy)
     G.block_until_ready()
     return G

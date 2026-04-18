@@ -454,3 +454,75 @@ def test_trR_over_trG_sharded_matches_single_device():
         rtol=1e-10, atol=1e-12,
         err_msg="sharded trR_over_trG diverges from single-device beyond fp64 noise",
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Wrapper-level argument validation (asymmetric windows + PW safety guard)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class _FakeWFN:
+    """Minimal stand-in exposing only the attributes the wrapper inspects
+    before it tries to build a Gram. Used to test the early-raising
+    validation without needing a real WFN.h5 + load_wfns pipeline."""
+    def __init__(self, nbands, ngk, nspinor, nelec):
+        self.nbands = nbands
+        self.ngk = np.asarray(ngk, dtype=np.int64)
+        self.nspinor = nspinor
+        self.nelec = nelec
+
+
+def test_prune_wrapper_raises_on_band_window_larger_than_nbands():
+    """Explicit (left, right) that overshoots wfn.nbands must raise."""
+    from src.centroid.pivoted_cholesky import prune_candidates_by_pivoted_cholesky
+    wfn = _FakeWFN(nbands=100, ngk=[512, 512], nspinor=2, nelec=8)
+    cand = np.zeros((64, 3), dtype=np.int64)
+    with pytest.raises(ValueError, match="wfn.nbands"):
+        prune_candidates_by_pivoted_cholesky(
+            wfn, sym=None, cand_idx=cand, n_keep=32,
+            band_range_left=(0, 50),
+            band_range_right=(0, 150),   # 150 > nbands=100
+        )
+
+
+def test_prune_wrapper_raises_when_half_pw_basis_exceeded():
+    """Requesting bands beyond 50% of the PW basis must raise — centroid
+    pruning is ill-posed there (caller should prune on the grid directly)."""
+    from src.centroid.pivoted_cholesky import prune_candidates_by_pivoted_cholesky
+    # 0.5 · ngk_max · nspinor = 0.5 · 200 · 2 = 200.
+    wfn = _FakeWFN(nbands=400, ngk=[200, 200, 200, 200], nspinor=2, nelec=8)
+    cand = np.zeros((64, 3), dtype=np.int64)
+    with pytest.raises(ValueError, match="exceeds 50 % of the plane-wave basis"):
+        prune_candidates_by_pivoted_cholesky(
+            wfn, sym=None, cand_idx=cand, n_keep=32,
+            band_range_left=(0, 250),    # 250 > 200 = half-basis
+            band_range_right=(0, 50),
+        )
+    # Legacy (n_val, n_cond) form hits the same guard.
+    with pytest.raises(ValueError, match="exceeds 50 % of the plane-wave basis"):
+        prune_candidates_by_pivoted_cholesky(
+            wfn, sym=None, cand_idx=cand, n_keep=32,
+            n_val=8, n_cond=250,   # 8 + 250 = 258 > 200
+        )
+
+
+def test_prune_wrapper_accepts_half_pw_boundary():
+    """Right at the 50% boundary is allowed (strict >)."""
+    from src.centroid.pivoted_cholesky import prune_candidates_by_pivoted_cholesky
+    wfn = _FakeWFN(nbands=400, ngk=[200, 200], nspinor=2, nelec=8)
+    cand = np.zeros((4, 3), dtype=np.int64)
+    # 200 bands == 0.5 · 200 · 2; the guard checks > 0.5 * npw, so exactly
+    # equal passes. We only need the pre-Gram checks to clear — so pick
+    # a legacy-mode window and expect the call to fail *later* (inside
+    # load_wfns / the Gram build path) rather than at the safety check.
+    # Test: the ValueError we want *not* to see is the PW-basis message.
+    try:
+        prune_candidates_by_pivoted_cholesky(
+            wfn, sym=None, cand_idx=cand, n_keep=2,
+            band_range_left=(0, 200),
+            band_range_right=(0, 200),
+        )
+    except ValueError as exc:
+        assert "exceeds 50 % of the plane-wave basis" not in str(exc)
+    except Exception:
+        pass  # any non-ValueError (AttributeError from missing sym etc.) is fine
