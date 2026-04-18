@@ -285,6 +285,84 @@ def compute_CCT_from_left_right_spin_matrix(
 	return _isdf_pipeline_cache[cache_key](P_l_k_ab, P_r_k_ab, nkx, nky, nkz)
 
 
+def compute_gram_q0_from_left_right(
+	P_v_k: jax.Array,
+	P_c_k: jax.Array,
+	k_weights: jax.Array,
+	mesh_xy: Mesh,
+) -> jax.Array:
+	"""
+	Build the q=0 valence-conduction pair-product Gram matrix from two
+	per-k pair densities produced by ``compute_pair_density_spin_traced``.
+
+	Mathematically (q=0 special case of the CCT-over-k structure):
+
+	    G_{ab} = Σ_k w_k · [Σ_v φ_{v,k}(r_a)  φ*_{v,k}(r_b)]
+	                     · [Σ_c ψ*_{c,k}(r_a) ψ_{c,k}(r_b)]
+	           = Σ_k w_k · conj(P_v_k(a,b)) · P_c_k(a,b)
+
+	where both ``P_v_k`` and ``P_c_k`` follow the gw_jax convention
+
+	    P_k(μ, ν) = Σ_{n,s} ψ*_{n,k,s}(μ) · ψ_{n,k,s}(ν)
+
+	(the ``compute_pair_density_spin_traced`` output). The ``conj`` on
+	``P_v_k`` flips its conjugation pattern to the valence-projector form
+	φ(a)φ*(b); multiplying it elementwise by the conduction
+	ψ*(a)ψ(b) yields the valence-conduction pair-product Gram used for
+	pivoted-Cholesky candidate pruning. See
+	``sandbox/pivoted_cholesky.md`` §1 for the full derivation.
+
+	Compared to ``compute_CCT_from_left_right``, this drops the k→q FFT
+	pair: at q=0 the k-sum IS the answer, no convolution is needed. For
+	any q≠0 you want the CCT path, not this one.
+
+	Args:
+		P_v_k: (nk, n_rmu, n_rmu) complex, valence pair density,
+			P(None, 'x', 'y'). The gw_jax-convention pair density — pass
+			the output of ``compute_pair_density_spin_traced`` fed with
+			the valence window.
+		P_c_k: (nk, n_rmu, n_rmu) complex, conduction pair density, same
+			layout. Same routine, conduction window.
+		k_weights: (nk,) real, k-point weights (IBZ weights summing to 1,
+			or 1/nk_tot for each full-BZ k-point — whatever convention
+			was used when building P_v_k / P_c_k).
+		mesh_xy: ('x','y') device mesh, same one used for the pair
+			densities.
+
+	Returns:
+		G: (n_rmu, n_rmu) complex Hermitian PSD, sharded P('x','y') on
+			the mesh.
+	"""
+	nk, n_rmu, _ = P_v_k.shape
+	cache_key = ('gram_q0_LR', id(mesh_xy), nk, n_rmu)
+
+	if cache_key not in _isdf_pipeline_cache:
+		in_xy = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+		out_xy = NamedSharding(mesh_xy, P('x', 'y'))
+		kw_rep = NamedSharding(mesh_xy, P())
+
+		@partial(jax.jit,
+		         in_shardings=(in_xy, in_xy, kw_rep),
+		         out_shardings=out_xy)
+		def _compute_gram_q0(P_v: jax.Array, P_c: jax.Array,
+		                     kw: jax.Array) -> jax.Array:
+			# Per-k product of (conj P_v) × P_c, weighted by kw[k], summed.
+			# Broadcasting kw to (nk, 1, 1) matches the (nk, μ, ν) layout.
+			prod = jnp.conj(P_v) * P_c
+			G = jnp.sum(kw[:, None, None] * prod, axis=0)
+			# Symmetrize: the q=0 Gram is Hermitian by construction, but
+			# fp-roundoff + reduction-order noise can break it. The
+			# pivoted-Cholesky select does its own diagonal clamp, but
+			# symmetrizing here costs only O(n_rmu²) and keeps the select
+			# on a bit-cleaner input.
+			G = 0.5 * (G + jnp.conj(G.T))
+			return G
+
+		_isdf_pipeline_cache[cache_key] = _compute_gram_q0
+
+	return _isdf_pipeline_cache[cache_key](P_v_k, P_c_k, k_weights)
+
+
 def compute_ZCT_from_left_right_zchunk(
 	P_l_k_muz: jax.Array,
 	P_r_k_muz: jax.Array,

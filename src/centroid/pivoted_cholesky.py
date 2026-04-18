@@ -336,6 +336,7 @@ def prune_candidates_by_pivoted_cholesky(
     tol_rel: float = 1e-10,
     verbose: bool = True,
     mesh: Mesh | None = None,
+    bispinor: bool = False,
 ) -> tuple[np.ndarray, int, jnp.ndarray, jnp.ndarray]:
     """Full q=0 pruning pipeline: gather → Gram → pivoted Cholesky → pivots.
 
@@ -379,45 +380,80 @@ def prune_candidates_by_pivoted_cholesky(
             f"wfn.nbands={n_tot} < n_val + n_cond = {n_val} + {n_cond}"
         )
 
-    if k_weights is None:
-        kw_arr = (np.asarray(wfn.kweights, dtype=np.float64)
-                  if hasattr(wfn, 'kweights') else
-                  np.ones(wfn.nkpts, dtype=np.float64) / wfn.nkpts)
-    else:
-        kw_arr = np.asarray(k_weights, dtype=np.float64)
-    kw_j = jnp.asarray(kw_arr, dtype=jnp.float32)
+    # Decide which pipeline to use based on the mesh shape:
+    #   • 2-D mesh with both 'x' and 'y'  → load_wfns-based pipeline:
+    #         read_Gvecs_to_devices → get_sharded_wfns_centroids →
+    #         compute_pair_density_spin_traced → compute_gram_q0_from_left_right
+    #         (G produced as P('x','y'); reshard to P(('x','y'), None) for select)
+    #   • 1-D mesh (just 'x')             → single-axis make_sharded_gram_q0
+    #   • No mesh                         → single-device build_candidate_gram_q0
+    # The 2-D path skips the host-side gather entirely and matches gw_jax's
+    # ISDF data loading; the 1-D path is kept as a fallback (and compatibility
+    # with earlier CLI invocations).
+    is_2d_mesh = (mesh is not None
+                  and 'x' in mesh.axis_names
+                  and 'y' in mesh.axis_names)
+
+    if not is_2d_mesh:
+        if k_weights is None:
+            kw_arr = (np.asarray(wfn.kweights, dtype=np.float64)
+                      if hasattr(wfn, 'kweights') else
+                      np.ones(wfn.nkpts, dtype=np.float64) / wfn.nkpts)
+        else:
+            kw_arr = np.asarray(k_weights, dtype=np.float64)
+        kw_j = jnp.asarray(kw_arr, dtype=jnp.float32)
 
     if verbose:
-        print(f"[pivoted_cholesky] M={M} candidates, n_keep={n_keep}, "
-              f"n_val={n_val}, n_cond={n_cond}, nk_irr={wfn.nkpts}")
+        if is_2d_mesh:
+            print(f"[pivoted_cholesky] M={M} candidates, n_keep={n_keep}, "
+                  f"n_val={n_val}, n_cond={n_cond}, nk_tot={sym.nk_tot} "
+                  f"(full-BZ via load_wfns on mesh "
+                  f"x={mesh.shape['x']}, y={mesh.shape['y']})")
+        else:
+            print(f"[pivoted_cholesky] M={M} candidates, n_keep={n_keep}, "
+                  f"n_val={n_val}, n_cond={n_cond}, nk_irr={wfn.nkpts} "
+                  f"(IBZ via host-gather)")
 
-    # Gather φ (valence, [0, n_val)) and ψ (conduction, [n_val, n_val+n_cond)).
-    phi = gather_wfn_at_candidates(wfn, sym, cand_idx, 0, n_val)
-    psi = gather_wfn_at_candidates(wfn, sym, cand_idx, n_val, n_val + n_cond)
-
-    # Fold spinor into band so the Gram einsum sees (nk, nv_eff, M).
-    phi_flat = _fold_spin_into_band(phi)
-    psi_flat = _fold_spin_into_band(psi)
-
-    # Sharded path: row-shard G and L across mesh 'x'. Requires M divisible
-    # by n_dev — gate and fall back to single-device if the condition isn't
-    # met (keeps the CLI behaviour predictable).
-    if mesh is not None:
-        n_dev = mesh.shape['x']
-        if M % n_dev != 0:
-            if verbose:
-                print(f"[pivoted_cholesky] M={M} not divisible by mesh 'x' "
-                      f"size {n_dev}; falling back to single-device.")
-            mesh = None
-        elif verbose:
-            print(f"[pivoted_cholesky] sharded build+select on mesh 'x' "
-                  f"of size {n_dev}")
-
-    if mesh is not None:
-        gram_step = make_sharded_gram_q0(mesh, M, enforce_hermitian=True)
-        G = gram_step(phi_flat, psi_flat, kw_j)
+    if is_2d_mesh:
+        # --- 2-D pipeline: full-BZ load_wfns + gw_jax pair-density helpers ---
+        G = build_gram_q0_via_loadwfns(
+            wfn, sym, jnp.asarray(cand_idx),
+            n_val=n_val, n_cond=n_cond,
+            mesh_xy=mesh, bispinor=bispinor, verbose=verbose,
+        )
+        # Reshard the Gram output ('x','y') → combined-axis row shard
+        # (('x','y'), None) so the existing sharded select has its
+        # column-access pattern stay collective-free.
+        if verbose:
+            print(f"[pivoted_cholesky] resharding G P('x','y') → "
+                  f"P(('x','y'), None) for select")
+        G = jax.lax.with_sharding_constraint(
+            G, NamedSharding(mesh, PartitionSpec(('x', 'y'), None)),
+        )
     else:
-        G = build_candidate_gram_q0(phi_flat, psi_flat, k_weights=kw_j)
+        # --- Legacy 1-D / single-device path: host-gather + IBZ sum ---
+        # Gather φ (valence, [0, n_val)) and ψ (conduction, [n_val, n_val+n_cond)).
+        phi = gather_wfn_at_candidates(wfn, sym, cand_idx, 0, n_val)
+        psi = gather_wfn_at_candidates(wfn, sym, cand_idx, n_val, n_val + n_cond)
+        phi_flat = _fold_spin_into_band(phi)
+        psi_flat = _fold_spin_into_band(psi)
+
+        if mesh is not None:
+            n_dev = mesh.shape['x']
+            if M % n_dev != 0:
+                if verbose:
+                    print(f"[pivoted_cholesky] M={M} not divisible by mesh 'x' "
+                          f"size {n_dev}; falling back to single-device.")
+                mesh = None
+            elif verbose:
+                print(f"[pivoted_cholesky] sharded build+select on mesh 'x' "
+                      f"of size {n_dev}")
+
+        if mesh is not None:
+            gram_step = make_sharded_gram_q0(mesh, M, enforce_hermitian=True)
+            G = gram_step(phi_flat, psi_flat, kw_j)
+        else:
+            G = build_candidate_gram_q0(phi_flat, psi_flat, k_weights=kw_j)
     G.block_until_ready()
 
     if verbose:
@@ -426,8 +462,13 @@ def prune_candidates_by_pivoted_cholesky(
               f"diag range [{diag.min():.3e}, {diag.max():.3e}]")
 
     if mesh is not None:
+        # Pick the select's axis to match G's current sharding: for the
+        # 2-D pipeline we already with_sharding_constraint'd G to
+        # P(('x','y'), None), so the select is also combined-axis.
+        select_axis = ('x', 'y') if is_2d_mesh else 'x'
         select_step = make_sharded_pivoted_cholesky_select(
             mesh, M, n_keep, tol_rel=tol_rel, tol_abs=0.0,
+            mesh_axis=select_axis,
         )
         piv, L, rank, d_final, d_taken = select_step(G)
     else:
@@ -550,7 +591,7 @@ def make_sharded_gram_q0(
             # Pick out this shard's columns of the left factors. The
             # right factor stays the full M so the output has shape
             # (M_slab, M).
-            my_idx = lax.axis_index('x')
+            my_idx = lax.axis_index('x')   # legacy 1-D 'x'-only path
             a_start = my_idx * M_slab
             phi_a_block = lax.dynamic_slice_in_dim(
                 phi_full, a_start, M_slab, axis=2
@@ -633,34 +674,48 @@ def make_sharded_pivoted_cholesky_select(
     *,
     tol_rel: float = 1e-10,
     tol_abs: float = 0.0,
+    mesh_axis: str | tuple[str, ...] = 'x',
 ):
     """Build a jitted sharded pivoted-Cholesky select closure over ``mesh``.
 
     The returned function signature matches ``pivoted_cholesky_select``
-    up to sharding: it takes a row-sharded ``G`` and returns piv (replicated),
+    up to sharding: it takes a row-sharded ``G`` (sharded on
+    ``mesh_axis`` along its first axis) and returns piv (replicated),
     L (row-sharded same as G), rank (replicated), d_final (row-sharded),
     d_taken (replicated).
 
     Args:
-        mesh: 1-axis device mesh named 'x'. ``M`` must be divisible by
-            ``mesh.shape['x']``.
+        mesh: device mesh containing every axis in ``mesh_axis``.
         M: total candidate count. Static.
         k_keep: target pivot count. Static.
         tol_rel, tol_abs: stopping tolerances; see
             ``pivoted_cholesky_select`` for semantics. Static.
+        mesh_axis: axis (or tuple of axes for combined-axis sharding) on
+            ``mesh`` along which the row dim of G is sharded. Default
+            ``'x'`` matches the legacy 1-D path. Pass e.g. ``('x', 'y')``
+            after a ``with_sharding_constraint`` from a 2-D-built G to a
+            flat row-sharded layout (the natural step before pivoting).
 
     Returns:
         A callable ``(G_row_sharded,) -> (piv, L, rank, d_final, d_taken)``.
     """
-    if 'x' not in mesh.axis_names:
-        raise ValueError(f"mesh must have an 'x' axis, got {mesh.axis_names}")
-    n_dev = mesh.shape['x']
+    axis_names = (mesh_axis,) if isinstance(mesh_axis, str) else tuple(mesh_axis)
+    for ax in axis_names:
+        if ax not in mesh.axis_names:
+            raise ValueError(
+                f"mesh_axis {mesh_axis!r} references '{ax}' not in "
+                f"mesh axes {mesh.axis_names}"
+            )
+    n_dev = 1
+    for a in axis_names:
+        n_dev *= mesh.shape[a]
     if M % n_dev != 0:
-        raise ValueError(f"M={M} must be divisible by mesh 'x' size {n_dev}")
+        raise ValueError(f"M={M} must be divisible by product of mesh axes "
+                         f"{mesh_axis} (= {n_dev})")
     M_slab = M // n_dev
 
-    row_shard = PartitionSpec('x', None)
-    row_shard_1d = PartitionSpec('x')
+    row_shard = PartitionSpec(mesh_axis, None)
+    row_shard_1d = PartitionSpec(mesh_axis)
     rep = PartitionSpec()
 
     in_specs = (row_shard,)
@@ -673,7 +728,7 @@ def make_sharded_pivoted_cholesky_select(
             real_dtype = G_slab.real.dtype
             eps = jnp.finfo(real_dtype).eps
             minus_inf = jnp.array(-jnp.inf, dtype=real_dtype)
-            my_idx = lax.axis_index('x')
+            my_idx = lax.axis_index(mesh_axis)
 
             # Initial local diagonal: each device owns rows
             # [my_idx*M_slab, (my_idx+1)*M_slab), and the diagonal of G
@@ -688,7 +743,7 @@ def make_sharded_pivoted_cholesky_select(
             local_diag = jnp.maximum(local_diag, 0.0)
 
             # d0max is a global statistic — reduce across shards.
-            d0max = lax.pmax(jnp.max(local_diag), axis_name='x')
+            d0max = lax.pmax(jnp.max(local_diag), axis_name=mesh_axis)
 
             L_slab = jnp.zeros((M_slab, k_keep), dtype=G_slab.dtype)
             piv = -jnp.ones((k_keep,), dtype=jnp.int32)
@@ -710,7 +765,7 @@ def make_sharded_pivoted_cholesky_select(
                 local_global_p = (my_idx * M_slab + local_p_idx).astype(jnp.int32)
 
                 # Reduce to find the global pivot value.
-                global_pv = lax.pmax(local_pv, 'x')
+                global_pv = lax.pmax(local_pv, mesh_axis)
                 # Tie-break: among devices that match the global max, take
                 # the one with the smallest global_p. Non-winners contribute
                 # a sentinel (INT_MAX) so the min is over just the winners.
@@ -718,7 +773,7 @@ def make_sharded_pivoted_cholesky_select(
                 winner_p = jnp.where(
                     i_am_winner, local_global_p, jnp.int32(2**30)
                 )
-                global_p = -lax.pmax(-winner_p, 'x')                 # min over winners
+                global_p = -lax.pmax(-winner_p, mesh_axis)           # min over winners
                 pivot_val = global_pv
 
                 take = (~done) & (pivot_val > tol_abs) & (pivot_val > tol_rel * d0max)
@@ -738,7 +793,7 @@ def make_sharded_pivoted_cholesky_select(
                 local_Lp = jnp.where(
                     my_has_p, local_Lp, jnp.zeros_like(local_Lp)
                 )
-                L_p = lax.psum(local_Lp, 'x')                         # (k_keep,) replicated
+                L_p = lax.psum(local_Lp, mesh_axis)                  # (k_keep,) replicated
 
                 prev_mask = (col_ids_k < j).astype(G_slab.dtype)
                 corr_slab = L @ (jnp.conj(L_p) * prev_mask)           # (M_slab,)
@@ -791,3 +846,139 @@ def make_sharded_pivoted_cholesky_select(
         )(G)
 
     return step
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Full 2-D Gram pipeline: load_wfns → pair density → q=0 Gram
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Uses the same data-loading path as the gw_jax ISDF fit:
+#
+#   read_Gvecs_to_devices(...)                       — full-BZ G-space wfns
+#      ↓
+#   get_sharded_wfns_centroids(...)                  — iFFT + gather at
+#                                                      candidate points;
+#                                                      returns psi_rmu_Y and
+#                                                      psi_rmuT_X (the latter
+#                                                      already conjugated)
+#      ↓
+#   compute_pair_density_spin_traced(psi_rmuT_X, psi_rmu_Y, mesh)
+#      ↓    P_k[mu_X, nu_Y] = Σ_{n,s} ψ*(μ) ψ(ν)        (gw_jax convention)
+#
+# Called once for valence (→ P_v_k) and once for conduction (→ P_c_k). Then
+# at q=0:
+#
+#   G[mu_X, nu_Y] = Σ_k w_k · conj(P_v_k) · P_c_k
+#                = common.isdf_fitting.compute_gram_q0_from_left_right(
+#                      P_v_k, P_c_k, k_weights, mesh
+#                  )
+#
+# The conj() on P_v_k flips it from gw_jax's Σ_v φ*(μ)φ(ν) to the
+# valence-projector form Σ_v φ(a)φ*(b) the Gram definition needs.
+#
+# Uses full-BZ unfold with uniform k-weights = 1/nk_tot (read_Gvecs_to_devices
+# unfolds symmetry, so IBZ-weighted IBZ data are not the inputs). This is the
+# correct convention to match gw_jax's pair-density pipeline exactly.
+
+
+def build_gram_q0_via_loadwfns(
+    wfn: WFNReader,
+    sym: symmetry_maps.SymMaps,
+    cand_idx: jnp.ndarray,
+    n_val: int,
+    n_cond: int,
+    mesh_xy: Mesh,
+    *,
+    bispinor: bool = False,
+    verbose: bool = True,
+) -> jnp.ndarray:
+    """Build the q=0 candidate Gram on a 2-D mesh using gw_jax's data path.
+
+    Full-BZ unfold: calls ``load_wfns.read_Gvecs_to_devices`` for the
+    valence window and again for the conduction window, feeds both
+    through ``get_sharded_wfns_centroids`` at the supplied candidate
+    indices, builds sharded pair densities via
+    ``compute_pair_density_spin_traced``, and combines them with the
+    q=0 sum via ``compute_gram_q0_from_left_right``. k-weights are
+    uniform 1 / nk_tot because we've unfolded.
+
+    Args:
+        wfn: open WFNReader.
+        sym: matching SymMaps.
+        cand_idx: (M, 3) int32 FFT-grid indices of candidate points.
+            Must be a ``jnp.ndarray`` (will be ``jnp.asarray``-ed if not).
+        n_val: number of valence bands.
+        n_cond: number of conduction bands above n_val.
+        mesh_xy: 2-D device mesh with axes ``'x'`` and ``'y'``. (Other
+            axis names work too, as long as both are present; the pair
+            density / Gram helpers hard-code the axis names ``'x'`` and
+            ``'y'`` at present — we follow that convention.)
+        bispinor: if True, upcast the spin structure to 4 components
+            (matches gw_jax's bispinor mode). Default False.
+        verbose: print progress lines.
+
+    Returns:
+        G: (M, M) complex, sharded ``P('x','y')`` on the mesh — ready to
+           be reshard-constrained to a 1-D row-shard for the select
+           stage.
+    """
+    # Lazy imports — these modules pull in the full gw_jax dep chain and
+    # we don't want to charge the single-device prune path for it.
+    from common.meta import Meta
+    from common.load_wfns import (
+        read_Gvecs_to_devices,
+        get_sharded_wfns_centroids,
+    )
+    from common.isdf_fitting import (
+        compute_pair_density_spin_traced,
+        compute_gram_q0_from_left_right,
+    )
+
+    M = int(cand_idx.shape[0])
+    cand_idx = jnp.asarray(cand_idx, dtype=jnp.int64)
+
+    # Build Meta using the full-BZ nk_tot (load_wfns unfolds).
+    meta = Meta.from_system(
+        wfn, sym,
+        nval=n_val, ncond=n_cond,
+        nband=n_val + n_cond,
+        n_rmu=M,
+        bispinor=bispinor,
+    )
+
+    # Uniform k-weights for full-BZ unfold.
+    kw = jnp.ones((sym.nk_tot,), dtype=jnp.float32) / float(sym.nk_tot)
+
+    # Full-BZ fractional k-vectors, as load_wfns expects.
+    kgrid = np.asarray(wfn.kgrid, dtype=np.float64)
+    kvecs_frac = np.asarray(sym.kvecs_asints) / kgrid[None, :]
+
+    if verbose:
+        print(f"[pivoted_cholesky] 2-D Gram build via load_wfns: "
+              f"nk_tot={sym.nk_tot}, nband_val={n_val}, nband_cond={n_cond}, "
+              f"M={M}")
+
+    # ---- Valence window ----
+    psi_G_val, _ = read_Gvecs_to_devices(
+        wfn, sym, (0, n_val), meta, bispinor, mesh_xy,
+    )
+    phi_rmu_Y, phi_rmuT_X = get_sharded_wfns_centroids(
+        psi_G_val, meta, cand_idx, kvecs_frac, mesh_xy, (0, n_val),
+    )
+    P_v_k = compute_pair_density_spin_traced(phi_rmuT_X, phi_rmu_Y, mesh_xy)
+    del psi_G_val, phi_rmu_Y, phi_rmuT_X
+
+    # ---- Conduction window ----
+    psi_G_cond, _ = read_Gvecs_to_devices(
+        wfn, sym, (n_val, n_val + n_cond), meta, bispinor, mesh_xy,
+    )
+    psi_rmu_Y, psi_rmuT_X = get_sharded_wfns_centroids(
+        psi_G_cond, meta, cand_idx, kvecs_frac, mesh_xy, (n_val, n_val + n_cond),
+    )
+    P_c_k = compute_pair_density_spin_traced(psi_rmuT_X, psi_rmu_Y, mesh_xy)
+    del psi_G_cond, psi_rmu_Y, psi_rmuT_X
+
+    # ---- q=0 Gram: sum_k w_k · conj(P_v_k) · P_c_k ----
+    G = compute_gram_q0_from_left_right(P_v_k, P_c_k, kw, mesh_xy)
+    G.block_until_ready()
+    return G

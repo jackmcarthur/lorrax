@@ -378,12 +378,16 @@ def _kmeans_update_step_sharded_impl(
     metric_tensor,
     n_c: int,
     c_block: int,
+    axis_name,
 ):
-    """Per-shard body for `kmeans_update_step_sharded`. See that function.
+    """Per-shard body for the sharded kmeans update step.
 
-    Runs inside `shard_map` with P sharded along axis 'x'. Each device sees
-    only its P_local slice; the two `psum` collectives combine the per-shard
-    `segment_sum` accumulators into globally correct (C, 3) / (C,) tensors.
+    Runs inside ``shard_map`` with the point axis sharded along
+    ``axis_name`` (which can be a string — e.g. ``'x'`` — or a tuple —
+    e.g. ``('X', 'Y')`` — in which case the sum reduces across the
+    combined axis). Each device sees only its P_local slice; the two
+    ``psum`` collectives combine the per-shard ``segment_sum``
+    accumulators into globally correct (C, 3) / (C,) tensors.
     """
     # Per-shard local label assignment (P_local, 3) × replicated (C, 3) → (P_local,)
     local_labels = assign_labels_chunked(
@@ -393,53 +397,73 @@ def _kmeans_update_step_sharded_impl(
     local_wsum, local_w = _local_update_accumulators(
         positions_frac, centroids_frac, rho_flat, local_labels, n_c
     )
-    sum_weighted_delta = lax.psum(local_wsum, axis_name='x')      # (C, 3) replicated
-    sum_weights = lax.psum(local_w, axis_name='x')                # (C,) replicated
+    sum_weighted_delta = lax.psum(local_wsum, axis_name=axis_name)  # (C, 3) replicated
+    sum_weights = lax.psum(local_w, axis_name=axis_name)            # (C,) replicated
     new_centroids_frac, movement_sq = _finalize_update(
         centroids_frac, sum_weighted_delta, sum_weights, metric_tensor
     )
     return new_centroids_frac, movement_sq, local_labels
 
 
-def make_sharded_kmeans_update(mesh: Mesh, n_c: int, c_block: int = _DEFAULT_C_BLOCK):
-    """Build a sharded `kmeans_update_step` bound to a device mesh.
+def make_sharded_kmeans_update(
+    mesh: Mesh,
+    n_c: int,
+    c_block: int = _DEFAULT_C_BLOCK,
+    mesh_axis: str | tuple[str, ...] = 'x',
+):
+    """Build a sharded ``kmeans_update_step`` bound to a device mesh.
 
-    The returned callable expects:
-      * positions_frac, rho_flat sharded along ``mesh['x']`` on the P axis.
-      * centroids_frac, metric_tensor replicated.
+    Sharding is driven by ``mesh_axis``, which can be a single axis name
+    (the historical 1-D case, e.g. ``'x'``) OR a tuple of axis names
+    (combined-axis sharding, e.g. ``('X', 'Y')`` to use all devices of a
+    2-D mesh as one flat point-sharding axis). The latter is what makes
+    the k-means stage share a mesh object with the downstream ISDF
+    pipeline (which needs X and Y separately for ``psi_rmu_[XY]`` pair
+    densities).
 
-    and returns:
-      * new_centroids_frac, movement_sq replicated (identical on every device).
-      * labels sharded along ``mesh['x']`` on the P axis (each device sees its
-        local slice, matching the input sharding).
+    Inputs to the returned callable:
+      * positions_frac, rho_flat sharded along ``mesh_axis`` on their P axis
+      * centroids_frac, metric_tensor replicated
 
-    We use ``shard_map`` so the single ``lax.psum`` inside the body is explicit
-    and the compiler has complete freedom to fuse the local work.
+    Outputs:
+      * new_centroids, movement_sq replicated
+      * labels sharded along ``mesh_axis`` on P
 
     Args:
-        mesh: 1-axis device mesh, axis name must be 'x'.
-        n_c: Static number of centroids (must match centroids_frac.shape[0]).
-        c_block: Static C-chunk size.
+        mesh: Device mesh. Must contain every axis in ``mesh_axis``.
+        n_c: Static number of centroids.
+        c_block: Static C-chunk size for the distance scan.
+        mesh_axis: Axis name(s) along which the P dimension is sharded.
+            Passed to ``PartitionSpec`` and ``lax.psum`` unchanged; JAX
+            accepts either a string or a tuple of strings for
+            combined-axis sharding.
     """
-    if 'x' not in mesh.axis_names:
-        raise ValueError(f"Mesh must have an 'x' axis, got {mesh.axis_names}")
+    axis_names = (mesh_axis,) if isinstance(mesh_axis, str) else tuple(mesh_axis)
+    for ax in axis_names:
+        if ax not in mesh.axis_names:
+            raise ValueError(
+                f"mesh_axis {mesh_axis!r} references '{ax}' which is not in "
+                f"mesh axes {mesh.axis_names}"
+            )
 
     in_specs = (
-        PartitionSpec('x', None),   # positions_frac (P, 3) sharded on P
-        PartitionSpec(None, None),  # centroids_frac (C, 3) replicated
-        PartitionSpec('x'),         # rho_flat (P,) sharded on P
-        PartitionSpec(None, None),  # metric_tensor (3, 3) replicated
+        PartitionSpec(mesh_axis, None),   # positions_frac (P, 3) sharded on P
+        PartitionSpec(None, None),        # centroids_frac (C, 3) replicated
+        PartitionSpec(mesh_axis),         # rho_flat (P,) sharded on P
+        PartitionSpec(None, None),        # metric_tensor (3, 3) replicated
     )
     out_specs = (
-        PartitionSpec(None, None),  # new_centroids replicated
-        PartitionSpec(None),        # movement_sq replicated
-        PartitionSpec('x'),         # labels sharded on P
+        PartitionSpec(None, None),        # new_centroids replicated
+        PartitionSpec(None),              # movement_sq replicated
+        PartitionSpec(mesh_axis),         # labels sharded on P
     )
 
     @partial(jax.jit, static_argnames=())
     def step(positions_frac, centroids_frac, rho_flat, metric_tensor):
         return shard_map(
-            lambda p, c, r, g: _kmeans_update_step_sharded_impl(p, c, r, g, n_c, c_block),
+            lambda p, c, r, g: _kmeans_update_step_sharded_impl(
+                p, c, r, g, n_c, c_block, mesh_axis,
+            ),
             mesh=mesh,
             in_specs=in_specs,
             out_specs=out_specs,
@@ -698,6 +722,7 @@ def weighted_kmeans_jax(
     tolerance: float = 5e-3,
     seed: int = 0,
     mesh: Mesh | None = None,
+    mesh_axis: str | tuple[str, ...] = 'x',
     force_shard: bool = False,
 ) -> tuple:
     """
@@ -739,8 +764,17 @@ def weighted_kmeans_jax(
         history: (N_c, max_steps) z-coordinate history (for debugging).
         steps_taken: Number of iterations until convergence.
     """
+    # Product of the sizes of every axis in `mesh_axis` — this is the
+    # actual number of point-shards. For a plain ('x',) 1-D mesh this is
+    # just mesh.shape['x']; for combined-axis ('X', 'Y') it's n_X * n_Y.
+    def _axis_size(m, axes):
+        axes = (axes,) if isinstance(axes, str) else tuple(axes)
+        n = 1
+        for a in axes:
+            n *= m.shape[a]
+        return n
     print(f"Starting weighted k-means with {N_c} clusters "
-          f"(mesh={'x=' + str(mesh.shape['x']) if mesh is not None else 'single-device'})...")
+          f"(mesh={'|'.join(str(a) + '=' + str(mesh.shape[a]) for a in (mesh_axis if isinstance(mesh_axis, tuple) else (mesh_axis,))) if mesh is not None else 'single-device'})...")
 
     # Precompute metric tensor: G = avec^T @ avec. Distances inherit avec's units.
     metric_tensor = jnp.array(avec.T @ avec, dtype=jnp.float32)
@@ -780,23 +814,26 @@ def weighted_kmeans_jax(
     _P_PER_SHARD_MIN = 100_000
     sharded_step = None
     if mesh is not None:
-        per_shard = n_points // mesh.shape['x']
-        if n_points % mesh.shape['x'] != 0:
+        n_shards = _axis_size(mesh, mesh_axis)
+        per_shard = n_points // n_shards
+        if n_points % n_shards != 0:
             raise ValueError(
-                f"n_points={n_points} must be divisible by mesh x-axis "
-                f"size {mesh.shape['x']} for even P-sharding"
+                f"n_points={n_points} must be divisible by the product of "
+                f"mesh axes {mesh_axis} (= {n_shards}) for even P-sharding"
             )
         if per_shard < _P_PER_SHARD_MIN and not force_shard:
-            print(f"[weighted_kmeans_jax] P/{mesh.shape['x']} = {per_shard} "
+            print(f"[weighted_kmeans_jax] P/{n_shards} = {per_shard} "
                   f"< {_P_PER_SHARD_MIN}; falling back to single-device "
                   f"(collective latency would dominate). Pass force_shard=True "
                   f"to override.")
             mesh = None
         else:
             if force_shard and per_shard < _P_PER_SHARD_MIN:
-                print(f"[weighted_kmeans_jax] P/{mesh.shape['x']} = {per_shard} "
+                print(f"[weighted_kmeans_jax] P/{n_shards} = {per_shard} "
                       f"< {_P_PER_SHARD_MIN}, but force_shard=True — using mesh anyway.")
-            sharded_step = make_sharded_kmeans_update(mesh, N_c, c_block=c_block)
+            sharded_step = make_sharded_kmeans_update(
+                mesh, N_c, c_block=c_block, mesh_axis=mesh_axis,
+            )
     
     # =========================================================================
     # K-means++ initialization — fully on-device, single jit dispatch.
@@ -834,8 +871,8 @@ def weighted_kmeans_jax(
 
     if mesh is not None:
         # Move inputs to the distributed layout now that k-means++ init is done.
-        pos_sharding = NamedSharding(mesh, PartitionSpec('x', None))
-        rho_sharding = NamedSharding(mesh, PartitionSpec('x'))
+        pos_sharding = NamedSharding(mesh, PartitionSpec(mesh_axis, None))
+        rho_sharding = NamedSharding(mesh, PartitionSpec(mesh_axis))
         rep_sharding = NamedSharding(mesh, PartitionSpec())
         positions = jax.device_put(positions, pos_sharding)
         rho_flat = jax.device_put(rho_flat, rho_sharding)
@@ -1111,18 +1148,37 @@ def main():
     rho_jax = jnp.asarray(charge_density, dtype=jnp.float32)
     avec_jax = jnp.asarray(avec_ang, dtype=jnp.float32)
 
+    # Sharding: build a 2-D mesh ('x','y') whenever possible. This is the
+    # same mesh shape used by the gw_jax ISDF pipeline, which lets the
+    # pivoted-Cholesky pruning stage below reuse load_wfns + the
+    # compute_pair_density_spin_traced helpers directly. The k-means Lloyd
+    # step treats the 2-D mesh as a *combined* axis via mesh_axis=('x','y')
+    # — it wants a 1-D point-sharding, and any flattening of the device
+    # grid works.
     mesh = None
+    kmeans_axis: str | tuple[str, ...] = 'x'
     if args.shard:
         devices = jax.devices()
-        if len(devices) < 2:
-            print(f"--shard requested but only {len(devices)} JAX device(s) "
+        n_dev = len(devices)
+        if n_dev < 2:
+            print(f"--shard requested but only {n_dev} JAX device(s) "
                   "visible; running single-device.")
         else:
-            mesh = Mesh(np.asarray(devices), ('x',))
-            print(f"Sharded Lloyd step: mesh axis 'x' of size {len(devices)}")
+            # Factor the device count into a 2-D (nx, ny). For 4 GPUs use
+            # 2×2; for 8 use 2×4 or 4×2 (pick 2×ceil(n/2)); etc. Simple
+            # heuristic: find largest nx ≤ sqrt(n) that divides n.
+            import math
+            nx = max(k for k in range(1, int(math.isqrt(n_dev)) + 1)
+                     if n_dev % k == 0)
+            ny = n_dev // nx
+            dev_grid = np.asarray(devices).reshape(nx, ny)
+            mesh = Mesh(dev_grid, ('x', 'y'))
+            kmeans_axis = ('x', 'y')
+            print(f"Sharded mesh: ('x'={nx}, 'y'={ny}) over {n_dev} devices")
 
     _, centroids_jax, _, _ = weighted_kmeans_jax(
         avec_jax, rho_jax, N_c=M_cand, seed=args.seed, mesh=mesh,
+        mesh_axis=kmeans_axis,
         force_shard=args.force_shard,
     )
 
