@@ -35,19 +35,28 @@ from common import timing
 # ============================================================================
 
 def exp_ikr_fftbox(fft_nx: int, fft_ny: int, fft_nz: int) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Return fractional coordinate grids for constructing exp(ik·r) on the FFT box."""
-    fx = jnp.arange(fft_nx, dtype=jnp.float64)[None, :, None, None] / float(fft_nx)
-    fy = jnp.arange(fft_ny, dtype=jnp.float64)[None, None, :, None] / float(fft_ny)
-    fz = jnp.arange(fft_nz, dtype=jnp.float64)[None, None, None, :] / float(fft_nz)
-    return fx, fy, fz
+    """Return fractional coordinate grids for constructing exp(ik·r) on the FFT box.
+
+    Tiny host-side shape builders: numpy first, jax.Array only at return.
+    Previously each jnp.arange/reshape emitted a standalone pjit at trace
+    time (~3 cache misses per call).
+    """
+    fx = np.arange(fft_nx, dtype=np.float64)[None, :, None, None] / float(fft_nx)
+    fy = np.arange(fft_ny, dtype=np.float64)[None, None, :, None] / float(fft_ny)
+    fz = np.arange(fft_nz, dtype=np.float64)[None, None, None, :] / float(fft_nz)
+    return jnp.asarray(fx), jnp.asarray(fy), jnp.asarray(fz)
 
 
 def fft_integer_axes(fft_nx: int, fft_ny: int, fft_nz: int) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Return integer FFT frequency grids in numpy.fft.fftfreq order."""
-    gx = (jnp.fft.fftfreq(fft_nx) * fft_nx).astype(jnp.float64).reshape(fft_nx, 1, 1)
-    gy = (jnp.fft.fftfreq(fft_ny) * fft_ny).astype(jnp.float64).reshape(1, fft_ny, 1)
-    gz = (jnp.fft.fftfreq(fft_nz) * fft_nz).astype(jnp.float64).reshape(1, 1, fft_nz)
-    return gx, gy, gz
+    """Return integer FFT frequency grids in numpy.fft.fftfreq order.
+
+    Host-side: numpy.fft.fftfreq + reshape, promoted to JAX only at return.
+    Saves ~7 cache misses per call vs the all-jnp formulation.
+    """
+    gx = (np.fft.fftfreq(fft_nx) * fft_nx).astype(np.float64).reshape(fft_nx, 1, 1)
+    gy = (np.fft.fftfreq(fft_ny) * fft_ny).astype(np.float64).reshape(1, fft_ny, 1)
+    gz = (np.fft.fftfreq(fft_nz) * fft_nz).astype(np.float64).reshape(1, 1, fft_nz)
+    return jnp.asarray(gx), jnp.asarray(gy), jnp.asarray(gz)
 
 
 # ============================================================================
