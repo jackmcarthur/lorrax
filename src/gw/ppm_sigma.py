@@ -37,12 +37,12 @@ File layout
 -----------
 
     data classes               PPMBuildResult / SigmaOmegaResult / _SigmaWindow / _SigmaPhysicsState / _SigmaBranch
-    leaf jits (physics)        _prepare_sigma_state · _project_tau_onto_omega · _accumulate_tau_into_window
-    cached kernel factories    _get_sigma_channel_pipeline · _get_sigma_tau_channel_kernel
+    leaf jits (physics)        _prepare_sigma_state · _project_tau_onto_omega
+    cached kernel factories    _get_sigma_kij_kernel · _get_sigma_tau_kernel
     PPM fit                    fit_gn_ppm
     host-side window build     _build_single_sigma_window · _build_three_sigma_windows
     accumulators               _SigmaAccumulator protocol
-                               _BufferedGpuAccumulator · _StreamedH5Accumulator
+                               _ReduceScatterGpuAccumulator · _StreamedH5Accumulator
     branch orchestration       _build_windows_for_branch (host) · _integrate_tau_windows_for_branch (device)
                                _run_sigma_branch (thin orchestrator)
     top-level driver           compute_sigma_c_ppm_omega_grid
@@ -121,7 +121,6 @@ class _SigmaBranch(NamedTuple):
     E_A: jax.Array              # (nk, nb) energy-above-Fermi for A-space (E_cond or H_val)
     base_mask_A: jax.Array      # (nk, nb) bool — which bands in A-space contribute
     kernel_sign: int            # +1 (Laplace on E_A ≥ 0)  /  -1 (sign-flipped kernel)
-    omega_sign_flip: int        # always +1 in current scheme (kept for generality)
     scale: float                # global prefactor from ω ↔ -ω symmetry (±1)
     omega_abs: np.ndarray       # non-negative ω values to evaluate at (|ω_rel|)
     omega_idx: np.ndarray       # global ω indices these map into
@@ -149,19 +148,19 @@ def _iter_branches(
     if omega_pos.size:
         branches += [
             _SigmaBranch(tag="ω≥E_F cond", E_A=E_cond, base_mask_A=cond_mask,
-                         kernel_sign=+1, omega_sign_flip=1, scale=+1.0,
+                         kernel_sign=+1, scale=+1.0,
                          omega_abs=omega_pos, omega_idx=idx_pos),
             _SigmaBranch(tag="ω≥E_F val",  E_A=H_val,  base_mask_A=val_mask,
-                         kernel_sign=-1, omega_sign_flip=1, scale=+1.0,
+                         kernel_sign=-1, scale=+1.0,
                          omega_abs=omega_pos, omega_idx=idx_pos),
         ]
     if omega_neg_abs.size:
         branches += [
             _SigmaBranch(tag="ω<E_F cond", E_A=E_cond, base_mask_A=cond_mask,
-                         kernel_sign=-1, omega_sign_flip=1, scale=-1.0,
+                         kernel_sign=-1, scale=-1.0,
                          omega_abs=omega_neg_abs, omega_idx=idx_neg),
             _SigmaBranch(tag="ω<E_F val",  E_A=H_val,  base_mask_A=val_mask,
-                         kernel_sign=+1, omega_sign_flip=1, scale=-1.0,
+                         kernel_sign=+1, scale=-1.0,
                          omega_abs=omega_neg_abs, omega_idx=idx_neg),
         ]
     return branches
@@ -217,8 +216,8 @@ def _materialize_window_mask_B(
     raise ValueError(f"Unknown mask_B_mode={mode!r}")
 
 
-_sigma_tau_channel_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
-_sigma_channel_pipeline_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
+_sigma_tau_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
+_sigma_kij_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
 _sigma_tau_scan_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
 
 
@@ -353,30 +352,11 @@ def _project_tau_onto_omega(
     return pref * contrib.astype(jnp.complex128)
 
 
-@jax.jit
-def _accumulate_tau_into_window(
-    acc_win: jax.Array,
-    sigma_tau_kij_re: jax.Array,
-    sigma_tau_kij_im: jax.Array,
-    omega_vec: jax.Array,
-    t_node: jax.Array,
-    alpha_eff: jax.Array,
-    omega_sign: jax.Array,
-    pref: jax.Array,
-    project_code: jax.Array,
-) -> jax.Array:
-    """Thin adder: ``acc_win + _project_tau_onto_omega(...)``, donated for in-place reuse."""
-    return acc_win + _project_tau_onto_omega(
-        sigma_tau_kij_re, sigma_tau_kij_im, omega_vec,
-        t_node, alpha_eff, omega_sign, pref, project_code,
-    )
-
-
 def _make_project_ri_reduce_scatter(mesh_xy: Mesh) -> Callable[..., jax.Array]:
     """Build a shard_map'd ψ* σ ψ that reduce-scatters the output.
 
     Drop-in replacement for ``projection_kernel.project_ri`` at the tail of
-    ``_sigma_channel_pipeline``.  Preserves the math exactly:
+    ``_sigma_kij_kernel``.  Preserves the math exactly:
 
         Σ_mn(k) = Σ_{s, μ} Σ_{s', μ'}  ψ*_m(k, s, μ) · σ(k, s, μ, s', μ')
                                         · ψ_n(k, s', μ')
@@ -455,7 +435,7 @@ def _make_project_ri_reduce_scatter(mesh_xy: Mesh) -> Callable[..., jax.Array]:
                      check_rep=False)
 
 
-def _get_sigma_channel_pipeline(
+def _get_sigma_kij_kernel(
     *,
     mesh_xy: Mesh,
     nkx: int,
@@ -464,7 +444,7 @@ def _get_sigma_channel_pipeline(
     nk_tot: int,
     bispinor: bool,
 ) -> Callable[..., jax.Array]:
-    """Return a jit-compatible sigma-channel pipeline with device-local FFTs.
+    """Return a jit-compatible sigma-kij kernel with device-local FFTs.
 
     The tail project (ψ* σ ψ → Σ_mn) uses the reduce-scatter variant so the
     emitted σ^τ is sharded (m_X, n_Y) — matching what
@@ -472,8 +452,8 @@ def _get_sigma_channel_pipeline(
     """
 
     pipeline_key = (id(mesh_xy), nkx, nky, nkz, nk_tot, bispinor)
-    if pipeline_key in _sigma_channel_pipeline_cache:
-        return _sigma_channel_pipeline_cache[pipeline_key]
+    if pipeline_key in _sigma_kij_kernel_cache:
+        return _sigma_kij_kernel_cache[pipeline_key]
 
     from common.fft_helpers import (
         make_jittable_local_fftn_3d,
@@ -504,7 +484,7 @@ def _get_sigma_channel_pipeline(
     _project_ri_rs = _make_project_ri_reduce_scatter(mesh_xy)
 
     @jax.jit
-    def _sigma_channel_pipeline(
+    def _sigma_kij_kernel(
         psi_coh_rmuT_X, psi_coh_rmu_Y, psi_proj_rmu_X, psi_proj_rmuT_Y,
         Gij, W_q,
     ):
@@ -519,11 +499,11 @@ def _get_sigma_channel_pipeline(
         sigma_k = _fft_flat_G(G_R * V_R * inv_sqrt_nk, _G_fftn)
         return _project_ri_rs(psi_proj_rmu_X, sigma_k, psi_proj_rmuT_Y)
 
-    _sigma_channel_pipeline_cache[pipeline_key] = _sigma_channel_pipeline
-    return _sigma_channel_pipeline
+    _sigma_kij_kernel_cache[pipeline_key] = _sigma_kij_kernel
+    return _sigma_kij_kernel
 
 
-def _get_sigma_tau_channel_kernel(
+def _get_sigma_tau_kernel(
     *,
     mesh_xy: Mesh,
     nkx: int,
@@ -535,12 +515,12 @@ def _get_sigma_tau_channel_kernel(
     """Return a cached tau-node sigma builder with jittable local FFTs."""
 
     cache_key = (id(mesh_xy), nkx, nky, nkz, nk_tot, bispinor)
-    if cache_key in _sigma_tau_channel_kernel_cache:
-        return _sigma_tau_channel_kernel_cache[cache_key]
+    if cache_key in _sigma_tau_kernel_cache:
+        return _sigma_tau_kernel_cache[cache_key]
 
     w_isdf._ensure_compilation_cache()
     q_mu_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    sigma_channel_pipeline = _get_sigma_channel_pipeline(
+    sigma_kij_kernel = _get_sigma_kij_kernel(
         mesh_xy=mesh_xy, nkx=nkx, nky=nky, nkz=nkz,
         nk_tot=nk_tot, bispinor=bispinor,
     )
@@ -560,7 +540,7 @@ def _get_sigma_tau_channel_kernel(
         return Gij, W_t_q
 
     @jax.jit
-    def _tau_channel_step(
+    def _tau_kernel(
         psi_coh_rmuT_X, psi_coh_rmu_Y,
         psi_proj_rmu_X, psi_proj_rmuT_Y,
         E_A, mask_A, B_q, Omega_q, mask_B,
@@ -570,14 +550,14 @@ def _get_sigma_tau_channel_kernel(
             E_A, mask_A, B_q, Omega_q, mask_B,
             E_ref_A, E_ref_B, t_node, eye_nb,
         )
-        return sigma_channel_pipeline(
+        return sigma_kij_kernel(
             psi_coh_rmuT_X, psi_coh_rmu_Y,
             psi_proj_rmu_X, psi_proj_rmuT_Y,
             Gij, W_t_q,
         )
 
-    _sigma_tau_channel_kernel_cache[cache_key] = _tau_channel_step
-    return _tau_channel_step
+    _sigma_tau_kernel_cache[cache_key] = _tau_kernel
+    return _tau_kernel
 
 
 def _get_sigma_tau_scan_kernel(
@@ -605,7 +585,7 @@ def _get_sigma_tau_scan_kernel(
     if cache_key in _sigma_tau_scan_cache:
         return _sigma_tau_scan_cache[cache_key]
 
-    tau_channel_step = _get_sigma_tau_channel_kernel(
+    tau_kernel = _get_sigma_tau_kernel(
         mesh_xy=mesh_xy, nkx=nkx, nky=nky, nkz=nkz,
         nk_tot=nk_tot, bispinor=bispinor,
     )
@@ -625,7 +605,7 @@ def _get_sigma_tau_scan_kernel(
 
         def body(acc, xs):
             t_node, alpha_node = xs
-            sigma_ri = tau_channel_step(
+            sigma_ri = tau_kernel(
                 psi_coh_rmuT_X, psi_coh_rmu_Y,
                 psi_proj_rmu_X, psi_proj_rmuT_Y,
                 E_A, mask_A, B_q, Omega_q, mask_B,
@@ -636,8 +616,8 @@ def _get_sigma_tau_scan_kernel(
             # α_eff = α(τ) · exp[-i·(E_ref_A + E_ref_B)·τ]  — minimax quad
             # weight with the phase shift absorbed into each τ node.
             alpha_eff = alpha_node * jnp.exp(-1j * E_ref_sum * t_node)
-            acc = _accumulate_tau_into_window(
-                acc, sigma_re, sigma_im, omega_vec,
+            acc = acc + _project_tau_onto_omega(
+                sigma_re, sigma_im, omega_vec,
                 t_node, alpha_eff, omega_sign, pref, project_code,
             )
             return acc, None
@@ -881,108 +861,32 @@ class _SigmaAccumulator:
     def finalize(self) -> jax.Array | None: ...
 
 
-class _BufferedGpuAccumulator(_SigmaAccumulator):
-    """Accumulate Σ^c(ω) on GPU into a single (n_ω, nk, nb, nb) tensor.
-
-    Per-window accumulation is kept separate so that the tau loop donates
-    its running buffer only once per window (helps XLA reuse the slot).
-    """
-    def __init__(self, shape: tuple[int, int, int, int]):
-        self.total = jnp.zeros(shape, dtype=jnp.complex128)
-        self._win_acc: jax.Array | None = None
-
-    def begin_window(self) -> None:
-        self._win_acc = jnp.zeros_like(self.total)
-
-    def add_tau(self, sigma_re, sigma_im, omega_vec,
-                t_node_j, alpha_eff_j, omega_sign_j, pref_j, project_code_j,
-                *, omega_global_idx=None):
-        assert self._win_acc is not None
-        self._win_acc = _accumulate_tau_into_window(
-            self._win_acc, sigma_re, sigma_im, omega_vec,
-            t_node_j, alpha_eff_j, omega_sign_j, pref_j, project_code_j,
-        )
-
-    def end_window(self) -> None:
-        assert self._win_acc is not None
-        self.total = self.total + self._win_acc
-        self._win_acc = None
-
-    def finalize(self) -> jax.Array:
-        return self.total
-
-
-# ---------------------------------------------------------------------------
-#  Reduce-scatter accumulator — scaffolding for the Σ_c(ω, k, m_X, n_Y) path.
-#
-#  Design intent (scaling target: n_rmu ≈ 10·n_b, n_k × n_b² ~ single-GPU HBM):
-#
-#      Σ_c(ω, k, m, n) lives on-GPU sharded (m on mesh.x, n on mesh.y) so
-#      every rank holds only (n_ω, n_k, n_b/p, n_b/p).  This is ~100× smaller
-#      than Σ_μν(k, q), which stays block-sharded (μ_X, ν_Y) upstream and
-#      never materializes replicated.  There is thus HBM headroom for many
-#      τ contributions to stack before a flush — we exploit that here.
-#
-#  Communication algorithm (the one to implement; not yet wired):
-#
-#      σ^τ   = project_ri(ψ, σ_k, ψ)           # currently: einsums auto-psum
-#                                               # over x AND y, σ^τ replicated
-#
-#      σ^τ_sharded = shard_map(local_project)  # TODO — replaces project_ri
-#          partial[c, k, m, n] = local einsum on rank's (μ_X, ν_Y) block
-#          partial = psum_scatter(partial, 'x', m_axis, tiled=True)
-#          partial = psum_scatter(partial, 'y', n_axis, tiled=True)
-#                                               # → (c, k, m/p, n/p) per rank
-#
-#      Σ[ω, k, m_X, n_Y] += coeff[ω, None, None, None] * σ^τ_sharded[None, k, m_X, n_Y]
-#
-#      For τ-batching (also not yet wired): stack n_batch tau nodes into a
-#      leading axis and use jax.lax.scan over the batch inside a single jit.
-#
-#  What this class does TODAY:
-#
-#      * Allocates Σ with the target sharding P(None, None, 'x', 'y').
-#      * Places an explicit with_sharding_constraint on σ^τ before the add
-#        — XLA re-plans the layout of the replicated σ^τ into the sharded
-#        shape, but no reduce-scatter happens here yet (the upstream
-#        project_ri still full-psums).
-#      * Accumulates via _accumulate_tau_into_window which already broadcasts
-#        the ω-coefficient along replicated ω, with sharded (m, n) downstream
-#        — the arithmetic is local per-rank once σ^τ is sharded.
-#
-#  What still needs doing for real comm savings:
-#
-#      (1) Replace _sigma_channel_pipeline's final project_ri call with a
-#          shard_map'd variant that emits σ^τ already sharded (m_X, n_Y).
-#          That is the only change that actually drops bytes on the wire.
-#      (2) Add m-chunking at this accumulator's add_tau entrance so partial
-#          is (m_chunk, n_full) before RS rather than (m_full, n_full).
-#          Default chunk = 1 output tile (m_chunk = m/p).
-#      (3) Stage many τ on GPU before flush in the FFI-backed variant
-#          (_CollectiveFlushSlabIoAccumulator), using SlabIO.write_slab for the
-#          collective parallel-HDF5 flush at window boundaries.
-# ---------------------------------------------------------------------------
-
-
 class _ReduceScatterGpuAccumulator(_SigmaAccumulator):
-    """Σ_c(ω, k, m, n) sharded (m_X, n_Y) on GPU — scaffolding.
+    """Σ_c(ω, k, m, n) held on-GPU sharded (m_X, n_Y).
 
-    Same external interface as _BufferedGpuAccumulator; differs in that:
+    σ^τ arrives already (m_X, n_Y)-sharded from the shard_map'd project at
+    the tail of the FFT/project kernel (see _make_project_ri_reduce_scatter),
+    and the ω-kernel multiply + accumulate stay local per-rank.  The per-rank
+    buffer is (n_b/p_x)·(n_b/p_y)·n_ω·n_k — ~100× smaller than Σ_μν, which
+    is the whole scaling argument for shipping this layout end-to-end.
 
-        * its running buffers live at NamedSharding(mesh, P(None, None, 'x', 'y'))
-        * σ^τ is restamped via with_sharding_constraint before the add,
-          so downstream arithmetic on each rank touches only the local shard
-        * the add closure is factored so a future lax.scan over a τ-batch
-          can replace the per-tau Python call without changing the caller
+    Follow-up work (not yet wired; see _CollectiveFlushSlabIoAccumulator
+    stub for the I/O leg and the lax.scan scaffolding in
+    _get_sigma_tau_scan_kernel for τ batching):
 
-    At n_b = 80 on a 2×2 mesh the per-rank buffer is 40×40×n_ω×n_k ≈ 1.2 MiB
-    vs the replicated 4.8 MiB — negligible here, but the sharding-preserving
-    arithmetic is the load-bearing piece at 1500+ bands.
+        (a) m-chunking at add_tau so σ^τ arrives one m-strip at a time
+            rather than one full (m_full, n_Y/p) shard — default chunk = 1
+            tile, = m/p.  Needed when (m, n, k, ω) per-rank stops fitting.
+        (b) τ batching via lax.scan over a stacked τ axis — reduces Python
+            dispatch overhead, currently a regression at small n_τ but wins
+            once the kernel's per-call cost exceeds compile amortization.
+        (c) Collective-flush SlabIO variant (see _StreamedH5Accumulator
+            docstring) — stages many τ on GPU and issues one parallel-HDF5
+            write at window close.
     """
 
     def __init__(self, shape: tuple[int, int, int, int], mesh_xy: Mesh):
         self._sharding = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
-        self._tau_sharding = NamedSharding(mesh_xy, P(None, 'x', 'y'))
         # Allocate already-sharded.  jax.lax.with_sharding_constraint requires
         # a trace context; jax.device_put is the equivalent for eager setup.
         self.total = jax.device_put(
@@ -998,10 +902,10 @@ class _ReduceScatterGpuAccumulator(_SigmaAccumulator):
                 *, omega_global_idx=None):
         assert self._win_acc is not None
         # σ^τ arrives already (k, m_X, n_Y)-sharded from the shard_map'd
-        # project inside _sigma_channel_pipeline.  The ω-kernel multiply and
+        # project inside the FFT/project kernel.  The ω-kernel multiply and
         # add therefore touch only each rank's local (m/p_x, n/p_y) block.
-        self._win_acc = _accumulate_tau_into_window(
-            self._win_acc, sigma_re, sigma_im, omega_vec,
+        self._win_acc = self._win_acc + _project_tau_onto_omega(
+            sigma_re, sigma_im, omega_vec,
             t_node_j, alpha_eff_j, omega_sign_j, pref_j, project_code_j,
         )
         # Pin the running buffer's sharding so XLA doesn't replicate it
@@ -1179,10 +1083,9 @@ def _integrate_tau_windows_for_branch(
     psi_proj_rmu_X: jax.Array,
     psi_proj_rmuT_Y: jax.Array,
     eye_nb: jax.Array,
-    tau_channel_step: Callable[..., jax.Array],
+    tau_kernel: Callable[..., jax.Array],
     tau_scan_kernel: Callable[..., jax.Array] | None,
     mesh_xy: Mesh,
-    omega_sign_flip: int,
     scale: float,
     log_tag: str,
     print_fn,
@@ -1193,13 +1096,13 @@ def _integrate_tau_windows_for_branch(
     writers that need each τ projection flushed to disk).
 
     Whether the result lands on GPU or disk is the accumulator's concern,
-    not this loop's — see _BufferedGpuAccumulator / _StreamedH5Accumulator.
+    not this loop's — see _ReduceScatterGpuAccumulator / _StreamedH5Accumulator.
 
     Future τ-batching hook (NOT yet wired — left for the shard_map refactor):
 
         The per-τ python loop below serializes on a block_until_ready after
-        each tau_channel_step call, so XLA cannot fuse across τ.  With the
-        reduce-scatter upstream in place, tau_channel_step's output becomes
+        each tau_kernel call, so XLA cannot fuse across τ.  With the
+        reduce-scatter upstream in place, tau_kernel's output becomes
         small enough that we can:
 
             t_nodes_j = jnp.asarray(win.t_nodes, dtype=jnp.complex128)   # (n_τ,)
@@ -1208,9 +1111,9 @@ def _integrate_tau_windows_for_branch(
             @jax.jit
             def _scan_body(acc, tau_ctx):
                 t_j, a_j = tau_ctx
-                sigma_re, sigma_im = tau_channel_step(..., t_j, ...)
-                acc = _accumulate_tau_into_window(
-                    acc, sigma_re, sigma_im, ω_vec, t_j, a_j, ...)
+                sigma_re, sigma_im = tau_kernel(..., t_j, ...)
+                acc = acc + _project_tau_onto_omega(
+                    sigma_re, sigma_im, ω_vec, t_j, a_j, ...)
                 return acc, None
 
             win_acc, _ = jax.lax.scan(_scan_body, zeros, (t_nodes_j, alphas_j))
@@ -1253,33 +1156,31 @@ def _integrate_tau_windows_for_branch(
                         f"expected 'full' (Laplace) or 'imag' (crossing).")
                 project_code_j = jnp.asarray(
                     {"full": 0, "imag": 1}[win.project], dtype=jnp.int32)
-                omega_sign_j = jnp.asarray(
-                    float(win.omega_sign) * float(omega_sign_flip), dtype=jnp.float64)
+                omega_sign_j = jnp.asarray(float(win.omega_sign), dtype=jnp.float64)
                 pref_j = jnp.asarray(win.prefactor * scale, dtype=jnp.float64)
 
                 if use_scan_path:
                     # Fast path: one jit dispatch per window instead of N_τ.
                     t_nodes_j = jnp.asarray(win.t_nodes, dtype=jnp.complex128)
                     alpha_nodes_j = jnp.asarray(win.alpha, dtype=jnp.complex128)
-                    with mesh_xy:
-                        accumulator.run_window_scan(
-                            tau_scan_kernel,
-                            t_nodes=t_nodes_j,
-                            alpha_nodes=alpha_nodes_j,
-                            window_args=dict(
-                                psi_coh_rmuT_X=psi_coh_rmuT_X,
-                                psi_coh_rmu_Y=psi_coh_rmu_Y,
-                                psi_proj_rmu_X=psi_proj_rmu_X,
-                                psi_proj_rmuT_Y=psi_proj_rmuT_Y,
-                                E_A=E_A, mask_A=mask_A,
-                                B_q=B_q, Omega_q=Omega_q, mask_B=mask_B,
-                                E_ref_A=E_ref_A_j, E_ref_B=E_ref_B_j,
-                                eye_nb=eye_nb,
-                                omega_vec=omega_vec, pref=pref_j,
-                                omega_sign=omega_sign_j,
-                                project_code=project_code_j,
-                            ),
-                        )
+                    accumulator.run_window_scan(
+                        tau_scan_kernel,
+                        t_nodes=t_nodes_j,
+                        alpha_nodes=alpha_nodes_j,
+                        window_args=dict(
+                            psi_coh_rmuT_X=psi_coh_rmuT_X,
+                            psi_coh_rmu_Y=psi_coh_rmu_Y,
+                            psi_proj_rmu_X=psi_proj_rmu_X,
+                            psi_proj_rmuT_Y=psi_proj_rmuT_Y,
+                            E_A=E_A, mask_A=mask_A,
+                            B_q=B_q, Omega_q=Omega_q, mask_B=mask_B,
+                            E_ref_A=E_ref_A_j, E_ref_B=E_ref_B_j,
+                            eye_nb=eye_nb,
+                            omega_vec=omega_vec, pref=pref_j,
+                            omega_sign=omega_sign_j,
+                            project_code=project_code_j,
+                        ),
+                    )
                     # Advance progress bar by the whole window (the scan is
                     # atomic from the Python side).
                     for _ in range(int(win.alpha.shape[0])):
@@ -1289,25 +1190,24 @@ def _integrate_tau_windows_for_branch(
                 accumulator.begin_window()
                 for t_node, alpha_node in zip(win.t_nodes, win.alpha):
                     t_node_j = jnp.asarray(t_node, dtype=jnp.complex128)
-                    with mesh_xy:
-                        # σ^τ is returned as a real/imag pair rather than complex:
-                        # the crossing window's HGL quadrature keeps only Im[coeff·σ],
-                        # so carrying complex through the FFT stack would double
-                        # HBM and collective traffic for no benefit.  See
-                        # _combine_coeff_with_sigma_tau for the recombination.
-                        #
-                        # NB: sigma_tau_ri is (2, nk, m_X, n_Y) sharded under the
-                        # reduce-scatter project — tuple-unpacking (a, b = arr)
-                        # would assert is_fully_addressable in multi-process mode,
-                        # so index explicitly.
-                        sigma_tau_ri = tau_channel_step(
-                            psi_coh_rmuT_X, psi_coh_rmu_Y,
-                            psi_proj_rmu_X, psi_proj_rmuT_Y,
-                            E_A, mask_A, B_q, Omega_q, mask_B,
-                            E_ref_A_j, E_ref_B_j, t_node_j, eye_nb,
-                        )
-                        sigma_tau_kij_re = sigma_tau_ri[0]
-                        sigma_tau_kij_im = sigma_tau_ri[1]
+                    # σ^τ is returned as a real/imag pair rather than complex:
+                    # the crossing window's HGL quadrature keeps only Im[coeff·σ],
+                    # so carrying complex through the FFT stack would double
+                    # HBM and collective traffic for no benefit.  See
+                    # _combine_coeff_with_sigma_tau for the recombination.
+                    #
+                    # NB: sigma_tau_ri is (2, nk, m_X, n_Y) sharded under the
+                    # reduce-scatter project — tuple-unpacking (a, b = arr)
+                    # would assert is_fully_addressable in multi-process mode,
+                    # so index explicitly.
+                    sigma_tau_ri = tau_kernel(
+                        psi_coh_rmuT_X, psi_coh_rmu_Y,
+                        psi_proj_rmu_X, psi_proj_rmuT_Y,
+                        E_A, mask_A, B_q, Omega_q, mask_B,
+                        E_ref_A_j, E_ref_B_j, t_node_j, eye_nb,
+                    )
+                    sigma_tau_kij_re = sigma_tau_ri[0]
+                    sigma_tau_kij_im = sigma_tau_ri[1]
                     sigma_tau_kij_re.block_until_ready()
                     progress.step()
 
@@ -1347,7 +1247,6 @@ def _run_sigma_branch(
     wfns,
     mesh_xy: Mesh,
     meta,
-    omega_sign_flip: int = 1,
     log_tag: str = "",
     print_fn=print,
     omega_batch_size: int = 4,
@@ -1392,7 +1291,7 @@ def _run_sigma_branch(
 
     omega_vec = jnp.asarray(omega_nonneg_ry, dtype=jnp.float64)
     eye_nb = jnp.eye(E_A.shape[1], dtype=jnp.complex128)
-    tau_channel_step = _get_sigma_tau_channel_kernel(
+    tau_kernel = _get_sigma_tau_kernel(
         mesh_xy=mesh_xy,
         nkx=int(meta.nkx), nky=int(meta.nky), nkz=int(meta.nkz),
         nk_tot=int(meta.nk_tot), bispinor=bool(meta.bispinor),
@@ -1402,7 +1301,7 @@ def _run_sigma_branch(
     # baseline) it actually regresses sigma_ppm by ~80% because:
     #   (a) each distinct n_τ compiles a separate scan module (9, 13, 103,
     #       125 in this run → 4 compiles);
-    #   (b) XLA inlines tau_channel_step into the scan module, producing
+    #   (b) XLA inlines tau_kernel into the scan module, producing
     #       a single big module whose static schedule can't overlap
     #       collectives the way Python's async-dispatch-with-block-until
     #       pattern does;
@@ -1433,10 +1332,10 @@ def _run_sigma_branch(
         E_A=E_A, B_q=B_q, Omega_q=Omega_q, base_mask_B=base_mask_B,
         psi_coh_rmuT_X=psi_coh_rmuT_X, psi_coh_rmu_Y=psi_coh_rmu_Y,
         psi_proj_rmu_X=psi_proj_rmu_X, psi_proj_rmuT_Y=psi_proj_rmuT_Y,
-        eye_nb=eye_nb, tau_channel_step=tau_channel_step,
+        eye_nb=eye_nb, tau_kernel=tau_kernel,
         tau_scan_kernel=tau_scan_kernel,
         mesh_xy=mesh_xy,
-        omega_sign_flip=omega_sign_flip, scale=scale,
+        scale=scale,
         log_tag=log_tag, print_fn=print_fn,
     )
 
@@ -1650,7 +1549,7 @@ def compute_sigma_c_ppm_omega_grid(
             sigma_kij, _ = _run_sigma_branch(
                 omega_nonneg_ry=br.omega_abs, omega_global_idx=br.omega_idx,
                 E_A=br.E_A, base_mask_A=br.base_mask_A,
-                kernel_sign=br.kernel_sign, omega_sign_flip=br.omega_sign_flip,
+                kernel_sign=br.kernel_sign,
                 log_tag=br.tag, scale=br.scale,
                 **common_branch_kwargs,
             )
