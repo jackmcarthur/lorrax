@@ -466,7 +466,8 @@ def prepare_isdf_and_wavefunctions(
 
 		write_restart_state_to_h5(
 			tensors_filename, V_qmunu,
-			wfns.psi_yr, wfns.enk, None, G0_mu_nu=G0, init_W0=True)
+			wfns.psi_yr, wfns.enk, None, G0_mu_nu=G0, init_W0=True,
+			mesh=mesh_xy, use_ffi_io=cfg.use_ffi_io)
 		save_restart_state_per_proc(
 			os.path.join(tmp_dir, "isdf_tensors"),
 			V_qmunu, None, wfns.psi_yr, wfns.enk, meta, mesh_xy)

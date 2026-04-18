@@ -21,69 +21,86 @@ def write_restart_state_to_h5(
     G0_mu_nu=None,
     W0_qmunu=None,
     init_W0: bool = False,
+    mesh=None,
+    use_ffi_io: bool = False,
 ):
-    """Write canonical restart state with a single full-band wavefunction dataset."""
-    from jax.experimental import multihost_utils as _mh
+    """Write canonical restart state via SlabIO.
 
-    def _to_host(a):
-        if isinstance(a, (jax.Array,)):
-            try:
-                return _mh.process_allgather(a, tiled=True)
-            except Exception:
-                return jax.device_get(a)
-        return a
+    Each of V_qmunu / S_qmunu / V0_noG0_munu / G0_mu_nu / W0_qmunu /
+    psi_full_y / enk_full may be a sharded ``jax.Array`` or a host
+    ndarray.  ``use_ffi_io=True`` routes each write through the
+    parallel-HDF5 FFI; the default gathers to rank 0 and writes with
+    h5py, matching the historical pattern.
+    """
+    from .slab_io import SlabIO
 
-    V_qmunu_h = _to_host(V_qmunu)
-    psi_full_y_h = _to_host(psi_full_y)
-    enk_full_h = _to_host(enk_full) if enk_full is not None else None
-    S_qmunu_h = _to_host(S_qmunu) if S_qmunu is not None else None
-    V0_noG0_h = _to_host(V0_noG0_munu) if V0_noG0_munu is not None else None
-    G0_mu_nu_h = _to_host(G0_mu_nu) if G0_mu_nu is not None else None
-    W0_qmunu_h = _to_host(W0_qmunu) if W0_qmunu is not None else None
+    with SlabIO(filename, mode="w", mesh=mesh, use_ffi_io=use_ffi_io) as io:
+        # restart_format_version is a small scalar attr — write as a
+        # dataset (allgather backend) / deferred attr (FFI backend).
+        io.write_attr("restart_format_version", np.int64(2))
 
-    if jax.process_index() == 0:
-        with h5py.File(filename, "w") as f:
-            f.attrs["restart_format_version"] = 2
-            f.create_dataset("V_qmunu", data=np.asarray(V_qmunu_h))
-            if S_qmunu_h is not None:
-                f.create_dataset("S_qmunu", data=np.asarray(S_qmunu_h))
-            if V0_noG0_h is not None:
-                f.create_dataset("V0_noG0_munu", data=np.asarray(V0_noG0_h))
-            if G0_mu_nu_h is not None:
-                f.create_dataset("G0_mu_nu", data=np.asarray(G0_mu_nu_h))
-            if W0_qmunu_h is not None:
-                dset = f.create_dataset("W0_qmunu", data=np.asarray(W0_qmunu_h))
-                dset.attrs["W0_ready"] = True
-            elif init_W0:
-                v_shape = np.asarray(V_qmunu_h).shape
-                v_dtype = np.asarray(V_qmunu_h).dtype
-                fill = np.zeros((), dtype=v_dtype)
-                dset = f.create_dataset("W0_qmunu", shape=v_shape, dtype=v_dtype, fillvalue=fill)
-                dset.attrs["W0_ready"] = False
-            f.create_dataset("psi_full_y", data=np.asarray(psi_full_y_h))
-            if enk_full_h is not None:
-                f.create_dataset("enk_full", data=np.asarray(enk_full_h))
+        def _write(name, arr):
+            if arr is None:
+                return
+            shape = tuple(arr.shape)
+            io.create_dataset(name, shape=shape, dtype=arr.dtype)
+            io.write_slab(name, arr, global_shape=shape)
+
+        _write("V_qmunu",      V_qmunu)
+        _write("S_qmunu",      S_qmunu)
+        _write("V0_noG0_munu", V0_noG0_munu)
+        _write("G0_mu_nu",     G0_mu_nu)
+        _write("psi_full_y",   psi_full_y)
+        _write("enk_full",     enk_full)
+
+        # W0_qmunu: either write the real data or pre-allocate an
+        # all-zeros placeholder.
+        w0_ready = False
+        if W0_qmunu is not None:
+            shape = tuple(W0_qmunu.shape)
+            io.create_dataset("W0_qmunu", shape=shape, dtype=W0_qmunu.dtype)
+            io.write_slab("W0_qmunu", W0_qmunu, global_shape=shape)
+            w0_ready = True
+        elif init_W0:
+            v_shape = tuple(V_qmunu.shape)
+            v_dtype = V_qmunu.dtype
+            io.create_dataset("W0_qmunu", shape=v_shape, dtype=v_dtype)
+            # Dataset is zero-initialised by HDF5 since we created but
+            # never wrote.  W0_ready=False flags "fill me in later".
+
+    # bse_io.py reads W0_ready as an HDF5 attr on the W0_qmunu dataset.
+    # Set it rank-0-only after SlabIO has released the file, to stay
+    # compatible with that reader.
+    if (W0_qmunu is not None or init_W0) and jax.process_index() == 0:
+        with h5py.File(filename, "a") as f:
+            f["W0_qmunu"].attrs["W0_ready"] = w0_ready
+    try:
+        from jax.experimental import multihost_utils as _mh
+        _mh.sync_global_devices("restart_W0_ready_flag")
+    except Exception:
+        pass
 
 
-def write_w0_qmunu_to_h5(filename, W0_qmunu):
+def write_w0_qmunu_to_h5(
+    filename, W0_qmunu, mesh=None, use_ffi_io: bool = False,
+):
     """Overwrite or append the W0_qmunu dataset in an existing restart file."""
-    from jax.experimental import multihost_utils as _mh
+    from .slab_io import SlabIO
 
-    def _to_host(a):
-        if isinstance(a, (jax.Array,)):
-            try:
-                return _mh.process_allgather(a, tiled=True)
-            except Exception:
-                return jax.device_get(a)
-        return a
+    shape = tuple(W0_qmunu.shape)
+    with SlabIO(filename, mode="a", mesh=mesh, use_ffi_io=use_ffi_io) as io:
+        io.create_dataset("W0_qmunu", shape=shape, dtype=W0_qmunu.dtype)
+        io.write_slab("W0_qmunu", W0_qmunu, global_shape=shape)
 
-    W0_qmunu_h = _to_host(W0_qmunu)
+    # W0_ready flag is a per-dataset attr read by bse_io.py.
     if jax.process_index() == 0:
         with h5py.File(filename, "a") as f:
-            if "W0_qmunu" in f:
-                del f["W0_qmunu"]
-            dset = f.create_dataset("W0_qmunu", data=np.asarray(W0_qmunu_h))
-            dset.attrs["W0_ready"] = True
+            f["W0_qmunu"].attrs["W0_ready"] = True
+    try:
+        from jax.experimental import multihost_utils as _mh
+        _mh.sync_global_devices("restart_W0_ready_flag")
+    except Exception:
+        pass
 
 
 def read_restart_state_from_h5(filename):
