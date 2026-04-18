@@ -960,41 +960,43 @@ def compute_sigma_c_ppm_omega_grid(
             use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
         )
 
-        # ω_rel >= 0: Σ^- (crossing) for cond, Σ^+ (sign-definite) for val
+        # Four branches: (ω sign) × (cond/val).  For ω_rel<0 we evaluate with
+        # |ω_rel| and swap kernel_sign between cond/val, with a global -1 scale.
+        # A tuple-of-dicts drives the loop so the physics reads in one place.
+        branches = []
         if omega_pos.size:
-            sigma_cond_pos, _ = _convolve_sigma_branch_kij(
-                omega_nonneg_ry=omega_pos, omega_global_idx=idx_pos,
-                E_A=E_cond, base_mask_A=cond_mask, kernel_sign=+1,
-                omega_sign_flip=1, log_tag="ω≥E_F cond", scale=1.0,
-                **common_branch_kwargs,
-            )
-            sigma_val_pos, _ = _convolve_sigma_branch_kij(
-                omega_nonneg_ry=omega_pos, omega_global_idx=idx_pos,
-                E_A=H_val, base_mask_A=val_mask, kernel_sign=-1,
-                omega_sign_flip=1, log_tag="ω≥E_F val", scale=1.0,
-                **common_branch_kwargs,
-            )
-            if not use_kij_stream:
-                sigma_kij_host[idx_pos] = np.asarray(
-                    jax.device_get(sigma_cond_pos + sigma_val_pos), dtype=np.complex128)
-
-        # ω_rel < 0: evaluate with |ω_rel| and swapped branch kernels, global -1 scale
+            branches += [
+                dict(E_A=E_cond, mask=cond_mask, kernel_sign=+1, scale=+1.0,
+                     omega_abs=omega_pos, omega_idx=idx_pos, tag="ω≥E_F cond"),
+                dict(E_A=H_val,  mask=val_mask,  kernel_sign=-1, scale=+1.0,
+                     omega_abs=omega_pos, omega_idx=idx_pos, tag="ω≥E_F val"),
+            ]
         if omega_neg_abs.size:
-            sigma_cond_neg, _ = _convolve_sigma_branch_kij(
-                omega_nonneg_ry=omega_neg_abs, omega_global_idx=idx_neg,
-                E_A=E_cond, base_mask_A=cond_mask, kernel_sign=-1,
-                omega_sign_flip=1, log_tag="ω<E_F cond", scale=-1.0,
+            branches += [
+                dict(E_A=E_cond, mask=cond_mask, kernel_sign=-1, scale=-1.0,
+                     omega_abs=omega_neg_abs, omega_idx=idx_neg, tag="ω<E_F cond"),
+                dict(E_A=H_val,  mask=val_mask,  kernel_sign=+1, scale=-1.0,
+                     omega_abs=omega_neg_abs, omega_idx=idx_neg, tag="ω<E_F val"),
+            ]
+
+        # Pair the branches that share the same ω-half, summing cond+val per half
+        # before gathering to host (matches original ordering to stay bit-identical).
+        per_half: dict[tuple, jax.Array] = {}
+        for br in branches:
+            sigma_kij, _ = _convolve_sigma_branch_kij(
+                omega_nonneg_ry=br["omega_abs"], omega_global_idx=br["omega_idx"],
+                E_A=br["E_A"], base_mask_A=br["mask"],
+                kernel_sign=br["kernel_sign"], omega_sign_flip=1,
+                log_tag=br["tag"], scale=br["scale"],
                 **common_branch_kwargs,
             )
-            sigma_val_neg, _ = _convolve_sigma_branch_kij(
-                omega_nonneg_ry=omega_neg_abs, omega_global_idx=idx_neg,
-                E_A=H_val, base_mask_A=val_mask, kernel_sign=+1,
-                omega_sign_flip=1, log_tag="ω<E_F val", scale=-1.0,
-                **common_branch_kwargs,
-            )
-            if not use_kij_stream:
-                sigma_kij_host[idx_neg] = np.asarray(
-                    jax.device_get(sigma_cond_neg + sigma_val_neg), dtype=np.complex128)
+            key = tuple(br["omega_idx"].tolist())
+            per_half[key] = (per_half[key] + sigma_kij) if key in per_half else sigma_kij
+
+        if not use_kij_stream:
+            for key, total in per_half.items():
+                idx = np.asarray(key, dtype=np.int64)
+                sigma_kij_host[idx] = np.asarray(jax.device_get(total), dtype=np.complex128)
     finally:
         if h5_kij is not None:
             h5_kij.close()
