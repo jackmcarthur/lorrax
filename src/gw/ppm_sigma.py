@@ -367,7 +367,12 @@ def _make_project_ri_reduce_scatter(mesh_xy: Mesh) -> Callable[..., jax.Array]:
         ψ_yn  P(None, None, 'y', None)       (nk, s', μ_Y, n)
 
     Output sharding:
-        P(None, None, 'x', 'y')              (c=2, nk, m_X, n_Y)
+        (sigma_re, sigma_im) each at  P(None, 'x', 'y')   (nk, m_X, n_Y)
+
+    Returns the re/im parts as a tuple rather than a single (2, nk, m, n)
+    stack — avoids the tuple-unpack at the caller (which would trigger a
+    gather+broadcast pjit pair for a sharded array and blocks on
+    is_fully_addressable in multi-process mode).
 
     Comms inside:  the two implicit psums of the original einsum
         psum(x)       over the μ_X contraction axis
@@ -386,49 +391,35 @@ def _make_project_ri_reduce_scatter(mesh_xy: Mesh) -> Callable[..., jax.Array]:
     from jax.experimental.shard_map import shard_map
 
     in_specs = (
-        P(None, None, None, 'x'),        # psi_xr  : (nk, m, s, μ_X)
-        P(None, None, 'x', None, 'y'),   # sigma_k : (nk, s, μ_X, s', μ_Y)
-        P(None, None, 'y', None),        # psi_yn  : (nk, s', μ_Y, n)
+        P(None, None, None, 'x'),          # psi_xr  : (nk, m, s, μ_X)
+        P(None, None, 'x', None, 'y'),     # sigma_k : (nk, s, μ_X, s', μ_Y)
+        P(None, None, 'y', None),          # psi_yn  : (nk, s', μ_Y, n)
     )
-    out_specs = P(None, None, 'x', 'y')  # sigma_ri : (c=2, nk, m_X, n_Y)
+    # 2-tuple output: re part, im part.  Each (nk, m_X, n_Y) sharded.
+    out_specs = (P(None, 'x', 'y'), P(None, 'x', 'y'))
 
     def _local(psi_xr_local, sigma_k_local, psi_yn_local):
-        # Stack re/im channels.  Each rank sees only its local (μ_X, μ_Y) tile
-        # of sigma_k, so the stack is cheap local work.
-        sigma_ri = jnp.stack(
-            (jnp.real(sigma_k_local), jnp.imag(sigma_k_local)), axis=0)
+        # Per-channel reduce-scatter: do re and im independently so the
+        # output is a tuple of two (nk, m/p_x, n/p_y) arrays rather than a
+        # stacked (2, nk, m, n) that callers would have to slice.
+        def _one_channel(sigma_real_or_imag):
+            # 'kmsx' × 'ksxty' -> 'kmty'  (contracts s, local μ_X)
+            left_partial = jnp.einsum(
+                'kmsx,ksxty->kmty',
+                jnp.conj(psi_xr_local), sigma_real_or_imag, optimize=True)
+            # psum_scatter(x, scatter_dim=m=1) → (nk, m/p_x, s', μ/p_y)
+            left_rs = jax.lax.psum_scatter(
+                left_partial, 'x', scatter_dimension=1, tiled=True)
+            # 'kmty' × 'ktyn' -> 'kmn'  (contracts s', local μ_Y)
+            result_partial = jnp.einsum(
+                'kmty,ktyn->kmn', left_rs, psi_yn_local, optimize=True)
+            # psum_scatter(y, scatter_dim=n=2) → (nk, m/p_x, n/p_y)
+            return jax.lax.psum_scatter(
+                result_partial, 'y', scatter_dimension=2, tiled=True,
+            ).astype(jnp.complex128)
 
-        # First einsum: contract local s and local μ_X ("x" axis) slot.
-        # Each x-rank computes a partial over its own μ_X chunk.  m and μ_Y
-        # are still full on this rank.
-        # Shapes: 'kmsx' × 'cksxty' -> 'ckmty'
-        #   psi_xr_local: (nk, m, s, μ/p_x)
-        #   sigma_ri:     (c, nk, s, μ/p_x, s', μ/p_y)
-        #   →             (c, nk, m, s', μ/p_y)   — partial along μ_X
-        left_partial = jnp.einsum(
-            'kmsx,cksxty->ckmty', jnp.conj(psi_xr_local), sigma_ri,
-            optimize=True)
-
-        # psum_scatter(x, scatter_dim=m=2): sum over x, scatter m across x.
-        # Output shape per-rank: (c, nk, m/p_x, s', μ/p_y).
-        left_rs = jax.lax.psum_scatter(
-            left_partial, 'x', scatter_dimension=2, tiled=True)
-
-        # Second einsum: contract local s' and local μ_Y.  n is still full.
-        # Shapes: 'ckmty' × 'ktyn' -> 'ckmn'
-        #   left_rs:      (c, nk, m/p_x, s', μ/p_y)
-        #   psi_yn_local: (nk, s', μ/p_y, n)
-        #   →             (c, nk, m/p_x, n)  — partial along μ_Y
-        result_partial = jnp.einsum(
-            'ckmty,ktyn->ckmn', left_rs, psi_yn_local,
-            optimize=True)
-
-        # psum_scatter(y, scatter_dim=n=3): sum over y, scatter n across y.
-        # Output per-rank: (c, nk, m/p_x, n/p_y).  This is what the global
-        # out_spec P(None, None, 'x', 'y') demands.
-        return jax.lax.psum_scatter(
-            result_partial, 'y', scatter_dimension=3, tiled=True
-        ).astype(jnp.complex128)
+        return (_one_channel(jnp.real(sigma_k_local)),
+                _one_channel(jnp.imag(sigma_k_local)))
 
     return shard_map(_local, mesh=mesh_xy,
                      in_specs=in_specs, out_specs=out_specs,
@@ -605,14 +596,12 @@ def _get_sigma_tau_scan_kernel(
 
         def body(acc, xs):
             t_node, alpha_node = xs
-            sigma_ri = tau_kernel(
+            sigma_re, sigma_im = tau_kernel(
                 psi_coh_rmuT_X, psi_coh_rmu_Y,
                 psi_proj_rmu_X, psi_proj_rmuT_Y,
                 E_A, mask_A, B_q, Omega_q, mask_B,
                 E_ref_A, E_ref_B, t_node, eye_nb,
             )
-            sigma_re = sigma_ri[0]
-            sigma_im = sigma_ri[1]
             # α_eff = α(τ) · exp[-i·(E_ref_A + E_ref_B)·τ]  — minimax quad
             # weight with the phase shift absorbed into each τ node.
             alpha_eff = alpha_node * jnp.exp(-1j * E_ref_sum * t_node)
@@ -1190,24 +1179,21 @@ def _integrate_tau_windows_for_branch(
                 accumulator.begin_window()
                 for t_node, alpha_node in zip(win.t_nodes, win.alpha):
                     t_node_j = jnp.asarray(t_node, dtype=jnp.complex128)
-                    # σ^τ is returned as a real/imag pair rather than complex:
-                    # the crossing window's HGL quadrature keeps only Im[coeff·σ],
-                    # so carrying complex through the FFT stack would double
-                    # HBM and collective traffic for no benefit.  See
-                    # _combine_coeff_with_sigma_tau for the recombination.
-                    #
-                    # NB: sigma_tau_ri is (2, nk, m_X, n_Y) sharded under the
-                    # reduce-scatter project — tuple-unpacking (a, b = arr)
-                    # would assert is_fully_addressable in multi-process mode,
-                    # so index explicitly.
-                    sigma_tau_ri = tau_kernel(
+                    # σ^τ is returned as a (re, im) tuple rather than a complex
+                    # or a stacked (2, …) array: the crossing window's HGL
+                    # quadrature keeps only Im[coeff·σ], so carrying complex
+                    # through the FFT stack would double HBM and collective
+                    # traffic; and returning a tuple from the shard_map lets
+                    # Python unpack it without triggering the gather+broadcast
+                    # pair that indexing a sharded (2, nk, …) array would
+                    # emit.  See _combine_coeff_with_sigma_tau for the
+                    # downstream recombination.
+                    sigma_tau_kij_re, sigma_tau_kij_im = tau_kernel(
                         psi_coh_rmuT_X, psi_coh_rmu_Y,
                         psi_proj_rmu_X, psi_proj_rmuT_Y,
                         E_A, mask_A, B_q, Omega_q, mask_B,
                         E_ref_A_j, E_ref_B_j, t_node_j, eye_nb,
                     )
-                    sigma_tau_kij_re = sigma_tau_ri[0]
-                    sigma_tau_kij_im = sigma_tau_ri[1]
                     sigma_tau_kij_re.block_until_ready()
                     progress.step()
 
