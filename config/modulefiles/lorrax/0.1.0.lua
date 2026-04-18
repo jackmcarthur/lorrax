@@ -85,14 +85,40 @@ if lorrax_deps ~= "" then
     pypath = pypath .. ":" .. lorrax_deps
 end
 
+-- FFI staged-deps bind-mounts.  Mirror run_shifter.sh so the FFI path
+-- (use_ffi_io=true, cusolvermp eigh, etc.) can be used from lxrun
+-- without manually invoking run_shifter.sh.  Default staging locations
+-- are the user's scratch dir, matching the stage_*.sh scripts under
+-- src/ffi/phdf5/scripts/.  Override via env if they live elsewhere.
+--
+-- Inside the container the paths are stable and visible to CMake /
+-- LD_LIBRARY_PATH at the /lorrax_nvhpc and /lorrax_phdf5 mount points.
+local user_first_letter = (os.getenv("USER") or "j"):sub(1, 1)
+local user = os.getenv("USER") or "jackm"
+local nvhpc_host = os.getenv("LORRAX_FFI_NVHPC_DIR")
+    or ("/pscratch/sd/" .. user_first_letter .. "/" .. user .. "/lorrax_nvhpc")
+local phdf5_host = os.getenv("LORRAX_FFI_PHDF5_DIR")
+    or ("/pscratch/sd/" .. user_first_letter .. "/" .. user .. "/lorrax_phdf5_openmpi/stage")
+-- LD_LIBRARY_PATH inside the container: phdf5 stage first (libhdf5 +
+-- SONAME shims), then NVHPC math_libs (libcusolverMp, libcal), then
+-- container's OpenMPI runtime (libmpi.so.40).
+local container_ldlib = table.concat({
+    "/lorrax_phdf5/lib",
+    "/lorrax_nvhpc/25.5_cuda12.9/math_libs/12.9/lib64",
+    "/opt/hpcx/ompi/lib",
+}, ":")
+
 local shifter_base = table.concat({
     "shifter",
     "--module=gpu",
     "--image=" .. image,
+    "--volume=" .. nvhpc_host .. ":/lorrax_nvhpc",
+    "--volume=" .. phdf5_host .. ":/lorrax_phdf5",
     "--env=PYTHONPATH=" .. pypath,
     "--env=HDF5_USE_FILE_LOCKING=FALSE",
     "--env=XLA_PYTHON_CLIENT_MEM_FRACTION=0.95",
     "--env=TF_GPU_ALLOCATOR=cuda_malloc_async",
+    "--env=LD_LIBRARY_PATH=" .. container_ldlib,
 }, " ")
 
 setenv("LORRAX_ROOT",    lorrax_root)
@@ -100,6 +126,8 @@ setenv("LORRAX_SRC",     lorrax_src)
 setenv("LORRAX_SITE",    lorrax_site)
 setenv("LORRAX_IMAGE",   image)
 setenv("LORRAX_SHIFTER", shifter_base)
+setenv("LORRAX_FFI_NVHPC_HOST", nvhpc_host)
+setenv("LORRAX_FFI_PHDF5_HOST", phdf5_host)
 
 -- =========================================================================
 --  Shell functions
@@ -124,13 +152,26 @@ set_shell_function("lxalloc", [[
 --   lxrun python3 -u -m gw.gw_jax -i cohsex.in
 --   LORRAX_NGPU=1 lxrun python3 -u -m centroid.kmeans_isdf 640
 
+-- ``--mpi=pmix`` is required for the container's OpenMPI (HPC-X) to
+-- bootstrap collectives, which the FFI path uses.  It has been observed
+-- to cause hangs in non-FFI workloads after V_q on Perlmutter
+-- (subsequent collectives wait on PMIx server state that JAX never
+-- touches).  Default: OFF.  For FFI runs, set LORRAX_MPI_TYPE=pmix
+-- before lxrun:
+--     LORRAX_MPI_TYPE=pmix LORRAX_NGPU=4 lxrun python3 -u -m gw.gw_jax ...
+
 set_shell_function("lxrun", [[
     local ngpu="${LORRAX_NGPU:-4}"
+    local mpitype="${LORRAX_MPI_TYPE:-}"
+    local mpiflag=""
+    if [ -n "${mpitype}" ] && [ "${mpitype}" != "none" ]; then
+        mpiflag="--mpi=${mpitype}"
+    fi
     local jobflag=""
     if [ -n "${SLURM_JOBID:-}" ] && [ -z "${SLURM_STEP_ID:-}" ]; then
         jobflag="--jobid=$SLURM_JOBID"
     fi
-    srun $jobflag --gres=gpu:${ngpu} -N 1 -n ${ngpu} \
+    srun $jobflag $mpiflag --gres=gpu:${ngpu} -N 1 -n ${ngpu} \
         ]] .. shifter_base .. [[ \
         "$@"
 ]], "")
