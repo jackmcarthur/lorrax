@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 
@@ -164,10 +165,20 @@ def _build_four_copies(psi_yr_full, mesh_xy):
 
 
 def _build_occ(enk_full, slices, efermi):
+    """Build occupation array (nk, nb_full), float64 in {0.0, 1.0}.
+
+    Host-side: enk_full is tiny (nk × nb, usually < 10K doubles) so the
+    D2H cost is trivial compared to the 8 pjit compiles the all-jnp
+    version emitted at trace time.  Returns a jax.Array; the caller
+    applies sharding constraints.
+    """
+    enk_host = np.asarray(enk_full)
     if efermi is None:
-        occ = jnp.zeros_like(enk_full, dtype=jnp.float64)
-        return occ.at[:, slices.occ].set(1.0)
-    return jnp.asarray(enk_full <= efermi, dtype=jnp.float64)
+        occ = np.zeros_like(enk_host, dtype=np.float64)
+        occ[:, slices.occ] = 1.0
+    else:
+        occ = (enk_host <= float(efermi)).astype(np.float64)
+    return jnp.asarray(occ)
 
 
 def build_wavefunctions(

@@ -142,11 +142,16 @@ def _build_mesh():
 
 
 def _build_Gij(meta, mesh_xy):
-	"""Occupation projector G_ij = diag(1,...,1,0,...,0) for sigma bands."""
+	"""Occupation projector G_ij = diag(1,...,1,0,...,0) for sigma bands.
+
+	Built in numpy — 8 jnp primitives (zeros/eye/scatter/convert) had been
+	firing as standalone pjits at trace time; all that work is sub-ms host
+	arithmetic on a (nk, nb, nb) matrix.
+	"""
 	nocc = min(meta.nelec, meta.nb_sigma)
-	Gij = jnp.zeros((meta.nk_tot, meta.nb_sigma, meta.nb_sigma), dtype=jnp.complex128)
-	Gij = Gij.at[:, :nocc, :nocc].set(jnp.eye(nocc, dtype=jnp.complex128))
-	return jax.device_put(Gij, NamedSharding(mesh_xy, P(None, None, None)))
+	Gij = np.zeros((meta.nk_tot, meta.nb_sigma, meta.nb_sigma), dtype=np.complex128)
+	Gij[:, :nocc, :nocc] = np.eye(nocc, dtype=np.complex128)
+	return jax.device_put(jnp.asarray(Gij), NamedSharding(mesh_xy, P(None, None, None)))
 
 
 def _compute_static_head(config, input_dir, wfn, sym, meta, do_screened, print0):
