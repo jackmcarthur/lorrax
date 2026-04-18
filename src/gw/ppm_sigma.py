@@ -209,7 +209,37 @@ def _project_sigma_channels(
 
 
 @jax.jit
-def _accumulate_window_channels_jit(
+def _project_tau_onto_omega(
+    sigma_tau_kij_re: jax.Array,
+    sigma_tau_kij_im: jax.Array,
+    omega_vec: jax.Array,
+    t_node: jax.Array,
+    alpha_eff: jax.Array,
+    omega_sign: jax.Array,
+    pref: jax.Array,
+    project_code: jax.Array,
+) -> jax.Array:
+    """Apply ω-kernel exp(i·ω_sign·ω·t_node) and project onto σ channels.
+
+    Returns the single-tau contribution at every ω in ``omega_vec``:
+        contrib[ω, k, i, j] = pref · α_eff · exp(i·sign·ω·t) · P(σ_re, σ_im)
+
+    where P selects {full, imag, real} via ``project_code``.  Callers either
+    accumulate the result on-GPU (+=) or write it to disk — this kernel is
+    agnostic to the consumer.
+    """
+    omega_kernel = jnp.exp(1j * omega_sign * omega_vec * t_node)
+    coeff = alpha_eff * omega_kernel
+    coeff_re = jnp.real(coeff)[:, None, None, None]
+    coeff_im = jnp.imag(coeff)[:, None, None, None]
+    contrib = _project_sigma_channels(
+        coeff_re, coeff_im, sigma_tau_kij_re, sigma_tau_kij_im, project_code
+    )
+    return pref * contrib.astype(jnp.complex128)
+
+
+@jax.jit
+def _accumulate_tau_into_window(
     acc_win: jax.Array,
     sigma_tau_kij_re: jax.Array,
     sigma_tau_kij_im: jax.Array,
@@ -220,35 +250,11 @@ def _accumulate_window_channels_jit(
     pref: jax.Array,
     project_code: jax.Array,
 ) -> jax.Array:
-    omega_kernel = jnp.exp(1j * omega_sign * omega_vec * t_node)
-    coeff = alpha_eff * omega_kernel
-    coeff_re = jnp.real(coeff)[:, None, None, None]
-    coeff_im = jnp.imag(coeff)[:, None, None, None]
-    contrib = _project_sigma_channels(
-        coeff_re, coeff_im, sigma_tau_kij_re, sigma_tau_kij_im, project_code
+    """Thin adder: ``acc_win + _project_tau_onto_omega(...)``, donated for in-place reuse."""
+    return acc_win + _project_tau_onto_omega(
+        sigma_tau_kij_re, sigma_tau_kij_im, omega_vec,
+        t_node, alpha_eff, omega_sign, pref, project_code,
     )
-    return acc_win + pref * contrib.astype(jnp.complex128)
-
-
-@jax.jit
-def _project_stream_batch_jit(
-    omega_batch: jax.Array,
-    sigma_tau_kij_re: jax.Array,
-    sigma_tau_kij_im: jax.Array,
-    t_node: jax.Array,
-    alpha_eff: jax.Array,
-    omega_sign: jax.Array,
-    pref: jax.Array,
-    project_code: jax.Array,
-) -> jax.Array:
-    omega_kernel = jnp.exp(1j * omega_sign * omega_batch * t_node)
-    coeff = alpha_eff * omega_kernel
-    coeff_re = jnp.real(coeff)[:, None, None, None]
-    coeff_im = jnp.imag(coeff)[:, None, None, None]
-    contrib = _project_sigma_channels(
-        coeff_re, coeff_im, sigma_tau_kij_re, sigma_tau_kij_im, project_code
-    )
-    return pref * contrib.astype(jnp.complex128)
 
 
 def _get_sigma_channel_pipeline(
@@ -739,7 +745,7 @@ def _convolve_sigma_branch_kij(
                     omega_sign_j = jnp.asarray(omega_sign, dtype=jnp.float64)
                     pref = jnp.asarray(win.prefactor * scale, dtype=jnp.float64)
                     if acc_win is not None:
-                        acc_win = _accumulate_window_channels_jit(
+                        acc_win = _accumulate_tau_into_window(
                             acc_win, sigma_tau_kij_re, sigma_tau_kij_im,
                             omega_vec, t_node_j, alpha_eff_j,
                             omega_sign_j, pref, project_code_j,
@@ -748,9 +754,9 @@ def _convolve_sigma_branch_kij(
                         for ibeg in range(0, n_omega, int(max(1, omega_batch_size))):
                             iend = min(ibeg + int(max(1, omega_batch_size)), n_omega)
                             idx = omega_global_idx[ibeg:iend]
-                            omega_batch = omega_vec[ibeg:iend]
-                            batch_proj = _project_stream_batch_jit(
-                                omega_batch, sigma_tau_kij_re, sigma_tau_kij_im,
+                            batch_proj = _project_tau_onto_omega(
+                                sigma_tau_kij_re, sigma_tau_kij_im,
+                                omega_vec[ibeg:iend],
                                 t_node_j, alpha_eff_j, omega_sign_j,
                                 pref, project_code_j,
                             )
