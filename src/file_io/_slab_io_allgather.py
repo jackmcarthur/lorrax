@@ -74,6 +74,11 @@ class _AllgatherBackend:
         self.path = os.path.abspath(path)
         self.mode = mode
         self._file: h5py.File | None = None
+        # Dedicated per-rank 'r' handle opened on first read_slab call
+        # and cached for the duration of the SlabIO lifetime.  Reopening
+        # per read was an 80 % time hit in the V_q compute loop where
+        # many small hyperslabs come through.
+        self._read_file: h5py.File | None = None
 
         d = os.path.dirname(self.path)
         if d and _rank0():
@@ -193,46 +198,40 @@ class _AllgatherBackend:
         dtype=None,
         offset: Sequence[int] | None = None,
         mesh=None,
+        as_numpy: bool = False,
     ) -> jax.Array:
-        """Read a hyperslab into a host numpy array, broadcast to every
-        process, optionally promote to a JAX array sharded on mesh.
+        """Read a hyperslab into a replicated JAX array.
 
-        Default backend has no notion of sharded reads — every process
-        ends up with a full copy of the slab.  Caller can re-shard via
-        ``jax.device_put`` + ``NamedSharding`` if needed.
+        Every process reads the hyperslab independently via its OWN
+        h5py handle (a second file descriptor, opened in 'r' mode for
+        non-rank-0 processes).  This matches the historical LORRAX
+        pattern: with HDF5_USE_FILE_LOCKING=FALSE on Lustre / GPFS,
+        N independent readers are cheaper than rank-0-reads +
+        ``broadcast_one_to_all`` (which has per-call coordinator
+        overhead that dominates for the many small reads in the V_q
+        loop).
+
+        Returns a ``jax.Array`` replicated on ``mesh`` (or a plain
+        host-backed JAX array if no mesh is given).
         """
-        if _rank0() and self._file is not None:
-            dset = self._file[name]
-            full_shape = tuple(dset.shape) if shape is None else tuple(shape)
-            off = tuple(offset) if offset is not None else tuple([0] * len(full_shape))
-            slicer = tuple(slice(o, o + s) for o, s in zip(off, full_shape))
-            host = np.asarray(dset[slicer], dtype=dtype) if dtype else np.asarray(dset[slicer])
-        else:
-            if shape is None:
-                raise ValueError(
-                    "read_slab(non-rank-0) requires explicit shape when "
-                    "the file isn't open on this process.")
-            host = np.empty(tuple(shape),
-                            dtype=(dtype if dtype is not None else np.complex128))
-
-        # Broadcast from rank 0 to every process via process_allgather.
-        # Every rank contributes its buffer (identical on rank 0, zeros
-        # elsewhere) and we sum-reduce by using the rank-0 copy.  Simpler:
-        # just use `multihost_utils.broadcast_one_to_all` if available.
-        try:
-            host = np.asarray(multihost_utils.broadcast_one_to_all(host))
-        except Exception:
-            # Fallback: allgather and take rank 0's view.
-            gathered = multihost_utils.process_allgather(
-                jnp.asarray(host), tiled=False)
-            gathered = np.asarray(jax.device_get(gathered))
-            if gathered.ndim == host.ndim + 1:
-                host = gathered[0]
+        # Per-rank cached 'r' handle; one h5py.File per SlabIO lifetime.
+        if self._read_file is None:
+            self._read_file = h5py.File(self.path, 'r')
+        dset = self._read_file[name]
+        full_shape = tuple(dset.shape) if shape is None else tuple(shape)
+        off = tuple(offset) if offset is not None else tuple([0] * len(full_shape))
+        slicer = tuple(slice(o, o + s) for o, s in zip(off, full_shape))
+        host = np.asarray(dset[slicer], dtype=dtype) if dtype \
+               else np.asarray(dset[slicer])
+        # Return-numpy fast path: skip the H2D+D2H round-trip that the
+        # default jax.Array return forces — crucial for V_q which reads
+        # many small hyperslabs straight into host numpy stacks.
+        if as_numpy:
+            return host
 
         arr = jnp.asarray(host)
         if mesh is not None:
             from jax.sharding import NamedSharding, PartitionSpec as P
-            # Default placement: replicated.  Caller re-shards as needed.
             arr = jax.device_put(arr, NamedSharding(mesh, P()))
         return arr
 
@@ -263,6 +262,9 @@ class _AllgatherBackend:
 
     # ------------------------------------------------------------------
     def close(self) -> None:
+        if self._read_file is not None:
+            self._read_file.close()
+            self._read_file = None
         if self._file is not None:
             self._file.close()
             self._file = None

@@ -765,7 +765,7 @@ def read_zeta_q_sharded(
 # ============================================================================
 
 def compute_all_V_q_from_zeta_h5(
-    zeta_h5,
+    zeta_io,
     kgrid: tuple[int, int, int],
     fft_grid: tuple[int, int, int],
     bvec: np.ndarray,
@@ -779,6 +779,8 @@ def compute_all_V_q_from_zeta_h5(
     mc_average_vcoul_body: bool = True,
     bare_coulomb_cutoff: float | None = None,
     bgw_v_grid_fn=None,
+    n_rmu: int | None = None,
+    n_rtot: int | None = None,
 ) -> jax.Array:
     """
     bgw_v_grid_fn : callable(q_frac_wrapped_tuple) -> (fft_nx, fft_ny, fft_nz) ndarray
@@ -813,10 +815,14 @@ def compute_all_V_q_from_zeta_h5(
     """
     nkx, nky, nkz = kgrid
     fft_nx, fft_ny, fft_nz = fft_grid
-    
-    zeta_dset = zeta_h5['zeta_q']
-    n_rmu = zeta_dset.shape[3]
-    n_rtot = zeta_dset.shape[4]
+
+    # zeta_io is a SlabIO (file_io.slab_io) opened in 'r' mode by the
+    # caller.  n_rmu / n_rtot must be passed by the caller — SlabIO
+    # doesn't currently expose dataset introspection.
+    if n_rmu is None or n_rtot is None:
+        raise ValueError(
+            "compute_all_V_q_from_zeta_h5: n_rmu / n_rtot must be provided; "
+            "SlabIO doesn't expose dataset-shape introspection yet.")
     
     nq_total = nkx * nky * nkz
     n_chunks = (n_rmu + mu_chunk_size - 1) // mu_chunk_size
@@ -893,7 +899,14 @@ def compute_all_V_q_from_zeta_h5(
                 )
                 qvecs.append(qvec_wrapped)
                 
-                zeta_stacked[i] = zeta_dset[qx, qy, qz, :, :]
+                arr = zeta_io.read_slab(
+                    'zeta_q',
+                    shape=(1, 1, 1, n_rmu, n_rtot),
+                    dtype=np.complex128,
+                    offset=(qx, qy, qz, 0, 0),
+                    as_numpy=True,
+                )
+                zeta_stacked[i] = arr[0, 0, 0]
             
             return zeta_stacked, qvecs
         
@@ -1037,21 +1050,33 @@ def compute_all_V_q_from_zeta_h5(
                             mu_i_start = i * mu_chunk_size
                             mu_i_end = min(mu_i_start + mu_chunk_size, n_rmu)
                             
-                            zeta_mu_r_np = zeta_dset[qx, qy, qz, mu_i_start:mu_i_end, :]
+                            _arr = zeta_io.read_slab(
+                                'zeta_q',
+                                shape=(1, 1, 1, mu_i_end - mu_i_start, n_rtot),
+                                dtype=np.complex128,
+                                offset=(qx, qy, qz, mu_i_start, 0),
+                                as_numpy=True)
+                            zeta_mu_r_np = _arr[0, 0, 0]
                             zeta_mu_r = jnp.asarray(zeta_mu_r_np)
                             B_mu_i = mu_i_end - mu_i_start
                             zeta_mu_weighted, g0_chunk = kernels.fft_and_weight(zeta_mu_r, sqrt_v, phase, B_mu_i)
-                            
+
                             g0_mu_np[qx, qy, qz, mu_i_start:mu_i_end] = np.asarray(g0_chunk)
-                            
+
                             V_ii = kernels.contract_block(zeta_mu_weighted, zeta_mu_weighted)
                             V_q_local[mu_i_start:mu_i_end, mu_i_start:mu_i_end] = np.asarray(V_ii)
-                            
+
                             for j in range(i + 1, n_chunks):
                                 mu_j_start = j * mu_chunk_size
                                 mu_j_end = min(mu_j_start + mu_chunk_size, n_rmu)
-                                
-                                zeta_nu_r_np = zeta_dset[qx, qy, qz, mu_j_start:mu_j_end, :]
+
+                                _arr = zeta_io.read_slab(
+                                    'zeta_q',
+                                    shape=(1, 1, 1, mu_j_end - mu_j_start, n_rtot),
+                                    dtype=np.complex128,
+                                    offset=(qx, qy, qz, mu_j_start, 0),
+                                    as_numpy=True)
+                                zeta_nu_r_np = _arr[0, 0, 0]
                                 zeta_nu_r = jnp.asarray(zeta_nu_r_np)
                                 B_mu_j = mu_j_end - mu_j_start
                                 zeta_nu_weighted, _ = kernels.fft_and_weight(zeta_nu_r, sqrt_v, phase, B_mu_j)

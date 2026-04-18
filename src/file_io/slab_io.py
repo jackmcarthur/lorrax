@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
+import numpy as np
 import jax
 
 from ._slab_io_allgather import _AllgatherBackend
@@ -168,19 +169,29 @@ class SlabIO:
         offset: Sequence[int] | None = None,
         mesh=None,
         partition_spec=None,
+        as_numpy: bool = False,
     ) -> jax.Array:
-        """Read a hyperslab into a JAX array.
+        """Read a hyperslab.
 
         On the allgather path, returns a replicated host-backed JAX
-        array.  On the FFI path, returns a sharded array with
-        ``partition_spec`` on ``mesh`` (default: replicated).
+        array (or a plain ``np.ndarray`` if ``as_numpy=True`` — useful
+        for readers that feed host-side numpy stacks straight into a
+        GPU compute kernel later, skipping a pointless H2D+D2H round
+        trip).  On the FFI path, returns a sharded array with
+        ``partition_spec`` on ``mesh`` (``as_numpy`` still forces a
+        host ndarray via ``device_get``).
         """
         if self.use_ffi_io:
-            return self._backend.read_slab(
+            arr = self._backend.read_slab(
                 name, shape=shape, dtype=dtype, offset=offset,
                 mesh=mesh or self.mesh, partition_spec=partition_spec)
-        return self._backend.read_slab(
-            name, shape=shape, dtype=dtype, offset=offset, mesh=mesh)
+        else:
+            arr = self._backend.read_slab(
+                name, shape=shape, dtype=dtype, offset=offset,
+                mesh=mesh, as_numpy=as_numpy)
+        if as_numpy and not isinstance(arr, np.ndarray):
+            arr = np.asarray(jax.device_get(arr))
+        return arr
 
     def accumulate_slab(
         self,

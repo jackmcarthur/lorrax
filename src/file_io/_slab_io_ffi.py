@@ -24,42 +24,47 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 # of ffi.phdf5 would break users who don't build the FFI .so.
 
 
-def _sharding_to_axis_for_dim(
+def _sharding_to_axis_info(
     sharding: NamedSharding, ndim: int,
-) -> tuple[int, ...]:
-    """For a NamedSharding over a Mesh, return a per-dim mesh-axis index
-    (or -1 for replicated).  Length always equals ``ndim``.
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Encode a NamedSharding's per-dim axis lists for the FFI attrs.
 
-    JAX canonicalises ``PartitionSpec(None, None)`` -> ``PartitionSpec()``
-    for fully replicated arrays, and in general pads / truncates trailing
-    Nones — so we iterate by the array's ndim and treat missing entries
-    as replicated.
+    Returns ``(axis_count_per_dim, axis_flat)``:
+      - axis_count_per_dim[d]: number of mesh axes sharding dim d
+        (0 = replicated).
+      - axis_flat: concatenation of per-dim axis index lists, in dim
+        order, each list preserving JAX's leftmost-is-slowest order.
 
-    Only supports single-axis-per-dim layouts; raises if a dim is
-    sharded over multiple mesh axes.
+    JAX canonicalises ``PartitionSpec(None, None)`` to
+    ``PartitionSpec()``, so iterate by the array's ndim and treat
+    missing trailing entries as ``None``.
     """
     axis_names = list(sharding.mesh.axis_names)
     spec = list(sharding.spec)
-    out: list[int] = []
+    counts: list[int] = []
+    flat: list[int] = []
     for i in range(ndim):
         s = spec[i] if i < len(spec) else None
         if s is None:
-            out.append(-1)
+            counts.append(0)
         elif isinstance(s, str):
             if s not in axis_names:
                 raise ValueError(
                     f"sharding spec dim {i}: axis '{s}' not in mesh "
                     f"axis_names {axis_names}")
-            out.append(axis_names.index(s))
+            counts.append(1)
+            flat.append(axis_names.index(s))
         elif isinstance(s, (list, tuple)):
-            if len(s) != 1:
-                raise NotImplementedError(
-                    f"multi-axis dim {i}={s!r}: not supported by the FFI "
-                    "backend yet; use use_ffi_io=False")
-            out.append(axis_names.index(s[0]))
+            counts.append(len(s))
+            for a in s:
+                if a not in axis_names:
+                    raise ValueError(
+                        f"sharding spec dim {i}: axis '{a}' not in mesh "
+                        f"axis_names {axis_names}")
+                flat.append(axis_names.index(a))
         else:
             raise ValueError(f"unrecognised spec element at dim {i}: {s!r}")
-    return tuple(out)
+    return tuple(counts), tuple(flat)
 
 
 def _replicated_sharding(mesh: Mesh, ndim: int) -> NamedSharding:
@@ -162,14 +167,11 @@ class _FfiBackend:
         if not isinstance(A.sharding, NamedSharding) or A.sharding.mesh is not self.mesh:
             A = jax.device_put(A, _replicated_sharding(self.mesh, A.ndim))
 
-        axis_for_dim = _sharding_to_axis_for_dim(A.sharding, A.ndim)
+        axis_count_per_dim, axis_flat = _sharding_to_axis_info(
+            A.sharding, A.ndim)
         off = tuple(offset) if offset is not None else tuple([0] * A.ndim)
         gshape = tuple(global_shape) if global_shape is not None else tuple(A.shape)
 
-        # Ensure the dataset exists; create_dataset may or may not have
-        # been called — this handles the single-shot `write_slab` case
-        # by ensuring with the caller-provided global_shape (default =
-        # A.shape when writing a whole dataset).
         if name not in self._ds_ids:
             ds_id = self._loader.phdf5_ensure_dataset(
                 self.fh, name, tuple(int(s) for s in gshape),
@@ -189,7 +191,8 @@ class _FfiBackend:
                 ds_id=int(ds_id),
                 offset_base=off,
                 mesh_shape=mesh_shape,
-                axis_for_dim=axis_for_dim,
+                axis_count_per_dim=axis_count_per_dim,
+                axis_flat=axis_flat,
             )
 
         shard_map(
@@ -208,6 +211,8 @@ class _FfiBackend:
         offset: Sequence[int] | None = None,
         mesh: Mesh | None = None,
         partition_spec: P | None = None,
+        as_numpy: bool = False,  # accepted for signature compatibility;
+        # the public SlabIO.read_slab handles the numpy conversion.
     ) -> jax.Array:
         from ffi.phdf5.read import ffi_read_call
 
@@ -219,14 +224,22 @@ class _FfiBackend:
         if partition_spec is None:
             partition_spec = P(*([None] * len(shape)))
         sharding = NamedSharding(mesh, partition_spec)
-        axis_for_dim = _sharding_to_axis_for_dim(sharding, len(shape))
+        axis_count_per_dim, axis_flat = _sharding_to_axis_info(
+            sharding, len(shape))
         mesh_shape = tuple(mesh.shape[ax] for ax in mesh.axis_names)
 
-        # Per-rank output shape: global shape / mesh_shape[axis] per sharded dim.
+        # Per-rank output shape: divide by the product of the mesh
+        # sizes of all axes sharding that dim.
         local_shape = list(shape)
-        for d, ax in enumerate(axis_for_dim):
-            if ax >= 0:
-                local_shape[d] = int(local_shape[d]) // int(mesh_shape[ax])
+        _flat_idx = 0
+        for d in range(len(shape)):
+            na = axis_count_per_dim[d]
+            if na > 0:
+                div = 1
+                for k in range(na):
+                    div *= int(mesh_shape[axis_flat[_flat_idx + k]])
+                local_shape[d] = int(local_shape[d]) // div
+                _flat_idx += na
         out_struct = jax.ShapeDtypeStruct(tuple(local_shape), jnp.dtype(dtype))
 
         ds_id = self._ds_id(name, readonly=True)
@@ -239,7 +252,8 @@ class _FfiBackend:
                 ds_id=int(ds_id),
                 offset_base=off,
                 mesh_shape=mesh_shape,
-                axis_for_dim=axis_for_dim,
+                axis_count_per_dim=axis_count_per_dim,
+                axis_flat=axis_flat,
             )
 
         result = shard_map(

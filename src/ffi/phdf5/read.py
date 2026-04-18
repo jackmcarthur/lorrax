@@ -33,19 +33,19 @@ def ffi_read_call(
     ds_id: int,
     offset_base: Sequence[int],
     mesh_shape: Sequence[int],
-    axis_for_dim: Sequence[int],
+    axis_count_per_dim: Sequence[int],
+    axis_flat: Sequence[int],
 ) -> jax.Array:
-    """Low-level FFI call.  Returns the rank-local shard (N-D).
-
-    Attrs match the N-D C++ contract; caller computes them.  Use
-    inside a ``shard_map`` body with ``in_specs=()``.
+    """Low-level FFI call.  See ffi.phdf5.write.ffi_write_call for the
+    ``axis_count_per_dim`` + ``axis_flat`` encoding.
     """
     return jax.ffi.ffi_call(_FFI_TARGET, out_struct)(
         ctx_handle=int(ctx_handle),
         ds_id=int(ds_id),
         offset_base=np.asarray(offset_base, dtype=np.int64),
         mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
-        axis_for_dim=np.asarray(axis_for_dim, dtype=np.int64),
+        axis_count_per_dim=np.asarray(axis_count_per_dim, dtype=np.int64),
+        axis_flat=np.asarray(axis_flat, dtype=np.int64),
     )
 
 
@@ -76,7 +76,8 @@ def read_sharded_slab(
             ds_id=int(ds_id),
             offset_base=(0, 0),
             mesh_shape=(p, q),
-            axis_for_dim=(0, 1),
+            axis_count_per_dim=(1, 1),
+            axis_flat=(0, 1),
         )
 
     return shard_map(

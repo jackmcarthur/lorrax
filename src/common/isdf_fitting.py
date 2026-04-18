@@ -640,6 +640,7 @@ def fit_zeta_chunked_to_h5(
     k_chunk_size: int = 0,
     q_gather_size: int = 0,
     band_norms: np.ndarray | None = None,
+    use_ffi_io: bool = False,
 ):
     """
     Full zeta fitting pipeline with r-chunk loop and HDF5 output.
@@ -820,28 +821,21 @@ def fit_zeta_chunked_to_h5(
     jax.clear_caches()  # Clear JAX function caches that may hold array refs
 
     # ========== STEP 4: Create HDF5 file ==========
-    # Only rank 0 creates the file structure
-    if jax.process_index() == 0:
-        with h5py.File(output_file, 'w') as f:
-            # Create dataset for full zeta
-            f.create_dataset(
-                'zeta_q',
-                shape=(nqx, nqy, nqz, n_rmu, n_rtot),
-                dtype=np.complex128,
-                chunks=(1, 1, 1, n_rmu, n_rchunk),  # Chunk by r-slice (contiguous in r!)
-            )
-            # Store metadata
-            f.attrs['n_rmu'] = n_rmu
-            f.attrs['n_rtot'] = n_rtot
-            f.attrs['fft_grid'] = meta.fft_grid
-            f.attrs['kgrid'] = kgrid
-            f.attrs['chunk_mode'] = 'r'
-            f.attrs['r_chunk_size'] = chunk_r
-            f.attrs['num_r_chunks'] = num_chunks
-            f.attrs['isdf_pair_mode'] = isdf_pair_mode
-
-    # Synchronize before writing
-    jax.experimental.multihost_utils.sync_global_devices("zeta_h5_create")
+    # Use SlabIO to create+pre-size the dataset with chunking, then
+    # close so the allgather-path writer_worker can own the file.  FFI
+    # path reopens zeta_io in 'a' mode just before the chunk loop.
+    from file_io.slab_io import SlabIO
+    with SlabIO(output_file, mode='w', mesh=mesh_xy, use_ffi_io=use_ffi_io) as _zeta_create_io:
+        _zeta_create_io.create_dataset(
+            'zeta_q',
+            shape=(nqx, nqy, nqz, n_rmu, n_rtot),
+            dtype=np.complex128,
+            chunks=(1, 1, 1, n_rmu, n_rchunk),
+        )
+    # Informational file-level attrs dropped (unused anywhere).
+    zeta_io = None
+    if use_ffi_io:
+        zeta_io = SlabIO(output_file, mode='a', mesh=mesh_xy, use_ffi_io=True)
 
     # ========== STEP 5: Pre-load G-space for all band chunks (ONCE) ==========
     # This caches the expensive HDF5 read + scatter so we don't repeat it
@@ -869,31 +863,27 @@ def fit_zeta_chunked_to_h5(
     t_write_total = 0.0
     t_chunk_start = time.perf_counter()
 
-    # Setup async writer thread for overlapped I/O
-    # This allows GPU computation to continue while HDF5 writes happen in background
+    # Per-chunk writes go through zeta_io (SlabIO).  On the allgather
+    # backend we keep the old async-writer pattern: main thread does
+    # the allgather, rank-0 background thread does the h5py hyperslab
+    # writes — this hides the h5 latency behind the next chunk's GPU
+    # compute.  On the FFI backend, writes are collective so all ranks
+    # must enter in lock-step; the synchronous SlabIO.write_slab call
+    # from the main thread is the right shape (H5Dwrite's host-block
+    # doesn't stall the CUDA stream, so the next chunk's build still
+    # overlaps).
     write_queue = queue.Queue()
-    write_error = [None]  # Mutable container to capture errors from writer thread
+    write_error = [None]
 
     def writer_worker():
-        """Background thread that processes HDF5 writes from the queue.
-
-        R-chunking advantage: r-slices are contiguous in the flattened xyz
-        index, enabling a single sequential HDF5 write per chunk.
-        """
+        """Rank-0 background thread: dequeue + h5py hyperslab writes."""
         try:
             while True:
                 item = write_queue.get()
-                if item is None:  # Poison pill signals shutdown
+                if item is None:
                     break
-                # Support both full-q and partial-q (q-chunked gather) formats
-                if len(item) == 6:
-                    zeta_data, r_start, r_end, chunk_id, q_start, q_end = item
-                else:
-                    zeta_data, r_start, r_end, chunk_id = item
-                    q_start, q_end = 0, zeta_data.shape[0]
-                # zeta_data: (n_q_slice, n_rmu, actual_n_rchunk)
-                # R-chunks are contiguous in r-space, so we can write directly!
-
+                zeta_data, r_start, r_end, chunk_id, q_start, q_end = item
+                # zeta_data: (n_q_slice, n_rmu, actual_n_rchunk), host numpy
                 with h5py.File(output_file, 'a') as f:
                     for i, q_flat in enumerate(range(q_start, q_end)):
                         qx = q_flat // (nqy * nqz)
@@ -905,9 +895,8 @@ def fit_zeta_chunked_to_h5(
             write_error[0] = e
             write_queue.task_done()
 
-    # Start writer thread (only on rank 0)
     writer_thread = None
-    if jax.process_index() == 0:
+    if not use_ffi_io and jax.process_index() == 0:
         writer_thread = threading.Thread(target=writer_worker, daemon=True)
         writer_thread.start()
 
@@ -1065,26 +1054,55 @@ def fit_zeta_chunked_to_h5(
                 # Each allgather produces a FULLY REPLICATED output per device:
                 # q_gather × n_rmu × chunk_r × 16 bytes, plus NCCL temp of same size.
                 # Cap to keep replicated output + NCCL under available memory.
-                _bytes_per_q_replicated = 2 * n_rmu * actual_n_rchunk * 16  # output + NCCL
+                _bytes_per_q_replicated = 2 * n_rmu * actual_n_rchunk * 16
                 _safe_q_gather = max(1, min(nq, int(10 * 1024**3 / max(1, _bytes_per_q_replicated))))
                 if q_gather_size > 0:
                     _q_gather = min(nq, q_gather_size, _safe_q_gather)
                 else:
                     _q_gather = _safe_q_gather
 
-                for _q0 in range(0, nq, _q_gather):
-                    _q1 = min(_q0 + _q_gather, nq)
-                    _slice = zeta_chunk[_q0:_q1]
-                    _gathered = jax.experimental.multihost_utils.process_allgather(_slice, tiled=False)
-                    if jax.process_index() == 0:
-                        _g = np.asarray(_gathered)
-                        if _g.ndim == 4 and _g.shape[0] == 1:
-                            _g = _g[0]
-                        write_queue.put((_g, r_start, r_end, chunk_idx, _q0, _q1))
-                    del _gathered, _slice
+                if use_ffi_io:
+                    # FFI path: zeta_chunk has shape (nq, n_rmu, chunk_r);
+                    # each rank writes its own hyperslab into
+                    # zeta_q[qx, qy, qz, :, r_start:r_end] directly from
+                    # the sharded JAX array.  We reshape the per-q slice
+                    # from (n_rmu, chunk_r) to (1, 1, 1, n_rmu, chunk_r)
+                    # so ndim matches the dataset; the trailing axes
+                    # carry the sharding and the singleton axes are
+                    # replicated (axis_count_per_dim[d] == 0).
+                    for _q0 in range(0, nq, _q_gather):
+                        _q1 = min(_q0 + _q_gather, nq)
+                        _slice = zeta_chunk[_q0:_q1]
+                        for i in range(_q1 - _q0):
+                            q_flat = _q0 + i
+                            qx = q_flat // (nqy * nqz)
+                            qy = (q_flat % (nqy * nqz)) // nqz
+                            qz = q_flat % nqz
+                            _one = _slice[i][None, None, None, :, :]
+                            zeta_io.write_slab(
+                                'zeta_q', _one,
+                                offset=(qx, qy, qz, 0, r_start),
+                                global_shape=(nqx, nqy, nqz, n_rmu, n_rtot))
+                        del _slice
+                else:
+                    # Allgather path: gather once per q-chunk on every rank,
+                    # queue the per-q hyperslab writes on rank 0's background
+                    # thread.  Preserves the async-write-behind-GPU-compute
+                    # overlap that the writer_worker provides.
+                    for _q0 in range(0, nq, _q_gather):
+                        _q1 = min(_q0 + _q_gather, nq)
+                        _slice = zeta_chunk[_q0:_q1]
+                        _gathered = jax.experimental.multihost_utils.process_allgather(
+                            _slice, tiled=False)
+                        if jax.process_index() == 0:
+                            _g = np.asarray(_gathered)
+                            if _g.ndim == 4 and _g.shape[0] == 1:
+                                _g = _g[0]
+                            write_queue.put((_g, r_start, r_end, chunk_idx, _q0, _q1))
+                        del _gathered, _slice
 
                 jax.experimental.multihost_utils.sync_global_devices(f"zeta_chunk_{chunk_idx}")
-                del zeta_chunk  # Free GPU memory before next chunk's FFT stage
+                del zeta_chunk
             t_write_total += time.perf_counter() - t0
             r_progress.step()
 
@@ -1092,17 +1110,21 @@ def fit_zeta_chunked_to_h5(
     t_chunks_total = time.perf_counter() - t_chunk_start
     r_progress.finish()
 
-    # Wait for all async writes to complete
+    # Drain the rank-0 writer queue (allgather backend only; FFI path
+    # writes are already fully flushed by the synchronous SlabIO calls).
     if jax.process_index() == 0 and writer_thread is not None:
-        write_queue.join()  # Wait for all queued writes
-        write_queue.put(None)  # Poison pill to stop writer thread
-        writer_thread.join()  # Wait for thread to exit
-
-        # Check for errors from writer thread
+        write_queue.join()
+        write_queue.put(None)
+        writer_thread.join()
         if write_error[0] is not None:
             raise RuntimeError(f"Async writer failed: {write_error[0]}")
 
-    # Sync all processes after writes complete
+    # Close the SlabIO handle (FFI path only; allgather path never
+    # opened one after STEP 4).
+    if zeta_io is not None:
+        zeta_io.close()
+
+    # Sync all processes so downstream reads see the file.
     jax.experimental.multihost_utils.sync_global_devices("zeta_writes_complete")
 
     # Free cached G-space now that chunk loop is done

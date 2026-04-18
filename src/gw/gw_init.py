@@ -317,6 +317,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			isdf_pair_mode=cfg.isdf_pair_mode,
 			k_chunk_size=chunks.get('k_chunk', 0),
 			band_norms=_band_norms,
+			use_ffi_io=cfg.use_ffi_io,
 		)
 
 	budget_gb = mem_est.get('budget_gb', cfg.memory_per_device_gb)
@@ -364,11 +365,13 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	if cfg.bare_coulomb_cutoff is not None:
 		print_fn(f"    V_q bare cutoff: {cfg.bare_coulomb_cutoff:.1f} Ry")
 
+	from file_io.slab_io import SlabIO
 	with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
-		with h5py.File(zeta_h5_path, 'r') as zeta_h5:
+		with SlabIO(zeta_h5_path, mode='r', mesh=mesh_xy,
+		            use_ffi_io=cfg.use_ffi_io) as zeta_io:
 			with mesh_xy:
 				V_q_raw, G0_all = compute_all_V_q_from_zeta_h5(
-					zeta_h5, kgrid=meta.kgrid, fft_grid=meta.fft_grid,
+					zeta_io, kgrid=meta.kgrid, fft_grid=meta.fft_grid,
 					bvec=bvec, cell_volume=meta.cell_volume,
 					mu_chunk_size=mu_chunk, mesh_xy=mesh_xy,
 					sys_dim=meta.sys_dim,
@@ -377,9 +380,11 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 					mc_average_vcoul_body=cfg.mc_average_vcoul_body,
 					bare_coulomb_cutoff=cfg.bare_coulomb_cutoff,
 					bgw_v_grid_fn=bgw_v_grid_fn,
+					n_rmu=meta.n_rmu, n_rtot=meta.n_rtot,
 				)
 
-	# Write G0 = ζ_μ(G=0) at q=0 back to zeta file for restart
+	# Write G0 = ζ_μ(G=0) at q=0 back to zeta file via SlabIO's deferred
+	# attr path (small; rank-0-only after MPI-IO file is closed).
 	G0_gathered = jax.experimental.multihost_utils.process_allgather(G0_all)
 	if G0_gathered.ndim == 5 and G0_gathered.shape[0] == 1:
 		G0_gathered = G0_gathered[0]

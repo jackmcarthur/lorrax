@@ -139,7 +139,8 @@ static ffi::Error WriteDispatch(
     int64_t ds_id,
     ffi::Span<const int64_t> offset_base,
     ffi::Span<const int64_t> mesh_shape,
-    ffi::Span<const int64_t> axis_for_dim)
+    ffi::Span<const int64_t> axis_count_per_dim,
+    ffi::Span<const int64_t> axis_flat)
 {
     auto* ctx = reinterpret_cast<PhdfCtx*>(ctx_handle);
     if (!ctx) {
@@ -149,31 +150,38 @@ static ffi::Error WriteDispatch(
 
     const auto dims = A.dimensions();
     const size_t N = dims.size();
-    if (offset_base.size() != N || axis_for_dim.size() != N) {
+    if (offset_base.size() != N || axis_count_per_dim.size() != N) {
         std::ostringstream os;
         os << "phdf5 write: rank mismatch  A.ndim=" << N
            << " offset_base.size=" << offset_base.size()
-           << " axis_for_dim.size=" << axis_for_dim.size();
+           << " axis_count_per_dim.size=" << axis_count_per_dim.size();
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
     }
 
-    // Derive this rank's coord in the mesh, then build the full
-    // per-rank offset.
     std::vector<int64_t> coord = unravel_rank(ctx->rank, mesh_shape);
     std::vector<hsize_t> offset(N), count(N);
+    size_t flat_idx = 0;
     for (size_t d = 0; d < N; ++d) {
         count[d] = (hsize_t)dims[d];
         offset[d] = (hsize_t)offset_base[d];
-        int64_t ax = axis_for_dim[d];
-        if (ax >= 0) {
-            if ((size_t)ax >= mesh_shape.size()) {
+        int64_t na = axis_count_per_dim[d];
+        // Dim d is sharded over `na` mesh axes; leftmost is slowest,
+        // rightmost has stride=1.  rank_coord = sum_k coord[ax_k] * prod(mesh_shape[ax_{k+1:}]).
+        int64_t rank_coord = 0;
+        int64_t stride_acc = 1;
+        for (int64_t k = na - 1; k >= 0; --k) {
+            int64_t ax = axis_flat[flat_idx + k];
+            if (ax < 0 || (size_t)ax >= mesh_shape.size()) {
                 std::ostringstream os;
-                os << "phdf5 write: axis_for_dim[" << d << "]=" << ax
-                   << " out of range for mesh_shape.size=" << mesh_shape.size();
+                os << "phdf5 write: bad axis " << ax
+                   << " at dim " << d << " axis " << k;
                 return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
             }
-            offset[d] += coord[ax] * count[d];
+            rank_coord += coord[ax] * stride_acc;
+            stride_acc *= mesh_shape[ax];
         }
+        offset[d] += rank_coord * count[d];
+        flat_idx += (size_t)na;
     }
 
     const auto dtype = A.element_type();
@@ -224,4 +232,5 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("ds_id")
         .Attr<xla::ffi::Span<const int64_t>>("offset_base")
         .Attr<xla::ffi::Span<const int64_t>>("mesh_shape")
-        .Attr<xla::ffi::Span<const int64_t>>("axis_for_dim"));
+        .Attr<xla::ffi::Span<const int64_t>>("axis_count_per_dim")
+        .Attr<xla::ffi::Span<const int64_t>>("axis_flat"));

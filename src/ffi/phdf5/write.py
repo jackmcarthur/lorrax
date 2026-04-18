@@ -36,12 +36,18 @@ def ffi_write_call(
     ds_id: int,
     offset_base: Sequence[int],
     mesh_shape: Sequence[int],
-    axis_for_dim: Sequence[int],
+    axis_count_per_dim: Sequence[int],
+    axis_flat: Sequence[int],
 ) -> jax.Array:
     """Low-level FFI call for one rank's local shard.  Returns token.
 
-    Attrs match the N-D C++ contract; caller is responsible for
-    computing them.  Use inside a ``shard_map`` body.
+    Attrs encode the N-D block-partitioned sharding with possible
+    multi-mesh-axis per dim:
+      - axis_count_per_dim[d] = number of mesh axes sharding dim d (0 =
+        replicated)
+      - axis_flat = concatenation of per-dim axis lists, in dim order,
+        each list in JAX leftmost-is-slowest order.
+    Use inside a ``shard_map`` body.
     """
     token_spec = jax.ShapeDtypeStruct((1,), jnp.int32)
     return jax.ffi.ffi_call(_FFI_TARGET, token_spec)(
@@ -50,7 +56,8 @@ def ffi_write_call(
         ds_id=int(ds_id),
         offset_base=np.asarray(offset_base, dtype=np.int64),
         mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
-        axis_for_dim=np.asarray(axis_for_dim, dtype=np.int64),
+        axis_count_per_dim=np.asarray(axis_count_per_dim, dtype=np.int64),
+        axis_flat=np.asarray(axis_flat, dtype=np.int64),
     )
 
 
@@ -90,7 +97,8 @@ def write_sharded_slab(
             ds_id=int(ds_id),
             offset_base=(0, 0),
             mesh_shape=(p, q),
-            axis_for_dim=(0, 1),
+            axis_count_per_dim=(1, 1),
+            axis_flat=(0, 1),
         )
 
     return shard_map(
