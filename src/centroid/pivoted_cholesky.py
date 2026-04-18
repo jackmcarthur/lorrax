@@ -46,6 +46,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jax.experimental.shard_map import shard_map
+from jax.experimental import multihost_utils as _mh
 from functools import partial
 
 from file_io import WFNReader
@@ -240,6 +241,14 @@ def pivoted_cholesky_select(
             ``k_keep`` is too small (last entry still ≫ tol_rel × d0max
             ⇒ stopping early would have been premature) or too large
             (last entries near zero ⇒ already extracting noise).
+        trR_over_trG: (k_keep + 1,) real — running ``tr(R_k) / tr(G)``,
+            i.e. the candidate-pool relative Frobenius residual after
+            each pivot. ``trR_over_trG[0] = 1`` (no pivots), then
+            ``trR_over_trG[k+1]`` reflects the state after step k.
+            Monotone non-increasing under exact arithmetic. Comparable
+            across band windows / N_c (it's already normalized by the
+            per-config trace), so this is the right curve to plot
+            ``accuracy vs # pivots`` for ISDF point-set design.
     """
     M = G.shape[0]
     real_dtype = G.real.dtype
@@ -248,6 +257,11 @@ def pivoted_cholesky_select(
 
     diag0 = jnp.maximum(jnp.real(jnp.diag(G)), 0.0)
     d0max = jnp.max(diag0)
+    # Total trace of G — invariant of the pivoting and the natural
+    # normalizer for the running residual ‖G − L_k L_k^H‖²_F (more
+    # precisely tr R_k, which is the candidate-pool relative Frobenius
+    # mass not yet captured by k pivots).
+    trG = jnp.sum(diag0)
 
     L0 = jnp.zeros((M, k_keep), dtype=G.dtype)
     piv0 = -jnp.ones((k_keep,), dtype=jnp.int32)
@@ -256,11 +270,15 @@ def pivoted_cholesky_select(
     done0 = jnp.array(False)
     rank0 = jnp.array(0, dtype=jnp.int32)
     d_taken0 = jnp.zeros((k_keep,), dtype=real_dtype)
+    # trR_over_trG[j+1] = sum(d_after_step_j) / trG. Index 0 stores the
+    # initial value (= 1.0); size is k_keep+1 so we get the full
+    # trajectory through the last accepted pivot.
+    trR_over_trG0 = jnp.zeros((k_keep + 1,), dtype=real_dtype).at[0].set(1.0)
 
     col_ids = jnp.arange(k_keep)
 
     def body_fun(j, carry):
-        d, L, piv, active, done, rank, d_taken = carry
+        d, L, piv, active, done, rank, d_taken, trR_over_trG = carry
 
         # Step 1: pick the pivot = row with the largest residual diagonal
         # among the still-active rows.
@@ -298,8 +316,18 @@ def pivoted_cholesky_select(
 
         # Step 4: Schur-complement update of the residual diagonal.
         #   d_new[i] = d[i] - |L[i, j]|²
-        # Clamp at 0 to kill fp32 noise, then disable the picked row.
+        # Clamp at 0 to kill fp64 noise. d_new[p] is naturally ≈ 0
+        # (because |newcol[p]|² == pivot_val by the cleanup above), so
+        # summing d_new gives the correct trace of the new Schur
+        # complement R_k. We must use d_new HERE (before substituting
+        # the -inf sentinel into d) so the trace sum stays meaningful.
         d_new = jnp.maximum(d - jnp.abs(newcol) ** 2, 0.0)
+        # trR / trG after this step. If take is False this iteration is
+        # a no-op, so just propagate the previous value.
+        trR_step = jnp.sum(d_new)
+        trR_over_trG = trR_over_trG.at[j + 1].set(
+            jnp.where(take, trR_step / trG, trR_over_trG[j])
+        )
         idx = jnp.arange(M)
         pivot_mask = (idx == p)
         active = active & ~(take & pivot_mask)
@@ -310,15 +338,16 @@ def pivoted_cholesky_select(
         done = done | (~take)
         rank = rank + take.astype(jnp.int32)
 
-        return d, L, piv, active, done, rank, d_taken
+        return d, L, piv, active, done, rank, d_taken, trR_over_trG
 
-    d, L, piv, active, done, rank, d_taken = lax.fori_loop(
-        0, k_keep, body_fun, (d0, L0, piv0, active0, done0, rank0, d_taken0)
+    d, L, piv, active, done, rank, d_taken, trR_over_trG = lax.fori_loop(
+        0, k_keep, body_fun,
+        (d0, L0, piv0, active0, done0, rank0, d_taken0, trR_over_trG0),
     )
     del active, done
 
     d_final = jnp.where(jnp.isfinite(d), d, 0.0)
-    return piv, L, rank, d_final, d_taken
+    return piv, L, rank, d_final, d_taken, trR_over_trG
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -472,18 +501,27 @@ def prune_candidates_by_pivoted_cholesky(
             mesh, M, n_keep, tol_rel=tol_rel, tol_abs=0.0,
             mesh_axis=select_axis,
         )
-        piv, L, rank, d_final, d_taken = select_step(G)
+        piv, L, rank, d_final, d_taken, trR_over_trG = select_step(G)
     else:
-        piv, L, rank, d_final, d_taken = pivoted_cholesky_select(
+        piv, L, rank, d_final, d_taken, trR_over_trG = pivoted_cholesky_select(
             G, n_keep, tol_rel=tol_rel, tol_abs=0.0
         )
     del L  # only useful if the caller needs the Cholesky factor
     rank = int(rank)
     piv_np = np.asarray(piv)
     d_taken_np = np.asarray(d_taken)
+    trR_over_trG_np = np.asarray(trR_over_trG)
+    # d_final is sharded along the select's mesh axis (`row_shard_1d`);
+    # in multi-process JAX a bare ``np.asarray`` raises because remote
+    # shards are non-addressable. Gather it once here so the host-side
+    # diagnostics + the wrapper's d_final return are safe to read.
+    if mesh is not None:
+        d_final_np = np.asarray(_mh.process_allgather(d_final, tiled=True))
+    else:
+        d_final_np = np.asarray(d_final)
 
     if verbose:
-        d_np = np.asarray(d_final)
+        d_np = d_final_np
         leftover_max = float(d_np.max()) if d_np.size else 0.0
         leftover_mean = float(d_np[d_np > 0].mean()) if np.any(d_np > 0) else 0.0
         # Pivot-decay summary: first/last picked, and a couple of percentile
@@ -497,6 +535,12 @@ def prune_candidates_by_pivoted_cholesky(
         print(f"[pivoted_cholesky] rank={rank}/{n_keep}")
         print(f"[pivoted_cholesky] picked-pivot residuals: "
               f"first={first:.3e}, mid={mid:.3e}, last={last:.3e}")
+        # Relative-Frobenius accuracy at the same checkpoints.
+        if rank > 0:
+            print(f"[pivoted_cholesky] tr(R_k)/tr(G): "
+                  f"first={trR_over_trG_np[1]:.3e}, "
+                  f"mid={trR_over_trG_np[rank // 2 + 1]:.3e}, "
+                  f"last={trR_over_trG_np[rank]:.3e}")
         print(f"[pivoted_cholesky] leftover residuals: "
               f"max={leftover_max:.3e}, mean(>0)={leftover_mean:.3e}")
         if last > 0 and leftover_max > 0:
@@ -517,7 +561,7 @@ def prune_candidates_by_pivoted_cholesky(
     # piv may contain -1 past rank; slice.
     keep_piv = piv_np[:rank]
     keep_idx = np.asarray(cand_idx)[keep_piv]
-    return keep_idx, rank, G, d_final, d_taken_np
+    return keep_idx, rank, G, d_final_np, d_taken_np, trR_over_trG_np
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -721,7 +765,8 @@ def make_sharded_pivoted_cholesky_select(
     rep = PartitionSpec()
 
     in_specs = (row_shard,)
-    out_specs = (rep, row_shard, rep, row_shard_1d, rep)
+    # outputs: piv, L, rank, d_final, d_taken, trR_over_trG
+    out_specs = (rep, row_shard, rep, row_shard_1d, rep, rep)
 
     @partial(jax.jit, static_argnames=())
     def step(G):
@@ -746,6 +791,8 @@ def make_sharded_pivoted_cholesky_select(
 
             # d0max is a global statistic — reduce across shards.
             d0max = lax.pmax(jnp.max(local_diag), axis_name=mesh_axis)
+            # tr(G) is also global — one extra psum, replicated everywhere.
+            trG = lax.psum(jnp.sum(local_diag), axis_name=mesh_axis)
 
             L_slab = jnp.zeros((M_slab, k_keep), dtype=G_slab.dtype)
             piv = -jnp.ones((k_keep,), dtype=jnp.int32)
@@ -754,10 +801,12 @@ def make_sharded_pivoted_cholesky_select(
             done = jnp.array(False)
             rank = jnp.array(0, dtype=jnp.int32)
             d_taken = jnp.zeros((k_keep,), dtype=real_dtype)
+            # See single-device select for shape rationale (k_keep + 1).
+            trR_over_trG = jnp.zeros((k_keep + 1,), dtype=real_dtype).at[0].set(1.0)
             col_ids_k = jnp.arange(k_keep)
 
             def body(j, carry):
-                d, L, piv, active, done, rank, d_taken = carry
+                d, L, piv, active, done, rank, d_taken, trR_over_trG = carry
 
                 # Step 1: pick the global pivot.
                 # Per-device argmax over active rows.
@@ -822,6 +871,13 @@ def make_sharded_pivoted_cholesky_select(
 
                 # Step 4: Schur-complement update of local d.
                 d_new = jnp.maximum(d - jnp.abs(newcol) ** 2, 0.0)
+                # Trace of the new Schur complement: sum over all M rows
+                # of d_new — psum across shards. d_new[p] is naturally ≈ 0
+                # by the pivot cleanup, so this is exactly tr(R_k).
+                trR_step = lax.psum(jnp.sum(d_new), axis_name=mesh_axis)
+                trR_over_trG = trR_over_trG.at[j + 1].set(
+                    jnp.where(take, trR_step / trG, trR_over_trG[j])
+                )
                 pivot_row_mask = my_has_p & (jnp.arange(M_slab) == local_p_rel)
                 active = active & ~(take & pivot_row_mask)
                 d = jnp.where(
@@ -832,15 +888,19 @@ def make_sharded_pivoted_cholesky_select(
                 done = done | (~take)
                 rank = rank + take.astype(jnp.int32)
 
-                return d, L, piv, active, done, rank, d_taken
+                return d, L, piv, active, done, rank, d_taken, trR_over_trG
 
-            d_final, L_out, piv_out, active_out, done_out, rank_out, d_taken_out = \
-                lax.fori_loop(0, k_keep, body,
-                              (d_slab, L_slab, piv, active_slab, done, rank, d_taken))
+            (d_final, L_out, piv_out, active_out, done_out, rank_out,
+             d_taken_out, trR_over_trG_out) = lax.fori_loop(
+                0, k_keep, body,
+                (d_slab, L_slab, piv, active_slab, done, rank, d_taken,
+                 trR_over_trG),
+            )
             del active_out, done_out
 
             d_final = jnp.where(jnp.isfinite(d_final), d_final, 0.0)
-            return piv_out, L_out, rank_out, d_final, d_taken_out
+            return (piv_out, L_out, rank_out, d_final, d_taken_out,
+                    trR_over_trG_out)
 
         return shard_map(
             body_local, mesh=mesh, in_specs=in_specs, out_specs=out_specs,

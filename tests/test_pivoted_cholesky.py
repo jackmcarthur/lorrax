@@ -101,7 +101,7 @@ def test_pivoted_cholesky_reconstructs_G():
     G = (A @ A.conj().T + 0.1 * np.eye(M)).astype(np.complex64)
     G = 0.5 * (G + G.conj().T)
 
-    piv, L, rank, d_final, d_taken = pivoted_cholesky_select(jnp.asarray(G), k_keep=M, tol_rel=0.0)
+    piv, L, rank, d_final, d_taken, _trR = pivoted_cholesky_select(jnp.asarray(G), k_keep=M, tol_rel=0.0)
     L = np.asarray(L)
     rank = int(rank)
     assert rank == M, f"expected full rank {M}, got {rank}"
@@ -137,7 +137,7 @@ def test_pivoted_cholesky_rank_deficient():
     G = (A @ A.conj().T).astype(np.complex64)
     G = 0.5 * (G + G.conj().T)
 
-    piv, L, rank, d_final, d_taken = pivoted_cholesky_select(
+    piv, L, rank, d_final, d_taken, _trR = pivoted_cholesky_select(
         jnp.asarray(G), k_keep=M, tol_rel=1e-6
     )
     rank = int(rank)
@@ -173,7 +173,7 @@ def test_pivoted_cholesky_residual_diagonal_nonincreasing():
 
     d_prev = np.maximum(np.diag(G).real, 0.0)
     for k_keep in range(1, 9):
-        _, _, _, d_final, _ = pivoted_cholesky_select(G_j, k_keep=k_keep, tol_rel=0.0)
+        _, _, _, d_final, _, _ = pivoted_cholesky_select(G_j, k_keep=k_keep, tol_rel=0.0)
         d = np.asarray(d_final)
         # Allow a tiny positive slop for fp32 noise.
         diff = d - d_prev
@@ -201,7 +201,7 @@ def test_end_to_end_via_wrapper_pipeline_shapes():
     assert G.shape == (M, M)
 
     n_keep = 32
-    piv, L, rank, d_final, d_taken = pivoted_cholesky_select(G, k_keep=n_keep, tol_rel=1e-10)
+    piv, L, rank, d_final, d_taken, _trR = pivoted_cholesky_select(G, k_keep=n_keep, tol_rel=1e-10)
     assert piv.shape == (n_keep,)
     assert L.shape == (M, n_keep)
     assert d_final.shape == (M,)
@@ -276,7 +276,7 @@ def test_d_taken_trace_monotone_and_matches_classical():
     G = (A @ A.conj().T + 1e-4 * np.eye(M)).astype(np.complex64)
     G = 0.5 * (G + G.conj().T)
 
-    piv, L, rank, d_final, d_taken = pivoted_cholesky_select(
+    piv, L, rank, d_final, d_taken, _trR = pivoted_cholesky_select(
         jnp.asarray(G), k_keep=M, tol_rel=0.0
     )
     rank = int(rank)
@@ -340,7 +340,7 @@ def test_sharded_select_matches_single_device():
     G_j = jnp.asarray(G)
 
     # Single-device reference.
-    piv_ref, L_ref, rank_ref, d_ref, d_taken_ref = pivoted_cholesky_select(
+    piv_ref, L_ref, rank_ref, d_ref, d_taken_ref, trR_ref = pivoted_cholesky_select(
         G_j, k_keep=k_keep, tol_rel=0.0
     )
 
@@ -352,7 +352,7 @@ def test_sharded_select_matches_single_device():
     G_sharded = jax.device_put(
         G_j, NamedSharding(mesh, PartitionSpec('x', None)),
     )
-    piv_s, L_s, rank_s, d_s, d_taken_s = sharded_step(G_sharded)
+    piv_s, L_s, rank_s, d_s, d_taken_s, trR_s = sharded_step(G_sharded)
 
     piv_ref_np = np.asarray(piv_ref)
     piv_s_np = np.asarray(piv_s)
@@ -383,4 +383,74 @@ def test_sharded_select_matches_single_device():
     np.testing.assert_allclose(
         d_s_np, d_ref_np, atol=5e-3 * scale, rtol=5e-3,
         err_msg="leftover d_final diverges beyond TF32 tolerance",
+    )
+
+
+def test_trR_over_trG_starts_at_one_and_decreases():
+    """``trR_over_trG`` must start at 1.0 and decrease monotonically.
+
+    Mathematically: tr(R_0) = tr(G), and tr(R_k) = tr(R_{k-1}) - d_taken[k-1]
+    is strictly less since d_taken[k-1] > 0 for accepted pivots. We allow
+    a tiny positive slop to absorb fp64 reduction-order roundoff.
+    """
+    rng = np.random.default_rng(99)
+    M = 24
+    A = (rng.standard_normal((M, M)) + 1j * rng.standard_normal((M, M))).astype(np.complex128)
+    G = (A @ A.conj().T + 0.05 * np.eye(M)).astype(np.complex128)
+    G = 0.5 * (G + G.conj().T)
+
+    _, _, rank, _, _, trR_over_trG = pivoted_cholesky_select(
+        jnp.asarray(G), k_keep=M, tol_rel=0.0
+    )
+    rank = int(rank)
+    trace = np.asarray(trR_over_trG)
+
+    assert trace.shape == (M + 1,)
+    # Initial value is exactly 1.
+    assert abs(float(trace[0]) - 1.0) < 1e-12, f"trR_over_trG[0] = {trace[0]}"
+    # Monotone non-increasing across accepted pivots.
+    diffs = np.diff(trace[: rank + 1])
+    assert float(diffs.max()) < 1e-10, (
+        f"trR_over_trG increased; max positive diff = {float(diffs.max()):.2e}"
+    )
+    # At full rank, trace ratio drops to ~ floating-point noise of trG.
+    assert float(trace[rank]) < 1e-10, (
+        f"trR_over_trG at full rank = {float(trace[rank]):.2e} (expected ~0)"
+    )
+
+
+@pytest.mark.skipif(len(jax.devices()) < 2,
+                    reason="Sharded select requires ≥2 JAX devices.")
+def test_trR_over_trG_sharded_matches_single_device():
+    """trR_over_trG agrees between sharded and single-device paths."""
+    from src.centroid.pivoted_cholesky import (
+        make_sharded_pivoted_cholesky_select,
+    )
+    devices = jax.devices()
+    n_dev = len(devices)
+    rng = np.random.default_rng(199)
+    M = 16 * n_dev
+    k_keep = M // 2
+    A = (rng.standard_normal((M, M)) + 1j * rng.standard_normal((M, M))).astype(np.complex128)
+    G = (A @ A.conj().T + 0.05 * np.eye(M)).astype(np.complex128)
+    G = 0.5 * (G + G.conj().T)
+    G_j = jnp.asarray(G)
+
+    *_, trR_ref = pivoted_cholesky_select(G_j, k_keep=k_keep, tol_rel=0.0)
+
+    mesh = Mesh(np.asarray(devices), ('x',))
+    sharded_step = make_sharded_pivoted_cholesky_select(
+        mesh, M, k_keep, tol_rel=0.0,
+    )
+    G_sharded = jax.device_put(
+        G_j, NamedSharding(mesh, PartitionSpec('x', None)),
+    )
+    *_, trR_s = sharded_step(G_sharded)
+
+    # Compare element-wise. Reduction order across shards changes the
+    # rounding floor, but the running ratio should agree to a few × ε.
+    np.testing.assert_allclose(
+        np.asarray(trR_s), np.asarray(trR_ref),
+        rtol=1e-10, atol=1e-12,
+        err_msg="sharded trR_over_trG diverges from single-device beyond fp64 noise",
     )

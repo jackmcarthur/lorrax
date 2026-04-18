@@ -1223,7 +1223,7 @@ def main():
               f"{N_c} final centroids...")
         # Reuse the same mesh (if any) built for the kmeans Lloyd step —
         # --shard/--force-shard apply to the Gram build + select too.
-        keep_idx, rank, _G, _d_final, _d_taken = prune_candidates_by_pivoted_cholesky(
+        keep_idx, rank, _G, _d_final, _d_taken, _trR_over_trG = prune_candidates_by_pivoted_cholesky(
             wfn, sym, centroid_indices,
             n_keep=N_c,
             n_val=args.prune_n_val,
