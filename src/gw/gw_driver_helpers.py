@@ -36,6 +36,7 @@ class PPMSigmaRuntimeOptions:
     write_w_copies_debug: bool
     w_copies_debug_file: str
     sigma_freq_debug_file: str
+    use_ffi_io: bool = False
 
 
 def _resolve_input_path(input_dir: str, path: str) -> str:
@@ -118,4 +119,5 @@ def build_ppm_sigma_runtime_options(config, *, input_dir: str, ryd2ev: float) ->
         write_w_copies_debug=write_w_copies_debug,
         w_copies_debug_file=_resolve_input_path(input_dir, w_copies_debug_file),
         sigma_freq_debug_file=_resolve_input_path(input_dir, sigma_freq_debug_file),
+        use_ffi_io=bool(_g("use_ffi_io", False)),
     )

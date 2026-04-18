@@ -825,35 +825,46 @@ def compute_sigma_c_ppm_omega_grid(
         use_kij_accum = True
 
     n_omega = int(omega_req.size)
+
+    # Stream mode is a fine-grained read-modify-write accumulator that
+    # fires once per (tau_node × omega_batch); at multi-process scale
+    # every call is a collective MPI-IO or rank-0 h5py round-trip, and
+    # there are hundreds of them — so it's a real perf problem under
+    # the current structure.  Until we refactor to accumulate on GPU
+    # and stream out at branch granularity, fall back to the accum
+    # path in multi-process runs.
+    use_ffi_io = bool(getattr(ppm_options, 'use_ffi_io', False))
+    if use_kij_stream and jax.process_count() != 1:
+        use_kij_stream = False
+        use_kij_accum = True
+
     sigma_kij_host = None if use_kij_stream else np.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=np.complex128)
 
-    # H5 streaming setup
+    # Single-process stream-mode file setup.  The accumulator pattern
+    # itself is unchanged from pre-SlabIO (rank-0 h5py); the final
+    # sigma_mnk.h5 copy-over is already migrated via
+    # write_sigma_omega_h5 in gw_jax.py.
     kij_stream_path = None
     h5_kij = None
     dset_sigma_kij = None
-    if use_kij_stream and sigma_kij_h5_path:
-        if jax.process_count() != 1:
-            use_kij_stream = False
-            use_kij_accum = True
-            sigma_kij_host = np.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=np.complex128)
-        elif jax.process_index() == 0:
-            kij_stream_path = str(sigma_kij_h5_path)
-            kij_dir = os.path.dirname(os.path.abspath(kij_stream_path))
-            if kij_dir:
-                os.makedirs(kij_dir, exist_ok=True)
-            k_chunks = max(1, min(4, nk_proj))
-            o_chunks = max(1, min(omega_batch_size, n_omega))
-            h5_kij = h5py.File(kij_stream_path, "w")
-            h5_kij.create_dataset("omega_ry", data=np.asarray(omega_req, dtype=np.float64))
-            h5_kij.create_dataset("omega_ev", data=np.asarray(omega_req * ryd2ev, dtype=np.float64))
-            dset_sigma_kij = h5_kij.create_dataset(
-                "sigma_c_kij_ry",
-                shape=(n_omega, nk_proj, nb_proj, nb_proj),
-                dtype=np.complex128,
-                chunks=(o_chunks, k_chunks, nb_proj, nb_proj),
-                fillvalue=0.0,
-            )
-            h5_kij.attrs["layout"] = "omega,k,i,j"
+    if use_kij_stream and sigma_kij_h5_path and jax.process_index() == 0:
+        kij_stream_path = str(sigma_kij_h5_path)
+        kij_dir = os.path.dirname(os.path.abspath(kij_stream_path))
+        if kij_dir:
+            os.makedirs(kij_dir, exist_ok=True)
+        k_chunks = max(1, min(4, nk_proj))
+        o_chunks = max(1, min(omega_batch_size, n_omega))
+        h5_kij = h5py.File(kij_stream_path, "w")
+        h5_kij.create_dataset("omega_ry", data=np.asarray(omega_req, dtype=np.float64))
+        h5_kij.create_dataset("omega_ev", data=np.asarray(omega_req * ryd2ev, dtype=np.float64))
+        dset_sigma_kij = h5_kij.create_dataset(
+            "sigma_c_kij_ry",
+            shape=(n_omega, nk_proj, nb_proj, nb_proj),
+            dtype=np.complex128,
+            chunks=(o_chunks, k_chunks, nb_proj, nb_proj),
+            fillvalue=0.0,
+        )
+        h5_kij.attrs["layout"] = "omega,k,i,j"
 
     try:
         if not (use_kij_accum or use_kij_stream):
