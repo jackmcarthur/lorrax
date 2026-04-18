@@ -44,6 +44,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from jax.experimental.shard_map import shard_map
 from functools import partial
 
 from file_io import WFNReader
@@ -414,3 +416,127 @@ def prune_candidates_by_pivoted_cholesky(
     keep_piv = piv_np[:rank]
     keep_idx = np.asarray(cand_idx)[keep_piv]
     return keep_idx, rank, G, d_final
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Multi-device — WIP: sharded Gram build
+# ═══════════════════════════════════════════════════════════════════════
+#
+# For large candidate pools (M ≳ 10⁴) the (M, M) complex Gram matrix no
+# longer fits on a single A100 (M = 16384 ⇒ 2.1 GiB in complex64). The
+# natural first step toward distributed pruning is to row-shard G on a
+# 1-D mesh 'x' so each device stores a (M / n_dev, M) slab. The per-k
+# matmul structure makes this trivial: each row-slab is produced by a
+# local matmul between the full (nk, nv, M) wavefunction replica and the
+# M_slab slice of column vectors — no cross-device communication during
+# the build.
+#
+# The sharded pivoted-Cholesky SELECT path is not in this commit — it
+# needs a small `psum`/`pmax` pattern per iteration (broadcast the pivot
+# row L[p, :] from its owning shard, and a global max-index reduction
+# over the residual diagonal). Coming in a follow-up. For now, callers
+# who want the sharded Gram can row-gather it back via
+# ``jax.device_put`` before calling the single-device
+# ``pivoted_cholesky_select`` — only useful when the Gram fits on one
+# device but the build fits better distributed.
+
+
+def make_sharded_gram_q0(
+    mesh: Mesh,
+    M: int,
+    *,
+    enforce_hermitian: bool = True,
+):
+    """Build a jitted Gram-assembly closure over ``mesh`` ('x',).
+
+    The returned function signature matches ``build_candidate_gram_q0``:
+    it takes replicated (nk, nv, M) and (nk, nc, M) wavefunction tensors
+    and a replicated (nk,) weight vector, and returns a row-sharded
+    (M, M) complex Gram matrix with ``NamedSharding(mesh, P('x', None))``.
+
+    The row shard is the natural output of ``φ_local.T @ conj(φ)`` when
+    the left factor is sliced to M_slab columns: each device computes
+    its own (M_slab, M) slab of both projectors, element-wise-multiplies,
+    and accumulates over k.
+
+    Args:
+        mesh: 1-axis device mesh named 'x'. ``M`` must be divisible by
+            ``mesh.shape['x']``.
+        M: candidate count. Static.
+        enforce_hermitian: if True, do a ``(G + G^H)/2`` symmetrization at
+            the end. This is an *all-pairs* operation over the sharded
+            axis — it requires an all-gather of G across the mesh and
+            therefore breaks the sharding; the caller can defer this
+            step until after the select if they want to avoid the gather.
+
+    Returns:
+        A callable ``(phi, psi, kw) -> G_row_sharded``.
+    """
+    if 'x' not in mesh.axis_names:
+        raise ValueError(f"mesh must have an 'x' axis, got {mesh.axis_names}")
+    n_dev = mesh.shape['x']
+    if M % n_dev != 0:
+        raise ValueError(f"M={M} must be divisible by mesh 'x' size {n_dev}")
+    M_slab = M // n_dev
+
+    rep = PartitionSpec()
+    row_shard = PartitionSpec('x', None)
+
+    in_specs = (rep, rep, rep)           # phi, psi, kw — all replicated
+    out_specs = row_shard                # G row-sharded
+
+    @partial(jax.jit, static_argnames=())
+    def step(phi, psi, kw):
+        def body_local(phi_full, psi_full, kw_full):
+            # Pick out this shard's columns of the left factors. The
+            # right factor stays the full M so the output has shape
+            # (M_slab, M).
+            my_idx = lax.axis_index('x')
+            a_start = my_idx * M_slab
+            phi_a_block = lax.dynamic_slice_in_dim(
+                phi_full, a_start, M_slab, axis=2
+            )   # (nk, nv, M_slab)
+            psi_a_block = lax.dynamic_slice_in_dim(
+                psi_full, a_start, M_slab, axis=2
+            )   # (nk, nc, M_slab)
+
+            nk = phi_full.shape[0]
+
+            def k_body(k, G_slab):
+                phi_k = phi_full[k]        # (nv, M)
+                psi_k = psi_full[k]        # (nc, M)
+                phi_k_block = phi_a_block[k]   # (nv, M_slab)
+                psi_k_block = psi_a_block[k]   # (nc, M_slab)
+
+                # P_v_slab[a, b] = Σ_v φ(a) φ*(b), a in local slab, b full.
+                P_v_slab = phi_k_block.T @ jnp.conj(phi_k)           # (M_slab, M)
+                # P̃_c_slab[a, b] = Σ_c ψ*(a) ψ(b)
+                P_c_slab = jnp.conj(psi_k_block).T @ psi_k           # (M_slab, M)
+                return G_slab + kw_full[k] * (P_v_slab * P_c_slab)
+
+            G_slab = jnp.zeros((M_slab, M), dtype=phi_full.dtype)
+            G_slab = lax.fori_loop(0, nk, k_body, G_slab)
+            return G_slab
+
+        G_sharded = shard_map(
+            body_local, mesh=mesh, in_specs=in_specs, out_specs=out_specs,
+            check_rep=False,
+        )(phi, psi, kw)
+
+        if enforce_hermitian:
+            # Hermitian symmetrization requires full G on one device. For
+            # now we pay the all-gather — acceptable while G still fits
+            # post-gather on one device. For truly out-of-core G this
+            # step should be deferred to the caller (and the select step
+            # can tolerate small non-Hermiticity via its own clamp).
+            G_full = jax.lax.with_sharding_constraint(
+                G_sharded, NamedSharding(mesh, PartitionSpec()),
+            )
+            G_full = 0.5 * (G_full + jnp.conj(G_full.T))
+            # Re-shard back so the caller sees the same layout.
+            G_sharded = jax.lax.with_sharding_constraint(
+                G_full, NamedSharding(mesh, row_shard),
+            )
+        return G_sharded
+
+    return step

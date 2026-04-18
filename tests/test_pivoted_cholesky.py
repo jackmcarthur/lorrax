@@ -211,3 +211,49 @@ def test_end_to_end_via_wrapper_pipeline_shapes():
     accepted = piv_np[:rank]
     assert accepted.min() >= 0 and accepted.max() < M
     assert len(set(accepted.tolist())) == rank, "pivoted Chol produced duplicate pivots"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Sharded Gram build (WIP: select still single-device)
+# ═══════════════════════════════════════════════════════════════════════
+
+from jax.sharding import Mesh
+from src.centroid.pivoted_cholesky import make_sharded_gram_q0
+
+
+@pytest.mark.skipif(len(jax.devices()) < 2,
+                    reason="Sharded Gram build requires ≥2 JAX devices.")
+def test_sharded_gram_matches_single_device():
+    """make_sharded_gram_q0 output, gathered, equals build_candidate_gram_q0.
+
+    The sharded build produces a row-sharded Gram on a 1D mesh 'x'; the
+    single-device build returns the full matrix. Gathering the sharded
+    version (via ``np.asarray`` on the global jax.Array — JAX will pull
+    across devices) should match the single-device reference up to the
+    same TF32 tolerance.
+    """
+    devices = jax.devices()
+    n_dev = len(devices)
+
+    rng = np.random.default_rng(11)
+    nk, nv, nc, M = 4, 6, 8, 4 * n_dev * 8   # M divisible by n_dev
+    phi = jnp.asarray(_random_psi(rng, nk, nv, M))
+    psi = jnp.asarray(_random_psi(rng, nk, nc, M))
+    kw = jnp.asarray(rng.random(nk).astype(np.float32)) + 0.1
+
+    # Single-device reference.
+    G_ref = np.asarray(build_candidate_gram_q0(phi, psi, k_weights=kw))
+
+    # Sharded path: row-shard on 'x'.
+    mesh = Mesh(np.asarray(devices), ('x',))
+    gram_step = make_sharded_gram_q0(mesh, M, enforce_hermitian=True)
+    G_sharded = gram_step(phi, psi, kw)
+    # Pulling to host assembles the full matrix from the shards.
+    G_out = np.asarray(G_sharded)
+
+    assert G_out.shape == (M, M), f"sharded Gram shape mismatch: {G_out.shape}"
+    scale = float(np.max(np.abs(G_ref)))
+    np.testing.assert_allclose(
+        G_out, G_ref, atol=3e-3 * scale, rtol=3e-3,
+        err_msg="sharded Gram diverges from single-device beyond TF32 tolerance",
+    )
