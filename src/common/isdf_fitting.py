@@ -885,7 +885,9 @@ def fit_zeta_chunked_to_h5(
                 if item is None:
                     break
                 zeta_data, r_start, r_end, chunk_id, q_start, q_end = item
-                # zeta_data: (n_q_slice, n_rmu, actual_n_rchunk), host numpy.
+                # zeta_data is already a host numpy array (process_allgather
+                # is blocking D2H + returns numpy, per JAX multihost_utils
+                # contract — there is no truly-async allgather-to-host API).
                 # Flat-q dataset: write each per-q slab at [q_flat, :, r].
                 with h5py.File(output_file, 'a') as f:
                     for i, q_flat in enumerate(range(q_start, q_end)):
@@ -1073,9 +1075,14 @@ def fit_zeta_chunked_to_h5(
                         global_shape=(nq, n_rmu, n_rtot))
                 else:
                     # Allgather path: gather once per q-chunk on every rank,
-                    # queue the per-q hyperslab writes on rank 0's background
-                    # thread.  Preserves the async-write-behind-GPU-compute
-                    # overlap that the writer_worker provides.
+                    # queue the per-q hyperslab writes on rank 0's
+                    # background thread so the h5py I/O is hidden behind
+                    # the next chunk's GPU compute.  process_allgather is
+                    # itself a blocking D2H+collective — there is no async
+                    # allgather-to-host API in JAX today — so the main
+                    # thread stall per chunk is roughly (cross-rank NCCL
+                    # time) + (PCIe D2H).  First chunk eats an extra ~1 s
+                    # of NCCL/XLA first-collective setup.
                     for _q0 in range(0, nq, _q_gather):
                         _q1 = min(_q0 + _q_gather, nq)
                         _slice = zeta_chunk[_q0:_q1]
@@ -1088,7 +1095,13 @@ def fit_zeta_chunked_to_h5(
                             write_queue.put((_g, r_start, r_end, chunk_idx, _q0, _q1))
                         del _gathered, _slice
 
-                jax.experimental.multihost_utils.sync_global_devices(f"zeta_chunk_{chunk_idx}")
+                # No per-chunk sync_global_devices here: the
+                # allgather is itself a collective so all ranks are
+                # already aligned at this point, and we want the main
+                # thread free to start next chunk's GPU compute while
+                # rank 0's writer thread flushes to disk.  Final
+                # sync_global_devices("zeta_writes_complete") at the
+                # bottom of this function serves as the rendezvous.
                 del zeta_chunk
             t_write_total += time.perf_counter() - t0
             r_progress.step()
