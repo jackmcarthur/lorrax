@@ -1054,10 +1054,36 @@ def main():
                         help="Explicit path to a QE <prefix>.save directory for "
                              "--rho-source=qe_save / auto. If omitted, a few "
                              "conventional sandbox locations are probed.")
+    parser.add_argument("--oversample", type=float, default=1.0,
+                        help="Oversampling ratio for the candidate pool: "
+                             "run k-means for ⌈N_c · oversample⌉ centroids, "
+                             "then prune back to N_c via pivoted Cholesky on "
+                             "the q=0 valence-conduction pair-product Gram. "
+                             "Default 1.0 disables pruning (same as before). "
+                             "Try 1.5–2.0 per pivoted_cholesky.md.")
+    parser.add_argument("--prune-n-val", type=int, default=None,
+                        help="Valence band count used in the pruning Gram. "
+                             "Default: wfn.nelec.")
+    parser.add_argument("--prune-n-cond", type=int, default=None,
+                        help="Conduction band count (above nval) used in "
+                             "the pruning Gram. Default: min(nval, nbands-nval).")
+    parser.add_argument("--prune-tol", type=float, default=1e-10,
+                        help="Relative residual-diagonal tolerance for the "
+                             "pivoted Cholesky stopping criterion.")
     args = parser.parse_args()
 
     N_c = args.N_c
-    print(f"Using N_c = {N_c} clusters")
+    # Over-sample: k-means runs for M = ⌈N_c · oversample⌉ candidates, then
+    # we prune back to N_c by pivoted Cholesky on the valence-conduction
+    # Gram. oversample=1.0 reproduces the previous behaviour (no prune).
+    oversample = float(args.oversample)
+    M_cand = int(np.ceil(N_c * oversample)) if oversample > 1.0 else N_c
+    if M_cand != N_c:
+        print(f"Over-sampling: running k-means for M = {M_cand} candidates, "
+              f"will prune to N_c = {N_c} via pivoted Cholesky "
+              f"(ratio {oversample:g})")
+    else:
+        print(f"Using N_c = {N_c} clusters (no pivoted-Cholesky pruning)")
 
     wfn = WFNReader("WFN.h5")
     sym = symmetry_maps.SymMaps(wfn)
@@ -1096,14 +1122,14 @@ def main():
             print(f"Sharded Lloyd step: mesh axis 'x' of size {len(devices)}")
 
     _, centroids_jax, _, _ = weighted_kmeans_jax(
-        avec_jax, rho_jax, N_c=N_c, seed=args.seed, mesh=mesh,
+        avec_jax, rho_jax, N_c=M_cand, seed=args.seed, mesh=mesh,
         force_shard=args.force_shard,
     )
 
     centroids_frac = np.array(centroids_jax)
-    
+
     # Snap centroids to the actual FFT grid and handle duplicates
-    print(f"\nSnapping {N_c} centroids to FFT grid {wfn.fft_grid}...")
+    print(f"\nSnapping {M_cand} centroids to FFT grid {wfn.fft_grid}...")
     centroid_indices, centroids_snapped, n_dups = snap_centroids_to_grid(
         centroids_frac, wfn.fft_grid, deduplicate=True
     )
@@ -1119,9 +1145,34 @@ def main():
         )
         n_unique = centroids_snapped.shape[0]
         print(f"After redistribution: {n_unique} unique centroids")
+        # Re-derive integer indices from the redistributed fractional coords
+        # so the pivoted-Cholesky pruning below gets a consistent cand_idx.
+        fft_grid = np.asarray(wfn.fft_grid)
+        centroid_indices = (np.round(centroids_snapped * fft_grid)
+                            .astype(np.int64) % fft_grid)
     else:
         print(f"✓ All {n_unique} centroids map to unique grid points.")
-    
+
+    # Optional pivoted-Cholesky pruning: oversampled M → N_c pivots that
+    # best condition the q=0 valence-conduction pair-product fit. See
+    # src/centroid/pivoted_cholesky.py + pivoted_cholesky.md.
+    if oversample > 1.0 and n_unique > N_c:
+        from .pivoted_cholesky import prune_candidates_by_pivoted_cholesky
+        print(f"\nPivoted-Cholesky pruning: {n_unique} candidates → "
+              f"{N_c} final centroids...")
+        keep_idx, rank, _G, _d_final = prune_candidates_by_pivoted_cholesky(
+            wfn, sym, centroid_indices,
+            n_keep=N_c,
+            n_val=args.prune_n_val,
+            n_cond=args.prune_n_cond,
+            tol_rel=args.prune_tol,
+        )
+        centroid_indices = np.asarray(keep_idx, dtype=np.int64)
+        fft_grid = np.asarray(wfn.fft_grid)
+        centroids_snapped = centroid_indices.astype(float) / fft_grid
+        n_unique = centroid_indices.shape[0]
+        print(f"After pivoted-Cholesky: {n_unique} centroids (rank={rank})")
+
     # Save the snapped (grid-aligned) centroids
     np.savetxt(
         f"centroids_frac_{n_unique}.txt",
