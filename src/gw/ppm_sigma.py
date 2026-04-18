@@ -9,7 +9,7 @@ This module reuses existing GW helpers:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, NamedTuple
 import os
 
 import jax
@@ -119,6 +119,71 @@ def _materialize_window_mask_B(
 
 _sigma_tau_channel_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
 _sigma_channel_pipeline_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
+
+
+# ---------------------------------------------------------------------------
+#  Physics-state prep — single jit that collapses the scattered trace-time
+#  jnp operations the driver used to emit (Fermi level, band masks, PPM
+#  pole masks, invalid-count tallies).
+# ---------------------------------------------------------------------------
+
+class _SigmaPhysicsState(NamedTuple):
+    efermi: jax.Array          # scalar
+    E_cond: jax.Array          # (nk, nb_full)  max(enk - efermi, 0)
+    H_val: jax.Array           # (nk, nb_full)  max(efermi - enk, 0)
+    cond_mask: jax.Array       # (nk, nb_full)  bool
+    val_mask: jax.Array        # (nk, nb_full)  bool
+    B_corr: jax.Array          # (nq, μ, μ)     c128, ready-to-contract B_q
+    Omega_abs: jax.Array       # (nq, μ, μ)     f64,  max(Re Ω_q, 0)
+    B_mask: jax.Array          # (nq, μ, μ)     bool, B_mask_raw & valid
+    n_total_modes: jax.Array   # scalar int64
+    n_invalid: jax.Array       # scalar int64
+
+
+@jax.jit
+def _prepare_sigma_state(
+    enk_full: jax.Array,
+    occ_full: jax.Array,
+    B_q: jax.Array,
+    Omega_q: jax.Array,
+    valid_mask_q: jax.Array,
+    use_midgap: jax.Array,
+) -> _SigmaPhysicsState:
+    """Derive Fermi level + derived energy/PPM arrays in one fused trace.
+
+    Replaces ~9 eager jnp ops previously emitted at trace time by the sigma
+    driver.  ``use_midgap`` is a traced bool scalar; the caller passes
+    ``jnp.asarray(fermi_reference == 'midgap')``.  ``valid_mask_q`` is always
+    a real bool array (the caller substitutes ``jnp.ones_like(...)`` when
+    no mask is available), so the helper doesn't branch on None.
+    """
+    occ_mask = occ_full > 0.5
+    unocc_mask = ~occ_mask
+
+    vbm = jnp.max(jnp.where(occ_mask, enk_full, -1.0e30))
+    cbm = jnp.min(jnp.where(unocc_mask, enk_full, 1.0e30))
+    has_unocc = jnp.any(unocc_mask)
+    midgap_candidate = jnp.where(has_unocc, 0.5 * (vbm + cbm), vbm)
+    efermi = jnp.where(use_midgap, midgap_candidate, vbm)
+
+    E_cond = jnp.maximum(enk_full - efermi, 0.0)
+    H_val = jnp.maximum(efermi - enk_full, 0.0)
+
+    Omega_abs = jnp.maximum(jnp.real(Omega_q), 0.0).astype(jnp.float64)
+    B_corr = jnp.asarray(B_q, dtype=jnp.complex128)
+    B_mask_raw = Omega_abs > 1.0e-14
+    valid = jnp.asarray(valid_mask_q, dtype=bool)
+    B_mask = B_mask_raw & valid
+    invalid_mask = B_mask_raw & (~valid)
+
+    return _SigmaPhysicsState(
+        efermi=efermi,
+        E_cond=E_cond, H_val=H_val,
+        cond_mask=unocc_mask, val_mask=occ_mask,
+        B_corr=B_corr, Omega_abs=Omega_abs, B_mask=B_mask,
+        n_total_modes=jnp.sum(B_mask_raw, dtype=jnp.int64),
+        n_invalid=jnp.sum(invalid_mask, dtype=jnp.int64),
+    )
 
 
 def _project_sigma_channels(
@@ -765,37 +830,29 @@ def compute_sigma_c_ppm_omega_grid(
     omega_pos = np.asarray(omega_req[idx_pos], dtype=np.float64)
     omega_neg_abs = np.asarray(-omega_req[idx_neg], dtype=np.float64)
 
-    # Fermi reference and band masks
+    # Fermi reference validation (string → traced bool for the jit)
     fermi_reference = str(fermi_reference).strip().lower()
     if fermi_reference not in ("vbm", "midgap"):
         raise ValueError("fermi_reference must be 'vbm' or 'midgap'.")
-    occ_mask = occ_full > 0.5
-    unocc_mask = ~occ_mask
-    vbm = jnp.max(jnp.where(occ_mask, enk_full, -1.0e30))
-    if fermi_reference == "midgap":
-        cbm = jnp.min(jnp.where(unocc_mask, enk_full, 1.0e30))
-        has_unocc = jnp.any(unocc_mask)
-        efermi = jnp.where(has_unocc, 0.5 * (vbm + cbm), vbm)
-    else:
-        efermi = vbm
-    E_cond = jnp.maximum(enk_full - efermi, 0.0)
-    H_val = jnp.maximum(efermi - enk_full, 0.0)
-    cond_mask = ~occ_mask
-    val_mask = occ_mask
 
-    # PPM mode masking
-    Omega_abs = jnp.maximum(jnp.real(Omega_q), 0.0).astype(jnp.float64)
-    B_corr = jnp.asarray(B_q, dtype=jnp.complex128)
-    B_mask = Omega_abs > 1.0e-14
-
+    # Derive Fermi level, energy/band masks, and PPM pole masks in one fused trace.
+    # valid_mask_q=None → all-true mask at the caller so the jit sees a real array.
     if valid_mask_q is None:
-        valid_mask = jnp.ones_like(B_mask, dtype=bool)
-    else:
-        valid_mask = jnp.asarray(valid_mask_q, dtype=bool)
-    invalid_mask = B_mask & (~valid_mask)
-    n_total_modes = int(np.asarray(jax.device_get(jnp.sum(B_mask, dtype=jnp.int64)), dtype=np.int64))
-    n_invalid = int(np.asarray(jax.device_get(jnp.sum(invalid_mask, dtype=jnp.int64)), dtype=np.int64))
-    B_mask = B_mask & valid_mask
+        valid_mask_q = jnp.ones(Omega_q.shape, dtype=bool)
+    state = _prepare_sigma_state(
+        enk_full, occ_full, B_q, Omega_q, valid_mask_q,
+        jnp.asarray(fermi_reference == "midgap", dtype=bool),
+    )
+    efermi = state.efermi
+    E_cond = state.E_cond
+    H_val = state.H_val
+    cond_mask = state.cond_mask
+    val_mask = state.val_mask
+    B_corr = state.B_corr
+    Omega_abs = state.Omega_abs
+    B_mask = state.B_mask
+    n_total_modes = int(jax.device_get(state.n_total_modes))
+    n_invalid = int(jax.device_get(state.n_invalid))
 
     ryd2ev = 13.6056980659
     omega_step_ev = float(omega_req[1] - omega_req[0]) * ryd2ev if omega_req.size > 1 else 0.0
