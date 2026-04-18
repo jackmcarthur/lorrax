@@ -127,67 +127,7 @@ from .get_charge_density import calculate_charge_density
 # PBC Distance Utilities (Pure JAX)
 # =============================================================================
 
-def precompute_metric_tensor(avec: np.ndarray) -> np.ndarray:
-    """Precompute the metric tensor G = A^T @ A for PBC distance calculations.
-    
-    The metric tensor allows computing squared Cartesian distances directly
-    from fractional displacements without explicit coordinate conversion:
-    
-        d² = df @ G @ df^T
-        
-    where df is the (wrapped) fractional displacement vector.
-    
-    This is equivalent to d² = |df @ avec|² but avoids materializing the
-    Cartesian displacement vector, saving memory for large arrays.
-    
-    Args:
-        avec: (3, 3) lattice vectors, rows are a1, a2, a3 in Cartesian coords
-        
-    Returns:
-        G: (3, 3) metric tensor
-    """
-    return avec.T @ avec
-
-
 @jax.jit
-def pbc_distance_sq_batch(
-    positions_frac: jnp.ndarray,
-    centroids_frac: jnp.ndarray, 
-    metric_tensor: jnp.ndarray
-) -> jnp.ndarray:
-    """Compute squared PBC distances between all positions and all centroids.
-    
-    Uses the minimal image convention: for each pair, finds the minimum distance
-    over all periodic images (equivalent to checking 27 neighboring cells).
-    
-    Implementation:
-        1. Compute fractional displacement: df = pos - cent
-        2. Wrap to [-0.5, 0.5): df = df - round(df)  [minimal image]
-        3. Compute squared distance: d² = df @ G @ df^T
-    
-    Args:
-        positions_frac: (P, 3) fractional coordinates of grid points
-        centroids_frac: (C, 3) fractional coordinates of centroids
-        metric_tensor: (3, 3) G = avec^T @ avec
-        
-    Returns:
-        distances_sq: (P, C) squared Cartesian distances with PBC
-    """
-    # Fractional displacement: shape (P, C, 3)
-    delta_frac = positions_frac[:, None, :] - centroids_frac[None, :, :]
-    
-    # Minimal image convention: wrap to [-0.5, 0.5)
-    # This finds the closest periodic image among all 27 neighboring cells
-    delta_frac = delta_frac - jnp.round(delta_frac)
-    
-    # Squared distance using metric tensor: d² = df @ G @ df^T
-    # einsum 'pci,ij,pcj->pc' computes this for all (P, C) pairs efficiently
-    distances_sq = jnp.einsum('pci,ij,pcj->pc', delta_frac, metric_tensor, delta_frac)
-    
-    return distances_sq
-
-
-@jax.jit  
 def pbc_distance_sq_single(
     positions_frac: jnp.ndarray,
     centroid_frac: jnp.ndarray,
@@ -750,22 +690,6 @@ def _pick_c_block(n_c: int, preferred: int = _DEFAULT_C_BLOCK) -> int:
     return min(preferred, n_c)
 
 
-def _pad_centroids(centroids: jnp.ndarray, n_padded: int) -> jnp.ndarray:
-    """Pad centroids with NaN rows up to ``n_padded`` total.
-
-    NaN positions produce NaN distances in the scan body, which are sanitized
-    to +inf before argmin, so padded rows never win. Padded rows also never
-    get assigned any points (labels cap at the real range), so their
-    ``segment_sum`` bucket is 0 and their updated position is NaN — the caller
-    discards those trailing rows.
-    """
-    n_real = centroids.shape[0]
-    if n_padded == n_real:
-        return centroids
-    pad = jnp.full((n_padded - n_real, 3), jnp.nan, dtype=centroids.dtype)
-    return jnp.concatenate([centroids, pad], axis=0)
-
-
 def weighted_kmeans_jax(
     avec: jnp.ndarray,
     rho_jax: jnp.ndarray,
@@ -1104,8 +1028,10 @@ def main():
     parser.add_argument("--seed", type=int, default=0, help="Random seed (default: 0)")
     parser.add_argument("--no-plot", action="store_true", help="Skip plotting")
     parser.add_argument("--plot-zoom", type=float, default=1.0,
-                        help="Zoom factor for density in plot (default: 1.0, higher = finer)")
-    parser.add_argument("--no-downsample", action="store_true", help="Use full FFT grid (no zoom)")
+                        help="Zoom factor for density in the 3D plot only "
+                             "(scipy ndimage bicubic interpolation; default 1.0 = "
+                             "no upsample). Does not affect kmeans — kmeans always "
+                             "runs on the native QE FFT grid.")
     parser.add_argument("--shard", action="store_true",
                         help="Use multi-device P-sharded Lloyd step (mesh 'x' "
                              "over all visible jax.devices()).")
@@ -1125,47 +1051,21 @@ def main():
 
     charge_density = calculate_charge_density(wfn, sym)
 
-    # BGW WFN.h5 stores ``avec`` in units of alat (so rows are typically
-    # unit-length) and ``alat`` in Bohr. Convert once to Å and use those
-    # Å-basis lattice vectors throughout: this makes ``lattice_lengths``,
-    # ``target_spacing``, the kmeans tolerance, and the printed movement all
-    # in the same consistent physical unit.
-    avec_ang = np.asarray(wfn.avec) * float(wfn.alat) * BOHR_TO_ANG  # (3, 3) in Å
+    # BGW WFN.h5 stores avec in units of alat (rows unit-length) and alat
+    # in Bohr. Convert once to Å so lattice lengths, the kmeans tolerance,
+    # and the printed movement are all in the same physical unit.
+    avec_ang = np.asarray(wfn.avec) * float(wfn.alat) * BOHR_TO_ANG
+    lattice_lengths = np.linalg.norm(avec_ang, axis=1)  # (3,) in Å
 
-    # Resize grid to target spacing of ~0.13 Å (gives ~10 points per 1.3 Å core region)
-    # For each direction i:
-    #   current_spacing = |a_i| / N_i
-    #   zoom_factor = current_spacing / target_spacing
-    # scipy.ndimage.zoom: new_N = old_N * zoom_factor
-    target_spacing = 0.13 * 0.52  # Angstroms
-    lattice_lengths = np.linalg.norm(avec_ang, axis=1)  # |a1|, |a2|, |a3| in Å
-    current_spacing = lattice_lengths / np.array(charge_density.shape)
-    zoom_factors = current_spacing / target_spacing
-    
-    # Don't upsample tiny grids, and cap zoom to avoid excessive memory
-    if args.no_downsample or any(wfn.fft_grid < 20):
-        zoom_factors = np.ones(3)
-    zoom_factors = np.clip(zoom_factors, 0.1, 2.0)  # Reasonable bounds
-
-    # Guard: if N_c is a significant fraction of the coarsened grid,
-    # the k-means has too few points to cluster meaningfully and centroids
-    # spread into vacuum. Skip downsampling in this case so the density
-    # contrast is preserved (e.g. molecule in a large box).
-    coarsened_size = int(np.prod(np.round(np.array(charge_density.shape) * zoom_factors)))
-    if N_c > coarsened_size // 10:
-        print(f"N_c={N_c} is >{coarsened_size//10} (10% of coarsened grid {coarsened_size})")
-        print(f"Skipping downsampling to preserve density contrast")
-        zoom_factors = np.ones(3)
-
+    # kmeans runs on the native QE FFT grid — no scipy upsampling. ρ(r) is
+    # already band-limited at 2·G_max_wfn, so interpolating to a finer grid
+    # adds no physical information and only inflates apparent pt/centroid
+    # counts. --plot-zoom still lets you interpolate for a smoother plot.
     print(f"Charge density shape: {charge_density.shape}")
-    print(f"Lattice lengths: {lattice_lengths} Å")
-    print(f"Current spacing: {current_spacing} Å")
-    print(f"Target spacing: {target_spacing} Å")
-    print(f"Zoom factors: {zoom_factors}")
-    rho_np = interpolate_density(charge_density, zoom_factors)
-    rho_np_cpu = np.asarray(rho_np)
+    print(f"Lattice lengths: {lattice_lengths} Å "
+          f"(spacing: {lattice_lengths / np.array(charge_density.shape)} Å)")
 
-    rho_jax = jnp.asarray(rho_np_cpu, dtype=jnp.float32)
+    rho_jax = jnp.asarray(charge_density, dtype=jnp.float32)
     avec_jax = jnp.asarray(avec_ang, dtype=jnp.float32)
 
     mesh = None
@@ -1217,10 +1117,10 @@ def main():
     print(f"Saved centroids to centroids_frac_{n_unique}.txt")
 
     if not args.no_plot:
-        if args.plot_zoom != 1.0:
-            rho_plot = interpolate_density(charge_density, zoom_factors * args.plot_zoom)
-        else:
-            rho_plot = rho_np
+        rho_plot = interpolate_density(
+            charge_density,
+            zoom_factors=(args.plot_zoom,) * 3,
+        )
         plot_density_and_centroids(wfn, rho_plot, centroids_snapped)
     return 0
 
