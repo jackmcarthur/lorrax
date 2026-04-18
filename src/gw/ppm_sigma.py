@@ -582,6 +582,97 @@ def _build_three_sigma_windows(
 
 
 # ---------------------------------------------------------------------------
+#  Sigma accumulators — one interface, two strategies.
+#
+#  The tau loop doesn't care whether its outputs land in a GPU buffer or on
+#  disk; it just needs to add per-tau contributions and knows when a window
+#  boundary falls.  The two implementations differ only in what "add" means.
+# ---------------------------------------------------------------------------
+
+class _SigmaAccumulator:
+    """Minimal protocol used by _integrate_tau_windows_for_branch.
+
+    Lifecycle per branch:
+        acc.begin_window()
+        for each tau:
+            acc.add_tau(σ_re, σ_im, ω_vec, t_node, α_eff, ω_sign, pref, code)
+        acc.end_window()
+    At branch end the caller calls ``acc.finalize()`` — returns the on-GPU
+    (n_ω, nk, nb, nb) tensor (buffered path) or None (stream path).
+    """
+    def begin_window(self) -> None: ...
+    def add_tau(self, *args, **kwargs) -> None: ...
+    def end_window(self) -> None: ...
+    def finalize(self) -> jax.Array | None: ...
+
+
+class _BufferedGpuAccumulator(_SigmaAccumulator):
+    """Accumulate Σ^c(ω) on GPU into a single (n_ω, nk, nb, nb) tensor.
+
+    Per-window accumulation is kept separate so that the tau loop donates
+    its running buffer only once per window (helps XLA reuse the slot).
+    """
+    def __init__(self, shape: tuple[int, int, int, int]):
+        self.total = jnp.zeros(shape, dtype=jnp.complex128)
+        self._win_acc: jax.Array | None = None
+
+    def begin_window(self) -> None:
+        self._win_acc = jnp.zeros_like(self.total)
+
+    def add_tau(self, sigma_re, sigma_im, omega_vec,
+                t_node_j, alpha_eff_j, omega_sign_j, pref_j, project_code_j,
+                *, omega_global_idx=None):
+        assert self._win_acc is not None
+        self._win_acc = _accumulate_tau_into_window(
+            self._win_acc, sigma_re, sigma_im, omega_vec,
+            t_node_j, alpha_eff_j, omega_sign_j, pref_j, project_code_j,
+        )
+
+    def end_window(self) -> None:
+        assert self._win_acc is not None
+        self.total = self.total + self._win_acc
+        self._win_acc = None
+
+    def finalize(self) -> jax.Array:
+        return self.total
+
+
+class _StreamedH5Accumulator(_SigmaAccumulator):
+    """Project each tau contribution in ω-batches and hand to a writer callable.
+
+    The writer is expected to read-modify-write the backing HDF5 dataset;
+    this class is agnostic to the storage (rank-0 h5py, SlabIO, …).
+    """
+    def __init__(self, writer: Callable[[np.ndarray, jax.Array], None],
+                 *, omega_global_idx: np.ndarray, omega_batch_size: int):
+        self._writer = writer
+        self._omega_global_idx = np.asarray(omega_global_idx, dtype=np.int64)
+        self._batch = int(max(1, omega_batch_size))
+
+    def begin_window(self) -> None:
+        pass
+
+    def add_tau(self, sigma_re, sigma_im, omega_vec,
+                t_node_j, alpha_eff_j, omega_sign_j, pref_j, project_code_j,
+                *, omega_global_idx=None):
+        n_omega = int(omega_vec.shape[0])
+        for ibeg in range(0, n_omega, self._batch):
+            iend = min(ibeg + self._batch, n_omega)
+            batch_proj = _project_tau_onto_omega(
+                sigma_re, sigma_im, omega_vec[ibeg:iend],
+                t_node_j, alpha_eff_j, omega_sign_j,
+                pref_j, project_code_j,
+            )
+            self._writer(self._omega_global_idx[ibeg:iend], batch_proj)
+
+    def end_window(self) -> None:
+        pass
+
+    def finalize(self) -> None:
+        return None
+
+
+# ---------------------------------------------------------------------------
 #  Sigma convolution — split into (a) host-side window construction and
 #  (b) device-side tau loop.  The two halves have no shared state beyond
 #  the window list itself, so they're easy to test independently and
@@ -672,7 +763,7 @@ def _integrate_tau_windows_for_branch(
     *,
     windows: list[_SigmaWindow],
     omega_vec: jax.Array,
-    omega_global_idx: np.ndarray,
+    accumulator: _SigmaAccumulator,
     E_A: jax.Array,
     B_q: jax.Array,
     Omega_q: jax.Array,
@@ -686,26 +777,15 @@ def _integrate_tau_windows_for_branch(
     mesh_xy: Mesh,
     omega_sign_flip: int,
     scale: float,
-    stream_writer: Callable[[np.ndarray, jax.Array], None] | None,
-    omega_batch_size: int,
     log_tag: str,
     print_fn,
-) -> jax.Array | None:
-    """Run the per-tau kernel across ``windows`` and project onto ω.
+) -> None:
+    """Walk windows × tau nodes, feed each (σ_re, σ_im) into ``accumulator``.
 
-    If ``stream_writer`` is None: returns the (n_ω, nk, nb, nb) accumulator
-    on device.  Else: pushes each (tau_node × ω_batch) contribution through
-    ``stream_writer(idx, batch)`` and returns None.
+    Whether the result lands on GPU or disk is the accumulator's concern,
+    not this loop's — see _BufferedGpuAccumulator / _StreamedH5Accumulator.
     """
     from common.progress import LoopProgress
-
-    n_omega = int(omega_vec.shape[0])
-    nk_proj = int(psi_proj_rmu_X.shape[0])
-    nb_proj = int(psi_proj_rmu_X.shape[1])
-    acc_total = (
-        None if stream_writer is not None
-        else jnp.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128)
-    )
 
     branch_label = log_tag if log_tag else "sigma"
     total_tau_nodes = sum(int(win.alpha.shape[0]) for win in windows)
@@ -726,8 +806,8 @@ def _integrate_tau_windows_for_branch(
                 E_ref_B_j = jnp.asarray(win.E_ref_B, dtype=jnp.float64)
                 project_code_j = jnp.asarray(
                     {"full": 0, "imag": 1}.get(win.project, 2), dtype=jnp.int32)
-                acc_win = jnp.zeros_like(acc_total) if acc_total is not None else None
 
+                accumulator.begin_window()
                 for t_node, alpha_node in zip(win.t_nodes, win.alpha):
                     t_node_j = jnp.asarray(t_node, dtype=jnp.complex128)
                     with mesh_xy:
@@ -747,28 +827,14 @@ def _integrate_tau_windows_for_branch(
                         float(win.omega_sign) * float(omega_sign_flip), dtype=jnp.float64)
                     pref_j = jnp.asarray(win.prefactor * scale, dtype=jnp.float64)
 
-                    if acc_win is not None:
-                        acc_win = _accumulate_tau_into_window(
-                            acc_win, sigma_tau_kij_re, sigma_tau_kij_im,
-                            omega_vec, t_node_j, alpha_eff_j,
-                            omega_sign_j, pref_j, project_code_j,
-                        )
-                    else:
-                        for ibeg in range(0, n_omega, omega_batch_size):
-                            iend = min(ibeg + omega_batch_size, n_omega)
-                            batch_proj = _project_tau_onto_omega(
-                                sigma_tau_kij_re, sigma_tau_kij_im,
-                                omega_vec[ibeg:iend],
-                                t_node_j, alpha_eff_j, omega_sign_j,
-                                pref_j, project_code_j,
-                            )
-                            stream_writer(omega_global_idx[ibeg:iend], batch_proj)
+                    accumulator.add_tau(
+                        sigma_tau_kij_re, sigma_tau_kij_im, omega_vec,
+                        t_node_j, alpha_eff_j, omega_sign_j, pref_j, project_code_j,
+                    )
 
-                if acc_win is not None:
-                    acc_total = acc_total + acc_win
+                accumulator.end_window()
 
     progress.finish()
-    return acc_total
 
 
 def _convolve_sigma_branch_kij(
@@ -841,19 +907,28 @@ def _convolve_sigma_branch_kij(
         nk_tot=int(meta.nk_tot), bispinor=bool(meta.bispinor),
     )
 
-    acc_total = _integrate_tau_windows_for_branch(
-        windows=windows, omega_vec=omega_vec, omega_global_idx=omega_global_idx,
+    if stream_writer is None:
+        accumulator: _SigmaAccumulator = _BufferedGpuAccumulator(
+            shape=(n_omega, nk_proj, nb_proj, nb_proj))
+    else:
+        accumulator = _StreamedH5Accumulator(
+            writer=stream_writer,
+            omega_global_idx=omega_global_idx,
+            omega_batch_size=int(max(1, omega_batch_size)),
+        )
+
+    _integrate_tau_windows_for_branch(
+        windows=windows, omega_vec=omega_vec, accumulator=accumulator,
         E_A=E_A, B_q=B_q, Omega_q=Omega_q, base_mask_B=base_mask_B,
         psi_coh_rmuT_X=psi_coh_rmuT_X, psi_coh_rmu_Y=psi_coh_rmu_Y,
         psi_proj_rmu_X=psi_proj_rmu_X, psi_proj_rmuT_Y=psi_proj_rmuT_Y,
         eye_nb=eye_nb, tau_channel_step=tau_channel_step,
         mesh_xy=mesh_xy,
         omega_sign_flip=omega_sign_flip, scale=scale,
-        stream_writer=stream_writer,
-        omega_batch_size=int(max(1, omega_batch_size)),
         log_tag=log_tag, print_fn=print_fn,
     )
 
+    acc_total = accumulator.finalize()
     if acc_total is None:
         return jnp.zeros((0, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), windows
     return acc_total, windows
