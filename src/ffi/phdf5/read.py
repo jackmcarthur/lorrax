@@ -28,21 +28,25 @@ _FFI_TARGET = "lorrax_phdf5_read"
 
 def ffi_read_call(
     out_struct: jax.ShapeDtypeStruct,
+    offset_base: jax.Array,
     *,
     ctx_handle: int,
     ds_id: int,
-    offset_base: Sequence[int],
     mesh_shape: Sequence[int],
     axis_count_per_dim: Sequence[int],
     axis_flat: Sequence[int],
 ) -> jax.Array:
-    """Low-level FFI call.  See ffi.phdf5.write.ffi_write_call for the
+    """Low-level FFI call.  ``offset_base`` is a jax.Array of shape
+    (ndim,) dtype int64 — passed as a traced Buffer input (not an FFI
+    Attr), mirroring ffi_write_call so shard_map closures compile
+    ONCE per dataset-ndim-dtype-sharding tuple and re-dispatch across
+    chunks with different offsets.  See ffi.phdf5.write for the
     ``axis_count_per_dim`` + ``axis_flat`` encoding.
     """
     return jax.ffi.ffi_call(_FFI_TARGET, out_struct)(
+        offset_base,
         ctx_handle=int(ctx_handle),
         ds_id=int(ds_id),
-        offset_base=np.asarray(offset_base, dtype=np.int64),
         mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
         axis_count_per_dim=np.asarray(axis_count_per_dim, dtype=np.int64),
         axis_flat=np.asarray(axis_flat, dtype=np.int64),
@@ -69,12 +73,14 @@ def read_sharded_slab(
     local_shape = (n_rows // p, n_cols // q)
     out_struct = jax.ShapeDtypeStruct(local_shape, jnp.dtype(dtype))
 
-    def _per_rank():
+    offset_array = jnp.zeros((2,), dtype=jnp.int64)
+
+    def _per_rank(offset_local):
         return ffi_read_call(
             out_struct,
+            offset_local,
             ctx_handle=int(fh),
             ds_id=int(ds_id),
-            offset_base=(0, 0),
             mesh_shape=(p, q),
             axis_count_per_dim=(1, 1),
             axis_flat=(0, 1),
@@ -82,6 +88,6 @@ def read_sharded_slab(
 
     return shard_map(
         _per_rank, mesh=mesh,
-        in_specs=(), out_specs=P("x", "y"),
+        in_specs=(P(),), out_specs=P("x", "y"),
         check_rep=False,
-    )()
+    )(offset_array)

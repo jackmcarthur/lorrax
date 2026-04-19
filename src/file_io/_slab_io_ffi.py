@@ -345,22 +345,42 @@ class _FfiBackend:
         ds_id = self._ds_id(name, readonly=True)
         ctx_handle = self.fh
 
-        def _per_rank():
-            return ffi_read_call(
-                out_struct,
-                ctx_handle=int(ctx_handle),
-                ds_id=int(ds_id),
-                offset_base=off,
-                mesh_shape=mesh_shape,
-                axis_count_per_dim=axis_count_per_dim,
-                axis_flat=axis_flat,
+        # Cache key: same as writes, plus the local_shape + partition_spec
+        # (since reads are parameterised by output shape + sharding spec).
+        cache_key = (
+            "read", int(ctx_handle), int(ds_id), mesh_shape,
+            axis_count_per_dim, axis_flat,
+            tuple(local_shape), str(jnp.dtype(dtype)),
+            partition_spec,
+        )
+        sm = self._sm_cache.get(cache_key)
+        if sm is None:
+            def _per_rank(offset_local,
+                          _ds_id=int(ds_id),
+                          _mesh_shape=mesh_shape,
+                          _axis_count=axis_count_per_dim,
+                          _axis_flat=axis_flat,
+                          _ctx_handle=int(ctx_handle),
+                          _out_struct=out_struct):
+                return ffi_read_call(
+                    _out_struct,
+                    offset_local,
+                    ctx_handle=_ctx_handle,
+                    ds_id=_ds_id,
+                    mesh_shape=_mesh_shape,
+                    axis_count_per_dim=_axis_count,
+                    axis_flat=_axis_flat,
+                )
+            sm_bare = shard_map(
+                _per_rank, mesh=mesh,
+                in_specs=(P(),), out_specs=partition_spec,
+                check_rep=False,
             )
+            sm = jax.jit(sm_bare)
+            self._sm_cache[cache_key] = sm
 
-        result = shard_map(
-            _per_rank, mesh=mesh,
-            in_specs=(), out_specs=partition_spec,
-            check_rep=False,
-        )()
+        offset_arr = jnp.asarray(off, dtype=jnp.int64)
+        result = sm(offset_arr)
         result.block_until_ready()
         return result
 
