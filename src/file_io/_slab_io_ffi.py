@@ -112,6 +112,10 @@ class _FfiBackend:
         # every rank dispatches in the same order, which is the MPI-IO
         # collective rendezvous requirement.  See
         # ``reports/session_2026-04-18_async_probe/report.md``.
+        # Cache of compiled shard_map closures keyed on the full FFI
+        # attr + shape/dtype signature, so repeat writes at identical
+        # signatures reuse the jit cache instead of recompiling.
+        self._sm_cache: dict = {}
         self._dispatch_queue: queue.Queue = queue.Queue()
         self._dispatch_pending: int = 0          # protected by _pending_mu
         self._pending_mu = threading.Lock()
@@ -246,34 +250,49 @@ class _FfiBackend:
         mesh_shape = tuple(self.mesh.shape[ax] for ax in self.mesh.axis_names)
         in_specs = A.sharding.spec  # PartitionSpec
 
-        def _per_rank(A_local):
-            return ffi_write_call(
-                A_local,
-                ctx_handle=int(ctx_handle),
-                ds_id=int(ds_id),
-                offset_base=off,
-                mesh_shape=mesh_shape,
-                axis_count_per_dim=axis_count_per_dim,
-                axis_flat=axis_flat,
-            )
-
-        # Enqueue the jit dispatch onto the Python worker thread.  Main
-        # thread returns immediately; the worker thread calls
-        # jit(shard_map(_per_rank))(A).block_until_ready() in FIFO order.
-        #
-        # We hold a reference to A inside the closure so XLA's backing
-        # buffer isn't GC'd before H5Dwrite reads it.  After
-        # block_until_ready returns, A goes out of scope and the
-        # buffer is released.
-        sm = shard_map(
-            _per_rank, mesh=self.mesh,
-            in_specs=in_specs, out_specs=P(),
-            check_rep=False,
+        # ── shard_map cache ──
+        # Every ``write_slab`` captures new values for ds_id, off, etc.
+        # into ``_per_rank``.  Each closure is a fresh Python function
+        # object, so shard_map(...) compiles a NEW XLA module every call
+        # — at MoS2 3x3 scale each compile is ~400-700 ms of a 900 MB
+        # HLO, which completely dominates write runtime.  Key the
+        # cached compiled shard_map by the full FFI attr tuple + the
+        # array's shape/dtype/sharding so identical writes hit the
+        # jit cache.
+        cache_key = (
+            int(ctx_handle), int(ds_id), off, mesh_shape,
+            axis_count_per_dim, axis_flat,
+            A.shape, str(A.dtype), in_specs,
         )
-        jitted = jax.jit(sm)
+        sm = self._sm_cache.get(cache_key)
+        if sm is None:
+            def _per_rank(A_local, _ds_id=int(ds_id), _off=off,
+                          _mesh_shape=mesh_shape,
+                          _axis_count=axis_count_per_dim,
+                          _axis_flat=axis_flat,
+                          _ctx_handle=int(ctx_handle)):
+                return ffi_write_call(
+                    A_local,
+                    ctx_handle=_ctx_handle,
+                    ds_id=_ds_id,
+                    offset_base=_off,
+                    mesh_shape=_mesh_shape,
+                    axis_count_per_dim=_axis_count,
+                    axis_flat=_axis_flat,
+                )
+            sm = shard_map(
+                _per_rank, mesh=self.mesh,
+                in_specs=in_specs, out_specs=P(),
+                check_rep=False,
+            )
+            self._sm_cache[cache_key] = sm
 
+        # Enqueue dispatch onto the Python worker thread.  Main thread
+        # returns in ~0.2ms; the worker thread calls ``sm(A)`` in FIFO
+        # order.  Eager shard_map is synchronous on its CALLER — the
+        # worker thread — which is exactly where we want the block.
         def _task():
-            tok = jitted(A)
+            tok = sm(A)
             tok.block_until_ready()
 
         with self._pending_cv:

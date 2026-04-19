@@ -42,15 +42,16 @@
 //    ranks in dispatch order, which is the MPI-IO collective
 //    rendezvous requirement.  Without that, per-call detached threads
 //    could let OS scheduling reorder H5Dwrites between ranks.
-//  - Per-call pinned buffer (``cudaMallocHost``) allows consecutive
-//    async dispatches to not race on a shared ``ctx->pinned_buf``.
-//    cudaMallocHost is ~17ms per 67 MB shard — a pool would be nice.
+//  - ``ensure_pinned`` grows ``ctx->pinned_buf`` once (first call)
+//    and reuses it on every subsequent write.  The Python worker
+//    thread serialises dispatches so no second write is in flight
+//    when the next handler D2Hs into the buffer.
 //
 // Work split:
-//  - XLA executor thread (fast path, ~17ms): cudaMallocHost, kick
-//    cudaMemcpyAsync D2H on ctx->stream, cross-stream-wait so XLA's
-//    output buffer donation is safe, record a CUDA event that fires
-//    when the D2H finishes, enqueue a task on the writer thread,
+//  - XLA executor thread (fast path): ensure_pinned (free on repeat
+//    calls), kick cudaMemcpyAsync D2H on ctx->stream, cross-stream-wait
+//    so XLA's output buffer donation is safe, record a CUDA event that
+//    fires when the D2H finishes, enqueue a task on the writer thread,
 //    return the Future.
 //  - Writer thread (slow path, one per ctx): pops next task, does
 //    cudaEventSynchronize for D2H, then H5Dwrite MPI-IO collective,
@@ -95,10 +96,13 @@ static std::vector<int64_t> unravel_rank(
     return coord;
 }
 
-// Run H5Dwrite on a detached worker thread after the D2H completes.
-// Owns: ev_done (destroyed here), pinned_buf (cudaFreeHost'd here).
+// Run H5Dwrite on the ctx writer thread after the D2H completes.
 // The XLA Promise is moved in; SetAvailable/SetError signals the
 // runtime that the Future is ready and downstream ops can proceed.
+// ``pinned_buf`` points into ``ctx->pinned_buf`` (shared, reused
+// across writes); the Python worker serializes ``write_slab`` calls
+// so there is no second writer in flight when the next handler kicks
+// off its D2H into this buffer.
 static void async_worker(
     PhdfCtx* ctx,
     hid_t ds_id,
@@ -114,7 +118,6 @@ static void async_worker(
     cudaError_t ce = cudaEventSynchronize(ev_done);
     cudaEventDestroy(ev_done);
     if (ce != cudaSuccess) {
-        cudaFreeHost(pinned_buf);
         std::ostringstream os;
         os << "phdf5 async write: cudaEventSynchronize failed: "
            << cudaGetErrorString(ce);
@@ -125,7 +128,6 @@ static void async_worker(
     const int rank = (int)offset.size();
     hid_t filespace = H5Dget_space(ds_id);
     if (filespace < 0) {
-        cudaFreeHost(pinned_buf);
         promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
                           "phdf5 async write: H5Dget_space failed"));
         return;
@@ -134,7 +136,6 @@ static void async_worker(
                              offset.data(), nullptr,
                              count.data(),  nullptr) < 0) {
         H5Sclose(filespace);
-        cudaFreeHost(pinned_buf);
         promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
                           "phdf5 async write: H5Sselect_hyperslab failed"));
         return;
@@ -142,7 +143,6 @@ static void async_worker(
     hid_t memspace = H5Screate_simple(rank, count.data(), nullptr);
     if (memspace < 0) {
         H5Sclose(filespace);
-        cudaFreeHost(pinned_buf);
         promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
                           "phdf5 async write: H5Screate_simple(memspace) failed"));
         return;
@@ -154,7 +154,8 @@ static void async_worker(
 
     H5Sclose(memspace);
     H5Sclose(filespace);
-    cudaFreeHost(pinned_buf);
+    // NOTE: do NOT cudaFreeHost here — ``pinned_buf`` is ``ctx->pinned_buf``
+    // which is owned by the ctx and reused across writes.
 
     if (st < 0) {
         promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
@@ -273,24 +274,23 @@ static ffi::Future WriteDispatch(
     for (auto c : count) n_local_elts *= (size_t)c;
     const size_t bytes = n_local_elts * elt_bytes;
 
-    // Per-call pinned buffer: dedicated to THIS write, freed in worker
-    // after H5Dwrite.  Isolates consecutive async dispatches from each
-    // other on ctx->stream.
-    void* pinned_buf = nullptr;
-    cudaError_t ce = cudaMallocHost(&pinned_buf, bytes);
-    if (ce != cudaSuccess) {
+    // Reuse ``ctx->pinned_buf``, growing on demand.  Safe because the
+    // Python worker thread serializes write_slab calls: the prior
+    // H5Dwrite has already completed (buffer released) by the time
+    // the next dispatch reaches us.  ``cudaMallocHost`` at 270 MB is
+    // ~50-100 ms — a per-call cost we can't afford.
+    if (!ensure_pinned(ctx, bytes)) {
         std::ostringstream os;
-        os << "phdf5 write: cudaMallocHost(" << bytes << ") failed: "
-           << cudaGetErrorString(ce);
+        os << "phdf5 write: ensure_pinned(" << bytes << ") failed";
         return fail(ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str()));
     }
+    void* pinned_buf = ctx->pinned_buf;
 
     // Wait on the input buffer being ready (xla_stream ordering).
     cudaEvent_t ev_prod;
     if (cudaEventCreateWithFlags(&ev_prod, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventRecord(ev_prod, xla_stream) != cudaSuccess ||
         cudaStreamWaitEvent(ctx->stream, ev_prod, 0) != cudaSuccess) {
-        cudaFreeHost(pinned_buf);
         return fail(ffi::Error(ffi::ErrorCode::kInternal,
                                "phdf5 write: event setup (producer) failed"));
     }
@@ -298,10 +298,9 @@ static ffi::Future WriteDispatch(
 
     // Kick the D2H onto ctx->stream.  Returns immediately to us; the
     // actual copy runs on the CUDA stream.
-    ce = cudaMemcpyAsync(pinned_buf, A.untyped_data(), bytes,
+    cudaError_t ce = cudaMemcpyAsync(pinned_buf, A.untyped_data(), bytes,
                          cudaMemcpyDeviceToHost, ctx->stream);
     if (ce != cudaSuccess) {
-        cudaFreeHost(pinned_buf);
         std::ostringstream os;
         os << "phdf5 write: cudaMemcpyAsync D2H failed: "
            << cudaGetErrorString(ce);
@@ -312,7 +311,6 @@ static ffi::Future WriteDispatch(
     cudaEvent_t ev_done;
     if (cudaEventCreateWithFlags(&ev_done, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventRecord(ev_done, ctx->stream) != cudaSuccess) {
-        cudaFreeHost(pinned_buf);
         return fail(ffi::Error(ffi::ErrorCode::kInternal,
                                "phdf5 write: event setup (consumer) failed"));
     }
@@ -322,7 +320,6 @@ static ffi::Future WriteDispatch(
     // we return the Future.
     if (cudaStreamWaitEvent(xla_stream, ev_done, 0) != cudaSuccess) {
         cudaEventDestroy(ev_done);
-        cudaFreeHost(pinned_buf);
         return fail(ffi::Error(ffi::ErrorCode::kInternal,
                                "phdf5 write: cudaStreamWaitEvent(xla) failed"));
     }
