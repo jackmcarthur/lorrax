@@ -816,28 +816,44 @@ def fit_zeta_chunked_to_h5(
     # (P_k_mumu was already deleted above)
     # This is critical for fitting within memory budget
     del C_q, C_q_flat
-    # Force garbage collection and JAX device memory cleanup
-    gc.collect()
-    jax.clear_caches()  # Clear JAX function caches that may hold array refs
+    with timing.section("zeta_fit.gc_pre_chunk_loop"):
+        gc.collect()
+        jax.clear_caches()  # Clear JAX function caches that may hold array refs
 
     # ========== STEP 4: Create HDF5 file ==========
     # zeta_q is stored flat-q: shape (nq, n_rmu, n_rtot) with
     # q_flat = qx*nqy*nqz + qy*nqz + qz.  Flat-q is the ongoing
     # convention across LORRAX; see file_io.slab_io docs.  Chunk by
     # single-q r-slice so per-q reads stay contiguous.
+    #
+    # Single SlabIO handle reused for both create_dataset and all
+    # writes — avoids the ~900 ms cost of a second collective
+    # H5Fopen/close pair (measured 2026-04-18 at MoS2 3x3).  The
+    # allgather backend doesn't need a long-lived handle (rank 0 writes
+    # from a Python worker using plain h5py) so we keep the old
+    # create-then-reopen pattern for that path.
     from file_io.slab_io import SlabIO
     nq = nqx * nqy * nqz
-    with SlabIO(output_file, mode='w', mesh=mesh_xy, use_ffi_io=use_ffi_io) as _zeta_create_io:
-        _zeta_create_io.create_dataset(
-            'zeta_q',
-            shape=(nq, n_rmu, n_rtot),
-            dtype=np.complex128,
-            chunks=(1, n_rmu, n_rchunk),
-        )
-    # Informational file-level attrs dropped (unused anywhere).
-    zeta_io = None
-    if use_ffi_io:
-        zeta_io = SlabIO(output_file, mode='a', mesh=mesh_xy, use_ffi_io=True)
+    with timing.section("zeta_fit.open_file"):
+        if use_ffi_io:
+            zeta_io = SlabIO(output_file, mode='w', mesh=mesh_xy,
+                             use_ffi_io=True)
+            zeta_io.create_dataset(
+                'zeta_q',
+                shape=(nq, n_rmu, n_rtot),
+                dtype=np.complex128,
+                chunks=(1, n_rmu, n_rchunk),
+            )
+        else:
+            with SlabIO(output_file, mode='w', mesh=mesh_xy,
+                        use_ffi_io=False) as _zeta_create_io:
+                _zeta_create_io.create_dataset(
+                    'zeta_q',
+                    shape=(nq, n_rmu, n_rtot),
+                    dtype=np.complex128,
+                    chunks=(1, n_rmu, n_rchunk),
+                )
+            zeta_io = None
 
     # ========== STEP 5: Pre-load G-space for all band chunks (ONCE) ==========
     # This caches the expensive HDF5 read + scatter so we don't repeat it
@@ -1121,11 +1137,12 @@ def fit_zeta_chunked_to_h5(
 
     # Close the SlabIO handle (FFI path only; allgather path never
     # opened one after STEP 4).
-    if zeta_io is not None:
-        zeta_io.close()
+    with timing.section("zeta_fit.close_io"):
+        if zeta_io is not None:
+            zeta_io.close()
 
-    # Sync all processes so downstream reads see the file.
-    jax.experimental.multihost_utils.sync_global_devices("zeta_writes_complete")
+    with timing.section("zeta_fit.sync_global"):
+        jax.experimental.multihost_utils.sync_global_devices("zeta_writes_complete")
 
     # Free cached G-space now that chunk loop is done
     if cached_gspace is not None:

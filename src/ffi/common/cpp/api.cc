@@ -39,6 +39,7 @@ namespace lorrax_ffi::phdf5 {
     hid_t    ensure_dataset(PhdfCtx* ctx, const std::string& ds_name,
                             const int64_t* shape, int ndim, int dtype_tag);
     hid_t    open_dataset_ro(PhdfCtx* ctx, const std::string& ds_name);
+    void     ensure_mpi_initialized();
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +146,13 @@ int lrx_phdf5_open(
 void lrx_phdf5_close(int64_t ctx_handle) {
     lorrax_ffi::phdf5::close_ctx(
         reinterpret_cast<lorrax_ffi::phdf5::PhdfCtx*>(ctx_handle));
+}
+
+// Eager MPI init.  Safe to call multiple times.  Use at program
+// startup to move the ~400 ms MPI_Init_thread(THREAD_MULTIPLE) cost
+// off the first-open critical path.
+void lrx_phdf5_init_mpi(void) {
+    lorrax_ffi::phdf5::ensure_mpi_initialized();
 }
 
 // Collective H5Dcreate/H5Dopen.  All ranks must call concurrently.

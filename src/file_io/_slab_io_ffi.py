@@ -178,7 +178,6 @@ class _FfiBackend:
         while True:
             task = self._dispatch_queue.get()
             if task is None:
-                # Shutdown sentinel; enqueued by close().
                 return
             try:
                 task()

@@ -133,6 +133,8 @@ def _set_argtypes(lib: ctypes.CDLL) -> None:
     lib.lrx_phdf5_open.restype = ctypes.c_int
     lib.lrx_phdf5_close.argtypes = [ctypes.c_int64]
     lib.lrx_phdf5_close.restype  = None
+    lib.lrx_phdf5_init_mpi.argtypes = []
+    lib.lrx_phdf5_init_mpi.restype  = None
 
     lib.lrx_phdf5_ensure_dataset.argtypes = [
         ctypes.c_int64,                      # ctx_handle
@@ -260,6 +262,14 @@ def phdf5_open(path: str, p: int, q: int, rank: int, world_size: int,
 
 def phdf5_close(ctx_handle: int) -> None:
     get_lib().lrx_phdf5_close(int(ctx_handle))
+
+
+def phdf5_init_mpi() -> None:
+    """Eagerly init MPI_THREAD_MULTIPLE so the first ``open_file`` in the
+    hot path doesn't pay the ~400 ms MPI_Init_thread cost.  Collective
+    across all ranks; idempotent after first call.
+    """
+    get_lib().lrx_phdf5_init_mpi()
 
 
 # Mapping from numpy/jax dtype to the integer tag matching xla::ffi::DataType.

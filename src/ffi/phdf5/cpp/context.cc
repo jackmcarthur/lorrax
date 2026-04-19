@@ -36,10 +36,13 @@ static void throw_if_cuda(cudaError_t st, const char* what) {
     }
 }
 
-// Lazy one-shot MPI init.  cuSOLVERMp doesn't use MPI, so if the caller
-// only ever touches cuSOLVERMp there's no MPI_Init surprise.  First
-// open_file triggers MPI_Init_thread(THREAD_MULTIPLE).
-static void ensure_mpi_initialized() {
+// One-shot MPI init.  cuSOLVERMp doesn't use MPI, so if the caller
+// only ever touches cuSOLVERMp there's no MPI_Init surprise.  Either
+// first open_file triggers MPI_Init_thread(THREAD_MULTIPLE), or the
+// caller triggers it eagerly via the exported ``lrx_phdf5_init_mpi``
+// (takes ~400 ms on first call; calling it during program startup
+// before the hot path saves that time on the critical path).
+void ensure_mpi_initialized() {
     int inited = 0;
     MPI_Initialized(&inited);
     if (inited) return;

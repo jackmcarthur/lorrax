@@ -214,6 +214,18 @@ def main(argv=None):
 	mesh_xy = _build_mesh()
 	grid_x, grid_y = mesh_xy.devices.shape
 
+	# Eagerly init MPI_THREAD_MULTIPLE via the phdf5 FFI so the first
+	# collective H5Fcreate (in zeta_fit_chunked) doesn't pay the
+	# ~400 ms MPI_Init_thread cost on the critical path.  Overlaps
+	# with the JAX compile phases that follow.  No-op if FFI isn't
+	# used; cheap to attempt and swallow errors.
+	if getattr(config, "use_ffi_io", False):
+		try:
+			from ffi.common.ffi_loader import phdf5_init_mpi
+			phdf5_init_mpi()
+		except Exception as _e:
+			print0(f"  [phdf5 init_mpi] skipped: {_e}")
+
 	from .gw_output import print_banner, print_section, print_system_summary, write_results, GWResults
 	print_banner(
 		backend=current_backend, n_devices=n_devices,
