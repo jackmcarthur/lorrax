@@ -31,30 +31,34 @@ _FFI_TARGET = "lorrax_phdf5_write"
 
 def ffi_write_call(
     A_local: jax.Array,
+    offset_base: jax.Array,
     *,
     ctx_handle: int,
     ds_id: int,
-    offset_base: Sequence[int],
     mesh_shape: Sequence[int],
     axis_count_per_dim: Sequence[int],
     axis_flat: Sequence[int],
 ) -> jax.Array:
     """Low-level FFI call for one rank's local shard.  Returns token.
 
-    Attrs encode the N-D block-partitioned sharding with possible
-    multi-mesh-axis per dim:
-      - axis_count_per_dim[d] = number of mesh axes sharding dim d (0 =
-        replicated)
-      - axis_flat = concatenation of per-dim axis lists, in dim order,
-        each list in JAX leftmost-is-slowest order.
+    ``offset_base`` is a jax.Array of shape (ndim,) dtype int64 — passed
+    as a traced Buffer input (not an FFI Attr) so that shard_map closures
+    compile ONCE per dataset-ndim-dtype-sharding tuple and re-dispatch
+    across chunks with different offsets.  Without this, each chunk
+    triggers a fresh ~400 ms XLA compile for the FFI body (measured at
+    MoS2 3x3 scale, see reports/zeta_offset_runtime_2026-04-19/).
+
+    The other mesh/axis attrs ARE compile-time attrs — they don't change
+    across chunks of a given dataset, so no recompile happens.
+
     Use inside a ``shard_map`` body.
     """
     token_spec = jax.ShapeDtypeStruct((1,), jnp.int32)
     return jax.ffi.ffi_call(_FFI_TARGET, token_spec, has_side_effect=True)(
         A_local,
+        offset_base,
         ctx_handle=int(ctx_handle),
         ds_id=int(ds_id),
-        offset_base=np.asarray(offset_base, dtype=np.int64),
         mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
         axis_count_per_dim=np.asarray(axis_count_per_dim, dtype=np.int64),
         axis_flat=np.asarray(axis_flat, dtype=np.int64),
@@ -90,12 +94,13 @@ def write_sharded_slab(
         fh, ds_name, (int(n_rows), int(n_cols)),
         str(jnp.dtype(A.dtype).name))
 
-    def _per_rank(A_local):
+    offset_array = jnp.zeros((2,), dtype=jnp.int64)
+
+    def _per_rank(A_local, offset_local):
         return ffi_write_call(
-            A_local,
+            A_local, offset_local,
             ctx_handle=int(fh),
             ds_id=int(ds_id),
-            offset_base=(0, 0),
             mesh_shape=(p, q),
             axis_count_per_dim=(1, 1),
             axis_flat=(0, 1),
@@ -103,6 +108,6 @@ def write_sharded_slab(
 
     return shard_map(
         _per_rank, mesh=mesh,
-        in_specs=P("x", "y"), out_specs=P(),
+        in_specs=(P("x", "y"), P()), out_specs=P(),
         check_rep=False,
-    )(A)
+    )(A, offset_array)

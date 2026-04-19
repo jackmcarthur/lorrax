@@ -173,13 +173,21 @@ static void async_worker(
 }
 
 // ---- Dispatch ------------------------------------------------------------
+// NOTE on ``offset_base`` being a Buffer rather than an Attr: offset
+// changes per chunk (0, r, 2r, 3r for zeta) and FFI Attrs are baked
+// into the XLA compile at dispatch time, so a fresh compile is needed
+// for every distinct offset.  At MoS2 3x3 that meant 9 × 900 MiB HLO
+// modules compiling just for FFI writes (measured via the profiling
+// stack's HLO dump 2026-04-19).  Passing offset as a traced device
+// buffer makes the trace signature shape-only (ndim), so shard_map
+// closures compile ONCE per (ds_id, ndim, dtype, sharding).
 static ffi::Future WriteDispatch(
     cudaStream_t xla_stream,
     ffi::AnyBuffer A,
+    ffi::Buffer<ffi::DataType::S64> offset_buf,   // shape (ndim,)
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> token_out,
     int64_t ctx_handle,
     int64_t ds_id,
-    ffi::Span<const int64_t> offset_base,
     ffi::Span<const int64_t> mesh_shape,
     ffi::Span<const int64_t> axis_count_per_dim,
     ffi::Span<const int64_t> axis_flat)
@@ -199,12 +207,26 @@ static ffi::Future WriteDispatch(
 
     const auto dims = A.dimensions();
     const size_t N = dims.size();
-    if (offset_base.size() != N || axis_count_per_dim.size() != N) {
+    if (offset_buf.dimensions().size() != 1 ||
+        (size_t)offset_buf.dimensions()[0] != N ||
+        axis_count_per_dim.size() != N) {
         std::ostringstream os;
         os << "phdf5 write: rank mismatch  A.ndim=" << N
-           << " offset_base.size=" << offset_base.size()
+           << " offset_buf.ndim=" << offset_buf.dimensions().size()
            << " axis_count_per_dim.size=" << axis_count_per_dim.size();
         return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str()));
+    }
+
+    // D2H-copy the small offset buffer (N × 8 bytes = 24-40 bytes
+    // typically).  Blocking cudaMemcpy; microseconds.
+    std::vector<int64_t> offset_host(N);
+    cudaError_t ce_off = cudaMemcpy(offset_host.data(), offset_buf.untyped_data(),
+                                    N * sizeof(int64_t), cudaMemcpyDeviceToHost);
+    if (ce_off != cudaSuccess) {
+        std::ostringstream os;
+        os << "phdf5 write: cudaMemcpy(offset) failed: "
+           << cudaGetErrorString(ce_off);
+        return fail(ffi::Error(ffi::ErrorCode::kInternal, os.str()));
     }
 
     std::vector<int64_t> coord = unravel_rank(ctx->rank, mesh_shape);
@@ -212,7 +234,7 @@ static ffi::Future WriteDispatch(
     size_t flat_idx = 0;
     for (size_t d = 0; d < N; ++d) {
         count[d] = (hsize_t)dims[d];
-        offset[d] = (hsize_t)offset_base[d];
+        offset[d] = (hsize_t)offset_host[d];
         int64_t na = axis_count_per_dim[d];
         // Dim d is sharded over `na` mesh axes; leftmost is slowest,
         // rightmost has stride=1.  rank_coord = sum_k coord[ax_k] * prod(mesh_shape[ax_{k+1:}]).
@@ -356,10 +378,10 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     xla::ffi::Ffi::Bind()
         .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
         .Arg<xla::ffi::AnyBuffer>()
+        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // offset_base
         .Ret<xla::ffi::Buffer<xla::ffi::DataType::S32>>()
         .Attr<int64_t>("ctx_handle")
         .Attr<int64_t>("ds_id")
-        .Attr<xla::ffi::Span<const int64_t>>("offset_base")
         .Attr<xla::ffi::Span<const int64_t>>("mesh_shape")
         .Attr<xla::ffi::Span<const int64_t>>("axis_count_per_dim")
         .Attr<xla::ffi::Span<const int64_t>>("axis_flat"));

@@ -250,48 +250,51 @@ class _FfiBackend:
         in_specs = A.sharding.spec  # PartitionSpec
 
         # ── shard_map cache ──
-        # Every ``write_slab`` captures new values for ds_id, off, etc.
-        # into ``_per_rank``.  Each closure is a fresh Python function
-        # object, so shard_map(...) compiles a NEW XLA module every call
-        # — at MoS2 3x3 scale each compile is ~400-700 ms of a 900 MB
-        # HLO, which completely dominates write runtime.  Key the
-        # cached compiled shard_map by the full FFI attr tuple + the
-        # array's shape/dtype/sharding so identical writes hit the
-        # jit cache.
+        # Keyed on everything that's a compile-time FFI attr + array
+        # shape/dtype/sharding, so repeat writes at identical signatures
+        # reuse the compiled module.  ``offset_base`` is now a RUNTIME
+        # Buffer (not an Attr), so it's intentionally NOT in the key —
+        # chunks with different offsets hit the same cached compile.
         cache_key = (
-            int(ctx_handle), int(ds_id), off, mesh_shape,
+            int(ctx_handle), int(ds_id), mesh_shape,
             axis_count_per_dim, axis_flat,
             A.shape, str(A.dtype), in_specs,
         )
         sm = self._sm_cache.get(cache_key)
         if sm is None:
-            def _per_rank(A_local, _ds_id=int(ds_id), _off=off,
+            def _per_rank(A_local, offset_local,
+                          _ds_id=int(ds_id),
                           _mesh_shape=mesh_shape,
                           _axis_count=axis_count_per_dim,
                           _axis_flat=axis_flat,
                           _ctx_handle=int(ctx_handle)):
                 return ffi_write_call(
-                    A_local,
+                    A_local, offset_local,
                     ctx_handle=_ctx_handle,
                     ds_id=_ds_id,
-                    offset_base=_off,
                     mesh_shape=_mesh_shape,
                     axis_count_per_dim=_axis_count,
                     axis_flat=_axis_flat,
                 )
-            sm = shard_map(
+            sm_bare = shard_map(
                 _per_rank, mesh=self.mesh,
-                in_specs=in_specs, out_specs=P(),
+                in_specs=(in_specs, P()), out_specs=P(),
                 check_rep=False,
             )
+            # Wrap in jax.jit so the trace+compile is cached at the
+            # JAX jit level.  Without this, shard_map re-traces on each
+            # call even though we reuse the same ``sm`` object — visible
+            # in the HLO dump as multiple identical-signature modules.
+            sm = jax.jit(sm_bare)
             self._sm_cache[cache_key] = sm
 
         # Enqueue dispatch onto the Python worker thread.  Main thread
-        # returns in ~0.2ms; the worker thread calls ``sm(A)`` in FIFO
-        # order.  Eager shard_map is synchronous on its CALLER — the
-        # worker thread — which is exactly where we want the block.
+        # returns in ~0.2ms; the worker thread calls ``sm(A, offset)``
+        # in FIFO order.  The offset Buffer is tiny (ndim × 8 bytes).
+        offset_arr = jnp.asarray(off, dtype=jnp.int64)
+
         def _task():
-            tok = sm(A)
+            tok = sm(A, offset_arr)
             tok.block_until_ready()
 
         with self._pending_cv:
