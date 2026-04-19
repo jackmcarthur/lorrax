@@ -1154,6 +1154,15 @@ def main(argv: list[str] | None = None) -> None:
 
     timing.reset()
 
+    # Enable JAX persistent compile cache before any jit compiles.
+    try:
+        from common.jax_compile_cache import ensure_jax_compile_cache
+        ensure_jax_compile_cache()
+    except Exception as _e:
+        import jax as _jax_mod
+        if _jax_mod.process_index() == 0:
+            print(f"  [jax compile cache] skipped: {_e}", flush=True)
+
     mesh_xy = _create_mesh_xy(args.px, args.py)
     restart_file = _find_restart_file(args.input)
     with timing.section("feast.restart_load"):

@@ -655,10 +655,17 @@ def main():
                         help="Zoom factor for density in plot (default: 1.0, higher = finer)")
     parser.add_argument("--no-downsample", action="store_true", help="Use full FFT grid (no zoom)")
     args = parser.parse_args()
-    
+
     N_k = args.N_k
     print(f"Using N_k = {N_k} clusters")
-    
+
+    # Enable JAX persistent compile cache before any jit compiles.
+    try:
+        from common.jax_compile_cache import ensure_jax_compile_cache
+        ensure_jax_compile_cache()
+    except Exception as _e:
+        print(f"  [jax compile cache] skipped: {_e}", flush=True)
+
     wfn = WFNReader("WFN.h5")
     sym = symmetry_maps.SymMaps(wfn)
 

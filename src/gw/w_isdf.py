@@ -25,46 +25,15 @@ from .minimax_screening import build_static_minimax_window_pair
 # Cache and sharding registry
 # ============================================================================
 
-_COMPILATION_CACHE_READY = False
 _chi_minimax_kernel_cache: dict = {}
 _w_solve_cache: dict = {}
 
 
+# Thin wrapper around the shared activator so in-place callers in this
+# module keep working.  See common.jax_compile_cache.
 def _ensure_compilation_cache():
-    """Enable JAX persistent compilation cache.
-
-    Uses the modern config API (``jax_compilation_cache_dir``); the
-    older ``jax.experimental.compilation_cache.set_cache_dir`` is
-    soft-deprecated and silently no-ops on recent jaxlib.  We also
-    drop the compile-time cache threshold to 0 so every compile
-    (not just expensive ones) is cached — at MoS2 3x3 scale this is
-    ~260 entries / 2 MB on disk and saves ~3 s of cold compile time
-    on warm re-runs (measured 2026-04-19).  Caller can opt out by
-    setting ``ISDF_JAX_CACHE_DIR=""`` before launch.
-    """
-    global _COMPILATION_CACHE_READY
-    if _COMPILATION_CACHE_READY:
-        return
-    cache_dir = os.environ.get("ISDF_JAX_CACHE_DIR")
-    if cache_dir is None:
-        base_cache = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
-        cache_dir = os.path.join(base_cache, "isdf_jax_compilation")
-    if not cache_dir:  # explicit opt-out via ISDF_JAX_CACHE_DIR=""
-        _COMPILATION_CACHE_READY = True
-        return
-    cache_path = Path(cache_dir).expanduser()
-    cache_path.mkdir(parents=True, exist_ok=True)
-    try:
-        import jax as _jax
-        _jax.config.update("jax_compilation_cache_dir", str(cache_path))
-        _jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
-    except Exception:
-        # Fall back to the legacy API if the config knobs aren't present.
-        try:
-            jax_compilation_cache.set_cache_dir(cache_path)
-        except Exception:
-            pass
-    _COMPILATION_CACHE_READY = True
+    from common.jax_compile_cache import ensure_jax_compile_cache
+    ensure_jax_compile_cache()
 
 
 # ============================================================================

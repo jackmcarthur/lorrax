@@ -559,6 +559,15 @@ def main():
     if args.pb_wfn:
         pb_wfn_input = args.pb_wfn
 
+    # Enable JAX persistent compile cache before any jit compiles.
+    # See common.jax_compile_cache for details.
+    try:
+        from common.jax_compile_cache import ensure_jax_compile_cache
+        ensure_jax_compile_cache()
+    except Exception as _e:
+        if jax.process_index() == 0:
+            print(f"  [jax compile cache] skipped: {_e}", flush=True)
+
     crystal = CrystalData.from_qe_save(save_dir)
     pseudos = load_pseudopotentials(args.pseudo_dir or save_dir)
 

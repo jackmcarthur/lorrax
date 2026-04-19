@@ -234,8 +234,8 @@ def main(argv=None):
 	# before launch.  Default cache location honours ISDF_JAX_CACHE_DIR
 	# → XDG_CACHE_HOME/isdf_jax_compilation → ~/.cache/isdf_jax_compilation.
 	try:
-		from .w_isdf import _ensure_compilation_cache
-		_ensure_compilation_cache()
+		from common.jax_compile_cache import ensure_jax_compile_cache
+		ensure_jax_compile_cache()
 	except Exception as _e:
 		print0(f"  [jax compile cache] skipped: {_e}")
 
