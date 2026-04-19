@@ -244,6 +244,10 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
     throw_if_cuda(cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking),
                   "cudaStreamCreate(phdf5 ctx)");
 
+    // --- reusable D2H-completion event (see ctx.h) ---
+    throw_if_cuda(cudaEventCreateWithFlags(&ctx->d2h_event, cudaEventDisableTiming),
+                  "cudaEventCreate(phdf5 d2h_event)");
+
     // --- start dedicated writer thread (FIFO task queue) ---
     ctx->writer_thread = std::thread([ctx]() {
         for (;;) {
@@ -381,7 +385,8 @@ void close_ctx(PhdfCtx* ctx) {
         ctx->pinned_buf = nullptr;
         ctx->pinned_capacity = 0;
     }
-    if (ctx->stream)  cudaStreamDestroy(ctx->stream);
+    if (ctx->d2h_event) cudaEventDestroy(ctx->d2h_event);
+    if (ctx->stream)    cudaStreamDestroy(ctx->stream);
 
     if (ctx->owns_comm && ctx->comm != MPI_COMM_NULL) {
         MPI_Comm_free(&ctx->comm);

@@ -51,6 +51,13 @@ struct PhdfCtx {
     cudaStream_t stream              = nullptr;
     void*        pinned_buf          = nullptr;
     size_t       pinned_capacity     = 0;
+    // Reused per-write D2H-completion event.  Created in open_ctx,
+    // destroyed in close_ctx.  Creating/destroying per write blocks
+    // cudaEventDestroy for ~800 ms on non-root ranks when xla_stream
+    // has a backlog (measured 2026-04-18 — cause not fully understood,
+    // presumably cuda_async allocator internal event-tracking).  One
+    // event suffices because Python worker serializes writes.
+    cudaEvent_t  d2h_event           = nullptr;
 
     // ─── Async-write worker ─────────────────────────────────────────
     // Single dedicated thread drains ``task_queue`` in FIFO order.

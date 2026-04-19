@@ -37,36 +37,41 @@
 // ``jit(ffi_call)(A).block_until_ready()`` call in FIFO order.  Main
 // thread enqueues onto that Python queue and returns in ~0.2ms.
 //
-// What this C++ file still buys us:
-//  - The writer thread + task queue serialise ``H5Dwrite`` across
-//    ranks in dispatch order, which is the MPI-IO collective
-//    rendezvous requirement.  Without that, per-call detached threads
-//    could let OS scheduling reorder H5Dwrites between ranks.
+// What this C++ file buys us:
+//  - Writer thread + task queue serialise ``H5Dwrite`` across ranks
+//    in dispatch order, which is the MPI-IO collective rendezvous
+//    requirement.  Per-call detached threads could let OS scheduling
+//    reorder H5Dwrites between ranks.
 //  - ``ensure_pinned`` grows ``ctx->pinned_buf`` once (first call)
 //    and reuses it on every subsequent write.  The Python worker
 //    thread serialises dispatches so no second write is in flight
 //    when the next handler D2Hs into the buffer.
+//  - ``ctx->d2h_event`` is a single ctx-owned cudaEvent, reused
+//    across writes (re-recorded, re-synced).  Creating a fresh event
+//    per call and destroying it in the writer thread caused
+//    cudaEventDestroy to block ~800 ms on 3 of 4 ranks at MoS2 3x3
+//    (measured 2026-04-18) — see the mystery-solved note below.
 //
 // Work split:
-//  - XLA executor thread (fast path): ensure_pinned (free on repeat
-//    calls), SYNC cudaMemcpy D2H into ctx->pinned_buf (~50 ms for 270
-//    MB, blocks the executor but NOT the Python main thread), enqueue
-//    a task on the writer thread, return the Future.
-//  - Writer thread (slow path, one per ctx): pops next task, calls
-//    H5Dwrite (MPI-IO collective, ~750 ms), promise.SetAvailable().
+//  - XLA executor thread (fast path, ~0.1 ms): ensure_pinned, kick
+//    cudaMemcpyAsync D2H on ctx->stream, cudaEventRecord the ctx's
+//    reusable d2h_event, enqueue a task on the writer thread, return
+//    the Future.
+//  - Writer thread (slow path, one per ctx): cudaEventSynchronize on
+//    ctx->d2h_event, H5Dwrite (MPI-IO collective, ~750 ms),
+//    promise.SetAvailable().
 //
-// NOTE on sync D2H: We used to cudaMemcpyAsync on a private ctx->stream
-// with a cross-stream-wait on xla_stream.  At MoS2 3x3 scale that
-// stalled the D2H by ~900 ms on 3 of 4 ranks — measured via per-rank
-// fprintf timestamps 2026-04-18.  The stall was NOT xla_stream queue
-// depth (removing the xla→ctx wait didn't help), NOT A's readiness
-// (an explicit main-thread block_until_ready didn't help), and NOT a
-// draining-xla_stream issue (a pre-enqueue jnp.zeros sync didn't help).
-// Hypothesis: some interaction between the cuda_async stream-ordered
-// allocator and cudaMemcpyAsync from a non-owning stream.  Sync
-// cudaMemcpy on the default stream sidesteps it entirely at a cost of
-// ~50 ms/chunk on the XLA executor thread — negligible vs the H5Dwrite
-// wall.
+// ─── The 800 ms "cudaEventDestroy" mystery (resolved 2026-04-18) ───
+// Original design created a fresh event in the handler and destroyed
+// it in the writer thread.  At MoS2 3x3 scale on 4 ranks, non-rank-0
+// writer threads blocked ~800 ms inside ``cudaEventDestroy``.
+// Instrumented per-stage timestamps pinned it to the destroy call
+// specifically; skipping destroy (leaking events) or reusing a single
+// event (this file) both eliminate the stall.  Root cause not fully
+// understood, likely a cuda_async stream-ordered allocator
+// interaction — destroying an event with outstanding xla_stream
+// dependencies appears to wait on that stream to drain.  The fix
+// here — one event per ctx — is clean and correct.
 
 #include <chrono>
 #include <complex>
@@ -107,13 +112,15 @@ static std::vector<int64_t> unravel_rank(
     return coord;
 }
 
-// Run H5Dwrite on the ctx writer thread.  Data is already on host
-// (sync cudaMemcpy happened in WriteDispatch before enqueue) so this
-// is pure MPI-IO.  The XLA Promise is moved in; SetAvailable/SetError
-// signals the runtime that the Future is ready.  ``pinned_buf`` points
-// into ``ctx->pinned_buf`` (shared, reused across writes); the Python
-// worker serializes ``write_slab`` calls so there is no second writer
-// in flight when the next handler kicks off its D2H into this buffer.
+// Run H5Dwrite on the ctx writer thread.  If ``wait_for_d2h`` is
+// true, first cudaEventSynchronize on the ctx's reusable d2h_event
+// so the pinned host buffer is valid.  We deliberately DO NOT
+// destroy the event here: cudaEventDestroy on a recently-recorded
+// event (per-call) blocks 700-800 ms on 3 of 4 ranks when xla_stream
+// has a main-thread backlog (measured 2026-04-18, cause: likely
+// an interaction with CUDA's stream-ordered allocator).  Using a
+// single ctx-owned event reused across writes avoids the per-call
+// destroy entirely; the event is destroyed once in close_ctx.
 static void async_worker(
     PhdfCtx* ctx,
     hid_t ds_id,
@@ -121,8 +128,12 @@ static void async_worker(
     std::vector<hsize_t> offset,
     std::vector<hsize_t> count,
     void* pinned_buf,
+    bool wait_for_d2h,
     ffi::Promise promise)
 {
+    if (wait_for_d2h) {
+        cudaEventSynchronize(ctx->d2h_event);
+    }
     const int rank = (int)offset.size();
     hid_t filespace = H5Dget_space(ds_id);
     if (filespace < 0) {
@@ -282,24 +293,32 @@ static ffi::Future WriteDispatch(
     }
     void* pinned_buf = ctx->pinned_buf;
 
-    // D2H via SYNCHRONOUS cudaMemcpy (null stream).  Blocks the XLA
-    // executor thread for the D2H wall time (~50 ms for 270 MB), but
-    // guarantees the copy starts immediately from device-resident
-    // source with peak PCIe bandwidth.  Async D2H on a private
-    // ctx->stream with the stream-ordered cuda_async allocator
-    // empirically stalled ~900 ms on 3 of 4 ranks at MoS2 3x3 —
-    // cause not yet understood (not xla_stream queue depth, not
-    // A's readiness, not cross-stream-wait).
-    cudaError_t ce = cudaMemcpy(pinned_buf, A.untyped_data(), bytes,
-                                cudaMemcpyDeviceToHost);
+    // D2H: cudaMemcpyAsync on ctx's private stream, then record the
+    // ctx's REUSABLE d2h_event so the writer thread can sync on it.
+    // Handler returns immediately after dispatching the copy.
+    //
+    // We deliberately do NOT cudaStreamWaitEvent(xla_stream, ev) to
+    // guard A from XLA buffer donation.  Doing so, combined with
+    // per-call event creation, caused cudaEventDestroy in the writer
+    // thread to block ~800 ms on non-rank-0 processes (measured
+    // 2026-04-18, likely an interaction with the cuda_async
+    // stream-ordered allocator).  Using a single ctx-owned event
+    // reused across writes avoids the per-call destroy entirely; the
+    // event is destroyed once in close_ctx.  Correctness: Python's
+    // ``A.block_until_ready()`` on the main thread before enqueue
+    // ensures A's device storage is finalised before we read it; the
+    // Python worker serialises writes so by the time the next
+    // handler runs, the previous H5Dwrite has already consumed
+    // pinned_buf.
+    cudaError_t ce = cudaMemcpyAsync(pinned_buf, A.untyped_data(), bytes,
+                                     cudaMemcpyDeviceToHost, ctx->stream);
     if (ce != cudaSuccess) {
         std::ostringstream os;
         os << "phdf5 write: cudaMemcpyAsync D2H failed: "
            << cudaGetErrorString(ce);
         return fail(ffi::Error(ffi::ErrorCode::kInternal, os.str()));
     }
-
-    // Sync cudaMemcpy already completed on return — no event needed.
+    cudaEventRecord(ctx->d2h_event, ctx->stream);
 
     // Standard Promise/Future handshake: construct promise, construct
     // future from it (one-shot), then move promise into the task
@@ -315,7 +334,8 @@ static ffi::Future WriteDispatch(
     {
         async_worker(ctx, dset, native_type,
                      std::move(offset), std::move(count),
-                     pinned_buf, std::move(promise));
+                     pinned_buf, /*wait_for_d2h=*/true,
+                     std::move(promise));
     };
 
     {
