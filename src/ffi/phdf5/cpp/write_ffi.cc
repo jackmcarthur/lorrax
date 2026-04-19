@@ -49,13 +49,24 @@
 //
 // Work split:
 //  - XLA executor thread (fast path): ensure_pinned (free on repeat
-//    calls), kick cudaMemcpyAsync D2H on ctx->stream, cross-stream-wait
-//    so XLA's output buffer donation is safe, record a CUDA event that
-//    fires when the D2H finishes, enqueue a task on the writer thread,
-//    return the Future.
-//  - Writer thread (slow path, one per ctx): pops next task, does
-//    cudaEventSynchronize for D2H, then H5Dwrite MPI-IO collective,
-//    cleanup, promise.SetAvailable().
+//    calls), SYNC cudaMemcpy D2H into ctx->pinned_buf (~50 ms for 270
+//    MB, blocks the executor but NOT the Python main thread), enqueue
+//    a task on the writer thread, return the Future.
+//  - Writer thread (slow path, one per ctx): pops next task, calls
+//    H5Dwrite (MPI-IO collective, ~750 ms), promise.SetAvailable().
+//
+// NOTE on sync D2H: We used to cudaMemcpyAsync on a private ctx->stream
+// with a cross-stream-wait on xla_stream.  At MoS2 3x3 scale that
+// stalled the D2H by ~900 ms on 3 of 4 ranks — measured via per-rank
+// fprintf timestamps 2026-04-18.  The stall was NOT xla_stream queue
+// depth (removing the xla→ctx wait didn't help), NOT A's readiness
+// (an explicit main-thread block_until_ready didn't help), and NOT a
+// draining-xla_stream issue (a pre-enqueue jnp.zeros sync didn't help).
+// Hypothesis: some interaction between the cuda_async stream-ordered
+// allocator and cudaMemcpyAsync from a non-owning stream.  Sync
+// cudaMemcpy on the default stream sidesteps it entirely at a cost of
+// ~50 ms/chunk on the XLA executor thread — negligible vs the H5Dwrite
+// wall.
 
 #include <chrono>
 #include <complex>
@@ -96,13 +107,13 @@ static std::vector<int64_t> unravel_rank(
     return coord;
 }
 
-// Run H5Dwrite on the ctx writer thread after the D2H completes.
-// The XLA Promise is moved in; SetAvailable/SetError signals the
-// runtime that the Future is ready and downstream ops can proceed.
-// ``pinned_buf`` points into ``ctx->pinned_buf`` (shared, reused
-// across writes); the Python worker serializes ``write_slab`` calls
-// so there is no second writer in flight when the next handler kicks
-// off its D2H into this buffer.
+// Run H5Dwrite on the ctx writer thread.  Data is already on host
+// (sync cudaMemcpy happened in WriteDispatch before enqueue) so this
+// is pure MPI-IO.  The XLA Promise is moved in; SetAvailable/SetError
+// signals the runtime that the Future is ready.  ``pinned_buf`` points
+// into ``ctx->pinned_buf`` (shared, reused across writes); the Python
+// worker serializes ``write_slab`` calls so there is no second writer
+// in flight when the next handler kicks off its D2H into this buffer.
 static void async_worker(
     PhdfCtx* ctx,
     hid_t ds_id,
@@ -110,21 +121,8 @@ static void async_worker(
     std::vector<hsize_t> offset,
     std::vector<hsize_t> count,
     void* pinned_buf,
-    cudaEvent_t ev_done,
     ffi::Promise promise)
 {
-    // Wait for the D2H to land in pinned_buf.  cudaEventSynchronize
-    // blocks THIS (worker) thread, not the XLA executor, not Python.
-    cudaError_t ce = cudaEventSynchronize(ev_done);
-    cudaEventDestroy(ev_done);
-    if (ce != cudaSuccess) {
-        std::ostringstream os;
-        os << "phdf5 async write: cudaEventSynchronize failed: "
-           << cudaGetErrorString(ce);
-        promise.SetError(ffi::Error(ffi::ErrorCode::kInternal, os.str()));
-        return;
-    }
-
     const int rank = (int)offset.size();
     hid_t filespace = H5Dget_space(ds_id);
     if (filespace < 0) {
@@ -154,8 +152,6 @@ static void async_worker(
 
     H5Sclose(memspace);
     H5Sclose(filespace);
-    // NOTE: do NOT cudaFreeHost here — ``pinned_buf`` is ``ctx->pinned_buf``
-    // which is owned by the ctx and reused across writes.
 
     if (st < 0) {
         promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
@@ -286,20 +282,16 @@ static ffi::Future WriteDispatch(
     }
     void* pinned_buf = ctx->pinned_buf;
 
-    // Wait on the input buffer being ready (xla_stream ordering).
-    cudaEvent_t ev_prod;
-    if (cudaEventCreateWithFlags(&ev_prod, cudaEventDisableTiming) != cudaSuccess ||
-        cudaEventRecord(ev_prod, xla_stream) != cudaSuccess ||
-        cudaStreamWaitEvent(ctx->stream, ev_prod, 0) != cudaSuccess) {
-        return fail(ffi::Error(ffi::ErrorCode::kInternal,
-                               "phdf5 write: event setup (producer) failed"));
-    }
-    cudaEventDestroy(ev_prod);
-
-    // Kick the D2H onto ctx->stream.  Returns immediately to us; the
-    // actual copy runs on the CUDA stream.
-    cudaError_t ce = cudaMemcpyAsync(pinned_buf, A.untyped_data(), bytes,
-                         cudaMemcpyDeviceToHost, ctx->stream);
+    // D2H via SYNCHRONOUS cudaMemcpy (null stream).  Blocks the XLA
+    // executor thread for the D2H wall time (~50 ms for 270 MB), but
+    // guarantees the copy starts immediately from device-resident
+    // source with peak PCIe bandwidth.  Async D2H on a private
+    // ctx->stream with the stream-ordered cuda_async allocator
+    // empirically stalled ~900 ms on 3 of 4 ranks at MoS2 3x3 —
+    // cause not yet understood (not xla_stream queue depth, not
+    // A's readiness, not cross-stream-wait).
+    cudaError_t ce = cudaMemcpy(pinned_buf, A.untyped_data(), bytes,
+                                cudaMemcpyDeviceToHost);
     if (ce != cudaSuccess) {
         std::ostringstream os;
         os << "phdf5 write: cudaMemcpyAsync D2H failed: "
@@ -307,22 +299,7 @@ static ffi::Future WriteDispatch(
         return fail(ffi::Error(ffi::ErrorCode::kInternal, os.str()));
     }
 
-    // Event that fires when the D2H finishes (worker waits on this).
-    cudaEvent_t ev_done;
-    if (cudaEventCreateWithFlags(&ev_done, cudaEventDisableTiming) != cudaSuccess ||
-        cudaEventRecord(ev_done, ctx->stream) != cudaSuccess) {
-        return fail(ffi::Error(ffi::ErrorCode::kInternal,
-                               "phdf5 write: event setup (consumer) failed"));
-    }
-
-    // Cross-stream wait so XLA's stream also observes the D2H
-    // completion.  This is what lets XLA reuse / donate A safely after
-    // we return the Future.
-    if (cudaStreamWaitEvent(xla_stream, ev_done, 0) != cudaSuccess) {
-        cudaEventDestroy(ev_done);
-        return fail(ffi::Error(ffi::ErrorCode::kInternal,
-                               "phdf5 write: cudaStreamWaitEvent(xla) failed"));
-    }
+    // Sync cudaMemcpy already completed on return — no event needed.
 
     // Standard Promise/Future handshake: construct promise, construct
     // future from it (one-shot), then move promise into the task
@@ -333,12 +310,12 @@ static ffi::Future WriteDispatch(
     auto task = [ctx, dset, native_type,
                  offset = std::move(offset),
                  count  = std::move(count),
-                 pinned_buf, ev_done,
+                 pinned_buf,
                  promise = std::move(promise)]() mutable
     {
         async_worker(ctx, dset, native_type,
                      std::move(offset), std::move(count),
-                     pinned_buf, ev_done, std::move(promise));
+                     pinned_buf, std::move(promise));
     };
 
     {
