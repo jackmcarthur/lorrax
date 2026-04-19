@@ -38,10 +38,11 @@ _LIB: Optional[ctypes.CDLL] = None
 _FFI_TARGET_SYMBOLS = {
     # One handler per routine covers all supported dtypes — dispatch is
     # done inside the .so based on the input buffer's element type.
-    "lorrax_cusolvermp_eigh":      "EighMpFfi",
-    "lorrax_cusolvermg_eigh_f64":  "EighMgF64",
-    "lorrax_phdf5_write":          "PhdfWriteFfi",
-    "lorrax_phdf5_read":           "PhdfReadFfi",
+    "lorrax_cusolvermp_eigh":       "EighMpFfi",
+    "lorrax_cusolvermg_eigh_f64":   "EighMgF64",
+    "lorrax_phdf5_write":           "PhdfWriteFfi",
+    "lorrax_phdf5_read":            "PhdfReadFfi",
+    "lorrax_phdf5_read_kchunk":     "PhdfReadKchunkFfi",
 }
 
 # Error buffer size for the lrx_ wrappers.
