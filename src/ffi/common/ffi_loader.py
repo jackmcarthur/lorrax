@@ -42,7 +42,8 @@ _FFI_TARGET_SYMBOLS = {
     "lorrax_cusolvermg_eigh_f64":   "EighMgF64",
     "lorrax_phdf5_write":           "PhdfWriteFfi",
     "lorrax_phdf5_read":            "PhdfReadFfi",
-    "lorrax_phdf5_read_kchunk":     "PhdfReadKchunkFfi",
+    "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkFfi",
+    "lorrax_phdf5_read_kchunk_union": "PhdfReadKchunkUnionFfi",
 }
 
 # Error buffer size for the lrx_ wrappers.

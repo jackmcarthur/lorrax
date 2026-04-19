@@ -44,7 +44,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental import multihost_utils
 
 from ffi.phdf5 import open_file, close_file
-from ffi.phdf5.read import read_kchunk_sharded
+from ffi.phdf5.read import read_kchunk_sharded, read_kchunk_union_sharded
 from file_io.slab_io import SlabIO
 
 
@@ -144,9 +144,71 @@ def main() -> int:
                       f"off_g={off_k} FAIL err={err}", flush=True)
                 local_err = 1
 
+    # ---------------------------------------------------------------
+    #  Now exercise the UNION handler (one H5Dread, H5S_SELECT_OR).
+    #  Use a DIFFERENT set of offsets that are strictly non-overlapping
+    #  in the file, with per-k VARIABLE counts along the G axis to mimic
+    #  the variable-ngk WFN case.
+    # ---------------------------------------------------------------
+    _log("\n--- UNION handler test ---")
+    k_offsets_u = np.array([
+        [0, 0,  0, 0],     # (nb=16, ns=2, g=6, 2)
+        [0, 0,  6, 0],     # (nb=16, ns=2, g=8, 2)
+        [0, 0, 14, 0],     # (nb=16, ns=2, g=7, 2)
+        [0, 0, 21, 0],     # (nb=16, ns=2, g=8, 2)
+    ], dtype=np.int64)
+    # Counts are per-rank (sharded dims get rank-local shape);
+    # bpr = nb//(p*q) = 4, ns/spin dims unsharded so count = global.
+    k_counts_u = np.array([
+        [bpr, ns, 6, 2],
+        [bpr, ns, 8, 2],
+        [bpr, ns, 7, 2],
+        [bpr, ns, 8, 2],
+    ], dtype=np.int64)
+    n_u = k_offsets_u.shape[0]
+    per_rank_max = (nb // (p * q), ns, 8, 2)   # ngkmax-equivalent = 8
+
+    fused_u = read_kchunk_union_sharded(
+        fh_r, "coeffs",
+        n_kchunk=n_u,
+        file_global_shape=(nb, ns, ng, 2),
+        per_rank_file_shape=per_rank_max,
+        kchunk_axis=2,   # n_u axis goes between ns (dim 1) and G (dim 2)
+        dtype=np.float64,
+        mesh=mesh,
+        file_partition_spec=P(("x", "y"), None, None, None),
+    )
+    out_u = fused_u(jnp.asarray(k_offsets_u), jnp.asarray(k_counts_u))
+    jax.block_until_ready(out_u)
+    # Output shape per rank: (bpr, ns, n_u, ngkmax=8, 2).  Transpose to
+    # (n_u, bpr, ns, 8, 2) for the per-k comparison.
+    _log(f"UNION read OK: out.shape={out_u.shape}  (expected {(nb, ns, n_u, 8, 2)})")
+
+    local_err_u = 0
+    for sh in out_u.addressable_shards:
+        local_np = np.asarray(sh.data)  # (bpr, ns, n_u, 8, 2)
+        # Band slice is axis 0 (the sharded one) — index 0 of sh.index.
+        row_slice = sh.index[0]
+        row_start = row_slice.start if row_slice.start else 0
+        # Permute to k-leading for easier per-k check.
+        local_k_leading = np.transpose(local_np, (2, 0, 1, 3, 4))  # (n_u, bpr, ns, 8, 2)
+        for k_idx in range(n_u):
+            off_k = int(k_offsets_u[k_idx, 2])
+            cnt_k = int(k_counts_u[k_idx, 2])
+            ref = A_host[row_start:row_start + bpr, :, off_k:off_k + cnt_k, :]
+            got = local_k_leading[k_idx, :, :, :cnt_k, :]
+            pad = local_k_leading[k_idx, :, :, cnt_k:, :]
+            if not np.array_equal(got, ref):
+                err = float(np.max(np.abs(got - ref)))
+                print(f"[rank {rank}] union k={k_idx} FAIL err={err}", flush=True)
+                local_err_u = 1
+            if np.any(pad != 0):
+                print(f"[rank {rank}] union k={k_idx} non-zero padding", flush=True)
+                local_err_u = 1
+
     close_file(fh_r)
 
-    flag_local = jnp.asarray(np.int64(local_err))
+    flag_local = jnp.asarray(np.int64(local_err + local_err_u))
     flags_all = np.asarray(
         multihost_utils.process_allgather(flag_local, tiled=False))
     n_fail = int(np.sum(flags_all))

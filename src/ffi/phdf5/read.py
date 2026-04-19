@@ -24,10 +24,12 @@ from .context import validate_mesh_2d
 __all__ = [
     "read_sharded_slab", "ffi_read_call",
     "ffi_read_kchunk_call", "read_kchunk_sharded",
+    "ffi_read_kchunk_union_call", "read_kchunk_union_sharded",
 ]
 
 _FFI_TARGET = "lorrax_phdf5_read"
 _FFI_TARGET_KCHUNK = "lorrax_phdf5_read_kchunk"
+_FFI_TARGET_KCHUNK_UNION = "lorrax_phdf5_read_kchunk_union"
 
 
 def ffi_read_call(
@@ -235,6 +237,120 @@ def read_kchunk_sharded(
     sm_bare = shard_map(
         _per_rank, mesh=mesh,
         in_specs=(P(),), out_specs=full_partition_spec,
+        check_rep=False,
+    )
+    return jax.jit(sm_bare)
+
+
+# ---------------------------------------------------------------------------
+#  k-chunk UNION reader — ONE H5Dread of a compound H5S_SELECT_OR
+#  selection over n_kchunk pairwise-disjoint per-k rectangles.  Caller
+#  must supply per-k (offset, count) arrays; the file-side rectangles
+#  must not overlap (otherwise the union's unique-element count < the
+#  memspace count and H5Dread rejects the selection).
+#
+#  Output buffer is ``(n_kchunk, *per_rank_max_file_shape)`` — per-k
+#  slabs pad up to per_rank_max_file_shape on the trailing dims; unused
+#  padding cells stay at zero (the handler memsets the pinned buffer
+#  before reading).  For WFN.h5 this means count[k] = (bpr, ns, ngk[k], 2)
+#  (variable on the ngk axis) and per_rank_max_file_shape
+#  = (bpr, ns, ngkmax, 2).
+# ---------------------------------------------------------------------------
+def ffi_read_kchunk_union_call(
+    out_struct: jax.ShapeDtypeStruct,
+    offset_base: jax.Array,       # (n_kchunk, N_file) int64
+    count_base: jax.Array,        # (n_kchunk, N_file) int64
+    *,
+    ctx_handle: int,
+    ds_id: int,
+    mesh_shape: Sequence[int],
+    axis_count_per_dim: Sequence[int],
+    axis_flat: Sequence[int],
+    n_kchunk: int,
+    kchunk_axis: int,
+) -> jax.Array:
+    return jax.ffi.ffi_call(_FFI_TARGET_KCHUNK_UNION, out_struct)(
+        offset_base,
+        count_base,
+        ctx_handle=int(ctx_handle),
+        ds_id=int(ds_id),
+        mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
+        axis_count_per_dim=np.asarray(axis_count_per_dim, dtype=np.int64),
+        axis_flat=np.asarray(axis_flat, dtype=np.int64),
+        n_kchunk=int(n_kchunk),
+        kchunk_axis=int(kchunk_axis),
+    )
+
+
+def read_kchunk_union_sharded(
+    fh: int,
+    ds_name: str,
+    *,
+    n_kchunk: int,
+    file_global_shape: Sequence[int],
+    per_rank_file_shape: Sequence[int],
+    kchunk_axis: int,
+    dtype,
+    mesh: Mesh,
+    file_partition_spec: P,
+):
+    """Build a jitted ``f(offset_base, count_base)`` callable that issues
+    ONE compound-hyperslab H5Dread for n_kchunk per-k windows.
+
+    Constraint: the per-k file rectangles must be pairwise disjoint
+    AND sorted in ascending row-major file order.  Why: HDF5 iterates
+    ``H5S_SELECT_OR`` unions row-major over the whole dataspace, so the
+    memspace selection (which the handler builds at axis
+    ``kchunk_axis`` with per-k stripes at positions ``[0, 1, …, n-1]``)
+    must iterate in the same order.  Place ``kchunk_axis`` right before
+    the per-k variable file dim (the G axis for WFN) so that fixing the
+    leading dims, the memspace iterates k=0's slab first (matching the
+    file visiting g-range[k=0] first), then k=1's, etc.
+
+    If the caller's physical k-indices aren't in ascending-file-offset
+    order, they should sort before calling and permute the output k
+    axis back afterward — both cheap operations.
+    """
+    from file_io._slab_io_ffi import _sharding_to_axis_info
+
+    p = int(mesh.shape["x"]); q = int(mesh.shape["y"])
+    n_file = len(per_rank_file_shape)
+    if len(file_global_shape) != n_file:
+        raise ValueError("file_global_shape ndim mismatch")
+    if not (0 <= kchunk_axis <= n_file):
+        raise ValueError(f"kchunk_axis {kchunk_axis} must be in [0, {n_file}]")
+
+    from jax.sharding import NamedSharding
+    file_sharding = NamedSharding(mesh, file_partition_spec)
+    axis_count_per_dim, axis_flat = _sharding_to_axis_info(file_sharding, n_file)
+
+    get_lib()
+    ds_id = ffi_loader.phdf5_open_dataset_ro(fh, ds_name)
+
+    # Per-rank output shape: insert n_kchunk at position kchunk_axis.
+    prs = list(int(s) for s in per_rank_file_shape)
+    out_local_shape = tuple(prs[:kchunk_axis] + [n_kchunk] + prs[kchunk_axis:])
+    out_struct = jax.ShapeDtypeStruct(out_local_shape, jnp.dtype(dtype))
+
+    # Full partition spec: file_partition_spec with None inserted at kchunk_axis.
+    fps = list(file_partition_spec)
+    full_partition_spec = P(*(fps[:kchunk_axis] + [None] + fps[kchunk_axis:]))
+
+    def _per_rank(offset_base_local, count_base_local):
+        return ffi_read_kchunk_union_call(
+            out_struct,
+            offset_base_local, count_base_local,
+            ctx_handle=int(fh),
+            ds_id=int(ds_id),
+            mesh_shape=(p, q),
+            axis_count_per_dim=axis_count_per_dim,
+            axis_flat=axis_flat,
+            n_kchunk=int(n_kchunk),
+            kchunk_axis=int(kchunk_axis),
+        )
+    sm_bare = shard_map(
+        _per_rank, mesh=mesh,
+        in_specs=(P(), P()), out_specs=full_partition_spec,
         check_rep=False,
     )
     return jax.jit(sm_bare)

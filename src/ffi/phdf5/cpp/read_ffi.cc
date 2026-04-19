@@ -501,13 +501,332 @@ static ffi::Error ReadKchunkDispatch(
     }
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+//  Read-kchunk-UNION handler — ONE H5Dread that pulls n_kchunk
+//  non-overlapping hyperslabs of a dataset via H5S_SELECT_OR compound
+//  selection.  Output buffer is (n_kchunk, *per_rank_max_shape); for each
+//  k, the FIRST count[k][d] cells of dim d in that k's output slot get
+//  filled from file offset offset[k][d], and the remaining padding cells
+//  stay at their initial zero.
+//
+//  Caller must guarantee the per-k (offset, count) file slabs are
+//  pairwise disjoint; otherwise HDF5's union-of-hyperslabs deduplicates
+//  and the element counts mismatch the memspace.  For WFN.h5-style
+//  data, passing count[k] = (bpr, ns, ngk[k], 2) (the *actual* ngk, not
+//  ngkmax) gives disjoint per-k slabs even when ngk varies.
+// ────────────────────────────────────────────────────────────────────────────
+
+template <typename T>
+static ffi::Error ReadKchunkUnionImpl(
+    cudaStream_t xla_stream,
+    PhdfCtx* ctx,
+    T* d_dst,
+    const std::vector<std::vector<hsize_t>>& file_offsets,    // (n_kchunk, N_file)
+    const std::vector<std::vector<hsize_t>>& file_counts,     // (n_kchunk, N_file)
+    const std::vector<hsize_t>& per_rank_max_shape,            // (N_file,)
+    int kchunk_axis,                                            // position of k axis in output
+    hid_t ds_id)
+{
+    const int n_kchunk = (int)file_offsets.size();
+    const int N_file = (int)per_rank_max_shape.size();
+    const bool do_time = std::getenv("LORRAX_PHDF5_TIME") != nullptr;
+    auto now = []() { return std::chrono::steady_clock::now(); };
+    auto ms = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    auto t0 = now();
+
+    // Output buffer size: n_kchunk * prod(per_rank_max_shape).
+    size_t per_k_elts = 1;
+    for (auto c : per_rank_max_shape) per_k_elts *= (size_t)c;
+    const size_t total_elts = per_k_elts * (size_t)n_kchunk;
+    const size_t bytes = total_elts * sizeof(T);
+
+    if (!ensure_pinned(ctx, bytes)) {
+        std::ostringstream os;
+        os << "phdf5 read_kchunk_union: cudaMallocHost(" << bytes << ") failed";
+        return ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str());
+    }
+    // Zero the pinned buffer so padding cells stay at exact zero.
+    std::memset(ctx->pinned_buf, 0, bytes);
+    auto t_pin = now();
+
+    hid_t native_type = dt::h5_native_type<T>();
+    hid_t dxpl = ctx->use_collective ? ctx->dxpl_coll : ctx->dxpl_indep;
+
+    // Memspace shape: per_rank_max_shape with n_kchunk inserted at
+    // ``kchunk_axis`` position.  Placement matters for correct
+    // row-major iteration matching the filespace union.
+    const int N_out = N_file + 1;
+    std::vector<hsize_t> mem_shape(N_out);
+    {
+        int fi = 0;
+        for (int d = 0; d < N_out; ++d) {
+            if (d == kchunk_axis) {
+                mem_shape[d] = (hsize_t)n_kchunk;
+            } else {
+                mem_shape[d] = per_rank_max_shape[fi++];
+            }
+        }
+    }
+    hid_t memspace = H5Screate_simple(N_out, mem_shape.data(), nullptr);
+    if (memspace < 0) {
+        return ffi::Error(ffi::ErrorCode::kInternal,
+            "phdf5 read_kchunk_union: H5Screate_simple(memspace) failed");
+    }
+    hid_t filespace = H5Dget_space(ds_id);
+    if (filespace < 0) {
+        H5Sclose(memspace);
+        return ffi::Error(ffi::ErrorCode::kInternal,
+            "phdf5 read_kchunk_union: H5Dget_space failed");
+    }
+    // Clear initial selections on both.
+    H5Sselect_none(filespace);
+    H5Sselect_none(memspace);
+    auto t_spaces = now();
+
+    // Build the compound selection.
+    std::vector<hsize_t> mem_off(N_out, 0);
+    std::vector<hsize_t> mem_count(N_out);
+    for (int k = 0; k < n_kchunk; ++k) {
+        if (H5Sselect_hyperslab(filespace, H5S_SELECT_OR,
+                                 file_offsets[k].data(), nullptr,
+                                 file_counts[k].data(), nullptr) < 0) {
+            H5Sclose(memspace); H5Sclose(filespace);
+            std::ostringstream os;
+            os << "phdf5 read_kchunk_union: file H5Sselect_hyperslab(OR) "
+               << "failed at k=" << k;
+            return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+        }
+        // Memspace: n_kchunk axis gets a length-1 slab at position k;
+        // other dims get file_counts[k][corresponding_file_dim].
+        int fi = 0;
+        for (int d = 0; d < N_out; ++d) {
+            if (d == kchunk_axis) {
+                mem_off[d] = (hsize_t)k;
+                mem_count[d] = 1;
+            } else {
+                mem_off[d] = 0;
+                mem_count[d] = file_counts[k][fi++];
+            }
+        }
+        if (H5Sselect_hyperslab(memspace, H5S_SELECT_OR,
+                                 mem_off.data(), nullptr,
+                                 mem_count.data(), nullptr) < 0) {
+            H5Sclose(memspace); H5Sclose(filespace);
+            std::ostringstream os;
+            os << "phdf5 read_kchunk_union: mem H5Sselect_hyperslab(OR) "
+               << "failed at k=" << k;
+            return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+        }
+    }
+    auto t_select = now();
+
+    hssize_t npts_file = H5Sget_select_npoints(filespace);
+    hssize_t npts_mem  = H5Sget_select_npoints(memspace);
+    if (npts_file != npts_mem) {
+        H5Sclose(memspace); H5Sclose(filespace);
+        std::ostringstream os;
+        os << "phdf5 read_kchunk_union: selection size mismatch — "
+           << "filespace=" << npts_file << " memspace=" << npts_mem
+           << " (overlapping per-k slabs?  Caller must supply disjoint "
+           << "file rectangles.)";
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+    }
+
+    herr_t st = H5Dread(ds_id, native_type, memspace, filespace, dxpl,
+                        ctx->pinned_buf);
+    auto t_read = now();
+    H5Sclose(memspace);
+    H5Sclose(filespace);
+    if (st < 0) {
+        return ffi::Error(ffi::ErrorCode::kInternal,
+                          "phdf5 read_kchunk_union: H5Dread failed");
+    }
+
+    LORRAX_CUDA_CHECK(cudaMemcpyAsync(d_dst, ctx->pinned_buf, bytes,
+                                      cudaMemcpyHostToDevice, ctx->stream));
+    LORRAX_CUDA_CHECK(cudaEventRecord(ctx->h2d_event, ctx->stream));
+    LORRAX_CUDA_CHECK(cudaStreamWaitEvent(xla_stream, ctx->h2d_event, 0));
+    auto t_h2d = now();
+
+    if (do_time && ctx->rank == 0) {
+        std::fprintf(stderr,
+            "[phdf5 kchunk-union r0] n_k=%d bytes/rank=%zu  "
+            "pin+zero=%.2f  spaces=%.2f  select=%.2f  read=%.2f  "
+            "h2d_setup=%.2f  total=%.2f (ms)  [selected_elts=%lld]\n",
+            n_kchunk, bytes,
+            ms(t0, t_pin), ms(t_pin, t_spaces),
+            ms(t_spaces, t_select), ms(t_select, t_read),
+            ms(t_read, t_h2d), ms(t0, t_h2d),
+            (long long)npts_file);
+    }
+    return ffi::Error::Success();
+}
+
+static ffi::Error ReadKchunkUnionDispatch(
+    cudaStream_t stream,
+    ffi::Buffer<ffi::DataType::S64> offset_buf,   // (n_kchunk, N_file)
+    ffi::Buffer<ffi::DataType::S64> count_buf,    // (n_kchunk, N_file)
+    ffi::Result<ffi::AnyBuffer> A_out,
+    int64_t ctx_handle,
+    int64_t ds_id,
+    ffi::Span<const int64_t> mesh_shape,
+    ffi::Span<const int64_t> axis_count_per_dim,
+    ffi::Span<const int64_t> axis_flat,
+    int64_t n_kchunk_attr,
+    int64_t kchunk_axis_attr)  // position of the n_kchunk axis in A_out
+{
+    auto* ctx = reinterpret_cast<PhdfCtx*>(ctx_handle);
+    if (!ctx) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "phdf5 read_kchunk_union: ctx_handle is null");
+    }
+
+    const auto dims = A_out->dimensions();
+    if (dims.size() < 2) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+            "phdf5 read_kchunk_union: output must have >= 2 dims");
+    }
+    const size_t N_out = dims.size();
+    const size_t N_file = N_out - 1;
+    if (kchunk_axis_attr < 0 || (size_t)kchunk_axis_attr >= N_out) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+            "phdf5 read_kchunk_union: kchunk_axis out of range");
+    }
+    const int kax = (int)kchunk_axis_attr;
+    const int64_t n_kchunk = (int64_t)dims[kax];
+    if (n_kchunk != n_kchunk_attr) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+            "phdf5 read_kchunk_union: dims[kchunk_axis] mismatch vs n_kchunk attr");
+    }
+    if (axis_count_per_dim.size() != N_file) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+            "phdf5 read_kchunk_union: axis_count_per_dim / N_file mismatch");
+    }
+    const auto obd = offset_buf.dimensions();
+    const auto cbd = count_buf.dimensions();
+    if (obd.size() != 2 || (int64_t)obd[0] != n_kchunk || (size_t)obd[1] != N_file
+        || cbd.size() != 2 || (int64_t)cbd[0] != n_kchunk || (size_t)cbd[1] != N_file) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+            "phdf5 read_kchunk_union: offset_buf / count_buf shape mismatch");
+    }
+
+    // D2H both small buffers.
+    std::vector<int64_t> off_host((size_t)n_kchunk * N_file);
+    std::vector<int64_t> cnt_host((size_t)n_kchunk * N_file);
+    cudaError_t ce;
+    ce = cudaMemcpy(off_host.data(), offset_buf.untyped_data(),
+                    off_host.size() * sizeof(int64_t), cudaMemcpyDeviceToHost);
+    if (ce != cudaSuccess) {
+        return ffi::Error(ffi::ErrorCode::kInternal,
+            std::string("phdf5 read_kchunk_union: D2H offset: ") +
+            cudaGetErrorString(ce));
+    }
+    ce = cudaMemcpy(cnt_host.data(), count_buf.untyped_data(),
+                    cnt_host.size() * sizeof(int64_t), cudaMemcpyDeviceToHost);
+    if (ce != cudaSuccess) {
+        return ffi::Error(ffi::ErrorCode::kInternal,
+            std::string("phdf5 read_kchunk_union: D2H count: ") +
+            cudaGetErrorString(ce));
+    }
+
+    // Per-rank coord shift on sharded dims (same encoding as single-
+    // offset handler).  Applied to both offset and count uniformly:
+    // offset[d] += rank_coord[d] * per_rank_max_shape[d]; count is
+    // per-k user value (bounded above by per_rank_max_shape[d]).
+    std::vector<int64_t> coord = unravel_rank(ctx->rank, mesh_shape);
+    std::vector<int64_t> rank_coord_per_dim(N_file, 0);
+    {
+        size_t flat_idx = 0;
+        for (size_t d = 0; d < N_file; ++d) {
+            int64_t na = axis_count_per_dim[d];
+            int64_t rc = 0, stride = 1;
+            for (int64_t k = na - 1; k >= 0; --k) {
+                int64_t ax = axis_flat[flat_idx + k];
+                if (ax < 0 || (size_t)ax >= mesh_shape.size()) {
+                    return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                        "phdf5 read_kchunk_union: bad axis");
+                }
+                rc += coord[ax] * stride;
+                stride *= mesh_shape[ax];
+            }
+            rank_coord_per_dim[d] = rc;
+            flat_idx += (size_t)na;
+        }
+    }
+
+    // per_rank_max_shape: dims with kchunk axis removed.
+    std::vector<hsize_t> per_rank_max(N_file);
+    {
+        size_t di = 0;
+        for (size_t d = 0; d < N_out; ++d) {
+            if ((int)d == kax) continue;
+            per_rank_max[di++] = (hsize_t)dims[d];
+        }
+    }
+
+    // Build the per-k file offset/count vectors, with per-rank shard shift.
+    std::vector<std::vector<hsize_t>> offsets(
+        (size_t)n_kchunk, std::vector<hsize_t>(N_file, 0));
+    std::vector<std::vector<hsize_t>> counts(
+        (size_t)n_kchunk, std::vector<hsize_t>(N_file, 0));
+    for (int64_t k = 0; k < n_kchunk; ++k) {
+        for (size_t d = 0; d < N_file; ++d) {
+            int64_t off = off_host[(size_t)k * N_file + d]
+                        + rank_coord_per_dim[d] * (int64_t)per_rank_max[d];
+            int64_t cnt = cnt_host[(size_t)k * N_file + d];
+            if (off < 0 || cnt < 0 || cnt > (int64_t)per_rank_max[d]) {
+                std::ostringstream os;
+                os << "phdf5 read_kchunk_union: bad (off,cnt) at k=" << k
+                   << " d=" << d << " off=" << off << " cnt=" << cnt
+                   << " max=" << per_rank_max[d];
+                return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+            }
+            offsets[(size_t)k][d] = (hsize_t)off;
+            counts[(size_t)k][d] = (hsize_t)cnt;
+        }
+    }
+
+    const auto dtype = A_out->element_type();
+    switch (dtype) {
+        case ffi::DataType::F32:
+            return ReadKchunkUnionImpl<float>(stream, ctx,
+                static_cast<float*>(A_out->untyped_data()),
+                offsets, counts, per_rank_max, kax, (hid_t)ds_id);
+        case ffi::DataType::F64:
+            return ReadKchunkUnionImpl<double>(stream, ctx,
+                static_cast<double*>(A_out->untyped_data()),
+                offsets, counts, per_rank_max, kax, (hid_t)ds_id);
+        case ffi::DataType::S32:
+            return ReadKchunkUnionImpl<int32_t>(stream, ctx,
+                static_cast<int32_t*>(A_out->untyped_data()),
+                offsets, counts, per_rank_max, kax, (hid_t)ds_id);
+        case ffi::DataType::S64:
+            return ReadKchunkUnionImpl<int64_t>(stream, ctx,
+                static_cast<int64_t*>(A_out->untyped_data()),
+                offsets, counts, per_rank_max, kax, (hid_t)ds_id);
+        case ffi::DataType::C64:
+            return ReadKchunkUnionImpl<std::complex<float>>(stream, ctx,
+                static_cast<std::complex<float>*>(A_out->untyped_data()),
+                offsets, counts, per_rank_max, kax, (hid_t)ds_id);
+        case ffi::DataType::C128:
+            return ReadKchunkUnionImpl<std::complex<double>>(stream, ctx,
+                static_cast<std::complex<double>*>(A_out->untyped_data()),
+                offsets, counts, per_rank_max, kax, (hid_t)ds_id);
+        default:
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                "phdf5 read_kchunk_union: unsupported dtype");
+    }
+}
+
 }  // namespace lorrax_ffi::phdf5
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     PhdfReadFfi, lorrax_ffi::phdf5::ReadDispatch,
     xla::ffi::Ffi::Bind()
         .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // offset_base
+        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()
         .Ret<xla::ffi::AnyBuffer>()
         .Attr<int64_t>("ctx_handle")
         .Attr<int64_t>("ds_id")
@@ -527,3 +846,18 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<xla::ffi::Span<const int64_t>>("axis_count_per_dim")
         .Attr<xla::ffi::Span<const int64_t>>("axis_flat")
         .Attr<int64_t>("n_kchunk"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    PhdfReadKchunkUnionFfi, lorrax_ffi::phdf5::ReadKchunkUnionDispatch,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // offset_buf (n_kchunk, N_file)
+        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // count_buf  (n_kchunk, N_file)
+        .Ret<xla::ffi::AnyBuffer>()
+        .Attr<int64_t>("ctx_handle")
+        .Attr<int64_t>("ds_id")
+        .Attr<xla::ffi::Span<const int64_t>>("mesh_shape")
+        .Attr<xla::ffi::Span<const int64_t>>("axis_count_per_dim")
+        .Attr<xla::ffi::Span<const int64_t>>("axis_flat")
+        .Attr<int64_t>("n_kchunk")
+        .Attr<int64_t>("kchunk_axis"));
