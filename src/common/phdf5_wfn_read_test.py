@@ -86,7 +86,9 @@ from common.symmetry_maps import SymMaps
 from common.load_wfns import read_Gvecs_to_devices
 from common.fft_helpers import make_jittable_local_ifftn_3d
 from file_io.slab_io import SlabIO
-from ffi.phdf5.read import read_kchunk_sharded, ffi_read_call
+from ffi.phdf5.read import (
+    read_kchunk_sharded, read_kchunk_union_sharded, ffi_read_call,
+)
 from ffi.common import ffi_loader
 
 
@@ -341,6 +343,87 @@ def _make_bigread_scatter_kernel(
     return jitted
 
 
+def _build_within_k_inv(wfn: WFNReader, ngkmax: int) -> np.ndarray:
+    """Per-k inverse index ``inv[k, nx, ny, nz]`` — position within k's
+    ngkmax-wide slab where the coefficient at FFT cell (nx, ny, nz)
+    lives, or ``ngkmax`` (sentinel) if this cell has no coefficient.
+
+    Intended for the union-read path: the output is
+    ``(bpr, ns, nk, ngkmax, 2)`` and for each (k, nx, ny, nz) we gather
+    from the ngkmax-wide slab dedicated to that k (zero-padded past
+    ngk[k]).  No need to know file offsets here.
+    """
+    nk = int(wfn.nkpts)
+    ngk = np.asarray(wfn.ngk, dtype=np.int64)
+    kpt_starts = np.asarray(wfn.kpt_starts, dtype=np.int64)
+    fft_grid = np.asarray(wfn.fft_grid, dtype=np.int64)
+    nx, ny, nz = (int(x) for x in fft_grid)
+    gvecs_all = np.asarray(wfn.gvecs, dtype=np.int32)
+
+    inv = np.full((nk, nx, ny, nz), ngkmax, dtype=np.int32)
+    for k in range(nk):
+        start = int(kpt_starts[k])
+        n = int(ngk[k])
+        gv = gvecs_all[start:start + n]
+        wrapped = gv % fft_grid[None, :]
+        for g_idx, (gx, gy, gz) in enumerate(wrapped):
+            inv[k, int(gx), int(gy), int(gz)] = int(g_idx)
+    return inv
+
+
+def _make_union_gather_kernel(
+    mesh: Mesh, nk: int, ngkmax: int, nb: int, nspinor: int,
+    fft_grid: tuple[int, int, int],
+):
+    """Gather kernel for the UNION-read output.
+
+    Input ``big`` shape: ``(bpr, ns, nk, ngkmax, 2)`` — per-k slabs with
+    G axis zero-padded past ngk[k].  Input ``inv`` shape:
+    ``(nk, nx, ny, nz)`` — per-k g-local index or ngkmax sentinel.
+
+    Gather: for each (b, s, k, x, y, z),
+      out[b, s, k, x, y, z] = cnk_padded[b, s, k, inv[k, x, y, z]]
+    where cnk_padded has one extra zero row at index ngkmax.  Implement
+    as a single ``jnp.take`` along axis 2 of the flattened
+    ``(bpr, ns, nk*(ngkmax+1))`` using ``flat_idx[k,x,y,z] =
+    k*(ngkmax+1) + inv[k,x,y,z]``.
+    """
+    nx, ny, nz = (int(x) for x in fft_grid)
+    p = int(mesh.shape["x"])
+    q = int(mesh.shape["y"])
+    world = p * q
+    bpr = nb // world
+    trace_counter = [0]
+
+    def _per_rank(big, inv):
+        trace_counter[0] += 1
+        # big: (bpr, ns, nk, ngkmax, 2) f64
+        # Complex conversion, then zero-pad an extra slot at ngkmax.
+        cnk = big[..., 0] + 1j * big[..., 1]               # (bpr, ns, nk, ngkmax)
+        zero_pad = jnp.zeros((bpr, nspinor, nk, 1), dtype=jnp.complex128)
+        cnk_padded = jnp.concatenate([cnk, zero_pad], axis=-1)  # (bpr, ns, nk, ngkmax+1)
+        # Flatten (nk, ngkmax+1) → nk*(ngkmax+1) for a 1-D gather.
+        cnk_flat = cnk_padded.reshape(bpr, nspinor, nk * (ngkmax + 1))
+        # Flat index combining (k, g_local).
+        flat_idx = (jnp.arange(nk, dtype=jnp.int32)[:, None, None, None]
+                    * (ngkmax + 1)) + inv
+        # Gather → (bpr, ns, nk, nx, ny, nz)
+        gathered = jnp.take(cnk_flat, flat_idx, axis=2)
+        # Move nk to front: (nk, bpr, ns, nx, ny, nz)
+        return jnp.transpose(gathered, (2, 0, 1, 3, 4, 5))
+
+    sm_bare = shard_map(
+        _per_rank, mesh=mesh,
+        in_specs=(P(("x", "y"), None, None, None, None),   # big (bpr-sharded)
+                  P(None, None, None, None)),                # inv (replicated)
+        out_specs=P(None, ("x", "y"), None, None, None, None),
+        check_rep=False,
+    )
+    jitted = jax.jit(sm_bare)
+    jitted._trace_counter = trace_counter  # type: ignore[attr-defined]
+    return jitted
+
+
 def _make_gather_kernel(
     mesh: Mesh, nk: int, ngktot: int, ngkmax: int, nb: int, nspinor: int,
     fft_grid: tuple[int, int, int],
@@ -481,11 +564,32 @@ def run_ffi_path(
             f"band count {nb} not divisible by world={world}; pick "
             f"a band_range multiple of world for this test.")
 
-    # Host prep: global gather index (nk, nx, ny, nz) int32.
-    global_idx_np = _build_global_gather_idx(wfn)
-    global_idx_dev = jax.device_put(
-        jnp.asarray(global_idx_np),
+    # Host prep: per-k within-slab inverse index (nk, nx, ny, nz) int32,
+    # plus per-k (offset, count) tables sorted ascending by file offset
+    # (the union handler requires sorted).
+    inv_within_np = _build_within_k_inv(wfn, ngkmax)
+    inv_within_dev = jax.device_put(
+        jnp.asarray(inv_within_np),
         NamedSharding(mesh, P(None, None, None, None)))
+
+    kpt_starts_np = np.asarray(wfn.kpt_starts, dtype=np.int64)
+    ngk_np = np.asarray(wfn.ngk, dtype=np.int64)
+    # MoS2 nosym: kpt_starts already ascending (k-space-parallel file).
+    # For symmetric files with a sparse / out-of-order k subset, the
+    # caller would sort here and permute output k afterward; skipped
+    # for this test since nosym is already sorted.
+    offsets_u_np = np.stack([
+        np.array([b_lo, 0, int(kpt_starts_np[k]), 0], dtype=np.int64)
+        for k in range(nk)
+    ], axis=0)
+    counts_u_np = np.stack([
+        np.array([bands_per_shard, nspinor, int(ngk_np[k]), 2], dtype=np.int64)
+        for k in range(nk)
+    ], axis=0)
+    offsets_u_dev = jax.device_put(jnp.asarray(offsets_u_np),
+                                   NamedSharding(mesh, P(None, None)))
+    counts_u_dev = jax.device_put(jnp.asarray(counts_u_np),
+                                  NamedSharding(mesh, P(None, None)))
 
     # iFFT.
     ifftn = make_jittable_local_ifftn_3d(
@@ -503,30 +607,30 @@ def run_ffi_path(
     stage_times["open"] = t_open
 
     try:
-        # One big FFI read (1 H5Dread of full G axis) + gather kernel.
+        # Union kchunk read: ONE H5Dread pulls per-k ngk[k]-sized slabs
+        # via compound H5S_SELECT_OR, placing each k's data in its own
+        # stripe of a (bpr, ns, nk, ngkmax, 2) per-rank buffer.
         ctx_handle = io._backend.fh
         ngktot = int(wfn.kpt_starts[-1] + wfn.ngk[-1])
-        ffi_loader.get_lib()
-        ds_id = ffi_loader.phdf5_open_dataset_ro(ctx_handle, "wfns/coeffs")
-        read_j = _make_bigread_kernel(
-            mesh, ngktot, nb_padded, nspinor,
-            ctx_handle=ctx_handle, ds_id=ds_id,
+
+        union_read = read_kchunk_union_sharded(
+            ctx_handle, "wfns/coeffs",
+            n_kchunk=nk,
+            file_global_shape=(int(wfn.nbands), nspinor, ngktot, 2),
+            per_rank_file_shape=(bands_per_shard, nspinor, ngkmax, 2),
+            kchunk_axis=2,                             # between ns and G
+            dtype=np.float64, mesh=mesh,
+            file_partition_spec=P(("x", "y"), None, None, None),
         )
-        gather_j = _make_gather_kernel(
-            mesh, nk, ngktot, ngkmax, nb_padded, nspinor, fft_grid)
+        gather_j = _make_union_gather_kernel(
+            mesh, nk, ngkmax, nb_padded, nspinor, fft_grid)
 
-        offset_arr = jnp.asarray((b_lo, 0, 0, 0), dtype=jnp.int64)
-
-        # ---- stage: read + gather (with internal split timing) ----
-        # No explicit cross-rank barriers: the FFI handler's internal
-        # H5Dread is self-synchronizing, and the gather is purely local
-        # per-rank (no collectives in its HLO).  block_until_ready on
-        # the final output is the only sync we need.
+        # ---- stage: read + gather (internal split timing) ----
         t_rs0 = time.perf_counter()
-        big = read_j(offset_arr)
+        big = union_read(offsets_u_dev, counts_u_dev)    # (bpr, ns, nk, ngkmax, 2)
         jax.block_until_ready(big)
         t_r1 = time.perf_counter()
-        psi_G_global = gather_j(big, global_idx_dev)
+        psi_G_global = gather_j(big, inv_within_dev)
         jax.block_until_ready(psi_G_global)
         t_r2 = time.perf_counter()
         stage_times["read_scatter"] = t_r2 - t_rs0
