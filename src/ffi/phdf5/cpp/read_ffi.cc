@@ -18,9 +18,11 @@
 // on non-rank-0 processes under JAX's cuda_async allocator (measured
 // 2026-04-18 on writes; same mechanism applies here).
 
+#include <chrono>
 #include <complex>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <string>
@@ -261,6 +263,13 @@ static ffi::Error ReadKchunkImpl(
 {
     const int n_kchunk = (int)offsets.size();
     const int N_file = (int)count.size();
+    // Diagnostic timing (LORRAX_PHDF5_TIME=1 to enable per-phase prints).
+    const bool do_time = std::getenv("LORRAX_PHDF5_TIME") != nullptr;
+    auto now = []() { return std::chrono::steady_clock::now(); };
+    auto ms = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    auto t0 = now();
 
     size_t per_k_elts = 1;
     for (auto c : count) per_k_elts *= (size_t)c;
@@ -272,6 +281,7 @@ static ffi::Error ReadKchunkImpl(
         os << "phdf5 read_kchunk: cudaMallocHost(" << bytes << ") failed";
         return ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str());
     }
+    auto t_pin = now();
 
     hid_t native_type = dt::h5_native_type<T>();
     if (ds_id < 0 || H5Iis_valid(ds_id) <= 0) {
@@ -281,9 +291,6 @@ static ffi::Error ReadKchunkImpl(
 
     hid_t dxpl = ctx->use_collective ? ctx->dxpl_coll : ctx->dxpl_indep;
 
-    // Reuse one filespace handle across k's — cheaper than H5Dget_space
-    // per iteration.  H5Sselect_hyperslab(SET, ...) overwrites any prior
-    // selection, which is what we want per-k.
     hid_t filespace = H5Dget_space(ds_id);
     if (filespace < 0) {
         return ffi::Error(ffi::ErrorCode::kInternal,
@@ -295,8 +302,11 @@ static ffi::Error ReadKchunkImpl(
         return ffi::Error(ffi::ErrorCode::kInternal,
                           "phdf5 read_kchunk: H5Screate_simple(memspace) failed");
     }
+    auto t_spaces = now();
 
+    double t_select_total = 0.0, t_read_total = 0.0;
     for (int k = 0; k < n_kchunk; ++k) {
+        auto ta = now();
         if (H5Sselect_hyperslab(filespace, H5S_SELECT_SET,
                                  offsets[k].data(), nullptr,
                                  count.data(), nullptr) < 0) {
@@ -306,8 +316,12 @@ static ffi::Error ReadKchunkImpl(
             os << "phdf5 read_kchunk: H5Sselect_hyperslab failed at k=" << k;
             return ffi::Error(ffi::ErrorCode::kInternal, os.str());
         }
+        auto tb = now();
         T* k_buf = static_cast<T*>(ctx->pinned_buf) + (size_t)k * per_k_elts;
         herr_t st = H5Dread(ds_id, native_type, memspace, filespace, dxpl, k_buf);
+        auto tc = now();
+        t_select_total += ms(ta, tb);
+        t_read_total += ms(tb, tc);
         if (st < 0) {
             H5Sclose(memspace);
             H5Sclose(filespace);
@@ -318,12 +332,24 @@ static ffi::Error ReadKchunkImpl(
     }
     H5Sclose(memspace);
     H5Sclose(filespace);
+    auto t_reads = now();
 
-    // One H2D of the full packed buffer, then signal xla_stream.
     LORRAX_CUDA_CHECK(cudaMemcpyAsync(d_dst, ctx->pinned_buf, bytes,
                                       cudaMemcpyHostToDevice, ctx->stream));
     LORRAX_CUDA_CHECK(cudaEventRecord(ctx->h2d_event, ctx->stream));
     LORRAX_CUDA_CHECK(cudaStreamWaitEvent(xla_stream, ctx->h2d_event, 0));
+    auto t_h2d = now();
+
+    if (do_time && ctx->rank == 0) {
+        std::fprintf(stderr,
+            "[phdf5 kchunk r0] n_k=%d bytes/rank=%zu  "
+            "pin=%.2f  spaces=%.2f  select=%.2f  read=%.2f  "
+            "(read/k=%.2f)  h2d_setup=%.2f  total=%.2f (ms)\n",
+            n_kchunk, bytes,
+            ms(t0, t_pin), ms(t_pin, t_spaces),
+            t_select_total, t_read_total, t_read_total / n_kchunk,
+            ms(t_reads, t_h2d), ms(t0, t_h2d));
+    }
     return ffi::Error::Success();
 }
 

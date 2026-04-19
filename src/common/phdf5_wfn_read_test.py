@@ -86,6 +86,8 @@ from common.symmetry_maps import SymMaps
 from common.load_wfns import read_Gvecs_to_devices
 from common.fft_helpers import make_jittable_local_ifftn_3d
 from file_io.slab_io import SlabIO
+from ffi.phdf5.read import read_kchunk_sharded, ffi_read_call
+from ffi.common import ffi_loader
 
 
 # =========================================================================
@@ -155,6 +157,49 @@ def _assert_safe_corner_ok(wfn: WFNReader) -> None:
             f"{int(hits.sum())} WFN G-vectors — can't use as safe corner")
 
 
+def _build_inv_map(wfn: WFNReader, ngkmax: int) -> tuple[np.ndarray, np.ndarray]:
+    """Precompute inv[k, nx, ny, nz] = g_local_within_slab (or ngkmax
+    sentinel for unused FFT slots) + per-k slab_offsets.
+
+    The gather formulation: given the (bpr, ns, ngkmax, 2) slab read for
+    one k-point, the FFT-box cell ``psi[k, b, s, nx, ny, nz]`` is
+    ``cnk[b, s, inv[k, nx, ny, nz]]`` where cnk is the complex
+    conversion of the slab (padded with a zero at index ngkmax for the
+    "no valid G here" case).  One gather op per k.  Avoids the slow
+    ``.at[].set()`` scatter kernel entirely.
+    """
+    nk = int(wfn.nkpts)
+    ngk = np.asarray(wfn.ngk, dtype=np.int64)
+    kpt_starts = np.asarray(wfn.kpt_starts, dtype=np.int64)
+    ngktot = int(kpt_starts[-1] + ngk[-1]) if nk > 0 else 0
+    fft_grid = np.asarray(wfn.fft_grid, dtype=np.int64)
+    nx, ny, nz = (int(x) for x in fft_grid)
+    gvecs_all = np.asarray(wfn.gvecs, dtype=np.int32)  # (ngktot, 3)
+
+    slab_offsets = np.zeros(nk, dtype=np.int32)
+    inv = np.full((nk, nx, ny, nz), ngkmax, dtype=np.int32)
+
+    for k in range(nk):
+        # slab_start: the file offset for reading this k's ngkmax slab.
+        # If kpt_starts[k] + ngkmax overflows, backshift so the slab
+        # ends at ngktot; the valid rows then live at the end of the
+        # slab, positions [ngkmax - ngk[k], ngkmax).
+        if kpt_starts[k] + ngkmax <= ngktot:
+            slab_start = int(kpt_starts[k])
+            g_local_start = 0
+        else:
+            slab_start = int(ngktot - ngkmax)
+            g_local_start = int(ngkmax - ngk[k])
+        slab_offsets[k] = slab_start
+
+        # Map each of this k's valid G-vectors to its (nx,ny,nz) FFT slot.
+        gv = gvecs_all[int(kpt_starts[k]):int(kpt_starts[k]) + int(ngk[k])]
+        wrapped = gv % fft_grid[None, :]
+        for g_idx, (gx, gy, gz) in enumerate(wrapped):
+            inv[k, int(gx), int(gy), int(gz)] = int(g_local_start + g_idx)
+    return inv, slab_offsets
+
+
 def _build_gvecs_slabs(wfn: WFNReader, ngkmax: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Precompute per-k fixed-width gvec slabs and mask-bounds on host.
 
@@ -214,57 +259,222 @@ def _build_gvecs_slabs(wfn: WFNReader, ngkmax: int) -> tuple[np.ndarray, np.ndar
     return gvecs_slabs, slab_offsets, valid_starts, valid_ends
 
 
-def _make_post_read_and_scatter(mesh: Mesh, ngkmax: int, nb: int, nspinor: int,
-                                fft_grid: tuple[int, int, int]):
-    """Jit a per-rank kernel: f64-real → complex + mask-to-zero + scatter
-    into the G-space FFT box shard.  One compile, per-k dispatch.
+def _make_bigread_kernel(
+    mesh: Mesh, ngktot: int, nb: int, nspinor: int,
+    ctx_handle: int, ds_id: int,
+):
+    """One FFI read → ``(nb, ns, ngktot, 2)`` sharded on band axis.
 
-    Inputs (per rank):
-      slab_local: (nb_shard, ns, ngkmax, 2) f64
-      gvec_slab : (ngkmax, 3) int32   [replicated]
-      valid_start, valid_end: scalar int32 jax arrays
+    Separating this from the scatter kernel gives XLA two small HLO
+    modules to optimize instead of one big one; combining them into the
+    same shard_map body dropped scatter throughput from ~200 ms
+    (standalone) to ~380 ms (combined) at MoS2 3×3 scale.
+    """
+    p = int(mesh.shape["x"])
+    q = int(mesh.shape["y"])
+    world = p * q
+    if nb % world != 0:
+        raise RuntimeError(f"band count {nb} not divisible by world={world}")
+    bpr = nb // world
 
-    Output (per rank):
-      psi_G_local: (nb_shard, ns, nx, ny, nz) c128
+    out_struct_shard = jax.ShapeDtypeStruct(
+        (bpr, nspinor, ngktot, 2), jnp.float64)
+    mesh_shape_attr = (p, q)
+    axis_count_per_dim = (2, 0, 0, 0)
+    axis_flat = (0, 1)
+
+    def _per_rank(offset_base):
+        return ffi_read_call(
+            out_struct_shard, offset_base,
+            ctx_handle=int(ctx_handle), ds_id=int(ds_id),
+            mesh_shape=mesh_shape_attr,
+            axis_count_per_dim=axis_count_per_dim,
+            axis_flat=axis_flat,
+        )
+    sm_bare = shard_map(
+        _per_rank, mesh=mesh,
+        in_specs=(P(),),
+        out_specs=P(("x", "y"), None, None, None),
+        check_rep=False,
+    )
+    return jax.jit(sm_bare)
+
+
+def _make_bigread_scatter_kernel(
+    mesh: Mesh, nk: int, ngktot: int, ngkmax: int, nb: int, nspinor: int,
+    fft_grid: tuple[int, int, int],
+):
+    """Scatter half (LEGACY — replaced by _make_gather_kernel).  Kept
+    around as a reference for the unique_indices=True scatter path."""
+    nx, ny, nz = (int(x) for x in fft_grid)
+    p = int(mesh.shape["x"])
+    q = int(mesh.shape["y"])
+    world = p * q
+    bpr = nb // world
+
+    corner_np = _fft_safe_corner(fft_grid)
+    trace_counter = [0]
+
+    def _per_rank(big, slab_offsets, gvec_stack, vs, ve):
+        trace_counter[0] += 1
+        idx = jnp.arange(ngkmax, dtype=jnp.int32)
+        corner = jnp.asarray(corner_np, dtype=jnp.int32)
+        n_rtot = nx * ny * nz
+
+        def body_one_k(slab_start, vs_k, ve_k, gvec_k):
+            slab = jax.lax.dynamic_slice(
+                big,
+                (jnp.int32(0), jnp.int32(0),
+                 slab_start.astype(jnp.int32), jnp.int32(0)),
+                (bpr, nspinor, ngkmax, 2))
+            mask = (idx >= vs_k) & (idx < ve_k)
+            cnk = slab[..., 0] + 1j * slab[..., 1]
+            gx = gvec_k[:, 0].astype(jnp.int32)
+            gy = gvec_k[:, 1].astype(jnp.int32)
+            gz = gvec_k[:, 2].astype(jnp.int32)
+            lin = gx * (ny * nz) + gy * nz + gz
+            lin = jnp.where(mask, lin, jnp.int32(-1))
+            psi_flat = jnp.zeros((bpr, nspinor, n_rtot), dtype=jnp.complex128)
+            psi_flat = psi_flat.at[:, :, lin].set(
+                cnk, mode="drop", unique_indices=True)
+            return psi_flat.reshape(bpr, nspinor, nx, ny, nz)
+
+        return jax.vmap(body_one_k, in_axes=(0, 0, 0, 0))(
+            slab_offsets, vs, ve, gvec_stack)
+
+    sm_bare = shard_map(
+        _per_rank, mesh=mesh,
+        in_specs=(P(("x", "y"), None, None, None),
+                  P(None), P(None, None, None), P(None), P(None)),
+        out_specs=P(None, ("x", "y"), None, None, None, None),
+        check_rep=False,
+    )
+    jitted = jax.jit(sm_bare)
+    jitted._trace_counter = trace_counter  # type: ignore[attr-defined]
+    return jitted
+
+
+def _make_gather_kernel(
+    mesh: Mesh, nk: int, ngktot: int, ngkmax: int, nb: int, nspinor: int,
+    fft_grid: tuple[int, int, int],
+):
+    """Gather half — the replacement for the slow scatter kernel.
+
+    Takes the ``(bpr, ns, ngktot, 2)`` big-read output + the precomputed
+    inverse index map ``inv[k, nx, ny, nz] → g_within_slab`` (with
+    ``ngkmax`` sentinel for empty FFT cells) + per-k slab offsets, and
+    produces the ``(nk, bpr, ns, nx, ny, nz)`` FFT-box via a single
+    ``jnp.take`` gather per k under vmap.
+
+    GPU gather is dramatically faster than scatter for this workload
+    (~800 ms → low ms for 9 k × 20 bpr × 2 ns × (nx*ny*nz=46k) cells at
+    MoS2 3×3 scale).  No masks needed at runtime: invalid-slot sentinel
+    in ``inv`` points into a zero-padded cnk so cells with no coefficient
+    pick up exact zero.
     """
     nx, ny, nz = (int(x) for x in fft_grid)
     p = int(mesh.shape["x"])
     q = int(mesh.shape["y"])
-    bands_per_shard = (nb + p * q - 1) // (p * q)
+    world = p * q
+    bpr = nb // world
 
-    band_spec = P(("x", "y"), None, None, None)     # slab_local
-    rep_spec  = P(None, None)                       # gvec_slab
-    sc_spec   = P()                                 # scalars
-    out_spec  = P(("x", "y"), None, None, None, None)  # psi_G_local
+    trace_counter = [0]
 
-    def _per_rank(slab_local, gvec_slab, valid_start, valid_end):
-        # slab_local is (bands_per_shard, ns, ngkmax, 2)
-        idx = jnp.arange(ngkmax, dtype=jnp.int32)
-        mask = (idx >= valid_start) & (idx < valid_end)          # (ngkmax,)
-        # complex cnk = (re + i*im) * mask
-        cnk = (slab_local[..., 0] + 1j * slab_local[..., 1]) * mask
-        # cnk: (bands_per_shard, ns, ngkmax) c128
+    def _per_rank(big, slab_offsets, inv):
+        trace_counter[0] += 1
 
-        # gvec remap: rows outside [valid_start, valid_end) go to safe corner.
-        corner = jnp.asarray(_fft_safe_corner(fft_grid), dtype=jnp.int32)
-        gvec = jnp.where(mask[:, None], gvec_slab, corner[None, :])
+        def body_one_k(slab_start, inv_k):
+            slab = jax.lax.dynamic_slice(
+                big,
+                (jnp.int32(0), jnp.int32(0),
+                 slab_start.astype(jnp.int32), jnp.int32(0)),
+                (bpr, nspinor, ngkmax, 2))
+            cnk = slab[..., 0] + 1j * slab[..., 1]          # (bpr, ns, ngkmax)
+            # Pad with a zero at index ngkmax; inv_k's sentinel value
+            # (== ngkmax) indexes into that zero.
+            zero_col = jnp.zeros((bpr, nspinor, 1), dtype=jnp.complex128)
+            cnk_padded = jnp.concatenate([cnk, zero_col], axis=-1)  # (bpr, ns, ngkmax+1)
+            # Gather: for every (nx, ny, nz) FFT cell, pick up
+            # cnk_padded[:, :, inv_k[nx, ny, nz]].  jnp.take along axis
+            # -1 of cnk_padded with indices inv_k broadcasts to produce
+            # (bpr, ns, nx, ny, nz).
+            return jnp.take(cnk_padded, inv_k, axis=-1)
 
-        # Scatter into the per-rank FFT box shard.  Band axis is local; FFT
-        # axes are replicated within the shard, so no cross-rank collectives.
-        psi_G = jnp.zeros((bands_per_shard, nspinor, nx, ny, nz),
-                          dtype=jnp.complex128)
-        # Scatter: psi[b, s, gx, gy, gz] = cnk[b, s, g].  Advanced
-        # indexing on trailing axes with 1-D index arrays.
-        psi_G = psi_G.at[:, :, gvec[:, 0], gvec[:, 1], gvec[:, 2]].set(cnk)
-        return psi_G
+        return jax.vmap(body_one_k, in_axes=(0, 0))(slab_offsets, inv)
 
-    sm = shard_map(
+    sm_bare = shard_map(
         _per_rank, mesh=mesh,
-        in_specs=(band_spec, rep_spec, sc_spec, sc_spec),
-        out_specs=out_spec,
+        in_specs=(P(("x", "y"), None, None, None),    # big
+                  P(None),                             # slab_offsets
+                  P(None, None, None, None)),          # inv[k, nx, ny, nz]
+        out_specs=P(None, ("x", "y"), None, None, None, None),
         check_rep=False,
     )
-    return jax.jit(sm)
+    jitted = jax.jit(sm_bare)
+    jitted._trace_counter = trace_counter  # type: ignore[attr-defined]
+    return jitted
+
+
+def _make_kchunk_scatter_kernel(
+    mesh: Mesh, nk: int, ngkmax: int, nb: int, nspinor: int,
+    fft_grid: tuple[int, int, int],
+):
+    """Per-rank post-read scatter kernel for a full k-chunk.
+
+    Takes the raw ``(nk, bpr, ns, ngkmax, 2)`` f64 slab returned by
+    ``read_kchunk_sharded`` (sharded on dim 1) + per-k gvec/mask tables
+    and produces the ``(nk, bpr, ns, nx, ny, nz)`` c128 G-space FFT box.
+
+    The k-loop is Python-unrolled inside the shard_map body — for modest
+    nk (≲ tens), this gives XLA a fully unrolled HLO and a single jit
+    compile; for large nk (hundreds/thousands at Si 10×10×10 etc.) we'd
+    switch to ``jax.lax.scan`` to keep HLO size bounded.  One compile,
+    regardless.  Trace counter exposed on the returned callable.
+    """
+    nx, ny, nz = (int(x) for x in fft_grid)
+    p = int(mesh.shape["x"])
+    q = int(mesh.shape["y"])
+    world = p * q
+    if nb % world != 0:
+        raise RuntimeError(f"band count {nb} not divisible by world={world}")
+    bpr = nb // world
+
+    corner_np = _fft_safe_corner(fft_grid)
+
+    trace_counter = [0]
+
+    def _per_rank(raw_local, gvec_stack, vs, ve):
+        trace_counter[0] += 1
+        # raw_local: (nk, bpr, ns, ngkmax, 2) f64 — per-rank view of the
+        # band-sharded kchunk output.
+        # gvec_stack: (nk, ngkmax, 3) int32, replicated.
+        # vs, ve    : (nk,) int32, replicated — per-k valid-row bounds.
+        idx = jnp.arange(ngkmax, dtype=jnp.int32)
+        corner = jnp.asarray(corner_np, dtype=jnp.int32)
+
+        psi_outs = []
+        for k in range(nk):
+            raw_k = raw_local[k]                  # (bpr, ns, ngkmax, 2)
+            gvec_k = gvec_stack[k]                # (ngkmax, 3)
+            mask = (idx >= vs[k]) & (idx < ve[k]) # (ngkmax,)
+            cnk = (raw_k[..., 0] + 1j * raw_k[..., 1]) * mask
+            gvec = jnp.where(mask[:, None], gvec_k, corner[None, :])
+            psi = jnp.zeros((bpr, nspinor, nx, ny, nz), dtype=jnp.complex128)
+            psi = psi.at[:, :, gvec[:, 0], gvec[:, 1], gvec[:, 2]].set(cnk)
+            psi_outs.append(psi)
+        return jnp.stack(psi_outs, axis=0)         # (nk, bpr, ns, nx, ny, nz)
+
+    sm_bare = shard_map(
+        _per_rank, mesh=mesh,
+        in_specs=(P(None, ("x", "y"), None, None, None),   # raw: nk_rep, bands on XY
+                  P(None, None, None),                      # gvec_stack replicated
+                  P(None), P(None)),                        # vs, ve replicated
+        out_specs=P(None, ("x", "y"), None, None, None, None),
+        check_rep=False,
+    )
+    jitted = jax.jit(sm_bare)
+    jitted._trace_counter = trace_counter  # type: ignore[attr-defined]
+    return jitted
 
 
 def run_ffi_path(
@@ -297,18 +507,13 @@ def run_ffi_path(
             f"band count {nb} not divisible by world={world}; pick "
             f"a band_range multiple of world for this test.")
 
-    # Host prep: per-k gvec slabs + offset tables + mask bounds
-    # (tiny, <1 MB even for 1k k-points).
-    gvecs_slabs_np, slab_offsets_np, vs_np, ve_np = _build_gvecs_slabs(wfn, ngkmax)
-
-    # Replicated per-k gvec stack on device (once): (nk, ngkmax, 3).
-    rep_sharding_3d = NamedSharding(mesh, P(None, None, None))
-    gvec_stack_dev = jax.device_put(jnp.asarray(gvecs_slabs_np), rep_sharding_3d)
-    vs_dev = jax.device_put(jnp.asarray(vs_np))
-    ve_dev = jax.device_put(jnp.asarray(ve_np))
-
-    # Jitted post-read-and-scatter kernel (one compile, per-k dispatch).
-    post = _make_post_read_and_scatter(mesh, ngkmax, nb_padded, nspinor, fft_grid)
+    # Host prep: inv index map + per-k slab offsets.
+    inv_np, slab_offsets_np = _build_inv_map(wfn, ngkmax)
+    inv_dev = jax.device_put(jnp.asarray(inv_np),
+                             NamedSharding(mesh, P(None, None, None, None)))
+    slab_off_dev = jax.device_put(
+        jnp.asarray(slab_offsets_np),
+        NamedSharding(mesh, P(None)))
 
     # iFFT.
     ifftn = make_jittable_local_ifftn_3d(
@@ -326,36 +531,33 @@ def run_ffi_path(
     stage_times["open"] = t_open
 
     try:
-        # ---- stage: read + scatter (one compile, cached dispatch per k) ----
-        t_rs0 = time.perf_counter()
-        _sync("ffi_read_loop_start")
+        # One big FFI read (1 H5Dread of full G axis) + gather kernel.
+        ctx_handle = io._backend.fh
+        ngktot = int(wfn.kpt_starts[-1] + wfn.ngk[-1])
+        ffi_loader.get_lib()
+        ds_id = ffi_loader.phdf5_open_dataset_ro(ctx_handle, "wfns/coeffs")
+        read_j = _make_bigread_kernel(
+            mesh, ngktot, nb_padded, nspinor,
+            ctx_handle=ctx_handle, ds_id=ds_id,
+        )
+        gather_j = _make_gather_kernel(
+            mesh, nk, ngktot, ngkmax, nb_padded, nspinor, fft_grid)
 
-        # Collect per-k G-space FFT boxes; stack into the global
-        # (nk, nb_pad, ns, nx, ny, nz) array at the end.  Stack on axis 0
-        # is free: the stacked axis is replicated, band sharding on axis
-        # 0 of each input becomes axis 1 of the stack.
-        psi_G_list = []
-        for k in range(nk):
-            slab = io.read_slab(
-                "wfns/coeffs",
-                shape=(nb, nspinor, ngkmax, 2),
-                dtype=np.float64,
-                offset=(b_lo, 0, int(slab_offsets_np[k]), 0),
-                partition_spec=P(("x", "y"), None, None, None),
-            )
-            psi_G_k = post(slab, gvec_stack_dev[k], vs_dev[k], ve_dev[k])
-            psi_G_list.append(psi_G_k)
-        psi_G_global = jnp.stack(psi_G_list, axis=0)
-        out_sharding = NamedSharding(
-            mesh, P(None, ("x", "y"), None, None, None, None))
-        psi_G_global = jax.lax.with_sharding_constraint(psi_G_global, out_sharding)
+        offset_arr = jnp.asarray((b_lo, 0, 0, 0), dtype=jnp.int64)
+
+        # ---- stage: read + gather ----
+        t_rs0 = time.perf_counter()
+        _sync("ffi_rs_start")
+        big = read_j(offset_arr)
+        psi_G_global = gather_j(big, slab_off_dev, inv_dev)
         jax.block_until_ready(psi_G_global)
-        _sync("ffi_read_loop_end")
+        _sync("ffi_rs_end")
         stage_times["read_scatter"] = time.perf_counter() - t_rs0
 
         # ---- stage: iFFT to real space ----
         t_fft, psi_r = _time(lambda psi_G: ifftn(psi_G), "ffi_fft", psi_G_global)
         stage_times["fft"] = t_fft
+        stage_times["_trace_count"] = int(gather_j._trace_counter[0])
     finally:
         io.close()
     return psi_r, stage_times
@@ -487,7 +689,9 @@ def main() -> int:
     # Safe-corner sanity check (reads fft_grid, ecutrho, ecutwfc).
     wfn_peek = WFNReader(args.wfn)
     _assert_safe_corner_ok(wfn_peek)
+    wfn_peek_nk = int(wfn_peek.nkpts)
     _log(f"safe corner  = {tuple(int(x) for x in _fft_safe_corner(tuple(int(x) for x in wfn_peek.fft_grid)))}")
+    _log(f"nk           = {wfn_peek_nk}")
     del wfn_peek  # don't keep the slurp around
 
     # ============================================================
@@ -506,7 +710,8 @@ def main() -> int:
                                        band_range, mesh, ngkmax)
     _log(f"  FFI      warmup: open={tF_warm['open']*1e3:7.1f} ms  "
          f"read+scatter={tF_warm['read_scatter']*1e3:7.1f} ms  "
-         f"fft={tF_warm['fft']*1e3:7.1f} ms")
+         f"fft={tF_warm['fft']*1e3:7.1f} ms  "
+         f"trace_count={tF_warm.get('_trace_count', '?')}  (nk={wfn_peek_nk})")
     _log(f"rss_post_ffi_warmup = {_rss_gb():.3f} GB")
 
     # ---- correctness ----
