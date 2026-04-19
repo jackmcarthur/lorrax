@@ -1,0 +1,120 @@
+# `gvec_fft_box` — a shared gather primitive for "sparse G → dense FFT box"
+
+## The pattern
+
+Several parts of LORRAX take a small vector of wavefunction
+coefficients `cnk` indexed by G-vectors and place them into a dense
+three-dimensional FFT box (so it can be inverse-FFT'd, gathered at
+centroid positions, multiplied against a dense G-space kernel, etc.):
+
+```
+psi[..., gvec[:,0], gvec[:,1], gvec[:,2]] = cnk
+```
+
+On GPU via `jax`, writing this as an `.at[...].set(...)` scatter is
+**catastrophically slow** — measured ~800 ms at MoS2 3×3 scale for
+9 k-points × 20 bands × 2 spinors × 1963 G-vectors (that's ≈700 k
+atomic writes into a 46 k-slot FFT box; GPU HBM-atomic bandwidth with
+contention puts this out at ~1 MB/s effective).  Even with
+`unique_indices=True` hinting and `mode='drop'`, the scatter kernel
+JAX emits has 10–100× worse throughput than the equivalent gather.
+
+## The fix — gather with a precomputed inverse index
+
+Flip the direction.  Instead of iterating over G-vectors and writing
+to FFT slots, iterate over FFT slots and read from G-vectors.  The
+sparsity structure — which G-slots map to which FFT cells — is fixed
+by the WFN file (doesn't change during a calculation), so precompute
+once on host:
+
+```
+inv[k, nx, ny, nz] = g_local_within_k    if (gvecs[k, g] % fft_grid) == (nx, ny, nz)
+                   = ngkmax (sentinel)   otherwise
+```
+
+At runtime, pad `cnk` with one zero row at index `ngkmax`, then:
+
+```
+psi[..., k, nx, ny, nz] = cnk_padded[..., k, inv[k, nx, ny, nz]]
+```
+
+One `jnp.take` per k (trivially vmapped or absorbed into a flat
+single-gather via `flat_idx = k*(ngkmax+1) + inv[k,...]`).  Measured
+in `common/phdf5_wfn_read_test.py`: **800 ms scatter → 90 ms gather**
+at MoS2 3×3 scale; scatter correctness drops out automatically
+because the sentinel row is zero.
+
+## Proposed utility
+
+`src/common/gvec_fft_box.py`:
+
+```python
+def build_inv_map(gvecs_per_k, ngk_per_k, fft_grid, *, ngkmax=None) -> np.ndarray:
+    """Precompute inv[..., nx, ny, nz] ∈ [0, ngkmax] sentinel map.
+    Host-side.  Small (nk × nx × ny × nz × 4 B = ~MB scale).
+    """
+
+@jax.jit
+def gather_fft_box(cnk_padded, inv, fft_grid) -> jax.Array:
+    """cnk_padded: (..., nk, ngkmax+1) complex, last col zero.
+       inv:        (nk, nx, ny, nz) int32, values in [0, ngkmax].
+       returns:    (..., nk, nx, ny, nz) complex — dense FFT box.
+    """
+```
+
+Both are already implemented as private helpers in
+`common/phdf5_wfn_read_test.py` (`_build_within_k_inv`,
+`_make_union_gather_kernel`).  The refactor lifts them into a shared
+module that the new phdf5 wfn reader consumes directly.
+
+## Call sites that should migrate
+
+Hot (inner loop, big win):
+
+- **`common/load_wfns.py::read_Gvecs_to_devices`** — the band-chunked
+  G-space loader.  Already replaced in the new `phdf5_wfn_reader`;
+  the legacy host-numpy path stays as a fallback for non-FFI builds.
+
+Setup-time (correctness-consistency win, modest throughput gain):
+
+- **`psp/get_DFT_mtxels.py:227`** — `buf.at[Gx, Gy, Gz].set(row)` for
+  the DFT-matrix-element buffer.  Runs once at psp setup; migration
+  is a 3-line edit.
+- **`centroid/get_charge_density.py:37`** — `fft_box.at[ix, iy, iz].set(data_1d)`
+  for the charge density used as kmeans weight.  Runs once at
+  preprocessing.
+
+Verification/debug (migrate opportunistically):
+
+- **`gw/w_from_eps0_0d_check.py:243`** — 0D check code.
+
+Leave alone (host-numpy scatter is already fast):
+
+- `load_wfns.py:41` (`load_kpoint_fftbox`) — host numpy.
+- `load_wfns.py:223` (legacy `read_Gvecs_to_devices` k-loop) — host
+  numpy.  The new phdf5 reader obsoletes this path but we keep it
+  around as a non-FFI fallback.
+
+## Design notes for the utility
+
+- `inv` is keyed by `(gvecs_per_k, fft_grid)` which for a given WFN
+  file is constant.  Build once, reuse across every band chunk, every
+  iteration of every driver.
+- The sentinel scheme (`ngkmax` as "empty") only works if `cnk_padded`
+  always has a zero at that slot — the utility should either own the
+  padding or document the contract loudly.
+- For variable-ngk (nosym/irreducible-wedge): zero-pad per k to
+  `ngkmax` before the sentinel slot; the gather covers the shape
+  uniformly.  No per-k dynamic logic at runtime.
+- Memory: `inv` is `nk × nx × ny × nz × 4` bytes.  At Si 10×10×10
+  (nk=1000, fft=24³): ~55 MB per rank, replicated — still fine.  If
+  that ever bites, shard `inv` on the k axis and build the gather
+  under `shard_map`.
+
+## Why this is not a sweeping refactor
+
+Only the hot inner-loop site (`read_Gvecs_to_devices`) paid a real
+cost.  The setup-time JAX scatters are two-edit migrations worth
+doing the next time we're editing those files — not a dedicated
+project.  Host-numpy sites are already fine.  The win was always
+concentrated in the band-chunked GW loop.
