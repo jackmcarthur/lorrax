@@ -226,6 +226,19 @@ def main(argv=None):
 		except Exception as _e:
 			print0(f"  [phdf5 init_mpi] skipped: {_e}")
 
+	# Enable JAX persistent compile cache for the WHOLE run (not just
+	# w_isdf / ppm_sigma where it was previously activated).  On a
+	# warm cache this reliably removes ~3 s of XLA compile from the
+	# cold-start path at MoS2 3x3 (measured 2026-04-19, 267 entries
+	# = 1.9 MiB on disk).  Opt-out by setting ISDF_JAX_CACHE_DIR=""
+	# before launch.  Default cache location honours ISDF_JAX_CACHE_DIR
+	# → XDG_CACHE_HOME/isdf_jax_compilation → ~/.cache/isdf_jax_compilation.
+	try:
+		from .w_isdf import _ensure_compilation_cache
+		_ensure_compilation_cache()
+	except Exception as _e:
+		print0(f"  [jax compile cache] skipped: {_e}")
+
 	from .gw_output import print_banner, print_section, print_system_summary, write_results, GWResults
 	print_banner(
 		backend=current_backend, n_devices=n_devices,
