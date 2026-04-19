@@ -157,16 +157,15 @@ def _assert_safe_corner_ok(wfn: WFNReader) -> None:
             f"{int(hits.sum())} WFN G-vectors — can't use as safe corner")
 
 
-def _build_inv_map(wfn: WFNReader, ngkmax: int) -> tuple[np.ndarray, np.ndarray]:
-    """Precompute inv[k, nx, ny, nz] = g_local_within_slab (or ngkmax
-    sentinel for unused FFT slots) + per-k slab_offsets.
-
-    The gather formulation: given the (bpr, ns, ngkmax, 2) slab read for
-    one k-point, the FFT-box cell ``psi[k, b, s, nx, ny, nz]`` is
-    ``cnk[b, s, inv[k, nx, ny, nz]]`` where cnk is the complex
-    conversion of the slab (padded with a zero at index ngkmax for the
-    "no valid G here" case).  One gather op per k.  Avoids the slow
-    ``.at[].set()`` scatter kernel entirely.
+def _build_global_gather_idx(wfn: WFNReader) -> np.ndarray:
+    """Precompute ``global_idx[k, nx, ny, nz]`` = position in the
+    ngktot-long G axis of ``big`` where ``(k, nx, ny, nz)``'s coefficient
+    lives, or ``ngktot`` (sentinel) if this FFT cell has no coefficient
+    for this k.  At runtime we pad ``big`` with a zero row at index
+    ngktot, then do ONE ``jnp.take`` gather of shape
+    ``(bpr, ns, ngktot+1, 2) → (bpr, ns, nk, nx, ny, nz, 2)``, transpose
+    to ``(nk, bpr, ns, nx, ny, nz, 2)``, and combine re+im to complex.
+    No per-k vmap, no per-k dynamic_slice — one kernel launch.
     """
     nk = int(wfn.nkpts)
     ngk = np.asarray(wfn.ngk, dtype=np.int64)
@@ -176,28 +175,16 @@ def _build_inv_map(wfn: WFNReader, ngkmax: int) -> tuple[np.ndarray, np.ndarray]
     nx, ny, nz = (int(x) for x in fft_grid)
     gvecs_all = np.asarray(wfn.gvecs, dtype=np.int32)  # (ngktot, 3)
 
-    slab_offsets = np.zeros(nk, dtype=np.int32)
-    inv = np.full((nk, nx, ny, nz), ngkmax, dtype=np.int32)
-
+    # Sentinel = ngktot means "gather from the zero-pad row at the end".
+    global_idx = np.full((nk, nx, ny, nz), ngktot, dtype=np.int32)
     for k in range(nk):
-        # slab_start: the file offset for reading this k's ngkmax slab.
-        # If kpt_starts[k] + ngkmax overflows, backshift so the slab
-        # ends at ngktot; the valid rows then live at the end of the
-        # slab, positions [ngkmax - ngk[k], ngkmax).
-        if kpt_starts[k] + ngkmax <= ngktot:
-            slab_start = int(kpt_starts[k])
-            g_local_start = 0
-        else:
-            slab_start = int(ngktot - ngkmax)
-            g_local_start = int(ngkmax - ngk[k])
-        slab_offsets[k] = slab_start
-
-        # Map each of this k's valid G-vectors to its (nx,ny,nz) FFT slot.
-        gv = gvecs_all[int(kpt_starts[k]):int(kpt_starts[k]) + int(ngk[k])]
+        start = int(kpt_starts[k])
+        n = int(ngk[k])
+        gv = gvecs_all[start:start + n]
         wrapped = gv % fft_grid[None, :]
         for g_idx, (gx, gy, gz) in enumerate(wrapped):
-            inv[k, int(gx), int(gy), int(gz)] = int(g_local_start + g_idx)
-    return inv, slab_offsets
+            global_idx[k, int(gx), int(gy), int(gz)] = int(start + g_idx)
+    return global_idx
 
 
 def _build_gvecs_slabs(wfn: WFNReader, ngkmax: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -358,55 +345,42 @@ def _make_gather_kernel(
     mesh: Mesh, nk: int, ngktot: int, ngkmax: int, nb: int, nspinor: int,
     fft_grid: tuple[int, int, int],
 ):
-    """Gather half — the replacement for the slow scatter kernel.
+    """Gather half — ONE global gather for all k-points at once.
 
     Takes the ``(bpr, ns, ngktot, 2)`` big-read output + the precomputed
-    inverse index map ``inv[k, nx, ny, nz] → g_within_slab`` (with
-    ``ngkmax`` sentinel for empty FFT cells) + per-k slab offsets, and
-    produces the ``(nk, bpr, ns, nx, ny, nz)`` FFT-box via a single
-    ``jnp.take`` gather per k under vmap.
+    ``global_idx[k, nx, ny, nz]`` index array (with ``ngktot`` sentinel
+    for empty FFT cells), pads big with one zero row at index ngktot,
+    and does ONE ``jnp.take`` along axis 2 → ``(bpr, ns, nk, nx, ny, nz, 2)``.
+    Transpose + combine re+im → ``(nk, bpr, ns, nx, ny, nz)``.
 
-    GPU gather is dramatically faster than scatter for this workload
-    (~800 ms → low ms for 9 k × 20 bpr × 2 ns × (nx*ny*nz=46k) cells at
-    MoS2 3×3 scale).  No masks needed at runtime: invalid-slot sentinel
-    in ``inv`` points into a zero-padded cnk so cells with no coefficient
-    pick up exact zero.
+    No per-k dynamic_slice, no vmap over k — single kernel launch for
+    the whole k-chunk.
     """
     nx, ny, nz = (int(x) for x in fft_grid)
     p = int(mesh.shape["x"])
     q = int(mesh.shape["y"])
     world = p * q
     bpr = nb // world
-
     trace_counter = [0]
 
-    def _per_rank(big, slab_offsets, inv):
+    def _per_rank(big, global_idx):
         trace_counter[0] += 1
-
-        def body_one_k(slab_start, inv_k):
-            slab = jax.lax.dynamic_slice(
-                big,
-                (jnp.int32(0), jnp.int32(0),
-                 slab_start.astype(jnp.int32), jnp.int32(0)),
-                (bpr, nspinor, ngkmax, 2))
-            cnk = slab[..., 0] + 1j * slab[..., 1]          # (bpr, ns, ngkmax)
-            # Pad with a zero at index ngkmax; inv_k's sentinel value
-            # (== ngkmax) indexes into that zero.
-            zero_col = jnp.zeros((bpr, nspinor, 1), dtype=jnp.complex128)
-            cnk_padded = jnp.concatenate([cnk, zero_col], axis=-1)  # (bpr, ns, ngkmax+1)
-            # Gather: for every (nx, ny, nz) FFT cell, pick up
-            # cnk_padded[:, :, inv_k[nx, ny, nz]].  jnp.take along axis
-            # -1 of cnk_padded with indices inv_k broadcasts to produce
-            # (bpr, ns, nx, ny, nz).
-            return jnp.take(cnk_padded, inv_k, axis=-1)
-
-        return jax.vmap(body_one_k, in_axes=(0, 0))(slab_offsets, inv)
+        # Pad with one zero row at the end of the ngktot axis so the
+        # sentinel index (== ngktot) gathers exact zero for empty cells.
+        zero_pad = jnp.zeros((bpr, nspinor, 1, 2), dtype=jnp.float64)
+        big_padded = jnp.concatenate([big, zero_pad], axis=2)
+        # Single gather: (bpr, ns, ngktot+1, 2) → take indices global_idx
+        # of shape (nk, nx, ny, nz) along axis 2 → (bpr, ns, nk, nx, ny, nz, 2)
+        gathered = jnp.take(big_padded, global_idx, axis=2)
+        # Move nk to front: (nk, bpr, ns, nx, ny, nz, 2)
+        gathered = jnp.transpose(gathered, (2, 0, 1, 3, 4, 5, 6))
+        # Real + imag → complex, trailing dim 2 collapses.
+        return gathered[..., 0] + 1j * gathered[..., 1]
 
     sm_bare = shard_map(
         _per_rank, mesh=mesh,
-        in_specs=(P(("x", "y"), None, None, None),    # big
-                  P(None),                             # slab_offsets
-                  P(None, None, None, None)),          # inv[k, nx, ny, nz]
+        in_specs=(P(("x", "y"), None, None, None),       # big
+                  P(None, None, None, None)),             # global_idx
         out_specs=P(None, ("x", "y"), None, None, None, None),
         check_rep=False,
     )
@@ -507,13 +481,11 @@ def run_ffi_path(
             f"band count {nb} not divisible by world={world}; pick "
             f"a band_range multiple of world for this test.")
 
-    # Host prep: inv index map + per-k slab offsets.
-    inv_np, slab_offsets_np = _build_inv_map(wfn, ngkmax)
-    inv_dev = jax.device_put(jnp.asarray(inv_np),
-                             NamedSharding(mesh, P(None, None, None, None)))
-    slab_off_dev = jax.device_put(
-        jnp.asarray(slab_offsets_np),
-        NamedSharding(mesh, P(None)))
+    # Host prep: global gather index (nk, nx, ny, nz) int32.
+    global_idx_np = _build_global_gather_idx(wfn)
+    global_idx_dev = jax.device_put(
+        jnp.asarray(global_idx_np),
+        NamedSharding(mesh, P(None, None, None, None)))
 
     # iFFT.
     ifftn = make_jittable_local_ifftn_3d(
@@ -545,14 +517,21 @@ def run_ffi_path(
 
         offset_arr = jnp.asarray((b_lo, 0, 0, 0), dtype=jnp.int64)
 
-        # ---- stage: read + gather ----
+        # ---- stage: read + gather (with internal split timing) ----
+        # No explicit cross-rank barriers: the FFI handler's internal
+        # H5Dread is self-synchronizing, and the gather is purely local
+        # per-rank (no collectives in its HLO).  block_until_ready on
+        # the final output is the only sync we need.
         t_rs0 = time.perf_counter()
-        _sync("ffi_rs_start")
         big = read_j(offset_arr)
-        psi_G_global = gather_j(big, slab_off_dev, inv_dev)
+        jax.block_until_ready(big)
+        t_r1 = time.perf_counter()
+        psi_G_global = gather_j(big, global_idx_dev)
         jax.block_until_ready(psi_G_global)
-        _sync("ffi_rs_end")
-        stage_times["read_scatter"] = time.perf_counter() - t_rs0
+        t_r2 = time.perf_counter()
+        stage_times["read_scatter"] = t_r2 - t_rs0
+        stage_times["_read_only"] = t_r1 - t_rs0
+        stage_times["_gather_only"] = t_r2 - t_r1
 
         # ---- stage: iFFT to real space ----
         t_fft, psi_r = _time(lambda psi_G: ifftn(psi_G), "ffi_fft", psi_G_global)
@@ -739,9 +718,13 @@ def main() -> int:
         _, tF = run_ffi_path(args.wfn, WFNReader(args.wfn), band_range, mesh, ngkmax)
         for k in F_times:
             F_times[k].append(tF[k])
+        split = ""
+        if "_read_only" in tF and "_gather_only" in tF:
+            split = (f"  [read={tF['_read_only']*1e3:.1f} "
+                     f"gather={tF['_gather_only']*1e3:.1f}]")
         _log(f"  (F) open={tF['open']*1e3:7.1f}  "
              f"r+s={tF['read_scatter']*1e3:7.1f}  "
-             f"fft={tF['fft']*1e3:7.1f}   (ms)")
+             f"fft={tF['fft']*1e3:7.1f}   (ms){split}")
 
     def _mean_ms(ts): return 1e3 * float(np.mean(ts))
 

@@ -861,6 +861,12 @@ def fit_zeta_chunked_to_h5(
     kgrid_arr = np.array(meta.kgrid)
     kvecs_frac = sym.kvecs_asints / kgrid_arr[None, :]
 
+    # Env-var override: forces the slow path (re-read WFN.h5 + re-FFT per
+    # r-chunk) even when memory would allow caching.  Useful for probing
+    # the scaling regime where wavefunctions don't fit in host memory
+    # (multi-TB WFN.h5).  LORRAX_DISABLE_GSPACE_CACHE=1 to enable.
+    if os.environ.get("LORRAX_DISABLE_GSPACE_CACHE") == "1":
+        use_gspace_cache = False
     if use_gspace_cache:
         with timing.section("zeta_fit.cache_gspace"):
             print(f"  Caching G-space wavefunctions for r-chunk loop")
@@ -870,7 +876,7 @@ def fit_zeta_chunked_to_h5(
             print(f"  G-space cache: {len(cached_gspace)} band chunks")
     else:
         cached_gspace = None
-        print("  G-space cache: disabled (exceeds memory budget)")
+        print("  G-space cache: disabled")
 
     # ========== STEP 6: Loop over chunks ==========
     # Track timing for summary (manual perf_counter for detailed breakdown)
