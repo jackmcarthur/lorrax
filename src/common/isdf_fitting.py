@@ -1169,15 +1169,34 @@ def fit_zeta_chunked_to_h5(
     _memprobe_chunk_idx = 0
     if _memprobe_on:
         import sys as _sys
+        import ctypes as _ct
+        # Ground-truth CUDA free/total (bypasses JAX's allocator pool
+        # bookkeeping).  Distinguishes "jax thinks it's holding" from
+        # "driver actually has allocated".
+        try:
+            _cudart = _ct.CDLL('libcudart.so', mode=_ct.RTLD_GLOBAL)
+            _cudart.cudaMemGetInfo.restype = _ct.c_int
+            _cudart.cudaMemGetInfo.argtypes = [_ct.POINTER(_ct.c_size_t),
+                                                _ct.POINTER(_ct.c_size_t)]
+        except Exception:
+            _cudart = None
+        def _cuda_used():
+            if _cudart is None:
+                return 0.0
+            f = _ct.c_size_t(0); t = _ct.c_size_t(0)
+            _cudart.cudaMemGetInfo(_ct.byref(f), _ct.byref(t))
+            return (t.value - f.value) / 1e9 if t.value > 0 else 0.0
         def _probe(label, **extra):
             try:
                 s = jax.devices()[0].memory_stats() or {}
                 used = s.get('bytes_in_use', 0) / 1e9
                 peak = s.get('peak_bytes_in_use', 0) / 1e9
+                c_used = _cuda_used()
                 tag = " ".join(f"{k}={v}" for k, v in extra.items())
                 _sys.stderr.write(
                     f"[memprobe] chunk={_memprobe_chunk_idx} "
-                    f"label={label:<18s} used={used:6.3f} GB peak={peak:6.3f} GB"
+                    f"label={label:<18s} jax_used={used:6.3f} "
+                    f"jax_peak={peak:6.3f} cuda_used={c_used:6.3f} GB"
                     f"{' ' + tag if tag else ''}\n")
                 _sys.stderr.flush()
             except Exception:
