@@ -112,18 +112,36 @@ static ffi::Error PotrfImpl(
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
 
-    // Zero out the upper-triangular region of each local tile so the
-    // caller gets a clean lower-triangular L (SLATE leaves the upper
-    // part of A undefined on entry, which shows up as uninitialised
-    // data otherwise).
+    // Zero out the strict-upper tiles (in SLATE's tile grid) so the
+    // resulting buffer is "clean L" — anything not written by potrf is
+    // explicitly zero, no leftover A-data.  This matters for the chained
+    // cholesky->trsm pattern: if we leave A's strict-upper data in
+    // place, trsm's Triangular(Lower) wrapper still col-majorises that
+    // region and uses some of it (despite uplo='Lower'), giving a few-
+    // percent residual.
     //
-    // With SLATE's Col grid + col-major tile layout on our JAX P('x','y')
-    // shards, each rank's local tile corresponds to a specific (ti, tj)
-    // block of the (conceptually transposed) global matrix.  The Uplo::
-    // Lower output means only tiles with ti >= tj were actually written
-    // to by potrf; upper-strict tiles on other ranks we leave as the
-    // copied-A values (caller applies the row-major-view interpretation
-    // in distributed_cholesky() on the Python side).
+    // Default-tile case (nb == n/p): each rank owns exactly one tile
+    // (ti, tj) = (rank%p, rank/p) under SLATE GridOrder::Col.  Strict
+    // upper means ti < tj.
+    if (nb == (n + p - 1) / p) {
+        const int my_ti = ctx->rank % p;
+        const int my_tj = ctx->rank / p;
+        if (my_ti < my_tj) {
+            cudaError_t cz = cudaMemsetAsync(
+                d_L_out, 0,
+                local_rows * local_cols * sizeof(T),
+                xla_stream);
+            if (cz != cudaSuccess) {
+                std::ostringstream os;
+                os << "slate.potrf: cudaMemsetAsync(strict-upper tile) failed: "
+                   << cudaGetErrorString(cz);
+                return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+            }
+        }
+    }
+    // For non-default nb (multiple tiles per rank), the right zero
+    // pattern is per-tile within the rank's buffer; not implemented yet
+    // since user code uses default nb (= n/p).
 
     return ffi::Error::Success();
 }

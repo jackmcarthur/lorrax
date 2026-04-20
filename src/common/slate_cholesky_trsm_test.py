@@ -122,74 +122,64 @@ def main():
         kw["block_size"] = args.nb
 
     t0 = time.perf_counter()
-    L = distributed_cholesky(A, **kw)
-    jax.block_until_ready(L)
+    L_handle = distributed_cholesky(A, **kw)
+    jax.block_until_ready(L_handle.raw)
     dt = time.perf_counter() - t0
-    _log(f"  potrf wall: {dt*1000:.1f} ms")
+    _log(f"  potrf wall: {dt*1000:.1f} ms (returned {type(L_handle).__name__})")
 
-    # Gather and compare.
+    # Gather and compare.  Use the canonical L (handle.to_jax_lower()).
+    L_canonical_jax = L_handle.to_jax_lower()
     A_full = multihost_utils.process_allgather(A)
-    L_full = multihost_utils.process_allgather(L)
+    L_raw_full = multihost_utils.process_allgather(L_handle.raw)
+    L_full = multihost_utils.process_allgather(L_canonical_jax)
     if jax.process_index() == 0:
         A_np = np.asarray(A_full)
-        L_np = np.asarray(L_full)
-        # Try several transforms to find the layout that matches the
-        # numpy reference, same pattern as the eigh test.
+        L_np = np.asarray(L_full)               # canonical from handle
+        L_raw_np = np.asarray(L_raw_full)       # raw FFI buffer
         L_ref = np.linalg.cholesky(A_np)
         H_norm = max(np.linalg.norm(A_np), 1.0)
-        variants = {
-            "L          ": L_np,
-            "L.T        ": L_np.T,
-            "L.conj().T ": L_np.conj().T,
-            "tril(L)    ": np.tril(L_np),
-            "tril(L).T  ": np.tril(L_np).T,
-            "tril(L.T)  ": np.tril(L_np.T),
-            "tril(L.c.T)": np.tril(L_np.conj().T),
-        }
-        best_name, best_res = None, None
-        for name, Lt in variants.items():
-            res = float(np.linalg.norm(Lt @ Lt.conj().T - A_np) / H_norm)
-            ref_diff = float(np.linalg.norm(Lt - L_ref) / max(np.linalg.norm(L_ref), 1.0))
-            print(f"    {name}: |Lt*Lt^H - A|/|A|={res:.3e}  "
-                  f"|Lt - L_numpy|/|L_numpy|={ref_diff:.3e}", flush=True)
-            if best_res is None or res < best_res:
-                best_res, best_name = res, name
-        print(f"  best variant: {best_name} (residual {best_res:.3e})",
-              flush=True)
+        res_canon = float(np.linalg.norm(L_np @ L_np.conj().T - A_np) / H_norm)
+        ref_diff_canon = float(np.linalg.norm(L_np - L_ref) /
+                               max(np.linalg.norm(L_ref), 1.0))
+        print(f"  CANONICAL (via handle.to_jax_lower()): "
+              f"|L*L^H - A|/|A|={res_canon:.3e}  "
+              f"|L - L_numpy|/|L_numpy|={ref_diff_canon:.3e}", flush=True)
+        # Sanity: is the strict-upper of the raw buffer zero?
+        # In SLATE GridOrder::Col with default nb=n/p, rank 2 owns SLATE
+        # tile (0, 1) = strict upper.  Its data should now be zero.
+        # When gathered, that's JAX block (1, 0) = bottom-left.
+        ul = L_raw_np[L_raw_np.shape[0]//2:, :L_raw_np.shape[1]//2]
+        print(f"  raw L upper-tile-block (rank 2, bottom-left of gather): "
+              f"max|val|={float(np.max(np.abs(ul))):.3e}", flush=True)
 
     # ---------- trsm: solve L X = B ----------
     B = build_rhs(args.n, m, dtype, args.seed + 1, mesh)
     jax.block_until_ready(B)
     multihost_utils.sync_global_devices("B_built")
 
-    t0 = time.perf_counter()
-    X = distributed_trsm(L, B, mesh=mesh, side="L", uplo="L", op="N",
-                         block_size=(args.nb or None))
-    jax.block_until_ready(X)
-    dt = time.perf_counter() - t0
-    _log(f"  trsm wall: {dt*1000:.1f} ms")
-
     B_full = multihost_utils.process_allgather(B)
-    X_full = multihost_utils.process_allgather(X)
+    # Forward solve: X_fwd = inv(L) @ B
+    t0 = time.perf_counter()
+    X_fwd = distributed_trsm(L_handle, B, mesh=mesh, op="N")
+    jax.block_until_ready(X_fwd)
+    dt_fwd = time.perf_counter() - t0
+    X_fwd_full = multihost_utils.process_allgather(X_fwd)
+    # Adjoint solve: Y_adj = inv(L^H) @ B
+    t0 = time.perf_counter()
+    Y_adj = distributed_trsm(L_handle, B, mesh=mesh, op="C")
+    jax.block_until_ready(Y_adj)
+    dt_adj = time.perf_counter() - t0
+    Y_adj_full = multihost_utils.process_allgather(Y_adj)
+
     if jax.process_index() == 0:
-        B_np = np.asarray(B_full)
-        X_np = np.asarray(X_full)
-        Bnorm = max(np.linalg.norm(B_np), 1.0)
-        L_np = np.asarray(L_full)
-        # Canonical numpy L is tril(L.T) from the Cholesky probe above.
-        L_canonical = np.tril(L_np.T)
-        for lhs_name, lhs in [
-            ("L_canon @ X       ", L_canonical @ X_np),
-            ("L_canon @ X.T     ", L_canonical @ X_np.T),
-            ("X @ L_canon       ", X_np @ L_canonical),
-            ("X.T @ L_canon     ", X_np.T @ L_canonical),
-            ("L @ X             ", L_np @ X_np),
-            ("L.T @ X           ", L_np.T @ X_np),
-            ("X.T @ L           ", X_np.T @ L_np),
-            ("X @ L.T           ", X_np @ L_np.T),
-        ]:
-            res = float(np.linalg.norm(lhs - B_np) / Bnorm)
-            print(f"    |{lhs_name} - B|/|B| = {res:.3e}", flush=True)
+        B_np = np.asarray(B_full); Bnorm = max(np.linalg.norm(B_np), 1.0)
+        X_fwd_np = np.asarray(X_fwd_full)
+        Y_adj_np = np.asarray(Y_adj_full)
+        L_can = L_np  # canonical lower factor (from handle.to_jax_lower())
+        res_fwd = float(np.linalg.norm(L_can @ X_fwd_np - B_np) / Bnorm)
+        res_adj = float(np.linalg.norm(L_can.conj().T @ Y_adj_np - B_np) / Bnorm)
+        _log(f"  trsm forward (op='N'): |L @ X - B|/|B|   = {res_fwd:.3e}  ({dt_fwd*1000:.1f} ms)")
+        _log(f"  trsm adjoint (op='C'): |L^H @ Y - B|/|B| = {res_adj:.3e}  ({dt_adj*1000:.1f} ms)")
     return 0
 
 

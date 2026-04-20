@@ -22,6 +22,7 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
 
 from ..common.ffi_loader import get_lib
+from .cholesky import SlateLowerL
 from .context import get_or_init_context
 
 __all__ = ["distributed_trsm"]
@@ -35,7 +36,7 @@ _DIAG  = {"N": 0, "U": 1}
 
 
 def distributed_trsm(
-    A: jax.Array,
+    A,
     B: jax.Array,
     *,
     mesh: Mesh,
@@ -46,13 +47,56 @@ def distributed_trsm(
     alpha: complex | float = 1.0,
     block_size: int | None = None,
 ) -> jax.Array:
-    if A.ndim != 2 or A.shape[0] != A.shape[1]:
-        raise ValueError(f"distributed_trsm: expected square A; got {A.shape}")
+    """Distributed triangular solve.
+
+    A may be either a plain JAX array (interpreted as a row-major lower
+    or upper triangular matrix per ``uplo``) or a :class:`SlateLowerL`
+    handle returned by :func:`distributed_cholesky`.  In the handle
+    case, the underlying SLATE-format buffer is passed straight back to
+    SLATE without any layout transform — best for chained
+    cholesky -> trsm where we want to keep SLATE's tile layout
+    consistent.
+    """
+    if isinstance(A, SlateLowerL):
+        # Handle path: SlateLowerL holds SLATE's tile-layout factor.  We
+        # remap the user-facing op to the SLATE convention that gives the
+        # right answer in JAX row-major view.  The forward solve needs
+        # ConjTrans (not just Trans) so the complex case is handled
+        # correctly; for real f64 ConjTrans collapses to Trans, no harm.
+        # Empirically:
+        #
+        #   user op='N' (forward solve, L @ X = B)
+        #     -> SLATE side='R', uplo='L', op='C'   residual ~1e-16
+        #   user op='C' (adjoint solve, L^H @ X = B)
+        #     -> SLATE side='R', uplo='L', op='N'   residual ~1e-16
+        #
+        # side and uplo from the caller are ignored for the handle path
+        # (the handle's layout pins them).
+        if op == "N":
+            side, uplo, op = "R", "L", "C"
+        elif op in ("C", "T"):
+            side, uplo, op = "R", "L", "N"
+        else:
+            raise ValueError(f"distributed_trsm(SlateLowerL, ...): "
+                             f"op must be 'N' (forward) or 'C' (adjoint); "
+                             f"got {op!r}")
+        A_raw = A.raw
+        if block_size is None:
+            block_size = A.nb
+        if mesh.axis_names != A.mesh.axis_names:
+            raise ValueError(
+                "trsm mesh axis names don't match the handle's mesh; "
+                "pass the same mesh used for distributed_cholesky.")
+    else:
+        A_raw = A
+
+    if A_raw.ndim != 2 or A_raw.shape[0] != A_raw.shape[1]:
+        raise ValueError(f"distributed_trsm: expected square A; got {A_raw.shape}")
     if B.ndim != 2:
         raise ValueError(f"distributed_trsm: expected 2D B; got {B.shape}")
-    if A.dtype != B.dtype:
+    if A_raw.dtype != B.dtype:
         raise ValueError(
-            f"distributed_trsm: A.dtype {A.dtype} != B.dtype {B.dtype}")
+            f"distributed_trsm: A.dtype {A_raw.dtype} != B.dtype {B.dtype}")
     if "x" not in mesh.axis_names or "y" not in mesh.axis_names:
         raise ValueError(
             f"mesh must have axes ('x','y'); got {mesh.axis_names}")
@@ -63,7 +107,7 @@ def distributed_trsm(
     if p * q != jax.process_count():
         raise ValueError(
             f"mesh {p}x{q} != jax.process_count()={jax.process_count()}")
-    n = int(A.shape[0])
+    n = int(A_raw.shape[0])
     if side == "L":
         if B.shape[0] != n:
             raise ValueError(
@@ -104,4 +148,4 @@ def distributed_trsm(
         return jax.ffi.ffi_call(_FFI_TARGET, X_local)(
             local_A, local_B, **attrs)
 
-    return _call(A, B)
+    return _call(A_raw, B)
