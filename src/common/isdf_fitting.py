@@ -40,8 +40,8 @@ from .fft_helpers import (
 )
 from .load_wfns import (
     read_Gvecs_to_devices,
-    get_psi_rchunk_from_cached,
     get_psi_rchunk,
+    iter_psi_rchunk_bandwise,
     load_centroids_band_chunked,
 )
 
@@ -49,24 +49,65 @@ from .load_wfns import (
 def load_gspace_for_bands(
     wfn, sym, meta, mesh_xy, band_range, bispinor,
     band_chunk_size: int = 16,
+    band_chunk_ranges: list[tuple[int, int]] | None = None,
 ) -> list[tuple[jax.Array, tuple[int, int]]]:
     """Load G-space wavefunctions for all band chunks ONCE.
 
     Caches the expensive HDF5 read + scatter so it can be reused across
-    multiple r-chunk iterations. Returns a list of (psi_Gtot, band_range)
-    tuples, one per band chunk.
+    multiple r-chunk iterations.  Returns a list of ``(psi_Gtot,
+    band_range)`` tuples, one per band chunk.
+
+    Pass ``band_chunk_ranges`` when the downstream streaming
+    pair-density loop uses custom chunk boundaries (e.g. respecting
+    left/right pair-density endpoints) — the cache keys must match
+    the yielded ``bc_range`` sequence exactly.  When None, contiguous
+    chunks of ``band_chunk_size`` are built from ``band_range``.
     """
-    b_start, b_end = band_range
-    nb_total = b_end - b_start
-    num_band_chunks = (nb_total + band_chunk_size - 1) // band_chunk_size
+    if band_chunk_ranges is None:
+        b_start, b_end = band_range
+        nb_total = b_end - b_start
+        num_band_chunks = (nb_total + band_chunk_size - 1) // band_chunk_size
+        band_chunk_ranges = [
+            (b_start + i * band_chunk_size,
+             min(b_start + (i + 1) * band_chunk_size, b_end))
+            for i in range(num_band_chunks)
+        ]
     cached_gspace = []
-    for bc_idx in range(num_band_chunks):
-        bc_start = b_start + bc_idx * band_chunk_size
-        bc_end = min(bc_start + band_chunk_size, b_end)
-        bc_range = (bc_start, bc_end)
-        global_psi_Gtot, _ = read_Gvecs_to_devices(wfn, sym, bc_range, meta, bispinor, mesh_xy)
-        cached_gspace.append((global_psi_Gtot, bc_range))
+    for bc_range in band_chunk_ranges:
+        global_psi_Gtot, _ = read_Gvecs_to_devices(
+            wfn, sym, bc_range, meta, bispinor, mesh_xy)
+        cached_gspace.append((global_psi_Gtot, tuple(bc_range)))
     return cached_gspace
+
+
+def _band_chunk_ranges_respecting_endpoints(
+    band_full: tuple[int, int],
+    endpoints: list[int],
+    chunk_size: int,
+) -> list[tuple[int, int]]:
+    """Build contiguous band-chunk ranges that never straddle any of
+    the given ``endpoints``.
+
+    Given the full band range ``(fs, fe)`` and a list of internal
+    breakpoints (typically the left/right pair-density endpoints
+    ``{b_L_start, b_L_end, b_R_start, b_R_end}``), return a list of
+    ``(bc_start, bc_end)`` chunks such that each chunk lies fully
+    inside one "segment" — which means the chunk is entirely inside
+    the left range, entirely inside the right range, inside both,
+    or outside both.  Downstream code can then do a Python-level
+    ``if bc_in_left:`` to skip the einsum for chunks outside each
+    range, never materialising an out-of-range matmul.
+    """
+    fs, fe = band_full
+    breakpoints = sorted(set([fs, fe] + [b for b in endpoints if fs < b < fe]))
+    ranges: list[tuple[int, int]] = []
+    for seg_start, seg_end in zip(breakpoints[:-1], breakpoints[1:]):
+        pos = seg_start
+        while pos < seg_end:
+            nxt = min(pos + chunk_size, seg_end)
+            ranges.append((pos, nxt))
+            pos = nxt
+    return ranges
 
 
 # ============================================================================
@@ -161,6 +202,73 @@ def compute_pair_density_spin_matrix(
 
 	return _compute_pair_density_cache[cache_key](psi_rmuT_X, psi_rcol_Y)
 
+
+_accum_pair_density_cache = {}
+
+
+def accumulate_pair_density_spin_traced(
+	P_accum: jax.Array,
+	psi_rmuT_X: jax.Array,
+	psi_rcol_Y: jax.Array,
+	mesh_xy: Mesh,
+) -> jax.Array:
+	"""``P_accum + Σ_{n,s} ψ*_{n,s}(r_μ) ψ_{n,s}(r_col)`` in one JIT.
+
+	Used by the band-chunk streaming pair-density path: each band
+	chunk contributes its partial einsum to the running accumulator
+	without materialising an intermediate — XLA can fuse the add
+	into the einsum's output write.
+
+	Shapes / shardings match :func:`compute_pair_density_spin_traced`
+	on the two inputs; ``P_accum`` lives on the same sharding as the
+	output (``P(None, 'x', 'y')``).
+	"""
+	nk, n_rmu, nb, ns = psi_rmuT_X.shape
+	_, _, _, n_col = psi_rcol_Y.shape
+	cache_key = ('spin_traced_accum', id(mesh_xy), nk, n_rmu, nb, ns, n_col)
+	if cache_key not in _accum_pair_density_cache:
+		P_sharding = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+		L_sharding = NamedSharding(mesh_xy, P(None, 'x', None, None))
+		R_sharding = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+
+		@partial(jax.jit,
+				 in_shardings=(P_sharding, L_sharding, R_sharding),
+				 out_shardings=P_sharding)
+		def _accum(P_in: jax.Array, psi_L: jax.Array, psi_R: jax.Array) -> jax.Array:
+			return P_in + jnp.einsum('kmns,knsv->kmv', psi_L, psi_R, optimize=True)
+
+		_accum_pair_density_cache[cache_key] = _accum
+	return _accum_pair_density_cache[cache_key](P_accum, psi_rmuT_X, psi_rcol_Y)
+
+
+def accumulate_pair_density_spin_matrix(
+	P_accum: jax.Array,
+	psi_rmuT_X: jax.Array,
+	psi_rcol_Y: jax.Array,
+	mesh_xy: Mesh,
+) -> jax.Array:
+	"""``P_accum + Σ_n ψ*_{n,a}(r_μ) ψ_{n,b}(r_col)`` (spin-resolved).
+
+	Shapes / shardings mirror :func:`compute_pair_density_spin_matrix`
+	on the inputs; ``P_accum`` holds the 2×2 spin matrix on
+	``P(None, None, None, 'x', 'y')``.
+	"""
+	nk, n_rmu, nb, ns = psi_rmuT_X.shape
+	_, _, _, n_col = psi_rcol_Y.shape
+	cache_key = ('spin_matrix_accum', id(mesh_xy), nk, n_rmu, nb, ns, n_col)
+	if cache_key not in _accum_pair_density_cache:
+		P_sharding = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
+		L_sharding = NamedSharding(mesh_xy, P(None, 'x', None, None))
+		R_sharding = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+
+		@partial(jax.jit,
+				 in_shardings=(P_sharding, L_sharding, R_sharding),
+				 out_shardings=P_sharding)
+		def _accum(P_in: jax.Array, psi_L: jax.Array, psi_R: jax.Array) -> jax.Array:
+			return P_in + jnp.einsum('kmna,knbr->kabmr', psi_L, psi_R, optimize=True)
+
+		_accum_pair_density_cache[cache_key] = _accum
+	return _accum_pair_density_cache[cache_key](P_accum, psi_rmuT_X, psi_rcol_Y)
 
 
 # Cache for ISDF pipeline jitted functions
@@ -867,13 +975,28 @@ def fit_zeta_chunked_to_h5(
     # (multi-TB WFN.h5).  LORRAX_DISABLE_GSPACE_CACHE=1 to enable.
     if os.environ.get("LORRAX_DISABLE_GSPACE_CACHE") == "1":
         use_gspace_cache = False
+    # Band chunks that respect the left/right pair-density endpoints
+    # so each chunk sits fully inside one (or both) of the two ranges.
+    # Used by the streaming pair-density loop below to dispatch P_l /
+    # P_r einsums conditionally per chunk — chunks between b3 and b4
+    # contribute to P_r only, etc., so the out-of-range matmul is
+    # never materialised.
+    band_chunk_ranges = _band_chunk_ranges_respecting_endpoints(
+        band_range_full,
+        [band_range_left[0], band_range_left[1],
+         band_range_right[0], band_range_right[1]],
+        band_chunk_size,
+    )
+
     if use_gspace_cache:
         with timing.section("zeta_fit.cache_gspace"):
             print(f"  Caching G-space wavefunctions for r-chunk loop")
             cached_gspace = load_gspace_for_bands(
-                wfn, sym, meta, mesh_xy, band_range_full, bispinor, band_chunk_size
+                wfn, sym, meta, mesh_xy, band_range_full, bispinor,
+                band_chunk_ranges=band_chunk_ranges,
             )
-            print(f"  G-space cache: {len(cached_gspace)} band chunks")
+            print(f"  G-space cache: {len(cached_gspace)} band chunks "
+                  f"({len(band_chunk_ranges)} L/R-aligned ranges)")
     else:
         cached_gspace = None
         print("  G-space cache: disabled")
@@ -948,63 +1071,82 @@ def fit_zeta_chunked_to_h5(
             r_end = min(r_start + chunk_r, n_rtot)
             actual_n_rchunk = r_end - r_start
 
-            # 6a. Get psi_nk,a(r_chunk) for FULL band range
+            # 6ab. Stream band chunks of the r-chunk wfns and
+            # accumulate P_l / P_r incrementally.  At any moment only
+            # one band chunk's r-chunk shard is live (instead of the
+            # full-band-range tensor) — decouples the pair-density
+            # peak from the band count.  Chunks are built to respect
+            # the left/right band endpoints (see band_chunk_ranges
+            # above) so each chunk is fully inside L, R, both, or
+            # neither, and an out-of-range einsum is simply never
+            # dispatched.
+            ns = meta.nspinor
+            P_sharding_traced = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+            P_sharding_spin   = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
+            if isdf_pair_mode == "spin_traced":
+                P_l_k_mux = jnp.zeros(
+                    (nk_tot, n_rmu, actual_n_rchunk), dtype=jnp.complex128)
+                P_l_k_mux = jax.lax.with_sharding_constraint(P_l_k_mux, P_sharding_traced)
+                P_r_k_mux = jnp.zeros(
+                    (nk_tot, n_rmu, actual_n_rchunk), dtype=jnp.complex128)
+                P_r_k_mux = jax.lax.with_sharding_constraint(P_r_k_mux, P_sharding_traced)
+                _accum = accumulate_pair_density_spin_traced
+            else:
+                P_l_k_mux = jnp.zeros(
+                    (nk_tot, ns, ns, n_rmu, actual_n_rchunk), dtype=jnp.complex128)
+                P_l_k_mux = jax.lax.with_sharding_constraint(P_l_k_mux, P_sharding_spin)
+                P_r_k_mux = jnp.zeros(
+                    (nk_tot, ns, ns, n_rmu, actual_n_rchunk), dtype=jnp.complex128)
+                P_r_k_mux = jax.lax.with_sharding_constraint(P_r_k_mux, P_sharding_spin)
+                _accum = accumulate_pair_density_spin_matrix
+
             t0 = time.perf_counter()
-            with timing.section("zeta_fit.chunk.load"):
-                if cached_gspace is not None:
-                    # Fast path: FFT only (G-space is cached)
-                    psi_chunk_Y = get_psi_rchunk_from_cached(
-                        cached_gspace, meta, mesh_xy, band_range_full,
-                        r_start, r_end, kvecs_frac,
-                        band_chunk_size=band_chunk_size
-                    )
-                else:
-                    # Slow path: reload from HDF5 each chunk
-                    psi_chunk_Y = get_psi_rchunk(
-                        wfn, sym, meta, mesh_xy, band_range_full,
-                        r_start, r_end, bispinor,
-                        band_chunk_size=band_chunk_size,
-                        k_chunk_size=k_chunk_size,
-                    )
-                psi_chunk_Y.block_until_ready()
-                _track_peak()
+            with timing.section("zeta_fit.chunk.load_and_pair_density"):
+                for bc_range, psi_bc_Y in iter_psi_rchunk_bandwise(
+                    wfn, sym, meta, mesh_xy, band_range_full,
+                    r_start, r_end, bispinor,
+                    band_chunk_size=band_chunk_size,
+                    k_chunk_size=k_chunk_size,
+                    band_chunk_ranges=band_chunk_ranges,
+                    cached_gspace=cached_gspace, kvecs_frac=kvecs_frac,
+                ):
+                    bc_lo, bc_hi = bc_range
+                    # Chunks were built to respect left/right endpoints, so
+                    # each of these two tests is a clean all-or-nothing.
+                    in_l = (bc_lo >= band_range_left[0]
+                            and bc_hi <= band_range_left[1])
+                    in_r = (bc_lo >= band_range_right[0]
+                            and bc_hi <= band_range_right[1])
 
-                # Slice for left and right (same logic as centroids)
-                psi_l_chunk_Y = psi_chunk_Y[:, l_band_start:l_band_end, :, :]
-                psi_r_chunk_Y = psi_chunk_Y[:, r_band_start:r_band_end, :, :]
+                    if in_l:
+                        l_lo = bc_lo - band_range_left[0]
+                        l_hi = bc_hi - band_range_left[0]
+                        psi_L_bc = psi_l_rmuT_X_fit[:, :, l_lo:l_hi, :]
+                        psi_R_bc = (psi_bc_Y / norms_l[l_lo:l_hi][None, :, None, None]
+                                    if band_norms is not None else psi_bc_Y)
+                        P_l_k_mux = _accum(P_l_k_mux, psi_L_bc, psi_R_bc, mesh_xy)
 
-                # Normalize r-chunk wavefunctions for ISDF fitting (pseudobands)
-                if band_norms is not None:
-                    psi_l_chunk_Y = psi_l_chunk_Y / norms_l[None, :, None, None]
-                    psi_r_chunk_Y = psi_r_chunk_Y / norms_r[None, :, None, None]
-            t_load_total += time.perf_counter() - t0
+                    if in_r:
+                        r_lo = bc_lo - band_range_right[0]
+                        r_hi = bc_hi - band_range_right[0]
+                        psi_L_bc = psi_r_rmuT_X_fit[:, :, r_lo:r_hi, :]
+                        psi_R_bc = (psi_bc_Y / norms_r[r_lo:r_hi][None, :, None, None]
+                                    if band_norms is not None else psi_bc_Y)
+                        P_r_k_mux = _accum(P_r_k_mux, psi_L_bc, psi_R_bc, mesh_xy)
 
-            # 6b. Compute left/right pair densities (unit-normalized for fitting)
-            t0 = time.perf_counter()
-            with timing.section("zeta_fit.chunk.pair_density"):
-                if isdf_pair_mode == "spin_traced":
-                    P_l_k_mux = compute_pair_density_spin_traced(
-                        psi_l_rmuT_X_fit, psi_l_chunk_Y, mesh_xy
-                    )
-                    P_r_k_mux = compute_pair_density_spin_traced(
-                        psi_r_rmuT_X_fit, psi_r_chunk_Y, mesh_xy
-                    )
-                else:
-                    # Keep spin channels explicit and contract only after IFFT.
-                    P_l_k_mux = compute_pair_density_spin_matrix(
-                        psi_l_rmuT_X_fit, psi_l_chunk_Y, mesh_xy
-                    )
-                    P_r_k_mux = compute_pair_density_spin_matrix(
-                        psi_r_rmuT_X_fit, psi_r_chunk_Y, mesh_xy
-                    )
+                    del psi_bc_Y
+
                 P_l_k_mux.block_until_ready()
                 _track_peak()
-                # No block_until_ready on P_r — ZCT will consume it asynchronously.
-                # P_l's block_until_ready (above) is needed for del psi_l_chunk_Y.
+                # No block_until_ready on P_r — ZCT will consume it
+                # asynchronously.  P_l's block is needed to bound
+                # t_pair_total and to gate _track_peak.
+            # Load and pair-density are fused into one streaming loop
+            # now — accumulate the combined wall into t_pair_total.
+            # t_load_total stays at 0 so the two-column "load vs pair"
+            # breakdown below doesn't double-count; the end-of-run
+            # table prints pair-density as the merged total.
             t_pair_total += time.perf_counter() - t0
-
-            # Free psi_chunk arrays - we have P_k now
-            del psi_chunk_Y, psi_l_chunk_Y, psi_r_chunk_Y
 
             # Reshape to explicit 3D k-grid before ZCT kernels so donation-compatible
             # stages see consistent input/output ranks and sharding.
