@@ -214,14 +214,11 @@ def main() -> int:
     mesh, p, q = _build_mesh(world_size)
 
     nb_default, ntran, ngkmax = _peek_band_defaults(args.wfn, world_size)
-    if ntran != 1:
-        _log(f"ERROR: v1 test supports nosym files only; got ntran={ntran}")
-        return 1
     band_range = tuple(args.band_range) if args.band_range else (0, nb_default)
     nb = band_range[1] - band_range[0]
 
     _log(f"world={world_size}, mesh=({p},{q})  wfn={args.wfn}")
-    _log(f"band_range={band_range}  (nb={nb})  ngkmax={ngkmax}")
+    _log(f"band_range={band_range}  (nb={nb})  ngkmax={ngkmax}  ntran={ntran}")
     _log(f"rss_pre_reads = {_peak_rss_gb():.3f} GB")
 
     # -------- warmup (trigger jit compiles, warm MPI-IO / page cache) --------
