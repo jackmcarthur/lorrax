@@ -387,10 +387,13 @@ def _place_windows_v2(
     n_windows_target: int,
     n_min: int,
     dim: int,
+    k: int = 1,
 ) -> np.ndarray:
     """Place window boundaries with equal-error rule + n_min state floor.
 
     Each window must contain at least n_min states (from DOS integral × dim).
+    The error metric uses the multi-pole bound σ^(2k)/ε^(2k+1) appropriate
+    for k-point Gauss quadrature (single-pole metric σ²/ε³ was the k=1 limit).
     """
     mask = (E_grid >= E_start) & (E_grid <= E_max)
     E_s = E_grid[mask]
@@ -418,7 +421,13 @@ def _place_windows_v2(
                 delta = trial - e_lo
                 eps_bar = 0.5 * (trial + e_lo)
                 sigma = delta / np.sqrt(12.0)
-                metric = n_eff * sigma**2 / max(eps_bar, 1e-30)**3
+                # Conservative effective-k=2 error metric σ⁴/ε⁵.  The full
+                # σ^(2k)/ε^(2k+1) bound assumes Gauss-optimal poles, which
+                # we don't have (Ritz + uniform weights in CJ windows after
+                # the empirical rollback in d1466ad).  σ⁴/ε⁵ still lets
+                # windows be wider than the single-pole σ²/ε³ limit, but
+                # doesn't overcommit on accuracy we can't deliver.
+                metric = n_eff * sigma**4 / max(eps_bar, 1e-30)**5
 
                 if metric >= tau_val and n_eff >= n_min:
                     best_hi = trial
@@ -543,7 +552,7 @@ def ritz_pseudobands_v2(
     else:
         boundaries = _place_windows_v2(
             dos.E_grid, dos.rho, E_start, dos.E_max,
-            n_windows_target=n_windows_target, n_min=k, dim=dim)
+            n_windows_target=n_windows_target, n_min=k, dim=dim, k=k)
     N_S = len(boundaries) - 1
 
     if verbose:
@@ -666,24 +675,24 @@ def ritz_pseudobands_v2(
                 b_hi_r * dos.half_width + dos.center,
                 dos.center, dos.half_width, M_max)
 
-            # n_eff from DOS integral over the CJ window indicator
-            n_eff_j = float(np.trapezoid(w_E * np.maximum(dos.rho, 0), dos.E_grid)) * dim
+            # n_eff from DOS integral over the CJ window indicator squared
+            # (shifted-CJ POU is quadratic: Σ_j w_j² ≈ 1, so the per-window
+            # spectral mass the outer-product construction actually captures
+            # is ∫ w_j(E)² ρ(E) dE, not ∫ w_j ρ dE).  Using w_j instead
+            # overcounts transition-zone mass where adjacent windows overlap.
+            n_eff_j = float(np.trapezoid(w_E**2 * np.maximum(dos.rho, 0), dos.E_grid)) * dim
 
-            # Try Gauss quadrature from shifted moments
-            e_mid = 0.5 * (e_lo + e_hi)
-            e_span = max(e_hi - e_lo, 1e-6)
-            moments = _compute_window_moments(
-                dos.E_grid, dos.rho, w_E, 2 * k,
-                E_shift=e_mid, E_scale=e_span)
-            moments *= dim
-            nodes, gauss_w = _gauss_from_moments(moments, k)
-            nodes = nodes * e_span + e_mid
-
-            # Use Ritz eigenvalues for energy placement, DOS for total weight.
-            # Gauss quadrature is available but Ritz energies are more robust
-            # for the GW pole structure (they come from the actual Hamiltonian).
+            # Use Ritz eigenvalues as node energies (variational consistency)
+            # and uniform weights n_eff/k (DOS total mass distributed evenly
+            # across the k pseudobands in the window).  Gauss-quadrature
+            # weights were tried but rejected: for small k (=2) in narrow
+            # high-E windows, the Gauss rule can assign very unbalanced
+            # weights (seen 14× ratio within a single window), which
+            # amplifies the per-seed stochastic noise of the dominant
+            # Ritz vector by the ratio squared — drove 240 meV std at
+            # V2 150win vs 7 meV for V1 150win with uniform weights.
             nodes = np.sort(np.real(theta_ritz))
-            gauss_w = np.full(k, n_eff_j / k)
+            gauss_w = np.full(k, n_eff_j / k, dtype=np.float64)
             mode = "CJ"
 
         # Sort Ritz and Gauss ascending, pair by order
