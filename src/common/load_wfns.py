@@ -14,6 +14,39 @@ from .fft_helpers import (
 )
 
 
+# Module-level PhdfWfnReader cache — see ``_get_phdf5_reader`` below.
+# Keyed by (wfn file path, Mesh).  Cached readers own MPI+HDF5 handles
+# and the JIT closures for the gather/unfold kernels; first call of a
+# new reader pays ~100 ms of XLA tracing/compile, subsequent calls
+# reuse the compiled artefacts.  Tests may call ``_close_phdf5_readers``
+# to tear these down explicitly.
+_PHDF5_READER_CACHE: dict[tuple[str, int], object] = {}
+
+
+def _get_phdf5_reader(filename: str, mesh: Mesh):
+    """Return a cached :class:`PhdfWfnReader` for ``(filename, mesh)``,
+    constructing one on first request.  Subsequent calls with the same
+    key hit the in-process JIT cache on ``_fft_box_kernel`` /
+    ``_unfold_kernel`` — the caller avoids paying XLA compile on every
+    ``load_centroids_band_chunked`` / ``get_psi_rchunk`` invocation."""
+    key = (str(filename), id(mesh))
+    reader = _PHDF5_READER_CACHE.get(key)
+    if reader is None:
+        from common.phdf5_wfn_reader import PhdfWfnReader
+        reader = PhdfWfnReader(filename, mesh=mesh)
+        _PHDF5_READER_CACHE[key] = reader
+    return reader
+
+
+def _close_phdf5_readers() -> None:
+    """Close every cached reader and drop them.  For tests that want a
+    clean slate; production code should leave them alive for the
+    process lifetime."""
+    for reader in _PHDF5_READER_CACHE.values():
+        reader.close()
+    _PHDF5_READER_CACHE.clear()
+
+
 def _make_kchunk_meta(meta: Meta, kc_start: int, kc_end: int):
     """Create a shallow copy of Meta with nk_tot adjusted for a k-chunk.
 
@@ -430,10 +463,8 @@ def get_psi_rchunk(
     else:
         # Slow path: load G-space from HDF5 for each band chunk
         num_band_chunks = (nb_total + band_chunk_size - 1) // band_chunk_size
-        phdf5_reader = None
-        if use_phdf5:
-            from common.phdf5_wfn_reader import PhdfWfnReader
-            phdf5_reader = PhdfWfnReader(wfn._filename, mesh=mesh_xy)
+        phdf5_reader = (_get_phdf5_reader(wfn._filename, mesh_xy)
+                        if use_phdf5 else None)
         for bc_idx in range(num_band_chunks):
             bc_start = b_start + bc_idx * band_chunk_size
             bc_end = min(bc_start + band_chunk_size, b_end)
@@ -468,9 +499,7 @@ def get_psi_rchunk(
                     psi_rchunk_all = psi_rchunk_all.at[k0:k1, local_bc_start:local_bc_start + nb_chunk, :, :].set(psi_k_chunk)
                     del psi_k_chunk, psi_k_gtot
 
-        if phdf5_reader is not None:
-            phdf5_reader.close()
-
+    # Cached reader stays alive — see ``_get_phdf5_reader``.
     return psi_rchunk_all
 
 
@@ -715,14 +744,14 @@ def load_centroids_band_chunked(
     # Process bands in chunks
     num_band_chunks = (nb_total + band_chunk_size - 1) // band_chunk_size
 
-    # PHDF5 path: open the parallel-HDF5 reader once, keep it alive
-    # for every band chunk, close at the end.  ``wfn._filename`` is the
-    # path WFNReader opened — reuse it so callers don't have to pass an
-    # extra argument.  Wired for both the all-k and k-chunked paths.
-    phdf5_reader = None
-    if use_phdf5:
-        from common.phdf5_wfn_reader import PhdfWfnReader
-        phdf5_reader = PhdfWfnReader(wfn._filename, mesh=mesh_xy)
+    # PHDF5 path: pull a cached parallel-HDF5 reader keyed by (path,
+    # mesh).  Cached readers own the FFI MPI+HDF5 handles and the JIT
+    # closures for the unfold/gather kernels; construction-time work
+    # (~100 ms of XLA tracing/compile on first call for a new
+    # band-chunk shape) is amortised across every subsequent call in
+    # the process.  Wired for both the all-k and k-chunked paths.
+    phdf5_reader = (_get_phdf5_reader(wfn._filename, mesh_xy)
+                    if use_phdf5 else None)
 
     for bc_idx in range(num_band_chunks):
         bc_start = b_start + bc_idx * band_chunk_size
@@ -778,6 +807,5 @@ def load_centroids_band_chunked(
                 del global_psi_Gtot, psi_rmu_kchunk, psi_rmuT_kchunk
                 gc.collect()
 
-    if phdf5_reader is not None:
-        phdf5_reader.close()
+    # Cached reader stays alive — see ``_get_phdf5_reader``.
     return psi_rmu_all, psi_rmuT_all

@@ -66,6 +66,7 @@ class PhdfWfnReader:
         self._build_symmetry_tables()
         self._open_parallel_file()
         self._g_index = self._build_g_index()
+        self._device_put_static_tables()
 
     def close(self) -> None:
         if self._ctx_handle:
@@ -131,6 +132,10 @@ class PhdfWfnReader:
         n_reads = len(ibz_file_sorted)
         cnk_at_ibz = self._reader(n_reads, bands_per_rank)(offsets, counts)
 
+        # Stage the k_ids to device once; the unfold + gather kernels
+        # consume slices of the pre-staged full-BZ tables via jnp.take.
+        k_ids_dev = jax.device_put(jnp.asarray(k_ids), self._rep1d)
+
         # Unfold to full-BZ: expand along k axis + τ phase + U_spinor +
         # optional TR conjugation, all on device.  Skipped entirely for
         # nosym files (ntran == 1), where file-k == full-BZ-k,
@@ -140,14 +145,13 @@ class PhdfWfnReader:
         if self.ntran == 1:
             cnk_at_full = cnk_at_ibz
         else:
-            sym_tables = self._sym_tables_for_ids(k_ids)
+            U_k, phase_k, tr_mask_k = self._sym_tables_for_ids(k_ids_dev)
             cnk_at_full = self._unfold_kernel(n_reads, n_k, bands_per_rank)(
-                cnk_at_ibz, *sym_tables, position_in_reads)
+                cnk_at_ibz, U_k, phase_k, tr_mask_k, position_in_reads)
 
-        # Scatter into FFT box via the shared gather kernel, using the
-        # full-BZ-k-specific rotated g_index.
-        g_index_for_ids = jax.device_put(
-            jnp.asarray(self._g_index[k_ids]), self._rep4d)
+        # Slice the full-BZ-k g_index down to the caller's k_ids on
+        # device, then scatter into FFT box via the shared gather kernel.
+        g_index_for_ids = jnp.take(self._g_index_dev, k_ids_dev, axis=0)
         psi_G = self._fft_box_kernel(n_k, bands_per_rank)(
             cnk_at_full, g_index_for_ids)
         return psi_G
@@ -194,6 +198,7 @@ class PhdfWfnReader:
 
         self._world_size = (
             int(self.mesh.shape["x"]) * int(self.mesh.shape["y"]))
+        self._rep1d = NamedSharding(self.mesh, P(None))
         self._rep2d = NamedSharding(self.mesh, P(None, None))
         self._rep4d = NamedSharding(self.mesh, P(None, None, None, None))
 
@@ -256,6 +261,26 @@ class PhdfWfnReader:
     def _open_parallel_file(self) -> None:
         self._ctx_handle = open_file(self.path, mesh=self.mesh, mode="r")
 
+    def _device_put_static_tables(self) -> None:
+        """Move the four per-full-BZ-k lookup tables onto the devices
+        once at init — they don't depend on the band range or the
+        k-chunk, so staging them on every call would be a 5.8 MB /
+        2.2 MB / 288 kB / 9 B H2D per call for MoS2 3×3.  With
+        ``k_ids`` a numpy array we then take a JAX ``take`` on device
+        to slice the requested rows, which is ~µs on-GPU instead of
+        ms-scale per-call H2D."""
+        U_sharding    = NamedSharding(self.mesh, P(None, None, None))
+        phase_sharding = NamedSharding(self.mesh, P(None, None))
+        tr_sharding   = NamedSharding(self.mesh, P(None))
+        self._g_index_dev = jax.device_put(
+            jnp.asarray(self._g_index), self._rep4d)
+        self._U_dev = jax.device_put(
+            jnp.asarray(self._U_spinor_per_full_k), U_sharding)
+        self._phase_dev = jax.device_put(
+            jnp.asarray(self._phase_per_full_k), phase_sharding)
+        self._tr_mask_dev = jax.device_put(
+            jnp.asarray(self._tr_mask_per_full_k), tr_sharding)
+
     def _build_g_index(self) -> np.ndarray:
         """``g_index[nk_full, nx, ny, nz]`` mapping each FFT-box cell to
         the g-position within the IBZ slab that maps here under the
@@ -316,21 +341,16 @@ class PhdfWfnReader:
         )
 
     def _sym_tables_for_ids(
-        self, k_ids: np.ndarray,
+        self, k_ids_dev: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Pack the three device tables the unfold kernel consumes:
-        U_spinor (n_k, 2, 2), phase (n_k, ngkmax), tr_mask (n_k,).
-        All replicated across the mesh."""
-        U = jax.device_put(
-            jnp.asarray(self._U_spinor_per_full_k[k_ids]),
-            NamedSharding(self.mesh, P(None, None, None)))
-        phase = jax.device_put(
-            jnp.asarray(self._phase_per_full_k[k_ids]),
-            NamedSharding(self.mesh, P(None, None)))
-        tr_mask = jax.device_put(
-            jnp.asarray(self._tr_mask_per_full_k[k_ids]),
-            NamedSharding(self.mesh, P(None)))
-        return U, phase, tr_mask
+        """Slice the pre-device-put full-BZ sym tables down to the
+        caller's k_ids on the device.  ``k_ids_dev`` is the replicated
+        int32 index array."""
+        return (
+            jnp.take(self._U_dev,       k_ids_dev, axis=0),
+            jnp.take(self._phase_dev,   k_ids_dev, axis=0),
+            jnp.take(self._tr_mask_dev, k_ids_dev, axis=0),
+        )
 
     # =====================================================================
     #  Jitted-callable cache
