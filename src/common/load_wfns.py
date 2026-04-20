@@ -377,6 +377,8 @@ def get_psi_rchunk(
     k_chunk_size: int = 0,
     cached_gspace: list[tuple[jax.Array, tuple[int, int]]] | None = None,
     kvecs_frac: np.ndarray | None = None,
+    *,
+    use_phdf5: bool = False,
 ) -> jax.Array:
     """
     Extract an r-chunk of wavefunctions in real space.
@@ -428,11 +430,19 @@ def get_psi_rchunk(
     else:
         # Slow path: load G-space from HDF5 for each band chunk
         num_band_chunks = (nb_total + band_chunk_size - 1) // band_chunk_size
+        phdf5_reader = None
+        if use_phdf5 and nk_batch >= nk_tot:
+            from common.phdf5_wfn_reader import PhdfWfnReader
+            phdf5_reader = PhdfWfnReader(wfn._filename, mesh=mesh_xy)
         for bc_idx in range(num_band_chunks):
             bc_start = b_start + bc_idx * band_chunk_size
             bc_end = min(bc_start + band_chunk_size, b_end)
             bc_range = (bc_start, bc_end)
-            global_psi_Gtot, _ = read_Gvecs_to_devices(wfn, sym, bc_range, meta, bispinor, mesh_xy)
+            if phdf5_reader is not None:
+                global_psi_Gtot = phdf5_reader.coeffs_gspace(bc_range)
+            else:
+                global_psi_Gtot, _ = read_Gvecs_to_devices(
+                    wfn, sym, bc_range, meta, bispinor, mesh_xy)
 
             if nk_batch >= nk_tot:
                 psi_rchunk_chunk = get_sharded_wfns_rchunk_slice(
@@ -452,6 +462,9 @@ def get_psi_rchunk(
                     psi_rchunk_all = psi_rchunk_all.at[k0:k1, local_bc_start:local_bc_start + nb_chunk, :, :].set(psi_k_chunk)
                     del psi_k_chunk
             del global_psi_Gtot
+
+        if phdf5_reader is not None:
+            phdf5_reader.close()
 
     return psi_rchunk_all
 
@@ -601,6 +614,8 @@ def load_centroids_band_chunked(
     band_range: tuple[int, int],
     band_chunk_size: int = 64,
     k_chunk_size: int | None = None,
+    *,
+    use_phdf5: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """
     Load centroid-sampled wavefunctions using band AND k-point chunking.
@@ -626,6 +641,16 @@ def load_centroids_band_chunked(
         k_chunk_size: K-points to FFT at once (None = all at once).
             When set, processes k-points in batches to control the size
             of the FFT box array (the dominant memory bottleneck).
+        use_phdf5: If True, pull G-space wavefunctions through
+            :class:`common.phdf5_wfn_reader.PhdfWfnReader` (parallel HDF5
+            FFI + on-device symmetry unfold).  Default False keeps the
+            legacy ``WFNReader`` + ``read_Gvecs_to_devices`` path so
+            existing callers are unaffected.  The phdf5 path opens the
+            file once for the whole call and streams each band chunk
+            directly onto device without slurping ``wfns/coeffs`` into
+            host RAM — suitable for WFN files that don't fit in host
+            memory.  Currently only the non-k-chunked path is wired; the
+            k-chunk fallback still uses the legacy loader.
 
     Returns:
         psi_rmu_Y: (nk, nb, ns, n_rmu) with P(None, None, None, 'y')
@@ -682,6 +707,16 @@ def load_centroids_band_chunked(
     # Process bands in chunks
     num_band_chunks = (nb_total + band_chunk_size - 1) // band_chunk_size
 
+    # PHDF5 path: open the parallel-HDF5 reader once, keep it alive
+    # for every band chunk, close at the end.  ``wfn._filename`` is the
+    # path WFNReader opened — reuse it so callers don't have to pass an
+    # extra argument.  K-chunked path is not yet wired for phdf5 and
+    # falls through to the legacy loader.
+    phdf5_reader = None
+    if use_phdf5 and not needs_k_chunking:
+        from common.phdf5_wfn_reader import PhdfWfnReader
+        phdf5_reader = PhdfWfnReader(wfn._filename, mesh=mesh_xy)
+
     for bc_idx in range(num_band_chunks):
         bc_start = b_start + bc_idx * band_chunk_size
         bc_end = min(bc_start + band_chunk_size, b_end)
@@ -691,9 +726,12 @@ def load_centroids_band_chunked(
         local_bc_end = local_bc_start + nb_chunk
 
         if not needs_k_chunking:
-            # Original path: load all k-points at once
-            global_psi_Gtot, _ = read_Gvecs_to_devices(
-                wfn, sym, bc_range, meta, bispinor, mesh_xy)
+            # Band-chunked only (all k at once).
+            if phdf5_reader is not None:
+                global_psi_Gtot = phdf5_reader.coeffs_gspace(bc_range)
+            else:
+                global_psi_Gtot, _ = read_Gvecs_to_devices(
+                    wfn, sym, bc_range, meta, bispinor, mesh_xy)
             psi_rmu_chunk, psi_rmuT_chunk = get_sharded_wfns_centroids(
                 global_psi_Gtot, meta, centroid_indices, kvecs_frac, mesh_xy, bc_range)
             psi_rmu_all = psi_rmu_all.at[:, local_bc_start:local_bc_end, :, :].set(psi_rmu_chunk)
@@ -728,5 +766,7 @@ def load_centroids_band_chunked(
 
                 del global_psi_Gtot, psi_rmu_kchunk, psi_rmuT_kchunk
                 gc.collect()
-    
+
+    if phdf5_reader is not None:
+        phdf5_reader.close()
     return psi_rmu_all, psi_rmuT_all
