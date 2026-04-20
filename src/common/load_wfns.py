@@ -451,6 +451,23 @@ def iter_psi_rchunk_bandwise(
             for i in range(num_band_chunks)
         ]
 
+    # JIT'd zero-allocator used by the k-chunked paths to avoid the
+    # double-allocation trap (``jnp.zeros`` at top-level creates a
+    # fully replicated intermediate on every device before the
+    # sharding constraint can redistribute — OOM at Si-10³-class
+    # sizes).  Memoised by shape so the N-1 full k-batches + last
+    # remainder produce at most two compile entries.
+    out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+    _zeros_Y_cache: dict = {}
+    def _zeros_Y(shape):
+        fn = _zeros_Y_cache.get(shape)
+        if fn is None:
+            fn = jax.jit(
+                lambda: jnp.zeros(shape, dtype=jnp.complex128),
+                out_shardings=out_Y)
+            _zeros_Y_cache[shape] = fn
+        return fn()
+
     if cached_gspace is not None:
         by_range = {tuple(bc_range): gtot for (gtot, bc_range) in cached_gspace}
         for bc_range in band_chunk_ranges:
@@ -459,9 +476,29 @@ def iter_psi_rchunk_bandwise(
                 raise KeyError(
                     f"cached_gspace has no entry for bc_range={bc_range}; "
                     f"available={list(by_range.keys())}")
-            psi_bc_Y = get_sharded_wfns_rchunk_slice(
-                gtot, meta, r_start, r_end, kvecs_frac, mesh_xy, bc_range)
-            yield bc_range, psi_bc_Y
+            if nk_batch >= nk_tot:
+                psi_bc_Y = get_sharded_wfns_rchunk_slice(
+                    gtot, meta, r_start, r_end, kvecs_frac, mesh_xy, bc_range)
+                yield bc_range, psi_bc_Y
+            else:
+                # K-chunk the FFT on the cached full-k G-space so the
+                # per-device FFT peak stays bounded (the full-k FFT
+                # workspace is ~4× nk_tot × nb × nx*ny*nz at this bc
+                # and can blow the budget on Si-10³-class systems).
+                n_rchunk = r_end - r_start
+                nb_chunk = bc_range[1] - bc_range[0]
+                nspinor = meta.nspinor
+                psi_bc_Y_full = _zeros_Y(
+                    (nk_tot, nb_chunk, nspinor, n_rchunk))
+                for k0 in range(0, nk_tot, nk_batch):
+                    k1 = min(k0 + nk_batch, nk_tot)
+                    sub_meta = _make_kchunk_meta(meta, k0, k1)
+                    psi_k_chunk = get_sharded_wfns_rchunk_slice(
+                        gtot[k0:k1], sub_meta, r_start, r_end,
+                        kvecs_frac[k0:k1], mesh_xy, bc_range)
+                    psi_bc_Y_full = psi_bc_Y_full.at[k0:k1, :, :, :].set(psi_k_chunk)
+                    del psi_k_chunk
+                yield bc_range, psi_bc_Y_full
         return
 
     phdf5_reader = (_get_phdf5_reader(wfn._filename, mesh_xy)
@@ -484,10 +521,8 @@ def iter_psi_rchunk_bandwise(
             n_rchunk = r_end - r_start
             nb_chunk = bc_range[1] - bc_range[0]
             nspinor = meta.nspinor
-            out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
-            psi_bc_Y_full = jnp.zeros(
-                (nk_tot, nb_chunk, nspinor, n_rchunk), dtype=jnp.complex128)
-            psi_bc_Y_full = jax.lax.with_sharding_constraint(psi_bc_Y_full, out_Y)
+            psi_bc_Y_full = _zeros_Y(
+                (nk_tot, nb_chunk, nspinor, n_rchunk))
             for k0 in range(0, nk_tot, nk_batch):
                 k1 = min(k0 + nk_batch, nk_tot)
                 sub_meta = _make_kchunk_meta(meta, k0, k1)

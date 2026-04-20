@@ -1068,6 +1068,39 @@ def fit_zeta_chunked_to_h5(
         num_chunks, print, title="zeta fitting",
         item_name="r-chunk", max_updates=min(num_chunks, 20))
 
+    # P-accumulator zero-allocator.  Built inside a JIT so XLA
+    # allocates directly with the sharded layout — a plain
+    # ``jnp.zeros`` at module scope would materialise a fully
+    # replicated intermediate on every device (e.g. 19.7 GB/device
+    # at Si 10×10×10 with n_rchunk ~2500) before
+    # ``with_sharding_constraint`` got a chance to reshard it.
+    # Hoisted out of the r-chunk loop and memoised per n_rchunk so
+    # the N-1 equally sized r-chunks + the final remainder hit
+    # exactly two compile-shape entries, with no new jit-wrapper
+    # identity per r-chunk iter.
+    ns = meta.nspinor
+    P_sharding_traced = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    P_sharding_spin   = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
+    if isdf_pair_mode == "spin_traced":
+        _P_sharding = P_sharding_traced
+        _P_shape_fn = lambda n_r: (nk_tot, n_rmu, n_r)
+        _accum = accumulate_pair_density_spin_traced
+    else:
+        _P_sharding = P_sharding_spin
+        _P_shape_fn = lambda n_r: (nk_tot, ns, ns, n_rmu, n_r)
+        _accum = accumulate_pair_density_spin_matrix
+    _P_zeros_cache: dict = {}
+
+    def _zero_P(n_r: int):
+        fn = _P_zeros_cache.get(n_r)
+        if fn is None:
+            shape = _P_shape_fn(n_r)
+            fn = jax.jit(
+                lambda: jnp.zeros(shape, dtype=jnp.complex128),
+                out_shardings=_P_sharding)
+            _P_zeros_cache[n_r] = fn
+        return fn()
+
     with timing.section("zeta_fit.chunk_loop"):
         for chunk_idx in range(num_chunks):
             r_start = chunk_idx * chunk_r
@@ -1085,25 +1118,8 @@ def fit_zeta_chunked_to_h5(
             # endpoint skip the corresponding einsum; the one chunk
             # that straddles an endpoint gets zero-padded on the L
             # side so its einsum still dispatches at ``bc_size``.
-            ns = meta.nspinor
-            P_sharding_traced = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-            P_sharding_spin   = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-            if isdf_pair_mode == "spin_traced":
-                P_l_k_mux = jnp.zeros(
-                    (nk_tot, n_rmu, actual_n_rchunk), dtype=jnp.complex128)
-                P_l_k_mux = jax.lax.with_sharding_constraint(P_l_k_mux, P_sharding_traced)
-                P_r_k_mux = jnp.zeros(
-                    (nk_tot, n_rmu, actual_n_rchunk), dtype=jnp.complex128)
-                P_r_k_mux = jax.lax.with_sharding_constraint(P_r_k_mux, P_sharding_traced)
-                _accum = accumulate_pair_density_spin_traced
-            else:
-                P_l_k_mux = jnp.zeros(
-                    (nk_tot, ns, ns, n_rmu, actual_n_rchunk), dtype=jnp.complex128)
-                P_l_k_mux = jax.lax.with_sharding_constraint(P_l_k_mux, P_sharding_spin)
-                P_r_k_mux = jnp.zeros(
-                    (nk_tot, ns, ns, n_rmu, actual_n_rchunk), dtype=jnp.complex128)
-                P_r_k_mux = jax.lax.with_sharding_constraint(P_r_k_mux, P_sharding_spin)
-                _accum = accumulate_pair_density_spin_matrix
+            P_l_k_mux = _zero_P(actual_n_rchunk)
+            P_r_k_mux = _zero_P(actual_n_rchunk)
 
             # Per-chunk L/R slicing.  For a chunk fully inside an L or
             # R range, ``_slice_and_norm`` returns a direct view of the
