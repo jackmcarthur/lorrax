@@ -44,6 +44,7 @@ _FFI_TARGET_SYMBOLS = {
     "lorrax_phdf5_read":            "PhdfReadFfi",
     "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkFfi",
     "lorrax_phdf5_read_kchunk_union": "PhdfReadKchunkUnionFfi",
+    "lorrax_slate_eigh":              "SlateEighFfi",
 }
 
 # Error buffer size for the lrx_ wrappers.
@@ -156,6 +157,21 @@ def _set_argtypes(lib: ctypes.CDLL) -> None:
         ctypes.c_char_p, ctypes.c_int,       # err_out, err_cap
     ]
     lib.lrx_phdf5_open_dataset_ro.restype = ctypes.c_int
+
+    # slate
+    lib.lrx_slate_context_create.argtypes = [
+        ctypes.c_int,           # rank
+        ctypes.c_int,           # world_size
+        ctypes.c_int,           # p
+        ctypes.c_int,           # q
+        ctypes.c_char_p,        # err_buf
+        ctypes.c_int,           # err_buf_len
+    ]
+    lib.lrx_slate_context_create.restype  = ctypes.c_int64
+    lib.lrx_slate_context_destroy.argtypes = [ctypes.c_int64]
+    lib.lrx_slate_context_destroy.restype  = None
+    lib.lrx_slate_init_mpi.argtypes = []
+    lib.lrx_slate_init_mpi.restype  = None
 
 
 def _register_ffi_targets(lib: ctypes.CDLL) -> None:
@@ -326,3 +342,32 @@ def phdf5_open_dataset_ro(ctx_handle: int, ds_name: str) -> int:
     )
     _check_err(rc, err)
     return int(ds_id_out.value)
+
+
+# ---- slate ----------------------------------------------------------------
+def create_slate_context(rank: int, world_size: int, p: int, q: int) -> int:
+    """Collective create of a SLATE context; returns opaque int64 handle.
+
+    Inits MPI_THREAD_MULTIPLE if not already inited, then dups
+    MPI_COMM_WORLD for SLATE's exclusive use.  Raises RuntimeError on
+    failure with a message from the .so's error buffer.
+    """
+    lib = get_lib()
+    err = ctypes.create_string_buffer(_ERR_CAP)
+    h = lib.lrx_slate_context_create(
+        int(rank), int(world_size), int(p), int(q), err, _ERR_CAP)
+    if int(h) == 0:
+        msg = err.value.decode("utf-8", errors="replace")
+        raise RuntimeError(f"lorrax_ffi slate.context_create failed: {msg}")
+    return int(h)
+
+
+def destroy_slate_context(ctx_handle: int) -> None:
+    get_lib().lrx_slate_context_destroy(int(ctx_handle))
+
+
+def slate_init_mpi() -> None:
+    """Eagerly init MPI_THREAD_MULTIPLE from outside SLATE's hot path.
+    Idempotent; no-op if MPI is already initialized.
+    """
+    get_lib().lrx_slate_init_mpi()

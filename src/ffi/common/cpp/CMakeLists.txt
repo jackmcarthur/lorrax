@@ -296,6 +296,50 @@ endif()
 message(STATUS "MPI:  include=${LORRAX_MPI_INCLUDE_DIR} lib=${LORRAX_MPI_LIBRARY}")
 
 # ----------------------------------------------------------------------------
+#  SLATE — for the ffi.slate subpackage.  Found via find_package(slate)
+#  pointing at the host install (accessible inside the container via
+#  siteFs mount of /global/u2).  Runtime deps (Cray libsci etc.) come from
+#  the stage dir populated by src/ffi/slate/scripts/stage_cray.sh.
+# ----------------------------------------------------------------------------
+if(NOT DEFINED LORRAX_SLATE_INSTALL_DIR AND DEFINED ENV{LORRAX_SLATE_INSTALL_DIR})
+    set(LORRAX_SLATE_INSTALL_DIR "$ENV{LORRAX_SLATE_INSTALL_DIR}" CACHE PATH
+        "SLATE install prefix")
+endif()
+if(NOT DEFINED LORRAX_SLATE_INSTALL_DIR)
+    set(LORRAX_SLATE_INSTALL_DIR "/global/homes/j/jackm/software/slate/install"
+        CACHE PATH "SLATE install prefix (default: host build on Perlmutter)")
+endif()
+
+# slateConfig.cmake internally find_dependency(blaspp, lapackpp), which
+# live alongside slate in ${LORRAX_SLATE_INSTALL_DIR}.  Point all three
+# at their CMake config dirs so the find chain resolves.
+set(slate_DIR    "${LORRAX_SLATE_INSTALL_DIR}/lib64/cmake/slate")
+set(blaspp_DIR   "${LORRAX_SLATE_INSTALL_DIR}/lib64/cmake/blaspp")
+set(lapackpp_DIR "${LORRAX_SLATE_INSTALL_DIR}/lib64/cmake/lapackpp")
+
+# slateConfig expects MPI::MPI_CXX (from find_package(MPI)).  We deliberately
+# avoid that search above so we can pin to the chosen MPI stack.  Create a
+# stand-in IMPORTED target that points at the same libmpi / mpi.h.
+if(NOT TARGET MPI::MPI_CXX)
+    add_library(MPI::MPI_CXX INTERFACE IMPORTED)
+    set_target_properties(MPI::MPI_CXX PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${LORRAX_MPI_INCLUDE_DIR}"
+        INTERFACE_LINK_LIBRARIES      "${LORRAX_MPI_LIBRARY}")
+endif()
+
+find_package(slate CONFIG)
+if(slate_FOUND)
+    message(STATUS "SLATE: found via ${LORRAX_SLATE_INSTALL_DIR}")
+    set(LORRAX_HAVE_SLATE 1)
+else()
+    message(STATUS
+        "SLATE: not found at ${LORRAX_SLATE_INSTALL_DIR} — ffi.slate targets "
+        "will be skipped.  Build SLATE (see sources/SLATE) or set "
+        "-DLORRAX_SLATE_INSTALL_DIR=... to include them.")
+    set(LORRAX_HAVE_SLATE 0)
+endif()
+
+# ----------------------------------------------------------------------------
 # Build lorrax_ffi.so
 # ----------------------------------------------------------------------------
 set(LORRAX_FFI_SOURCES
@@ -307,6 +351,12 @@ set(LORRAX_FFI_SOURCES
     ../../phdf5/cpp/write_ffi.cc
     ../../phdf5/cpp/read_ffi.cc
 )
+if(LORRAX_HAVE_SLATE)
+    list(APPEND LORRAX_FFI_SOURCES
+        ../../slate/cpp/context.cc
+        ../../slate/cpp/eigh_ffi.cc
+    )
+endif()
 
 add_library(lorrax_ffi SHARED ${LORRAX_FFI_SOURCES})
 
@@ -316,7 +366,7 @@ set_target_properties(lorrax_ffi PROPERTIES
     # RPATH points at the NVHPC directory so the runtime linker finds
     # libcusolverMp.so and libcal.so without LD_LIBRARY_PATH.
     BUILD_WITH_INSTALL_RPATH ON
-    INSTALL_RPATH "${CUSOLVERMP_LIBDIR};${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/lib64;/lorrax_phdf5/lib"
+    INSTALL_RPATH "${CUSOLVERMP_LIBDIR};${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/lib64;/lorrax_phdf5/lib;/lorrax_slate/lib;${LORRAX_SLATE_INSTALL_DIR}/lib64"
 )
 
 target_include_directories(lorrax_ffi PRIVATE
@@ -342,6 +392,9 @@ target_link_libraries(lorrax_ffi PRIVATE
     "${LORRAX_MPI_LIBRARY}"
     Threads::Threads
 )
+if(LORRAX_HAVE_SLATE)
+    target_link_libraries(lorrax_ffi PRIVATE slate)
+endif()
 
 target_compile_options(lorrax_ffi PRIVATE
     -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable
