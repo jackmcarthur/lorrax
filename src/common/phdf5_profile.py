@@ -92,6 +92,12 @@ def main() -> int:
                          "centroid gather) for both legacy and phdf5 paths. "
                          "Warms each path once before tracing.")
     ap.add_argument("--n-centroids", type=int, default=16)
+    ap.add_argument("--drop-cache", action="store_true",
+                    help="``posix_fadvise(POSIX_FADV_DONTNEED)`` the WFN "
+                         "file before every timed iter so both paths hit "
+                         "disk instead of the OS page cache — necessary for "
+                         "a fair legacy-vs-phdf5 I/O comparison on small "
+                         "WFN files that would otherwise be RAM-resident.")
     args = ap.parse_args()
 
     world = jax.process_count()
@@ -155,6 +161,24 @@ def main() -> int:
     return 0
 
 
+def _drop_wfn_cache(path: str) -> None:
+    """Hint the kernel to drop the WFN file's cached pages.  Best-
+    effort — works only if nothing else has the file mmapped; between
+    load_wfns calls in this driver that's satisfied.  On MPI jobs only
+    rank 0 issues the call; the kernel's page cache is node-global so
+    the other ranks benefit without extra syscalls."""
+    if jax.process_index() != 0:
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
 def _centroids_mode(args, world: int, mesh: Mesh) -> int:
     """Warm + trace ``load_centroids_band_chunked`` for both the legacy
     and phdf5 paths.  Each path is called three times: once to trigger
@@ -192,7 +216,9 @@ def _centroids_mode(args, world: int, mesh: Mesh) -> int:
         band_chunk_size=args.band_chunk_size,
     )
 
-    def run(use_phdf5: bool) -> float:
+    def run(use_phdf5: bool, drop_cache: bool = False) -> float:
+        if drop_cache:
+            _drop_wfn_cache(args.wfn)
         sync(f"run_{use_phdf5}_start")
         t0 = time.perf_counter()
         out = load_centroids_band_chunked(**base_args, use_phdf5=use_phdf5)
@@ -205,15 +231,17 @@ def _centroids_mode(args, world: int, mesh: Mesh) -> int:
     log(f"band_chunk_size={args.band_chunk_size}  n_chunks={args.n_chunks}  "
         f"nk_tot={sym.nk_tot}  n_centroids={args.n_centroids}")
 
+    cache_tag = " (drop-cache)" if args.drop_cache else " (cached)"
     for path_name, flag in (("legacy", False), ("phdf5", True)):
         # Warm once (compile), then time.
         run(flag)
-        walls = [run(flag) for _ in range(args.timed)]
-        log(f"  {path_name:<6} steady wall: "
+        walls = [run(flag, drop_cache=args.drop_cache)
+                 for _ in range(args.timed)]
+        log(f"  {path_name:<6}{cache_tag} wall: "
             f"mean {np.mean(walls)*1e3:7.1f} ms  "
             f"min {np.min(walls)*1e3:7.1f} ms")
         with jax_profile.trace_section(f"centroids_{path_name}"):
-            run(flag)
+            run(flag, drop_cache=args.drop_cache)
     return 0
 
 
