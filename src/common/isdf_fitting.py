@@ -34,8 +34,8 @@ from .cholesky_2d import (
     tiles_to_dense,
 )
 from .fft_helpers import (
-    make_jittable_local_ifftn_3d,
-    make_jittable_local_fftn_3d,
+    make_flat_k_ifftn,
+    make_flat_k_fftn,
     compute_block_size_for_2d_cholesky,
 )
 from .load_wfns import (
@@ -306,11 +306,11 @@ def compute_CCT_from_left_right(
 	Args:
 		P_l_k: (nk, n_rmu, n_rmu) left pair density, P(None, 'x', 'y')
 		P_r_k: (nk, n_rmu, n_rmu) right pair density, P(None, 'x', 'y')
-		kgrid: (nkx, nky, nkz)
+		kgrid: (nkx, nky, nkz) — the 3-D form only appears inside the FFT helper.
 		mesh_xy: Device mesh
 
 	Returns:
-		C_q: (nqx, nqy, nqz, n_rmu, n_rmu) with P(None, None, None, 'x', 'y')
+		C_q: (nq, n_rmu, n_rmu) flat-q, P(None, 'x', 'y').
 	"""
 	nkx, nky, nkz = kgrid
 	nk, n_rmu, _ = P_l_k.shape
@@ -318,46 +318,29 @@ def compute_CCT_from_left_right(
 	cache_key = ('CCT_LR', id(mesh_xy), nk, n_rmu, nkx)
 
 	if cache_key not in _isdf_pipeline_cache:
-		in_xy = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-		out_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-		# Keep pair-density in (k, mu, nu) layout (good for einsum/matmul contiguity),
-		# and FFT directly over the leading k-grid axes.
-		fft_in = P(None, None, None, 'x', 'y')
-		local_ifftn = make_jittable_local_ifftn_3d(mesh_xy, fft_in, fft_in, norm='forward', axes=(0, 1, 2))
-		local_fftn = make_jittable_local_fftn_3d(mesh_xy, fft_in, fft_in, norm='forward', axes=(0, 1, 2))
+		flat_xy = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+		spec = P(None, None, None, 'x', 'y')
+		local_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, spec, norm='forward')
+		local_fftn  = make_flat_k_fftn( mesh_xy, kgrid, spec, norm='forward')
 
-		# No ``donate_argnums``: XLA can't prove the input→output layout
-		# is donation-compatible (input is rank-3 (nk, μ, μ), output
-		# is rank-5 (nkx, nky, nkz, μ, μ) via reshape inside the jit),
-		# so donating here produces a UserWarning "Some donated buffers
-		# were not usable" on every call and the buffers are copied
-		# anyway.  Leaving this non-donated — the overhead is a single
-		# centroid-CCT call per run.
-		@partial(jax.jit, in_shardings=(in_xy, in_xy), out_shardings=out_xy,
-		         static_argnames=('nkx', 'nky', 'nkz'))
-		def _compute_CCT_LR(P_l: jax.Array, P_r: jax.Array,
-		                    nkx: int, nky: int, nkz: int) -> jax.Array:
-			# Reshape to 3D k-grid: (nk, μ, ν) -> (nkx, nky, nkz, μ, ν)
-			P_l_3d = P_l.reshape(nkx, nky, nkz, n_rmu, n_rmu)
-			P_r_3d = P_r.reshape(nkx, nky, nkz, n_rmu, n_rmu)
-
-			# Use norm='forward' for BOTH IFFT and FFT to match direct k-sum.
-			# With forward: IFFT is unscaled (sum), FFT divides by N.
-			# Convolution theorem: C_q = FFT(IFFT(A)* ⊙ IFFT(B))
-			# This gives C_q = Σ_k A*_k B_{k+q} (matches gw_jax direct sum)
-			P_l_Rt = local_ifftn(P_l_3d)
-			P_r_Rt = local_ifftn(P_r_3d)
-
-			# Cross-product: C_R = conj(P_l_R) * P_r_R (element-wise)
+		# Flat-k in and flat-q out (same (nk, μ, μ) shape and sharding on both
+		# sides).  The 3-D k-grid reshape now lives inside ``local_{i,}fftn``,
+		# so donation is safe: P_l and P_r are consumed by the two IFFTs and
+		# the result preserves rank-3 end-to-end.
+		@partial(jax.jit, in_shardings=(flat_xy, flat_xy), out_shardings=flat_xy,
+		         donate_argnums=(0, 1))
+		def _compute_CCT_LR(P_l: jax.Array, P_r: jax.Array) -> jax.Array:
+			# norm='forward' for BOTH IFFT and FFT — convolution theorem with
+			# unscaled IFFT (sum) + FFT/N matches gw_jax's direct k-sum:
+			#   C_q = FFT(conj(IFFT(A)) ⊙ IFFT(B)) = Σ_k A*_k B_{k+q}.
+			P_l_Rt = local_ifftn(P_l)
+			P_r_Rt = local_ifftn(P_r)
 			C_Rt = jnp.conj(P_l_Rt) * P_r_Rt
-
-			# FFT to q-space
-			C_qt = local_fftn(C_Rt)
-			return C_qt
+			return local_fftn(C_Rt)
 
 		_isdf_pipeline_cache[cache_key] = _compute_CCT_LR
 
-	return _isdf_pipeline_cache[cache_key](P_l_k, P_r_k, nkx, nky, nkz)
+	return _isdf_pipeline_cache[cache_key](P_l_k, P_r_k)
 
 
 def compute_CCT_from_left_right_spin_matrix(
@@ -379,31 +362,40 @@ def compute_CCT_from_left_right_spin_matrix(
 	cache_key = ('CCT_LR_spin_matrix', id(mesh_xy), nk, ns1, ns2, n_rmu, nkx, nky, nkz)
 
 	if cache_key not in _isdf_pipeline_cache:
-		in_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-		out_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-		fft_spin = P(None, None, None, None, None, 'x', 'y')
-		fft_scalar = P(None, None, None, 'x', 'y')
-		local_ifftn_spin = make_jittable_local_ifftn_3d(mesh_xy, fft_spin, fft_spin, norm='forward', axes=(0, 1, 2))
-		local_fftn_scalar = make_jittable_local_fftn_3d(mesh_xy, fft_scalar, fft_scalar, norm='forward', axes=(0, 1, 2))
+		spin_spec = P(None, None, None, 'x', 'y')  # 5-axis: (nk, a, b, μ, μ)
+		scalar_spec = P(None, 'x', 'y')            # 3-axis: (nk, μ, μ)
+		spin_flat_shard = NamedSharding(mesh_xy, spin_spec)
+		scalar_flat_shard = NamedSharding(mesh_xy, scalar_spec)
+		# The 3D-form specs prepend (None, None, None) to the flat spec.
+		fft_spin_3d = P(None, None, None, None, None, 'x', 'y')
+		fft_scalar_3d = P(None, None, None, 'x', 'y')
+		local_ifftn_spin   = make_flat_k_ifftn(mesh_xy, kgrid, fft_spin_3d,   norm='forward')
+		local_fftn_scalar  = make_flat_k_fftn( mesh_xy, kgrid, fft_scalar_3d, norm='forward')
 
-		# No ``donate_argnums``: see note on ``_compute_CCT_LR``
-		# above — rank-3 → rank-5 reshape inside the jit blocks XLA
-		# from proving donation is safe, and it falls back to a copy
-		# with a UserWarning.  Not donated.
-		@partial(jax.jit, in_shardings=(in_xy, in_xy), out_shardings=out_xy,
-		         static_argnames=('nkx', 'nky', 'nkz'))
-		def _compute_CCT_LR_spin(P_l: jax.Array, P_r: jax.Array,
-		                         nkx: int, nky: int, nkz: int) -> jax.Array:
-			P_l_3d = P_l.reshape(nkx, nky, nkz, ns1, ns2, n_rmu, n_rmu)
-			P_r_3d = P_r.reshape(nkx, nky, nkz, ns1, ns2, n_rmu, n_rmu)
-			P_l_Rt = local_ifftn_spin(P_l_3d)
-			P_r_Rt = local_ifftn_spin(P_r_3d)
-			C_Rt = jnp.sum(jnp.conj(P_l_Rt) * P_r_Rt, axis=(3, 4))
+		# Split into two sub-jits so XLA can donate the rank-5 P_l/P_r into
+		# their rank-5 IFFT outputs; the sum-over-spin rank drop (5→3)
+		# happens in the outer jit which doesn't try to donate.
+		@partial(jax.jit, in_shardings=spin_flat_shard, out_shardings=spin_flat_shard,
+		         donate_argnums=(0,))
+		def _ifft_conj(P_l: jax.Array) -> jax.Array:
+			return jnp.conj(local_ifftn_spin(P_l))
+
+		@partial(jax.jit,
+		         in_shardings=(spin_flat_shard, spin_flat_shard),
+		         out_shardings=scalar_flat_shard,
+		         donate_argnums=(0, 1))
+		def _ifft_contract_fft(P_r: jax.Array, P_l_Rt_conj: jax.Array) -> jax.Array:
+			P_r_Rt = local_ifftn_spin(P_r)
+			C_Rt = jnp.sum(P_l_Rt_conj * P_r_Rt, axis=(1, 2))
 			return local_fftn_scalar(C_Rt)
+
+		def _compute_CCT_LR_spin(P_l: jax.Array, P_r: jax.Array) -> jax.Array:
+			P_l_Rt_conj = _ifft_conj(P_l)
+			return _ifft_contract_fft(P_r, P_l_Rt_conj)
 
 		_isdf_pipeline_cache[cache_key] = _compute_CCT_LR_spin
 
-	return _isdf_pipeline_cache[cache_key](P_l_k_ab, P_r_k_ab, nkx, nky, nkz)
+	return _isdf_pipeline_cache[cache_key](P_l_k_ab, P_r_k_ab)
 
 
 def compute_ZCT_from_left_right_zchunk(
@@ -418,45 +410,42 @@ def compute_ZCT_from_left_right_zchunk(
 	Z_q(μ,r) = FFT[ conj(IFFT(P_l(μ,r))) ⊙ IFFT(P_r(μ,r)) ]
 
 	Args:
-		P_l_k_muz: (nkx, nky, nkz, n_rmu, n_zchunk) left pair density in k-grid form
-		          with P(None, None, None, 'x', 'y')
-		P_r_k_muz: (nkx, nky, nkz, n_rmu, n_zchunk) right pair density in k-grid form
-		          with P(None, None, None, 'x', 'y')
-		kgrid: (nkx, nky, nkz)
+		P_l_k_muz: (nk, n_rmu, n_zchunk) left pair density, flat-k, P(None, 'x', 'y').
+		P_r_k_muz: (nk, n_rmu, n_zchunk) right pair density, flat-k, P(None, 'x', 'y').
+		kgrid: (nkx, nky, nkz) — 3-D form appears only inside the FFT helper.
 		mesh_xy: Device mesh
 
 	Returns:
-		Z_q: (nqx, nqy, nqz, n_rmu, n_zchunk) with P(None, None, None, 'x', 'y')
+		Z_q: (nq, n_rmu, n_zchunk) flat-q, P(None, 'x', 'y').
 	"""
 	nkx, nky, nkz = kgrid
-	n_rmu, n_zchunk = P_l_k_muz.shape[3], P_l_k_muz.shape[4]
-	assert P_l_k_muz.shape[:3] == (nkx, nky, nkz), (
-		f"P_l_k_muz leading k-grid dims {P_l_k_muz.shape[:3]} do not match {kgrid}"
+	nk, n_rmu, n_zchunk = P_l_k_muz.shape
+	assert nk == nkx * nky * nkz, (
+		f"P_l_k_muz flat-k dim {nk} does not match kgrid product {nkx*nky*nkz}"
 	)
-	assert P_r_k_muz.shape[:3] == (nkx, nky, nkz), (
-		f"P_r_k_muz leading k-grid dims {P_r_k_muz.shape[:3]} do not match {kgrid}"
+	assert P_r_k_muz.shape == P_l_k_muz.shape, (
+		f"P_l/P_r shape mismatch: {P_l_k_muz.shape} vs {P_r_k_muz.shape}"
 	)
 
-	cache_key = ('ZCT_LR', id(mesh_xy), nkx, nky, nkz, n_rmu, n_zchunk)
+	cache_key = ('ZCT_LR', id(mesh_xy), nk, n_rmu, n_zchunk)
 
 	if cache_key not in _isdf_pipeline_cache:
-		out_xy = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-		# Keep pair-density in (k, mu, z) layout (good for einsum/matmul contiguity),
-		# and FFT directly over the leading k-grid axes.
-		fft_in = P(None, None, None, 'x', 'y')
-		fft_shard = NamedSharding(mesh_xy, fft_in)
-		local_ifftn = make_jittable_local_ifftn_3d(mesh_xy, fft_in, fft_in, norm='forward', axes=(0, 1, 2))
-		local_fftn = make_jittable_local_fftn_3d(mesh_xy, fft_in, fft_in, norm='forward', axes=(0, 1, 2))
+		flat_spec = P(None, 'x', 'y')
+		flat_shard = NamedSharding(mesh_xy, flat_spec)
+		spec_3d = P(None, None, None, 'x', 'y')
+		local_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, spec_3d, norm='forward')
+		local_fftn  = make_flat_k_fftn( mesh_xy, kgrid, spec_3d, norm='forward')
 
-		@partial(jax.jit, in_shardings=fft_shard, out_shardings=fft_shard, donate_argnums=(0,))
-		def _left_ifft_conj(P_l_3d: jax.Array) -> jax.Array:
-			# Use norm='forward' to match direct k-sum convention.
-			return jnp.conj(local_ifftn(P_l_3d))
+		@partial(jax.jit, in_shardings=flat_shard, out_shardings=flat_shard,
+		         donate_argnums=(0,))
+		def _left_ifft_conj(P_l: jax.Array) -> jax.Array:
+			return jnp.conj(local_ifftn(P_l))
 
-		@partial(jax.jit, in_shardings=(fft_shard, fft_shard), out_shardings=out_xy, donate_argnums=(0,))
-		def _right_ifft_mul_fft(P_r_3d: jax.Array, P_l_Rt: jax.Array) -> jax.Array:
-			# Keep R-side intermediate internal to avoid materializing both Rt arrays at API boundary.
-			P_r_Rt = local_ifftn(P_r_3d)
+		@partial(jax.jit,
+		         in_shardings=(flat_shard, flat_shard), out_shardings=flat_shard,
+		         donate_argnums=(0, 1))
+		def _right_ifft_mul_fft(P_r: jax.Array, P_l_Rt: jax.Array) -> jax.Array:
+			P_r_Rt = local_ifftn(P_r)
 			Z_Rt = P_l_Rt * P_r_Rt
 			return local_fftn(Z_Rt)
 
@@ -481,37 +470,39 @@ def compute_ZCT_from_left_right_zchunk_spin_matrix(
 	Z_q(mu,r) = FFT[ sum_ab conj(IFFT(P_l_ab(mu,r))) * IFFT(P_r_ab(mu,r)) ].
 	"""
 	nkx, nky, nkz = kgrid
-	assert P_l_k_ab_muz.shape[:3] == (nkx, nky, nkz), (
-		f"P_l_k_ab_muz leading k-grid dims {P_l_k_ab_muz.shape[:3]} do not match {kgrid}"
+	nk, n_s1, n_s2, n_rmu, n_zchunk = P_l_k_ab_muz.shape
+	assert nk == nkx * nky * nkz, (
+		f"P_l_k_ab_muz flat-k dim {nk} does not match kgrid product {nkx*nky*nkz}"
 	)
-	assert P_r_k_ab_muz.shape[:3] == (nkx, nky, nkz), (
-		f"P_r_k_ab_muz leading k-grid dims {P_r_k_ab_muz.shape[:3]} do not match {kgrid}"
-	)
-	n_s1, n_s2, n_rmu, n_zchunk = (
-		P_l_k_ab_muz.shape[3],
-		P_l_k_ab_muz.shape[4],
-		P_l_k_ab_muz.shape[5],
-		P_l_k_ab_muz.shape[6],
+	assert P_r_k_ab_muz.shape == P_l_k_ab_muz.shape, (
+		f"P_l/P_r shape mismatch: {P_l_k_ab_muz.shape} vs {P_r_k_ab_muz.shape}"
 	)
 
-	cache_key = ('ZCT_LR_spin_matrix', id(mesh_xy), nkx, nky, nkz, n_s1, n_s2, n_rmu, n_zchunk)
+	cache_key = ('ZCT_LR_spin_matrix', id(mesh_xy), nk, n_s1, n_s2, n_rmu, n_zchunk)
 
 	if cache_key not in _isdf_pipeline_cache:
-		fft_spin = P(None, None, None, None, None, 'x', 'y')
-		fft_scalar = P(None, None, None, 'x', 'y')
-		fft_shard_spin = NamedSharding(mesh_xy, fft_spin)
-		out_xy = NamedSharding(mesh_xy, fft_scalar)
-		local_ifftn_spin = make_jittable_local_ifftn_3d(mesh_xy, fft_spin, fft_spin, norm='forward', axes=(0, 1, 2))
-		local_fftn_scalar = make_jittable_local_fftn_3d(mesh_xy, fft_scalar, fft_scalar, norm='forward', axes=(0, 1, 2))
+		spin_spec = P(None, None, None, 'x', 'y')  # 5-axis: (nk, a, b, μ, z)
+		scalar_spec = P(None, 'x', 'y')            # 3-axis: (nk, μ, z)
+		spin_flat_shard = NamedSharding(mesh_xy, spin_spec)
+		scalar_flat_shard = NamedSharding(mesh_xy, scalar_spec)
+		spec_spin_3d = P(None, None, None, None, None, 'x', 'y')
+		spec_scalar_3d = P(None, None, None, 'x', 'y')
+		local_ifftn_spin   = make_flat_k_ifftn(mesh_xy, kgrid, spec_spin_3d,   norm='forward')
+		local_fftn_scalar  = make_flat_k_fftn( mesh_xy, kgrid, spec_scalar_3d, norm='forward')
 
-		@partial(jax.jit, in_shardings=fft_shard_spin, out_shardings=fft_shard_spin, donate_argnums=(0,))
-		def _left_ifft_conj(P_l_3d: jax.Array) -> jax.Array:
-			return jnp.conj(local_ifftn_spin(P_l_3d))
+		@partial(jax.jit, in_shardings=spin_flat_shard, out_shardings=spin_flat_shard,
+		         donate_argnums=(0,))
+		def _left_ifft_conj(P_l: jax.Array) -> jax.Array:
+			return jnp.conj(local_ifftn_spin(P_l))
 
-		@partial(jax.jit, in_shardings=(fft_shard_spin, fft_shard_spin), out_shardings=out_xy, donate_argnums=(0,))
-		def _right_ifft_contract_fft(P_r_3d: jax.Array, P_l_Rt: jax.Array) -> jax.Array:
-			P_r_Rt = local_ifftn_spin(P_r_3d)
-			Z_Rt = jnp.sum(P_l_Rt * P_r_Rt, axis=(3, 4))
+		@partial(jax.jit,
+		         in_shardings=(spin_flat_shard, spin_flat_shard),
+		         out_shardings=scalar_flat_shard,
+		         donate_argnums=(0, 1))
+		def _right_ifft_contract_fft(P_r: jax.Array, P_l_Rt: jax.Array) -> jax.Array:
+			P_r_Rt = local_ifftn_spin(P_r)
+			# Sum over spin channels (axes 1, 2 on flat-k rank-5 tensor).
+			Z_Rt = jnp.sum(P_l_Rt * P_r_Rt, axis=(1, 2))
 			return local_fftn_scalar(Z_Rt)
 
 		def _compute_ZCT_LR_spin(P_l: jax.Array, P_r: jax.Array) -> jax.Array:
@@ -1252,48 +1243,24 @@ def fit_zeta_chunked_to_h5(
             # table prints pair-density as the merged total.
             t_pair_total += time.perf_counter() - t0
 
-            # Reshape to explicit 3D k-grid before ZCT kernels so donation-compatible
-            # stages see consistent input/output ranks and sharding.
-            if isdf_pair_mode == "spin_traced":
-                fft_chunk_shard = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-                P_l_k_mux = jax.lax.with_sharding_constraint(
-                    P_l_k_mux.reshape(nqx, nqy, nqz, n_rmu, actual_n_rchunk),
-                    fft_chunk_shard,
-                )
-                P_r_k_mux = jax.lax.with_sharding_constraint(
-                    P_r_k_mux.reshape(nqx, nqy, nqz, n_rmu, actual_n_rchunk),
-                    fft_chunk_shard,
-                )
-            else:
-                n_s = meta.nspinor
-                fft_chunk_spin_shard = NamedSharding(mesh_xy, P(None, None, None, None, None, 'x', 'y'))
-                P_l_k_mux = jax.lax.with_sharding_constraint(
-                    P_l_k_mux.reshape(nqx, nqy, nqz, n_s, n_s, n_rmu, actual_n_rchunk),
-                    fft_chunk_spin_shard,
-                )
-                P_r_k_mux = jax.lax.with_sharding_constraint(
-                    P_r_k_mux.reshape(nqx, nqy, nqz, n_s, n_s, n_rmu, actual_n_rchunk),
-                    fft_chunk_spin_shard,
-                )
-
-            # 6c. Compute Z_q via left/right cross-product FFT
+            # 6c. Compute Z_q via left/right cross-product FFT.
+            # P_l_k_mux / P_r_k_mux stay flat-k throughout — the 3-D k-grid
+            # only appears inside the FFT helper.  The ZCT kernels return
+            # flat-q (nq, μ, z-chunk) matching the input sharding.
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.ZCT"):
                 if isdf_pair_mode == "spin_traced":
-                    Z_q = compute_ZCT_from_left_right_zchunk(
+                    Z_q_flat = compute_ZCT_from_left_right_zchunk(
                         P_l_k_mux, P_r_k_mux, kgrid, mesh_xy
                     )
                 else:
-                    Z_q = compute_ZCT_from_left_right_zchunk_spin_matrix(
+                    Z_q_flat = compute_ZCT_from_left_right_zchunk_spin_matrix(
                         P_l_k_mux, P_r_k_mux, kgrid, mesh_xy
                     )
-                # No block_until_ready on Z_q — reshape consumes it asynchronously.
-                # P_l/P_r become unreferenced and will be freed by XLA when Z_q
-                # computation completes (they're consumed by the ZCT JIT).
+                # P_l/P_r are consumed by the ZCT jits (donate_argnums);
+                # no-op del for name-scope hygiene.
                 del P_l_k_mux, P_r_k_mux
 
-                Z_q_flat = Z_q.reshape(nq, n_rmu, actual_n_rchunk)
-                del Z_q  # free 3D ref; reshape may share buffer
                 Z_q_flat = jax.lax.with_sharding_constraint(Z_q_flat, flat_shard)
                 # No block_until_ready — reshard will consume Z_q_flat asynchronously.
             t_zct_total += time.perf_counter() - t0

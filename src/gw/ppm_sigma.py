@@ -446,29 +446,16 @@ def _get_sigma_kij_kernel(
     if pipeline_key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[pipeline_key]
 
-    from common.fft_helpers import (
-        make_jittable_local_fftn_3d,
-        make_jittable_local_ifftn_3d,
-    )
+    from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
 
     w_isdf._ensure_compilation_cache()
+    kgrid = (nkx, nky, nkz)
     _G_spec = P(None, None, None, None, 'x', None, 'y')
     _V_spec = P(None, None, None, 'x', 'y')
-    _G_shard = NamedSharding(mesh_xy, _G_spec)
-    _V_shard = NamedSharding(mesh_xy, _V_spec)
-    _G_ifftn = make_jittable_local_ifftn_3d(mesh_xy, _G_spec, _G_spec, norm='ortho', axes=(0, 1, 2))
-    _G_fftn = make_jittable_local_fftn_3d(mesh_xy, _G_spec, _G_spec, norm='ortho', axes=(0, 1, 2))
-    _V_ifftn = make_jittable_local_ifftn_3d(mesh_xy, _V_spec, _V_spec, norm='ortho', axes=(0, 1, 2))
-    nk = nkx * nky * nkz
+    _G_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _G_spec, norm='ortho')
+    _G_fftn  = make_flat_k_fftn( mesh_xy, kgrid, _G_spec, norm='ortho')
+    _V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _V_spec, norm='ortho')
     inv_sqrt_nk = -1.0 / np.sqrt(float(nk_tot))
-
-    def _fft_flat_G(x_k, fft_fn):
-        x_3d = jax.lax.with_sharding_constraint(x_k.reshape(nkx, nky, nkz, *x_k.shape[1:]), _G_shard)
-        return fft_fn(x_3d).reshape(nk, *x_k.shape[1:])
-
-    def _fft_flat_V(x_k):
-        x_3d = jax.lax.with_sharding_constraint(x_k.reshape(nkx, nky, nkz, *x_k.shape[1:]), _V_shard)
-        return _V_ifftn(x_3d).reshape(nk, *x_k.shape[1:])
 
     from .greens_function_kernel import build_G as _build_G
 
@@ -485,9 +472,9 @@ def _get_sigma_kij_kernel(
         Output (Σ_ri) emerges (m_X, n_Y)-sharded from the final shard_map.
         """
         G_k = _build_G(psi_coh_rmuT_X, psi_coh_rmu_Y, Gij=Gij)
-        G_R = _fft_flat_G(G_k, _G_ifftn)
-        V_R = _fft_flat_V(W_q)[:, None, :, None, :]  # (nk,1,μ,1,μ) broadcast to G shape
-        sigma_k = _fft_flat_G(G_R * V_R * inv_sqrt_nk, _G_fftn)
+        G_R = _G_ifftn(G_k)
+        V_R = _V_ifftn(W_q)[:, None, :, None, :]  # (nk,1,μ,1,μ) broadcast to G shape
+        sigma_k = _G_fftn(G_R * V_R * inv_sqrt_nk)
         return _project_ri_rs(psi_proj_rmu_X, sigma_k, psi_proj_rmuT_Y)
 
     _sigma_kij_kernel_cache[pipeline_key] = _sigma_kij_kernel

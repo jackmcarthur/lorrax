@@ -349,25 +349,13 @@ def main(argv=None):
 	_nk_tot = int(meta.nk_tot)
 
 	# FFT helpers: flat-k ↔ flat-R.  Callers pass flat arrays, never see 3D k-grid.
-	from common.fft_helpers import make_jittable_local_fftn_3d, make_jittable_local_ifftn_3d
+	from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
 
-	def _make_fft_pair(spec):
-		"""Build IFFT/FFT pair that accept flat-k-first and return flat-R/k-first."""
-		shard = NamedSharding(mesh_xy, spec)
-		raw_ifftn = make_jittable_local_ifftn_3d(mesh_xy, spec, spec, norm='ortho', axes=(0, 1, 2))
-		raw_fftn = make_jittable_local_fftn_3d(mesh_xy, spec, spec, norm='ortho', axes=(0, 1, 2))
-		@jax.jit
-		def ifftn(x_k):
-			x_3d = jax.lax.with_sharding_constraint(x_k.reshape(*kgrid, *x_k.shape[1:]), shard)
-			return raw_ifftn(x_3d).reshape(_nk_tot, *x_k.shape[1:])
-		@jax.jit
-		def fftn(x_R):
-			x_3d = jax.lax.with_sharding_constraint(x_R.reshape(*kgrid, *x_R.shape[1:]), shard)
-			return raw_fftn(x_3d).reshape(_nk_tot, *x_R.shape[1:])
-		return ifftn, fftn
-
-	_G_ifftn, _G_fftn = _make_fft_pair(P(None, None, None, None, 'x', None, 'y'))
-	_V_ifftn, _ = _make_fft_pair(P(None, None, None, 'x', 'y'))
+	_G_spec = P(None, None, None, None, 'x', None, 'y')
+	_V_spec = P(None, None, None, 'x', 'y')
+	_G_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _G_spec, norm='ortho')
+	_G_fftn  = make_flat_k_fftn( mesh_xy, kgrid, _G_spec, norm='ortho')
+	_V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _V_spec, norm='ortho')
 
 	_inv_sqrt_nk = -1.0 / jnp.sqrt(_nk_tot)
 

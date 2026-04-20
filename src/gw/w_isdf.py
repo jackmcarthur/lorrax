@@ -42,7 +42,7 @@ def _ensure_compilation_cache():
 
 def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
     """Build chi0 kernel with device-local FFTs.  Returns flat-q χ₀(nq, μ, μ)."""
-    from common.fft_helpers import make_jittable_local_fftn_3d, make_jittable_local_ifftn_3d
+    from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
 
     nkx, nky, nkz = kgrid
     nk = nkx * nky * nkz
@@ -50,29 +50,14 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 
-    # Flat FFT helpers using device-local shard_map (production path)
+    # Flat-k FFT helpers — callers see only (nk, *trail) arrays.
     _Gv_spec = P(None, None, None, None, 'x', None, 'y')
     _Gc_spec = P(None, None, None, None, 'y', None, 'x')
     _chi_spec = P(None, None, None, 'x', 'y')
-    _Gv_shard = NamedSharding(mesh_xy, _Gv_spec)
-    _Gc_shard = NamedSharding(mesh_xy, _Gc_spec)
-    _chi_shard = NamedSharding(mesh_xy, _chi_spec)
 
-    _raw_ifftn_Gv = make_jittable_local_ifftn_3d(mesh_xy, _Gv_spec, _Gv_spec, norm='ortho', axes=(0, 1, 2))
-    _raw_fftn_Gc = make_jittable_local_fftn_3d(mesh_xy, _Gc_spec, _Gc_spec, norm='ortho', axes=(0, 1, 2))
-    _raw_fftn_chi = make_jittable_local_fftn_3d(mesh_xy, _chi_spec, _chi_spec, norm='ortho', axes=(0, 1, 2))
-
-    def _Gv_ifftn(g_k):
-        return _raw_ifftn_Gv(jax.lax.with_sharding_constraint(
-            g_k.reshape(nkx, nky, nkz, *g_k.shape[1:]), _Gv_shard)).reshape(nk, *g_k.shape[1:])
-
-    def _Gc_fftn(g_k):
-        return _raw_fftn_Gc(jax.lax.with_sharding_constraint(
-            g_k.reshape(nkx, nky, nkz, *g_k.shape[1:]), _Gc_shard)).reshape(nk, *g_k.shape[1:])
-
-    def _chi_fftn_local(c_R):
-        return _raw_fftn_chi(jax.lax.with_sharding_constraint(
-            c_R.reshape(nkx, nky, nkz, *c_R.shape[1:]), _chi_shard)).reshape(nk, *c_R.shape[1:])
+    _Gv_ifftn      = make_flat_k_ifftn(mesh_xy, kgrid, _Gv_spec,  norm='ortho')
+    _Gc_fftn       = make_flat_k_fftn( mesh_xy, kgrid, _Gc_spec,  norm='ortho')
+    _chi_fftn_local = make_flat_k_fftn(mesh_xy, kgrid, _chi_spec, norm='ortho')
 
     from .greens_function_kernel import build_G as _build_G_mm
 

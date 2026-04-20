@@ -1,5 +1,7 @@
 import math
+from typing import Callable
 
+import jax
 import jax.numpy as jnp
 from jax.experimental.custom_partitioning import custom_partitioning
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -241,3 +243,83 @@ def make_sharded_fftn_3d(
         return jnp.fft.fftn(x_local, axes=axes, norm=norm)
 
     return shard_map(_local_fftn, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec)
+
+
+# ============================================================================
+# Flat-k FFT helpers — callers operate on (nk, *trail) arrays everywhere and
+# the k-grid 3D form only exists inside this wrapper, matching the
+# "flatten kx/ky/kz except inside the FFT" convention used across the GW
+# pipeline (w_isdf chi0, ppm_sigma, gw_jax static COHSEX, isdf_fitting
+# CCT/ZCT).  Internally: reshape (nk, *trail) -> (nkx, nky, nkz, *trail),
+# pin with `with_sharding_constraint`, run a jittable device-local 3D FFT
+# over the leading (0, 1, 2) k-axes, reshape back to (nk, *trail).
+# ============================================================================
+
+
+def make_flat_k_fft(
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    spec: P,
+    *,
+    kind: str,
+    norm: str | None = 'ortho',
+    out_spec: P | None = None,
+) -> Callable:
+    """Return a flat-k FFT: ``(nk, *trail) -> (nk, *trail)``.
+
+    ``spec`` is the ``PartitionSpec`` on the 3-D form
+    ``(nkx, nky, nkz, *trail)``.  The three leading k-axes must be
+    replicated (``None``) so the inner custom-partitioned FFT sees the
+    full FFT axis on every device.  ``out_spec`` defaults to ``spec``;
+    pass a different one only if a post-FFT reshard is wanted.
+
+    ``kind='ifftn'`` or ``'fftn'`` selects the direction.  ``norm``
+    follows ``jnp.fft.*`` ('ortho', 'forward', 'backward' / None).
+    """
+    nkx, nky, nkz = (int(v) for v in kgrid)
+    nk = nkx * nky * nkz
+    in_shard = NamedSharding(mesh, spec)
+    if kind == 'ifftn':
+        inner = make_jittable_local_ifftn_3d(
+            mesh, spec, out_spec if out_spec is not None else spec,
+            norm=norm, axes=(0, 1, 2))
+    elif kind == 'fftn':
+        inner = make_jittable_local_fftn_3d(
+            mesh, spec, out_spec if out_spec is not None else spec,
+            norm=norm, axes=(0, 1, 2))
+    else:
+        raise ValueError(f"kind must be 'ifftn' or 'fftn', got {kind!r}")
+
+    def _flat_k_fft(x_flat):
+        trail = x_flat.shape[1:]
+        x_3d = jax.lax.with_sharding_constraint(
+            x_flat.reshape(nkx, nky, nkz, *trail), in_shard)
+        return inner(x_3d).reshape(nk, *trail)
+
+    return _flat_k_fft
+
+
+def make_flat_k_ifftn(
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    spec: P,
+    *,
+    norm: str | None = 'ortho',
+    out_spec: P | None = None,
+) -> Callable:
+    """Flat-k IFFT ``(nk, *trail) -> (nk, *trail)``.  See :func:`make_flat_k_fft`."""
+    return make_flat_k_fft(mesh, kgrid, spec, kind='ifftn',
+                           norm=norm, out_spec=out_spec)
+
+
+def make_flat_k_fftn(
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    spec: P,
+    *,
+    norm: str | None = 'ortho',
+    out_spec: P | None = None,
+) -> Callable:
+    """Flat-k FFT ``(nk, *trail) -> (nk, *trail)``.  See :func:`make_flat_k_fft`."""
+    return make_flat_k_fft(mesh, kgrid, spec, kind='fftn',
+                           norm=norm, out_spec=out_spec)
