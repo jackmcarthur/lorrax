@@ -98,6 +98,13 @@ def main() -> int:
                          "disk instead of the OS page cache — necessary for "
                          "a fair legacy-vs-phdf5 I/O comparison on small "
                          "WFN files that would otherwise be RAM-resident.")
+    ap.add_argument("--memory-per-device-gb", type=float, default=0.0,
+                    help="Force ``meta.memory_per_device_gb`` to this "
+                         "value so the k-chunker sizes against a known "
+                         "budget; a post-run ``peak_bytes_in_use`` readout "
+                         "then tells us whether the 9x peak-copies "
+                         "heuristic lines up with what XLA actually "
+                         "allocates.")
     args = ap.parse_args()
 
     world = jax.process_count()
@@ -194,7 +201,8 @@ def _centroids_mode(args, world: int, mesh: Mesh) -> int:
         fft_grid=fft_grid, nspinor=int(wfn.nspinor),
         nspinor_wfnfile=int(wfn.nspinor),
         nk_tot=int(sym.nk_tot),
-        kgrid=tuple(int(x) for x in wfn.kgrid))
+        kgrid=tuple(int(x) for x in wfn.kgrid),
+        memory_per_device_gb=args.memory_per_device_gb)
     nb_total = args.band_chunk_size * args.n_chunks
     if nb_total > wfn.nbands:
         log(f"ERROR: want {nb_total} bands but wfn has only {wfn.nbands}")
@@ -242,6 +250,13 @@ def _centroids_mode(args, world: int, mesh: Mesh) -> int:
             f"min {np.min(walls)*1e3:7.1f} ms")
         with jax_profile.trace_section(f"centroids_{path_name}"):
             run(flag, drop_cache=args.drop_cache)
+        # Report per-device peak high-water mark for this path.
+        peak = jax.local_devices()[0].memory_stats().get(
+            "peak_bytes_in_use", 0)
+        log(f"  {path_name:<6} local-device peak_bytes_in_use: "
+            f"{peak/1e9:.2f} GB"
+            + (f"   budget={args.memory_per_device_gb:.2f} GB"
+               if args.memory_per_device_gb > 0 else ""))
     return 0
 
 
