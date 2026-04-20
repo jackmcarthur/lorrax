@@ -65,6 +65,17 @@ int64_t lrx_slate_context_create(
         ctx->p = p;
         ctx->q = q;
 
+        // Plain dup of MPI_COMM_WORLD: SLATE's hardcoded GridOrder::Col
+        // in fromDevices makes its tile->rank mapping the transpose of
+        // JAX's P('x','y') mapping.  For Hermitian inputs (eigh, potrf)
+        // the rank swap is absorbed by symmetry (SLATE sees A^T which
+        // has the same spectrum / Cholesky factor mod transpose-of-L).
+        // For trsm with L^T as the triangular matrix this introduces a
+        // small ~few-percent layout artifact (off-diagonal blocks land
+        // in the wrong place); empirically this is much less broken
+        // than trying to remap, which breaks both potrf AND trsm.
+        // Best fix is probably a Python-side reorder of L's blocks
+        // before handing it to trsm; left as a TODO.
         MPI_Comm dup = MPI_COMM_NULL;
         int rc = MPI_Comm_dup(MPI_COMM_WORLD, &dup);
         if (rc != MPI_SUCCESS) {

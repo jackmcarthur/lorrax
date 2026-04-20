@@ -45,6 +45,8 @@ _FFI_TARGET_SYMBOLS = {
     "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkFfi",
     "lorrax_phdf5_read_kchunk_union": "PhdfReadKchunkUnionFfi",
     "lorrax_slate_eigh":              "SlateEighFfi",
+    "lorrax_slate_potrf":             "SlatePotrfFfi",
+    "lorrax_slate_trsm":              "SlateTrsmFfi",
 }
 
 # Error buffer size for the lrx_ wrappers.

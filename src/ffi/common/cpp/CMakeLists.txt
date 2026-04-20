@@ -355,6 +355,8 @@ if(LORRAX_HAVE_SLATE)
     list(APPEND LORRAX_FFI_SOURCES
         ../../slate/cpp/context.cc
         ../../slate/cpp/eigh_ffi.cc
+        ../../slate/cpp/potrf_ffi.cc
+        ../../slate/cpp/trsm_ffi.cc
     )
 endif()
 

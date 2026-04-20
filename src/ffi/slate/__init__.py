@@ -11,6 +11,8 @@ on a square ``('x','y')`` mesh.  See ``eigh.py`` for the shape contract.
 """
 from __future__ import annotations
 
+from .cholesky import distributed_cholesky  # noqa: F401
 from .eigh import distributed_eigh  # noqa: F401
+from .trsm import distributed_trsm  # noqa: F401
 
-__all__ = ["distributed_eigh"]
+__all__ = ["distributed_cholesky", "distributed_eigh", "distributed_trsm"]
