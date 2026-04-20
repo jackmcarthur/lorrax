@@ -175,7 +175,25 @@ class _FfiBackend:
         # attr + shape/dtype signature, so repeat writes at identical
         # signatures reuse the jit cache instead of recompiling.
         self._sm_cache: dict = {}
-        self._dispatch_queue: queue.Queue = queue.Queue()
+        # Bound the write-dispatch queue to prevent GPU memory growth
+        # across chunks.  Each queued ``_task`` closure captures its
+        # input ``A`` (the jax.Array being written) by Python reference
+        # — XLA's allocator counts A as live-in-use until the closure
+        # runs and returns.  With H5Dwrite at ~11 s per chunk and
+        # chunk-compute at ~1-2 s, an unbounded queue grows ~1 task per
+        # chunk at steady state, so each chunk's A accumulates on GPU
+        # and ``bytes_in_use`` rises by ~1 zeta_chunk/rank per chunk
+        # until OOM.  Measured on Si 4x4x4 60Ry / 2400 centroids / mem16:
+        # unbounded → 12.91 → 22.48 GB over 12 chunks (growing); K=4 →
+        # plateaus at 18.5 GB from chunk 4 onward.  K=4 balances
+        # throughput (compute runs ahead of the writer) with bounded
+        # residue (K × per-rank zeta_chunk).  Writer is the bottleneck
+        # regardless, so larger K has diminishing throughput benefit.
+        # Override via ``LORRAX_WRITE_QUEUE_MAXSIZE``; set to 0 for
+        # legacy unbounded behavior (not recommended — causes OOM on
+        # multi-chunk runs with chunk size ≥ ~1 GB).
+        _qmax = int(os.environ.get('LORRAX_WRITE_QUEUE_MAXSIZE', '4'))
+        self._dispatch_queue: queue.Queue = queue.Queue(maxsize=_qmax)
         self._dispatch_pending: int = 0          # protected by _pending_mu
         self._pending_mu = threading.Lock()
         self._pending_cv = threading.Condition(self._pending_mu)
@@ -340,11 +358,17 @@ class _FfiBackend:
                 in_specs=(in_specs, P()), out_specs=P(),
                 check_rep=False,
             )
-            # Wrap in jax.jit so the trace+compile is cached at the
-            # JAX jit level.  Without this, shard_map re-traces on each
-            # call even though we reuse the same ``sm`` object — visible
-            # in the HLO dump as multiple identical-signature modules.
-            sm = jax.jit(sm_bare)
+            # DIAGNOSTIC: LORRAX_WRITE_NO_JIT=1 bypasses the jax.jit
+            # wrapper — tests whether jit's argument-retention cache is
+            # what's leaking ~1 zeta_chunk/rank per write.
+            if os.environ.get('LORRAX_WRITE_NO_JIT'):
+                sm = sm_bare
+            else:
+                # Wrap in jax.jit so the trace+compile is cached at the
+                # JAX jit level.  Without this, shard_map re-traces on each
+                # call even though we reuse the same ``sm`` object — visible
+                # in the HLO dump as multiple identical-signature modules.
+                sm = jax.jit(sm_bare)
             self._sm_cache[cache_key] = sm
 
         # Enqueue dispatch onto the Python worker thread.  Main thread
