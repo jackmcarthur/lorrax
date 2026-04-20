@@ -51,6 +51,7 @@ struct PhdfCtx {
     cudaStream_t stream              = nullptr;
     void*        pinned_buf          = nullptr;
     size_t       pinned_capacity     = 0;
+    int          cuda_device         = -1;         // CUDA device id the main thread was on at open_ctx time; the writer_thread binds here before running any CUDA API (otherwise GPU pointers from main thread's context aren't recognised → cudaErrorMemoryAllocation on cudaMemcpyAsync).
     // Reused I/O-completion events.  Created in open_ctx, destroyed
     // in close_ctx.  Per-call cudaEventCreate/Destroy blocks for
     // ~800 ms on non-root ranks when xla_stream has a backlog

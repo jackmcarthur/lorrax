@@ -244,6 +244,12 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
     H5Pset_dxpl_mpio(ctx->dxpl_indep, H5FD_MPIO_INDEPENDENT);
 
     // --- private CUDA stream for D2H staging ---
+    // Record the current device so the writer_thread can bind to the
+    // same one; GPU pointers allocated under the main thread's JAX
+    // context aren't recognised on a different device and
+    // cudaMemcpyAsync returns cudaErrorMemoryAllocation.
+    throw_if_cuda(cudaGetDevice(&ctx->cuda_device),
+                  "cudaGetDevice(phdf5 ctx)");
     throw_if_cuda(cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking),
                   "cudaStreamCreate(phdf5 ctx)");
 
@@ -254,7 +260,13 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
                   "cudaEventCreate(phdf5 h2d_event)");
 
     // --- start dedicated writer thread (FIFO task queue) ---
+    // The worker thread must attach to the CUDA primary context before
+    // any task runs — write tasks don't call CUDA themselves but read
+    // tasks do (cudaMemcpyAsync H2D after the H5Dread).  Without this
+    // the runtime returns cudaErrorMemoryAllocation on the first CUDA
+    // call from this thread.
     ctx->writer_thread = std::thread([ctx]() {
+        cudaSetDevice(ctx->cuda_device);
         for (;;) {
             std::function<void()> task;
             {
