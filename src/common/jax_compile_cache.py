@@ -24,6 +24,7 @@ compat with existing user shell aliases and run scripts.
 from __future__ import annotations
 
 import os
+import warnings
 from pathlib import Path
 
 _COMPILATION_CACHE_READY = False
@@ -42,12 +43,42 @@ def ensure_jax_compile_cache() -> None:
     skips truly trivial compiles (const, simple reshape, etc.), so
     "cache everything" is already reasonably targeted.
 
+    Partitioning: cache entries are nested under
+    ``{base}/np{N_proc}/rank{N}/`` so each rank reads/writes its
+    own dir.  JAX's cache key hashes in the per-rank device
+    assignment, which means rank 1 would previously try to load
+    rank 0's entries, find a device-index mismatch, and emit a
+    ``"Device assignment does not have any local devices"`` warning
+    per primitive per JIT on every warm run.  With per-rank dirs
+    each rank only ever sees its own entries, so the mismatch
+    never arises.  Shared-cache sharing across ranks was a marginal
+    optimisation (rank writes, another rank reads) and in practice
+    the per-rank caches converge within one warm run.
+
+    Also silences the legacy warning via a targeted
+    ``warnings.filterwarnings`` as defense-in-depth for cases where
+    a pre-existing shared cache (e.g. from older versions of this
+    helper) is still on disk.
+
     Idempotent: safe to call multiple times.  Calling from two
     different drivers in the same process is fine.
     """
     global _COMPILATION_CACHE_READY
     if _COMPILATION_CACHE_READY:
         return
+
+    # Silence "Error reading persistent compilation cache entry ...
+    # Device assignment does not have any local devices" — emitted by
+    # jax/_src/compiler.py when it finds a cache entry whose device
+    # binding doesn't match this rank.  Non-fatal; JAX recompiles.
+    # Filter is global but message-specific so other warnings are
+    # untouched.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Error reading persistent compilation cache entry .*",
+        category=UserWarning,
+    )
+
     cache_dir = os.environ.get("ISDF_JAX_CACHE_DIR")
     if cache_dir is None:
         base_cache = os.environ.get(
@@ -56,25 +87,15 @@ def ensure_jax_compile_cache() -> None:
     if not cache_dir:  # explicit opt-out via ISDF_JAX_CACHE_DIR=""
         _COMPILATION_CACHE_READY = True
         return
-    # Namespace cache by num_processes.  JAX's persistent cache
-    # hashes device assignment into the key; a run with different
-    # process count has different device assignment and the entries
-    # wouldn't be re-usable anyway.  Within a given n_proc we let all
-    # ranks share a dir — in SPMD patterns (gw_jax with shard_map)
-    # every rank has an identical cache key so sharing lets each
-    # rank read any rank's saved entries; in k-parallel DP patterns
-    # (psp.run_nscf, rank N owns local GPU N) JAX writes entries
-    # only on rank 0 anyway, so sharing is equivalent to per-rank.
-    # The DP case may emit "Device assignment does not have any
-    # local devices" warnings when ranks 1-3 try to load rank 0's
-    # entries — those warnings are non-fatal (the compile proceeds),
-    # cost ~ms each, and only happen on one warm run per cache.
     try:
         import jax as _jax
         n_proc = _jax.process_count()
+        proc_idx = _jax.process_index()
     except Exception:
         n_proc = 1
-    cache_path = Path(cache_dir).expanduser() / f"np{n_proc}"
+        proc_idx = 0
+    cache_path = (Path(cache_dir).expanduser()
+                  / f"np{n_proc}" / f"rank{proc_idx}")
     try:
         cache_path.mkdir(parents=True, exist_ok=True)
     except Exception:
