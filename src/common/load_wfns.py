@@ -431,37 +431,42 @@ def get_psi_rchunk(
         # Slow path: load G-space from HDF5 for each band chunk
         num_band_chunks = (nb_total + band_chunk_size - 1) // band_chunk_size
         phdf5_reader = None
-        if use_phdf5 and nk_batch >= nk_tot:
+        if use_phdf5:
             from common.phdf5_wfn_reader import PhdfWfnReader
             phdf5_reader = PhdfWfnReader(wfn._filename, mesh=mesh_xy)
         for bc_idx in range(num_band_chunks):
             bc_start = b_start + bc_idx * band_chunk_size
             bc_end = min(bc_start + band_chunk_size, b_end)
             bc_range = (bc_start, bc_end)
-            if phdf5_reader is not None:
-                global_psi_Gtot = phdf5_reader.coeffs_gspace(bc_range)
-            else:
-                global_psi_Gtot, _ = read_Gvecs_to_devices(
-                    wfn, sym, bc_range, meta, bispinor, mesh_xy)
+            local_bc_start = bc_idx * band_chunk_size
+            nb_chunk = bc_end - bc_start
 
             if nk_batch >= nk_tot:
+                if phdf5_reader is not None:
+                    global_psi_Gtot = phdf5_reader.coeffs_gspace(bc_range)
+                else:
+                    global_psi_Gtot, _ = read_Gvecs_to_devices(
+                        wfn, sym, bc_range, meta, bispinor, mesh_xy)
                 psi_rchunk_chunk = get_sharded_wfns_rchunk_slice(
                     global_psi_Gtot, meta, r_start, r_end, kvecs_frac, mesh_xy, bc_range)
-                local_bc_start = bc_idx * band_chunk_size
-                psi_rchunk_all = psi_rchunk_all.at[:, local_bc_start:local_bc_start + (bc_end - bc_start), :, :].set(psi_rchunk_chunk)
-                del psi_rchunk_chunk
+                psi_rchunk_all = psi_rchunk_all.at[:, local_bc_start:local_bc_start + nb_chunk, :, :].set(psi_rchunk_chunk)
+                del psi_rchunk_chunk, global_psi_Gtot
             else:
-                local_bc_start = bc_idx * band_chunk_size
-                nb_chunk = bc_end - bc_start
                 for k0 in range(0, nk_tot, nk_batch):
                     k1 = min(k0 + nk_batch, nk_tot)
                     sub_meta = _make_kchunk_meta(meta, k0, k1)
+                    if phdf5_reader is not None:
+                        k_ids = np.arange(k0, k1, dtype=np.int32)
+                        psi_k_gtot = phdf5_reader.coeffs_gspace(bc_range, k_ids=k_ids)
+                    else:
+                        psi_k_gtot, _ = read_Gvecs_to_devices(
+                            wfn, sym, bc_range, sub_meta, bispinor, mesh_xy,
+                            k_range=(k0, k1))
                     psi_k_chunk = get_sharded_wfns_rchunk_slice(
-                        global_psi_Gtot[k0:k1], sub_meta, r_start, r_end,
+                        psi_k_gtot, sub_meta, r_start, r_end,
                         kvecs_frac[k0:k1], mesh_xy, bc_range)
                     psi_rchunk_all = psi_rchunk_all.at[k0:k1, local_bc_start:local_bc_start + nb_chunk, :, :].set(psi_k_chunk)
-                    del psi_k_chunk
-            del global_psi_Gtot
+                    del psi_k_chunk, psi_k_gtot
 
         if phdf5_reader is not None:
             phdf5_reader.close()
@@ -646,11 +651,14 @@ def load_centroids_band_chunked(
             FFI + on-device symmetry unfold).  Default False keeps the
             legacy ``WFNReader`` + ``read_Gvecs_to_devices`` path so
             existing callers are unaffected.  The phdf5 path opens the
-            file once for the whole call and streams each band chunk
-            directly onto device without slurping ``wfns/coeffs`` into
-            host RAM — suitable for WFN files that don't fit in host
-            memory.  Currently only the non-k-chunked path is wired; the
-            k-chunk fallback still uses the legacy loader.
+            file once for the whole call and streams each (band-chunk,
+            k-chunk) rectangle directly onto device without slurping
+            ``wfns/coeffs`` into host RAM — suitable for WFN files that
+            don't fit in host memory.  Handles both the all-k path and
+            the k-chunked memory-budget path; for a k-chunk, the
+            reader fetches only the irreducible-BZ k's backing that
+            chunk (via the existing SymMaps-based dedup) and unfolds
+            on device.
 
     Returns:
         psi_rmu_Y: (nk, nb, ns, n_rmu) with P(None, None, None, 'y')
@@ -710,10 +718,9 @@ def load_centroids_band_chunked(
     # PHDF5 path: open the parallel-HDF5 reader once, keep it alive
     # for every band chunk, close at the end.  ``wfn._filename`` is the
     # path WFNReader opened — reuse it so callers don't have to pass an
-    # extra argument.  K-chunked path is not yet wired for phdf5 and
-    # falls through to the legacy loader.
+    # extra argument.  Wired for both the all-k and k-chunked paths.
     phdf5_reader = None
-    if use_phdf5 and not needs_k_chunking:
+    if use_phdf5:
         from common.phdf5_wfn_reader import PhdfWfnReader
         phdf5_reader = PhdfWfnReader(wfn._filename, mesh=mesh_xy)
 
@@ -751,9 +758,13 @@ def load_centroids_band_chunked(
                 kvecs_frac_chunk = kvecs_frac[kc_start:kc_end]
 
                 # Load G-space for this k-chunk × band-chunk
-                global_psi_Gtot, _ = read_Gvecs_to_devices(
-                    wfn, sym, bc_range, meta_kchunk, bispinor, mesh_xy,
-                    k_range=(kc_start, kc_end))
+                if phdf5_reader is not None:
+                    k_ids = np.arange(kc_start, kc_end, dtype=np.int32)
+                    global_psi_Gtot = phdf5_reader.coeffs_gspace(bc_range, k_ids=k_ids)
+                else:
+                    global_psi_Gtot, _ = read_Gvecs_to_devices(
+                        wfn, sym, bc_range, meta_kchunk, bispinor, mesh_xy,
+                        k_range=(kc_start, kc_end))
 
                 # FFT and extract centroids
                 psi_rmu_kchunk, psi_rmuT_kchunk = get_sharded_wfns_centroids(

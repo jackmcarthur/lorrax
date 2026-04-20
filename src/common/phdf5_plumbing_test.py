@@ -119,7 +119,8 @@ def pick_centroids(wfn, n: int, seed: int = 42) -> np.ndarray:
 # =============================================================================
 #  Comparisons
 # =============================================================================
-def run_centroids(wfn_path: str, mesh: Mesh, n_centroids: int, band_range):
+def run_centroids(wfn_path: str, mesh: Mesh, n_centroids: int, band_range,
+                  k_chunk_size: int | None = None):
     wfn = WFNReader(wfn_path)
     sym = SymMaps(wfn)
     meta = meta_stub(wfn, sym)
@@ -131,6 +132,7 @@ def run_centroids(wfn_path: str, mesh: Mesh, n_centroids: int, band_range):
         bispinor=False, mesh_xy=mesh,
         band_range=band_range,
         band_chunk_size=band_range[1] - band_range[0],
+        k_chunk_size=k_chunk_size,
     )
 
     t_legacy, (rmu_B, rmuT_B) = time_call(
@@ -140,7 +142,8 @@ def run_centroids(wfn_path: str, mesh: Mesh, n_centroids: int, band_range):
 
     diff_rmu = global_max_diff(rmu_B, rmu_F)
     diff_rmuT = global_max_diff(rmuT_B, rmuT_F)
-    log(f"centroids  psi_rmu  max|B-F| = {diff_rmu:.3e}   "
+    tag = f"kchunk={k_chunk_size}" if k_chunk_size else "all-k"
+    log(f"centroids [{tag}]  psi_rmu  max|B-F| = {diff_rmu:.3e}   "
         f"psi_rmuT max|B-F| = {diff_rmuT:.3e}")
     log(f"           legacy {t_legacy*1e3:7.1f} ms    "
         f"phdf5 {t_phdf5*1e3:7.1f} ms   "
@@ -148,7 +151,8 @@ def run_centroids(wfn_path: str, mesh: Mesh, n_centroids: int, band_range):
     return max(diff_rmu, diff_rmuT)
 
 
-def run_rchunk(wfn_path: str, mesh: Mesh, r_range, band_range):
+def run_rchunk(wfn_path: str, mesh: Mesh, r_range, band_range,
+               k_chunk_size: int = 0):
     wfn = WFNReader(wfn_path)
     sym = SymMaps(wfn)
     meta = meta_stub(wfn, sym)
@@ -159,13 +163,15 @@ def run_rchunk(wfn_path: str, mesh: Mesh, r_range, band_range):
         r_start=r_range[0], r_end=r_range[1],
         bispinor=False,
         band_chunk_size=band_range[1] - band_range[0],
+        k_chunk_size=k_chunk_size,
     )
 
     t_legacy, psi_B = time_call(get_psi_rchunk, **args)
     t_phdf5, psi_F = time_call(get_psi_rchunk, **args, use_phdf5=True)
 
     diff = global_max_diff(psi_B, psi_F)
-    log(f"rchunk     max|B-F| = {diff:.3e}")
+    tag = f"kchunk={k_chunk_size}" if k_chunk_size else "all-k"
+    log(f"rchunk    [{tag}]  max|B-F| = {diff:.3e}")
     log(f"           legacy {t_legacy*1e3:7.1f} ms    "
         f"phdf5 {t_phdf5*1e3:7.1f} ms   "
         f"ratio {t_legacy/t_phdf5:.2f}x")
@@ -184,6 +190,8 @@ def main() -> int:
     ap.add_argument("--n-centroids", type=int, default=16)
     ap.add_argument("--n-rcells", type=int, default=128,
                     help="length of r-chunk (contiguous flattened-xyz range).")
+    ap.add_argument("--skip-kchunk", action="store_true",
+                    help="skip the k-chunked-read variant of the test.")
     args = ap.parse_args()
 
     world = jax.process_count()
@@ -196,15 +204,35 @@ def main() -> int:
     nb = (nbands // world) * world
     band_range = (0, min(nb, 80 if world > 1 else nb))
 
-    log(f"world={world}  wfn={args.wfn}  band_range={band_range}")
+    wfn_probe = WFNReader(args.wfn)
+    sym_probe = SymMaps(wfn_probe)
+    nk_tot = int(sym_probe.nk_tot)
+    # Force k-chunking: half the unfolded k-set, rounded up so a small nk
+    # still produces at least two chunks.
+    k_chunk_size = max(1, (nk_tot + 1) // 2)
+
+    log(f"world={world}  wfn={args.wfn}  band_range={band_range}  "
+        f"nk_tot={nk_tot}  k_chunk_size={k_chunk_size}")
 
     tol = 1e-12
+
+    log("\n--- all-k read ---")
     d_centroids = run_centroids(args.wfn, mesh, args.n_centroids, band_range)
     d_rchunk = run_rchunk(args.wfn, mesh, (0, args.n_rcells), band_range)
+    worst = max(d_centroids, d_rchunk)
 
-    ok = (d_centroids <= tol) and (d_rchunk <= tol)
-    log("\nPASS" if ok else "\nFAIL")
-    return 0 if ok else 1
+    if not args.skip_kchunk and nk_tot > 1:
+        log("\n--- k-chunked read ---")
+        d_centroids_k = run_centroids(
+            args.wfn, mesh, args.n_centroids, band_range,
+            k_chunk_size=k_chunk_size)
+        d_rchunk_k = run_rchunk(
+            args.wfn, mesh, (0, args.n_rcells), band_range,
+            k_chunk_size=k_chunk_size)
+        worst = max(worst, d_centroids_k, d_rchunk_k)
+
+    log("\nPASS" if worst <= tol else "\nFAIL")
+    return 0 if worst <= tol else 1
 
 
 if __name__ == "__main__":

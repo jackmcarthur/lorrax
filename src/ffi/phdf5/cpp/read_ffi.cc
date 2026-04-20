@@ -523,15 +523,28 @@ static ffi::Error ReadKchunkDispatch(
 // drain through one C++ thread — either writes or reads queue up in
 // dispatch order.
 //
+// Observed end-to-end impact on MoS2 3×3 and Si pseudobands at 4×A100:
+// ~1% faster than the equivalent sync path.  This was smaller than
+// projected because JAX's default async dispatch already hides most
+// of the read latency on xla_stream — the handler invocation is
+// microseconds, and downstream xla_stream compute implicitly waits
+// only as long as the worker-thread H5Dread takes anyway.  The
+// explicit ``ffi::Future`` still gives XLA permission to schedule
+// unrelated work concurrently with the H5Dread and mirrors the
+// write-path design for consistency, and the benefit is expected to
+// grow at TB-scale WFN reads (100s of ms per band-chunk) — but at the
+// scales we've measured so far it's a small perf delta.  See
+// ``common/phdf5_async_overlap_bench.py`` for the measurement.
+//
 // Single-buffer (``ctx->pinned_buf``) reuse is safe because:
 //   1. Tasks run strictly sequentially on the writer thread.
 //   2. The task *starts* by ``cudaEventSynchronize(h2d_event)`` which
 //      blocks until the PREVIOUS task's async H2D has drained — so the
 //      ``memset`` + ``H5Dread`` that follow don't stomp a memcpy that's
 //      still reading from ``pinned_buf``.
-//   3. At the end the task records ``h2d_event`` again and makes
-//      ``xla_stream`` wait on it, so any downstream XLA op that reads
-//      ``d_dst`` is ordered after the H2D.
+//   3. At the end the task records ``h2d_event`` again and syncs
+//      before firing the Promise, so when downstream XLA reads
+//      ``d_dst`` the H2D is already complete.
 static void async_read_kchunk_union_worker(
     PhdfCtx* ctx,
     hid_t ds_id,
