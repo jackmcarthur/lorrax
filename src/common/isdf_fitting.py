@@ -975,18 +975,20 @@ def fit_zeta_chunked_to_h5(
     # (multi-TB WFN.h5).  LORRAX_DISABLE_GSPACE_CACHE=1 to enable.
     if os.environ.get("LORRAX_DISABLE_GSPACE_CACHE") == "1":
         use_gspace_cache = False
-    # Band chunks that respect the left/right pair-density endpoints
-    # so each chunk sits fully inside one (or both) of the two ranges.
-    # Used by the streaming pair-density loop below to dispatch P_l /
-    # P_r einsums conditionally per chunk — chunks between b3 and b4
-    # contribute to P_r only, etc., so the out-of-range matmul is
-    # never materialised.
-    band_chunk_ranges = _band_chunk_ranges_respecting_endpoints(
-        band_range_full,
-        [band_range_left[0], band_range_left[1],
-         band_range_right[0], band_range_right[1]],
-        band_chunk_size,
-    )
+    # Uniform band chunks over [b_full_start, b_full_end]: N-1 of
+    # size ``band_chunk_size`` plus one remainder chunk.  This gives
+    # the read/FFT pipeline and the pair-density einsum exactly
+    # TWO compile shapes, regardless of where the L/R endpoints fall.
+    # Chunks that straddle an L/R endpoint get handled in the loop
+    # below by padding the left-side ``psi_L_bc`` slice with zero
+    # bands — the resulting einsum still runs at the uniform
+    # ``bc_size``, so it hits the same JIT cache.
+    _bfs, _bfe = band_range_full
+    band_chunk_ranges = [
+        (_bfs + i * band_chunk_size,
+         min(_bfs + (i + 1) * band_chunk_size, _bfe))
+        for i in range((_bfe - _bfs + band_chunk_size - 1) // band_chunk_size)
+    ]
 
     if use_gspace_cache:
         with timing.section("zeta_fit.cache_gspace"):
@@ -996,7 +998,8 @@ def fit_zeta_chunked_to_h5(
                 band_chunk_ranges=band_chunk_ranges,
             )
             print(f"  G-space cache: {len(cached_gspace)} band chunks "
-                  f"({len(band_chunk_ranges)} L/R-aligned ranges)")
+                  f"(chunk_size={band_chunk_size}, remainder="
+                  f"{(_bfe - _bfs) % band_chunk_size or band_chunk_size})")
     else:
         cached_gspace = None
         print("  G-space cache: disabled")
@@ -1075,11 +1078,13 @@ def fit_zeta_chunked_to_h5(
             # accumulate P_l / P_r incrementally.  At any moment only
             # one band chunk's r-chunk shard is live (instead of the
             # full-band-range tensor) — decouples the pair-density
-            # peak from the band count.  Chunks are built to respect
-            # the left/right band endpoints (see band_chunk_ranges
-            # above) so each chunk is fully inside L, R, both, or
-            # neither, and an out-of-range einsum is simply never
-            # dispatched.
+            # peak from the band count.  Chunks are uniform size
+            # ``band_chunk_size`` (N-1 of them) + one remainder, so
+            # the read/FFT pipeline and the pair-density einsum see
+            # exactly TWO compile shapes.  Chunks fully past an L/R
+            # endpoint skip the corresponding einsum; the one chunk
+            # that straddles an endpoint gets zero-padded on the L
+            # side so its einsum still dispatches at ``bc_size``.
             ns = meta.nspinor
             P_sharding_traced = NamedSharding(mesh_xy, P(None, 'x', 'y'))
             P_sharding_spin   = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
@@ -1100,6 +1105,65 @@ def fit_zeta_chunked_to_h5(
                 P_r_k_mux = jax.lax.with_sharding_constraint(P_r_k_mux, P_sharding_spin)
                 _accum = accumulate_pair_density_spin_matrix
 
+            # Per-chunk L/R slicing.  For a chunk fully inside an L or
+            # R range, ``_slice_and_norm`` returns a direct view of the
+            # centroid tensor — no extra allocation, no padding, so
+            # the downstream einsum hits the same JIT cache entry as
+            # the N-1 full-size chunks.  For the at-most-one-per-
+            # endpoint straddle chunk, it zero-pads out-of-range
+            # bands into a fresh tensor so the einsum shape is still
+            # uniform ``bc_size``.  Compile cost: the hot einsum is
+            # TWO shapes ({B, remainder}); the zero-pad op compiles
+            # once per unique straddle geometry (≤ one per endpoint).
+            L_slice_shard = NamedSharding(
+                mesh_xy, P(None, 'x', None, None))
+
+            def _slice_and_norm(psi_fit, norms_fit, range_abs,
+                                bc_lo, bc_hi):
+                """Return (psi_L_bc, norm_bc) for this band chunk, both
+                zero/one-padded if the chunk straddles ``range_abs``.
+                ``psi_L_bc`` has shape ``(nk, nrmu, bc_hi-bc_lo, ns)``;
+                ``norm_bc`` has shape ``(bc_hi-bc_lo,)`` with 1.0
+                outside the overlap so dividing ``psi_bc_Y`` by it
+                leaves out-of-range bands unchanged (psi_L's zero
+                entries kill their contribution in the einsum
+                anyway).  Returns ``(None, None)`` when the chunk is
+                entirely outside ``range_abs``.
+                """
+                rs, re = range_abs
+                ol_lo = max(bc_lo, rs)
+                ol_hi = min(bc_hi, re)
+                if ol_hi <= ol_lo:
+                    return None, None
+                bc_size = bc_hi - bc_lo
+                # Fast path: chunk fully inside range, direct slice.
+                if ol_lo == bc_lo and ol_hi == bc_hi:
+                    psi_L_bc = psi_fit[:, :, (bc_lo - rs):(bc_hi - rs), :]
+                    norm_bc = (norms_fit[(bc_lo - rs):(bc_hi - rs)]
+                               if norms_fit is not None else None)
+                    return psi_L_bc, norm_bc
+                # Straddle: zero-pad psi_L and one-pad norm to bc_size.
+                ns = psi_fit.shape[-1]
+                psi_L_bc = jnp.zeros(
+                    (nk_tot, n_rmu, bc_size, ns),
+                    dtype=jnp.complex128)
+                psi_L_bc = jax.lax.with_sharding_constraint(
+                    psi_L_bc, L_slice_shard)
+                psi_L_bc = psi_L_bc.at[
+                    :, :, (ol_lo - bc_lo):(ol_hi - bc_lo), :].set(
+                    psi_fit[:, :, (ol_lo - rs):(ol_hi - rs), :])
+                if norms_fit is not None:
+                    norm_bc = jnp.ones((bc_size,), dtype=jnp.float64)
+                    norm_bc = norm_bc.at[
+                        (ol_lo - bc_lo):(ol_hi - bc_lo)].set(
+                        norms_fit[(ol_lo - rs):(ol_hi - rs)])
+                else:
+                    norm_bc = None
+                return psi_L_bc, norm_bc
+
+            norms_l_used = norms_l if band_norms is not None else None
+            norms_r_used = norms_r if band_norms is not None else None
+
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.load_and_pair_density"):
                 for bc_range, psi_bc_Y in iter_psi_rchunk_bandwise(
@@ -1111,27 +1175,23 @@ def fit_zeta_chunked_to_h5(
                     cached_gspace=cached_gspace, kvecs_frac=kvecs_frac,
                 ):
                     bc_lo, bc_hi = bc_range
-                    # Chunks were built to respect left/right endpoints, so
-                    # each of these two tests is a clean all-or-nothing.
-                    in_l = (bc_lo >= band_range_left[0]
-                            and bc_hi <= band_range_left[1])
-                    in_r = (bc_lo >= band_range_right[0]
-                            and bc_hi <= band_range_right[1])
 
-                    if in_l:
-                        l_lo = bc_lo - band_range_left[0]
-                        l_hi = bc_hi - band_range_left[0]
-                        psi_L_bc = psi_l_rmuT_X_fit[:, :, l_lo:l_hi, :]
-                        psi_R_bc = (psi_bc_Y / norms_l[l_lo:l_hi][None, :, None, None]
-                                    if band_norms is not None else psi_bc_Y)
+                    # Left contribution
+                    psi_L_bc, norm_bc = _slice_and_norm(
+                        psi_l_rmuT_X_fit, norms_l_used,
+                        band_range_left, bc_lo, bc_hi)
+                    if psi_L_bc is not None:
+                        psi_R_bc = (psi_bc_Y / norm_bc[None, :, None, None]
+                                    if norm_bc is not None else psi_bc_Y)
                         P_l_k_mux = _accum(P_l_k_mux, psi_L_bc, psi_R_bc, mesh_xy)
 
-                    if in_r:
-                        r_lo = bc_lo - band_range_right[0]
-                        r_hi = bc_hi - band_range_right[0]
-                        psi_L_bc = psi_r_rmuT_X_fit[:, :, r_lo:r_hi, :]
-                        psi_R_bc = (psi_bc_Y / norms_r[r_lo:r_hi][None, :, None, None]
-                                    if band_norms is not None else psi_bc_Y)
+                    # Right contribution
+                    psi_L_bc, norm_bc = _slice_and_norm(
+                        psi_r_rmuT_X_fit, norms_r_used,
+                        band_range_right, bc_lo, bc_hi)
+                    if psi_L_bc is not None:
+                        psi_R_bc = (psi_bc_Y / norm_bc[None, :, None, None]
+                                    if norm_bc is not None else psi_bc_Y)
                         P_r_k_mux = _accum(P_r_k_mux, psi_L_bc, psi_R_bc, mesh_xy)
 
                     del psi_bc_Y
