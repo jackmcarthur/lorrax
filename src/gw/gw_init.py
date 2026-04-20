@@ -372,15 +372,9 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		mu_chunk = int(jax.device_get(_mq)[0])
 		q_batch = int(jax.device_get(_mq)[1])
 
-	# Auto-default ``bare_coulomb_cutoff`` to 4·ecutwfc (Ry) when the user
-	# left it unset.  By the triangle inequality on M(G) = Σ_G' ψ*(G-G')
-	# ψ(G'), the pair density's Fourier support is bounded by |G| ≤
-	# 2·√ecutwfc → |G|² ≤ 4·ecutwfc — so this is the *tightest* cutoff
-	# that still drops zero physics.  BGW sizes the FFT grid so its
-	# Nyquist-inscribed sphere exactly covers this bound (ecutrho =
-	# 4·ecutwfc).  Enables the V_q sphere gather (saves ~66 % of V_q
-	# contract FLOPs at Si 10³ scale), bit-identical to the full-box
-	# path.  Logged explicitly so runs are reproducible.
+	# Auto-default to 4·ecutwfc: tightest |q+G|² cutoff that drops zero
+	# physics (triangle ineq on ψ*ψ bounds pair-density at |G|² ≤ 4·ecutwfc)
+	# and activates the V_q sphere gather in compute_vcoul.
 	if cfg.bare_coulomb_cutoff is None:
 		vcoul_cutoff_ry = 4.0 * float(wfn.ecutwfc)
 		print_fn(f"    V_q bare cutoff: {vcoul_cutoff_ry:.1f} Ry (auto: 4·ecutwfc)")
