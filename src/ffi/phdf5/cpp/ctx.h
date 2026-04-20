@@ -79,9 +79,16 @@ struct PhdfCtx {
     std::deque<std::function<void()>> task_queue;
     bool                              shutdown_flag = false;
 
-    // Tuning flags, read from env at open time.
-    bool   use_collective    = true;
-    bool   coll_metadata     = true;
+    // Tuning flags, read from env at open time.  Default: collective
+    // reads (OpenMPI-ROMIO's two-phase I/O is optimal) + independent
+    // writes (avoids Cray MPICH's ad_cray_write_coll.c:669 OOM at
+    // >~1 GB/rank, neutral on OpenMPI at our measured sizes).  Metadata
+    // defaults to non-collective so file-level ops (H5Dcreate/extend)
+    // also bypass the Cray collective driver — and per ARCHITECTURE.md
+    // non-collective meta is ~100 ms faster on OpenMPI small writes too.
+    bool   use_collective_read  = true;
+    bool   use_collective_write = false;
+    bool   coll_metadata        = false;
     size_t align_threshold   = 1 << 20;          // 1 MiB
     size_t align_length      = 1 << 20;
 };

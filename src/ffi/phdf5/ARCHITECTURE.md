@@ -269,8 +269,9 @@ Environment variables, loosely in order of how often you'd touch them:
 | var | default | effect |
 |---|---|---|
 | `ISDF_JAX_CACHE_DIR` | `~/.cache/isdf_jax_compilation` | persistent compile-cache path; set to `""` to disable |
-| `LORRAX_PHDF5_INDEPENDENT` | `0` | if `1`, `H5FD_MPIO_INDEPENDENT` instead of collective — rarely helpful on Lustre |
-| `LORRAX_PHDF5_NO_COLL_META` | `0` | if `1`, disable collective metadata ops — shaves ~100 ms on small writes |
+| `LORRAX_PHDF5_INDEPENDENT` | `0` | if `1`, also force **reads** to independent (writes are already independent by default) — rarely helpful on OpenMPI; neutral on Cray |
+| `LORRAX_PHDF5_COLLECTIVE_WRITES` | `0` | if `1`, force writes back to collective — **do not set on Cray MPICH** (triggers `ad_cray_write_coll.c:669` OOM at ≥ 1 GB/rank); on OpenMPI the default independent write path matches collective within noise |
+| `LORRAX_PHDF5_COLL_META` | `0` | if `1`, re-enable collective metadata ops — default is non-collective (faster everywhere: +100 ms on OpenMPI small writes, required on Cray for n ≥ 16384 C128 writes) |
 | `LORRAX_PHDF5_ALIGN_MB` | `4` | H5Pset_alignment threshold/stride in MiB; `0` disables |
 | `LORRAX_PHDF5_STRIPE_COUNT` | `16` | Lustre stripe count hint via MPI_Info |
 | `LORRAX_PHDF5_STRIPE_SIZE` | `4194304` | stripe size (bytes) via MPI_Info |

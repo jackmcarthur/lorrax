@@ -124,9 +124,19 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
     ctx->rank = rank;
     ctx->world_size = world_size;
 
-    // Env-driven tuning.
-    ctx->use_collective  = (env_long("LORRAX_PHDF5_INDEPENDENT", 0) == 0);
-    ctx->coll_metadata   = (env_long("LORRAX_PHDF5_NO_COLL_META", 0) == 0);
+    // Env-driven tuning.  Defaults (see ctx.h): reads collective, writes
+    // independent, metadata non-collective.  Env overrides:
+    //   LORRAX_PHDF5_INDEPENDENT=1    → also force reads independent
+    //   LORRAX_PHDF5_COLLECTIVE_WRITES=1 → force writes back to collective
+    //                                    (OpenMPI-only; crashes on Cray at large
+    //                                    writes)
+    //   LORRAX_PHDF5_COLL_META=1      → re-enable collective metadata ops
+    const bool force_indep_read    = env_long("LORRAX_PHDF5_INDEPENDENT", 0) != 0;
+    const bool force_coll_write    = env_long("LORRAX_PHDF5_COLLECTIVE_WRITES", 0) != 0;
+    const bool force_coll_metadata = env_long("LORRAX_PHDF5_COLL_META", 0) != 0;
+    ctx->use_collective_read  = !force_indep_read;
+    ctx->use_collective_write = force_coll_write;
+    ctx->coll_metadata        = force_coll_metadata;
     // Alignment default matches the new striping_unit default (4 MiB) so
     // H5 objects start on Lustre stripe boundaries.
     long align_mb        = env_long("LORRAX_PHDF5_ALIGN_MB", 4);

@@ -99,7 +99,7 @@ static ffi::Error ReadImpl(
                           "phdf5 read: H5Screate_simple(memspace) failed");
     }
 
-    hid_t dxpl = ctx->use_collective ? ctx->dxpl_coll : ctx->dxpl_indep;
+    hid_t dxpl = ctx->use_collective_read ? ctx->dxpl_coll : ctx->dxpl_indep;
     herr_t st = H5Dread(dset, native_type, memspace, filespace, dxpl,
                         ctx->pinned_buf);
     H5Sclose(memspace);
@@ -289,7 +289,7 @@ static ffi::Error ReadKchunkImpl(
             "phdf5 read_kchunk: ds_id is invalid");
     }
 
-    hid_t dxpl = ctx->use_collective ? ctx->dxpl_coll : ctx->dxpl_indep;
+    hid_t dxpl = ctx->use_collective_read ? ctx->dxpl_coll : ctx->dxpl_indep;
 
     hid_t filespace = H5Dget_space(ds_id);
     if (filespace < 0) {
@@ -587,7 +587,7 @@ static void async_read_kchunk_union_worker(
     std::memset(ctx->pinned_buf, 0, bytes);
     auto t_pin = now();
 
-    hid_t dxpl = ctx->use_collective ? ctx->dxpl_coll : ctx->dxpl_indep;
+    hid_t dxpl = ctx->use_collective_read ? ctx->dxpl_coll : ctx->dxpl_indep;
 
     std::vector<hsize_t> mem_shape(N_out);
     {

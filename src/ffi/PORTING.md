@@ -162,7 +162,7 @@ HDF5 / MPI-IO.  Two stacks are supported, selected via
 - **Performance** (4 nodes / 16 GPUs, 4.29 GB C128):
   `4.08 GB/s` — `8.02×` over `multihost_utils.process_allgather + rank-0 h5py`.
 
-### Option B — Cray MPICH / cray-hdf5-parallel (opt-in, unstable)
+### Option B — Cray MPICH / cray-hdf5-parallel (opt-in, viable)
 
 - **HDF5**: a copy of the host's `cray-hdf5-parallel` module, staged
   at `/pscratch/sd/$USER/lorrax_phdf5_cray/stage/`.  Regenerate with
@@ -175,18 +175,18 @@ HDF5 / MPI-IO.  Two stacks are supported, selected via
   runtime that shifter provides.
 - **Shifter modules**: `--module=gpu,mpich`.
 - **Slurm PMI**: `--mpi=pmi2` (Cray MPICH native).
-- **Performance**: _unstable_.  Best observed was `~3.2 GB/s` at one
-  point but we have been unable to reproduce it on different
-  allocations.  Large collective writes crash with `Out of memory in
-  ad_cray_write_coll.c:669` regardless of `cb_buffer_size`,
-  `cb_nodes`, or stripe settings, and `cray_cb_write_lock_mode=2`
-  (Lustre Lock-Ahead) triggers a different internal assertion failure
-  in `ADIOI_CRAY_Calc_aggregator_pfl`.  The 4-GPU single-node
-  round-trip test does pass.
-- **Why keep it**: the stack itself is portable across DOE Cray
-  systems, and the instability may be resolvable by a NERSC support
-  ticket (opening one is advised before relying on this path).
-  Useful as a reference implementation + A/B comparison.
+- **Performance** (1 node / 4 GPUs / 4.29 GB C128, `phdf5_read_bench`
+  n=16384 with post-2026-04-20 defaults, indep writes + non-coll meta):
+  `3.79 GB/s` read, write stable — **+24 % over OpenMPI (3.06 GB/s)**
+  at the same scale.  At MoS2 3×3 scale (45 MB WFN): `17.9 ms` min
+  per `phdf5_profile` iter, within noise of OpenMPI (`18.3 ms`).
+- **History**: Prior attempts at making Cray the default (commit
+  `1513662`) concluded "unstable" because the default write path
+  routed through `ad_cray_write_coll.c`, which OOMs at ≥ 1 GB/rank.
+  The 2026-04-20 fix was to flip the FFI's write default to
+  `H5FD_MPIO_INDEPENDENT` + disable collective metadata ops, which
+  bypasses the Cray collective write driver entirely.  Reads remain
+  collective (optimal on both stacks at our scales).
 
 ### Porting to a non-Cray cluster
 
@@ -216,8 +216,9 @@ HDF5 / MPI-IO.  Two stacks are supported, selected via
 | `LORRAX_PHDF5_STRIPE_COUNT`     | `16`         | Lustre striping_factor.         |
 | `LORRAX_PHDF5_STRIPE_SIZE`      | `4194304`    | Lustre striping_unit (bytes).   |
 | `LORRAX_PHDF5_ALIGN_MB`         | `4`          | `H5Pset_alignment` threshold.   |
-| `LORRAX_PHDF5_INDEPENDENT`      | `0`          | 1 → H5FD_MPIO_INDEPENDENT.      |
-| `LORRAX_PHDF5_NO_COLL_META`     | `0`          | 1 → disable collective metadata. |
+| `LORRAX_PHDF5_INDEPENDENT`      | `0`          | 1 → also force **reads** to independent (writes are independent by default). |
+| `LORRAX_PHDF5_COLLECTIVE_WRITES`| `0`          | 1 → force writes back to collective; do NOT set on Cray MPICH (hits `ad_cray_write_coll.c:669` OOM at ≥ 1 GB/rank). |
+| `LORRAX_PHDF5_COLL_META`        | `0`          | 1 → re-enable collective metadata ops. Default is non-collective (faster on both stacks; required for Cray at large writes). |
 
 Baked-in DCPL: `H5D_FILL_TIME_NEVER` + `H5D_ALLOC_TIME_EARLY`
 (avoids the default zero-fill that would double the IO), plus
