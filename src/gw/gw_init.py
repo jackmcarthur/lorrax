@@ -381,8 +381,15 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 
 	from file_io.slab_io import SlabIO
 	with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
+		# Force use_ffi_io=False for the V_q zeta READ: V_q overlaps
+		# disk I/O with GPU compute via a background ``ThreadPoolExecutor``,
+		# which is incompatible with SlabIO's FFI-read shard_map
+		# dispatch — the collective H5Dread can't safely interleave
+		# with the main thread's JAX ops on the same rank.  The write
+		# path uses the FFI (``cfg.use_ffi_io``) separately; only
+		# this specific read is pinned to the allgather/h5py path.
 		with SlabIO(zeta_h5_path, mode='r', mesh=mesh_xy,
-		            use_ffi_io=cfg.use_ffi_io) as zeta_io:
+		            use_ffi_io=False) as zeta_io:
 			with mesh_xy:
 				V_q_raw, G0_all = compute_all_V_q_from_zeta_h5(
 					zeta_io, kgrid=meta.kgrid, fft_grid=meta.fft_grid,

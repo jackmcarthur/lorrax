@@ -472,12 +472,42 @@ class _FfiBackend:
         # close_ctx() in C++ also drains its own task queue, but an
         # in-flight Python-side jit dispatch could still be holding a
         # reference to ctx_handle when we call close_file below.
+        #
+        # The drain can take minutes for multi-GB writes (N collective
+        # MPI-IO calls serialised through one writer thread per ctx).
+        # Print per-stage timings on rank 0 so a long drain doesn't
+        # look like a hang.
+        import time as _time
+        _rank0 = (jax.process_index() == 0)
+        _verbose = _rank0 and bool(
+            os.environ.get("LORRAX_PHDF5_CLOSE_VERBOSE", "1") != "0")
+        with self._pending_mu:
+            _pending = self._dispatch_pending
+        if _verbose:
+            print(f"  [SlabIO.close] draining {_pending} pending writes "
+                  f"for {os.path.basename(self.path)} …", flush=True)
+        _t0 = _time.perf_counter()
         self._drain_pending()
+        _t_drain = _time.perf_counter() - _t0
+        if _verbose:
+            print(f"  [SlabIO.close] Python dispatch drained in "
+                  f"{_t_drain:.1f} s; joining writer thread", flush=True)
+        _t0 = _time.perf_counter()
         self._dispatch_queue.put(None)          # shutdown sentinel
         self._dispatch_worker.join()
+        _t_join = _time.perf_counter() - _t0
         if self.fh:
+            if _verbose:
+                print(f"  [SlabIO.close] writer thread joined in "
+                      f"{_t_join:.1f} s; calling H5Fclose collectively",
+                      flush=True)
+            _t0 = _time.perf_counter()
             self._close_file(self.fh)
             self.fh = 0
+            _t_close = _time.perf_counter() - _t0
+            if _verbose:
+                print(f"  [SlabIO.close] H5Fclose returned in "
+                      f"{_t_close:.1f} s", flush=True)
         # Now that MPI-IO has released the file, rank 0 can safely
         # reopen with h5py to tack on any deferred small-metadata
         # datasets (omega_ev and friends).

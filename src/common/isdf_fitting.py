@@ -233,7 +233,8 @@ def accumulate_pair_density_spin_traced(
 
 		@partial(jax.jit,
 				 in_shardings=(P_sharding, L_sharding, R_sharding),
-				 out_shardings=P_sharding)
+				 out_shardings=P_sharding,
+				 donate_argnums=(0,))
 		def _accum(P_in: jax.Array, psi_L: jax.Array, psi_R: jax.Array) -> jax.Array:
 			return P_in + jnp.einsum('kmns,knsv->kmv', psi_L, psi_R, optimize=True)
 
@@ -263,7 +264,8 @@ def accumulate_pair_density_spin_matrix(
 
 		@partial(jax.jit,
 				 in_shardings=(P_sharding, L_sharding, R_sharding),
-				 out_shardings=P_sharding)
+				 out_shardings=P_sharding,
+				 donate_argnums=(0,))
 		def _accum(P_in: jax.Array, psi_L: jax.Array, psi_R: jax.Array) -> jax.Array:
 			return P_in + jnp.einsum('kmna,knbr->kabmr', psi_L, psi_R, optimize=True)
 
