@@ -11,21 +11,24 @@
 #
 # MPI STACK — pick one of:
 #
-#   LORRAX_PHDF5_MPI_STACK=openmpi   (default, verified, ~4.5 GB/s)
-#     - container's HPC-X OpenMPI at /opt/hpcx/ompi satisfies libmpi.so.40
-#     - phdf5 stage: conda-forge HDF5 1.14 linked against openmpi
-#     - default LORRAX_FFI_PHDF5_DIR:
-#         /pscratch/sd/$USER/lorrax_phdf5_openmpi/stage
-#     - srun --mpi=pmix
-#
-#   LORRAX_PHDF5_MPI_STACK=mpich
+#   LORRAX_PHDF5_MPI_STACK=mpich   (default as of 2026-04-20)
 #     - shifter --module=mpich bind-mounts Cray MPICH (libmpi.so.12)
 #     - phdf5 stage: copy of cray-hdf5-parallel (1.12, libmpi_gnu_*.so.12)
 #     - default LORRAX_FFI_PHDF5_DIR:
 #         /pscratch/sd/$USER/lorrax_phdf5_cray/stage
 #     - srun --mpi=pmi2
-#     - KNOWN ISSUE: intermittent OOMs in ad_cray_write_coll.c:669 for
-#       large collective writes; see src/ffi/PORTING.md.
+#     - Perf (1 node / 4 GPUs / 4.29 GB C128): 3.79 GB/s, +24% over
+#       openmpi; at MoS2 3×3 scale within noise of openmpi.
+#     - Requires post-2026-04-20 defaults (indep writes + non-coll meta)
+#       to avoid ad_cray_write_coll.c:669 OOM at ≥ 1 GB/rank writes.
+#
+#   LORRAX_PHDF5_MPI_STACK=openmpi
+#     - container's HPC-X OpenMPI at /opt/hpcx/ompi satisfies libmpi.so.40
+#     - phdf5 stage: conda-forge HDF5 1.14 linked against openmpi
+#     - default LORRAX_FFI_PHDF5_DIR:
+#         /pscratch/sd/$USER/lorrax_phdf5_openmpi/stage
+#     - srun --mpi=pmix
+#     - Kept as fallback for non-Cray clusters.
 #
 # Other env:
 #   LORRAX_FFI_NVHPC_DIR   host path to the staged nvhpc subset.
@@ -36,7 +39,7 @@
 
 set -euo pipefail
 
-MPI_STACK="${LORRAX_PHDF5_MPI_STACK:-openmpi}"
+MPI_STACK="${LORRAX_PHDF5_MPI_STACK:-mpich}"
 
 NVHPC_HOST="${LORRAX_FFI_NVHPC_DIR:-/pscratch/sd/j/jackm/lorrax_nvhpc}"
 IMAGE="${LORRAX_FFI_IMAGE:-nvcr.io/nvidia/jax:25.04-py3}"
