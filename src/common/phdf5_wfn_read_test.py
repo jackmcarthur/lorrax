@@ -150,7 +150,7 @@ def run_reader_path(
 
     try:
         t_rs, psi_G = _time_stage(
-            lambda: reader.load_band_chunk_gspace(band_range),
+            lambda: reader.coeffs_gspace(band_range),
             "reader_read")
         times["read_scatter"] = t_rs
 

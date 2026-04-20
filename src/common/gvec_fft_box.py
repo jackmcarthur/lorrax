@@ -1,26 +1,16 @@
-"""Sparse-G → dense-FFT-box via precomputed inverse-index gather.
+"""Sparse-G → dense-FFT-box via precomputed index + gather.
 
-See ``GVEC_FFT_BOX_GATHER.md`` for the motivation.  Short version: the
-straightforward ``psi.at[..., gx, gy, gz].set(cnk)`` scatter is 10–100×
-slower on A100 than the equivalent gather.  Flip it: precompute an
-``inv[..., nx, ny, nz]`` index map once (host-side, cheap), and at
-runtime read from a zero-padded ``cnk`` via one ``jnp.take``.
+See ``GVEC_FFT_BOX_GATHER.md`` for motivation.  For each k-point, a
+lookup table maps every ``(nx, ny, nz)`` FFT-box cell to the
+``g``-index within that k's coefficient slab (or a sentinel if the
+cell has no coefficient).  At runtime one ``jnp.take`` fills the
+whole FFT box — no scatter, no per-k loop.
 
 Public API
 ----------
-:func:`build_within_k_inv_map`
-    Build ``inv[k, nx, ny, nz] = g_local`` where each k-point's
-    coefficient slab is a contiguous ``[0, ngk[k])`` range; the
-    returned map has an ``ngkmax`` sentinel for empty FFT cells.
-    Suitable for any caller that holds per-k ngkmax-wide slabs (the
-    ``PhdfReadKchunkUnionFfi`` output layout is the motivating example).
-
-:func:`make_gather_fft_box_kernel`
-    Build a jitted ``shard_map`` kernel that consumes an
-    ``(*leading, nk, ngkmax, 2)`` real+imag slab and an ``inv`` map,
-    and produces an ``(*leading, nk, nx, ny, nz)`` complex FFT box.
-    Band axis is sharded over ``('x','y')``; everything else
-    replicated.
+``build_g_index_for_fft_box`` — host-side precompute, once per WFN.
+``make_fft_box_kernel``       — jitted shard_map kernel, reused per
+                                band chunk.
 """
 from __future__ import annotations
 
@@ -33,58 +23,50 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
 
 
-__all__ = [
-    "build_within_k_inv_map",
-    "make_gather_fft_box_kernel",
-]
+__all__ = ["build_g_index_for_fft_box", "make_fft_box_kernel"]
 
 
-def build_within_k_inv_map(
+def build_g_index_for_fft_box(
     gvecs_per_k: Sequence[np.ndarray],
     fft_grid: tuple[int, int, int],
     ngkmax: int,
 ) -> np.ndarray:
-    """Precompute ``inv[k, nx, ny, nz]`` mapping FFT cells to within-slab
-    G-indices (with an ``ngkmax`` sentinel for unused cells).
+    """Precompute ``g_index[k, nx, ny, nz]``.
+
+    For each k and each FFT-box cell ``(nx, ny, nz)``, the entry is the
+    position ``g`` in ``[0, ngk[k])`` such that ``gvecs_per_k[k][g] %
+    fft_grid == (nx, ny, nz)``, or ``ngkmax`` (a sentinel used by the
+    runtime kernel to gather zero for empty cells).
 
     Parameters
     ----------
-    gvecs_per_k : sequence of length ``nk``
-        Each element is an ``(ngk[k], 3)`` int array giving this
-        k-point's G-vectors in integer reciprocal-lattice coordinates.
-        Unwrapped (may be negative) — they get modulo'd by ``fft_grid``
-        inside.
+    gvecs_per_k : length-``nk`` sequence of ``(ngk[k], 3)`` int arrays
+        Integer G-vectors (may be negative; wrapped mod ``fft_grid``).
     fft_grid : (nx, ny, nz)
-        FFT-box dimensions.
     ngkmax : int
-        Maximum G-count per k (compile-time constant downstream).
-        Must satisfy ``ngkmax >= max(len(gvecs_per_k[k]))``.
+        Max G-count across all k; also the sentinel value.
 
     Returns
     -------
-    inv : (nk, nx, ny, nz) int32
-        ``inv[k, a, b, c] = g_local`` for the unique g in ``[0, ngk[k])``
-        such that ``gvecs_per_k[k][g] % fft_grid == (a, b, c)``, or
-        ``ngkmax`` (sentinel) if no such g exists.
+    g_index : ``(nk, nx, ny, nz)`` int32
     """
     nk = len(gvecs_per_k)
     nx, ny, nz = (int(v) for v in fft_grid)
-    inv = np.full((nk, nx, ny, nz), ngkmax, dtype=np.int32)
+    g_index = np.full((nk, nx, ny, nz), ngkmax, dtype=np.int32)
 
-    fft_np = np.asarray(fft_grid, dtype=np.int64)
+    fft_grid_np = np.asarray(fft_grid, dtype=np.int64)
     for k in range(nk):
-        gv = np.asarray(gvecs_per_k[k], dtype=np.int32)
-        if gv.shape[0] > ngkmax:
+        gvecs = np.asarray(gvecs_per_k[k], dtype=np.int32)
+        if gvecs.shape[0] > ngkmax:
             raise ValueError(
-                f"build_within_k_inv_map: k={k} has ngk={gv.shape[0]} > "
-                f"ngkmax={ngkmax}")
-        wrapped = gv % fft_np[None, :]
-        for g_local, (gx, gy, gz) in enumerate(wrapped):
-            inv[k, int(gx), int(gy), int(gz)] = int(g_local)
-    return inv
+                f"k={k}: ngk={gvecs.shape[0]} > ngkmax={ngkmax}")
+        wrapped = gvecs % fft_grid_np[None, :]
+        g_locals = np.arange(gvecs.shape[0], dtype=np.int32)
+        g_index[k, wrapped[:, 0], wrapped[:, 1], wrapped[:, 2]] = g_locals
+    return g_index
 
 
-def make_gather_fft_box_kernel(
+def make_fft_box_kernel(
     mesh: Mesh,
     nk: int,
     ngkmax: int,
@@ -92,76 +74,59 @@ def make_gather_fft_box_kernel(
     nspinor: int,
     fft_grid: tuple[int, int, int],
 ):
-    """Build a jitted kernel: ``(real+imag slab, inv) → complex FFT box``.
+    """Build a jitted ``(cnk_slab, g_index) → psi_G_box`` kernel.
 
-    The kernel does ONE ``jnp.take`` per rank (fused into a single
-    scatter-free CUDA kernel by XLA) — no Python unrolling, no per-k
-    vmap.  Output is the shard of the dense FFT box for this rank's
-    band stripe.
+    Inputs (global, cnk_slab band-sharded over the combined ``(x,y)``
+    mesh axes, g_index replicated):
 
-    Input shardings
-    ---------------
-    slab_real_imag : global ``(nb_padded, nspinor, nk, ngkmax, 2)`` f64.
-        Sharded ``P(('x','y'), None, None, None, None)`` — band axis is
-        split over the combined ``('x','y')`` mesh axes; nk sits
-        between spinor and G so HDF5 row-major iteration of a union
-        read visits ``(b, s)`` then all k's in g-order (see
-        ``ffi/phdf5/cpp/read_ffi.cc`` for the iteration-order design
-        note).
-    inv : global ``(nk, nx, ny, nz)`` int32, fully replicated.
+    ``cnk_slab``     ``(nb_padded, nspinor, nk, ngkmax, 2)`` f64 — the
+                     ``re/im``-packed output of ``read_kchunk_union_sharded``
+                     with ``kchunk_axis=2``.
+    ``g_index``      ``(nk, nx, ny, nz)`` int32 from
+                     :func:`build_g_index_for_fft_box`.
 
-    Output sharding
-    ---------------
-    psi_G : global ``(nk, nb_padded, nspinor, nx, ny, nz)`` c128,
-        sharded ``P(None, ('x','y'), None, None, None, None)``.
+    Output:
+
+    ``psi_G_box``    ``(nk, nb_padded, nspinor, nx, ny, nz)`` c128
+                     sharded ``P(None, ('x','y'), None, None, None, None)``.
     """
-    p = int(mesh.shape["x"])
-    q = int(mesh.shape["y"])
-    world = p * q
-    if nb_padded % world != 0:
-        raise ValueError(
-            f"nb_padded={nb_padded} not divisible by world={world}")
-    bands_per_rank = nb_padded // world
+    mesh_x = int(mesh.shape["x"])
+    mesh_y = int(mesh.shape["y"])
+    world_size = mesh_x * mesh_y
+    if nb_padded % world_size != 0:
+        raise ValueError(f"nb_padded={nb_padded} not divisible by {world_size}")
+    bands_per_rank = nb_padded // world_size
     nx, ny, nz = (int(v) for v in fft_grid)
 
-    trace_counter = [0]
-
-    def _per_rank(slab_real_imag: jax.Array, inv: jax.Array) -> jax.Array:
-        trace_counter[0] += 1
-        # slab_real_imag: (bands_per_rank, nspinor, nk, ngkmax, 2) f64
-        cnk = slab_real_imag[..., 0] + 1j * slab_real_imag[..., 1]
-
-        # Zero-pad a single extra G-slot at index ngkmax; the inv
-        # sentinel (== ngkmax) indexes into it, so empty FFT cells
-        # gather exact zero.
+    def _per_rank(cnk_slab: jax.Array, g_index: jax.Array) -> jax.Array:
+        # (bpr, ns, nk, ngkmax, 2) f64 → (bpr, ns, nk, ngkmax) c128
+        cnk = cnk_slab[..., 0] + 1j * cnk_slab[..., 1]
+        # Append one zero slot so the sentinel index (== ngkmax) gathers
+        # zero.  `_padded` has the extra slot on the G axis only.
         zero_slot = jnp.zeros(
             (bands_per_rank, nspinor, nk, 1), dtype=jnp.complex128)
         cnk_padded = jnp.concatenate([cnk, zero_slot], axis=-1)
 
-        # Flatten the (nk, ngkmax+1) trailing dims so we can express
-        # the k-dependent gather as a single 1-D lookup.
+        # Single flat-axis gather: view cnk_padded as
+        # (bpr, ns, nk * (ngkmax + 1)) and look up a k-and-g-combined
+        # index per FFT cell.  One kernel launch for every (k, box cell).
         cnk_flat = cnk_padded.reshape(
             bands_per_rank, nspinor, nk * (ngkmax + 1))
-        flat_idx = (
-            jnp.arange(nk, dtype=jnp.int32)[:, None, None, None]
-            * (ngkmax + 1)
-            + inv
+        k_stride = ngkmax + 1
+        flat_index = (
+            jnp.arange(nk, dtype=jnp.int32)[:, None, None, None] * k_stride
+            + g_index
         )  # (nk, nx, ny, nz)
-
-        gathered = jnp.take(cnk_flat, flat_idx, axis=2)  # (bpr, ns, nk, nx, ny, nz)
-        # Move nk to the front for the conventional output layout.
+        gathered = jnp.take(cnk_flat, flat_index, axis=2)
+        # Move nk to the front for the canonical output layout.
         return jnp.transpose(gathered, (2, 0, 1, 3, 4, 5))
 
-    input_spec_slab = P(("x", "y"), None, None, None, None)
-    input_spec_inv = P(None, None, None, None)
-    output_spec = P(None, ("x", "y"), None, None, None, None)
-
-    sharded = shard_map(
+    return jax.jit(shard_map(
         _per_rank, mesh=mesh,
-        in_specs=(input_spec_slab, input_spec_inv),
-        out_specs=output_spec,
+        in_specs=(
+            P(("x", "y"), None, None, None, None),   # cnk_slab
+            P(None, None, None, None),                # g_index
+        ),
+        out_specs=P(None, ("x", "y"), None, None, None, None),
         check_rep=False,
-    )
-    jitted = jax.jit(sharded)
-    jitted._trace_counter = trace_counter  # type: ignore[attr-defined]
-    return jitted
+    ))

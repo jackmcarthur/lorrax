@@ -49,23 +49,21 @@ because the sentinel row is zero.
 `src/common/gvec_fft_box.py`:
 
 ```python
-def build_inv_map(gvecs_per_k, ngk_per_k, fft_grid, *, ngkmax=None) -> np.ndarray:
-    """Precompute inv[..., nx, ny, nz] ∈ [0, ngkmax] sentinel map.
-    Host-side.  Small (nk × nx × ny × nz × 4 B = ~MB scale).
-    """
+def build_g_index_for_fft_box(
+    gvecs_per_k, fft_grid, ngkmax,
+) -> np.ndarray:
+    """g_index[k, nx, ny, nz] = position of this box cell's coefficient
+    within k's coefficient slab, or ngkmax (sentinel) if empty."""
 
-@jax.jit
-def gather_fft_box(cnk_padded, inv, fft_grid) -> jax.Array:
-    """cnk_padded: (..., nk, ngkmax+1) complex, last col zero.
-       inv:        (nk, nx, ny, nz) int32, values in [0, ngkmax].
-       returns:    (..., nk, nx, ny, nz) complex — dense FFT box.
-    """
+def make_fft_box_kernel(mesh, nk, ngkmax, nb_padded, nspinor, fft_grid):
+    """Returns a jitted callable (cnk_slab, g_index) -> psi_G_fft_box
+    that fills a sharded FFT box from a re/im-packed coefficient slab
+    in one gather (no scatter, no per-k loop)."""
 ```
 
-Both are already implemented as private helpers in
-`common/phdf5_wfn_read_test.py` (`_build_within_k_inv`,
-`_make_union_gather_kernel`).  The refactor lifts them into a shared
-module that the new phdf5 wfn reader consumes directly.
+Both are already used by `PhdfWfnReader` in
+`common/phdf5_wfn_reader.py`; available to any caller that holds
+per-k ngkmax-wide slabs in the same layout.
 
 ## Call sites that should migrate
 
