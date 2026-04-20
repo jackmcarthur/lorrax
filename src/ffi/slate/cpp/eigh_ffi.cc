@@ -123,9 +123,50 @@ static ffi::Error EighImpl(
 
     try {
         if (compute_evecs) {
-            sl::Matrix<T> Z = sl::Matrix<T>::fromDevices(
-                n, n, Q_ptrs, num_devices, lld_Q, nb, p, q, ctx->comm);
+            // Let SLATE manage Z's storage internally, then copy each
+            // local tile back to the JAX output buffer after heev.
+            // fromDevices (pointing at JAX's d_Q_local) was empirically
+            // observed to leave some ranks' buffers un-written — SLATE's
+            // tile layout / origin handling inside heev doesn't always
+            // hit the user-provided pointer.  Copying explicitly post-
+            // heev is the robust path.
+            sl::Matrix<T> Z(n, n, nb, p, q, ctx->comm);
+            Z.insertLocalTiles(sl::Target::Devices);
             sl::heev(A, Lambda, Z, opts);
+
+            // Copy local tile data back to d_Q_local (col-major within
+            // the tile, matching what JAX interprets as row-major of
+            // Q^T).  At most one local tile per rank with our nb=n/p,
+            // though we loop to stay correct for smaller nb.
+            cudaStream_t stream = xla_stream;
+            for (int64_t ti = 0; ti < Z.mt(); ++ti) {
+                for (int64_t tj = 0; tj < Z.nt(); ++tj) {
+                    if (!Z.tileIsLocal(ti, tj)) continue;
+                    auto tile = Z(ti, tj, Z.tileDevice(ti, tj));
+                    const T* src = tile.data();
+                    const int64_t mb = tile.mb();
+                    const int64_t nb_t = tile.nb();
+                    const int64_t stride = tile.stride();
+                    // Destination offset within d_Q_local: same mapping
+                    // BaseTrapezoidMatrix::fromDevices would have used.
+                    const int64_t ii = ti * nb, jj = tj * nb;
+                    const int64_t ii_local = (ii / (nb * p)) * nb + (ii % nb);
+                    const int64_t jj_local = (jj / (nb * q)) * nb + (jj % nb);
+                    T* dst = d_Q_local + ii_local + jj_local * lld_Q;
+                    cudaError_t ce = cudaMemcpy2DAsync(
+                        dst, lld_Q * sizeof(T),
+                        src, stride * sizeof(T),
+                        mb * sizeof(T), nb_t,
+                        cudaMemcpyDeviceToDevice, stream);
+                    if (ce != cudaSuccess) {
+                        std::ostringstream os;
+                        os << "slate.eigh: cudaMemcpy2DAsync(Z tile (" << ti
+                           << "," << tj << ") -> d_Q_local) failed: "
+                           << cudaGetErrorString(ce);
+                        return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+                    }
+                }
+            }
         } else {
             sl::heev(A, Lambda, opts);
         }

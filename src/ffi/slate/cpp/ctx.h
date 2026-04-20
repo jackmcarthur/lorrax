@@ -12,9 +12,22 @@ struct SlateCtx {
     int world_size = 0;
     int p = 0, q = 0;
 
-    // MPI: SLATE needs MPI_THREAD_MULTIPLE.  We dup MPI_COMM_WORLD so
-    // SLATE's internal splits/teardown don't affect phdf5 or other FFI MPI
-    // users in the same process.
+    // MPI: SLATE needs MPI_THREAD_MULTIPLE.  We build a dup'd
+    // MPI_COMM_WORLD with ranks REORDERED so SLATE's hardcoded
+    // GridOrder::Col in fromDevices matches JAX's P('x','y') shard layout.
+    //
+    // JAX mesh layout (Mesh(reshape(p, q), ('x','y'))) puts shard (x, y)
+    // on process x*q + y.
+    //
+    // SLATE GridOrder::Col (fromDevices default) puts tile (ti, tj) on
+    // rank ti + tj*p.
+    //
+    // For JAX shard (x, y) to land on SLATE tile (x, y), we need:
+    //   SLATE_rank(tile (x, y)) == JAX_proc(shard (x, y))
+    //   x + y*p              == x*q + y
+    // Only true when p == q == 1.  Otherwise remap: make the FFI comm
+    // assign new rank = x + y*p to process (x*q + y), i.e. to JAX rank
+    // (jax_rank / q) + (jax_rank % q) * p.
     MPI_Comm comm = MPI_COMM_NULL;
     bool     owns_comm = false;
 

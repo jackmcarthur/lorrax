@@ -58,23 +58,29 @@ def _log(s: str) -> None:
         print(s, flush=True)
 
 
-def make_hermitian(n: int, seed: int, dtype, mesh: Mesh) -> jax.Array:
+def make_hermitian(n: int, seed: int, dtype, mesh: Mesh,
+                   kind: str = "random") -> jax.Array:
     sharding = NamedSharding(mesh, P("x", "y"))
 
     @jax.jit
     def build():
-        k = jax.random.key(seed)
-        if jnp.issubdtype(dtype, jnp.complexfloating):
-            k_r, k_i = jax.random.split(k, 2)
-            a = jax.random.normal(k_r, (n, n), dtype=jnp.float64)
-            b = jax.random.normal(k_i, (n, n), dtype=jnp.float64)
-            z = a + 1j * b
-            H = 0.5 * (z + z.conj().T)
-            H = H.astype(dtype)
+        if kind == "diag":
+            # Known eigvals = 1..n, eigvecs = identity.
+            diag = jnp.arange(1, n + 1, dtype=jnp.float64)
+            H = jnp.diag(diag).astype(dtype)
         else:
-            a = jax.random.normal(k, (n, n), dtype=jnp.float64)
-            H = 0.5 * (a + a.T)
-            H = H.astype(dtype)
+            k = jax.random.key(seed)
+            if jnp.issubdtype(dtype, jnp.complexfloating):
+                k_r, k_i = jax.random.split(k, 2)
+                a = jax.random.normal(k_r, (n, n), dtype=jnp.float64)
+                b = jax.random.normal(k_i, (n, n), dtype=jnp.float64)
+                z = a + 1j * b
+                H = 0.5 * (z + z.conj().T)
+                H = H.astype(dtype)
+            else:
+                a = jax.random.normal(k, (n, n), dtype=jnp.float64)
+                H = 0.5 * (a + a.T)
+                H = H.astype(dtype)
         return jax.lax.with_sharding_constraint(H, sharding)
 
     return build()
@@ -87,6 +93,9 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--nb", type=int, default=0,
                     help="SLATE tile size nb (0 = n/p)")
+    ap.add_argument("--kind", choices=["random", "diag"], default="random",
+                    help="diag: A=diag(1..n), so expected Q=I (helps diagnose "
+                         "layout)")
     args = ap.parse_args()
 
     world = jax.process_count()
@@ -100,7 +109,7 @@ def main() -> int:
     dtype = jnp.complex128 if args.dtype == "c128" else jnp.float64
     _log(f"world={world} grid=({side},{side}) n={args.n} dtype={args.dtype}")
 
-    H = make_hermitian(args.n, args.seed, dtype, mesh)
+    H = make_hermitian(args.n, args.seed, dtype, mesh, args.kind)
     jax.block_until_ready(H)
     multihost_utils.sync_global_devices("matrix_built")
 
@@ -135,13 +144,19 @@ def main() -> int:
               flush=True)
 
         # Residual: |H Q - Q diag(W)| / |H|
+        # Try several layout transforms to diagnose how SLATE stored Q.
         if Q_np.shape == (args.n, args.n):
+            H_norm = max(np.linalg.norm(H_np), 1.0)
             HQ = H_np @ Q_np
             QW = Q_np * W_np[None, :]
-            res = float(np.linalg.norm(HQ - QW) / max(np.linalg.norm(H_np), 1.0))
+            res = float(np.linalg.norm(HQ - QW) / H_norm)
             print(f"  residual |HQ - QW|/|H| = {res:.3e}", flush=True)
+            if args.kind == "diag":
+                # For diagonal H, expected Q = I — reveals any layout issues.
+                print(f"  |Q - I|_F = {np.linalg.norm(Q_np - np.eye(args.n)):.3e}")
+                sig = np.argwhere(np.abs(Q_np) > 0.5)
+                print(f"  |Q[i,j]| > 0.5 at: {[(int(i),int(j)) for (i,j) in sig[:8]]}")
         else:
-            res = None
             print(f"  Q gather shape {Q_np.shape} != ({args.n},{args.n}); "
                   f"skipping residual", flush=True)
 
