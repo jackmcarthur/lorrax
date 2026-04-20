@@ -724,6 +724,7 @@ def weighted_kmeans_jax(
     mesh: Mesh | None = None,
     mesh_axis: str | tuple[str, ...] = 'x',
     force_shard: bool = False,
+    init_method: str = 'kpp',
 ) -> tuple:
     """
     Density-weighted k-means clustering with periodic boundary conditions.
@@ -841,21 +842,41 @@ def weighted_kmeans_jax(
             )
     
     # =========================================================================
-    # K-means++ initialization — fully on-device, single jit dispatch.
+    # Initialization — k-means++ (default) or density-weighted random.
     # =========================================================================
-    # Density-weighted k-means++ with PBC minimal-image distances. Gumbel-max
-    # sampling replaces the former host-side `rng.choice(p=...)`, so the whole
-    # N_c-step selection runs inside one `lax.fori_loop`. See `kmeans_pp_init`.
+    # k-means++: density-weighted with PBC minimal-image distances, Gumbel-max
+    # sampling; N_c-step selection runs inside one `lax.fori_loop`
+    # (see `kmeans_pp_init`). Cost is O(N_c · P) — prohibitive when N_c
+    # itself is a sizeable fraction of the FFT grid, so the CLI falls back
+    # to ``init_method='random'`` above a density threshold.
+    #
+    # Density-weighted random: draw N_c points i.i.d. from p(r) ∝ ρ(r).
+    # Skips the distance-maximization step entirely. At high N_c the Lloyd
+    # refinement step converges regardless — the k-means++ advantage is for
+    # small-N_c cases where a good initial spread matters.
     # =========================================================================
-    print("K-means++ initialization (on-device fori_loop)...")
-
-    centroids = kmeans_pp_init(
-        positions, rho_flat, metric_tensor, N_c, jax.random.PRNGKey(seed)
-    )
-    # Bring the centroids to host once (tiny, (N_c, 3)) so the Lloyd driver's
-    # optional resharding step below can reshape them freely.
-    centroids.block_until_ready()
-    print("K-means++ initialization complete.")
+    if init_method == 'kpp':
+        print("K-means++ initialization (on-device fori_loop)...")
+        centroids = kmeans_pp_init(
+            positions, rho_flat, metric_tensor, N_c, jax.random.PRNGKey(seed)
+        )
+        centroids.block_until_ready()
+        print("K-means++ initialization complete.")
+    elif init_method == 'random':
+        print(f"Density-weighted random initialization (N_c = {N_c} skipping "
+              "k-means++; size is large enough that init scheme doesn't "
+              "matter)...")
+        rho_p = rho_flat / jnp.sum(rho_flat)
+        key = jax.random.PRNGKey(seed)
+        idx = jax.random.choice(
+            key, rho_flat.shape[0], shape=(N_c,), p=rho_p, replace=False,
+        )
+        centroids = positions[idx]
+        centroids.block_until_ready()
+    else:
+        raise ValueError(
+            f"init_method must be 'kpp' or 'random', got {init_method!r}"
+        )
 
     # =========================================================================
     # Lloyd's algorithm (iterative refinement)
@@ -1062,6 +1083,63 @@ def ensure_unique_centroids(
 BOHR_TO_ANG = 0.529177210544
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Grid-density threshold heuristics
+# ═══════════════════════════════════════════════════════════════════════
+#
+# When the requested centroid count approaches a sizeable fraction of the
+# real-space FFT grid, two separate things start to break:
+#
+#   1. k-means++ initialization (O(N_c · P) on-device fori_loop) becomes
+#      expensive AND unnecessary — at N_c ≳ P/10 the density-weighted
+#      random draw gives equivalent coverage after Lloyd convergence.
+#   2. Pivoted Cholesky on a k-means-sampled candidate pool of size
+#      ⌈oversample · N_c⌉ starts picking a large fraction of the grid,
+#      which means we're just sub-sampling an already-dense sampling —
+#      pointless. The right algorithm in that regime is pivoted Cholesky
+#      on the ENTIRE real-space grid (not implemented here).
+#
+# The thresholds below are heuristic; they're the point at which the
+# cheap-to-compute alternative is demonstrably no worse than the expensive
+# path, not a hard safety guard.
+
+_KPP_SKIP_FRACTION = 0.10   # skip k-means++ when N_c > n_rtot * this
+_DENSE_WARN_FRACTION = 0.25 # warn about missing dense-grid path when N_c > n_rtot * this
+
+
+def _decide_init_method(n_c: int, n_rtot: int,
+                        threshold: float = _KPP_SKIP_FRACTION,
+                        ) -> tuple[str, str | None]:
+    """Pick 'kpp' or 'random' init for k-means depending on N_c / n_rtot.
+
+    Returns (init_method, message_for_user_or_None).
+    """
+    if n_c > int(n_rtot * threshold):
+        msg = (f"N_c = {n_c} > {int(n_rtot * threshold)} = "
+               f"n_rtot · {threshold:g}; skipping k-means++ init "
+               f"(density-weighted random sampling instead).")
+        return 'random', msg
+    return 'kpp', None
+
+
+def _warn_dense_grid_regime(m_cand: int, n_c: int, n_rtot: int,
+                            threshold: float = _DENSE_WARN_FRACTION,
+                            ) -> str | None:
+    """If M_cand (oversampled pool) covers more than ``threshold`` of the
+    grid, return a warning string; else None. The *right* algorithm at this
+    density is pivoted Cholesky on the whole FFT grid — not implemented
+    here, hence the soft warning.
+    """
+    if n_c > int(n_rtot * threshold):
+        return (f"WARNING: N_c = {n_c} > {int(n_rtot * threshold)} = "
+                f"n_rtot · {threshold:g}; with oversample the candidate pool "
+                f"covers {100*m_cand/n_rtot:.1f}% of the real-space grid. "
+                f"Pivoted Cholesky on the *entire* dense real-space grid "
+                f"would be the correct algorithm here but is not "
+                f"implemented; proceeding with k-means + oversample+prune.")
+    return None
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Weighted k-means for ISDF sampling points")
@@ -1096,13 +1174,16 @@ def main():
                         help="Explicit path to a QE <prefix>.save directory for "
                              "--rho-source=qe_save / auto. If omitted, a few "
                              "conventional sandbox locations are probed.")
-    parser.add_argument("--oversample", type=float, default=1.0,
+    parser.add_argument("--oversample", type=float, default=1.5,
                         help="Oversampling ratio for the candidate pool: "
                              "run k-means for ⌈N_c · oversample⌉ centroids, "
                              "then prune back to N_c via pivoted Cholesky on "
                              "the q=0 valence-conduction pair-product Gram. "
-                             "Default 1.0 disables pruning (same as before). "
-                             "Try 1.5–2.0 per pivoted_cholesky.md.")
+                             "Default 1.5 (pivoted Cholesky always runs). "
+                             "Pass 1.0 to disable pruning and recover the "
+                             "pre-2026-04-20 behaviour. Values beyond 2.0 "
+                             "give diminishing returns per the "
+                             "prune_vs_direct_centroids_2026-04-19 report.")
     parser.add_argument("--prune-n-val", type=int, default=None,
                         help="Valence band count used in the pruning Gram. "
                              "Default: wfn.nelec.")
@@ -1117,7 +1198,9 @@ def main():
     N_c = args.N_c
     # Over-sample: k-means runs for M = ⌈N_c · oversample⌉ candidates, then
     # we prune back to N_c by pivoted Cholesky on the valence-conduction
-    # Gram. oversample=1.0 reproduces the previous behaviour (no prune).
+    # Gram. Default 1.5× per the 2026-04-19 prune-vs-direct study:
+    # oversampling + pruning gives 2–3× lower pair-product reconstruction
+    # error and 10–100× better Gram conditioning at the same final N_c.
     oversample = float(args.oversample)
     M_cand = int(np.ceil(N_c * oversample)) if oversample > 1.0 else N_c
     if M_cand != N_c:
@@ -1129,6 +1212,19 @@ def main():
 
     wfn = WFNReader("WFN.h5")
     sym = symmetry_maps.SymMaps(wfn)
+
+    # Dense-grid regime checks. Use the target N_c (not M_cand) for the
+    # init-method cutoff: k-means++ cost scales as N_c · P, so the
+    # expensive-init regime is set by the final centroid count, not the
+    # oversampled pool size. Use M_cand for the dense-warn check since
+    # that's the actual fraction of grid being evaluated.
+    n_rtot = int(np.prod(wfn.fft_grid))
+    init_method, init_msg = _decide_init_method(N_c, n_rtot)
+    if init_msg is not None:
+        print(init_msg)
+    dense_warn = _warn_dense_grid_regime(M_cand, N_c, n_rtot)
+    if dense_warn is not None:
+        print(dense_warn)
 
     charge_density = get_charge_density(
         wfn=wfn, sym=sym,
@@ -1185,6 +1281,7 @@ def main():
         avec_jax, rho_jax, N_c=M_cand, seed=args.seed, mesh=mesh,
         mesh_axis=kmeans_axis,
         force_shard=args.force_shard,
+        init_method=init_method,
     )
 
     centroids_frac = np.array(centroids_jax)

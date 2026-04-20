@@ -401,3 +401,78 @@ def test_sharded_trajectory_matches_single_device():
         rtol=1e-4, atol=1e-4,
         err_msg="sharded trajectory diverged from single-device after 10 iters",
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Grid-density threshold heuristics
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def test_decide_init_method_below_threshold_uses_kpp():
+    from src.centroid.kmeans_isdf import _decide_init_method
+    # 500 centroids out of a 36³=46656-point grid is ~1% — well below 10%.
+    method, msg = _decide_init_method(n_c=500, n_rtot=46656)
+    assert method == 'kpp'
+    assert msg is None
+
+
+def test_decide_init_method_above_threshold_switches_to_random():
+    from src.centroid.kmeans_isdf import _decide_init_method
+    # 12000 out of 46656 ≈ 25% — well above 10% threshold.
+    method, msg = _decide_init_method(n_c=12000, n_rtot=46656)
+    assert method == 'random'
+    assert msg is not None and 'random' in msg.lower()
+
+
+def test_decide_init_method_threshold_is_strict_greater():
+    from src.centroid.kmeans_isdf import _decide_init_method
+    # Exactly at the 10% cutoff: should still use kpp (strict > check).
+    n_rtot = 1000
+    method, _ = _decide_init_method(n_c=100, n_rtot=n_rtot)
+    assert method == 'kpp'
+    method, _ = _decide_init_method(n_c=101, n_rtot=n_rtot)
+    assert method == 'random'
+
+
+def test_warn_dense_grid_regime_below_threshold_is_silent():
+    from src.centroid.kmeans_isdf import _warn_dense_grid_regime
+    # N_c=1000 out of 46656 is ~2% — below 25% threshold.
+    assert _warn_dense_grid_regime(m_cand=1500, n_c=1000, n_rtot=46656) is None
+
+
+def test_warn_dense_grid_regime_above_threshold_returns_message():
+    from src.centroid.kmeans_isdf import _warn_dense_grid_regime
+    # N_c=15000 out of 46656 is ~32% — above 25% threshold.
+    msg = _warn_dense_grid_regime(m_cand=22500, n_c=15000, n_rtot=46656)
+    assert msg is not None
+    assert 'dense' in msg.lower() or 'not implemented' in msg.lower()
+
+
+def test_weighted_kmeans_jax_random_init_runs():
+    """Smoke test: random init path produces a valid Lloyd output."""
+    from src.centroid.kmeans_isdf import weighted_kmeans_jax
+    # Tiny synthetic cell: 16³ grid, 100 centroids (well above 10% threshold
+    # → test the random-init branch).
+    nx = 16
+    avec = jnp.eye(3) * 5.0  # 5 Å cubic
+    rng = np.random.default_rng(3)
+    rho = jnp.asarray(
+        np.abs(rng.standard_normal((nx, nx, nx))) + 0.1,
+        dtype=jnp.float64,
+    )
+    _, cent, _, _ = weighted_kmeans_jax(
+        avec, rho, N_c=80, seed=1, max_steps=10, init_method='random',
+    )
+    cent_np = np.asarray(cent)
+    assert cent_np.shape == (80, 3)
+    # All centroids should land in the unit cell.
+    assert np.all(cent_np >= 0) and np.all(cent_np < 1.0)
+
+
+def test_weighted_kmeans_jax_rejects_bad_init_method():
+    from src.centroid.kmeans_isdf import weighted_kmeans_jax
+    avec = jnp.eye(3)
+    rho = jnp.ones((8, 8, 8), dtype=jnp.float64)
+    with pytest.raises(ValueError, match="init_method"):
+        weighted_kmeans_jax(avec, rho, N_c=10, max_steps=2,
+                            init_method='nonexistent')
