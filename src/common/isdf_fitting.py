@@ -326,9 +326,15 @@ def compute_CCT_from_left_right(
 		local_ifftn = make_jittable_local_ifftn_3d(mesh_xy, fft_in, fft_in, norm='forward', axes=(0, 1, 2))
 		local_fftn = make_jittable_local_fftn_3d(mesh_xy, fft_in, fft_in, norm='forward', axes=(0, 1, 2))
 
+		# No ``donate_argnums``: XLA can't prove the input→output layout
+		# is donation-compatible (input is rank-3 (nk, μ, μ), output
+		# is rank-5 (nkx, nky, nkz, μ, μ) via reshape inside the jit),
+		# so donating here produces a UserWarning "Some donated buffers
+		# were not usable" on every call and the buffers are copied
+		# anyway.  Leaving this non-donated — the overhead is a single
+		# centroid-CCT call per run.
 		@partial(jax.jit, in_shardings=(in_xy, in_xy), out_shardings=out_xy,
-		         static_argnames=('nkx', 'nky', 'nkz'),
-		         donate_argnums=(0, 1))
+		         static_argnames=('nkx', 'nky', 'nkz'))
 		def _compute_CCT_LR(P_l: jax.Array, P_r: jax.Array,
 		                    nkx: int, nky: int, nkz: int) -> jax.Array:
 			# Reshape to 3D k-grid: (nk, μ, ν) -> (nkx, nky, nkz, μ, ν)
@@ -380,9 +386,12 @@ def compute_CCT_from_left_right_spin_matrix(
 		local_ifftn_spin = make_jittable_local_ifftn_3d(mesh_xy, fft_spin, fft_spin, norm='forward', axes=(0, 1, 2))
 		local_fftn_scalar = make_jittable_local_fftn_3d(mesh_xy, fft_scalar, fft_scalar, norm='forward', axes=(0, 1, 2))
 
+		# No ``donate_argnums``: see note on ``_compute_CCT_LR``
+		# above — rank-3 → rank-5 reshape inside the jit blocks XLA
+		# from proving donation is safe, and it falls back to a copy
+		# with a UserWarning.  Not donated.
 		@partial(jax.jit, in_shardings=(in_xy, in_xy), out_shardings=out_xy,
-		         static_argnames=('nkx', 'nky', 'nkz'),
-		         donate_argnums=(0, 1))
+		         static_argnames=('nkx', 'nky', 'nkz'))
 		def _compute_CCT_LR_spin(P_l: jax.Array, P_r: jax.Array,
 		                         nkx: int, nky: int, nkz: int) -> jax.Array:
 			P_l_3d = P_l.reshape(nkx, nky, nkz, ns1, ns2, n_rmu, n_rmu)
