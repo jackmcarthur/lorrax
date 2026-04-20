@@ -181,18 +181,23 @@ class _FfiBackend:
         # — XLA's allocator counts A as live-in-use until the closure
         # runs and returns.  With H5Dwrite at ~11 s per chunk and
         # chunk-compute at ~1-2 s, an unbounded queue grows ~1 task per
-        # chunk at steady state, so each chunk's A accumulates on GPU
-        # and ``bytes_in_use`` rises by ~1 zeta_chunk/rank per chunk
-        # until OOM.  Measured on Si 4x4x4 60Ry / 2400 centroids / mem16:
-        # unbounded → 12.91 → 22.48 GB over 12 chunks (growing); K=4 →
-        # plateaus at 18.5 GB from chunk 4 onward.  K=4 balances
-        # throughput (compute runs ahead of the writer) with bounded
-        # residue (K × per-rank zeta_chunk).  Writer is the bottleneck
-        # regardless, so larger K has diminishing throughput benefit.
-        # Override via ``LORRAX_WRITE_QUEUE_MAXSIZE``; set to 0 for
-        # legacy unbounded behavior (not recommended — causes OOM on
-        # multi-chunk runs with chunk size ≥ ~1 GB).
-        _qmax = int(os.environ.get('LORRAX_WRITE_QUEUE_MAXSIZE', '4'))
+        # chunk at steady state: each chunk's A accumulates on GPU and
+        # ``bytes_in_use`` rises by ~1 zeta_chunk/rank/chunk until OOM.
+        #
+        # Total in-flight A-holding at queue-cap K = (K queued +
+        # 1 being processed + 1 in main-thread transpose view).
+        # Throughput cost vs unbounded is small above K=2; writer is
+        # already the bottleneck on typical H5Dwrite rates.
+        #
+        # Measured at Si 4x4x4 60Ry / 2400c / mem16:
+        #   K=0 unbounded: 12.91 → 22.48+ GB / 28 s zeta_fit (OOM-bound)
+        #   K=2:           12.91 → 16.47 GB (flat) / 97 s zeta_fit
+        #   K=4:           12.91 → 18.50 GB (flat) / 92 s zeta_fit
+        # K=2 gives identical throughput to K=4 on this system (writer
+        # saturates) while saving 2 × zeta_chunk/rank — picked as the
+        # default.  Override via ``LORRAX_WRITE_QUEUE_MAXSIZE``; 0 =
+        # legacy unbounded (not recommended).
+        _qmax = int(os.environ.get('LORRAX_WRITE_QUEUE_MAXSIZE', '2'))
         self._dispatch_queue: queue.Queue = queue.Queue(maxsize=_qmax)
         self._dispatch_pending: int = 0          # protected by _pending_mu
         self._pending_mu = threading.Lock()
