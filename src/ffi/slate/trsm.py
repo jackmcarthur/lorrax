@@ -102,8 +102,13 @@ def distributed_trsm(
             f"mesh must have axes ('x','y'); got {mesh.axis_names}")
     p = int(mesh.shape["x"])
     q = int(mesh.shape["y"])
+    # SLATE trsm itself supports any p x q grid, but our FFI's row-major
+    # ↔ col-major hack only works for square meshes (p==q); see the
+    # docstring in cholesky.py for details.
     if p != q:
-        raise ValueError(f"slate.trsm currently requires square mesh; got {p}x{q}.")
+        raise ValueError(
+            f"distributed_trsm: only square meshes (p==q) supported by this "
+            f"FFI; got {p}x{q}.")
     if p * q != jax.process_count():
         raise ValueError(
             f"mesh {p}x{q} != jax.process_count()={jax.process_count()}")
@@ -125,7 +130,7 @@ def distributed_trsm(
     get_lib()
     ctx_handle = get_or_init_context(mesh)
 
-    nb = n // p if block_size is None else int(block_size)
+    nb = n // max(p, q) if block_size is None else int(block_size)
 
     # Local output shape matches B's sharding.
     bshape_local = (B.shape[0] // p, B.shape[1] // q)

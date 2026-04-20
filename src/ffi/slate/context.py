@@ -45,11 +45,9 @@ def _make_ctx(mesh: Mesh) -> int:
             f"mesh.shape['x']*mesh.shape['y'] = {p*q} does not match "
             f"jax.process_count() = {world}.  SLATE's heev wants one "
             f"process per grid cell.")
-    # SLATE's heev also requires a square process grid.
-    if p != q:
-        raise ValueError(
-            f"SLATE heev requires a square process grid (p==q); "
-            f"got p={p}, q={q}.")
+    # heev requires a square process grid (p==q); potrf and trsm don't.
+    # Note: this check happens in eigh.py's wrapper, not here, so other
+    # ops can use non-square meshes.
     return int(ffi_loader.create_slate_context(
         rank=rank, world_size=world, p=p, q=q))
 

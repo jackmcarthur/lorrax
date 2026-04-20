@@ -83,8 +83,19 @@ def distributed_cholesky(
             f"mesh must have axes ('x','y'); got {mesh.axis_names}")
     p = int(mesh.shape["x"])
     q = int(mesh.shape["y"])
+    # SLATE potrf supports any p x q grid in principle, but our FFI
+    # passes row-major JAX shards as if they were col-major SLATE tiles.
+    # For square (p==q), per-rank shard is (n/p, n/p) and the
+    # reinterpretation is just a transpose, which a Hermitian A absorbs.
+    # For p != q the per-rank shape is rectangular (n/p, n/q) and the
+    # SLATE col-major view ends up at shape (n/q, n/p) — mismatched, so
+    # SLATE assembles something that isn't actually A and potrf reports
+    # info != 0.  Fix would be a local D2D transpose per shard before
+    # SLATE sees it; not implemented yet.
     if p != q:
-        raise ValueError(f"SLATE potrf requires square mesh; got p={p}, q={q}.")
+        raise ValueError(
+            f"distributed_cholesky: only square meshes (p==q) are supported "
+            f"by this FFI; got {p}x{q}.  See cholesky.py for layout details.")
     if p * q != jax.process_count():
         raise ValueError(
             f"mesh {p}x{q} != jax.process_count()={jax.process_count()}")
@@ -95,7 +106,11 @@ def distributed_cholesky(
     get_lib()
     ctx_handle = get_or_init_context(mesh)
 
-    nb = n // p if block_size is None else int(block_size)
+    # Default tile size: divide by the larger grid axis so each rank
+    # holds at least 1 tile along both directions.  For square p==q this
+    # collapses to n//p (the original).  For non-square, n//p alone gave
+    # tile = n on p=1 grids → one giant tile, SLATE complains.
+    nb = n // max(p, q) if block_size is None else int(block_size)
     L_local = jax.ShapeDtypeStruct((n // p, n // q), A.dtype)
 
     attrs = dict(n=n, nb=nb, ctx_handle=int(ctx_handle))
