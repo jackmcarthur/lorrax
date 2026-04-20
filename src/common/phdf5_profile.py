@@ -46,6 +46,10 @@ from jax.sharding import Mesh
 
 from common import jax_profile
 from common.phdf5_wfn_reader import PhdfWfnReader
+from common.wfnreader import WFNReader
+from common.symmetry_maps import SymMaps
+from common.load_wfns import load_centroids_band_chunked
+import types
 
 
 def log(msg: str) -> None:
@@ -82,10 +86,19 @@ def main() -> int:
     ap.add_argument("--timed", type=int, default=4)
     ap.add_argument("--kchunk", type=int, default=0,
                     help="if >0, split full-k into chunks of this size.")
+    ap.add_argument("--centroids", action="store_true",
+                    help="instead of reader-only, profile the full "
+                         "``load_centroids_band_chunked`` loop (read + FFT + "
+                         "centroid gather) for both legacy and phdf5 paths. "
+                         "Warms each path once before tracing.")
+    ap.add_argument("--n-centroids", type=int, default=16)
     args = ap.parse_args()
 
     world = jax.process_count()
     mesh = build_mesh(world)
+
+    if args.centroids:
+        return _centroids_mode(args, world, mesh)
 
     reader = PhdfWfnReader(args.wfn, mesh=mesh)
     try:
@@ -139,6 +152,68 @@ def main() -> int:
         log("  trace dumped (if ISDF_JAX_PROFILE_DIR is set).")
     finally:
         reader.close()
+    return 0
+
+
+def _centroids_mode(args, world: int, mesh: Mesh) -> int:
+    """Warm + trace ``load_centroids_band_chunked`` for both the legacy
+    and phdf5 paths.  Each path is called three times: once to trigger
+    compile, twice to get a timed mean, then once more inside a
+    ``trace_section`` to dump a profiler bundle for the steady-state
+    iter.  This gives a fair overlap comparison — cold compile stays
+    out of the trace and only the read/FFT/gather loop is measured.
+    """
+    wfn = WFNReader(args.wfn)
+    sym = SymMaps(wfn)
+    fft_grid = tuple(int(x) for x in wfn.fft_grid)
+    meta = types.SimpleNamespace(
+        fft_grid=fft_grid, nspinor=int(wfn.nspinor),
+        nspinor_wfnfile=int(wfn.nspinor),
+        nk_tot=int(sym.nk_tot),
+        kgrid=tuple(int(x) for x in wfn.kgrid))
+    nb_total = args.band_chunk_size * args.n_chunks
+    if nb_total > wfn.nbands:
+        log(f"ERROR: want {nb_total} bands but wfn has only {wfn.nbands}")
+        return 1
+    rng = np.random.default_rng(42)
+    n_rtot = int(np.prod(fft_grid))
+    flat = rng.choice(n_rtot, size=args.n_centroids, replace=False)
+    nx, ny, nz = fft_grid
+    centroids_np = np.stack(
+        [flat // (ny * nz), (flat // nz) % ny, flat % nz], axis=1
+    ).astype(np.int32)
+    centroids = jnp.asarray(centroids_np)
+
+    base_args = dict(
+        wfn=wfn, sym=sym, meta=meta,
+        centroid_indices=centroids,
+        bispinor=False, mesh_xy=mesh,
+        band_range=(0, nb_total),
+        band_chunk_size=args.band_chunk_size,
+    )
+
+    def run(use_phdf5: bool) -> float:
+        sync(f"run_{use_phdf5}_start")
+        t0 = time.perf_counter()
+        out = load_centroids_band_chunked(**base_args, use_phdf5=use_phdf5)
+        jax.block_until_ready(out)
+        dt = time.perf_counter() - t0
+        sync(f"run_{use_phdf5}_end")
+        return dt
+
+    log(f"world={world}  wfn={args.wfn}")
+    log(f"band_chunk_size={args.band_chunk_size}  n_chunks={args.n_chunks}  "
+        f"nk_tot={sym.nk_tot}  n_centroids={args.n_centroids}")
+
+    for path_name, flag in (("legacy", False), ("phdf5", True)):
+        # Warm once (compile), then time.
+        run(flag)
+        walls = [run(flag) for _ in range(args.timed)]
+        log(f"  {path_name:<6} steady wall: "
+            f"mean {np.mean(walls)*1e3:7.1f} ms  "
+            f"min {np.min(walls)*1e3:7.1f} ms")
+        with jax_profile.trace_section(f"centroids_{path_name}"):
+            run(flag)
     return 0
 
 

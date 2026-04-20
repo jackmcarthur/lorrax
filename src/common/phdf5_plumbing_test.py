@@ -49,6 +49,7 @@ from jax.sharding import Mesh
 from common.wfnreader import WFNReader
 from common.symmetry_maps import SymMaps
 from common.load_wfns import load_centroids_band_chunked, get_psi_rchunk
+from common import jax_profile
 
 
 # =============================================================================
@@ -135,10 +136,12 @@ def run_centroids(wfn_path: str, mesh: Mesh, n_centroids: int, band_range,
         k_chunk_size=k_chunk_size,
     )
 
-    t_legacy, (rmu_B, rmuT_B) = time_call(
-        load_centroids_band_chunked, **args)
-    t_phdf5, (rmu_F, rmuT_F) = time_call(
-        load_centroids_band_chunked, **args, use_phdf5=True)
+    with jax_profile.trace_section("centroids_legacy"):
+        t_legacy, (rmu_B, rmuT_B) = time_call(
+            load_centroids_band_chunked, **args)
+    with jax_profile.trace_section("centroids_phdf5"):
+        t_phdf5, (rmu_F, rmuT_F) = time_call(
+            load_centroids_band_chunked, **args, use_phdf5=True)
 
     diff_rmu = global_max_diff(rmu_B, rmu_F)
     diff_rmuT = global_max_diff(rmuT_B, rmuT_F)
