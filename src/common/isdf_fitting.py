@@ -955,24 +955,35 @@ def fit_zeta_chunked_to_h5(
     # create-then-reopen pattern for that path.
     from file_io.slab_io import SlabIO
     nq = nqx * nqy * nqz
+    # Dataset layout ``(nq, n_rtot, n_rmu)`` — NOT ``(nq, n_rmu, n_rtot)``.
+    # Rationale: per-r-chunk writes span the full innermost axis (n_rmu)
+    # under this layout, so each ``(q, r)`` row is contiguous on disk.
+    # Under the old ``(nq, n_rmu, n_rtot)`` layout we'd write n_rchunk <
+    # n_rtot on the innermost axis, producing 480K × 1920-B scattered
+    # strips per rank per write (measured at 0.18 GB/s on Perlmutter
+    # pscratch, 8× slower than contiguous).  Per-q reads (V_q) stay
+    # contiguous under this layout too: a 6.6 M-element slab at
+    # ``(q, 0, 0)`` is a single contiguous block.  Downstream V_q
+    # transposes the returned array on GPU to match the kernel's
+    # (n_rmu, n_rtot) expectation — ~50 µs per q, negligible.
     with timing.section("zeta_fit.open_file"):
         if use_ffi_io:
             zeta_io = SlabIO(output_file, mode='w', mesh=mesh_xy,
                              use_ffi_io=True)
             zeta_io.create_dataset(
                 'zeta_q',
-                shape=(nq, n_rmu, n_rtot),
+                shape=(nq, n_rtot, n_rmu),
                 dtype=np.complex128,
-                chunks=(1, n_rmu, n_rchunk),
+                chunks=(1, n_rchunk, n_rmu),
             )
         else:
             with SlabIO(output_file, mode='w', mesh=mesh_xy,
                         use_ffi_io=False) as _zeta_create_io:
                 _zeta_create_io.create_dataset(
                     'zeta_q',
-                    shape=(nq, n_rmu, n_rtot),
+                    shape=(nq, n_rtot, n_rmu),
                     dtype=np.complex128,
-                    chunks=(1, n_rmu, n_rchunk),
+                    chunks=(1, n_rchunk, n_rmu),
                 )
             zeta_io = None
 
@@ -1046,13 +1057,17 @@ def fit_zeta_chunked_to_h5(
                 if item is None:
                     break
                 zeta_data, r_start, r_end, chunk_id, q_start, q_end = item
-                # zeta_data is already a host numpy array (process_allgather
-                # is blocking D2H + returns numpy, per JAX multihost_utils
-                # contract — there is no truly-async allgather-to-host API).
-                # Flat-q dataset: write each per-q slab at [q_flat, :, r].
+                # zeta_data is already a host numpy array of shape
+                # (q_end-q_start, n_rmu, r_end-r_start) in the order
+                # the shard_map produced.  Dataset on disk is
+                # (nq, n_rtot, n_rmu) — swap the last two axes at
+                # write time.  h5py is happy with a non-contiguous
+                # source (stride-swap view); it linearizes internally.
                 with h5py.File(output_file, 'a') as f:
                     for i, q_flat in enumerate(range(q_start, q_end)):
-                        f['zeta_q'][q_flat, :, r_start:r_end] = zeta_data[i]
+                        # zeta_data[i] is (n_rmu, r_chunk) → transpose
+                        # to (r_chunk, n_rmu) to match file layout.
+                        f['zeta_q'][q_flat, r_start:r_end, :] = zeta_data[i].T
                 write_queue.task_done()
         except Exception as e:
             write_error[0] = e
@@ -1317,15 +1332,22 @@ def fit_zeta_chunked_to_h5(
                     _q_gather = _safe_q_gather
 
                 if use_ffi_io:
-                    # FFI path: zeta_chunk is (nq, n_rmu, chunk_r) and
-                    # the file dataset is flat-q (nq, n_rmu, n_rtot), so
-                    # one collective write per r-chunk at offset
-                    # (0, 0, r_start) covers the whole chunk with no
-                    # reshape needed.
+                    # FFI path: zeta_chunk is (nq, n_rmu, chunk_r),
+                    # dataset is (nq, n_rtot, n_rmu) — transpose the
+                    # last two axes before writing so the slab matches
+                    # the disk layout.  The transpose is a JAX
+                    # metadata-only operation (shard axis 'chunk_r' /
+                    # sharded → axis 1 of the post-transpose tensor;
+                    # NamedSharding updates in place, no data motion).
+                    # Per-rank write pattern goes from ~120 K small
+                    # strips (old (nq, n_rmu, n_rtot) layout) to 1000
+                    # fat contiguous strips (one per q, full n_rmu +
+                    # rank's n_rchunk/4 rows).
+                    zeta_chunk_write = zeta_chunk.transpose(0, 2, 1)
                     zeta_io.write_slab(
-                        'zeta_q', zeta_chunk,
-                        offset=(0, 0, r_start),
-                        global_shape=(nq, n_rmu, n_rtot))
+                        'zeta_q', zeta_chunk_write,
+                        offset=(0, r_start, 0),
+                        global_shape=(nq, n_rtot, n_rmu))
                 else:
                     # Allgather path: gather once per q-chunk on every rank,
                     # queue the per-q hyperslab writes on rank 0's

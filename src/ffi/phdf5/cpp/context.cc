@@ -234,6 +234,39 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
         throw std::runtime_error(os.str());
     }
 
+    // --- diagnostic: dump the MPI_Info the MPI-IO driver actually
+    //     retained for this file (rank 0 only).  Opt-in via env so it
+    //     doesn't clutter normal output; indispensable when tuning
+    //     Lustre/ROMIO performance because ROMIO silently ignores hints
+    //     it doesn't understand or that the filesystem overrides.
+    if (ctx->rank == 0 && env_long("LORRAX_PHDF5_DUMP_HINTS", 0) != 0) {
+        void* vfd_handle = nullptr;
+        if (H5Fget_vfd_handle(ctx->file_id, ctx->fapl_id, &vfd_handle) >= 0
+            && vfd_handle != nullptr) {
+            MPI_File mpi_fh = *static_cast<MPI_File*>(vfd_handle);
+            MPI_Info info_out = MPI_INFO_NULL;
+            if (MPI_File_get_info(mpi_fh, &info_out) == MPI_SUCCESS) {
+                int nkeys = 0;
+                MPI_Info_get_nkeys(info_out, &nkeys);
+                std::fprintf(stderr,
+                    "[phdf5.hints %s] %d hints retained by ROMIO:\n",
+                    path.c_str(), nkeys);
+                for (int k = 0; k < nkeys; ++k) {
+                    char key[MPI_MAX_INFO_KEY + 1] = {0};
+                    MPI_Info_get_nthkey(info_out, k, key);
+                    int vlen = 0, flag = 0;
+                    MPI_Info_get_valuelen(info_out, key, &vlen, &flag);
+                    std::string val(vlen + 1, '\0');
+                    MPI_Info_get(info_out, key, vlen + 1, &val[0], &flag);
+                    val.resize(vlen);
+                    std::fprintf(stderr, "  %-40s = %s\n", key, val.c_str());
+                }
+                std::fflush(stderr);
+                MPI_Info_free(&info_out);
+            }
+        }
+    }
+
     // --- dxpl for dataset transfers (cached; collective default) ---
     ctx->dxpl_coll = H5Pcreate(H5P_DATASET_XFER);
     throw_if(ctx->dxpl_coll, "H5Pcreate(DATASET_XFER coll)");

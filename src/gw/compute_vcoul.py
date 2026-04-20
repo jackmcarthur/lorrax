@@ -538,9 +538,11 @@ def compute_V_q_from_zeta_h5(
         qy = (q_idx % (nqy * nqz)) // nqz
         qz = q_idx % nqz
     
-    # Get zeta shape (flat-q dataset: (nq, n_rmu, n_rtot))
+    # Get zeta shape.  Dataset layout is ``(nq, n_rtot, n_rmu)``
+    # (see note in ``isdf_fitting.fit_zeta_chunked_to_h5.open_file`` on
+    # why).  ``n_rmu`` is the innermost axis.
     zeta_dset = zeta_h5['zeta_q']
-    n_rmu = zeta_dset.shape[1]
+    n_rmu = zeta_dset.shape[2]
     q_flat = qx * (nqy * nqz) + qy * nqz + qz
 
     n_chunks = (n_rmu + mu_chunk_size - 1) // mu_chunk_size
@@ -558,8 +560,10 @@ def compute_V_q_from_zeta_h5(
         mu_i_start = i * mu_chunk_size
         mu_i_end = min(mu_i_start + mu_chunk_size, n_rmu)
 
-        # Load from HDF5 (CPU) then transfer to device
-        zeta_mu_r_np = zeta_dset[q_flat, mu_i_start:mu_i_end, :]
+        # Load from HDF5 (CPU) then transfer to device.  Dataset is
+        # ``(nq, n_rtot, n_rmu)``; we want ``(B_mu, n_rtot)`` for the
+        # FFT kernel, so read ``(n_rtot, mu_chunk)`` and transpose.
+        zeta_mu_r_np = zeta_dset[q_flat, :, mu_i_start:mu_i_end].T
         zeta_mu_r = jnp.asarray(zeta_mu_r_np)
 
         # FFT and weight (JITted) - also returns G=0 component
@@ -578,8 +582,8 @@ def compute_V_q_from_zeta_h5(
             mu_j_start = j * mu_chunk_size
             mu_j_end = min(mu_j_start + mu_chunk_size, n_rmu)
 
-            # Load and FFT ν-chunk
-            zeta_nu_r_np = zeta_dset[q_flat, mu_j_start:mu_j_end, :]
+            # Load and FFT ν-chunk (see transpose note above).
+            zeta_nu_r_np = zeta_dset[q_flat, :, mu_j_start:mu_j_end].T
             zeta_nu_r = jnp.asarray(zeta_nu_r_np)
             B_nu = mu_j_end - mu_j_start
             zeta_nu_weighted, _ = kernels.fft_and_weight(zeta_nu_r, sqrt_v, phase, B_nu)
@@ -925,15 +929,21 @@ def compute_all_V_q_from_zeta_h5(
                 qvecs.append(qvec_wrapped)
                 
                 q_flat = qx * (nky * nkz) + qy * nkz + qz
+                # Dataset layout is ``(nq, n_rtot, n_rmu)`` (see note in
+                # ``isdf_fitting.fit_zeta_chunked_to_h5.open_file``).
+                # Read the per-q slab as ``(1, n_rtot, n_rmu)``, then
+                # transpose to the downstream kernel's expected
+                # ``(n_rmu, n_rtot)``.  Per-q transpose is ~50 µs on
+                # GPU, negligible next to V_q compute.
                 arr = zeta_io.read_slab(
                     'zeta_q',
-                    shape=(1, n_rmu, n_rtot),
+                    shape=(1, n_rtot, n_rmu),
                     dtype=np.complex128,
                     offset=(q_flat, 0, 0),
                     as_numpy=True,
                 )
-                zeta_stacked[i] = arr[0]
-            
+                zeta_stacked[i] = arr[0].T  # (n_rtot, n_rmu) → (n_rmu, n_rtot)
+
             return zeta_stacked, qvecs
         
         def prepare_batch_on_gpu(zeta_stacked_np, qvec_list, actual_size):
@@ -1075,15 +1085,19 @@ def compute_all_V_q_from_zeta_h5(
                         for i in range(n_chunks):
                             mu_i_start = i * mu_chunk_size
                             mu_i_end = min(mu_i_start + mu_chunk_size, n_rmu)
-                            
+
                             q_flat = qx * (nky * nkz) + qy * nkz + qz
+                            # Dataset ``(nq, n_rtot, n_rmu)`` — read the
+                            # full r-extent for this mu-chunk, then
+                            # transpose ``(n_rtot, B_mu) → (B_mu, n_rtot)``
+                            # to match the FFT kernel's expected shape.
                             _arr = zeta_io.read_slab(
                                 'zeta_q',
-                                shape=(1, mu_i_end - mu_i_start, n_rtot),
+                                shape=(1, n_rtot, mu_i_end - mu_i_start),
                                 dtype=np.complex128,
-                                offset=(q_flat, mu_i_start, 0),
+                                offset=(q_flat, 0, mu_i_start),
                                 as_numpy=True)
-                            zeta_mu_r_np = _arr[0]
+                            zeta_mu_r_np = _arr[0].T  # (n_rtot, B_mu) → (B_mu, n_rtot)
                             zeta_mu_r = jnp.asarray(zeta_mu_r_np)
                             B_mu_i = mu_i_end - mu_i_start
                             zeta_mu_weighted, g0_chunk = kernels.fft_and_weight(zeta_mu_r, sqrt_v, phase, B_mu_i)
@@ -1099,11 +1113,11 @@ def compute_all_V_q_from_zeta_h5(
 
                                 _arr = zeta_io.read_slab(
                                     'zeta_q',
-                                    shape=(1, mu_j_end - mu_j_start, n_rtot),
+                                    shape=(1, n_rtot, mu_j_end - mu_j_start),
                                     dtype=np.complex128,
-                                    offset=(q_flat, mu_j_start, 0),
+                                    offset=(q_flat, 0, mu_j_start),
                                     as_numpy=True)
-                                zeta_nu_r_np = _arr[0]
+                                zeta_nu_r_np = _arr[0].T
                                 zeta_nu_r = jnp.asarray(zeta_nu_r_np)
                                 B_mu_j = mu_j_end - mu_j_start
                                 zeta_nu_weighted, _ = kernels.fft_and_weight(zeta_nu_r, sqrt_v, phase, B_mu_j)
