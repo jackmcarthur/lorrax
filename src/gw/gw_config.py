@@ -46,9 +46,12 @@ _DEFAULTS = {
     "self_consistent": False,
     "use_ppm_sigma": False,
     # I/O backend: True routes big sigma/zeta writes through the
-    # parallel-HDF5 FFI (collective MPI-IO); False (default) keeps
-    # the historical process_allgather + rank-0 h5py path.
-    "use_ffi_io": False,
+    # parallel-HDF5 FFI (collective MPI-IO, ~5× faster than the
+    # rank-0 h5py path once Lustre striping is applied — see
+    # ``_slab_io_ffi._lustre_prestripe``).  False keeps the historical
+    # ``process_allgather`` + rank-0 ``h5py`` path as a fallback for
+    # non-Lustre filesystems or systems without the FFI ``.so`` built.
+    "use_ffi_io": True,
     # Memory / chunking
     "memory_per_device_gb": 0.0,  # 0 = auto-detect
     "chunk_size": -1,

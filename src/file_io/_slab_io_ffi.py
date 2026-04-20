@@ -12,7 +12,10 @@ sharded dim.  See ``ffi/phdf5/cpp/write_ffi.cc`` for the C++ side.
 """
 from __future__ import annotations
 
+import os
 import queue
+import shutil
+import subprocess
 import threading
 from typing import Sequence
 
@@ -21,6 +24,47 @@ import jax.numpy as jnp
 from jax.experimental.shard_map import shard_map
 from jax.experimental import multihost_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+
+def _lustre_prestripe(path: str, stripe_count: int = 16,
+                      stripe_size: str = "4M") -> None:
+    """Pre-create ``path`` with an explicit Lustre stripe layout.
+
+    Must be called on rank 0 only, BEFORE ``open_file``.  On Lustre,
+    the MPI-IO hints ``striping_factor`` / ``striping_unit`` passed via
+    ``H5Pset_fapl_mpio`` are frequently ignored by Cray MPICH when the
+    containing directory has a fixed stripe (default 1×1 MiB on
+    Perlmutter's ``pscratch``) — the file inherits the directory
+    layout and the hint is silently dropped.  Pre-striping the file
+    with ``lfs setstripe`` forces the desired layout; HDF5's
+    ``H5Fcreate`` with ``H5F_ACC_TRUNC`` then truncates it in place and
+    the stripe metadata survives.
+
+    Measured on Si 10³ zeta_q.h5 write: with default 1×1 MiB stripe,
+    per-write effective bandwidth was ~32 MB/s/rank (64 GB total in
+    515 s).  With 16×4 MiB stripe we expect ~500 MB/s/rank on
+    Perlmutter's HDD OSTs.
+
+    Best-effort: if ``lfs`` isn't on PATH or striping fails (e.g.,
+    non-Lustre filesystem), this is a no-op.
+    """
+    if shutil.which("lfs") is None:
+        return
+    try:
+        # Remove any existing file so lfs can set the stripe.  Safe for
+        # mode='w' callers since that mode is about to truncate anyway.
+        if os.path.exists(path):
+            os.remove(path)
+        subprocess.run(
+            ["lfs", "setstripe", "-c", str(stripe_count),
+             "-S", stripe_size, path],
+            check=False, capture_output=True, timeout=10,
+        )
+    except Exception:
+        # Best-effort; fall through to plain H5Fcreate.  A debug
+        # message would be nice here but we don't want to pollute
+        # stdout on non-Lustre targets.
+        pass
 
 # Lazy imports happen inside the class methods; module-level imports
 # of ffi.phdf5 would break users who don't build the FFI .so.
@@ -92,6 +136,21 @@ class _FfiBackend:
         self.path = path
         self.mesh = mesh
         self.mode = mode
+        # Pre-stripe the file on rank 0 so Lustre's per-stripe layout
+        # actually matches the MPI_Info hints the FFI passes to ROMIO.
+        # Only for 'w' mode — existing files in 'a'/'r' already have
+        # their layout and we'd lose it by unlinking.  Barrier after
+        # so all ranks see the new inode before H5Fcreate.
+        if mode == "w" and jax.process_index() == 0:
+            stripe_count = int(os.environ.get("LORRAX_PHDF5_STRIPE_COUNT", "16"))
+            stripe_size = os.environ.get("LORRAX_PHDF5_STRIPE_SIZE_FS", "4M")
+            _lustre_prestripe(path, stripe_count=stripe_count,
+                              stripe_size=stripe_size)
+        if mode == "w":
+            try:
+                multihost_utils.sync_global_devices("slab_io_ffi_prestripe")
+            except Exception:
+                pass
         self.fh: int = self._open_file(path, mesh=mesh, mode=mode)
         self._ds_ids: dict[str, int] = {}
         # write_attr needs plain h5py (the FFI doesn't expose a

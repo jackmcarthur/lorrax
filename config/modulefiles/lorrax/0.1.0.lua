@@ -171,6 +171,22 @@ set_shell_function("lxalloc", [[
 --     LORRAX_MPI_TYPE=pmix LORRAX_NGPU=4 lxrun python3 -u -m gw.gw_jax ...
 
 set_shell_function("lxrun", [[
+    # Lustre pre-stripe for large parallel HDF5 writes under tmp/.
+    # The FFI SlabIO (use_ffi_io=true) writes zeta_q.h5 and sigma_mnk.h5
+    # via MPI-IO collectives; without an explicit Lustre stripe the
+    # files inherit pscratch's default 1×1MB layout, which caps write
+    # throughput at ~30 MB/s/rank.  ``lfs`` isn't available inside the
+    # Shifter container so the stripe must be set on the host side.
+    # Applied to ``$PWD/tmp`` since that's the conventional zeta/ISDF
+    # output directory; dir inherits mean new files pick up 16×4 MiB.
+    # Override knobs: LORRAX_NO_PRESTRIPE=1 to skip entirely,
+    # LORRAX_LUSTRE_STRIPE_COUNT, LORRAX_LUSTRE_STRIPE_SIZE to tune.
+    if [ -z "${LORRAX_NO_PRESTRIPE:-}" ] && command -v lfs >/dev/null 2>&1; then
+        mkdir -p "$PWD/tmp" 2>/dev/null
+        lfs setstripe -c "${LORRAX_LUSTRE_STRIPE_COUNT:-16}" \
+                      -S "${LORRAX_LUSTRE_STRIPE_SIZE:-4M}" \
+                      "$PWD/tmp" >/dev/null 2>&1 || true
+    fi
     local ngpu="${LORRAX_NGPU:-4}"
     local mpitype="${LORRAX_MPI_TYPE:-}"
     local mpiflag=""
