@@ -327,7 +327,8 @@ def compute_CCT_from_left_right(
 		local_fftn = make_jittable_local_fftn_3d(mesh_xy, fft_in, fft_in, norm='forward', axes=(0, 1, 2))
 
 		@partial(jax.jit, in_shardings=(in_xy, in_xy), out_shardings=out_xy,
-		         static_argnames=('nkx', 'nky', 'nkz'))
+		         static_argnames=('nkx', 'nky', 'nkz'),
+		         donate_argnums=(0, 1))
 		def _compute_CCT_LR(P_l: jax.Array, P_r: jax.Array,
 		                    nkx: int, nky: int, nkz: int) -> jax.Array:
 			# Reshape to 3D k-grid: (nk, μ, ν) -> (nkx, nky, nkz, μ, ν)
@@ -380,7 +381,8 @@ def compute_CCT_from_left_right_spin_matrix(
 		local_fftn_scalar = make_jittable_local_fftn_3d(mesh_xy, fft_scalar, fft_scalar, norm='forward', axes=(0, 1, 2))
 
 		@partial(jax.jit, in_shardings=(in_xy, in_xy), out_shardings=out_xy,
-		         static_argnames=('nkx', 'nky', 'nkz'))
+		         static_argnames=('nkx', 'nky', 'nkz'),
+		         donate_argnums=(0, 1))
 		def _compute_CCT_LR_spin(P_l: jax.Array, P_r: jax.Array,
 		                         nkx: int, nky: int, nkz: int) -> jax.Array:
 			P_l_3d = P_l.reshape(nkx, nky, nkz, ns1, ns2, n_rmu, n_rmu)
