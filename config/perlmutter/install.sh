@@ -75,18 +75,35 @@ echo "Installing modulefile..."
 echo "  Source:  $SRC_MODULE"
 echo "  Target:  $DST_MODULE"
 
-# Patch the template placeholders with resolved paths
+# Patch the template placeholders with resolved paths.
 sed \
     -e "s|@LORRAX_ROOT@|$LORRAX_INSTALL_ROOT|g" \
     -e "s|@LORRAX_SITE@|$LORRAX_SITE_PACKAGES|g" \
     -e "s|@LORRAX_DEPS@|$DEPS|g" \
     -e "s|@LORRAX_IMAGE@|$IMAGE|g" \
+    -e "s|@LORRAX_SLURM_ACCOUNT@|${LORRAX_SLURM_ACCOUNT}|g" \
+    -e "s|@LORRAX_SLURM_QOS@|${LORRAX_SLURM_QOS}|g" \
+    -e "s|@LORRAX_SLURM_CONSTRAINT@|${LORRAX_SLURM_CONSTRAINT}|g" \
+    -e "s|@LORRAX_GPUS_PER_NODE@|${LORRAX_GPUS_PER_NODE}|g" \
+    -e "s|@LORRAX_SHIFTER_MODULES@|${LORRAX_SHIFTER_MODULES}|g" \
+    -e "s|@LORRAX_MPI_TYPE_DEFAULT@|${LORRAX_MPI_TYPE_DEFAULT}|g" \
+    -e "s|@LORRAX_NVHPC_SUBPATH@|${LORRAX_NVHPC_SUBPATH}|g" \
+    -e "s|@LORRAX_MPICH_CONTAINER_DIR@|${LORRAX_MPICH_CONTAINER_DIR}|g" \
+    -e "s|@LORRAX_DARSHAN_LIB_DIR@|${LORRAX_DARSHAN_LIB_DIR}|g" \
+    -e "s|@LORRAX_FFI_NVHPC_DIR_DEFAULT@|${LORRAX_FFI_NVHPC_DIR_DEFAULT}|g" \
+    -e "s|@LORRAX_FFI_PHDF5_DIR_DEFAULT@|${LORRAX_FFI_PHDF5_DIR_DEFAULT}|g" \
+    -e "s|@LORRAX_FFI_SLATE_DIR_DEFAULT@|${LORRAX_FFI_SLATE_DIR_DEFAULT}|g" \
+    -e "s|@LORRAX_SLATE_INSTALL_DIR_DEFAULT@|${LORRAX_SLATE_INSTALL_DIR_DEFAULT}|g" \
     "$SRC_MODULE" > "$DST_MODULE"
 
-echo "  Patched: LORRAX_ROOT  = $LORRAX_INSTALL_ROOT"
-echo "  Patched: LORRAX_SITE  = $LORRAX_SITE_PACKAGES"
-echo "  Patched: LORRAX_DEPS  = ${DEPS:-(none)}"
-echo "  Patched: LORRAX_IMAGE = $IMAGE"
+echo "  Patched: LORRAX_ROOT       = $LORRAX_INSTALL_ROOT"
+echo "  Patched: LORRAX_SITE       = $LORRAX_SITE_PACKAGES"
+echo "  Patched: LORRAX_DEPS       = ${DEPS:-(none)}"
+echo "  Patched: LORRAX_IMAGE      = $IMAGE"
+echo "  Patched: SLURM account/qos = ${LORRAX_SLURM_ACCOUNT} / ${LORRAX_SLURM_QOS}"
+echo "  Patched: GPUs per node     = ${LORRAX_GPUS_PER_NODE}"
+echo "  Patched: shifter modules   = ${LORRAX_SHIFTER_MODULES}"
+echo "  Patched: default --mpi=    = ${LORRAX_MPI_TYPE_DEFAULT}"
 echo "  Module name: $MODULE_NAME  (load with: module load $MODULE_NAME)"
 
 # --- Add module use to bashrc ---
