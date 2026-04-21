@@ -695,14 +695,11 @@ def compute_L_q_from_CCT(
     mode = _resolve_memory_mode(memory_mode, mesh_xy)
 
     if mode == "low_mem":
-        # Reshard C_q from P(None, 'x', 'y') to P('x', None, 'y').  Batch 'x'
-        # puts q-points onto different X-rows (each X-row owns nq/Px
-        # matrices), and 'y' column-shards each (n_rmu, n_rmu) slice.  This
-        # is the layout the batched cuSOLVERMp FFI expects.
+        # batched cuSOLVERMp potrf on the full (Px, Py) grid.  C_q comes
+        # in as P(None, 'x', 'y'); that's exactly the FFI's input spec,
+        # so no reshard is needed.
         from ffi.cusolvermp import batched_distributed_cholesky
-        target_shard = NamedSharding(mesh_xy, P('x', None, 'y'))
-        C_resh = jax.lax.with_sharding_constraint(C_q, target_shard)
-        handle = batched_distributed_cholesky(C_resh, mesh=mesh_xy)
+        handle = batched_distributed_cholesky(C_q, mesh=mesh_xy)
         return ZetaCholFactor(
             mode="low_mem", mesh=mesh_xy,
             nq=nq, n_rmu=n_rmu, dtype=C_q.dtype,
@@ -790,22 +787,16 @@ def solve_zeta_from_L_q(
     Returns:
         zeta_q: (nq, n_rmu, n_zchunk) solution.
             high_mem → sharded P(None, None, ('x','y'))
-            low_mem  → sharded P('x', None, 'y')  (batch-distributed output;
-                      downstream allgather-to-host already tolerates this
-                      via the standard multihost_utils.process_allgather
-                      path.)
+            low_mem  → sharded P(None, 'x', 'y')    (natural ISDF layout —
+                      Z_q flows through unchanged; downstream HDF5 write
+                      path consumes either sharding)
     """
     if L_factor.mode == "low_mem":
+        # Full-mesh batched cuSOLVERMp potrs.  Z_q comes in as
+        # P(None, 'x', 'y') and the output X inherits that sharding —
+        # no reshard.
         from ffi.cusolvermp import batched_distributed_potrs
-        target_shard = NamedSharding(mesh_xy, P('x', None, 'y'))
-        Z_resh = jax.lax.with_sharding_constraint(Z_q, target_shard)
-        X = batched_distributed_potrs(L_factor._handle, Z_resh, mesh=mesh_xy)
-        # Reshard to the high_mem output layout so downstream consumers
-        # (q-chunked allgather in fit_zeta_chunked_to_h5, or write_slab)
-        # see an identical sharding regardless of memory_mode.  Modest
-        # all-to-all cost; keeps the abstraction clean at the top level.
-        out_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
-        return jax.lax.with_sharding_constraint(X, out_shard)
+        return batched_distributed_potrs(L_factor._handle, Z_q, mesh=mesh_xy)
 
     # --- high_mem path (existing replicate-L + vmap-trsm) ---------------
     L_q = L_factor._dense_L
@@ -1463,28 +1454,28 @@ def fit_zeta_chunked_to_h5(
                 # No block_until_ready — reshard will consume Z_q_flat asynchronously.
             t_zct_total += time.perf_counter() - t0
 
-            # q-loop.  Different target sharding per memory_mode:
+            # q-loop.  Mode-dependent:
             #   high_mem: Z_col P(None, None, ('x','y')) — μ-replicated for
-            #             the vmap local trsm.  Legacy path.
-            #   low_mem : Z_col P('x', None, 'y') — batch-distributed for
-            #             cuSOLVERMp's per-X-row potrs.
-            # Donating Z_q_flat lets XLA alias the input buffer for the
-            # output (we `del Z_q_flat` immediately below).  Without
-            # donation the high_mem case hits Involuntary full
-            # rematerialization going from P(None,'x','y') →
-            # P(None,None,('x','y')) — measured at Si 4×4×4 60Ry
-            # (μ=2400, B_r=12672, 2×2 mesh): no donate 31.14 GB/dev,
-            # donate 15.57 GB/dev (50% reduction).
+            #             the vmap local trsm.  Donated reshard (without
+            #             donation, SPMD hits Involuntary full
+            #             rematerialization going P(None,'x','y') →
+            #             P(None,None,('x','y')); at Si 4×4×4 60Ry
+            #             μ=2400 B_r=12672: 31.14 GB/dev → 15.57 GB/dev
+            #             with donation, 50 % reduction).
+            #   low_mem : no reshard — cuSOLVERMp's batched_potrs
+            #             consumes P(None,'x','y') directly.  Renames
+            #             Z_q_flat → Z_col for the `del Z_q_flat` below
+            #             to release the only reference.
             if L_q.mode == "low_mem":
-                z_col_shard = NamedSharding(mesh_xy, P('x', None, 'y'))
+                Z_col = Z_q_flat
             else:
                 z_col_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
 
-            @partial(jax.jit, donate_argnums=(0,))
-            def _reshard_to_z_col(z):
-                return jax.lax.with_sharding_constraint(z, z_col_shard)
+                @partial(jax.jit, donate_argnums=(0,))
+                def _reshard_to_z_col(z):
+                    return jax.lax.with_sharding_constraint(z, z_col_shard)
 
-            Z_col = _reshard_to_z_col(Z_q_flat)
+                Z_col = _reshard_to_z_col(Z_q_flat)
             Z_col.block_until_ready()
             _track_peak()
             del Z_q_flat

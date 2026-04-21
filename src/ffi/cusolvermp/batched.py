@@ -1,60 +1,45 @@
-"""``batched_distributed_{cholesky,potrs}`` — cuSOLVERMp batched solve.
+"""Per-q cuSOLVERMp potrf + potrs on the full (Px, Py) process mesh.
 
-Use case: a batch of ``Nbatch`` independent Hermitian PD matrices
-``A_q`` of shape ``(N, N)``, each one too big for one GPU (sharded
-across a 1-axis sub-group of ``Py`` ranks), and a batch of right-hand
-sides ``B_q`` of shape ``(N, Mrhs)``. Want ``A_q X_q = B_q`` for all
-``q`` in parallel across the mesh.
+Use case: a stack of ``Nq`` independent Hermitian PD matrices ``A_q`` of
+shape ``(N, N)``, each 2D-sharded across the full device mesh; ``A_q``
+is too big to fit on one GPU even alone, so the distribution buys
+memory scalability.  Right-hand sides ``B_q`` have shape ``(N, Mrhs)``
+(``Mrhs`` can be much larger than ``N``) and share the same column
+sharding.
 
-Sharding contract
------------------
-Inputs / outputs have shape ``(Nbatch, N, N)`` (cholesky) or
-``(Nbatch, N, Mrhs)`` (RHS), sharded ``P('x', None, 'y')`` on a 2-D
-``('x', 'y')`` mesh of shape ``(Px, Py)``. Batch is split along
-``'x'``; each ``(N, N)`` and ``(N, Mrhs)`` is column-sharded across
-``'y'``. Each X-row of the mesh is an independent NCCL sub-comm of
-size ``Py``; cuSOLVERMp runs on a grid ``(1, Py)`` inside.
+Sharding contract (matches ``distributed_eigh``'s P('x','y') layout,
+extended to the batch dim):
 
-cuSOLVERMp has no native batched potrf / potrs — the "batching" is a
-C++ for-loop over the per-rank batch dimension in the FFI handler.
-Grid, handle, and matrix descriptors are built once per FFI call and
-reused across the loop; only the slice pointer changes per iteration.
+    A : (Nq, N, N)       P(None, 'x', 'y')   # per-rank local (Nq, N/Px, N/Py)
+    B : (Nq, N, Mrhs)    P(None, 'x', 'y')   # per-rank local (Nq, N/Px, Mrhs/Py)
+    L : (Nq, N, N)       P(None, 'x', 'y')   # same as A
+    X : (Nq, N, Mrhs)    P(None, 'x', 'y')   # same as B
 
-For the slate twin with the same shape contract (AMD-GPU fallback
-path) see ``ffi.slate.batched``.
+No reshards in or out — the caller feeds and consumes the natural
+``P(None, 'x', 'y')`` layout used throughout the ISDF / zeta pipeline.
+The FFI handler loops over q and issues one ``cusolverMpPotrf`` /
+``cusolverMpPotrs`` call per matrix on the world-wide (Px, Py) grid.
 
-Early-init tip
---------------
-First call to either function triggers a lazy ``get_or_init_subrow_context``
-that collectively creates an NCCL sub-comm + cuSOLVERMp handle + grid
-(~hundreds of ms).  To hoist that off the critical path of the first
-batched op, call it eagerly in ``main()`` right after
-``jax.distributed.initialize()``::
+Why not batch across 'x' (per-X-row sub-comm) for batch parallelism?
+The earlier sub-comm variant is faster per matrix (2 ranks each,
+simpler NCCL) but forces the caller to reshard to ``P('x', None, 'y')``
+and complicates the downstream layout.  For the ISDF workflow the net
+wall-clock is similar (measured), so the simpler full-mesh layout
+wins on readability + zero reshard cost.
 
-    from ffi.cusolvermp.context import get_or_init_subrow_context
-    get_or_init_subrow_context(mesh)     # warm the sub-row context
-    # ... other JAX compile work can now overlap with the NCCL bootstrap
-
-Restrictions
-------------
-* Mesh must be 2-D with axes ``('x', 'y')``.
-* ``Nbatch % Px == 0``; ``N % Py == 0``; ``Mrhs % Py == 0``.
-* Dtypes: F64 / C128.
-* One cuSOLVERMp handle per process → don't mix the world-wide
-  ``distributed_eigh`` context and this sub-row context in the same
-  session.
-* ``Mrhs`` is baked into the compiled JIT.  Users who loop with the
-  *same* chunk size pay zero recompile cost (jit-cache in this module).
-  Users who genuinely vary the chunk size per call would want an FFI
-  variant with ``mrhs`` as a runtime ``Buffer<S64>`` arg (phdf5 §2.3
-  pattern); not implemented today since GWJAX-style callers pick one
-  chunk size and stick with it.
+Restrictions:
+  * Mesh is 2-D with axes ('x', 'y').
+  * Dtypes F64 / C128.
+  * The world-wide cuSOLVERMp context must be created with
+    ``col_major=False`` so tile-(i, j) → rank ``i*Py + j`` matches
+    JAX's row-major mesh reshape.  ``get_or_init_context(mesh,
+    col_major=False)`` handles this and caches the ctx.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
-from typing import Optional
+from typing import Any, Optional
 
 import jax
 import jax.numpy as jnp
@@ -62,7 +47,7 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
 
 from ..common.ffi_loader import get_lib
-from .context import get_or_init_subrow_context
+from .context import get_or_init_context
 
 __all__ = [
     "CusolverMpBatchedLowerL",
@@ -73,14 +58,9 @@ __all__ = [
 _POTRF_TARGET = "lorrax_cusolvermp_batched_potrf"
 _POTRS_TARGET = "lorrax_cusolvermp_batched_potrs"
 
-# ---------------------------------------------------------------------------
-# jit(shard_map(...)) cache.  `shard_map` in eager mode re-traces on every
-# invocation (see src/ffi/phdf5/ARCHITECTURE.md §2.4 for the measurement on
-# the phdf5 write path).  Wrapping once in `jax.jit` and caching the
-# compiled function by signature eliminates the per-call retrace cost —
-# matters when the user loops potrs over many RHS chunks with the same
-# shape.  Key covers everything that affects the compiled HLO.
-# ---------------------------------------------------------------------------
+# jit(shard_map(...)) cache per signature.  See
+# src/ffi/phdf5/ARCHITECTURE.md §2.4: eager shard_map re-traces per call;
+# wrapping in jax.jit once amortises.
 _JIT_CACHE: dict = {}
 
 def _mesh_key(mesh: Mesh):
@@ -89,26 +69,27 @@ def _mesh_key(mesh: Mesh):
 
 @dataclass(frozen=True)
 class CusolverMpBatchedLowerL:
-    """Batched-cholesky output handle.
+    """Opaque handle wrapping the batched Cholesky factor.
 
     Attributes
     ----------
     raw : jax.Array
-        Shape ``(Nbatch, N, N)`` sharded ``P('x', 'y', None)``. Bytes
-        hold cuSOLVERMp's col-major L tiles per slice. JAX reading
-        ``raw[q]`` directly sees ``L.T`` (or ``L.conj().T`` for complex);
-        the ``batched_distributed_potrs`` handler knows the layout and
-        feeds it straight back to cuSOLVERMp.
+        Shape ``(Nq, N, N)``, sharded ``P(None, 'y', 'x')``.  Bytes are
+        cuSOLVERMp's col-major L tiles per slice (from the inner-dim
+        transpose that translates JAX row-major to cuSOLVERMp col-major).
+        Pass this back to ``batched_distributed_potrs``; don't read the
+        inner (N, N) directly — use ``to_jax_lower()`` if you need a
+        conventional row-major lower-triangular L.
     mesh : Mesh
     n : int
-        Per-slice side length.
-    nb : int
-        cuSOLVERMp tile block size along the column axis.
-    nbatch : int
+    mb : int           # col block of A's descriptor (N/Px in the default)
+    nb : int           # row block of A's descriptor (N/Py in the default)
+    nbatch : int       # Nq
     """
     raw: jax.Array
     mesh: Mesh
     n: int
+    mb: int
     nb: int
     nbatch: int
 
@@ -129,61 +110,42 @@ def batched_distributed_cholesky(
     A: jax.Array,
     *,
     mesh: Mesh,
-    block_size: Optional[int] = None,
 ) -> CusolverMpBatchedLowerL:
     """Factor each ``A[q]`` = ``L[q] L[q]^H`` via ``cusolverMpPotrf``.
 
-    Parameters
-    ----------
-    A : jax.Array
-        Shape ``(Nbatch, N, N)``, dtype F64 or C128, sharded
-        ``P('x', None, 'y')``.
-    mesh : Mesh
-    block_size : int, optional
-        cuSOLVERMp tile block size. Default ``N // Py``.
+    Input sharding: ``P(None, 'x', 'y')`` — exactly the layout produced
+    by the ISDF pipeline's ``C_q_flat`` (no reshard needed).
     """
     if A.ndim != 3 or A.shape[1] != A.shape[2]:
         raise ValueError(
-            f"batched_distributed_cholesky: expected (Nbatch, N, N); "
+            f"batched_distributed_cholesky: expected (Nq, N, N); "
             f"got {A.shape}")
     Px, Py = _validate_mesh(mesh)
-    nbatch = int(A.shape[0])
-    n      = int(A.shape[1])
-    if nbatch % Px != 0:
-        raise ValueError(
-            f"Nbatch={nbatch} must be divisible by mesh 'x' axis size {Px}.")
+    nq = int(A.shape[0])
+    n  = int(A.shape[1])
+    if n % Px != 0:
+        raise ValueError(f"N={n} must be divisible by Px={Px}.")
     if n % Py != 0:
-        raise ValueError(
-            f"N={n} must be divisible by mesh 'y' axis size {Py}.")
+        raise ValueError(f"N={n} must be divisible by Py={Py}.")
 
     get_lib()
-    ctx_handle = get_or_init_subrow_context(mesh)
+    # Row-major grid → tile (i, j) on rank i*Py + j = JAX rank ordering.
+    ctx_handle = get_or_init_context(mesh, col_major=False)
 
-    nb_batch_local = nbatch // Px
-    # cuSOLVERMp expects square tiles (mb == nb).  Default: one tile per
-    # rank in the column direction (nb = N/Py).  With grid (1, Py) and
-    # mb == nb, each rank holds N/nb row-tiles stacked in a single
-    # (N × N/Py) col-major strip.
-    nb = (n // Py) if block_size is None else int(block_size)
-    mb = nb
+    mb = n // Px          # A's row block (per-rank local row count)
+    nb = n // Py          # A's col block (per-rank local col count)
 
-    key = ("potrf", _mesh_key(mesh), A.dtype,
-           nbatch, n, mb, nb, int(ctx_handle))
+    key = ("potrf", _mesh_key(mesh), A.dtype, nq, n, mb, nb, int(ctx_handle))
     jit_potrf = _JIT_CACHE.get(key)
     if jit_potrf is None:
-        # Local inner-dim transpose: (Nb_local, N, N/Py) row-major →
-        # (Nb_local, N/Py, N) row-major ≡ (N, N/Py) col-major per slice,
-        # which is what cuSOLVERMp's grid (1, Py) expects with lld=N.
-        L_local_T = jax.ShapeDtypeStruct(
-            (nb_batch_local, n // Py, n), A.dtype)
-        attrs = dict(
-            nbatch_local=nb_batch_local, n=n, mb=mb, nb=nb,
-            ctx_handle=int(ctx_handle),
-        )
+        # Inner-dim transpose per slice: (Nq, N/Px, N/Py) row-major →
+        # (Nq, N/Py, N/Px) row-major ≡ (N/Px, N/Py) col-major per slice.
+        L_local_T = jax.ShapeDtypeStruct((nq, n // Py, n // Px), A.dtype)
+        attrs = dict(nq=nq, n=n, mb=mb, nb=nb, ctx_handle=int(ctx_handle))
 
         @partial(shard_map, mesh=mesh,
-                 in_specs=P("x", None, "y"),
-                 out_specs=P("x", "y", None),
+                 in_specs=P(None, "x", "y"),
+                 out_specs=P(None, "y", "x"),
                  check_rep=False)
         def _potrf(local_A):
             local_A_T = jnp.transpose(local_A, (0, 2, 1))
@@ -194,7 +156,7 @@ def batched_distributed_cholesky(
 
     L_raw_T = jit_potrf(A)
     return CusolverMpBatchedLowerL(
-        raw=L_raw_T, mesh=mesh, n=n, nb=nb, nbatch=nbatch)
+        raw=L_raw_T, mesh=mesh, n=n, mb=mb, nb=nb, nbatch=nq)
 
 
 def batched_distributed_potrs(
@@ -202,27 +164,12 @@ def batched_distributed_potrs(
     B: jax.Array,
     *,
     mesh: Mesh,
-    block_size: Optional[int] = None,
 ) -> jax.Array:
-    """Solve ``A[q] X[q] = B[q]`` using ``L[q]`` from ``batched_distributed_cholesky``.
+    """Solve ``A[q] X[q] = B[q]`` using the factor from ``batched_distributed_cholesky``.
 
-    One cuSOLVERMp ``potrs`` call per slice; equivalent to applying
-    ``L^{-1}`` then ``L^{-H}`` in sequence.
-
-    Parameters
-    ----------
-    L : CusolverMpBatchedLowerL
-        Output of ``batched_distributed_cholesky``.
-    B : jax.Array
-        Shape ``(Nbatch, N, Mrhs)`` sharded ``P('x', None, 'y')``, same
-        dtype as the factored L.
-    mesh : Mesh
-        Must match ``L.mesh`` axis names.
-
-    Returns
-    -------
-    X : jax.Array
-        Same shape / sharding / dtype as ``B``.
+    Input sharding: ``B`` in ``P(None, 'x', 'y')``.  Output has the same
+    sharding.  No reshard — the caller's Z_col layout flows straight
+    through.
     """
     Px, Py = _validate_mesh(mesh)
     if mesh.axis_names != L.mesh.axis_names:
@@ -230,64 +177,55 @@ def batched_distributed_potrs(
     if B.ndim != 3:
         raise ValueError(
             f"batched_distributed_potrs: expected 3D B; got {B.shape}")
-    nbatch = L.nbatch
-    n      = L.n
-    if int(B.shape[0]) != nbatch:
-        raise ValueError(
-            f"batched_distributed_potrs: B.shape[0]={B.shape[0]} != "
-            f"Nbatch={nbatch}")
+    nq = L.nbatch
+    n  = L.n
+    if int(B.shape[0]) != nq:
+        raise ValueError(f"B.shape[0]={B.shape[0]} != Nq={nq}")
     if int(B.shape[1]) != n:
-        raise ValueError(
-            f"batched_distributed_potrs: B.shape[1]={B.shape[1]} != N={n}")
+        raise ValueError(f"B.shape[1]={B.shape[1]} != N={n}")
     mrhs = int(B.shape[2])
     if mrhs % Py != 0:
-        raise ValueError(
-            f"Mrhs={mrhs} must be divisible by mesh 'y' axis size {Py}.")
+        raise ValueError(f"Mrhs={mrhs} must be divisible by Py={Py}.")
     if L.raw.dtype != B.dtype:
-        raise ValueError(
-            f"L.dtype {L.raw.dtype} != B.dtype {B.dtype}")
+        raise ValueError(f"L.dtype {L.raw.dtype} != B.dtype {B.dtype}")
 
     get_lib()
-    ctx_handle = get_or_init_subrow_context(mesh)
+    ctx_handle = get_or_init_context(mesh, col_major=False)
 
-    # Block sizes.  cuSOLVERMp's block-cyclic descriptor must match JAX's
-    # contiguous P('x', None, 'y') distribution.  With grid (1, Py),
-    # block-cyclic puts tile j on y-rank (j % Py).  For rank y to own a
-    # single contiguous slab [y*mrhs/Py, (y+1)*mrhs/Py), we need exactly
-    # Py column tiles globally — i.e. nb_B = mrhs/Py.
-    #
-    # descA stays mb=nb=n/Py (square, one tile per rank — already matches
-    # JAX); descB uses mb=nb_A (row block must equal A's col block for
-    # the forward-solve pipeline) and nb_B=mrhs/Py (one col-tile per rank).
-    nb_A = L.nb if block_size is None else int(block_size)
-    mb_A = nb_A
-    mb_B = nb_A
-    nb_B = mrhs // Py
+    # descA : mb=L.mb (rows block = N/Px), nb=L.nb (cols block = N/Py)
+    # descB : mb_B = L.mb   (row block must equal A's row block — each rank's
+    #                         local row count lld = N/Px)
+    #         nb_B = Mrhs/Py (one col-tile per rank, matches JAX's
+    #                         contiguous P(None, 'x', 'y') slab)
+    mb_a = L.mb
+    nb_a = L.nb
+    mb_b = L.mb
+    nb_b = mrhs // Py
 
-    nb_batch_local = nbatch // Px
     key = ("potrs", _mesh_key(mesh), B.dtype,
-           nbatch, n, mrhs, mb_A, nb_A, mb_B, nb_B, int(ctx_handle))
+           nq, n, mrhs, mb_a, nb_a, mb_b, nb_b, int(ctx_handle))
     jit_potrs = _JIT_CACHE.get(key)
     if jit_potrs is None:
         X_local_T = jax.ShapeDtypeStruct(
-            (nb_batch_local, mrhs // Py, n), B.dtype)
+            (nq, mrhs // Py, n // Px), B.dtype)
         attrs = dict(
-            nbatch_local=nb_batch_local,
-            n=n, mrhs=mrhs,
-            mb_a=mb_A, nb_a=nb_A, mb_b=mb_B, nb_b=nb_B,
+            nq=nq, n=n, mrhs=mrhs,
+            mb_a=mb_a, nb_a=nb_a, mb_b=mb_b, nb_b=nb_b,
             ctx_handle=int(ctx_handle),
         )
 
         @partial(shard_map, mesh=mesh,
-                 in_specs=(P("x", "y", None), P("x", None, "y")),
-                 out_specs=P("x", None, "y"),
+                 in_specs=(P(None, "y", "x"), P(None, "x", "y")),
+                 out_specs=P(None, "x", "y"),
                  check_rep=False)
         def _potrs(local_L, local_B):
+            # B row-major (Nq, N/Px, Mrhs/Py) → inner transpose →
+            # (Nq, Mrhs/Py, N/Px) row-major = (N/Px, Mrhs/Py) col-major per slice.
             local_B_T = jnp.transpose(local_B, (0, 2, 1))
             X_T = jax.ffi.ffi_call(_POTRS_TARGET, X_local_T)(
                 local_L, local_B_T, **attrs)
-            # Untranspose inside the shard_map → output has P('x',None,'y')
-            # directly, saving a second shard_map pass.
+            # Untranspose inside the shard_map → output is the natural
+            # row-major (Nq, N/Px, Mrhs/Py) matching P(None, 'x', 'y').
             return jnp.transpose(X_T, (0, 2, 1))
 
         jit_potrs = jax.jit(_potrs)
