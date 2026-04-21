@@ -1476,14 +1476,22 @@ def fit_zeta_chunked_to_h5(
                     return jax.lax.with_sharding_constraint(z, z_col_shard)
 
                 Z_col = _reshard_to_z_col(Z_q_flat)
-            Z_col.block_until_ready()
-            _track_peak()
+            # block_until_ready only under LORRAX_MEM_PROFILE — outside
+            # that mode we want the next r-chunk's dispatch (wfn-load,
+            # pair density, Z-compute) to overlap with this chunk's solve,
+            # so we deliberately do not sync the host here.  `del Z_q_flat`
+            # just drops the Python ref; XLA keeps the buffer live until
+            # all consumers finish.
+            if _MEM_PROFILE:
+                Z_col.block_until_ready()
+                _track_peak()
             del Z_q_flat
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.solve"), jax_profile.step_annotation("chunk_solve", step_num=chunk_idx):
                 zeta_chunk = solve_zeta_from_L_q(L_q, Z_col, mesh_xy, q_chunk_size)
-                zeta_chunk.block_until_ready()
-                _track_peak()
+                if _MEM_PROFILE:
+                    zeta_chunk.block_until_ready()
+                    _track_peak()
                 del Z_col
             t_solve_total += time.perf_counter() - t0
 

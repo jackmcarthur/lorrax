@@ -65,10 +65,16 @@ static ffi::Error BatchedPotrfImpl(
     const int64_t slice_elems = lld_A * local_cols;
 
     // Copy full batch into output, then factor each slice in place.
-    LORRAX_CUDA_CHECK(cudaMemcpyAsync(
-        d_L_out, d_A_in,
-        nq * slice_elems * sizeof(T),
-        cudaMemcpyDeviceToDevice, ctx->stream));
+    // When the caller declares input_output_aliases={0: 0} on the
+    // ffi_call, XLA reuses A's buffer for L and the pointers are
+    // equal — skip the memcpy entirely.  At Si scale this saves ~1 GB
+    // of transient VRAM per rank for potrf and ~1.7 GB for potrs.
+    if (d_L_out != static_cast<const T*>(d_A_in)) {
+        LORRAX_CUDA_CHECK(cudaMemcpyAsync(
+            d_L_out, d_A_in,
+            nq * slice_elems * sizeof(T),
+            cudaMemcpyDeviceToDevice, ctx->stream));
+    }
 
     cusolverMpMatrixDescriptor_t descA = nullptr;
     LORRAX_LIB_CHECK(

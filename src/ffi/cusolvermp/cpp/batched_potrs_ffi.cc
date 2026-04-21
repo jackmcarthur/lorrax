@@ -66,10 +66,15 @@ static ffi::Error BatchedPotrsImpl(
     const int64_t A_slice = lld_A * A_local_cols;
     const int64_t B_slice = lld_B * B_local_cols;
 
-    LORRAX_CUDA_CHECK(cudaMemcpyAsync(
-        d_X_out, d_B_in,
-        nq * B_slice * sizeof(T),
-        cudaMemcpyDeviceToDevice, ctx->stream));
+    // Skip the memcpy when input_output_aliases={1: 0} on the
+    // ffi_call gives us B === X (XLA reuses the buffer).  See
+    // batched_potrf_ffi.cc for the rationale.
+    if (d_X_out != static_cast<const T*>(d_B_in)) {
+        LORRAX_CUDA_CHECK(cudaMemcpyAsync(
+            d_X_out, d_B_in,
+            nq * B_slice * sizeof(T),
+            cudaMemcpyDeviceToDevice, ctx->stream));
+    }
 
     cusolverMpMatrixDescriptor_t descA = nullptr, descB = nullptr;
     LORRAX_LIB_CHECK(

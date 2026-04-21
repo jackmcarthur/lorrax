@@ -149,9 +149,14 @@ def batched_distributed_cholesky(
                  check_rep=False)
         def _potrf(local_A):
             local_A_T = jnp.transpose(local_A, (0, 2, 1))
-            return jax.ffi.ffi_call(_POTRF_TARGET, L_local_T)(local_A_T, **attrs)
+            # Alias A → L: factor in place, skip the D2D memcpy in the
+            # handler.  Saves ~1 GB transient VRAM per rank at Si scale.
+            return jax.ffi.ffi_call(
+                _POTRF_TARGET, L_local_T,
+                input_output_aliases={0: 0},
+            )(local_A_T, **attrs)
 
-        jit_potrf = jax.jit(_potrf)
+        jit_potrf = jax.jit(_potrf, donate_argnums=(0,))
         _JIT_CACHE[key] = jit_potrf
 
     L_raw_T = jit_potrf(A)
@@ -222,13 +227,17 @@ def batched_distributed_potrs(
             # B row-major (Nq, N/Px, Mrhs/Py) → inner transpose →
             # (Nq, Mrhs/Py, N/Px) row-major = (N/Px, Mrhs/Py) col-major per slice.
             local_B_T = jnp.transpose(local_B, (0, 2, 1))
-            X_T = jax.ffi.ffi_call(_POTRS_TARGET, X_local_T)(
-                local_L, local_B_T, **attrs)
+            # Alias B → X: in-place solve, skip the D2D memcpy in the
+            # handler.  Saves ~1.7 GB transient VRAM per rank at Si scale.
+            X_T = jax.ffi.ffi_call(
+                _POTRS_TARGET, X_local_T,
+                input_output_aliases={1: 0},
+            )(local_L, local_B_T, **attrs)
             # Untranspose inside the shard_map → output is the natural
             # row-major (Nq, N/Px, Mrhs/Py) matching P(None, 'x', 'y').
             return jnp.transpose(X_T, (0, 2, 1))
 
-        jit_potrs = jax.jit(_potrs)
+        jit_potrs = jax.jit(_potrs, donate_argnums=(1,))
         _JIT_CACHE[key] = jit_potrs
 
     return jit_potrs(L.raw, B)
