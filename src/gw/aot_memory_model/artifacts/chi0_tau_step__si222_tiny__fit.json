@@ -1,0 +1,28 @@
+{
+  "kernel": "chi0_tau_step",
+  "feature_names": [
+    "chi_acc",
+    "Gbuf",
+    "psi_x_val",
+    "psi_y_val",
+    "psi_x_cond",
+    "psi_y_cond",
+    "mu2_px",
+    "mu2_py"
+  ],
+  "coefs": [
+    0.0,
+    4.499954426142632,
+    0.0,
+    2.0010062647357842,
+    1.2006781037975964,
+    0.8005185175171058,
+    0.0,
+    0.0
+  ],
+  "intercept": 1508.8751703388868,
+  "gamma": 1.0,
+  "residual_rms": 487.6629881183034,
+  "n_samples": 10,
+  "notes": ""
+}

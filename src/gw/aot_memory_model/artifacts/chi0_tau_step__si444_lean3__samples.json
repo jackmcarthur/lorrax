@@ -1,0 +1,266 @@
+[
+  {
+    "sys": {
+      "kgrid": [
+        4,
+        4,
+        4
+      ],
+      "n_rmu": 2400,
+      "n_s": 2,
+      "nspinor": 1,
+      "n_b_v": 20,
+      "n_b_c": 276,
+      "n_b": 0,
+      "n_r": 0,
+      "n_k": 64
+    },
+    "knobs": {},
+    "mesh": {
+      "p_x": 2,
+      "p_y": 2
+    },
+    "meas": {
+      "temp": 23592960400,
+      "argument": 2929610792,
+      "output": 1474560000,
+      "alias": 0,
+      "total": 27997131192,
+      "flops": 47505465344.0,
+      "rematerialized": false,
+      "t_lower_s": 0.17266672989353538,
+      "t_compile_s": 0.6650768350809813
+    }
+  },
+  {
+    "sys": {
+      "kgrid": [
+        2,
+        2,
+        2
+      ],
+      "n_rmu": 2400,
+      "n_s": 2,
+      "nspinor": 1,
+      "n_b_v": 20,
+      "n_b_c": 276,
+      "n_b": 0,
+      "n_r": 0,
+      "n_k": 8
+    },
+    "knobs": {},
+    "mesh": {
+      "p_x": 2,
+      "p_y": 2
+    },
+    "meas": {
+      "temp": 2949120400,
+      "argument": 366201384,
+      "output": 184320000,
+      "alias": 0,
+      "total": 3499641784,
+      "flops": 3726343168.0,
+      "rematerialized": false,
+      "t_lower_s": 0.030011530965566635,
+      "t_compile_s": 0.2709092830773443
+    }
+  },
+  {
+    "sys": {
+      "kgrid": [
+        4,
+        4,
+        2
+      ],
+      "n_rmu": 2400,
+      "n_s": 2,
+      "nspinor": 1,
+      "n_b_v": 20,
+      "n_b_c": 276,
+      "n_b": 0,
+      "n_r": 0,
+      "n_k": 32
+    },
+    "knobs": {},
+    "mesh": {
+      "p_x": 2,
+      "p_y": 2
+    },
+    "meas": {
+      "temp": 11796480400,
+      "argument": 1464805416,
+      "output": 737280000,
+      "alias": 0,
+      "total": 13998565816,
+      "flops": 20803612672.0,
+      "rematerialized": false,
+      "t_lower_s": 0.02744475402869284,
+      "t_compile_s": 0.27408611099235713
+    }
+  },
+  {
+    "sys": {
+      "kgrid": [
+        4,
+        4,
+        4
+      ],
+      "n_rmu": 1200,
+      "n_s": 2,
+      "nspinor": 1,
+      "n_b_v": 20,
+      "n_b_c": 276,
+      "n_b": 0,
+      "n_r": 0,
+      "n_k": 64
+    },
+    "knobs": {},
+    "mesh": {
+      "p_x": 2,
+      "p_y": 2
+    },
+    "meas": {
+      "temp": 5898240400,
+      "argument": 1096241192,
+      "output": 368640000,
+      "alias": 0,
+      "total": 7363121592,
+      "flops": 11933241344.0,
+      "rematerialized": false,
+      "t_lower_s": 0.025131157017312944,
+      "t_compile_s": 0.2677742780651897
+    }
+  },
+  {
+    "sys": {
+      "kgrid": [
+        4,
+        4,
+        4
+      ],
+      "n_rmu": 2400,
+      "n_s": 2,
+      "nspinor": 1,
+      "n_b_v": 20,
+      "n_b_c": 552,
+      "n_b": 0,
+      "n_r": 0,
+      "n_k": 64
+    },
+    "knobs": {},
+    "mesh": {
+      "p_x": 2,
+      "p_y": 2
+    },
+    "meas": {
+      "temp": 23592960400,
+      "argument": 4286347304,
+      "output": 1474560000,
+      "alias": 0,
+      "total": 29353867704,
+      "flops": 47717486592.0,
+      "rematerialized": false,
+      "t_lower_s": 0.023037405917420983,
+      "t_compile_s": 0.2691803270718083
+    }
+  },
+  {
+    "sys": {
+      "kgrid": [
+        4,
+        4,
+        4
+      ],
+      "n_rmu": 2400,
+      "n_s": 1,
+      "nspinor": 1,
+      "n_b_v": 20,
+      "n_b_c": 276,
+      "n_b": 0,
+      "n_r": 0,
+      "n_k": 64
+    },
+    "knobs": {},
+    "mesh": {
+      "p_x": 2,
+      "p_y": 2
+    },
+    "meas": {
+      "temp": 3627418112,
+      "argument": 2202161192,
+      "output": 1474560000,
+      "alias": 0,
+      "total": 7304139304,
+      "flops": 12002361344.0,
+      "rematerialized": false,
+      "t_lower_s": 0.02463947597425431,
+      "t_compile_s": 0.24555954604875296
+    }
+  },
+  {
+    "sys": {
+      "kgrid": [
+        4,
+        4,
+        4
+      ],
+      "n_rmu": 1200,
+      "n_s": 1,
+      "nspinor": 1,
+      "n_b_v": 20,
+      "n_b_c": 276,
+      "n_b": 0,
+      "n_r": 0,
+      "n_k": 64
+    },
+    "knobs": {},
+    "mesh": {
+      "p_x": 2,
+      "p_y": 2
+    },
+    "meas": {
+      "temp": 1076429312,
+      "argument": 732516392,
+      "output": 368640000,
+      "alias": 0,
+      "total": 2177585704,
+      "flops": 3029048832.0,
+      "rematerialized": false,
+      "t_lower_s": 0.02562927210237831,
+      "t_compile_s": 0.24550847697537392
+    }
+  },
+  {
+    "sys": {
+      "kgrid": [
+        4,
+        4,
+        4
+      ],
+      "n_rmu": 2400,
+      "n_s": 2,
+      "nspinor": 1,
+      "n_b_v": 20,
+      "n_b_c": 276,
+      "n_b": 0,
+      "n_r": 0,
+      "n_k": 64
+    },
+    "knobs": {},
+    "mesh": {
+      "p_x": 1,
+      "p_y": 4
+    },
+    "meas": {
+      "temp": 23592960272,
+      "argument": 3293335592,
+      "output": 1474560000,
+      "alias": 0,
+      "total": 28360855864,
+      "flops": 47391801344.0,
+      "rematerialized": false,
+      "t_lower_s": 0.027658357052132487,
+      "t_compile_s": 0.3258989999303594
+    }
+  }
+]
