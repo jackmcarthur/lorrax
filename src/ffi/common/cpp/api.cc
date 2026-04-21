@@ -29,6 +29,11 @@ namespace lorrax_ffi::cusolvermp {
     int     smoke_allreduce_sum(int64_t ctx_handle,
                                 uintptr_t device_ptr,
                                 int nelems);
+    int64_t create_subrow_context(int world_rank, int world_size,
+                                  uintptr_t nccl_unique_id_addr,
+                                  int nccl_unique_id_nbytes,
+                                  int Px, int Py);
+    void    destroy_subrow_context(int64_t ctx_handle);
 }
 
 namespace lorrax_ffi::phdf5 {
@@ -99,6 +104,32 @@ int lrx_create_cusolvermp_context(
 
 void lrx_destroy_cusolvermp_context(int64_t ctx_handle) {
     lrx::destroy_context(ctx_handle);
+}
+
+// Batched potrf/potrs path: per-X-row sub-comm on a (Px, Py) mesh.
+int lrx_create_cusolvermp_subrow_context(
+    int world_rank, int world_size,
+    void* nccl_unique_id_addr,
+    int nccl_unique_id_nbytes,
+    int Px, int Py,
+    int64_t* ctx_out,
+    char* err_out, int err_cap)
+{
+    try {
+        int64_t h = lrx::create_subrow_context(
+            world_rank, world_size,
+            reinterpret_cast<uintptr_t>(nccl_unique_id_addr),
+            nccl_unique_id_nbytes, Px, Py);
+        *ctx_out = h;
+        return 0;
+    } catch (const std::exception& e) {
+        if (err_out && err_cap > 0) snprintf(err_out, err_cap, "%s", e.what());
+        return 1;
+    }
+}
+
+void lrx_destroy_cusolvermp_subrow_context(int64_t ctx_handle) {
+    lrx::destroy_subrow_context(ctx_handle);
 }
 
 int lrx_smoke_allreduce_sum(int64_t ctx_handle,

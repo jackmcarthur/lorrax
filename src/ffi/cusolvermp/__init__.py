@@ -6,6 +6,16 @@ Public API:
 
     evals, Q = distributed_eigh(A, mesh=mesh)
 """
+from .batched import (
+    CusolverMpBatchedLowerL,
+    batched_distributed_cholesky,
+    batched_distributed_potrs,
+)
 from .eigh import distributed_eigh
 
-__all__ = ["distributed_eigh"]
+__all__ = [
+    "CusolverMpBatchedLowerL",
+    "batched_distributed_cholesky",
+    "batched_distributed_potrs",
+    "distributed_eigh",
+]

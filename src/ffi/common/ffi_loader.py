@@ -39,6 +39,8 @@ _FFI_TARGET_SYMBOLS = {
     # One handler per routine covers all supported dtypes — dispatch is
     # done inside the .so based on the input buffer's element type.
     "lorrax_cusolvermp_eigh":       "EighMpFfi",
+    "lorrax_cusolvermp_batched_potrf": "CusolverMpBatchedPotrfFfi",
+    "lorrax_cusolvermp_batched_potrs": "CusolverMpBatchedPotrsFfi",
     "lorrax_cusolvermg_eigh_f64":   "EighMgF64",
     "lorrax_phdf5_write":           "PhdfWriteFfi",
     "lorrax_phdf5_read":            "PhdfReadFfi",
@@ -115,6 +117,22 @@ def _set_argtypes(lib: ctypes.CDLL) -> None:
 
     lib.lrx_destroy_cusolvermp_context.argtypes = [ctypes.c_int64]
     lib.lrx_destroy_cusolvermp_context.restype  = None
+
+    lib.lrx_create_cusolvermp_subrow_context.argtypes = [
+        ctypes.c_int,                       # world_rank
+        ctypes.c_int,                       # world_size
+        ctypes.c_void_p,                    # nccl_unique_id_addr
+        ctypes.c_int,                       # nccl_unique_id_nbytes
+        ctypes.c_int,                       # Px
+        ctypes.c_int,                       # Py
+        ctypes.POINTER(ctypes.c_int64),     # ctx_out
+        ctypes.c_char_p,                    # err_out
+        ctypes.c_int,                       # err_cap
+    ]
+    lib.lrx_create_cusolvermp_subrow_context.restype = ctypes.c_int
+
+    lib.lrx_destroy_cusolvermp_subrow_context.argtypes = [ctypes.c_int64]
+    lib.lrx_destroy_cusolvermp_subrow_context.restype  = None
 
     lib.lrx_smoke_allreduce_sum.argtypes = [
         ctypes.c_int64, ctypes.c_void_p, ctypes.c_int,
@@ -255,6 +273,35 @@ def create_cusolvermp_context(
 
 def destroy_cusolvermp_context(ctx_handle: int) -> None:
     get_lib().lrx_destroy_cusolvermp_context(int(ctx_handle))
+
+
+def create_cusolvermp_subrow_context(
+    world_rank: int, world_size: int,
+    nccl_unique_id_addr: int, nccl_unique_id_nbytes: int,
+    Px: int, Py: int,
+) -> int:
+    """Collective create of a per-X-row cuSOLVERMp sub-context.
+
+    On a (Px, Py) process mesh each X-row (size Py) gets its own NCCL
+    sub-comm + ``cal_comm_t`` + ``cusolverMpGrid_t`` of shape (1, Py).
+    Used by the batched potrf/potrs path.
+    """
+    lib = get_lib()
+    ctx_out = ctypes.c_int64(0)
+    err = ctypes.create_string_buffer(_ERR_CAP)
+    rc = lib.lrx_create_cusolvermp_subrow_context(
+        int(world_rank), int(world_size),
+        int(nccl_unique_id_addr), int(nccl_unique_id_nbytes),
+        int(Px), int(Py),
+        ctypes.byref(ctx_out),
+        err, _ERR_CAP,
+    )
+    _check_err(rc, err)
+    return int(ctx_out.value)
+
+
+def destroy_cusolvermp_subrow_context(ctx_handle: int) -> None:
+    get_lib().lrx_destroy_cusolvermp_subrow_context(int(ctx_handle))
 
 
 def smoke_allreduce_sum(ctx_handle: int, device_ptr: int, nelems: int) -> int:
