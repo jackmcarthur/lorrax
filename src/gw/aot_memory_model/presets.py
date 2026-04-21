@@ -191,13 +191,24 @@ def points_vq_mu_chunk(preset: str):
 
 def points_sigma_kij(preset: str):
     baseline = SysDims(kgrid=(4, 4, 4), n_rmu=2400, n_s=2, n_b=40)
+    # 4 n_s=1 points confirm that the 2.67/2.33 Gmid/Vmid split is not
+    # a DoE collinearity artifact — it's XLA's actual buffer scheduling.
+    # Adding more n_s=1 points leaves the fit unchanged.  The
+    # constraint structure is 4α+β (n_s=2) and α+β (n_s=1), uniquely
+    # determined with 2 data points; extra points add robustness but
+    # don't shift the answer.
     return [
         (baseline, Knobs.of(), MeshSpec(2, 2)),
         (replace(baseline, kgrid=(2, 2, 2)), Knobs.of(), MeshSpec(2, 2)),
         (replace(baseline, n_rmu=1200), Knobs.of(), MeshSpec(2, 2)),
         (replace(baseline, n_b=20), Knobs.of(), MeshSpec(2, 2)),
         (replace(baseline, n_b=80), Knobs.of(), MeshSpec(2, 2)),
+        # n_s=1 axis, multiple points so Gmid/Vmid could separate *in
+        # principle*; they don't because the fit is already identified.
         (replace(baseline, n_s=1), Knobs.of(), MeshSpec(2, 2)),
+        (replace(baseline, n_s=1, n_rmu=1200), Knobs.of(), MeshSpec(2, 2)),
+        (replace(baseline, n_s=1, n_b=80), Knobs.of(), MeshSpec(2, 2)),
+        (replace(baseline, n_s=1, kgrid=(2, 2, 2)), Knobs.of(), MeshSpec(2, 2)),
         (baseline, Knobs.of(), MeshSpec(1, 4)),
         (baseline, Knobs.of(), MeshSpec(4, 1)),
     ]
