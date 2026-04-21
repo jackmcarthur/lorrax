@@ -1,0 +1,14 @@
+{
+  "kernel": "slab_write",
+  "feature_names": [
+    "slab"
+  ],
+  "coefs": [
+    1.0000000000000002
+  ],
+  "intercept": 0.0,
+  "gamma": 1.0,
+  "residual_rms": 4.017901312435321e-06,
+  "n_samples": 7,
+  "notes": ""
+}

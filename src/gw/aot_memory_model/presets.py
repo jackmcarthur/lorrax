@@ -201,3 +201,67 @@ def points_sigma_kij(preset: str):
         (baseline, Knobs.of(), MeshSpec(1, 4)),
         (baseline, Knobs.of(), MeshSpec(4, 1)),
     ]
+
+
+# ---------------------------------------------------------------------------
+# load_psi_rchunk_fft  (knobs: chunk_r, nb_pad)
+# ---------------------------------------------------------------------------
+
+def points_load_psi_rchunk_fft(preset: str):
+    # FFT grid here is kgrid (we repurpose SysDims.kgrid as the real-space
+    # FFT grid; n_r := prod(kgrid)).  Typical Si 4x4x4 60 Ry fft_grid is
+    # (24, 24, 24) but we go smaller for reasonable compile wall.
+    baseline = SysDims(kgrid=(24, 24, 24), n_rmu=0, n_s=2,
+                       n_b=16, n_r=24 ** 3)
+    return [
+        (baseline, Knobs.of(chunk_r=3456, nb_pad=16),  MeshSpec(2, 2)),
+        (baseline, Knobs.of(chunk_r=1728, nb_pad=16),  MeshSpec(2, 2)),
+        (baseline, Knobs.of(chunk_r=6912, nb_pad=16),  MeshSpec(2, 2)),
+        (replace(baseline, n_b=32, n_r=24**3),
+         Knobs.of(chunk_r=3456, nb_pad=32), MeshSpec(2, 2)),
+        (replace(baseline, kgrid=(32, 32, 32), n_r=32**3),
+         Knobs.of(chunk_r=3456, nb_pad=16), MeshSpec(2, 2)),
+        (replace(baseline, n_s=1),
+         Knobs.of(chunk_r=3456, nb_pad=16), MeshSpec(2, 2)),
+        (baseline, Knobs.of(chunk_r=3456, nb_pad=16), MeshSpec(1, 4)),
+        (baseline, Knobs.of(chunk_r=3456, nb_pad=16), MeshSpec(4, 1)),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# load_psi_rchunk_reshard  (knobs: chunk_r, nb_pad)
+# ---------------------------------------------------------------------------
+
+def points_load_psi_rchunk_reshard(preset: str):
+    baseline = SysDims(kgrid=(4, 4, 4), n_rmu=0, n_s=2,
+                       n_b=296, n_r=24 ** 3)
+    return [
+        (baseline, Knobs.of(chunk_r=3456, nb_pad=296),  MeshSpec(2, 2)),
+        (baseline, Knobs.of(chunk_r=1728, nb_pad=296),  MeshSpec(2, 2)),
+        (baseline, Knobs.of(chunk_r=6912, nb_pad=296),  MeshSpec(2, 2)),
+        (replace(baseline, n_b=148),
+         Knobs.of(chunk_r=3456, nb_pad=148), MeshSpec(2, 2)),
+        (replace(baseline, kgrid=(2, 2, 2)),
+         Knobs.of(chunk_r=3456, nb_pad=296), MeshSpec(2, 2)),
+        (replace(baseline, n_s=1),
+         Knobs.of(chunk_r=3456, nb_pad=296), MeshSpec(2, 2)),
+        (baseline, Knobs.of(chunk_r=3456, nb_pad=296), MeshSpec(1, 4)),
+        (baseline, Knobs.of(chunk_r=3456, nb_pad=296), MeshSpec(4, 1)),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# slab_write  (knob: chunk_r)
+# ---------------------------------------------------------------------------
+
+def points_slab_write(preset: str):
+    baseline = SysDims(kgrid=(4, 4, 4), n_rmu=2400, n_r=12672)
+    return [
+        (baseline, Knobs.of(chunk_r=12672), MeshSpec(2, 2)),
+        (baseline, Knobs.of(chunk_r=6336),  MeshSpec(2, 2)),
+        (baseline, Knobs.of(chunk_r=25344), MeshSpec(2, 2)),
+        (replace(baseline, n_rmu=1200), Knobs.of(chunk_r=12672), MeshSpec(2, 2)),
+        (replace(baseline, n_rmu=3200), Knobs.of(chunk_r=12672), MeshSpec(2, 2)),
+        (replace(baseline, kgrid=(2, 2, 2)), Knobs.of(chunk_r=12672), MeshSpec(2, 2)),
+        (baseline, Knobs.of(chunk_r=12672), MeshSpec(1, 4)),
+    ]

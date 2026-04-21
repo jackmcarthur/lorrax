@@ -14,16 +14,28 @@ Production entry: ``gw.ppm_sigma._get_sigma_kij_kernel`` (returns
 Output (2-tuple):
     sigma_re, sigma_im  (nk, m_proj, n_proj)   each  P(None, 'x', 'y')
 
-Key primitives:
-    T_G_mid   = 16·n_k·n_s²·μ² / (p_x·p_y)   G_k / G_R (Gbuf-like)
-    T_V_mid   = 16·n_k·μ² / (p_x·p_y)        V_R / W_q
-    T_psi_L   = 16·n_k·m_coh·n_s·μ / p_x     psi_coh_rmuT_X shard
-    T_psi_R   = 16·n_k·m_coh·n_s·μ / p_y     psi_coh_rmu_Y shard
-    T_psi_proj = 16·n_k·n_proj·n_s·μ / P     average for proj shards
+Key primitives (n_b represents m_coh == n_proj for this POC):
+    T_G_mid    = 16·n_k·n_s²·μ² / (p_x·p_y)   G_k / G_R (Gbuf-like)
+    T_V_mid    = 16·n_k·μ² / (p_x·p_y)        V_R / W_q
+    T_psi_X    = 16·n_k·n_b·n_s·μ / p_x       psi_*_X shards
+    T_psi_Y    = 16·n_k·n_b·n_s·μ / p_y       psi_*_Y shards
 
-For this POC we model ``m_coh == n_proj == sys.n_b`` (they often are at
-the PPM use-site).  Breaking that out would need more primitives.
+Reduce-scatter structure (the multistage trick at
+``_make_project_ri_reduce_scatter``): per sigma_k we run **2 branches
+(re, im)** × **2 psum_scatters each** = N_RS = 4 total RS ops.  Each
+psum_scatter holds a pre-scatter partial buffer alive until the
+collective commits.  Key per-RS primitives:
+
+    T_rs_left  = 16·n_k·n_b·n_s·μ / p_y          first-stage left_partial
+                                                  (kmsx × ksxty -> kmty)
+    T_rs_mn    = 16·n_k·n_b·n_b / (p_x·p_y)      second-stage pre-scatter
+                                                  (kmty × ktyn -> kmn)
+
+The fit's β on these primitives × N_RS=4 gives the total RS live-set.
+If we ever fuse re+im into one stacked op, N_RS drops to 2; the
+primitive names make this explicit.
 """
+N_RS_STAGES = 4   # re + im, each doing 2 psum_scatters
 from functools import partial
 
 import jax
@@ -36,9 +48,11 @@ from ..core import AotKernel, Knobs, MeshSpec, SysDims, register_kernel
 _B = 16.0
 
 def _T_Gmid(sys, knobs, mesh):
+    """G_k / G_R / sigma_k shape (nk, s, μ, s, μ) on P(None,None,'x',None,'y')."""
     return _B * sys.n_k * (sys.n_s ** 2) * sys.n_rmu ** 2 / (mesh.p_x * mesh.p_y)
 
 def _T_Vmid(sys, knobs, mesh):
+    """W_q / V_R shape (nk, μ, μ) on P(None,'x','y')."""
     return _B * sys.n_k * sys.n_rmu ** 2 / (mesh.p_x * mesh.p_y)
 
 def _T_psi_X(sys, knobs, mesh):
@@ -47,14 +61,36 @@ def _T_psi_X(sys, knobs, mesh):
 def _T_psi_Y(sys, knobs, mesh):
     return _B * sys.n_k * sys.n_b * sys.n_s * sys.n_rmu / mesh.p_y
 
+# --- Reduce-scatter primitives (N_RS_STAGES = 4: re + im × 2 RS each) ---
+
+def _T_rs_left(sys, knobs, mesh):
+    """left_partial at stage 1: (nk, m, s, μ/p_y) -- X-local, Y-sharded.
+    Lives before psum_scatter('x') commits; multiplied by the RS stage
+    count (2 left per branch × 2 branches = 4 if fit extracts full n_rs).
+    """
+    return _B * sys.n_k * sys.n_b * sys.n_s * sys.n_rmu / mesh.p_y
+
+def _T_rs_mn(sys, knobs, mesh):
+    """second-stage pre-scatter: (nk, m/p_x, n, μ/p_y).
+    Post-left-RS, before right-RS commits.
+    """
+    return (_B * sys.n_k * sys.n_b * sys.n_b
+            * sys.n_rmu / (mesh.p_x * mesh.p_y))
+
 
 @register_kernel
 class SigmaKijKernel(AotKernel):
     name = "sigma_kij"
     SYSTEM_DIMS = ("n_k", "n_rmu", "n_s", "n_b", "kgrid")
     KNOBS = ()
-    PRIMITIVES = {"Gmid": _T_Gmid, "Vmid": _T_Vmid,
-                  "psi_X": _T_psi_X, "psi_Y": _T_psi_Y}
+    PRIMITIVES = {
+        "Gmid":    _T_Gmid,
+        "Vmid":    _T_Vmid,
+        "psi_X":   _T_psi_X,
+        "psi_Y":   _T_psi_Y,
+        "rs_left": _T_rs_left,
+        "rs_mn":   _T_rs_mn,
+    }
 
     def build_specs(self, sys, knobs, mesh):
         nk, mu, ns, nb = sys.n_k, sys.n_rmu, sys.n_s, sys.n_b
