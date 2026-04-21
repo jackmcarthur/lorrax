@@ -259,8 +259,7 @@ class FitOneRChunkKernel(AotKernel):
         kernel = _make_fit_one_rchunk_kernel(
             mesh, meta, band_chunk_ranges,
             band_range_left, band_range_right, band_range_full,
-            Br, q_chunk_size,
-            hash(kvecs_frac.tobytes()), kvecs_frac,
+            Br, q_chunk_size, kvecs_frac,
         )
 
         # The factory returns the bare jit.  Wrap so the AOT specs'

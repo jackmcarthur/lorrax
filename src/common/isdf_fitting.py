@@ -40,8 +40,6 @@ from .fft_helpers import (
 )
 from .load_wfns import (
     read_Gvecs_to_devices,
-    get_psi_rchunk,
-    iter_psi_rchunk_bandwise,
     load_centroids_band_chunked,
 )
 
@@ -78,36 +76,6 @@ def load_gspace_for_bands(
             wfn, sym, bc_range, meta, bispinor, mesh_xy)
         cached_gspace.append((global_psi_Gtot, tuple(bc_range)))
     return cached_gspace
-
-
-def _band_chunk_ranges_respecting_endpoints(
-    band_full: tuple[int, int],
-    endpoints: list[int],
-    chunk_size: int,
-) -> list[tuple[int, int]]:
-    """Build contiguous band-chunk ranges that never straddle any of
-    the given ``endpoints``.
-
-    Given the full band range ``(fs, fe)`` and a list of internal
-    breakpoints (typically the left/right pair-density endpoints
-    ``{b_L_start, b_L_end, b_R_start, b_R_end}``), return a list of
-    ``(bc_start, bc_end)`` chunks such that each chunk lies fully
-    inside one "segment" — which means the chunk is entirely inside
-    the left range, entirely inside the right range, inside both,
-    or outside both.  Downstream code can then do a Python-level
-    ``if bc_in_left:`` to skip the einsum for chunks outside each
-    range, never materialising an out-of-range matmul.
-    """
-    fs, fe = band_full
-    breakpoints = sorted(set([fs, fe] + [b for b in endpoints if fs < b < fe]))
-    ranges: list[tuple[int, int]] = []
-    for seg_start, seg_end in zip(breakpoints[:-1], breakpoints[1:]):
-        pos = seg_start
-        while pos < seg_end:
-            nxt = min(pos + chunk_size, seg_end)
-            ranges.append((pos, nxt))
-            pos = nxt
-    return ranges
 
 
 # ============================================================================
@@ -679,7 +647,6 @@ def _make_fit_one_rchunk_kernel(
     band_range_full: tuple[int, int],
     actual_n_rchunk: int,
     q_chunk_size: int,
-    kvecs_frac_hash: int,
     kvecs_frac,
 ):
     """Factory: returns a ``jax.jit``'d fit_one_rchunk callable closing
@@ -706,23 +673,25 @@ def _make_fit_one_rchunk_kernel(
     n_rmu = meta.n_rmu
     nspinor = meta.nspinor
     kgrid = meta.kgrid
-    nqx, nqy, nqz = kgrid
-    nq = nqx * nqy * nqz
 
     l_lo, l_hi = band_range_left
     r_lo, r_hi = band_range_right
-    nb_left = l_hi - l_lo
-    nb_right = r_hi - r_lo
 
     P_sharding = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     L_slice_shard = NamedSharding(mesh_xy, P(None, 'x', None, None))
 
-    # Classify each band-chunk into (left_status, right_status) at trace
-    # time.  Values: 'skip' | 'direct' | 'pad'.  "skip" = entirely out of
-    # the L/R band range; "direct" = entirely inside (slice with no pad);
-    # "pad" = straddles the boundary (zero-pad to bc_size).  The Python
-    # for-loop below branches on these strings at trace time so the jit
-    # body only emits the needed ops per band-chunk.
+    # Classify each band-chunk against the L and R endpoint ranges at
+    # trace time.  Status codes (``'skip' | 'direct' | 'pad'``) dispatch
+    # the Python if-branch inside _kernel below so the jit body only
+    # emits the ops that matter for this bc.
+    #
+    #   skip   — bc_range is entirely outside [rs, re); the contribution
+    #            is dropped at trace (no ops emitted).
+    #   direct — bc_range ⊆ [rs, re); straight slice of the centroid
+    #            copy, no zero-padding needed.
+    #   pad    — bc_range straddles an endpoint; slot the overlapping
+    #            bands into a zero-padded bc_size-wide buffer so the
+    #            pair-density einsum still hits the uniform jit cache.
     def _classify(rs, re, bc_lo, bc_hi):
         ol_lo = max(bc_lo, rs)
         ol_hi = min(bc_hi, re)
@@ -751,73 +720,55 @@ def _make_fit_one_rchunk_kernel(
         norms_r,
         r_start_dyn,
     ):
-        # 1. Initialise pair-density accumulators for this r-chunk
-        P_l = jax.lax.with_sharding_constraint(
-            jnp.zeros((nk_tot, n_rmu, actual_n_rchunk), dtype=jnp.complex128),
-            P_sharding)
-        P_r = jax.lax.with_sharding_constraint(
-            jnp.zeros((nk_tot, n_rmu, actual_n_rchunk), dtype=jnp.complex128),
-            P_sharding)
+        # --- 1. Pair-density accumulators (one r-chunk wide) ---
+        def _zero_P():
+            return jax.lax.with_sharding_constraint(
+                jnp.zeros((nk_tot, n_rmu, actual_n_rchunk),
+                          dtype=jnp.complex128),
+                P_sharding)
+        P_l = _zero_P()
+        P_r = _zero_P()
 
-        # 2. Stream band-chunks: FFT + reshard + accumulate into P_l, P_r
+        # Pair-density bc-contribution — shared for the L and R sides.
+        # ``cls`` is the _classify tuple for THIS side; ``psi_centroid``
+        # is psi_l_rmuT_X_fit (for L) or psi_r_rmuT_X_fit (for R);
+        # ``norms`` is the matching clamped weights.  Returns the
+        # updated accumulator (P_l or P_r).
+        def _accumulate(P_acc, cls, psi_centroid, norms, psi_bc_Y, bc_size):
+            tag, payload = cls
+            if tag == 'skip':
+                return P_acc
+            if tag == 'direct':
+                lo, hi = payload
+                psi_L_bc = psi_centroid[:, :, lo:hi, :]
+                norm_slice = norms[lo:hi]
+            else:  # 'pad' — straddles an endpoint
+                cen_lo, cen_hi, dst_lo, dst_hi = payload
+                psi_L_bc = jax.lax.with_sharding_constraint(
+                    jnp.zeros((nk_tot, n_rmu, bc_size, nspinor),
+                              dtype=jnp.complex128),
+                    L_slice_shard)
+                psi_L_bc = psi_L_bc.at[:, :, dst_lo:dst_hi, :].set(
+                    psi_centroid[:, :, cen_lo:cen_hi, :])
+                norm_slice = jnp.ones((bc_size,), dtype=jnp.float64
+                                      ).at[dst_lo:dst_hi].set(
+                    norms[cen_lo:cen_hi])
+            psi_R_bc = psi_bc_Y / norm_slice[None, :, None, None]
+            return accumulate_pair_density_spin_traced(
+                P_acc, psi_L_bc, psi_R_bc, mesh_xy)
+
+        # --- 2. Stream band-chunks: FFT + reshard + L/R contributions ---
         for bc_idx, (bc_range, l_cls, r_cls) in enumerate(bc_classify):
-            bc_lo, bc_hi = bc_range
-            bc_size = bc_hi - bc_lo
-
-            psi_G_bc = psi_bc_G_tuple[bc_idx]
-            # Reuse production's FFT + reshard (both jit'd; the decorator
-            # inlines them into our outer jit at trace time).  r_start_dyn
-            # is a tracer scalar, r_chunk_size=actual_n_rchunk is static.
+            bc_size = bc_range[1] - bc_range[0]
+            # FFT + reshard (both jit'd upstream; inlined here at trace).
+            # r_start_dyn is a tracer scalar, r_chunk_size is static.
             psi_bc_Y = get_sharded_wfns_rchunk_slice(
-                psi_G_bc, meta, r_start_dyn, actual_n_rchunk,
+                psi_bc_G_tuple[bc_idx], meta, r_start_dyn, actual_n_rchunk,
                 kvecs_frac, mesh_xy, bc_range)
-
-            # --- Left pair-density contribution ---
-            if l_cls[0] == 'direct':
-                lo, hi = l_cls[1]
-                psi_L_bc = psi_l_rmuT_X_fit[:, :, lo:hi, :]
-                norm_slice = norms_l[lo:hi]
-                psi_R_bc = psi_bc_Y / norm_slice[None, :, None, None]
-                P_l = accumulate_pair_density_spin_traced(
-                    P_l, psi_L_bc, psi_R_bc, mesh_xy)
-            elif l_cls[0] == 'pad':
-                centroid_lo, centroid_hi, dest_lo, dest_hi = l_cls[1]
-                psi_L_bc = jax.lax.with_sharding_constraint(
-                    jnp.zeros((nk_tot, n_rmu, bc_size, nspinor),
-                              dtype=jnp.complex128),
-                    L_slice_shard)
-                psi_L_bc = psi_L_bc.at[:, :, dest_lo:dest_hi, :].set(
-                    psi_l_rmuT_X_fit[:, :, centroid_lo:centroid_hi, :])
-                norm_bc = jnp.ones((bc_size,), dtype=jnp.float64)
-                norm_bc = norm_bc.at[dest_lo:dest_hi].set(
-                    norms_l[centroid_lo:centroid_hi])
-                psi_R_bc = psi_bc_Y / norm_bc[None, :, None, None]
-                P_l = accumulate_pair_density_spin_traced(
-                    P_l, psi_L_bc, psi_R_bc, mesh_xy)
-            # else 'skip': no L-contribution from this bc
-
-            # --- Right pair-density contribution ---
-            if r_cls[0] == 'direct':
-                lo, hi = r_cls[1]
-                psi_L_bc = psi_r_rmuT_X_fit[:, :, lo:hi, :]
-                norm_slice = norms_r[lo:hi]
-                psi_R_bc = psi_bc_Y / norm_slice[None, :, None, None]
-                P_r = accumulate_pair_density_spin_traced(
-                    P_r, psi_L_bc, psi_R_bc, mesh_xy)
-            elif r_cls[0] == 'pad':
-                centroid_lo, centroid_hi, dest_lo, dest_hi = r_cls[1]
-                psi_L_bc = jax.lax.with_sharding_constraint(
-                    jnp.zeros((nk_tot, n_rmu, bc_size, nspinor),
-                              dtype=jnp.complex128),
-                    L_slice_shard)
-                psi_L_bc = psi_L_bc.at[:, :, dest_lo:dest_hi, :].set(
-                    psi_r_rmuT_X_fit[:, :, centroid_lo:centroid_hi, :])
-                norm_bc = jnp.ones((bc_size,), dtype=jnp.float64)
-                norm_bc = norm_bc.at[dest_lo:dest_hi].set(
-                    norms_r[centroid_lo:centroid_hi])
-                psi_R_bc = psi_bc_Y / norm_bc[None, :, None, None]
-                P_r = accumulate_pair_density_spin_traced(
-                    P_r, psi_L_bc, psi_R_bc, mesh_xy)
+            P_l = _accumulate(P_l, l_cls, psi_l_rmuT_X_fit,
+                              norms_l, psi_bc_Y, bc_size)
+            P_r = _accumulate(P_r, r_cls, psi_r_rmuT_X_fit,
+                              norms_r, psi_bc_Y, bc_size)
 
         # 3. ZCT + reshard + solve
         Z_q = compute_ZCT_from_left_right_zchunk(P_l, P_r, kgrid, mesh_xy)
@@ -871,7 +822,6 @@ def fit_one_rchunk(
             tuple(band_range_full),
             actual_n_rchunk,
             q_chunk_size,
-            hash(kvecs_frac.tobytes()),
             kvecs_frac,
         )
         _fit_one_rchunk_cache[cache_key] = fn
@@ -884,6 +834,73 @@ def fit_one_rchunk(
         norms_r,
         r_start_dyn,
     )
+
+
+def _band_norms_slice(
+    band_norms: np.ndarray | None, band_range: tuple[int, int], nb: int,
+) -> jax.Array:
+    """Slice + clamp the pseudobands weights to a ``(nb,)`` jax array.
+
+    Divisor is ``max(1, w_n)``: low-weight pseudobands keep their
+    sub-unit norm (DOS-preserving), high-weight ones are pulled back
+    to unit (no dominance), zero-weight windows stay at 1.0 since the
+    ``max(1, 0)=1`` floor avoids a divide-by-zero.  When
+    ``band_norms`` is ``None`` (no pseudobands), returns ``jnp.ones``.
+    """
+    if band_norms is None:
+        return jnp.ones((nb,), dtype=jnp.float64)
+    lo, hi = band_range
+    return jnp.maximum(jnp.asarray(band_norms[lo:hi], dtype=jnp.float64), 1.0)
+
+
+def _setup_gspace_source(
+    *,
+    wfn, sym, meta: Meta, mesh_xy: Mesh,
+    band_range_full: tuple[int, int],
+    bispinor: bool,
+    band_chunk_ranges: list[tuple[int, int]],
+    use_phdf5_gspace: bool,
+):
+    """Return a zero-arg callable that produces ``psi_bc_G_tuple`` for
+    one r-chunk iteration.
+
+    Encapsulates the two gspace strategies so the r-chunk loop doesn't
+    branch per-iter:
+      * phdf5 on-demand — calls ``PhdfWfnReader.coeffs_gspace`` fresh
+        per band-chunk every call.  Zero persistent GPU residency
+        between r-chunks.
+      * device cache — pre-loads ``(psi_G, bc)`` tuples onto GPU once
+        and returns them via a name-keyed lookup.
+    """
+    if use_phdf5_gspace:
+        from common.load_wfns import _get_phdf5_reader
+        wfn_path = getattr(wfn, "_filename", None)
+        if wfn_path is None:
+            raise ValueError(
+                "use_phdf5_gspace=True but wfn._filename is unset")
+        reader = _get_phdf5_reader(wfn_path, mesh_xy)
+        bc_tuples = tuple(tuple(bc) for bc in band_chunk_ranges)
+        print(f"  G-space: phdf5 on-demand (no device cache)")
+        def _phdf5_factory():
+            return tuple(reader.coeffs_gspace(bc) for bc in bc_tuples)
+        return _phdf5_factory
+
+    with timing.section("zeta_fit.cache_gspace"):
+        print(f"  Caching G-space wavefunctions for r-chunk loop")
+        cached = load_gspace_for_bands(
+            wfn, sym, meta, mesh_xy, band_range_full, bispinor,
+            band_chunk_ranges=band_chunk_ranges,
+        )
+    _bfs, _bfe = band_range_full
+    bc_size = band_chunk_ranges[0][1] - band_chunk_ranges[0][0]
+    print(f"  G-space cache: {len(cached)} band chunks "
+          f"(chunk_size={bc_size}, remainder="
+          f"{(_bfe - _bfs) % bc_size or bc_size})")
+    by_range = {tuple(bc): g for (g, bc) in cached}
+    bc_tuples = tuple(tuple(bc) for bc in band_chunk_ranges)
+    def _cache_factory():
+        return tuple(by_range[bc] for bc in bc_tuples)
+    return _cache_factory
 
 
 def fit_zeta_chunked_to_h5(
@@ -1002,31 +1019,22 @@ def fit_zeta_chunked_to_h5(
         print(f"  Left wfns:  {psi_l_rmu_Y.shape}")
         print(f"  Right wfns: {psi_r_rmu_Y.shape}")
 
-        # For pseudobands: normalize wavefunctions for ISDF fitting.
-        # Divisor is max(1, w_n) — we never amplify a stored state (so
-        # low-weight pseudobands retain their sub-unit norm in the fit,
-        # preserving DOS weighting), and high-weight pseudobands are
-        # brought back down to unit so they don't dominate.  Zero-norm
-        # pseudobands (empty/dropped windows) stay zero via the floor.
+        # Pseudobands: clamp weights to ``max(1, w_n)`` and apply them to
+        # the centroid copies used for CCT.  When band_norms is None the
+        # slices are jnp.ones → the *_fit aliases are identical to the
+        # *_rmu_Y / *_rmuT_X copies.  See _band_norms_slice for the why.
+        norms_l_jax = _band_norms_slice(band_norms, band_range_left, nb_left)
+        norms_r_jax = _band_norms_slice(band_norms, band_range_right, nb_right)
+        # psi shapes: Y=(nk, nb, ns, n_rmu), X=(nk, n_rmu, nb, ns)
+        psi_l_rmu_Y_fit = psi_l_rmu_Y / norms_l_jax[None, :, None, None]
+        psi_l_rmuT_X_fit = psi_l_rmuT_X / norms_l_jax[None, None, :, None]
+        psi_r_rmu_Y_fit = psi_r_rmu_Y / norms_r_jax[None, :, None, None]
+        psi_r_rmuT_X_fit = psi_r_rmuT_X / norms_r_jax[None, None, :, None]
         if band_norms is not None:
-            norms_l = jnp.asarray(band_norms[band_range_left[0]:band_range_left[1]])
-            norms_r = jnp.asarray(band_norms[band_range_right[0]:band_range_right[1]])
-            norms_l = jnp.maximum(norms_l, 1.0)
-            norms_r = jnp.maximum(norms_r, 1.0)
-            # psi shapes: Y=(nk, nb, ns, n_rmu), X=(nk, n_rmu, nb, ns)
-            psi_l_rmu_Y_fit = psi_l_rmu_Y / norms_l[None, :, None, None]
-            psi_l_rmuT_X_fit = psi_l_rmuT_X / norms_l[None, None, :, None]
-            psi_r_rmu_Y_fit = psi_r_rmu_Y / norms_r[None, :, None, None]
-            psi_r_rmuT_X_fit = psi_r_rmuT_X / norms_r[None, None, :, None]
             n_weighted = int(np.sum(band_norms > 1.01))
             n_zero = int(np.sum(band_norms < 1e-10))
             print(f"  Pseudobands normalization: {n_weighted} weighted, "
                   f"{n_zero} zero-weight (skipped)")
-        else:
-            psi_l_rmu_Y_fit = psi_l_rmu_Y
-            psi_l_rmuT_X_fit = psi_l_rmuT_X
-            psi_r_rmu_Y_fit = psi_r_rmu_Y
-            psi_r_rmuT_X_fit = psi_r_rmuT_X
 
     # ========== STEP 2: Compute CCT (C_q) from left/right pair densities ==========
     # Uses normalized copies for fitting (equal-weight pair densities)
@@ -1076,7 +1084,6 @@ def fit_zeta_chunked_to_h5(
     # from a Python worker using plain h5py) so we keep the old
     # create-then-reopen pattern for that path.
     from file_io.slab_io import SlabIO
-    nq = nqx * nqy * nqz
     # Dataset layout ``(nq, n_rtot, n_rmu)`` — NOT ``(nq, n_rmu, n_rtot)``.
     # Rationale: per-r-chunk writes span the full innermost axis (n_rmu)
     # under this layout, so each ``(q, r)`` row is contiguous on disk.
@@ -1136,47 +1143,33 @@ def fit_zeta_chunked_to_h5(
         for i in range((_bfe - _bfs + band_chunk_size - 1) // band_chunk_size)
     ]
 
-    # G-space source selection:
-    #   ``use_phdf5_gspace`` → no persistent cache; read one band chunk
-    #     per r-chunk via PhdfWfnReader.coeffs_gspace() and free it after
-    #     the fit_one_rchunk jit returns.  Keeps GPU footprint off the
-    #     critical path (no nbc × per-chunk cache alive between r-chunks).
-    #     Cost: nbc × read_time per r-chunk; cheap under phdf5.
-    #   ``use_gspace_cache`` → device-resident nbc tuple pre-loaded once,
-    #     kept alive for the whole fit.  Preserves current behavior for
-    #     callers that don't want phdf5, at the cost of GPU residency.
-    #   else → raises at use site (legacy path through
-    #     iter_psi_rchunk_bandwise isn't wired into fit_one_rchunk).
-    phdf5_reader = None
-    if use_phdf5_gspace:
-        from common.load_wfns import _get_phdf5_reader
-        wfn_path = getattr(wfn, "_filename", None)
-        if wfn_path is None:
-            raise ValueError(
-                "use_phdf5_gspace=True but wfn._filename is unset")
-        phdf5_reader = _get_phdf5_reader(wfn_path, mesh_xy)
-        cached_gspace = None
-        print(f"  G-space: phdf5 on-demand (no device cache)")
-    elif use_gspace_cache:
-        with timing.section("zeta_fit.cache_gspace"):
-            print(f"  Caching G-space wavefunctions for r-chunk loop")
-            cached_gspace = load_gspace_for_bands(
-                wfn, sym, meta, mesh_xy, band_range_full, bispinor,
-                band_chunk_ranges=band_chunk_ranges,
-            )
-            print(f"  G-space cache: {len(cached_gspace)} band chunks "
-                  f"(chunk_size={band_chunk_size}, remainder="
-                  f"{(_bfe - _bfs) % band_chunk_size or band_chunk_size})")
-    else:
-        cached_gspace = None
-        print("  G-space cache: disabled")
+    # G-space source — pick exactly one, fail fast if neither is set.
+    # The choice drives how ``psi_bc_G_tuple`` is built per r-chunk (see
+    # the closure below).
+    #
+    #   ``use_phdf5_gspace``  → PhdfWfnReader.coeffs_gspace() per r-chunk
+    #                            per band chunk, freshly allocated and
+    #                            ``del``'d after the jit returns.  No
+    #                            between-rchunk GPU residency.
+    #   ``use_gspace_cache``  → device-resident nbc tuple pre-loaded once
+    #                            and kept alive for the whole fit.
+    if not (use_phdf5_gspace or use_gspace_cache):
+        raise ValueError(
+            "fit_zeta_chunked_to_h5 requires one of "
+            "use_phdf5_gspace / use_gspace_cache to be True.")
+    get_psi_bc_G_tuple = _setup_gspace_source(
+        wfn=wfn, sym=sym, meta=meta, mesh_xy=mesh_xy,
+        band_range_full=band_range_full, bispinor=bispinor,
+        band_chunk_ranges=band_chunk_ranges,
+        use_phdf5_gspace=use_phdf5_gspace,
+    )
 
     # ========== STEP 6: Loop over chunks ==========
-    # Track timing for summary (manual perf_counter for detailed breakdown)
-    t_load_total = 0.0
-    t_pair_total = 0.0
-    t_zct_total = 0.0
-    t_solve_total = 0.0
+    # Wall-clock totals for the end-of-fit timing line.  ``t_fit_total``
+    # covers the fused fit_one_rchunk jit (load + pair + ZCT + solve) —
+    # finer-grained breakdown now lives inside the jit and is only
+    # observable via xprof, not perf_counter.
+    t_fit_total = 0.0
     t_write_total = 0.0
     t_chunk_start = time.perf_counter()
 
@@ -1239,28 +1232,8 @@ def fit_zeta_chunked_to_h5(
         num_chunks, print, title="zeta fitting",
         item_name="r-chunk", max_updates=min(num_chunks, 20))
 
-    # P-accumulator zero-allocator.  Built inside a JIT so XLA
-    # allocates directly with the sharded layout — a plain
-    # ``jnp.zeros`` at module scope would materialise a fully
-    # replicated intermediate on every device (e.g. 19.7 GB/device
-    # at Si 10×10×10 with n_rchunk ~2500) before
-    # ``with_sharding_constraint`` got a chance to reshard it.
-    # Hoisted out of the r-chunk loop and memoised per n_rchunk so
-    # the N-1 equally sized r-chunks + the final remainder hit
-    # exactly two compile-shape entries, with no new jit-wrapper
-    # identity per r-chunk iter.
-    # Normalise band norms into jax arrays of the correct shape so the
-    # fit_one_rchunk jit always receives a (nb,) norms array.  When no
-    # pseudo-band weighting is in effect both are jnp.ones → no-op
-    # division inside the jit.
-    if band_norms is None:
-        norms_l_jax = jnp.ones((nb_left,), dtype=jnp.float64)
-        norms_r_jax = jnp.ones((nb_right,), dtype=jnp.float64)
-    else:
-        norms_l_jax = jnp.maximum(
-            jnp.asarray(band_norms[band_range_left[0]:band_range_left[1]]), 1.0)
-        norms_r_jax = jnp.maximum(
-            jnp.asarray(band_norms[band_range_right[0]:band_range_right[1]]), 1.0)
+    # norms_l_jax / norms_r_jax were built in STEP 1 above — reuse them
+    # as the uniform-shape (nb,) inputs to the fit_one_rchunk jit.
 
     with timing.section("zeta_fit.chunk_loop"):
         for chunk_idx in range(num_chunks):
@@ -1268,31 +1241,9 @@ def fit_zeta_chunked_to_h5(
             r_end = min(r_start + chunk_r, n_rtot)
             actual_n_rchunk = r_end - r_start
 
-            # Collect G-space for every band-chunk into a tuple — the
-            # fit_one_rchunk jit consumes these as positional inputs.
-            #
-            # Two sources (see use_phdf5_gspace / use_gspace_cache branch
-            # above):
-            #   - phdf5 on-demand: call PhdfWfnReader.coeffs_gspace() per
-            #     bc_range, freshly allocated this r-chunk and ``del``'d
-            #     after the jit returns.  No between-chunk GPU residency.
-            #   - device cache:    lookup in the pre-loaded
-            #     ``cached_gspace`` list of ``(psi_G, bc_range)`` tuples.
-            if phdf5_reader is not None:
-                psi_bc_G_tuple = tuple(
-                    phdf5_reader.coeffs_gspace(tuple(bc_range))
-                    for bc_range in band_chunk_ranges
-                )
-            elif cached_gspace is not None:
-                psi_bc_G_tuple = tuple(
-                    next(g for (g, bc) in cached_gspace
-                         if tuple(bc) == tuple(bc_range))
-                    for bc_range in band_chunk_ranges
-                )
-            else:
-                raise NotImplementedError(
-                    "fit_one_rchunk requires either use_gspace_cache=True "
-                    "or use_phdf5_gspace=True.")
+            # One tuple entry per band-chunk — fit_one_rchunk's jit
+            # consumes them as positional inputs.
+            psi_bc_G_tuple = get_psi_bc_G_tuple()
 
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.fit_one_rchunk"), \
@@ -1319,12 +1270,11 @@ def fit_zeta_chunked_to_h5(
                 _track_peak()
             # Under phdf5-on-demand, drop the per-r-chunk G-space tuple
             # so nothing accumulates between iterations.  Under the
-            # device-cache path this is a no-op (the tuple entries alias
-            # the persistent cache list).
-            if phdf5_reader is not None:
-                del psi_bc_G_tuple
-            # Fused wall-clock: load + pair_density + ZCT + reshard + solve.
-            t_pair_total += time.perf_counter() - t0
+            # device-cache path this is a no-op (tuple entries alias
+            # the persistent cache list) but ``del`` on the local name
+            # is still cheap and clear.
+            del psi_bc_G_tuple
+            t_fit_total += time.perf_counter() - t0
 
             # 6e. Q-chunked allgather → host copy → async HDF5 write.
             # The allgather replicates zeta slices: per-device output is
@@ -1414,15 +1364,18 @@ def fit_zeta_chunked_to_h5(
     with timing.section("zeta_fit.sync_global"):
         jax.experimental.multihost_utils.sync_global_devices("zeta_writes_complete")
 
-    # Free cached G-space now that chunk loop is done
-    if cached_gspace is not None:
-        del cached_gspace
+    # Free the G-space source now that the chunk loop is done.  For the
+    # device-cache path this drops the nbc tuple references; for phdf5
+    # on-demand this drops the factory closure (reader stays cached at
+    # module level for later calls).
+    del get_psi_bc_G_tuple
 
-    # Per-stage timing breakdown
+    # Per-stage timing breakdown.  ``fit`` is the fused fit_one_rchunk jit;
+    # ``H5`` is the allgather+write (or FFI write_slab).  Everything else
+    # lives inside the jit — see xprof for the intra-jit breakdown.
     print(f"  Zeta output: {output_file}  shape: ({nqx},{nqy},{nqz},{n_rmu},{n_rtot})")
     print(f"  Timing ({num_chunks} r-chunks, {t_chunks_total:.1f}s total):")
-    for label, t in [("load", t_load_total), ("pair", t_pair_total),
-                     ("ZCT", t_zct_total), ("solve", t_solve_total), ("H5", t_write_total)]:
+    for label, t in [("fit", t_fit_total), ("H5", t_write_total)]:
         print(f"    {label:<6} {t:6.2f}s  {100*t/t_chunks_total:4.1f}%")
 
     # Return only peak-memory high-water mark; centroid wavefunctions
