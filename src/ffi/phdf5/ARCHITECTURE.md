@@ -1,13 +1,16 @@
 # `ffi.phdf5` — architecture, pitfalls, and why things look odd
 
-**Audience**: the next engineer or agent who looks at this FFI,
-wonders why something is written a certain way, and needs a durable
-explanation *before* they "fix" something that turns out to be
-load-bearing. This is a companion to the code in `cpp/`, `write.py`,
-`read.py`, `context.py`, and the integration layer in
-`file_io/_slab_io_ffi.py`. Timings cited are MoS2 3×3, 4 × A100 on
-Perlmutter, 2026-04-19 build; they'll drift, the *shapes* of the
-problems won't.
+**Audience**: the next engineer or agent who touches this FFI and needs
+a durable explanation before "fixing" something that turns out to be
+load-bearing. Companion to `cpp/`, `write.py`, `read.py`, `context.py`,
+and `file_io/_slab_io_ffi.py`. Timings are MoS2 3×3, 4 × A100 Perlmutter,
+2026-04-19 build — absolute numbers drift, the *shapes* of the problems
+don't.
+
+**MPI stack**: unified on Cray MPICH as of 2026-04-20 (was OpenMPI
+earlier in the investigation). Section 2.6 below refers to the first
+`MPI_Init_thread` cost; the number scales similarly on both stacks.
+Stack-specific tuning is in [`PORTING.md`](../PORTING.md).
 
 ------------------------------------------------------------------------
 
@@ -192,16 +195,15 @@ long-lived collective handle.
 
 ### 2.6. Eager `MPI_Init_thread` at program startup
 
-Unrelated to the FFI itself but a direct consequence of the open
-audit: on Perlmutter's HPC-X OpenMPI, the first `MPI_Init_thread(
-THREAD_MULTIPLE)` call takes ~400 ms. Previously paid by the first
-`open_file` inside `zeta_fit_chunked` — on the critical path.
+Unrelated to the FFI itself but turned up in the open audit: the first
+`MPI_Init_thread(THREAD_MULTIPLE)` costs ~400 ms (measured on Perlmutter
+HPC-X OpenMPI; Cray MPICH is the same order). Previously paid by the
+first `open_file` inside `zeta_fit_chunked`, on the critical path.
 
-**Fix**: `lrx_phdf5_init_mpi()` extern-C entry + Python wrapper +
-eager call in `gw_jax.main()` right after mesh setup, *before* any
-jit. 400 ms moves off the critical path and overlaps with the JAX
-compile phases that follow. Same knob honourable in any other driver
-that uses the FFI.
+**Fix**: `lrx_phdf5_init_mpi()` extern-C entry + Python wrapper + eager
+call in `gw_jax.main()` right after mesh setup, before any jit. 400 ms
+moves off the critical path and overlaps with JAX compile. Same trick
+applies for SLATE (`lrx_slate_init_mpi()`).
 
 ### 2.7. File path must be identical on every rank for `H5Fcreate`
 
@@ -295,20 +297,13 @@ within ±200 ms. At larger scale these will matter more.
 | `phdf5_loop_test` | overlap / pipelining sanity | `common.phdf5_loop_test` |
 | `pytest -q` (top-level) | 14 LORRAX-wide correctness tests; passes throughout | — |
 
-Run locally with:
+Run locally with `lxalloc` + `lxrun` (module's defaults cover the
+full stack env):
 
 ```bash
 lxalloc
-# SLURM_JOBID is exported by salloc into the caller's shell
 lxrun python3 -u -m common.phdf5_multi_offset_test
 ```
-
-The module's `lxrun` defaults (`--mpi=cray_shasta`, `--module=gpu,mpich`,
-`select_gpu.sh`, `LD_PRELOAD libmpi_gtl_cuda.so.0`,
-`HDF5_USE_FILE_LOCKING=FALSE`) cover what the phdf5 tests need — no
-per-invocation env juggling required.  Override with `LORRAX_MPI_TYPE=pmix`
-only if you explicitly need the container's HPC-X OpenMPI path
-(historical; the unified stack uses Cray MPICH everywhere now).
 
 ------------------------------------------------------------------------
 
@@ -356,20 +351,22 @@ src/ffi/phdf5/
 ├── context.py             (Python-side open/close wrappers)
 ├── write.py               (ffi_write_call, write_sharded_slab)
 ├── read.py                (ffi_read_call, read_sharded_slab)
-└── cpp/
-    ├── ctx.h              (PhdfCtx: fapl/dxpl plists, pooled events, writer_thread, task_queue)
-    ├── context.cc         (open_ctx, close_ctx, ensure_dataset, ensure_mpi_initialized)
-    ├── write_ffi.cc       (WriteDispatch — runtime offset, async H5Dwrite task)
-    ├── read_ffi.cc        (ReadDispatch — runtime offset, sync H5Dread + async H2D)
-    └── phdf5_interface.h  (HDF5 dtype helpers)
+├── cpp/
+│   ├── ctx.h              (PhdfCtx: fapl/dxpl plists, pooled events, writer_thread, task_queue)
+│   ├── context.cc         (open_ctx, close_ctx, ensure_dataset, ensure_mpi_initialized)
+│   ├── write_ffi.cc       (WriteDispatch — runtime offset, async H5Dwrite task)
+│   ├── read_ffi.cc        (ReadDispatch — runtime offset, sync H5Dread + async H2D)
+│   └── phdf5_interface.h  (HDF5 dtype helpers)
+└── scripts/
+    ├── stage_cray.sh      (copy cray-hdf5-parallel + MPICH-ABI shim to $SCRATCH)
+    └── stage_openmpi.sh   (copy conda-forge HDF5+OpenMPI to $SCRATCH)
 
-src/file_io/_slab_io_ffi.py    (_FfiBackend: Python worker thread, _sm_cache, wraps shard_map+jit)
-src/file_io/slab_io.py          (unified SlabIO front-end that dispatches to FFI or allgather)
-
-src/common/jax_compile_cache.py (shared JAX persistent compile-cache activator)
+src/file_io/_slab_io_ffi.py         (_FfiBackend: Python worker thread, _sm_cache, wraps shard_map+jit)
+src/file_io/slab_io.py              (unified SlabIO front-end: dispatches to FFI or rank-0-allgather)
+src/common/jax_compile_cache.py     (shared JAX persistent compile-cache activator)
 
 src/common/phdf5_write_test.py          (single-offset smoke)
-src/common/phdf5_multi_offset_test.py   (multi-offset smoke)
+src/common/phdf5_multi_offset_test.py   (multi-offset smoke — guards §2.3 regression)
 src/common/phdf5_read_bench.py          (read bandwidth bench)
 src/common/phdf5_loop_test.py           (pipelining/overlap bench)
 ```
