@@ -8,3 +8,4 @@ from . import vq_mu_chunk      # noqa: F401
 from . import sigma_kij        # noqa: F401
 from . import load_psi_rchunk  # noqa: F401  -- two kernels registered inside
 from . import slab_write       # noqa: F401
+from . import fit_one_rchunk   # noqa: F401  -- driver-level composite

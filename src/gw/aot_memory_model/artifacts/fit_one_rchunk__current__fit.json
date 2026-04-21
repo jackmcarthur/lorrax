@@ -1,0 +1,26 @@
+{
+  "kernel": "fit_one_rchunk",
+  "feature_names": [
+    "Pacc",
+    "PrBc",
+    "psiBc",
+    "psiBcY",
+    "psi_cent",
+    "L_q",
+    "psiG_total"
+  ],
+  "coefs": [
+    0.0,
+    1.0339249949802596,
+    0.0,
+    0.0,
+    0.0,
+    5.022263850154462,
+    1.6540918431044513
+  ],
+  "intercept": 0.0,
+  "gamma": 1.0,
+  "residual_rms": 233410764.40693858,
+  "n_samples": 11,
+  "notes": ""
+}

@@ -52,6 +52,11 @@ class SysDims:
     n_b_c: int = 0     # conduction bands in chi0 pair
     n_b: int = 0       # generic band count (pair-density / sigma uses)
     n_r: int = 0       # real-space FFT grid nx*ny*nz (V_q, FFT kernels)
+    fft_grid: tuple[int, int, int] | None = None
+    # Real-space FFT grid dims — distinct from kgrid when a kernel
+    # needs BOTH the k-grid (for nq = ∏k) and the FFT box (for the
+    # IFFT reshape).  Falls back to kgrid when unset (back-compat with
+    # kernels that repurpose kgrid as the FFT box).
 
     @property
     def n_k(self) -> int:
@@ -63,6 +68,11 @@ class SysDims:
              for k, v in asdict(self).items()}
         d["n_k"] = self.n_k
         return d
+
+    @property
+    def fft_shape(self) -> tuple[int, int, int]:
+        """Real-space FFT box.  Falls back to kgrid when fft_grid is None."""
+        return tuple(self.fft_grid) if self.fft_grid is not None else tuple(self.kgrid)
 
 
 @dataclass(frozen=True)
@@ -344,6 +354,8 @@ def samples_to_fit_input(
     for s in samples:
         sys_kw = dict(s["sys"])
         sys_kw["kgrid"] = tuple(sys_kw["kgrid"])
+        if sys_kw.get("fft_grid") is not None:
+            sys_kw["fft_grid"] = tuple(sys_kw["fft_grid"])
         sys_kw.pop("n_k", None)  # derived; not a constructor arg
         sys = SysDims(**sys_kw)
         knobs = Knobs.of(**s["knobs"])

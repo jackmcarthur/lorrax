@@ -275,6 +275,61 @@ def points_load_psi_rchunk_reshard(preset: str):
 
 
 # ---------------------------------------------------------------------------
+# fit_one_rchunk  — composite driver jit
+#
+# Memory features that scale independently:
+#   chunk_r     -> Pacc / PrBc / psiBcY / (all r-scale primitives)
+#   band_chunk  -> psiBc / psiBcY (per-call temps; NOT psi_cent nor psiG_total)
+#   n_b         -> psi_cent, psiG_total (centroid + cache volume)
+#   n_rmu       -> Pacc, PrBc, psi_cent, L_q
+#   kgrid       -> n_k, n_r
+#   mesh shape  -> all primitives (p_x × p_y distribution)
+# Goal: separate the above via one-at-a-time axis sweep around MoS2 3×3.
+# ---------------------------------------------------------------------------
+
+def points_fit_one_rchunk(preset: str):
+    """Driver-level r-chunk-body AOT DoE."""
+    if preset == "mos2_3x3":
+        # Realistic per-r-chunk shape at MoS2 3×3.  fft_grid=(80,72,8)
+        # → n_r=46080 matching the production smoke test.  Those axes are
+        # all divisible by 2 so the (2×2) mesh partitions cleanly.
+        baseline = SysDims(
+            kgrid=(3, 3, 1), fft_grid=(80, 72, 8),
+            n_rmu=640, n_s=2, n_b=80, n_r=80 * 72 * 8,
+        )
+        chunk_r_axes  = [5000, 20000, 46080]
+        band_chunk_axes = [8, 32]
+    elif preset == "si444_60Ry":
+        # Si 4×4×4 60 Ry — fft_grid=24³ = 13824 per production runs.
+        baseline = SysDims(
+            kgrid=(4, 4, 4), fft_grid=(24, 24, 24),
+            n_rmu=2400, n_s=2, n_b=296, n_r=24 ** 3,
+        )
+        chunk_r_axes  = [1728, 3456, 6912]
+        band_chunk_axes = [16, 32]
+    else:
+        raise ValueError(f"Unknown preset {preset!r} for fit_one_rchunk")
+
+    base_knobs = Knobs.of(chunk_r=chunk_r_axes[1], band_chunk=band_chunk_axes[0])
+    mesh = MeshSpec(2, 2)
+
+    sys_axes = {
+        "n_rmu":  [baseline.n_rmu // 2, baseline.n_rmu * 2],
+        "n_b":    [max(8, baseline.n_b // 2), baseline.n_b * 2],
+        "n_s":    [1 if baseline.n_s == 2 else 2],
+    }
+    knob_axes = {
+        "chunk_r":    chunk_r_axes,
+        "band_chunk": band_chunk_axes,
+    }
+    mesh_axes = [MeshSpec(1, 4), MeshSpec(4, 1)]
+
+    return build_doe_axes(baseline, base_knobs, mesh,
+                          sys_axes=sys_axes, knob_axes=knob_axes,
+                          mesh_axes=mesh_axes)
+
+
+# ---------------------------------------------------------------------------
 # slab_write  (knob: chunk_r)
 # ---------------------------------------------------------------------------
 
