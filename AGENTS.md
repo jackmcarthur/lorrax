@@ -12,15 +12,38 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 | Path | What | When to read |
 |------|------|-------------|
 | `src/gw/gw_jax.py` | Main GW driver | Any GW debugging |
+| `src/gw/gw_init.py` | Input parsing, chunking strategy, pipeline orchestration | Input file questions, chunk sizing |
+| `src/gw/gw_config.py` | `LorraxConfig` runtime options dataclass | Flag plumbing, memory budget |
+| `src/gw/gw_driver_helpers.py` | Screening/PPM setup helpers | Driver wiring |
+| `src/gw/w_isdf.py` | χ₀ → W screening pipeline (CTSP, Dyson solve) | Screening / epsilon issues |
 | `src/gw/ppm_sigma.py` | GN-PPM dynamic self-energy Σ^c(ω) | Frequency-dependent sigma issues |
-| `src/gw/w_isdf.py` | χ₀ → W screening pipeline | Screening / epsilon issues |
 | `src/gw/minimax_screening.py` | PPM extraction, minimax window helpers | PPM parameter issues |
-| `src/gw/gw_init.py` | Input parsing, ISDF fitting, memory model | Input file questions, chunk sizing |
-| `src/gw/vcoul.py` | Coulomb potential (2D slab, 0D box) | Head corrections, truncation |
+| `src/gw/minimax_config.py` | Shared minimax / sigma quadrature config | Quadrature setup |
+| `src/gw/head_correction.py` | q=0 head / wing correction | Head corrections |
+| `src/gw/vcoul.py`, `compute_vcoul.py`, `compute_vcoul_0d.py` | Coulomb potential (3D / 2D slab / 0D box) | Truncation, V_q build |
+| `src/gw/greens_function_kernel.py` | `build_G` occupied/all Green's function | G-matrix construction |
+| `src/gw/projection_kernel.py` | Σ_μν → Σ_ij band projection | Band-basis projection |
+| `src/gw/qsgw_utils.py` | QSGW fixed-point solver, Σ^xc I/O | Self-consistent GW |
+| `src/gw/kin_ion_io.py`, `kin_ion_io_chunked.py` | Kinetic + ionic Hamiltonian I/O | `kin_ion.h5` issues |
+| `src/common/isdf_fitting.py` | CCT/ZCT, pair-density kernels, zeta solve | Zeta fitting, pair density |
+| `src/common/load_wfns.py` | Wavefunction loading + band-chunked FFT | WFN load path |
+| `src/common/cholesky_2d.py` | 2D-blocked Cholesky for sharded CCT | Cholesky issues |
+| `src/common/fft_helpers.py` | Flat-k FFT helpers | FFT plumbing |
+| `src/common/gvec_fft_box.py` | Sphere ↔ FFT-box gather | V_q G-space build |
+| `src/common/symmetry_maps.py` | `SymMaps`: IBZ→full BZ unfolding, spinor rotations | Symmetry / k-point unfolding |
 | `src/common/minimax.py` | Minimax quadrature solvers | Quadrature node/weight issues |
-| `src/common/wfnreader.py` | WFN.h5 reader | Wavefunction loading |
-| `src/psp/` | Pseudopotentials, dipole matrix elements | `dipole.h5` or `kin_ion.h5` issues |
-| `src/isdf_init/kmeans_isdf.py` | ISDF centroid generation | Centroid count / quality |
+| `src/common/meta.py` | `Meta` system-parameters dataclass | k/q-grid, band ranges |
+| `src/common/phdf5_wfn_reader.py` | phdf5 (parallel HDF5) WFN reader | Async H5 reads |
+| `src/common/gpu_utils.py` | Host-side GPU memory detection | Chunk auto-sizing |
+| `src/file_io/wfnreader.py` | Canonical WFN.h5 reader (used by `gw_jax`) | Wavefunction loading |
+| `src/file_io/slab_io.py` | `SlabIO`: phdf5 writer wrapper for zeta_q / V_qmunu | Big HDF5 writes |
+| `src/file_io/sigma_output.py` | Σ output (eqp.dat, sigma.h5) | Output formats |
+| `src/ffi/` | XLA FFI bridge: `cusolvermp`, `cusolvermg`, `phdf5`, `slate` | Native-library entry points |
+| `src/solvers/` | Davidson, Lanczos, Chebyshev, pseudobands | Iterative eigensolvers |
+| `src/centroid/kmeans_isdf.py` | ISDF centroid generation (k-means) | Centroid count / quality |
+| `src/psp/` | Pseudopotentials, dipole / kin+ion generators | `dipole.h5` or `kin_ion.h5` issues |
+| `src/bse/` | Bethe–Salpeter equation (experimental) | Optical spectra |
+| `src/bandstructure/` | H-matrix interpolation (experimental) | Band-structure plots |
 
 ## Key documentation
 
@@ -35,6 +58,8 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 
 ## How to run
 
+### Local dev (single machine, uv)
+
 ```bash
 # Preprocessing (centroids, dipole, kin+ion)
 uv run python -m centroid.kmeans_isdf -i cohsex.in 600
@@ -44,10 +69,21 @@ uv run python -m gw.kin_ion_io -i cohsex.in
 # GW calculation
 uv run python -m gw.gw_jax -i cohsex.in
 
-
 # Tests (~15s, JAX compilation overhead)
 uv run python -m pytest -q
 ```
+
+### Perlmutter (Shifter via Lmod module)
+
+```bash
+module load lorrax_X           # X = A | B | C
+lxalloc                        # 1 node / 4 GPUs / 2 h
+lxpre cohsex.in 640            # all 3 preprocessing steps (single-GPU)
+lxrun python3 -u -m gw.gw_jax -i cohsex.in        # 4-GPU GW
+LORRAX_NGPU=1 lxrun ...                           # single-GPU override
+```
+
+See [`config/README.md`](config/README.md) for the full cluster reference. Docs: [`docs/ENVIRONMENT_COMPREHENSIVE.md`](docs/ENVIRONMENT_COMPREHENSIVE.md).
 
 ## Coding standards
 

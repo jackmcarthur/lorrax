@@ -1,6 +1,6 @@
 # Environment Setup & Configuration
 
-**For AI agents**: This document covers dependencies, installation, JAX configuration, cluster usage, and troubleshooting. Read this when working on build/deployment issues. For code structure, see [`CODEBASE_COMPREHENSIVE.md`](CODEBASE_COMPREHENSIVE.md).
+**For AI agents**: Dependencies, installation, JAX configuration, cluster usage, and troubleshooting. Read this for build/deployment issues. For code structure see [`CODEBASE_COMPREHENSIVE.md`](CODEBASE_COMPREHENSIVE.md). For Perlmutter specifically, [`config/README.md`](../config/README.md) is authoritative — this file summarises and cross-references.
 
 ---
 
@@ -9,609 +9,447 @@
 1. [Dependencies](#1-dependencies)
 2. [Installation Methods](#2-installation-methods)
 3. [JAX Configuration](#3-jax-configuration)
-4. [Cluster Usage](#4-cluster-usage)
-5. [Multi-Host/Multi-GPU Setup](#5-multi-hostmulti-gpu-setup)
-6. [CUDA Compatibility](#6-cuda-compatibility)
-7. [Build from Source](#7-build-from-source)
+4. [Perlmutter via Lmod module](#4-perlmutter-via-lmod-module)
+5. [FFI stack (SLATE, cuSOLVERMp, phdf5)](#5-ffi-stack-slate-cusolvermp-phdf5)
+6. [Multi-Host / Multi-GPU Setup](#6-multi-host--multi-gpu-setup)
+7. [Generic SLURM clusters](#7-generic-slurm-clusters)
 8. [Troubleshooting](#8-troubleshooting)
 
 ---
 
 ## 1. Dependencies
 
-### 1.1 Core Dependencies
+Authoritative source: [`pyproject.toml`](../pyproject.toml). No docker images, no cupy, no jax-finufft. The Perlmutter Shifter image ships JAX + CUDA; the rest is installed via `uv sync` or bind-mounted from `LORRAX_SITE_PACKAGES`.
+
+### 1.1 Runtime dependencies
 
 | Package | Version | Purpose |
-|---------|---------|---------|
+|---|---|---|
 | **Python** | ≥3.12 | Language runtime |
-| **JAX** | ≥0.9.0 | Array operations, auto-differentiation, GPU acceleration |
-| **jaxlib** | ≥0.9.0 | JAX backend (CPU/GPU kernels) |
-| **NumPy** | ≥2.3.1 | Array operations, I/O |
-| **SciPy** | ≥1.16.0 | Linear algebra, FFTs |
-| **h5py** | ≥3.14.0 | HDF5 file I/O |
-| **cupy-cuda13x** | ≥13.6.0 | GPU arrays (phasing out for JAX) |
+| **jax[cuda13]** | ≥0.9.0 | Array ops, autodiff, GPU acceleration |
+| **jaxlib** | ≥0.9.0 | JAX backend |
+| **numpy** | ≥2.3.1 | Arrays, host-side I/O |
+| **scipy** | ≥1.16.0 | Linear algebra, FFTs (host) |
+| **h5py** | ≥3.14.0 | HDF5 I/O (host path) |
+| **matplotlib** | ≥3.10.3 | Plotting |
+| **xmlschema**, **xsdata** | ≥4.1.0, ≥25.7 | UPF pseudopotential parsing |
+| **mkdocs** / **mkdocs-material** / **mkdocstrings** | — | API docs (`tools/gen_api_docs.sh`) |
 
-### 1.2 Optional Dependencies
+### 1.2 Dependency groups
 
-| Package | Purpose | Notes |
-|---------|---------|-------|
-| **jax-finufft** | Non-uniform FFT (NUFFT) | CPU-only in uv, use conda-forge for GPU |
-| **finufft** | NUFFT backend | Dependency of jax-finufft |
-| **matplotlib** | Plotting | Development |
-| **pytest** | Unit tests | Development |
+Declared under `[dependency-groups]` in `pyproject.toml`:
 
-### 1.3 Build Dependencies
+| Group | Contents | When |
+|---|---|---|
+| `dev` | flake8, pytest, pdoc, pydoc-markdown | Everywhere |
+| `jax` | Explicit `jax[cuda13]` + jaxlib pin | If uv resolves without extras |
+| `build` | cmake, ninja, pybind11, nanobind, scikit-build-core | Building the FFI C++ shared object `liblorrax_ffi.so` (§5) |
+| `profile` | tensorboard, tensorboard-plugin-profile, xprof | JAX/XProf traces |
 
-Only needed when building `jax-finufft`/`finufft` from source:
+### 1.3 Not dependencies
 
-| Package | Version | Purpose |
-|---------|---------|---------|
-| **scikit-build-core** | ≥0.11.0 | CMake-based Python builds |
-| **cmake** | ≥3.26 | Build system |
-| **ninja** | ≥1.10 | Build backend |
-| **pybind11** | ≥3.0.0 | Python-C++ bindings |
+The following appear in older docs but are **removed or never required**:
+
+- **cupy / cufft / cupyx** — gone. All GPU arrays are JAX. `common.gpu_utils` only provides host-side memory detection helpers.
+- **jax-finufft / finufft / cufinufft** — not a dep. Any residual NUFFT code paths have been either retired or rewritten onto FFTs.
+- **Docker / docker-compose** — no Dockerfiles in-tree. Production uses the NVIDIA JAX Shifter image; local dev uses plain `uv venv`.
 
 ---
 
 ## 2. Installation Methods
 
-### 2.1 Quick Start: uv (Recommended for Development)
+### 2.1 Local dev (uv)
 
-**Install uv** (if not already installed):
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-**Create environment and install dependencies**:
-```bash
-cd /path/to/lorrax
+curl -LsSf https://astral.sh/uv/install.sh | sh    # one-time
+cd /path/to/lorrax_X
 uv venv
 uv sync --no-install-project --locked
-```
-
-**Activate environment**:
-```bash
 source .venv/bin/activate
-```
-
-**Run tools**:
-```bash
 uv run python -m gw.gw_jax -i cohsex.in
-# or use console commands directly:
-uv run gw_jax -i cohsex.in
+# or: uv run gw_jax -i cohsex.in
 ```
 
-**Note**: uv builds `jax-finufft` from source with **CPU-only** by default (see pyproject.toml lines 46-50). For GPU support, use conda-forge (§2.2).
+Console scripts (from `pyproject.toml`):
 
----
-
-### 2.2 conda-forge (GPU NUFFT Support)
-
-**When to use**: If you need GPU-accelerated NUFFT (`jax-finufft` with cufinufft)
-
-**Installation**:
-```bash
-conda create -n lorrax python=3.12
-conda activate lorrax
-conda install -c conda-forge jax-finufft cufinufft jax
-pip install h5py scipy matplotlib
-pip install -e .  # Install isdf package
+```toml
+lorrax-gw        = "gw.gw_jax:main"
+gw_jax           = "gw.gw_jax:main"          # alias
+lorrax-centroids = "centroid.kmeans_isdf:main"
+lorrax-bse       = "bse.bse_isdf:main"
 ```
 
-**Why conda-forge?**
-- Pre-built binaries for CUDA 12/13
-- Avoids C++17/thrust compatibility issues (see §6)
-- Much faster than building from source
+One `.venv/` per machine, gitignored. Let uv use its global cache.
 
----
+### 2.2 Perlmutter (Shifter via Lmod module)
 
-### 2.3 Docker/Shifter (HPC Clusters)
-
-**NERSC Perlmutter** (recommended for production):
-See [`config/README.md`](../config/README.md)
-
-**Dockerfiles** (in repo root):
-
-| File | Purpose | Notes |
-|------|---------|-------|
-| `Dockerfile.gpu` | Single-GPU dev image (NVIDIA JAX base) | Venv at `/opt/venv` to avoid bind-mount shadowing |
-| `Dockerfile.cpu` | CPU-only dev image | `jax[cpu]`, FFTW, project deps via uv |
-| `Dockerfile` | Runtime with MPI + parallel HDF5 | MPICH/HDF5 built from source; `.venv` inside repo |
-| `Dockerfile.multigpu` | Multi-GPU runs | Like `Dockerfile` but targeted at multi-GPU |
-
-All Dockerfiles use `uv sync --frozen` for reproducibility. GPU images use `nvcr.io/nvidia/jax` base.
-
-**docker-compose** (`docker-compose.gpu.yaml`):
-```bash
-docker build -t isdf-gpu -f Dockerfile.gpu .
-docker compose -f docker-compose.gpu.yaml up -d
-docker compose -f docker-compose.gpu.yaml exec isdf bash
-# inside container:
-python -c 'import jax; print(jax.devices())'
-```
-
-The compose service bind-mounts `.:/workspace/ISDF`, mounts CUDA toolkit read-only,
-requests all GPUs, and runs `sleep infinity` for `exec` access.
-
-**Bind-mount model**: The container provides the toolchain (CUDA, NCCL, MPI, HDF5,
-Python deps). Code is bind-mounted to `/workspace/ISDF` — edits are immediate;
-rebuild only when dependencies or system libs change.
+See §4. The module bind-mounts `LORRAX_SITE_PACKAGES` into the container so the JAX image gets h5py / scipy / matplotlib without an in-container pip install. No uv invocation needed inside the container — the python interpreter inside Shifter is the one that runs LORRAX.
 
 ---
 
 ## 3. JAX Configuration
 
-### 3.1 Environment Variables
+### 3.1 Environment variables
 
-JAX behavior is controlled by environment variables set **before importing JAX**.
+Set **before `import jax`**. `gw_jax.py` hard-defaults the two X64 / platform vars; everything else is set by `module load lorrax_X` (see `config/README.md`):
 
-**Key variables** (set in `gw_jax.py` lines 9-13):
+| Variable | Value | Purpose |
+|---|---|---|
+| `JAX_ENABLE_X64` | `1` | 64-bit precision (required for GW) |
+| `JAX_PLATFORMS` | `cuda,cpu` | Prefer CUDA, fall back to CPU |
+| `XLA_PYTHON_CLIENT_PREALLOCATE` | `false` | Don't pre-grab a fixed XLA pool |
+| `XLA_PYTHON_CLIENT_ALLOCATOR` | `platform` | Use CUDA async mempool (shared with NCCL / cuSOLVERMp / SLATE) |
+| `TF_GPU_ALLOCATOR` | `cuda_malloc_async` | CUDA 12 async allocator (no pipeline stalls) |
+| `JAX_COMPILATION_CACHE_DIR` | `$SCRATCH/.jax_cache` | Persistent XLA PTX cache across processes |
+| `HDF5_USE_FILE_LOCKING` | `FALSE` | Lustre HDF5 compatibility |
 
-```bash
-# Enable 64-bit precision (required for GW accuracy)
-export JAX_ENABLE_X64=1
+### 3.2 Why the platform allocator, not `MEM_FRACTION=0.95`
 
-# Device priority: try CUDA first, fallback to CPU
-export JAX_PLATFORMS="cuda,cpu"
+Pre-allocating 95 % of A100 VRAM into XLA's BFC pool leaves NCCL only ~2 GB for staging, and cuSOLVERMp's `syevd` surfaces this as `NCCL error 1 unhandled cuda error` → `cusolverMpSyevd: status=7`. Using `XLA_PYTHON_CLIENT_ALLOCATOR=platform` (cudaMallocAsync) lets XLA and NCCL (and CAL / SLATE) share one pool. If you need a hard cap, use `MEM_FRACTION` only with `XLA_PYTHON_CLIENT_ALLOCATOR=default` (BFC) — the platform allocator ignores it.
 
-# Disable memory pre-allocation (allows multiple processes per GPU)
-export XLA_PYTHON_CLIENT_PREALLOCATE=false
+### 3.3 Device selection
 
-# Use platform allocator (more efficient than BFC)
-export XLA_PYTHON_CLIENT_ALLOCATOR=platform
-
-# CUDA async allocator (reduces fragmentation)
-export TF_GPU_ALLOCATOR=cuda_malloc_async
+```python
+import jax
+devices = jax.devices()              # all available GPUs or CPUs
+jax.config.update("jax_platform_name", "cpu")    # force CPU
 ```
 
-**For multi-host CPU testing** (no GPUs):
 ```bash
-# Create 4 fake CPU "devices" for sharding tests
+CUDA_VISIBLE_DEVICES=2,3 python -m gw.gw_jax -i cohsex.in   # restrict GPUs
+```
+
+### 3.4 Multi-host CPU mock (for sharding tests)
+
+```bash
 export XLA_FLAGS="--xla_force_host_platform_device_count=4"
 ```
 
----
+### 3.5 Memory inspection
 
-### 3.2 Device Selection
-
-**Auto-detect** (default):
-```python
-import jax
-devices = jax.devices()  # Returns all available GPUs or CPUs
-```
-
-**Force CPU**:
-```python
-import jax
-jax.config.update("jax_platform_name", "cpu")
-devices = jax.devices("cpu")
-```
-
-**Select specific GPUs**:
-```bash
-# Use only GPU 2 and 3
-export CUDA_VISIBLE_DEVICES=2,3
-python -m gw.gw_jax -i cohsex.in
-```
-
----
-
-### 3.3 Memory Management
-
-**LORRAX default** (set by `module load lorrax`):
-```bash
-export XLA_PYTHON_CLIENT_PREALLOCATE=false
-export XLA_PYTHON_CLIENT_ALLOCATOR=platform
-export TF_GPU_ALLOCATOR=cuda_malloc_async
-```
-
-This makes XLA pull from the CUDA asynchronous mempool on demand
-(`cudaMallocAsync`) rather than pre-allocating a fixed BFC pool. The
-important consequence: **NCCL, cuSOLVERMp, and SLATE share one pool
-with XLA**, so none of them can starve. An older default of
-`XLA_PYTHON_CLIENT_MEM_FRACTION=0.95` with BFC was observed to surface
-as `NCCL error 1 unhandled cuda error` → `cusolverMpSyevd status=7`
-on the Cray MPICH stack; `platform` + `PREALLOCATE=false` fixes it.
-
-**If you need a hard cap** (e.g. to leave room for another process on
-the same GPU), you can still use `XLA_PYTHON_CLIENT_MEM_FRACTION`, but
-only with `XLA_PYTHON_CLIENT_ALLOCATOR=default` (BFC) — the platform
-allocator ignores it.
-
-**Monitor memory usage**:
 ```python
 import jax
 print(jax.local_devices()[0].memory_stats())
 ```
 
+Also useful: `common.gpu_utils.get_device_memory_info()` returns a dict with `backend / total_gb / available_gb / budget_gb / source`, which `gw_init` uses to size chunking parameters.
+
 ---
 
-## 4. Cluster Usage
+## 4. Perlmutter via Lmod module
 
-### 4.1 NERSC Perlmutter
-
-LORRAX ships an Lmod module that wires up the Shifter container, Cray
-MPICH, GPU affinity, and FFI bind-mounts so you never hand-write
-`shifter --image=...` / `srun --mpi=...` flags. The full reference is
-[`config/README.md`](../config/README.md); minimal flow:
+### 4.1 One-time install
 
 ```bash
-# One-time: install the module (patches site-specific values via
-# config/perlmutter/site_config.sh)
+vi config/perlmutter/site_config.sh          # edit account, QoS, paths
 bash config/perlmutter/install.sh
-
-# Every session: allocate + load + run
-module load lorrax
-lxalloc                                      # 1 node / 4 GPUs / 2 hours
-lxrun python3 -u -m gw.gw_jax -i cohsex.in   # 4 GPUs, Cray MPICH stack
-lxshell                                      # interactive container shell
-
-# Single-GPU override:
-LORRAX_NGPU=1 lxrun python3 -u -m gw.gw_jax -i cohsex.in
 ```
 
-**Stack**: `--mpi=cray_shasta`, `--module=gpu,mpich`, one GPU per rank
-via `select_gpu.sh` (`CUDA_VISIBLE_DEVICES=$SLURM_LOCALID`),
-`LD_PRELOAD=libmpi_gtl_cuda.so.0` (CUDA-12 copy). SLATE FFI, cuSOLVERMp
-FFI, and phdf5 (Cray HDF5) all share this single stack.
+Three parallel checkouts (A/B/C) with their own module names:
 
-**Batch job** — the module's shell functions work inside `#SBATCH`
-scripts; just `module load lorrax` at the top and use `lxrun`:
+```bash
+LORRAX_MODULE_NAME=lorrax_A bash /path/to/lorrax_A/config/perlmutter/install.sh
+LORRAX_MODULE_NAME=lorrax_B bash /path/to/lorrax_B/config/perlmutter/install.sh
+LORRAX_MODULE_NAME=lorrax_C bash /path/to/lorrax_C/config/perlmutter/install.sh
+```
+
+`family("lorrax")` in the modulefile makes variants mutually exclusive within a shell; `module load lorrax_B` auto-swaps `lorrax_A` out. Separate shells are fully independent (own `LORRAX_ROOT`, own `lxalloc` allocation).
+
+### 4.2 Every session
+
+```bash
+module load lorrax_X                    # X = A | B | C
+lxalloc                                 # 1 node / 4 GPUs / 2 h, exports SLURM_JOBID
+lxalloc 4                               # 4 nodes / 16 GPUs / 2 h
+lxalloc 1 4:00:00                       # custom time
+
+lxpre cohsex.in 640                     # all 3 preprocessing steps (single-GPU)
+lxrun python3 -u -m gw.gw_jax -i cohsex.in           # 4-GPU GW
+LORRAX_NGPU=1 lxrun python3 -u -m gw.gw_jax -i cohsex.in    # single-GPU override
+lxshell                                 # interactive single-rank shell in container
+
+lxkill                                  # cancel allocation, unset SLURM_JOBID
+```
+
+Every `lxrun` invocation expands to:
+
+```bash
+srun --mpi=cray_shasta --gres=gpu:$NGPU -N $NNODES -n $NGPU \
+     select_gpu.sh   \                          # CUDA_VISIBLE_DEVICES=$SLURM_LOCALID
+     shifter --module=gpu,mpich --image=... --volume=... --env=... \
+     in_container.sh \                          # re-asserts MPICH_GPU_SUPPORT_ENABLED=1
+     "$@"
+```
+
+Each rank sees exactly one GPU as device 0 — callers that need `jax.distributed.initialize` pass `local_device_ids=[0]` (§6).
+
+### 4.3 Batch submission
+
+Template at [`config/perlmutter/run_gw.slurm`](../config/perlmutter/run_gw.slurm):
 
 ```bash
 #!/bin/bash -l
-#SBATCH -N 2 -C gpu -q regular -t 04:00:00 -A <account>
+#SBATCH -N 1 -C gpu -q regular -t 01:00:00 -A m2651
 #SBATCH --ntasks-per-node=4 --gpus-per-node=4
 
-module load lorrax
-lxrun python3 -u -m gw.gw_jax -i cohsex.in
+module load lorrax_X
+lxrun python3 -u -m gw.gw_jax -i cohsex.in 2>&1 | tee gw.out
 ```
 
-A template lives at [`config/perlmutter/run_gw.slurm`](../config/perlmutter/run_gw.slurm).
+`SLURM_JOBID` is not required inside `sbatch` — the allocation is the job itself.
 
-**Container**: `nvcr.io/nvidia/jax:25.04-py3`. Includes JAX + CUDA 12,
-NumPy. Additional deps (h5py, scipy, matplotlib) are bind-mounted from
-the per-user `LORRAX_SITE_PACKAGES` directory (see `config/README.md`).
+### 4.4 Per-invocation cost
+
+| Phase | Time |
+|---|---|
+| srun step creation | 2–5 s |
+| Shifter namespace bring-up | ~5 s |
+| `import jax` + first GPU tensor | ~1.2 s |
+| `jax.distributed.initialize` handshake (multi-rank) | 3–5 s |
+
+Single-rank: ~7 s end-to-end. Multi-rank: ~10–15 s. Fast-iteration knobs:
+
+- `lxshell` keeps the container alive across calls (saves ~5 s bring-up per invocation). Still pays Python cold-start; for real back-to-back work keep one REPL alive.
+- `JAX_COMPILATION_CACHE_DIR=$SCRATCH/.jax_cache` amortises XLA PTX compile across processes.
 
 ---
 
-### 4.2 Generic SLURM Cluster
+## 5. FFI stack (SLATE, cuSOLVERMp, phdf5)
 
-**Single-node, 4 GPUs**:
+LORRAX ships an XLA FFI bridge (`src/ffi/`) that calls into three native libraries not present in the JAX container. A single `liblorrax_ffi.so` exposes all of them; the LORRAX module bind-mounts pre-staged copies of the supporting shared libraries into the container at fixed paths.
+
+### 5.1 Targets
+
+| Subpackage | Library | Process model | Use |
+|---|---|---|---|
+| `cusolvermp` | cuSOLVERMp + CAL/NCCL | 1 proc per GPU | Distributed `eigh` (syevd) |
+| `cusolvermg` | cuSOLVERMg | 1 proc × N GPUs | Single-proc multi-GPU `eigh` |
+| `phdf5` | parallel HDF5 via MPI-IO | 1 proc per GPU | Sharded slab read/write of `zeta_q.h5`, `V_qmunu.h5`, etc. |
+| `slate` | SLATE + libsci | p×q GPU grid | Distributed Cholesky, trsm, heev (evaluation) |
+
+Details: [`src/ffi/AGENTS.md`](../src/ffi/AGENTS.md), [`src/ffi/PORTING.md`](../src/ffi/PORTING.md), [`src/ffi/phdf5/ARCHITECTURE.md`](../src/ffi/phdf5/ARCHITECTURE.md).
+
+### 5.2 Bind-mounts
+
+Pre-staged host-side directories bind-mount to fixed container paths:
+
+| Host path (override var) | Container mount | Contents |
+|---|---|---|
+| `$LORRAX_FFI_NVHPC_DIR` (default `$SCRATCH/lorrax_nvhpc`) | `/lorrax_nvhpc` | NVHPC 25.5 subset: `libcusolverMp.so.0`, `libcal` |
+| `$LORRAX_FFI_PHDF5_DIR` (default `$SCRATCH/lorrax_phdf5_cray/stage`) | `/lorrax_phdf5` | Cray HDF5 1.12 (libmpi_gnu_*.so.12) |
+| `$LORRAX_FFI_SLATE_DIR` (default `$SCRATCH/lorrax_slate_cray/stage`) | `/lorrax_slate` | Cray libsci + `libmpi_gtl_cuda.so.0` + xpmem + lustreapi |
+
+Container-side `LD_LIBRARY_PATH` (order matters):
+
+```
+$LORRAX_SLATE_INSTALL_DIR/lib64 : /lorrax_slate/lib : /lorrax_phdf5/lib :
+/lorrax_nvhpc/<nvhpc-subpath>/lib64 : /opt/udiImage/modules/mpich :
+/opt/udiImage/modules/mpich/dep [: darshan]
+```
+
+`LORRAX_NVHPC_SUBPATH`, `LORRAX_MPICH_CONTAINER_DIR`, and `LORRAX_DARSHAN_LIB_DIR` are cluster-specific and patched from `site_config.sh`.
+
+### 5.3 Staging (one-time per cluster)
+
+```bash
+src/ffi/cusolvermp/scripts/stage_nvhpc.sh   # ~100 MB → /pscratch
+src/ffi/phdf5/scripts/stage_cray.sh         # Cray HDF5 1.12 (default stack)
+src/ffi/phdf5/scripts/stage_openmpi.sh      # legacy OpenMPI stack (not unified)
+src/ffi/slate/scripts/stage_cray.sh         # libsci + GTL + xpmem
+```
+
+Staging copies are mandatory because Shifter's `udiRoot.conf` on Perlmutter forbids `--volume` sources under `/opt/*` or `$HOME` — only `/pscratch` is bind-mountable. All scripts are idempotent and end with a `readelf -d` sanity check.
+
+### 5.4 Building `liblorrax_ffi.so`
+
+```bash
+src/ffi/common/cpp/run_shifter.sh bash src/ffi/common/cpp/build.sh
+```
+
+Output: `src/ffi/common/cpp/build/liblorrax_ffi.so`. CMake logs the resolved HDF5 / MPI paths — eyeball them to confirm the right stack.
+
+### 5.5 MPI stack override
+
+```bash
+LORRAX_MPI_TYPE=cray_shasta   # default — Cray MPICH PMI
+LORRAX_MPI_TYPE=none          # disable --mpi flag (single-rank code)
+LORRAX_MPI_TYPE=pmix          # legacy OpenMPI path, not unified; has hung non-FFI workloads
+```
+
+`pmix` is opt-in and known to hang some non-FFI workloads — don't set it unconditionally.
+
+### 5.6 GPU-aware MPICH
+
+`module load lorrax_X` sets:
+
+```
+MPICH_GPU_SUPPORT_ENABLED=1
+LD_PRELOAD=libmpi_gtl_cuda.so.0      # CUDA-12 copy for the container's MPICH
+```
+
+This activates GPU-Direct RDMA for `MPI_*` collectives used by SLATE / CAL. `in_container.sh` re-asserts the env var inside Shifter after the image switch.
+
+---
+
+## 6. Multi-Host / Multi-GPU Setup
+
+### 6.1 Distributed init
+
+`gw_jax.py:21` calls `_maybe_init_jax_distributed()` which auto-detects SLURM:
+
+```python
+proc_count = int(os.environ.get("SLURM_NTASKS", "1"))
+if proc_count > 1:
+    jax.distributed.initialize()      # reads SLURM_PROCID, SLURM_NTASKS via Cray PMI
+```
+
+A sentinel env var (`_LORRAX_JAX_DISTRIBUTED_DONE`) guards re-entry when `python -m gw.gw_jax` executes as `__main__` and then gets re-imported as `gw.gw_jax`.
+
+### 6.2 One-GPU-per-rank via `select_gpu.sh`
+
+LORRAX deliberately avoids `--gpus-per-task=1` and instead pins GPUs via `select_gpu.sh` (`CUDA_VISIBLE_DEVICES=$SLURM_LOCALID`).
+
+Rationale: `--gpus-per-task=1` breaks JAX's distributed topology sync. Each rank's `local_devices` call returns narrow-view device ordinals, but JAX's coordinator expects all ranks to report from the same global ordinal space. With `select_gpu.sh` each rank sees exactly one GPU as device 0, and the sandbox tests that call `jax.distributed.initialize()` pass `local_device_ids=[0]` (auto-detected via `len(CUDA_VISIBLE_DEVICES.split(",")) == 1`).
+
+### 6.3 Multi-node via the module
+
+```bash
+#!/bin/bash -l
+#SBATCH -N 2 -C gpu -q regular -t 04:00:00 -A m2651
+#SBATCH --ntasks-per-node=4 --gpus-per-node=4
+
+module load lorrax_X
+LORRAX_NNODES=2 LORRAX_NGPU=8 lxrun python3 -u -m gw.gw_jax -i cohsex.in
+```
+
+Expected topology inside the job:
+
+```python
+import jax
+jax.process_index(), jax.process_count()  # e.g. (0, 8)
+jax.local_devices()                       # [cuda:0]  — one per rank
+len(jax.devices())                        # 8 — global across both nodes
+```
+
+### 6.4 Non-SLURM clusters
+
+```python
+jax.distributed.initialize(
+    coordinator_address="node001:12355",
+    num_processes=4,
+    process_id=0,
+)
+```
+
+Or via env vars `JAX_COORDINATOR_ADDRESS`, `JAX_NUM_PROCESSES`, `JAX_PROCESS_INDEX`.
+
+---
+
+## 7. Generic SLURM clusters
+
+Port via `config/<cluster>/` (see [`config/README.md`](../config/README.md) §Porting for the full knob list). Headline edits live in `site_config.sh`:
+
+| Knob | Perlmutter value |
+|---|---|
+| `LORRAX_SLURM_{ACCOUNT,QOS,CONSTRAINT}` | `m2651` / `interactive` / `gpu` |
+| `LORRAX_GPUS_PER_NODE` | 4 |
+| `LORRAX_SHIFTER_MODULES` | `gpu,mpich` |
+| `LORRAX_MPI_TYPE_DEFAULT` | `cray_shasta` |
+| `LORRAX_NVHPC_SUBPATH` | `25.5_cuda12.9/math_libs/12.9/lib64` |
+| `LORRAX_MPICH_CONTAINER_DIR` | `/opt/udiImage/modules/mpich` |
+| `LORRAX_DARSHAN_LIB_DIR` | (optional; empty to skip) |
+| `LORRAX_FFI_{NVHPC,PHDF5,SLATE}_DIR_DEFAULT` | under `$SCRATCH` |
+| `LORRAX_SLATE_INSTALL_DIR_DEFAULT` | `$HOME/software/slate/install` |
+
+For non-Shifter runtimes (Apptainer, Singularity, bare venv) you need to swap the `shifter` invocation in `lxrun`/`lxshell`/`lxpre`. `select_gpu.sh`, `in_container.sh`, `LD_LIBRARY_PATH` composition, and SLURM defaults are portable.
+
+Bare-venv fallback (no container):
+
 ```bash
 #!/bin/bash
-#SBATCH -N 1
-#SBATCH --gres=gpu:4
-#SBATCH -t 02:00:00
-
+#SBATCH -N 1 --gres=gpu:4 -t 02:00:00
 module load cuda/12.3 python/3.12
 source /path/to/venv/bin/activate
-
-export JAX_ENABLE_X64=1
-export JAX_PLATFORMS="cuda,cpu"
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-
+export JAX_ENABLE_X64=1 JAX_PLATFORMS=cuda,cpu
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export XLA_PYTHON_CLIENT_ALLOCATOR=platform
+export TF_GPU_ALLOCATOR=cuda_malloc_async
 python -m gw.gw_jax -i cohsex.in
 ```
 
 ---
 
-## 5. Multi-Host/Multi-GPU Setup
-
-### 5.1 JAX Distributed Initialization
-
-**Automatic** (SLURM environment variables):
-```python
-import jax
-jax.distributed.initialize()  # Auto-detects SLURM_PROCID, SLURM_NTASKS, etc.
-```
-
-**Manual** (non-SLURM):
-```python
-import jax
-jax.distributed.initialize(
-    coordinator_address="node001:12355",  # First node, arbitrary port
-    num_processes=4,                      # Total MPI ranks
-    process_id=0                          # This rank (0, 1, 2, 3)
-)
-```
-
-**Environment variables** (if auto-detect fails):
-```bash
-export JAX_COORDINATOR_ADDRESS="node001:12355"
-export JAX_NUM_PROCESSES=4
-export JAX_PROCESS_INDEX=0  # Different for each rank
-```
-
----
-
-### 5.2 Multi-Node Execution
-
-**2 nodes × 4 GPUs = 8 processes** via the LORRAX module:
-
-```bash
-#!/bin/bash -l
-#SBATCH -N 2 -C gpu -q regular -t 04:00:00 -A <account>
-#SBATCH --ntasks-per-node=4 --gpus-per-node=4
-
-module load lorrax
-LORRAX_NNODES=2 LORRAX_NGPU=8 lxrun python3 -u -m gw.gw_jax -i cohsex.in
-```
-
-**GPU affinity caveat.** LORRAX deliberately avoids `--gpus-per-task=1`
-and instead pins GPUs via `select_gpu.sh`
-(`CUDA_VISIBLE_DEVICES=$SLURM_LOCALID`). `--gpus-per-task=1` breaks
-JAX's distributed topology sync: each rank's `local_devices` call uses
-narrow-view device ordinals but JAX's coordinator expects all ranks to
-report from the same global ordinal space. With `select_gpu.sh` each
-rank sees exactly one GPU as device 0, and callers pass
-`local_device_ids=[0]` to `jax.distributed.initialize()` (auto-detected
-via `len(CUDA_VISIBLE_DEVICES.split(","))==1` in the sandbox tests).
-
-**JAX will**:
-1. Auto-detect `SLURM_NTASKS=8`, `SLURM_PROCID=0..7` via Cray PMI.
-2. Initialize the distributed backend (each rank contributes its
-   one `local_device_ids=[0]`).
-3. Shard arrays across all 8 GPUs.
-
----
-
-### 5.3 Debugging Multi-Host
-
-**Check JAX sees all devices**:
-```python
-import jax
-print(f"Process {jax.process_index()}/{jax.process_count()}")
-print(f"Devices: {jax.local_devices()}")
-print(f"Global devices: {jax.devices()}")
-```
-
-**Expected output** (node 0, 4 GPUs):
-```
-Process 0/8
-Devices: [cuda:0, cuda:1, cuda:2, cuda:3]
-Global devices: [cuda:0, cuda:1, ..., cuda:7]  # All 8 GPUs across 2 nodes
-```
-
-**See also**: [`docs/advanced/jax_multihost.md`](advanced/jax_multihost.md) for deep dive
-
----
-
-## 6. CUDA Compatibility
-
-### 6.1 CUDA Version Requirements
-
-| Component | CUDA 12.x | CUDA 13.x | Notes |
-|-----------|-----------|-----------|-------|
-| **JAX/jaxlib** | ✅ Supported | ✅ Supported | Use `jax[cuda12]` or `jax[cuda13]` |
-| **cupy** | ✅ | ✅ | Use `cupy-cuda12x` or `cupy-cuda13x` |
-| **jax-finufft (pip)** | ⚠️ CPU-only | ⚠️ CPU-only | GPU build fails (see §6.2) |
-| **jax-finufft (conda)** | ✅ GPU | ✅ GPU | Pre-built binaries available |
-
----
-
-### 6.2 jax-finufft GPU Build Issues (CUDA 13.0)
-
-**Problem**: Building `jax-finufft` with GPU support fails on CUDA 13.0 due to:
-
-1. **Missing CUFFT error codes** (`helper_cuda.h`):
-   ```c
-   case CUFFT_INCOMPLETE_PARAMETER_LIST:  // Doesn't exist in CUDA 13
-   case CUFFT_PARSE_ERROR:                // Doesn't exist in CUDA 13
-   case CUFFT_LICENSE_ERROR:              // Doesn't exist in CUDA 13
-   ```
-
-2. **thrust::binary_function removed**:
-   ```cpp
-   struct cmp : public thrust::binary_function<int, int, bool>  // Removed in C++17
-   ```
-   CUDA 13.0 defaults to C++17, but thrust removed deprecated templates.
-
-**Workarounds**:
-- **Option A**: Use conda-forge pre-built binaries (recommended)
-- **Option B**: Use CPU-only NUFFT (default in pyproject.toml)
-- **Option C**: Standard FFT (omit `q_grid` parameter)
-
-**See**: [`JAX_FINUFFT_USAGE.md`](../JAX_FINUFFT_USAGE.md) for detailed build notes
-
----
-
-### 6.3 Current pyproject.toml Configuration
-
-**Lines 46-50** (CPU-only NUFFT):
-```toml
-[tool.uv.extra-build-variables.jax-finufft]
-CMAKE_CUDA_COMPILER = "/usr/local/cuda/bin/nvcc"
-CUDACXX             = "/usr/local/cuda/bin/nvcc"
-CUDAHOME            = "/usr/local/cuda"
-CMAKE_ARGS          = "-DJAX_FINUFFT_USE_CUDA=OFF -DCMAKE_CUDA_ARCHITECTURES=native"
-```
-
-**To enable GPU** (if you patch finufft):
-```toml
-CMAKE_ARGS = "-DJAX_FINUFFT_USE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native"
-```
-
----
-
-## 7. Build from Source
-
-### 7.1 Build jax-finufft (CPU-only)
-
-**Already configured** in `pyproject.toml`. Build happens automatically:
-```bash
-uv sync
-```
-
-**Manual build** (if needed):
-```bash
-git clone https://github.com/flatironinstitute/jax-finufft
-cd jax-finufft
-git submodule update --init --recursive
-pip install scikit-build-core cmake ninja
-CMAKE_ARGS="-DJAX_FINUFFT_USE_CUDA=OFF" pip install -e .
-```
-
----
-
-### 7.2 Build finufft (GPU)
-
-**Prerequisites**:
-- CUDA Toolkit 12.x (13.x has compatibility issues)
-- CMake ≥3.26
-- ninja
-
-**Steps**:
-```bash
-git clone https://github.com/flatironinstitute/finufft
-cd finufft
-git checkout v2.2.0  # Latest stable
-
-mkdir build && cd build
-cmake .. \
-  -DFINUFFT_USE_CUDA=ON \
-  -DCMAKE_CUDA_ARCHITECTURES=70  # V100=70, A100=80, H100=90 \
-  -GNinja
-
-ninja
-ninja install  # Installs to /usr/local by default
-```
-
-**Then install jax-finufft**:
-```bash
-CMAKE_ARGS="-DJAX_FINUFFT_USE_CUDA=ON" pip install jax-finufft
-```
-
-**Note**: This likely fails on CUDA 13.0. Use conda-forge instead.
-
----
-
 ## 8. Troubleshooting
 
-### 8.1 Common Errors
+### 8.1 "No GPU/TPU found"
 
-#### "No GPU/TPU found"
-```python
+```
 RuntimeError: No GPU/TPU found, falling back to CPU.
 ```
 
-**Solutions**:
-1. Check CUDA installation: `nvidia-smi`
-2. Install `jax[cuda12]` or `jax[cuda13]`: `pip install 'jax[cuda13]'`
-3. Check `CUDA_VISIBLE_DEVICES`: `echo $CUDA_VISIBLE_DEVICES`
-4. Verify jaxlib has CUDA support: `python -c "import jax; print(jax.default_backend())"`
+1. `nvidia-smi` — are GPUs visible at all?
+2. `python -c "import jax; print(jax.default_backend())"` — should print `gpu`
+3. `echo $CUDA_VISIBLE_DEVICES` — inside Shifter this is set by `select_gpu.sh` to `$SLURM_LOCALID`
+4. `pip list | grep jax` — jaxlib must be the CUDA build (`jax[cuda13]`)
 
----
+### 8.2 Out-of-memory
 
-#### "jaxlib version mismatch"
-```
-RuntimeError: jaxlib version 0.4.20 is newer than supported jax version 0.4.19
-```
-
-**Solution**: Update both to matching versions
-```bash
-pip install --upgrade "jax[cuda13]" jaxlib
-```
-
----
-
-#### "Out of memory" (GPU)
 ```
 XlaRuntimeError: RESOURCE_EXHAUSTED: Out of memory
 ```
 
-**Solutions**:
-1. Reduce chunk sizes in `cohsex.in`:
-   ```
-   chunk_bands = 4   # Reduce from 6
-   chunk_q = 2       # Reduce from 3
-   ```
-2. Disable pre-allocation: `export XLA_PYTHON_CLIENT_PREALLOCATE=false`
-3. Use memory profiler: See [`MEMORY_MODEL.md`](MEMORY_MODEL.md)
+1. Confirm `memory_per_device_gb` in `cohsex.in` matches GPU (28 on A100, 6 on RTX 5070).
+2. Reduce `chunk_bands` / `chunk_q` (or unset and let `gw_init.compute_optimal_chunks` auto-size).
+3. Inspect bottleneck: `common.gpu_utils.get_device_memory_info()` at a checkpoint, or `jax.local_devices()[0].memory_stats()`.
+4. Check `MEMORY_MODEL.md` for per-stage formulas.
 
----
+### 8.3 cuSOLVERMp `status=7` or NCCL "unhandled cuda error"
 
-#### "Import error: libcufft.so.11"
-```
-ImportError: libcufft.so.11: cannot open shared object file
-```
+Symptom: eigh FFI fails with `cusolverMpSyevd: status=7` and an NCCL error 1.
 
-**Solution**: CUDA libraries not in `LD_LIBRARY_PATH`
+Cause: XLA BFC preallocated the GPU pool, leaving NCCL no staging memory.
+
+Fix: confirm `XLA_PYTHON_CLIENT_PREALLOCATE=false` and `XLA_PYTHON_CLIENT_ALLOCATOR=platform` are set (the module sets them; a user-level `XLA_PYTHON_CLIENT_MEM_FRACTION` export can override and break things).
+
+### 8.4 `LORRAX_MPI_TYPE=pmix` hangs
+
+Don't set `pmix` unconditionally — it hangs some non-FFI workloads. The unified default (`cray_shasta`) covers SLATE, cuSOLVERMp, and phdf5.
+
+### 8.5 HDF5 "file is already open" on Lustre
+
+Set (or confirm) `HDF5_USE_FILE_LOCKING=FALSE`. The module sets this.
+
+### 8.6 JIT cache misses after module updates
+
+Stale cache entries can produce `KeyError` warnings. Easiest: `rm -rf $JAX_COMPILATION_CACHE_DIR`, or use a per-checkout subdir (the module does this via `common.jax_compile_cache`).
+
+### 8.7 Debug flags
+
 ```bash
-export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+export JAX_DEBUG_NANS=1              # crash on NaN
+export JAX_DISABLE_JIT=1              # disable JIT
+export JAX_LOG_COMPILES=1             # log compilations
+export TF_CPP_MIN_LOG_LEVEL=0         # verbose XLA logs
 ```
 
-Or install matching CUDA toolkit:
-```bash
-# For CUDA 12
-pip install --upgrade "jax[cuda12_local]"
-```
+Profiling:
 
----
-
-#### "finufft not found" (import error)
-```
-ModuleNotFoundError: No module named 'finufft'
-```
-
-**Solution**: Install finufft
-```bash
-# Option A: conda-forge
-conda install -c conda-forge finufft
-
-# Option B: pip (CPU-only)
-pip install finufft
-
-# Option C: Build from source (see §7.2)
-```
-
----
-
-### 8.2 Performance Debugging
-
-#### Slow NUFFT performance
-- **Expected**: CPU NUFFT is ~100× slower than GPU FFT
-- **Solution**: Use conda-forge GPU build or standard FFT
-
-#### Slow zeta fitting
-- **Check**: `zeta_q.h5` size (10-100 GB causes disk I/O bottleneck)
-- **Solution**: Use faster filesystem (NVMe, not NFS) or reduce `n_centroids`
-
-#### GPU underutilization
-- **Check**: `nvidia-smi dmon` during run
-- **Common cause**: Small system size, GPU overhead dominates
-- **Solution**: Use CPU for small systems (<50 bands, <10×10×1 k-grid)
-
----
-
-### 8.3 Debugging Tools
-
-**JAX debugging flags**:
-```bash
-export JAX_DEBUG_NANS=1         # Crash on NaN
-export JAX_DISABLE_JIT=1        # Disable JIT for debugging
-export JAX_LOG_COMPILES=1       # Log all compilations
-export TF_CPP_MIN_LOG_LEVEL=0   # Verbose XLA logs
-```
-
-**Profile memory**:
 ```python
 import jax
 jax.profiler.start_trace("/tmp/jax_trace")
 # ... run code ...
 jax.profiler.stop_trace()
-# View in chrome://tracing or TensorBoard
 ```
 
-**See also**:
-- [`docs/MEMORY_MODEL.md`](MEMORY_MODEL.md) — Memory budgets
-- [`docs/MEMORY_MODEL.md`](MEMORY_MODEL.md) — Chunking constraints and bottleneck arrays
-- [`docs/advanced/jax_multihost.md`](advanced/jax_multihost.md) — Multi-GPU debugging
+Canonical xprof triage: [`reports/ppm_sigma_profiling_2026-04-05/XPROF_TRACE_GUIDE.md`](../../reports/ppm_sigma_profiling_2026-04-05/XPROF_TRACE_GUIDE.md) in the sandbox repo (not in LORRAX src).
 
 ---
 
 ## Next Steps
 
-**For code structure**: See [`CODEBASE_COMPREHENSIVE.md`](CODEBASE_COMPREHENSIVE.md)
-**For physics/theory**: See [`PHYSICS_COMPREHENSIVE.md`](PHYSICS_COMPREHENSIVE.md)
-**For improvement suggestions**: See [`AGENT_TODO.md`](AGENT_TODO.md)
+- Code structure: [`CODEBASE_COMPREHENSIVE.md`](CODEBASE_COMPREHENSIVE.md)
+- Physics / theory: [`PHYSICS_COMPREHENSIVE.md`](PHYSICS_COMPREHENSIVE.md)
+- Memory model: [`MEMORY_MODEL.md`](MEMORY_MODEL.md)
+- Perlmutter cluster detail: [`../config/README.md`](../config/README.md)
+- FFI internals: [`../src/ffi/AGENTS.md`](../src/ffi/AGENTS.md)
+- Agent TODOs: [`AGENT_TODO.md`](AGENT_TODO.md)
