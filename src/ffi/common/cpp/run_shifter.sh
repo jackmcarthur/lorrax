@@ -141,6 +141,12 @@ SHIFTER_ARGS=(
     --env=TF_GPU_ALLOCATOR=cuda_malloc_async
     --env=LD_LIBRARY_PATH="${LDLIB}"
     --env=LD_PRELOAD="${SLATE_PRELOAD}"
+    # Activate Cray MPICH's GPU-Direct RDMA path so MPI_Send with a
+    # device pointer goes GPU->GPU over Slingshot, not staged through
+    # host RAM.  Required for any decent perf in SLATE (and other
+    # MPI-based GPU libs); pairs with the libmpi_gtl_cuda LD_PRELOAD
+    # above.  Shifter strips the host-set env, so we re-set it here.
+    --env=MPICH_GPU_SUPPORT_ENABLED=1
     # Expose the chosen stack's MPI include + lib paths to CMake so the
     # FFI build picks the right headers / library without guessing.
     --env=LORRAX_MPI_INCLUDE_DIR="${MPI_INCLUDE_DIR_CT}"
@@ -166,9 +172,16 @@ if [[ -n "${SLURM_JOBID:-}" && -z "${SLURM_STEP_ID:-}" ]]; then
     if [[ "${LORRAX_SELECT_GPU:-0}" == "1" ]]; then
         SRUN_WRAPPER=("$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/select_gpu.sh")
     fi
+    # in_container.sh runs inside shifter and re-exports
+    # MPICH_GPU_SUPPORT_ENABLED=1 (which shifter's --module=mpich
+    # explicitly unsets per /etc/shifter/udiRoot.conf).  Required so
+    # MPI calls with device pointers go GPU->GPU via Slingshot
+    # GPU-Direct RDMA.  Path is the host path; resolves the same
+    # inside the container via /global/u2 siteFs.
+    IN_CONTAINER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/in_container.sh"
     exec srun "${jobflag}" --mpi="${LORRAX_MPI_TYPE}" \
         --gres=gpu:"${NGPU}" -N "${NNODES}" -n "${NTASKS}" \
-        "${SRUN_WRAPPER[@]}" "${SHIFTER_ARGS[@]}" "$@"
+        "${SRUN_WRAPPER[@]}" "${SHIFTER_ARGS[@]}" "${IN_CONTAINER}" "$@"
 else
     exec "${SHIFTER_ARGS[@]}" "$@"
 fi
