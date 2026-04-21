@@ -1,4 +1,4 @@
-// ctx.h — shared SlateCtx used by context.cc and eigh_ffi.cc.
+// ctx.h — shared SlateCtx used by context.cc and the per-op handlers.
 #pragma once
 
 #include <cstdint>
@@ -6,36 +6,28 @@
 
 namespace lorrax_ffi::slate {
 
+// One SlateCtx per (p, q) mesh shape.  Built by lrx_slate_context_create
+// in context.cc, lifetime-managed by the Python wrapper's atexit.
+//
+// MPI: SLATE needs MPI_THREAD_MULTIPLE plus an MPI_Comm.  We dup
+// MPI_COMM_WORLD with a rank reorder so SLATE's hardcoded
+// GridOrder::Col in fromDevices matches JAX's P('x','y') shard layout
+// (paired with the per-rank local-transpose on the Python side; see
+// src/ffi/slate/README.md for the full layout rationale).
+//
+// Mapping (any p × q):
+//   JAX shard (x, y)            -> JAX rank (x*q + y)
+//   SLATE Col tile (ti, tj)     -> SLATE rank (ti + tj*p)
+// Want JAX rank holding shard (mx, my) to be SLATE rank for tile
+// (mx, my), so SLATE rank = mx + my*p.  MPI_Comm_split with
+//   key = (jax_rank / q) + (jax_rank % q) * p.
+// Identity for p==1 or q==1; nontrivial pairwise swaps for p, q > 1.
 struct SlateCtx {
-    // identity
-    int rank = -1;
-    int world_size = 0;
-    int p = 0, q = 0;
-
-    // MPI: SLATE needs MPI_THREAD_MULTIPLE.  We build a dup'd
-    // MPI_COMM_WORLD with ranks REORDERED so SLATE's hardcoded
-    // GridOrder::Col in fromDevices matches JAX's P('x','y') shard layout.
-    //
-    // JAX mesh layout (Mesh(reshape(p, q), ('x','y'))) puts shard (x, y)
-    // on process x*q + y.
-    //
-    // SLATE GridOrder::Col (fromDevices default) puts tile (ti, tj) on
-    // rank ti + tj*p.
-    //
-    // For JAX shard (x, y) to land on SLATE tile (x, y), we need:
-    //   SLATE_rank(tile (x, y)) == JAX_proc(shard (x, y))
-    //   x + y*p              == x*q + y
-    // Only true when p == q == 1.  Otherwise remap: make the FFI comm
-    // assign new rank = x + y*p to process (x*q + y), i.e. to JAX rank
-    // (jax_rank / q) + (jax_rank % q) * p.
-    MPI_Comm comm = MPI_COMM_NULL;
+    int      rank = -1;            // JAX-side rank
+    int      world_size = 0;
+    int      p = 0, q = 0;
+    MPI_Comm comm = MPI_COMM_NULL; // remapped comm passed to SLATE
     bool     owns_comm = false;
-
-    // Default 2-D block-cyclic tile size (nb).  n/p is the simplest choice
-    // (one SLATE tile per rank = matches JAX's block sharding, no
-    // reshuffling).  Smaller nb = more parallelism in the panel factor but
-    // more communication.  256 is a reasonable middle ground for A100.
-    int64_t default_nb = 256;
 };
 
 }  // namespace lorrax_ffi::slate

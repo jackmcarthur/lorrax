@@ -1,25 +1,22 @@
 """``distributed_cholesky`` — JAX FFI wrapper around ``slate::potrf``.
 
-Layout convention
------------------
-JAX stores arrays row-major; SLATE tiles are column-major with
-``lda = nb``.  We materialise the transpose (``jnp.transpose(A, (1,0))``
-+ ``with_sharding_constraint``) before handing the buffer to SLATE:
-the bytes of that transposed array are the original ``A`` in
-column-major layout, and SLATE reads them directly.  This works for
-**any p×q mesh** — including rectangular ones — because the transpose
-is a local (per-rank) operation, no inter-rank communication.
+Layout
+------
+JAX is row-major; SLATE tiles are column-major.  Each rank locally
+transposes its own shard via ``shard_map`` + ``jnp.transpose`` (no
+inter-rank comm) so the bytes SLATE reads are correctly col-major.
+Combined with the C++-side MPI rank remap (``cpp/context.cc``), SLATE
+sees the user's matrix correctly assembled on **any p × q mesh**.
 
-Returns a :class:`SlateLowerL` opaque handle.  The underlying buffer
-is in SLATE's col-major-in-row-major layout (i.e. the transpose of the
-row-major L).  Two ways to consume it:
+Returns a :class:`SlateLowerL` opaque handle.  Two ways to consume it:
 
   * Pass the handle to :func:`ffi.slate.distributed_trsm` — trsm knows
     the handle's layout and feeds it straight back to SLATE.
   * Call :meth:`SlateLowerL.to_jax_lower` for a conventional
     row-major lower-triangular L.
 
-Only ``Uplo::Lower`` (SLATE's potrf) and dtypes F64 / C128.
+Only ``Uplo::Lower`` (SLATE's potrf), dtypes F64 / C128.  See
+``src/ffi/slate/README.md`` for the wider design notes.
 """
 from __future__ import annotations
 
@@ -30,10 +27,10 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 from jax.experimental.shard_map import shard_map
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh, PartitionSpec as P
 
 from ..common.ffi_loader import get_lib
-from .context import get_or_init_context
+from .context import get_or_init_context, validate_mesh
 
 __all__ = ["SlateLowerL", "distributed_cholesky"]
 
@@ -84,18 +81,12 @@ def distributed_cholesky(
 ) -> SlateLowerL:
     if A.ndim != 2 or A.shape[0] != A.shape[1]:
         raise ValueError(f"distributed_cholesky: expected square A; got {A.shape}")
-    if "x" not in mesh.axis_names or "y" not in mesh.axis_names:
-        raise ValueError(
-            f"mesh must have axes ('x','y'); got {mesh.axis_names}")
-    p = int(mesh.shape["x"])
-    q = int(mesh.shape["y"])
-    if p * q != jax.process_count():
-        raise ValueError(
-            f"mesh {p}x{q} != jax.process_count()={jax.process_count()}")
+    p, q = validate_mesh(mesh)
     n = int(A.shape[0])
     if n % p != 0 or n % q != 0:
         raise ValueError(
-            f"n={n} must be divisible by both mesh axes ({p},{q}).")
+            f"distributed_cholesky: n={n} must be divisible by both mesh "
+            f"axes ({p},{q}).")
 
     get_lib()
     ctx_handle = get_or_init_context(mesh)

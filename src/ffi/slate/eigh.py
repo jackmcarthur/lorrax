@@ -14,7 +14,7 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
 
 from ..common.ffi_loader import get_lib
-from .context import get_or_init_context
+from .context import get_or_init_context, validate_mesh
 
 __all__ = ["distributed_eigh"]
 
@@ -60,23 +60,11 @@ def distributed_eigh(
     if A.ndim != 2 or A.shape[0] != A.shape[1]:
         raise ValueError(f"distributed_eigh: expected a square matrix, "
                          f"got {A.shape}")
-    if "x" not in mesh.axis_names or "y" not in mesh.axis_names:
-        raise ValueError(
-            f"mesh must have axes ('x','y'); got {mesh.axis_names}")
-    p = int(mesh.shape["x"])
-    q = int(mesh.shape["y"])
-    if p != q:
-        raise ValueError(
-            f"slate.distributed_eigh requires a square mesh (p==q); "
-            f"got p={p}, q={q}.")
-    if p * q != jax.process_count():
-        raise ValueError(
-            f"mesh {p}x{q} does not cover all "
-            f"{jax.process_count()} JAX processes")
+    p, q = validate_mesh(mesh, require_square=True)
     n = int(A.shape[0])
-    if n % p != 0 or n % q != 0:
+    if n % p != 0:
         raise ValueError(
-            f"n={n} must be divisible by mesh shape ({p},{q}).")
+            f"distributed_eigh: n={n} must be divisible by mesh axis size {p}.")
 
     get_lib()
     ctx_handle = get_or_init_context(mesh)

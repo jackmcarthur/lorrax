@@ -1,13 +1,21 @@
-"""SLATE FFI — distributed Hermitian eigendecomposition via ``slate::heev``.
+"""SLATE FFI — distributed dense linear algebra on GPUs from JAX.
 
-Usage::
+SLATE is a tile-based, MPI + GPU library from ICL.  This package calls
+SLATE from inside JAX FFI handlers, one process per GPU on a 2-D
+``('x', 'y')`` mesh.  See ``src/ffi/slate/README.md`` for the design
+notes (layout, MPI, GPU-aware comms) and ``src/ffi/slate/{cholesky,
+trsm, eigh}.py`` for per-op shape contracts.
+
+Public API::
+
+    from ffi.slate import distributed_cholesky, distributed_trsm
+    L = distributed_cholesky(A, mesh=mesh)        # SlateLowerL handle
+    X = distributed_trsm(L, B, mesh=mesh, op='N') # forward solve
 
     from ffi.slate import distributed_eigh
-    W, Q = distributed_eigh(A, mesh=mesh)
+    W, Q = distributed_eigh(A, mesh=mesh)         # eigenvectors buggy; W ok
 
-SLATE is a tile-based, MPI + GPU linear algebra library from ICL.  This
-wrapper calls ``slate::heev`` from inside a JAX FFI, one process per GPU
-on a square ``('x','y')`` mesh.  See ``eigh.py`` for the shape contract.
+cholesky + trsm work on any p×q mesh (p == q for eigh).
 """
 from __future__ import annotations
 
