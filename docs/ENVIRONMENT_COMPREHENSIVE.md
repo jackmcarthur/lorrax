@@ -198,18 +198,25 @@ python -m gw.gw_jax -i cohsex.in
 
 ### 3.3 Memory Management
 
-**Issue**: JAX pre-allocates 90% of GPU memory by default
-
-**Solution**: Disable pre-allocation
+**LORRAX default** (set by `module load lorrax`):
 ```bash
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export XLA_PYTHON_CLIENT_ALLOCATOR=platform
+export TF_GPU_ALLOCATOR=cuda_malloc_async
 ```
 
-**Per-process memory limit**:
-```bash
-# Limit each JAX process to 16 GB
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.5  # 50% of GPU memory
-```
+This makes XLA pull from the CUDA asynchronous mempool on demand
+(`cudaMallocAsync`) rather than pre-allocating a fixed BFC pool. The
+important consequence: **NCCL, cuSOLVERMp, and SLATE share one pool
+with XLA**, so none of them can starve. An older default of
+`XLA_PYTHON_CLIENT_MEM_FRACTION=0.95` with BFC was observed to surface
+as `NCCL error 1 unhandled cuda error` → `cusolverMpSyevd status=7`
+on the Cray MPICH stack; `platform` + `PREALLOCATE=false` fixes it.
+
+**If you need a hard cap** (e.g. to leave room for another process on
+the same GPU), you can still use `XLA_PYTHON_CLIENT_MEM_FRACTION`, but
+only with `XLA_PYTHON_CLIENT_ALLOCATOR=default` (BFC) — the platform
+allocator ignores it.
 
 **Monitor memory usage**:
 ```python
@@ -223,38 +230,48 @@ print(jax.local_devices()[0].memory_stats())
 
 ### 4.1 NERSC Perlmutter
 
-**Interactive job** (4 GPUs, 1 node):
+LORRAX ships an Lmod module that wires up the Shifter container, Cray
+MPICH, GPU affinity, and FFI bind-mounts so you never hand-write
+`shifter --image=...` / `srun --mpi=...` flags. The full reference is
+[`config/README.md`](../config/README.md); minimal flow:
+
 ```bash
-salloc -N 1 -C gpu -q interactive -t 01:00:00 -A <account>
-shifter --image=nvcr.io/nvidia/jax:24.04-py3 --module=gpu,nccl bash
-cd /global/cfs/cdirs/<project>/lorrax
-python -m gw.gw_jax -i cohsex.in
+# One-time: install the module (patches site-specific values via
+# config/perlmutter/site_config.sh)
+bash config/perlmutter/install.sh
+
+# Every session: allocate + load + run
+module load lorrax
+lxalloc                                      # 1 node / 4 GPUs / 2 hours
+lxrun python3 -u -m gw.gw_jax -i cohsex.in   # 4 GPUs, Cray MPICH stack
+lxshell                                      # interactive container shell
+
+# Single-GPU override:
+LORRAX_NGPU=1 lxrun python3 -u -m gw.gw_jax -i cohsex.in
 ```
 
-**Batch job** (`submit.sh`):
-```bash
-#!/bin/bash
-#SBATCH -N 2                    # 2 nodes
-#SBATCH -C gpu                  # GPU constraint
-#SBATCH -q regular              # Queue
-#SBATCH -t 04:00:00             # 4 hours
-#SBATCH -A <account>
-#SBATCH --image=nvcr.io/nvidia/jax:24.04-py3
-#SBATCH --module=gpu,nccl
+**Stack**: `--mpi=cray_shasta`, `--module=gpu,mpich`, one GPU per rank
+via `select_gpu.sh` (`CUDA_VISIBLE_DEVICES=$SLURM_LOCALID`),
+`LD_PRELOAD=libmpi_gtl_cuda.so.0` (CUDA-12 copy). SLATE FFI, cuSOLVERMp
+FFI, and phdf5 (Cray HDF5) all share this single stack.
 
-export SLURM_CPU_BIND="cores"
-srun shifter python -m gw.gw_jax -i cohsex.in
+**Batch job** — the module's shell functions work inside `#SBATCH`
+scripts; just `module load lorrax` at the top and use `lxrun`:
+
+```bash
+#!/bin/bash -l
+#SBATCH -N 2 -C gpu -q regular -t 04:00:00 -A <account>
+#SBATCH --ntasks-per-node=4 --gpus-per-node=4
+
+module load lorrax
+lxrun python3 -u -m gw.gw_jax -i cohsex.in
 ```
 
-Submit:
-```bash
-sbatch submit.sh
-```
+A template lives at [`config/perlmutter/run_gw.slurm`](../config/perlmutter/run_gw.slurm).
 
-**Environment**: NVIDIA JAX container includes:
-- JAX 0.4.26+ with CUDA 12.3
-- cuDNN, NCCL for multi-GPU
-- Pre-installed NumPy, SciPy, h5py
+**Container**: `nvcr.io/nvidia/jax:25.04-py3`. Includes JAX + CUDA 12,
+NumPy. Additional deps (h5py, scipy, matplotlib) are bind-mounted from
+the per-user `LORRAX_SITE_PACKAGES` directory (see `config/README.md`).
 
 ---
 
@@ -310,21 +327,32 @@ export JAX_PROCESS_INDEX=0  # Different for each rank
 
 ### 5.2 Multi-Node Execution
 
-**2 nodes × 4 GPUs = 8 processes**:
+**2 nodes × 4 GPUs = 8 processes** via the LORRAX module:
 
 ```bash
-#!/bin/bash
-#SBATCH -N 2
-#SBATCH --ntasks-per-node=4
-#SBATCH --gpus-per-task=1
+#!/bin/bash -l
+#SBATCH -N 2 -C gpu -q regular -t 04:00:00 -A <account>
+#SBATCH --ntasks-per-node=4 --gpus-per-node=4
 
-srun python -m gw.gw_jax -i cohsex.in
+module load lorrax
+LORRAX_NNODES=2 LORRAX_NGPU=8 lxrun python3 -u -m gw.gw_jax -i cohsex.in
 ```
 
+**GPU affinity caveat.** LORRAX deliberately avoids `--gpus-per-task=1`
+and instead pins GPUs via `select_gpu.sh`
+(`CUDA_VISIBLE_DEVICES=$SLURM_LOCALID`). `--gpus-per-task=1` breaks
+JAX's distributed topology sync: each rank's `local_devices` call uses
+narrow-view device ordinals but JAX's coordinator expects all ranks to
+report from the same global ordinal space. With `select_gpu.sh` each
+rank sees exactly one GPU as device 0, and callers pass
+`local_device_ids=[0]` to `jax.distributed.initialize()` (auto-detected
+via `len(CUDA_VISIBLE_DEVICES.split(","))==1` in the sandbox tests).
+
 **JAX will**:
-1. Auto-detect `SLURM_NTASKS=8`, `SLURM_PROCID=0..7`
-2. Initialize distributed backend
-3. Shard arrays across all 8 GPUs
+1. Auto-detect `SLURM_NTASKS=8`, `SLURM_PROCID=0..7` via Cray PMI.
+2. Initialize the distributed backend (each rank contributes its
+   one `local_device_ids=[0]`).
+3. Shard arrays across all 8 GPUs.
 
 ---
 

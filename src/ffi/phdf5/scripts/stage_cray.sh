@@ -9,11 +9,13 @@
 # under /pscratch (and a handful of other paths).  So we copy the
 # module to /pscratch, where Shifter is willing to bind-mount it.
 #
-# WARNING: the Cray MPICH path is unstable under large collective
-# writes in our shifter+JAX-container setup (intermittent OOMs in
-# ad_cray_write_coll.c:669).  Use stage_openmpi.sh as the default.
-# This script is provided for investigation / A-B testing on Cray
-# systems and for future use once the Cray MPICH issues are resolved.
+# This is the default staged-deps target as of 2026-04-20.  Historical
+# note: we used to ship `stage_openmpi.sh` as default because Cray
+# MPICH's collective-write path (`ad_cray_write_coll.c:669`) OOMs at
+# ≥ 1 GB/rank.  That's worked around now by forcing independent writes
+# (LORRAX_PHDF5_INDEPENDENT=1 defaults) and non-collective metadata
+# (LORRAX_PHDF5_COLL_META=0 defaults) — see `src/ffi/phdf5/cpp/ctx.h`.
+# stage_openmpi.sh is kept as a fallback for non-Cray clusters.
 #
 # Run on a NERSC login node, after `module load cray-hdf5-parallel
 # cray-mpich` (so $HDF5_DIR and $MPICH_DIR are set).  No container, no GPU:
@@ -21,7 +23,8 @@
 #   module load cray-hdf5-parallel cray-mpich
 #   src/ffi/phdf5/scripts/stage_cray.sh
 #
-# Then use with `LORRAX_PHDF5_MPI_STACK=mpich` in run_shifter.sh.
+# Then use with `LORRAX_PHDF5_MPI_STACK=mpich` in run_shifter.sh
+# (the module's `lxrun` uses this stack by default).
 
 set -euo pipefail
 

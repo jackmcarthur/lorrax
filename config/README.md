@@ -59,8 +59,16 @@ sbatch $LORRAX_ROOT/config/perlmutter/run_gw.slurm
 | Variable | Value | Purpose |
 |---|---|---|
 | `HDF5_USE_FILE_LOCKING` | `FALSE` | Lustre filesystem HDF5 compatibility |
-| `XLA_PYTHON_CLIENT_MEM_FRACTION` | `0.95` | Pre-allocate 95% of GPU into XLA's memory pool |
+| `XLA_PYTHON_CLIENT_PREALLOCATE` | `false` | Don't pre-grab a fixed XLA pool; let NCCL/cuSOLVERMp share VRAM |
+| `XLA_PYTHON_CLIENT_ALLOCATOR` | `platform` | Use the CUDA async mempool (shared with NCCL) instead of XLA's BFC |
 | `TF_GPU_ALLOCATOR` | `cuda_malloc_async` | CUDA 12 async allocator (no pipeline stalls) |
+| `JAX_COMPILATION_CACHE_DIR` | `$SCRATCH/.jax_cache` | Persistent XLA PTX cache across JAX processes |
+
+> **Why not `MEM_FRACTION=0.95`?**  We tried it.  Pre-allocating 95 % of A100
+> VRAM into XLA's BFC pool leaves NCCL only ~2 GB for its staging buffers,
+> and cuSOLVERMp's `syevd` surfaces that as `NCCL error 1 unhandled cuda
+> error` → `cusolverMpSyevd: status=7`.  Switching to the platform allocator
+> (cudaMallocAsync) lets XLA and NCCL share one pool.
 
 **Shell functions:**
 
@@ -96,17 +104,22 @@ the common tests auto-detect this via `CUDA_VISIBLE_DEVICES`).
 
 **Bind-mounts** (pre-staged via `src/ffi/*/scripts/stage_*.sh`, one-time):
 
-| Host path (override) | Container mount | Contents |
-|---|---|---|
-| `$LORRAX_FFI_NVHPC_DIR` *(default `/pscratch/sd/${U:0:1}/${U}/lorrax_nvhpc`)* | `/lorrax_nvhpc` | NVHPC 25.5 subset: `libcusolverMp.so.0`, `libcal` |
-| `$LORRAX_FFI_PHDF5_DIR` *(default `/pscratch/sd/${U:0:1}/${U}/lorrax_phdf5_cray/stage`)* | `/lorrax_phdf5` | Cray HDF5 1.12 (libmpi_gnu_*.so.12) |
-| `$LORRAX_FFI_SLATE_DIR` *(default `/pscratch/sd/${U:0:1}/${U}/lorrax_slate_cray/stage`)* | `/lorrax_slate` | Cray libsci + `libmpi_gtl_cuda.so.0` + xpmem + lustreapi |
+| Host path (override)                | Container mount   | Contents |
+|-------------------------------------|-------------------|----------|
+| `$LORRAX_FFI_NVHPC_DIR` (default `$SCRATCH/lorrax_nvhpc`)              | `/lorrax_nvhpc`   | NVHPC 25.5 subset: `libcusolverMp.so.0`, `libcal` |
+| `$LORRAX_FFI_PHDF5_DIR` (default `$SCRATCH/lorrax_phdf5_cray/stage`)   | `/lorrax_phdf5`   | Cray HDF5 1.12 (libmpi_gnu_*.so.12) |
+| `$LORRAX_FFI_SLATE_DIR` (default `$SCRATCH/lorrax_slate_cray/stage`)   | `/lorrax_slate`   | Cray libsci + `libmpi_gtl_cuda.so.0` + xpmem + lustreapi |
 
 Container-side `LD_LIBRARY_PATH` (in order):
 ```
 $LORRAX_SLATE_INSTALL_DIR/lib64 : /lorrax_slate/lib : /lorrax_phdf5/lib :
-/lorrax_nvhpc/.../lib64 : /opt/udiImage/modules/mpich : /opt/udiImage/modules/mpich/dep
+/lorrax_nvhpc/<nvhpc-subpath>/lib64 : /opt/udiImage/modules/mpich :
+/opt/udiImage/modules/mpich/dep [: darshan]
 ```
+
+The `nvhpc-subpath`, mpich container dir, and optional Darshan dir are
+cluster-specific (`LORRAX_NVHPC_SUBPATH`, `LORRAX_MPICH_CONTAINER_DIR`,
+`LORRAX_DARSHAN_LIB_DIR` in `site_config.sh`).
 
 **`LORRAX_MPI_TYPE`** override:
 
@@ -116,14 +129,27 @@ LORRAX_MPI_TYPE=none          # disable --mpi flag (single-rank code)
 LORRAX_MPI_TYPE=pmix          # legacy OpenMPI path (not wired up)
 ```
 
-### Fast-iteration tips
+### Per-invocation cost & fast-iteration tips
+
+Measured breakdown of a single `lxrun python3 ...` call:
+
+| Phase | Time |
+|---|---|
+| srun step creation | 2–5 s |
+| Shifter namespace bring-up | ~5 s |
+| `import jax` + `jax.devices()` + first GPU tensor | ~1.2 s |
+| `jax.distributed.initialize` handshake (multi-rank only) | 3–5 s |
+
+Single-rank: ~7 s end-to-end. Multi-rank: ~10–15 s. The JAX cold start
+itself is *not* the bottleneck — everything above it is.
 
 - **`lxshell`**: drop into an interactive container shell, then run
   `python3 -m common.slate_batched_test`, `python3 -m common.cusolvermp_eigh_test`,
-  etc. back-to-back.  Saves the ~5 s shifter bring-up per invocation.
-- **`JAX_COMPILATION_CACHE_DIR`** is set to `$SCRATCH/.jax_cache` by
-  default.  Amortises XLA PTX compile across JAX processes
-  (doesn't cut the ~15-25 s CUDA backend init itself).
+  etc. back-to-back. Saves the ~5 s shifter bring-up per invocation.
+  (Python still cold-starts each call inside the shell — the real 100×
+  win is keeping one Python REPL alive.)
+- **`JAX_COMPILATION_CACHE_DIR`** defaults to `$SCRATCH/.jax_cache`.
+  Amortises XLA PTX compile across JAX processes.
 - For multi-rank MPI runs, `lxrun` is still required — shifter's
   MPI integration needs `srun` on the outside (per upstream Shifter
   SLURM integration docs).
@@ -188,8 +214,31 @@ config/
 
 ## Porting to other clusters
 
-1. Create `config/<cluster>/site_config.sh` with that cluster's paths
-2. Create `config/<cluster>/install.sh` (the Perlmutter one is reusable
-   for any Lmod + Shifter site)
-3. For non-Shifter clusters (Apptainer/Singularity), the modulefile's
-   `shifter_base` variable needs adaptation
+The Lua modulefile at `config/modulefiles/lorrax/0.1.0.lua` is
+cluster-agnostic: every cluster-specific value is an `@FOO@` placeholder
+patched at install time by `site_config.sh`. See that file for the full
+list; headline knobs:
+
+| `site_config.sh` var | Purpose |
+|---|---|
+| `LORRAX_SLURM_{ACCOUNT,QOS,CONSTRAINT}` | `lxalloc` SLURM defaults |
+| `LORRAX_GPUS_PER_NODE` | GPU count per node (Perlmutter: 4) |
+| `LORRAX_SHIFTER_MODULES` | Shifter `--module=` list (Perlmutter: `gpu,mpich`) |
+| `LORRAX_MPI_TYPE_DEFAULT` | `srun --mpi=` (Perlmutter: `cray_shasta`) |
+| `LORRAX_NVHPC_SUBPATH` | NVHPC lib subdir under `/lorrax_nvhpc` |
+| `LORRAX_MPICH_CONTAINER_DIR` | Where Shifter bind-mounts MPICH libs |
+| `LORRAX_DARSHAN_LIB_DIR` | Optional I/O profiler lib dir (empty to skip) |
+| `LORRAX_FFI_{NVHPC,PHDF5,SLATE}_DIR_DEFAULT` | Default host stage-dir roots |
+| `LORRAX_SLATE_INSTALL_DIR_DEFAULT` | Host SLATE install prefix |
+
+To port:
+
+1. `cp -r config/perlmutter config/<cluster>/`
+2. Edit `config/<cluster>/site_config.sh` with the new cluster's values.
+3. `bash config/<cluster>/install.sh`.
+
+For non-Shifter clusters (Apptainer, Singularity, bare venv) the Lua
+modulefile's `shifter_args` composition needs adaptation — swap the
+`shifter` invocation in the shell functions for the equivalent runtime
+wrapper. Everything else (SLURM defaults, LD_LIBRARY_PATH composition,
+`select_gpu.sh`, `in_container.sh`) is portable.

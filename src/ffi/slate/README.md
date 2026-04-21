@@ -28,11 +28,15 @@ X_adj    = distributed_trsm(L_handle, B, mesh=mesh, op='C')   # L^H X = B
 L_jax = L_handle.to_jax_lower()   # standard row-major lower-tri L
 ```
 
-Smoke tests / benches (require `LORRAX_SELECT_GPU=1`,
-`XLA_PYTHON_CLIENT_MEM_FRACTION=0.5`):
+Smoke tests / benches (via the LORRAX module — `module load lorrax`
+sets the select_gpu / Cray MPICH / LD_PRELOAD / XLA memory flags):
 
-- `python3 -m common.slate_cholesky_trsm_test -n 256 --dtype c128`
-- `python3 -m common.slate_chol_trsm_bench --mesh 2x2 -n 1024`
+```bash
+lxalloc
+lxrun python3 -u -m common.slate_cholesky_trsm_test -n 256 --dtype c128
+lxrun python3 -u -m common.slate_batched_test --nbatch 8 -n 128 --mesh 2x2 --dtype c128
+lxrun python3 -u -m common.slate_chol_trsm_bench --mesh 2x2 -n 1024
+```
 
 ## Design rationale
 
@@ -52,12 +56,17 @@ Three coordinated pieces make SLATE play nicely with JAX-sharded data:
    to rebuild the comm such that SLATE's tile-to-rank assignment matches
    JAX's shard-to-rank assignment.
 
-3. **GPU-aware MPI** (`cpp/run_shifter.sh` + `cpp/in_container.sh`).
-   Cray MPICH on Perlmutter does GPU-Direct RDMA over Slingshot
-   (the closest equivalent to NCCL for any MPI-based library)
-   only when `MPICH_GPU_SUPPORT_ENABLED=1` and `libmpi_gtl_cuda.so`
-   is loaded.  shifter's `--module=mpich` explicitly *unsets* the
-   env var, so `in_container.sh` re-asserts it after shifter starts.
+3. **GPU-aware MPI** (wired up by `config/modulefiles/lorrax/...lua`
+   → `lxrun` / `lxshell`, build-time by `cpp/run_shifter.sh`, both via
+   `cpp/in_container.sh`).  Cray MPICH on Perlmutter does GPU-Direct
+   RDMA over Slingshot (the closest equivalent to NCCL for any
+   MPI-based library) only when `MPICH_GPU_SUPPORT_ENABLED=1` and
+   `libmpi_gtl_cuda.so` is loaded.  shifter's `--module=mpich`
+   explicitly *unsets* the env var per `/etc/shifter/udiRoot.conf`,
+   so `in_container.sh` re-asserts it inside the container.  The
+   module also `LD_PRELOAD`s the CUDA-12 copy of `libmpi_gtl_cuda.so.0`
+   from the stage so the loader doesn't pick up shifter's CUDA-11-linked
+   one and look for `libcudart.so.11.0`.
 
 The combination yields the standard SLATE convention (`side='L',
 uplo='L', op='N'`) for the trsm of a Cholesky factor: no inverted
@@ -86,42 +95,37 @@ User scenario: a batch of `Nmu × Nmu` Hermitian PD matrices, depth
 be 2-D-sharded; multiple batch elements should be processed in
 parallel across the available GPUs.
 
-Recommended pattern:
+**Implemented** — see [`batched.py`](batched.py),
+[`cpp/batched_potrf_ffi.cc`](cpp/batched_potrf_ffi.cc),
+[`cpp/batched_trsm_ffi.cc`](cpp/batched_trsm_ffi.cc).  The sharding
+contract is `P('x', None, 'y')`: batch across `'x'`, inner matrix
+across `'y'`.  Each X-row of the mesh gets its own MPI sub-comm of
+size `Py` (`MPI_Comm_split` by `x_rank`, via
+`lrx_slate_subrow_context_create`), and the FFI handler loops over the
+per-rank batch on that sub-comm with SLATE grid `p=1, q=Py`.
 
-1. Build a JAX 3-D mesh `('batch', 'x', 'y')` of shape
-   `(B, Px, Py)` where `B * Px * Py == jax.process_count()`.
-   Choose `Px, Py` so a single `Nmu × Nmu` matrix tiles cleanly across
-   the `(x, y)` sub-mesh; pick `B` so `Nq / B` is a manageable per-rank
-   batch.
+SLATE has no native batched `potrf`, so the inner loop is a plain
+C++ `for` — but the sub-comm setup is shared across iterations, which
+is the only amortisable bit.  The real batched kernel lives in
+cuSOLVERMp; a parallel cuSOLVERMp implementation with a true batched
+API is planned.
 
-2. Reshard the batch from `(q, mu_X, nu_Y)` to `(q_BATCH, mu, nu_Y)`
-   (one all-to-all up front) so each `'batch'`-row of the mesh owns
-   `Nq/B` matrices and the inner `(x, y)` sub-mesh shards each matrix.
-
-3. Loop in Python over the per-rank batch, calling
-   `distributed_cholesky` / `distributed_trsm` for each matrix using a
-   2-D sub-mesh restricted to the `(x, y)` axes.  **Today this requires
-   a sub-mesh API the FFI doesn't expose** — the validator rejects
-   meshes that don't cover the full process count.  See *Future work*.
-
-4. Reshard outputs back to whatever layout the rest of GWJAX wants.
-
-For `Nq = 8000` and per-call wall ≈ 100 ms, total ≈ 800 s on one
-batch row — divide by `B` to parallelise across rows.  This dominates
-unless we add a batched FFI primitive (see Future work).
+Correctness verified on a 2×2 mesh (`nbatch=8, n=128, c128`) at
+machine precision (~2.3e-16 for cholesky+trsm).  1×4 mesh currently
+trips an internal SLATE assertion in `internal_batch.hh:290` — out
+of scope; cuSOLVERMp is the answer if you need rectangular meshes.
 
 ## Future work
 
-- **Sub-mesh / partial-world support.**  Allow
-  `distributed_cholesky(A, mesh=sub_mesh_of_('x','y'))` where
-  `sub_mesh_of_(...).size < jax.process_count()`.  Each unique sub-mesh
-  would have its own `MPI_Comm_split`'d sub-comm and its own
-  `SlateCtx`.  Required for the GWJAX batched pattern above to actually
-  parallelise across the `'batch'` mesh axis.
-- **Batched primitives.**  Single FFI call accepting a `(Nq, Nmu, Nmu)`
-  input that loops potrf internally on each batch slice.  Amortises the
-  Python ↔ XLA dispatch overhead (~50 ms per call right now); could
-  also fuse with the in-place trsm to avoid the L-handle round-trip.
+- **Sub-mesh / partial-world support.**  Generalise the sub-row
+  `MPI_Comm_split` trick to arbitrary sub-meshes for ops other than
+  the batched-along-X case, so callers can compose a SLATE op across
+  an arbitrary `n < world_size` process slice.  Today
+  `validate_mesh` rejects anything where `p*q != jax.process_count()`.
+- **Batched cuSOLVERMp.**  cuSOLVERMp exposes a real batched
+  `syevd` / `potrf` (NCCL-backed) that will be much faster than SLATE's
+  for-loop for small-n Hermitian batches; SLATE remains the AMD-GPU
+  fallback path (HIP/Frontier).
 - **`heev` eigenvectors.**  See `eigh.py` for the layout artifact;
   unresolved.
 - **`gels` / least-squares.**  Useful for the ISDF fitting paths
@@ -132,16 +136,40 @@ unless we add a batched FFI primitive (see Future work).
 - `cholesky.py` — `distributed_cholesky` + `SlateLowerL` handle.
 - `trsm.py`     — `distributed_trsm` (handle + plain-array paths).
 - `eigh.py`     — `distributed_eigh`.
-- `context.py`  — per-(p,q) `MPI_Comm` + `SlateCtx` cache + `validate_mesh`.
+- `batched.py`  — `batched_distributed_{cholesky,trsm}` + `SlateBatchedLowerL`.
+- `context.py`  — per-(p,q) `MPI_Comm` + `SlateCtx` cache + `validate_mesh`
+                  + `get_or_init_subrow_context` for the batched sub-comm.
 - `cpp/ctx.h`           — `SlateCtx` struct.
-- `cpp/context.cc`      — `lrx_slate_context_create/destroy/init_mpi`.
+- `cpp/context.cc`      — `lrx_slate_{context,subrow_context}_create/destroy/init_mpi`.
 - `cpp/{eigh,potrf,trsm}_ffi.cc` — XLA FFI handlers per op.
-- `scripts/stage_cray.sh` — populate `/pscratch/.../lorrax_slate_cray/stage`
+- `cpp/batched_{potrf,trsm}_ffi.cc` — batched variants (sub-row comm).
+- `scripts/stage_cray.sh` — populate `$SCRATCH/lorrax_slate_cray/stage`
   with libsci + libmpi_gtl_cuda + xpmem + lustreapi (run once per
   module update).
 
-Build: `bash src/ffi/common/cpp/run_shifter.sh bash src/ffi/common/cpp/build.sh`.
-Tests under `src/common/slate_*_test.py` and `slate_*_bench.py`.
+Build (login node — doesn't need an allocation):
+```
+bash src/ffi/common/cpp/run_shifter.sh bash src/ffi/common/cpp/build.sh
+```
+
+Tests under `src/common/slate_*_test.py` and `slate_*_bench.py`; run
+via `lxrun` (inside an `lxalloc`-created allocation).
+
+### Batched variant — `batched.py`, `batched_{potrf,trsm}_ffi.cc`
+
+For the GWJAX `(Nq, Nmu, Nmu)` workload, `batched_distributed_cholesky`
+and `batched_distributed_trsm` take a 3-D input sharded
+`P('x', None, 'y')`: batch across `'x'`, each `Nmu × Nmu` across `'y'`.
+Each X-row of the mesh gets its own MPI sub-comm of size `Py`
+(`MPI_Comm_split` by `x_rank`), and the FFI handler loops over the
+per-rank batch calling `slate::potrf` / `slate::trsm` on each slice.
+
+SLATE has no native batched potrf, so the "batching" is literally a
+C++ for-loop — but the sub-comm setup is shared across iterations,
+which is the only bit that matters for amortising Python↔XLA dispatch
+overhead.  See `batched.py` docstring for the full shape contract and
+`src/common/slate_batched_test.py` for a 4-GPU 2×2 correctness test
+(machine precision).
 
 ## References
 

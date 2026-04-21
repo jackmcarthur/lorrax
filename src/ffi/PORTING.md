@@ -150,17 +150,11 @@ HDF5 / MPI-IO.  Two stacks are supported, selected via
 `LORRAX_PHDF5_MPI_STACK={openmpi,mpich}` (see
 [run_shifter.sh](common/cpp/run_shifter.sh)).
 
-### Option A — OpenMPI (default, verified)
+### Option A — Cray MPICH / cray-hdf5-parallel (default as of 2026-04-20)
 
-- **HDF5**: conda-forge `hdf5-1.14.6-mpi_openmpi_*.conda`,
-  staged at `/pscratch/sd/$USER/lorrax_phdf5_openmpi/stage/`.
-  Regenerate with [`src/ffi/phdf5/scripts/stage_openmpi.sh`](phdf5/scripts/stage_openmpi.sh).
-- **MPI**: the JAX container's bundled HPC-X OpenMPI at
-  `/opt/hpcx/ompi`, satisfying `libmpi.so.40`.
-- **Shifter modules**: `--module=gpu` only.
-- **Slurm PMI**: `--mpi=pmix`.
-- **Performance** (4 nodes / 16 GPUs, 4.29 GB C128):
-  `4.08 GB/s` — `8.02×` over `multihost_utils.process_allgather + rank-0 h5py`.
+See Option B below for the full details — promoted to the default now
+that SLATE, cuSOLVERMp, and phdf5 are unified on this stack (`lxrun`
+from the Lmod module drives it).
 
 ### Option B — Cray MPICH / cray-hdf5-parallel (opt-in, viable)
 
@@ -174,7 +168,10 @@ HDF5 / MPI-IO.  Two stacks are supported, selected via
   bridges Cray-PE's compiler-specific SONAME onto the generic MPICH-ABI
   runtime that shifter provides.
 - **Shifter modules**: `--module=gpu,mpich`.
-- **Slurm PMI**: `--mpi=pmi2` (Cray MPICH native).
+- **Slurm PMI**: `--mpi=cray_shasta` (Cray MPICH native).  Note:
+  `--mpi=pmi2` and `--mpi=pmix` both give singleton-MPI
+  (each rank sees `MPI_COMM_WORLD` size 1) inside the `--module=mpich`
+  shifter sandbox; `cray_shasta` is the correct PMI flavour.
 - **Performance** (1 node / 4 GPUs / 4.29 GB C128, `phdf5_read_bench`
   n=16384 with post-2026-04-20 defaults, indep writes + non-coll meta):
   `3.79 GB/s` read, write stable — **+24 % over OpenMPI (3.06 GB/s)**

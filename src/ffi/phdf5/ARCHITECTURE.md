@@ -299,14 +299,16 @@ Run locally with:
 
 ```bash
 lxalloc
-export SLURM_JOBID=<from lxalloc>
-LORRAX_NGPU=4 LORRAX_MPI_TYPE=pmix \
-    HDF5_USE_FILE_LOCKING=FALSE \
-    lxrun python3 -u -m common.phdf5_multi_offset_test
+# SLURM_JOBID is exported by salloc into the caller's shell
+lxrun python3 -u -m common.phdf5_multi_offset_test
 ```
 
-The `--mpi=pmix` (via `LORRAX_MPI_TYPE=pmix`) is required for the
-Shifter container's OpenMPI.
+The module's `lxrun` defaults (`--mpi=cray_shasta`, `--module=gpu,mpich`,
+`select_gpu.sh`, `LD_PRELOAD libmpi_gtl_cuda.so.0`,
+`HDF5_USE_FILE_LOCKING=FALSE`) cover what the phdf5 tests need — no
+per-invocation env juggling required.  Override with `LORRAX_MPI_TYPE=pmix`
+only if you explicitly need the container's HPC-X OpenMPI path
+(historical; the unified stack uses Cray MPICH everywhere now).
 
 ------------------------------------------------------------------------
 
