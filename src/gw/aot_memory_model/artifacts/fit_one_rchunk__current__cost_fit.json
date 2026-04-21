@@ -1,0 +1,18 @@
+{
+  "kernel": "fit_one_rchunk",
+  "feature_names": [
+    "pair_density",
+    "bc_fft",
+    "zct",
+    "solve"
+  ],
+  "coefs": [
+    0.011620946175929953,
+    2.4602683108197354,
+    5.061960075600819,
+    0.0
+  ],
+  "intercept": 0.0,
+  "residual_rms": 89283208.39993666,
+  "n_samples": 11
+}

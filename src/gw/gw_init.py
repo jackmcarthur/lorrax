@@ -275,6 +275,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	band_range_right = (band_slices.b1, band_slices.b4)   # sigma val + all cond
 
 	mem_est = chunks.get('memory_estimate', {})
+	aot_peak_gb = None  # filled in below if the AOT model is available
 	if jax.process_index() == 0 and mem_est:
 		print_fn(f"    Memory estimate: peak {mem_est['peak_estimate_gb']:.2f} GB "
 		         f"(budget {mem_est['budget_gb']:.2f} GB), bottleneck={mem_est['bottleneck']}")
@@ -282,12 +283,16 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		if stages:
 			print_fn(f"    Per-stage: " + "  ".join(f"{k}={v:.2f}" for k, v in stages.items()) + " GB")
 
-		# AOT-derived driver-level peak — sanity-check against per-stage heuristic.
-		# Logged only; does NOT override chunk_r.  When the fit artifact is
-		# missing or the prediction throws, we stay silent.
+		# AOT-derived driver-level peak — sanity-check against per-stage
+		# heuristic.  When ``use_aot_chunk_chooser`` is set, the AOT
+		# chooser's pick supersedes ``chunks['chunk_r']`` and
+		# ``chunks['band_chunk']``; otherwise this block just LOGS the
+		# predicted peak alongside the heuristic output.  Silent when
+		# the fit artifact is missing or the prediction throws.
 		try:
 			from gw.aot_memory_model import (
-				predict_kernel_peak, SysDims, Knobs, MeshSpec,
+				predict_kernel_peak, SysDims, MeshSpec, Knobs,
+				choose_chunks_aot, describe_chunks,
 			)
 			p_x, p_y = mesh_xy.devices.shape
 			aot_sys = SysDims(
@@ -299,17 +304,34 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				       + band_range_right[1] - band_range_right[0]),
 				n_r=int(meta.n_rtot),
 			)
-			aot_peak = predict_kernel_peak(
-				"fit_one_rchunk", aot_sys,
-				Knobs.of(chunk_r=int(chunks['chunk_r']),
-				         band_chunk=int(chunks['band_chunk'])),
-				MeshSpec(p_x=int(p_x), p_y=int(p_y)),
-				tag="current",
-			)
-			print_fn(f"    AOT fit_one_rchunk peak (driver-level): "
-			         f"{aot_peak / 1e9:.2f} GB")
-		except Exception:
-			pass
+			aot_mesh = MeshSpec(p_x=int(p_x), p_y=int(p_y))
+			if cfg.use_aot_chunk_chooser:
+				choice = choose_chunks_aot(
+					aot_sys, aot_mesh,
+					budget_bytes=cfg.memory_per_device_gb * 1e9 * cfg.chunk_target_utilization,
+					kernel_name="fit_one_rchunk", tag="current",
+				)
+				print_fn(f"    {describe_chunks(choice)}")
+				# Override the heuristic's chunk_r / band_chunk.  Keep
+				# q_chunk, q_gather, k_chunk from the old chooser since
+				# the AOT model doesn't cover them yet.
+				chunks['chunk_r'] = int(choice.chunk_r)
+				chunks['band_chunk'] = int(choice.band_chunk)
+				aot_peak_gb = choice.peak_bytes / 1e9
+			else:
+				aot_peak = predict_kernel_peak(
+					"fit_one_rchunk", aot_sys,
+					Knobs.of(chunk_r=int(chunks['chunk_r']),
+					         band_chunk=int(chunks['band_chunk'])),
+					aot_mesh, tag="current",
+				)
+				print_fn(f"    AOT fit_one_rchunk peak (driver-level): "
+				         f"{aot_peak / 1e9:.2f} GB")
+				aot_peak_gb = aot_peak / 1e9
+		except Exception as _aot_exc:
+			if cfg.use_aot_chunk_chooser:
+				print_fn(f"    AOT chooser FAILED ({_aot_exc!r}); "
+				         f"falling back to heuristic.")
 
 	zeta_h5_path = os.path.join(tmp_dir, "zeta_q.h5")
 	print_fn(f"\n  Chunked ISDF fitting:")
@@ -345,6 +367,16 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		peak_gb = peak_bytes / 1e9
 		print_fn(f"    GPU high-water mark: {peak_gb:.2f} GB / {budget_gb:.2f} GB budget "
 		         f"({100 * peak_gb / budget_gb:.0f}%)")
+		# γ calibration: runtime peak vs AOT-predicted peak.  γ > 1 means
+		# AOT under-predicts (expected for FFT-heavy kernels because
+		# cuFFT scratch is invisible to memory_analysis); γ < 1 means
+		# AOT over-predicts (often XLA remat triggered at runtime).
+		# Logged for manual tracking — wire a CLI to roll these into
+		# per-kernel γ calibration once we have enough data.
+		if aot_peak_gb is not None and aot_peak_gb > 0:
+			gamma = peak_gb / aot_peak_gb
+			print_fn(f"    γ (runtime / AOT-pred) = {gamma:.3f}  "
+			         f"(AOT predicted {aot_peak_gb:.2f} GB)")
 
 	return zeta_h5_path, mem_est
 

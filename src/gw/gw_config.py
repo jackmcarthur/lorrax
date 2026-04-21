@@ -56,6 +56,13 @@ _DEFAULTS = {
     # Trades a per-r-chunk read for zero persistent GPU footprint of the
     # per-band-chunk G-space tuple.  Cheap under phdf5; slow under h5py.
     "use_phdf5_gspace": False,
+    # AOT-fit chunk chooser: replaces the per-stage byte heuristic in
+    # compute_optimal_chunks with the driver-level
+    # ``aot_memory_model.choose_chunks_aot`` — minimises total FLOPs
+    # subject to the predicted peak fitting under the memory budget.
+    # Requires fit artifacts at
+    # src/gw/aot_memory_model/artifacts/fit_one_rchunk__current__*.json.
+    "use_aot_chunk_chooser": False,
     # Memory / chunking
     "memory_per_device_gb": 0.0,  # 0 = auto-detect
     "chunk_size": -1,
@@ -293,6 +300,7 @@ class LorraxConfig:
     use_ppm_sigma: bool
     use_ffi_io: bool
     use_phdf5_gspace: bool
+    use_aot_chunk_chooser: bool
 
     # --- Memory / chunking (resolved at construction) ---
     memory_per_device_gb: float
@@ -496,6 +504,7 @@ class LorraxConfig:
             use_ppm_sigma=bool(_get("use_ppm_sigma")),
             use_ffi_io=bool(_get("use_ffi_io")),
             use_phdf5_gspace=bool(_get("use_phdf5_gspace")),
+            use_aot_chunk_chooser=bool(_get("use_aot_chunk_chooser")),
             # Memory / chunking
             memory_per_device_gb=memory_per_device_gb,
             chunk_target_utilization=chunk_utilization,

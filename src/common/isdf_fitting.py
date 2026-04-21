@@ -1220,8 +1220,12 @@ def fit_zeta_chunked_to_h5(
     _peak_bytes = 0
     def _track_peak():
         nonlocal _peak_bytes
+        # Use the LOCAL device — jax.devices()[0] may be remote under
+        # multi-process, in which case memory_stats() returns None and
+        # we'd silently stick at 0.  jax.local_devices()[0] is always
+        # queryable from this rank.
         try:
-            stats = jax.devices()[0].memory_stats()
+            stats = jax.local_devices()[0].memory_stats()
             if stats:
                 _peak_bytes = max(_peak_bytes, stats.get('peak_bytes_in_use', 0))
         except Exception:

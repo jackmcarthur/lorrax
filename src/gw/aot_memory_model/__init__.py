@@ -24,20 +24,38 @@ from .core import (
     predict_peak,
     save_fit,
 )
+from .cost import (
+    CostFit,
+    fit_cost_from_saved,
+    fit_cost_nnls,
+    load_cost_fit,
+    predict_flops_per_call,
+    save_cost_fit,
+)
+from .chooser import ChunkChoice, choose_chunks_aot, describe_chunks
 from .doe import build_doe_axes
 
 __all__ = [
     "AotKernel",
+    "ChunkChoice",
+    "CostFit",
     "Knobs",
     "MeshSpec",
     "SysDims",
     "aot_measure",
     "build_doe_axes",
+    "choose_chunks_aot",
+    "describe_chunks",
+    "fit_cost_from_saved",
+    "fit_cost_nnls",
     "fit_nnls",
     "get_kernel",
+    "load_cost_fit",
     "load_fit",
+    "predict_flops_per_call",
     "predict_kernel_peak",
     "predict_peak",
+    "save_cost_fit",
     "save_fit",
 ]
 

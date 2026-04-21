@@ -141,6 +141,64 @@ def _T_psiG_total(sys, knobs, mesh):
 
 
 # ---------------------------------------------------------------------------
+# FLOPs primitives — per-call cost of one fit_one_rchunk jit invocation.
+#
+# Derived from the algebra of the kernel body:
+#
+#   1. Stream band-chunks (nbc iterations of size bc = band_chunk):
+#        - IFFT3D on (nk, bc, n_s, nx, ny, nz)   ~ bc·nk·n_s·n_r·log(n_r)
+#        - pair-density einsum 'kmnm,knms->knmm-like'   ~ bc·nk·n_rmu·B_r
+#          (L contribution and R contribution both; nbc×2 times total)
+#   2. ZCT stage (ONCE per rchunk call, independent of bc):
+#        - IFFT over kgrid, elementwise mul, FFT back   ~ n_k·n_rmu·B_r·log(n_k)
+#   3. Cholesky solve (ONCE per rchunk call):
+#        - per-q triangular solve n_rmu²·B_r   ~ n_q·n_rmu²·B_r
+#
+# We fold (log factors, constants) into the NNLS fit coefficients.
+# Primitives are CHOSEN so that each has a distinct scaling — the fit
+# can split the per-call cost into its components.
+# ---------------------------------------------------------------------------
+
+def _F_fixed(sys, knobs, mesh):
+    """Per-call intercept — compile overhead + small ops with no
+    explicit scaling.  Represented as a constant 1.0 feature via the
+    fit's intercept column; kept here for naming only."""
+    return 1.0
+
+
+def _F_pair_density(sys, knobs, mesh):
+    """Pair-density accumulate across all band-chunks.  Two sides (L,R)
+    summed over nbc band-chunks:
+        nbc × 2 × bc · nk · n_rmu · B_r
+      = 2 · n_b · nk · n_rmu · B_r      (nbc·bc = n_b)
+    Note: mesh-sharded internally but total FLOPs is mesh-invariant."""
+    Br = _Br(sys, knobs)
+    return 2.0 * sys.n_b * sys.n_k * sys.n_rmu * Br
+
+
+def _F_bc_fft(sys, knobs, mesh):
+    """Per-bc IFFT+phase across all band-chunks:
+        nbc × bc × nk × n_s × n_r × log(n_r)
+      = n_b · nk · n_s · n_r · log2(n_r)"""
+    n_r = sys.n_r or (sys.fft_shape[0] * sys.fft_shape[1] * sys.fft_shape[2])
+    return sys.n_b * sys.n_k * sys.n_s * n_r * np.log2(max(2, n_r))
+
+
+def _F_zct(sys, knobs, mesh):
+    """ZCT FFT over k-grid (ONE call per r-chunk):
+        n_k · n_rmu · B_r · log(n_k)"""
+    Br = _Br(sys, knobs)
+    return sys.n_k * sys.n_rmu * Br * np.log2(max(2, sys.n_k))
+
+
+def _F_solve(sys, knobs, mesh):
+    """Per-q triangular solve (ONE call per r-chunk):
+        n_q · n_rmu^2 · B_r    (q = k for Γ-centered grids)"""
+    Br = _Br(sys, knobs)
+    return sys.n_k * (sys.n_rmu ** 2) * Br
+
+
+# ---------------------------------------------------------------------------
 # Kernel
 # ---------------------------------------------------------------------------
 
@@ -158,6 +216,14 @@ class FitOneRChunkKernel(AotKernel):
         "psi_cent":   _T_psi_centroid,
         "L_q":        _T_L_q,
         "psiG_total": _T_psiG_total,
+    }
+    # Cost-side primitives — distinct from memory primitives because
+    # FLOPs count != bytes-per-device.  See _F_* helpers above.
+    FLOPS_PRIMITIVES = {
+        "pair_density": _F_pair_density,
+        "bc_fft":       _F_bc_fft,
+        "zct":          _F_zct,
+        "solve":        _F_solve,
     }
 
     # ---------- specs ----------
