@@ -53,10 +53,13 @@ __all__ = [
     "CusolverMpBatchedLowerL",
     "batched_distributed_cholesky",
     "batched_distributed_potrs",
+    "batched_distributed_solve_lu",
+    "cholesky_handle_to_natural_L",
 ]
 
 _POTRF_TARGET = "lorrax_cusolvermp_batched_potrf"
 _POTRS_TARGET = "lorrax_cusolvermp_batched_potrs"
+_SOLVE_LU_TARGET = "lorrax_cusolvermp_batched_solve_lu"
 
 # jit(shard_map(...)) cache per signature.  See
 # src/ffi/phdf5/ARCHITECTURE.md §2.4: eager shard_map re-traces per call;
@@ -175,6 +178,15 @@ def batched_distributed_potrs(
     Input sharding: ``B`` in ``P(None, 'x', 'y')``.  Output has the same
     sharding.  No reshard — the caller's Z_col layout flows straight
     through.
+
+    ***cuSOLVERMp 0.6.0 bug on 2D grids***: this FFI returns wrong
+    answers (quiet, no error) when ``NRHS ≤ N`` on a 2D process grid
+    (Px>1 AND Py>1).  ``NRHS ≥ N + Py`` works correctly to machine
+    precision.  Callers whose natural ``NRHS`` is small relative to N
+    must pad with zero columns and slice the result.  See
+    ``w_isdf.solve_w_low_mem`` for a concrete workaround.  The zeta-fit
+    chunked path escapes the bug because its ``NRHS = n_rchunk`` is
+    typically ≫ N.
     """
     Px, Py = _validate_mesh(mesh)
     if mesh.axis_names != L.mesh.axis_names:
@@ -241,3 +253,148 @@ def batched_distributed_potrs(
         _JIT_CACHE[key] = jit_potrs
 
     return jit_potrs(L.raw, B)
+
+
+def cholesky_handle_to_natural_L(L_handle: CusolverMpBatchedLowerL) -> jax.Array:
+    """Materialize the opaque Cholesky handle into a regular ``jax.Array``.
+
+    The handle wraps ``L_raw_T`` sharded ``P(None, 'y', 'x')`` whose bytes
+    are cuSOLVERMp's col-major ``L`` tiles per slice.  Reinterpreted as
+    row-major these bytes are exactly ``L^T``.  Transposing the inner two
+    dims (a materialized XLA transpose) gives back ``L`` in row-major
+    natural layout with sharding ``P(None, 'x', 'y')``.  We then apply a
+    per-rank ``tril`` mask to zero the garbage upper-triangle that
+    cuSOLVERMp leaves untouched (it's whatever was in A's upper when A
+    was donated).
+
+    This is needed by consumers that want a conventional ``L`` jax.Array
+    (e.g. the symmetric W-solve path: ``W = X H⁻¹ X†`` where we form
+    ``X† χ X`` via matmul).
+
+    Returns
+    -------
+    L : jax.Array
+        Shape ``(Nq, N, N)``, sharded ``P(None, 'x', 'y')``.
+        ``L[q]`` is the lower-triangular Cholesky factor of the original
+        A[q], row-major, with the upper triangle zeroed.
+    """
+    mesh = L_handle.mesh
+    Px = int(mesh.shape["x"])
+    Py = int(mesh.shape["y"])
+    nq = L_handle.nbatch
+    n  = L_handle.n
+    mb = L_handle.mb   # N/Px
+    nb = L_handle.nb   # N/Py
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=P(None, "y", "x"),
+             out_specs=P(None, "x", "y"),
+             check_rep=False)
+    def _to_natural(L_raw_T):
+        # L_raw_T local bytes = L^T (row-major view of col-major L bytes).
+        # Swap inner dims to recover L in row-major (materialized copy).
+        L = jnp.transpose(L_raw_T, (0, 2, 1))
+        # Per-rank triangular mask: each rank owns the tile with global
+        # row range [x_idx*mb, (x_idx+1)*mb) and col range
+        # [y_idx*nb, (y_idx+1)*nb).  Entry is kept iff global_row >= global_col.
+        x_idx = jax.lax.axis_index("x")
+        y_idx = jax.lax.axis_index("y")
+        rows = jnp.arange(mb) + x_idx * mb
+        cols = jnp.arange(nb) + y_idx * nb
+        tril = (rows[:, None] >= cols[None, :]).astype(L.dtype)
+        return L * tril[None, :, :]
+
+    return _to_natural(L_handle.raw)
+
+
+def batched_distributed_solve_lu(
+    A: jax.Array,
+    B: jax.Array,
+    *,
+    mesh: Mesh,
+) -> jax.Array:
+    """Solve ``A[q] X[q] = B[q]`` via per-q cuSOLVERMp ``getrf`` + ``getrs``.
+
+    WARNING: cuSOLVERMp 0.6.0 (NVHPC 25.5) has a correctness bug in the
+    2D-grid getrf/getrs path — it returns wrong answers (info=0 but
+    garbage X) for most (N, NRHS, Px, Py) configurations with Px>1 AND
+    Py>1.  Works on 1xN and Nx1 meshes.  For W-solve we use the
+    symmetric Cholesky formulation in ``w_isdf.solve_w_low_mem``
+    instead.  This entry-point is kept for future use once NVIDIA fixes
+    the bug (likely cuSOLVERMp 0.7+).
+
+    For the general (non-Hermitian) case — used by ``w_isdf`` where
+    ``A = I - V χ`` has no symmetry.  Pivot vectors are allocated per
+    call inside the FFI and never surfaced to Python.
+
+    Input sharding: both ``A`` and ``B`` in ``P(None, 'x', 'y')``.
+    Output has the same shape and sharding as ``B``.  ``A`` is donated —
+    XLA may reuse its buffer for the LU factors (which we then discard).
+
+    Restrictions:
+      * A: (Nq, N, N), B: (Nq, N, NRHS) — N % Px == 0, N % Py == 0,
+        NRHS % Py == 0.  Square N on both sides because cuSOLVERMp's
+        descB must have the same row-block as descA (mb_b = N/Px).
+      * Dtypes F64 / C128.
+    """
+    if A.ndim != 3 or A.shape[1] != A.shape[2]:
+        raise ValueError(
+            f"batched_distributed_solve_lu: expected A of shape (Nq, N, N); "
+            f"got {A.shape}")
+    if B.ndim != 3 or int(B.shape[0]) != int(A.shape[0]) or int(B.shape[1]) != int(A.shape[1]):
+        raise ValueError(
+            f"batched_distributed_solve_lu: B must be (Nq, N, NRHS) with "
+            f"Nq, N matching A; got A={A.shape}, B={B.shape}")
+    if A.dtype != B.dtype:
+        raise ValueError(f"A.dtype {A.dtype} != B.dtype {B.dtype}")
+    Px, Py = _validate_mesh(mesh)
+    nq   = int(A.shape[0])
+    n    = int(A.shape[1])
+    nrhs = int(B.shape[2])
+    if n % Px != 0:
+        raise ValueError(f"N={n} must be divisible by Px={Px}.")
+    if n % Py != 0:
+        raise ValueError(f"N={n} must be divisible by Py={Py}.")
+    if nrhs % Py != 0:
+        raise ValueError(f"NRHS={nrhs} must be divisible by Py={Py}.")
+
+    get_lib()
+    ctx_handle = get_or_init_context(mesh, col_major=False)
+
+    mb_a = n // Px
+    nb_a = n // Py
+    mb_b = n // Px
+    nb_b = nrhs // Py
+
+    key = ("solve_lu", _mesh_key(mesh), A.dtype,
+           nq, n, nrhs, mb_a, nb_a, mb_b, nb_b, int(ctx_handle))
+    jit_solve = _JIT_CACHE.get(key)
+    if jit_solve is None:
+        A_local_T = jax.ShapeDtypeStruct((nq, n // Py, n // Px), A.dtype)
+        X_local_T = jax.ShapeDtypeStruct((nq, nrhs // Py, n // Px), B.dtype)
+        attrs = dict(
+            nq=nq, n=n, nrhs=nrhs,
+            mb_a=mb_a, nb_a=nb_a, mb_b=mb_b, nb_b=nb_b,
+            ctx_handle=int(ctx_handle),
+        )
+
+        @partial(shard_map, mesh=mesh,
+                 in_specs=(P(None, "x", "y"), P(None, "x", "y")),
+                 out_specs=P(None, "x", "y"),
+                 check_rep=False)
+        def _solve(local_A, local_B):
+            local_A_T = jnp.transpose(local_A, (0, 2, 1))
+            local_B_T = jnp.transpose(local_B, (0, 2, 1))
+            # Single output X_T.  A is donated in-place (getrf
+            # scribbles LU factors into A's buffer), B → X aliasing
+            # makes getrs in-place on B.
+            X_T = jax.ffi.ffi_call(
+                _SOLVE_LU_TARGET, X_local_T,
+                input_output_aliases={1: 0},
+            )(local_A_T, local_B_T, **attrs)
+            return jnp.transpose(X_T, (0, 2, 1))
+
+        jit_solve = jax.jit(_solve, donate_argnums=(0, 1))
+        _JIT_CACHE[key] = jit_solve
+
+    return jit_solve(A, B)

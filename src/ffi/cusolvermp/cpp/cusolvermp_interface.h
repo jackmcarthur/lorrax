@@ -151,4 +151,86 @@ inline cusolverStatus_t Potrs(
         d_info);
 }
 
+// ---------------------------------------------------------------------------
+//  Getrf / Getrs — distributed LU factorization with partial pivoting
+// ---------------------------------------------------------------------------
+
+template <typename T>
+inline cusolverStatus_t GetrfBufferSize(
+    cusolverMpHandle_t handle,
+    int64_t m, int64_t n,
+    const T* d_A, int64_t ia, int64_t ja, cusolverMpMatrixDescriptor_t descA,
+    int64_t* d_ipiv,
+    size_t* workspace_bytes_device,
+    size_t* workspace_bytes_host)
+{
+    return cusolverMpGetrf_bufferSize(
+        handle, m, n,
+        const_cast<void*>(static_cast<const void*>(d_A)), ia, ja, descA,
+        d_ipiv,
+        CudaDataTypeOf<T>::value,
+        workspace_bytes_device, workspace_bytes_host);
+}
+
+template <typename T>
+inline cusolverStatus_t Getrf(
+    cusolverMpHandle_t handle,
+    int64_t m, int64_t n,
+    T* d_A, int64_t ia, int64_t ja, cusolverMpMatrixDescriptor_t descA,
+    int64_t* d_ipiv,
+    void* d_workspace, size_t workspace_bytes_device,
+    void* h_workspace, size_t workspace_bytes_host,
+    int* d_info)
+{
+    return cusolverMpGetrf(
+        handle, m, n,
+        static_cast<void*>(d_A), ia, ja, descA,
+        d_ipiv,
+        CudaDataTypeOf<T>::value,
+        d_workspace, workspace_bytes_device,
+        h_workspace, workspace_bytes_host,
+        d_info);
+}
+
+template <typename T>
+inline cusolverStatus_t GetrsBufferSize(
+    cusolverMpHandle_t handle,
+    cublasOperation_t trans, int64_t n, int64_t nrhs,
+    const T* d_A, int64_t ia, int64_t ja, cusolverMpMatrixDescriptor_t descA,
+    const int64_t* d_ipiv,
+    const T* d_B, int64_t ib, int64_t jb, cusolverMpMatrixDescriptor_t descB,
+    size_t* workspace_bytes_device,
+    size_t* workspace_bytes_host)
+{
+    return cusolverMpGetrs_bufferSize(
+        handle, trans, n, nrhs,
+        const_cast<void*>(static_cast<const void*>(d_A)), ia, ja, descA,
+        d_ipiv,
+        const_cast<void*>(static_cast<const void*>(d_B)), ib, jb, descB,
+        CudaDataTypeOf<T>::value,
+        workspace_bytes_device, workspace_bytes_host);
+}
+
+template <typename T>
+inline cusolverStatus_t Getrs(
+    cusolverMpHandle_t handle,
+    cublasOperation_t trans, int64_t n, int64_t nrhs,
+    const T* d_A, int64_t ia, int64_t ja, cusolverMpMatrixDescriptor_t descA,
+    const int64_t* d_ipiv,
+    T* d_B, int64_t ib, int64_t jb, cusolverMpMatrixDescriptor_t descB,
+    void* d_workspace, size_t workspace_bytes_device,
+    void* h_workspace, size_t workspace_bytes_host,
+    int* d_info)
+{
+    return cusolverMpGetrs(
+        handle, trans, n, nrhs,
+        const_cast<void*>(static_cast<const void*>(d_A)), ia, ja, descA,
+        d_ipiv,
+        static_cast<void*>(d_B), ib, jb, descB,
+        CudaDataTypeOf<T>::value,
+        d_workspace, workspace_bytes_device,
+        h_workspace, workspace_bytes_host,
+        d_info);
+}
+
 }  // namespace lorrax_ffi::cusolvermp::mp

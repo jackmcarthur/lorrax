@@ -348,6 +348,7 @@ set(LORRAX_FFI_SOURCES
     ../../cusolvermp/cpp/eigh_ffi.cc
     ../../cusolvermp/cpp/batched_potrf_ffi.cc
     ../../cusolvermp/cpp/batched_potrs_ffi.cc
+    ../../cusolvermp/cpp/batched_solve_lu_ffi.cc
     ../../cusolvermg/cpp/eigh_mg_ffi.cc
     ../../phdf5/cpp/context.cc
     ../../phdf5/cpp/write_ffi.cc

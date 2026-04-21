@@ -341,7 +341,8 @@ def main(argv=None):
 			with jax_profile.trace_section("chi0_W"):
 				quad, e_ref = build_static_quadrature(wfns, config.minimax_config, print_fn=print0)
 				chi0_q = compute_chi0(wfns, quad, meta, mesh_xy, energy_reference=e_ref)
-				W_q = solve_w(V_q, chi0_q, meta, mesh_xy)
+				W_q = solve_w(V_q, chi0_q, meta, mesh_xy,
+				              memory_mode=config.isdf_memory_mode)
 				chi0_q.block_until_ready()
 				W_q.block_until_ready()
 				print0(f"  |χ(0)|_max = {float(jnp.max(jnp.abs(chi0_q))):.6e}  "
@@ -456,7 +457,8 @@ def main(argv=None):
 			quad_imag = build_imag_quadrature(
 				quad, config.ppm_omega_p, config.minimax_config, print_fn=print0)
 			chi0_imag = compute_chi0(wfns, quad_imag, meta, mesh_xy, energy_reference=e_ref)
-			Wiwp_q = solve_w(V_q, chi0_imag, meta, mesh_xy)
+			Wiwp_q = solve_w(V_q, chi0_imag, meta, mesh_xy,
+			                 memory_mode=config.isdf_memory_mode)
 			chi0_imag.block_until_ready()
 			Wiwp_q.block_until_ready()
 

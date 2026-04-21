@@ -240,10 +240,87 @@ def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int):
     return _solve_w
 
 
-def solve_w(V_q, chi0_q, meta, mesh_xy):
+def _get_w_solve_fn_low_mem(mesh_xy: Mesh, nq: int, n_rmu: int, dtype):
+    """Low-mem W-solve: symmetric Cholesky path.
+
+    Trick (algebraic identity (I − AB)⁻¹ A = A (I − BA)⁻¹):
+        v = X X†        (Cholesky of v)
+        W = (I − v χ)⁻¹ v = X (I − X† χ X)⁻¹ X† = X H⁻¹ X†
+    where H = I − X† χ X is Hermitian PD (χ ≼ 0 for static response).
+    All distributed ops use the working Cholesky + trisolve kernels.
+
+    We use this because cuSOLVERMp 0.6.0 has a 2D-grid bug in getrf/getrs
+    (see ffi.cusolvermp.batched_distributed_solve_lu).  Also potentially
+    2× faster than LU: 2× potrf + 1× potrs vs getrf+getrs, though the
+    three extra matmuls can dominate at small N.
+    """
+    from ffi.cusolvermp import (
+        batched_distributed_cholesky,
+        batched_distributed_potrs,
+        cholesky_handle_to_natural_L,
+    )
+    from jax.sharding import NamedSharding
+
+    cache_key = ("low_mem", id(mesh_xy), nq, n_rmu, dtype)
+    if cache_key in _w_solve_cache:
+        return _w_solve_cache[cache_key]
+
+    Py = int(mesh_xy.shape["y"])
+    nat = NamedSharding(mesh_xy, P(None, "x", "y"))
+    I_q = jnp.broadcast_to(jnp.eye(n_rmu, dtype=dtype)[None, :, :],
+                            (nq, n_rmu, n_rmu))
+
+    @jax.jit
+    def _solve_w_low(V_q, chi0_q, pref):
+        chi_scaled = pref * chi0_q
+        V_q = jax.lax.with_sharding_constraint(V_q, nat)
+        chi_scaled = jax.lax.with_sharding_constraint(chi_scaled, nat)
+        # 1. X = chol(V)   [batched distributed potrf]
+        X_handle = batched_distributed_cholesky(V_q, mesh=mesh_xy)
+        # 2. Materialize X and X† as regular jax.Arrays.
+        X = cholesky_handle_to_natural_L(X_handle)
+        X_dagger = jnp.conj(jnp.swapaxes(X, -1, -2))
+        # 3. T = X† χ X — two distributed matmuls.
+        T = X_dagger @ chi_scaled @ X
+        # 4. H = I − T  (Hermitian, expected PD)
+        H = jax.lax.with_sharding_constraint(I_q - T, nat)
+        # 5. L_H = chol(H)
+        L_H_handle = batched_distributed_cholesky(H, mesh=mesh_xy)
+        # 6. Y = potrs(L_H, X†) = H⁻¹ X†.  Two workarounds for
+        #    cuSOLVERMp 0.6.0 bugs on 2D grids:
+        #      (a) potrs requires B sharded P(None, 'x', 'y') — X_dagger
+        #          is P(None, 'y', 'x') after the swapaxes.
+        #      (b) potrs returns wrong answers when NRHS ≤ N.  Pad X_dagger
+        #          along the RHS column axis so NRHS > N, then slice
+        #          the result back to (nq, N, N).  Padding cost is
+        #          O(1/N) relative; negligible at N ≥ 640.
+        pad = 2 * Py   # keep NRHS divisible by Py; pick smallest passing
+        X_dagger_padded = jnp.pad(
+            X_dagger, ((0, 0), (0, 0), (0, pad)), mode="constant")
+        X_dagger_padded = jax.lax.with_sharding_constraint(
+            X_dagger_padded, NamedSharding(mesh_xy, P(None, "x", "y")))
+        Y_padded = batched_distributed_potrs(
+            L_H_handle, X_dagger_padded, mesh=mesh_xy)
+        Y = Y_padded[:, :, :n_rmu]
+        # 7. W = X Y
+        W = X @ Y
+        return jax.lax.with_sharding_constraint(W, nat)
+
+    _w_solve_cache[cache_key] = _solve_w_low
+    return _solve_w_low
+
+
+def solve_w(V_q, chi0_q, meta, mesh_xy, *, memory_mode: str = "high_mem"):
     """W(q) = (I − V χ₀)⁻¹ V  via q-parallel Dyson solve.
 
     All arrays flat-q: V(nq, μ, μ), χ₀(nq, μ, μ) → W(nq, μ, μ).
+
+    memory_mode:
+        "high_mem": q-parallel reshard + local LU on each rank (existing
+            path; legal for any mesh; uses one all-gather + all-scatter).
+        "low_mem": symmetric Cholesky formulation W = X H⁻¹ X†; no
+            reshard to q-parallel, but matmuls can reshard internally
+            (JAX-planned).  Requires χ such that I − X†χX is PD.
     """
     nq = int(meta.nk_tot)
     n_rmu = chi0_q.shape[1]
@@ -251,7 +328,11 @@ def solve_w(V_q, chi0_q, meta, mesh_xy):
     nspinor = max(1, int(getattr(meta, 'nspinor', 1)))
     pref = jnp.asarray(2.0 / (float(max(1, nq)) ** 0.5 * float(nspin) * float(nspinor)),
                         dtype=jnp.complex128)
-    solve_fn = _get_w_solve_fn(mesh_xy, nq, n_rmu)
+    mode = (memory_mode or "high_mem").lower()
+    if mode == "low_mem":
+        solve_fn = _get_w_solve_fn_low_mem(mesh_xy, nq, n_rmu, V_q.dtype)
+    else:
+        solve_fn = _get_w_solve_fn(mesh_xy, nq, n_rmu)
     with jax_profile.annotation("W_solve"):
         return solve_fn(V_q, chi0_q, pref)
 
