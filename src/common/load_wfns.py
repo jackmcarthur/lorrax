@@ -286,27 +286,30 @@ _rchunk_slice_cache = {}
 def get_sharded_wfns_rchunk_slice(
     global_psi_Gtot: jax.Array,
     meta: Meta,
-    r_start: int,
-    r_end: int,
+    r_start,
+    r_chunk_size: int,
     kvecs_frac: np.ndarray,
     mesh_xy: Mesh,
     band_range: tuple[int, int],
 ) -> jax.Array:
     """
     FFT wavefunctions and extract r-chunk via flattened r-index slicing.
-    
-    R-chunking gives CONTIGUOUS r-indices: slicing r in [r_start, r_end)
+
+    R-chunking gives CONTIGUOUS r-indices: slicing r in [r_start, r_start+r_chunk_size)
     produces a contiguous block in the flattened xyz order and can be written
     to HDF5 in a single sequential operation.
-    
+
     Args:
         global_psi_Gtot: G-space wfns from read_Gvecs_to_devices
         meta: Meta object
-        r_start, r_end: R-index range [r_start, r_end)
+        r_start: starting R-index (Python int for driver calls, or jax
+            scalar tracer when this function is called inside an outer jit)
+        r_chunk_size: static Python int — width of the slice.  Must be
+            a concrete int so the FFT output shape is known at trace.
         kvecs_frac: (nk, 3) k-vectors in fractional coordinates
         mesh_xy: Device mesh
         band_range: (b_start, b_end)
-    
+
     Returns:
         psi_rchunk_Y: (nk, nb, ns, n_rchunk) with P(None, None, None, 'y')
     """
@@ -314,7 +317,7 @@ def get_sharded_wfns_rchunk_slice(
     nspinor = meta.nspinor
     fft_grid = meta.fft_grid
     nx, ny, nz = fft_grid
-    r_chunk_size = r_end - r_start
+    r_chunk_size = int(r_chunk_size)
     b_start, b_end = band_range
     nb = b_end - b_start
     n_rtot = nx * ny * nz
@@ -494,7 +497,7 @@ def iter_psi_rchunk_bandwise(
                     f"available={list(by_range.keys())}")
             if nk_batch >= nk_tot:
                 psi_bc_Y = get_sharded_wfns_rchunk_slice(
-                    gtot, meta, r_start, r_end, kvecs_frac, mesh_xy, bc_range)
+                    gtot, meta, r_start, r_end - r_start, kvecs_frac, mesh_xy, bc_range)
                 yield bc_range, psi_bc_Y
             else:
                 # K-chunk the FFT on the cached full-k G-space so the
@@ -510,7 +513,7 @@ def iter_psi_rchunk_bandwise(
                     k1 = min(k0 + nk_batch, nk_tot)
                     sub_meta = _make_kchunk_meta(meta, k0, k1)
                     psi_k_chunk = get_sharded_wfns_rchunk_slice(
-                        gtot[k0:k1], sub_meta, r_start, r_end,
+                        gtot[k0:k1], sub_meta, r_start, r_end - r_start,
                         kvecs_frac[k0:k1], mesh_xy, bc_range)
                     psi_bc_Y_full = psi_bc_Y_full.at[k0:k1, :, :, :].set(psi_k_chunk)
                     del psi_k_chunk
@@ -527,7 +530,7 @@ def iter_psi_rchunk_bandwise(
                 gtot, _ = read_Gvecs_to_devices(
                     wfn, sym, bc_range, meta, bispinor, mesh_xy)
             psi_bc_Y = get_sharded_wfns_rchunk_slice(
-                gtot, meta, r_start, r_end, kvecs_frac, mesh_xy, bc_range)
+                gtot, meta, r_start, r_end - r_start, kvecs_frac, mesh_xy, bc_range)
             del gtot
             yield bc_range, psi_bc_Y
         else:
@@ -550,7 +553,7 @@ def iter_psi_rchunk_bandwise(
                         wfn, sym, bc_range, sub_meta, bispinor, mesh_xy,
                         k_range=(k0, k1))
                 psi_k_chunk = get_sharded_wfns_rchunk_slice(
-                    psi_k_gtot, sub_meta, r_start, r_end,
+                    psi_k_gtot, sub_meta, r_start, r_end - r_start,
                     kvecs_frac[k0:k1], mesh_xy, bc_range)
                 psi_bc_Y_full = psi_bc_Y_full.at[k0:k1, :, :, :].set(psi_k_chunk)
                 del psi_k_chunk, psi_k_gtot

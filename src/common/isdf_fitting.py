@@ -3,10 +3,8 @@ import os
 import queue
 import threading
 import time
-from dataclasses import dataclass
 from types import SimpleNamespace
 from functools import partial
-from typing import Any, Optional, Union
 
 import numpy as np
 import jax
@@ -427,66 +425,6 @@ _chol_2d_cache = {}
 
 
 # ============================================================================
-# ZetaCholFactor — unified handle hiding the memory-mode choice
-# ============================================================================
-# The Cholesky factor of the stack of ISDF normal-equation matrices C_q has
-# two possible storage / compute regimes that we want to choose between
-# without cluttering the caller's code:
-#
-#   mode='high_mem'  (legacy)    L_q is a dense (nq, N, N) jax.Array sharded
-#                                P(None, 'x', 'y'); solve_zeta replicates L
-#                                across ranks for a local vmap trsm.  Cheap
-#                                when N is small and nq × N² fits in VRAM.
-#
-#   mode='low_mem'   (new)       L_q is an opaque CusolverMpBatchedLowerL
-#                                handle — batch sharded along 'x', matrix
-#                                1-axis-sharded along 'y'.  No replication;
-#                                solve_zeta runs the cuSOLVERMp distributed
-#                                potrs per-slice on the per-X-row sub-comm.
-#                                Scales to N >> single-GPU VRAM.
-#
-# Callers see a single object with `.shape`, `.dtype`, `.block_until_ready()`
-# quacking like a jax.Array so existing diagnostic prints still work.  The
-# solve function dispatches on `factor.mode`.
-
-@dataclass(frozen=True)
-class ZetaCholFactor:
-    mode: str                                        # 'high_mem' | 'low_mem'
-    mesh: Mesh
-    nq: int
-    n_rmu: int
-    dtype: Any
-    # Exactly one of these is populated depending on mode.
-    _dense_L: Optional[jax.Array] = None
-    _handle: Optional[Any] = None    # CusolverMpBatchedLowerL; Any to avoid hard import
-
-    @property
-    def shape(self):
-        return (self.nq, self.n_rmu, self.n_rmu)
-
-    def block_until_ready(self):
-        if self._dense_L is not None:
-            self._dense_L.block_until_ready()
-        elif self._handle is not None:
-            self._handle.raw.block_until_ready()
-        return self
-
-
-def _resolve_memory_mode(memory_mode: str, mesh_xy: Mesh) -> str:
-    """`auto` currently preserves back-compat: defaults to `high_mem`."""
-    m = memory_mode.lower()
-    if m == "auto":
-        return "high_mem"
-    if m not in ("high_mem", "low_mem"):
-        raise ValueError(
-            f"memory_mode must be one of auto|high_mem|low_mem; got {memory_mode!r}")
-    if m == "low_mem" and mesh_xy.devices.size == 1:
-        # cuSOLVERMp requires a real process grid; degrade to high_mem.
-        return "high_mem"
-    return m
-
-
-# ============================================================================
 # Full zeta fitting pipeline with z-chunk loop and HDF5 output
 # ============================================================================
 
@@ -494,41 +432,21 @@ def compute_L_q_from_CCT(
     C_q: jax.Array,
     mesh_xy: Mesh,
     block_size: int = None,
-    *,
-    memory_mode: str = "auto",
-) -> ZetaCholFactor:
+) -> jax.Array:
     """
-    Compute Cholesky factor L_q from the CCT matrix stack.
+    Compute Cholesky factor L_q from CCT matrix using 2D blocked algorithm.
 
     Args:
-        C_q: (nq, n_rmu, n_rmu) CCT matrix, sharded P(None, 'x', 'y').
-        mesh_xy: 2D device mesh with axes ('x', 'y').
-        block_size: Tile block size for the high_mem 2D-blocked JAX Cholesky
-                    (ignored by the low_mem path).  Auto if None.
-        memory_mode: "auto" | "high_mem" | "low_mem".  See module docstring
-                    on ZetaCholFactor for the regimes.
+        C_q: (nq, n_rmu, n_rmu) CCT matrix, sharded P(None, 'x', 'y')
+        mesh_xy: 2D device mesh
+        block_size: Tile block size (auto if None)
 
     Returns:
-        ZetaCholFactor wrapping either a dense L (high_mem) or a
-        CusolverMpBatchedLowerL handle (low_mem).
+        L_q: (nq, n_rmu, n_rmu) Cholesky factor, sharded P(None, 'x', 'y')
     """
     nq, n_rmu, n_rmu2 = C_q.shape
     assert n_rmu == n_rmu2, f"C_q must be square, got {n_rmu} x {n_rmu2}"
 
-    mode = _resolve_memory_mode(memory_mode, mesh_xy)
-
-    if mode == "low_mem":
-        # batched cuSOLVERMp potrf on the full (Px, Py) grid.  C_q comes
-        # in as P(None, 'x', 'y'); that's exactly the FFI's input spec,
-        # so no reshard is needed.
-        from ffi.cusolvermp import batched_distributed_cholesky
-        handle = batched_distributed_cholesky(C_q, mesh=mesh_xy)
-        return ZetaCholFactor(
-            mode="low_mem", mesh=mesh_xy,
-            nq=nq, n_rmu=n_rmu, dtype=C_q.dtype,
-            _handle=handle)
-
-    # --- high_mem path (existing 2D-blocked JAX Cholesky) ---------------
     Pr = mesh_xy.shape['x']
     Pc = mesh_xy.shape['y']
 
@@ -545,11 +463,7 @@ def compute_L_q_from_CCT(
         C_q_reg = C_q + ridge
         L_q_dense = jnp.linalg.cholesky(C_q_reg)
         L_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-        L_q_dense = jax.lax.with_sharding_constraint(L_q_dense, L_shard)
-        return ZetaCholFactor(
-            mode="high_mem", mesh=mesh_xy,
-            nq=nq, n_rmu=n_rmu, dtype=C_q.dtype,
-            _dense_L=L_q_dense)
+        return jax.lax.with_sharding_constraint(L_q_dense, L_shard)
 
     if block_size is None:
         block_size, J = compute_block_size_for_2d_cholesky(n_rmu, Pr, Pc)
@@ -575,10 +489,7 @@ def compute_L_q_from_CCT(
     L_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     L_q_dense = jax.lax.with_sharding_constraint(L_q_dense, L_shard)
 
-    return ZetaCholFactor(
-        mode="high_mem", mesh=mesh_xy,
-        nq=nq, n_rmu=n_rmu, dtype=C_q.dtype,
-        _dense_L=L_q_dense)
+    return L_q_dense
 
 
 # Cache for solve function
@@ -586,51 +497,31 @@ _solve_cache = {}
 
 
 def solve_zeta_from_L_q(
-    L_factor: ZetaCholFactor,
+    L_q: jax.Array,
     Z_q: jax.Array,
     mesh_xy: Mesh,
     q_chunk_size: int = 1,
 ) -> jax.Array:
     """
-    Solve for zeta_q given pre-computed Cholesky factor.
+    Solve for zeta_q given pre-computed Cholesky factor L_q.
 
-    Dispatches on `L_factor.mode`:
-      * high_mem: q-chunked all-gather + local vmap trsm (legacy).
-      * low_mem : batched cuSOLVERMp potrs on the per-X-row sub-comm.
+    Uses q-chunked all-gather strategy: gather B_q L matrices at a time,
+    then solve all B_q systems in parallel using vmap.
+
+    Memory trade-off:
+    - q_chunk_size=1: Minimum memory (one L replicated at a time)
+    - q_chunk_size=nq: Maximum parallelism (all L replicated)
 
     Args:
-        L_factor: ZetaCholFactor returned by compute_L_q_from_CCT.
-        Z_q: (nq, n_rmu, n_zchunk) ZCT matrix.  Accepted shardings:
-             P(None, 'x', 'y') | P(None, None, ('x','y')) | P('x', None, 'y')
-             — the function reshards internally to whatever the chosen
-             mode needs.
-        mesh_xy: 2D device mesh.
-        q_chunk_size: (high_mem only) q-points to solve simultaneously.
+        L_q: (nq, n_rmu, n_rmu) Cholesky factor, sharded P(None, 'x', 'y')
+        Z_q: (nq, n_rmu, n_zchunk) ZCT matrix, sharded P(None, 'x', 'y')
+             or P(None, None, ('x','y')) if caller already resharded
+        mesh_xy: 2D device mesh
+        q_chunk_size: Number of q-points to solve simultaneously (default 1)
 
     Returns:
-        zeta_q: (nq, n_rmu, n_zchunk) solution.
-            high_mem → sharded P(None, None, ('x','y'))
-            low_mem  → sharded P(None, 'x', 'y')    (natural ISDF layout —
-                      Z_q flows through unchanged; downstream HDF5 write
-                      path consumes either sharding)
+        zeta_q: (nq, n_rmu, n_zchunk) solution, sharded P(None, None, ('x','y'))
     """
-    if L_factor.mode == "low_mem":
-        # Full-mesh batched cuSOLVERMp potrs.  Z_q comes in as
-        # P(None, 'x', 'y') and the output X inherits that sharding.
-        # We reshard the result to P(None, None, ('x','y')) to match
-        # the high_mem layout: downstream phdf5 write_slab is much
-        # faster (~5×) when each rank contributes a 1D row-strip to
-        # the (nq, n_rtot, n_rmu) dataset rather than a 2D tile — the
-        # tile case hits a non-contiguous MPI-IO collective-buffer
-        # path that dominated total zeta_fit wall at Si 4×4×4
-        # (close_io 33 s → 6 s).
-        from ffi.cusolvermp import batched_distributed_potrs
-        X = batched_distributed_potrs(L_factor._handle, Z_q, mesh=mesh_xy)
-        out_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
-        return jax.lax.with_sharding_constraint(X, out_shard)
-
-    # --- high_mem path (existing replicate-L + vmap-trsm) ---------------
-    L_q = L_factor._dense_L
     nq, n_rmu, _ = L_q.shape
     _, _, n_zchunk = Z_q.shape
 
@@ -720,7 +611,10 @@ def solve_zeta_from_L_q(
         def _reshard_z(z):
             return jax.lax.with_sharding_constraint(z, _target_sharding)
         Z_col = _reshard_z(Z_q)
-        Z_col.block_until_ready()
+        # No-op when called inside an outer jit (tracer has no
+        # block_until_ready and the outer jit syncs at its boundary).
+        if not isinstance(Z_col, jax.core.Tracer):
+            Z_col.block_until_ready()
         del Z_q
 
     # Fast path: solve all q-points at once
@@ -753,6 +647,245 @@ def solve_zeta_from_L_q(
     return zeta
 
 
+# =============================================================================
+# Jittable r-chunk body — the whole per-r-chunk iteration in one jit
+# =============================================================================
+#
+# This is the hot kernel: load-phase FFT → reshard → streaming pair-density
+# accumulate (both L and R) over all band-chunks → ZCT → reshard → solve,
+# all fused into one jax.jit.  The Python driver only does persistent-state
+# setup (centroids, L_q, G-space cache) and H5 I/O writes around the jit call.
+#
+# All "structural" configuration (band_chunk_ranges, band_range_left/right,
+# actual_n_rchunk, q_chunk_size, kvecs_frac, mesh, meta) is closure state —
+# the factory compiles a distinct jit per (hashable) tuple.  The typical
+# r-chunk loop has exactly TWO compiled variants: the full-sized r-chunks
+# and the last remainder.
+#
+# Dynamic inputs: the pre-loaded G-space tuple (one array per band-chunk),
+# the centroid copies and L_q (persistent across the full fit), band_norms
+# (normalised to jnp.ones(nb) when absent so the shape is uniform), and
+# r_start as a scalar dynamic int.
+
+_fit_one_rchunk_cache: dict = {}
+
+
+def _make_fit_one_rchunk_kernel(
+    mesh_xy: Mesh,
+    meta: Meta,
+    band_chunk_ranges: tuple[tuple[int, int], ...],
+    band_range_left: tuple[int, int],
+    band_range_right: tuple[int, int],
+    band_range_full: tuple[int, int],
+    actual_n_rchunk: int,
+    q_chunk_size: int,
+    kvecs_frac_hash: int,
+    kvecs_frac,
+):
+    """Factory: returns a ``jax.jit``'d fit_one_rchunk callable closing
+    over every piece of static structure.  The cache is keyed below.
+
+    Returned function signature::
+
+        zeta_chunk = kernel(
+            psi_bc_G_tuple,        # tuple of arrays, one per band-chunk
+            psi_l_rmuT_X_fit,
+            psi_r_rmuT_X_fit,
+            L_q,
+            norms_l, norms_r,      # jax arrays; jnp.ones when no band_norms
+            r_start_dyn,           # scalar int32
+        )
+
+    The inner body fully composes the load-phase FFT + reshard, the
+    band-chunk pair-density streaming loop (Python-unrolled at trace),
+    the ZCT, the Z_q→Z_col reshard, and the Cholesky solve.
+    """
+    from .load_wfns import get_sharded_wfns_rchunk_slice
+
+    nk_tot = meta.nk_tot
+    n_rmu = meta.n_rmu
+    nspinor = meta.nspinor
+    kgrid = meta.kgrid
+    nqx, nqy, nqz = kgrid
+    nq = nqx * nqy * nqz
+
+    l_lo, l_hi = band_range_left
+    r_lo, r_hi = band_range_right
+    nb_left = l_hi - l_lo
+    nb_right = r_hi - r_lo
+
+    P_sharding = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    L_slice_shard = NamedSharding(mesh_xy, P(None, 'x', None, None))
+
+    # Classify each band-chunk into (left_status, right_status) at trace
+    # time.  Values: 'skip' | 'direct' | 'pad'.  "skip" = entirely out of
+    # the L/R band range; "direct" = entirely inside (slice with no pad);
+    # "pad" = straddles the boundary (zero-pad to bc_size).  The Python
+    # for-loop below branches on these strings at trace time so the jit
+    # body only emits the needed ops per band-chunk.
+    def _classify(rs, re, bc_lo, bc_hi):
+        ol_lo = max(bc_lo, rs)
+        ol_hi = min(bc_hi, re)
+        if ol_hi <= ol_lo:
+            return 'skip', None
+        if ol_lo == bc_lo and ol_hi == bc_hi:
+            return 'direct', (ol_lo - rs, ol_hi - rs)
+        return 'pad', (ol_lo - rs, ol_hi - rs, ol_lo - bc_lo, ol_hi - bc_lo)
+
+    bc_classify = [
+        (
+            bc_range,
+            _classify(l_lo, l_hi, bc_range[0], bc_range[1]),
+            _classify(r_lo, r_hi, bc_range[0], bc_range[1]),
+        )
+        for bc_range in band_chunk_ranges
+    ]
+
+    @jax.jit
+    def _kernel(
+        psi_bc_G_tuple,
+        psi_l_rmuT_X_fit,
+        psi_r_rmuT_X_fit,
+        L_q,
+        norms_l,
+        norms_r,
+        r_start_dyn,
+    ):
+        # 1. Initialise pair-density accumulators for this r-chunk
+        P_l = jax.lax.with_sharding_constraint(
+            jnp.zeros((nk_tot, n_rmu, actual_n_rchunk), dtype=jnp.complex128),
+            P_sharding)
+        P_r = jax.lax.with_sharding_constraint(
+            jnp.zeros((nk_tot, n_rmu, actual_n_rchunk), dtype=jnp.complex128),
+            P_sharding)
+
+        # 2. Stream band-chunks: FFT + reshard + accumulate into P_l, P_r
+        for bc_idx, (bc_range, l_cls, r_cls) in enumerate(bc_classify):
+            bc_lo, bc_hi = bc_range
+            bc_size = bc_hi - bc_lo
+
+            psi_G_bc = psi_bc_G_tuple[bc_idx]
+            # Reuse production's FFT + reshard (both jit'd; the decorator
+            # inlines them into our outer jit at trace time).  r_start_dyn
+            # is a tracer scalar, r_chunk_size=actual_n_rchunk is static.
+            psi_bc_Y = get_sharded_wfns_rchunk_slice(
+                psi_G_bc, meta, r_start_dyn, actual_n_rchunk,
+                kvecs_frac, mesh_xy, bc_range)
+
+            # --- Left pair-density contribution ---
+            if l_cls[0] == 'direct':
+                lo, hi = l_cls[1]
+                psi_L_bc = psi_l_rmuT_X_fit[:, :, lo:hi, :]
+                norm_slice = norms_l[lo:hi]
+                psi_R_bc = psi_bc_Y / norm_slice[None, :, None, None]
+                P_l = accumulate_pair_density_spin_traced(
+                    P_l, psi_L_bc, psi_R_bc, mesh_xy)
+            elif l_cls[0] == 'pad':
+                centroid_lo, centroid_hi, dest_lo, dest_hi = l_cls[1]
+                psi_L_bc = jax.lax.with_sharding_constraint(
+                    jnp.zeros((nk_tot, n_rmu, bc_size, nspinor),
+                              dtype=jnp.complex128),
+                    L_slice_shard)
+                psi_L_bc = psi_L_bc.at[:, :, dest_lo:dest_hi, :].set(
+                    psi_l_rmuT_X_fit[:, :, centroid_lo:centroid_hi, :])
+                norm_bc = jnp.ones((bc_size,), dtype=jnp.float64)
+                norm_bc = norm_bc.at[dest_lo:dest_hi].set(
+                    norms_l[centroid_lo:centroid_hi])
+                psi_R_bc = psi_bc_Y / norm_bc[None, :, None, None]
+                P_l = accumulate_pair_density_spin_traced(
+                    P_l, psi_L_bc, psi_R_bc, mesh_xy)
+            # else 'skip': no L-contribution from this bc
+
+            # --- Right pair-density contribution ---
+            if r_cls[0] == 'direct':
+                lo, hi = r_cls[1]
+                psi_L_bc = psi_r_rmuT_X_fit[:, :, lo:hi, :]
+                norm_slice = norms_r[lo:hi]
+                psi_R_bc = psi_bc_Y / norm_slice[None, :, None, None]
+                P_r = accumulate_pair_density_spin_traced(
+                    P_r, psi_L_bc, psi_R_bc, mesh_xy)
+            elif r_cls[0] == 'pad':
+                centroid_lo, centroid_hi, dest_lo, dest_hi = r_cls[1]
+                psi_L_bc = jax.lax.with_sharding_constraint(
+                    jnp.zeros((nk_tot, n_rmu, bc_size, nspinor),
+                              dtype=jnp.complex128),
+                    L_slice_shard)
+                psi_L_bc = psi_L_bc.at[:, :, dest_lo:dest_hi, :].set(
+                    psi_r_rmuT_X_fit[:, :, centroid_lo:centroid_hi, :])
+                norm_bc = jnp.ones((bc_size,), dtype=jnp.float64)
+                norm_bc = norm_bc.at[dest_lo:dest_hi].set(
+                    norms_r[centroid_lo:centroid_hi])
+                psi_R_bc = psi_bc_Y / norm_bc[None, :, None, None]
+                P_r = accumulate_pair_density_spin_traced(
+                    P_r, psi_L_bc, psi_R_bc, mesh_xy)
+
+        # 3. ZCT + reshard + solve
+        Z_q = compute_ZCT_from_left_right_zchunk(P_l, P_r, kgrid, mesh_xy)
+        z_col_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
+        Z_col = jax.lax.with_sharding_constraint(Z_q, z_col_shard)
+        zeta = solve_zeta_from_L_q(L_q, Z_col, mesh_xy, q_chunk_size)
+        return zeta
+
+    return _kernel
+
+
+def fit_one_rchunk(
+    *,
+    psi_bc_G_tuple,
+    psi_l_rmuT_X_fit,
+    psi_r_rmuT_X_fit,
+    L_q,
+    norms_l,
+    norms_r,
+    r_start_dyn,
+    mesh_xy: Mesh,
+    meta: Meta,
+    band_chunk_ranges: tuple[tuple[int, int], ...],
+    band_range_left: tuple[int, int],
+    band_range_right: tuple[int, int],
+    band_range_full: tuple[int, int],
+    actual_n_rchunk: int,
+    q_chunk_size: int,
+    kvecs_frac: np.ndarray,
+):
+    """Entry point for the r-chunk body jit.  Caches one compiled kernel
+    per distinct static configuration."""
+    cache_key = (
+        id(mesh_xy),
+        actual_n_rchunk,
+        tuple(tuple(b) for b in band_chunk_ranges),
+        tuple(band_range_left), tuple(band_range_right),
+        tuple(band_range_full),
+        q_chunk_size,
+        meta.n_rmu, meta.nk_tot, meta.nspinor,
+        tuple(meta.fft_grid),
+        hash(kvecs_frac.tobytes()),
+    )
+    fn = _fit_one_rchunk_cache.get(cache_key)
+    if fn is None:
+        fn = _make_fit_one_rchunk_kernel(
+            mesh_xy, meta,
+            tuple(tuple(b) for b in band_chunk_ranges),
+            tuple(band_range_left),
+            tuple(band_range_right),
+            tuple(band_range_full),
+            actual_n_rchunk,
+            q_chunk_size,
+            hash(kvecs_frac.tobytes()),
+            kvecs_frac,
+        )
+        _fit_one_rchunk_cache[cache_key] = fn
+    return fn(
+        psi_bc_G_tuple,
+        psi_l_rmuT_X_fit,
+        psi_r_rmuT_X_fit,
+        L_q,
+        norms_l,
+        norms_r,
+        r_start_dyn,
+    )
+
+
 def fit_zeta_chunked_to_h5(
     wfn,
     sym,
@@ -773,7 +906,6 @@ def fit_zeta_chunked_to_h5(
     q_gather_size: int = 0,
     band_norms: np.ndarray | None = None,
     use_ffi_io: bool = False,
-    memory_mode: str = "auto",
 ):
     """
     Full zeta fitting pipeline with r-chunk loop and HDF5 output.
@@ -917,10 +1049,10 @@ def fit_zeta_chunked_to_h5(
 
     # ========== STEP 3: Compute L_q = chol(C_q) once ==========
     with timing.section("zeta_fit.cholesky"):
-        print(f"  Computing L_q = chol(C_q) [memory_mode={memory_mode}]")
-        L_q = compute_L_q_from_CCT(C_q_flat, mesh_xy, memory_mode=memory_mode)
+        print(f"  Computing L_q = chol(C_q)")
+        L_q = compute_L_q_from_CCT(C_q_flat, mesh_xy)
         L_q.block_until_ready()
-        print(f"  L_q: shape={L_q.shape}  mode={L_q.mode}")
+        print(f"  L_q: {L_q.shape}")
 
     # Free C_q to reclaim GPU memory before z-chunk loop
     # (P_k_mumu was already deleted above)
@@ -1095,19 +1227,18 @@ def fit_zeta_chunked_to_h5(
     # the N-1 equally sized r-chunks + the final remainder hit
     # exactly two compile-shape entries, with no new jit-wrapper
     # identity per r-chunk iter.
-    _P_sharding = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    _accum = accumulate_pair_density_spin_traced
-    _P_zeros_cache: dict = {}
-
-    def _zero_P(n_r: int):
-        fn = _P_zeros_cache.get(n_r)
-        if fn is None:
-            shape = (nk_tot, n_rmu, n_r)
-            fn = jax.jit(
-                lambda: jnp.zeros(shape, dtype=jnp.complex128),
-                out_shardings=_P_sharding)
-            _P_zeros_cache[n_r] = fn
-        return fn()
+    # Normalise band norms into jax arrays of the correct shape so the
+    # fit_one_rchunk jit always receives a (nb,) norms array.  When no
+    # pseudo-band weighting is in effect both are jnp.ones → no-op
+    # division inside the jit.
+    if band_norms is None:
+        norms_l_jax = jnp.ones((nb_left,), dtype=jnp.float64)
+        norms_r_jax = jnp.ones((nb_right,), dtype=jnp.float64)
+    else:
+        norms_l_jax = jnp.maximum(
+            jnp.asarray(band_norms[band_range_left[0]:band_range_left[1]]), 1.0)
+        norms_r_jax = jnp.maximum(
+            jnp.asarray(band_norms[band_range_right[0]:band_range_right[1]]), 1.0)
 
     with timing.section("zeta_fit.chunk_loop"):
         for chunk_idx in range(num_chunks):
@@ -1115,180 +1246,48 @@ def fit_zeta_chunked_to_h5(
             r_end = min(r_start + chunk_r, n_rtot)
             actual_n_rchunk = r_end - r_start
 
-            # 6ab. Stream band chunks of the r-chunk wfns and
-            # accumulate P_l / P_r incrementally.  At any moment only
-            # one band chunk's r-chunk shard is live (instead of the
-            # full-band-range tensor) — decouples the pair-density
-            # peak from the band count.  Chunks are uniform size
-            # ``band_chunk_size`` (N-1 of them) + one remainder, so
-            # the read/FFT pipeline and the pair-density einsum see
-            # exactly TWO compile shapes.  Chunks fully past an L/R
-            # endpoint skip the corresponding einsum; the one chunk
-            # that straddles an endpoint gets zero-padded on the L
-            # side so its einsum still dispatches at ``bc_size``.
-            P_l_k_mux = _zero_P(actual_n_rchunk)
-            P_r_k_mux = _zero_P(actual_n_rchunk)
+            # Collect G-space for every band-chunk into a tuple — the
+            # fit_one_rchunk jit consumes these as positional inputs.
+            # When caching is enabled, these are just lookups (device-
+            # resident arrays returned by load_gspace_for_bands).  Without
+            # caching, iter_psi_rchunk_bandwise reads from H5 per call;
+            # we'd need to refactor that path to feed fit_one_rchunk.
+            # For now, require cached_gspace for the jit path.
+            if cached_gspace is None:
+                raise NotImplementedError(
+                    "fit_one_rchunk requires cached_gspace for now; "
+                    "set use_gspace_cache=True.")
 
-            # Per-chunk L/R slicing.  For a chunk fully inside an L or
-            # R range, ``_slice_and_norm`` returns a direct view of the
-            # centroid tensor — no extra allocation, no padding, so
-            # the downstream einsum hits the same JIT cache entry as
-            # the N-1 full-size chunks.  For the at-most-one-per-
-            # endpoint straddle chunk, it zero-pads out-of-range
-            # bands into a fresh tensor so the einsum shape is still
-            # uniform ``bc_size``.  Compile cost: the hot einsum is
-            # TWO shapes ({B, remainder}); the zero-pad op compiles
-            # once per unique straddle geometry (≤ one per endpoint).
-            L_slice_shard = NamedSharding(
-                mesh_xy, P(None, 'x', None, None))
-
-            def _slice_and_norm(psi_fit, norms_fit, range_abs,
-                                bc_lo, bc_hi):
-                """Return (psi_L_bc, norm_bc) for this band chunk, both
-                zero/one-padded if the chunk straddles ``range_abs``.
-                ``psi_L_bc`` has shape ``(nk, nrmu, bc_hi-bc_lo, ns)``;
-                ``norm_bc`` has shape ``(bc_hi-bc_lo,)`` with 1.0
-                outside the overlap so dividing ``psi_bc_Y`` by it
-                leaves out-of-range bands unchanged (psi_L's zero
-                entries kill their contribution in the einsum
-                anyway).  Returns ``(None, None)`` when the chunk is
-                entirely outside ``range_abs``.
-                """
-                rs, re = range_abs
-                ol_lo = max(bc_lo, rs)
-                ol_hi = min(bc_hi, re)
-                if ol_hi <= ol_lo:
-                    return None, None
-                bc_size = bc_hi - bc_lo
-                # Fast path: chunk fully inside range, direct slice.
-                if ol_lo == bc_lo and ol_hi == bc_hi:
-                    psi_L_bc = psi_fit[:, :, (bc_lo - rs):(bc_hi - rs), :]
-                    norm_bc = (norms_fit[(bc_lo - rs):(bc_hi - rs)]
-                               if norms_fit is not None else None)
-                    return psi_L_bc, norm_bc
-                # Straddle: zero-pad psi_L and one-pad norm to bc_size.
-                ns = psi_fit.shape[-1]
-                psi_L_bc = jnp.zeros(
-                    (nk_tot, n_rmu, bc_size, ns),
-                    dtype=jnp.complex128)
-                psi_L_bc = jax.lax.with_sharding_constraint(
-                    psi_L_bc, L_slice_shard)
-                psi_L_bc = psi_L_bc.at[
-                    :, :, (ol_lo - bc_lo):(ol_hi - bc_lo), :].set(
-                    psi_fit[:, :, (ol_lo - rs):(ol_hi - rs), :])
-                if norms_fit is not None:
-                    norm_bc = jnp.ones((bc_size,), dtype=jnp.float64)
-                    norm_bc = norm_bc.at[
-                        (ol_lo - bc_lo):(ol_hi - bc_lo)].set(
-                        norms_fit[(ol_lo - rs):(ol_hi - rs)])
-                else:
-                    norm_bc = None
-                return psi_L_bc, norm_bc
-
-            norms_l_used = norms_l if band_norms is not None else None
-            norms_r_used = norms_r if band_norms is not None else None
+            psi_bc_G_tuple = tuple(
+                next(g for (g, bc) in cached_gspace if tuple(bc) == tuple(bc_range))
+                for bc_range in band_chunk_ranges
+            )
 
             t0 = time.perf_counter()
-            with timing.section("zeta_fit.chunk.load_and_pair_density"):
-                for bc_range, psi_bc_Y in iter_psi_rchunk_bandwise(
-                    wfn, sym, meta, mesh_xy, band_range_full,
-                    r_start, r_end, bispinor,
-                    band_chunk_size=band_chunk_size,
-                    k_chunk_size=k_chunk_size,
+            with timing.section("zeta_fit.chunk.fit_one_rchunk"), \
+                 jax_profile.step_annotation("chunk_fit", step_num=chunk_idx):
+                zeta_chunk = fit_one_rchunk(
+                    psi_bc_G_tuple=psi_bc_G_tuple,
+                    psi_l_rmuT_X_fit=psi_l_rmuT_X_fit,
+                    psi_r_rmuT_X_fit=psi_r_rmuT_X_fit,
+                    L_q=L_q,
+                    norms_l=norms_l_jax,
+                    norms_r=norms_r_jax,
+                    r_start_dyn=jnp.asarray(r_start, dtype=jnp.int32),
+                    mesh_xy=mesh_xy,
+                    meta=meta,
                     band_chunk_ranges=band_chunk_ranges,
-                    cached_gspace=cached_gspace, kvecs_frac=kvecs_frac,
-                ):
-                    bc_lo, bc_hi = bc_range
-
-                    # Left contribution
-                    psi_L_bc, norm_bc = _slice_and_norm(
-                        psi_l_rmuT_X_fit, norms_l_used,
-                        band_range_left, bc_lo, bc_hi)
-                    if psi_L_bc is not None:
-                        psi_R_bc = (psi_bc_Y / norm_bc[None, :, None, None]
-                                    if norm_bc is not None else psi_bc_Y)
-                        P_l_k_mux = _accum(P_l_k_mux, psi_L_bc, psi_R_bc, mesh_xy)
-
-                    # Right contribution
-                    psi_L_bc, norm_bc = _slice_and_norm(
-                        psi_r_rmuT_X_fit, norms_r_used,
-                        band_range_right, bc_lo, bc_hi)
-                    if psi_L_bc is not None:
-                        psi_R_bc = (psi_bc_Y / norm_bc[None, :, None, None]
-                                    if norm_bc is not None else psi_bc_Y)
-                        P_r_k_mux = _accum(P_r_k_mux, psi_L_bc, psi_R_bc, mesh_xy)
-
-                    del psi_bc_Y
-
-                P_l_k_mux.block_until_ready()
-                _track_peak()
-                # No block_until_ready on P_r — ZCT will consume it
-                # asynchronously.  P_l's block is needed to bound
-                # t_pair_total and to gate _track_peak.
-            # Load and pair-density are fused into one streaming loop
-            # now — accumulate the combined wall into t_pair_total.
-            # t_load_total stays at 0 so the two-column "load vs pair"
-            # breakdown below doesn't double-count; the end-of-run
-            # table prints pair-density as the merged total.
-            t_pair_total += time.perf_counter() - t0
-
-            # 6c. Compute Z_q via left/right cross-product FFT.
-            # P_l_k_mux / P_r_k_mux stay flat-k throughout — the 3-D k-grid
-            # only appears inside the FFT helper.  The ZCT kernels return
-            # flat-q (nq, μ, z-chunk) matching the input sharding.
-            t0 = time.perf_counter()
-            with timing.section("zeta_fit.chunk.ZCT"):
-                Z_q_flat = compute_ZCT_from_left_right_zchunk(
-                    P_l_k_mux, P_r_k_mux, kgrid, mesh_xy
+                    band_range_left=band_range_left,
+                    band_range_right=band_range_right,
+                    band_range_full=band_range_full,
+                    actual_n_rchunk=actual_n_rchunk,
+                    q_chunk_size=q_chunk_size,
+                    kvecs_frac=kvecs_frac,
                 )
-                # P_l/P_r are consumed by the ZCT jit (donate_argnums);
-                # no-op del for name-scope hygiene.
-                del P_l_k_mux, P_r_k_mux
-
-                Z_q_flat = jax.lax.with_sharding_constraint(Z_q_flat, flat_shard)
-                # No block_until_ready — reshard will consume Z_q_flat asynchronously.
-            t_zct_total += time.perf_counter() - t0
-
-            # q-loop.  Mode-dependent:
-            #   high_mem: Z_col P(None, None, ('x','y')) — μ-replicated for
-            #             the vmap local trsm.  Donated reshard (without
-            #             donation, SPMD hits Involuntary full
-            #             rematerialization going P(None,'x','y') →
-            #             P(None,None,('x','y')); at Si 4×4×4 60Ry
-            #             μ=2400 B_r=12672: 31.14 GB/dev → 15.57 GB/dev
-            #             with donation, 50 % reduction).
-            #   low_mem : no reshard — cuSOLVERMp's batched_potrs
-            #             consumes P(None,'x','y') directly.  Renames
-            #             Z_q_flat → Z_col for the `del Z_q_flat` below
-            #             to release the only reference.
-            if L_q.mode == "low_mem":
-                Z_col = Z_q_flat
-            else:
-                z_col_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
-
-                @partial(jax.jit, donate_argnums=(0,))
-                def _reshard_to_z_col(z):
-                    return jax.lax.with_sharding_constraint(z, z_col_shard)
-
-                Z_col = _reshard_to_z_col(Z_q_flat)
-            # block_until_ready only under LORRAX_MEM_PROFILE — outside
-            # that mode we want the next r-chunk's dispatch (wfn-load,
-            # pair density, Z-compute) to overlap with this chunk's solve,
-            # so we deliberately do not sync the host here.  `del Z_q_flat`
-            # just drops the Python ref; XLA keeps the buffer live until
-            # all consumers finish.
-            if _MEM_PROFILE:
-                Z_col.block_until_ready()
+                zeta_chunk.block_until_ready()
                 _track_peak()
-            del Z_q_flat
-            t0 = time.perf_counter()
-            with timing.section("zeta_fit.chunk.solve"), jax_profile.step_annotation("chunk_solve", step_num=chunk_idx):
-                zeta_chunk = solve_zeta_from_L_q(L_q, Z_col, mesh_xy, q_chunk_size)
-                if _MEM_PROFILE:
-                    zeta_chunk.block_until_ready()
-                    _track_peak()
-                del Z_col
-            t_solve_total += time.perf_counter() - t0
+            # Fused wall-clock: load + pair_density + ZCT + reshard + solve.
+            t_pair_total += time.perf_counter() - t0
 
             # 6e. Q-chunked allgather → host copy → async HDF5 write.
             # The allgather replicates zeta slices: per-device output is
