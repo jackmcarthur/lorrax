@@ -1,0 +1,26 @@
+{
+  "kernel": "fit_one_rchunk",
+  "feature_names": [
+    "Pacc",
+    "PrBc",
+    "psiBc",
+    "psiBcY",
+    "psi_cent",
+    "L_q",
+    "psiG_total"
+  ],
+  "coefs": [
+    0.0,
+    1.0339249949802596,
+    0.0,
+    0.0,
+    0.0,
+    5.022263850154462,
+    1.6540918431044513
+  ],
+  "intercept": 0.0,
+  "gamma": 0.51,
+  "residual_rms": 233410764.40693858,
+  "n_samples": 11,
+  "notes": "gamma calibrated at MoS2 3x3 nosym (n_b=80, chunk_r=46080): runtime nvidia-smi 3.06 GB / AOT predicted 6.00 GB = 0.510"
+}

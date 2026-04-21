@@ -85,59 +85,95 @@ def _nbc(sys, knobs):
 
 
 # ---------------------------------------------------------------------------
-# Primitives
+# Primitives — each one is the bytes of a SINGLE physical shard at a
+# distinct HLO allocation shape.  β_i from the NNLS fit then counts how
+# many concurrent instances of that shard XLA holds alive at peak (for
+# the small kernels like zct_lr this comes out as an integer like 4).
+#
+# Orthogonality requirements met by the DoE (`mos2_ortho` preset):
+#   * n_rmu axis at fixed n_r → separates T_centroid (∝ μ) from T_psiG (∝ r)
+#   * n_r axis via fft_grid sweep → separates T_psiG from T_centroid
+#     more directly (at fixed n_rmu, n_b, n_s, only T_psiG varies)
+#   * n_s axis (1 vs 2) → anything scaling in n_s pops out
+#   * kgrid axis → varies n_k (and n_q, collinear at Γ-centered q)
+#   * mesh asymmetry (2×2, 1×4, 4×1) → separates p_x-sharded from
+#     p_y-sharded from (p_x·p_y)-sharded
+#   * bc × cr cross terms → identify T_psiY ∝ bc·cr separately from
+#     T_pair ∝ cr (linear in bc at fixed cr is the break).
+#
+# Primitives known to be COLLINEAR at fixed total_devices (single node):
+#   * T_Lq_sharded and T_Lq_rep differ only by the 1/(p_x·p_y) factor.
+#     Any mesh with the same product keeps their ratio fixed, so NNLS
+#     can't split them on a 1-node DoE.  I keep both primitive names
+#     for physical clarity but expect β_Lq_sharded to absorb everything
+#     at β ≈ 1 + P (5 at P=4 if both are alive at the solve stage).
 # ---------------------------------------------------------------------------
 
-def _T_Pacc(sys, knobs, mesh):
-    """Two pair-density accumulators P_l, P_r: (n_k, n_rmu, B_r)/P."""
-    return (2.0 * _B * sys.n_k * sys.n_rmu * _Br(sys, knobs)
+def _T_pair(sys, knobs, mesh):
+    """One pair-density-shape shard: (n_k, n_rmu, chunk_r) on
+    P(None, 'x', 'y').  β counts concurrent instances at peak
+    (accumulators P_l, P_r; ZCT-stage temps; Z_q; zeta output).
+    Expected β ≈ 5–7."""
+    return (_B * sys.n_k * sys.n_rmu * _Br(sys, knobs)
             / (mesh.p_x * mesh.p_y))
 
 
-def _T_PrBc(sys, knobs, mesh):
-    """ZCT-stage buffer family: (4·n_k + n_q) · n_rmu · B_r / P.
-    Matches the zct_lr kernel primitive — 4 concurrent pair-sized temps
-    + 1 output.  Kept as a separate primitive for easy diagnosis."""
-    nq = sys.n_k  # for Γ-centered k = q grids; safe conservative proxy
-    return (_B * (4.0 * sys.n_k + nq) * sys.n_rmu * _Br(sys, knobs)
+def _T_psiG_cache(sys, knobs, mesh):
+    """Full G-space cache (all nbc band chunks alive): (n_k, n_b,
+    n_s, n_r) / (p_x·p_y).  β counts how many full caches coexist —
+    typically 1 since the tuple is passed as jit input.  Held constant
+    throughout the fit until Phase 1b's phdf5-on-demand wins."""
+    n_r = sys.n_r or (sys.fft_shape[0] * sys.fft_shape[1] * sys.fft_shape[2])
+    return (_B * sys.n_k * sys.n_b * sys.n_s * n_r
             / (mesh.p_x * mesh.p_y))
 
 
-def _T_psiBc(sys, knobs, mesh):
-    """Per-bc FFT output: (n_k, bc_size, n_s, n_r) / P.  Peak inside
-    the streaming loop, superseded bc-by-bc but alive during accumulate."""
+def _T_psiG_bc(sys, knobs, mesh):
+    """Per-bc G-space slice: (n_k, bc, n_s, n_r) / (p_x·p_y) — one
+    instance alive at a time during the streaming bc-loop.  β captures
+    the transient FFT workspace (input + output + cuFFT scratch — may
+    show β ≈ 2–3)."""
     n_r = sys.n_r or (sys.fft_shape[0] * sys.fft_shape[1] * sys.fft_shape[2])
     return (_B * sys.n_k * _bc(sys, knobs) * sys.n_s * n_r
             / (mesh.p_x * mesh.p_y))
 
 
-def _T_psiBcY(sys, knobs, mesh):
-    """Per-bc reshard output: (n_k, bc_size, n_s, B_r) / p_y."""
+def _T_psiY_bc(sys, knobs, mesh):
+    """Per-bc r-chunk slab after reshard: (n_k, bc, n_s, chunk_r) /
+    p_y (Y-sharded only).  β counts instances alive during the
+    streaming bc-loop — expected 1 if streaming works.  Scales with
+    chunk_r·bc so it's the most restrictive knob interaction."""
     return (_B * sys.n_k * _bc(sys, knobs) * sys.n_s * _Br(sys, knobs)
             / mesh.p_y)
 
 
-def _T_psi_centroid(sys, knobs, mesh):
-    """Centroid copies psi_l_rmuT_X_fit + psi_r_rmuT_X_fit:
-    (n_k, n_rmu, n_b, n_s) / p_x — always alive through the bc loop."""
+def _T_centroid(sys, knobs, mesh):
+    """One X-sharded centroid copy: (n_k, n_rmu, n_b, n_s) / p_x.
+    β counts instances — expected 2 (psi_l_rmuT_X + psi_r_rmuT_X;
+    both are jit arguments so argument_size counts them both)."""
     return (_B * sys.n_k * sys.n_rmu * sys.n_b * sys.n_s
             / mesh.p_x)
 
 
-def _T_L_q(sys, knobs, mesh):
-    """L_q Cholesky factor: (n_q, n_rmu, n_rmu) / (p_x·p_y).  Always alive."""
-    nq = sys.n_k
-    return _B * nq * sys.n_rmu * sys.n_rmu / (mesh.p_x * mesh.p_y)
+def _T_Lq_sharded(sys, knobs, mesh):
+    """XY-sharded Cholesky factor: (n_q, n_rmu, n_rmu) / (p_x·p_y).
+    β counts persistent instances (typically 1 = just L_q as input).
+    NOTE: at fixed total_devices this is collinear with T_Lq_rep —
+    NNLS will lump them together (expected β ≈ 5 at P=4 if both
+    sharded + replicated L are alive during solve)."""
+    return _B * sys.n_k * sys.n_rmu * sys.n_rmu / (mesh.p_x * mesh.p_y)
 
 
-def _T_psiG_total(sys, knobs, mesh):
-    """Total psi_G cache across all band chunks:
-    (n_k · n_b · n_s · n_r) / (p_x · p_y).  Natively 6D in production
-    but same byte volume.  Alive throughout the fit (Phase 1b will move
-    this host-resident → exclude from peak)."""
-    n_r = sys.n_r or (sys.fft_shape[0] * sys.fft_shape[1] * sys.fft_shape[2])
-    return (_B * sys.n_k * sys.n_b * sys.n_s * n_r
-            / (mesh.p_x * mesh.p_y))
+def _T_Lq_rep(sys, knobs, mesh):
+    """Fully replicated L: (n_q, n_rmu, n_rmu) — no mesh division.
+    β counts instances during the replicated solve stage (expected 1).
+    Collinear with T_Lq_sharded at fixed total_devices; see above."""
+    return _B * sys.n_k * sys.n_rmu * sys.n_rmu
+
+
+# Dropped: T_zcol (identical bytes to T_pair — NNLS can't separate
+# them on any DoE with fixed total_devices).  Z_col instances fold
+# into T_pair's β count.
 
 
 # ---------------------------------------------------------------------------
@@ -209,13 +245,13 @@ class FitOneRChunkKernel(AotKernel):
     SYSTEM_DIMS = ("n_k", "n_rmu", "n_s", "n_b", "n_r", "kgrid")
     KNOBS = ("chunk_r", "band_chunk")
     PRIMITIVES = {
-        "Pacc":       _T_Pacc,
-        "PrBc":       _T_PrBc,
-        "psiBc":      _T_psiBc,
-        "psiBcY":     _T_psiBcY,
-        "psi_cent":   _T_psi_centroid,
-        "L_q":        _T_L_q,
-        "psiG_total": _T_psiG_total,
+        "pair":       _T_pair,
+        "psiG_cache": _T_psiG_cache,
+        "psiG_bc":    _T_psiG_bc,
+        "psiY_bc":    _T_psiY_bc,
+        "centroid":   _T_centroid,
+        "Lq_sharded": _T_Lq_sharded,
+        "Lq_rep":     _T_Lq_rep,
     }
     # Scaling class of each primitive in (chunk_r, bc) — the analytic
     # chooser groups β_i·T_i into (α₀, α_cr, α_bc, α_crbc) and inverts
@@ -225,13 +261,13 @@ class FitOneRChunkKernel(AotKernel):
     #   "bc"      : T_i is linear in bc only.
     #   "crbc"    : T_i scales like chunk_r·bc.
     PRIMITIVE_CLASSES = {
-        "Pacc":       "cr",
-        "PrBc":       "cr",
-        "psiBc":      "bc",
-        "psiBcY":     "crbc",
-        "psi_cent":   "const",
-        "L_q":        "const",
-        "psiG_total": "const",
+        "pair":       "cr",
+        "psiG_cache": "const",
+        "psiG_bc":    "bc",
+        "psiY_bc":    "crbc",
+        "centroid":   "const",
+        "Lq_sharded": "const",
+        "Lq_rep":     "const",
     }
     # Cost-side primitives — distinct from memory primitives because
     # FLOPs count != bytes-per-device.  See _F_* helpers above.

@@ -289,6 +289,83 @@ def points_load_psi_rchunk_reshard(preset: str):
 
 def points_fit_one_rchunk(preset: str):
     """Driver-level r-chunk-body AOT DoE."""
+    if preset == "mos2_ortho":
+        # Orthogonal DoE for the post-cleanup primitives — every primitive
+        # varies independently on at least one axis so NNLS β's come out
+        # as the small-integer counts seen in the zct_lr / cct_lr fits
+        # rather than the 1.65 / 5.02 dumps my first DoE produced.
+        #
+        # Axes that each primitive is identifiable on:
+        #   T_pair       ∝ n_k·n_rmu·cr/P       — cr axis, n_rmu axis, kgrid axis
+        #   T_psiG_cache ∝ n_k·n_b·n_s·n_r/P    — n_b, n_r (via fft_grid), n_s
+        #   T_psiG_bc    ∝ n_k·bc·n_s·n_r/P     — bc axis at fixed n_b
+        #   T_psiY_bc    ∝ n_k·bc·n_s·cr/p_y    — bc·cr cross, mesh asymmetry
+        #   T_centroid   ∝ n_k·n_rmu·n_b·n_s/p_x — n_rmu at fixed n_r, mesh
+        #   T_Lq_*       ∝ n_q·n_rmu²/P or /1   — n_rmu quadratic (vs linear)
+        base = SysDims(
+            kgrid=(3, 3, 1), fft_grid=(80, 72, 8),
+            n_rmu=320, n_s=1, n_b=40, n_r=80 * 72 * 8,
+        )
+        kn0 = Knobs.of(chunk_r=10000, band_chunk=20)
+        mesh0 = MeshSpec(2, 2)
+
+        pts = [(base, kn0, mesh0)]  # baseline
+
+        def P(s=None, k=None, m=None):
+            return (s if s is not None else base,
+                    k if k is not None else kn0,
+                    m if m is not None else mesh0)
+
+        # One-at-a-time axis sweeps
+        pts += [  # n_rmu
+            P(replace(base, n_rmu=160)),
+            P(replace(base, n_rmu=640)),
+        ]
+        pts += [  # n_b (40 baseline)
+            P(replace(base, n_b=20)),
+            P(replace(base, n_b=80)),
+        ]
+        pts += [  # n_s (1 baseline)
+            P(replace(base, n_s=2)),
+        ]
+        pts += [  # chunk_r
+            P(k=Knobs.of(chunk_r=5000, band_chunk=20)),
+            P(k=Knobs.of(chunk_r=46080, band_chunk=20)),
+        ]
+        pts += [  # band_chunk
+            P(k=Knobs.of(chunk_r=10000, band_chunk=8)),
+            P(k=Knobs.of(chunk_r=10000, band_chunk=40)),
+        ]
+        pts += [  # kgrid → varies n_k (n_q collinear)
+            P(replace(base, kgrid=(2, 2, 1))),
+            P(replace(base, kgrid=(4, 4, 1))),
+        ]
+        pts += [  # mesh asymmetry at fixed total_devices=4
+            P(m=MeshSpec(1, 4)),
+            P(m=MeshSpec(4, 1)),
+        ]
+        pts += [  # fft_grid → varies n_r at fixed n_rmu; breaks
+                 # psiG_cache vs centroid collinearity cleanly
+            P(replace(base, fft_grid=(40, 72, 8), n_r=40 * 72 * 8)),
+            P(replace(base, fft_grid=(80, 72, 16), n_r=80 * 72 * 16)),
+        ]
+
+        # Cross-terms — probe product-only interactions that might
+        # escape the one-at-a-time sweep
+        pts += [
+            # big n_rmu × big cr: stresses T_pair identification
+            P(replace(base, n_rmu=640),
+              Knobs.of(chunk_r=46080, band_chunk=20)),
+            # bc × cr: identifies T_psiY_bc
+            P(k=Knobs.of(chunk_r=46080, band_chunk=40)),
+            P(k=Knobs.of(chunk_r=5000, band_chunk=8)),
+            # n_s × n_b: scales anything with n_s·n_b jointly
+            P(replace(base, n_s=2, n_b=80)),
+            # mesh × n_rmu: stresses centroid mesh dependence
+            P(replace(base, n_rmu=640), m=MeshSpec(4, 1)),
+        ]
+        return pts
+
     if preset == "mos2_3x3":
         # Realistic per-r-chunk shape at MoS2 3×3.  fft_grid=(80,72,8)
         # → n_r=46080 matching the production smoke test.  Those axes are

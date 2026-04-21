@@ -1218,15 +1218,14 @@ def fit_zeta_chunked_to_h5(
     # This is the number that determines whether you OOM: it includes JIT caches and
     # prior-stage allocations, not just the chunk loop arrays.
     # GPU high-water tracker.  The JAX CUDA PJRT on this stack returns
-    # None from ``memory_stats()``, so we fall back to nvidia-smi per
-    # r-chunk.  ``CUDA_VISIBLE_DEVICES`` pins this rank to exactly one
-    # GPU (LORRAX's standard layout), so --id=0 queries the right one.
+    # None from ``memory_stats()``, so we fall back to a single
+    # nvidia-smi sample at the end of the chunk loop.  Sampled once
+    # (not per-chunk) because concurrent nvidia-smi from all 4 ranks
+    # inside the Shifter container has been observed to hang on some
+    # Perlmutter node types.
     _peak_bytes = 0
-    _nvsmi_fail = [False]
     def _track_peak():
         nonlocal _peak_bytes
-        if _nvsmi_fail[0]:
-            return
         try:
             import subprocess
             out = subprocess.check_output(
@@ -1236,7 +1235,7 @@ def fit_zeta_chunked_to_h5(
             mb = int(out.splitlines()[0])
             _peak_bytes = max(_peak_bytes, mb * (1024 ** 2))
         except Exception:
-            _nvsmi_fail[0] = True
+            pass  # leave _peak_bytes = 0; caller suppresses the print
 
     from common.progress import LoopProgress
     r_progress = LoopProgress(
@@ -1278,7 +1277,6 @@ def fit_zeta_chunked_to_h5(
                     kvecs_frac=kvecs_frac,
                 )
                 zeta_chunk.block_until_ready()
-                _track_peak()  # read high-water AFTER the jit settles
             # Under phdf5-on-demand, drop the per-r-chunk G-space tuple
             # so nothing accumulates between iterations.  Under the
             # device-cache path this is a no-op (tuple entries alias
@@ -1356,6 +1354,10 @@ def fit_zeta_chunked_to_h5(
 
     t_chunks_total = time.perf_counter() - t_chunk_start
     r_progress.finish()
+    # Sample GPU memory ONCE after the last chunk's jit settles.  The
+    # allocator keeps the peak reservation so this reads close to the
+    # all-time high water.
+    _track_peak()
 
     # Drain the rank-0 writer queue (allgather backend only; FFI path
     # writes are already fully flushed by the synchronous SlabIO calls).

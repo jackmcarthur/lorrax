@@ -19,8 +19,8 @@
     0.8603517612314369
   ],
   "intercept": 0.0,
-  "gamma": 0.652,
+  "gamma": 1.0,
   "residual_rms": 22402986.89874855,
   "n_samples": 21,
-  "notes": "ortho DoE (21 samples): \u03b2[pair]=4.0, \u03b2[psiG_cache]=1.1, \u03b2[Lq_rep]=0.9, \u03b2[centroid]=17.4 residual-absorber. RMS 22MB. \u03b3=0.652 measured at MoS2 3\u00d73 (AOT 4.70GB vs runtime nvidia-smi 3.06GB)."
+  "notes": ""
 }
