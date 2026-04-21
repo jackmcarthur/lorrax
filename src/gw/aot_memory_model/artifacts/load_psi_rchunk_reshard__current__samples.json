@@ -16,22 +16,23 @@
       "n_k": 64
     },
     "knobs": {
+      "band_chunk": 32,
       "chunk_r": 3456,
-      "nb_pad": 296
+      "k_chunk": 64
     },
     "mesh": {
       "p_x": 2,
       "p_y": 2
     },
     "meas": {
-      "temp": 1047527808,
-      "argument": 523763712,
-      "output": 1047527424,
+      "temp": 113246592,
+      "argument": 56623104,
+      "output": 113246208,
       "alias": 0,
-      "total": 2618818944,
+      "total": 283115904,
       "flops": null,
-      "t_lower_s": 0.13465164904482663,
-      "t_compile_s": 0.43745611200574785
+      "t_lower_s": 0.10946766298729926,
+      "t_compile_s": 0.4266318440204486
     }
   },
   {
@@ -51,22 +52,131 @@
       "n_k": 64
     },
     "knobs": {
+      "band_chunk": 16,
+      "chunk_r": 3456,
+      "k_chunk": 64
+    },
+    "mesh": {
+      "p_x": 2,
+      "p_y": 2
+    },
+    "meas": {
+      "temp": 56623488,
+      "argument": 28311552,
+      "output": 56623104,
+      "alias": 0,
+      "total": 141558144,
+      "flops": null,
+      "t_lower_s": 0.0031286660814657807,
+      "t_compile_s": 0.06628999789245427
+    }
+  },
+  {
+    "sys": {
+      "kgrid": [
+        4,
+        4,
+        4
+      ],
+      "n_rmu": 0,
+      "n_s": 2,
+      "nspinor": 1,
+      "n_b_v": 0,
+      "n_b_c": 0,
+      "n_b": 296,
+      "n_r": 13824,
+      "n_k": 64
+    },
+    "knobs": {
+      "band_chunk": 32,
+      "chunk_r": 3456,
+      "k_chunk": 32
+    },
+    "mesh": {
+      "p_x": 2,
+      "p_y": 2
+    },
+    "meas": {
+      "temp": 56623488,
+      "argument": 28311552,
+      "output": 56623104,
+      "alias": 0,
+      "total": 141558144,
+      "flops": null,
+      "t_lower_s": 0.0028612499590963125,
+      "t_compile_s": 0.059808201040141284
+    }
+  },
+  {
+    "sys": {
+      "kgrid": [
+        4,
+        4,
+        4
+      ],
+      "n_rmu": 0,
+      "n_s": 2,
+      "nspinor": 1,
+      "n_b_v": 0,
+      "n_b_c": 0,
+      "n_b": 296,
+      "n_r": 13824,
+      "n_k": 64
+    },
+    "knobs": {
+      "band_chunk": 32,
+      "chunk_r": 3456,
+      "k_chunk": 16
+    },
+    "mesh": {
+      "p_x": 2,
+      "p_y": 2
+    },
+    "meas": {
+      "temp": 28311936,
+      "argument": 14155776,
+      "output": 28311552,
+      "alias": 0,
+      "total": 70779264,
+      "flops": null,
+      "t_lower_s": 0.0029286990175023675,
+      "t_compile_s": 0.06769495294429362
+    }
+  },
+  {
+    "sys": {
+      "kgrid": [
+        4,
+        4,
+        4
+      ],
+      "n_rmu": 0,
+      "n_s": 2,
+      "nspinor": 1,
+      "n_b_v": 0,
+      "n_b_c": 0,
+      "n_b": 296,
+      "n_r": 13824,
+      "n_k": 64
+    },
+    "knobs": {
+      "band_chunk": 32,
       "chunk_r": 1728,
-      "nb_pad": 296
+      "k_chunk": 64
     },
     "mesh": {
       "p_x": 2,
       "p_y": 2
     },
     "meas": {
-      "temp": 523764096,
-      "argument": 261881856,
-      "output": 523763712,
+      "temp": 56623488,
+      "argument": 28311552,
+      "output": 56623104,
       "alias": 0,
-      "total": 1309409664,
+      "total": 141558144,
       "flops": null,
-      "t_lower_s": 0.0030255370074883103,
-      "t_compile_s": 0.08441539900377393
+      "t_lower_s": 0.0028209310257807374,
+      "t_compile_s": 0.059965736931189895
     }
   },
   {
@@ -86,92 +196,23 @@
       "n_k": 64
     },
     "knobs": {
+      "band_chunk": 32,
       "chunk_r": 6912,
-      "nb_pad": 296
+      "k_chunk": 64
     },
     "mesh": {
       "p_x": 2,
       "p_y": 2
     },
     "meas": {
-      "temp": 2095055232,
-      "argument": 1047527424,
-      "output": 2095054848,
+      "temp": 226492800,
+      "argument": 113246208,
+      "output": 226492416,
       "alias": 0,
-      "total": 5237637504,
+      "total": 566231424,
       "flops": null,
-      "t_lower_s": 0.0027608750388026237,
-      "t_compile_s": 0.0586457799654454
-    }
-  },
-  {
-    "sys": {
-      "kgrid": [
-        4,
-        4,
-        4
-      ],
-      "n_rmu": 0,
-      "n_s": 2,
-      "nspinor": 1,
-      "n_b_v": 0,
-      "n_b_c": 0,
-      "n_b": 148,
-      "n_r": 13824,
-      "n_k": 64
-    },
-    "knobs": {
-      "chunk_r": 3456,
-      "nb_pad": 148
-    },
-    "mesh": {
-      "p_x": 2,
-      "p_y": 2
-    },
-    "meas": {
-      "temp": 523764096,
-      "argument": 261881856,
-      "output": 523763712,
-      "alias": 0,
-      "total": 1309409664,
-      "flops": null,
-      "t_lower_s": 0.0027572879334911704,
-      "t_compile_s": 0.0594703140668571
-    }
-  },
-  {
-    "sys": {
-      "kgrid": [
-        2,
-        2,
-        2
-      ],
-      "n_rmu": 0,
-      "n_s": 2,
-      "nspinor": 1,
-      "n_b_v": 0,
-      "n_b_c": 0,
-      "n_b": 296,
-      "n_r": 13824,
-      "n_k": 8
-    },
-    "knobs": {
-      "chunk_r": 3456,
-      "nb_pad": 296
-    },
-    "mesh": {
-      "p_x": 2,
-      "p_y": 2
-    },
-    "meas": {
-      "temp": 130941312,
-      "argument": 65470464,
-      "output": 130940928,
-      "alias": 0,
-      "total": 327352704,
-      "flops": null,
-      "t_lower_s": 0.002745114965364337,
-      "t_compile_s": 0.05898758105468005
+      "t_lower_s": 0.0028154300525784492,
+      "t_compile_s": 0.0594346399884671
     }
   },
   {
@@ -191,22 +232,23 @@
       "n_k": 64
     },
     "knobs": {
+      "band_chunk": 32,
       "chunk_r": 3456,
-      "nb_pad": 296
+      "k_chunk": 64
     },
     "mesh": {
       "p_x": 2,
       "p_y": 2
     },
     "meas": {
-      "temp": 523764096,
-      "argument": 261881856,
-      "output": 523763712,
+      "temp": 56623488,
+      "argument": 28311552,
+      "output": 56623104,
       "alias": 0,
-      "total": 1309409664,
+      "total": 141558144,
       "flops": null,
-      "t_lower_s": 0.0027329609729349613,
-      "t_compile_s": 0.06603012001141906
+      "t_lower_s": 0.0028146490221843123,
+      "t_compile_s": 0.05713973508682102
     }
   },
   {
@@ -226,22 +268,23 @@
       "n_k": 64
     },
     "knobs": {
+      "band_chunk": 32,
       "chunk_r": 3456,
-      "nb_pad": 296
+      "k_chunk": 64
     },
     "mesh": {
       "p_x": 1,
       "p_y": 4
     },
     "meas": {
-      "temp": 523763968,
-      "argument": 523763712,
-      "output": 523763712,
+      "temp": 56623360,
+      "argument": 56623104,
+      "output": 56623104,
       "alias": 0,
-      "total": 1571291392,
+      "total": 169869568,
       "flops": null,
-      "t_lower_s": 0.0028154599713161588,
-      "t_compile_s": 0.055890887044370174
+      "t_lower_s": 0.003031859057955444,
+      "t_compile_s": 0.05344528693240136
     }
   },
   {
@@ -261,22 +304,23 @@
       "n_k": 64
     },
     "knobs": {
+      "band_chunk": 32,
       "chunk_r": 3456,
-      "nb_pad": 296
+      "k_chunk": 64
     },
     "mesh": {
       "p_x": 4,
       "p_y": 1
     },
     "meas": {
-      "temp": 2095054976,
-      "argument": 523763712,
-      "output": 2095054848,
+      "temp": 226492544,
+      "argument": 56623104,
+      "output": 226492416,
       "alias": 0,
-      "total": 4713873536,
+      "total": 509608064,
       "flops": null,
-      "t_lower_s": 0.0029394900193437934,
-      "t_compile_s": 0.04872590093873441
+      "t_lower_s": 0.0028557779733091593,
+      "t_compile_s": 0.05406768003012985
     }
   }
 ]

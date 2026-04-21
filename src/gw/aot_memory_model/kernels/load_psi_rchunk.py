@@ -40,31 +40,58 @@ from ..core import AotKernel, Knobs, MeshSpec, SysDims, register_kernel
 _B = 16.0
 
 
+def _k(sys, knobs):
+    """Effective k-count per jit invocation.  When the caller sets
+    ``k_chunk``, the iter_psi_rchunk_bandwise loop processes that many
+    k-points per FFT/reshard call (not the full ``sys.n_k``).  The
+    clamp to ``sys.n_k`` keeps callers safe when k_chunk=0 / unset
+    (meaning "all k-points at once")."""
+    k = knobs.get("k_chunk", 0)
+    return sys.n_k if (k is None or k <= 0 or k >= sys.n_k) else int(k)
+
+
+def _b(sys, knobs):
+    """Effective band count per jit invocation.  ``band_chunk`` = the
+    number of bands handed to a single FFT call (padded up to ``nb_pad``
+    divisible by P in production; we use nb_pad if provided, else
+    band_chunk itself, else sys.n_b)."""
+    nb_pad = knobs.get("nb_pad", None)
+    if nb_pad is not None and nb_pad > 0:
+        return int(nb_pad)
+    b = knobs.get("band_chunk", 0)
+    return sys.n_b if (b is None or b <= 0 or b >= sys.n_b) else int(b)
+
+
 # ---------------------------------------------------------------------------
-# Primitives
+# Primitives  —  all scale with effective (k_chunk × band_chunk),
+# NOT full sys.n_k × sys.n_b, so the fit tracks production correctly.
 # ---------------------------------------------------------------------------
 
 def _T_fft_full(sys, knobs, mesh):
-    """FFT workspace shard: (nk, nb_pad, n_s, n_rtot) on XY bands."""
-    return (_B * sys.n_k * knobs.get("nb_pad", sys.n_b)
+    """FFT workspace shard: (k_chunk, band_chunk, n_s, n_rtot) / (p_x·p_y)."""
+    return (_B * _k(sys, knobs) * _b(sys, knobs)
             * sys.n_s * sys.n_r / (mesh.p_x * mesh.p_y))
 
 def _T_psi_G(sys, knobs, mesh):
-    """Input G-space shard: (nk, nb_pad, n_s, n_gmax).  n_gmax ≈ n_r / 8
-    but we use n_r as upper bound; fit coefficient absorbs the ratio."""
-    return (_B * sys.n_k * knobs.get("nb_pad", sys.n_b)
+    """Input G-space shard: (k_chunk, band_chunk, n_s, n_gmax).  n_gmax ≈
+    n_r / 4–8 (ecut-bounded) but we pass n_r as upper bound; fit
+    coefficient absorbs the ratio.  Collinear with T_fft_full at this
+    primitive level — NNLS will put all weight on one of them."""
+    return (_B * _k(sys, knobs) * _b(sys, knobs)
             * sys.n_s * sys.n_r / (mesh.p_x * mesh.p_y))
 
 def _T_rchunk_xy(sys, knobs, mesh):
-    """r-chunk band-sharded: (nk, nb_pad, n_s, chunk_r) / (p_x·p_y)."""
-    return (_B * sys.n_k * knobs.get("nb_pad", sys.n_b)
+    """r-chunk band-sharded output: (k_chunk, band_chunk, n_s, chunk_r)
+    / (p_x·p_y)."""
+    return (_B * _k(sys, knobs) * _b(sys, knobs)
             * sys.n_s * knobs.get("chunk_r", sys.n_r)
             / (mesh.p_x * mesh.p_y))
 
 def _T_rchunk_y(sys, knobs, mesh):
-    """r-chunk y-only: (nk, nb_pad, n_s, chunk_r) / p_y.  Pre-all-to-all
-    intermediate AND final output size (equal total per-device)."""
-    return (_B * sys.n_k * knobs.get("nb_pad", sys.n_b)
+    """r-chunk y-only intermediate: (k_chunk, band_chunk, n_s, chunk_r) /
+    p_y.  Stage buffer in the reshard (all_to_all-y output + final Y
+    output — same per-device size, different sharding)."""
+    return (_B * _k(sys, knobs) * _b(sys, knobs)
             * sys.n_s * knobs.get("chunk_r", sys.n_r) / mesh.p_y)
 
 
@@ -74,10 +101,19 @@ def _T_rchunk_y(sys, knobs, mesh):
 
 @register_kernel
 class LoadPsiRchunkFftKernel(AotKernel):
-    """_fft_and_rslice: IFFT + phase + r-slice, band-sharded output."""
+    """_fft_and_rslice: IFFT + phase + r-slice, band-sharded output.
+
+    Knob contract matching production's per-jit invocation:
+      * ``k_chunk``: bands a single jit call processes (default = sys.n_k).
+        When the outer ``iter_psi_rchunk_bandwise`` loop k-chunks, each
+        call to _fft_and_rslice sees only ``k_chunk`` k-points.
+      * ``nb_pad`` or ``band_chunk``: bands per jit call, padded up to P
+        for clean band-sharding.  ``nb_pad`` overrides ``band_chunk``.
+      * ``chunk_r``: real-space slice width output (number of r-indices).
+    """
     name = "load_psi_rchunk_fft"
     SYSTEM_DIMS = ("n_k", "n_b", "n_s", "kgrid", "n_r")
-    KNOBS = ("chunk_r", "nb_pad")
+    KNOBS = ("k_chunk", "band_chunk", "nb_pad", "chunk_r")
     PRIMITIVES = {
         "psi_G":     _T_psi_G,
         "fft_full":  _T_fft_full,
@@ -85,17 +121,21 @@ class LoadPsiRchunkFftKernel(AotKernel):
     }
 
     def build_specs(self, sys, knobs, mesh):
-        nk, nb, ns = sys.n_k, knobs.get("nb_pad", sys.n_b), sys.n_s
+        nk = _k(sys, knobs)
+        nb = _b(sys, knobs)
+        ns = sys.n_s
         nx, ny, nz = sys.kgrid
         n_r = nx * ny * nz
         sh = NamedSharding(mesh, P(None, ("x", "y"), None, None))
-        # We use n_r for n_gmax (upper bound; real ecut gives smaller).
+        # Using n_r as the G-space dim (upper bound of n_gmax).
         return (
             jax.ShapeDtypeStruct((nk, nb, ns, n_r), jnp.complex128, sharding=sh),
         )
 
     def build_callable(self, sys, knobs, mesh):
         from common.fft_helpers import make_jittable_local_ifftn_3d
+        nk = _k(sys, knobs)
+        nb = _b(sys, knobs)
         nx, ny, nz = sys.kgrid
         n_rtot = nx * ny * nz
         chunk_r = knobs.get("chunk_r", n_rtot)
@@ -108,18 +148,14 @@ class LoadPsiRchunkFftKernel(AotKernel):
         )
 
         band_shard = P(None, ("x", "y"), None, None)
-
-        # Fake replicated phase data — AOT only cares about shapes.
-        kvecs_cached = jnp.zeros((sys.n_k, 3), dtype=jnp.float64)
+        kvecs_cached = jnp.zeros((nk, 3), dtype=jnp.float64)
         fx = jnp.arange(nx, dtype=jnp.float64)[None, :, None, None] / nx
         fy = jnp.arange(ny, dtype=jnp.float64)[None, None, :, None] / ny
         fz = jnp.arange(nz, dtype=jnp.float64)[None, None, None, :] / nz
 
         @jax.jit
         def _fft_and_rslice(psi_G):
-            # FFT to real space.  Input reshapes (nk, nb, ns, nx*ny*nz)
-            # to (nk, nb, ns, nx, ny, nz) for the 3-D FFT axes.
-            psi_G_6d = psi_G.reshape(sys.n_k, psi_G.shape[1], sys.n_s, nx, ny, nz)
+            psi_G_6d = psi_G.reshape(nk, psi_G.shape[1], sys.n_s, nx, ny, nz)
             psi_r = local_ifftn(psi_G_6d)
             phase = jnp.exp(
                 2j * jnp.pi * (
@@ -131,7 +167,7 @@ class LoadPsiRchunkFftKernel(AotKernel):
             psi_r = psi_r * phase[:, None, None, :, :, :]
             psi_r = psi_r * jnp.sqrt(float(n_rtot))
             nb_padded = psi_r.shape[1]
-            psi_flat = psi_r.reshape(sys.n_k, nb_padded, sys.n_s, n_rtot)
+            psi_flat = psi_r.reshape(nk, nb_padded, sys.n_s, n_rtot)
 
             def _local_rslice(psi_local, r_start_arr):
                 return jax.lax.dynamic_slice_in_dim(
@@ -159,14 +195,16 @@ class LoadPsiRchunkReshardKernel(AotKernel):
     """
     name = "load_psi_rchunk_reshard"
     SYSTEM_DIMS = ("n_k", "n_b", "n_s")
-    KNOBS = ("chunk_r", "nb_pad")
+    KNOBS = ("k_chunk", "band_chunk", "nb_pad", "chunk_r")
     PRIMITIVES = {
         "rchunk_xy": _T_rchunk_xy,
         "rchunk_y":  _T_rchunk_y,
     }
 
     def build_specs(self, sys, knobs, mesh):
-        nk, nb, ns = sys.n_k, knobs.get("nb_pad", sys.n_b), sys.n_s
+        nk = _k(sys, knobs)
+        nb = _b(sys, knobs)
+        ns = sys.n_s
         Br = knobs.get("chunk_r", sys.n_r)
         sh_xy = NamedSharding(mesh, P(None, ("x", "y"), None, None))
         return (

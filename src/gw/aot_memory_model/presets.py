@@ -219,23 +219,35 @@ def points_sigma_kij(preset: str):
 # ---------------------------------------------------------------------------
 
 def points_load_psi_rchunk_fft(preset: str):
-    # FFT grid here is kgrid (we repurpose SysDims.kgrid as the real-space
-    # FFT grid; n_r := prod(kgrid)).  Typical Si 4x4x4 60 Ry fft_grid is
-    # (24, 24, 24) but we go smaller for reasonable compile wall.
+    # FFT grid is kgrid here (we repurpose SysDims.kgrid as the real-space
+    # FFT grid; n_r = prod(kgrid)).  System has Si 4x4x4 64 k-points.
+    # DoE sweeps k_chunk × band_chunk × chunk_r + system dims (n_s, n_r).
     baseline = SysDims(kgrid=(24, 24, 24), n_rmu=0, n_s=2,
                        n_b=16, n_r=24 ** 3)
+    # sys.n_k is derived from kgrid=(24,24,24) → 13824, way bigger than we
+    # want for a per-call jit.  We override via k_chunk knob instead.
+    # So all DoE points specify (k_chunk, band_chunk).
     return [
-        (baseline, Knobs.of(chunk_r=3456, nb_pad=16),  MeshSpec(2, 2)),
-        (baseline, Knobs.of(chunk_r=1728, nb_pad=16),  MeshSpec(2, 2)),
-        (baseline, Knobs.of(chunk_r=6912, nb_pad=16),  MeshSpec(2, 2)),
-        (replace(baseline, n_b=32, n_r=24**3),
-         Knobs.of(chunk_r=3456, nb_pad=32), MeshSpec(2, 2)),
-        (replace(baseline, kgrid=(32, 32, 32), n_r=32**3),
-         Knobs.of(chunk_r=3456, nb_pad=16), MeshSpec(2, 2)),
+        # --- baseline: k=64 (Si 4x4x4-like), b=16 ---
+        (baseline, Knobs.of(k_chunk=64, band_chunk=16, chunk_r=3456), MeshSpec(2, 2)),
+        # --- vary band_chunk at fixed k ---
+        (baseline, Knobs.of(k_chunk=64, band_chunk=8,  chunk_r=3456), MeshSpec(2, 2)),
+        (baseline, Knobs.of(k_chunk=64, band_chunk=32, chunk_r=3456), MeshSpec(2, 2)),
+        # --- vary k_chunk at fixed band ---
+        (baseline, Knobs.of(k_chunk=16, band_chunk=16, chunk_r=3456), MeshSpec(2, 2)),
+        (baseline, Knobs.of(k_chunk=32, band_chunk=16, chunk_r=3456), MeshSpec(2, 2)),
+        # --- vary chunk_r ---
+        (baseline, Knobs.of(k_chunk=64, band_chunk=16, chunk_r=1728), MeshSpec(2, 2)),
+        (baseline, Knobs.of(k_chunk=64, band_chunk=16, chunk_r=6912), MeshSpec(2, 2)),
+        # --- vary n_s (for spin scaling) ---
         (replace(baseline, n_s=1),
-         Knobs.of(chunk_r=3456, nb_pad=16), MeshSpec(2, 2)),
-        (baseline, Knobs.of(chunk_r=3456, nb_pad=16), MeshSpec(1, 4)),
-        (baseline, Knobs.of(chunk_r=3456, nb_pad=16), MeshSpec(4, 1)),
+            Knobs.of(k_chunk=64, band_chunk=16, chunk_r=3456), MeshSpec(2, 2)),
+        # --- vary kgrid / n_r ---
+        (replace(baseline, kgrid=(32, 32, 32), n_r=32**3),
+            Knobs.of(k_chunk=64, band_chunk=16, chunk_r=3456), MeshSpec(2, 2)),
+        # --- mesh asymmetry ---
+        (baseline, Knobs.of(k_chunk=64, band_chunk=16, chunk_r=3456), MeshSpec(1, 4)),
+        (baseline, Knobs.of(k_chunk=64, band_chunk=16, chunk_r=3456), MeshSpec(4, 1)),
     ]
 
 
@@ -246,18 +258,19 @@ def points_load_psi_rchunk_fft(preset: str):
 def points_load_psi_rchunk_reshard(preset: str):
     baseline = SysDims(kgrid=(4, 4, 4), n_rmu=0, n_s=2,
                        n_b=296, n_r=24 ** 3)
+    # DoE: vary k_chunk × band_chunk × chunk_r × mesh.  Sys.n_k=64 at
+    # baseline; k_chunk knob controls how many of those each jit call sees.
     return [
-        (baseline, Knobs.of(chunk_r=3456, nb_pad=296),  MeshSpec(2, 2)),
-        (baseline, Knobs.of(chunk_r=1728, nb_pad=296),  MeshSpec(2, 2)),
-        (baseline, Knobs.of(chunk_r=6912, nb_pad=296),  MeshSpec(2, 2)),
-        (replace(baseline, n_b=148),
-         Knobs.of(chunk_r=3456, nb_pad=148), MeshSpec(2, 2)),
-        (replace(baseline, kgrid=(2, 2, 2)),
-         Knobs.of(chunk_r=3456, nb_pad=296), MeshSpec(2, 2)),
+        (baseline, Knobs.of(k_chunk=64, band_chunk=32, chunk_r=3456), MeshSpec(2, 2)),
+        (baseline, Knobs.of(k_chunk=64, band_chunk=16, chunk_r=3456), MeshSpec(2, 2)),
+        (baseline, Knobs.of(k_chunk=32, band_chunk=32, chunk_r=3456), MeshSpec(2, 2)),
+        (baseline, Knobs.of(k_chunk=16, band_chunk=32, chunk_r=3456), MeshSpec(2, 2)),
+        (baseline, Knobs.of(k_chunk=64, band_chunk=32, chunk_r=1728), MeshSpec(2, 2)),
+        (baseline, Knobs.of(k_chunk=64, band_chunk=32, chunk_r=6912), MeshSpec(2, 2)),
         (replace(baseline, n_s=1),
-         Knobs.of(chunk_r=3456, nb_pad=296), MeshSpec(2, 2)),
-        (baseline, Knobs.of(chunk_r=3456, nb_pad=296), MeshSpec(1, 4)),
-        (baseline, Knobs.of(chunk_r=3456, nb_pad=296), MeshSpec(4, 1)),
+            Knobs.of(k_chunk=64, band_chunk=32, chunk_r=3456), MeshSpec(2, 2)),
+        (baseline, Knobs.of(k_chunk=64, band_chunk=32, chunk_r=3456), MeshSpec(1, 4)),
+        (baseline, Knobs.of(k_chunk=64, band_chunk=32, chunk_r=3456), MeshSpec(4, 1)),
     ]
 
 
