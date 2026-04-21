@@ -35,12 +35,17 @@ from jax.sharding import Mesh
 
 from ..common import ffi_loader
 
-__all__ = ["get_or_init_context", "validate_mesh"]
+__all__ = [
+    "get_or_init_context",
+    "get_or_init_subrow_context",
+    "validate_mesh",
+]
 
 MeshKey = Tuple[int, int]  # (p, q)
 
 _LOCK = threading.Lock()
 _CACHE: Dict[MeshKey, int] = {}
+_SUBROW_CACHE: Dict[MeshKey, int] = {}
 
 
 def validate_mesh(mesh: Mesh, *, require_square: bool = False) -> Tuple[int, int]:
@@ -90,6 +95,34 @@ def get_or_init_context(mesh: Mesh) -> int:
         return h
 
 
+def _make_subrow_ctx(mesh: Mesh) -> int:
+    ffi_loader.get_lib()
+    rank  = int(jax.process_index())
+    world = int(jax.process_count())
+    Px, Py = validate_mesh(mesh)
+    return int(ffi_loader.create_slate_subrow_context(
+        rank=rank, world_size=world, Px=Px, Py=Py))
+
+
+def get_or_init_subrow_context(mesh: Mesh) -> int:
+    """Return the opaque int handle for a per-X-row Y-axis sub-comm SLATE ctx.
+
+    The sub-comm is ``MPI_COMM_WORLD`` split by x-coordinate: one comm of
+    size ``Py`` per X-row.  Thread-safe.  First call collectively splits
+    MPI_COMM_WORLD.  Intended for batched ops where each X-row handles an
+    independent slice of a ``(Nbatch, N, N)`` input distributed along
+    ``'x'`` (batch) and ``'y'`` (inner matrix).
+    """
+    key = validate_mesh(mesh)
+    with _LOCK:
+        h = _SUBROW_CACHE.get(key)
+        if h is not None:
+            return h
+        h = _make_subrow_ctx(mesh)
+        _SUBROW_CACHE[key] = h
+        return h
+
+
 def _atexit_teardown() -> None:
     try:
         ffi_loader.get_lib()
@@ -101,6 +134,12 @@ def _atexit_teardown() -> None:
         except Exception:
             pass
     _CACHE.clear()
+    for _, h in list(_SUBROW_CACHE.items()):
+        try:
+            ffi_loader.destroy_slate_context(int(h))
+        except Exception:
+            pass
+    _SUBROW_CACHE.clear()
 
 
 atexit.register(_atexit_teardown)

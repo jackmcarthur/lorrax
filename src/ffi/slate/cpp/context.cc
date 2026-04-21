@@ -103,6 +103,62 @@ int64_t lrx_slate_context_create(
     }
 }
 
+// Create a SLATE context for the per-X-row Y-axis sub-communicator, given a
+// full (Px, Py) process grid.  Intended for batched ops where each X-row
+// cooperatively processes an independent slice of a (Nbatch, N, N) input
+// (batch distributed along X, each N×N distributed across Y).
+//
+// All world ranks must call this collectively.  The call performs
+// MPI_Comm_split with color = x_rank and key = y_rank, yielding a per-
+// X-row sub-comm of size Py.  Since the sub-grid is (1, Py), SLATE's
+// GridOrder::Col tile (0, j) → rank j already matches JAX's shard (0, j)
+// → rank j — no further remap needed.
+int64_t lrx_slate_subrow_context_create(
+    int rank, int world_size, int Px, int Py,
+    char* err_buf, int err_buf_len)
+{
+    try {
+        if (Px <= 0 || Py <= 0 || Px * Py != world_size) {
+            if (err_buf_len > 0) {
+                std::snprintf(err_buf, err_buf_len,
+                    "slate subrow: invalid grid Px=%d Py=%d world=%d "
+                    "(need Px*Py==world)", Px, Py, world_size);
+            }
+            return 0;
+        }
+
+        lorrax_ffi::slate::ensure_mpi_initialized();
+
+        const int x_rank = rank / Py;
+        const int y_rank = rank % Py;
+
+        MPI_Comm sub = MPI_COMM_NULL;
+        int rc = MPI_Comm_split(MPI_COMM_WORLD, x_rank, y_rank, &sub);
+        if (rc != MPI_SUCCESS) {
+            if (err_buf_len > 0) {
+                std::snprintf(err_buf, err_buf_len,
+                    "slate subrow: MPI_Comm_split failed rc=%d", rc);
+            }
+            return 0;
+        }
+
+        auto* ctx = new lorrax_ffi::slate::SlateCtx{};
+        ctx->rank = y_rank;           // rank within sub-comm
+        ctx->world_size = Py;         // size of sub-comm
+        ctx->p = 1;
+        ctx->q = Py;
+        ctx->comm = sub;
+        ctx->owns_comm = true;
+        return reinterpret_cast<int64_t>(ctx);
+    } catch (const std::exception& ex) {
+        if (err_buf_len > 0) {
+            std::snprintf(err_buf, err_buf_len,
+                "slate subrow: context_create threw: %s", ex.what());
+        }
+        return 0;
+    }
+}
+
 void lrx_slate_context_destroy(int64_t handle) {
     auto* ctx = reinterpret_cast<lorrax_ffi::slate::SlateCtx*>(handle);
     if (ctx == nullptr) return;

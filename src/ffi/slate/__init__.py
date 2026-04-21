@@ -19,12 +19,20 @@ cholesky + trsm work on any p×q mesh (p == q for eigh).
 """
 from __future__ import annotations
 
+from .batched import (  # noqa: F401
+    SlateBatchedLowerL,
+    batched_distributed_cholesky,
+    batched_distributed_trsm,
+)
 from .cholesky import SlateLowerL, distributed_cholesky  # noqa: F401
 from .eigh import distributed_eigh  # noqa: F401
 from .trsm import distributed_trsm  # noqa: F401
 
 __all__ = [
+    "SlateBatchedLowerL",
     "SlateLowerL",
+    "batched_distributed_cholesky",
+    "batched_distributed_trsm",
     "distributed_cholesky",
     "distributed_eigh",
     "distributed_trsm",

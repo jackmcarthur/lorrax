@@ -48,8 +48,15 @@ def _maybe_init_jax_distributed():
                          os.environ.get("JAX_NUM_PROCESSES",
                          os.environ.get("SLURM_NTASKS", "1"))))
     if proc_count > 1:
+        # Under LORRAX_SELECT_GPU=1 each rank has only 1 GPU visible
+        # (CUDA_VISIBLE_DEVICES=$SLURM_LOCALID).  JAX's default init
+        # assumes all processes see all GPUs and times out waiting for
+        # the missing local topologies.  Tell it explicitly.
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        one_gpu = cvd and "," not in cvd
+        init_kwargs = {"local_device_ids": [0]} if one_gpu else {}
         try:
-            jax.distributed.initialize()
+            jax.distributed.initialize(**init_kwargs)
             os.environ[_DIST_SENTINEL] = "1"
             return
         except Exception:

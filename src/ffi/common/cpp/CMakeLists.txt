@@ -357,6 +357,8 @@ if(LORRAX_HAVE_SLATE)
         ../../slate/cpp/eigh_ffi.cc
         ../../slate/cpp/potrf_ffi.cc
         ../../slate/cpp/trsm_ffi.cc
+        ../../slate/cpp/batched_potrf_ffi.cc
+        ../../slate/cpp/batched_trsm_ffi.cc
     )
 endif()
 

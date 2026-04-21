@@ -47,6 +47,8 @@ _FFI_TARGET_SYMBOLS = {
     "lorrax_slate_eigh":              "SlateEighFfi",
     "lorrax_slate_potrf":             "SlatePotrfFfi",
     "lorrax_slate_trsm":              "SlateTrsmFfi",
+    "lorrax_slate_batched_potrf":     "SlateBatchedPotrfFfi",
+    "lorrax_slate_batched_trsm":      "SlateBatchedTrsmFfi",
 }
 
 # Error buffer size for the lrx_ wrappers.
@@ -170,6 +172,15 @@ def _set_argtypes(lib: ctypes.CDLL) -> None:
         ctypes.c_int,           # err_buf_len
     ]
     lib.lrx_slate_context_create.restype  = ctypes.c_int64
+    lib.lrx_slate_subrow_context_create.argtypes = [
+        ctypes.c_int,           # rank (full-world)
+        ctypes.c_int,           # world_size
+        ctypes.c_int,           # Px
+        ctypes.c_int,           # Py
+        ctypes.c_char_p,        # err_buf
+        ctypes.c_int,           # err_buf_len
+    ]
+    lib.lrx_slate_subrow_context_create.restype  = ctypes.c_int64
     lib.lrx_slate_context_destroy.argtypes = [ctypes.c_int64]
     lib.lrx_slate_context_destroy.restype  = None
     lib.lrx_slate_init_mpi.argtypes = []
@@ -361,6 +372,26 @@ def create_slate_context(rank: int, world_size: int, p: int, q: int) -> int:
     if int(h) == 0:
         msg = err.value.decode("utf-8", errors="replace")
         raise RuntimeError(f"lorrax_ffi slate.context_create failed: {msg}")
+    return int(h)
+
+
+def create_slate_subrow_context(rank: int, world_size: int,
+                                Px: int, Py: int) -> int:
+    """Collective create of a SLATE sub-row context; returns int64 handle.
+
+    The sub-comm is MPI_COMM_WORLD split by x-coordinate (color=x_rank,
+    key=y_rank), producing one comm of size ``Py`` per X-row.  Intended
+    for batched ops where each X-row independently processes a slice of
+    a 3-D (Nbatch, N, N) input distributed as P('x', None, 'y').
+    """
+    lib = get_lib()
+    err = ctypes.create_string_buffer(_ERR_CAP)
+    h = lib.lrx_slate_subrow_context_create(
+        int(rank), int(world_size), int(Px), int(Py), err, _ERR_CAP)
+    if int(h) == 0:
+        msg = err.value.decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"lorrax_ffi slate.subrow_context_create failed: {msg}")
     return int(h)
 
 

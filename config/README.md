@@ -66,56 +66,67 @@ sbatch $LORRAX_ROOT/config/perlmutter/run_gw.slurm
 
 | Function | Purpose |
 |---|---|
-| `lxalloc [N] [time]` | Get an interactive GPU allocation (N nodes, default 1) |
-| `lxrun <cmd>` | Run `<cmd>` inside the LORRAX Shifter container with srun |
+| `lxalloc [N] [time]` | Interactive GPU allocation (N nodes, default 1) |
+| `lxrun <cmd>` | Run `<cmd>` on `LORRAX_NGPU` ranks (default 4) inside the Shifter container |
+| `lxshell` | Single-rank pty shell inside the container — iterate without paying shifter bring-up per invocation |
 | `lxpre <input> <N>` | Run all 3 preprocessing steps (single-GPU each) |
 
 **Exported variables** for scripting:
 `LORRAX_ROOT`, `LORRAX_SRC`, `LORRAX_SITE`, `LORRAX_IMAGE`, `LORRAX_SHIFTER`,
-`LORRAX_FFI_NVHPC_HOST`, `LORRAX_FFI_PHDF5_HOST`.
+`LORRAX_FFI_NVHPC_HOST`, `LORRAX_FFI_PHDF5_HOST`, `LORRAX_FFI_SLATE_HOST`,
+`LORRAX_SLATE_INSTALL_DIR`, `JAX_COMPILATION_CACHE_DIR`.
 
-### FFI staged-deps bind-mounts inside `lxrun`
+### Unified Cray MPICH stack
 
-`shifter_base` bind-mounts the staged NVHPC (cuSOLVERMp, libcal) and
-parallel-HDF5 (MPI-IO, linked against the container's HPC-X OpenMPI)
-trees into the container at stable paths, and adds
-`LD_LIBRARY_PATH` so the loader finds them.  End users don't have to
-set anything for this — it happens automatically on `module load`.
+The module defaults all workloads (SLATE, cuSOLVERMp, phdf5) to a single
+stack: **Cray MPICH + one GPU per rank**.  Every `lxrun` invocation
+does:
+
+```
+srun --mpi=cray_shasta --gres=gpu:$NGPU -N 1 -n $NGPU \
+    select_gpu.sh   \    # CUDA_VISIBLE_DEVICES=$SLURM_LOCALID
+    shifter --module=gpu,mpich --image=... --volume=... --env=... \
+    in_container.sh \    # re-assert MPICH_GPU_SUPPORT_ENABLED=1
+    "$@"
+```
+
+Each rank sees exactly one GPU (JAX callers must use
+`jax.distributed.initialize(local_device_ids=[0])` when world > 1 —
+the common tests auto-detect this via `CUDA_VISIBLE_DEVICES`).
+
+**Bind-mounts** (pre-staged via `src/ffi/*/scripts/stage_*.sh`, one-time):
 
 | Host path (override) | Container mount | Contents |
 |---|---|---|
-| `$LORRAX_FFI_NVHPC_DIR` *(default `/pscratch/sd/${U:0:1}/${U}/lorrax_nvhpc`)* | `/lorrax_nvhpc` | NVHPC 25.5 subset: `libcusolverMp.so.0`, `libcal`, cuSOLVERMp + NCCL headers |
-| `$LORRAX_FFI_PHDF5_DIR` *(default `/pscratch/sd/${U:0:1}/${U}/lorrax_phdf5_openmpi/stage`)* | `/lorrax_phdf5` | conda-forge HDF5 1.14 built against the container's HPC-X OpenMPI (libmpi.so.40) |
+| `$LORRAX_FFI_NVHPC_DIR` *(default `/pscratch/sd/${U:0:1}/${U}/lorrax_nvhpc`)* | `/lorrax_nvhpc` | NVHPC 25.5 subset: `libcusolverMp.so.0`, `libcal` |
+| `$LORRAX_FFI_PHDF5_DIR` *(default `/pscratch/sd/${U:0:1}/${U}/lorrax_phdf5_cray/stage`)* | `/lorrax_phdf5` | Cray HDF5 1.12 (libmpi_gnu_*.so.12) |
+| `$LORRAX_FFI_SLATE_DIR` *(default `/pscratch/sd/${U:0:1}/${U}/lorrax_slate_cray/stage`)* | `/lorrax_slate` | Cray libsci + `libmpi_gtl_cuda.so.0` + xpmem + lustreapi |
 
-Container-side `LD_LIBRARY_PATH` set to:
+Container-side `LD_LIBRARY_PATH` (in order):
 ```
-/lorrax_phdf5/lib : /lorrax_nvhpc/25.5_cuda12.9/math_libs/12.9/lib64 : /opt/hpcx/ompi/lib
-```
-
-**Staging**: run the one-time scripts under `src/ffi/`:
-```bash
-src/ffi/cusolvermp/scripts/stage_nvhpc.sh      # ~100 MB
-src/ffi/phdf5/scripts/stage_openmpi.sh         #  ~40 MB
+$LORRAX_SLATE_INSTALL_DIR/lib64 : /lorrax_slate/lib : /lorrax_phdf5/lib :
+/lorrax_nvhpc/.../lib64 : /opt/udiImage/modules/mpich : /opt/udiImage/modules/mpich/dep
 ```
 
-**Running FFI workloads** (`use_ffi_io=true`, `cusolvermp` eigh, etc.) —
-opt in with `LORRAX_MPI_TYPE=pmix` so `srun` bootstraps PMIx for the
-container's OpenMPI:
+**`LORRAX_MPI_TYPE`** override:
 
 ```bash
-LORRAX_MPI_TYPE=pmix LORRAX_NGPU=4 lxrun python3 -u -m common.phdf5_write_test
-LORRAX_MPI_TYPE=pmix LORRAX_NGPU=4 lxrun env CUSOLVERMP_FORCE_NCCL=1 \
-    XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async \
-    python3 -u -m common.cusolvermp_eigh_test --grid 2 2
+LORRAX_MPI_TYPE=cray_shasta   # default — Cray MPICH PMI
+LORRAX_MPI_TYPE=none          # disable --mpi flag (single-rank code)
+LORRAX_MPI_TYPE=pmix          # legacy OpenMPI path (not wired up)
 ```
 
-`--mpi=pmix` is **off by default** because unconditionally enabling it
-was observed to hang some non-FFI workloads after the first NCCL
-collective.  Setting `LORRAX_MPI_TYPE=none` explicitly disables it.
+### Fast-iteration tips
 
-If you need a different staging path or a non-default container image,
-set `LORRAX_FFI_NVHPC_DIR` / `LORRAX_FFI_PHDF5_DIR` *before* loading
-the module (they're read at module-load time, not per-call).
+- **`lxshell`**: drop into an interactive container shell, then run
+  `python3 -m common.slate_batched_test`, `python3 -m common.cusolvermp_eigh_test`,
+  etc. back-to-back.  Saves the ~5 s shifter bring-up per invocation.
+- **`JAX_COMPILATION_CACHE_DIR`** is set to `$SCRATCH/.jax_cache` by
+  default.  Amortises XLA PTX compile across JAX processes
+  (doesn't cut the ~15-25 s CUDA backend init itself).
+- For multi-rank MPI runs, `lxrun` is still required — shifter's
+  MPI integration needs `srun` on the outside (per upstream Shifter
+  SLURM integration docs).
 
 ## Multiple parallel checkouts (A/B/C agent sessions)
 
