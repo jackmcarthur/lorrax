@@ -282,6 +282,35 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		if stages:
 			print_fn(f"    Per-stage: " + "  ".join(f"{k}={v:.2f}" for k, v in stages.items()) + " GB")
 
+		# AOT-derived driver-level peak — sanity-check against per-stage heuristic.
+		# Logged only; does NOT override chunk_r.  When the fit artifact is
+		# missing or the prediction throws, we stay silent.
+		try:
+			from gw.aot_memory_model import (
+				predict_kernel_peak, SysDims, Knobs, MeshSpec,
+			)
+			p_x, p_y = mesh_xy.devices.shape
+			aot_sys = SysDims(
+				kgrid=tuple(meta.kgrid),
+				fft_grid=tuple(meta.fft_grid),
+				n_rmu=int(meta.n_rmu),
+				n_s=int(meta.nspinor),
+				n_b=int(band_range_left[1] - band_range_left[0]
+				       + band_range_right[1] - band_range_right[0]),
+				n_r=int(meta.n_rtot),
+			)
+			aot_peak = predict_kernel_peak(
+				"fit_one_rchunk", aot_sys,
+				Knobs.of(chunk_r=int(chunks['chunk_r']),
+				         band_chunk=int(chunks['band_chunk'])),
+				MeshSpec(p_x=int(p_x), p_y=int(p_y)),
+				tag="current",
+			)
+			print_fn(f"    AOT fit_one_rchunk peak (driver-level): "
+			         f"{aot_peak / 1e9:.2f} GB")
+		except Exception:
+			pass
+
 	zeta_h5_path = os.path.join(tmp_dir, "zeta_q.h5")
 	print_fn(f"\n  Chunked ISDF fitting:")
 	print_fn(f"    Band chunks: {chunks['band_chunk']}")
