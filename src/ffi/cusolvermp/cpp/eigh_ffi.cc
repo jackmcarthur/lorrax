@@ -150,8 +150,8 @@ static ffi::Error EighImpl(
         ctx->h_workspace_bytes = h_ws_bytes;
     }
 
-    LORRAX_CUDA_CHECK(
-        cudaMemsetAsync(ctx->d_info, 0, sizeof(int), ctx->stream));
+    // d_info is never read (mp_st already indicates success); skip the
+    // per-call memset.  cuSOLVERMp writes into d_info in Syevd.
 
     // cuSOLVERMp overwrites A's tile (Householder tridiagonalisation);
     // const-cast once at the call site.
