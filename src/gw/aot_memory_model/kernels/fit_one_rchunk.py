@@ -217,6 +217,22 @@ class FitOneRChunkKernel(AotKernel):
         "L_q":        _T_L_q,
         "psiG_total": _T_psiG_total,
     }
+    # Scaling class of each primitive in (chunk_r, bc) — the analytic
+    # chooser groups β_i·T_i into (α₀, α_cr, α_bc, α_crbc) and inverts
+    # the feasibility bound `peak ≤ M` in closed form.  Classes:
+    #   "const"   : T_i depends on neither chunk_r nor bc.
+    #   "cr"      : T_i is linear in chunk_r only.
+    #   "bc"      : T_i is linear in bc only.
+    #   "crbc"    : T_i scales like chunk_r·bc.
+    PRIMITIVE_CLASSES = {
+        "Pacc":       "cr",
+        "PrBc":       "cr",
+        "psiBc":      "bc",
+        "psiBcY":     "crbc",
+        "psi_cent":   "const",
+        "L_q":        "const",
+        "psiG_total": "const",
+    }
     # Cost-side primitives — distinct from memory primitives because
     # FLOPs count != bytes-per-device.  See _F_* helpers above.
     FLOPS_PRIMITIVES = {

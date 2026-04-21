@@ -1217,19 +1217,26 @@ def fit_zeta_chunked_to_h5(
     # Peak GPU memory tracker — reports the all-time high-water mark (peak_bytes_in_use).
     # This is the number that determines whether you OOM: it includes JIT caches and
     # prior-stage allocations, not just the chunk loop arrays.
+    # GPU high-water tracker.  The JAX CUDA PJRT on this stack returns
+    # None from ``memory_stats()``, so we fall back to nvidia-smi per
+    # r-chunk.  ``CUDA_VISIBLE_DEVICES`` pins this rank to exactly one
+    # GPU (LORRAX's standard layout), so --id=0 queries the right one.
     _peak_bytes = 0
+    _nvsmi_fail = [False]
     def _track_peak():
         nonlocal _peak_bytes
-        # Use the LOCAL device — jax.devices()[0] may be remote under
-        # multi-process, in which case memory_stats() returns None and
-        # we'd silently stick at 0.  jax.local_devices()[0] is always
-        # queryable from this rank.
+        if _nvsmi_fail[0]:
+            return
         try:
-            stats = jax.local_devices()[0].memory_stats()
-            if stats:
-                _peak_bytes = max(_peak_bytes, stats.get('peak_bytes_in_use', 0))
+            import subprocess
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=memory.used",
+                 "--format=csv,nounits,noheader", "--id=0"],
+                text=True, timeout=2).strip()
+            mb = int(out.splitlines()[0])
+            _peak_bytes = max(_peak_bytes, mb * (1024 ** 2))
         except Exception:
-            pass
+            _nvsmi_fail[0] = True
 
     from common.progress import LoopProgress
     r_progress = LoopProgress(
@@ -1271,7 +1278,7 @@ def fit_zeta_chunked_to_h5(
                     kvecs_frac=kvecs_frac,
                 )
                 zeta_chunk.block_until_ready()
-                _track_peak()
+                _track_peak()  # read high-water AFTER the jit settles
             # Under phdf5-on-demand, drop the per-r-chunk G-space tuple
             # so nothing accumulates between iterations.  Under the
             # device-cache path this is a no-op (tuple entries alias

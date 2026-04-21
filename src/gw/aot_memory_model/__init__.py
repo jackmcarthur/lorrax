@@ -32,10 +32,17 @@ from .cost import (
     predict_flops_per_call,
     save_cost_fit,
 )
-from .chooser import ChunkChoice, choose_chunks_aot, describe_chunks
+from .chooser import (
+    AlphaFit,
+    ChunkChoice,
+    choose_chunks_analytic,
+    choose_chunks_aot,
+    describe_chunks,
+)
 from .doe import build_doe_axes
 
 __all__ = [
+    "AlphaFit",
     "AotKernel",
     "ChunkChoice",
     "CostFit",
@@ -44,6 +51,7 @@ __all__ = [
     "SysDims",
     "aot_measure",
     "build_doe_axes",
+    "choose_chunks_analytic",
     "choose_chunks_aot",
     "describe_chunks",
     "fit_cost_from_saved",

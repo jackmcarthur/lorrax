@@ -171,6 +171,200 @@ def choose_chunks_aot(
     return best
 
 
+# ===========================================================================
+# Analytic chooser — closed-form inversion of the bilinear peak bound
+# ===========================================================================
+#
+# For fit_one_rchunk the peak-bytes model, after grouping primitives by
+# their scaling class (PRIMITIVE_CLASSES on the kernel), collapses to
+#
+#     peak(chunk_r, bc) = α₀ + α_cr · chunk_r + α_bc · bc
+#                              + α_crbc · (chunk_r · bc)
+#
+# At a fixed bc this is LINEAR in chunk_r — so
+#
+#     chunk_r_max(bc) = (M − α₀ − α_bc · bc) / (α_cr + α_crbc · bc)
+#
+# …solvable in closed form.  The chooser then 1-D searches over a
+# handful of discrete bc candidates (mesh-divisible, bounded by n_b),
+# computing total cost at chunk_r_max(bc).  No 2-D grid enumeration.
+#
+# Total FLOPs:
+#     cost(chunk_r, bc) =
+#        ceil(n_rtot / chunk_r) · [F_fixed + F_wfnFFT(bc)]
+#
+# F_wfnFFT(bc) = n_b · C_per_band + (n_b / bc) · C_launch.  The
+# C_launch term is a calibration hook: default 0 (pure FLOPs, faithful
+# to cost_analysis), can be set post-hoc from runtime measurements to
+# capture the "small-chunk performance hit" in kernel dispatch.
+
+
+@dataclass
+class AlphaFit:
+    """Regrouped memory-fit coefficients for analytic inversion."""
+    alpha0: float
+    alpha_cr: float
+    alpha_bc: float
+    alpha_crbc: float
+
+
+def _group_alpha(
+    kernel, mem_fit, sys: SysDims, mesh: MeshSpec,
+) -> AlphaFit:
+    """Regroup the 7 primitive β·T contributions into the 4 scaling
+    classes.  Each primitive T_i is evaluated at chunk_r=1, bc=1 so
+    the returned coefficient already carries (sys, mesh) scaling.
+
+    Requires the kernel class to declare ``PRIMITIVE_CLASSES``.
+    """
+    classes = getattr(kernel, "PRIMITIVE_CLASSES", None)
+    if not classes:
+        raise ValueError(
+            f"Kernel {kernel.name!r} has no PRIMITIVE_CLASSES — "
+            "analytic chooser can't regroup its fit.")
+    unit_knobs = Knobs.of(chunk_r=1, band_chunk=1)
+    alpha = {"const": float(mem_fit.intercept), "cr": 0.0, "bc": 0.0, "crbc": 0.0}
+    for name, coef in zip(mem_fit.feature_names, mem_fit.coefs):
+        cls = classes.get(name)
+        if cls is None:
+            raise ValueError(
+                f"PRIMITIVE_CLASSES missing entry for {name!r}")
+        T_unit = kernel.PRIMITIVES[name](sys, unit_knobs, mesh)
+        alpha[cls] += coef * T_unit
+    # γ correction — memory_analysis is an upper bound; XLA schedules
+    # tighter at runtime.  γ captures runtime_peak / aot_predicted from
+    # calibration.  Applied uniformly to α₀ / α_cr / α_bc / α_crbc so
+    # feasibility bounds match real GPU usage, not the worst case.
+    gamma = float(getattr(mem_fit, "gamma", 1.0)) or 1.0
+    return AlphaFit(
+        alpha0=alpha["const"] * gamma,
+        alpha_cr=alpha["cr"] * gamma,
+        alpha_bc=alpha["bc"] * gamma,
+        alpha_crbc=alpha["crbc"] * gamma,
+    )
+
+
+def _p_divisible_floor(x: float, p: int) -> int:
+    """Round DOWN to the nearest non-zero multiple of p."""
+    v = int(x) // p * p
+    return max(0, v)
+
+
+def choose_chunks_analytic(
+    sys: SysDims, mesh: MeshSpec,
+    *,
+    budget_bytes: float,
+    kernel_name: str = "fit_one_rchunk",
+    tag: str = "current",
+    band_chunk_values: Sequence[int] | None = None,
+    fft_launch_overhead_flops: float = 0.0,
+    fft_per_band_flops: float | None = None,
+) -> ChunkChoice:
+    """Closed-form chunk chooser.
+
+    For every ``bc`` candidate we evaluate
+      1. ``chunk_r_max(bc) = (M − α₀ − α_bc·bc) / (α_cr + α_crbc·bc)``
+      2. round down to p-divisible and clamp to ``n_rtot``
+      3. compute ``total_cost`` at that ``chunk_r_max`` and keep the
+         candidate with minimal cost.
+
+    Returns the same :class:`ChunkChoice` dataclass as the grid-search
+    chooser so callers can swap without changing downstream code.
+
+    Parameters
+    ----------
+    fft_launch_overhead_flops
+        Per-call overhead for the wavefunction FFT, captured as
+        additional FLOPs per-call.  When > 0 the cost term becomes
+        ``total_launch = (n_b / bc) · C_launch`` per r-chunk — smaller
+        ``bc`` → more launches → more overhead.  Default 0 (FLOPs
+        model is pure compute, honest to ``cost_analysis``).  Populate
+        from runtime measurements via ``profile_chunks_vs_model``.
+    fft_per_band_flops
+        Per-band wavefunction-FFT FLOPs.  When ``None``, inferred from
+        the cost fit via the ``bc_fft`` primitive.  Override only for
+        calibration experiments.
+    """
+    kernel = get_kernel(kernel_name)
+    mem_fit = load_fit(kernel_name, tag=tag)
+    cost_fit = load_cost_fit(kernel_name, tag=tag)
+
+    alpha = _group_alpha(kernel, mem_fit, sys, mesh)
+    n_rtot = sys.n_r or (
+        sys.fft_shape[0] * sys.fft_shape[1] * sys.fft_shape[2])
+    p = mesh.p_x * mesh.p_y
+
+    # bc candidates: p-divisible in [p, n_b], with n_b itself included.
+    if band_chunk_values is None:
+        pow2 = []
+        v = max(p, 8)
+        while v <= sys.n_b:
+            if v % p == 0 and v <= sys.n_b:
+                pow2.append(v)
+            v *= 2
+        pow2.append(sys.n_b)
+        band_chunk_values = sorted(set(pow2))
+
+    best: ChunkChoice | None = None
+    for bc in band_chunk_values:
+        if bc < p or bc > sys.n_b:
+            continue
+
+        # Closed-form: peak(cr, bc) = α₀ + α_cr·cr + α_bc·bc + α_crbc·cr·bc ≤ M
+        # → cr ≤ (M − α₀ − α_bc·bc) / (α_cr + α_crbc·bc)
+        denom = alpha.alpha_cr + alpha.alpha_crbc * bc
+        numer = budget_bytes - alpha.alpha0 - alpha.alpha_bc * bc
+        if denom <= 0 or numer <= 0:
+            continue
+        cr_budget = numer / denom
+        cr = min(int(cr_budget), n_rtot)
+        cr = _p_divisible_floor(cr, p)
+        if cr <= 0:
+            continue
+
+        num_r = _ceil_div(n_rtot, cr)
+        per_call = predict_flops_per_call(cost_fit, kernel, sys,
+                                          Knobs.of(chunk_r=cr, band_chunk=bc),
+                                          mesh)
+        # Optional: small-bc launch penalty.  Added only to TOTAL cost,
+        # not per-call FLOPs, so the AOT fit stays faithful to
+        # cost_analysis.
+        launch_penalty = (sys.n_b / max(1, bc)) * fft_launch_overhead_flops
+        total = num_r * (per_call + launch_penalty)
+
+        # Peak at the chosen (cr, bc) — for validation/logging we
+        # re-predict exactly rather than trusting the inversion
+        # (handles p-divisible rounding).
+        peak = (alpha.alpha0 + alpha.alpha_cr * cr
+                + alpha.alpha_bc * bc + alpha.alpha_crbc * cr * bc)
+
+        cand = ChunkChoice(
+            chunk_r=cr, band_chunk=bc, k_chunk=sys.n_k,
+            num_r_chunks=num_r, num_bc_chunks=_ceil_div(sys.n_b, bc),
+            peak_bytes=peak, per_call_flops=per_call,
+            total_flops=total, budget_bytes=budget_bytes,
+            note=f"analytic (alpha0={alpha.alpha0/1e9:.2f}GB, "
+                 f"cr={alpha.alpha_cr/1e6:.1f}MB/cr, "
+                 f"bc={alpha.alpha_bc/1e6:.1f}MB/bc, "
+                 f"crbc={alpha.alpha_crbc/1e3:.2f}kB/(cr·bc))",
+        )
+        if best is None:
+            best = cand
+            continue
+        # Tiebreak identically to the grid chooser.
+        _cand_key = (-cand.total_flops, cand.chunk_r, cand.band_chunk)
+        _best_key = (-best.total_flops, best.chunk_r, best.band_chunk)
+        if _cand_key > _best_key:
+            best = cand
+
+    if best is None:
+        raise ValueError(
+            f"No feasible (chunk_r, band_chunk) under budget "
+            f"{budget_bytes/1e9:.2f} GB for system {sys}; "
+            f"α₀={alpha.alpha0/1e9:.2f} GB (already above budget?).")
+    return best
+
+
 def describe_chunks(choice: ChunkChoice) -> str:
     """Format a one-line summary, for the existing fit_zeta log line."""
     util = 100.0 * choice.peak_bytes / max(1.0, choice.budget_bytes)

@@ -292,21 +292,26 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		try:
 			from gw.aot_memory_model import (
 				predict_kernel_peak, SysDims, MeshSpec, Knobs,
-				choose_chunks_aot, describe_chunks,
+				choose_chunks_analytic, describe_chunks,
 			)
 			p_x, p_y = mesh_xy.devices.shape
+			# n_b semantic: the *union* range the G-space cache
+			# covers (= band_range_full size).  The pair-density cost
+			# primitive doubles n_b internally to account for the L+R
+			# sum, so passing nb_L+nb_R here double-counts.
+			nb_full = (max(band_range_left[1], band_range_right[1])
+			           - min(band_range_left[0], band_range_right[0]))
 			aot_sys = SysDims(
 				kgrid=tuple(meta.kgrid),
 				fft_grid=tuple(meta.fft_grid),
 				n_rmu=int(meta.n_rmu),
 				n_s=int(meta.nspinor),
-				n_b=int(band_range_left[1] - band_range_left[0]
-				       + band_range_right[1] - band_range_right[0]),
+				n_b=int(nb_full),
 				n_r=int(meta.n_rtot),
 			)
 			aot_mesh = MeshSpec(p_x=int(p_x), p_y=int(p_y))
 			if cfg.use_aot_chunk_chooser:
-				choice = choose_chunks_aot(
+				choice = choose_chunks_analytic(
 					aot_sys, aot_mesh,
 					budget_bytes=cfg.memory_per_device_gb * 1e9 * cfg.chunk_target_utilization,
 					kernel_name="fit_one_rchunk", tag="current",
