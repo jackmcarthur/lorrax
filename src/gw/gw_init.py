@@ -302,7 +302,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# Band norms for pseudobands normalization (1.0 for deterministic bands)
 	_band_norms = getattr(wfn, 'band_norms', None)
 
-	with timing.section("gw_jax.zeta_fit_chunked"):
+	with timing.section("gw_jax.zeta_fit_chunked"), jax_profile.trace_section("zeta_fit"):
 		psi_l_yr, psi_r_yr, _psi_l_xn, _psi_r_xn, peak_bytes = fit_zeta_chunked_to_h5(
 			wfn=wfn, sym=sym, meta=meta,
 			centroid_indices=centroid_indices, mesh_xy=mesh_xy,

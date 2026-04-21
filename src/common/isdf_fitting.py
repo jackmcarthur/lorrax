@@ -793,10 +793,18 @@ def solve_zeta_from_L_q(
     """
     if L_factor.mode == "low_mem":
         # Full-mesh batched cuSOLVERMp potrs.  Z_q comes in as
-        # P(None, 'x', 'y') and the output X inherits that sharding —
-        # no reshard.
+        # P(None, 'x', 'y') and the output X inherits that sharding.
+        # We reshard the result to P(None, None, ('x','y')) to match
+        # the high_mem layout: downstream phdf5 write_slab is much
+        # faster (~5×) when each rank contributes a 1D row-strip to
+        # the (nq, n_rtot, n_rmu) dataset rather than a 2D tile — the
+        # tile case hits a non-contiguous MPI-IO collective-buffer
+        # path that dominated total zeta_fit wall at Si 4×4×4
+        # (close_io 33 s → 6 s).
         from ffi.cusolvermp import batched_distributed_potrs
-        return batched_distributed_potrs(L_factor._handle, Z_q, mesh=mesh_xy)
+        X = batched_distributed_potrs(L_factor._handle, Z_q, mesh=mesh_xy)
+        out_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
+        return jax.lax.with_sharding_constraint(X, out_shard)
 
     # --- high_mem path (existing replicate-L + vmap-trsm) ---------------
     L_q = L_factor._dense_L
