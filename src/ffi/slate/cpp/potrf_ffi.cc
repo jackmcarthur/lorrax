@@ -112,36 +112,11 @@ static ffi::Error PotrfImpl(
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
 
-    // Zero out the strict-upper tiles (in SLATE's tile grid) so the
-    // resulting buffer is "clean L" — anything not written by potrf is
-    // explicitly zero, no leftover A-data.  This matters for the chained
-    // cholesky->trsm pattern: if we leave A's strict-upper data in
-    // place, trsm's Triangular(Lower) wrapper still col-majorises that
-    // region and uses some of it (despite uplo='Lower'), giving a few-
-    // percent residual.
-    //
-    // Default-tile case (nb == n/p): each rank owns exactly one tile
-    // (ti, tj) = (rank%p, rank/p) under SLATE GridOrder::Col.  Strict
-    // upper means ti < tj.
-    if (nb == (n + p - 1) / p) {
-        const int my_ti = ctx->rank % p;
-        const int my_tj = ctx->rank / p;
-        if (my_ti < my_tj) {
-            cudaError_t cz = cudaMemsetAsync(
-                d_L_out, 0,
-                local_rows * local_cols * sizeof(T),
-                xla_stream);
-            if (cz != cudaSuccess) {
-                std::ostringstream os;
-                os << "slate.potrf: cudaMemsetAsync(strict-upper tile) failed: "
-                   << cudaGetErrorString(cz);
-                return ffi::Error(ffi::ErrorCode::kInternal, os.str());
-            }
-        }
-    }
-    // For non-default nb (multiple tiles per rank), the right zero
-    // pattern is per-tile within the rank's buffer; not implemented yet
-    // since user code uses default nb (= n/p).
+    // No explicit strict-upper zeroing: SLATE's potrf(Hermitian Lower)
+    // only reads lower-tri tiles, and SLATE's trsm(Lower) downstream
+    // also only reads lower-tri.  Leftover A-data in unused tiles is
+    // ignored.  to_jax_lower() applies tril() if the user wants a
+    // clean L for use outside SLATE.
 
     return ffi::Error::Success();
 }

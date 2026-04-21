@@ -1,18 +1,25 @@
 """``distributed_cholesky`` — JAX FFI wrapper around ``slate::potrf``.
 
-Returns a :class:`SlateLowerL` opaque handle, not a plain JAX array.
-The underlying buffer is in SLATE's distributed-tile / col-major-tile
-layout, which JAX cannot interpret as a "row-major lower-triangular L"
-without an explicit transform.  Two ways to consume it:
+Layout convention
+-----------------
+JAX stores arrays row-major; SLATE tiles are column-major with
+``lda = nb``.  We materialise the transpose (``jnp.transpose(A, (1,0))``
++ ``with_sharding_constraint``) before handing the buffer to SLATE:
+the bytes of that transposed array are the original ``A`` in
+column-major layout, and SLATE reads them directly.  This works for
+**any p×q mesh** — including rectangular ones — because the transpose
+is a local (per-rank) operation, no inter-rank communication.
 
-    * Pass it directly to :func:`ffi.slate.distributed_trsm` — the trsm
-      FFI knows how to feed SLATE's own layout straight back without
-      going through any layout massaging.
-    * Call :meth:`SlateLowerL.to_jax_lower` to get the standard
-      lower-triangular L in JAX's row-major view (equivalent to
-      ``jnp.tril(raw.conj().T)``).
+Returns a :class:`SlateLowerL` opaque handle.  The underlying buffer
+is in SLATE's col-major-in-row-major layout (i.e. the transpose of the
+row-major L).  Two ways to consume it:
 
-Only ``Uplo::Lower`` is supported (SLATE's potrf).  dtype F64 or C128.
+  * Pass the handle to :func:`ffi.slate.distributed_trsm` — trsm knows
+    the handle's layout and feeds it straight back to SLATE.
+  * Call :meth:`SlateLowerL.to_jax_lower` for a conventional
+    row-major lower-triangular L.
+
+Only ``Uplo::Lower`` (SLATE's potrf) and dtypes F64 / C128.
 """
 from __future__ import annotations
 
@@ -23,7 +30,7 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 from jax.experimental.shard_map import shard_map
-from jax.sharding import Mesh, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from ..common.ffi_loader import get_lib
 from .context import get_or_init_context
@@ -37,21 +44,16 @@ _FFI_TARGET = "lorrax_slate_potrf"
 class SlateLowerL:
     """Opaque handle to a SLATE-format Cholesky lower factor.
 
-    Not interpretable as a dense L in JAX's row-major view — the buffer
-    holds SLATE's distributed col-major-tile layout.  The strict-upper
-    tiles are explicitly zero (potrf FFI guarantees this for the
-    default ``nb = n/p`` block size) so chaining into ``distributed_trsm``
-    works correctly.
-
     Attributes
     ----------
     raw : jax.Array
-        Raw FFI output buffer, P('x','y')-sharded on ``mesh``.  Shape
-        ``(n, n)``, dtype matching the input ``A``.
+        Shape ``(n, n)``, sharded ``P('y', 'x')`` on ``mesh``.  Bytes
+        are SLATE's col-major L tiles; JAX reading this directly would
+        give ``L.T`` (or ``L.conj().T`` for complex).
     mesh : Mesh
         2-D mesh the factor was computed on.
     n : int
-        Side length of the matrix.
+        Matrix side length.
     nb : int
         Tile block size SLATE used.
     """
@@ -61,13 +63,17 @@ class SlateLowerL:
     nb: int
 
     def to_jax_lower(self) -> jax.Array:
-        """Return the standard lower-triangular L in JAX's row-major view.
+        """Return L in the conventional JAX row-major lower-triangular form.
 
-        Equivalent to ``jnp.tril(raw.conj().T)``.  Useful if the caller
-        wants to do operations on L outside of SLATE.  For chaining into
-        SLATE's trsm, pass the handle directly instead.
+        Local-transposes the per-rank buffer (P('y','x') → P('x','y'),
+        no inter-rank comm) and strips the (zeroed) strict-upper.
         """
-        return jnp.tril(self.raw.conj().T)
+        @partial(shard_map, mesh=self.mesh,
+                 in_specs=P("y", "x"), out_specs=P("x", "y"),
+                 check_rep=False)
+        def _local_T(local):
+            return jnp.transpose(local, (1, 0))
+        return jnp.tril(_local_T(self.raw))
 
 
 def distributed_cholesky(
@@ -83,43 +89,37 @@ def distributed_cholesky(
             f"mesh must have axes ('x','y'); got {mesh.axis_names}")
     p = int(mesh.shape["x"])
     q = int(mesh.shape["y"])
-    # SLATE potrf supports any p x q grid in principle, but our FFI
-    # passes row-major JAX shards as if they were col-major SLATE tiles.
-    # For square (p==q), per-rank shard is (n/p, n/p) and the
-    # reinterpretation is just a transpose, which a Hermitian A absorbs.
-    # For p != q the per-rank shape is rectangular (n/p, n/q) and the
-    # SLATE col-major view ends up at shape (n/q, n/p) — mismatched, so
-    # SLATE assembles something that isn't actually A and potrf reports
-    # info != 0.  Fix would be a local D2D transpose per shard before
-    # SLATE sees it; not implemented yet.
-    if p != q:
-        raise ValueError(
-            f"distributed_cholesky: only square meshes (p==q) are supported "
-            f"by this FFI; got {p}x{q}.  See cholesky.py for layout details.")
     if p * q != jax.process_count():
         raise ValueError(
             f"mesh {p}x{q} != jax.process_count()={jax.process_count()}")
     n = int(A.shape[0])
-    if n % p != 0:
-        raise ValueError(f"n={n} must be divisible by mesh axis size {p}")
+    if n % p != 0 or n % q != 0:
+        raise ValueError(
+            f"n={n} must be divisible by both mesh axes ({p},{q}).")
 
     get_lib()
     ctx_handle = get_or_init_context(mesh)
 
-    # Default tile size: divide by the larger grid axis so each rank
-    # holds at least 1 tile along both directions.  For square p==q this
-    # collapses to n//p (the original).  For non-square, n//p alone gave
-    # tile = n on p=1 grids → one giant tile, SLATE complains.
+    # Default tile size divides by the larger grid axis so each rank
+    # still holds >=1 tile along both directions.
     nb = n // max(p, q) if block_size is None else int(block_size)
-    L_local = jax.ShapeDtypeStruct((n // p, n // q), A.dtype)
 
+    # Local transpose via shard_map: each rank flips its own (n/p, n/q)
+    # row-major shard to (n/q, n/p) row-major.  Bytes are the same set
+    # the rank already had — no inter-rank communication.  After the
+    # transpose, those bytes equal the original block in col-major
+    # layout, which SLATE reads correctly.  Combined with the comm-remap
+    # on the C++ side (context.cc), SLATE assembles the global A
+    # correctly for any p x q mesh.
+    L_local_T = jax.ShapeDtypeStruct((n // q, n // p), A.dtype)
     attrs = dict(n=n, nb=nb, ctx_handle=int(ctx_handle))
 
     @partial(shard_map, mesh=mesh,
-             in_specs=P("x", "y"), out_specs=P("x", "y"),
+             in_specs=P("x", "y"), out_specs=P("y", "x"),
              check_rep=False)
-    def _call(local_A):
-        return jax.ffi.ffi_call(_FFI_TARGET, L_local)(local_A, **attrs)
+    def _potrf(local_A):
+        local_A_T = jnp.transpose(local_A, (1, 0))
+        return jax.ffi.ffi_call(_FFI_TARGET, L_local_T)(local_A_T, **attrs)
 
-    L_raw = _call(A)
-    return SlateLowerL(raw=L_raw, mesh=mesh, n=n, nb=nb)
+    L_raw_T = _potrf(A)
+    return SlateLowerL(raw=L_raw_T, mesh=mesh, n=n, nb=nb)
