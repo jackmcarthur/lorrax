@@ -23,6 +23,18 @@ reused across the loop; only the slice pointer changes per iteration.
 For the slate twin with the same shape contract (AMD-GPU fallback
 path) see ``ffi.slate.batched``.
 
+Early-init tip
+--------------
+First call to either function triggers a lazy ``get_or_init_subrow_context``
+that collectively creates an NCCL sub-comm + cuSOLVERMp handle + grid
+(~hundreds of ms).  To hoist that off the critical path of the first
+batched op, call it eagerly in ``main()`` right after
+``jax.distributed.initialize()``::
+
+    from ffi.cusolvermp.context import get_or_init_subrow_context
+    get_or_init_subrow_context(mesh)     # warm the sub-row context
+    # ... other JAX compile work can now overlap with the NCCL bootstrap
+
 Restrictions
 ------------
 * Mesh must be 2-D with axes ``('x', 'y')``.
@@ -31,6 +43,12 @@ Restrictions
 * One cuSOLVERMp handle per process → don't mix the world-wide
   ``distributed_eigh`` context and this sub-row context in the same
   session.
+* ``Mrhs`` is baked into the compiled JIT.  Users who loop with the
+  *same* chunk size pay zero recompile cost (jit-cache in this module).
+  Users who genuinely vary the chunk size per call would want an FFI
+  variant with ``mrhs`` as a runtime ``Buffer<S64>`` arg (phdf5 §2.3
+  pattern); not implemented today since GWJAX-style callers pick one
+  chunk size and stick with it.
 """
 from __future__ import annotations
 
@@ -54,6 +72,19 @@ __all__ = [
 
 _POTRF_TARGET = "lorrax_cusolvermp_batched_potrf"
 _POTRS_TARGET = "lorrax_cusolvermp_batched_potrs"
+
+# ---------------------------------------------------------------------------
+# jit(shard_map(...)) cache.  `shard_map` in eager mode re-traces on every
+# invocation (see src/ffi/phdf5/ARCHITECTURE.md §2.4 for the measurement on
+# the phdf5 write path).  Wrapping once in `jax.jit` and caching the
+# compiled function by signature eliminates the per-call retrace cost —
+# matters when the user loops potrs over many RHS chunks with the same
+# shape.  Key covers everything that affects the compiled HLO.
+# ---------------------------------------------------------------------------
+_JIT_CACHE: dict = {}
+
+def _mesh_key(mesh: Mesh):
+    return (tuple(mesh.axis_names), tuple(int(s) for s in mesh.shape.values()))
 
 
 @dataclass(frozen=True)
@@ -136,25 +167,32 @@ def batched_distributed_cholesky(
     nb = (n // Py) if block_size is None else int(block_size)
     mb = nb
 
-    # Local inner-dim transpose: (Nb_local, N, N/Py) row-major →
-    # (Nb_local, N/Py, N) row-major ≡ (N, N/Py) col-major per slice,
-    # which is what cuSOLVERMp's grid (1, Py) expects with lld=N.
-    L_local_T = jax.ShapeDtypeStruct(
-        (nb_batch_local, n // Py, n), A.dtype)
-    attrs = dict(
-        nbatch_local=nb_batch_local, n=n, mb=mb, nb=nb,
-        ctx_handle=int(ctx_handle),
-    )
+    key = ("potrf", _mesh_key(mesh), A.dtype,
+           nbatch, n, mb, nb, int(ctx_handle))
+    jit_potrf = _JIT_CACHE.get(key)
+    if jit_potrf is None:
+        # Local inner-dim transpose: (Nb_local, N, N/Py) row-major →
+        # (Nb_local, N/Py, N) row-major ≡ (N, N/Py) col-major per slice,
+        # which is what cuSOLVERMp's grid (1, Py) expects with lld=N.
+        L_local_T = jax.ShapeDtypeStruct(
+            (nb_batch_local, n // Py, n), A.dtype)
+        attrs = dict(
+            nbatch_local=nb_batch_local, n=n, mb=mb, nb=nb,
+            ctx_handle=int(ctx_handle),
+        )
 
-    @partial(shard_map, mesh=mesh,
-             in_specs=P("x", None, "y"),
-             out_specs=P("x", "y", None),
-             check_rep=False)
-    def _potrf(local_A):
-        local_A_T = jnp.transpose(local_A, (0, 2, 1))
-        return jax.ffi.ffi_call(_POTRF_TARGET, L_local_T)(local_A_T, **attrs)
+        @partial(shard_map, mesh=mesh,
+                 in_specs=P("x", None, "y"),
+                 out_specs=P("x", "y", None),
+                 check_rep=False)
+        def _potrf(local_A):
+            local_A_T = jnp.transpose(local_A, (0, 2, 1))
+            return jax.ffi.ffi_call(_POTRF_TARGET, L_local_T)(local_A_T, **attrs)
 
-    L_raw_T = _potrf(A)
+        jit_potrf = jax.jit(_potrf)
+        _JIT_CACHE[key] = jit_potrf
+
+    L_raw_T = jit_potrf(A)
     return CusolverMpBatchedLowerL(
         raw=L_raw_T, mesh=mesh, n=n, nb=nb, nbatch=nbatch)
 
@@ -216,27 +254,31 @@ def batched_distributed_potrs(
     mb = nb
 
     nb_batch_local = nbatch // Px
-    X_local_T = jax.ShapeDtypeStruct(
-        (nb_batch_local, mrhs // Py, n), B.dtype)
-    attrs = dict(
-        nbatch_local=nb_batch_local,
-        n=n, mrhs=mrhs, mb=mb, nb=nb,
-        ctx_handle=int(ctx_handle),
-    )
+    key = ("potrs", _mesh_key(mesh), B.dtype,
+           nbatch, n, mrhs, mb, nb, int(ctx_handle))
+    jit_potrs = _JIT_CACHE.get(key)
+    if jit_potrs is None:
+        X_local_T = jax.ShapeDtypeStruct(
+            (nb_batch_local, mrhs // Py, n), B.dtype)
+        attrs = dict(
+            nbatch_local=nb_batch_local,
+            n=n, mrhs=mrhs, mb=mb, nb=nb,
+            ctx_handle=int(ctx_handle),
+        )
 
-    @partial(shard_map, mesh=mesh,
-             in_specs=(P("x", "y", None), P("x", None, "y")),
-             out_specs=P("x", "y", None),
-             check_rep=False)
-    def _potrs(local_L, local_B):
-        local_B_T = jnp.transpose(local_B, (0, 2, 1))
-        return jax.ffi.ffi_call(_POTRS_TARGET, X_local_T)(
-            local_L, local_B_T, **attrs)
-    X_T = _potrs(L.raw, B)
+        @partial(shard_map, mesh=mesh,
+                 in_specs=(P("x", "y", None), P("x", None, "y")),
+                 out_specs=P("x", None, "y"),
+                 check_rep=False)
+        def _potrs(local_L, local_B):
+            local_B_T = jnp.transpose(local_B, (0, 2, 1))
+            X_T = jax.ffi.ffi_call(_POTRS_TARGET, X_local_T)(
+                local_L, local_B_T, **attrs)
+            # Untranspose inside the shard_map → output has P('x',None,'y')
+            # directly, saving a second shard_map pass.
+            return jnp.transpose(X_T, (0, 2, 1))
 
-    @partial(shard_map, mesh=mesh,
-             in_specs=P("x", "y", None), out_specs=P("x", None, "y"),
-             check_rep=False)
-    def _untranspose(local_X_T):
-        return jnp.transpose(local_X_T, (0, 2, 1))
-    return _untranspose(X_T)
+        jit_potrs = jax.jit(_potrs)
+        _JIT_CACHE[key] = jit_potrs
+
+    return jit_potrs(L.raw, B)

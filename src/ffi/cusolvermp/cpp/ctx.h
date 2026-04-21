@@ -35,6 +35,14 @@ struct LorraxCusolverMpCtx {
     cusolverMpGrid_t    grid       = nullptr;
     CalNcclShim         shim{};                 // stable address — CAL holds a ptr
 
+    // Pooled events for cross-stream joins.  Created once in ctor, destroyed
+    // once in dtor.  cudaEventRecord on an already-recorded event just
+    // updates the record point.  Avoids the +750 ms stalls that phdf5 hit
+    // with per-call cudaEventDestroy under cuda_malloc_async (see
+    // src/ffi/phdf5/ARCHITECTURE.md §2.2).
+    cudaEvent_t  ev_xla_in  = nullptr;   // signal on xla_stream → wait on ctx
+    cudaEvent_t  ev_ctx_out = nullptr;   // signal on ctx_stream → wait on xla
+
     // per-call scratch reused across invocations
     void*   d_workspace       = nullptr;
     size_t  d_workspace_bytes = 0;
@@ -74,6 +82,10 @@ struct LorraxCusolverMpSubRowCtx {
     cal_comm_t          cal_comm  = nullptr;
     cusolverMpGrid_t    grid      = nullptr;   // (1, Py)
     CalNcclShim         shim{};
+
+    // Pooled cross-stream join events (see LorraxCusolverMpCtx for rationale).
+    cudaEvent_t  ev_xla_in  = nullptr;
+    cudaEvent_t  ev_ctx_out = nullptr;
 
     // reused scratchpads
     void*   d_workspace       = nullptr;

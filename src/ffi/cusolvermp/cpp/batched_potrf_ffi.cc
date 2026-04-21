@@ -40,14 +40,16 @@ using lorrax_ffi::cusolvermp::LorraxCusolverMpSubRowCtx;
 using lorrax_ffi::cusolvermp::ensure_subrow_workspace;
 namespace mp = lorrax_ffi::cusolvermp::mp;
 
-// Record on signaller, wait on waiter — no host-level stream sync.
-static ffi::Error cross_stream_wait(cudaStream_t waiter,
-                                    cudaStream_t signaller) {
-    cudaEvent_t ev;
-    LORRAX_CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+// Cross-stream join using a pooled event.  `ev` is re-recorded on
+// `signaller`; cudaEventRecord on an already-recorded event just updates
+// the record point, so this is amortised to zero per-call cost.  See
+// src/ffi/phdf5/ARCHITECTURE.md §2.2 for why we avoid the per-call
+// cudaEventCreate / cudaEventDestroy pair on the hot path.
+static ffi::Error cross_stream_wait_pooled(cudaStream_t waiter,
+                                           cudaStream_t signaller,
+                                           cudaEvent_t  ev) {
     LORRAX_CUDA_CHECK(cudaEventRecord(ev, signaller));
     LORRAX_CUDA_CHECK(cudaStreamWaitEvent(waiter, ev, 0));
-    LORRAX_CUDA_CHECK(cudaEventDestroy(ev));
     return ffi::Error::Success();
 }
 
@@ -58,7 +60,8 @@ static ffi::Error BatchedPotrfImpl(
     LorraxCusolverMpSubRowCtx* ctx,
     const T* d_A_in, T* d_L_out)
 {
-    FFI_RETURN_IF_ERROR(cross_stream_wait(ctx->stream, xla_stream));
+    FFI_RETURN_IF_ERROR(cross_stream_wait_pooled(
+        ctx->stream, xla_stream, ctx->ev_xla_in));
 
     const int64_t Py   = ctx->Py;
     const int64_t lld  = n;                    // grid (1, Py) → full rows per rank
@@ -99,10 +102,11 @@ static ffi::Error BatchedPotrfImpl(
         return ffi::Error(ffi::ErrorCode::kResourceExhausted, ex.what());
     }
 
+    // d_info is never read (per-iter `status` already indicates success);
+    // skip the memset to avoid wasted stream ops.  Allocated once in ctor
+    // so the pointer is valid; cuSOLVERMp overwrites it per call.
     for (int64_t b = 0; b < nbatch_local; ++b) {
         T* slice_ptr = d_L_out + b * slice_elems;
-        LORRAX_CUDA_CHECK(
-            cudaMemsetAsync(ctx->d_info, 0, sizeof(int), ctx->stream));
         mp_st = mp::Potrf<T>(
             ctx->handle, CUBLAS_FILL_MODE_LOWER, n,
             slice_ptr, 1, 1, descA,
@@ -119,7 +123,8 @@ static ffi::Error BatchedPotrfImpl(
 
     cusolverMpDestroyMatrixDesc(descA);
 
-    FFI_RETURN_IF_ERROR(cross_stream_wait(xla_stream, ctx->stream));
+    FFI_RETURN_IF_ERROR(cross_stream_wait_pooled(
+        xla_stream, ctx->stream, ctx->ev_ctx_out));
     return ffi::Error::Success();
 }
 

@@ -51,17 +51,15 @@ static inline bool profile_enabled() {
 }
 
 // ---------------------------------------------------------------------------
-//  Cross-stream join.  XLA's stream produced the input; our ctx stream is
-//  what cusolverMp uses.  Record an event on one side, wait on the other
-//  — no host-level cudaStreamSynchronize needed in the hot path.
+//  Cross-stream join using pooled events on the ctx.  Avoids the +750 ms
+//  per-call stalls that phdf5 hit with `cudaEventDestroy` under
+//  `cuda_malloc_async` (see src/ffi/phdf5/ARCHITECTURE.md §2.2).
 // ---------------------------------------------------------------------------
-static ffi::Error cross_stream_wait(cudaStream_t waiter,
-                                    cudaStream_t signaller) {
-    cudaEvent_t ev;
-    LORRAX_CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+static ffi::Error cross_stream_wait_pooled(cudaStream_t waiter,
+                                           cudaStream_t signaller,
+                                           cudaEvent_t  ev) {
     LORRAX_CUDA_CHECK(cudaEventRecord(ev, signaller));
     LORRAX_CUDA_CHECK(cudaStreamWaitEvent(waiter, ev, 0));
-    LORRAX_CUDA_CHECK(cudaEventDestroy(ev));
     return ffi::Error::Success();
 }
 
@@ -87,7 +85,8 @@ static ffi::Error EighImpl(
         LORRAX_CUDA_CHECK(cudaEventRecord(ev[0], ctx->stream));
     }
 
-    FFI_RETURN_IF_ERROR(cross_stream_wait(ctx->stream, xla_stream));
+    FFI_RETURN_IF_ERROR(cross_stream_wait_pooled(
+        ctx->stream, xla_stream, ctx->ev_xla_in));
     if (prof) LORRAX_CUDA_CHECK(cudaEventRecord(ev[1], ctx->stream));
 
     const int64_t llda = (n + ctx->p - 1) / ctx->p;   // = n/p when exact
@@ -175,7 +174,8 @@ static ffi::Error EighImpl(
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
 
-    FFI_RETURN_IF_ERROR(cross_stream_wait(xla_stream, ctx->stream));
+    FFI_RETURN_IF_ERROR(cross_stream_wait_pooled(
+        xla_stream, ctx->stream, ctx->ev_ctx_out));
     if (prof) LORRAX_CUDA_CHECK(cudaEventRecord(ev[5], ctx->stream));
 
     if (prof) {

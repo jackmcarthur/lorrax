@@ -38,13 +38,12 @@ using lorrax_ffi::cusolvermp::LorraxCusolverMpSubRowCtx;
 using lorrax_ffi::cusolvermp::ensure_subrow_workspace;
 namespace mp = lorrax_ffi::cusolvermp::mp;
 
-static ffi::Error cross_stream_wait(cudaStream_t waiter,
-                                    cudaStream_t signaller) {
-    cudaEvent_t ev;
-    LORRAX_CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+// See batched_potrf_ffi.cc for the rationale for the pooled-event pattern.
+static ffi::Error cross_stream_wait_pooled(cudaStream_t waiter,
+                                           cudaStream_t signaller,
+                                           cudaEvent_t  ev) {
     LORRAX_CUDA_CHECK(cudaEventRecord(ev, signaller));
     LORRAX_CUDA_CHECK(cudaStreamWaitEvent(waiter, ev, 0));
-    LORRAX_CUDA_CHECK(cudaEventDestroy(ev));
     return ffi::Error::Success();
 }
 
@@ -56,7 +55,8 @@ static ffi::Error BatchedPotrsImpl(
     LorraxCusolverMpSubRowCtx* ctx,
     const T* d_L, const T* d_B_in, T* d_X_out)
 {
-    FFI_RETURN_IF_ERROR(cross_stream_wait(ctx->stream, xla_stream));
+    FFI_RETURN_IF_ERROR(cross_stream_wait_pooled(
+        ctx->stream, xla_stream, ctx->ev_xla_in));
 
     const int64_t Py   = ctx->Py;
     const int64_t lldA = n;
@@ -105,11 +105,10 @@ static ffi::Error BatchedPotrsImpl(
         return ffi::Error(ffi::ErrorCode::kResourceExhausted, ex.what());
     }
 
+    // d_info never read per iter (see batched_potrf_ffi.cc).
     for (int64_t b = 0; b < nbatch_local; ++b) {
         T* A_slice_ptr = const_cast<T*>(d_L) + b * A_slice;
         T* X_slice_ptr = d_X_out + b * B_slice;
-        LORRAX_CUDA_CHECK(
-            cudaMemsetAsync(ctx->d_info, 0, sizeof(int), ctx->stream));
         mp_st = mp::Potrs<T>(
             ctx->handle, CUBLAS_FILL_MODE_LOWER, n, mrhs,
             A_slice_ptr, 1, 1, descA,
@@ -129,7 +128,8 @@ static ffi::Error BatchedPotrsImpl(
     cusolverMpDestroyMatrixDesc(descA);
     cusolverMpDestroyMatrixDesc(descB);
 
-    FFI_RETURN_IF_ERROR(cross_stream_wait(xla_stream, ctx->stream));
+    FFI_RETURN_IF_ERROR(cross_stream_wait_pooled(
+        xla_stream, ctx->stream, ctx->ev_ctx_out));
     return ffi::Error::Success();
 }
 

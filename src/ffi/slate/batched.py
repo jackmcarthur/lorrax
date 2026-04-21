@@ -58,6 +58,15 @@ _UPLO  = {"L": 0, "U": 1}
 _OP    = {"N": 0, "T": 1, "C": 2}
 _DIAG  = {"N": 0, "U": 1}
 
+# jit(shard_map(...)) cache per signature.  shard_map in eager mode
+# re-traces per call; wrapping in jax.jit once and reusing eliminates
+# that cost when the user loops the same-shape op (e.g. batched_trsm
+# across many RHS chunks).  See src/ffi/phdf5/ARCHITECTURE.md §2.4.
+_JIT_CACHE: dict = {}
+
+def _mesh_key(mesh: Mesh):
+    return (tuple(mesh.axis_names), tuple(int(s) for s in mesh.shape.values()))
+
 
 @dataclass(frozen=True)
 class SlateBatchedLowerL:
@@ -121,26 +130,33 @@ def batched_distributed_cholesky(
     nb_batch_local = nbatch // Px
     nb = n // Py if block_size is None else int(block_size)
 
-    # Local transpose of the inner two dims: (Nb_local, N, N/Py) row-major
-    # → (Nb_local, N/Py, N) row-major, which is (N, N/Py) col-major per
-    # slice — the layout SLATE's fromDevices expects with p=1, q=Py.
-    L_local_T = jax.ShapeDtypeStruct(
-        (nb_batch_local, n // Py, n), A.dtype)
-    attrs = dict(
-        nbatch_local=nb_batch_local, n=n, nb=nb,
-        ctx_handle=int(ctx_handle),
-    )
+    key = ("potrf", _mesh_key(mesh), A.dtype,
+           nbatch, n, nb, int(ctx_handle))
+    jit_potrf = _JIT_CACHE.get(key)
+    if jit_potrf is None:
+        # Local transpose of the inner two dims: (Nb_local, N, N/Py) row-major
+        # → (Nb_local, N/Py, N) row-major, which is (N, N/Py) col-major per
+        # slice — the layout SLATE's fromDevices expects with p=1, q=Py.
+        L_local_T = jax.ShapeDtypeStruct(
+            (nb_batch_local, n // Py, n), A.dtype)
+        attrs = dict(
+            nbatch_local=nb_batch_local, n=n, nb=nb,
+            ctx_handle=int(ctx_handle),
+        )
 
-    @partial(shard_map, mesh=mesh,
-             in_specs=P("x", None, "y"),
-             out_specs=P("x", "y", None),
-             check_rep=False)
-    def _potrf(local_A):
-        # local_A shape: (Nb_local, N, N/Py)
-        local_A_T = jnp.transpose(local_A, (0, 2, 1))
-        return jax.ffi.ffi_call(_POTRF_TARGET, L_local_T)(local_A_T, **attrs)
+        @partial(shard_map, mesh=mesh,
+                 in_specs=P("x", None, "y"),
+                 out_specs=P("x", "y", None),
+                 check_rep=False)
+        def _potrf(local_A):
+            # local_A shape: (Nb_local, N, N/Py)
+            local_A_T = jnp.transpose(local_A, (0, 2, 1))
+            return jax.ffi.ffi_call(_POTRF_TARGET, L_local_T)(local_A_T, **attrs)
 
-    L_raw_T = _potrf(A)
+        jit_potrf = jax.jit(_potrf)
+        _JIT_CACHE[key] = jit_potrf
+
+    L_raw_T = jit_potrf(A)
     return SlateBatchedLowerL(
         raw=L_raw_T, mesh=mesh, n=n, nb=nb, nbatch=nbatch)
 
@@ -229,47 +245,53 @@ def batched_distributed_trsm(
     nbatch_local = nbatch // Px
     nb = n // Py if block_size is None else int(block_size)
 
-    # Expected per-slice: (B.shape[1], B.shape[2]/Py) row-major → transpose
-    # inner two dims → (B.shape[2]/Py, B.shape[1]) row-major ≡ col-major.
-    X_local_T_shape = (nbatch_local, B.shape[2] // Py, B.shape[1])
-    X_local_T = jax.ShapeDtypeStruct(X_local_T_shape, B.dtype)
-
     alpha_c = complex(alpha)
-    attrs = dict(
-        nbatch_local=nbatch_local,
-        n=n, m=m, nb=nb,
-        side=_SIDE[side], uplo=_UPLO[uplo],
-        op=_OP[op], diag=_DIAG[diag],
-        alpha_re=float(alpha_c.real),
-        alpha_im=float(alpha_c.imag),
-        ctx_handle=int(ctx_handle),
-    )
+    key = ("trsm", _mesh_key(mesh), B.dtype, A_is_handle,
+           nbatch, n, m, nb,
+           _SIDE[side], _UPLO[uplo], _OP[op], _DIAG[diag],
+           float(alpha_c.real), float(alpha_c.imag),
+           int(ctx_handle))
+    jit_trsm = _JIT_CACHE.get(key)
+    if jit_trsm is None:
+        # Expected per-slice: (B.shape[1], B.shape[2]/Py) row-major → transpose
+        # inner two dims → (B.shape[2]/Py, B.shape[1]) row-major ≡ col-major.
+        X_local_T_shape = (nbatch_local, B.shape[2] // Py, B.shape[1])
+        X_local_T = jax.ShapeDtypeStruct(X_local_T_shape, B.dtype)
 
-    if A_is_handle:
-        @partial(shard_map, mesh=mesh,
-                 in_specs=(P("x", "y", None), P("x", None, "y")),
-                 out_specs=P("x", "y", None),
-                 check_rep=False)
-        def _trsm(local_A_handle, local_B):
-            local_B_T = jnp.transpose(local_B, (0, 2, 1))
-            return jax.ffi.ffi_call(_TRSM_TARGET, X_local_T)(
-                local_A_handle, local_B_T, **attrs)
-        X_T = _trsm(A_arg, B)
-    else:
-        @partial(shard_map, mesh=mesh,
-                 in_specs=(P("x", None, "y"), P("x", None, "y")),
-                 out_specs=P("x", "y", None),
-                 check_rep=False)
-        def _trsm(local_A, local_B):
-            local_A_T = jnp.transpose(local_A, (0, 2, 1))
-            local_B_T = jnp.transpose(local_B, (0, 2, 1))
-            return jax.ffi.ffi_call(_TRSM_TARGET, X_local_T)(
-                local_A_T, local_B_T, **attrs)
-        X_T = _trsm(A_arg, B)
+        attrs = dict(
+            nbatch_local=nbatch_local,
+            n=n, m=m, nb=nb,
+            side=_SIDE[side], uplo=_UPLO[uplo],
+            op=_OP[op], diag=_DIAG[diag],
+            alpha_re=float(alpha_c.real),
+            alpha_im=float(alpha_c.imag),
+            ctx_handle=int(ctx_handle),
+        )
 
-    @partial(shard_map, mesh=mesh,
-             in_specs=P("x", "y", None), out_specs=P("x", None, "y"),
-             check_rep=False)
-    def _untranspose(local_X_T):
-        return jnp.transpose(local_X_T, (0, 2, 1))
-    return _untranspose(X_T)
+        if A_is_handle:
+            @partial(shard_map, mesh=mesh,
+                     in_specs=(P("x", "y", None), P("x", None, "y")),
+                     out_specs=P("x", None, "y"),
+                     check_rep=False)
+            def _trsm(local_A_handle, local_B):
+                local_B_T = jnp.transpose(local_B, (0, 2, 1))
+                X_T = jax.ffi.ffi_call(_TRSM_TARGET, X_local_T)(
+                    local_A_handle, local_B_T, **attrs)
+                # Untranspose inside the shard_map → skip a second pass.
+                return jnp.transpose(X_T, (0, 2, 1))
+        else:
+            @partial(shard_map, mesh=mesh,
+                     in_specs=(P("x", None, "y"), P("x", None, "y")),
+                     out_specs=P("x", None, "y"),
+                     check_rep=False)
+            def _trsm(local_A, local_B):
+                local_A_T = jnp.transpose(local_A, (0, 2, 1))
+                local_B_T = jnp.transpose(local_B, (0, 2, 1))
+                X_T = jax.ffi.ffi_call(_TRSM_TARGET, X_local_T)(
+                    local_A_T, local_B_T, **attrs)
+                return jnp.transpose(X_T, (0, 2, 1))
+
+        jit_trsm = jax.jit(_trsm)
+        _JIT_CACHE[key] = jit_trsm
+
+    return jit_trsm(A_arg, B)

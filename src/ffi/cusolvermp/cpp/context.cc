@@ -208,6 +208,14 @@ int64_t create_context(int rank, int world_size,
     throw_if_cuda(cudaMalloc(&ctx->d_info, sizeof(int)), "cudaMalloc(d_info)");
     throw_if_cuda(cudaMemset(ctx->d_info, 0, sizeof(int)), "cudaMemset(d_info)");
 
+    // Pooled cross-stream events.  Created once, reused for every FFI call.
+    throw_if_cuda(cudaEventCreateWithFlags(&ctx->ev_xla_in,
+                                           cudaEventDisableTiming),
+                  "cudaEventCreate(ev_xla_in)");
+    throw_if_cuda(cudaEventCreateWithFlags(&ctx->ev_ctx_out,
+                                           cudaEventDisableTiming),
+                  "cudaEventCreate(ev_ctx_out)");
+
     // Workspace scratchpads start empty; grown on demand in the FFI.
     ctx->d_workspace = nullptr;
     ctx->d_workspace_bytes = 0;
@@ -229,6 +237,8 @@ void destroy_context(int64_t ctx_handle) {
         ctx->shim.d_scratch = nullptr;
         ctx->shim.d_scratch_bytes = 0;
     }
+    if (ctx->ev_xla_in)  { cudaEventDestroy(ctx->ev_xla_in);     ctx->ev_xla_in = nullptr; }
+    if (ctx->ev_ctx_out) { cudaEventDestroy(ctx->ev_ctx_out);    ctx->ev_ctx_out = nullptr; }
     if (ctx->stream)   { cudaStreamDestroy(ctx->stream);         ctx->stream = nullptr; }
     if (ctx->nccl_comm){ ncclCommDestroy(ctx->nccl_comm);        ctx->nccl_comm = nullptr; }
     if (ctx->d_info)  { cudaFree(ctx->d_info);                   ctx->d_info = nullptr; }
@@ -351,6 +361,13 @@ int64_t create_subrow_context(int world_rank, int world_size,
 
     throw_if_cuda(cudaMalloc(&ctx->d_info, sizeof(int)), "cudaMalloc(d_info)");
     throw_if_cuda(cudaMemset(ctx->d_info, 0, sizeof(int)), "cudaMemset(d_info)");
+
+    throw_if_cuda(cudaEventCreateWithFlags(&ctx->ev_xla_in,
+                                           cudaEventDisableTiming),
+                  "cudaEventCreate(subrow ev_xla_in)");
+    throw_if_cuda(cudaEventCreateWithFlags(&ctx->ev_ctx_out,
+                                           cudaEventDisableTiming),
+                  "cudaEventCreate(subrow ev_ctx_out)");
     return reinterpret_cast<int64_t>(ctx);
 }
 
@@ -365,6 +382,8 @@ void destroy_subrow_context(int64_t ctx_handle) {
         ctx->shim.d_scratch = nullptr;
         ctx->shim.d_scratch_bytes = 0;
     }
+    if (ctx->ev_xla_in)  { cudaEventDestroy(ctx->ev_xla_in);   ctx->ev_xla_in = nullptr; }
+    if (ctx->ev_ctx_out) { cudaEventDestroy(ctx->ev_ctx_out);  ctx->ev_ctx_out = nullptr; }
     if (ctx->stream)   { cudaStreamDestroy(ctx->stream);       ctx->stream = nullptr; }
     if (ctx->nccl_comm){ ncclCommDestroy(ctx->nccl_comm);      ctx->nccl_comm = nullptr; }
     if (ctx->d_info)   { cudaFree(ctx->d_info);                ctx->d_info = nullptr; }
