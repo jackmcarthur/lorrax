@@ -241,70 +241,35 @@ def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int):
 
 
 def _get_w_solve_fn_low_mem(mesh_xy: Mesh, nq: int, n_rmu: int, dtype):
-    """Low-mem W-solve: symmetric Cholesky path.
+    """Low-mem W-solve: fused cuBLASMp + cuSOLVERMp FFI.
 
-    Trick (algebraic identity (I − AB)⁻¹ A = A (I − BA)⁻¹):
-        v = X X†        (Cholesky of v)
-        W = (I − v χ)⁻¹ v = X (I − X† χ X)⁻¹ X† = X H⁻¹ X†
-    where H = I − X† χ X is Hermitian PD (χ ≼ 0 for static response).
-    All distributed ops use the working Cholesky + trisolve kernels.
+    One distributed FFI call runs the entire symmetric Cholesky Dyson
+    solve inside the device:
+        v = X X†                 (cusolverMp potrf)
+        H = I − X† (pref·χ) X    (2 cublasMp gemms + identity kernel)
+        L_H = chol(H)            (cusolverMp potrf)
+        W = X H⁻¹ X†             (2 cublasMp trsms + 1 cublasMp gemm)
 
-    We use this because cuSOLVERMp 0.6.0 has a 2D-grid bug in getrf/getrs
-    (see ffi.cusolvermp.batched_distributed_solve_lu).  Also potentially
-    2× faster than LU: 2× potrf + 1× potrs vs getrf+getrs, though the
-    three extra matmuls can dominate at small N.
+    No JAX-level intermediates, no opportunity for XLA to reshard or
+    rematerialize — all matmuls are distributed-native in-device.
     """
-    from ffi.cusolvermp import (
-        batched_distributed_cholesky,
-        batched_distributed_potrs,
-        cholesky_handle_to_natural_L,
-    )
+    from ffi.cublasmp import batched_fused_w_solve
     from jax.sharding import NamedSharding
 
-    cache_key = ("low_mem", id(mesh_xy), nq, n_rmu, dtype)
+    cache_key = ("low_mem_fused", id(mesh_xy), nq, n_rmu, dtype)
     if cache_key in _w_solve_cache:
         return _w_solve_cache[cache_key]
 
-    Py = int(mesh_xy.shape["y"])
     nat = NamedSharding(mesh_xy, P(None, "x", "y"))
-    I_q = jnp.broadcast_to(jnp.eye(n_rmu, dtype=dtype)[None, :, :],
-                            (nq, n_rmu, n_rmu))
 
-    @jax.jit
     def _solve_w_low(V_q, chi0_q, pref):
-        chi_scaled = pref * chi0_q
-        V_q = jax.lax.with_sharding_constraint(V_q, nat)
-        chi_scaled = jax.lax.with_sharding_constraint(chi_scaled, nat)
-        # 1. X = chol(V)   [batched distributed potrf]
-        X_handle = batched_distributed_cholesky(V_q, mesh=mesh_xy)
-        # 2. Materialize X and X† as regular jax.Arrays.
-        X = cholesky_handle_to_natural_L(X_handle)
-        X_dagger = jnp.conj(jnp.swapaxes(X, -1, -2))
-        # 3. T = X† χ X — two distributed matmuls.
-        T = X_dagger @ chi_scaled @ X
-        # 4. H = I − T  (Hermitian, expected PD)
-        H = jax.lax.with_sharding_constraint(I_q - T, nat)
-        # 5. L_H = chol(H)
-        L_H_handle = batched_distributed_cholesky(H, mesh=mesh_xy)
-        # 6. Y = potrs(L_H, X†) = H⁻¹ X†.  Two workarounds for
-        #    cuSOLVERMp 0.6.0 bugs on 2D grids:
-        #      (a) potrs requires B sharded P(None, 'x', 'y') — X_dagger
-        #          is P(None, 'y', 'x') after the swapaxes.
-        #      (b) potrs returns wrong answers when NRHS ≤ N.  Pad X_dagger
-        #          along the RHS column axis so NRHS > N, then slice
-        #          the result back to (nq, N, N).  Padding cost is
-        #          O(1/N) relative; negligible at N ≥ 640.
-        pad = 2 * Py   # keep NRHS divisible by Py; pick smallest passing
-        X_dagger_padded = jnp.pad(
-            X_dagger, ((0, 0), (0, 0), (0, pad)), mode="constant")
-        X_dagger_padded = jax.lax.with_sharding_constraint(
-            X_dagger_padded, NamedSharding(mesh_xy, P(None, "x", "y")))
-        Y_padded = batched_distributed_potrs(
-            L_H_handle, X_dagger_padded, mesh=mesh_xy)
-        Y = Y_padded[:, :, :n_rmu]
-        # 7. W = X Y
-        W = X @ Y
-        return jax.lax.with_sharding_constraint(W, nat)
+        # The fused FFI reads pref as a compile-time complex scalar attr,
+        # so pref must be a Python scalar here (not a jnp array).  We
+        # don't wrap this in @jax.jit because batched_fused_w_solve's
+        # inner shard_map is already jit-cached per (mesh, shape, pref).
+        V_q    = jax.lax.with_sharding_constraint(V_q,    nat)
+        chi0_q = jax.lax.with_sharding_constraint(chi0_q, nat)
+        return batched_fused_w_solve(V_q, chi0_q, pref, mesh=mesh_xy)
 
     _w_solve_cache[cache_key] = _solve_w_low
     return _solve_w_low
@@ -326,15 +291,18 @@ def solve_w(V_q, chi0_q, meta, mesh_xy, *, memory_mode: str = "high_mem"):
     n_rmu = chi0_q.shape[1]
     nspin = max(1, int(getattr(meta, 'nspin', 1)))
     nspinor = max(1, int(getattr(meta, 'nspinor', 1)))
-    pref = jnp.asarray(2.0 / (float(max(1, nq)) ** 0.5 * float(nspin) * float(nspinor)),
-                        dtype=jnp.complex128)
+    pref_scalar = 2.0 / (float(max(1, nq)) ** 0.5 * float(nspin) * float(nspinor))
     mode = (memory_mode or "high_mem").lower()
     if mode == "low_mem":
+        # Fused FFI consumes pref as a Python scalar (compile-time attr).
         solve_fn = _get_w_solve_fn_low_mem(mesh_xy, nq, n_rmu, V_q.dtype)
+        with jax_profile.annotation("W_solve"):
+            return solve_fn(V_q, chi0_q, complex(pref_scalar))
     else:
         solve_fn = _get_w_solve_fn(mesh_xy, nq, n_rmu)
-    with jax_profile.annotation("W_solve"):
-        return solve_fn(V_q, chi0_q, pref)
+        pref_jnp = jnp.asarray(pref_scalar, dtype=jnp.complex128)
+        with jax_profile.annotation("W_solve"):
+            return solve_fn(V_q, chi0_q, pref_jnp)
 
 
 # Backward-compatible alias

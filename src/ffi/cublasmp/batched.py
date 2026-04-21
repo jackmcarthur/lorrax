@@ -32,9 +32,10 @@ from jax.sharding import Mesh, PartitionSpec as P
 from ..common.ffi_loader import get_lib
 from ..cusolvermp.context import get_or_init_context
 
-__all__ = ["batched_distributed_gemm"]
+__all__ = ["batched_distributed_gemm", "batched_fused_w_solve"]
 
 _GEMM_TARGET = "lorrax_cublasmp_batched_gemm"
+_W_SOLVE_TARGET = "lorrax_cublasmp_batched_w_solve"
 
 _OP_CODE = {"N": 0, "T": 1, "C": 2,
             "n": 0, "t": 1, "c": 2}
@@ -183,3 +184,85 @@ def batched_distributed_gemm(
         _JIT_CACHE[key] = jit_gemm
 
     return jit_gemm(A, B, C)
+
+
+def batched_fused_w_solve(
+    V: jax.Array,
+    chi: jax.Array,
+    pref: Union[float, complex],
+    *,
+    mesh: Mesh,
+    stop_after_step: int = 0,
+) -> jax.Array:
+    """Fused distributed W-solve:  W = X (I − X^† pref·χ X)^{-1} X^†.
+
+    Runs the entire symmetric Cholesky formulation of the Dyson solve in
+    a single FFI: potrf(V) → 2 cuBLASMp gemms → identity−T kernel →
+    potrf(H) → 2 cuBLASMp trsms → cuBLASMp gemm.  No JAX-level
+    intermediates, no opportunity for XLA to reshard or rematerialize.
+
+    Inputs
+    ------
+    V : (Nq, N, N)  P(None,'x','y')  — Hermitian PD Coulomb, DONATED (XLA
+        reuses its buffer for the Cholesky factor X).
+    chi : (Nq, N, N) P(None,'x','y') — Hermitian, typically χ ≼ 0 so
+        H = I − X^† pref·χ X is Hermitian PD (Cholesky-factorisable).
+    pref : complex scalar — multiplier on χ inside the solve.
+
+    Output
+    ------
+    W : (Nq, N, N) P(None,'x','y') — same sharding as V/χ.
+    """
+    if V.ndim != 3 or V.shape[1] != V.shape[2]:
+        raise ValueError(f"V must be (Nq, N, N); got {V.shape}")
+    if chi.shape != V.shape or chi.dtype != V.dtype:
+        raise ValueError(
+            f"chi must match V in shape/dtype; got V={V.shape}/{V.dtype} "
+            f"chi={chi.shape}/{chi.dtype}")
+    Px, Py = _validate_mesh(mesh)
+    nq = int(V.shape[0])
+    n  = int(V.shape[1])
+    if n % Px != 0 or n % Py != 0:
+        raise ValueError(
+            f"N={n} must be divisible by both Px={Px} and Py={Py}.")
+
+    get_lib()
+    ctx_handle = get_or_init_context(mesh, col_major=False)
+
+    pref_c = complex(pref)
+    stop_after_step = int(stop_after_step)
+    key = ("w_solve", _mesh_key(mesh), V.dtype, nq, n,
+           pref_c, int(ctx_handle), stop_after_step)
+    jit_fn = _JIT_CACHE.get(key)
+    if jit_fn is None:
+        W_local_T = jax.ShapeDtypeStruct(
+            (nq, n // Py, n // Px), V.dtype)
+        attrs = dict(
+            nq=nq, n=n,
+            pref_re=float(pref_c.real),
+            pref_im=float(pref_c.imag),
+            ctx_handle=int(ctx_handle),
+            stop_after_step=stop_after_step,
+        )
+
+        @partial(shard_map, mesh=mesh,
+                 in_specs=(P(None, "x", "y"), P(None, "x", "y")),
+                 out_specs=P(None, "x", "y"),
+                 check_rep=False)
+        def _w_solve(local_V, local_chi):
+            # Pre-transpose so bytes are col-major (N/Px × N/Py) per rank.
+            V_T   = jnp.transpose(local_V,   (0, 2, 1))
+            chi_T = jnp.transpose(local_chi, (0, 2, 1))
+            W_T = jax.ffi.ffi_call(
+                _W_SOLVE_TARGET, W_local_T,
+                # Don't alias V → output: V is typically consumed by
+                # downstream (e.g. sigma_coh needs the original v), and
+                # the FFI's cudaMemcpyAsync V_in → V_work path handles
+                # the non-aliased case correctly.
+            )(V_T, chi_T, **attrs)
+            return jnp.transpose(W_T, (0, 2, 1))
+
+        jit_fn = jax.jit(_w_solve)
+        _JIT_CACHE[key] = jit_fn
+
+    return jit_fn(V, chi)

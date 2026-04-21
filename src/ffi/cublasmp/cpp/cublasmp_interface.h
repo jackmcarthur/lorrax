@@ -83,4 +83,51 @@ inline cublasMpStatus_t Matmul(
         h_workspace, workspace_bytes_host);
 }
 
+// ---------------------------------------------------------------------------
+//  Trsm — distributed triangular solve:  op(A) X = alpha B  (side=LEFT) or
+//                                         X op(A) = alpha B  (side=RIGHT)
+//  B is read and overwritten with X (in place).  A is triangular.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+inline cublasMpStatus_t TrsmBufferSize(
+    cublasMpHandle_t handle,
+    cublasSideMode_t side, cublasFillMode_t uplo,
+    cublasOperation_t trans, cublasDiagType_t diag,
+    int64_t m, int64_t n,
+    const T* alpha,
+    const T* d_A, int64_t ia, int64_t ja, cublasMpMatrixDescriptor_t descA,
+    T* d_B, int64_t ib, int64_t jb, cublasMpMatrixDescriptor_t descB,
+    size_t* workspace_bytes_device,
+    size_t* workspace_bytes_host)
+{
+    return cublasMpTrsm_bufferSize(
+        handle, side, uplo, trans, diag, m, n,
+        alpha, d_A, ia, ja, descA,
+        d_B, ib, jb, descB,
+        ComputeTypeOf<T>::value,
+        workspace_bytes_device, workspace_bytes_host);
+}
+
+template <typename T>
+inline cublasMpStatus_t Trsm(
+    cublasMpHandle_t handle,
+    cublasSideMode_t side, cublasFillMode_t uplo,
+    cublasOperation_t trans, cublasDiagType_t diag,
+    int64_t m, int64_t n,
+    const T* alpha,
+    const T* d_A, int64_t ia, int64_t ja, cublasMpMatrixDescriptor_t descA,
+    T* d_B, int64_t ib, int64_t jb, cublasMpMatrixDescriptor_t descB,
+    void* d_workspace, size_t workspace_bytes_device,
+    void* h_workspace, size_t workspace_bytes_host)
+{
+    return cublasMpTrsm(
+        handle, side, uplo, trans, diag, m, n,
+        alpha, d_A, ia, ja, descA,
+        d_B, ib, jb, descB,
+        ComputeTypeOf<T>::value,
+        d_workspace, workspace_bytes_device,
+        h_workspace, workspace_bytes_host);
+}
+
 }  // namespace lorrax_ffi::cublasmp::mp

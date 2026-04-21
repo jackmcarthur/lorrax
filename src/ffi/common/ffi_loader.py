@@ -43,6 +43,7 @@ _FFI_TARGET_SYMBOLS = {
     "lorrax_cusolvermp_batched_potrs":    "CusolverMpBatchedPotrsFfi",
     "lorrax_cusolvermp_batched_solve_lu": "CusolverMpBatchedSolveLuFfi",
     "lorrax_cublasmp_batched_gemm":       "CublasMpBatchedGemmFfi",
+    "lorrax_cublasmp_batched_w_solve":    "CublasMpBatchedWSolveFfi",
     "lorrax_cusolvermg_eigh_f64":   "EighMgF64",
     "lorrax_phdf5_write":           "PhdfWriteFfi",
     "lorrax_phdf5_read":            "PhdfReadFfi",

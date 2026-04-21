@@ -9,6 +9,24 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # ----------------------------------------------------------------------------
+# CUDA language (for .cu kernel translation units compiled by nvcc).  We
+# point CMAKE_CUDA_COMPILER at the container's nvcc so it matches the
+# toolkit whose headers/runtime we already use for the C++ TUs.  A100 =
+# compute_80 / sm_80; the Shifter container on Perlmutter is A100-only.
+# ----------------------------------------------------------------------------
+if(NOT DEFINED CMAKE_CUDA_COMPILER)
+    if(EXISTS "/usr/local/cuda/bin/nvcc")
+        set(CMAKE_CUDA_COMPILER "/usr/local/cuda/bin/nvcc")
+    endif()
+endif()
+enable_language(CUDA)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 80)  # A100 on Perlmutter
+endif()
+
+# ----------------------------------------------------------------------------
 #  Locate cuSOLVERMp + libcal.  BGW-style: prefer -D options, else env vars,
 #  else well-known paths.  See src/ffi/PORTING.md for per-cluster notes.
 # ----------------------------------------------------------------------------
@@ -350,6 +368,8 @@ set(LORRAX_FFI_SOURCES
     ../../cusolvermp/cpp/batched_potrs_ffi.cc
     ../../cusolvermp/cpp/batched_solve_lu_ffi.cc
     ../../cublasmp/cpp/batched_gemm_ffi.cc
+    ../../cublasmp/cpp/batched_w_solve_ffi.cc
+    ../../cublasmp/cpp/w_solve_kernels.cu
     ../../cusolvermg/cpp/eigh_mg_ffi.cc
     ../../phdf5/cpp/context.cc
     ../../phdf5/cpp/write_ffi.cc
@@ -406,7 +426,18 @@ if(LORRAX_HAVE_SLATE)
 endif()
 
 target_compile_options(lorrax_ffi PRIVATE
-    -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable
+    $<$<COMPILE_LANGUAGE:CXX>:-Wall>
+    $<$<COMPILE_LANGUAGE:CXX>:-Wextra>
+    $<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-parameter>
+    $<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-variable>
+)
+
+# Ensure nvcc passes -fPIC to the host compiler for .cu TUs linked into
+# the shared lib.  CMAKE_POSITION_INDEPENDENT_CODE usually handles this,
+# but being explicit avoids relocation R_X86_64_PC32 link errors.
+set_target_properties(lorrax_ffi PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    POSITION_INDEPENDENT_CODE ON
 )
 
 message(STATUS "lorrax_ffi will link:")
