@@ -377,31 +377,36 @@ def get_sharded_wfns_rchunk_slice(
             )(psi_flat, jnp.array([r_start_dyn]))
             return psi_rchunk
 
-        # Reshard {-,XY,-,-} → {-,Y,-,-} → {-,-,-,Y} + donation.
+        # Reshard {-,XY,-,-} → {-,X,-,Y} → {-,-,-,Y} (y-first).
         #
-        # The two with_sharding_constraint hints steer SPMD through an
-        # intermediate where bands are y-sharded only (all-gather along x
-        # first, then all-to-all along y).  Going directly to the final
-        # sharding triggers an Involuntary full rematerialization because
-        # both mesh axes re-shard at once; the stage_Y hint prevents it.
-        # Donation lets XLA alias the input buffer for the final output,
-        # dropping peak from 3× T_rchunk_y to 2× (+ one NCCL staging).
-        # Using a separate JIT from the FFT prevents XLA from
+        # Stage through P(None,'x',None,'y') — do the all_to_all on 'y'
+        # FIRST (split rchunk, concat bands) while the tile is still
+        # small (bytes stay constant), then the final all_gather on 'x'
+        # inflates the tile by p_x.  X-first inflates BEFORE the
+        # all_to_all and pays 2× NCCL staging on the inflated tile;
+        # y-first pays 1× (small all_to_all on input-sized tile, then
+        # one all_gather).
+        #
+        # ``out_shardings=final`` on the jit is load-bearing: without it
+        # XLA treats the second with_sharding_constraint as a
+        # suggestion and silently drops the final all_gather-x,
+        # returning stage sharding P(None,'x',None,'y').  With
+        # out_shardings set the final sharding is a hard contract so
+        # the all_gather is guaranteed to run.
+        #
+        # Measured at MoS2 3×3 nosym (nk=9, nb=80, Br=46080, 2×2 mesh):
+        #   x-first hints:  1.86 GB/dev
+        #   y-first + out_shardings:  1.33 GB/dev  (~28 % reduction)
+        #
+        # Using a separate jit from the FFT prevents XLA from
         # rematerializing the FFT during the reshard.
-        #
-        # A y-first order (stage_X_rchunk_Y = P(None,'x',None,'y')) was
-        # tried — XLA silently dropped the final constraint and returned
-        # the stage sharding, producing wrong downstream results.  The
-        # AOT "win" was bogus.  Keep x-first.
         _final_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
-        _stage_Y = NamedSharding(mesh_xy, P(None, 'y', None, None))
+        _stage_X_rchunk_Y = NamedSharding(mesh_xy, P(None, 'x', None, 'y'))
 
-        @partial(jax.jit, donate_argnums=(0,))
+        @partial(jax.jit, out_shardings=_final_Y)
         def _reshard_rchunk(psi_rchunk):
-            """Reshard r-chunk: {-,XY,-,-} → {-,Y,-,-} → {-,-,-,Y} (donated)."""
-            psi_rchunk = jax.lax.with_sharding_constraint(psi_rchunk, _stage_Y)
-            psi_rchunk = jax.lax.with_sharding_constraint(psi_rchunk, _final_Y)
-            return psi_rchunk
+            """Reshard r-chunk y-first: {-,XY,-,-} → {-,X,-,Y} → {-,-,-,Y}."""
+            return jax.lax.with_sharding_constraint(psi_rchunk, _stage_X_rchunk_Y)
 
         def _extract_rchunk_slice(psi_G, r_start_dyn, nb_static):
             psi_rchunk = _fft_and_rslice(psi_G, r_start_dyn, nb_static)

@@ -25,9 +25,21 @@ def _maybe_init_jax_distributed():
 						 os.environ.get("JAX_NUM_PROCESSES",
 						 os.environ.get("SLURM_NTASKS", "1"))))
 	if proc_count > 1:
-		# Prefer auto-detection (NERSC pattern): JAX reads SLURM env vars directly
+		# Under the Cray MPICH stack, each rank runs on exactly one GPU
+		# via CUDA_VISIBLE_DEVICES=$SLURM_LOCALID (set by select_gpu.sh
+		# in lxrun).  JAX's no-args distributed.initialize() assumes
+		# each process owns *all* local GPUs, then hangs in the
+		# jax.devices() topology exchange ("GetKeyValue() timed out
+		# with key: cuda:local_topology/cuda/1") because each rank is
+		# looking for peers that don't exist on its side.  Detect local
+		# GPU count from CUDA_VISIBLE_DEVICES and pass local_device_ids
+		# explicitly — same pattern used by slate_*_test.py,
+		# cusolvermp_eigh_test.py, and psp.run_nscf.
+		cv = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+		n_local = len([x for x in cv.split(",") if x.strip()]) if cv else 0
+		init_kwargs = {"local_device_ids": list(range(n_local))} if n_local else {}
 		try:
-			jax.distributed.initialize()
+			jax.distributed.initialize(**init_kwargs)
 			os.environ[_DISTRIBUTED_SENTINEL] = "1"
 			return
 		except Exception:
