@@ -22,5 +22,5 @@
   "gamma": 0.652,
   "residual_rms": 22402986.89874855,
   "n_samples": 21,
-  "notes": "ortho DoE (21 samples, symmetric L=R): \u03b2[pair]=4, \u03b2[psiG_cache]=1.1, \u03b2[Lq_rep]=0.9, \u03b2[centroid]=8.7 residual-absorber. T_centroid reformulated to use n_b_sum=nb_L+nb_R (was n_b) so \u03b2 halved from 17.4 at old primitive. RMS 22MB. \u03b3=0.652 at MoS2 3\u00d73."
+  "notes": "ortho DoE (21 samples, symmetric L=R): \u03b2[pair]=4.0, \u03b2[psiG_cache]=1.1, \u03b2[Lq_rep]=0.9, \u03b2[centroid]=8.7 residual-absorber (T_centroid reformulated with n_b_sum = nb_L+nb_R).  RMS 22MB.\n\n\u03b3 calibration \u2014 VARIES with system scale:\n  MoS2 3\u00d73 nosym:  AOT raw 4.70 GB, runtime nvidia-smi 3.06 GB, \u03b3=0.651\n  Si 4\u00d74\u00d74 nosym:  AOT raw 7.94 GB, runtime nvidia-smi 4.04 GB, \u03b3=0.509\n\nStored \u03b3=0.652 is the MAX measured \u2014 safe at both systems (predicted > runtime everywhere), but over-predicts at Si scales by ~20%.  The ~20% variation suggests XLA scheduler efficiency is system-dependent, not a global scalar.  Per-primitive or n_k-dependent \u03b3 would be a better fit but needs multi-system calibration."
 }
