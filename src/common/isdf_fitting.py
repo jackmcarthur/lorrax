@@ -906,6 +906,7 @@ def fit_zeta_chunked_to_h5(
     q_gather_size: int = 0,
     band_norms: np.ndarray | None = None,
     use_ffi_io: bool = False,
+    use_phdf5_gspace: bool = False,
 ):
     """
     Full zeta fitting pipeline with r-chunk loop and HDF5 output.
@@ -1135,7 +1136,28 @@ def fit_zeta_chunked_to_h5(
         for i in range((_bfe - _bfs + band_chunk_size - 1) // band_chunk_size)
     ]
 
-    if use_gspace_cache:
+    # G-space source selection:
+    #   ``use_phdf5_gspace`` → no persistent cache; read one band chunk
+    #     per r-chunk via PhdfWfnReader.coeffs_gspace() and free it after
+    #     the fit_one_rchunk jit returns.  Keeps GPU footprint off the
+    #     critical path (no nbc × per-chunk cache alive between r-chunks).
+    #     Cost: nbc × read_time per r-chunk; cheap under phdf5.
+    #   ``use_gspace_cache`` → device-resident nbc tuple pre-loaded once,
+    #     kept alive for the whole fit.  Preserves current behavior for
+    #     callers that don't want phdf5, at the cost of GPU residency.
+    #   else → raises at use site (legacy path through
+    #     iter_psi_rchunk_bandwise isn't wired into fit_one_rchunk).
+    phdf5_reader = None
+    if use_phdf5_gspace:
+        from common.load_wfns import _get_phdf5_reader
+        wfn_path = getattr(wfn, "_filename", None)
+        if wfn_path is None:
+            raise ValueError(
+                "use_phdf5_gspace=True but wfn._filename is unset")
+        phdf5_reader = _get_phdf5_reader(wfn_path, mesh_xy)
+        cached_gspace = None
+        print(f"  G-space: phdf5 on-demand (no device cache)")
+    elif use_gspace_cache:
         with timing.section("zeta_fit.cache_gspace"):
             print(f"  Caching G-space wavefunctions for r-chunk loop")
             cached_gspace = load_gspace_for_bands(
@@ -1248,20 +1270,29 @@ def fit_zeta_chunked_to_h5(
 
             # Collect G-space for every band-chunk into a tuple — the
             # fit_one_rchunk jit consumes these as positional inputs.
-            # When caching is enabled, these are just lookups (device-
-            # resident arrays returned by load_gspace_for_bands).  Without
-            # caching, iter_psi_rchunk_bandwise reads from H5 per call;
-            # we'd need to refactor that path to feed fit_one_rchunk.
-            # For now, require cached_gspace for the jit path.
-            if cached_gspace is None:
+            #
+            # Two sources (see use_phdf5_gspace / use_gspace_cache branch
+            # above):
+            #   - phdf5 on-demand: call PhdfWfnReader.coeffs_gspace() per
+            #     bc_range, freshly allocated this r-chunk and ``del``'d
+            #     after the jit returns.  No between-chunk GPU residency.
+            #   - device cache:    lookup in the pre-loaded
+            #     ``cached_gspace`` list of ``(psi_G, bc_range)`` tuples.
+            if phdf5_reader is not None:
+                psi_bc_G_tuple = tuple(
+                    phdf5_reader.coeffs_gspace(tuple(bc_range))
+                    for bc_range in band_chunk_ranges
+                )
+            elif cached_gspace is not None:
+                psi_bc_G_tuple = tuple(
+                    next(g for (g, bc) in cached_gspace
+                         if tuple(bc) == tuple(bc_range))
+                    for bc_range in band_chunk_ranges
+                )
+            else:
                 raise NotImplementedError(
-                    "fit_one_rchunk requires cached_gspace for now; "
-                    "set use_gspace_cache=True.")
-
-            psi_bc_G_tuple = tuple(
-                next(g for (g, bc) in cached_gspace if tuple(bc) == tuple(bc_range))
-                for bc_range in band_chunk_ranges
-            )
+                    "fit_one_rchunk requires either use_gspace_cache=True "
+                    "or use_phdf5_gspace=True.")
 
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.fit_one_rchunk"), \
@@ -1286,6 +1317,12 @@ def fit_zeta_chunked_to_h5(
                 )
                 zeta_chunk.block_until_ready()
                 _track_peak()
+            # Under phdf5-on-demand, drop the per-r-chunk G-space tuple
+            # so nothing accumulates between iterations.  Under the
+            # device-cache path this is a no-op (the tuple entries alias
+            # the persistent cache list).
+            if phdf5_reader is not None:
+                del psi_bc_G_tuple
             # Fused wall-clock: load + pair_density + ZCT + reshard + solve.
             t_pair_total += time.perf_counter() - t0
 

@@ -52,6 +52,10 @@ _DEFAULTS = {
     # ``process_allgather`` + rank-0 ``h5py`` path as a fallback for
     # non-Lustre filesystems or systems without the FFI ``.so`` built.
     "use_ffi_io": True,
+    # phdf5 on-demand G-space reads during ISDF fit (no device cache).
+    # Trades a per-r-chunk read for zero persistent GPU footprint of the
+    # per-band-chunk G-space tuple.  Cheap under phdf5; slow under h5py.
+    "use_phdf5_gspace": False,
     # Memory / chunking
     "memory_per_device_gb": 0.0,  # 0 = auto-detect
     "chunk_size": -1,
@@ -288,6 +292,7 @@ class LorraxConfig:
     self_consistent: bool
     use_ppm_sigma: bool
     use_ffi_io: bool
+    use_phdf5_gspace: bool
 
     # --- Memory / chunking (resolved at construction) ---
     memory_per_device_gb: float
@@ -490,6 +495,7 @@ class LorraxConfig:
             self_consistent=bool(_get("self_consistent")),
             use_ppm_sigma=bool(_get("use_ppm_sigma")),
             use_ffi_io=bool(_get("use_ffi_io")),
+            use_phdf5_gspace=bool(_get("use_phdf5_gspace")),
             # Memory / chunking
             memory_per_device_gb=memory_per_device_gb,
             chunk_target_utilization=chunk_utilization,
