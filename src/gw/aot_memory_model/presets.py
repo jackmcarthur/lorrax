@@ -95,3 +95,109 @@ def points_chi0_tau_step(preset: str):
 
     return build_doe_axes(baseline, knobs, mesh,
                           sys_axes=sys_axes, mesh_axes=mesh_axes)
+
+
+# ---------------------------------------------------------------------------
+# pair_density_traced
+# ---------------------------------------------------------------------------
+
+def points_pair_density_traced(preset: str):
+    baseline = SysDims(kgrid=(4, 4, 4), n_rmu=2400, n_s=2, n_b=296)
+    return [
+        (baseline, Knobs.of(), MeshSpec(2, 2)),
+        (replace(baseline, kgrid=(2, 2, 2)), Knobs.of(), MeshSpec(2, 2)),
+        (replace(baseline, n_rmu=1200), Knobs.of(), MeshSpec(2, 2)),
+        (replace(baseline, n_b=148), Knobs.of(), MeshSpec(2, 2)),
+        (replace(baseline, n_b=592), Knobs.of(), MeshSpec(2, 2)),
+        (replace(baseline, n_s=1), Knobs.of(), MeshSpec(2, 2)),
+        (baseline, Knobs.of(), MeshSpec(1, 4)),
+        (baseline, Knobs.of(), MeshSpec(4, 1)),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# cct_lr
+# ---------------------------------------------------------------------------
+
+def points_cct_lr(preset: str):
+    baseline = SysDims(kgrid=(4, 4, 4), n_rmu=2400)
+    return [
+        (baseline, Knobs.of(), MeshSpec(2, 2)),
+        (replace(baseline, kgrid=(2, 2, 2)), Knobs.of(), MeshSpec(2, 2)),
+        (replace(baseline, kgrid=(4, 4, 2)), Knobs.of(), MeshSpec(2, 2)),
+        (replace(baseline, n_rmu=1200), Knobs.of(), MeshSpec(2, 2)),
+        (replace(baseline, n_rmu=3200), Knobs.of(), MeshSpec(2, 2)),
+        (baseline, Knobs.of(), MeshSpec(1, 4)),
+        (baseline, Knobs.of(), MeshSpec(4, 1)),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# zct_lr  (knob: chunk_r)
+# ---------------------------------------------------------------------------
+
+def points_zct_lr(preset: str):
+    baseline = SysDims(kgrid=(4, 4, 4), n_rmu=2400, n_r=12672)
+    return [
+        (baseline, Knobs.of(chunk_r=12672), MeshSpec(2, 2)),
+        (baseline, Knobs.of(chunk_r=6336),  MeshSpec(2, 2)),
+        (baseline, Knobs.of(chunk_r=25344), MeshSpec(2, 2)),
+        (replace(baseline, kgrid=(2, 2, 2)), Knobs.of(chunk_r=12672), MeshSpec(2, 2)),
+        (replace(baseline, n_rmu=1200), Knobs.of(chunk_r=12672), MeshSpec(2, 2)),
+        (replace(baseline, n_rmu=3200), Knobs.of(chunk_r=12672), MeshSpec(2, 2)),
+        (baseline, Knobs.of(chunk_r=12672), MeshSpec(1, 4)),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# solve_q  (knobs: chunk_r, q_chunk)
+# ---------------------------------------------------------------------------
+
+def points_solve_q(preset: str):
+    baseline = SysDims(kgrid=(4, 4, 4), n_rmu=2400, n_r=12672)
+    return [
+        (baseline, Knobs.of(chunk_r=12672, q_chunk=1),  MeshSpec(2, 2)),
+        (baseline, Knobs.of(chunk_r=6336,  q_chunk=1),  MeshSpec(2, 2)),
+        (baseline, Knobs.of(chunk_r=12672, q_chunk=4),  MeshSpec(2, 2)),
+        (replace(baseline, kgrid=(2, 2, 2)), Knobs.of(chunk_r=12672, q_chunk=1), MeshSpec(2, 2)),
+        (replace(baseline, n_rmu=1200), Knobs.of(chunk_r=12672, q_chunk=1), MeshSpec(2, 2)),
+        (replace(baseline, n_rmu=3200), Knobs.of(chunk_r=12672, q_chunk=1), MeshSpec(2, 2)),
+        (baseline, Knobs.of(chunk_r=12672, q_chunk=1), MeshSpec(1, 4)),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# vq_mu_chunk  — single-GPU, kgrid = FFT box (knob: mu_chunk)
+# ---------------------------------------------------------------------------
+
+def points_vq_mu_chunk(preset: str):
+    baseline = SysDims(kgrid=(48, 48, 48), n_rmu=2400, n_r=48 ** 3)
+    mesh = MeshSpec(1, 1)
+    return [
+        (baseline, Knobs.of(mu_chunk=128),  mesh),
+        (baseline, Knobs.of(mu_chunk=256),  mesh),
+        (baseline, Knobs.of(mu_chunk=512),  mesh),
+        (baseline, Knobs.of(mu_chunk=1024), mesh),
+        (replace(baseline, kgrid=(36, 36, 36), n_r=36 ** 3),
+         Knobs.of(mu_chunk=128), mesh),
+        (replace(baseline, kgrid=(60, 60, 60), n_r=60 ** 3),
+         Knobs.of(mu_chunk=128), mesh),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# sigma_kij
+# ---------------------------------------------------------------------------
+
+def points_sigma_kij(preset: str):
+    baseline = SysDims(kgrid=(4, 4, 4), n_rmu=2400, n_s=2, n_b=40)
+    return [
+        (baseline, Knobs.of(), MeshSpec(2, 2)),
+        (replace(baseline, kgrid=(2, 2, 2)), Knobs.of(), MeshSpec(2, 2)),
+        (replace(baseline, n_rmu=1200), Knobs.of(), MeshSpec(2, 2)),
+        (replace(baseline, n_b=20), Knobs.of(), MeshSpec(2, 2)),
+        (replace(baseline, n_b=80), Knobs.of(), MeshSpec(2, 2)),
+        (replace(baseline, n_s=1), Knobs.of(), MeshSpec(2, 2)),
+        (baseline, Knobs.of(), MeshSpec(1, 4)),
+        (baseline, Knobs.of(), MeshSpec(4, 1)),
+    ]

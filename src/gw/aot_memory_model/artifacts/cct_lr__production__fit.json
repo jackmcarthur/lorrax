@@ -1,0 +1,14 @@
+{
+  "kernel": "cct_lr",
+  "feature_names": [
+    "Pq"
+  ],
+  "coefs": [
+    3.9999999999999996
+  ],
+  "intercept": 3.295722453380528e-07,
+  "gamma": 1.0,
+  "residual_rms": 2.714330768930903e-06,
+  "n_samples": 7,
+  "notes": ""
+}

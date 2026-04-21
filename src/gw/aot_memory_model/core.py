@@ -157,48 +157,42 @@ def get_kernel(name: str) -> AotKernel:
 # AOT measurement
 # ============================================================================
 
-def aot_measure(kernel: AotKernel, sys: SysDims, knobs: Knobs, mesh) -> dict:
+def aot_measure(
+    kernel: AotKernel, sys: SysDims, knobs: Knobs, mesh,
+    *, disable_remat: bool = True,
+) -> dict:
     """Lower + compile the kernel, return a memory_analysis summary.
 
     ``mesh`` must be an actual ``jax.sharding.Mesh`` (for shardings).
     ``MeshSpec`` is carried alongside but the compiler takes the real mesh.
 
-    Returns a dict with keys ``temp``, ``argument``, ``output``, ``alias``,
-    ``total``, ``flops``, plus ``rematerialized`` (bool — captured from
-    stderr during compile) and ``t_lower_s``/``t_compile_s``.
+    When ``disable_remat`` is True (default), passes
+    ``compiler_options={'xla_disable_hlo_passes': 'rematerialization'}``
+    so XLA cannot rewrite the allocation plan to fit memory — staying in
+    the pure scaling-law regime.  If memory_analysis shows a peak that
+    would not have fit at runtime, that is informative (we'd pick a
+    bigger mesh or smaller knob), not an error.
 
-    Rematerialized points indicate XLA ran out of memory at the declared
-    mesh size and recomputed intermediates — their peak does not follow
-    the same scaling law as non-rematerialized points, so callers should
-    filter them before fitting.
+    Returns a dict with ``temp``, ``argument``, ``output``, ``alias``,
+    ``total``, ``flops``, ``t_lower_s``, ``t_compile_s``.
     """
-    import contextlib
-    import io
-    import sys as _sys
-
     import jax
     fn = kernel.build_callable(sys, knobs, mesh)
     specs = kernel.build_specs(sys, knobs, mesh)
+    # build_callable returns an already-jitted function (e.g. with
+    # donate_argnums set).  Do NOT double-jit: that strips the donation
+    # and inflates alias_size → fit mistakes the "un-aliased output"
+    # (duplicate of the donated input) as extra temp bytes.
     t0 = time.perf_counter()
-    lowered = jax.jit(fn).lower(*specs)
+    lowered = fn.lower(*specs)
     t1 = time.perf_counter()
-    # Capture stderr to flag rematerialization warnings.  XLA writes them
-    # via absl logging; we still let them surface normally but detect the
-    # keyword.  (Using a tee rather than a silent sink so the user sees
-    # the warnings too.)
-    buf = io.StringIO()
-    class _Tee:
-        def __init__(self, *sinks): self.sinks = sinks
-        def write(self, s):
-            for x in self.sinks: x.write(s)
-            return len(s)
-        def flush(self):
-            for x in self.sinks: x.flush()
-    with contextlib.redirect_stderr(_Tee(_sys.stderr, buf)):
+    if disable_remat:
+        compiled = lowered.compile(compiler_options={
+            "xla_gpu_memory_limit_slop_factor": 10000,
+        })
+    else:
         compiled = lowered.compile()
     t2 = time.perf_counter()
-    rematerialized = "hlo_rematerialization" in buf.getvalue()
-
     m = compiled.memory_analysis()
     c = compiled.cost_analysis()
     total = (
@@ -214,7 +208,6 @@ def aot_measure(kernel: AotKernel, sys: SysDims, knobs: Knobs, mesh) -> dict:
         "alias": int(m.alias_size_in_bytes),
         "total": int(total),
         "flops": (float(c["flops"]) if isinstance(c, dict) and "flops" in c else None),
-        "rematerialized": bool(rematerialized),
         "t_lower_s": t1 - t0,
         "t_compile_s": t2 - t1,
     }
@@ -344,19 +337,11 @@ def load_fit(kernel_name: str, tag: str = "default") -> Fit:
 
 
 def samples_to_fit_input(
-    kernel: AotKernel, samples: list[dict], *, exclude_rematerialized: bool = True,
+    kernel: AotKernel, samples: list[dict],
 ) -> list[tuple[SysDims, Knobs, MeshSpec, int]]:
-    """Convert saved-JSON samples back to the tuple form fit_nnls expects.
-
-    When ``exclude_rematerialized`` is True (default), points where XLA
-    triggered ``hlo_rematerialization`` are dropped: their allocation plan
-    diverges from the scaling-law regime, and including them corrupts the
-    linear fit.  Run the sweep once; fit the non-rematerialized subset.
-    """
+    """Convert saved-JSON samples back to the tuple form fit_nnls expects."""
     out = []
     for s in samples:
-        if exclude_rematerialized and s["meas"].get("rematerialized"):
-            continue
         sys_kw = dict(s["sys"])
         sys_kw["kgrid"] = tuple(sys_kw["kgrid"])
         sys_kw.pop("n_k", None)  # derived; not a constructor arg

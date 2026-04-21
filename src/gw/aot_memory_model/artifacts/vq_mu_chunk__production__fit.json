@@ -1,0 +1,18 @@
+{
+  "kernel": "vq_mu_chunk",
+  "feature_names": [
+    "zeta",
+    "vphase",
+    "out"
+  ],
+  "coefs": [
+    3.0,
+    1.5000000000000329,
+    1.0000000000000495
+  ],
+  "intercept": 4194560.000000264,
+  "gamma": 1.0,
+  "residual_rms": 2.2127379833563157e-07,
+  "n_samples": 6,
+  "notes": ""
+}
