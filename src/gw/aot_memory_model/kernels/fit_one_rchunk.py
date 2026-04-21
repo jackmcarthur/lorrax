@@ -148,10 +148,15 @@ def _T_psiY_bc(sys, knobs, mesh):
 
 
 def _T_centroid(sys, knobs, mesh):
-    """One X-sharded centroid copy: (n_k, n_rmu, n_b, n_s) / p_x.
-    β counts instances — expected 2 (psi_l_rmuT_X + psi_r_rmuT_X;
-    both are jit arguments so argument_size counts them both)."""
-    return (_B * sys.n_k * sys.n_rmu * sys.n_b * sys.n_s
+    """Combined X-sharded centroid bytes for L+R:
+    (n_k, n_rmu, n_b_sum, n_s) / p_x, where n_b_sum = n_b_L + n_b_R.
+
+    Symmetric case (L == R == full) has n_b_sum = 2·n_b — captures
+    BOTH centroid copies in a single primitive so β counts "1 unit of
+    L+R centroid bytes" (expected β = 1 since both copies are alive
+    as jit arguments).  Asymmetric case uses sys.n_b_sum explicitly.
+    """
+    return (_B * sys.n_k * sys.n_rmu * sys.nb_sum * sys.n_s
             / mesh.p_x)
 
 
@@ -203,13 +208,16 @@ def _F_fixed(sys, knobs, mesh):
 
 
 def _F_pair_density(sys, knobs, mesh):
-    """Pair-density accumulate across all band-chunks.  Two sides (L,R)
-    summed over nbc band-chunks:
-        nbc × 2 × bc · nk · n_rmu · B_r
-      = 2 · n_b · nk · n_rmu · B_r      (nbc·bc = n_b)
-    Note: mesh-sharded internally but total FLOPs is mesh-invariant."""
+    """Pair-density accumulate across all band-chunks, summed over
+    both L and R contributions:
+        nbc_L × bc · nk · n_rmu · B_r  +  nbc_R × bc · nk · n_rmu · B_r
+      = (n_b_L + n_b_R) · nk · n_rmu · B_r
+      = n_b_sum · nk · n_rmu · B_r
+
+    Symmetric case has n_b_sum = 2·n_b (factor of 2 for L+R).  The
+    formula is mesh-invariant for total FLOPs."""
     Br = _Br(sys, knobs)
-    return 2.0 * sys.n_b * sys.n_k * sys.n_rmu * Br
+    return sys.nb_sum * sys.n_k * sys.n_rmu * Br
 
 
 def _F_bc_fft(sys, knobs, mesh):

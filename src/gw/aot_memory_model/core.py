@@ -50,7 +50,15 @@ class SysDims:
     nspinor: int = 1   # spinor dimension (1 or 2)
     n_b_v: int = 0     # valence bands in chi0 pair
     n_b_c: int = 0     # conduction bands in chi0 pair
-    n_b: int = 0       # generic band count (pair-density / sigma uses)
+    n_b: int = 0       # generic band count — the UNION range that
+                       # psi_G cache / band_chunk FFT cover.  Production
+                       # = max(b_L_end, b_R_end) − min(b_L_start, b_R_start).
+    n_b_sum: int | None = None
+    # Size of the L+R pair-density work, used by kernels where both a
+    # "left" and "right" band window contribute (ISDF fit, sigma_kij).
+    # Defaults to ``2·n_b`` when symmetric.  For production GW where
+    # ``band_range_left=(b0, b3)`` and ``band_range_right=(b1, b4)``
+    # differ, pass ``n_b_sum = (b3-b0) + (b4-b1)`` explicitly.
     n_r: int = 0       # real-space FFT grid nx*ny*nz (V_q, FFT kernels)
     fft_grid: tuple[int, int, int] | None = None
     # Real-space FFT grid dims — distinct from kgrid when a kernel
@@ -73,6 +81,11 @@ class SysDims:
     def fft_shape(self) -> tuple[int, int, int]:
         """Real-space FFT box.  Falls back to kgrid when fft_grid is None."""
         return tuple(self.fft_grid) if self.fft_grid is not None else tuple(self.kgrid)
+
+    @property
+    def nb_sum(self) -> int:
+        """L+R pair-density band count — ``2·n_b`` when symmetric."""
+        return int(self.n_b_sum) if self.n_b_sum is not None else 2 * self.n_b
 
 
 @dataclass(frozen=True)

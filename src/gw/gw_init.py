@@ -295,10 +295,14 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				choose_chunks_analytic, describe_chunks,
 			)
 			p_x, p_y = mesh_xy.devices.shape
-			# n_b semantic: the *union* range the G-space cache
-			# covers (= band_range_full size).  The pair-density cost
-			# primitive doubles n_b internally to account for the L+R
-			# sum, so passing nb_L+nb_R here double-counts.
+			# n_b = UNION range (bytes of psi_G cache / band-chunk FFT).
+			# n_b_sum = nb_L + nb_R (L+R pair-density work + centroid bytes).
+			# Symmetric production GW (nval == nelec, nband == nelec+ncond)
+			# has nb_L == nb_R == nb_full so n_b_sum == 2·n_b; asymmetric
+			# windows (pseudobands, sub-valence, extra-cond) are picked
+			# up correctly here.
+			nb_L = band_range_left[1] - band_range_left[0]
+			nb_R = band_range_right[1] - band_range_right[0]
 			nb_full = (max(band_range_left[1], band_range_right[1])
 			           - min(band_range_left[0], band_range_right[0]))
 			aot_sys = SysDims(
@@ -307,6 +311,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				n_rmu=int(meta.n_rmu),
 				n_s=int(meta.nspinor),
 				n_b=int(nb_full),
+				n_b_sum=int(nb_L + nb_R),
 				n_r=int(meta.n_rtot),
 			)
 			aot_mesh = MeshSpec(p_x=int(p_x), p_y=int(p_y))
