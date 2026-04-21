@@ -259,6 +259,7 @@ def choose_chunks_analytic(
     band_chunk_values: Sequence[int] | None = None,
     fft_launch_overhead_flops: float = 0.0,
     fft_per_band_flops: float | None = None,
+    q_gather_min: int = 1,
 ) -> ChunkChoice:
     """Closed-form chunk chooser.
 
@@ -284,6 +285,14 @@ def choose_chunks_analytic(
         Per-band wavefunction-FFT FLOPs.  When ``None``, inferred from
         the cost fit via the ``bc_fft`` primitive.  Override only for
         calibration experiments.
+    q_gather_min
+        Minimum q-chunk gather size the driver can support.  The
+        allgather in ``fit_zeta_chunked_to_h5`` replicates
+        ``q_gather × n_rmu × chunk_r × 16`` bytes per device after
+        each r-chunk — this bounds chunk_r from above.  Default 1
+        means "driver can always pick q_gather=1 if it has to" — if
+        the caller knows a higher floor (e.g. 2 for performance),
+        passing it here gives a tighter cr bound.
     """
     kernel = get_kernel(kernel_name)
     mem_fit = load_fit(kernel_name, tag=tag)
@@ -306,6 +315,16 @@ def choose_chunks_analytic(
         band_chunk_values = sorted(set(pow2))
 
     best: ChunkChoice | None = None
+    # Post-jit allgather bound: fit_zeta_chunked_to_h5 replicates
+    # ``q_gather × n_rmu × chunk_r × 16`` bytes across all devices
+    # after each r-chunk.  The driver itself chooses q_gather
+    # dynamically to fit, but chunk_r still bounds it: for the
+    # minimum-feasible q_gather_min, the replicated slab must fit.
+    _allgather_per_cr = 16.0 * q_gather_min * sys.n_rmu  # bytes per cr-unit
+    # Leave a 20% slack to account for concurrent live arrays during
+    # the gather (zeta input + NCCL temp + output both live).
+    _allgather_cr_cap = int(0.8 * budget_bytes / max(1.0, _allgather_per_cr))
+
     for bc in band_chunk_values:
         if bc < p or bc > sys.n_b:
             continue
@@ -317,7 +336,7 @@ def choose_chunks_analytic(
         if denom <= 0 or numer <= 0:
             continue
         cr_budget = numer / denom
-        cr = min(int(cr_budget), n_rtot)
+        cr = min(int(cr_budget), n_rtot, _allgather_cr_cap)
         cr = _p_divisible_floor(cr, p)
         if cr <= 0:
             continue
