@@ -1160,51 +1160,6 @@ def fit_zeta_chunked_to_h5(
         except Exception:
             pass
 
-    # Opt-in per-stage peak probe.  When ``LORRAX_MEM_PROBE=1`` is set
-    # emits a rank-0 stderr line at each labeled point inside the
-    # r-chunk loop: ``[memprobe] label=... chunk=i used=... peak=...``.
-    # Zero cost when disabled.  Used to rebuild the memory model by
-    # attributing observed peaks to specific chunk-loop stages.
-    _memprobe_on = bool(os.environ.get('LORRAX_MEM_PROBE', '')) and jax.process_index() == 0
-    _memprobe_chunk_idx = 0
-    if _memprobe_on:
-        import sys as _sys
-        import ctypes as _ct
-        # Ground-truth CUDA free/total (bypasses JAX's allocator pool
-        # bookkeeping).  Distinguishes "jax thinks it's holding" from
-        # "driver actually has allocated".
-        try:
-            _cudart = _ct.CDLL('libcudart.so', mode=_ct.RTLD_GLOBAL)
-            _cudart.cudaMemGetInfo.restype = _ct.c_int
-            _cudart.cudaMemGetInfo.argtypes = [_ct.POINTER(_ct.c_size_t),
-                                                _ct.POINTER(_ct.c_size_t)]
-        except Exception:
-            _cudart = None
-        def _cuda_used():
-            if _cudart is None:
-                return 0.0
-            f = _ct.c_size_t(0); t = _ct.c_size_t(0)
-            _cudart.cudaMemGetInfo(_ct.byref(f), _ct.byref(t))
-            return (t.value - f.value) / 1e9 if t.value > 0 else 0.0
-        def _probe(label, **extra):
-            try:
-                s = jax.devices()[0].memory_stats() or {}
-                used = s.get('bytes_in_use', 0) / 1e9
-                peak = s.get('peak_bytes_in_use', 0) / 1e9
-                c_used = _cuda_used()
-                tag = " ".join(f"{k}={v}" for k, v in extra.items())
-                _sys.stderr.write(
-                    f"[memprobe] chunk={_memprobe_chunk_idx} "
-                    f"label={label:<18s} jax_used={used:6.3f} "
-                    f"jax_peak={peak:6.3f} cuda_used={c_used:6.3f} GB"
-                    f"{' ' + tag if tag else ''}\n")
-                _sys.stderr.flush()
-            except Exception:
-                pass
-    else:
-        def _probe(label, **extra):
-            pass
-
     from common.progress import LoopProgress
     r_progress = LoopProgress(
         num_chunks, print, title="zeta fitting",
@@ -1243,15 +1198,11 @@ def fit_zeta_chunked_to_h5(
             _P_zeros_cache[n_r] = fn
         return fn()
 
-    _probe("before_chunk_loop")
     with timing.section("zeta_fit.chunk_loop"):
         for chunk_idx in range(num_chunks):
-            if _memprobe_on:
-                _memprobe_chunk_idx = chunk_idx
             r_start = chunk_idx * chunk_r
             r_end = min(r_start + chunk_r, n_rtot)
             actual_n_rchunk = r_end - r_start
-            _probe("chunk_start", r_start=r_start, r_end=r_end)
 
             # 6ab. Stream band chunks of the r-chunk wfns and
             # accumulate P_l / P_r incrementally.  At any moment only
@@ -1360,7 +1311,6 @@ def fit_zeta_chunked_to_h5(
 
                 P_l_k_mux.block_until_ready()
                 _track_peak()
-                _probe("after_pair")
                 # No block_until_ready on P_r — ZCT will consume it
                 # asynchronously.  P_l's block is needed to bound
                 # t_pair_total and to gate _track_peak.
@@ -1401,14 +1351,12 @@ def fit_zeta_chunked_to_h5(
             Z_col = jax.lax.with_sharding_constraint(Z_q_flat, z_col_shard)
             Z_col.block_until_ready()
             _track_peak()
-            _probe("after_zct_reshard")
             del Z_q_flat
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.solve"), jax_profile.step_annotation("chunk_solve", step_num=chunk_idx):
                 zeta_chunk = solve_zeta_from_L_q(L_q, Z_col, mesh_xy, q_chunk_size)
                 zeta_chunk.block_until_ready()
                 _track_peak()
-                _probe("after_solve")
                 del Z_col
             t_solve_total += time.perf_counter() - t0
 
@@ -1476,13 +1424,11 @@ def fit_zeta_chunked_to_h5(
                 # bottom of this function serves as the rendezvous.
                 del zeta_chunk
             t_write_total += time.perf_counter() - t0
-            _probe("after_h5_write_dispatch")
             r_progress.step()
 
 
     t_chunks_total = time.perf_counter() - t_chunk_start
     r_progress.finish()
-    _probe("after_chunk_loop")
 
     # Drain the rank-0 writer queue (allgather backend only; FFI path
     # writes are already fully flushed by the synchronous SlabIO calls).
