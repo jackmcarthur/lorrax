@@ -349,6 +349,7 @@ set(LORRAX_FFI_SOURCES
     ../../cusolvermp/cpp/batched_potrf_ffi.cc
     ../../cusolvermp/cpp/batched_potrs_ffi.cc
     ../../cusolvermp/cpp/batched_solve_lu_ffi.cc
+    ../../cublasmp/cpp/batched_gemm_ffi.cc
     ../../cusolvermg/cpp/eigh_mg_ffi.cc
     ../../phdf5/cpp/context.cc
     ../../phdf5/cpp/write_ffi.cc
@@ -391,6 +392,7 @@ find_package(Threads REQUIRED)
 
 target_link_libraries(lorrax_ffi PRIVATE
     "${CUSOLVERMP_LIBDIR}/libcusolverMp.so"
+    "${CUSOLVERMP_LIBDIR}/libcublasmp.so"
     "${NCCL_LIBRARY}"
     "${CUDART_LIBRARY}"
     "${CUSOLVER_LIBRARY}"

@@ -14,6 +14,7 @@
 #include <nccl.h>
 #include <cal.h>
 #include <cusolverMp.h>
+#include <cublasmp.h>
 
 #include "../../common/cpp/ffi_helpers.h"
 #include "ctx.h"
@@ -104,6 +105,12 @@ static void throw_if_cusolver(cusolverStatus_t st, const char* what) {
     if (st == CUSOLVER_STATUS_SUCCESS) return;
     std::ostringstream os;
     os << what << ": cusolver status=" << static_cast<int>(st);
+    throw std::runtime_error(os.str());
+}
+static void throw_if_cublasmp(cublasMpStatus_t st, const char* what) {
+    if (st == CUBLASMP_STATUS_SUCCESS) return;
+    std::ostringstream os;
+    os << what << ": cublasmp status=" << static_cast<int>(st);
     throw std::runtime_error(os.str());
 }
 
@@ -229,6 +236,10 @@ void destroy_context(int64_t ctx_handle) {
     if (ctx_handle == 0) return;
     auto* ctx = reinterpret_cast<LorraxCusolverMpCtx*>(ctx_handle);
 
+    // cuBLASMp first (it shares the CAL comm with cuSOLVERMp — tear down
+    // the client handles before we destroy the comm underneath them).
+    if (ctx->cublasmp_grid)   { cublasMpGridDestroy(ctx->cublasmp_grid);     ctx->cublasmp_grid = nullptr; }
+    if (ctx->cublasmp_handle) { cublasMpDestroy(ctx->cublasmp_handle);       ctx->cublasmp_handle = nullptr; }
     if (ctx->grid)     { cusolverMpDestroyGrid(ctx->grid);       ctx->grid = nullptr; }
     if (ctx->handle)   { cusolverMpDestroy(ctx->handle);         ctx->handle = nullptr; }
     if (ctx->cal_comm) { cal_comm_destroy(ctx->cal_comm);        ctx->cal_comm = nullptr; }
@@ -246,6 +257,32 @@ void destroy_context(int64_t ctx_handle) {
     if (ctx->h_workspace) { free(ctx->h_workspace);              ctx->h_workspace = nullptr; }
 
     delete ctx;
+}
+
+// Lazy init for cuBLASMp.  Reuses the cuSOLVERMp ctx's CAL comm and stream
+// so there is no additional NCCL bootstrap.  First call in a process may
+// take a few milliseconds; subsequent calls are no-ops.
+void ensure_cublasmp(LorraxCusolverMpCtx* ctx) {
+    if (ctx->cublasmp_handle && ctx->cublasmp_grid) return;
+    if (!ctx->cal_comm) {
+        throw std::runtime_error(
+            "ensure_cublasmp: cuSOLVERMp ctx has no CAL comm — "
+            "cuBLASMp must be initialised after cuSOLVERMp.");
+    }
+    if (!ctx->cublasmp_handle) {
+        throw_if_cublasmp(
+            cublasMpCreate(&ctx->cublasmp_handle, ctx->stream),
+            "cublasMpCreate");
+    }
+    if (!ctx->cublasmp_grid) {
+        cublasMpGridLayout_t layout = ctx->grid_layout_col_major
+            ? CUBLASMP_GRID_LAYOUT_COL_MAJOR
+            : CUBLASMP_GRID_LAYOUT_ROW_MAJOR;
+        throw_if_cublasmp(
+            cublasMpGridCreate(ctx->p, ctx->q, layout,
+                                ctx->cal_comm, &ctx->cublasmp_grid),
+            "cublasMpGridCreate");
+    }
 }
 
 // Grow workspace on demand; preserves the larger allocation on future calls.

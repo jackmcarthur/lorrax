@@ -6,6 +6,7 @@
 #include <nccl.h>
 #include <cal.h>
 #include <cusolverMp.h>
+#include <cublasmp.h>
 
 namespace lorrax_ffi::cusolvermp {
 
@@ -49,9 +50,21 @@ struct LorraxCusolverMpCtx {
     void*   h_workspace       = nullptr;
     size_t  h_workspace_bytes = 0;
     int*    d_info            = nullptr;
+
+    // cuBLASMp handle + grid — shares the CAL comm and CUDA stream with
+    // the cuSOLVERMp side so the two are interoperable in fused FFIs.
+    // Lazily populated by ensure_cublasmp(): the first fused-kernel
+    // call builds the handle/grid, subsequent calls reuse them.
+    cublasMpHandle_t  cublasmp_handle = nullptr;
+    cublasMpGrid_t    cublasmp_grid   = nullptr;
 };
 
 // Grow (d_workspace, h_workspace) if needed; keeps largest allocation.
 void ensure_workspace(LorraxCusolverMpCtx* ctx, size_t d_need, size_t h_need);
+
+// Lazy-initialise the cuBLASMp handle + grid, sharing the existing CAL
+// comm and CUDA stream with cuSOLVERMp.  No-op on repeat calls.  Callers
+// that don't need cuBLASMp never pay the init cost.  Throws on failure.
+void ensure_cublasmp(LorraxCusolverMpCtx* ctx);
 
 }  // namespace lorrax_ffi::cusolvermp
