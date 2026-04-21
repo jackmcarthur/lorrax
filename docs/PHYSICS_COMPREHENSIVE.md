@@ -2,7 +2,7 @@
 
 **Consolidates**: `formalism.md`, `isdf_context.md`, `isdf_spin_galerkin_derivation.md`, `ZETA_FITTING_ALGORITHM.md`, `cohsex_jax_physics.md`
 
-**Status**: Describes current implementation in `src/isdf/common/load_wfns.py`, `src/gw/gw_jax.py`, `src/gw/w_isdf.py`.
+**Status**: describes the current implementation in `src/common/isdf_fitting.py` (zeta pipeline), `src/gw/gw_jax.py` (driver), `src/gw/w_isdf.py` (χ₀ + W), `src/gw/ppm_sigma.py` (GN-PPM Σ^c(ω)), `src/gw/head_correction.py` (q→0 head), and `src/gw/greens_function_kernel.py` + `src/gw/projection_kernel.py` (leaf kernels). All physics arrays use the flat-k / flat-q convention (`(nk_tot, …)`); 3-D k-grid layout only appears inside `common/fft_helpers.py`.
 
 ---
 
@@ -48,9 +48,9 @@ This produces centroids concentrated in regions of **high electronic density** (
 Typical ratio: $n_\mu \approx 10 \times n_{\text{bands}}$ for convergence.
 
 **Files**:
-- Generation: `src/isdf/centroid/kmeans_isdf.py`
+- Generation: `src/centroid/kmeans_isdf.py`
 - Storage: `centroids_frac.h5` (fractional coordinates)
-- Loading: `src/isdf/io/centroids.py`
+- Loading: `src/file_io/centroids.py`
 
 ---
 
@@ -139,7 +139,7 @@ $$Z_{q,\nu}(\mathbf{r}) = \sum_{\mathbf{R}} e^{i\mathbf{q}\cdot\mathbf{R}} \sum_
 
 **Why FFT convolution?** Direct summation $\sum_{\mathbf{k}, \mathbf{k}'} (\cdots)$ scales as $O(n_k^2)$. Using FFTs to perform the convolution in R-space reduces this to $O(n_k \log n_k)$, making the procedure tractable for large k-grids.
 
-**Implementation**: Compute $P_{\mathbf{k}}$ on k-grid, FFT to R-grid via `jnp.fft.ifftn(..., norm='ortho')`, form spin-traced products, FFT back to q-space. See `compute_CCT_from_left_right()` and `compute_ZCT_from_left_right()` in `load_wfns.py`.
+**Implementation**: Compute $P_{\mathbf{k}}$ on k-grid, FFT to R-grid using `make_flat_k_ifftn` from `common/fft_helpers.py` (per-device local FFT on replicated k-axes via `custom_partitioning`), form spin-traced products, FFT back to q-space. See `compute_CCT_from_left_right()` and `compute_ZCT_from_left_right_zchunk()` in `common/isdf_fitting.py`. `norm='forward'` is used for the convolution identity: $C_q = \text{FFT}(\overline{\text{IFFT}(A)} \odot \text{IFFT}(B)) = \sum_{\mathbf k} A^*_k B_{k+q}$.
 
 ---
 
@@ -201,7 +201,7 @@ $$C_q(\mu, \nu) = \text{FFT}_{\mathbf{R}}\left[C_{\mathbf{R}}(\mu, \nu)\right]$$
 
 **Sharding**: $C_q(\mu_X, \nu_Y)$ is 2D tiled for blocked Cholesky.
 
-**Implementation**: `compute_CCT_from_left_right()` in `load_wfns.py:942`.
+**Implementation**: `compute_CCT_from_left_right()` (spin-traced) and `compute_CCT_from_left_right_spin_matrix()` (explicit $P_{ab}$ channels) in `common/isdf_fitting.py`. Choose via `isdf_pair_mode = "spin_traced" | "spin_matrix_frobenius"` in `cohsex.in`.
 
 ### 4.4 Stage 3: Cholesky Factorization
 
@@ -215,9 +215,9 @@ $$L_q(\mu_X, \nu_Y) = \text{cholesky\_2d\_batched}(C_q)$$
 - Compute: $O(n_\mu^3 / P)$
 - Communication: $O(n_\mu^2 / \sqrt{P})$
 
-**Sharding**: $L_q(\mu_X, \nu_Y)$ same 2D tiles as $C_q$.
+**Sharding**: $L_q(\mu_X, \nu_Y)$ — 2D tiles `P(None, 'x', 'y', None, None)` internally; dense form `P(None, 'x', 'y')` on return.
 
-**Implementation**: `cholesky_2d_batched()` in `cholesky_2d.py`.
+**Implementation**: `compute_L_q_from_CCT()` in `common/isdf_fitting.py`, which calls `cholesky_2d_batched()` in `common/cholesky_2d.py`. On a 1×1 mesh (single GPU), falls back to dense `jnp.linalg.cholesky` with a small trace-proportional ridge to regularize the rank-deficient pair-density matrix.
 
 ### 4.5 Stage 4: ZCT and Triangular Solve (Z-Chunked)
 
@@ -239,30 +239,27 @@ $$Z_{\mathbf{R}}(\mu, r) = \sum_{s,s'} (P^{(L)}_{\mathbf{R},s's})^* \cdot P^{(R)
 
 $$Z_q(\mu_X, r_{XY}) = \text{FFT}_{\mathbf{R}}[Z_{\mathbf{R}}]$$
 
-**Step 4c**: Triangular solve (per-q gather to avoid full replication):
+**Step 4c**: Triangular solve. `solve_zeta_from_L_q()` in `common/isdf_fitting.py` loops over q-batches of size `q_chunk_size` (default 1) and, inside a `shard_map` over `('x','y')` with the r-column axis scattered, runs a vmapped Cholesky back-solve:
 
 ```python
-for q in range(n_q):
-    L_rep = all_gather(L_q[q])              # (n_μ, n_μ) replicated on all devices
-    y = triangular_solve(L_rep, Z_q[q])     # Forward: L y = Z
-    ζ_q[q] = triangular_solve(L_rep.T.conj(), y)  # Backward: L† ζ = y
+# shard_map in_specs = (P(None, None, None), P(None, None, ('x','y')))
+# out_specs          =  P(None, None, ('x','y'))
+def _sharded_cho_solve_batch(L_batch, Z_batch):
+    def solve_single(L, Z):
+        y = jax.scipy.linalg.solve_triangular(L, Z, lower=True)
+        return jax.scipy.linalg.solve_triangular(L.conj().T, y, lower=False)
+    return jax.vmap(solve_single)(L_batch, Z_batch)
 ```
 
-Each device solves for its column shard: $\zeta_q[q](\mu, r_{XY})$.
+L is gathered to replicated inside the shard_map, so each device solves its r-column shard. The Python-level outer loop with `donate_argnums` forces sequential GPU execution: `fori_loop` SPMD-replicates the sharded carry (88 GB OOM at Si 10³), and `scan(unroll=8)` pipelines adjacent iterations (18.9 GB preallocated temp).
 
-**Step 4d**: Write to HDF5 immediately (per-q to avoid host OOM):
-
-```python
-for q in range(n_q):
-    ζ_host = np.asarray(ζ_q[q])  # gather (n_μ, n_r_chunk) to host
-    f['zeta_q'][qx, qy, qz, :, r_start:r_end] = ζ_host
-```
+**Step 4d**: Write to HDF5 via `SlabIO.write_slab` (phdf5 FFI when `use_ffi_io=true`, rank-0 allgather fallback otherwise). Layout is flat-q `(nq, n_rtot, n_rmu)` with the μ axis innermost so per-r-chunk writes are contiguous; per-q reads for V_q stay contiguous too.
 
 **Sharding**:
-- $Z_q(\mu_X, r_{XY})$: columns distributed across all $P$ devices
-- $\zeta_q(\mu, r_{XY})$: same column sharding
+- $Z_q(\mu_X, r_Y)$ built in ZCT: `P(None, 'x', 'y')`; resharded once to `P(None, None, ('x','y'))` for the solve
+- $\zeta_q(\mu, r_{XY})$: `P(None, None, ('x','y'))` — r-column distributed
 
-**Implementation**: `fit_zeta_chunked_to_h5()` in `load_wfns.py:1720`.
+**Implementation**: `fit_zeta_chunked_to_h5()` in `common/isdf_fitting.py`.
 
 ### 4.6 Stage 5: Coulomb Matrix Elements
 
@@ -292,13 +289,13 @@ $$\tilde{z}_{q,\mu}(\mathbf{G}) = \sqrt{v_{\mathbf{q}}(\mathbf{G})} \cdot z_{q,\
 
 $$V_{q,\mu\nu} = \sum_{\mathbf{G}} \tilde{z}^*_{q,\mu}(\mathbf{G}) \, \tilde{z}_{q,\nu}(\mathbf{G}) = \langle \tilde{z}_{q,\mu} | \tilde{z}_{q,\nu} \rangle$$
 
-**Memory**: $\zeta$ is loaded $\mu$-chunked (typically $\mu_{\text{chunk}} \approx M_{\text{budget}} / (3 \times 16 \times n_r)$ to hold r-space, G-space, and $\nu$-block).
+**Memory**: $\zeta$ is loaded $\mu$-chunked and each q-batch is read from `zeta_q.h5` into a background thread while the previous batch computes on GPU (overlapped I/O, `ThreadPoolExecutor` in `compute_all_V_q_from_zeta_h5`). A single-chunk path vmaps the whole q-batch through one JIT.
 
-**Output**: `V_qmunu.h5` with shape $(n_q, n_\mu, n_\mu)$, used as input to GW pipeline.
+**Output**: `V_qmunu` array, shape $(n_{qx}, n_{qy}, n_{qz}, n_\mu, n_\mu)$, sharded `P(None, None, None, 'x', 'y')`. Used directly in memory by the GW pipeline; not routinely persisted to disk.
 
-**Disk bottleneck**: The file `zeta_q.h5` with shape $(n_{qx}, n_{qy}, n_{qz}, n_\mu, n_r)$ is often **10-100 GB** and represents a significant disk storage constraint. For systems with $n_q = 128$, $n_\mu = 40000$, $n_r = 10^6$, this is $\sim$80 GB in complex128 format.
+**Disk bottleneck**: The file `zeta_q.h5` has flat-q layout $(n_q, n_r, n_\mu)$ and is typically **10–100 GB**. Dataset layout puts $n_\mu$ innermost so per-r-chunk writes are contiguous (the earlier `(n_q, n_\mu, n_r)` layout was 8× slower on Perlmutter pscratch).
 
-**Implementation**: `compute_all_V_q_from_zeta_h5()` in `compute_vcoul.py`.
+**Implementation**: `compute_all_V_q_from_zeta_h5()` in `gw/compute_vcoul.py`. Q=0 divergence handled via Voronoi Monte Carlo in `gw/vcoul.py:compute_q0_averages`. Box truncation (0-D molecules) via `gw/compute_vcoul_0d.py`.
 
 ---
 
@@ -379,7 +376,7 @@ for q_start in range(0, n_q, B_q):
 
 $$B_q \leq \frac{M_{\text{budget}} - M_{\text{base}} - 2 \times M_{Z_{\text{col}}}}{16 \times n_\mu^2}$$
 
-**Automatic sizing**: Function `compute_optimal_chunks()` in `gw_init.py` solves this constraint system analytically, iteratively reducing chunk sizes until all stages fit.
+**Automatic sizing**: Function `compute_optimal_chunks()` in `gw/gw_init.py` solves this constraint system analytically, iteratively reducing chunk sizes until all stages fit, using `common.gpu_utils.get_device_memory_info()` to probe the per-device budget.
 
 **See**: `docs/MEMORY_MODEL.md` for detailed formulas and bottleneck arrays.
 
@@ -476,9 +473,9 @@ $$\chi^0_{\ell m} = -\frac{2\gamma}{\sqrt{N_k} \, n_{\text{spin}} n_{\text{spino
 
 **Quadrature size**: $N_\tau = \alpha(0.4 - 0.3\ln\epsilon)$ where $\alpha = \sqrt{E_{\text{bw}}/E_{\text{gap}}}$ and $\epsilon$ is target error.
 
-**Implementation**: Universal chi kernel with energy masking in `_get_chi_kernel()` (`w_isdf.py:60`). Single JIT compilation, window pairs selected via boolean masks.
+**Implementation**: `compute_chi0_minimax()` in `gw/w_isdf.py`. The cached `_get_chi_minimax_kernel()` (flat-k, compiled once per mesh × kgrid) builds $G^v(\tau)$ and $G^c(\tau)$ via `greens_function_kernel.build_G` with Laplace phases, IFFTs each to R-space using `make_flat_k_ifftn` (see §7.2 below for the swapped μ/ν ↔ 'x'/'y' assignment that keeps the output naturally sharded), contracts `einsum('Rambn,Rbnam->Rmn')`, accumulates `χ_R` over τ nodes in a donated fori-loop, and FFTs back to q. The outer `compute_chi0()` (`gw/w_isdf.py`) pulls the τ nodes and minimax weights from a `LaplaceMinimaxQuadrature` built by `common.minimax` (or loaded from `src/common/minimax_assets/` when `regenerate_minimax_tables = false`).
 
-**Reference**: Kim, Martyna & Ismail-Beigi, PRB 101, 035139 (2020). Full derivation in `docs/MINIMAX_QUADRATURE.md`.
+**Reference**: Kim, Martyna & Ismail-Beigi, PRB 101, 035139 (2020). Full derivation in `docs/MINIMAX_QUADRATURE.md`. Windowing strategy in `docs/NEW_WINDOW_MINIMAX_GUIDELINES.md`.
 
 ### 6.4 Screened Interaction (Dyson Equation)
 
@@ -492,9 +489,9 @@ $$(1 - V\chi^0) W = V$$
 
 **Note**: The whitening step (orthogonalizing via overlap matrix $S = \langle \zeta_\mu | \zeta_\nu \rangle$) is **not used** in the current implementation. We solve the Dyson equation directly in the original ISDF basis.
 
-**Sharding**: During solve, reshard from $V_q(\mu_X, \nu_Y)$ to $V_q(q_{XY}, \mu, \nu)$ for per-q LU (q-point parallelism).
+**Sharding**: both V and χ₀ arrive as `P(None, 'x', 'y')` on a flat-q `(nq, μ, μ)` layout. `_get_w_solve_fn` pads to a multiple of `mesh.size`, reshapes the sharding via two `with_sharding_constraint` stages (replicate → `P(('x','y'), None, None)`, i.e. q-parallel with μ and ν replicated per-q), and runs a `shard_map` that loops per-q via `fori_loop` calling `jsp_linalg.lu_factor` and `lu_solve`. The result is resharded back to replicated for downstream FFT convolutions.
 
-**Implementation**: `get_static_w_q_jax()` in `w_isdf.py:240`.
+**Implementation**: `solve_w()` in `gw/w_isdf.py` (public) / `_get_w_solve_fn()` cached factory.
 
 ### 6.5 Head Correction for q=0, G=0 Divergence
 
@@ -522,7 +519,7 @@ Solving: $W_{00}(\omega) = \bar{v}_0 / (1 - \bar{v}_0 \chi_{00}(\omega))$.
 
 The full $W$ at $q=0$ includes this head contribution added in the same way as to $V$.
 
-**Implementation**: Head added in `gw_jax.py:1948`, dipole $S_{\alpha\beta}$ computed in `chi_from_dipole.py`.
+**Implementation**: `gw/head_correction.py` centralizes the head path. `resolve_head_sample()` selects the source (`vhead`/`whead_0freq`/`whead_imfreq` overrides → `epshead` from `eps0mat.h5` → `s_tensor` from `dipole.h5`) and returns a scalar `HeadSample(v_c0, W_c0, source, ω)`. `compute_static_head_terms_from_sample()` builds **exact** band-diagonal shifts for Σ^X, Σ^SX, Σ^{SX−X}, and Σ^COH (all in Ry); `static_head_terms_to_kij()` broadcasts them to dense `(nk, nb, nb)` matrices that are added to the sigma matrices in `gw_jax.main` (`_add_head`). Dipole $S_{\alpha\beta}(\omega)$ is computed in `common/chi_from_dipole.py : compute_S_omega`. The GN-PPM path uses a separate scalar `HeadGNParams` (`fit_head_gn`) for dynamic head contributions.
 
 ### 6.6 Self-Energy Matrix Elements
 
@@ -564,9 +561,12 @@ temp = einsum('kiaμ, kaμbν -> kibν', ψ.conj(), Σ)  # (k, i, b, ν)
 
 **Sharding**: $\Sigma_{ij,\mathbf{k}}(k, i, j)$ replicated or batch-sharded over k.
 
-**Output**: Written to `sigma.h5` and `eqp.dat` (quasiparticle energies).
+**Output**: The Σ_ij k-matrices are post-processed on the host: `H_QP = kin_ion + Σ_SX + Σ_COH + V_H`, Hermitianized, diagonalized by `jax.vmap(jnp.linalg.eigh)` → `eqp.dat` / `eqp1.dat` (BGW-compatible text, written by `file_io.sigma_output.write_eqp_g0w0` / `write_eqp1`). The full Σ^c(ω) (when `use_ppm_sigma=true`) is written to `sigma_mnk.h5` with datasets `sigma_c_kij_ev` / `sigma_sx_kij_ev` / `hartree_kij_ev` / `omega_ev` via `write_sigma_omega_h5` (phdf5-capable).
 
-**Implementation**: `get_sigma_x_kij_jax()` in `gw_jax.py:804`.
+**Implementation**:
+- Static kernels: `sigma_sx` / `sigma_coh` / `hartree` in `gw/gw_jax.py` (local `@jax.jit` closures that wrap `build_G` + `_convolve` + `project`).
+- `build_G`: `gw/greens_function_kernel.py` — unified builder for `G_ii^{occ}`, `G^{all}`, and phased `G(τ)`.
+- `project` / `project_ri`: `gw/projection_kernel.py` — the static path uses `project`; the GN-PPM σ^τ path uses a `shard_map`'d reduce-scatter variant (`_make_project_ri_reduce_scatter` in `gw/ppm_sigma.py`) that lands the output `(m_X, n_Y)`-sharded so downstream coeff·σ multiplies stay local.
 
 **Important frequency-dependent caveat**: for the windowed GN-PPM $\Sigma^c(\omega)$ pipeline, the per-window `Re`/`Im` projection must be taken before band projection. In general,
 
@@ -610,63 +610,200 @@ $$H_{QP} = (H_{DFT} - V_{xc}) + V_H + \Sigma_{xc}(\omega).$$
 3. Diagonalize $H_{\text{QP}}^{(i)} = H_{\text{KS}} - V_{xc} + \Sigma^{(i)}$ → new $\psi_n^{(i+1)}, E_n^{(i+1)}$
 4. Repeat until $|\!|E^{(i+1)} - E^{(i)}|\!| < \epsilon$
 
-**Current status**: A fixed-point iteration prototype exists in `gw_jax.py` using Anderson mixing from `mixing/acceleration.py`, but is **not yet validated**. The code currently performs **one-shot GW** (G₀W₀): compute $\Sigma$ once from DFT wavefunctions without iterating.
+**Current status**: A fixed-point COHSEX self-consistency path exists behind `config.self_consistent=True` in `gw_jax.main`. It uses Anderson mixing (`mixing/acceleration.py : rcrop_nojit`, history `m=3`, maxit=40, tol 1e-5) on the flattened upper-Hermitian of Σ_total. Each step:
 
-**Implementation**: `gw_jax.py:1230` (prototype, disabled by default).
+1. Unflatten Σ, form $H_{QP} = (H_{DFT} - V_{xc}) + \Sigma$, Hermitianize.
+2. `jax.vmap(jnp.linalg.eigh)` → `U_k`.
+3. Form new occupation projector $G_{ij} = U_k\, f\, U_k^\dagger$ with fixed-count occupation.
+4. Recompute $\Sigma_{SX}$, $\Sigma_{COH}$, $V_H$ with the new $G_{ij}$; return flattened upper-Hermitian.
+
+The default `G_0 W_0` path (`self_consistent=False`) performs **one-shot** static COHSEX. A separate diagonal-Σ_xc fixed-point (`gw/qsgw_utils.py : solve_diagonal_sigma_fixed_point`) runs post-hoc when `use_ppm_sigma=true` to evaluate $E = \text{diag}(H_0) + \text{Re}\,\Sigma_{xc}(E)$, with a scissor fit (`gw/scissor.py`) extrapolating out-of-ω-grid bands.
+
+**Implementation**: `gw/gw_jax.py : main` — the `if config.self_consistent:` block builds `_sc_step()` and passes it to `rcrop_nojit`; QSGW Σ^xc reconstruction via `build_qsgw_sigma_xc_from_h5` in `gw/qsgw_utils.py`.
+
+### 6.9 GN-PPM dynamic self-energy Σ^c(ω)
+
+Static COHSEX neglects the ω-dependence of $W$. For a full $\Sigma^c(\omega)$ we use the Godby–Needs plasmon-pole model: every $(μ,ν,q)$ matrix element of the correlated screening $W^c = W - V$ is approximated by a single pole,
+
+$$W^c_{q,μν}(\omega) \approx \frac{B_{q,μν}}{\omega^2 - \Omega_{q,μν}^2},$$
+
+with two parameters $(B, \Omega)$ fitted at each $(μ,ν,q)$ from two known samples — $W^c(0)$ and $W^c(i\omega_p)$ — via `gw/minimax_screening.py : fit_gn_ppm_from_wc_pair`. The driver computes $W(0)$ from the static minimax χ₀, then rebuilds $χ₀(i\omega_p)$ via a second `compute_chi0_minimax` call with an imaginary-frequency quadrature (`build_imag_quadrature`), solves the Dyson equation again for $W(i\omega_p)$, and hands both to `fit_gn_ppm` (`gw/ppm_sigma.py`).
+
+#### 6.9.1 Time-domain integrand
+
+Starting from the standard time-ordered expression $\Sigma^c(\omega) = \frac{i}{2\pi} \int d\omega' G(\omega + \omega') W^c(\omega')$, closing the contour in the upper / lower half-plane and substituting the PPM ansatz gives (per band):
+
+$$\Sigma^c_{n m \mathbf{k}}(\omega) = \sum_q \sum_{a \in \{\mathrm{v}, \mathrm{c}\}} \text{sign}_a \int_0^\infty d\tau\ e^{i\,\text{sign}_\omega \omega \tau}\ \text{project}\!\left[ G_a(\tau) \cdot W_{\text{PPM}}^a(\tau) / \sqrt{N_k} \right]$$
+
+where
+- $G_\mathrm{c}(\tau) = \sum_{m \in \text{cond}} e^{-i (E_{m\mathbf{k}} - E_F)\tau}\, \psi_{m\mathbf{k}}(\mu) \psi^*_{m\mathbf{k}}(\nu)$ uses $E_A = E_c - E_F \ge 0$,
+- $G_\mathrm{v}(\tau) = \sum_{m \in \text{val}} e^{-i (E_F - E_{m\mathbf{k}})\tau}\, \psi_{m\mathbf{k}}(\mu) \psi^*_{m\mathbf{k}}(\nu)$ uses $H_A = E_F - E_v \ge 0$ with a sign-flipped kernel,
+- $W^a_\mathrm{PPM}(\tau) = \sum_{μν} B_{q,μν}\, e^{-i (\Omega_{q,μν} - E_{\mathrm{ref}_B}) \tau}$ (static-pole time transform of the PPM).
+
+Four branches cover $\omega \in \mathbb R$:
+
+| Branch | A-space | `kernel_sign` | `scale` | ω |
+|---|---|---|---|---|
+| (+ω, cond) | $E_c - E_F$ | +1 | +1 | $\omega \ge 0$ |
+| (+ω, val) | $E_F - E_v$ | −1 | +1 | $\omega \ge 0$ |
+| (−ω, cond) | $E_c - E_F$ | −1 | −1 | $\omega < 0$, evaluated at $\lvert\omega\rvert$ |
+| (−ω, val) | $E_F - E_v$ | +1 | −1 | $\omega < 0$, evaluated at $\lvert\omega\rvert$ |
+
+Enumerated in `_iter_branches` (`gw/ppm_sigma.py`).
+
+#### 6.9.2 Minimax window decomposition
+
+For a given branch the τ integrand decomposes into three regimes of the combined energy $E_A + \Omega$:
+
+1. **Laplace core**: $E_A + \Omega \gg \omega$ — smooth decay, one Laplace-minimax window covers it.
+2. **Crossing stripe**: $E_A + \Omega \approx \omega$ — resonance. Uses a phase-minimax (HGL / `solve_phase_minimax_bandwidth`) quadrature and stores only $\text{Im}[\text{coeff} \cdot \sigma^\tau]$ (see `_combine_coeff_with_sigma_tau`, `project_code = "imag"`).
+3. **Tail slab**: $E_A + \Omega \ll \omega$ — wide energy bandwidth, covered by a second Laplace minimax with a tighter target error.
+
+`_build_three_sigma_windows` (host-side) builds the three `_SigmaWindow` specs per +ω branch; val and −ω branches use `_build_single_sigma_window`. See [`GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md`](GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md) for the full derivation of the window edges and error model.
+
+#### 6.9.3 Per-τ kernel
+
+For each τ node the device-side kernel (`_get_sigma_tau_kernel` in `gw/ppm_sigma.py`) builds:
+
+- `Gij[k, i, j] = δ_ij · exp(-i (E_A[k,i] - E_ref_A) τ) · mask_A[k,i]` — band-diagonal occupation projector with Laplace phase.
+- `W_t_q[q, μ, ν] = B_q[q,μ,ν] · exp(-i (Ω_q[q,μ,ν] - E_ref_B) τ) · mask_B[q,μ,ν]` — per-(μ,ν) PPM time transform.
+
+and calls the static-shape kernel
+
+$$\sigma^\tau_{k,m,n} = \text{project\_ri}\!\left[ \text{FFT}\!\left[ G_k(\tau) \odot W^\tau_R / \sqrt{N_k} \right] \right]$$
+
+which reuses the same flat-k pipeline as static COHSEX but with the *frequency-integrated* projection variant: `_make_project_ri_reduce_scatter` lands the output `(m_X, n_Y)`-sharded and carries **real + imaginary** channels separately so the crossing window can keep only $\text{Im}[\text{coeff} \cdot \sigma^\tau]$ without materializing a complex σ^τ.
+
+All τ nodes of a single window run inside one `jax.lax.scan` (`_get_sigma_tau_scan_kernel`) so XLA can pipeline NCCL across iterations — this is what makes the GN-PPM path competitive with static COHSEX wall-time for small ω grids.
+
+#### 6.9.4 Projecting τ onto ω
+
+Within each window, the minimax quadrature carries weights $\alpha_\ell$ and nodes $\tau_\ell$. The ω-dependence is *linear in τ* — every τ contribution feeds all ω:
+
+$$c_u(\omega) = \alpha_u\, e^{-i(E_{\mathrm{ref}_A} + E_{\mathrm{ref}_B})\tau_u}\, e^{i\,\text{sign}_\omega \omega \tau_u}$$
+
+Then `_project_tau_onto_omega` adds
+
+$$\Delta \Sigma^c_{kmn}(\omega) = \text{pref} \cdot \text{scale} \cdot P\left[ c_u(\omega) \cdot \sigma^{\tau_u}_{kmn} \right]$$
+
+where $P \in \{\text{full}, \text{imag}\}$ is the window's `project_code`. For crossing windows,
+
+$$P_\text{imag}[c \cdot \sigma] = c_{\Re} \sigma_{\Im} + c_{\Im} \sigma_{\Re} = \text{Im}[c \sigma],$$
+
+which is the correct reduced storage: see the "important frequency-dependent caveat" note at §6.7 — taking `Re`/`Im` of an already-band-projected complex Σ is **not** equivalent, so σ^τ must carry both channels from the kernel.
+
+#### 6.9.5 Accumulation
+
+The $(n_\omega, n_k, m_X, n_Y)$ accumulator is chosen automatically (`omega_accumulation = auto | kij | kij_stream`):
+
+- `_ReduceScatterGpuAccumulator` — accumulate directly on-device, keep the `(m_X, n_Y)` sharding, gather once to host at the end. Multi-process safe. Default for typical ω grids.
+- `_StreamedH5Accumulator` — single-process only. Reads / modifies / writes `sigma_c_kij_ry` via rank-0 h5py on every (τ × ω-batch) dispatch. Hundreds of round-trips — currently falls back to accum mode under multi-process. Useful only for very large ω grids that blow the device budget.
+
+Implementation: `compute_sigma_c_ppm_omega_grid` in `gw/ppm_sigma.py`. Output written to `sigma_mnk.h5` (`omega_ev`, `sigma_c_kij_ev`, `sigma_sx_kij_ev`, `hartree_kij_ev`) via `file_io.sigma_output.write_sigma_omega_h5`.
 
 ---
 
 ## 7. JAX Sharding Summary
 
+Everything runs on a single 2-D mesh `Mesh(devices, ('x', 'y'))` built in `gw_jax._build_mesh` as a most-square factorization of `jax.process_count() * jax.local_device_count()`. There is no `'bands'` axis. Flat-k / flat-q: the 3-D `(nkx, nky, nkz)` form only appears inside `common/fft_helpers.make_flat_k_{fftn,ifftn}`.
+
 ### 7.1 Zeta Fitting Pipeline
 
-| Array | Sharding | Size | Notes |
-|-------|----------|------|-------|
-| $\psi_{\text{rmu}}$ | $(k, n, s, \mu_Y)$ | $n_k \times n_b \times 2 \times n_\mu$ | Centroids on Y |
-| $\psi_{\text{rmuT}}$ | $(k, \mu_X, n, s)$ | Same | Transposed for matmul |
-| $P_{\mathbf{k}}$ | $(k, s, \mu_X, s, \mu_Y)$ | $n_k \times 4 \times n_\mu^2$ | Pair density (2D tiles) |
-| $C_q$ | $(q, \mu_X, \nu_Y)$ | $n_q \times n_\mu^2$ | CCT matrix |
-| $L_q$ | $(q, \mu_X, \nu_Y)$ | Same | Cholesky factor |
-| $Z_q$ | $(q, \mu_X, r_{XY})$ | $n_q \times n_\mu \times n_r$ | ZCT matrix |
-| $\zeta_q$ | $(q, \mu, r_{XY})$ | Same | Interpolation vectors |
+| Array | Sharding spec | Shape | Notes |
+|-------|---------------|-------|-------|
+| ψ_yr | `P(None, None, None, 'y')` | `(nk, n, s, μ_Y)` | `wavefunction_bundle.PSI_YR_SPEC` |
+| ψ_xr | `P(None, None, None, 'x')` | `(nk, n, s, μ_X)` | Σ-projection LHS |
+| ψ_xn | `P(None, None, 'x', None)` | `(nk, s, μ_X, n)` | G/χ₀ LHS |
+| ψ_yn | `P(None, None, 'y', None)` | `(nk, s, μ_Y, n)` | Σ-projection RHS |
+| P_k (spin-traced) | `P(None, 'x', 'y')` | `(nk, μ_X, ν_Y)` | `compute_pair_density_spin_traced` |
+| P_k (spin-matrix) | `P(None, None, None, 'x', 'y')` | `(nk, s, s', μ_X, ν_Y)` | spin-matrix Frobenius mode |
+| C_q | `P(None, 'x', 'y')` | `(nq, μ_X, ν_Y)` | CCT, flat-q |
+| L_q (tiles) | `P(None, 'x', 'y', None, None)` | `(nq, J_X, J_Y, b, b)` | internal to `cholesky_2d_batched` |
+| L_q (dense) | `P(None, 'x', 'y')` | `(nq, μ_X, ν_Y)` | on return |
+| Z_q (ZCT) | `P(None, 'x', 'y')` | `(nq, μ_X, r_Y)` | z-chunked build |
+| ζ_q (solve out) | `P(None, None, ('x','y'))` | `(nq, μ, r_{XY})` | r-columns distributed |
+| `zeta_q.h5` on disk | — | `(nq_flat, n_rtot, n_rmu)` | μ innermost for contiguous r-chunk writes |
 
-### 7.2 GW Pipeline
+### 7.2 Screening + static Σ
 
-| Array | Sharding | Size | Notes |
-|-------|----------|------|-------|
-| $G_{\mathbf{k}}$ | $(k, s_a, \mu_X, s_b, \nu_Y)$ | $n_k \times 4 \times n_\mu^2$ | Green's function |
-| $\chi^0_q$ | $(q, \mu_X, \nu_Y)$ | $n_q \times n_\mu^2$ | Polarizability |
-| $V_q$ | $(q, \mu_X, \nu_Y)$ | Same | Bare Coulomb |
-| $W_q$ (solve) | $(q_{XY}, \mu, \nu)$ | Same | Resharded for per-q LU |
-| $W_q$ (final) | $(q, \mu_X, \nu_Y)$ | Same | Resharded back |
-| $\Sigma_{\mathbf{k}}$ | $(k, s_a, \mu_X, s_b, \nu_Y)$ | $n_k \times 4 \times n_\mu^2$ | Self-energy |
-| $\Sigma_{ij,\mathbf{k}}$ | $(k, i, j)$ | $n_k \times n_b^2$ | Band basis |
+| Array | Sharding spec | Shape | Notes |
+|-------|---------------|-------|-------|
+| G(k) 5-D flat-k | `P(None, None, 'x', None, 'y')` | `(nk, s, μ_X, s', ν_Y)` | `build_G` output |
+| G (χ₀ kernel, valence) | `P(None, None, 'x', None, 'y')` | `(nk, s, μ_X, s', ν_Y)` | `_Gv_spec` — μ on x, ν on y |
+| G (χ₀ kernel, conduction) | `P(None, None, 'y', None, 'x')` | `(nk, s, μ_Y, s', ν_X)` | `_Gc_spec` — **swapped** to leave einsum output sharded |
+| χ₀_R accumulator | `P(None, 'y', 'x')` | `(nR, μ_Y, ν_X)` | `_chi_R_spec` — **y then x** to match `einsum('Rambn,Rbnam->Rmn')` output |
+| χ₀_q | `P(None, 'x', 'y')` | `(nq, μ_X, ν_Y)` | after FFT to q |
+| V_q, W_q (physics) | `P(None, 'x', 'y')` | `(nq, μ_X, ν_Y)` | flat-q Coulomb / screened |
+| V / W inside `_convolve` | `P(None, None, None, 'x', 'y')` | `(nkx, nky, nkz, μ_X, ν_Y)` | 3-D k reshape internal to FFT helper |
+| W solve input | `P(('x','y'), None, None)` | `(nq_padded/P, μ, ν)` | q-parallel shard for per-q LU |
+| W solve output | replicated | `(nq, μ, ν)` | `with_sharding_constraint` to `rep_3d` |
+| Σ_k (static/σ^τ) | `P(None, None, 'x', None, 'y')` | `(nk, s, μ_X, s', ν_Y)` | before band projection |
+| Σ_{k,ij} (static) | `P(None, None, None)` | `(nk, i, j)` | replicated after project |
+| Σ_{k,ij} (reduce-scatter) | `P(None, 'x', 'y')` | `(nk, m_X, n_Y)` | σ^τ path: `_make_project_ri_reduce_scatter` |
+| kin_ion, enk, occ | replicated | `(nk, nb, nb)` / `(nk, nb)` | host-loaded |
 
-**Notation**: Subscripts $X, Y, XY$ denote sharding axes on 2D mesh `Mesh(devices, ('x', 'y'))`.
+### 7.3 GN-PPM parameters
+
+| Array | Sharding spec | Shape | Notes |
+|-------|---------------|-------|-------|
+| B_q, Ω_q, valid_mask_q | `P(None, 'x', 'y')` | `(nq, μ_X, ν_Y)` | `fit_gn_ppm` output (constrained) |
+| W_τ_q (single τ) | `P(None, 'x', 'y')` | `(nq, μ_X, ν_Y)` | `_build_tau_operands` |
+| Σ^τ_kmn real / imag | `P(None, 'x', 'y')` | `(nk, m_X, n_Y)` | carried as re/im pair |
+| Σ^c(ω) accumulator | `P(None, None, 'x', 'y')` | `(nω, nk, m_X, n_Y)` | `_ReduceScatterGpuAccumulator` |
+
+### 7.4 Key collective patterns
+
+- **χ₀ kernel**: `Gv` and `Gc` use *swapped* μ/ν ↔ 'x'/'y' so that `einsum('Rambn,Rbnam->Rmn')` contracts over the two local axes and leaves output naturally sharded `P(None,'y','x')`. The explicit `with_sharding_constraint(…, _chi_R_spec)` prevents XLA from materializing a replicated 23 GB buffer at Si 4×4×4 60 Ry μ=2400.
+- **Dyson W solve**: `shard_map` over `'x'` and `'y'` flattened into a q-parallel axis `P(('x','y'), None, None)`; per-q `fori_loop` with `lu_factor/lu_solve`. Replicated on return.
+- **Σ projection** (frequency-dependent path): `shard_map` with **two `psum_scatter`** calls — one over `'x'` scattering `m`, one over `'y'` scattering `n`. Same NCCL byte volume as two plain `psum`s but outputs arrive `(m_X, n_Y)`-sharded so `coeff·σ` in `_project_tau_onto_omega` stays device-local.
+- **Cholesky**: `cholesky_2d_batched` operates on tile layout `P(None,'x','y',None,None)`; panel broadcasts + triangular updates via `lax.psum` over axis `'x'`. Falls back to dense `jnp.linalg.cholesky` on 1×1 meshes.
+- **Triangular ζ solve**: per-q batch gathered to replicated inside a `shard_map` over `'x'`/`'y'` flattened on the r-column axis; `vmap(solve_triangular × 2)` for L⁻¹ and L⁻H. Python outer loop with `donate_argnums` for sequential GPU execution.
 
 ---
 
 ## 8. File Organization
 
-### Core Implementation
+### Core implementation
 
-| File | Lines | Purpose |
-|------|-------|---------|
-| `load_wfns.py` | 1900 | Zeta pipeline: CCT/ZCT, Cholesky, chunking |
-| `gw_jax.py` | 1400 | Main driver: wfn loading, $\Sigma$ calculation |
-| `w_isdf.py` | 350 | $\chi^0$ and $W$ via CTSP, Dyson solve |
-| `cholesky_2d.py` | 600 | 2D blocked Cholesky for sharded CCT |
-| `compute_vcoul.py` | 800 | $V_q$ from zeta HDF5 |
-| `gw_init.py` | 650 | Input parsing, automatic chunk sizing |
-| `meta.py` | 200 | System metadata (k/q-grids, cell) |
+| File | Purpose |
+|------|---------|
+| `gw/gw_jax.py` | Driver `main()`: mesh, config, ISDF, χ₀/W, static Σ, head, GN-PPM, QSGW |
+| `gw/gw_config.py` | `LorraxConfig` (parsed from `cohsex.in`) |
+| `gw/gw_init.py` | `compute_optimal_chunks`, `prepare_isdf_and_wavefunctions` |
+| `gw/gw_driver_helpers.py` | Config → runtime-option translators (PPM, screening) |
+| `gw/w_isdf.py` | χ₀ minimax kernel + W Dyson solve (flat-q) |
+| `gw/ppm_sigma.py` | GN-PPM fit + Σ^c(ω) branch/window/τ pipeline |
+| `gw/minimax_screening.py` | Window construction + shipped-table lookup + PPM fit |
+| `gw/minimax_config.py` | `MinimaxConfig`, `SigmaQuadratureConfig` |
+| `gw/greens_function_kernel.py` | `build_G` unified Green's-function builder |
+| `gw/projection_kernel.py` | `project`, `project_ri` band-basis contractions |
+| `gw/head_correction.py` | q→0 head sample + exact static head terms |
+| `gw/vcoul.py`, `gw/compute_vcoul.py`, `gw/compute_vcoul_0d.py` | Coulomb kernel + V_q build |
+| `gw/qsgw_utils.py` | Diagonal Σ fixed-point + QSGW Σ^xc |
+| `gw/scissor.py` | Valence/conduction scissor extrapolation |
+| `gw/wavefunction_bundle.py` | `BandSlices`, `Wavefunctions` (4 sharded ψ copies) |
+| `common/isdf_fitting.py` | CCT/ZCT kernels, Cholesky, ζ solve, full pipeline |
+| `common/cholesky_2d.py` | 2D blocked Cholesky |
+| `common/fft_helpers.py` | Flat-k ↔ 3-D FFT helpers (custom_partitioning) |
+| `common/meta.py` | `Meta` system dataclass |
+| `common/symmetry_maps.py` | IBZ → full BZ unfolding, spinor rotations |
+| `common/minimax.py`, `common/minimax_assets/` | Quadrature solvers + shipped tables |
+| `common/chi_from_dipole.py` | $S_{\alpha\beta}(\omega)$ from dipole mtxels |
+| `file_io/slab_io.py` | `SlabIO` — phdf5 writer (FFI + allgather backends) |
+| `file_io/sigma_output.py` | eqp.dat / eqp1.dat / sigma_mnk.h5 |
+| `mixing/acceleration.py` | Anderson mixing for self-consistent COHSEX |
 
 ### Documentation
 
 | Doc | Focus |
 |-----|-------|
-| **This file** | Theory + implementation |
-| `MEMORY_MODEL.md` | Detailed memory formulas and bottleneck arrays |
-| `MINIMAX_QUADRATURE.md` | CTSP theory, quadrature derivations, solver methods |
+| **This file** | Theory + implementation + sharding map |
+| [`CODEBASE_COMPREHENSIVE.md`](CODEBASE_COMPREHENSIVE.md) | Module map, call hierarchy, file formats |
+| [`MEMORY_MODEL.md`](MEMORY_MODEL.md) | Per-stage memory formulas, bottleneck arrays |
+| [`MINIMAX_QUADRATURE.md`](MINIMAX_QUADRATURE.md) | CTSP theory, quadrature derivations |
+| [`GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md`](GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md) | GN-PPM Σ^c(ω) window derivations |
+| [`NEW_WINDOW_MINIMAX_GUIDELINES.md`](NEW_WINDOW_MINIMAX_GUIDELINES.md) | Minimax window placement rules |
+| [`SIGMA_FREQ_AUDIT_STATUS.md`](SIGMA_FREQ_AUDIT_STATUS.md) | Current BGW-vs-LORRAX comparison status |
 
 ---
 
@@ -675,35 +812,42 @@ $$H_{QP} = (H_{DFT} - V_{xc}) + V_H + \Sigma_{xc}(\omega).$$
 ### Preparation
 
 1. DFT wavefunctions: `pw2bgw.x` → `WFN.h5`, `WFNq.h5`
-2. Centroid selection: `uv run kmeans_isdf -i kmeans.in` → `centroids_frac.h5`
-3. Input file: `cohsex.in` with band ranges, memory budget
+2. Centroid selection: `lxpre cohsex.in 640` (runs `centroid.kmeans_isdf`, `psp.get_dipole_mtxels`, `gw.kin_ion_io` in sequence) → `centroids_frac.h5`, `dipole.h5`, `kin_ion.h5`
+3. Input file: `cohsex.in` with band ranges, memory budget, head source, ISDF pair mode, GN-PPM flags
 
-### Zeta Fitting
-
-```bash
-uv run python -m gw.gw_jax -i cohsex.in --fit-zeta-only
-```
-
-**Produces**:
-- `zeta_q.h5`: $(n_{qx}, n_{qy}, n_{qz}, n_\mu, n_r)$
-- `V_qmunu.h5`: $(n_q, n_\mu, n_\mu)$
-
-### GW Calculation
+### GW calculation (one-shot)
 
 ```bash
+# Perlmutter
+lxrun python3 -u -m gw.gw_jax -i cohsex.in           # 4-GPU
+
+# Local
 uv run python -m gw.gw_jax -i cohsex.in
 ```
 
-**Uses**: Cached `zeta_q.h5`, `V_qmunu.h5`
+**Produces**:
+- `eqp.dat`, `eqp1.dat` — BGW-compatible QP energy tables
+- `sigma_mnk.h5` (when `use_ppm_sigma=true`) — datasets `omega_ev`, `sigma_c_kij_ev`, `sigma_sx_kij_ev`, `hartree_kij_ev`
+- `qp_rotations.h5` — U matrices + eigenvalues
+- `zeta_q.h5` — cached on disk under `<input_dir>/tmp/isdf_tensors_{n_rmu}.h5` for restarts (unless `isdf_restart=false`)
 
-**Produces**: `sigma.h5`, `eqp.dat` (quasiparticle energies)
+### Restart
+
+Set `isdf_restart=true` in `cohsex.in` and the driver loads the cached `isdf_tensors_*.h5` instead of re-running the zeta fit.
+
+### Sandbox / BGW comparisons
+
+See the `lorrax_sandbox` superproject `skills/execute_workflow/SKILL.md` for the QE → BGW → LORRAX pipeline, and `skills/compare/SKILL.md` for output parsers.
 
 ---
 
-## 10. Known Issues
+## 10. Known Issues / Active Work
 
-1. **Dyson solve**: LU for $(1-V\chi^0)^{-1}$ not distributed over $\mu$ (communication bottleneck)
-2. **Self-consistency**: Fixed-point prototype exists but not validated
+1. **Dyson solve** is q-parallel but not μ-distributed within a q — each device holds the full `(μ, ν)` matrix for its q slab. Acceptable at Si 4×4×4 / MoS2 3×3 scale; bottleneck for >= 10³ k-grids. Future work: SLATE distributed LU (FFI scaffold already in place).
+2. **Σ^c(ω) streamed H5 accumulator** falls back to in-GPU accum under multi-process (rank-0 round-trip per (τ × ω-batch) is too expensive). Not urgent unless the kij accumulator blows the GPU budget.
+3. **Self-consistent COHSEX** (`self_consistent=true`) converges on tested systems but doesn't compose with `use_ppm_sigma=true` yet (driver raises). A proper QSGW with full Σ^c(ω) is a separate path.
+4. **Pseudobands normalization** for non-unit-norm coefficients: ISDF fit divides ψ by `max(1, band_norm)`, but the diag-SC fixed-point uses `eigvalsh(H_qp)` which is unreliable for compressed states — the driver substitutes DFT energies for out-of-grid bands via `scissor.fit_scissor`.
+5. **FFI path opt-in**: `use_ffi_io=true` uses phdf5 for zeta/V/sigma I/O. `LORRAX_MPI_TYPE=pmix` required only for legacy OpenMPI paths; the default `cray_shasta` / unified MPICH stack covers all three FFI targets.
 
 ---
 

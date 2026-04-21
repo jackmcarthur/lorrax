@@ -1,6 +1,6 @@
 # Codebase Structure & Architecture
 
-**For AI agents**: This document describes the code organization, module responsibilities, key classes, data flow, and file formats. Read this when working on implementation tasks. For physics/theory, see [`PHYSICS_COMPREHENSIVE.md`](PHYSICS_COMPREHENSIVE.md).
+**For AI agents**: module organization, key classes, data flow, file formats. Read this when working on implementation tasks. For physics/theory see [`PHYSICS_COMPREHENSIVE.md`](PHYSICS_COMPREHENSIVE.md); for environment setup see [`ENVIRONMENT_COMPREHENSIVE.md`](ENVIRONMENT_COMPREHENSIVE.md).
 
 ---
 
@@ -8,12 +8,13 @@
 
 1. [Module Structure](#1-module-structure)
 2. [Key Classes](#2-key-classes)
-3. [Data Flow Pipeline](#3-data-flow-pipeline)
-4. [File Formats](#4-file-formats)
-5. [Entry Points & CLI Tools](#5-entry-points--cli-tools)
-6. [Function Call Hierarchy](#6-function-call-hierarchy)
-7. [JAX Sharding Patterns](#7-jax-sharding-patterns)
-8. [Code Locations Quick Reference](#8-code-locations-quick-reference)
+3. [Device mesh and sharding conventions](#3-device-mesh-and-sharding-conventions)
+4. [Flat-k / flat-q convention](#4-flat-k--flat-q-convention)
+5. [Data Flow Pipeline](#5-data-flow-pipeline)
+6. [File Formats](#6-file-formats)
+7. [Entry Points](#7-entry-points)
+8. [Function Call Hierarchy](#8-function-call-hierarchy)
+9. [Code Locations Quick Reference](#9-code-locations-quick-reference)
 
 ---
 
@@ -21,604 +22,619 @@
 
 ```
 src/
-├── gw/            # GW/COHSEX calculations
-│   ├── gw_jax.py       # Main GW driver (entry point)
-│   ├── gw_driver_helpers.py # Driver-side setup helpers for screening/PPM sigma
-│   ├── gw_init.py      # Input parsing, chunking strategy
-│   ├── minimax_config.py # Shared minimax/sigma quadrature config objects
-│   ├── w_isdf.py       # Screened interaction W(iω) via CTSP
-│   ├── ppm_sigma.py    # GN-PPM dynamic self-energy Σ^c(ω)
-│   ├── minimax_screening.py # PPM extraction, quadrature helpers, shipped-table lookup
-│   ├── vcoul.py        # Coulomb interaction (2D slab, 0D box)
-│   ├── compute_vcoul.py# V_q computation from zeta
-│   └── archive/
-│       └── cohsex_isdf.py  # Legacy driver with eps→ISDF W projection
-│                            # (useful reference for epsmat→W_μν mapping)
+├── gw/                   # GW driver + sigma kernels
+│   ├── gw_jax.py              main(): mesh, config, ISDF, χ₀/W, Σ, head, QSGW
+│   ├── gw_config.py           LorraxConfig dataclass (from cohsex.in)
+│   ├── gw_init.py             chunk sizing, prepare_isdf_and_wavefunctions
+│   ├── gw_driver_helpers.py   build_*_runtime_options (config → kernel kwargs)
+│   ├── gw_output.py           banner / section / GWResults / write_results
+│   ├── minimax_config.py      MinimaxConfig / SigmaQuadratureConfig
+│   ├── minimax_screening.py   PPM extraction, window helpers, shipped-table lookup
+│   ├── w_isdf.py              χ₀ minimax kernel + W Dyson solve (flat-q)
+│   ├── ppm_sigma.py           GN-PPM build + Σ^c(ω) branch/window/τ pipeline
+│   ├── greens_function_kernel.py  build_G (single entry point)
+│   ├── projection_kernel.py   project, project_ri (band-space contractions)
+│   ├── head_correction.py     q→0 head sample + exact static head terms
+│   ├── wavefunction_bundle.py BandSlices + Wavefunctions (4 sharded ψ copies)
+│   ├── vcoul.py               v(q+G), MC q=0 averages, 2D/3D/0D truncation
+│   ├── compute_vcoul.py       V_qμν from ζ (μ-chunked FFT + H5 prefetch)
+│   ├── compute_vcoul_0d.py    box-truncated Coulomb (molecules)
+│   ├── qsgw_utils.py          diagonal fixed-point + QSGW from sigma_mnk.h5
+│   ├── scissor.py             valence/conduction scissor fit (out-of-grid bands)
+│   ├── kin_ion_io.py          kinetic + ionic H matrix elements
+│   └── kin_ion_io_chunked.py  k-chunked variant
 │
-└── isdf/
-    ├── centroid/          # ISDF initialization & k-means clustering
-    │   ├── kmeans_isdf.py  # K-means centroid selection (entry point)
-    │   └── get_charge_density.py  # Charge density computation
-    │
-    ├── bse/           # Bethe-Salpeter equation (BSE)
-    │   ├── bse.py     # BSE driver (entry point)
-    │   └── bse_kpm.py      # BSE kernel computation
-    │
-    ├── common/             # Shared utilities & core algorithms
-    │   ├── meta.py         # Meta dataclass (system parameters)
-    │   ├── load_wfns.py    # Wavefunction loading, FFT, CCT/ZCT fitting
-    │   ├── symmetry_maps.py  # k-point symmetry operations
-    │   ├── chi_from_dipole.py  # Dipole-based susceptibility
-    │   ├── gamma_matrices.py  # Pauli matrices for spinors
-    │   ├── timing.py       # Performance timing utilities
-    │   └── jax_profile.py  # JAX profiling context managers
-    │
-    ├── io/                 # Input/output operations
-    │   ├── wfnreader.py    # WFNReader class (HDF5 wavefunction I/O)
-    │   ├── epsreader.py    # EPSReader class (dielectric matrix I/O)
-    │   ├── centroids.py    # Centroid file I/O
-    │   ├── sigma_output.py # Self-energy output (eqp, sigma files)
-    │   ├── qp_wfn.py       # Quasiparticle wavefunction I/O
-    │   ├── tagged_arrays.py  # HDF5 array I/O with metadata
-    │   ├── kin_ion.py      # Kinetic/ionic Hamiltonian I/O
-    │   └── paths.py        # Path resolution utilities
-    │
-    ├── mixing/             # Self-consistent GW mixing/acceleration
-    │   └── acceleration.py # Anderson mixing, fixed-point acceleration
-    │
-    ├── postprocess/        # Post-processing utilities
-    │   └── rotate_wfn_to_qp.py  # Rotate wavefunctions to QP basis
-    │
-    ├── bandstructure/        # Hamiltonian interpolation (experimental)
-    │   └── htransform.py   # H-matrix interpolation
-    │
-    └── psp/                # Pseudopotential parsing (UPF, BerkeleyGW)
-        ├── load_psp.py     # BerkeleyGW pseudopotential loader
-        ├── load_upf.py     # UPF pseudopotential parser (entry point)
-        └── upf_model_2_0_1/  # UPF XML schema models (xsdata)
+├── common/               # Shared kernels + utilities
+│   ├── meta.py                Meta dataclass (system params, band edges)
+│   ├── symmetry_maps.py       SymMaps (IBZ → full BZ, spinor rotations)
+│   ├── load_wfns.py           WFN.h5 reads, per-k FFT, kchunk helpers
+│   ├── isdf_fitting.py        CCT/ZCT kernels, Cholesky, zeta solve, full pipeline
+│   ├── cholesky_2d.py         2D blocked Cholesky (sharded)
+│   ├── fft_helpers.py         flat-k ↔ 3D k FFT helpers via custom_partitioning
+│   ├── gvec_fft_box.py        sphere ↔ FFT-box gather (G-space layouts)
+│   ├── chi_from_dipole.py     S(ω) tensor from dipole matrix elements
+│   ├── gamma_matrices.py      Pauli / bispinor helpers
+│   ├── bispinor_init.py       spinor → bispinor lift
+│   ├── phdf5_wfn_reader.py    parallel-HDF5 WFN reader (async)
+│   ├── jax_compile_cache.py   XLA persistent cache activator
+│   ├── jax_profile.py         annotation / trace_section context mgrs
+│   ├── gpu_utils.py           device-memory budget probes
+│   ├── progress.py            LoopProgress (rank-0 progress bar)
+│   ├── timing.py              named sections, aggregate report
+│   ├── wfnreader.py           host-side WFN.h5 reader (legacy / BSE)
+│   ├── epsreader.py           host-side EPS reader (legacy)
+│   ├── minimax.py             Laplace + imag-ω minimax solvers
+│   ├── minimax_assets/        shipped quadrature tables (npz + catalog.json)
+│   ├── slate_* / cusolvermp_eigh_test / cusolvermg_eigh_test
+│   │                          FFI smoke tests / benchmarks (run via lxrun)
+│   └── phdf5_*                phdf5 benchmarks + plumbing tests
+│
+├── file_io/              # Canonical file-format I/O (used by gw_jax)
+│   ├── wfnreader.py           WFNReader (gw_jax's canonical reader)
+│   ├── wfn_writer.py          BGW-compatible WFN.h5 writer
+│   ├── epsreader.py           EPSReader (eps0mat / epsmat)
+│   ├── qe_save_reader.py      CrystalData from QE .save
+│   ├── tagged_arrays.py       ISDF restart state serialization
+│   ├── sigma_output.py        eqp.dat, eqp1.dat, sigma_mnk.h5 writers
+│   ├── kin_ion.py             load_kin_ion_submatrix
+│   ├── qp_wfn.py              write_qp_rotations_h5
+│   ├── centroids.py           centroid file loader
+│   ├── paths.py               path resolution helpers
+│   ├── read_bgw_vcoul.py      BGW vcoul table reader (diagnostic override)
+│   └── slab_io.py             SlabIO: MPI-IO-like phdf5 writer (+ allgather fallback)
+│       _slab_io_ffi.py          phdf5 FFI backend
+│       _slab_io_allgather.py    plain-h5py rank-0 backend
+│
+├── ffi/                  # XLA FFI bridge to native libraries
+│   ├── common/                ffi_loader (ctypes) + cpp (CMake) → liblorrax_ffi.so
+│   ├── cusolvermp/            distributed eigh (multi-proc multi-GPU, CAL+NCCL)
+│   ├── cusolvermg/            single-proc multi-GPU eigh (cuSOLVERMg)
+│   ├── phdf5/                 parallel HDF5 read/write (MPI-IO)
+│   └── slate/                 SLATE Cholesky / trsm / heev (p×q grid)
+│
+├── solvers/              # Iterative eigensolvers + quadrature / DOS
+│   ├── davidson.py, lanczos.py, chebyshev.py
+│   ├── pseudobands.py, pseudobands_v2.py     (DFT-band compression)
+│   ├── quadrature.py, dos.py
+│   └── docs/                  solver-specific notes
+│
+├── centroid/             # ISDF centroid selection
+│   ├── kmeans_isdf.py         k-means with k-means++ init, charge-weighted
+│   ├── get_charge_density.py  ρ(r) build for centroid weights
+│   └── pivoted_cholesky.py    Cholesky-pruned candidate list
+│
+├── psp/                  # Pseudopotentials + DFT operators
+│   ├── pseudos.py, upf/, radial/
+│   ├── get_dipole_mtxels.py   dipole.h5 generator
+│   ├── get_DFT_mtxels.py      DFT matrix elements
+│   ├── h_dft.py, dft_operators.py, dft_precond.py
+│   ├── run_nscf.py, nscf_input.py
+│   ├── kpm_dos.py
+│   └── tests/                 psp unit tests
+│
+├── mixing/               # Self-consistent acceleration
+│   └── acceleration.py        Anderson / rcrop fixed-point solver
+│
+├── bse/                  # Bethe–Salpeter (experimental; see src/bse/)
+│   ├── bse_isdf.py, bse_jax.py, bse_w_exact.py
+│   ├── bse_feast.py, bse_lanczos.py, bse_kpm.py
+│   ├── bse_preconditioner.py, bse_pseudopoles.py
+│   ├── bse_ring_comm.py, bse_serial.py
+│   └── context/, test_bse.py
+│
+├── bandstructure/        # H-matrix interpolation (experimental)
+│   └── htransform.py
+│
+└── postprocess/
+    └── rotate_wfn_to_qp.py
 ```
-
-### Module Responsibilities
-
-| Module | Responsibility |
-|--------|---------------|
-| **centroid** | Select interpolation points (centroids) via k-means clustering on charge density |
-| **gw** | GW/COHSEX self-energy calculations, main computational pipeline |
-| **gw/archive** | Legacy code. `cohsex_isdf.py` contains the original eps→ISDF W projection pathway: how to map BerkeleyGW's `epsmat.h5`/`eps0mat.h5` dielectric matrices into the ISDF W_μν representation. Useful reference when debugging W projection or the ISDF SoS debug script. |
-| **common** | Core algorithms: FFT/NUFFT transforms, CCT/ZCT fitting, wavefunction manipulation |
-| **io** | All file I/O: HDF5 wavefunctions, centroids, self-energy output, tagged arrays |
-| **mixing** | Self-consistent GW acceleration (Anderson mixing, DIIS) |
-| **bse** | Bethe-Salpeter equation for optical spectra (experimental) |
-| **postprocess** | Post-GW analysis tools |
-
-### Shipped minimax assets
-
-Canonical minimax quadratures can optionally be loaded from the bundled asset catalog in
-`src/common/minimax_assets/` instead of being solved at runtime.
-
-Contents:
-- `catalog.json`: machine-readable table descriptor
-- `README.md`: sweep values and error conventions
-- `crossing/*.npz`, `noncrossing/*.npz`: stored node/weight tables
-
-Runtime lookup is implemented in `src/gw/minimax_screening.py` and is controlled from
-the GW input file with a negative-form flag:
-
-```ini
-regenerate_minimax_tables = false
-```
-
-Default is `false`, which means "reuse shipped tables when available." Setting it to
-`true` forces exact quadrature regeneration.
 
 ---
 
 ## 2. Key Classes
 
-### 2.1 `Meta` (src/isdf/common/meta.py)
+### 2.1 `LorraxConfig` — `src/gw/gw_config.py`
 
-**Purpose**: Immutable dataclass containing all system parameters
+Loaded from `cohsex.in` via `LorraxConfig.from_input_file()`. Holds every flag the driver consults: file paths, band ranges, ISDF parameters, screening / PPM knobs, head-correction policy, `use_ffi_io`, `use_ppm_sigma`, `use_bgw_vcoul`, `memory_per_device_gb`, `sys_dim`, `bispinor`, `self_consistent`, etc. Two nested configs:
 
-**Key attributes**:
+- `MinimaxConfig` (`minimax_config.py`) — static/imag-ω quadrature parameters.
+- `SigmaQuadratureConfig` — Σ^c(ω) window quadrature parameters.
+
+### 2.2 `Meta` — `src/common/meta.py`
+
+Immutable-ish dataclass with all system parameters derived from `WFNReader` + `SymMaps`:
+
 ```python
 @dataclass
 class Meta:
-    # MPI info
-    rank: int                    # MPI rank
-    n_proc: int                  # Total MPI processes
+    rank, n_proc                     # MPI / jax.process info
+    b_id_0 .. b_id_4                 # band edges
+    fft_grid, cell_volume
+    n_rtot, n_rmu                    # total r-grid, centroids
+    npol, nfreq, nspin, nspinor, nspinor_wfnfile
+    nkx, nky, nkz, nk_tot
+    nbnd_jax, n_rtot_jax, n_rmu_jax  # round-up-to-n_proc versions
 
-    # Band indices (b_id_0 ≤ b_id_1 ≤ b_id_2 ≤ b_id_3 ≤ b_id_4)
-    b_id_0: int                  # Lowest band (occupied)
-    b_id_1: int                  # Valence band minimum (for Σ)
-    b_id_2: int                  # VBM (Fermi level)
-    b_id_3: int                  # Conduction band maximum (for Σ)
-    b_id_4: int                  # Highest band (all bands)
-
-    # FFT grid
-    fft_grid: tuple[int, int, int]  # (nx, ny, nz) real-space FFT grid
-
-    # Interpolation points
-    n_rtot: int                  # Total centroid points
-    n_rmu: int                   # Centroid points (same as n_rtot)
-
-    # Spins
-    npol: int                    # Spin polarization (1=unpolarized, 2=polarized)
-    nspin: int                   # Number of spin channels
-    nspinor: int                 # Spinor components (1=scalar, 2=spinor)
-
-    # k-grid (wavefunctions)
-    nkx, nky, nkz: int           # k-grid dimensions
-    nk_tot: int                  # Total k-points
-
-    # q-grid (ISDF fitting) [NUFFT BACKEND]
-    nqx, nqy, nqz: int           # q-grid dimensions (defaults to k-grid)
-    nq_tot: int                  # Total q-points
-    use_nufft: bool              # True if q-grid ≠ k-grid
-
-    # Frequency grid
-    nfreq: int                   # Frequency points for χ⁰(iω)
-
-    # Computed properties
-    band_edges: tuple            # (b0, b1, b2, b3, b4)
-    band_ranges: SimpleNamespace # .valence, .conduction, .sigma, etc.
-    kgrid: tuple                 # (nkx, nky, nkz)
-    qgrid: tuple                 # (nqx, nqy, nqz)
+    # derived in __post_init__:
+    nelec = b_id_2
+    nb_sigma = b_id_3 - b_id_0
+    kgrid = (nkx, nky, nkz)
+    band_edges = (b0, b1, b2, b3, b4)
+    band_ranges.valence / conduction / sigma / full / occupied /
+        val_plus_sigma / cond_plus_sigma   # SimpleNamespace of (lo, hi)
 ```
 
-**Band range names**:
-- `valence`: (b1, b2) — Valence bands for self-energy
-- `conduction`: (b2, b3) — Conduction bands for self-energy
-- `sigma`: (b1, b3) — All bands for self-energy
-- `occupied`: (b0, b2) — Occupied bands (for G^occ)
-- `full`: (b0, b4) — All bands (for G^all)
+Constructed via `Meta.from_system(wfn, sym, nval, ncond, nband, n_rmu, bispinor)` in the driver.
 
-**Usage**:
-```python
-meta = Meta(rank=0, n_proc=1, b_id_0=0, b_id_1=8, b_id_2=12, ...)
-vb_min, vb_max = meta.band_range("valence")  # (8, 12)
-```
+### 2.3 `BandSlices` + `Wavefunctions` — `src/gw/wavefunction_bundle.py`
+
+The canonical wavefunction container. **Four** sharded copies of ψ_nk(r_μ), one per contraction direction:
+
+| Field | Shape | Spec | Used as |
+|---|---|---|---|
+| `psi_xn` | `(nk, s, μ_X, n)` | `P(None, None, 'x', None)` | G LHS, χ₀ LHS (direct, conj inside `build_G`) |
+| `psi_xr` | `(nk, n, s, μ_X)` | `P(None, None, None, 'x')` | Σ-projection LHS (conjugated) |
+| `psi_yr` | `(nk, n, s, μ_Y)` | `P(None, None, None, 'y')` | G RHS, χ₀ RHS |
+| `psi_yn` | `(nk, s, μ_Y, n)` | `P(None, None, 'y', None)` | Σ-projection RHS |
+
+Plus `enk (nk, nb_full)` and `occ (nk, nb_full)`, both replicated. `slices: BandSlices` carries local `val / cond / sigma / full / occ` slices and `b0..b4`.
+
+Built via `build_wavefunctions(psi_l_yr, psi_r_yr, ...)` or `build_wavefunctions_from_full(...)`; `Wavefunctions` is registered as a JAX pytree so it threads through `@jax.jit` cleanly.
+
+Accessors: `wfns.xn(s.val)`, `wfns.xr(s.sigma)`, etc.
+
+### 2.4 `WFNReader` — `src/file_io/wfnreader.py`
+
+Reads BerkeleyGW `WFN.h5`. Per-k raw reads return IBZ data without unfolding — all symmetry unfolding lives in `SymMaps`. Also has `band_norms` for pseudobands normalization. `src/common/wfnreader.py` is a legacy copy still used by BSE and some benchmarks; the GW driver uses the `file_io` one.
+
+### 2.5 `SymMaps` — `src/common/symmetry_maps.py`
+
+IBZ → full BZ unfolding. Builds the full mesh, k→q maps, spinor SU(2) rotations (Markley quaternion), and fractional-translation phases for non-symmorphic operators. Key methods:
+
+- `get_gvecs_kfull(wfn, nk)` — rotated G-vectors at full-BZ k-point
+- `get_cnk_fullzone(wfn, nb, nk)` — rotated coefficients with spinor rotation + TR conjugation
+- `get_cnk_fullzone_batch(wfn, band_indices, nk)` — vectorized
+
+### 2.6 `EPSReader` — `src/file_io/epsreader.py`
+
+Reads `eps0mat.h5` / `epsmat.h5`. Used only by the `epshead` head source (`head_correction.resolve_head_sample`) and BSE.
+
+### 2.7 `SlabIO` — `src/file_io/slab_io.py`
+
+Sharded HDF5 writer with two backends:
+
+- `use_ffi_io=True` → `_slab_io_ffi.py` (parallel HDF5 via the phdf5 FFI); independent MPI-IO writes, non-collective metadata. Default.
+- `use_ffi_io=False` → `_slab_io_allgather.py` (all-gather then rank-0 h5py). Fallback for debugging.
+
+Used for `zeta_q.h5` and `V_qmunu.h5` (big files), and for `sigma_mnk.h5` via `write_sigma_omega_h5`.
 
 ---
 
-### 2.2 `WFNReader` (src/isdf/io/wfnreader.py)
+## 3. Device mesh and sharding conventions
 
-**Purpose**: Read BerkeleyGW HDF5 wavefunction files (`WFN.h5`, `WFNq.h5`)
+### 3.1 The one mesh
 
-**Key methods**:
+`gw_jax._build_mesh()` returns a single 2-D mesh:
+
 ```python
-class WFNReader:
-    def __init__(self, filepath: str):
-        """Open WFN.h5 file."""
-
-    def read_gvecs(self) -> np.ndarray:
-        """Read G-vectors (n_g, 3)."""
-
-    def read_coeffs(self, ik: int, bands: slice) -> np.ndarray:
-        """Read wavefunction coefficients for k-point ik.
-        Returns: (n_bands, n_spinor, n_g) complex array."""
-
-    def read_evals(self) -> np.ndarray:
-        """Read eigenvalues (n_k, n_bands)."""
-
-    @property
-    def nkpts(self) -> int:
-        """Number of k-points."""
-
-    @property
-    def nbands(self) -> int:
-        """Number of bands."""
-
-    @property
-    def nspinor(self) -> int:
-        """Number of spinor components (1 or 2)."""
+total = jax.process_count() * jax.local_device_count()
+gx = int(sqrt(total)); while total % gx: gx -= 1
+Mesh(devices.reshape(gx, total//gx), ('x', 'y'))
 ```
 
-**HDF5 structure** (BerkeleyGW format):
-```
-WFN.h5
-├── /wfns/gvecs           # G-vectors: (n_g, 3) int32
-├── /wfns/coeffs          # Coefficients: (n_k, n_bands, n_spinor, n_g) complex128
-├── /wfns/ekn             # Eigenvalues: (n_k, n_bands) float64
-├── /kpoints/rk           # k-points in crystal coords: (n_k, 3) float64
-└── /mf_header/...        # Crystal structure, FFT grid, etc.
-```
+Most-square factorization. There is **no** 1-D `'bands'` mesh — every pjit/shard_map in the driver uses axes `'x'` and `'y'`. On 4 GPUs this is 2×2; on 16 GPUs, 4×4.
+
+### 3.2 Canonical specs
+
+Centroid-space (μ_X, ν_Y) is the dominant sharding. Flat-k / flat-q arrays are `(nk_tot, …)` with `P(None, …)` on the leading axis.
+
+| Array | Spec | Comment |
+|---|---|---|
+| ψ_xn | `P(None, None, 'x', None)` | G/χ₀ build |
+| ψ_xr | `P(None, None, None, 'x')` | Σ projection LHS |
+| ψ_yr | `P(None, None, None, 'y')` | G/χ₀ build |
+| ψ_yn | `P(None, None, 'y', None)` | Σ projection RHS |
+| Pair density `P_k(μ, ν)` | `P(None, 'x', 'y')` | scalar (spin-traced) |
+| Pair density `P_k(s, s', μ, ν)` | `P(None, None, None, 'x', 'y')` | spin-matrix mode |
+| `C_q(μ, ν)` | `P(None, 'x', 'y')` | CCT |
+| `L_q(μ, ν)` | `P(None, 'x', 'y')` | Cholesky factor |
+| `L_q` as tiles | `P(None, 'x', 'y', None, None)` | 2-D blocked algo |
+| `Z_q(μ, r)` | `P(None, 'x', 'y')` | ZCT z-chunk |
+| `ζ_q(μ, r_XY)` | `P(None, None, ('x','y'))` | triangular-solve output |
+| `V_q` flat-q | `P(None, 'x', 'y')` | (nq, μ_X, ν_Y) |
+| `χ₀_R` in tau step | `P(None, 'y', 'x')` | **Note**: μ on y, ν on x — matches einsum output |
+| G(k) 5D flat-k | `P(None, None, 'x', None, 'y')` | (nk, s, μ_X, s', ν_Y) |
+| G/W on 7D (3-D k) | `P(None, None, None, None, 'x', None, 'y')` | reshape inside FFT helper |
+| V on 5D (3-D k) | `P(None, None, None, 'x', 'y')` | reshape inside FFT helper |
+| W solve reshard | `P(('x','y'), None, None)` | per-q LU via shard_map |
+| Σ_k(s, μ, s', ν) | `P(None, None, 'x', None, 'y')` | σ^τ output |
+| Σ_k(m, n) | `P(None, 'x', 'y')` | band basis, reduce-scattered |
+| `enk`, `occ`, `efermi` | replicated | small |
+| `B_q`, `Omega_q` (PPM) | `P(None, 'x', 'y')` | |
+
+### 3.3 Key collective patterns
+
+- **Static COHSEX Σ path** (`gw_jax.sigma_sx/sigma_coh/hartree`): `_convolve(G, W)` uses per-device IFFT/FFT on the replicated 3-D k-axes (via `fft_helpers`) while keeping μ on `'x'` and ν on `'y'`. The final `project(psi_xr, psi_yn, Σ_k)` does two einsum contractions that end up replicated on (k, m, n).
+
+- **χ₀ minimax kernel** (`w_isdf._get_chi_minimax_kernel`): `Gv` and `Gc` use *swapped* μ/ν ⇄ 'x'/'y' assignments (`_Gv_spec` μ=x, ν=y; `_Gc_spec` μ=y, ν=x) so that the final `einsum('Rambn,Rbnam->Rmn')` contracts over the two local axes and leaves output sharded `(μ_Y, ν_X)` — explicit `with_sharding_constraint` on `_chi_R_spec = P(None, 'y', 'x')` prevents XLA from replicating a 23 GB intermediate at Si 4×4×4 60 Ry μ=2400.
+
+- **Dyson solve** (`w_isdf._get_w_solve_fn`): V and χ₀ both arrive as `P(None, 'x', 'y')`. They are padded to a multiple of `mesh.size`, constrained to `P(('x','y'), None, None)` via two `with_sharding_constraint` stages (replicate → q-shard), then a `shard_map` runs `jsp_linalg.lu_factor/lu_solve` per-q inside a `fori_loop`. Output is resharded back to fully-replicated `rep_3d`.
+
+- **Σ^c(ω) project** (`ppm_sigma._make_project_ri_reduce_scatter`): replaces the naive `project_ri(ψ* σ ψ)` with a `shard_map` that uses two `psum_scatter` operations — one over `'x'` scattering the `m` index, one over `'y'` scattering `n`. Same NCCL byte volume as two psums, but output arrives `(m_X, n_Y)`-sharded, so every downstream `coeff·σ` multiply stays local.
+
+- **Cholesky** (`cholesky_2d.cholesky_2d_batched`): operates on tile layout `P(None, 'x', 'y', None, None)`. Panel broadcasts + triangular updates use `lax.psum` over axis `'x'`. Falls back to dense `jnp.linalg.cholesky` when `mesh.size == 1`.
+
+- **Triangular solve** (`isdf_fitting.solve_zeta_from_L_q`): loops over q-batches of size `q_chunk_size` (default 1); gathers `L_q[q0:q1]` to replicated, runs vmapped `solve_triangular` inside a `shard_map` over `('x','y')` flattened as a single scatter axis for the column dimension. Python loop with `donate_argnums` forces sequential GPU execution (fori_loop SPMD-replicates the carry; scan unrolled OOMs).
 
 ---
 
-### 2.3 `EPSReader` (src/isdf/io/epsreader.py)
+## 4. Flat-k / flat-q convention
 
-**Purpose**: Read BerkeleyGW dielectric matrix files (`eps0mat.h5`, `epsmat.h5`)
+Every physics array uses flattened k/q indexing: `(nk_tot, *trail)` with `q_flat = qx*nky*nkz + qy*nkz + qz`. The 3-D `(nkx, nky, nkz)` shape only appears **inside** `common.fft_helpers`:
 
-**Key methods**:
 ```python
-class EPSReader:
-    def read_chi_head(self, iq: int) -> complex:
-        """Read χ_00(q) for q-point iq."""
+from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
 
-    def read_full_matrix(self, iq: int) -> np.ndarray:
-        """Read full ε_GG'(q) matrix."""
+spec_3d = P(None, None, None, None, 'x', None, 'y')   # (nkx, nky, nkz, ..., μ, ..., ν)
+ifft = make_flat_k_ifftn(mesh_xy, kgrid, spec_3d, norm='ortho')
+
+x_R = ifft(x_k)   # callers only see (nk, *trail) ↦ (nk, *trail)
 ```
 
-**Usage**: Primarily for dipole-based head correction (§6.5 of PHYSICS_COMPREHENSIVE.md)
+The helper reshapes `(nk, *trail) → (nkx, nky, nkz, *trail)`, constrains to `spec_3d`, runs a `custom_partitioning`-wrapped `jnp.fft.fft` along axes `(0, 1, 2)` on each device locally (replicated k-axes guarantee the full FFT is visible), then reshapes back. `norm='ortho'` is used for physics FFTs; `'forward'` for the convolution identity in CCT/ZCT. The driver, `w_isdf`, `ppm_sigma`, and `isdf_fitting` all build their FFTs through this helper — **never** `jnp.fft.fftn` directly on a sharded array.
 
 ---
 
-### 2.4 `SymMaps` (src/common/symmetry_maps.py)
+## 5. Data Flow Pipeline
 
-**Purpose**: Unfold IBZ k-points to full BZ using crystal symmetries, rotate
-wavefunctions, and provide k↔q mappings for the screening calculation.
-
-**Key methods**:
-```python
-class SymMaps:
-    def __init__(self, wfn: WFNReader):
-        """Initialize from WFN.h5 reader. Reads symmetry ops, builds full BZ
-        mesh, computes IBZ→full mappings and spinor rotation matrices.
-        Handles both spatial (ntran) and time-reversal symmetries."""
-
-    def get_gvecs_kfull(self, wfn, nk) -> np.ndarray:
-        """Rotated G-vectors for full BZ k-point nk. Shape (ngk, 3)."""
-
-    def get_cnk_fullzone(self, wfn, nb, nk) -> np.ndarray:
-        """Rotated wavefunction coefficients at full BZ k-point nk.
-        Applies G-vector rotation, spinor rotation (U_spinor), and
-        complex conjugation for time-reversal ops. Shape (2, ngk)."""
-
-    def get_cnk_fullzone_batch(self, wfn, band_indices, nk) -> np.ndarray:
-        """Vectorized version for multiple bands. Shape (nb, 2, ngk)."""
-```
-
-**Spinor rotation**: `get_spinor_rotations()` converts Cartesian rotation
-matrices to SU(2) via the Markley quaternion algorithm. Improper rotations
-(det < 0) are negated to proper before conversion, matching BGW's
-`spinor_symmetries.f90` convention (inversion → identity in SU(2)).
-
----
-
-## 3. Data Flow Pipeline
-
-### 3.1 Full GW/COHSEX Pipeline
+The driver runs in one `main()` in `gw/gw_jax.py`; read it top-to-bottom.
 
 ```
-INPUT FILES
+cohsex.in
+    │  LorraxConfig.from_input_file()
+    ▼
+WFN.h5 + WFNq.h5 + centroids_frac.h5 + (eps0mat.h5, dipole.h5 optional)
+    │  WFNReader, SymMaps, load_centroids
+    │  Meta.from_system, BandSlices.from_band_edges
+    │  mesh_xy = _build_mesh()
+    │  if use_ffi_io: phdf5_init_mpi() (eager MPI_THREAD_MULTIPLE init)
+    │  ensure_jax_compile_cache()
+    ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ ISDF  —  gw_init.prepare_isdf_and_wavefunctions                       │
+│ ─────────────────────────────────────────────────────────────────────│
+│ Returns an isdf bundle with V_qmunu + Wavefunctions.                  │
+│ Two paths:                                                            │
+│   restart=True  → load_restart_state_from_h5 (tagged_arrays.h5)       │
+│   restart=False →                                                     │
+│     isdf_fitting.fit_zeta_chunked_to_h5                               │
+│       ├─ load_centroids_band_chunked       (band-chunked FFT at r_μ)  │
+│       ├─ compute_pair_density_spin_{traced,matrix}   (both L and R)   │
+│       ├─ compute_CCT_from_left_right{_spin_matrix}   (k → R → q conv) │
+│       ├─ compute_L_q_from_CCT               (2-D blocked chol)        │
+│       └─ z-chunk loop:                                                │
+│           ├─ compute_ZCT_from_left_right_zchunk{_spin_matrix}          │
+│           ├─ solve_zeta_from_L_q             (triangular solve)       │
+│           └─ zeta_io.write_slab('zeta_q', ...)  via SlabIO            │
+│     compute_vcoul.compute_all_V_q_from_zeta_h5                        │
+│       ├─ μ-chunked FFT of ζ_q with √v(q+G) weight                     │
+│       ├─ overlapped H5 prefetch (batch N+1 while GPU computes N)      │
+│       └─ vmap'd per-q contract → V_qmunu                              │
+│     build_wavefunctions(...) → Wavefunctions bundle                   │
+└──────────────────────────────────────────────────────────────────────┘
     │
-    ├─→ WFN.h5, WFNq.h5         (wavefunctions)
-    ├─→ centroids.h5            (interpolation points from k-means)
-    ├─→ cohsex.in               (input parameters)
-    └─→ eps0mat.h5 (optional)   (dipole matrix elements)
+    │  V_q = flatten_V_qmunu(V_qmunu)   (nq, μ, μ) on P(None, 'x', 'y')
+    ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ Screening  —  if config.do_screened                                   │
+│ ─────────────────────────────────────────────────────────────────────│
+│   quad, e_ref = w_isdf.build_static_quadrature(wfns, minimax_config)  │
+│   χ₀_q       = w_isdf.compute_chi0(wfns, quad, meta, mesh_xy, e_ref)   │
+│                (minimax kernel accumulates χ_R across τ via fori loop)│
+│   W_q        = w_isdf.solve_w(V_q, χ₀_q, meta, mesh_xy)                │
+│                (per-q LU via shard_map, returns replicated)           │
+│ else: W_q = V_q                                                       │
+└──────────────────────────────────────────────────────────────────────┘
     │
-    ↓
-┌───────────────────────────────────────────────────────────┐
-│ STAGE 1: ISDF Fitting (load_wfns.py)                      │
-│ ────────────────────────────────────────────────────────  │
-│ For each q-chunk:                                          │
-│   1. Load wavefunctions ψ(k) in band chunks               │
-│   2. FFT G-space → real-space: ψ(k,r)                    │
-│   3. Extract at centroids: ψ(k,r_μ)                       │
-│   4. Compute pair density: P_k,ab(μ,ν)                    │
-│   5. FFT k→R: P_R,ab(μ,ν)                                │
-│   6. Spin-trace: C_R(μ,ν) = Σ_ab |P_R,ab|²               │
-│   7. FFT R→q: C_q(μ,ν)                                   │
-│   8. Cholesky: L_q(μ,ν) = chol(C_q)                      │
-│   9. Load ψ(k,r) in R-chunks, compute Z_q(μ,r)           │
-│  10. Solve: ζ_q(μ,r) = L_q^-H L_q^-1 Z_q(μ,r)            │
-│  11. Write to zeta_q.h5                                   │
-└─────────────────────┬─────────────────────────────────────┘
-                      ↓
-               zeta_q.h5 (10-100 GB, disk bottleneck)
-                      │
-                      ↓
-┌───────────────────────────────────────────────────────────┐
-│ STAGE 2: Coulomb Interaction (compute_vcoul.py)           │
-│ ────────────────────────────────────────────────────────  │
-│ For each q:                                                │
-│   1. Load ζ_q(μ,r)                                        │
-│   2. FFT: ζ_q(μ,G)                                        │
-│   3. Compute: V_q(μ,ν) = Σ_G ζ*_q(μ,G) v(q+G) ζ_q(ν,G)   │
-│   4. (Optional) Head correction for q=0                   │
-└─────────────────────┬─────────────────────────────────────┘
-                      ↓
-                  V_q(μ,ν) arrays
-                      │
-                      ↓
-┌───────────────────────────────────────────────────────────┐
-│ STAGE 3: Screening Setup + Susceptibility              │
-│ ────────────────────────────────────────────────────────  │
-│   1. Driver resolves screening setup                    │
-│      (gw_driver_helpers.py + minimax_config.py)         │
-│   2. Compute χ⁰_R(μ,ν,iω) via minimax/CTSP (w_isdf.py)  │
-│   3. FFT R→q: χ⁰_q(μ,ν,iω)                              │
-│   4. Dyson solve: W_q(μ,ν,iω) = V_q + V_q χ⁰_q W_q      │
-│   5. Extract static: W_R(μ,ν) = W_R(μ,ν,ω=0)            │
-└─────────────────────┬─────────────────────────────────────┘
-                      ↓
-              W_R(μ,ν), V_R(μ,ν)
-                      │
-                      ↓
-┌───────────────────────────────────────────────────────────┐
-│ STAGE 4: Self-Energy + Optional GN-PPM Sigma             │
-│ ────────────────────────────────────────────────────────  │
-│   1. Exchange/COHSEX static pipeline in gw_jax.py        │
-│   2. Optional GN-PPM build from minimax W(0), W(iωp)     │
-│      (ppm_sigma.py + minimax_config.py)                  │
-│   3. Optional Σ^c(ω) windowing and accumulation          │
-│      (ppm_sigma.py + gw_driver_helpers.py)               │
-│   4. FFT/projection to Σ_k,ij                            │
-│   5. (Optional) Self-consistency loop (experimental)     │
-└─────────────────────┬─────────────────────────────────────┘
-                      ↓
-OUTPUT FILES
+    │  Gij = _build_Gij(meta, mesh_xy)   (nk, nb_sigma, nb_sigma) occupation proj
+    │  static_head_terms = head_correction.compute_static_head_terms_from_sample(...)
+    │    iff do_G0 and not use_ppm_sigma
+    ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ Static COHSEX                                                         │
+│ ─────────────────────────────────────────────────────────────────────│
+│   sigma_sx(wfns, Gij, W_q) :   -project[ IFFT(G_occ)·IFFT(W) ·√Nk⁻¹ ]  │
+│   sigma_coh(wfns, W_q, V_q):  +½ project[ IFFT(G_all)·IFFT(W-V) ...]   │
+│   hartree(wfns, Gij, V_q) :      project[ V(q=0) · ρ ]                 │
+│   sig_x = sigma_sx(wfns, Gij, V_q)   # bare-exchange diagnostic      │
+│   + static_head_terms_to_kij (exact q→0 band-diagonal shifts)         │
+└──────────────────────────────────────────────────────────────────────┘
     │
-    ├─→ sigma_hp.log            (self-energy matrix elements)
-    ├─→ eqp.dat                 (quasiparticle energies)
-    ├─→ sigma_k.h5              (full Σ_k arrays)
-    └─→ qp_rotations.h5         (QP wavefunction rotations)
+    ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ GN-PPM Σ^c(ω)  —  if config.use_ppm_sigma                             │
+│ ─────────────────────────────────────────────────────────────────────│
+│   quad_imag = w_isdf.build_imag_quadrature(quad, ωp, minimax_config)  │
+│   χ₀(iωp)   = w_isdf.compute_chi0(..., quad_imag)                     │
+│   W(iωp)    = w_isdf.solve_w(V_q, χ₀(iωp), ...)                        │
+│   ppm       = ppm_sigma.fit_gn_ppm(W(0), W(iωp), V_q, ωp, mesh_xy)     │
+│                → B_q, Ω_q, valid_mask_q  (all P(None,'x','y'))        │
+│   Σ^c(ω)    = ppm_sigma.compute_sigma_c_ppm_omega_grid(...)           │
+│     └─ 4 branches ×   (+ω cond / +ω val / -ω cond / -ω val)           │
+│        each branch:                                                   │
+│          _build_windows_for_branch   (host-side minimax window build) │
+│          _integrate_tau_windows_for_branch                            │
+│            └─ for each window (Laplace / crossing / slab):            │
+│                 _get_sigma_tau_scan_kernel                            │
+│                   lax.scan over τ nodes:                              │
+│                     tau_kernel: σ^τ = project[IFFT(G·W_τ)/√Nk]        │
+│                     _project_tau_onto_omega: apply e^{iω·τ} kernel    │
+│                       onto acc(n_ω, nk, m_X, n_Y)                     │
+│          accumulator:                                                 │
+│            _ReduceScatterGpuAccumulator   (kij in GPU)                │
+│            _StreamedH5Accumulator          (sigma_kij.h5, 1-proc only)│
+│   + diagonal SC fixed-point (qsgw_utils.solve_diagonal_sigma_fixed_point)│
+│   + scissor fit for out-of-grid bands (scissor.fit_scissor)           │
+│   + QSGW Σ^xc construction (qsgw_utils.build_qsgw_sigma_xc_from_h5)   │
+│   → sigma_mnk.h5                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+    │
+    │  sigma_total = sig_sx + sig_coh + sig_h
+    │  kin_ion = load_kin_ion_submatrix(kin_ion_file, b0, b3)
+    │  H_qp = (kin_ion + sigma_total) hermitianized
+    │  E_qp, U_qp = jax.vmap(jnp.linalg.eigh)(H_qp)
+    ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ Optional self-consistent COHSEX  —  if config.self_consistent         │
+│ ─────────────────────────────────────────────────────────────────────│
+│   rcrop_nojit Anderson fixed-point on flattened upper-Hermitian Σ:    │
+│     _sc_step: diag H_qp → U → G_ij = U f U†  → rebuild Σ_sx+Σ_coh+V_H │
+│   converges on |ΔΣ| < 1e-5 with m=3 Anderson history                   │
+└──────────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+GWResults → write_results → eqp.dat / eqp1.dat / sigma_mnk.h5 / qp_rotations.h5
+                            + timing.report
 ```
 
 ---
 
-### 3.2 Data Array Sizes
+## 6. File Formats
 
-Typical system: 3×3×1 k-grid, 12 valence + 12 conduction bands, 100 centroids, 8 frequencies
+### 6.1 Input — `cohsex.in`
 
-| Array | Shape | Size (GB) | Location |
-|-------|-------|-----------|----------|
-| ψ(k,n,s,G) coefficients | (9, 24, 2, 50k) | 0.17 | WFN.h5 |
-| ψ(k,n,s,r_μ) at centroids | (9, 24, 2, 100) | 0.0003 | In-memory |
-| C_q(μ,ν) CCT matrix | (9, 100, 100) | 0.0007 | In-memory |
-| ζ_q(μ,r) interpolation vectors | (9, 100, 64³) | 1.8 | zeta_q.h5 (disk) |
-| V_q(μ,ν) Coulomb | (9, 100, 100) | 0.0007 | In-memory |
-| χ⁰_q(μ,ν,ω) susceptibility | (9, 100, 100, 8) | 0.006 | In-memory |
-| W_q(μ,ν,ω) screened interaction | (9, 100, 100, 8) | 0.006 | In-memory |
-| Σ_k,ab(i,j) self-energy | (9, 2, 2, 24, 24) | 0.0002 | In-memory |
+Parsed by `LorraxConfig.from_input_file()`. Canonical reference: [`docs/docs_gwjax/COHSEX_INPUT.md`](../../docs/docs_gwjax/COHSEX_INPUT.md) in the sandbox (not in this repo) — covers every flag (band ranges, ISDF parameters, memory budget, screening knobs, head-correction policy, frequency grid, etc.).
 
-**Key bottleneck**: `zeta_q.h5` is often 10-100 GB for production systems, causing significant disk I/O overhead.
+### 6.2 Input — `centroids_frac.h5`
+
+Generated by `centroid.kmeans_isdf`. Stores fractional centroid coordinates (legacy layouts also supported).
+
+### 6.3 Intermediate — `zeta_q.h5`
+
+Written by `isdf_fitting.fit_zeta_chunked_to_h5` via `SlabIO`.
+
+```
+/zeta_q : (n_q_flat, n_rtot, n_rmu)  complex128
+          chunks = (1, n_rchunk, n_rmu)
+          layout = flat-q:  q_flat = qx*nky*nkz + qy*nkz + qz
+```
+
+**Layout note**: dataset is `(nq, n_rtot, n_rmu)` with n_rmu innermost — so each per-r-chunk write spans the full μ axis contiguously. The old `(nq, n_rmu, n_rtot)` layout scattered 480K × 1920-B strips per rank per write and ran 8× slower on Perlmutter pscratch. V_q reads remain contiguous (per-q slab at `(q, 0, 0)` is one block); the downstream kernel transposes on GPU (~50 µs/q).
+
+### 6.4 Intermediate — `V_qmunu.h5` (or returned in-memory)
+
+```
+/V_qmunu : (nqx, nqy, nqz, n_rmu, n_rmu)  complex128
+           sharded P(None, None, None, 'x', 'y') when in GPU mem
+```
+
+### 6.5 Intermediate — `isdf_tensors_{n_rmu}.h5` (tagged-array restart file)
+
+`file_io.tagged_arrays.read_restart_state_from_h5` / `write_restart_state_to_h5`. Lets you skip the zeta-fit stage on a rerun. Contains V_q, ψ bundle arrays, kin_ion submatrix pointers, and related metadata.
+
+### 6.6 Output — `eqp.dat` / `eqp1.dat`
+
+BGW-compatible text. Written by `file_io.sigma_output.write_eqp_g0w0` / `write_eqp1`. Columns depend on path (G₀W₀ one-shot vs. self-consistent) — see `write_eqp_table`.
+
+### 6.7 Output — `sigma_mnk.h5` (new format)
+
+Written by `write_sigma_omega_h5` (phdf5-capable). Datasets in eV:
+
+```
+/omega_ev          (n_omega,)
+/sigma_c_kij_ev    (n_omega, nk, nb_sigma, nb_sigma)  complex128
+/sigma_sx_kij_ev   (nk, nb_sigma, nb_sigma)           complex128
+/hartree_kij_ev    (nk, nb_sigma, nb_sigma)           complex128
+```
+
+### 6.8 Output — `qp_rotations.h5`
+
+`file_io.qp_wfn.write_qp_rotations_h5`. U matrices + eigenvalues for QP rotation.
+
+### 6.9 Sandbox (not this repo) — `manifest.yaml`, `reports/*/report.md`
+
+Run-tracking metadata in the `lorrax_sandbox` superproject.
 
 ---
 
-## 4. File Formats
+## 7. Entry Points
 
-### 4.1 Input Files
-
-#### `cohsex.in` (text input file)
-```
-# Example COHSEX input
-wfn_file    = WFN.h5
-wfnq_file   = WFNq.h5
-centroids   = centroids.h5
-output_dir  = ./output
-
-# Band ranges (0-indexed)
-band_occupied_min = 0
-band_valence_min  = 8
-band_fermi        = 12
-band_conduction_max = 24
-band_max          = 30
-
-# ISDF parameters
-n_centroids = 100
-
-# Q-grid for ISDF fitting (optional, defaults to k-grid)
-q_grid = 2 2 1
-
-# Frequency grid (CTSP quadrature)
-n_freq = 8
-
-# Chunking (optional, auto-detected if omitted)
-chunk_bands = 6
-chunk_q = 3
-```
-
-#### `centroids.h5` (HDF5)
-```
-centroids.h5
-├── /centroids      # (n_mu, 3) float64 — centroid positions in crystal coords
-└── /weights        # (n_mu,) float64 — charge density weights (optional)
-```
-
-Generated by: `kmeans_isdf` CLI tool
-
----
-
-### 4.2 Intermediate Files
-
-#### `zeta_q.h5` (HDF5)
-```
-zeta_q.h5
-├── /zeta_q_0       # (n_mu, fft_nz, fft_ny, fft_nx) complex128
-├── /zeta_q_1       # ...for q-point 1
-├── ...
-├── /zeta_q_N       # ...for q-point N-1
-└── /metadata
-    ├── n_q_tot     # Total q-points
-    ├── n_mu        # Number of centroids
-    ├── fft_grid    # (nx, ny, nz) FFT grid
-    └── qgrid       # (nqx, nqy, nqz) q-grid dimensions
-```
-
-**Size**: 10-100 GB (disk bottleneck)
-**Purpose**: Interpolation vectors ζ_q(μ,r) for reconstructing pair products
-
----
-
-### 4.3 Output Files
-
-#### `sigma_hp.log` (text, BerkeleyGW format)
-```
-# k-point    band_i  band_j   E_KS    Σ^X      Σ^C      E_QP
-    1         11      11    -2.345  -8.123   7.234   -2.456
-    1         12      12     2.134  -7.456   6.789    2.223
-    ...
-```
-
-#### `eqp.dat` (text, BerkeleyGW format)
-```
-# k-point  band   E_KS   E_QP   occupation
-    1      11    -2.345  -2.456  1.0
-    1      12     2.134   2.223  0.0
-    ...
-```
-
-#### `sigma_k.h5` (HDF5)
-```
-sigma_k.h5
-├── /sigma_x        # (n_k, n_spin, n_spin, n_band, n_band) complex128
-├── /sigma_c        # (n_k, n_spin, n_spin, n_band, n_band) complex128
-├── /eqp            # (n_k, n_band) float64
-└── /metadata
-    ├── k_grid      # (nkx, nky, nkz)
-    ├── band_range  # (b1, b3)
-    └── n_spinor    # 1 or 2
-```
-
----
-
-## 5. Entry Points & CLI Tools
-
-### 5.1 Console Commands (pyproject.toml)
+### 7.1 Console scripts (pyproject.toml)
 
 ```toml
-[project.scripts]
-lorrax-gw = "gw.gw_jax:main"
-gw_jax = "gw.gw_jax:main"
+lorrax-gw        = "gw.gw_jax:main"
+gw_jax           = "gw.gw_jax:main"          # alias
 lorrax-centroids = "centroid.kmeans_isdf:main"
-lorrax-bse = "bse.bse:main"
-load_upf = "isdf.psp.load_upf:main"
+lorrax-bse       = "bse.bse_isdf:main"
 ```
 
-### 5.2 Usage Examples
+### 7.2 Common module invocations
 
-#### K-means Centroid Selection
 ```bash
-kmeans_isdf --wfn WFN.h5 --n-centroids 100 --output centroids.h5
-```
+# Perlmutter canonical (see config/README.md)
+lxpre cohsex.in 640                              # centroids + dipole + kin_ion
+lxrun python3 -u -m gw.gw_jax -i cohsex.in       # 4-GPU GW
 
-#### GW/COHSEX Calculation
-```bash
-gw_jax --input cohsex.in
-# or equivalently:
-python -m gw.gw_jax --input cohsex.in
-```
+# Local dev
+uv run python -m centroid.kmeans_isdf -i cohsex.in 640
+uv run python -m psp.get_dipole_mtxels -i cohsex.in
+uv run python -m gw.kin_ion_io -i cohsex.in
+uv run python -m gw.gw_jax -i cohsex.in
 
-#### BSE Calculation (experimental)
-```bash
-bse --input bse.in
+# FFI smoke tests (module-load + lxalloc first)
+lxrun python3 -m common.slate_batched_test
+lxrun python3 -m common.cusolvermp_eigh_test
+lxrun python3 -m common.phdf5_write_test
 ```
 
 ---
 
-## 6. Function Call Hierarchy
+## 8. Function Call Hierarchy
 
-### 6.1 ISDF Fitting Call Stack
-
-```
-gw_jax.main()
-  └─→ fit_zeta_chunked_to_h5()                    [load_wfns.py:1720]
-       ├─→ get_sharded_wfns()                     [load_wfns.py:1520]
-       │    └─→ read_Gvecs_to_devices()           [load_wfns.py:450]
-       ├─→ compute_CCT_from_left_right()          [load_wfns.py:850]
-       │    ├─→ compute_pair_density_spin_traced()[load_wfns.py:670]
-       │    └─→ (NUFFT or FFT k→R, R→q)
-       ├─→ blocked_cholesky_2d()                  [load_wfns.py:1200]
-       └─→ compute_ZCT_from_left_right()          [load_wfns.py:950]
-            └─→ solve_zeta_cholesky()             [gw_jax.py:172]
-```
-
-### 6.2 Self-Energy Call Stack
+### 8.1 ISDF fitting
 
 ```
-gw_jax.main()
-  ├─→ build_screening_setup()                     [gw_driver_helpers.py]
-  ├─→ maybe_build_ctsp_windows()                 [gw_driver_helpers.py]
-  ├─→ compute_screening()                         [w_isdf.py]
-  │    ├─→ build_static_minimax_window_pair()     [minimax_screening.py]
-  │    └─→ compute_chi0_minimax() / solve_w...    [w_isdf.py]
-  ├─→ compute_sigma_pipeline_jax()                [gw_jax.py]
-  │    ├─→ get_sigma_static_mu_nu_jax()           [gw_jax.py]
-  │    └─→ get_sigma_static_kij_jax()             [gw_jax.py]
-  ├─→ build_ppm_sigma_runtime_options()           [gw_driver_helpers.py]
-  ├─→ compute_w0_wiwp_and_ppm_from_minimax()      [ppm_sigma.py]
-  │    ├─→ build_static_minimax_window_pair()     [minimax_screening.py]
-  │    └─→ extract_gn_ppm_parameters_from_Wc()    [minimax_screening.py]
-  └─→ compute_sigma_c_ppm_omega_grid()            [ppm_sigma.py]
+prepare_isdf_and_wavefunctions          [gw/gw_init.py]
+ ├─ fit_zeta_chunked_to_h5               [common/isdf_fitting.py]
+ │   ├─ load_centroids_band_chunked       [common/load_wfns.py]
+ │   │   └─ read_Gvecs_to_devices           [common/load_wfns.py]
+ │   ├─ compute_pair_density_spin_{traced,matrix}  [common/isdf_fitting.py]
+ │   ├─ compute_CCT_from_left_right[_spin_matrix]  [common/isdf_fitting.py]
+ │   │   └─ make_flat_k_{fftn,ifftn}        [common/fft_helpers.py]
+ │   ├─ compute_L_q_from_CCT               [common/isdf_fitting.py]
+ │   │   └─ cholesky_2d_batched            [common/cholesky_2d.py]
+ │   └─ z-chunk loop:
+ │       ├─ compute_ZCT_from_left_right_zchunk    [common/isdf_fitting.py]
+ │       ├─ solve_zeta_from_L_q             [common/isdf_fitting.py]
+ │       └─ SlabIO.write_slab               [file_io/slab_io.py]
+ └─ compute_all_V_q_from_zeta_h5          [gw/compute_vcoul.py]
+     ├─ make_v_munu_chunked_kernel         [gw/compute_vcoul.py]
+     └─ SlabIO.read_slab                   [file_io/slab_io.py]
+```
+
+### 8.2 Screening + static Σ
+
+```
+main                                       [gw/gw_jax.py]
+ ├─ build_static_quadrature                 [gw/w_isdf.py]
+ │   └─ build_static_minimax_window_pair     [gw/minimax_screening.py]
+ ├─ compute_chi0 → compute_chi0_minimax     [gw/w_isdf.py]
+ │   └─ _get_chi_minimax_kernel (cached)
+ │       ├─ build_G                          [gw/greens_function_kernel.py]
+ │       └─ flat-k FFTs via fft_helpers
+ ├─ solve_w → _get_w_solve_fn (cached)      [gw/w_isdf.py]
+ │   └─ shard_map( fori_loop( lu_factor + lu_solve ) )
+ ├─ sigma_sx / sigma_coh / hartree          [gw/gw_jax.py]
+ │   ├─ build_G                              [gw/greens_function_kernel.py]
+ │   ├─ _convolve (G·W/√Nk via IFFT/FFT)     [gw/gw_jax.py]
+ │   └─ project                              [gw/projection_kernel.py]
+ └─ _compute_static_head                     [gw/gw_jax.py]
+     └─ head_correction.resolve_head_sample  [gw/head_correction.py]
+         ├─ EPSReader.epshead                [file_io/epsreader.py]
+         └─ chi_from_dipole.compute_S_omega  [common/chi_from_dipole.py]
+```
+
+### 8.3 GN-PPM Σ^c(ω)
+
+```
+main                                       [gw/gw_jax.py]
+ ├─ build_imag_quadrature                   [gw/w_isdf.py]
+ ├─ compute_chi0 (imag ω)                   [gw/w_isdf.py]
+ ├─ solve_w (imag ω)                        [gw/w_isdf.py]
+ ├─ fit_gn_ppm                              [gw/ppm_sigma.py]
+ │   └─ fit_gn_ppm_from_wc_pair              [gw/minimax_screening.py]
+ └─ compute_sigma_c_ppm_omega_grid          [gw/ppm_sigma.py]
+     ├─ _prepare_sigma_state                 (fused Fermi / masks)
+     ├─ _iter_branches                       (4-branch enumerator)
+     └─ _run_sigma_branch (×4)
+         ├─ _build_windows_for_branch       (host: window + minimax)
+         │   ├─ _build_single_sigma_window  (Laplace)
+         │   └─ _build_three_sigma_windows  (Laplace + crossing + slab)
+         └─ _integrate_tau_windows_for_branch
+             └─ _get_sigma_tau_scan_kernel  (device: scan over τ)
+                 ├─ _get_sigma_tau_kernel
+                 │   ├─ _build_tau_operands  (Gij, W_τ_q)
+                 │   └─ _get_sigma_kij_kernel
+                 │       ├─ build_G         [greens_function_kernel.py]
+                 │       ├─ _convolve via fft_helpers
+                 │       └─ _make_project_ri_reduce_scatter  (reduce-scatter on m,n)
+                 └─ _project_tau_onto_omega  (e^{iωτ} kernel ⊗ σ^τ)
+     → _ReduceScatterGpuAccumulator  or  _StreamedH5Accumulator
+```
+
+### 8.4 Post-processing (all rank-0 host)
+
+```
+main                                       [gw/gw_jax.py]
+ ├─ solve_diagonal_sigma_fixed_point         [gw/qsgw_utils.py]
+ ├─ fit_scissor                              [gw/scissor.py]
+ ├─ build_qsgw_sigma_xc_from_h5              [gw/qsgw_utils.py]
+ ├─ rcrop_nojit                              [mixing/acceleration.py]    (if self_consistent)
+ ├─ write_sigma_omega_h5                     [file_io/sigma_output.py]
+ ├─ write_results → write_eqp_table          [gw/gw_output.py, file_io/sigma_output.py]
+ └─ write_qp_rotations_h5                    [file_io/qp_wfn.py]
 ```
 
 ---
 
-## 7. JAX Sharding Patterns
+## 9. Code Locations Quick Reference
 
-### 7.1 Mesh Definition
-
-**Global mesh**: `mesh_bands = Mesh(devices, ("bands",))` (gw_jax.py:72)
-**2D mesh**: `mesh_xy = Mesh(devices.reshape(Px, Py), ("x", "y"))`
-
-### 7.2 Sharding Specifications
-
-From `PHYSICS_COMPREHENSIVE.md` §7:
-
-| Array | Shape | Sharding | Notes |
-|-------|-------|----------|-------|
-| ψ(k,n,s,G) | (n_k, n_bands, n_s, n_g) | `P(None, 'bands', None, None)` | Shard bands across devices |
-| ψ(k,n,s,r_μ) | (n_k, n_bands, n_s, n_μ) | `P(None, 'bands', None, 'y')` | 2D: bands + centroids |
-| P_k,ab(μ,ν) | (n_k, 2, 2, n_μ, n_ν) | `P(None, None, None, 'x', 'y')` | 2D: centroids only |
-| C_q(μ,ν) | (n_q, n_μ, n_ν) | `P(None, 'x', 'y')` | 2D blocked |
-| ζ_q(μ,r) | (n_q, n_μ, n_r) | `P(None, 'x', None)` | 1D along centroids |
-| Σ_k(i,j) | (n_k, n_bands, n_bands) | `P(None, 'bands', None)` | Shard outer band index |
-
-### 7.3 Key JAX Patterns
-
-**shard_map** (load_wfns.py:74): Per-device FFT without communication
-```python
-@partial(shard_map, mesh=mesh, in_specs=P(...), out_specs=P(...))
-def fft_local(x):
-    return jnp.fft.fftn(x)  # FFT on local shard only
-```
-
-**pjit** (gw_jax.py): Automatic sharding with named axes
-```python
-@partial(pjit, in_shardings=NamedSharding(mesh, P('x', 'y')),
-               out_shardings=NamedSharding(mesh, P('x', 'y')))
-def matmul_2d(A, B):
-    return A @ B  # JAX inserts collectives automatically
-```
-
----
-
-## 8. Code Locations Quick Reference
-
-### Common Tasks → File Locations
-
-| Task | Primary File | Function/Class |
-|------|-------------|----------------|
-| **Parse input file** | `gw/gw_init.py` | `read_cohsex_input()` |
-| **Shared minimax config** | `gw/minimax_config.py` | `MinimaxConfig`, `SigmaQuadratureConfig` |
-| **Driver setup helpers** | `gw/gw_driver_helpers.py` | `build_screening_setup()`, `build_ppm_sigma_runtime_options()` |
-| **Load wavefunctions** | `common/load_wfns.py` | `get_sharded_wfns()` |
-| **FFT G→r** | `common/load_wfns.py:74` | `shard_map` FFT |
-| **NUFFT k→R** | `common/load_wfns.py:97` | `nufft_k_to_R_batched()` |
-| **Compute pair density** | `common/load_wfns.py:552` | `compute_pair_density_...()` |
-| **CCT matrix** | `common/load_wfns.py:850` | `compute_CCT_from_left_right()` |
-| **Cholesky factorization** | `common/load_wfns.py:1200` | `blocked_cholesky_2d()` |
-| **ZCT matrix** | `common/load_wfns.py:950` | `compute_ZCT_from_left_right()` |
-| **Solve for ζ** | `gw/gw_jax.py:172` | `solve_zeta_cholesky()` |
-| **Fit zeta (full pipeline)** | `common/load_wfns.py:1720` | `fit_zeta_chunked_to_h5()` |
-| **Compute V_q** | `gw/compute_vcoul.py` | `compute_all_V_q_from_zeta_h5()` |
-| **Canonical minimax lookup** | `gw/minimax_screening.py` | `build_static_minimax_window_pair()` |
-| **χ⁰ kernel** | `gw/w_isdf.py:60` | `_get_chi_kernel()` |
-| **Dyson solve for W** | `gw/w_isdf.py:240` | `get_static_w_q_jax()` |
-| **PPM build from minimax W** | `gw/ppm_sigma.py` | `compute_w0_wiwp_and_ppm_from_minimax()` |
-| **Σc(ω) GN-PPM path** | `gw/ppm_sigma.py` | `compute_sigma_c_ppm_omega_grid()` |
-| **Self-energy Σ** | `gw/gw_jax.py:941` | `get_sigma_static_mu_nu_jax()` |
-| **Project to bands** | `gw/gw_jax.py:1050` | `project_potential_to_bands()` |
-| **Head correction** | `gw/gw_jax.py:1948` | (inline in main loop) |
-| **Dipole S(ω)** | `common/chi_from_dipole.py` | `compute_S_omega()` |
-| **Write sigma output** | `io/sigma_output.py` | `write_sigma_to_file()` |
-| **Symmetry operations** | `common/symmetry_maps.py` | `SymMaps` class |
+| Task | File : function |
+|------|-----------------|
+| **Main driver** | `gw/gw_jax.py : main` |
+| **Parse cohsex.in** | `gw/gw_config.py : LorraxConfig.from_input_file` |
+| **Chunk auto-sizing** | `gw/gw_init.py : compute_optimal_chunks`, `prepare_isdf_and_wavefunctions` |
+| **Minimax / sigma quad config** | `gw/minimax_config.py : MinimaxConfig`, `SigmaQuadratureConfig` |
+| **Build `Meta`** | `common/meta.py : Meta.from_system` |
+| **Build wavefunction bundle** | `gw/wavefunction_bundle.py : build_wavefunctions_from_full` |
+| **Load WFN.h5** | `file_io/wfnreader.py : WFNReader`; band-chunked FFT `common/load_wfns.py : load_centroids_band_chunked` |
+| **Symmetry unfolding** | `common/symmetry_maps.py : SymMaps.get_cnk_fullzone[_batch]` |
+| **Flat-k FFT helpers** | `common/fft_helpers.py : make_flat_k_fftn`, `make_flat_k_ifftn` |
+| **Pair density (spin-traced)** | `common/isdf_fitting.py : compute_pair_density_spin_traced` |
+| **CCT matrix** | `common/isdf_fitting.py : compute_CCT_from_left_right[_spin_matrix]` |
+| **Cholesky factorization** | `common/isdf_fitting.py : compute_L_q_from_CCT` → `common/cholesky_2d.py : cholesky_2d_batched` |
+| **ZCT matrix (z-chunk)** | `common/isdf_fitting.py : compute_ZCT_from_left_right_zchunk` |
+| **ζ solve** | `common/isdf_fitting.py : solve_zeta_from_L_q` |
+| **Full ζ pipeline** | `common/isdf_fitting.py : fit_zeta_chunked_to_h5` |
+| **Compute V_q** | `gw/compute_vcoul.py : compute_all_V_q_from_zeta_h5` |
+| **Voronoi MC for q=0** | `gw/vcoul.py : compute_q0_averages` |
+| **Coulomb kernel + truncation** | `gw/vcoul.py : compute_V_qfullG_for_q` (`sys_dim=2` 2D slab, `3` 3D bulk, `0` box via `compute_vcoul_0d.py`) |
+| **χ₀ minimax kernel** | `gw/w_isdf.py : _get_chi_minimax_kernel`, `compute_chi0_minimax` |
+| **W Dyson solve** | `gw/w_isdf.py : solve_w`, `_get_w_solve_fn` |
+| **Static minimax lookup** | `gw/minimax_screening.py : build_static_minimax_window_pair` |
+| **Build G** | `gw/greens_function_kernel.py : build_G` |
+| **Σ band projection** | `gw/projection_kernel.py : project`, `project_ri` |
+| **Reduce-scatter projection** | `gw/ppm_sigma.py : _make_project_ri_reduce_scatter` |
+| **Static Σ_SX / Σ_COH / V_H** | `gw/gw_jax.py : sigma_sx`, `sigma_coh`, `hartree` |
+| **q→0 head resolution** | `gw/head_correction.py : resolve_head_sample` |
+| **Exact static head terms** | `gw/head_correction.py : compute_static_head_terms`, `static_head_terms_to_kij` |
+| **Dipole S(ω)** | `common/chi_from_dipole.py : compute_S_omega` |
+| **GN-PPM fit** | `gw/ppm_sigma.py : fit_gn_ppm` → `gw/minimax_screening.py : fit_gn_ppm_from_wc_pair` |
+| **Σ^c(ω) driver** | `gw/ppm_sigma.py : compute_sigma_c_ppm_omega_grid` |
+| **σ^τ kernel** | `gw/ppm_sigma.py : _get_sigma_tau_kernel`, `_get_sigma_tau_scan_kernel` |
+| **Diagonal fixed-point** | `gw/qsgw_utils.py : solve_diagonal_sigma_fixed_point` |
+| **Scissor extrapolation** | `gw/scissor.py : fit_scissor` |
+| **QSGW Σ^xc** | `gw/qsgw_utils.py : build_qsgw_sigma_xc_from_h5` |
+| **Anderson mixing (SC)** | `mixing/acceleration.py : rcrop_nojit`, `hermitian_to_upper_flat` |
+| **Write sigma_mnk.h5** | `file_io/sigma_output.py : write_sigma_omega_h5` |
+| **Write eqp.dat / eqp1.dat** | `file_io/sigma_output.py : write_eqp_g0w0`, `write_eqp1` |
+| **SlabIO (phdf5 writer)** | `file_io/slab_io.py : SlabIO` (backends in `_slab_io_ffi.py` / `_slab_io_allgather.py`) |
+| **Centroid selection** | `centroid/kmeans_isdf.py : main` |
+| **Dipole generation** | `psp/get_dipole_mtxels.py : main` |
+| **kin_ion generation** | `gw/kin_ion_io.py : main` |
+| **FFI loader** | `ffi/common/ffi_loader.py : phdf5_init_mpi`, `register_handlers` |
+| **cuSOLVERMp eigh** | `ffi/cusolvermp/eigh.py`, smoke test `common/cusolvermp_eigh_test.py` |
+| **SLATE eigh / Cholesky / trsm** | `ffi/slate/` , tests `common/slate_*_test.py` |
+| **phdf5 R/W** | `ffi/phdf5/` , benchmarks `common/phdf5_*.py` |
 
 ---
 
 ## Next Steps
 
-**For physics/theory**: See [`PHYSICS_COMPREHENSIVE.md`](PHYSICS_COMPREHENSIVE.md)
-**For environment setup**: See [`ENVIRONMENT_COMPREHENSIVE.md`](ENVIRONMENT_COMPREHENSIVE.md)
-**For agent improvement suggestions**: See [`AGENT_TODO.md`](AGENT_TODO.md)
+- Physics / theory: [`PHYSICS_COMPREHENSIVE.md`](PHYSICS_COMPREHENSIVE.md)
+- Memory model: [`MEMORY_MODEL.md`](MEMORY_MODEL.md)
+- Environment / Perlmutter: [`ENVIRONMENT_COMPREHENSIVE.md`](ENVIRONMENT_COMPREHENSIVE.md), [`../config/README.md`](../config/README.md)
+- FFI internals: [`../src/ffi/AGENTS.md`](../src/ffi/AGENTS.md)
+- GN-PPM Σ details: [`GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md`](GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md)
+- Current BGW-vs-LORRAX status: [`SIGMA_FREQ_AUDIT_STATUS.md`](SIGMA_FREQ_AUDIT_STATUS.md)
+- Agent todos: [`AGENT_TODO.md`](AGENT_TODO.md)
