@@ -150,7 +150,13 @@ class LoadPsiRchunkFftKernel(AotKernel):
 
 @register_kernel
 class LoadPsiRchunkReshardKernel(AotKernel):
-    """_reshard_rchunk: {-, XY, -, -} → {-, Y, -, -} → {-, -, -, Y}."""
+    """_reshard_rchunk: {-, XY, -, -} → {-, X, -, Y} → {-, -, -, Y} (y-first).
+
+    Matches the production form in ``common.load_wfns`` after 2026-04-21
+    reshard audit — y-first ordering + out_shardings on the jit forces
+    the final all_gather-x to run instead of being dropped as a
+    suggestion by XLA's SPMD partitioner.
+    """
     name = "load_psi_rchunk_reshard"
     SYSTEM_DIMS = ("n_k", "n_b", "n_s")
     KNOBS = ("chunk_r", "nb_pad")
@@ -168,12 +174,10 @@ class LoadPsiRchunkReshardKernel(AotKernel):
         )
 
     def build_callable(self, sys, knobs, mesh):
-        _stage_Y = NamedSharding(mesh, P(None, "y", None, None))
         _final_Y = NamedSharding(mesh, P(None, None, None, "y"))
+        _stage_X_rchunk_Y = NamedSharding(mesh, P(None, "x", None, "y"))
 
-        @jax.jit
+        @partial(jax.jit, out_shardings=_final_Y)
         def _reshard_rchunk(psi_rchunk):
-            psi_rchunk = jax.lax.with_sharding_constraint(psi_rchunk, _stage_Y)
-            psi_rchunk = jax.lax.with_sharding_constraint(psi_rchunk, _final_Y)
-            return psi_rchunk
+            return jax.lax.with_sharding_constraint(psi_rchunk, _stage_X_rchunk_Y)
         return _reshard_rchunk

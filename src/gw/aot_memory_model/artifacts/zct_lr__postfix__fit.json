@@ -1,0 +1,14 @@
+{
+  "kernel": "zct_lr",
+  "feature_names": [
+    "PrBr"
+  ],
+  "coefs": [
+    4.000000000000001
+  ],
+  "intercept": 0.0,
+  "gamma": 1.0,
+  "residual_rms": 1.6071605249741285e-05,
+  "n_samples": 7,
+  "notes": ""
+}
