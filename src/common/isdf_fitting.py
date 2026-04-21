@@ -775,7 +775,16 @@ def solve_zeta_from_L_q(
         Z_col = Z_q
         del Z_q
     else:
-        @jax.jit
+        # Donation on Z_q is the key — the caller `del Z_q` immediately
+        # after this block, so XLA can alias the input buffer for the
+        # output (2× tile theoretical minimum).  Without donation SPMD
+        # hits an Involuntary full rematerialization going from
+        # P(None,'x','y') → P(None,None,('x','y')) because both mesh
+        # axes need to re-shard at once.  Measured at Si 4×4×4 60Ry
+        # (nq=64, μ=2400, B_r=12672, 2×2 mesh):
+        #   direct, no donate: 31.14 GB/dev (temp 15.57 GB, Involuntary Remat)
+        #   direct, donate:    15.57 GB/dev (temp 7.79 GB) -- 50% reduction
+        @partial(jax.jit, donate_argnums=(0,))
         def _reshard_z(z):
             return jax.lax.with_sharding_constraint(z, _target_sharding)
         Z_col = _reshard_z(Z_q)
@@ -1347,8 +1356,21 @@ def fit_zeta_chunked_to_h5(
             # q-loop.  If we pass Z_q_flat into solve_zeta_from_L_q, the caller's
             # reference survives during the entire solve loop, keeping 3× m_zcol
             # alive (Z_q_flat + Z_col + zeta) instead of 2× (Z_col + zeta).
+            #
+            # Donating Z_q_flat lets XLA alias the input buffer for the
+            # output (we `del Z_q_flat` immediately below).  Without donation
+            # SPMD hits an Involuntary full rematerialization going from
+            # P(None,'x','y') → P(None,None,('x','y')).  Measured at Si 4×4×4
+            # 60Ry (μ=2400, B_r=12672, 2×2 mesh):
+            #   no donate: 31.14 GB/dev (Involuntary Remat)
+            #   donate:    15.57 GB/dev (50% reduction)
             z_col_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
-            Z_col = jax.lax.with_sharding_constraint(Z_q_flat, z_col_shard)
+
+            @partial(jax.jit, donate_argnums=(0,))
+            def _reshard_to_z_col(z):
+                return jax.lax.with_sharding_constraint(z, z_col_shard)
+
+            Z_col = _reshard_to_z_col(Z_q_flat)
             Z_col.block_until_ready()
             _track_peak()
             del Z_q_flat

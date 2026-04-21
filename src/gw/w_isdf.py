@@ -190,6 +190,15 @@ def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int):
 
     q_shard = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
     rep_3d = NamedSharding(mesh_xy, P(None, None, None))
+    # Intermediate sharding for the reshard from P(None,'x','y') → q_shard.
+    # Routing through P('x',None,'y') (x parks on nq, y stays on μ₂) lets
+    # SPMD plan it as two single-axis all_to_alls instead of the
+    # "Involuntary full rematerialization" it falls into when asked to
+    # un-shard both x and y on μ simultaneously via a fully replicated
+    # intermediate.  Measured at Si 4×4×4 60Ry (nq=64, μ=1200, 2×2 mesh):
+    #   via rep_3d: peak 2.95 GB/dev (temp 2.21 GB) — SPMD Involuntary Remat
+    #   via P('x',None,'y'): peak 1.11 GB/dev (temp 0.37 GB)  -- 62% reduction
+    reshard_mid = NamedSharding(mesh_xy, P('x', None, 'y'))
     q_spec = P(('x', 'y'), None, None)
 
     @jax.jit
@@ -206,9 +215,9 @@ def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int):
         V_padded = jnp.pad(V_flat, ((0, pad), (0, 0), (0, 0))) if pad > 0 else V_flat
         chi_padded = jnp.pad(chi_scaled, ((0, pad), (0, 0), (0, 0))) if pad > 0 else chi_scaled
         V_q = jax.lax.with_sharding_constraint(
-            jax.lax.with_sharding_constraint(V_padded, rep_3d), q_shard)
+            jax.lax.with_sharding_constraint(V_padded, reshard_mid), q_shard)
         chi_q = jax.lax.with_sharding_constraint(
-            jax.lax.with_sharding_constraint(chi_padded, rep_3d), q_shard)
+            jax.lax.with_sharding_constraint(chi_padded, reshard_mid), q_shard)
 
         def _local_solve(V_local, chi_local):
             nq_dev = V_local.shape[0]
