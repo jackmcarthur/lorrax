@@ -250,19 +250,31 @@ def batched_distributed_potrs(
     get_lib()
     ctx_handle = get_or_init_subrow_context(mesh)
 
-    nb = L.nb if block_size is None else int(block_size)
-    mb = nb
+    # Block sizes.  cuSOLVERMp's block-cyclic descriptor must match JAX's
+    # contiguous P('x', None, 'y') distribution.  With grid (1, Py),
+    # block-cyclic puts tile j on y-rank (j % Py).  For rank y to own a
+    # single contiguous slab [y*mrhs/Py, (y+1)*mrhs/Py), we need exactly
+    # Py column tiles globally — i.e. nb_B = mrhs/Py.
+    #
+    # descA stays mb=nb=n/Py (square, one tile per rank — already matches
+    # JAX); descB uses mb=nb_A (row block must equal A's col block for
+    # the forward-solve pipeline) and nb_B=mrhs/Py (one col-tile per rank).
+    nb_A = L.nb if block_size is None else int(block_size)
+    mb_A = nb_A
+    mb_B = nb_A
+    nb_B = mrhs // Py
 
     nb_batch_local = nbatch // Px
     key = ("potrs", _mesh_key(mesh), B.dtype,
-           nbatch, n, mrhs, mb, nb, int(ctx_handle))
+           nbatch, n, mrhs, mb_A, nb_A, mb_B, nb_B, int(ctx_handle))
     jit_potrs = _JIT_CACHE.get(key)
     if jit_potrs is None:
         X_local_T = jax.ShapeDtypeStruct(
             (nb_batch_local, mrhs // Py, n), B.dtype)
         attrs = dict(
             nbatch_local=nb_batch_local,
-            n=n, mrhs=mrhs, mb=mb, nb=nb,
+            n=n, mrhs=mrhs,
+            mb_a=mb_A, nb_a=nb_A, mb_b=mb_B, nb_b=nb_B,
             ctx_handle=int(ctx_handle),
         )
 

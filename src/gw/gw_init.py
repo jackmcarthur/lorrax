@@ -318,6 +318,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			k_chunk_size=chunks.get('k_chunk', 0),
 			band_norms=_band_norms,
 			use_ffi_io=cfg.use_ffi_io,
+			memory_mode=cfg.isdf_memory_mode,
 		)
 
 	budget_gb = mem_est.get('budget_gb', cfg.memory_per_device_gb)

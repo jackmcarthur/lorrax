@@ -50,7 +50,7 @@ static ffi::Error cross_stream_wait_pooled(cudaStream_t waiter,
 template <typename T>
 static ffi::Error BatchedPotrsImpl(
     int64_t nbatch_local, int64_t n, int64_t mrhs,
-    int64_t mb, int64_t nb,
+    int64_t mb_a, int64_t nb_a, int64_t mb_b, int64_t nb_b,
     cudaStream_t xla_stream,
     LorraxCusolverMpSubRowCtx* ctx,
     const T* d_L, const T* d_B_in, T* d_X_out)
@@ -76,12 +76,12 @@ static ffi::Error BatchedPotrsImpl(
     LORRAX_LIB_CHECK(
         cusolverMpCreateMatrixDesc(&descA, ctx->grid,
                                    mp::CudaDataTypeOf<T>::value,
-                                   n, n, mb, nb, 0, 0, lldA),
+                                   n, n, mb_a, nb_a, 0, 0, lldA),
         CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(A)");
     LORRAX_LIB_CHECK(
         cusolverMpCreateMatrixDesc(&descB, ctx->grid,
                                    mp::CudaDataTypeOf<T>::value,
-                                   n, mrhs, mb, nb, 0, 0, lldB),
+                                   n, mrhs, mb_b, nb_b, 0, 0, lldB),
         CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(B)");
 
     size_t d_ws = 0, h_ws = 0;
@@ -139,7 +139,7 @@ static ffi::Error BatchedPotrsDispatch(
     ffi::AnyBuffer B,
     ffi::Result<ffi::AnyBuffer> X_out,
     int64_t nbatch_local, int64_t n, int64_t mrhs,
-    int64_t mb, int64_t nb,
+    int64_t mb_a, int64_t nb_a, int64_t mb_b, int64_t nb_b,
     int64_t ctx_handle)
 {
     auto* ctx = reinterpret_cast<LorraxCusolverMpSubRowCtx*>(ctx_handle);
@@ -155,14 +155,14 @@ static ffi::Error BatchedPotrsDispatch(
     switch (dtype) {
         case ffi::DataType::F64:
             return BatchedPotrsImpl<double>(
-                nbatch_local, n, mrhs, mb, nb, stream, ctx,
+                nbatch_local, n, mrhs, mb_a, nb_a, mb_b, nb_b, stream, ctx,
                 static_cast<const double*>(L.untyped_data()),
                 static_cast<const double*>(B.untyped_data()),
                 static_cast<double*>(X_out->untyped_data()));
         case ffi::DataType::C128:
             using C128 = std::complex<double>;
             return BatchedPotrsImpl<C128>(
-                nbatch_local, n, mrhs, mb, nb, stream, ctx,
+                nbatch_local, n, mrhs, mb_a, nb_a, mb_b, nb_b, stream, ctx,
                 static_cast<const C128*>(L.untyped_data()),
                 static_cast<const C128*>(B.untyped_data()),
                 static_cast<C128*>(X_out->untyped_data()));
@@ -188,6 +188,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("nbatch_local")
         .Attr<int64_t>("n")
         .Attr<int64_t>("mrhs")
-        .Attr<int64_t>("mb")
-        .Attr<int64_t>("nb")
+        .Attr<int64_t>("mb_a")
+        .Attr<int64_t>("nb_a")
+        .Attr<int64_t>("mb_b")
+        .Attr<int64_t>("nb_b")
         .Attr<int64_t>("ctx_handle"));

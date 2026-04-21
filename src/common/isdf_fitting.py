@@ -3,8 +3,10 @@ import os
 import queue
 import threading
 import time
+from dataclasses import dataclass
 from types import SimpleNamespace
 from functools import partial
+from typing import Any, Optional, Union
 
 import numpy as np
 import jax
@@ -602,6 +604,66 @@ _chol_2d_cache = {}
 
 
 # ============================================================================
+# ZetaCholFactor — unified handle hiding the memory-mode choice
+# ============================================================================
+# The Cholesky factor of the stack of ISDF normal-equation matrices C_q has
+# two possible storage / compute regimes that we want to choose between
+# without cluttering the caller's code:
+#
+#   mode='high_mem'  (legacy)    L_q is a dense (nq, N, N) jax.Array sharded
+#                                P(None, 'x', 'y'); solve_zeta replicates L
+#                                across ranks for a local vmap trsm.  Cheap
+#                                when N is small and nq × N² fits in VRAM.
+#
+#   mode='low_mem'   (new)       L_q is an opaque CusolverMpBatchedLowerL
+#                                handle — batch sharded along 'x', matrix
+#                                1-axis-sharded along 'y'.  No replication;
+#                                solve_zeta runs the cuSOLVERMp distributed
+#                                potrs per-slice on the per-X-row sub-comm.
+#                                Scales to N >> single-GPU VRAM.
+#
+# Callers see a single object with `.shape`, `.dtype`, `.block_until_ready()`
+# quacking like a jax.Array so existing diagnostic prints still work.  The
+# solve function dispatches on `factor.mode`.
+
+@dataclass(frozen=True)
+class ZetaCholFactor:
+    mode: str                                        # 'high_mem' | 'low_mem'
+    mesh: Mesh
+    nq: int
+    n_rmu: int
+    dtype: Any
+    # Exactly one of these is populated depending on mode.
+    _dense_L: Optional[jax.Array] = None
+    _handle: Optional[Any] = None    # CusolverMpBatchedLowerL; Any to avoid hard import
+
+    @property
+    def shape(self):
+        return (self.nq, self.n_rmu, self.n_rmu)
+
+    def block_until_ready(self):
+        if self._dense_L is not None:
+            self._dense_L.block_until_ready()
+        elif self._handle is not None:
+            self._handle.raw.block_until_ready()
+        return self
+
+
+def _resolve_memory_mode(memory_mode: str, mesh_xy: Mesh) -> str:
+    """`auto` currently preserves back-compat: defaults to `high_mem`."""
+    m = memory_mode.lower()
+    if m == "auto":
+        return "high_mem"
+    if m not in ("high_mem", "low_mem"):
+        raise ValueError(
+            f"memory_mode must be one of auto|high_mem|low_mem; got {memory_mode!r}")
+    if m == "low_mem" and mesh_xy.devices.size == 1:
+        # cuSOLVERMp requires a real process grid; degrade to high_mem.
+        return "high_mem"
+    return m
+
+
+# ============================================================================
 # Full zeta fitting pipeline with z-chunk loop and HDF5 output
 # ============================================================================
 
@@ -609,21 +671,44 @@ def compute_L_q_from_CCT(
     C_q: jax.Array,
     mesh_xy: Mesh,
     block_size: int = None,
-) -> jax.Array:
+    *,
+    memory_mode: str = "auto",
+) -> ZetaCholFactor:
     """
-    Compute Cholesky factor L_q from CCT matrix using 2D blocked algorithm.
+    Compute Cholesky factor L_q from the CCT matrix stack.
 
     Args:
-        C_q: (nq, n_rmu, n_rmu) CCT matrix, sharded P(None, 'x', 'y')
-        mesh_xy: 2D device mesh
-        block_size: Tile block size (auto if None)
+        C_q: (nq, n_rmu, n_rmu) CCT matrix, sharded P(None, 'x', 'y').
+        mesh_xy: 2D device mesh with axes ('x', 'y').
+        block_size: Tile block size for the high_mem 2D-blocked JAX Cholesky
+                    (ignored by the low_mem path).  Auto if None.
+        memory_mode: "auto" | "high_mem" | "low_mem".  See module docstring
+                    on ZetaCholFactor for the regimes.
 
     Returns:
-        L_q: (nq, n_rmu, n_rmu) Cholesky factor, sharded P(None, 'x', 'y')
+        ZetaCholFactor wrapping either a dense L (high_mem) or a
+        CusolverMpBatchedLowerL handle (low_mem).
     """
     nq, n_rmu, n_rmu2 = C_q.shape
     assert n_rmu == n_rmu2, f"C_q must be square, got {n_rmu} x {n_rmu2}"
 
+    mode = _resolve_memory_mode(memory_mode, mesh_xy)
+
+    if mode == "low_mem":
+        # Reshard C_q from P(None, 'x', 'y') to P('x', None, 'y').  Batch 'x'
+        # puts q-points onto different X-rows (each X-row owns nq/Px
+        # matrices), and 'y' column-shards each (n_rmu, n_rmu) slice.  This
+        # is the layout the batched cuSOLVERMp FFI expects.
+        from ffi.cusolvermp import batched_distributed_cholesky
+        target_shard = NamedSharding(mesh_xy, P('x', None, 'y'))
+        C_resh = jax.lax.with_sharding_constraint(C_q, target_shard)
+        handle = batched_distributed_cholesky(C_resh, mesh=mesh_xy)
+        return ZetaCholFactor(
+            mode="low_mem", mesh=mesh_xy,
+            nq=nq, n_rmu=n_rmu, dtype=C_q.dtype,
+            _handle=handle)
+
+    # --- high_mem path (existing 2D-blocked JAX Cholesky) ---------------
     Pr = mesh_xy.shape['x']
     Pc = mesh_xy.shape['y']
 
@@ -640,7 +725,11 @@ def compute_L_q_from_CCT(
         C_q_reg = C_q + ridge
         L_q_dense = jnp.linalg.cholesky(C_q_reg)
         L_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-        return jax.lax.with_sharding_constraint(L_q_dense, L_shard)
+        L_q_dense = jax.lax.with_sharding_constraint(L_q_dense, L_shard)
+        return ZetaCholFactor(
+            mode="high_mem", mesh=mesh_xy,
+            nq=nq, n_rmu=n_rmu, dtype=C_q.dtype,
+            _dense_L=L_q_dense)
 
     if block_size is None:
         block_size, J = compute_block_size_for_2d_cholesky(n_rmu, Pr, Pc)
@@ -666,7 +755,10 @@ def compute_L_q_from_CCT(
     L_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     L_q_dense = jax.lax.with_sharding_constraint(L_q_dense, L_shard)
 
-    return L_q_dense
+    return ZetaCholFactor(
+        mode="high_mem", mesh=mesh_xy,
+        nq=nq, n_rmu=n_rmu, dtype=C_q.dtype,
+        _dense_L=L_q_dense)
 
 
 # Cache for solve function
@@ -674,31 +766,49 @@ _solve_cache = {}
 
 
 def solve_zeta_from_L_q(
-    L_q: jax.Array,
+    L_factor: ZetaCholFactor,
     Z_q: jax.Array,
     mesh_xy: Mesh,
     q_chunk_size: int = 1,
 ) -> jax.Array:
     """
-    Solve for zeta_q given pre-computed Cholesky factor L_q.
+    Solve for zeta_q given pre-computed Cholesky factor.
 
-    Uses q-chunked all-gather strategy: gather B_q L matrices at a time,
-    then solve all B_q systems in parallel using vmap.
-
-    Memory trade-off:
-    - q_chunk_size=1: Minimum memory (one L replicated at a time)
-    - q_chunk_size=nq: Maximum parallelism (all L replicated)
+    Dispatches on `L_factor.mode`:
+      * high_mem: q-chunked all-gather + local vmap trsm (legacy).
+      * low_mem : batched cuSOLVERMp potrs on the per-X-row sub-comm.
 
     Args:
-        L_q: (nq, n_rmu, n_rmu) Cholesky factor, sharded P(None, 'x', 'y')
-        Z_q: (nq, n_rmu, n_zchunk) ZCT matrix, sharded P(None, 'x', 'y')
-             or P(None, None, ('x','y')) if caller already resharded
-        mesh_xy: 2D device mesh
-        q_chunk_size: Number of q-points to solve simultaneously (default 1)
+        L_factor: ZetaCholFactor returned by compute_L_q_from_CCT.
+        Z_q: (nq, n_rmu, n_zchunk) ZCT matrix.  Accepted shardings:
+             P(None, 'x', 'y') | P(None, None, ('x','y')) | P('x', None, 'y')
+             — the function reshards internally to whatever the chosen
+             mode needs.
+        mesh_xy: 2D device mesh.
+        q_chunk_size: (high_mem only) q-points to solve simultaneously.
 
     Returns:
-        zeta_q: (nq, n_rmu, n_zchunk) solution, sharded P(None, None, ('x','y'))
+        zeta_q: (nq, n_rmu, n_zchunk) solution.
+            high_mem → sharded P(None, None, ('x','y'))
+            low_mem  → sharded P('x', None, 'y')  (batch-distributed output;
+                      downstream allgather-to-host already tolerates this
+                      via the standard multihost_utils.process_allgather
+                      path.)
     """
+    if L_factor.mode == "low_mem":
+        from ffi.cusolvermp import batched_distributed_potrs
+        target_shard = NamedSharding(mesh_xy, P('x', None, 'y'))
+        Z_resh = jax.lax.with_sharding_constraint(Z_q, target_shard)
+        X = batched_distributed_potrs(L_factor._handle, Z_resh, mesh=mesh_xy)
+        # Reshard to the high_mem output layout so downstream consumers
+        # (q-chunked allgather in fit_zeta_chunked_to_h5, or write_slab)
+        # see an identical sharding regardless of memory_mode.  Modest
+        # all-to-all cost; keeps the abstraction clean at the top level.
+        out_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
+        return jax.lax.with_sharding_constraint(X, out_shard)
+
+    # --- high_mem path (existing replicate-L + vmap-trsm) ---------------
+    L_q = L_factor._dense_L
     nq, n_rmu, _ = L_q.shape
     _, _, n_zchunk = Z_q.shape
 
@@ -840,6 +950,7 @@ def fit_zeta_chunked_to_h5(
     q_gather_size: int = 0,
     band_norms: np.ndarray | None = None,
     use_ffi_io: bool = False,
+    memory_mode: str = "auto",
 ):
     """
     Full zeta fitting pipeline with r-chunk loop and HDF5 output.
@@ -1006,10 +1117,10 @@ def fit_zeta_chunked_to_h5(
 
     # ========== STEP 3: Compute L_q = chol(C_q) once ==========
     with timing.section("zeta_fit.cholesky"):
-        print(f"  Computing L_q = chol(C_q)")
-        L_q = compute_L_q_from_CCT(C_q_flat, mesh_xy)
+        print(f"  Computing L_q = chol(C_q) [memory_mode={memory_mode}]")
+        L_q = compute_L_q_from_CCT(C_q_flat, mesh_xy, memory_mode=memory_mode)
         L_q.block_until_ready()
-        print(f"  L_q: {L_q.shape}")
+        print(f"  L_q: shape={L_q.shape}  mode={L_q.mode}")
 
     # Free C_q to reclaim GPU memory before z-chunk loop
     # (P_k_mumu was already deleted above)
@@ -1352,19 +1463,22 @@ def fit_zeta_chunked_to_h5(
                 # No block_until_ready — reshard will consume Z_q_flat asynchronously.
             t_zct_total += time.perf_counter() - t0
 
-            # 6d. Reshard Z_q_flat → Z_col, then free Z_q_flat BEFORE the solve
-            # q-loop.  If we pass Z_q_flat into solve_zeta_from_L_q, the caller's
-            # reference survives during the entire solve loop, keeping 3× m_zcol
-            # alive (Z_q_flat + Z_col + zeta) instead of 2× (Z_col + zeta).
-            #
+            # q-loop.  Different target sharding per memory_mode:
+            #   high_mem: Z_col P(None, None, ('x','y')) — μ-replicated for
+            #             the vmap local trsm.  Legacy path.
+            #   low_mem : Z_col P('x', None, 'y') — batch-distributed for
+            #             cuSOLVERMp's per-X-row potrs.
             # Donating Z_q_flat lets XLA alias the input buffer for the
-            # output (we `del Z_q_flat` immediately below).  Without donation
-            # SPMD hits an Involuntary full rematerialization going from
-            # P(None,'x','y') → P(None,None,('x','y')).  Measured at Si 4×4×4
-            # 60Ry (μ=2400, B_r=12672, 2×2 mesh):
-            #   no donate: 31.14 GB/dev (Involuntary Remat)
-            #   donate:    15.57 GB/dev (50% reduction)
-            z_col_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
+            # output (we `del Z_q_flat` immediately below).  Without
+            # donation the high_mem case hits Involuntary full
+            # rematerialization going from P(None,'x','y') →
+            # P(None,None,('x','y')) — measured at Si 4×4×4 60Ry
+            # (μ=2400, B_r=12672, 2×2 mesh): no donate 31.14 GB/dev,
+            # donate 15.57 GB/dev (50% reduction).
+            if L_q.mode == "low_mem":
+                z_col_shard = NamedSharding(mesh_xy, P('x', None, 'y'))
+            else:
+                z_col_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
 
             @partial(jax.jit, donate_argnums=(0,))
             def _reshard_to_z_col(z):
