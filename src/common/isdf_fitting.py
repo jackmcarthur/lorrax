@@ -171,40 +171,6 @@ def compute_pair_density_spin_traced(
 	return _compute_pair_density_cache[cache_key](psi_rmuT_X, psi_rmu_Y)
 
 
-def compute_pair_density_spin_matrix(
-	psi_rmuT_X: jax.Array,
-	psi_rcol_Y: jax.Array,
-	mesh_xy: Mesh,
-) -> jax.Array:
-	"""
-	Compute spin-resolved pair density P_k,ab(mu,col) = sum_n psi*_nka(mu) psi_nkb(col).
-
-	Input:
-		psi_rmuT_X: (nk, n_rmu, nb, ns) with P(None, 'x', None, None)
-		psi_rcol_Y: (nk, nb, ns, n_col) with P(None, None, None, 'y')
-
-	Output:
-		P_k_ab: (nk, ns, ns, n_rmu, n_col) with P(None, None, None, 'x', 'y')
-	"""
-	nk, n_rmu, nb, ns = psi_rmuT_X.shape
-	_, _, _, n_col = psi_rcol_Y.shape
-	cache_key = ('spin_matrix', id(mesh_xy), nk, n_rmu, nb, ns, n_col)
-
-	if cache_key not in _compute_pair_density_cache:
-		x1_4 = NamedSharding(mesh_xy, P(None, 'x', None, None))
-		y3_4 = NamedSharding(mesh_xy, P(None, None, None, 'y'))
-		xy_out = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-
-		@partial(jax.jit, in_shardings=(x1_4, y3_4), out_shardings=xy_out)
-		def _compute_P_spin_matrix(psi_L: jax.Array, psi_R: jax.Array) -> jax.Array:
-			# Keep spin channels explicit: P[k,a,b,mu,col].
-			return jnp.einsum('kmna,knbr->kabmr', psi_L, psi_R, optimize=True)
-
-		_compute_pair_density_cache[cache_key] = _compute_P_spin_matrix
-
-	return _compute_pair_density_cache[cache_key](psi_rmuT_X, psi_rcol_Y)
-
-
 _accum_pair_density_cache = {}
 
 
@@ -239,37 +205,6 @@ def accumulate_pair_density_spin_traced(
 				 donate_argnums=(0,))
 		def _accum(P_in: jax.Array, psi_L: jax.Array, psi_R: jax.Array) -> jax.Array:
 			return P_in + jnp.einsum('kmns,knsv->kmv', psi_L, psi_R, optimize=True)
-
-		_accum_pair_density_cache[cache_key] = _accum
-	return _accum_pair_density_cache[cache_key](P_accum, psi_rmuT_X, psi_rcol_Y)
-
-
-def accumulate_pair_density_spin_matrix(
-	P_accum: jax.Array,
-	psi_rmuT_X: jax.Array,
-	psi_rcol_Y: jax.Array,
-	mesh_xy: Mesh,
-) -> jax.Array:
-	"""``P_accum + Σ_n ψ*_{n,a}(r_μ) ψ_{n,b}(r_col)`` (spin-resolved).
-
-	Shapes / shardings mirror :func:`compute_pair_density_spin_matrix`
-	on the inputs; ``P_accum`` holds the 2×2 spin matrix on
-	``P(None, None, None, 'x', 'y')``.
-	"""
-	nk, n_rmu, nb, ns = psi_rmuT_X.shape
-	_, _, _, n_col = psi_rcol_Y.shape
-	cache_key = ('spin_matrix_accum', id(mesh_xy), nk, n_rmu, nb, ns, n_col)
-	if cache_key not in _accum_pair_density_cache:
-		P_sharding = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-		L_sharding = NamedSharding(mesh_xy, P(None, 'x', None, None))
-		R_sharding = NamedSharding(mesh_xy, P(None, None, None, 'y'))
-
-		@partial(jax.jit,
-				 in_shardings=(P_sharding, L_sharding, R_sharding),
-				 out_shardings=P_sharding,
-				 donate_argnums=(0,))
-		def _accum(P_in: jax.Array, psi_L: jax.Array, psi_R: jax.Array) -> jax.Array:
-			return P_in + jnp.einsum('kmna,knbr->kabmr', psi_L, psi_R, optimize=True)
 
 		_accum_pair_density_cache[cache_key] = _accum
 	return _accum_pair_density_cache[cache_key](P_accum, psi_rmuT_X, psi_rcol_Y)
@@ -343,61 +278,6 @@ def compute_CCT_from_left_right(
 		_isdf_pipeline_cache[cache_key] = _compute_CCT_LR
 
 	return _isdf_pipeline_cache[cache_key](P_l_k, P_r_k)
-
-
-def compute_CCT_from_left_right_spin_matrix(
-	P_l_k_ab: jax.Array,
-	P_r_k_ab: jax.Array,
-	kgrid: tuple[int, int, int],
-	mesh_xy: Mesh,
-) -> jax.Array:
-	"""
-	Compute CCT from explicit spin-channel pair densities.
-
-	C_q(mu,nu) = FFT[ sum_ab conj(IFFT(P_l_ab)) * IFFT(P_r_ab) ].
-	For identical left/right windows, this reduces to Frobenius ||P_ab||^2.
-	"""
-	nkx, nky, nkz = kgrid
-	nk, ns1, ns2, n_rmu, n_col = P_l_k_ab.shape
-	assert n_col == n_rmu, f"CCT expects square centroid columns, got n_col={n_col}, n_rmu={n_rmu}"
-
-	cache_key = ('CCT_LR_spin_matrix', id(mesh_xy), nk, ns1, ns2, n_rmu, nkx, nky, nkz)
-
-	if cache_key not in _isdf_pipeline_cache:
-		spin_spec = P(None, None, None, 'x', 'y')  # 5-axis: (nk, a, b, μ, μ)
-		scalar_spec = P(None, 'x', 'y')            # 3-axis: (nk, μ, μ)
-		spin_flat_shard = NamedSharding(mesh_xy, spin_spec)
-		scalar_flat_shard = NamedSharding(mesh_xy, scalar_spec)
-		# The 3D-form specs prepend (None, None, None) to the flat spec.
-		fft_spin_3d = P(None, None, None, None, None, 'x', 'y')
-		fft_scalar_3d = P(None, None, None, 'x', 'y')
-		local_ifftn_spin   = make_flat_k_ifftn(mesh_xy, kgrid, fft_spin_3d,   norm='forward')
-		local_fftn_scalar  = make_flat_k_fftn( mesh_xy, kgrid, fft_scalar_3d, norm='forward')
-
-		# Split into two sub-jits so XLA can donate the rank-5 P_l/P_r into
-		# their rank-5 IFFT outputs; the sum-over-spin rank drop (5→3)
-		# happens in the outer jit which doesn't try to donate.
-		@partial(jax.jit, in_shardings=spin_flat_shard, out_shardings=spin_flat_shard,
-		         donate_argnums=(0,))
-		def _ifft_conj(P_l: jax.Array) -> jax.Array:
-			return jnp.conj(local_ifftn_spin(P_l))
-
-		@partial(jax.jit,
-		         in_shardings=(spin_flat_shard, spin_flat_shard),
-		         out_shardings=scalar_flat_shard,
-		         donate_argnums=(0, 1))
-		def _ifft_contract_fft(P_r: jax.Array, P_l_Rt_conj: jax.Array) -> jax.Array:
-			P_r_Rt = local_ifftn_spin(P_r)
-			C_Rt = jnp.sum(P_l_Rt_conj * P_r_Rt, axis=(1, 2))
-			return local_fftn_scalar(C_Rt)
-
-		def _compute_CCT_LR_spin(P_l: jax.Array, P_r: jax.Array) -> jax.Array:
-			P_l_Rt_conj = _ifft_conj(P_l)
-			return _ifft_contract_fft(P_r, P_l_Rt_conj)
-
-		_isdf_pipeline_cache[cache_key] = _compute_CCT_LR_spin
-
-	return _isdf_pipeline_cache[cache_key](P_l_k_ab, P_r_k_ab)
 
 
 def compute_gram_q0_from_left_right(
@@ -536,63 +416,6 @@ def compute_ZCT_from_left_right_zchunk(
 		_isdf_pipeline_cache[cache_key] = _compute_ZCT_LR
 
 	return _isdf_pipeline_cache[cache_key](P_l_k_muz, P_r_k_muz)
-
-
-def compute_ZCT_from_left_right_zchunk_spin_matrix(
-	P_l_k_ab_muz: jax.Array,
-	P_r_k_ab_muz: jax.Array,
-	kgrid: tuple[int, int, int],
-	mesh_xy: Mesh,
-) -> jax.Array:
-	"""
-	Compute ZCT from explicit spin-channel pair densities on (mu, r_chunk).
-
-	Z_q(mu,r) = FFT[ sum_ab conj(IFFT(P_l_ab(mu,r))) * IFFT(P_r_ab(mu,r)) ].
-	"""
-	nkx, nky, nkz = kgrid
-	nk, n_s1, n_s2, n_rmu, n_zchunk = P_l_k_ab_muz.shape
-	assert nk == nkx * nky * nkz, (
-		f"P_l_k_ab_muz flat-k dim {nk} does not match kgrid product {nkx*nky*nkz}"
-	)
-	assert P_r_k_ab_muz.shape == P_l_k_ab_muz.shape, (
-		f"P_l/P_r shape mismatch: {P_l_k_ab_muz.shape} vs {P_r_k_ab_muz.shape}"
-	)
-
-	cache_key = ('ZCT_LR_spin_matrix', id(mesh_xy), nk, n_s1, n_s2, n_rmu, n_zchunk)
-
-	if cache_key not in _isdf_pipeline_cache:
-		spin_spec = P(None, None, None, 'x', 'y')  # 5-axis: (nk, a, b, μ, z)
-		scalar_spec = P(None, 'x', 'y')            # 3-axis: (nk, μ, z)
-		spin_flat_shard = NamedSharding(mesh_xy, spin_spec)
-		scalar_flat_shard = NamedSharding(mesh_xy, scalar_spec)
-		spec_spin_3d = P(None, None, None, None, None, 'x', 'y')
-		spec_scalar_3d = P(None, None, None, 'x', 'y')
-		local_ifftn_spin   = make_flat_k_ifftn(mesh_xy, kgrid, spec_spin_3d,   norm='forward')
-		local_fftn_scalar  = make_flat_k_fftn( mesh_xy, kgrid, spec_scalar_3d, norm='forward')
-
-		@partial(jax.jit, in_shardings=spin_flat_shard, out_shardings=spin_flat_shard,
-		         donate_argnums=(0,))
-		def _left_ifft_conj(P_l: jax.Array) -> jax.Array:
-			return jnp.conj(local_ifftn_spin(P_l))
-
-		@partial(jax.jit,
-		         in_shardings=(spin_flat_shard, spin_flat_shard),
-		         out_shardings=scalar_flat_shard,
-		         donate_argnums=(0, 1))
-		def _right_ifft_contract_fft(P_r: jax.Array, P_l_Rt: jax.Array) -> jax.Array:
-			P_r_Rt = local_ifftn_spin(P_r)
-			# Sum over spin channels (axes 1, 2 on flat-k rank-5 tensor).
-			Z_Rt = jnp.sum(P_l_Rt * P_r_Rt, axis=(1, 2))
-			return local_fftn_scalar(Z_Rt)
-
-		def _compute_ZCT_LR_spin(P_l: jax.Array, P_r: jax.Array) -> jax.Array:
-			P_l_Rt = _left_ifft_conj(P_l)
-			return _right_ifft_contract_fft(P_r, P_l_Rt)
-
-		_isdf_pipeline_cache[cache_key] = _compute_ZCT_LR_spin
-
-	return _isdf_pipeline_cache[cache_key](P_l_k_ab_muz, P_r_k_ab_muz)
-
 
 
 # ============================================================================
@@ -946,7 +769,6 @@ def fit_zeta_chunked_to_h5(
     use_gspace_cache: bool = True,
     band_range_left: tuple[int, int] | None = None,
     band_range_right: tuple[int, int] | None = None,
-    isdf_pair_mode: str = "spin_traced",
     k_chunk_size: int = 0,
     q_gather_size: int = 0,
     band_norms: np.ndarray | None = None,
@@ -988,9 +810,6 @@ def fit_zeta_chunked_to_h5(
         use_gspace_cache: If True, cache G-space across r-chunks
         band_range_left: (start, end) for left wfns. Default: (b0, b3)
         band_range_right: (start, end) for right wfns. Default: (b0, b4)
-        isdf_pair_mode: Pair-density mode for CCT/ZCT.
-            "spin_traced": P(mu,col)=sum_{n,s} psi* psi (current default)
-            "spin_matrix_frobenius": Keep spin channels P_ab and contract sum_ab after FFT
 
     Returns:
         peak_bytes:  GPU high-water mark (peak_bytes_in_use) during chunk loop
@@ -1003,12 +822,6 @@ def fit_zeta_chunked_to_h5(
     import h5py
 
     nx, ny, nz = meta.fft_grid
-    isdf_pair_mode = str(isdf_pair_mode).strip().lower()
-    if isdf_pair_mode not in ("spin_traced", "spin_matrix_frobenius"):
-        raise ValueError(
-            f"Unknown isdf_pair_mode={isdf_pair_mode!r}. "
-            "Expected 'spin_traced' or 'spin_matrix_frobenius'."
-        )
     n_rmu = meta.n_rmu
     n_rtot = meta.n_rtot
     nk_tot = meta.nk_tot
@@ -1035,7 +848,7 @@ def fit_zeta_chunked_to_h5(
     nb_full = band_range_full[1] - band_range_full[0]
 
     print(f"\n  Zeta fitting: {num_chunks} r-chunks x {n_rchunk} r-points, "
-          f"{nb_full} bands ({nb_left} left + {nb_right} right), {isdf_pair_mode}")
+          f"{nb_full} bands ({nb_left} left + {nb_right} right)")
     print(f"  Output: {output_file}")
 
     # ========== STEP 1: Slice pre-loaded centroid ψ into left/right halves ==========
@@ -1085,19 +898,12 @@ def fit_zeta_chunked_to_h5(
     # ========== STEP 2: Compute CCT (C_q) from left/right pair densities ==========
     # Uses normalized copies for fitting (equal-weight pair densities)
     with timing.section("zeta_fit.CCT"):
-        print(f"  Computing pair densities P_l, P_r ({isdf_pair_mode})")
-        if isdf_pair_mode == "spin_traced":
-            P_l_k = compute_pair_density_spin_traced(psi_l_rmuT_X_fit, psi_l_rmu_Y_fit, mesh_xy)
-            P_r_k = compute_pair_density_spin_traced(psi_r_rmuT_X_fit, psi_r_rmu_Y_fit, mesh_xy)
-            P_l_k.block_until_ready()
-            P_r_k.block_until_ready()
-            C_q = compute_CCT_from_left_right(P_l_k, P_r_k, kgrid, mesh_xy)
-        else:
-            P_l_k = compute_pair_density_spin_matrix(psi_l_rmuT_X, psi_l_rmu_Y, mesh_xy)
-            P_r_k = compute_pair_density_spin_matrix(psi_r_rmuT_X, psi_r_rmu_Y, mesh_xy)
-            P_l_k.block_until_ready()
-            P_r_k.block_until_ready()
-            C_q = compute_CCT_from_left_right_spin_matrix(P_l_k, P_r_k, kgrid, mesh_xy)
+        print(f"  Computing pair densities P_l, P_r (spin_traced)")
+        P_l_k = compute_pair_density_spin_traced(psi_l_rmuT_X_fit, psi_l_rmu_Y_fit, mesh_xy)
+        P_r_k = compute_pair_density_spin_traced(psi_r_rmuT_X_fit, psi_r_rmu_Y_fit, mesh_xy)
+        P_l_k.block_until_ready()
+        P_r_k.block_until_ready()
+        C_q = compute_CCT_from_left_right(P_l_k, P_r_k, kgrid, mesh_xy)
         C_q.block_until_ready()
         # C_q: (nqx, nqy, nqz, n_rmu, n_rmu)
 
@@ -1289,23 +1095,14 @@ def fit_zeta_chunked_to_h5(
     # the N-1 equally sized r-chunks + the final remainder hit
     # exactly two compile-shape entries, with no new jit-wrapper
     # identity per r-chunk iter.
-    ns = meta.nspinor
-    P_sharding_traced = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    P_sharding_spin   = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-    if isdf_pair_mode == "spin_traced":
-        _P_sharding = P_sharding_traced
-        _P_shape_fn = lambda n_r: (nk_tot, n_rmu, n_r)
-        _accum = accumulate_pair_density_spin_traced
-    else:
-        _P_sharding = P_sharding_spin
-        _P_shape_fn = lambda n_r: (nk_tot, ns, ns, n_rmu, n_r)
-        _accum = accumulate_pair_density_spin_matrix
+    _P_sharding = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    _accum = accumulate_pair_density_spin_traced
     _P_zeros_cache: dict = {}
 
     def _zero_P(n_r: int):
         fn = _P_zeros_cache.get(n_r)
         if fn is None:
-            shape = _P_shape_fn(n_r)
+            shape = (nk_tot, n_rmu, n_r)
             fn = jax.jit(
                 lambda: jnp.zeros(shape, dtype=jnp.complex128),
                 out_shardings=_P_sharding)
@@ -1441,15 +1238,10 @@ def fit_zeta_chunked_to_h5(
             # flat-q (nq, μ, z-chunk) matching the input sharding.
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.ZCT"):
-                if isdf_pair_mode == "spin_traced":
-                    Z_q_flat = compute_ZCT_from_left_right_zchunk(
-                        P_l_k_mux, P_r_k_mux, kgrid, mesh_xy
-                    )
-                else:
-                    Z_q_flat = compute_ZCT_from_left_right_zchunk_spin_matrix(
-                        P_l_k_mux, P_r_k_mux, kgrid, mesh_xy
-                    )
-                # P_l/P_r are consumed by the ZCT jits (donate_argnums);
+                Z_q_flat = compute_ZCT_from_left_right_zchunk(
+                    P_l_k_mux, P_r_k_mux, kgrid, mesh_xy
+                )
+                # P_l/P_r are consumed by the ZCT jit (donate_argnums);
                 # no-op del for name-scope hygiene.
                 del P_l_k_mux, P_r_k_mux
 

@@ -23,7 +23,6 @@ def compute_optimal_chunks(
     target_utilization: float = 0.97,
     verbose: bool = True,
     n_b_left: int | None = None, n_b_right: int | None = None,
-    pair_density_channels: int = 1,
     r_chunk_override: int | None = None,
     zct_stage_cap_gb: float | None = None,
 ) -> dict:
@@ -63,7 +62,6 @@ def compute_optimal_chunks(
     nb_r = int(n_b_right) if n_b_right is not None else nb
     nk, ns, mu, nq, nr = float(meta.nk_tot), float(meta.nspinor), float(meta.n_rmu), float(meta.nk_tot), float(meta.n_rtot)
     nx, ny, nz = meta.fft_grid
-    pc = float(pair_density_channels)
 
     def _mem(*dims, shard=1):
         """complex128 array bytes: 16 · ∏(dims) / shard."""
@@ -100,7 +98,7 @@ def compute_optimal_chunks(
     peak_fft_stage = m_centroids_full + FFT_COPIES * _mem(nk, bpd, ns, nr) + m_phase
 
     # ---- C_q build (pair density → C_q → L_q, runs before chunk loop) ----
-    stage_cct = m_centroids + 2 * _mem(pc, nk, mu, mu, shard=p_x * p_y) + _mem(nq, mu, mu, shard=p_x * p_y)
+    stage_cct = m_centroids + 2 * _mem(nk, mu, mu, shard=p_x * p_y) + _mem(nq, mu, mu, shard=p_x * p_y)
     if stage_cct > m_budget:
         raise ValueError(f"C_q build requires {stage_cct/1e9:.2f} GB/device — exceeds budget.")
     m_L_q = _mem(nq, mu, mu, shard=p_x * p_y)  # L_q persists; same size as C_q
@@ -114,7 +112,7 @@ def compute_optimal_chunks(
     # The optimal cr = min over i of (headroom − cᵢ) / αᵢ.
     # ======================================================================
     α_psi     = _mem(nk, nb, ns, shard=p_y)        # ψ(r_chunk) output accumulator
-    α_pair    = _mem(pc, nk, mu, shard=p_x * p_y)  # one pair density P(nk, μ, cr)
+    α_pair    = _mem(nk, mu, shard=p_x * p_y)  # one pair density P(nk, μ, cr)
     α_zcol    = _mem(nq, mu, shard=p)               # Z_col column slice
     α_z_slice = _mem(mu, shard=p)                   # per-q Z_slice or Z_transpose
     α_gather  = _mem(mu, shard=p) + 2 * _mem(mu)    # sharded input + replicated output + NCCL
@@ -289,7 +287,6 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	print_fn(f"    Band chunks: {chunks['band_chunk']}")
 	print_fn(f"    R chunks:    {chunks['chunk_r']} (contiguous r-space)")
 	print_fn(f"    Q chunks:    {chunks['q_chunk']}")
-	print_fn(f"    Pair mode:   {cfg.isdf_pair_mode}")
 	print_fn(f"    Zeta output: {zeta_h5_path}")
 
 	# Band norms for pseudobands normalization (1.0 for deterministic bands)
@@ -308,7 +305,6 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			use_gspace_cache=chunks.get('use_gspace_cache', True),
 			band_range_left=band_range_left,
 			band_range_right=band_range_right,
-			isdf_pair_mode=cfg.isdf_pair_mode,
 			k_chunk_size=chunks.get('k_chunk', 0),
 			band_norms=_band_norms,
 			use_ffi_io=cfg.use_ffi_io,

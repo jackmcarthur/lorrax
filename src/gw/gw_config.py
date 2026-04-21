@@ -58,7 +58,6 @@ _DEFAULTS = {
     "band_chunk_size": 16,
     "r_chunk_size": 0,
     # ISDF
-    "isdf_pair_mode": "spin_traced",
     "isdf_memory_mode": "auto",   # auto | high_mem | low_mem
                                    # high_mem (default): 2D-blocked JAX Cholesky +
                                    #   replicate-L vmap trsm.  Fast for small n_rmu.
@@ -124,7 +123,7 @@ _DEFAULTS = {
 # Keys whose string values should be lowercased and stripped
 _NORMALIZE_STR = {
     "wcoul0_source", "screening_method", "minimax_energy_reference",
-    "sigma_omega_accumulation", "fermi_reference", "isdf_pair_mode",
+    "sigma_omega_accumulation", "fermi_reference",
     "isdf_memory_mode",
     "ppm_invalid_mode",
 }
@@ -299,7 +298,6 @@ class LorraxConfig:
     zct_stage_cap_gb: float | None
 
     # --- ISDF ---
-    isdf_pair_mode: str
     isdf_memory_mode: str
     mc_average_vcoul_body: bool
     bare_coulomb_cutoff: float | None
@@ -425,9 +423,6 @@ class LorraxConfig:
         resolve_input_paths(params, input_dir)
 
         # --- Validate ---
-        isdf_pair_mode = str(params.get("isdf_pair_mode", "spin_traced")).strip().lower()
-        if isdf_pair_mode not in ("spin_traced", "spin_matrix_frobenius"):
-            raise ValueError(f"isdf_pair_mode={isdf_pair_mode!r} is invalid.")
         isdf_memory_mode = str(params.get("isdf_memory_mode", "auto")).strip().lower()
         if isdf_memory_mode not in ("auto", "high_mem", "low_mem"):
             raise ValueError(f"isdf_memory_mode={isdf_memory_mode!r} invalid; "
@@ -503,7 +498,6 @@ class LorraxConfig:
             r_chunk_override=int(_get("r_chunk_size")),
             zct_stage_cap_gb=zct_stage_cap_gb,
             # ISDF
-            isdf_pair_mode=isdf_pair_mode,
             isdf_memory_mode=isdf_memory_mode,
             mc_average_vcoul_body=bool(_get("mc_average_vcoul_body")),
             bare_coulomb_cutoff=_get("bare_coulomb_cutoff"),
