@@ -1181,5 +1181,505 @@ def compute_all_V_q_from_zeta_h5(
     if mesh_xy is not None:
         V_shard = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
         V_qmunu = jax.lax.with_sharding_constraint(V_qmunu, V_shard)
-    
+
+    return V_qmunu, g0_mu_all
+
+
+# ============================================================================
+# Sharded V_q — mesh-parallel computation via one-axis gathers
+# ============================================================================
+#
+# Design
+# ------
+# This path supersedes ``_single_chunk_proc`` in the replicated-compute branch
+# of ``compute_all_V_q_from_zeta_h5``.  The replicated path reads ζ_q(μ, r)
+# into every rank, runs the FFT+contract independently on each rank, and
+# produces the same output 16× — no scaling benefit from extra GPUs, plus
+# inter-node overhead that *hurts* as the mesh grows.  The sharded path below
+# distributes work across the full (P_x × P_y) mesh; for MoS2 3×3 at 16 GPU
+# it drops V_q exec from ~9 s to sub-second.
+#
+# Per q-chunk data flow
+# ---------------------
+# Let the mesh be (P_x × P_y), N_μ = n_rmu, N_G = n_G_sph (post-sphere-cutoff
+# G count), N_q the active q-chunk size.  One zeta element is 16 bytes (c128).
+#
+#   ζ_q,μ(r_tot)  shape (N_q, N_μ, n_rtot)  sharded  P(None, ('x','y'), None)
+#     ^^ read directly into this layout via SlabIO.read_slab(..., partition_spec)
+#        → per-rank bytes: 16 · N_q · (N_μ / (P_x·P_y)) · n_rtot
+#
+#   → 3-D FFT on the trailing rtot axis (rtot → G_box) — fully local (only
+#     μ is sharded; rtot is on every rank).  No wasted FFT work: each rank
+#     FFTs its own (N_μ/(P_x·P_y)) μ-rows only.
+#
+#   → phase multiply (per-q fractional shift) + sphere pick (G_box → G_flat
+#     via take(sphere_idx)) — local.  New shape (N_q, N_μ, N_G) sharded
+#     P(None, ('x','y'), None).
+#
+#   → elementwise multiply by sqrt_v(q+G) (replicated (N_q, N_G) array) —
+#     local; still P(None, ('x','y'), None).
+#
+#   --- free the μ_XY sharded post-multiply array after the two gathers
+#       capture their own copies (XLA's aliasing/SSA gets to decide when
+#       exactly but a Python `del` after the two jit calls is the hint). ---
+#
+#   → All-gather on Y   (separate jit, explicit in/out shardings):
+#         P(None, ('x','y'), None)  →  P(None, 'x', None)
+#     Result: ζ_q,μ_X(G), μ only X-sharded.  Per-rank bytes:
+#         16 · N_q · (N_μ / P_x) · N_G
+#
+#   → All-gather on X   (separate jit, parallel-issued with the Y gather):
+#         P(None, ('x','y'), None)  →  P(None, 'y', None)
+#     Result: ζ_q,ν_Y(G), ν only Y-sharded.  Per-rank bytes equal to the
+#         Y-gather when P_x = P_y.
+#
+#   → Contract  V_q[μ_X, ν_Y] = Σ_G conj(ζ_q,μ_X(G)) · ζ_q,ν_Y(G)
+#     Einsum 'qmG,qnG->qmn' on (μ_X, G) × (ν_Y, G) → (μ_X, ν_Y).
+#     Both inputs have the contraction axis (G) fully replicated and the
+#     non-contraction axes disjointly sharded, so the product is local per
+#     rank — no collective during the gemm.  Output lands natively in
+#     P(None, 'x', 'y') — the exact layout downstream sigma_sx/sigma_coh
+#     consume, so the chi0→W→V→sigma chain is reshard-free from here on.
+#
+#   → `del` both μ_X and μ_Y operands immediately after the gemm.
+#
+#   → phdf5 async write of V_q (or the full V_qmunu batch) — overlaps the
+#     next q-chunk's ζ read + FFT.  Same pattern as fit_zeta_chunked_to_h5.
+#
+# Memory model (per-rank, bytes)
+# ------------------------------
+# Let P_min = min(P_x, P_y).  The dominant live set during compute is:
+#
+#     peak ≈ 3 · N_zeta · N_q · N_μ · N_G / P_min      (two gathered copies
+#                                                       + one workspace buffer
+#                                                       for the contract temp)
+#           + N_zeta · N_q · N_G                       (sqrt_v(q+G) table,
+#                                                       replicated per rank)
+#           + N_zeta · N_q · N_μ²                      (output V_q, sharded
+#                                                       P(x,y) so typically
+#                                                       negligible per rank)
+#
+# With N_zeta = 16 and N_μ² / (P_x·P_y) small compared to the gathered μ·G
+# tiles, the first term dominates.
+#
+# Chooser policy  (``_choose_v_q_chunks`` below)
+# -----------------------------------------------
+# The caller has a per-device budget ``B`` (bytes) minus space reserved for
+# input buffers, I/O scratch, and the output accumulator.  Let
+#
+#     per_q_bytes = 3 · N_zeta · N_μ · N_G / P_min      (the "fits-one-q" cost)
+#
+# and ``max_zeta_elems`` the implied slack for the fit-sizing vocabulary the
+# user uses: ``N_zeta-that-fits := (B − N_zeta·N_G) / (3 · N_zeta / P_min)``.
+#
+#   Case A — μ fits on one q (N_zeta_fit ≥ N_μ):
+#       Q_max = floor((B − N_zeta·N_G · N_q_total) / per_q_bytes)
+#       q_chunk = min(Q_max, N_q_total)
+#       μ_chunk = N_μ  (no μ tiling needed)
+#       ν_chunk = N_μ
+#     The (N_zeta · N_G) sqrt_v table is reused for every q in the chunk
+#     so an early-rank-dense-batch wins: batching many q at once amortises
+#     sphere pick / phase compute / memory plan construction, but each extra
+#     q adds per_q_bytes/N_q × N_q to the peak.  Cap Q_max by budget and by
+#     ``N_q_total`` (the actual number of distinct q-points the caller has).
+#
+#   Case B — μ does NOT fit on one q (N_zeta_fit < N_μ):
+#       q_chunk = 1  (single q per call, non-negotiable at this budget)
+#       Then tile μ × ν into blocks (μ_chunk, ν_chunk) such that
+#            3 · N_zeta · (μ_chunk + ν_chunk) · N_G / P_min ≤ B − N_zeta·N_G
+#       Typically pick μ_chunk = ν_chunk for a square tile, giving
+#            2 · N_zeta · μ_chunk · N_G / P_min  (only two μ-slabs live
+#                                                 at once — the μ-X and
+#                                                 ν-Y gathered copies —
+#                                                 plus a small contract
+#                                                 workspace).
+#       The loop is
+#            for (μ_i, ν_j) in diagonal-first order:
+#                zeta_μ = read(μ_i ranges);  all-gather Y  →  μ_X-only
+#                if (μ_i == ν_j):
+#                    zeta_ν = zeta_μ       # same block; no second read
+#                else:
+#                    zeta_ν = read(ν_j ranges)
+#                all-gather X  → μ_Y-only
+#                V[μ_i, ν_j] = contract; write via async slab write
+#       Reading the same block twice would be pointless; having the *option*
+#       to read two blocks is gated purely on ``μ_i != ν_j`` at planning time,
+#       i.e., known statically.
+#
+# Static-time knobs summary
+# -------------------------
+#     (q_chunk, μ_chunk, ν_chunk, read_ν_separately)
+# all are Python-level ints / bools decided from (B, N_μ, N_G, N_q_total, P).
+# This keeps the jit cache tight: two compile shapes maximum (full-sized and
+# last-partial q-chunk; same story for μ-tile if Case B).
+
+
+def _choose_v_q_chunks(
+    *,
+    n_rmu: int,
+    n_G: int,
+    n_q_total: int,
+    budget_bytes: float,
+    p_x: int,
+    p_y: int,
+) -> dict:
+    """Pick (q_chunk, μ_chunk, ν_chunk) per the memory model above.
+
+    Returns a dict with keys:
+        q_chunk       : int — number of q per sharded-compute call
+        mu_chunk      : int — μ block size (== n_rmu when no tile)
+        nu_chunk      : int — ν block size (== n_rmu when no tile)
+        tiled         : bool — True ⟺ Case B (μ×ν tiling)
+        per_rank_peak : float — predicted per-rank peak bytes at this choice
+    """
+    N_zeta = 16.0  # c128
+    p_min = float(min(int(p_x), int(p_y)))
+    # sqrt_v(q+G) table lives replicated on each rank, size depends on q_chunk.
+    # Since we want q_chunk static at trace time, pick q_chunk first assuming
+    # the v-table scales linearly with it.
+
+    # Case A check: can we hold *one* q's worth of gathered μ×G?
+    one_q_bytes = 3.0 * N_zeta * n_rmu * n_G / p_min
+    v_per_q_bytes = N_zeta * n_G
+    slack_after_one_q = budget_bytes - (one_q_bytes + v_per_q_bytes)
+    if slack_after_one_q < 0:
+        # Case B — single q, tile μ×ν.
+        # Two concurrent gathered slabs of (μ_chunk × N_G) plus a small
+        # contract workspace; solve for μ_chunk with a 2× factor:
+        #     2 · N_zeta · μ_chunk · N_G / p_min ≤ budget − v_per_q
+        mu_chunk_max = max(
+            1, int((budget_bytes - v_per_q_bytes) * p_min /
+                   (2.0 * N_zeta * n_G)))
+        mu_chunk = min(n_rmu, mu_chunk_max)
+        # Snap to a μ divisor of p_x, p_y so each rank owns a whole number
+        # of μ rows in the gathered layout.
+        mu_chunk -= mu_chunk % (int(p_x) * int(p_y) or 1)
+        mu_chunk = max(int(p_x) * int(p_y), mu_chunk)
+        peak = 2.0 * N_zeta * mu_chunk * n_G / p_min + v_per_q_bytes
+        return dict(
+            q_chunk=1, mu_chunk=mu_chunk, nu_chunk=mu_chunk,
+            tiled=True, per_rank_peak=peak,
+        )
+
+    # Case A — can fit at least one q with full μ.  Fit as many as possible.
+    q_max = int((budget_bytes - v_per_q_bytes * max(1, n_q_total)) /
+                one_q_bytes) if one_q_bytes > 0 else n_q_total
+    q_chunk = max(1, min(n_q_total, q_max))
+    peak = q_chunk * one_q_bytes + q_chunk * v_per_q_bytes
+    return dict(
+        q_chunk=q_chunk, mu_chunk=n_rmu, nu_chunk=n_rmu,
+        tiled=False, per_rank_peak=peak,
+    )
+
+
+_sharded_v_q_kernel_cache: dict = {}
+
+
+def _make_sharded_v_q_kernel(
+    *,
+    q_chunk: int,
+    n_rmu: int,
+    n_G_sph: int,
+    fft_shape: tuple[int, int, int],
+    sphere_idx: jax.Array | None,
+    mesh_xy: Mesh,
+):
+    """Build (and cache) the three staged jits that compose one q-chunk of
+    the sharded V_q computation.  Kernels close over shapes so XLA's cache
+    key is stable across q-chunk calls that share these statics.
+
+    Returns a SimpleNamespace with:
+        fft_sphere_weight : P(None, ('x','y'), None) ζ(r) → P(None, ('x','y'), None) ζ(G)·√v
+        gather_y          : P(None, ('x','y'), None) → P(None, 'x', None)   (all-gather Y)
+        gather_x          : P(None, ('x','y'), None) → P(None, 'y', None)   (all-gather X)
+        contract          : (μ_X, ν_Y) → V_q sharded P(None, 'x', 'y')
+    """
+    from types import SimpleNamespace
+    cache_key = (id(mesh_xy), q_chunk, n_rmu, n_G_sph, tuple(fft_shape),
+                 id(sphere_idx))
+    hit = _sharded_v_q_kernel_cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    nx, ny, nz = fft_shape
+    n_rtot = nx * ny * nz
+
+    _mu_xy = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
+    _mu_x  = NamedSharding(mesh_xy, P(None, 'x', None))
+    _mu_y  = NamedSharding(mesh_xy, P(None, 'y', None))
+    _V_sh  = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    _rep   = NamedSharding(mesh_xy, P())
+    _phase_sh = NamedSharding(mesh_xy, P(None, None, None, None))  # (Q, nx, ny, nz) replicated
+    _sqrtv_sh = NamedSharding(mesh_xy, P(None, None))               # (Q, n_G)    replicated
+
+    @partial(jax.jit,
+             in_shardings=(_mu_xy, _sqrtv_sh, _phase_sh),
+             out_shardings=(_mu_xy, _rep))
+    def _fft_sphere_weight(zeta_r, sqrt_v, phase):
+        """FFT(r→G), phase-shift, sphere-pick, √v multiply — all local per
+        rank since μ is sharded and r/G/sqrt_v are replicated.  Returns the
+        √v-weighted ζ on the sphere AND the G=0 column (for head handling)."""
+        Q, mu_per_rank, _ = zeta_r.shape
+        zeta_box = jnp.fft.fftn(
+            zeta_r.reshape(Q, mu_per_rank, nx, ny, nz) * phase[:, None, :, :, :],
+            axes=(-3, -2, -1),
+        ).reshape(Q, mu_per_rank, n_rtot)
+        g0 = zeta_box[:, :, 0]                           # (Q, μ_xy) — kept sharded
+        if sphere_idx is not None:
+            zeta_G = jnp.take(zeta_box, sphere_idx, axis=-1)
+        else:
+            zeta_G = zeta_box
+        return zeta_G * sqrt_v[:, None, :], g0
+
+    @partial(jax.jit, in_shardings=_mu_xy, out_shardings=_mu_x)
+    def _gather_y(zeta_xy):
+        """All-gather on y: collapses the y-shard of μ back into axis-1.
+        After this call μ is only x-sharded."""
+        return jax.lax.with_sharding_constraint(zeta_xy, _mu_x)
+
+    @partial(jax.jit, in_shardings=_mu_xy, out_shardings=_mu_y)
+    def _gather_x(zeta_xy):
+        """All-gather on x: collapses the x-shard of μ back into axis-1.
+        After this call μ is only y-sharded.  Relabel as ν downstream."""
+        return jax.lax.with_sharding_constraint(zeta_xy, _mu_y)
+
+    @partial(jax.jit,
+             in_shardings=(_mu_x, _mu_y),
+             out_shardings=_V_sh)
+    def _contract(zeta_mu_X, zeta_nu_Y):
+        """V[q, μ_X, ν_Y] = Σ_G conj(ζ_μ_X(G)) · ζ_ν_Y(G).  Both operands
+        have G fully replicated; the non-contraction axes are disjointly
+        sharded (μ on x, ν on y).  XLA emits a local per-rank gemm with
+        no collective."""
+        return jnp.einsum('qmG,qnG->qmn',
+                          jnp.conj(zeta_mu_X), zeta_nu_Y, optimize=True)
+
+    kernels = SimpleNamespace(
+        fft_sphere_weight=_fft_sphere_weight,
+        gather_y=_gather_y,
+        gather_x=_gather_x,
+        contract=_contract,
+        mu_xy_sh=_mu_xy, mu_x_sh=_mu_x, mu_y_sh=_mu_y, V_sh=_V_sh,
+    )
+    _sharded_v_q_kernel_cache[cache_key] = kernels
+    return kernels
+
+
+def compute_all_V_q_sharded(
+    zeta_io,
+    kgrid: tuple[int, int, int],
+    fft_grid: tuple[int, int, int],
+    bvec: np.ndarray,
+    cell_volume: float,
+    mesh_xy: Mesh,
+    *,
+    n_rmu: int,
+    n_rtot: int,
+    sys_dim: int = 2,
+    bdot: np.ndarray | None = None,
+    mc_average_vcoul_body: bool = True,
+    bare_coulomb_cutoff: float | None = None,
+    bgw_v_grid_fn=None,
+    budget_bytes: float | None = None,
+    verbose: bool = True,
+) -> tuple[jax.Array, jax.Array]:
+    """Mesh-parallel V_q computation — the algorithm documented in the
+    big comment above.  Preferred path when ``mesh_xy`` has p_x*p_y > 1;
+    falls back to the replicated ``compute_all_V_q_from_zeta_h5`` at p=1
+    (that function remains the single-GPU reference implementation).
+
+    Returns:
+        V_qmunu  : (nkx, nky, nkz, n_rmu, n_rmu) sharded P(None,None,None,'x','y')
+        g0_mu_all: (nkx, nky, nkz, n_rmu)       sharded P(None,None,None,'x')
+    """
+    from common.progress import LoopProgress
+
+    nkx, nky, nkz = kgrid
+    nq_total = nkx * nky * nkz
+    p_x = int(mesh_xy.shape['x'])
+    p_y = int(mesh_xy.shape['y'])
+    p_min = min(p_x, p_y)
+
+    # Build the V-μν kernel bundle (sphere_idx, sqrt_v/phase helpers, etc.).
+    kernels = make_v_munu_chunked_kernel(
+        fft_grid[0], fft_grid[1], fft_grid[2], nkx, nky, nkz,
+        bvec, cell_volume, sys_dim, bdot=bdot,
+        mc_average_vcoul_body=mc_average_vcoul_body,
+        vcoul_cutoff_ry=bare_coulomb_cutoff,
+    )
+    n_G_sph = int(kernels.n_sph)
+
+    # --- Chooser ---
+    if budget_bytes is None:
+        # 28 GB/device on A100 is the sandbox default; leave some headroom.
+        budget_bytes = 24.0e9
+    choice = _choose_v_q_chunks(
+        n_rmu=n_rmu, n_G=n_G_sph, n_q_total=nq_total,
+        budget_bytes=budget_bytes, p_x=p_x, p_y=p_y,
+    )
+    if choice['tiled']:
+        raise NotImplementedError(
+            "compute_all_V_q_sharded: μ×ν tiled case (budget too tight for "
+            "full μ at even one q) is not yet implemented.  Choose a larger "
+            "memory budget or fall back to compute_all_V_q_from_zeta_h5 for "
+            "now; see the 'Case B' section in the algorithm comment for the "
+            "plan.")
+    q_chunk = int(choice['q_chunk'])
+
+    if verbose and jax.process_index() == 0:
+        print(f"  V_q (sharded): mesh={p_x}x{p_y}, q_chunk={q_chunk}, "
+              f"N_μ={n_rmu}, N_G={n_G_sph}, "
+              f"predicted peak/rank={choice['per_rank_peak']/1e9:.2f} GB")
+
+    # Build the 3 staged jits (cached by shape).
+    skernels = _make_sharded_v_q_kernel(
+        q_chunk=q_chunk, n_rmu=n_rmu, n_G_sph=n_G_sph,
+        fft_shape=fft_grid, sphere_idx=kernels.sphere_idx, mesh_xy=mesh_xy,
+    )
+
+    # Build the full list of q-coords in flat-q order, then split into chunks.
+    q_coords = [(qx, qy, qz)
+                for qx in range(nkx) for qy in range(nky) for qz in range(nkz)]
+    batches = [q_coords[i:i + q_chunk] for i in range(0, nq_total, q_chunk)]
+
+    # Output accumulators (host-side list, concatenated at the end).
+    V_pieces = []
+    g0_pieces = []
+
+    kgrid_arr = np.array([nkx, nky, nkz], dtype=np.float64)
+    V_shard = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
+    g0_shard = NamedSharding(mesh_xy, P(None, None, None, 'x'))
+
+    if not getattr(zeta_io, 'use_ffi_io', False):
+        raise RuntimeError(
+            "compute_all_V_q_sharded requires zeta_io opened with "
+            "use_ffi_io=True so reads land directly in a sharded layout.  "
+            "Without FFI phdf5, every rank would read the full ζ slab "
+            "through the allgather path — defeating the μ-sharded compute.")
+
+    # On-disk layout is (nq, n_rtot, n_rmu); reading with
+    # ``partition_spec=P(None, None, ('x','y'))`` shards n_rmu across the
+    # mesh so each rank only pulls its μ-shard off disk.  A local
+    # transpose (rtot, μ) → (μ, rtot) then lands in the kernel's expected
+    # P(None, ('x','y'), None) layout with no collective.
+    _read_spec_rtot_mu = P(None, None, ('x', 'y'))
+
+    @partial(jax.jit,
+             in_shardings=NamedSharding(mesh_xy, _read_spec_rtot_mu),
+             out_shardings=skernels.mu_xy_sh)
+    def _transpose_to_mu_first(zeta_rtot_mu):
+        """(Q, n_rtot, n_rmu) with μ on ('x','y') → (Q, n_rmu, n_rtot) with
+        μ still on ('x','y').  Local transpose, no collective — both
+        endpoints share the same mesh-axis for μ."""
+        return jnp.transpose(zeta_rtot_mu, (0, 2, 1))
+
+    def _read_batch_sharded(batch_coords):
+        """phdf5 sharded read of ζ for a q-batch.  Issues one collective
+        FFI read per batch (contiguous q-flat range is the common case);
+        the read is async at the jax level so subsequent compute jits
+        overlap the disk latency without an explicit Python thread."""
+        qvecs, q_flats = [], []
+        for (qx, qy, qz) in batch_coords:
+            qvec_nn = np.array([qx, qy, qz], dtype=np.float64)
+            qvec_wrapped = np.where(qvec_nn > kgrid_arr / 2,
+                                    qvec_nn - kgrid_arr, qvec_nn)
+            qvecs.append(qvec_wrapped)
+            q_flats.append(qx * (nky * nkz) + qy * nkz + qz)
+        Q = len(batch_coords)
+        contiguous = all(q_flats[i] == q_flats[0] + i for i in range(Q))
+        if contiguous:
+            zeta_rtot_mu = zeta_io.read_slab(
+                'zeta_q', shape=(Q, n_rtot, n_rmu), dtype=np.complex128,
+                offset=(q_flats[0], 0, 0),
+                mesh=mesh_xy, partition_spec=_read_spec_rtot_mu)
+        else:
+            slabs = [zeta_io.read_slab(
+                'zeta_q', shape=(1, n_rtot, n_rmu), dtype=np.complex128,
+                offset=(qf, 0, 0),
+                mesh=mesh_xy, partition_spec=_read_spec_rtot_mu)
+                for qf in q_flats]
+            zeta_rtot_mu = jnp.concatenate(slabs, axis=0)
+            del slabs
+        return _transpose_to_mu_first(zeta_rtot_mu), qvecs
+
+    def _prepare_sqrt_phase(qvec_list, actual_batch_size):
+        """Per-q √v(q+G) + phase; pad to q_chunk for shape-stable jits."""
+        sqrt_list, phase_list = [], []
+        for qvec_wrapped in qvec_list:
+            sv, ph = kernels.get_sqrt_v_and_phase(jnp.asarray(qvec_wrapped))
+            sqrt_list.append(sv)
+            phase_list.append(ph)
+        if actual_batch_size < q_chunk:
+            for _ in range(q_chunk - actual_batch_size):
+                sqrt_list.append(sqrt_list[0])
+                phase_list.append(phase_list[0])
+        return jnp.stack(sqrt_list, axis=0), jnp.stack(phase_list, axis=0)
+
+    @partial(jax.jit,
+             in_shardings=skernels.mu_xy_sh,
+             out_shardings=skernels.mu_xy_sh)
+    def _pad_zeta_to_q_chunk(zeta):
+        """Pad the q axis up to q_chunk by dynamic_update_slice into zeros.
+        Preserves μ-XY sharding; called only on the last partial batch."""
+        pad_shape = (q_chunk, zeta.shape[1], zeta.shape[2])
+        padded = jax.lax.with_sharding_constraint(
+            jnp.zeros(pad_shape, dtype=zeta.dtype), skernels.mu_xy_sh)
+        zero = jnp.int32(0)
+        return jax.lax.dynamic_update_slice(padded, zeta, (zero, zero, zero))
+
+    if verbose and jax.process_index() == 0:
+        print(f"  V_q (sharded): {nq_total} q-points in {len(batches)} batches "
+              f"of up to {q_chunk}", flush=True)
+    vq_progress = LoopProgress(
+        nq_total, print, title="V_q computation",
+        item_name="q-point", max_updates=min(nq_total, 20))
+
+    with timing.section("compute_all_V_q_sharded"):
+        for b_idx, batch in enumerate(batches):
+            actual = len(batch)
+            zeta_mu_xy, qvec_list = _read_batch_sharded(batch)
+            if actual < q_chunk:
+                zeta_mu_xy = _pad_zeta_to_q_chunk(zeta_mu_xy)
+            sqrt_v_batch, phase_batch = _prepare_sqrt_phase(qvec_list, actual)
+
+            # Stage 1 — FFT + sphere + √v (μ_XY-sharded, local).
+            with timing.section("fft_sphere_weight"):
+                zeta_xy, g0_xy = skernels.fft_sphere_weight(
+                    zeta_mu_xy, sqrt_v_batch, phase_batch)
+            del zeta_mu_xy    # release the r-space input
+
+            # Stage 2 — two one-axis gathers (issued back-to-back; jax's
+            # async dispatch lets XLA overlap independent NCCL streams).
+            with timing.section("gather_xy_to_x_and_y"):
+                zeta_mu_X = skernels.gather_y(zeta_xy)
+                zeta_nu_Y = skernels.gather_x(zeta_xy)
+            del zeta_xy        # both gathered copies now own the data
+
+            # Stage 3 — local per-rank gemm (no collective during contract).
+            with timing.section("contract_V"):
+                V_batch = skernels.contract(zeta_mu_X, zeta_nu_Y)
+            del zeta_mu_X, zeta_nu_Y   # free the large gathered operands
+
+            V_batch = V_batch[:actual]                                # (actual, μ, μ) P(None,'x','y')
+            g0_batch = jax.lax.with_sharding_constraint(
+                g0_xy[:actual],
+                NamedSharding(mesh_xy, P(None, 'x')))                  # (actual, μ) P(None,'x')
+            del g0_xy
+
+            V_pieces.append(V_batch)
+            g0_pieces.append(g0_batch)
+            for _ in range(actual):
+                vq_progress.step()
+
+        vq_progress.finish()
+
+    # Concatenate and reshape to final (nkx, nky, nkz, μ, μ).
+    V_flat = jnp.concatenate(V_pieces, axis=0)   # (nq_total, μ, μ)
+    g0_flat = jnp.concatenate(g0_pieces, axis=0) # (nq_total, μ)
+    del V_pieces, g0_pieces
+
+    V_qmunu = V_flat.reshape(nkx, nky, nkz, n_rmu, n_rmu)
+    g0_mu_all = g0_flat.reshape(nkx, nky, nkz, n_rmu)
+    V_qmunu = jax.lax.with_sharding_constraint(V_qmunu, V_shard)
+    g0_mu_all = jax.lax.with_sharding_constraint(g0_mu_all, g0_shard)
     return V_qmunu, g0_mu_all
