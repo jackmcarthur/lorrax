@@ -1775,22 +1775,13 @@ def compute_all_V_q_sharded(
         # === Case A — one contiguous read per q-batch; one jit call per
         # batch.  Full μ in both directions; two one-axis gathers from
         # the single post-FFT ζ(G) tensor.
-        kernel = _make_V_q_caseA_kernel(
-            q_chunk=q_chunk, n_rmu=n_rmu, n_G_sph=n_G_sph,
-            fft_shape=fft_grid, sphere_idx=kernels.sphere_idx,
-            mesh_xy=mesh_xy,
-        )
-
-        @partial(jax.jit,
-                 in_shardings=kernel.zeta_disk_sh,
-                 out_shardings=kernel.zeta_disk_sh)
-        def _pad_q(zeta):
-            pad_shape = (q_chunk, zeta.shape[1], zeta.shape[2])
-            padded = jax.lax.with_sharding_constraint(
-                jnp.zeros(pad_shape, dtype=zeta.dtype), kernel.zeta_disk_sh)
-            z = jnp.int32(0)
-            return jax.lax.dynamic_update_slice(padded, zeta, (z, z, z))
-
+        #
+        # Two-compile-shape cache: ``_make_V_q_caseA_kernel`` keys on
+        # ``q_chunk``, so calling it with ``actual`` each iter gets the
+        # full-size kernel for all-but-last batches and a second compile
+        # for the last-partial batch (the standard LORRAX pattern — see
+        # ``fit_one_rchunk`` which caches by ``actual_n_rchunk``).  No
+        # padding, no wasted compute on filler q's.
         q_coords = [(qx, qy, qz) for qx in range(nkx)
                     for qy in range(nky) for qz in range(nkz)]
         batches = [q_coords[i:i + q_chunk]
@@ -1800,6 +1791,10 @@ def compute_all_V_q_sharded(
             q_cursor = 0
             for batch in batches:
                 actual = len(batch)
+                kernel = _make_V_q_caseA_kernel(
+                    q_chunk=actual, n_rmu=n_rmu, n_G_sph=n_G_sph,
+                    fft_shape=fft_grid, sphere_idx=kernels.sphere_idx,
+                    mesh_xy=mesh_xy)
                 qvecs = [_qvec_wrap(*c) for c in batch]
                 q_flat0 = batch[0][0] * (nky * nkz) + batch[0][1] * nkz + batch[0][2]
 
@@ -1809,9 +1804,7 @@ def compute_all_V_q_sharded(
                     dtype=np.complex128,
                     offset=(q_flat0, 0, 0),
                     mesh=mesh_xy, partition_spec=_read_spec)
-                if actual < q_chunk:
-                    zeta = _pad_q(zeta)
-                sqrt_v_b, phase_b = _sqrt_v_phase_batch(qvecs, pad_to=q_chunk)
+                sqrt_v_b, phase_b = _sqrt_v_phase_batch(qvecs, pad_to=actual)
                 V_acc, g0_acc = kernel(
                     V_acc, g0_acc,
                     zeta, sqrt_v_b, phase_b,
