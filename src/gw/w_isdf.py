@@ -169,53 +169,6 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
     return _chi_scan
 
 
-def compute_chi0_minimax(
-    psi_v_xn: jax.Array, psi_v_yr: jax.Array,
-    psi_c_yr: jax.Array, psi_c_xn: jax.Array,
-    enk_v: jax.Array, enk_c: jax.Array,
-    quad, meta, mesh_xy: Mesh,
-    energy_reference: float | None = None,
-) -> jax.Array:
-    """Compute χ₀ from a LaplaceMinimaxQuadrature directly.
-
-    quad.tau and quad.alpha approximate either:
-      1/x  (static)  or  x/(x²+ωp²)  (imaginary-frequency)
-    on [x_min, x_max] where x = E_c - E_v.
-
-    The physical chi0 is:
-      χ₀ = -2 Σ_ℓ α_ℓ Σ_{v,c} |M_vc|² exp(-τ_ℓ (E_c - E_v))
-
-    A uniform energy shift is optional via ``energy_reference`` and is applied
-    to both valence and conduction energies before building the minimax factors.
-    Because only differences enter, this is algebraically invariant; the knob is
-    provided so callers can keep the implementation explicitly aligned with their
-    chosen global zero of energy (e.g. midgap or VBM).
-    """
-    _ensure_compilation_cache()
-    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
-
-    eref = 0.0 if energy_reference is None else float(energy_reference)
-    enk_v_host = np.asarray(jax.device_get(enk_v), dtype=np.float64) - eref
-    enk_c_host = np.asarray(jax.device_get(enk_c), dtype=np.float64) - eref
-    vmax = float(np.max(enk_v_host))
-    cmin = float(np.min(enk_c_host))
-    E_gap = cmin - vmax
-
-    tau = np.asarray(quad.tau, dtype=np.float64)
-    prefactor = -2.0 * np.asarray(quad.alpha, dtype=np.float64) * np.exp(-tau * E_gap)
-
-    kernel = _get_chi_minimax_kernel(mesh_xy, kgrid)
-    return kernel(
-        psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
-        enk_v - jnp.asarray(eref, dtype=enk_v.dtype),
-        enk_c - jnp.asarray(eref, dtype=enk_c.dtype),
-        jnp.asarray(tau, dtype=jnp.float64),
-        jnp.asarray(prefactor, dtype=jnp.float64),
-        jnp.asarray(vmax, dtype=jnp.float64),
-        jnp.asarray(cmin, dtype=jnp.float64),
-    )
-
-
 # ============================================================================
 # W solve with two-stage resharding (following load_wfns pattern)
 # ============================================================================
@@ -429,16 +382,49 @@ def build_imag_quadrature(quad, omega_p, minimax_config, *, print_fn=None):
     return quad_imag
 
 
-def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
+def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
     """Compute χ₀(q) from wavefunction bundle and minimax quadrature.
 
-    Returns flat-q array (nq, μ, μ).  Thin wrapper around compute_chi0_minimax.
+    Returns flat-q array (nq, μ, μ) sharded P(None, 'x', 'y').
+
+    ``quad.tau`` and ``quad.alpha`` approximate either:
+      1/x  (static)  or  x/(x²+ωp²)  (imaginary-frequency)
+    on [x_min, x_max] where x = E_c - E_v.  The physical chi0 is:
+
+      χ₀ = -2 Σ_ℓ α_ℓ Σ_{v,c} |M_vc|² exp(-τ_ℓ (E_c - E_v))
+
+    A uniform energy shift is optional via ``energy_reference`` and is
+    applied to both valence and conduction energies before building the
+    minimax factors.  Because only differences enter, this is algebraically
+    invariant; the knob is provided so callers can keep the implementation
+    explicitly aligned with their chosen global zero of energy (e.g. midgap
+    or VBM).
     """
+    _ensure_compilation_cache()
     s = wfns.slices
-    return compute_chi0_minimax(
+    enk_v = wfns.enk[:, s.val]
+    enk_c = wfns.enk[:, s.cond]
+
+    eref = 0.0 if energy_reference is None else float(energy_reference)
+    enk_v_host = np.asarray(jax.device_get(enk_v), dtype=np.float64) - eref
+    enk_c_host = np.asarray(jax.device_get(enk_c), dtype=np.float64) - eref
+    vmax = float(np.max(enk_v_host))
+    cmin = float(np.min(enk_c_host))
+    E_gap = cmin - vmax
+
+    tau = np.asarray(quad.tau, dtype=np.float64)
+    prefactor = -2.0 * np.asarray(quad.alpha, dtype=np.float64) * np.exp(-tau * E_gap)
+
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    kernel = _get_chi_minimax_kernel(mesh_xy, kgrid)
+    return kernel(
         wfns.xn(s.val), wfns.yr(s.val),
         wfns.yr(s.cond), wfns.xn(s.cond),
-        wfns.enk[:, s.val], wfns.enk[:, s.cond],
-        quad, meta, mesh_xy, energy_reference=energy_reference,
+        enk_v - jnp.asarray(eref, dtype=enk_v.dtype),
+        enk_c - jnp.asarray(eref, dtype=enk_c.dtype),
+        jnp.asarray(tau, dtype=jnp.float64),
+        jnp.asarray(prefactor, dtype=jnp.float64),
+        jnp.asarray(vmax, dtype=jnp.float64),
+        jnp.asarray(cmin, dtype=jnp.float64),
     )
 
