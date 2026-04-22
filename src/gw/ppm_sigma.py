@@ -429,11 +429,7 @@ def _make_project_ri_reduce_scatter(mesh_xy: Mesh) -> Callable[..., jax.Array]:
 def _get_sigma_kij_kernel(
     *,
     mesh_xy: Mesh,
-    nkx: int,
-    nky: int,
-    nkz: int,
-    nk_tot: int,
-    bispinor: bool,
+    kgrid: tuple[int, int, int],
 ) -> Callable[..., jax.Array]:
     """Return a jit-compatible sigma-kij kernel with device-local FFTs.
 
@@ -442,14 +438,15 @@ def _get_sigma_kij_kernel(
     _ReduceScatterGpuAccumulator expects without any downstream reshuffle.
     """
 
-    pipeline_key = (id(mesh_xy), nkx, nky, nkz, nk_tot, bispinor)
+    kgrid = tuple(int(x) for x in kgrid)
+    nk_tot = kgrid[0] * kgrid[1] * kgrid[2]
+    pipeline_key = (id(mesh_xy), kgrid)
     if pipeline_key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[pipeline_key]
 
     from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
 
     w_isdf._ensure_compilation_cache()
-    kgrid = (nkx, nky, nkz)
     _G_spec = P(None, None, None, None, 'x', None, 'y')
     _V_spec = P(None, None, None, 'x', 'y')
     _G_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _G_spec, norm='ortho')
@@ -457,25 +454,31 @@ def _get_sigma_kij_kernel(
     _V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _V_spec, norm='ortho')
     inv_sqrt_nk = -1.0 / np.sqrt(float(nk_tot))
 
-    from .greens_function_kernel import build_G as _build_G
+    from .greens_function_kernel import build_G_tau
 
     _project_ri_rs = _make_project_ri_reduce_scatter(mesh_xy)
 
     @jax.jit
     def _sigma_kij_kernel(
-        psi_coh_rmuT_X, psi_coh_rmu_Y, psi_proj_rmu_X, psi_proj_rmuT_Y,
-        Gij, W_q,
+        psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+        E_A, mask_A, E_ref_A, t_node, W_q,
     ):
         """Σ_kij = project_rs[ FFT[ G(R) · W(R) / √Nk ] ].  All flat-k.
 
         W_q is (nq, μ, μ) flat-q — same layout as all other flat-k arrays.
-        Output (Σ_ri) emerges (m_X, n_Y)-sharded from the final shard_map.
+        G(t) = build_G_tau(psi, E_A, 1j·t_node, e_ref=E_ref_A, mask=mask_A),
+        i.e. the unified ISDF-basis G builder with pure-imaginary t
+        (real-time evolution).  Output (Σ_ri) emerges (m_X, n_Y)-sharded
+        from the final shard_map.
         """
-        G_k = _build_G(psi_coh_rmuT_X, psi_coh_rmu_Y, Gij=Gij)
+        G_k = build_G_tau(
+            psi_coh_xn, psi_coh_yr, E_A, 1j * t_node,
+            e_ref=E_ref_A, mask=mask_A,
+        )
         G_R = _G_ifftn(G_k)
         V_R = _V_ifftn(W_q)[:, None, :, None, :]  # (nk,1,μ,1,μ) broadcast to G shape
         sigma_k = _G_fftn(G_R * V_R * inv_sqrt_nk)
-        return _project_ri_rs(psi_proj_rmu_X, sigma_k, psi_proj_rmuT_Y)
+        return _project_ri_rs(psi_proj_xr, sigma_k, psi_proj_yn)
 
     _sigma_kij_kernel_cache[pipeline_key] = _sigma_kij_kernel
     return _sigma_kij_kernel
@@ -484,54 +487,43 @@ def _get_sigma_kij_kernel(
 def _get_sigma_tau_kernel(
     *,
     mesh_xy: Mesh,
-    nkx: int,
-    nky: int,
-    nkz: int,
-    nk_tot: int,
-    bispinor: bool,
+    kgrid: tuple[int, int, int],
 ) -> Callable[..., jax.Array]:
     """Return a cached tau-node sigma builder with jittable local FFTs."""
 
-    cache_key = (id(mesh_xy), nkx, nky, nkz, nk_tot, bispinor)
+    kgrid = tuple(int(x) for x in kgrid)
+    cache_key = (id(mesh_xy), kgrid)
     if cache_key in _sigma_tau_kernel_cache:
         return _sigma_tau_kernel_cache[cache_key]
 
     w_isdf._ensure_compilation_cache()
     q_mu_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    sigma_kij_kernel = _get_sigma_kij_kernel(
-        mesh_xy=mesh_xy, nkx=nkx, nky=nky, nkz=nkz,
-        nk_tot=nk_tot, bispinor=bispinor,
-    )
+    sigma_kij_kernel = _get_sigma_kij_kernel(mesh_xy=mesh_xy, kgrid=kgrid)
 
     @jax.jit
-    def _build_tau_operands(
-        E_A, mask_A, B_q, Omega_q, mask_B,
-        E_ref_A, E_ref_B, t_node, eye_nb,
-    ):
-        phase_A = jnp.exp(-1j * (E_A - E_ref_A) * t_node)
-        weights_kn = jnp.where(mask_A, phase_A, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
-        Gij = eye_nb[None, :, :] * weights_kn[:, :, None]
+    def _build_W_t_q(B_q, Omega_q, mask_B, E_ref_B, t_node):
+        """W(τ) = Σ_q B_q · exp(-i·(Ω_q - E_ref_B)·τ) · mask_B.
 
+        (A-side G now built inside sigma_kij_kernel via build_G_tau, so
+        the tau-operand helper only shapes the PPM-pole-sum B-side.)
+        """
         phase_B = jnp.exp(-1j * (Omega_q - E_ref_B) * t_node)
-        W_t_q = jnp.where(mask_B, B_q * phase_B, jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
-        W_t_q = jax.lax.with_sharding_constraint(W_t_q, q_mu_shard)
-        return Gij, W_t_q
+        W_t_q = jnp.where(mask_B, B_q * phase_B,
+                          jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
+        return jax.lax.with_sharding_constraint(W_t_q, q_mu_shard)
 
     @jax.jit
     def _tau_kernel(
-        psi_coh_rmuT_X, psi_coh_rmu_Y,
-        psi_proj_rmu_X, psi_proj_rmuT_Y,
+        psi_coh_xn, psi_coh_yr,
+        psi_proj_xr, psi_proj_yn,
         E_A, mask_A, B_q, Omega_q, mask_B,
-        E_ref_A, E_ref_B, t_node, eye_nb,
+        E_ref_A, E_ref_B, t_node,
     ):
-        Gij, W_t_q = _build_tau_operands(
-            E_A, mask_A, B_q, Omega_q, mask_B,
-            E_ref_A, E_ref_B, t_node, eye_nb,
-        )
+        W_t_q = _build_W_t_q(B_q, Omega_q, mask_B, E_ref_B, t_node)
         return sigma_kij_kernel(
-            psi_coh_rmuT_X, psi_coh_rmu_Y,
-            psi_proj_rmu_X, psi_proj_rmuT_Y,
-            Gij, W_t_q,
+            psi_coh_xn, psi_coh_yr,
+            psi_proj_xr, psi_proj_yn,
+            E_A, mask_A, E_ref_A, t_node, W_t_q,
         )
 
     _sigma_tau_kernel_cache[cache_key] = _tau_kernel
@@ -541,11 +533,7 @@ def _get_sigma_tau_kernel(
 def _get_sigma_tau_scan_kernel(
     *,
     mesh_xy: Mesh,
-    nkx: int,
-    nky: int,
-    nkz: int,
-    nk_tot: int,
-    bispinor: bool,
+    kgrid: tuple[int, int, int],
 ) -> Callable[..., jax.Array]:
     """Cached factory: runs an entire window's τ nodes in one jax.lax.scan.
 
@@ -559,14 +547,12 @@ def _get_sigma_tau_scan_kernel(
     amortized over hundreds of τ nodes each.  If retraces become costly,
     pad all windows to max(n_τ) and mask in the scan body.
     """
-    cache_key = (id(mesh_xy), nkx, nky, nkz, nk_tot, bispinor)
+    kgrid = tuple(int(x) for x in kgrid)
+    cache_key = (id(mesh_xy), kgrid)
     if cache_key in _sigma_tau_scan_cache:
         return _sigma_tau_scan_cache[cache_key]
 
-    tau_kernel = _get_sigma_tau_kernel(
-        mesh_xy=mesh_xy, nkx=nkx, nky=nky, nkz=nkz,
-        nk_tot=nk_tot, bispinor=bispinor,
-    )
+    tau_kernel = _get_sigma_tau_kernel(mesh_xy=mesh_xy, kgrid=kgrid)
 
     @jax.jit
     def _scan_window(
@@ -574,9 +560,9 @@ def _get_sigma_tau_scan_kernel(
         # per-τ (stacked on leading axis):
         t_nodes, alpha_nodes,
         # window constants:
-        psi_coh_rmuT_X, psi_coh_rmu_Y, psi_proj_rmu_X, psi_proj_rmuT_Y,
+        psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
         E_A, mask_A, B_q, Omega_q, mask_B,
-        E_ref_A, E_ref_B, eye_nb,
+        E_ref_A, E_ref_B,
         omega_vec, pref, omega_sign, project_code,
     ):
         E_ref_sum = E_ref_A + E_ref_B
@@ -584,10 +570,10 @@ def _get_sigma_tau_scan_kernel(
         def body(acc, xs):
             t_node, alpha_node = xs
             sigma_re, sigma_im = tau_kernel(
-                psi_coh_rmuT_X, psi_coh_rmu_Y,
-                psi_proj_rmu_X, psi_proj_rmuT_Y,
+                psi_coh_xn, psi_coh_yr,
+                psi_proj_xr, psi_proj_yn,
                 E_A, mask_A, B_q, Omega_q, mask_B,
-                E_ref_A, E_ref_B, t_node, eye_nb,
+                E_ref_A, E_ref_B, t_node,
             )
             # α_eff = α(τ) · exp[-i·(E_ref_A + E_ref_B)·τ]  — minimax quad
             # weight with the phase shift absorbed into each τ node.
@@ -1054,11 +1040,10 @@ def _integrate_tau_windows_for_branch(
     B_q: jax.Array,
     Omega_q: jax.Array,
     base_mask_B: jax.Array,
-    psi_coh_rmuT_X: jax.Array,
-    psi_coh_rmu_Y: jax.Array,
-    psi_proj_rmu_X: jax.Array,
-    psi_proj_rmuT_Y: jax.Array,
-    eye_nb: jax.Array,
+    psi_coh_xn: jax.Array,
+    psi_coh_yr: jax.Array,
+    psi_proj_xr: jax.Array,
+    psi_proj_yn: jax.Array,
     tau_kernel: Callable[..., jax.Array],
     tau_scan_kernel: Callable[..., jax.Array] | None,
     mesh_xy: Mesh,
@@ -1144,14 +1129,13 @@ def _integrate_tau_windows_for_branch(
                         t_nodes=t_nodes_j,
                         alpha_nodes=alpha_nodes_j,
                         window_args=dict(
-                            psi_coh_rmuT_X=psi_coh_rmuT_X,
-                            psi_coh_rmu_Y=psi_coh_rmu_Y,
-                            psi_proj_rmu_X=psi_proj_rmu_X,
-                            psi_proj_rmuT_Y=psi_proj_rmuT_Y,
+                            psi_coh_xn=psi_coh_xn,
+                            psi_coh_yr=psi_coh_yr,
+                            psi_proj_xr=psi_proj_xr,
+                            psi_proj_yn=psi_proj_yn,
                             E_A=E_A, mask_A=mask_A,
                             B_q=B_q, Omega_q=Omega_q, mask_B=mask_B,
                             E_ref_A=E_ref_A_j, E_ref_B=E_ref_B_j,
-                            eye_nb=eye_nb,
                             omega_vec=omega_vec, pref=pref_j,
                             omega_sign=omega_sign_j,
                             project_code=project_code_j,
@@ -1176,10 +1160,10 @@ def _integrate_tau_windows_for_branch(
                     # emit.  See _combine_coeff_with_sigma_tau for the
                     # downstream recombination.
                     sigma_tau_kij_re, sigma_tau_kij_im = tau_kernel(
-                        psi_coh_rmuT_X, psi_coh_rmu_Y,
-                        psi_proj_rmu_X, psi_proj_rmuT_Y,
+                        psi_coh_xn, psi_coh_yr,
+                        psi_proj_xr, psi_proj_yn,
                         E_A, mask_A, B_q, Omega_q, mask_B,
-                        E_ref_A_j, E_ref_B_j, t_node_j, eye_nb,
+                        E_ref_A_j, E_ref_B_j, t_node_j,
                     )
                     sigma_tau_kij_re.block_until_ready()
                     progress.step()
@@ -1237,12 +1221,12 @@ def _run_sigma_branch(
     n_omega = int(omega_nonneg_ry.shape[0])
 
     s = wfns.slices
-    psi_coh_rmuT_X = wfns.xn(s.full)
-    psi_coh_rmu_Y = wfns.yr(s.full)
-    psi_proj_rmu_X = wfns.xr(s.sigma)
-    psi_proj_rmuT_Y = wfns.yn(s.sigma)
-    nk_proj = int(psi_proj_rmu_X.shape[0])
-    nb_proj = int(psi_proj_rmu_X.shape[1])
+    psi_coh_xn = wfns.xn(s.full)
+    psi_coh_yr = wfns.yr(s.full)
+    psi_proj_xr = wfns.xr(s.sigma)
+    psi_proj_yn = wfns.yn(s.sigma)
+    nk_proj = int(psi_proj_xr.shape[0])
+    nb_proj = int(psi_proj_xr.shape[1])
 
     if n_omega == 0:
         return jnp.zeros((0, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), []
@@ -1263,11 +1247,9 @@ def _run_sigma_branch(
         return jnp.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), []
 
     omega_vec = jnp.asarray(omega_nonneg_ry, dtype=jnp.float64)
-    eye_nb = jnp.eye(E_A.shape[1], dtype=jnp.complex128)
     tau_kernel = _get_sigma_tau_kernel(
         mesh_xy=mesh_xy,
-        nkx=int(meta.nkx), nky=int(meta.nky), nkz=int(meta.nkz),
-        nk_tot=int(meta.nk_tot), bispinor=bool(meta.bispinor),
+        kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
     )
     # lax.scan variant is available (see _get_sigma_tau_scan_kernel) but
     # NOT wired by default.  At MoS2 3×3 scale (276 τ, 5 s Python-loop
@@ -1303,9 +1285,9 @@ def _run_sigma_branch(
     _integrate_tau_windows_for_branch(
         windows=windows, omega_vec=omega_vec, accumulator=accumulator,
         E_A=E_A, B_q=B_q, Omega_q=Omega_q, base_mask_B=base_mask_B,
-        psi_coh_rmuT_X=psi_coh_rmuT_X, psi_coh_rmu_Y=psi_coh_rmu_Y,
-        psi_proj_rmu_X=psi_proj_rmu_X, psi_proj_rmuT_Y=psi_proj_rmuT_Y,
-        eye_nb=eye_nb, tau_kernel=tau_kernel,
+        psi_coh_xn=psi_coh_xn, psi_coh_yr=psi_coh_yr,
+        psi_proj_xr=psi_proj_xr, psi_proj_yn=psi_proj_yn,
+        tau_kernel=tau_kernel,
         tau_scan_kernel=tau_scan_kernel,
         mesh_xy=mesh_xy,
         scale=scale,
@@ -1335,7 +1317,7 @@ def compute_sigma_c_ppm_omega_grid(
     """Compute Σ^c_kij(ω) via GN-PPM windowed minimax integration."""
 
     s = wfns.slices
-    psi_proj_rmu_X = wfns.xr(s.sigma)
+    psi_proj_xr = wfns.xr(s.sigma)
     enk_full = wfns.enk[:, s.full]
     occ_full = wfns.occ[:, s.full]
     B_q = ppm.B_q
@@ -1421,8 +1403,8 @@ def compute_sigma_c_ppm_omega_grid(
         )
 
     # Accumulation mode
-    nk_proj = int(psi_proj_rmu_X.shape[0])
-    nb_proj = int(psi_proj_rmu_X.shape[1])
+    nk_proj = int(psi_proj_xr.shape[0])
+    nb_proj = int(psi_proj_xr.shape[1])
     kij_bytes = float(omega_req.size * nk_proj * nb_proj * nb_proj * 16)
     use_kij_accum = omega_accumulation == "kij"
     use_kij_stream = omega_accumulation == "kij_stream"
