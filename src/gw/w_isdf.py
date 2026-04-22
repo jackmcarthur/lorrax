@@ -50,30 +50,18 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 
-    # Flat-k FFT helpers — callers see only (nk, *trail) arrays.
+    # Sharding specs.  Both Gv_k and Gc_k carry the natural 5-D ψ layout
+    # P(_, _, 'x', _, 'y') — μ_X on x (from the _rmuT_X ψ), μ_Y on y (from
+    # the _rmu_Y ψ).  chi_R inherits P(_, 'x', 'y'), already aligned with V
+    # for the downstream W-solve, so no reshard at the hand-off.
     #
-    # Historical form had Gv via ifftn (sign +ikR) and Gc via fftn (sign -ikR),
-    # with einsum 'Rambn, Rbnam -> Rmn' swapping the μ_m/μ_n positions across
-    # the two operands.  That forced Gc (or Gv) to reshard its μ sharding to
-    # make the contracted index consistent, and landed chi_R in
-    # P(None, 'y', 'x') — which then had to reshard AGAIN at the hand-off to
-    # the W-solve (which consumes chi in P(None, 'x', 'y')).
-    #
-    # We exploit G's per-k Hermitian property ``G_k(μ,ν) = G_k(ν,μ)*``.  After
-    # FT, ``G_R(μ,ν) = G_{-R}(ν,μ)*``, so running Gv's k→R with the SAME sign
-    # as Gc's (both fftn, not one fft + one ifft) gives a Gv_R that equals
-    # ``conj(original_Gv_R)`` with (μ_m, μ_n) swapped to the Gc-natural order.
-    # The chi0 einsum then collapses to an element-wise product + spin sum:
-    #
-    #    chi_R(m,n) = Σ_{a,b} Gc_R(a,m,b,n) · conj(Gv_R(a,m,b,n))
-    #
-    # identical index order on both operands, no reshard.  Verified to
-    # machine precision against the original formulation.
-    #
-    # Both Gs now share their natural 5-D sharding P(_, _, 'x', _, 'y')
-    # (μ_first on x from psi_xn, μ_second on y from psi_yr).  chi_R inherits
-    # P(_, 'x', 'y') naturally — aligned with V for W-solve, so the post-chi0
-    # reshard into the fused W-solve drops out too.
+    # The chi_R einsum is element-wise (identical index order on both Gs)
+    # because we exploit G's per-k Hermiticity: G_k(μ,ν) = G_k(ν,μ)* implies
+    # G_R(μ,ν) = G_{-R}(ν,μ)*, so running Gv's k→R with the SAME sign as Gc's
+    # (both fftn, not one fft + one ifft) gives a Gv_R that already has the
+    # (μ_m, μ_n) order of Gc_R up to a conj.  Hence:
+    #     chi_R(m,n) = Σ_{a,b} Gc_R(a,m,b,n) · conj(Gv_R(a,m,b,n))
+    # with no μ-axis reshard and no swapped-index einsum.
     _G_spec         = P(None, None, None, None, 'x', None, 'y')    # 7-D FFT form
     _G_out_flatk    = P(None, None, 'x', None, 'y')                # 5-D flat-k form
     _chi_spec       = P(None, None, None, 'x', 'y')                # 5-D chi FFT form
@@ -99,23 +87,33 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
     @partial(jax.jit,
              in_shardings=(NamedSharding(mesh_xy, _psi_xn_spec),
                             NamedSharding(mesh_xy, _psi_yr_spec),
-                            NamedSharding(mesh_xy, _psi_yr_spec),
-                            NamedSharding(mesh_xy, _psi_xn_spec),
                             NamedSharding(mesh_xy, _rep1),
-                            NamedSharding(mesh_xy, _rep1),
-                            NamedSharding(mesh_xy, _rep0),
                             NamedSharding(mesh_xy, _rep0),
                             NamedSharding(mesh_xy, _rep0)),
-             out_shardings=(_G_k_shard, _G_k_shard))
-    def _build_G(psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
-                 enk_v, enk_c, tau_scalar, vmax, cmin):
+             out_shardings=_G_k_shard)
+    def _build_Gv(psi_v_xn, psi_v_yr, enk_v, tau_scalar, vmax):
+        """Gv_k = Σ_n e^{-τ(vmax − e_nv)} ψ_v(μ_X, n) ψ_v*(μ_Y, n).
+
+        Returned conjugated so the Gc/Gv index order matches downstream (see
+        file-level note on the Hermitian swap trick)."""
         phases_v = jnp.exp(-tau_scalar * (vmax - enk_v))
+        Gv_k = _build_G_mm(psi_v_xn, psi_v_yr, phases=phases_v)
+        return jnp.conj(jax.lax.with_sharding_constraint(Gv_k, _G_k_shard))
+
+    @partial(jax.jit,
+             in_shardings=(NamedSharding(mesh_xy, _psi_xn_spec),
+                            NamedSharding(mesh_xy, _psi_yr_spec),
+                            NamedSharding(mesh_xy, _rep1),
+                            NamedSharding(mesh_xy, _rep0),
+                            NamedSharding(mesh_xy, _rep0)),
+             out_shardings=_G_k_shard)
+    def _build_Gc(psi_c_xn, psi_c_yr, enk_c, tau_scalar, cmin):
+        """Gc_k = Σ_n e^{-τ(e_nc − cmin)} ψ_c(μ_X, n) ψ_c*(μ_Y, n).
+
+        Returned conjugated to match _build_Gv (see that docstring)."""
         phases_c = jnp.exp(-tau_scalar * (enk_c - cmin))
-        Gv_k = jax.lax.with_sharding_constraint(
-            _build_G_mm(psi_v_xn, psi_v_yr, phases=phases_v), _G_k_shard)
-        Gc_k = jax.lax.with_sharding_constraint(
-            _build_G_mm(psi_c_xn, psi_c_yr, phases=phases_c), _G_k_shard)
-        return jnp.conj(Gv_k), jnp.conj(Gc_k)
+        Gc_k = _build_G_mm(psi_c_xn, psi_c_yr, phases=phases_c)
+        return jnp.conj(jax.lax.with_sharding_constraint(Gc_k, _G_k_shard))
 
     @partial(jax.jit,
              in_shardings=(NamedSharding(mesh_xy, _psi_xn_spec),
@@ -142,11 +140,8 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
 
         def _body(chi_R_acc, xs):
             tau_scalar, prefactor_scalar = xs
-            Gv_k, Gc_k = _build_G(psi_v_xn, psi_v_yr,
-                                    psi_c_yr, psi_c_xn,
-                                    enk_v, enk_c, tau_scalar, vmax, cmin)
-            Gv_R = _Gv_fftn(Gv_k)
-            Gc_R = _Gc_fftn(Gc_k)
+            Gv_R = _Gv_fftn(_build_Gv(psi_v_xn, psi_v_yr, enk_v, tau_scalar, vmax))
+            Gc_R = _Gc_fftn(_build_Gc(psi_c_xn, psi_c_yr, enk_c, tau_scalar, cmin))
             # chi_R(m, n) = Σ_{a,b} Gc_R(a,m,b,n) · conj(Gv_R(a,m,b,n))
             chi_tau = jax.lax.with_sharding_constraint(
                 jnp.einsum('Rambn,Rambn->Rmn',
