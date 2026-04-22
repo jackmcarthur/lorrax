@@ -292,7 +292,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		try:
 			from gw.aot_memory_model import (
 				predict_kernel_peak, SysDims, MeshSpec, Knobs,
-				choose_chunks_analytic, describe_chunks,
+				choose_chunks_analytic, choose_chunks_heuristic,
+				describe_chunks,
 			)
 			p_x, p_y = mesh_xy.devices.shape
 			# n_b = UNION range (bytes of psi_G cache / band-chunk FFT).
@@ -316,11 +317,22 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			)
 			aot_mesh = MeshSpec(p_x=int(p_x), p_y=int(p_y))
 			if cfg.use_aot_chunk_chooser:
-				choice = choose_chunks_analytic(
-					aot_sys, aot_mesh,
-					budget_bytes=cfg.memory_per_device_gb * 1e9 * cfg.chunk_target_utilization,
-					kernel_name="fit_one_rchunk", tag="current",
-				)
+				# 20/80 heuristic is the default — simpler, no DoE deps.
+				# Falls back to the regressed-fit analytic chooser if
+				# the user sets LORRAX_CHOOSER_MODE=analytic.
+				_mode = os.environ.get("LORRAX_CHOOSER_MODE", "heuristic")
+				budget = (cfg.memory_per_device_gb * 1e9
+				          * cfg.chunk_target_utilization)
+				if _mode == "analytic":
+					choice = choose_chunks_analytic(
+						aot_sys, aot_mesh,
+						budget_bytes=budget,
+						kernel_name="fit_one_rchunk", tag="current",
+					)
+				else:
+					choice = choose_chunks_heuristic(
+						aot_sys, aot_mesh, budget_bytes=budget,
+					)
 				print_fn(f"    {describe_chunks(choice)}")
 				# Override the heuristic's chunk_r / band_chunk.  Keep
 				# q_chunk, q_gather, k_chunk from the old chooser since

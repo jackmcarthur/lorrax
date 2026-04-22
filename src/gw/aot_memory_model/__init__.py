@@ -37,6 +37,7 @@ from .chooser import (
     ChunkChoice,
     choose_chunks_analytic,
     choose_chunks_aot,
+    choose_chunks_heuristic,
     describe_chunks,
 )
 from .doe import build_doe_axes
@@ -53,6 +54,7 @@ __all__ = [
     "build_doe_axes",
     "choose_chunks_analytic",
     "choose_chunks_aot",
+    "choose_chunks_heuristic",
     "describe_chunks",
     "fit_cost_from_saved",
     "fit_cost_nnls",

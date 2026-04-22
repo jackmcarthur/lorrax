@@ -393,3 +393,178 @@ def describe_chunks(choice: ChunkChoice) -> str:
             f"peak={choice.peak_bytes/1e9:.2f} GB / "
             f"{choice.budget_bytes/1e9:.2f} GB = {util:.0f}%, "
             f"total={choice.total_flops/1e9:.1f} GF)")
+
+
+# ===========================================================================
+# 20 / 80 heuristic chooser — simpler and DoE-independent
+# ===========================================================================
+#
+# Motivation: the analytic chooser's cost model nominally wants to
+# minimise FLOPs, but total FLOPs for the ISDF fit is essentially
+# chunk-invariant (same work, just partitioned differently) — per-call
+# overhead dominates.  So "optimise FLOPs" degenerates to "make bc=1
+# with the biggest possible chunk_r", which is bad for GPU
+# occupancy and creates too-small pair-density einsums.
+#
+# The practical rule — reserve a fraction of the budget for the
+# wavefunction workspace and let the rest cover the rchunk work:
+#
+#     wfn_budget  = frac · budget          (default frac = 0.2)
+#     rchunk_budget = (1 - frac) · budget
+#
+# Within wfn_budget, size (band_chunk × k_chunk) so the FFT workspace
+# fits.  Production's load_psi_rchunk_fft β[psi_G]=3 tells us each
+# wavefunction needs ~3× its own size in transient workspace (input +
+# output + cuFFT scratch).  So:
+#
+#     per_wfn_bytes = 3 · 16 · n_s · n_r / (p_x · p_y)
+#     n_wfn_max    = wfn_budget / per_wfn_bytes
+#
+# Split n_wfn_max into (k_chunk × band_chunk) the way the user asked:
+# if n_wfn_max >= n_k, use all k per call (k_chunk = n_k) and set
+# band_chunk = n_wfn_max / n_k.  Otherwise, band_chunk = 1 and
+# k_chunk = n_wfn_max.
+#
+# Within rchunk_budget, the dominant cost is 4 pair-sized temps from
+# the ZCT stage (β[pair]=4 from zct_lr, confirmed in fit_one_rchunk).
+# Solve:
+#
+#     4 · 16 · n_k · n_rmu · chunk_r / (p_x · p_y)  +  base_persistent
+#                                                ≤ rchunk_budget
+#     → chunk_r ≤ (rchunk_budget − base) / (64 · n_k · n_rmu / P)
+#
+# where base_persistent is the always-alive centroid + L_q bytes
+# (tiny at MoS2/Si scales; we compute it exactly).
+
+
+def choose_chunks_heuristic(
+    sys: SysDims,
+    mesh: MeshSpec,
+    *,
+    budget_bytes: float,
+    wfn_workspace_frac: float = 0.20,
+    pair_temp_count: int = 4,
+    fft_workspace_multiplier: int = 3,
+    q_gather_min: int = 1,
+) -> ChunkChoice:
+    """Budget-split chunk chooser.
+
+    Reserves ``wfn_workspace_frac`` of the budget for the wavefunction
+    FFT workspace (driving band_chunk × k_chunk), and the rest for the
+    r-chunk's pair-density temps and intermediates (driving chunk_r).
+
+    No DoE, no AOT fit lookups — just closed-form algebra on
+    physically-motivated coefficients from the small-kernel fits:
+
+        β[psi_G]=3      (load_psi_rchunk_fft — per-wfn FFT workspace)
+        β[PrBr]=4       (zct_lr — concurrent pair-sized ZCT temps)
+
+    Much more robust than the regressed chooser across untested
+    (system, mesh) combinations — has one free parameter
+    (``wfn_workspace_frac``) instead of a 7-primitive fit with known
+    DoE degeneracies.
+    """
+    p_x, p_y = int(mesh.p_x), int(mesh.p_y)
+    P = p_x * p_y
+    n_k = int(sys.n_k)
+    mu = int(sys.n_rmu)
+    n_s = int(sys.n_s)
+    n_b = int(sys.n_b)
+    fft_shape = sys.fft_shape
+    n_r = sys.n_r or (fft_shape[0] * fft_shape[1] * fft_shape[2])
+
+    # --- 1. Split budget ---
+    wfn_budget = wfn_workspace_frac * budget_bytes
+    rchunk_budget = budget_bytes - wfn_budget
+
+    # --- 2. Pick (band_chunk, k_chunk) for the wfn workspace ---
+    # Bytes for one (k, band) wavefunction shard + its FFT workspace.
+    per_wfn_bytes = fft_workspace_multiplier * 16.0 * n_s * n_r / P
+    n_wfn_max = int(wfn_budget / max(1.0, per_wfn_bytes))
+
+    if n_wfn_max >= n_k:
+        # Fits all k at once — keep k_chunk = n_k (load everything
+        # per call, which is the normal production pattern) and
+        # size band_chunk within the remaining budget.
+        k_chunk = n_k
+        band_chunk = max(1, min(n_b, n_wfn_max // n_k))
+    else:
+        # Even one band per call doesn't fit all k; shrink k_chunk.
+        # This is the "user-priority-4" regime where band_chunk=1
+        # first, then we whittle down k.
+        band_chunk = 1
+        k_chunk = max(1, n_wfn_max)
+
+    # Mesh-divisibility: band_chunk must be ≥ p (for band-sharding).
+    # Round band_chunk down to largest p-multiple ≤ current choice.
+    if band_chunk >= P:
+        band_chunk = (band_chunk // P) * P
+    else:
+        # Below p — keep band_chunk at the smallest valid multiple
+        # of P (which is P itself); fall back to k_chunk reduction.
+        band_chunk = P
+        # Re-check the wfn budget at bc=P
+        if n_k * band_chunk > n_wfn_max:
+            k_chunk = max(1, n_wfn_max // band_chunk)
+
+    # --- 3. Pick chunk_r from the rchunk_budget ---
+    # Persistent (always alive): 2 centroids + psi_G cache + L_q.
+    nb_sum = sys.nb_sum
+    base_centroid = 16.0 * n_k * mu * nb_sum * n_s / p_x
+    base_psiG     = 16.0 * n_k * n_b * n_s * n_r / P
+    base_Lq       = 16.0 * n_k * mu * mu / P      # sharded L_q
+    base_persistent = base_centroid + base_psiG + base_Lq
+
+    # Dominant chunk_r-linear term: pair_temp_count × 16·n_k·μ·cr/P
+    cr_per_byte = pair_temp_count * 16.0 * n_k * mu / P
+
+    headroom = rchunk_budget - base_persistent
+    if headroom <= 0:
+        # Persistent alone exceeds 80% budget — fallback: use whole
+        # budget and accept a tight fit.
+        headroom = budget_bytes - base_persistent
+        if headroom <= 0:
+            raise ValueError(
+                f"Persistent state ({base_persistent/1e9:.2f} GB) "
+                f"exceeds full budget ({budget_bytes/1e9:.2f} GB)")
+
+    # Post-jit allgather bound (from Phase C earlier work):
+    allgather_cap = int(0.8 * budget_bytes / max(1.0, 16.0 * q_gather_min * mu))
+
+    n_rtot = sys.n_r or (fft_shape[0] * fft_shape[1] * fft_shape[2])
+    chunk_r = int(min(n_rtot, headroom / cr_per_byte, allgather_cap))
+    # p-divisible for shard_map:
+    chunk_r = (chunk_r // P) * P
+    if chunk_r <= 0:
+        raise ValueError(
+            f"No feasible chunk_r under budget {budget_bytes/1e9:.2f} GB; "
+            f"persistent {base_persistent/1e9:.2f} GB, "
+            f"allgather cap {allgather_cap}")
+
+    # --- 4. Compute predicted peak for logging ---
+    predicted_peak = base_persistent + cr_per_byte * chunk_r
+    # Plus wfn workspace contribution (transient, per call):
+    wfn_contribution = band_chunk * k_chunk * per_wfn_bytes
+    predicted_peak_total = predicted_peak + wfn_contribution
+
+    def _ceil_div_local(a, b):
+        return (a + b - 1) // b
+
+    num_r = _ceil_div_local(n_rtot, chunk_r)
+    num_bc = _ceil_div_local(n_b, band_chunk) * _ceil_div_local(n_k, k_chunk)
+
+    return ChunkChoice(
+        chunk_r=chunk_r,
+        band_chunk=band_chunk,
+        k_chunk=k_chunk,
+        num_r_chunks=num_r,
+        num_bc_chunks=num_bc,
+        peak_bytes=predicted_peak_total,
+        per_call_flops=0.0,  # N/A — heuristic doesn't use FLOPs
+        total_flops=0.0,
+        budget_bytes=budget_bytes,
+        note=(f"heuristic {int(100*wfn_workspace_frac)}/{int(100*(1-wfn_workspace_frac))}: "
+              f"wfn={wfn_contribution/1e9:.2f}GB (cap {wfn_budget/1e9:.2f}GB), "
+              f"rchunk={cr_per_byte*chunk_r/1e9:.2f}GB, "
+              f"persistent={base_persistent/1e9:.2f}GB"),
+    )
