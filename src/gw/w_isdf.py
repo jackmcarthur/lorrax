@@ -44,9 +44,8 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
     """Build chi0 kernel with device-local FFTs.  Returns flat-q χ₀(nq, μ, μ)."""
     from common.fft_helpers import make_flat_k_fftn
 
-    nkx, nky, nkz = kgrid
-    nk = nkx * nky * nkz
-    cache_key = (id(mesh_xy), nkx, nky, nkz)
+    nk = int(kgrid[0]) * int(kgrid[1]) * int(kgrid[2])
+    cache_key = (id(mesh_xy), tuple(int(x) for x in kgrid))
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 
@@ -83,7 +82,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
     _Gc_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
     _chi_fftn_local = make_flat_k_fftn(mesh_xy, kgrid, _chi_spec, norm='ortho')
 
-    from .greens_function_kernel import build_G as _build_G_mm
+    from .greens_function_kernel import build_G_tau
 
     # Shardings for psi inputs (carried at the caller's natural layout; 'x' on
     # the μ_X axis for the _xn variant, 'y' on the μ_Y axis for the _yr one).
@@ -107,14 +106,18 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
                             NamedSharding(mesh_xy, _rep0),
                             NamedSharding(mesh_xy, _rep0)),
              out_shardings=(_G_k_shard, _G_k_shard))
-    def _build_G(psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
-                 enk_v, enk_c, tau_scalar, vmax, cmin):
-        phases_v = jnp.exp(-tau_scalar * (vmax - enk_v))
-        phases_c = jnp.exp(-tau_scalar * (enk_c - cmin))
+    def _build_Gv_Gc(psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
+                    enk_v, enk_c, tau_scalar, vmax, cmin):
+        # phases_v = exp(-τ (vmax - e_v)) = exp(-(-τ)(e_v - vmax))  → t=-τ, e_ref=vmax
+        # phases_c = exp(-τ (e_c - cmin))                            → t=+τ, e_ref=cmin
         Gv_k = jax.lax.with_sharding_constraint(
-            _build_G_mm(psi_v_xn, psi_v_yr, phases=phases_v), _G_k_shard)
+            build_G_tau(psi_v_xn, psi_v_yr, enk_v, -tau_scalar, e_ref=vmax),
+            _G_k_shard)
         Gc_k = jax.lax.with_sharding_constraint(
-            _build_G_mm(psi_c_xn, psi_c_yr, phases=phases_c), _G_k_shard)
+            build_G_tau(psi_c_xn, psi_c_yr, enk_c,  tau_scalar, e_ref=cmin),
+            _G_k_shard)
+        # Hermitian-swap conj (see FFT-convention block comment above) —
+        # belongs at the call site, NOT inside build_G_tau.
         return jnp.conj(Gv_k), jnp.conj(Gc_k)
 
     @partial(jax.jit,
@@ -142,9 +145,9 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
 
         def _body(chi_R_acc, xs):
             tau_scalar, prefactor_scalar = xs
-            Gv_k, Gc_k = _build_G(psi_v_xn, psi_v_yr,
-                                    psi_c_yr, psi_c_xn,
-                                    enk_v, enk_c, tau_scalar, vmax, cmin)
+            Gv_k, Gc_k = _build_Gv_Gc(psi_v_xn, psi_v_yr,
+                                      psi_c_yr, psi_c_xn,
+                                      enk_v, enk_c, tau_scalar, vmax, cmin)
             Gv_R = _Gv_fftn(Gv_k)
             Gc_R = _Gc_fftn(Gc_k)
             # chi_R(m, n) = Σ_{a,b} Gc_R(a,m,b,n) · conj(Gv_R(a,m,b,n))
@@ -157,16 +160,10 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
         final_R, _ = jax.lax.scan(_body, chi_R_zero, (tau_arr, prefactor_arr))
         return _chi_fftn_local(final_R)
 
-    def _chi_kernel(psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
-                    enk_v, enk_c, tau_i, prefactor_i, vmax, cmin):
-        n_rmu = psi_v_xn.shape[2]
-        if len(tau_i) == 0:
-            return jnp.zeros((nk, n_rmu, n_rmu), dtype=jnp.complex128)
-        return _chi_scan(psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
-                         enk_v, enk_c, tau_i, prefactor_i, vmax, cmin)
-
-    _chi_minimax_kernel_cache[cache_key] = _chi_kernel
-    return _chi_kernel
+    # Minimax quadrature always delivers ≥1 node, so the old empty-tau
+    # short-circuit wrapper is gone — _chi_scan IS the kernel.
+    _chi_minimax_kernel_cache[cache_key] = _chi_scan
+    return _chi_scan
 
 
 def compute_chi0_minimax(
