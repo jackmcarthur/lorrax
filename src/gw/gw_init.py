@@ -420,7 +420,10 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	Returns (V_qmunu, G0) where V_qmunu has shape (1, npol, npol, nkx, nky, nkz, μ, μ)
 	and G0 is (n_rmu,) ζ_μ(G=0) at q=0.
 	"""
-	from .compute_vcoul import compute_all_V_q_from_zeta_h5
+	from .compute_vcoul import (
+		compute_all_V_q_from_zeta_h5,
+		compute_all_V_q_sharded,
+	)
 
 	if jax.process_index() == 0:
 		os.sync()
@@ -473,29 +476,43 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		print_fn(f"    V_q q batches: {q_batch}")
 
 	from file_io.slab_io import SlabIO
+	# Sharded path = default: ``compute_all_V_q_sharded`` runs each q-batch
+	# as one big jit (fit_one_rchunk-style) with sharded FFI reads landing
+	# ζ directly in μ-on-('x','y') layout — FFT + gathers + gemm all stay
+	# mesh-parallel.  Fallback to the replicated ``compute_all_V_q_from_zeta_h5``
+	# when FFI phdf5 isn't available (single-GPU sandbox builds, h5py-only
+	# backend).
+	use_sharded_v_q = bool(cfg.use_ffi_io)
 	with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
-		# Force use_ffi_io=False for the V_q zeta READ: V_q overlaps
-		# disk I/O with GPU compute via a background ``ThreadPoolExecutor``,
-		# which is incompatible with SlabIO's FFI-read shard_map
-		# dispatch — the collective H5Dread can't safely interleave
-		# with the main thread's JAX ops on the same rank.  The write
-		# path uses the FFI (``cfg.use_ffi_io``) separately; only
-		# this specific read is pinned to the allgather/h5py path.
 		with SlabIO(zeta_h5_path, mode='r', mesh=mesh_xy,
-		            use_ffi_io=False) as zeta_io:
+		            use_ffi_io=use_sharded_v_q) as zeta_io:
 			with mesh_xy:
-				V_q_raw, G0_all = compute_all_V_q_from_zeta_h5(
-					zeta_io, kgrid=meta.kgrid, fft_grid=meta.fft_grid,
-					bvec=bvec, cell_volume=meta.cell_volume,
-					mu_chunk_size=mu_chunk, mesh_xy=mesh_xy,
-					sys_dim=meta.sys_dim,
-					q_batch_size=q_batch if mu_chunk >= meta.n_rmu else None,
-					bdot=np.asarray(wfn.bdot, dtype=np.float64) if meta.sys_dim == 0 else None,
-					mc_average_vcoul_body=cfg.mc_average_vcoul_body,
-					bare_coulomb_cutoff=vcoul_cutoff_ry,
-					bgw_v_grid_fn=bgw_v_grid_fn,
-					n_rmu=meta.n_rmu, n_rtot=meta.n_rtot,
-				)
+				if use_sharded_v_q:
+					V_q_raw, G0_all = compute_all_V_q_sharded(
+						zeta_io, kgrid=meta.kgrid, fft_grid=meta.fft_grid,
+						bvec=bvec, cell_volume=meta.cell_volume,
+						mesh_xy=mesh_xy,
+						n_rmu=meta.n_rmu, n_rtot=meta.n_rtot,
+						sys_dim=meta.sys_dim,
+						bdot=np.asarray(wfn.bdot, dtype=np.float64) if meta.sys_dim == 0 else None,
+						mc_average_vcoul_body=cfg.mc_average_vcoul_body,
+						bare_coulomb_cutoff=vcoul_cutoff_ry,
+						bgw_v_grid_fn=bgw_v_grid_fn,
+						budget_bytes=m_budget,
+					)
+				else:
+					V_q_raw, G0_all = compute_all_V_q_from_zeta_h5(
+						zeta_io, kgrid=meta.kgrid, fft_grid=meta.fft_grid,
+						bvec=bvec, cell_volume=meta.cell_volume,
+						mu_chunk_size=mu_chunk, mesh_xy=mesh_xy,
+						sys_dim=meta.sys_dim,
+						q_batch_size=q_batch if mu_chunk >= meta.n_rmu else None,
+						bdot=np.asarray(wfn.bdot, dtype=np.float64) if meta.sys_dim == 0 else None,
+						mc_average_vcoul_body=cfg.mc_average_vcoul_body,
+						bare_coulomb_cutoff=vcoul_cutoff_ry,
+						bgw_v_grid_fn=bgw_v_grid_fn,
+						n_rmu=meta.n_rmu, n_rtot=meta.n_rtot,
+					)
 
 	# Write G0 = ζ_μ(G=0) at q=0 back to zeta file via SlabIO's deferred
 	# attr path (small; rank-0-only after MPI-IO file is closed).
