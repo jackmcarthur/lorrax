@@ -250,6 +250,34 @@ def _p_divisible_floor(x: float, p: int) -> int:
     return max(0, v)
 
 
+def _largest_even_divisor_leq(n: int, cap: int, p: int) -> int:
+    """Largest divisor of ``n`` that is ≤ cap AND a multiple of ``p``.
+
+    Used to pick chunk sizes that:
+      * make every chunk SAME size (no remainder → one compile shape)
+      * are mesh-divisible (required for shard_map)
+
+    If no divisor of n fits, falls back to the largest p-multiple ≤ cap
+    (which means the last chunk is smaller — 2 compile shapes).  The
+    caller sees this via ``chunk % n != 0``.
+    """
+    cap = max(p, int(cap))
+    # Enumerate divisors of n in descending order; pick first ≤ cap
+    # that's also p-divisible.  n typically ≤ few×10⁴ so this is cheap.
+    best_div = 0
+    d = 1
+    while d * d <= n:
+        if n % d == 0:
+            for cand in (d, n // d):
+                if cand <= cap and cand % p == 0 and cand > best_div:
+                    best_div = cand
+        d += 1
+    if best_div > 0:
+        return best_div
+    # No clean divisor — fall back to plain p-multiple (2 compile shapes)
+    return (cap // p) * p
+
+
 def choose_chunks_analytic(
     sys: SysDims, mesh: MeshSpec,
     *,
@@ -483,29 +511,21 @@ def choose_chunks_heuristic(
     n_wfn_max = int(wfn_budget / max(1.0, per_wfn_bytes))
 
     if n_wfn_max >= n_k:
-        # Fits all k at once — keep k_chunk = n_k (load everything
-        # per call, which is the normal production pattern) and
-        # size band_chunk within the remaining budget.
+        # Fits all k at once — keep k_chunk = n_k and size band_chunk
+        # within the remaining budget.  Prefer band_chunk that
+        # DIVIDES n_b so every band chunk has the same size (one
+        # compile shape inside the r-chunk loop).
         k_chunk = n_k
-        band_chunk = max(1, min(n_b, n_wfn_max // n_k))
+        bc_cap = max(1, n_wfn_max // n_k)
+        band_chunk = _largest_even_divisor_leq(n_b, bc_cap, P)
+        if band_chunk <= 0:
+            # No divisor of n_b fits; fall back to a p-multiple
+            # (accepts 2 compile shapes for the remainder bc-chunk).
+            band_chunk = max(P, (bc_cap // P) * P)
     else:
         # Even one band per call doesn't fit all k; shrink k_chunk.
-        # This is the "user-priority-4" regime where band_chunk=1
-        # first, then we whittle down k.
         band_chunk = 1
         k_chunk = max(1, n_wfn_max)
-
-    # Mesh-divisibility: band_chunk must be ≥ p (for band-sharding).
-    # Round band_chunk down to largest p-multiple ≤ current choice.
-    if band_chunk >= P:
-        band_chunk = (band_chunk // P) * P
-    else:
-        # Below p — keep band_chunk at the smallest valid multiple
-        # of P (which is P itself); fall back to k_chunk reduction.
-        band_chunk = P
-        # Re-check the wfn budget at bc=P
-        if n_k * band_chunk > n_wfn_max:
-            k_chunk = max(1, n_wfn_max // band_chunk)
 
     # --- 3. Pick chunk_r from the rchunk_budget ---
     # Persistent (always alive): 2 centroids + psi_G cache + L_q.
@@ -532,9 +552,11 @@ def choose_chunks_heuristic(
     allgather_cap = int(0.8 * budget_bytes / max(1.0, 16.0 * q_gather_min * mu))
 
     n_rtot = sys.n_r or (fft_shape[0] * fft_shape[1] * fft_shape[2])
-    chunk_r = int(min(n_rtot, headroom / cr_per_byte, allgather_cap))
-    # p-divisible for shard_map:
-    chunk_r = (chunk_r // P) * P
+    cr_cap = int(min(n_rtot, headroom / cr_per_byte, allgather_cap))
+    # Prefer chunk_r that DIVIDES n_rtot evenly — one compile shape
+    # for every r-chunk (no remainder recompile).  Falls back to a
+    # p-multiple if no divisor fits (accepts 2 compile shapes).
+    chunk_r = _largest_even_divisor_leq(n_rtot, cr_cap, P)
     if chunk_r <= 0:
         raise ValueError(
             f"No feasible chunk_r under budget {budget_bytes/1e9:.2f} GB; "
