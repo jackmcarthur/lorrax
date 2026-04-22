@@ -276,84 +276,95 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 
 	mem_est = chunks.get('memory_estimate', {})
 	aot_peak_gb = None  # filled in below if the AOT model is available
-	if jax.process_index() == 0 and mem_est:
+	_rank0 = (jax.process_index() == 0)
+	if _rank0 and mem_est:
 		print_fn(f"    Memory estimate: peak {mem_est['peak_estimate_gb']:.2f} GB "
 		         f"(budget {mem_est['budget_gb']:.2f} GB), bottleneck={mem_est['bottleneck']}")
 		stages = mem_est.get('limit_info', {})
 		if stages:
 			print_fn(f"    Per-stage: " + "  ".join(f"{k}={v:.2f}" for k, v in stages.items()) + " GB")
 
-		# AOT-derived driver-level peak — sanity-check against per-stage
-		# heuristic.  When ``use_aot_chunk_chooser`` is set, the AOT
-		# chooser's pick supersedes ``chunks['chunk_r']`` and
-		# ``chunks['band_chunk']``; otherwise this block just LOGS the
-		# predicted peak alongside the heuristic output.  Silent when
-		# the fit artifact is missing or the prediction throws.
-		try:
-			from gw.aot_memory_model import (
-				predict_kernel_peak, SysDims, MeshSpec, Knobs,
-				choose_chunks_analytic, choose_chunks_heuristic,
-				describe_chunks,
-			)
-			p_x, p_y = mesh_xy.devices.shape
-			# n_b = UNION range (bytes of psi_G cache / band-chunk FFT).
-			# n_b_sum = nb_L + nb_R (L+R pair-density work + centroid bytes).
-			# Symmetric production GW (nval == nelec, nband == nelec+ncond)
-			# has nb_L == nb_R == nb_full so n_b_sum == 2·n_b; asymmetric
-			# windows (pseudobands, sub-valence, extra-cond) are picked
-			# up correctly here.
-			nb_L = band_range_left[1] - band_range_left[0]
-			nb_R = band_range_right[1] - band_range_right[0]
-			nb_full = (max(band_range_left[1], band_range_right[1])
-			           - min(band_range_left[0], band_range_right[0]))
-			aot_sys = SysDims(
-				kgrid=tuple(meta.kgrid),
-				fft_grid=tuple(meta.fft_grid),
-				n_rmu=int(meta.n_rmu),
-				n_s=int(meta.nspinor),
-				n_b=int(nb_full),
-				n_b_sum=int(nb_L + nb_R),
-				n_r=int(meta.n_rtot),
-			)
-			aot_mesh = MeshSpec(p_x=int(p_x), p_y=int(p_y))
-			if cfg.use_aot_chunk_chooser:
-				# 20/80 heuristic is the default — simpler, no DoE deps.
-				# Falls back to the regressed-fit analytic chooser if
-				# the user sets LORRAX_CHOOSER_MODE=analytic.
-				_mode = os.environ.get("LORRAX_CHOOSER_MODE", "heuristic")
-				budget = (cfg.memory_per_device_gb * 1e9
-				          * cfg.chunk_target_utilization)
-				if _mode == "analytic":
-					choice = choose_chunks_analytic(
-						aot_sys, aot_mesh,
-						budget_bytes=budget,
-						kernel_name="fit_one_rchunk", tag="current",
-					)
-				else:
-					choice = choose_chunks_heuristic(
-						aot_sys, aot_mesh, budget_bytes=budget,
-					)
-				print_fn(f"    {describe_chunks(choice)}")
-				# Override the heuristic's chunk_r / band_chunk.  Keep
-				# q_chunk, q_gather, k_chunk from the old chooser since
-				# the AOT model doesn't cover them yet.
-				chunks['chunk_r'] = int(choice.chunk_r)
-				chunks['band_chunk'] = int(choice.band_chunk)
-				aot_peak_gb = choice.peak_bytes / 1e9
-			else:
-				aot_peak = predict_kernel_peak(
-					"fit_one_rchunk", aot_sys,
-					Knobs.of(chunk_r=int(chunks['chunk_r']),
-					         band_chunk=int(chunks['band_chunk'])),
-					aot_mesh, tag="current",
+	# AOT-derived driver-level peak + chunk-size override.
+	#
+	# CRITICAL: this block runs on EVERY rank, not just rank 0.  Both
+	# ``compute_optimal_chunks`` (above) and the AOT chooser below are
+	# deterministic pure-Python on identical inputs, so they yield the
+	# same ``chunks`` dict on every rank — but only if we call them on
+	# every rank.  Historically this block was wrapped in
+	# ``if jax.process_index() == 0``, which caused rank 0 to override
+	# ``chunks['band_chunk']`` while ranks 1..p kept the heuristic's
+	# pick; the inner ``_fft_gather_reshard`` jit shape depends on
+	# ``band_chunk``, so the ranks then posted mismatched NCCL buffers
+	# and hung mid-all-gather on the 2nd band chunk.  Keep all control
+	# flow that mutates ``chunks`` OUT of the rank-0 guard; only the
+	# ``print_fn`` calls are rank-0-only.
+	try:
+		from gw.aot_memory_model import (
+			predict_kernel_peak, SysDims, MeshSpec, Knobs,
+			choose_chunks_analytic, choose_chunks_heuristic,
+			describe_chunks,
+		)
+		p_x, p_y = mesh_xy.devices.shape
+		# n_b = UNION range (bytes of psi_G cache / band-chunk FFT).
+		# n_b_sum = nb_L + nb_R (L+R pair-density work + centroid bytes).
+		# Symmetric production GW (nval == nelec, nband == nelec+ncond)
+		# has nb_L == nb_R == nb_full so n_b_sum == 2·n_b; asymmetric
+		# windows (pseudobands, sub-valence, extra-cond) are picked
+		# up correctly here.
+		nb_L = band_range_left[1] - band_range_left[0]
+		nb_R = band_range_right[1] - band_range_right[0]
+		nb_full = (max(band_range_left[1], band_range_right[1])
+		           - min(band_range_left[0], band_range_right[0]))
+		aot_sys = SysDims(
+			kgrid=tuple(meta.kgrid),
+			fft_grid=tuple(meta.fft_grid),
+			n_rmu=int(meta.n_rmu),
+			n_s=int(meta.nspinor),
+			n_b=int(nb_full),
+			n_b_sum=int(nb_L + nb_R),
+			n_r=int(meta.n_rtot),
+		)
+		aot_mesh = MeshSpec(p_x=int(p_x), p_y=int(p_y))
+		if cfg.use_aot_chunk_chooser:
+			# 20/80 heuristic is the default — simpler, no DoE deps.
+			# Falls back to the regressed-fit analytic chooser if
+			# the user sets LORRAX_CHOOSER_MODE=analytic.
+			_mode = os.environ.get("LORRAX_CHOOSER_MODE", "heuristic")
+			budget = (cfg.memory_per_device_gb * 1e9
+			          * cfg.chunk_target_utilization)
+			if _mode == "analytic":
+				choice = choose_chunks_analytic(
+					aot_sys, aot_mesh,
+					budget_bytes=budget,
+					kernel_name="fit_one_rchunk", tag="current",
 				)
+			else:
+				choice = choose_chunks_heuristic(
+					aot_sys, aot_mesh, budget_bytes=budget,
+				)
+			if _rank0:
+				print_fn(f"    {describe_chunks(choice)}")
+			# Override the heuristic's chunk_r / band_chunk.  Keep
+			# q_chunk, q_gather, k_chunk from the old chooser since
+			# the AOT model doesn't cover them yet.
+			chunks['chunk_r'] = int(choice.chunk_r)
+			chunks['band_chunk'] = int(choice.band_chunk)
+			aot_peak_gb = choice.peak_bytes / 1e9
+		else:
+			aot_peak = predict_kernel_peak(
+				"fit_one_rchunk", aot_sys,
+				Knobs.of(chunk_r=int(chunks['chunk_r']),
+				         band_chunk=int(chunks['band_chunk'])),
+				aot_mesh, tag="current",
+			)
+			if _rank0:
 				print_fn(f"    AOT fit_one_rchunk peak (driver-level): "
 				         f"{aot_peak / 1e9:.2f} GB")
-				aot_peak_gb = aot_peak / 1e9
-		except Exception as _aot_exc:
-			if cfg.use_aot_chunk_chooser:
-				print_fn(f"    AOT chooser FAILED ({_aot_exc!r}); "
-				         f"falling back to heuristic.")
+			aot_peak_gb = aot_peak / 1e9
+	except Exception as _aot_exc:
+		if cfg.use_aot_chunk_chooser and _rank0:
+			print_fn(f"    AOT chooser FAILED ({_aot_exc!r}); "
+			         f"falling back to heuristic.")
 
 	zeta_h5_path = os.path.join(tmp_dir, "zeta_q.h5")
 	print_fn(f"\n  Chunked ISDF fitting:")
