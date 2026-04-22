@@ -261,32 +261,20 @@ def get_bandranges(nv, nc, nband, nelec):
 	return nvrange, ncrange, nsigmarange, n_fullrange, n_valrange
 
 
-def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir, print_fn=print):
+def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
+             psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print):
 	"""Fit ISDF interpolation vectors ζ and write to HDF5.
 
-	Returns (zeta_h5_path, psi_l_yr, psi_r_yr, psi_l_xn, psi_r_xn, mem_est).
-
-	The xn-layout halves are a zero-cost byproduct of the zeta kernel
-	(see :func:`common.isdf_fitting.fit_zeta_chunked_to_h5`).  We thread
-	them out so downstream :func:`build_wavefunction_bundle` can skip
-	the y→x reshards it would otherwise emit to build psi_xn / psi_xr.
+	The caller supplies (a) the full-range centroid wavefunctions
+	(``psi_rmu_Y`` / ``psi_rmuT_X``, spanning [b0, b4) as returned by
+	``load_centroids_band_chunked``) and (b) the chunk plan from
+	:func:`compute_optimal_chunks`.  Returns ``(zeta_h5_path, mem_est)``.
 	"""
 	from common.isdf_fitting import fit_zeta_chunked_to_h5
 
 	# ISDF left/right band windows (pair density needs asymmetric ranges)
 	band_range_left = (band_slices.b0, band_slices.b3)   # all val + sigma cond
 	band_range_right = (band_slices.b1, band_slices.b4)   # sigma val + all cond
-
-	chunks = compute_optimal_chunks(
-		meta, mesh_xy,
-		memory_budget_gb=cfg.memory_per_device_gb,
-		target_utilization=cfg.chunk_target_utilization,
-		n_b_left=band_range_left[1] - band_range_left[0],
-		n_b_right=band_range_right[1] - band_range_right[0],
-		pair_density_channels=1 if cfg.isdf_pair_mode == "spin_traced" else meta.nspinor ** 2,
-		r_chunk_override=cfg.r_chunk_override if cfg.r_chunk_override > 0 else None,
-		zct_stage_cap_gb=cfg.zct_stage_cap_gb,
-	)
 
 	mem_est = chunks.get('memory_estimate', {})
 	if jax.process_index() == 0 and mem_est:
@@ -308,10 +296,11 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	_band_norms = getattr(wfn, 'band_norms', None)
 
 	with timing.section("gw_jax.zeta_fit_chunked"), jax_profile.trace_section("zeta_fit"):
-		psi_l_yr, psi_r_yr, psi_l_xn, psi_r_xn, peak_bytes = fit_zeta_chunked_to_h5(
+		peak_bytes = fit_zeta_chunked_to_h5(
 			wfn=wfn, sym=sym, meta=meta,
 			centroid_indices=centroid_indices, mesh_xy=mesh_xy,
 			chunk_r=chunks['chunk_r'], output_file=zeta_h5_path,
+			psi_rmu_Y=psi_rmu_Y, psi_rmuT_X=psi_rmuT_X,
 			band_chunk_size=chunks['band_chunk'],
 			q_chunk_size=chunks['q_chunk'],
 			q_gather_size=chunks.get('q_gather', 0),
@@ -332,7 +321,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		print_fn(f"    GPU high-water mark: {peak_gb:.2f} GB / {budget_gb:.2f} GB budget "
 		         f"({100 * peak_gb / budget_gb:.0f}%)")
 
-	return zeta_h5_path, psi_l_yr, psi_r_yr, psi_l_xn, psi_r_xn, mem_est
+	return zeta_h5_path, mem_est
 
 
 def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None):
@@ -447,20 +436,12 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 
 def build_wavefunction_bundle(
 	wfn, sym, meta, band_slices, mesh_xy,
-	*, psi_l_yr=None, psi_r_yr=None, psi_l_xn=None, psi_r_xn=None,
-	psi_full_yr=None, psi_full_xn=None,
-	enk_full=None, print_fn=print,
+	*, psi_rmu_Y, psi_rmuT_X, enk_full=None, print_fn=print,
 ):
-	"""Build 4-copy Wavefunctions bundle from ISDF or restart inputs.
-
-	Two input shapes, one output:
-	  * ISDF path: ``psi_{l,r}_yr`` + ``psi_{l,r}_xn`` (the latter pair
-	    is optional but strongly preferred — it's the zeta kernel's
-	    free byproduct and lets us skip y→x reshards on the μ axis).
-	  * Restart path: ``psi_full_yr`` + ``psi_full_xn`` — same idea
-	    with pre-assembled arrays.
+	"""Build 4-copy Wavefunctions bundle from the two centroid-sampled
+	arrays produced by ``load_centroids_band_chunked``.
 	"""
-	from .wavefunction_bundle import build_wavefunctions, build_wavefunctions_from_full
+	from .wavefunction_bundle import build_wavefunctions
 	from common.load_wfns import get_enk_bandrange
 
 	if enk_full is None:
@@ -468,15 +449,9 @@ def build_wavefunction_bundle(
 			wfn, sym, band_slices.full_range,
 			(band_slices.b1, band_slices.b3), nspinor=meta.nspinor)
 
-	if psi_full_yr is not None:
-		wfns = build_wavefunctions_from_full(
-			psi_full_yr, psi_xn_full=psi_full_xn,
-			enk_full=enk_full, slices=band_slices, mesh_xy=mesh_xy)
-	else:
-		wfns = build_wavefunctions(
-			psi_l_yr, psi_r_yr,
-			psi_l_xn=psi_l_xn, psi_r_xn=psi_r_xn,
-			enk_full=enk_full, slices=band_slices, mesh_xy=mesh_xy)
+	wfns = build_wavefunctions(
+		psi_rmu_Y, psi_rmuT_X,
+		enk_full=enk_full, slices=band_slices, mesh_xy=mesh_xy)
 
 	print_fn(f"  Wavefunctions built (b0:b4={band_slices.nb_full} bands, "
 	         f"4 sharded copies: xn/xr/yr/yn)")
@@ -487,33 +462,81 @@ def prepare_isdf_and_wavefunctions(
 	*, cfg, wfn, sym, meta, centroid_indices, band_slices,
 	mesh_xy, tmp_dir, tensors_filename, print0, bgw_v_grid_fn=None, **_ignored,
 ):
-	"""ISDF pipeline: fit_zeta → compute_V_q → build_wavefunction_bundle.
+	"""ISDF pipeline (non-restart path reads top-to-bottom):
+
+	  1. ``compute_optimal_chunks`` → chunk plan (band/r/q chunk sizes).
+	  2. ``load_centroids_band_chunked`` → ψ at centroids for [b0, b4).
+	  3. ``fit_zeta`` → ζ.h5 (consumes ψ slices for pair density).
+	  4. ``compute_V_q`` → V_qmunu, G0 (reads ζ from disk).
+	  5. Flush V_q / G0 / enk + W0 placeholder to restart H5 (mode="w").
+	  6. ``build_wavefunctions`` → 4-copy Wavefunctions bundle (reuses ψ).
+	  7. Append ``psi_full_y`` (= wfns.psi_yr) to restart H5 (mode="a").
 
 	Returns SimpleNamespace(V_qmunu, wf_bundle).
 	"""
 	from file_io import write_restart_state_to_h5, save_restart_state_per_proc
+	from common.load_wfns import load_centroids_band_chunked
 
 	if not cfg.restart:
+		from common.load_wfns import get_enk_bandrange
+
 		with mesh_xy:
-			zeta_path, psi_l_yr, psi_r_yr, psi_l_xn, psi_r_xn, mem_est = fit_zeta(
+			# Plan chunks (band/r/q sizes).
+			chunks = compute_optimal_chunks(
+				meta, mesh_xy,
+				memory_budget_gb=cfg.memory_per_device_gb,
+				target_utilization=cfg.chunk_target_utilization,
+				n_b_left=band_slices.b3 - band_slices.b0,
+				n_b_right=band_slices.b4 - band_slices.b1,
+				pair_density_channels=(1 if cfg.isdf_pair_mode == "spin_traced"
+				                       else meta.nspinor ** 2),
+				r_chunk_override=cfg.r_chunk_override if cfg.r_chunk_override > 0 else None,
+				zct_stage_cap_gb=cfg.zct_stage_cap_gb,
+			)
+
+			# Load centroid ψ once for the full [b0, b4) range; reused by
+			# both the zeta fit (sliced into halves internally) and the
+			# downstream Wavefunctions bundle.
+			with timing.section("gw_jax.load_centroid_wfns"):
+				psi_rmu_Y, psi_rmuT_X = load_centroids_band_chunked(
+					wfn, sym, meta, centroid_indices, cfg.bispinor, mesh_xy,
+					band_range=band_slices.full_range,
+					band_chunk_size=chunks['band_chunk'],
+				)
+
+			zeta_path, mem_est = fit_zeta(
 				wfn, sym, meta, centroid_indices, mesh_xy,
-				cfg, band_slices, tmp_dir, print_fn=print0)
+				cfg, band_slices, tmp_dir,
+				psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print0)
 			V_qmunu, G0 = compute_V_q(
 				zeta_path, wfn, meta, mesh_xy, cfg,
 				mem_est=mem_est, print_fn=print0,
 				bgw_v_grid_fn=bgw_v_grid_fn)
 
-		with timing.section("gw_jax.wavefunction_setup"):
-			wfns = build_wavefunction_bundle(
-				wfn, sym, meta, band_slices, mesh_xy,
-				psi_l_yr=psi_l_yr, psi_r_yr=psi_r_yr,
-				psi_l_xn=psi_l_xn, psi_r_xn=psi_r_xn,
-				print_fn=print0)
+			enk_full, _ = get_enk_bandrange(
+				wfn, sym, band_slices.full_range,
+				(band_slices.b1, band_slices.b3), nspinor=meta.nspinor)
 
-		write_restart_state_to_h5(
-			tensors_filename, V_qmunu,
-			wfns.psi_yr, wfns.enk, None, G0_mu_nu=G0, init_W0=True,
-			mesh=mesh_xy, use_ffi_io=cfg.use_ffi_io)
+			# Flush V_q / G0 / enk + W0 placeholder immediately.
+			write_restart_state_to_h5(
+				tensors_filename,
+				V_qmunu=V_qmunu, G0_mu_nu=G0, enk_full=enk_full,
+				init_W0=True, mesh=mesh_xy, use_ffi_io=cfg.use_ffi_io,
+				mode="w",
+			)
+
+			with timing.section("gw_jax.wavefunction_setup"):
+				wfns = build_wavefunction_bundle(
+					wfn, sym, meta, band_slices, mesh_xy,
+					psi_rmu_Y=psi_rmu_Y, psi_rmuT_X=psi_rmuT_X,
+					enk_full=enk_full, print_fn=print0)
+
+			# Append ψ to the now-open restart file.
+			write_restart_state_to_h5(
+				tensors_filename,
+				psi_full_y=wfns.psi_yr, mesh=mesh_xy,
+				use_ffi_io=cfg.use_ffi_io, mode="a",
+			)
 		save_restart_state_per_proc(
 			os.path.join(tmp_dir, "isdf_tensors"),
 			V_qmunu, None, wfns.psi_yr, wfns.enk, meta, mesh_xy)
@@ -522,12 +545,13 @@ def prepare_isdf_and_wavefunctions(
 	else:
 		from file_io import load_restart_state_from_h5
 		with timing.section("gw_jax.restart_load"):
-			V_qmunu, _S, psi_full_xn, psi_full_yr, enk_full, _V0, _G0 = (
-				load_restart_state_from_h5(tensors_filename, mesh_xy, band_slices=band_slices))
+			rs = load_restart_state_from_h5(
+				tensors_filename, mesh_xy, band_slices=band_slices)
+			V_qmunu = rs.V_qmunu
 			print0("  Loaded restart tensors from H5.")
 			wfns = build_wavefunction_bundle(
 				wfn, sym, meta, band_slices, mesh_xy,
-				psi_full_yr=psi_full_yr, psi_full_xn=psi_full_xn,
-				enk_full=enk_full, print_fn=print0)
+				psi_rmu_Y=rs.psi_rmu_Y, psi_rmuT_X=rs.psi_rmuT_X,
+				enk_full=rs.enk_full, print_fn=print0)
 
 	return SimpleNamespace(V_qmunu=V_qmunu, wf_bundle=wfns)

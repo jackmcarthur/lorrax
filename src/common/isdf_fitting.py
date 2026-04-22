@@ -938,6 +938,8 @@ def fit_zeta_chunked_to_h5(
     mesh_xy: Mesh,
     chunk_r: int,
     output_file: str,
+    psi_rmu_Y: jax.Array,
+    psi_rmuT_X: jax.Array,
     band_chunk_size: int = 16,
     q_chunk_size: int = 1,
     bispinor: bool = True,
@@ -955,11 +957,10 @@ def fit_zeta_chunked_to_h5(
     Full zeta fitting pipeline with r-chunk loop and HDF5 output.
 
     Workflow:
-    1. Load wavefunctions (band-chunked FFT) for max range
-    2. Slice to get left (0:b3) and right (0:b4) views
-    3. Compute C_q from left/right pair density via FFT
-    4. Compute L_q = chol(C_q) using 2D blocked algorithm
-    5. For each r-chunk:
+    1. Slice pre-loaded centroid wavefunctions into left/right halves.
+    2. Compute C_q from left/right pair density via FFT.
+    3. Compute L_q = chol(C_q) using 2D blocked algorithm.
+    4. For each r-chunk:
        a. Compute psi_nk,a(r_chunk) via FFT
        b. Compute left/right pair densities at r-chunk
        c. Compute Z_q via ortho FFT with left/right cross-product
@@ -974,6 +975,13 @@ def fit_zeta_chunked_to_h5(
         mesh_xy: 2D device mesh
         chunk_r: Number of flattened r-points per chunk
         output_file: Path to output HDF5 file
+        psi_rmu_Y:  Centroid wavefunctions for the full [b0, b4) band range,
+                    shape (nk, nb_full, ns, n_rmu), P(None, None, None, 'y'),
+                    un-conjugated ψ.  Produced by
+                    :func:`common.load_wfns.load_centroids_band_chunked`.
+        psi_rmuT_X: Same centroid data transposed/sharded for the pair-density
+                    kernel, shape (nk, n_rmu, nb_full, ns),
+                    P(None, 'x', None, None), conjugated ψ*.
         band_chunk_size: Bands to process at once when FFTing wavefunctions (with global r)
         q_chunk_size: Q-points to solve C_q @ zeta_q = Z_q simultaneously
         bispinor: Whether to use bispinor wavefunctions
@@ -985,11 +993,12 @@ def fit_zeta_chunked_to_h5(
             "spin_matrix_frobenius": Keep spin channels P_ab and contract sum_ab after FFT
 
     Returns:
-        psi_l_yr:    Left centroid wfns  (nk, nb_l, ns, n_rmu), Y-sharded
-        psi_r_yr:    Right centroid wfns (nk, nb_r, ns, n_rmu), Y-sharded
-        psi_l_xn:    Left centroid wfns  (nk, ns, n_rmu, nb_l), X-sharded
-        psi_r_xn:    Right centroid wfns (nk, ns, n_rmu, nb_r), X-sharded
         peak_bytes:  GPU high-water mark (peak_bytes_in_use) during chunk loop
+
+    The centroid wavefunctions are inputs, not outputs — the caller is
+    expected to hold the single ``load_centroids_band_chunked`` result and
+    reuse it for :func:`gw.wavefunction_bundle.build_wavefunctions` after
+    the fit completes.
     """
     import h5py
 
@@ -1029,34 +1038,20 @@ def fit_zeta_chunked_to_h5(
           f"{nb_full} bands ({nb_left} left + {nb_right} right), {isdf_pair_mode}")
     print(f"  Output: {output_file}")
 
-    # ========== STEP 1: Load wavefunctions at centroids (band-chunked) ==========
-    # Load full range, then slice for left and right
-    with timing.section("zeta_fit.load_wfns"):
-        psi_full_rmu_Y, psi_full_rmuT_X = load_centroids_band_chunked(
-            wfn, sym, meta, centroid_indices, bispinor, mesh_xy, band_range_full,
-            band_chunk_size=band_chunk_size
-        )
-        # psi_full shapes: (nk, nb_full, ns, n_rmu) and (nk, n_rmu, nb_full, ns)
-
-        # Slice for left and right wavefunctions
-        # Convert global band ranges to local indices in the full array
-        # Left: bands [band_range_left[0], band_range_left[1]) relative to full[0]
-        # Right: bands [band_range_right[0], band_range_right[1]) relative to full[0]
+    # ========== STEP 1: Slice pre-loaded centroid ψ into left/right halves ==========
+    with timing.section("zeta_fit.slice_halves"):
+        # Band range arithmetic — left/right are sub-ranges of [b0, b4).
         l_band_start = band_range_left[0] - band_range_full[0]
         l_band_end = l_band_start + nb_left
         r_band_start = band_range_right[0] - band_range_full[0]
         r_band_end = r_band_start + nb_right
 
-        # NOTE: JAX slices are views sharing memory with the parent array.
-        # To allow garbage collection of the full array, we must make
-        # the slices independent using jnp.asarray which forces a copy.
-        psi_l_rmu_Y = jnp.asarray(psi_full_rmu_Y[:, l_band_start:l_band_end, :, :])
-        psi_l_rmuT_X = jnp.asarray(psi_full_rmuT_X[:, :, l_band_start:l_band_end, :])
-        psi_r_rmu_Y = jnp.asarray(psi_full_rmu_Y[:, r_band_start:r_band_end, :, :])
-        psi_r_rmuT_X = jnp.asarray(psi_full_rmuT_X[:, :, r_band_start:r_band_end, :])
-
-        # Now safe to delete full arrays - slices are independent copies
-        del psi_full_rmu_Y, psi_full_rmuT_X
+        # Cheap views — the caller keeps the full arrays alive for the
+        # post-fit wfn bundle build, so we don't need independent copies.
+        psi_l_rmu_Y = psi_rmu_Y[:, l_band_start:l_band_end, :, :]
+        psi_l_rmuT_X = psi_rmuT_X[:, :, l_band_start:l_band_end, :]
+        psi_r_rmu_Y = psi_rmu_Y[:, r_band_start:r_band_end, :, :]
+        psi_r_rmuT_X = psi_rmuT_X[:, :, r_band_start:r_band_end, :]
 
         print(f"  Left wfns:  {psi_l_rmu_Y.shape}")
         print(f"  Right wfns: {psi_r_rmu_Y.shape}")
@@ -1602,5 +1597,7 @@ def fit_zeta_chunked_to_h5(
                      ("ZCT", t_zct_total), ("solve", t_solve_total), ("H5", t_write_total)]:
         print(f"    {label:<6} {t:6.2f}s  {100*t/t_chunks_total:4.1f}%")
 
-    # Return left/right centroid wavefunctions + peak memory high-water mark.
-    return psi_l_rmu_Y, psi_r_rmu_Y, psi_l_rmuT_X, psi_r_rmuT_X, _peak_bytes
+    # Return only peak-memory high-water mark; centroid wavefunctions
+    # are not returned (see docstring — callers re-load them directly
+    # via ``load_centroids_band_chunked``).
+    return _peak_bytes

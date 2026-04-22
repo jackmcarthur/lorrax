@@ -13,8 +13,9 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 def write_restart_state_to_h5(
     filename,
-    V_qmunu,
-    psi_full_y,
+    *,
+    V_qmunu=None,
+    psi_full_y=None,
     enk_full=None,
     S_qmunu=None,
     V0_noG0_munu=None,
@@ -23,21 +24,28 @@ def write_restart_state_to_h5(
     init_W0: bool = False,
     mesh=None,
     use_ffi_io: bool = False,
+    mode: str = "w",
 ):
-    """Write canonical restart state via SlabIO.
+    """Write (subset of) canonical restart state via SlabIO.
 
-    Each of V_qmunu / S_qmunu / V0_noG0_munu / G0_mu_nu / W0_qmunu /
-    psi_full_y / enk_full may be a sharded ``jax.Array`` or a host
-    ndarray.  ``use_ffi_io=True`` routes each write through the
-    parallel-HDF5 FFI; the default gathers to rank 0 and writes with
-    h5py, matching the historical pattern.
+    All array arguments are optional — only the provided ones are
+    written, so this function can be called multiple times to flush
+    pieces of the restart state as they become available.  With
+    ``mode="w"`` the file is truncated first (and the format-version
+    attribute written); with ``mode="a"`` the file is opened for
+    append / overwrite of the named datasets.
+
+    ``init_W0=True`` pre-allocates an all-zeros W0_qmunu dataset sized
+    from ``V_qmunu``; the ``W0_ready`` attr on that dataset is set to
+    False so downstream readers (bse_io) know to treat it as a
+    placeholder.  Passing ``W0_qmunu`` directly flips ``W0_ready`` to
+    True.
     """
     from .slab_io import SlabIO
 
-    with SlabIO(filename, mode="w", mesh=mesh, use_ffi_io=use_ffi_io) as io:
-        # restart_format_version is a small scalar attr — write as a
-        # dataset (allgather backend) / deferred attr (FFI backend).
-        io.write_attr("restart_format_version", np.int64(2))
+    with SlabIO(filename, mode=mode, mesh=mesh, use_ffi_io=use_ffi_io) as io:
+        if mode == "w":
+            io.write_attr("restart_format_version", np.int64(2))
 
         def _write(name, arr):
             if arr is None:
@@ -55,6 +63,7 @@ def write_restart_state_to_h5(
 
         # W0_qmunu: either write the real data or pre-allocate an
         # all-zeros placeholder.
+        w0_touched = W0_qmunu is not None or init_W0
         w0_ready = False
         if W0_qmunu is not None:
             shape = tuple(W0_qmunu.shape)
@@ -62,16 +71,16 @@ def write_restart_state_to_h5(
             io.write_slab("W0_qmunu", W0_qmunu, global_shape=shape)
             w0_ready = True
         elif init_W0:
+            if V_qmunu is None:
+                raise ValueError("init_W0=True requires V_qmunu to size the placeholder")
             v_shape = tuple(V_qmunu.shape)
             v_dtype = V_qmunu.dtype
             io.create_dataset("W0_qmunu", shape=v_shape, dtype=v_dtype)
-            # Dataset is zero-initialised by HDF5 since we created but
-            # never wrote.  W0_ready=False flags "fill me in later".
 
     # bse_io.py reads W0_ready as an HDF5 attr on the W0_qmunu dataset.
     # Set it rank-0-only after SlabIO has released the file, to stay
     # compatible with that reader.
-    if (W0_qmunu is not None or init_W0) and jax.process_index() == 0:
+    if w0_touched and jax.process_index() == 0:
         with h5py.File(filename, "a") as f:
             f["W0_qmunu"].attrs["W0_ready"] = w0_ready
     try:
@@ -123,14 +132,30 @@ def read_restart_state_from_h5(filename):
 
 
 def load_restart_state_from_h5(filename, mesh_xy, band_slices=None):
-    """Load canonical restart arrays with explicit X/Y shardings for full wavefunctions."""
+    """Load canonical restart state and reshape wavefunctions into the
+    two arrays expected by :func:`gw.wavefunction_bundle.build_wavefunctions`.
+
+    Returns a ``SimpleNamespace`` with fields:
+
+      V_qmunu, S_qmunu, V0_noG0_munu, G0_mu_nu, enk_full
+      psi_rmu_Y   (nk, nb, ns, n_rmu)   P(None, None, None, 'y')
+                  un-conjugated ψ.
+      psi_rmuT_X  (nk, n_rmu, nb, ns)   P(None, 'x', None, None)
+                  conjugated ψ* (matches the pair-density convention
+                  ``load_centroids_band_chunked`` uses).
+
+    The x-sharded psi copy is derived from the y-sharded one with a
+    single y→x all-to-all on the μ axis; this is the only reshard on
+    the restart path.
+    """
     del band_slices  # retained for call-site compatibility
+    from types import SimpleNamespace
     V_qmunu, S_qmunu, psi_full_y_raw, enk_full, V0_noG0_munu, G0_mu_nu = read_restart_state_from_h5(filename)
 
     x6y7_8 = NamedSharding(mesh_xy, P(None, None, None, None, None, None, "x", "y"))
     x3y4_5 = NamedSharding(mesh_xy, P(None, None, None, "x", "y"))
-    y3_4 = NamedSharding(mesh_xy, P(None, None, None, "y"))
-    x2_4 = NamedSharding(mesh_xy, P(None, None, "x", None))
+    y3_psi_Y = NamedSharding(mesh_xy, P(None, None, None, "y"))
+    x1_psi_X = NamedSharding(mesh_xy, P(None, "x", None, None))
     replicated_2 = NamedSharding(mesh_xy, P(None, None))
 
     V_qmunu = jax.lax.with_sharding_constraint(V_qmunu, x6y7_8)
@@ -145,12 +170,21 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None):
             G0_mu_nu = G0_mu_nu[0]
         G0_mu_nu = jax.lax.with_sharding_constraint(G0_mu_nu, NamedSharding(mesh_xy, P("y")))
 
-    psi_full_y = jax.lax.with_sharding_constraint(psi_full_y_raw, y3_4)
-    psi_full_x = jax.lax.with_sharding_constraint(psi_full_y.transpose(0, 2, 3, 1), x2_4)
+    # psi_rmu_Y: stored layout (un-conjugated ψ), just pin to Y-sharding.
+    psi_rmu_Y = jax.lax.with_sharding_constraint(psi_full_y_raw, y3_psi_Y)
+    # psi_rmuT_X: conj + transpose(nb↔μ) then y→x reshard on μ.
+    psi_rmuT_X = jax.lax.with_sharding_constraint(
+        jnp.conj(psi_rmu_Y).transpose(0, 3, 1, 2),
+        x1_psi_X,
+    )
     if enk_full is not None:
         enk_full = jax.lax.with_sharding_constraint(enk_full, replicated_2)
 
-    return V_qmunu, S_qmunu, psi_full_x, psi_full_y, enk_full, V0_noG0_munu, G0_mu_nu
+    return SimpleNamespace(
+        V_qmunu=V_qmunu, S_qmunu=S_qmunu, V0_noG0_munu=V0_noG0_munu,
+        G0_mu_nu=G0_mu_nu, enk_full=enk_full,
+        psi_rmu_Y=psi_rmu_Y, psi_rmuT_X=psi_rmuT_X,
+    )
 
 
 def _mesh_coords_for_local_process(mesh_xy):
