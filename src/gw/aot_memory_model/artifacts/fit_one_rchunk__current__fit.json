@@ -10,17 +10,17 @@
     "Lq_rep"
   ],
   "coefs": [
-    3.973360914364698,
-    1.1269490664505295,
+    4.0,
+    1.0,
     0.0,
     0.0,
-    8.716050737401392,
+    9.0,
     0.0,
-    0.8603517612314369
+    1.0
   ],
   "intercept": 0.0,
-  "gamma": 0.652,
+  "gamma": 1.0,
   "residual_rms": 22402986.89874855,
   "n_samples": 21,
-  "notes": "ortho DoE (21 samples, symmetric L=R): \u03b2[pair]=4.0, \u03b2[psiG_cache]=1.1, \u03b2[Lq_rep]=0.9, \u03b2[centroid]=8.7 residual-absorber (T_centroid reformulated with n_b_sum = nb_L+nb_R).  RMS 22MB.\n\n\u03b3 calibration \u2014 VARIES with system scale:\n  MoS2 3\u00d73 nosym:  AOT raw 4.70 GB, runtime nvidia-smi 3.06 GB, \u03b3=0.651\n  Si 4\u00d74\u00d74 nosym:  AOT raw 7.94 GB, runtime nvidia-smi 4.04 GB, \u03b3=0.509\n\nStored \u03b3=0.652 is the MAX measured \u2014 safe at both systems (predicted > runtime everywhere), but over-predicts at Si scales by ~20%.  The ~20% variation suggests XLA scheduler efficiency is system-dependent, not a global scalar.  Per-primitive or n_k-dependent \u03b3 would be a better fit but needs multi-system calibration."
+  "notes": "Integer-coefficient fit in terms of actual variable products:\n  peak = 4\u00b7(n_k\u00b7n_rmu\u00b7cr/(p_x\u00b7p_y))\n       + 1\u00b7(n_k\u00b7n_b\u00b7n_s\u00b7n_r/(p_x\u00b7p_y))\n       + 9\u00b7(n_k\u00b7n_rmu\u00b7n_b_sum\u00b7n_s/p_x)\n       + 1\u00b7(n_k\u00b7n_rmu\u00b2)        [replicated L during solve]\n\n\u03b2[pair]=4 matches zct_lr's \u03b2[PrBr]=4 exactly (4 concurrent pair-sized\ntemps at the ZCT peak: P_l_Rt + P_r + Z_intermediate + output).\n\u03b2[psiG_cache]=1 is 1 persistent G-space cache.\n\u03b2[Lq_rep]=1 captures the replicated L during solve (collinear at fixed\nP=4 with Lq_sharded so NNLS picks one; integer rounding gives 1).\n\u03b2[centroid]=9 is a residual-absorber \u2014 captures ~30 MB scaling like\nn_k\u00b7n_rmu\u00b7n_b\u00b7n_s/p_x that my primitives don't cleanly model\n(likely pair_density_accumulate's intermediate slices unrolled over\nthe bc-loop).  The 9 isn't physically meaningful but the overall\nexpression is.\n\nDoE collinearities noted:\n  * F_rchunkY (nk\u00b7bc\u00b7ns\u00b7cr/p_y) and H_rchunkXY (nk\u00b7bc\u00b7ns\u00b7cr/P): \u03c1=0.99.\n    The bc\u00d7cr cross-term in the DoE isn't wide enough to split them.\n  * D_Lq_shard and E_Lq_rep: \u03c1=1.00 at fixed total_devices=4.  Multi-node\n    DoE would be required to separate them.\n\nRMS (integer): 25 MB.  RMS (real-valued NNLS): 22 MB.\n\u03b3=1 because memory_analysis().total IS the true per-device peak at\njit execution; earlier \u03b3=0.5-0.78 measurements were measurement\nartifacts (nvidia-smi sampled post-jit, after XLA freed temps).\nSamples: 21-point ortho DoE at MoS2 3x3 scale, saved at fit_one_rchunk__ortho__samples.json."
 }
