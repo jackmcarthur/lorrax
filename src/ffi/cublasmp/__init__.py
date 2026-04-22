@@ -8,6 +8,14 @@ Public API::
                                   alpha=1.0, beta=0.0,
                                   transa='N', transb='N')
 """
-from .batched import batched_distributed_gemm, batched_fused_w_solve
+from .batched import (
+    batched_distributed_gemm,
+    batched_fused_w_solve,
+    batched_fused_w_solve_jit,
+)
 
-__all__ = ["batched_distributed_gemm", "batched_fused_w_solve"]
+__all__ = [
+    "batched_distributed_gemm",
+    "batched_fused_w_solve",
+    "batched_fused_w_solve_jit",
+]

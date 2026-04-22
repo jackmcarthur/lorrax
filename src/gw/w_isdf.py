@@ -494,24 +494,32 @@ def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
 def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, memory_mode: str = "high_mem"):
     """AOT lower+compile of the W-solve jit.  See ``precompile_chi0``.
 
-    No-op on the ``low_mem`` path: that wrapper is a plain Python call
-    into the FFI primitive ``batched_fused_w_solve``, which has no XLA
-    compile of its own — first-call latency there is device setup, not
-    XLA compile.
+    Both paths have an XLA jit to precompile:
+
+    * ``high_mem``: the ``_solve_w`` jit built by ``_get_w_solve_fn`` —
+      q-parallel reshard + per-rank LU via shard_map.
+    * ``low_mem``: the cuBLASMp fused-W-solve jit built by
+      ``ffi.cublasmp.batched_fused_w_solve_jit`` — shard_map + FFI call,
+      still a JAX jit (cached per (mesh, dtype, nq, n, pref, ctx))
+      which pays an XLA compile on first invocation.
     """
     _ensure_compilation_cache()
     nq = int(meta.nk_tot)
     n_rmu = chi0_q.shape[1]
-    mode = (memory_mode or "high_mem").lower()
-    if mode == "low_mem":
-        # Still prime the wrapper cache so the FFI handle is allocated;
-        # actual work happens inside the single FFI call on first invoke.
-        _get_w_solve_fn_low_mem(mesh_xy, nq, n_rmu, V_q.dtype)
-        return
-    solve_fn = _get_w_solve_fn(mesh_xy, nq, n_rmu)
     nspin = max(1, int(getattr(meta, 'nspin', 1)))
     nspinor = max(1, int(getattr(meta, 'nspinor', 1)))
     pref_scalar = 2.0 / (float(max(1, nq)) ** 0.5 * float(nspin) * float(nspinor))
+    mode = (memory_mode or "high_mem").lower()
+    if mode == "low_mem":
+        # Also primes the cuBLASMp context handle via get_or_init_context.
+        from ffi.cublasmp import batched_fused_w_solve_jit
+        jit_fn = batched_fused_w_solve_jit(
+            dtype=V_q.dtype, nq=nq, n=n_rmu,
+            pref=complex(pref_scalar), mesh=mesh_xy,
+        )
+        jit_fn.lower(V_q, chi0_q).compile()
+        return
+    solve_fn = _get_w_solve_fn(mesh_xy, nq, n_rmu)
     pref_jnp = jnp.asarray(pref_scalar, dtype=jnp.complex128)
     solve_fn.lower(V_q, chi0_q, pref_jnp).compile()
 

@@ -32,7 +32,8 @@ from jax.sharding import Mesh, PartitionSpec as P
 from ..common.ffi_loader import get_lib
 from ..cusolvermp.context import get_or_init_context
 
-__all__ = ["batched_distributed_gemm", "batched_fused_w_solve"]
+__all__ = ["batched_distributed_gemm", "batched_fused_w_solve",
+           "batched_fused_w_solve_jit"]
 
 _GEMM_TARGET = "lorrax_cublasmp_batched_gemm"
 _W_SOLVE_TARGET = "lorrax_cublasmp_batched_w_solve"
@@ -219,9 +220,29 @@ def batched_fused_w_solve(
         raise ValueError(
             f"chi must match V in shape/dtype; got V={V.shape}/{V.dtype} "
             f"chi={chi.shape}/{chi.dtype}")
+    jit_fn = batched_fused_w_solve_jit(
+        dtype=V.dtype, nq=int(V.shape[0]), n=int(V.shape[1]),
+        pref=pref, mesh=mesh, stop_after_step=stop_after_step)
+    return jit_fn(V, chi)
+
+
+def batched_fused_w_solve_jit(
+    *,
+    dtype,
+    nq: int,
+    n: int,
+    pref: Union[float, complex],
+    mesh: Mesh,
+    stop_after_step: int = 0,
+):
+    """Return the cached ``jax.jit``-wrapped W-solve for the given
+    (dtype, nq, n, pref, mesh, stop_after_step).  Builds it on cache
+    miss.  Exposed so callers can AOT ``lower(V, chi).compile()`` the
+    jit independently of invoking it — used by
+    ``precompile_solve_w`` to split compile time from exec time in
+    the end-of-run timing report.
+    """
     Px, Py = _validate_mesh(mesh)
-    nq = int(V.shape[0])
-    n  = int(V.shape[1])
     if n % Px != 0 or n % Py != 0:
         raise ValueError(
             f"N={n} must be divisible by both Px={Px} and Py={Py}.")
@@ -231,38 +252,39 @@ def batched_fused_w_solve(
 
     pref_c = complex(pref)
     stop_after_step = int(stop_after_step)
-    key = ("w_solve", _mesh_key(mesh), V.dtype, nq, n,
+    key = ("w_solve", _mesh_key(mesh), dtype, nq, n,
            pref_c, int(ctx_handle), stop_after_step)
     jit_fn = _JIT_CACHE.get(key)
-    if jit_fn is None:
-        W_local_T = jax.ShapeDtypeStruct(
-            (nq, n // Py, n // Px), V.dtype)
-        attrs = dict(
-            nq=nq, n=n,
-            pref_re=float(pref_c.real),
-            pref_im=float(pref_c.imag),
-            ctx_handle=int(ctx_handle),
-            stop_after_step=stop_after_step,
-        )
+    if jit_fn is not None:
+        return jit_fn
 
-        @partial(shard_map, mesh=mesh,
-                 in_specs=(P(None, "x", "y"), P(None, "x", "y")),
-                 out_specs=P(None, "x", "y"),
-                 check_rep=False)
-        def _w_solve(local_V, local_chi):
-            # Pre-transpose so bytes are col-major (N/Px × N/Py) per rank.
-            V_T   = jnp.transpose(local_V,   (0, 2, 1))
-            chi_T = jnp.transpose(local_chi, (0, 2, 1))
-            W_T = jax.ffi.ffi_call(
-                _W_SOLVE_TARGET, W_local_T,
-                # Don't alias V → output: V is typically consumed by
-                # downstream (e.g. sigma_coh needs the original v), and
-                # the FFI's cudaMemcpyAsync V_in → V_work path handles
-                # the non-aliased case correctly.
-            )(V_T, chi_T, **attrs)
-            return jnp.transpose(W_T, (0, 2, 1))
+    W_local_T = jax.ShapeDtypeStruct(
+        (nq, n // Py, n // Px), dtype)
+    attrs = dict(
+        nq=nq, n=n,
+        pref_re=float(pref_c.real),
+        pref_im=float(pref_c.imag),
+        ctx_handle=int(ctx_handle),
+        stop_after_step=stop_after_step,
+    )
 
-        jit_fn = jax.jit(_w_solve)
-        _JIT_CACHE[key] = jit_fn
+    @partial(shard_map, mesh=mesh,
+             in_specs=(P(None, "x", "y"), P(None, "x", "y")),
+             out_specs=P(None, "x", "y"),
+             check_rep=False)
+    def _w_solve(local_V, local_chi):
+        # Pre-transpose so bytes are col-major (N/Px × N/Py) per rank.
+        V_T   = jnp.transpose(local_V,   (0, 2, 1))
+        chi_T = jnp.transpose(local_chi, (0, 2, 1))
+        W_T = jax.ffi.ffi_call(
+            _W_SOLVE_TARGET, W_local_T,
+            # Don't alias V → output: V is typically consumed by
+            # downstream (e.g. sigma_coh needs the original v), and
+            # the FFI's cudaMemcpyAsync V_in → V_work path handles
+            # the non-aliased case correctly.
+        )(V_T, chi_T, **attrs)
+        return jnp.transpose(W_T, (0, 2, 1))
 
-    return jit_fn(V, chi)
+    jit_fn = jax.jit(_w_solve)
+    _JIT_CACHE[key] = jit_fn
+    return jit_fn
