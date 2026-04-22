@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec as P
 import numpy as np
 import h5py
 
@@ -84,8 +85,11 @@ def compute_optimal_chunks(
             f"but only {memory_budget_gb:.2f} GB allocated.")
 
     # ---- Band-chunked FFT (centroid extraction, runs before chunk loop) ----
-    # ψ(G) → IFFT → ψ(r): 3× buffer (input + output + cuFFT scratch) + phase array.
-    # Bands are sharded across all p devices; bpd = ceil(band_chunk / p).
+    # ψ(G) → IFFT → ψ(r).  FFT_COPIES=3 is the nominal lower bound (input +
+    # output + one scratch); the *actual* per-rank peak (incl. cuFFT plan-
+    # specific workspace) is measured exactly via query_fft_peak_bytes
+    # below when we have a candidate bpd.  This pre-loop sizing loop uses
+    # the nominal 3× to set bpd_max.
     FFT_COPIES = 3
     m_phase = _mem(nk, nr)
     headroom_fft = m_budget - m_centroids_full
@@ -95,7 +99,7 @@ def compute_optimal_chunks(
     bpd_max = max(1, int((headroom_fft - m_phase) / one_band))
     band_chunk = min(nb, bpd_max * p)
     bpd = max(1, -(-band_chunk // p))  # ceil div matching read_Gvecs_to_devices
-    peak_fft_stage = m_centroids_full + FFT_COPIES * _mem(nk, bpd, ns, nr) + m_phase
+    peak_centroid_fft_stage = m_centroids_full + FFT_COPIES * _mem(nk, bpd, ns, nr) + m_phase
 
     # ---- C_q build (pair density → C_q → L_q, runs before chunk loop) ----
     stage_cct = m_centroids + 2 * _mem(nk, mu, mu, shard=p_x * p_y) + _mem(nq, mu, mu, shard=p_x * p_y)
@@ -222,30 +226,37 @@ def compute_optimal_chunks(
     # never happens — caused Si 10×10×10 4-GPU to under-predict peak by
     # ~19 GiB (measured in module_0147.jit__kernel memory-usage-report:
     # top preallocated-temp = 18.54 GiB = 3 × (nk·bpd·ns·nr · 16)).
-    # cuFFT workspace is not just FFT_COPIES × data size — cuFFT's planner
-    # allocates an additional scratch whose size depends on the FFT box
-    # radix factoring AND the batch size (24 = 2³·3 mixed radix; workspace
-    # grows non-linearly when batch is large).  Empirical AOT measurements
-    # on Si 10³ (24³ box) at the chooser's picks across budgets:
-    #    cr,bc,bpd=192,8,2    → temp ≈ 9 GB, data = 0.44 GB/rank → 20× data
-    #    cr,bc,bpd=440,20,5   → temp ≈ 8.8 GB, data = 1.1 GB/rank → 8× data
-    #    cr,bc,bpd=2140,60,15 → temp ≈ 18.4 GB, data = 3.3 GB/rank → 5.5× data
-    # So the workspace/data ratio grows as bpd shrinks.  For a conservative
-    # safe-at-all-bpd coefficient, use 3.  Sum with FFT_COPIES=3 gives
-    # fft_inloop = 6× data — still under-predicts at bpd=2 (20× would need)
-    # but the current floor is dominated by the *intercept* cost which
-    # scales primarily with nr and nk, not cr.  This keeps the model on
-    # the safe side for bpd ≥ 4, mildly aggressive for bpd < 4.
-    CUFFT_WS_EXTRA = 3
-    fft_inloop = (FFT_COPIES + CUFFT_WS_EXTRA) * _mem(nk, bpd, ns, nr)
+    # In-loop band-FFT workspace: query XLA directly for the exact per-rank
+    # peak its emitted FFT thunk would allocate, including cuFFT's planner-
+    # dependent scratch.  Pure-JAX, platform-portable, cached per shape — see
+    # common/fft_helpers.query_fft_peak_bytes.  Shape + sharding match the
+    # actual in-loop FFT in get_sharded_wfns_rchunk_slice: (nk, bpd, ns, nx,
+    # ny, nz) sharded on P(None, ('x','y'), None, None, None, None).
+    from common.fft_helpers import query_fft_peak_bytes
+
+    def _fft_inloop_bytes(band_chunk_val):
+        # Pass the UNSHARDED full shape — query_fft_peak_bytes applies the
+        # sharding to compute the per-rank peak.  Band axis is axis 1 of the
+        # 6-D tensor (nk, band_chunk, ns, nx, ny, nz); sharded on ('x','y')
+        # over p_x·p_y = p ranks so each rank sees bpd = band_chunk/p bands.
+        ix, iy, iz = meta.fft_grid
+        return query_fft_peak_bytes(
+            input_shape=(int(nk), int(band_chunk_val), int(ns),
+                         int(ix), int(iy), int(iz)),
+            fft_axes=(-3, -2, -1),
+            sharding=NamedSharding(
+                mesh_xy, P(None, ('x', 'y'), None, None, None, None)),
+            dtype=jnp.complex128,
+        )
+
+    fft_inloop = _fft_inloop_bytes(band_chunk)
     result = _find_r_chunk(True, fft_inloop, r_chunk_override) or \
              _find_r_chunk(False, fft_inloop, r_chunk_override)
     while result is None and bpd > 1:
         bpd = max(1, bpd // 2)
         band_chunk = min(nb, bpd * p)
         bpd = max(1, -(-band_chunk // p))
-        fft_inloop = (FFT_COPIES + CUFFT_WS_EXTRA) * _mem(nk, bpd, ns, nr)
-        peak_fft_stage = m_centroids_full + (FFT_COPIES + CUFFT_WS_EXTRA) * _mem(nk, bpd, ns, nr) + m_phase
+        fft_inloop = _fft_inloop_bytes(band_chunk)
         if verbose:
             print(f"    Reducing band_chunk to {band_chunk} (bands/device={bpd})")
         result = _find_r_chunk(True, fft_inloop, r_chunk_override) or \
@@ -265,7 +276,7 @@ def compute_optimal_chunks(
         result['peak'],
         base + 2 * m_zcol + q_chunk * result['solve_per_q'],
         base + m_zcol + q_gather * result['gather_per_q'],
-        peak_fft_stage, m_centroids_full + m_centroids, stage_cct)
+        peak_centroid_fft_stage, m_centroids_full + m_centroids, stage_cct)
 
     k_chunk = result['k_batch']
     if k_chunk < int(nk) and verbose:

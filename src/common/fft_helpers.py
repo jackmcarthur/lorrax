@@ -8,6 +8,96 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 
 
+# =============================================================================
+# FFT workspace query (for memory-model sizing)
+# =============================================================================
+# The stage-cost memory model in ``gw_init.compute_optimal_chunks`` (and the
+# V_q chooser in ``compute_vcoul._choose_v_q_chunks``) needs the per-rank peak
+# HBM an ``N``-D batched FFT will allocate.  Nominal ``N_copies × data_size``
+# fudge factors under-predict badly for mixed-radix boxes (24 = 2³·3, 10 = 2·5)
+# at small batch sizes — cuFFT's planner picks different algorithms there with
+# non-linear workspace growth.
+#
+# Rather than query cuFFT via ctypes (fragile across shifter / conda / bare-
+# metal JAX builds and may not match XLA's actual plan choice), we AOT-compile
+# the exact ``jnp.fft.fftn`` XLA would emit, read its ``memory_analysis()``,
+# and cache the result — pure JAX, works wherever JAX works.
+#
+# This function is called statically at chooser time (never in a hot loop), so
+# the ~1-2 s per-shape compile cost is amortised across the full run.  Two
+# canonical uses in the pipeline:
+#   * Wavefunction-box FFT:   shape = fft_grid (nx, ny, nz), batched by
+#                             nk × bpd × ns (in-loop ψ_G → ψ_r).
+#   * k-grid FFT (ZCT / CCT): shape = kgrid (nkx, nky, nkz), batched by
+#                             μ × cr or μ × μ.
+
+_fft_workspace_cache: dict = {}
+
+
+def query_fft_peak_bytes(
+    *,
+    input_shape: tuple[int, ...],
+    fft_axes: tuple[int, ...],
+    sharding: NamedSharding,
+    dtype=jnp.complex128,
+) -> int:
+    """AOT-compile a ``jnp.fft.fftn`` over the given input/sharding and
+    return the XLA-measured total peak bytes PER RANK.
+
+    "Peak" here is ``temp + argument + output − alias`` from
+    ``compiled.memory_analysis()`` — the full per-rank HBM footprint of
+    a standalone FFT jit (input buffer + output buffer + cuFFT scratch,
+    minus donated-alias savings).  Subtract what you already count in
+    other stage terms if you only want the "extra" workspace.
+
+    Caches by ``(input_shape, fft_axes, sharding.spec, dtype_str,
+    mesh_shape)``, so each unique FFT shape compiles once per process.
+    """
+    mesh = sharding.mesh
+    key = (tuple(input_shape), tuple(fft_axes),
+           str(sharding.spec), jnp.dtype(dtype).str,
+           tuple(mesh.axis_names),
+           tuple(int(mesh.shape[a]) for a in mesh.axis_names))
+    hit = _fft_workspace_cache.get(key)
+    if hit is not None:
+        return hit
+
+    spec = jax.ShapeDtypeStruct(
+        tuple(int(s) for s in input_shape), dtype, sharding=sharding)
+
+    @jax.jit
+    def _fft(x):
+        return jnp.fft.fftn(x, axes=tuple(fft_axes))
+
+    try:
+        compiled = _fft.lower(spec).compile(
+            compiler_options={"xla_gpu_memory_limit_slop_factor": 10000})
+    except Exception:
+        # If AOT compile fails (unusual — happens e.g. when called before
+        # JAX has a backend), fall back to an over-conservative estimate:
+        # 3× data size.  Logged so the caller notices.
+        elem = jnp.dtype(dtype).itemsize
+        total_elems = 1
+        for s in input_shape:
+            total_elems *= int(s)
+        # Divide by total device count for per-rank estimate (approximate
+        # — assumes input is sharded across all devices).
+        n_devs = 1
+        for a in mesh.axis_names:
+            n_devs *= int(mesh.shape[a])
+        fallback = 3 * total_elems * elem // max(1, n_devs)
+        _fft_workspace_cache[key] = fallback
+        return fallback
+
+    m = compiled.memory_analysis()
+    total = (int(m.temp_size_in_bytes)
+             + int(m.argument_size_in_bytes)
+             + int(m.output_size_in_bytes)
+             - int(m.alias_size_in_bytes))
+    _fft_workspace_cache[key] = total
+    return total
+
+
 def compute_block_size_for_2d_cholesky(n_rmu: int, Pr: int, Pc: int) -> tuple[int, int]:
     """
     Compute block size for 2D blocked Cholesky that satisfies distribution constraints.
