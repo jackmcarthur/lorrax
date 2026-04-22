@@ -578,8 +578,6 @@ def prepare_isdf_and_wavefunctions(
 				target_utilization=cfg.chunk_target_utilization,
 				n_b_left=band_slices.b3 - band_slices.b0,
 				n_b_right=band_slices.b4 - band_slices.b1,
-				pair_density_channels=(1 if cfg.isdf_pair_mode == "spin_traced"
-				                       else meta.nspinor ** 2),
 				r_chunk_override=cfg.r_chunk_override if cfg.r_chunk_override > 0 else None,
 				zct_stage_cap_gb=cfg.zct_stage_cap_gb,
 			)
