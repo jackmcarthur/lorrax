@@ -36,15 +36,14 @@ is non-trivial; val and -ω branches use a single Laplace window.
 File layout
 -----------
 
-    data classes               PPMBuildResult / SigmaOmegaResult / _SigmaWindow / _SigmaPhysicsState / _SigmaBranch
+    data classes               PPMBuildResult / SigmaOmegaResult / _SigmaWindow / _SigmaPhysicsState
     leaf jits (physics)        _prepare_sigma_state · _project_tau_onto_omega
     cached kernel factories    _get_sigma_kij_kernel · _get_sigma_tau_kernel
     PPM fit                    fit_gn_ppm
     host-side window build     _build_single_sigma_window · _build_three_sigma_windows
     accumulators               _SigmaAccumulator protocol
                                _ReduceScatterGpuAccumulator · _StreamedH5Accumulator
-    branch orchestration       _build_windows_for_branch (host) · _integrate_tau_windows_for_branch (device)
-                               _run_sigma_branch (thin orchestrator)
+    branch orchestration       _run_sigma_branch (builds windows, integrates τ loop)
     top-level driver           compute_sigma_c_ppm_omega_grid
 """
 
@@ -107,63 +106,6 @@ class _SigmaWindow:
     mask_B_mode: str = "explicit"
     mask_B_threshold: float | None = None
     crossing_kind: str | None = None
-
-
-# ---------------------------------------------------------------------------
-#  Branch enumeration — the four (ω sign × cond/val) calls that together
-#  sum to Σ_c(ω).  Split into a NamedTuple so every caller sees the same
-#  physics labeling without copy-pasted kwargs.
-# ---------------------------------------------------------------------------
-
-class _SigmaBranch(NamedTuple):
-    """One branch of the Σ_c(ω) sum.  Four branches cover ω ∈ ℝ."""
-    tag: str                    # human label ("ω≥E_F cond" etc.) — drives progress output
-    E_A: jax.Array              # (nk, nb) energy-above-Fermi for A-space (E_cond or H_val)
-    base_mask_A: jax.Array      # (nk, nb) bool — which bands in A-space contribute
-    kernel_sign: int            # +1 (Laplace on E_A ≥ 0)  /  -1 (sign-flipped kernel)
-    scale: float                # global prefactor from ω ↔ -ω symmetry (±1)
-    omega_abs: np.ndarray       # non-negative ω values to evaluate at (|ω_rel|)
-    omega_idx: np.ndarray       # global ω indices these map into
-
-
-def _iter_branches(
-    *,
-    omega_pos: np.ndarray, idx_pos: np.ndarray,
-    omega_neg_abs: np.ndarray, idx_neg: np.ndarray,
-    E_cond: jax.Array, H_val: jax.Array,
-    cond_mask: jax.Array, val_mask: jax.Array,
-) -> list[_SigmaBranch]:
-    """Enumerate the 4 branches, skipping empty ω halves.
-
-    Why the flipped signs?
-
-        +ω  half:  Σ_c is a Laplace transform on E_A = E_c - E_F  (kernel_sign=+1).
-                   For the val space, E_A = E_F - E_v ≥ 0 but the kernel picks up
-                   the opposite sign so kernel_sign=-1 on the val side.
-        -ω  half:  evaluate at |ω| and exploit Σ_c(-ω) = -[Σ_c(ω)]^* for the same
-                   (E_A, mask) structure.  This means scale=-1 globally and
-                   kernel_sign swaps between cond and val relative to the +ω half.
-    """
-    branches: list[_SigmaBranch] = []
-    if omega_pos.size:
-        branches += [
-            _SigmaBranch(tag="ω≥E_F cond", E_A=E_cond, base_mask_A=cond_mask,
-                         kernel_sign=+1, scale=+1.0,
-                         omega_abs=omega_pos, omega_idx=idx_pos),
-            _SigmaBranch(tag="ω≥E_F val",  E_A=H_val,  base_mask_A=val_mask,
-                         kernel_sign=-1, scale=+1.0,
-                         omega_abs=omega_pos, omega_idx=idx_pos),
-        ]
-    if omega_neg_abs.size:
-        branches += [
-            _SigmaBranch(tag="ω<E_F cond", E_A=E_cond, base_mask_A=cond_mask,
-                         kernel_sign=-1, scale=-1.0,
-                         omega_abs=omega_neg_abs, omega_idx=idx_neg),
-            _SigmaBranch(tag="ω<E_F val",  E_A=H_val,  base_mask_A=val_mask,
-                         kernel_sign=+1, scale=-1.0,
-                         omega_abs=omega_neg_abs, omega_idx=idx_neg),
-        ]
-    return branches
 
 
 def _to_host_np(a, dtype=np.complex128, *, tiled: bool = False):
@@ -800,7 +742,7 @@ def _build_three_sigma_windows(
 # ---------------------------------------------------------------------------
 
 class _SigmaAccumulator:
-    """Minimal protocol used by _integrate_tau_windows_for_branch.
+    """Minimal protocol used by the τ loop in _run_sigma_branch.
 
     Lifecycle per branch:
         acc.begin_window()
@@ -1025,162 +967,6 @@ def _build_windows_for_branch(
     return windows
 
 
-def _integrate_tau_windows_for_branch(
-    *,
-    windows: list[_SigmaWindow],
-    omega_vec: jax.Array,
-    accumulator: _SigmaAccumulator,
-    E_A: jax.Array,
-    B_q: jax.Array,
-    Omega_q: jax.Array,
-    base_mask_B: jax.Array,
-    psi_coh_xn: jax.Array,
-    psi_coh_yr: jax.Array,
-    psi_proj_xr: jax.Array,
-    psi_proj_yn: jax.Array,
-    tau_kernel: Callable[..., jax.Array],
-    tau_scan_kernel: Callable[[str], Callable[..., jax.Array]] | None,
-    mesh_xy: Mesh,
-    scale: float,
-    log_tag: str,
-    print_fn,
-) -> None:
-    """Walk windows; for each, either lax.scan the τ nodes in one device-side
-    pass (fast path — accumulator supplies ``run_window_scan``) or fall back
-    to the Python per-τ loop calling ``add_tau`` one at a time (for streamed
-    writers that need each τ projection flushed to disk).
-
-    Whether the result lands on GPU or disk is the accumulator's concern,
-    not this loop's — see _ReduceScatterGpuAccumulator / _StreamedH5Accumulator.
-
-    Future τ-batching hook (NOT yet wired — left for the shard_map refactor):
-
-        The per-τ python loop below serializes on a block_until_ready after
-        each tau_kernel call, so XLA cannot fuse across τ.  With the
-        reduce-scatter upstream in place, tau_kernel's output becomes
-        small enough that we can:
-
-            t_nodes_j = jnp.asarray(win.t_nodes, dtype=jnp.complex128)   # (n_τ,)
-            alphas_j  = jnp.asarray(win.alpha,   dtype=jnp.float64)      # (n_τ,)
-
-            @jax.jit
-            def _scan_body(acc, tau_ctx):
-                t_j, a_j = tau_ctx
-                sigma_re, sigma_im = tau_kernel(..., t_j, ...)
-                acc = acc + _project_tau_onto_omega(
-                    sigma_re, sigma_im, ω_vec, t_j, a_j, ...)
-                return acc, None
-
-            win_acc, _ = jax.lax.scan(_scan_body, zeros, (t_nodes_j, alphas_j))
-
-        That collapses N_τ jit dispatches into 1 compile, one NCCL fence per
-        window instead of per τ, and lets XLA schedule the D2H overlap of
-        subsequent windows.  Only safe once σ^τ is shard-scatter'd — today a
-        scan over replicated σ^τ would blow up HBM because all τ contribs
-        would coexist during the scan trace.
-
-    m-chunking hook for the accumulator (also NOT wired): add_tau's
-    ``omega_global_idx`` slot is currently unused by _ReduceScatterGpuAccumulator
-    but is a natural place to pass an m-chunk selector; default (None) is
-    one m-strip per x-rank (= m/p).  Wire when upstream RS lands.
-    """
-    from common.progress import LoopProgress
-
-    branch_label = log_tag if log_tag else "sigma"
-    total_tau_nodes = sum(int(win.alpha.shape[0]) for win in windows)
-    progress = LoopProgress(
-        total_tau_nodes, print_fn, title=f"sigma[{branch_label}]",
-        item_name="tau node", max_updates=10)
-
-    use_scan_path = tau_scan_kernel is not None and hasattr(accumulator, "run_window_scan")
-
-    with jax_profile.annotation(f"sigma_branch[{branch_label}]"):
-        for win_idx, win in enumerate(windows):
-            with jax_profile.step_annotation(
-                "sigma_window", step_num=win_idx,
-                detail=f"{branch_label}:{win.name}:n{int(win.alpha.shape[0])}",
-            ):
-                mask_A = jnp.asarray(win.mask_A)
-                mask_B = _materialize_window_mask_B(
-                    win, base_mask_B=base_mask_B, Omega_q=Omega_q)
-                E_ref_A_j = jnp.asarray(win.E_ref_A, dtype=jnp.float64)
-                E_ref_B_j = jnp.asarray(win.E_ref_B, dtype=jnp.float64)
-                if win.project not in ("full", "imag"):
-                    raise ValueError(
-                        f"Unknown window projection {win.project!r}; "
-                        f"expected 'full' (Laplace) or 'imag' (crossing).")
-                project_str = str(win.project)
-                omega_sign_j = jnp.asarray(float(win.omega_sign), dtype=jnp.float64)
-                pref_j = jnp.asarray(win.prefactor * scale, dtype=jnp.float64)
-
-                if use_scan_path:
-                    # Fast path: one jit dispatch per window instead of N_τ.
-                    # tau_scan_kernel is a resolver (project: str) → compiled
-                    # scan kernel so project bakes into compile at factory time.
-                    t_nodes_j = jnp.asarray(win.t_nodes, dtype=jnp.complex128)
-                    alpha_nodes_j = jnp.asarray(win.alpha, dtype=jnp.complex128)
-                    accumulator.run_window_scan(
-                        tau_scan_kernel(project_str),
-                        t_nodes=t_nodes_j,
-                        alpha_nodes=alpha_nodes_j,
-                        window_args=dict(
-                            psi_coh_xn=psi_coh_xn,
-                            psi_coh_yr=psi_coh_yr,
-                            psi_proj_xr=psi_proj_xr,
-                            psi_proj_yn=psi_proj_yn,
-                            E_A=E_A, mask_A=mask_A,
-                            B_q=B_q, Omega_q=Omega_q, mask_B=mask_B,
-                            E_ref_A=E_ref_A_j, E_ref_B=E_ref_B_j,
-                            omega_vec=omega_vec, pref=pref_j,
-                            omega_sign=omega_sign_j,
-                        ),
-                    )
-                    # Advance progress bar by the whole window (the scan is
-                    # atomic from the Python side).
-                    for _ in range(int(win.alpha.shape[0])):
-                        progress.step()
-                    continue
-
-                accumulator.begin_window()
-                for t_node, alpha_node in zip(win.t_nodes, win.alpha):
-                    t_node_j = jnp.asarray(t_node, dtype=jnp.complex128)
-                    # σ^τ is returned as a (re, im) tuple rather than a complex
-                    # or a stacked (2, …) array: the crossing window's HGL
-                    # quadrature keeps only Im[coeff·σ], so carrying complex
-                    # through the FFT stack would double HBM and collective
-                    # traffic; and returning a tuple from the shard_map lets
-                    # Python unpack it without triggering the gather+broadcast
-                    # pair that indexing a sharded (2, nk, …) array would
-                    # emit.  See _project_tau_onto_omega for the downstream
-                    # recombination (project='full' keeps the full complex
-                    # product; project='imag' keeps only Im[coeff·σ]).
-                    sigma_tau_kij_re, sigma_tau_kij_im = tau_kernel(
-                        psi_coh_xn, psi_coh_yr,
-                        psi_proj_xr, psi_proj_yn,
-                        E_A, mask_A, B_q, Omega_q, mask_B,
-                        E_ref_A_j, E_ref_B_j, t_node_j,
-                    )
-                    sigma_tau_kij_re.block_until_ready()
-                    progress.step()
-
-                    # α_eff = α(τ) · exp[-i·(E_ref_A + E_ref_B)·τ]  — the minimax
-                    # quadrature weight for this τ node, phase-shifted so the
-                    # Laplace transform kernel sees E_A and Ω_q as ≥ 0 arguments.
-                    alpha_eff = complex(alpha_node) * np.exp(
-                        -1j * (win.E_ref_A + win.E_ref_B) * t_node)
-                    alpha_eff_j = jnp.asarray(alpha_eff, dtype=jnp.complex128)
-
-                    accumulator.add_tau(
-                        sigma_tau_kij_re, sigma_tau_kij_im, omega_vec,
-                        t_node_j, alpha_eff_j, omega_sign_j, pref_j,
-                        project=project_str,
-                    )
-
-                accumulator.end_window()
-
-    progress.finish()
-
-
 def _run_sigma_branch(
     *,
     omega_nonneg_ry: np.ndarray,
@@ -1207,12 +993,28 @@ def _run_sigma_branch(
     scale: float = 1.0,
     use_shipped_minimax_tables: bool = True,
 ) -> tuple[jax.Array, list[_SigmaWindow]]:
-    """Orchestrator for one branch (cond or val × pos or neg ω half).
+    """Drive one Σ_c branch: build windows on host, integrate τ nodes on device.
 
-    Reads as a physics outline:
-        windows = _build_windows_for_branch(...)          # host
-        acc     = _integrate_tau_windows_for_branch(...)  # device
+    Physics outline:
+        windows = _build_windows_for_branch(...)      # host minimax build
+        for win in windows:
+            for τ, α in zip(win.t_nodes, win.alpha):
+                σ^τ = tau_kernel(...)                 # G(τ)·W(τ) + project
+                acc += _project_tau_onto_omega(σ^τ)   # ω-kernel × quad α
+
+    The τ loop is Python-serial: each tau_kernel dispatch is async and
+    XLA overlaps its collectives with the next step's dispatch (see the
+    _get_sigma_tau_scan_kernel docstring for why lax.scan is not the
+    default path).
+
+    Whether ``acc`` lands on GPU or is streamed to disk is the
+    accumulator's concern — see _ReduceScatterGpuAccumulator /
+    _StreamedH5Accumulator.  m-chunking hook (NOT wired): add_tau's
+    ``omega_global_idx`` slot is currently unused but is a natural place
+    to pass an m-chunk selector; default (None) is one m-strip per x-rank.
     """
+    from common.progress import LoopProgress
+
     omega_nonneg_ry = np.asarray(omega_nonneg_ry, dtype=np.float64)
     n_omega = int(omega_nonneg_ry.shape[0])
 
@@ -1249,24 +1051,11 @@ def _run_sigma_branch(
     )
     # lax.scan variant is available (see _get_sigma_tau_scan_kernel) but
     # NOT wired by default.  At MoS2 3×3 scale (276 τ, 5 s Python-loop
-    # baseline) it actually regresses sigma_ppm by ~80% because:
-    #   (a) each distinct n_τ compiles a separate scan module (9, 13, 103,
-    #       125 in this run → 4 compiles);
-    #   (b) XLA inlines tau_kernel into the scan module, producing
-    #       a single big module whose static schedule can't overlap
-    #       collectives the way Python's async-dispatch-with-block-until
-    #       pattern does;
-    #   (c) compile cost isn't amortized by persistent cache within a run.
-    # The scan path becomes the right choice once (a) individual τ dispatches
-    # get expensive (larger mesh, bigger n_rmu) or (b) we pad all windows
-    # to a single n_τ and reuse one compile.  Flip to:
-    #     tau_scan_kernel = _get_sigma_tau_scan_kernel(mesh_xy, ...)
-    # to enable, accumulator's run_window_scan will pick it up.
-    tau_scan_kernel = None
+    # baseline) it actually regresses sigma_ppm by ~80% — per-tau async
+    # dispatch beats a single big scan module that can't overlap
+    # collectives.  See the scan factory docstring for details.
 
     if stream_writer is None:
-        # Reduce-scatter-shaped accumulator with run_window_scan → tau_scan_kernel
-        # owns the per-window τ loop; one jit dispatch per window instead of N_τ.
         accumulator: _SigmaAccumulator = _ReduceScatterGpuAccumulator(
             shape=(n_omega, nk_proj, nb_proj, nb_proj),
             mesh_xy=mesh_xy,
@@ -1278,17 +1067,65 @@ def _run_sigma_branch(
             omega_batch_size=int(max(1, omega_batch_size)),
         )
 
-    _integrate_tau_windows_for_branch(
-        windows=windows, omega_vec=omega_vec, accumulator=accumulator,
-        E_A=E_A, B_q=B_q, Omega_q=Omega_q, base_mask_B=base_mask_B,
-        psi_coh_xn=psi_coh_xn, psi_coh_yr=psi_coh_yr,
-        psi_proj_xr=psi_proj_xr, psi_proj_yn=psi_proj_yn,
-        tau_kernel=tau_kernel,
-        tau_scan_kernel=tau_scan_kernel,
-        mesh_xy=mesh_xy,
-        scale=scale,
-        log_tag=log_tag, print_fn=print_fn,
-    )
+    branch_label = log_tag if log_tag else "sigma"
+    total_tau_nodes = sum(int(win.alpha.shape[0]) for win in windows)
+    progress = LoopProgress(
+        total_tau_nodes, print_fn, title=f"sigma[{branch_label}]",
+        item_name="tau node", max_updates=10)
+
+    with jax_profile.annotation(f"sigma_branch[{branch_label}]"):
+        for win_idx, win in enumerate(windows):
+            with jax_profile.step_annotation(
+                "sigma_window", step_num=win_idx,
+                detail=f"{branch_label}:{win.name}:n{int(win.alpha.shape[0])}",
+            ):
+                mask_A = jnp.asarray(win.mask_A)
+                mask_B = _materialize_window_mask_B(
+                    win, base_mask_B=base_mask_B, Omega_q=Omega_q)
+                E_ref_A_j = jnp.asarray(win.E_ref_A, dtype=jnp.float64)
+                E_ref_B_j = jnp.asarray(win.E_ref_B, dtype=jnp.float64)
+                if win.project not in ("full", "imag"):
+                    raise ValueError(
+                        f"Unknown window projection {win.project!r}; "
+                        f"expected 'full' (Laplace) or 'imag' (crossing).")
+                project_str = str(win.project)
+                omega_sign_j = jnp.asarray(float(win.omega_sign), dtype=jnp.float64)
+                pref_j = jnp.asarray(win.prefactor * scale, dtype=jnp.float64)
+
+                accumulator.begin_window()
+                for t_node, alpha_node in zip(win.t_nodes, win.alpha):
+                    t_node_j = jnp.asarray(t_node, dtype=jnp.complex128)
+                    # σ^τ is returned as a (re, im) tuple so the crossing
+                    # window's HGL quadrature (which keeps only Im[coeff·σ])
+                    # doesn't carry a complex σ^τ through the FFT stack
+                    # (would double HBM + collective traffic).  See
+                    # _project_tau_onto_omega for how project='full' vs
+                    # 'imag' recombines the (re, im) parts.
+                    sigma_tau_kij_re, sigma_tau_kij_im = tau_kernel(
+                        psi_coh_xn, psi_coh_yr,
+                        psi_proj_xr, psi_proj_yn,
+                        E_A, mask_A, B_q, Omega_q, mask_B,
+                        E_ref_A_j, E_ref_B_j, t_node_j,
+                    )
+                    sigma_tau_kij_re.block_until_ready()
+                    progress.step()
+
+                    # α_eff = α(τ) · exp[-i·(E_ref_A + E_ref_B)·τ]  — the minimax
+                    # quadrature weight for this τ node, phase-shifted so the
+                    # Laplace transform kernel sees E_A and Ω_q as ≥ 0 arguments.
+                    alpha_eff = complex(alpha_node) * np.exp(
+                        -1j * (win.E_ref_A + win.E_ref_B) * t_node)
+                    alpha_eff_j = jnp.asarray(alpha_eff, dtype=jnp.complex128)
+
+                    accumulator.add_tau(
+                        sigma_tau_kij_re, sigma_tau_kij_im, omega_vec,
+                        t_node_j, alpha_eff_j, omega_sign_j, pref_j,
+                        project=project_str,
+                    )
+
+                accumulator.end_window()
+
+    progress.finish()
 
     acc_total = accumulator.finalize()
     if acc_total is None:
@@ -1485,26 +1322,40 @@ def compute_sigma_c_ppm_omega_grid(
         )
 
         # Enumerate the 4 branches (ω sign × cond/val), skipping empty ω halves.
-        # See _iter_branches for the sign/scale convention derivation.
-        branches = _iter_branches(
-            omega_pos=omega_pos, idx_pos=idx_pos,
-            omega_neg_abs=omega_neg_abs, idx_neg=idx_neg,
-            E_cond=E_cond, H_val=H_val,
-            cond_mask=cond_mask, val_mask=val_mask,
-        )
+        #
+        # Sign/scale convention:
+        #   +ω half: Σ_c is a Laplace transform on E_A = E_c - E_F (kernel_sign=+1).
+        #            For val, E_A = E_F - E_v ≥ 0 but the kernel picks up the
+        #            opposite sign → kernel_sign=-1 on the val side.
+        #   -ω half: evaluate at |ω| and exploit Σ_c(-ω) = -[Σ_c(ω)]^* for the
+        #            same (E_A, mask) structure → scale=-1 globally; kernel_sign
+        #            swaps between cond and val relative to the +ω half.
+        #
+        # Tuple fields: (tag, E_A, base_mask_A, kernel_sign, scale, ω_abs, ω_idx).
+        branches: list[tuple] = []
+        if omega_pos.size:
+            branches += [
+                ("ω≥E_F cond", E_cond, cond_mask, +1, +1.0, omega_pos, idx_pos),
+                ("ω≥E_F val",  H_val,  val_mask,  -1, +1.0, omega_pos, idx_pos),
+            ]
+        if omega_neg_abs.size:
+            branches += [
+                ("ω<E_F cond", E_cond, cond_mask, -1, -1.0, omega_neg_abs, idx_neg),
+                ("ω<E_F val",  H_val,  val_mask,  +1, -1.0, omega_neg_abs, idx_neg),
+            ]
 
         # Sum cond+val per ω-half before gathering to host.  Preserves the
         # original traversal order so reduction ordering stays bit-identical.
         per_half: dict[tuple, jax.Array] = {}
-        for br in branches:
+        for tag, E_A_br, base_mask_br, ksign, bscale, omega_abs, omega_idx in branches:
             sigma_kij, _ = _run_sigma_branch(
-                omega_nonneg_ry=br.omega_abs, omega_global_idx=br.omega_idx,
-                E_A=br.E_A, base_mask_A=br.base_mask_A,
-                kernel_sign=br.kernel_sign,
-                log_tag=br.tag, scale=br.scale,
+                omega_nonneg_ry=omega_abs, omega_global_idx=omega_idx,
+                E_A=E_A_br, base_mask_A=base_mask_br,
+                kernel_sign=ksign,
+                log_tag=tag, scale=bscale,
                 **common_branch_kwargs,
             )
-            key = tuple(br.omega_idx.tolist())
+            key = tuple(omega_idx.tolist())
             per_half[key] = (per_half[key] + sigma_kij) if key in per_half else sigma_kij
 
         if not use_kij_stream:
