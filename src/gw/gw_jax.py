@@ -100,6 +100,12 @@ from .ppm_sigma import (
 	fit_gn_ppm,
 	compute_sigma_c_ppm_omega_grid,
 )
+from .cohsex_sigma import (
+	build_Gij,
+	compute_sigma_cohsex,
+	get_cohsex_kernels,
+	_add_static_head,
+)
 from .qsgw_utils import (
 	print_scf_diagnostics,
 	solve_diagonal_sigma_fixed_point,
@@ -111,9 +117,8 @@ from .head_correction import (
 	format_head_sample_diagnostics,
 	format_static_head_diagnostics,
 	resolve_head_sample,
-	static_head_terms_to_kij,
 )
-from .wavefunction_bundle import BandSlices, G_FFT7D_SPEC, V_FFT5D_SPEC
+from .wavefunction_bundle import BandSlices
 from mixing.acceleration import (
     rcrop_nojit, hermitian_to_upper_flat, upper_flat_to_hermitian
 )
@@ -127,21 +132,7 @@ import builtins
 
 # ================= ISDF sigma =================
 #
-# Sigma_SX  = -project[ FFT[ G_occ(R) * W(R) / sqrt(Nk) ] ]
-# Sigma_COH = +project[ FFT[ G_RI(R) * (W-V)(R) / (2*sqrt(Nk)) ] ]
-# V_H       = project[ V0 * rho ]
-
-from .projection_kernel import project as _project
-
-def _hartree(wfns, Gij, V_q, nk_tot):
-	"""V_H(m,n,k) = <m| V(q=0,noG0) * rho |n>.  V_q is flat-k (nk,μ,μ); uses V_q[0]."""
-	s = wfns.slices
-	psi_yr, psi_xr = wfns.yr(s.sigma), wfns.xr(s.sigma)
-	rho = jnp.real(jnp.einsum('kisx,kjsx,kij->x', jnp.conj(psi_yr), psi_yr, Gij, optimize=True))
-	Vrho = jnp.einsum('xy,y->x', V_q[0], rho / jnp.asarray(nk_tot, dtype=jnp.float64), optimize=True)
-	return jnp.einsum('kmsx,x,knsx->kmn', jnp.conj(psi_xr), Vrho, psi_xr, optimize=True)
-
-from .greens_function_kernel import build_G
+# Static COHSEX kernels (Σ_SX, Σ_COH, V_H) live in cohsex_sigma.py.
 
 
 def _build_mesh():
@@ -151,23 +142,6 @@ def _build_mesh():
 	while gx > 1 and total % gx != 0:
 		gx -= 1
 	return Mesh(np.array(jax.devices()).reshape(gx, total // gx), ['x', 'y'])
-
-
-def _build_Gij(meta, mesh_xy):
-	"""Occupation projector G_ij = diag(1,...,1,0,...,0) for sigma bands.
-
-	─ NOTE TO FUTURE EDITORS — THE numpy USAGE BELOW IS INTENTIONAL ─
-	(nk, nb_sigma, nb_sigma) is a tiny host-side matrix (<1 MiB in
-	every realistic case).  The all-``jnp`` version fired 8 standalone
-	pjits per call (zeros, eye, dynamic_slice, scatter, convert) for
-	zero runtime benefit.  Commit 7781b80 (2026-04-18) converted to
-	numpy; the ``device_put`` at the end places it on the mesh.
-	DO NOT "fix" back to ``jnp``.
-	"""
-	nocc = min(meta.nelec, meta.nb_sigma)
-	Gij = np.zeros((meta.nk_tot, meta.nb_sigma, meta.nb_sigma), dtype=np.complex128)
-	Gij[:, :nocc, :nocc] = np.eye(nocc, dtype=np.complex128)
-	return jax.device_put(jnp.asarray(Gij), NamedSharding(mesh_xy, P(None, None, None)))
 
 
 def _compute_static_head(config, input_dir, wfn, sym, meta, do_screened, print0):
@@ -350,7 +324,7 @@ def main(argv=None):
 
 	if not config.do_screened:
 		W_q = V_q  # unscreened: W = V
-	Gij = _build_Gij(meta, mesh_xy)
+	Gij = build_Gij(meta, mesh_xy)
 
 	# q→0 head correction (exact band-diagonal terms for static COHSEX)
 	static_head_terms = None
@@ -358,77 +332,19 @@ def main(argv=None):
 		static_head_terms = _compute_static_head(
 			config, input_dir, wfn, sym, meta, config.do_screened, print0)
 
-	kgrid = meta.kgrid
-	_nk_tot = int(meta.nk_tot)
-
-	# FFT helpers: flat-k ↔ flat-R.  Callers pass flat arrays, never see 3D k-grid.
-	from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
-
-	_G_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
-	_G_fftn  = make_flat_k_fftn( mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
-	_V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
-
-	_inv_sqrt_nk = -1.0 / jnp.sqrt(_nk_tot)
-
-	@jax.jit
-	def _convolve(G_k, V_or_W, prefactor):
-		G_R = _G_ifftn(G_k)
-		V_R = _V_ifftn(V_or_W)[:, None, :, None, :]
-		return prefactor * _G_fftn(G_R * V_R * _inv_sqrt_nk)
-
-	# ---- Static COHSEX: Σ_SX, Σ_COH, V_H ----
-
-	@jax.jit
-	def sigma_sx(wfns, Gij, W_q):
-		s = wfns.slices
-		G_occ = build_G(wfns.xn(s.sigma), wfns.yr(s.sigma), Gij=Gij)
-		return _project(wfns.xr(s.sigma), wfns.yn(s.sigma), _convolve(G_occ, W_q, 1.0))
-
-	@jax.jit
-	def sigma_coh(wfns, W_q, V_q):
-		s = wfns.slices
-		G_ri = build_G(wfns.xn(s.full), wfns.yr(s.full))
-		return _project(wfns.xr(s.sigma), wfns.yn(s.sigma), _convolve(G_ri, W_q - V_q, -0.5))
-
-	@jax.jit
-	def hartree(wfns, Gij, V_q):
-		return _hartree(wfns, Gij, V_q, _nk_tot)
-
-	def _add_head(sig_sx, sig_coh):
-		if static_head_terms is None:
-			return sig_sx, sig_coh
-		sx_h, coh_h = static_head_terms_to_kij(
-			static_head_terms, nk_tot=meta.nk_tot, do_screened=config.do_screened)
-		if not config.do_screened:
-			coh_h = jnp.zeros_like(coh_h)
-		rep = NamedSharding(mesh_xy, P(None, None, None))
-		return sig_sx + jax.device_put(sx_h, rep), sig_coh + jax.device_put(coh_h, rep)
-
-	# ---- Execute static COHSEX ----
+	# ---- Static COHSEX: Σ_SX, Σ_COH, V_H + bare Σ_X ----
 	import gc; gc.collect()
-	with mesh_xy:
-		with timing.section("gw_jax.sigma"):
-			sig_sx  = sigma_sx(wfns, Gij, W_q)
-			sig_coh = sigma_coh(wfns, W_q, V_q)
-			sig_h   = hartree(wfns, Gij, V_q)
-
-			sig_sx, sig_coh = _add_head(sig_sx, sig_coh)
-
-			sig_sx.block_until_ready()
-			sig_coh.block_until_ready()
-			sig_h.block_until_ready()
-
-	# Bare exchange Σ_X (used for both COHSEX comparison and PPM Σ^c = Σ_xc - Σ_X)
-	with mesh_xy:
-		sig_x = sigma_sx(wfns, Gij, V_q)
-	sig_x.block_until_ready()
-
-	# Add bare-exchange head correction (q→0 contribution)
-	if static_head_terms is not None:
-		x_head, _ = static_head_terms_to_kij(
-			static_head_terms, nk_tot=meta.nk_tot, do_screened=False)
-		rep = NamedSharding(mesh_xy, P(None, None, None))
-		sig_x = sig_x + jax.device_put(x_head, rep)
+	with timing.section("gw_jax.sigma"):
+		cohsex = compute_sigma_cohsex(
+			wfns, V_q, W_q, meta, mesh_xy,
+			Gij=Gij, do_screened=config.do_screened,
+			static_head_terms=static_head_terms,
+			compute_bare_x=True,
+		)
+	sig_sx  = cohsex["sig_sx"]
+	sig_coh = cohsex["sig_coh"]
+	sig_h   = cohsex["sig_h"]
+	sig_x   = cohsex["sig_x"]
 
 	# Print bare Σ_X diagonal for ISDF quality assessment
 	sig_x_diag = np.real(np.diagonal(np.asarray(sig_x), axis1=1, axis2=2)) * ryd2ev
@@ -612,7 +528,13 @@ def main(argv=None):
 			f"({100*qsgw['frac_interp_clipped']:.1f}%)")
 
 	if config.self_consistent:
-		# SC-COHSEX iteration
+		# SC-COHSEX iteration — reuse the cached jit'd kernels directly so
+		# the fixed-point driver can vary Gij.
+		sigma_sx_k, sigma_coh_k, hartree_k = get_cohsex_kernels(meta, mesh_xy)
+		def _add_head(a, b):
+			return _add_static_head(
+				a, b, static_head_terms=static_head_terms,
+				meta=meta, mesh_xy=mesh_xy, do_screened=config.do_screened)
 		n_upper = meta.nb_sigma * (meta.nb_sigma + 1) // 2
 		nk = meta.nk_tot
 
@@ -624,9 +546,9 @@ def main(argv=None):
 			f = (jnp.arange(meta.nb_sigma) < meta.nelec).astype(jnp.float64)
 			Gij_new = jnp.einsum('kim,m,kjm->kij', U, f, jnp.conj(U), optimize=True)
 			with mesh_xy:
-				sx_new = sigma_sx(wfns, Gij_new, W_q)
-				coh_new = sigma_coh(wfns, W_q, V_q)
-				h_new = hartree(wfns, Gij_new, V_q)
+				sx_new = sigma_sx_k(wfns, Gij_new, W_q)
+				coh_new = sigma_coh_k(wfns, W_q, V_q)
+				h_new = hartree_k(wfns, Gij_new, V_q)
 			sx_new, coh_new = _add_head(sx_new, coh_new)
 			return hermitian_to_upper_flat(sx_new + coh_new + h_new).flatten()
 
@@ -644,9 +566,9 @@ def main(argv=None):
 		Gij_final = jnp.einsum('kim,m,kjm->kij', U_full, f, jnp.conj(U_full), optimize=True)
 		print_scf_diagnostics(Gij_final, U_full, meta.nelec, meta.nb_sigma, print0)
 		with mesh_xy:
-			sig_sx  = sigma_sx(wfns, Gij_final, W_q)
-			sig_coh = sigma_coh(wfns, W_q, V_q)
-			sig_h   = hartree(wfns, Gij_final, V_q)
+			sig_sx  = sigma_sx_k(wfns, Gij_final, W_q)
+			sig_coh = sigma_coh_k(wfns, W_q, V_q)
+			sig_h   = hartree_k(wfns, Gij_final, V_q)
 		sig_sx, sig_coh = _add_head(sig_sx, sig_coh)
 	else:
 		H = 0.5 * ((kin_ion + sigma_total) + jnp.conj(jnp.swapaxes(kin_ion + sigma_total, -1, -2)))
