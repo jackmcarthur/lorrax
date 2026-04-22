@@ -264,7 +264,12 @@ def get_bandranges(nv, nc, nband, nelec):
 def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir, print_fn=print):
 	"""Fit ISDF interpolation vectors ζ and write to HDF5.
 
-	Returns (zeta_h5_path, psi_l_yr, psi_r_yr, mem_est).
+	Returns (zeta_h5_path, psi_l_yr, psi_r_yr, psi_l_xn, psi_r_xn, mem_est).
+
+	The xn-layout halves are a zero-cost byproduct of the zeta kernel
+	(see :func:`common.isdf_fitting.fit_zeta_chunked_to_h5`).  We thread
+	them out so downstream :func:`build_wavefunction_bundle` can skip
+	the y→x reshards it would otherwise emit to build psi_xn / psi_xr.
 	"""
 	from common.isdf_fitting import fit_zeta_chunked_to_h5
 
@@ -303,7 +308,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	_band_norms = getattr(wfn, 'band_norms', None)
 
 	with timing.section("gw_jax.zeta_fit_chunked"), jax_profile.trace_section("zeta_fit"):
-		psi_l_yr, psi_r_yr, _psi_l_xn, _psi_r_xn, peak_bytes = fit_zeta_chunked_to_h5(
+		psi_l_yr, psi_r_yr, psi_l_xn, psi_r_xn, peak_bytes = fit_zeta_chunked_to_h5(
 			wfn=wfn, sym=sym, meta=meta,
 			centroid_indices=centroid_indices, mesh_xy=mesh_xy,
 			chunk_r=chunks['chunk_r'], output_file=zeta_h5_path,
@@ -327,7 +332,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		print_fn(f"    GPU high-water mark: {peak_gb:.2f} GB / {budget_gb:.2f} GB budget "
 		         f"({100 * peak_gb / budget_gb:.0f}%)")
 
-	return zeta_h5_path, psi_l_yr, psi_r_yr, mem_est
+	return zeta_h5_path, psi_l_yr, psi_r_yr, psi_l_xn, psi_r_xn, mem_est
 
 
 def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None):
@@ -442,11 +447,19 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 
 def build_wavefunction_bundle(
 	wfn, sym, meta, band_slices, mesh_xy,
-	*, psi_l_yr=None, psi_r_yr=None,
+	*, psi_l_yr=None, psi_r_yr=None, psi_l_xn=None, psi_r_xn=None,
 	psi_full_yr=None, psi_full_xn=None,
 	enk_full=None, print_fn=print,
 ):
-	"""Build 4-copy Wavefunctions bundle from ISDF (psi_l/r_yr) or restart (psi_full_yr)."""
+	"""Build 4-copy Wavefunctions bundle from ISDF or restart inputs.
+
+	Two input shapes, one output:
+	  * ISDF path: ``psi_{l,r}_yr`` + ``psi_{l,r}_xn`` (the latter pair
+	    is optional but strongly preferred — it's the zeta kernel's
+	    free byproduct and lets us skip y→x reshards on the μ axis).
+	  * Restart path: ``psi_full_yr`` + ``psi_full_xn`` — same idea
+	    with pre-assembled arrays.
+	"""
 	from .wavefunction_bundle import build_wavefunctions, build_wavefunctions_from_full
 	from common.load_wfns import get_enk_bandrange
 
@@ -462,6 +475,7 @@ def build_wavefunction_bundle(
 	else:
 		wfns = build_wavefunctions(
 			psi_l_yr, psi_r_yr,
+			psi_l_xn=psi_l_xn, psi_r_xn=psi_r_xn,
 			enk_full=enk_full, slices=band_slices, mesh_xy=mesh_xy)
 
 	print_fn(f"  Wavefunctions built (b0:b4={band_slices.nb_full} bands, "
@@ -481,7 +495,7 @@ def prepare_isdf_and_wavefunctions(
 
 	if not cfg.restart:
 		with mesh_xy:
-			zeta_path, psi_l_yr, psi_r_yr, mem_est = fit_zeta(
+			zeta_path, psi_l_yr, psi_r_yr, psi_l_xn, psi_r_xn, mem_est = fit_zeta(
 				wfn, sym, meta, centroid_indices, mesh_xy,
 				cfg, band_slices, tmp_dir, print_fn=print0)
 			V_qmunu, G0 = compute_V_q(
@@ -492,7 +506,9 @@ def prepare_isdf_and_wavefunctions(
 		with timing.section("gw_jax.wavefunction_setup"):
 			wfns = build_wavefunction_bundle(
 				wfn, sym, meta, band_slices, mesh_xy,
-				psi_l_yr=psi_l_yr, psi_r_yr=psi_r_yr, print_fn=print0)
+				psi_l_yr=psi_l_yr, psi_r_yr=psi_r_yr,
+				psi_l_xn=psi_l_xn, psi_r_xn=psi_r_xn,
+				print_fn=print0)
 
 		write_restart_state_to_h5(
 			tensors_filename, V_qmunu,

@@ -134,7 +134,11 @@ jax.tree_util.register_dataclass(
 # ---------------------------------------------------------------------------
 
 def _assemble_full_yr(psi_l_yr, psi_r_yr, slices):
-    """Build full b0:b4 array in yr layout from left/right halves."""
+    """Concatenate left/right halves along the band axis — yr layout.
+
+    psi_{l,r}_yr shape: (nk, nb, ns, n_rmu).  Band axis is axis 1.
+    Axis 1 is replicated under PSI_YR_SPEC, so the concat is local.
+    """
     nb_full = slices.nb_full
     if psi_l_yr.shape[1] >= nb_full:
         return psi_l_yr[:, :nb_full, :, :]
@@ -148,19 +152,76 @@ def _assemble_full_yr(psi_l_yr, psi_r_yr, slices):
     return jnp.concatenate([psi_v, psi_c], axis=1)
 
 
-def _build_four_copies(psi_yr_full, mesh_xy):
-    """From a single yr-layout array, build all four sharded copies."""
+def _assemble_full_xn(psi_l_xn, psi_r_xn, slices):
+    """Concatenate left/right halves along the band axis — xn layout.
+
+    The ISDF zeta kernel stores x-sharded psi as ``psi_rmuT = conj(ψ)``
+    so the conjugated factor is prefilled for its pair-density kernel.
+    Downstream consumers (chi0 build_G, Σ_kij) expect psi_xn to be the
+    *un-conjugated* ψ (they conjugate the yr side themselves).  We
+    take ``jnp.conj`` here to recover that convention.
+
+    Zeta layout: ``(nk, n_rmu, nb, ns)`` — μ on axis 1 (x-sharded),
+    bands on axis 2 (replicated).  :func:`_build_four_copies` does the
+    final transpose into PSI_XN_SPEC without crossing device boundaries.
+    """
+    nb_full = slices.nb_full
+    if psi_l_xn.shape[2] >= nb_full:
+        return jnp.conj(psi_l_xn[:, :, :nb_full, :])
+    if psi_r_xn is None:
+        raise ValueError("psi_l_xn does not span full range and psi_r_xn is missing.")
+    nb_v = slices.b2 - slices.b0
+    nb_c = slices.b4 - slices.b2
+    r_c_start = slices.b2 - slices.b1
+    psi_v = psi_l_xn[:, :, :nb_v, :]
+    psi_c = psi_r_xn[:, :, r_c_start:(r_c_start + nb_c), :]
+    return jnp.conj(jnp.concatenate([psi_v, psi_c], axis=2))
+
+
+def _build_four_copies(psi_yr_full, mesh_xy, *, psi_xn_full=None):
+    """Build the four sharded psi views chi0 / Σ consume.
+
+    Layouts (see PSI_*_SPEC at the top of the module):
+      psi_yr   (nk, nb,  ns,  μ_Y)     μ sharded on y
+      psi_yn   (nk, ns,  μ_Y, nb)      μ sharded on y
+      psi_xn   (nk, ns,  μ_X, nb)      μ sharded on x
+      psi_xr   (nk, nb,  ns,  μ_X)     μ sharded on x
+
+    The y-sharded pair is always cheap to derive from ``psi_yr_full``
+    (transpose is a metadata op; sharding already matches).
+
+    The x-sharded pair needs μ moved from y to x.  If the caller hands
+    in ``psi_xn_full`` (as the ISDF zeta kernel already produces, both
+    layouts as a byproduct of the fit), we derive psi_xn / psi_xr from
+    it — no cross-device movement.  Otherwise we fall back to resharding
+    ``psi_yr_full``, which costs two y→x all-to-alls on the μ axis.
+    """
     with mesh_xy:
+        # y-sharded views — no reshard, both from psi_yr_full.
         psi_yr = jax.lax.with_sharding_constraint(
             psi_yr_full, NamedSharding(mesh_xy, PSI_YR_SPEC))
-        psi_xn = jax.lax.with_sharding_constraint(
-            psi_yr_full.transpose(0, 2, 3, 1),
-            NamedSharding(mesh_xy, PSI_XN_SPEC))
-        psi_xr = jax.lax.with_sharding_constraint(
-            psi_yr_full, NamedSharding(mesh_xy, PSI_XR_SPEC))
         psi_yn = jax.lax.with_sharding_constraint(
             psi_yr_full.transpose(0, 2, 3, 1),
             NamedSharding(mesh_xy, PSI_YN_SPEC))
+
+        if psi_xn_full is not None:
+            # Zeta kernel layout: (nk, μ_X, nb, ns) — x on axis 1.
+            # Transpose into the two canonical layouts; each transpose
+            # preserves the x-sharding on the μ axis (see PSI_*_SPEC).
+            psi_xn = jax.lax.with_sharding_constraint(
+                psi_xn_full.transpose(0, 3, 1, 2),   # → (nk, ns, μ_X, nb)
+                NamedSharding(mesh_xy, PSI_XN_SPEC))
+            psi_xr = jax.lax.with_sharding_constraint(
+                psi_xn_full.transpose(0, 2, 3, 1),   # → (nk, nb, ns, μ_X)
+                NamedSharding(mesh_xy, PSI_XR_SPEC))
+        else:
+            # Fallback: derive x-sharded views from psi_yr_full (two
+            # y→x all-to-alls on the μ axis).
+            psi_xn = jax.lax.with_sharding_constraint(
+                psi_yr_full.transpose(0, 2, 3, 1),
+                NamedSharding(mesh_xy, PSI_XN_SPEC))
+            psi_xr = jax.lax.with_sharding_constraint(
+                psi_yr_full, NamedSharding(mesh_xy, PSI_XR_SPEC))
     return psi_xn, psi_xr, psi_yr, psi_yn
 
 
@@ -189,37 +250,44 @@ def _build_occ(enk_full, slices, efermi):
 
 def build_wavefunctions(
     psi_l_yr, psi_r_yr, *, enk_full, slices, mesh_xy, efermi=None,
+    psi_l_xn=None, psi_r_xn=None,
 ) -> Wavefunctions:
-    """Build all four copies from left/right yr-layout arrays."""
+    """Build all four sharded copies from left/right zeta-fit outputs.
+
+    ``psi_{l,r}_yr`` are the required y-sharded halves.  Pass the
+    x-sharded halves ``psi_{l,r}_xn`` too when available (the ISDF
+    zeta-fit kernel returns both by construction) — that lets
+    :func:`_build_four_copies` skip the y→x reshard on the μ axis.
+    """
     psi_yr_full = _assemble_full_yr(psi_l_yr, psi_r_yr, slices)
-    occ_full = _build_occ(enk_full, slices, efermi)
-    psi_xn, psi_xr, psi_yr, psi_yn = _build_four_copies(psi_yr_full, mesh_xy)
-    rep2 = NamedSharding(mesh_xy, P(None, None))
-    with mesh_xy:
-        enk_full = jax.lax.with_sharding_constraint(enk_full, rep2)
-        occ_full = jax.lax.with_sharding_constraint(occ_full, rep2)
-    return Wavefunctions(psi_xn=psi_xn, psi_xr=psi_xr, psi_yr=psi_yr,
-                         psi_yn=psi_yn, enk=enk_full, occ=occ_full, slices=slices)
+    psi_xn_full = (
+        _assemble_full_xn(psi_l_xn, psi_r_xn, slices)
+        if (psi_l_xn is not None and psi_r_xn is not None)
+        else None)
+    return _finalise_bundle(
+        psi_yr_full, psi_xn_full=psi_xn_full,
+        enk_full=enk_full, slices=slices, mesh_xy=mesh_xy, efermi=efermi)
 
 
 def build_wavefunctions_from_full(
     psi_yr_full, *, enk_full, slices, mesh_xy, efermi=None, psi_xn_full=None,
 ) -> Wavefunctions:
-    """Build all four copies from a full-band yr-layout array."""
+    """Build all four copies from already-assembled full-band arrays.
+
+    Restart path: the HDF5-reloaded psi arrays are pre-assembled.  Same
+    reshard-skip trick applies when psi_xn_full is provided.
+    """
+    return _finalise_bundle(
+        psi_yr_full, psi_xn_full=psi_xn_full,
+        enk_full=enk_full, slices=slices, mesh_xy=mesh_xy, efermi=efermi)
+
+
+def _finalise_bundle(psi_yr_full, *, psi_xn_full, enk_full, slices, mesh_xy,
+                      efermi):
+    """Shared tail: four sharded psi views + occupations → Wavefunctions."""
     occ_full = _build_occ(enk_full, slices, efermi)
-    if psi_xn_full is not None:
-        with mesh_xy:
-            psi_yr = jax.lax.with_sharding_constraint(
-                psi_yr_full, NamedSharding(mesh_xy, PSI_YR_SPEC))
-            psi_xn = jax.lax.with_sharding_constraint(
-                psi_xn_full, NamedSharding(mesh_xy, PSI_XN_SPEC))
-            psi_xr = jax.lax.with_sharding_constraint(
-                psi_yr_full, NamedSharding(mesh_xy, PSI_XR_SPEC))
-            psi_yn = jax.lax.with_sharding_constraint(
-                psi_yr_full.transpose(0, 2, 3, 1),
-                NamedSharding(mesh_xy, PSI_YN_SPEC))
-    else:
-        psi_xn, psi_xr, psi_yr, psi_yn = _build_four_copies(psi_yr_full, mesh_xy)
+    psi_xn, psi_xr, psi_yr, psi_yn = _build_four_copies(
+        psi_yr_full, mesh_xy, psi_xn_full=psi_xn_full)
     rep2 = NamedSharding(mesh_xy, P(None, None))
     with mesh_xy:
         enk_full = jax.lax.with_sharding_constraint(enk_full, rep2)

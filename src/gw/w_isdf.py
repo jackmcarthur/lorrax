@@ -42,7 +42,7 @@ def _ensure_compilation_cache():
 
 def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
     """Build chi0 kernel with device-local FFTs.  Returns flat-q χ₀(nq, μ, μ)."""
-    from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
+    from common.fft_helpers import make_flat_k_fftn
 
     nkx, nky, nkz = kgrid
     nk = nkx * nky * nkz
@@ -51,79 +51,119 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
         return _chi_minimax_kernel_cache[cache_key]
 
     # Flat-k FFT helpers — callers see only (nk, *trail) arrays.
-    # Gv_R label 'Rbnam' (n at axis 4, m at axis 6) with spec below pins
-    # n on 'x', m on 'y'.  Gc_mR label 'Rambn' (m at axis 4, n at axis 6)
-    # pins m on 'y', n on 'x'.  The einsum 'Rambn,Rbnam->Rmn' contracts out
-    # the replicated (a, b, n) axes and leaves output sharded (m='y', n='x').
-    # chi_R_acc MUST agree: (m='y', n='x') == P(None, 'y', 'x').  Earlier
-    # code had P(None, 'x', 'y') which forced XLA to materialize the full
-    # c128[64,2400,2400] replicated buffer every tau step to permute the
-    # sharding — 23.6 GB temp that OOMs at Si 4x4x4 60Ry μ=2400.
-    _Gv_spec = P(None, None, None, None, 'x', None, 'y')
-    _Gc_spec = P(None, None, None, None, 'y', None, 'x')
-    _chi_spec = P(None, None, None, 'y', 'x')
+    #
+    # Historical form had Gv via ifftn (sign +ikR) and Gc via fftn (sign -ikR),
+    # with einsum 'Rambn, Rbnam -> Rmn' swapping the μ_m/μ_n positions across
+    # the two operands.  That forced Gc (or Gv) to reshard its μ sharding to
+    # make the contracted index consistent, and landed chi_R in
+    # P(None, 'y', 'x') — which then had to reshard AGAIN at the hand-off to
+    # the W-solve (which consumes chi in P(None, 'x', 'y')).
+    #
+    # We exploit G's per-k Hermitian property ``G_k(μ,ν) = G_k(ν,μ)*``.  After
+    # FT, ``G_R(μ,ν) = G_{-R}(ν,μ)*``, so running Gv's k→R with the SAME sign
+    # as Gc's (both fftn, not one fft + one ifft) gives a Gv_R that equals
+    # ``conj(original_Gv_R)`` with (μ_m, μ_n) swapped to the Gc-natural order.
+    # The chi0 einsum then collapses to an element-wise product + spin sum:
+    #
+    #    chi_R(m,n) = Σ_{a,b} Gc_R(a,m,b,n) · conj(Gv_R(a,m,b,n))
+    #
+    # identical index order on both operands, no reshard.  Verified to
+    # machine precision against the original formulation.
+    #
+    # Both Gs now share their natural 5-D sharding P(_, _, 'x', _, 'y')
+    # (μ_first on x from psi_xn, μ_second on y from psi_yr).  chi_R inherits
+    # P(_, 'x', 'y') naturally — aligned with V for W-solve, so the post-chi0
+    # reshard into the fused W-solve drops out too.
+    _G_spec         = P(None, None, None, None, 'x', None, 'y')    # 7-D FFT form
+    _G_out_flatk    = P(None, None, 'x', None, 'y')                # 5-D flat-k form
+    _chi_spec       = P(None, None, None, 'x', 'y')                # 5-D chi FFT form
+    _chi_R_spec     = P(None, 'x', 'y')                            # flat-k chi
 
-    _Gv_ifftn      = make_flat_k_ifftn(mesh_xy, kgrid, _Gv_spec,  norm='ortho')
-    _Gc_fftn       = make_flat_k_fftn( mesh_xy, kgrid, _Gc_spec,  norm='ortho')
+    _Gv_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
+    _Gc_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
     _chi_fftn_local = make_flat_k_fftn(mesh_xy, kgrid, _chi_spec, norm='ortho')
 
     from .greens_function_kernel import build_G as _build_G_mm
 
-    # 5-D flat-k output shardings matching the 7-D FFT input specs above
-    # (μ_X on 'x', μ_Y on 'y' for Gv; swapped for Gc).  Explicit constraints
-    # on the einsum output force XLA to pick a sharded GEMM lowering rather
-    # than a replicated cuBLAS call that materializes the full 64×2400×2400
-    # buffer per device.
-    _Gv_out_flatk = P(None, None, 'x', None, 'y')
-    _Gc_out_flatk = P(None, None, 'y', None, 'x')
-    _chi_R_spec = P(None, 'y', 'x')
+    # Shardings for psi inputs (carried at the caller's natural layout; 'x' on
+    # the μ_X axis for the _xn variant, 'y' on the μ_Y axis for the _yr one).
+    _psi_xn_spec = P(None, None, 'x', None)   # (nk, s, μ_X, nb)
+    _psi_yr_spec = P(None, None, None, 'y')   # (nk, nb, s, μ_Y)
+    # Scalars / 1-D arrays replicated across all devices.
+    _rep0 = P()             # scalar
+    _rep1 = P(None)         # (nb,) band-indexed
 
-    @jax.jit
+    _G_k_shard = NamedSharding(mesh_xy, _G_out_flatk)
+    _chi_R_shard = NamedSharding(mesh_xy, _chi_R_spec)
+
+    @partial(jax.jit,
+             in_shardings=(NamedSharding(mesh_xy, _psi_xn_spec),
+                            NamedSharding(mesh_xy, _psi_yr_spec),
+                            NamedSharding(mesh_xy, _psi_yr_spec),
+                            NamedSharding(mesh_xy, _psi_xn_spec),
+                            NamedSharding(mesh_xy, _rep1),
+                            NamedSharding(mesh_xy, _rep1),
+                            NamedSharding(mesh_xy, _rep0),
+                            NamedSharding(mesh_xy, _rep0),
+                            NamedSharding(mesh_xy, _rep0)),
+             out_shardings=(_G_k_shard, _G_k_shard))
     def _build_G(psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
                  enk_v, enk_c, tau_scalar, vmax, cmin):
         phases_v = jnp.exp(-tau_scalar * (vmax - enk_v))
         phases_c = jnp.exp(-tau_scalar * (enk_c - cmin))
         Gv_k = jax.lax.with_sharding_constraint(
-            _build_G_mm(psi_val_xn, psi_val_yr, phases=phases_v),
-            NamedSharding(mesh_xy, _Gv_out_flatk))
+            _build_G_mm(psi_val_xn, psi_val_yr, phases=phases_v), _G_k_shard)
         Gc_k = jax.lax.with_sharding_constraint(
-            _build_G_mm(psi_cond_xn, psi_cond_yr, phases=phases_c),
-            NamedSharding(mesh_xy, _Gc_out_flatk))
+            _build_G_mm(psi_cond_xn, psi_cond_yr, phases=phases_c), _G_k_shard)
         return jnp.conj(Gv_k), jnp.conj(Gc_k)
 
-    @partial(jax.jit, donate_argnums=(0,))
-    def _tau_step(chi_R_acc, psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
-                  enk_v, enk_c, tau_scalar, prefactor_scalar, vmax, cmin):
-        Gv_k, Gc_k = _build_G(psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
-                               enk_v, enk_c, tau_scalar, vmax, cmin)
-        Gv_R = _Gv_ifftn(Gv_k)
-        Gc_mR = _Gc_fftn(Gc_k)
-        chi_tau = jax.lax.with_sharding_constraint(
-            jnp.einsum('Rambn,Rbnam->Rmn', Gc_mR, Gv_R, optimize=True),
-            NamedSharding(mesh_xy, _chi_R_spec))
-        return chi_R_acc + prefactor_scalar * chi_tau
+    @partial(jax.jit,
+             in_shardings=(NamedSharding(mesh_xy, _psi_xn_spec),
+                            NamedSharding(mesh_xy, _psi_yr_spec),
+                            NamedSharding(mesh_xy, _psi_yr_spec),
+                            NamedSharding(mesh_xy, _psi_xn_spec),
+                            NamedSharding(mesh_xy, _rep1),
+                            NamedSharding(mesh_xy, _rep1),
+                            NamedSharding(mesh_xy, _rep1),       # tau_arr
+                            NamedSharding(mesh_xy, _rep1),       # prefactor_arr
+                            NamedSharding(mesh_xy, _rep0),       # vmax
+                            NamedSharding(mesh_xy, _rep0)),      # cmin
+             out_shardings=_chi_R_shard,
+             static_argnums=())
+    def _chi_scan(psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
+                  enk_v, enk_c, tau_arr, prefactor_arr, vmax, cmin):
+        """Full τ sweep in one jit: lax.scan walks the minimax nodes, builds
+        Gv/Gc per τ, element-wise contracts to chi_R, accumulates, then one
+        final FFT to chi_q.  All collectives and dispatch happen inside a
+        single compiled graph — no Python loop over τ, no per-τ jit call."""
+        n_rmu = psi_val_xn.shape[2]
+        chi_R_zero = jax.lax.with_sharding_constraint(
+            jnp.zeros((nk, n_rmu, n_rmu), dtype=jnp.complex128), _chi_R_shard)
+
+        def _body(chi_R_acc, xs):
+            tau_scalar, prefactor_scalar = xs
+            Gv_k, Gc_k = _build_G(psi_val_xn, psi_val_yr,
+                                    psi_cond_yr, psi_cond_xn,
+                                    enk_v, enk_c, tau_scalar, vmax, cmin)
+            Gv_R = _Gv_fftn(Gv_k)
+            Gc_R = _Gc_fftn(Gc_k)
+            # chi_R(m, n) = Σ_{a,b} Gc_R(a,m,b,n) · conj(Gv_R(a,m,b,n))
+            chi_tau = jax.lax.with_sharding_constraint(
+                jnp.einsum('Rambn,Rambn->Rmn',
+                           Gc_R, jnp.conj(Gv_R), optimize=True),
+                _chi_R_shard)
+            return chi_R_acc + prefactor_scalar * chi_tau, None
+
+        final_R, _ = jax.lax.scan(_body, chi_R_zero, (tau_arr, prefactor_arr))
+        return _chi_fftn_local(final_R)
 
     def _chi_kernel(psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
                     enk_v, enk_c, tau_i, prefactor_i, vmax, cmin):
         n_rmu = psi_val_xn.shape[2]
-        ntau = len(tau_i)
-        if ntau == 0:
+        if len(tau_i) == 0:
             return jnp.zeros((nk, n_rmu, n_rmu), dtype=jnp.complex128)
-
-        chi_R_shape = (nk, n_rmu, n_rmu)
-        def _chi_zeros(idx):
-            sh = tuple((s.stop - s.start) if s.stop is not None else d
-                       for s, d in zip(idx, chi_R_shape))
-            return np.zeros(sh, dtype=np.complex128)
-        chi_R_acc = jax.make_array_from_callback(
-            chi_R_shape, NamedSharding(mesh_xy, _chi_R_spec), _chi_zeros)
-
-        for itau in range(ntau):
-            chi_R_acc = _tau_step(
-                chi_R_acc, psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
-                enk_v, enk_c, tau_i[itau], prefactor_i[itau], vmax, cmin)
-
-        return _chi_fftn_local(chi_R_acc)
+        return _chi_scan(psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
+                         enk_v, enk_c, tau_i, prefactor_i, vmax, cmin)
 
     _chi_minimax_kernel_cache[cache_key] = _chi_kernel
     return _chi_kernel
@@ -264,10 +304,10 @@ def _get_w_solve_fn_low_mem(mesh_xy: Mesh, nq: int, n_rmu: int, dtype):
 
     def _solve_w_low(V_q, chi0_q, pref):
         # The fused FFI reads pref as a compile-time complex scalar attr,
-        # so pref must be a Python scalar here (not a jnp array).  We
-        # don't wrap this in @jax.jit because batched_fused_w_solve's
-        # inner shard_map is already jit-cached per (mesh, shape, pref).
-        V_q    = jax.lax.with_sharding_constraint(V_q,    nat)
+        # so pref must be a Python scalar here (not a jnp array).
+        # chi0_q now comes out of compute_chi0 in P(None, 'x', 'y')
+        # (same as V_q) — no reshard needed at the hand-off.
+        V_q    = jax.lax.with_sharding_constraint(V_q, nat)
         chi0_q = jax.lax.with_sharding_constraint(chi0_q, nat)
         return batched_fused_w_solve(V_q, chi0_q, pref, mesh=mesh_xy)
 
