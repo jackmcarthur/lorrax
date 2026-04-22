@@ -77,10 +77,10 @@ class LoopProgress:
 
     Usage::
 
-        total_nodes = sum(len(w.t_nodes) for w in windows)
+        total_nodes = sum(w.n_tau for w in windows)
         progress = LoopProgress(total_nodes, print_fn, title="sigma convolution")
         for win in windows:
-            for t_node in win.t_nodes:
+            for t_node in win.nodes.t:
                 do_work(t_node)
                 progress.step()
         progress.finish()
