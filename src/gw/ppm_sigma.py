@@ -69,6 +69,7 @@ from .minimax_screening import (
     solve_phase_minimax_bandwidth,
 )
 from . import w_isdf
+from .wavefunction_bundle import G_FFT7D_SPEC, V_FFT5D_SPEC, CHI_Q_SPEC
 
 
 @dataclass(frozen=True)
@@ -376,11 +377,9 @@ def _get_sigma_kij_kernel(
     from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
 
     w_isdf._ensure_compilation_cache()
-    _G_spec = P(None, None, None, None, 'x', None, 'y')
-    _V_spec = P(None, None, None, 'x', 'y')
-    _G_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _G_spec, norm='ortho')
-    _G_fftn  = make_flat_k_fftn( mesh_xy, kgrid, _G_spec, norm='ortho')
-    _V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _V_spec, norm='ortho')
+    _G_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
+    _G_fftn  = make_flat_k_fftn( mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
+    _V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
     inv_sqrt_nk = -1.0 / np.sqrt(float(nk_tot))
 
     from .greens_function_kernel import build_G_tau
@@ -426,7 +425,7 @@ def _get_sigma_tau_kernel(
         return _sigma_tau_kernel_cache[cache_key]
 
     w_isdf._ensure_compilation_cache()
-    q_mu_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    q_mu_shard = NamedSharding(mesh_xy, CHI_Q_SPEC)
     sigma_kij_kernel = _get_sigma_kij_kernel(mesh_xy=mesh_xy, kgrid=kgrid)
 
     @jax.jit
@@ -556,7 +555,7 @@ def fit_gn_ppm(
     omega_qmunu, b_qmunu, valid_qmunu, unfulfilled = fit_gn_ppm_from_wc_pair(
         Wc0_q, Wci_q, 1j * complex(omega_p), fallback_omega=float(fallback_omega))
 
-    q_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    q_shard = NamedSharding(mesh_xy, CHI_Q_SPEC)
     Omega = jax.lax.with_sharding_constraint(jnp.asarray(omega_qmunu), q_shard)
     B = jax.lax.with_sharding_constraint(jnp.asarray(b_qmunu), q_shard)
     valid_mask = jax.lax.with_sharding_constraint(jnp.asarray(valid_qmunu), q_shard)

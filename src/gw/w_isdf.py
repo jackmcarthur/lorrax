@@ -19,6 +19,7 @@ import numpy as np
 from common import Meta, jax_profile
 from .minimax_config import MinimaxConfig
 from .minimax_screening import build_static_minimax_window_pair
+from .wavefunction_bundle import G_FFT7D_SPEC, V_FFT5D_SPEC, CHI_Q_SPEC
 
 
 # ============================================================================
@@ -73,14 +74,16 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
     # (μ_first on x from psi_xn, μ_second on y from psi_yr).  chi_R inherits
     # P(_, 'x', 'y') naturally — aligned with V for W-solve, so the post-chi0
     # reshard into the fused W-solve drops out too.
-    _G_spec         = P(None, None, None, None, 'x', None, 'y')    # 7-D FFT form
+    # Specs hoisted to wavefunction_bundle:
+    #   G_FFT7D_SPEC  = P(None, None, None, None, 'x', None, 'y')  — 7-D G FFT form
+    #   V_FFT5D_SPEC  = P(None, None, None, 'x', 'y')              — 5-D chi FFT form
+    #   CHI_Q_SPEC    = P(None, 'x', 'y')                          — flat-k/q chi
+    # Intermediate 5-D flat-k G spec is local to this module.
     _G_out_flatk    = P(None, None, 'x', None, 'y')                # 5-D flat-k form
-    _chi_spec       = P(None, None, None, 'x', 'y')                # 5-D chi FFT form
-    _chi_R_spec     = P(None, 'x', 'y')                            # flat-k chi
 
-    _Gv_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
-    _Gc_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
-    _chi_fftn_local = make_flat_k_fftn(mesh_xy, kgrid, _chi_spec, norm='ortho')
+    _Gv_fftn        = make_flat_k_fftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
+    _Gc_fftn        = make_flat_k_fftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
+    _chi_fftn_local = make_flat_k_fftn(mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
 
     from .greens_function_kernel import build_G_tau
 
@@ -93,7 +96,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
     _rep1 = P(None)         # (nb,) band-indexed
 
     _G_k_shard = NamedSharding(mesh_xy, _G_out_flatk)
-    _chi_R_shard = NamedSharding(mesh_xy, _chi_R_spec)
+    _chi_R_shard = NamedSharding(mesh_xy, CHI_Q_SPEC)
 
     @partial(jax.jit,
              in_shardings=(NamedSharding(mesh_xy, _psi_xn_spec),

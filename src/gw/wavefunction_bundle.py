@@ -94,6 +94,30 @@ PSI_YN_SPEC = P(None, None, 'y', None)   # (nk, s, μ_Y, n)
 
 
 # ---------------------------------------------------------------------------
+# Sharding specs for downstream G / V / χ / W flat-k/q tensors.
+#
+# These are shared across w_isdf (chi0 + W solve), ppm_sigma (sigma_kij
+# kernels) and gw_jax (COHSEX pipeline).  Hoisted here so a single
+# definition is the truth — editing one place no longer has to stay in
+# sync with three scattered copies.  Specs that appear in only ONE
+# module (e.g. w_isdf's intermediate P(None, None, 'x', None, 'y') flat-k
+# G, or ppm_sigma's shard_map in/out specs) stay local.
+# ---------------------------------------------------------------------------
+# 7-D FFT form of G_k (nkx, nky, nkz, s, μ_X, s, μ_Y) — consumed by
+# make_flat_k_fftn / make_flat_k_ifftn in both the chi0 minimax loop
+# (w_isdf) and the sigma_kij kernels (ppm_sigma + gw_jax cohsex pipeline).
+G_FFT7D_SPEC = P(None, None, None, None, 'x', None, 'y')
+# 5-D FFT form of V / W / chi (nkx, nky, nkz, μ_X, μ_Y) — the FFT-helper
+# layout used when lifting V(q) ↔ V(R) and chi_R ↔ chi_q.  Same spec for
+# V, W, and chi in the chi0/W/sigma plumbing.
+V_FFT5D_SPEC = P(None, None, None, 'x', 'y')
+# 3-D flat-q form of V/W/chi/B/Ω/B_mask (nq, μ, μ).  Emitted by the chi0
+# kernel, consumed by the W-solve, and persists through the PPM pipeline
+# all the way into sigma's τ-loop operands.
+CHI_Q_SPEC = P(None, 'x', 'y')
+
+
+# ---------------------------------------------------------------------------
 # Wavefunction storage
 # ---------------------------------------------------------------------------
 

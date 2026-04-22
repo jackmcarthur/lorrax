@@ -113,7 +113,7 @@ from .head_correction import (
 	resolve_head_sample,
 	static_head_terms_to_kij,
 )
-from .wavefunction_bundle import BandSlices
+from .wavefunction_bundle import BandSlices, G_FFT7D_SPEC, V_FFT5D_SPEC
 from mixing.acceleration import (
     rcrop_nojit, hermitian_to_upper_flat, upper_flat_to_hermitian
 )
@@ -364,11 +364,9 @@ def main(argv=None):
 	# FFT helpers: flat-k ↔ flat-R.  Callers pass flat arrays, never see 3D k-grid.
 	from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
 
-	_G_spec = P(None, None, None, None, 'x', None, 'y')
-	_V_spec = P(None, None, None, 'x', 'y')
-	_G_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _G_spec, norm='ortho')
-	_G_fftn  = make_flat_k_fftn( mesh_xy, kgrid, _G_spec, norm='ortho')
-	_V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _V_spec, norm='ortho')
+	_G_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
+	_G_fftn  = make_flat_k_fftn( mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
+	_V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
 
 	_inv_sqrt_nk = -1.0 / jnp.sqrt(_nk_tot)
 
