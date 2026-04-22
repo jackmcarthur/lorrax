@@ -20,22 +20,15 @@ LORRAX has **two** chunk choosers that can run in parallel:
    per-kernel artifact JSONs under
    [`src/gw/aot_memory_model/artifacts/`](../src/gw/aot_memory_model/artifacts/).
 
-For automatic memory detection, `common.gpu_utils.get_device_memory_gb` uses
-`budget = 0.9 * bytes_available`, with:
-- `bytes_available = bytes_limit - bytes_in_use` from `jax.memory_stats()` when available
-- fallback: `bytes_available = nvidia-smi memory.free`
+Conventions throughout this doc:
 
-That detector-side 10% guard band is the only default safety margin; the chunk
-solver default is `target_utilization = 0.97` (configurable via
-`cohsex.in :: chunk_target_utilization`).
-
-The driver no longer applies an implicit ZCT soft cap.  If needed, set one
-explicitly with `ISDF_ZCT_STAGE_CAP_GB` (absolute) or `ISDF_ZCT_STAGE_CAP_FRAC`
-(fraction of total GPU memory).
-
-All sizes below use complex128 storage (`bytes_per_complex = 16`).  Mesh axes
-follow the code: `'x'` shards the μ/centroid axis, `'y'` shards r-chunks and
-the band axis in FFTs, and the total processor count is `P = p_x * p_y`.
+| Concept | Value |
+|---|---|
+| Element size | complex128 → 16 B (`_mem(…) = 16 · ∏dims / shard`) |
+| Mesh axes | `'x'` = μ/centroid, `'y'` = r-chunk; `P = p_x · p_y` |
+| Budget detection | `common.gpu_utils.get_device_memory_gb = 0.9 · bytes_available`; `bytes_available` from `jax.memory_stats().bytes_limit − bytes_in_use`, falls back to `nvidia-smi memory.free` |
+| Target utilization | 0.97 of detected budget (`cohsex.in :: chunk_target_utilization`) |
+| Safety cap (opt-in) | `ISDF_ZCT_STAGE_CAP_GB` / `ISDF_ZCT_STAGE_CAP_FRAC` env vars for the ZCT stage only |
 
 Typical ranges (from production datasets):
 
@@ -77,25 +70,18 @@ persistent centroid arrays. The FFT peak is the dominant cost.
 
 ### FFT peak memory (measured)
 
-The 3D `ifftn` is decomposed into three 1D FFTs (x→y→z). At peak, four
-copies of the per-device psi shard coexist:
-
-1. **`psi_G`** (FFT input): `(n_k, B_b/P, n_s, n_r)` — the band-sharded
-   G-space wavefunction being transformed
-2. **`psi_r`** (FFT output): same shape — the real-space result
-3. **FFT staging buffer 1**: same shape — intermediate after the x-FFT
-4. **FFT staging buffer 2**: same shape — intermediate after the y-FFT
-
-After the FFT completes, buffers 3–4 are freed and the phase multiply
-allocates a fifth copy briefly (but by then the staging buffers are gone,
-so the steady state is 3 copies). The peak is therefore **4×** the shard:
+The 3-D `ifftn` decomposes into three 1-D FFTs (x→y→z).  At peak four copies
+of the shard `(n_k, B_b/P, n_s, n_r)` coexist — the G-space input, the
+real-space output, and two staging buffers from the intermediate passes.
+After the FFT finishes the staging buffers free and the phase multiply
+briefly reuses their space, so the peak holds at 4× the shard:
 
 ```
 M_fft_peak = 4 * 16 * n_k * (B_b / P) * n_s * n_r + 16 * n_k * n_r
 ```
 
-The second term is `phase_spatial` at `(n_k, n_r)`, replicated on all
-devices. For most systems this is <1% of the first term.
+The second term is the `(n_k, n_r)` phase array (replicated, <1% of the
+first term).
 
 **Measured validation** (each in a fresh process, 1 GPU):
 
@@ -128,63 +114,51 @@ system physically cannot fit; the solver raises a descriptive error.
 
 ## R-Chunk (`B_r = x_chunk_r`)
 
-`B_r` is the number of contiguous r-points processed per chunk
-(`x_chunk * ny * nz`).  Four independent constraints must hold:
+`B_r` is the number of contiguous r-points per chunk (`x_chunk · ny · nz`).
+Four independent constraints must hold, with `base = M_cent + M_L_q + cache`.
 
-1. **R-chunk wavefunction reshard**
-
-Before the pair density, the r-chunk wavefunctions must be resharded from
-band-sharded `{-, XY, -, -}` (output of the FFT) to `{-, -, -, Y}` (input
-for pair density). The reshard goes `{-, XY, -, -}` → `{-, Y, -, -}` →
-`{-, -, -, Y}` via all-gather along X then all-to-all along Y.
-
-The binding intermediate is at the `{-, Y, -, -}` stage, where each device
-holds `ceil(nb_pad / p_y)` bands with the full r-chunk (not yet Y-sharded):
+**1. R-chunk wavefunction reshard.**  Between the FFT and the pair density
+the wavefunctions reshard from band-sharded `{-, XY, -, -}` (FFT output) to
+centroid-sharded `{-, -, -, Y}` (pair-density input) via all-gather along X
+then all-to-all along Y.  The binding intermediate is the middle stage,
+where each device holds `ceil(nb_pad / p_y)` bands on the full r-chunk:
 
 ```
 M_reshard = 16 * n_k * ceil(nb_pad / p_y) * n_s * B_r
 ```
 
-This is the largest single buffer during the r-chunk pipeline and often
-the binding constraint for `B_r`. For Si 10×10×10 on a 4×4 mesh with
-`B_r = 12672`: `M_reshard = 16 × 1000 × 16 × 2 × 12672 = 6.5 GB`.
+This is the largest single buffer in the r-chunk pipeline and often binds
+`B_r`.  Concrete scale: Si 10×10×10 on a 4×4 mesh with `B_r = 12672` gives
+`M_reshard = 16 · 1000 · 16 · 2 · 12672 = 6.5 GB`.  The reshard runs in a
+separate JIT from the FFT; fusing them lets XLA's SPMD partitioner
+rematerialize the FFT output to satisfy the output sharding (22+ GB on a
+single device).
 
-The reshard is executed in a separate JIT from the FFT to prevent XLA's
-SPMD partitioner from rematerializing the FFT output to satisfy the
-output sharding (which would require 22+ GB on a single device).
-
-2. **Pair density build**
-
-```
-base + 16 * (B_r / p_y) * [n_k n_b n_s + 2 n_k (n_rmu / p_x)] <= M_budget
-```
-
-Bottleneck arrays: `psi_xchunk_Y (n_k, n_b, n_s, B_r/p_y)`,
-`P_l`/`P_r (n_k, n_rmu/p_x, B_r/p_y)`.
-
-3. **ZCT pipeline**
+**2. Pair density build.**  `psi_xchunk_Y (n_k, n_b, n_s, B_r/p_y)` plus the
+two `P_l / P_r (n_k, n_rmu/p_x, B_r/p_y)`:
 
 ```
-base + 16 * B_r * [ (4 n_k + n_q) * n_rmu ] <= M_budget
+base + 16 * (B_r / p_y) * [n_k·n_b·n_s + 2·n_k·(n_rmu / p_x)] <= M_budget
 ```
 
-Bottleneck arrays: `P_l`/`P_r (n_k, n_rmu/p_x, B_r/p_y)`,
-`Z_q (n_q, n_rmu/p_x, B_r/p_y)`.
-
-4. **Solve (with q_chunk = 1)**
+**3. ZCT pipeline.**  `P_l / P_r` and `Z_q (n_q, n_rmu/p_x, B_r/p_y)` — the
+4× coefficient is the confirmed live-set model (4 concurrent pair-sized
+temps, cf. AOT `zct_lr : β[PrBr] = 4`):
 
 ```
-base + 4 * 16 * n_q * n_rmu * (B_r / P) + M_L_q + 16*n_rmu^2 <= M_budget
+base + 16 * B_r * [(4·n_k + n_q) · n_rmu] <= M_budget
 ```
 
-Bottleneck arrays: `Z_col`/`zeta (n_q, n_rmu, B_r/P)`,
-`L_rep (n_rmu, n_rmu)` per q during the solve.
+**4. Solve (with q_chunk = 1).**  `Z_col / zeta (n_q, n_rmu, B_r/P)` plus
+one replicated `L_rep (n_rmu, n_rmu)`:
 
-`base = M_cent + M_L_q + cache`.  The analytic upper bounds from these
-inequalities provide an initial guess which is then rounded to an integer
-number of x-slices, forced to be divisible by `p_y`, and iteratively reduced
-until the evaluated stage peaks fall below the budget.  This preserves the
-“fill the GPU” behavior without ad-hoc percentages.
+```
+base + 4 * 16 * n_q * n_rmu * (B_r / P) + M_L_q + 16·n_rmu^2 <= M_budget
+```
+
+The solver takes the min over these four, rounds down to a multiple of
+`P = p_x · p_y`, and halves `band_chunk` and retries if no feasible `B_r > 0`
+exists (up to `bpd = 1`).  "Fill the GPU" behavior with no ad-hoc percentages.
 
 ## Q-Chunk (`B_q`)
 
@@ -208,27 +182,18 @@ plus `Z_col`/`zeta` from the x-chunk stage.
 
 ## μ-Chunk for `V_q`
 
-When building `V_q` from the stored zeta HDF5 the code holds
-
-1. `ζ_μ(r)` for the current μ-block,
-2. its FFT/weighted counterpart `ζ̃_μ(G)`, and
-3. a second ν-block when contracting off-diagonal tiles.
-
-This leads to the simple bound used by the driver:
+Building `V_q` from on-disk zeta holds three `(μ_chunk, n_r)` buffers
+concurrently — `ζ_μ(r)`, its weighted G-space counterpart `ζ̃_μ(G)`, and a
+second ν-block for off-diagonal tiles — plus the persistent `V_q (n_rmu,
+n_rmu)` accumulator (on-GPU via `.at[].set()`, no device→host sync per block
+since commit `b0e0f41`).  Available bytes are `effective_budget − M_cent`
+because the centroids stay resident through COHSEX:
 
 ```
 μ_chunk <= available_bytes / (3 * 16 * n_r)
 ```
 
-The “available bytes” are `effective_budget - M_cent`, because the centroids
-remain resident for the rest of the COHSEX calculation.  The CLI now reports
-this chunk alongside the others so users can correlate V_q throughput with
-memory settings.
-
-Bottleneck arrays: `ζ_μ(r)` at `(μ_chunk, n_r)`, `ζ̃_μ(G)` at `(μ_chunk, n_r)`
-after weighting, `ζ̃_ν(G)` for off-diagonal contraction, and `V_q` accumulator
-at `(n_rmu, n_rmu)` on GPU. The accumulation is done entirely on GPU via
-`.at[].set()` — no device→host sync per block (as of commit `b0e0f41`).
+The CLI reports this chunk alongside the others.
 
 ## Automatic Sizing Algorithm
 
@@ -274,49 +239,27 @@ overrides the `chunk_r` / `band_chunk` it picked.
    The heuristic `_find_r_chunk` still populates `chunks['q_chunk']`,
    `chunks['q_gather']`, `chunks['k_chunk']`.
 
-10. **Instrumentation**: The heuristic solver returns a top-level dict plus a
-    `memory_estimate` sub-dict.  The fields `fit_zeta` prints:
-
-    Top-level:
-
-    - `band_chunk`, `chunk_r`, `q_chunk`, `q_gather`, `k_chunk`
-    - `use_gspace_cache` (bool)
-
-    Under `memory_estimate`:
-
-    - `peak_estimate_gb` — max of the six chunk-loop stages + pre-loop FFT + C_q
-    - `budget_gb` — `memory_per_device_gb`
-    - `bottleneck` — name of the binding stage (`fft` / `pair` / `zct` /
-      `reshard` / `solve` / `gather`)
-    - `available_vcoul_gb` — `m_budget - m_centroids` (headroom for V_q μ-chunk)
-    - `limit_info` — per-stage peaks in GB (`fft`, `pair`, `zct`, `reshard`,
-      `solve`, `gather`)
-
-    These map directly to the 6-stage table at the top.  For the AOT chooser
-    the equivalent information comes from the `ChunkChoice.note` field
-    (printed by `describe_chunks`), which lists the α components
-    (`α₀`, `α_cr`, `α_bc`, `α_crbc`) for the analytic path, or the per-budget
-    wfn / rchunk / persistent splits for the heuristic path.
+10. **Instrumentation**: the heuristic solver returns the chunk plan
+    (`band_chunk`, `chunk_r`, `q_chunk`, `q_gather`, `k_chunk`,
+    `use_gspace_cache`) plus a `memory_estimate` sub-dict holding
+    `peak_estimate_gb` (max of all chunk-loop stages + pre-loop FFT + C_q),
+    `budget_gb`, `bottleneck` (the binding stage name: `fft` / `pair` /
+    `zct` / `reshard` / `solve` / `gather`), `available_vcoul_gb`
+    (`m_budget − m_centroids`, headroom for V_q), and `limit_info` (per-stage
+    peaks in GB).  The AOT chooser exposes the equivalent via
+    `ChunkChoice.note` (`describe_chunks`), reporting either the α
+    components (`α₀`, `α_cr`, `α_bc`, `α_crbc`) for the analytic path or the
+    wfn/rchunk/persistent splits for the 20/80 heuristic.
 
 ## Working Backwards from a Failure
 
-When the solver raises an error it always references the offending stage and
-provides the required gigabytes.  Typical remedies are:
-
-1. **Centroid copy failure**  
-   Reduce `n_b_left`/`n_b_right` (e.g., shrink the sigma window) or increase
-   `memory_per_device_gb`.
-
-2. **C_q build failure**  
-   Reduce `n_rmu` or `n_q`; these are the only dials that affect the μ×μ stage.
-
-3. **Chunk stage failure**  
-   This means even `x_chunk = 1` and `q_chunk = 1` would not fit.  Lower
-   `n_rmu`, use more devices, or increase the budget.
-
-4. **V_q μ-chunk failure**  
-   Increase the μ chunks or disable caching so more memory is available to the
-   V_q builder.
+Solver errors always name the offending stage and the required GB.  Common
+remedies: **centroid copy** — shrink `n_b_left`/`n_b_right` (sigma window) or
+raise `memory_per_device_gb`.  **C_q build** — drop `n_rmu` or `n_q` (only
+dials that touch the μ×μ stage).  **Chunk stage** (even `x_chunk = 1` and
+`q_chunk = 1` don't fit) — lower `n_rmu`, use more devices, or raise the
+budget.  **V_q μ-chunk** — grow the μ chunks or disable the G-space cache so
+more memory is free when V_q runs.
 
 ## XProf Workflow
 
@@ -365,29 +308,27 @@ primitives of the isolated jits — the per-kernel fits come out with integer
 
 ## AOT Memory Model
 
-**Where**: `src/gw/aot_memory_model/` (Python package, in-tree).  Entry points
-re-exported from `src.gw.aot_memory_model.__init__`.
+`src/gw/aot_memory_model/` (in-tree, entry points re-exported from the
+package `__init__`).
 
-**Motivation**: the hand-derived `compute_optimal_chunks` formulas above
-describe a *hypothesis* about each stage's allocation set.  When XLA schedules
-something we didn't predict (remat, allocator coalescing, donation failures),
-the hand-model silently gets the peak wrong — the symptom is a runtime OOM at
-a `chunk_r` the heuristic claimed would fit.  The AOT tool addresses this by
-**measuring** the peak via
+The hand-derived formulas above are hypotheses about each stage's
+allocation set.  When XLA schedules something the hand-model missed — remat,
+allocator coalescing, a donation failure — the symptom is a runtime OOM at a
+`chunk_r` the heuristic claimed would fit.  The AOT tool addresses this by
+*measuring* each jit's peak via
 `jax.jit(f).lower(specs).compile().memory_analysis()` at many `(sys, knobs,
-mesh)` points, then **fitting** a non-negative linear combination of
+mesh)` points, then NNLS-fitting a non-negative linear combination of
 dimensional primitives:
 
 ```
 peak(sys, knobs, mesh) = intercept + Σ_i  β_i · T_i(sys, knobs, mesh)
 ```
 
-where each primitive `T_i` is bytes of one physical shard (e.g. `(n_k, n_rmu,
-B_r)/P`), and `β_i` counts how many concurrent copies XLA holds alive at the
-peak.  A clean fit gives integer β's; residual RMS in the MB range indicates
-the primitive set is complete.  Update the fit by re-running the sweep when
-you modify a kernel — the artifact JSONs are checked in so other agents see
-the same formulas.
+Each primitive `T_i` is the bytes of one physical shard (e.g. `(n_k, n_rmu,
+B_r)/P`), and `β_i` counts concurrent copies at peak.  A clean fit gives
+integer β's with MB-range residual RMS — that's the signal the primitive set
+is complete.  Re-run the sweep when you modify a kernel; artifact JSONs are
+checked in so every agent sees the same formulas.
 
 ### Architecture
 
@@ -446,104 +387,72 @@ save_fit(fit, tag="current")
 ```
 
 The `sweep` module wraps this end-to-end — rank 0 drives a preset DoE and
-writes both `*_samples.json` and `*_fit.json` into `artifacts/`.  The
-sweep **must** run inside `lxrun` (needs JAX + a mesh), even though the AOT
-lower/compile path allocates no GPU memory.
+writes both `*_samples.json` and `*_fit.json` into `artifacts/`.  Sweeps
+must run inside `lxrun` because they need a real JAX mesh, even though the
+AOT lower/compile path allocates no GPU memory.
 
 ### Chooser modes
 
 `gw_init.fit_zeta` consults the AOT chooser when
-`cohsex.in :: use_aot_chunk_chooser = true`:
+`cohsex.in :: use_aot_chunk_chooser = true`, picking one of three modes:
 
-```python
-from gw.aot_memory_model import (
-    choose_chunks_heuristic,   # default
-    choose_chunks_analytic,    # LORRAX_CHOOSER_MODE=analytic
-)
-choice = choose_chunks_heuristic(  # or _analytic
-    aot_sys, aot_mesh, budget_bytes=budget,
-)
-chunks['chunk_r']    = int(choice.chunk_r)
-chunks['band_chunk'] = int(choice.band_chunk)
-```
-
-**Heuristic (default)** — `choose_chunks_heuristic` in `chooser.py`.
-Budget-split without any regression:
+**Heuristic (default, `LORRAX_CHOOSER_MODE=heuristic`)** — `choose_chunks_heuristic`.
+No DoE lookups; splits the budget 20/80 between wfn-FFT workspace and the
+r-chunk body, then sizes against two calibrated integer β's:
 
 ```
-wfn_budget   = 0.20 · budget       (wavefunction FFT workspace)
-rchunk_budget = 0.80 · budget      (pair-density + ZCT + solve)
+wfn_budget    = 0.20 · budget           # k_chunk · bc · (3·16·n_s·n_r/P) ≤ wfn_budget
+rchunk_budget = 0.80 · budget           # 4·16·n_k·n_rmu·cr/P + M_persistent ≤ rchunk_budget
 ```
 
-Pick `(k_chunk, band_chunk)` so `k_chunk · band_chunk · (3·16·n_s·n_r/P) ≤
-wfn_budget` (the 3 is `β[psi_G]=3` from `load_psi_rchunk_fft`).  Pick
-`chunk_r` so `4·16·n_k·n_rmu·chunk_r/P + M_persistent ≤ rchunk_budget` (the 4
-is `β[pair]=4` from `zct_lr` + `fit_one_rchunk`).  Rounds to a divisor of
-`n_rtot` / `n_b` when possible so every chunk is the same size (one compile
-shape per loop).  No DoE lookups — the two integer β's are the only
-calibrated constants.
+The 3 is `β[psi_G]=3` from `load_psi_rchunk_fft`; the 4 is `β[pair]=4` from
+`zct_lr` + `fit_one_rchunk`.  Prefers `chunk_r` / `band_chunk` values that
+divide `n_rtot` / `n_b` so every loop iteration is one compile shape.
 
-**Analytic** — `choose_chunks_analytic` in `chooser.py`.  Regroups the
-`fit_one_rchunk` primitive β·T contributions into four scaling classes:
+**Analytic (`LORRAX_CHOOSER_MODE=analytic`)** — `choose_chunks_analytic`.
+Regroups the `fit_one_rchunk` β·T contributions into four scaling classes
+(`PRIMITIVE_CLASSES` in `kernels/fit_one_rchunk.py` assigns each primitive
+to `const` / `cr` / `bc` / `crbc`):
 
 ```
-peak(chunk_r, bc) = α₀ + α_cr·chunk_r + α_bc·bc + α_crbc·(chunk_r·bc)
+peak(chunk_r, bc) = α₀ + α_cr·chunk_r + α_bc·bc + α_crbc·(chunk_r·bc) ≤ M
 ```
 
-(`PRIMITIVE_CLASSES` in `kernels/fit_one_rchunk.py` assigns each primitive to
-a class — `pair`→cr, `psiG_bc`→bc, `psiY_bc`→crbc, everything else→const.)
-Inverts the bilinear bound `peak ≤ M` in closed form for each candidate
-`bc`, picks the `(cr, bc)` that minimizes total FLOPs (from the companion
-`cost_fit`).  Applies a post-jit allgather bound (16·q_gather·n_rmu·cr
-bytes per device must also fit).
+Inverted in closed form per candidate `bc`; minimises total FLOPs via the
+companion `cost_fit`.  Also enforces the post-jit allgather bound
+(`16·q_gather·n_rmu·cr` bytes per device).
 
-**Grid-search fallback** — `choose_chunks_aot`.  Enumerates a coarse
-`(cr, bc)` grid and calls `predict_peak`.  Used for unit tests and manual
-exploration; not wired into the driver by default.
+**Grid search** — `choose_chunks_aot`.  Coarse `(cr, bc)` grid + `predict_peak`.
+For tests and manual exploration; not wired into the driver.
 
 ### γ calibration
 
-`memory_analysis()` is an upper-bound *compiler estimate*.  XLA schedules
-tighter at runtime — remat can happen even with
-`xla_disable_hlo_passes=rematerialization` disabled if the initial plan
-overflows, and NCCL / cuFFT scratch is outside the reported peak.  Each
-`Fit` carries a scalar `gamma = runtime_peak / aot_predicted` applied
-uniformly to the intercept and all β·T terms at prediction time.  Fresh fits
-start at `γ = 1.0`.  `gw_init.fit_zeta` prints `γ = peak_gb / aot_peak_gb`
-after every ζ-fit run so you can update it manually; a CLI to roll these
-into the artifact JSON is TODO.
+`memory_analysis()` is an upper-bound *compiler* estimate — XLA schedules
+tighter at runtime, and NCCL / cuFFT scratch sits outside the reported
+peak.  Each `Fit` carries a scalar `γ = runtime_peak / aot_predicted`
+applied uniformly to intercept and all β·T terms (fresh fits start at
+`γ = 1.0`).  `gw_init.fit_zeta` prints `γ` after every ζ-fit so it can be
+updated manually; a CLI to roll it into the artifact JSON is still TODO.
 
 ### When to trust which chooser
 
-- **Default heuristic** (`use_aot_chunk_chooser = false`): stable across
-  (system, mesh) combinations never seen in the DoE.  The α coefficients are
-  physically motivated and change only when you modify the pipeline.  First
-  choice unless you have evidence it OOMs.
-- **AOT 20/80 heuristic** (`use_aot_chunk_chooser = true`,
-  `LORRAX_CHOOSER_MODE=heuristic`): one free parameter
-  (`wfn_workspace_frac`, default 0.2).  Good for investigating "why am I
-  leaving memory on the table" — it's intentionally conservative.
-- **AOT analytic** (`use_aot_chunk_chooser = true`,
-  `LORRAX_CHOOSER_MODE=analytic`): maximally precise *within the DoE range*.
-  Can over-fit on narrow sweeps (e.g. `solve_q__current__fit` fractional β's
-  from a 7-point DoE).  Extrapolating far outside the calibrated range gives
-  polite numbers that miss by ~10% on a new machine.
+**Default heuristic** (`use_aot_chunk_chooser = false`) is the first choice:
+α coefficients are physically motivated and stable across untested
+(system, mesh) combinations.  The AOT **20/80 heuristic** is the natural
+second stop — one free parameter (`wfn_workspace_frac`) and intentionally
+conservative; useful for diagnosing "am I leaving memory on the table?".
+The AOT **analytic** path is maximally precise *within the calibrated DoE
+range* but can overfit on narrow sweeps (e.g. `solve_q` fractional β's from
+7 points) and misses by ~10% when extrapolating far beyond them.
 
 ### Status (2026-04-20)
 
-The AOT pipeline is **scaffolded and calibrated at MoS2 3×3 / Si 4×4×4
-scales**.  Not yet the default.  Known gaps:
-
-- Multi-node DoE missing — some primitives are collinear at fixed
-  `total_devices` (e.g. `Lq_sharded` vs `Lq_rep` in `fit_one_rchunk`).  The
-  fit absorbs them into one coefficient; validate before trusting
-  predictions beyond 4 GPUs.
-- `q_chunk`, `q_gather`, `k_chunk` are still picked by the hand-heuristic.
-  `choose_chunks_aot` only overrides `chunk_r` and `band_chunk`.
-- `γ` calibration is manual (printed each run, not persisted).
-- The `γ` field in artifact JSON is not yet used by the choosers (added in
-  `core.Fit`, wired through `_group_alpha` for the analytic chooser only).
-
-See the per-kernel `.notes` fields in the `*_fit.json` artifacts for
-DoE-specific caveats (which primitives are collinear, which cross-terms were
-probed, etc.).
+Scaffolded and calibrated at MoS2 3×3 and Si 4×4×4 scales; not the default
+yet.  Known gaps: no multi-node DoE (some primitives are collinear at fixed
+`total_devices` — e.g. `Lq_sharded` vs `Lq_rep` fold into one coefficient —
+so predictions beyond 4 GPUs need validation); `q_chunk` / `q_gather` /
+`k_chunk` stay on the hand-heuristic (the AOT chooser only overrides
+`chunk_r` and `band_chunk`); `γ` is manual, not persisted to JSON, and is
+currently wired into the analytic chooser only.  Per-kernel DoE caveats
+(which primitives are collinear, which cross-terms were probed) live in the
+`.notes` fields of the `*_fit.json` artifacts.
