@@ -122,13 +122,42 @@ local jax_cache_dir = env_or("JAX_COMPILATION_CACHE_DIR",
 -- Lustre: HDF5 file-locking must be off.
 setenv("HDF5_USE_FILE_LOCKING", "FALSE")
 
--- XLA memory: grow on demand from the CUDA async mempool instead of a
--- fixed-size BFC pool.  NCCL / cuSOLVERMp / SLATE then share VRAM with
--- XLA cleanly.  At MEM_FRACTION=0.95 with BFC, NCCL starves and surfaces
+-- Allocator choice.
+--
+-- Default (LORRAX_XLA_PREALLOCATE unset): grow on demand from the CUDA
+-- async mempool.  NCCL / cuSOLVERMp / SLATE then share VRAM with XLA
+-- cleanly.  At MEM_FRACTION=0.95 with BFC, NCCL starves and surfaces
 -- as `NCCL error 1 unhandled cuda error` inside cusolverMpSyevd.
-setenv("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-setenv("XLA_PYTHON_CLIENT_ALLOCATOR",   "platform")
-setenv("TF_GPU_ALLOCATOR",              "cuda_malloc_async")
+--
+-- Opt-in (LORRAX_XLA_PREALLOCATE=1 in shell BEFORE `module load`): BFC
+-- preallocation.  Faster for workloads that don't hit cuSOLVERMp (e.g.
+-- MoS2 3×3 COHSEX at a 28 GB budget), at the cost of NCCL starvation
+-- risk on workloads that do.  Override the fraction with
+-- LORRAX_XLA_MEM_FRACTION (default 0.75, JAX default).
+local _prealloc_flag = os.getenv("LORRAX_XLA_PREALLOCATE") or ""
+local use_preallocate = (_prealloc_flag == "1" or _prealloc_flag == "true")
+
+local allocator_env
+if use_preallocate then
+    allocator_env = {
+        {"XLA_PYTHON_CLIENT_PREALLOCATE",  "true"},
+        {"XLA_PYTHON_CLIENT_ALLOCATOR",    "bfc"},
+        {"XLA_PYTHON_CLIENT_MEM_FRACTION", env_or("LORRAX_XLA_MEM_FRACTION", "0.75")},
+        -- TF_GPU_ALLOCATOR overrides the allocator kind in some jaxlib
+        -- builds; force-clear it in preallocate mode.
+        {"TF_GPU_ALLOCATOR",               ""},
+    }
+else
+    allocator_env = {
+        {"XLA_PYTHON_CLIENT_PREALLOCATE",  "false"},
+        {"XLA_PYTHON_CLIENT_ALLOCATOR",    "platform"},
+        {"TF_GPU_ALLOCATOR",               "cuda_malloc_async"},
+    }
+end
+
+for _, kv in ipairs(allocator_env) do
+    setenv(kv[1], kv[2])
+end
 
 -- =========================================================================
 --  PYTHONPATH + container LD_LIBRARY_PATH
@@ -171,9 +200,6 @@ local container_ldlib = table.concat(ldlib_parts, ":")
 local shifter_env_parts = {
     "--env=PYTHONPATH=" .. pypath,
     "--env=HDF5_USE_FILE_LOCKING=FALSE",
-    "--env=XLA_PYTHON_CLIENT_PREALLOCATE=false",
-    "--env=XLA_PYTHON_CLIENT_ALLOCATOR=platform",
-    "--env=TF_GPU_ALLOCATOR=cuda_malloc_async",
     "--env=LD_LIBRARY_PATH=" .. container_ldlib,
     -- Shifter's mpich module ships libmpi_gtl_cuda.so.0 built against
     -- CUDA 11 (needs libcudart.so.11 we don't have).  LD_PRELOAD the
@@ -188,6 +214,13 @@ local shifter_env_parts = {
     "--env=LORRAX_MPI_INCLUDE_DIR=/lorrax_phdf5/include",
     "--env=LORRAX_MPICH_LIB_DIR=" .. mpich_container_dir,
 }
+
+-- Forward the allocator trio so the container sees the same choice the
+-- login side set above.  Empty values clear an inherited inside-container
+-- setting (needed when switching TF_GPU_ALLOCATOR off in preallocate mode).
+for _, kv in ipairs(allocator_env) do
+    table.insert(shifter_env_parts, "--env=" .. kv[1] .. "=" .. kv[2])
+end
 
 local shifter_args = table.concat({
     "--image=" .. image,
