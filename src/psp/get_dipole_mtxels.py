@@ -11,11 +11,11 @@ The nonlocal velocity term is stubbed pending detailed implementation; the code
 initializes QE-style projectors so downstream development can fill it in.
 """
 
-import os
+from runtime import set_default_env
+set_default_env()
+
 import argparse
 from pathlib import Path
-
-os.environ.setdefault("JAX_ENABLE_X64", "1")
 
 import numpy as np
 import jax

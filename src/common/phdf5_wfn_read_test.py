@@ -27,11 +27,11 @@ handler printed by rank 0.
 """
 from __future__ import annotations
 
-import os
-os.environ.setdefault("JAX_ENABLE_X64", "1")
-os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
+from runtime import set_default_env
+set_default_env()
 
 import argparse
+import os
 import resource
 import sys
 import time
@@ -42,17 +42,8 @@ import jax.numpy as jnp
 import numpy as np
 jax.config.update("jax_enable_x64", True)
 
-_DIST_SENTINEL = "_LORRAX_JAX_DISTRIBUTED_DONE"
-def _maybe_init_jax_distributed():
-    if os.environ.get(_DIST_SENTINEL):
-        return
-    if int(os.environ.get("SLURM_NTASKS", "1")) > 1:
-        try:
-            jax.distributed.initialize()
-        except Exception:
-            pass
-    os.environ[_DIST_SENTINEL] = "1"
-_maybe_init_jax_distributed()
+from runtime import init_jax_distributed
+init_jax_distributed()
 
 from jax.experimental import multihost_utils
 from jax.sharding import Mesh, PartitionSpec as P

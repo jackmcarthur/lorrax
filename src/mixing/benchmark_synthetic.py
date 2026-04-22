@@ -14,12 +14,10 @@ Run with:
 
 from __future__ import annotations
 
-import os
 import sys
 
-# Enable 64-bit precision
-os.environ.setdefault("JAX_ENABLE_X64", "1")
-os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
+from runtime import set_default_env
+set_default_env(platform="cpu")
 
 # Set interactive matplotlib backend if --show is in args (before importing pyplot)
 if "--show" in sys.argv:

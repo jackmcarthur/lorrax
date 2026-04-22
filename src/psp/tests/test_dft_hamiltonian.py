@@ -21,10 +21,11 @@ Usage (Perlmutter login node, single GPU):
         --pseudo_dir qe/scf \
         --wfn qe/nscf/WFN.h5
 """
-import os
-os.environ.setdefault("JAX_ENABLE_X64", "1")
+from runtime import set_default_env
+set_default_env()
 
 import argparse
+import os
 import sys
 import numpy as np
 import h5py

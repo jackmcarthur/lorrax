@@ -20,64 +20,23 @@ Usage:
 """
 from __future__ import annotations
 
-import os
-os.environ.setdefault("JAX_ENABLE_X64", "1")
+from runtime import set_default_env
+set_default_env()
 
 import argparse
+import os
 import time
 
 import numpy as np
 import jax
 import jax.numpy as jnp
 
-
-# ── Multi-process bootstrap ────────────────────────────────────────────
 # run_nscf is embarrassingly k-parallel: each k-point is an independent
-# Davidson diagonalization. Under SLURM (multiple srun tasks), we initialize
-# jax.distributed so every process sees exactly one GPU, then stride
-# k-points over ranks. Same pattern as gw.gw_jax._maybe_init_jax_distributed.
-_DISTRIBUTED_SENTINEL = "_LORRAX_JAX_DISTRIBUTED_DONE"
-
-
-def _maybe_init_jax_distributed() -> None:
-    if os.environ.get(_DISTRIBUTED_SENTINEL):
-        return
-    proc_count = int(
-        os.environ.get("JAX_PROCESS_COUNT",
-        os.environ.get("JAX_NUM_PROCESSES",
-        os.environ.get("SLURM_NTASKS", "1"))))
-    if proc_count > 1:
-        try:
-            jax.distributed.initialize()
-            os.environ[_DISTRIBUTED_SENTINEL] = "1"
-            return
-        except Exception:
-            pass
-        coord = os.environ.get("JAX_COORDINATOR_ADDRESS")
-        if coord is None:
-            import subprocess
-            nodelist = os.environ.get("SLURM_NODELIST")
-            if nodelist:
-                try:
-                    result = subprocess.run(
-                        ["scontrol", "show", "hostnames", nodelist],
-                        capture_output=True, text=True, check=True)
-                    coord = f"{result.stdout.strip().splitlines()[0]}:12355"
-                except Exception:
-                    pass
-            if coord is None:
-                host = (os.environ.get("SLURMD_NODENAME") or
-                        os.environ.get("HOSTNAME") or "localhost")
-                coord = f"{host}:12355"
-        proc_id = int(os.environ.get("JAX_PROCESS_INDEX",
-                                     os.environ.get("SLURM_PROCID", "0")))
-        jax.distributed.initialize(coordinator_address=coord,
-                                   num_processes=proc_count,
-                                   process_id=proc_id)
-    os.environ[_DISTRIBUTED_SENTINEL] = "1"
-
-
-_maybe_init_jax_distributed()
+# Davidson diagonalisation.  Under SLURM (multiple srun tasks), we
+# initialise jax.distributed so every process sees exactly one GPU, then
+# stride k-points over ranks.
+from runtime import init_jax_distributed
+init_jax_distributed()
 
 from file_io import CrystalData, WFNWriter
 from psp.pseudos import load_pseudopotentials

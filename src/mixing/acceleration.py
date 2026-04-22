@@ -21,12 +21,11 @@ References:
 
 from __future__ import annotations
 
-import os
+from runtime import set_default_env
+set_default_env()
+
 from functools import partial
 from typing import Callable, NamedTuple
-
-# Enable 64-bit precision before importing JAX
-os.environ.setdefault("JAX_ENABLE_X64", "1")
 
 import jax
 import jax.numpy as jnp

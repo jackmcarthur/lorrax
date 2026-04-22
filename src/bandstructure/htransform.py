@@ -1,10 +1,10 @@
+from runtime import set_default_env
+set_default_env()
+
 import os
 import re
 import argparse
 import numpy as np
-
-os.environ.setdefault("JAX_ENABLE_X64", "1")
-# Allow GPU if available (previously forced CPU)
 
 import jax
 import jax.numpy as jnp

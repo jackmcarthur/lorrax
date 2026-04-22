@@ -13,10 +13,11 @@ handling (explicit loop here vs ring communication in BSE).
 """
 from __future__ import annotations
 
-import os
-os.environ.setdefault("JAX_ENABLE_X64", "1")
+from runtime import set_default_env
+set_default_env()
 
 import argparse
+import os
 import time
 
 import numpy as np

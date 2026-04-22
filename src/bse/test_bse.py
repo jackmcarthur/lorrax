@@ -14,12 +14,14 @@ Profiling:
     tensorboard --logdir=./jax_traces
 """
 from __future__ import annotations
+
+from runtime import set_default_env
+set_default_env()
+
 import argparse
 import glob
 import os
 import sys
-
-os.environ.setdefault("JAX_ENABLE_X64", "1")
 
 import h5py
 import numpy as np

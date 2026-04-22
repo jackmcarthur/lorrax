@@ -1,9 +1,8 @@
 """GW/COHSEX driver package."""
 
-import os
-
-# Ensure double precision is enabled before any module in this package imports JAX.
-os.environ.setdefault("JAX_ENABLE_X64", "1")
+# Ensure double precision is enabled before any submodule imports JAX.
+from runtime import set_default_env
+set_default_env()
 
 from .gw_init import get_bandranges
 from .gw_config import read_lorrax_input, read_cohsex_input

@@ -26,11 +26,10 @@ For non-orthogonal cells, this approximation works well when the cell is "not to
 For highly skewed cells, one should check neighboring images explicitly.
 """
 
-import os
-import numpy as np
+from runtime import set_default_env
+set_default_env()
 
-from jax import config
-config.update("jax_enable_x64", True)
+import numpy as np
 
 import jax
 import jax.numpy as jnp
@@ -39,54 +38,8 @@ from jax.sharding import Mesh, PartitionSpec, NamedSharding
 from jax.experimental.shard_map import shard_map
 from functools import partial
 
-
-# Multi-process bootstrap. When launched under `srun -n N>1` each rank is a
-# separate Python process with its own local GPU; `jax.distributed.initialize()`
-# stitches them into one multi-host JAX job so `jax.devices()` returns all N
-# GPUs and we can build a single `Mesh` spanning them. Matches the pattern in
-# ``psp/run_nscf.py`` and ``gw/gw_jax.py``.
-_DISTRIBUTED_SENTINEL = "_LORRAX_KMEANS_DISTRIBUTED_DONE"
-
-
-def _maybe_init_jax_distributed() -> None:
-    if os.environ.get(_DISTRIBUTED_SENTINEL):
-        return
-    proc_count = int(
-        os.environ.get("JAX_PROCESS_COUNT",
-        os.environ.get("JAX_NUM_PROCESSES",
-        os.environ.get("SLURM_NTASKS", "1"))))
-    if proc_count > 1:
-        try:
-            jax.distributed.initialize()
-            os.environ[_DISTRIBUTED_SENTINEL] = "1"
-            return
-        except Exception:
-            pass
-        coord = os.environ.get("JAX_COORDINATOR_ADDRESS")
-        if coord is None:
-            import subprocess
-            nodelist = os.environ.get("SLURM_NODELIST")
-            if nodelist:
-                try:
-                    result = subprocess.run(
-                        ["scontrol", "show", "hostnames", nodelist],
-                        capture_output=True, text=True, check=True)
-                    coord = f"{result.stdout.strip().splitlines()[0]}:12355"
-                except Exception:
-                    pass
-            if coord is None:
-                host = (os.environ.get("SLURMD_NODENAME") or
-                        os.environ.get("HOSTNAME") or "localhost")
-                coord = f"{host}:12355"
-        proc_id = int(os.environ.get("JAX_PROCESS_INDEX",
-                                     os.environ.get("SLURM_PROCID", "0")))
-        jax.distributed.initialize(coordinator_address=coord,
-                                   num_processes=proc_count,
-                                   process_id=proc_id)
-    os.environ[_DISTRIBUTED_SENTINEL] = "1"
-
-
-_maybe_init_jax_distributed()
+from runtime import init_jax_distributed
+init_jax_distributed()
 
 print(f"✓ JAX initialized: {len(jax.devices())} device(s) "
       f"(local: {len(jax.local_devices())}, proc {jax.process_index()}/"

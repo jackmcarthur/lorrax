@@ -23,10 +23,10 @@ Usage:
 """
 from __future__ import annotations
 
-import os
-os.environ.setdefault("JAX_ENABLE_X64", "1")
-os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
+from runtime import set_default_env
+set_default_env()
 
+import os
 import sys
 import tempfile
 
@@ -35,20 +35,8 @@ import jax
 import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 
-_DIST_SENTINEL = "_LORRAX_JAX_DISTRIBUTED_DONE"
-def _maybe_init_jax_distributed():
-    if os.environ.get(_DIST_SENTINEL):
-        return
-    proc_count = int(os.environ.get("JAX_PROCESS_COUNT",
-                         os.environ.get("JAX_NUM_PROCESSES",
-                         os.environ.get("SLURM_NTASKS", "1"))))
-    if proc_count > 1:
-        try:
-            jax.distributed.initialize()
-        except Exception:
-            pass
-    os.environ[_DIST_SENTINEL] = "1"
-_maybe_init_jax_distributed()
+from runtime import init_jax_distributed
+init_jax_distributed()
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from file_io.slab_io import SlabIO

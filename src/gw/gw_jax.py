@@ -1,9 +1,8 @@
-import os
-
-os.environ.setdefault("JAX_ENABLE_X64", "1")
-os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
+from runtime import set_default_env
+set_default_env()
 
 import argparse
+import os
 
 import numpy as np
 import jax
@@ -11,72 +10,10 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 jax.config.update("jax_enable_x64", True)
 
-# Initialize JAX distributed only when running multi-process.
-# Guard: when run via `python -m gw.gw_jax`, the module executes as __main__
-# first, then gw_init.py re-imports it as gw.gw_jax.  Module-level globals
-# are NOT shared between these two namespace copies, so we use an env-var
-# sentinel that persists across re-imports within the same process.
-_DISTRIBUTED_SENTINEL = "_LORRAX_JAX_DISTRIBUTED_DONE"
+from runtime import init_jax_distributed, fallback_to_cpu_if_no_gpu_backend
+init_jax_distributed()
+fallback_to_cpu_if_no_gpu_backend()
 
-def _maybe_init_jax_distributed():
-	if os.environ.get(_DISTRIBUTED_SENTINEL):
-		return
-	proc_count = int(os.environ.get("JAX_PROCESS_COUNT",
-						 os.environ.get("JAX_NUM_PROCESSES",
-						 os.environ.get("SLURM_NTASKS", "1"))))
-	if proc_count > 1:
-		# Under the Cray MPICH stack, each rank runs on exactly one GPU
-		# via CUDA_VISIBLE_DEVICES=$SLURM_LOCALID (set by select_gpu.sh
-		# in lxrun).  JAX's no-args distributed.initialize() assumes
-		# each process owns *all* local GPUs, then hangs in the
-		# jax.devices() topology exchange ("GetKeyValue() timed out
-		# with key: cuda:local_topology/cuda/1") because each rank is
-		# looking for peers that don't exist on its side.  Detect local
-		# GPU count from CUDA_VISIBLE_DEVICES and pass local_device_ids
-		# explicitly — same pattern used by slate_*_test.py,
-		# cusolvermp_eigh_test.py, and psp.run_nscf.
-		cv = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-		n_local = len([x for x in cv.split(",") if x.strip()]) if cv else 0
-		init_kwargs = {"local_device_ids": list(range(n_local))} if n_local else {}
-		try:
-			jax.distributed.initialize(**init_kwargs)
-			os.environ[_DISTRIBUTED_SENTINEL] = "1"
-			return
-		except Exception:
-			pass
-		# Fallback: explicit coordinator from SLURM_NODELIST (first node)
-		coord = os.environ.get("JAX_COORDINATOR_ADDRESS")
-		if coord is None:
-			import subprocess
-			nodelist = os.environ.get("SLURM_NODELIST")
-			if nodelist:
-				try:
-					result = subprocess.run(
-						["scontrol", "show", "hostnames", nodelist],
-						capture_output=True, text=True, check=True
-					)
-					first_host = result.stdout.strip().split("\n")[0]
-					coord = f"{first_host}:12355"
-				except Exception:
-					pass
-			if coord is None:
-				host = os.environ.get("SLURMD_NODENAME") or os.environ.get("HOSTNAME") or "localhost"
-				coord = f"{host}:12355"
-		proc_id = int(os.environ.get("JAX_PROCESS_INDEX", os.environ.get("SLURM_PROCID", "0")))
-		jax.distributed.initialize(coordinator_address=coord,
-								   num_processes=proc_count,
-								   process_id=proc_id)
-	os.environ[_DISTRIBUTED_SENTINEL] = "1"
-
-_maybe_init_jax_distributed()
-try:
-	jax.devices()
-except RuntimeError as exc:
-	if "Unknown backend: 'gpu'" in str(exc):
-		os.environ.pop("JAX_PLATFORM_NAME", None)
-		os.environ["JAX_PLATFORMS"] = "cpu"
-	else:
-		raise
 from file_io import (
     WFNReader, write_sigma_omega_h5,
     load_kin_ion_submatrix, load_centroids,

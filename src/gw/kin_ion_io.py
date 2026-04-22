@@ -15,14 +15,11 @@ Usage:
   python -m gw.kin_ion_io -i tests/cohsex_debug/cohsex_test.in [-o kin_ion.h5]
 """
 
-import os
+from runtime import set_default_env
+set_default_env()
 
-os.environ.setdefault("JAX_ENABLE_X64", "1")
-os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
-os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 import argparse
+import os
 import numpy as np
 import jax
 from jax.sharding import Mesh

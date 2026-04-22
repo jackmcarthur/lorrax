@@ -11,21 +11,15 @@ This module computes all terms of the DFT Hamiltonian:
 Also computes valence (n_v) and core (n_c) charge densities.
 """
 
+from runtime import set_default_env
+set_default_env()
+
 import os
 import argparse
 import configparser
 import re
 import glob
 from pathlib import Path
-
-# Set JAX configs BEFORE importing JAX (prefer GPU if available)
-os.environ.setdefault("JAX_ENABLE_X64", "1")
-# Respect user/project overrides; otherwise prefer GPU-capable platforms
-if "JAX_PLATFORMS" not in os.environ and "JAX_PLATFORM_NAME" not in os.environ:
-    os.environ["JAX_PLATFORMS"] = "cuda,cpu"
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
-os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 
 import numpy as np
 import jax

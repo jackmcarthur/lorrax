@@ -9,13 +9,11 @@ Usage:
   python -m gw.kin_ion_io_chunked -i gw.inp -o kin_ion.h5 [--sys_dim 3]
 """
 
-import os
-os.environ.setdefault("JAX_ENABLE_X64", "1")
-os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
+from runtime import set_default_env
+set_default_env()
 
 import argparse
+import os
 import numpy as np
 import jax
 import jax.numpy as jnp
