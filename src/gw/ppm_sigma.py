@@ -390,26 +390,28 @@ def _get_sigma_kij_kernel(
     _project_ri_rs = _make_project_ri_reduce_scatter(mesh_xy)
 
     @jax.jit
-    def _sigma_kij_kernel(
-        psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-        E_A, mask_A, E_ref_A, t_node, W_q,
-    ):
+    def _sigma_kij_kernel(wfns, E_A, mask_A, E_ref_A, t_node, W_q):
         """Σ_kij = project_rs[ FFT[ G(R) · W(R) / √Nk ] ].  All flat-k.
 
-        W_q is (nq, μ, μ) flat-q — same layout as all other flat-k arrays.
-        G(t) = build_G_tau(psi, E_A, 1j·t_node, e_ref=E_ref_A, mask=mask_A),
-        i.e. the unified ISDF-basis G builder with pure-imaginary t
-        (real-time evolution).  Output (Σ_ri) emerges (m_X, n_Y)-sharded
-        from the final shard_map.
+        Bundle-in / Σ_ri-out.  Slices are static metadata on
+        ``wfns.slices`` (BandSlices pytree meta_field), so the kernel
+        can unpack its four ψ views (coh_xn, coh_yr on the full range;
+        proj_xr, proj_yn on the sigma range) inside the jit — matching
+        cohsex_sigma's convention.  ``W_q`` is flat-q (nq, μ, μ).
+        G(t) = build_G_tau(ψ_coh, E_A, 1j·t_node, e_ref=E_ref_A, mask=mask_A),
+        the unified ISDF-basis G builder with pure-imaginary t
+        (real-time evolution).  Output (σ_re, σ_im) emerges
+        (m_X, n_Y)-sharded from the final shard_map.
         """
+        s = wfns.slices
         G_k = build_G_tau(
-            psi_coh_xn, psi_coh_yr, E_A, 1j * t_node,
+            wfns.xn(s.full), wfns.yr(s.full), E_A, 1j * t_node,
             e_ref=E_ref_A, mask=mask_A,
         )
         G_R = _G_ifftn(G_k)
         V_R = _V_ifftn(W_q)[:, None, :, None, :]  # (nk,1,μ,1,μ) broadcast to G shape
         sigma_k = _G_fftn(G_R * V_R * inv_sqrt_nk)
-        return _project_ri_rs(psi_proj_xr, sigma_k, psi_proj_yn)
+        return _project_ri_rs(wfns.xr(s.sigma), sigma_k, wfns.yn(s.sigma))
 
     _sigma_kij_kernel_cache[pipeline_key] = _sigma_kij_kernel
     return _sigma_kij_kernel
@@ -445,17 +447,12 @@ def _get_sigma_tau_kernel(
 
     @jax.jit
     def _tau_kernel(
-        psi_coh_xn, psi_coh_yr,
-        psi_proj_xr, psi_proj_yn,
+        wfns,
         E_A, mask_A, B_q, Omega_q, mask_B,
         E_ref_A, E_ref_B, t_node,
     ):
         W_t_q = _build_W_t_q(B_q, Omega_q, mask_B, E_ref_B, t_node)
-        return sigma_kij_kernel(
-            psi_coh_xn, psi_coh_yr,
-            psi_proj_xr, psi_proj_yn,
-            E_A, mask_A, E_ref_A, t_node, W_t_q,
-        )
+        return sigma_kij_kernel(wfns, E_A, mask_A, E_ref_A, t_node, W_t_q)
 
     _sigma_tau_kernel_cache[cache_key] = _tau_kernel
     return _tau_kernel
@@ -1007,12 +1004,9 @@ def _run_sigma_branch(
     n_omega = int(omega_nonneg_ry.shape[0])
 
     s = wfns.slices
-    psi_coh_xn = wfns.xn(s.full)
-    psi_coh_yr = wfns.yr(s.full)
-    psi_proj_xr = wfns.xr(s.sigma)
-    psi_proj_yn = wfns.yn(s.sigma)
-    nk_proj = int(psi_proj_xr.shape[0])
-    nb_proj = int(psi_proj_xr.shape[1])
+    psi_proj_xr_shape = wfns.xr(s.sigma).shape
+    nk_proj = int(psi_proj_xr_shape[0])
+    nb_proj = int(psi_proj_xr_shape[1])
 
     if n_omega == 0:
         return jnp.zeros((0, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), []
@@ -1084,20 +1078,18 @@ def _run_sigma_branch(
                 # Per-window builder: bundles G(τ)·W(τ), FFT, project_ri into
                 # one callable of ``t_j``.  Closes over the pinned args so the
                 # τ loop reads parallel to chi0's (nodes → scan body →
-                # contraction → accumulate).
+                # contraction → accumulate).  The ψ views live inside
+                # tau_kernel (unpacked from wfns.slices there) — identical
+                # to the cohsex/chi0 convention.
                 def build_sigma_tau(t_j, *,
-                                    _psi_coh_xn=psi_coh_xn,
-                                    _psi_coh_yr=psi_coh_yr,
-                                    _psi_proj_xr=psi_proj_xr,
-                                    _psi_proj_yn=psi_proj_yn,
+                                    _wfns=wfns,
                                     _E_A=E_A, _mask_A=mask_A,
                                     _B_q=B_q, _Omega_q=Omega_q,
                                     _mask_B=mask_B,
                                     _E_ref_A_j=E_ref_A_j,
                                     _E_ref_B_j=E_ref_B_j):
                     return tau_kernel(
-                        _psi_coh_xn, _psi_coh_yr,
-                        _psi_proj_xr, _psi_proj_yn,
+                        _wfns,
                         _E_A, _mask_A, _B_q, _Omega_q, _mask_B,
                         _E_ref_A_j, _E_ref_B_j, t_j,
                     )
@@ -1149,7 +1141,7 @@ def compute_sigma_c_ppm_omega_grid(
     """Compute Σ^c_kij(ω) via GN-PPM windowed minimax integration."""
 
     s = wfns.slices
-    psi_proj_xr = wfns.xr(s.sigma)
+    proj_shape = wfns.xr(s.sigma).shape  # (nk, nb_sigma, ns, μ_X) — dims only
     enk_full = wfns.enk[:, s.full]
     occ_full = wfns.occ[:, s.full]
     B_q = ppm.B_q
@@ -1234,8 +1226,8 @@ def compute_sigma_c_ppm_omega_grid(
         )
 
     # Accumulation mode
-    nk_proj = int(psi_proj_xr.shape[0])
-    nb_proj = int(psi_proj_xr.shape[1])
+    nk_proj = int(proj_shape[0])
+    nb_proj = int(proj_shape[1])
     kij_bytes = float(omega_req.size * nk_proj * nb_proj * nb_proj * 16)
     use_kij_accum = omega_accumulation == "kij"
     use_kij_stream = omega_accumulation == "kij_stream"
