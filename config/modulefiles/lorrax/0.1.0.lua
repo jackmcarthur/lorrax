@@ -122,38 +122,77 @@ local jax_cache_dir = env_or("JAX_COMPILATION_CACHE_DIR",
 -- Lustre: HDF5 file-locking must be off.
 setenv("HDF5_USE_FILE_LOCKING", "FALSE")
 
--- Allocator choice.
+-- Allocator choice.  Four modes, selected by LORRAX_XLA_ALLOCATOR env
+-- var (read BEFORE `module load`):
 --
--- Default (LORRAX_XLA_PREALLOCATE unset): grow on demand from the CUDA
--- async mempool.  NCCL / cuSOLVERMp / SLATE then share VRAM with XLA
--- cleanly.  At MEM_FRACTION=0.95 with BFC, NCCL starves and surfaces
--- as `NCCL error 1 unhandled cuda error` inside cusolverMpSyevd.
+--   default (unset):  platform + cuda_malloc_async.  Safe with
+--     cuSOLVERMp / NCCL / SLATE; slow — `platform` is JAX's on-demand
+--     debugging allocator.  Kept only for compatibility with existing
+--     lxrun invocations that rely on it.
 --
--- Opt-in (LORRAX_XLA_PREALLOCATE=1 in shell BEFORE `module load`): BFC
--- preallocation.  Faster for workloads that don't hit cuSOLVERMp (e.g.
--- MoS2 3×3 COHSEX at a 28 GB budget), at the cost of NCCL starvation
--- risk on workloads that do.  Override the fraction with
--- LORRAX_XLA_MEM_FRACTION (default 0.75, JAX default).
+--   bfc:              BFC preallocate=true + XLA_PYTHON_CLIENT_ALLOCATOR=bfc.
+--     Fastest for XLA compute, but at MEM_FRACTION=0.95 NCCL starves
+--     inside cuSOLVERMp (surfaces as `NCCL error 1 unhandled cuda
+--     error`).  Use LORRAX_XLA_MEM_FRACTION=0.5 to leave room.
+--
+--   cuda_async:       JAX's CUDA async allocator (no BFC).  Per XLA
+--     source: calls cuDeviceGetDefaultMemPool, so JAX and FFI
+--     cudaMallocAsync share the device's default mempool — no pool
+--     contention.  Release threshold is set to MEM_FRACTION * total
+--     VRAM.  Optional: LORRAX_XLA_PRESEED=-1 (or bytes) triggers
+--     TF_CUDA_MALLOC_ASYNC_SUPPORTED_PREALLOC to pre-seed the pool
+--     up-front, removing pool-growth cost at run-time.
+--
+-- LORRAX_XLA_PREALLOCATE=1 is kept as a back-compat alias for
+-- LORRAX_XLA_ALLOCATOR=bfc.
+local _alloc_raw = (os.getenv("LORRAX_XLA_ALLOCATOR") or ""):lower()
 local _prealloc_flag = os.getenv("LORRAX_XLA_PREALLOCATE") or ""
-local use_preallocate = (_prealloc_flag == "1" or _prealloc_flag == "true")
+if _alloc_raw == "" and (_prealloc_flag == "1" or _prealloc_flag == "true") then
+    _alloc_raw = "bfc"
+end
+if _alloc_raw == "" then
+    _alloc_raw = "default"
+end
 
-local allocator_env
-if use_preallocate then
-    allocator_env = {
-        {"XLA_PYTHON_CLIENT_PREALLOCATE",  "true"},
-        {"XLA_PYTHON_CLIENT_ALLOCATOR",    "bfc"},
-        {"XLA_PYTHON_CLIENT_MEM_FRACTION", env_or("LORRAX_XLA_MEM_FRACTION", "0.75")},
-    }
-    -- TF_GPU_ALLOCATOR overrides the allocator kind in some jaxlib
-    -- builds; force-clear it in preallocate mode.  Shifter/srun reject
-    -- empty `--env=KEY=` values, so we unsetenv rather than pass through.
-    unsetenv("TF_GPU_ALLOCATOR")
-else
+local allocator_env = {}
+local _mf = env_or("LORRAX_XLA_MEM_FRACTION", "")   -- empty = XLA default
+
+if _alloc_raw == "default" then
     allocator_env = {
         {"XLA_PYTHON_CLIENT_PREALLOCATE",  "false"},
         {"XLA_PYTHON_CLIENT_ALLOCATOR",    "platform"},
         {"TF_GPU_ALLOCATOR",               "cuda_malloc_async"},
     }
+elseif _alloc_raw == "bfc" then
+    -- MEM_FRACTION default 0.5 = ~20 GB XLA pool on an A100, leaves
+    -- 20 GB for cuSOLVERMp / NCCL / SLATE — the original "NCCL starves"
+    -- warning applied at 0.95, not 0.5.  Verified safe on MoS2 3×3
+    -- low_mem (cublasMp W-solve) and common.cusolvermp_eigh_test.
+    -- Push higher (0.75, 0.9) for workloads that don't hit cuSOLVERMp.
+    allocator_env = {
+        {"XLA_PYTHON_CLIENT_PREALLOCATE",  "true"},
+        {"XLA_PYTHON_CLIENT_ALLOCATOR",    "bfc"},
+        {"XLA_PYTHON_CLIENT_MEM_FRACTION", _mf ~= "" and _mf or "0.5"},
+    }
+    unsetenv("TF_GPU_ALLOCATOR")
+elseif _alloc_raw == "cuda_async" then
+    allocator_env = {
+        {"XLA_PYTHON_CLIENT_PREALLOCATE",  "false"},
+        {"XLA_PYTHON_CLIENT_ALLOCATOR",    "cuda_async"},
+    }
+    if _mf ~= "" then
+        table.insert(allocator_env,
+            {"XLA_PYTHON_CLIENT_MEM_FRACTION", _mf})
+    end
+    local _preseed = os.getenv("LORRAX_XLA_PRESEED") or ""
+    if _preseed ~= "" then
+        table.insert(allocator_env,
+            {"TF_CUDA_MALLOC_ASYNC_SUPPORTED_PREALLOC", _preseed})
+    end
+    unsetenv("TF_GPU_ALLOCATOR")
+else
+    LmodError("LORRAX_XLA_ALLOCATOR=" .. _alloc_raw ..
+              " invalid; expected default|bfc|cuda_async")
 end
 
 for _, kv in ipairs(allocator_env) do
