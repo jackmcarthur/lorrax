@@ -140,16 +140,6 @@ def _add_static_head(sig_sx, sig_coh, *, static_head_terms, meta, mesh_xy,
             sig_coh + jax.device_put(coh_h, rep))
 
 
-def _add_static_head_x(sig_x, *, static_head_terms, meta, mesh_xy):
-    """Add the q→0 head correction to bare exchange Σ_X (no-op if None)."""
-    if static_head_terms is None:
-        return sig_x
-    x_head, _ = static_head_terms_to_kij(
-        static_head_terms, nk_tot=meta.nk_tot, do_screened=False)
-    rep = NamedSharding(mesh_xy, P(None, None, None))
-    return sig_x + jax.device_put(x_head, rep)
-
-
 # ---------------------------------------------------------------------------
 # Top-level driver.
 # ---------------------------------------------------------------------------
@@ -220,9 +210,11 @@ def compute_sigma_cohsex(
         with mesh_xy:
             sig_x = sigma_sx_k(wfns, Gij, V_q)
         sig_x.block_until_ready()
-        sig_x = _add_static_head_x(
-            sig_x, static_head_terms=static_head_terms,
-            meta=meta, mesh_xy=mesh_xy)
+        if static_head_terms is not None:
+            x_head, _ = static_head_terms_to_kij(
+                static_head_terms, nk_tot=meta.nk_tot, do_screened=False)
+            rep = NamedSharding(mesh_xy, P(None, None, None))
+            sig_x = sig_x + jax.device_put(x_head, rep)
 
     return {
         "sig_sx":  sig_sx,
