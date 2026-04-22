@@ -200,11 +200,12 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
 # W solve with two-stage resharding (following load_wfns pattern)
 # ============================================================================
 
-def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int):
+def _get_w_solve_fn(mesh_xy: Mesh, kgrid: tuple[int, int, int], n_rmu: int):
     """W = (I - V χ)⁻¹ V via q-parallel shard_map.  All arrays flat-q: (nq, μ, μ)."""
     from jax.experimental.shard_map import shard_map
 
-    cache_key = (id(mesh_xy), nq, n_rmu)
+    kgrid = tuple(int(x) for x in kgrid)
+    cache_key = (id(mesh_xy), kgrid, n_rmu)
     if cache_key in _w_solve_cache:
         return _w_solve_cache[cache_key]
 
@@ -260,7 +261,8 @@ def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int):
     return _solve_w
 
 
-def _get_w_solve_fn_low_mem(mesh_xy: Mesh, nq: int, n_rmu: int, dtype):
+def _get_w_solve_fn_low_mem(mesh_xy: Mesh, kgrid: tuple[int, int, int],
+                              n_rmu: int, dtype):
     """Low-mem W-solve: fused cuBLASMp + cuSOLVERMp FFI.
 
     One distributed FFI call runs the entire symmetric Cholesky Dyson
@@ -276,7 +278,8 @@ def _get_w_solve_fn_low_mem(mesh_xy: Mesh, nq: int, n_rmu: int, dtype):
     from ffi.cublasmp import batched_fused_w_solve
     from jax.sharding import NamedSharding
 
-    cache_key = ("low_mem_fused", id(mesh_xy), nq, n_rmu, dtype)
+    kgrid = tuple(int(x) for x in kgrid)
+    cache_key = ("low_mem_fused", id(mesh_xy), kgrid, n_rmu, dtype)
     if cache_key in _w_solve_cache:
         return _w_solve_cache[cache_key]
 
@@ -309,17 +312,18 @@ def solve_w(V_q, chi0_q, meta, mesh_xy, *, memory_mode: str = "high_mem"):
     """
     nq = int(meta.nk_tot)
     n_rmu = chi0_q.shape[1]
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     nspin = max(1, int(getattr(meta, 'nspin', 1)))
     nspinor = max(1, int(getattr(meta, 'nspinor', 1)))
     pref_scalar = 2.0 / (float(max(1, nq)) ** 0.5 * float(nspin) * float(nspinor))
     mode = (memory_mode or "high_mem").lower()
     if mode == "low_mem":
         # Fused FFI consumes pref as a Python scalar (compile-time attr).
-        solve_fn = _get_w_solve_fn_low_mem(mesh_xy, nq, n_rmu, V_q.dtype)
+        solve_fn = _get_w_solve_fn_low_mem(mesh_xy, kgrid, n_rmu, V_q.dtype)
         with jax_profile.annotation("W_solve"):
             return solve_fn(V_q, chi0_q, complex(pref_scalar))
     else:
-        solve_fn = _get_w_solve_fn(mesh_xy, nq, n_rmu)
+        solve_fn = _get_w_solve_fn(mesh_xy, kgrid, n_rmu)
         pref_jnp = jnp.asarray(pref_scalar, dtype=jnp.complex128)
         with jax_profile.annotation("W_solve"):
             return solve_fn(V_q, chi0_q, pref_jnp)

@@ -63,10 +63,12 @@ _cohsex_kernel_cache: dict[tuple[object, ...], tuple] = {}
 def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int], nk_tot: int):
     """Cached factory: returns (sigma_sx, sigma_coh, hartree) jit'd kernels.
 
-    Keyed on (id(mesh_xy), kgrid) so repeat calls within one process
-    reuse the compiled FFT helpers.
+    Keyed on (id(mesh_xy), kgrid) — same shape the chi0 / ppm_sigma
+    kernel caches use.  ``nk_tot`` = prod(kgrid) and is redundant for
+    cache-lookup purposes; it stays as a positional arg because the
+    Hartree kernel closes over it as a compile-time constant.
     """
-    cache_key = (id(mesh_xy), tuple(int(x) for x in kgrid), int(nk_tot))
+    cache_key = (id(mesh_xy), tuple(int(x) for x in kgrid))
     if cache_key in _cohsex_kernel_cache:
         return _cohsex_kernel_cache[cache_key]
 
