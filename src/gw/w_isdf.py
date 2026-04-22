@@ -165,6 +165,10 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
         return _chi_scan(psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
                          enk_v, enk_c, tau_i, prefactor_i, vmax, cmin)
 
+    # Expose the underlying jit so ``precompile_chi0`` can call
+    # ``.lower(*args).compile()`` to AOT-warm the in-process cache and
+    # separate compile time from exec time in timing reports.
+    _chi_kernel.compiled_fn = _chi_scan
     _chi_minimax_kernel_cache[cache_key] = _chi_kernel
     return _chi_kernel
 
@@ -445,4 +449,69 @@ def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
         wfns.enk[:, s.val], wfns.enk[:, s.cond],
         quad, meta, mesh_xy, energy_reference=energy_reference,
     )
+
+
+def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
+    """AOT lower+compile of the χ₀ minimax kernel at the real input
+    shapes/shardings — warms the JAX in-process cache so the first
+    ``compute_chi0`` call is execution-only.  Call inside a dedicated
+    ``timing.section('chi0_W.chi.compile')`` block to separate compile
+    from exec in the end-of-run timing report.
+    """
+    _ensure_compilation_cache()
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    eref = 0.0 if energy_reference is None else float(energy_reference)
+    s = wfns.slices
+    enk_v = wfns.enk[:, s.val]
+    enk_c = wfns.enk[:, s.cond]
+    enk_v_host = np.asarray(jax.device_get(enk_v), dtype=np.float64) - eref
+    enk_c_host = np.asarray(jax.device_get(enk_c), dtype=np.float64) - eref
+    vmax = float(np.max(enk_v_host))
+    cmin = float(np.min(enk_c_host))
+    E_gap = cmin - vmax
+    tau = np.asarray(quad.tau, dtype=np.float64)
+    if len(tau) == 0:
+        return  # compute_chi0 falls through to a static-zeros path — nothing to compile
+    prefactor = -2.0 * np.asarray(quad.alpha, dtype=np.float64) * np.exp(-tau * E_gap)
+
+    kernel = _get_chi_minimax_kernel(mesh_xy, kgrid)
+    scan_jit = getattr(kernel, "compiled_fn", None)
+    if scan_jit is None:
+        return
+
+    scan_jit.lower(
+        wfns.xn(s.val), wfns.yr(s.val),
+        wfns.yr(s.cond), wfns.xn(s.cond),
+        enk_v - jnp.asarray(eref, dtype=enk_v.dtype),
+        enk_c - jnp.asarray(eref, dtype=enk_c.dtype),
+        jnp.asarray(tau, dtype=jnp.float64),
+        jnp.asarray(prefactor, dtype=jnp.float64),
+        jnp.asarray(vmax, dtype=jnp.float64),
+        jnp.asarray(cmin, dtype=jnp.float64),
+    ).compile()
+
+
+def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, memory_mode: str = "high_mem"):
+    """AOT lower+compile of the W-solve jit.  See ``precompile_chi0``.
+
+    No-op on the ``low_mem`` path: that wrapper is a plain Python call
+    into the FFI primitive ``batched_fused_w_solve``, which has no XLA
+    compile of its own — first-call latency there is device setup, not
+    XLA compile.
+    """
+    _ensure_compilation_cache()
+    nq = int(meta.nk_tot)
+    n_rmu = chi0_q.shape[1]
+    mode = (memory_mode or "high_mem").lower()
+    if mode == "low_mem":
+        # Still prime the wrapper cache so the FFI handle is allocated;
+        # actual work happens inside the single FFI call on first invoke.
+        _get_w_solve_fn_low_mem(mesh_xy, nq, n_rmu, V_q.dtype)
+        return
+    solve_fn = _get_w_solve_fn(mesh_xy, nq, n_rmu)
+    nspin = max(1, int(getattr(meta, 'nspin', 1)))
+    nspinor = max(1, int(getattr(meta, 'nspinor', 1)))
+    pref_scalar = 2.0 / (float(max(1, nq)) ** 0.5 * float(nspin) * float(nspinor))
+    pref_jnp = jnp.asarray(pref_scalar, dtype=jnp.complex128)
+    solve_fn.lower(V_q, chi0_q, pref_jnp).compile()
 

@@ -94,6 +94,8 @@ from .w_isdf import (
 	build_imag_quadrature,
 	compute_chi0,
 	flatten_V_qmunu,
+	precompile_chi0,
+	precompile_solve_w,
 	solve_w,
 )
 from .ppm_sigma import (
@@ -339,12 +341,24 @@ def main(argv=None):
 	if config.do_screened:
 		with timing.section("gw_jax.chi0_W"):
 			with jax_profile.trace_section("chi0_W"):
+				# Split compile vs exec for χ₀ and W.  Each section's
+				# wall time is read off the end-of-run timing report
+				# under ``gw_jax.chi0_W.{chi,W}.{compile,exec}``.
 				quad, e_ref = build_static_quadrature(wfns, config.minimax_config, print_fn=print0)
-				chi0_q = compute_chi0(wfns, quad, meta, mesh_xy, energy_reference=e_ref)
-				W_q = solve_w(V_q, chi0_q, meta, mesh_xy,
-				              memory_mode=config.isdf_memory_mode)
-				chi0_q.block_until_ready()
-				W_q.block_until_ready()
+				with timing.section("chi.compile"):
+					precompile_chi0(wfns, quad, meta, mesh_xy,
+					                energy_reference=e_ref)
+				with timing.section("chi.exec") as _chi_sec:
+					chi0_q = compute_chi0(wfns, quad, meta, mesh_xy,
+					                      energy_reference=e_ref)
+					_chi_sec.watch(chi0_q)
+				with timing.section("W.compile"):
+					precompile_solve_w(V_q, chi0_q, meta, mesh_xy,
+					                   memory_mode=config.isdf_memory_mode)
+				with timing.section("W.exec") as _W_sec:
+					W_q = solve_w(V_q, chi0_q, meta, mesh_xy,
+					              memory_mode=config.isdf_memory_mode)
+					_W_sec.watch(W_q)
 				print0(f"  |χ(0)|_max = {float(jnp.max(jnp.abs(chi0_q))):.6e}  "
 				       f"(minimax, {quad.node_count} nodes)")
 
