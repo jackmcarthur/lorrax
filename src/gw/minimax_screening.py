@@ -288,6 +288,68 @@ class MinimaxWindowPair:
 
 
 @dataclass(frozen=True)
+class MinimaxNodes:
+    """τ nodes + weights in complex form, passable to jit as a pytree.
+
+    Both chi0's Laplace quad (real τ → Im(t)=0) and sigma's crossing /
+    non-crossing quads (``-1j·τ`` or ``τ/ξ``) live in the same complex128
+    storage so one sibling function shape (``minimax_tau_integrate_*``)
+    handles both pipelines.
+    """
+
+    t: jax.Array       # complex128, shape (n,)
+    alpha: jax.Array   # complex128, shape (n,)
+
+
+jax.tree_util.register_dataclass(
+    MinimaxNodes, data_fields=['t', 'alpha'], meta_fields=[])
+
+
+def _laplace_to_minimax_nodes(
+    tau: np.ndarray, alpha: np.ndarray, *, time_axis: str,
+) -> MinimaxNodes:
+    """Convert a (real τ, real α) Laplace quadrature into complex ``MinimaxNodes``.
+
+    ``time_axis``:
+      * ``'real'``      — chi0 Laplace: ``t = τ + 0j``, α cast to complex.
+                          exp(-t·ΔE) stays real-valued for real ΔE.
+      * ``'imag'``      — sigma Laplace windows (single/a_stripe/b_slab):
+                          ``t = -1j·τ``, α cast to complex.
+    """
+    tau_j = jnp.asarray(np.asarray(tau, dtype=np.float64), dtype=jnp.float64)
+    alpha_j = jnp.asarray(np.asarray(alpha, dtype=np.float64), dtype=jnp.float64)
+    if time_axis == 'real':
+        t = tau_j.astype(jnp.complex128)
+    elif time_axis == 'imag':
+        t = (-1j) * tau_j.astype(jnp.complex128)
+    else:
+        raise ValueError(
+            f"Unknown time_axis={time_axis!r}; expected 'real' or 'imag'.")
+    return MinimaxNodes(t=t, alpha=alpha_j.astype(jnp.complex128))
+
+
+def _crossing_to_minimax_nodes(
+    tau: np.ndarray, alpha: np.ndarray, *, time_axis: str,
+) -> MinimaxNodes:
+    """Convert a crossing quadrature into complex ``MinimaxNodes``.
+
+    ``time_axis='crossing_hgl'`` keeps τ real (cast to complex) — the
+    crossing window integrates ``Im[...]`` on the real-τ axis directly.
+    Callers that need to rescale by 1/ξ apply that externally.
+    """
+    if time_axis != 'crossing_hgl':
+        raise ValueError(
+            f"Unknown time_axis={time_axis!r} for crossing quadrature; "
+            f"expected 'crossing_hgl'.")
+    tau_j = jnp.asarray(np.asarray(tau, dtype=np.float64), dtype=jnp.float64)
+    alpha_j = jnp.asarray(np.asarray(alpha, dtype=np.float64), dtype=jnp.float64)
+    return MinimaxNodes(
+        t=tau_j.astype(jnp.complex128),
+        alpha=alpha_j.astype(jnp.complex128),
+    )
+
+
+@dataclass(frozen=True)
 class LaplaceMinimaxQuadrature:
     """Quadrature summary for ``1/x`` on ``[x_min, x_max]``."""
 
@@ -300,6 +362,16 @@ class LaplaceMinimaxQuadrature:
     @property
     def node_count(self) -> int:
         return int(self.tau.shape[0])
+
+    def to_minimax_nodes(self, *, time_axis: str) -> MinimaxNodes:
+        """Return ``MinimaxNodes`` in the caller's sign convention.
+
+        See ``_laplace_to_minimax_nodes`` for the set of accepted
+        ``time_axis`` values.  The returned pytree is safe to close over
+        in a jit or pass as an argument.
+        """
+        return _laplace_to_minimax_nodes(
+            self.tau, self.alpha, time_axis=time_axis)
 
 
 @dataclass(frozen=True)
@@ -315,6 +387,11 @@ class CrossingMinimaxQuadrature:
     @property
     def node_count(self) -> int:
         return int(self.tau.shape[0])
+
+    def to_minimax_nodes(self, *, time_axis: str = 'crossing_hgl') -> MinimaxNodes:
+        """Return ``MinimaxNodes`` for the crossing-window τ axis."""
+        return _crossing_to_minimax_nodes(
+            self.tau, self.alpha, time_axis=time_axis)
 
 
 @dataclass(frozen=True)
