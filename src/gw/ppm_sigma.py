@@ -1158,8 +1158,7 @@ def compute_sigma_c_ppm_omega_grid(
     valid_mask_q = getattr(ppm, 'valid_mask_q', None)
     omega_values_ry = ppm_options.omega_grid_ry
 
-    nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
-    nk = int(nkx * nky * nkz)
+    nk = int(meta.nk_tot)
 
     # Quadrature config
     if sigma_window_quad is not None:
