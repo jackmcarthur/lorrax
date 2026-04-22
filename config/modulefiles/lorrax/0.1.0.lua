@@ -143,10 +143,11 @@ if use_preallocate then
         {"XLA_PYTHON_CLIENT_PREALLOCATE",  "true"},
         {"XLA_PYTHON_CLIENT_ALLOCATOR",    "bfc"},
         {"XLA_PYTHON_CLIENT_MEM_FRACTION", env_or("LORRAX_XLA_MEM_FRACTION", "0.75")},
-        -- TF_GPU_ALLOCATOR overrides the allocator kind in some jaxlib
-        -- builds; force-clear it in preallocate mode.
-        {"TF_GPU_ALLOCATOR",               ""},
     }
+    -- TF_GPU_ALLOCATOR overrides the allocator kind in some jaxlib
+    -- builds; force-clear it in preallocate mode.  Shifter/srun reject
+    -- empty `--env=KEY=` values, so we unsetenv rather than pass through.
+    unsetenv("TF_GPU_ALLOCATOR")
 else
     allocator_env = {
         {"XLA_PYTHON_CLIENT_PREALLOCATE",  "false"},
