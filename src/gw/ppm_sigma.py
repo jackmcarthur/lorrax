@@ -161,7 +161,6 @@ def _materialize_window_mask_B(
 
 _sigma_tau_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
 _sigma_kij_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
-_sigma_tau_scan_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -458,74 +457,6 @@ def _get_sigma_tau_kernel(
     return _tau_kernel
 
 
-def _get_sigma_tau_scan_kernel(
-    *,
-    mesh_xy: Mesh,
-    kgrid: tuple[int, int, int],
-    project: str,
-) -> Callable[..., jax.Array]:
-    """Cached factory: runs an entire window's τ nodes in one jax.lax.scan.
-
-    Replaces N_τ Python-level dispatches + NCCL fences with one compiled
-    fori-loop on the device.  Reduces host-side overhead and lets XLA
-    schedule across τ iterations (overlap comm with next step's FFTs).
-
-    Specializes on the window's τ count via the trailing shape of t_nodes
-    / alpha_nodes — windows with different n_τ (9, 13, 103, 125 at MoS2
-    scale) retrace this kernel separately.  That's ~4 compiles per mesh,
-    amortized over hundreds of τ nodes each.  If retraces become costly,
-    pad all windows to max(n_τ) and mask in the scan body.
-
-    ``project`` (one of 'full' / 'imag') is a static-time closure — baked
-    into the compile so the scan body avoids a lax.switch per τ node.
-    """
-    kgrid = tuple(int(x) for x in kgrid)
-    if project not in ("full", "imag"):
-        raise ValueError(f"Unknown project={project!r}; expected 'full' or 'imag'.")
-    cache_key = (id(mesh_xy), kgrid, project)
-    if cache_key in _sigma_tau_scan_cache:
-        return _sigma_tau_scan_cache[cache_key]
-
-    tau_kernel = _get_sigma_tau_kernel(mesh_xy=mesh_xy, kgrid=kgrid)
-
-    @jax.jit
-    def _scan_window(
-        acc_win,
-        # per-τ (stacked on leading axis):
-        t_nodes, alpha_nodes,
-        # window constants:
-        psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-        E_A, mask_A, B_q, Omega_q, mask_B,
-        E_ref_A, E_ref_B,
-        omega_vec, pref, omega_sign,
-    ):
-        E_ref_sum = E_ref_A + E_ref_B
-
-        def body(acc, xs):
-            t_node, alpha_node = xs
-            sigma_re, sigma_im = tau_kernel(
-                psi_coh_xn, psi_coh_yr,
-                psi_proj_xr, psi_proj_yn,
-                E_A, mask_A, B_q, Omega_q, mask_B,
-                E_ref_A, E_ref_B, t_node,
-            )
-            # α_eff = α(τ) · exp[-i·(E_ref_A + E_ref_B)·τ]  — minimax quad
-            # weight with the phase shift absorbed into each τ node.
-            alpha_eff = alpha_node * jnp.exp(-1j * E_ref_sum * t_node)
-            acc = acc + _project_tau_onto_omega(
-                sigma_re, sigma_im, omega_vec,
-                t_node, alpha_eff, omega_sign, pref, project=project,
-            )
-            return acc, None
-
-        final_acc, _ = jax.lax.scan(
-            body, acc_win, (t_nodes, alpha_nodes))
-        return final_acc
-
-    _sigma_tau_scan_cache[cache_key] = _scan_window
-    return _scan_window
-
-
 # ---------------------------------------------------------------------------
 #  PPM construction
 # ---------------------------------------------------------------------------
@@ -768,15 +699,16 @@ class _ReduceScatterGpuAccumulator(_SigmaAccumulator):
     is the whole scaling argument for shipping this layout end-to-end.
 
     Follow-up work (not yet wired; see _CollectiveFlushSlabIoAccumulator
-    stub for the I/O leg and the lax.scan scaffolding in
-    _get_sigma_tau_scan_kernel for τ batching):
+    stub for the I/O leg):
 
         (a) m-chunking at add_tau so σ^τ arrives one m-strip at a time
             rather than one full (m_full, n_Y/p) shard — default chunk = 1
             tile, = m/p.  Needed when (m, n, k, ω) per-rank stops fitting.
         (b) τ batching via lax.scan over a stacked τ axis — reduces Python
-            dispatch overhead, currently a regression at small n_τ but wins
-            once the kernel's per-call cost exceeds compile amortization.
+            dispatch overhead; was tried (see chi0's _chi_scan in w_isdf.py
+            as a reference implementation) but regressed sigma by ~80% at
+            MoS2 3×3 because per-τ async dispatch beats a monolithic
+            compiled scan that can't overlap NCCL with the next FFT.
         (c) Collective-flush SlabIO variant (see _StreamedH5Accumulator
             docstring) — stages many τ on GPU and issues one parallel-HDF5
             write at window close.
@@ -818,19 +750,6 @@ class _ReduceScatterGpuAccumulator(_SigmaAccumulator):
 
     def finalize(self) -> jax.Array:
         return self.total
-
-    # Fast path: if the caller has a lax.scan'd window kernel, let it own
-    # the whole per-window τ loop (one jit dispatch per window instead of
-    # N_τ).  Caller supplies the compiled fn + inputs; we hand back an
-    # updated running total.  The per-τ add_tau still works as the fallback
-    # for accumulators without this method (e.g. _StreamedH5Accumulator).
-    def run_window_scan(self, scan_fn, *, t_nodes, alpha_nodes, window_args):
-        init = jax.device_put(
-            jnp.zeros_like(self.total), self._sharding)
-        win_acc = scan_fn(init, t_nodes, alpha_nodes, **window_args)
-        win_acc = jax.lax.with_sharding_constraint(win_acc, self._sharding)
-        self.total = jax.lax.with_sharding_constraint(
-            self.total + win_acc, self._sharding)
 
 
 class _StreamedH5Accumulator(_SigmaAccumulator):
@@ -1002,9 +921,13 @@ def _run_sigma_branch(
                 acc += _project_tau_onto_omega(σ^τ)   # ω-kernel × quad α
 
     The τ loop is Python-serial: each tau_kernel dispatch is async and
-    XLA overlaps its collectives with the next step's dispatch (see the
-    _get_sigma_tau_scan_kernel docstring for why lax.scan is not the
-    default path).
+    XLA overlaps its collectives with the next step's dispatch.  A
+    monolithic lax.scan-over-τ variant was tried and removed — it
+    regressed sigma by ~80% at MoS2 3×3 because the single compiled
+    scan cannot interleave NCCL with the next FFT.  chi0's τ sweep
+    (w_isdf._chi_scan) IS run as one lax.scan because its inner body
+    doesn't emit any collective; that pattern is the right reference
+    if someone retries the sigma fusion later.
 
     Whether ``acc`` lands on GPU or is streamed to disk is the
     accumulator's concern — see _ReduceScatterGpuAccumulator /
@@ -1048,11 +971,11 @@ def _run_sigma_branch(
         mesh_xy=mesh_xy,
         kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
     )
-    # lax.scan variant is available (see _get_sigma_tau_scan_kernel) but
-    # NOT wired by default.  At MoS2 3×3 scale (276 τ, 5 s Python-loop
-    # baseline) it actually regresses sigma_ppm by ~80% — per-tau async
-    # dispatch beats a single big scan module that can't overlap
-    # collectives.  See the scan factory docstring for details.
+    # Note: a monolithic lax.scan-over-τ variant was tried and removed
+    # (regressed sigma_ppm by ~80% at MoS2 3×3).  Chi0 does use one
+    # lax.scan because its body emits no collective; for sigma, per-τ
+    # async dispatch lets XLA overlap NCCL with the next FFT and wins.
+    # See w_isdf._chi_scan if someone wants to retry the fusion.
 
     if stream_writer is None:
         accumulator: _SigmaAccumulator = _ReduceScatterGpuAccumulator(
