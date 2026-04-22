@@ -245,8 +245,10 @@ def _get_project_tau_onto_omega(mesh_xy: Mesh) -> Callable[..., jax.Array]:
     )
     out_sh = NamedSharding(mesh_xy, out_spec)
 
+    # ``project`` is positional-with-static (not keyword-only) because pjit
+    # rejects ``kwargs`` when ``in_shardings`` is set, even for static args.
     @partial(jax.jit,
-             static_argnames=("project",),
+             static_argnums=(7,),
              in_shardings=in_sh,
              out_shardings=out_sh)
     def _project_tau_onto_omega(
@@ -257,7 +259,6 @@ def _get_project_tau_onto_omega(mesh_xy: Mesh) -> Callable[..., jax.Array]:
         alpha_eff: jax.Array,
         omega_sign: jax.Array,
         pref: jax.Array,
-        *,
         project: str,
     ) -> jax.Array:
         """Apply ω-kernel exp(i·ω_sign·ω·t_node) and project onto σ channels.
@@ -751,9 +752,10 @@ class _ReduceScatterGpuAccumulator(_SigmaAccumulator):
         # add therefore touch only each rank's local (m/p_x, n/p_y) block.
         # The mesh-cached _project_tau_onto_omega pins the output sharding to
         # P(None, None, 'x', 'y') — matches _win_acc so the += is local.
+        # ``project`` is positional (pjit forbids kwargs with in_shardings).
         self._win_acc = self._win_acc + self._project_tau(
             sigma_re, sigma_im, omega_vec,
-            t_node_j, alpha_eff_j, omega_sign_j, pref_j, project=project,
+            t_node_j, alpha_eff_j, omega_sign_j, pref_j, project,
         )
         # Pin the running buffer's sharding so XLA doesn't replicate it
         # between adds.
@@ -807,7 +809,7 @@ class _StreamedH5Accumulator(_SigmaAccumulator):
             batch_proj = self._project_tau(
                 sigma_re, sigma_im, omega_vec[ibeg:iend],
                 t_node_j, alpha_eff_j, omega_sign_j,
-                pref_j, project=project,
+                pref_j, project,
             )
             self._writer(self._omega_global_idx[ibeg:iend], batch_proj)
 
