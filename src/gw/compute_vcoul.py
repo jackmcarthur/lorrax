@@ -28,6 +28,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from functools import partial
 
 from common import timing
+from common.fft_helpers import make_jittable_local_fftn_3d
 
 
 # ============================================================================
@@ -1472,32 +1473,48 @@ def _make_V_q_caseA_kernel(
     n_rtot = nx * ny * nz
 
     mu_xy_sh = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
+    # 5-D μ-XY-sharded layout for the FFT intermediate.  The fft helper
+    # uses ``custom_partitioning`` to pin this sharding through the
+    # 3-D fftn, which raw ``jnp.fft.fftn`` doesn't advertise — without
+    # it XLA's propagation pass defaults to gathering μ to fully
+    # replicated (measured 4.94 GiB all-gather on (Q, μ, nx, ny, nz)
+    # at MoS2 3×3 16-GPU).
+    mu_xy_5d_spec = P(None, ('x', 'y'), None, None, None)
+    mu_xy_5d_sh = NamedSharding(mesh_xy, mu_xy_5d_spec)
     mu_x_sh  = NamedSharding(mesh_xy, P(None, 'x', None))
     mu_y_sh  = NamedSharding(mesh_xy, P(None, 'y', None))
     V_sh     = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     g0_sh    = NamedSharding(mesh_xy, P(None, 'x'))
-    phase_sh = NamedSharding(mesh_xy, P(None, None, None, None))
+    phase_sh = NamedSharding(mesh_xy, P(None, None, None, None, None))  # (Q,1,nx,ny,nz)
     sqrtv_sh = NamedSharding(mesh_xy, P(None, None))
     zeta_disk_sh = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
     rep      = NamedSharding(mesh_xy, P())
 
+    # Local-FFT wrapper with custom_partitioning — same primitive the
+    # chi0 / CCT / ZCT paths use.  Axes (-3,-2,-1) = (nx, ny, nz).
+    _local_fftn_3d = make_jittable_local_fftn_3d(
+        mesh_xy, mu_xy_5d_spec, mu_xy_5d_spec)
+
     @partial(jax.jit,
-             in_shardings=(zeta_disk_sh, sqrtv_sh, phase_sh, rep),
-             donate_argnames=('V_ref', 'g0_ref'))
-    def _kernel(V_ref, g0_ref,
+             in_shardings=(V_sh, g0_sh, zeta_disk_sh, sqrtv_sh, phase_sh, rep),
+             out_shardings=(V_sh, g0_sh),
+             donate_argnums=(0, 1))
+    def _kernel(V_acc, g0_acc,
                 zeta_rtot_mu, sqrt_v_batch, phase_batch, q_lo_dyn):
         # 1. Local transpose (Q, n_rtot, n_rmu) → (Q, n_rmu, n_rtot).
-        #    μ stays on ('x','y'); no collective.
         zeta_mu_r = jax.lax.with_sharding_constraint(
             jnp.transpose(zeta_rtot_mu, (0, 2, 1)), mu_xy_sh)
 
-        # 2. 3-D FFT + phase shift, all local per rank.
+        # 2. 3-D FFT + phase shift via custom_partitioning FFT helper.
+        # ``_local_fftn_3d`` pins μ-XY sharding through the fftn so each
+        # rank FFTs its own μ-slab — matches the chi0/CCT/ZCT pattern.
         Q, mu_per_rank, _ = zeta_mu_r.shape
-        zeta_box = jnp.fft.fftn(
-            zeta_mu_r.reshape(Q, mu_per_rank, nx, ny, nz)
-                * phase_batch[:, None, :, :, :],
-            axes=(-3, -2, -1),
-        ).reshape(Q, mu_per_rank, n_rtot)
+        zeta_5d = jax.lax.with_sharding_constraint(
+            zeta_mu_r.reshape(Q, mu_per_rank, nx, ny, nz) * phase_batch,
+            mu_xy_5d_sh)
+        zeta_box = _local_fftn_3d(zeta_5d)
+        zeta_box = jax.lax.with_sharding_constraint(
+            zeta_box.reshape(Q, mu_per_rank, n_rtot), mu_xy_sh)
 
         # 3. G=0 column for the head term (kept sharded on μ).
         g0 = jax.lax.with_sharding_constraint(
@@ -1511,8 +1528,7 @@ def _make_V_q_caseA_kernel(
         zeta_G = jax.lax.with_sharding_constraint(
             zeta_G * sqrt_v_batch[:, None, :], mu_xy_sh)
 
-        # 5. Two one-axis gathers — with_sharding_constraint hints XLA
-        #    to emit one all-gather on y and one on x.
+        # 5. Two one-axis gathers.
         zeta_mu_X = jax.lax.with_sharding_constraint(zeta_G, mu_x_sh)
         zeta_nu_Y = jax.lax.with_sharding_constraint(zeta_G, mu_y_sh)
 
@@ -1522,20 +1538,16 @@ def _make_V_q_caseA_kernel(
                               optimize=True)
         V_block = jax.lax.with_sharding_constraint(V_block, V_sh)
 
-        # 7. In-place ref writes via DUS.  XLA fuses read-modify-write
-        #    into an in-place update when the ref is donated.
-        V_full = V_ref[...]
-        V_full = jax.lax.dynamic_update_slice(
-            V_full, V_block, (q_lo_dyn, jnp.int32(0), jnp.int32(0)))
-        V_ref[...] = jax.lax.with_sharding_constraint(V_full, V_sh)
+        # 7. DUS updates on donated accumulators → in-place under XLA.
+        V_new = jax.lax.dynamic_update_slice(
+            V_acc, V_block, (q_lo_dyn, jnp.int32(0), jnp.int32(0)))
+        V_new = jax.lax.with_sharding_constraint(V_new, V_sh)
 
-        # g0 axis: promote μ-XY sharding to μ-X for the g0_ref (P(None,'x')).
         g0 = jax.lax.with_sharding_constraint(g0, g0_sh)
-        g0_full = g0_ref[...]
-        g0_full = jax.lax.dynamic_update_slice(
-            g0_full, g0, (q_lo_dyn, jnp.int32(0)))
-        g0_ref[...] = jax.lax.with_sharding_constraint(g0_full, g0_sh)
-        return V_ref, g0_ref
+        g0_new = jax.lax.dynamic_update_slice(
+            g0_acc, g0, (q_lo_dyn, jnp.int32(0)))
+        g0_new = jax.lax.with_sharding_constraint(g0_new, g0_sh)
+        return V_new, g0_new
 
     _kernel.zeta_disk_sh = zeta_disk_sh
     _kernel.V_sh = V_sh
@@ -1578,20 +1590,27 @@ def _make_V_q_caseB_kernel(
     blk_y_sh  = NamedSharding(mesh_xy, P(None, 'y', None))
     V_sh      = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     g0_sh     = NamedSharding(mesh_xy, P(None, 'x'))
-    phase_sh  = NamedSharding(mesh_xy, P(None, None, None, None))
+    phase_sh  = NamedSharding(mesh_xy, P(None, None, None, None, None))  # (Q,1,nx,ny,nz)
     sqrtv_sh  = NamedSharding(mesh_xy, P(None, None))
     zeta_disk_sh = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
     rep       = NamedSharding(mesh_xy, P())
+    # 5-D μ-sharded layout for the FFT — see Case-A comment.
+    blk_xy_5d_spec = P(None, ('x', 'y'), None, None, None)
+    blk_xy_5d_sh = NamedSharding(mesh_xy, blk_xy_5d_spec)
+    # Local-FFT with custom_partitioning (see Case-A).
+    _local_fftn_3d = make_jittable_local_fftn_3d(
+        mesh_xy, blk_xy_5d_spec, blk_xy_5d_spec)
 
     def _fft_sphere_weight(zeta_rtot_mu, sqrt_v_batch, phase_batch):
         zeta_mu_r = jax.lax.with_sharding_constraint(
             jnp.transpose(zeta_rtot_mu, (0, 2, 1)), blk_xy_sh)
         Q, mu_per_rank, _ = zeta_mu_r.shape
-        zeta_box = jnp.fft.fftn(
-            zeta_mu_r.reshape(Q, mu_per_rank, nx, ny, nz)
-                * phase_batch[:, None, :, :, :],
-            axes=(-3, -2, -1),
-        ).reshape(Q, mu_per_rank, n_rtot)
+        zeta_5d = jax.lax.with_sharding_constraint(
+            zeta_mu_r.reshape(Q, mu_per_rank, nx, ny, nz) * phase_batch,
+            blk_xy_5d_sh)
+        zeta_box = _local_fftn_3d(zeta_5d)
+        zeta_box = jax.lax.with_sharding_constraint(
+            zeta_box.reshape(Q, mu_per_rank, n_rtot), blk_xy_sh)
         g0_blk = zeta_box[:, :, 0]
         if sphere_idx is not None:
             zeta_G = jnp.take(zeta_box, sphere_idx, axis=-1)
@@ -1602,13 +1621,14 @@ def _make_V_q_caseB_kernel(
         return zeta_G, g0_blk
 
     @partial(jax.jit,
-             in_shardings=(zeta_disk_sh, zeta_disk_sh,
-                            sqrtv_sh, phase_sh, rep, rep),
-             donate_argnames=('V_ref', 'g0_ref'))
-    def _kernel(V_ref, g0_ref,
+             in_shardings=(V_sh, g0_sh, zeta_disk_sh, zeta_disk_sh,
+                            sqrtv_sh, phase_sh, rep, rep, rep),
+             out_shardings=(V_sh, g0_sh),
+             donate_argnums=(0, 1))
+    def _kernel(V_acc, g0_acc,
                 zeta_mu_disk, zeta_nu_disk,
                 sqrt_v_batch, phase_batch,
-                mu_lo_dyn, nu_lo_dyn):
+                q_lo_dyn, mu_lo_dyn, nu_lo_dyn):
         # FFT + √v on BOTH blocks (independent; XLA schedules in parallel).
         zeta_mu_G, g0_mu = _fft_sphere_weight(
             zeta_mu_disk, sqrt_v_batch, phase_batch)
@@ -1620,27 +1640,25 @@ def _make_V_q_caseB_kernel(
         zeta_mu_X = jax.lax.with_sharding_constraint(zeta_mu_G, blk_x_sh)
         zeta_nu_Y = jax.lax.with_sharding_constraint(zeta_nu_G, blk_y_sh)
 
-        # Contract — block V[q, μ_chunk, μ_chunk] sharded P(None,'x','y').
+        # Contract — block V[1, μ_chunk, μ_chunk] sharded P(None,'x','y').
         V_block = jnp.einsum('qmG,qnG->qmn',
                               jnp.conj(zeta_mu_X), zeta_nu_Y,
                               optimize=True)
         V_block = jax.lax.with_sharding_constraint(V_block, V_sh)
 
-        # In-place ref write at (q_lo=0 — q is already scalar here; the
-        # outer loop handles q advancement by updating only one q per
-        # call in Case B) offset (0, mu_lo, nu_lo).
-        V_full = V_ref[...]
-        V_full = jax.lax.dynamic_update_slice(
-            V_full, V_block, (jnp.int32(0), mu_lo_dyn, nu_lo_dyn))
-        V_ref[...] = jax.lax.with_sharding_constraint(V_full, V_sh)
+        # DUS update on donated V_acc at (q_lo, mu_lo, nu_lo).
+        V_new = jax.lax.dynamic_update_slice(
+            V_acc, V_block, (q_lo_dyn, mu_lo_dyn, nu_lo_dyn))
+        V_new = jax.lax.with_sharding_constraint(V_new, V_sh)
 
         if write_g0:
             g0_mu = jax.lax.with_sharding_constraint(g0_mu, g0_sh)
-            g0_full = g0_ref[...]
-            g0_full = jax.lax.dynamic_update_slice(
-                g0_full, g0_mu, (jnp.int32(0), mu_lo_dyn))
-            g0_ref[...] = jax.lax.with_sharding_constraint(g0_full, g0_sh)
-        return V_ref, g0_ref
+            g0_new = jax.lax.dynamic_update_slice(
+                g0_acc, g0_mu, (q_lo_dyn, mu_lo_dyn))
+            g0_new = jax.lax.with_sharding_constraint(g0_new, g0_sh)
+        else:
+            g0_new = g0_acc
+        return V_new, g0_new
 
     _kernel.zeta_disk_sh = zeta_disk_sh
     _kernel.V_sh = V_sh
@@ -1720,17 +1738,17 @@ def compute_all_V_q_sharded(
     V_sh_full = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     g0_sh_full = NamedSharding(mesh_xy, P(None, 'x'))
 
-    # Pre-allocate the output refs.  ``jax.new_ref`` over a sharded
-    # zeros array gives us a mutable accumulator that each per-batch jit
-    # writes into via DUS-style updates under `donate_argnames`.
-    V_zeros = jax.lax.with_sharding_constraint(
-        jnp.zeros((nq_total, n_rmu, n_rmu), dtype=jnp.complex128),
-        V_sh_full)
-    g0_zeros = jax.lax.with_sharding_constraint(
-        jnp.zeros((nq_total, n_rmu), dtype=jnp.complex128),
-        g0_sh_full)
-    V_ref = jax.new_ref(V_zeros)
-    g0_ref = jax.new_ref(g0_zeros)
+    # Pre-allocate the output accumulators as regular sharded arrays.
+    # Each per-batch kernel is jitted with ``donate_argnums=(0,1)`` on
+    # (V_acc, g0_acc) so XLA fuses the DUS read-modify-write into an
+    # in-place update on the donated buffer — functionally equivalent
+    # to jax.new_ref, just using the pre-refs API on this jax build.
+    @partial(jax.jit, out_shardings=(V_sh_full, g0_sh_full))
+    def _init_accum():
+        V = jnp.zeros((nq_total, n_rmu, n_rmu), dtype=jnp.complex128)
+        g = jnp.zeros((nq_total, n_rmu), dtype=jnp.complex128)
+        return V, g
+    V_acc, g0_acc = _init_accum()
 
     kgrid_arr = np.array([nkx, nky, nkz], dtype=np.float64)
     _read_spec = P(None, None, ('x', 'y'))
@@ -1794,8 +1812,8 @@ def compute_all_V_q_sharded(
                 if actual < q_chunk:
                     zeta = _pad_q(zeta)
                 sqrt_v_b, phase_b = _sqrt_v_phase_batch(qvecs, pad_to=q_chunk)
-                V_ref, g0_ref = kernel(
-                    V_ref, g0_ref,
+                V_acc, g0_acc = kernel(
+                    V_acc, g0_acc,
                     zeta, sqrt_v_b, phase_b,
                     jnp.int32(q_cursor))
                 del zeta
@@ -1844,18 +1862,19 @@ def compute_all_V_q_sharded(
                                 offset=(q_flat, 0, nu_lo),
                                 mesh=mesh_xy, partition_spec=_read_spec)
                             k = kernel_diag if (nu_j == mu_i) else kernel_off
-                            V_ref, g0_ref = k(
-                                V_ref, g0_ref,
+                            V_acc, g0_acc = k(
+                                V_acc, g0_acc,
                                 zeta_mu, zeta_nu, sqrt_v_b, phase_b,
+                                jnp.int32(q_flat),
                                 jnp.int32(mu_lo), jnp.int32(nu_lo))
                             del zeta_nu
                         del zeta_mu
                     vq_progress.step()
             vq_progress.finish()
 
-    # Materialise refs → sharded arrays (zero-copy under jax.new_ref semantics).
-    V_flat = V_ref[...]
-    g0_flat = g0_ref[...]
+    # Accumulators now hold the full V_qmunu / g0; reshape + constraint below.
+    V_flat = V_acc
+    g0_flat = g0_acc
     V_qmunu = V_flat.reshape(nkx, nky, nkz, n_rmu, n_rmu)
     g0_mu_all = g0_flat.reshape(nkx, nky, nkz, n_rmu)
     V_qmunu = jax.lax.with_sharding_constraint(
