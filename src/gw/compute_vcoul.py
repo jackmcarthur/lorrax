@@ -19,6 +19,7 @@ Note: For future optimization, if a single zeta_q(μ, r) fits on sqrt(P) process
       we could batch multiple q-points to amortize FFT setup costs.
 """
 
+import os
 import time
 
 import numpy as np
@@ -1558,7 +1559,8 @@ def _make_V_q_caseA_kernel(
 
 def _make_V_q_caseB_kernel(
     *,
-    mu_chunk: int,
+    mu_size: int,
+    nu_size: int,
     n_rmu: int,
     n_G_sph: int,
     fft_shape: tuple[int, int, int],
@@ -1566,17 +1568,30 @@ def _make_V_q_caseB_kernel(
     mesh_xy: Mesh,
     write_g0: bool,
 ):
-    """Case-B kernel — one q, one (μ_i, ν_j) tile.  Reads TWO contiguous
-    μ-blocks (always, even on the diagonal) to keep the jit body uniform.
-    FFT+√v both sides locally, one-axis gather on each side (y for μ,
-    x for ν), einsum, and a ref slice-set at offset (μ_lo, ν_lo) that
-    lets XLA emit the reshard-on-write when the block doesn't align
-    with V_ref's final shard boundaries.  ``write_g0`` is a Python
-    static flag: True only on the (μ_i == ν_j) iteration per μ_block,
-    so the diagonal is the one that writes the g0 slab — no runtime
-    branch.
+    """Case-B kernel — one q, one (μ_i, ν_j) tile of shape
+    ``(mu_size, nu_size)``.  Separate ``mu_size`` / ``nu_size`` args so
+    the cache keys on both, giving the standard 4-compile-shape
+    envelope when the last μ- and ν-blocks are partial:
+
+        (full_mu, full_nu)  — the interior iterations, hit once
+        (full_mu, tail_nu)  — the last ν of each μ row
+        (tail_mu, full_nu)  — the last μ row's interior ν's
+        (tail_mu, tail_nu)  — the bottom-right corner
+
+    (each × {write_g0=True | False} = up to 8 compile shapes; in the
+    aligned-chooser case all mu_size == nu_size == mu_chunk so only
+    1–2 shapes actually instantiate.)
+
+    Reads TWO contiguous μ-blocks (always, even on the diagonal) to
+    keep the jit body uniform.  FFT+√v both sides locally,
+    one-axis gather on each side (y for μ, x for ν), einsum, and a
+    ref slice-set at offset (q_lo, μ_lo, ν_lo) that lets XLA emit the
+    reshard-on-write when the block doesn't align with V_ref's final
+    shard boundaries.  ``write_g0`` is a Python static flag: True only
+    on the (μ_i == ν_j) iteration per μ_block, so the diagonal is the
+    one that writes the g0 slab — no runtime branch.
     """
-    cache_key = ('B', id(mesh_xy), mu_chunk, n_rmu, n_G_sph,
+    cache_key = ('B', id(mesh_xy), mu_size, nu_size, n_rmu, n_G_sph,
                  tuple(fft_shape), id(sphere_idx), bool(write_g0))
     hit = _v_q_kernel_cache.get(cache_key)
     if hit is not None:
@@ -1720,6 +1735,21 @@ def compute_all_V_q_sharded(
         n_rmu=n_rmu, n_G=n_G_sph, n_q_total=nq_total,
         budget_bytes=budget_bytes, p_x=p_x, p_y=p_y,
     )
+    # Debug knob: force Case B at a caller-specified μ-chunk so the tile
+    # path can be exercised on systems that otherwise land in Case A.
+    # ``LORRAX_V_Q_MU_CHUNK=<int>`` overrides the chooser's pick.
+    _force_mu = int(os.environ.get('LORRAX_V_Q_MU_CHUNK', '0') or 0)
+    if _force_mu > 0 and _force_mu < n_rmu:
+        n_blocks = (n_rmu + _force_mu - 1) // _force_mu
+        choice = dict(
+            q_chunk=1, mu_chunk=_force_mu, n_mu_blocks=n_blocks,
+            tiled=True, aligned=(n_rmu % _force_mu == 0),
+            per_rank_peak=choice['per_rank_peak'],
+            ref_bytes=choice['ref_bytes'],
+        )
+        if jax.process_index() == 0:
+            print(f"  [LORRAX_V_Q_MU_CHUNK] forcing Case B with "
+                  f"μ_chunk={_force_mu}, n_mu_blocks={n_blocks}")
     tiled = choice['tiled']
     q_chunk = int(choice['q_chunk'])
     mu_chunk = int(choice['mu_chunk'])
@@ -1820,15 +1850,12 @@ def compute_all_V_q_sharded(
         # iteration (even on the diagonal, to keep the jit body uniform).
         # ``write_g0`` is a Python-static bool baked into the kernel's
         # cache key; only diagonal-block kernels do the g0 slice-set.
-        kernel_diag = _make_V_q_caseB_kernel(
-            mu_chunk=mu_chunk, n_rmu=n_rmu, n_G_sph=n_G_sph,
-            fft_shape=fft_grid, sphere_idx=kernels.sphere_idx,
-            mesh_xy=mesh_xy, write_g0=True)
-        kernel_off = _make_V_q_caseB_kernel(
-            mu_chunk=mu_chunk, n_rmu=n_rmu, n_G_sph=n_G_sph,
-            fft_shape=fft_grid, sphere_idx=kernels.sphere_idx,
-            mesh_xy=mesh_xy, write_g0=False)
-
+        #
+        # Partial last μ/ν block handling: read with
+        # ``min(mu_chunk, n_rmu - offset)`` and cache one kernel per
+        # (mu_size, nu_size, write_g0) triple — up to 4 shape-pairs
+        # × 2 write_g0 = 8 compile shapes worst case, 1 shape in the
+        # chooser-aligned case (μ_chunk divides N_μ cleanly).
         with timing.section("compute_all_V_q_sharded"):
             for qx in range(nkx):
               for qy in range(nky):
@@ -1840,21 +1867,29 @@ def compute_all_V_q_sharded(
 
                     for mu_i in range(n_mu_blocks):
                         mu_lo = mu_i * mu_chunk
+                        mu_size = min(mu_chunk, n_rmu - mu_lo)
                         zeta_mu = zeta_io.read_slab(
                             'zeta_q',
-                            shape=(1, n_rtot, mu_chunk),
+                            shape=(1, n_rtot, mu_size),
                             dtype=np.complex128,
                             offset=(q_flat, 0, mu_lo),
                             mesh=mesh_xy, partition_spec=_read_spec)
                         for nu_j in range(n_mu_blocks):
                             nu_lo = nu_j * mu_chunk
+                            nu_size = min(mu_chunk, n_rmu - nu_lo)
                             zeta_nu = zeta_io.read_slab(
                                 'zeta_q',
-                                shape=(1, n_rtot, mu_chunk),
+                                shape=(1, n_rtot, nu_size),
                                 dtype=np.complex128,
                                 offset=(q_flat, 0, nu_lo),
                                 mesh=mesh_xy, partition_spec=_read_spec)
-                            k = kernel_diag if (nu_j == mu_i) else kernel_off
+                            k = _make_V_q_caseB_kernel(
+                                mu_size=mu_size, nu_size=nu_size,
+                                n_rmu=n_rmu, n_G_sph=n_G_sph,
+                                fft_shape=fft_grid,
+                                sphere_idx=kernels.sphere_idx,
+                                mesh_xy=mesh_xy,
+                                write_g0=(nu_j == mu_i))
                             V_acc, g0_acc = k(
                                 V_acc, g0_acc,
                                 zeta_mu, zeta_nu, sqrt_v_b, phase_b,
