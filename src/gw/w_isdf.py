@@ -11,7 +11,6 @@ from typing import Callable
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
-from jax.experimental import compilation_cache as jax_compilation_cache
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 import numpy as np
@@ -28,13 +27,6 @@ from .wavefunction_bundle import G_FFT7D_SPEC, V_FFT5D_SPEC, CHI_Q_SPEC
 
 _chi_minimax_kernel_cache: dict = {}
 _w_solve_cache: dict = {}
-
-
-# Thin wrapper around the shared activator so in-place callers in this
-# module keep working.  See common.jax_compile_cache.
-def _ensure_compilation_cache():
-    from common.jax_compile_cache import ensure_jax_compile_cache
-    ensure_jax_compile_cache()
 
 
 # ============================================================================
@@ -430,8 +422,11 @@ def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
     invariant; the knob is provided so callers can keep the implementation
     explicitly aligned with their chosen global zero of energy (e.g. midgap
     or VBM).
+
+    Callers are expected to have activated the JAX compile cache at
+    driver init (see common.jax_compile_cache.ensure_jax_compile_cache);
+    gw_jax.main does this once near the top of the process.
     """
-    _ensure_compilation_cache()
     s = wfns.slices
     enk_v = wfns.enk[:, s.val]
     enk_c = wfns.enk[:, s.cond]

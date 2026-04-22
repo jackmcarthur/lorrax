@@ -356,7 +356,6 @@ def _get_sigma_kij_kernel(
 
     from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
 
-    w_isdf._ensure_compilation_cache()
     _G_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
     _G_fftn  = make_flat_k_fftn( mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
     _V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
@@ -406,7 +405,6 @@ def _get_sigma_tau_kernel(
     if cache_key in _sigma_tau_kernel_cache:
         return _sigma_tau_kernel_cache[cache_key]
 
-    w_isdf._ensure_compilation_cache()
     q_mu_shard = NamedSharding(mesh_xy, CHI_Q_SPEC)
     sigma_kij_kernel = _get_sigma_kij_kernel(mesh_xy=mesh_xy, kgrid=kgrid)
 
