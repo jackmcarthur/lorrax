@@ -118,12 +118,31 @@ def compute_optimal_chunks(
     α_gather  = _mem(mu, shard=p) + 2 * _mem(mu)    # sharded input + replicated output + NCCL
     c_solve   = _mem(mu, mu, shard=p_x * p_x) + 3 * _mem(mu, mu)  # L_rep(sharded) + 3×L_full(μ²)
 
+    # ZCT stage cost breakdown:
+    #   4 · α_pair · cr : four concurrent pair-density buffers (P_l, P_r,
+    #                     P_l_Rt, P_r_Rt) live at the ZCT peak.
+    #   ZCT_FFT_WS · α_pair · cr : cuFFT workspace for the 3-D FFTs over
+    #                     the (nk, μ, cr) tensor.  ``compute_ZCT_from_
+    #                     left_right_zchunk`` does 2× ifftn + 1× fftn
+    #                     across two jits; each cuFFT plan allocates a
+    #                     workspace roughly equal to the transform size.
+    #                     We use 3 to match the existing ``FFT_COPIES=3``
+    #                     convention the centroid-FFT stage already uses.
+    #   Observed at Si 10×10×10 (nk=1000, μ=480, 4 GPUs, 35 GB), see
+    #   module_0147.jit__kernel memory-usage-report: the 18.54 GiB top
+    #   preallocated-temp is dominated by the in-loop band-FFT tensor
+    #   (c128[nk, bpd, ns, nx, ny, nz] × 3 cuFFT copies) — that
+    #   mis-prediction is fixed separately by computing the ``fft`` loop
+    #   stage with the full-nk FFT workspace.  The 3 here still accounts
+    #   for the ZCT stage's two ifftn + one fftn cuFFT plans.
+    ZCT_FFT_WS = 3
+    zct_coef = 4 + ZCT_FFT_WS
     def _max_cr(headroom, fft_cost_per_k):
         """Invert each stage's linear cost to get max feasible cr per stage."""
         limits = {
             'fft':     (headroom - fft_cost_per_k) / α_psi if α_psi > 0 else nr,
             'pair':    headroom / (α_psi + 2 * α_pair) if (α_psi + 2 * α_pair) > 0 else nr,
-            'zct':     headroom / (4 * α_pair) if α_pair > 0 else nr,
+            'zct':     headroom / (zct_coef * α_pair) if α_pair > 0 else nr,
             'reshard': headroom / (4 * α_zcol) if α_zcol > 0 else nr,
             'solve':   (headroom - c_solve) / (2 * α_zcol + 2 * α_z_slice) if (2 * α_zcol + 2 * α_z_slice) > 0 else nr,
             'gather':  headroom / (α_zcol + α_gather) if (α_zcol + α_gather) > 0 else nr,
@@ -132,30 +151,34 @@ def compute_optimal_chunks(
         if m_zct_cap is not None and α_pair > 0:
             zct_headroom = m_zct_cap - (m_budget - headroom)
             if zct_headroom > 0:
-                limits['zct'] = min(limits['zct'], zct_headroom / (4 * α_pair))
+                limits['zct'] = min(limits['zct'], zct_headroom / (zct_coef * α_pair))
         return limits
 
-    def _eval_stages(cr, base, fft_cost_per_k):
+    # Per-k centroid-load FFT cost — used only for k_batch sizing.  The
+    # in-loop FFT workspace cost is a separate, full-nk term.
+    fft_per_k = FFT_COPIES * _mem(bpd, ns, nr) + _mem(nr)
+
+    def _eval_stages(cr, base, fft_inloop):
         """Forward-evaluate all stage costs at a given cr (algebraic inverse of _max_cr)."""
         m_zcol = α_zcol * cr
         m_solve_per_q = 2 * α_z_slice * cr + c_solve
         m_gather_per_q = α_gather * cr
         stages = {
-            'fft':     base + α_psi * cr + fft_cost_per_k,
+            'fft':     base + α_psi * cr + fft_inloop,
             'pair':    base + (α_psi + 2 * α_pair) * cr,
-            'zct':     base + 4 * α_pair * cr,
+            'zct':     base + zct_coef * α_pair * cr,
             'reshard': base + 4 * m_zcol,
             'solve':   base + 2 * m_zcol + m_solve_per_q,
             'gather':  base + m_zcol + m_gather_per_q,
         }
-        # k_batch: fill remaining FFT headroom for throughput (does not affect cr choice)
+        # k_batch sized against fft_per_k (per-k cost), capped by headroom.
         fft_head = m_budget - base - α_psi * cr
         k_batch = 1
-        if fft_cost_per_k > 0 and fft_head > fft_cost_per_k:
-            k_batch = min(int(nk), max(1, int(fft_head * 0.5 / fft_cost_per_k)))
+        if fft_per_k > 0 and fft_head > fft_per_k:
+            k_batch = min(int(nk), max(1, int(fft_head * 0.5 / fft_per_k)))
         return stages, m_zcol, m_solve_per_q, m_gather_per_q, k_batch
 
-    def _find_r_chunk(use_cache, fft_cost_per_k, override=None):
+    def _find_r_chunk(use_cache, fft_inloop, override=None):
         """Compute optimal cr from direct formula, round down to p-divisible."""
         base = m_centroids + m_L_q + (m_gspace_cache if use_cache else 0.0)
         headroom = m_budget - base
@@ -164,13 +187,13 @@ def compute_optimal_chunks(
         if override and override > 0:
             cr = min(int(override), int(nr))
         else:
-            cr = min(int(nr), max(0, int(min(_max_cr(headroom, fft_cost_per_k).values()))))
+            cr = min(int(nr), max(0, int(min(_max_cr(headroom, fft_inloop).values()))))
         pt = p_x * p_y  # cr must be divisible by total device count for solve sharding
         if pt > 1 and cr > 0:
             cr -= cr % pt
         if cr <= 0:
             return None
-        stages, m_zcol, m_spq, m_gpq, k_batch = _eval_stages(cr, base, fft_cost_per_k)
+        stages, m_zcol, m_spq, m_gpq, k_batch = _eval_stages(cr, base, fft_inloop)
         return {
             'chunk_r': cr, 'peak': max(stages.values()),
             'bottleneck': max(stages, key=stages.get), 'stages': stages,
@@ -180,19 +203,27 @@ def compute_optimal_chunks(
         }
 
     # ---- Solve for chunk sizes: try cache→no-cache, halving band_chunk if needed ----
-    fft_per_k = FFT_COPIES * _mem(bpd, ns, nr) + _mem(nr)
-    result = _find_r_chunk(True, fft_per_k, r_chunk_override) or \
-             _find_r_chunk(False, fft_per_k, r_chunk_override)
+    # In-loop band-FFT tensor lives as (nk, bpd, ns, nx, ny, nz) — FULL nk,
+    # no k-chunking inside ``get_sharded_wfns_rchunk_slice``.  XLA holds
+    # FFT_COPIES concurrent copies (input, output, cuFFT scratch) in a
+    # single preallocated-temp slot.  The old ``fft_per_k = FFT_COPIES ·
+    # _mem(bpd, ns, nr)`` dropped the nk factor, assuming k-chunking that
+    # never happens — caused Si 10×10×10 4-GPU to under-predict peak by
+    # ~19 GiB (measured in module_0147.jit__kernel memory-usage-report:
+    # top preallocated-temp = 18.54 GiB = 3 × (nk·bpd·ns·nr · 16)).
+    fft_inloop = FFT_COPIES * _mem(nk, bpd, ns, nr)
+    result = _find_r_chunk(True, fft_inloop, r_chunk_override) or \
+             _find_r_chunk(False, fft_inloop, r_chunk_override)
     while result is None and bpd > 1:
         bpd = max(1, bpd // 2)
         band_chunk = min(nb, bpd * p)
         bpd = max(1, -(-band_chunk // p))
-        fft_per_k = FFT_COPIES * _mem(bpd, ns, nr) + _mem(nr)
+        fft_inloop = FFT_COPIES * _mem(nk, bpd, ns, nr)
         peak_fft_stage = m_centroids_full + FFT_COPIES * _mem(nk, bpd, ns, nr) + m_phase
         if verbose:
             print(f"    Reducing band_chunk to {band_chunk} (bands/device={bpd})")
-        result = _find_r_chunk(True, fft_per_k, r_chunk_override) or \
-                 _find_r_chunk(False, fft_per_k, r_chunk_override)
+        result = _find_r_chunk(True, fft_inloop, r_chunk_override) or \
+                 _find_r_chunk(False, fft_inloop, r_chunk_override)
     if result is None:
         raise ValueError("Unable to find r-chunk that fits the memory budget.")
 
