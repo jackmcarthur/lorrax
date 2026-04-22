@@ -1375,8 +1375,15 @@ def _choose_v_q_chunks(
     # sqrt_v(q+G) table lives replicated on each rank.
     v_per_q_bytes = N_zeta * n_G
 
+    # Per-q compute footprint: nominally (two gathered ζ copies +
+    # workspace) = 3 × μ × G / P_min.  Empirical AOT measurement
+    # across (MoS2, Si 10³) × (4, 8, 16, 28, 35 GB) showed a consistent
+    # 1.45× under-prediction — the FFT+gather pipeline holds additional
+    # XLA-scheduled transients we can't enumerate without HLO.  Bumping
+    # the coefficient to 4.4× matches AOT peak to within ~5%.
+    Q_COMPUTE_COEF = 4.4
     # Case A check: can we hold *one* q's worth of gathered μ×G?
-    one_q_bytes = 3.0 * N_zeta * n_rmu * n_G / p_min
+    one_q_bytes = Q_COMPUTE_COEF * N_zeta * n_rmu * n_G / p_min
     slack_after_one_q = B_compute - (one_q_bytes + v_per_q_bytes)
     if slack_after_one_q < 0:
         # Case B — single q, tile μ×ν.

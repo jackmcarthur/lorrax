@@ -179,8 +179,19 @@ def compute_optimal_chunks(
         return stages, m_zcol, m_solve_per_q, m_gather_per_q, k_batch
 
     def _find_r_chunk(use_cache, fft_inloop, override=None):
-        """Compute optimal cr from direct formula, round down to p-divisible."""
-        base = m_centroids + m_L_q + (m_gspace_cache if use_cache else 0.0)
+        """Compute optimal cr from direct formula, round down to p-divisible.
+
+        ``use_cache`` controls the I/O path (pre-load ζ(G) once vs re-read
+        per r-chunk), NOT the memory footprint — the fit_one_rchunk jit
+        takes the full psi_bc_G tuple either way, so m_gspace_cache is
+        always resident at the call site.  Always include it in base.
+        Empirical confirmation: AOT memory_analysis() on Si 10³ reports
+        arg ≈ 4.7 GB = centroids + L_q + G-space cache, regardless of
+        how the chooser labels use_cache.  Dropping the cache term from
+        base at tight budgets was a 3-5 GB under-prediction that let
+        the chooser pick cr values that OOM'd at runtime.
+        """
+        base = m_centroids + m_L_q + m_gspace_cache
         headroom = m_budget - base
         if headroom <= c_solve:
             return None
@@ -211,15 +222,30 @@ def compute_optimal_chunks(
     # never happens — caused Si 10×10×10 4-GPU to under-predict peak by
     # ~19 GiB (measured in module_0147.jit__kernel memory-usage-report:
     # top preallocated-temp = 18.54 GiB = 3 × (nk·bpd·ns·nr · 16)).
-    fft_inloop = FFT_COPIES * _mem(nk, bpd, ns, nr)
+    # cuFFT workspace is not just FFT_COPIES × data size — cuFFT's planner
+    # allocates an additional scratch whose size depends on the FFT box
+    # radix factoring AND the batch size (24 = 2³·3 mixed radix; workspace
+    # grows non-linearly when batch is large).  Empirical AOT measurements
+    # on Si 10³ (24³ box) at the chooser's picks across budgets:
+    #    cr,bc,bpd=192,8,2    → temp ≈ 9 GB, data = 0.44 GB/rank → 20× data
+    #    cr,bc,bpd=440,20,5   → temp ≈ 8.8 GB, data = 1.1 GB/rank → 8× data
+    #    cr,bc,bpd=2140,60,15 → temp ≈ 18.4 GB, data = 3.3 GB/rank → 5.5× data
+    # So the workspace/data ratio grows as bpd shrinks.  For a conservative
+    # safe-at-all-bpd coefficient, use 3.  Sum with FFT_COPIES=3 gives
+    # fft_inloop = 6× data — still under-predicts at bpd=2 (20× would need)
+    # but the current floor is dominated by the *intercept* cost which
+    # scales primarily with nr and nk, not cr.  This keeps the model on
+    # the safe side for bpd ≥ 4, mildly aggressive for bpd < 4.
+    CUFFT_WS_EXTRA = 3
+    fft_inloop = (FFT_COPIES + CUFFT_WS_EXTRA) * _mem(nk, bpd, ns, nr)
     result = _find_r_chunk(True, fft_inloop, r_chunk_override) or \
              _find_r_chunk(False, fft_inloop, r_chunk_override)
     while result is None and bpd > 1:
         bpd = max(1, bpd // 2)
         band_chunk = min(nb, bpd * p)
         bpd = max(1, -(-band_chunk // p))
-        fft_inloop = FFT_COPIES * _mem(nk, bpd, ns, nr)
-        peak_fft_stage = m_centroids_full + FFT_COPIES * _mem(nk, bpd, ns, nr) + m_phase
+        fft_inloop = (FFT_COPIES + CUFFT_WS_EXTRA) * _mem(nk, bpd, ns, nr)
+        peak_fft_stage = m_centroids_full + (FFT_COPIES + CUFFT_WS_EXTRA) * _mem(nk, bpd, ns, nr) + m_phase
         if verbose:
             print(f"    Reducing band_chunk to {band_chunk} (bands/device={bpd})")
         result = _find_r_chunk(True, fft_inloop, r_chunk_override) or \
