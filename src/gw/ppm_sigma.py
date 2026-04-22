@@ -44,7 +44,7 @@ File layout
     accumulators               _SigmaAccumulator protocol
                                _ReduceScatterGpuAccumulator · _StreamedH5Accumulator
     branch orchestration       _run_sigma_branch (builds windows, integrates τ loop)
-    top-level driver           compute_sigma_c_ppm_omega_grid
+    top-level driver           compute_ppm_sigma_omega_grid
 """
 
 from __future__ import annotations
@@ -1103,7 +1103,7 @@ def _run_sigma_branch(
 #  Top-level sigma driver
 # ---------------------------------------------------------------------------
 
-def compute_sigma_c_ppm_omega_grid(
+def compute_ppm_sigma_omega_grid(
     wfns,
     ppm,
     meta,

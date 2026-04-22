@@ -98,11 +98,11 @@ from .w_isdf import (
 )
 from .ppm_sigma import (
 	fit_gn_ppm,
-	compute_sigma_c_ppm_omega_grid,
+	compute_ppm_sigma_omega_grid,
 )
 from .cohsex_sigma import (
 	build_Gij,
-	compute_sigma_cohsex,
+	compute_cohsex_sigma,
 	get_cohsex_kernels,
 	_add_static_head,
 )
@@ -335,7 +335,7 @@ def main(argv=None):
 	# ---- Static COHSEX: Σ_SX, Σ_COH, V_H + bare Σ_X ----
 	import gc; gc.collect()
 	with timing.section("gw_jax.sigma"):
-		cohsex = compute_sigma_cohsex(
+		cohsex = compute_cohsex_sigma(
 			wfns, V_q, W_q, meta, mesh_xy,
 			Gij=Gij, do_screened=config.do_screened,
 			static_head_terms=static_head_terms,
@@ -394,7 +394,7 @@ def main(argv=None):
 				print0(f"  [pf] profiling hooks unavailable: {_e}")
 			_cm = _pf.region("sigma_ppm") if _pf is not None else timing.section("sigma_ppm_body")
 			with _cm:
-				sigma_omega = compute_sigma_c_ppm_omega_grid(
+				sigma_omega = compute_ppm_sigma_omega_grid(
 					wfns, ppm, meta, mesh_xy, ppm_options,
 					sigma_window_quad=config.sigma_quadrature_config,
 					print_fn=print0,

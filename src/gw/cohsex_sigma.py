@@ -10,7 +10,7 @@ flat-k/flat-q sharding consistent with the rest of the GW stack.
 The screening operand is W for the COHSEX channel and V for bare
 exchange — pass V as ``W_or_V_q`` to get Σ_X out of the same kernel.
 
-The driver entry :func:`compute_sigma_cohsex` builds all three
+The driver entry :func:`compute_cohsex_sigma` builds all three
 contributions from a wavefunction bundle and flat-q V / W and returns
 them as a dict.  Static head correction (q→0 band-diagonal terms) is
 optional and applied to SX/COH (and to the bare-X pass separately).
@@ -146,7 +146,7 @@ def _add_static_head(sig_sx, sig_coh, *, static_head_terms, meta, mesh_xy,
 # Top-level driver.
 # ---------------------------------------------------------------------------
 
-def compute_sigma_cohsex(
+def compute_cohsex_sigma(
     wfns,
     V_q: jax.Array,
     W_q: jax.Array,
@@ -231,6 +231,6 @@ def get_cohsex_kernels(meta, mesh_xy: Mesh):
 
     Exposed for the SC-COHSEX fixed-point loop, which needs to call the
     kernels repeatedly with a mutated Gij inside its own jit/mixing
-    harness.  New callers should use :func:`compute_sigma_cohsex`.
+    harness.  New callers should use :func:`compute_cohsex_sigma`.
     """
     return _make_cohsex_kernels(mesh_xy, meta.kgrid, int(meta.nk_tot))
