@@ -9,10 +9,10 @@ Mirrors the production construction in ``gw.w_isdf._get_chi_minimax_kernel``:
 
 Input shapes (flat-k form):
     chi_R_acc:   (n_k, n_rmu, n_rmu)                P(None, 'y', 'x')
-    psi_val_xn:  (n_k, n_s, n_rmu, n_b_v)           P(None, None, 'x', None)
-    psi_val_yr:  (n_k, n_b_v, n_s, n_rmu)           P(None, None, None, 'y')
-    psi_cond_yr: (n_k, n_b_c, n_s, n_rmu)           P(None, None, None, 'y')
-    psi_cond_xn: (n_k, n_s, n_rmu, n_b_c)           P(None, None, 'x', None)
+    psi_v_xn:  (n_k, n_s, n_rmu, n_b_v)           P(None, None, 'x', None)
+    psi_v_yr:  (n_k, n_b_v, n_s, n_rmu)           P(None, None, None, 'y')
+    psi_c_yr: (n_k, n_b_c, n_s, n_rmu)           P(None, None, None, 'y')
+    psi_c_xn: (n_k, n_s, n_rmu, n_b_c)           P(None, None, 'x', None)
     enk_v:       (n_k, n_b_v)  replicated
     enk_c:       (n_k, n_b_c)  replicated
     tau, prefactor, vmax, cmin: scalars
@@ -48,9 +48,9 @@ from ..core import AotKernel, Knobs, MeshSpec, SysDims, register_kernel
 #
 #   allocation 14 (preallocated-temp): 21.97 GiB = 4 × Gbuf (4 concurrent)
 #   allocation 0 (chi_R_acc):           1.37 GiB = T_chi  (donated -> aliased)
-#   allocation 1 (psi_cond_xn):        675 MiB   = T_psi  (one of four psi inputs)
-#   allocation 2 (psi_cond_yr):        675 MiB   = T_psi
-#   tail: psi_val_*  ~50 MiB each       (small; nb_v << nb_c in production)
+#   allocation 1 (psi_c_xn):        675 MiB   = T_psi  (one of four psi inputs)
+#   allocation 2 (psi_c_yr):        675 MiB   = T_psi
+#   tail: psi_v_*  ~50 MiB each         (small; nb_v << nb_c in production)
 #
 # With chi_R_acc donated, fit should give β[chi] ≈ 0 and β[Gbuf] ≈ 4.
 # The combined ``psi`` primitive sums the four input shards, so β[psi] ≈ 1.
@@ -149,16 +149,16 @@ class Chi0TauStepKernel(AotKernel):
         _Gc_fftn        = make_flat_k_fftn (mesh, kgrid, _Gc_spec, norm="ortho")
 
         def _tau_step(
-            chi_R_acc, psi_val_xn, psi_val_yr, psi_cond_yr, psi_cond_xn,
+            chi_R_acc, psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
             enk_v, enk_c, tau_scalar, prefactor_scalar, vmax, cmin,
         ):
             phases_v = jnp.exp(-tau_scalar * (vmax - enk_v))
             phases_c = jnp.exp(-tau_scalar * (enk_c - cmin))
             Gv_k = jax.lax.with_sharding_constraint(
-                _build_G_mm(psi_val_xn, psi_val_yr, phases=phases_v),
+                _build_G_mm(psi_v_xn, psi_v_yr, phases=phases_v),
                 NamedSharding(mesh, _Gv_out_flatk))
             Gc_k = jax.lax.with_sharding_constraint(
-                _build_G_mm(psi_cond_xn, psi_cond_yr, phases=phases_c),
+                _build_G_mm(psi_c_xn, psi_c_yr, phases=phases_c),
                 NamedSharding(mesh, _Gc_out_flatk))
             Gv_k = jnp.conj(Gv_k)
             Gc_k = jnp.conj(Gc_k)
