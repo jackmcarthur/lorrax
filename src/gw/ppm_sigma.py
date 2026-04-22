@@ -60,6 +60,11 @@ import numpy as np
 import h5py
 
 from common import jax_profile
+from common.host_gather import (
+    to_host_np as _to_host_np,
+    to_host_scalar as _to_host_scalar,
+    masked_stats_device as _masked_stats_device,
+)
 from .minimax_config import MinimaxConfig, SigmaQuadratureConfig
 from .minimax_screening import (
     MinimaxNodes,
@@ -111,34 +116,6 @@ class _SigmaWindow:
     @property
     def n_tau(self) -> int:
         return int(self.nodes.t.shape[0])
-
-
-def _to_host_np(a, dtype=np.complex128, *, tiled: bool = False):
-    """Gather a possibly sharded array to host."""
-    try:
-        return np.asarray(
-            jax.experimental.multihost_utils.process_allgather(a, tiled=tiled),
-            dtype=dtype,
-        )
-    except Exception:
-        return np.asarray(jax.device_get(a), dtype=dtype)
-
-
-def _to_host_scalar(a, dtype=float):
-    np_dtype = np.dtype(dtype)
-    gathered = _to_host_np(jnp.asarray(a), dtype=np_dtype, tiled=False)
-    return dtype(np.asarray(gathered).reshape(-1)[0])
-
-
-def _masked_stats_device(values: jax.Array, mask: jax.Array) -> tuple[int, int, float | None, float | None]:
-    """Return total size, masked count, and masked min/max."""
-    total = int(np.prod(values.shape))
-    count = int(_to_host_scalar(jnp.sum(mask, dtype=jnp.int64), int))
-    if count == 0:
-        return total, 0, None, None
-    min_val = float(_to_host_scalar(jnp.min(jnp.where(mask, values, jnp.inf)), float))
-    max_val = float(_to_host_scalar(jnp.max(jnp.where(mask, values, -jnp.inf)), float))
-    return total, count, min_val, max_val
 
 
 def _materialize_window_mask_B(
