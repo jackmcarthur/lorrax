@@ -74,9 +74,10 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
     from .greens_function_kernel import build_G as _build_G_mm
 
     # Shardings for psi inputs (carried at the caller's natural layout; 'x' on
-    # the μ_X axis for the _xn variant, 'y' on the μ_Y axis for the _yr one).
-    _psi_xn_spec = P(None, None, 'x', None)   # (nk, s, μ_X, nb)
-    _psi_yr_spec = P(None, None, None, 'y')   # (nk, nb, s, μ_Y)
+    # the μ_X axis for the _rmuT_X variant, 'y' on the μ_Y axis for the _rmu_Y).
+    # Match the long-form naming used by ppm_sigma's psi_{coh,proj}_* locals.
+    _psi_xn_spec = P(None, None, 'x', None)   # (nk, s, μ_X, nb)   — _rmuT_X
+    _psi_yr_spec = P(None, None, None, 'y')   # (nk, nb, s, μ_Y)   — _rmu_Y
     # Scalars / 1-D arrays replicated across all devices.
     _rep0 = P()             # scalar
     _rep1 = P(None)         # (nb,) band-indexed
@@ -91,13 +92,13 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
                             NamedSharding(mesh_xy, _rep0),
                             NamedSharding(mesh_xy, _rep0)),
              out_shardings=_G_k_shard)
-    def _build_Gv(psi_v_xn, psi_v_yr, enk_v, tau_scalar, vmax):
+    def _build_Gv(psi_v_rmuT_X, psi_v_rmu_Y, enk_v, tau_scalar, vmax):
         """Gv_k = Σ_n e^{-τ(vmax − e_nv)} ψ_v(μ_X, n) ψ_v*(μ_Y, n).
 
         Returned conjugated so the Gc/Gv index order matches downstream (see
         file-level note on the Hermitian swap trick)."""
         phases_v = jnp.exp(-tau_scalar * (vmax - enk_v))
-        Gv_k = _build_G_mm(psi_v_xn, psi_v_yr, phases=phases_v)
+        Gv_k = _build_G_mm(psi_v_rmuT_X, psi_v_rmu_Y, phases=phases_v)
         return jnp.conj(jax.lax.with_sharding_constraint(Gv_k, _G_k_shard))
 
     @partial(jax.jit,
@@ -107,12 +108,12 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
                             NamedSharding(mesh_xy, _rep0),
                             NamedSharding(mesh_xy, _rep0)),
              out_shardings=_G_k_shard)
-    def _build_Gc(psi_c_xn, psi_c_yr, enk_c, tau_scalar, cmin):
+    def _build_Gc(psi_c_rmuT_X, psi_c_rmu_Y, enk_c, tau_scalar, cmin):
         """Gc_k = Σ_n e^{-τ(e_nc − cmin)} ψ_c(μ_X, n) ψ_c*(μ_Y, n).
 
         Returned conjugated to match _build_Gv (see that docstring)."""
         phases_c = jnp.exp(-tau_scalar * (enk_c - cmin))
-        Gc_k = _build_G_mm(psi_c_xn, psi_c_yr, phases=phases_c)
+        Gc_k = _build_G_mm(psi_c_rmuT_X, psi_c_rmu_Y, phases=phases_c)
         return jnp.conj(jax.lax.with_sharding_constraint(Gc_k, _G_k_shard))
 
     @partial(jax.jit,
@@ -128,20 +129,20 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
                             NamedSharding(mesh_xy, _rep0)),      # cmin
              out_shardings=_chi_R_shard,
              static_argnums=())
-    def _chi_scan(psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
+    def _chi_scan(psi_v_rmuT_X, psi_v_rmu_Y, psi_c_rmu_Y, psi_c_rmuT_X,
                   enk_v, enk_c, tau_arr, prefactor_arr, vmax, cmin):
         """Full τ sweep in one jit: lax.scan walks the minimax nodes, builds
         Gv/Gc per τ, element-wise contracts to chi_R, accumulates, then one
         final FFT to chi_q.  All collectives and dispatch happen inside a
         single compiled graph — no Python loop over τ, no per-τ jit call."""
-        n_rmu = psi_v_xn.shape[2]
+        n_rmu = psi_v_rmuT_X.shape[2]
         chi_R_zero = jax.lax.with_sharding_constraint(
             jnp.zeros((nk, n_rmu, n_rmu), dtype=jnp.complex128), _chi_R_shard)
 
         def _body(chi_R_acc, xs):
             tau_scalar, prefactor_scalar = xs
-            Gv_R = _Gv_fftn(_build_Gv(psi_v_xn, psi_v_yr, enk_v, tau_scalar, vmax))
-            Gc_R = _Gc_fftn(_build_Gc(psi_c_xn, psi_c_yr, enk_c, tau_scalar, cmin))
+            Gv_R = _Gv_fftn(_build_Gv(psi_v_rmuT_X, psi_v_rmu_Y, enk_v, tau_scalar, vmax))
+            Gc_R = _Gc_fftn(_build_Gc(psi_c_rmuT_X, psi_c_rmu_Y, enk_c, tau_scalar, cmin))
             # chi_R(m, n) = Σ_{a,b} Gc_R(a,m,b,n) · conj(Gv_R(a,m,b,n))
             chi_tau = jax.lax.with_sharding_constraint(
                 jnp.einsum('Rambn,Rambn->Rmn',
@@ -152,12 +153,12 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
         final_R, _ = jax.lax.scan(_body, chi_R_zero, (tau_arr, prefactor_arr))
         return _chi_fftn_local(final_R)
 
-    def _chi_kernel(psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
+    def _chi_kernel(psi_v_rmuT_X, psi_v_rmu_Y, psi_c_rmu_Y, psi_c_rmuT_X,
                     enk_v, enk_c, tau_i, prefactor_i, vmax, cmin):
-        n_rmu = psi_v_xn.shape[2]
+        n_rmu = psi_v_rmuT_X.shape[2]
         if len(tau_i) == 0:
             return jnp.zeros((nk, n_rmu, n_rmu), dtype=jnp.complex128)
-        return _chi_scan(psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
+        return _chi_scan(psi_v_rmuT_X, psi_v_rmu_Y, psi_c_rmu_Y, psi_c_rmuT_X,
                          enk_v, enk_c, tau_i, prefactor_i, vmax, cmin)
 
     _chi_minimax_kernel_cache[cache_key] = _chi_kernel
@@ -165,8 +166,8 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
 
 
 def compute_chi0_minimax(
-    psi_v_xn: jax.Array, psi_v_yr: jax.Array,
-    psi_c_yr: jax.Array, psi_c_xn: jax.Array,
+    psi_v_rmuT_X: jax.Array, psi_v_rmu_Y: jax.Array,
+    psi_c_rmu_Y: jax.Array, psi_c_rmuT_X: jax.Array,
     enk_v: jax.Array, enk_c: jax.Array,
     quad, meta, mesh_xy: Mesh,
     energy_reference: float | None = None,
@@ -201,7 +202,7 @@ def compute_chi0_minimax(
 
     kernel = _get_chi_minimax_kernel(mesh_xy, kgrid)
     return kernel(
-        psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
+        psi_v_rmuT_X, psi_v_rmu_Y, psi_c_rmu_Y, psi_c_rmuT_X,
         enk_v - jnp.asarray(eref, dtype=enk_v.dtype),
         enk_c - jnp.asarray(eref, dtype=enk_c.dtype),
         jnp.asarray(tau, dtype=jnp.float64),
