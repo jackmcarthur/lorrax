@@ -342,10 +342,6 @@ def solve_w(V_q, chi0_q, meta, mesh_xy, *, memory_mode: str = "high_mem"):
             return solve_fn(V_q, chi0_q, pref_jnp)
 
 
-# Backward-compatible alias
-solve_w_from_chi_q_jax = solve_w
-
-
 
 def resolve_minimax_energy_reference(
     enk_v: jax.Array,

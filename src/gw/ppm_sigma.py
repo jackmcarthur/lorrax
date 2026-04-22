@@ -286,42 +286,10 @@ def _prepare_sigma_state(
     )
 
 
-def _combine_coeff_with_sigma_tau(
-    coeff_re: jax.Array,
-    coeff_im: jax.Array,
-    sigma_tau_kij_re: jax.Array,
-    sigma_tau_kij_im: jax.Array,
-    project_code: jax.Array,
-) -> jax.Array:
-    """Multiply ω-kernel coefficient by σ^τ, keeping only the physical piece.
-
-    σ^τ is carried as a real/imag pair because the crossing window's HGL
-    quadrature needs only Im[ coeff·σ^τ ] — carrying complex σ^τ through
-    the FFT pipeline would double memory for no benefit.  The window sets
-    ``project_code`` via ``_SigmaWindow.project``:
-
-        code=0 ("full")  Laplace window (stripe, slab, single) — keep the
-                         full complex product  (coeff_re + i·coeff_im) · (σ_re + i·σ_im).
-        code=1 ("imag")  Crossing window      — keep only  Im[coeff·σ]
-                                              = coeff_re·σ_im + coeff_im·σ_re.
-
-    The historical "real" code path (Re[coeff·σ]) is unused by every current
-    window builder.  lax.switch is retained with a 2-way dispatch so that
-    the generated HLO matches the previous "full" / "imag" lowering exactly
-    and no minimax-table consumer gets a silent behavior change.
-    """
-
-    def _full(_):
-        sigma_full = sigma_tau_kij_re[None, ...] + 1j * sigma_tau_kij_im[None, ...]
-        return (coeff_re + 1j * coeff_im) * sigma_full
-
-    def _imag(_):
-        return coeff_re * sigma_tau_kij_im[None, ...] + coeff_im * sigma_tau_kij_re[None, ...]
-
-    return jax.lax.switch(project_code, (_full, _imag), operand=None)
+from functools import partial
 
 
-@jax.jit
+@partial(jax.jit, static_argnames=("project",))
 def _project_tau_onto_omega(
     sigma_tau_kij_re: jax.Array,
     sigma_tau_kij_im: jax.Array,
@@ -330,15 +298,27 @@ def _project_tau_onto_omega(
     alpha_eff: jax.Array,
     omega_sign: jax.Array,
     pref: jax.Array,
-    project_code: jax.Array,
+    *,
+    project: str,
 ) -> jax.Array:
     """Apply ω-kernel exp(i·ω_sign·ω·t_node) and project onto σ channels.
 
     Returns the single-tau contribution at every ω in ``omega_vec``:
         contrib[ω, k, i, j] = pref · α_eff · exp(i·sign·ω·t) · P(σ_re, σ_im)
 
-    where P selects {full, imag} via ``project_code`` — see
-    ``_combine_coeff_with_sigma_tau`` for why σ^τ is kept as a (re, im) pair.
+    σ^τ is carried as a real/imag pair because the crossing window's HGL
+    quadrature needs only Im[coeff·σ^τ] — carrying complex σ^τ through
+    the FFT pipeline would double memory for no benefit.  The window sets
+    ``project`` via ``_SigmaWindow.project``:
+
+        "full"  Laplace window (stripe, slab, single) — keep the full
+                complex product (coeff_re + i·coeff_im) · (σ_re + i·σ_im).
+        "imag"  Crossing window — keep only Im[coeff·σ]
+                = coeff_re·σ_im + coeff_im·σ_re.
+
+    ``project`` is a static argname, so both branches compile separately
+    and the previous lax.switch dispatch is gone.  The historical "real"
+    code path (Re[coeff·σ]) was never wired by any window builder.
     Callers either accumulate the result on-GPU (+=) or write it to disk —
     this kernel is agnostic to the consumer.
     """
@@ -346,9 +326,16 @@ def _project_tau_onto_omega(
     coeff = alpha_eff * omega_kernel
     coeff_re = jnp.real(coeff)[:, None, None, None]
     coeff_im = jnp.imag(coeff)[:, None, None, None]
-    contrib = _combine_coeff_with_sigma_tau(
-        coeff_re, coeff_im, sigma_tau_kij_re, sigma_tau_kij_im, project_code
-    )
+
+    if project == "full":
+        sigma_full = sigma_tau_kij_re[None, ...] + 1j * sigma_tau_kij_im[None, ...]
+        contrib = (coeff_re + 1j * coeff_im) * sigma_full
+    elif project == "imag":
+        contrib = (coeff_re * sigma_tau_kij_im[None, ...]
+                   + coeff_im * sigma_tau_kij_re[None, ...])
+    else:
+        raise ValueError(f"Unknown project={project!r}; expected 'full' or 'imag'.")
+
     return pref * contrib.astype(jnp.complex128)
 
 
@@ -534,6 +521,7 @@ def _get_sigma_tau_scan_kernel(
     *,
     mesh_xy: Mesh,
     kgrid: tuple[int, int, int],
+    project: str,
 ) -> Callable[..., jax.Array]:
     """Cached factory: runs an entire window's τ nodes in one jax.lax.scan.
 
@@ -546,9 +534,14 @@ def _get_sigma_tau_scan_kernel(
     scale) retrace this kernel separately.  That's ~4 compiles per mesh,
     amortized over hundreds of τ nodes each.  If retraces become costly,
     pad all windows to max(n_τ) and mask in the scan body.
+
+    ``project`` (one of 'full' / 'imag') is a static-time closure — baked
+    into the compile so the scan body avoids a lax.switch per τ node.
     """
     kgrid = tuple(int(x) for x in kgrid)
-    cache_key = (id(mesh_xy), kgrid)
+    if project not in ("full", "imag"):
+        raise ValueError(f"Unknown project={project!r}; expected 'full' or 'imag'.")
+    cache_key = (id(mesh_xy), kgrid, project)
     if cache_key in _sigma_tau_scan_cache:
         return _sigma_tau_scan_cache[cache_key]
 
@@ -563,7 +556,7 @@ def _get_sigma_tau_scan_kernel(
         psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
         E_A, mask_A, B_q, Omega_q, mask_B,
         E_ref_A, E_ref_B,
-        omega_vec, pref, omega_sign, project_code,
+        omega_vec, pref, omega_sign,
     ):
         E_ref_sum = E_ref_A + E_ref_B
 
@@ -580,7 +573,7 @@ def _get_sigma_tau_scan_kernel(
             alpha_eff = alpha_node * jnp.exp(-1j * E_ref_sum * t_node)
             acc = acc + _project_tau_onto_omega(
                 sigma_re, sigma_im, omega_vec,
-                t_node, alpha_eff, omega_sign, pref, project_code,
+                t_node, alpha_eff, omega_sign, pref, project=project,
             )
             return acc, None
 
@@ -812,7 +805,8 @@ class _SigmaAccumulator:
     Lifecycle per branch:
         acc.begin_window()
         for each tau:
-            acc.add_tau(σ_re, σ_im, ω_vec, t_node, α_eff, ω_sign, pref, code)
+            acc.add_tau(σ_re, σ_im, ω_vec, t_node, α_eff, ω_sign, pref,
+                        project=win.project)
         acc.end_window()
     At branch end the caller calls ``acc.finalize()`` — returns the on-GPU
     (n_ω, nk, nb, nb) tensor (buffered path) or None (stream path).
@@ -860,15 +854,15 @@ class _ReduceScatterGpuAccumulator(_SigmaAccumulator):
             jnp.zeros_like(self.total), self._sharding)
 
     def add_tau(self, sigma_re, sigma_im, omega_vec,
-                t_node_j, alpha_eff_j, omega_sign_j, pref_j, project_code_j,
-                *, omega_global_idx=None):
+                t_node_j, alpha_eff_j, omega_sign_j, pref_j, *, project: str,
+                omega_global_idx=None):
         assert self._win_acc is not None
         # σ^τ arrives already (k, m_X, n_Y)-sharded from the shard_map'd
         # project inside the FFT/project kernel.  The ω-kernel multiply and
         # add therefore touch only each rank's local (m/p_x, n/p_y) block.
         self._win_acc = self._win_acc + _project_tau_onto_omega(
             sigma_re, sigma_im, omega_vec,
-            t_node_j, alpha_eff_j, omega_sign_j, pref_j, project_code_j,
+            t_node_j, alpha_eff_j, omega_sign_j, pref_j, project=project,
         )
         # Pin the running buffer's sharding so XLA doesn't replicate it
         # between adds.
@@ -925,15 +919,15 @@ class _StreamedH5Accumulator(_SigmaAccumulator):
         pass
 
     def add_tau(self, sigma_re, sigma_im, omega_vec,
-                t_node_j, alpha_eff_j, omega_sign_j, pref_j, project_code_j,
-                *, omega_global_idx=None):
+                t_node_j, alpha_eff_j, omega_sign_j, pref_j, *, project: str,
+                omega_global_idx=None):
         n_omega = int(omega_vec.shape[0])
         for ibeg in range(0, n_omega, self._batch):
             iend = min(ibeg + self._batch, n_omega)
             batch_proj = _project_tau_onto_omega(
                 sigma_re, sigma_im, omega_vec[ibeg:iend],
                 t_node_j, alpha_eff_j, omega_sign_j,
-                pref_j, project_code_j,
+                pref_j, project=project,
             )
             self._writer(self._omega_global_idx[ibeg:iend], batch_proj)
 
@@ -1045,7 +1039,7 @@ def _integrate_tau_windows_for_branch(
     psi_proj_xr: jax.Array,
     psi_proj_yn: jax.Array,
     tau_kernel: Callable[..., jax.Array],
-    tau_scan_kernel: Callable[..., jax.Array] | None,
+    tau_scan_kernel: Callable[[str], Callable[..., jax.Array]] | None,
     mesh_xy: Mesh,
     scale: float,
     log_tag: str,
@@ -1115,17 +1109,18 @@ def _integrate_tau_windows_for_branch(
                     raise ValueError(
                         f"Unknown window projection {win.project!r}; "
                         f"expected 'full' (Laplace) or 'imag' (crossing).")
-                project_code_j = jnp.asarray(
-                    {"full": 0, "imag": 1}[win.project], dtype=jnp.int32)
+                project_str = str(win.project)
                 omega_sign_j = jnp.asarray(float(win.omega_sign), dtype=jnp.float64)
                 pref_j = jnp.asarray(win.prefactor * scale, dtype=jnp.float64)
 
                 if use_scan_path:
                     # Fast path: one jit dispatch per window instead of N_τ.
+                    # tau_scan_kernel is a resolver (project: str) → compiled
+                    # scan kernel so project bakes into compile at factory time.
                     t_nodes_j = jnp.asarray(win.t_nodes, dtype=jnp.complex128)
                     alpha_nodes_j = jnp.asarray(win.alpha, dtype=jnp.complex128)
                     accumulator.run_window_scan(
-                        tau_scan_kernel,
+                        tau_scan_kernel(project_str),
                         t_nodes=t_nodes_j,
                         alpha_nodes=alpha_nodes_j,
                         window_args=dict(
@@ -1138,7 +1133,6 @@ def _integrate_tau_windows_for_branch(
                             E_ref_A=E_ref_A_j, E_ref_B=E_ref_B_j,
                             omega_vec=omega_vec, pref=pref_j,
                             omega_sign=omega_sign_j,
-                            project_code=project_code_j,
                         ),
                     )
                     # Advance progress bar by the whole window (the scan is
@@ -1157,8 +1151,9 @@ def _integrate_tau_windows_for_branch(
                     # traffic; and returning a tuple from the shard_map lets
                     # Python unpack it without triggering the gather+broadcast
                     # pair that indexing a sharded (2, nk, …) array would
-                    # emit.  See _combine_coeff_with_sigma_tau for the
-                    # downstream recombination.
+                    # emit.  See _project_tau_onto_omega for the downstream
+                    # recombination (project='full' keeps the full complex
+                    # product; project='imag' keeps only Im[coeff·σ]).
                     sigma_tau_kij_re, sigma_tau_kij_im = tau_kernel(
                         psi_coh_xn, psi_coh_yr,
                         psi_proj_xr, psi_proj_yn,
@@ -1177,7 +1172,8 @@ def _integrate_tau_windows_for_branch(
 
                     accumulator.add_tau(
                         sigma_tau_kij_re, sigma_tau_kij_im, omega_vec,
-                        t_node_j, alpha_eff_j, omega_sign_j, pref_j, project_code_j,
+                        t_node_j, alpha_eff_j, omega_sign_j, pref_j,
+                        project=project_str,
                     )
 
                 accumulator.end_window()
