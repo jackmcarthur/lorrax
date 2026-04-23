@@ -543,6 +543,49 @@ def _get_sigma_tau_kernel(
     return _tau_kernel
 
 
+def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh) -> None:
+    """AOT lower + compile the per-τ sigma kernel.
+
+    Parallel to :func:`w_isdf.precompile_chi0` / ``precompile_solve_w``:
+    lower the cached ``_tau_kernel`` at the real input shapes/shardings
+    and eagerly ``.compile()`` it so the first per-τ dispatch inside
+    ``compute_sigma_c_ppm_omega_grid`` is execution-only.  Call inside
+    a dedicated ``timing.section('sigma.compile')`` block to split
+    compile from exec in the end-of-run timing report.
+
+    The kernel is shape-invariant across the four ω-sign × cond/val
+    branches (ψ / E_A / mask_A / B_q / Ω_q / mask_B / scalars all have
+    fixed shape+dtype+sharding; only values change per window) — so
+    one AOT compile covers every branch.
+    """
+    w_isdf._ensure_compilation_cache()
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    tau_kernel = _get_sigma_tau_kernel(mesh_xy=mesh_xy, kgrid=kgrid)
+
+    s = wfns.slices
+    psi_coh_xn  = wfns.xn(s.full)
+    psi_coh_yr  = wfns.yr(s.full)
+    psi_proj_xr = wfns.xr(s.sigma)
+    psi_proj_yn = wfns.yn(s.sigma)
+
+    # Representative non-ψ inputs — values don't matter for AOT, only
+    # shapes+dtypes+shardings.  E_A / mask_A are replicated (default
+    # device set); mask_B inherits Ω_q's sharding so the compiled
+    # graph matches what ``_materialize_window_mask_B`` emits at runtime.
+    nb_full = int(psi_coh_xn.shape[-1])
+    E_A     = jnp.zeros((int(meta.nk_tot), nb_full), dtype=jnp.float64)
+    mask_A  = jnp.ones((int(meta.nk_tot), nb_full), dtype=bool)
+    mask_B  = jnp.ones_like(ppm.Omega_q, dtype=bool)
+    E_ref_A = jnp.asarray(0.0, dtype=jnp.float64)
+    E_ref_B = jnp.asarray(0.0, dtype=jnp.float64)
+    t_node  = jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128)
+
+    tau_kernel.lower(
+        psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+        E_A, mask_A, ppm.B_q, ppm.Omega_q, mask_B,
+        E_ref_A, E_ref_B, t_node,
+    ).compile()
+
 
 # ---------------------------------------------------------------------------
 #  PPM construction

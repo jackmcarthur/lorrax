@@ -41,6 +41,7 @@ from .w_isdf import (
 from .ppm_sigma import (
 	fit_gn_ppm,
 	compute_sigma_c_ppm_omega_grid,
+	precompile_sigma,
 )
 from .cohsex_sigma import (
 	build_Gij,
@@ -360,7 +361,9 @@ def main(argv=None):
 			except Exception as _e:
 				_pf = None
 				print0(f"  [pf] profiling hooks unavailable: {_e}")
-			_cm = _pf.region("sigma_ppm") if _pf is not None else timing.section("sigma_ppm_body")
+			with timing.section("sigma.compile"):
+				precompile_sigma(wfns, ppm, meta, mesh_xy)
+			_cm = _pf.region("sigma_ppm") if _pf is not None else timing.section("sigma.exec")
 			with _cm:
 				sigma_omega = compute_sigma_c_ppm_omega_grid(
 					wfns, ppm, meta, mesh_xy, ppm_options,
