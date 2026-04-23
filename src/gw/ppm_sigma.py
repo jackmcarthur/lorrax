@@ -441,7 +441,10 @@ def _get_sigma_kij_kernel(
     _ReduceScatterGpuAccumulator expects without any downstream reshuffle.
     """
 
-    pipeline_key = (id(mesh_xy), nkx, nky, nkz, nk_tot, bispinor)
+    # Cache key: (id(mesh), kgrid).  nk_tot is redundant (= prod(kgrid))
+    # and bispinor is inferrable from ψ.shape — neither needs to
+    # participate in the cache key within one process.
+    pipeline_key = (id(mesh_xy), (nkx, nky, nkz))
     if pipeline_key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[pipeline_key]
 
@@ -490,7 +493,7 @@ def _get_sigma_tau_kernel(
 ) -> Callable[..., jax.Array]:
     """Return a cached tau-node sigma builder with jittable local FFTs."""
 
-    cache_key = (id(mesh_xy), nkx, nky, nkz, nk_tot, bispinor)
+    cache_key = (id(mesh_xy), (nkx, nky, nkz))
     if cache_key in _sigma_tau_kernel_cache:
         return _sigma_tau_kernel_cache[cache_key]
 
@@ -1180,8 +1183,10 @@ def compute_sigma_c_ppm_omega_grid(
     valid_mask_q = getattr(ppm, 'valid_mask_q', None)
     omega_values_ry = ppm_options.omega_grid_ry
 
-    nkx, nky, nkz = int(meta.nkx), int(meta.nky), int(meta.nkz)
-    nk = int(nkx * nky * nkz)
+    # Flat nk is used throughout this driver; (nkx, nky, nkz) only flows
+    # into the kernel factory (tau_kernel) below — it's already the
+    # kernel's cache key, so we don't unpack kgrid here at the driver.
+    nk = int(meta.nk_tot)
 
     # Quadrature config
     if sigma_window_quad is not None:

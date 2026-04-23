@@ -46,7 +46,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
 
     nkx, nky, nkz = kgrid
     nk = nkx * nky * nkz
-    cache_key = (id(mesh_xy), nkx, nky, nkz)
+    cache_key = (id(mesh_xy), kgrid)
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 
