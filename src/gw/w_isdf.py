@@ -86,7 +86,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
     _Gc_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
     _chi_fftn_local = make_flat_k_fftn(mesh_xy, kgrid, _chi_spec, norm='ortho')
 
-    from .greens_function_kernel import build_G as _build_G_mm
+    from .greens_function_kernel import build_G_tau
     # Scalars / 1-D arrays replicated across all devices.
     _rep0 = P()             # scalar
     _rep1 = P(None)         # (nb,) band-indexed
@@ -105,14 +105,18 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
                             NamedSharding(mesh_xy, _rep0),
                             NamedSharding(mesh_xy, _rep0)),
              out_shardings=(_G_k_shard, _G_k_shard))
-    def _build_G(psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
-                 enk_v, enk_c, tau_scalar, vmax, cmin):
-        phases_v = jnp.exp(-tau_scalar * (vmax - enk_v))
-        phases_c = jnp.exp(-tau_scalar * (enk_c - cmin))
+    def _build_Gv_Gc(psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
+                    enk_v, enk_c, tau_scalar, vmax, cmin):
+        # phases_v = exp(-τ (vmax - e_v)) = exp(-(-τ)(e_v - vmax))  → t=-τ, e_ref=vmax
+        # phases_c = exp(-τ (e_c - cmin))                            → t=+τ, e_ref=cmin
         Gv_k = jax.lax.with_sharding_constraint(
-            _build_G_mm(psi_v_xn, psi_v_yr, phases=phases_v), _G_k_shard)
+            build_G_tau(psi_v_xn, psi_v_yr, enk_v, -tau_scalar, e_ref=vmax),
+            _G_k_shard)
         Gc_k = jax.lax.with_sharding_constraint(
-            _build_G_mm(psi_c_xn, psi_c_yr, phases=phases_c), _G_k_shard)
+            build_G_tau(psi_c_xn, psi_c_yr, enk_c,  tau_scalar, e_ref=cmin),
+            _G_k_shard)
+        # Hermitian-swap conj (see FFT-convention block comment above) —
+        # belongs at the call site, NOT inside build_G_tau.
         return jnp.conj(Gv_k), jnp.conj(Gc_k)
 
     @partial(jax.jit,
@@ -140,9 +144,9 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
 
         def _body(chi_R_acc, xs):
             tau_scalar, prefactor_scalar = xs
-            Gv_k, Gc_k = _build_G(psi_v_xn, psi_v_yr,
-                                    psi_c_yr, psi_c_xn,
-                                    enk_v, enk_c, tau_scalar, vmax, cmin)
+            Gv_k, Gc_k = _build_Gv_Gc(psi_v_xn, psi_v_yr,
+                                      psi_c_yr, psi_c_xn,
+                                      enk_v, enk_c, tau_scalar, vmax, cmin)
             Gv_R = _Gv_fftn(Gv_k)
             Gc_R = _Gc_fftn(Gc_k)
             # chi_R(m, n) = Σ_{a,b} Gc_R(a,m,b,n) · conj(Gv_R(a,m,b,n))
@@ -155,20 +159,11 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
         final_R, _ = jax.lax.scan(_body, chi_R_zero, (tau_arr, prefactor_arr))
         return _chi_fftn_local(final_R)
 
-    def _chi_kernel(psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
-                    enk_v, enk_c, tau_i, prefactor_i, vmax, cmin):
-        n_rmu = psi_v_xn.shape[2]
-        if len(tau_i) == 0:
-            return jnp.zeros((nk, n_rmu, n_rmu), dtype=jnp.complex128)
-        return _chi_scan(psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
-                         enk_v, enk_c, tau_i, prefactor_i, vmax, cmin)
-
-    # Expose the underlying jit so ``precompile_chi0`` can call
-    # ``.lower(*args).compile()`` to AOT-warm the in-process cache and
-    # separate compile time from exec time in timing reports.
-    _chi_kernel.compiled_fn = _chi_scan
-    _chi_minimax_kernel_cache[cache_key] = _chi_kernel
-    return _chi_kernel
+    # Minimax quadrature always delivers ≥1 node, so the old empty-tau
+    # short-circuit wrapper is gone — _chi_scan IS the kernel.  It is a jit
+    # directly, so precompile_chi0 calls ``.lower(*args).compile()`` on it.
+    _chi_minimax_kernel_cache[cache_key] = _chi_scan
+    return _chi_scan
 
 
 
@@ -458,11 +453,7 @@ def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
     prefactor = -2.0 * np.asarray(quad.alpha, dtype=np.float64) * np.exp(-tau * E_gap)
 
     kernel = _get_chi_minimax_kernel(mesh_xy, kgrid)
-    scan_jit = getattr(kernel, "compiled_fn", None)
-    if scan_jit is None:
-        return
-
-    scan_jit.lower(
+    kernel.lower(
         wfns.xn(s.val), wfns.yr(s.val),
         wfns.yr(s.cond), wfns.xn(s.cond),
         enk_v - jnp.asarray(eref, dtype=enk_v.dtype),
