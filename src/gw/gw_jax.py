@@ -357,6 +357,9 @@ def main(argv=None):
 				W_q, Wiwp_q, V_q, config.ppm_omega_p, mesh_xy,
 				fallback_omega=config.ppm_fallback_omega,
 				n_nodes_static=quad.node_count, print_fn=print0)
+			# Wiwp_q is used only for the PPM fit; drop the Python
+			# reference so XLA can reclaim its (nq, μ, μ) c128 buffer.
+			del Wiwp_q
 
 			# Frequency-integrated Σ^c(ω)
 			# Temporary profiling hooks: pf.region + pre/post snapshots bracket the sigma PPM call
