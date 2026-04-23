@@ -74,21 +74,19 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
     # (μ_first on x from psi_xn, μ_second on y from psi_yr).  chi_R inherits
     # P(_, 'x', 'y') naturally — aligned with V for W-solve, so the post-chi0
     # reshard into the fused W-solve drops out too.
-    _G_spec         = P(None, None, None, None, 'x', None, 'y')    # 7-D FFT form
-    _G_out_flatk    = P(None, None, 'x', None, 'y')                # 5-D flat-k form
-    _chi_spec       = P(None, None, None, 'x', 'y')                # 5-D chi FFT form
-    _chi_R_spec     = P(None, 'x', 'y')                            # flat-k chi
-
+    from .wavefunction_bundle import (
+        G_FFT7D_SPEC as _G_spec,
+        G_FLATK_SPEC as _G_out_flatk,
+        CHI_Q_SPEC as _chi_spec,
+        CHI_R_SPEC as _chi_R_spec,
+        PSI_XN_SPEC as _psi_xn_spec,
+        PSI_YR_SPEC as _psi_yr_spec,
+    )
     _Gv_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
     _Gc_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
     _chi_fftn_local = make_flat_k_fftn(mesh_xy, kgrid, _chi_spec, norm='ortho')
 
     from .greens_function_kernel import build_G as _build_G_mm
-
-    # Shardings for psi inputs (carried at the caller's natural layout; 'x' on
-    # the μ_X axis for the _xn variant, 'y' on the μ_Y axis for the _yr one).
-    _psi_xn_spec = P(None, None, 'x', None)   # (nk, s, μ_X, nb)
-    _psi_yr_spec = P(None, None, None, 'y')   # (nk, nb, s, μ_Y)
     # Scalars / 1-D arrays replicated across all devices.
     _rep0 = P()             # scalar
     _rep1 = P(None)         # (nb,) band-indexed

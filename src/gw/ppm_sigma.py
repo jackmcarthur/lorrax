@@ -446,11 +446,10 @@ def _get_sigma_kij_kernel(
         return _sigma_kij_kernel_cache[pipeline_key]
 
     from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
+    from .wavefunction_bundle import G_FFT7D_SPEC as _G_spec, V_FFT5D_SPEC as _V_spec
 
     w_isdf._ensure_compilation_cache()
     kgrid = (nkx, nky, nkz)
-    _G_spec = P(None, None, None, None, 'x', None, 'y')
-    _V_spec = P(None, None, None, 'x', 'y')
     _G_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _G_spec, norm='ortho')
     _G_fftn  = make_flat_k_fftn( mesh_xy, kgrid, _G_spec, norm='ortho')
     _V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _V_spec, norm='ortho')

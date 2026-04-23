@@ -85,12 +85,43 @@ class BandSlices:
 
 
 # ---------------------------------------------------------------------------
-# Sharding specs for the four copies (2-D mesh with axes 'x', 'y').
+# Sharding specs for the four ψ copies (2-D mesh with axes 'x', 'y').
 # ---------------------------------------------------------------------------
 PSI_XN_SPEC = P(None, None, 'x', None)   # (nk, s, μ_X, n)
 PSI_XR_SPEC = P(None, None, None, 'x')   # (nk, n, s, μ_X)
 PSI_YR_SPEC = P(None, None, None, 'y')   # (nk, n, s, μ_Y)
 PSI_YN_SPEC = P(None, None, 'y', None)   # (nk, s, μ_Y, n)
+
+# ---------------------------------------------------------------------------
+# Sharding specs for the intermediate tensors that flow between chi0 / W /
+# sigma / cohsex kernels.  Kept here (not in each consumer) so every
+# module sees the same canonical layout and a reshard-mismatch is caught
+# at import time rather than at HLO compile.
+# ---------------------------------------------------------------------------
+# G(k) in 7-D FFT-box form, used by chi0's build_G and sigma's Gij
+# construction.  (nkx, nky, nkz, s, μ_X, spinor, μ_Y) with μ on the
+# (x, y) mesh.  The s-axis and spinor-axis are replicated because they
+# sum contiguously in downstream einsums.
+G_FFT7D_SPEC = P(None, None, None, None, 'x', None, 'y')
+
+# V_q / W_q in 5-D k-space form: (nkx, nky, nkz, μ_X, μ_Y) both μ-axes
+# sharded.  Used by compute_vcoul, w_isdf's V_q factory, and the W_q
+# input to sigma.
+V_FFT5D_SPEC = P(None, None, None, 'x', 'y')
+
+# chi(q) / σ^τ(k, μ, ν) in 5-D flat-q or k-sharded form: both μ axes on
+# the (x, y) mesh, q/k replicated.  Used by the inner tau kernel and
+# the chi0 → W solve.
+CHI_Q_SPEC = P(None, None, None, 'x', 'y')
+
+# G(k) in 5-D flat-k form — the output of make_flat_k_fftn when the
+# upstream op operates on a 3-D k-grid view.  (nk_flat, s, μ_X, spinor,
+# μ_Y).
+G_FLATK_SPEC = P(None, None, 'x', None, 'y')
+
+# chi / W in R-space, flat-k form, used by the chi0-to-W pipeline post
+# iFFT: (nk_flat, μ_X, μ_Y).
+CHI_R_SPEC = P(None, 'x', 'y')
 
 
 # ---------------------------------------------------------------------------
