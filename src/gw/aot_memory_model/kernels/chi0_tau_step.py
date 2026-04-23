@@ -1,6 +1,8 @@
 """chi0 per-tau-step jit (the OOM bottleneck at Si 4x4x4 60 Ry mem=16 GB).
 
-Mirrors the production construction in ``gw.w_isdf._get_chi_minimax_kernel``:
+Mirrors the production construction in
+``gw.w_isdf.minimax_tau_integrate_chi`` (cached via
+``_get_chi_minimax_kernel``):
     Gv_k, Gc_k = build_G(...) with with_sharding_constraint
     Gv_R = ifftn(Gv_k)
     Gc_mR = fftn(Gc_k)
@@ -125,10 +127,11 @@ class Chi0TauStepKernel(AotKernel):
         """Construct the _tau_step exactly as production does.
 
         NOTE: duplicates the construction pattern in
-        ``gw.w_isdf._get_chi_minimax_kernel`` because that factory returns
-        only ``_chi_kernel``, not ``_tau_step`` directly.  If production
-        changes its sharding specs, this must update in lockstep — the
-        validation point (gamma calibration vs runtime) will catch drift.
+        ``gw.w_isdf.minimax_tau_integrate_chi`` because that factory
+        returns only the full compiled scan, not ``_tau_step`` directly.
+        If production changes its sharding specs, this must update in
+        lockstep — the validation point (gamma calibration vs runtime)
+        will catch drift.
         """
         from common.fft_helpers import make_flat_k_ifftn, make_flat_k_fftn
         from gw.greens_function_kernel import build_G as _build_G_mm

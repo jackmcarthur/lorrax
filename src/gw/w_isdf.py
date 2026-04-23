@@ -18,7 +18,7 @@ import numpy as np
 
 from common import Meta, jax_profile
 from .minimax_config import MinimaxConfig
-from .minimax_screening import build_static_minimax_window_pair
+from .minimax_screening import MinimaxNodes, build_static_minimax_window_pair
 
 
 # ============================================================================
@@ -119,34 +119,57 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
         # belongs at the call site, NOT inside build_G_tau.
         return jnp.conj(Gv_k), jnp.conj(Gc_k)
 
+    # MinimaxNodes pytree (t, alpha) — both replicated across devices.
+    _nodes_shard = MinimaxNodes(
+        t=NamedSharding(mesh_xy, _rep1),
+        alpha=NamedSharding(mesh_xy, _rep1),
+    )
+
     @partial(jax.jit,
-             in_shardings=(NamedSharding(mesh_xy, _psi_xn_spec),
+             in_shardings=(_nodes_shard,
+                            NamedSharding(mesh_xy, _psi_xn_spec),
                             NamedSharding(mesh_xy, _psi_yr_spec),
                             NamedSharding(mesh_xy, _psi_yr_spec),
                             NamedSharding(mesh_xy, _psi_xn_spec),
                             NamedSharding(mesh_xy, _rep1),
                             NamedSharding(mesh_xy, _rep1),
-                            NamedSharding(mesh_xy, _rep1),       # tau_arr
-                            NamedSharding(mesh_xy, _rep1),       # prefactor_arr
                             NamedSharding(mesh_xy, _rep0),       # vmax
                             NamedSharding(mesh_xy, _rep0)),      # cmin
              out_shardings=_chi_R_shard,
              static_argnums=())
-    def _chi_scan(psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
-                  enk_v, enk_c, tau_arr, prefactor_arr, vmax, cmin):
-        """Full τ sweep in one jit: lax.scan walks the minimax nodes, builds
-        Gv/Gc per τ, element-wise contracts to chi_R, accumulates, then one
-        final FFT to chi_q.  All collectives and dispatch happen inside a
-        single compiled graph — no Python loop over τ, no per-τ jit call."""
+    def minimax_tau_integrate_chi(
+        nodes, psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
+        enk_v, enk_c, vmax, cmin,
+    ):
+        """Full τ sweep accumulating χ_R, then one R→q FFT.
+
+        Sibling of ``ppm_sigma.minimax_tau_integrate_sigma`` — takes a
+        ``MinimaxNodes`` pytree in the same slot.  For chi0 the nodes
+        arrive with purely-real τ (``time_axis='real'``) and complex α
+        whose Im part is zero; ``alpha`` already includes the chi0
+        prefactor ``-2·α_quad·exp(-τ·E_gap)`` so the scan body only
+        scales the per-τ contraction.
+
+        For each τ node: build Gv, Gc via build_G_tau; FFT both to R;
+        element-wise contract (Σ_{a,b} Gc_R · conj(Gv_R)) into chi_R;
+        accumulate weighted by α; final back-FFT to q.  All collectives
+        and dispatch happen inside one compiled graph — no Python loop.
+        """
         n_rmu = psi_v_xn.shape[2]
         chi_R_zero = jax.lax.with_sharding_constraint(
             jnp.zeros((nk, n_rmu, n_rmu), dtype=jnp.complex128), _chi_R_shard)
 
         def _body(chi_R_acc, xs):
-            tau_scalar, prefactor_scalar = xs
+            t_scalar, alpha_scalar = xs
+            # ``t`` arrives complex (pytree dtype); chi0's Laplace quad
+            # places it with Im=0.  Cast to float64 so _build_Gv_Gc's
+            # float64 tau signature — and build_G_tau's downstream exp —
+            # stay on the exact numerical path that produced the locked
+            # MoS2 3×3 regression hash.
+            tau_real = jnp.real(t_scalar).astype(jnp.float64)
             Gv_k, Gc_k = _build_Gv_Gc(psi_v_xn, psi_v_yr,
                                       psi_c_yr, psi_c_xn,
-                                      enk_v, enk_c, tau_scalar, vmax, cmin)
+                                      enk_v, enk_c, tau_real, vmax, cmin)
             Gv_R = _Gv_fftn(Gv_k)
             Gc_R = _Gc_fftn(Gc_k)
             # chi_R(m, n) = Σ_{a,b} Gc_R(a,m,b,n) · conj(Gv_R(a,m,b,n))
@@ -154,16 +177,19 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
                 jnp.einsum('Rambn,Rambn->Rmn',
                            Gc_R, jnp.conj(Gv_R), optimize=True),
                 _chi_R_shard)
-            return chi_R_acc + prefactor_scalar * chi_tau, None
+            # α is complex; its Im part is zero for the chi0 Laplace
+            # window.  Multiplying complex·complex is identical to
+            # float·complex at the hardware level when Im(α)=0.
+            return chi_R_acc + alpha_scalar * chi_tau, None
 
-        final_R, _ = jax.lax.scan(_body, chi_R_zero, (tau_arr, prefactor_arr))
+        final_R, _ = jax.lax.scan(
+            _body, chi_R_zero, (nodes.t, nodes.alpha))
         return _chi_fftn_local(final_R)
 
-    # Minimax quadrature always delivers ≥1 node, so the old empty-tau
-    # short-circuit wrapper is gone — _chi_scan IS the kernel.  It is a jit
-    # directly, so precompile_chi0 calls ``.lower(*args).compile()`` on it.
-    _chi_minimax_kernel_cache[cache_key] = _chi_scan
-    return _chi_scan
+    # Minimax quadrature always delivers ≥1 node — the compiled scan
+    # handles any n≥1 without a short-circuit wrapper.
+    _chi_minimax_kernel_cache[cache_key] = minimax_tau_integrate_chi
+    return minimax_tau_integrate_chi
 
 
 
@@ -414,16 +440,22 @@ def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
     E_gap = cmin - vmax
 
     tau = np.asarray(quad.tau, dtype=np.float64)
-    prefactor = -2.0 * np.asarray(quad.alpha, dtype=np.float64) * np.exp(-tau * E_gap)
+    # Fold the chi0 prefactor (-2 · exp(-τ·E_gap)) into α so the τ-scan
+    # body can apply a single weighted add per node.  ``MinimaxNodes``
+    # carries both in complex128; τ has Im=0 for the Laplace quad.
+    alpha_chi = -2.0 * np.asarray(quad.alpha, dtype=np.float64) * np.exp(-tau * E_gap)
+    nodes = MinimaxNodes(
+        t=jnp.asarray(tau, dtype=jnp.complex128),
+        alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
+    )
 
     kernel = _get_chi_minimax_kernel(mesh_xy, kgrid)
     return kernel(
+        nodes,
         wfns.xn(s.val), wfns.yr(s.val),
         wfns.yr(s.cond), wfns.xn(s.cond),
         enk_v - jnp.asarray(eref, dtype=enk_v.dtype),
         enk_c - jnp.asarray(eref, dtype=enk_c.dtype),
-        jnp.asarray(tau, dtype=jnp.float64),
-        jnp.asarray(prefactor, dtype=jnp.float64),
         jnp.asarray(vmax, dtype=jnp.float64),
         jnp.asarray(cmin, dtype=jnp.float64),
     )
@@ -450,16 +482,19 @@ def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
     tau = np.asarray(quad.tau, dtype=np.float64)
     if len(tau) == 0:
         return  # compute_chi0 falls through to a static-zeros path — nothing to compile
-    prefactor = -2.0 * np.asarray(quad.alpha, dtype=np.float64) * np.exp(-tau * E_gap)
+    alpha_chi = -2.0 * np.asarray(quad.alpha, dtype=np.float64) * np.exp(-tau * E_gap)
+    nodes = MinimaxNodes(
+        t=jnp.asarray(tau, dtype=jnp.complex128),
+        alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
+    )
 
     kernel = _get_chi_minimax_kernel(mesh_xy, kgrid)
     kernel.lower(
+        nodes,
         wfns.xn(s.val), wfns.yr(s.val),
         wfns.yr(s.cond), wfns.xn(s.cond),
         enk_v - jnp.asarray(eref, dtype=enk_v.dtype),
         enk_c - jnp.asarray(eref, dtype=enk_c.dtype),
-        jnp.asarray(tau, dtype=jnp.float64),
-        jnp.asarray(prefactor, dtype=jnp.float64),
         jnp.asarray(vmax, dtype=jnp.float64),
         jnp.asarray(cmin, dtype=jnp.float64),
     ).compile()
