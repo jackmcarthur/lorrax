@@ -218,7 +218,6 @@ def _materialize_window_mask_B(
 
 _sigma_tau_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
 _sigma_kij_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
-_sigma_tau_scan_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -538,73 +537,6 @@ def _get_sigma_tau_kernel(
     return _tau_kernel
 
 
-def _get_sigma_tau_scan_kernel(
-    *,
-    mesh_xy: Mesh,
-    nkx: int,
-    nky: int,
-    nkz: int,
-    nk_tot: int,
-    bispinor: bool,
-) -> Callable[..., jax.Array]:
-    """Cached factory: runs an entire window's τ nodes in one jax.lax.scan.
-
-    Replaces N_τ Python-level dispatches + NCCL fences with one compiled
-    fori-loop on the device.  Reduces host-side overhead and lets XLA
-    schedule across τ iterations (overlap comm with next step's FFTs).
-
-    Specializes on the window's τ count via the trailing shape of t_nodes
-    / alpha_nodes — windows with different n_τ (9, 13, 103, 125 at MoS2
-    scale) retrace this kernel separately.  That's ~4 compiles per mesh,
-    amortized over hundreds of τ nodes each.  If retraces become costly,
-    pad all windows to max(n_τ) and mask in the scan body.
-    """
-    cache_key = (id(mesh_xy), nkx, nky, nkz, nk_tot, bispinor)
-    if cache_key in _sigma_tau_scan_cache:
-        return _sigma_tau_scan_cache[cache_key]
-
-    tau_kernel = _get_sigma_tau_kernel(
-        mesh_xy=mesh_xy, nkx=nkx, nky=nky, nkz=nkz,
-        nk_tot=nk_tot, bispinor=bispinor,
-    )
-
-    @jax.jit
-    def _scan_window(
-        acc_win,
-        # per-τ (stacked on leading axis):
-        t_nodes, alpha_nodes,
-        # window constants:
-        psi_coh_rmuT_X, psi_coh_rmu_Y, psi_proj_rmu_X, psi_proj_rmuT_Y,
-        E_A, mask_A, B_q, Omega_q, mask_B,
-        E_ref_A, E_ref_B, eye_nb,
-        omega_vec, pref, omega_sign, project_code,
-    ):
-        E_ref_sum = E_ref_A + E_ref_B
-
-        def body(acc, xs):
-            t_node, alpha_node = xs
-            sigma_re, sigma_im = tau_kernel(
-                psi_coh_rmuT_X, psi_coh_rmu_Y,
-                psi_proj_rmu_X, psi_proj_rmuT_Y,
-                E_A, mask_A, B_q, Omega_q, mask_B,
-                E_ref_A, E_ref_B, t_node, eye_nb,
-            )
-            # α_eff = α(τ) · exp[-i·(E_ref_A + E_ref_B)·τ]  — minimax quad
-            # weight with the phase shift absorbed into each τ node.
-            alpha_eff = alpha_node * jnp.exp(-1j * E_ref_sum * t_node)
-            acc = acc + _project_tau_onto_omega(
-                sigma_re, sigma_im, omega_vec,
-                t_node, alpha_eff, omega_sign, pref, project_code,
-            )
-            return acc, None
-
-        final_acc, _ = jax.lax.scan(
-            body, acc_win, (t_nodes, alpha_nodes))
-        return final_acc
-
-    _sigma_tau_scan_cache[cache_key] = _scan_window
-    return _scan_window
-
 
 # ---------------------------------------------------------------------------
 #  PPM construction
@@ -847,15 +779,17 @@ class _ReduceScatterGpuAccumulator(_SigmaAccumulator):
     is the whole scaling argument for shipping this layout end-to-end.
 
     Follow-up work (not yet wired; see _CollectiveFlushSlabIoAccumulator
-    stub for the I/O leg and the lax.scan scaffolding in
-    _get_sigma_tau_scan_kernel for τ batching):
+    stub for the I/O leg):
 
         (a) m-chunking at add_tau so σ^τ arrives one m-strip at a time
             rather than one full (m_full, n_Y/p) shard — default chunk = 1
             tile, = m/p.  Needed when (m, n, k, ω) per-rank stops fitting.
-        (b) τ batching via lax.scan over a stacked τ axis — reduces Python
-            dispatch overhead, currently a regression at small n_τ but wins
-            once the kernel's per-call cost exceeds compile amortization.
+        (b) τ batching via lax.scan over a stacked τ axis — a dormant
+            scan factory existed here previously; deleted because it
+            regressed sigma_ppm by ~80% at MoS2 3×3 scale (multiple n_τ
+            compiles, no amortization, lost async-dispatch overlap).
+            Re-add when per-τ Python dispatch cost exceeds those costs
+            (larger mesh / larger n_rmu).
         (c) Collective-flush SlabIO variant (see _StreamedH5Accumulator
             docstring) — stages many τ on GPU and issues one parallel-HDF5
             write at window close.
@@ -897,19 +831,6 @@ class _ReduceScatterGpuAccumulator(_SigmaAccumulator):
 
     def finalize(self) -> jax.Array:
         return self.total
-
-    # Fast path: if the caller has a lax.scan'd window kernel, let it own
-    # the whole per-window τ loop (one jit dispatch per window instead of
-    # N_τ).  Caller supplies the compiled fn + inputs; we hand back an
-    # updated running total.  The per-τ add_tau still works as the fallback
-    # for accumulators without this method (e.g. _StreamedH5Accumulator).
-    def run_window_scan(self, scan_fn, *, t_nodes, alpha_nodes, window_args):
-        init = jax.device_put(
-            jnp.zeros_like(self.total), self._sharding)
-        win_acc = scan_fn(init, t_nodes, alpha_nodes, **window_args)
-        win_acc = jax.lax.with_sharding_constraint(win_acc, self._sharding)
-        self.total = jax.lax.with_sharding_constraint(
-            self.total + win_acc, self._sharding)
 
 
 class _StreamedH5Accumulator(_SigmaAccumulator):
@@ -1060,50 +981,16 @@ def _integrate_tau_windows_for_branch(
     psi_proj_rmuT_Y: jax.Array,
     eye_nb: jax.Array,
     tau_kernel: Callable[..., jax.Array],
-    tau_scan_kernel: Callable[..., jax.Array] | None,
     mesh_xy: Mesh,
     scale: float,
     log_tag: str,
     print_fn,
 ) -> None:
-    """Walk windows; for each, either lax.scan the τ nodes in one device-side
-    pass (fast path — accumulator supplies ``run_window_scan``) or fall back
-    to the Python per-τ loop calling ``add_tau`` one at a time (for streamed
-    writers that need each τ projection flushed to disk).
-
-    Whether the result lands on GPU or disk is the accumulator's concern,
-    not this loop's — see _ReduceScatterGpuAccumulator / _StreamedH5Accumulator.
-
-    Future τ-batching hook (NOT yet wired — left for the shard_map refactor):
-
-        The per-τ python loop below serializes on a block_until_ready after
-        each tau_kernel call, so XLA cannot fuse across τ.  With the
-        reduce-scatter upstream in place, tau_kernel's output becomes
-        small enough that we can:
-
-            t_nodes_j = jnp.asarray(win.t_nodes, dtype=jnp.complex128)   # (n_τ,)
-            alphas_j  = jnp.asarray(win.alpha,   dtype=jnp.float64)      # (n_τ,)
-
-            @jax.jit
-            def _scan_body(acc, tau_ctx):
-                t_j, a_j = tau_ctx
-                sigma_re, sigma_im = tau_kernel(..., t_j, ...)
-                acc = acc + _project_tau_onto_omega(
-                    sigma_re, sigma_im, ω_vec, t_j, a_j, ...)
-                return acc, None
-
-            win_acc, _ = jax.lax.scan(_scan_body, zeros, (t_nodes_j, alphas_j))
-
-        That collapses N_τ jit dispatches into 1 compile, one NCCL fence per
-        window instead of per τ, and lets XLA schedule the D2H overlap of
-        subsequent windows.  Only safe once σ^τ is shard-scatter'd — today a
-        scan over replicated σ^τ would blow up HBM because all τ contribs
-        would coexist during the scan trace.
-
-    m-chunking hook for the accumulator (also NOT wired): add_tau's
-    ``omega_global_idx`` slot is currently unused by _ReduceScatterGpuAccumulator
-    but is a natural place to pass an m-chunk selector; default (None) is
-    one m-strip per x-rank (= m/p).  Wire when upstream RS lands.
+    """Walk windows; for each, run the Python per-τ loop calling ``add_tau``
+    one τ at a time.  The result lands either on-GPU (reduce-scatter
+    accumulator) or streamed to H5 — that decision is the accumulator's,
+    not this loop's.  See _ReduceScatterGpuAccumulator /
+    _StreamedH5Accumulator.
     """
     from common.progress import LoopProgress
 
@@ -1112,8 +999,6 @@ def _integrate_tau_windows_for_branch(
     progress = LoopProgress(
         total_tau_nodes, print_fn, title=f"sigma[{branch_label}]",
         item_name="tau node", max_updates=10)
-
-    use_scan_path = tau_scan_kernel is not None and hasattr(accumulator, "run_window_scan")
 
     with jax_profile.annotation(f"sigma_branch[{branch_label}]"):
         for win_idx, win in enumerate(windows):
@@ -1134,34 +1019,6 @@ def _integrate_tau_windows_for_branch(
                     {"full": 0, "imag": 1}[win.project], dtype=jnp.int32)
                 omega_sign_j = jnp.asarray(float(win.omega_sign), dtype=jnp.float64)
                 pref_j = jnp.asarray(win.prefactor * scale, dtype=jnp.float64)
-
-                if use_scan_path:
-                    # Fast path: one jit dispatch per window instead of N_τ.
-                    t_nodes_j = jnp.asarray(win.t_nodes, dtype=jnp.complex128)
-                    alpha_nodes_j = jnp.asarray(win.alpha, dtype=jnp.complex128)
-                    accumulator.run_window_scan(
-                        tau_scan_kernel,
-                        t_nodes=t_nodes_j,
-                        alpha_nodes=alpha_nodes_j,
-                        window_args=dict(
-                            psi_coh_rmuT_X=psi_coh_rmuT_X,
-                            psi_coh_rmu_Y=psi_coh_rmu_Y,
-                            psi_proj_rmu_X=psi_proj_rmu_X,
-                            psi_proj_rmuT_Y=psi_proj_rmuT_Y,
-                            E_A=E_A, mask_A=mask_A,
-                            B_q=B_q, Omega_q=Omega_q, mask_B=mask_B,
-                            E_ref_A=E_ref_A_j, E_ref_B=E_ref_B_j,
-                            eye_nb=eye_nb,
-                            omega_vec=omega_vec, pref=pref_j,
-                            omega_sign=omega_sign_j,
-                            project_code=project_code_j,
-                        ),
-                    )
-                    # Advance progress bar by the whole window (the scan is
-                    # atomic from the Python side).
-                    for _ in range(int(win.alpha.shape[0])):
-                        progress.step()
-                    continue
 
                 accumulator.begin_window()
                 for t_node, alpha_node in zip(win.t_nodes, win.alpha):
@@ -1269,26 +1126,8 @@ def _run_sigma_branch(
         nkx=int(meta.nkx), nky=int(meta.nky), nkz=int(meta.nkz),
         nk_tot=int(meta.nk_tot), bispinor=bool(meta.bispinor),
     )
-    # lax.scan variant is available (see _get_sigma_tau_scan_kernel) but
-    # NOT wired by default.  At MoS2 3×3 scale (276 τ, 5 s Python-loop
-    # baseline) it actually regresses sigma_ppm by ~80% because:
-    #   (a) each distinct n_τ compiles a separate scan module (9, 13, 103,
-    #       125 in this run → 4 compiles);
-    #   (b) XLA inlines tau_kernel into the scan module, producing
-    #       a single big module whose static schedule can't overlap
-    #       collectives the way Python's async-dispatch-with-block-until
-    #       pattern does;
-    #   (c) compile cost isn't amortized by persistent cache within a run.
-    # The scan path becomes the right choice once (a) individual τ dispatches
-    # get expensive (larger mesh, bigger n_rmu) or (b) we pad all windows
-    # to a single n_τ and reuse one compile.  Flip to:
-    #     tau_scan_kernel = _get_sigma_tau_scan_kernel(mesh_xy, ...)
-    # to enable, accumulator's run_window_scan will pick it up.
-    tau_scan_kernel = None
 
     if stream_writer is None:
-        # Reduce-scatter-shaped accumulator with run_window_scan → tau_scan_kernel
-        # owns the per-window τ loop; one jit dispatch per window instead of N_τ.
         accumulator: _SigmaAccumulator = _ReduceScatterGpuAccumulator(
             shape=(n_omega, nk_proj, nb_proj, nb_proj),
             mesh_xy=mesh_xy,
@@ -1306,7 +1145,6 @@ def _run_sigma_branch(
         psi_coh_rmuT_X=psi_coh_rmuT_X, psi_coh_rmu_Y=psi_coh_rmu_Y,
         psi_proj_rmu_X=psi_proj_rmu_X, psi_proj_rmuT_Y=psi_proj_rmuT_Y,
         eye_nb=eye_nb, tau_kernel=tau_kernel,
-        tau_scan_kernel=tau_scan_kernel,
         mesh_xy=mesh_xy,
         scale=scale,
         log_tag=log_tag, print_fn=print_fn,
