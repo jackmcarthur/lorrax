@@ -44,40 +44,6 @@ from .load_wfns import (
 )
 
 
-def load_gspace_for_bands(
-    wfn, sym, meta, mesh_xy, band_range, bispinor,
-    band_chunk_size: int = 16,
-    band_chunk_ranges: list[tuple[int, int]] | None = None,
-) -> list[tuple[jax.Array, tuple[int, int]]]:
-    """Load G-space wavefunctions for all band chunks ONCE.
-
-    Caches the expensive HDF5 read + scatter so it can be reused across
-    multiple r-chunk iterations.  Returns a list of ``(psi_Gtot,
-    band_range)`` tuples, one per band chunk.
-
-    Pass ``band_chunk_ranges`` when the downstream streaming
-    pair-density loop uses custom chunk boundaries (e.g. respecting
-    left/right pair-density endpoints) — the cache keys must match
-    the yielded ``bc_range`` sequence exactly.  When None, contiguous
-    chunks of ``band_chunk_size`` are built from ``band_range``.
-    """
-    if band_chunk_ranges is None:
-        b_start, b_end = band_range
-        nb_total = b_end - b_start
-        num_band_chunks = (nb_total + band_chunk_size - 1) // band_chunk_size
-        band_chunk_ranges = [
-            (b_start + i * band_chunk_size,
-             min(b_start + (i + 1) * band_chunk_size, b_end))
-            for i in range(num_band_chunks)
-        ]
-    cached_gspace = []
-    for bc_range in band_chunk_ranges:
-        global_psi_Gtot, _ = read_Gvecs_to_devices(
-            wfn, sym, bc_range, meta, bispinor, mesh_xy)
-        cached_gspace.append((global_psi_Gtot, tuple(bc_range)))
-    return cached_gspace
-
-
 # ============================================================================
 # Pair density computation: P_k,ab(r_mu, r_nu) = sum_n psi*_nk,a(r_mu) * psi_nk,b(r_nu)
 # ============================================================================
@@ -648,20 +614,26 @@ def _make_fit_one_rchunk_kernel(
     actual_n_rchunk: int,
     q_chunk_size: int,
     kvecs_frac,
+    psi_G_store,
 ):
     """Factory: returns a ``jax.jit``'d fit_one_rchunk callable closing
-    over every piece of static structure.  The cache is keyed below.
+    over every piece of static structure + a :class:`PsiGStore` that
+    supplies per-bc ψ(G) slices from host memory.
 
     Returned function signature::
 
         zeta_chunk = kernel(
-            psi_bc_G_tuple,        # tuple of arrays, one per band-chunk
             psi_l_rmuT_X_fit,
             psi_r_rmuT_X_fit,
             L_q,
             norms_l, norms_r,      # jax arrays; jnp.ones when no band_norms
             r_start_dyn,           # scalar int32
         )
+
+    ψ(G) is NOT a jit argument.  The bc-loop fetches each chunk from
+    the host-resident store via ``io_callback`` — only the currently
+    active bc lives on device.  See :mod:`common.psi_G_store` for
+    lifecycle + layout details.
 
     The inner body fully composes the load-phase FFT + reshard, the
     band-chunk pair-density streaming loop (Python-unrolled at trace),
@@ -712,7 +684,6 @@ def _make_fit_one_rchunk_kernel(
 
     @jax.jit
     def _kernel(
-        psi_bc_G_tuple,
         psi_l_rmuT_X_fit,
         psi_r_rmuT_X_fit,
         L_q,
@@ -757,13 +728,14 @@ def _make_fit_one_rchunk_kernel(
             return accumulate_pair_density_spin_traced(
                 P_acc, psi_L_bc, psi_R_bc, mesh_xy)
 
-        # --- 2. Stream band-chunks: FFT + reshard + L/R contributions ---
+        # --- 2. Stream band-chunks: fetch ψ(G) per-bc from host via
+        #       io_callback, FFT + reshard, accumulate pair density.
+        #       Each bc's ψ(G) is live only during its own iteration.
         for bc_idx, (bc_range, l_cls, r_cls) in enumerate(bc_classify):
             bc_size = bc_range[1] - bc_range[0]
-            # FFT + reshard (both jit'd upstream; inlined here at trace).
-            # r_start_dyn is a tracer scalar, r_chunk_size is static.
+            psi_bc_G = psi_G_store.fetch_psi_G(bc_range)
             psi_bc_Y = get_sharded_wfns_rchunk_slice(
-                psi_bc_G_tuple[bc_idx], meta, r_start_dyn, actual_n_rchunk,
+                psi_bc_G, meta, r_start_dyn, actual_n_rchunk,
                 kvecs_frac, mesh_xy, bc_range)
             P_l = _accumulate(P_l, l_cls, psi_l_rmuT_X_fit,
                               norms_l, psi_bc_Y, bc_size)
@@ -782,7 +754,7 @@ def _make_fit_one_rchunk_kernel(
 
 def fit_one_rchunk(
     *,
-    psi_bc_G_tuple,
+    psi_G_store,
     psi_l_rmuT_X_fit,
     psi_r_rmuT_X_fit,
     L_q,
@@ -800,7 +772,13 @@ def fit_one_rchunk(
     kvecs_frac: np.ndarray,
 ):
     """Entry point for the r-chunk body jit.  Caches one compiled kernel
-    per distinct static configuration."""
+    per distinct static configuration.
+
+    ``psi_G_store`` is captured in the jit closure (not a jit arg) so
+    the compiled kernel calls its ``fetch_psi_G`` method via io_callback
+    inside the bc-loop.  The cache key includes ``id(psi_G_store)`` to
+    avoid reusing a compile built against a different store.
+    """
     cache_key = (
         id(mesh_xy),
         actual_n_rchunk,
@@ -811,6 +789,7 @@ def fit_one_rchunk(
         meta.n_rmu, meta.nk_tot, meta.nspinor,
         tuple(meta.fft_grid),
         hash(kvecs_frac.tobytes()),
+        id(psi_G_store),
     )
     fn = _fit_one_rchunk_cache.get(cache_key)
     if fn is None:
@@ -823,10 +802,10 @@ def fit_one_rchunk(
             actual_n_rchunk,
             q_chunk_size,
             kvecs_frac,
+            psi_G_store,
         )
         _fit_one_rchunk_cache[cache_key] = fn
     return fn(
-        psi_bc_G_tuple,
         psi_l_rmuT_X_fit,
         psi_r_rmuT_X_fit,
         L_q,
@@ -853,54 +832,12 @@ def _band_norms_slice(
     return jnp.maximum(jnp.asarray(band_norms[lo:hi], dtype=jnp.float64), 1.0)
 
 
-def _setup_gspace_source(
-    *,
-    wfn, sym, meta: Meta, mesh_xy: Mesh,
-    band_range_full: tuple[int, int],
-    bispinor: bool,
-    band_chunk_ranges: list[tuple[int, int]],
-    use_phdf5_gspace: bool,
-):
-    """Return a zero-arg callable that produces ``psi_bc_G_tuple`` for
-    one r-chunk iteration.
-
-    Encapsulates the two gspace strategies so the r-chunk loop doesn't
-    branch per-iter:
-      * phdf5 on-demand — calls ``PhdfWfnReader.coeffs_gspace`` fresh
-        per band-chunk every call.  Zero persistent GPU residency
-        between r-chunks.
-      * device cache — pre-loads ``(psi_G, bc)`` tuples onto GPU once
-        and returns them via a name-keyed lookup.
-    """
-    if use_phdf5_gspace:
-        from common.load_wfns import _get_phdf5_reader
-        wfn_path = getattr(wfn, "_filename", None)
-        if wfn_path is None:
-            raise ValueError(
-                "use_phdf5_gspace=True but wfn._filename is unset")
-        reader = _get_phdf5_reader(wfn_path, mesh_xy)
-        bc_tuples = tuple(tuple(bc) for bc in band_chunk_ranges)
-        print(f"  G-space: phdf5 on-demand (no device cache)")
-        def _phdf5_factory():
-            return tuple(reader.coeffs_gspace(bc) for bc in bc_tuples)
-        return _phdf5_factory
-
-    with timing.section("zeta_fit.cache_gspace"):
-        print(f"  Caching G-space wavefunctions for r-chunk loop")
-        cached = load_gspace_for_bands(
-            wfn, sym, meta, mesh_xy, band_range_full, bispinor,
-            band_chunk_ranges=band_chunk_ranges,
-        )
-    _bfs, _bfe = band_range_full
-    bc_size = band_chunk_ranges[0][1] - band_chunk_ranges[0][0]
-    print(f"  G-space cache: {len(cached)} band chunks "
-          f"(chunk_size={bc_size}, remainder="
-          f"{(_bfe - _bfs) % bc_size or bc_size})")
-    by_range = {tuple(bc): g for (g, bc) in cached}
-    bc_tuples = tuple(tuple(bc) for bc in band_chunk_ranges)
-    def _cache_factory():
-        return tuple(by_range[bc] for bc in bc_tuples)
-    return _cache_factory
+# ψ(G) no longer enters the jit as a tuple of arguments.  It lives on
+# host, sharded n_XY over bands in per-rank tiles — each rank owns one
+# contiguous ``(nk, nb/P, ns, nx, ny, nz)`` numpy array — and the
+# kernel body slices per-bc (and optionally per-k) subsets via
+# :func:`common.psi_G_store.PsiGStore.fetch_psi_G`.  See that module
+# for the two lifecycle modes (host_cache vs file_reread).
 
 
 def fit_zeta_chunked_to_h5(
@@ -916,14 +853,13 @@ def fit_zeta_chunked_to_h5(
     band_chunk_size: int = 16,
     q_chunk_size: int = 1,
     bispinor: bool = True,
-    use_gspace_cache: bool = True,
     band_range_left: tuple[int, int] | None = None,
     band_range_right: tuple[int, int] | None = None,
     k_chunk_size: int = 0,
     q_gather_size: int = 0,
     band_norms: np.ndarray | None = None,
     use_ffi_io: bool = False,
-    use_phdf5_gspace: bool = False,
+    gspace_mode: str = "host_cache",
 ):
     """
     Full zeta fitting pipeline with r-chunk loop and HDF5 output.
@@ -957,7 +893,12 @@ def fit_zeta_chunked_to_h5(
         band_chunk_size: Bands to process at once when FFTing wavefunctions (with global r)
         q_chunk_size: Q-points to solve C_q @ zeta_q = Z_q simultaneously
         bispinor: Whether to use bispinor wavefunctions
-        use_gspace_cache: If True, cache G-space across r-chunks
+        gspace_mode: ``"host_cache"`` (default) loads all ψ(G) band-chunks
+                     into host RAM once at startup and pulls per-bc shards
+                     into the jit via io_callback.  ``"file_reread"`` drops
+                     the host cache between r-chunks and re-reads via
+                     phdf5 collective I/O.  In both modes the jit never
+                     holds more than one bc's ψ(G) on device.
         band_range_left: (start, end) for left wfns. Default: (b0, b3)
         band_range_right: (start, end) for right wfns. Default: (b0, b4)
 
@@ -1122,12 +1063,15 @@ def fit_zeta_chunked_to_h5(
     kgrid_arr = np.array(meta.kgrid)
     kvecs_frac = sym.kvecs_asints / kgrid_arr[None, :]
 
-    # Env-var override: forces the slow path (re-read WFN.h5 + re-FFT per
-    # r-chunk) even when memory would allow caching.  Useful for probing
-    # the scaling regime where wavefunctions don't fit in host memory
-    # (multi-TB WFN.h5).  LORRAX_DISABLE_GSPACE_CACHE=1 to enable.
-    if os.environ.get("LORRAX_DISABLE_GSPACE_CACHE") == "1":
-        use_gspace_cache = False
+    # Env-var override: forces the slow path (re-read WFN.h5 per
+    # r-chunk) even when memory would allow host caching.  Useful for
+    # probing the scaling regime where wavefunctions don't fit in host
+    # memory (multi-TB WFN.h5).  LORRAX_GSPACE_MODE=file_reread to
+    # override the caller's default.
+    _gspace_mode_override = os.environ.get("LORRAX_GSPACE_MODE")
+    if _gspace_mode_override:
+        gspace_mode = _gspace_mode_override
+
     # Uniform band chunks over [b_full_start, b_full_end]: N-1 of
     # size ``band_chunk_size`` plus one remainder chunk.  This gives
     # the read/FFT pipeline and the pair-density einsum exactly
@@ -1143,25 +1087,14 @@ def fit_zeta_chunked_to_h5(
         for i in range((_bfe - _bfs + band_chunk_size - 1) // band_chunk_size)
     ]
 
-    # G-space source — pick exactly one, fail fast if neither is set.
-    # The choice drives how ``psi_bc_G_tuple`` is built per r-chunk (see
-    # the closure below).
-    #
-    #   ``use_phdf5_gspace``  → PhdfWfnReader.coeffs_gspace() per r-chunk
-    #                            per band chunk, freshly allocated and
-    #                            ``del``'d after the jit returns.  No
-    #                            between-rchunk GPU residency.
-    #   ``use_gspace_cache``  → device-resident nbc tuple pre-loaded once
-    #                            and kept alive for the whole fit.
-    if not (use_phdf5_gspace or use_gspace_cache):
-        raise ValueError(
-            "fit_zeta_chunked_to_h5 requires one of "
-            "use_phdf5_gspace / use_gspace_cache to be True.")
-    get_psi_bc_G_tuple = _setup_gspace_source(
-        wfn=wfn, sym=sym, meta=meta, mesh_xy=mesh_xy,
-        band_range_full=band_range_full, bispinor=bispinor,
+    # Build the host-resident ψ(G) store.  Both modes keep zero
+    # persistent device residency — the jit fetches one bc at a time
+    # via io_callback.  See :mod:`common.psi_G_store` for details.
+    from common.psi_G_store import build_psi_G_store
+    psi_G_store = build_psi_G_store(
+        wfn=wfn, mesh_xy=mesh_xy, meta=meta,
         band_chunk_ranges=band_chunk_ranges,
-        use_phdf5_gspace=use_phdf5_gspace,
+        mode=gspace_mode,
     )
 
     # ========== STEP 6: Loop over chunks ==========
@@ -1251,38 +1184,38 @@ def fit_zeta_chunked_to_h5(
             r_end = min(r_start + chunk_r, n_rtot)
             actual_n_rchunk = r_end - r_start
 
-            # One tuple entry per band-chunk — fit_one_rchunk's jit
-            # consumes them as positional inputs.
-            psi_bc_G_tuple = get_psi_bc_G_tuple()
+            # file_reread mode: (re)build the host-side ψ(G) tiles
+            # for this r-chunk.  host_cache mode: no-op.
+            psi_G_store.begin_rchunk(r_start, r_end)
 
             t0 = time.perf_counter()
-            with timing.section("zeta_fit.chunk.fit_one_rchunk"), \
-                 jax_profile.step_annotation("chunk_fit", step_num=chunk_idx):
-                zeta_chunk = fit_one_rchunk(
-                    psi_bc_G_tuple=psi_bc_G_tuple,
-                    psi_l_rmuT_X_fit=psi_l_rmuT_X_fit,
-                    psi_r_rmuT_X_fit=psi_r_rmuT_X_fit,
-                    L_q=L_q,
-                    norms_l=norms_l_jax,
-                    norms_r=norms_r_jax,
-                    r_start_dyn=jnp.asarray(r_start, dtype=jnp.int32),
-                    mesh_xy=mesh_xy,
-                    meta=meta,
-                    band_chunk_ranges=band_chunk_ranges,
-                    band_range_left=band_range_left,
-                    band_range_right=band_range_right,
-                    band_range_full=band_range_full,
-                    actual_n_rchunk=actual_n_rchunk,
-                    q_chunk_size=q_chunk_size,
-                    kvecs_frac=kvecs_frac,
-                )
-                zeta_chunk.block_until_ready()
-            # Under phdf5-on-demand, drop the per-r-chunk G-space tuple
-            # so nothing accumulates between iterations.  Under the
-            # device-cache path this is a no-op (tuple entries alias
-            # the persistent cache list) but ``del`` on the local name
-            # is still cheap and clear.
-            del psi_bc_G_tuple
+            try:
+                with timing.section("zeta_fit.chunk.fit_one_rchunk"), \
+                     jax_profile.step_annotation("chunk_fit", step_num=chunk_idx):
+                    zeta_chunk = fit_one_rchunk(
+                        psi_G_store=psi_G_store,
+                        psi_l_rmuT_X_fit=psi_l_rmuT_X_fit,
+                        psi_r_rmuT_X_fit=psi_r_rmuT_X_fit,
+                        L_q=L_q,
+                        norms_l=norms_l_jax,
+                        norms_r=norms_r_jax,
+                        r_start_dyn=jnp.asarray(r_start, dtype=jnp.int32),
+                        mesh_xy=mesh_xy,
+                        meta=meta,
+                        band_chunk_ranges=band_chunk_ranges,
+                        band_range_left=band_range_left,
+                        band_range_right=band_range_right,
+                        band_range_full=band_range_full,
+                        actual_n_rchunk=actual_n_rchunk,
+                        q_chunk_size=q_chunk_size,
+                        kvecs_frac=kvecs_frac,
+                    )
+                    zeta_chunk.block_until_ready()
+            finally:
+                # MUST run after block_until_ready — under file_reread
+                # the host tiles are freed here and any still-pending
+                # io_callback would use-after-free.
+                psi_G_store.end_rchunk()
             t_fit_total += time.perf_counter() - t0
 
             # 6e. Q-chunked allgather → host copy → async HDF5 write.
@@ -1377,11 +1310,10 @@ def fit_zeta_chunked_to_h5(
     with timing.section("zeta_fit.sync_global"):
         jax.experimental.multihost_utils.sync_global_devices("zeta_writes_complete")
 
-    # Free the G-space source now that the chunk loop is done.  For the
-    # device-cache path this drops the nbc tuple references; for phdf5
-    # on-demand this drops the factory closure (reader stays cached at
-    # module level for later calls).
-    del get_psi_bc_G_tuple
+    # Free the host tiles (host_cache mode only; file_reread's tiles
+    # are already empty after the final end_rchunk).  The phdf5 reader
+    # itself is cached at module level and survives.
+    psi_G_store.close()
 
     # Per-stage timing breakdown.  ``fit`` is the fused fit_one_rchunk jit;
     # ``H5`` is the allgather+write (or FFI write_slab).  Everything else

@@ -34,7 +34,7 @@ def compute_optimal_chunks(
 
         stage_cost(cr) = base + αᵢ·cr + cᵢ
 
-    where base = centroids + L_q + optional G-space cache (persistent arrays),
+    where base = centroids + L_q (persistent; ψ(G) now host-only, per-bc via io_callback),
     αᵢ is the per-cr byte coefficient, and cᵢ is the cr-independent overhead.
     The optimal cr is min over stages of (headroom − cᵢ) / αᵢ — one division
     per stage, no iterative search.
@@ -107,8 +107,10 @@ def compute_optimal_chunks(
         raise ValueError(f"C_q build requires {stage_cct/1e9:.2f} GB/device — exceeds budget.")
     m_L_q = _mem(nq, mu, mu, shard=p_x * p_y)  # L_q persists; same size as C_q
 
-    # ---- G-space cache: stores ψ(G) for all bands to avoid re-reading H5 per chunk ----
-    m_gspace_cache = _mem(nk, nb, ns, nr, shard=p)
+    # ψ(G) now lives on the HOST (per-rank band-sharded) and is pulled
+    # into the jit one bc at a time via io_callback.  No persistent
+    # device residency — only the currently active bc is on device
+    # (captured in the fft stage as α_psi_bc below).
 
     # ======================================================================
     # Per-cr cost coefficients α (bytes per unit chunk_r on one device).
@@ -117,6 +119,11 @@ def compute_optimal_chunks(
     # ======================================================================
     α_psi     = _mem(nk, nb, ns, shard=p_y)        # ψ(r_chunk) output accumulator
     α_pair    = _mem(nk, mu, shard=p_x * p_y)  # one pair density P(nk, μ, cr)
+    # One bc's ψ(G) slab transits through device memory during its FFT
+    # (io_callback pull → FFT → r-slice).  ``band_chunk / P`` bands
+    # per device, shape (nk, bpd, ns, nx, ny, nz).  Held alive for the
+    # duration of one bc's accumulate; freed at the next bc's pull.
+    m_psi_bc = _mem(nk, band_chunk, ns, nr, shard=p)
     α_zcol    = _mem(nq, mu, shard=p)               # Z_col column slice
     α_z_slice = _mem(mu, shard=p)                   # per-q Z_slice or Z_transpose
     α_gather  = _mem(mu, shard=p) + 2 * _mem(mu)    # sharded input + replicated output + NCCL
@@ -144,7 +151,7 @@ def compute_optimal_chunks(
     def _max_cr(headroom, fft_cost_per_k):
         """Invert each stage's linear cost to get max feasible cr per stage."""
         limits = {
-            'fft':     (headroom - fft_cost_per_k) / α_psi if α_psi > 0 else nr,
+            'fft':     (headroom - fft_cost_per_k - m_psi_bc) / α_psi if α_psi > 0 else nr,
             'pair':    headroom / (α_psi + 2 * α_pair) if (α_psi + 2 * α_pair) > 0 else nr,
             'zct':     headroom / (zct_coef * α_pair) if α_pair > 0 else nr,
             'reshard': headroom / (4 * α_zcol) if α_zcol > 0 else nr,
@@ -168,7 +175,7 @@ def compute_optimal_chunks(
         m_solve_per_q = 2 * α_z_slice * cr + c_solve
         m_gather_per_q = α_gather * cr
         stages = {
-            'fft':     base + α_psi * cr + fft_inloop,
+            'fft':     base + α_psi * cr + fft_inloop + m_psi_bc,
             'pair':    base + (α_psi + 2 * α_pair) * cr,
             'zct':     base + zct_coef * α_pair * cr,
             'reshard': base + 4 * m_zcol,
@@ -185,17 +192,15 @@ def compute_optimal_chunks(
     def _find_r_chunk(use_cache, fft_inloop, override=None):
         """Compute optimal cr from direct formula, round down to p-divisible.
 
-        ``use_cache`` controls the I/O path (pre-load ζ(G) once vs re-read
-        per r-chunk), NOT the memory footprint — the fit_one_rchunk jit
-        takes the full psi_bc_G tuple either way, so m_gspace_cache is
-        always resident at the call site.  Always include it in base.
-        Empirical confirmation: AOT memory_analysis() on Si 10³ reports
-        arg ≈ 4.7 GB = centroids + L_q + G-space cache, regardless of
-        how the chooser labels use_cache.  Dropping the cache term from
-        base at tight budgets was a 3-5 GB under-prediction that let
-        the chooser pick cr values that OOM'd at runtime.
+        Persistent device residency at the fit_one_rchunk call site:
+        centroids (L + R copies on X, Y shards) + L_q (sharded).  The
+        ψ(G) cache is host-only now and pulled per-bc via io_callback,
+        so it doesn't enter ``base``.  ``use_cache`` is retained for
+        callsite symmetry but no longer affects memory sizing (left for
+        the caller to decide ``gspace_mode``).
         """
-        base = m_centroids + m_L_q + m_gspace_cache
+        del use_cache  # no longer drives memory sizing
+        base = m_centroids + m_L_q
         headroom = m_budget - base
         if headroom <= c_solve:
             return None
@@ -214,7 +219,7 @@ def compute_optimal_chunks(
             'bottleneck': max(stages, key=stages.get), 'stages': stages,
             'base': base, 'zcol': m_zcol, 'solve_per_q': m_spq,
             'gather_per_q': m_gpq, 'k_batch': k_batch,
-            'cache_bytes': m_gspace_cache if use_cache else 0.0,
+            'cache_bytes': 0.0,  # host-only now
         }
 
     # ---- Solve for chunk sizes: try cache→no-cache, halving band_chunk if needed ----
@@ -288,7 +293,6 @@ def compute_optimal_chunks(
         'q_chunk': q_chunk,
         'q_gather': q_gather,
         'k_chunk': k_chunk,
-        'use_gspace_cache': result['cache_bytes'] > 0,
         'memory_estimate': {
             'peak_estimate_gb': overall_peak / 1e9,
             'budget_gb': memory_budget_gb,
@@ -454,13 +458,12 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			q_chunk_size=chunks['q_chunk'],
 			q_gather_size=chunks.get('q_gather', 0),
 			bispinor=cfg.bispinor,
-			use_gspace_cache=chunks.get('use_gspace_cache', True),
 			band_range_left=band_range_left,
 			band_range_right=band_range_right,
 			k_chunk_size=chunks.get('k_chunk', 0),
 			band_norms=_band_norms,
 			use_ffi_io=cfg.use_ffi_io,
-			use_phdf5_gspace=cfg.use_phdf5_gspace,
+			gspace_mode=cfg.gspace_mode,
 		)
 
 	budget_gb = mem_est.get('budget_gb', cfg.memory_per_device_gb)

@@ -8,8 +8,9 @@ buffers (G-space cache + centroid copies + L_q + live P_l/P_r +
 per-bc FFT outputs), which per-stage kernels cannot model.
 
 Input shapes (all complex128 unless noted):
-    psi_G_bc_i : (n_k, bc_size, n_s, n_r) on P(None,('x','y'),None,None)
-                 one per band-chunk — passed as a tuple of tensors
+    [ψ(G) is NO LONGER a jit arg.  Each bc's ψ(G) is fetched from the
+     host via io_callback inside the jit body — see
+     common.psi_G_store.PsiGStore.fetch_psi_G.]
     psi_l_rmuT_X_fit : (n_k, n_rmu, n_b_l, n_s) on P(None, None, 'x', None)
     psi_r_rmuT_X_fit : (n_k, n_rmu, n_b_r, n_s) on P(None, None, 'x', None)
     L_q              : (n_q, n_rmu, n_rmu) on P(None, 'x', 'y')
@@ -39,13 +40,14 @@ Knobs:
     * ``chunk_r``  (r-slab width; primary DoE axis for driver peak)
     * ``band_chunk`` (bc_size for the streaming pair-density)
 
-Note: ``psi_bc_G_tuple`` is a *pytree* of tensors passed positionally.
-We use the conservative path of duplicating the same shape across all
-band chunks for AOT specs — production rounds up to the full band count
-so most chunks are uniform; the remainder chunk is folded via a separate
-compile (the actual jit cache key distinguishes them).  A single AOT
-compile with ``n_bc`` uniform-width chunks is representative of the
-steady-state cost.
+Note: the production kernel fetches ψ(G) per band-chunk from a
+host-side :class:`common.psi_G_store.PsiGStore` via io_callback inside
+its bc-loop.  For AOT memory analysis we plug in an
+``_AotStubPsiGStore`` whose ``fetch_psi_G`` returns zeros of the
+correct per-device shape, so the compiled HLO has the same io_callback
+-> FFT -> accumulate structure as production.  The io_callback does not
+itself allocate persistent device memory — the peak it contributes is
+captured in the single-bc ψ(G) live during FFT (``psiG_bc`` primitive).
 """
 from __future__ import annotations
 
@@ -54,9 +56,56 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental import io_callback
+from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from ..core import AotKernel, Knobs, MeshSpec, SysDims, register_kernel
+
+
+class _AotStubPsiGStore:
+    """AOT-only :class:`common.psi_G_store.PsiGStore` stand-in.
+
+    ``fetch_psi_G`` returns a sharded jax.Array of zeros in the same
+    shape/sharding the production store produces, so the HLO emitted
+    by ``_make_fit_one_rchunk_kernel`` is structurally identical to
+    production — same io_callback + FFT + pair-density sequence, same
+    ``memory_analysis`` — without needing a real WFN.h5 on hand.
+    Strictly for AOT peak measurement; never actually executed.
+    """
+
+    def __init__(self, mesh: Mesh, meta, band_chunk_ranges):
+        self.mesh = mesh
+        self.band_chunk_ranges = band_chunk_ranges
+        p = int(mesh.shape['x']) * int(mesh.shape['y'])
+        bc_uniform = band_chunk_ranges[0][1] - band_chunk_ranges[0][0]
+        assert bc_uniform % p == 0, \
+            f"band_chunk={bc_uniform} must divide total devices {p}"
+        nx, ny, nz = meta.fft_grid
+        self._per_device_shape = (
+            int(meta.nk_tot), bc_uniform // p, int(meta.nspinor), nx, ny, nz)
+
+    def begin_rchunk(self, *_): pass
+    def end_rchunk(self): pass
+    def close(self): pass
+
+    def fetch_psi_G(self, band_range, k_range=None):
+        del band_range, k_range
+        per_dev = self._per_device_shape
+        out_sds = jax.ShapeDtypeStruct(per_dev, jnp.complex128)
+        spec = P(None, ('x', 'y'), None, None, None, None)
+        zeros = np.zeros(per_dev, dtype=np.complex128)
+
+        def _cb(_x, _y):
+            return zeros
+
+        @partial(shard_map, mesh=self.mesh,
+                 in_specs=(), out_specs=spec, check_rep=False)
+        def _sm():
+            x = jax.lax.axis_index('x')
+            y = jax.lax.axis_index('y')
+            return io_callback(_cb, out_sds, x, y, ordered=True)
+        return _sm()
 
 _B = 16.0
 
@@ -292,42 +341,25 @@ class FitOneRChunkKernel(AotKernel):
         mu = sys.n_rmu
         ns = sys.n_s
         nb = sys.n_b
-        Br = _Br(sys, knobs)
-        bc = _bc(sys, knobs)
-        nbc = _nbc(sys, knobs)
-        fft_shape = sys.fft_shape
-        n_r_total = sys.n_r or (fft_shape[0] * fft_shape[1] * fft_shape[2])
 
-        psiG_shard = NamedSharding(
-            mesh, P(None, ("x", "y"), None, None, None, None))
         cent_shard = NamedSharding(mesh, P(None, None, "x", None))
         L_shard    = NamedSharding(mesh, P(None, "x", "y"))
         rep        = NamedSharding(mesh, P())
 
-        nx, ny, nz = fft_shape
-        specs = []
-        # psi_G tuple — one entry per band chunk, each natively 6D:
-        # (n_k, bc_size, n_s, nx, ny, nz) matching read_Gvecs_to_devices.
-        for _ in range(nbc):
-            specs.append(jax.ShapeDtypeStruct(
-                (nk, bc, ns, nx, ny, nz), jnp.complex128,
-                sharding=psiG_shard))
-        # psi_l_rmuT_X_fit, psi_r_rmuT_X_fit
-        specs.append(jax.ShapeDtypeStruct(
-            (nk, mu, nb, ns), jnp.complex128, sharding=cent_shard))
-        specs.append(jax.ShapeDtypeStruct(
-            (nk, mu, nb, ns), jnp.complex128, sharding=cent_shard))
-        # L_q
-        specs.append(jax.ShapeDtypeStruct(
-            (nk, mu, mu), jnp.complex128, sharding=L_shard))
-        # norms
-        specs.append(jax.ShapeDtypeStruct(
-            (nb,), jnp.float64, sharding=rep))
-        specs.append(jax.ShapeDtypeStruct(
-            (nb,), jnp.float64, sharding=rep))
-        # r_start scalar — dynamic int32 passed inside the jit
-        specs.append(jax.ShapeDtypeStruct((), jnp.int32))
-        return tuple(specs)
+        # psi_bc_G is no longer a jit argument — the provider pulls each
+        # bc from host via io_callback inside the jit body.  Specs cover
+        # only: psi_l_X, psi_r_X, L_q, norms_l, norms_r, r_start.
+        return (
+            jax.ShapeDtypeStruct(
+                (nk, mu, nb, ns), jnp.complex128, sharding=cent_shard),
+            jax.ShapeDtypeStruct(
+                (nk, mu, nb, ns), jnp.complex128, sharding=cent_shard),
+            jax.ShapeDtypeStruct(
+                (nk, mu, mu), jnp.complex128, sharding=L_shard),
+            jax.ShapeDtypeStruct((nb,), jnp.float64, sharding=rep),
+            jax.ShapeDtypeStruct((nb,), jnp.float64, sharding=rep),
+            jax.ShapeDtypeStruct((), jnp.int32),
+        )
 
     # ---------- callable ----------
     def build_callable(self, sys: SysDims, knobs: Knobs, mesh: Mesh):
@@ -382,18 +414,25 @@ class FitOneRChunkKernel(AotKernel):
         kvecs_frac = np.ascontiguousarray(grid)
 
         q_chunk_size = 1
+
+        # ψ(G) is no longer a jit arg — provide a stub PsiGStore whose
+        # ``fetch_psi_G`` returns zeros of the right per-device shape.
+        # This gives the AOT compile the same graph structure the
+        # production kernel emits (one io_callback per bc, one FFT per
+        # bc, one pair-density accumulate per bc), without needing an
+        # actual WFN.h5 file open on the DoE driver.
+        stub_store = _AotStubPsiGStore(mesh, meta, band_chunk_ranges)
         kernel = _make_fit_one_rchunk_kernel(
             mesh, meta, band_chunk_ranges,
             band_range_left, band_range_right, band_range_full,
             Br, q_chunk_size, kvecs_frac,
+            stub_store,
         )
 
         # The factory returns the bare jit.  Wrap so the AOT specs'
-        # positional order matches: tuple_of_psiG + X + Y + L_q + norms + r_start.
-        def _apply(*args):
-            psi_tuple = args[:nbc]
-            psi_l_X, psi_r_X, L_q, norms_l, norms_r, r_start = args[nbc:]
-            return kernel(psi_tuple, psi_l_X, psi_r_X, L_q,
+        # positional order matches: X + Y + L_q + norms + r_start.
+        def _apply(psi_l_X, psi_r_X, L_q, norms_l, norms_r, r_start):
+            return kernel(psi_l_X, psi_r_X, L_q,
                           norms_l, norms_r, r_start)
 
         return jax.jit(_apply)

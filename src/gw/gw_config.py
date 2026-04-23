@@ -52,10 +52,17 @@ _DEFAULTS = {
     # ``process_allgather`` + rank-0 ``h5py`` path as a fallback for
     # non-Lustre filesystems or systems without the FFI ``.so`` built.
     "use_ffi_io": True,
-    # phdf5 on-demand G-space reads during ISDF fit (no device cache).
-    # Trades a per-r-chunk read for zero persistent GPU footprint of the
-    # per-band-chunk G-space tuple.  Cheap under phdf5; slow under h5py.
-    "use_phdf5_gspace": False,
+    # ψ(G) source for the ISDF r-chunk loop.  Both modes keep ψ(G) on
+    # the HOST in per-rank band-sharded layout and pull one band-chunk
+    # at a time into the jit via io_callback — never more than one bc
+    # on device at a time.  Modes differ in host-side lifecycle:
+    #   "host_cache"  – read once at startup, keep resident in host
+    #                   RAM for the full run (default; fastest).
+    #   "file_reread" – rebuild the host buffer at each r-chunk via
+    #                   phdf5 collective read; drop between r-chunks.
+    #                   Zero persistent host residency (needed for
+    #                   huge systems where host RAM can't hold ψ(G)).
+    "gspace_mode": "host_cache",
     # AOT-fit chunk chooser: replaces the per-stage byte heuristic in
     # compute_optimal_chunks with the driver-level
     # ``aot_memory_model.choose_chunks_aot`` — minimises total FLOPs
@@ -299,7 +306,7 @@ class LorraxConfig:
     self_consistent: bool
     use_ppm_sigma: bool
     use_ffi_io: bool
-    use_phdf5_gspace: bool
+    gspace_mode: str
     use_aot_chunk_chooser: bool
 
     # --- Memory / chunking (resolved at construction) ---
@@ -503,7 +510,7 @@ class LorraxConfig:
             self_consistent=bool(_get("self_consistent")),
             use_ppm_sigma=bool(_get("use_ppm_sigma")),
             use_ffi_io=bool(_get("use_ffi_io")),
-            use_phdf5_gspace=bool(_get("use_phdf5_gspace")),
+            gspace_mode=str(_get("gspace_mode")),
             use_aot_chunk_chooser=bool(_get("use_aot_chunk_chooser")),
             # Memory / chunking
             memory_per_device_gb=memory_per_device_gb,

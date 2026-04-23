@@ -167,7 +167,7 @@ def choose_chunks_aot(
         raise ValueError(
             f"No feasible (chunk_r, band_chunk) under budget "
             f"{budget_bytes/1e9:.2f} GB — try a bigger mesh, lower "
-            "chunk_r_min, or off-device gspace (use_phdf5_gspace=True).")
+            "chunk_r_min, or smaller band_chunk.")
     return best
 
 
