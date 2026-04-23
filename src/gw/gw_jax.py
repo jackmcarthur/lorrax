@@ -283,24 +283,33 @@ def main(argv=None):
 			with jax_profile.trace_section("chi0_W"):
 				# Split compile vs exec for χ₀ and W.  Each section's
 				# wall time is read off the end-of-run timing report
-				# under ``gw_jax.chi0_W.{chi,W}.{compile,exec}``.
+				# under ``gw_jax.chi0_W.{chi,W}.{compile,exec}``.  The
+				# explicit ``block_until_ready`` inside the exec sections
+				# is load-bearing: it (a) pins chi.exec / W.exec wall time
+				# to the actual dispatched compute (not just the host
+				# dispatch), and (b) drops the last Python reference to
+				# χ₀ before the W-solve call so XLA can donate that
+				# buffer.  Do NOT use ``_chi_sec.watch(...)`` here — it
+				# keeps a bound ``block_until_ready`` method alive on the
+				# section object past W-solve, which blocks donation.
 				quad, e_ref = build_static_quadrature(wfns, config.minimax_config, print_fn=print0)
 				with timing.section("chi.compile"):
 					precompile_chi0(wfns, quad, meta, mesh_xy,
 					                energy_reference=e_ref)
-				with timing.section("chi.exec") as _chi_sec:
+				with timing.section("chi.exec"):
 					chi0_q = compute_chi0(wfns, quad, meta, mesh_xy,
 					                      energy_reference=e_ref)
-					_chi_sec.watch(chi0_q)
+					chi0_q.block_until_ready()
 				with timing.section("W.compile"):
 					precompile_solve_w(V_q, chi0_q, meta, mesh_xy,
 					                   memory_mode=config.isdf_memory_mode)
-				with timing.section("W.exec") as _W_sec:
+				with timing.section("W.exec"):
 					W_q = solve_w(V_q, chi0_q, meta, mesh_xy,
 					              memory_mode=config.isdf_memory_mode)
-					_W_sec.watch(W_q)
-				print0(f"  |χ(0)|_max = {float(jnp.max(jnp.abs(chi0_q))):.6e}  "
-				       f"(minimax, {quad.node_count} nodes)")
+					# χ₀ is donated inside solve_w — the reference is
+					# now invalid.  Do NOT touch ``chi0_q`` after this.
+					del chi0_q
+					W_q.block_until_ready()
 
 	if not config.do_screened:
 		W_q = V_q  # unscreened: W = V
@@ -411,9 +420,14 @@ def main(argv=None):
 			quad_imag = build_imag_quadrature(
 				quad, config.ppm_omega_p, config.minimax_config, print_fn=print0)
 			chi0_imag = compute_chi0(wfns, quad_imag, meta, mesh_xy, energy_reference=e_ref)
+			# Block BEFORE solve_w so the chi0_imag compute time isn't
+			# folded into the W-solve wall; this also drops the last host
+			# reference so solve_w can donate χ₀'s buffer (see the
+			# ``donate_argnums=(1,)`` on ``_solve_w``).
+			chi0_imag.block_until_ready()
 			Wiwp_q = solve_w(V_q, chi0_imag, meta, mesh_xy,
 			                 memory_mode=config.isdf_memory_mode)
-			chi0_imag.block_until_ready()
+			del chi0_imag
 			Wiwp_q.block_until_ready()
 
 			ppm = fit_gn_ppm(

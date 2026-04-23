@@ -198,7 +198,11 @@ def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int):
     reshard_mid = NamedSharding(mesh_xy, P('x', None, 'y'))
     q_spec = P(('x', 'y'), None, None)
 
-    @jax.jit
+    # ``chi_flat`` is donated (position 1): the caller releases χ₀ right
+    # after this call (see ``gw_jax.main`` — the ``del chi0_q`` inside the
+    # ``W.exec`` timing block).  ``V_flat`` is NOT donated — V is reused
+    # by COHSEX Σ_SX, Σ_COH, Σ_X and the PPM fit's Wc = W - V step.
+    @partial(jax.jit, donate_argnums=(1,))
     def _solve_w(V_flat: jax.Array, chi_flat: jax.Array, pref: jax.Array) -> jax.Array:
         """V_flat, chi_flat: (nq, μ, μ).  Returns W: (nq, μ, μ)."""
         nq_local = V_flat.shape[0]

@@ -80,9 +80,14 @@ def main():
 
     meta = SimpleNamespace(nk_tot=nq, nspin=1, nspinor=1)
 
-    W_hi = solve_w(V_q, chi0_q, meta, mesh, memory_mode="high_mem")
+    # solve_w donates its χ₀ input (position 1) so the caller must pass
+    # an independent copy each time if it plans to re-use.  Run an
+    # identity-jit to materialise a fresh-buffer duplicate before each
+    # call.
+    _fresh = jax.jit(lambda x: x)
+    W_hi = solve_w(V_q, _fresh(chi0_q), meta, mesh, memory_mode="high_mem")
     jax.block_until_ready(W_hi)
-    W_lo = solve_w(V_q, chi0_q, meta, mesh, memory_mode="low_mem")
+    W_lo = solve_w(V_q, _fresh(chi0_q), meta, mesh, memory_mode="low_mem")
     jax.block_until_ready(W_lo)
 
     W_hi_full = np.asarray(multihost_utils.process_allgather(W_hi))
