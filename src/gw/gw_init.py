@@ -107,83 +107,149 @@ def compute_optimal_chunks(
         raise ValueError(f"C_q build requires {stage_cct/1e9:.2f} GB/device — exceeds budget.")
     m_L_q = _mem(nq, mu, mu, shard=p_x * p_y)  # L_q persists; same size as C_q
 
-    # ψ(G) now lives on the HOST (per-rank band-sharded) and is pulled
-    # into the jit one bc at a time via io_callback.  No persistent
-    # device residency — only the currently active bc is on device
-    # (captured in the fft stage as α_psi_bc below).
+    # ψ(G) lives on HOST (per-rank band-sharded) and is fetched into the
+    # jit one bc at a time via io_callback; no persistent device residency.
+    # Only the currently active bc's ψ(G) is on device — captured in
+    # the fft_moment term below.
 
     # ======================================================================
-    # Per-cr cost coefficients α (bytes per unit chunk_r on one device).
-    # Every chunk-loop stage cost is:  base + αᵢ·cr [+ cᵢ]
-    # The optimal cr = min over i of (headroom − cᵢ) / αᵢ.
+    #  Chunk-loop memory model — five moments, each grounded in a buffer
+    #  visible in the fit_one_rchunk HLO dump.
+    #
+    #  ψ(G) arrives via io_callback, gets FFT'd to ψ(r)-box, resharded to
+    #  an r-chunk slab ψ_bc_Y, then einsum'd into P_l/P_r accumulators.
+    #  ZCT is 2× ifftn + 1× fftn over kgrid on the pair-density tensor.
+    #  Then reshard Z_q → Z_col → solve L_q · zeta = Z_col, per-q-batch.
+    #  Finally q_gather copies are replicated + written to H5.
     # ======================================================================
-    α_psi     = _mem(nk, nb, ns, shard=p_y)        # ψ(r_chunk) output accumulator
-    α_pair    = _mem(nk, mu, shard=p_x * p_y)  # one pair density P(nk, μ, cr)
-    # One bc's ψ(G) slab transits through device memory during its FFT
-    # (io_callback pull → FFT → r-slice).  ``band_chunk / P`` bands
-    # per device, shape (nk, bpd, ns, nx, ny, nz).  Held alive for the
-    # duration of one bc's accumulate; freed at the next bc's pull.
-    m_psi_bc = _mem(nk, band_chunk, ns, nr, shard=p)
-    α_zcol    = _mem(nq, mu, shard=p)               # Z_col column slice
-    α_z_slice = _mem(mu, shard=p)                   # per-q Z_slice or Z_transpose
-    α_gather  = _mem(mu, shard=p) + 2 * _mem(mu)    # sharded input + replicated output + NCCL
-    c_solve   = _mem(mu, mu, shard=p_x * p_x) + 3 * _mem(mu, mu)  # L_rep(sharded) + 3×L_full(μ²)
+    α_pair     = _mem(nk, mu, shard=p_x * p_y)      # P_l/P_r per unit cr
+    α_psi_Y_bc = _mem(nk, band_chunk, ns, shard=p_y) # ψ_bc_Y per unit cr, post-reshard (Y-sharded on r-axis)
+    α_zcol     = _mem(nq, mu, shard=p)              # Z_col per unit cr
+    α_z_slice  = _mem(mu, shard=p)                  # per-q Z-slice per cr
+    α_gather   = _mem(mu, shard=p) + 2 * _mem(mu)   # q-gather: sharded + replicated copy + NCCL
 
-    # ZCT stage cost breakdown:
-    #   4 · α_pair · cr : four concurrent pair-density buffers (P_l, P_r,
-    #                     P_l_Rt, P_r_Rt) live at the ZCT peak.
-    #   ZCT_FFT_WS · α_pair · cr : cuFFT workspace for the 3-D FFTs over
-    #                     the (nk, μ, cr) tensor.  ``compute_ZCT_from_
-    #                     left_right_zchunk`` does 2× ifftn + 1× fftn
-    #                     across two jits; each cuFFT plan allocates a
-    #                     workspace roughly equal to the transform size.
-    #                     We use 3 to match the existing ``FFT_COPIES=3``
-    #                     convention the centroid-FFT stage already uses.
-    #   Observed at Si 10×10×10 (nk=1000, μ=480, 4 GPUs, 35 GB), see
-    #   module_0147.jit__kernel memory-usage-report: the 18.54 GiB top
-    #   preallocated-temp is dominated by the in-loop band-FFT tensor
-    #   (c128[nk, bpd, ns, nx, ny, nz] × 3 cuFFT copies) — that
-    #   mis-prediction is fixed separately by computing the ``fft`` loop
-    #   stage with the full-nk FFT workspace.  The 3 here still accounts
-    #   for the ZCT stage's two ifftn + one fftn cuFFT plans.
-    ZCT_FFT_WS = 3
-    zct_coef = 4 + ZCT_FFT_WS
+    # Per-bc transient ψ(G) slab (one bc on device during its FFT only):
+    m_psi_G_bc = _mem(nk, band_chunk, ns, nr, shard=p)
+    # Replicated-L temps during Cholesky solve (L_batch_rep + 3× L_full):
+    c_solve    = _mem(mu, mu, shard=p_x * p_x) + 3 * _mem(mu, mu)
+
+    # ZCT adds 3·α_pair·cr on top of the persistent P_l/P_r accumulators.
+    # MEASURED: AOT-compiling compute_ZCT_from_left_right_zchunk as a
+    # standalone kernel gives arg=2·α_pair·cr (P_l + P_r inputs),
+    # temp=2·α_pair·cr (internal working buffers), out=1·α_pair·cr
+    # (Z_q).  Inside fit_one_rchunk the 2 args are already live as
+    # the persistent accumulators, so the ADDITIONAL live set at the
+    # ZCT peak is temp+out = 3·α_pair·cr.  The old (4 + 3)=7· fudge
+    # over-counted by 2 (no donation credit + over-estimated cuFFT
+    # scratch).  Validated across kgrids (3,3,1), (10,10,10) and
+    # multiple cr values — ratio of measured temp to 4·α_pair·cr was
+    # uniform 0.5 → coefficient is 2·α_pair·cr for temp + 1 for out
+    # = 3 total additional.  See scripts/validate_fft_workspaces.py.
+    ZCT_ADDITIONAL_COEF = 3
+
+    def _fft_moment(cr, base, fft_inloop_bytes):
+        """Peak during one bc-iteration's FFT + reshard + accumulate.
+
+        Live simultaneously:
+          - base (persistent centroids + L_q)
+          - 2 pair-density accumulators (P_l, P_r) — kept across bc-loop
+          - FFT workspace for the wfn FFT (input + output + cuFFT scratch,
+            all captured by ``fft_inloop_bytes`` from query_fft_peak_bytes)
+          - post-reshard ψ_bc_Y slab — still live until the pair einsum
+            folds it in (α_psi_Y_bc · cr)
+        """
+        return base + 2 * α_pair * cr + fft_inloop_bytes + α_psi_Y_bc * cr
+
+    def _zct_moment(cr, base):
+        """Peak during the ZCT stage.
+
+        Live simultaneously:
+          - base (persistent)
+          - 2 pair-density accumulators (P_l, P_r — persistent across bc-loop)
+          - 3 additional pair-density-sized buffers for ZCT's internal
+            working set + Z_q output (AOT-measured, see ZCT_ADDITIONAL_COEF)
+        """
+        return base + (2 + ZCT_ADDITIONAL_COEF) * α_pair * cr
+
+    def _reshard_moment(cr, base):
+        """Peak during the Z_q → Z_col reshard.
+
+        Z_col has size α_zcol·cr; the reshard needs input + output.
+        FUDGE: coefficient 3 covers (input + output + NCCL scratch).
+        TODO: AOT-measure an isolated reshard jit to calibrate.
+        """
+        return base + 3 * α_zcol * cr
+
+    def _solve_moment(cr, base, q_batch):
+        """Peak during per-q-batch triangular solve.
+
+        Z_col (input) + zeta_acc (donation-compatible output, same size).
+        Per-q-batch replicated L slab lives inside the solve jit.
+        """
+        return base + 2 * α_zcol * cr + q_batch * (2 * α_z_slice * cr + c_solve)
+
+    def _gather_moment(cr, base, q_gather):
+        """Peak during q-gather + H5 write.
+
+        Z_col sharded + q_gather replicated copies (one per q being
+        written) + NCCL scratch.
+        """
+        return base + α_zcol * cr + q_gather * α_gather * cr
+
     def _max_cr(headroom, fft_cost_per_k):
-        """Invert each stage's linear cost to get max feasible cr per stage."""
+        """Invert each MOMENT's linear cost to get max feasible cr.
+
+        One inversion per distinct live-range snapshot.  The bc-loop's
+        ``fft_moment`` and ``zct_moment`` are the two real in-loop peaks;
+        reshard / solve / gather are post-loop moments with their own
+        linear cr-dependence.
+        """
+        # fft_moment: base + 2·α_pair·cr + fft_inloop + α_psi_Y_bc·cr
+        #   → cr ≤ (headroom - fft_inloop) / (2·α_pair + α_psi_Y_bc)
+        denom_fft = 2 * α_pair + α_psi_Y_bc
+        # zct_moment: base + (2 + ZCT_ADDITIONAL_COEF)·α_pair·cr
+        denom_zct = (2 + ZCT_ADDITIONAL_COEF) * α_pair
         limits = {
-            'fft':     (headroom - fft_cost_per_k - m_psi_bc) / α_psi if α_psi > 0 else nr,
-            'pair':    headroom / (α_psi + 2 * α_pair) if (α_psi + 2 * α_pair) > 0 else nr,
-            'zct':     headroom / (zct_coef * α_pair) if α_pair > 0 else nr,
-            'reshard': headroom / (4 * α_zcol) if α_zcol > 0 else nr,
+            'fft':     (headroom - fft_cost_per_k) / denom_fft if denom_fft > 0 else nr,
+            'zct':     headroom / denom_zct if denom_zct > 0 else nr,
+            'reshard': headroom / (3 * α_zcol) if α_zcol > 0 else nr,
+            # solve/gather live post-loop and have extra per-q terms; size
+            # them against their cr-linear part (the 2·α_zcol + α_zcol
+            # components dominate; per-q batch costs are capped below).
             'solve':   (headroom - c_solve) / (2 * α_zcol + 2 * α_z_slice) if (2 * α_zcol + 2 * α_z_slice) > 0 else nr,
             'gather':  headroom / (α_zcol + α_gather) if (α_zcol + α_gather) > 0 else nr,
         }
-        # Optional soft cap on ZCT stage (env var override for tight-memory systems)
+        # Optional soft cap on zct stage (env override for tight-memory systems)
         if m_zct_cap is not None and α_pair > 0:
             zct_headroom = m_zct_cap - (m_budget - headroom)
             if zct_headroom > 0:
-                limits['zct'] = min(limits['zct'], zct_headroom / (zct_coef * α_pair))
+                limits['zct'] = min(limits['zct'], zct_headroom / denom_zct)
         return limits
 
     # Per-k centroid-load FFT cost — used only for k_batch sizing.  The
-    # in-loop FFT workspace cost is a separate, full-nk term.
+    # in-loop FFT workspace cost is queried separately via
+    # query_fft_peak_bytes (see below).
     fft_per_k = FFT_COPIES * _mem(bpd, ns, nr) + _mem(nr)
 
     def _eval_stages(cr, base, fft_inloop):
-        """Forward-evaluate all stage costs at a given cr (algebraic inverse of _max_cr)."""
+        """Forward-evaluate each moment at a given cr."""
         m_zcol = α_zcol * cr
         m_solve_per_q = 2 * α_z_slice * cr + c_solve
         m_gather_per_q = α_gather * cr
+        # Note: fft_inloop already includes the input (=m_psi_G_bc), output,
+        # and cuFFT scratch via query_fft_peak_bytes.  Don't add m_psi_G_bc
+        # on top — that was double-counting the argument buffer.
         stages = {
-            'fft':     base + α_psi * cr + fft_inloop + m_psi_bc,
-            'pair':    base + (α_psi + 2 * α_pair) * cr,
-            'zct':     base + zct_coef * α_pair * cr,
-            'reshard': base + 4 * m_zcol,
-            'solve':   base + 2 * m_zcol + m_solve_per_q,
-            'gather':  base + m_zcol + m_gather_per_q,
+            'fft':     _fft_moment(cr, base, fft_inloop),
+            'zct':     _zct_moment(cr, base),
+            'reshard': _reshard_moment(cr, base),
+            'solve':   base + 2 * m_zcol + m_solve_per_q,  # q_batch=1 in AOT
+            'gather':  base + m_zcol + m_gather_per_q,      # q_gather=1 for sizing
         }
-        # k_batch sized against fft_per_k (per-k cost), capped by headroom.
-        fft_head = m_budget - base - α_psi * cr
+        # k_batch sizing — uses per-k FFT cost to pack as many k's as
+        # headroom allows.  Kept from the old model; only matters for
+        # centroid-load FFT, which is a separate pre-loop stage.
+        fft_head = m_budget - base - (2 * α_pair + α_psi_Y_bc) * cr
         k_batch = 1
         if fft_per_k > 0 and fft_head > fft_per_k:
             k_batch = min(int(nk), max(1, int(fft_head * 0.5 / fft_per_k)))

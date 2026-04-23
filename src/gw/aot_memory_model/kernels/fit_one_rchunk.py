@@ -303,12 +303,23 @@ class FitOneRChunkKernel(AotKernel):
     KNOBS = ("chunk_r", "band_chunk")
     PRIMITIVES = {
         "pair":       _T_pair,
-        "psiG_cache": _T_psiG_cache,
+        # psiG_cache REMOVED: was n_k·n_b·n_s·n_r/P bytes representing the
+        # full resident ψ(G) cache.  After the io_callback refactor ψ(G)
+        # is host-only, no persistent device-side buffer of this size
+        # exists.  Leaving the primitive in extrapolates as a phantom
+        # ~3.3 GB/process at Si 10³ scale (conservative over-prediction).
         "psiG_bc":    _T_psiG_bc,
         "psiY_bc":    _T_psiY_bc,
         "centroid":   _T_centroid,
         "Lq_sharded": _T_Lq_sharded,
-        "Lq_rep":     _T_Lq_rep,
+        # Lq_rep REMOVED: was n_k·μ² (fully replicated across P).  HLO
+        # audit of Si 10³ fit_one_rchunk confirmed no c128[nk, μ, μ]
+        # fully-replicated buffer exists anywhere in the compiled
+        # kernel — L_q stays as c128[nk, μ/p_x, μ/p_y] throughout the
+        # solve.  This primitive was absorbing n_k·μ²-scaling residual
+        # from MoS2 3×3 DoE collinearity (at fixed P=4 it was exactly
+        # proportional to Lq_sharded); extrapolating to Si 10³ gave a
+        # phantom 3.7 GB/process.
     }
     # Scaling class of each primitive in (chunk_r, bc) — the analytic
     # chooser groups β_i·T_i into (α₀, α_cr, α_bc, α_crbc) and inverts
@@ -319,12 +330,10 @@ class FitOneRChunkKernel(AotKernel):
     #   "crbc"    : T_i scales like chunk_r·bc.
     PRIMITIVE_CLASSES = {
         "pair":       "cr",
-        "psiG_cache": "const",
         "psiG_bc":    "bc",
         "psiY_bc":    "crbc",
         "centroid":   "const",
         "Lq_sharded": "const",
-        "Lq_rep":     "const",
     }
     # Cost-side primitives — distinct from memory primitives because
     # FLOPs count != bytes-per-device.  See _F_* helpers above.

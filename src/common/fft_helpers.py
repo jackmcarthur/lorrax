@@ -65,12 +65,22 @@ def query_fft_peak_bytes(
     spec = jax.ShapeDtypeStruct(
         tuple(int(s) for s in input_shape), dtype, sharding=sharding)
 
-    @jax.jit
-    def _fft(x):
-        return jnp.fft.fftn(x, axes=tuple(fft_axes))
+    # Use make_jittable_local_fftn_3d — matches the real kernel's FFT
+    # partitioning.  Plain jnp.fft.fftn on a sharded tensor forces XLA
+    # to reason about the FFT at HLO level; since it can't see that
+    # sharded axes aren't FFT axes, it inserts a gather for the output
+    # and a ~2× replicated temp buffer, inflating reported peak by ~8×
+    # for small-FFT-axis + large-batch shapes.  The custom_partitioning
+    # wrapper hides the FFT in an opaque primitive so XLA sees only
+    # the local per-device FFT — matching production memory usage.
+    local_fftn = make_jittable_local_fftn_3d(
+        mesh, sharding.spec, sharding.spec,
+        axes=tuple(fft_axes), norm=None,
+    )
+    jit_fft = jax.jit(local_fftn, out_shardings=sharding)
 
     try:
-        compiled = _fft.lower(spec).compile(
+        compiled = jit_fft.lower(spec).compile(
             compiler_options={"xla_gpu_memory_limit_slop_factor": 10000})
     except Exception:
         # If AOT compile fails (unusual — happens e.g. when called before
