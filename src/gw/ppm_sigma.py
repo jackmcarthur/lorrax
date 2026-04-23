@@ -471,7 +471,7 @@ def _get_sigma_kij_kernel(
 
     _project_ri_rs = _make_project_ri_reduce_scatter(mesh_xy)
 
-    @jax.jit
+    @partial(jax.jit, donate_argnums=(8,))
     def _sigma_kij_kernel(
         psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
         E_A, mask_A, E_ref_A, t_node, W_q,
@@ -479,6 +479,11 @@ def _get_sigma_kij_kernel(
         """Σ_kij = project_rs[ FFT[ G(R) · W(R) / √Nk ] ].  All flat-k.
 
         W_q is (nq, μ, μ) flat-q — same layout as all other flat-k arrays.
+        ``W_q`` is **donated**: it's built fresh each τ by ``_build_W_t_q``
+        and only consumed here, so XLA can reuse its buffer for the
+        ``V_R = _V_ifftn(W_q)`` output instead of allocating a separate
+        intermediate.
+
         G(t) = build_G_tau(psi, E_A, 1j·t_node, e_ref=E_ref_A, mask=mask_A),
         i.e. the unified ISDF-basis G builder with pure-imaginary t
         (real-time evolution).  Output (Σ_ri) emerges (m_X, n_Y)-sharded
@@ -569,11 +574,19 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh) -> None:
     psi_proj_yn = wfns.yn(s.sigma)
 
     # Representative non-ψ inputs — values don't matter for AOT, only
-    # shapes+dtypes+shardings.  E_A / mask_A are replicated (default
-    # device set); mask_B inherits Ω_q's sharding so the compiled
-    # graph matches what ``_materialize_window_mask_B`` emits at runtime.
+    # the full `(shape, dtype, sharding, committed-ness)` tuple must
+    # match the runtime signature or pjit re-traces.  Specifically:
+    #   * E_A at runtime comes from ``_prepare_sigma_state`` (jit output)
+    #     — committed to the mesh as ``NamedSharding(P(None, None))``.
+    #     Must device_put the dummy to match, otherwise pjit sees
+    #     ``UnspecifiedValue`` vs ``P(None, None)`` and re-compiles.
+    #   * mask_A, scalars: at runtime go through ``jnp.asarray(numpy_val)``
+    #     which stays uncommitted — leave as plain jnp to match.
+    #   * mask_B inherits Ω_q's sharding, same as ``_materialize_window_mask_B``.
     nb_full = int(psi_coh_xn.shape[-1])
-    E_A     = jnp.zeros((int(meta.nk_tot), nb_full), dtype=jnp.float64)
+    rep_2d  = NamedSharding(mesh_xy, P(None, None))
+    E_A     = jax.device_put(
+        jnp.zeros((int(meta.nk_tot), nb_full), dtype=jnp.float64), rep_2d)
     mask_A  = jnp.ones((int(meta.nk_tot), nb_full), dtype=bool)
     mask_B  = jnp.ones_like(ppm.Omega_q, dtype=bool)
     E_ref_A = jnp.asarray(0.0, dtype=jnp.float64)

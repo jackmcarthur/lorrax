@@ -10,7 +10,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 jax.config.update("jax_enable_x64", True)
 
-from runtime import init_jax_distributed, fallback_to_cpu_if_no_gpu_backend
+from runtime import init_jax_distributed, fallback_to_cpu_if_no_gpu_backend, nccl_warmup
 init_jax_distributed()
 fallback_to_cpu_if_no_gpu_backend()
 
@@ -68,6 +68,7 @@ from mixing.acceleration import (
 from common import Meta
 from common import jax_profile
 import common.timing as timing
+import contextlib
 import h5py
 import builtins
 
@@ -142,6 +143,13 @@ def main(argv=None):
 
 	mesh_xy = _build_mesh()
 	grid_x, grid_y = mesh_xy.devices.shape
+
+	# Pre-init NCCL communicators for full-mesh + per-axis psums so the
+	# first real collective (seen as a ~1.9 s ``all-reduce-start`` inside
+	# ``jit(_mean)`` during sigma in the 2026-04-23 profile) doesn't eat
+	# a timed section.  No-op single-process.
+	with timing.section("nccl_warmup"):
+		nccl_warmup(mesh_xy)
 
 	# Eagerly init MPI_THREAD_MULTIPLE via the phdf5 FFI so the first
 	# collective H5Fcreate (in zeta_fit_chunked) doesn't pay the
@@ -363,8 +371,11 @@ def main(argv=None):
 				print0(f"  [pf] profiling hooks unavailable: {_e}")
 			with timing.section("sigma.compile"):
 				precompile_sigma(wfns, ppm, meta, mesh_xy)
-			_cm = _pf.region("sigma_ppm") if _pf is not None else timing.section("sigma.exec")
-			with _cm:
+			# Always nest timing.section so the "sigma.exec" bucket is
+			# recorded; pf.region is an xprof annotation and does NOT
+			# feed the timing report.
+			_cm = _pf.region("sigma_ppm") if _pf is not None else contextlib.nullcontext()
+			with timing.section("sigma.exec"), _cm:
 				sigma_omega = compute_sigma_c_ppm_omega_grid(
 					wfns, ppm, meta, mesh_xy, ppm_options,
 					sigma_window_quad=config.sigma_quadrature_config,
