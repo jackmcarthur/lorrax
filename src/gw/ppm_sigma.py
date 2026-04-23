@@ -63,6 +63,7 @@ import h5py
 from common import jax_profile
 from .minimax_config import MinimaxConfig, SigmaQuadratureConfig
 from .minimax_screening import (
+    MinimaxNodes,
     build_static_minimax_window_pair,
     fit_gn_ppm_from_wc_pair,
     solve_laplace_minimax_interval,
@@ -95,8 +96,7 @@ class SigmaOmegaResult:
 @dataclass(frozen=True)
 class _SigmaWindow:
     name: str
-    t_nodes: np.ndarray        # (n_tau,)
-    alpha: np.ndarray          # (n_tau,)
+    nodes: MinimaxNodes        # (t, alpha) complex128, carries this window's τ points
     mask_A: np.ndarray         # (nk, nb)
     mask_B: np.ndarray | None  # (nk, nb)
     E_ref_A: float
@@ -107,6 +107,10 @@ class _SigmaWindow:
     mask_B_mode: str = "explicit"
     mask_B_threshold: float | None = None
     crossing_kind: str | None = None
+
+    @property
+    def n_tau(self) -> int:
+        return int(self.nodes.t.shape[0])
 
 
 # ---------------------------------------------------------------------------
@@ -619,8 +623,7 @@ def _build_single_sigma_window(
     return [
         _SigmaWindow(
             name="single",
-            t_nodes=np.asarray(-1j * q.tau, dtype=np.complex128),
-            alpha=np.asarray(q.alpha, dtype=np.float64),
+            nodes=q.to_minimax_nodes(time_axis='imag'),
             mask_A=np.asarray(base_mask_A, dtype=bool),
             mask_B=None,
             E_ref_A=float(np.min(A_vals)),
@@ -695,8 +698,9 @@ def _build_three_sigma_windows(
                 target_kind="hgl",
                 use_shipped_tables=use_shipped_tables,
             )
-            t_nodes = np.asarray(q_cross.tau / xi, dtype=np.complex128)
-            alpha = np.asarray(q_cross.alpha / xi, dtype=np.float64)
+            raw = q_cross.to_minimax_nodes(time_axis='crossing_hgl')
+            # Crossing scaling: t = τ/ξ, α = α/ξ (both divided by ξ).
+            nodes = MinimaxNodes(t=raw.t / xi, alpha=raw.alpha / xi)
             project = "imag"
             prefactor = -1.0
         else:
@@ -710,16 +714,14 @@ def _build_three_sigma_windows(
                 max_nodes=max_nodes,
                 use_shipped_tables=use_shipped_tables,
             )
-            t_nodes = np.asarray(-1j * q.tau, dtype=np.complex128)
-            alpha = np.asarray(q.alpha, dtype=np.float64)
+            nodes = q.to_minimax_nodes(time_axis='imag')
             project = "full"
             prefactor = +1.0
 
         windows.append(
             _SigmaWindow(
                 name=name,
-                t_nodes=t_nodes,
-                alpha=alpha,
+                nodes=nodes,
                 mask_A=np.asarray(mA, dtype=bool),
                 mask_B=None,
                 E_ref_A=E_ref_A,
@@ -950,11 +952,73 @@ def _build_windows_for_branch(
         kind = "crossing" if win.crossing_kind else "Laplace"
         print_fn(
             f"    {log_tag} window \"{win.name}\" ({kind}): "
-            f"{int(win.alpha.shape[0])} nodes, err<{target_error:.0e}, "
+            f"{win.n_tau} nodes, err<{target_error:.0e}, "
             f"E_A=[{float(np.min(A_vals)):.4f}, {float(np.max(A_vals)):.4f}] Ry, "
             f"project={win.project}"
         )
     return windows
+
+
+def minimax_tau_integrate_sigma(
+    nodes: MinimaxNodes,
+    *,
+    build_sigma_tau: Callable[[jax.Array], tuple[jax.Array, jax.Array]],
+    add_tau: Callable[..., None],
+    E_ref_sum: float,
+    progress=None,
+) -> None:
+    """One window's τ integration for Σ^c(ω).
+
+    Sibling of ``w_isdf.minimax_tau_integrate_chi`` — both take a
+    ``MinimaxNodes`` pytree in the same slot.  chi0 can run its τ sweep
+    inside one ``lax.scan`` because its body emits no collective; sigma
+    stays a Python τ loop because its per-τ body emits NCCL and a
+    monolithic scan regressed MoS2 3×3 by ~80%.
+
+    Parameters
+    ----------
+    nodes
+        Window-local τ nodes (complex128 ``t`` and ``alpha``).  For
+        Laplace windows ``t = -1j·τ_real``; for crossing windows
+        ``t = τ_real / ξ``.
+    build_sigma_tau
+        Callable ``t_j -> (σ_re, σ_im)`` that bundles G(τ)·W(τ), the
+        FFT round-trip and ψ-projection for one τ scalar.  Closes over
+        the window-pinned args (psi, masks, E_ref_A/B, B_q, Ω_q) so
+        the signature here reads parallel to chi0's builders.
+    add_tau
+        Callable invoked per τ with ``(σ_re, σ_im, t_j, α_eff_j)``.
+        Encapsulates the ω-kernel multiply, project-code branch,
+        pref·scale weighting, and the GPU-accumulate vs H5-stream
+        accumulator back end.
+    E_ref_sum
+        ``E_ref_A + E_ref_B`` for this window — absorbed into α per τ as
+        ``α_eff = α · exp(-i · E_ref_sum · t)`` so the Laplace kernel
+        sees non-negative (E_A, Ω_q) arguments.
+    progress
+        Optional ``LoopProgress``-like object whose ``.step()`` is called
+        after each τ dispatch.
+    """
+    # Compute α_eff on the host using numpy — matches the byte-exact
+    # formula (``complex(α) * np.exp(-1j·E_ref_sum·τ)``) the legacy code
+    # emitted, so the MoS2 3×3 regression hash is preserved.  Host-get on
+    # ~tens of nodes is negligible compared with the dispatched τ kernels.
+    t_host = np.asarray(jax.device_get(nodes.t), dtype=np.complex128)
+    alpha_host = np.asarray(jax.device_get(nodes.alpha), dtype=np.complex128)
+    alpha_eff_host = alpha_host * np.exp(-1j * float(E_ref_sum) * t_host)
+
+    n_tau = int(nodes.t.shape[0])
+    for i in range(n_tau):
+        t_j = jnp.asarray(t_host[i], dtype=jnp.complex128)
+        alpha_eff_j = jnp.asarray(alpha_eff_host[i], dtype=jnp.complex128)
+        # σ^τ is returned as a (re, im) tuple so the crossing window's HGL
+        # quadrature (which keeps only Im[coeff·σ]) doesn't carry a complex
+        # σ^τ through the FFT stack — would double HBM + collective traffic.
+        sigma_re, sigma_im = build_sigma_tau(t_j)
+        sigma_re.block_until_ready()
+        if progress is not None:
+            progress.step()
+        add_tau(sigma_re, sigma_im, t_j, alpha_eff_j)
 
 
 def _integrate_tau_windows_for_branch(
@@ -976,16 +1040,17 @@ def _integrate_tau_windows_for_branch(
     log_tag: str,
     print_fn,
 ) -> None:
-    """Walk windows; for each, run the Python per-τ loop calling ``add_tau``
-    one τ at a time.  The result lands either on-GPU (reduce-scatter
-    accumulator) or streamed to H5 — that decision is the accumulator's,
-    not this loop's.  See _ReduceScatterGpuAccumulator /
-    _StreamedH5Accumulator.
+    """Walk windows; for each, dispatch ``minimax_tau_integrate_sigma``
+    with closures that bind this window's (psi, masks, E_ref, kernel) and
+    feed the window's σ^τ into the accumulator.  The result lands either
+    on-GPU (reduce-scatter accumulator) or streamed to H5 — that decision
+    is the accumulator's, not this loop's.  See
+    _ReduceScatterGpuAccumulator / _StreamedH5Accumulator.
     """
     from common.progress import LoopProgress
 
     branch_label = log_tag if log_tag else "sigma"
-    total_tau_nodes = sum(int(win.alpha.shape[0]) for win in windows)
+    total_tau_nodes = sum(win.n_tau for win in windows)
     progress = LoopProgress(
         total_tau_nodes, print_fn, title=f"sigma[{branch_label}]",
         item_name="tau node", max_updates=10)
@@ -994,7 +1059,7 @@ def _integrate_tau_windows_for_branch(
         for win_idx, win in enumerate(windows):
             with jax_profile.step_annotation(
                 "sigma_window", step_num=win_idx,
-                detail=f"{branch_label}:{win.name}:n{int(win.alpha.shape[0])}",
+                detail=f"{branch_label}:{win.name}:n{win.n_tau}",
             ):
                 mask_A = jnp.asarray(win.mask_A)
                 mask_B = _materialize_window_mask_B(
@@ -1010,39 +1075,47 @@ def _integrate_tau_windows_for_branch(
                 omega_sign_j = jnp.asarray(float(win.omega_sign), dtype=jnp.float64)
                 pref_j = jnp.asarray(win.prefactor * scale, dtype=jnp.float64)
 
+                # Per-window builder: bundles G(τ)·W(τ), FFT, project_ri into
+                # one callable of ``t_j``.  Closes over the pinned args so the
+                # τ loop reads parallel to chi0's (nodes → scan body →
+                # contraction → accumulate).
+                def build_sigma_tau(t_j, *,
+                                    _psi_coh_xn=psi_coh_xn,
+                                    _psi_coh_yr=psi_coh_yr,
+                                    _psi_proj_xr=psi_proj_xr,
+                                    _psi_proj_yn=psi_proj_yn,
+                                    _E_A=E_A, _mask_A=mask_A,
+                                    _B_q=B_q, _Omega_q=Omega_q,
+                                    _mask_B=mask_B,
+                                    _E_ref_A_j=E_ref_A_j,
+                                    _E_ref_B_j=E_ref_B_j):
+                    return tau_kernel(
+                        _psi_coh_xn, _psi_coh_yr,
+                        _psi_proj_xr, _psi_proj_yn,
+                        _E_A, _mask_A, _B_q, _Omega_q, _mask_B,
+                        _E_ref_A_j, _E_ref_B_j, t_j,
+                    )
+
+                def add_tau(sigma_re, sigma_im, t_j, alpha_eff_j, *,
+                            _accumulator=accumulator,
+                            _omega_vec=omega_vec,
+                            _omega_sign_j=omega_sign_j,
+                            _pref_j=pref_j,
+                            _project_code_j=project_code_j):
+                    _accumulator.add_tau(
+                        sigma_re, sigma_im, _omega_vec,
+                        t_j, alpha_eff_j, _omega_sign_j, _pref_j,
+                        _project_code_j,
+                    )
+
                 accumulator.begin_window()
-                for t_node, alpha_node in zip(win.t_nodes, win.alpha):
-                    t_node_j = jnp.asarray(t_node, dtype=jnp.complex128)
-                    # σ^τ is returned as a (re, im) tuple rather than a complex
-                    # or a stacked (2, …) array: the crossing window's HGL
-                    # quadrature keeps only Im[coeff·σ], so carrying complex
-                    # through the FFT stack would double HBM and collective
-                    # traffic; and returning a tuple from the shard_map lets
-                    # Python unpack it without triggering the gather+broadcast
-                    # pair that indexing a sharded (2, nk, …) array would
-                    # emit.  See _combine_coeff_with_sigma_tau for the
-                    # downstream recombination.
-                    sigma_tau_kij_re, sigma_tau_kij_im = tau_kernel(
-                        psi_coh_xn, psi_coh_yr,
-                        psi_proj_xr, psi_proj_yn,
-                        E_A, mask_A, B_q, Omega_q, mask_B,
-                        E_ref_A_j, E_ref_B_j, t_node_j,
-                    )
-                    sigma_tau_kij_re.block_until_ready()
-                    progress.step()
-
-                    # α_eff = α(τ) · exp[-i·(E_ref_A + E_ref_B)·τ]  — the minimax
-                    # quadrature weight for this τ node, phase-shifted so the
-                    # Laplace transform kernel sees E_A and Ω_q as ≥ 0 arguments.
-                    alpha_eff = complex(alpha_node) * np.exp(
-                        -1j * (win.E_ref_A + win.E_ref_B) * t_node)
-                    alpha_eff_j = jnp.asarray(alpha_eff, dtype=jnp.complex128)
-
-                    accumulator.add_tau(
-                        sigma_tau_kij_re, sigma_tau_kij_im, omega_vec,
-                        t_node_j, alpha_eff_j, omega_sign_j, pref_j, project_code_j,
-                    )
-
+                minimax_tau_integrate_sigma(
+                    win.nodes,
+                    build_sigma_tau=build_sigma_tau,
+                    add_tau=add_tau,
+                    E_ref_sum=win.E_ref_A + win.E_ref_B,
+                    progress=progress,
+                )
                 accumulator.end_window()
 
     progress.finish()
