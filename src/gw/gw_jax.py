@@ -109,7 +109,6 @@ def _build_Gij(meta, mesh_xy):
 
 def _compute_static_head(config, input_dir, wfn, sym, meta, do_screened, print0):
 	"""Resolve q→0 head and compute exact band-diagonal head terms for COHSEX."""
-	# resolve_head_sample expects a dict-like interface for params
 	head_params = {
 		"wcoul0_source": config.wcoul0_source,
 		"wcoul0_eta": config.wcoul0_eta,
@@ -399,28 +398,25 @@ def main(argv=None):
 			raise ValueError("use_ppm_sigma=true requires do_screened=true.")
 		if config.self_consistent:
 			raise NotImplementedError("use_ppm_sigma not supported with self_consistent.")
-		# PPM Σ_c needs the head at *both* ω=0 and ω=iω_p.  The Apr-10
-		# 'Unify head resolution and remove G0 injection' commit (1542342)
-		# kept only the static (ω=0) injection path, so PPM Σ_c currently
-		# has no q→0 head contribution at all and is wrong by ~1–2 eV per
-		# band on bulk semiconductors.  Until the imag-freq head injection
-		# is reintroduced, refuse to silently run with a partial override:
-		# if the user is overriding the head, demand whead_imfreq too so
-		# the inconsistency is loud.
-		if config.vhead is not None or config.whead_0freq is not None:
-			if config.whead_imfreq is None:
-				raise ValueError(
-					"use_ppm_sigma=true with vhead/whead_0freq override but "
-					"whead_imfreq is unset.  PPM Σ_c needs W(q→0, G=0, ω=iω_p) "
-					"too — extract it from BGW's debug 'W(q->0, G=0, ω=iω_p)' "
-					"line and set whead_imfreq.  (Currently the imag-freq head "
-					"is NOT injected by gw_jax even when whead_imfreq is set; "
-					"see 1542342.  This guard exists so the missing PPM head "
-					"correction doesn't go unnoticed.)"
-				)
 
 		ppm_options = build_ppm_sigma_runtime_options(config, input_dir=input_dir, ryd2ev=ryd2ev)
 		print_section("GN-PPM + FREQUENCY-INTEGRATED SIGMA", print0)
+
+		# q→0, G=G'=0 head: explicitly NOT injected into Σ_c here.
+		# Rationale (see docs/gn_bug_plan.md and skills/compare/SKILL.md §4i, §4j):
+		#   - At q=0, G=0 the pair amplitude M_{nm}=δ_{nm} so any head contribution
+		#     to Σ_c is band-diagonal and tiny (~0.5 meV in 2D MoS2 reference).
+		#   - The large q→0 Coulomb divergence enters Σ_X (bare exchange) via
+		#     mini-BZ-averaged vcoul; LORRAX captures that exactly through
+		#     `static_head_terms` injected into sig_x above.
+		#   - BGW's GN-PPM treatment of the Σ_c head is broken — it produces a
+		#     spurious +3 eV shift between BGW PPM and BGW COHSEX at the Γ
+		#     valence band on Si 4×4×4.  Matching it would propagate that bug.
+		#     Verified 2026-04-24 by directly diffing BGW Sig' columns from
+		#     `runs/Si/00_si_4x4x4_60band/{00_bgw_cohsex,01_bgw_gn_ppm}/sigma_hp.log`.
+		#   - `compute_ppm_head_sigma_kij` in `head_correction.py` is the
+		#     analytic GN-pole head Σ_c that we *would* inject if we wanted to
+		#     reproduce BGW's number.  Kept around as documentation; not called.
 
 		with timing.section("gw_jax.ppm_sigma"):
 			# χ₀(iωp) → W(iωp) → GN-PPM pole fit
