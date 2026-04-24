@@ -446,6 +446,20 @@ def run_sternheimer(
             H_kminq, Gkminq_int = H_cache[ik_kminq]
             apply_H_kminq = make_apply_H(H_kminq)
 
+            # KNOWN ISSUE: when (k − q) falls outside [0,1)³ and ``sym.kq_map``
+            # wraps to the equivalent in-BZ k, there's an umklapp-phase
+            # bookkeeping between the source / p_wrap G-spheres that we do NOT
+            # currently apply.  Symptoms on MoS2 3×3 nosym:  χ₀₀(q) picks up a
+            # spurious imaginary part at q's with a 2/3 component (q=(0,2/3) →
+            # χ₀₀ = 0.0056 − 0.0025j while sum-over-states gives a real value).
+            # A naive G_wrap = k_wrap − (k−q)_naive correction was tested but
+            # doesn't remove the imag part either — likely compounded with the
+            # pre-existing SymMaps "non-symmorphic phases NOT applied for
+            # TR-unfolded k-points" warning (see sources/lorrax_B startup log).
+            # For now the pipeline is correct at q-points whose k − q mapping
+            # does not wrap (q=(0,0), (1/3,1/3), etc.).  Proper fix needs a
+            # pass through SymMaps' TR-unfolding tau-phase handling.
+
             # ── ψ coefficients: box view (for FFT path) + G-sphere gather (for ops) ──
             U_val_k_box     = psi_box_full[ik_full,  :n_occ]           # (nv, ns, nx, ny, nz) G-space scatter
             U_val_k_G       = _psi_box_to_G_sphere(U_val_k_box, Gk_int)  # (nv, ns, ngk_k)
