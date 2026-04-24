@@ -235,6 +235,103 @@ def make_umklapp_phase(G_wrap: np.ndarray, fft_grid, sign: int = +1) -> jax.Arra
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  k·p response  ∂u_{v, kvec_p}/∂kvec_p  — "unfreeze the projector"
+# ═══════════════════════════════════════════════════════════════════════
+
+def compute_kp_tangent_at_kvec(
+    kvec_p_base_np: np.ndarray,        # (3,) — where to evaluate ∂u/∂kvec_p
+    Gkminq_int_np: np.ndarray,         # (nG_p, 3) — G-sphere at kvec_p_base
+    vnl_setup,
+    V_scf: jax.Array, mask: jax.Array,
+    Gx: jax.Array, Gy: jax.Array, Gz: jax.Array,
+    fft_grid,
+    bdot: jax.Array,
+    vnl_E_super: jax.Array,
+    U_val_G: jax.Array,                 # (nv, ns, nG_p) — occupied at kvec_p_base
+    eps_v_at_kvec_p: jax.Array,         # (nv,) — eigenvalues AT kvec_p (not source k!)
+    alpha_pv_sc: jax.Array,
+    precond_diag: jax.Array,            # (nv, 1, nG_p) — TPA at kvec_p_base
+    *,
+    tol: float = 1e-10,
+    max_iter: int = 200,
+    use_schur: bool = False,
+    U_extra_G: jax.Array | None = None,
+    eps_extra_v_at_kvec_p: jax.Array | None = None,
+) -> jax.Array:
+    """Return  ∂u_{v, kvec_p}/∂kvec_p  as a (3, nv, nspinor, nG) array.
+
+    k·p response at a specific kvec_p, obtained by solving the Sternheimer
+    equation with source  b_i = Q_{kvec_p} · (∂H/∂kvec_p_i) · u_{v, kvec_p} ,
+    for each cartesian crystal-coordinate direction ``i ∈ {0, 1, 2}``.
+
+    The chain-rule link to q-derivatives:  with kvec_p(q) = kvec_p_base −
+    (q − q_base) (the convention used in
+    :func:`chi_col_contrib_at_kvec_traced`), we have
+
+        ∂U_val(q) / ∂q_i   =  −  ∂U_val / ∂kvec_p_i    at q = q_base.
+
+    So the driver passes this ``U_val_grad`` (returned here) into its
+    end-to-end pipeline as a linearisation of ``U_val(kvec_p)``, and
+    ``jax.jvp`` composes it automatically into the ∂χ/∂q tangent.  Result:
+    the first derivative of χ is no longer the "frozen-projector"
+    approximation (guide §5 "simplest first impl"); it includes the
+    full ∂P_occ/∂q contribution.
+
+    Cost: 3 batched CG solves per call (one per cartesian direction,
+    batched over all ``nv`` valence bands).  Each solve reuses the same
+    jitted ``sternheimer_solve`` kernel as the main χ computation.
+    Cache the result per unique k_wrap if you plan multiple q-derivative
+    evaluations — the k·p response is kvec_p-local and doesn't depend on q.
+
+    Parameters
+    ----------
+    eps_v_at_kvec_p : (nv,)
+        **Eigenvalues at kvec_p**, not at the source k.  ``U_val_G`` is an
+        eigenstate of H_{kvec_p}; the k·p Sternheimer uses those
+        eigenvalues for its shifts.  This is different from the main
+        χ-column's ``eps_v`` (which comes from the source k).
+    """
+    from solvers.sternheimer_solve import (
+        SternheimerOp, sternheimer_solve, _apply_A_inline)
+
+    def _op_at(kvec_p_t):
+        """Build the level-shifted Sternheimer op at kvec_p_t (traced)."""
+        return build_sternheimer_op_at_kvec_traced(
+            kvec_p_t, Gkminq_int_np, vnl_setup,
+            V_scf=V_scf, mask=mask, Gx=Gx, Gy=Gy, Gz=Gz, fft_grid=fft_grid,
+            bdot=bdot, vnl_E_super=vnl_E_super,
+            U_val_kminq_G=U_val_G, eps_v=eps_v_at_kvec_p,
+            alpha_pv_sc=alpha_pv_sc, precond_diag=precond_diag,
+            U_extra_G=U_extra_G, eps_extra=eps_extra_v_at_kvec_p,
+        )
+
+    kvec_p_base = jnp.asarray(kvec_p_base_np, dtype=jnp.float64)
+    op_base = _op_at(kvec_p_base)
+
+    # Q_{kvec_p} projector for the source.
+    def Q_of(x):
+        coefs = jnp.einsum('msG,vsG->vm', jnp.conj(U_val_G), x, optimize=True)
+        return x - jnp.einsum('vm,msG->vsG', coefs, U_val_G, optimize=True)
+
+    U_val_grad = []
+    for i in range(3):
+        dk = jnp.zeros(3, dtype=jnp.float64).at[i].set(1.0)
+        # (∂A/∂kvec_p_i) · U_val = (∂H/∂kvec_p_i) · U_val
+        # (α·P_val and -ε_v terms don't depend on kvec_p → their tangents = 0)
+        _, A_dot_u = jax.jvp(
+            lambda k: _apply_A_inline(_op_at(k), U_val_G),
+            (kvec_p_base,), (dk,))
+        # Source: b_i = Q_{kvec_p} · (∂H/∂kvec_p_i) · u_v
+        b_i = Q_of(A_dot_u)
+        # Solve  A · (∂u/∂kvec_p_i) = −b_i   (sternheimer_solve negates internally)
+        du_dki = sternheimer_solve(op_base, b_i,
+                                    tol=tol, max_iter=max_iter,
+                                    use_schur=use_schur)
+        U_val_grad.append(du_dki)
+    return jnp.stack(U_val_grad, axis=0)      # (3, nv, ns, nG)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  JAX-friendly Sternheimer operator rebuild (for q-derivatives via jax.jvp)
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -336,6 +433,8 @@ def chi_col_contrib_at_kvec_traced(
     use_schur: bool = False,
     U_extra_G: jax.Array | None = None,
     eps_extra: jax.Array | None = None,
+    U_val_grad_kp: jax.Array | None = None,   # (3, nv, ns, nG_p) ∂U_val/∂kvec_p  — unfreezes projector
+    kvec_p_base_for_grad: jax.Array | None = None,
 ) -> jax.Array:
     """Return the (ng_out,) χ_{G'0}(q, 0) contribution from a single source-k pair.
 
@@ -357,13 +456,26 @@ def chi_col_contrib_at_kvec_traced(
     """
     from solvers.sternheimer_solve import sternheimer_solve
 
+    # Projector linearisation (see compute_kp_tangent_at_kvec).  If the caller
+    # pre-computed the k·p gradient, use the linear model
+    #     U_val(kvec_p) = U_val_base + (kvec_p - kvec_p_base) · U_val_grad_kp,
+    # so that  ∂U_val/∂q = −U_val_grad_kp · dq  propagates through jax.jvp
+    # (via the chain rule  ∂/∂q = −∂/∂kvec_p).  At q = q_base the primal
+    # U_val is unchanged; only the tangent picks up the projector correction.
+    if U_val_grad_kp is not None and kvec_p_base_for_grad is not None:
+        dk = kvec_p_traced - kvec_p_base_for_grad                  # (3,)
+        U_val_eff = U_val_kminq_G + jnp.einsum(
+            'i,ivsG->vsG', dk, U_val_grad_kp, optimize=True)
+    else:
+        U_val_eff = U_val_kminq_G
+
     # Build the Sternheimer operator at this kvec_p, then solve for δu_wrap.
     op = build_sternheimer_op_at_kvec_traced(
         kvec_p_traced, Gkminq_int_np, vnl_setup,
         V_scf=V_scf, mask=mask,
         Gx=Gx, Gy=Gy, Gz=Gz, fft_grid=fft_grid,
         bdot=bdot, vnl_E_super=vnl_E_super,
-        U_val_kminq_G=U_val_kminq_G, eps_v=eps_v,
+        U_val_kminq_G=U_val_eff, eps_v=eps_v,
         alpha_pv_sc=alpha_pv_sc, precond_diag=precond_diag,
         U_extra_G=U_extra_G, eps_extra=eps_extra,
     )
