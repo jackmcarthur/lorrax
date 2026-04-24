@@ -309,6 +309,81 @@ def build_sternheimer_op_at_kvec_traced(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  End-to-end χ_{G'0}(q, 0) as a pure JAX function  (qvec → chi_col)
+# ═══════════════════════════════════════════════════════════════════════
+
+def chi_col_contrib_at_kvec_traced(
+    kvec_p_traced: jax.Array,         # traced — carries the q-tangent
+    Gkminq_int_np: np.ndarray,
+    vnl_setup,
+    V_scf: jax.Array,
+    mask: jax.Array,
+    Gx, Gy, Gz: jax.Array,
+    fft_grid,
+    bdot: jax.Array,
+    vnl_E_super: jax.Array,
+    U_val_kminq_G: jax.Array,
+    eps_v: jax.Array,
+    alpha_pv_sc: jax.Array,
+    precond_diag: jax.Array,
+    U_val_k_box: jax.Array,           # (nv, nspinor, nx, ny, nz) G-space scatter at source k
+    b: jax.Array,                     # (nv, nspinor, nG_p) — source, built once per (k, q)
+    Gprime_int: jax.Array,            # (ng_out, 3) int32 — output G'-list (constant)
+    phase_unwrap: jax.Array,          # (nx, ny, nz) e^{-iG_wrap·r} (unity if no wrap)
+    prefactor: jax.Array,             # () scalar χ-normalisation (spin_factor·2·√N/(V·N_k))
+    tol: float = 1e-6,
+    max_iter: int = 100,
+    use_schur: bool = False,
+    U_extra_G: jax.Array | None = None,
+    eps_extra: jax.Array | None = None,
+) -> jax.Array:
+    """Return the (ng_out,) χ_{G'0}(q, 0) contribution from a single source-k pair.
+
+    Single JAX-jittable function:  qvec (via kvec_p_traced) → χ_col[G'].
+    Wrapping ``jax.jvp`` / ``jax.jacfwd`` around this gives ∂χ/∂q for this
+    (k_source, k-q) pair; summing over source k's gives the total column's
+    q-derivative.  All non-q-dependent data is passed through unchanged.
+
+    Why this helper exists:  the driver loops over source k's in Python and
+    accumulates the density in real space before a single final FFT.  For
+    jvp purposes we exploit linearity:
+
+        χ_col(q) = Σ_k (chi_col_contrib_at_kvec_traced at k's kvec_p(q))
+        ∂χ_col/∂q = Σ_k  jax.jvp(contrib_at_k, ...)
+
+    Each contribution is a clean JAX function so the custom-jvp machinery
+    for the inner Sternheimer solve composes through the density-project
+    step.
+    """
+    from solvers.sternheimer_solve import sternheimer_solve
+
+    # Build the Sternheimer operator at this kvec_p, then solve for δu_wrap.
+    op = build_sternheimer_op_at_kvec_traced(
+        kvec_p_traced, Gkminq_int_np, vnl_setup,
+        V_scf=V_scf, mask=mask,
+        Gx=Gx, Gy=Gy, Gz=Gz, fft_grid=fft_grid,
+        bdot=bdot, vnl_E_super=vnl_E_super,
+        U_val_kminq_G=U_val_kminq_G, eps_v=eps_v,
+        alpha_pv_sc=alpha_pv_sc, precond_diag=precond_diag,
+        U_extra_G=U_extra_G, eps_extra=eps_extra,
+    )
+    delta_u = sternheimer_solve(op, b, tol=tol, max_iter=max_iter, use_schur=use_schur)
+
+    # ── Density contribution (naive frame; phase_unwrap handles G_wrap) ──
+    # accumulate_chi_density:  δn_contrib(r) = Σ_v u_{v,k_s}(r) · conj(δu_naive(r))
+    # where δu_naive(r) = phase_unwrap(r) · δu_wrap(r).
+    delta_n_contrib_r = accumulate_chi_density(
+        U_val_k_box, delta_u, jnp.asarray(Gkminq_int_np), fft_grid,
+        phase_unwrap=phase_unwrap)
+
+    # ── FFT δn to G-space, gather at target G' list ──
+    chi_col_raw = project_density_to_Gsphere(delta_n_contrib_r, Gprime_int)
+
+    # ── Apply Adler-Wiser normalization prefactor ──
+    return prefactor * chi_col_raw
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  Full-BZ WFN buffer
 # ═══════════════════════════════════════════════════════════════════════
 
