@@ -68,8 +68,8 @@ from psp.dft_operators import setup_H_k_from_kvec
 from psp.h_dft import make_apply_H
 from psp.pseudos import load_pseudopotentials
 from psp.scf_potential import build_dft_potentials, build_rho_val_from_wfn
-from solvers.minres import minres
-from solvers.projectors import make_Q_kminq
+from solvers.cg_posdef import cg_posdef
+from solvers.projectors import make_P_val, make_Q_kminq
 from solvers.sternheimer_precond import (
     compute_per_band_kinetic,
     make_tpa_preconditioner,
@@ -79,6 +79,12 @@ from solvers.sternheimer_precond import (
 # ═══════════════════════════════════════════════════════════════════════
 #  Jitted real-space kernels (single-GPU; no sharding)
 # ═══════════════════════════════════════════════════════════════════════
+
+def _batched_real_norm_host(a: jax.Array) -> jax.Array:
+    """``(batch,)`` real L2 norm over the trailing two axes — for the b≈0 fast path."""
+    return jnp.sqrt(jnp.real(
+        jnp.einsum('vsG,vsG->v', jnp.conj(a), a, optimize=True)))
+
 
 def _gather_box_at_G(box: jax.Array, G_int: jax.Array) -> jax.Array:
     """Gather values at the signed integer G-indices (wrapped mod FFT-grid).
@@ -350,14 +356,46 @@ def run_sternheimer(
     psi_box_full, en_full = _load_unfolded_wfns(wfn, sym, meta, nb_load, verbose=verbose)
     # FFT-box layout: (nk_full, nb, ns, nx, ny, nz)
 
-    # Per-k G-vector lists in QE order (unfolded via SymMaps).
-    gvecs_full = [np.asarray(sym.get_gvecs_kfull(wfn, ik), dtype=np.int32)
-                  for ik in range(sym.nk_tot)]
-    # Padded uniform G-count not used here — we work at natural nG_k.
+    # Per-k G-vector lists — but the **canonical** G-order we use for coefficients
+    # is ``H_k.{Gx, Gy, Gz}`` from ``setup_H_k_from_kvec``, NOT SymMaps' order.
+    # Those two orderings are permutations of each other (both are sphere-sorts,
+    # but differ in the tie-breaking rule).  Mixing them corrupts apply_H, which
+    # scatters coefficients using H_k's order — the first MoS2 run revealed this
+    # by giving <u|H|u> − ε = +3.77 Ry with huge off-diagonals; using H_k's order
+    # recovers <u|H|u> = ε to 0.04 mRy (NSCF convergence residual).
+    #
+    # We pre-compute and cache per-k (Gk_int, H_k) pairs so the inner loop
+    # doesn't re-setup H_k twice per (ik_full, iq).  H_k's Gx/Gy/Gz are
+    # jax.Arrays; we store them alongside the H_k object.
+    H_cache = []   # list of (H_k, Gk_int_canonical) per full-BZ k
+    for ik in range(sym.nk_tot):
+        kv = np.asarray(sym.unfolded_kpts[ik], dtype=np.float64)
+        H_k = setup_H_k_from_kvec(kv, V_scf, vnl_setup, wfn, meta, V_loc_r=V_loc)
+        Gk_int = jnp.stack([H_k.Gx, H_k.Gy, H_k.Gz], axis=-1).astype(jnp.int32)
+        H_cache.append((H_k, Gk_int))
+    if verbose:
+        print(f"  H_k cache: {len(H_cache)} Hamiltonians, max nG={max(int(H.nG) for H, _ in H_cache)}")
 
     if verbose:
         dt = time.perf_counter() - t_setup
         print(f"\n  Setup complete ({dt:.1f}s)")
+
+    # ── α_pv: level-shift for QE-DFPT-style positive-definite solve ────
+    # Following LR_Modules/setup_alpha_pv.f90:  α_pv = 2·(E_max − E_min) of the
+    # loaded-band spectrum.  This is enough to make
+    #   A_v = H_{k-q} − ε_{v,k} + α_pv · P_val^{k-q}
+    # positive-definite on the ENTIRE Hilbert space: on range(P_val) the
+    # eigenvalues are ≈ α_pv − (ε_{v'} − ε_{v,k}) > 0 by construction, and on
+    # range(Q) they are ε_c − ε_{v,k} > 0 for any insulator.  With A_v PD we
+    # run plain CG (no projection inside iterations) — the mathematical gap
+    # between "projected MINRES" and "level-shifted CG" lands us at the same
+    # solution (both: δu ⊥ occupied at k-q when b is) but CG avoids MINRES'
+    # pseudo-convergence-NaN pitfall under our JIT'd fixed-iter loop.
+    en_occ = np.asarray(en_full[:, :n_occ], dtype=np.float64)
+    alpha_pv = float(2.0 * (en_occ.max() - en_occ.min()))
+    if verbose:
+        print(f"\n  α_pv = 2·(E_max − E_min) = {alpha_pv:.3f} Ry "
+              f"(from {n_occ} occupied bands × {int(sym.nk_tot)} k-points)")
 
     # ── HDF5 output ────────────────────────────────────────────────────
     out_h5 = h5py.File(output_path, "w")
@@ -402,17 +440,13 @@ def run_sternheimer(
         t_q = time.perf_counter()
         for ik_full in range(nk_full):
             ik_kminq = int(sym.kq_map[ik_full, iq_red])
-            kvec_kminq = np.asarray(sym.unfolded_kpts[ik_kminq], dtype=np.float64)
 
-            # ── H_{k-q}, apply_H_kminq ──
-            H_kminq = setup_H_k_from_kvec(
-                kvec_kminq, V_scf, vnl_setup, wfn, meta,
-                V_loc_r=V_loc)                                    # natural nG, no padding
+            # ── Pull cached H / G-order (canonical = H_k's Gx/Gy/Gz) ──
+            H_k,     Gk_int     = H_cache[ik_full]
+            H_kminq, Gkminq_int = H_cache[ik_kminq]
             apply_H_kminq = make_apply_H(H_kminq)
-            Gkminq_int = jnp.asarray(gvecs_full[ik_kminq])
 
             # ── ψ coefficients: box view (for FFT path) + G-sphere gather (for ops) ──
-            Gk_int = jnp.asarray(gvecs_full[ik_full])
             U_val_k_box     = psi_box_full[ik_full,  :n_occ]           # (nv, ns, nx, ny, nz) G-space scatter
             U_val_k_G       = _psi_box_to_G_sphere(U_val_k_box, Gk_int)  # (nv, ns, ngk_k)
             U_val_kminq_box = psi_box_full[ik_kminq, :n_occ]
@@ -421,8 +455,9 @@ def run_sternheimer(
             # Eigenvalues at the SOURCE k (not k-q).
             eps_vk = en_full[ik_full, :n_occ]                      # (nv,)
 
-            # ── Projector Q_{k-q} ──
+            # ── Projector + level-shift operator for CG ──
             Q_kminq = make_Q_kminq(U_val_kminq_G)
+            P_val_kminq = make_P_val(U_val_kminq_G)
 
             # ── Source b_{v,k} = Q_{k-q} · V_pert(r) · u_{v,k} ──
             b = build_sternheimer_source(
@@ -435,45 +470,55 @@ def run_sternheimer(
 
             # ── TPA preconditioner ──
             # K̄²_v = ⟨ψ_{v,k}|T_k|ψ_{v,k}⟩ from the *source* k's kinetic diagonal.
-            # Build H_k only for T_diag_k; nonlocal setup is reused via vnl_setup.
-            H_k = setup_H_k_from_kvec(
-                np.asarray(sym.unfolded_kpts[ik_full], dtype=np.float64),
-                V_scf, vnl_setup, wfn, meta, V_loc_r=V_loc)
             K_bar_sq = compute_per_band_kinetic(U_val_k_G, H_k.T_diag)
             precond = make_tpa_preconditioner(H_kminq.T_diag, K_bar_sq)
 
-            # ── Build the Sternheimer operator  A_v(x) = Q (H_kminq x − ε_v x) ──
+            # ── QE-DFPT level-shifted Sternheimer operator ──
+            #   A_v(x) = H_{k-q} x − ε_{v,k} x + α_pv · P_val^{k-q}(x)
+            # Positive-definite on the whole Hilbert space ⇒ plain CG converges
+            # without projector drift.  The solution is automatically orthogonal
+            # to occupied because the RHS is Q_{k-q}-projected (anything in
+            # range(P_val) on the LHS must come from a P_val component of b).
             def apply_A(x, apply_H_kminq=apply_H_kminq,
-                         Q_kminq=Q_kminq, eps_vk=eps_vk):
+                         P_val_kminq=P_val_kminq,
+                         eps_vk=eps_vk, alpha_pv=alpha_pv):
                 Hx = apply_H_kminq(x)
                 shifted = Hx - eps_vk[:, None, None].astype(x.dtype) * x
-                return Q_kminq(shifted)
+                return shifted + alpha_pv * P_val_kminq(x)
 
-            # ── MINRES solve ──
-            delta_u, info = minres(
-                apply_A, -b,
-                precond=precond, project=Q_kminq,
-                tol=tol, max_iter=max_iter)
+            # ── Primal fast path: ‖b‖ below numerical noise → δu = 0 ──
+            # At q = 0, b = Q_k · u_{v,k} = 0 analytically; floating-point
+            # gives ~1e-15 residue.  Running CG on numerical noise is not only
+            # wasteful, it's harmful (see the dead-band saga in solvers/minres.py).
+            # The correct primal answer is x = 0; the non-trivial content at
+            # q = 0 sits in the *derivative*, which comes from a custom JVP
+            # (see Stage 3) that solves A·ẋ = ḃ with the differentiated source —
+            # not from running CG on zero.
+            b_norms = _batched_real_norm_host(b)       # (nv,) float — cheap, on-device
+            b_norm_max = float(jnp.max(b_norms))
+            if b_norm_max < 1e-12:
+                delta_u = jnp.zeros_like(b)
+                res_max = 0.0
+                converged = True
+            else:
+                delta_u, info = cg_posdef(
+                    apply_A, -b, precond=precond,
+                    tol=tol, max_iter=max_iter)
+                res_max = float(jnp.max(info.res_norms))
+                converged = bool(jnp.all(info.converged))
 
-            total_res = max(total_res, float(jnp.max(info.res_norms)))
-            total_conv = total_conv and bool(jnp.all(info.converged))
+            total_res = max(total_res, res_max)
+            total_conv = total_conv and converged
 
-            # δu orthogonality sanity: ‖U_p^† δu‖ should be ~0.
+            # δu orthogonality sanity: ‖U_p^† δu‖ should be ~0 (from CG + shift).
             U_dag_du = jnp.einsum('nsG,vsG->vn',
                                    jnp.conj(U_val_kminq_G), delta_u)
             leak_du = float(jnp.max(jnp.abs(U_dag_du)))
             total_leak = max(total_leak, leak_du)
 
             # ── Density contribution ──
-            dn_contrib = accumulate_chi_density(
+            delta_n_r = delta_n_r + accumulate_chi_density(
                 U_val_k_box, delta_u, Gkminq_int, wfn.fft_grid)
-            if ik_full < 3 and verbose:
-                du_nan = bool(jnp.any(jnp.isnan(delta_u)))
-                dn_nan = bool(jnp.any(jnp.isnan(dn_contrib)))
-                print(f"    [debug ik={ik_full}] du_nan={du_nan} dn_nan={dn_nan} "
-                      f"|du|={float(jnp.max(jnp.abs(delta_u))):.2e} "
-                      f"|dn|={float(jnp.max(jnp.abs(dn_contrib))):.2e}")
-            delta_n_r = delta_n_r + dn_contrib
 
         # ── Project δn → χ column at G' ──
         # Prefactor = spin_factor / N_k.  Spin factor is 2 for scalar (nspinor=1)
