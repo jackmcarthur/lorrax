@@ -98,6 +98,23 @@ def _gather_box_at_G(box: jax.Array, G_int: jax.Array) -> jax.Array:
     return box[..., ix, iy, iz]
 
 
+def build_sternheimer_source_preQ(
+    U_box_k: jax.Array,
+    Gkminq_int: jax.Array,
+    V_pert_real: jax.Array,
+) -> jax.Array:
+    """V_pert(r)·u_{v,k_s}(r) gathered on the (k-q) G-sphere — BEFORE Q-projection.
+
+    Split out of ``build_sternheimer_source`` so the caller can apply
+    Q_{k-q} with a Q that varies with q (needed when unfreezing the
+    projector for ∂χ/∂q — see ``chi_col_contrib_at_kvec_traced``).
+    """
+    u_r = jnp.fft.ifftn(U_box_k, axes=(-3, -2, -1), norm='ortho')
+    Vu_r = V_pert_real[None, None, :, :, :] * u_r
+    Vu_box = jnp.fft.fftn(Vu_r, axes=(-3, -2, -1), norm='ortho')
+    return _gather_box_at_G(Vu_box, Gkminq_int)
+
+
 def build_sternheimer_source(
     U_box_k: jax.Array,            # (nv, nspinor, nx, ny, nz)  G-space scatter
     Gkminq_int: jax.Array,         # (ngk_p, 3)
@@ -424,7 +441,9 @@ def chi_col_contrib_at_kvec_traced(
     alpha_pv_sc: jax.Array,
     precond_diag: jax.Array,
     U_val_k_box: jax.Array,           # (nv, nspinor, nx, ny, nz) G-space scatter at source k
-    b: jax.Array,                     # (nv, nspinor, nG_p) — source, built once per (k, q)
+    b: jax.Array,                     # (nv, nspinor, nG_p) — Q-projected source for the frozen-
+                                      #                        projector path; ignored when Vu_G_preQ
+                                      #                        is supplied (unfrozen path)
     Gprime_int: jax.Array,            # (ng_out, 3) int32 — output G'-list (constant)
     phase_unwrap: jax.Array,          # (nx, ny, nz) e^{-iG_wrap·r} (unity if no wrap)
     prefactor: jax.Array,             # () scalar χ-normalisation (spin_factor·2·√N/(V·N_k))
@@ -435,6 +454,10 @@ def chi_col_contrib_at_kvec_traced(
     eps_extra: jax.Array | None = None,
     U_val_grad_kp: jax.Array | None = None,   # (3, nv, ns, nG_p) ∂U_val/∂kvec_p  — unfreezes projector
     kvec_p_base_for_grad: jax.Array | None = None,
+    Vu_G_preQ: jax.Array | None = None,   # (nv, nspinor, nG_p) — V_pert(r)·u_{v,k_s} gathered
+                                           # on the p-sphere, pre-Q-projection.  Pass this
+                                           # (together with U_val_grad_kp) to get the correct
+                                           # q-dependence of the source via Q_{k-q}(q).
 ) -> jax.Array:
     """Return the (ng_out,) χ_{G'0}(q, 0) contribution from a single source-k pair.
 
@@ -479,7 +502,21 @@ def chi_col_contrib_at_kvec_traced(
         alpha_pv_sc=alpha_pv_sc, precond_diag=precond_diag,
         U_extra_G=U_extra_G, eps_extra=eps_extra,
     )
-    delta_u = sternheimer_solve(op, b, tol=tol, max_iter=max_iter, use_schur=use_schur)
+
+    # Source b for this q.  The PHYSICAL source is Q_{k-q}(q) · V_pert · u_{v,k_s}.
+    # When the projector is unfrozen, Q_{k-q} depends on q through U_val_eff,
+    # and b must be recomputed here so its q-tangent enters the custom_jvp
+    # rule.  If Vu_G_preQ (= V_pert · u_{v,k_s} on the p-sphere, BEFORE
+    # Q-projection) is provided, apply Q(U_val_eff) here; otherwise fall
+    # back to the frozen-source path for backward compatibility.
+    if Vu_G_preQ is not None:
+        # Q_{k-q}(x) = x − U_val_eff · (U_val_eff^† x)
+        coefs = jnp.einsum('msG,vsG->vm', jnp.conj(U_val_eff), Vu_G_preQ, optimize=True)
+        b_eff = Vu_G_preQ - jnp.einsum('vm,msG->vsG', coefs, U_val_eff, optimize=True)
+    else:
+        b_eff = b
+
+    delta_u = sternheimer_solve(op, b_eff, tol=tol, max_iter=max_iter, use_schur=use_schur)
 
     # ── Density contribution (naive frame; phase_unwrap handles G_wrap) ──
     # accumulate_chi_density:  δn_contrib(r) = Σ_v u_{v,k_s}(r) · conj(δu_naive(r))
