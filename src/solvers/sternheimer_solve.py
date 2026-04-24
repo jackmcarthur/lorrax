@@ -71,15 +71,22 @@ class SternheimerOp:
     eps_v          : (nv,)                  — eigenvalues at source k
     alpha_pv       : ()  scalar             — level-shift
     precond_diag   : (nv, 1, nG)            — TPA preconditioner weights
+
+    Schur initial-guess fields (all None if unused — plain CG starts from zero):
+    U_extra        : (M, nspinor, nG) or None — low-energy Ritz / conduction
+                     vectors at k-q, orthonormal and orthogonal to U_val
+    eps_extra      : (M,) or None             — eigenvalues of H_{k-q} on U_extra
     """
     __slots__ = ("T_diag", "V_scf", "Gx", "Gy", "Gz",
                  "vnl_Z", "vnl_E", "mask",
                  "U_val", "eps_v", "alpha_pv", "precond_diag",
+                 "U_extra", "eps_extra",
                  "fft_grid")
 
     def __init__(
         self, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask,
         U_val, eps_v, alpha_pv, precond_diag, fft_grid,
+        U_extra=None, eps_extra=None,
     ):
         self.T_diag = T_diag
         self.V_scf = V_scf
@@ -93,19 +100,27 @@ class SternheimerOp:
         self.eps_v = eps_v
         self.alpha_pv = alpha_pv
         self.precond_diag = precond_diag
-        self.fft_grid = fft_grid          # static (tuple of ints)
+        self.U_extra = U_extra              # may be None
+        self.eps_extra = eps_extra          # may be None
+        self.fft_grid = fft_grid            # static (tuple of ints)
 
     def tree_flatten(self):
+        # None-valued Schur fields become empty leaves for pytree compat.
         children = (self.T_diag, self.V_scf, self.Gx, self.Gy, self.Gz,
                     self.vnl_Z, self.vnl_E, self.mask,
-                    self.U_val, self.eps_v, self.alpha_pv, self.precond_diag)
-        aux = (self.fft_grid,)
+                    self.U_val, self.eps_v, self.alpha_pv, self.precond_diag,
+                    self.U_extra, self.eps_extra)
+        aux = (self.fft_grid, self.U_extra is None)
         return children, aux
 
     @classmethod
     def tree_unflatten(cls, aux, children):
-        (fft_grid,) = aux
-        return cls(*children, fft_grid=fft_grid)
+        (fft_grid, schur_off) = aux
+        # Preserve the None when rebuilding after a pytree transform.
+        (*core, U_ext, eps_ext) = children
+        if schur_off:
+            U_ext = None; eps_ext = None
+        return cls(*core, fft_grid=fft_grid, U_extra=U_ext, eps_extra=eps_ext)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -155,13 +170,54 @@ def _batched_real_norm(a):
     return jnp.sqrt(jnp.real(_batched_dot(a, a)))
 
 
-@functools.partial(jax.jit, static_argnames=('max_iter',))
-def _sternheimer_core(op: SternheimerOp, b: jax.Array, tol: float, max_iter: int) -> jax.Array:
+def _schur_initial_guess(op: SternheimerOp, b: jax.Array) -> jax.Array:
+    """Explicit T-block solution (= standard sum-over-states formula over the
+    loaded extra-Ritz subspace) used as the CG initial guess.
+
+    Since U_extra are Ritz vectors of H_{k-q} with eigenvalues eps_extra, and
+    they're orthogonal to U_val (so α_pv·P_val·U_extra = 0), the T-block of
+    the level-shifted operator A = H_{k-q} − ε_{v,k} + α_pv·P_val is diagonal:
+
+        A_TT[m, m'] = (eps_extra[m] − eps_v) · δ_{m, m'}
+
+    and the T-block of the solution   A · x = −b   reads
+
+        x^T_v(r) = −Σ_m  ⟨U_m | b_v⟩_cell / (eps_extra[m] − eps_v[v]) · U_m(r)
+
+    That's the k·p / SoS formula applied to the first M ``extra`` bands.
+    CG from this initial guess then only has to correct the residual beyond
+    those M bands — the hard (low-energy / small-denominator) part is
+    handled explicitly.
+    """
+    # coefs[v, m] = ⟨U_m | b_v⟩_cell = Σ_{s,G} conj(U_extra[m,s,G]) · b[v,s,G]
+    coefs = jnp.einsum('msG,vsG->vm', jnp.conj(op.U_extra), b, optimize=True)
+    # Energy denominator  (eps_extra[m] − eps_v[v])   (M, ) − (v,) → (v, M)
+    denom = op.eps_extra[None, :] - op.eps_v[:, None]                 # (batch, M)
+    # Guard against near-zero denominator (crossings between extra-Ritz
+    # and occupied energies).  For a proper insulator this never happens,
+    # but include a clamp so a degenerate band doesn't blow up.
+    denom_safe = jnp.where(jnp.abs(denom) > 1e-8, denom, 1.0)
+    y = jnp.where(jnp.abs(denom) > 1e-8, -coefs / denom_safe, 0.0)     # (batch, M)
+    # x0[v,s,G] = Σ_m y[v,m] · U_m[s,G]
+    return jnp.einsum('vm,msG->vsG', y, op.U_extra, optimize=True)
+
+
+@functools.partial(jax.jit, static_argnames=('max_iter', 'use_schur'))
+def _sternheimer_core(op: SternheimerOp, b: jax.Array,
+                      tol: float, max_iter: int,
+                      use_schur: bool = False) -> jax.Array:
     """Level-shifted preconditioned CG for  A_v · δu = −b.
 
     Returns δu of the same shape as ``b``.  The solution lies in range(Q_{k-q})
     automatically when ``b`` does (A is block-diagonal on the
     range(Q) ⊕ range(P_val) decomposition).
+
+    When ``use_schur`` is True the CG is warm-started from the explicit
+    T-block solution over op.U_extra (see :func:`_schur_initial_guess`).
+    Equivalent to the Cancès-et-al. Schur split in initial-guess form
+    (guide §3 final paragraph).  Reduces CG iteration count for systems
+    where small-denominator low-energy conduction modes dominate the
+    spectrum of the iterate.
 
     Per-band convergence freeze (mirrors QE's ``conv(ibnd)``): once a band's
     residual drops below tol·‖b‖, subsequent iterations don't update it.
@@ -176,8 +232,11 @@ def _sternheimer_core(op: SternheimerOp, b: jax.Array, tol: float, max_iter: int
     batch = b.shape[0]
 
     rhs = -b                                            # actual RHS for CG
-    x0 = jnp.zeros_like(b)
-    r0 = rhs - _apply_A_inline(op, x0)                  # = rhs
+    if use_schur:
+        x0 = _schur_initial_guess(op, b)
+    else:
+        x0 = jnp.zeros_like(b)
+    r0 = rhs - _apply_A_inline(op, x0)                  # = rhs for x0=0
     z0 = _precond_inline(op, r0)
     rho0 = jnp.real(_batched_dot(r0, z0))               # ≥ 0 for HPD M
     b_norm = _batched_real_norm(rhs)
@@ -223,9 +282,10 @@ def _sternheimer_core(op: SternheimerOp, b: jax.Array, tol: float, max_iter: int
 #  Public primitive with custom JVP
 # ═══════════════════════════════════════════════════════════════════════
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(2, 3))
+@functools.partial(jax.custom_jvp, nondiff_argnums=(2, 3, 4))
 def sternheimer_solve(op: SternheimerOp, b: jax.Array,
-                      tol: float = 1e-6, max_iter: int = 100) -> jax.Array:
+                      tol: float = 1e-6, max_iter: int = 100,
+                      use_schur: bool = False) -> jax.Array:
     """Solve  A_v · δu = −b  via level-shifted CG.  Single-compile.
 
     Primal + custom JVP, so ``jax.jvp`` / ``jax.jacfwd`` work without
@@ -246,11 +306,11 @@ def sternheimer_solve(op: SternheimerOp, b: jax.Array,
     tol : float — convergence tolerance.
     max_iter : int — static iteration cap.
     """
-    return _sternheimer_core(op, b, tol, max_iter)
+    return _sternheimer_core(op, b, tol, max_iter, use_schur)
 
 
 @sternheimer_solve.defjvp
-def _sternheimer_solve_jvp(tol, max_iter, primals, tangents):
+def _sternheimer_solve_jvp(tol, max_iter, use_schur, primals, tangents):
     """JVP rule via implicit differentiation.
 
     Let  A x = b  with  x = sternheimer_solve(op, b).  Then
@@ -259,12 +319,15 @@ def _sternheimer_solve_jvp(tol, max_iter, primals, tangents):
                       └──── linearise apply_A(op, x) wrt op, at fixed x ────┘
 
     so ``ẋ`` is obtained by calling the primitive again with the tangent RHS.
+    The tangent solve also uses Schur warm-start when ``use_schur`` is True —
+    its T-block initial guess is the standard k·p formula applied to the
+    differentiated RHS (same Ritz vectors, same denominators).
     """
     op, b = primals
     op_dot, b_dot = tangents
 
     # Primal solve.
-    x = _sternheimer_core(op, b, tol, max_iter)
+    x = _sternheimer_core(op, b, tol, max_iter, use_schur)
 
     # Compute Ȧ · x  via jax.jvp of _apply_A_inline w.r.t. op at fixed x.
     _, A_dot_x = jax.jvp(
@@ -278,7 +341,7 @@ def _sternheimer_solve_jvp(tol, max_iter, primals, tangents):
     # internally solves A·ẋ = −(ḃ − Ȧ·x); but the WANTED equation is
     # A·ẋ = ḃ − Ȧ·x, so we instead pass the NEGATED quantity.
     rhs_tangent = -(b_dot - A_dot_x)                    # fed to _sternheimer_core which negates → + (ḃ − Ȧx)
-    x_dot = _sternheimer_core(op, rhs_tangent, tol, max_iter)
+    x_dot = _sternheimer_core(op, rhs_tangent, tol, max_iter, use_schur)
 
     return x, x_dot
 

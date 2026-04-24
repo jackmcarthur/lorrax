@@ -538,6 +538,24 @@ def run_sternheimer(
             # the q-derivative via an implicit-differentiation solve.
             K_bar_sq = compute_per_band_kinetic(U_val_k_G, H_k.T_diag)
             precond_diag = tpa_preconditioner_diag(H_kminq.T_diag, K_bar_sq)
+
+            # ── Schur-block extras: M low-energy conduction Ritz vectors at p=k-q ──
+            # When ``n_cond_bands > 0`` is passed, we load that many extra
+            # bands from WFN.h5 past n_occ and use them as the T-block in the
+            # Schur split.  Because these are H_{k-q} eigenstates, A_TT is
+            # diagonal with entries (ε_{c,p} − ε_v), and the T-block initial
+            # guess reduces to the standard k·p formula — see
+            # ``solvers.sternheimer_solve._schur_initial_guess``.  Since
+            # n_cond_bands is a runtime knob (may be 0), we thread U_extra as
+            # None vs populated.
+            if n_cond_bands > 0:
+                U_extra_kminq_box = psi_box_full[ik_kminq, n_occ:n_occ + n_cond_bands]
+                U_extra_kminq_G = _psi_box_to_G_sphere(U_extra_kminq_box, Gkminq_int)
+                eps_extra_kminq = en_full[ik_kminq, n_occ:n_occ + n_cond_bands]
+            else:
+                U_extra_kminq_G = None
+                eps_extra_kminq = None
+
             op = SternheimerOp(
                 T_diag=H_kminq.T_diag, V_scf=H_kminq.V_scf,
                 Gx=H_kminq.Gx, Gy=H_kminq.Gy, Gz=H_kminq.Gz,
@@ -546,6 +564,7 @@ def run_sternheimer(
                 alpha_pv=jnp.asarray(alpha_pv, dtype=jnp.float64),
                 precond_diag=precond_diag,
                 fft_grid=H_kminq.fft_grid,
+                U_extra=U_extra_kminq_G, eps_extra=eps_extra_kminq,
             )
 
             # ── Primal fast path for ‖b‖ ≈ 0 (q=0, G=0 case) ──
@@ -555,7 +574,9 @@ def run_sternheimer(
                 res_max = 0.0
                 converged = True
             else:
-                delta_u = sternheimer_solve(op, b, tol=tol, max_iter=max_iter)
+                use_schur = (n_cond_bands > 0)
+                delta_u = sternheimer_solve(op, b, tol=tol, max_iter=max_iter,
+                                             use_schur=use_schur)
                 # Residual check outside the primitive (don't bake it into
                 # the JIT trace — the primitive is converged-by-design).
                 from solvers.sternheimer_solve import _apply_A_inline
