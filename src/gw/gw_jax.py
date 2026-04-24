@@ -399,6 +399,25 @@ def main(argv=None):
 			raise ValueError("use_ppm_sigma=true requires do_screened=true.")
 		if config.self_consistent:
 			raise NotImplementedError("use_ppm_sigma not supported with self_consistent.")
+		# PPM Σ_c needs the head at *both* ω=0 and ω=iω_p.  The Apr-10
+		# 'Unify head resolution and remove G0 injection' commit (1542342)
+		# kept only the static (ω=0) injection path, so PPM Σ_c currently
+		# has no q→0 head contribution at all and is wrong by ~1–2 eV per
+		# band on bulk semiconductors.  Until the imag-freq head injection
+		# is reintroduced, refuse to silently run with a partial override:
+		# if the user is overriding the head, demand whead_imfreq too so
+		# the inconsistency is loud.
+		if config.vhead is not None or config.whead_0freq is not None:
+			if config.whead_imfreq is None:
+				raise ValueError(
+					"use_ppm_sigma=true with vhead/whead_0freq override but "
+					"whead_imfreq is unset.  PPM Σ_c needs W(q→0, G=0, ω=iω_p) "
+					"too — extract it from BGW's debug 'W(q->0, G=0, ω=iω_p)' "
+					"line and set whead_imfreq.  (Currently the imag-freq head "
+					"is NOT injected by gw_jax even when whead_imfreq is set; "
+					"see 1542342.  This guard exists so the missing PPM head "
+					"correction doesn't go unnoticed.)"
+				)
 
 		ppm_options = build_ppm_sigma_runtime_options(config, input_dir=input_dir, ryd2ev=ryd2ev)
 		print_section("GN-PPM + FREQUENCY-INTEGRATED SIGMA", print0)
