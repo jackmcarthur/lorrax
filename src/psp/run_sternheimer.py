@@ -68,12 +68,12 @@ from psp.dft_operators import setup_H_k_from_kvec
 from psp.h_dft import make_apply_H
 from psp.pseudos import load_pseudopotentials
 from psp.scf_potential import build_dft_potentials, build_rho_val_from_wfn
-from solvers.cg_posdef import cg_posdef
-from solvers.projectors import make_P_val, make_Q_kminq
+from solvers.projectors import make_Q_kminq
 from solvers.sternheimer_precond import (
     compute_per_band_kinetic,
-    make_tpa_preconditioner,
+    tpa_preconditioner_diag,
 )
+from solvers.sternheimer_solve import SternheimerOp, sternheimer_solve
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -469,9 +469,8 @@ def run_sternheimer(
             # Eigenvalues at the SOURCE k (not k-q).
             eps_vk = en_full[ik_full, :n_occ]                      # (nv,)
 
-            # ── Projector + level-shift operator for CG ──
+            # ── Projector (for source construction) ──
             Q_kminq = make_Q_kminq(U_val_kminq_G)
-            P_val_kminq = make_P_val(U_val_kminq_G)
 
             # ── Source b_{v,k} = Q_{k-q} · V_pert(r) · u_{v,k} ──
             b = build_sternheimer_source(
@@ -482,43 +481,39 @@ def run_sternheimer(
             leak_b = float(jnp.max(jnp.abs(U_dag_b)))
             total_leak = max(total_leak, leak_b)
 
-            # ── TPA preconditioner ──
-            # K̄²_v = ⟨ψ_{v,k}|T_k|ψ_{v,k}⟩ from the *source* k's kinetic diagonal.
+            # ── Level-shifted Sternheimer primitive via ``sternheimer_solve`` ──
+            # The operator  A_v = H_{k-q} − ε_{v,k} + α_pv · P_val^{k-q}  is
+            # bundled into a single ``SternheimerOp`` pytree; the primitive
+            # itself is ``@jax.jit``'d once and reused across all (ik, iq)
+            # with matching shapes.  ``jax.custom_jvp`` on the primitive
+            # means that wrapping this whole block in ``jax.jvp`` would give
+            # the q-derivative via an implicit-differentiation solve.
             K_bar_sq = compute_per_band_kinetic(U_val_k_G, H_k.T_diag)
-            precond = make_tpa_preconditioner(H_kminq.T_diag, K_bar_sq)
+            precond_diag = tpa_preconditioner_diag(H_kminq.T_diag, K_bar_sq)
+            op = SternheimerOp(
+                T_diag=H_kminq.T_diag, V_scf=H_kminq.V_scf,
+                Gx=H_kminq.Gx, Gy=H_kminq.Gy, Gz=H_kminq.Gz,
+                vnl_Z=H_kminq.vnl_Z, vnl_E=H_kminq.vnl_E, mask=H_kminq.mask,
+                U_val=U_val_kminq_G, eps_v=eps_vk,
+                alpha_pv=jnp.asarray(alpha_pv, dtype=jnp.float64),
+                precond_diag=precond_diag,
+                fft_grid=H_kminq.fft_grid,
+            )
 
-            # ── QE-DFPT level-shifted Sternheimer operator ──
-            #   A_v(x) = H_{k-q} x − ε_{v,k} x + α_pv · P_val^{k-q}(x)
-            # Positive-definite on the whole Hilbert space ⇒ plain CG converges
-            # without projector drift.  The solution is automatically orthogonal
-            # to occupied because the RHS is Q_{k-q}-projected (anything in
-            # range(P_val) on the LHS must come from a P_val component of b).
-            def apply_A(x, apply_H_kminq=apply_H_kminq,
-                         P_val_kminq=P_val_kminq,
-                         eps_vk=eps_vk, alpha_pv=alpha_pv):
-                Hx = apply_H_kminq(x)
-                shifted = Hx - eps_vk[:, None, None].astype(x.dtype) * x
-                return shifted + alpha_pv * P_val_kminq(x)
-
-            # ── Primal fast path: ‖b‖ below numerical noise → δu = 0 ──
-            # At q = 0, b = Q_k · u_{v,k} = 0 analytically; floating-point
-            # gives ~1e-15 residue.  Running CG on numerical noise is not only
-            # wasteful, it's harmful (see the dead-band saga in solvers/minres.py).
-            # The correct primal answer is x = 0; the non-trivial content at
-            # q = 0 sits in the *derivative*, which comes from a custom JVP
-            # (see Stage 3) that solves A·ẋ = ḃ with the differentiated source —
-            # not from running CG on zero.
+            # ── Primal fast path for ‖b‖ ≈ 0 (q=0, G=0 case) ──
             b_norm_max = float(jnp.max(_batched_real_norm_host(b)))
             if b_norm_max < 1e-12:
                 delta_u = jnp.zeros_like(b)
                 res_max = 0.0
                 converged = True
             else:
-                delta_u, info = cg_posdef(
-                    apply_A, -b, precond=precond,
-                    tol=tol, max_iter=max_iter)
-                res_max = float(jnp.max(info.res_norms))
-                converged = bool(jnp.all(info.converged))
+                delta_u = sternheimer_solve(op, b, tol=tol, max_iter=max_iter)
+                # Residual check outside the primitive (don't bake it into
+                # the JIT trace — the primitive is converged-by-design).
+                from solvers.sternheimer_solve import _apply_A_inline
+                residual = -b - _apply_A_inline(op, delta_u)
+                res_max = float(jnp.max(jnp.sqrt(jnp.sum(jnp.abs(residual)**2, axis=(1,2)))))
+                converged = res_max < tol * b_norm_max
 
             total_res = max(total_res, res_max)
             total_conv = total_conv and converged

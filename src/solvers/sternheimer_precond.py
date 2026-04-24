@@ -80,6 +80,21 @@ def compute_per_band_kinetic(U_val: jax.Array, T_diag: jax.Array) -> jax.Array:
 #  Factory: preconditioner closure
 # ═══════════════════════════════════════════════════════════════════════
 
+def tpa_preconditioner_diag(
+    T_diag_kminq: jax.Array,
+    K_bar_sq: jax.Array,
+) -> jax.Array:
+    """Return the TPA diagonal weights as an array  ``(nv, 1, nG_p)``.
+
+    Equivalent to the factory below but skips the Python-callable wrapper
+    — for plugging directly into a JIT-stable Sternheimer primitive where
+    the preconditioner is an elementwise multiply by a precomputed array.
+    """
+    K_safe = jnp.where(K_bar_sq > 0.0, K_bar_sq, 1.0)
+    x = T_diag_kminq[None, :] / K_safe[:, None]
+    return _tpa(x)[:, None, :]
+
+
 def make_tpa_preconditioner(
     T_diag_kminq: jax.Array,
     K_bar_sq: jax.Array,
@@ -119,4 +134,5 @@ def make_tpa_preconditioner(
 __all__ = [
     "compute_per_band_kinetic",
     "make_tpa_preconditioner",
+    "tpa_preconditioner_diag",
 ]
