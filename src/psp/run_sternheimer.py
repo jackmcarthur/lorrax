@@ -533,18 +533,28 @@ def run_sternheimer(
             delta_n_r = delta_n_r + accumulate_chi_density(
                 U_val_k_box, delta_u, Gkminq_int, wfn.fft_grid)
 
-        # ── Project δn → χ column at G' ──
-        # Prefactor = spin_factor / N_k.  Spin factor is 2 for scalar (nspinor=1)
-        # and 1 for FR (nspinor=2); the conventional Adler–Wiser "2" for
-        # spin degeneracy.  The +q and -q components of δn are NOT both summed
-        # into χ_{G'0}(q, 0) — only the +q component matches e^{-i(q+G')·r}
-        # in the integral, so no extra factor of 2 from pole combination.
+        # ── Project δn → χ column at G' ──  Adler–Wiser normalisation.
         #
-        # Absolute normalisation (cell volume, FFT-box factors from ortho-FFT)
-        # is deferred: downstream consumers compare trend-wise against BGW
-        # band-sum output, which pins down the multiplicative constant.
+        # Derivation (see CHANGELOG 2026-04-24):
+        #   1. ortho-IFFT convention:  u_r[j] = (1/√N) Σ_G c_u(G) e^{iG·r_j} = u(r_j)/√N.
+        #   2. accumulate_chi_density returns  δn_r[j] = Σ_{v,k} (1/N) u(r_j)·conj(δu(r_j)).
+        #   3. ortho-FFT at G'=0:  (1/√N)·Σ_j δn_r[j]  =  my raw chi_col[0].
+        #   4. Continuous cell Fourier coef:  (δn)_{G'=0} = (1/V)∫_cell δn(r) dr
+        #      = (1/N)·standard_FFT(δn)[0] = (1/√N)·ortho_FFT(δn)[0].
+        #
+        # Substituting the exact Sternheimer solution δu = Σ_c (-M_cv/ΔE) u_c,k-q,
+        #   (my raw chi_col[G'=0]) = -(1/(√N·N_k)) · Σ_{v,c,k} |M_vc|² / ΔE_cv
+        # whereas the Rydberg-atomic-units Adler–Wiser convention (e.g. BGW
+        # epsmat.h5, and Hybertsen–Louie PRB 34 5390) is
+        #   χ_physical = -(2·spin_factor/(V_cell·N_k)) · Σ |M|² / ΔE
+        # with the "2" from the +ω/−ω pole combination at ω=0.  Therefore
+        #
+        #   χ_physical = (my raw chi_col) · [2·spin_factor·√N_grid / V_cell]
+        #
+        # Cross-checked against on-file sum-over-states at several q-points
+        # on MoS2 3×3 FR: ratio agrees to CG-tolerance + band-cutoff residual.
         spin_factor = 2 if nspinor == 1 else 1
-        prefactor = spin_factor / nk_full
+        prefactor = (2.0 * spin_factor * np.sqrt(N_grid)) / (vol * nk_full)
         delta_n_r = delta_n_r * prefactor
 
         chi_col = project_density_to_Gsphere(delta_n_r, Gprime_j)
