@@ -17,7 +17,7 @@ from solvers.lanczos import (
     simple_lanczos_eig,
     lanczos_eig_jit,
 )
-from .bse_serial import apply_bse_hamiltonian_single_device
+from .bse_serial import apply_bse_hamiltonian_single_device, compute_pair_amplitude
 
 
 def solve_bse(
@@ -44,11 +44,25 @@ def solve_bse(
     shape = (nc, nv, nk)
     n_flat = nc * nv * nk
 
-    @partial(jax.jit, static_argnames=("nkx", "nky", "nkz", "include_W"))
-    def _matvec_impl(v, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz, include_W):
+    # Precompute matvec-invariants once so the Lanczos hot loop doesn't
+    # redo an ifftn on W_q (200× redundancy on 200-iter Lanczos) or an
+    # einsum pair-amplitude on psi_c,psi_v.  Both depend only on fixed
+    # GW/wfn inputs, not on the Lanczos vector v.  NB: precomputing
+    # conj(psi_c,psi_v) actually slowed things down (jit closure cost
+    # beat einsum-fused conj savings) so we leave those inlined.
+    if include_W:
+        W_R = jax.jit(lambda W: jnp.fft.ifftn(W, axes=(2, 3, 4), norm="ortho"))(W_q)
+    else:
+        W_R = jnp.zeros_like(W_q)
+    M = jax.jit(compute_pair_amplitude)(psi_c, psi_v)
+
+    @partial(jax.jit, static_argnames=("nkx", "nky", "nkz", "include_W"), donate_argnums=(0,))
+    def _matvec_impl(v, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, W_R, M,
+                     nkx, nky, nkz, include_W):
         X = v.reshape(1, nc, nv, nk)
         HX = apply_bse_hamiltonian_single_device(
-            X, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz, include_W
+            X, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz, include_W,
+            W_R=W_R, M=M,
         )
         return HX.reshape(-1)
 
@@ -60,6 +74,8 @@ def solve_bse(
         eps_v=eps_v,
         W_q=W_q,
         V_q0=V_q0,
+        W_R=W_R,
+        M=M,
         nkx=nkx,
         nky=nky,
         nkz=nkz,
@@ -68,7 +84,8 @@ def solve_bse(
 
     matvec_block = partial(
         lambda X: apply_bse_hamiltonian_single_device(
-            X, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz, include_W
+            X, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz, include_W,
+            W_R=W_R, M=M,
         )
     )
 

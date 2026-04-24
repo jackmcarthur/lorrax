@@ -57,7 +57,7 @@ def _make_symmaps():
     )
     sym.irk_sym_map = np.asarray([0], dtype=np.int32)
     sym.irk_to_k_map = np.asarray([0], dtype=np.int32)
-    sym.sym_matrices = c2z[None, :, :]
+    sym.sym_mats_R = c2z[None, :, :]
     sym.sym_mats_k = c2z[None, :, :]
     sym.unfolded_kpts = np.asarray([[0.75, 0.0, 0.0]], dtype=np.float64)
     sym.U_spinor = np.eye(2, dtype=np.complex128)[None, :, :]

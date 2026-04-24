@@ -47,8 +47,21 @@ def apply_bse_hamiltonian_single_device(
     nky: int,
     nkz: int,
     include_W: bool = True,
+    *,
+    W_R: jax.Array | None = None,
+    M: jax.Array | None = None,
+    psi_c_conj: jax.Array | None = None,
+    psi_v_conj: jax.Array | None = None,
+    M_conj: jax.Array | None = None,
 ) -> jax.Array:
-    """Single-device BSE Hamiltonian for verification."""
+    """Single-device BSE Hamiltonian for verification.
+
+    ``W_R`` (= ifftn(W_q)), ``M`` (pair amplitude conj(ψ_c)·ψ_v), and the
+    ``*_conj`` tensors all depend only on the fixed GW/wfn inputs, so
+    passing them precomputed avoids ~200× redundant work inside the
+    Lanczos loop.  If not passed, they are computed on-the-fly
+    (verification path).
+    """
     nk = nkx * nky * nkz
     nspinor = psi_c.shape[2]
     n_rmu = psi_c.shape[3]
@@ -56,25 +69,33 @@ def apply_bse_hamiltonian_single_device(
     delta_E = energy_diff_cv_k(eps_c, eps_v)[None, :, :, :]
     D_term = delta_E * X
 
-    M = compute_pair_amplitude(psi_c, psi_v)
+    if M is None:
+        M = compute_pair_amplitude(psi_c, psi_v)
+    if M_conj is None:
+        M_conj = jnp.conj(M)
+    if psi_c_conj is None:
+        psi_c_conj = jnp.conj(psi_c)
+    if psi_v_conj is None:
+        psi_v_conj = jnp.conj(psi_v)
     sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
 
     S_V = jnp.einsum("kcvN,bcvk->bNk", M, X) / sqrt_nk
     U_V = jnp.einsum("MN,bNk->bMk", V_q0, S_V)
-    V_term = jnp.einsum("kcvM,bMk->bcvk", jnp.conj(M), U_V) / sqrt_nk
+    V_term = jnp.einsum("kcvM,bMk->bcvk", M_conj, U_V) / sqrt_nk
 
     if not include_W:
         return D_term + V_term
 
-    R = jnp.einsum("kvsN,bcvk->bcksN", jnp.conj(psi_v), X)
+    R = jnp.einsum("kvsN,bcvk->bcksN", psi_v_conj, X)
     T = jnp.einsum("kctM,bcksN->bMNtsk", psi_c, R)
     T_k = T.reshape(X.shape[0], n_rmu, n_rmu, nspinor, nspinor, nkx, nky, nkz)
     T_R = jnp.fft.ifftn(T_k, axes=(5, 6, 7), norm="ortho")
-    W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
+    if W_R is None:
+        W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
     U_R = W_R[None, :, :, None, None, :, :, :] * T_R
     U_q = jnp.fft.fftn(U_R, axes=(5, 6, 7), norm="ortho")
     U = U_q.reshape(X.shape[0], n_rmu, n_rmu, nspinor, nspinor, nk)
-    A = jnp.einsum("kctM,bMNtsk->bcNsk", jnp.conj(psi_c), U)
+    A = jnp.einsum("kctM,bMNtsk->bcNsk", psi_c_conj, U)
     W_term = jnp.einsum("kvsN,bcNsk->bcvk", psi_v, A) / sqrt_nk
 
     return D_term + V_term - W_term

@@ -137,7 +137,7 @@ def _symmetrise_density(
     Uses the reciprocal-space rotation matrices from SymMaps.
     """
     nx, ny, nz = meta.fft_grid
-    nsym = sym.sym_matrices.shape[0]
+    nsym = sym.sym_mats_R.shape[0]
 
     # FFT to G-space
     rho_G = jnp.fft.fftn(rho_r)  # (nx, ny, nz) complex
