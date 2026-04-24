@@ -993,8 +993,14 @@ def compute_all_V_q_from_zeta_h5(
                     # fewer than LORRAX's cutoff set) get overwritten; the
                     # rest keep LORRAX's point value.
                     kgrid_a = np.array([nkx, nky, nkz], dtype=np.float64)
+                    # IMPORTANT: pass the SIGNED q_frac (no mod 1) so
+                    # find_q_index discovers the integer kg0 connecting
+                    # LORRAX's q-convention (q in [-0.5, 0.5)) to BGW's
+                    # stored q (in [0, 1)). unfold_gvecs then shifts the
+                    # G-list by -kg0 to land at the right FFT slots.
+                    # Mod-wrapping here would silently set kg0=0 and
+                    # misplace BGW's body values by one Brillouin zone.
                     q_frac = np.asarray(qvec_wrapped, dtype=np.float64) / kgrid_a
-                    q_frac = np.mod(q_frac, 1.0)
                     v_scaled_bgw = np.asarray(bgw_v_grid_fn(tuple(q_frac))).reshape(-1)
                     if kernels.sphere_idx is not None:
                         v_scaled_bgw = v_scaled_bgw[np.asarray(kernels.sphere_idx)]
@@ -1110,8 +1116,10 @@ def compute_all_V_q_from_zeta_h5(
 
                         sqrt_v, phase = kernels.get_sqrt_v_and_phase(qvec_wrapped_jax)
                         if bgw_v_grid_fn is not None:
+                            # See note at single-chunk path: pass SIGNED q_frac so
+                            # find_q_index discovers the kg0 shift between LORRAX's
+                            # signed convention and BGW's [0, 1) convention.
                             q_frac = np.asarray(qvec_wrapped, dtype=np.float64) / kgrid_arr
-                            q_frac = np.mod(q_frac, 1.0)
                             v_scaled_bgw = np.asarray(bgw_v_grid_fn(tuple(q_frac))).reshape(-1)
                             if kernels.sphere_idx is not None:
                                 v_scaled_bgw = v_scaled_bgw[np.asarray(kernels.sphere_idx)]

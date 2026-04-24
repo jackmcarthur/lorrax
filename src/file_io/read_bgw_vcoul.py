@@ -78,6 +78,16 @@ class BGWVcoulTable:
                     if kg0 is not None:
                         return i, np.rint(S_k).astype(np.int32), kg0
 
+        # 3. q=0 with shifted q0: BGW epsilon-style vcoul files carry a
+        # small shift (e.g. 0.00025) on q0 for the finite-difference q→0
+        # limit.  Treat the stored q closest to (0,0,0) as the q=0 entry
+        # when LORRAX asks for q=(0,0,0).
+        if np.max(np.abs(q - np.rint(q))) < tol:
+            q_norms = np.linalg.norm(np.mod(self.q_fracs + 0.5, 1.0) - 0.5, axis=1)
+            i0 = int(np.argmin(q_norms))
+            if q_norms[i0] < 1e-2:
+                return i0, eye, np.zeros(3, dtype=np.int32)
+
         raise ValueError(f"No BGW q-point matches {q_frac} (after symmetry search)")
 
 
@@ -155,13 +165,13 @@ def fill_v_grid_for_q(
     G_miller = table.G_miller_per_q[iq]
     vcoul = table.vcoul_per_q[iq]
 
-    # Map G-vectors using the same integer formula as
-    # common/symmetry_maps.py:get_gvecs_kfull (lines 689-690):
-    #     G_full = sym_krep @ G_irr - kg0
-    # Here q_frac plays the role of k_full, q_table plays k_bar, and kg0
-    # satisfies q_frac = S_k @ q_table + kg0.  Both S_k and kg0 are
-    # integer-valued so the transform preserves the FFT grid.
-    G_input = np.einsum('ij,gj->gi', S_k.astype(np.int32), G_miller) - kg0[None, :]
+    # Map G-vectors via the shared helper. For a scalar v(q+G) with
+    #   q_frac = S_k @ q_table + kg0
+    # the G map is G_full = S_k · G_table - kg0. No fractional-translation
+    # phase enters (v is a scalar on q+G). Same formula as
+    # SymMaps.get_gvecs_kfull.
+    from common.symmetry_maps import unfold_gvecs
+    G_input = unfold_gvecs(S_k, G_miller, kg0)
 
     # Wrap Miller indices into FFT grid
     gx = np.mod(G_input[:, 0], fft_nx)
@@ -171,9 +181,9 @@ def fill_v_grid_for_q(
     v_scaled[gx, gy, gz] = vcoul / float(cell_volume)
 
     # Zero G=(0,0,0) *only at q=0* — that's the true head, handled
-    # separately via the rank-1 head correction.  For q≠0 the G=0 entry
-    # is just v(q, G=0)=8π/|q|², a finite body contribution that must be
-    # preserved.
+    # separately via the rank-1 head correction.  For q≠0 the G=0
+    # entry is v(q, G=0)=8π/|q|², a finite body contribution BGW
+    # writes as a point value; LORRAX keeps it as-is.
     q_arr = np.asarray(q_frac, dtype=np.float64)
     q_wrapped_bz = np.mod(q_arr + 0.5, 1.0) - 0.5
     if np.all(np.abs(q_wrapped_bz) < tol):

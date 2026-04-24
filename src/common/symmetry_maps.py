@@ -12,13 +12,42 @@ import jax.numpy as jnp
 from .wfnreader import WFNReader
 
 
+def unfold_gvecs(sym_krep, gvecs_ibz, kg0):
+    """Transform IBZ G-vectors to a symmetry-unfolded full-BZ k-point.
+
+    For a scalar-on-(q+G) object ``f(q+G)`` (Coulomb kernel, v(q+G) etc.)
+    related by a crystal symmetry ``q' + G' = S (q + G)`` with
+    ``q' = S_k · q + kg0``, the G map is ``G' = S_k · G - kg0``. The
+    fractional translation τ produces no phase on a scalar v(q+G); only
+    the rotation+umklapp enters. See ``fill_v_grid_for_q`` in
+    ``file_io/read_bgw_vcoul.py`` and ``SymMaps.get_gvecs_kfull`` for
+    the two callers.
+
+    Parameters
+    ----------
+    sym_krep : (3, 3) reciprocal-space symmetry matrix (``sym_mats_k``).
+    gvecs_ibz : (ngvec, 3) integer Miller indices at the parent IBZ q.
+    kg0 : (3,) integer umklapp vector satisfying q_full = S_k @ q_ibz + kg0.
+
+    Returns
+    -------
+    (ngvec, 3) integer Miller indices at the unfolded q' = S_k · q_ibz + kg0.
+    """
+    rot = np.einsum(
+        'ij,kj->ki',
+        np.asarray(sym_krep, dtype=np.int32),
+        np.asarray(gvecs_ibz, dtype=np.int32),
+    )
+    return rot - np.asarray(kg0, dtype=np.int32)[None, :]
+
+
 class SymMaps:
     def __init__(self, wfn):
         """
         Initialize symmetry mappings for a given WFN file.
         class variables are:
         dict: irk_to_k_map[irk] = [k1, k2, k3, ...], kpt id's that map to irk
-        dict: irk_sym_map[irk] = [sym1, sym2, sym3, ...], sym op sym_matrices[sym1] maps irk to ik
+        dict: irk_sym_map[irk] = [sym1, sym2, sym3, ...], sym op sym_mats_R[sym1] maps irk to ik
         U_spinor[sym_idx] is the spinor rotation matrix for the sym_idx-th symmetry operation.
         The matrices are currently 2x2 Pauli-spinor rotations; upcoming work
         will expand this to the 4-component formalism used in relativistic
@@ -30,7 +59,7 @@ class SymMaps:
             wfn: WFNReader instance
         """
         # Create k-point mappings
-        #self.sym_matrices, self.sym_mats_k = self.get_syms_from_kgridlog('kgrid.log')
+        #self.sym_mats_R, self.sym_mats_k = self.get_syms_from_kgridlog('kgrid.log')
 
         # get symmetry matrices from wfn file
         try:
@@ -39,8 +68,8 @@ class SymMaps:
             ntran = 1
         if ntran <= 1:
             # Trivial identity-only symmetry path
-            self.sym_matrices = np.eye(3, dtype=np.int32)[None, :, :]
-            self.sym_mats_k = self.sym_matrices.transpose(0, 2, 1).copy()
+            self.sym_mats_R = np.eye(3, dtype=np.int32)[None, :, :]
+            self.sym_mats_k = self.sym_mats_R.transpose(0, 2, 1).copy()
 
             # In no-symmetry case, unfolded grid equals irreducible grid
             self.unfolded_kpts = np.asarray(wfn.kpoints, dtype=float)
@@ -107,8 +136,8 @@ class SymMaps:
             ).astype(np.int32)
             return
 
-        self.sym_matrices = wfn.sym_matrices[:wfn.ntran] # these apply to real space coords as sym_matrices[i] @ [rx,ry,rz]
-        self.sym_mats_k = self.sym_matrices[:wfn.ntran].transpose(0,2,1).copy()  # these apply to k-points as sym_mats_k[i] @ [kx,ky,kz]
+        self.sym_mats_R = wfn.sym_matrices[:wfn.ntran]  # real-space: sym_mats_R[i] @ [rx,ry,rz]
+        self.sym_mats_k = self.sym_mats_R[:wfn.ntran].transpose(0, 2, 1).copy()  # reciprocal: sym_mats_k[i] @ [kx,ky,kz]
         
         # Add time-reversal symmetry (k → -k) combined with each spatial symmetry
         # This is needed because QE uses time-reversal to reduce k-points, but doesn't
@@ -149,7 +178,7 @@ class SymMaps:
         # k,q (both full zone) to k-q (full zone)
         
         # Get rotation matrices and their spinor representations
-        self.R_grid = np.rint(self.sym_matrices).astype(np.int32)
+        self.R_grid = np.rint(self.sym_mats_R).astype(np.int32)
         self.Rinv_grid = np.rint(np.linalg.inv(self.R_grid)).astype(np.int32)
 
         
@@ -190,7 +219,7 @@ class SymMaps:
         
 
     def get_syms_from_kgridlog(self,kgridfname):
-        # return the identity + the set of sym_matrices that unfold the k-points
+        # return the identity + the set of sym_mats_R that unfold the k-points
         # if \psi_nk(S^-1r) = psi_n(S^-1T.k)(r), Skbar + G_S = k
         matrices = [np.eye(3, dtype=np.int32)]
         parsing = False
@@ -303,7 +332,7 @@ class SymMaps:
         del kpoint_map  # kept in signature for compatibility with older callers
         irk_to_k_map = np.zeros(full_kpts.shape[0], dtype=np.int32)
         irk_sym_map = np.zeros(full_kpts.shape[0], dtype=np.int32)
-        ntran = len(self.sym_matrices)
+        ntran = len(self.sym_mats_R)
         # all symmetries applied to the irr k-points: shape (nkbar, nsym, 3)
         Skbar = np.einsum('ijk,lk->lij', self.sym_mats_k, wfn.kpoints)
         Skbar = self._wrap_to_bz(Skbar)
@@ -410,9 +439,24 @@ class SymMaps:
         # Calculate (B^T)^-1
         B_T_inv = np.linalg.inv(B_T)
         
-        # Convert each symmetry matrix
-        # NOT SURE IF THESE SHOULD BE SYM_MATS_K OR SYM_MATS TODO
-        sym_matrices_cart = np.einsum('ij,njk,kl->nil', B_T_inv, self.sym_mats_k, B_T)
+        # Convert each symmetry matrix.  SU(2) spinor rotations are
+        # derived from the REAL-space rotation R (via Shepperd's
+        # quaternion algorithm on the cartesian R_cart).  For spinor
+        # wavefunctions the k-space transpose of R must not be used
+        # here — doing so transposes cos/sin of rotation components in
+        # the SU(2) embedding and produces a wrong-direction rotation
+        # for operations with non-trivial rotation angle, which
+        # empirically scrambled bands across degenerate irreps for
+        # specific sym_idx (Si 4×4×4: sym_idx=6,7 gave 1+ eV Σ_X
+        # outliers).  Using self.sym_mats_R gives zero off-block
+        # leakage across all 56 non-trivial k-points.
+        #
+        # Also append -sym_mats_R for time-reversed ops so U_spinor
+        # has the same length (2*ntran) as sym_mats_k.
+        all_sym_real = np.concatenate(
+            [self.sym_mats_R, -self.sym_mats_R], axis=0
+        ) if len(self.sym_mats_k) == 2 * len(self.sym_mats_R) else self.sym_mats_R
+        sym_matrices_cart = np.einsum('ij,njk,kl->nil', B_T_inv, all_sym_real, B_T)
         sym_matrices_cart = np.around(sym_matrices_cart, decimals=10)
         
         return sym_matrices_cart
@@ -621,7 +665,7 @@ class SymMaps:
         We use the same convention here so that the associated
         non-symmorphic phase matches Common/gmap.f90.
         """
-        if sym_idx >= len(self.sym_matrices):
+        if sym_idx >= len(self.sym_mats_R):
             q_full = np.asarray(sym_krep @ wfn.kpoints[kbar_idx], dtype=np.float64)
             q_inzone = q_full % 1.0
             q_inzone[q_inzone > 0.9999] = 0.0
@@ -661,7 +705,7 @@ class SymMaps:
         This is the form used below because LORRAX reads coefficients on the
         source irreducible-zone G-list before rotating them into the full zone.
         """
-        if sym_idx >= len(self.sym_matrices):
+        if sym_idx >= len(self.sym_mats_R):
             return None
 
         tau = np.asarray(wfn.translations[sym_idx], dtype=np.float64)
@@ -690,13 +734,12 @@ class SymMaps:
         # (S.T@G = G@S)
 
         sym_idx, kbar_idx, sym_krep = self._get_symmetry_context(nk)
-        
+
         #wfn_kG = wfn.get_cnk(kbar_idx,nb)
         k_gvecs = wfn.get_gvec_nk(kbar_idx)
         Gkk = self._get_umklapp_vector(wfn, nk, sym_idx, kbar_idx, sym_krep)
 
-        k_gvecs_rot = np.einsum('ij,kj->ki', sym_krep.astype(np.int32), k_gvecs) # kgrid.x says sym 9 maps k to kbar
-        k_gvecs_rot -= Gkk
+        k_gvecs_rot = unfold_gvecs(sym_krep, k_gvecs, Gkk)
         #wfn_kG = np.einsum('jk,kl->jl', self.U_spinor[sym_idx], wfn_kG)
         #wfn_kGgrid = np.zeros((2,*wfn.fft_grid),dtype=np.complex128)
         #for ispin in range(2):
@@ -708,25 +751,32 @@ class SymMaps:
 
         k_gvecs = None
         wfn_kG = wfn.get_cnk(kbar_idx,nb)
-        
-        # For time-reversal symmetries (sym_idx >= ntran), apply complex conjugation
-        # Time-reversal: ψ_{n,-k}(r) = ψ*_{nk}(r), so u_{n,-k}(G) = u*_{nk}(-G)
-        ntran = len(self.sym_matrices)  # Number of spatial symmetries
+
+        # For time-reversal symmetries (sym_idx >= ntran) the full op is
+        # T ∘ R with T = iσ_y K (proper spinor time-reversal).  Since in
+        # SU(2) iσ_y · conj(U) = U · iσ_y, we can equivalently apply T
+        # after R: rotate spinor with U_spinor[R], then do iσ_y · conj(·).
+        # Pure K is WRONG for spinors — it rescrambles spinor components
+        # and produces non-unitary block structure on full-BZ bands.
+        ntran = len(self.sym_mats_R)
         if sym_idx >= ntran:
-            wfn_kG = np.conj(wfn_kG)
-        else:
+            spatial_idx = sym_idx - ntran
+            spatial_krep = np.asarray(self.sym_mats_k[spatial_idx], dtype=np.int32)
             phase = self._get_fractional_translation_phase(
-                wfn,
-                nk,
-                sym_idx,
-                kbar_idx,
-                sym_krep,
-                k_gvecs=k_gvecs,
+                wfn, nk, spatial_idx, kbar_idx, spatial_krep, k_gvecs=k_gvecs,
             )
             if phase is not None:
                 wfn_kG = wfn_kG * phase[None, :]
-        
-        wfn_kG = np.einsum('jk,kl->jl', self.U_spinor[sym_idx], wfn_kG)
+            # K then iσ_y: new_up = conj(old_down), new_down = -conj(old_up)
+            wfn_kG = np.stack([np.conj(wfn_kG[1, :]), -np.conj(wfn_kG[0, :])], axis=0)
+            wfn_kG = np.einsum('jk,kl->jl', self.U_spinor[spatial_idx], wfn_kG)
+        else:
+            phase = self._get_fractional_translation_phase(
+                wfn, nk, sym_idx, kbar_idx, sym_krep, k_gvecs=k_gvecs,
+            )
+            if phase is not None:
+                wfn_kG = wfn_kG * phase[None, :]
+            wfn_kG = np.einsum('jk,kl->jl', self.U_spinor[sym_idx], wfn_kG)
         return wfn_kG
 
     def get_cnk_fullzone_batch(self, wfn, band_indices, nk):
@@ -741,27 +791,34 @@ class SymMaps:
             np.ndarray: Rotated coefficients of shape (nb, 2, ngk)
         """
         sym_idx, kbar_idx, sym_krep = self._get_symmetry_context(nk)
-        
+
         # Batch read from WFN: (nb, 2, ngk)
         cnk_batch = wfn.get_cnk_batch(kbar_idx, band_indices)
-        
-        # Time-reversal conjugation if needed
-        ntran = len(self.sym_matrices)
+
+        # For time-reversal symmetries (sym_idx >= ntran) the full op is
+        # T ∘ R with T = iσ_y K (proper spinor time-reversal).  In SU(2)
+        # iσ_y · conj(U) = U · iσ_y, so we can equivalently apply T after R:
+        # rotate spinor with U_spinor[R], then do iσ_y · conj(·).
+        ntran = len(self.sym_mats_R)
         if sym_idx >= ntran:
-            cnk_batch = np.conj(cnk_batch)
-        else:
+            spatial_idx = sym_idx - ntran
+            spatial_krep = np.asarray(self.sym_mats_k[spatial_idx], dtype=np.int32)
             phase = self._get_fractional_translation_phase(
-                wfn,
-                nk,
-                sym_idx,
-                kbar_idx,
-                sym_krep,
+                wfn, nk, spatial_idx, kbar_idx, spatial_krep,
             )
             if phase is not None:
                 cnk_batch = cnk_batch * phase[None, None, :]
-        
-        # Vectorized spinor rotation: U[j,k] @ cnk[n,k,l] -> result[n,j,l]
-        # U_spinor is (2, 2), cnk_batch is (nb, 2, ngk)
+            # K then iσ_y: new_up = conj(old_down), new_down = -conj(old_up)
+            cnk_batch = np.stack(
+                [np.conj(cnk_batch[:, 1, :]), -np.conj(cnk_batch[:, 0, :])], axis=1
+            )
+            return np.einsum('jk,nkl->njl', self.U_spinor[spatial_idx], cnk_batch)
+
+        phase = self._get_fractional_translation_phase(
+            wfn, nk, sym_idx, kbar_idx, sym_krep,
+        )
+        if phase is not None:
+            cnk_batch = cnk_batch * phase[None, None, :]
         return np.einsum('jk,nkl->njl', self.U_spinor[sym_idx], cnk_batch)
 
     def find_qpoint_index(self, q_ext, tol=1e-6):
