@@ -287,11 +287,25 @@ def main(argv=None):
 
 	if not config.do_screened:
 		W_q = V_q  # unscreened: W = V
+	# Regression fix (was in compute_screening before commit 4ba05ba removed it):
+	# write W0_qmunu back to the restart tensor file so downstream BSE can read it.
+	if config.do_screened and tensors_filename is not None and os.path.exists(tensors_filename):
+		from file_io import write_w0_qmunu_to_h5
+		_kgrid = tuple(int(x) for x in meta.kgrid)
+		_W0_7d = W_q.reshape(*_kgrid, W_q.shape[1], W_q.shape[2])
+		write_w0_qmunu_to_h5(
+			tensors_filename,
+			_W0_7d[None, None, None, :, :, :, :, :],
+			mesh=mesh_xy, use_ffi_io=config.use_ffi_io,
+		)
 	Gij = _build_Gij(meta, mesh_xy)
 
-	# q→0 head correction (exact band-diagonal terms for static COHSEX)
+	# q→0 head correction (exact band-diagonal terms for Σ^X, Σ^SX, Σ^COH).
+	# The bare-Σ^X head is needed in both COHSEX and PPM mode — stripping
+	# V_q(0,0,0)=0 in compute_vcoul leaves sig_x without its head until we
+	# inject it here.
 	static_head_terms = None
-	if config.do_G0 and not config.use_ppm_sigma:
+	if config.do_G0:
 		static_head_terms = _compute_static_head(
 			config, input_dir, wfn, sym, meta, config.do_screened, print0)
 
