@@ -24,6 +24,7 @@ import jax.numpy as jnp
 from psp.radial.build_projectors_qe import build_E_blocks_full
 from psp.radial.radial_jax import differentiate_uniform_table
 from psp.radial.solid_harmonics import solid_harmonics_jax as _solid_harmonics_jax
+from psp.radial_tables import projector_deriv_table as _projector_deriv_table
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +165,12 @@ def build_vnl_setup(
             msize = 2 * l + 1
             R = nbeta * msize
 
-            # F_l(q) from pre-built tables → G_l = F_l/q^l, then differentiate
+            # F_l(q) from pre-built tables → G_l = F_l/q^l.
+            # Gp_l = dG_l/dq is obtained ANALYTICALLY via the Bessel-recurrence
+            # formula  dG_l/dq = -H_{l+1}(β; q)/q^l  (see radial_tables.py).
+            # This replaces an earlier central-FD derivative which was O(dq²)
+            # biased for curved G_l(q) and led to ~10% errors in velocity
+            # matrix elements taken via jax.jvp through _table_interp.
             for ip in proj_ids:
                 F_vals = tables["proj_tables"][isp][ip]
                 if l == 0:
@@ -174,7 +180,7 @@ def build_vnl_setup(
                     G_vals[1:] = F_vals[1:] / q_grid[1:] ** l
                     G_vals[0] = F_vals[1] / q_grid[1] ** l
                 G_rows.append(G_vals)
-                Gp_rows.append(differentiate_uniform_table(G_vals, dq))
+                Gp_rows.append(_projector_deriv_table(sp, ip, q_grid))
 
             channels.append(ChannelMeta(
                 l=l, nbeta=nbeta, msize=msize, R=R,
@@ -257,6 +263,33 @@ def _table_interp(q, dq, table):
     return (1.0 - t)[None, :] * table[:, idx] + t[None, :] * table[:, idx + 1]
 
 
+@jax.custom_jvp
+def _interp_with_deriv(q, dq, table, deriv_table):
+    """Linear interp of ``table`` at ``q``, with a custom JVP that uses
+    ``deriv_table`` as the q-tangent instead of the forward-slope of the
+    linear interpolation.
+
+    Drop-in replacement for ``_table_interp(q, dq, table)`` whenever callers
+    want ``jax.jvp`` / ``jax.jacfwd`` through the form factor to produce the
+    **physical** derivative (velocity operator matrix elements, k·p response,
+    ∂χ/∂q in the Sternheimer solver).  The physical dG/dq is tabulated at
+    setup time via the Bessel-recurrence identity (see
+    ``radial_tables.projector_deriv_table``) and passed in as
+    ``deriv_table`` — this avoids the O(dq²) bias that afflicts the
+    forward-slope derivative of the linear interpolant.
+    """
+    return _table_interp(q, dq, table)
+
+
+@_interp_with_deriv.defjvp
+def _interp_with_deriv_jvp(primals, tangents):
+    q, dq, table, deriv_table = primals
+    q_dot, _, _, _ = tangents
+    val = _table_interp(q, dq, table)
+    slope = _table_interp(q, dq, deriv_table)
+    return val, slope * q_dot
+
+
 # ---------------------------------------------------------------------------
 # Per-k projector construction
 # ---------------------------------------------------------------------------
@@ -322,8 +355,13 @@ def _build_vnl_kdata_core(
     # table lookup still lands in the (q=0) bin.
     q = jnp.sqrt(jnp.sum(K_cart ** 2, axis=1) + 1e-8)
 
-    # Radial form factors: evaluate all betas at all G-vectors
-    G_all = _table_interp(q, setup.dq, setup.G_table)    # (total_nbeta, nG)
+    # Radial form factors: evaluate all betas at all G-vectors.
+    # _interp_with_deriv has a custom_jvp rule that uses setup.Gp_table
+    # (analytic dG_l/dq from the Bessel-recurrence Hankel integral) as the
+    # q-tangent — so any  jax.jvp  taken through this path (velocity
+    # operator, k·p response, ∂χ/∂q in Sternheimer) lands on the physical
+    # derivative rather than the forward-slope of the linear interpolant.
+    G_all = _interp_with_deriv(q, setup.dq, setup.G_table, setup.Gp_table)    # (total_nbeta, nG)
 
     # Solid harmonics: all l in one call
     S_all = all_solid_harmonics(K_cart, l_max=setup.l_max)  # (l_max+1, 2*l_max+1, nG)

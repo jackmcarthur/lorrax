@@ -66,6 +66,38 @@ def projector_table(sp: SpeciesData, ip: int, q: np.ndarray) -> np.ndarray:
     return hankel_l(int(sp.proj_l[ip]), sp.r, sp.beta_r[ip], q, sp.rab)
 
 
+def projector_deriv_table(sp: SpeciesData, ip: int, q: np.ndarray) -> np.ndarray:
+    """Analytic q-derivative of the **reduced** form factor  G_l(q) ≡ F_l(q)/q^l.
+
+    Starting from  F_l(q) = ∫ (β(r)/r) · j_l(qr) · r² dr  and the spherical-
+    Bessel recurrence  j_l'(x) = −j_{l+1}(x) + (l/x)·j_l(x)  the q-derivative
+    of the reduced form factor collapses (after the l·F_l/q^{l+1} terms cancel)
+    to the clean expression
+
+        dG_l/dq(q)  =  −  H_{l+1}(β; q)  /  q^l          (q > 0)
+
+    where  H_{l+1}(β; q) ≡ ∫ β(r) · j_{l+1}(qr) · r² dr  (= ``hankel_l(l+1, β)``).
+
+    This is the radial-form-factor derivative that mature DFT codes (QE, Abinit,
+    VASP) tabulate analytically to avoid the FD / interpolation-slope inaccuracies
+    that plague autodiff-through-``_table_interp`` paths.
+
+    Analyticity at q = 0:  j_{l+1}(qr) ∼ (qr)^{l+1}/(2l+3)!!  so  H_{l+1}(β; q) ∼
+    q^{l+1} — the ratio → 0 as q → 0 (set exactly to zero at the q=0 grid point,
+    matching the evenness of G_l(q)).
+    """
+    l = int(sp.proj_l[ip])
+    beta = sp.beta_r[ip] * sp.r              # sp.beta_r stores β(r)/r → restore β(r)
+    H_lp1 = hankel_l(l + 1, sp.r, beta, q, sp.rab)
+    if l == 0:
+        return -H_lp1
+    deriv = np.empty_like(H_lp1)
+    mask = q > 0
+    deriv[mask] = -H_lp1[mask] / q[mask] ** l
+    deriv[~mask] = 0.0
+    return deriv
+
+
 def alpha_z(sp: SpeciesData, vol: float) -> float:
     """G=0 local potential: (4π/Ω) ∫ r·[r·V_loc(r) + Z·e²] rab dr."""
     e2 = 2.0
