@@ -36,16 +36,14 @@ init_jax_distributed()
 
 from file_io import CrystalData, WFNWriter
 from psp.pseudos import load_pseudopotentials
-from psp.ionic_gspace import build_ionic_and_core
-from psp.dft_operators import build_G_cart, compute_V_H_and_V_xc, build_V_scf
 from psp.h_dft import setup_H_k_from_kvec, make_apply_H
 from psp.dft_precond import make_dft_preconditioner, make_pw_init
 from psp.gvec_utils import (
     build_master_gvec_list, select_gvecs_for_k,
     compute_ngkmax, reorder_to_qe,
 )
+from psp.scf_potential import build_dft_potentials
 from solvers.davidson import davidson, warmup_davidson_jit
-import psp.vnl_ops as vnl_ops
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -53,32 +51,18 @@ import psp.vnl_ops as vnl_ops
 # ═══════════════════════════════════════════════════════════════════════
 
 def _build_potentials(crystal, pseudos, verbose=True):
-    """Build k-independent DFT potentials from crystal + pseudos."""
-    truncation_2d = crystal.assume_isolated == "2D"
-    fft_grid = crystal.fft_grid
-    nspinor = crystal.nspinor
-    t0 = time.perf_counter()
+    """Build k-independent DFT potentials from a CrystalData + pseudos.
 
-    V_loc, rho_core, rho_core_G = build_ionic_and_core(
-        crystal, pseudos, fft_grid, truncation_2d=truncation_2d)
+    Thin wrapper over :func:`psp.scf_potential.build_dft_potentials` that
+    sources ρ_val and the 2D-truncation flag from the QE ``.save`` via
+    CrystalData.  The Sternheimer driver calls ``build_dft_potentials``
+    directly with a WFNReader-derived ρ_val instead.
+    """
     rho_val = jnp.asarray(crystal.load_charge_density()[0], dtype=jnp.float64)
-    nx, ny, nz = int(fft_grid[0]), int(fft_grid[1]), int(fft_grid[2])
-    G_cart = build_G_cart(nx, ny, nz,
-                          float(crystal.blat) * np.asarray(crystal.bvec, dtype=float))
-    V_H, V_xc = compute_V_H_and_V_xc(
-        rho_val, rho_core, rho_core_G, G_cart,
-        jnp.asarray(crystal.bdot, dtype=jnp.float64),
-        jnp.asarray(crystal.bvec, dtype=jnp.float64), crystal.blat,
-        truncation_2d=truncation_2d)
-    V_scf = build_V_scf(V_loc, V_H, V_xc)
-    vnl_setup = vnl_ops.build_vnl_setup(
-        crystal, pseudos=pseudos, nspinor=nspinor,
-        q_max=float(np.sqrt(float(crystal.ecutwfc))) * 1.01)
-
-    if verbose:
-        print(f"  Potentials: {time.perf_counter()-t0:.2f}s")
-
-    return V_scf, V_loc, vnl_setup
+    truncation_2d = crystal.assume_isolated == "2D"
+    return build_dft_potentials(
+        crystal, pseudos, rho_val,
+        truncation_2d=truncation_2d, verbose=verbose)
 
 
 # ═══════════════════════════════════════════════════════════════════════
