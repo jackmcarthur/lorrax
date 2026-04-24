@@ -171,39 +171,29 @@ def project_density_to_Gsphere(
 #  Perturbation factories
 # ═══════════════════════════════════════════════════════════════════════
 
-def make_density_perturbation(
-    qvec_crys: np.ndarray,           # (3,) in crystal (reduced) coordinates
-    fft_grid,
-    bvec: np.ndarray,
-    blat: float,
-) -> jax.Array:
-    """Return ``V_pert_real(r) = exp(-i q · r)`` on the FFT box.
+def make_density_perturbation(fft_grid) -> jax.Array:
+    """Cell-periodic part of the density-response perturbation — identically 1.
 
-    Convention: ``p = k − q`` (``SymMaps.kq_map``), so the source phase
-    is ``e^{-iq·r}``.  At q = 0 this degenerates to the identity, which
-    is the (handy) q=0 sanity-check baseline:  Q_k · 1 · u_{v,k} = 0.
+    The full external perturbation is ``V_ext(r) = e^{iq·r}``, which has no
+    cell-periodic part.  Acting on ψ_{v,k} = e^{ik·r}u_{v,k}(r), the product
+    ``e^{iq·r} · ψ_{v,k}(r) = e^{i(k+q)·r} · u_{v,k}(r)`` has Bloch momentum
+    k+q and the **same** cell-periodic part u_{v,k}(r).  In our p = k-q
+    convention the symmetric result is that the cell-periodic source at p
+    is u_{v,k} itself — i.e. ``V_pert_cell(r) = 1``.  The q-dependence
+    enters only through the change of G-sphere (k → k-q).
 
-    Parameters
-    ----------
-    qvec_crys : (3,) float — q in reduced (crystal-basis) units.
-    fft_grid  : (nx, ny, nz).
-    bvec      : (3, 3) — reciprocal-lattice vectors (reduced units).
-    blat      : float  — 2π / alat, so ``B_cart = blat · bvec``.
+    This is why the forward χ_{G'0}(q, 0) pipeline does NOT apply any
+    real-space phase for the density-response case — the ``e^{-iq·r}`` phase
+    that appears in the analytic integral ``∫ dr e^{-i(q+G')r} δn(r)`` is
+    accounted for by the p = k-q momentum-shift bookkeeping inside
+    ``build_sternheimer_source`` + ``accumulate_chi_density``.
+
+    For phonon DFPT the caller would instead pass
+    ``V_pert_cell(r) = ∂V_scf/∂R_α`` (cell-periodic by construction); the
+    e^{iqr} plane-wave factor still comes in for free via the k → k+q shift.
     """
     nx, ny, nz = fft_grid
-    # r_crys on [0, 1) in crystal coordinates (fractional).
-    rx = jnp.arange(nx, dtype=jnp.float64) / nx
-    ry = jnp.arange(ny, dtype=jnp.float64) / ny
-    rz = jnp.arange(nz, dtype=jnp.float64) / nz
-    # q·r = 2π q_crys · r_crys  (q and r both in reduced coords, 2π from alat · blat).
-    # Phase factor = exp(-i · 2π · q_crys · r_crys).
-    q = jnp.asarray(qvec_crys, dtype=jnp.float64)
-    phase = -2.0 * jnp.pi * (
-        q[0] * rx[:, None, None]
-        + q[1] * ry[None, :, None]
-        + q[2] * rz[None, None, :]
-    )
-    return jnp.exp(1j * phase).astype(jnp.complex128)
+    return jnp.ones((nx, ny, nz), dtype=jnp.complex128)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -337,8 +327,11 @@ def run_sternheimer(
             f"{nb_load} bands, but WFN has only {int(wfn.nbands)}.")
 
     # Minimal Meta (we only consume fft_grid / nspinor / cell_volume).
+    # bispinor=False → meta.nspinor = wfn.nspinor (native 2-component for FR,
+    # 1 for scalar).  The 4-component (bispinor=True) path is a specialised
+    # LORRAX mode not needed for the density-response Sternheimer.
     meta = Meta.from_system(wfn, sym, nval=n_occ, ncond=max(0, n_cond_bands),
-                            nband=nb_load, n_rmu=0, bispinor=(nspinor == 2))
+                            nband=nb_load, n_rmu=0, bispinor=False)
 
     # ── Pseudos + V_scf ────────────────────────────────────────────────
     pseudos = load_pseudopotentials(pseudo_dir)
@@ -393,9 +386,10 @@ def run_sternheimer(
         Gprime_int = build_Gprime_list(qvec, wfn, ng_out)        # (ng_out, 3)
         Gprime_j = jnp.asarray(Gprime_int)
 
-        # Real-space perturbation (V_pert(r) = e^{-iq·r}).
-        V_pert_real = make_density_perturbation(
-            qvec, wfn.fft_grid, wfn.bvec, wfn.blat)
+        # Cell-periodic part of the density-response perturbation: identically
+        # 1.  (See ``make_density_perturbation`` docstring for why the e^{iq·r}
+        # factor enters through the k→k-q G-sphere shift instead.)
+        V_pert_real = make_density_perturbation(wfn.fft_grid)
 
         # Accumulator for δn(r) over all k.
         delta_n_r = jnp.zeros((nx, ny, nz), dtype=jnp.complex128)
@@ -471,8 +465,15 @@ def run_sternheimer(
             total_leak = max(total_leak, leak_du)
 
             # ── Density contribution ──
-            delta_n_r = delta_n_r + accumulate_chi_density(
+            dn_contrib = accumulate_chi_density(
                 U_val_k_box, delta_u, Gkminq_int, wfn.fft_grid)
+            if ik_full < 3 and verbose:
+                du_nan = bool(jnp.any(jnp.isnan(delta_u)))
+                dn_nan = bool(jnp.any(jnp.isnan(dn_contrib)))
+                print(f"    [debug ik={ik_full}] du_nan={du_nan} dn_nan={dn_nan} "
+                      f"|du|={float(jnp.max(jnp.abs(delta_u))):.2e} "
+                      f"|dn|={float(jnp.max(jnp.abs(dn_contrib))):.2e}")
+            delta_n_r = delta_n_r + dn_contrib
 
         # ── Project δn → χ column at G' ──
         # Prefactor = spin_factor / N_k.  Spin factor is 2 for scalar (nspinor=1)

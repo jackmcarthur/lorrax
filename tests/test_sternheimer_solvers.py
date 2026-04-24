@@ -204,7 +204,11 @@ class TestMinres:
             rng.standard_normal((batch, nspinor, n))
             + 1j * rng.standard_normal((batch, nspinor, n)))
 
-        x, info = minres(apply_A, b_raw, project=Q, max_iter=200, tol=1e-10)
+        # n=20, nspinor=2 → subspace dim = 40.  MINRES exact-arith convergence is
+        # ≤ 40 iters.  Iterating far past that (e.g. 200) triggers pseudo-convergence
+        # NaN in finite precision, a well-known MINRES pitfall — cap at 60 for
+        # a small margin.
+        x, info = minres(apply_A, b_raw, project=Q, max_iter=60, tol=1e-10)
 
         assert bool(jnp.all(info.converged))
         # Solution in range(Q): ‖P_val x‖ ≈ 0.

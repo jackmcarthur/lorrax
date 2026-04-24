@@ -183,12 +183,30 @@ def _minres_core(
     # ── Initialisation (k = 0 in the loop corresponds to MINRES step k=1) ──
     # r_0 = b − A x_0   (projected)
     r0 = b - project(apply_A(x0))
-    z0 = precond(r0)
+    # Effective preconditioner  M̃ = Π · M · Π.  Π r = r already (r ∈ range(Π)),
+    # so applying Π after M⁻¹ keeps z ∈ range(Π).  Without this projection the
+    # update direction w_k picks up components in range(P_val) that drift the
+    # iterate out of the conduction subspace.  Standard constrained-MINRES
+    # (Gould–Hribar–Nocedal 2001) recipe.
+    z0 = project(precond(r0))
     # β_1 = √<r_0, z_0>   (= ‖r_0‖_{M⁻¹}); real because M⁻¹ is HPD.
     beta0 = jnp.sqrt(jnp.maximum(jnp.real(_batched_dot(r0, z0)), 0.0))
-    beta0_safe = jnp.where(beta0 > 0, beta0, 1.0)
-    v_curr = r0 / beta0_safe[:, None, None].astype(dtype_c)
-    z_curr = z0 / beta0_safe[:, None, None].astype(dtype_c)
+    # Dead-band mask: if β_0 is at or below machine precision we've effectively
+    # solved  A x = 0 → x = x_0 — running MINRES on pure numerical noise amplifies
+    # it to O(1) via v_1 = r_0/β_0 and eventually produces NaN after many
+    # iterations.  Gate every x_k update by this mask so such branches stay at
+    # x_0 instead of drifting.  (SciPy's minres and the Paige–Saunders 1975
+    # reference both short-circuit outright when β_0 == 0; we keep the full
+    # loop for JIT-shape stability and mask per-batch-element instead.)
+    _BETA_DEADBAND = jnp.asarray(1e-14, dtype=dtype_r)
+    alive_mask = (beta0 > _BETA_DEADBAND)
+    beta0_safe = jnp.where(alive_mask, beta0, 1.0)
+    # Zero out the Lanczos state for dead bands — otherwise v_1 = r_0 / β_0_safe
+    # amplifies numerical-noise r_0 (at ~1e-15 for effectively-zero b) to unit
+    # scale, contaminating subsequent iterations and eventually producing NaN.
+    _vmask_c = alive_mask[:, None, None].astype(dtype_c)
+    v_curr = (r0 / beta0_safe[:, None, None].astype(dtype_c)) * _vmask_c
+    z_curr = (z0 / beta0_safe[:, None, None].astype(dtype_c)) * _vmask_c
 
     v_prev = jnp.zeros_like(b)
     z_prev = jnp.zeros_like(b)
@@ -203,12 +221,12 @@ def _minres_core(
 
     state = (x0, v_prev, v_curr, z_prev, z_curr,
              w_pp, w_p,
-             beta0, c_p, c_pp, s_p, s_pp, eta)
+             beta0, c_p, c_pp, s_p, s_pp, eta, alive_mask)
 
     def body(_i: int, st):
         (x, v_prev, v_curr, z_prev, z_curr,
          w_pp, w_p,
-         beta_prev, c_p, c_pp, s_p, s_pp, eta) = st
+         beta_prev, c_p, c_pp, s_p, s_pp, eta, alive_mask) = st
 
         # ── 1. Preconditioned Lanczos step ──
         # p = A z_k  (projected)
@@ -219,7 +237,8 @@ def _minres_core(
         r_new = (p
                  - alpha[:, None, None].astype(dtype_c) * v_curr
                  - beta_prev[:, None, None].astype(dtype_c) * v_prev)
-        z_new_raw = precond(r_new)
+        # Constrained preconditioner  M̃ = Π · M · Π — see init block for why.
+        z_new_raw = project(precond(r_new))
         # β_{k+1}² = <r_{k+1}, M⁻¹ r_{k+1}> — real and ≥ 0 in exact arith.
         beta_new = jnp.sqrt(
             jnp.maximum(jnp.real(_batched_dot(r_new, z_new_raw)), 0.0))
@@ -258,14 +277,15 @@ def _minres_core(
                 ) / gamma_safe[:, None, None].astype(dtype_c)
 
         # ── 7. Solution update x_k = x_{k-1} + (c_k η_k) w_k ──
-        # Mask the update where γ_k = 0 (system solved for that v).
-        gamma_mask = (gamma > 0).astype(dtype_c)[:, None, None]
-        x_new = x + gamma_mask * eta_used[:, None, None].astype(dtype_c) * w_new
+        # Two masks: γ_k = 0 (this step produced no update — system exhausted),
+        # and alive_mask (β_0 was below dead-band → x stays at x_0 forever).
+        update_mask = ((gamma > 0) & alive_mask).astype(dtype_c)[:, None, None]
+        x_new = x + update_mask * eta_used[:, None, None].astype(dtype_c) * w_new
 
         # ── 8. Advance rolling state ──
         return (x_new, v_curr, v_new, z_curr, z_new,
                 w_p, w_new,
-                beta_new, c_new, c_p, s_new, s_p, eta_next)
+                beta_new, c_new, c_p, s_new, s_p, eta_next, alive_mask)
 
     final = lax.fori_loop(0, max_iter, body, state)
     return final[0]
