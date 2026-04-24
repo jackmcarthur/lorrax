@@ -348,9 +348,231 @@ def compute_kp_tangent_at_kvec(
     return jnp.stack(U_val_grad, axis=0)      # (3, nv, ns, nG)
 
 
+def compute_kp2_tangent_at_kvec(
+    kvec_p_base_np: np.ndarray,        # (3,)
+    Gkminq_int_np: np.ndarray,         # (nG_p, 3)
+    vnl_setup,
+    V_scf: jax.Array, mask: jax.Array,
+    Gx: jax.Array, Gy: jax.Array, Gz: jax.Array,
+    fft_grid,
+    bdot: jax.Array,
+    vnl_E_super: jax.Array,
+    U_val_G: jax.Array,                 # (nv, ns, nG_p)
+    U_val_grad_kp: jax.Array,           # (3, nv, ns, nG_p) from compute_kp_tangent_at_kvec
+    eps_v_at_kvec_p: jax.Array,
+    alpha_pv_sc: jax.Array,
+    precond_diag: jax.Array,
+    *,
+    tol: float = 1e-10,
+    max_iter: int = 300,
+    use_schur: bool = False,
+    U_extra_G: jax.Array | None = None,
+    eps_extra_v_at_kvec_p: jax.Array | None = None,
+) -> jax.Array:
+    """Return ∂²u_v/∂kvec_p_i ∂kvec_p_j as a (3, 3, nv, nspinor, nG) array,
+    symmetric over (i, j).
+
+    Second-order k·p response.  The standard insulator derivation gives
+
+        Q (H − ε) Q · ∂²u/∂k_i∂k_j  =  − Q · [ (∂²H/∂k_i∂k_j) u
+                                              + (∂H/∂k_i) ∂u/∂k_j
+                                              + (∂H/∂k_j) ∂u/∂k_i ]
+
+    (the ε-derivatives don't survive the Q-projection since ∂u/∂k are already
+    in range(Q)).  Implementation uses nested ``jax.jvp`` on ``A(k) · x``
+    with ``x`` in turn equal to ``U_val_G`` or ``U_val_grad_kp[i]``; the
+    operator tangent ``∂A/∂k_i`` reduces to ``∂H/∂k_i`` because the α·P_val
+    and −ε_v terms are kvec_p-independent.
+
+    This is the missing ingredient for the exact S-tensor at q=0: the
+    linear U_val_eff ansatz in ``chi_col_contrib_at_kvec_traced`` captures
+    only first-order projector drift; picking up the second-order projector
+    correction requires this Hess of U_val to appear in the quadratic
+    U_val_eff term.
+
+    Cost: 6 batched CG solves per call (symmetric 3×3 matrix; only i≤j pairs
+    are solved; diagonal entries reuse the single cross term).  Each solve
+    is the same jitted ``sternheimer_solve`` kernel as the main χ column.
+    """
+    from solvers.sternheimer_solve import (
+        SternheimerOp, sternheimer_solve, _apply_A_inline)
+
+    def _op_at(kvec_p_t):
+        return build_sternheimer_op_at_kvec_traced(
+            kvec_p_t, Gkminq_int_np, vnl_setup,
+            V_scf=V_scf, mask=mask, Gx=Gx, Gy=Gy, Gz=Gz, fft_grid=fft_grid,
+            bdot=bdot, vnl_E_super=vnl_E_super,
+            U_val_kminq_G=U_val_G, eps_v=eps_v_at_kvec_p,
+            alpha_pv_sc=alpha_pv_sc, precond_diag=precond_diag,
+            U_extra_G=U_extra_G, eps_extra=eps_extra_v_at_kvec_p,
+        )
+
+    kvec_p_base = jnp.asarray(kvec_p_base_np, dtype=jnp.float64)
+    op_base = _op_at(kvec_p_base)
+
+    def Q_of(x):
+        coefs = jnp.einsum('msG,vsG->vm', jnp.conj(U_val_G), x, optimize=True)
+        return x - jnp.einsum('vm,msG->vsG', coefs, U_val_G, optimize=True)
+
+    def e_vec(k):
+        return jnp.zeros(3, dtype=jnp.float64).at[k].set(1.0)
+
+    hess = [[None] * 3 for _ in range(3)]
+    for i in range(3):
+        for j in range(i + 1):
+            ei = e_vec(i)
+            ej = e_vec(j)
+
+            # (∂²A/∂k_i∂k_j) · U_val  via nested jax.jvp on k ↦ A(k)·U_val.
+            def _A_u(k):
+                return _apply_A_inline(_op_at(k), U_val_G)
+            def _grad_j_A_u(k):
+                _, out = jax.jvp(_A_u, (k,), (ej,))
+                return out
+            _, A_ij_u = jax.jvp(_grad_j_A_u, (kvec_p_base,), (ei,))
+
+            # (∂A/∂k_i) · (∂u/∂k_j)
+            _, A_i_duj = jax.jvp(
+                lambda k: _apply_A_inline(_op_at(k), U_val_grad_kp[j]),
+                (kvec_p_base,), (ei,))
+            # (∂A/∂k_j) · (∂u/∂k_i)  — equals A_i_duj when i == j
+            if i == j:
+                A_j_dui = A_i_duj
+            else:
+                _, A_j_dui = jax.jvp(
+                    lambda k: _apply_A_inline(_op_at(k), U_val_grad_kp[i]),
+                    (kvec_p_base,), (ej,))
+
+            rhs_ij = A_ij_u + A_i_duj + A_j_dui
+            b_ij = Q_of(rhs_ij)
+            d2u_ij = sternheimer_solve(op_base, b_ij,
+                                        tol=tol, max_iter=max_iter,
+                                        use_schur=use_schur)
+            # Diagnostic: residual ‖A·d2u + b‖  (solver solves A·d2u = -b).
+            res_ij = _apply_A_inline(op_base, d2u_ij) + b_ij
+            res_norm_ij = jnp.max(jnp.sqrt(jnp.real(
+                jnp.einsum('vsG,vsG->v', jnp.conj(res_ij), res_ij, optimize=True))))
+            b_norm_ij = jnp.max(jnp.sqrt(jnp.real(
+                jnp.einsum('vsG,vsG->v', jnp.conj(b_ij), b_ij, optimize=True))))
+            import os as _os
+            if _os.environ.get('KP2_DEBUG'):
+                print(f"    kp2 (i={i}, j={j}) at kvec_p_base={kvec_p_base_np}: "
+                      f"‖b_ij‖_max = {float(b_norm_ij):.3e}, "
+                      f"‖residual‖_max = {float(res_norm_ij):.3e}, "
+                      f"‖d2u_ij‖ = {float(jnp.sqrt(jnp.sum(jnp.abs(d2u_ij)**2))):.3e}")
+            hess[i][j] = d2u_ij
+            hess[j][i] = d2u_ij
+
+    return jnp.stack([jnp.stack(row, axis=0) for row in hess], axis=0)
+
+
 # ═══════════════════════════════════════════════════════════════════════
-#  JAX-friendly Sternheimer operator rebuild (for q-derivatives via jax.jvp)
+#  Explicit S-tensor at q = 0 — bypasses nested jvp entirely
 # ═══════════════════════════════════════════════════════════════════════
+
+def _q_project(U_val_G: jax.Array, x: jax.Array) -> jax.Array:
+    """Q_{k-q}(x) = x - Σ_m U_val[m]·<U_val[m]|x>."""
+    coefs = jnp.einsum('msG,vsG->vm', jnp.conj(U_val_G), x, optimize=True)
+    return x - jnp.einsum('vm,msG->vsG', coefs, U_val_G, optimize=True)
+
+
+def compute_s_tensor_contrib_at_q0(
+    kvec_p_base_np: np.ndarray,        # (3,) = kvec_k at q=0 (non-wrapping k's)
+    Gkminq_int_np: np.ndarray,         # (nG_p, 3)
+    vnl_setup,
+    V_scf: jax.Array,
+    mask: jax.Array,
+    Gx: jax.Array, Gy: jax.Array, Gz: jax.Array,
+    fft_grid,
+    bdot: jax.Array,
+    vnl_E_super: jax.Array,
+    U_val_G: jax.Array,                 # (nv, ns, nG_p) — U_val at kvec_p_base
+    U_val_grad_kp: jax.Array,           # (3, nv, ns, nG_p) ∂U/∂kvec_p
+    eps_v: jax.Array,                   # (nv,)
+    alpha_pv_sc: jax.Array,
+    precond_diag: jax.Array,
+    *,
+    tol: float = 1e-12,
+    max_iter: int = 300,
+    use_schur: bool = False,
+    U_extra_G: jax.Array | None = None,
+    eps_extra: jax.Array | None = None,
+) -> jax.Array:
+    """Return the per-k (3, 3) complex contribution to the density-response
+    S-tensor  S_{ij} = ∂²χ_{00}/∂q_i∂q_j|_0  (in units of
+    ``Σ_v <grad_v_i | δu̇_v_j>``, pre-``prefactor``).
+
+    Physics — why we don't need Hess.  At q = 0 the primal Sternheimer solve
+    has b = Q_k · u_{v,k} = 0 and δu(0) = 0.  The naive quadratic expansion
+    δu(q) = q_i · δu̇_i + (1/2) q_i q_j · δü_ij   in a *fixed* k-basis
+    must respect the constraint Q(q) · δu(q) = δu(q) where Q(q) = Q_{k-q} is
+    q-dependent through the occupied subspace.  Expanding:
+
+        P_val(0) · δü_ij  =  2 ·( Q̇_i · δu̇_j  +  Q̇_j · δu̇_i )
+
+    The **Q-part** of δü_ij (containing the k·p² Hess) is orthogonal to
+    u_v,k and therefore does NOT contribute to the density overlap
+    <u_v | δü>_G .  Only the **P_val-part** contributes, and it's determined
+    entirely by the first tangent δu̇_i:
+
+        <u_v | δü_ij>  =  2 ·(<grad_v_i | δu̇_v_j> + <grad_v_j | δu̇_v_i>)
+
+    So the S-tensor at q = 0 reduces to a **cross-correlation of k·p
+    gradients through A⁻¹**, which is exactly the sum-over-states structure
+    of the Adler–Wiser dipole formula (``common.chi_from_dipole``).
+
+    Cost: 3 Sternheimer solves per k (for δu̇_i = −A⁻¹·grad_i).  The
+    k·p² Hess machinery (6 more solves per k) is **not used** here — it was
+    a dead-end for S-tensor at q = 0 though it may still be useful for
+    ∂²χ/∂q² evaluated at q ≠ 0.
+
+    Returns
+    -------
+    (3, 3) complex array of per-k G-sphere overlaps
+    ``Σ_v [<grad_v_i | δu̇_v_j> + <grad_v_j | δu̇_v_i>]``.
+    The caller multiplies by ``(2 · spin_factor / (V_cell · N_k))`` to
+    match the standard Adler–Wiser normalisation — see main run_sternheimer.
+    """
+    from solvers.sternheimer_solve import sternheimer_solve
+
+    # ── First tangents  δu̇_i  (3 solves) ─────────────────────────────────
+    # solve(op, b) satisfies A·x = −b, so passing b = grad_i[v] yields
+    # x = −A⁻¹·grad_i[v] = δu̇_i  (matches physical ẋ_i = −A⁻¹·∂b/∂q_i|_0
+    # with ∂b/∂q_i|_0 = +grad_i[v]).
+    op = build_sternheimer_op_at_kvec_traced(
+        jnp.asarray(kvec_p_base_np, dtype=jnp.float64),
+        Gkminq_int_np, vnl_setup,
+        V_scf=V_scf, mask=mask, Gx=Gx, Gy=Gy, Gz=Gz, fft_grid=fft_grid,
+        bdot=bdot, vnl_E_super=vnl_E_super,
+        U_val_kminq_G=U_val_G, eps_v=eps_v,
+        alpha_pv_sc=alpha_pv_sc, precond_diag=precond_diag,
+        U_extra_G=U_extra_G, eps_extra=eps_extra,
+    )
+    delta_u_dot = [
+        sternheimer_solve(op, U_val_grad_kp[i],
+                           tol=tol, max_iter=max_iter, use_schur=use_schur)
+        for i in range(3)
+    ]
+
+    # ── Compute  <grad_v_i | δu̇_v_j>  for all (i, j) pairs ──────────────
+    # From the Q(q)-constraint Taylor expansion at q = 0 (valid only when
+    # δu is taken as symmetric-in-(a,b) in the Taylor expansion):
+    #     P_val(0)·δü_ab  =  Q̇_a·δu̇_b  +  Q̇_b·δu̇_a
+    # and therefore
+    #     <u_v | δü_ab>_P  =  <grad_a | δu̇_b>  +  <grad_b | δu̇_a>.
+    S_k = jnp.zeros((3, 3), dtype=jnp.complex128)
+    for i in range(3):
+        for j in range(3):
+            ovlp_ij = jnp.einsum(
+                'vsG,vsG->', jnp.conj(U_val_grad_kp[i]), delta_u_dot[j],
+                optimize=True)
+            S_k = S_k.at[i, j].add(ovlp_ij)
+            ovlp_ji = jnp.einsum(
+                'vsG,vsG->', jnp.conj(U_val_grad_kp[j]), delta_u_dot[i],
+                optimize=True)
+            S_k = S_k.at[i, j].add(ovlp_ji)
+
+    return S_k
 
 def build_sternheimer_op_at_kvec_traced(
     kvec_p_traced: jax.Array,                 # (3,) — JAX tracer (the k-q at which to evaluate H)
@@ -458,6 +680,9 @@ def chi_col_contrib_at_kvec_traced(
                                            # on the p-sphere, pre-Q-projection.  Pass this
                                            # (together with U_val_grad_kp) to get the correct
                                            # q-dependence of the source via Q_{k-q}(q).
+    U_val_hess_kp: jax.Array | None = None,   # (3, 3, nv, ns, nG_p) ∂²U_val/∂kvec_p_i∂kvec_p_j
+                                               # — upgrades U_val_eff to quadratic-in-q ansatz;
+                                               # required for the exact S-tensor (∂²χ/∂q²) at q=0.
 ) -> jax.Array:
     """Return the (ng_out,) χ_{G'0}(q, 0) contribution from a single source-k pair.
 
@@ -489,6 +714,9 @@ def chi_col_contrib_at_kvec_traced(
         dk = kvec_p_traced - kvec_p_base_for_grad                  # (3,)
         U_val_eff = U_val_kminq_G + jnp.einsum(
             'i,ivsG->vsG', dk, U_val_grad_kp, optimize=True)
+        if U_val_hess_kp is not None:
+            U_val_eff = U_val_eff + 0.5 * jnp.einsum(
+                'i,j,ijvsG->vsG', dk, dk, U_val_hess_kp, optimize=True)
     else:
         U_val_eff = U_val_kminq_G
 

@@ -311,7 +311,16 @@ def _build_vnl_kdata_core(
     K_crys = jnp.asarray(Gk_np, dtype=jnp.float64) + jnp.asarray(kvec)[None, :]
     B_j = jnp.asarray(setup.B, dtype=jnp.float64)
     K_cart = K_crys @ B_j
-    q = jnp.sqrt(jnp.sum(K_cart ** 2, axis=1) + 1e-60)
+    # Regularizer: avoids 1/q divergence in autodiff.  The value 1e-60 that was
+    # here is enough for 1st-derivatives (q itself gets clamped to 1e-30 at the
+    # Γ+G=0 point but ∂q/∂kvec = K_cart/q vanishes in the numerator there, so
+    # the 1st derivative is 0).  But NESTED jvp at K=0 gets a ∂²q/∂kvec² ~
+    # B·B/q ~ 1e30 which blows up Z's Hessian.  A modest 1e-8 regularizer
+    # keeps q ≥ 1e-4 at K=0, making the 2nd derivative ~ 1e4 (harmless), with
+    # essentially no effect on Z at any physically relevant K where |K|^2 ≫
+    # 1e-8.  The VNL tables are sampled at dq ~ 1e-3, so at the K=0 point the
+    # table lookup still lands in the (q=0) bin.
+    q = jnp.sqrt(jnp.sum(K_cart ** 2, axis=1) + 1e-8)
 
     # Radial form factors: evaluate all betas at all G-vectors
     G_all = _table_interp(q, setup.dq, setup.G_table)    # (total_nbeta, nG)
