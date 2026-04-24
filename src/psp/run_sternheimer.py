@@ -68,6 +68,7 @@ from psp.dft_operators import setup_H_k_from_kvec
 from psp.h_dft import make_apply_H
 from psp.pseudos import load_pseudopotentials
 from psp.scf_potential import build_dft_potentials, build_rho_val_from_wfn
+from psp.vnl_ops import _build_vnl_kdata_core
 from solvers.projectors import make_Q_kminq
 from solvers.sternheimer_precond import (
     compute_per_band_kinetic,
@@ -231,6 +232,80 @@ def make_umklapp_phase(G_wrap: np.ndarray, fft_grid, sign: int = +1) -> jax.Arra
         + float(G_wrap[2]) * fz[None, None, :]
     )
     return jnp.exp(1j * phase_arg).astype(jnp.complex128)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  JAX-friendly Sternheimer operator rebuild (for q-derivatives via jax.jvp)
+# ═══════════════════════════════════════════════════════════════════════
+
+def build_sternheimer_op_at_kvec_traced(
+    kvec_p_traced: jax.Array,                 # (3,) — JAX tracer (the k-q at which to evaluate H)
+    Gkminq_int_np: np.ndarray,                # (nG_p, 3) — INTEGER G-list, constant across jvp
+    vnl_setup,                                # from psp.vnl_ops.build_vnl_setup
+    V_scf: jax.Array,                         # (nx, ny, nz) — V_scf is k-independent
+    mask: jax.Array,                          # (nG_p,) — sphere mask, constant
+    Gx, Gy, Gz: jax.Array,                    # (nG_p,) int32, each — constant across jvp
+    fft_grid,                                 # tuple, static
+    bdot: jax.Array,                          # (3, 3)
+    vnl_E_super: jax.Array,                   # (nspinor, nspinor, R, R) — k-indep KB energies
+    U_val_kminq_G: jax.Array,                 # (nv, nspinor, nG_p) — frozen-projector approx
+    eps_v: jax.Array,                         # (nv,)
+    alpha_pv_sc: jax.Array,                   # () scalar
+    precond_diag: jax.Array,                  # (nv, 1, nG_p)
+    U_extra_G: jax.Array | None = None,       # (M, nspinor, nG_p) or None
+    eps_extra: jax.Array | None = None,       # (M,) or None
+):
+    """Rebuild a ``SternheimerOp`` from a traced ``kvec_p`` — JAX-jvp-friendly.
+
+    Use this when you want to take derivatives of a Sternheimer solve with
+    respect to ``q`` (or any parameter that shifts ``kvec_p = k − q``):
+
+        solve_of_q = lambda q: sternheimer_solve(
+            build_sternheimer_op_at_kvec_traced(kvec_p_base - (q - q_base), ...),
+            b, tol, max_iter)
+        dx = jax.jvp(solve_of_q, (q,), (dq,))[1]
+
+    The ∂/∂q tangent then propagates through:
+
+      * T_diag = |k+G|² (via bdot metric)  — autodiff through ``jnp.einsum``.
+      * vnl_Z via ``_build_vnl_kdata_core`` — which has its own internal custom
+        JVPs for the solid-harmonic / radial-table kernels (see
+        ``psp/vnl_ops.py``).  Validated against FD to 3e-10 rel err.
+
+    The **simplest-first approximation** per the guide is frozen-Q_{k-q}
+    (``∂U_val/∂q ≈ 0``); ``U_val_kminq_G`` is passed in as a static array.
+    For full consistency one would also update U_val via a Davidson sub-solve
+    at the perturbed kvec, but that's a much bigger integration.
+
+    Identity used internally (per the user-provided physics note):
+
+        ∂V_NL / ∂q  =  − ∂V_NL / ∂k     (k-q is the Bloch momentum fed to H)
+
+    handled automatically because ``_build_vnl_kdata_core`` differentiates
+    wrt its ``kvec`` argument (= ``kvec_p``), and the caller composes that
+    with ``kvec_p_traced = kvec_p_base - (q - q_base)`` (sign from the
+    chain rule flips ∂/∂k → −∂/∂q).
+    """
+    # T_diag:  |k+G|² on the bdot metric.
+    Gk_float = jnp.asarray(Gkminq_int_np, dtype=jnp.float64)
+    kG = Gk_float + kvec_p_traced[None, :]
+    T_diag = jnp.einsum('gi,ij,gj->g', kG, bdot, kG)
+
+    # Exact VNL-Z via the traceable kernel.
+    kdata = _build_vnl_kdata_core(kvec_p_traced, Gkminq_int_np, vnl_setup,
+                                   compute_dZ=False)
+
+    from solvers.sternheimer_solve import SternheimerOp
+    return SternheimerOp(
+        T_diag=T_diag, V_scf=V_scf,
+        Gx=Gx, Gy=Gy, Gz=Gz,
+        vnl_Z=kdata.Z, vnl_E=vnl_E_super, mask=mask,
+        U_val=U_val_kminq_G, eps_v=eps_v,
+        alpha_pv=alpha_pv_sc,
+        precond_diag=precond_diag,
+        fft_grid=fft_grid,
+        U_extra=U_extra_G, eps_extra=eps_extra,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
