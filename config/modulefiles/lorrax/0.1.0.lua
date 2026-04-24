@@ -124,17 +124,22 @@ setenv("HDF5_USE_FILE_LOCKING", "FALSE")
 
 -- Allocator choice.  Two modes, selected by LORRAX_XLA_ALLOCATOR:
 --
---   bfc (default):   XLA BFC preallocate=true at MEM_FRACTION=0.9.
---     Measured ~20% faster on sigma_ppm_body vs. `default` mode on
---     MoS2 3×3 low_mem; cuSOLVERMp / NCCL / cuBLASMp all work at MF=0.9
---     (residual 10% of VRAM fits workspace + libcal comms + driver on
---     A100 for tested problem sizes).  Override MEM_FRACTION with
---     LORRAX_XLA_MEM_FRACTION=<float> if a larger workload needs more
---     residual (seen no benefit varying in [0.5, 0.9] on MoS2 3×3).
+--   default (default):  platform + cuda_malloc_async.  Safe with
+--     use_ffi_io=true (collective phdf5 H5Dwrite + fit_one_rchunk JIT)
+--     on both COHSEX and PPM paths.  Slightly slower than bfc on
+--     compute-heavy sigma kernels, but stable is the priority here.
 --
---   default:         platform + cuda_malloc_async.  JAX's slow on-demand
---     debugging allocator.  Kept for callers that rely on it; not
---     recommended for new work.
+--   bfc:                BFC preallocate=true at MEM_FRACTION=0.75
+--     (override with LORRAX_XLA_MEM_FRACTION).  ~20% faster than
+--     default on sigma_ppm_body at MoS2 3×3 low_mem.  Sensitive to
+--     MEM_FRACTION at MoS2 3×3 scale with use_ffi_io=true:
+--       MF=0.75  stable on COHSEX + PPM (default for this mode)
+--       MF=0.5   sometimes hangs at phdf5 H5Dwrite (flaky)
+--       MF=0.9   hangs inside fit_one_rchunk JIT + io_callback
+--     Root cause not isolated; suspected BFC-preallocated-address
+--     interaction with collective paths (NCCL user-buffer
+--     registration, MPI-IO collective writes).  Do NOT use bfc at
+--     MF=0.9 with use_ffi_io=true.
 --
 -- `cuda_async` mode and the `LORRAX_XLA_PRESEED` knob were tested and
 -- removed: measured slower than `default` on every tested workload.
@@ -148,7 +153,7 @@ if _alloc_raw == "" and (_prealloc_flag == "1" or _prealloc_flag == "true") then
     _alloc_raw = "bfc"
 end
 if _alloc_raw == "" then
-    _alloc_raw = "bfc"     -- new default
+    _alloc_raw = "default"   -- safe for all FFI / collective paths
 end
 
 local allocator_env = {}
@@ -158,7 +163,7 @@ if _alloc_raw == "bfc" then
     allocator_env = {
         {"XLA_PYTHON_CLIENT_PREALLOCATE",  "true"},
         {"XLA_PYTHON_CLIENT_ALLOCATOR",    "bfc"},
-        {"XLA_PYTHON_CLIENT_MEM_FRACTION", _mf ~= "" and _mf or "0.9"},
+        {"XLA_PYTHON_CLIENT_MEM_FRACTION", _mf ~= "" and _mf or "0.75"},
     }
     unsetenv("TF_GPU_ALLOCATOR")
 elseif _alloc_raw == "default" then
