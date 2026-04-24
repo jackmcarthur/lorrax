@@ -494,8 +494,7 @@ def run_sternheimer(
             # q = 0 sits in the *derivative*, which comes from a custom JVP
             # (see Stage 3) that solves A·ẋ = ḃ with the differentiated source —
             # not from running CG on zero.
-            b_norms = _batched_real_norm_host(b)       # (nv,) float — cheap, on-device
-            b_norm_max = float(jnp.max(b_norms))
+            b_norm_max = float(jnp.max(_batched_real_norm_host(b)))
             if b_norm_max < 1e-12:
                 delta_u = jnp.zeros_like(b)
                 res_max = 0.0
@@ -541,7 +540,7 @@ def run_sternheimer(
         if verbose:
             dt = time.perf_counter() - t_q
             print(f"  ── q[{q_idx}] summary ──")
-            print(f"    max MINRES residual      = {total_res:.3e}")
+            print(f"    max CG residual          = {total_res:.3e}")
             print(f"    all v converged?         = {total_conv}")
             print(f"    max projector-leak       = {total_leak:.3e}")
             print(f"    χ_{{00}}(q, 0)           = {chi_col_np[0]:.6e}")
