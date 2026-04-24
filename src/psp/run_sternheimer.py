@@ -139,20 +139,21 @@ def build_sternheimer_source(
 
 def accumulate_chi_density(
     U_box_k: jax.Array,            # (nv, nspinor, nx, ny, nz)   G-space scatter at k
-    delta_u_G: jax.Array,          # (nv, nspinor, ngk_p)        G-sphere coeffs at k-q
+    delta_u_G: jax.Array,          # (nv, nspinor, ngk_p)        G-sphere coeffs at k-q (wrapped gauge)
     Gkminq_int: jax.Array,         # (ngk_p, 3)
     fft_grid,
+    phase_unwrap: jax.Array | None = None,  # (nx, ny, nz) e^{-i G_wrap·r}; default 1
 ) -> jax.Array:
-    """Return the (nx,ny,nz) real-space contribution
-    ``Σ_v  u_{v,k}(r) · conj(δu_{v,k}^q(r))``  of χ_{G'0}(q,0)'s induced density.
+    """Return the (nx,ny,nz) real-space contribution  Σ_v u_{v,k}(r) ·
+    conj(δu^{q,\\mathrm{naive}}_{v,k}(r))  for the χ_{G'0}(q,0) induced density.
 
-    The +q momentum component of  ψ^*·δψ + c.c.  that picks up ``e^{-i(q+G')·r}``
-    in the χ integral is  u · conj(δu)  (see module docstring derivation).
-    Summed over v here; caller sums over k and FFTs afterwards.
+    The CG solves in the wrapped-(k-q) gauge where δu_wrap(r) = e^{+iG_wrap·r}·
+    δu_naive(r).  Multiplying δu_wrap by phase_unwrap = e^{-iG_wrap·r} in real
+    space recovers δu_naive, which is what enters the physical density at the
+    naive Bloch momentum — putting its Fourier content into the correct G-slot
+    of the chi column.
     """
-    # u_{v,k}(r): IFFT of the already-scattered G-box.
     u_r = jnp.fft.ifftn(U_box_k, axes=(-3, -2, -1), norm='ortho')
-    # δu_{v,k}^q(r): scatter G-sphere coeffs to a fresh box, then IFFT.
     nv, nspinor, _ = delta_u_G.shape
     nx, ny, nz = fft_grid
     ix = jnp.mod(Gkminq_int[:, 0], nx)
@@ -160,8 +161,13 @@ def accumulate_chi_density(
     iz = jnp.mod(Gkminq_int[:, 2], nz)
     du_box = jnp.zeros((nv, nspinor, nx, ny, nz), dtype=delta_u_G.dtype)
     du_box = du_box.at[:, :, ix, iy, iz].set(delta_u_G)
-    du_r = jnp.fft.ifftn(du_box, axes=(-3, -2, -1), norm='ortho')
-    return jnp.sum(u_r * jnp.conj(du_r), axis=(0, 1))
+    du_wrap_r = jnp.fft.ifftn(du_box, axes=(-3, -2, -1), norm='ortho')
+    # Gauge conversion wrapped → naive.
+    if phase_unwrap is not None:
+        du_naive_r = phase_unwrap[None, None, :, :, :] * du_wrap_r
+    else:
+        du_naive_r = du_wrap_r
+    return jnp.sum(u_r * jnp.conj(du_naive_r), axis=(0, 1))
 
 
 def project_density_to_Gsphere(
@@ -180,26 +186,51 @@ def project_density_to_Gsphere(
 def make_density_perturbation(fft_grid) -> jax.Array:
     """Cell-periodic part of the density-response perturbation — identically 1.
 
-    The full external perturbation is ``V_ext(r) = e^{iq·r}``, which has no
-    cell-periodic part.  Acting on ψ_{v,k} = e^{ik·r}u_{v,k}(r), the product
-    ``e^{iq·r} · ψ_{v,k}(r) = e^{i(k+q)·r} · u_{v,k}(r)`` has Bloch momentum
-    k+q and the **same** cell-periodic part u_{v,k}(r).  In our p = k-q
-    convention the symmetric result is that the cell-periodic source at p
-    is u_{v,k} itself — i.e. ``V_pert_cell(r) = 1``.  The q-dependence
-    enters only through the change of G-sphere (k → k-q).
+    The q-dependence of the density-response source is carried by the change
+    of Bloch momentum (k → k-q) under V_ext(r) = e^{iq·r}; no explicit
+    real-space phase is needed when the (k-q)-sector does not wrap.  When the
+    wrap does occur, an additional ``phase_wrap`` = e^{+iG_wrap·r} is
+    multiplied into V_pert_cell at driver-level to convert the source from
+    the naive to the wrapped cell-periodic gauge (see driver q-loop).
 
-    This is why the forward χ_{G'0}(q, 0) pipeline does NOT apply any
-    real-space phase for the density-response case — the ``e^{-iq·r}`` phase
-    that appears in the analytic integral ``∫ dr e^{-i(q+G')r} δn(r)`` is
-    accounted for by the p = k-q momentum-shift bookkeeping inside
-    ``build_sternheimer_source`` + ``accumulate_chi_density``.
-
-    For phonon DFPT the caller would instead pass
-    ``V_pert_cell(r) = ∂V_scf/∂R_α`` (cell-periodic by construction); the
-    e^{iqr} plane-wave factor still comes in for free via the k → k+q shift.
+    For phonon DFPT the caller would pass V_pert_cell(r) = ∂V_scf/∂R_α
+    (cell-periodic by construction); the e^{iqr} plane-wave factor still
+    comes in for free via the k → k±q G-sphere shift.
     """
     nx, ny, nz = fft_grid
     return jnp.ones((nx, ny, nz), dtype=jnp.complex128)
+
+
+def make_umklapp_phase(G_wrap: np.ndarray, fft_grid, sign: int = +1) -> jax.Array:
+    """Return e^{i·sign·G_wrap·r} on the FFT grid, with r in crystal coords.
+
+    Build exp(sign · 2π i · G_wrap · r_frac) at FFT grid points r_frac =
+    (j_x/nx, j_y/ny, j_z/nz).  This is cell-periodic when G_wrap is an
+    integer reciprocal vector; it converts a cell-periodic function from the
+    naive-(k-q) gauge to the wrapped-(k-q) gauge (sign=+1) or back (sign=-1):
+
+        u_{wrap}(r) = e^{-i G_wrap · r} · u_{naive}(r)      [user derivation §1]
+        δu_{naive}(r) = e^{-i G_wrap · r} · δu_{wrap}(r)   [user derivation §2]
+
+    So the source builder multiplies by phase_wrap  = exp(+2πi G_wrap · r_frac)
+    to push u_{v,k_s}(r) into the wrapped gauge before projecting on Q_{k-q}_wrap,
+    and the accumulator multiplies δu_wrap by phase_unwrap = conj(phase_wrap)
+    to recover δu_naive before contracting with u_{v,k_s}(r).
+
+    If ``G_wrap == 0``, returns constant 1 (no-op).
+    """
+    nx, ny, nz = fft_grid
+    if int(G_wrap[0]) == 0 and int(G_wrap[1]) == 0 and int(G_wrap[2]) == 0:
+        return jnp.ones((nx, ny, nz), dtype=jnp.complex128)
+    fx = jnp.arange(nx, dtype=jnp.float64) / nx
+    fy = jnp.arange(ny, dtype=jnp.float64) / ny
+    fz = jnp.arange(nz, dtype=jnp.float64) / nz
+    phase_arg = (2.0 * jnp.pi * sign) * (
+        float(G_wrap[0]) * fx[:, None, None]
+        + float(G_wrap[1]) * fy[None, :, None]
+        + float(G_wrap[2]) * fz[None, None, :]
+    )
+    return jnp.exp(1j * phase_arg).astype(jnp.complex128)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -417,17 +448,28 @@ def run_sternheimer(
     vol = float(wfn.cell_volume)
 
     for q_idx, iq_red in enumerate(iq_list):
-        qvec = np.asarray(wfn.kpoints[iq_red], dtype=np.float64)
+        qvec_pos = np.asarray(wfn.kpoints[iq_red], dtype=np.float64)
+        # Signed representative q_signed ∈ [-1/2, 1/2)³.  Using signed-q makes
+        # V_pert_base(r) = 1 self-consistent (the physical perturbation
+        # e^{i q_signed · r} has a purely plane-wave character with no extra
+        # reciprocal-lattice phase) AND minimises the number of k's for which
+        # (k - q) wraps back into the BZ.  Non-wrap k contributions then give
+        # pure-real χ₀₀ trivially; wrap k's pick up a small G_wrap phase.
+        qvec = qvec_pos - np.round(qvec_pos)                        # → [-0.5, 0.5)
+        # ``sym.kq_map[ik, iq_red]`` is indexed by the **positive** iq_red,
+        # so we keep iq_red as-is for the index lookup; only the q-value
+        # itself flips to its signed representative.
         if verbose:
-            print(f"\n══ q[{q_idx}] = {qvec}   (reduced idx {iq_red}) ══")
+            print(f"\n══ q[{q_idx}] = {qvec}   (signed; reduced idx {iq_red}) ══")
 
         Gprime_int = build_Gprime_list(qvec, wfn, ng_out)        # (ng_out, 3)
         Gprime_j = jnp.asarray(Gprime_int)
 
-        # Cell-periodic part of the density-response perturbation: identically
-        # 1.  (See ``make_density_perturbation`` docstring for why the e^{iq·r}
-        # factor enters through the k→k-q G-sphere shift instead.)
-        V_pert_real = make_density_perturbation(wfn.fft_grid)
+        # Cell-periodic part of the density-response perturbation is identically
+        # 1; any wrap-gauge factor e^{+iG_wrap·r} is added per-k inside the
+        # k-loop (see below).  For phonon DFPT the caller would pass a real
+        # ∂V_scf/∂R_α here instead.
+        V_pert_base = make_density_perturbation(wfn.fft_grid)
 
         # Accumulator for δn(r) over all k.
         delta_n_r = jnp.zeros((nx, ny, nz), dtype=jnp.complex128)
@@ -446,19 +488,25 @@ def run_sternheimer(
             H_kminq, Gkminq_int = H_cache[ik_kminq]
             apply_H_kminq = make_apply_H(H_kminq)
 
-            # KNOWN ISSUE: when (k − q) falls outside [0,1)³ and ``sym.kq_map``
-            # wraps to the equivalent in-BZ k, there's an umklapp-phase
-            # bookkeeping between the source / p_wrap G-spheres that we do NOT
-            # currently apply.  Symptoms on MoS2 3×3 nosym:  χ₀₀(q) picks up a
-            # spurious imaginary part at q's with a 2/3 component (q=(0,2/3) →
-            # χ₀₀ = 0.0056 − 0.0025j while sum-over-states gives a real value).
-            # A naive G_wrap = k_wrap − (k−q)_naive correction was tested but
-            # doesn't remove the imag part either — likely compounded with the
-            # pre-existing SymMaps "non-symmorphic phases NOT applied for
-            # TR-unfolded k-points" warning (see sources/lorrax_B startup log).
-            # For now the pipeline is correct at q-points whose k − q mapping
-            # does not wrap (q=(0,0), (1/3,1/3), etc.).  Proper fix needs a
-            # pass through SymMaps' TR-unfolding tau-phase handling.
+            # ── Umklapp G_wrap for the wrapped ↔ naive gauge conversion ──
+            # Convention:  p_naive = k - q,  p_wrap ∈ [0,1)³ from kq_map,
+            # so  G_wrap = p_naive − p_wrap ∈ ℤ³.  Then
+            #     u_{v, k_wrap}(r)  =  e^{+i G_wrap · r} · u_{v, k_naive}(r)
+            # (the Bloch phase identity for wrapping by a reciprocal vector).
+            # The source is pushed naive → wrapped by multiplying by
+            # phase_wrap = e^{+i G_wrap · r} (it's zero / unity when no wrap).
+            # δu_wrap from the CG is pulled back wrapped → naive by
+            # phase_unwrap = e^{-i G_wrap · r} inside accumulate_chi_density.
+            kvec_k_np          = np.asarray(sym.unfolded_kpts[ik_full],  dtype=np.float64)
+            kvec_kminq_wrap_np = np.asarray(sym.unfolded_kpts[ik_kminq], dtype=np.float64)
+            G_wrap_np = np.rint(
+                (kvec_k_np - qvec) - kvec_kminq_wrap_np).astype(np.int32)   # (3,)
+            phase_wrap   = make_umklapp_phase(G_wrap_np, wfn.fft_grid, sign=+1)
+            phase_unwrap = make_umklapp_phase(G_wrap_np, wfn.fft_grid, sign=-1)
+            # Compose the perturbation used by the source builder:
+            #   V_pert_real(r) = V_pert_base(r) · phase_wrap(r)
+            # For density response: V_pert_base = 1, so V_pert_real = phase_wrap.
+            V_pert_real = V_pert_base * phase_wrap
 
             # ── ψ coefficients: box view (for FFT path) + G-sphere gather (for ops) ──
             U_val_k_box     = psi_box_full[ik_full,  :n_occ]           # (nv, ns, nx, ny, nz) G-space scatter
@@ -524,9 +572,10 @@ def run_sternheimer(
             leak_du = float(jnp.max(jnp.abs(U_dag_du)))
             total_leak = max(total_leak, leak_du)
 
-            # ── Density contribution ──
+            # ── Density contribution — convert δu_wrap → δu_naive in real space ──
             delta_n_r = delta_n_r + accumulate_chi_density(
-                U_val_k_box, delta_u, Gkminq_int, wfn.fft_grid)
+                U_val_k_box, delta_u, Gkminq_int, wfn.fft_grid,
+                phase_unwrap=phase_unwrap)
 
         # ── Project δn → χ column at G' ──  Adler–Wiser normalisation.
         #
