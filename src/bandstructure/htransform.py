@@ -16,202 +16,183 @@ from jax.scipy.special import erf
 from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental.shard_map import shard_map
+from functools import partial
 
 from file_io import WFNReader
 from common import symmetry_maps
 from common import Meta
-from common.load_wfns import get_enk_bandrange
-
-FFT_CHUNK = 25  # bands per FFT batch to limit GPU memory
-
-
-def _build_k_mesh(nk: int) -> Mesh:
-    """Build a 2-axis device mesh ('replicated', 'k') using every visible device.
-
-    ``pk = gcd(nk, jax.device_count())`` is the k-axis partition; whatever is
-    left (``ndev // pk``) goes to the ``'replicated'`` axis so leftover GPUs
-    still participate in collectives (they just hold replicated copies). A
-    third axis for distributed μ/ν linear algebra later is a one-line change.
-    """
-    import math
-    ndev = jax.device_count()
-    pk = max(math.gcd(nk, ndev), 1)
-    replicated = ndev // pk
-    devices = np.asarray(jax.devices()).reshape(replicated, pk)
-    return Mesh(devices, ('replicated', 'k'))
+from common.load_wfns import (
+    get_enk_bandrange, load_centroids_band_chunked, iter_psi_rchunk_bandwise,
+)
+from common.isdf_fitting import compute_L_q_from_CCT
 
 
-def _ifft_one_kpoint(wfn, sym, k_idx, band_indices, fft_grid):
-    """FFT one k-point to real space, streaming bands in chunks.
-
-    Returns numpy array of shape (nb, nspinor, nr) on CPU.
-    """
-    nb = len(band_indices)
-    nx, ny, nz = fft_grid
-    nr = nx * ny * nz
-    sqrt_nr = np.sqrt(nr)
-    nspinor = 2  # always spinor for CrI3
-
-    # Get rotated G-vectors and coefficients
-    gvecs = sym.get_gvecs_kfull(wfn, k_idx)  # (ngk, 3)
-    gx = gvecs[:, 0] % nx
-    gy = gvecs[:, 1] % ny
-    gz = gvecs[:, 2] % nz
-    cnk_batch = sym.get_cnk_fullzone_batch(wfn, band_indices, k_idx)  # (nb, nspinor, ngk)
-
-    # Bloch phase exp(2πi k·r)
-    kvec = sym.unfolded_kpts[k_idx]
-    fx = np.arange(nx, dtype=np.float64) / nx
-    fy = np.arange(ny, dtype=np.float64) / ny
-    fz = np.arange(nz, dtype=np.float64) / nz
-    phase_3d = np.exp(2j * np.pi * (
-        kvec[0] * fx[:, None, None] +
-        kvec[1] * fy[None, :, None] +
-        kvec[2] * fz[None, None, :]
-    ))  # (nx, ny, nz)
-
-    result = np.zeros((nb, nspinor, nr), dtype=np.complex128)
-    for s in range(0, nb, FFT_CHUNK):
-        e = min(s + FFT_CHUNK, nb)
-        nc = e - s
-        c_grid = np.zeros((nc, nspinor, nx, ny, nz), dtype=np.complex128)
-        for ispin in range(nspinor):
-            c_grid[:, ispin, gx, gy, gz] = cnk_batch[s:e, ispin, :]
-        u = jnp.fft.ifftn(jnp.asarray(c_grid), axes=(2, 3, 4)) * sqrt_nr
-        u = u * jnp.asarray(phase_3d)[None, None, :, :, :]
-        result[s:e] = np.asarray(u.reshape(nc, nspinor, nr))
-        del u, c_grid
-    return result
+def _build_mesh_xy() -> Mesh:
+    """Most-square 2D ('x','y') mesh — matches gw_jax._build_mesh idiom."""
+    total = jax.process_count() * jax.local_device_count()
+    gx = int(np.sqrt(total))
+    while gx > 1 and total % gx != 0:
+        gx -= 1
+    return Mesh(np.asarray(jax.devices()).reshape(gx, total // gx), ('x', 'y'))
 
 
-def streaming_galerkin_solve(wfn, sym, band_indices, fft_grid, centroid_indices,
-                             rtol=1e-8, log_fn=None, spatial_chunk=400_000,
-                             k_mesh: Mesh | None = None):
-    """Galerkin projection, k-sharded.
+_accum_G_cache: dict = {}
 
-    The FFT pass remains serial on process-0 (WFN.h5 is single-file read), but
-    psi_rmu and psi_r live on-device sharded across k. The G-accumulation hot
-    spot becomes one shard_map+psum; the single-device streaming-chunk loop
-    goes away. SVD on psi_mu_flat stays single-device — its shape
-    (nk·nb, nspinor·n_mu) is modest even at production scale.
+
+def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
+                             band_range: tuple[int, int],
+                             rtol: float = 1e-8, log_fn=None,
+                             band_chunk_size: int = 64,
+                             bispinor: bool = False):
+    """Galerkin projection using gw_jax shared loaders.
+
+    Single ('x','y') mesh throughout. ψ at centroids comes from
+    ``load_centroids_band_chunked``; ψ at full r is streamed via
+    ``iter_psi_rchunk_bandwise`` (band+r chunked, sharded on 'y'). G is built
+    sharded ``P('x','y')`` and Cholesky-factored via ``compute_L_q_from_CCT``
+    so the 1×1-mesh dense path and the 2D-blocked distributed path both work.
+
+    Args:
+        wfn, sym, meta: standard gw_jax handles.
+        centroid_indices: (n_μ, 3) FFT-grid coordinates.
+        mesh_xy: 2D ``('x','y')`` device mesh.
+        band_range: ``(b_start, b_end)`` — bands included in the SVD basis.
+        rtol: SVD truncation tolerance (relative to s.max()).
+        band_chunk_size: bands per FFT chunk inside the loader.
+        bispinor: passed through to ``load_centroids_band_chunked``.
+
+    Returns ``(S, ctilde)`` matching the legacy contract.
     """
     import time
     if log_fn is None:
         log_fn = lambda *a, **kw: None
 
-    nk = sym.nk_tot
-    nb = len(band_indices)
-    nx, ny, nz = fft_grid
-    nr = nx * ny * nz
-    nspinor = 2
-    n_total = nspinor * nr  # spinor-folded spatial dimension
+    b_start, b_end = band_range
+    nb = b_end - b_start
+    nk = meta.nk_tot
+    nspinor = meta.nspinor
+    n_mu = int(centroid_indices.shape[0])
 
-    # Compute centroid linear indices
-    ci = np.asarray(centroid_indices)
-    centroid_lin = ci[:, 0] * (ny * nz) + ci[:, 1] * nz + ci[:, 2]
-    n_mu = len(centroid_lin)
+    rep = NamedSharding(mesh_xy, P())               # fully replicated
+    grid_xy = NamedSharding(mesh_xy, P('x', 'y'))   # (rank, rank) face
 
-    if k_mesh is None:
-        k_mesh = _build_k_mesh(nk)
-    pk = k_mesh.shape['k']
-    nrep = k_mesh.shape['replicated']
-    if nk % pk:
-        raise ValueError(f"k_mesh size {pk} does not divide nk={nk}")
-    nk_loc = nk // pk
-    shard_k = NamedSharding(k_mesh, P('k'))           # (nk, ...) sharded on k, replicated on 'replicated'
-    shard_rep = NamedSharding(k_mesh, P())            # fully replicated
+    log_fn(
+        f"  Streaming Galerkin: nk={nk}, nb={nb}, nr={meta.n_rtot}, "
+        f"n_mu={n_mu}, mesh=({mesh_xy.shape['x']}x{mesh_xy.shape['y']})"
+    )
 
-    log_fn(f"  Streaming Galerkin: nk={nk}, nb={nb}, nr={nr}, n_mu={n_mu}, k_mesh=(rep={nrep},k={pk})")
-    log_fn(f"  Per-shard psi_r: {nk_loc*nb*n_total*16/1e9:.2f} GB × {pk} k-shard(s)")
-
-    # ── FFT pass: each process fills its k-shard, assembles global sharded array ──
-    # With 1 device per process, proc p owns k-shard (p mod pk). When pk=1
-    # (ndev doesn't divide nk cleanly) all procs end up redundantly
-    # computing the same shard — inefficient but correct; pick nk divisible
-    # by ndev to actually parallelize.
+    # ── 1. Load ψ at centroids (band-sharded internally on 'y') ──
     t0 = time.time()
-    log_fn(f"  FFT pass: all k-points to real space...")
-    my_k_shard = jax.process_index() % pk
-    my_k_lo, my_k_hi = my_k_shard * nk_loc, (my_k_shard + 1) * nk_loc
-    psi_rmu_loc = np.zeros((nk_loc, nb, nspinor, n_mu), dtype=np.complex128)
-    psi_r_loc = np.zeros((nk_loc, nb, n_total), dtype=np.complex128)
-    for i, ik in enumerate(range(my_k_lo, my_k_hi)):
-        tk = time.time()
-        psi_r_k = _ifft_one_kpoint(wfn, sym, ik, band_indices, fft_grid)
-        psi_rmu_loc[i] = psi_r_k[:, :, centroid_lin]
-        psi_r_loc[i] = psi_r_k.reshape(nb, n_total)
-        del psi_r_k
-        if i == 0 or i == nk_loc - 1:
-            log_fn(f"    proc {jax.process_index()}: k={ik} ({time.time()-tk:.2f}s)")
-    psi_rmu = jax.make_array_from_process_local_data(shard_k, psi_rmu_loc, (nk, nb, nspinor, n_mu))
-    psi_r = jax.make_array_from_process_local_data(shard_k, psi_r_loc, (nk, nb, n_total))
-    del psi_rmu_loc, psi_r_loc
-    log_fn(f"  FFT pass done in {time.time()-t0:.1f}s")
+    psi_rmu_Y, _ = load_centroids_band_chunked(
+        wfn, sym, meta, centroid_indices, bispinor, mesh_xy,
+        band_range=band_range, band_chunk_size=band_chunk_size,
+    )
+    # psi_rmu_Y: (nk, nb, ns, n_μ), sharded P(None, None, None, 'y')
+    log_fn(f"  load_centroids_band_chunked: {time.time()-t0:.2f}s")
 
-    # ── SVD on centroid matrix (replicated — input gathered, output replicated) ──
-    # For k_mesh of size >1, jnp gathers implicitly; the matrix is small.
-    psi_mu_flat = jnp.asarray(psi_rmu.reshape(nk * nb, nspinor * n_mu))
-    psi_mu_flat = jax.device_put(psi_mu_flat, shard_rep)
-    del psi_rmu
-    log_fn(f"  SVD of ({nk*nb}, {nspinor*n_mu}) centroid matrix...")
+    # ── 2. SVD of A = ψ@centroids reshaped to (nk·nb, ns·n_μ) ──
+    # FFI seam: today gather to replicated, run dense SVD on each device
+    # (small for our sizes); swap for distributed SVD when n_μ scales up.
     t1 = time.time()
-    U, s, Vh = jnp.linalg.svd(psi_mu_flat, full_matrices=False)
-    del Vh, psi_mu_flat
-    mask = s > (s.max() * rtol)
-    rank = int(mask.sum())
+    A = psi_rmu_Y.reshape(nk * nb, nspinor * n_mu)
+    A = jax.device_put(A, rep)
+    del psi_rmu_Y
+
+    @partial(jax.jit, donate_argnums=(0,), out_shardings=(rep, rep, rep))
+    def _svd_replicated(A):
+        result = jnp.linalg.svd(A, full_matrices=False)
+        return result.U, result.S, result.Vh
+
+    U, s, _Vh = _svd_replicated(A)
+    del _Vh, A
+    s_host = np.asarray(s)
+    rank = int((s_host > s_host.max() * rtol).sum())
     U = U[:, :rank]
     s = s[:rank]
-    log_fn(f"  SVD rank: {rank}, top σ={float(s[0]):.4f}, bottom σ={float(s[rank-1]):.6f} ({time.time()-t1:.1f}s)")
+    log_fn(f"  SVD of ({nk*nb}, {nspinor*n_mu}): rank={rank}, "
+           f"σ_max={float(s_host[0]):.3e}, σ_min/{rtol:.0e}={float(s_host[rank-1]):.3e} "
+           f"({time.time()-t1:.2f}s)")
 
-    coeffs = U * s[None, :]  # (nk*nb, rank), replicated
+    coeffs = U * s[None, :]                  # (nk·nb, rank), replicated
+    inv_s = (1.0 / s)[:, None]               # (rank, 1), replicated
+    UH = U.conj().T                          # (rank, nk·nb), replicated
+    del U
 
-    # ── G accumulation: one sharded kernel, no Python chunk loop ──
-    # UH columns are indexed by (ik, ib); reshape so the ik axis is explicit
-    # and shard it matching psi_r. The contraction over (ik_loc, ib) is local,
-    # then psum across k reduces to the replicated (rank, rank) Gram matrix.
-    inv_s = (1.0 / s)[:, None]
-    UH_k = U.conj().T.reshape(rank, nk, nb).transpose(1, 0, 2)  # (nk, rank, nb)
-    UH_k = jax.device_put(UH_k, shard_k)
+    # ── 3. G = Σ_chunks Q_chunk Q_chunk^H, streaming over r-chunks ──
+    # Inside each chunk:
+    #   Q_chunk = inv_s · UH @ ψ_r_chunk   (psi sharded P(...,'y') on r-axis)
+    #   G_chunk = Q_chunk @ Q_chunk^H      (rank,rank), psum over 'y'
+    # JIT-cached by (n_rchunk, n_bchunk, rank).
+    n_rtot = meta.fft_grid[0] * meta.fft_grid[1] * meta.fft_grid[2]
+    band_chunk_ranges = [
+        (b_start + i * band_chunk_size, min(b_start + (i + 1) * band_chunk_size, b_end))
+        for i in range((nb + band_chunk_size - 1) // band_chunk_size)
+    ]
 
-    @jax.jit
-    def _accum_G(UH_k, psi_r, inv_s):
-        # UH_k: (nk, rank, nb) sharded on k; psi_r: (nk, nb, n_total) sharded on k
-        # G = Q Q^H where Q = inv_s · Σ_k UH_k psi_k (nk summed). Q is NOT
-        # sharded after the psum, so the outer product Q Q^H picks up the
-        # cross-shard terms correctly. Materialising Q (rank, n_total) is
-        # O(rank · n_total) per device; for larger systems we'd shard n_total
-        # too, with a final psum of G over that axis.
-        def _local(UH_loc, psi_loc, inv_s):
-            Q_loc = inv_s * jnp.einsum('krb,kbt->rt', UH_loc, psi_loc)
-            Q = lax.psum(Q_loc, 'k')        # (rank, n_total) replicated across 'k'
-            return Q @ Q.conj().T           # (rank, rank) replicated
-        return shard_map(
-            _local, mesh=k_mesh,
-            in_specs=(P('k', None, None), P('k', None, None), P()),
-            out_specs=P(), check_rep=False,
-        )(UH_k, psi_r, inv_s)
+    def _make_accum_kernel(rank_, bc_size, nspinor_, mesh_, sharding_y, sharding_xy):
+        key = (id(mesh_), rank_, bc_size, nspinor_)
+        fn = _accum_G_cache.get(key)
+        if fn is not None:
+            return fn
 
-    log_fn(f"  G accumulation (k-sharded, pk={pk})...")
+        @partial(jax.jit, donate_argnums=(2,), out_shardings=sharding_xy)
+        def _accum(UH_bc, inv_s, psi_bc, G_in):
+            # UH_bc: (rank, nk·bc) replicated; inv_s: (rank,1) replicated
+            # psi_bc: (nk, bc, ns, r_chunk) sharded P(None,None,None,'y')
+            # Reshape psi so the contraction axis is (nk·bc) and the
+            # remaining axis is (ns·r_chunk). Spinor folds with r-axis,
+            # matching the (ns·n_μ) column axis of A used in the SVD.
+            nkv, bcv, nsv, rcv = psi_bc.shape
+            psi_flat = psi_bc.reshape(nkv * bcv, nsv * rcv)  # (nk·bc, ns·r_chunk)
+            Q = inv_s * (UH_bc @ psi_flat)                   # (rank, ns·r_chunk), sharded on 'y'
+            Q = jax.lax.with_sharding_constraint(Q, sharding_y)
+            return G_in + (Q @ Q.conj().T)                   # (rank, rank), sharded P('x','y')
+
+        _accum_G_cache[key] = _accum
+        return _accum
+
+    sharding_y = NamedSharding(mesh_xy, P(None, 'y'))
+    G = jax.device_put(jnp.zeros((rank, rank), dtype=jnp.complex128), grid_xy)
+
     t2 = time.time()
-    G = _accum_G(UH_k, psi_r, inv_s)
+    chunk_count = 0
+    UH_kb = UH.reshape(rank, nk, nb)  # for band-chunk slicing
+    for bc_range, psi_bc_Y in iter_psi_rchunk_bandwise(
+            wfn, sym, meta, mesh_xy, band_range, 0, meta.n_rtot, bispinor,
+            band_chunk_size=band_chunk_size,
+            band_chunk_ranges=band_chunk_ranges):
+        bc = bc_range[1] - bc_range[0]
+        bc_lo = bc_range[0] - b_start
+        bc_hi = bc_range[1] - b_start
+        UH_bc = UH_kb[:, :, bc_lo:bc_hi].reshape(rank, nk * bc)
+
+        accum = _make_accum_kernel(rank, bc, nspinor, mesh_xy, sharding_y, grid_xy)
+        G = accum(UH_bc, inv_s, psi_bc_Y, G)
+        chunk_count += 1
     jax.block_until_ready(G)
-    log_fn(f"  G accumulation done in {time.time()-t2:.1f}s")
-    del UH_k, psi_r, inv_s
+    log_fn(f"  G accumulation: {chunk_count} chunk(s), {time.time()-t2:.2f}s")
 
-    # ── Cholesky orthogonalization ──
-    chol = jnp.linalg.cholesky(G)
-    coeffs = coeffs @ chol
-    del G, chol
+    # ── 4. Cholesky on G ──
+    # FFI seam: gw_jax's compute_L_q_from_CCT (which has dual 1×1-dense /
+    # 2D-blocked paths) is the natural drop-in for distributed scaling, but
+    # its 1e-14·trace ridge is calibrated for ISDF's huge-trace C_q matrices
+    # and biases htransform's small-trace G by ~1e-5. Use raw Cholesky for
+    # numerical parity with the legacy pipeline; swap to compute_L_q_from_CCT
+    # (or its FFI variant) when n_μ scales to where rank-deficiency dominates.
+    t3 = time.time()
+    L = jnp.linalg.cholesky(G)
+    log_fn(f"  Cholesky of G: {time.time()-t3:.2f}s")
 
+    # ── 5. ctilde = coeffs · L (small, replicated) ──
+    coeffs = coeffs @ L
     S = jnp.eye(rank, dtype=jnp.complex128)
-    # Reshape coeffs back to (nk, nb, rank); shard on k for downstream fH_k.
-    ctilde = jax.device_put(coeffs.reshape(nk, nb, rank), shard_k)
+    ctilde = jax.device_put(coeffs.reshape(nk, nb, rank), rep)
 
-    # Orthogonality check at k=0
+    # Sanity check: ctilde[0] @ ctilde[0]^H should be ~ I
     CtC = ctilde[0] @ ctilde[0].conj().T
     ortho_err = float(jnp.max(jnp.abs(CtC - jnp.eye(nb, dtype=jnp.complex128))))
     log_fn(f"  ctilde[0] orthogonality error: {ortho_err:.3e}")
-    log_fn(f"  Total Galerkin: {time.time()-t0:.1f}s")
+    log_fn(f"  Total Galerkin: {time.time()-t0:.2f}s")
 
     return S, ctilde
 
@@ -497,7 +478,10 @@ def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.A
     return jnp.asarray(energies_window.T, dtype=jnp.float64)
 
 
-def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None = None):
+def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None = None,
+                    mesh_xy: Mesh | None = None):
+    from file_io.centroids import load_centroids as _shared_load_centroids
+
     input_dir = os.path.dirname(os.path.abspath(input_path))
 
     def _resolve(path: str) -> str:
@@ -506,12 +490,13 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
     wfn_file = _resolve(params["wfn_file"])
     wfn, sym = setup_wfn_and_sym(wfn_file)
     centroid_path = _resolve(params.get("centroids_file", "centroids_frac.txt"))
-    centroid_indices = _load_centroids(centroid_path, tuple(int(x) for x in wfn.fft_grid))
+    _, centroid_indices, n_rmu = _shared_load_centroids(centroid_path, tuple(int(x) for x in wfn.fft_grid))
 
     nval = int(params["nval"])
     ncond = int(params["ncond"])
     nband = int(params["nband"])
-    meta = Meta.from_system(wfn, sym, nval, ncond, nband, int(centroid_indices.shape[0]), params.get("bispinor", False))
+    bispinor = bool(params.get("bispinor", False))
+    meta = Meta.from_system(wfn, sym, nval, ncond, nband, n_rmu, bispinor)
     nsigmarange, enk_sigma = load_wfns_and_enk_for_sigma(wfn, sym, nval, ncond, nband)
 
     # Optionally override energies with EQP values from a file only if explicitly requested via CLI
@@ -526,14 +511,16 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             except Exception as exc:
                 log_fn(f"EQP override skipped for {os.path.basename(eqp_path)}: {exc}")
 
-    band_indices = np.arange(int(nsigmarange[0]), int(nsigmarange[1]))
-    fft_grid = tuple(int(x) for x in wfn.fft_grid)
-    S, ctilde = streaming_galerkin_solve(
-        wfn, sym, band_indices, fft_grid, centroid_indices,
-        rtol=1e-8, log_fn=log_fn,
-    )
-    log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, nb={len(band_indices)}, rank={ctilde.shape[2]}")
-    return wfn, sym, meta, S, ctilde, enk_sigma
+    if mesh_xy is None:
+        mesh_xy = _build_mesh_xy()
+    band_range = (int(nsigmarange[0]), int(nsigmarange[1]))
+    with mesh_xy:
+        S, ctilde = streaming_galerkin_solve(
+            wfn, sym, meta, centroid_indices, mesh_xy, band_range,
+            rtol=1e-8, log_fn=log_fn, bispinor=bispinor,
+        )
+    log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, nb={band_range[1]-band_range[0]}, rank={ctilde.shape[2]}")
+    return wfn, sym, meta, mesh_xy, S, ctilde, enk_sigma
 
 
 def initialize_kpath(wfn, params):
@@ -550,7 +537,7 @@ def initialize_kpath(wfn, params):
     return kpath_frac, x_path, node_indices, node_labels, gamma_positions
 
 
-def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn,
+def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 a_band_index: int | None = None):
     nk = int(meta.nkx * meta.nky * meta.nkz)
     states = ctilde.shape[1]
@@ -560,19 +547,18 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn,
     log_fn(f"Transform parameters: a={a_f:.6f}, n={n_f:.2f}, shift={shift:.6f}"
            + (f", a from band {a_band_index}" if a_band_index is not None else ""))
 
+    # fH_k inherits the (rank, rank) face sharding P(None, 'x', 'y') — same idiom
+    # as gw_jax V_qmunu / CCT. Each (x, y) shard FFTs its own (rank, rank) slice
+    # along the k-axes; no inter-device comm during the k-FFT.
+    fH_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+
     coeffs = ctilde.reshape(nk, states, rank)
     f_eps_ki = jnp.where(f_eps.T > 0, 0.0, f_eps.T)
     band_weights = jnp.sqrt(jnp.clip(-f_eps_ki, 0.0, None))
-    # Per-k outer product; ctilde is already k-sharded from streaming_galerkin_solve.
-    # band_weights is tiny and cheap to replicate.
     weighted = coeffs * band_weights[..., None]
     fH_k = -jnp.einsum('kim,kin->kmn', weighted, jnp.conj(weighted), optimize=True)
     fH_k = 0.5 * (fH_k + jnp.swapaxes(fH_k, -1, -2).conj())
-    # Gather fH_k onto a single device before the k-FFT. fH_k has shape
-    # (nk, rank, rank): for nk up to a few hundred and rank ~ 10·nb this is
-    # well under a GB. When nk grows into the thousands we'd switch to a
-    # distributed 3D FFT here (future work).
-    fH_k = jax.device_put(fH_k, NamedSharding(_build_k_mesh(nk), P()))
+    fH_k = jax.lax.with_sharding_constraint(fH_k, fH_shard)
     log_fn(
         "fH_k real range: [{:.3e}, {:.3e}], |imag|max={:.3e}".format(
             float(jnp.min(jnp.real(fH_k))),
@@ -633,17 +619,24 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn,
 
     if kpath_frac is not None:
         wrapped_k = (kpath_frac + 0.5) % 1.0 - 0.5
-        # Process q-points in batches to avoid OOM on large paths
+        # Pad nq up to a multiple of batch_size so every batch has the same
+        # shape — avoids the duplicate-compile pipeline for the partial last
+        # batch (saw c128[32,...] AND c128[N_remainder,...] in baseline).
         batch_size = 32
         nq = wrapped_k.shape[0]
+        n_pad = (-nq) % batch_size  # pad up to multiple of batch_size
+        if n_pad:
+            wrapped_k = jnp.concatenate(
+                [wrapped_k, jnp.zeros((n_pad, 3), dtype=wrapped_k.dtype)], axis=0)
+        nq_padded = wrapped_k.shape[0]
         lambda_q_list = []
-        for i in range(0, nq, batch_size):
+        for i in range(0, nq_padded, batch_size):
             batch_k = wrapped_k[i:i+batch_size]
             batch_H = project_to_q(batch_k)
             batch_eigs = jax.vmap(_solve_generalized)(batch_H)
             lambda_q_list.append(batch_eigs)
-            jax.block_until_ready(batch_eigs)  # Free memory before next batch
-        lambda_q = jnp.concatenate(lambda_q_list, axis=0)
+            jax.block_until_ready(batch_eigs)
+        lambda_q = jnp.concatenate(lambda_q_list, axis=0)[:nq]
         energies_on_path = jax.vmap(lambda row: newton_inv(a_f, n_f, shift, row.real))(lambda_q)
         energies_sorted = np.asarray(jnp.sort(energies_on_path, axis=1)[:, :nb_keep])
         # Determine Fermi energy as the maximum along path of the wfn.nelec-th band (1-based -> 0-based)
@@ -759,10 +752,12 @@ def main(argv=None):
         params["wfn_file"] = args.wfn_file
         log(f"Using WFN file from CLI: {args.wfn_file}")
 
-    wfn, sym, meta, S, ctilde, enk_sigma = initialize_wfns(args.input, params, log, args.eqp_file)
+    wfn, sym, meta, mesh_xy, S, ctilde, enk_sigma = initialize_wfns(
+        args.input, params, log, args.eqp_file)
     kpath_data = initialize_kpath(wfn, params)
-    result = h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log,
-                         a_band_index=args.a_band)
+    with mesh_xy:
+        result = h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log, mesh_xy,
+                             a_band_index=args.a_band)
 
     if args.plot:
         plot_bands(result)
