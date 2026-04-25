@@ -1257,13 +1257,6 @@ def run_sternheimer(
         chi-column solve, sum over k.  When ``with_derivs`` is True,
         also returns the (ng_out, 3) Jacobian via ``jax.linearize``
         sharing the primal trace."""
-        stk = _build_stk_at_q(
-            qvec_j, kminq_idx_j, V_pert_base_j,
-            T_diag_full, mask_full, Gx_full, Gy_full, Gz_full,
-            Gk_int_full, kvec_kmq_full, U_kmq_G_full,
-            K_bar_sq_full, en_occ_full, U_box_full,
-            fft_grid_static=fft_grid_static,
-        )
         if use_schur_default:
             U_extra_idx = U_extra_G_full[kminq_idx_j]
             eps_extra_idx = eps_extra_full[kminq_idx_j]
