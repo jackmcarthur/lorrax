@@ -115,6 +115,15 @@ def alpha_z(sp: SpeciesData, vol: float) -> float:
 # Build all tables for all species in one pass
 # ---------------------------------------------------------------------------
 
+def _simpson_weights(n_r: int) -> np.ndarray:
+    """Simpson 1/3 quadrature weights for a uniform n_r-point grid."""
+    sw = np.ones(n_r, dtype=np.float64)
+    sw[1:-1:2] = 4.0 / 3.0
+    sw[2:-1:2] = 2.0 / 3.0
+    sw[0] = sw[-1] = 1.0 / 3.0
+    return sw
+
+
 def build_all_tables(
     species_list: list[SpeciesData],
     q_max: float,
@@ -122,38 +131,98 @@ def build_all_tables(
 ) -> dict:
     """Build Hankel tables for all species on a uniform q-grid.
 
+    Per-species the per-projector forward (F_l) and analytic-deriv
+    raw-Hankel (H_{l+1}) tables are produced in two batched JAX kernel
+    invocations — one per unique l (resp. l+1).  All Bessel evaluation
+    + integrand reduction lives on GPU; only the (n_proj_s, n_q)
+    result moves back to host.  Replaces a per-projector scipy.special
+    .spherical_jn call site (~10 s total on MoS2) with ~1 s of GPU
+    work + persistent-cached compile.
+
     Returns dict with:
       q : (n_q,) uniform grid
-      vloc : (n_species, n_q) V_loc short-range tables
-      nlcc : (n_species, n_q) core density tables
-      has_vloc : (n_species,) bool
-      has_nlcc : (n_species,) bool
-      proj_tables : list of (n_proj_s, n_q) per species
-      proj_l : list of (n_proj_s,) int per species
-      proj_j : list of (n_proj_s,) float per species
+      dq : float
+      vloc : (n_species, n_q) V_loc short-range tables  (l=0 Hankel)
+      nlcc : (n_species, n_q) core density tables       (l=0 Hankel)
+      has_vloc, has_nlcc : (n_species,) bool
+      proj_tables   : list of (n_proj_s, n_q) — F_l(q) per species
+      deriv_tables  : list of (n_proj_s, n_q) — raw H_{l+1}(β; q) per
+                       species, the *unscaled* integral that
+                       projector_deriv_table normalises by /q^l.  Caller
+                       (build_vnl_setup) does the q^l division.
     """
+    import jax.numpy as jnp
+    from psp.radial.radial_jax import spherical_hankel_table_batch_jax
+
     q = np.linspace(0.0, max(q_max, 1e-8), n_q)
     n_sp = len(species_list)
+    q_j = jnp.asarray(q, dtype=jnp.float64)
 
     vloc = np.zeros((n_sp, n_q), dtype=np.float64)
     nlcc = np.zeros((n_sp, n_q), dtype=np.float64)
     has_vloc = np.ones(n_sp, dtype=bool)
     has_nlcc = np.zeros(n_sp, dtype=bool)
     proj_tables = []
+    deriv_tables = []
 
+    e2 = 2.0
     for i, sp in enumerate(species_list):
-        vloc[i] = vloc_sr_table(sp, q)
+        n_r = len(sp.r)
+        weights_np = _simpson_weights(n_r) * sp.rab
+        r_j = jnp.asarray(sp.r, dtype=jnp.float64)
+        w_j = jnp.asarray(weights_np, dtype=jnp.float64)
+
+        # ── vloc + core (l=0 single rows, batched together) ──
+        v_sr_rows = [None, None]
+        safe_r = np.where(sp.r > 0, sp.r, 1.0)
+        erf_over_r = np.where(sp.r > 0, scipy_erf(sp.r) / safe_r,
+                              2.0 / np.sqrt(np.pi))
+        v_sr_rows[0] = sp.vloc_r + sp.z_valence * e2 * erf_over_r
+        v_sr_rows[1] = sp.rho_core_r if sp.has_nlcc else np.zeros(n_r)
+        l0_block = spherical_hankel_table_batch_jax(
+            0, r_j, jnp.asarray(np.stack(v_sr_rows), dtype=jnp.float64),
+            q_j, w_j,
+        )
+        l0_np = np.asarray(l0_block)
+        vloc[i] = l0_np[0]
         if sp.has_nlcc:
-            nlcc[i] = core_charge_table(sp, q)
+            nlcc[i] = l0_np[1]
             has_nlcc[i] = True
 
-        # All projector tables for this species
-        ptab = np.zeros((sp.n_proj, n_q), dtype=np.float64)
-        for ip in range(sp.n_proj):
-            ptab[ip] = projector_table(sp, ip, q)
-        proj_tables.append(ptab)
+        # ── Projector forward + deriv tables, grouped by l (resp. l+1) ──
+        n_proj = sp.n_proj
+        ls = np.asarray(sp.proj_l, dtype=int)
+        F_table = np.zeros((n_proj, n_q), dtype=np.float64)
+        H_table = np.zeros((n_proj, n_q), dtype=np.float64)
+
+        # Forward F_l: integrand is (β/r), Bessel order l_p
+        beta_over_r = np.asarray(sp.beta_r, dtype=np.float64)        # (n_proj, n_r)
+        # Deriv raw H_{l+1}: integrand is β(r) = (β/r)·r, Bessel order l_p+1
+        beta_full = beta_over_r * sp.r[None, :]                       # (n_proj, n_r)
+
+        for l_val in np.unique(ls):
+            idx = np.where(ls == l_val)[0]
+            F_block = spherical_hankel_table_batch_jax(
+                int(l_val), r_j,
+                jnp.asarray(beta_over_r[idx], dtype=jnp.float64),
+                q_j, w_j,
+            )
+            F_table[idx] = np.asarray(F_block)
+
+        for l_val in np.unique(ls + 1):
+            idx = np.where(ls + 1 == l_val)[0]
+            H_block = spherical_hankel_table_batch_jax(
+                int(l_val), r_j,
+                jnp.asarray(beta_full[idx], dtype=jnp.float64),
+                q_j, w_j,
+            )
+            H_table[idx] = np.asarray(H_block)
+
+        proj_tables.append(F_table)
+        deriv_tables.append(H_table)
 
     return dict(q=q, dq=float(q[1] - q[0]) if n_q > 1 else 1.0,
                 vloc=vloc, nlcc=nlcc,
                 has_vloc=has_vloc, has_nlcc=has_nlcc,
-                proj_tables=proj_tables)
+                proj_tables=proj_tables,
+                deriv_tables=deriv_tables)

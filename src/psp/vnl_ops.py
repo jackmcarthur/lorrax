@@ -169,19 +169,27 @@ def build_vnl_setup(
             # F_l(q) from pre-built tables → G_l = F_l/q^l.
             # Gp_l = dG_l/dq is obtained ANALYTICALLY via the Bessel-recurrence
             # formula  dG_l/dq = -H_{l+1}(β; q)/q^l  (see radial_tables.py).
-            # This replaces an earlier central-FD derivative which was O(dq²)
+            # H_{l+1} is the *raw* (unscaled) deriv Hankel pre-computed by
+            # build_all_tables on GPU; we apply the q^l division here.  This
+            # replaces an earlier central-FD derivative which was O(dq²)
             # biased for curved G_l(q) and led to ~10% errors in velocity
             # matrix elements taken via jax.jvp through _table_interp.
             for ip in proj_ids:
                 F_vals = tables["proj_tables"][isp][ip]
+                H_vals = tables["deriv_tables"][isp][ip]
                 if l == 0:
                     G_vals = F_vals.copy()
+                    Gp_vals = -H_vals
                 else:
                     G_vals = np.empty(n_q, dtype=np.float64)
                     G_vals[1:] = F_vals[1:] / q_grid[1:] ** l
                     G_vals[0] = F_vals[1] / q_grid[1] ** l
+                    Gp_vals = np.zeros(n_q, dtype=np.float64)
+                    Gp_vals[1:] = -H_vals[1:] / q_grid[1:] ** l
+                    # q=0 limit of dG_l/dq is 0 (j_{l+1}(qr) ~ q^{l+1}, so
+                    # H_{l+1}/q^l → 0 as q → 0).
                 G_rows.append(G_vals)
-                Gp_rows.append(_projector_deriv_table(sp, ip, q_grid))
+                Gp_rows.append(Gp_vals)
 
             channels.append(ChannelMeta(
                 l=l, nbeta=nbeta, msize=msize, R=R,
