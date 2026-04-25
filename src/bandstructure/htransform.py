@@ -6,11 +6,16 @@ import numpy as np
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 # Allow GPU if available (previously forced CPU)
 
+from runtime import init_jax_distributed
+init_jax_distributed()
+
 import jax
 import jax.numpy as jnp
 from jax.scipy import linalg as jsp_linalg
 from jax.scipy.special import erf
 from jax import lax
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.experimental.shard_map import shard_map
 
 from file_io import WFNReader
 from common import symmetry_maps
@@ -18,6 +23,22 @@ from common import Meta
 from common.load_wfns import get_enk_bandrange
 
 FFT_CHUNK = 25  # bands per FFT batch to limit GPU memory
+
+
+def _build_k_mesh(nk: int) -> Mesh:
+    """Build a 2-axis device mesh ('replicated', 'k') using every visible device.
+
+    ``pk = gcd(nk, jax.device_count())`` is the k-axis partition; whatever is
+    left (``ndev // pk``) goes to the ``'replicated'`` axis so leftover GPUs
+    still participate in collectives (they just hold replicated copies). A
+    third axis for distributed μ/ν linear algebra later is a one-line change.
+    """
+    import math
+    ndev = jax.device_count()
+    pk = max(math.gcd(nk, ndev), 1)
+    replicated = ndev // pk
+    devices = np.asarray(jax.devices()).reshape(replicated, pk)
+    return Mesh(devices, ('replicated', 'k'))
 
 
 def _ifft_one_kpoint(wfn, sym, k_idx, band_indices, fft_grid):
@@ -64,12 +85,15 @@ def _ifft_one_kpoint(wfn, sym, k_idx, band_indices, fft_grid):
 
 
 def streaming_galerkin_solve(wfn, sym, band_indices, fft_grid, centroid_indices,
-                             rtol=1e-8, log_fn=None, spatial_chunk=400_000):
-    """Streaming Galerkin projection with CPU storage of psi_r.
+                             rtol=1e-8, log_fn=None, spatial_chunk=400_000,
+                             k_mesh: Mesh | None = None):
+    """Galerkin projection, k-sharded.
 
-    Single pass of FFTs, stores full psi_r on CPU, then streams spatial chunks
-    to GPU for G accumulation. CPU memory ~ nk*nb*nspinor*nr*16 bytes.
-    Returns (S, ctilde) with S = I(rank).
+    The FFT pass remains serial on process-0 (WFN.h5 is single-file read), but
+    psi_rmu and psi_r live on-device sharded across k. The G-accumulation hot
+    spot becomes one shard_map+psum; the single-device streaming-chunk loop
+    goes away. SVD on psi_mu_flat stays single-device — its shape
+    (nk·nb, nspinor·n_mu) is modest even at production scale.
     """
     import time
     if log_fn is None:
@@ -87,27 +111,47 @@ def streaming_galerkin_solve(wfn, sym, band_indices, fft_grid, centroid_indices,
     centroid_lin = ci[:, 0] * (ny * nz) + ci[:, 1] * nz + ci[:, 2]
     n_mu = len(centroid_lin)
 
-    cpu_gb = nk * nb * n_total * 16 / 1e9
-    log_fn(f"  Streaming Galerkin: nk={nk}, nb={nb}, nr={nr}, n_mu={n_mu}")
-    log_fn(f"  CPU storage for psi_r: {cpu_gb:.1f} GB")
+    if k_mesh is None:
+        k_mesh = _build_k_mesh(nk)
+    pk = k_mesh.shape['k']
+    nrep = k_mesh.shape['replicated']
+    if nk % pk:
+        raise ValueError(f"k_mesh size {pk} does not divide nk={nk}")
+    nk_loc = nk // pk
+    shard_k = NamedSharding(k_mesh, P('k'))           # (nk, ...) sharded on k, replicated on 'replicated'
+    shard_rep = NamedSharding(k_mesh, P())            # fully replicated
 
-    # ── Single FFT pass: extract centroids + store full psi_r on CPU ──
+    log_fn(f"  Streaming Galerkin: nk={nk}, nb={nb}, nr={nr}, n_mu={n_mu}, k_mesh=(rep={nrep},k={pk})")
+    log_fn(f"  Per-shard psi_r: {nk_loc*nb*n_total*16/1e9:.2f} GB × {pk} k-shard(s)")
+
+    # ── FFT pass: each process fills its k-shard, assembles global sharded array ──
+    # With 1 device per process, proc p owns k-shard (p mod pk). When pk=1
+    # (ndev doesn't divide nk cleanly) all procs end up redundantly
+    # computing the same shard — inefficient but correct; pick nk divisible
+    # by ndev to actually parallelize.
     t0 = time.time()
     log_fn(f"  FFT pass: all k-points to real space...")
-    psi_rmu = np.zeros((nk, nb, nspinor, n_mu), dtype=np.complex128)
-    psi_r_cpu = np.zeros((nk, nb, n_total), dtype=np.complex128)
-    for ik in range(nk):
+    my_k_shard = jax.process_index() % pk
+    my_k_lo, my_k_hi = my_k_shard * nk_loc, (my_k_shard + 1) * nk_loc
+    psi_rmu_loc = np.zeros((nk_loc, nb, nspinor, n_mu), dtype=np.complex128)
+    psi_r_loc = np.zeros((nk_loc, nb, n_total), dtype=np.complex128)
+    for i, ik in enumerate(range(my_k_lo, my_k_hi)):
         tk = time.time()
         psi_r_k = _ifft_one_kpoint(wfn, sym, ik, band_indices, fft_grid)
-        psi_rmu[ik] = psi_r_k[:, :, centroid_lin]
-        psi_r_cpu[ik] = psi_r_k.reshape(nb, n_total)
+        psi_rmu_loc[i] = psi_r_k[:, :, centroid_lin]
+        psi_r_loc[i] = psi_r_k.reshape(nb, n_total)
         del psi_r_k
-        if ik == 0 or ik == nk - 1:
-            log_fn(f"    k={ik}/{nk} ({time.time()-tk:.2f}s)")
+        if i == 0 or i == nk_loc - 1:
+            log_fn(f"    proc {jax.process_index()}: k={ik} ({time.time()-tk:.2f}s)")
+    psi_rmu = jax.make_array_from_process_local_data(shard_k, psi_rmu_loc, (nk, nb, nspinor, n_mu))
+    psi_r = jax.make_array_from_process_local_data(shard_k, psi_r_loc, (nk, nb, n_total))
+    del psi_rmu_loc, psi_r_loc
     log_fn(f"  FFT pass done in {time.time()-t0:.1f}s")
 
-    # ── SVD on centroid matrix ──
+    # ── SVD on centroid matrix (replicated — input gathered, output replicated) ──
+    # For k_mesh of size >1, jnp gathers implicitly; the matrix is small.
     psi_mu_flat = jnp.asarray(psi_rmu.reshape(nk * nb, nspinor * n_mu))
+    psi_mu_flat = jax.device_put(psi_mu_flat, shard_rep)
     del psi_rmu
     log_fn(f"  SVD of ({nk*nb}, {nspinor*n_mu}) centroid matrix...")
     t1 = time.time()
@@ -119,42 +163,40 @@ def streaming_galerkin_solve(wfn, sym, band_indices, fft_grid, centroid_indices,
     s = s[:rank]
     log_fn(f"  SVD rank: {rank}, top σ={float(s[0]):.4f}, bottom σ={float(s[rank-1]):.6f} ({time.time()-t1:.1f}s)")
 
-    coeffs = U * s[None, :]  # (nk*nb, rank)
+    coeffs = U * s[None, :]  # (nk*nb, rank), replicated
 
-    # ── G accumulation: stream spatial chunks from CPU ──
-    # Q = diag(1/s) @ U^H @ psi_r  =>  G = Q @ Q^H
-    # Batch all k-points into single matmul per chunk (no Python inner loop).
-    inv_s = np.asarray(1.0 / s)  # (rank,)
-    UH = np.asarray(U.conj().T)  # (rank, nk*nb)
-    del U, s
-    # Pre-upload UH and inv_s to GPU once
-    UH_jax = jnp.asarray(UH)  # (rank, nk*nb)
-    inv_s_jax = jnp.asarray(inv_s)[:, None]  # (rank, 1) for broadcasting
-    del UH
+    # ── G accumulation: one sharded kernel, no Python chunk loop ──
+    # UH columns are indexed by (ik, ib); reshape so the ik axis is explicit
+    # and shard it matching psi_r. The contraction over (ik_loc, ib) is local,
+    # then psum across k reduces to the replicated (rank, rank) Gram matrix.
+    inv_s = (1.0 / s)[:, None]
+    UH_k = U.conj().T.reshape(rank, nk, nb).transpose(1, 0, 2)  # (nk, rank, nb)
+    UH_k = jax.device_put(UH_k, shard_k)
 
-    n_chunks = (n_total + spatial_chunk - 1) // spatial_chunk
-    log_fn(f"  G accumulation: {n_chunks} spatial chunks, rank={rank}...")
+    @jax.jit
+    def _accum_G(UH_k, psi_r, inv_s):
+        # UH_k: (nk, rank, nb) sharded on k; psi_r: (nk, nb, n_total) sharded on k
+        # G = Q Q^H where Q = inv_s · Σ_k UH_k psi_k (nk summed). Q is NOT
+        # sharded after the psum, so the outer product Q Q^H picks up the
+        # cross-shard terms correctly. Materialising Q (rank, n_total) is
+        # O(rank · n_total) per device; for larger systems we'd shard n_total
+        # too, with a final psum of G over that axis.
+        def _local(UH_loc, psi_loc, inv_s):
+            Q_loc = inv_s * jnp.einsum('krb,kbt->rt', UH_loc, psi_loc)
+            Q = lax.psum(Q_loc, 'k')        # (rank, n_total) replicated across 'k'
+            return Q @ Q.conj().T           # (rank, rank) replicated
+        return shard_map(
+            _local, mesh=k_mesh,
+            in_specs=(P('k', None, None), P('k', None, None), P()),
+            out_specs=P(), check_rep=False,
+        )(UH_k, psi_r, inv_s)
+
+    log_fn(f"  G accumulation (k-sharded, pk={pk})...")
     t2 = time.time()
-
-    G = jnp.zeros((rank, rank), dtype=jnp.complex128)
-    for ic in range(n_chunks):
-        tc = time.time()
-        rs = ic * spatial_chunk
-        re_idx = min(rs + spatial_chunk, n_total)
-        # Gather all k-points into one (nk*nb, chunk) array on CPU, then transfer once
-        psi_chunk = psi_r_cpu[:, :, rs:re_idx].reshape(nk * nb, re_idx - rs)
-        psi_chunk_gpu = jnp.asarray(psi_chunk)  # single H2D transfer
-        del psi_chunk
-        # Single batched matmul: (rank, nk*nb) @ (nk*nb, chunk) = (rank, chunk)
-        Q_chunk = inv_s_jax * (UH_jax @ psi_chunk_gpu)
-        del psi_chunk_gpu
-        G = G + Q_chunk @ Q_chunk.conj().T
-        del Q_chunk
-        jax.block_until_ready(G)
-        log_fn(f"    chunk {ic+1}/{n_chunks} ({time.time()-tc:.1f}s)")
-
-    del UH_jax, inv_s_jax, psi_r_cpu
+    G = _accum_G(UH_k, psi_r, inv_s)
+    jax.block_until_ready(G)
     log_fn(f"  G accumulation done in {time.time()-t2:.1f}s")
+    del UH_k, psi_r, inv_s
 
     # ── Cholesky orthogonalization ──
     chol = jnp.linalg.cholesky(G)
@@ -162,7 +204,8 @@ def streaming_galerkin_solve(wfn, sym, band_indices, fft_grid, centroid_indices,
     del G, chol
 
     S = jnp.eye(rank, dtype=jnp.complex128)
-    ctilde = coeffs.reshape(nk, nb, rank)
+    # Reshape coeffs back to (nk, nb, rank); shard on k for downstream fH_k.
+    ctilde = jax.device_put(coeffs.reshape(nk, nb, rank), shard_k)
 
     # Orthogonality check at k=0
     CtC = ctilde[0] @ ctilde[0].conj().T
@@ -520,9 +563,16 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn,
     coeffs = ctilde.reshape(nk, states, rank)
     f_eps_ki = jnp.where(f_eps.T > 0, 0.0, f_eps.T)
     band_weights = jnp.sqrt(jnp.clip(-f_eps_ki, 0.0, None))
+    # Per-k outer product; ctilde is already k-sharded from streaming_galerkin_solve.
+    # band_weights is tiny and cheap to replicate.
     weighted = coeffs * band_weights[..., None]
     fH_k = -jnp.einsum('kim,kin->kmn', weighted, jnp.conj(weighted), optimize=True)
     fH_k = 0.5 * (fH_k + jnp.swapaxes(fH_k, -1, -2).conj())
+    # Gather fH_k onto a single device before the k-FFT. fH_k has shape
+    # (nk, rank, rank): for nk up to a few hundred and rank ~ 10·nb this is
+    # well under a GB. When nk grows into the thousands we'd switch to a
+    # distributed 3D FFT here (future work).
+    fH_k = jax.device_put(fH_k, NamedSharding(_build_k_mesh(nk), P()))
     log_fn(
         "fH_k real range: [{:.3e}, {:.3e}], |imag|max={:.3e}".format(
             float(jnp.min(jnp.real(fH_k))),
@@ -701,7 +751,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     log = _make_logger(args.verbose)
 
-    from gw.gw_jax import read_cohsex_input
+    from gw.gw_init import read_cohsex_input
     params = read_cohsex_input(args.input)
     
     # Override WFN file if provided via CLI
