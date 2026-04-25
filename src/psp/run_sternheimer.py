@@ -330,22 +330,36 @@ def compute_kp_tangent_at_kvec(
         coefs = jnp.einsum('msG,vsG->vm', jnp.conj(U_val_G), x, optimize=True)
         return x - jnp.einsum('vm,msG->vsG', coefs, U_val_G, optimize=True)
 
-    U_val_grad = []
-    for i in range(3):
-        dk = jnp.zeros(3, dtype=jnp.float64).at[i].set(1.0)
-        # (∂A/∂kvec_p_i) · U_val = (∂H/∂kvec_p_i) · U_val
-        # (α·P_val and -ε_v terms don't depend on kvec_p → their tangents = 0)
+    # 3 cartesian directions stacked as a leading batch dim then solved as
+    # one batched CG: build the 3 RHS vectors in parallel via vmap, then
+    # collapse (3, nv) → (3·nv) for a single sternheimer_solve call.  Faster
+    # than the prior 3-iteration Python loop because the inner CG kernel
+    # is reused once (one compile, one launch sequence).
+    def _rhs_one_dir(dk):
         _, A_dot_u = jax.jvp(
             lambda k: _apply_A_inline(_op_at(k), U_val_G),
             (kvec_p_base,), (dk,))
-        # Source: b_i = Q_{kvec_p} · (∂H/∂kvec_p_i) · u_v
-        b_i = Q_of(A_dot_u)
-        # Solve  A · (∂u/∂kvec_p_i) = −b_i   (sternheimer_solve negates internally)
-        du_dki = sternheimer_solve(op_base, b_i,
-                                    tol=tol, max_iter=max_iter,
-                                    use_schur=use_schur)
-        U_val_grad.append(du_dki)
-    return jnp.stack(U_val_grad, axis=0)      # (3, nv, ns, nG)
+        return Q_of(A_dot_u)
+    eye3 = jnp.eye(3, dtype=jnp.float64)
+    rhs_3 = jax.vmap(_rhs_one_dir)(eye3)               # (3, nv, ns, nG)
+    nv = U_val_G.shape[0]
+    rhs_flat = rhs_3.reshape(-1, *rhs_3.shape[2:])     # (3·nv, ns, nG)
+    # Replicate eps_v 3× so the batched solver's level-shift matches each
+    # direction-band pair.  This requires reshaping op_base.eps_v.
+    op_b3 = SternheimerOp(
+        T_diag=op_base.T_diag, V_scf=op_base.V_scf,
+        Gx=op_base.Gx, Gy=op_base.Gy, Gz=op_base.Gz,
+        vnl_Z=op_base.vnl_Z, vnl_E=op_base.vnl_E, mask=op_base.mask,
+        U_val=op_base.U_val,
+        eps_v=jnp.tile(op_base.eps_v, 3),
+        alpha_pv=op_base.alpha_pv,
+        precond_diag=jnp.tile(op_base.precond_diag, (3, 1, 1)),
+        fft_grid=op_base.fft_grid,
+        U_extra=op_base.U_extra, eps_extra=op_base.eps_extra,
+    )
+    du_flat = sternheimer_solve(op_b3, rhs_flat,
+                                  tol=tol, max_iter=max_iter, use_schur=use_schur)
+    return du_flat.reshape(3, nv, *du_flat.shape[1:])  # (3, nv, ns, nG)
 
 
 def compute_kp2_tangent_at_kvec(
@@ -548,31 +562,33 @@ def compute_s_tensor_contrib_at_q0(
         alpha_pv_sc=alpha_pv_sc, precond_diag=precond_diag,
         U_extra_G=U_extra_G, eps_extra=eps_extra,
     )
-    delta_u_dot = [
-        sternheimer_solve(op, U_val_grad_kp[i],
-                           tol=tol, max_iter=max_iter, use_schur=use_schur)
-        for i in range(3)
-    ]
+    # 3 first-tangent solves collapsed into one batched CG over (3·nv).
+    # Match eps_v / precond_diag by tiling 3×.
+    nv = U_val_G.shape[0]
+    op_3 = SternheimerOp(
+        T_diag=op.T_diag, V_scf=op.V_scf,
+        Gx=op.Gx, Gy=op.Gy, Gz=op.Gz,
+        vnl_Z=op.vnl_Z, vnl_E=op.vnl_E, mask=op.mask,
+        U_val=op.U_val,
+        eps_v=jnp.tile(op.eps_v, 3),
+        alpha_pv=op.alpha_pv,
+        precond_diag=jnp.tile(op.precond_diag, (3, 1, 1)),
+        fft_grid=op.fft_grid,
+        U_extra=op.U_extra, eps_extra=op.eps_extra,
+    )
+    rhs_flat = U_val_grad_kp.reshape(-1, *U_val_grad_kp.shape[2:])  # (3·nv, ns, nG)
+    du_flat = sternheimer_solve(op_3, rhs_flat,
+                                  tol=tol, max_iter=max_iter, use_schur=use_schur)
+    delta_u_dot = du_flat.reshape(3, nv, *du_flat.shape[1:])
 
-    # ── Compute  <grad_v_i | δu̇_v_j>  for all (i, j) pairs ──────────────
-    # From the Q(q)-constraint Taylor expansion at q = 0 (valid only when
-    # δu is taken as symmetric-in-(a,b) in the Taylor expansion):
+    # ── <grad_v_i | δu̇_v_j>  for all (i, j) pairs in one fused einsum ──
+    # From the Q(q)-constraint Taylor expansion at q = 0 (symmetric δü):
     #     P_val(0)·δü_ab  =  Q̇_a·δu̇_b  +  Q̇_b·δu̇_a
-    # and therefore
-    #     <u_v | δü_ab>_P  =  <grad_a | δu̇_b>  +  <grad_b | δu̇_a>.
-    S_k = jnp.zeros((3, 3), dtype=jnp.complex128)
-    for i in range(3):
-        for j in range(3):
-            ovlp_ij = jnp.einsum(
-                'vsG,vsG->', jnp.conj(U_val_grad_kp[i]), delta_u_dot[j],
-                optimize=True)
-            S_k = S_k.at[i, j].add(ovlp_ij)
-            ovlp_ji = jnp.einsum(
-                'vsG,vsG->', jnp.conj(U_val_grad_kp[j]), delta_u_dot[i],
-                optimize=True)
-            S_k = S_k.at[i, j].add(ovlp_ji)
-
-    return S_k
+    # so   <u_v | δü_ab>_P  =  <grad_a | δu̇_b>  +  <grad_b | δu̇_a>.
+    ovlp = jnp.einsum('ivsG,jvsG->ij',
+                      jnp.conj(U_val_grad_kp), delta_u_dot,
+                      optimize=True)            # (3, 3)
+    return ovlp + ovlp.T                         # symmetrize
 
 def build_sternheimer_op_at_kvec_traced(
     kvec_p_traced: jax.Array,                 # (3,) — JAX tracer (the k-q at which to evaluate H)
