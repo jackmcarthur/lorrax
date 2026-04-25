@@ -25,6 +25,7 @@ from common.load_wfns import (
     get_enk_bandrange, load_centroids_band_chunked, iter_psi_rchunk_bandwise,
 )
 from common.isdf_fitting import compute_L_q_from_CCT
+from common.fft_helpers import make_flat_k_ifftn
 
 
 def _build_mesh_xy() -> Mesh:
@@ -542,23 +543,35 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     nk = int(meta.nkx * meta.nky * meta.nkz)
     states = ctilde.shape[1]
     rank = ctilde.shape[2]
+    kgrid = (meta.nkx, meta.nky, meta.nkz)
 
     f_eps, a_f, n_f, shift = f_transform_eigs(enk_sigma, a_band_index=a_band_index)
     log_fn(f"Transform parameters: a={a_f:.6f}, n={n_f:.2f}, shift={shift:.6f}"
            + (f", a from band {a_band_index}" if a_band_index is not None else ""))
 
-    # fH_k inherits the (rank, rank) face sharding P(None, 'x', 'y') — same idiom
-    # as gw_jax V_qmunu / CCT. Each (x, y) shard FFTs its own (rank, rank) slice
-    # along the k-axes; no inter-device comm during the k-FFT.
-    fH_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    # ── Build fH_R in one jit ────────────────────────────────────────────
+    # fH_k lives on the (rank, rank) face sharded P(None, 'x', 'y') — gw_jax
+    # V_qmunu idiom. Bundle: einsum + symmetrize + flat-k IFFT into ONE jit
+    # so the body is one compile module instead of ~6 fragmented ones.
+    flat_xy = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    spec_3d = P(None, None, None, 'x', 'y')
+    # 'backward' = 1/N in ifft → matches legacy `jnp.fft.ifftn(norm=None)`.
+    local_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, spec_3d, norm='backward')
+
+    @partial(jax.jit, out_shardings=(flat_xy, flat_xy))
+    def _build_fH(ctilde_in, f_eps_T):
+        f_eps_ki = jnp.where(f_eps_T > 0, 0.0, f_eps_T)
+        band_weights = jnp.sqrt(jnp.clip(-f_eps_ki, 0.0, None))
+        weighted = ctilde_in * band_weights[..., None]
+        fH_k = -jnp.einsum('kim,kin->kmn', weighted, jnp.conj(weighted), optimize=True)
+        fH_k = 0.5 * (fH_k + jnp.swapaxes(fH_k, -1, -2).conj())
+        fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
+        # Flat-k IFFT preserves P(None, 'x', 'y') sharding; no inter-device comm.
+        fH_R = local_ifftn(fH_k)
+        return fH_k, fH_R
 
     coeffs = ctilde.reshape(nk, states, rank)
-    f_eps_ki = jnp.where(f_eps.T > 0, 0.0, f_eps.T)
-    band_weights = jnp.sqrt(jnp.clip(-f_eps_ki, 0.0, None))
-    weighted = coeffs * band_weights[..., None]
-    fH_k = -jnp.einsum('kim,kin->kmn', weighted, jnp.conj(weighted), optimize=True)
-    fH_k = 0.5 * (fH_k + jnp.swapaxes(fH_k, -1, -2).conj())
-    fH_k = jax.lax.with_sharding_constraint(fH_k, fH_shard)
+    fH_k, fH_R = _build_fH(coeffs, f_eps.T)
     log_fn(
         "fH_k real range: [{:.3e}, {:.3e}], |imag|max={:.3e}".format(
             float(jnp.min(jnp.real(fH_k))),
@@ -577,33 +590,37 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     log_fn(f"  f(eps) last 5:  {np.array(f_expected_0[-5:])}")
     log_fn(f"  fH eig last 5:  {np.array(eigs_fHk0[states-5:states])}")
 
+    # S Cholesky (rank × rank, replicated, small)
     S_sym = (S + S.conj().T) * 0.5
     S_sym += 1e-10 * jnp.mean(jnp.real(jnp.diag(S_sym))) * jnp.eye(rank, dtype=S_sym.dtype)
     S_chol = jnp.linalg.cholesky(S_sym)
 
-    def _solve_generalized(mat):
-        y = jsp_linalg.solve_triangular(S_chol, mat, lower=True)
-        z = jsp_linalg.solve_triangular(S_chol, y, lower=True, trans=2)
-        return jnp.linalg.eigvalsh((z + z.conj().T) * 0.5)
-
-    fH_grid = fH_k.reshape(meta.nkx, meta.nky, meta.nkz, rank, rank).transpose(3, 4, 0, 1, 2)
-    # Use the default inverse-FFT normalization (1/N). This pairs with the
-    # explicit forward projection below so that the round-trip reproduces fH_k.
-    fH_R = jnp.fft.ifftn(fH_grid, axes=(-3, -2, -1), norm=None)
-    fH_R = fH_R.transpose(2, 3, 4, 0, 1).reshape(nk, rank, rank)
+    R_grid = jnp.stack(
+        jnp.meshgrid(_shift_indices(meta.nkx), _shift_indices(meta.nky),
+                     _shift_indices(meta.nkz), indexing='ij'),
+        axis=-1).reshape(nk, 3)
     fH_R_flat = fH_R.reshape(nk, rank * rank)
 
-    R_grid = jnp.stack(jnp.meshgrid(_shift_indices(meta.nkx), _shift_indices(meta.nky), _shift_indices(meta.nkz), indexing='ij'), axis=-1).reshape(nk, 3)
+    # ── Bundle project_to_q + batched generalized eigvalsh into ONE jit ──
+    # This compiles ONCE for batch_size=32, reused across all batches.
+    @partial(jax.jit)
+    def _kpath_batch(batch_k, fH_R_flat, S_chol):
+        phase = jnp.exp(-2j * jnp.pi * (batch_k @ R_grid.T))           # (bs, nk)
+        mat = 0.5 * (phase @ fH_R_flat).reshape(batch_k.shape[0], rank, rank)
+        mat = mat + jnp.swapaxes(mat, 1, 2).conj()                     # (bs, rank, rank)
 
-    def project_to_q(q_frac: jax.Array) -> jax.Array:
-        phase = jnp.exp(-2j * jnp.pi * (q_frac @ R_grid.T))
-        mat = 0.5 * (phase @ fH_R_flat).reshape(q_frac.shape[0], rank, rank)
-        return mat + jnp.swapaxes(mat, 1, 2).conj()
+        def _solve_one(m):
+            y = jsp_linalg.solve_triangular(S_chol, m, lower=True)
+            z = jsp_linalg.solve_triangular(S_chol, y, lower=True, trans=2)
+            return jnp.linalg.eigvalsh((z + z.conj().T) * 0.5)
 
-    # Round-trip diagnostic at Γ only. Identify the Γ index in fH_k by
-    # matching the projection at q=0 against all k-slices.
+        return jax.vmap(_solve_one)(mat)
+
+    # Round-trip diagnostic at Γ — single-batch projection + compare.
     q0 = jnp.zeros((1, 3), dtype=jnp.float64)
-    fH_gamma_rt = project_to_q(q0)[0]
+    phase0 = jnp.exp(-2j * jnp.pi * (q0 @ R_grid.T))
+    fH_gamma_rt = 0.5 * (phase0 @ fH_R_flat).reshape(1, rank, rank)
+    fH_gamma_rt = (fH_gamma_rt + jnp.swapaxes(fH_gamma_rt, 1, 2).conj())[0]
     diffs = jnp.max(jnp.abs(fH_k - fH_gamma_rt), axis=(1, 2))
     rt_err = float(jnp.min(diffs))
     log_fn(f"FFT Γ round-trip max error: {rt_err:.3e}")
@@ -619,21 +636,18 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
 
     if kpath_frac is not None:
         wrapped_k = (kpath_frac + 0.5) % 1.0 - 0.5
-        # Pad nq up to a multiple of batch_size so every batch has the same
-        # shape — avoids the duplicate-compile pipeline for the partial last
-        # batch (saw c128[32,...] AND c128[N_remainder,...] in baseline).
+        # Pad nq to a multiple of batch_size — every batch has the same
+        # shape, _kpath_batch compiles ONCE.
         batch_size = 32
         nq = wrapped_k.shape[0]
-        n_pad = (-nq) % batch_size  # pad up to multiple of batch_size
+        n_pad = (-nq) % batch_size
         if n_pad:
             wrapped_k = jnp.concatenate(
                 [wrapped_k, jnp.zeros((n_pad, 3), dtype=wrapped_k.dtype)], axis=0)
         nq_padded = wrapped_k.shape[0]
         lambda_q_list = []
         for i in range(0, nq_padded, batch_size):
-            batch_k = wrapped_k[i:i+batch_size]
-            batch_H = project_to_q(batch_k)
-            batch_eigs = jax.vmap(_solve_generalized)(batch_H)
+            batch_eigs = _kpath_batch(wrapped_k[i:i+batch_size], fH_R_flat, S_chol)
             lambda_q_list.append(batch_eigs)
             jax.block_until_ready(batch_eigs)
         lambda_q = jnp.concatenate(lambda_q_list, axis=0)[:nq]
