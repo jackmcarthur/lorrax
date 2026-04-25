@@ -49,6 +49,7 @@ from runtime import set_default_env
 set_default_env()  # BEFORE `import jax`
 
 import argparse
+import functools
 import os
 import time
 from pathlib import Path
@@ -847,6 +848,192 @@ def build_Gprime_list(qvec_crys: np.ndarray, wfn: WFNReader, ng_out: int) -> np.
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  Batched-over-k pipeline: vmap-over-k chi_col + first derivatives
+# ═══════════════════════════════════════════════════════════════════════
+#
+# All 9 source k's at a fixed q go through ONE batched CG via jax.vmap.
+# Required: setup_H_k_from_kvec called with ngkmax so all per-k arrays
+# share a common G-sphere shape, and per-k ψ-on-G gathers are masked
+# (padded G-indices alias to FFT-box (0,0,0) under ngkmax-pad-with-zeros,
+# so without masking the padded coefficients pollute Q-projections).
+#
+# The per-q stack builder ``_build_stk_at_q`` is JIT'd at module scope
+# with a signature that's constant across q (only ``qvec`` and the
+# ``kminq_idx`` lookup vary), so one XLA module is reused for every q.
+
+def _per_k_chi(kvec_p, Gkm_int, mask, Gx, Gy, Gz,
+                V_scf, vnl_E_super,
+                U_kmq_G, eps_v, precond_diag,
+                U_k_box, b, phase_unwrap,
+                Gprime_int, prefactor_j, alpha_pv_sc, bdot_,
+                vnl_setup,
+                fft_grid_static,
+                tol, max_iter, use_schur,
+                U_extra_G=None, eps_extra=None):
+    """Per-k chi-column contribution, hoisted to module scope so its jit
+    cache is shared across q-values (no closure capture of qvec)."""
+    return chi_col_contrib_at_kvec_traced(
+        kvec_p_traced=kvec_p, Gkminq_int_np=Gkm_int, vnl_setup=vnl_setup,
+        V_scf=V_scf, mask=mask, Gx=Gx, Gy=Gy, Gz=Gz,
+        fft_grid=fft_grid_static, bdot=bdot_, vnl_E_super=vnl_E_super,
+        U_val_kminq_G=U_kmq_G, eps_v=eps_v,
+        alpha_pv_sc=alpha_pv_sc, precond_diag=precond_diag,
+        U_val_k_box=U_k_box, b=b,
+        Gprime_int=Gprime_int, phase_unwrap=phase_unwrap,
+        prefactor=prefactor_j,
+        tol=tol, max_iter=max_iter, use_schur=use_schur,
+        U_extra_G=U_extra_G, eps_extra=eps_extra,
+    )
+
+
+# Vmap over the 14 leading-k-axis args; the rest (V_scf, vnl_E_super,
+# Gprime_int, prefactor, alpha_pv, bdot, vnl_setup, fft_grid, tol,
+# max_iter, use_schur) are shared across k.  None for U_extra/eps_extra
+# tells vmap to broadcast — but in_axes=0 for those when Schur is on.
+def _make_chi_vmap_over_k(use_extra: bool):
+    """Build a vmap'd ``_per_k_chi`` with the right ``in_axes`` based on
+    whether Schur warm-start (``U_extra_G``, ``eps_extra``) is enabled."""
+    base_axes = (
+        0, 0, 0, 0, 0, 0,        # kvec_p, Gkm_int, mask, Gx, Gy, Gz
+        None, None,               # V_scf, vnl_E_super
+        0, 0, 0,                  # U_kmq_G, eps_v, precond_diag
+        0, 0, 0,                  # U_k_box, b, phase_unwrap
+        None, None, None, None,   # Gprime_int, prefactor, alpha_pv, bdot
+        None, None,               # vnl_setup, fft_grid_static
+        None, None, None,         # tol, max_iter, use_schur
+    )
+    if use_extra:
+        base_axes = base_axes + (0, 0)   # U_extra_G, eps_extra
+    else:
+        base_axes = base_axes + (None, None)
+    return jax.vmap(_per_k_chi, in_axes=base_axes)
+
+
+# ── Per-q JIT'd stack builder (closure-free) ──
+@functools.partial(jax.jit, static_argnames=('fft_grid_static',))
+def _build_stk_at_q(
+    qvec, kminq_idx, V_pert_base,
+    # Pre-stacked per-k arrays (indexed by full-BZ k):
+    T_diag_full, mask_full, Gx_full, Gy_full, Gz_full,
+    Gk_int_full, kvec_kmq_full, U_kmq_G_full,
+    K_bar_sq_full, en_occ_full, U_k_box_full,
+    *, fft_grid_static,
+):
+    """JIT-compiled per-q stack builder.  Inputs are shape-stable across
+    all q-values (only ``qvec`` and ``kminq_idx`` change), so this
+    compiles once and is reused for every q-call."""
+    # Gather per-kminq stacks via fancy indexing.
+    T_diag_kmq = T_diag_full[kminq_idx]
+    mask_kmq   = mask_full[kminq_idx]
+    Gx_kmq     = Gx_full[kminq_idx]
+    Gy_kmq     = Gy_full[kminq_idx]
+    Gz_kmq     = Gz_full[kminq_idx]
+    Gk_int_kmq = Gk_int_full[kminq_idx]                   # (nk, nG, 3)
+    U_kmq_G    = U_kmq_G_full[kminq_idx]
+    kvec_kmq   = kvec_kmq_full[kminq_idx]
+
+    # Per-source-k umklapp G_wrap, phases.
+    G_wrap_int = jnp.round(
+        (kvec_kmq_full - qvec[None, :]) - kvec_kmq).astype(jnp.int32)
+
+    nx, ny, nz = fft_grid_static
+    fx = jnp.arange(nx, dtype=jnp.float64) / nx
+    fy = jnp.arange(ny, dtype=jnp.float64) / ny
+    fz = jnp.arange(nz, dtype=jnp.float64) / nz
+
+    def _phase_for_k(G_wrap, sign):
+        arg = (2.0 * jnp.pi * sign) * (
+            G_wrap[0].astype(jnp.float64) * fx[:, None, None]
+            + G_wrap[1].astype(jnp.float64) * fy[None, :, None]
+            + G_wrap[2].astype(jnp.float64) * fz[None, None, :])
+        return jnp.exp(1j * arg).astype(jnp.complex128)
+
+    phase_wrap_stack   = jax.vmap(_phase_for_k, in_axes=(0, None))(G_wrap_int, +1.0)
+    phase_unwrap_stack = jax.vmap(_phase_for_k, in_axes=(0, None))(G_wrap_int, -1.0)
+    V_pert_real_stack  = V_pert_base[None, :, :, :] * phase_wrap_stack
+
+    def _vu_for_k(U_k_box_one, Gk_int_kmq_one, V_pert_real_one, mask_kmq_one):
+        Vu = build_sternheimer_source_preQ(
+            U_k_box_one, Gk_int_kmq_one, V_pert_real_one)
+        return Vu * mask_kmq_one[None, None, :].astype(Vu.dtype)
+    Vu_G_stack = jax.vmap(_vu_for_k)(
+        U_k_box_full, Gk_int_kmq, V_pert_real_stack, mask_kmq)
+
+    # b = Q_{kmq}(Vu) — per-k Q-projection.
+    def _q_apply(U_kmq_G_one, Vu_one):
+        coefs = jnp.einsum(
+            'msG,vsG->vm', jnp.conj(U_kmq_G_one), Vu_one, optimize=True)
+        return Vu_one - jnp.einsum(
+            'vm,msG->vsG', coefs, U_kmq_G_one, optimize=True)
+    b_stack = jax.vmap(_q_apply)(U_kmq_G, Vu_G_stack)
+
+    # TPA precond per source k.
+    precond_stack = jax.vmap(tpa_preconditioner_diag)(T_diag_kmq, K_bar_sq_full)
+
+    return dict(
+        kvec_p_stack=kvec_kmq, Gkmq_int_stack=Gk_int_kmq, mask_stack=mask_kmq,
+        Gx_stack=Gx_kmq, Gy_stack=Gy_kmq, Gz_stack=Gz_kmq,
+        U_kmq_G_stack=U_kmq_G, eps_vk_stack=en_occ_full,
+        precond_diag_stack=precond_stack,
+        U_k_box_stack=U_k_box_full, b_stack=b_stack,
+        phase_unwrap_stack=phase_unwrap_stack,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  S-tensor-at-q=0:  fused kp + assemble in one jitted vmap-over-k call
+# ═══════════════════════════════════════════════════════════════════════
+
+def _per_k_full_S(kvec_k, Gk_int, mask, Gx, Gy, Gz,
+                   U_val_G, eps_vk, precond_diag,
+                   V_scf, vnl_E_super,
+                   vnl_setup, fft_grid_static, alpha_pv_sc, bdot_,
+                   tol, max_iter,
+                   U_extra_G=None, eps_extra=None):
+    """End-to-end per-k S-tensor: 3 first-tangent k·p solves → 3 first-
+    tangent solves with grad as RHS → (3,3) overlap.  All inside one
+    jitted function so the kp + assemble compiles fuse into a single
+    XLA module."""
+    grad_kp = compute_kp_tangent_at_kvec(
+        kvec_p_base_np=kvec_k, Gkminq_int_np=Gk_int, vnl_setup=vnl_setup,
+        V_scf=V_scf, mask=mask, Gx=Gx, Gy=Gy, Gz=Gz,
+        fft_grid=fft_grid_static, bdot=bdot_, vnl_E_super=vnl_E_super,
+        U_val_G=U_val_G, eps_v_at_kvec_p=eps_vk,
+        alpha_pv_sc=alpha_pv_sc, precond_diag=precond_diag,
+        tol=tol, max_iter=max_iter,
+        U_extra_G=U_extra_G, eps_extra_v_at_kvec_p=eps_extra,
+    )
+    return compute_s_tensor_contrib_at_q0(
+        kvec_p_base_np=kvec_k, Gkminq_int_np=Gk_int, vnl_setup=vnl_setup,
+        V_scf=V_scf, mask=mask, Gx=Gx, Gy=Gy, Gz=Gz,
+        fft_grid=fft_grid_static, bdot=bdot_, vnl_E_super=vnl_E_super,
+        U_val_G=U_val_G, U_val_grad_kp=grad_kp,
+        eps_v=eps_vk, alpha_pv_sc=alpha_pv_sc, precond_diag=precond_diag,
+        tol=tol, max_iter=max_iter,
+        U_extra_G=U_extra_G, eps_extra=eps_extra,
+    )
+
+
+def _make_s_vmap_over_k(use_extra: bool):
+    """Build a vmap'd full S-tensor kernel; in_axes depends on Schur.
+
+    Returns the *unjitted* vmap — caller must wrap it in a jit closure
+    that captures ``vnl_setup`` / ``fft_grid_static`` (Python pytrees,
+    not abstractable by jax.jit positionally).  Mirrors the
+    ``_chi_at_q_jit`` pattern."""
+    base_axes = (
+        0, 0, 0, 0, 0, 0,        # kvec_k, Gk_int, mask, Gx, Gy, Gz
+        0, 0, 0,                  # U_val_G, eps_vk, precond_diag
+        None, None,               # V_scf, vnl_E_super
+        None, None,               # vnl_setup, fft_grid_static
+        None, None,               # alpha_pv_sc, bdot
+        None, None,               # tol, max_iter
+    )
+    base_axes = base_axes + ((0, 0) if use_extra else (None, None))
+    return jax.vmap(_per_k_full_S, in_axes=base_axes)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  Main driver
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -854,13 +1041,15 @@ def run_sternheimer(
     wfn_path: str,
     pseudo_dir: str,
     *,
-    n_cond_bands: int = 0,
+    n_cond_bands: int = 20,
     iq_list: list[int] | None = None,
     ng_out: int = 64,
     tol: float = 1e-6,
-    max_iter: int = 200,
+    max_iter: int = 80,
     truncation_2d: bool = False,
     output_path: str = "sternheimer.h5",
+    with_derivatives: bool = False,
+    with_s_tensor: bool = False,
     verbose: bool = True,
 ):
     """Forward Sternheimer G=0 column for a list of reduced-BZ q-points.
@@ -941,14 +1130,24 @@ def run_sternheimer(
     # We pre-compute and cache per-k (Gk_int, H_k) pairs so the inner loop
     # doesn't re-setup H_k twice per (ik_full, iq).  H_k's Gx/Gy/Gz are
     # jax.Arrays; we store them alongside the H_k object.
+    #
+    # ngkmax-padding is REQUIRED for the batched-over-k pipeline below to
+    # vmap over k with shape-stable arrays (different k's would otherwise
+    # have different nG).  Compute it once and pass to every
+    # setup_H_k_from_kvec call.
+    from psp.dft_operators import compute_ngkmax
+    kpts_all = np.asarray(sym.unfolded_kpts, dtype=np.float64)
+    ngkmax = int(compute_ngkmax(kpts_all, np.asarray(wfn.bdot),
+                                 float(wfn.ecutwfc), tuple(wfn.fft_grid)))
     H_cache = []   # list of (H_k, Gk_int_canonical) per full-BZ k
     for ik in range(sym.nk_tot):
         kv = np.asarray(sym.unfolded_kpts[ik], dtype=np.float64)
-        H_k = setup_H_k_from_kvec(kv, V_scf, vnl_setup, wfn, meta, V_loc_r=V_loc)
+        H_k = setup_H_k_from_kvec(kv, V_scf, vnl_setup, wfn, meta,
+                                   V_loc_r=V_loc, ngkmax=ngkmax)
         Gk_int = jnp.stack([H_k.Gx, H_k.Gy, H_k.Gz], axis=-1).astype(jnp.int32)
         H_cache.append((H_k, Gk_int))
     if verbose:
-        print(f"  H_k cache: {len(H_cache)} Hamiltonians, max nG={max(int(H.nG) for H, _ in H_cache)}")
+        print(f"  H_k cache: {len(H_cache)} Hamiltonians, ngkmax={ngkmax}")
 
     if verbose:
         dt = time.perf_counter() - t_setup
@@ -978,223 +1177,237 @@ def run_sternheimer(
     out_h5.attrs['n_cond_bands'] = n_cond_bands
     out_h5.attrs['n_occ'] = n_occ
     out_h5.attrs['truncation_2d'] = truncation_2d
+    out_h5.attrs['ngkmax'] = ngkmax
+    out_h5.attrs['use_schur'] = bool(n_cond_bands > 0)
+    out_h5.attrs['with_derivatives'] = with_derivatives
+    out_h5.attrs['with_s_tensor'] = with_s_tensor
     out_h5.attrs['note'] = "chi_col[iq, ig] = χ_{G'0}(q, ω=0); G' sorted by |q+G'|_cart²"
     out_h5.create_dataset('q_crys', data=np.asarray(wfn.kpoints[iq_list]))
     out_h5.create_dataset('iq_reduced', data=np.asarray(iq_list, dtype=np.int32))
 
     # ══════════════════════════════════════════════════════════════════
-    #  q-loop
+    #  Pre-stack per-k arrays (independent of q) for the batched pipeline
     # ══════════════════════════════════════════════════════════════════
     nk_full = int(sym.nk_tot)
     nx, ny, nz = (int(v) for v in wfn.fft_grid)
     N_grid = nx * ny * nz
     vol = float(wfn.cell_volume)
+    fft_grid_static = tuple(int(v) for v in wfn.fft_grid)
+    bdot = jnp.asarray(wfn.bdot, dtype=jnp.float64)
+    spin_factor = 2 if nspinor == 1 else 1
+    prefactor_chi_val = (2.0 * spin_factor * np.sqrt(N_grid)) / (vol * nk_full)
+    prefactor_st_val  = (2.0 * spin_factor) / (vol * nk_full)
+    prefactor_chi = jnp.asarray(prefactor_chi_val, dtype=jnp.float64)
+    alpha_pv_j = jnp.asarray(alpha_pv, dtype=jnp.float64)
+    use_schur_default = bool(n_cond_bands > 0)
 
+    # Stack per-k Hamiltonian fields and gathered ψ-G arrays.
+    T_diag_full   = jnp.stack([H_cache[ik][0].T_diag for ik in range(nk_full)], axis=0)
+    mask_full     = jnp.stack([H_cache[ik][0].mask   for ik in range(nk_full)], axis=0)
+    Gx_full       = jnp.stack([H_cache[ik][0].Gx     for ik in range(nk_full)], axis=0)
+    Gy_full       = jnp.stack([H_cache[ik][0].Gy     for ik in range(nk_full)], axis=0)
+    Gz_full       = jnp.stack([H_cache[ik][0].Gz     for ik in range(nk_full)], axis=0)
+    Gk_int_full   = jnp.stack([H_cache[ik][1]        for ik in range(nk_full)], axis=0)
+    kvec_kmq_full = jnp.asarray(np.asarray(sym.unfolded_kpts), dtype=jnp.float64)
+
+    # ψ on FFT box (donatable through the chi pipeline).
+    U_box_full    = psi_box_full[:, :n_occ]                              # (nk, nv, ns, nx, ny, nz)
+    en_occ_full   = en_full[:, :n_occ]                                    # (nk, nv)
+
+    # Mask-applied U on the per-k G-sphere (kills padded-G aliasing into
+    # box[0,0,0]; otherwise Q-projections pick up spurious overlaps).
+    U_kmq_G_full = jnp.stack([
+        _psi_box_to_G_sphere(psi_box_full[ik, :n_occ], H_cache[ik][1]) *
+        H_cache[ik][0].mask[None, None, :].astype(psi_box_full.dtype)
+        for ik in range(nk_full)
+    ], axis=0)
+    K_bar_sq_full = jnp.stack([
+        compute_per_band_kinetic(
+            _psi_box_to_G_sphere(psi_box_full[ik, :n_occ], H_cache[ik][1]) *
+            H_cache[ik][0].mask[None, None, :].astype(psi_box_full.dtype),
+            H_cache[ik][0].T_diag,
+        ) for ik in range(nk_full)
+    ], axis=0)
+
+    # Optional Schur extras: stacked low-energy conduction Ritz vectors at p=k-q.
+    if use_schur_default:
+        U_extra_G_full = jnp.stack([
+            _psi_box_to_G_sphere(
+                psi_box_full[ik, n_occ:n_occ + n_cond_bands], H_cache[ik][1]) *
+            H_cache[ik][0].mask[None, None, :].astype(psi_box_full.dtype)
+            for ik in range(nk_full)
+        ], axis=0)
+        eps_extra_full = en_full[:, n_occ:n_occ + n_cond_bands]
+    else:
+        U_extra_G_full = None
+        eps_extra_full = None
+
+    # Module-level vmap kernels rebuilt for the active Schur in_axes.
+    chi_vmap_over_k = _make_chi_vmap_over_k(use_extra=use_schur_default)
+    s_vmap_over_k   = _make_s_vmap_over_k  (use_extra=use_schur_default)
+
+    V_pert_base_j = make_density_perturbation(fft_grid_static)            # constant ≡ 1
+
+    @functools.partial(jax.jit, static_argnames=('with_derivs',))
+    def _chi_at_q_jit(qvec_j, kminq_idx_j, Gprime_int_j, *, with_derivs):
+        """Single XLA module: build the per-q stack, run the vmap'd
+        chi-column solve, sum over k.  When ``with_derivs`` is True,
+        also returns the (ng_out, 3) Jacobian via ``jax.linearize``
+        sharing the primal trace."""
+        stk = _build_stk_at_q(
+            qvec_j, kminq_idx_j, V_pert_base_j,
+            T_diag_full, mask_full, Gx_full, Gy_full, Gz_full,
+            Gk_int_full, kvec_kmq_full, U_kmq_G_full,
+            K_bar_sq_full, en_occ_full, U_box_full,
+            fft_grid_static=fft_grid_static,
+        )
+        if use_schur_default:
+            U_extra_idx = U_extra_G_full[kminq_idx_j]
+            eps_extra_idx = eps_extra_full[kminq_idx_j]
+        else:
+            U_extra_idx = None
+            eps_extra_idx = None
+
+        def _chi_for(q):
+            stk_q = _build_stk_at_q(
+                q, kminq_idx_j, V_pert_base_j,
+                T_diag_full, mask_full, Gx_full, Gy_full, Gz_full,
+                Gk_int_full, kvec_kmq_full, U_kmq_G_full,
+                K_bar_sq_full, en_occ_full, U_box_full,
+                fft_grid_static=fft_grid_static,
+            )
+            chi_per_k = chi_vmap_over_k(
+                stk_q['kvec_p_stack'], stk_q['Gkmq_int_stack'],
+                stk_q['mask_stack'],
+                stk_q['Gx_stack'], stk_q['Gy_stack'], stk_q['Gz_stack'],
+                V_scf, jnp.asarray(H_cache[0][0].vnl_E),
+                stk_q['U_kmq_G_stack'], stk_q['eps_vk_stack'],
+                stk_q['precond_diag_stack'],
+                stk_q['U_k_box_stack'], stk_q['b_stack'],
+                stk_q['phase_unwrap_stack'],
+                Gprime_int_j, prefactor_chi, alpha_pv_j, bdot,
+                vnl_setup, fft_grid_static,
+                tol, max_iter, use_schur_default,
+                U_extra_idx, eps_extra_idx,
+            )
+            return jnp.sum(chi_per_k, axis=0)
+
+        if with_derivs:
+            primal, jvp_fn = jax.linearize(_chi_for, qvec_j)
+            jac = jax.vmap(jvp_fn)(jnp.eye(3, dtype=jnp.float64))   # (3, ng_out)
+            return primal, jnp.moveaxis(jac, 0, -1)                 # (ng_out, 3)
+        return _chi_for(qvec_j)
+
+    # ══════════════════════════════════════════════════════════════════
+    #  q-loop:  Python over q, vmap+jit over k
+    # ══════════════════════════════════════════════════════════════════
     for q_idx, iq_red in enumerate(iq_list):
         qvec_pos = np.asarray(wfn.kpoints[iq_red], dtype=np.float64)
-        # Signed representative q_signed ∈ [-1/2, 1/2)³.  Using signed-q makes
-        # V_pert_base(r) = 1 self-consistent (the physical perturbation
-        # e^{i q_signed · r} has a purely plane-wave character with no extra
-        # reciprocal-lattice phase) AND minimises the number of k's for which
-        # (k - q) wraps back into the BZ.  Non-wrap k contributions then give
-        # pure-real χ₀₀ trivially; wrap k's pick up a small G_wrap phase.
-        qvec = qvec_pos - np.round(qvec_pos)                        # → [-0.5, 0.5)
-        # ``sym.kq_map[ik, iq_red]`` is indexed by the **positive** iq_red,
-        # so we keep iq_red as-is for the index lookup; only the q-value
-        # itself flips to its signed representative.
+        # Signed representative q_signed ∈ [-1/2, 1/2)³.
+        qvec = qvec_pos - np.round(qvec_pos)
         if verbose:
             print(f"\n══ q[{q_idx}] = {qvec}   (signed; reduced idx {iq_red}) ══")
 
-        Gprime_int = build_Gprime_list(qvec, wfn, ng_out)        # (ng_out, 3)
+        Gprime_int = build_Gprime_list(qvec, wfn, ng_out)
         Gprime_j = jnp.asarray(Gprime_int)
-
-        # Cell-periodic part of the density-response perturbation is identically
-        # 1; any wrap-gauge factor e^{+iG_wrap·r} is added per-k inside the
-        # k-loop (see below).  For phonon DFPT the caller would pass a real
-        # ∂V_scf/∂R_α here instead.
-        V_pert_base = make_density_perturbation(wfn.fft_grid)
-
-        # Accumulator for δn(r) over all k.
-        delta_n_r = jnp.zeros((nx, ny, nz), dtype=jnp.complex128)
-
-        # Per-q diagnostics.
-        total_res = 0.0
-        total_conv = True
-        total_leak = 0.0
+        kminq_idx_j = jnp.asarray(np.asarray(sym.kq_map[:, iq_red], dtype=np.int32))
+        qvec_j = jnp.asarray(qvec, dtype=jnp.float64)
 
         t_q = time.perf_counter()
-        for ik_full in range(nk_full):
-            ik_kminq = int(sym.kq_map[ik_full, iq_red])
-
-            # ── Pull cached H / G-order (canonical = H_k's Gx/Gy/Gz) ──
-            H_k,     Gk_int     = H_cache[ik_full]
-            H_kminq, Gkminq_int = H_cache[ik_kminq]
-            apply_H_kminq = make_apply_H(H_kminq)
-
-            # ── Umklapp G_wrap for the wrapped ↔ naive gauge conversion ──
-            # Convention:  p_naive = k - q,  p_wrap ∈ [0,1)³ from kq_map,
-            # so  G_wrap = p_naive − p_wrap ∈ ℤ³.  Then
-            #     u_{v, k_wrap}(r)  =  e^{+i G_wrap · r} · u_{v, k_naive}(r)
-            # (the Bloch phase identity for wrapping by a reciprocal vector).
-            # The source is pushed naive → wrapped by multiplying by
-            # phase_wrap = e^{+i G_wrap · r} (it's zero / unity when no wrap).
-            # δu_wrap from the CG is pulled back wrapped → naive by
-            # phase_unwrap = e^{-i G_wrap · r} inside accumulate_chi_density.
-            kvec_k_np          = np.asarray(sym.unfolded_kpts[ik_full],  dtype=np.float64)
-            kvec_kminq_wrap_np = np.asarray(sym.unfolded_kpts[ik_kminq], dtype=np.float64)
-            G_wrap_np = np.rint(
-                (kvec_k_np - qvec) - kvec_kminq_wrap_np).astype(np.int32)   # (3,)
-            phase_wrap   = make_umklapp_phase(G_wrap_np, wfn.fft_grid, sign=+1)
-            phase_unwrap = make_umklapp_phase(G_wrap_np, wfn.fft_grid, sign=-1)
-            # Compose the perturbation used by the source builder:
-            #   V_pert_real(r) = V_pert_base(r) · phase_wrap(r)
-            # For density response: V_pert_base = 1, so V_pert_real = phase_wrap.
-            V_pert_real = V_pert_base * phase_wrap
-
-            # ── ψ coefficients: box view (for FFT path) + G-sphere gather (for ops) ──
-            U_val_k_box     = psi_box_full[ik_full,  :n_occ]           # (nv, ns, nx, ny, nz) G-space scatter
-            U_val_k_G       = _psi_box_to_G_sphere(U_val_k_box, Gk_int)  # (nv, ns, ngk_k)
-            U_val_kminq_box = psi_box_full[ik_kminq, :n_occ]
-            U_val_kminq_G   = _psi_box_to_G_sphere(U_val_kminq_box, Gkminq_int)
-
-            # Eigenvalues at the SOURCE k (not k-q).
-            eps_vk = en_full[ik_full, :n_occ]                      # (nv,)
-
-            # ── Projector (for source construction) ──
-            Q_kminq = make_Q_kminq(U_val_kminq_G)
-
-            # ── Source b_{v,k} = Q_{k-q} · V_pert(r) · u_{v,k} ──
-            b = build_sternheimer_source(
-                U_val_k_box, Gkminq_int, V_pert_real, Q_kminq)
-
-            # Projector orthogonality sanity (‖U_p^† b‖ should be ~0).
-            U_dag_b = jnp.einsum('nsG,vsG->vn', jnp.conj(U_val_kminq_G), b)
-            leak_b = float(jnp.max(jnp.abs(U_dag_b)))
-            total_leak = max(total_leak, leak_b)
-
-            # ── Level-shifted Sternheimer primitive via ``sternheimer_solve`` ──
-            # The operator  A_v = H_{k-q} − ε_{v,k} + α_pv · P_val^{k-q}  is
-            # bundled into a single ``SternheimerOp`` pytree; the primitive
-            # itself is ``@jax.jit``'d once and reused across all (ik, iq)
-            # with matching shapes.  ``jax.custom_jvp`` on the primitive
-            # means that wrapping this whole block in ``jax.jvp`` would give
-            # the q-derivative via an implicit-differentiation solve.
-            K_bar_sq = compute_per_band_kinetic(U_val_k_G, H_k.T_diag)
-            precond_diag = tpa_preconditioner_diag(H_kminq.T_diag, K_bar_sq)
-
-            # ── Schur-block extras: M low-energy conduction Ritz vectors at p=k-q ──
-            # When ``n_cond_bands > 0`` is passed, we load that many extra
-            # bands from WFN.h5 past n_occ and use them as the T-block in the
-            # Schur split.  Because these are H_{k-q} eigenstates, A_TT is
-            # diagonal with entries (ε_{c,p} − ε_v), and the T-block initial
-            # guess reduces to the standard k·p formula — see
-            # ``solvers.sternheimer_solve._schur_initial_guess``.  Since
-            # n_cond_bands is a runtime knob (may be 0), we thread U_extra as
-            # None vs populated.
-            if n_cond_bands > 0:
-                U_extra_kminq_box = psi_box_full[ik_kminq, n_occ:n_occ + n_cond_bands]
-                U_extra_kminq_G = _psi_box_to_G_sphere(U_extra_kminq_box, Gkminq_int)
-                eps_extra_kminq = en_full[ik_kminq, n_occ:n_occ + n_cond_bands]
-            else:
-                U_extra_kminq_G = None
-                eps_extra_kminq = None
-
-            op = SternheimerOp(
-                T_diag=H_kminq.T_diag, V_scf=H_kminq.V_scf,
-                Gx=H_kminq.Gx, Gy=H_kminq.Gy, Gz=H_kminq.Gz,
-                vnl_Z=H_kminq.vnl_Z, vnl_E=H_kminq.vnl_E, mask=H_kminq.mask,
-                U_val=U_val_kminq_G, eps_v=eps_vk,
-                alpha_pv=jnp.asarray(alpha_pv, dtype=jnp.float64),
-                precond_diag=precond_diag,
-                fft_grid=H_kminq.fft_grid,
-                U_extra=U_extra_kminq_G, eps_extra=eps_extra_kminq,
-            )
-
-            # ── Primal fast path for ‖b‖ ≈ 0 (q=0, G=0 case) ──
-            b_norm_max = float(jnp.max(_batched_real_norm_host(b)))
-            if b_norm_max < 1e-12:
-                delta_u = jnp.zeros_like(b)
-                res_max = 0.0
-                converged = True
-            else:
-                use_schur = (n_cond_bands > 0)
-                delta_u = sternheimer_solve(op, b, tol=tol, max_iter=max_iter,
-                                             use_schur=use_schur)
-                # Residual check outside the primitive (don't bake it into
-                # the JIT trace — the primitive is converged-by-design).
-                from solvers.sternheimer_solve import _apply_A_inline
-                residual = -b - _apply_A_inline(op, delta_u)
-                res_max = float(jnp.max(jnp.sqrt(jnp.sum(jnp.abs(residual)**2, axis=(1,2)))))
-                converged = res_max < tol * b_norm_max
-
-            total_res = max(total_res, res_max)
-            total_conv = total_conv and converged
-
-            # δu orthogonality sanity: ‖U_p^† δu‖ should be ~0 (from CG + shift).
-            U_dag_du = jnp.einsum('nsG,vsG->vn',
-                                   jnp.conj(U_val_kminq_G), delta_u)
-            leak_du = float(jnp.max(jnp.abs(U_dag_du)))
-            total_leak = max(total_leak, leak_du)
-
-            # ── Density contribution — convert δu_wrap → δu_naive in real space ──
-            delta_n_r = delta_n_r + accumulate_chi_density(
-                U_val_k_box, delta_u, Gkminq_int, wfn.fft_grid,
-                phase_unwrap=phase_unwrap)
-
-        # ── Project δn → χ column at G' ──  Adler–Wiser normalisation.
-        #
-        # Derivation (see CHANGELOG 2026-04-24):
-        #   1. ortho-IFFT convention:  u_r[j] = (1/√N) Σ_G c_u(G) e^{iG·r_j} = u(r_j)/√N.
-        #   2. accumulate_chi_density returns  δn_r[j] = Σ_{v,k} (1/N) u(r_j)·conj(δu(r_j)).
-        #   3. ortho-FFT at G'=0:  (1/√N)·Σ_j δn_r[j]  =  my raw chi_col[0].
-        #   4. Continuous cell Fourier coef:  (δn)_{G'=0} = (1/V)∫_cell δn(r) dr
-        #      = (1/N)·standard_FFT(δn)[0] = (1/√N)·ortho_FFT(δn)[0].
-        #
-        # Substituting the exact Sternheimer solution δu = Σ_c (-M_cv/ΔE) u_c,k-q,
-        #   (my raw chi_col[G'=0]) = -(1/(√N·N_k)) · Σ_{v,c,k} |M_vc|² / ΔE_cv
-        # whereas the Rydberg-atomic-units Adler–Wiser convention (e.g. BGW
-        # epsmat.h5, and Hybertsen–Louie PRB 34 5390) is
-        #   χ_physical = -(2·spin_factor/(V_cell·N_k)) · Σ |M|² / ΔE
-        # with the "2" from the +ω/−ω pole combination at ω=0.  Therefore
-        #
-        #   χ_physical = (my raw chi_col) · [2·spin_factor·√N_grid / V_cell]
-        #
-        # Cross-checked against on-file sum-over-states at several q-points
-        # on MoS2 3×3 FR: ratio agrees to CG-tolerance + band-cutoff residual.
-        spin_factor = 2 if nspinor == 1 else 1
-        prefactor = (2.0 * spin_factor * np.sqrt(N_grid)) / (vol * nk_full)
-        delta_n_r = delta_n_r * prefactor
-
-        chi_col = project_density_to_Gsphere(delta_n_r, Gprime_j)
-        chi_col_np = np.asarray(chi_col)
-
+        if with_derivatives:
+            chi_col, dchi_col = _chi_at_q_jit(
+                qvec_j, kminq_idx_j, Gprime_j, with_derivs=True)
+            chi_col.block_until_ready()
+            dchi_col.block_until_ready()
+            chi_col_np = np.asarray(chi_col)
+            dchi_col_np = np.asarray(dchi_col)
+        else:
+            chi_col = _chi_at_q_jit(
+                qvec_j, kminq_idx_j, Gprime_j, with_derivs=False)
+            chi_col.block_until_ready()
+            chi_col_np = np.asarray(chi_col)
+            dchi_col_np = None
         # ── Sanity print ──
         if verbose:
             dt = time.perf_counter() - t_q
             print(f"  ── q[{q_idx}] summary ──")
-            print(f"    max CG residual          = {total_res:.3e}")
-            print(f"    all v converged?         = {total_conv}")
-            print(f"    max projector-leak       = {total_leak:.3e}")
-            print(f"    χ_{{00}}(q, 0)           = {chi_col_np[0]:.6e}")
-            # q=0 sanity check: should be ~0 for all G' (source b is 0 by Q_k·u_v=0).
+            print(f"    χ_{{00}}(q, 0)           = {chi_col_np[0]:+.6e}")
             if np.allclose(qvec, 0.0):
                 max_abs = float(np.max(np.abs(chi_col_np)))
                 print(f"    q=0 check: max|χ(G')|   = {max_abs:.3e}  (expect ~0)")
-            print(f"    time                     = {dt:.1f}s")
+            print(f"    time                     = {dt:.2f}s")
 
         # ── Write to HDF5 ──
         grp = out_h5.create_group(f"q_{q_idx}")
         grp.create_dataset('chi_col', data=chi_col_np)
         grp.create_dataset('G_int', data=Gprime_int)
+        if dchi_col_np is not None:
+            # ∂χ/∂q_i shape (ng_out, 3) — directional derivative along each
+            # of the 3 cartesian crystal-coord directions, evaluated at the
+            # signed-q representative.  q_i index runs over (qx, qy, qz).
+            grp.create_dataset('dchi_col_dq', data=dchi_col_np)
         grp.attrs['q_crys'] = qvec
         grp.attrs['iq_reduced'] = int(iq_red)
-        grp.attrs['max_residual'] = total_res
-        grp.attrs['max_projector_leak'] = total_leak
-        grp.attrs['all_converged'] = total_conv
+
+    # ══════════════════════════════════════════════════════════════════
+    #  Optional S-tensor at q=0  (∂²χ_{G'=0}/∂q_i∂q_j  via the explicit
+    #  P_val-rotation formula — see compute_s_tensor_contrib_at_q0).
+    # ══════════════════════════════════════════════════════════════════
+    if with_s_tensor:
+        if verbose:
+            print(f"\n══ S-tensor at q=0 ══")
+        kvec_k_stack    = jnp.asarray(np.asarray(sym.unfolded_kpts), dtype=jnp.float64)
+        precond_stack_S = jnp.stack([
+            tpa_preconditioner_diag(H_cache[ik][0].T_diag, K_bar_sq_full[ik])
+            for ik in range(nk_full)
+        ], axis=0)
+        eps_v_stack_S = en_occ_full
+        vnl_E_super_jnp = jnp.asarray(H_cache[0][0].vnl_E)
+
+        # Wrap the vmap'd kernel in a jit closure that captures
+        # vnl_setup + fft_grid_static (Python pytrees not abstractable
+        # by jax.jit positionally).  Mirrors ``_chi_at_q_jit`` pattern.
+        @jax.jit
+        def _s_at_q0_jit(kvec_k_stk, Gk_int_stk, mask_stk,
+                         Gx_stk, Gy_stk, Gz_stk,
+                         U_val_stk, eps_v_stk, precond_stk,
+                         V_scf_, vnl_E_super_, alpha_pv_, bdot_,
+                         U_extra_stk, eps_extra_stk):
+            return s_vmap_over_k(
+                kvec_k_stk, Gk_int_stk, mask_stk,
+                Gx_stk, Gy_stk, Gz_stk,
+                U_val_stk, eps_v_stk, precond_stk,
+                V_scf_, vnl_E_super_,
+                vnl_setup, fft_grid_static, alpha_pv_, bdot_,
+                tol, max_iter,
+                U_extra_stk, eps_extra_stk,
+            )
+
+        t_S = time.perf_counter()
+        S_per_k = _s_at_q0_jit(
+            kvec_k_stack, Gk_int_full, mask_full,
+            Gx_full, Gy_full, Gz_full,
+            U_kmq_G_full, eps_v_stack_S, precond_stack_S,
+            V_scf, vnl_E_super_jnp, alpha_pv_j, bdot,
+            U_extra_G_full, eps_extra_full,
+        )
+        S_per_k.block_until_ready()
+        S_total = prefactor_st_val * np.asarray(jnp.sum(S_per_k, axis=0))
+        if verbose:
+            dt = time.perf_counter() - t_S
+            print(f"  S-tensor (crystal coords, real, t={dt:.2f}s):")
+            for row in S_total.real:
+                print(f"    {row[0]:+.4e}  {row[1]:+.4e}  {row[2]:+.4e}")
+            print(f"  imag max: {float(np.max(np.abs(S_total.imag))):.2e}")
+        out_h5.create_dataset('s_tensor_q0', data=S_total)
+        out_h5.attrs['s_tensor_note'] = (
+            "S_ij = ∂²χ_{G'=0}/∂q_i∂q_j |_{q=0}  in CRYSTAL coords; "
+            "convention = Hessian (NOT q²-coefficient).  See "
+            "compute_s_tensor_contrib_at_q0 docstring.")
 
     out_h5.close()
     if verbose:
-        print(f"\nWrote χ columns → {output_path}")
+        print(f"\nWrote → {output_path}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1210,16 +1423,25 @@ def main(argv=None):
     parser.add_argument("--wfn", default=None, help="WFN.h5 path")
     parser.add_argument("--pseudo_dir", default=None,
                         help="Directory with matching UPF pseudopotentials")
-    parser.add_argument("--n-cond-bands", type=int, default=0,
-                        help="Extra conduction bands in the WFN buffer (Schur prep)")
+    parser.add_argument("--n-cond-bands", type=int, default=20,
+                        help="Extra conduction bands loaded for Schur warm-start "
+                             "(default: 20).  Set to 0 to disable Schur.")
     parser.add_argument("--iq-list", type=int, nargs='+', default=[0, 1],
                         help="Reduced-BZ q indices to run (default: 0 1)")
     parser.add_argument("--ng-out", type=int, default=64,
                         help="# of G' in output column (sorted by |q+G'|_cart²)")
     parser.add_argument("--tol", type=float, default=1e-6)
-    parser.add_argument("--max-iter", type=int, default=200)
+    parser.add_argument("--max-iter", type=int, default=80)
     parser.add_argument("--truncation-2d", action="store_true",
                         help="Apply 2D Coulomb truncation in V_H (slab systems)")
+    parser.add_argument("--with-derivatives", action="store_true",
+                        help="Also compute ∂χ_{G'0}/∂q_i at each q via "
+                             "jax.linearize (3 cartesian-crystal directions, "
+                             "shared primal trace).")
+    parser.add_argument("--s-tensor", action="store_true",
+                        help="Also compute the S-tensor at q=0  "
+                             "S_ij = ∂²χ_{G'=0}/∂q_i∂q_j  via the explicit "
+                             "P_val-rotation formula.")
     parser.add_argument("-o", "--output", default="sternheimer.h5")
     args = parser.parse_args(argv)
 
@@ -1263,6 +1485,8 @@ def main(argv=None):
         max_iter=args.max_iter,
         truncation_2d=truncation_2d,
         output_path=args.output,
+        with_derivatives=bool(args.with_derivatives),
+        with_s_tensor=bool(args.s_tensor),
     )
 
 
