@@ -176,54 +176,89 @@ def build_ionic_and_core(
             az = alpha_z(sp, vol)
             tables["vloc"][i, 0] = az * vol / (4.0 * np.pi)
 
-    # ── Ship to GPU ──
-    G_crys_j = jnp.asarray(G_crys_flat, dtype=jnp.float64)
-    G_norm_j = jnp.asarray(G_norm_flat, dtype=jnp.float64)
-    S_species = species_structure_factors(
+    # ── Ship to GPU and run the full G-space build inside ONE jit ──
+    # All the structure-factor, NLCC accumulation, V_loc short+long range
+    # assembly, optional 2D-truncation, and final FFTs are pure jax-numpy
+    # operations on G-grid arrays.  Wrapping them in a single
+    # ``@jax.jit``'d helper collapses what was previously ~15 individual
+    # eager-compile dispatches (jnp.where, jnp.sum, jnp.exp,
+    # G2_safe.at[0].set(0), jnp.fft.ifftn, etc.) into a single XLA module —
+    # ~3 s of wall-clock saved on first call, on the cache thereafter.
+    sqrtN = float(np.sqrt(float(N)))
+    nlcc_pf_np = np.where(tables["has_nlcc"], 4.0 * np.pi / vol, 0.0)
+    vloc_pf_np = np.where(tables["has_vloc"], sqrtN * 4.0 * np.pi / vol, 0.0)
+    z_vals_np = np.asarray([sp.z_valence for sp in species_list], dtype=np.float64)
+    B_cart = blat * bvec
+
+    V_loc_r, rho_core_r, rho_core_G_scaled = _ionic_gspace_jit(
+        jnp.asarray(G_crys_flat, dtype=jnp.float64),
+        jnp.asarray(G_norm_flat, dtype=jnp.float64),
         jnp.asarray(species_tau, dtype=jnp.float64),
         jnp.asarray(species_natoms, dtype=jnp.int32),
-        G_crys_j, max_atoms)
-
-    # ── NLCC accumulation ──
-    nlcc_pf = jnp.asarray(
-        np.where(tables["has_nlcc"], 4.0 * np.pi / vol, 0.0), dtype=jnp.float64)
-    rho_core_G_flat = accumulate_species_on_G(
-        jnp.asarray(tables["nlcc"]), nlcc_pf, S_species, G_norm_j, q0, dq)
-    rho_core_G = rho_core_G_flat.reshape(nx, ny, nz)
-    rho_core_r = jnp.real(jnp.fft.ifftn(rho_core_G)) * N
+        jnp.asarray(tables["nlcc"], dtype=jnp.float64),
+        jnp.asarray(tables["vloc"], dtype=jnp.float64),
+        jnp.asarray(nlcc_pf_np, dtype=jnp.float64),
+        jnp.asarray(vloc_pf_np, dtype=jnp.float64),
+        jnp.asarray(z_vals_np, dtype=jnp.float64),
+        jnp.asarray(B_cart, dtype=jnp.float64),
+        jnp.asarray(float(q0), dtype=jnp.float64),
+        jnp.asarray(float(dq), dtype=jnp.float64),
+        jnp.asarray(float(vol), dtype=jnp.float64),
+        jnp.asarray(sqrtN, dtype=jnp.float64),
+        jnp.asarray(float(N), dtype=jnp.float64),
+        max_atoms=int(max_atoms),
+        nx=nx, ny=ny, nz=nz,
+        truncation_2d=bool(truncation_2d),
+    )
 
     n_nlcc_atoms = int(np.sum(species_natoms[tables["has_nlcc"]]))
     print(f"  Core density integral: {float(jnp.sum(rho_core_r)) * vol / N:.4f} e "
           f"(from NLCC, {n_nlcc_atoms} atoms)")
 
+    return V_loc_r, rho_core_r, rho_core_G_scaled
+
+
+@functools.partial(jax.jit,
+    static_argnames=('max_atoms', 'nx', 'ny', 'nz', 'truncation_2d'))
+def _ionic_gspace_jit(
+    G_crys, G_norm, species_tau, species_natoms,
+    tables_nlcc, tables_vloc, nlcc_pf, vloc_pf, z_vals,
+    B_cart, q0, dq, vol, sqrtN, N,
+    *, max_atoms, nx, ny, nz, truncation_2d,
+):
+    """One-shot G-space ionic + NLCC build: structure factors → species
+    accumulations (NLCC and V_loc short-range) → V_loc long-range Coulomb
+    tail (with optional 2-D truncation) → real-space output via two ortho
+    FFTs.  Single XLA compile in place of ~15 eager dispatches."""
+    S_species = species_structure_factors(
+        species_tau, species_natoms, G_crys, max_atoms)
+
+    # NLCC core density
+    rho_core_G_flat = accumulate_species_on_G(
+        tables_nlcc, nlcc_pf, S_species, G_norm, q0, dq)
+    rho_core_G = rho_core_G_flat.reshape(nx, ny, nz)
+    rho_core_r = jnp.real(jnp.fft.ifftn(rho_core_G)) * N
     rho_core_G_scaled = rho_core_G * N
 
-    # ── V_loc short-range accumulation ──
-    sqrtN = np.sqrt(float(N))
-    vloc_pf = jnp.asarray(
-        np.where(tables["has_vloc"], sqrtN * 4.0 * np.pi / vol, 0.0), dtype=jnp.float64)
+    # V_loc short-range
     Vloc_sr_G_flat = accumulate_species_on_G(
-        jnp.asarray(tables["vloc"]), vloc_pf, S_species, G_norm_j, q0, dq)
+        tables_vloc, vloc_pf, S_species, G_norm, q0, dq)
 
-    # ── V_loc long-range Coulomb tail ──
-    G2_flat = G_norm_j ** 2
+    # V_loc long-range Coulomb tail
+    G2_flat = G_norm ** 2
     G2_safe = jnp.where(G2_flat == 0.0, 1.0, G2_flat)
-    z_vals = jnp.asarray([sp.z_valence for sp in species_list], dtype=jnp.float64)
     rho_ion_G = -jnp.sum(z_vals[:, None] * S_species, axis=0)
-
-    Vloc_lr_G_flat = (sqrtN * 4.0 * np.pi * 2.0 / vol) * (
+    Vloc_lr_G_flat = (sqrtN * 4.0 * jnp.pi * 2.0 / vol) * (
         rho_ion_G / G2_safe * jnp.exp(-0.25 * G2_flat))
 
     if truncation_2d:
-        B = blat * bvec
-        G_cart_flat = G_crys_flat @ B
+        G_cart_flat = G_crys @ B_cart
         Gxy = jnp.sqrt(G_cart_flat[:, 0] ** 2 + G_cart_flat[:, 1] ** 2)
-        lz = np.pi / B[2, 2]
+        lz = jnp.pi / B_cart[2, 2]
         cutoff = 1.0 - jnp.exp(-Gxy * lz) * jnp.cos(G_cart_flat[:, 2] * lz)
         Vloc_lr_G_flat = Vloc_lr_G_flat * jnp.where(G2_flat == 0.0, 0.0, cutoff)
 
     Vloc_lr_G_flat = Vloc_lr_G_flat.at[0].set(0.0)
-
     V_tot_G = (Vloc_sr_G_flat + Vloc_lr_G_flat).reshape(nx, ny, nz)
     V_loc_r = jnp.real(jnp.fft.ifftn(V_tot_G, norm="ortho"))
 
