@@ -1216,27 +1216,30 @@ def run_sternheimer(
 
     # Mask-applied U on the per-k G-sphere (kills padded-G aliasing into
     # box[0,0,0]; otherwise Q-projections pick up spurious overlaps).
-    U_kmq_G_full = jnp.stack([
-        _psi_box_to_G_sphere(psi_box_full[ik, :n_occ], H_cache[ik][1]) *
-        H_cache[ik][0].mask[None, None, :].astype(psi_box_full.dtype)
-        for ik in range(nk_full)
-    ], axis=0)
-    K_bar_sq_full = jnp.stack([
-        compute_per_band_kinetic(
-            _psi_box_to_G_sphere(psi_box_full[ik, :n_occ], H_cache[ik][1]) *
-            H_cache[ik][0].mask[None, None, :].astype(psi_box_full.dtype),
-            H_cache[ik][0].T_diag,
-        ) for ik in range(nk_full)
-    ], axis=0)
+    # Vmapped over k so the gather + multiply + per-band kinetic compile
+    # exactly once across the full BZ, replacing what used to be ~16
+    # eager-pjit cache misses in this block.
+    @jax.jit
+    def _per_k_psi_to_masked_G(psi_box_k, Gk_int_k, mask_k):
+        return _psi_box_to_G_sphere(psi_box_k, Gk_int_k) * \
+            mask_k[None, None, :].astype(psi_box_k.dtype)
+
+    @jax.jit
+    def _per_k_kinetic(U_G_k, T_diag_k):
+        return compute_per_band_kinetic(U_G_k, T_diag_k)
+
+    _U_to_G_vmap = jax.vmap(_per_k_psi_to_masked_G, in_axes=(0, 0, 0))
+    _kinetic_vmap = jax.vmap(_per_k_kinetic, in_axes=(0, 0))
+
+    U_kmq_G_full = _U_to_G_vmap(
+        psi_box_full[:, :n_occ], Gk_int_full, mask_full)
+    K_bar_sq_full = _kinetic_vmap(U_kmq_G_full, T_diag_full)
 
     # Optional Schur extras: stacked low-energy conduction Ritz vectors at p=k-q.
     if use_schur_default:
-        U_extra_G_full = jnp.stack([
-            _psi_box_to_G_sphere(
-                psi_box_full[ik, n_occ:n_occ + n_cond_bands], H_cache[ik][1]) *
-            H_cache[ik][0].mask[None, None, :].astype(psi_box_full.dtype)
-            for ik in range(nk_full)
-        ], axis=0)
+        U_extra_G_full = _U_to_G_vmap(
+            psi_box_full[:, n_occ:n_occ + n_cond_bands],
+            Gk_int_full, mask_full)
         eps_extra_full = en_full[:, n_occ:n_occ + n_cond_bands]
     else:
         U_extra_G_full = None

@@ -503,14 +503,19 @@ def setup_H_k(
     import psp.vnl_ops as vnl_ops
     kdata = vnl_ops.build_vnl_kdata_from_kvec(kvec, Gk_int, vnl_setup)
 
-    h_diag = (build_h_diag(T_diag, V_loc_r, kdata.Z, kdata.E_super)
+    # Tail-G mask: padded Z entries are non-zero (computed at K=kvec) —
+    # zero them so apply_vnl / build_h_diag never see spurious overlap.
+    vnl_Z = jnp.where(mask[None, :], kdata.Z, jnp.zeros((), dtype=kdata.Z.dtype))
+
+    h_diag = (build_h_diag(T_diag, V_loc_r, vnl_Z, kdata.E_super)
               if V_loc_r is not None else T_diag)
+    h_diag = jnp.where(mask, h_diag, jnp.asarray(1e10, dtype=h_diag.dtype))
 
     return HamiltonianK(
         T_diag=T_diag,
         V_scf=V_scf,
         Gx=Gx, Gy=Gy, Gz=Gz,
-        vnl_Z=kdata.Z,
+        vnl_Z=vnl_Z,
         vnl_E=kdata.E_super,
         h_diag=h_diag,
         mask=mask,
@@ -545,27 +550,39 @@ def setup_H_k_from_kvec(
 
     T_diag, Gx, Gy, Gz = build_T_diag_from_kvec(kvec, crystal)
     nG_actual = int(Gx.shape[0])
-    Gk_int = np.stack([np.asarray(Gx), np.asarray(Gy), np.asarray(Gz)], axis=-1)
-    kdata = vnl_ops.build_vnl_kdata_from_kvec(kvec, Gk_int, vnl_setup)
-    h_diag = (build_h_diag(T_diag, V_loc_r, kdata.Z, kdata.E_super)
-              if V_loc_r is not None else T_diag)
 
-    mask = jnp.ones(nG_actual, dtype=jnp.bool_)
-
-    # Pad to ngkmax if requested (uniform shapes for JIT reuse)
+    # Pre-pad Gk_int + per-G arrays to ngkmax BEFORE the vnl call so
+    # build_vnl_kdata_from_kvec sees a shape-stable G-sphere across all
+    # k-points — its assembly (the _assemble_Z_jit kernel) then compiles
+    # once and is reused for every k.  Tail-G entries hold (0,0,0); Z is
+    # computed there at K=kvec (finite, in-table values) and zeroed
+    # post-call via ``mask``.
     if ngkmax is not None and ngkmax > nG_actual:
         pad = ngkmax - nG_actual
         T_diag = jnp.pad(T_diag, (0, pad), constant_values=1e10)
-        h_diag = jnp.pad(h_diag, (0, pad), constant_values=1e10)
         Gx = jnp.pad(Gx, (0, pad), constant_values=0)
         Gy = jnp.pad(Gy, (0, pad), constant_values=0)
         Gz = jnp.pad(Gz, (0, pad), constant_values=0)
-        vnl_Z = jnp.pad(kdata.Z, ((0, 0), (0, pad)), constant_values=0.0)
-        vnl_E = kdata.E_super
-        mask = jnp.concatenate([mask, jnp.zeros(pad, dtype=jnp.bool_)])
+        mask = jnp.concatenate([jnp.ones(nG_actual, dtype=jnp.bool_),
+                                jnp.zeros(pad, dtype=jnp.bool_)])
     else:
-        vnl_Z = kdata.Z
-        vnl_E = kdata.E_super
+        mask = jnp.ones(nG_actual, dtype=jnp.bool_)
+
+    Gk_int = np.stack([np.asarray(Gx), np.asarray(Gy), np.asarray(Gz)], axis=-1)
+    kdata = vnl_ops.build_vnl_kdata_from_kvec(kvec, Gk_int, vnl_setup)
+
+    # Tail-G mask: padded Z entries are non-zero (computed at K=kvec) —
+    # mask them so apply_vnl / Q-projections never see spurious overlap.
+    vnl_Z = jnp.where(mask[None, :], kdata.Z, jnp.zeros((), dtype=kdata.Z.dtype))
+    vnl_E = kdata.E_super
+
+    h_diag = (build_h_diag(T_diag, V_loc_r, vnl_Z, vnl_E)
+              if V_loc_r is not None else T_diag)
+    # Force h_diag = 1e10 at padded entries (T_diag is already 1e10
+    # there; build_h_diag adds the constant v_of_0, so this snap-back
+    # restores the old sentinel exactly for any preconditioner that
+    # tests against it).
+    h_diag = jnp.where(mask, h_diag, jnp.asarray(1e10, dtype=h_diag.dtype))
 
     return HamiltonianK(
         T_diag=T_diag,

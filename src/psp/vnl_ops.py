@@ -16,6 +16,7 @@ autodiff-safe behaviour at K=0.
 """
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 import numpy as np
 import jax
@@ -325,6 +326,43 @@ def build_vnl_kdata_from_kvec(
                                   setup, compute_dZ=compute_dZ)
 
 
+@functools.partial(jax.jit, static_argnames=('l_max',))
+def _assemble_Z_jit(
+    kvec, Gk_int,
+    B, dq, G_table, Gp_table, prefactor,
+    row_beta_idx, row_l, row_m, row_tau,
+    *, l_max,
+):
+    """JIT'd body of ``_build_vnl_kdata_core`` for ``compute_dZ=False``.
+
+    Pulled to module scope so its compile cache is shared across every
+    per-k call site (run_sternheimer, run_nscf Davidson, kpm_dos,
+    get_dipole_mtxels).  Without this, each k re-traces the eager
+    ``K_cart``/``q``/``S_all``/``G_all``/``Z`` arithmetic and emits a
+    long tail of single-primitive XLA modules.
+
+    All inputs are JAX arrays — ``setup`` is decomposed at the call site
+    so the dataclass (a Python pytree, not abstractable positionally)
+    doesn't enter the jit.  ``l_max`` is the only static arg (it
+    controls the unrolled solid-harmonics block).
+    """
+    from psp.radial.solid_harmonics import all_solid_harmonics
+
+    K_crys = Gk_int.astype(jnp.float64) + kvec[None, :]
+    K_cart = K_crys @ B
+    # Regularizer: avoids 1/q divergence in autodiff.  See
+    # _build_vnl_kdata_core for the full physics rationale.
+    q = jnp.sqrt(jnp.sum(K_cart ** 2, axis=1) + 1e-8)
+    G_all = _interp_with_deriv(q, dq, G_table, Gp_table)        # (total_nbeta, nG)
+    S_all = all_solid_harmonics(K_cart, l_max=l_max)            # (l_max+1, 2*l_max+1, nG)
+
+    G_r = G_all[row_beta_idx]                                    # (total_R, nG)
+    S_r = S_all[row_l, row_m]                                    # (total_R, nG)
+    phase_r = jnp.exp(-2j * jnp.pi * (K_crys @ row_tau.T)).T     # (total_R, nG)
+    c_il_r = prefactor * (1j) ** row_l                           # (total_R,)
+    return c_il_r[:, None] * G_r * S_r * phase_r                 # (total_R, nG)
+
+
 def _build_vnl_kdata_core(
     kvec: np.ndarray,
     Gk_np: np.ndarray,
@@ -337,41 +375,45 @@ def _build_vnl_kdata_core(
     Z[r, G] = c_il * G_beta(q) * S_lm(K) * exp(-2πi K·τ)
 
     All per-row metadata (beta_idx, l, m, tau) was pre-flattened at setup time.
+
+    Tail-G handling: if ``Gk_np`` is pre-padded by the caller (e.g.
+    ``setup_H_k_from_kvec`` padding to ``ngkmax``), Z is computed at
+    those padded entries too — at K = kvec (no zero-G in the padded
+    rows), which gives finite, in-table values for q.  The caller is
+    responsible for masking Z at padded entries before any contraction.
     """
+    nG = Gk_np.shape[0]
+
+    if not compute_dZ:
+        Z = _assemble_Z_jit(
+            jnp.asarray(kvec, dtype=jnp.float64),
+            jnp.asarray(Gk_np, dtype=jnp.int32),
+            jnp.asarray(setup.B, dtype=jnp.float64),
+            jnp.asarray(setup.dq, dtype=jnp.float64),
+            setup.G_table, setup.Gp_table,
+            jnp.asarray(setup.prefactor, dtype=jnp.float64),
+            setup.row_beta_idx, setup.row_l, setup.row_m, setup.row_tau,
+            l_max=int(setup.l_max),
+        )
+        return VNLKData(Z=Z, E_super=setup.E_super, nG=nG,
+                        total_R=setup.total_R, dZ=None)
+
+    # ── compute_dZ=True path: still eager (used by get_dipole_mtxels).
+    #    TODO: jit this too once the per-channel for-loop is vectorised.
     from psp.radial.solid_harmonics import all_solid_harmonics
 
-    nG = Gk_np.shape[0]
     K_crys = jnp.asarray(Gk_np, dtype=jnp.float64) + jnp.asarray(kvec)[None, :]
     B_j = jnp.asarray(setup.B, dtype=jnp.float64)
     K_cart = K_crys @ B_j
-    # Regularizer: avoids 1/q divergence in autodiff.  The value 1e-60 that was
-    # here is enough for 1st-derivatives (q itself gets clamped to 1e-30 at the
-    # Γ+G=0 point but ∂q/∂kvec = K_cart/q vanishes in the numerator there, so
-    # the 1st derivative is 0).  But NESTED jvp at K=0 gets a ∂²q/∂kvec² ~
-    # B·B/q ~ 1e30 which blows up Z's Hessian.  A modest 1e-8 regularizer
-    # keeps q ≥ 1e-4 at K=0, making the 2nd derivative ~ 1e4 (harmless), with
-    # essentially no effect on Z at any physically relevant K where |K|^2 ≫
-    # 1e-8.  The VNL tables are sampled at dq ~ 1e-3, so at the K=0 point the
-    # table lookup still lands in the (q=0) bin.
     q = jnp.sqrt(jnp.sum(K_cart ** 2, axis=1) + 1e-8)
 
-    # Radial form factors: evaluate all betas at all G-vectors.
-    # _interp_with_deriv has a custom_jvp rule that uses setup.Gp_table
-    # (analytic dG_l/dq from the Bessel-recurrence Hankel integral) as the
-    # q-tangent — so any  jax.jvp  taken through this path (velocity
-    # operator, k·p response, ∂χ/∂q in Sternheimer) lands on the physical
-    # derivative rather than the forward-slope of the linear interpolant.
-    G_all = _interp_with_deriv(q, setup.dq, setup.G_table, setup.Gp_table)    # (total_nbeta, nG)
+    G_all = _interp_with_deriv(q, setup.dq, setup.G_table, setup.Gp_table)
+    S_all = all_solid_harmonics(K_cart, l_max=setup.l_max)
 
-    # Solid harmonics: all l in one call
-    S_all = all_solid_harmonics(K_cart, l_max=setup.l_max)  # (l_max+1, 2*l_max+1, nG)
-
-    # ── Vectorized Z assembly — one operation, no loops ──
-    # Each row r: Z[r] = c_il[r] * G[beta_idx[r], :] * S[l[r], m[r], :] * phase[r, :]
-    G_r = G_all[setup.row_beta_idx]                        # (total_R, nG)
-    S_r = S_all[setup.row_l, setup.row_m]                  # (total_R, nG)
-    phase_r = jnp.exp(-2j * jnp.pi * (K_crys @ setup.row_tau.T)).T  # (total_R, nG)
-    c_il_r = setup.prefactor * (1j) ** setup.row_l         # (total_R,)
+    G_r = G_all[setup.row_beta_idx]
+    S_r = S_all[setup.row_l, setup.row_m]
+    phase_r = jnp.exp(-2j * jnp.pi * (K_crys @ setup.row_tau.T)).T
+    c_il_r = setup.prefactor * (1j) ** setup.row_l
 
     Z = c_il_r[:, None] * G_r * S_r * phase_r             # (total_R, nG)
 
