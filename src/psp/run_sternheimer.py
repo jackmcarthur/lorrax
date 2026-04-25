@@ -700,6 +700,12 @@ def chi_col_contrib_at_kvec_traced(
     U_val_hess_kp: jax.Array | None = None,   # (3, 3, nv, ns, nG_p) ∂²U_val/∂kvec_p_i∂kvec_p_j
                                                # — upgrades U_val_eff to quadratic-in-q ansatz;
                                                # required for the exact S-tensor (∂²χ/∂q²) at q=0.
+    sos_only: bool = False,                # if True, return χ contribution from the
+                                           # explicit cond-N projector subspace
+                                           # (op.U_extra) only — closed-form
+                                           # sum-over-states truncated to N=n_cond_bands.
+                                           # No CG iteration; requires use_schur=True
+                                           # (i.e. U_extra_G/eps_extra not None).
 ) -> jax.Array:
     """Return the (ng_out,) χ_{G'0}(q, 0) contribution from a single source-k pair.
 
@@ -761,7 +767,14 @@ def chi_col_contrib_at_kvec_traced(
     else:
         b_eff = b
 
-    delta_u = sternheimer_solve(op, b_eff, tol=tol, max_iter=max_iter, use_schur=use_schur)
+    if sos_only:
+        # Truncated SoS: explicit cond-N projector instead of full
+        # Q_{k-q}.  δu lives entirely in span(op.U_extra) and is a
+        # closed-form (k·p / SoS) expression — no CG iteration.
+        from solvers.sternheimer_solve import cond_subspace_sos_solve
+        delta_u = cond_subspace_sos_solve(op, b_eff)
+    else:
+        delta_u = sternheimer_solve(op, b_eff, tol=tol, max_iter=max_iter, use_schur=use_schur)
 
     # ── Density contribution (naive frame; phase_unwrap handles G_wrap) ──
     # accumulate_chi_density:  δn_contrib(r) = Σ_v u_{v,k_s}(r) · conj(δu_naive(r))
@@ -869,7 +882,8 @@ def _per_k_chi(kvec_p, Gkm_int, mask, Gx, Gy, Gz,
                 vnl_setup,
                 fft_grid_static,
                 tol, max_iter, use_schur,
-                U_extra_G=None, eps_extra=None):
+                U_extra_G=None, eps_extra=None,
+                sos_only: bool = False):
     """Per-k chi-column contribution, hoisted to module scope so its jit
     cache is shared across q-values (no closure capture of qvec)."""
     return chi_col_contrib_at_kvec_traced(
@@ -883,6 +897,7 @@ def _per_k_chi(kvec_p, Gkm_int, mask, Gx, Gy, Gz,
         prefactor=prefactor_j,
         tol=tol, max_iter=max_iter, use_schur=use_schur,
         U_extra_G=U_extra_G, eps_extra=eps_extra,
+        sos_only=sos_only,
     )
 
 
@@ -906,6 +921,7 @@ def _make_chi_vmap_over_k(use_extra: bool):
         base_axes = base_axes + (0, 0)   # U_extra_G, eps_extra
     else:
         base_axes = base_axes + (None, None)
+    base_axes = base_axes + (None,)   # sos_only
     return jax.vmap(_per_k_chi, in_axes=base_axes)
 
 
@@ -1050,6 +1066,7 @@ def run_sternheimer(
     output_path: str = "sternheimer.h5",
     with_derivatives: bool = False,
     with_s_tensor: bool = False,
+    sos_only: bool = False,
     verbose: bool = True,
 ):
     """Forward Sternheimer G=0 column for a list of reduced-BZ q-points.
@@ -1285,6 +1302,7 @@ def run_sternheimer(
                 vnl_setup, fft_grid_static,
                 tol, max_iter, use_schur_default,
                 U_extra_idx, eps_extra_idx,
+                sos_only,
             )
             return jnp.sum(chi_per_k, axis=0)
 
@@ -1438,6 +1456,14 @@ def main(argv=None):
                         help="Also compute the S-tensor at q=0  "
                              "S_ij = ∂²χ_{G'=0}/∂q_i∂q_j  via the explicit "
                              "P_val-rotation formula.")
+    parser.add_argument("--sos-only", action="store_true",
+                        help="Use the explicit cond-N projector (= "
+                             "truncated sum-over-states over the loaded "
+                             "n_cond_bands conduction Ritz vectors) "
+                             "instead of the iterative Sternheimer solve.  "
+                             "Useful for studying how each component of "
+                             "χ_{G'0}(q) converges with the cond-band "
+                             "basis.  Requires n_cond_bands>0.")
     parser.add_argument("-o", "--output", default="sternheimer.h5")
     args = parser.parse_args(argv)
 
@@ -1483,6 +1509,7 @@ def main(argv=None):
         output_path=args.output,
         with_derivatives=bool(args.with_derivatives),
         with_s_tensor=bool(args.s_tensor),
+        sos_only=bool(args.sos_only),
     )
 
 

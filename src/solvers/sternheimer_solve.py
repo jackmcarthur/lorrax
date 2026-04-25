@@ -168,6 +168,23 @@ def _batched_real_norm(a):
     return jnp.sqrt(jnp.real(_batched_dot(a, a)))
 
 
+def cond_subspace_sos_solve(op: SternheimerOp, b: jax.Array) -> jax.Array:
+    """Explicit T-block solution = sum-over-states formula restricted to the
+    cond-Ritz subspace ``op.U_extra``.
+
+    Equivalent to using the projector  P_cond_N = Σ_{m<N} |U_m⟩⟨U_m|  in
+    place of  Q_{k-q} = 1 − P_val  in the Sternheimer source projection.
+    Returns the closed-form δu inside that subspace; no CG iteration.
+
+    Used in two contexts:
+      1. As a CG warm-start (see :func:`_sternheimer_core` ``use_schur``).
+      2. As the *only* solve when comparing how fast each component of
+         χ_{G'0}(q) converges with the truncated-cond-N basis size — set
+         ``sos_only=True`` on the chi pipeline.
+    """
+    return _schur_initial_guess(op, b)
+
+
 def _schur_initial_guess(op: SternheimerOp, b: jax.Array) -> jax.Array:
     """Explicit T-block solution (= standard sum-over-states formula over the
     loaded extra-Ritz subspace) used as the CG initial guess.
