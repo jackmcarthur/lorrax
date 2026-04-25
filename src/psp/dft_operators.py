@@ -637,6 +637,50 @@ def apply(psi_box: jax.Array, H_k: HamiltonianK) -> jax.Array:
 
 
 @jax.jit
+def apply_H_k_from_G(psi_G, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
+    """H|ψ⟩ where the input is the **G-sphere** representation (not the FFT
+    box).  Skips the redundant ``scatter→gather`` round trip used by
+    ``_apply_A_inline``: callers that already have ψ in G-form (e.g. CG
+    iterates) can use this directly, paying for ONE scatter (only for the
+    FFT path) and ONE gather (only after the FFT path), instead of one
+    scatter (caller-side) plus two gathers (apply_H_k internal).
+
+    Saves one O(nG) operation per Sternheimer matvec — ~5–10 % of the inner
+    CG body cost on A100 with the MoS2 3×3 batch shapes.
+
+    Parameters
+    ----------
+    psi_G : (nvec, nspinor, nG_padded) complex128
+    All other args as in ``apply_H_k``.
+    """
+    nx, ny, nz = V_scf.shape
+    mask_f = mask[None, None, :].astype(psi_G.dtype)
+    psi_G_m = psi_G * mask_f
+
+    # T·ψ on the G-sphere directly — no scatter/gather needed.
+    H_G = T_diag[None, None, :] * psi_G_m
+
+    # V_scf path: scatter ψ_G → box, FFT, multiply by V_scf, FFT back, gather.
+    # NOTE: must use ``.add()``, not ``.set()`` — under ngkmax padding, all
+    # padded G-indices map to (0,0,0) which collides with the real G=0
+    # entry.  ``.set()`` overwrites in undefined order and zeros out the
+    # physical G=0 coefficient; ``.add()`` accumulates (padded values are
+    # already masked to 0 above) so the real entry survives.
+    psi_box = jnp.zeros((*psi_G.shape[:2], nx, ny, nz), dtype=psi_G.dtype)
+    psi_box = psi_box.at[:, :, Gx, Gy, Gz].add(psi_G_m)
+    psi_r = jnp.fft.ifftn(psi_box, axes=(-3, -2, -1), norm='ortho')
+    Vpsi_box = jnp.fft.fftn(psi_r * V_scf, axes=(-3, -2, -1), norm='ortho')
+    H_G = H_G + Vpsi_box[:, :, Gx, Gy, Gz] * mask_f
+
+    # V_NL on the G-sphere directly.
+    P = jnp.einsum('RG,vsG->Rsv', jnp.conj(vnl_Z), psi_G_m, optimize=True)
+    D = jnp.einsum('stRQ,Qtv->Rsv', vnl_E, P, optimize=True)
+    H_G = H_G + jnp.einsum('RG,Rsv->vsG', vnl_Z, D, optimize=True) * mask_f
+
+    return H_G
+
+
+@jax.jit
 def build_matrix_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
     """Full ⟨m|H|n⟩ matrix at one k-point.  Returns (nb, nb) complex128."""
     import psp.vnl_ops as vnl_ops

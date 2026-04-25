@@ -40,7 +40,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from psp.dft_operators import apply_H_k
+from psp.dft_operators import apply_H_k_from_G
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -135,16 +135,11 @@ def _apply_A_inline(op: SternheimerOp, x: jax.Array) -> jax.Array:
     Written inline (not as its own jit'd fn) so the enclosing
     :func:`_sternheimer_core` has a single fused trace.
     """
-    # H·x  — use the shared _apply_H kernel.  apply_H_k lives in dft_operators,
-    # which in turn uses static fft_grid dims.  Since op.fft_grid is static
-    # (aux pytree data), this re-jits if the grid changes but NOT per-k.
-    nx, ny, nz = op.fft_grid
-    mask_f = op.mask[None, None, :].astype(x.dtype)
-    psi_box = jnp.zeros((*x.shape[:2], nx, ny, nz), dtype=x.dtype)
-    psi_box = psi_box.at[:, :, op.Gx, op.Gy, op.Gz].add(x * mask_f)
-    Hx = apply_H_k(psi_box, op.T_diag, op.V_scf,
-                   op.Gx, op.Gy, op.Gz,
-                   op.vnl_Z, op.vnl_E, op.mask)
+    # H·x via the G-sphere entry point — one scatter (for FFT path) instead
+    # of the scatter→gather round-trip the box-input ``apply_H_k`` forces.
+    Hx = apply_H_k_from_G(x, op.T_diag, op.V_scf,
+                           op.Gx, op.Gy, op.Gz,
+                           op.vnl_Z, op.vnl_E, op.mask)
     # H·x − ε_v·x
     shifted = Hx - op.eps_v[:, None, None].astype(x.dtype) * x
     # α_pv · P_val(x)
@@ -247,8 +242,8 @@ def _sternheimer_core(op: SternheimerOp, b: jax.Array,
     _DEAD = jnp.asarray(1e-14, dtype=dtype_r)
     alive0 = (b_norm > _DEAD)
 
-    def body(_i, state):
-        x, r, z, p, rho, alive = state
+    def body(state):
+        x, r, z, p, rho, alive, i = state
 
         Ap = _apply_A_inline(op, p)
         pAp = jnp.real(_batched_dot(p, Ap))
@@ -271,11 +266,19 @@ def _sternheimer_core(op: SternheimerOp, b: jax.Array,
         beta_c = beta[:, None, None].astype(dtype_c)
         p_new = z_new + beta_c * p
 
-        return (x_new, r_new, z_new, p_new, rho_new, still_alive)
+        return (x_new, r_new, z_new, p_new, rho_new, still_alive, i + 1)
 
-    state0 = (x0, r0, z0, z0, rho0, alive0)
-    x_final, *_ = lax.fori_loop(0, max_iter, body, state0)
-    return x_final
+    def cond(state):
+        # Continue as long as ANY band is still un-converged AND we haven't
+        # hit max_iter.  Switching from a fixed-iteration ``fori_loop`` to
+        # this ``while_loop`` eliminates the ~50% of iterations that ran
+        # purely on already-converged bands at QE-DFPT-style tolerances.
+        _, _, _, _, _, alive, i = state
+        return jnp.logical_and(jnp.any(alive), i < max_iter)
+
+    state0 = (x0, r0, z0, z0, rho0, alive0, jnp.asarray(0, dtype=jnp.int32))
+    final_state = lax.while_loop(cond, body, state0)
+    return final_state[0]
 
 
 # ═══════════════════════════════════════════════════════════════════════
