@@ -104,12 +104,13 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         result = jnp.linalg.svd(A, full_matrices=False)
         return result.U, result.S, result.Vh
 
-    U, s, _Vh = _svd_replicated(A)
-    del _Vh, A
+    U, s, Vh = _svd_replicated(A)
+    del A
     s_host = np.asarray(s)
     rank = int((s_host > s_host.max() * rtol).sum())
     U = U[:, :rank]
     s = s[:rank]
+    Vh = Vh[:rank, :]                        # (rank, ns·n_μ), keep for centroid recovery
     log_fn(f"  SVD of ({nk*nb}, {nspinor*n_mu}): rank={rank}, "
            f"σ_max={float(s_host[0]):.3e}, σ_min/{rtol:.0e}={float(s_host[rank-1]):.3e} "
            f"({time.time()-t1:.2f}s)")
@@ -184,22 +185,96 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     L = jnp.linalg.cholesky(G)
     log_fn(f"  Cholesky of G: {time.time()-t3:.2f}s")
 
-    # ── 5. ctilde = coeffs · L + ortho diagnostic (one jit) ──
+    # ── 5. ctilde = coeffs · L + ortho diagnostic + B = L⁻¹V^H ──
+    # B is the rank-α basis evaluated at the centroids:
+    #   ψ_nk(r_μ, s) = Σ_α ctilde[k,n,α] · B[α, s, μ]
+    # Math: with A = ψ at centroids = U s V^H, the Cholesky-orthogonalised
+    # interpolation vectors at r_μ are exactly L^{-1} V^H (in the (ns, n_μ)
+    # column index of V^H). This is what downstream Fourier-upscaling +
+    # reconstruction needs to recover ψ at any new k at the centroids.
     @jax.jit
-    def _finalize(coeffs, L):
+    def _finalize(coeffs, L, Vh):
         coeffs = coeffs @ L
         ctilde = coeffs.reshape(nk, nb, rank)
         CtC = ctilde[0] @ ctilde[0].conj().T
         ortho_err = jnp.max(jnp.abs(CtC - jnp.eye(nb, dtype=ctilde.dtype)))
-        return ctilde, ortho_err
+        # B = L⁻¹ V^H, then split (ns·n_μ) → (ns, n_μ).
+        B_flat = jsp_linalg.solve_triangular(L, Vh, lower=True)  # (rank, ns·n_μ)
+        B = B_flat.reshape(rank, nspinor, n_mu)
+        return ctilde, ortho_err, B
 
-    ctilde, ortho_err = _finalize(coeffs, L)
+    ctilde, ortho_err, B_at_mu = _finalize(coeffs, L, Vh)
     ctilde = jax.device_put(ctilde, rep)
+    B_at_mu = jax.device_put(B_at_mu, rep)
     S = jnp.eye(rank, dtype=jnp.complex128)
     log_fn(f"  ctilde[0] orthogonality error: {float(ortho_err):.3e}")
     log_fn(f"  Total Galerkin: {time.time()-t0:.2f}s")
 
-    return S, ctilde
+    return S, ctilde, B_at_mu
+
+
+def upscale_ctilde_uniform(
+    ctilde: jax.Array,
+    kgrid_co: tuple[int, int, int],
+    kgrid_fi: tuple[int, int, int],
+) -> jax.Array:
+    """Bandlimited Fourier upscale of htransform coefficients onto a finer
+    uniform k-grid via FFT-pad-FFT.
+
+    Args:
+        ctilde: (nk_co, nb, rank) wavefunction coefficients in the rank-α
+            SVD basis on the coarse uniform k-grid.
+        kgrid_co: (nkx, nky, nkz) coarse grid.
+        kgrid_fi: (nkx_fi, nky_fi, nkz_fi) fine grid. Each axis must be
+            ≥ the corresponding coarse axis (no downsampling).
+
+    Returns:
+        ctilde_fi: (nk_fi, nb, rank) coefficients on the fine grid. With the
+            same B (interpolation basis at centroids), ψ at any fine k can be
+            reconstructed via reconstruct_psi_at_centroids(ctilde_fi, B).
+    """
+    nkx_co, nky_co, nkz_co = kgrid_co
+    nkx_fi, nky_fi, nkz_fi = kgrid_fi
+    if any(f < c for f, c in zip((nkx_fi, nky_fi, nkz_fi), (nkx_co, nky_co, nkz_co))):
+        raise ValueError(f"fine grid {kgrid_fi} must be ≥ coarse {kgrid_co} per axis")
+
+    nk_co = nkx_co * nky_co * nkz_co
+    nk_fi = nkx_fi * nky_fi * nkz_fi
+    nb = ctilde.shape[-2]
+    rank = ctilde.shape[-1]
+
+    # Reshape ctilde flat-k → 3-D k-grid, FFT to lattice-R representation.
+    c_3d = ctilde.reshape(nkx_co, nky_co, nkz_co, nb, rank)
+    c_R = jnp.fft.fftn(c_3d, axes=(0, 1, 2), norm='backward')
+
+    # fftshift centers the spectrum, then we zero-pad symmetrically.
+    c_R = jnp.fft.fftshift(c_R, axes=(0, 1, 2))
+    pads = [
+        ((kgrid_fi[i] - kgrid_co[i]) // 2,
+         (kgrid_fi[i] - kgrid_co[i]) - (kgrid_fi[i] - kgrid_co[i]) // 2)
+        for i in range(3)
+    ]
+    c_R = jnp.pad(c_R, [pads[0], pads[1], pads[2], (0, 0), (0, 0)], mode='constant')
+    c_R = jnp.fft.ifftshift(c_R, axes=(0, 1, 2))
+
+    # IFFT back; rescale by nk_fi / nk_co to compensate for the IFFT 1/N.
+    c_fi_3d = jnp.fft.ifftn(c_R, axes=(0, 1, 2), norm='backward') * (nk_fi / nk_co)
+    return c_fi_3d.reshape(nk_fi, nb, rank)
+
+
+def reconstruct_psi_at_centroids(ctilde: jax.Array, B_at_mu: jax.Array) -> jax.Array:
+    """Reconstruct ψ_nk(r_μ, s) at the centroids from the rank-α coeffs.
+
+    Args:
+        ctilde: (nk, nb, rank) htransform coefficients (any k-grid).
+        B_at_mu: (rank, ns, n_μ) interpolation basis at centroids — second
+            return value of streaming_galerkin_solve, threaded through
+            initialize_wfns.
+
+    Returns:
+        ψ at centroids: (nk, nb, ns, n_μ).
+    """
+    return jnp.einsum('kna,asm->knsm', ctilde, B_at_mu)
 
 
 def solve_q0_galerkin(
@@ -528,12 +603,12 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
         mesh_xy = _build_mesh_xy()
     band_range = (int(nsigmarange[0]), int(nsigmarange[1]))
     with mesh_xy:
-        S, ctilde = streaming_galerkin_solve(
+        S, ctilde, B_at_mu = streaming_galerkin_solve(
             wfn, sym, meta, centroid_indices, mesh_xy, band_range,
             rtol=1e-8, log_fn=log_fn, bispinor=bispinor,
         )
     log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, nb={band_range[1]-band_range[0]}, rank={ctilde.shape[2]}")
-    return wfn, sym, meta, mesh_xy, S, ctilde, enk_sigma
+    return wfn, sym, meta, mesh_xy, S, ctilde, B_at_mu, enk_sigma
 
 
 def initialize_kpath(wfn, params):
@@ -833,7 +908,7 @@ def main(argv=None):
         params["wfn_file"] = args.wfn_file
         log(f"Using WFN file from CLI: {args.wfn_file}")
 
-    wfn, sym, meta, mesh_xy, S, ctilde, enk_sigma = initialize_wfns(
+    wfn, sym, meta, mesh_xy, S, ctilde, B_at_mu, enk_sigma = initialize_wfns(
         args.input, params, log, args.eqp_file)
     kpath_data = initialize_kpath(wfn, params)
     with mesh_xy:
