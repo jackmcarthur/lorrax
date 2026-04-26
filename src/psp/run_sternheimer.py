@@ -1067,6 +1067,7 @@ def run_sternheimer(
     with_derivatives: bool = False,
     with_s_tensor: bool = False,
     sos_only: bool = False,
+    V_pert_box: jax.Array | None = None,
     verbose: bool = True,
 ):
     """Forward Sternheimer G=0 column for a list of reduced-BZ q-points.
@@ -1266,7 +1267,24 @@ def run_sternheimer(
     chi_vmap_over_k = _make_chi_vmap_over_k(use_extra=use_schur_default)
     s_vmap_over_k   = _make_s_vmap_over_k  (use_extra=use_schur_default)
 
-    V_pert_base_j = make_density_perturbation(fft_grid_static)            # constant ≡ 1
+    if V_pert_box is None:
+        # Default: V_pert(r) = e^{iq·r} (cell-periodic part ≡ 1).
+        # Output is then χ_{G'0}(q) — the head + wings of the q-column.
+        V_pert_base_j = make_density_perturbation(fft_grid_static)
+    else:
+        # User-supplied cell-periodic perturbation.  V_pert(r) =
+        # V_pert_box(r) · e^{iq·r}.  If V_pert_box(r) = sum_G c_G ·
+        # e^{i·2π·G·r}, the chi-pipeline output column is then
+        # χ_{G' G}(q) = sum_G χ_{G' G}(q) · c_G  — i.e. a body
+        # contraction of the polarisability against the input c_G
+        # coefficients.  Caller is responsible for the FFT-box
+        # convention (build via e.g.
+        # ``sqrt(N) * jnp.fft.ifftn(scatter(c_G), norm='ortho')``).
+        V_pert_base_j = jnp.asarray(V_pert_box, dtype=jnp.complex128)
+        if V_pert_base_j.shape != fft_grid_static:
+            raise ValueError(
+                f"V_pert_box shape {V_pert_base_j.shape} != "
+                f"FFT grid {fft_grid_static}")
 
     @functools.partial(jax.jit, static_argnames=('with_derivs',))
     def _chi_at_q_jit(qvec_j, kminq_idx_j, Gprime_int_j, *, with_derivs):
