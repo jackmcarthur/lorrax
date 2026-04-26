@@ -184,15 +184,19 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     L = jnp.linalg.cholesky(G)
     log_fn(f"  Cholesky of G: {time.time()-t3:.2f}s")
 
-    # ── 5. ctilde = coeffs · L (small, replicated) ──
-    coeffs = coeffs @ L
-    S = jnp.eye(rank, dtype=jnp.complex128)
-    ctilde = jax.device_put(coeffs.reshape(nk, nb, rank), rep)
+    # ── 5. ctilde = coeffs · L + ortho diagnostic (one jit) ──
+    @jax.jit
+    def _finalize(coeffs, L):
+        coeffs = coeffs @ L
+        ctilde = coeffs.reshape(nk, nb, rank)
+        CtC = ctilde[0] @ ctilde[0].conj().T
+        ortho_err = jnp.max(jnp.abs(CtC - jnp.eye(nb, dtype=ctilde.dtype)))
+        return ctilde, ortho_err
 
-    # Sanity check: ctilde[0] @ ctilde[0]^H should be ~ I
-    CtC = ctilde[0] @ ctilde[0].conj().T
-    ortho_err = float(jnp.max(jnp.abs(CtC - jnp.eye(nb, dtype=jnp.complex128))))
-    log_fn(f"  ctilde[0] orthogonality error: {ortho_err:.3e}")
+    ctilde, ortho_err = _finalize(coeffs, L)
+    ctilde = jax.device_put(ctilde, rep)
+    S = jnp.eye(rank, dtype=jnp.complex128)
+    log_fn(f"  ctilde[0] orthogonality error: {float(ortho_err):.3e}")
     log_fn(f"  Total Galerkin: {time.time()-t0:.2f}s")
 
     return S, ctilde
@@ -266,9 +270,8 @@ def _f_params_from_energies(enk_nb_nk: jax.Array, top_band_index: int,
     return gap, n, shift
 
 
-def fun(a: float, n: float, shift: float, x: jax.Array) -> jax.Array:
-    """Transform function f(x) — matches Fortran fun(). Works in unshifted space."""
-    a = float(a); n = float(n)
+@partial(jax.jit, static_argnames=('a', 'n', 'shift'))
+def _fun_jit(a: float, n: float, shift: float, x: jax.Array) -> jax.Array:
     erf_half = erf(n * 0.5)
     y = x - shift
     cond_left = y <= -a
@@ -284,9 +287,13 @@ def fun(a: float, n: float, shift: float, x: jax.Array) -> jax.Array:
     return jnp.where(f > 0, 0.0, f)
 
 
-def dfun(a: float, n: float, shift: float, x: jax.Array) -> jax.Array:
-    """Derivative of transform function — matches Fortran dfun()."""
-    a = float(a); n = float(n)
+def fun(a: float, n: float, shift: float, x: jax.Array) -> jax.Array:
+    """Transform function f(x) — matches Fortran fun(). Works in unshifted space."""
+    return _fun_jit(float(a), float(n), float(shift), x)
+
+
+@partial(jax.jit, static_argnames=('a', 'n', 'shift'))
+def _dfun_jit(a: float, n: float, shift: float, x: jax.Array) -> jax.Array:
     erf_half = erf(n * 0.5)
     y = x - shift
     cond_left = y <= -a
@@ -296,6 +303,11 @@ def dfun(a: float, n: float, shift: float, x: jax.Array) -> jax.Array:
     arg = n * (0.5 + y / a)
     df = jnp.where(cond_mid, 0.5 - erf(arg) / (2 * erf_half), df)
     return jnp.where(y >= 0, 0.0, df)
+
+
+def dfun(a: float, n: float, shift: float, x: jax.Array) -> jax.Array:
+    """Derivative of transform function — matches Fortran dfun()."""
+    return _dfun_jit(float(a), float(n), float(shift), x)
 
 
 def f_transform_eigs(enk_nb_nk: jax.Array,
@@ -572,33 +584,49 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
 
     coeffs = ctilde.reshape(nk, states, rank)
     fH_k, fH_R = _build_fH(coeffs, f_eps.T)
-    log_fn(
-        "fH_k real range: [{:.3e}, {:.3e}], |imag|max={:.3e}".format(
-            float(jnp.min(jnp.real(fH_k))),
-            float(jnp.max(jnp.real(fH_k))),
-            float(jnp.max(jnp.abs(jnp.imag(fH_k)))),
-        )
-    )
 
-    # Diagnostic: fH eigenvalues vs expected f(eps) at Γ (k=0)
-    eigs_fHk0 = jnp.sort(jnp.linalg.eigvalsh(fH_k[0]))
-    f_expected_0 = jnp.sort(f_eps[:, 0])
-    fH_eig_err = float(jnp.max(jnp.abs(eigs_fHk0[:states] - f_expected_0)))
+    # Bundle all the per-call diagnostics that were emitting separate eager
+    # pjit compiles (min/max/abs/sort/eigvalsh) into ONE jit returning a
+    # tuple of small scalars/arrays. Same playbook as gw_jax's helper-jit
+    # collapses (commit ecd312e).
+    @jax.jit
+    def _diag_stats(fH_k, f_eps):
+        re_min = jnp.min(jnp.real(fH_k))
+        re_max = jnp.max(jnp.real(fH_k))
+        im_max = jnp.max(jnp.abs(jnp.imag(fH_k)))
+        eigs0 = jnp.sort(jnp.linalg.eigvalsh(fH_k[0]))
+        f_exp0 = jnp.sort(f_eps[:, 0])
+        eig_err = jnp.max(jnp.abs(eigs0[:f_exp0.shape[0]] - f_exp0))
+        return re_min, re_max, im_max, eigs0, f_exp0, eig_err
+
+    re_min, re_max, im_max, eigs_fHk0, f_expected_0, fH_eig_err_arr = _diag_stats(fH_k, f_eps)
+    log_fn("fH_k real range: [{:.3e}, {:.3e}], |imag|max={:.3e}".format(
+        float(re_min), float(re_max), float(im_max)))
+    fH_eig_err = float(fH_eig_err_arr)
     log_fn(f"fH(k=0) eigenvalue error vs f(eps): {fH_eig_err:.6f} Ry = {fH_eig_err * 13.6057:.3f} eV")
     log_fn(f"  f(eps) first 5: {np.array(f_expected_0[:5])}")
     log_fn(f"  fH eig first 5: {np.array(eigs_fHk0[:5])}")
     log_fn(f"  f(eps) last 5:  {np.array(f_expected_0[-5:])}")
     log_fn(f"  fH eig last 5:  {np.array(eigs_fHk0[states-5:states])}")
 
-    # S Cholesky (rank × rank, replicated, small)
-    S_sym = (S + S.conj().T) * 0.5
-    S_sym += 1e-10 * jnp.mean(jnp.real(jnp.diag(S_sym))) * jnp.eye(rank, dtype=S_sym.dtype)
-    S_chol = jnp.linalg.cholesky(S_sym)
+    # S Cholesky (rank × rank, replicated, small) — bundle the symmetrise +
+    # ridge + cholesky into one jit so each line isn't a separate compile.
+    @jax.jit
+    def _build_S_chol(S):
+        S_sym = (S + S.conj().T) * 0.5
+        S_sym += 1e-10 * jnp.mean(jnp.real(jnp.diag(S_sym))) * jnp.eye(rank, dtype=S_sym.dtype)
+        return jnp.linalg.cholesky(S_sym)
+    S_chol = _build_S_chol(S)
 
-    R_grid = jnp.stack(
-        jnp.meshgrid(_shift_indices(meta.nkx), _shift_indices(meta.nky),
-                     _shift_indices(meta.nkz), indexing='ij'),
-        axis=-1).reshape(nk, 3)
+    # R_grid is a static numpy array — meta.nk{x,y,z} are Python ints, no
+    # need to round-trip through jnp ops and trigger separate compiles for
+    # iota/where/meshgrid/stack/reshape.
+    def _shift_np(n: int) -> np.ndarray:
+        a = np.arange(n, dtype=np.float64)
+        return np.where(a >= (n + 1) // 2, a - n, a)
+    R_grid = jnp.asarray(np.stack(np.meshgrid(
+        _shift_np(meta.nkx), _shift_np(meta.nky), _shift_np(meta.nkz), indexing='ij'),
+        axis=-1).reshape(nk, 3))
     fH_R_flat = fH_R.reshape(nk, rank * rank)
 
     # ── Bundle project_to_q + batched generalized eigvalsh into ONE jit ──
@@ -650,9 +678,20 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
             batch_eigs = _kpath_batch(wrapped_k[i:i+batch_size], fH_R_flat, S_chol)
             lambda_q_list.append(batch_eigs)
             jax.block_until_ready(batch_eigs)
-        lambda_q = jnp.concatenate(lambda_q_list, axis=0)[:nq]
-        energies_on_path = jax.vmap(lambda row: newton_inv(a_f, n_f, shift, row.real))(lambda_q)
-        energies_sorted = np.asarray(jnp.sort(energies_on_path, axis=1)[:, :nb_keep])
+
+        # Bundle concat + slice + vmap(newton_inv) + sort into ONE jit so the
+        # post-loop processing emits one compile rather than 4 (concatenate,
+        # sort, gather, vmap-newton).
+        @partial(jax.jit, static_argnames=('nq', 'nb_keep'))
+        def _post_kpath(batches, nq, nb_keep):
+            lambda_q = jnp.concatenate(batches, axis=0)[:nq]
+            energies = jax.vmap(lambda row: newton_inv(a_f, n_f, shift, row.real))(lambda_q)
+            energies_sorted = jnp.sort(energies, axis=1)[:, :nb_keep]
+            return energies, energies_sorted
+
+        energies_on_path, energies_sorted_jax = _post_kpath(
+            tuple(lambda_q_list), int(nq), int(nb_keep))
+        energies_sorted = np.asarray(energies_sorted_jax)
         # Determine Fermi energy as the maximum along path of the wfn.nelec-th band (1-based -> 0-based)
         fermi_band_idx = int(wfn.nelec) - 1
         if 0 <= fermi_band_idx < energies_sorted.shape[1]:
