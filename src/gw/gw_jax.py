@@ -402,21 +402,26 @@ def main(argv=None):
 		ppm_options = build_ppm_sigma_runtime_options(config, input_dir=input_dir, ryd2ev=ryd2ev)
 		print_section("GN-PPM + FREQUENCY-INTEGRATED SIGMA", print0)
 
-		# q→0, G=G'=0 head: explicitly NOT injected into Σ_c here.
-		# Rationale (see docs/gn_bug_plan.md and skills/compare/SKILL.md §4i, §4j):
-		#   - At q=0, G=0 the pair amplitude M_{nm}=δ_{nm} so any head contribution
-		#     to Σ_c is band-diagonal and tiny (~0.5 meV in 2D MoS2 reference).
-		#   - The large q→0 Coulomb divergence enters Σ_X (bare exchange) via
-		#     mini-BZ-averaged vcoul; LORRAX captures that exactly through
-		#     `static_head_terms` injected into sig_x above.
-		#   - BGW's GN-PPM treatment of the Σ_c head is broken — it produces a
-		#     spurious +3 eV shift between BGW PPM and BGW COHSEX at the Γ
-		#     valence band on Si 4×4×4.  Matching it would propagate that bug.
-		#     Verified 2026-04-24 by directly diffing BGW Sig' columns from
-		#     `runs/Si/00_si_4x4x4_60band/{00_bgw_cohsex,01_bgw_gn_ppm}/sigma_hp.log`.
-		#   - `compute_ppm_head_sigma_kij` in `head_correction.py` is the
-		#     analytic GN-pole head Σ_c that we *would* inject if we wanted to
-		#     reproduce BGW's number.  Kept around as documentation; not called.
+		# q→0, G=G'=0 head: injected *analytically* into Σ_c at the end of the
+		# block via `compute_ppm_head_sigma_kij`.  The body integral in
+		# `compute_sigma_c_ppm_omega_grid` excludes q=0,G=0 (V is zeroed there
+		# in `compute_vcoul.get_sqrt_v_and_phase`); this analytic head is the
+		# missing piece.  Magnitude is ±W^c(0)/(2 V_cell N_k) on-shell — ~1.24 eV
+		# per band on Si 4×4×4 60-band, so omitting it shows up as a uniform
+		# ±1.24 eV shift between Σ_c at occupied vs empty bands.
+		# History:
+		#   - Pre-Apr-10: in-body rank-1 head injection
+		#     (apply_head_correction adding vc0·G0·G0^T to V_q[0,0,0] and
+		#     wcoul0·G0·G0^T to W_q[0]).  Removed in 1542342 (Apr-10) when
+		#     head plumbing was unified, but the equivalent post-hoc analytic
+		#     injection was never re-added.
+		#   - Apr-24 prior agent (3e8ac4e) decided not to inject because the
+		#     *finite-Nk* result then disagreed with BGW PPM by ~+1.4 eV at
+		#     occupied Γ.  That is the right disagreement: BGW PPM has a real
+		#     finite-size head bug — see
+		#     reports/mos2_kgrid_gnppm_head_convergence_2026-4-10/, where
+		#     BGW PPM and LORRAX-no-head both diverge as 1/√Nk while
+		#     LORRAX-with-head sits at the Nk→∞ asymptote.
 
 		with timing.section("gw_jax.ppm_sigma"):
 			# χ₀(iωp) → W(iωp) → GN-PPM pole fit
@@ -457,6 +462,53 @@ def main(argv=None):
 				except Exception:
 					pass
 			sigma_c_omega = sigma_omega.sigma_c_kij  # (n_omega, nk, nb, nb) or None if streamed
+
+			# === Σ_c head injection (analytic GN pole, properly mini-BZ-averaged) ===
+			# See block comment above this `with timing.section(...)` for rationale.
+			# Resolved at ω=0 and ω=iωp from the same head sample plumbing as the
+			# COHSEX static head (so vhead/whead overrides flow through identically).
+			from .head_correction import (
+				fit_head_gn_from_samples, compute_ppm_head_sigma_kij,
+				format_head_diagnostics)
+			_head_params = {
+				"wcoul0_source": config.wcoul0_source,
+				"wcoul0_eta": config.wcoul0_eta,
+				"vhead": config.vhead,
+				"whead_0freq": config.whead_0freq,
+				"whead_imfreq": config.whead_imfreq,
+			}
+			_head_static = resolve_head_sample(
+				_head_params, input_dir, wfn, sym, meta, print0,
+				omega=0.0+0.0j)
+			_head_imag = resolve_head_sample(
+				_head_params, input_dir, wfn, sym, meta, print0,
+				omega=1j * float(config.ppm_omega_p))
+			_head_gn = fit_head_gn_from_samples(
+				_head_static, _head_imag, omega_p_ry=float(config.ppm_omega_p))
+			print0(format_head_diagnostics(_head_gn, cell_volume=meta.cell_volume))
+
+			if sigma_c_omega is not None:
+				_enk_full, _ = get_enk_bandrange(wfn, sym,
+					band_slices.sigma_range, band_slices.sigma_range,
+					nspinor=meta.nspinor)
+				_enk_full_np = np.asarray(_enk_full, dtype=np.float64)
+				_n_occ = min(meta.nelec, _enk_full_np.shape[1])
+				_vbm_ry = float(np.max(_enk_full_np[:, :_n_occ]))
+				_cbm_ry = float(np.min(_enk_full_np[:, _n_occ:])) if _n_occ < _enk_full_np.shape[1] else _vbm_ry
+				_efermi_ry = 0.5 * (_vbm_ry + _cbm_ry)
+				_head_sigma_kij_ry = compute_ppm_head_sigma_kij(
+					_head_gn,
+					omega_grid_ry=np.asarray(ppm_options.omega_grid_ry, dtype=np.float64),
+					enk_ry=_enk_full_np,
+					efermi_ry=_efermi_ry,
+					n_occ=_n_occ,
+					cell_volume=float(meta.cell_volume),
+					nk_tot=int(meta.nk_tot),
+				)
+				_head_max_ev = float(np.max(np.abs(_head_sigma_kij_ry))) * ryd2ev
+				print0(f"  Σ_c head shift: max|Σ^head_diag| = {_head_max_ev:.4f} eV "
+				       f"(on-shell occ band → {-_head_gn.R_h/(_head_gn.omega_h * meta.cell_volume * meta.nk_tot) * ryd2ev:+.4f} eV)")
+				sigma_c_omega = sigma_c_omega + jnp.asarray(_head_sigma_kij_ry, dtype=jnp.complex128)
 
 			# Evaluate Σ_c at DFT energies
 			sigma_c_at_dft_ev = None
