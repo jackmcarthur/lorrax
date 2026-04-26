@@ -1794,15 +1794,22 @@ def compute_all_V_q_sharded(
         qvec = np.array([qx, qy, qz], dtype=np.float64)
         return np.where(qvec > kgrid_arr / 2, qvec - kgrid_arr, qvec)
 
+    # Pre-stage qvec list in numpy → one host→GPU transfer + one
+    # vmap of ``kernels.get_sqrt_v_and_phase`` (already a @jax.jit) per
+    # batch.  Replaces the previous python-for-loop + per-call jit
+    # invocation + final ``jnp.stack`` pair, which emitted ~12 eager
+    # cache misses per V_q batch (line 1805 broadcast_in_dim ×2).
+    _vmapped_sqrt_v_phase = jax.vmap(kernels.get_sqrt_v_and_phase)
+
     def _sqrt_v_phase_batch(qvec_list, pad_to: int):
-        sqrt_list, phase_list = [], []
-        for qw in qvec_list:
-            sv, ph = kernels.get_sqrt_v_and_phase(jnp.asarray(qw))
-            sqrt_list.append(sv); phase_list.append(ph)
-        while len(sqrt_list) < pad_to:
-            sqrt_list.append(sqrt_list[0])
-            phase_list.append(phase_list[0])
-        return jnp.stack(sqrt_list, axis=0), jnp.stack(phase_list, axis=0)
+        n_actual = len(qvec_list)
+        qvec_np = np.stack([np.asarray(qw, dtype=np.float64)
+                             for qw in qvec_list], axis=0)
+        if n_actual < pad_to:
+            pad = np.tile(qvec_np[0:1], (pad_to - n_actual, 1))
+            qvec_np = np.concatenate([qvec_np, pad], axis=0)
+        qvec_arr = jnp.asarray(qvec_np, dtype=jnp.float64)
+        return _vmapped_sqrt_v_phase(qvec_arr)
 
     vq_progress = LoopProgress(
         nq_total, print, title="V_q computation",
