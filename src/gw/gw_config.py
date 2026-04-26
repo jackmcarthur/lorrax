@@ -136,6 +136,12 @@ _DEFAULTS = {
     "write_w_copies_debug": False,
     "w_copies_debug_file": "",
     "sigma_freq_debug_file": "sigma_freq_debug.dat",
+    # BSE interpolation setup (htransform-driven fine-k wfn recovery; see
+    # ``bandstructure.bse_setup.compute_wfns_fi``).
+    "get_centroids_fi": False,   # Gate; if True, compute fine-grid wfns at coarse centroids.
+    "wfn_fi_min": 0,             # Sub-window of htransform band axis (0-based).
+    "wfn_fi_max": 0,             # Exclusive upper end. wfn_fi_max==0 → use full window.
+    "kgrid_fi": "",              # "nx ny nz" or "nx,ny,nz". Empty → no fine grid.
 }
 
 # Keys whose string values should be lowercased and stripped
@@ -375,6 +381,12 @@ class LorraxConfig:
     w_copies_debug_file: str
     sigma_freq_debug_file: str
 
+    # --- BSE interpolation setup (htransform-driven) ---
+    get_centroids_fi: bool
+    wfn_fi_min: int
+    wfn_fi_max: int
+    kgrid_fi: str
+
     # --- Optional parsed blocks ---
     kpoints_crystal_b: dict | None = None
 
@@ -570,6 +582,11 @@ class LorraxConfig:
             write_w_copies_debug=bool(_get("write_w_copies_debug")),
             w_copies_debug_file=str(_get("w_copies_debug_file") or ""),
             sigma_freq_debug_file=str(_get("sigma_freq_debug_file")),
+            # BSE interpolation setup
+            get_centroids_fi=bool(_get("get_centroids_fi")),
+            wfn_fi_min=int(_get("wfn_fi_min")),
+            wfn_fi_max=int(_get("wfn_fi_max")),
+            kgrid_fi=str(_get("kgrid_fi") or ""),
             # Parsed blocks
             kpoints_crystal_b=params.get("kpoints_crystal_b"),
             input_dir=input_dir,

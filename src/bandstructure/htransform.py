@@ -213,165 +213,6 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     return S, ctilde, B_at_mu
 
 
-def centroids_and_basis(
-    wfn,
-    sym,
-    meta,
-    centroid_indices,
-    mesh_xy: Mesh,
-    band_range: tuple[int, int],
-    *,
-    rtol: float = 1e-8,
-    log_fn=None,
-    band_chunk_size: int = 64,
-    bispinor: bool = False,
-):
-    """ψ-at-centroids + un-orthogonalised SVD basis. Strictly cheaper than
-    ``streaming_galerkin_solve`` when you only need ψ values at centroids
-    (with optional Fourier upscaling) and don't need the f-transformed
-    Hamiltonian eigenvalue mapping.
-
-    Math: with A = ψ-at-centroids reshaped to (nk·nb, ns·n_μ),
-    SVD gives A = U·s·V^H, and ψ-at-centroids reconstruction is exact via
-
-        ψ_nk(r_μ, s) = Σ_α (Us)[(k,n), α] · V^H[α, (s, μ)]
-                     = Σ_α ctilde_unnorm[k,n,α] · B_unnorm[α, s, μ]
-
-    The Cholesky orthogonalisation in ``streaming_galerkin_solve`` only
-    matters for downstream ``h_transform`` (which needs ctilde·ctilde^H = I);
-    for ψ-at-centroids it's a no-op (it cancels in ctilde·B).
-
-    Skip the G accumulation + Cholesky entirely — saves ~80 ms GPU + the
-    whole ``iter_psi_rchunk_bandwise`` r-space FFT pass.
-
-    Returns:
-        ctilde_unnorm: (nk, nb, rank) — U·s reshaped, replicated.
-        B_unnorm:      (rank, ns, n_μ) — V^H reshaped, replicated.
-        psi_rmu_Y:     (nk, nb, ns, n_μ) — raw centroid samples,
-                       sharded P(None,None,None,'y'). Returned as a
-                       sanity-check / direct-access output.
-    """
-    import time
-    if log_fn is None:
-        log_fn = lambda *a, **kw: None
-
-    b_start, b_end = band_range
-    nb = b_end - b_start
-    nk = meta.nk_tot
-    nspinor = meta.nspinor
-    n_mu = int(centroid_indices.shape[0])
-
-    rep = NamedSharding(mesh_xy, P())
-
-    log_fn(f"  centroids_and_basis: nk={nk}, nb={nb}, n_mu={n_mu}, "
-           f"mesh=({mesh_xy.shape['x']}x{mesh_xy.shape['y']})")
-
-    # 1. ψ at centroids via gw_jax shared loader (band-sharded internally).
-    t0 = time.time()
-    psi_rmu_Y, _ = load_centroids_band_chunked(
-        wfn, sym, meta, centroid_indices, bispinor, mesh_xy,
-        band_range=band_range, band_chunk_size=band_chunk_size,
-    )
-    log_fn(f"  load_centroids_band_chunked: {time.time()-t0:.2f}s")
-
-    # 2. SVD of A = (nk·nb, ns·n_μ); gather to replicated then run cuSolver
-    #    (FFI seam: swap to distributed gesvd at production scale).
-    t1 = time.time()
-    A = psi_rmu_Y.reshape(nk * nb, nspinor * n_mu)
-    A = jax.device_put(A, rep)
-
-    @partial(jax.jit, donate_argnums=(0,), out_shardings=(rep, rep, rep))
-    def _svd_replicated(A):
-        result = jnp.linalg.svd(A, full_matrices=False)
-        return result.U, result.S, result.Vh
-
-    U, s, Vh = _svd_replicated(A)
-    s_host = np.asarray(s)
-    rank = int((s_host > s_host.max() * rtol).sum())
-    U = U[:, :rank]
-    s = s[:rank]
-    Vh = Vh[:rank, :]
-    log_fn(f"  SVD of ({nk*nb}, {nspinor*n_mu}): rank={rank}, "
-           f"σ_max={float(s_host[0]):.3e}, σ_min={float(s_host[rank-1]):.3e} "
-           f"({time.time()-t1:.2f}s)")
-
-    # 3. ctilde_unnorm = U·s, B_unnorm = V^H — bundle into one jit so the
-    #    reshape + multiply emit a single XLA module rather than two.
-    @jax.jit
-    def _pack(U, s, Vh):
-        coeffs = U * s[None, :]
-        ctilde = coeffs.reshape(nk, nb, rank)
-        B = Vh.reshape(rank, nspinor, n_mu)
-        return ctilde, B
-
-    ctilde_unnorm, B_unnorm = _pack(U, s, Vh)
-    return ctilde_unnorm, B_unnorm, psi_rmu_Y
-
-
-def upscale_ctilde_uniform(
-    ctilde: jax.Array,
-    kgrid_co: tuple[int, int, int],
-    kgrid_fi: tuple[int, int, int],
-) -> jax.Array:
-    """Bandlimited Fourier upscale of htransform coefficients onto a finer
-    uniform k-grid via FFT-pad-FFT.
-
-    Args:
-        ctilde: (nk_co, nb, rank) wavefunction coefficients in the rank-α
-            SVD basis on the coarse uniform k-grid.
-        kgrid_co: (nkx, nky, nkz) coarse grid.
-        kgrid_fi: (nkx_fi, nky_fi, nkz_fi) fine grid. Each axis must be
-            ≥ the corresponding coarse axis (no downsampling).
-
-    Returns:
-        ctilde_fi: (nk_fi, nb, rank) coefficients on the fine grid. With the
-            same B (interpolation basis at centroids), ψ at any fine k can be
-            reconstructed via reconstruct_psi_at_centroids(ctilde_fi, B).
-    """
-    nkx_co, nky_co, nkz_co = kgrid_co
-    nkx_fi, nky_fi, nkz_fi = kgrid_fi
-    if any(f < c for f, c in zip((nkx_fi, nky_fi, nkz_fi), (nkx_co, nky_co, nkz_co))):
-        raise ValueError(f"fine grid {kgrid_fi} must be ≥ coarse {kgrid_co} per axis")
-
-    nk_co = nkx_co * nky_co * nkz_co
-    nk_fi = nkx_fi * nky_fi * nkz_fi
-    nb = ctilde.shape[-2]
-    rank = ctilde.shape[-1]
-
-    # Reshape ctilde flat-k → 3-D k-grid, FFT to lattice-R representation.
-    c_3d = ctilde.reshape(nkx_co, nky_co, nkz_co, nb, rank)
-    c_R = jnp.fft.fftn(c_3d, axes=(0, 1, 2), norm='backward')
-
-    # fftshift centers the spectrum, then we zero-pad symmetrically.
-    c_R = jnp.fft.fftshift(c_R, axes=(0, 1, 2))
-    pads = [
-        ((kgrid_fi[i] - kgrid_co[i]) // 2,
-         (kgrid_fi[i] - kgrid_co[i]) - (kgrid_fi[i] - kgrid_co[i]) // 2)
-        for i in range(3)
-    ]
-    c_R = jnp.pad(c_R, [pads[0], pads[1], pads[2], (0, 0), (0, 0)], mode='constant')
-    c_R = jnp.fft.ifftshift(c_R, axes=(0, 1, 2))
-
-    # IFFT back; rescale by nk_fi / nk_co to compensate for the IFFT 1/N.
-    c_fi_3d = jnp.fft.ifftn(c_R, axes=(0, 1, 2), norm='backward') * (nk_fi / nk_co)
-    return c_fi_3d.reshape(nk_fi, nb, rank)
-
-
-def reconstruct_psi_at_centroids(ctilde: jax.Array, B_at_mu: jax.Array) -> jax.Array:
-    """Reconstruct ψ_nk(r_μ, s) at the centroids from the rank-α coeffs.
-
-    Args:
-        ctilde: (nk, nb, rank) htransform coefficients (any k-grid).
-        B_at_mu: (rank, ns, n_μ) interpolation basis at centroids — second
-            return value of streaming_galerkin_solve, threaded through
-            initialize_wfns.
-
-    Returns:
-        ψ at centroids: (nk, nb, ns, n_μ).
-    """
-    return jnp.einsum('kna,asm->knsm', ctilde, B_at_mu)
-
-
 def solve_q0_galerkin(
     psi_mu: jax.Array,
     psi_r: jax.Array,
@@ -488,6 +329,77 @@ def f_transform_eigs(enk_nb_nk: jax.Array,
                                           a_band_index=a_band_index)
     f_eps = fun(a, n, shift, enk_nb_nk)
     return f_eps, a, n, shift
+
+
+def build_R_grid_np(kgrid: tuple[int, int, int]) -> np.ndarray:
+    """Lattice-R grid (nk, 3) matching the IFFT-shift convention used by
+    ``make_flat_k_ifftn`` — symmetric around 0, with R_i ∈ {-n/2, ..., n/2-1}."""
+    def _shift(n):
+        a = np.arange(n, dtype=np.float64)
+        return np.where(a >= (n + 1) // 2, a - n, a)
+    return np.stack(np.meshgrid(
+        _shift(kgrid[0]), _shift(kgrid[1]), _shift(kgrid[2]), indexing='ij'),
+        axis=-1).reshape(-1, 3)
+
+
+def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
+               kgrid_co: tuple[int, int, int], mesh_xy: Mesh,
+               *, a_band_index: int | None = None,
+               log_fn=None):
+    """f-transformed Hamiltonian in real-space lattice representation.
+
+    Math (htransform paper):
+        fH_k  = -Σ_n |sqrt(-f(ε_n,k))|² ctilde_n,k ctilde_n,k^H
+              = Σ_n f(ε_n,k) ctilde_n,k ctilde_n,k^H
+        fH_R  = (1/N_k) Σ_k e^{-2πi k·R} fH_k                          # IFFT
+    where f(ε) is the smooth bandwidth-bound transform from
+    ``f_transform_eigs`` (≤0 for ε<shift, =0 for ε≥shift). For any q,
+    fH_q = Σ_R e^{-2πi q·R} fH_R recovers the rank-α-basis Hamiltonian
+    whose eigenvalues are f(ε_n,q) and whose eigenvectors are c_n,q,
+    enabling both bandstructure interpolation (eigvalsh + newton_inv on
+    eigvals) and wfn recovery (eigh, then ψ_n,q(r_μ) = Σ_α c_n,q[α]·B[α,s,μ]).
+
+    Args:
+        ctilde:    (nk_co, nb, rank) Galerkin coefficients in the rank-α basis,
+                   replicated. Output of ``streaming_galerkin_solve``.
+        enk_sigma: (nb, nk_co) DFT band energies in Ry.
+        kgrid_co:  (nkx, nky, nkz) coarse uniform k-grid.
+        mesh_xy:   ('x','y') device mesh.
+        a_band_index: optional band index whose bandwidth sets ``a``;
+                   defaults to top of the htransform window (nb-1).
+        log_fn:    optional logger.
+
+    Returns:
+        fH_k:    (nk_co, rank, rank), sharded P(None, 'x', 'y').
+        fH_R:    (nk_co, rank, rank), sharded P(None, 'x', 'y') (lattice-R index).
+        params:  (a_f, n_f, shift) — for ``newton_inv`` on the eigvals of fH_q.
+        f_eps:   (nb, nk_co) f-transformed eigenvalues, replicated.
+    """
+    if log_fn is None:
+        log_fn = lambda *a, **kw: None
+
+    f_eps, a_f, n_f, shift = f_transform_eigs(enk_sigma, a_band_index=a_band_index)
+    log_fn(f"  f-transform: a={a_f:.6f} Ry, n={n_f:.2f}, shift={shift:.6f} Ry"
+           + (f" (a from band {a_band_index})" if a_band_index is not None else ""))
+
+    flat_xy = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    spec_3d = P(None, None, None, 'x', 'y')
+    # 'backward' = 1/N normalisation in IFFT — matches Σ_R e^{-2πik·R} fH_R = fH_k.
+    local_ifftn = make_flat_k_ifftn(mesh_xy, kgrid_co, spec_3d, norm='backward')
+
+    @partial(jax.jit, out_shardings=(flat_xy, flat_xy))
+    def _build(ctilde_in, f_eps_T):
+        f_eps_ki = jnp.where(f_eps_T > 0, 0.0, f_eps_T)
+        bw = jnp.sqrt(jnp.clip(-f_eps_ki, 0.0, None))
+        weighted = ctilde_in * bw[..., None]
+        fH_k = -jnp.einsum('kim,kin->kmn', weighted, jnp.conj(weighted), optimize=True)
+        fH_k = 0.5 * (fH_k + jnp.swapaxes(fH_k, -1, -2).conj())
+        fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
+        fH_R = local_ifftn(fH_k)
+        return fH_k, fH_R
+
+    fH_k, fH_R = _build(ctilde, f_eps.T)
+    return fH_k, fH_R, (a_f, n_f, shift), f_eps
 
 
 def newton_inv(a: float, n: float, shift: float, y: jax.Array,
@@ -727,34 +639,11 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     rank = ctilde.shape[2]
     kgrid = (meta.nkx, meta.nky, meta.nkz)
 
-    f_eps, a_f, n_f, shift = f_transform_eigs(enk_sigma, a_band_index=a_band_index)
-    log_fn(f"Transform parameters: a={a_f:.6f}, n={n_f:.2f}, shift={shift:.6f}"
-           + (f", a from band {a_band_index}" if a_band_index is not None else ""))
-
     rep = NamedSharding(mesh_xy, P())  # fully replicated, used for diagnostics
 
-    # ── Build fH_R in one jit ────────────────────────────────────────────
-    # fH_k lives on the (rank, rank) face sharded P(None, 'x', 'y') — gw_jax
-    # V_qmunu idiom. Bundle: einsum + symmetrize + flat-k IFFT into ONE jit
-    # so the body is one compile module instead of ~6 fragmented ones.
-    flat_xy = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    spec_3d = P(None, None, None, 'x', 'y')
-    # 'backward' = 1/N in ifft → matches legacy `jnp.fft.ifftn(norm=None)`.
-    local_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, spec_3d, norm='backward')
-
-    @partial(jax.jit, out_shardings=(flat_xy, flat_xy))
-    def _build_fH(ctilde_in, f_eps_T):
-        f_eps_ki = jnp.where(f_eps_T > 0, 0.0, f_eps_T)
-        band_weights = jnp.sqrt(jnp.clip(-f_eps_ki, 0.0, None))
-        weighted = ctilde_in * band_weights[..., None]
-        fH_k = -jnp.einsum('kim,kin->kmn', weighted, jnp.conj(weighted), optimize=True)
-        fH_k = 0.5 * (fH_k + jnp.swapaxes(fH_k, -1, -2).conj())
-        fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
-        fH_R = local_ifftn(fH_k)
-        return fH_k, fH_R
-
     coeffs = ctilde.reshape(nk, states, rank)
-    fH_k, fH_R = _build_fH(coeffs, f_eps.T)
+    fH_k, fH_R, (a_f, n_f, shift), f_eps = build_fH_R(
+        coeffs, enk_sigma, kgrid, mesh_xy, a_band_index=a_band_index, log_fn=log_fn)
 
     # Diagnostics. Split into two small jits:
     #   _diag_stats_fast  — sharding-respecting reductions on the full fH_k
@@ -797,15 +686,7 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         return jnp.linalg.cholesky(S_sym)
     S_chol = _build_S_chol(S)
 
-    # R_grid is a static numpy array — meta.nk{x,y,z} are Python ints, no
-    # need to round-trip through jnp ops and trigger separate compiles for
-    # iota/where/meshgrid/stack/reshape.
-    def _shift_np(n: int) -> np.ndarray:
-        a = np.arange(n, dtype=np.float64)
-        return np.where(a >= (n + 1) // 2, a - n, a)
-    R_grid = jnp.asarray(np.stack(np.meshgrid(
-        _shift_np(meta.nkx), _shift_np(meta.nky), _shift_np(meta.nkz), indexing='ij'),
-        axis=-1).reshape(nk, 3))
+    R_grid = jnp.asarray(build_R_grid_np(kgrid))
 
     # ── Kpath-batch processing — Regime A ────────────────────────────────
     # Replicate fH_R upfront (~240 MB at our scale), so each batch's compute
@@ -1009,6 +890,24 @@ def main(argv=None):
     with mesh_xy:
         result = h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log, mesh_xy,
                              a_band_index=args.a_band)
+
+    # Optional BSE interpolation handoff: fine-k wfns at coarse centroids.
+    # Driven by ``get_centroids_fi`` + ``kgrid_fi`` + ``wfn_fi_{min,max}``;
+    # see ``bandstructure.bse_setup.compute_wfns_fi`` for the contract.
+    if params.get("get_centroids_fi", False):
+        from .bse_setup import compute_wfns_fi
+        b_min = int(params["wfn_fi_min"])
+        b_max = int(params["wfn_fi_max"]) or int(ctilde.shape[1])
+        with mesh_xy:
+            psi_rmu_Y, psi_rmuT_X, lam_fi, energies_fi = compute_wfns_fi(
+                ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
+                kgrid_co=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
+                kgrid_fi=params["kgrid_fi"],
+                band_window_fi=(b_min, b_max),
+                mesh_xy=mesh_xy, a_band_index=args.a_band, log_fn=log,
+            )
+        log(f"BSE setup: psi_rmu_Y={psi_rmu_Y.shape} P{psi_rmu_Y.sharding.spec}, "
+            f"psi_rmuT_X={psi_rmuT_X.shape} P{psi_rmuT_X.sharding.spec}")
 
     if args.plot:
         plot_bands(result)

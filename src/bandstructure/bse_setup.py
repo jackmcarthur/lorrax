@@ -1,0 +1,174 @@
+"""BSE interpolation setup — fine-k wfn recovery via standard htransform.
+
+Top-level entry point for the BSE-interpolation handoff. Takes the
+coarse-grid htransform outputs (``ctilde``, ``B_at_mu``, ``enk_sigma``)
+plus a finer uniform k-grid spec, and produces wfns at the
+already-selected coarse-grid centroids on the fine grid via the
+standard htransform pipeline:
+
+    fH_R       = build_fH_R(ctilde, enk_sigma, kgrid_co)
+    fH_q       = Σ_R e^{-2πi q·R} fH_R                       # one Fourier sum
+    (lam, c)   = eigh(fH_q)                                  # eigvals f(ε), eigvecs in α-basis
+    ψ_n,q(r_μ) = Σ_α c_n,q[α] · B_at_μ[α, s, μ]              # reconstruction
+
+The resulting wfns are returned as the canonical X/Y-sharded bundle
+used elsewhere in LORRAX (matching ``load_centroids_band_chunked``),
+ready to drop in as a BSE interpolation input.
+
+This module deliberately stays narrow: it calls the core htransform
+routines (``build_fH_R``, ``build_R_grid_np``, ``newton_inv``) and
+adds only the fine-grid k-list construction, the per-q eigh path, and
+the X/Y reshard.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import jax
+import jax.numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from functools import partial
+
+from .htransform import build_fH_R, build_R_grid_np, newton_inv
+
+
+def _parse_kgrid_fi(spec) -> tuple[int, int, int]:
+    """Accept '8 8 1', '8,8,1', or a tuple/list."""
+    if isinstance(spec, (tuple, list)):
+        parts = list(spec)
+    else:
+        parts = str(spec).replace(',', ' ').split()
+    if len(parts) != 3:
+        raise ValueError(f"kgrid_fi must have 3 entries, got {spec!r}")
+    return tuple(int(x) for x in parts)
+
+
+def _uniform_kgrid_frac(kgrid: tuple[int, int, int]) -> jax.Array:
+    """Γ-centred uniform k-grid in crystal coords, wrapped to (-0.5, 0.5]."""
+    nx, ny, nz = kgrid
+    ix = np.arange(nx, dtype=np.float64) / nx
+    iy = np.arange(ny, dtype=np.float64) / ny
+    iz = np.arange(nz, dtype=np.float64) / nz
+    grid = np.stack(np.meshgrid(ix, iy, iz, indexing='ij'), axis=-1).reshape(-1, 3)
+    return jnp.asarray((grid + 0.5) % 1.0 - 0.5)
+
+
+def compute_wfns_fi(
+    *,
+    ctilde: jax.Array,
+    B_at_mu: jax.Array,
+    enk_sigma: jax.Array,
+    kgrid_co: tuple[int, int, int],
+    kgrid_fi,
+    band_window_fi: tuple[int, int],
+    mesh_xy: Mesh,
+    a_band_index: int | None = None,
+    batch_size: int = 32,
+    log_fn=None,
+):
+    """Recover ψ at the coarse-grid centroids on a finer uniform k-grid.
+
+    Args:
+        ctilde:    (nk_co, nb, rank) Galerkin coeffs in the rank-α basis,
+                   replicated. From ``streaming_galerkin_solve``.
+        B_at_mu:   (rank, ns, n_μ) α-basis evaluated at coarse centroids.
+        enk_sigma: (nb, nk_co) DFT band energies in Ry.
+        kgrid_co:  (nkx, nky, nkz) coarse uniform k-grid.
+        kgrid_fi:  (nkx_fi, nky_fi, nkz_fi) fine k-grid; tuple/list/string.
+        band_window_fi: (b_min, b_max) — sub-window of the htransform band
+                   axis to keep on the fine grid (0-based, exclusive end).
+        mesh_xy:   ('x','y') device mesh.
+        a_band_index: optional band index for the f-transform 'a' parameter
+                   (defaults to the top of the htransform window).
+        batch_size: q-points per fH_q batch (≥1 jit compile reuse).
+        log_fn:    optional logger.
+
+    Returns:
+        psi_rmu_Y:   (nk_fi, nb_fi, ns, n_μ),  P(None, None, None, 'y')
+        psi_rmuT_X:  (nk_fi, n_μ, nb_fi, ns),  P(None, 'x', None, None)
+        lam_fi:      (nk_fi, nb_fi)            f(ε_n,q) eigenvalues
+        energies_fi: (nk_fi, nb_fi)            recovered DFT energies (Ry)
+
+    Both wfn copies live on-device and are sharding-distinct so any
+    contraction over (n_μ) along either mesh axis stays local.
+    """
+    log = log_fn if log_fn is not None else (lambda *a, **kw: None)
+    kgrid_fi = _parse_kgrid_fi(kgrid_fi)
+    nb_co = int(ctilde.shape[1])
+    rank = int(ctilde.shape[2])
+    nspinor = int(B_at_mu.shape[1])
+    n_mu = int(B_at_mu.shape[2])
+
+    b_min, b_max = int(band_window_fi[0]), int(band_window_fi[1])
+    nb_fi = b_max - b_min
+    if nb_fi <= 0 or b_min < 0 or b_max > rank:
+        raise ValueError(
+            f"band_window_fi {band_window_fi} not a valid sub-range of [0, {rank})")
+
+    nq = kgrid_fi[0] * kgrid_fi[1] * kgrid_fi[2]
+    log(f"  bse_setup: {kgrid_co} → {kgrid_fi} ({nq} q-pts), "
+        f"bands [{b_min}, {b_max}) of {rank}, batch={batch_size}")
+
+    # ── Build fH_R via the shared htransform core ────────────────────────
+    fH_k, fH_R, (a_f, n_f, shift), _f_eps = build_fH_R(
+        ctilde, enk_sigma, kgrid_co, mesh_xy,
+        a_band_index=a_band_index, log_fn=log)
+    del fH_k  # diagnostic-only here; not needed downstream
+
+    # Replicate fH_R + B_at_mu so each q-batch is a local matmul + eigh.
+    rep = NamedSharding(mesh_xy, P())
+    fH_R_rep = jax.device_put(fH_R, rep)
+    B_rep = jax.device_put(B_at_mu, rep)
+    R_grid = jnp.asarray(build_R_grid_np(kgrid_co))
+
+    # ── Fine-grid q-points, padded to a multiple of batch_size for reuse ─
+    q_all = _uniform_kgrid_frac(kgrid_fi)
+    n_pad = (-nq) % batch_size
+    q_pad = (jnp.concatenate([q_all, jnp.zeros((n_pad, 3), dtype=q_all.dtype)])
+             if n_pad else q_all)
+
+    # ── Per-batch: Fourier sum + eigh + ψ-at-centroids reconstruction ────
+    # Bands [b_min, b_max) selected on the eigenvalue axis (ascending), so the
+    # restriction is exactly the lowest-energy ``nb_fi`` bands of the window.
+    @partial(jax.jit, static_argnames=('b_min', 'b_max'))
+    def _q_batch(q_batch, fH_R, B, b_min, b_max):
+        phase = jnp.exp(-2j * jnp.pi * (q_batch @ R_grid.T))           # (bs, nk_co)
+        fH_q = jnp.einsum('qk,kij->qij', phase, fH_R)
+        fH_q = 0.5 * (fH_q + jnp.swapaxes(fH_q, -1, -2).conj())
+        lam, U = jnp.linalg.eigh(fH_q)                                  # ascending
+        c = U[:, :, b_min:b_max]                                        # (bs, rank, nb_fi)
+        psi = jnp.einsum('qan,asm->qnsm', c, B)                         # (bs, nb_fi, ns, n_μ)
+        return lam[:, b_min:b_max], psi
+
+    lam_chunks, psi_chunks = [], []
+    for i in range(0, q_pad.shape[0], batch_size):
+        lam_b, psi_b = _q_batch(q_pad[i:i+batch_size], fH_R_rep, B_rep, b_min, b_max)
+        lam_chunks.append(lam_b)
+        psi_chunks.append(psi_b)
+        jax.block_until_ready(psi_b)
+    lam_fi = jnp.concatenate(lam_chunks, axis=0)[:nq]
+    psi_fi = jnp.concatenate(psi_chunks, axis=0)[:nq]
+
+    # ── Newton-invert lam_fi → DFT-equivalent energies ───────────────────
+    @jax.jit
+    def _inv(lam):
+        return jax.vmap(lambda row: newton_inv(a_f, n_f, shift, row.real))(lam)
+    energies_fi = _inv(lam_fi)
+
+    # ── Reshard into the canonical (Y, X) wfn-bundle layout ──────────────
+    # Matches ``common.load_wfns.load_centroids_band_chunked``:
+    #   psi_rmu_Y:  (nk, nb, ns, n_μ)   P(None, None, None, 'y')   — n_μ on Y
+    #   psi_rmuT_X: (nk, n_μ, nb, ns)   P(None, 'x', None, None)   — n_μ on X
+    out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+    out_X = NamedSharding(mesh_xy, P(None, 'x', None, None))
+
+    @partial(jax.jit, out_shardings=(out_Y, out_X))
+    def _make_bundle(psi):
+        psi_Y = jax.lax.with_sharding_constraint(psi, out_Y)
+        psi_X = jax.lax.with_sharding_constraint(
+            jnp.transpose(psi, (0, 3, 1, 2)), out_X)
+        return psi_Y, psi_X
+
+    psi_rmu_Y, psi_rmuT_X = _make_bundle(psi_fi)
+    log(f"  bundle: psi_rmu_Y={psi_rmu_Y.shape}, psi_rmuT_X={psi_rmuT_X.shape}")
+    return psi_rmu_Y, psi_rmuT_X, lam_fi, energies_fi
