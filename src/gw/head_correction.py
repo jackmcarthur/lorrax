@@ -15,10 +15,12 @@ This module centralizes:
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 import os
 
 import numpy as np
+import jax
 import jax.numpy as jnp
 
 
@@ -416,14 +418,24 @@ def format_static_head_diagnostics(head: StaticHeadTerms) -> str:
     return "\n".join(lines)
 
 
-def expand_band_diagonal_to_kij(diag: jnp.ndarray, nk_tot: int) -> jnp.ndarray:
-    """Broadcast a band-diagonal shift to a dense ``(nk, nb, nb)`` matrix."""
+@functools.partial(jax.jit, static_argnames=('nk_tot', 'nb'))
+def _expand_band_diagonal_to_kij_jit(diag, *, nk_tot: int, nb: int):
+    """JIT'd body of :func:`expand_band_diagonal_to_kij`."""
+    eye = jnp.eye(nb, dtype=jnp.complex128)
+    one_k = eye[None, :, :] * diag[None, :, None]
+    return jnp.broadcast_to(one_k, (nk_tot, nb, nb))
 
+
+def expand_band_diagonal_to_kij(diag: jnp.ndarray, nk_tot: int) -> jnp.ndarray:
+    """Broadcast a band-diagonal shift to a dense ``(nk, nb, nb)`` matrix.
+
+    Thin Python wrapper that pulls ``nb`` from ``diag.shape`` and
+    forwards to ``_expand_band_diagonal_to_kij_jit`` — collapses
+    ~6 eager-pjit cache misses per call into one cached XLA module.
+    """
     diag_arr = jnp.asarray(diag, dtype=jnp.complex128)
     nb = int(diag_arr.shape[0])
-    eye = jnp.eye(nb, dtype=jnp.complex128)
-    one_k = eye[None, :, :] * diag_arr[None, :, None]
-    return jnp.broadcast_to(one_k, (int(nk_tot), nb, nb))
+    return _expand_band_diagonal_to_kij_jit(diag_arr, nk_tot=int(nk_tot), nb=nb)
 
 
 def static_head_terms_to_kij(

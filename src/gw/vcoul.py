@@ -4,6 +4,8 @@ This module now supports Sobol QMC sampling for the q=0 averages by default
 and keeps the V(q,G) head zero so head averages are injected explicitly later.
 """
 
+import functools
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -12,10 +14,17 @@ from common import Meta
 
 
 
-def wrap_points_to_voronoi(randcart, bvec, nmax=1):
+@functools.partial(jax.jit, static_argnames=('nmax',))
+def wrap_points_to_voronoi(randcart, bvec, nmax: int = 1):
 	"""
 	Helper function to get test q-points for mini-BZ average with correct Voronoi cell.
 	Rewritten to use JAX arrays.
+
+	Wrapped in ``@jax.jit`` (with ``nmax`` static) so all the per-line
+	primitives (meshgrid, stack, reshape, matmul, broadcast subtract,
+	norm, argmin, gather, subtract) collapse into a single XLA module
+	cached on (input shape × nmax).  Without the jit each call site
+	emitted ~10 eager-pjit cache misses.
 	"""
 	randcart_j = jnp.asarray(randcart, dtype=jnp.float64)
 	bvec_j = jnp.asarray(bvec, dtype=jnp.float64)

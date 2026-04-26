@@ -15,6 +15,7 @@ apply :func:`jnp.conj` themselves.
 """
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 
 import jax
@@ -140,15 +141,23 @@ class Wavefunctions:
     occ: jax.Array       # (nk, nb_full) replicated
     slices: BandSlices
 
+    # Slice accessors — bands is a Python ``slice`` (hashable in 3.12+) so
+    # jit can take it as static_argname.  Without these jits each accessor
+    # call (used heavily by chi/W/Σ) emits a fresh eager-pjit ``gather``,
+    # producing a tail of cache misses (~17/run on Si 4×4×4).
+    @functools.partial(jax.jit, static_argnames=('bands',))
     def xn(self, bands: slice) -> jax.Array:
         return self.psi_xn[:, :, :, bands]
 
+    @functools.partial(jax.jit, static_argnames=('bands',))
     def xr(self, bands: slice) -> jax.Array:
         return self.psi_xr[:, bands, :, :]
 
+    @functools.partial(jax.jit, static_argnames=('bands',))
     def yr(self, bands: slice) -> jax.Array:
         return self.psi_yr[:, bands, :, :]
 
+    @functools.partial(jax.jit, static_argnames=('bands',))
     def yn(self, bands: slice) -> jax.Array:
         return self.psi_yn[:, :, :, bands]
 
