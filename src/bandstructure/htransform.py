@@ -561,6 +561,8 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     log_fn(f"Transform parameters: a={a_f:.6f}, n={n_f:.2f}, shift={shift:.6f}"
            + (f", a from band {a_band_index}" if a_band_index is not None else ""))
 
+    rep = NamedSharding(mesh_xy, P())  # fully replicated, used for diagnostics
+
     # ── Build fH_R in one jit ────────────────────────────────────────────
     # fH_k lives on the (rank, rank) face sharded P(None, 'x', 'y') — gw_jax
     # V_qmunu idiom. Bundle: einsum + symmetrize + flat-k IFFT into ONE jit
@@ -578,30 +580,37 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         fH_k = -jnp.einsum('kim,kin->kmn', weighted, jnp.conj(weighted), optimize=True)
         fH_k = 0.5 * (fH_k + jnp.swapaxes(fH_k, -1, -2).conj())
         fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
-        # Flat-k IFFT preserves P(None, 'x', 'y') sharding; no inter-device comm.
         fH_R = local_ifftn(fH_k)
         return fH_k, fH_R
 
     coeffs = ctilde.reshape(nk, states, rank)
     fH_k, fH_R = _build_fH(coeffs, f_eps.T)
 
-    # Bundle all the per-call diagnostics that were emitting separate eager
-    # pjit compiles (min/max/abs/sort/eigvalsh) into ONE jit returning a
-    # tuple of small scalars/arrays. Same playbook as gw_jax's helper-jit
-    # collapses (commit ecd312e).
+    # Diagnostics. Split into two small jits:
+    #   _diag_stats_fast  — sharding-respecting reductions on the full fH_k
+    #     (no gather needed; psum on the (x,y) face).
+    #   _diag_eig_at_gamma — eigvalsh on fH_k[0] only. Pull fH_k[0:1] to
+    #     replicated FIRST (7.4 MB at our scale), so the eigvalsh runs
+    #     single-device locally rather than driving an all-gather of the
+    #     full (rank, rank) face inside the eigvalsh module.
     @jax.jit
-    def _diag_stats(fH_k, f_eps):
-        re_min = jnp.min(jnp.real(fH_k))
-        re_max = jnp.max(jnp.real(fH_k))
-        im_max = jnp.max(jnp.abs(jnp.imag(fH_k)))
-        eigs0 = jnp.sort(jnp.linalg.eigvalsh(fH_k[0]))
-        f_exp0 = jnp.sort(f_eps[:, 0])
-        eig_err = jnp.max(jnp.abs(eigs0[:f_exp0.shape[0]] - f_exp0))
-        return re_min, re_max, im_max, eigs0, f_exp0, eig_err
+    def _diag_stats_fast(fH_k):
+        return (jnp.min(jnp.real(fH_k)),
+                jnp.max(jnp.real(fH_k)),
+                jnp.max(jnp.abs(jnp.imag(fH_k))))
 
-    re_min, re_max, im_max, eigs_fHk0, f_expected_0, fH_eig_err_arr = _diag_stats(fH_k, f_eps)
+    @jax.jit
+    def _diag_eig_at_gamma(fH_k0_rep, f_eps_col0):
+        eigs0 = jnp.sort(jnp.linalg.eigvalsh(fH_k0_rep))
+        f_exp0 = jnp.sort(f_eps_col0)
+        eig_err = jnp.max(jnp.abs(eigs0[:f_exp0.shape[0]] - f_exp0))
+        return eigs0, f_exp0, eig_err
+
+    re_min, re_max, im_max = _diag_stats_fast(fH_k)
     log_fn("fH_k real range: [{:.3e}, {:.3e}], |imag|max={:.3e}".format(
         float(re_min), float(re_max), float(im_max)))
+    fH_k0_rep = jax.device_put(fH_k[0], rep)  # (rank, rank) replicated, ~7 MB
+    eigs_fHk0, f_expected_0, fH_eig_err_arr = _diag_eig_at_gamma(fH_k0_rep, f_eps[:, 0])
     fH_eig_err = float(fH_eig_err_arr)
     log_fn(f"fH(k=0) eigenvalue error vs f(eps): {fH_eig_err:.6f} Ry = {fH_eig_err * 13.6057:.3f} eV")
     log_fn(f"  f(eps) first 5: {np.array(f_expected_0[:5])}")
@@ -627,15 +636,29 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     R_grid = jnp.asarray(np.stack(np.meshgrid(
         _shift_np(meta.nkx), _shift_np(meta.nky), _shift_np(meta.nkz), indexing='ij'),
         axis=-1).reshape(nk, 3))
-    fH_R_flat = fH_R.reshape(nk, rank * rank)
 
-    # ── Bundle project_to_q + batched generalized eigvalsh into ONE jit ──
-    # This compiles ONCE for batch_size=32, reused across all batches.
-    @partial(jax.jit)
-    def _kpath_batch(batch_k, fH_R_flat, S_chol):
+    # ── Kpath-batch processing — Regime A ────────────────────────────────
+    # Replicate fH_R upfront (~240 MB at our scale), so each batch's compute
+    # is fully local and the only collective in the kpath section is the
+    # one-shot upfront all-gather. Per-batch eigvalsh runs ndev-parallel via
+    # batch-axis sharding. Production-scale Regime B (distributed eigh per
+    # batch element) is the same code with a different out_sharding + FFI
+    # swap and no upfront fH_R replication.
+    fH_R_rep = jax.device_put(fH_R, rep)
+
+    # Sharding specs for batched (bs, rank, rank) → (bs, rank) eigvalsh.
+    batch_mat_shard = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
+    batch_eig_shard = NamedSharding(mesh_xy, P(('x', 'y'), None))
+
+    @partial(jax.jit, out_shardings=batch_eig_shard)
+    def _kpath_batch(batch_k, fH_R_rep, S_chol):
+        # batch_k: (bs, 3) replicated; fH_R_rep: (nk, rank, rank) replicated;
+        # S_chol: (rank, rank) replicated. All inputs replicated → einsum
+        # is local, only the final reshard for eigvalsh is collective.
         phase = jnp.exp(-2j * jnp.pi * (batch_k @ R_grid.T))           # (bs, nk)
-        mat = 0.5 * (phase @ fH_R_flat).reshape(batch_k.shape[0], rank, rank)
-        mat = mat + jnp.swapaxes(mat, 1, 2).conj()                     # (bs, rank, rank)
+        mat = 0.5 * jnp.einsum('bk,kij->bij', phase, fH_R_rep)         # (bs, rank, rank)
+        mat = mat + jnp.swapaxes(mat, 1, 2).conj()
+        mat = jax.lax.with_sharding_constraint(mat, batch_mat_shard)
 
         def _solve_one(m):
             y = jsp_linalg.solve_triangular(S_chol, m, lower=True)
@@ -644,11 +667,16 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
 
         return jax.vmap(_solve_one)(mat)
 
-    # Round-trip diagnostic at Γ — single-batch projection + compare.
+    # Round-trip diagnostic at Γ — single-batch via einsum (replicated input).
     q0 = jnp.zeros((1, 3), dtype=jnp.float64)
-    phase0 = jnp.exp(-2j * jnp.pi * (q0 @ R_grid.T))
-    fH_gamma_rt = 0.5 * (phase0 @ fH_R_flat).reshape(1, rank, rank)
-    fH_gamma_rt = (fH_gamma_rt + jnp.swapaxes(fH_gamma_rt, 1, 2).conj())[0]
+
+    @jax.jit
+    def _gamma_rt(fH_R_rep):
+        phase0 = jnp.exp(-2j * jnp.pi * (q0 @ R_grid.T))
+        m = 0.5 * jnp.einsum('bk,kij->bij', phase0, fH_R_rep)
+        return (m + jnp.swapaxes(m, 1, 2).conj())[0]
+
+    fH_gamma_rt = _gamma_rt(fH_R_rep)
     diffs = jnp.max(jnp.abs(fH_k - fH_gamma_rt), axis=(1, 2))
     rt_err = float(jnp.min(diffs))
     log_fn(f"FFT Γ round-trip max error: {rt_err:.3e}")
@@ -675,7 +703,7 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         nq_padded = wrapped_k.shape[0]
         lambda_q_list = []
         for i in range(0, nq_padded, batch_size):
-            batch_eigs = _kpath_batch(wrapped_k[i:i+batch_size], fH_R_flat, S_chol)
+            batch_eigs = _kpath_batch(wrapped_k[i:i+batch_size], fH_R_rep, S_chol)
             lambda_q_list.append(batch_eigs)
             jax.block_until_ready(batch_eigs)
 
