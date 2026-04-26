@@ -213,6 +213,101 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     return S, ctilde, B_at_mu
 
 
+def centroids_and_basis(
+    wfn,
+    sym,
+    meta,
+    centroid_indices,
+    mesh_xy: Mesh,
+    band_range: tuple[int, int],
+    *,
+    rtol: float = 1e-8,
+    log_fn=None,
+    band_chunk_size: int = 64,
+    bispinor: bool = False,
+):
+    """ψ-at-centroids + un-orthogonalised SVD basis. Strictly cheaper than
+    ``streaming_galerkin_solve`` when you only need ψ values at centroids
+    (with optional Fourier upscaling) and don't need the f-transformed
+    Hamiltonian eigenvalue mapping.
+
+    Math: with A = ψ-at-centroids reshaped to (nk·nb, ns·n_μ),
+    SVD gives A = U·s·V^H, and ψ-at-centroids reconstruction is exact via
+
+        ψ_nk(r_μ, s) = Σ_α (Us)[(k,n), α] · V^H[α, (s, μ)]
+                     = Σ_α ctilde_unnorm[k,n,α] · B_unnorm[α, s, μ]
+
+    The Cholesky orthogonalisation in ``streaming_galerkin_solve`` only
+    matters for downstream ``h_transform`` (which needs ctilde·ctilde^H = I);
+    for ψ-at-centroids it's a no-op (it cancels in ctilde·B).
+
+    Skip the G accumulation + Cholesky entirely — saves ~80 ms GPU + the
+    whole ``iter_psi_rchunk_bandwise`` r-space FFT pass.
+
+    Returns:
+        ctilde_unnorm: (nk, nb, rank) — U·s reshaped, replicated.
+        B_unnorm:      (rank, ns, n_μ) — V^H reshaped, replicated.
+        psi_rmu_Y:     (nk, nb, ns, n_μ) — raw centroid samples,
+                       sharded P(None,None,None,'y'). Returned as a
+                       sanity-check / direct-access output.
+    """
+    import time
+    if log_fn is None:
+        log_fn = lambda *a, **kw: None
+
+    b_start, b_end = band_range
+    nb = b_end - b_start
+    nk = meta.nk_tot
+    nspinor = meta.nspinor
+    n_mu = int(centroid_indices.shape[0])
+
+    rep = NamedSharding(mesh_xy, P())
+
+    log_fn(f"  centroids_and_basis: nk={nk}, nb={nb}, n_mu={n_mu}, "
+           f"mesh=({mesh_xy.shape['x']}x{mesh_xy.shape['y']})")
+
+    # 1. ψ at centroids via gw_jax shared loader (band-sharded internally).
+    t0 = time.time()
+    psi_rmu_Y, _ = load_centroids_band_chunked(
+        wfn, sym, meta, centroid_indices, bispinor, mesh_xy,
+        band_range=band_range, band_chunk_size=band_chunk_size,
+    )
+    log_fn(f"  load_centroids_band_chunked: {time.time()-t0:.2f}s")
+
+    # 2. SVD of A = (nk·nb, ns·n_μ); gather to replicated then run cuSolver
+    #    (FFI seam: swap to distributed gesvd at production scale).
+    t1 = time.time()
+    A = psi_rmu_Y.reshape(nk * nb, nspinor * n_mu)
+    A = jax.device_put(A, rep)
+
+    @partial(jax.jit, donate_argnums=(0,), out_shardings=(rep, rep, rep))
+    def _svd_replicated(A):
+        result = jnp.linalg.svd(A, full_matrices=False)
+        return result.U, result.S, result.Vh
+
+    U, s, Vh = _svd_replicated(A)
+    s_host = np.asarray(s)
+    rank = int((s_host > s_host.max() * rtol).sum())
+    U = U[:, :rank]
+    s = s[:rank]
+    Vh = Vh[:rank, :]
+    log_fn(f"  SVD of ({nk*nb}, {nspinor*n_mu}): rank={rank}, "
+           f"σ_max={float(s_host[0]):.3e}, σ_min={float(s_host[rank-1]):.3e} "
+           f"({time.time()-t1:.2f}s)")
+
+    # 3. ctilde_unnorm = U·s, B_unnorm = V^H — bundle into one jit so the
+    #    reshape + multiply emit a single XLA module rather than two.
+    @jax.jit
+    def _pack(U, s, Vh):
+        coeffs = U * s[None, :]
+        ctilde = coeffs.reshape(nk, nb, rank)
+        B = Vh.reshape(rank, nspinor, n_mu)
+        return ctilde, B
+
+    ctilde_unnorm, B_unnorm = _pack(U, s, Vh)
+    return ctilde_unnorm, B_unnorm, psi_rmu_Y
+
+
 def upscale_ctilde_uniform(
     ctilde: jax.Array,
     kgrid_co: tuple[int, int, int],
