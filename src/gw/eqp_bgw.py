@@ -1,0 +1,351 @@
+"""BerkeleyGW ``eqp0.dat`` / ``eqp1.dat`` writer for LORRAX gw_jax outputs.
+
+Reproduces the exact text format BerkeleyGW emits at
+``Sigma/sigma_main.f90:3174-3193`` so the BSE / band-structure interface
+files from a LORRAX gw_jax run are byte-identical (modulo numerics) to
+a reference BGW Sigma run.
+
+Physics
+-------
+We never materialize ``V_xc`` itself — the standard rearrangement
+
+    E_DFT(k,n) = K + I + V_H + V_xc       (mean-field eigenvalue)
+    E_GW(k,n,ω) = K + I + V_H + Σ_xc(ω)
+
+means
+
+    Δ(k,n,ω) ≡ E_GW(ω) - E_DFT
+            = (K + I + V_H + Σ_xc(ω)) - E_DFT
+            = kin_ion[k,n,n] + V_H[k,n,n] + Σ_xc[k,n,n](ω) - E_DFT[k,n]
+
+reads directly off LORRAX outputs without ever forming ``V_xc``.  The
+diagonal QP energies BGW writes are the standard Newton iteration on
+the on-shell Σ:
+
+    eqp0[k,n] = E_DFT[k,n] + Δ(k,n, E_DFT[k,n])               (zeroth order)
+    eqp1[k,n] = E_DFT[k,n] + Z[k,n] · Δ(k,n, E_DFT[k,n])      (linearized)
+    Z[k,n]   = 1 / (1 - dRe[Σ_c]/dω | ω = E_DFT[k,n])
+
+Σ_x and V_H are ω-independent, so only Σ_c contributes to Z.
+
+Inputs (per LORRAX gw_jax run directory)
+----------------------------------------
+- ``WFN.h5``                 — IBZ wedge k-points + DFT energies in Ry
+- ``kin_ion.h5``             — K+I matrix elements in Ry (nk_full, nb, nb)
+- ``sigma_mnk.h5``           — Σ_x, Σ_c(ω), V_H matrix elements in eV; ω in eV
+                               relative to the DFT mid-gap Fermi level
+- ``qp_wfn_rotations.h5``    — band_range + kirr_to_kfull mapping
+
+Output format (BGW ``Sigma/sigma_main.f90:3175-3193``)
+-----------------------------------------------------
+Per IBZ k-point one block:
+
+    header  ``(3f13.9, i8)``       kx_frac ky_frac kz_frac (nspin·nb)
+    body    ``(2i8, 2f15.9)``      ispin iband_abs E_DFT_eV E_QP_eV
+
+CLI
+---
+    python -m gw.eqp_bgw <run_dir>
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from typing import Optional
+
+import h5py
+import numpy as np
+
+
+_RYD2EV = 13.6056980659
+
+
+# ---------------------------------------------------------------------------
+# Pure formatter (matches BGW sigma_main.f90 byte-for-byte)
+# ---------------------------------------------------------------------------
+
+def write_bgw_eqp(
+	path: str,
+	kpoints_irr_frac: np.ndarray,
+	e_dft_ev: np.ndarray,
+	e_qp_ev: np.ndarray,
+	*,
+	band_offset: int,
+	nspin: int = 1,
+) -> str:
+	"""Write a BerkeleyGW ``eqp{0,1}.dat`` file.
+
+	Parameters
+	----------
+	path
+	    Output file path.
+	kpoints_irr_frac : (nk, 3)
+	    IBZ-wedge k-points in fractional crystal coordinates.
+	e_dft_ev, e_qp_ev : (nk, nb)
+	    DFT and quasiparticle eigenvalues in eV, indexed over the
+	    sigma-window bands.
+	band_offset
+	    0-based absolute band index of the first sigma-window band; the
+	    BGW file uses 1-based labels ``band_offset + 1 .. band_offset + nb``.
+	nspin
+	    Number of spin channels (LORRAX runs at nspin=1).
+	"""
+	kpts = np.asarray(kpoints_irr_frac, dtype=np.float64)
+	e_dft = np.asarray(e_dft_ev, dtype=np.float64)
+	e_qp = np.asarray(e_qp_ev, dtype=np.float64)
+	nk, nb = e_dft.shape
+	if kpts.shape != (nk, 3):
+		raise ValueError(f"kpoints shape {kpts.shape} does not match e_dft {(nk, 3)}")
+	if e_qp.shape != (nk, nb):
+		raise ValueError(f"e_qp shape {e_qp.shape} does not match e_dft {(nk, nb)}")
+
+	abs_path = os.path.abspath(path)
+	if os.path.dirname(abs_path):
+		os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+
+	with open(abs_path, "w") as fh:
+		for ik in range(nk):
+			kx, ky, kz = (float(kpts[ik, j]) for j in range(3))
+			# Fortran (3f13.9, i8)
+			fh.write(f"{kx:13.9f}{ky:13.9f}{kz:13.9f}{nspin * nb:8d}\n")
+			for ispin in range(1, nspin + 1):
+				for ib in range(nb):
+					iband = band_offset + ib + 1  # 1-based BGW absolute band
+					# Fortran (2i8, 2f15.9) — BGW format consumes only 4 args
+					# even though the spec advertises 3f15.9; sigma_main.f90 passes
+					# (ispin, iband, E_DFT, E_QP).
+					fh.write(
+						f"{ispin:8d}{iband:8d}"
+						f"{float(e_dft[ik, ib]):15.9f}{float(e_qp[ik, ib]):15.9f}\n"
+					)
+	return abs_path
+
+
+# ---------------------------------------------------------------------------
+# Numerics: eqp0 / eqp1 from per-state Σ on a global ω-grid
+# ---------------------------------------------------------------------------
+
+def compute_eqp_diag(
+	*,
+	kin_ion_diag_ev: np.ndarray,        # (nk, nb)
+	hartree_diag_ev: np.ndarray,        # (nk, nb)
+	sigma_x_diag_ev: np.ndarray,        # (nk, nb)
+	sigma_c_omega_diag_ev: np.ndarray,  # (n_omega, nk, nb)
+	omega_rel_ev: np.ndarray,           # (n_omega,)  — ω axis relative to E_F
+	e_dft_rel_ev: np.ndarray,           # (nk, nb)    — E_DFT - E_F
+	e_dft_ev: np.ndarray,               # (nk, nb)    — absolute E_DFT
+	dE_ev: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray]:
+	"""Return ``(eqp0_ev, eqp1_ev)`` arrays of shape ``(nk, nb)``.
+
+	``sigma_c_omega_diag_ev`` is interpolated linearly along the global ω
+	grid at each per-state ``E_DFT_nk - E_F`` to give Σ_c at the on-shell
+	frequency, and at ``± dE_ev`` around it for the central-difference
+	derivative used in the Z-factor.
+
+	``dE_ev`` plays the role of BGW's ``finite_difference_spacing``; 0.5 eV
+	matches the BGW default.  For the ω-grid spacing of 0.25 eV used by
+	gw_jax this falls cleanly on grid points.
+	"""
+	nk, nb = e_dft_rel_ev.shape
+	if sigma_c_omega_diag_ev.shape != (omega_rel_ev.size, nk, nb):
+		raise ValueError(
+			f"sigma_c_omega shape {sigma_c_omega_diag_ev.shape} mismatched against "
+			f"({omega_rel_ev.size}, {nk}, {nb})"
+		)
+
+	sig_c_re = np.real(sigma_c_omega_diag_ev)
+	sig_c_im = np.imag(sigma_c_omega_diag_ev)
+
+	def _interp_at(omega_query_ev: np.ndarray) -> np.ndarray:
+		out = np.empty((nk, nb), dtype=np.complex128)
+		for ik in range(nk):
+			for ib in range(nb):
+				w = float(omega_query_ev[ik, ib])
+				out[ik, ib] = complex(
+					np.interp(w, omega_rel_ev, sig_c_re[:, ik, ib]),
+					np.interp(w, omega_rel_ev, sig_c_im[:, ik, ib]),
+				)
+		return out
+
+	sigma_c_at_dft = _interp_at(e_dft_rel_ev)
+	sigma_c_plus = _interp_at(e_dft_rel_ev + dE_ev)
+	sigma_c_minus = _interp_at(e_dft_rel_ev - dE_ev)
+
+	# Central-difference dRe[Σ_c]/dω at E_DFT
+	dsigma_dE = (np.real(sigma_c_plus) - np.real(sigma_c_minus)) / (2.0 * dE_ev)
+	z_factor = 1.0 / (1.0 - dsigma_dE)
+
+	sigma_xc_at_dft = sigma_x_diag_ev + sigma_c_at_dft
+
+	# E_GW(E_DFT) = kin_ion + V_H + Σ_xc(E_DFT)
+	delta_at_dft = (
+		kin_ion_diag_ev + hartree_diag_ev + sigma_xc_at_dft - e_dft_ev
+	).real
+
+	eqp0 = e_dft_ev + delta_at_dft
+	eqp1 = e_dft_ev + z_factor * delta_at_dft
+	return eqp0, eqp1
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator: read the run directory and emit eqp{0,1}.dat
+# ---------------------------------------------------------------------------
+
+def make_eqp_bgw(
+	run_dir: str,
+	*,
+	wfn_path: Optional[str] = None,
+	kin_ion_path: Optional[str] = None,
+	sigma_mnk_path: Optional[str] = None,
+	qp_rotations_path: Optional[str] = None,
+	eqp0_out: str = "eqp0.dat",
+	eqp1_out: str = "eqp1.dat",
+	finite_difference_spacing_ev: float = 0.5,
+) -> tuple[str, str]:
+	"""Emit BGW-format ``eqp0.dat`` and ``eqp1.dat`` from a LORRAX gw_jax run.
+
+	All file paths default to standard names inside ``run_dir``.  Returns
+	``(eqp0_path, eqp1_path)``.
+	"""
+	wfn_path = wfn_path or os.path.join(run_dir, "WFN.h5")
+	kin_ion_path = kin_ion_path or os.path.join(run_dir, "kin_ion.h5")
+	sigma_mnk_path = sigma_mnk_path or os.path.join(run_dir, "sigma_mnk.h5")
+	qp_rotations_path = qp_rotations_path or os.path.join(run_dir, "qp_wfn_rotations.h5")
+	eqp0_path = (
+		eqp0_out if os.path.isabs(eqp0_out) else os.path.join(run_dir, eqp0_out)
+	)
+	eqp1_path = (
+		eqp1_out if os.path.isabs(eqp1_out) else os.path.join(run_dir, eqp1_out)
+	)
+
+	# IBZ k-points + per-state DFT energies (Ry → eV)
+	with h5py.File(wfn_path, "r") as wfn:
+		kpoints_irr = np.asarray(wfn["mf_header/kpoints/rk"])
+		nspin = int(np.asarray(wfn["mf_header/kpoints/nspin"]))
+		# energies: (nspin, nk, nbands_total) in Ry
+		energies_ry = np.asarray(wfn["mf_header/kpoints/el"])
+		ifmax = np.asarray(wfn["mf_header/kpoints/ifmax"])  # (nspin, nk) 1-based
+	if nspin != 1:
+		raise NotImplementedError("LORRAX runs at nspin=1; got nspin={}".format(nspin))
+
+	nk_irr = kpoints_irr.shape[0]
+
+	# IBZ → full-BZ index map; band_range
+	with h5py.File(qp_rotations_path, "r") as qp:
+		band_range = np.asarray(qp["band_range"], dtype=np.int64)
+		kirr_to_kfull = np.asarray(qp["kirr_to_kfull"], dtype=np.int64)
+	band_start, band_stop = int(band_range[0]), int(band_range[1])
+	nb_window = band_stop - band_start
+	if kirr_to_kfull.size != nk_irr:
+		raise ValueError(
+			f"kirr_to_kfull size {kirr_to_kfull.size} != IBZ kpts {nk_irr}"
+		)
+
+	# DFT energies on the IBZ wedge for the sigma window (eV)
+	# energies_ry shape (nspin=1, nk_irr, nb_total); take spin 0.
+	e_dft_ev = energies_ry[0, :, band_start:band_stop] * _RYD2EV
+	if e_dft_ev.shape != (nk_irr, nb_window):
+		raise ValueError(
+			f"WFN energies shape {energies_ry.shape} inconsistent with "
+			f"band_range {(band_start, band_stop)} on {nk_irr} IBZ kpts"
+		)
+
+	# Mid-gap Fermi level from the IBZ DFT energies (matches gw_jax convention)
+	n_occ = int(np.max(ifmax[0]))                       # 1-based highest occ
+	occ_idx_local = n_occ - 1 - band_start              # within the window
+	if occ_idx_local < 0 or occ_idx_local + 1 >= nb_window:
+		raise ValueError(
+			"sigma window does not bracket VBM/CBM: band_range="
+			f"[{band_start},{band_stop}), VBM index={n_occ - 1}"
+		)
+	vbm_ev = float(np.max(e_dft_ev[:, : occ_idx_local + 1]))
+	cbm_ev = float(np.min(e_dft_ev[:, occ_idx_local + 1 :]))
+	efermi_ev = 0.5 * (vbm_ev + cbm_ev)
+	e_dft_rel_ev = e_dft_ev - efermi_ev
+
+	# kin_ion (Ry → eV), pulled on the IBZ wedge directly
+	with h5py.File(kin_ion_path, "r") as kih:
+		kin_full = np.asarray(kih["kin_ion"])
+	if kin_full.ndim != 3:
+		raise ValueError(f"kin_ion dataset must be (nk, nb, nb); got {kin_full.shape}")
+	kin_irr = kin_full[kirr_to_kfull, band_start:band_stop, band_start:band_stop]
+	kin_ion_diag_ev = np.real(np.diagonal(kin_irr, axis1=1, axis2=2)) * _RYD2EV
+
+	# sigma_mnk.h5: σ_x, σ_c(ω), V_H, ω axis (all already in eV, ω relative to E_F)
+	with h5py.File(sigma_mnk_path, "r") as sf:
+		omega_rel_ev = np.asarray(sf["omega_ev"], dtype=np.float64)
+		sigma_x_full = np.asarray(sf["sigma_sx_kij_ev"])
+		hartree_full = np.asarray(sf["hartree_kij_ev"])
+		sigma_c_full = np.asarray(sf["sigma_c_kij_ev"])
+	# Subset to IBZ wedge × sigma-window bands
+	sigma_x_irr = sigma_x_full[kirr_to_kfull][:, band_start:band_stop, band_start:band_stop]
+	hartree_irr = hartree_full[kirr_to_kfull][:, band_start:band_stop, band_start:band_stop]
+	sigma_c_irr = sigma_c_full[:, kirr_to_kfull][:, :, band_start:band_stop, band_start:band_stop]
+
+	sigma_x_diag = np.diagonal(sigma_x_irr, axis1=1, axis2=2)
+	hartree_diag = np.diagonal(hartree_irr, axis1=1, axis2=2)
+	sigma_c_omega_diag = np.diagonal(sigma_c_irr, axis1=2, axis2=3)  # (n_omega, nk, nb)
+
+	eqp0_ev, eqp1_ev = compute_eqp_diag(
+		kin_ion_diag_ev=kin_ion_diag_ev,
+		hartree_diag_ev=np.real(hartree_diag),
+		sigma_x_diag_ev=np.real(sigma_x_diag),
+		sigma_c_omega_diag_ev=sigma_c_omega_diag,
+		omega_rel_ev=omega_rel_ev,
+		e_dft_rel_ev=e_dft_rel_ev,
+		e_dft_ev=e_dft_ev,
+		dE_ev=finite_difference_spacing_ev,
+	)
+
+	write_bgw_eqp(eqp0_path, kpoints_irr, e_dft_ev, eqp0_ev,
+	              band_offset=band_start, nspin=1)
+	write_bgw_eqp(eqp1_path, kpoints_irr, e_dft_ev, eqp1_ev,
+	              band_offset=band_start, nspin=1)
+	return eqp0_path, eqp1_path
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _build_parser() -> argparse.ArgumentParser:
+	p = argparse.ArgumentParser(
+		prog="python -m gw.eqp_bgw",
+		description="Reproduce BGW eqp0.dat / eqp1.dat from a LORRAX gw_jax run.",
+	)
+	p.add_argument("run_dir", help="Run directory containing WFN.h5, kin_ion.h5, sigma_mnk.h5, qp_wfn_rotations.h5")
+	p.add_argument("--wfn", default=None, help="Path to WFN.h5 (default: <run_dir>/WFN.h5)")
+	p.add_argument("--kin-ion", default=None, help="Path to kin_ion.h5")
+	p.add_argument("--sigma-mnk", default=None, help="Path to sigma_mnk.h5")
+	p.add_argument("--qp-rotations", default=None, help="Path to qp_wfn_rotations.h5")
+	p.add_argument("--eqp0", default="eqp0.dat", help="Output eqp0 filename (relative to run_dir unless absolute)")
+	p.add_argument("--eqp1", default="eqp1.dat", help="Output eqp1 filename (relative to run_dir unless absolute)")
+	p.add_argument(
+		"--finite-difference-spacing",
+		type=float, default=0.5,
+		help="dE (eV) for the Z-factor central difference (BGW default 0.5)",
+	)
+	return p
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+	args = _build_parser().parse_args(argv)
+	eqp0_path, eqp1_path = make_eqp_bgw(
+		args.run_dir,
+		wfn_path=args.wfn,
+		kin_ion_path=args.kin_ion,
+		sigma_mnk_path=args.sigma_mnk,
+		qp_rotations_path=args.qp_rotations,
+		eqp0_out=args.eqp0,
+		eqp1_out=args.eqp1,
+		finite_difference_spacing_ev=args.finite_difference_spacing,
+	)
+	print(f"wrote: {eqp0_path}")
+	print(f"wrote: {eqp1_path}")
+	return 0
+
+
+if __name__ == "__main__":
+	raise SystemExit(main())

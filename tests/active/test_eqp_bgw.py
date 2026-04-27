@@ -1,0 +1,75 @@
+"""Format-byte-identity check for the BGW eqp.dat writer.
+
+The BerkeleyGW reference values come straight out of an unmodified
+``Sigma`` run — they're loaded back into the writer to verify we emit
+byte-for-byte the same file.
+"""
+import os
+import sys
+import numpy as np
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+
+from gw.eqp_bgw import write_bgw_eqp
+
+
+# Single-k-point block from
+# runs/MoS2_1x1_full_workflow/00_bgw/eqp0.dat — known-good BGW output.
+_BGW_REFERENCE = """\
+  0.000000000  0.000000000  0.000000000      12
+       1      19   -7.669034940  -21.227075031
+       1      20   -7.669034940  -21.227075031
+       1      21   -7.007156651  -20.917726271
+       1      22   -7.007156651  -20.917726271
+       1      23   -6.928614406  -20.834339920
+       1      24   -6.928614406  -20.834339920
+       1      25   -5.201528388  -18.322730475
+       1      26   -5.201528388  -18.322730475
+       1      27   -2.823196564   -4.843995275
+       1      28   -2.823196564   -4.843995275
+       1      29   -2.788658343   -4.606570924
+       1      30   -2.788658343   -4.606570924
+"""
+
+
+@pytest.fixture
+def reference_block():
+	kpts = np.array([[0.0, 0.0, 0.0]])
+	e_dft = np.array([[
+		-7.669034940, -7.669034940, -7.007156651, -7.007156651,
+		-6.928614406, -6.928614406, -5.201528388, -5.201528388,
+		-2.823196564, -2.823196564, -2.788658343, -2.788658343,
+	]])
+	e_qp = np.array([[
+		-21.227075031, -21.227075031, -20.917726271, -20.917726271,
+		-20.834339920, -20.834339920, -18.322730475, -18.322730475,
+		 -4.843995275,  -4.843995275,  -4.606570924,  -4.606570924,
+	]])
+	return kpts, e_dft, e_qp
+
+
+def test_writer_byte_identical_to_bgw(tmp_path, reference_block):
+	kpts, e_dft, e_qp = reference_block
+	out = tmp_path / "eqp0.dat"
+	write_bgw_eqp(str(out), kpts, e_dft, e_qp, band_offset=18, nspin=1)
+	assert out.read_text() == _BGW_REFERENCE
+
+
+def test_writer_band_offset_uses_one_based_label(tmp_path, reference_block):
+	kpts, e_dft, e_qp = reference_block
+	out = tmp_path / "eqp0.dat"
+	# band_offset=0 → labels start at 1 (not 19)
+	write_bgw_eqp(str(out), kpts, e_dft, e_qp, band_offset=0, nspin=1)
+	first_band_line = out.read_text().splitlines()[1]
+	# Format ``(2i8, 2f15.9)`` — first eight chars are ``"%8d" % ispin``.
+	assert first_band_line[:16] == "       1       1"
+
+
+def test_writer_rejects_shape_mismatch(tmp_path, reference_block):
+	kpts, e_dft, e_qp = reference_block
+	out = tmp_path / "eqp0.dat"
+	with pytest.raises(ValueError, match="kpoints shape"):
+		write_bgw_eqp(str(out), np.zeros((2, 3)), e_dft, e_qp, band_offset=0)
+	with pytest.raises(ValueError, match="e_qp shape"):
+		write_bgw_eqp(str(out), kpts, e_dft, e_qp[:, :4], band_offset=0)
