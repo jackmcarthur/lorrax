@@ -44,6 +44,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 
 from common.fft_helpers import (
+    make_custom_partition_fftn_3d,
     make_sharded_fftn_3d,
     make_sharded_ifftn_3d,
 )
@@ -57,6 +58,7 @@ def build_bse_simple_matvec(
     nkz: int,
     *,
     include_W: bool = True,
+    fft_wrapper: str = "shard_map",
 ):
     """Build a plain-jit BSE matvec — no shard_map, no rings.
 
@@ -74,13 +76,26 @@ def build_bse_simple_matvec(
     nk = nkx * nky * nkz
     sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=jnp.float64))
 
-    # 3D FFT over k-axes 5,6,7 of the 8D T tensor, via cuFFT 3D plan in
-    # one shot.  shard_map only as axis-name binding (no collective).
+    # 3D FFT over k-axes 5,6,7 of the 8D T tensor, single cuFFT 3D plan
+    # wrapped in ``shard_map``.  ``fft_wrapper="custom_partitioning"`` is
+    # available for A/B testing — same primitive cost, but the
+    # CustomCallOp boundary blocks XLA from optimizing across the FFT
+    # (it ends up emitting an explicit ~100 ms reduce-scatter that
+    # shard_map's body-inlining elides).  Si 4×4×4 BSE: shard_map 6.1 s
+    # vs custom_partitioning 7.3 s.
     _T_8d_spec = P(None, "x", "y", None, None, None, None, None)
-    _T_local_ifftn = make_sharded_ifftn_3d(
-        mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
-    _T_local_fftn = make_sharded_fftn_3d(
-        mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
+    if fft_wrapper == "custom_partitioning":
+        _T_local_ifftn = make_custom_partition_fftn_3d(
+            mesh_xy, _T_8d_spec, _T_8d_spec, fft_kind="ifftn",
+            axes=(5, 6, 7), norm='ortho')
+        _T_local_fftn = make_custom_partition_fftn_3d(
+            mesh_xy, _T_8d_spec, _T_8d_spec, fft_kind="fftn",
+            axes=(5, 6, 7), norm='ortho')
+    else:
+        _T_local_ifftn = make_sharded_ifftn_3d(
+            mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
+        _T_local_fftn = make_sharded_fftn_3d(
+            mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
 
     def _matvec(
         X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,

@@ -216,6 +216,7 @@ def _preview_lanczos(
     rtol: float = 0.0,
     check_every: int = 4,
     matvec_kind: str = "ring",
+    fft_wrapper: str = "shard_map",
 ) -> None:
     restart_file = _find_restart_file(input_file)
     n_devices = jax.device_count()
@@ -237,6 +238,7 @@ def _preview_lanczos(
         )
         # T-encoding strategy plumbed via the data dict (see solve_bse_sharded).
         data["matvec_kind"] = matvec_kind
+        data["fft_wrapper"] = fft_wrapper
         # EQP override on enk_full (BGW eqp1.dat semantics).
         if eqp_file is not None:
             from .bse_io import apply_eqp_corrections
@@ -441,6 +443,15 @@ if __name__ == "__main__":
              "+ with_sharding_constraint, no shard_map (XLA auto-partitions).",
     )
     parser.add_argument(
+        "--fft-wrapper",
+        choices=("shard_map", "custom_partitioning"),
+        default="shard_map",
+        help="How to wrap the BSE matvec's W-contraction 3D FFT so XLA's "
+             "GSPMD doesn't all-gather the input (JAX's fft_p has no SPMD "
+             "partitioner registered). Both wrap a single jnp.fft.fftn(axes=...) "
+             "call; this flag is for A/B comparison only.",
+    )
+    parser.add_argument(
         "--gather-t",
         action="store_true",
         help="(Deprecated alias for --matvec-kind=gather)",
@@ -598,6 +609,7 @@ if __name__ == "__main__":
         rtol=args.lanczos_rtol,
         check_every=args.lanczos_check_every,
         matvec_kind=("gather" if args.gather_t else args.matvec_kind),
+        fft_wrapper=args.fft_wrapper,
     )
     raise SystemExit(0)
 
