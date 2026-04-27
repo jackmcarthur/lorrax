@@ -1,8 +1,15 @@
 """BSE JAX entry points and CLI wrappers."""
 from __future__ import annotations
 
+import os
 import sys
 
+# Ensure x64 + jax.distributed bootstrap before any jax-collective code
+# (the ring matvec uses lax.psum/ppermute on the 2D mesh, which is silent-
+# wrong if processes don't agree on a shared distributed runtime).
+os.environ.setdefault("JAX_ENABLE_X64", "1")
+from runtime import init_jax_distributed
+init_jax_distributed()
 
 import jax
 import jax.numpy as jnp
@@ -207,40 +214,94 @@ def _preview_lanczos(
     n_occ: int | None = None,
 ) -> None:
     restart_file = _find_restart_file(input_file)
-    payload = _load_ring_subset(
-        restart_file,
-        n_val,
-        n_cond,
-        1,
-        1,
-        eqp_file=eqp_file,
-        n_occ=n_occ,
-        input_file=input_file,
-    )
-    psi_c = payload["psi_c"]
-    psi_v = payload["psi_v"]
-    eps_c = payload["eps_c"]
-    eps_v = payload["eps_v"]
-    W_q = payload["W_q"]
-    V_q0 = payload["V_q0"]
-    nkx = payload["nkx"]
-    nky = payload["nky"]
-    nkz = payload["nkz"]
+    n_devices = jax.device_count()
+    use_sharded = n_devices > 1
 
-    nk = nkx * nky * nkz
-    nc_actual = psi_c.shape[1]
-    nv_actual = psi_v.shape[1]
-    bse_dim = nc_actual * nv_actual * nk
-    print(f"BSE problem: {nc_actual} cond x {nv_actual} val x {nk} k = {bse_dim} dimension")
+    if use_sharded:
+        # Sharded ring matvec — parallelises (μ,ν) and avoids per-iter
+        # 3D-FFT of W_q (precomputes W_R once outside the Lanczos loop).
+        from .bse_io import load_bse_data_from_restart_sharded
+        from .bse_lanczos import solve_bse_sharded
+        mesh_xy = create_mesh_2d()
+        # n_occ-aware band split: load_bse_data_from_restart_sharded
+        # auto-detects valence by ``mean_enk < fermi_energy``; user-given
+        # n_occ replaces that detection identically to _load_ring_subset.
+        # We pass fermi_energy=0.0 (default) and rely on enk_full's reference.
+        data = load_bse_data_from_restart_sharded(
+            restart_file, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,
+            input_file=input_file, n_occ=n_occ,
+        )
+        # EQP override on enk_full (BGW eqp1.dat semantics).
+        if eqp_file is not None:
+            from .bse_io import apply_eqp_corrections
+            import numpy as _np
+            # Re-derive full enk and band-slice indices to apply EQP, then
+            # update eps_v / eps_c slices in-place. Simpler: reload enk
+            # and re-apply slicing.
+            with __import__('h5py').File(restart_file, "r") as f:
+                enk_full_np = _np.asarray(f["enk_full"][:])
+            enk_full_np = apply_eqp_corrections(
+                enk_full_np, eqp_file, input_file=input_file)
+            mean_enk = _np.mean(enk_full_np, axis=0)
+            n_occ_eff = n_occ if n_occ is not None else int((mean_enk < 0.0).sum())
+            val_idx = _np.arange(n_occ_eff - n_val, n_occ_eff)
+            cond_idx = _np.arange(n_occ_eff, n_occ_eff + n_cond)
+            data["eps_v"] = jnp.asarray(enk_full_np[:, val_idx])
+            data["eps_c"] = jnp.asarray(enk_full_np[:, cond_idx])
+            # Pad to match psi_v_X / psi_c_X band axes.
+            from .bse_io import _pad_axis_to_multiple
+            grid_x, grid_y = mesh_xy.devices.shape
+            data["eps_v"], _ = _pad_axis_to_multiple(data["eps_v"], axis=1, multiple=grid_y)
+            data["eps_c"], _ = _pad_axis_to_multiple(data["eps_c"], axis=1, multiple=grid_x)
+        nkx = data["nkx"]; nky = data["nky"]; nkz = data["nkz"]
+        nk = nkx * nky * nkz
+        nc_pad = int(data["n_cond_pad"])
+        nv_pad = int(data["n_val_pad"])
+        bse_dim = nc_pad * nv_pad * nk
+        print(f"BSE problem (sharded {grid_x}x{grid_y}): "
+              f"{nc_pad} cond × {nv_pad} val × {nk} k = {bse_dim} dim")
+        if max_lanczos_iter is None:
+            max_lanczos_iter = max(30, min(200, bse_dim // 2))
+        print(f"Lanczos: {max_lanczos_iter} iterations")
+        eigenvalues, eigenvectors = solve_bse_sharded(
+            data, mesh_xy, n_eig=n_eig, max_iter=max_lanczos_iter,
+            include_W=include_W,
+        )
+    else:
+        payload = _load_ring_subset(
+            restart_file,
+            n_val,
+            n_cond,
+            1,
+            1,
+            eqp_file=eqp_file,
+            n_occ=n_occ,
+            input_file=input_file,
+        )
+        psi_c = payload["psi_c"]
+        psi_v = payload["psi_v"]
+        eps_c = payload["eps_c"]
+        eps_v = payload["eps_v"]
+        W_q = payload["W_q"]
+        V_q0 = payload["V_q0"]
+        nkx = payload["nkx"]
+        nky = payload["nky"]
+        nkz = payload["nkz"]
 
-    if max_lanczos_iter is None:
-        max_lanczos_iter = max(30, min(200, bse_dim // 2))
-    print(f"Lanczos: {max_lanczos_iter} iterations")
+        nk = nkx * nky * nkz
+        nc_actual = psi_c.shape[1]
+        nv_actual = psi_v.shape[1]
+        bse_dim = nc_actual * nv_actual * nk
+        print(f"BSE problem: {nc_actual} cond x {nv_actual} val x {nk} k = {bse_dim} dimension")
 
-    eigenvalues, eigenvectors = solve_bse(
-        psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz,
-        n_eig=n_eig, max_iter=max_lanczos_iter, include_W=include_W,
-    )
+        if max_lanczos_iter is None:
+            max_lanczos_iter = max(30, min(200, bse_dim // 2))
+        print(f"Lanczos: {max_lanczos_iter} iterations")
+
+        eigenvalues, eigenvectors = solve_bse(
+            psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz,
+            n_eig=n_eig, max_iter=max_lanczos_iter, include_W=include_W,
+        )
     ryd2ev = 13.6056980659
     print(f"Lowest {n_eig} eigenvalues (Ry): {eigenvalues}")
     print(f"Lowest {n_eig} eigenvalues (eV): {eigenvalues * ryd2ev}")

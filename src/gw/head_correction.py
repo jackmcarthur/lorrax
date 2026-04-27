@@ -598,3 +598,64 @@ def apply_q0_head_rank1(
         W_qmunu = W_qmunu.at[..., 0, 0, 0, :, :].add(w_scalar * g0g0)
 
     return V_qmunu, W_qmunu
+
+
+def apply_q0_head_rank1_sharded(
+    V_q0: jnp.ndarray,
+    W_q: jnp.ndarray | None,
+    g0_X: jnp.ndarray,
+    g0_Y: jnp.ndarray,
+    vhead: complex | float | None,
+    whead: jnp.ndarray | complex | float | None,
+    cell_volume: float,
+    *,
+    omega_index: int = 0,
+):
+    """Sharded q=0 head injection — local on every proc.
+
+    Variant of :func:`apply_q0_head_rank1` for the BSE-side sharded
+    (``P("x", "y")``-on-(μ,ν)) tensors loaded by
+    :func:`bse_io.load_bse_data_from_restart_sharded`.
+
+    The single replicated G0 vector is split into two complementary
+    sharded copies:
+
+      - ``g0_X``: shape ``(n_rmu,)``, sharded ``P("x")`` on the μ-axis.
+      - ``g0_Y``: shape ``(n_rmu,)``, sharded ``P("y")`` on the ν-axis.
+
+    On every (X_proc, Y_proc) tile of V_q0 / W_q the rank-1 update
+
+        local += (scalar / V_cell) · conj(g0_X_local)[:, None] · g0_Y_local[None, :]
+
+    is fully local — no collectives, no all-gather. The two copies make
+    the broadcast operands shaped to match each proc's local tile shape.
+
+    Args:
+        V_q0:    ``(n_μ, n_ν)``,                     sharded ``P("x", "y")``.
+        W_q:     ``(n_μ, n_ν, nkx, nky, nkz)`` or ``None``,
+                 sharded ``P("x", "y", None, None, None)`` if not None.
+        g0_X:    ``(n_μ,)`` sharded ``P("x")`` — μ-axis copy of ζ(0,μ,G=0).
+        g0_Y:    ``(n_ν,)`` sharded ``P("y")`` — ν-axis copy of ζ(0,ν,G=0).
+        vhead:   scalar or None.
+        whead:   scalar / ``(n_omega,)`` / None.
+        cell_volume: V_cell in Bohr³.
+        omega_index: which slot of ``whead`` to apply (default 0 = static).
+
+    Returns:
+        (V_q0, W_q) with q=0 head injected. Inputs not updated returned unchanged.
+    """
+    inv_V = 1.0 / float(cell_volume)
+    g0g0 = jnp.conj(g0_X)[:, None] * g0_Y[None, :]                  # (n_μ, n_ν), P("x","y")
+
+    if vhead is not None:
+        v_scalar = jnp.asarray(complex(vhead) * inv_V, dtype=V_q0.dtype)
+        V_q0 = V_q0 + v_scalar * g0g0
+
+    if W_q is not None and whead is not None:
+        whead_arr = jnp.asarray(whead, dtype=jnp.complex128)
+        w_val = whead_arr if whead_arr.ndim == 0 else whead_arr[omega_index]
+        w_scalar = jnp.asarray(w_val * inv_V, dtype=W_q.dtype)
+        # W_q layout: (n_μ, n_ν, nkx, nky, nkz). Add to the q=0 slice only.
+        W_q = W_q.at[:, :, 0, 0, 0].add(w_scalar * g0g0)
+
+    return V_q0, W_q
