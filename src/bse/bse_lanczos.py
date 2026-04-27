@@ -144,16 +144,22 @@ def solve_bse_sharded(
     bs = int(block_size)
     shape = (bs, nc_pad, nv_pad, nk)
 
-    # ``low_mem`` selects the per-iter T-encoding:
-    #   True  → ring of ``lax.ppermute`` shifts (low memory peak).
-    #   False → ``lax.all_gather`` then local einsum (higher peak, single
-    #            collective, sometimes faster for small systems).
-    # ``data["low_mem"]`` lets the caller pick; default keeps the
-    # existing ring behaviour.
-    matvec_ring = build_bse_ring_matvec(
-        mesh_xy, nkx, nky, nkz, include_W=include_W,
-        low_mem=bool(data.get("low_mem", True)),
-    )
+    # Three matvec implementations are available:
+    #   "ring"   — shard_map + lax.ppermute (low memory peak; default).
+    #   "gather" — shard_map + lax.all_gather (higher peak, faster).
+    #   "simple" — plain jit + jnp.einsum + with_sharding_constraint;
+    #             no shard_map. XLA partitions automatically.
+    matvec_kind = data.get("matvec_kind", "ring")
+    if matvec_kind == "simple":
+        from .bse_simple import build_bse_simple_matvec
+        matvec_ring = build_bse_simple_matvec(
+            mesh_xy, nkx, nky, nkz, include_W=include_W,
+        )
+    else:
+        matvec_ring = build_bse_ring_matvec(
+            mesh_xy, nkx, nky, nkz, include_W=include_W,
+            low_mem=(matvec_kind == "ring"),
+        )
 
     # W_R = ifft_q(W_q) computed ONCE inside the outer jit. Use the
     # gw_jax custom-partitioned IFFT helper — plain ``jnp.fft.ifftn`` on
