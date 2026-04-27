@@ -41,9 +41,13 @@ import numpy as np
 from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from jax.experimental.shard_map import shard_map
+
 from common.fft_helpers import (
     make_jittable_local_fftn_3d,
     make_jittable_local_ifftn_3d,
+    make_sharded_fftn_3d,
+    make_sharded_ifftn_3d,
 )
 from .bse_ring_comm import make_bse_shardings
 
@@ -72,11 +76,15 @@ def build_bse_simple_matvec(
     nk = nkx * nky * nkz
     sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=jnp.float64))
 
-    # Custom-partitioned FFTs over k-axes 5,6,7 of the 8D T tensor.
+    # 3D FFT over k-axes 5,6,7 of the 8D T tensor, via cuFFT 3D plan in
+    # one shot (much fewer transposes than the 3-sequential-1D-FFT
+    # variant).  The shard_map is here only as an axis-name binding so
+    # XLA knows the FFT axes are replicated and the call is local — no
+    # ``lax.ppermute`` / collective inside.
     _T_8d_spec = P(None, "x", "y", None, None, None, None, None)
-    _T_local_ifftn = make_jittable_local_ifftn_3d(
+    _T_local_ifftn = make_sharded_ifftn_3d(
         mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
-    _T_local_fftn = make_jittable_local_fftn_3d(
+    _T_local_fftn = make_sharded_fftn_3d(
         mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
 
     def _matvec(
@@ -153,10 +161,9 @@ def build_bse_simple_matvec(
         T_k = T.reshape(T.shape[0], T.shape[1], T.shape[2],
                         T.shape[3], T.shape[4], nkx, nky, nkz)
         T_R = _T_local_ifftn(T_k)
-
-        # Pointwise: U_R = W_R[None, μ, ν, None, None, kx, ky, kz] · T_R.
-        # W_R P(x, y, None, None, None); T_R P(None, x, y, None, None, None, None, None).
-        # Aligned on (x, y). Local multiply — no comm.
+        # Pointwise multiply W_R · T_R (broadcasting over b, t, s).
+        # W_R sharded P(x,y,None,None,None); T_R sharded
+        # P(None,x,y,None,None,None,None,None); multiply is local.
         U_R = W_R[None, :, :, None, None, :, :, :] * T_R
         U_q = _T_local_fftn(U_R)
         U = U_q.reshape(U_q.shape[0], U_q.shape[1], U_q.shape[2],
