@@ -1032,12 +1032,31 @@ def vnl_velocity_autodiff(k_crys, psi_G, G_int, B, channels):
 # ═══════════════════════════════════════════════════════════════════════
 
 @jax.jit
+def apply_kinetic_velocity_to_ket(psi_G, G_int, k_crys, B):
+    """v_kin^α |n,k⟩ on the same G-sphere as ``psi_G``.  Returns
+    ``(3, nb, nspinor, nG)`` complex.
+
+    The kinetic velocity in Rydberg atomic units is
+    ``v_kin = 2(k + G)_cart`` (i.e. ``-i∇`` with the factor-of-2
+    Rydberg-momentum convention used by the rest of LORRAX); see
+    :func:`momentum_matrix_k` for the q=0 matrix-element wrapper.
+    Pulling the apply step out lets the q=0 dipole path AND the
+    finite-q SOS pipeline share a single source of truth for the
+    velocity operator.
+    """
+    K_cart = (G_int.astype(jnp.float64) + k_crys[None, :]) @ B            # (nG, 3)
+    return 2.0 * jnp.einsum('Gi,nsG->insG', K_cart, psi_G, optimize=True)
+
+
+@jax.jit
 def momentum_matrix_k(psi_G, G_int, k_crys, B):
-    """Kinetic part of velocity: p_i = 2(k+G)_i.  Returns (3, nb, nb)."""
-    K_cart = (G_int.astype(jnp.float64) + k_crys[None, :]) @ B
-    return 2.0 * jnp.einsum(
-        'msG,Gi,nsG->imn', jnp.conj(psi_G), K_cart, psi_G, optimize=True,
-    )
+    """Kinetic part of velocity: p_i = 2(k+G)_i.  Returns (3, nb, nb).
+
+    Thin bra-contraction wrapper around :func:`apply_kinetic_velocity_to_ket`.
+    """
+    v_ket = apply_kinetic_velocity_to_ket(psi_G, G_int, k_crys, B)         # (3, nb, ns, nG)
+    return jnp.einsum('msG,insG->imn', jnp.conj(psi_G), v_ket,
+                      optimize=True)
 
 
 def velocity_matrix_k(psi_G, G_int, k_crys, B, channels, *, Z_dZ_E=None):
