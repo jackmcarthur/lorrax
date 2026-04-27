@@ -23,11 +23,13 @@ the X/Y reshard.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from functools import partial
+
 import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from functools import partial
 
 from .htransform import build_fH_R, build_R_grid_np, newton_inv
 
@@ -84,10 +86,13 @@ def compute_wfns_fi(
         log_fn:    optional logger.
 
     Returns:
-        psi_rmu_Y:   (nk_fi, nb_fi, ns, n_μ),  P(None, None, None, 'y')
-        psi_rmuT_X:  (nk_fi, n_μ, nb_fi, ns),  P(None, 'x', None, None)
-        lam_fi:      (nk_fi, nb_fi)            f(ε_n,q) eigenvalues
-        energies_fi: (nk_fi, nb_fi)            recovered DFT energies (Ry)
+        SimpleNamespace bundle (matching ``file_io.tagged_arrays`` convention):
+            .psi_rmu_Y:  (nk_fi, nb_fi, ns, n_μ)  P(None, None, None, 'y')
+            .psi_rmuT_X: (nk_fi, n_μ, nb_fi, ns)  P(None, 'x', None, None)
+            .enk_full:   (nk_fi, nb_fi)           recovered DFT energies (Ry)
+                                                  via ``newton_inv`` of fH_q eigvals
+            .lam_fi:     (nk_fi, nb_fi)           raw fH_q eigenvalues (= f(ε_n,q))
+                                                  kept for diagnostics
 
     Both wfn copies live on-device and are sharding-distinct so any
     contraction over (n_μ) along either mesh axis stays local.
@@ -171,4 +176,9 @@ def compute_wfns_fi(
 
     psi_rmu_Y, psi_rmuT_X = _make_bundle(psi_fi)
     log(f"  bundle: psi_rmu_Y={psi_rmu_Y.shape}, psi_rmuT_X={psi_rmuT_X.shape}")
-    return psi_rmu_Y, psi_rmuT_X, lam_fi, energies_fi
+    return SimpleNamespace(
+        psi_rmu_Y=psi_rmu_Y,
+        psi_rmuT_X=psi_rmuT_X,
+        enk_full=energies_fi,
+        lam_fi=lam_fi,
+    )

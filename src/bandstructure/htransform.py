@@ -899,15 +899,18 @@ def main(argv=None):
         b_min = int(params["wfn_fi_min"])
         b_max = int(params["wfn_fi_max"]) or int(ctilde.shape[1])
         with mesh_xy:
-            psi_rmu_Y, psi_rmuT_X, lam_fi, energies_fi = compute_wfns_fi(
+            wfns_fi = compute_wfns_fi(
                 ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
                 kgrid_co=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
                 kgrid_fi=params["kgrid_fi"],
                 band_window_fi=(b_min, b_max),
                 mesh_xy=mesh_xy, a_band_index=args.a_band, log_fn=log,
             )
-        log(f"BSE setup: psi_rmu_Y={psi_rmu_Y.shape} P{psi_rmu_Y.sharding.spec}, "
-            f"psi_rmuT_X={psi_rmuT_X.shape} P{psi_rmuT_X.sharding.spec}")
+        log(f"BSE setup: psi_rmu_Y={wfns_fi.psi_rmu_Y.shape} "
+            f"P{wfns_fi.psi_rmu_Y.sharding.spec}, "
+            f"psi_rmuT_X={wfns_fi.psi_rmuT_X.shape} "
+            f"P{wfns_fi.psi_rmuT_X.sharding.spec}, "
+            f"enk_full={wfns_fi.enk_full.shape}")
 
     if args.plot:
         plot_bands(result)
