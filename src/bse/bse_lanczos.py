@@ -144,8 +144,15 @@ def solve_bse_sharded(
     bs = int(block_size)
     shape = (bs, nc_pad, nv_pad, nk)
 
+    # ``low_mem`` selects the per-iter T-encoding:
+    #   True  → ring of ``lax.ppermute`` shifts (low memory peak).
+    #   False → ``lax.all_gather`` then local einsum (higher peak, single
+    #            collective, sometimes faster for small systems).
+    # ``data["low_mem"]`` lets the caller pick; default keeps the
+    # existing ring behaviour.
     matvec_ring = build_bse_ring_matvec(
         mesh_xy, nkx, nky, nkz, include_W=include_W,
+        low_mem=bool(data.get("low_mem", True)),
     )
 
     # W_R = ifft_q(W_q) computed ONCE inside the outer jit. Use the
@@ -188,6 +195,18 @@ def solve_bse_sharded(
                     eps_c, eps_v, W_R, V_q0,
                 )
                 return HX.reshape(-1)
+            if rtol > 0.0:
+                # Convergence-driven path: route through the block-Lanczos
+                # while_loop with bs=1 (mathematically the same as a
+                # single-vector Lanczos with early exit).
+                def matvec_block(V_block):
+                    return matvec(V_block.reshape(-1)).reshape(1, -1)
+                return block_lanczos_eig_jit_converged(
+                    matvec_block, n_flat, n_eig=n_eig,
+                    block_size=1, max_iter=max_iter,
+                    rtol=rtol, atol=atol, check_every=check_every,
+                    n_reorth=n_reorth,
+                )
             evs, evecs = lanczos_eig_jit(
                 matvec, n_flat, n_eig=n_eig, max_iter=max_iter, n_reorth=n_reorth,
             )

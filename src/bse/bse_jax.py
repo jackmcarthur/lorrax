@@ -215,6 +215,7 @@ def _preview_lanczos(
     block_size: int = 1,
     rtol: float = 0.0,
     check_every: int = 4,
+    low_mem_t: bool = True,
 ) -> None:
     restart_file = _find_restart_file(input_file)
     n_devices = jax.device_count()
@@ -234,6 +235,8 @@ def _preview_lanczos(
             restart_file, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,
             input_file=input_file, n_occ=n_occ,
         )
+        # T-encoding strategy plumbed via the data dict (see solve_bse_sharded).
+        data["low_mem"] = low_mem_t
         # EQP override on enk_full (BGW eqp1.dat semantics).
         if eqp_file is not None:
             from .bse_io import apply_eqp_corrections
@@ -268,21 +271,22 @@ def _preview_lanczos(
         # ``max_lanczos_iter`` is the *total* Krylov dimension upper
         # bound; block path divides by block_size.
         block_max_iter = max(1, max_lanczos_iter // max(1, block_size))
+        mode = (f"convergence-driven (rtol={rtol:.1e}, every {check_every} iters)"
+                if rtol > 0 else "fixed")
         if block_size > 1:
-            mode = (f"convergence-driven (rtol={rtol:.1e}, every {check_every} iters)"
-                    if rtol > 0 else "fixed")
             print(f"Block Lanczos [{mode}]: ≤ {block_max_iter} block iter × "
                   f"block_size={block_size} = ≤ {block_max_iter * block_size} Krylov dim")
         else:
-            print(f"Lanczos: {max_lanczos_iter} iterations")
+            print(f"Lanczos [{mode}]: ≤ {block_max_iter} iterations")
         eigenvalues, eigenvectors, n_iter_done = solve_bse_sharded(
             data, mesh_xy, n_eig=n_eig, max_iter=block_max_iter,
             include_W=include_W, block_size=block_size,
             rtol=rtol, check_every=check_every,
         )
         n_done = int(n_iter_done)
-        if rtol > 0 and block_size > 1:
-            print(f"Block Lanczos exited at iter {n_done}/{block_max_iter} "
+        if rtol > 0:
+            tag = "Block Lanczos" if block_size > 1 else "Lanczos"
+            print(f"{tag} exited at iter {n_done}/{block_max_iter} "
                   f"(Krylov dim = {n_done * block_size})")
     else:
         payload = _load_ring_subset(
@@ -426,6 +430,14 @@ if __name__ == "__main__":
         type=int,
         default=4,
         help="Convergence check cadence in block iterations (default 4).",
+    )
+    parser.add_argument(
+        "--gather-t",
+        action="store_true",
+        help="Switch the T-encoding (W-contraction's first half) from "
+             "ring-ppermute to all-gather. Higher peak memory, single "
+             "collective per matvec instead of py-1 ring shifts; usually "
+             "faster on small problems.",
     )
     parser.add_argument("--kpm-dos", action="store_true", help="Run KPM Chebyshev DOS and exit.")
     parser.add_argument("--kpm-n-moments", type=int, default=100, help="Chebyshev moments M for KPM.")
@@ -579,6 +591,7 @@ if __name__ == "__main__":
         block_size=args.block_size,
         rtol=args.lanczos_rtol,
         check_every=args.lanczos_check_every,
+        low_mem_t=not args.gather_t,
     )
     raise SystemExit(0)
 
