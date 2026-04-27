@@ -135,6 +135,7 @@ def read_cohsex_input(filename: str) -> dict:
             "nband": geti("nband", fallback=100),
             "bispinor": getb("bispinor", fallback=False),
             "ecutrho_eV": section.getfloat("ecutrho", fallback=None),
+            "sys_dim": geti("sys_dim", fallback=3),
         }
     # Fallback defaults if no INI sections found
     return {
@@ -144,6 +145,7 @@ def read_cohsex_input(filename: str) -> dict:
         "nband": 100,
         "bispinor": False,
         "ecutrho_eV": None,
+        "sys_dim": 3,
     }
 
 
