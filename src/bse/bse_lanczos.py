@@ -154,6 +154,7 @@ def solve_bse_sharded(
         from .bse_simple import build_bse_simple_matvec
         matvec_ring = build_bse_simple_matvec(
             mesh_xy, nkx, nky, nkz, include_W=include_W,
+            fft_wrapper=data.get("fft_wrapper", "shard_map"),
         )
     else:
         matvec_ring = build_bse_ring_matvec(
