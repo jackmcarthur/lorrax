@@ -13,6 +13,7 @@ initializes QE-style projectors so downstream development can fill it in.
 
 import os
 import argparse
+import functools
 from pathlib import Path
 
 os.environ.setdefault("JAX_ENABLE_X64", "1")
@@ -98,6 +99,221 @@ def compute_projected_momentum_bgw_like(*args, **kwargs):
 def compute_block_direct_cnk(*args, **kwargs):
     raise NotImplementedError("Debug-only direct cnk path removed")
 
+
+# --------------------------
+# Finite-q matrix elements for SOS chi head/wing/S/w pipeline
+# --------------------------
+
+def _load_psi_box_full(wfn, sym, meta, nb_load: int) -> jax.Array:
+    """Load all unfolded ψ on the FFT box for finite-q overlaps.
+
+    Mirrors ``psp.run_sternheimer._load_unfolded_wfns`` but kept as a
+    private helper here so the dipole driver doesn't depend on the
+    Sternheimer module.  Returns ``(nk_full, nb_load, nspinor, nx, ny, nz)``
+    complex128 — same convention used by the SOS finite-q overlaps and
+    the Sternheimer χ-column pipeline.
+    """
+    from common.load_wfns import load_kpoint_fftbox
+    nk_full = int(sym.nk_tot)
+    psi_list = [load_kpoint_fftbox(wfn, sym, meta, ik, nb_load)
+                for ik in range(nk_full)]
+    return jnp.stack(psi_list, axis=0)
+
+
+@functools.partial(jax.jit, static_argnames=('fft_grid',))
+def _apply_kinetic_velocity_Gbox(psi_Gbox_k, kvec, bvec_blat, fft_grid):
+    """Compute v^α_kin |ψ_n,k⟩ in the G-space FFT-box layout.
+
+    ``load_kpoint_fftbox`` stores ``c_nk(G)`` scattered into an FFT-box
+    array (zero outside the G-sphere).  The kinetic velocity in G-space
+    is just an elementwise multiplication by ``(k + G)_cart^α`` — no
+    FFT.  Note: this matches the convention of
+    ``dft_operators.momentum_matrix_k``  (atomic-unit cartesian
+    velocity, no V_cell factor).
+
+    Parameters
+    ----------
+    psi_Gbox_k : (nb, nspinor, nx, ny, nz) complex128 — c_n,k(G) in box.
+    kvec       : (3,) float64 crystal coords.
+    bvec_blat  : (3, 3) float64 — blat·bvec (cartesian rec-lat).
+    fft_grid   : static (nx, ny, nz).
+
+    Returns
+    -------
+    (3, nb, nspinor, nx, ny, nz) — c_n,k(G) · (k+G)_cart^α per α.
+    """
+    nx, ny, nz = fft_grid
+    gx = jnp.fft.fftfreq(nx, d=1.0 / nx).astype(jnp.float64)
+    gy = jnp.fft.fftfreq(ny, d=1.0 / ny).astype(jnp.float64)
+    gz = jnp.fft.fftfreq(nz, d=1.0 / nz).astype(jnp.float64)
+    kGc_x = kvec[0] + gx[:, None, None]
+    kGc_y = kvec[1] + gy[None, :, None]
+    kGc_z = kvec[2] + gz[None, None, :]
+    kG_cart_x = (kGc_x * bvec_blat[0, 0] + kGc_y * bvec_blat[1, 0]
+                  + kGc_z * bvec_blat[2, 0])
+    kG_cart_y = (kGc_x * bvec_blat[0, 1] + kGc_y * bvec_blat[1, 1]
+                  + kGc_z * bvec_blat[2, 1])
+    kG_cart_z = (kGc_x * bvec_blat[0, 2] + kGc_y * bvec_blat[1, 2]
+                  + kGc_z * bvec_blat[2, 2])
+
+    return jnp.stack((
+        psi_Gbox_k * kG_cart_x[None, None, :, :, :].astype(psi_Gbox_k.dtype),
+        psi_Gbox_k * kG_cart_y[None, None, :, :, :].astype(psi_Gbox_k.dtype),
+        psi_Gbox_k * kG_cart_z[None, None, :, :, :].astype(psi_Gbox_k.dtype),
+    ), axis=0)
+
+
+@functools.partial(jax.jit, static_argnames=('fft_grid',))
+def _cell_overlaps_at_q_Gbox(
+    psi_Gbox_k_n, vpsi_Gbox_k_n, psi_Gbox_kmq_m_canonical, G_wrap, fft_grid,
+):
+    """G-space cell overlaps for one (k, q) pair — kinetic-only velocity.
+
+    Compute
+        rho_mn(k, q) = ⟨u_{m, k-q} | u_{n, k}⟩_cell
+        v_mn_α(k, q) = ⟨u_{m, k-q} | v^α | u_{n, k}⟩_cell  (kinetic part)
+
+    in G-space.  Umklapp from canonical-(k-q) to actual k-q is handled
+    via a 3-axis ``jnp.roll`` of the bra:
+        c_{m, k-q}(G) = c_{m, canonical}(G + G_wrap)
+                       = roll(c_{m, canonical}, shift=−G_wrap)(G)
+    so the bra in G-box is roll(c_can, −G_wrap_int) along the (gx, gy, gz)
+    axes.  No 1/N_grid factor — convention matches
+    ``momentum_matrix_k`` (sum over G of c* (k+G) c gives the AU velocity
+    matrix element directly).
+
+    Parameters
+    ----------
+    psi_Gbox_k_n            : (nb_n, nspinor, nx, ny, nz)
+    vpsi_Gbox_k_n           : (3, nb_n, nspinor, nx, ny, nz)
+    psi_Gbox_kmq_m_canonical : (nb_m, nspinor, nx, ny, nz)
+    G_wrap                  : (3,) int32 — umklapp shift for THIS (k, q).
+    fft_grid                : static.
+
+    Returns
+    -------
+    rho_mn   : (nb_m, nb_n) complex128
+    v_mn_alp : (3, nb_m, nb_n) complex128
+    """
+    # Roll the bra by −G_wrap along the 3 G-axes (last 3).
+    # ``shift`` is the number of places to shift TOWARDS HIGHER indices;
+    # roll(x, +s)[i] = x[i − s].  We want bra[G] = c_can[G + G_wrap], so
+    # shift = −G_wrap.
+    # G_wrap is a 3-vector traced under vmap; jnp.roll accepts traced
+    # shifts in modern JAX, but we re-roll one axis at a time so the
+    # codepath is robust across versions.
+    bra_can = jnp.conj(psi_Gbox_kmq_m_canonical)
+    bra = jnp.roll(bra_can, shift=-G_wrap[0], axis=-3)
+    bra = jnp.roll(bra,     shift=-G_wrap[1], axis=-2)
+    bra = jnp.roll(bra,     shift=-G_wrap[2], axis=-1)
+
+    rho_mn = jnp.einsum('msxyz,nsxyz->mn', bra, psi_Gbox_k_n,
+                          optimize=True)
+    v_mn_alp = jnp.einsum('msxyz,ansxyz->amn', bra, vpsi_Gbox_k_n,
+                          optimize=True)
+    return rho_mn, v_mn_alp
+
+
+def compute_finite_q_mtxels(
+    wfn, sym, meta, vnl_setup,
+    *,
+    iq_list: list[int],
+    nb_load: int,
+    nv_block: int,
+    nc_block: int,
+    verbose: bool = True,
+):
+    """Driver: produce per-(k, iq, c, v) finite-q matrix elements.
+
+    Returns numpy arrays:
+      rho_cvkq[nc, nv, nk, nq] complex128  — h_t(q) = ⟨u_{c, k-q} | u_{v, k}⟩_cell
+      v_cvkq[3, nc, nv, nk, nq] complex128 — kinetic v^α part of
+                                              ⟨u_{c, k-q} | v^α u_{v, k}⟩_cell
+      kminq_idx[nk, nq] int32 — per-(ik, iq) lookup (= sym.kq_map[:, iq_list])
+
+    Notes
+    -----
+    Stores ONLY the c-v block (m ∈ conduction = [n_occ, n_occ + nc_block),
+    n ∈ valence = [n_occ - nv_block, n_occ)) since that is what the SOS
+    head/wing chi formulas need.  Memory budget at MoS₂ 3×3 (nk=9, nq=9,
+    nv=26, nc=20): ~67 KB for ``rho`` and 200 KB for ``v_α`` — trivial.
+
+    The VNL-velocity contribution is *not* yet included here — only the
+    kinetic ``(k+G)_cart`` piece — pending a vmap-friendly finite-q
+    extension of ``compute_vnl_velocity_cart``.  Document and TODO.
+    """
+    from common.kq_mapping import kminq_idx_for_iq, umklapp_G_wrap
+
+    nk_full = int(sym.nk_tot)
+    fft_grid = tuple(int(v) for v in wfn.fft_grid)
+    bvec_blat = jnp.asarray(np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat),
+                             dtype=jnp.float64)
+    n_occ = int(wfn.nelec)
+
+    # Bands actually loaded into psi_box_full: at least n_occ + nc_block
+    nb_eff = max(int(nb_load), n_occ + int(nc_block))
+    nb_eff = min(nb_eff, int(wfn.nbands))
+    if verbose:
+        print(f"  finite-q: loading psi_box_full  (nk={nk_full}, nb={nb_eff}, "
+              f"FFT={fft_grid})")
+    psi_box_full = _load_psi_box_full(wfn, sym, meta, nb_eff)
+
+    # Slice once: bra = m∈conduction band range, ket = n∈valence band range.
+    v_lo = max(0, n_occ - int(nv_block))
+    c_lo = n_occ
+    c_hi = min(n_occ + int(nc_block), nb_eff)
+    psi_v_full = psi_box_full[:, v_lo:n_occ]                       # (nk, nv, ns, ...)
+    psi_c_full = psi_box_full[:, c_lo:c_hi]                        # (nk, nc, ns, ...)
+    nc_eff = c_hi - c_lo
+    nv_eff = n_occ - v_lo
+
+    # Per source-k, multiply c_n,k(G) by (k+G)_cart^α once — gives v^α u_n,k
+    # in the same G-box layout as the wfn.
+    if verbose:
+        print(f"  finite-q: applying kinetic velocity to {nv_eff} valence × "
+              f"{nk_full} k-points")
+    kpts_full = jnp.asarray(np.asarray(sym.unfolded_kpts, dtype=np.float64),
+                              dtype=jnp.float64)
+    def _per_k_v(kvec, psi_Gbox_k):
+        return _apply_kinetic_velocity_Gbox(
+            psi_Gbox_k, kvec, bvec_blat, fft_grid=fft_grid)
+    vpsi_v_full = jax.vmap(_per_k_v)(kpts_full, psi_v_full)        # (nk, 3, nv, ns, nx, ny, nz)
+    vpsi_v_full.block_until_ready()
+
+    nq = len(iq_list)
+    rho_cvkq = np.zeros((nc_eff, nv_eff, nk_full, nq), dtype=np.complex128)
+    v_cvkq   = np.zeros((3, nc_eff, nv_eff, nk_full, nq), dtype=np.complex128)
+    kminq_idx_kq = np.zeros((nk_full, nq), dtype=np.int32)
+
+    for jq, iq_red in enumerate(iq_list):
+        kminq_idx = kminq_idx_for_iq(sym, iq_red)                  # (nk_full,)
+        kminq_idx_kq[:, jq] = kminq_idx
+
+        qvec_pos = np.asarray(wfn.kpoints[iq_red], dtype=np.float64)
+        qvec = qvec_pos - np.round(qvec_pos)
+        qvec_j = jnp.asarray(qvec, dtype=jnp.float64)
+
+        kvec_kmq_full = kpts_full[jnp.asarray(kminq_idx)]
+        G_wrap = umklapp_G_wrap(kpts_full, kvec_kmq_full, qvec_j)  # (nk_full, 3)
+
+        psi_c_kmq = psi_c_full[jnp.asarray(kminq_idx)]             # (nk_full, nc, ns, ...)
+
+        def _per_k_overlap(psi_v_k, vpsi_v_k, psi_c_kmq_k, G_wrap_k):
+            return _cell_overlaps_at_q_Gbox(
+                psi_v_k, vpsi_v_k, psi_c_kmq_k, G_wrap_k, fft_grid)
+
+        rho_kc_v, v_kca_v = jax.vmap(_per_k_overlap)(
+            psi_v_full, vpsi_v_full, psi_c_kmq, G_wrap)
+        rho_kc_v.block_until_ready()
+        rho_cvkq[:, :, :, jq] = np.moveaxis(np.asarray(rho_kc_v), 0, 2)
+        v_cvkq[:, :, :, :, jq] = np.moveaxis(np.asarray(v_kca_v), (0, 1), (3, 0))
+        if verbose:
+            print(f"    iq={iq_red:>3d}  q_signed={tuple(float(v) for v in qvec)}  "
+                  f"|rho|_∞={float(np.max(np.abs(rho_kc_v))):.3e}  "
+                  f"|v|_∞={float(np.max(np.abs(v_kca_v))):.3e}")
+
+    return rho_cvkq, v_cvkq, kminq_idx_kq, n_occ, v_lo, c_hi
+
 # --------------------------
 # Main driver
 # --------------------------
@@ -149,6 +365,21 @@ def main(argv=None):
 		type=int,
 		default=1,
 		help="k-point index to use for --debug table (0-based). Default: 1",
+	)
+	parser.add_argument(
+		"--with-finite-q",
+		action="store_true",
+		help="Also compute finite-q SOS matrix elements rho_mnkq + v_mnkq "
+			 "for the c-v block on a list of reduced-BZ q-points.  Output "
+			 "datasets are added to dipole.h5 alongside the existing q=0 "
+			 "(dipole_cart, deltaE) blocks.",
+	)
+	parser.add_argument(
+		"--iq-list",
+		type=int,
+		nargs='+',
+		default=None,
+		help="Reduced-BZ q-indices for --with-finite-q (default: all 0..nk-1).",
 	)
 	args = parser.parse_args(argv)
 
@@ -348,6 +579,27 @@ def main(argv=None):
 				print(f"  {fn10:.6f} {fn11:.6f} {fn12:.6f}")
 
 
+	# Optional: finite-q matrix elements for the SOS chi head/wing/S/w pipeline.
+	rho_cvkq = v_cvkq = kminq_idx_kq = None
+	cv_meta = None
+	if args.with_finite_q:
+		print("\nComputing finite-q matrix elements (SOS pipeline)...")
+		iq_list = args.iq_list if args.iq_list is not None else list(range(int(sym.nk_tot)))
+		rho_cvkq, v_cvkq, kminq_idx_kq, n_occ_eff, v_lo, c_hi = compute_finite_q_mtxels(
+			wfn, sym, meta, vnl_setup,
+			iq_list=iq_list,
+			nb_load=nband_eff,
+			nv_block=int(nval),
+			nc_block=int(ncond),
+			verbose=True,
+		)
+		cv_meta = {
+			'iq_list': np.asarray(iq_list, dtype=np.int32),
+			'n_occ': int(n_occ_eff),
+			'v_lo': int(v_lo),
+			'c_hi': int(c_hi),
+		}
+
 	# Save to dipole.h5 with deltaE
 	out_path = Path('dipole.h5').resolve()
 	with h5py.File(str(out_path), 'w') as h5:
@@ -356,6 +608,20 @@ def main(argv=None):
 		h5.attrs['nbands'] = int(wfn.nbands)
 		h5.attrs['nk'] = int(sym.nk_tot)
 		h5.attrs['note'] = 'dipole_cart[3,x,y] = p_i + i[r_i, V_NL]; deltaE[k,:,:] = E_b - E_b\''
+		if rho_cvkq is not None:
+			fq = h5.create_group('finite_q')
+			fq.create_dataset('rho_cvkq', data=rho_cvkq)         # (nc, nv, nk, nq)
+			fq.create_dataset('v_cvkq',   data=v_cvkq)           # (3, nc, nv, nk, nq)
+			fq.create_dataset('kminq_idx', data=kminq_idx_kq)    # (nk, nq)
+			fq.create_dataset('iq_list',   data=cv_meta['iq_list'])
+			fq.attrs['n_occ']   = cv_meta['n_occ']
+			fq.attrs['v_lo']    = cv_meta['v_lo']
+			fq.attrs['c_hi']    = cv_meta['c_hi']
+			fq.attrs['note'] = (
+				"rho_cvkq[c, v, k, q] = <u_{c, k-q}|u_{v, k}>_cell; "
+				"v_cvkq[a, c, v, k, q] = <u_{c, k-q}|v^a u_{v, k}>_cell "
+				"(KINETIC velocity only — VNL contribution TBD); "
+				"kminq_idx[k, q] = canonical k-q index in unfolded_kpts.")
 	print(f"\nWrote dipole data to {out_path}")
 
 

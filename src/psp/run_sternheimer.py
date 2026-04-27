@@ -948,24 +948,14 @@ def _build_stk_at_q(
     U_kmq_G    = U_kmq_G_full[kminq_idx]
     kvec_kmq   = kvec_kmq_full[kminq_idx]
 
-    # Per-source-k umklapp G_wrap, phases.
-    G_wrap_int = jnp.round(
-        (kvec_kmq_full - qvec[None, :]) - kvec_kmq).astype(jnp.int32)
-
-    nx, ny, nz = fft_grid_static
-    fx = jnp.arange(nx, dtype=jnp.float64) / nx
-    fy = jnp.arange(ny, dtype=jnp.float64) / ny
-    fz = jnp.arange(nz, dtype=jnp.float64) / nz
-
-    def _phase_for_k(G_wrap, sign):
-        arg = (2.0 * jnp.pi * sign) * (
-            G_wrap[0].astype(jnp.float64) * fx[:, None, None]
-            + G_wrap[1].astype(jnp.float64) * fy[None, :, None]
-            + G_wrap[2].astype(jnp.float64) * fz[None, None, :])
-        return jnp.exp(1j * arg).astype(jnp.complex128)
-
-    phase_wrap_stack   = jax.vmap(_phase_for_k, in_axes=(0, None))(G_wrap_int, +1.0)
-    phase_unwrap_stack = jax.vmap(_phase_for_k, in_axes=(0, None))(G_wrap_int, -1.0)
+    # Per-source-k umklapp G_wrap and phase factors.  Shared plumbing in
+    # ``common.kq_mapping`` is the single source of truth used by both the
+    # Sternheimer pipeline (this function) and the SOS finite-q matrix
+    # element pipeline (``common.chi_sos`` + ``get_dipole_mtxels``).
+    from common.kq_mapping import umklapp_G_wrap, umklapp_phase_box_batched
+    G_wrap_int = umklapp_G_wrap(kvec_kmq_full, kvec_kmq, qvec)
+    phase_wrap_stack   = umklapp_phase_box_batched(G_wrap_int, fft_grid_static, +1.0)
+    phase_unwrap_stack = umklapp_phase_box_batched(G_wrap_int, fft_grid_static, -1.0)
     V_pert_real_stack  = V_pert_base[None, :, :, :] * phase_wrap_stack
 
     def _vu_for_k(U_k_box_one, Gk_int_kmq_one, V_pert_real_one, mask_kmq_one):
@@ -1342,7 +1332,8 @@ def run_sternheimer(
 
         Gprime_int = build_Gprime_list(qvec, wfn, ng_out)
         Gprime_j = jnp.asarray(Gprime_int)
-        kminq_idx_j = jnp.asarray(np.asarray(sym.kq_map[:, iq_red], dtype=np.int32))
+        from common.kq_mapping import kminq_idx_for_iq
+        kminq_idx_j = jnp.asarray(kminq_idx_for_iq(sym, iq_red))
         qvec_j = jnp.asarray(qvec, dtype=jnp.float64)
 
         t_q = time.perf_counter()
