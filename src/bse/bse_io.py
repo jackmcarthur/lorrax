@@ -304,6 +304,10 @@ def load_bse_data_from_restart_sharded(
     fermi_energy: float = 0.0,
     mesh_xy: Optional[Mesh] = None,
     pad_bands: bool = True,
+    *,
+    input_file: Optional[str] = None,
+    cell_volume: Optional[float] = None,
+    n_occ: Optional[int] = None,
 ) -> dict:
     """Load BSE tensors from canonical gw_jax restart state (psi_full_y/enk_full)."""
     if mesh_xy is None:
@@ -329,21 +333,36 @@ def load_bse_data_from_restart_sharded(
         if n_rmu != n_rnu:
             raise ValueError("Expected square μ/ν dimensions in V_qmunu")
 
-        mean_enk_full = np.mean(enk_full, axis=0)
-        val_mask = mean_enk_full < fermi_energy
-        cond_mask = mean_enk_full > fermi_energy
-        n_val_available = int(np.sum(val_mask))
-        n_cond_available = int(np.sum(cond_mask))
-        if n_val > n_val_available:
-            print(f"Warning: requested {n_val} valence bands but only {n_val_available} available; using {n_val_available}")
-        if n_cond > n_cond_available:
-            print(f"Warning: requested {n_cond} conduction bands but only {n_cond_available} available; using {n_cond_available}")
-        n_val = min(n_val, n_val_available)
-        n_cond = min(n_cond, n_cond_available)
-        if n_val == 0 or n_cond == 0:
-            raise ValueError("No valence or conduction bands found for given Fermi energy")
-        val_indices = np.argsort(np.where(val_mask, mean_enk_full, -np.inf))[-n_val:]
-        cond_indices = np.argsort(np.where(cond_mask, mean_enk_full, np.inf))[:n_cond]
+        if n_occ is not None:
+            # Explicit nelec → bypass the mean-enk auto-detect (which is
+            # fragile when EQP overrides shift the enk reference).
+            nb_total = int(enk_full.shape[1])
+            n_val_available = int(n_occ)
+            n_cond_available = nb_total - int(n_occ)
+            if n_val > n_val_available:
+                print(f"Warning: requested {n_val} valence bands but only {n_val_available} available; using {n_val_available}")
+            if n_cond > n_cond_available:
+                print(f"Warning: requested {n_cond} conduction bands but only {n_cond_available} available; using {n_cond_available}")
+            n_val = min(n_val, n_val_available)
+            n_cond = min(n_cond, n_cond_available)
+            val_indices = np.arange(n_occ - n_val, n_occ)
+            cond_indices = np.arange(n_occ, n_occ + n_cond)
+        else:
+            mean_enk_full = np.mean(enk_full, axis=0)
+            val_mask = mean_enk_full < fermi_energy
+            cond_mask = mean_enk_full > fermi_energy
+            n_val_available = int(np.sum(val_mask))
+            n_cond_available = int(np.sum(cond_mask))
+            if n_val > n_val_available:
+                print(f"Warning: requested {n_val} valence bands but only {n_val_available} available; using {n_val_available}")
+            if n_cond > n_cond_available:
+                print(f"Warning: requested {n_cond} conduction bands but only {n_cond_available} available; using {n_cond_available}")
+            n_val = min(n_val, n_val_available)
+            n_cond = min(n_cond, n_cond_available)
+            if n_val == 0 or n_cond == 0:
+                raise ValueError("No valence or conduction bands found for given Fermi energy")
+            val_indices = np.argsort(np.where(val_mask, mean_enk_full, -np.inf))[-n_val:]
+            cond_indices = np.argsort(np.where(cond_mask, mean_enk_full, np.inf))[:n_cond]
 
         eps_v = jnp.asarray(enk_full[:, val_indices])
         eps_c = jnp.asarray(enk_full[:, cond_indices])
@@ -371,6 +390,58 @@ def load_bse_data_from_restart_sharded(
         V_q0 = _read_vq0_sharded(vq_dset, mu_per_x, nu_per_y, mesh_xy, n_rmu_pad, trim=False)
         W_q = _read_wq_sharded(wq_dset, mu_per_x, nu_per_y, mesh_xy, n_rmu_pad, trim=False)
 
+        # ── q=0 head: load G0_mu_nu, dual-shard X/Y, inject as rank-1 ────
+        # On the (μ,ν)-sharded V_q0 and W_q tensors, the rank-1 update
+        # ``conj(g0_X[μ_loc]) * g0_Y[ν_loc]`` is local on every proc when
+        # g0 is held in TWO copies — one P("x") on μ, one P("y") on ν.
+        # Source priority: cohsex.in overrides → restart vhead/whead.
+        if "G0_mu_nu" in f:
+            G0_full = np.asarray(f["G0_mu_nu"][:], dtype=np.complex128)
+            if G0_full.size < n_rmu_pad:
+                G0_pad = np.zeros((n_rmu_pad,), dtype=np.complex128)
+                G0_pad[:G0_full.size] = G0_full
+                G0_full = G0_pad
+            g0_X = jax.device_put(jnp.asarray(G0_full),
+                                  NamedSharding(mesh_xy, P("x")))
+            g0_Y = jax.device_put(jnp.asarray(G0_full),
+                                  NamedSharding(mesh_xy, P("y")))
+            vhead_restart = (complex(f["vhead"][()])
+                             if "vhead" in f else None)
+            whead_restart = (jnp.asarray(f["whead"][:], dtype=jnp.complex128)
+                             if "whead" in f else None)
+        else:
+            g0_X = g0_Y = None
+            vhead_restart = whead_restart = None
+
+    if g0_X is not None:
+        vhead_in, whead0_in = _parse_head_overrides(input_file)
+        vhead = vhead_in if vhead_in is not None else vhead_restart
+        if whead0_in is not None:
+            whead = jnp.asarray([whead0_in], dtype=jnp.complex128)
+        else:
+            whead = whead_restart
+
+        # cell_volume: caller may pass directly; otherwise pull from WFN.
+        if cell_volume is None and input_file is not None:
+            try:
+                from file_io import WFNReader
+                cell_volume = float(WFNReader(_parse_wfn_path(input_file)).cell_volume)
+            except Exception as exc:
+                print(f"BSE sharded load: cell_volume unresolved ({exc}); skipping head")
+                cell_volume = None
+
+        if cell_volume is not None and (vhead is not None or whead is not None):
+            from gw.head_correction import apply_q0_head_rank1_sharded
+            V_q0, W_q = apply_q0_head_rank1_sharded(
+                V_q0, W_q, g0_X, g0_Y, vhead, whead, cell_volume,
+                omega_index=0)
+            v_str = (f"vhead={complex(vhead).real:.3f}"
+                     if vhead is not None else "vhead=skipped")
+            w_str = (f"whead[0]={complex(whead[0]).real:.3f}"
+                     if whead is not None else "whead=skipped")
+            print(f"BSE-sharded: q=0 head injected (rank-1, dual-sharded G0, "
+                  f"V_cell={cell_volume:.2f}): {v_str}, {w_str}")
+
     return {
         "psi_c_X": psi_c_X,
         "psi_c_Y": psi_c_Y,
@@ -380,6 +451,8 @@ def load_bse_data_from_restart_sharded(
         "eps_v": eps_v,
         "W_q": W_q,
         "V_q0": V_q0,
+        "g0_X": g0_X,
+        "g0_Y": g0_Y,
         "nkx": nkx,
         "nky": nky,
         "nkz": nkz,

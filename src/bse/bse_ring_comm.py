@@ -88,7 +88,6 @@ def _ring_sum_valence(
         buf = lax.ppermute(buf, axis_name="y", perm=perm)
         return buf, R
 
-    R0 = lax.pcast(R0, axis_name=("x", "y"), to="varying")
     _, R_total = lax.fori_loop(0, py, step, (X, R0))
     return R_total
 
@@ -119,7 +118,6 @@ def _ring_sum_conduction(
         buf = lax.ppermute(buf, axis_name="x", perm=perm)
         return buf, T
 
-    T0 = lax.pcast(T0, axis_name=("x", "y"), to="varying")
     _, T_total = lax.fori_loop(0, px, step, (R, T0))
     return T_total
 
@@ -151,7 +149,6 @@ def _ring_sum_conduction_first(
         buf = lax.ppermute(buf, axis_name="x", perm=perm)
         return buf, R
 
-    R0 = lax.pcast(R0, axis_name=("x", "y"), to="varying")
     _, R_total = lax.fori_loop(0, px, step, (X, R0))
     return R_total
 
@@ -183,7 +180,6 @@ def _ring_sum_valence_second(
         buf = lax.ppermute(buf, axis_name="y", perm=perm)
         return buf, T
 
-    T0 = lax.pcast(T0, axis_name=("x", "y"), to="varying")
     _, T_total = lax.fori_loop(0, py, step, (R, T0))
     return T_total
 
@@ -271,7 +267,6 @@ def apply_V_ring(
         buf = lax.ppermute(buf, axis_name="y", perm=perm_y)
         return buf, A
 
-    A0 = lax.pcast(A0, axis_name=("x", "y"), to="varying")
     _, A_local = lax.fori_loop(0, py, step_y, (X, A0))
 
     S0 = jnp.zeros((nb_trial, nu_local, nk_local), dtype=X.dtype)
@@ -283,7 +278,6 @@ def apply_V_ring(
         buf = lax.ppermute(buf, axis_name="x", perm=perm_x)
         return buf, S
 
-    S0 = lax.pcast(S0, axis_name=("x", "y"), to="varying")
     _, S_total = lax.fori_loop(0, px, step_x, (A_local, S0))
 
     S_total = S_total / sqrt_nk
@@ -366,7 +360,6 @@ def build_bse_ring_matvec(
         mesh=mesh_xy,
         in_specs=(P(None, "x", "y", None), P(None, None, None, "x"), P(None, None, None, "y")),
         out_specs=P(None, "x", "y", None, None, None),
-        axis_names={"x", "y"},
     )
 
     def _encode_T_gather(X, psi_c_X, psi_v_Y):
@@ -381,7 +374,6 @@ def build_bse_ring_matvec(
         mesh=mesh_xy,
         in_specs=(P(None, "x", "y", None), P(None, None, None, "x"), P(None, None, None, "y")),
         out_specs=P(None, "x", "y", None, None, None),
-        axis_names={"x", "y"},
     )
 
     def _apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0):
@@ -393,7 +385,6 @@ def build_bse_ring_matvec(
         in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"),
                   P(None, None, None, "x"), P(None, None, None, "x"), P("x", "y")),
         out_specs=P(None, "x", "y", None),
-        axis_names={"x", "y"},
     )
 
     def _apply_W_from_T(T, psi_c_X, psi_v_Y, W_R):
@@ -501,7 +492,6 @@ def build_bse_ring_matvec_full(
         mesh=mesh_xy,
         in_specs=(P(None, "x", "y", None), P(None, None, None, "x"), P(None, None, None, "y")),
         out_specs=P(None, "x", "y", None, None, None),
-        axis_names={"x", "y"},
     )
 
     def _encode_T_gather(X, psi_c_X, psi_v_Y):
@@ -516,7 +506,6 @@ def build_bse_ring_matvec_full(
         mesh=mesh_xy,
         in_specs=(P(None, "x", "y", None), P(None, None, None, "x"), P(None, None, None, "y")),
         out_specs=P(None, "x", "y", None, None, None),
-        axis_names={"x", "y"},
     )
 
     def _encode_T_B(X, psi_c_Y, psi_v_X):
@@ -533,7 +522,6 @@ def build_bse_ring_matvec_full(
         mesh=mesh_xy,
         in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "x")),
         out_specs=P(None, "x", "y", None, None, None),
-        axis_names={"x", "y"},
     )
 
     def _encode_T_B_gather(X, psi_c_Y, psi_v_X):
@@ -548,7 +536,6 @@ def build_bse_ring_matvec_full(
         mesh=mesh_xy,
         in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "x")),
         out_specs=P(None, "x", "y", None, None, None),
-        axis_names={"x", "y"},
     )
 
     def _apply_V_ring_only(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0):
@@ -560,7 +547,6 @@ def build_bse_ring_matvec_full(
         in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"),
                   P(None, None, None, "x"), P(None, None, None, "x"), P("x", "y")),
         out_specs=P(None, "x", "y", None),
-        axis_names={"x", "y"},
     )
 
     def _apply_V_ring_B(X, psi_c_Y, psi_v_Y, psi_c_X, psi_v_X, V_q0):
@@ -582,7 +568,6 @@ def build_bse_ring_matvec_full(
         in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"),
                   P(None, None, None, "x"), P(None, None, None, "x"), P("x", "y")),
         out_specs=P(None, "x", "y", None),
-        axis_names={"x", "y"},
     )
 
     def _apply_W_from_T(T, psi_c_X, psi_v_Y, W_R):
@@ -748,7 +733,6 @@ def build_realspace_random_transition_generator(
         mesh=mesh_xy,
         in_specs=(P(None, "y", None), P(None, None, None, "x"), P(None, None, None, "x"), P("x", "y")),
         out_specs=P(None, "x", "y", None),
-        axis_names={"x", "y"},
     )
 
 
@@ -801,7 +785,6 @@ def build_density_snapshot_operator(
             buf = lax.ppermute(buf, axis_name="y", perm=perm_y)
             return buf, A
 
-        A0 = lax.pcast(A0, axis_name=("x", "y"), to="varying")
         _, A_local = lax.fori_loop(0, py, step_y, (s, A0))
 
         S0 = jnp.zeros((nb_trial, nu_local, nk_local), dtype=s.dtype)
@@ -813,7 +796,6 @@ def build_density_snapshot_operator(
             buf = lax.ppermute(buf, axis_name="x", perm=perm_x)
             return buf, S
 
-        S0 = lax.pcast(S0, axis_name=("x", "y"), to="varying")
         _, S_total = lax.fori_loop(0, px, step_x, (A_local, S0))
 
         S_total = S_total / sqrt_nk
@@ -829,7 +811,6 @@ def build_density_snapshot_operator(
         mesh=mesh_xy,
         in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"), P("x", "y")),
         out_specs=P(None, "x"),
-        axis_names={"x", "y"},
     )
 
 
