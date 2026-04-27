@@ -18,6 +18,8 @@ from common.fft_helpers import make_jittable_local_ifftn_3d
 
 from solvers.lanczos import (
     block_lanczos_eig,
+    block_lanczos_eig_jit,
+    block_lanczos_eig_jit_converged,
     simple_lanczos_eig,
     lanczos_eig_jit,
 )
@@ -103,6 +105,10 @@ def solve_bse_sharded(
     max_iter: int = 200,
     n_reorth: int = 10,
     include_W: bool = True,
+    block_size: int = 1,
+    rtol: float = 0.0,
+    atol: float = 1e-8,
+    check_every: int = 4,
 ) -> Tuple[jax.Array, jax.Array]:
     """Sharded BSE Lanczos using the (μ,ν) ring matvec.
 
@@ -134,8 +140,9 @@ def solve_bse_sharded(
     nky = int(data["nky"])
     nkz = int(data["nkz"])
     nk = nkx * nky * nkz
-    shape = (1, nc_pad, nv_pad, nk)
     n_flat = nc_pad * nv_pad * nk
+    bs = int(block_size)
+    shape = (bs, nc_pad, nv_pad, nk)
 
     matvec_ring = build_bse_ring_matvec(
         mesh_xy, nkx, nky, nkz, include_W=include_W,
@@ -163,7 +170,7 @@ def solve_bse_sharded(
             sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
             sh.eps, sh.eps, sh.W, sh.V,
         ),
-        out_shardings=(rep_eig, rep_eig),
+        out_shardings=(rep_eig, rep_eig, rep_eig),
         donate_argnums=(6,),  # W_q — only used to build W_R
     )
     def _full_run(psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_q, V_q0):
@@ -171,23 +178,54 @@ def solve_bse_sharded(
             W_R = _W_local_ifftn(W_q)
         else:
             W_R = W_q
-        def matvec(v_flat):
-            X = v_flat.reshape(shape)
-            X = jax.lax.with_sharding_constraint(X, sh.X)
-            HX = matvec_ring(
-                X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                eps_c, eps_v, W_R, V_q0,
+        if bs == 1:
+            # Single-vector matvec — accept (n_flat,) and reshape to (1, c, v, k).
+            def matvec(v_flat):
+                X = v_flat.reshape(shape)
+                X = jax.lax.with_sharding_constraint(X, sh.X)
+                HX = matvec_ring(
+                    X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
+                    eps_c, eps_v, W_R, V_q0,
+                )
+                return HX.reshape(-1)
+            evs, evecs = lanczos_eig_jit(
+                matvec, n_flat, n_eig=n_eig, max_iter=max_iter, n_reorth=n_reorth,
             )
-            return HX.reshape(-1)
-        return lanczos_eig_jit(
-            matvec, n_flat, n_eig=n_eig, max_iter=max_iter, n_reorth=n_reorth,
-        )
+            return evs, evecs, jnp.int32(max_iter)
+        else:
+            # Block matvec — accept (block_size, n_flat) and reshape to
+            # (block_size, c, v, k). Each call processes ``block_size``
+            # vectors at once → ``block_size``-larger GEMMs (better GPU
+            # occupancy) and ``block_size``-fewer host dispatches.
+            def matvec_block(V_block):
+                X = V_block.reshape(shape)
+                X = jax.lax.with_sharding_constraint(X, sh.X)
+                HX = matvec_ring(
+                    X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
+                    eps_c, eps_v, W_R, V_q0,
+                )
+                return HX.reshape(bs, -1)
+            if rtol > 0.0:
+                # Convergence-driven: ``lax.while_loop`` exits when the
+                # n_eig lowest Ritz values stabilise within ``rtol``.
+                return block_lanczos_eig_jit_converged(
+                    matvec_block, n_flat, n_eig=n_eig,
+                    block_size=bs, max_iter=max_iter,
+                    rtol=rtol, atol=atol, check_every=check_every,
+                    n_reorth=n_reorth,
+                )
+            else:
+                evs, evecs = block_lanczos_eig_jit(
+                    matvec_block, n_flat, n_eig=n_eig,
+                    block_size=bs, max_iter=max_iter, n_reorth=n_reorth,
+                )
+                return evs, evecs, jnp.int32(max_iter)
 
-    eigenvalues, eigenvectors = _full_run(
+    eigenvalues, eigenvectors, n_iter_done = _full_run(
         data["psi_c_X"], data["psi_c_Y"],
         data["psi_v_X"], data["psi_v_Y"],
         data["eps_c"], data["eps_v"],
         data["W_q"], data["V_q0"],
     )
     eigenvectors = eigenvectors.reshape(n_eig, 1, nc_pad, nv_pad, nk)
-    return eigenvalues, eigenvectors
+    return eigenvalues, eigenvectors, n_iter_done

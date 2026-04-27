@@ -212,6 +212,9 @@ def _preview_lanczos(
     include_W: bool = True,
     eqp_file: str | None = None,
     n_occ: int | None = None,
+    block_size: int = 1,
+    rtol: float = 0.0,
+    check_every: int = 4,
 ) -> None:
     restart_file = _find_restart_file(input_file)
     n_devices = jax.device_count()
@@ -262,11 +265,25 @@ def _preview_lanczos(
               f"{nc_pad} cond × {nv_pad} val × {nk} k = {bse_dim} dim")
         if max_lanczos_iter is None:
             max_lanczos_iter = max(30, min(200, bse_dim // 2))
-        print(f"Lanczos: {max_lanczos_iter} iterations")
-        eigenvalues, eigenvectors = solve_bse_sharded(
-            data, mesh_xy, n_eig=n_eig, max_iter=max_lanczos_iter,
-            include_W=include_W,
+        # ``max_lanczos_iter`` is the *total* Krylov dimension upper
+        # bound; block path divides by block_size.
+        block_max_iter = max(1, max_lanczos_iter // max(1, block_size))
+        if block_size > 1:
+            mode = (f"convergence-driven (rtol={rtol:.1e}, every {check_every} iters)"
+                    if rtol > 0 else "fixed")
+            print(f"Block Lanczos [{mode}]: ≤ {block_max_iter} block iter × "
+                  f"block_size={block_size} = ≤ {block_max_iter * block_size} Krylov dim")
+        else:
+            print(f"Lanczos: {max_lanczos_iter} iterations")
+        eigenvalues, eigenvectors, n_iter_done = solve_bse_sharded(
+            data, mesh_xy, n_eig=n_eig, max_iter=block_max_iter,
+            include_W=include_W, block_size=block_size,
+            rtol=rtol, check_every=check_every,
         )
+        n_done = int(n_iter_done)
+        if rtol > 0 and block_size > 1:
+            print(f"Block Lanczos exited at iter {n_done}/{block_max_iter} "
+                  f"(Krylov dim = {n_done * block_size})")
     else:
         payload = _load_ring_subset(
             restart_file,
@@ -385,7 +402,30 @@ if __name__ == "__main__":
         "--max-lanczos-iter",
         type=int,
         default=None,
-        help="Lanczos iterations for eigensolve (default: auto-scale with problem size).",
+        help="Lanczos iterations for eigensolve (default: auto-scale with problem size). "
+             "When --block-size > 1, this is total Krylov dimension (= block iters × block_size).",
+    )
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=1,
+        help="Block-Lanczos block size (default 1 = single-vector Lanczos). "
+             "Larger blocks → larger per-call GEMMs and fewer host dispatches.",
+    )
+    parser.add_argument(
+        "--lanczos-rtol",
+        type=float,
+        default=0.0,
+        help="Convergence threshold on Ritz-eigenvalue change between checks. "
+             "0 (default) = fixed --max-lanczos-iter iterations, no early exit. "
+             ">0 enables ``lax.while_loop`` Lanczos that exits when the lowest "
+             "n-eig Ritz values stabilise within rtol (block-Lanczos only).",
+    )
+    parser.add_argument(
+        "--lanczos-check-every",
+        type=int,
+        default=4,
+        help="Convergence check cadence in block iterations (default 4).",
     )
     parser.add_argument("--kpm-dos", action="store_true", help="Run KPM Chebyshev DOS and exit.")
     parser.add_argument("--kpm-n-moments", type=int, default=100, help="Chebyshev moments M for KPM.")
@@ -536,6 +576,9 @@ if __name__ == "__main__":
         include_W=not (args.rpa or not args.bse),
         eqp_file=args.eqp,
         n_occ=args.n_occ,
+        block_size=args.block_size,
+        rtol=args.lanczos_rtol,
+        check_every=args.lanczos_check_every,
     )
     raise SystemExit(0)
 
