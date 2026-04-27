@@ -5,12 +5,16 @@ The modern GWJAX paths keep the head separate from the ISDF body tensors:
 - Dynamic GN-PPM uses scalar head samples ``(v_h, W_h(0), W_h(iω_p))``.
 - Static COHSEX uses exact band-diagonal head shifts for ``Σ^X``, ``Σ^SX``,
   ``Σ^(SX-X)``, and ``Σ^COH``.
+- Downstream BSE / Σ-builders that already consume ``V_qmunu``/``W_qmunu``
+  can absorb the head as a rank-1 update at ``q=0`` via
+  ``apply_q0_head_rank1`` (see below).
 
 This module centralizes:
 
 - head source resolution (`override`, `epshead`, `s_tensor`)
 - scalar GN-PPM head fitting
 - exact static COHSEX head terms
+- rank-1 (μ,ν)-basis head injection at q=0
 """
 
 from __future__ import annotations
@@ -528,3 +532,69 @@ def format_head_diagnostics(head: HeadGNParams, cell_volume: float) -> str:
     else:
         lines.append("  R_h / (Ω_h · vol)  = 0.0 (degenerate)")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+#  Rank-1 head injection in the (μ, ν) ISDF basis at q=0
+# ---------------------------------------------------------------------------
+
+def apply_q0_head_rank1(
+    V_qmunu: jnp.ndarray,
+    W_qmunu: jnp.ndarray | None,
+    G0_mu_nu: jnp.ndarray,
+    vhead: complex | float | None,
+    whead: jnp.ndarray | complex | float | None,
+    cell_volume: float,
+    *,
+    omega_index: int = 0,
+):
+    """Inject the ``q=0, G=G'=0`` Coulomb head as a rank-1 update in the
+    centroid ``(μ, ν)`` basis.
+
+    ``compute_vcoul`` zeroes the ``G=G'=0`` element of ``v(q+G)`` at
+    ``q=0`` to avoid the divergence; the BGW-equivalent mini-BZ-averaged
+    value is the scalar ``vhead = v_h``.  In the centroid basis the
+    missing piece factors as
+
+        ΔV_{q=0,μν} = (v_h / V_cell) · ζ̄(0, μ, G=0) · ζ(0, ν, G=0)
+                    = (v_h / V_cell) · conj(G0[μ]) · G0[ν]            (rank 1)
+
+    The ``1/V_cell`` factor matches the LORRAX storage convention for
+    ``V_qmunu`` / ``W_qmunu`` — see ``gw.sigma_direct_check`` for the
+    canonical reference (``vol_scale = 1/cell_volume`` in the head
+    overlay there).  Conjugation lands on ``μ`` because
+    ``V_{qμν} = Σ_GG' ζ*(q,μ,G) v(G,G') ζ(q,ν,G')``.
+
+    Args:
+        V_qmunu:   (..., nkx, nky, nkz, n_μ, n_ν) bare-Coulomb body, q=0
+                   slice has ``G=G'=0`` zeroed.
+        W_qmunu:   same shape as V_qmunu (single ω) or ``None`` to skip the
+                   W update.  Pass the static slice for COHSEX/BSE; pass
+                   ``Wiwp`` separately for PPM imag-freq if needed.
+        G0_mu_nu:  (n_μ,) — ``ζ(q=0, μ, G=0)``, complex.
+        vhead:     scalar ``v_h`` (Ry, BGW convention) or None to skip V.
+        whead:     scalar or shape ``(n_omega,)``, in Ry. ``n_omega=1``
+                   for static COHSEX, ``2`` for GN-PPM (static, iω_p).
+                   ``None`` to skip W update.
+        cell_volume: ``V_cell`` in Bohr³ — provides the ``1/V`` scaling.
+        omega_index: which slot of ``whead`` to apply (default 0 = static).
+
+    Returns:
+        (V_qmunu, W_qmunu) with the q=0 slice updated. Inputs not updated
+        are returned unchanged.
+    """
+    g0g0 = jnp.einsum('m,n->mn', jnp.conj(G0_mu_nu), G0_mu_nu)
+    inv_V = 1.0 / float(cell_volume)
+
+    if vhead is not None:
+        v_scalar = jnp.asarray(complex(vhead) * inv_V, dtype=V_qmunu.dtype)
+        # V layout: (..., nkx, nky, nkz, n_μ, n_ν); q=0 is index 0 on each k axis.
+        V_qmunu = V_qmunu.at[..., 0, 0, 0, :, :].add(v_scalar * g0g0)
+
+    if W_qmunu is not None and whead is not None:
+        whead_arr = jnp.asarray(whead, dtype=jnp.complex128)
+        w_val = whead_arr if whead_arr.ndim == 0 else whead_arr[omega_index]
+        w_scalar = jnp.asarray(w_val * inv_V, dtype=W_qmunu.dtype)
+        W_qmunu = W_qmunu.at[..., 0, 0, 0, :, :].add(w_scalar * g0g0)
+
+    return V_qmunu, W_qmunu
