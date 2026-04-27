@@ -10,7 +10,7 @@ from functools import partial
 from . import Meta
 from . import timing
 from .fft_helpers import (
-    make_jittable_local_ifftn_3d,
+    make_sharded_ifftn_3d,
 )
 
 
@@ -329,8 +329,8 @@ def get_sharded_wfns_rchunk_slice(
     if cache_key not in _rchunk_slice_cache:
         out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
         
-        local_ifftn = make_jittable_local_ifftn_3d(
-            mesh_xy, 
+        local_ifftn = make_sharded_ifftn_3d(
+            mesh_xy,
             P(None, ('x', 'y'), None, None, None, None),
             P(None, ('x', 'y'), None, None, None, None)
         )
@@ -675,7 +675,7 @@ def get_sharded_wfns_centroids(
         out_X = NamedSharding(mesh_xy, P(None, 'x', None, None))
         null_4 = NamedSharding(mesh_xy, P(None, None, None, None))
         
-        local_ifftn = make_jittable_local_ifftn_3d(
+        local_ifftn = make_sharded_ifftn_3d(
             mesh_xy,
             P(None, ('x', 'y'), None, None, None, None),
             P(None, ('x', 'y'), None, None, None, None)

@@ -18,8 +18,8 @@ except ImportError:  # pragma: no cover - older JAX
 
 import common.timing as timing
 from common.fft_helpers import (
-    make_jittable_local_fftn_3d,
-    make_jittable_local_ifftn_3d,
+    make_sharded_fftn_3d,
+    make_sharded_ifftn_3d,
 )
 from .bse_io import _find_restart_file, _load_ring_subset, load_bse_data_from_restart_sharded
 from .bse_serial import apply_D, apply_bse_hamiltonian_single_device, compute_pair_amplitude
@@ -401,9 +401,9 @@ def build_bse_ring_matvec(
     # T_k 8D spec: (b, μ, ν, ns, ns, kx, ky, kz) — same μ,ν shardings as
     # storage T (6D) but with last nk axis split into 3 replicated dims.
     _T_8d_spec = P(None, "x", "y", None, None, None, None, None)
-    _T_local_ifftn = make_jittable_local_ifftn_3d(
+    _T_local_ifftn = make_sharded_ifftn_3d(
         mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
-    _T_local_fftn = make_jittable_local_fftn_3d(
+    _T_local_fftn = make_sharded_fftn_3d(
         mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
 
     def _apply_W_from_T(T, psi_c_X, psi_v_Y, W_R):
@@ -600,9 +600,9 @@ def build_bse_ring_matvec_full(
     # T_k 8D spec: (b, μ, ν, ns, ns, kx, ky, kz) — same μ,ν shardings as
     # storage T (6D) but with last nk axis split into 3 replicated dims.
     _T_8d_spec = P(None, "x", "y", None, None, None, None, None)
-    _T_local_ifftn = make_jittable_local_ifftn_3d(
+    _T_local_ifftn = make_sharded_ifftn_3d(
         mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
-    _T_local_fftn = make_jittable_local_fftn_3d(
+    _T_local_fftn = make_sharded_fftn_3d(
         mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
 
     def _apply_W_from_T(T, psi_c_X, psi_v_Y, W_R):

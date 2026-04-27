@@ -379,12 +379,19 @@ def make_flat_k_fft(
     nkx, nky, nkz = (int(v) for v in kgrid)
     nk = nkx * nky * nkz
     in_shard = NamedSharding(mesh, spec)
+    # Use the single 3D-cuFFT-plan variant rather than the 3-sequential-
+    # 1D-FFT (custom_partitioning per-axis) form.  Same correctness
+    # contract (FFT axes must be replicated in ``spec``); cuFFT's 3D
+    # plan handles the axis sequencing internally with far fewer
+    # explicit transposes in the generated HLO.  Si 4×4×4 BSE sweep
+    # measured this swap at ~1 s walltime savings in a 200-iter
+    # Lanczos run.
     if kind == 'ifftn':
-        inner = make_jittable_local_ifftn_3d(
+        inner = make_sharded_ifftn_3d(
             mesh, spec, out_spec if out_spec is not None else spec,
             norm=norm, axes=(0, 1, 2))
     elif kind == 'fftn':
-        inner = make_jittable_local_fftn_3d(
+        inner = make_sharded_fftn_3d(
             mesh, spec, out_spec if out_spec is not None else spec,
             norm=norm, axes=(0, 1, 2))
     else:
