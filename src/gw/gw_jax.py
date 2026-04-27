@@ -296,6 +296,52 @@ def main(argv=None):
 
 	if not config.do_screened:
 		W_q = V_q  # unscreened: W = V
+
+	# ── Persist W0_qmunu + q=0 head scalars to the restart file ──────────
+	# Downstream consumers (BSE, future Σ-builders) reload these and apply
+	# the rank-1 head update via ``head_correction.apply_q0_head_rank1``.
+	# The ``whead`` axis is length 1 for COHSEX (just static) and length 2
+	# for GN-PPM (static + iω_p). ``vhead``/``whead_*`` cohsex.in overrides
+	# are honoured because ``resolve_head_sample`` consults ``head_params``
+	# first (override path) before falling back to s_tensor/epshead.
+	if config.do_screened and os.path.exists(tensors_filename):
+		from file_io import write_w0_qmunu_to_h5, write_head_scalars_to_h5
+		nkx, nky, nkz = (int(x) for x in meta.kgrid)
+		W_q_8d = W_q.reshape(1, 1, 1, nkx, nky, nkz, W_q.shape[-2], W_q.shape[-1])
+		write_w0_qmunu_to_h5(tensors_filename, W_q_8d,
+		                     mesh=mesh_xy, use_ffi_io=config.use_ffi_io)
+		head_params = {
+			"wcoul0_source": config.wcoul0_source,
+			"wcoul0_eta": config.wcoul0_eta,
+			"vhead": config.vhead,
+			"whead_0freq": config.whead_0freq,
+			"whead_imfreq": config.whead_imfreq,
+		}
+		head_static = resolve_head_sample(
+			head_params, input_dir, wfn, sym, meta, print0, omega=0.0+0.0j)
+		if config.use_ppm_sigma:
+			omega_imp = 1j * config.ppm_omega_p
+			head_imag = resolve_head_sample(
+				head_params, input_dir, wfn, sym, meta, print0, omega=omega_imp)
+			whead_arr = np.array(
+				[head_static.wcoul0, head_imag.wcoul0], dtype=np.complex128)
+			omega_grid = np.array([0.0, float(omega_imp.imag)], dtype=np.float64)
+		else:
+			whead_arr = np.array([head_static.wcoul0], dtype=np.complex128)
+			omega_grid = np.array([0.0], dtype=np.float64)
+		write_head_scalars_to_h5(
+			tensors_filename,
+			vhead=complex(head_static.vc0),
+			whead=whead_arr,
+			omega_grid=omega_grid,
+		)
+		print0(
+			f"  Persisted W0_qmunu + q=0 head scalars: "
+			f"vhead={head_static.vc0.real:.3f} a.u.,  "
+			f"whead[ω=0]={whead_arr[0].real:.3f} a.u."
+			+ (f",  whead[iωp]={whead_arr[1].real:.3f} a.u." if len(whead_arr) > 1 else "")
+		)
+
 	Gij = build_Gij(meta, mesh_xy)
 
 	# q→0 head correction (exact band-diagonal terms for static COHSEX)

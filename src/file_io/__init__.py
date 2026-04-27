@@ -18,6 +18,7 @@ from .epsreader import EPSReader
 from .tagged_arrays import (
     write_restart_state_to_h5,
     write_w0_qmunu_to_h5,
+    write_head_scalars_to_h5,
     read_restart_state_from_h5,
     load_restart_state_from_h5,
     save_restart_state_per_proc,

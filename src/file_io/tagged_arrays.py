@@ -112,6 +112,53 @@ def write_w0_qmunu_to_h5(
         pass
 
 
+def write_head_scalars_to_h5(
+    filename: str,
+    *,
+    vhead: complex | None = None,
+    whead: np.ndarray | jnp.ndarray | None = None,
+    omega_grid: np.ndarray | jnp.ndarray | None = None,
+):
+    """Persist q=0 Coulomb head scalars to the restart file.
+
+    Stored alongside ``G0_mu_nu``; consumed by ``bse_io._load_ring_subset``
+    (and any future Σ-builder) via ``head_correction.apply_q0_head_rank1``.
+
+    - ``vhead``: scalar v(q→0, G=G'=0) in Ry, BGW convention.
+    - ``whead``: shape ``(n_omega,)``. Length 1 for static COHSEX,
+      length 2 for GN-PPM (static, iω_p).
+    - ``omega_grid``: optional ``(n_omega,)`` array of the ω values
+      (in Ry) corresponding to ``whead`` — written as an attribute on
+      the ``whead`` dataset for consumer interpretation.
+
+    Rank-0-only write (these are tiny; no MPI-IO needed).
+    """
+    if jax.process_index() != 0:
+        try:
+            from jax.experimental import multihost_utils as _mh
+            _mh.sync_global_devices("restart_head_scalars")
+        except Exception:
+            pass
+        return
+    with h5py.File(filename, "a") as f:
+        if vhead is not None:
+            if "vhead" in f:
+                del f["vhead"]
+            f.create_dataset("vhead", data=np.complex128(vhead))
+        if whead is not None:
+            if "whead" in f:
+                del f["whead"]
+            arr = np.asarray(whead, dtype=np.complex128).reshape(-1)
+            ds = f.create_dataset("whead", data=arr)
+            if omega_grid is not None:
+                ds.attrs["omega_grid"] = np.asarray(omega_grid, dtype=np.float64).reshape(-1)
+    try:
+        from jax.experimental import multihost_utils as _mh
+        _mh.sync_global_devices("restart_head_scalars")
+    except Exception:
+        pass
+
+
 def read_restart_state_from_h5(filename):
     """Read canonical restart state from HDF5 (restart format v2)."""
     with h5py.File(filename, "r") as f:
