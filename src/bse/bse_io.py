@@ -476,8 +476,13 @@ def read_bgw_eqp(eqp_file: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     with open(eqp_file) as f:
         while True:
             header = f.readline()
-            if not header.strip():
+            if not header:
                 break
+            stripped = header.strip()
+            if not stripped:
+                break
+            if stripped.startswith("#"):
+                continue
             parts = header.split()
             if len(parts) < 4:
                 break
