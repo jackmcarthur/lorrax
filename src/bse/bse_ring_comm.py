@@ -17,6 +17,10 @@ except ImportError:  # pragma: no cover - older JAX
     _shard_map_fn = _shard_map_mod.shard_map
 
 import common.timing as timing
+from common.fft_helpers import (
+    make_jittable_local_fftn_3d,
+    make_jittable_local_ifftn_3d,
+)
 from .bse_io import _find_restart_file, _load_ring_subset, load_bse_data_from_restart_sharded
 from .bse_serial import apply_D, apply_bse_hamiltonian_single_device, compute_pair_amplitude
 
@@ -387,6 +391,21 @@ def build_bse_ring_matvec(
         out_specs=P(None, "x", "y", None),
     )
 
+    # Custom-partitioned FFTs on the (kx, ky, kz) axes — those axes are
+    # ``None``-sharded in T (sh.T) and W_R (sh.W), so the FFT can run
+    # locally on every device.  Plain ``jnp.fft.ifftn`` / ``fftn`` on a
+    # sharded tensor forces XLA to all-gather the entire array before
+    # the FFT — see ``common.fft_helpers`` for the JAX bug this works
+    # around.  In the BSE Lanczos loop those gathers cost ~5 s over
+    # 200 matvecs on Si 4×4×4 (profile_sharded_v2/trace_summary.md).
+    # T_k 8D spec: (b, μ, ν, ns, ns, kx, ky, kz) — same μ,ν shardings as
+    # storage T (6D) but with last nk axis split into 3 replicated dims.
+    _T_8d_spec = P(None, "x", "y", None, None, None, None, None)
+    _T_local_ifftn = make_jittable_local_ifftn_3d(
+        mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
+    _T_local_fftn = make_jittable_local_fftn_3d(
+        mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
+
     def _apply_W_from_T(T, psi_c_X, psi_v_Y, W_R):
         nspinor = psi_c_X.shape[2]
         nb_trial = T.shape[0]
@@ -395,9 +414,9 @@ def build_bse_ring_matvec(
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=T.real.dtype))
 
         T_k = T.reshape(nb_trial, n_rmu_local_X, n_rmu_local_Y, nspinor, nspinor, nkx, nky, nkz)
-        T_R = jnp.fft.ifftn(T_k, axes=(5, 6, 7), norm="ortho")
+        T_R = _T_local_ifftn(T_k)
         U_R = W_R[None, :, :, None, None, :, :, :] * T_R
-        U_q = jnp.fft.fftn(U_R, axes=(5, 6, 7), norm="ortho")
+        U_q = _T_local_fftn(U_R)
         U = U_q.reshape(nb_trial, n_rmu_local_X, n_rmu_local_Y, nspinor, nspinor, nk)
 
         A = jnp.einsum("kctM,bMNtsk->bcNsk", jnp.conj(psi_c_X), U)
@@ -408,6 +427,7 @@ def build_bse_ring_matvec(
         _apply_W_from_T,
         in_shardings=(sh.T, sh.psi_x, sh.psi_y, sh.W),
         out_shardings=sh.X,
+        donate_argnums=(0,),  # T consumed once, no need to keep
     )
 
     def _apply_D_term(X, eps_c, eps_v):
@@ -570,6 +590,21 @@ def build_bse_ring_matvec_full(
         out_specs=P(None, "x", "y", None),
     )
 
+    # Custom-partitioned FFTs on the (kx, ky, kz) axes — those axes are
+    # ``None``-sharded in T (sh.T) and W_R (sh.W), so the FFT can run
+    # locally on every device.  Plain ``jnp.fft.ifftn`` / ``fftn`` on a
+    # sharded tensor forces XLA to all-gather the entire array before
+    # the FFT — see ``common.fft_helpers`` for the JAX bug this works
+    # around.  In the BSE Lanczos loop those gathers cost ~5 s over
+    # 200 matvecs on Si 4×4×4 (profile_sharded_v2/trace_summary.md).
+    # T_k 8D spec: (b, μ, ν, ns, ns, kx, ky, kz) — same μ,ν shardings as
+    # storage T (6D) but with last nk axis split into 3 replicated dims.
+    _T_8d_spec = P(None, "x", "y", None, None, None, None, None)
+    _T_local_ifftn = make_jittable_local_ifftn_3d(
+        mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
+    _T_local_fftn = make_jittable_local_fftn_3d(
+        mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
+
     def _apply_W_from_T(T, psi_c_X, psi_v_Y, W_R):
         nspinor = psi_c_X.shape[2]
         nb_trial = T.shape[0]
@@ -578,9 +613,9 @@ def build_bse_ring_matvec_full(
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=T.real.dtype))
 
         T_k = T.reshape(nb_trial, n_rmu_local_X, n_rmu_local_Y, nspinor, nspinor, nkx, nky, nkz)
-        T_R = jnp.fft.ifftn(T_k, axes=(5, 6, 7), norm="ortho")
+        T_R = _T_local_ifftn(T_k)
         U_R = W_R[None, :, :, None, None, :, :, :] * T_R
-        U_q = jnp.fft.fftn(U_R, axes=(5, 6, 7), norm="ortho")
+        U_q = _T_local_fftn(U_R)
         U = U_q.reshape(nb_trial, n_rmu_local_X, n_rmu_local_Y, nspinor, nspinor, nk)
 
         A = jnp.einsum("kctM,bMNtsk->bcNsk", jnp.conj(psi_c_X), U)
@@ -591,6 +626,7 @@ def build_bse_ring_matvec_full(
         _apply_W_from_T,
         in_shardings=(sh.T, sh.psi_x, sh.psi_y, sh.W),
         out_shardings=sh.X,
+        donate_argnums=(0,),  # T consumed once, no need to keep
     )
 
     def _apply_D_term(X, eps_c, eps_v):
