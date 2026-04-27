@@ -104,20 +104,78 @@ def compute_block_direct_cnk(*args, **kwargs):
 # Finite-q matrix elements for SOS chi head/wing/S/w pipeline
 # --------------------------
 
-def _load_psi_box_full(wfn, sym, meta, nb_load: int) -> jax.Array:
-    """Load all unfolded ψ on the FFT box for finite-q overlaps.
+def _build_g_lookup(Gk_int_kmq: np.ndarray, Gk_int_k: np.ndarray,
+                     G_wrap: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per-(k, q) integer lookup that translates between the G-spheres of
+    ``k`` and ``canonical(k − q)`` under umklapp.
 
-    Mirrors ``psp.run_sternheimer._load_unfolded_wfns`` but kept as a
-    private helper here so the dipole driver doesn't depend on the
-    Sternheimer module.  Returns ``(nk_full, nb_load, nspinor, nx, ny, nz)``
-    complex128 — same convention used by the SOS finite-q overlaps and
-    the Sternheimer χ-column pipeline.
+    For each μ_k in the ket's G-sphere, we want the μ_kmq such that
+    ``Gk_int_kmq[μ_kmq] == Gk_int_k[μ_k] + G_wrap``.  When that G-vector
+    lies outside the canonical-kmq sphere we mark it −1 (the bra
+    coefficient there is zero anyway, so the contribution to the
+    overlap is zero).
+
+    Returns
+    -------
+    map_arr : (nG_k,) int32  — μ_kmq index per μ_k (0 placeholder where
+              not found; use ``mask`` to gate).
+    mask    : (nG_k,) bool   — True where the lookup succeeded.
     """
-    from common.load_wfns import load_kpoint_fftbox
-    nk_full = int(sym.nk_tot)
-    psi_list = [load_kpoint_fftbox(wfn, sym, meta, ik, nb_load)
-                for ik in range(nk_full)]
-    return jnp.stack(psi_list, axis=0)
+    target = Gk_int_k + G_wrap[None, :]                                 # (nG_k, 3)
+    g_dict = {tuple(int(x) for x in g): i for i, g in enumerate(Gk_int_kmq)}
+    nG_k = target.shape[0]
+    map_arr = np.empty(nG_k, dtype=np.int32)
+    mask = np.empty(nG_k, dtype=bool)
+    for i, t in enumerate(target):
+        idx = g_dict.get((int(t[0]), int(t[1]), int(t[2])), -1)
+        mask[i] = idx >= 0
+        map_arr[i] = idx if idx >= 0 else 0
+    return map_arr, mask
+
+
+@jax.jit
+def _cell_overlap_with_lookup(c_can_m, c_n_k, vket_alpha, vbra_alpha,
+                                map_arr, mask):
+    """Symmetric-velocity cell overlap on G-sphere with umklapp lookup.
+
+    All inputs in the canonical-kmq / k G-sphere layouts:
+      c_can_m    : (nc, ns, nG_can)  — bra coefs on canonical k-q sphere
+      c_n_k      : (nv, ns, nG_k)    — ket coefs on k sphere
+      vket_alpha : (3, nv, ns, nG_k) — v applied to ket at k (kin + VNL(k))
+      vbra_alpha : (3, nc, ns, nG_can) — v applied to bra at k_can_kmq
+                                         (kin + VNL(k_can_kmq))
+      map_arr    : (nG_k,) int32 — μ_can index for each μ_k
+      mask       : (nG_k,) bool  — gate for out-of-sphere G's
+
+    The bra is gathered along the canonical-kmq G-axis at the indices
+    ``map_arr[μ_k]`` so the contracted-G-axis is the *ket's* G-sphere.
+
+    Returns
+    -------
+    rho_mn   : (nc, nv) complex128
+    v_mn_alp : (3, nc, nv) complex128 — symmetrized:
+                 v_sym = ½(v_R + v_L)
+                 v_R = ⟨bra | (kin + VNL(k))|ket⟩       — bra unchanged
+                 v_L = ⟨(kin + VNL(k_can_kmq))|bra⟩† |ket⟩
+    """
+    # Bra aligned to ket's G-axis: (nc, ns, nG_k).
+    bra_aligned = jnp.take(c_can_m, map_arr, axis=-1)
+    bra_aligned = jnp.where(mask[None, None, :], bra_aligned,
+                              jnp.zeros((), dtype=bra_aligned.dtype))
+    vbra_aligned = jnp.take(vbra_alpha, map_arr, axis=-1)               # (3, nc, ns, nG_k)
+    vbra_aligned = jnp.where(mask[None, None, None, :], vbra_aligned,
+                               jnp.zeros((), dtype=vbra_aligned.dtype))
+
+    rho_mn = jnp.einsum('msG,nsG->mn', jnp.conj(bra_aligned), c_n_k,
+                          optimize=True)
+    # v_R: original bra dotted with v-applied ket  (bra at k-q, ket apply v(k))
+    v_R = jnp.einsum('msG,ansG->amn', jnp.conj(bra_aligned), vket_alpha,
+                       optimize=True)
+    # v_L: v-applied bra (now aligned and conjugated) dotted with original ket
+    v_L = jnp.einsum('amsG,nsG->amn', jnp.conj(vbra_aligned), c_n_k,
+                       optimize=True)
+    v_sym = 0.5 * (v_R + v_L)
+    return rho_mn, v_sym
 
 
 @functools.partial(jax.jit, static_argnames=('fft_grid',))
@@ -215,102 +273,150 @@ def _cell_overlaps_at_q_Gbox(
 
 
 def compute_finite_q_mtxels(
-    wfn, sym, meta, vnl_setup,
+    wfn, sym, meta, vnl_setup, wfn_k_sharded, Gk_crys_all,
     *,
     iq_list: list[int],
-    nb_load: int,
     nv_block: int,
     nc_block: int,
     verbose: bool = True,
 ):
-    """Driver: produce per-(k, iq, c, v) finite-q matrix elements.
+    """Driver: produce symmetric finite-q matrix elements on G-sphere.
 
     Returns numpy arrays:
-      rho_cvkq[nc, nv, nk, nq] complex128  — h_t(q) = ⟨u_{c, k-q} | u_{v, k}⟩_cell
-      v_cvkq[3, nc, nv, nk, nq] complex128 — kinetic v^α part of
-                                              ⟨u_{c, k-q} | v^α u_{v, k}⟩_cell
-      kminq_idx[nk, nq] int32 — per-(ik, iq) lookup (= sym.kq_map[:, iq_list])
+      rho_cvkq[nc, nv, nk, nq] complex128  — ⟨u_{c, k-q} | u_{v, k}⟩_cell
+      v_cvkq[3, nc, nv, nk, nq] complex128 — symmetric (v_R + v_L)/2 of
+                                              ⟨u_{c, k-q} | v^α | u_{v, k}⟩_cell
+                                              including kinetic + VNL.
+      kminq_idx[nk, nq] int32 — canonical k-q lookup.
 
-    Notes
-    -----
-    Stores ONLY the c-v block (m ∈ conduction = [n_occ, n_occ + nc_block),
-    n ∈ valence = [n_occ - nv_block, n_occ)) since that is what the SOS
-    head/wing chi formulas need.  Memory budget at MoS₂ 3×3 (nk=9, nq=9,
-    nv=26, nc=20): ~67 KB for ``rho`` and 200 KB for ``v_α`` — trivial.
+    Plumbing:
+      • G-sphere throughout (no FFT box).  Wfns are taken from
+        ``wfn_k_sharded`` (already loaded in the q=0 dipole pass).
+      • Kinetic apply via ``apply_kinetic_velocity_to_ket``.
+      • VNL apply via ``vnl_ops.apply_vnl_velocity_to_ket`` with k-side
+        Z(k) projectors for v_R and bra-side Z(k_can_kmq) projectors
+        for v_L.  Both projector tables come from
+        ``vnl_ops.build_vnl_kdata_from_kvec`` per k.
+      • Umklapp via per-(k, q) integer G-lookup table that maps
+        ket's μ_k → bra's μ_can such that
+        ``Gk_int_can[μ_can] == Gk_int_k[μ_k] + G_wrap``.  The
+        unmatched G's contribute 0 (their canonical coefficients are
+        outside the cutoff sphere anyway).
 
-    The VNL-velocity contribution is *not* yet included here — only the
-    kinetic ``(k+G)_cart`` piece — pending a vmap-friendly finite-q
-    extension of ``compute_vnl_velocity_cart``.  Document and TODO.
+    Stored c-v block:
+      m ∈ [n_occ, n_occ + nc_block)  (conduction)
+      n ∈ [n_occ - nv_block, n_occ)  (valence)
     """
     from common.kq_mapping import kminq_idx_for_iq, umklapp_G_wrap
+    from psp.dft_operators import apply_kinetic_velocity_to_ket
+    import psp.vnl_ops as vnl_ops
 
     nk_full = int(sym.nk_tot)
-    fft_grid = tuple(int(v) for v in wfn.fft_grid)
     bvec_blat = jnp.asarray(np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat),
                              dtype=jnp.float64)
     n_occ = int(wfn.nelec)
-
-    # Bands actually loaded into psi_box_full: at least n_occ + nc_block
-    nb_eff = max(int(nb_load), n_occ + int(nc_block))
-    nb_eff = min(nb_eff, int(wfn.nbands))
-    if verbose:
-        print(f"  finite-q: loading psi_box_full  (nk={nk_full}, nb={nb_eff}, "
-              f"FFT={fft_grid})")
-    psi_box_full = _load_psi_box_full(wfn, sym, meta, nb_eff)
-
-    # Slice once: bra = m∈conduction band range, ket = n∈valence band range.
     v_lo = max(0, n_occ - int(nv_block))
     c_lo = n_occ
-    c_hi = min(n_occ + int(nc_block), nb_eff)
-    psi_v_full = psi_box_full[:, v_lo:n_occ]                       # (nk, nv, ns, ...)
-    psi_c_full = psi_box_full[:, c_lo:c_hi]                        # (nk, nc, ns, ...)
-    nc_eff = c_hi - c_lo
+    c_hi = min(n_occ + int(nc_block), int(wfn_k_sharded.shape[1]))
     nv_eff = n_occ - v_lo
+    nc_eff = c_hi - c_lo
 
-    # Per source-k, multiply c_n,k(G) by (k+G)_cart^α once — gives v^α u_n,k
-    # in the same G-box layout as the wfn.
+    kpts_full = np.asarray(sym.unfolded_kpts, dtype=np.float64)
+
+    # ── Per-k apply: kinetic + VNL on the ket side, plus same on bra side ──
+    # Note: the apply'd vectors live on each k's own G-sphere.  We need
+    # the apply at every full-BZ k since both ket-side (k) and bra-side
+    # (canonical k-q) draw from the same set of full-BZ k-vectors.  Build
+    # once.
     if verbose:
-        print(f"  finite-q: applying kinetic velocity to {nv_eff} valence × "
-              f"{nk_full} k-points")
-    kpts_full = jnp.asarray(np.asarray(sym.unfolded_kpts, dtype=np.float64),
-                              dtype=jnp.float64)
-    def _per_k_v(kvec, psi_Gbox_k):
-        return _apply_kinetic_velocity_Gbox(
-            psi_Gbox_k, kvec, bvec_blat, fft_grid=fft_grid)
-    vpsi_v_full = jax.vmap(_per_k_v)(kpts_full, psi_v_full)        # (nk, 3, nv, ns, nx, ny, nz)
-    vpsi_v_full.block_until_ready()
+        print(f"  finite-q: applying v_kin + V_NL  to {nv_eff} valence + "
+              f"{nc_eff} conduction × {nk_full} k-points (G-sphere)")
 
+    # Per-k (kdata, vket_v, vket_c) — different shapes per k (G-sphere
+    # length varies) so we keep a Python list rather than vmap'ing.
+    vket_v_per_k = []     # (3, nv, ns, nG_k)  each
+    vket_c_per_k = []     # (3, nc, ns, nG_k)  each
+    psi_v_per_k  = []     # (nv, ns, nG_k)
+    psi_c_per_k  = []     # (nc, ns, nG_k)
+    for ik in range(nk_full):
+        kvec = jnp.asarray(kpts_full[ik], dtype=jnp.float64)
+        Gk_int = Gk_crys_all[ik]                                       # (nG_k, 3) int
+        # Slice psi → G-sphere shape (nb, ns, nG_k).  ``wfn_k_sharded`` is
+        # (nk, nb, ns, nG_k); the gather already happened upstream via
+        # ``read_Gvecs_to_devices``.
+        psi_k = wfn_k_sharded[ik]                                      # (nb, ns, nG_k)
+        # Gather FFT-box layout → G-sphere coeffs at this k's integer G-list.
+        psi_k_G = gather_psi_G_from_crys(psi_k, Gk_int)               # (nb, ns, nG_k)
+        psi_v = psi_k_G[v_lo:n_occ]
+        psi_c = psi_k_G[c_lo:c_hi]
+        psi_v_per_k.append(psi_v)
+        psi_c_per_k.append(psi_c)
+
+        # Kinetic apply (Rydberg p = 2(k+G)).
+        v_kin_v = apply_kinetic_velocity_to_ket(psi_v, Gk_int, kvec, bvec_blat)
+        v_kin_c = apply_kinetic_velocity_to_ket(psi_c, Gk_int, kvec, bvec_blat)
+        # VNL apply: build Z, dZ at this k, then apply with compute_dZ=True.
+        kdata = vnl_ops.build_vnl_kdata_from_kvec(
+            np.asarray(kpts_full[ik], dtype=float),
+            np.asarray(Gk_int, dtype=int),
+            vnl_setup, compute_dZ=True,
+        )
+        # vnl_ops applies a global sign flip relative to the BGW convention
+        # (see comment in main(): vNL_cart = -vNL_cart). Match here.
+        v_NL_v = -vnl_ops.apply_vnl_velocity_to_ket(
+            psi_v[:, :int(kdata.E_super.shape[0])],
+            kdata.Z, kdata.dZ, kdata.E_super)
+        v_NL_c = -vnl_ops.apply_vnl_velocity_to_ket(
+            psi_c[:, :int(kdata.E_super.shape[0])],
+            kdata.Z, kdata.dZ, kdata.E_super)
+        # The VNL apply may return only nspinor_E spinors; pad to full nspinor.
+        if v_NL_v.shape[2] < v_kin_v.shape[2]:
+            pad = v_kin_v.shape[2] - v_NL_v.shape[2]
+            v_NL_v = jnp.concatenate([v_NL_v, jnp.zeros(
+                v_NL_v.shape[:2] + (pad,) + v_NL_v.shape[3:], dtype=v_NL_v.dtype)], axis=2)
+            v_NL_c = jnp.concatenate([v_NL_c, jnp.zeros(
+                v_NL_c.shape[:2] + (pad,) + v_NL_c.shape[3:], dtype=v_NL_c.dtype)], axis=2)
+        vket_v_per_k.append(v_kin_v + v_NL_v)
+        vket_c_per_k.append(v_kin_c + v_NL_c)
+
+    # ── Per (k, q) loop ──
     nq = len(iq_list)
     rho_cvkq = np.zeros((nc_eff, nv_eff, nk_full, nq), dtype=np.complex128)
     v_cvkq   = np.zeros((3, nc_eff, nv_eff, nk_full, nq), dtype=np.complex128)
     kminq_idx_kq = np.zeros((nk_full, nq), dtype=np.int32)
 
     for jq, iq_red in enumerate(iq_list):
-        kminq_idx = kminq_idx_for_iq(sym, iq_red)                  # (nk_full,)
+        kminq_idx = kminq_idx_for_iq(sym, iq_red)
         kminq_idx_kq[:, jq] = kminq_idx
 
         qvec_pos = np.asarray(wfn.kpoints[iq_red], dtype=np.float64)
         qvec = qvec_pos - np.round(qvec_pos)
-        qvec_j = jnp.asarray(qvec, dtype=jnp.float64)
 
-        kvec_kmq_full = kpts_full[jnp.asarray(kminq_idx)]
-        G_wrap = umklapp_G_wrap(kpts_full, kvec_kmq_full, qvec_j)  # (nk_full, 3)
+        max_rho = max_v = 0.0
+        for ik in range(nk_full):
+            ikmq = int(kminq_idx[ik])
+            kvec_k_np   = kpts_full[ik]
+            kvec_kmq_np = kpts_full[ikmq]
+            G_wrap_np = np.round((kvec_k_np - qvec) - kvec_kmq_np).astype(np.int32)
 
-        psi_c_kmq = psi_c_full[jnp.asarray(kminq_idx)]             # (nk_full, nc, ns, ...)
+            Gk_int_k   = np.asarray(Gk_crys_all[ik],   dtype=np.int32)
+            Gk_int_can = np.asarray(Gk_crys_all[ikmq], dtype=np.int32)
+            map_arr, mask = _build_g_lookup(Gk_int_can, Gk_int_k, G_wrap_np)
+            map_arr_j = jnp.asarray(map_arr, dtype=jnp.int32)
+            mask_j    = jnp.asarray(mask)
 
-        def _per_k_overlap(psi_v_k, vpsi_v_k, psi_c_kmq_k, G_wrap_k):
-            return _cell_overlaps_at_q_Gbox(
-                psi_v_k, vpsi_v_k, psi_c_kmq_k, G_wrap_k, fft_grid)
-
-        rho_kc_v, v_kca_v = jax.vmap(_per_k_overlap)(
-            psi_v_full, vpsi_v_full, psi_c_kmq, G_wrap)
-        rho_kc_v.block_until_ready()
-        rho_cvkq[:, :, :, jq] = np.moveaxis(np.asarray(rho_kc_v), 0, 2)
-        v_cvkq[:, :, :, :, jq] = np.moveaxis(np.asarray(v_kca_v), (0, 1), (3, 0))
+            rho_mn, v_sym = _cell_overlap_with_lookup(
+                psi_c_per_k[ikmq], psi_v_per_k[ik],
+                vket_v_per_k[ik],  vket_c_per_k[ikmq],
+                map_arr_j, mask_j,
+            )
+            rho_cvkq[:, :, ik, jq] = np.asarray(rho_mn)
+            v_cvkq[:, :, :, ik, jq] = np.asarray(v_sym)
+            max_rho = max(max_rho, float(jnp.max(jnp.abs(rho_mn))))
+            max_v   = max(max_v,   float(jnp.max(jnp.abs(v_sym))))
         if verbose:
             print(f"    iq={iq_red:>3d}  q_signed={tuple(float(v) for v in qvec)}  "
-                  f"|rho|_∞={float(np.max(np.abs(rho_kc_v))):.3e}  "
-                  f"|v|_∞={float(np.max(np.abs(v_kca_v))):.3e}")
+                  f"|rho|_∞={max_rho:.3e}  |v|_∞={max_v:.3e}")
 
     return rho_cvkq, v_cvkq, kminq_idx_kq, n_occ, v_lo, c_hi
 
@@ -586,9 +692,8 @@ def main(argv=None):
 		print("\nComputing finite-q matrix elements (SOS pipeline)...")
 		iq_list = args.iq_list if args.iq_list is not None else list(range(int(sym.nk_tot)))
 		rho_cvkq, v_cvkq, kminq_idx_kq, n_occ_eff, v_lo, c_hi = compute_finite_q_mtxels(
-			wfn, sym, meta, vnl_setup,
+			wfn, sym, meta, vnl_setup, wfn_k_sharded, Gk_crys_all,
 			iq_list=iq_list,
-			nb_load=nband_eff,
 			nv_block=int(nval),
 			nc_block=int(ncond),
 			verbose=True,
@@ -619,8 +724,8 @@ def main(argv=None):
 			fq.attrs['c_hi']    = cv_meta['c_hi']
 			fq.attrs['note'] = (
 				"rho_cvkq[c, v, k, q] = <u_{c, k-q}|u_{v, k}>_cell; "
-				"v_cvkq[a, c, v, k, q] = <u_{c, k-q}|v^a u_{v, k}>_cell "
-				"(KINETIC velocity only — VNL contribution TBD); "
+				"v_cvkq[a, c, v, k, q] = symmetric (v_R + v_L)/2 of "
+				"<u_{c, k-q}|v^a|u_{v, k}>_cell  (kinetic + VNL); "
 				"kminq_idx[k, q] = canonical k-q index in unfolded_kpts.")
 	print(f"\nWrote dipole data to {out_path}")
 

@@ -488,17 +488,39 @@ def vnl_matrix(psi_G, Z, E_super):
 
 
 @jax.jit
-def vnl_velocity_matrix(psi_G, Z, dZ, E_super):
-    """dV_NL/dK_cart matrix elements.  Returns (3, nb, nb).
+def apply_vnl_velocity_to_ket(psi_G, Z, dZ, E_super):
+    """∂V_NL/∂K_cart^α applied to a ket on the G-sphere.
 
-    dZ : (3, total_R, nG)
+    Returns ``(3, nb, nspinor, nG)`` complex — the velocity-applied ket
+    ``v_NL^α |n,k⟩``  in the SAME G-sphere layout as ``psi_G``.
+
+    Math:  ``∂V_NL/∂k^α = (∂Z^α) E Z† + Z E (∂Z^α)†``  (k-dependence
+    flows through the projectors Z(k); E_super is k-independent).  The
+    apply form leaves the bra index free so callers can either contract
+    against ``conj(psi_G)`` to get the q=0 matrix element (see
+    :func:`vnl_velocity_matrix`) OR against a different bra at a
+    different k for the finite-q matrix element used in the SOS chi
+    head/wing pipeline.
     """
-    P = jnp.einsum('RG,nsG->Rsn', jnp.conj(Z), psi_G, optimize=True)
-    D = jnp.einsum('stRQ,Qtn->Rsn', E_super, P, optimize=True)
-    # dP[j] = dZ[j]† ψ
+    P  = jnp.einsum('RG,nsG->Rsn', jnp.conj(Z),  psi_G, optimize=True)   # ⟨Z|n⟩
+    D  = jnp.einsum('stRQ,Qtn->Rsn', E_super, P, optimize=True)
     dP = jnp.einsum('jRG,nsG->jRsn', jnp.conj(dZ), psi_G, optimize=True)
     dD = jnp.einsum('stRQ,jQtn->jRsn', E_super, dP, optimize=True)
-    # v[j] = conj(dP[j]) D + conj(P) dD[j]
-    t1 = jnp.einsum('jRsm,Rsn->jmn', jnp.conj(dP), D, optimize=True)
-    t2 = jnp.einsum('Rsm,jRsn->jmn', jnp.conj(P), dD, optimize=True)
+    # (∂Z^j) D — first piece in the symmetrized derivative
+    t1 = jnp.einsum('jRG,Rsn->jnsG', dZ, D, optimize=True)
+    # Z dD — second piece
+    t2 = jnp.einsum('RG,jRsn->jnsG', Z,  dD, optimize=True)
     return t1 + t2
+
+
+@jax.jit
+def vnl_velocity_matrix(psi_G, Z, dZ, E_super):
+    """⟨m | ∂V_NL/∂K_cart^α | n⟩ matrix elements at one k.  Returns (3, nb, nb).
+
+    Thin bra-contraction wrapper around :func:`apply_vnl_velocity_to_ket`
+    so the q=0 dipole path and the finite-q SOS path share the same
+    underlying velocity application — no duplicated logic.
+    """
+    v_ket = apply_vnl_velocity_to_ket(psi_G, Z, dZ, E_super)            # (3, nb, ns, nG)
+    return jnp.einsum('msG,jnsG->jmn', jnp.conj(psi_G), v_ket,
+                       optimize=True)

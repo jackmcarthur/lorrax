@@ -131,7 +131,7 @@ def compute_chi_head_at_q(
 
     Returns ``(n_w, nq)`` complex (singleton ω axis when scalar).
     """
-    pref = 4.0 / (float(cell_volume) * float(nk_tot) *
+    pref = 2.0 / (float(cell_volume) * float(nk_tot) *
                    float(max(nspin, 1)) * float(max(nspinor, 1)))
     pref_c = jnp.asarray(pref, dtype=jnp.complex128)
     omegas_arr = jnp.asarray(omegas, dtype=jnp.complex128)
@@ -191,7 +191,7 @@ def compute_chi_wing_at_q(
     nspinor: int = 1,
 ):
     """Public driver: χ_wing,μ(q, ω) on the q-list embedded in rho_cvkq."""
-    pref = 4.0 / (float(cell_volume) * float(nk_tot) *
+    pref = 2.0 / (float(cell_volume) * float(nk_tot) *
                    float(max(nspin, 1)) * float(max(nspinor, 1)))
     pref_c = jnp.asarray(pref, dtype=jnp.complex128)
     omegas_arr = jnp.asarray(omegas, dtype=jnp.complex128)
@@ -263,7 +263,7 @@ def compute_S_tensor_sos(
     v^α_t / Δ_t  here, with the same denominator regularisation pattern
     as ``compute_S_omega`` (which sets the term to 0 when |Δ| < 1e-12).
     """
-    pref = 4.0 / (float(cell_volume) * float(nk_tot) *
+    pref = 2.0 / (float(cell_volume) * float(nk_tot) *
                    float(max(nspin, 1)) * float(max(nspinor, 1)))
     pref_c = jnp.asarray(pref, dtype=jnp.complex128)
 
@@ -330,7 +330,7 @@ def compute_w_tensor_sos(
     velocity / Δ_t factors.  ``b0_cvk_mu`` is the q=0 centroid pair-
     density vertex  ``b^0_{t,μ} = Σ_s ψ*_{c,k,s}(r_μ) ψ_{v,k,s}(r_μ)``.
     """
-    pref = 4.0 / (float(cell_volume) * float(nk_tot) *
+    pref = 2.0 / (float(cell_volume) * float(nk_tot) *
                    float(max(nspin, 1)) * float(max(nspinor, 1)))
     pref_c = jnp.asarray(pref, dtype=jnp.complex128)
 
