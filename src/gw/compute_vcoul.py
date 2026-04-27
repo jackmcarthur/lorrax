@@ -29,7 +29,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from functools import partial
 
 from common import timing
-from common.fft_helpers import make_jittable_local_fftn_3d
+from common.fft_helpers import make_sharded_fftn_3d
 
 
 # ============================================================================
@@ -1500,7 +1500,7 @@ def _make_V_q_caseA_kernel(
 
     # Local-FFT wrapper with custom_partitioning — same primitive the
     # chi0 / CCT / ZCT paths use.  Axes (-3,-2,-1) = (nx, ny, nz).
-    _local_fftn_3d = make_jittable_local_fftn_3d(
+    _local_fftn_3d = make_sharded_fftn_3d(
         mesh_xy, mu_xy_5d_spec, mu_xy_5d_spec)
 
     @partial(jax.jit,

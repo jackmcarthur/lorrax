@@ -44,8 +44,6 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 
 from common.fft_helpers import (
-    make_jittable_local_fftn_3d,
-    make_jittable_local_ifftn_3d,
     make_sharded_fftn_3d,
     make_sharded_ifftn_3d,
 )
