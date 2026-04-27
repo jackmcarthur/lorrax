@@ -14,6 +14,8 @@ import jax.numpy as jnp
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.fft_helpers import make_jittable_local_ifftn_3d
+
 from solvers.lanczos import (
     block_lanczos_eig,
     simple_lanczos_eig,
@@ -139,22 +141,34 @@ def solve_bse_sharded(
         mesh_xy, nkx, nky, nkz, include_W=include_W,
     )
 
-    # W_R = ifft(W_q) — precomputed once outside the Lanczos loop. Without
-    # the head, this is a property of the body W. The head was already
-    # injected at q=0 by load_bse_data_from_restart_sharded; that q=0 piece
-    # is a constant under ifft over the q-axis (it lives at a single q
-    # index and the IFFT just spreads it uniformly across R), so the
-    # precomputation is consistent with the head-corrected W.
-    # Compute W_R = ifft_q(W_q) ONCE inside the outer jit so the FFT runs
-    # sharding-aware on the (μ,ν)-sharded W tensor. Doing the ifft eagerly
-    # outside the jit makes XLA all-gather W on every Lanczos step (the
-    # eager output sharding doesn't match sh.W, so each matvec triggers a
-    # 337-MiB resharding) — see profile_sharded/collectives_details.txt.
-    @jax.jit
+    # W_R = ifft_q(W_q) computed ONCE inside the outer jit. Use the
+    # gw_jax custom-partitioned IFFT helper — plain ``jnp.fft.ifftn`` on
+    # a sharded tensor inserts a 337-MiB all-gather around the FFT under
+    # current JAX even when the FFT axes are unsharded; the helper hides
+    # the FFT in an opaque primitive so XLA only sees a per-device local
+    # FFT (axes (2,3,4) of W_q are replicated; (μ,ν) stay on x,y).
+    if include_W:
+        _W_local_ifftn = make_jittable_local_ifftn_3d(
+            mesh_xy, sh.W.spec, sh.W.spec, axes=(2, 3, 4), norm='ortho')
+    else:
+        _W_local_ifftn = None
+
+    rep_eig = NamedSharding(mesh_xy, P())  # eigenvalues / eigenvectors come back replicated.
+
+    # End-to-end jit with explicit in/out shardings + donate the bulky
+    # buffers we won't need post-Lanczos.
+    @partial(
+        jax.jit,
+        in_shardings=(
+            sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
+            sh.eps, sh.eps, sh.W, sh.V,
+        ),
+        out_shardings=(rep_eig, rep_eig),
+        donate_argnums=(6,),  # W_q — only used to build W_R
+    )
     def _full_run(psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_q, V_q0):
         if include_W:
-            W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
-            W_R = jax.lax.with_sharding_constraint(W_R, sh.W)
+            W_R = _W_local_ifftn(W_q)
         else:
             W_R = W_q
         def matvec(v_flat):
