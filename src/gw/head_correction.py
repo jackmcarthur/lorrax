@@ -509,6 +509,84 @@ def compute_head_sigma_at_omega(
     return (head.R_h / cell_volume) * (occ_term + emp_term)
 
 
+def compute_ppm_head_sigma_kij(
+    head: HeadGNParams,
+    *,
+    omega_grid_ry: np.ndarray,
+    enk_ry: np.ndarray,
+    efermi_ry: float,
+    n_occ: int,
+    cell_volume: float,
+    nk_tot: int,
+    eta: float = 1.0e-6,
+) -> np.ndarray:
+    """q→0, G=G'=0 head contribution to PPM ``Σ^c_kij(ω)``.
+
+    At q=0, ``M_{nm}(k, q→0, G=0) = δ_{nm}``, so the head only enters the
+    band-diagonal ``(i, i)`` of the PPM ``Σ^c`` matrix.  With the GN pole
+    extracted in :func:`fit_head_gn` (``R_h = B_h / (2 Ω_h)``,
+    ``B_h = -W^c(0) · Ω_h²``):
+
+        Σ^c_n^head(ω - E_F) =
+            +R_h / (V_cell · N_k) · [
+                  f_n     / (ω - ε_n + Ω_h - iη)
+                + (1-f_n) / (ω - ε_n - Ω_h + iη)
+            ]
+
+    where ω, ε_n are taken in the same E_F-relative convention (the difference
+    ω - ε_n is invariant under that shift).  In the static limit ω → ε_n
+    this reduces to ``-W^c(0) / (2 V_cell N_k)`` for occupied bands and
+    ``+W^c(0) / (2 V_cell N_k)`` for empty bands, matching the COHSEX
+    static-head pieces (``Σ^{SX-X} + Σ^COH``) built by
+    :func:`compute_static_head_terms`.
+
+    Parameters
+    ----------
+    head
+        Fitted GN head pole.
+    omega_grid_ry
+        Σ^c frequency grid (relative to E_F), shape ``(n_omega,)`` in Ry.
+    enk_ry
+        Absolute band energies for the σ window, shape ``(nk, nb)`` in Ry.
+    efermi_ry
+        Fermi level in Ry (subtracted from ``enk_ry`` to get ``ε - E_F``).
+    n_occ
+        Number of occupied bands at the bottom of the σ window
+        (``f_n = 1`` for ``n < n_occ``, else ``0``).
+    cell_volume, nk_tot
+        Unit-cell volume and full-zone k-point count.
+    eta
+        Imaginary regularization for the retarded poles.
+
+    Returns
+    -------
+    sigma_kij : np.ndarray, shape ``(n_omega, nk, nb, nb)``, dtype complex128
+        Diagonal-in-band head contribution; off-diagonals are zero.
+    """
+
+    omega = np.asarray(omega_grid_ry, dtype=np.float64).reshape(-1)
+    enk = np.asarray(enk_ry, dtype=np.float64)
+    if enk.ndim != 2:
+        raise ValueError("enk_ry must be 2D (nk, nb)")
+    n_omega = int(omega.size)
+    nk, nb = enk.shape
+    out = np.zeros((n_omega, nk, nb, nb), dtype=np.complex128)
+    if abs(head.R_h) < 1.0e-30 or abs(head.omega_h) < 1.0e-30:
+        return out
+
+    eps_rel = enk - float(efermi_ry)                                # (nk, nb)
+    f = np.zeros((nb,), dtype=np.float64)
+    f[: max(0, min(int(n_occ), nb))] = 1.0
+    delta = omega[:, None, None] - eps_rel[None, :, :]              # (nω, nk, nb)
+    occ_term = f[None, None, :] / (delta + head.omega_h - 1j * eta)
+    emp_term = (1.0 - f[None, None, :]) / (delta - head.omega_h + 1j * eta)
+    sigma_diag = (head.R_h / (float(cell_volume) * float(nk_tot))) * (occ_term + emp_term)
+
+    idx = np.arange(nb)
+    out[:, :, idx, idx] = sigma_diag
+    return out
+
+
 def format_head_diagnostics(head: HeadGNParams, cell_volume: float) -> str:
     """Return a short multiline diagnostic summary for the scalar head fit."""
 
