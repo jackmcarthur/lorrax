@@ -14,7 +14,7 @@ import jax.numpy as jnp
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.fft_helpers import make_jittable_local_ifftn_3d
+from common.fft_helpers import make_sharded_ifftn_3d
 
 from solvers.lanczos import (
     block_lanczos_eig,
@@ -168,7 +168,11 @@ def solve_bse_sharded(
     # the FFT in an opaque primitive so XLA only sees a per-device local
     # FFT (axes (2,3,4) of W_q are replicated; (μ,ν) stay on x,y).
     if include_W:
-        _W_local_ifftn = make_jittable_local_ifftn_3d(
+        # 3D cuFFT in one shot rather than 3 sequential 1D custom_partitioning
+        # calls (the older ``make_jittable_local_ifftn_3d``).  Same correctness
+        # constraint (FFT axes replicated); ~5–10× fewer transposes in the
+        # generated HLO.
+        _W_local_ifftn = make_sharded_ifftn_3d(
             mesh_xy, sh.W.spec, sh.W.spec, axes=(2, 3, 4), norm='ortho')
     else:
         _W_local_ifftn = None

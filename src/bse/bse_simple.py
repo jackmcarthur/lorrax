@@ -78,10 +78,6 @@ def build_bse_simple_matvec(
 
     # 3D FFT over k-axes 5,6,7 of the 8D T tensor, via cuFFT 3D plan in
     # one shot.  shard_map only as axis-name binding (no collective).
-    # I tried fusing ifft → mul → fft into one shard_map — same kernels
-    # got generated (cuFFT is an opaque library call XLA can't fuse
-    # arithmetic into) but the larger shard_map body added compile +
-    # call overhead.  Net ~+1 s on Si 4×4×4.  Reverted.
     _T_8d_spec = P(None, "x", "y", None, None, None, None, None)
     _T_local_ifftn = make_sharded_ifftn_3d(
         mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
