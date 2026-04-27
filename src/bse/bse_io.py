@@ -452,6 +452,37 @@ def _parse_wfn_path(input_file: str) -> str:
     return wfn_file
 
 
+def _parse_head_overrides(input_file: Optional[str]):
+    """Extract ``vhead`` and ``whead_0freq`` overrides from cohsex.in.
+
+    Returns ``(vhead, whead_0freq)`` where each is ``complex`` or ``None``
+    if the key is absent / blank. These take precedence over any
+    restart-file head values when assembling the q=0 rank-1 update.
+    """
+    if input_file is None or not os.path.isfile(input_file):
+        return None, None
+    vhead = None
+    whead0 = None
+    with open(input_file) as fh:
+        for line in fh:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, _, val = stripped.partition("=")
+            key = key.strip().lower()
+            val = val.strip()
+            if not val:
+                continue
+            try:
+                if key == "vhead":
+                    vhead = complex(float(val))
+                elif key == "whead_0freq":
+                    whead0 = complex(float(val))
+            except ValueError:
+                continue
+    return vhead, whead0
+
+
 def apply_eqp_corrections(
     enk_full: np.ndarray,
     eqp_file: str,
@@ -538,6 +569,13 @@ def _load_ring_subset(
             W0_qmunu = jnp.asarray(f["W0_qmunu"][:])
         else:
             W0_qmunu = None
+        # G0_mu_nu = ζ(q=0, μ, G=0) — rank-1 head projector. Persisted by the
+        # GW writer; consumed below by the q=0 head-injection step.
+        G0_mu_nu = jnp.asarray(f["G0_mu_nu"][:]) if "G0_mu_nu" in f else None
+        # Restart-side scalar head fields (Phase B writer; may not exist yet).
+        vhead_restart = complex(f["vhead"][()]) if "vhead" in f else None
+        whead_restart = (jnp.asarray(f["whead"][:], dtype=jnp.complex128)
+                         if "whead" in f else None)
         if "psi_full_y" not in f or "enk_full" not in f:
             raise ValueError(
                 f"{restart_file} is missing canonical psi_full_y/enk_full datasets. "
@@ -550,6 +588,40 @@ def _load_ring_subset(
         enk_full_np = apply_eqp_corrections(enk_full_np, eqp_file, input_file=input_file)
 
     enk_full = jnp.asarray(enk_full_np)
+
+    # ── q=0 head injection (rank-1 in (μ,ν) ISDF basis) ──────────────────
+    # compute_vcoul zeroes the G=G'=0 element of v(q=0); BGW's BSE kernel
+    # uses the mini-BZ-averaged 1/q² value there. We reinstate it as a
+    # rank-1 update in the centroid basis using G0_mu_nu = ζ(0,μ,G=0).
+    # Source priority: cohsex.in overrides > restart-file values. Both
+    # vhead and whead_0freq must resolve for the W update; either is
+    # silently skipped if missing.
+    vhead_in, whead0_in = _parse_head_overrides(input_file)
+    vhead = vhead_in if vhead_in is not None else vhead_restart
+    if whead0_in is not None:
+        whead = jnp.asarray([whead0_in], dtype=jnp.complex128)
+    else:
+        whead = whead_restart
+    if G0_mu_nu is not None and (vhead is not None or whead is not None):
+        from gw.head_correction import apply_q0_head_rank1
+        # Pull cell_volume from the WFN — head update needs the 1/V_cell
+        # scaling (see sigma_direct_check.py:489 for the canonical convention).
+        from file_io import WFNReader
+        wfn = WFNReader(_parse_wfn_path(input_file)) if input_file else None
+        cell_volume = float(wfn.cell_volume) if wfn is not None else None
+        if cell_volume is None:
+            print("BSE: head injection skipped — could not resolve cell_volume "
+                  "(input_file required)")
+        else:
+            V_qmunu, W0_qmunu = apply_q0_head_rank1(
+                V_qmunu, W0_qmunu, G0_mu_nu, vhead, whead, cell_volume,
+                omega_index=0)
+            v_str = (f"vhead={complex(vhead).real:.3f}"
+                     if vhead is not None else "vhead=skipped")
+            w_str = (f"whead[0]={complex(whead[0]).real:.3f}"
+                     if whead is not None else "whead=skipped")
+            print(f"BSE: q=0 head injected (rank-1 in μν, V_cell={cell_volume:.2f}): "
+                  f"{v_str}, {w_str}")
 
     nkx, nky, nkz = V_qmunu.shape[3:6]
     nk = nkx * nky * nkz
