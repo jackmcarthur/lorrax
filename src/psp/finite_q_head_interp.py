@@ -73,26 +73,59 @@ remains valid through the q'→0 limit, with all singular behaviour analytic.
 PoC scope (this file)
 =====================
 
-Serial, single-device.  The intent is correctness and pedagogical clarity, not
-production performance.  Public surface:
+Serial, single-device.  Reconstruction kernel + glue for an end-to-end
+finite-q W-interpolation experiment, leaning on the existing SOS pipeline:
 
-  - :func:`v_head_3d`, :func:`v_head_2d_slab`           singular head v(Q)
-  - :func:`compute_g_mu_at_q`                            absolute-channel projector
-  - :func:`compute_V_body_from_zeta`                     V_body as in compute_V_q (G_q-zeroed)
-  - :func:`compute_pair_density_head`                    h_t(q) = ⟨c,k-q|e^{iq·r}|v,k⟩
-  - :func:`compute_pair_density_centroid`                b_{t,μ}(q) = Σ_s ψ*ψ at r_μ
-  - :func:`compute_chi_head_wing_body_q`                 χ_head, χ_wing, χ_wing', χ_body (SOS)
-  - :func:`compute_dipole_dt`                            d_{a,t} = ⟨c,k|∇_k|v,k⟩/(ε_c−ε_v)
-  - :func:`compute_q0_dispersion_tensors`                S_ab, w_aμ, w'_aν
-  - :func:`solve_W_body0`                                (1-V_body χ_body)^{-1} V_body
-  - :func:`build_chi_head_eff_and_A_wings`               local-field combinations
-  - :func:`reconstruct_V_munu`, :func:`reconstruct_W_munu`   per-Q reconstruction
-  - :func:`fourier_interpolate_coarse_to_fine`           crude Fourier upscaler
-  - :func:`reconstruct_W_at_target_Q`                    end-to-end reconstruction at Q
+  • SOS finite-q matrix elements ``rho_cvkq``, ``v_cvkq`` come from
+    ``psp.get_dipole_mtxels --with-finite-q`` (commit ``061a13f``/``903c2b7``).
+  • ``χ_head(q,ω)``, ``χ_wing(q,ω)``, ``S_{αβ}(0,ω)``, ``w_{α,μ}(0,ω)`` come
+    from ``common.chi_sos`` (validated bit-identical against
+    ``chi_from_dipole.compute_S_omega``).
+  • ``χ_wing'(q)`` and ``w'_{α,ν}`` are recovered by Hermitian conjugation
+    at static ω=0 — see :func:`chi_wingp_from_wing` for why this is exact
+    (real F_t at ω=0).
+  • ``ζ_q`` and ``g0_mu(q)`` come from ``compute_V_q_from_zeta_array``;
+    ``V_body(q)`` is recovered as a rank-1 subtract from the persisted
+    ``V_qmunu``.
+  • ``W_body0(q,ω) = (1 − V_body(q) χ_centroid(q,ω))^{-1} V_body(q)`` is a
+    per-q dense solve here (PoC); production would route through the
+    sharded :func:`gw.w_isdf.solve_w`.
 
-A synthetic smoke test (``__main__``) builds toy data, takes the q'→0 limit,
-and checks against the rank-1 q=0 head injection used today in
-``gw.head_correction.apply_q0_head_rank1``.
+Public surface:
+
+  Coulomb head (analytic, never interpolated)
+    :func:`v_head_3d`, :func:`v_head_2d_slab`
+
+  Absolute-channel projection at any q
+    :func:`compute_g_mu_at_q`,
+    :func:`extract_V_body_from_V_q`              rank-1 subtract from V_qmunu
+
+  Centroid pair-density vertex at finite q
+    :func:`build_b_cvkq_mu_from_centroid_wfns`
+
+  Wrappers around chi_sos + the Schur reductions
+    :func:`chi_wingp_from_wing`,
+    :func:`assemble_smooth_tensors_at_q`,        (g, V_body, W^0_body, χ_head_eff, A_wing, A_wing')
+    :func:`assemble_q0_dispersion`               (S_eff, B, B') + q=0 references
+
+  Body W solve (PoC dense solve)
+    :func:`solve_W_body0`
+
+  Local-field combinations (smooth interpolation targets)
+    :func:`build_chi_head_eff_and_A_wings`,
+    :func:`build_q0_dispersion_eff`
+
+  Reconstruction at a target Q
+    :func:`reconstruct_V_munu`, :func:`reconstruct_W_munu`,
+    :func:`reconstruct_W_at_target_Q_nonzero`,
+    :func:`reconstruct_W_at_target_Q_zero_cell`
+
+  Crude Fourier interpolation between coarse q's
+    :func:`fourier_interpolate_coarse_to_fine`
+
+Two synthetic smoke tests (``__main__``) verify:
+  1. Five-term reconstruction == bordered-Dyson Schur projection (1e-15).
+  2. q'→0 dispersion path == explicit Schur with linearised χ_wing (1e-13).
 
 Hooking up a real run
 =====================
@@ -100,17 +133,19 @@ Hooking up a real run
 The intended driver flow is:
 
   1. Read coarse-grid restart (V_qmunu, W0_qmunu, vhead, whead, G0_mu_nu, zeta_q).
-  2. For every coarse q ≠ 0: build h_t(q), b_{t,μ}(q) from full-zone ψ_n,k (via
-     symmetry_maps + load_wfns), then assemble χ_head/wing/wing'/body.
-  3. At q = 0: build d_{a,t} via psp.get_dipole_mtxels (or velocity matrix
-     elements), build S_ab, w_aμ, w'_aν.
-  4. Form W^0_body(Q) by reusing :func:`gw.w_isdf.solve_w` per-q with the
-     head-removed V_body.
-  5. Persist the smooth interpolation tensors next to the existing restart;
-     downstream BSE-on-fine-grid (``bandstructure.bse_setup.compute_wfns_fi``)
-     calls :func:`reconstruct_W_at_target_Q` for each fine Q.
+  2. Read coarse-grid dipole.h5/finite_q (rho_cvkq, v_cvkq, kminq_idx).
+  3. Read centroid wfns ψ_n,k(r_μ) at full BZ (for b_{t,μ}(q) construction).
+  4. For every coarse q ≠ 0: compute χ_head, χ_wing via chi_sos; derive
+     χ_wing' by conjugation; extract V_body via rank-1 subtract; resolve
+     v_head(q); solve W^0_body(q); form (χ_head_eff, A_wing, A_wing').
+  5. At q = 0: compute S, w via chi_sos; W^0_body(0) from V_body(0) and
+     χ_centroid(0); form S_eff, B, B'.
+  6. Interpolate the smooth tensors (g, V_body, W^0_body, χ_head_eff,
+     A_wing, A_wing') to fine Q's (Fourier upscale or trilinear).
+  7. Reconstruct V_μν(Q), W_μν(Q,ω) at every fine Q using the analytic
+     v_head(Q).
 
-Step 5 closes the loop with C's q=0 head rank-1 work
+Step 7 closes the loop with C's q=0 head rank-1 work
 (``gw.head_correction.apply_q0_head_rank1``); the q'→0 limit of this
 reconstruction is exactly that rank-1 update.
 """
@@ -119,7 +154,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -214,212 +249,167 @@ def compute_g_mu_at_q(
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  Body Coulomb  V^body_{μν}(q)  — thin wrapper for clarity
+#  Body Coulomb  V^body_{μν}(q) — rank-1 subtract from V_qmunu
 # ════════════════════════════════════════════════════════════════════════
 #
-# In production we already have ``gw.compute_vcoul.compute_V_q_from_zeta_array``
-# which returns (V_body, g0_mu) for one q. The "body" Coulomb is the same
-# routine *with the absolute channel zeroed* — currently only at q_red = 0
-# is G=0 explicitly excluded (``compute_vcoul`` zeros the G=G'=0 element).
-# The interpolation needs the same exclusion at every coarse q (with G_Q
-# the relevant absolute channel).  The user's note suggests storing
-# ``V_qmunu`` with G_Q always zeroed; that is a one-line change in
-# compute_V_q_from_zeta_array (subtract the rank-1  g* g  contribution
-# at G_Q after the full sum, which is what apply_q0_head_rank1 reverses
-# at q=0 today).
-#
-# This PoC takes the *already-G_Q-zeroed* V_body arrays as input — exactly
-# what GW persists once the small compute_vcoul change is in place.
+# V_centroid(q) as persisted by gw_jax includes the absolute G_Q channel
+# at q≠0 (compute_vcoul only zeros G=0 at q_red=0 today).  The user's
+# bordered formulation requires V_body = V_centroid − v_head(q)·g g†
+# at every coarse q.  Since g0_mu(q) is already saved per coarse q in the
+# restart and v_head(q) is analytic, the body extraction is one rank-1
+# subtract — no GW recompute needed.
 
-
-# ════════════════════════════════════════════════════════════════════════
-#  Sum-over-states evaluators
-# ════════════════════════════════════════════════════════════════════════
-#
-# Conventions (matching gw.w_isdf.compute_chi0 and BGW):
-#
-#   χ_GG'(q,ω) = (4 / N_k Ω) · Σ_{v,c,k} M*_t(G) M_t(G')
-#                                · [ 1/(ω − Δε_t + iη) − 1/(ω + Δε_t − iη) ]
-#
-#   Δε_t = ε_{c,k-q} − ε_{v,k},     M_t(G) = ⟨c,k-q | e^{i(q+G)·r} | v,k⟩
-#
-# In the centroid basis the body matrix element is  Σ_s ψ*_{c,k-q,s}(r_μ) ψ_{v,k,s}(r_μ),
-# and the head element (G=0) is  M_t(0) = h_t(q) = ⟨c,k-q|e^{iq·r}|v,k⟩.
-#
-# The PoC denominator factor is parametrised: pass any ``denom_fn(eps_v,
-# eps_c, omega)`` returning F_t(q, ω). For static screening (COHSEX) use
-# the convenience :func:`F_static`.
-
-def F_static(eps_v: np.ndarray, eps_c: np.ndarray, omega: complex = 0.0+0j,
-             eta: float = 1e-6) -> np.ndarray:
-    """Static-limit Adler–Wiser denominator factor (without the leading 4/N_k Ω).
-
-        F_t = 1/(ω − Δε_t + iη) − 1/(ω + Δε_t − iη)
-
-    For ω → 0 this reduces to  −2 Δε_t / (Δε_t² + η²)  — pure real, negative.
-
-    Shapes:  eps_v[v,k] and eps_c[c,k] broadcast against the transition axis.
-    Returns an array shaped like the broadcast outer  (v,c,k)  product.
-    """
-    deps = eps_c[:, None, :] - eps_v[None, :, :]                    # (c, v, k)
-    denom1 = (omega - deps + 1j * eta)
-    denom2 = (omega + deps - 1j * eta)
-    return 1.0 / denom1 - 1.0 / denom2                              # (c, v, k)
-
-
-def compute_pair_density_head(
-    psi_v_k_box: np.ndarray,        # (n_v, n_spinor, nx, ny, nz)  ψ_{v,k} on FFT box (full ψ, not cell-periodic)
-    psi_c_kmq_box: np.ndarray,      # (n_c, n_spinor, nx, ny, nz)  ψ_{c, k-q}, similarly
+def extract_V_body_from_V_q(
+    V_q: np.ndarray,                # (n_μ, n_ν)
+    g_mu: np.ndarray,               # (n_μ,)
+    v_head_value: float,            # v(q) — analytic, finite for q ≠ 0
 ) -> np.ndarray:
-    """Return  h_t(q) = ⟨c, k-q | e^{iq·r} | v, k⟩  for one (k, q).
+    """V_body(q) = V_q(q) − v_head(q) · g_μ* g_ν.
 
-    Cell-periodic identity:  ⟨c,k-q|e^{iq·r}|v,k⟩
-                          = (1/Ω_cell) ∫_cell  u*_{c,k-q}(r) u_{v,k}(r) dr
-                          = sum over the FFT box of  conj(ψ_c) ψ_v / N_FFT
-                          (the e^{iq·r} cancels the Bloch-phase mismatch).
-
-    Inputs are full ψ (with Bloch phase) on the FFT box — exactly what the
-    LORRAX wfn-loader returns.  The cancellation of  e^{−i k·r} e^{i (k-q)·r}
-    against  e^{iq·r}  is automatic.
-
-    Shapes:
-      out: (n_c, n_v)  complex
+    At q=0, the persisted ``V_qmunu`` already has the G=G'=0 element zeroed
+    by ``compute_vcoul``; the rank-1 head term IS the missing piece, and
+    this function applied with ``v_head_value = vhead`` returns
+    V_body == V_qmunu (no-op for the body, since the rank-1 was never
+    added).  For q≠0, V_q includes the absolute channel and this routine
+    removes it.
     """
-    n_v = psi_v_k_box.shape[0]
-    n_c = psi_c_kmq_box.shape[0]
-    n_FFT = float(np.prod(psi_v_k_box.shape[2:]))
-    # Sum over spinor + spatial axes; broadcast over c (rows) and v (cols).
-    return jnp.einsum('csxyz,vsxyz->cv',
-                      jnp.conj(psi_c_kmq_box), psi_v_k_box,
-                      optimize=True) / n_FFT
+    return V_q - v_head_value * jnp.einsum('m,n->mn', jnp.conj(g_mu), g_mu)
 
 
-def compute_pair_density_centroid(
-    psi_v_k_rmu: np.ndarray,        # (n_v, n_spinor, n_μ)  ψ_{v,k}(r_μ)
-    psi_c_kmq_rmu: np.ndarray,      # (n_c, n_spinor, n_μ)  ψ_{c, k-q}(r_μ)
+# ════════════════════════════════════════════════════════════════════════
+#  Centroid pair-density vertex  b_{t,μ}(q)  for chi_sos.compute_chi_wing
+# ════════════════════════════════════════════════════════════════════════
+#
+# ``chi_sos`` consumes ``b_cvkq_mu[c,v,k,q,μ]`` as caller-provided input.
+# Here we assemble it from the ψ-at-centroid arrays already computed by
+# the htransform pipeline (or read from the centroid-wfn HDF5 product
+# of the GW preprocessing step).
+
+def build_b_cvkq_mu_from_centroid_wfns(
+    psi_rmu_full: np.ndarray,       # (nb, nspinor, n_μ, nk_full)  ψ_n,k(r_μ) at every full-BZ k
+    kminq_idx: np.ndarray,          # (nk_full, nq) int — k → k-q lookup (= dipole.h5/finite_q/kminq_idx)
+    v_lo: int, c_lo: int, c_hi: int,
 ) -> np.ndarray:
-    """Return  b_{t,μ}(q) = Σ_s ψ*_{c,k-q,s}(r_μ) ψ_{v,k,s}(r_μ)  for one (k, q).
+    """Return  b_{t,μ}(q) = Σ_s ψ*_{c,k-q,s}(r_μ) ψ_{v,k,s}(r_μ)  as the
+    (n_c, n_v, n_k_full, n_q, n_μ) tensor consumed by
+    ``chi_sos.compute_chi_wing_at_q``.
 
-    Output shape:  (n_c, n_v, n_μ)  complex.  Centroid pair density before
-    the ζ-overlap weighting — this is the canonical "B_at_mu" used by
-    htransform / bse_setup, for the (c,k-q ; v,k) pair.
+    The  c, v  band slices match the ones the dipole driver used:
+        v ∈ [v_lo : c_lo)         valence
+        c ∈ [c_lo : c_hi)         conduction
+
+    PoC routes through numpy with no chunking — for production this would
+    be a sharded contraction over the (μ, k) axes via shard_map.
     """
-    return jnp.einsum('csm,vsm->cvm',
-                      jnp.conj(psi_c_kmq_rmu), psi_v_k_rmu,
-                      optimize=True)
+    psi = jnp.asarray(psi_rmu_full)                        # (nb, ns, n_μ, nk)
+    nk_full, nq = kminq_idx.shape
+    n_v = c_lo - v_lo
+    n_c = c_hi - c_lo
+    n_mu = psi.shape[2]
+    out = jnp.zeros((n_c, n_v, nk_full, nq, n_mu), dtype=jnp.complex128)
+    for jq in range(int(nq)):
+        ikmq = jnp.asarray(kminq_idx[:, jq], dtype=jnp.int32)         # (nk_full,)
+        # ψ_c at k-q for every k:  (n_c, ns, n_μ, nk)
+        psi_c_kmq = jnp.take(psi[c_lo:c_hi], ikmq, axis=-1)
+        psi_v_k   = psi[v_lo:c_lo]                                     # (n_v, ns, n_μ, nk)
+        # b[c, v, k, μ] = Σ_s ψ*_c,k-q[s, μ, k] · ψ_v,k[s, μ, k]
+        b = jnp.einsum('csmk,vsmk->cvkm',
+                       jnp.conj(psi_c_kmq), psi_v_k, optimize=True)
+        out = out.at[..., jq, :].set(b)
+    return out
 
 
-def compute_chi_head_wing_body_q(
-    h: np.ndarray,                  # (n_c, n_v, n_k)             h_t(q)
-    b: np.ndarray,                  # (n_c, n_v, n_k, n_μ)        b_{t,μ}(q)
-    eps_v: np.ndarray,              # (n_v, n_k)                  ε_{v,k}
-    eps_c_kmq: np.ndarray,          # (n_c, n_k)                  ε_{c, k-q}  (already mapped)
-    cell_volume: float,
-    n_k_total: int,                 # full-BZ N_k for the prefactor
-    spin_factor: float = 4.0,       # BGW χ leading 4 (= 2·spin·2 from Adler–Wiser)
-    denom_fn: Callable = F_static,
-    omega: complex = 0.0+0j,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Build the four (head, wing, wing', body) susceptibility pieces at one q.
+def chi_wingp_from_wing(chi_wing: np.ndarray,
+                        omega_is_static: bool = True) -> np.ndarray:
+    """Recover  χ_wing'(q,ω) from χ_wing(q,ω) by Hermitian conjugation.
 
-    Returns (all in the natural BGW units, *before* the head/wing scaling
-    convention used in epsilon.x — same convention as ``compute_chi0``):
+    For static screening (ω = 0, real F_t) the SOS forms
 
-      χ_head   : ()                     scalar
-      χ_wing   : (n_μ,)                 (b*_{t,μ} h_t  contracted)
-      χ_wing'  : (n_ν,)                 (h*_t b_{t,ν}  contracted)
-      χ_body   : (n_μ, n_ν)             (b*_{t,μ} b_{t,ν} contracted)
+        χ_wing[μ]  = Σ_t F_t · b*_{t,μ}(q) · h_t(q)
+        χ_wing'[ν] = Σ_t F_t · h*_t(q)     · b_{t,ν}(q)
 
-    Numerical formula:
+    differ only by complex conjugation: χ_wing'[ν] = (χ_wing[ν])* exactly.
+    For finite real ω with real F_t the same identity holds. For complex
+    ω (off-axis) F_t becomes complex and the identity breaks; an extra
+    SOS pass is required (chi_sos doesn't currently expose it but mirrors
+    chi_wing trivially).
 
-      F_t  = denom_fn(eps_v, eps_c_kmq, omega)             (n_c, n_v, n_k)
-      pref = spin_factor / (cell_volume · n_k_total)
-
-      χ_head     = pref · Σ_t F_t · |h_t|²
-      χ_wing[μ]  = pref · Σ_t F_t · b*_{t,μ} · h_t
-      χ_wing'[ν] = pref · Σ_t F_t · h*_t   · b_{t,ν}
-      χ_body[μν] = pref · Σ_t F_t · b*_{t,μ} · b_{t,ν}
-
-    All transition contractions are done with one ``einsum`` per piece to
-    keep memory bounded (no  (c,v,k,μ,ν)  intermediates).
+    Pass-through copy with conjugation; no extra SOS work.
     """
-    F = denom_fn(eps_v, eps_c_kmq, omega)                  # (c, v, k)
-    pref = spin_factor / (cell_volume * float(n_k_total))
-
-    # Head — pure SOS sum.
-    chi_head = pref * jnp.einsum('cvk,cvk,cvk->',
-                                 F, jnp.conj(h), h, optimize=True)
-
-    # Wings — these are (n_μ,) and (n_ν,).
-    # Memory: (c,v,k,μ) only inside einsum; jax/numpy keeps the loop fused.
-    chi_wing = pref * jnp.einsum('cvk,cvkm,cvk->m',
-                                 F, jnp.conj(b), h, optimize=True)
-    chi_wingp = pref * jnp.einsum('cvk,cvk,cvkn->n',
-                                  F, jnp.conj(h), b, optimize=True)
-
-    # Body — output (n_μ, n_ν), the heaviest contraction.  This recomputes
-    # what gw.w_isdf.compute_chi0 already does; useful as a sanity reference
-    # for small systems, but in production the caller should reuse compute_chi0.
-    chi_body = pref * jnp.einsum('cvk,cvkm,cvkn->mn',
-                                 F, jnp.conj(b), b, optimize=True)
-
-    return chi_head, chi_wing, chi_wingp, chi_body
+    if not omega_is_static:
+        raise NotImplementedError(
+            "chi_wing' for complex ω needs an explicit SOS pass; "
+            "chi_sos currently only writes χ_wing")
+    return jnp.conj(chi_wing)
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  q → 0 dispersion tensors  (S_ab, w_aμ, w'_aν)
+#  Glue: assemble smooth interpolation tensors at one coarse q
 # ════════════════════════════════════════════════════════════════════════
-#
-# At q = 0 the head vertex h_t(q) vanishes:  ⟨c,k|v,k⟩ = δ_{cv} = 0 in our
-# transition convention. Its leading derivative is the k·p / dipole element
-#
-#     d_{a,t}  =  q·d/dq h_t(q)|_{q=0}        (a labels Cartesian directions)
-#               =  i ⟨c,k| ∂/∂k_a |v,k⟩
-#                = i · ⟨c,k| p_a / m | v,k⟩ / (ε_{c,k} − ε_{v,k})        (BGW dipole)
-#
-# In LORRAX this is computed by ``psp.get_dipole_mtxels`` (matrix elements
-# of the velocity operator i[H,r] including non-local commutators).  The
-# PoC accepts d_{a,t} as input so users can plug in either path.
 
-def compute_q0_dispersion_tensors(
-    d: np.ndarray,                  # (n_a=3, n_c, n_v, n_k)  d_{a,t}
-    b0: np.ndarray,                 # (n_c, n_v, n_k, n_μ)    b_{t,μ}(q=0)
-    eps_v: np.ndarray,              # (n_v, n_k)
-    eps_c: np.ndarray,              # (n_c, n_k)              ε_{c,k}  (no shift)
-    cell_volume: float,
-    n_k_total: int,
-    spin_factor: float = 4.0,
-    denom_fn: Callable = F_static,
-    omega: complex = 0.0+0j,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Build  S_{ab}, w_{a,μ}, w'_{a,ν}, χ_body(q=0)  as the q'→0 expansion
-    coefficients of the susceptibility pieces.
+def assemble_smooth_tensors_at_q(
+    V_q: np.ndarray,                # (n_μ, n_ν)         persisted V_qmunu at this q
+    chi_centroid_q: np.ndarray,     # (n_μ, n_ν)         compute_chi0 output at this q
+    g_mu_q: np.ndarray,             # (n_μ,)             ζ_q,μ(G_Q)
+    v_head_value: float,            # v(q) analytic (finite for q ≠ 0)
+    chi_head: complex,              # chi_sos.compute_chi_head_at_q  →  this q
+    chi_wing: np.ndarray,           # chi_sos.compute_chi_wing_at_q  →  this q  (n_μ,)
+    chi_wingp: Optional[np.ndarray] = None,
+):
+    """Return the smooth interpolation targets at one nonzero coarse q:
 
-    Returns
-    -------
-    S_ab       : (3, 3)             head Hessian  ∂²χ_head/∂q'_a ∂q'_b|_0
-    w_a_mu     : (3, n_μ)           leading wing slope along q'_a, μ-component
-    w_a_nu     : (3, n_ν)           leading wing' slope along q'_a, ν-component
-    chi_body_0 : (n_μ, n_ν)         χ_body(q=0)
+        g_mu, V_body, W_body0, χ_head_eff, A_wing, A_wing'
+
+    χ_wing' defaults to ``conj(χ_wing)`` (static-ω regime).
     """
-    F = denom_fn(eps_v, eps_c, omega)                       # (c, v, k)
-    pref = spin_factor / (cell_volume * float(n_k_total))
+    if chi_wingp is None:
+        chi_wingp = chi_wingp_from_wing(chi_wing, omega_is_static=True)
+    V_body = extract_V_body_from_V_q(V_q, g_mu_q, v_head_value)
+    W_body0 = solve_W_body0(np.asarray(V_body), np.asarray(chi_centroid_q))
+    chi_eff, A_wing, A_wingp = build_chi_head_eff_and_A_wings(
+        chi_head, chi_wing, chi_wingp, W_body0)
+    return CoarseQDataNonzero(
+        g_mu=np.asarray(g_mu_q),
+        V_body=np.asarray(V_body),
+        W_body0=np.asarray(W_body0),
+        chi_head_eff=complex(chi_eff),
+        A_wing=np.asarray(A_wing),
+        A_wingp=np.asarray(A_wingp),
+    )
 
-    # S_ab = pref · Σ_t F_t · d*_{a,t} d_{b,t}    (small (3,3))
-    S = pref * jnp.einsum('cvk,acvk,bcvk->ab',
-                          F, jnp.conj(d), d, optimize=True)
 
-    # w_{a,μ}  = pref · Σ_t F_t · b*_{t,μ}(0) · d_{a,t}
-    w_mu = pref * jnp.einsum('cvk,cvkm,acvk->am',
-                             F, jnp.conj(b0), d, optimize=True)
+def assemble_q0_dispersion(
+    V_q0: np.ndarray,               # (n_μ, n_ν)         V_qmunu at q=0 (G=0 already zeroed)
+    chi_centroid_q0: np.ndarray,    # (n_μ, n_ν)         compute_chi0 at q=0
+    g_mu_q0: np.ndarray,            # (n_μ,)             G0_mu_nu from restart
+    S_ab: np.ndarray,               # (3, 3)             chi_sos.compute_S_tensor_sos
+    w_a_mu: np.ndarray,             # (3, n_μ)           chi_sos.compute_w_tensor_sos
+    w_a_nu: Optional[np.ndarray] = None,
+):
+    """Return the q=0 mini-cell coarse data (analytic dispersion):
 
-    # w'_{a,ν} = pref · Σ_t F_t · d*_{a,t} · b_{t,ν}(0)
-    w_nu = pref * jnp.einsum('cvk,acvk,cvkn->an',
-                             F, jnp.conj(d), b0, optimize=True)
+        g_mu_at_q0, V_body_q0, W_body0_q0, S_eff, B, B'
 
-    chi_body_0 = pref * jnp.einsum('cvk,cvkm,cvkn->mn',
-                                   F, jnp.conj(b0), b0, optimize=True)
-    return S, w_mu, w_nu, chi_body_0
+    ``w'_{a,ν}`` defaults to ``conj(w_a_mu)`` (static-ω regime).
+    Note V_body_q0 == V_q0 because compute_vcoul already zeros G=G'=0 at q=0.
+    """
+    if w_a_nu is None:
+        w_a_nu = jnp.conj(w_a_mu)
+    # V_body at q=0: gw_jax persists V_qmunu with the G=0 element ALREADY
+    # zeroed at q=0 (compute_vcoul does this).  No further subtraction needed.
+    V_body_q0 = np.asarray(V_q0)
+    W_body0_q0 = solve_W_body0(V_body_q0, np.asarray(chi_centroid_q0))
+    S_eff, B, Bp = build_q0_dispersion_eff(
+        np.asarray(S_ab), np.asarray(w_a_mu), np.asarray(w_a_nu),
+        W_body0_q0)
+    return CoarseQDataZero(
+        g_mu_at_q0=np.asarray(g_mu_q0),
+        V_body_q0=V_body_q0,
+        W_body0_q0=np.asarray(W_body0_q0),
+        S_eff=np.asarray(S_eff),
+        B=np.asarray(B),
+        Bp=np.asarray(Bp),
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════
