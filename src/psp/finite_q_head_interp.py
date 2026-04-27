@@ -630,34 +630,50 @@ def fourier_interpolate_coarse_to_fine(
             "Fine grid must be an integer multiple of the coarse grid in this "
             "PoC; for arbitrary Q targets use the direct-sum interpolation "
             "with the same R-space kernel.")
-    # FT to R-space, zero-pad in R, IFT back: this is the standard "spectral
-    # zero-padding" upscale.  Effectively assumes the function is smooth and
-    # bandlimited by the coarse grid — fine for the smooth interpolation
-    # targets here, NOT fine for the singular Coulomb head (which is why we
-    # split it off analytically).
-    # Use ifftn on the q-axes (BGW convention: q-space is forward FFT).
+    # Spectral zero-padding upscale: ifftn → R-space → zero-pad in R → fftn.
+    # Per-axis low-frequency packing handled generically (works for any axis
+    # sizes including the trivial ``Nc=1`` case for slab geometries).
     R = np.fft.ifftn(values_coarse, axes=(0, 1, 2))
-    # Pad to (Nx, Ny, Nz) preserving the FFT-frequency layout.
     pad_shape = (Nx, Ny, Nz) + values_coarse.shape[3:]
     R_padded = np.zeros(pad_shape, dtype=values_coarse.dtype)
-    # Copy the four corners (positive + negative frequencies) into the pad.
-    half_x = nkx_c // 2; half_y = nky_c // 2; half_z = nkz_c // 2
-    # (Simple corner copy — works for even coarse grids.  For odd coarse
-    # grids the Nyquist split is one-sided; this PoC asserts even.)
-    if any(c % 2 for c in (nkx_c, nky_c, nkz_c)):
-        raise NotImplementedError("Coarse grid axes must be even in this PoC.")
-    sx = slice; sy = slice; sz = slice  # readability
-    R_padded[:half_x, :half_y, :half_z]       = R[:half_x, :half_y, :half_z]
-    R_padded[-half_x:, :half_y, :half_z]      = R[half_x:, :half_y, :half_z]
-    R_padded[:half_x, -half_y:, :half_z]      = R[:half_x, half_y:, :half_z]
-    R_padded[:half_x, :half_y, -half_z:]      = R[:half_x, :half_y, half_z:]
-    R_padded[-half_x:, -half_y:, :half_z]     = R[half_x:, half_y:, :half_z]
-    R_padded[-half_x:, :half_y, -half_z:]     = R[half_x:, :half_y, half_z:]
-    R_padded[:half_x, -half_y:, -half_z:]     = R[:half_x, half_y:, half_z:]
-    R_padded[-half_x:, -half_y:, -half_z:]    = R[half_x:, half_y:, half_z:]
-    # Renormalise so that ifft/fft round-trips at the same magnitudes.
-    scale = (Nx * Ny * Nz) / (nkx_c * nky_c * nkz_c)
-    return np.fft.fftn(R_padded, axes=(0, 1, 2)) * scale
+
+    def _axis_index_pairs(Nc, Nf):
+        """Per-axis low-frequency unpack: list of (slice_in_coarse, slice_in_fine)
+        chunks that copy DC + positive freqs to the front and negative freqs to
+        the tail.  Generic for arbitrary Nc / Nf, including Nc=1 (axis is just
+        DC; fine axis fills with the constant).
+
+        ``Nyquist`` (when Nc is even) lives at index Nc//2 in the coarse FFT
+        layout.  Spectral zero-padding splits the Nyquist component evenly
+        between the +Nc/2 and −Nc/2 positions of the fine grid; here we put
+        full weight on the +Nc/2 slot and 0 on the −Nc/2 slot, which is
+        standard for real-valued spectral upscaling and matches numpy's
+        ``np.fft.fftn(zero-pad)`` convention.  For complex data (no
+        Hermitian constraint) this is sometimes called the "single-sided"
+        pad; results agree with the round-trip identity at coarse points.
+        """
+        if Nc == 1:
+            return [(slice(0, 1), slice(0, 1))]
+        half = Nc // 2 + (Nc % 2)            # number of "low + DC" coeffs
+        neg  = Nc - half                     # number of "negative" coeffs
+        return [
+            (slice(0, half),     slice(0, half)),                      # DC + low+
+            (slice(half, Nc),    slice(Nf - neg, Nf)),                 # high-/neg
+        ]
+
+    px = _axis_index_pairs(nkx_c, Nx)
+    py = _axis_index_pairs(nky_c, Ny)
+    pz = _axis_index_pairs(nkz_c, Nz)
+    for sx_c, sx_f in px:
+        for sy_c, sy_f in py:
+            for sz_c, sz_f in pz:
+                R_padded[sx_f, sy_f, sz_f] = R[sx_c, sy_c, sz_c]
+
+    # No extra scale factor.  The ifftn → pad-with-zeros → fftn round-trip
+    # already preserves coincident-point values exactly: at fine indices that
+    # coincide with coarse grid points, fftn(R_padded) recovers v_coarse to
+    # machine precision.  See _smoke_test_fourier_upscale below.
+    return np.fft.fftn(R_padded, axes=(0, 1, 2))
 
 
 # ════════════════════════════════════════════════════════════════════════
