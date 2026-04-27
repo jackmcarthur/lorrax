@@ -215,7 +215,7 @@ def _preview_lanczos(
     block_size: int = 1,
     rtol: float = 0.0,
     check_every: int = 4,
-    low_mem_t: bool = True,
+    matvec_kind: str = "ring",
 ) -> None:
     restart_file = _find_restart_file(input_file)
     n_devices = jax.device_count()
@@ -236,7 +236,7 @@ def _preview_lanczos(
             input_file=input_file, n_occ=n_occ,
         )
         # T-encoding strategy plumbed via the data dict (see solve_bse_sharded).
-        data["low_mem"] = low_mem_t
+        data["matvec_kind"] = matvec_kind
         # EQP override on enk_full (BGW eqp1.dat semantics).
         if eqp_file is not None:
             from .bse_io import apply_eqp_corrections
@@ -432,12 +432,18 @@ if __name__ == "__main__":
         help="Convergence check cadence in block iterations (default 4).",
     )
     parser.add_argument(
+        "--matvec-kind",
+        choices=("ring", "gather", "simple"),
+        default="ring",
+        help="BSE matvec implementation. ``ring`` (default): shard_map + "
+             "lax.ppermute (low memory). ``gather``: shard_map + lax.all_gather "
+             "(faster on small problems). ``simple``: plain jit + jnp.einsum "
+             "+ with_sharding_constraint, no shard_map (XLA auto-partitions).",
+    )
+    parser.add_argument(
         "--gather-t",
         action="store_true",
-        help="Switch the T-encoding (W-contraction's first half) from "
-             "ring-ppermute to all-gather. Higher peak memory, single "
-             "collective per matvec instead of py-1 ring shifts; usually "
-             "faster on small problems.",
+        help="(Deprecated alias for --matvec-kind=gather)",
     )
     parser.add_argument("--kpm-dos", action="store_true", help="Run KPM Chebyshev DOS and exit.")
     parser.add_argument("--kpm-n-moments", type=int, default=100, help="Chebyshev moments M for KPM.")
@@ -591,7 +597,7 @@ if __name__ == "__main__":
         block_size=args.block_size,
         rtol=args.lanczos_rtol,
         check_every=args.lanczos_check_every,
-        low_mem_t=not args.gather_t,
+        matvec_kind=("gather" if args.gather_t else args.matvec_kind),
     )
     raise SystemExit(0)
 
