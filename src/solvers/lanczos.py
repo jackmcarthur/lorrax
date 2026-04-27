@@ -298,3 +298,285 @@ def lanczos_eig_jit(
     eigenvectors = eigenvectors / jnp.maximum(norms, 1e-15)
 
     return eigenvalues, eigenvectors
+
+
+def _build_block_tridiag(alpha_all, beta_all, max_iter: int, bs: int):
+    """Build the block-tridiagonal T from per-iter (bs,bs) blocks.
+
+    Done inside the jit by ``lax.fori_loop`` so the trace-time HLO stays
+    O(1) instead of unrolling ``max_iter`` slot updates. Used by both
+    the fixed-iter and convergence-driven block Lanczos paths.
+    """
+    T_size = bs * max_iter
+    T = jnp.zeros((T_size, T_size), dtype=jnp.complex128)
+
+    def body(j, T):
+        s = j * bs
+        T = lax.dynamic_update_slice(T, alpha_all[j], (s, s))
+        # Off-diagonal beta only when j+1 < max_iter (zero alpha/beta past
+        # the end keeps the slot a no-op even when j is at the boundary).
+        T = lax.dynamic_update_slice(T, beta_all[j], (s + bs, s))
+        T = lax.dynamic_update_slice(
+            T, jnp.conj(beta_all[j]).T, (s, s + bs))
+        return T
+
+    T = lax.fori_loop(0, max_iter - 1, body, T)
+    # Final diagonal block (no off-diagonal past the end).
+    s_last = (max_iter - 1) * bs
+    T = lax.dynamic_update_slice(T, alpha_all[max_iter - 1], (s_last, s_last))
+    return (T + jnp.conj(T).T) * 0.5
+
+
+def block_lanczos_eig_jit(
+    matvec: Callable[[jax.Array], jax.Array],
+    n: int,
+    n_eig: int = 20,
+    block_size: int = 4,
+    max_iter: int = 50,
+    seed: int = 42,
+    n_reorth: int = 2,
+) -> tuple[jax.Array, jax.Array]:
+    """JIT-compiled block Lanczos using ``lax.fori_loop``.
+
+    Same algorithm as :func:`block_lanczos_eig`, but all state lives in
+    pre-allocated arrays so the body fits in ``lax.fori_loop`` and the
+    caller's outer jit can fuse this with the matvec.  The matvec
+    operates on a *block* of trial vectors
+
+        matvec : (block_size, n) -> (block_size, n)
+
+    so the BSE-style ring matvec processes ``block_size`` vectors per
+    call.  That makes the per-call GEMMs ``block_size`` times larger
+    (better arithmetic intensity / GPU occupancy) and reduces the host
+    dispatch count by ``block_size`` for the same total Krylov
+    dimension.
+
+    The total Krylov dimension is ``block_size * max_iter``; pick
+    ``max_iter`` so this is comparable to a single-vector Lanczos's
+    ``max_iter``.
+
+    Parameters
+    ----------
+    matvec : (block_size, n) -> (block_size, n)
+        Hermitian matvec on a block of flat vectors.
+    n : int
+        Single-vector dimension.
+    n_eig : int
+        Number of lowest eigenvalues to compute.
+    block_size : int
+        Vectors per Lanczos block.
+    max_iter : int
+        Block iterations (fixed for JIT). Total Krylov size = block_size·max_iter.
+    seed : int
+        Random seed for initial block.
+    n_reorth : int
+        Window size (in *blocks*) for partial reorthogonalisation.
+    """
+    bs = int(block_size)
+    T_size = bs * int(max_iter)
+
+    # Initial orthonormal block via QR of random complex Gaussian.
+    key = jax.random.PRNGKey(seed)
+    k1, k2 = jax.random.split(key)
+    Q0 = (jax.random.normal(k1, (n, bs), dtype=jnp.float64)
+          + 1j * jax.random.normal(k2, (n, bs), dtype=jnp.float64))
+    Q0, _ = jnp.linalg.qr(Q0)                          # (n, bs)
+
+    # Ring buffer of all Q-blocks: (max_iter, n, bs).  alpha and beta
+    # blocks: (max_iter, bs, bs).  All pre-allocated to fit in fori_loop.
+    Q_all = jnp.zeros((int(max_iter), n, bs), dtype=jnp.complex128)
+    Q_all = Q_all.at[0].set(Q0)
+    alpha_all = jnp.zeros((int(max_iter), bs, bs), dtype=jnp.complex128)
+    beta_all = jnp.zeros((int(max_iter), bs, bs), dtype=jnp.complex128)
+
+    def body(j, carry):
+        Q_all, alpha_all, beta_all = carry
+        Q_j = Q_all[j]                                 # (n, bs)
+        # Block matvec over (bs, n) → (bs, n); transpose to (n, bs).
+        Z = matvec(Q_j.T).T                            # (n, bs)
+
+        alpha_j = jnp.conj(Q_j).T @ Z                  # (bs, bs)
+        alpha_all = alpha_all.at[j].set(alpha_j)
+        Z = Z - Q_j @ alpha_j
+
+        # Subtract Q_{j-1} · β_{j-1}^H (skip on j=0).
+        Q_jm1 = Q_all[jnp.maximum(j - 1, 0)]
+        beta_prev = beta_all[jnp.maximum(j - 1, 0)]
+        Z = jnp.where(j > 0, Z - Q_jm1 @ jnp.conj(beta_prev).T, Z)
+
+        # Partial reorth over the last n_reorth blocks.
+        def reorth_body(i, Z_acc):
+            valid = i < j
+            Q_i = Q_all[i]
+            proj = jnp.where(valid, jnp.conj(Q_i).T @ Z_acc, jnp.zeros((bs, bs), dtype=Z_acc.dtype))
+            return Z_acc - Q_i @ proj
+        start = jnp.maximum(0, j - n_reorth)
+        Z = lax.fori_loop(start, j + 1, reorth_body, Z)
+
+        # QR(Z) → next block + β_j.
+        Q_next, beta_j = jnp.linalg.qr(Z)              # (n, bs), (bs, bs)
+        beta_all = beta_all.at[j].set(beta_j)
+        next_idx = jnp.minimum(j + 1, int(max_iter) - 1)
+        Q_all = Q_all.at[next_idx].set(Q_next)
+        return (Q_all, alpha_all, beta_all)
+
+    Q_all, alpha_all, beta_all = lax.fori_loop(
+        0, int(max_iter), body, (Q_all, alpha_all, beta_all))
+
+    # Block-tridiagonal T built inside-jit (no Python loop unroll).
+    T = _build_block_tridiag(alpha_all, beta_all, int(max_iter), bs)
+
+    evals_T, vecs_T = jnp.linalg.eigh(T)
+    idx = jnp.argsort(evals_T)[:n_eig]
+    eigenvalues = evals_T[idx]
+
+    # Q_all is (max_iter, n, bs) → reshape to (n, T_size).
+    Q_full = jnp.transpose(Q_all, (1, 0, 2)).reshape(n, T_size)
+    eigenvectors = (Q_full @ vecs_T[:, idx]).T          # (n_eig, n)
+    norms = jnp.linalg.norm(eigenvectors, axis=1, keepdims=True)
+    eigenvectors = eigenvectors / jnp.maximum(norms, 1e-15)
+    return eigenvalues, eigenvectors
+
+
+def block_lanczos_eig_jit_converged(
+    matvec: Callable[[jax.Array], jax.Array],
+    n: int,
+    n_eig: int = 20,
+    block_size: int = 4,
+    max_iter: int = 50,
+    *,
+    rtol: float = 1e-6,
+    atol: float = 1e-8,
+    check_every: int = 4,
+    min_iter: int | None = None,
+    seed: int = 42,
+    n_reorth: int = 2,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Convergence-driven block Lanczos via ``lax.while_loop``.
+
+    Same algorithm as :func:`block_lanczos_eig_jit`, but the iteration
+    count is decided by Ritz-eigenvalue stability rather than fixed:
+
+      every ``check_every`` block-iters, build the partial T (with
+      future-block α/β set to zero), eigh it, and compare the lowest
+      ``n_eig`` Ritz values against the previous check.  Exit when
+
+          max_i |λ_i - λ_i_prev| < rtol·max(|λ_i|, atol).
+
+    The pre-allocated buffers fix the upper bound at ``max_iter`` block
+    iterations (so ``max_iter * block_size`` total Krylov dimension);
+    the ``while_loop`` carry includes the running iteration count and
+    the previous Ritz values for comparison.
+
+    Returns (eigenvalues, eigenvectors, n_iter_done) — the third value
+    is the actual block iteration count where the loop exited (≤
+    ``max_iter``).
+    """
+    bs = int(block_size)
+    M = int(max_iter)
+    T_size = bs * M
+    if min_iter is None:
+        min_iter = max(2 * check_every, max(1, n_eig // bs + 1))
+    min_iter = int(min_iter)
+
+    key = jax.random.PRNGKey(seed)
+    k1, k2 = jax.random.split(key)
+    Q0 = (jax.random.normal(k1, (n, bs), dtype=jnp.float64)
+          + 1j * jax.random.normal(k2, (n, bs), dtype=jnp.float64))
+    Q0, _ = jnp.linalg.qr(Q0)
+
+    Q_all = jnp.zeros((M, n, bs), dtype=jnp.complex128).at[0].set(Q0)
+    alpha_all = jnp.zeros((M, bs, bs), dtype=jnp.complex128)
+    beta_all = jnp.zeros((M, bs, bs), dtype=jnp.complex128)
+    last_evals = jnp.full((n_eig,), jnp.inf, dtype=jnp.float64)
+    converged = jnp.bool_(False)
+
+    def step(j, Q_all, alpha_all, beta_all):
+        Q_j = Q_all[j]
+        Z = matvec(Q_j.T).T
+        alpha_j = jnp.conj(Q_j).T @ Z
+        alpha_all = alpha_all.at[j].set(alpha_j)
+        Z = Z - Q_j @ alpha_j
+        Q_jm1 = Q_all[jnp.maximum(j - 1, 0)]
+        beta_prev = beta_all[jnp.maximum(j - 1, 0)]
+        Z = jnp.where(j > 0, Z - Q_jm1 @ jnp.conj(beta_prev).T, Z)
+
+        def reorth_body(i, Z_acc):
+            valid = i < j
+            Q_i = Q_all[i]
+            proj = jnp.where(
+                valid, jnp.conj(Q_i).T @ Z_acc,
+                jnp.zeros((bs, bs), dtype=Z_acc.dtype))
+            return Z_acc - Q_i @ proj
+        start = jnp.maximum(0, j - n_reorth)
+        Z = lax.fori_loop(start, j + 1, reorth_body, Z)
+
+        Q_next, beta_j = jnp.linalg.qr(Z)
+        beta_all = beta_all.at[j].set(beta_j)
+        Q_all = Q_all.at[jnp.minimum(j + 1, M - 1)].set(Q_next)
+        return Q_all, alpha_all, beta_all
+
+    def cond(state):
+        j, _, _, _, _, conv = state
+        return jnp.logical_and(j < M, jnp.logical_not(conv))
+
+    def body(state):
+        j, Q_all, alpha_all, beta_all, last_evals, _ = state
+        Q_all, alpha_all, beta_all = step(j, Q_all, alpha_all, beta_all)
+
+        # Convergence check — only every ``check_every`` iters and after
+        # ``min_iter`` warmup. ``jax.lax.cond`` keeps both branches
+        # constant-cost (no Python-level branching).
+        do_check = jnp.logical_and(
+            (j + 1) >= min_iter,
+            ((j + 1) % check_every) == 0,
+        )
+
+        def _check_branch(args):
+            alpha_all, beta_all, last_evals, j_done = args
+            T = _build_block_tridiag(alpha_all, beta_all, M, bs)
+            # Mask inactive (zero) part of T by adding a large constant
+            # to its diagonal — pushes inactive eigvals out of the
+            # spectrum so jnp.sort()[:n_eig] picks only real Ritz vals.
+            LARGE = jnp.asarray(1.0e6, dtype=T.real.dtype)
+            pos = jnp.arange(M * bs)
+            active = (j_done + 1) * bs                        # completed iters × bs
+            mask = (pos >= active).astype(T.real.dtype) * LARGE
+            T = T + jnp.diag(mask).astype(T.dtype)
+            ev = jnp.linalg.eigvalsh(T)
+            ev = jnp.sort(ev)[:n_eig]
+            scale = jnp.maximum(jnp.abs(ev), atol)
+            delta = jnp.max(jnp.abs(ev - last_evals) / scale)
+            new_conv = delta < rtol
+            return ev, new_conv
+
+        def _skip_branch(args):
+            _, _, last_evals, _ = args
+            return last_evals, jnp.bool_(False)
+
+        new_evals, new_conv = lax.cond(
+            do_check, _check_branch, _skip_branch,
+            (alpha_all, beta_all, last_evals, j),
+        )
+        return (j + 1, Q_all, alpha_all, beta_all, new_evals, new_conv)
+
+    init = (jnp.int32(0), Q_all, alpha_all, beta_all, last_evals, converged)
+    j_final, Q_all, alpha_all, beta_all, _, _ = lax.while_loop(cond, body, init)
+
+    # Final eigh — mask inactive blocks the same way as the convergence
+    # check, otherwise the zero eigvals from unfilled iters dominate
+    # ``sort()[:n_eig]``.
+    T = _build_block_tridiag(alpha_all, beta_all, M, bs)
+    LARGE_F = jnp.asarray(1.0e6, dtype=T.real.dtype)
+    pos_F = jnp.arange(T_size)
+    active_F = j_final * bs
+    mask_F = (pos_F >= active_F).astype(T.real.dtype) * LARGE_F
+    T = T + jnp.diag(mask_F).astype(T.dtype)
+    evals_T, vecs_T = jnp.linalg.eigh(T)
+    idx = jnp.argsort(evals_T)[:n_eig]
+    eigenvalues = evals_T[idx]
+    Q_full = jnp.transpose(Q_all, (1, 0, 2)).reshape(n, T_size)
+    eigenvectors = (Q_full @ vecs_T[:, idx]).T
+    norms = jnp.linalg.norm(eigenvectors, axis=1, keepdims=True)
+    eigenvectors = eigenvectors / jnp.maximum(norms, 1e-15)
+    return eigenvalues, eigenvectors, j_final
