@@ -77,10 +77,11 @@ def build_bse_simple_matvec(
     sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=jnp.float64))
 
     # 3D FFT over k-axes 5,6,7 of the 8D T tensor, via cuFFT 3D plan in
-    # one shot (much fewer transposes than the 3-sequential-1D-FFT
-    # variant).  The shard_map is here only as an axis-name binding so
-    # XLA knows the FFT axes are replicated and the call is local — no
-    # ``lax.ppermute`` / collective inside.
+    # one shot.  shard_map only as axis-name binding (no collective).
+    # I tried fusing ifft → mul → fft into one shard_map — same kernels
+    # got generated (cuFFT is an opaque library call XLA can't fuse
+    # arithmetic into) but the larger shard_map body added compile +
+    # call overhead.  Net ~+1 s on Si 4×4×4.  Reverted.
     _T_8d_spec = P(None, "x", "y", None, None, None, None, None)
     _T_local_ifftn = make_sharded_ifftn_3d(
         mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
@@ -161,9 +162,9 @@ def build_bse_simple_matvec(
         T_k = T.reshape(T.shape[0], T.shape[1], T.shape[2],
                         T.shape[3], T.shape[4], nkx, nky, nkz)
         T_R = _T_local_ifftn(T_k)
-        # Pointwise multiply W_R · T_R (broadcasting over b, t, s).
-        # W_R sharded P(x,y,None,None,None); T_R sharded
-        # P(None,x,y,None,None,None,None,None); multiply is local.
+        # Pointwise W_R · T_R: W_R sharded P(x,y,None,None,None);
+        # T_R sharded P(None,x,y,None,None,None,None,None); the
+        # broadcast-multiply is local on every (x,y) tile.
         U_R = W_R[None, :, :, None, None, :, :, :] * T_R
         U_q = _T_local_fftn(U_R)
         U = U_q.reshape(U_q.shape[0], U_q.shape[1], U_q.shape[2],
