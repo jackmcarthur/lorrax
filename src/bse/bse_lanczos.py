@@ -109,6 +109,9 @@ def solve_bse_sharded(
     rtol: float = 0.0,
     atol: float = 1e-8,
     check_every: int = 4,
+    solver_kind: str = "lanczos",
+    davidson_n_random_init: int = 5,
+    davidson_eps_shift_Ry: float = 1e-3,
 ) -> Tuple[jax.Array, jax.Array]:
     """Sharded BSE Lanczos using the (μ,ν) ring matvec.
 
@@ -176,6 +179,43 @@ def solve_bse_sharded(
             mesh_xy, sh.W.spec, sh.W.spec, axes=(2, 3, 4), norm='ortho')
     else:
         _W_local_ifftn = None
+
+    # ── Davidson path: doesn't fit inside a single jit wrap (Python-side
+    # iteration + on-the-fly Ritz solve), so build matvec + W_R outside and
+    # delegate to the shape-agnostic ``solvers.davidson.davidson``.  Returns
+    # the same `(eigenvalues, eigenvectors, n_iter_done)` tuple as the
+    # Lanczos path so callers don't branch.
+    if solver_kind == "davidson":
+        from solvers.davidson import davidson
+        from .bse_davidson_helpers import bse_diagonal_precond, init_bse_subspace
+
+        psi_c_X = data["psi_c_X"]; psi_c_Y = data["psi_c_Y"]
+        psi_v_X = data["psi_v_X"]; psi_v_Y = data["psi_v_Y"]
+        eps_c   = data["eps_c"];   eps_v   = data["eps_v"]
+        V_q0    = data["V_q0"];    W_q     = data["W_q"]
+        W_R = _W_local_ifftn(W_q) if include_W else W_q
+
+        def apply_H(V):    # V: (m, nc_pad, nv_pad, nk) sharded P(None,"x","y",None)
+            V = jax.lax.with_sharding_constraint(V, sh.X)
+            return matvec_ring(V, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
+                               eps_c, eps_v, W_R, V_q0)
+
+        bse_sharding = NamedSharding(mesh_xy, P(None, "x", "y", None))
+        precond_fn = bse_diagonal_precond(
+            eps_c, eps_v, sharding=NamedSharding(mesh_xy, P("x", "y", None)),
+            epsilon_shift=davidson_eps_shift_Ry)
+        X0 = init_bse_subspace(
+            eps_c, eps_v, n_eig=n_eig, n_random=davidson_n_random_init,
+            mesh=mesh_xy, sharding=bse_sharding)
+
+        eigenvalues, eigenvectors = davidson(
+            apply_H, n_eig=n_eig, precond_fn=precond_fn, X0=X0,
+            max_iter=max_iter, tol=atol if atol > 0 else 1e-8,
+            verbose=True,
+        )
+        # Match Lanczos return shape: (n_eig, bs=1, nc_pad, nv_pad, nk).
+        eigenvectors = eigenvectors.reshape(n_eig, 1, nc_pad, nv_pad, nk)
+        return eigenvalues, eigenvectors, jnp.int32(max_iter)
 
     rep_eig = NamedSharding(mesh_xy, P())  # eigenvalues / eigenvectors come back replicated.
 
