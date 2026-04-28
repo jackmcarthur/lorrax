@@ -18,7 +18,11 @@ import numpy as np
 
 from common import Meta, jax_profile
 from .minimax_config import MinimaxConfig
-from .minimax_screening import MinimaxNodes, build_static_minimax_window_pair
+from .minimax_screening import (
+    LaplaceMinimaxQuadrature,
+    MinimaxNodes,
+    build_static_minimax_window_pair,
+)
 
 
 # ============================================================================
@@ -408,6 +412,93 @@ def build_imag_quadrature(quad, omega_p, minimax_config, *, print_fn=None):
             f"  PPM imag-freq quadrature (ωp={float(omega_p):.4f} Ry): "
             f"R={R:.1f}, nodes={quad_imag.node_count}, err~{quad_imag.max_error:.1e}")
     return quad_imag
+
+
+def build_real_quadrature(quad, Omega, minimax_config, *, print_fn=None):
+    """Build real-frequency (HL-PPM) χ₀(Ω) quadrature without a new minimax kernel.
+
+    Decomposes the real-axis target into two ``1/y`` pieces and reuses
+    the existing static (noncrossing) Laplace minimax twice::
+
+        x / (x² - Ω²) = (1/2) · [ 1/(x - Ω)  +  1/(x + Ω) ]
+                      = -(1/2)/(Ω - x)  +  (1/2)/(Ω + x)
+
+    For ``Ω > x_max`` both ``Ω-x`` and ``Ω+x`` are strictly positive on
+    ``x ∈ [x_min, x_max]``, so each can be approximated by a standard
+    ``1/y`` minimax on the shifted interval (no new solver needed).
+
+    Combining via the substitutions ``y = Ω-x`` and ``y = Ω+x`` and
+    folding the constant ``e^{-τ·Ω}`` shift into the weights gives the
+    same ``Σ_l α_l e^{-τ_l x}`` representation that ``compute_chi0``
+    already consumes — with mixed-sign ``τ_l``: positive on the
+    ``(Ω+x)`` branch, negative on the ``(Ω-x)`` branch.
+
+    The numerical-stability prefold inside ``compute_chi0`` works
+    transparently because in the realistic HL regime (``Ω`` ≈ 200 Ry,
+    ``x_max`` ≈ 5 Ry → ``R'`` of either shifted interval ≈ 1.03)
+    each ``1/y`` minimax needs only 1-3 nodes and ``|τ_l|`` ≈ ``1/Ω``,
+    so any residual exponent ``|τ_l|·x_range`` ≈ 0.025 is harmless.
+
+    Requires ``Omega > quad.x_max``.
+    """
+    from .minimax_screening import solve_laplace_minimax_interval
+
+    Omega = float(Omega)
+    if Omega <= float(quad.x_max):
+        raise ValueError(
+            f"build_real_quadrature requires Omega > x_max "
+            f"(got Omega={Omega}, x_max={quad.x_max}). "
+            f"HL-PPM is only defined for probes above all transitions."
+        )
+    target_error = float(minimax_config.target_error)
+    max_nodes = int(minimax_config.max_nodes)
+
+    # (Ω + x) branch: y ∈ [Ω + x_min, Ω + x_max] (strictly positive).
+    quad_plus = solve_laplace_minimax_interval(
+        Omega + quad.x_min, Omega + quad.x_max,
+        target_error=target_error, max_nodes=max_nodes,
+    )
+    tau_plus = np.asarray(quad_plus.tau, dtype=np.float64)
+    alpha_plus = (
+        +0.5 * np.asarray(quad_plus.alpha, dtype=np.float64)
+        * np.exp(-tau_plus * Omega)
+    )
+
+    # (Ω - x) branch: y ∈ [Ω - x_max, Ω - x_min] (strictly positive for Ω > x_max).
+    quad_minus = solve_laplace_minimax_interval(
+        Omega - quad.x_max, Omega - quad.x_min,
+        target_error=target_error, max_nodes=max_nodes,
+    )
+    tau_minus_raw = np.asarray(quad_minus.tau, dtype=np.float64)
+    # 1/(Ω - x) ≈ Σ α e^{-τ(Ω-x)} = Σ [α e^{-τ·Ω}] e^{+τ·x}
+    # Cast into the kernel's e^{-τ'·x} form by τ' = -τ.  Decomposition sign is -1/2.
+    tau_minus = -tau_minus_raw
+    alpha_minus = (
+        -0.5 * np.asarray(quad_minus.alpha, dtype=np.float64)
+        * np.exp(-tau_minus_raw * Omega)
+    )
+
+    tau = np.concatenate([tau_plus, tau_minus])
+    alpha = np.concatenate([alpha_plus, alpha_minus])
+    err_combined = float(0.5 * (quad_plus.max_error + quad_minus.max_error))
+
+    fused = LaplaceMinimaxQuadrature(
+        x_min=float(quad.x_min),
+        x_max=float(quad.x_max),
+        tau=tau,
+        alpha=alpha,
+        max_error=err_combined,
+    )
+
+    if print_fn is not None:
+        print_fn(
+            f"  PPM real-freq quadrature (Ω={Omega:.4f} Ry, "
+            f"decomposed via 1/y minimax): "
+            f"+branch nodes={quad_plus.node_count} (R'={Omega/quad.x_min + quad.x_max/quad.x_min:.3f}), "
+            f"-branch nodes={quad_minus.node_count} "
+            f"(R'={(Omega-quad.x_min)/(Omega-quad.x_max):.3f}), "
+            f"err~{err_combined:.1e}")
+    return fused
 
 
 def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
