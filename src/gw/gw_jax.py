@@ -344,9 +344,15 @@ def main(argv=None):
 
 	Gij = build_Gij(meta, mesh_xy)
 
-	# q→0 head correction (exact band-diagonal terms for static COHSEX)
+	# q→0 head correction.  The bare-X head is the same physical quantity in
+	# both COHSEX and PPM modes; gating this on ``not use_ppm_sigma`` was
+	# the original ``Bare Σ_X missing q→0 head'' bug (skill compare/SKILL.md
+	# §4i).  The SX/COH head pieces are also attached to the static
+	# sig_sx/sig_coh in compute_cohsex_sigma, but for PPM those static values
+	# are overwritten downstream (sig_sx ← sig_x, sig_c ← PPM-evaluated
+	# correlation), so only the X-head survives — which is the piece needed.
 	static_head_terms = None
-	if config.do_G0 and not config.use_ppm_sigma:
+	if config.do_G0:
 		static_head_terms = _compute_static_head(
 			config, input_dir, wfn, sym, meta, config.do_screened, print0)
 
