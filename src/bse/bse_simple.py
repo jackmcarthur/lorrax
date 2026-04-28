@@ -31,20 +31,12 @@ mesh axis we'll need next.
 """
 from __future__ import annotations
 
-from functools import partial
-from types import SimpleNamespace
-from typing import Optional
-
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax import lax
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-
-from jax.experimental.shard_map import shard_map
+from jax.sharding import Mesh, PartitionSpec as P
 
 from common.fft_helpers import (
-    make_custom_partition_fftn_3d,
     make_sharded_fftn_3d,
     make_sharded_ifftn_3d,
 )
@@ -58,7 +50,6 @@ def build_bse_simple_matvec(
     nkz: int,
     *,
     include_W: bool = True,
-    fft_wrapper: str = "shard_map",
 ):
     """Build a plain-jit BSE matvec — no shard_map, no rings.
 
@@ -67,35 +58,21 @@ def build_bse_simple_matvec(
                eps_c, eps_v, W_R, V_q0)  → HX
 
     All collectives are XLA-generated from einsums + sharding hints.
-    Custom-partitioned FFTs from ``common.fft_helpers`` are still used
-    for the (kx, ky, kz) IFFT/FFT around the W contraction (those wrap
-    a JAX-bug-affected FFT primitive — separate from the shard_map
-    avoidance question).
+    The (kx, ky, kz) ifft/fft around the W contraction is wrapped with
+    ``make_sharded_*fftn_3d`` (single 3D cuFFT inside shard_map). A/B
+    benchmarks (custom_partitioning, fused_ifft_mul, fused_all) all
+    came in slower — cuFFT is a CustomCall and won't fuse with the
+    multiply, so the closure overhead is pure cost.
     """
     sh = make_bse_shardings(mesh_xy)
     nk = nkx * nky * nkz
     sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=jnp.float64))
 
-    # 3D FFT over k-axes 5,6,7 of the 8D T tensor, single cuFFT 3D plan
-    # wrapped in ``shard_map``.  ``fft_wrapper="custom_partitioning"`` is
-    # available for A/B testing — same primitive cost, but the
-    # CustomCallOp boundary blocks XLA from optimizing across the FFT
-    # (it ends up emitting an explicit ~100 ms reduce-scatter that
-    # shard_map's body-inlining elides).  Si 4×4×4 BSE: shard_map 6.1 s
-    # vs custom_partitioning 7.3 s.
     _T_8d_spec = P(None, "x", "y", None, None, None, None, None)
-    if fft_wrapper == "custom_partitioning":
-        _T_local_ifftn = make_custom_partition_fftn_3d(
-            mesh_xy, _T_8d_spec, _T_8d_spec, fft_kind="ifftn",
-            axes=(5, 6, 7), norm='ortho')
-        _T_local_fftn = make_custom_partition_fftn_3d(
-            mesh_xy, _T_8d_spec, _T_8d_spec, fft_kind="fftn",
-            axes=(5, 6, 7), norm='ortho')
-    else:
-        _T_local_ifftn = make_sharded_ifftn_3d(
-            mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
-        _T_local_fftn = make_sharded_fftn_3d(
-            mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
+    _T_local_ifftn = make_sharded_ifftn_3d(
+        mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
+    _T_local_fftn = make_sharded_fftn_3d(
+        mesh_xy, _T_8d_spec, _T_8d_spec, axes=(5, 6, 7), norm='ortho')
 
     def _matvec(
         X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,

@@ -32,7 +32,12 @@ def write_eigenvectors_stream(
 ) -> None:
     from .write_eigenvectors import generate_kpts_grid
 
-    eigenvalues = np.asarray(jax.device_get(eigenvalues[:n_write]))
+    # BGW eigenvectors.h5 stores eigenvalues in eV (header text in
+    # ``eigenvalues.dat`` says "eig (eV)"; matches BGW's BSE/diag.f90
+    # write path).  Our solvers return Ry — convert here so a downstream
+    # consumer using BGW conventions reads the right number.
+    RYD2EV = 13.6056980659
+    eigenvalues = np.asarray(jax.device_get(eigenvalues[:n_write])) * RYD2EV
     kpts = generate_kpts_grid(nkx, nky, nkz)
     nk = kpts.shape[0]
     ns = 1
@@ -80,7 +85,18 @@ def write_eigenvectors_stream(
 
         for i in range(n_write):
             vec = jax.device_get(eigenvectors[i])
+            # Sharded path returns (block=1, nc, nv, nk); the unsharded
+            # path returns (nc, nv, nk).  Squeeze the leading block axis
+            # if present so the transpose below is unambiguous.
+            if vec.ndim == 4:
+                vec = vec[0]
             vec = np.transpose(vec, (2, 0, 1))  # (nk, nc, nv)
+            # BGW convention: valence axis is reversed, v=0 is the highest
+            # valence band (just below the gap), counting down to deepest.
+            # Our internal slice ``val_idx = n_occ - n_val .. n_occ`` puts
+            # v=0 at the deepest valence — flip on write so the file is
+            # BGW-format-compliant (BSE/input_fi.f90:407).
+            vec = vec[:, :, ::-1]
             vec = vec[..., None]  # (nk, nc, nv, ns)
             evec_dset[0, i, :, :, :, :, 0] = vec.real
             evec_dset[0, i, :, :, :, :, 1] = vec.imag
