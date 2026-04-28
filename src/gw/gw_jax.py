@@ -497,6 +497,7 @@ def main(argv=None):
 			# COHSEX static head (so vhead/whead overrides flow through identically).
 			from .head_correction import (
 				fit_head_ppm_from_samples, fit_head_hl_analytic_from_sample,
+				fit_head_with_fixed_omega_from_sample,
 				compute_ppm_head_sigma_kij, format_head_diagnostics)
 			_head_params = {
 				"wcoul0_source": config.wcoul0_source,
@@ -508,7 +509,15 @@ def main(argv=None):
 			_head_static = resolve_head_sample(
 				_head_params, input_dir, wfn, sym, meta, print0,
 				omega=0.0+0.0j)
-			if ppm_model == "hl":
+			_head_omega_override = getattr(config, "ppm_head_omega_h_ry", None)
+			if _head_omega_override is not None:
+				# User-supplied head pole Ω_h (e.g. BGW's analytic value).
+				# Static W^c(0) head still LORRAX's — see fit_head_with_fixed_omega.
+				_head_gn = fit_head_with_fixed_omega_from_sample(
+					_head_static, omega_h_ry=float(_head_omega_override))
+				print0(f"  PPM head: Ω_h override = {float(_head_omega_override):.6f} Ry "
+				       f"({float(_head_omega_override)*ryd2ev:.4f} eV)")
+			elif ppm_model == "hl":
 				# BGW-style analytic head pole: Ω_h² = ω_p² / (1 − ε_head⁻¹).
 				# ω_p² = 16π · N_e / V_cell in Ry² (Hartree-AU energies → Ry² has factor 4 → 16π).
 				_omega_p_sq_ry = 16.0 * float(np.pi) * float(meta.nelec) / float(meta.cell_volume)
