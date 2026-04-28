@@ -467,6 +467,19 @@ def main(argv=None):
 		help="Numeric FD on V_NL: naive central or Richardson-extrapolated",
 	)
 	parser.add_argument(
+		"--skip-vnl",
+		action="store_true",
+		help="Skip the i[r,V_NL] commutator term — write p̂ only. Used to "
+		     "match BGW's `use_momentum` keyword for apples-to-apples "
+		     "absorption comparison.",
+	)
+	parser.add_argument(
+		"--out",
+		type=str,
+		default="dipole.h5",
+		help="Output filename (default: dipole.h5)",
+	)
+	parser.add_argument(
 		"--debug-kindex",
 		type=int,
 		default=1,
@@ -580,7 +593,9 @@ def main(argv=None):
 			float(wfn.blat),
 		)  # (3, nb, nb)
 		# Nonlocal velocity components via commutator i[r_i, V_NL]
-		if args.vnl_mode == "numeric":
+		if args.skip_vnl:
+			vNL_cart = np.zeros((3, nb, nb), dtype=np.complex128)
+		elif args.vnl_mode == "numeric":
 			# Numeric derivative on V_NL with optional Richardson and adaptive h
 			B = (np.asarray(wfn.bvec, dtype=float)) * float(wfn.blat)
 			Binv = np.linalg.inv(B)
@@ -706,13 +721,18 @@ def main(argv=None):
 		}
 
 	# Save to dipole.h5 with deltaE
-	out_path = Path('dipole.h5').resolve()
+	out_path = Path(args.out).resolve()
+	note = ('dipole_cart[3,x,y] = p_i (V_NL skipped, --skip-vnl); '
+	        if args.skip_vnl
+	        else 'dipole_cart[3,x,y] = p_i + i[r_i, V_NL]; ')
+	note += 'deltaE[k,:,:] = E_b - E_b\''
 	with h5py.File(str(out_path), 'w') as h5:
 		h5.create_dataset('dipole_cart', data=dipole)
 		h5.create_dataset('deltaE', data=deltaE)
 		h5.attrs['nbands'] = int(wfn.nbands)
 		h5.attrs['nk'] = int(sym.nk_tot)
-		h5.attrs['note'] = 'dipole_cart[3,x,y] = p_i + i[r_i, V_NL]; deltaE[k,:,:] = E_b - E_b\''
+		h5.attrs['skip_vnl'] = bool(args.skip_vnl)
+		h5.attrs['note'] = note
 		if rho_cvkq is not None:
 			fq = h5.create_group('finite_q')
 			fq.create_dataset('rho_cvkq', data=rho_cvkq)         # (nc, nv, nk, nq)

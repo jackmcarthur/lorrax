@@ -216,7 +216,7 @@ def _preview_lanczos(
     rtol: float = 0.0,
     check_every: int = 4,
     matvec_kind: str = "ring",
-    fft_wrapper: str = "shard_map",
+    n_reorth: int = -1,
 ) -> None:
     restart_file = _find_restart_file(input_file)
     n_devices = jax.device_count()
@@ -238,7 +238,6 @@ def _preview_lanczos(
         )
         # T-encoding strategy plumbed via the data dict (see solve_bse_sharded).
         data["matvec_kind"] = matvec_kind
-        data["fft_wrapper"] = fft_wrapper
         # EQP override on enk_full (BGW eqp1.dat semantics).
         if eqp_file is not None:
             from .bse_io import apply_eqp_corrections
@@ -280,10 +279,12 @@ def _preview_lanczos(
                   f"block_size={block_size} = ≤ {block_max_iter * block_size} Krylov dim")
         else:
             print(f"Lanczos [{mode}]: ≤ {block_max_iter} iterations")
+        # Resolve full-reorth sentinel (-1) to the actual Krylov depth.
+        n_reorth_eff = block_max_iter if n_reorth < 0 else n_reorth
         eigenvalues, eigenvectors, n_iter_done = solve_bse_sharded(
             data, mesh_xy, n_eig=n_eig, max_iter=block_max_iter,
             include_W=include_W, block_size=block_size,
-            rtol=rtol, check_every=check_every,
+            rtol=rtol, check_every=check_every, n_reorth=n_reorth_eff,
         )
         n_done = int(n_iter_done)
         if rtol > 0:
@@ -434,6 +435,17 @@ if __name__ == "__main__":
         help="Convergence check cadence in block iterations (default 4).",
     )
     parser.add_argument(
+        "--n-reorth",
+        type=int,
+        default=-1,
+        help="Lanczos partial-reorthogonalisation window. -1 (default) "
+             "= full reorth (= max_lanczos_iter); essential for highly "
+             "degenerate spectra (e.g. spinor BSE) so Ritz vectors stay "
+             "orthogonal across the full Krylov basis. Smaller windows "
+             "(e.g. 10) are faster but give ghost eigenvalues that "
+             "destroy per-state oscillator strengths.",
+    )
+    parser.add_argument(
         "--matvec-kind",
         choices=("ring", "gather", "simple"),
         default="ring",
@@ -441,15 +453,6 @@ if __name__ == "__main__":
              "lax.ppermute (low memory). ``gather``: shard_map + lax.all_gather "
              "(faster on small problems). ``simple``: plain jit + jnp.einsum "
              "+ with_sharding_constraint, no shard_map (XLA auto-partitions).",
-    )
-    parser.add_argument(
-        "--fft-wrapper",
-        choices=("shard_map", "custom_partitioning"),
-        default="shard_map",
-        help="How to wrap the BSE matvec's W-contraction 3D FFT so XLA's "
-             "GSPMD doesn't all-gather the input (JAX's fft_p has no SPMD "
-             "partitioner registered). Both wrap a single jnp.fft.fftn(axes=...) "
-             "call; this flag is for A/B comparison only.",
     )
     parser.add_argument(
         "--gather-t",
@@ -609,7 +612,7 @@ if __name__ == "__main__":
         rtol=args.lanczos_rtol,
         check_every=args.lanczos_check_every,
         matvec_kind=("gather" if args.gather_t else args.matvec_kind),
-        fft_wrapper=args.fft_wrapper,
+        n_reorth=args.n_reorth,
     )
     raise SystemExit(0)
 
