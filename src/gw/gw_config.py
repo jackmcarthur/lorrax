@@ -119,6 +119,12 @@ _DEFAULTS = {
     "ppm_model": "gn",
     "ppm_omega_p": 2.0,
     "ppm_fallback_omega": 2.0,
+    # Override the head pole frequency Ω_h directly (Ry).  Useful for
+    # testing against BGW's analytic head — set to BGW's
+    # √(ω_p²/(1−ε_head⁻¹)) value to remove the LORRAX-vs-BGW
+    # ε_head averaging convention as a source of disagreement.
+    # None = compute Ω_h normally (analytic for HL, 2-pt fit for GN).
+    "ppm_head_omega_h_ry": None,
     "ppm_sigma_target_error": 1.0e-6,
     "ppm_sigma_max_nodes": 64,
     # Sigma frequency grid
@@ -364,6 +370,7 @@ class LorraxConfig:
     ppm_model: str
     ppm_omega_p: float
     ppm_fallback_omega: float
+    ppm_head_omega_h_ry: float | None
     ppm_sigma_target_error: float
     ppm_sigma_max_nodes: int
 
@@ -572,6 +579,9 @@ class LorraxConfig:
             ppm_model=str(_get("ppm_model")).strip().lower(),
             ppm_omega_p=float(_get("ppm_omega_p")),
             ppm_fallback_omega=float(_get("ppm_fallback_omega")),
+            ppm_head_omega_h_ry=(
+                float(_get("ppm_head_omega_h_ry"))
+                if _get("ppm_head_omega_h_ry") is not None else None),
             ppm_sigma_target_error=float(_get("ppm_sigma_target_error")),
             ppm_sigma_max_nodes=int(_get("ppm_sigma_max_nodes")),
             # Sigma grid
