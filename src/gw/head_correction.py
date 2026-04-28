@@ -320,6 +320,71 @@ def fit_head_ppm_from_samples(
     )
 
 
+def fit_head_hl_analytic(
+    vc0: float,
+    wcoul0_static: float,
+    omega_p_sq_ry: float,
+) -> HeadGNParams:
+    """Set the HL-PPM head pole analytically from the bulk plasmon, BGW-style.
+
+    The 2-point HL fit at finite probe Ω asymptotes to the f-sum-rule
+    value as Ω → ∞, but at finite Ω the static-vs-probe head W^c samples
+    can be sensitive to numerical convention (mini-BZ averaging, head
+    truncation), giving an Ω_h that drifts ~10–20 % from the exact
+    bulk-plasmon limit.  BGW sidesteps this by taking the head pole
+    directly from the analytic f-sum-rule: ``Ω̃²(0,0) = ω_p²`` (set in
+    ``Sigma/wpeff.f90`` as the q=g=g'=0 special case), and the kernel
+    pole ``wtilde² = Ω² / I_ε(0,0) = ω_p² / (1 − ε⁻¹(0,0))``.
+
+    This mirrors that: ``Ω_h² = ω_p² / I_ε_head`` where
+    ``I_ε_head = (v_head − W(0)) / v_head`` is computed from the same
+    mini-BZ-averaged static head ``W(0)`` LORRAX already resolves.
+    The static W^c(0) head is still used (for B_h and R_h via the GN/HL
+    pole ansatz), so the magnitude of the head correction stays
+    consistent with the COHSEX block.
+    """
+    w1 = wcoul0_static - vc0  # W^c(0) head, in a.u.
+    if abs(w1) < 1.0e-30 or abs(vc0) < 1.0e-30:
+        return HeadGNParams(
+            omega_h_sq=1.0, omega_h=1.0, B_h=0.0, R_h=0.0,
+            wc_head_0=w1, wc_head_iwp=0.0, vc0=vc0,
+            omega_p=float(omega_p_sq_ry) ** 0.5 if omega_p_sq_ry > 0 else 1.0,
+        )
+
+    # I_ε_head = 1 − ε⁻¹(0,0) = 1 − W(0)/v(0) = (v − W)/v = −W^c/v.
+    I_eps_head = -w1 / float(vc0)
+    if I_eps_head <= 0.0:
+        I_eps_head = 1.0  # graceful fallback; prevents sqrt of negative
+
+    omega_h_sq = float(omega_p_sq_ry) / I_eps_head
+    omega_h = omega_h_sq ** 0.5
+    B_h = -w1 * omega_h_sq
+    R_h = B_h / (2.0 * omega_h)
+    return HeadGNParams(
+        omega_h_sq=omega_h_sq,
+        omega_h=omega_h,
+        B_h=B_h,
+        R_h=R_h,
+        wc_head_0=w1,
+        wc_head_iwp=0.0,  # not used in this analytic path
+        vc0=vc0,
+        omega_p=float(omega_p_sq_ry) ** 0.5,
+    )
+
+
+def fit_head_hl_analytic_from_sample(
+    head_static: HeadSample,
+    *,
+    omega_p_sq_ry: float,
+) -> HeadGNParams:
+    """Wrapper for :func:`fit_head_hl_analytic` using a resolved head sample."""
+    return fit_head_hl_analytic(
+        vc0=float(head_static.vc0.real),
+        wcoul0_static=float(head_static.wcoul0.real),
+        omega_p_sq_ry=omega_p_sq_ry,
+    )
+
+
 def fit_head_gn_from_samples(head_static: HeadSample, head_imag: HeadSample,
                              *, omega_p_ry: float) -> HeadGNParams:
     """Fit the scalar GN head from resolved static and imag-frequency samples."""
