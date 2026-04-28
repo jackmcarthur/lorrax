@@ -218,25 +218,6 @@ def format_head_sample_diagnostics(head: HeadSample, *, include_screened: bool =
     return "\n".join(lines)
 
 
-def format_head_pair_diagnostics(head_static: HeadSample, head_imag: HeadSample) -> str:
-    """Return a compact summary of static and imaginary-frequency head samples."""
-
-    lines = [
-        "",
-        "-" * 72,
-        "  FINITE-SIZE CORRECTIONS",
-        "-" * 72,
-        f"  Head source (ω=0):    {head_static.source}",
-        f"  Head source (ω=iωp):  {head_imag.source}",
-        f"  v(q→0)               = {head_static.vc0.real:12.3f} a.u.  (bare Coulomb head)",
-        f"  W(q→0, ω=0)          = {head_static.wcoul0.real:12.3f} a.u.",
-        f"  W(q→0, ω=iωp)        = {head_imag.wcoul0.real:12.3f} a.u.  [ω={head_imag.omega} Ry]",
-        f"  W^c(q→0, ω=0)        = {(head_static.wcoul0.real - head_static.vc0.real):12.3f} a.u.",
-        f"  W^c(q→0, ω=iωp)      = {(head_imag.wcoul0.real - head_imag.vc0.real):12.3f} a.u.",
-    ]
-    return "\n".join(lines)
-
-
 # ---------------------------------------------------------------------------
 # Dynamic GN-PPM scalar head
 # ---------------------------------------------------------------------------
@@ -297,20 +278,13 @@ def fit_head_gn(
     )
 
 
-def fit_head_gn_from_samples(
-    head_static: HeadSample,
-    head_imag: HeadSample,
-    *,
-    omega_p_ry: float,
-) -> HeadGNParams:
-    """Fit the scalar GN head from resolved static and imaginary-frequency samples."""
-
-    return fit_head_gn(
-        vc0=float(head_static.vc0.real),
-        wcoul0_static=float(head_static.wcoul0.real),
-        wcoul0_imfreq=float(head_imag.wcoul0.real),
-        omega_p_ry=omega_p_ry,
-    )
+def fit_head_gn_from_samples(head_static: HeadSample, head_imag: HeadSample,
+                             *, omega_p_ry: float) -> HeadGNParams:
+    """Fit the scalar GN head from resolved static and imag-frequency samples."""
+    return fit_head_gn(vc0=float(head_static.vc0.real),
+                       wcoul0_static=float(head_static.wcoul0.real),
+                       wcoul0_imfreq=float(head_imag.wcoul0.real),
+                       omega_p_ry=omega_p_ry)
 
 
 _RY2EV = 13.6056980659
@@ -329,29 +303,12 @@ def compute_static_head_terms(
     nk_tot: int,
     source: str = "unknown",
 ) -> StaticHeadTerms:
-    """Build exact static COHSEX head terms in band space.
+    """Build exact static COHSEX head terms (Σ^X, Σ^SX, Σ^{SX-X}, Σ^COH) in band space.
 
-    Parameters
-    ----------
-    vc0
-        Bare Coulomb head ``v_h`` in atomic units.
-    wcoul0_static
-        Static screened Coulomb head ``W_h(omega=0)`` in atomic units.
-    occ
-        Occupation mask for the active band window, shape ``(nb,)`` with values
-        in ``{0, 1}``.
-    cell_volume
-        Cell volume in atomic units.
-    nk_tot
-        Total number of k-points in the full Brillouin-zone average.
-    source
-        Human-readable source tag for diagnostics.
-
-    Returns
-    -------
-    StaticHeadTerms
-        Exact diagonal head pieces for:
-        ``Sigma^X``, ``Sigma^SX``, ``Sigma^{SX-X}``, and ``Sigma^COH``.
+    ``vc0`` / ``wcoul0_static`` are the bare and static-screened Coulomb heads
+    in a.u.; ``occ`` is the (nb,) {0,1} occupation mask for the active window.
+    Returns diagonal-in-band shifts in Rydberg, with the Brillouin-zone
+    average carried by an explicit ``1 / (V_cell · N_k)`` prefactor.
     """
 
     occ_arr = jnp.asarray(occ, dtype=jnp.complex128)
@@ -379,23 +336,13 @@ def compute_static_head_terms(
     )
 
 
-def compute_static_head_terms_from_sample(
-    head: HeadSample,
-    *,
-    occ: np.ndarray | jnp.ndarray,
-    cell_volume: float,
-    nk_tot: int,
-) -> StaticHeadTerms:
+def compute_static_head_terms_from_sample(head: HeadSample, *,
+                                          occ, cell_volume: float,
+                                          nk_tot: int) -> StaticHeadTerms:
     """Build exact static COHSEX head terms from a resolved head sample."""
-
-    return compute_static_head_terms(
-        vc0=head.vc0,
-        wcoul0_static=head.wcoul0,
-        occ=occ,
-        cell_volume=cell_volume,
-        nk_tot=nk_tot,
-        source=head.source,
-    )
+    return compute_static_head_terms(vc0=head.vc0, wcoul0_static=head.wcoul0,
+                                     occ=occ, cell_volume=cell_volume,
+                                     nk_tot=nk_tot, source=head.source)
 
 
 def format_static_head_diagnostics(head: StaticHeadTerms) -> str:
@@ -472,41 +419,6 @@ def static_head_terms_to_kij(
         expand_band_diagonal_to_kij(sx_diag, nk_tot),
         expand_band_diagonal_to_kij(head.sigma_coh_diag, nk_tot),
     )
-
-
-def compute_head_sigma_diagonal(
-    head: HeadGNParams,
-    energies_dft_ry: np.ndarray,
-    occ: np.ndarray,
-    cell_volume: float,
-) -> np.ndarray:
-    """Compute the simple on-shell diagonal head shift."""
-
-    if abs(head.R_h) < 1.0e-30 or abs(head.omega_h) < 1.0e-30:
-        return np.zeros_like(energies_dft_ry)
-    occ_arr = np.asarray(occ, dtype=np.float64)
-    return (head.R_h / (head.omega_h * cell_volume)) * (2.0 * occ_arr - 1.0)
-
-
-def compute_head_sigma_at_omega(
-    head: HeadGNParams,
-    energies_dft_ry: np.ndarray,
-    omega_eval_ry: np.ndarray,
-    occ: np.ndarray,
-    cell_volume: float,
-) -> np.ndarray:
-    """Compute the scalar head self-energy at arbitrary frequencies."""
-
-    if abs(head.R_h) < 1.0e-30 or abs(head.omega_h) < 1.0e-30:
-        return np.zeros_like(energies_dft_ry, dtype=np.complex128)
-
-    eps = np.asarray(energies_dft_ry, dtype=np.float64)
-    omega = np.asarray(omega_eval_ry, dtype=np.float64)
-    f = np.asarray(occ, dtype=np.float64)
-    eta = 1.0e-6
-    occ_term = f / (omega - eps + head.omega_h - 1j * eta)
-    emp_term = (1.0 - f) / (omega - eps - head.omega_h + 1j * eta)
-    return (head.R_h / cell_volume) * (occ_term + emp_term)
 
 
 def compute_ppm_head_sigma_kij(
@@ -615,6 +527,31 @@ def format_head_diagnostics(head: HeadGNParams, cell_volume: float) -> str:
 # ---------------------------------------------------------------------------
 #  Rank-1 head injection in the (μ, ν) ISDF basis at q=0
 # ---------------------------------------------------------------------------
+#
+# ``compute_vcoul`` zeroes the ``G=G'=0`` element of ``v(q+G)`` at q=0 to
+# avoid the divergence; the BGW-equivalent mini-BZ-averaged value is the
+# scalar ``vhead = v_h``.  In the centroid basis the missing piece factors as
+#
+#     ΔV_{q=0,μν} = (v_h / V_cell) · ζ̄(0, μ, G=0) · ζ(0, ν, G=0)
+#                 = (v_h / V_cell) · conj(G0[μ]) · G0[ν]            (rank 1)
+#
+# The ``1/V_cell`` factor matches the LORRAX storage convention for
+# ``V_qmunu`` / ``W_qmunu`` (see ``gw.sigma_direct_check`` for the canonical
+# reference).  Conjugation lands on ``μ`` because
+# ``V_{qμν} = Σ_GG' ζ*(q,μ,G) v(G,G') ζ(q,ν,G')``.
+
+
+def _head_rank1_scalars(vhead, whead, cell_volume, omega_index, dtype):
+    """Resolve (v_scalar, w_scalar) = (head / V_cell) for a rank-1 update."""
+    inv_V = 1.0 / float(cell_volume)
+    v_scalar = (jnp.asarray(complex(vhead) * inv_V, dtype=dtype)
+                if vhead is not None else None)
+    if whead is None:
+        return v_scalar, None
+    whead_arr = jnp.asarray(whead, dtype=jnp.complex128)
+    w_val = whead_arr if whead_arr.ndim == 0 else whead_arr[omega_index]
+    return v_scalar, jnp.asarray(w_val * inv_V, dtype=dtype)
+
 
 def apply_q0_head_rank1(
     V_qmunu: jnp.ndarray,
@@ -626,55 +563,29 @@ def apply_q0_head_rank1(
     *,
     omega_index: int = 0,
 ):
-    """Inject the ``q=0, G=G'=0`` Coulomb head as a rank-1 update in the
-    centroid ``(μ, ν)`` basis.
-
-    ``compute_vcoul`` zeroes the ``G=G'=0`` element of ``v(q+G)`` at
-    ``q=0`` to avoid the divergence; the BGW-equivalent mini-BZ-averaged
-    value is the scalar ``vhead = v_h``.  In the centroid basis the
-    missing piece factors as
-
-        ΔV_{q=0,μν} = (v_h / V_cell) · ζ̄(0, μ, G=0) · ζ(0, ν, G=0)
-                    = (v_h / V_cell) · conj(G0[μ]) · G0[ν]            (rank 1)
-
-    The ``1/V_cell`` factor matches the LORRAX storage convention for
-    ``V_qmunu`` / ``W_qmunu`` — see ``gw.sigma_direct_check`` for the
-    canonical reference (``vol_scale = 1/cell_volume`` in the head
-    overlay there).  Conjugation lands on ``μ`` because
-    ``V_{qμν} = Σ_GG' ζ*(q,μ,G) v(G,G') ζ(q,ν,G')``.
+    """Inject the q=0 Coulomb head as a rank-1 update in the centroid basis.
 
     Args:
-        V_qmunu:   (..., nkx, nky, nkz, n_μ, n_ν) bare-Coulomb body, q=0
-                   slice has ``G=G'=0`` zeroed.
-        W_qmunu:   same shape as V_qmunu (single ω) or ``None`` to skip the
-                   W update.  Pass the static slice for COHSEX/BSE; pass
-                   ``Wiwp`` separately for PPM imag-freq if needed.
-        G0_mu_nu:  (n_μ,) — ``ζ(q=0, μ, G=0)``, complex.
-        vhead:     scalar ``v_h`` (Ry, BGW convention) or None to skip V.
-        whead:     scalar or shape ``(n_omega,)``, in Ry. ``n_omega=1``
-                   for static COHSEX, ``2`` for GN-PPM (static, iω_p).
-                   ``None`` to skip W update.
-        cell_volume: ``V_cell`` in Bohr³ — provides the ``1/V`` scaling.
-        omega_index: which slot of ``whead`` to apply (default 0 = static).
+        V_qmunu:   (..., nkx, nky, nkz, n_μ, n_ν) bare-Coulomb body.
+        W_qmunu:   same shape (single ω) or ``None`` to skip W.
+        G0_mu_nu:  (n_μ,) — ``ζ(q=0, μ, G=0)``.
+        vhead, whead: scalar or ``(n_omega,)`` in Ry, or ``None`` to skip.
+        cell_volume: V_cell in Bohr³.
+        omega_index: slot of ``whead`` to apply (default 0).
 
     Returns:
-        (V_qmunu, W_qmunu) with the q=0 slice updated. Inputs not updated
-        are returned unchanged.
+        (V_qmunu, W_qmunu) with the q=0 slice updated.
     """
     g0g0 = jnp.einsum('m,n->mn', jnp.conj(G0_mu_nu), G0_mu_nu)
-    inv_V = 1.0 / float(cell_volume)
+    v_scalar, w_scalar = _head_rank1_scalars(
+        vhead, whead, cell_volume, omega_index,
+        dtype=(W_qmunu.dtype if W_qmunu is not None else V_qmunu.dtype))
 
-    if vhead is not None:
-        v_scalar = jnp.asarray(complex(vhead) * inv_V, dtype=V_qmunu.dtype)
+    if v_scalar is not None:
         # V layout: (..., nkx, nky, nkz, n_μ, n_ν); q=0 is index 0 on each k axis.
         V_qmunu = V_qmunu.at[..., 0, 0, 0, :, :].add(v_scalar * g0g0)
-
-    if W_qmunu is not None and whead is not None:
-        whead_arr = jnp.asarray(whead, dtype=jnp.complex128)
-        w_val = whead_arr if whead_arr.ndim == 0 else whead_arr[omega_index]
-        w_scalar = jnp.asarray(w_val * inv_V, dtype=W_qmunu.dtype)
+    if W_qmunu is not None and w_scalar is not None:
         W_qmunu = W_qmunu.at[..., 0, 0, 0, :, :].add(w_scalar * g0g0)
-
     return V_qmunu, W_qmunu
 
 
@@ -691,49 +602,27 @@ def apply_q0_head_rank1_sharded(
 ):
     """Sharded q=0 head injection — local on every proc.
 
-    Variant of :func:`apply_q0_head_rank1` for the BSE-side sharded
-    (``P("x", "y")``-on-(μ,ν)) tensors loaded by
-    :func:`bse_io.load_bse_data_from_restart_sharded`.
-
-    The single replicated G0 vector is split into two complementary
-    sharded copies:
-
-      - ``g0_X``: shape ``(n_rmu,)``, sharded ``P("x")`` on the μ-axis.
-      - ``g0_Y``: shape ``(n_rmu,)``, sharded ``P("y")`` on the ν-axis.
-
-    On every (X_proc, Y_proc) tile of V_q0 / W_q the rank-1 update
-
-        local += (scalar / V_cell) · conj(g0_X_local)[:, None] · g0_Y_local[None, :]
-
-    is fully local — no collectives, no all-gather. The two copies make
-    the broadcast operands shaped to match each proc's local tile shape.
+    Variant of :func:`apply_q0_head_rank1` for BSE-side sharded
+    (``P("x", "y")``-on-(μ,ν)) tensors.  ``g0_X`` and ``g0_Y`` are the
+    same ``ζ(0,μ,G=0)`` vector duplicated under ``P("x")`` and ``P("y")``
+    so the rank-1 ``conj(g0_X)[:, None] * g0_Y[None, :]`` is local.
 
     Args:
-        V_q0:    ``(n_μ, n_ν)``,                     sharded ``P("x", "y")``.
-        W_q:     ``(n_μ, n_ν, nkx, nky, nkz)`` or ``None``,
-                 sharded ``P("x", "y", None, None, None)`` if not None.
-        g0_X:    ``(n_μ,)`` sharded ``P("x")`` — μ-axis copy of ζ(0,μ,G=0).
-        g0_Y:    ``(n_ν,)`` sharded ``P("y")`` — ν-axis copy of ζ(0,ν,G=0).
-        vhead:   scalar or None.
-        whead:   scalar / ``(n_omega,)`` / None.
-        cell_volume: V_cell in Bohr³.
-        omega_index: which slot of ``whead`` to apply (default 0 = static).
-
-    Returns:
-        (V_q0, W_q) with q=0 head injected. Inputs not updated returned unchanged.
+        V_q0:  ``(n_μ, n_ν)``                       sharded ``P("x", "y")``.
+        W_q:   ``(n_μ, n_ν, nkx, nky, nkz)`` or ``None``.
+        g0_X:  ``(n_μ,)`` sharded ``P("x")`` — μ-axis copy of ζ(0,μ,G=0).
+        g0_Y:  ``(n_ν,)`` sharded ``P("y")`` — ν-axis copy of ζ(0,ν,G=0).
+        vhead, whead, cell_volume, omega_index: as in
+            :func:`apply_q0_head_rank1`.
     """
-    inv_V = 1.0 / float(cell_volume)
-    g0g0 = jnp.conj(g0_X)[:, None] * g0_Y[None, :]                  # (n_μ, n_ν), P("x","y")
+    g0g0 = jnp.conj(g0_X)[:, None] * g0_Y[None, :]
+    v_scalar, w_scalar = _head_rank1_scalars(
+        vhead, whead, cell_volume, omega_index,
+        dtype=(W_q.dtype if W_q is not None else V_q0.dtype))
 
-    if vhead is not None:
-        v_scalar = jnp.asarray(complex(vhead) * inv_V, dtype=V_q0.dtype)
+    if v_scalar is not None:
         V_q0 = V_q0 + v_scalar * g0g0
-
-    if W_q is not None and whead is not None:
-        whead_arr = jnp.asarray(whead, dtype=jnp.complex128)
-        w_val = whead_arr if whead_arr.ndim == 0 else whead_arr[omega_index]
-        w_scalar = jnp.asarray(w_val * inv_V, dtype=W_q.dtype)
+    if W_q is not None and w_scalar is not None:
         # W_q layout: (n_μ, n_ν, nkx, nky, nkz). Add to the q=0 slice only.
         W_q = W_q.at[:, :, 0, 0, 0].add(w_scalar * g0g0)
-
     return V_q0, W_q
