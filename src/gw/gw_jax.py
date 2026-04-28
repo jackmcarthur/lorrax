@@ -320,12 +320,20 @@ def main(argv=None):
 		head_static = resolve_head_sample(
 			head_params, input_dir, wfn, sym, meta, print0, omega=0.0+0.0j)
 		if config.use_ppm_sigma:
-			omega_imp = 1j * config.ppm_omega_p
+			# GN-PPM: probe at iωp on the imaginary axis.
+			# HL-PPM: probe at Ω on the real axis (above all transitions).
+			ppm_model = str(getattr(config, "ppm_model", "gn")).strip().lower()
+			if ppm_model == "hl":
+				omega_imp = complex(float(config.ppm_omega_p), 0.0)
+				_omega_grid_entry = float(omega_imp.real)
+			else:
+				omega_imp = 1j * float(config.ppm_omega_p)
+				_omega_grid_entry = float(omega_imp.imag)
 			head_imag = resolve_head_sample(
 				head_params, input_dir, wfn, sym, meta, print0, omega=omega_imp)
 			whead_arr = np.array(
 				[head_static.wcoul0, head_imag.wcoul0], dtype=np.complex128)
-			omega_grid = np.array([0.0, float(omega_imp.imag)], dtype=np.float64)
+			omega_grid = np.array([0.0, _omega_grid_entry], dtype=np.float64)
 		else:
 			whead_arr = np.array([head_static.wcoul0], dtype=np.complex128)
 			omega_grid = np.array([0.0], dtype=np.float64)
@@ -426,24 +434,42 @@ def main(argv=None):
 		#     LORRAX-with-head sits at the Nk→∞ asymptote.
 
 		with timing.section("gw_jax.ppm_sigma"):
-			# χ₀(iωp) → W(iωp) → GN-PPM pole fit
-			quad_imag = build_imag_quadrature(
-				quad, config.ppm_omega_p, config.minimax_config, print_fn=print0)
-			chi0_imag = compute_chi0(wfns, quad_imag, meta, mesh_xy, energy_reference=e_ref)
-			# Block BEFORE solve_w so the chi0_imag compute time isn't
+			# χ₀(probe) → W(probe) → two-point PPM pole fit.
+			# GN: probe = iωp on the imaginary axis (build_imag_quadrature).
+			# HL: probe = Ω on the real axis above all transitions
+			#     (build_real_quadrature; requires Ω > x_max).
+			ppm_model = str(getattr(config, "ppm_model", "gn")).strip().lower()
+			if ppm_model == "hl":
+				from .w_isdf import build_real_quadrature
+				probe_omega = complex(float(config.ppm_omega_p), 0.0)
+				quad_probe = build_real_quadrature(
+					quad, float(config.ppm_omega_p),
+					config.minimax_config, print_fn=print0)
+			else:
+				probe_omega = 1j * float(config.ppm_omega_p)
+				quad_probe = build_imag_quadrature(
+					quad, config.ppm_omega_p,
+					config.minimax_config, print_fn=print0)
+			chi0_probe = compute_chi0(
+				wfns, quad_probe, meta, mesh_xy, energy_reference=e_ref)
+			# Block BEFORE solve_w so the chi0_probe compute time isn't
 			# folded into the W-solve wall; this also drops the last host
 			# reference so solve_w can donate χ₀'s buffer (see the
 			# ``donate_argnums=(1,)`` on ``_solve_w``).
-			chi0_imag.block_until_ready()
-			Wiwp_q = solve_w(V_q, chi0_imag, meta, mesh_xy,
+			chi0_probe.block_until_ready()
+			Wiwp_q = solve_w(V_q, chi0_probe, meta, mesh_xy,
 			                 memory_mode=config.isdf_memory_mode)
-			del chi0_imag
+			del chi0_probe
 			Wiwp_q.block_until_ready()
 
-			ppm = fit_gn_ppm(
-				W_q, Wiwp_q, V_q, config.ppm_omega_p, mesh_xy,
+			from .ppm_sigma import fit_ppm
+			ppm = fit_ppm(
+				W_q, Wiwp_q, V_q, probe_omega, mesh_xy,
 				fallback_omega=config.ppm_fallback_omega,
-				n_nodes_static=quad.node_count, print_fn=print0)
+				n_nodes_static=quad.node_count,
+				print_fn=print0,
+				model_label="HL-PPM" if ppm_model == "hl" else "GN-PPM",
+			)
 			# Wiwp_q is used only for the PPM fit; drop the Python
 			# reference so XLA can reclaim its (nq, μ, μ) c128 buffer.
 			del Wiwp_q
@@ -483,7 +509,7 @@ def main(argv=None):
 			# Resolved at ω=0 and ω=iωp from the same head sample plumbing as the
 			# COHSEX static head (so vhead/whead overrides flow through identically).
 			from .head_correction import (
-				fit_head_gn_from_samples, compute_ppm_head_sigma_kij,
+				fit_head_ppm_from_samples, compute_ppm_head_sigma_kij,
 				format_head_diagnostics)
 			_head_params = {
 				"wcoul0_source": config.wcoul0_source,
@@ -495,11 +521,11 @@ def main(argv=None):
 			_head_static = resolve_head_sample(
 				_head_params, input_dir, wfn, sym, meta, print0,
 				omega=0.0+0.0j)
-			_head_imag = resolve_head_sample(
+			_head_probe = resolve_head_sample(
 				_head_params, input_dir, wfn, sym, meta, print0,
-				omega=1j * float(config.ppm_omega_p))
-			_head_gn = fit_head_gn_from_samples(
-				_head_static, _head_imag, omega_p_ry=float(config.ppm_omega_p))
+				omega=probe_omega)
+			_head_gn = fit_head_ppm_from_samples(
+				_head_static, _head_probe, probe_omega=probe_omega)
 			print0(format_head_diagnostics(_head_gn, cell_volume=meta.cell_volume))
 
 			if sigma_c_omega is not None:

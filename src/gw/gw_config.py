@@ -111,6 +111,12 @@ _DEFAULTS = {
     "regenerate_minimax_tables": False,
     "minimax_energy_reference": "midgap",
     # PPM
+    # ppm_model picks the two-point pole-fit ansatz:
+    #   "gn" — Godby-Needs: second probe at ω = i·ppm_omega_p (imaginary,
+    #          ppm_omega_p ≈ 2 Ry by default).
+    #   "hl" — Hybertsen-Louie: second probe at ω = ppm_omega_p (real,
+    #          chosen above all transition energies; default 200 Ry).
+    "ppm_model": "gn",
     "ppm_omega_p": 2.0,
     "ppm_fallback_omega": 2.0,
     "ppm_sigma_target_error": 1.0e-6,
@@ -156,6 +162,7 @@ _NORMALIZE_STR = {
     "sigma_omega_accumulation", "fermi_reference",
     "isdf_memory_mode",
     "ppm_invalid_mode",
+    "ppm_model",
 }
 
 
@@ -354,6 +361,7 @@ class LorraxConfig:
     minimax_energy_reference: str
 
     # --- PPM ---
+    ppm_model: str
     ppm_omega_p: float
     ppm_fallback_omega: float
     ppm_sigma_target_error: float
@@ -561,6 +569,7 @@ class LorraxConfig:
             regenerate_minimax_tables=bool(_get("regenerate_minimax_tables")),
             minimax_energy_reference=str(_get("minimax_energy_reference")).strip().lower(),
             # PPM
+            ppm_model=str(_get("ppm_model")).strip().lower(),
             ppm_omega_p=float(_get("ppm_omega_p")),
             ppm_fallback_omega=float(_get("ppm_fallback_omega")),
             ppm_sigma_target_error=float(_get("ppm_sigma_target_error")),

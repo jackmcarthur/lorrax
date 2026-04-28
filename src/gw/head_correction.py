@@ -222,17 +222,29 @@ def format_head_sample_diagnostics(head: HeadSample, *, include_screened: bool =
 # Dynamic GN-PPM scalar head
 # ---------------------------------------------------------------------------
 
-def fit_head_gn(
+def fit_head_ppm(
     vc0: float,
     wcoul0_static: float,
-    wcoul0_imfreq: float,
-    omega_p_ry: float,
+    wcoul0_probe: float,
+    probe_omega: complex,
 ) -> HeadGNParams:
-    """Fit a scalar GN pole from two W^c head samples."""
+    """Fit a scalar PPM pole from two W^c head samples.
+
+    Model-agnostic two-point fit: the same algebra serves both the
+    Godby-Needs PPM (purely imaginary probe ``probe_omega = i·ωp``) and
+    the Hybertsen-Louie PPM (real probe ``probe_omega = Ω`` above all
+    transitions).  The signed quantity ``z² = (probe_omega)²`` carries
+    the model choice — negative for GN, positive for HL.
+    """
+
+    z = complex(probe_omega)
+    omega_2_sq = float((z * z).real)
+    # Real-axis log-magnitude for diagnostics ("ω_p" was historically the
+    # imaginary-axis magnitude; for HL it's the real frequency itself).
+    probe_mag = float(abs(z))
 
     w1 = wcoul0_static - vc0
-    w2 = wcoul0_imfreq - vc0
-    omega_2_sq = -(omega_p_ry ** 2)
+    w2 = wcoul0_probe - vc0
 
     denom = w1 - w2
     if abs(denom) < 1.0e-30:
@@ -244,7 +256,7 @@ def fit_head_gn(
             wc_head_0=w1,
             wc_head_iwp=w2,
             vc0=vc0,
-            omega_p=omega_p_ry,
+            omega_p=probe_mag,
         )
 
     omega_h_sq = -w2 * omega_2_sq / denom
@@ -261,7 +273,7 @@ def fit_head_gn(
             wc_head_0=w1,
             wc_head_iwp=w2,
             vc0=vc0,
-            omega_p=omega_p_ry,
+            omega_p=probe_mag,
         )
 
     omega_h = omega_h_sq ** 0.5
@@ -274,17 +286,46 @@ def fit_head_gn(
         wc_head_0=w1,
         wc_head_iwp=w2,
         vc0=vc0,
-        omega_p=omega_p_ry,
+        omega_p=probe_mag,
+    )
+
+
+def fit_head_gn(
+    vc0: float,
+    wcoul0_static: float,
+    wcoul0_imfreq: float,
+    omega_p_ry: float,
+) -> HeadGNParams:
+    """Fit a scalar GN pole from two W^c head samples (imaginary probe)."""
+    return fit_head_ppm(
+        vc0=vc0,
+        wcoul0_static=wcoul0_static,
+        wcoul0_probe=wcoul0_imfreq,
+        probe_omega=1j * float(omega_p_ry),
+    )
+
+
+def fit_head_ppm_from_samples(
+    head_static: HeadSample,
+    head_probe: HeadSample,
+    *,
+    probe_omega: complex,
+) -> HeadGNParams:
+    """Fit the scalar PPM head from resolved static and probe-frequency samples."""
+    return fit_head_ppm(
+        vc0=float(head_static.vc0.real),
+        wcoul0_static=float(head_static.wcoul0.real),
+        wcoul0_probe=float(head_probe.wcoul0.real),
+        probe_omega=probe_omega,
     )
 
 
 def fit_head_gn_from_samples(head_static: HeadSample, head_imag: HeadSample,
                              *, omega_p_ry: float) -> HeadGNParams:
     """Fit the scalar GN head from resolved static and imag-frequency samples."""
-    return fit_head_gn(vc0=float(head_static.vc0.real),
-                       wcoul0_static=float(head_static.wcoul0.real),
-                       wcoul0_imfreq=float(head_imag.wcoul0.real),
-                       omega_p_ry=omega_p_ry)
+    return fit_head_ppm_from_samples(
+        head_static, head_imag, probe_omega=1j * float(omega_p_ry),
+    )
 
 
 _RY2EV = 13.6056980659

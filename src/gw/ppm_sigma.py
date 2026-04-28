@@ -604,6 +604,66 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh) -> None:
 #  PPM construction
 # ---------------------------------------------------------------------------
 
+def fit_ppm(
+    W0_q: jax.Array,
+    Wprobe_q: jax.Array,
+    V_q: jax.Array,
+    probe_omega: complex,
+    mesh_xy: Mesh,
+    *,
+    fallback_omega: float = 2.0,
+    n_nodes_static: int = 0,
+    print_fn=None,
+    model_label: str = "PPM",
+) -> PPMBuildResult:
+    """Fit two-point PPM pole parameters from precomputed W(0) and W(probe).
+
+    Model-agnostic over the pole-fit ansatz: the same algebra serves
+    both Godby-Needs (purely imaginary ``probe_omega = i·ωp``) and
+    Hybertsen-Louie (real ``probe_omega = Ω`` above all transitions).
+
+    All input arrays are flat-q (nq, μ, μ).  Returns PPMBuildResult with
+    B_q, Omega_q, valid_mask_q sharded as P(None, 'x', 'y').
+    """
+    import time as _t
+    z = complex(probe_omega)
+    t0 = _t.perf_counter()
+
+    Wc0_q = W0_q - V_q
+    Wci_q = Wprobe_q - V_q
+    omega_qmunu, b_qmunu, valid_qmunu, unfulfilled = fit_gn_ppm_from_wc_pair(
+        Wc0_q, Wci_q, z, fallback_omega=float(fallback_omega))
+
+    q_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    Omega = jax.lax.with_sharding_constraint(jnp.asarray(omega_qmunu), q_shard)
+    B = jax.lax.with_sharding_constraint(jnp.asarray(b_qmunu), q_shard)
+    valid_mask = jax.lax.with_sharding_constraint(jnp.asarray(valid_qmunu), q_shard)
+    t1 = _t.perf_counter()
+
+    # ω_p in PPMBuildResult historically meant the imaginary-axis magnitude;
+    # carry the probe magnitude there for diagnostics.  Downstream Σ kernels
+    # consume only B_q, Omega_q (the *fitted* pole frequency), so the probe
+    # magnitude is for logging / restart provenance only.
+    probe_mag = float(abs(z))
+
+    if print_fn is not None:
+        kind = "iωp" if abs(z.real) < 1.0e-12 else "Ω"
+        print_fn(
+            f"  {model_label} fit: {t1-t0:.2f}s, {kind}={probe_mag:.4f} Ry, "
+            f"unfulfilled={100.0 * unfulfilled:.2f}%")
+
+    return PPMBuildResult(
+        omega_p=probe_mag,
+        W0_q=W0_q,
+        Wiwp_q=Wprobe_q,
+        B_q=B,
+        Omega_q=Omega,
+        valid_mask_q=valid_mask,
+        unfulfilled_fraction=unfulfilled,
+        n_nodes_static=n_nodes_static,
+    )
+
+
 def fit_gn_ppm(
     W0_q: jax.Array,
     Wiwp_q: jax.Array,
@@ -615,39 +675,16 @@ def fit_gn_ppm(
     n_nodes_static: int = 0,
     print_fn=None,
 ) -> PPMBuildResult:
-    """Fit GN-PPM pole parameters from precomputed W(0) and W(iωp).
+    """Fit Godby-Needs PPM (imaginary probe ``i·omega_p``).
 
-    All input arrays are flat-q (nq, μ, μ).  Returns PPMBuildResult with
-    B_q, Omega_q, valid_mask_q sharded as P(None, 'x', 'y').
+    Thin wrapper around :func:`fit_ppm` for the GN model.
     """
-    import time as _t
-    omega_p = float(omega_p)
-    t0 = _t.perf_counter()
-
-    Wc0_q = W0_q - V_q
-    Wci_q = Wiwp_q - V_q
-    omega_qmunu, b_qmunu, valid_qmunu, unfulfilled = fit_gn_ppm_from_wc_pair(
-        Wc0_q, Wci_q, 1j * complex(omega_p), fallback_omega=float(fallback_omega))
-
-    q_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    Omega = jax.lax.with_sharding_constraint(jnp.asarray(omega_qmunu), q_shard)
-    B = jax.lax.with_sharding_constraint(jnp.asarray(b_qmunu), q_shard)
-    valid_mask = jax.lax.with_sharding_constraint(jnp.asarray(valid_qmunu), q_shard)
-    t1 = _t.perf_counter()
-
-    if print_fn is not None:
-        print_fn(f"  GN-PPM fit: {t1-t0:.2f}s, ωp={omega_p:.4f} Ry, "
-                 f"unfulfilled={100.0 * unfulfilled:.2f}%")
-
-    return PPMBuildResult(
-        omega_p=omega_p,
-        W0_q=W0_q,
-        Wiwp_q=Wiwp_q,
-        B_q=B,
-        Omega_q=Omega,
-        valid_mask_q=valid_mask,
-        unfulfilled_fraction=unfulfilled,
+    return fit_ppm(
+        W0_q, Wiwp_q, V_q, 1j * float(omega_p), mesh_xy,
+        fallback_omega=fallback_omega,
         n_nodes_static=n_nodes_static,
+        print_fn=print_fn,
+        model_label="GN-PPM",
     )
 
 
