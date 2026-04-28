@@ -194,7 +194,7 @@ def run_nscf(
             print("\n── Davidson ──")
 
         t1 = time.perf_counter()
-        warmup_davidson_jit(nbnd, ngkmax, nspinor)
+        warmup_davidson_jit(nbnd, (nspinor, ngkmax))
         H_k0 = setup_H_k_from_kvec(kpoints[0], V_scf, vnl_setup, crystal, None,
                                      V_loc_r=V_loc, ngkmax=ngkmax)
         apply_H0 = make_apply_H(H_k0)

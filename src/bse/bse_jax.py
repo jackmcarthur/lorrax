@@ -217,6 +217,7 @@ def _preview_lanczos(
     check_every: int = 4,
     matvec_kind: str = "ring",
     n_reorth: int = -1,
+    solver_kind: str = "lanczos",
 ) -> None:
     restart_file = _find_restart_file(input_file)
     n_devices = jax.device_count()
@@ -285,6 +286,7 @@ def _preview_lanczos(
             data, mesh_xy, n_eig=n_eig, max_iter=block_max_iter,
             include_W=include_W, block_size=block_size,
             rtol=rtol, check_every=check_every, n_reorth=n_reorth_eff,
+            solver_kind=solver_kind,
         )
         n_done = int(n_iter_done)
         if rtol > 0:
@@ -459,6 +461,16 @@ if __name__ == "__main__":
         action="store_true",
         help="(Deprecated alias for --matvec-kind=gather)",
     )
+    parser.add_argument(
+        "--solver",
+        choices=("lanczos", "davidson"),
+        default="lanczos",
+        help="Eigensolver. ``lanczos`` (default) for fast spectrum-shape "
+             "convergence (ε₂(ω)). ``davidson`` for tight per-state "
+             "eigenvector convergence using diagonal (E_c−E_v) "
+             "preconditioner — better for individual-state oscillator "
+             "strengths in densely-packed band-edge spectra.",
+    )
     parser.add_argument("--kpm-dos", action="store_true", help="Run KPM Chebyshev DOS and exit.")
     parser.add_argument("--kpm-n-moments", type=int, default=100, help="Chebyshev moments M for KPM.")
     parser.add_argument("--kpm-n-random", type=int, default=4, help="Stochastic trace vectors R for KPM.")
@@ -613,6 +625,7 @@ if __name__ == "__main__":
         check_every=args.lanczos_check_every,
         matvec_kind=("gather" if args.gather_t else args.matvec_kind),
         n_reorth=args.n_reorth,
+        solver_kind=args.solver,
     )
     raise SystemExit(0)
 

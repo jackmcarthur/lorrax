@@ -1,10 +1,23 @@
 """
-solvers/davidson.py — Block Davidson iterative eigensolver.
+solvers/davidson.py — Block Davidson iterative eigensolver (shape-agnostic).
 
 Finds the lowest n_eig eigenvalues of a Hermitian operator H given only
 callables for the matvec, preconditioner, and initial guess.
-No DFT or physics knowledge — works for any Hermitian eigenproblem
-with state vectors of shape (batch, n_channels, dim).
+No DFT or physics knowledge — works for any Hermitian eigenproblem.
+
+Shape convention
+----------------
+The state vector batch ``V`` has the form ``(m, *trailing)`` where ``m`` is
+the batch axis (number of subspace vectors) and ``trailing`` is whatever
+shape encodes one vector — flat ``(dim,)``, plane-wave ``(n_channels, dim)``,
+exciton ``(n_cond, n_val, nk)``, or anything else. All internal contractions
+are written with numpy/JAX einsum ellipsis (``'m...,n...->mn'``,
+``'mn,m...->n...'``) so a single implementation supports every layout.
+
+The trailing axes may be sharded; Davidson never reshapes them, never
+flattens them, and never gathers them. The Ritz-vector reconstruction
+``X = V x`` uses ``jnp.einsum('mn,m...->n...', x, V)`` whose output
+inherits the sharding pattern of ``V``.
 
 Algorithm (after QE cegterg.f90):
   1. init_fn builds the starting subspace
@@ -29,12 +42,37 @@ import jax.numpy as jnp
 import numpy as np
 
 
+def _to_host(arr) -> np.ndarray:
+    """Bring a (possibly multi-process) jax.Array to host as numpy.
+
+    Multi-process JAX refuses ``np.asarray`` on arrays whose shards live
+    on non-local devices, even when the array is logically replicated.
+    Mirror the pattern used by ``file_io._slab_io_allgather._to_host``:
+    ``process_allgather(tiled=False)`` returns ``(world, *A.shape)`` —
+    take row 0 (all rows identical for replicated data).
+    """
+    if isinstance(arr, np.ndarray):
+        return arr
+    if jax.process_count() == 1:
+        return np.asarray(jax.device_get(arr))
+    from jax.experimental import multihost_utils
+    gathered = multihost_utils.process_allgather(arr, tiled=False)
+    host = np.asarray(jax.device_get(gathered))
+    expected = tuple(int(d) for d in arr.shape)
+    if host.ndim == len(expected) + 1 and host.shape[1:] == expected:
+        host = host[0]
+    return host
+
+
 # ═══════════════════════════════════════════════════════════════════════
-#  JIT'd subspace projection kernel
+#  JIT'd subspace projection kernel (shape-agnostic via ellipsis einsum)
 # ═══════════════════════════════════════════════════════════════════════
 
 def _generalized_eigh(A, B):
-    """Solve A v = λ B v via Cholesky reduction.  JIT-compatible."""
+    """Solve A v = λ B v via Cholesky reduction.  JIT-compatible.
+
+    Operates on small (m, m) replicated matrices — fine to keep replicated.
+    """
     m = B.shape[0]
     B_reg = B + 1e-12 * jnp.eye(m, dtype=B.dtype)
     L = jnp.linalg.cholesky(B_reg)
@@ -48,12 +86,18 @@ def _generalized_eigh(A, B):
 
 @functools.partial(jax.jit, static_argnames=('n_eig',))
 def _ritz_and_residuals(V, HV, n_eig):
-    """Project → solve → Ritz vectors → residuals.
+    """Project → solve → Ritz vectors → residuals (shape-agnostic).
+
+    V, HV are (m, *trailing) — batch on axis 0, vector content on the rest.
+    The Gram/Hamiltonian matrices are (m, m) and stay replicated.
+    Ritz vectors are reconstructed as ``X = V x`` via ellipsis einsum so
+    sharding on ``trailing`` propagates from V to X.
 
     Returns (eigenvalues, X, HX, R, res_norms).
     """
-    Hc = jnp.einsum('msG,nsG->mn', jnp.conj(V), HV, optimize=True)
-    Sc = jnp.einsum('msG,nsG->mn', jnp.conj(V), V, optimize=True)
+    # (m, m) projections — ellipsis sums all trailing axes
+    Hc = jnp.einsum('m...,n...->mn', jnp.conj(V), HV, optimize=True)
+    Sc = jnp.einsum('m...,n...->mn', jnp.conj(V), V, optimize=True)
     Hc = 0.5 * (Hc + Hc.conj().T)
     Sc = 0.5 * (Sc + Sc.conj().T)
 
@@ -61,33 +105,71 @@ def _ritz_and_residuals(V, HV, n_eig):
     Lambda = eig_all[:n_eig]
     C_N = C_all[:, :n_eig]
 
-    X = jnp.einsum('mn,msG->nsG', C_N, V, optimize=True)
-    HX = jnp.einsum('mn,msG->nsG', C_N, HV, optimize=True)
+    # Ritz vector reconstruction. The 'mn,m...->n...' contraction has the
+    # SUBSPACE m axis on V — which is replicated — and the TRAILING axes
+    # (whatever they are) untouched. XLA / shard_map keeps the trailing
+    # sharding identical to V's, so X inherits V's PartitionSpec.
+    X = jnp.einsum('mn,m...->n...', C_N, V, optimize=True)
+    HX = jnp.einsum('mn,m...->n...', C_N, HV, optimize=True)
 
-    R = HX - X * Lambda[:, None, None]
-    res_norms = jnp.sqrt(jnp.sum(jnp.abs(R) ** 2, axis=(1, 2)))
+    # Residual: HX - λ X. Broadcast Lambda along all trailing axes.
+    # ``Lambda`` is (n_eig,); pad to (n_eig, *ones) matching X's rank.
+    lam_shape = (n_eig,) + (1,) * (X.ndim - 1)
+    R = HX - X * Lambda.reshape(lam_shape)
+
+    # ‖R‖ per state — sum over every trailing axis.
+    trailing_axes = tuple(range(1, R.ndim))
+    res_norms = jnp.sqrt(jnp.sum(jnp.abs(R) ** 2, axis=trailing_axes))
 
     return Lambda, X, HX, R, res_norms
 
 
 def _default_precond(R, eigenvalues):
-    """Identity preconditioner (no-op)."""
-    norms = jnp.sqrt(jnp.sum(jnp.abs(R) ** 2, axis=(1, 2)))
-    return R / jnp.maximum(norms, 1e-30)[:, None, None]
+    """Identity preconditioner (no-op): returns R / ‖R‖ per state."""
+    trailing_axes = tuple(range(1, R.ndim))
+    norms = jnp.sqrt(jnp.sum(jnp.abs(R) ** 2, axis=trailing_axes))
+    norm_shape = (R.shape[0],) + (1,) * (R.ndim - 1)
+    return R / jnp.maximum(norms, 1e-30).reshape(norm_shape)
 
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Warmup
 # ═══════════════════════════════════════════════════════════════════════
 
-def warmup_davidson_jit(n_eig: int, dim: int, n_channels: int,
-                        m_max: int | None = None):
-    """Pre-compile _ritz_and_residuals at all subspace sizes."""
+def warmup_davidson_jit(
+    n_eig: int,
+    trailing_shape: tuple[int, ...],
+    m_max: int | None = None,
+    *,
+    dtype=jnp.complex128,
+    sharding=None,
+):
+    """Pre-compile _ritz_and_residuals at all subspace sizes.
+
+    Parameters
+    ----------
+    n_eig : int
+        Number of eigenvalues being sought; controls the static argument.
+    trailing_shape : tuple[int, ...]
+        Shape of *one* state vector (everything after the batch axis 0).
+        Examples: ``(n_channels, dim)``, ``(nc, nv, nk)``, ``(dim,)``.
+    m_max : int, optional
+        Largest subspace dimension that will be reached. Default 4·n_eig.
+    dtype : jnp dtype, optional
+        Subspace-vector dtype. Default complex128.
+    sharding : jax.sharding.Sharding, optional
+        If given, dummy buffers are placed under this sharding so the
+        compile cache key matches the production shardings.
+    """
     if m_max is None:
         m_max = 4 * n_eig
     for m in range(n_eig, m_max + n_eig, n_eig):
-        V = jnp.zeros((min(m, m_max), n_channels, dim), dtype=jnp.complex128)
-        HV = jnp.zeros_like(V)
+        m_eff = min(m, m_max)
+        shape = (m_eff,) + tuple(trailing_shape)
+        V = jnp.zeros(shape, dtype=dtype)
+        if sharding is not None:
+            V = jax.device_put(V, sharding)
+        HV = V
         _ritz_and_residuals(V, HV, n_eig)
 
 
@@ -107,27 +189,40 @@ def davidson(
     tol: float = 1e-8,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Block Davidson iterative eigensolver.
+    """Block Davidson iterative eigensolver — shape-agnostic.
 
     Parameters
     ----------
-    apply_H : (m, n_channels, dim) → (m, n_channels, dim)
-        Hermitian matvec.
-    n_eig : number of lowest eigenvalues to converge.
+    apply_H : (m, *trailing) → (m, *trailing)
+        Hermitian matvec. Trailing shape is arbitrary; sharding (if any)
+        is the caller's responsibility — Davidson never reshapes the
+        trailing axes and never inserts collectives.
+    n_eig : int
+        Number of lowest eigenvalues to converge.
     precond_fn : (R, eigenvalues) → P
-        Preconditioner: maps residuals (n_eig, n_channels, dim) and
-        eigenvalues (n_eig,) to normalised corrections P.
+        Preconditioner: maps residuals (n_eig, *trailing) and eigenvalues
+        (n_eig,) to corrections P with the same shape and sharding.
         Default: identity (normalised residuals).
     init_fn : (apply_H, n_eig) → (X0, HX0)
-        Initial subspace builder. Returns (n_eig, n_channels, dim) arrays.
+        Initial subspace builder. Returns (n_eig, *trailing) arrays.
         Default: must provide X0 instead.
-    X0 : (n_eig, n_channels, dim) — explicit initial vectors (alternative to init_fn).
-    m_max : max subspace dimension before restart (default 4 × n_eig).
+    X0 : (n_eig, *trailing)
+        Explicit initial vectors (alternative to init_fn).
+    m_max : int, optional
+        Max subspace dimension before restart. Default 4 × n_eig.
+    max_iter : int, optional
+        Iteration cap. Default 100.
+    tol : float, optional
+        Convergence tolerance; per-state ‖R‖ < tol·max(1,|λ|). Default 1e-8.
+    verbose : bool, optional
+        Print per-iteration progress. Default True.
 
     Returns
     -------
-    eigenvalues : (n_eig,)
-    eigenvectors : (n_eig, n_channels, dim)
+    eigenvalues : np.ndarray, shape (n_eig,)
+    eigenvectors : jax.Array, shape (n_eig, *trailing)
+        Returned as a JAX array so callers can keep its sharding; cast
+        with ``np.asarray`` if you want host memory.
     """
     if precond_fn is None:
         precond_fn = _default_precond
@@ -136,7 +231,8 @@ def davidson(
 
     # ── initial subspace ──
     if X0 is not None:
-        V = jnp.asarray(X0[:n_eig], dtype=jnp.complex128)
+        # Explicit X0 — caller controls dtype and sharding.
+        V = jnp.asarray(X0[:n_eig])
         HV = apply_H(V)
     elif init_fn is not None:
         V, HV = init_fn(apply_H, n_eig)
@@ -144,9 +240,10 @@ def davidson(
         raise ValueError("Provide either init_fn or X0")
 
     if verbose:
-        print(f"Davidson: n_eig={n_eig}, dim={V.shape[-1]}, m_max={m_max}")
+        print(f"Davidson: n_eig={n_eig}, trailing={V.shape[1:]}, m_max={m_max}")
 
     eigenvalues = None
+    X = V  # in case the loop never runs
 
     for it in range(1, max_iter + 1):
         # ── GPU: project + solve + Ritz + residual (one JIT) ──
@@ -156,8 +253,9 @@ def davidson(
         P = precond_fn(R, Lambda)
 
         # ── convergence check (CPU) ──
-        res_np = np.asarray(res)
-        rel_tol = tol * np.maximum(1.0, np.abs(np.asarray(Lambda)))
+        res_np = _to_host(res)
+        Lambda_np = _to_host(Lambda)
+        rel_tol = tol * np.maximum(1.0, np.abs(Lambda_np))
         conv = res_np < rel_tol
         n_conv = 0
         for i in range(n_eig):
@@ -166,7 +264,7 @@ def davidson(
             else:
                 break
 
-        eigenvalues = np.asarray(Lambda)
+        eigenvalues = Lambda_np
         if verbose and (it <= 5 or it % 5 == 0 or n_conv == n_eig):
             print(f"  iter {it:3d}: m={V.shape[0]:3d}  "
                   f"eig[0]={float(Lambda[0]):12.6f}  "
@@ -177,7 +275,7 @@ def davidson(
         if n_conv == n_eig:
             if verbose:
                 print(f"  Converged all {n_eig} in {it} iterations.")
-            return eigenvalues, np.asarray(X)
+            return eigenvalues, X
 
         # ── expand subspace ──
         HP = apply_H(P)
@@ -193,4 +291,4 @@ def davidson(
     if verbose:
         print(f"  WARNING: did not converge in {max_iter} iterations. "
               f"Best: {n_conv}/{n_eig}")
-    return eigenvalues, np.asarray(X)
+    return eigenvalues, X
