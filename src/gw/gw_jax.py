@@ -410,7 +410,8 @@ def main(argv=None):
 			raise NotImplementedError("use_ppm_sigma not supported with self_consistent.")
 
 		ppm_options = build_ppm_sigma_runtime_options(config, input_dir=input_dir, ryd2ev=ryd2ev)
-		print_section("GN-PPM + FREQUENCY-INTEGRATED SIGMA", print0)
+		_ppm_label = "HL-PPM" if str(getattr(config, "ppm_model", "gn")).strip().lower() == "hl" else "GN-PPM"
+		print_section(f"{_ppm_label} + FREQUENCY-INTEGRATED SIGMA", print0)
 
 		# q→0, G=G'=0 head: injected *analytically* into Σ_c at the end of the
 		# block via `compute_ppm_head_sigma_kij`.  The body integral in
