@@ -724,6 +724,26 @@ def main(argv=None):
 	enk_dft, _ = get_enk_bandrange(wfn, sym,
 		band_slices.sigma_range, band_slices.sigma_range, nspinor=meta.nspinor)
 
+	# In PPM mode, replace sig_coh's band-diagonal with the dynamic
+	# Σ_c(E_DFT) so eqp0.dat's "sigC" column reports the on-shell
+	# dynamic correlation (directly comparable to BGW's (SX-X)+CH at
+	# Eo=E_DFT) instead of the static COHSEX Coulomb hole.  Off-diagonals
+	# are zeroed because we only have the diagonal interpolation here;
+	# the full Σ_c(ω, k, i, j) tensor remains in sigma_mnk.h5 for callers
+	# that need off-diagonals.  Rank-0 only — write_results runs only
+	# there, and sigma_c_at_dft_ev was computed only on rank 0.
+	if (
+		config.use_ppm_sigma
+		and meta.rank == 0
+		and sigma_c_at_dft_ev is not None
+	):
+		_sig_coh_eqp0 = np.zeros(np.asarray(sig_coh).shape, dtype=np.complex128)
+		_diag_ry = sigma_c_at_dft_ev / ryd2ev
+		_nk, _nb = _diag_ry.shape
+		_idx = np.arange(_nb)
+		_sig_coh_eqp0[:, _idx, _idx] = _diag_ry
+		sig_coh = _sig_coh_eqp0
+
 	# ---- Output ----
 	results = GWResults(
 		sig_sx=np.array(sig_sx),
