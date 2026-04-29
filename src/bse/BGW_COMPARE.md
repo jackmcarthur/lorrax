@@ -96,7 +96,7 @@ compression).
 | LORRAX's `eqp0.dat` not BGW's `eqp.dat` | BSE eigvals 50–200 meV off | §2 |
 | Missing `bgw_vcoul_file` | Eigvals shift 10–100 meV | §3 |
 | Mixing SOC band conventions (`--n-val 8` + `--n-occ 4`) | Loader truncates / wrong space | §4 |
-| Comparing LORRAX Lanczos n=100 to BGW full diag | LORRAX peak ~18% of BGW (real, not a bug) | Use Haydock, or match n_max via `eigvals_to_eps2` |
+| Comparing LORRAX Lanczos eigvec n=N to BGW full-diag truncated to N | LORRAX peak ~18% of BGW at N=100, ~50% at N=400 (real, not a bug — Lanczos Ritz vectors at finite N ≠ exact lowest-N eigenvectors). **This bites every time. Use Haydock instead.** | Haydock route in §2a |
 | Mismatched η | Peak heights look 30%+ off | §6 |
 | Comparing raw Σ\|d\|² across codes | "10× off" results that vanish at ε₂ level | Compare ε₂(ω), not raw \|d\|² |
 
