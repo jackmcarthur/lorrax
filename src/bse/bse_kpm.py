@@ -368,6 +368,7 @@ def main(argv: list[str] | None = None) -> None:
             n_cond=args.n_cond,
             mesh_xy=mesh_xy,
             use_nohead=args.nohead,
+            input_file=args.input,
         )
 
     nk = int(data["nkx"] * data["nky"] * data["nkz"])

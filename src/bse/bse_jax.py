@@ -239,9 +239,10 @@ def _preview_lanczos(
         )
         # T-encoding strategy plumbed via the data dict (see solve_bse_sharded).
         data["matvec_kind"] = matvec_kind
+        grid_x, grid_y = mesh_xy.devices.shape
         # EQP override on enk_full (BGW eqp1.dat semantics).
         if eqp_file is not None:
-            from .bse_io import apply_eqp_corrections
+            from .bse_io import apply_eqp_corrections, resolve_n_occ
             import numpy as _np
             # Re-derive full enk and band-slice indices to apply EQP, then
             # update eps_v / eps_c slices in-place. Simpler: reload enk
@@ -250,15 +251,14 @@ def _preview_lanczos(
                 enk_full_np = _np.asarray(f["enk_full"][:])
             enk_full_np = apply_eqp_corrections(
                 enk_full_np, eqp_file, input_file=input_file)
-            mean_enk = _np.mean(enk_full_np, axis=0)
-            n_occ_eff = n_occ if n_occ is not None else int((mean_enk < 0.0).sum())
+            n_occ_eff = resolve_n_occ(
+                enk_full_np, n_occ=n_occ, input_file=input_file)
             val_idx = _np.arange(n_occ_eff - n_val, n_occ_eff)
             cond_idx = _np.arange(n_occ_eff, n_occ_eff + n_cond)
             data["eps_v"] = jnp.asarray(enk_full_np[:, val_idx])
             data["eps_c"] = jnp.asarray(enk_full_np[:, cond_idx])
             # Pad to match psi_v_X / psi_c_X band axes.
             from .bse_io import _pad_axis_to_multiple
-            grid_x, grid_y = mesh_xy.devices.shape
             data["eps_v"], _ = _pad_axis_to_multiple(data["eps_v"], axis=1, multiple=grid_y)
             data["eps_c"], _ = _pad_axis_to_multiple(data["eps_c"], axis=1, multiple=grid_x)
         nkx = data["nkx"]; nky = data["nky"]; nkz = data["nkz"]

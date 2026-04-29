@@ -916,7 +916,8 @@ def ring_matvec_correctness_check(
     mesh = Mesh(np.array(devices[:px * py]).reshape(px, py), axis_names=("x", "y"))
     sh = make_bse_shardings(mesh)
 
-    payload = _load_ring_subset(restart_file, n_val, n_cond, px, py)
+    payload = _load_ring_subset(restart_file, n_val, n_cond, px, py,
+                                input_file=input_file)
     psi_c = payload["psi_c"]
     psi_v = payload["psi_v"]
     eps_c = payload["eps_c"]
@@ -1020,9 +1021,9 @@ def ring_matvec_timing(
             restart_file,
             n_val=n_val,
             n_cond=n_cond,
-            fermi_energy=0.0,
             mesh_xy=mesh,
             pad_bands=True,
+            input_file=input_file,
         )
         psi_c_X = payload["psi_c_X"]
         psi_c_Y = payload["psi_c_Y"]

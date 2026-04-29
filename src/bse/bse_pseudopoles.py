@@ -597,6 +597,7 @@ def main(argv: list[str] | None = None) -> None:
             n_cond=args.n_cond,
             mesh_xy=mesh_xy,
             use_nohead=args.nohead,
+            input_file=args.input,
         )
 
     with timing.section("pseudopoles.bounds"):

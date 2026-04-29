@@ -186,7 +186,7 @@ def solve_bse_sharded(
     # the same `(eigenvalues, eigenvectors, n_iter_done)` tuple as the
     # Lanczos path so callers don't branch.
     if solver_kind == "davidson":
-        from solvers.davidson import davidson
+        from solvers.davidson import davidson, warmup_davidson_jit
         from .bse_davidson_helpers import bse_diagonal_precond, init_bse_subspace
 
         psi_c_X = data["psi_c_X"]; psi_c_Y = data["psi_c_Y"]
@@ -207,6 +207,19 @@ def solve_bse_sharded(
         X0 = init_bse_subspace(
             eps_c, eps_v, n_eig=n_eig, n_random=davidson_n_random_init,
             mesh=mesh_xy, sharding=bse_sharding)
+
+        # Pre-compile _ritz_and_residuals at every subspace size m ∈ {n_eig,
+        # 2·n_eig, …, m_max} so the Davidson loop does not pay 4 separate
+        # XLA compiles as the subspace grows between restarts. Compiles
+        # ~2 s otherwise; with warmup this is a one-time up-front cost.
+        m_max_warm = 4 * n_eig
+        warmup_davidson_jit(
+            n_eig=n_eig,
+            trailing_shape=tuple(X0.shape[1:]),
+            m_max=m_max_warm,
+            dtype=X0.dtype,
+            sharding=bse_sharding,
+        )
 
         eigenvalues, eigenvectors = davidson(
             apply_H, n_eig=n_eig, precond_fn=precond_fn, X0=X0,

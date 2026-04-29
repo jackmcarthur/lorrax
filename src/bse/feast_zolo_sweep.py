@@ -286,6 +286,7 @@ def main(argv: list[str] | None = None) -> None:
         n_val=args.n_val,
         n_cond=args.n_cond,
         mesh_xy=mesh_xy,
+        input_file=args.input,
     )
 
     print("Estimating spectral bounds...", flush=True)

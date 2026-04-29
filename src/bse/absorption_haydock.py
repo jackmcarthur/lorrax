@@ -168,14 +168,17 @@ def run_haydock(
         restart_file, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,
         input_file=input_file, n_occ=n_occ,
     )
+    # Resolve n_occ for the downstream dipole slice — same source as the
+    # loader used (WFN.h5 ifmax → largest-gap fallback).
+    with h5py.File(restart_file, "r") as f:
+        enk_full_np = np.asarray(f["enk_full"][:])
+    from .bse_io import resolve_n_occ
+    n_occ = resolve_n_occ(enk_full_np, n_occ=n_occ, input_file=input_file)
     if eqp_file is not None:
         from .bse_io import _pad_axis_to_multiple, apply_eqp_corrections
-        with h5py.File(restart_file, "r") as f:
-            enk_full_np = np.asarray(f["enk_full"][:])
         enk_full_np = apply_eqp_corrections(enk_full_np, eqp_file, input_file=input_file)
-        n_occ_eff = n_occ if n_occ is not None else int((np.mean(enk_full_np, 0) < 0.0).sum())
-        val_idx = np.arange(n_occ_eff - n_val, n_occ_eff)
-        cond_idx = np.arange(n_occ_eff, n_occ_eff + n_cond)
+        val_idx = np.arange(n_occ - n_val, n_occ)
+        cond_idx = np.arange(n_occ, n_occ + n_cond)
         data["eps_v"] = jnp.asarray(enk_full_np[:, val_idx])
         data["eps_c"] = jnp.asarray(enk_full_np[:, cond_idx])
         data["eps_v"], _ = _pad_axis_to_multiple(data["eps_v"], axis=1, multiple=grid_y)

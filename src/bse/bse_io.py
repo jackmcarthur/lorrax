@@ -349,36 +349,26 @@ def load_bse_data_from_restart_sharded(
         if n_rmu != n_rnu:
             raise ValueError("Expected square μ/ν dimensions in V_qmunu")
 
-        if n_occ is not None:
-            # Explicit nelec → bypass the mean-enk auto-detect (which is
-            # fragile when EQP overrides shift the enk reference).
-            nb_total = int(enk_full.shape[1])
-            n_val_available = int(n_occ)
-            n_cond_available = nb_total - int(n_occ)
-            if n_val > n_val_available:
-                print(f"Warning: requested {n_val} valence bands but only {n_val_available} available; using {n_val_available}")
-            if n_cond > n_cond_available:
-                print(f"Warning: requested {n_cond} conduction bands but only {n_cond_available} available; using {n_cond_available}")
-            n_val = min(n_val, n_val_available)
-            n_cond = min(n_cond, n_cond_available)
-            val_indices = np.arange(n_occ - n_val, n_occ)
-            cond_indices = np.arange(n_occ, n_occ + n_cond)
-        else:
-            mean_enk_full = np.mean(enk_full, axis=0)
-            val_mask = mean_enk_full < fermi_energy
-            cond_mask = mean_enk_full > fermi_energy
-            n_val_available = int(np.sum(val_mask))
-            n_cond_available = int(np.sum(cond_mask))
-            if n_val > n_val_available:
-                print(f"Warning: requested {n_val} valence bands but only {n_val_available} available; using {n_val_available}")
-            if n_cond > n_cond_available:
-                print(f"Warning: requested {n_cond} conduction bands but only {n_cond_available} available; using {n_cond_available}")
-            n_val = min(n_val, n_val_available)
-            n_cond = min(n_cond, n_cond_available)
-            if n_val == 0 or n_cond == 0:
-                raise ValueError("No valence or conduction bands found for given Fermi energy")
-            val_indices = np.argsort(np.where(val_mask, mean_enk_full, -np.inf))[-n_val:]
-            cond_indices = np.argsort(np.where(cond_mask, mean_enk_full, np.inf))[:n_cond]
+        n_occ = resolve_n_occ(
+            enk_full, n_occ=n_occ, input_file=input_file,
+            fermi_energy=fermi_energy if fermi_energy != 0.0 else None,
+        )
+        nb_total = int(enk_full.shape[1])
+        n_val_available = int(n_occ)
+        n_cond_available = nb_total - int(n_occ)
+        if n_val > n_val_available:
+            print(f"Warning: requested {n_val} valence bands but only {n_val_available} available; using {n_val_available}")
+        if n_cond > n_cond_available:
+            print(f"Warning: requested {n_cond} conduction bands but only {n_cond_available} available; using {n_cond_available}")
+        n_val = min(n_val, n_val_available)
+        n_cond = min(n_cond, n_cond_available)
+        if n_val == 0 or n_cond == 0:
+            raise ValueError(
+                f"No valence ({n_val_available}) or conduction ({n_cond_available}) bands "
+                f"resolved (n_occ={n_occ}, total={nb_total})."
+            )
+        val_indices = np.arange(n_occ - n_val, n_occ)
+        cond_indices = np.arange(n_occ, n_occ + n_cond)
 
         eps_v = jnp.asarray(enk_full[:, val_indices])
         eps_c = jnp.asarray(enk_full[:, cond_indices])
@@ -544,6 +534,70 @@ def _parse_wfn_path(input_file: str) -> str:
     if not os.path.isabs(wfn_file):
         wfn_file = os.path.join(input_dir, wfn_file)
     return wfn_file
+
+
+def resolve_n_occ(
+    enk_full: np.ndarray,
+    *,
+    n_occ: Optional[int] = None,
+    input_file: Optional[str] = None,
+    fermi_energy: Optional[float] = None,
+) -> int:
+    """Determine n_occ (count of occupied bands) for BSE band slicing.
+
+    Resolution order:
+
+      1. **Explicit ``n_occ``** — caller knows; return as-is.
+      2. **WFN.h5 ``ifmax``** via ``input_file`` (cohsex.in's ``wfn_file``
+         entry). Reads ``mf_header/kpoints/ifmax`` directly — authoritative.
+      3. **``mean_enk < fermi_energy``** if ``fermi_energy`` is explicitly
+         passed (Ry). Caller's responsibility to pass a sane reference.
+
+    Raises ``ValueError`` if none of the above resolves. The previous
+    "auto-detect" heuristic (``mean_enk < 0`` or "largest gap") was
+    silently broken for systems whose pseudopotential reference puts the
+    valence well above zero (most QE setups, e.g. Si): it returned only
+    the deepest semicore states. We now require an explicit source.
+
+    Parameters
+    ----------
+    enk_full : (nk, nb) ndarray (Ry) — DFT eigenvalues per k. Used only
+        when ``fermi_energy`` is given as a hint.
+    n_occ : int, optional — explicit bypass.
+    input_file : str, optional — cohsex.in / nscf.in path. Its
+        ``wfn_file`` entry is followed to a WFN.h5 to read ``ifmax``.
+    fermi_energy : float, optional (Ry) — explicit Fermi-level hint.
+    """
+    if n_occ is not None:
+        return int(n_occ)
+
+    if input_file is not None:
+        try:
+            from common.wfnreader import WFNReader
+            wfn_path = _parse_wfn_path(input_file)
+            if os.path.exists(wfn_path):
+                w = WFNReader(wfn_path)
+                return int(w.nelec)
+            else:
+                print(f"  [resolve_n_occ] WFN.h5 not found at {wfn_path}; "
+                      "trying fermi_energy hint next.")
+        except Exception as e:
+            print(f"  [resolve_n_occ] WFN.h5 lookup failed "
+                  f"({type(e).__name__}: {e}); trying fermi_energy hint next.")
+
+    if fermi_energy is not None:
+        mean_enk = np.asarray(np.mean(enk_full, axis=0))
+        nb = mean_enk.size
+        n_occ_hint = int(np.sum(mean_enk < fermi_energy))
+        if 1 <= n_occ_hint <= nb - 1:
+            return n_occ_hint
+
+    raise ValueError(
+        "Could not determine n_occ. Pass `n_occ=` explicitly, or "
+        "`input_file=` pointing to a cohsex.in / nscf.in whose `wfn_file` "
+        "resolves to a valid WFN.h5 (where `mf_header/kpoints/ifmax` "
+        "gives the count of occupied bands authoritatively)."
+    )
 
 
 def _parse_head_overrides(input_file: Optional[str]):
@@ -724,14 +778,9 @@ def _load_ring_subset(
     n_rmu_pad = ((n_rmu + lcm_xy - 1) // lcm_xy) * lcm_xy
 
     n_bands_total = enk_full.shape[1]
-    if n_occ is not None:
-        n_val_available = n_occ
-        n_cond_available = n_bands_total - n_occ
-    else:
-        mean_enk_full = jnp.mean(enk_full, axis=0)
-        n_val_available = int(jnp.sum(mean_enk_full < 0.0))
-        n_cond_available = int(jnp.sum(mean_enk_full > 0.0))
-        n_occ = n_val_available
+    n_occ = resolve_n_occ(enk_full_np, n_occ=n_occ, input_file=input_file)
+    n_val_available = int(n_occ)
+    n_cond_available = n_bands_total - n_occ
     if n_val > n_val_available:
         print(f"Warning: requested {n_val} valence bands but only {n_val_available} available; using {n_val_available}")
     if n_cond > n_cond_available:
