@@ -1,5 +1,13 @@
 # BSE module status — agent C, 2026-04-28
 
+> **If you are about to run a LORRAX-vs-BGW absorption comparison, stop
+> and read [BGW_COMPARE.md](BGW_COMPARE.md) first.** It enumerates six
+> conventions (dipole operator, eqp source, head injection, SOC band
+> counting, n_occ resolution, broadening/iter-count) that *every*
+> comparison must satisfy. Skipping any of them produces silent O(1)
+> errors that look plausible. The cookbook there has the exact command
+> sequence that reproduces the validated 8×8 Si Haydock comparison.
+
 ## Modules
 
 | File | Role | Status |
