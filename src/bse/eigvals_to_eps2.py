@@ -61,12 +61,26 @@ def lorentzian(omegas, energies, weights, eta):
     return L @ weights
 
 
+def gaussian(omegas, energies, weights, eta):
+    """Gaussian-broadened sum-of-deltas. ``eta`` is the standard deviation
+    σ in the same units as ``omegas`` and ``energies``. Normalised so
+    ∫G(ω) dω = 1 (peak height = 1/(σ√(2π))).
+    """
+    delta = omegas[:, None] - energies[None, :]
+    G = np.exp(-0.5 * (delta / eta) ** 2) / (eta * np.sqrt(2 * np.pi))
+    return G @ weights
+
+
 def compute_eps2(E_eV, f_S, V_super, n_spin, n_spinor,
-                 *, omegas_eV, eta_eV, n_max=None):
+                 *, omegas_eV, eta_eV, n_max=None, kernel="lorentzian"):
     """Mirrors ``bse.absorption_eigvecs.compute_eps2``: prefactor 16π²/V
     with V the supercell volume in bohr³, broadening done in **Rydberg**
-    units (Lorentzian normalisation depends on η's units; LORRAX's
-    writer + absorption.x agree on Ry-space broadening).
+    units (the ε₂ writer + BGW's absorption.x agree on Ry-space broadening).
+
+    Parameters
+    ----------
+    kernel : "lorentzian" or "gaussian". Default "lorentzian" (BGW
+        default). With "gaussian", ``eta_eV`` is the Gaussian std-dev σ.
     """
     ryd2ev = 13.6056980659
     if n_max is not None:
@@ -76,18 +90,21 @@ def compute_eps2(E_eV, f_S, V_super, n_spin, n_spinor,
     E_Ry = E_eV / ryd2ev
     eta_Ry = eta_eV / ryd2ev
     pref = 16.0 * np.pi ** 2 / (V_super * n_spin * n_spinor)
-    return pref * lorentzian(omegas_Ry, E_Ry, f_S, eta_Ry)
+    broaden = gaussian if kernel == "gaussian" else lorentzian
+    return pref * broaden(omegas_Ry, E_Ry, f_S, eta_Ry)
 
 
 def compute_eps2_from_files(paths, *, eta_eV, n_max=None,
-                            omega_min_eV=0.0, omega_max_eV=8.0, n_omega=4001):
+                            omega_min_eV=0.0, omega_max_eV=8.0, n_omega=4001,
+                            kernel="lorentzian"):
     omegas = np.linspace(omega_min_eV, omega_max_eV, n_omega)
     out = {}
     for p in paths:
         E, f, V, ns, nspinor, n_in = read_bgw_eigvals(p)
         n_used = min(n_max, n_in) if n_max else n_in
         eps2 = compute_eps2(E, f, V, ns, nspinor,
-                            omegas_eV=omegas, eta_eV=eta_eV, n_max=n_max)
+                            omegas_eV=omegas, eta_eV=eta_eV, n_max=n_max,
+                            kernel=kernel)
         out[str(p)] = dict(eps2=eps2, n_used=n_used, V=V,
                            E=E[:n_used], f=f[:n_used])
     return omegas, out
@@ -98,7 +115,11 @@ def _main():
     p.add_argument("--files", nargs="+", required=True,
                    help="One or more BGW-format eigenvalues.dat paths")
     p.add_argument("--eta-eV", type=float, default=0.05,
-                   help="Lorentzian half-width η (default 0.05)")
+                   help="Broadening width (Lorentzian half-width η or "
+                        "Gaussian std σ). Default 0.05.")
+    p.add_argument("--kernel", choices=("lorentzian", "gaussian"),
+                   default="lorentzian",
+                   help="Broadening kernel (BGW default = lorentzian)")
     p.add_argument("--n-max", type=int, default=None,
                    help="Truncate each spectrum to first n_max states "
                         "(default: file's full neig)")
@@ -117,7 +138,7 @@ def _main():
     omegas, out = compute_eps2_from_files(
         args.files, eta_eV=args.eta_eV, n_max=args.n_max,
         omega_min_eV=args.omega_min_eV, omega_max_eV=args.omega_max_eV,
-        n_omega=args.n_omega)
+        n_omega=args.n_omega, kernel=args.kernel)
 
     labels = args.label or [Path(p).name for p in args.files]
     if len(labels) != len(args.files):
