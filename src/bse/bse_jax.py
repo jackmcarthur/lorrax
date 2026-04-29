@@ -23,7 +23,6 @@ from .bse_ring_comm import (
     make_bse_shardings,
     ring_matvec_correctness_check,
     ring_matvec_smoke_test,
-    ring_matvec_timing,
 )
 from .bse_io import _find_restart_file, _load_ring_subset
 from .bse_serial import (
@@ -59,7 +58,6 @@ __all__ = [
     "make_bse_shardings",
     "ring_matvec_correctness_check",
     "ring_matvec_smoke_test",
-    "ring_matvec_timing",
     "simple_lanczos_eig",
     "solve_bse",
     "symmetrize_W_q",
@@ -357,8 +355,6 @@ if __name__ == "__main__":
     parser.add_argument("--n-cond", type=int, default=4)
     parser.add_argument("--px", type=int, default=1)
     parser.add_argument("--py", type=int, default=1)
-    parser.add_argument("--repeat", type=int, default=5)
-    parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--n-eig", type=int, default=5)
     parser.add_argument("--feast-n-lanczos", type=int, default=10, help="Lanczos steps for FEAST bounds.")
     parser.add_argument("--feast-buffer", type=float, default=0.05, help="Emax buffer fraction for FEAST windows.")
@@ -628,14 +624,3 @@ if __name__ == "__main__":
         solver_kind=args.solver,
     )
     raise SystemExit(0)
-
-    ring_matvec_timing(
-        args.input,
-        args.n_val,
-        args.n_cond,
-        args.px,
-        args.py,
-        args.repeat,
-        args.warmup,
-        True,
-    )

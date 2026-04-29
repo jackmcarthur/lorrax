@@ -130,23 +130,27 @@ def main(argv=None):
     eps_c, eps_v = data["eps_c"], data["eps_v"]
     V_q0 = data["V_q0"]
 
-    # The simple matvec has an internal workspace whose size scales worse
-    # than linearly with the batch axis m (~m^1.5 empirically; 4.5 GB at
-    # m=10 → 88 GB at m=50). The state vectors themselves are tiny
-    # (m=20 × 8×8×64 c128 = 1.3 MB), so the bloat is unsharded
-    # intermediates inside the matvec, not the inputs/outputs. lax.scan
-    # one vector at a time so XLA sees a single small matvec and reuses
-    # its workspace; output sharding is preserved across iterations.
+    # The simple matvec's workspace scales worse than linearly with the
+    # batch axis m (~m^1.5; 4.5 GB at m=10 → 88 GB at m=50). The state
+    # vectors themselves are tiny. Use lax.scan over m=1 calls so XLA
+    # reuses the m=1 workspace.
+    #
+    # Multi-host: jit closures over sharded arrays raise
+    # "Closing over jax.Array that spans non-addressable devices".
+    # Pass psi_*, eps_*, W_R, V_q0 as arguments to the jit'd function;
+    # the outer apply_H is plain python that forwards them at call time.
     @jax.jit
-    def apply_H(X):
-        # X: (m, nc, nv, nk) sharded P(None, "x", "y", None).
+    def matvec_scan(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0):
         def body(carry, x_one):
-            # x_one: (nc, nv, nk) sharded P("x", "y", None).
             Hx = matvec_simple(x_one[None], psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
                                eps_c, eps_v, W_R, V_q0)
             return carry, Hx[0]
         _, HX = jax.lax.scan(body, None, X)
         return HX
+
+    def apply_H(X):
+        return matvec_scan(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
+                           eps_c, eps_v, W_R, V_q0)
 
     # ── Initial subspace ───────────────────────────────────────────────
     V0 = init_bse_subspace(
