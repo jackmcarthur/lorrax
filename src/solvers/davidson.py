@@ -132,6 +132,52 @@ def _default_precond(R, eigenvalues):
     return R / jnp.maximum(norms, 1e-30).reshape(norm_shape)
 
 
+@jax.jit
+def _orthonormalise_batch(P):
+    """Self-orthonormalise the batch axis of P via Cholesky of P^H P.
+
+    Same self-orthonormalisation step as ``_ortho_expand`` without the
+    against-V projection — used to clean up the initial subspace V0.
+    """
+    S_P = jnp.einsum('m...,n...->mn', jnp.conj(P), P, optimize=True)
+    S_P = 0.5 * (S_P + S_P.conj().T)
+    n = S_P.shape[0]
+    L_P = jnp.linalg.cholesky(S_P + 1e-12 * jnp.eye(n, dtype=S_P.dtype))
+    L_P_inv = jnp.linalg.inv(L_P)
+    return jnp.einsum('mi,i...->m...', jnp.conj(L_P_inv), P, optimize=True)
+
+
+@jax.jit
+def _ortho_expand(V, P):
+    """Orthonormalise P against V (CGS2) and self-orthonormalise P columns.
+
+    Without this, the Davidson subspace V loses orthonormality across
+    iterations: ‖V^H V − I‖ grows, the Cholesky in ``_generalized_eigh``
+    becomes ill-conditioned, and eigenvalues blow up to ~1e+40 within
+    ~50 iterations. Maintaining V orthonormal keeps Sc ≈ I throughout.
+
+    V    : (m_V, *trailing) — assumed already orthonormal in batch axis.
+    P    : (n_eig, *trailing) — preconditioned residuals.
+
+    Returns P with V^H P ≈ 0 and P^H P ≈ I (in the (m, n) Gram metric
+    summing over all trailing axes).
+    """
+    # Iterated classical Gram-Schmidt against V (twice for full numerical
+    # orthogonality at the cost of one extra projection).
+    for _ in range(2):
+        overlap = jnp.einsum('m...,n...->mn', jnp.conj(V), P, optimize=True)
+        P = P - jnp.einsum('mn,m...->n...', overlap, V, optimize=True)
+
+    # Self-orthonormalisation of P via Cholesky factorisation of P^H P.
+    S_P = jnp.einsum('m...,n...->mn', jnp.conj(P), P, optimize=True)
+    S_P = 0.5 * (S_P + S_P.conj().T)
+    n = S_P.shape[0]
+    L_P = jnp.linalg.cholesky(S_P + 1e-12 * jnp.eye(n, dtype=S_P.dtype))
+    L_P_inv = jnp.linalg.inv(L_P)
+    P = jnp.einsum('mi,i...->m...', jnp.conj(L_P_inv), P, optimize=True)
+    return P
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Warmup
 # ═══════════════════════════════════════════════════════════════════════
@@ -233,11 +279,18 @@ def davidson(
     if X0 is not None:
         # Explicit X0 — caller controls dtype and sharding.
         V = jnp.asarray(X0[:n_eig])
-        HV = apply_H(V)
     elif init_fn is not None:
-        V, HV = init_fn(apply_H, n_eig)
+        V, _HV = init_fn(apply_H, n_eig)
     else:
         raise ValueError("Provide either init_fn or X0")
+
+    # Orthonormalise V0 so the very first ``_ritz_and_residuals`` call
+    # operates on a well-conditioned Gram matrix. ``init_bse_subspace`` mixes
+    # indicator vectors (mostly orthogonal) with a random Gaussian tail —
+    # close to orthonormal but not exactly, and CGS2 in ``_ortho_expand``
+    # below assumes V is orthonormal when projecting subsequent residuals.
+    V = _orthonormalise_batch(V)
+    HV = apply_H(V)
 
     if verbose:
         print(f"Davidson: n_eig={n_eig}, trailing={V.shape[1:]}, m_max={m_max}")
@@ -278,6 +331,11 @@ def davidson(
             return eigenvalues, X
 
         # ── expand subspace ──
+        # Re-orthonormalise P against V before computing HP. This keeps V's
+        # batch-axis Gram matrix close to the identity across iterations;
+        # otherwise the Cholesky-based generalized eigh in
+        # ``_ritz_and_residuals`` blows up at large m.
+        P = _ortho_expand(V, P)
         HP = apply_H(P)
         V = jnp.concatenate([V, P], axis=0)
         HV = jnp.concatenate([HV, HP], axis=0)
