@@ -45,6 +45,12 @@ _DEFAULTS = {
     "do_G0": True,
     "self_consistent": False,
     "use_ppm_sigma": False,
+    # BGW-style averaging of diagonal Σ within degenerate sets (mirrors
+    # ``Sigma/shiftenergy.f90`` band-averaging).  ``no_degen_averaging =
+    # true`` disables it and emits the raw QE-basis-dependent diagonals.
+    # ``degen_avg_tol_ry`` matches BGW's ``TOL_Degeneracy = 1e-6 Ry``.
+    "no_degen_averaging": False,
+    "degen_avg_tol_ry": 1.0e-6,
     # I/O backend: True routes big sigma/zeta writes through the
     # parallel-HDF5 FFI (collective MPI-IO, ~5× faster than the
     # rank-0 h5py path once Lustre striping is applied — see
@@ -324,6 +330,8 @@ class LorraxConfig:
     do_G0: bool
     self_consistent: bool
     use_ppm_sigma: bool
+    no_degen_averaging: bool
+    degen_avg_tol_ry: float
     use_ffi_io: bool
     gspace_mode: str
     use_aot_chunk_chooser: bool
@@ -534,6 +542,8 @@ class LorraxConfig:
             do_screened=bool(_get("do_screened")),
             bispinor=bool(_get("bispinor")),
             do_G0=bool(_get("do_G0")),
+            no_degen_averaging=bool(_get("no_degen_averaging")),
+            degen_avg_tol_ry=float(_get("degen_avg_tol_ry")),
             self_consistent=bool(_get("self_consistent")),
             use_ppm_sigma=bool(_get("use_ppm_sigma")),
             use_ffi_io=bool(_get("use_ffi_io")),

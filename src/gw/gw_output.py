@@ -157,6 +157,9 @@ def write_results(
     kpoints_reduced: np.ndarray | None = None,
     kirr_to_kfull: np.ndarray | None = None,
     print_fn=print,
+    *,
+    no_degen_averaging: bool = False,
+    degen_avg_tol_ry: float = 1.0e-6,
 ):
     """Serialize all GW outputs — the unified ``punch('all')`` gateway.
 
@@ -185,12 +188,26 @@ def write_results(
 
     r2e = _RYD2EV
 
+    # BGW-style degenerate-set averaging: replace the diagonal of each
+    # Σ matrix with the mean over each contiguous degenerate group of
+    # DFT eigenvalues.  Mirrors Sigma/shiftenergy.f90 (lines 86-122).
+    # Off-diagonal entries are preserved.
+    sig_sx_out  = r2e * results.sig_sx
+    sig_coh_out = r2e * results.sig_coh
+    sig_h_out   = r2e * results.sig_h
+    if not no_degen_averaging:
+        from .degen_average import apply_to_matrix_diagonals
+        e_kn_ry = np.asarray(results.E_dft_ry, dtype=np.float64)
+        sig_sx_out  = apply_to_matrix_diagonals(sig_sx_out,  e_kn_ry, degen_avg_tol_ry)
+        sig_coh_out = apply_to_matrix_diagonals(sig_coh_out, e_kn_ry, degen_avg_tol_ry)
+        sig_h_out   = apply_to_matrix_diagonals(sig_h_out,   e_kn_ry, degen_avg_tol_ry)
+
     # 1. eqp0.dat — main QP self-energy output
     write_sigma_to_file(
-        r2e * results.sig_sx,
+        sig_sx_out,
         output_file,
-        sigma_coh_kij_eV=r2e * results.sig_coh,
-        hartree_kij_eV=r2e * results.sig_h,
+        sigma_coh_kij_eV=sig_coh_out,
+        hartree_kij_eV=sig_h_out,
         sx_label="sigX" if results.use_ppm else "sigSX",
         corr_label="sigC" if results.use_ppm else "sigCOH",
         total_label="sigXC" if results.use_ppm else "sigTOT",

@@ -378,8 +378,22 @@ def main(argv=None):
 	sig_h   = cohsex["sig_h"]
 	sig_x   = cohsex["sig_x"]
 
-	# Print bare Σ_X diagonal for ISDF quality assessment
+	# Print bare Σ_X diagonal for ISDF quality assessment.  Apply BGW-style
+	# degenerate-set averaging (mirrors Sigma/shiftenergy.f90) unless
+	# explicitly disabled via ``no_degen_averaging``.  Without this, the
+	# QE basis-dependent splitting within degenerate manifolds shows up
+	# as a few-meV spread across symmetry-equivalent bands.
+	from .degen_average import average_within_degenerate_sets
 	sig_x_diag = np.real(np.diagonal(np.asarray(sig_x), axis1=1, axis2=2)) * ryd2ev
+	if not config.no_degen_averaging:
+		_enk_sigma_ry, _ = get_enk_bandrange(
+			wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
+			nspinor=meta.nspinor)
+		sig_x_diag = average_within_degenerate_sets(
+			sig_x_diag,
+			energies_kn_ry=np.asarray(_enk_sigma_ry, dtype=np.float64),
+			tol_ry=float(config.degen_avg_tol_ry),
+		)
 	print0(f"  Bare Σ_X diagonal (eV), k=0: "
 	       + "  ".join(f"{sig_x_diag[0, i]:.4f}" for i in range(min(8, sig_x_diag.shape[1]))))
 
@@ -775,6 +789,8 @@ def main(argv=None):
 			kpoints_reduced=np.array(wfn.kpoints, dtype=np.float64),
 			kirr_to_kfull=np.array(sym.kirr_fullids, dtype=np.int32),
 			print_fn=print0,
+			no_degen_averaging=config.no_degen_averaging,
+			degen_avg_tol_ry=config.degen_avg_tol_ry,
 		)
 	if jax.process_index() == 0:
 		timing.report(print_fn=print0, title="--- Timing ---")
