@@ -24,6 +24,8 @@ from src.centroid.kmeans_isdf import (
     make_sharded_kmeans_update,
     kmeans_pp_init,
     _pick_c_block,
+    build_min_image_offsets,
+    pbc_distance_sq_single,
 )
 
 
@@ -448,13 +450,16 @@ def test_warn_dense_grid_regime_above_threshold_returns_message():
     assert 'dense' in msg.lower() or 'not implemented' in msg.lower()
 
 
+def _one_device_mesh():
+    """Convenience: a 1-element mesh for callers that don't care about sharding."""
+    return Mesh(np.asarray(jax.devices()[:1]), ('x',))
+
+
 def test_weighted_kmeans_jax_random_init_runs():
     """Smoke test: random init path produces a valid Lloyd output."""
     from src.centroid.kmeans_isdf import weighted_kmeans_jax
-    # Tiny synthetic cell: 16³ grid, 100 centroids (well above 10% threshold
-    # → test the random-init branch).
     nx = 16
-    avec = jnp.eye(3) * 5.0  # 5 Å cubic
+    avec = jnp.eye(3) * 5.0
     rng = np.random.default_rng(3)
     rho = jnp.asarray(
         np.abs(rng.standard_normal((nx, nx, nx))) + 0.1,
@@ -462,10 +467,10 @@ def test_weighted_kmeans_jax_random_init_runs():
     )
     _, cent, _, _ = weighted_kmeans_jax(
         avec, rho, N_c=80, seed=1, max_steps=10, init_method='random',
+        mesh=_one_device_mesh(),
     )
     cent_np = np.asarray(cent)
     assert cent_np.shape == (80, 3)
-    # All centroids should land in the unit cell.
     assert np.all(cent_np >= 0) and np.all(cent_np < 1.0)
 
 
@@ -475,4 +480,215 @@ def test_weighted_kmeans_jax_rejects_bad_init_method():
     rho = jnp.ones((8, 8, 8), dtype=jnp.float64)
     with pytest.raises(ValueError, match="init_method"):
         weighted_kmeans_jax(avec, rho, N_c=10, max_steps=2,
-                            init_method='nonexistent')
+                            init_method='nonexistent',
+                            mesh=_one_device_mesh())
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Lattice-aware PBC minimum image (offset table)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Round-trip + 27-image brute-force reference for the new offset-table
+# kernels. The round-trick alone is exact ONLY for orthorhombic / cubic
+# cells; for hex (e.g. MoS2 γ=120°) it overestimates ~16 % of grid-point
+# distances by up to ~30 %. These tests pin down the new behaviour:
+#   1. ``build_min_image_offsets`` returns identity-only for cubic/orthorhombic.
+#   2. For MoS2 hex the table picks up the 4 in-plane nearest-neighbour
+#      offsets (5 total).
+#   3. ``pbc_distance_sq_single`` with the lattice-aware table agrees with a
+#      brute-force search over all 125 images in {-2,...,2}^3.
+#   4. ``assign_labels_chunked`` agrees with a brute-force min-image naive
+#      reference on a hex cell — i.e. the hex bias is gone.
+
+
+def _brute_min_image_d2(df: np.ndarray, G: np.ndarray, R: int = 2) -> np.ndarray:
+    """Reference: min over n in {-R,...,R}^3 of (df+n)^T G (df+n)."""
+    import itertools
+    ns = np.array(list(itertools.product(range(-R, R + 1), repeat=3)),
+                  dtype=df.dtype)                          # (Nimg, 3)
+    df_all = df[..., None, :] + ns                          # (..., Nimg, 3)
+    d2 = np.einsum("...ki,ij,...kj->...k", df_all, G, df_all)
+    return d2.min(axis=-1)
+
+
+def test_build_min_image_offsets_cubic_identity_only():
+    """Orthorhombic / cubic: round-trick is exact, table = {(0,0,0)}."""
+    G = np.eye(3) * 9.0
+    offsets = build_min_image_offsets(G)
+    assert offsets.shape == (1, 3)
+    np.testing.assert_array_equal(offsets[0], [0, 0, 0])
+
+
+def test_build_min_image_offsets_hex_mos2():
+    """MoS2 hex 120° in alat units: 5 offsets, identity + 4 in-plane axes."""
+    avec = np.array([
+        [1.0, 0.0, 0.0],
+        [-0.5, np.sqrt(3) / 2, 0.0],
+        [0.0, 0.0, 3.79231752],
+    ])
+    G = avec @ avec.T
+    offsets = build_min_image_offsets(G)
+    expected = {(0, 0, 0), (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0)}
+    actual = {tuple(int(x) for x in row) for row in offsets}
+    assert actual == expected, f"got {actual}, expected {expected}"
+
+
+def test_pbc_distance_sq_single_matches_brute_27_on_hex():
+    """``pbc_distance_sq_single`` with the lattice-aware offset table agrees
+    with a brute-force 125-image search on a hex cell. Worst-case round-trick
+    error here is ~32 %, so a passing exact-match nails down that the hex
+    bias is fixed."""
+    avec = np.array([
+        [1.0, 0.0, 0.0],
+        [-0.5, np.sqrt(3) / 2, 0.0],
+        [0.0, 0.0, 3.79231752],
+    ])
+    G = avec @ avec.T
+    offsets_np = build_min_image_offsets(G)
+    rng = np.random.default_rng(0)
+    P = 5_000
+    positions = rng.uniform(0.0, 1.0, size=(P, 3))
+    centroid = np.array([0.05, 0.05, 0.5])
+
+    G_jnp = jnp.asarray(G)
+    pos_jnp = jnp.asarray(positions)
+    cent_jnp = jnp.asarray(centroid)
+    offsets_jnp = jnp.asarray(offsets_np)
+
+    d2_jax = np.asarray(pbc_distance_sq_single(
+        pos_jnp, cent_jnp, G_jnp, offsets_jnp
+    ))
+    d2_brute = _brute_min_image_d2(positions - centroid[None, :], G)
+
+    np.testing.assert_allclose(d2_jax, d2_brute, rtol=1e-12, atol=1e-12,
+                               err_msg="pbc_distance_sq_single != brute-125 on hex")
+
+
+def test_assign_labels_chunked_matches_brute_min_image_on_hex():
+    """``assign_labels_chunked`` with the lattice-aware offset table agrees
+    with a brute-force min-image naive reference on a hex cell — proving
+    that the centroid assignment uses WS-cell-correct distances, not the
+    biased round-trick."""
+    avec = np.array([
+        [1.0, 0.0, 0.0],
+        [-0.5, np.sqrt(3) / 2, 0.0],
+        [0.0, 0.0, 3.79231752],
+    ])
+    G = avec @ avec.T
+    offsets_np = build_min_image_offsets(G)
+
+    rng = np.random.default_rng(1)
+    P, n_c = 1_024, 32
+    positions = rng.uniform(0.0, 1.0, size=(P, 3))
+    centroids = rng.uniform(0.0, 1.0, size=(n_c, 3))
+
+    # Brute reference: full (P, C, 3) tensor, per-pair min-image search over
+    # 125 offsets, then argmin over centroids.
+    delta = positions[:, None, :] - centroids[None, :, :]    # (P, C, 3)
+    d2_brute = _brute_min_image_d2(delta, G)                  # (P, C)
+    labels_brute = np.argmin(d2_brute, axis=1).astype(np.int32)
+
+    labels_jax = np.asarray(assign_labels_chunked(
+        jnp.asarray(positions), jnp.asarray(centroids), jnp.asarray(G),
+        n_c=n_c, c_block=16, offsets=jnp.asarray(offsets_np),
+    ))
+
+    np.testing.assert_array_equal(
+        labels_jax, labels_brute,
+        err_msg="hex labels diverge from brute-force min-image reference",
+    )
+
+
+def test_weighted_kmeans_jax_hex_end_to_end():
+    """End-to-end driver smoke test on a hex (MoS2-like) cell.
+
+    Exercises the path that builds the offset table inside ``weighted_kmeans_jax``
+    and threads it through k-means++ init + Lloyd iterations. Catches:
+      * a wrong metric tensor (avec.T @ avec vs avec @ avec.T) — would yield
+        wildly different centroid placement;
+      * a missing offset thread — would produce hex-biased Lloyd convergence;
+      * any signature mismatch in the kpp / Lloyd / shard plumbing.
+    """
+    from src.centroid.kmeans_isdf import weighted_kmeans_jax
+    # MoS2-style hex cell, c/a small enough for a 3D grid that fits in seconds.
+    avec = jnp.asarray(
+        np.array([
+            [1.0, 0.0, 0.0],
+            [-0.5, np.sqrt(3) / 2, 0.0],
+            [0.0, 0.0, 2.0],
+        ]) * 3.0,                       # ~3 Å lattice constant
+        dtype=jnp.float64,
+    )
+    # Small synthetic density: two Gaussian bumps at hex Wyckoff positions
+    # (atoms at (1/3, 2/3) and (2/3, 1/3) under the hex 120° convention).
+    Nx, Ny, Nz = 12, 12, 12
+    xs = jnp.linspace(0.0, 1.0, Nx, endpoint=False, dtype=jnp.float64)
+    X, Y, Z = jnp.meshgrid(xs, xs, xs, indexing="ij")
+    # Build rho on host so we can use the (correct) hex metric for the bumps.
+    G_np = np.asarray(avec @ avec.T)
+    centers = np.array([[1/3, 2/3, 0.5], [2/3, 1/3, 0.5]])
+    pos = np.stack([np.asarray(X), np.asarray(Y), np.asarray(Z)],
+                   axis=-1).reshape(-1, 3)
+    rho = np.full(pos.shape[0], 1e-3)
+    for c in centers:
+        d = pos - c
+        d -= np.round(d)
+        d2 = np.einsum("pi,ij,pj->p", d, G_np, d)
+        rho = rho + np.exp(-d2 / 0.05)
+    rho_jax = jnp.asarray(rho.reshape(Nx, Ny, Nz), dtype=jnp.float64)
+
+    _, centroids, steps, _ = weighted_kmeans_jax(
+        avec, rho_jax, N_c=24, max_steps=50, tolerance=1e-3, seed=0,
+        init_method="kpp",
+        mesh=_one_device_mesh(),
+    )
+    centroids = np.asarray(centroids)
+    assert centroids.shape == (24, 3)
+    # Centroids must lie in [0, 1) — hex driver wraps via `% 1.0`.
+    assert np.all(centroids >= 0.0) and np.all(centroids < 1.0), (
+        f"centroids escaped unit cell: min={centroids.min():.3e}, "
+        f"max={centroids.max():.3e}"
+    )
+    # Lloyd should converge in well under max_steps for this benign density.
+    assert steps < 50, f"k-means failed to converge ({steps}/50 steps)"
+
+
+def test_round_trick_distance_overestimates_on_hex():
+    """Sanity / motivation check on **distances** (not labels): the OLD
+    round-trick path overestimates ~10 %+ of squared distances by a few
+    percent or more on a hex cell, with worst-case overestimates exceeding
+    20 %. Labels are robust to small distance errors when centroids are
+    well-separated, so this test probes ``pbc_distance_sq_single`` directly
+    rather than ``assign_labels_chunked``'s argmin output. If this test
+    starts passing, the hex-bias claim — and the new offset-table fix — are
+    not doing anything.
+    """
+    avec = np.array([
+        [1.0, 0.0, 0.0],
+        [-0.5, np.sqrt(3) / 2, 0.0],
+        [0.0, 0.0, 3.79231752],
+    ])
+    G = avec @ avec.T
+    rng = np.random.default_rng(2)
+    P = 50_000
+    df = rng.uniform(-0.5, 0.5, size=(P, 3))                        # already wrapped
+    d2_brute = _brute_min_image_d2(df, G, R=2)
+
+    # Identity-only ⇒ the kernel reduces to the bare round-trick path.
+    d2_round = np.asarray(pbc_distance_sq_single(
+        jnp.asarray(df), jnp.zeros(3), jnp.asarray(G),
+        jnp.zeros((1, 3), dtype=jnp.int32),
+    ))
+
+    ratio = np.sqrt(d2_round / np.maximum(d2_brute, 1e-30))
+    frac_overestimate_5pct = np.mean(ratio > 1.05)
+    worst = ratio.max()
+    assert frac_overestimate_5pct > 0.05, (
+        f"round-trick overestimates by >5% only on {100*frac_overestimate_5pct:.2f}% "
+        f"of df, expected >5% (worst-case overestimate {worst:.3f}). The hex "
+        f"bias should be visible at this density."
+    )
+    assert worst > 1.20, (
+        f"worst-case round-trick overestimate is only {worst:.3f}, expected >1.20. "
+        f"On hex 120° we predict ~32% peak overestimate."
+    )

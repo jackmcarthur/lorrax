@@ -50,7 +50,7 @@ from jax.experimental import multihost_utils as _mh
 from functools import partial
 
 from file_io import WFNReader
-from common import symmetry_maps
+from common import symmetry_maps, timing
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -193,161 +193,82 @@ def build_candidate_gram_q0(
 def pivoted_cholesky_select(
     G: jnp.ndarray,
     k_keep: int,
-    tol_rel: float = 1e-10,
-    tol_abs: float = 0.0,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Exact greedy pivoted Cholesky on an explicit Hermitian PSD matrix.
+    orbit_id: jnp.ndarray | None = None,
+):
+    """Greedy pivoted Cholesky on an Hermitian PSD ``G``. Always runs k_keep
+    iterations. Returns ``(piv, L, rank, d_final, d_taken, trR_over_trG)``.
 
-    Standard LAPACK pstrf-style algorithm written so it jits cleanly:
-
-      * ``k_keep`` is static, so ``L`` has a fixed (M, k_keep) shape.
-      * ``lax.fori_loop`` drives the outer iteration (no Python break).
-      * Stopping handled by a ``done`` flag in the carry; past-convergence
-        iterations become masked no-ops.
-      * ``L[:, :j]`` is replaced by a full-width masked matvec so the
-        shape is static under jit.
-      * G itself is never physically reordered — the permutation is just
-        the ``piv`` output.
-
-    The algorithm (textbook, see pivoted_cholesky.md §4.3):
-
-      d_0 = diag(G)
-      for j = 0 .. k_keep - 1:
-        p = argmax d over active set
-        if d[p] < tol: mark done and break (via mask)
-        L[:, j] = (G[:, p] - L[:, :j] @ conj(L[p, :j])) / sqrt(d[p])
-        L[p, j] = sqrt(d[p])                # cleanup pivot entry
-        d := max(d - |L[:, j]|^2, 0)        # Schur complement
-        d[p] := -inf                         # mark p inactive
-        piv[j] = p
-
-    Args:
-        G: (M, M) complex Hermitian PSD matrix.
-        k_keep: static number of pivots to take.
-        tol_rel: stopping tolerance relative to max(diag(G)). Once the
-            largest residual diagonal drops below this, later loop
-            iterations do nothing.
-        tol_abs: absolute stopping tolerance on the residual diagonal.
-
-    Returns:
-        piv: (k_keep,) int32. Entries past ``rank`` are −1.
-        L: (M, k_keep) complex. Columns past ``rank`` are zero.
-        rank: int32 scalar — how many pivots were actually taken.
-        d_final: (M,) real — residual Schur-complement diagonal at end;
-            +inf sentinels (inactive rows) are returned as 0.
-        d_taken: (k_keep,) real — pivot value (residual diagonal) at the
-            moment each pivot was accepted, in pivot order. Entries past
-            ``rank`` are 0. Useful for diagnosing whether the chosen
-            ``k_keep`` is too small (last entry still ≫ tol_rel × d0max
-            ⇒ stopping early would have been premature) or too large
-            (last entries near zero ⇒ already extracting noise).
-        trR_over_trG: (k_keep + 1,) real — running ``tr(R_k) / tr(G)``,
-            i.e. the candidate-pool relative Frobenius residual after
-            each pivot. ``trR_over_trG[0] = 1`` (no pivots), then
-            ``trR_over_trG[k+1]`` reflects the state after step k.
-            Monotone non-increasing under exact arithmetic. Comparable
-            across band windows / N_c (it's already normalized by the
-            per-config trace), so this is the right curve to plot
-            ``accuracy vs # pivots`` for ISDF point-set design.
+    When ``orbit_id`` is given (shape ``(M,)`` int), each pivot iteration
+    marks the **whole orbit** of the picked point as inactive — i.e. one
+    pivot per orbit. With a sym-invariant Gram (e.g. ρ-symmetric ISDF
+    candidate Gram), all orbit members of the picked pivot have the same
+    residual diagonal and the column update on any one of them is, by
+    symmetry, the optimal full-orbit removal. The caller unfolds picked
+    pivots through their orbits at output time to recover the full
+    centroid set.
     """
     M = G.shape[0]
     real_dtype = G.real.dtype
     eps = jnp.finfo(real_dtype).eps
     minus_inf = jnp.array(-jnp.inf, dtype=real_dtype)
+    if orbit_id is None:
+        orbit_id = jnp.arange(M, dtype=jnp.int32)         # each point its own orbit
 
     diag0 = jnp.maximum(jnp.real(jnp.diag(G)), 0.0)
-    d0max = jnp.max(diag0)
-    # Total trace of G — invariant of the pivoting and the natural
-    # normalizer for the running residual ‖G − L_k L_k^H‖²_F (more
-    # precisely tr R_k, which is the candidate-pool relative Frobenius
-    # mass not yet captured by k pivots).
     trG = jnp.sum(diag0)
 
-    L0 = jnp.zeros((M, k_keep), dtype=G.dtype)
-    piv0 = -jnp.ones((k_keep,), dtype=jnp.int32)
-    d0 = diag0
-    active0 = jnp.ones((M,), dtype=bool)
-    done0 = jnp.array(False)
-    rank0 = jnp.array(0, dtype=jnp.int32)
-    d_taken0 = jnp.zeros((k_keep,), dtype=real_dtype)
-    # trR_over_trG[j+1] = sum(d_after_step_j) / trG. Index 0 stores the
-    # initial value (= 1.0); size is k_keep+1 so we get the full
-    # trajectory through the last accepted pivot.
-    trR_over_trG0 = jnp.zeros((k_keep + 1,), dtype=real_dtype).at[0].set(1.0)
-
+    init = (
+        diag0,                                                       # d
+        jnp.zeros((M, k_keep), dtype=G.dtype),                       # L
+        -jnp.ones((k_keep,), dtype=jnp.int32),                       # piv
+        jnp.ones((M,), dtype=bool),                                  # active
+        jnp.zeros((k_keep,), dtype=real_dtype),                      # d_taken
+        jnp.zeros((k_keep + 1,), dtype=real_dtype).at[0].set(1.0),   # trR/trG
+    )
     col_ids = jnp.arange(k_keep)
 
-    def body_fun(j, carry):
-        d, L, piv, active, done, rank, d_taken, trR_over_trG = carry
+    def body(j, carry):
+        d, L, piv, active, d_taken, trR_over_trG = carry
 
-        # Step 1: pick the pivot = row with the largest residual diagonal
-        # among the still-active rows.
         masked_d = jnp.where(active, d, minus_inf)
         p = jnp.argmax(masked_d)
-        pivot_val = masked_d[p]
+        pivot_val = jnp.maximum(masked_d[p], eps)         # eps for div-safety
 
-        # Should we take this pivot this iteration? (False if already done,
-        # or if residual is below tolerance.)
-        take = (~done) & (pivot_val > tol_abs) & (pivot_val > tol_rel * d0max)
-
-        # Step 2: compute the new Cholesky column. Need
-        #   L[:, j] = (G[:, p] - Σ_{i<j} L[:, i] * conj(L[p, i])) / sqrt(d[p])
-        # Implemented as a full-width matvec with ``col_ids < j`` mask, so
-        # the shape is static under jit.
+        # L[:, j] = (G[:, p] - Σ_{i<j} L[:, i] · conj(L[p, i])) / sqrt(d[p])
         prev_mask = (col_ids < j).astype(G.dtype)
-        gcol = G[:, p]                            # (M,)
         corr = L @ (jnp.conj(L[p, :]) * prev_mask)
-        denom = jnp.where(take, jnp.sqrt(jnp.maximum(pivot_val, eps)), 1.0)
-        newcol = (gcol - corr) / denom
-        newcol = jnp.where(take, newcol, jnp.zeros_like(newcol))
-        # Numerical cleanup: the pivot entry should be exactly sqrt(d[p]).
-        newcol = newcol.at[p].set(
-            jnp.where(take, denom.astype(G.dtype), newcol[p])
-        )
+        denom = jnp.sqrt(pivot_val)
+        newcol = (G[:, p] - corr) / denom
+        # Pivot entry exactly sqrt(d[p]) — kills rounding drift.
+        newcol = newcol.at[p].set(denom.astype(G.dtype))
 
-        # Step 3: write the new column and pivot index (no-op when ~take).
-        oldcol = L[:, j]
-        L = L.at[:, j].set(jnp.where(take, newcol, oldcol))
-        piv = piv.at[j].set(jnp.where(take, p.astype(jnp.int32), piv[j]))
-        # Record the pivot value as picked (or leave the slot at 0 if no-op).
-        d_taken = d_taken.at[j].set(
-            jnp.where(take, pivot_val.astype(real_dtype), d_taken[j])
-        )
+        L = L.at[:, j].set(newcol)
+        piv = piv.at[j].set(p.astype(jnp.int32))
+        d_taken = d_taken.at[j].set(pivot_val.astype(real_dtype))
 
-        # Step 4: Schur-complement update of the residual diagonal.
-        #   d_new[i] = d[i] - |L[i, j]|²
-        # Clamp at 0 to kill fp64 noise. d_new[p] is naturally ≈ 0
-        # (because |newcol[p]|² == pivot_val by the cleanup above), so
-        # summing d_new gives the correct trace of the new Schur
-        # complement R_k. We must use d_new HERE (before substituting
-        # the -inf sentinel into d) so the trace sum stays meaningful.
+        # Schur-complement update; d_new[p] ≈ 0 by the cleanup above.
         d_new = jnp.maximum(d - jnp.abs(newcol) ** 2, 0.0)
-        # trR / trG after this step. If take is False this iteration is
-        # a no-op, so just propagate the previous value.
-        trR_step = jnp.sum(d_new)
-        trR_over_trG = trR_over_trG.at[j + 1].set(
-            jnp.where(take, trR_step / trG, trR_over_trG[j])
-        )
-        idx = jnp.arange(M)
-        pivot_mask = (idx == p)
-        active = active & ~(take & pivot_mask)
-        d = jnp.where(take & pivot_mask, minus_inf,
-                      jnp.where(take, d_new, d))
+        trR_over_trG = trR_over_trG.at[j + 1].set(jnp.sum(d_new) / trG)
+        # Mark p (or its whole orbit, if orbit_id was provided) inactive.
+        kill_mask = orbit_id == orbit_id[p]
+        d = jnp.where(kill_mask, minus_inf, d_new)
+        active = active & ~kill_mask
 
-        # Step 5: bookkeeping.
-        done = done | (~take)
-        rank = rank + take.astype(jnp.int32)
+        return d, L, piv, active, d_taken, trR_over_trG
 
-        return d, L, piv, active, done, rank, d_taken, trR_over_trG
-
-    d, L, piv, active, done, rank, d_taken, trR_over_trG = lax.fori_loop(
-        0, k_keep, body_fun,
-        (d0, L0, piv0, active0, done0, rank0, d_taken0, trR_over_trG0),
-    )
-    del active, done
-
+    d, L, piv, _, d_taken, trR_over_trG = lax.fori_loop(0, k_keep, body, init)
     d_final = jnp.where(jnp.isfinite(d), d, 0.0)
+    # Effective rank = #pivots above a fp-noise floor relative to ‖G‖.
+    # The algorithm always runs k_keep iterations (residual decay is smooth
+    # in the production use case); rank is only reported so callers can
+    # detect rank-deficient synthetic inputs.
+    floor = jnp.sqrt(eps) * jnp.max(jnp.real(jnp.diag(G)))
+    rank = jnp.sum(d_taken > floor).astype(jnp.int32)
+    # Zero out post-rank entries so callers can rely on d_taken[rank:] == 0.
+    d_taken = jnp.where(jnp.arange(k_keep) < rank, d_taken, 0.0)
     return piv, L, rank, d_final, d_taken, trR_over_trG
+
+
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -360,6 +281,7 @@ def prune_candidates_by_pivoted_cholesky(
     sym: symmetry_maps.SymMaps,
     cand_idx: np.ndarray,
     n_keep: int,
+    mesh: Mesh,
     *,
     n_val: int | None = None,
     n_cond: int | None = None,
@@ -367,50 +289,26 @@ def prune_candidates_by_pivoted_cholesky(
     band_range_right: tuple[int, int] | None = None,
     band_norms: np.ndarray | None = None,
     k_weights: np.ndarray | None = None,
-    tol_rel: float = 1e-10,
     verbose: bool = True,
-    mesh: Mesh | None = None,
     bispinor: bool = False,
-) -> tuple[np.ndarray, int, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Full q=0 pruning pipeline: gather → Gram → pivoted Cholesky → pivots.
+    orbit_id: np.ndarray | None = None,
+    use_phdf5: bool = False,
+):
+    """End-to-end pruning: gather wfns → Gram → pivoted Cholesky → keep.
 
-    Suggested oversampling per the md: ``cand_idx.shape[0] ≈ 1.5 · n_keep``
-    or ``2 · n_keep``. This function does not pick the oversampling ratio;
-    the caller decides how many candidates to pass in.
+    Requires a 2-D mesh ``('x', 'y')`` (single-device callers pass a 1×1
+    mesh — same shape gw_jax uses). Wavefunction loading goes through
+    ``load_centroids_band_chunked`` so the prune path is agnostic to which
+    G-space backend (WFNReader / phdf5 / future jax-multihost) is in use.
 
-    Args:
-        wfn: open WFNReader.
-        sym: matching SymMaps (passed through to the gather step).
-        cand_idx: (M, 3) int32 FFT-grid indices of candidate points. M is
-            the oversampled count.
-        n_keep: target number of pruned points (N_μ).
-        n_val: number of valence bands for the legacy v × c Gram.
-            Used only if ``band_range_left`` is not given.
-        n_cond: number of conduction bands above n_val for the legacy
-            v × c Gram.
-        band_range_left: explicit left window ``(b_start, b_end)``. In
-            the gw_jax / ISDF convention this is ``(b0, b3)`` =
-            "all val + sigma cond". Overrides (n_val, n_cond).
-        band_range_right: explicit right window ``(b_start, b_end)``.
-            In the gw_jax convention this is ``(b1, b4)`` = "sigma val +
-            all cond". Overrides (n_val, n_cond).
-        band_norms: optional (nbands,) pseudoband norms (e.g.
-            ``wfn.band_norms``). Applied as ``ψ /= max(norm, 1.0)`` on
-            both left and right windows before the pair density — same
-            clamp recipe as ``isdf_fitting.fit_zeta_chunked_to_h5``.
-        k_weights: optional (nkpts,) real weights. Defaults to
-            ``wfn.kweights`` if present else uniform.
-        tol_rel: relative tolerance for pivot acceptance (see
-            ``pivoted_cholesky_select``).
-        verbose: print diagnostic summary (rank, residual decay).
+    When ``orbit_id`` is provided (one int per candidate, equal for sym-
+    equivalent candidates), PC picks one pivot per orbit and the returned
+    ``keep_idx`` is the union of orbits of the picked pivots — guaranteed
+    orbit-closed under the sym group used to assign ``orbit_id``. In that
+    mode ``n_keep`` counts ORBITS (final unfolded centroid count is
+    ``Σ orbit_size`` for picked orbits).
 
-    Returns:
-        keep_idx: (rank, 3) int32 FFT-grid indices of the N_μ pruned
-            points. If the numerical rank came out < n_keep, only
-            ``rank`` rows are returned.
-        rank: int number of actually accepted pivots.
-        G: (M, M) complex Gram matrix (returned for inspection / caching).
-        d_final: (M,) real final Schur-complement residual diagonal.
+    Returns ``(keep_idx, rank, G, d_final, d_taken, trR_over_trG)``.
     """
     M = int(cand_idx.shape[0])
     n_tot = int(wfn.nbands)
@@ -454,53 +352,37 @@ def prune_candidates_by_pivoted_cholesky(
                 f"grid directly instead."
             )
 
-    # Decide which pipeline to use based on the mesh shape:
-    #   • 2-D mesh with both 'x' and 'y'  → load_wfns-based pipeline:
-    #         read_Gvecs_to_devices → get_sharded_wfns_centroids →
-    #         compute_pair_density_spin_traced → compute_gram_q0_from_left_right
-    #         (G produced as P('x','y'); reshard to P(('x','y'), None) for select)
-    #   • 1-D mesh (just 'x')             → single-axis make_sharded_gram_q0
-    #   • No mesh                         → single-device build_candidate_gram_q0
-    # The 2-D path skips the host-side gather entirely and matches gw_jax's
-    # ISDF data loading; the 1-D path is kept as a fallback (and compatibility
-    # with earlier CLI invocations).
-    is_2d_mesh = (mesh is not None
-                  and 'x' in mesh.axis_names
-                  and 'y' in mesh.axis_names)
-
-    if not is_2d_mesh:
-        if k_weights is None:
-            kw_arr = (np.asarray(wfn.kweights, dtype=np.float64)
-                      if hasattr(wfn, 'kweights') else
-                      np.ones(wfn.nkpts, dtype=np.float64) / wfn.nkpts)
-        else:
-            kw_arr = np.asarray(k_weights, dtype=np.float64)
-        kw_j = jnp.asarray(kw_arr, dtype=jnp.float64)
-
-    if verbose:
-        if asymmetric:
-            window_tag = (f"left={band_range_left}, right={band_range_right}, "
-                          f"norms={'on' if band_norms is not None else 'off'}")
-        else:
-            window_tag = f"n_val={n_val}, n_cond={n_cond}"
-        if is_2d_mesh:
-            print(f"[pivoted_cholesky] M={M} candidates, n_keep={n_keep}, "
-                  f"{window_tag}, nk_tot={sym.nk_tot} "
-                  f"(full-BZ via load_wfns on mesh "
-                  f"x={mesh.shape['x']}, y={mesh.shape['y']})")
-        else:
-            print(f"[pivoted_cholesky] M={M} candidates, n_keep={n_keep}, "
-                  f"{window_tag}, nk_irr={wfn.nkpts} "
-                  f"(IBZ via host-gather)")
-
-    if asymmetric and not is_2d_mesh:
-        raise NotImplementedError(
-            "Explicit (band_range_left, band_range_right) requires the "
-            "2-D load_wfns pipeline; pass a 2-D mesh."
+    if not ('x' in mesh.axis_names and 'y' in mesh.axis_names):
+        raise ValueError(
+            f"prune_candidates_by_pivoted_cholesky requires a 2-D mesh "
+            f"with axes ('x', 'y'); got {mesh.axis_names}. Build the mesh "
+            f"the same way gw_jax does (single-device → 1×1)."
         )
 
-    if is_2d_mesh:
-        # --- 2-D pipeline: full-BZ load_wfns + gw_jax pair-density helpers ---
+    # The sharded select kernel requires M to be divisible by the product
+    # of the mesh axis sizes (each shard owns M/n_dev rows). Orbit-unfold
+    # counts can land on awkward M (special-position orbits don't all have
+    # size n_sym), so check up-front and give a hint instead of letting
+    # ``make_sharded_pivoted_cholesky_select`` fail with a cryptic message.
+    n_dev = int(mesh.shape['x']) * int(mesh.shape['y'])
+    if M % n_dev != 0:
+        raise ValueError(
+            f"M={M} (number of candidates) must be divisible by the "
+            f"product of mesh axes 'x' and 'y' (= {n_dev}). The sharded "
+            f"pivoted-Cholesky select kernel splits M evenly across "
+            f"shards. Either drop the last {M % n_dev} candidate(s) before "
+            f"calling this function, run on a mesh size that divides M, "
+            f"or pass ``--no-shard`` to use a single-device 1×1 mesh."
+        )
+
+    if verbose:
+        window_tag = (f"left={band_range_left}, right={band_range_right}, "
+                      f"norms={'on' if band_norms is not None else 'off'}"
+                      if asymmetric else f"n_val={n_val}, n_cond={n_cond}")
+        print(f"[pivoted_cholesky] M={M}, n_keep={n_keep}, {window_tag} "
+              f"(load_wfns 2-D, mesh axes {mesh.axis_names})")
+
+    with timing.section("prune.gram"):
         G = build_gram_q0_via_loadwfns(
             wfn, sym, jnp.asarray(cand_idx),
             n_val=n_val, n_cond=n_cond,
@@ -508,117 +390,63 @@ def prune_candidates_by_pivoted_cholesky(
             band_range_left=band_range_left,
             band_range_right=band_range_right,
             band_norms=band_norms,
+            use_phdf5=use_phdf5,
         )
-        # Reshard the Gram output ('x','y') → combined-axis row shard
-        # (('x','y'), None) so the existing sharded select has its
-        # column-access pattern stay collective-free.
-        if verbose:
-            print(f"[pivoted_cholesky] resharding G P('x','y') → "
-                  f"P(('x','y'), None) for select")
+        # Reshard ('x','y') → row-sharded for the column-major pivot scan.
         G = jax.lax.with_sharding_constraint(
             G, NamedSharding(mesh, PartitionSpec(('x', 'y'), None)),
         )
-    else:
-        # --- Legacy 1-D / single-device path: host-gather + IBZ sum ---
-        # Gather φ (valence, [0, n_val)) and ψ (conduction, [n_val, n_val+n_cond)).
-        phi = gather_wfn_at_candidates(wfn, sym, cand_idx, 0, n_val)
-        psi = gather_wfn_at_candidates(wfn, sym, cand_idx, n_val, n_val + n_cond)
-        phi_flat = _fold_spin_into_band(phi)
-        psi_flat = _fold_spin_into_band(psi)
-
-        if mesh is not None:
-            n_dev = mesh.shape['x']
-            if M % n_dev != 0:
-                if verbose:
-                    print(f"[pivoted_cholesky] M={M} not divisible by mesh 'x' "
-                          f"size {n_dev}; falling back to single-device.")
-                mesh = None
-            elif verbose:
-                print(f"[pivoted_cholesky] sharded build+select on mesh 'x' "
-                      f"of size {n_dev}")
-
-        if mesh is not None:
-            gram_step = make_sharded_gram_q0(mesh, M, enforce_hermitian=True)
-            G = gram_step(phi_flat, psi_flat, kw_j)
-        else:
-            G = build_candidate_gram_q0(phi_flat, psi_flat, k_weights=kw_j)
-    G.block_until_ready()
+        G.block_until_ready()
+    select_axis = ('x', 'y')
 
     if verbose:
-        diag = np.asarray(jnp.real(jnp.diag(G)))
+        diag = jnp.real(jnp.diag(G))
         print(f"[pivoted_cholesky] G built, shape={G.shape}, "
-              f"diag range [{diag.min():.3e}, {diag.max():.3e}]")
+              f"diag range [{float(diag.min()):.3e}, {float(diag.max()):.3e}]")
 
-    if mesh is not None:
-        # Pick the select's axis to match G's current sharding: for the
-        # 2-D pipeline we already with_sharding_constraint'd G to
-        # P(('x','y'), None), so the select is also combined-axis.
-        select_axis = ('x', 'y') if is_2d_mesh else 'x'
+    # Run select on the row-sharded Gram. Orbit-aware mode passes orbit_id
+    # row-sharded the same way as G; the body marks the whole orbit
+    # inactive after each pivot pick (orbit_id of the pivot is broadcast
+    # via psum-with-mask, same idiom as the L[p, :] broadcast).
+    with timing.section("prune.select"):
         select_step = make_sharded_pivoted_cholesky_select(
-            mesh, M, n_keep, tol_rel=tol_rel, tol_abs=0.0,
-            mesh_axis=select_axis,
+            mesh, M, n_keep, mesh_axis=select_axis,
         )
-        piv, L, rank, d_final, d_taken, trR_over_trG = select_step(G)
-    else:
-        piv, L, rank, d_final, d_taken, trR_over_trG = pivoted_cholesky_select(
-            G, n_keep, tol_rel=tol_rel, tol_abs=0.0
-        )
-    del L  # only useful if the caller needs the Cholesky factor
-    rank = int(rank)
-    piv_np = np.asarray(piv)
-    d_taken_np = np.asarray(d_taken)
-    trR_over_trG_np = np.asarray(trR_over_trG)
-    # d_final is sharded along the select's mesh axis (`row_shard_1d`);
-    # in multi-process JAX a bare ``np.asarray`` raises because remote
-    # shards are non-addressable. Gather it once here so the host-side
-    # diagnostics + the wrapper's d_final return are safe to read.
-    if mesh is not None:
-        d_final_np = np.asarray(_mh.process_allgather(d_final, tiled=True))
-    else:
-        d_final_np = np.asarray(d_final)
+        if orbit_id is None:
+            piv, L, rank, d_final, d_taken, trR_over_trG = select_step(G)
+        else:
+            orbit_id_jax = jax.device_put(
+                jnp.asarray(orbit_id, dtype=jnp.int32),
+                NamedSharding(mesh, PartitionSpec(select_axis)),
+            )
+            piv, L, rank, d_final, d_taken, trR_over_trG = select_step(G, orbit_id_jax)
+        piv.block_until_ready()
+    del L
 
     if verbose:
-        d_np = d_final_np
-        leftover_max = float(d_np.max()) if d_np.size else 0.0
-        leftover_mean = float(d_np[d_np > 0].mean()) if np.any(d_np > 0) else 0.0
-        # Pivot-decay summary: first/last picked, and a couple of percentile
-        # checkpoints. The right diagnostic is whether the LAST picked pivot
-        # is much bigger than the biggest leftover (leftover_max). If yes,
-        # we cut at a meaningful drop. If no, k_keep was about right or too
-        # large.
-        first = float(d_taken_np[0]) if rank > 0 else 0.0
-        last = float(d_taken_np[rank - 1]) if rank > 0 else 0.0
-        mid = float(d_taken_np[rank // 2]) if rank > 0 else 0.0
-        print(f"[pivoted_cholesky] rank={rank}/{n_keep}")
         print(f"[pivoted_cholesky] picked-pivot residuals: "
-              f"first={first:.3e}, mid={mid:.3e}, last={last:.3e}")
-        # Relative-Frobenius accuracy at the same checkpoints.
-        if rank > 0:
-            print(f"[pivoted_cholesky] tr(R_k)/tr(G): "
-                  f"first={trR_over_trG_np[1]:.3e}, "
-                  f"mid={trR_over_trG_np[rank // 2 + 1]:.3e}, "
-                  f"last={trR_over_trG_np[rank]:.3e}")
-        print(f"[pivoted_cholesky] leftover residuals: "
-              f"max={leftover_max:.3e}, mean(>0)={leftover_mean:.3e}")
-        if last > 0 and leftover_max > 0:
-            ratio = last / leftover_max
-            if ratio < 2:
-                print(f"  ⚠ last picked / biggest leftover = {ratio:.2f}: "
-                      f"k_keep cuts in a region where picked and leftover "
-                      f"residuals are similar — try increasing k_keep or "
-                      f"shrinking the candidate pool.")
-            elif ratio > 100:
-                print(f"  ℹ last picked / biggest leftover = {ratio:.1f}×: "
-                      f"clear cutoff; could likely lower k_keep.")
-        if rank < n_keep:
-            print(f"  ⚠ rank-deficient ({rank} < {n_keep}): either the "
-                  f"candidate pool is too small, or tol_rel={tol_rel} cut "
-                  f"off the residual diagonal.")
+              f"first={float(d_taken[0]):.3e}, "
+              f"mid={float(d_taken[n_keep // 2]):.3e}, "
+              f"last={float(d_taken[-1]):.3e}")
+        print(f"[pivoted_cholesky] tr(R_k)/tr(G): "
+              f"first={float(trR_over_trG[1]):.3e}, "
+              f"mid={float(trR_over_trG[n_keep // 2 + 1]):.3e}, "
+              f"last={float(trR_over_trG[n_keep]):.3e}")
 
-    # piv may contain -1 past rank; slice.
-    keep_piv = piv_np[:rank]
-    keep_idx = np.asarray(cand_idx)[keep_piv]
-    return keep_idx, rank, G, d_final_np, d_taken_np, trR_over_trG_np
+    piv_np = np.asarray(piv)
+    if orbit_id is None:
+        keep_idx = np.asarray(cand_idx)[piv_np]
+    else:
+        # Unfold: kept = union of orbits of picked pivots.
+        orbit_id_np = np.asarray(orbit_id)
+        picked_orbits = orbit_id_np[piv_np]
+        in_kept = np.isin(orbit_id_np, picked_orbits)
+        keep_idx = np.asarray(cand_idx)[in_kept]
+        if verbose:
+            print(f"[pivoted_cholesky] orbit-aware: {len(piv_np)} orbits picked "
+                  f"→ {len(keep_idx)} unfolded centroids (orbit-closed)")
+    d_final_np = np.asarray(_mh.process_allgather(d_final, tiled=True))
+    return keep_idx, int(rank), G, d_final_np, np.asarray(d_taken), np.asarray(trR_over_trG)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -775,33 +603,13 @@ def make_sharded_pivoted_cholesky_select(
     M: int,
     k_keep: int,
     *,
-    tol_rel: float = 1e-10,
-    tol_abs: float = 0.0,
     mesh_axis: str | tuple[str, ...] = 'x',
 ):
-    """Build a jitted sharded pivoted-Cholesky select closure over ``mesh``.
-
-    The returned function signature matches ``pivoted_cholesky_select``
-    up to sharding: it takes a row-sharded ``G`` (sharded on
-    ``mesh_axis`` along its first axis) and returns piv (replicated),
-    L (row-sharded same as G), rank (replicated), d_final (row-sharded),
-    d_taken (replicated).
-
-    Args:
-        mesh: device mesh containing every axis in ``mesh_axis``.
-        M: total candidate count. Static.
-        k_keep: target pivot count. Static.
-        tol_rel, tol_abs: stopping tolerances; see
-            ``pivoted_cholesky_select`` for semantics. Static.
-        mesh_axis: axis (or tuple of axes for combined-axis sharding) on
-            ``mesh`` along which the row dim of G is sharded. Default
-            ``'x'`` matches the legacy 1-D path. Pass e.g. ``('x', 'y')``
-            after a ``with_sharding_constraint`` from a 2-D-built G to a
-            flat row-sharded layout (the natural step before pivoting).
-
-    Returns:
-        A callable ``(G_row_sharded,) -> (piv, L, rank, d_final, d_taken)``.
-    """
+    """Sharded pivoted-Cholesky select on a row-sharded Gram. Always runs
+    k_keep iterations (no tolerance early-stop). Returns the same tuple as
+    ``pivoted_cholesky_select``: ``(piv, L, rank, d_final, d_taken,
+    trR_over_trG)`` with shardings (replicated, row-sharded, replicated,
+    row-sharded-1d, replicated, replicated)."""
     axis_names = (mesh_axis,) if isinstance(mesh_axis, str) else tuple(mesh_axis)
     for ax in axis_names:
         if ax not in mesh.axis_names:
@@ -821,148 +629,122 @@ def make_sharded_pivoted_cholesky_select(
     row_shard_1d = PartitionSpec(mesh_axis)
     rep = PartitionSpec()
 
-    in_specs = (row_shard,)
-    # outputs: piv, L, rank, d_final, d_taken, trR_over_trG
+    # Two input layouts: G alone (no orbit) or (G, orbit_id) with orbit_id
+    # row-sharded the same way as G's row dim.
+    in_specs_no_orbit = (row_shard,)
+    in_specs_orbit    = (row_shard, row_shard_1d)
     out_specs = (rep, row_shard, rep, row_shard_1d, rep, rep)
 
-    @partial(jax.jit, static_argnames=())
-    def step(G):
-        def body_local(G_slab):
-            # G_slab: (M_slab, M) on each device.
+    @jax.jit
+    def step(G, orbit_id=None):
+        def body_local(G_slab, orbit_id_slab=None):
             real_dtype = G_slab.real.dtype
             eps = jnp.finfo(real_dtype).eps
             minus_inf = jnp.array(-jnp.inf, dtype=real_dtype)
             my_idx = lax.axis_index(mesh_axis)
 
-            # Initial local diagonal: each device owns rows
-            # [my_idx*M_slab, (my_idx+1)*M_slab), and the diagonal of G
-            # falls at column index = row index. So
-            #   G_slab[i, my_idx*M_slab + i]  for  i = 0..M_slab-1
-            # extracts the local diagonal.
-            my_offset = my_idx * M_slab
-            col_ids_local = my_offset + jnp.arange(M_slab)
-            local_diag = jnp.real(
-                G_slab[jnp.arange(M_slab), col_ids_local]
+            # Local diagonal of G: each device owns rows [my_idx*M_slab,
+            # (my_idx+1)*M_slab); the diag entry sits at col == row.
+            col_ids_local = my_idx * M_slab + jnp.arange(M_slab)
+            local_diag = jnp.maximum(
+                jnp.real(G_slab[jnp.arange(M_slab), col_ids_local]), 0.0,
             )
-            local_diag = jnp.maximum(local_diag, 0.0)
-
-            # d0max is a global statistic — reduce across shards.
-            d0max = lax.pmax(jnp.max(local_diag), axis_name=mesh_axis)
-            # tr(G) is also global — one extra psum, replicated everywhere.
             trG = lax.psum(jnp.sum(local_diag), axis_name=mesh_axis)
-
-            L_slab = jnp.zeros((M_slab, k_keep), dtype=G_slab.dtype)
-            piv = -jnp.ones((k_keep,), dtype=jnp.int32)
-            d_slab = local_diag
-            active_slab = jnp.ones((M_slab,), dtype=bool)
-            done = jnp.array(False)
-            rank = jnp.array(0, dtype=jnp.int32)
-            d_taken = jnp.zeros((k_keep,), dtype=real_dtype)
-            # See single-device select for shape rationale (k_keep + 1).
-            trR_over_trG = jnp.zeros((k_keep + 1,), dtype=real_dtype).at[0].set(1.0)
             col_ids_k = jnp.arange(k_keep)
 
+            init = (
+                local_diag,                                              # d_slab
+                jnp.zeros((M_slab, k_keep), dtype=G_slab.dtype),         # L_slab
+                -jnp.ones((k_keep,), dtype=jnp.int32),                   # piv
+                jnp.ones((M_slab,), dtype=bool),                         # active
+                jnp.zeros((k_keep,), dtype=real_dtype),                  # d_taken
+                jnp.zeros((k_keep + 1,), dtype=real_dtype).at[0].set(1.0),
+            )
+
             def body(j, carry):
-                d, L, piv, active, done, rank, d_taken, trR_over_trG = carry
+                d, L, piv, active, d_taken, trR_over_trG = carry
 
-                # Step 1: pick the global pivot.
-                # Per-device argmax over active rows.
+                # Pick global pivot: per-device argmax then pmax + tie-break
+                # to lowest global index.
                 masked_d = jnp.where(active, d, minus_inf)
-                local_p_idx = jnp.argmax(masked_d)                   # [0, M_slab)
-                local_pv = masked_d[local_p_idx]                     # scalar
-                local_global_p = (my_idx * M_slab + local_p_idx).astype(jnp.int32)
-
-                # Reduce to find the global pivot value.
+                local_p_idx = jnp.argmax(masked_d)
+                local_pv = masked_d[local_p_idx]
                 global_pv = lax.pmax(local_pv, mesh_axis)
-                # Tie-break: among devices that match the global max, take
-                # the one with the smallest global_p. Non-winners contribute
-                # a sentinel (INT_MAX) so the min is over just the winners.
-                i_am_winner = local_pv >= global_pv
+                local_global_p = (my_idx * M_slab + local_p_idx).astype(jnp.int32)
                 winner_p = jnp.where(
-                    i_am_winner, local_global_p, jnp.int32(2**30)
+                    local_pv >= global_pv, local_global_p, jnp.int32(2**30),
                 )
-                global_p = -lax.pmax(-winner_p, mesh_axis)           # min over winners
-                pivot_val = global_pv
+                global_p = -lax.pmax(-winner_p, mesh_axis)
+                pivot_val = jnp.maximum(global_pv, eps)
 
-                take = (~done) & (pivot_val > tol_abs) & (pivot_val > tol_rel * d0max)
+                # Column p of G (no collective: G is row-sharded).
+                gcol_slab = G_slab[:, global_p]
 
-                # Step 2: compute the new Cholesky column, L[:, j].
-                # gcol: column p of G. Each device's local rows of that
-                # column are already in G_slab — column access from a
-                # row-sharded matrix is collective-free.
-                gcol_slab = G_slab[:, global_p]                       # (M_slab,)
-
-                # L[p, :]: broadcast from the owning shard via psum-with-mask.
-                pivot_owner_dev = global_p // M_slab
-                my_has_p = (pivot_owner_dev == my_idx)
+                # Row p of L: broadcast from owning shard via masked psum.
+                my_has_p = (global_p // M_slab == my_idx)
                 local_p_rel = global_p - my_idx * M_slab
                 safe_idx = jnp.clip(local_p_rel, 0, M_slab - 1)
-                local_Lp = L[safe_idx, :]                             # (k_keep,) — may be wrong on non-owners
                 local_Lp = jnp.where(
-                    my_has_p, local_Lp, jnp.zeros_like(local_Lp)
+                    my_has_p, L[safe_idx, :], jnp.zeros_like(L[safe_idx, :]),
                 )
-                L_p = lax.psum(local_Lp, mesh_axis)                  # (k_keep,) replicated
+                L_p = lax.psum(local_Lp, mesh_axis)
 
+                # New column.
                 prev_mask = (col_ids_k < j).astype(G_slab.dtype)
-                corr_slab = L @ (jnp.conj(L_p) * prev_mask)           # (M_slab,)
-
-                denom = jnp.where(take, jnp.sqrt(jnp.maximum(pivot_val, eps)), 1.0)
-                newcol = (gcol_slab - corr_slab) / denom              # (M_slab,)
-                newcol = jnp.where(take, newcol, jnp.zeros_like(newcol))
-                # Numerical cleanup of the pivot entry (only on owner).
+                corr = L @ (jnp.conj(L_p) * prev_mask)
+                denom = jnp.sqrt(pivot_val)
+                newcol = (gcol_slab - corr) / denom
+                # Pivot-row entry exactly sqrt(d[p]), only on the owner.
                 fix_row_mask = my_has_p & (jnp.arange(M_slab) == local_p_rel)
-                newcol = jnp.where(
-                    fix_row_mask & take, denom.astype(G_slab.dtype), newcol
-                )
+                newcol = jnp.where(fix_row_mask, denom.astype(G_slab.dtype), newcol)
 
-                # Step 3: write the new column locally. Piv and d_taken
-                # are replicated — every device writes the same value.
-                oldcol = L[:, j]
-                L = L.at[:, j].set(jnp.where(take, newcol, oldcol))
-                piv = piv.at[j].set(
-                    jnp.where(take, global_p, piv[j])
-                )
-                d_taken = d_taken.at[j].set(
-                    jnp.where(take, pivot_val, d_taken[j])
-                )
+                L = L.at[:, j].set(newcol)
+                piv = piv.at[j].set(global_p)
+                d_taken = d_taken.at[j].set(pivot_val)
 
-                # Step 4: Schur-complement update of local d.
+                # Schur update; mark p (or its whole orbit) inactive.
                 d_new = jnp.maximum(d - jnp.abs(newcol) ** 2, 0.0)
-                # Trace of the new Schur complement: sum over all M rows
-                # of d_new — psum across shards. d_new[p] is naturally ≈ 0
-                # by the pivot cleanup, so this is exactly tr(R_k).
-                trR_step = lax.psum(jnp.sum(d_new), axis_name=mesh_axis)
                 trR_over_trG = trR_over_trG.at[j + 1].set(
-                    jnp.where(take, trR_step / trG, trR_over_trG[j])
+                    lax.psum(jnp.sum(d_new), axis_name=mesh_axis) / trG,
                 )
-                pivot_row_mask = my_has_p & (jnp.arange(M_slab) == local_p_rel)
-                active = active & ~(take & pivot_row_mask)
-                d = jnp.where(
-                    take & pivot_row_mask, minus_inf,
-                    jnp.where(take, d_new, d)
-                )
+                if orbit_id_slab is None:
+                    kill_mask = my_has_p & (jnp.arange(M_slab) == local_p_rel)
+                else:
+                    # Broadcast orbit_id of the picked pivot via psum-with-mask
+                    # (same idiom as the L[p, :] broadcast above), then mark
+                    # all local orbit-mates inactive.
+                    local_op_val = jnp.where(
+                        my_has_p, orbit_id_slab[safe_idx], jnp.int32(0),
+                    )
+                    orbit_id_p = lax.psum(local_op_val, mesh_axis)
+                    kill_mask = orbit_id_slab == orbit_id_p
+                active = active & ~kill_mask
+                d = jnp.where(kill_mask, minus_inf, d_new)
 
-                done = done | (~take)
-                rank = rank + take.astype(jnp.int32)
+                return d, L, piv, active, d_taken, trR_over_trG
 
-                return d, L, piv, active, done, rank, d_taken, trR_over_trG
-
-            (d_final, L_out, piv_out, active_out, done_out, rank_out,
-             d_taken_out, trR_over_trG_out) = lax.fori_loop(
-                0, k_keep, body,
-                (d_slab, L_slab, piv, active_slab, done, rank, d_taken,
-                 trR_over_trG),
+            d_final, L_out, piv_out, _, d_taken, trR_over_trG = lax.fori_loop(
+                0, k_keep, body, init,
             )
-            del active_out, done_out
-
             d_final = jnp.where(jnp.isfinite(d_final), d_final, 0.0)
-            return (piv_out, L_out, rank_out, d_final, d_taken_out,
-                    trR_over_trG_out)
+            d0max_global = lax.pmax(jnp.max(local_diag), axis_name=mesh_axis)
+            floor = jnp.sqrt(eps) * d0max_global
+            rank = jnp.sum(d_taken > floor).astype(jnp.int32)
+            d_taken = jnp.where(jnp.arange(k_keep) < rank, d_taken, 0.0)
+            return piv_out, L_out, rank, d_final, d_taken, trR_over_trG
 
-        return shard_map(
-            body_local, mesh=mesh, in_specs=in_specs, out_specs=out_specs,
-            check_rep=False,
-        )(G)
+        if orbit_id is None:
+            return shard_map(
+                lambda g: body_local(g, None), mesh=mesh,
+                in_specs=in_specs_no_orbit, out_specs=out_specs,
+                check_rep=False,
+            )(G)
+        else:
+            return shard_map(
+                body_local, mesh=mesh,
+                in_specs=in_specs_orbit, out_specs=out_specs,
+                check_rep=False,
+            )(G, orbit_id)
 
     return step
 
@@ -1013,6 +795,9 @@ def build_gram_q0_via_loadwfns(
     band_range_left: tuple[int, int] | None = None,
     band_range_right: tuple[int, int] | None = None,
     band_norms: np.ndarray | None = None,
+    band_chunk_size: int = 64,
+    use_phdf5: bool = False,
+    memory_per_device_gb: float | None = None,
 ) -> jnp.ndarray:
     """Build the q=0 candidate Gram on a 2-D mesh using gw_jax's data path.
 
@@ -1069,10 +854,7 @@ def build_gram_q0_via_loadwfns(
     # Lazy imports — these modules pull in the full gw_jax dep chain and
     # we don't want to charge the single-device prune path for it.
     from common.meta import Meta
-    from common.load_wfns import (
-        read_Gvecs_to_devices,
-        get_sharded_wfns_centroids,
-    )
+    from common.load_wfns import load_centroids_band_chunked
     from common.isdf_fitting import (
         compute_pair_density_spin_traced,
         compute_gram_q0_from_left_right,
@@ -1118,8 +900,19 @@ def build_gram_q0_via_loadwfns(
     )
 
     kw = jnp.ones((sym.nk_tot,), dtype=jnp.float64) / float(sym.nk_tot)
-    kgrid = np.asarray(wfn.kgrid, dtype=np.float64)
-    kvecs_frac = np.asarray(sym.kvecs_asints) / kgrid[None, :]
+
+    # Memory budget for the band-+k-chunker. ``load_centroids_band_chunked``
+    # reads ``meta.memory_per_device_gb`` to size the FFT-box per chunk; if
+    # the caller didn't pin a budget, auto-detect device HBM the same way
+    # gw_config does so the prune path tracks whatever the rest of LORRAX
+    # is using.
+    if memory_per_device_gb is None or memory_per_device_gb <= 0:
+        try:
+            from common.gpu_utils import get_device_memory_gb
+            memory_per_device_gb = float(get_device_memory_gb())
+        except Exception:
+            memory_per_device_gb = 0.0  # falls back to the 36 GB default
+    setattr(meta, "memory_per_device_gb", float(memory_per_device_gb))
 
     # Optional pseudoband norms — same clamp recipe as isdf_fitting.
     if band_norms is not None:
@@ -1145,36 +938,44 @@ def build_gram_q0_via_loadwfns(
         print(f"[pivoted_cholesky] 2-D Gram build via load_wfns: "
               f"nk_tot={sym.nk_tot}, left={left_range} (nb={nb_left}), "
               f"right={right_range} (nb={nb_right}), M={M}, "
-              f"norms={'on' if band_norms is not None else 'off'}")
+              f"norms={'on' if band_norms is not None else 'off'}, "
+              f"backend={'phdf5' if use_phdf5 else 'WFNReader'}, "
+              f"budget={meta.memory_per_device_gb:g} GB/device, "
+              f"band_chunk_size={band_chunk_size}")
 
     # ---- Left window ----
-    psi_G_l, _ = read_Gvecs_to_devices(
-        wfn, sym, left_range, meta, bispinor, mesh_xy,
-    )
-    psi_l_rmu_Y, psi_l_rmuT_X = get_sharded_wfns_centroids(
-        psi_G_l, meta, cand_idx, kvecs_frac, mesh_xy, left_range,
-    )
-    if norms_l_j is not None:
-        # Y shape (nk, nb, ns, n_rmu); X shape (nk, n_rmu, nb, ns)
-        psi_l_rmu_Y = psi_l_rmu_Y / norms_l_j[None, :, None, None]
-        psi_l_rmuT_X = psi_l_rmuT_X / norms_l_j[None, None, :, None]
-    P_l_k = compute_pair_density_spin_traced(psi_l_rmuT_X, psi_l_rmu_Y, mesh_xy)
-    del psi_G_l, psi_l_rmu_Y, psi_l_rmuT_X
+    with timing.section("left.load"):
+        psi_l_rmu_Y, psi_l_rmuT_X = load_centroids_band_chunked(
+            wfn, sym, meta, cand_idx, bispinor, mesh_xy, left_range,
+            band_chunk_size=band_chunk_size, use_phdf5=use_phdf5,
+        )
+        if norms_l_j is not None:
+            # Y shape (nk, nb, ns, n_rmu); X shape (nk, n_rmu, nb, ns)
+            psi_l_rmu_Y = psi_l_rmu_Y / norms_l_j[None, :, None, None]
+            psi_l_rmuT_X = psi_l_rmuT_X / norms_l_j[None, None, :, None]
+        psi_l_rmu_Y.block_until_ready()
+    with timing.section("left.pair"):
+        P_l_k = compute_pair_density_spin_traced(psi_l_rmuT_X, psi_l_rmu_Y, mesh_xy)
+        P_l_k.block_until_ready()
+    del psi_l_rmu_Y, psi_l_rmuT_X
 
     # ---- Right window ----
-    psi_G_r, _ = read_Gvecs_to_devices(
-        wfn, sym, right_range, meta, bispinor, mesh_xy,
-    )
-    psi_r_rmu_Y, psi_r_rmuT_X = get_sharded_wfns_centroids(
-        psi_G_r, meta, cand_idx, kvecs_frac, mesh_xy, right_range,
-    )
-    if norms_r_j is not None:
-        psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
-        psi_r_rmuT_X = psi_r_rmuT_X / norms_r_j[None, None, :, None]
-    P_r_k = compute_pair_density_spin_traced(psi_r_rmuT_X, psi_r_rmu_Y, mesh_xy)
-    del psi_G_r, psi_r_rmu_Y, psi_r_rmuT_X
+    with timing.section("right.load"):
+        psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
+            wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
+            band_chunk_size=band_chunk_size, use_phdf5=use_phdf5,
+        )
+        if norms_r_j is not None:
+            psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
+            psi_r_rmuT_X = psi_r_rmuT_X / norms_r_j[None, None, :, None]
+        psi_r_rmu_Y.block_until_ready()
+    with timing.section("right.pair"):
+        P_r_k = compute_pair_density_spin_traced(psi_r_rmuT_X, psi_r_rmu_Y, mesh_xy)
+        P_r_k.block_until_ready()
+    del psi_r_rmu_Y, psi_r_rmuT_X
 
     # ---- q=0 Gram: sum_k w_k · conj(P_l_k) · P_r_k ----
-    G = compute_gram_q0_from_left_right(P_l_k, P_r_k, kw, mesh_xy)
-    G.block_until_ready()
+    with timing.section("q0_sum"):
+        G = compute_gram_q0_from_left_right(P_l_k, P_r_k, kw, mesh_xy)
+        G.block_until_ready()
     return G

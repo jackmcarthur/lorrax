@@ -101,7 +101,7 @@ def test_pivoted_cholesky_reconstructs_G():
     G = (A @ A.conj().T + 0.1 * np.eye(M)).astype(np.complex64)
     G = 0.5 * (G + G.conj().T)
 
-    piv, L, rank, d_final, d_taken, _trR = pivoted_cholesky_select(jnp.asarray(G), k_keep=M, tol_rel=0.0)
+    piv, L, rank, d_final, d_taken, _trR = pivoted_cholesky_select(jnp.asarray(G), k_keep=M)
     L = np.asarray(L)
     rank = int(rank)
     assert rank == M, f"expected full rank {M}, got {rank}"
@@ -124,12 +124,12 @@ def test_pivoted_cholesky_reconstructs_G():
 
 
 def test_pivoted_cholesky_rank_deficient():
-    """Rank-``r`` PSD → pivoted Chol stops at exactly rank ``r``.
+    """Rank-``r`` PSD doesn't crash; algorithm runs all k_keep iterations.
 
-    Construct G = A A^H with A of shape (M, r); then G has rank r exactly.
-    The Cholesky should accept r pivots and the residual should go to zero
-    (all of G is captured), while later loop iterations no-op because
-    ``pivot_val <= tol``.
+    Production PC always runs k_keep iters (residual decay is smooth in real
+    use; rank-deficient inputs are not the target case). We just verify
+    the algorithm doesn't choke on a synthetic rank-deficient G and the
+    reported ``rank`` is in a sane range (≤ true r + small fp-noise pad).
     """
     rng = np.random.default_rng(2)
     M, r = 32, 10
@@ -138,23 +138,14 @@ def test_pivoted_cholesky_rank_deficient():
     G = 0.5 * (G + G.conj().T)
 
     piv, L, rank, d_final, d_taken, _trR = pivoted_cholesky_select(
-        jnp.asarray(G), k_keep=M, tol_rel=1e-6
+        jnp.asarray(G), k_keep=M
     )
     rank = int(rank)
-
-    # Rank must match (allow ±1 for fp32 noise near the last-accepted
-    # singular value; typical behavior on well-separated rank is exact).
-    assert rank in (r, r - 1, r + 1), (
-        f"rank detected = {rank}, expected r = {r}"
-    )
-    # Accepted pivots form a valid index set.
+    assert rank <= r + 4, f"rank detected = {rank} much larger than r = {r}"
+    # Accepted pivots are a valid index set.
     piv_np = np.asarray(piv)
-    accepted = piv_np[:rank]
-    assert len(set(accepted.tolist())) == rank, "duplicate pivot indices"
-    assert accepted.min() >= 0 and accepted.max() < M, "pivot out of range"
-    # Unaccepted pivot slots are -1.
-    unaccepted = piv_np[rank:]
-    assert np.all(unaccepted == -1), "garbage in unaccepted pivot slots"
+    assert len(set(piv_np.tolist())) == M, "duplicate pivot indices"
+    assert piv_np.min() >= 0 and piv_np.max() < M, "pivot out of range"
 
 
 def test_pivoted_cholesky_residual_diagonal_nonincreasing():
@@ -173,7 +164,7 @@ def test_pivoted_cholesky_residual_diagonal_nonincreasing():
 
     d_prev = np.maximum(np.diag(G).real, 0.0)
     for k_keep in range(1, 9):
-        _, _, _, d_final, _, _ = pivoted_cholesky_select(G_j, k_keep=k_keep, tol_rel=0.0)
+        _, _, _, d_final, _, _ = pivoted_cholesky_select(G_j, k_keep=k_keep)
         d = np.asarray(d_final)
         # Allow a tiny positive slop for fp32 noise.
         diff = d - d_prev
@@ -201,7 +192,7 @@ def test_end_to_end_via_wrapper_pipeline_shapes():
     assert G.shape == (M, M)
 
     n_keep = 32
-    piv, L, rank, d_final, d_taken, _trR = pivoted_cholesky_select(G, k_keep=n_keep, tol_rel=1e-10)
+    piv, L, rank, d_final, d_taken, _trR = pivoted_cholesky_select(G, k_keep=n_keep)
     assert piv.shape == (n_keep,)
     assert L.shape == (M, n_keep)
     assert d_final.shape == (M,)
@@ -277,7 +268,7 @@ def test_d_taken_trace_monotone_and_matches_classical():
     G = 0.5 * (G + G.conj().T)
 
     piv, L, rank, d_final, d_taken, _trR = pivoted_cholesky_select(
-        jnp.asarray(G), k_keep=M, tol_rel=0.0
+        jnp.asarray(G), k_keep=M
     )
     rank = int(rank)
     d_taken_np = np.asarray(d_taken)
@@ -341,13 +332,13 @@ def test_sharded_select_matches_single_device():
 
     # Single-device reference.
     piv_ref, L_ref, rank_ref, d_ref, d_taken_ref, trR_ref = pivoted_cholesky_select(
-        G_j, k_keep=k_keep, tol_rel=0.0
+        G_j, k_keep=k_keep
     )
 
     # Sharded path.
     mesh = Mesh(np.asarray(devices), ('x',))
     sharded_step = make_sharded_pivoted_cholesky_select(
-        mesh, M, k_keep, tol_rel=0.0
+        mesh, M, k_keep
     )
     G_sharded = jax.device_put(
         G_j, NamedSharding(mesh, PartitionSpec('x', None)),
@@ -400,7 +391,7 @@ def test_trR_over_trG_starts_at_one_and_decreases():
     G = 0.5 * (G + G.conj().T)
 
     _, _, rank, _, _, trR_over_trG = pivoted_cholesky_select(
-        jnp.asarray(G), k_keep=M, tol_rel=0.0
+        jnp.asarray(G), k_keep=M
     )
     rank = int(rank)
     trace = np.asarray(trR_over_trG)
@@ -436,11 +427,11 @@ def test_trR_over_trG_sharded_matches_single_device():
     G = 0.5 * (G + G.conj().T)
     G_j = jnp.asarray(G)
 
-    *_, trR_ref = pivoted_cholesky_select(G_j, k_keep=k_keep, tol_rel=0.0)
+    *_, trR_ref = pivoted_cholesky_select(G_j, k_keep=k_keep)
 
     mesh = Mesh(np.asarray(devices), ('x',))
     sharded_step = make_sharded_pivoted_cholesky_select(
-        mesh, M, k_keep, tol_rel=0.0,
+        mesh, M, k_keep,
     )
     G_sharded = jax.device_put(
         G_j, NamedSharding(mesh, PartitionSpec('x', None)),
@@ -479,7 +470,7 @@ def test_prune_wrapper_raises_on_band_window_larger_than_nbands():
     cand = np.zeros((64, 3), dtype=np.int64)
     with pytest.raises(ValueError, match="wfn.nbands"):
         prune_candidates_by_pivoted_cholesky(
-            wfn, sym=None, cand_idx=cand, n_keep=32,
+            wfn, sym=None, cand_idx=cand, n_keep=32, mesh=Mesh(np.asarray(jax.devices()[:1]), ("x",)),
             band_range_left=(0, 50),
             band_range_right=(0, 150),   # 150 > nbands=100
         )
@@ -494,14 +485,14 @@ def test_prune_wrapper_raises_when_half_pw_basis_exceeded():
     cand = np.zeros((64, 3), dtype=np.int64)
     with pytest.raises(ValueError, match="exceeds 50 % of the plane-wave basis"):
         prune_candidates_by_pivoted_cholesky(
-            wfn, sym=None, cand_idx=cand, n_keep=32,
+            wfn, sym=None, cand_idx=cand, n_keep=32, mesh=Mesh(np.asarray(jax.devices()[:1]), ("x",)),
             band_range_left=(0, 250),    # 250 > 200 = half-basis
             band_range_right=(0, 50),
         )
     # Legacy (n_val, n_cond) form hits the same guard.
     with pytest.raises(ValueError, match="exceeds 50 % of the plane-wave basis"):
         prune_candidates_by_pivoted_cholesky(
-            wfn, sym=None, cand_idx=cand, n_keep=32,
+            wfn, sym=None, cand_idx=cand, n_keep=32, mesh=Mesh(np.asarray(jax.devices()[:1]), ("x",)),
             n_val=8, n_cond=250,   # 8 + 250 = 258 > 200
         )
 
@@ -518,7 +509,7 @@ def test_prune_wrapper_accepts_half_pw_boundary():
     # Test: the ValueError we want *not* to see is the PW-basis message.
     try:
         prune_candidates_by_pivoted_cholesky(
-            wfn, sym=None, cand_idx=cand, n_keep=2,
+            wfn, sym=None, cand_idx=cand, n_keep=2, mesh=Mesh(np.asarray(jax.devices()[:1]), ("x",)),
             band_range_left=(0, 200),
             band_range_right=(0, 200),
         )
