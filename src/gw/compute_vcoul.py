@@ -272,13 +272,19 @@ def make_v_munu_chunked_kernel(
         if bdot is None:
             raise ValueError("bdot is required for sys_dim=0 (box truncation)")
         sqrt_v_0d = compute_sqrt_vcoul_0d(fft_nx, fft_ny, fft_nz, bdot, cell_volume)
+        # Flatten to 1-D (n_rtot,) so the per-q vmap output is (Q, n_rtot),
+        # matching the kernel's ``sqrt_v_batch[:, None, :]`` broadcast onto
+        # ``zeta_G`` which is (Q, μ, n_rtot) when ``sphere_idx is None``.
+        # Same convention as the 3-D sphere path, which calls
+        # ``sqrt_v.reshape(-1)[sphere_idx]`` to land at 1-D pre-vmap.
+        sqrt_v_0d_flat = sqrt_v_0d.reshape(-1)
 
         @jax.jit
         def get_sqrt_v_and_phase(qvec_wrapped: jax.Array) -> tuple[jax.Array, jax.Array]:
             """Return precomputed √v(G) and trivial phase (q must be 0)."""
             # Phase is 1.0 for q=0
             phase = jnp.ones((1, fft_nx, fft_ny, fft_nz), dtype=jnp.complex128)
-            return sqrt_v_0d, phase
+            return sqrt_v_0d_flat, phase
     else:
         # 2D slab or 3D bulk: analytic formula, computed per q-point
         gx, gy, gz = fft_integer_axes(fft_nx, fft_ny, fft_nz)
@@ -1801,6 +1807,11 @@ def compute_all_V_q_sharded(
     # cache misses per V_q batch (line 1805 broadcast_in_dim ×2).
     _vmapped_sqrt_v_phase = jax.vmap(kernels.get_sqrt_v_and_phase)
 
+    # Cache the sphere-idx in numpy so the per-q overlay path doesn't pay
+    # a host↔device sync each call.
+    _sphere_idx_np = (np.asarray(kernels.sphere_idx)
+                      if kernels.sphere_idx is not None else None)
+
     def _sqrt_v_phase_batch(qvec_list, pad_to: int):
         n_actual = len(qvec_list)
         qvec_np = np.stack([np.asarray(qw, dtype=np.float64)
@@ -1809,7 +1820,38 @@ def compute_all_V_q_sharded(
             pad = np.tile(qvec_np[0:1], (pad_to - n_actual, 1))
             qvec_np = np.concatenate([qvec_np, pad], axis=0)
         qvec_arr = jnp.asarray(qvec_np, dtype=jnp.float64)
-        return _vmapped_sqrt_v_phase(qvec_arr)
+        sqrt_v_batch, phase_batch = _vmapped_sqrt_v_phase(qvec_arr)
+
+        # BGW vcoul overlay: replace per-G v(q+G) values with BGW's stored
+        # MC-averaged values.  Mirrors the chunked path's overlay (line ~998
+        # of this file) so ``use_bgw_vcoul=true`` is no longer a no-op when
+        # the sharded V_q kernel is used.  Only G's BGW wrote (typically a
+        # subset of LORRAX's cutoff sphere) get overwritten; the rest keep
+        # LORRAX's native value.
+        if bgw_v_grid_fn is not None:
+            kgrid_a = np.array([nkx, nky, nkz], dtype=np.float64)
+            sqrt_v_np = np.asarray(sqrt_v_batch).copy()
+            for iq in range(qvec_np.shape[0]):
+                # Pass qvec_wrapped/kgrid in signed form (no mod 1.0).  The
+                # native sqrt_v's FFT-box layout uses v(q+G=Gint) at FFT-box
+                # position Gint mod N — the standard FFT-box convention.
+                # If we wrap q to [0,1) instead, ``fill_v_grid_for_q`` finds
+                # a different sym (S_k, kg0) decomposition whose rotated G's
+                # land at different FFT-box positions, so the BGW v_box and
+                # LORRAX's native v_box disagree on what G each cell is.
+                q_frac = qvec_np[iq] / kgrid_a
+                v_scaled_bgw = np.asarray(
+                    bgw_v_grid_fn(tuple(q_frac))).reshape(-1)
+                if _sphere_idx_np is not None:
+                    v_scaled_bgw = v_scaled_bgw[_sphere_idx_np]
+                sqrt_v_bgw = np.sqrt(np.maximum(v_scaled_bgw, 0.0))
+                sqrt_v_native = sqrt_v_np[iq].real
+                sqrt_v_np[iq] = np.where(
+                    v_scaled_bgw != 0.0, sqrt_v_bgw, sqrt_v_native
+                ).astype(np.complex128)
+            sqrt_v_batch = jnp.asarray(sqrt_v_np)
+
+        return sqrt_v_batch, phase_batch
 
     vq_progress = LoopProgress(
         nq_total, print, title="V_q computation",
