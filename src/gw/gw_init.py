@@ -597,12 +597,13 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		mu_chunk = int(jax.device_get(_mq)[0])
 		q_batch = int(jax.device_get(_mq)[1])
 
-	# Auto-default to 4·ecutwfc: tightest |q+G|² cutoff that drops zero
-	# physics (triangle ineq on ψ*ψ bounds pair-density at |G|² ≤ 4·ecutwfc)
-	# and activates the V_q sphere gather in compute_vcoul.
+	# Default to ecutwfc — matches BGW's screened_coulomb_cutoff convention
+	# (BGW truncates the pair-density v(q+G) sphere at ecutwfc).  The previous
+	# default of 4·ecutwfc was the strict mathematical cutoff for ψ*ψ but
+	# produced a ~4% V_μν body offset vs BGW's vcoul.dat on Si 4×4×4.
 	if cfg.bare_coulomb_cutoff is None:
-		vcoul_cutoff_ry = 4.0 * float(wfn.ecutwfc)
-		print_fn(f"    V_q bare cutoff: {vcoul_cutoff_ry:.1f} Ry (auto: 4·ecutwfc)")
+		vcoul_cutoff_ry = float(wfn.ecutwfc)
+		print_fn(f"    V_q bare cutoff: {vcoul_cutoff_ry:.1f} Ry (auto: ecutwfc)")
 	else:
 		vcoul_cutoff_ry = float(cfg.bare_coulomb_cutoff)
 		print_fn(f"    V_q bare cutoff: {vcoul_cutoff_ry:.1f} Ry")
