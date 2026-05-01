@@ -125,7 +125,7 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
                 print_fn(
                     f"wcoul0_source=epshead is static-only; using epshead(0) for omega={omega_val} Ry"
                 )
-            from file_io.epsmat_reader import EPSReader
+            from file_io.epsreader import EPSReader
             from gw.vcoul import compute_q0_averages
 
             eps0 = EPSReader(eps0_path)
