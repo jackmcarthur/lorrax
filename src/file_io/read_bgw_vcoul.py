@@ -84,9 +84,20 @@ class BGWVcoulTable:
 def read_bgw_vcoul(path: str) -> BGWVcoulTable:
     """Parse a BGW vcoul text file.
 
-    Returns a BGWVcoulTable with one entry per *unique* q-point (BGW
-    re-emits each q once per (q, k) combination; repeated contiguous
-    blocks for the same q are deduplicated).
+    Returns a BGWVcoulTable with one entry per IBZ q-point — the q-blocks
+    written during sigma's *first* outer-k iteration.  Subsequent outer-k
+    iterations re-emit blocks for the same q-list (and may add new
+    non-IBZ q's), each computed from a fresh mini-BZ Monte-Carlo draw, so
+    redundant blocks for the same q are NOT bit-identical at the few-meV
+    level.  Trusting the first block per q is what matches BGW's internal
+    behaviour at outer-k = ``rk(1)``; later occurrences are MC-noise
+    siblings and should not leak into downstream Σ_X / V_q construction.
+
+    We detect the boundary as "first repeated q-coord": once an
+    already-seen q reappears, sigma has wrapped to its second outer-k
+    iteration and we stop reading.  Non-IBZ q's needed downstream are
+    obtained via the BGW symmetry path in
+    :meth:`BGWVcoulTable.find_q_index`, not from later blocks.
     """
     arr = np.loadtxt(path)
     q_all = arr[:, 0:3]
@@ -97,18 +108,19 @@ def read_bgw_vcoul(path: str) -> BGWVcoulTable:
     q_key_all = np.round(np.mod(q_all, 1.0) * 1e8).astype(np.int64)
 
     q_fracs, G_miller_per_q, vcoul_per_q = [], [], []
-    seen_keys = {}
+    seen_keys: set[tuple] = set()
     i = 0
     while i < arr.shape[0]:
         key = tuple(q_key_all[i])
         block_end = i
         while block_end < arr.shape[0] and tuple(q_key_all[block_end]) == key:
             block_end += 1
-        if key not in seen_keys:
-            seen_keys[key] = len(q_fracs)
-            q_fracs.append(np.asarray(key, dtype=np.float64) / 1e8)
-            G_miller_per_q.append(np.asarray(G_all[i:block_end], dtype=np.int32))
-            vcoul_per_q.append(np.asarray(v_all[i:block_end], dtype=np.float64))
+        if key in seen_keys:
+            break
+        seen_keys.add(key)
+        q_fracs.append(np.asarray(key, dtype=np.float64) / 1e8)
+        G_miller_per_q.append(np.asarray(G_all[i:block_end], dtype=np.int32))
+        vcoul_per_q.append(np.asarray(v_all[i:block_end], dtype=np.float64))
         i = block_end
 
     return BGWVcoulTable(
