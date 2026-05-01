@@ -62,6 +62,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Charge density source. 'auto' (default) prefers "
                         "QE's symmetrized rho when reachable, else falls "
                         "back to the WFN IBZ sum.")
+    p.add_argument("--rho-power", type=float, default=1.0,
+                   help="Use ρ(r)^α as the k-means weight (default α=1.0). "
+                        "Per Gersho (3D), centroid number-density "
+                        "asymptotically scales as ρ^(3α/5), so α=1 gives "
+                        "ρ^0.6, α=5/3≈1.667 gives ρ^1, α=10/3≈3.333 gives "
+                        "ρ^2 (closer to the |ψ_v|²|ψ_c|² distribution the "
+                        "ISDF actually wants to fit). Bump above 1 if your "
+                        "centroids are under-clustering high-density "
+                        "regions.")
     p.add_argument("--qe-save", type=str, default=None,
                    help="Explicit QE <prefix>.save path. Default: "
                         "auto-detected from cwd via qe/scf/*.save or "
@@ -197,6 +206,12 @@ def main():
     print(f"Lattice lengths: {np.linalg.norm(avec_ang, axis=1)} Å")
 
     rho_jax = jnp.asarray(charge_density, dtype=jnp.float64)
+    if args.rho_power != 1.0:
+        # Clip to non-negative before power (QE iFFT can leave tiny < 0
+        # noise) and tell the user we're using a non-default exponent.
+        rho_jax = jnp.maximum(rho_jax, 0.0) ** float(args.rho_power)
+        print(f"k-means weight: ρ(r)^{args.rho_power:g} "
+              f"(asymptotic centroid density ∝ ρ^{0.6*args.rho_power:.3f})")
     avec_jax = jnp.asarray(avec_ang, dtype=jnp.float64)
 
     n_points = int(np.prod(fft_grid))
