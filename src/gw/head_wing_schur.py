@@ -53,6 +53,33 @@ G0_X_SPEC    = P(None, 'x')           # (nq, μ_X) — replicated on y
 G0_Y_SPEC    = P(None, 'y')           # (nq, μ_Y) — replicated on x
 SCALAR_Q_SPEC = P(None,)              # (nq,) — replicated
 
+# Intermediate sharding for the V_FLATQ_SPEC ↔ q-shard reshard.
+# Same trick as ``w_isdf._get_w_solve_fn``: routing through
+# ``P('x', None, 'y')`` lets SPMD plan the reshard as two single-axis
+# all_to_alls (one on x for the q axis, one on y for the μ axis)
+# instead of falling into "Involuntary full rematerialization" when
+# asked to un-shard or re-shard both x and y simultaneously.  The
+# helper below applies this stage at the entry of any function that
+# consumes W_body0 (output of ``_get_w_solve_fn``) and re-imposes
+# V_FLATQ_SPEC for the kernel body.
+_RESHARD_MID_SPEC = P('x', None, 'y')
+
+
+def _reshard_W_to_flatq(W_q: jax.Array, mesh_xy: Mesh) -> jax.Array:
+    """Two-stage reshard back to V_FLATQ_SPEC, avoiding SPMD remat.
+
+    ``with_sharding_constraint`` to ``P('x', None, 'y')`` first parks
+    one axis at a time, then a second constraint to ``V_FLATQ_SPEC``
+    moves the other.  Without the intermediate, XLA hits "Involuntary
+    full rematerialization" when the producer (``_get_w_solve_fn``)
+    leaves W q-sharded across the combined ('x','y') axis tuple.
+    """
+    W_q = jax.lax.with_sharding_constraint(
+        W_q, NamedSharding(mesh_xy, _RESHARD_MID_SPEC))
+    W_q = jax.lax.with_sharding_constraint(
+        W_q, NamedSharding(mesh_xy, V_FLATQ_SPEC))
+    return W_q
+
 
 # ---------------------------------------------------------------------------
 # Step 1: rank-1 head-channel subtract  (zero comm)
@@ -105,7 +132,15 @@ def solve_W_body0_sharded(
     n_mu = int(V_body_q.shape[1])
     solve_w = _get_w_solve_fn(mesh_xy, nq, n_mu)
     pref_arr = jnp.asarray(pref, dtype=jnp.complex128)
-    return solve_w(V_body_q, chi_body_q, pref_arr)
+    W = solve_w(V_body_q, chi_body_q, pref_arr)
+    # ``_get_w_solve_fn`` ends with ``with_sharding_constraint(W, rep_3d)``
+    # which XLA may or may not honour — when it doesn't, downstream
+    # consumers asking for V_FLATQ_SPEC hit "Involuntary full
+    # rematerialization" on the implicit reshard.  Force the output to
+    # V_FLATQ_SPEC HERE via the two-stage reshard, so that consumers
+    # (schur_reductions_sharded, assemble_W_sharded) see a
+    # cleanly-sharded input and don't need any reshard themselves.
+    return _reshard_W_to_flatq(W, mesh_xy)
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +167,13 @@ def schur_reductions_sharded(
     Each contraction is one psum on the contracted axis.  Total comm per q:
     one all-reduce on y for A_wing, one on x for A_wing', and one on the
     full mesh for χ_head_eff.  Three small reductions per q.
+
+    **Caller contract:** ``W_body0_q`` MUST already be on V_FLATQ_SPEC.
+    ``solve_W_body0_sharded`` returns it that way; if you got W_body0
+    from a different source, two-stage-reshard via
+    ``_reshard_W_to_flatq`` first.  This function does NOT defensively
+    reshard, because doing so charges a 16-all-to-all reshard cost on
+    every call even when the input is already correctly sharded.
     """
     # A_wing[q, μ_X] = Σ_ν W_body0[q, μ_X, ν_Y] · chi_wing_y[q, ν_Y]
     #   einsum reduces along the y axis → output on x
@@ -181,6 +223,11 @@ def assemble_W_sharded(
     Zero-comm: every component on the rhs is already on the right
     axis (x-shard for left, y-shard for right).  The outer product is
     a pure local kernel on each device.
+
+    **Caller contract:** ``W_body0_q`` must already be on V_FLATQ_SPEC
+    (use ``solve_W_body0_sharded`` whose output respects this; or
+    apply ``_reshard_W_to_flatq`` first).  This function trusts the
+    sharding label and does no defensive resharding.
     """
     left  = jnp.conj(g0_x) + A_wing_x        # (nq, μ_X) on x
     right = g0_y           + A_wingp_y       # (nq, μ_Y) on y
