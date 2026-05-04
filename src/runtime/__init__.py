@@ -43,6 +43,7 @@ __all__ = [
     "init_jax_distributed",
     "fallback_to_cpu_if_no_gpu_backend",
     "gate_print_to_rank0",
+    "tee_stdout_to_file",
 ]
 
 
@@ -106,6 +107,50 @@ def _resolve_coordinator_address() -> str:
             or os.environ.get("HOSTNAME")
             or "localhost")
     return f"{host}:12355"
+
+
+def tee_stdout_to_file(path: str | os.PathLike) -> None:
+    """Mirror stdout + stderr to ``path`` (rank 0 only) while keeping
+    them on the terminal.  Useful when a driver wants its run log to
+    land in the run_dir instead of relying on whatever shell wrapper
+    captures the output (e.g. the bash tool's /tmp/claude-* tasks
+    dir, which is RAM-backed and per-host).
+
+    Call AFTER :func:`init_jax_distributed` so only rank 0 writes the
+    file (otherwise N ranks race-write the same path).  Single-process
+    runs always write.
+
+    The file is opened ``'w'`` (truncate) and line-buffered.  Subsequent
+    ``print(...)`` calls land in both terminal and file; tracebacks
+    via stderr also land there.
+    """
+    import sys
+    import jax
+
+    if jax.process_count() > 1 and jax.process_index() != 0:
+        return
+
+    p = str(path)
+    parent = os.path.dirname(os.path.abspath(p))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    f = open(p, 'w', buffering=1)  # line-buffered
+
+    class _Tee:
+        def __init__(self, *streams):
+            self._streams = streams
+        def write(self, data):
+            for s in self._streams:
+                s.write(data)
+                s.flush()
+        def flush(self):
+            for s in self._streams:
+                s.flush()
+        def isatty(self):
+            return False
+
+    sys.stdout = _Tee(sys.__stdout__, f)
+    sys.stderr = _Tee(sys.__stderr__, f)
 
 
 def gate_print_to_rank0() -> None:
