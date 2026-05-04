@@ -135,26 +135,44 @@ def _choose_v_q_chunks(
     # sqrt_v(q+G) table lives replicated on each rank.
     v_per_q_bytes = N_zeta * n_G
 
-    # Per-q compute footprint, in two parts:
+    # Per-q compute footprint, in three parts:
     #   (a) post-FFT G-sphere slab (μ × n_G / p_min) — the working set
-    #       of the contraction kernel.  Coefficient ``Q_COMPUTE_COEF``
-    #       absorbs FFT-side transients on top of the nominal
-    #       2 × ζ_X + ζ_Y replicas.
-    #   (b) pre-FFT n_rtot disk-read slab (μ × n_rtot / p_prod, sharded
-    #       on ('x','y')).  Lives concurrently with (a) for at least
-    #       one buffer's worth — XLA pipelines these — so we add the
-    #       worst-case single buffer.
-    # Empirical AOT measurement across (MoS2, Si 10³) × (4, 8, 16, 28,
-    # 35 GB) showed Q_COMPUTE_COEF ≈ 4.4 matches the peak to within
-    # ~5% when n_rtot ≈ n_G (older Si runs); on MoS2 / CrI3 where
-    # n_rtot/n_G ≈ 8–16× the legacy model under-predicted because the
-    # disk-read slab dominates the post-FFT slab.
+    #       of the contraction kernel after the one-axis gather.
+    #       Coefficient ``Q_COMPUTE_COEF`` absorbs the 2 ζ-X + ζ_Y
+    #       replicas + einsum output staging.
+    #   (b) pre-FFT n_rtot slab (μ × n_rtot / p_prod, sharded on
+    #       ('x','y')) — the disk-read buffer.
+    #   (c) cuFFT in-place transients on the 5-D (Q, μ, nx, ny, nz)
+    #       tensor.  ``RTOT_FFT_COEF`` counts how many concurrent
+    #       n_rtot-shaped buffers XLA + cuFFT hold at peak (input,
+    #       output, planner scratch).  The previous code rolled this
+    #       into a single 1× n_rtot buffer (only the pre-FFT slab),
+    #       which underpredicted by 5× on CrI3 16-GPU where the cuFFT
+    #       scratch is the dominant single-q allocation.
+    #
+    # CALIBRATION (2026-05-03):
+    #   Q_COMPUTE_COEF = 4.4  (kept from old DOE; matches MoS2/Si well)
+    #   RTOT_FFT_COEF  = 7    (was implicit 1; raised so on CrI3 35 GB
+    #                          budget the chooser drops q_chunk to 2
+    #                          (predicted peak ~31 GB ≈ measured ~27
+    #                          GB) instead of q_chunk=3 (predicted 14
+    #                          GB but actual 41 GB → OOM at 35 GB).
+    #                          On MoS2 the same coefficient gives
+    #                          predicted ~8 GB vs measured ~1.5 GB —
+    #                          conservative but doesn't force Case B
+    #                          (still picks q_chunk=9, full Case A).
+    #                          See bispinor_pipeline_2026-05-04
+    #                          report for the failure mode.)
     Q_COMPUTE_COEF = 4.4
+    RTOT_FFT_COEF = 7.0
     if n_rtot is None or int(n_rtot) <= 0:
         rtot_per_q_bytes = 0.0
     else:
-        # μ × n_rtot / p_prod, single concurrent disk-read buffer.
-        rtot_per_q_bytes = N_zeta * n_rmu * float(n_rtot) / p_prod
+        # μ × n_rtot / p_prod for the cuFFT 5-D plan: input, output,
+        # cuFFT planner scratch, plus the disk-read buffer that lives
+        # concurrent with the FFT input.  Coefficient 5 covers all of
+        # these (3× cuFFT + 1× disk-read + 1× post-IFFT staging).
+        rtot_per_q_bytes = RTOT_FFT_COEF * N_zeta * n_rmu * float(n_rtot) / p_prod
     # Case A check: can we hold *one* q's worth of gathered μ×G?
     one_q_bytes = Q_COMPUTE_COEF * N_zeta * n_rmu * n_G / p_min + rtot_per_q_bytes
     slack_after_one_q = B_compute - (one_q_bytes + v_per_q_bytes)
@@ -203,8 +221,11 @@ def _choose_v_q_chunks(
             mu_chunk = max(snap, mu_chunk_max - (mu_chunk_max % snap))
 
         n_mu_blocks = (int(n_rmu) + mu_chunk - 1) // mu_chunk
-        # Case B per-tile peak: 2 ζ-G slabs + per-tile disk slab.
-        rtot_tile_bytes = (N_zeta * mu_chunk * float(n_rtot) / p_prod
+        # Case B per-tile peak: 2 ζ-G slabs + per-tile disk + cuFFT slab.
+        # Use the same RTOT_FFT_COEF as Case A so the chooser is
+        # consistent across the two regimes (the FFT buffers are the
+        # same ones — just the μ extent shrinks from n_rmu to mu_chunk).
+        rtot_tile_bytes = (RTOT_FFT_COEF * N_zeta * mu_chunk * float(n_rtot) / p_prod
                            if n_rtot is not None and int(n_rtot) > 0 else 0.0)
         peak = (2.0 * N_zeta * mu_chunk * n_G / p_min + rtot_tile_bytes
                 + v_per_q_bytes + ref_bytes)

@@ -133,19 +133,30 @@ def compute_optimal_chunks(
     # Replicated-L temps during Cholesky solve (L_batch_rep + 3× L_full):
     c_solve    = _mem(mu, mu, shard=p_x * p_x) + 3 * _mem(mu, mu)
 
-    # ZCT adds 3·α_pair·cr on top of the persistent P_l/P_r accumulators.
-    # MEASURED: AOT-compiling compute_ZCT_from_left_right_zchunk as a
-    # standalone kernel gives arg=2·α_pair·cr (P_l + P_r inputs),
-    # temp=2·α_pair·cr (internal working buffers), out=1·α_pair·cr
-    # (Z_q).  Inside fit_one_rchunk the 2 args are already live as
-    # the persistent accumulators, so the ADDITIONAL live set at the
-    # ZCT peak is temp+out = 3·α_pair·cr.  The old (4 + 3)=7· fudge
-    # over-counted by 2 (no donation credit + over-estimated cuFFT
-    # scratch).  Validated across kgrids (3,3,1), (10,10,10) and
-    # multiple cr values — ratio of measured temp to 4·α_pair·cr was
-    # uniform 0.5 → coefficient is 2·α_pair·cr for temp + 1 for out
-    # = 3 total additional.  See scripts/validate_fft_workspaces.py.
-    ZCT_ADDITIONAL_COEF = 3
+    # ZCT adds N·α_pair·cr on top of the persistent P_l/P_r accumulators.
+    # CALIBRATION (2026-05-03, MoS2 r_chunk sweep + CrI3 16-GPU spot
+    # checks; see runs/MoS2/B_bispinor_profile/sweep_results.json):
+    #
+    #   The previous value (3) was an AOT-isolated-kernel measurement of
+    #   "temp+out" buffers visible inside compute_ZCT_from_left_right_zchunk,
+    #   but XLA donates and reuses buffers inside the larger
+    #   fit_one_rchunk fusion — at runtime only ~1 ZCT-internal buffer
+    #   stays concurrent with the P_l, P_r accumulators.  Setting
+    #   ZCT_ADDITIONAL_COEF=3 gave heur=10.65 GB at MoS2 cr=46080 vs
+    #   measured 2.80 GB (3.8× over-prediction); on CrI3 16-GPU
+    #   r_chunk=25000 it gave 45.95 GB vs measured 5.91 GB (~8× over-
+    #   prediction) and tripped the chooser into picking r_chunk=4992
+    #   (sub-optimal performance).
+    #
+    #   The fitted slope across MoS2 cr={1k…46k} sweep is closer to
+    #   1×α_pair (saturation regime, single concurrent ZCT buffer);
+    #   on CrI3 16-GPU it rises to ~2.7×α_pair (more aggressive
+    #   pipelining at 16-rank scale).  Setting ZCT_ADDITIONAL_COEF=1
+    #   (total 2+1=3·α_pair·cr) gives:
+    #     MoS2  cr=46080: heur 3.21 GB vs measured 2.80 GB (1.15×)
+    #     CrI3  cr=25000: heur ≈ 7.6 GB vs measured 5.91 GB (1.29×)
+    #   both within 30 % across the full sweep.
+    ZCT_ADDITIONAL_COEF = 1
 
     def _fft_moment(cr, base, fft_inloop_bytes):
         """Peak during one bc-iteration's FFT + reshard + accumulate.
@@ -267,7 +278,14 @@ def compute_optimal_chunks(
         """
         del use_cache  # no longer drives memory sizing
         base = m_centroids + m_L_q
-        headroom = m_budget - base
+        # CALIBRATION: subtract the runtime-overhead floor (allocator pool
+        # + NCCL/cuFFT buffers + persistent jit caches; ~0.8 GB on this
+        # stack) from the per-cr headroom so the auto-picked cr leaves
+        # room for the constant overhead too.  Without this, auto-picked
+        # cr saturates the budget and a downstream OOM trips on the next
+        # JIT compile that NCCL grows the ring buffer for.
+        _RUNTIME_OVERHEAD_FOR_HEADROOM = 0.8e9
+        headroom = m_budget - base - _RUNTIME_OVERHEAD_FOR_HEADROOM
         if headroom <= c_solve:
             return None
         if override and override > 0:
@@ -342,12 +360,41 @@ def compute_optimal_chunks(
     avail_gather = max(0.0, m_budget - base - m_zcol)
     q_gather = max(1, min(int(nq), int(avail_gather / result['gather_per_q']))) if result['gather_per_q'] > 0 else int(nq)
 
-    # ---- Overall peak across all stages (chunk loop + pre-loop) ----
+    # CALIBRATION (2026-05-03): the post-loop gather stage's α_gather
+    # term claimed 2 × replicated copies of (μ × cr) live concurrently
+    # per device, but in practice ``process_allgather`` is a D2H copy
+    # — the replicated GPU-side buffer is a fused transient, not a
+    # persistent allocation, and ``np.asarray`` immediately pulls it
+    # to host.  Empirically the gather stage NEVER drives the peak on
+    # nvidia-smi: at MoS2 cr=46080 the heuristic predicted 9·1.09 GB
+    # = 9.8 GB for it, but measured peak was 2.80 GB (see
+    # sweep_results.json).  Drop the gather contribution from the
+    # overall-peak computation; the runtime ``_safe_q_gather`` cap in
+    # ``fit_zeta_chunked_to_h5`` already prevents OOM here.
+    #
+    # CALIBRATION: nvidia-smi memory.used captures the JAX preallocator
+    # pool, NCCL ring buffers, cuFFT plan caches, persistent compiled-
+    # jit memory, and the kernel working set.  The heuristic above
+    # models only the working set; the MoS2 4-GPU sweep shows a
+    # consistent ~0.8 GB gap that's independent of cr.  Add it as a
+    # single per-rank constant.  CrI3 16-GPU spot-checks show the same
+    # ~0.8-1.0 GB floor.  See sweep_results.json + bispinor pipeline
+    # report 2026-05-04 for the data source.
+    RUNTIME_OVERHEAD_BYTES = 0.8e9
+
+    # CALIBRATION: the post-loop solve runs as a JAX scan over q-points
+    # inside one jit body (see ``_solve_zeta_per_q_chunk_with_full_L_q``);
+    # only ONE q's Z_slice + L slab is alive at a time inside the scan,
+    # not q_chunk simultaneously.  The old formula
+    # ``q_chunk * solve_per_q`` over-counted by ~q_chunk× and was the
+    # dominant predictor at cr=46080 on MoS2 (5.27 GB heuristic vs
+    # actual 2.80 GB).  Use 1× per_q here — matches the scan's live
+    # working set.
     overall_peak = max(
         result['peak'],
-        base + 2 * m_zcol + q_chunk * result['solve_per_q'],
-        base + m_zcol + q_gather * result['gather_per_q'],
-        peak_centroid_fft_stage, m_centroids_full + m_centroids, stage_cct)
+        base + 2 * m_zcol + result['solve_per_q'],
+        peak_centroid_fft_stage, m_centroids_full + m_centroids, stage_cct,
+    ) + RUNTIME_OVERHEAD_BYTES
 
     k_chunk = result['k_batch']
     if k_chunk < int(nk) and verbose:
