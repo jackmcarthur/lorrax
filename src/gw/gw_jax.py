@@ -407,7 +407,7 @@ def main(argv=None):
 		# q→0, G=G'=0 head: injected *analytically* into Σ_c at the end of the
 		# block via `compute_ppm_head_sigma_kij`.  The body integral in
 		# `compute_sigma_c_ppm_omega_grid` excludes q=0,G=0 (V is zeroed there
-		# in `compute_vcoul.get_sqrt_v_and_phase`); this analytic head is the
+		# in `coulomb_kernel.get_sqrt_v_and_phase`); this analytic head is the
 		# missing piece.  Magnitude is ±W^c(0)/(2 V_cell N_k) on-shell — ~1.24 eV
 		# per band on Si 4×4×4 60-band, so omitting it shows up as a uniform
 		# ±1.24 eV shift between Σ_c at occupied vs empty bands.

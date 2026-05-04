@@ -277,6 +277,11 @@ def make_v_munu_chunked_kernel(
         # Same convention as the 3-D sphere path, which calls
         # ``sqrt_v.reshape(-1)[sphere_idx]`` to land at 1-D pre-vmap.
         sqrt_v_0d_flat = sqrt_v_0d.reshape(-1)
+        # ``v_per_G_0d`` = sqrt_v_0d ** 2 (un-sqrt'd v on the FFT box).
+        # Used by the unified V_q tile kernel which takes √v inside.
+        # Float64 (real, non-negative) so ``jnp.sqrt`` in the kernel is
+        # well-defined (PSD assumption).
+        v_per_G_0d_flat = (jnp.real(sqrt_v_0d_flat) ** 2).astype(jnp.float64)
 
         @jax.jit
         def get_sqrt_v_and_phase(qvec_wrapped: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -284,6 +289,17 @@ def make_v_munu_chunked_kernel(
             # Phase is 1.0 for q=0
             phase = jnp.ones((1, fft_nx, fft_ny, fft_nz), dtype=jnp.complex128)
             return sqrt_v_0d_flat, phase
+
+        @jax.jit
+        def get_v_per_G_and_phase(qvec_wrapped: jax.Array) -> tuple[jax.Array, jax.Array]:
+            """Return v(G) (un-sqrt'd, ≥0) and trivial phase (q must be 0).
+
+            Companion to ``get_sqrt_v_and_phase`` for the unified V_q
+            tile kernel (``v_q_tile.compute_V_q_tile``) which takes √v
+            inside.  Always real, non-negative.
+            """
+            phase = jnp.ones((1, fft_nx, fft_ny, fft_nz), dtype=jnp.complex128)
+            return v_per_G_0d_flat, phase
     else:
         # 2D slab or 3D bulk: analytic formula, computed per q-point
         gx, gy, gz = fft_integer_axes(fft_nx, fft_ny, fft_nz)
@@ -334,22 +350,18 @@ def make_v_munu_chunked_kernel(
                         _v_head_avg[qx, qy, qz] = np.mean(8.0 * np.pi / denom)
         _v_head_avg_j = jnp.asarray(_v_head_avg * (1.0 / cell_volume))
 
-        @jax.jit
-        def get_sqrt_v_and_phase(qvec_wrapped: jax.Array) -> tuple[jax.Array, jax.Array]:
-            """Compute √v(q+G) and phase for 3D bulk (untruncated Coulomb).
+        def _v_scaled_3d(qvec_wrapped):
+            """Build the un-sqrt'd v(q+G) on the full FFT box (3-D bulk).
 
-            For G≠0: v = 8π/|q+G|² (point value).
-            For G=0, q≠0: v = <8π/|q+δq|²>_miniBZ (MC averaged over Voronoi cell).
-            For G=0, q=0: v = 0 (head injected separately via rank-1 correction).
+            Same masking convention as the legacy ``get_sqrt_v_and_phase``
+            (real, ≥ 0, with G=0 → MC-averaged value or 0 for q=0).  The
+            two factories below wrap this and either return v directly
+            (``get_v_per_G_and_phase``) or its sqrt cast to c128
+            (``get_sqrt_v_and_phase``).  Splitting the helper guarantees
+            both surfaces produce bit-identical v_scaled, so √v_scaled
+            in either factory can be applied symmetrically by the
+            unified V_q tile kernel.
             """
-            # Phase factor
-            phase = jnp.exp(-2j * jnp.pi * (
-                qvec_wrapped[0] / nkx_f * fx +
-                qvec_wrapped[1] / nky_f * fy +
-                qvec_wrapped[2] / nkz_f * fz
-            ))
-
-            # Body: v(q+G) = 8π/|q+G|² for all G
             q_frac = jnp.asarray((
                 qvec_wrapped[0] / nkx_f,
                 qvec_wrapped[1] / nky_f,
@@ -376,24 +388,48 @@ def make_v_munu_chunked_kernel(
             # Optional G-vector cutoff (match BGW bare_coulomb_cutoff)
             if vcoul_cutoff_ry is not None:
                 v_scaled = jnp.where(denom > vcoul_cutoff_ry, 0.0, v_scaled)
+            return v_scaled
 
-            sqrt_v = jnp.where(v_scaled > 0.0, jnp.sqrt(v_scaled), 0.0).astype(jnp.complex128)
-            if sphere_idx is not None:
-                sqrt_v = sqrt_v.reshape(-1)[sphere_idx]  # 1-D for fft_and_weight sphere path
-            return sqrt_v, phase
-
-    elif sys_dim == 2:
-        @jax.jit
-        def get_sqrt_v_and_phase(qvec_wrapped: jax.Array) -> tuple[jax.Array, jax.Array]:
-            """Compute √v(q+G) and phase for a given q-point."""
-            # Phase factor
-            phase = jnp.exp(-2j * jnp.pi * (
+        def _phase_3d(qvec_wrapped):
+            return jnp.exp(-2j * jnp.pi * (
                 qvec_wrapped[0] / nkx_f * fx +
                 qvec_wrapped[1] / nky_f * fy +
                 qvec_wrapped[2] / nkz_f * fz
             ))
 
-            # Coulomb potential
+        @jax.jit
+        def get_sqrt_v_and_phase(qvec_wrapped: jax.Array) -> tuple[jax.Array, jax.Array]:
+            """Compute √v(q+G) and phase for 3D bulk (untruncated Coulomb).
+
+            For G≠0: v = 8π/|q+G|² (point value).
+            For G=0, q≠0: v = <8π/|q+δq|²>_miniBZ (MC averaged over Voronoi cell).
+            For G=0, q=0: v = 0 (head injected separately via rank-1 correction).
+            """
+            phase = _phase_3d(qvec_wrapped)
+            v_scaled = _v_scaled_3d(qvec_wrapped)
+            sqrt_v = jnp.where(v_scaled > 0.0, jnp.sqrt(v_scaled), 0.0).astype(jnp.complex128)
+            if sphere_idx is not None:
+                sqrt_v = sqrt_v.reshape(-1)[sphere_idx]  # 1-D for fft_and_weight sphere path
+            return sqrt_v, phase
+
+        @jax.jit
+        def get_v_per_G_and_phase(qvec_wrapped: jax.Array) -> tuple[jax.Array, jax.Array]:
+            """Companion of ``get_sqrt_v_and_phase``: returns v(q+G) un-sqrt'd.
+
+            Used by the unified V_q tile kernel (``v_q_tile``) which
+            takes ``sqrt`` inside.  Always real, non-negative.  Same
+            masking and MC-averaging as ``get_sqrt_v_and_phase``.
+            """
+            phase = _phase_3d(qvec_wrapped)
+            v_scaled = _v_scaled_3d(qvec_wrapped)
+            if sphere_idx is not None:
+                v_scaled = v_scaled.reshape(-1)[sphere_idx]
+            return v_scaled, phase
+
+    elif sys_dim == 2:
+
+        def _v_scaled_2d(qvec_wrapped):
+            """Build the un-sqrt'd v(q+G) on the full FFT box (2-D slab)."""
             q_frac = jnp.asarray((
                 qvec_wrapped[0] / nkx_f,
                 qvec_wrapped[1] / nky_f,
@@ -415,10 +451,36 @@ def make_v_munu_chunked_kernel(
             # Optional G-vector cutoff (match BGW bare_coulomb_cutoff)
             if vcoul_cutoff_ry is not None:
                 v_scaled = jnp.where(denom > vcoul_cutoff_ry, 0.0, v_scaled)
+            return v_scaled
+
+        def _phase_2d(qvec_wrapped):
+            return jnp.exp(-2j * jnp.pi * (
+                qvec_wrapped[0] / nkx_f * fx +
+                qvec_wrapped[1] / nky_f * fy +
+                qvec_wrapped[2] / nkz_f * fz
+            ))
+
+        @jax.jit
+        def get_sqrt_v_and_phase(qvec_wrapped: jax.Array) -> tuple[jax.Array, jax.Array]:
+            """Compute √v(q+G) and phase for a given q-point."""
+            phase = _phase_2d(qvec_wrapped)
+            v_scaled = _v_scaled_2d(qvec_wrapped)
             sqrt_v = jnp.where(v_scaled > 0.0, jnp.sqrt(v_scaled), 0.0).astype(jnp.complex128)
             if sphere_idx is not None:
                 sqrt_v = sqrt_v.reshape(-1)[sphere_idx]  # 1-D for fft_and_weight sphere path
             return sqrt_v, phase
+
+        @jax.jit
+        def get_v_per_G_and_phase(qvec_wrapped: jax.Array) -> tuple[jax.Array, jax.Array]:
+            """Companion of ``get_sqrt_v_and_phase`` for the unified V_q
+            tile kernel: returns v(q+G) un-sqrt'd (real, ≥0), same
+            masking as ``get_sqrt_v_and_phase``.
+            """
+            phase = _phase_2d(qvec_wrapped)
+            v_scaled = _v_scaled_2d(qvec_wrapped)
+            if sphere_idx is not None:
+                v_scaled = v_scaled.reshape(-1)[sphere_idx]
+            return v_scaled, phase
 
     # NOTE: These are NOT JIT'd - they're meant to be called from an outer JIT
     # to avoid nested JIT compilation overhead. The outer JIT (_batch_proc or
@@ -494,6 +556,7 @@ def make_v_munu_chunked_kernel(
     from types import SimpleNamespace
     kernels = SimpleNamespace(
         get_sqrt_v_and_phase=get_sqrt_v_and_phase,
+        get_v_per_G_and_phase=get_v_per_G_and_phase,  # un-sqrt'd v + phase, used by v_q_tile
         fft_and_weight=fft_and_weight,  # JIT'd for standalone/chunked use
         fft_and_weight_inner=fft_and_weight_inner,  # non-JIT'd for nested use
         contract_block=contract_block,  # JIT'd for standalone/chunked use

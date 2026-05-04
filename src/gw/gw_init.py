@@ -557,7 +557,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	Returns (V_qmunu, G0) where V_qmunu has shape (1, npol, npol, nkx, nky, nkz, μ, μ)
 	and G0 is (n_rmu,) ζ_μ(G=0) at q=0.
 	"""
-	from .compute_vcoul import (
+	from .v_q_driver import (
 		compute_all_V_q_from_zeta_h5,
 		compute_all_V_q_sharded,
 	)
