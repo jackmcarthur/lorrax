@@ -117,14 +117,12 @@ def main(argv=None):
 		help="Input file",
 	)
 	args = argp.parse_args(argv)
-	
-	# Gate prints to rank 0
-	_orig_print = builtins.print
-	def print0(*a, **k):
-		if jax.process_index() == 0:
-			k.setdefault("flush", True)
-			_orig_print(*a, **k)
-	builtins.print = print0
+
+	# ``runtime.init_jax_distributed`` (called at top-of-module) already
+	# gates ``builtins.print`` to rank 0 on multi-process runs.  Keep
+	# ``print0`` as a local name so the many ``print_fn=print0`` callers
+	# downstream continue to compile; it's now just an alias.
+	print0 = builtins.print
  
 	# ========================================================================
 	# CONFIGURATION
@@ -187,6 +185,36 @@ def main(argv=None):
 	wfn = WFNReader(config.wfn_file)
 	sym = symmetry_maps.SymMaps(wfn)
 	_, centroid_indices, _n_rmu = load_centroids(config.centroids_file, wfn.fft_grid)
+	# Bispinor: also load the current-density (Gordon-Pauli) centroid set used
+	# for the γ̃^{1,2,3} (i-channel) ζ fits.  See docs/BISPINOR_DHFB_DESIGN.md
+	# §4 for the two-centroid-file architecture.
+	centroid_indices_current = None
+	_n_rmu_current = 0
+	if config.bispinor:
+		from centroid.centroid_io import read_centroids as _read_centroids_with_header
+		import os as _os
+		if not _os.path.exists(config.centroids_file_current):
+			raise FileNotFoundError(
+				f"bispinor=True but current-density centroid file missing: "
+				f"{config.centroids_file_current}\n"
+				f"Generate it with:\n"
+				f"  cd {input_dir}\n"
+				f"  python3 -m centroid.kmeans_cli --density-mode current <N_c>"
+			)
+		_cf = _read_centroids_with_header(config.centroids_file_current)
+		if _cf.density != "current":
+			print0(
+				f"  [bispinor] WARNING: {config.centroids_file_current} has "
+				f"density={_cf.density!r}, expected 'current'.  Proceeding anyway."
+			)
+		_, centroid_indices_current, _n_rmu_current = load_centroids(
+			config.centroids_file_current, wfn.fft_grid
+		)
+		print0(
+			f"  [bispinor] scalar centroids: {_n_rmu}  "
+			f"current centroids: {_n_rmu_current}  "
+			f"(file: {config.centroids_file_current})"
+		)
 	tmp_dir = os.path.join(input_dir, "tmp")
 	os.makedirs(tmp_dir, exist_ok=True)
 	tensors_filename = os.path.join(tmp_dir, f"isdf_tensors_{_n_rmu}.h5")

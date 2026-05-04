@@ -858,6 +858,7 @@ def compute_all_V_q_sharded(
     choice = _choose_v_q_chunks(
         n_rmu=n_rmu, n_G=n_G_sph, n_q_total=nq_total,
         budget_bytes=budget_bytes, p_x=p_x, p_y=p_y,
+        n_rtot=n_rtot,
     )
     # Debug knob: force Case B at a caller-specified μ-chunk so the tile
     # path can be exercised on systems that otherwise land in Case A.
@@ -967,17 +968,15 @@ def compute_all_V_q_sharded(
     # in the same_zeta=True path (Case A always; Case B diagonal blocks).
     from .v_q_tile import compute_V_q_tile
     V_acc, g0_acc = compute_V_q_tile(
+        coulomb_kernels=kernels,
         zeta_L_io=zeta_io,
         zeta_R_io=zeta_io,
         v_per_G_fn=_v_per_G_fn,
         phase_fn=_phase_fn,
-        sphere_idx=kernels.sphere_idx,
         mesh_xy=mesh_xy,
         kgrid=kgrid,
-        fft_grid=fft_grid,
         n_rmu_L=n_rmu,
         n_rmu_R=n_rmu,
-        n_rtot=n_rtot,
         V_acc=V_acc,
         g0_acc=g0_acc,
         chooser_choice=chooser_choice,

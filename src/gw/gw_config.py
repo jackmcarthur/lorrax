@@ -32,6 +32,9 @@ _DEFAULTS = {
     # File paths
     "wfn_file": "WFN.h5",
     "centroids_file": "centroids_frac.txt",
+    # Bispinor: explicit override for the current-density centroid file.
+    # Empty string = auto-derive "<base>_current<ext>" from centroids_file.
+    "centroids_file_current": "",
     "output_file": "eqp0_noqsym.dat",
     "kin_ion_file": "kin_ion.h5",
     "eqp_output_file": "eqp.dat",
@@ -81,6 +84,9 @@ _DEFAULTS = {
     "chunk_size": -1,
     "band_chunk_size": 16,
     "r_chunk_size": 0,
+    # Debug knob: cap r-chunk loop in fit_zeta_chunked_to_h5 (≤0 → run all).
+    # Used for fast wiring tests; produces a partial zeta_q.h5.
+    "max_r_chunks": -1,
     # ISDF
     "isdf_memory_mode": "auto",   # auto | high_mem | low_mem
                                    # high_mem (default): 2D-blocked JAX Cholesky +
@@ -303,6 +309,10 @@ class LorraxConfig:
     # --- File paths (resolved to absolute) ---
     wfn_file: str
     centroids_file: str
+    # Bispinor-only: path to the second (current-density) centroid file.
+    # Auto-derived from centroids_file when bispinor=True (replaces "<...>.txt"
+    # → "<...>_current.txt").  Always None for non-bispinor runs.
+    centroids_file_current: str | None
     output_file: str
     kin_ion_file: str
     eqp_output_file: str
@@ -328,6 +338,7 @@ class LorraxConfig:
     chunk_target_utilization: float
     chunk_size: int
     band_chunk_size: int
+    max_r_chunks: int
     r_chunk_override: int
     zct_stage_cap_gb: float | None
 
@@ -507,6 +518,25 @@ class LorraxConfig:
         def _get(key):
             return params.get(key, _DEFAULTS.get(key))
 
+        # Bispinor: current-density centroid file path.  Explicit override
+        # via the `centroids_file_current` input key (when the current
+        # centroid count differs from the scalar one); else auto-derive
+        # "<base>_current<ext>" from `centroids_file`.  Both are produced
+        # by `centroid.kmeans_cli --density-mode {scalar,current}`.
+        _bispinor = bool(_get("bispinor"))
+        _centroids_file = str(_get("centroids_file"))
+        _centroids_file_current = None
+        if _bispinor:
+            _explicit = str(_get("centroids_file_current") or "").strip()
+            if _explicit:
+                _centroids_file_current = _explicit
+            else:
+                from pathlib import Path as _Path
+                _base = _Path(_centroids_file)
+                _centroids_file_current = str(
+                    _base.with_name(_base.stem + "_current" + _base.suffix)
+                )
+
         return cls(
             # System
             nval=int(_get("nval")),
@@ -515,7 +545,8 @@ class LorraxConfig:
             sys_dim=int(_get("sys_dim")),
             # Paths
             wfn_file=str(_get("wfn_file")),
-            centroids_file=str(_get("centroids_file")),
+            centroids_file=_centroids_file,
+            centroids_file_current=_centroids_file_current,
             output_file=str(_get("output_file")),
             kin_ion_file=str(_get("kin_ion_file")),
             eqp_output_file=str(_get("eqp_output_file")),
@@ -539,6 +570,7 @@ class LorraxConfig:
             chunk_target_utilization=chunk_utilization,
             chunk_size=int(_get("chunk_size")),
             band_chunk_size=int(_get("band_chunk_size")),
+            max_r_chunks=int(_get("max_r_chunks")),
             r_chunk_override=int(_get("r_chunk_size")),
             zct_stage_cap_gb=zct_stage_cap_gb,
             # ISDF

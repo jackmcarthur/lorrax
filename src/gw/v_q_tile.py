@@ -41,18 +41,26 @@ tiles are ``same_zeta=False`` instantiations.  The 5-D μ-XY-sharded FFT
 helper, the two one-axis gathers, the local gemm, and the DUS write are
 shared verbatim — no per-case forks.
 
-API note (v_per_G_fn vs sqrt_v_batch)
--------------------------------------
-The kernel takes the *un-sqrt'd* v(q+G) on the sphere (shape
-``(Q, n_G_sph)``, c128 on the PSD support), and computes
-``sqrt(v_per_G)`` inside before multiplying onto each side.  This matches
-the bispinor extension where the caller may want to project v(K) by the
-transverse projector P^T_ij(K) (still PSD per-G as a scalar, since v > 0
-on the support and P^T has eigenvalues {0, 1}) before passing it in.
-For the V^{0,0} case the caller hands in the same v_per_G the old kernel
-computed internally — the only change is where the sqrt lives.  Bit
-equivalence with the old Case A/B kernels is documented in the refactor
-report.
+API note (v_per_G_fn — one-sided weight)
+-----------------------------------------
+The kernel takes ``v_per_G_batch`` of shape ``(Q, n_G_sph)`` c128 and
+applies it ONCE on the left side of the contraction:
+
+    V_block(μ, ν) = Σ_G  conj(ζ_L(G) · v(K))  ζ_R(G)
+                  = Σ_G  conj(ζ_L(G))  v*(K)  ζ_R(G)
+
+For the V^{0,0} self-contraction the caller passes a real, non-negative
+``v(q+G)`` and the result is mathematically identical to the
+symmetric-√v form ``conj(√v ζ_L) · √v ζ_R`` (the half-sqrt is just
+factored to the L side).  For the bispinor V^{μ_L, ν_L} off-diagonal
+tiles (``μ_L ≠ ν_L``) the projector ``v(K) · (-K̂_i K̂_j)`` is signed and
+non-PSD per-G, but the one-sided multiply still yields the correct
+real V_block (because ``v`` is real, ``conj(v) == v`` and the einsum
+reduces to ``Σ_G v(K) · conj(ζ_L) · ζ_R``).
+
+The old symmetric-√v form would have crashed (``sqrt`` of a negative)
+or silently produced garbage on the off-diagonal projector blocks; the
+one-sided form is correct for any real-valued (signed) weight.
 """
 
 from functools import partial
@@ -82,12 +90,25 @@ def _choose_v_q_chunks(
     budget_bytes: float,
     p_x: int,
     p_y: int,
+    n_rtot: int | None = None,
 ) -> dict:
     """Pick (q_chunk, μ_chunk) per the memory model documented in the
     long Design comment in ``v_q_driver``.
 
     Subtracts the V_ref/g0_ref accumulator bytes from the total budget
     FIRST, then sizes the compute-transient portion of the budget.
+
+    Parameters
+    ----------
+    n_rmu, n_G, n_q_total : int
+        Centroid count, sphere-G count (post-cutoff), kgrid prod.
+    n_rtot : int | None
+        Full real-space grid size = ``nx*ny*nz``.  When provided, the
+        chooser adds an n_rtot-shaped term to the per-q footprint to
+        account for the disk-read ζ slab that lives concurrently with
+        the post-FFT G-sphere slab.  Setting ``n_rtot=None`` recovers
+        the legacy n_G-only model (used by callers that haven't been
+        plumbed yet).
 
     Returns a dict with keys:
         q_chunk       : int — number of q per sharded-compute call
@@ -114,20 +135,37 @@ def _choose_v_q_chunks(
     # sqrt_v(q+G) table lives replicated on each rank.
     v_per_q_bytes = N_zeta * n_G
 
-    # Per-q compute footprint: nominally (two gathered ζ copies +
-    # workspace) = 3 × μ × G / P_min.  Empirical AOT measurement
-    # across (MoS2, Si 10³) × (4, 8, 16, 28, 35 GB) showed a consistent
-    # 1.45× under-prediction — the FFT+gather pipeline holds additional
-    # XLA-scheduled transients we can't enumerate without HLO.  Bumping
-    # the coefficient to 4.4× matches AOT peak to within ~5%.
+    # Per-q compute footprint, in two parts:
+    #   (a) post-FFT G-sphere slab (μ × n_G / p_min) — the working set
+    #       of the contraction kernel.  Coefficient ``Q_COMPUTE_COEF``
+    #       absorbs FFT-side transients on top of the nominal
+    #       2 × ζ_X + ζ_Y replicas.
+    #   (b) pre-FFT n_rtot disk-read slab (μ × n_rtot / p_prod, sharded
+    #       on ('x','y')).  Lives concurrently with (a) for at least
+    #       one buffer's worth — XLA pipelines these — so we add the
+    #       worst-case single buffer.
+    # Empirical AOT measurement across (MoS2, Si 10³) × (4, 8, 16, 28,
+    # 35 GB) showed Q_COMPUTE_COEF ≈ 4.4 matches the peak to within
+    # ~5% when n_rtot ≈ n_G (older Si runs); on MoS2 / CrI3 where
+    # n_rtot/n_G ≈ 8–16× the legacy model under-predicted because the
+    # disk-read slab dominates the post-FFT slab.
     Q_COMPUTE_COEF = 4.4
+    if n_rtot is None or int(n_rtot) <= 0:
+        rtot_per_q_bytes = 0.0
+    else:
+        # μ × n_rtot / p_prod, single concurrent disk-read buffer.
+        rtot_per_q_bytes = N_zeta * n_rmu * float(n_rtot) / p_prod
     # Case A check: can we hold *one* q's worth of gathered μ×G?
-    one_q_bytes = Q_COMPUTE_COEF * N_zeta * n_rmu * n_G / p_min
+    one_q_bytes = Q_COMPUTE_COEF * N_zeta * n_rmu * n_G / p_min + rtot_per_q_bytes
     slack_after_one_q = B_compute - (one_q_bytes + v_per_q_bytes)
     if slack_after_one_q < 0:
         # Case B — single q, tile μ×ν.
         # Two concurrent gathered slabs of (μ_chunk × N_G) plus a small
         # contract workspace:  2·N_zeta·μ_chunk·N_G / p_min ≤ B_compute − v_per_q
+        # In Case B the disk-read slab is per-tile (size μ_chunk × n_rtot
+        # / p_prod) which is small for the tile sizes we expect, so the
+        # n_rtot term doesn't drive μ_chunk down here.  We still budget
+        # for it via a fixed per-tile reservation below.
         mu_chunk_max = max(
             1, int((B_compute - v_per_q_bytes) * p_min /
                    (2.0 * N_zeta * n_G)))
@@ -165,7 +203,11 @@ def _choose_v_q_chunks(
             mu_chunk = max(snap, mu_chunk_max - (mu_chunk_max % snap))
 
         n_mu_blocks = (int(n_rmu) + mu_chunk - 1) // mu_chunk
-        peak = 2.0 * N_zeta * mu_chunk * n_G / p_min + v_per_q_bytes + ref_bytes
+        # Case B per-tile peak: 2 ζ-G slabs + per-tile disk slab.
+        rtot_tile_bytes = (N_zeta * mu_chunk * float(n_rtot) / p_prod
+                           if n_rtot is not None and int(n_rtot) > 0 else 0.0)
+        peak = (2.0 * N_zeta * mu_chunk * n_G / p_min + rtot_tile_bytes
+                + v_per_q_bytes + ref_bytes)
         return dict(
             q_chunk=1, mu_chunk=int(mu_chunk), n_mu_blocks=int(n_mu_blocks),
             tiled=True, aligned=aligned,
@@ -193,15 +235,13 @@ _v_q_tile_kernel_cache: dict = {}
 
 def _make_V_q_tile_kernel(
     *,
+    coulomb_kernels,
+    mesh_xy: Mesh,
     q_chunk: int,
     mu_size: int,
     nu_size: int,
     n_rmu_L: int,
     n_rmu_R: int,
-    n_G_sph: int,
-    fft_shape: tuple[int, int, int],
-    sphere_idx: jax.Array | None,
-    mesh_xy: Mesh,
     same_zeta: bool,
     write_g0: bool,
 ):
@@ -209,26 +249,33 @@ def _make_V_q_tile_kernel(
 
     Parameters
     ----------
+    coulomb_kernels : SimpleNamespace
+        The bundle returned by
+        ``coulomb_kernel.make_v_munu_chunked_kernel``.  This kernel
+        consumes three of its fields: ``sphere_idx`` (G-sphere indices
+        into the flat FFT box, or ``None`` if no cutoff), ``n_sph``
+        (post-cutoff G-vector count, == n_G when sphere inactive), and
+        ``fft_shape`` (the (nx, ny, nz) FFT-box dims).  Bundling rather
+        than re-passing keeps the V_q tile call sites consistent with
+        the rest of the chi0/W chain that already threads this
+        namespace.
+    mesh_xy : Mesh
+        2-D device mesh (axes 'x', 'y').
     q_chunk : int
         Number of q-points handled per kernel call.  In Case A this
         equals the q-batch size; in Case B it is always 1.
     mu_size, nu_size : int
-        Block sizes on the left (μ) and right (ν) ζ.  In Case A both
-        equal ``n_rmu_L``/``n_rmu_R`` (full); in Case B they are the
-        chunked sizes (with ``min(mu_chunk, n_rmu - offset)`` for the
-        last partial block).
+        Block sizes on the left (μ) and right (ν) ζ for *this* kernel
+        call — i.e. the per-call shape, which sets the jit cache key.
+        In Case A both equal ``n_rmu_L`` / ``n_rmu_R`` (full); in Case B
+        they are the chunked sizes (with ``min(mu_chunk, n_rmu -
+        offset)`` for the last partial block).
     n_rmu_L, n_rmu_R : int
-        Total μ counts on the left / right ζ.  Equal for V^{0,0}; may
-        differ for bispinor V^{μ_L, ν_L} tiles.
-    n_G_sph : int
-        Sphere size (post-cutoff G-vector count).
-    fft_shape : (nx, ny, nz)
-        FFT box dims.
-    sphere_idx : jnp.int32[n_sph] | None
-        Sphere-pick indices into the flat FFT box.  ``None`` means no
-        cutoff sphere.
-    mesh_xy : Mesh
-        2-D device mesh (axes 'x', 'y').
+        Total μ counts on the left / right ζ — i.e. the *full* extents
+        of the V_acc accumulator.  Distinct from ``mu_size`` /
+        ``nu_size`` (the per-call block sizes); the kernel uses these
+        only to shape the donated V_acc / g0_acc inputs.  Equal for
+        V^{0,0}; may differ for bispinor V^{μ_L, ν_L} tiles.
     same_zeta : bool (static)
         ``True`` when the left and right ζ slabs come from the same file
         AND offsets coincide on the diagonal — the kernel skips the
@@ -254,6 +301,10 @@ def _make_V_q_tile_kernel(
     plus the convenience attributes ``zeta_disk_sh``, ``V_sh``, ``g0_sh``
     used by the driver to allocate input arrays in the right layout.
     """
+    sphere_idx = coulomb_kernels.sphere_idx
+    n_G_sph = coulomb_kernels.n_sph
+    fft_shape = coulomb_kernels.fft_shape
+
     cache_key = (
         'unified', id(mesh_xy), q_chunk, mu_size, nu_size,
         n_rmu_L, n_rmu_R, n_G_sph, tuple(fft_shape),
@@ -292,14 +343,14 @@ def _make_V_q_tile_kernel(
     _local_fftn_3d = make_sharded_fftn_3d(
         mesh_xy, blk_xy_5d_spec, blk_xy_5d_spec)
 
-    def _fft_sphere_weight(zeta_rtot_mu, sqrt_v_batch, phase_batch):
-        """Local transpose + 3-D FFT + sphere pick + √v multiply.
+    def _fft_and_sphere(zeta_rtot_mu, phase_batch):
+        """Local transpose + 3-D FFT + sphere pick (NO v multiply).
 
         Returns ``(zeta_G, g0_blk)`` where ``g0_blk`` is the G=(0,0,0)
         column (shape ``(Q, μ_per_rank)``, μ-XY-sharded) and ``zeta_G``
-        is the post-√v sphere-gathered slab (shape ``(Q, μ_per_rank,
-        n_G_sph)``, μ-XY-sharded).  ``sqrt_v_batch`` is c128 with shape
-        ``(Q, n_G_sph)``.
+        is the sphere-gathered slab (shape ``(Q, μ_per_rank, n_G_sph)``,
+        μ-XY-sharded).  The caller is responsible for applying the v(K)
+        weight on one side of the contraction (see module docstring).
         """
         zeta_mu_r = jax.lax.with_sharding_constraint(
             jnp.transpose(zeta_rtot_mu, (0, 2, 1)), blk_xy_sh)
@@ -315,8 +366,7 @@ def _make_V_q_tile_kernel(
             zeta_G = jnp.take(zeta_box, sphere_idx, axis=-1)
         else:
             zeta_G = zeta_box
-        zeta_G = jax.lax.with_sharding_constraint(
-            zeta_G * sqrt_v_batch[:, None, :], blk_xy_sh)
+        zeta_G = jax.lax.with_sharding_constraint(zeta_G, blk_xy_sh)
         return zeta_G, g0_blk
 
     if same_zeta:
@@ -332,19 +382,21 @@ def _make_V_q_tile_kernel(
                     zeta_mu_disk,
                     v_per_G_batch, phase_batch,
                     q_lo_dyn, mu_lo_dyn, nu_lo_dyn):
-            # Take √v on the real values (PSD on the support — caller
-            # promises ``v_per_G_batch`` is real and ≥ 0).  Casting first
-            # to real then taking sqrt is bit-identical to the old
-            # legacy path which did sqrt on a real ``v_scaled`` array
-            # before casting to c128.
-            v_real = jnp.real(v_per_G_batch)
-            sqrt_v_batch = jnp.sqrt(v_real).astype(jnp.complex128)
-            zeta_G, g0_mu = _fft_sphere_weight(
-                zeta_mu_disk, sqrt_v_batch, phase_batch)
+            # FFT + sphere only — no v multiply yet (see module docstring,
+            # API note: v is applied on one side of the contraction).
+            zeta_G, g0_mu = _fft_and_sphere(zeta_mu_disk, phase_batch)
 
             # Two one-axis gathers from the same post-FFT tensor.
             zeta_mu_X = jax.lax.with_sharding_constraint(zeta_G, blk_x_sh)
             zeta_nu_Y = jax.lax.with_sharding_constraint(zeta_G, blk_y_sh)
+
+            # One-sided v(K) multiply on the L (μ) side.  Mathematically
+            # identical to symmetric-√v for real, non-negative v — the
+            # only difference is that this form also handles the signed,
+            # non-PSD transverse-projector weight v(K) · (-K̂_i K̂_j) used
+            # by the bispinor V^{μ_L, ν_L} (μ_L ≠ ν_L) tiles.
+            zeta_mu_X = jax.lax.with_sharding_constraint(
+                zeta_mu_X * v_per_G_batch[:, None, :], blk_x_sh)
 
             V_block = jnp.einsum('qmG,qnG->qmn',
                                  jnp.conj(zeta_mu_X), zeta_nu_Y,
@@ -384,22 +436,21 @@ def _make_V_q_tile_kernel(
                     zeta_mu_disk, zeta_nu_disk,
                     v_per_G_batch, phase_batch,
                     q_lo_dyn, mu_lo_dyn, nu_lo_dyn):
-            # Take √v on the real values (PSD on the support — caller
-            # promises ``v_per_G_batch`` is real and ≥ 0).  Casting first
-            # to real then taking sqrt is bit-identical to the old
-            # legacy path which did sqrt on a real ``v_scaled`` array
-            # before casting to c128.
-            v_real = jnp.real(v_per_G_batch)
-            sqrt_v_batch = jnp.sqrt(v_real).astype(jnp.complex128)
-            zeta_mu_G, _ = _fft_sphere_weight(
-                zeta_mu_disk, sqrt_v_batch, phase_batch)
-            zeta_nu_G, _ = _fft_sphere_weight(
-                zeta_nu_disk, sqrt_v_batch, phase_batch)
+            # FFT + sphere only — no v multiply yet (see module docstring,
+            # API note: v is applied on one side of the contraction).
+            zeta_mu_G, _ = _fft_and_sphere(zeta_mu_disk, phase_batch)
+            zeta_nu_G, _ = _fft_and_sphere(zeta_nu_disk, phase_batch)
 
             # One-axis gathers: μ side → μ only X-sharded; ν side → ν only
             # Y-sharded.
             zeta_mu_X = jax.lax.with_sharding_constraint(zeta_mu_G, blk_x_sh)
             zeta_nu_Y = jax.lax.with_sharding_constraint(zeta_nu_G, blk_y_sh)
+
+            # One-sided v(K) multiply on the L (μ) side — handles the
+            # signed transverse-projector weight v(K) · (-K̂_i K̂_j) used
+            # by bispinor off-diagonal tiles.
+            zeta_mu_X = jax.lax.with_sharding_constraint(
+                zeta_mu_X * v_per_G_batch[:, None, :], blk_x_sh)
 
             V_block = jnp.einsum('qmG,qnG->qmn',
                                  jnp.conj(zeta_mu_X), zeta_nu_Y,
@@ -425,17 +476,15 @@ def _make_V_q_tile_kernel(
 
 def compute_V_q_tile(
     *,
+    coulomb_kernels,
     zeta_L_io,
     zeta_R_io,
     v_per_G_fn,
     phase_fn,
-    sphere_idx,
     mesh_xy: Mesh,
     kgrid: tuple[int, int, int],
-    fft_grid: tuple[int, int, int],
     n_rmu_L: int,
     n_rmu_R: int,
-    n_rtot: int,
     V_acc,
     g0_acc=None,
     chooser_choice: dict | None = None,
@@ -454,33 +503,36 @@ def compute_V_q_tile(
 
     Parameters
     ----------
+    coulomb_kernels : SimpleNamespace
+        The bundle returned by
+        ``coulomb_kernel.make_v_munu_chunked_kernel``.  Used here to
+        derive ``sphere_idx`` (G-sphere indices into the flat FFT box,
+        or ``None`` when no cutoff), ``fft_shape`` (FFT-box dims), and
+        the implied ``n_rtot = prod(fft_shape)``; passed straight
+        through to ``_make_V_q_tile_kernel``.
     zeta_L_io, zeta_R_io : SlabIO
         Open SlabIO handles for the left / right ζ files.  When both
         are the same object (``zeta_L_io is zeta_R_io``) the kernel
         runs in single-zeta mode (one FFT, two gathers) — this is the
         V^{0,0} self-contraction case.
     v_per_G_fn : callable(qvec_batch_np) -> jnp.ndarray (Q, n_G_sph) c128
-        Returns the *un-sqrt'd* v(q+G) on the sphere for a batch of
-        q-vectors.  Caller's responsibility to ensure values are PSD
-        (≥ 0); the kernel takes ``sqrt`` once and applies symmetrically
-        to both halves.  For V^{0,0} this is the standard
-        ``v(q+G)`` from the Coulomb kernel; for bispinor V^{μ_L, ν_L}
-        it is ``v(K) · P^T_ij(K)`` (still PSD per-G — see module docstring).
+        Returns the per-G weight applied on the L side of the
+        contraction (see module docstring).  Any complex-valued weight
+        is allowed (signed, non-PSD); the kernel multiplies it once on
+        the μ side before the einsum.  For V^{0,0} this is just
+        ``v(q+G)`` (real, ≥ 0) and the math is bit-identical to the
+        old symmetric-√v form.  For bispinor V^{μ_L, ν_L} it is
+        ``v(K) · t_{μ_L, ν_L}(K)`` where ``t`` is the (signed)
+        transverse-projector entry — see ``v_q_lorentz``.
     phase_fn : callable(qvec_batch_np) -> jnp.ndarray (Q, 1, nx, ny, nz) c128
         Returns the per-q phase factor ``exp(-2πi q·r)`` on the FFT
         box.  Independent of the v-side (factored out of the kernel
         bundle).
-    sphere_idx : jnp.int32[n_sph] | None
-        G-sphere indices into the flat FFT box (caller obtains from
-        ``coulomb_kernel.make_v_munu_chunked_kernel(...).sphere_idx``).
     mesh_xy : Mesh
         2-D device mesh.
     kgrid : (nkx, nky, nkz)
-    fft_grid : (nx, ny, nz)
     n_rmu_L, n_rmu_R : int
         Total μ counts on the left / right ζ.
-    n_rtot : int
-        nx · ny · nz.
     V_acc : jnp.ndarray, shape (n_q_total, n_rmu_L, n_rmu_R), P(None, 'x', 'y')
         Donated mutable accumulator.  The kernel performs DUS writes
         into it.  Caller pre-allocates with ``jnp.zeros`` of the right
@@ -530,6 +582,11 @@ def compute_V_q_tile(
     p_x = int(mesh_xy.shape['x'])
     p_y = int(mesh_xy.shape['y'])
 
+    # Derive geometry from the Coulomb kernel bundle.
+    sphere_idx = coulomb_kernels.sphere_idx
+    fft_grid = coulomb_kernels.fft_shape
+    n_rtot = int(np.prod(fft_grid))
+
     same_zeta = (zeta_L_io is zeta_R_io)
 
     # The caller must shape n_rmu_L == n_rmu_R for the V^{0,0} case to
@@ -561,6 +618,7 @@ def compute_V_q_tile(
         chooser_choice = _choose_v_q_chunks(
             n_rmu=max(n_rmu_L, n_rmu_R), n_G=n_G_sph, n_q_total=nq_total,
             budget_bytes=budget_bytes, p_x=p_x, p_y=p_y,
+            n_rtot=n_rtot,
         )
 
     tiled = bool(chooser_choice['tiled'])
@@ -622,10 +680,10 @@ def compute_V_q_tile(
             for batch in batches:
                 actual = len(batch)
                 kernel = _make_V_q_tile_kernel(
+                    coulomb_kernels=coulomb_kernels,
+                    mesh_xy=mesh_xy,
                     q_chunk=actual, mu_size=n_rmu_L, nu_size=n_rmu_R,
                     n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R,
-                    n_G_sph=n_G_sph, fft_shape=fft_grid,
-                    sphere_idx=sphere_idx, mesh_xy=mesh_xy,
                     same_zeta=same_zeta,
                     write_g0=(same_zeta and g0_acc is not None))
                 qvecs = [_qvec_wrap(*c) for c in batch]
@@ -700,10 +758,10 @@ def compute_V_q_tile(
                                 # Reuse the μ slab as the ν slab too
                                 # (identical offsets).  Single-FFT path.
                                 k = _make_V_q_tile_kernel(
+                                    coulomb_kernels=coulomb_kernels,
+                                    mesh_xy=mesh_xy,
                                     q_chunk=1, mu_size=mu_size, nu_size=nu_size,
                                     n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R,
-                                    n_G_sph=n_G_sph, fft_shape=fft_grid,
-                                    sphere_idx=sphere_idx, mesh_xy=mesh_xy,
                                     same_zeta=True, write_g0=do_write_g0)
                                 V_acc, g0_acc_filled = k(
                                     V_acc,
@@ -722,10 +780,10 @@ def compute_V_q_tile(
                                     offset=(q_flat, 0, nu_lo),
                                     mesh=mesh_xy, partition_spec=_read_spec)
                                 k = _make_V_q_tile_kernel(
+                                    coulomb_kernels=coulomb_kernels,
+                                    mesh_xy=mesh_xy,
                                     q_chunk=1, mu_size=mu_size, nu_size=nu_size,
                                     n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R,
-                                    n_G_sph=n_G_sph, fft_shape=fft_grid,
-                                    sphere_idx=sphere_idx, mesh_xy=mesh_xy,
                                     same_zeta=False, write_g0=False)
                                 V_acc, _ = k(
                                     V_acc,

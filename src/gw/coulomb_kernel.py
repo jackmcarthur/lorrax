@@ -552,11 +552,41 @@ def make_v_munu_chunked_kernel(
         """FFT + weight, returning the weighted zeta for reuse in off-diagonal blocks."""
         return fft_and_weight_inner(zeta_r, sqrt_v, phase)
 
+    # K_cart helper for the bispinor V_q Lorentz driver.
+    # Returns (q+G)_cart in Bohr⁻¹ on the post-cutoff sphere (or full
+    # FFT box when sphere inactive).  Same convention as the internal
+    # ``_v_scaled_*`` helpers (G_cart_base + q_cart, with q_cart =
+    # q_frac @ bvec_j).  Only available for sys_dim ∈ {2, 3}; sys_dim=0
+    # has q ≡ 0 and a numerical Coulomb so K_cart isn't meaningful.
+    if sys_dim in (2, 3):
+        @jax.jit
+        def get_K_cart_on_sphere(qvec_wrapped: jax.Array) -> jax.Array:
+            """Return K_cart = (q+G)_cart in Bohr⁻¹, shape (n_sph, 3).
+
+            Used by the bispinor V^{μ_L, ν_L} driver
+            (``v_q_lorentz``) to build the transverse-projector
+            weight ``v(K) · (-K̂_i K̂_j)`` etc.
+            """
+            q_frac = jnp.asarray((
+                qvec_wrapped[0] / nkx_f,
+                qvec_wrapped[1] / nky_f,
+                qvec_wrapped[2] / nkz_f,
+            ), dtype=jnp.float64)
+            q_cart = jnp.einsum('a,ab->b', q_frac, bvec_j, optimize=True)
+            G_full = G_cart_base + q_cart.reshape((1, 1, 1, 3))
+            G_full = G_full.reshape(-1, 3)
+            if sphere_idx is not None:
+                return jnp.take(G_full, sphere_idx, axis=0)
+            return G_full
+    else:
+        get_K_cart_on_sphere = None
+
     # Bundle kernels
     from types import SimpleNamespace
     kernels = SimpleNamespace(
         get_sqrt_v_and_phase=get_sqrt_v_and_phase,
         get_v_per_G_and_phase=get_v_per_G_and_phase,  # un-sqrt'd v + phase, used by v_q_tile
+        get_K_cart_on_sphere=get_K_cart_on_sphere,  # bispinor projector K̂ (sys_dim ∈ {2,3})
         fft_and_weight=fft_and_weight,  # JIT'd for standalone/chunked use
         fft_and_weight_inner=fft_and_weight_inner,  # non-JIT'd for nested use
         contract_block=contract_block,  # JIT'd for standalone/chunked use

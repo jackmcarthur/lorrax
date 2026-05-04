@@ -235,7 +235,9 @@ def read_Gvecs_to_devices(
                 cnk_batch = sym.get_cnk_fullzone_batch(wfn, owned_band_indices, k_idx)
                 psi_Gspace_all[k_local, local_band_indices, 0:meta.nspinor_wfnfile, :ngk] = cnk_batch
 
-            # Expand to 4 components if requested
+            # Expand to 4 components if requested.  ``wfn.bvec`` is the
+            # raw BGW HDF5 array in 2π/alat units; the lift converts to
+            # Bohr⁻¹ internally using ``wfn.alat``.
             if bispinor:
                 psi_Gspace_local = psi_Gspace_all[k_local, :, :, :ngk]
                 psi_Gspace_all[k_local, :, 2:4, :ngk] = np.asarray(get_small_psi_component(
@@ -243,6 +245,7 @@ def read_Gvecs_to_devices(
                     jnp.asarray(sym.unfolded_kpts[k_idx], dtype=jnp.float64),
                     jnp.asarray(wfn.bvec, dtype=jnp.float64),
                     jnp.asarray(psi_Gspace_local),
+                    float(wfn.alat),
                 ))
     
     # Phase 2: Scatter to FFT box (NumPy advanced indexing)
