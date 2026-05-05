@@ -833,8 +833,9 @@ def read_zeta_q_sharded(
 # Full V_q computation pipeline with all q-points
 # ============================================================================
 
-def compute_all_V_q_from_zeta_h5(
+def _compute_all_V_q_replicated(
     zeta_io,
+    *,
     kgrid: tuple[int, int, int],
     fft_grid: tuple[int, int, int],
     bvec: np.ndarray,
@@ -891,7 +892,7 @@ def compute_all_V_q_from_zeta_h5(
     # doesn't currently expose dataset introspection.
     if n_rmu is None or n_rtot is None:
         raise ValueError(
-            "compute_all_V_q_from_zeta_h5: n_rmu / n_rtot must be provided; "
+            "_compute_all_V_q_replicated: n_rmu / n_rtot must be provided; "
             "SlabIO doesn't expose dataset-shape introspection yet.")
     
     nq_total = nkx * nky * nkz
@@ -1695,7 +1696,76 @@ def _make_V_q_caseB_kernel(
     return _kernel
 
 
-def compute_all_V_q_sharded(
+def compute_all_V_q(
+    zeta_io,
+    *,
+    kgrid: tuple[int, int, int],
+    fft_grid: tuple[int, int, int],
+    bvec: np.ndarray,
+    cell_volume: float,
+    mesh_xy: Mesh,
+    n_rmu: int,
+    n_rtot: int,
+    sys_dim: int = 2,
+    bdot: np.ndarray | None = None,
+    mc_average_vcoul_body: bool = True,
+    bare_coulomb_cutoff: float | None = None,
+    bgw_v_grid_fn=None,
+    mu_chunk_size: int | None = None,
+    q_batch_size: int | None = None,
+    budget_bytes: float | None = None,
+    verbose: bool = True,
+) -> tuple[jax.Array, jax.Array]:
+    """Compute ``V_qmunu`` (and ``G0_mu`` at q=0) from a sharded ζ HDF5.
+
+    Single entry point for the V_q stage; routes to the right backend
+    kernel based on how ``zeta_io`` was opened:
+
+    * :attr:`SlabIOBackend.PHDF5_FFI` → :func:`_compute_all_V_q_sharded`.
+      Mesh-parallel FFI reads land ζ directly in μ-on-(x,y) layout;
+      one outer jit per ``budget_bytes``-sized r/q block.
+    * :attr:`SlabIOBackend.H5PY_ALLGATHER` → :func:`_compute_all_V_q_replicated`.
+      ζ is read fully replicated by rank 0; μ-chunked + optionally
+      q-batched per chunk.
+
+    The caller doesn't pick the backend — opening the SlabIO already did.
+    Pass ``mu_chunk_size`` / ``q_batch_size`` for the replicated path, or
+    ``budget_bytes`` for the sharded path; the irrelevant ones are
+    silently ignored.
+    """
+    from gw.gw_config import SlabIOBackend
+    if zeta_io.backend is SlabIOBackend.PHDF5_FFI:
+        return _compute_all_V_q_sharded(
+            zeta_io,
+            kgrid=kgrid, fft_grid=fft_grid,
+            bvec=bvec, cell_volume=cell_volume,
+            mesh_xy=mesh_xy,
+            n_rmu=n_rmu, n_rtot=n_rtot,
+            sys_dim=sys_dim, bdot=bdot,
+            mc_average_vcoul_body=mc_average_vcoul_body,
+            bare_coulomb_cutoff=bare_coulomb_cutoff,
+            bgw_v_grid_fn=bgw_v_grid_fn,
+            budget_bytes=budget_bytes,
+            verbose=verbose,
+        )
+    if mu_chunk_size is None:
+        mu_chunk_size = n_rmu  # single-chunk default for the replicated path
+    return _compute_all_V_q_replicated(
+        zeta_io,
+        kgrid=kgrid, fft_grid=fft_grid,
+        bvec=bvec, cell_volume=cell_volume,
+        mu_chunk_size=mu_chunk_size,
+        mesh_xy=mesh_xy, sys_dim=sys_dim,
+        q_batch_size=q_batch_size,
+        verbose=verbose, bdot=bdot,
+        mc_average_vcoul_body=mc_average_vcoul_body,
+        bare_coulomb_cutoff=bare_coulomb_cutoff,
+        bgw_v_grid_fn=bgw_v_grid_fn,
+        n_rmu=n_rmu, n_rtot=n_rtot,
+    )
+
+
+def _compute_all_V_q_sharded(
     zeta_io,
     kgrid: tuple[int, int, int],
     fft_grid: tuple[int, int, int],

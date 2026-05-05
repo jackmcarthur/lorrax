@@ -593,10 +593,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	Returns (V_qmunu, G0) where V_qmunu has shape (1, npol, npol, nkx, nky, nkz, μ, μ)
 	and G0 is (n_rmu,) ζ_μ(G=0) at q=0.
 	"""
-	from .compute_vcoul import (
-		compute_all_V_q_from_zeta_h5,
-		compute_all_V_q_sharded,
-	)
+	from .compute_vcoul import compute_all_V_q
 
 	if jax.process_index() == 0:
 		os.sync()
@@ -623,7 +620,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	# get_device_memory_info reports this rank's free HBM, which can
 	# differ across ranks (pool fragmentation, non-symmetric allocations
 	# before this point) → mu_chunk + q_batch can diverge across ranks.
-	# compute_all_V_q_from_zeta_h5 then branches on (n_chunks == 1) at
+	# _compute_all_V_q_replicated then branches on (n_chunks == 1) at
 	# line ~884; divergent branches across ranks deadlock on the first
 	# collective inside one branch (observed 2026-04-18 w/ FFI read).
 	# Fix: broadcast rank 0's numbers to every rank so they agree.
@@ -650,44 +647,31 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		print_fn(f"    V_q q batches: {q_batch}")
 
 	from file_io.slab_io import SlabIO
-	# Sharded path = default: ``compute_all_V_q_sharded`` runs each q-batch
-	# as one big jit (fit_one_rchunk-style) with sharded FFI reads landing
-	# ζ directly in μ-on-('x','y') layout — FFT + gathers + gemm all stay
-	# mesh-parallel.  Fallback to the replicated ``compute_all_V_q_from_zeta_h5``
-	# when FFI phdf5 isn't available (single-GPU sandbox builds, h5py-only
-	# backend).
-	from .gw_config import SlabIOBackend
-	use_sharded_v_q = (cfg.backend.slab_io is SlabIOBackend.PHDF5_FFI)
+	# Single dispatcher: ``compute_all_V_q`` selects the right kernel from
+	# the SlabIO backend (PHDF5_FFI → mesh-parallel ζ reads + outer jit,
+	# H5PY_ALLGATHER → replicated rank-0 read with μ-chunking + optional
+	# q-batching).
 	with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
 		with SlabIO(zeta_h5_path, mode='r', mesh=mesh_xy,
 		            backend=cfg.backend.slab_io) as zeta_io:
 			with mesh_xy:
-				if use_sharded_v_q:
-					V_q_raw, G0_all = compute_all_V_q_sharded(
-						zeta_io, kgrid=meta.kgrid, fft_grid=meta.fft_grid,
-						bvec=bvec, cell_volume=meta.cell_volume,
-						mesh_xy=mesh_xy,
-						n_rmu=meta.n_rmu, n_rtot=meta.n_rtot,
-						sys_dim=meta.sys_dim,
-						bdot=np.asarray(wfn.bdot, dtype=np.float64) if meta.sys_dim == 0 else None,
-						mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
-						bare_coulomb_cutoff=vcoul_cutoff_ry,
-						bgw_v_grid_fn=bgw_v_grid_fn,
-						budget_bytes=m_budget,
-					)
-				else:
-					V_q_raw, G0_all = compute_all_V_q_from_zeta_h5(
-						zeta_io, kgrid=meta.kgrid, fft_grid=meta.fft_grid,
-						bvec=bvec, cell_volume=meta.cell_volume,
-						mu_chunk_size=mu_chunk, mesh_xy=mesh_xy,
-						sys_dim=meta.sys_dim,
-						q_batch_size=q_batch if mu_chunk >= meta.n_rmu else None,
-						bdot=np.asarray(wfn.bdot, dtype=np.float64) if meta.sys_dim == 0 else None,
-						mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
-						bare_coulomb_cutoff=vcoul_cutoff_ry,
-						bgw_v_grid_fn=bgw_v_grid_fn,
-						n_rmu=meta.n_rmu, n_rtot=meta.n_rtot,
-					)
+				V_q_raw, G0_all = compute_all_V_q(
+					zeta_io,
+					kgrid=meta.kgrid, fft_grid=meta.fft_grid,
+					bvec=bvec, cell_volume=meta.cell_volume,
+					mesh_xy=mesh_xy,
+					n_rmu=meta.n_rmu, n_rtot=meta.n_rtot,
+					sys_dim=meta.sys_dim,
+					bdot=np.asarray(wfn.bdot, dtype=np.float64)
+						if meta.sys_dim == 0 else None,
+					mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
+					bare_coulomb_cutoff=vcoul_cutoff_ry,
+					bgw_v_grid_fn=bgw_v_grid_fn,
+					mu_chunk_size=mu_chunk,
+					q_batch_size=(q_batch if mu_chunk >= meta.n_rmu
+					              else None),
+					budget_bytes=m_budget,
+				)
 
 	# Write G0 = ζ_μ(G=0) at q=0 back to zeta file via SlabIO's deferred
 	# attr path (small; rank-0-only after MPI-IO file is closed).
