@@ -421,10 +421,55 @@ def make_v_munu_chunked_kernel(
                 sqrt_v = sqrt_v.reshape(-1)[sphere_idx]  # 1-D for fft_and_weight sphere path
             return sqrt_v, phase
 
+    # ------------------------------------------------------------------
+    # Bispinor-V_q helpers: un-sqrt'd v(K) + K_cart on the sphere.
+    # The bispinor V^{μ_L, ν_L} driver in v_q_lorentz applies v(K) ONE-
+    # SIDED on the L side of the contraction (so it can multiply by the
+    # signed transverse projector ``-K̂_iK̂_j`` without going through a
+    # negative √).  Both helpers are no-ops for sys_dim=0 (q ≡ 0,
+    # numerical Coulomb).  See ``v_q_tile`` module docstring (API note).
+    # ------------------------------------------------------------------
+    @jax.jit
+    def get_v_per_G_and_phase(qvec_wrapped: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """Return (v(q+G), phase) on the sphere — un-sqrt'd v in c128.
+
+        Mirrors ``get_sqrt_v_and_phase`` but returns ``v`` (real ≥ 0)
+        instead of ``√v``.  Reuses the same factory closure to keep
+        the v-construction logic in a single place.
+        """
+        sqrt_v, phase = get_sqrt_v_and_phase(qvec_wrapped)
+        # sqrt_v is real-valued in c128 (zeros where v ≤ 0 from cutoff);
+        # squaring recovers v exactly.  No imag part, no sign flip.
+        v_per_G = sqrt_v * sqrt_v
+        return v_per_G, phase
+
+    if sys_dim in (2, 3):
+        @jax.jit
+        def get_K_cart_on_sphere(qvec_wrapped: jax.Array) -> jax.Array:
+            """Return K_cart = (q+G)_cart in Bohr⁻¹, shape (n_sph, 3).
+
+            Used by the bispinor V^{μ_L, ν_L} driver to build the
+            transverse-projector weight ``v(K) · (-K̂_i K̂_j)`` etc.
+            sys_dim=0 path returns None (q ≡ 0; not used for bispinor).
+            """
+            q_frac = jnp.asarray((
+                qvec_wrapped[0] / nkx_f,
+                qvec_wrapped[1] / nky_f,
+                qvec_wrapped[2] / nkz_f,
+            ), dtype=jnp.float64)
+            q_cart = jnp.einsum('a,ab->b', q_frac, bvec_j, optimize=True)
+            G_full = G_cart_base + q_cart.reshape((1, 1, 1, 3))
+            G_full = G_full.reshape(-1, 3)
+            if sphere_idx is not None:
+                return jnp.take(G_full, sphere_idx, axis=0)
+            return G_full
+    else:
+        get_K_cart_on_sphere = None
+
     # NOTE: These are NOT JIT'd - they're meant to be called from an outer JIT
-    # to avoid nested JIT compilation overhead. The outer JIT (_batch_proc or 
+    # to avoid nested JIT compilation overhead. The outer JIT (_batch_proc or
     # the chunked loop) compiles everything together.
-    
+
     def fft_and_weight_inner(
         zeta_r: jax.Array,
         sqrt_v: jax.Array,
@@ -495,6 +540,8 @@ def make_v_munu_chunked_kernel(
     from types import SimpleNamespace
     kernels = SimpleNamespace(
         get_sqrt_v_and_phase=get_sqrt_v_and_phase,
+        get_v_per_G_and_phase=get_v_per_G_and_phase,  # un-sqrt'd v + phase, used by v_q_tile bispinor path
+        get_K_cart_on_sphere=get_K_cart_on_sphere,    # bispinor projector K̂ (sys_dim ∈ {2, 3})
         fft_and_weight=fft_and_weight,  # JIT'd for standalone/chunked use
         fft_and_weight_inner=fft_and_weight_inner,  # non-JIT'd for nested use
         contract_block=contract_block,  # JIT'd for standalone/chunked use
