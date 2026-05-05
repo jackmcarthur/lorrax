@@ -26,7 +26,7 @@ from common.units import RYD_TO_EV
 from common.load_wfns import get_enk_bandrange
 import common.timing as timing
 
-from .gw_config import LorraxConfig
+from .gw_config import ComputeMode, LorraxConfig
 from .gw_driver_helpers import (
     PPMSigmaRuntimeOptions,
     build_ppm_sigma_runtime_options,
@@ -61,8 +61,8 @@ class PPMOutputs:
 
 def _build_probe_quadrature(quad, config, *, print_fn):
     """Return (probe_omega, quad_probe) for the GN (imag) or HL (real) path."""
-    ppm_model = str(config.ppm_model).strip().lower()
-    if ppm_model == "hl":
+    is_hl = config.compute_mode is ComputeMode.HL_PPM
+    if is_hl:
         probe_omega = complex(float(config.ppm_omega_p), 0.0)
         quad_probe = build_real_quadrature(
             quad, float(config.ppm_omega_p),
@@ -94,7 +94,7 @@ def _fit_head_correction(
 
     head_static = head_resolver.at(0.0 + 0.0j)
     omega_h_override = config.ppm_head_omega_h_ry
-    ppm_model = str(config.ppm_model).strip().lower()
+    is_hl = config.compute_mode is ComputeMode.HL_PPM
 
     if omega_h_override is not None:
         # User-supplied head pole Ω_h (e.g. BGW's analytic value).  Static
@@ -105,7 +105,7 @@ def _fit_head_correction(
             f"  PPM head: Ω_h override = {float(omega_h_override):.6f} Ry "
             f"({float(omega_h_override) * RYD_TO_EV:.4f} eV)"
         )
-    elif ppm_model == "hl":
+    elif is_hl:
         # BGW-style analytic head pole: Ω_h² = ω_p² / (1 − ε_head⁻¹).
         # ω_p² = 16π · N_e / V_cell in Ry² (Hartree-AU energies → Ry²
         # has factor 4 → 16π).
@@ -328,8 +328,7 @@ def compute_ppm_sigma_pipeline(
         )
 
     ppm_options = build_ppm_sigma_runtime_options(config, input_dir=input_dir)
-    ppm_model = str(config.ppm_model).strip().lower()
-    label = "HL-PPM" if ppm_model == "hl" else "GN-PPM"
+    label = "HL-PPM" if config.compute_mode is ComputeMode.HL_PPM else "GN-PPM"
     from .gw_output import print_section
     print_section(f"{label} + FREQUENCY-INTEGRATED SIGMA", print_fn)
 

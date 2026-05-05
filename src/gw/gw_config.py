@@ -11,6 +11,7 @@ PPMSigmaRuntimeOptions) are constructed on demand via properties.
 from __future__ import annotations
 
 import configparser
+import enum
 import os
 import re
 from dataclasses import dataclass, field
@@ -19,6 +20,42 @@ from pathlib import Path
 import numpy as np
 
 from common.units import RYD_TO_EV
+
+
+class ComputeMode(str, enum.Enum):
+    """The single axis describing what self-energy is computed.
+
+    Orthogonal to ``self_consistent``: any mode can in principle be wrapped
+    in a fixed-point loop (currently only ``COHSEX`` is wired).
+
+    - ``X_ONLY`` — bare exchange Σ_X = -G·V (no screening, no correlation).
+    - ``COHSEX`` — static screened-exchange + Coulomb-hole.
+    - ``GN_PPM`` — dynamic Σ_c(ω) via GN plasmon-pole (probe at iω_p).
+    - ``HL_PPM`` — dynamic Σ_c(ω) via HL plasmon-pole (probe at real Ω).
+    """
+
+    X_ONLY = "x_only"
+    COHSEX = "cohsex"
+    GN_PPM = "gn_ppm"
+    HL_PPM = "hl_ppm"
+
+    @property
+    def needs_screening(self) -> bool:
+        """True for COHSEX / GN-PPM / HL-PPM; False for bare X."""
+        return self is not ComputeMode.X_ONLY
+
+    @property
+    def is_dynamic(self) -> bool:
+        """True for GN-PPM / HL-PPM; False for static modes."""
+        return self in (ComputeMode.GN_PPM, ComputeMode.HL_PPM)
+
+    @property
+    def ppm_model(self) -> str | None:
+        """``'gn'`` for GN-PPM, ``'hl'`` for HL-PPM, else None."""
+        return {
+            ComputeMode.GN_PPM: "gn",
+            ComputeMode.HL_PPM: "hl",
+        }.get(self)
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +78,14 @@ _DEFAULTS = {
     "sigma_kij_h5_file": "",
     # Core flags
     "restart": True,
+    # ``compute_mode`` is the single axis describing the self-energy ansatz.
+    # ``"auto"`` infers from the legacy ``do_screened`` / ``use_ppm_sigma`` /
+    # ``ppm_model`` flags so existing input files keep working unchanged.
+    # New input files should set ``compute_mode`` explicitly:
+    #   "x_only" | "cohsex" | "gn_ppm" | "hl_ppm".
+    # ``self_consistent`` remains an orthogonal flag (currently only
+    # implemented on top of COHSEX).
+    "compute_mode": "auto",
     "do_screened": True,
     "bispinor": False,
     "do_G0": True,
@@ -165,6 +210,7 @@ _DEFAULTS = {
 
 # Keys whose string values should be lowercased and stripped
 _NORMALIZE_STR = {
+    "compute_mode",
     "wcoul0_source", "screening_method", "minimax_energy_reference",
     "sigma_omega_accumulation", "fermi_reference",
     "isdf_memory_mode",
@@ -325,6 +371,7 @@ class LorraxConfig:
 
     # --- Core flags ---
     restart: bool
+    compute_mode_raw: str   # "auto" | one of ComputeMode.value strings
     do_screened: bool
     bispinor: bool
     do_G0: bool
@@ -419,6 +466,37 @@ class LorraxConfig:
     # ------------------------------------------------------------------
     #  Derived config objects
     # ------------------------------------------------------------------
+
+    @property
+    def compute_mode(self) -> ComputeMode:
+        """Resolve ``compute_mode`` from explicit input or legacy flags.
+
+        ``compute_mode = auto`` (the default) infers from
+        ``do_screened`` / ``use_ppm_sigma`` / ``ppm_model``.  An explicit
+        setting overrides them; the legacy fields are still parsed for
+        back-compat but the enum is the load-bearing axis the driver
+        pivots on.
+        """
+        raw = (self.compute_mode_raw or "auto").strip().lower()
+        if raw == "auto":
+            if self.use_ppm_sigma:
+                if not self.do_screened:
+                    raise ValueError(
+                        "use_ppm_sigma=true requires do_screened=true."
+                    )
+                return (
+                    ComputeMode.HL_PPM
+                    if str(self.ppm_model).strip().lower() == "hl"
+                    else ComputeMode.GN_PPM
+                )
+            return ComputeMode.COHSEX if self.do_screened else ComputeMode.X_ONLY
+        try:
+            return ComputeMode(raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"compute_mode={raw!r} invalid; expected one of: "
+                f"{', '.join(m.value for m in ComputeMode)}, or 'auto'."
+            ) from exc
 
     @property
     def minimax_config(self):
@@ -535,6 +613,7 @@ class LorraxConfig:
             sigma_kij_h5_file=str(_get("sigma_kij_h5_file") or ""),
             # Core flags
             restart=bool(_get("restart")),
+            compute_mode_raw=str(_get("compute_mode") or "auto").strip().lower(),
             do_screened=bool(_get("do_screened")),
             bispinor=bool(_get("bispinor")),
             do_G0=bool(_get("do_G0")),

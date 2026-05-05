@@ -23,7 +23,7 @@ from file_io import (
 )
 from common import symmetry_maps
 from common.load_wfns import get_enk_bandrange
-from .gw_config import LorraxConfig
+from .gw_config import ComputeMode, LorraxConfig
 from .gw_init import (
 	get_effective_chunk_size,
 	prepare_isdf_and_wavefunctions,
@@ -240,11 +240,10 @@ def main(argv=None):
 		write_w0_qmunu_to_h5(tensors_filename, W_q_8d,
 		                     mesh=mesh_xy, use_ffi_io=config.use_ffi_io)
 		head_static = head_resolver.at(0.0 + 0.0j)
-		if config.use_ppm_sigma:
+		if config.compute_mode.is_dynamic:
 			# GN-PPM: probe at iωp on the imaginary axis.
 			# HL-PPM: probe at Ω on the real axis (above all transitions).
-			ppm_model = str(getattr(config, "ppm_model", "gn")).strip().lower()
-			if ppm_model == "hl":
+			if config.compute_mode is ComputeMode.HL_PPM:
 				omega_imp = complex(float(config.ppm_omega_p), 0.0)
 				_omega_grid_entry = float(omega_imp.real)
 			else:
@@ -317,23 +316,23 @@ def main(argv=None):
 	print0(f"  Bare Σ_X diagonal (eV), k=0: "
 	       + "  ".join(f"{sig_x_diag[0, i]:.4f}" for i in range(min(8, sig_x_diag.shape[1]))))
 
-	# ---- GN/HL-PPM: frequency-integrated Σ^c(ω) ----
+	# ---- Mode-pivoted dispatch ----
+	# ``compute_mode`` is the single axis describing the self-energy ansatz
+	# (X_ONLY / COHSEX / GN_PPM / HL_PPM); ``self_consistent`` is orthogonal.
+	# Static COHSEX matrices were already computed above (the bare-X pass
+	# reuses the same kernel), so X_ONLY and COHSEX both fall through with
+	# the existing sig_sx / sig_coh / sig_x.  Dynamic modes go through the
+	# PPM pipeline.
 	#
-	# History note (kept here because it explains a specific decision and is
-	# not yet captured anywhere else): the analytic q→0 head injected at the
-	# end of ``compute_ppm_sigma_pipeline`` was re-added in 2026-04-25 after
-	# being removed in 1542342 (Apr-10).  The original removal was
-	# well-intentioned head-plumbing unification; the analytic injection
-	# was never re-added even though the body integral in
-	# ``compute_sigma_c_ppm_omega_grid`` excludes q=0,G=0.  Magnitude is
-	# ±W^c(0)/(2·V_cell·N_k) on-shell — ~1.24 eV per band on Si 4×4×4 60b.
-	# A 2026-04-24 prior agent (3e8ac4e) had decided not to inject; the
-	# right call is the opposite — see
-	# reports/mos2_kgrid_gnppm_head_convergence_2026-4-10/ which shows BGW
-	# PPM and LORRAX-no-head diverge as 1/√Nk while LORRAX-with-head sits
-	# at the Nk→∞ asymptote.
+	# History note (kept here because it explains a specific decision and
+	# is not yet captured anywhere else): the analytic q→0 head injected
+	# at the end of ``compute_ppm_sigma_pipeline`` was re-added in
+	# 2026-04-25 after being removed in 1542342 (Apr-10).  Magnitude is
+	# ±W^c(0)/(2·V_cell·N_k) on-shell — ~1.24 eV/band on Si 4×4×4 60b.
+	# See reports/mos2_kgrid_gnppm_head_convergence_2026-4-10/.
+	mode = config.compute_mode
 	ppm_outputs = None
-	if config.use_ppm_sigma:
+	if mode.is_dynamic:
 		ppm_outputs = compute_ppm_sigma_pipeline(
 			wfns=wfns,
 			V_q=V_q, W_q=W_q, sig_x=sig_x, sig_h=sig_h,
@@ -355,8 +354,8 @@ def main(argv=None):
 	sigma_total = sig_sx + sig_coh + sig_h
 	kin_ion = load_kin_ion_submatrix(config.kin_ion_file, band_slices.b0, band_slices.b3)
 
-	# PPM diagonal self-consistency and QSGW (rank 0 only)
-	if config.use_ppm_sigma and meta.rank == 0 and sigma_omega_h5_path and os.path.exists(sigma_omega_h5_path):
+	# Dynamic-mode diagonal self-consistency + QSGW (rank 0 only)
+	if mode.is_dynamic and meta.rank == 0 and sigma_omega_h5_path and os.path.exists(sigma_omega_h5_path):
 		H_qp = np.array(kin_ion + sigma_total)
 		H_qp = 0.5 * (H_qp + np.conj(np.swapaxes(H_qp, -1, -2)))
 		E_qp_ev = np.linalg.eigvalsh(H_qp) * RYD_TO_EV
@@ -463,7 +462,7 @@ def main(argv=None):
 	# Σ_c(ω, k, i, j) tensor is in sigma_mnk.h5 for callers that need them.
 	sigma_c_diag_at_dft_ry = (
 		sigma_c_at_dft_ev / RYD_TO_EV
-		if (config.use_ppm_sigma and meta.rank == 0 and sigma_c_at_dft_ev is not None)
+		if (mode.is_dynamic and meta.rank == 0 and sigma_c_at_dft_ev is not None)
 		else None
 	)
 
@@ -479,7 +478,7 @@ def main(argv=None):
 		kin_ion_ry=np.array(kin_ion),
 		band_start=band_slices.b0,
 		band_stop=band_slices.b3,
-		use_ppm=config.use_ppm_sigma,
+		use_ppm=mode.is_dynamic,
 		self_consistent=config.self_consistent,
 		sigma_c_diag_at_dft_ry=sigma_c_diag_at_dft_ry,
 		sigma_xc_at_dft_ev=sigma_xc_at_dft_ev,
