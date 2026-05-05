@@ -10,7 +10,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 jax.config.update("jax_enable_x64", True)
 
-from runtime import init_jax_distributed, fallback_to_cpu_if_no_gpu_backend, nccl_warmup
+from runtime import init_jax_distributed, fallback_to_cpu_if_no_gpu_backend
 init_jax_distributed()
 fallback_to_cpu_if_no_gpu_backend()
 
@@ -28,7 +28,12 @@ from .gw_init import (
 	get_effective_chunk_size,
 	prepare_isdf_and_wavefunctions,
 )
-from .gw_driver_helpers import build_ppm_sigma_runtime_options
+from .gw_driver_helpers import (
+	build_bgw_v_grid_fn,
+	build_ppm_sigma_runtime_options,
+	profile_section,
+	setup_runtime,
+)
 from .w_isdf import (
 	build_static_quadrature,
 	build_imag_quadrature,
@@ -56,10 +61,10 @@ from .qsgw_utils import (
 	build_qsgw_sigma_xc_from_h5,
 )
 from .head_correction import (
+	HeadResolver,
 	compute_static_head_terms_from_sample,
 	format_head_sample_diagnostics,
 	format_static_head_diagnostics,
-	resolve_head_sample,
 )
 from .wavefunction_bundle import BandSlices
 from mixing.acceleration import (
@@ -68,7 +73,6 @@ from mixing.acceleration import (
 from common import Meta, RYD_TO_EV
 from common import jax_profile
 import common.timing as timing
-import contextlib
 import h5py
 
 
@@ -87,17 +91,9 @@ def _build_mesh():
 	return Mesh(np.array(jax.devices()).reshape(gx, total // gx), ['x', 'y'])
 
 
-def _compute_static_head(config, input_dir, wfn, sym, meta, do_screened, print0):
+def _compute_static_head(head_resolver, meta, do_screened, print0):
 	"""Resolve q→0 head and compute exact band-diagonal head terms for COHSEX."""
-	# resolve_head_sample expects a dict-like interface for params
-	head_params = {
-		"wcoul0_source": config.wcoul0_source,
-		"wcoul0_eta": config.wcoul0_eta,
-		"vhead": config.vhead,
-		"whead_0freq": config.whead_0freq,
-		"whead_imfreq": config.whead_imfreq,
-	}
-	head = resolve_head_sample(head_params, input_dir, wfn, sym, meta, print0, omega=0.0+0.0j)
+	head = head_resolver.at(0.0 + 0.0j)
 	print0(format_head_sample_diagnostics(head, include_screened=do_screened))
 	occ_mask = np.arange(meta.nb_sigma, dtype=np.int32) < meta.nelec
 	terms = compute_static_head_terms_from_sample(
@@ -142,37 +138,7 @@ def main(argv=None):
 	mesh_xy = _build_mesh()
 	grid_x, grid_y = mesh_xy.devices.shape
 
-	# Pre-init NCCL communicators for full-mesh + per-axis psums so the
-	# first real collective (seen as a ~1.9 s ``all-reduce-start`` inside
-	# ``jit(_mean)`` during sigma in the 2026-04-23 profile) doesn't eat
-	# a timed section.  No-op single-process.
-	with timing.section("nccl_warmup"):
-		nccl_warmup(mesh_xy)
-
-	# Eagerly init MPI_THREAD_MULTIPLE via the phdf5 FFI so the first
-	# collective H5Fcreate (in zeta_fit_chunked) doesn't pay the
-	# ~400 ms MPI_Init_thread cost on the critical path.  Overlaps
-	# with the JAX compile phases that follow.  No-op if FFI isn't
-	# used; cheap to attempt and swallow errors.
-	if getattr(config, "use_ffi_io", False):
-		try:
-			from ffi.common.ffi_loader import phdf5_init_mpi
-			phdf5_init_mpi()
-		except Exception as _e:
-			print0(f"  [phdf5 init_mpi] skipped: {_e}")
-
-	# Enable JAX persistent compile cache for the WHOLE run (not just
-	# w_isdf / ppm_sigma where it was previously activated).  On a
-	# warm cache this reliably removes ~3 s of XLA compile from the
-	# cold-start path at MoS2 3x3 (measured 2026-04-19, 267 entries
-	# = 1.9 MiB on disk).  Opt-out by setting ISDF_JAX_CACHE_DIR=""
-	# before launch.  Default cache location honours ISDF_JAX_CACHE_DIR
-	# → XDG_CACHE_HOME/isdf_jax_compilation → ~/.cache/isdf_jax_compilation.
-	try:
-		from common.jax_compile_cache import ensure_jax_compile_cache
-		ensure_jax_compile_cache()
-	except Exception as _e:
-		print0(f"  [jax compile cache] skipped: {_e}")
+	setup_runtime(config, mesh_xy, print_fn=print0)
 
 	from .gw_output import print_banner, print_section, print_system_summary, write_results, GWResults
 	print_banner(
@@ -201,42 +167,16 @@ def main(argv=None):
 
 	band_slices = BandSlices.from_band_edges(*meta.band_edges)
 
-	# Optional BGW vcoul override: use BGW's MC-averaged v(q+G) for all G
-	# (LORRAX's internal mc_average_vcoul_body only averages G=0).  This is
-	# purely diagnostic — enables bit-reproducible BGW comparisons.
-	bgw_v_grid_fn = None
-	if config.use_bgw_vcoul:
-		if config.bgw_vcoul_file is None:
-			raise ValueError("use_bgw_vcoul=true requires bgw_vcoul_file to be set")
-		from file_io import read_bgw_vcoul, fill_v_grid_for_q
-		bgw_path = config.bgw_vcoul_file
-		if not os.path.isabs(bgw_path):
-			bgw_path = os.path.join(input_dir, bgw_path)
-		print0(f"  BGW vcoul override: loading {bgw_path}")
-		_bgw_table = read_bgw_vcoul(bgw_path)
-		print0(f"    {_bgw_table.q_fracs.shape[0]} unique q-points, "
-		       f"G counts per q: {[len(g) for g in _bgw_table.G_miller_per_q]}")
-		_cell_vol = float(wfn.cell_volume)
-		_fft_grid = tuple(int(x) for x in wfn.fft_grid)
-		# Reciprocal-space symmetry operators.  BGW's vcoul file only stores
-		# unique IBZ q's; mapping LORRAX's full-BZ q to those requires the
-		# full crystal sym group.  A nosym WFN stores only identity in
-		# mf_header/symmetry/mtrx, so allow pulling the 48 ops from an aux
-		# sym-reduced WFN when provided (bgw_vcoul_sym_wfn).
-		if config.bgw_vcoul_sym_wfn:
-			aux_path = config.bgw_vcoul_sym_wfn
-			if not os.path.isabs(aux_path):
-				aux_path = os.path.join(input_dir, aux_path)
-			with h5py.File(aux_path, "r") as _fsym:
-				_sym_real = np.asarray(_fsym["mf_header/symmetry/mtrx"][:], dtype=np.int32)
-			print0(f"    crystal sym ops loaded from {aux_path}: {_sym_real.shape[0]}")
-			_sym_mats_k = _sym_real.transpose(0, 2, 1).copy()
-		else:
-			_sym_mats_k = np.asarray(sym.sym_mats_k, dtype=np.int32)
-		def bgw_v_grid_fn(q_frac_tuple):
-			return fill_v_grid_for_q(
-				_bgw_table, q_frac_tuple, _fft_grid, _cell_vol,
-				sym_mats_k=_sym_mats_k)
+	# Single resolver for every q→0 head sample we'll need this run; the
+	# COHSEX static head, the W0 restart-flush head, and the PPM dynamic
+	# head all read from the same plumbing (overrides → epshead → s_tensor)
+	# so they share one cache.  See ``head_correction.HeadResolver``.
+	head_resolver = HeadResolver(config, input_dir, wfn, sym, meta, print0)
+
+	# Optional BGW vcoul override (purely diagnostic — bit-reproducible BGW
+	# comparisons).  Returns None when ``use_bgw_vcoul`` is False.
+	bgw_v_grid_fn = build_bgw_v_grid_fn(
+		config, wfn=wfn, sym=sym, input_dir=input_dir, print_fn=print0)
 
 	# ISDF fitting or restart loading
 	timing.reset()
@@ -298,24 +238,16 @@ def main(argv=None):
 	# Downstream consumers (BSE, future Σ-builders) reload these and apply
 	# the rank-1 head update via ``head_correction.apply_q0_head_rank1``.
 	# The ``whead`` axis is length 1 for COHSEX (just static) and length 2
-	# for GN-PPM (static + iω_p). ``vhead``/``whead_*`` cohsex.in overrides
-	# are honoured because ``resolve_head_sample`` consults ``head_params``
-	# first (override path) before falling back to s_tensor/epshead.
+	# for GN-PPM (static + iω_p).  ``vhead``/``whead_*`` cohsex.in overrides
+	# flow through automatically because ``HeadResolver`` consults the
+	# config's override fields first before falling back to s_tensor/epshead.
 	if config.do_screened and os.path.exists(tensors_filename):
 		from file_io import write_w0_qmunu_to_h5, write_head_scalars_to_h5
 		nkx, nky, nkz = (int(x) for x in meta.kgrid)
 		W_q_8d = W_q.reshape(1, 1, 1, nkx, nky, nkz, W_q.shape[-2], W_q.shape[-1])
 		write_w0_qmunu_to_h5(tensors_filename, W_q_8d,
 		                     mesh=mesh_xy, use_ffi_io=config.use_ffi_io)
-		head_params = {
-			"wcoul0_source": config.wcoul0_source,
-			"wcoul0_eta": config.wcoul0_eta,
-			"vhead": config.vhead,
-			"whead_0freq": config.whead_0freq,
-			"whead_imfreq": config.whead_imfreq,
-		}
-		head_static = resolve_head_sample(
-			head_params, input_dir, wfn, sym, meta, print0, omega=0.0+0.0j)
+		head_static = head_resolver.at(0.0 + 0.0j)
 		if config.use_ppm_sigma:
 			# GN-PPM: probe at iωp on the imaginary axis.
 			# HL-PPM: probe at Ω on the real axis (above all transitions).
@@ -326,8 +258,7 @@ def main(argv=None):
 			else:
 				omega_imp = 1j * float(config.ppm_omega_p)
 				_omega_grid_entry = float(omega_imp.imag)
-			head_imag = resolve_head_sample(
-				head_params, input_dir, wfn, sym, meta, print0, omega=omega_imp)
+			head_imag = head_resolver.at(omega_imp)
 			whead_arr = np.array(
 				[head_static.wcoul0, head_imag.wcoul0], dtype=np.complex128)
 			omega_grid = np.array([0.0, _omega_grid_entry], dtype=np.float64)
@@ -359,7 +290,7 @@ def main(argv=None):
 	static_head_terms = None
 	if config.do_G0:
 		static_head_terms = _compute_static_head(
-			config, input_dir, wfn, sym, meta, config.do_screened, print0)
+			head_resolver, meta, config.do_screened, print0)
 
 	# ---- Static COHSEX: Σ_SX, Σ_COH, V_H + bare Σ_X ----
 	import gc; gc.collect()
@@ -472,34 +403,16 @@ def main(argv=None):
 			# reference so XLA can reclaim its (nq, μ, μ) c128 buffer.
 			del Wiwp_q
 
-			# Frequency-integrated Σ^c(ω)
-			# Temporary profiling hooks: pf.region + pre/post snapshots bracket the sigma PPM call
-			try:
-				import sys as _sys
-				_sys.path.insert(0, "/pscratch/sd/j/jackm/lorrax_sandbox/scripts/profiling")
-				import pf as _pf
-				_pf_art = os.environ.get("PF_ARTIFACTS_DIR", "profile")
-				_pf.snapshot_memory(f"{_pf_art}/memprof/sigma_ppm_pre.prof", label="sigma_ppm_pre")
-			except Exception as _e:
-				_pf = None
-				print0(f"  [pf] profiling hooks unavailable: {_e}")
+			# Frequency-integrated Σ^c(ω) — wrap pre/post memprof snapshots and
+			# the xprof region in one ``profile_section`` CM.
 			with timing.section("sigma.compile"):
 				precompile_sigma(wfns, ppm, meta, mesh_xy)
-			# Always nest timing.section so the "sigma.exec" bucket is
-			# recorded; pf.region is an xprof annotation and does NOT
-			# feed the timing report.
-			_cm = _pf.region("sigma_ppm") if _pf is not None else contextlib.nullcontext()
-			with timing.section("sigma.exec"), _cm:
+			with timing.section("sigma.exec"), profile_section("sigma_ppm", print_fn=print0):
 				sigma_omega = compute_sigma_c_ppm_omega_grid(
 					wfns, ppm, meta, mesh_xy, ppm_options,
 					sigma_window_quad=config.sigma_quadrature_config,
 					print_fn=print0,
 				)
-			if _pf is not None:
-				try:
-					_pf.snapshot_memory(f"{_pf_art}/memprof/sigma_ppm_post.prof", label="sigma_ppm_post")
-				except Exception:
-					pass
 			sigma_c_omega = sigma_omega.sigma_c_kij  # (n_omega, nk, nb, nb) or None if streamed
 
 			# === Σ_c head injection (analytic GN pole, properly mini-BZ-averaged) ===
@@ -510,16 +423,7 @@ def main(argv=None):
 				fit_head_ppm_from_samples, fit_head_hl_analytic_from_sample,
 				fit_head_with_fixed_omega_from_sample,
 				compute_ppm_head_sigma_kij, format_head_diagnostics)
-			_head_params = {
-				"wcoul0_source": config.wcoul0_source,
-				"wcoul0_eta": config.wcoul0_eta,
-				"vhead": config.vhead,
-				"whead_0freq": config.whead_0freq,
-				"whead_imfreq": config.whead_imfreq,
-			}
-			_head_static = resolve_head_sample(
-				_head_params, input_dir, wfn, sym, meta, print0,
-				omega=0.0+0.0j)
+			_head_static = head_resolver.at(0.0 + 0.0j)
 			_head_omega_override = getattr(config, "ppm_head_omega_h_ry", None)
 			if _head_omega_override is not None:
 				# User-supplied head pole Ω_h (e.g. BGW's analytic value).
@@ -537,9 +441,7 @@ def main(argv=None):
 				print0(f"  HL head: ω_p (analytic, BGW-style) = {_omega_p_sq_ry**0.5:.6f} Ry "
 				       f"({(_omega_p_sq_ry**0.5)*RYD_TO_EV:.4f} eV)")
 			else:
-				_head_probe = resolve_head_sample(
-					_head_params, input_dir, wfn, sym, meta, print0,
-					omega=probe_omega)
+				_head_probe = head_resolver.at(probe_omega)
 				_head_gn = fit_head_ppm_from_samples(
 					_head_static, _head_probe, probe_omega=probe_omega)
 			print0(format_head_diagnostics(_head_gn, cell_volume=meta.cell_volume))

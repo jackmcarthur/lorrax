@@ -199,6 +199,58 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
     )
 
 
+class HeadResolver:
+    """Memoized q=0 head-sample resolver for a single GW run.
+
+    The driver needs the head sample at up to two frequencies (ω=0 always,
+    and a second probe ω for the dynamic PPM path).  Building it requires
+    reading ``eps0mat.h5`` or ``dipole.h5`` and crunching a Voronoi-cell
+    integral, which is non-trivial; without memoization the same work was
+    being done three times per run.
+
+    Construct once at the top of ``main()``::
+
+        head = HeadResolver(config, input_dir, wfn, sym, meta, print_fn)
+        head_static = head.at(0.0 + 0.0j)
+        head_probe  = head.at(probe_omega)
+    """
+
+    __slots__ = ("_params", "_input_dir", "_wfn", "_sym", "_meta",
+                 "_print_fn", "_cache")
+
+    def __init__(self, config, input_dir, wfn, sym, meta, print_fn):
+        self._params = {
+            "wcoul0_source": config.wcoul0_source,
+            "wcoul0_eta": config.wcoul0_eta,
+            "vhead": config.vhead,
+            "whead_0freq": config.whead_0freq,
+            "whead_imfreq": config.whead_imfreq,
+        }
+        self._input_dir = input_dir
+        self._wfn = wfn
+        self._sym = sym
+        self._meta = meta
+        self._print_fn = print_fn
+        self._cache: dict[tuple[float, float], HeadSample] = {}
+
+    def _cache_key(self, omega) -> tuple[float, float]:
+        z = complex(omega)
+        return (round(z.real, 12), round(z.imag, 12))
+
+    def at(self, omega) -> HeadSample:
+        """Resolve (and memoize) the head sample at ``omega`` in Ry."""
+        key = self._cache_key(omega)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        sample = resolve_head_sample(
+            self._params, self._input_dir, self._wfn, self._sym,
+            self._meta, self._print_fn, omega=omega,
+        )
+        self._cache[key] = sample
+        return sample
+
+
 def format_head_sample_diagnostics(head: HeadSample, *, include_screened: bool = True) -> str:
     """Return a compact diagnostic summary for one resolved head sample."""
 
