@@ -1084,25 +1084,18 @@ def prepare_isdf_and_wavefunctions(
 				wfn, sym, band_slices.full_range,
 				(band_slices.b1, band_slices.b3), nspinor=meta.nspinor)
 
-			# Flush V_q / G0 / enk + W0 placeholder immediately.  For
-			# bispinor V_q is a dict of 10 tiles; ``write_restart_state_to_h5``
-			# only consumes a single rank-N V_qmunu, so we use the (0,0)
-			# tile broadcast as a *placeholder* in the restart file (it
-			# preserves the layout the legacy restart loader expects).
-			# The dict itself is held in memory and threaded into Σ_X^B
-			# below — restart-loaded bispinor runs need to recompute V_q
-			# from disk-backed zeta files (skipping fit_zeta), not load
-			# tiles from the restart h5.
-			V_qmunu_for_restart = V_q_or_blocks
-			if isinstance(V_q_or_blocks, dict):
-				_v00 = V_q_or_blocks[(0, 0)]
-				_n00 = int(_v00.shape[-1])
-				V_qmunu_for_restart = jnp.broadcast_to(
-					_v00[None, None, None],
-					(1, meta.npol, meta.npol, *meta.kgrid, _n00, _n00))
+			# Flush V_q / G0 / enk + W0 placeholder immediately.  The
+			# v3 restart writer accepts EITHER a single Array (treated
+			# as the (0,0) Lorentz slot for non-bispinor) OR a
+			# dict[(μ_L, ν_L), Array] of per-channel slabs (bispinor;
+			# 10 non-zero tiles).  Each slot writes to its own
+			# ``V_qmunu/pol_X_Y`` dataset of shape
+			# ``(nkx, nky, nkz, n_rmu_X, n_rmu_Y)`` via the SAME
+			# write_slab machinery — no broadcast view, no padding,
+			# different (μ, ν) sizes per slot are fine.
 			write_restart_state_to_h5(
 				tensors_filename,
-				V_qmunu=V_qmunu_for_restart, G0_mu_nu=G0, enk_full=enk_full,
+				V_qmunu=V_q_or_blocks, G0_mu_nu=G0, enk_full=enk_full,
 				init_W0=True, mesh=mesh_xy, backend=cfg.backend.slab_io,
 				mode="w",
 			)
@@ -1133,41 +1126,39 @@ def prepare_isdf_and_wavefunctions(
 				psi_full_y=wfns.psi_yr, mesh=mesh_xy,
 				backend=cfg.backend.slab_io, mode="a",
 			)
-		# save_restart_state_per_proc forces a materialise-then-slice on
-		# V_qmunu via ``V_qmunu[..., vx0:vx1, vy0:vy1]`` (JAX's _gather).
-		# For bispinor that's a view-of-broadcast and the slice
-		# rematerialises the full (1, npol, npol, nkx, nky, nkz, μ, μ)
-		# tensor (~30 GB on CrI3), OOMing at scale.  And for bispinor
-		# the saved (0,0)-only view is a *wrong* representation anyway
-		# (a real bispinor restart needs all 10 V_blocks tiles).  Skip
-		# the per-proc save for bispinor; non-bispinor runs are
-		# unchanged.
-		if isinstance(V_q_or_blocks, dict):
-			print0("  [bispinor] skipping save_restart_state_per_proc — "
-			       "(0,0)-only view would mis-represent bispinor V_q")
-		else:
-			save_restart_state_per_proc(
-				os.path.join(tmp_dir, "isdf_tensors"),
-				V_qmunu_for_restart, None, wfns.psi_yr, wfns.enk,
-				meta, mesh_xy)
-			V_qmunu_for_restart.block_until_ready()
+		# Per-proc shard backup.  ``save_restart_state_per_proc`` accepts
+		# the same single-Array-or-dict shape as the global writer and
+		# stores per-(μ_L, ν_L) shards under V_local/pol_X_Y.  For
+		# bispinor each per-pol slab is a real materialised array (NOT
+		# a broadcast view), so the local slice on (μ_X, ν_Y) is a true
+		# device-local op — no rematerialisation OOM.
+		save_restart_state_per_proc(
+			os.path.join(tmp_dir, "isdf_tensors"),
+			V_q_or_blocks, None, wfns.psi_yr, wfns.enk,
+			meta, mesh_xy)
 		print0("  Chunked ISDF path complete")
 	else:
 		from file_io import load_restart_state_from_h5
 		with timing.section("gw_jax.restart_load"):
 			rs = load_restart_state_from_h5(
 				tensors_filename, mesh_xy, band_slices=band_slices)
-			V_q_or_blocks = rs.V_qmunu
+			# v3 reader returns V_blocks dict; for non-bispinor (single
+			# (0,0) slot) collapse to a single Array so downstream Σ
+			# kernels stay on the legacy single-tensor path.  Bispinor
+			# (multi-slot) keeps the dict and routes to compute_cohsex
+			# _sigma_bispinor.
+			if rs.V_blocks is not None and len(rs.V_blocks) > 1:
+				V_q_or_blocks = rs.V_blocks
+			else:
+				V_q_or_blocks = rs.V_qmunu  # legacy alias = (0,0) slot
 			print0("  Loaded restart tensors from H5.")
 			wfns = build_wavefunction_bundle(
 				wfn, sym, meta, band_slices, mesh_xy,
 				psi_rmu_Y=rs.psi_rmu_Y, psi_rmuT_X=rs.psi_rmuT_X,
 				enk_full=rs.enk_full, print_fn=print0)
-			# Restart path doesn't currently rebuild wfns_current — Σ_X^B
-			# would need to recompute V_q from disk-backed zeta files
-			# anyway (the restart format only stores one V_qmunu).  When
-			# we add a bispinor restart format this should populate from
-			# the saved current-centroid ψ.
+			# wfns_current rebuild on restart isn't yet wired — bispinor
+			# Σ_X^B from a restart needs the current centroid ψ.  Add
+			# this when we wire bispinor restart-from-disk.
 			wfns_current = None
 
 	return SimpleNamespace(
