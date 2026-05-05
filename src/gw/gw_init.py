@@ -564,7 +564,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			band_range_right=band_range_right,
 			k_chunk_size=chunks.get('k_chunk', 0),
 			band_norms=_band_norms,
-			use_ffi_io=cfg.use_ffi_io,
+			slab_io_backend=cfg.backend.slab_io,
 			gspace_mode=cfg.gspace_mode,
 		)
 
@@ -656,10 +656,11 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	# mesh-parallel.  Fallback to the replicated ``compute_all_V_q_from_zeta_h5``
 	# when FFI phdf5 isn't available (single-GPU sandbox builds, h5py-only
 	# backend).
-	use_sharded_v_q = bool(cfg.use_ffi_io)
+	from .gw_config import SlabIOBackend
+	use_sharded_v_q = (cfg.backend.slab_io is SlabIOBackend.PHDF5_FFI)
 	with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
 		with SlabIO(zeta_h5_path, mode='r', mesh=mesh_xy,
-		            use_ffi_io=use_sharded_v_q) as zeta_io:
+		            backend=cfg.backend.slab_io) as zeta_io:
 			with mesh_xy:
 				if use_sharded_v_q:
 					V_q_raw, G0_all = compute_all_V_q_sharded(
@@ -801,7 +802,7 @@ def prepare_isdf_and_wavefunctions(
 			write_restart_state_to_h5(
 				tensors_filename,
 				V_qmunu=V_qmunu, G0_mu_nu=G0, enk_full=enk_full,
-				init_W0=True, mesh=mesh_xy, use_ffi_io=cfg.use_ffi_io,
+				init_W0=True, mesh=mesh_xy, backend=cfg.backend.slab_io,
 				mode="w",
 			)
 
@@ -815,7 +816,7 @@ def prepare_isdf_and_wavefunctions(
 			write_restart_state_to_h5(
 				tensors_filename,
 				psi_full_y=wfns.psi_yr, mesh=mesh_xy,
-				use_ffi_io=cfg.use_ffi_io, mode="a",
+				backend=cfg.backend.slab_io, mode="a",
 			)
 		save_restart_state_per_proc(
 			os.path.join(tmp_dir, "isdf_tensors"),

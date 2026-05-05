@@ -858,7 +858,7 @@ def fit_zeta_chunked_to_h5(
     k_chunk_size: int = 0,
     q_gather_size: int = 0,
     band_norms: np.ndarray | None = None,
-    use_ffi_io: bool = False,
+    slab_io_backend=None,
     gspace_mode: str = "host_cache",
 ):
     """
@@ -910,6 +910,10 @@ def fit_zeta_chunked_to_h5(
     reuse it for :func:`gw.wavefunction_bundle.build_wavefunctions` after
     the fit completes.
     """
+    from gw.gw_config import SlabIOBackend
+    if slab_io_backend is None:
+        slab_io_backend = SlabIOBackend.H5PY_ALLGATHER
+    use_ffi_io = (slab_io_backend is SlabIOBackend.PHDF5_FFI)
     import h5py
 
     nx, ny, nz = meta.fft_grid
@@ -1039,7 +1043,7 @@ def fit_zeta_chunked_to_h5(
     with timing.section("zeta_fit.open_file"):
         if use_ffi_io:
             zeta_io = SlabIO(output_file, mode='w', mesh=mesh_xy,
-                             use_ffi_io=True)
+                             backend=slab_io_backend)
             zeta_io.create_dataset(
                 'zeta_q',
                 shape=(nq, n_rtot, n_rmu),
@@ -1048,7 +1052,7 @@ def fit_zeta_chunked_to_h5(
             )
         else:
             with SlabIO(output_file, mode='w', mesh=mesh_xy,
-                        use_ffi_io=False) as _zeta_create_io:
+                        backend=slab_io_backend) as _zeta_create_io:
                 _zeta_create_io.create_dataset(
                     'zeta_q',
                     shape=(nq, n_rtot, n_rmu),

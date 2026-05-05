@@ -238,7 +238,7 @@ def main(argv=None):
 		nkx, nky, nkz = (int(x) for x in meta.kgrid)
 		W_q_8d = W_q.reshape(1, 1, 1, nkx, nky, nkz, W_q.shape[-2], W_q.shape[-1])
 		write_w0_qmunu_to_h5(tensors_filename, W_q_8d,
-		                     mesh=mesh_xy, use_ffi_io=config.use_ffi_io)
+		                     mesh=mesh_xy, backend=config.backend.slab_io)
 		head_static = head_resolver.at(0.0 + 0.0j)
 		if config.compute_mode.is_dynamic:
 			# GN-PPM: probe at iωp on the imaginary axis.

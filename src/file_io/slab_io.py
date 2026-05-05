@@ -4,15 +4,20 @@ One helper for all large-sharded-array writes/reads: replaces the
 ad-hoc ``process_allgather`` → rank-0 ``h5py`` patterns sprinkled
 across the codebase.
 
-Two backends, selected by ``use_ffi_io: bool``:
+Two backends, selected by ``backend: SlabIOBackend``:
 
-- ``False`` (default) — :mod:`file_io._slab_io_allgather`.  Gather to
-  rank 0 via ``jax.experimental.multihost_utils.process_allgather``,
-  write with plain ``h5py``.  Byte-identical to today's hand-rolled
-  pattern.  Works anywhere ``h5py`` + ``jax`` work.
-- ``True`` — :mod:`file_io._slab_io_ffi`.  Collective MPI-IO via
-  ``ffi.phdf5``; each rank writes its own hyperslab directly.  Lazy
-  import; only loads the FFI when this flag is set.
+- :attr:`SlabIOBackend.H5PY_ALLGATHER` (default) —
+  :mod:`file_io._slab_io_allgather`.  Gather to rank 0 via
+  ``jax.experimental.multihost_utils.process_allgather``, write with
+  plain ``h5py``.  Byte-identical to today's hand-rolled pattern.
+  Works anywhere ``h5py`` + ``jax`` work.
+- :attr:`SlabIOBackend.PHDF5_FFI` — :mod:`file_io._slab_io_ffi`.
+  Collective MPI-IO via ``ffi.phdf5``; each rank writes its own
+  hyperslab directly.  Lazy import; only loads the FFI when selected.
+
+The legacy ``use_ffi_io: bool`` kwarg is still accepted on every entry
+point and silently coerced via :func:`_normalize_slab_backend` — pass
+the enum in new code.
 
 Three primitives:
 
@@ -45,6 +50,31 @@ __all__ = [
 ]
 
 
+def _normalize_slab_backend(backend, use_ffi_io):
+    """Resolve ``(backend, use_ffi_io)`` to a :class:`SlabIOBackend`.
+
+    Accepts:
+    - ``backend=SlabIOBackend.PHDF5_FFI | H5PY_ALLGATHER`` (preferred)
+    - ``use_ffi_io=True | False`` (legacy boolean — coerced)
+    - both ``None``: defaults to allgather
+
+    The legacy boolean is the only place strings/bools cross over into
+    the enum world for SlabIO; everywhere else stays in enum land.
+    """
+    from gw.gw_config import SlabIOBackend  # avoid circular import at module load
+    if backend is not None:
+        if isinstance(backend, SlabIOBackend):
+            return backend
+        raise TypeError(
+            f"backend={backend!r} must be SlabIOBackend, "
+            f"not {type(backend).__name__}"
+        )
+    if use_ffi_io is None:
+        return SlabIOBackend.H5PY_ALLGATHER
+    return (SlabIOBackend.PHDF5_FFI if bool(use_ffi_io)
+            else SlabIOBackend.H5PY_ALLGATHER)
+
+
 # ---------------------------------------------------------------------------
 # Public context manager
 # ---------------------------------------------------------------------------
@@ -53,7 +83,9 @@ class SlabIO:
 
     Usage::
 
-        with SlabIO(path, mode="w", mesh=mesh, use_ffi_io=False) as io:
+        from gw.gw_config import SlabIOBackend
+        with SlabIO(path, mode="w", mesh=mesh,
+                    backend=SlabIOBackend.PHDF5_FFI) as io:
             io.create_dataset("A", shape=(N, M), dtype=jnp.complex128)
             io.write_slab("A", A_sharded)          # whole dataset
             io.write_slab("A", chunk, offset=(i, 0))  # sub-slab
@@ -69,9 +101,10 @@ class SlabIO:
     mesh : jax.sharding.Mesh, optional
         Required by the FFI backend; the allgather backend ignores
         it (rank-0 always owns the file).
-    use_ffi_io : bool
-        ``True`` routes through :mod:`ffi.phdf5` (collective MPI-IO);
-        ``False`` uses ``process_allgather`` + rank-0 ``h5py``.
+    backend : SlabIOBackend, optional
+        Selects the underlying I/O path.  Defaults to allgather when
+        omitted.  The legacy ``use_ffi_io: bool`` kwarg is also
+        accepted for back-compat.
     """
 
     def __init__(
@@ -80,15 +113,22 @@ class SlabIO:
         *,
         mode: str = "w",
         mesh=None,
-        use_ffi_io: bool = False,
+        backend=None,
+        use_ffi_io: bool | None = None,
     ) -> None:
+        from gw.gw_config import SlabIOBackend
         self.path = path
         self.mode = mode
         self.mesh = mesh
-        self.use_ffi_io = use_ffi_io
-        if use_ffi_io:
+        self.backend = _normalize_slab_backend(backend, use_ffi_io)
+        # Boolean shortcut still used internally by ``read_slab`` for
+        # branch dispatch — kept as a derived attribute, not the source
+        # of truth.
+        self.use_ffi_io = (self.backend is SlabIOBackend.PHDF5_FFI)
+        if self.use_ffi_io:
             if mesh is None:
-                raise ValueError("use_ffi_io=True requires mesh")
+                raise ValueError(
+                    "backend=SlabIOBackend.PHDF5_FFI requires mesh")
             from ._slab_io_ffi import _FfiBackend
             self._backend = _FfiBackend(path, mesh=mesh, mode=mode)
         else:
@@ -225,10 +265,12 @@ def write_slab(
     mode: str = "a",
     chunks: Sequence[int] | None = None,
     attrs: dict | None = None,
-    use_ffi_io: bool = False,
+    backend=None,
+    use_ffi_io: bool | None = None,
 ) -> None:
     """Open + write + close for a one-off dataset write."""
-    with SlabIO(path, mode=mode, mesh=mesh, use_ffi_io=use_ffi_io) as io:
+    with SlabIO(path, mode=mode, mesh=mesh,
+                backend=backend, use_ffi_io=use_ffi_io) as io:
         gshape = global_shape if global_shape is not None else tuple(A.shape)
         # Pre-create with user-provided chunks/attrs on first write.
         io.create_dataset(
@@ -246,10 +288,12 @@ def read_slab(
     offset: Sequence[int] | None = None,
     mesh=None,
     partition_spec=None,
-    use_ffi_io: bool = False,
+    backend=None,
+    use_ffi_io: bool | None = None,
 ) -> jax.Array:
     """Open + read + close for a one-off dataset read."""
-    with SlabIO(path, mode="r", mesh=mesh, use_ffi_io=use_ffi_io) as io:
+    with SlabIO(path, mode="r", mesh=mesh,
+                backend=backend, use_ffi_io=use_ffi_io) as io:
         return io.read_slab(
             ds_name, shape=shape, dtype=dtype, offset=offset,
             mesh=mesh, partition_spec=partition_spec)
@@ -262,8 +306,10 @@ def accumulate_slab(
     *,
     offset: Sequence[int] | None = None,
     mesh=None,
-    use_ffi_io: bool = False,
+    backend=None,
+    use_ffi_io: bool | None = None,
 ) -> None:
     """Open + read-modify-write + close for a one-off accumulate."""
-    with SlabIO(path, mode="a", mesh=mesh, use_ffi_io=use_ffi_io) as io:
+    with SlabIO(path, mode="a", mesh=mesh,
+                backend=backend, use_ffi_io=use_ffi_io) as io:
         io.accumulate_slab(ds_name, A, offset=offset)

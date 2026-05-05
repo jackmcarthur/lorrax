@@ -41,7 +41,6 @@ class PPMSigmaRuntimeOptions:
     write_w_copies_debug: bool
     w_copies_debug_file: str
     sigma_freq_debug_file: str
-    use_ffi_io: bool = False
 
 
 def _resolve_input_path(input_dir: str, path: str) -> str:
@@ -136,10 +135,11 @@ def setup_runtime(config: LorraxConfig, mesh_xy, *, print_fn=print) -> None:
     - **NCCL warmup**: pre-allocates communicators for full-mesh and
       per-axis psums so the first real collective (sigma's all-reduce-
       start) doesn't eat a timed section.  No-op in single-process.
-    - **phdf5 ``MPI_Init_thread``**: when ``use_ffi_io`` is set, eagerly
-      enter ``MPI_THREAD_MULTIPLE`` so the first collective ``H5Fcreate``
-      (in ``zeta_fit_chunked``) doesn't pay the ~400 ms MPI_Init cost on
-      the critical path; failures are logged and swallowed.
+    - **phdf5 ``MPI_Init_thread``**: when the slab-IO backend is the
+      phdf5 FFI, eagerly enter ``MPI_THREAD_MULTIPLE`` so the first
+      collective ``H5Fcreate`` (in ``zeta_fit_chunked``) doesn't pay
+      the ~400 ms MPI_Init cost on the critical path; failures are
+      logged and swallowed.
     - **JAX persistent compile cache**: enable XDG-style on-disk cache
       so warm-cache cold starts skip ~3 s of XLA compile.  Opt out via
       ``ISDF_JAX_CACHE_DIR=""``.
@@ -276,5 +276,4 @@ def build_ppm_sigma_runtime_options(
         write_w_copies_debug=bool(debug.write_w_copies_debug),
         w_copies_debug_file=_resolve_input_path(input_dir, str(debug.w_copies_debug_file or "").strip()),
         sigma_freq_debug_file=_resolve_input_path(input_dir, str(debug.sigma_freq_debug_file or "").strip()),
-        use_ffi_io=bool(config.backend.slab_io is SlabIOBackend.PHDF5_FFI),
     )

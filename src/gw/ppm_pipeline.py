@@ -273,7 +273,7 @@ def _write_sigma_omega_h5(
             sigma_sx_kij_ev=RYD_TO_EV * sig_x,
             hartree_kij_ev=RYD_TO_EV * sig_h,
             mesh=mesh_xy,
-            use_ffi_io=bool(config.use_ffi_io),
+            backend=config.backend.slab_io,
         )
     elif meta.rank == 0 and sigma_omega.sigma_kij_h5_path:
         copy_sigma_kij_h5_to_omega_h5(

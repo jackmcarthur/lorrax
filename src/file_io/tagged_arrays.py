@@ -23,7 +23,8 @@ def write_restart_state_to_h5(
     W0_qmunu=None,
     init_W0: bool = False,
     mesh=None,
-    use_ffi_io: bool = False,
+    backend=None,
+    use_ffi_io: bool | None = None,
     mode: str = "w",
 ):
     """Write (subset of) canonical restart state via SlabIO.
@@ -43,7 +44,8 @@ def write_restart_state_to_h5(
     """
     from .slab_io import SlabIO
 
-    with SlabIO(filename, mode=mode, mesh=mesh, use_ffi_io=use_ffi_io) as io:
+    with SlabIO(filename, mode=mode, mesh=mesh,
+                backend=backend, use_ffi_io=use_ffi_io) as io:
         if mode == "w":
             io.write_attr("restart_format_version", np.int64(2))
 
@@ -91,13 +93,15 @@ def write_restart_state_to_h5(
 
 
 def write_w0_qmunu_to_h5(
-    filename, W0_qmunu, mesh=None, use_ffi_io: bool = False,
+    filename, W0_qmunu, mesh=None,
+    backend=None, use_ffi_io: bool | None = None,
 ):
     """Overwrite or append the W0_qmunu dataset in an existing restart file."""
     from .slab_io import SlabIO
 
     shape = tuple(W0_qmunu.shape)
-    with SlabIO(filename, mode="a", mesh=mesh, use_ffi_io=use_ffi_io) as io:
+    with SlabIO(filename, mode="a", mesh=mesh,
+                backend=backend, use_ffi_io=use_ffi_io) as io:
         io.create_dataset("W0_qmunu", shape=shape, dtype=W0_qmunu.dtype)
         io.write_slab("W0_qmunu", W0_qmunu, global_shape=shape)
 
