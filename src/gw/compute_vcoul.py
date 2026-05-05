@@ -433,14 +433,24 @@ def make_v_munu_chunked_kernel(
     def get_v_per_G_and_phase(qvec_wrapped: jax.Array) -> tuple[jax.Array, jax.Array]:
         """Return (v(q+G), phase) on the sphere — un-sqrt'd v in c128.
 
+        Always returns ``v_per_G`` as a flat ``(n_sph,)`` array so the
+        bispinor V_q tile kernel can broadcast it as ``[:, None, :]`` over
+        a (Q, μ, n_sph) ζ slab.  When ``sphere_idx`` is None
+        (no bare-Coulomb cutoff) ``n_sph == n_G == nx*ny*nz`` and the
+        result is just the box-shaped sqrt_v² flattened.
+
         Mirrors ``get_sqrt_v_and_phase`` but returns ``v`` (real ≥ 0)
-        instead of ``√v``.  Reuses the same factory closure to keep
-        the v-construction logic in a single place.
+        instead of ``√v``.
         """
         sqrt_v, phase = get_sqrt_v_and_phase(qvec_wrapped)
         # sqrt_v is real-valued in c128 (zeros where v ≤ 0 from cutoff);
         # squaring recovers v exactly.  No imag part, no sign flip.
         v_per_G = sqrt_v * sqrt_v
+        # Flatten to (n_sph,) when sphere_idx is None — sqrt_v keeps the
+        # box shape (nx, ny, nz) in that branch, and v_q_tile expects
+        # 1-D input.  When sphere_idx is set, sqrt_v is already 1-D.
+        if sphere_idx is None:
+            v_per_G = v_per_G.reshape(-1)
         return v_per_G, phase
 
     if sys_dim in (2, 3):
