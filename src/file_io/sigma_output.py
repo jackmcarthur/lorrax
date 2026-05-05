@@ -3,6 +3,8 @@ import os
 import numpy as np
 import h5py
 
+from common.provenance import provenance_header
+
 
 def write_sigma_to_file(
 	sigma_sx_kij_eV,
@@ -35,6 +37,7 @@ def write_sigma_to_file(
 
 	with open(abs_path, "w") as f:
 		# Write header with units
+		f.write(provenance_header())
 		f.write("# Sigma output (all in eV)\n")
 		f.write(f"# {total_label} = {sx_label} + {corr_label}\n")
 		for k in range(nk):
@@ -76,59 +79,6 @@ def write_sigma_to_file(
 				f.write(line + "\n")
 
 
-def write_eqp1(
-	eqp1_path,
-	energies_dft_ev,
-	energies_qp_ev,
-	E_oneshot_ev,
-	nkx, nky, nkz,
-	nb_sigma,
-):
-	"""Write eqp1.dat with DFT, one-shot, and QP eigenvalues per k-point.
-
-	Parameters
-	----------
-	eqp1_path : str
-		Output file path.
-	energies_dft_ev : array (nk, nb)
-		DFT eigenvalues in eV.
-	energies_qp_ev : array (nk, nb)
-		QP eigenvalues in eV (from diagonalizing H_DFT + Σ).
-	E_oneshot_ev : array (nk, nb)
-		One-shot diagonal energies in eV.
-	nkx, nky, nkz : int
-		k-grid dimensions.
-	nb_sigma : int
-		Number of bands in sigma window.
-	"""
-	energies_dft_ev = np.asarray(energies_dft_ev, dtype=np.float64)
-	energies_qp_ev = np.asarray(energies_qp_ev, dtype=np.float64)
-	E_oneshot_ev = np.asarray(E_oneshot_ev, dtype=np.float64)
-
-	abs_path = os.path.abspath(eqp1_path)
-	dirname = os.path.dirname(abs_path)
-	if dirname:
-		os.makedirs(dirname, exist_ok=True)
-
-	with open(abs_path, "w") as f:
-		f.write("# kx ky kz nbands\n")
-		f.write("# spin band E_DFT E_oneshot(DFT-basis) E_QP(eigh)\n")
-		ik = 0
-		for ikz in range(nkz):
-			for iky in range(nky):
-				for ikx in range(nkx):
-					kx = ikx / nkx
-					ky = iky / nky
-					kz = ikz / nkz
-					f.write(f"  {kx:.9f}  {ky:.9f}  {kz:.9f}      {nb_sigma}\n")
-					for ib in range(nb_sigma):
-						e_dft = float(energies_dft_ev[ik, ib])
-						e_oneshot = float(E_oneshot_ev[ik, ib])
-						e_qp = float(energies_qp_ev[ik, ib])
-						f.write(f"       1       {ib+1}  {e_dft:14.9f}  {e_oneshot:14.9f}  {e_qp:14.9f}\n")
-					ik += 1
-
-
 def write_eqp_g0w0(
 	eqp_path,
 	energies_dft_ev,
@@ -158,6 +108,7 @@ def write_eqp_g0w0(
 		os.makedirs(dirname, exist_ok=True)
 
 	with open(abs_path, "w") as f:
+		f.write(provenance_header())
 		f.write("# G0W0 diagonal energies (eV)\n")
 		f.write("# columns: band  E_DFT  Re[H0+Sigma_xc(E_DFT)]  Im[H0+Sigma_xc(E_DFT)]\n")
 		for k in range(energies_dft_ev.shape[0]):
@@ -216,6 +167,7 @@ def write_sigma_freq_debug_table(
 		os.makedirs(dirname, exist_ok=True)
 
 	with open(abs_path, "w") as f:
+		f.write(provenance_header())
 		sep = "\t\t"
 		col_w = 15
 		cols = [
@@ -265,38 +217,6 @@ def write_sigma_freq_debug_table(
 				line = sep.join(row)
 				f.write(line + "\n")
 	return abs_path
-
-
-def write_eqp_table(dft_energies_ev, qp_energies_ev, filename="eqp.dat"):
-	"""Write DFT vs quasiparticle energies per (k,n) in eqp-style text format.
-
-	Args:
-		dft_energies_ev: array-like with shape (nk, nb)
-		qp_energies_ev: array-like with shape (nk, nb)
-		filename: output path for the table
-	"""
-	dft = np.asarray(dft_energies_ev, dtype=np.float64)
-	qp = np.asarray(qp_energies_ev, dtype=np.complex128)
-	if dft.shape != qp.shape:
-		raise ValueError(f"Shape mismatch for EQP table: DFT {dft.shape} vs QP {qp.shape}")
-
-	abs_path = os.path.abspath(filename)
-	dirname = os.path.dirname(abs_path)
-	if dirname:
-		os.makedirs(dirname, exist_ok=True)
-	print(f"Writing EQP table to: {abs_path}")
-
-	nk, nb = dft.shape
-	with open(abs_path, "w") as f:
-		for k in range(nk):
-			f.write(f"\nk-point {k}:\n")
-			f.write("-" * 60 + "\n")
-			for n in range(nb):
-				e_dft = float(dft[k, n])
-				e_qp = complex(qp[k, n])
-				f.write(
-					f"n={n:<3} EDFT={e_dft:>9.4f}  EQP={e_qp.real:>9.4f} + {e_qp.imag:>9.4f}i\n"
-					)
 
 
 def write_chunked_complex_dataset_h5(

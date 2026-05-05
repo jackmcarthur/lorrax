@@ -348,6 +348,18 @@ def main(argv=None):
 	sigma_xc_at_dft_ev  = ppm_outputs.sigma_xc_at_dft_ev  if ppm_outputs else None
 	omega_dft_rel_ev    = ppm_outputs.omega_dft_rel_ev    if ppm_outputs else None
 	efermi_dft_ev       = ppm_outputs.efermi_dft_ev       if ppm_outputs else None
+	# ω-grid Σ_c diagonal for the BGW eqp1.dat Z-factor (PPM modes only).
+	# ppm_outputs.sigma_c_omega is (n_omega, nk_full, nb, nb) Ry, post-head;
+	# we hand the diagonal in eV to the writer which then central-diffs it.
+	if ppm_outputs is not None and ppm_outputs.sigma_c_omega is not None:
+		sigma_c_omega_diag_ev = (
+			np.diagonal(np.asarray(ppm_outputs.sigma_c_omega),
+			            axis1=2, axis2=3) * RYD_TO_EV
+		)
+		omega_rel_ev = np.asarray(ppm_outputs.ppm_options.omega_grid_ev)
+	else:
+		sigma_c_omega_diag_ev = None
+		omega_rel_ev = None
 	ppm_options         = ppm_outputs.ppm_options         if ppm_outputs else None
 
 	# ---- QP Hamiltonian: H_QP = (H_DFT - V_xc) + V_H + Σ_xc ----
@@ -482,16 +494,21 @@ def main(argv=None):
 		self_consistent=config.self_consistent,
 		sigma_c_diag_at_dft_ry=sigma_c_diag_at_dft_ry,
 		sigma_xc_at_dft_ev=sigma_xc_at_dft_ev,
+		sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,
+		omega_rel_ev=omega_rel_ev,
 		sigma_omega_h5_path=sigma_omega_h5_path,
 		tensors_filename=tensors_filename,
 	)
 	if meta.rank == 0:
 		write_results(
 			results,
-			output_file=config.output_file,
+			sigma_diag_file=config.sigma_diag_file,
+			eqp0_file=config.eqp0_file,
+			eqp1_file=config.eqp1_file,
 			input_dir=input_dir,
 			kpoints_crys=np.array(sym.unfolded_kpts, dtype=np.float64),
 			kgrid=meta.kgrid,
+			kpoints_irr_frac=np.array(wfn.kpoints, dtype=np.float64),
 			kpoints_reduced=np.array(wfn.kpoints, dtype=np.float64),
 			kirr_to_kfull=np.array(sym.kirr_fullids, dtype=np.int32),
 			print_fn=print0,

@@ -71,9 +71,18 @@ _DEFAULTS = {
     # File paths
     "wfn_file": "WFN.h5",
     "centroids_file": "centroids_frac.txt",
-    "output_file": "eqp0_noqsym.dat",
     "kin_ion_file": "kin_ion.h5",
-    "eqp_output_file": "eqp.dat",
+    # Three human-readable text outputs (always written):
+    #   sigma_diag.dat — LORRAX-native per-(k,n) Σ-decomposition dump.
+    #   eqp0.dat       — BGW-format zeroth-order QP energies.
+    #   eqp1.dat       — BGW-format Z-linearized QP energies (Z=1 in
+    #                    static COHSEX, central-difference Z in PPM).
+    # The legacy ``output_file`` key (LORRAX-native eqp0.dat) and
+    # ``eqp_output_file`` (unused) were dropped 2026-05-04; setting
+    # them in cohsex.in now logs a deprecation warning and is ignored.
+    "sigma_diag_file": "sigma_diag.dat",
+    "eqp0_file": "eqp0.dat",
+    "eqp1_file": "eqp1.dat",
     "sigma_omega_h5_file": "sigma_mnk.h5",
     "sigma_kij_h5_file": "",
     # Core flags
@@ -279,6 +288,19 @@ def read_lorrax_input(filename: str) -> dict:
             raise ValueError(
                 "Input key 'use_shipped_minimax_tables' is no longer supported. "
                 "Use 'regenerate_minimax_tables = true/false' instead.")
+        for legacy_key in ("output_file", "eqp_output_file"):
+            if section.get(legacy_key, fallback=None) is not None:
+                import warnings
+                warnings.warn(
+                    f"Input key '{legacy_key}' is no longer supported and "
+                    f"will be ignored.  ``output_file`` (LORRAX-native eqp0) "
+                    f"is now ``sigma_diag_file`` (defaults to "
+                    f"``sigma_diag.dat``); BGW-format ``eqp0.dat`` and "
+                    f"``eqp1.dat`` (with Z-linearization) are written "
+                    f"automatically.  Remove '{legacy_key}' from your "
+                    f"input file.",
+                    DeprecationWarning, stacklevel=2,
+                )
 
         # Build params from _DEFAULTS, overriding with parsed values
         params = {}
@@ -363,9 +385,10 @@ class LorraxConfig:
     # --- File paths (resolved to absolute) ---
     wfn_file: str
     centroids_file: str
-    output_file: str
     kin_ion_file: str
-    eqp_output_file: str
+    sigma_diag_file: str
+    eqp0_file: str
+    eqp1_file: str
     sigma_omega_h5_file: str
     sigma_kij_h5_file: str
 
@@ -606,9 +629,10 @@ class LorraxConfig:
             # Paths
             wfn_file=str(_get("wfn_file")),
             centroids_file=str(_get("centroids_file")),
-            output_file=str(_get("output_file")),
             kin_ion_file=str(_get("kin_ion_file")),
-            eqp_output_file=str(_get("eqp_output_file")),
+            sigma_diag_file=str(_get("sigma_diag_file")),
+            eqp0_file=str(_get("eqp0_file")),
+            eqp1_file=str(_get("eqp1_file")),
             sigma_omega_h5_file=str(_get("sigma_omega_h5_file")),
             sigma_kij_h5_file=str(_get("sigma_kij_h5_file") or ""),
             # Core flags

@@ -25,8 +25,6 @@ from .tagged_arrays import (
 )
 from .sigma_output import (
     write_sigma_to_file,
-    write_eqp_table,
-    write_eqp1,
     write_eqp_g0w0,
     write_sigma_omega_h5,
     write_chunked_complex_dataset_h5,
