@@ -212,13 +212,12 @@ def main(argv=None):
 					chi0_q = compute_chi0(wfns, quad, meta, mesh_xy,
 					                      energy_reference=e_ref)
 					chi0_q.block_until_ready()
-				# isdf_memory_mode is the legacy alias for backend.screening_solver
 				with timing.section("W.compile"):
 					precompile_solve_w(V_q, chi0_q, meta, mesh_xy,
-					                   memory_mode=config.isdf_memory_mode)
+					                   solver=config.backend.screening_solver)
 				with timing.section("W.exec"):
 					W_q = solve_w(V_q, chi0_q, meta, mesh_xy,
-					              memory_mode=config.isdf_memory_mode)
+					              solver=config.backend.screening_solver)
 					# χ₀ is donated inside solve_w — the reference is
 					# now invalid.  Do NOT touch ``chi0_q`` after this.
 					del chi0_q

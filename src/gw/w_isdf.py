@@ -301,34 +301,82 @@ def _get_w_solve_fn_low_mem(mesh_xy: Mesh, nq: int, n_rmu: int, dtype):
     return _solve_w_low
 
 
-def solve_w(V_q, chi0_q, meta, mesh_xy, *, memory_mode: str = "high_mem"):
+def _w_solve_pref_scalar(meta) -> float:
+    """The 2/(√N_k · n_spin · n_spinor) prefactor in front of χ₀ in the
+    Dyson solve.  Same value for both backends; pulled out so the
+    dispatch helper below isn't the only place it's computed."""
+    nq = int(meta.nk_tot)
+    nspin = max(1, int(getattr(meta, 'nspin', 1)))
+    nspinor = max(1, int(getattr(meta, 'nspinor', 1)))
+    return 2.0 / (float(max(1, nq)) ** 0.5 * float(nspin) * float(nspinor))
+
+
+def _normalize_screening_solver(solver_or_mode):
+    """Accept either a :class:`ScreeningSolver` or the legacy string
+    (``"high_mem"``/``"low_mem"``/``"auto"``) and return the enum.
+
+    Kept narrow so the only place legacy strings cross over is here.
+    """
+    from .gw_config import ScreeningSolver, _LEGACY_ISDF_MEMORY_MODE
+    if isinstance(solver_or_mode, ScreeningSolver):
+        return solver_or_mode
+    s = (solver_or_mode or "auto").strip().lower()
+    if s in _LEGACY_ISDF_MEMORY_MODE:
+        return _LEGACY_ISDF_MEMORY_MODE[s]
+    raise ValueError(
+        f"solver={solver_or_mode!r} invalid; pass a ScreeningSolver enum "
+        f"or one of {sorted(_LEGACY_ISDF_MEMORY_MODE)}."
+    )
+
+
+def _resolve_w_solve_fn(meta, mesh_xy, *, solver, dtype, n_rmu):
+    """Return ``(solve_fn, pref)`` for the requested screening solver.
+
+    Single source of truth for the JAX-native vs cuBLASMp-FFI fork.
+    Both ``solve_w`` and ``precompile_solve_w`` go through this helper —
+    the dispatch logic exists in one place.
+    """
+    from .gw_config import ScreeningSolver
+    solver = _normalize_screening_solver(solver)
+    nq = int(meta.nk_tot)
+    pref_scalar = _w_solve_pref_scalar(meta)
+
+    if solver is ScreeningSolver.CUBLASMP_FFI:
+        # Fused FFI consumes pref as a Python complex scalar (compile-time attr).
+        solve_fn = _get_w_solve_fn_low_mem(mesh_xy, nq, n_rmu, dtype)
+        return solve_fn, complex(pref_scalar)
+
+    # JAX_NATIVE (q-parallel reshard + per-rank LU via shard_map).
+    solve_fn = _get_w_solve_fn(mesh_xy, nq, n_rmu)
+    return solve_fn, jnp.asarray(pref_scalar, dtype=jnp.complex128)
+
+
+def solve_w(V_q, chi0_q, meta, mesh_xy, *, solver=None, memory_mode=None):
     """W(q) = (I − V χ₀)⁻¹ V  via q-parallel Dyson solve.
 
     All arrays flat-q: V(nq, μ, μ), χ₀(nq, μ, μ) → W(nq, μ, μ).
 
-    memory_mode:
-        "high_mem": q-parallel reshard + local LU on each rank (existing
-            path; legal for any mesh; uses one all-gather + all-scatter).
-        "low_mem": symmetric Cholesky formulation W = X H⁻¹ X†; no
-            reshard to q-parallel, but matmuls can reshard internally
-            (JAX-planned).  Requires χ such that I − X†χX is PD.
+    Pass either ``solver`` (a :class:`ScreeningSolver` enum) or the
+    legacy ``memory_mode`` string ("high_mem" / "low_mem" / "auto").
+    Legacy callers that still hand in the string keep working —
+    ``_normalize_screening_solver`` does the coercion in one place.
+
+    Solver semantics:
+
+    - :attr:`ScreeningSolver.JAX_NATIVE` (default): q-parallel reshard
+      + per-rank LU via shard_map.  Legal on any mesh, one all-gather +
+      one all-scatter of (μ, μ) blocks.
+    - :attr:`ScreeningSolver.CUBLASMP_FFI`: fused symmetric Cholesky
+      W = X H⁻¹ X†; no reshard to q-parallel, but matmuls can reshard
+      internally (JAX-planned).  Requires χ such that I − X†χX is PD.
     """
-    nq = int(meta.nk_tot)
-    n_rmu = chi0_q.shape[1]
-    nspin = max(1, int(getattr(meta, 'nspin', 1)))
-    nspinor = max(1, int(getattr(meta, 'nspinor', 1)))
-    pref_scalar = 2.0 / (float(max(1, nq)) ** 0.5 * float(nspin) * float(nspinor))
-    mode = (memory_mode or "high_mem").lower()
-    if mode == "low_mem":
-        # Fused FFI consumes pref as a Python scalar (compile-time attr).
-        solve_fn = _get_w_solve_fn_low_mem(mesh_xy, nq, n_rmu, V_q.dtype)
-        with jax_profile.annotation("W_solve"):
-            return solve_fn(V_q, chi0_q, complex(pref_scalar))
-    else:
-        solve_fn = _get_w_solve_fn(mesh_xy, nq, n_rmu)
-        pref_jnp = jnp.asarray(pref_scalar, dtype=jnp.complex128)
-        with jax_profile.annotation("W_solve"):
-            return solve_fn(V_q, chi0_q, pref_jnp)
+    chosen = solver if solver is not None else memory_mode
+    solve_fn, pref = _resolve_w_solve_fn(
+        meta, mesh_xy,
+        solver=chosen, dtype=V_q.dtype, n_rmu=chi0_q.shape[1],
+    )
+    with jax_profile.annotation("W_solve"):
+        return solve_fn(V_q, chi0_q, pref)
 
 
 def resolve_minimax_energy_reference(
@@ -591,35 +639,36 @@ def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
     ).compile()
 
 
-def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, memory_mode: str = "high_mem"):
+def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, solver=None, memory_mode=None):
     """AOT lower+compile of the W-solve jit.  See ``precompile_chi0``.
 
-    Both paths have an XLA jit to precompile:
-
-    * ``high_mem``: the ``_solve_w`` jit built by ``_get_w_solve_fn`` —
-      q-parallel reshard + per-rank LU via shard_map.
-    * ``low_mem``: the cuBLASMp fused-W-solve jit built by
-      ``ffi.cublasmp.batched_fused_w_solve_jit`` — shard_map + FFI call,
-      still a JAX jit (cached per (mesh, dtype, nq, n, pref, ctx))
-      which pays an XLA compile on first invocation.
+    Goes through the same ``_resolve_w_solve_fn`` dispatch as
+    :func:`solve_w` so both paths agree on which jit to compile.  The
+    cuBLASMp FFI path uses a slightly different ``.lower(V_q, chi0_q)``
+    signature (pref is folded into the compile-time attribute set, not
+    a runtime arg) so the precompile is a thin per-solver branch here.
     """
+    from .gw_config import ScreeningSolver
     _ensure_compilation_cache()
+    chosen = solver if solver is not None else memory_mode
+    solver_enum = _normalize_screening_solver(chosen)
     nq = int(meta.nk_tot)
     n_rmu = chi0_q.shape[1]
-    nspin = max(1, int(getattr(meta, 'nspin', 1)))
-    nspinor = max(1, int(getattr(meta, 'nspinor', 1)))
-    pref_scalar = 2.0 / (float(max(1, nq)) ** 0.5 * float(nspin) * float(nspinor))
-    mode = (memory_mode or "high_mem").lower()
-    if mode == "low_mem":
+
+    if solver_enum is ScreeningSolver.CUBLASMP_FFI:
         # Also primes the cuBLASMp context handle via get_or_init_context.
         from ffi.cublasmp import batched_fused_w_solve_jit
+        pref_scalar = _w_solve_pref_scalar(meta)
         jit_fn = batched_fused_w_solve_jit(
             dtype=V_q.dtype, nq=nq, n=n_rmu,
             pref=complex(pref_scalar), mesh=mesh_xy,
         )
         jit_fn.lower(V_q, chi0_q).compile()
         return
-    solve_fn = _get_w_solve_fn(mesh_xy, nq, n_rmu)
-    pref_jnp = jnp.asarray(pref_scalar, dtype=jnp.complex128)
-    solve_fn.lower(V_q, chi0_q, pref_jnp).compile()
+
+    solve_fn, pref = _resolve_w_solve_fn(
+        meta, mesh_xy,
+        solver=ScreeningSolver.JAX_NATIVE, dtype=V_q.dtype, n_rmu=n_rmu,
+    )
+    solve_fn.lower(V_q, chi0_q, pref).compile()
 

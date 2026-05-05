@@ -343,7 +343,7 @@ def compute_ppm_sigma_pipeline(
         chi0_probe.block_until_ready()
         Wiwp_q = solve_w(
             V_q, chi0_probe, meta, mesh_xy,
-            memory_mode=config.isdf_memory_mode,
+            solver=config.backend.screening_solver,
         )
         del chi0_probe
         Wiwp_q.block_until_ready()
