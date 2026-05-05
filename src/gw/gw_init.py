@@ -898,9 +898,18 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		nkx, nky, nkz = meta.kgrid
 		n_rmu_0 = int(n_rmu_by_channel[0])
 		V_q_raw = V_q_raw_flat.reshape(nkx, nky, nkz, n_rmu_0, n_rmu_0)
-		V_qmunu = jnp.array(jnp.broadcast_to(
+		# DO NOT wrap the broadcast in ``jnp.array(...)``: for bispinor
+		# npol=4 that materialises a (1, 4, 4, ...) tensor 16× the
+		# (nkx, nky, nkz, μ, μ) base, which on CrI3 16-GPU is a 30 GB
+		# allocation that OOMs ``save_restart_state_per_proc``'s
+		# ``V_qmunu[..., vx0:vx1, vy0:vy1]`` slice.  Keep it as a view
+		# — downstream consumers (Σ, the slice in save_restart) only
+		# materialise their per-q / per-μ slabs which are 16× smaller.
+		# Non-bispinor (npol=1) was unaffected by the materialisation
+		# because its broadcast is shape-preserving.
+		V_qmunu = jnp.broadcast_to(
 			V_q_raw[None, None, None],
-			(1, meta.npol, meta.npol, nkx, nky, nkz, n_rmu_0, n_rmu_0)))
+			(1, meta.npol, meta.npol, nkx, nky, nkz, n_rmu_0, n_rmu_0))
 		return V_qmunu, G0
 
 	# Single dispatcher: ``compute_all_V_q`` selects the right kernel from
