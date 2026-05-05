@@ -74,13 +74,27 @@ def _build_chunk_alphas(*, nk, ns, mu, nq, band_chunk, p_x, p_y, p, nr) -> _Chun
     )
 
 
-def _fft_moment(cr, base, fft_inloop_bytes, a: _ChunkAlphas):
-    """Peak during one bc-iteration's FFT + reshard + accumulate.
+def _fft_moment(cr, base, fft_inloop_bytes, a: _ChunkAlphas, *, n_bc: int = 1):
+    """Peak across the bc-loop's FFT + reshard + accumulate.
 
-    Live: base + 2× pair-density accumulators + the FFT workspace + the
-    post-reshard ψ_bc_Y slab.
+    Live during a single bc-iteration: base + 2× pair-density accumulators
+    + the FFT workspace + the post-reshard ψ_bc_Y slab.
+
+    BUT: ``_make_fit_one_rchunk_kernel`` Python-unrolls the bc-loop
+    (``for bc_idx in band_chunk_ranges`` over ``n_bc`` iterations) inside
+    one giant jit, so XLA sees n_bc separate ``io_callback + FFT +
+    reshard + accumulate`` traces.  The FFT workspace itself can be
+    reused iter-to-iter (one cuFFT plan, scratch reused), but each
+    iter's post-reshard ψ_bc_Y is a distinct buffer the scheduler can
+    keep live concurrently with later iters' to overlap fetch with
+    accumulate — measured cumulative live across unroll matches
+    ``n_bc · α_psi_Y_bc · cr`` on CrI3 16-GPU (was missing 17 GB at
+    chunk_r=112016, band_chunk=16, n_bc=5).
+
+    Pass ``n_bc=1`` to recover the per-iter peak (the legacy model);
+    pass ``n_bc = nb / band_chunk`` to honour the unroll cost.
     """
-    return base + 2 * a.α_pair * cr + fft_inloop_bytes + a.α_psi_Y_bc * cr
+    return base + 2 * a.α_pair * cr + fft_inloop_bytes + n_bc * a.α_psi_Y_bc * cr
 
 
 def _zct_moment(cr, base, a: _ChunkAlphas):
@@ -104,15 +118,19 @@ def _gather_moment(cr, base, q_gather, a: _ChunkAlphas):
 
 
 def _max_cr_per_stage(headroom, fft_cost_in_loop, a: _ChunkAlphas, *,
-                      nr_max, m_budget, m_zct_cap) -> dict:
+                      nr_max, m_budget, m_zct_cap, n_bc: int = 1) -> dict:
     """Closed-form max feasible ``cr`` for each moment (linear inversion).
 
     Each moment is ``base + α·cr + c`` so ``cr ≤ (headroom − c) / α``; the
     caller takes the minimum over moments.  Returns a per-stage dict so the
     bottleneck can be reported.
+
+    ``n_bc`` honours the Python-unrolled bc-loop cost in the FFT moment
+    (cumulative ψ_bc_Y across n_bc iters live concurrent under XLA's
+    fused jit) — see :func:`_fft_moment` for the full rationale.
     """
     # Optional soft cap on zct stage (env override for tight-memory systems).
-    denom_fft = 2 * a.α_pair + a.α_psi_Y_bc
+    denom_fft = 2 * a.α_pair + n_bc * a.α_psi_Y_bc
     denom_zct = (2 + _ZCT_ADDITIONAL_COEF) * a.α_pair
     denom_solve = 2 * a.α_zcol + 2 * a.α_z_slice
     limits = {
@@ -234,18 +252,22 @@ def compute_optimal_chunks(
         band_chunk=band_chunk, p_x=p_x, p_y=p_y, p=p, nr=nr,
     )
 
-    def _eval_stages(cr, base, fft_inloop):
+    def _eval_stages(cr, base, fft_inloop, n_bc):
         """Forward-evaluate each moment at a given cr.
 
         Returns ``(stages_dict, m_zcol, m_solve_per_q, m_gather_per_q, k_batch)``.
         Note: ``fft_inloop`` already includes the input (=m_psi_G_bc), output,
         and cuFFT scratch via ``query_fft_peak_bytes``.
+
+        ``n_bc`` is the number of bc-iterations the kernel's Python-unrolled
+        bc-loop emits — fed into ``_fft_moment`` so the cumulative ψ_bc_Y
+        live across iters is honoured.
         """
         m_zcol = alphas.α_zcol * cr
         m_solve_per_q = 2 * alphas.α_z_slice * cr + alphas.c_solve
         m_gather_per_q = alphas.α_gather * cr
         stages = {
-            'fft':     _fft_moment(cr, base, fft_inloop, alphas),
+            'fft':     _fft_moment(cr, base, fft_inloop, alphas, n_bc=n_bc),
             'zct':     _zct_moment(cr, base, alphas),
             'reshard': _reshard_moment(cr, base, alphas),
             'solve':   base + 2 * m_zcol + m_solve_per_q,    # q_batch=1 in AOT
@@ -253,7 +275,9 @@ def compute_optimal_chunks(
         }
         # k_batch sizing — uses per-k FFT cost to pack as many k's as
         # headroom allows.  Only matters for centroid-load FFT, which is a
-        # separate pre-loop stage.
+        # separate pre-loop stage.  The k_batch sizing models a SINGLE bc
+        # iter (one centroid load), not the cumulative bc-unroll, so this
+        # term keeps the legacy 1× α_psi_Y_bc.
         fft_per_k = _FFT_COPIES * _bytes_c128(bpd, ns, nr) + _bytes_c128(nr)
         fft_head = m_budget - base - (2 * alphas.α_pair + alphas.α_psi_Y_bc) * cr
         k_batch = 1
@@ -272,12 +296,16 @@ def compute_optimal_chunks(
         headroom = m_budget - base
         if headroom <= alphas.c_solve:
             return None
+        # bc-loop is Python-unrolled inside the fit_one_rchunk kernel;
+        # n_bc copies of psi_bc_Y stack across XLA's fused trace.
+        n_bc = max(1, -(-int(nb) // int(band_chunk)))
         if override and override > 0:
             cr = min(int(override), int(nr))
         else:
             limits = _max_cr_per_stage(
                 headroom, fft_inloop, alphas,
                 nr_max=nr, m_budget=m_budget, m_zct_cap=m_zct_cap,
+                n_bc=n_bc,
             )
             cr = min(int(nr), max(0, int(min(limits.values()))))
         pt = p_x * p_y  # cr must be divisible by p_total for solve sharding
@@ -285,7 +313,7 @@ def compute_optimal_chunks(
             cr -= cr % pt
         if cr <= 0:
             return None
-        stages, m_zcol, m_spq, m_gpq, k_batch = _eval_stages(cr, base, fft_inloop)
+        stages, m_zcol, m_spq, m_gpq, k_batch = _eval_stages(cr, base, fft_inloop, n_bc)
         return {
             'chunk_r': cr, 'peak': max(stages.values()),
             'bottleneck': max(stages, key=stages.get), 'stages': stages,
