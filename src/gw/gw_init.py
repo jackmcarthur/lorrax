@@ -383,17 +383,19 @@ def _apply_aot_chunk_model(
 
     Two modes:
 
-    - ``cfg.use_aot_chunk_chooser=True``: the AOT chooser picks ``chunk_r``
-      and ``band_chunk``; the heuristic's existing values are overridden.
-      ``LORRAX_CHOOSER_MODE=analytic`` swaps the regressed-fit analytic
-      chooser in for the default 20/80 heuristic.
-    - ``cfg.use_aot_chunk_chooser=False``: the AOT *predictor* runs alongside
-      the heuristic and prints its predicted peak — used for γ calibration
-      against the runtime nvidia-smi sample taken inside ``fit_zeta``.
+    - ``cfg.memory.use_aot_chunk_chooser=True``: the AOT chooser picks
+      ``chunk_r`` and ``band_chunk``; the heuristic's existing values are
+      overridden.  ``LORRAX_CHOOSER_MODE=analytic`` swaps the regressed-fit
+      analytic chooser in for the default 20/80 heuristic.
+    - ``cfg.memory.use_aot_chunk_chooser=False``: the AOT *predictor* runs
+      alongside the heuristic and prints its predicted peak — used for γ
+      calibration against the runtime nvidia-smi sample taken inside
+      ``fit_zeta``.
 
     Returns the AOT-predicted peak in GB (or ``None`` if the AOT path
     isn't importable; the heuristic still drives sizing in that case).
     """
+    mem = cfg.memory
     try:
         from gw.aot_memory_model import (
             predict_kernel_peak, SysDims, MeshSpec, Knobs,
@@ -401,7 +403,7 @@ def _apply_aot_chunk_model(
             describe_chunks,
         )
     except Exception as exc:
-        if cfg.use_aot_chunk_chooser and rank0:
+        if mem.use_aot_chunk_chooser and rank0:
             print_fn(
                 f"    AOT chooser FAILED ({exc!r}); falling back to heuristic."
             )
@@ -427,12 +429,12 @@ def _apply_aot_chunk_model(
     )
     aot_mesh = MeshSpec(p_x=int(p_x), p_y=int(p_y))
 
-    if cfg.use_aot_chunk_chooser:
+    if mem.use_aot_chunk_chooser:
         # 20/80 heuristic is the default — no DoE deps.  Falls back to the
         # regressed-fit analytic chooser when LORRAX_CHOOSER_MODE=analytic.
         chooser_mode = os.environ.get("LORRAX_CHOOSER_MODE", "heuristic")
         budget_bytes = (
-            cfg.memory_per_device_gb * 1e9 * cfg.chunk_target_utilization
+            mem.per_device_gb * 1e9 * mem.chunk_target_utilization
         )
         if chooser_mode == "analytic":
             choice = choose_chunks_analytic(
@@ -566,7 +568,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			gspace_mode=cfg.gspace_mode,
 		)
 
-	budget_gb = mem_est.get('budget_gb', cfg.memory_per_device_gb)
+	budget_gb = mem_est.get('budget_gb', cfg.memory.per_device_gb)
 	if peak_bytes > 0:
 		peak_gb = peak_bytes / 1e9
 		print_fn(f"    GPU high-water mark: {peak_gb:.2f} GB / {budget_gb:.2f} GB budget "
@@ -605,7 +607,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	# V_q memory model: 2 zeta reads + 1 FFT workspace = 3× (μ × n_G × 16 bytes)
 	if mem_est is None:
 		mem_est = {}
-	budget_gb = float(mem_est.get('available_vcoul_gb', cfg.memory_per_device_gb))
+	budget_gb = float(mem_est.get('available_vcoul_gb', cfg.memory.per_device_gb))
 	try:
 		from common.gpu_utils import get_device_memory_info
 		budget_gb = min(budget_gb, float(get_device_memory_info().get('budget_gb', budget_gb)))
@@ -635,11 +637,11 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	# (BGW truncates the pair-density v(q+G) sphere at ecutwfc).  The previous
 	# default of 4·ecutwfc was the strict mathematical cutoff for ψ*ψ but
 	# produced a ~4% V_μν body offset vs BGW's vcoul.dat on Si 4×4×4.
-	if cfg.bare_coulomb_cutoff is None:
+	if cfg.head.bare_coulomb_cutoff is None:
 		vcoul_cutoff_ry = float(wfn.ecutwfc)
 		print_fn(f"    V_q bare cutoff: {vcoul_cutoff_ry:.1f} Ry (auto: ecutwfc)")
 	else:
-		vcoul_cutoff_ry = float(cfg.bare_coulomb_cutoff)
+		vcoul_cutoff_ry = float(cfg.head.bare_coulomb_cutoff)
 		print_fn(f"    V_q bare cutoff: {vcoul_cutoff_ry:.1f} Ry")
 
 	print_fn(f"    V_q budget:    {budget_gb:.2f} GB")
@@ -667,7 +669,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 						n_rmu=meta.n_rmu, n_rtot=meta.n_rtot,
 						sys_dim=meta.sys_dim,
 						bdot=np.asarray(wfn.bdot, dtype=np.float64) if meta.sys_dim == 0 else None,
-						mc_average_vcoul_body=cfg.mc_average_vcoul_body,
+						mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
 						bare_coulomb_cutoff=vcoul_cutoff_ry,
 						bgw_v_grid_fn=bgw_v_grid_fn,
 						budget_bytes=m_budget,
@@ -680,7 +682,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 						sys_dim=meta.sys_dim,
 						q_batch_size=q_batch if mu_chunk >= meta.n_rmu else None,
 						bdot=np.asarray(wfn.bdot, dtype=np.float64) if meta.sys_dim == 0 else None,
-						mc_average_vcoul_body=cfg.mc_average_vcoul_body,
+						mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
 						bare_coulomb_cutoff=vcoul_cutoff_ry,
 						bgw_v_grid_fn=bgw_v_grid_fn,
 						n_rmu=meta.n_rmu, n_rtot=meta.n_rtot,
@@ -761,14 +763,15 @@ def prepare_isdf_and_wavefunctions(
 
 		with mesh_xy:
 			# Plan chunks (band/r/q sizes).
+			mem = cfg.memory
 			chunks = compute_optimal_chunks(
 				meta, mesh_xy,
-				memory_budget_gb=cfg.memory_per_device_gb,
-				target_utilization=cfg.chunk_target_utilization,
+				memory_budget_gb=mem.per_device_gb,
+				target_utilization=mem.chunk_target_utilization,
 				n_b_left=band_slices.b3 - band_slices.b0,
 				n_b_right=band_slices.b4 - band_slices.b1,
-				r_chunk_override=cfg.r_chunk_override if cfg.r_chunk_override > 0 else None,
-				zct_stage_cap_gb=cfg.zct_stage_cap_gb,
+				r_chunk_override=mem.r_chunk_override if mem.r_chunk_override > 0 else None,
+				zct_stage_cap_gb=mem.zct_stage_cap_gb,
 			)
 
 			# Load centroid ψ once for the full [b0, b4) range; reused by

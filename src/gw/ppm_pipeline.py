@@ -63,15 +63,15 @@ def _build_probe_quadrature(quad, config, *, print_fn):
     """Return (probe_omega, quad_probe) for the GN (imag) or HL (real) path."""
     is_hl = config.compute_mode is ComputeMode.HL_PPM
     if is_hl:
-        probe_omega = complex(float(config.ppm_omega_p), 0.0)
+        probe_omega = complex(float(config.ppm.omega_p), 0.0)
         quad_probe = build_real_quadrature(
-            quad, float(config.ppm_omega_p),
+            quad, float(config.ppm.omega_p),
             config.minimax_config, print_fn=print_fn,
         )
     else:
-        probe_omega = 1j * float(config.ppm_omega_p)
+        probe_omega = 1j * float(config.ppm.omega_p)
         quad_probe = build_imag_quadrature(
-            quad, config.ppm_omega_p,
+            quad, config.ppm.omega_p,
             config.minimax_config, print_fn=print_fn,
         )
     return probe_omega, quad_probe
@@ -93,7 +93,7 @@ def _fit_head_correction(
     )
 
     head_static = head_resolver.at(0.0 + 0.0j)
-    omega_h_override = config.ppm_head_omega_h_ry
+    omega_h_override = config.ppm.head_omega_h_ry
     is_hl = config.compute_mode is ComputeMode.HL_PPM
 
     if omega_h_override is not None:
@@ -260,7 +260,7 @@ def _write_sigma_omega_h5(
         write_sigma_omega_h5,
     )
 
-    out_path = config.sigma_omega_h5_file
+    out_path = config.paths.sigma_omega_h5_file
     if not os.path.isabs(out_path):
         out_path = os.path.join(input_dir, out_path)
 
@@ -351,7 +351,7 @@ def compute_ppm_sigma_pipeline(
         # Step 3: PPM pole fit
         ppm = fit_ppm(
             W_q, Wiwp_q, V_q, probe_omega, mesh_xy,
-            fallback_omega=config.ppm_fallback_omega,
+            fallback_omega=config.ppm.fallback_omega,
             n_nodes_static=quad.node_count,
             print_fn=print_fn,
             model_label=label,

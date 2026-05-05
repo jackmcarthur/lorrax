@@ -139,9 +139,9 @@ def main(argv=None):
 		device_kind=device_names, print_fn=print0,
 	)
 
-	wfn = WFNReader(config.wfn_file)
+	wfn = WFNReader(config.paths.wfn_file)
 	sym = symmetry_maps.SymMaps(wfn)
-	_, centroid_indices, _n_rmu = load_centroids(config.centroids_file, wfn.fft_grid)
+	_, centroid_indices, _n_rmu = load_centroids(config.paths.centroids_file, wfn.fft_grid)
 	tmp_dir = os.path.join(input_dir, "tmp")
 	os.makedirs(tmp_dir, exist_ok=True)
 	tensors_filename = os.path.join(tmp_dir, f"isdf_tensors_{_n_rmu}.h5")
@@ -155,7 +155,7 @@ def main(argv=None):
 	meta.n_proc = jax.process_count()
 	meta.sys_dim = config.sys_dim
 	meta.bispinor = config.bispinor
-	meta.chunk_size = get_effective_chunk_size(config.chunk_size)
+	meta.chunk_size = get_effective_chunk_size(config.memory.chunk_size)
 
 	band_slices = BandSlices.from_band_edges(*meta.band_edges)
 
@@ -212,6 +212,7 @@ def main(argv=None):
 					chi0_q = compute_chi0(wfns, quad, meta, mesh_xy,
 					                      energy_reference=e_ref)
 					chi0_q.block_until_ready()
+				# isdf_memory_mode is the legacy alias for backend.screening_solver
 				with timing.section("W.compile"):
 					precompile_solve_w(V_q, chi0_q, meta, mesh_xy,
 					                   memory_mode=config.isdf_memory_mode)
@@ -244,10 +245,10 @@ def main(argv=None):
 			# GN-PPM: probe at iωp on the imaginary axis.
 			# HL-PPM: probe at Ω on the real axis (above all transitions).
 			if config.compute_mode is ComputeMode.HL_PPM:
-				omega_imp = complex(float(config.ppm_omega_p), 0.0)
+				omega_imp = complex(float(config.ppm.omega_p), 0.0)
 				_omega_grid_entry = float(omega_imp.real)
 			else:
-				omega_imp = 1j * float(config.ppm_omega_p)
+				omega_imp = 1j * float(config.ppm.omega_p)
 				_omega_grid_entry = float(omega_imp.imag)
 			head_imag = head_resolver.at(omega_imp)
 			whead_arr = np.array(
@@ -364,7 +365,7 @@ def main(argv=None):
 
 	# ---- QP Hamiltonian: H_QP = (H_DFT - V_xc) + V_H + Σ_xc ----
 	sigma_total = sig_sx + sig_coh + sig_h
-	kin_ion = load_kin_ion_submatrix(config.kin_ion_file, band_slices.b0, band_slices.b3)
+	kin_ion = load_kin_ion_submatrix(config.paths.kin_ion_file, band_slices.b0, band_slices.b3)
 
 	# Dynamic-mode diagonal self-consistency + QSGW (rank 0 only)
 	if mode.is_dynamic and meta.rank == 0 and sigma_omega_h5_path and os.path.exists(sigma_omega_h5_path):
@@ -393,7 +394,7 @@ def main(argv=None):
 		in_grid = (E_dft_rel_ev >= omega_ev[0]) & (E_dft_rel_ev <= omega_ev[-1])
 		n_in = int(np.count_nonzero(in_grid))
 
-		if config.sigma_at_dft_extrapolate and np.any(in_grid) and np.any(~in_grid):
+		if config.ppm.sigma_at_dft_extrapolate and np.any(in_grid) and np.any(~in_grid):
 			# Scissor: ΔE_n = E_QP_n − E_DFT_n fit against E_DFT, separate
 			# slopes/intercepts for valence and conduction.  Out-of-grid bands
 			# get E_QP = E_DFT + (α·E_DFT + β) using the fitted line.
@@ -502,9 +503,9 @@ def main(argv=None):
 	if meta.rank == 0:
 		write_results(
 			results,
-			sigma_diag_file=config.sigma_diag_file,
-			eqp0_file=config.eqp0_file,
-			eqp1_file=config.eqp1_file,
+			sigma_diag_file=config.paths.sigma_diag_file,
+			eqp0_file=config.paths.eqp0_file,
+			eqp1_file=config.paths.eqp1_file,
 			input_dir=input_dir,
 			kpoints_crys=np.array(sym.unfolded_kpts, dtype=np.float64),
 			kgrid=meta.kgrid,

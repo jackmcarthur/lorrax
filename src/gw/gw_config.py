@@ -1,11 +1,29 @@
 """Unified configuration for LORRAX GW calculations.
 
-LorraxConfig replaces the old params dict + cfg SimpleNamespace + derivative
-config objects. It is created once from the input file and passed through
-the entire driver pipeline.
+``LorraxConfig`` is built once via :meth:`LorraxConfig.from_input_file`
+from the ``[cohsex]`` section of ``cohsex.in`` and threaded through the
+entire driver.  Its ~80 input keys are grouped into sub-dataclasses
+along the same axes the input file's section comments already use:
 
-Derived config sub-objects (MinimaxConfig, SigmaQuadratureConfig,
-PPMSigmaRuntimeOptions) are constructed on demand via properties.
+    config.head        — q→0 Coulomb-head sources & overrides
+    config.minimax     — screening-minimax target error / max nodes / table mode
+    config.ppm         — PPM model + sigma quadrature + on-shell σ_c options
+    config.sigma_grid  — ω-grid for Σ_c(ω) output
+    config.memory      — chunk sizing + AOT chunk-chooser
+    config.backend     — FFI/IO backend selection (slab_io / gspace_io / screening_solver)
+    config.debug       — debug-only flags & file paths
+    config.bse         — BSE interpolation setup (htransform-driven)
+    config.paths       — output filenames
+
+The top-level ``LorraxConfig`` retains only system geometry
+(``nval`` / ``ncond`` / ``nband`` / ``sys_dim``) and the orthogonal
+mode flags (``compute_mode`` / ``self_consistent`` / etc.) that the
+driver reads on the fast path.
+
+Derived sub-objects (the math-internal ``MinimaxConfig`` and
+``SigmaQuadratureConfig`` from ``minimax_config.py``, plus
+``PPMSigmaRuntimeOptions`` from ``gw_driver_helpers.py``) are still
+constructed on demand via ``LorraxConfig`` properties.
 """
 
 from __future__ import annotations
@@ -21,6 +39,10 @@ import numpy as np
 
 from common.units import RYD_TO_EV
 
+
+# ---------------------------------------------------------------------------
+#  Enums
+# ---------------------------------------------------------------------------
 
 class ComputeMode(str, enum.Enum):
     """The single axis describing what self-energy is computed.
@@ -56,6 +78,64 @@ class ComputeMode(str, enum.Enum):
             ComputeMode.GN_PPM: "gn",
             ComputeMode.HL_PPM: "hl",
         }.get(self)
+
+
+class SlabIOBackend(str, enum.Enum):
+    """How big sigma/zeta/restart HDF5 files are written.
+
+    - ``PHDF5_FFI`` — every rank writes its hyperslab via the parallel-HDF5
+      FFI (collective MPI-IO).  Default.  ~5× faster than the rank-0 path
+      once Lustre striping is applied.
+    - ``H5PY_ALLGATHER`` — gather to rank 0 and write via h5py.  Fallback
+      for systems without the FFI ``.so`` built or for non-Lustre
+      filesystems.
+    """
+    PHDF5_FFI = "phdf5_ffi"
+    H5PY_ALLGATHER = "h5py_allgather"
+
+
+class GspaceIO(str, enum.Enum):
+    """How ψ(G) is moved into the ISDF r-chunk loop.
+
+    Both modes keep ψ(G) on host in per-rank band-sharded layout and
+    pull one band-chunk at a time into the jit via io_callback — never
+    more than one bc on device at a time.
+
+    - ``HOST_CACHE`` — read ψ(G) once at startup, keep resident in host
+      RAM for the full run.  Default; fastest.
+    - ``FILE_REREAD`` — rebuild the host buffer at each r-chunk via
+      phdf5 collective read; drop between r-chunks.  Zero persistent
+      host residency (needed for huge systems where host RAM can't
+      hold ψ(G)).
+    """
+    HOST_CACHE = "host_cache"
+    FILE_REREAD = "file_reread"
+
+
+class ScreeningSolver(str, enum.Enum):
+    """Which solver runs the W = (1 - V·χ₀)⁻¹·V Dyson equation.
+
+    - ``JAX_NATIVE`` — q-parallel reshard + ``jax.scipy.linalg.lu_factor``
+      / ``lu_solve`` per q.  Default; uses one all-gather + all-scatter.
+    - ``CUBLASMP_FFI`` — fused symmetric Cholesky W = X·H⁻¹·X† via
+      cuBLASMp + cuSOLVERMp FFI.  No JAX-level intermediates between
+      the matmuls; needed when ``nq · n_rmu²`` exceeds VRAM.
+    """
+    JAX_NATIVE = "jax_native"
+    CUBLASMP_FFI = "cublasmp_ffi"
+
+
+# Legacy ``isdf_memory_mode`` strings → ``ScreeningSolver`` enum.  Used
+# by both the input-file parser and the back-compat property aliases.
+_LEGACY_ISDF_MEMORY_MODE = {
+    "auto":     ScreeningSolver.JAX_NATIVE,    # back-compat default
+    "high_mem": ScreeningSolver.JAX_NATIVE,
+    "low_mem":  ScreeningSolver.CUBLASMP_FFI,
+}
+_SCREENING_SOLVER_TO_LEGACY = {
+    ScreeningSolver.JAX_NATIVE:   "high_mem",
+    ScreeningSolver.CUBLASMP_FFI: "low_mem",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -368,21 +448,13 @@ read_cohsex_input = read_lorrax_input
 #  LorraxConfig
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+#  Sub-dataclasses (each frozen, attribute-accessed via ``config.<group>.X``)
+# ---------------------------------------------------------------------------
+
 @dataclass(frozen=True)
-class LorraxConfig:
-    """Unified, immutable configuration for a LORRAX GW calculation.
-
-    Created once via ``LorraxConfig.from_input_file()`` and threaded through
-    the entire driver. Replaces the old params dict + cfg SimpleNamespace.
-    """
-
-    # --- System geometry ---
-    nval: int
-    ncond: int
-    nband: int
-    sys_dim: int
-
-    # --- File paths (resolved to absolute) ---
+class FilePaths:
+    """Output filenames + non-WFN inputs.  Resolved to absolute paths."""
     wfn_file: str
     centroids_file: str
     kin_ion_file: str
@@ -392,76 +464,121 @@ class LorraxConfig:
     sigma_omega_h5_file: str
     sigma_kij_h5_file: str
 
-    # --- Core flags ---
-    restart: bool
-    compute_mode_raw: str   # "auto" | one of ComputeMode.value strings
-    do_screened: bool
-    bispinor: bool
-    do_G0: bool
-    self_consistent: bool
-    use_ppm_sigma: bool
-    no_degen_averaging: bool
-    degen_avg_tol_ry: float
-    use_ffi_io: bool
-    gspace_mode: str
-    use_aot_chunk_chooser: bool
 
-    # --- Memory / chunking (resolved at construction) ---
-    memory_per_device_gb: float
-    chunk_target_utilization: float
-    chunk_size: int
-    band_chunk_size: int
-    r_chunk_override: int
-    zct_stage_cap_gb: float | None
+@dataclass(frozen=True)
+class HeadConfig:
+    """q→0 Coulomb-head sources, BGW vcoul override, bare-cutoff knobs.
 
-    # --- ISDF ---
-    isdf_memory_mode: str
+    All Coulomb-at-small-q tweaks live here.  Σ head plumbing
+    (``wcoul0_*``, ``vhead``/``whead_*``) is consumed by
+    :class:`gw.head_correction.HeadResolver`; the BGW vcoul override is
+    purely diagnostic (matches BGW's per-G mini-BZ averaging exactly for
+    bit-reproducible comparisons).
+    """
+    wcoul0_source: str            # "s_tensor" | "epshead"
+    wcoul0_eta: float
+    vhead: float | None           # explicit override v_h[ω=0]
+    whead_0freq: float | None     # explicit override W_h[ω=0]
+    whead_imfreq: float | None    # explicit override W_h[iω_p]
     mc_average_vcoul_body: bool
     bare_coulomb_cutoff: float | None
     use_bgw_vcoul: bool
     bgw_vcoul_file: str | None
     bgw_vcoul_sym_wfn: str | None
 
-    # --- Coulomb head ---
-    wcoul0_source: str
-    wcoul0_eta: float
-    vhead: float | None
-    whead_0freq: float | None
-    whead_imfreq: float | None
 
-    # --- Screening / minimax ---
-    screening_method: str
+@dataclass(frozen=True)
+class ScreeningConfig:
+    """χ₀ / W screening: method choice + minimax-quadrature knobs."""
+    method: str                   # "minimax" (only one currently)
     minimax_target_error: float
     minimax_max_nodes: int
     regenerate_minimax_tables: bool
-    minimax_energy_reference: str
+    minimax_energy_reference: str  # "midgap" | "vbm"
 
-    # --- PPM ---
-    ppm_model: str
-    ppm_omega_p: float
-    ppm_fallback_omega: float
-    ppm_head_omega_h_ry: float | None
-    ppm_sigma_target_error: float
-    ppm_sigma_max_nodes: int
 
-    # --- Sigma frequency grid ---
-    sigma_omega_min_ev: float
-    sigma_omega_max_ev: float
-    sigma_omega_step_ev: float
-    sigma_regularization_ev: float
-    sigma_window_edge_factor: float
-    sigma_omega_batch_size: int
-    sigma_omega_accumulation: str
+@dataclass(frozen=True)
+class PPMConfig:
+    """Plasmon-pole model + Σ_c(ω) output grid + on-shell options.
 
-    # --- PPM sigma options ---
-    ppm_sigma_scale: float
-    ppm_sigma_flip_neg: bool
-    ppm_invalid_mode: str
-    fermi_reference: str
+    Single grouped home for everything PPM/Σ_c-related: the pole-fit
+    ansatz, the probe-ω choice, the analytic head-pole override, the
+    σ-quadrature minimax tolerances, the ω-grid for the output, and
+    the post-hoc on-shell evaluation knobs.
+    """
+    # --- Model selection ---
+    model: str                    # "gn" | "hl" — picked by ComputeMode usually
+    omega_p: float                # probe ω (Ry); imag for GN, real for HL
+    fallback_omega: float
+    head_omega_h_ry: float | None # override Ω_h directly (BGW comparisons)
+
+    # --- σ-quadrature minimax ---
+    sigma_target_error: float
+    sigma_max_nodes: int
+
+    # --- ω-grid for Σ_c(ω) output (eV) ---
+    omega_min_ev: float
+    omega_max_ev: float
+    omega_step_ev: float
+    regularization_ev: float
+    window_edge_factor: float
+    omega_batch_size: int
+    omega_accumulation: str       # "auto" | "kij" | "kij_stream"
+
+    # --- on-shell evaluation knobs ---
+    sigma_scale: float
+    sigma_flip_neg: bool
+    invalid_mode: str             # "static_limit"
+    fermi_reference: str          # "midgap" | "vbm"
     sigma_at_dft_extrapolate: bool
     sigma_at_dft_energies: bool
 
-    # --- Debug ---
+
+@dataclass(frozen=True)
+class MemoryConfig:
+    """Per-device memory budget + chunk sizing + AOT chunk-chooser flag.
+
+    ``memory_per_device_gb=0`` triggers GPU auto-detection at config
+    construction time.  ``chunk_target_utilization`` is sourced from the
+    ``ISDF_CHUNK_TARGET_UTILIZATION`` env var (default 0.97).
+    ``zct_stage_cap_gb`` similarly from
+    ``ISDF_ZCT_STAGE_CAP_GB`` / ``ISDF_ZCT_STAGE_CAP_FRAC``.
+    """
+    per_device_gb: float
+    chunk_target_utilization: float
+    chunk_size: int               # legacy band-chunk knob; -1 = no chunking
+    band_chunk_size: int
+    r_chunk_override: int         # 0 = auto
+    zct_stage_cap_gb: float | None
+    use_aot_chunk_chooser: bool
+
+
+@dataclass(frozen=True)
+class BackendConfig:
+    """Three-axis backend selection: I/O + ψ(G) lifecycle + screening solver.
+
+    All three knobs were previously orthogonal-sounding boolean/string
+    flags in different namespaces (``use_ffi_io`` / ``gspace_mode`` /
+    ``isdf_memory_mode``) that secretly toggled FFI paths.  Grouped here
+    so :meth:`summary` can print one line at startup describing what's
+    actually active per channel.
+    """
+    slab_io: SlabIOBackend
+    gspace_io: GspaceIO
+    screening_solver: ScreeningSolver
+
+    def summary(self) -> str:
+        """One-line "what's active" for the run banner."""
+        return (
+            f"backend: slab_io={self.slab_io.value}, "
+            f"gspace_io={self.gspace_io.value}, "
+            f"screening_solver={self.screening_solver.value}"
+        )
+
+
+@dataclass(frozen=True)
+class DebugConfig:
+    """Debug-only flags + auxiliary output filenames."""
     debug_hartree: bool
     debug_omega: float | None
     sigma_debug_split_contrib: bool
@@ -474,11 +591,69 @@ class LorraxConfig:
     w_copies_debug_file: str
     sigma_freq_debug_file: str
 
-    # --- BSE interpolation setup (htransform-driven) ---
+
+@dataclass(frozen=True)
+class BSEConfig:
+    """BSE interpolation setup (htransform-driven fine-k wfn recovery).
+
+    See ``bandstructure.bse_setup.compute_wfns_fi``.  ``get_centroids_fi``
+    is the master gate; if False the rest is unused.
+    """
     get_centroids_fi: bool
     wfn_fi_min: int
     wfn_fi_max: int
     kgrid_fi: str
+
+
+@dataclass(frozen=True)
+class LorraxConfig:
+    """Unified, immutable configuration for a LORRAX GW calculation.
+
+    Created once via :meth:`from_input_file` and threaded through the
+    entire driver.  Top-level fields are ``hot-path`` reads (system
+    geometry + the orthogonal mode flags); group sub-dataclasses
+    organise the remaining ~70 input keys along the same axes the
+    input file's section comments already use.
+
+    Access pattern::
+
+        config.compute_mode           # -> ComputeMode enum
+        config.head.wcoul0_source     # head plumbing
+        config.ppm.omega_p            # PPM probe ω
+        config.backend.slab_io        # which writer backend
+        config.debug.sigma_freq_debug_output
+
+    See module docstring for the full grouping.  ``cohsex.in`` keys
+    are unchanged — input files written for prior versions still parse
+    (the factory unflattens the dict into sub-dataclasses).
+    """
+
+    # --- System geometry (top-level; hot path) ---
+    nval: int
+    ncond: int
+    nband: int
+    sys_dim: int
+
+    # --- Core mode flags (top-level; hot path) ---
+    restart: bool
+    compute_mode_raw: str         # "auto" | one of ComputeMode.value strings
+    do_screened: bool
+    bispinor: bool
+    do_G0: bool
+    self_consistent: bool
+    use_ppm_sigma: bool           # legacy mirror; ``compute_mode`` is canonical
+    no_degen_averaging: bool
+    degen_avg_tol_ry: float
+
+    # --- Sub-dataclass groups (everything else) ---
+    paths: FilePaths
+    head: HeadConfig
+    screening: ScreeningConfig
+    ppm: PPMConfig
+    memory: MemoryConfig
+    backend: BackendConfig
+    debug: DebugConfig
+    bse: BSEConfig
 
     # --- Optional parsed blocks ---
     kpoints_crystal_b: dict | None = None
@@ -495,7 +670,7 @@ class LorraxConfig:
         """Resolve ``compute_mode`` from explicit input or legacy flags.
 
         ``compute_mode = auto`` (the default) infers from
-        ``do_screened`` / ``use_ppm_sigma`` / ``ppm_model``.  An explicit
+        ``do_screened`` / ``use_ppm_sigma`` / ``ppm.model``.  An explicit
         setting overrides them; the legacy fields are still parsed for
         back-compat but the enum is the load-bearing axis the driver
         pivots on.
@@ -509,7 +684,7 @@ class LorraxConfig:
                     )
                 return (
                     ComputeMode.HL_PPM
-                    if str(self.ppm_model).strip().lower() == "hl"
+                    if str(self.ppm.model).strip().lower() == "hl"
                     else ComputeMode.GN_PPM
                 )
             return ComputeMode.COHSEX if self.do_screened else ComputeMode.X_ONLY
@@ -523,42 +698,66 @@ class LorraxConfig:
 
     @property
     def minimax_config(self):
+        """Math-internal :class:`gw.minimax_config.MinimaxConfig` for χ₀."""
         from .minimax_config import MinimaxConfig
         return MinimaxConfig(
-            target_error=self.minimax_target_error,
-            max_nodes=self.minimax_max_nodes,
-            regenerate_tables=self.regenerate_minimax_tables,
-            energy_reference=self.minimax_energy_reference,
+            target_error=self.screening.minimax_target_error,
+            max_nodes=self.screening.minimax_max_nodes,
+            regenerate_tables=self.screening.regenerate_minimax_tables,
+            energy_reference=self.screening.minimax_energy_reference,
         )
 
     @property
     def sigma_quadrature_config(self):
+        """Math-internal :class:`gw.minimax_config.SigmaQuadratureConfig`."""
         from .minimax_config import SigmaQuadratureConfig
         return SigmaQuadratureConfig(
-            target_error=self.ppm_sigma_target_error,
-            max_nodes=self.ppm_sigma_max_nodes,
-            crossing_max_nodes=max(500, self.ppm_sigma_max_nodes),
+            target_error=self.ppm.sigma_target_error,
+            max_nodes=self.ppm.sigma_max_nodes,
+            crossing_max_nodes=max(500, self.ppm.sigma_max_nodes),
             crossing_eps_q=1.0e-3,
-            regenerate_tables=self.regenerate_minimax_tables,
+            regenerate_tables=self.screening.regenerate_minimax_tables,
         )
 
     @property
     def omega_grid_ry(self):
-        """Sigma frequency grid in Rydberg."""
+        """Σ_c(ω) frequency grid in Rydberg."""
         return np.arange(
-            self.sigma_omega_min_ev / RYD_TO_EV,
-            (self.sigma_omega_max_ev + 0.5 * self.sigma_omega_step_ev) / RYD_TO_EV,
-            self.sigma_omega_step_ev / RYD_TO_EV,
+            self.ppm.omega_min_ev / RYD_TO_EV,
+            (self.ppm.omega_max_ev + 0.5 * self.ppm.omega_step_ev) / RYD_TO_EV,
+            self.ppm.omega_step_ev / RYD_TO_EV,
         )
 
     @property
     def omega_grid_ev(self):
-        """Sigma frequency grid in eV."""
+        """Σ_c(ω) frequency grid in eV."""
         return np.arange(
-            self.sigma_omega_min_ev,
-            self.sigma_omega_max_ev + 0.5 * self.sigma_omega_step_ev,
-            self.sigma_omega_step_ev,
+            self.ppm.omega_min_ev,
+            self.ppm.omega_max_ev + 0.5 * self.ppm.omega_step_ev,
+            self.ppm.omega_step_ev,
         )
+
+    # ------------------------------------------------------------------
+    #  Back-compat aliases — the FFI/IO group changed semantics (bool /
+    #  string → enum), so callers that still want the old names get
+    #  coerced views.  New code should use ``config.backend.<field>`` /
+    #  ``config.memory.<field>`` etc. directly.
+    # ------------------------------------------------------------------
+
+    @property
+    def use_ffi_io(self) -> bool:
+        """Legacy ``use_ffi_io: bool`` → ``backend.slab_io is PHDF5_FFI``."""
+        return self.backend.slab_io is SlabIOBackend.PHDF5_FFI
+
+    @property
+    def gspace_mode(self) -> str:
+        """Legacy ``gspace_mode: str`` view of ``backend.gspace_io``."""
+        return self.backend.gspace_io.value
+
+    @property
+    def isdf_memory_mode(self) -> str:
+        """Legacy ``isdf_memory_mode`` view of ``backend.screening_solver``."""
+        return _SCREENING_SOLVER_TO_LEGACY[self.backend.screening_solver]
 
     # ------------------------------------------------------------------
     #  Factory
@@ -568,8 +767,9 @@ class LorraxConfig:
     def from_input_file(cls, filename: str, *, print_fn=print) -> LorraxConfig:
         """Parse input file and resolve runtime settings (memory, env vars).
 
-        This replaces read_cohsex_input + resolve_runtime_config + path
-        resolution in a single call.
+        Replaces ``read_cohsex_input`` + ``resolve_runtime_config`` +
+        path resolution in one call.  Returns a ``LorraxConfig`` with
+        sub-dataclasses fully populated.
         """
         from file_io import resolve_input_paths
 
@@ -577,22 +777,28 @@ class LorraxConfig:
         input_dir = os.path.dirname(os.path.abspath(filename))
         resolve_input_paths(params, input_dir)
 
-        # --- Validate ---
-        isdf_memory_mode = str(params.get("isdf_memory_mode", "auto")).strip().lower()
-        if isdf_memory_mode not in ("auto", "high_mem", "low_mem"):
-            raise ValueError(f"isdf_memory_mode={isdf_memory_mode!r} invalid; "
-                             f"expected auto|high_mem|low_mem")
+        # --- Validate isdf_memory_mode (legacy string → ScreeningSolver) ---
+        isdf_memory_mode = str(
+            params.get("isdf_memory_mode", "auto")).strip().lower()
+        if isdf_memory_mode not in _LEGACY_ISDF_MEMORY_MODE:
+            raise ValueError(
+                f"isdf_memory_mode={isdf_memory_mode!r} invalid; "
+                f"expected one of {sorted(_LEGACY_ISDF_MEMORY_MODE)}"
+            )
 
         # --- Memory auto-detection ---
         memory_per_device_gb = float(params.get("memory_per_device_gb", 0.0))
         if memory_per_device_gb <= 0:
             from common.gpu_utils import get_device_memory_gb
             memory_per_device_gb = get_device_memory_gb()
-            print_fn(f"  Auto-detected memory budget: {memory_per_device_gb:.2f} GB/device")
+            print_fn(
+                f"  Auto-detected memory budget: {memory_per_device_gb:.2f} GB/device"
+            )
 
         # --- Chunk utilization from env ---
         try:
-            chunk_utilization = float(os.environ.get("ISDF_CHUNK_TARGET_UTILIZATION", "0.97"))
+            chunk_utilization = float(
+                os.environ.get("ISDF_CHUNK_TARGET_UTILIZATION", "0.97"))
         except Exception:
             chunk_utilization = 0.97
         chunk_utilization = max(0.85, min(1.0, chunk_utilization))
@@ -604,10 +810,12 @@ class LorraxConfig:
         zct_frac_env = os.environ.get("ISDF_ZCT_STAGE_CAP_FRAC")
         if zct_cap_env:
             try:
-                zct_stage_cap_gb = min(memory_per_device_gb, max(0.0, float(zct_cap_env)))
+                zct_stage_cap_gb = min(
+                    memory_per_device_gb, max(0.0, float(zct_cap_env)))
             except Exception:
                 pass
-        if zct_stage_cap_gb is None and zct_frac_env and jax.default_backend() in ("gpu", "cuda"):
+        if (zct_stage_cap_gb is None and zct_frac_env
+                and jax.default_backend() in ("gpu", "cuda")):
             from common.gpu_utils import get_device_memory_info
             total_gb = float(get_device_memory_info().get("total_gb", 0.0))
             if total_gb > 0:
@@ -617,104 +825,123 @@ class LorraxConfig:
                 except Exception:
                     pass
 
-        def _get(key):
+        def _g(key):
             return params.get(key, _DEFAULTS.get(key))
 
-        return cls(
-            # System
-            nval=int(_get("nval")),
-            ncond=int(_get("ncond")),
-            nband=int(_get("nband")),
-            sys_dim=int(_get("sys_dim")),
-            # Paths
-            wfn_file=str(_get("wfn_file")),
-            centroids_file=str(_get("centroids_file")),
-            kin_ion_file=str(_get("kin_ion_file")),
-            sigma_diag_file=str(_get("sigma_diag_file")),
-            eqp0_file=str(_get("eqp0_file")),
-            eqp1_file=str(_get("eqp1_file")),
-            sigma_omega_h5_file=str(_get("sigma_omega_h5_file")),
-            sigma_kij_h5_file=str(_get("sigma_kij_h5_file") or ""),
-            # Core flags
-            restart=bool(_get("restart")),
-            compute_mode_raw=str(_get("compute_mode") or "auto").strip().lower(),
-            do_screened=bool(_get("do_screened")),
-            bispinor=bool(_get("bispinor")),
-            do_G0=bool(_get("do_G0")),
-            no_degen_averaging=bool(_get("no_degen_averaging")),
-            degen_avg_tol_ry=float(_get("degen_avg_tol_ry")),
-            self_consistent=bool(_get("self_consistent")),
-            use_ppm_sigma=bool(_get("use_ppm_sigma")),
-            use_ffi_io=bool(_get("use_ffi_io")),
-            gspace_mode=str(_get("gspace_mode")),
-            use_aot_chunk_chooser=bool(_get("use_aot_chunk_chooser")),
-            # Memory / chunking
-            memory_per_device_gb=memory_per_device_gb,
+        # --- Build sub-dataclasses ---
+        paths = FilePaths(
+            wfn_file=str(_g("wfn_file")),
+            centroids_file=str(_g("centroids_file")),
+            kin_ion_file=str(_g("kin_ion_file")),
+            sigma_diag_file=str(_g("sigma_diag_file")),
+            eqp0_file=str(_g("eqp0_file")),
+            eqp1_file=str(_g("eqp1_file")),
+            sigma_omega_h5_file=str(_g("sigma_omega_h5_file")),
+            sigma_kij_h5_file=str(_g("sigma_kij_h5_file") or ""),
+        )
+        head = HeadConfig(
+            wcoul0_source=str(_g("wcoul0_source")).strip().lower(),
+            wcoul0_eta=float(_g("wcoul0_eta") or 0.0),
+            vhead=_g("vhead"),
+            whead_0freq=_g("whead_0freq"),
+            whead_imfreq=_g("whead_imfreq"),
+            mc_average_vcoul_body=bool(_g("mc_average_vcoul_body")),
+            bare_coulomb_cutoff=_g("bare_coulomb_cutoff"),
+            use_bgw_vcoul=bool(_g("use_bgw_vcoul")),
+            bgw_vcoul_file=(str(_g("bgw_vcoul_file")) or None),
+            bgw_vcoul_sym_wfn=(str(_g("bgw_vcoul_sym_wfn")) or None),
+        )
+        screening = ScreeningConfig(
+            method=str(_g("screening_method")).strip().lower(),
+            minimax_target_error=float(_g("minimax_target_error")),
+            minimax_max_nodes=int(_g("minimax_max_nodes")),
+            regenerate_minimax_tables=bool(_g("regenerate_minimax_tables")),
+            minimax_energy_reference=str(_g("minimax_energy_reference")).strip().lower(),
+        )
+        ppm = PPMConfig(
+            model=str(_g("ppm_model")).strip().lower(),
+            omega_p=float(_g("ppm_omega_p")),
+            fallback_omega=float(_g("ppm_fallback_omega")),
+            head_omega_h_ry=(
+                float(_g("ppm_head_omega_h_ry"))
+                if _g("ppm_head_omega_h_ry") is not None else None),
+            sigma_target_error=float(_g("ppm_sigma_target_error")),
+            sigma_max_nodes=int(_g("ppm_sigma_max_nodes")),
+            omega_min_ev=float(_g("sigma_omega_min_ev")),
+            omega_max_ev=float(_g("sigma_omega_max_ev")),
+            omega_step_ev=float(_g("sigma_omega_step_ev")),
+            regularization_ev=float(_g("sigma_regularization_ev")),
+            window_edge_factor=float(_g("sigma_window_edge_factor")),
+            omega_batch_size=int(_g("sigma_omega_batch_size")),
+            omega_accumulation=str(_g("sigma_omega_accumulation")).strip().lower(),
+            sigma_scale=float(_g("ppm_sigma_scale")),
+            sigma_flip_neg=bool(_g("ppm_sigma_flip_neg")),
+            invalid_mode=str(_g("ppm_invalid_mode") or "static_limit"),
+            fermi_reference=str(_g("fermi_reference")).strip().lower(),
+            sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
+            sigma_at_dft_energies=bool(_g("sigma_at_dft_energies")),
+        )
+        memory = MemoryConfig(
+            per_device_gb=memory_per_device_gb,
             chunk_target_utilization=chunk_utilization,
-            chunk_size=int(_get("chunk_size")),
-            band_chunk_size=int(_get("band_chunk_size")),
-            r_chunk_override=int(_get("r_chunk_size")),
+            chunk_size=int(_g("chunk_size")),
+            band_chunk_size=int(_g("band_chunk_size")),
+            r_chunk_override=int(_g("r_chunk_size")),
             zct_stage_cap_gb=zct_stage_cap_gb,
-            # ISDF
-            isdf_memory_mode=isdf_memory_mode,
-            mc_average_vcoul_body=bool(_get("mc_average_vcoul_body")),
-            bare_coulomb_cutoff=_get("bare_coulomb_cutoff"),
-            use_bgw_vcoul=bool(_get("use_bgw_vcoul")),
-            bgw_vcoul_file=(str(_get("bgw_vcoul_file")) or None),
-            bgw_vcoul_sym_wfn=(str(_get("bgw_vcoul_sym_wfn")) or None),
-            # Coulomb head
-            wcoul0_source=str(_get("wcoul0_source")).strip().lower(),
-            wcoul0_eta=float(_get("wcoul0_eta") or 0.0),
-            vhead=_get("vhead"),
-            whead_0freq=_get("whead_0freq"),
-            whead_imfreq=_get("whead_imfreq"),
-            # Screening
-            screening_method=str(_get("screening_method")).strip().lower(),
-            minimax_target_error=float(_get("minimax_target_error")),
-            minimax_max_nodes=int(_get("minimax_max_nodes")),
-            regenerate_minimax_tables=bool(_get("regenerate_minimax_tables")),
-            minimax_energy_reference=str(_get("minimax_energy_reference")).strip().lower(),
-            # PPM
-            ppm_model=str(_get("ppm_model")).strip().lower(),
-            ppm_omega_p=float(_get("ppm_omega_p")),
-            ppm_fallback_omega=float(_get("ppm_fallback_omega")),
-            ppm_head_omega_h_ry=(
-                float(_get("ppm_head_omega_h_ry"))
-                if _get("ppm_head_omega_h_ry") is not None else None),
-            ppm_sigma_target_error=float(_get("ppm_sigma_target_error")),
-            ppm_sigma_max_nodes=int(_get("ppm_sigma_max_nodes")),
-            # Sigma grid
-            sigma_omega_min_ev=float(_get("sigma_omega_min_ev")),
-            sigma_omega_max_ev=float(_get("sigma_omega_max_ev")),
-            sigma_omega_step_ev=float(_get("sigma_omega_step_ev")),
-            sigma_regularization_ev=float(_get("sigma_regularization_ev")),
-            sigma_window_edge_factor=float(_get("sigma_window_edge_factor")),
-            sigma_omega_batch_size=int(_get("sigma_omega_batch_size")),
-            sigma_omega_accumulation=str(_get("sigma_omega_accumulation")).strip().lower(),
-            # PPM sigma
-            ppm_sigma_scale=float(_get("ppm_sigma_scale")),
-            ppm_sigma_flip_neg=bool(_get("ppm_sigma_flip_neg")),
-            ppm_invalid_mode=str(_get("ppm_invalid_mode") or "static_limit"),
-            fermi_reference=str(_get("fermi_reference")).strip().lower(),
-            sigma_at_dft_extrapolate=bool(_get("sigma_at_dft_extrapolate")),
-            sigma_at_dft_energies=bool(_get("sigma_at_dft_energies")),
-            # Debug
-            debug_hartree=bool(_get("debug_hartree")),
-            debug_omega=_get("debug_omega"),
-            sigma_debug_split_contrib=bool(_get("sigma_debug_split_contrib")),
-            sigma_freq_debug_output=bool(_get("sigma_freq_debug_output")),
-            ppm_sigma_debug_static_norm=bool(_get("ppm_sigma_debug_static_norm")),
-            ppm_static_cohsex_check=bool(_get("ppm_static_cohsex_check")),
-            sigma_debug_quadrature=bool(_get("sigma_debug_quadrature")),
-            sigma_debug_quadrature_samples=int(_get("sigma_debug_quadrature_samples")),
-            write_w_copies_debug=bool(_get("write_w_copies_debug")),
-            w_copies_debug_file=str(_get("w_copies_debug_file") or ""),
-            sigma_freq_debug_file=str(_get("sigma_freq_debug_file")),
-            # BSE interpolation setup
-            get_centroids_fi=bool(_get("get_centroids_fi")),
-            wfn_fi_min=int(_get("wfn_fi_min")),
-            wfn_fi_max=int(_get("wfn_fi_max")),
-            kgrid_fi=str(_get("kgrid_fi") or ""),
+            use_aot_chunk_chooser=bool(_g("use_aot_chunk_chooser")),
+        )
+        backend = BackendConfig(
+            slab_io=(
+                SlabIOBackend.PHDF5_FFI if bool(_g("use_ffi_io"))
+                else SlabIOBackend.H5PY_ALLGATHER
+            ),
+            gspace_io=GspaceIO(str(_g("gspace_mode")).strip().lower()),
+            screening_solver=_LEGACY_ISDF_MEMORY_MODE[isdf_memory_mode],
+        )
+        debug = DebugConfig(
+            debug_hartree=bool(_g("debug_hartree")),
+            debug_omega=_g("debug_omega"),
+            sigma_debug_split_contrib=bool(_g("sigma_debug_split_contrib")),
+            sigma_freq_debug_output=bool(_g("sigma_freq_debug_output")),
+            ppm_sigma_debug_static_norm=bool(_g("ppm_sigma_debug_static_norm")),
+            ppm_static_cohsex_check=bool(_g("ppm_static_cohsex_check")),
+            sigma_debug_quadrature=bool(_g("sigma_debug_quadrature")),
+            sigma_debug_quadrature_samples=int(_g("sigma_debug_quadrature_samples")),
+            write_w_copies_debug=bool(_g("write_w_copies_debug")),
+            w_copies_debug_file=str(_g("w_copies_debug_file") or ""),
+            sigma_freq_debug_file=str(_g("sigma_freq_debug_file")),
+        )
+        bse = BSEConfig(
+            get_centroids_fi=bool(_g("get_centroids_fi")),
+            wfn_fi_min=int(_g("wfn_fi_min")),
+            wfn_fi_max=int(_g("wfn_fi_max")),
+            kgrid_fi=str(_g("kgrid_fi") or ""),
+        )
+
+        return cls(
+            # Top-level: system + mode flags
+            nval=int(_g("nval")),
+            ncond=int(_g("ncond")),
+            nband=int(_g("nband")),
+            sys_dim=int(_g("sys_dim")),
+            restart=bool(_g("restart")),
+            compute_mode_raw=str(_g("compute_mode") or "auto").strip().lower(),
+            do_screened=bool(_g("do_screened")),
+            bispinor=bool(_g("bispinor")),
+            do_G0=bool(_g("do_G0")),
+            self_consistent=bool(_g("self_consistent")),
+            use_ppm_sigma=bool(_g("use_ppm_sigma")),
+            no_degen_averaging=bool(_g("no_degen_averaging")),
+            degen_avg_tol_ry=float(_g("degen_avg_tol_ry")),
+            # Sub-dataclass groups
+            paths=paths,
+            head=head,
+            screening=screening,
+            ppm=ppm,
+            memory=memory,
+            backend=backend,
+            debug=debug,
+            bse=bse,
             # Parsed blocks
             kpoints_crystal_b=params.get("kpoints_crystal_b"),
             input_dir=input_dir,

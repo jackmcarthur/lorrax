@@ -219,12 +219,13 @@ class HeadResolver:
                  "_print_fn", "_cache")
 
     def __init__(self, config, input_dir, wfn, sym, meta, print_fn):
+        head = config.head
         self._params = {
-            "wcoul0_source": config.wcoul0_source,
-            "wcoul0_eta": config.wcoul0_eta,
-            "vhead": config.vhead,
-            "whead_0freq": config.whead_0freq,
-            "whead_imfreq": config.whead_imfreq,
+            "wcoul0_source": head.wcoul0_source,
+            "wcoul0_eta": head.wcoul0_eta,
+            "vhead": head.vhead,
+            "whead_0freq": head.whead_0freq,
+            "whead_imfreq": head.whead_imfreq,
         }
         self._input_dir = input_dir
         self._wfn = wfn

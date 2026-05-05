@@ -10,7 +10,7 @@ import h5py
 import numpy as np
 
 from common.units import RYD_TO_EV
-from .gw_config import LorraxConfig
+from .gw_config import LorraxConfig, SlabIOBackend
 
 
 @dataclass(frozen=True)
@@ -152,7 +152,7 @@ def setup_runtime(config: LorraxConfig, mesh_xy, *, print_fn=print) -> None:
     with _timing.section("nccl_warmup"):
         nccl_warmup(mesh_xy)
 
-    if config.use_ffi_io:
+    if config.backend.slab_io is SlabIOBackend.PHDF5_FFI:
         try:
             from ffi.common.ffi_loader import phdf5_init_mpi
             phdf5_init_mpi()
@@ -175,23 +175,26 @@ def build_bgw_v_grid_fn(
 ) -> Optional[Callable[[tuple], np.ndarray]]:
     """Build the optional BGW vcoul override closure (or None).
 
-    When ``config.use_bgw_vcoul`` is set the GW driver substitutes BGW's
-    MC-averaged ``v(q+G)`` for LORRAX's internal head-only mini-BZ
-    average — this enables bit-reproducible BGW comparisons.  The
-    returned callable maps a fractional q-tuple to a dense G-grid of
-    Coulomb values; pass it through to ``compute_V_q``.
+    When ``config.head.use_bgw_vcoul`` is set the GW driver substitutes
+    BGW's MC-averaged ``v(q+G)`` for LORRAX's internal head-only
+    mini-BZ average — this enables bit-reproducible BGW comparisons.
+    The returned callable maps a fractional q-tuple to a dense G-grid
+    of Coulomb values; pass it through to ``compute_V_q``.
 
     Returns ``None`` when the override is disabled, so callers can do
     ``bgw_v_grid_fn = build_bgw_v_grid_fn(...)`` unconditionally.
     """
-    if not config.use_bgw_vcoul:
+    head = config.head
+    if not head.use_bgw_vcoul:
         return None
-    if config.bgw_vcoul_file is None:
-        raise ValueError("use_bgw_vcoul=true requires bgw_vcoul_file to be set")
+    if head.bgw_vcoul_file is None:
+        raise ValueError(
+            "head.use_bgw_vcoul=true requires head.bgw_vcoul_file to be set"
+        )
 
     from file_io import read_bgw_vcoul, fill_v_grid_for_q
 
-    bgw_path = _resolve_input_path(input_dir, config.bgw_vcoul_file)
+    bgw_path = _resolve_input_path(input_dir, head.bgw_vcoul_file)
     print_fn(f"  BGW vcoul override: loading {bgw_path}")
     bgw_table = read_bgw_vcoul(bgw_path)
     print_fn(
@@ -206,8 +209,8 @@ def build_bgw_v_grid_fn(
     # full-BZ q to those needs the full crystal sym group.  A nosym WFN
     # stores only identity in mf_header/symmetry/mtrx, so allow pulling
     # the 48 ops from an aux sym-reduced WFN when provided.
-    if config.bgw_vcoul_sym_wfn:
-        aux_path = _resolve_input_path(input_dir, config.bgw_vcoul_sym_wfn)
+    if head.bgw_vcoul_sym_wfn:
+        aux_path = _resolve_input_path(input_dir, head.bgw_vcoul_sym_wfn)
         with h5py.File(aux_path, "r") as fsym:
             sym_real = np.asarray(
                 fsym["mf_header/symmetry/mtrx"][:], dtype=np.int32)
@@ -229,49 +232,49 @@ def build_ppm_sigma_runtime_options(
     config: LorraxConfig, *, input_dir: str
 ) -> PPMSigmaRuntimeOptions:
     """Build PPM sigma runtime options from a ``LorraxConfig``."""
+    ppm = config.ppm
+    debug = config.debug
 
-    if config.sigma_omega_step_ev <= 0.0:
-        raise ValueError("sigma_omega_step_ev must be > 0.")
-    if config.sigma_omega_max_ev < config.sigma_omega_min_ev:
-        raise ValueError("sigma_omega_max_ev must be >= sigma_omega_min_ev.")
-    if config.fermi_reference not in ("vbm", "midgap"):
-        raise ValueError("fermi_reference must be 'vbm' or 'midgap'.")
+    if ppm.omega_step_ev <= 0.0:
+        raise ValueError("ppm.omega_step_ev must be > 0.")
+    if ppm.omega_max_ev < ppm.omega_min_ev:
+        raise ValueError("ppm.omega_max_ev must be >= ppm.omega_min_ev.")
+    if ppm.fermi_reference not in ("vbm", "midgap"):
+        raise ValueError("ppm.fermi_reference must be 'vbm' or 'midgap'.")
 
     n_omega = int(np.floor(
-        (config.sigma_omega_max_ev - config.sigma_omega_min_ev)
-        / config.sigma_omega_step_ev + 0.5
+        (ppm.omega_max_ev - ppm.omega_min_ev) / ppm.omega_step_ev + 0.5
     )) + 1
     omega_grid_ev = (
-        config.sigma_omega_min_ev
-        + config.sigma_omega_step_ev * np.arange(n_omega, dtype=np.float64)
+        ppm.omega_min_ev + ppm.omega_step_ev * np.arange(n_omega, dtype=np.float64)
     )
     omega_grid_ry = omega_grid_ev / RYD_TO_EV
-    sigma_regularization_ry = config.sigma_regularization_ev / RYD_TO_EV
+    sigma_regularization_ry = ppm.regularization_ev / RYD_TO_EV
 
     return PPMSigmaRuntimeOptions(
-        omega_p_ry=float(config.ppm_omega_p),
-        ppm_fallback=float(config.ppm_fallback_omega),
+        omega_p_ry=float(ppm.omega_p),
+        ppm_fallback=float(ppm.fallback_omega),
         omega_grid_ev=omega_grid_ev,
         omega_grid_ry=omega_grid_ry,
         sigma_regularization_ry=sigma_regularization_ry,
-        sigma_edge_factor=float(config.sigma_window_edge_factor),
-        sigma_omega_batch_size=int(max(1, config.sigma_omega_batch_size)),
-        sigma_omega_accumulation=str(config.sigma_omega_accumulation).strip().lower(),
-        ppm_sigma_scale=float(config.ppm_sigma_scale),
-        ppm_sigma_flip_neg=bool(config.ppm_sigma_flip_neg),
-        ppm_invalid_mode=str(config.ppm_invalid_mode).strip().lower(),
-        sigma_debug_split_contrib=bool(config.sigma_debug_split_contrib),
-        sigma_freq_debug_output=bool(config.sigma_freq_debug_output),
-        fermi_reference=str(config.fermi_reference).strip().lower(),
-        sigma_at_dft_extrapolate=bool(config.sigma_at_dft_extrapolate),
-        sigma_at_dft_energies=bool(config.sigma_at_dft_energies),
-        ppm_sigma_debug_static_norm=bool(config.ppm_sigma_debug_static_norm),
-        ppm_static_cohsex_check=bool(config.ppm_static_cohsex_check),
-        sigma_debug_quadrature=bool(config.sigma_debug_quadrature),
-        sigma_debug_quadrature_samples=int(config.sigma_debug_quadrature_samples),
-        sigma_kij_h5_path=_resolve_input_path(input_dir, str(config.sigma_kij_h5_file or "").strip()),
-        write_w_copies_debug=bool(config.write_w_copies_debug),
-        w_copies_debug_file=_resolve_input_path(input_dir, str(config.w_copies_debug_file or "").strip()),
-        sigma_freq_debug_file=_resolve_input_path(input_dir, str(config.sigma_freq_debug_file or "").strip()),
-        use_ffi_io=bool(config.use_ffi_io),
+        sigma_edge_factor=float(ppm.window_edge_factor),
+        sigma_omega_batch_size=int(max(1, ppm.omega_batch_size)),
+        sigma_omega_accumulation=str(ppm.omega_accumulation).strip().lower(),
+        ppm_sigma_scale=float(ppm.sigma_scale),
+        ppm_sigma_flip_neg=bool(ppm.sigma_flip_neg),
+        ppm_invalid_mode=str(ppm.invalid_mode).strip().lower(),
+        sigma_debug_split_contrib=bool(debug.sigma_debug_split_contrib),
+        sigma_freq_debug_output=bool(debug.sigma_freq_debug_output),
+        fermi_reference=str(ppm.fermi_reference).strip().lower(),
+        sigma_at_dft_extrapolate=bool(ppm.sigma_at_dft_extrapolate),
+        sigma_at_dft_energies=bool(ppm.sigma_at_dft_energies),
+        ppm_sigma_debug_static_norm=bool(debug.ppm_sigma_debug_static_norm),
+        ppm_static_cohsex_check=bool(debug.ppm_static_cohsex_check),
+        sigma_debug_quadrature=bool(debug.sigma_debug_quadrature),
+        sigma_debug_quadrature_samples=int(debug.sigma_debug_quadrature_samples),
+        sigma_kij_h5_path=_resolve_input_path(input_dir, str(config.paths.sigma_kij_h5_file or "").strip()),
+        write_w_copies_debug=bool(debug.write_w_copies_debug),
+        w_copies_debug_file=_resolve_input_path(input_dir, str(debug.w_copies_debug_file or "").strip()),
+        sigma_freq_debug_file=_resolve_input_path(input_dir, str(debug.sigma_freq_debug_file or "").strip()),
+        use_ffi_io=bool(config.backend.slab_io is SlabIOBackend.PHDF5_FFI),
     )
