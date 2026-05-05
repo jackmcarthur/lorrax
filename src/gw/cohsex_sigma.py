@@ -17,6 +17,8 @@ optional and applied to SX/COH (and to the bare-X pass separately).
 """
 from __future__ import annotations
 
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -364,6 +366,214 @@ def _make_sigma_x_lorentz_kernel(mesh_xy: Mesh, kgrid, nk_tot: int):
 _sigma_x_lorentz_cache: dict[tuple[object, ...], object] = {}
 
 
+# ---------------------------------------------------------------------------
+# Bispinor Hartree Σ_H^B
+# ---------------------------------------------------------------------------
+#
+# The bispinor Hartree-tadpole is
+#
+#   Σ_H^{αβ}(r) = γ̃^{μ_L}_{αβ} ∫dr' D^{μ_L,ν_L}(r,r') ρ^{ν_L}(r')
+#
+# with the 4-component density (Lorentz channel ν_L):
+#
+#   ρ^{ν_L}(r) = tr[γ̃^{ν_L} G(r,r⁺)] = Σ_{n∈occ,αβ} ψ*_{n,α}(r) γ̃^{ν_L}_{αβ} ψ_{n,β}(r)
+#
+# In ISDF basis at centroids (μ_X, μ_Y):
+#
+#   Σ_H^B(k,m,n) = Σ_{μ_L,ν_L,μ_X,μ_Y}
+#       [ψ*_{m,k,α} γ̃^{μ_L}_{αβ} ψ_{n,k,β}](μ_X)        ← LEFT (γ̃^{μ_L} pair density)
+#     · V^{μ_L,ν_L}_{q=0}(μ_X,μ_Y) / N_k                 ← V tile q=0 slice
+#     · ρ^{ν_L}(μ_Y)                                      ← RIGHT (γ̃^{ν_L} 4-density)
+#
+# The transverse-projector V^{μ_L,ν_L}_q(G) ∝ (δ_{ij} − K̂_iK̂_j) for
+# i,j ∈ {1,2,3} is zero on the (0,i)/(i,0) cross-charge-current channels,
+# so V_blocks only carries 10 non-zero (μ_L, ν_L) tiles and the loop
+# below naturally skips the gauge-zero ones.
+#
+# Centroid-set dispatch (same rule as Σ_X^B, no mixed-bundle case):
+#   (0,0):       wfns_charge  on both sides    (charge centroids)
+#   (i,j) i,j∈{1,2,3}: wfns_current on both sides   (current centroids)
+#
+# Sharding flow (per μ_L group):
+#   ψ_yr  P(None,None,None,'y')    →   ρ^{ν_L}  P('y')        — local
+#   V_block[0,0,0]  P('x','y')                                  — file-staged
+#   V_H^{μ_L}(μ_X) = Σ_ν V[0,0,0] · ρ^ν / N_k   P('x')         — local matvec
+#   ψ_xr  P(None,None,None,'x') × V_H^{μ_L}     × ψ_xr         — local
+# No collectives inside any per-tile kernel.
+
+_sigma_h_lorentz_cache: dict[tuple[object, ...], tuple] = {}
+_rho_lorentz_cache: dict[tuple[object, ...], object] = {}
+
+
+def _make_rho_lorentz_kernel(mesh_xy: Mesh):
+    """Cached factory for the band-summed 4-density at centroids.
+
+    Returns ``f(psi_yr_sigma, Gij, gamma_tilde) → ρ^{ν_L}(μ_Y)`` of shape
+    ``(n_rmu_Y,)``, sharded ``P('y')``, complex128 (mathematically real
+    for Hermitian γ̃ but kept c128 to match V's dtype downstream).
+
+    Reuses the structure of the scalar Hartree's ρ-build but inserts γ̃
+    between the conjugated and direct ψ on the spinor axes:
+
+        ρ^{ν_L}(μ) = Σ_{k,i,j,α,β}
+                     ψ*_{i,k,α}(μ) γ̃^{ν_L}_{αβ} ψ_{j,k,β}(μ) G_{ij}(k)
+    """
+    cache_key = (id(mesh_xy),)
+    hit = _rho_lorentz_cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    psi_y_sh = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+    Gij_sh   = NamedSharding(mesh_xy, P(None, None, None))
+    gamma_sh = NamedSharding(mesh_xy, P())
+    rho_sh   = NamedSharding(mesh_xy, P('y'))
+
+    @partial(
+        jax.jit,
+        in_shardings=(psi_y_sh, Gij_sh, gamma_sh),
+        out_shardings=rho_sh,
+    )
+    def _rho_lorentz(psi_yr_sigma, Gij, gamma_tilde):
+        rho = jnp.einsum(
+            'kiay, ab, kjby, kij -> y',
+            jnp.conj(psi_yr_sigma), gamma_tilde, psi_yr_sigma, Gij,
+            optimize=True)
+        # Hermitian γ̃ ⇒ ρ is real-valued; .real denoises the einsum, then
+        # cast back to c128 to keep V·ρ on the c128 path.
+        return jnp.real(rho).astype(jnp.complex128)
+
+    _rho_lorentz_cache[cache_key] = _rho_lorentz
+    return _rho_lorentz
+
+
+def _make_sigma_h_lorentz_kernel(mesh_xy: Mesh, nk_tot: int):
+    """Cached factory: the V_H × γ̃ × ψ̄ψ band-projection.
+
+    Two pieces:
+
+    * ``apply_v_q0_to_rho(V_block_q0, rho)`` — q=0 V tile times ρ on
+      the matching centroid set.  Pure local matvec (V is P('x','y'),
+      ρ is P('y'), result V_H is P('x')).  Accumulates into the
+      caller's per-μ_L V_H sum.
+
+    * ``project_v_h(psi_xr_sigma, gamma_tilde, V_H_mu_L)`` — final
+      Σ_H^{(μ_L)} band projection with γ̃^{μ_L} between the two outer
+      ψ's spinor axes.  Local product over (m,n,α,β,μ_X).
+    """
+    cache_key = (id(mesh_xy), int(nk_tot))
+    hit = _sigma_h_lorentz_cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    V_q0_sh   = NamedSharding(mesh_xy, P('x', 'y'))
+    rho_sh    = NamedSharding(mesh_xy, P('y'))
+    V_H_sh    = NamedSharding(mesh_xy, P('x'))
+    psi_x_sh  = NamedSharding(mesh_xy, P(None, None, None, 'x'))
+    gamma_sh  = NamedSharding(mesh_xy, P())
+    rep_3d    = NamedSharding(mesh_xy, P(None, None, None))
+
+    inv_nk = 1.0 / float(nk_tot)
+
+    @partial(
+        jax.jit,
+        in_shardings=(V_q0_sh, rho_sh),
+        out_shardings=V_H_sh,
+    )
+    def apply_v_q0_to_rho(V_block_q0, rho):
+        return jnp.einsum('xy, y -> x', V_block_q0, rho, optimize=True) * inv_nk
+
+    @partial(
+        jax.jit,
+        in_shardings=(psi_x_sh, gamma_sh, V_H_sh),
+        out_shardings=rep_3d,
+    )
+    def project_v_h(psi_xr_sigma, gamma_tilde, V_H_mu_L):
+        return jnp.einsum(
+            'kmax, ab, x, knbx -> kmn',
+            jnp.conj(psi_xr_sigma), gamma_tilde, V_H_mu_L, psi_xr_sigma,
+            optimize=True)
+
+    out = (apply_v_q0_to_rho, project_v_h)
+    _sigma_h_lorentz_cache[cache_key] = out
+    return out
+
+
+def compute_sigma_h_lorentz(
+    wfns_charge,
+    wfns_current,
+    V_blocks: dict,
+    meta,
+    mesh_xy: Mesh,
+    *,
+    Gij: jax.Array | None = None,
+    print_fn=print,
+) -> jax.Array:
+    """Bispinor Hartree self-energy Σ_H^B summed over the (μ_L, ν_L)
+    Lorentz tiles in ``V_blocks``.
+
+    Parameters mirror :func:`compute_sigma_x_lorentz`.  Returns a
+    rank-3 ``(n_k, n_b_sigma, n_b_sigma)`` array (replicated).
+    """
+    if Gij is None:
+        Gij = build_Gij(meta, mesh_xy)
+    if wfns_charge is None or wfns_current is None:
+        raise ValueError(
+            "compute_sigma_h_lorentz requires both charge and current "
+            "wavefunction bundles.")
+
+    rho_kernel = _make_rho_lorentz_kernel(mesh_xy)
+    apply_v_q0, project_v_h = _make_sigma_h_lorentz_kernel(
+        mesh_xy, int(meta.nk_tot))
+
+    rep = NamedSharding(mesh_xy, P())
+    gammas = {mu: jax.device_put(_gamma_tilde_4x4(mu), rep)
+              for mu in (0, 1, 2, 3)}
+
+    s_charge = wfns_charge.slices
+    s_current = wfns_current.slices
+
+    # Step 1: ρ^{ν_L}(μ_Y) per Lorentz channel, on the matching bundle.
+    with mesh_xy:
+        rho = {0: rho_kernel(wfns_charge.yr(s_charge.sigma), Gij, gammas[0])}
+        for nu in (1, 2, 3):
+            rho[nu] = rho_kernel(
+                wfns_current.yr(s_current.sigma), Gij, gammas[nu])
+
+    # Step 2: V_H^{μ_L}(μ_X) = Σ_ν_L V^{μ_L,ν_L}_{q=0}(μ_X, μ_Y) ρ^{ν_L}(μ_Y) / N_k
+    # accumulated per μ_L from the (μ_L, ν_L) dict entries that exist
+    # (non-zero gauge tiles only).
+    V_H: dict[int, jax.Array] = {}
+    with mesh_xy:
+        for (mu_L, nu_L), V_block in V_blocks.items():
+            V_q0 = V_block[0, 0, 0]   # (n_rmu_X, n_rmu_Y) sharded P('x','y')
+            contrib = apply_v_q0(V_q0, rho[int(nu_L)])
+            mu = int(mu_L)
+            V_H[mu] = contrib if mu not in V_H else V_H[mu] + contrib
+
+    # Step 3: project each μ_L into band space with the matching bundle.
+    sig_h = None
+    contributions: dict[int, float] = {}
+    with mesh_xy:
+        for mu_L, V_H_mu in V_H.items():
+            bundle = wfns_charge if mu_L == 0 else wfns_current
+            s = bundle.slices
+            contrib = project_v_h(
+                bundle.xr(s.sigma), gammas[mu_L], V_H_mu)
+            contrib.block_until_ready()
+            try:
+                tr = float(jnp.einsum('kmm->', contrib).real)
+            except Exception:
+                tr = float('nan')
+            contributions[mu_L] = tr
+            sig_h = contrib if sig_h is None else (sig_h + contrib)
+
+    print_fn(f"\n  Σ_H^B (bispinor) per-μ_L diagonal trace contributions:")
+    for mu_L, tr in sorted(contributions.items()):
+        print_fn(f"      μ_L={mu_L}: tr Σ_H = {tr:+.6f} eV  "
+                 f"(bundle = {'charge' if mu_L == 0 else 'current'})")
+    return sig_h
+
+
 def compute_sigma_x_lorentz(
     wfns_charge,
     wfns_current,
@@ -490,21 +700,14 @@ def compute_cohsex_sigma_bispinor(
     if Gij is None:
         Gij = build_Gij(meta, mesh_xy)
 
-    # Hartree V_H = ⟨n| V(q=0) ρ |n⟩.  In the bispinor pipeline ρ is
-    # the charge density ψ̄ γ̃^0 ψ = ψ† ψ (the (0,0) Lorentz channel),
-    # so V_H couples only to ``V_blocks[(0,0)]`` and the CHARGE
-    # centroid bundle.  Reuse the existing scalar Hartree kernel by
-    # passing it the rank-3 V_q from the (0,0) tile (kgrid-shape) flat-
-    # q-reshaped — same structure compute_cohsex_sigma feeds it in the
-    # non-bispinor path.
-    sigma_sx_k, sigma_coh_k, hartree_k = _make_cohsex_kernels(
-        mesh_xy, meta.kgrid, int(meta.nk_tot))
-    nq = int(meta.nk_tot)
-    V00_kgrid = V_blocks[(0, 0)]
-    V00_flat = V00_kgrid.reshape(nq, *V00_kgrid.shape[-2:])
-    with mesh_xy:
-        sig_h = hartree_k(wfns_charge, Gij, V00_flat)
-        sig_h.block_until_ready()
+    # Hartree Σ_H^B over the 10 V_q^{μ_L,ν_L} Lorentz tiles — γ̃^{μ_L}
+    # left-vertex × ψ̄ψ × V^{μ_L,ν_L}_{q=0} × ρ^{ν_L}(μ_Y) — using the
+    # charge bundle for μ_L=0 and current for μ_L∈{1,2,3}.  The
+    # gauge-zero (0,i)/(i,0) tiles are absent from V_blocks and skipped
+    # naturally.  See ``compute_sigma_h_lorentz`` for the derivation.
+    sig_h = compute_sigma_h_lorentz(
+        wfns_charge, wfns_current, V_blocks, meta, mesh_xy,
+        Gij=Gij, print_fn=print_fn)
 
     sig_x = None
     if compute_bare_x:
