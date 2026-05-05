@@ -1351,11 +1351,24 @@ def _choose_v_q_chunks(
     budget_bytes: float,
     p_x: int,
     p_y: int,
+    n_rtot: int | None = None,
 ) -> dict:
     """Pick (q_chunk, μ_chunk) per the memory model documented above.
 
     Subtracts the V_ref/g0_ref accumulator bytes from the total budget
     FIRST, then sizes the compute-transient portion of the budget.
+
+    Parameters
+    ----------
+    n_rmu, n_G, n_q_total : int
+        Centroid count, sphere-G count (post-cutoff), kgrid prod.
+    n_rtot : int | None
+        Full real-space grid size = ``nx*ny*nz``.  When provided, the
+        chooser adds an n_rtot-shaped term to the per-q footprint to
+        account for the cuFFT 5-D plan transients (input + output +
+        planner scratch + disk-read buffer) that live concurrent with
+        the post-FFT G-sphere slab.  Setting ``n_rtot=None`` recovers
+        the legacy n_G-only model.
 
     Returns a dict with keys:
         q_chunk       : int — number of q per sharded-compute call
@@ -1382,15 +1395,33 @@ def _choose_v_q_chunks(
     # sqrt_v(q+G) table lives replicated on each rank.
     v_per_q_bytes = N_zeta * n_G
 
-    # Per-q compute footprint: nominally (two gathered ζ copies +
-    # workspace) = 3 × μ × G / P_min.  Empirical AOT measurement
-    # across (MoS2, Si 10³) × (4, 8, 16, 28, 35 GB) showed a consistent
-    # 1.45× under-prediction — the FFT+gather pipeline holds additional
-    # XLA-scheduled transients we can't enumerate without HLO.  Bumping
-    # the coefficient to 4.4× matches AOT peak to within ~5%.
+    # Per-q compute footprint, in three parts:
+    #   (a) post-FFT G-sphere slab (μ × n_G / p_min) — the working set
+    #       of the contraction kernel after the one-axis gather.
+    #       Coefficient ``Q_COMPUTE_COEF`` absorbs the 2 ζ_X + ζ_Y
+    #       replicas + einsum output staging.
+    #   (b) pre-FFT n_rtot slab (μ × n_rtot / p_prod, sharded on
+    #       ('x','y')) — the disk-read buffer.
+    #   (c) cuFFT in-place transients on the 5-D (Q, μ, nx, ny, nz)
+    #       tensor.  ``RTOT_FFT_COEF`` counts how many concurrent
+    #       n_rtot-shaped buffers XLA + cuFFT hold at peak (input,
+    #       output, planner scratch).  The previous code rolled this
+    #       into a single 1× n_rtot buffer (only the pre-FFT slab),
+    #       which underpredicted by 5× on CrI3 16-GPU where the cuFFT
+    #       scratch is the dominant single-q allocation.
+    #
+    # CALIBRATION (2026-05-03): Q_COMPUTE_COEF=4.4 matches MoS2/Si well;
+    # RTOT_FFT_COEF=7 calibrated so on CrI3 35 GB budget the chooser
+    # drops q_chunk to 2 (predicted ~31 GB ≈ measured ~27 GB) instead
+    # of q_chunk=3 (predicted 14 GB but actual 41 GB → OOM at 35 GB).
     Q_COMPUTE_COEF = 4.4
+    RTOT_FFT_COEF = 7.0
+    if n_rtot is None or int(n_rtot) <= 0:
+        rtot_per_q_bytes = 0.0
+    else:
+        rtot_per_q_bytes = RTOT_FFT_COEF * N_zeta * n_rmu * float(n_rtot) / p_prod
     # Case A check: can we hold *one* q's worth of gathered μ×G?
-    one_q_bytes = Q_COMPUTE_COEF * N_zeta * n_rmu * n_G / p_min
+    one_q_bytes = Q_COMPUTE_COEF * N_zeta * n_rmu * n_G / p_min + rtot_per_q_bytes
     slack_after_one_q = B_compute - (one_q_bytes + v_per_q_bytes)
     if slack_after_one_q < 0:
         # Case B — single q, tile μ×ν.
@@ -1434,7 +1465,14 @@ def _choose_v_q_chunks(
             mu_chunk = max(snap, mu_chunk_max - (mu_chunk_max % snap))
 
         n_mu_blocks = (int(n_rmu) + mu_chunk - 1) // mu_chunk
-        peak = 2.0 * N_zeta * mu_chunk * n_G / p_min + v_per_q_bytes + ref_bytes
+        # Case B per-tile peak: 2 ζ-G slabs + per-tile cuFFT slab.  Use
+        # the same RTOT_FFT_COEF as Case A so the chooser is consistent
+        # across the two regimes (the FFT buffers are the same — just
+        # the μ extent shrinks from n_rmu to mu_chunk).
+        rtot_tile_bytes = (RTOT_FFT_COEF * N_zeta * mu_chunk * float(n_rtot) / p_prod
+                           if n_rtot is not None and int(n_rtot) > 0 else 0.0)
+        peak = (2.0 * N_zeta * mu_chunk * n_G / p_min + rtot_tile_bytes
+                + v_per_q_bytes + ref_bytes)
         return dict(
             q_chunk=1, mu_chunk=int(mu_chunk), n_mu_blocks=int(n_mu_blocks),
             tiled=True, aligned=aligned,
@@ -1817,6 +1855,7 @@ def _compute_all_V_q_sharded(
     choice = _choose_v_q_chunks(
         n_rmu=n_rmu, n_G=n_G_sph, n_q_total=nq_total,
         budget_bytes=budget_bytes, p_x=p_x, p_y=p_y,
+        n_rtot=int(np.prod(fft_grid)),
     )
     # Debug knob: force Case B at a caller-specified μ-chunk so the tile
     # path can be exercised on systems that otherwise land in Case A.
