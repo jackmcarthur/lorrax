@@ -1133,10 +1133,24 @@ def prepare_isdf_and_wavefunctions(
 				psi_full_y=wfns.psi_yr, mesh=mesh_xy,
 				backend=cfg.backend.slab_io, mode="a",
 			)
-		save_restart_state_per_proc(
-			os.path.join(tmp_dir, "isdf_tensors"),
-			V_qmunu_for_restart, None, wfns.psi_yr, wfns.enk, meta, mesh_xy)
-		V_qmunu_for_restart.block_until_ready()
+		# save_restart_state_per_proc forces a materialise-then-slice on
+		# V_qmunu via ``V_qmunu[..., vx0:vx1, vy0:vy1]`` (JAX's _gather).
+		# For bispinor that's a view-of-broadcast and the slice
+		# rematerialises the full (1, npol, npol, nkx, nky, nkz, μ, μ)
+		# tensor (~30 GB on CrI3), OOMing at scale.  And for bispinor
+		# the saved (0,0)-only view is a *wrong* representation anyway
+		# (a real bispinor restart needs all 10 V_blocks tiles).  Skip
+		# the per-proc save for bispinor; non-bispinor runs are
+		# unchanged.
+		if isinstance(V_q_or_blocks, dict):
+			print0("  [bispinor] skipping save_restart_state_per_proc — "
+			       "(0,0)-only view would mis-represent bispinor V_q")
+		else:
+			save_restart_state_per_proc(
+				os.path.join(tmp_dir, "isdf_tensors"),
+				V_qmunu_for_restart, None, wfns.psi_yr, wfns.enk,
+				meta, mesh_xy)
+			V_qmunu_for_restart.block_until_ready()
 		print0("  Chunked ISDF path complete")
 	else:
 		from file_io import load_restart_state_from_h5
