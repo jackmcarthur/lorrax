@@ -87,11 +87,16 @@ class PhdfWfnReader:
         band_range: tuple[int, int],
         *,
         k_ids: Sequence[int] | None = None,
+        bispinor: bool = False,
     ) -> jax.Array:
         """G-space FFT box for one band chunk, at a set of full-BZ k-points.
 
-        Returns shape ``(len(k_ids), nb_padded, nspinor, nx, ny, nz)``
-        complex128, sharded ``P(None, ('x','y'), None, None, None, None)``.
+        Returns shape ``(len(k_ids), nb_padded, ns_out, nx, ny, nz)``
+        complex128, sharded ``P(None, ('x','y'), None, None, None, None)``,
+        where ``ns_out = self.nspinor`` for the default 2-spinor read
+        and ``ns_out = 4`` when ``bispinor=True`` (kinetic-balance lift
+        ψ_S = (α/2)(σ·(k+G)) ψ_L applied per FFT-box bin; mirrors
+        ``common.bispinor_init.get_small_psi_component``).
         ``nb_padded = band_range[1] - band_range[0]`` must divide the
         world size.  ``k_ids=None`` means all full-BZ k-points in
         index order.
@@ -103,6 +108,10 @@ class PhdfWfnReader:
         TR conjugation``) on device.  k_ids may be in any order — the
         output k axis is returned in the caller's requested order.
         """
+        if bispinor and self.nspinor != 2:
+            raise ValueError(
+                f"bispinor lift requires a 2-spinor source wfn; "
+                f"file has nspinor={self.nspinor}.")
         b_lo, b_hi = band_range
         nb = b_hi - b_lo
         if nb % self._world_size:
@@ -113,7 +122,8 @@ class PhdfWfnReader:
 
         # Common path: file holds every requested band.
         if b_hi <= self.nbands:
-            return self._coeffs_gspace_aligned(b_lo, b_hi, k_ids)
+            return self._coeffs_gspace_aligned(b_lo, b_hi, k_ids,
+                                                bispinor=bispinor)
 
         # File-short path: pad target exceeds wfn.nbands.  Split the
         # request into a fast collective bulk read of the largest
@@ -125,13 +135,15 @@ class PhdfWfnReader:
         n_in_file = max(0, int(self.nbands) - int(b_lo))
         n_aligned = (n_in_file // self._world_size) * self._world_size
         return self._coeffs_gspace_with_short_tail(
-            b_lo, b_hi, n_aligned, k_ids)
+            b_lo, b_hi, n_aligned, k_ids, bispinor=bispinor)
 
     def _coeffs_gspace_aligned(
         self,
         b_lo: int,
         b_hi: int,
         k_ids: Sequence[int] | None,
+        *,
+        bispinor: bool = False,
     ) -> jax.Array:
         """Fast path: collective FFI read assuming ``b_hi <= self.nbands``
         and ``(b_hi - b_lo) % world == 0``.  This is the body the
@@ -184,6 +196,16 @@ class PhdfWfnReader:
         g_index_for_ids = jnp.take(self._g_index_dev, k_ids_dev, axis=0)
         psi_G = self._fft_box_kernel(n_k, bands_per_rank)(
             cnk_at_full, g_index_for_ids)
+        if bispinor:
+            # Apply kinetic-balance lift to lift the 2-spinor ψ_L to a
+            # 4-spinor (ψ_L, ψ_S) using the FFT-bin (k+G)_cart.  Output
+            # spinor axis grows from 2 → 4.  Mirrors
+            # ``common.bispinor_init.get_small_psi_component`` but
+            # vectorised over the dense FFT box (bins past ngk[k] have
+            # ψ_L = 0 so contribute zero).
+            kfrac_for_ids = jnp.take(self._kfrac_dev, k_ids_dev, axis=0)
+            psi_G = self._bispinor_lift_kernel(n_k, bands_per_rank)(
+                psi_G, kfrac_for_ids)
         return psi_G
 
     def _coeffs_gspace_with_short_tail(
@@ -192,6 +214,8 @@ class PhdfWfnReader:
         b_hi: int,
         n_aligned: int,
         k_ids: Sequence[int] | None,
+        *,
+        bispinor: bool = False,
     ) -> jax.Array:
         """File-short path.  Bulk: collective FFI read of ``[b_lo,
         b_lo + n_aligned)``.  Tail: replicated h5py read of
@@ -218,6 +242,11 @@ class PhdfWfnReader:
         n_k = len(k_ids)
 
         nx, ny, nz = (int(v) for v in self.fft_grid)
+        # Bulk + tail come back as 2-spinor (file's nspinor); the
+        # bispinor lift is applied AFTER the concat so all three pieces
+        # (bulk + tail + zero pad) get lifted in one shot.  The
+        # zero-pad block is sized at file nspinor and stays zero through
+        # the lift (σ·K · 0 = 0).
         ns = int(self.nspinor)
         rep_shard = NamedSharding(self.mesh, P())
         final_shard = NamedSharding(
@@ -225,7 +254,8 @@ class PhdfWfnReader:
 
         parts = []
 
-        # 1. Bulk via FFI (skip if n_aligned == 0).
+        # 1. Bulk via FFI (skip if n_aligned == 0).  bispinor=False here:
+        # the lift is applied after the concat (see below).
         if n_aligned > 0:
             parts.append(
                 self._coeffs_gspace_aligned(b_lo, b_lo + n_aligned, k_ids))
@@ -243,7 +273,19 @@ class PhdfWfnReader:
             parts.append(zero_block)
 
         full = jnp.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
-        return jax.lax.with_sharding_constraint(full, final_shard)
+        full = jax.lax.with_sharding_constraint(full, final_shard)
+        if bispinor:
+            nb_full = full.shape[1]
+            bands_per_rank = nb_full // self._world_size
+            if k_ids is None:
+                k_ids = np.arange(self.nk_full, dtype=np.int32)
+            else:
+                k_ids = np.asarray(k_ids, dtype=np.int32)
+            k_ids_dev = jax.device_put(jnp.asarray(k_ids), self._rep1d)
+            kfrac_for_ids = jnp.take(self._kfrac_dev, k_ids_dev, axis=0)
+            full = self._bispinor_lift_kernel(n_k, bands_per_rank)(
+                full, kfrac_for_ids)
+        return full
 
     def _coeffs_gspace_replicated_tail(
         self,
@@ -365,6 +407,9 @@ class PhdfWfnReader:
             # crystal-to-cartesian rotation of spinor axes.
             self.bvec = np.asarray(
                 hdr["crystal/bvec"][:], dtype=np.float64)
+            # alat — needed by the bispinor kinetic-balance lift
+            # ψ_S = (α/2)(σ·(k+G)) ψ_L, where (k+G)_cart = 2π/alat (k+G)·bvec.
+            self.alat = float(hdr["crystal/alat"][()])
 
             self.gvecs_all = np.asarray(f["wfns/gvecs"][:], dtype=np.int32)
             self.ecutwfc = float(hdr["kpoints/ecutwfc"][()])
@@ -459,6 +504,10 @@ class PhdfWfnReader:
             jnp.asarray(self._phase_per_full_k), phase_sharding)
         self._tr_mask_dev = jax.device_put(
             jnp.asarray(self._tr_mask_per_full_k), tr_sharding)
+        # Full-BZ k-points (fractional, replicated) for the bispinor lift.
+        self._kfrac_dev = jax.device_put(
+            jnp.asarray(self._sym.unfolded_kpts, dtype=jnp.float64),
+            self._rep2d)
 
     def _build_g_index(self) -> np.ndarray:
         """``g_index[nk_full, nx, ny, nz]`` mapping each FFT-box cell to
@@ -576,6 +625,17 @@ class PhdfWfnReader:
             fft_grid=self.fft_grid,
         )
 
+    @lru_cache(maxsize=16)
+    def _bispinor_lift_kernel(self, n_k: int, bands_per_rank: int):
+        return _make_bispinor_lift_kernel(
+            mesh=self.mesh,
+            n_k=n_k,
+            bands_per_rank=bands_per_rank,
+            fft_grid=self.fft_grid,
+            bvec=self.bvec,
+            alat=self.alat,
+        )
+
 
 # =============================================================================
 #  Unfold kernel — takes the re/im-packed union-read output at IBZ k-points
@@ -656,3 +716,70 @@ def _unfold_replicated_body(
     cnk = cnk * phase_per_k[None, None, :, :]
     cnk = jnp.einsum("kac,bckg->bakg", U_per_k, cnk)
     return jnp.stack([cnk.real, cnk.imag], axis=-1)
+
+
+# =============================================================================
+#  Bispinor kinetic-balance lift in FFT-box G-space
+#  ψ_S = (α/2) (σ·(k+G)) ψ_L on each FFT-bin, mirrors
+#  ``common.bispinor_init.get_small_psi_component`` but vectorised over the
+#  dense FFT box (bins past ngk[k] have ψ_L = 0 so contribute zero).
+# =============================================================================
+def _make_bispinor_lift_kernel(
+    *, mesh: Mesh, n_k: int, bands_per_rank: int,
+    fft_grid: tuple[int, int, int], bvec: np.ndarray, alat: float,
+):
+    nx, ny, nz = (int(v) for v in fft_grid)
+    bvec_jax = jnp.asarray(bvec, dtype=jnp.float64)
+    halfalpha = jnp.complex128(0.00364867628215)
+    tpi_over_alat = float(2.0 * np.pi / alat)
+
+    def _per_rank(psi_L_box, k_frac_per_k):
+        # psi_L_box: (n_k, bpr, 2, nx, ny, nz) c128, band axis sharded on (x,y)
+        # k_frac_per_k: (n_k, 3) f64, replicated
+        gx = jnp.fft.fftfreq(nx, d=1.0 / nx).astype(jnp.float64)
+        gy = jnp.fft.fftfreq(ny, d=1.0 / ny).astype(jnp.float64)
+        gz = jnp.fft.fftfreq(nz, d=1.0 / nz).astype(jnp.float64)
+        # K_frac per (k, bin): k + G.  Build axis-by-axis to keep the
+        # intermediate small (no full meshgrid).
+        kx = (k_frac_per_k[:, 0:1, None, None] * bvec_jax[0, 0]
+              + k_frac_per_k[:, 1:2, None, None] * bvec_jax[1, 0]
+              + k_frac_per_k[:, 2:3, None, None] * bvec_jax[2, 0]
+              + gx[None, :, None, None] * bvec_jax[0, 0]
+              + gy[None, None, :, None] * bvec_jax[1, 0]
+              + gz[None, None, None, :] * bvec_jax[2, 0])
+        ky = (k_frac_per_k[:, 0:1, None, None] * bvec_jax[0, 1]
+              + k_frac_per_k[:, 1:2, None, None] * bvec_jax[1, 1]
+              + k_frac_per_k[:, 2:3, None, None] * bvec_jax[2, 1]
+              + gx[None, :, None, None] * bvec_jax[0, 1]
+              + gy[None, None, :, None] * bvec_jax[1, 1]
+              + gz[None, None, None, :] * bvec_jax[2, 1])
+        kz = (k_frac_per_k[:, 0:1, None, None] * bvec_jax[0, 2]
+              + k_frac_per_k[:, 1:2, None, None] * bvec_jax[1, 2]
+              + k_frac_per_k[:, 2:3, None, None] * bvec_jax[2, 2]
+              + gx[None, :, None, None] * bvec_jax[0, 2]
+              + gy[None, None, :, None] * bvec_jax[1, 2]
+              + gz[None, None, None, :] * bvec_jax[2, 2])
+        Kx = (tpi_over_alat * kx).astype(jnp.complex128)   # (n_k, nx, ny, nz)
+        Ky = (tpi_over_alat * ky).astype(jnp.complex128)
+        Kz = (tpi_over_alat * kz).astype(jnp.complex128)
+        # σ·K matrix elements: σ_z=Kz, σ_+=Kx+iKy, σ_−=Kx−iKy.
+        Km = (Kx - 1j * Ky)[:, None, ...]   # (n_k, 1, nx, ny, nz) for broadcast over bands
+        Kp = (Kx + 1j * Ky)[:, None, ...]
+        Kz_b = Kz[:, None, ...]
+        psi_L_0 = psi_L_box[:, :, 0, ...]
+        psi_L_1 = psi_L_box[:, :, 1, ...]
+        psi_S_0 = halfalpha * (Kz_b * psi_L_0 + Km * psi_L_1)
+        psi_S_1 = halfalpha * (Kp * psi_L_0 - Kz_b * psi_L_1)
+        # (n_k, bpr, 4, nx, ny, nz)
+        return jnp.stack([psi_L_0, psi_L_1, psi_S_0, psi_S_1], axis=2)
+
+    sharded = shard_map(
+        _per_rank, mesh=mesh,
+        in_specs=(
+            P(None, ("x", "y"), None, None, None, None),
+            P(None, None),
+        ),
+        out_specs=P(None, ("x", "y"), None, None, None, None),
+        check_rep=False,
+    )
+    return jax.jit(sharded)
