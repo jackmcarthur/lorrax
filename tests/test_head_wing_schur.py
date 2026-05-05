@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 import sys
 
-# Allow ``import gw.head_wing_schur`` from a fresh process.
+# Allow ``import gw.experimental.head_wing_schur`` from a fresh process.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.normpath(os.path.join(_HERE, "..", "src"))
 if _SRC not in sys.path:
@@ -61,7 +61,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental import multihost_utils
 
-from gw.head_wing_schur import (  # noqa: E402
+from gw.experimental.head_wing_schur import (  # noqa: E402
     extract_V_body_sharded,
     solve_W_body0_sharded,
     schur_reductions_sharded,

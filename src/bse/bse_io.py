@@ -753,7 +753,7 @@ def _load_ring_subset(
     if G0_mu_nu is not None and (vhead is not None or whead is not None):
         from gw.head_correction import apply_q0_head_rank1
         # Pull cell_volume from the WFN — head update needs the 1/V_cell
-        # scaling (see sigma_direct_check.py:489 for the canonical convention).
+        # scaling (see scripts/checks/sigma_direct_check.py for the canonical convention).
         from file_io import WFNReader
         wfn = WFNReader(_parse_wfn_path(input_file)) if input_file else None
         cell_volume = float(wfn.cell_volume) if wfn is not None else None

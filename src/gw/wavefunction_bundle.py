@@ -244,3 +244,33 @@ def build_wavefunctions(
         psi_xn=psi_xn, psi_xr=psi_xr, psi_yr=psi_yr, psi_yn=psi_yn,
         enk=enk_full, occ=occ_full, slices=slices,
     )
+
+
+# ---------------------------------------------------------------------------
+# Band-basis projection — Σ_mn(k) = Σ_{s,μ,s',μ'} ψ*_m(s,μ) Σ(s,μ,s',μ') ψ_n(s',μ')
+#
+# Lives here because the only state these contractions need is the (xr, yn)
+# pair of sharded ψ copies that the bundle owns; consumers (cohsex_sigma,
+# the AOT memory model) operate at the bundle's seam.
+# ---------------------------------------------------------------------------
+
+def project(psi_xr, psi_yn, sigma_k):
+    """Σ(nk, s, μ, s, μ) → Σ(nk, m, n) in band basis."""
+    left = jnp.einsum('kmsx,ksxty->kmty',
+                      jnp.conj(psi_xr), sigma_k, optimize=True)
+    return jnp.einsum('kmty,ktyn->kmn', left, psi_yn, optimize=True)
+
+
+def project_ri(psi_xr, psi_yn, sigma_k):
+    """Σ(nk, s, μ, s, μ) → (2, nk, m, n) with [Re, Im] channels.
+
+    Used by the windowed PPM Σ^c(ω) τ-loop, where the crossing window
+    keeps only ``Im[coeff·σ^τ]`` so σ^τ has to carry both channels.
+    A sharded reduce-scatter variant lives in ``ppm_sigma`` for the
+    multi-device path.
+    """
+    sigma_ri = jnp.stack((jnp.real(sigma_k), jnp.imag(sigma_k)), axis=0)
+    left = jnp.einsum('kmsx,cksxty->ckmty',
+                      jnp.conj(psi_xr), sigma_ri, optimize=True)
+    return jnp.einsum('ckmty,ktyn->ckmn',
+                      left, psi_yn, optimize=True).astype(jnp.complex128)

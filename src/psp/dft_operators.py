@@ -2,7 +2,7 @@
 psp/dft_operators.py — Plane-wave DFT Hamiltonian: build, apply, differentiate.
 
 Canonical module for all DFT Hamiltonian operations.  Other modules
-(kin_ion_io_chunked, get_dipole_mtxels, davidson) should call these
+(kin_ion_io, get_dipole_mtxels, davidson) should call these
 functions rather than reimplementing operator construction.
 
 Public API (Hamiltonian construction + application):

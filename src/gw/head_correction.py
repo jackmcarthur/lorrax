@@ -740,7 +740,7 @@ def format_head_diagnostics(head: HeadGNParams, cell_volume: float) -> str:
 #                 = (v_h / V_cell) · conj(G0[μ]) · G0[ν]            (rank 1)
 #
 # The ``1/V_cell`` factor matches the LORRAX storage convention for
-# ``V_qmunu`` / ``W_qmunu`` (see ``gw.sigma_direct_check`` for the canonical
+# ``V_qmunu`` / ``W_qmunu`` (see ``scripts/checks/sigma_direct_check.py`` for the canonical
 # reference).  Conjugation lands on ``μ`` because
 # ``V_{qμν} = Σ_GG' ζ*(q,μ,G) v(G,G') ζ(q,ν,G')``.
 

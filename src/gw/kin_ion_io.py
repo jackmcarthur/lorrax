@@ -1,152 +1,218 @@
 #!/usr/bin/env python3
-"""
-Utility to compute and write kin+ion (T + V_loc + V_NL) matrices to kin_ion.h5.
+"""kin+ion computation: T + V_loc + V_NL for all k-points → kin_ion.h5.
 
-By construction, these matrix elements correspond to H_DFT - V_xc. The
-Hartree term is not included unless --do-hartree is enabled. This keeps the GW
-Hamiltonian in the standard form (H_DFT - V_xc) + V_H + Sigma_xc.
-
-This script loads the wavefunctions, symmetry maps, pseudopotentials, and
-constructs the required sharded wavefunctions before calling:
-  - get_kin_ion(...) -> (nk, nb, nb) complex array
-  - write_kin_ion_h5(...)
+By construction these matrix elements correspond to ``H_DFT - V_xc``;
+Hartree (``V_H``) enters via the self-energy in the GW step, not here.
+The kernel processes k-points one at a time to keep peak GPU memory
+bounded on large k-grids — the older "all-at-once" path was removed
+in 2026-05-04 since this chunked path is a strict generalisation.
 
 Usage:
-  python -m gw.kin_ion_io -i tests/cohsex_debug/cohsex_test.in [-o kin_ion.h5]
+  python -m gw.kin_ion_io -i cohsex.in -o kin_ion.h5 [--sys_dim 3]
 """
 
 import os
-
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
-os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
+
 import argparse
 import numpy as np
 import jax
-from jax.sharding import Mesh
+import jax.numpy as jnp
+import h5py
 
 from file_io import WFNReader
-from common import symmetry_maps
-from common import Meta
-from common.load_wfns import read_Gvecs_to_devices
-
+from common import symmetry_maps, Meta
+from common.load_wfns import load_kpoint_fftbox
 import common.timing as timing
 
-from psp.pseudos import load_pseudopotentials
-from psp.get_DFT_mtxels import read_cohsex_input, get_kin_ion, write_kin_ion_h5
+from psp.pseudos import load_pseudopotentials, build_atom_pp_assignments
+from psp.dft_operators import generate_gvectors_k, vnl_matrix_from_kdata
+from psp.radial.build_projectors_qe import build_local_ionic_potential_on_G_total
+from psp.get_DFT_mtxels import read_cohsex_input, compute_kinetic_k, compute_local_V_k
+from psp.operator_checks import validate_operator_inputs
+import psp.vnl_ops as vnl_ops
 
 
 def _resolve_against(path: str, base_dir: str) -> str:
     return path if os.path.isabs(path) else os.path.join(base_dir, path)
 
 
-def _get_devices_array():
-    """Return available JAX devices, falling back to CPU if GPU backend is unavailable."""
-    try:
-        return np.asarray(jax.devices())
-    except RuntimeError as exc:
-        if "Unknown backend" in str(exc):
-            os.environ.pop("JAX_PLATFORM_NAME", None)
-            os.environ["JAX_PLATFORMS"] = "cpu"
-            return np.asarray(jax.devices("cpu"))
-        raise
+def get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, vnl_setup, wfn, g_mask=None):
+    """Compute T + V_loc + V_NL for a single k-point.
+
+    Parameters
+    ----------
+    wfn_k : (nb, nspinor, nx, ny, nz) — wavefunctions in FFT box
+    Gk_crys : (nG, 3) int — G-vector indices for this k
+    kvec : (3,) float — k-point in crystal coords
+    V_loc_r : (nx, ny, nz) — local ionic potential on FFT grid
+    vnl_setup : VNLSetup from vnl_ops.build_vnl_setup (or None to skip V_NL)
+    wfn : WFNReader (for bdot, bvec, blat, cell_volume)
+    g_mask : (nG,) float or None — mask for padded G-vectors
+    """
+    bdot_np = np.asarray(wfn.bdot, dtype=float)
+    T_k = compute_kinetic_k(wfn_k, Gk_crys, kvec, bdot_np, g_mask=g_mask)
+    V_loc_k = compute_local_V_k(
+        wfn_k, Gk_crys, V_loc_r, wfn.cell_volume, g_mask=g_mask
+    )
+
+    V_NL_k = 0.0
+    if vnl_setup is not None:
+        kdata = vnl_ops.build_vnl_kdata_from_kvec(
+            np.asarray(kvec, dtype=float),
+            np.asarray(Gk_crys, dtype=int),
+            vnl_setup,
+        )
+        V_NL_k = vnl_matrix_from_kdata(wfn_k, Gk_crys, kdata)
+
+    return T_k + V_loc_k + V_NL_k
 
 
 def main(argv=None):
-    argp = argparse.ArgumentParser(description="Compute kin+ion matrices and write kin_ion.h5")
-    argp.add_argument("-i", "--input", default="tests/cohsex_debug/cohsex_test.in", help="cohsex input file")
-    argp.add_argument("-o", "--output", default=None, help="output HDF5 path (default: kin_ion.h5 next to input)")
-    argp.add_argument("-n", "--nb", type=int, default=None, help="number of bands to use starting from band 0")
-    argp.add_argument("--do-hartree", action="store_true", help="Include Hartree potential when building H(k)")
+    argp = argparse.ArgumentParser(description="Chunked kin+ion computation")
+    argp.add_argument("-i", "--input", required=True, help="cohsex / GW input file")
+    argp.add_argument("-o", "--output", default=None, help="output HDF5 (default: kin_ion.h5)")
+    argp.add_argument("-n", "--nb", type=int, default=None, help="number of bands")
+    argp.add_argument("--sys_dim", type=int, default=None,
+                      help="system dimensionality: 0, 2, or 3 (overrides input file)")
+    argp.add_argument("--pseudo_dir", default=None,
+                      help="directory containing *.upf files (default: input file dir)")
     args = argp.parse_args(argv)
 
     timing.reset()
-
-    print("== kin_ion_io: prepare inputs ==")
+    print("== kin_ion_io ==")
     input_dir = os.path.dirname(os.path.abspath(args.input))
-    with timing.section("kin_ion_io.read_input"):
-        params = read_cohsex_input(args.input)
+
+    # ---- parse input ----
+    params = read_cohsex_input(args.input)
     wfn_path = _resolve_against(params.get("wfn_file", "WFN.h5"), input_dir)
 
+    # sys_dim: CLI flag > input file > default 3
+    sys_dim = args.sys_dim
+    if sys_dim is None:
+        sys_dim = int(params.get("sys_dim", 3))
+
     print(f"Loading WFN: {os.path.basename(wfn_path)}")
-    with timing.section("kin_ion_io.load_wfn"):
+    with timing.section("load_wfn"):
         wfn = WFNReader(wfn_path)
-    with timing.section("kin_ion_io.symmetry"):
         sym = symmetry_maps.SymMaps(wfn)
 
     nval = int(params.get("nval", 5))
     ncond = int(params.get("ncond", 5))
     nband = int(params.get("nband", 100))
     bispinor = bool(params.get("bispinor", False))
-    print(f"Params: nval={nval} ncond={ncond} nband={nband} bispinor={bispinor}")
 
-    # Determine effective band count: override input nband with --nb when provided
     nb_req = int(args.nb) if args.nb is not None else int(nband)
     nb_eff = max(1, min(int(wfn.nbands), nb_req))
-    if args.do_hartree:
-        if args.nb is not None and int(args.nb) < int(wfn.nelec):
-            raise ValueError(f"--do-hartree requested with nb={args.nb}, but nelec={wfn.nelec}. Increase --nb to at least {wfn.nelec}.")
-        if nb_eff < int(wfn.nelec):
-            promoted_nb = min(int(wfn.nbands), int(wfn.nelec))
-            print(f"--do-hartree requires at least nelec={wfn.nelec} bands; promoting nb from {nb_eff} to {promoted_nb}")
-            nb_eff = promoted_nb
-    with timing.section("kin_ion_io.meta_setup"):
-        meta = Meta.from_system(wfn, sym, nval, ncond, nb_eff, 0, bispinor)
-    print(f"FFT grid: {meta.fft_grid}; spinor: {meta.nspinor}")
+    meta = Meta.from_system(wfn, sym, nval, ncond, nb_eff, 0, bispinor)
+    nx, ny, nz = meta.fft_grid
+    print(f"Bands: {nb_eff}, FFT grid: {meta.fft_grid}, k-points: {sym.nk_tot}")
+    print(f"sys_dim: {sys_dim}")
+    print(f"Devices: {jax.device_count()}")
 
-    # Device mesh (same heuristic as elsewhere)
-    with timing.section("kin_ion_io.device_mesh"):
-        devices = _get_devices_array()
-        total_devices = int(jax.process_count() * jax.local_device_count())
-        if devices.size != total_devices:
-            total_devices = int(devices.size)
-        if total_devices == 0:
-            raise RuntimeError("No JAX devices available for kin_ion_io.")
-        grid_x = max(1, int(np.sqrt(total_devices)))
-        while grid_x > 1 and total_devices % grid_x != 0:
-            grid_x -= 1
-        grid_y = max(1, total_devices // grid_x)
-        mesh_xy = Mesh(devices.reshape(grid_x, grid_y), ['x', 'y'])
-    print(f"Device mesh: {grid_x}x{grid_y} ({total_devices})")
-
-    # Load wavefunctions to devices
-    # Load lowest nb_eff bands directly (independent of sigma ranges)
-    brange = (0, int(nb_eff))
-    print("Loading G-space coefficients to devices...")
-    with timing.section("kin_ion_io.read_Gvecs") as timer_read:
-        global_psi_G, nb_actual = read_Gvecs_to_devices(wfn, sym, brange, meta, bispinor, mesh_xy)
-        timer_read.watch(global_psi_G)
-    print(f"Loaded bands: {nb_actual}, array shape: {tuple(global_psi_G.shape)}")
-
-    # Load pseudopotentials from input directory
-    with timing.section("kin_ion_io.load_pseudos"):
-        pseudos = load_pseudopotentials(input_dir)
+    # ---- load pseudopotentials ----
+    pseudo_dir = args.pseudo_dir or input_dir
+    pseudos = load_pseudopotentials(pseudo_dir)
     if not pseudos:
-        print("Warning: no pseudopotentials found; kin+ion will be kinetic-only")
+        # Also try the QE subdirectory (common sandbox layout)
+        for fallback in [os.path.join(input_dir, '..', 'qe', 'scf'),
+                         os.path.join(input_dir, '..', 'qe', 'nscf')]:
+            pseudos = load_pseudopotentials(fallback)
+            if pseudos:
+                print(f"Found pseudopotentials in {fallback}")
+                break
 
-    print("Computing kin+ion matrices...")
-    with timing.section("kin_ion_io.compute_kin_ion") as timer_compute:
-        kin_ion = get_kin_ion(
-            global_psi_G,
+    # ---- validate (will raise if pseudos missing or sys_dim invalid) ----
+    ctx = validate_operator_inputs(
+        pseudos=pseudos, wfn=wfn, sys_dim=sys_dim,
+        caller="kin_ion_io",
+    )
+    print(f"Pseudopotentials: {list(ctx.pseudos.keys())}")
+    print(f"Coulomb truncation: {'2D slab' if ctx.truncation_2d else '3D bulk'}")
+
+    # ---- build structure data ----
+    atom_positions = np.asarray(wfn.atom_crys, dtype=float)
+    atom_types = np.asarray(wfn.atom_types, dtype=int)
+    assignments = build_atom_pp_assignments(
+        jnp.asarray(atom_positions), jnp.asarray(atom_types), pseudos
+    )
+    species_tmp = {}
+    for ap in assignments:
+        if ap.pseudo is None:
+            continue
+        key = id(ap.pseudo)
+        entry = species_tmp.setdefault(key, {"pseudo": ap.pseudo, "positions": []})
+        entry["positions"].append(np.asarray(ap.position, dtype=float))
+    species_payload = [
+        (e["pseudo"], np.asarray(e["positions"], dtype=float)
+         if e["positions"] else np.zeros((0, 3), dtype=float))
+        for e in species_tmp.values()
+    ]
+
+    # ---- build V_loc on the FFT grid (k-independent) ----
+    print("Building V_loc...")
+    with timing.section("build_V_loc"):
+        V_loc_r = build_local_ionic_potential_on_G_total(
+            assignments=[
+                {"pseudo": ap.pseudo, "position": np.asarray(ap.position, dtype=float)}
+                for ap in assignments
+            ],
+            species_groups=species_payload,
+            fft_grid=(nx, ny, nz),
+            bdot=np.asarray(wfn.bdot, dtype=float),
+            cell_volume=float(wfn.cell_volume),
+            bvec=np.asarray(wfn.bvec, dtype=float),
+            blat=float(wfn.blat),
+            truncation_2d=ctx.truncation_2d,
+        )
+        V_loc_r = jnp.asarray(V_loc_r, dtype=jnp.float64)
+
+    vnl_setup = None
+    if pseudos:
+        print("Building unified V_NL setup...")
+        vnl_setup = vnl_ops.build_vnl_setup(
             wfn,
             sym,
-            pseudos,
             meta,
-            mesh_xy,
-            include_hartree=bool(args.do_hartree),
-            nb_limit=args.nb,
+            pseudos,
+            nspinor=int(wfn.nspinor),
         )
-        timer_compute.watch(kin_ion)
-    out_path = args.output or os.path.join(input_dir, 'kin_ion.h5')
-    with timing.section("kin_ion_io.write_h5") as timer_write:
-        host_kin_ion = np.asarray(kin_ion)
-        timer_write.watch(host_kin_ion)
-        write_kin_ion_h5(host_kin_ion, out_path)
-    print(f"Wrote kin+ion to {out_path}")
-    timing.report(title="--- Timing (seconds) ---")
 
+    # ---- compute kin+ion per k-point ----
+    out_path = args.output or os.path.join(input_dir, "kin_ion.h5")
+    kin_ion_all = np.zeros((sym.nk_tot, nb_eff, nb_eff), dtype=np.complex128)
+
+    print(f"\nProcessing {sym.nk_tot} k-points...")
+    for ik in range(sym.nk_tot):
+        if ik % 16 == 0:
+            print(f"  k={ik + 1}/{sym.nk_tot}...")
+
+        with timing.section(f"k{ik}"):
+            wfn_k = load_kpoint_fftbox(wfn, sym, meta, ik, nb_eff)
+            kvec = sym.unfolded_kpts[ik]
+            Gk_crys, _ = generate_gvectors_k(ik, sym, wfn, meta)
+
+            H_k = get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, vnl_setup, wfn)
+            kin_ion_all[ik] = np.asarray(H_k)
+            del wfn_k
+
+    # ---- write output ----
+    print(f"\nWriting to {out_path}...")
+    with timing.section("write_h5"):
+        with h5py.File(out_path, "w") as f:
+            ds = f.create_dataset("kin_ion", data=kin_ion_all, dtype=np.complex128)
+            ds.attrs["description"] = "T + V_loc + V_NL matrix elements"
+            ds.attrs["nk"] = sym.nk_tot
+            ds.attrs["nb"] = nb_eff
+            ds.attrs["sys_dim"] = sys_dim
+            ds.attrs["truncation_2d"] = ctx.truncation_2d
+            ds.attrs["pseudopotentials"] = str(list(pseudos.keys()))
+
+    print(f"Wrote kin_ion.h5: shape {kin_ion_all.shape}, sys_dim={sys_dim}")
+    timing.report(title="--- Timing (seconds) ---")
     return 0
 
 

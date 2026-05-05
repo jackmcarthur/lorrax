@@ -24,7 +24,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from .greens_function_kernel import build_G
 from .head_correction import static_head_terms_to_kij
-from .projection_kernel import project as _project
+from .wavefunction_bundle import project as _project
 from .wavefunction_bundle import G_FFT7D_SPEC, V_FFT5D_SPEC
 
 

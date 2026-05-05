@@ -26,7 +26,7 @@ QE `.save/data-file-schema.xml` + `charge-density.hdf5` + pseudopotentials.
 
 - Active preprocessing callers now share the same VNL backend:
   `get_dipole_mtxels.py`, `get_dipole_mtxels_chunked.py`,
-  `get_DFT_mtxels.py`, and `gw/kin_ion_io_chunked.py` now build one
+  `get_DFT_mtxels.py`, and `gw/kin_ion_io.py` now build one
   `vnl_ops.build_vnl_setup(...)` and then use per-k
   `build_vnl_kdata_from_kvec(...)` + dense JAX contractions.
 - The custom JAX radial machinery remains centralized.  Uniform radial tables,
@@ -40,7 +40,7 @@ QE `.save/data-file-schema.xml` + `charge-density.hdf5` + pseudopotentials.
 
 1. **truncation_2d=True hardcoded** in get_kin_ion and build_operator_setup.
    For 3D bulk: ~3 mRy band error, ~200 mRy offset. Now from sys_dim.
-2. **kin_ion_io_chunked silently skipped V_loc** (checked `wfn.Vloc_r` which
+2. **kin_ion_io silently skipped V_loc** (checked `wfn.Vloc_r` which
    was never set). Any saved kin_ion.h5 from the chunked path was T-only.
 3. **No validation pseudopotentials loaded**: silent T-only matrices.
 4. **Davidson: standard eigh instead of generalized**. Non-orthogonal basis

@@ -127,7 +127,7 @@ def solve_W_body0_sharded(
     (``gw_jax`` passes ``2.0+0j`` for the spinor factor in static COHSEX);
     the test passes ``1.0+0j`` for synthetic data.
     """
-    from .w_isdf import _get_w_solve_fn
+    from ..w_isdf import _get_w_solve_fn
     nq = int(V_body_q.shape[0])
     n_mu = int(V_body_q.shape[1])
     solve_w = _get_w_solve_fn(mesh_xy, nq, n_mu)
