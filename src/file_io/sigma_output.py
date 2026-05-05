@@ -428,3 +428,58 @@ def write_sigma_omega_h5(
 				global_shape=tuple(hartree_kij_ev.shape),
 				k_chunk_size=k_chunk)
 	return abs_path
+
+
+def copy_sigma_kij_h5_to_omega_h5(
+	streamed_h5_path: str,
+	output_path: str,
+	omega_grid_ev,
+	*,
+	sigma_sx_kij_ev,
+	hartree_kij_ev,
+	omega_batch_size: int = 4,
+):
+	"""Convert a Ry-units streamed Σ_c(ω,k,i,j) HDF5 to an eV-units file.
+
+	The ``_StreamedH5Accumulator`` path in ``ppm_sigma`` writes per-(τ × ω-batch)
+	contributions into a transient ``sigma_c_kij_ry`` dataset (single-process
+	only).  When the GW driver is in PPM mode and the accumulator returned
+	``sigma_c_omega = None`` (streamed path), this helper copies the result
+	into the canonical ``sigma_mnk.h5`` layout (eV units) with chunked reads
+	so the host buffer never holds the full (n_omega × nk × nb × nb) tensor.
+
+	Rank-0-only — caller must already gate.  Writes are serial h5py.
+	"""
+	import h5py
+	from common.units import RYD_TO_EV
+
+	with h5py.File(streamed_h5_path, "r") as h5_in:
+		dset_c = h5_in["sigma_c_kij_ry"]
+		n_omega, nk, nb, nb2 = dset_c.shape
+		batch = max(1, min(int(omega_batch_size), n_omega))
+		with h5py.File(output_path, "w") as h5_out:
+			h5_out.create_dataset(
+				"omega_ev",
+				data=np.asarray(omega_grid_ev, dtype=np.float64),
+			)
+			dset_out = h5_out.create_dataset(
+				"sigma_c_kij_ev",
+				shape=dset_c.shape,
+				dtype=np.complex128,
+				chunks=(batch, max(1, min(4, nk)), nb, nb2),
+			)
+			h5_out.create_dataset(
+				"sigma_sx_kij_ev",
+				data=RYD_TO_EV * np.array(sigma_sx_kij_ev),
+			)
+			h5_out.create_dataset(
+				"hartree_kij_ev",
+				data=RYD_TO_EV * np.array(hartree_kij_ev),
+			)
+			for ibeg in range(0, n_omega, batch):
+				iend = min(ibeg + batch, n_omega)
+				dset_out[ibeg:iend] = (
+					RYD_TO_EV
+					* np.array(dset_c[ibeg:iend], dtype=np.complex128)
+				)
+	return output_path

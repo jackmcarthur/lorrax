@@ -24,14 +24,23 @@ class GWResults:
     Self-energy arrays are in **Rydberg** (the internal unit).  The writer
     converts to eV when producing human-readable files.
 
+    Static-COHSEX components (``sig_sx``, ``sig_coh``) and bare exchange
+    (``sig_x``) are always populated.  When ``use_ppm=True`` the dynamic
+    correlation diagonal is in ``sigma_c_diag_at_dft_ry`` and the writer
+    emits sigX/sigC columns instead of sigSX/sigCOH.
+
     Attributes
     ----------
     sig_sx : np.ndarray, (nk, nb, nb)
-        Self-exchange (COHSEX) or bare exchange (PPM) Σ_SX / Σ_X.
+        Static screened-exchange Σ_SX (Ry).  In PPM mode this is still
+        the static COHSEX value, retained for diagnostics/restart.
     sig_coh : np.ndarray, (nk, nb, nb)
-        Screened-COH self-energy (static COHSEX path).
+        Static Coulomb-hole Σ_COH (Ry).
     sig_h : np.ndarray, (nk, nb, nb)
-        Hartree self-energy.
+        Hartree self-energy (Ry).
+    sig_x : np.ndarray, (nk, nb, nb)
+        Bare exchange Σ_X (Ry).  Used as the "sigX" column in PPM mode
+        and as a quality-of-fit check in COHSEX mode.
     E_qp_ry : np.ndarray, (nk, nb)
         Quasiparticle eigenvalues from diagonalisation (Rydberg).
     U_qp : np.ndarray, (nk, nb, nb)
@@ -43,9 +52,15 @@ class GWResults:
     band_start, band_stop : int
         0-based band window [band_start, band_stop).
     use_ppm : bool
-        If True, labels switch from SX/COH to X/C in output files.
+        If True, labels switch from SX/COH to X/C in output files and
+        the writer pulls the correlated diagonal from
+        ``sigma_c_diag_at_dft_ry``.
     self_consistent : bool
         Whether the self-energy was obtained self-consistently.
+    sigma_c_diag_at_dft_ry : np.ndarray or None, (nk, nb)
+        Diagonal of Σ_c interpolated at DFT energies (Ry).  Present only
+        for PPM non-SC runs; the writer expands it to a band-diagonal
+        matrix for the eqp0.dat ``sigC`` column.
     sigma_xc_at_dft_ev : np.ndarray or None, (nk, nb)
         Diagonal Σ_xc interpolated at DFT energies (eV).  Present only
         for G₀W₀-PPM non-self-consistent runs.
@@ -58,6 +73,7 @@ class GWResults:
     sig_sx: np.ndarray
     sig_coh: np.ndarray
     sig_h: np.ndarray
+    sig_x: np.ndarray
     E_qp_ry: np.ndarray
     U_qp: np.ndarray
     E_dft_ry: np.ndarray
@@ -66,6 +82,7 @@ class GWResults:
     band_stop: int
     use_ppm: bool = False
     self_consistent: bool = False
+    sigma_c_diag_at_dft_ry: np.ndarray | None = None
     sigma_xc_at_dft_ev: np.ndarray | None = None
     sigma_omega_h5_path: str | None = None
     tensors_filename: str | None = None
@@ -187,25 +204,46 @@ def write_results(
 
     r2e = RYD_TO_EV
 
+    # In PPM mode, eqp0.dat reports bare X (sigX) and the on-shell dynamic
+    # correlation (sigC); in static COHSEX mode it reports sigSX and sigCOH.
+    # The arrays passed to ``write_sigma_to_file`` switch accordingly so the
+    # driver doesn't have to overload the names.
+    if results.use_ppm:
+        sx_arr = results.sig_x
+        # ``sigC`` column = diagonal Σ_c(E_DFT) expanded to (nk, nb, nb).
+        # Off-diagonals stay zero — the full Σ_c(ω,k,i,j) tensor lives
+        # in sigma_mnk.h5 for callers that need them.
+        diag_ry = results.sigma_c_diag_at_dft_ry
+        if diag_ry is None:
+            corr_arr = np.zeros_like(results.sig_coh)
+        else:
+            corr_arr = np.zeros_like(results.sig_coh)
+            nb = diag_ry.shape[1]
+            idx = np.arange(nb)
+            corr_arr[:, idx, idx] = np.asarray(diag_ry)
+    else:
+        sx_arr = results.sig_sx
+        corr_arr = results.sig_coh
+
+    sx_out      = r2e * sx_arr
+    corr_out    = r2e * corr_arr
+    sig_h_out   = r2e * results.sig_h
     # BGW-style degenerate-set averaging: replace the diagonal of each
     # Σ matrix with the mean over each contiguous degenerate group of
     # DFT eigenvalues.  Mirrors Sigma/shiftenergy.f90 (lines 86-122).
     # Off-diagonal entries are preserved.
-    sig_sx_out  = r2e * results.sig_sx
-    sig_coh_out = r2e * results.sig_coh
-    sig_h_out   = r2e * results.sig_h
     if not no_degen_averaging:
         from .degen_average import apply_to_matrix_diagonals
         e_kn_ry = np.asarray(results.E_dft_ry, dtype=np.float64)
-        sig_sx_out  = apply_to_matrix_diagonals(sig_sx_out,  e_kn_ry, degen_avg_tol_ry)
-        sig_coh_out = apply_to_matrix_diagonals(sig_coh_out, e_kn_ry, degen_avg_tol_ry)
-        sig_h_out   = apply_to_matrix_diagonals(sig_h_out,   e_kn_ry, degen_avg_tol_ry)
+        sx_out    = apply_to_matrix_diagonals(sx_out,    e_kn_ry, degen_avg_tol_ry)
+        corr_out  = apply_to_matrix_diagonals(corr_out,  e_kn_ry, degen_avg_tol_ry)
+        sig_h_out = apply_to_matrix_diagonals(sig_h_out, e_kn_ry, degen_avg_tol_ry)
 
     # 1. eqp0.dat — main QP self-energy output
     write_sigma_to_file(
-        sig_sx_out,
+        sx_out,
         output_file,
-        sigma_coh_kij_eV=sig_coh_out,
+        sigma_coh_kij_eV=corr_out,
         hartree_kij_eV=sig_h_out,
         sx_label="sigX" if results.use_ppm else "sigSX",
         corr_label="sigC" if results.use_ppm else "sigCOH",

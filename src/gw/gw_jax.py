@@ -30,24 +30,17 @@ from .gw_init import (
 )
 from .gw_driver_helpers import (
 	build_bgw_v_grid_fn,
-	build_ppm_sigma_runtime_options,
-	profile_section,
 	setup_runtime,
 )
 from .w_isdf import (
 	build_static_quadrature,
-	build_imag_quadrature,
 	compute_chi0,
 	flatten_V_qmunu,
 	precompile_chi0,
 	precompile_solve_w,
 	solve_w,
 )
-from .ppm_sigma import (
-	fit_gn_ppm,
-	compute_sigma_c_ppm_omega_grid,
-	precompile_sigma,
-)
+from .ppm_pipeline import compute_ppm_sigma_pipeline
 from .cohsex_sigma import (
 	build_Gij,
 	compute_cohsex_sigma,
@@ -73,7 +66,6 @@ from mixing.acceleration import (
 from common import Meta, RYD_TO_EV
 from common import jax_profile
 import common.timing as timing
-import h5py
 
 
 
@@ -325,216 +317,39 @@ def main(argv=None):
 	print0(f"  Bare Σ_X diagonal (eV), k=0: "
 	       + "  ".join(f"{sig_x_diag[0, i]:.4f}" for i in range(min(8, sig_x_diag.shape[1]))))
 
-	# ---- GN-PPM: replace static COH with frequency-integrated Σ^c ----
-	sigma_omega_h5_path = None
-	sigma_c_at_dft_ev = None
-	sigma_xc_at_dft_ev = None
-	omega_dft_rel_ev = None
-	efermi_dft_ev = None
+	# ---- GN/HL-PPM: frequency-integrated Σ^c(ω) ----
+	#
+	# History note (kept here because it explains a specific decision and is
+	# not yet captured anywhere else): the analytic q→0 head injected at the
+	# end of ``compute_ppm_sigma_pipeline`` was re-added in 2026-04-25 after
+	# being removed in 1542342 (Apr-10).  The original removal was
+	# well-intentioned head-plumbing unification; the analytic injection
+	# was never re-added even though the body integral in
+	# ``compute_sigma_c_ppm_omega_grid`` excludes q=0,G=0.  Magnitude is
+	# ±W^c(0)/(2·V_cell·N_k) on-shell — ~1.24 eV per band on Si 4×4×4 60b.
+	# A 2026-04-24 prior agent (3e8ac4e) had decided not to inject; the
+	# right call is the opposite — see
+	# reports/mos2_kgrid_gnppm_head_convergence_2026-4-10/ which shows BGW
+	# PPM and LORRAX-no-head diverge as 1/√Nk while LORRAX-with-head sits
+	# at the Nk→∞ asymptote.
+	ppm_outputs = None
 	if config.use_ppm_sigma:
-		if not config.do_screened:
-			raise ValueError("use_ppm_sigma=true requires do_screened=true.")
-		if config.self_consistent:
-			raise NotImplementedError("use_ppm_sigma not supported with self_consistent.")
-
-		ppm_options = build_ppm_sigma_runtime_options(config, input_dir=input_dir)
-		_ppm_label = "HL-PPM" if str(getattr(config, "ppm_model", "gn")).strip().lower() == "hl" else "GN-PPM"
-		print_section(f"{_ppm_label} + FREQUENCY-INTEGRATED SIGMA", print0)
-
-		# q→0, G=G'=0 head: injected *analytically* into Σ_c at the end of the
-		# block via `compute_ppm_head_sigma_kij`.  The body integral in
-		# `compute_sigma_c_ppm_omega_grid` excludes q=0,G=0 (V is zeroed there
-		# in `compute_vcoul.get_sqrt_v_and_phase`); this analytic head is the
-		# missing piece.  Magnitude is ±W^c(0)/(2 V_cell N_k) on-shell — ~1.24 eV
-		# per band on Si 4×4×4 60-band, so omitting it shows up as a uniform
-		# ±1.24 eV shift between Σ_c at occupied vs empty bands.
-		# History:
-		#   - Pre-Apr-10: in-body rank-1 head injection
-		#     (apply_head_correction adding vc0·G0·G0^T to V_q[0,0,0] and
-		#     wcoul0·G0·G0^T to W_q[0]).  Removed in 1542342 (Apr-10) when
-		#     head plumbing was unified, but the equivalent post-hoc analytic
-		#     injection was never re-added.
-		#   - Apr-24 prior agent (3e8ac4e) decided not to inject because the
-		#     *finite-Nk* result then disagreed with BGW PPM by ~+1.4 eV at
-		#     occupied Γ.  That is the right disagreement: BGW PPM has a real
-		#     finite-size head bug — see
-		#     reports/mos2_kgrid_gnppm_head_convergence_2026-4-10/, where
-		#     BGW PPM and LORRAX-no-head both diverge as 1/√Nk while
-		#     LORRAX-with-head sits at the Nk→∞ asymptote.
-
-		with timing.section("gw_jax.ppm_sigma"):
-			# χ₀(probe) → W(probe) → two-point PPM pole fit.
-			# GN: probe = iωp on the imaginary axis (build_imag_quadrature).
-			# HL: probe = Ω on the real axis above all transitions
-			#     (build_real_quadrature; requires Ω > x_max).
-			ppm_model = str(getattr(config, "ppm_model", "gn")).strip().lower()
-			if ppm_model == "hl":
-				from .w_isdf import build_real_quadrature
-				probe_omega = complex(float(config.ppm_omega_p), 0.0)
-				quad_probe = build_real_quadrature(
-					quad, float(config.ppm_omega_p),
-					config.minimax_config, print_fn=print0)
-			else:
-				probe_omega = 1j * float(config.ppm_omega_p)
-				quad_probe = build_imag_quadrature(
-					quad, config.ppm_omega_p,
-					config.minimax_config, print_fn=print0)
-			chi0_probe = compute_chi0(
-				wfns, quad_probe, meta, mesh_xy, energy_reference=e_ref)
-			# Block BEFORE solve_w so the chi0_probe compute time isn't
-			# folded into the W-solve wall; this also drops the last host
-			# reference so solve_w can donate χ₀'s buffer (see the
-			# ``donate_argnums=(1,)`` on ``_solve_w``).
-			chi0_probe.block_until_ready()
-			Wiwp_q = solve_w(V_q, chi0_probe, meta, mesh_xy,
-			                 memory_mode=config.isdf_memory_mode)
-			del chi0_probe
-			Wiwp_q.block_until_ready()
-
-			from .ppm_sigma import fit_ppm
-			ppm = fit_ppm(
-				W_q, Wiwp_q, V_q, probe_omega, mesh_xy,
-				fallback_omega=config.ppm_fallback_omega,
-				n_nodes_static=quad.node_count,
-				print_fn=print0,
-				model_label="HL-PPM" if ppm_model == "hl" else "GN-PPM",
-			)
-			# Wiwp_q is used only for the PPM fit; drop the Python
-			# reference so XLA can reclaim its (nq, μ, μ) c128 buffer.
-			del Wiwp_q
-
-			# Frequency-integrated Σ^c(ω) — wrap pre/post memprof snapshots and
-			# the xprof region in one ``profile_section`` CM.
-			with timing.section("sigma.compile"):
-				precompile_sigma(wfns, ppm, meta, mesh_xy)
-			with timing.section("sigma.exec"), profile_section("sigma_ppm", print_fn=print0):
-				sigma_omega = compute_sigma_c_ppm_omega_grid(
-					wfns, ppm, meta, mesh_xy, ppm_options,
-					sigma_window_quad=config.sigma_quadrature_config,
-					print_fn=print0,
-				)
-			sigma_c_omega = sigma_omega.sigma_c_kij  # (n_omega, nk, nb, nb) or None if streamed
-
-			# === Σ_c head injection (analytic GN pole, properly mini-BZ-averaged) ===
-			# See block comment above this `with timing.section(...)` for rationale.
-			# Resolved at ω=0 and ω=iωp from the same head sample plumbing as the
-			# COHSEX static head (so vhead/whead overrides flow through identically).
-			from .head_correction import (
-				fit_head_ppm_from_samples, fit_head_hl_analytic_from_sample,
-				fit_head_with_fixed_omega_from_sample,
-				compute_ppm_head_sigma_kij, format_head_diagnostics)
-			_head_static = head_resolver.at(0.0 + 0.0j)
-			_head_omega_override = getattr(config, "ppm_head_omega_h_ry", None)
-			if _head_omega_override is not None:
-				# User-supplied head pole Ω_h (e.g. BGW's analytic value).
-				# Static W^c(0) head still LORRAX's — see fit_head_with_fixed_omega.
-				_head_gn = fit_head_with_fixed_omega_from_sample(
-					_head_static, omega_h_ry=float(_head_omega_override))
-				print0(f"  PPM head: Ω_h override = {float(_head_omega_override):.6f} Ry "
-				       f"({float(_head_omega_override)*RYD_TO_EV:.4f} eV)")
-			elif ppm_model == "hl":
-				# BGW-style analytic head pole: Ω_h² = ω_p² / (1 − ε_head⁻¹).
-				# ω_p² = 16π · N_e / V_cell in Ry² (Hartree-AU energies → Ry² has factor 4 → 16π).
-				_omega_p_sq_ry = 16.0 * float(np.pi) * float(meta.nelec) / float(meta.cell_volume)
-				_head_gn = fit_head_hl_analytic_from_sample(
-					_head_static, omega_p_sq_ry=_omega_p_sq_ry)
-				print0(f"  HL head: ω_p (analytic, BGW-style) = {_omega_p_sq_ry**0.5:.6f} Ry "
-				       f"({(_omega_p_sq_ry**0.5)*RYD_TO_EV:.4f} eV)")
-			else:
-				_head_probe = head_resolver.at(probe_omega)
-				_head_gn = fit_head_ppm_from_samples(
-					_head_static, _head_probe, probe_omega=probe_omega)
-			print0(format_head_diagnostics(_head_gn, cell_volume=meta.cell_volume))
-
-			if sigma_c_omega is not None:
-				_enk_full, _ = get_enk_bandrange(wfn, sym,
-					band_slices.sigma_range, band_slices.sigma_range,
-					nspinor=meta.nspinor)
-				_enk_full_np = np.asarray(_enk_full, dtype=np.float64)
-				_n_occ = min(meta.nelec, _enk_full_np.shape[1])
-				_vbm_ry = float(np.max(_enk_full_np[:, :_n_occ]))
-				_cbm_ry = float(np.min(_enk_full_np[:, _n_occ:])) if _n_occ < _enk_full_np.shape[1] else _vbm_ry
-				_efermi_ry = 0.5 * (_vbm_ry + _cbm_ry)
-				_head_sigma_kij_ry = compute_ppm_head_sigma_kij(
-					_head_gn,
-					omega_grid_ry=np.asarray(ppm_options.omega_grid_ry, dtype=np.float64),
-					enk_ry=_enk_full_np,
-					efermi_ry=_efermi_ry,
-					n_occ=_n_occ,
-					cell_volume=float(meta.cell_volume),
-					nk_tot=int(meta.nk_tot),
-				)
-				_head_max_ev = float(np.max(np.abs(_head_sigma_kij_ry))) * RYD_TO_EV
-				print0(f"  Σ_c head shift: max|Σ^head_diag| = {_head_max_ev:.4f} eV "
-				       f"(on-shell occ band → {-_head_gn.R_h/(_head_gn.omega_h * meta.cell_volume * meta.nk_tot) * RYD_TO_EV:+.4f} eV)")
-				sigma_c_omega = sigma_c_omega + jnp.asarray(_head_sigma_kij_ry, dtype=jnp.complex128)
-
-			# Evaluate Σ_c at DFT energies
-			sigma_c_at_dft_ev = None
-			sigma_xc_at_dft_ev = None
-			omega_dft_rel_ev = None
-			efermi_dft_ev = None
-			if meta.rank == 0:
-				enk_dft, _ = get_enk_bandrange(wfn, sym,
-					band_slices.sigma_range,
-					band_slices.sigma_range, nspinor=meta.nspinor)
-				enk_dft_ev = np.asarray(enk_dft) * RYD_TO_EV
-				n_occ = min(meta.nelec, enk_dft_ev.shape[1])
-				vbm_ev = float(np.max(enk_dft_ev[:, :n_occ]))
-				cbm_ev = float(np.min(enk_dft_ev[:, n_occ:])) if n_occ < enk_dft_ev.shape[1] else vbm_ev
-				efermi_dft_ev = 0.5 * (vbm_ev + cbm_ev)
-				omega_dft_rel_ev = enk_dft_ev - efermi_dft_ev
-				print0(f"  E_F(midgap) = {efermi_dft_ev:.6f} eV  (VBM={vbm_ev:.6f}, CBM={cbm_ev:.6f})")
-
-				# Interpolate diagonal Σ_c(ω) at each DFT energy
-				omega_ev = np.asarray(ppm_options.omega_grid_ev, dtype=np.float64)
-				if sigma_c_omega is not None:
-					sig_c_diag = np.diagonal(np.asarray(sigma_c_omega), axis1=2, axis2=3) * RYD_TO_EV
-				else:
-					with h5py.File(sigma_omega.sigma_kij_h5_path, "r") as h5:
-						sig_c_diag = np.diagonal(
-							np.asarray(h5["sigma_c_kij_ry"], dtype=np.complex128), axis1=2, axis2=3) * RYD_TO_EV
-				nk, nb = sig_c_diag.shape[1], sig_c_diag.shape[2]
-				sigma_c_at_dft_ev = np.array([
-					[complex(np.interp(omega_dft_rel_ev[ik, ib], omega_ev, np.real(sig_c_diag[:, ik, ib])),
-					         np.interp(omega_dft_rel_ev[ik, ib], omega_ev, np.imag(sig_c_diag[:, ik, ib])))
-					 for ib in range(nb)] for ik in range(nk)], dtype=np.complex128)
-				sig_x_diag_ev = np.diagonal(np.asarray(sig_x), axis1=1, axis2=2) * RYD_TO_EV
-				sigma_xc_at_dft_ev = sig_x_diag_ev + sigma_c_at_dft_ev
-
-			# Replace static COHSEX with PPM results
-			sig_sx = sig_x
-			# sig_coh is replaced by a diagonal Σ_c(E_DFT) matrix for output;
-			# the full Σ_c(ω) is in sigma_c_omega / sigma_omega_h5
-
-			# Write sigma_mnk.h5
-			sigma_omega_h5_path = config.sigma_omega_h5_file
-			if not os.path.isabs(sigma_omega_h5_path):
-				sigma_omega_h5_path = os.path.join(input_dir, sigma_omega_h5_path)
-			# SlabIO handles rank-0 dispatch internally; both backends
-			# need all ranks to enter, so no `if meta.rank == 0:` guard.
-			if sigma_c_omega is not None:
-				write_sigma_omega_h5(
-					sigma_omega_h5_path, ppm_options.omega_grid_ev, None,
-					sigma_c_kij_ev=RYD_TO_EV * sigma_c_omega,
-					sigma_sx_kij_ev=RYD_TO_EV * sig_sx,
-					hartree_kij_ev=RYD_TO_EV * sig_h,
-					mesh=mesh_xy,
-					use_ffi_io=getattr(config, "use_ffi_io", False))
-			elif meta.rank == 0 and sigma_omega.sigma_kij_h5_path:
-					with h5py.File(sigma_omega.sigma_kij_h5_path, "r") as h5_in:
-						dset_c = h5_in["sigma_c_kij_ry"]
-						n_omega, nk, nb = dset_c.shape[0], dset_c.shape[1], dset_c.shape[2]
-						batch = max(1, min(ppm_options.sigma_omega_batch_size, n_omega))
-						with h5py.File(sigma_omega_h5_path, "w") as h5_out:
-							h5_out.create_dataset("omega_ev", data=np.asarray(ppm_options.omega_grid_ev, dtype=np.float64))
-							dset_out = h5_out.create_dataset("sigma_c_kij_ev",
-								shape=dset_c.shape, dtype=np.complex128, chunks=(batch, max(1, min(4, nk)), nb, nb))
-							h5_out.create_dataset("sigma_sx_kij_ev", data=RYD_TO_EV * np.array(sig_sx))
-							h5_out.create_dataset("hartree_kij_ev", data=RYD_TO_EV * np.array(sig_h))
-							for ibeg in range(0, n_omega, batch):
-								dset_out[ibeg:min(ibeg+batch, n_omega)] = \
-									RYD_TO_EV * np.array(dset_c[ibeg:min(ibeg+batch, n_omega)], dtype=np.complex128)
+		ppm_outputs = compute_ppm_sigma_pipeline(
+			wfns=wfns,
+			V_q=V_q, W_q=W_q, sig_x=sig_x, sig_h=sig_h,
+			quad=quad, e_ref=e_ref,
+			config=config, meta=meta, mesh_xy=mesh_xy,
+			head_resolver=head_resolver,
+			band_slices=band_slices, wfn=wfn, sym=sym,
+			input_dir=input_dir,
+			print_fn=print0,
+		)
+	sigma_omega_h5_path = ppm_outputs.sigma_omega_h5_path if ppm_outputs else None
+	sigma_c_at_dft_ev   = ppm_outputs.sigma_c_at_dft_ev   if ppm_outputs else None
+	sigma_xc_at_dft_ev  = ppm_outputs.sigma_xc_at_dft_ev  if ppm_outputs else None
+	omega_dft_rel_ev    = ppm_outputs.omega_dft_rel_ev    if ppm_outputs else None
+	efermi_dft_ev       = ppm_outputs.efermi_dft_ev       if ppm_outputs else None
+	ppm_options         = ppm_outputs.ppm_options         if ppm_outputs else None
 
 	# ---- QP Hamiltonian: H_QP = (H_DFT - V_xc) + V_H + Σ_xc ----
 	sigma_total = sig_sx + sig_coh + sig_h
@@ -553,7 +368,8 @@ def main(argv=None):
 		cbm = float(np.min(E_qp_ev[:, occ_idx + 1])) if occ_idx + 1 < E_qp_ev.shape[1] else vbm
 		efermi = 0.5 * (vbm + cbm)
 		omega_ev = np.asarray(ppm_options.omega_grid_ev, dtype=np.float64)
-		sigma_xc_diag = np.real(load_sigma_xc_diag_from_h5(sigma_omega_h5_path, RYD_TO_EV * np.array(sig_sx)))
+		# PPM mode: Σ_xc(ω) = Σ_x_bare + Σ_c(ω); the H5 file holds Σ_c only.
+		sigma_xc_diag = np.real(load_sigma_xc_diag_from_h5(sigma_omega_h5_path, RYD_TO_EV * np.array(sig_x)))
 		E_sc, conv, n_iter = solve_diagonal_sigma_fixed_point(
 			h0_diag_ev - efermi, sigma_xc_diag, omega_ev, max_iter=120, tol_ev=1e-7, mixing=0.6)
 		# In-grid test is against DFT energy (the Sigma(omega) grid is indexed
@@ -586,7 +402,7 @@ def main(argv=None):
 		print0(f"  Diagonal SC: {n_in}/{in_grid.size} states in grid, {n_iter} iterations")
 
 		qsgw = build_qsgw_sigma_xc_from_h5(sigma_omega_h5_path,
-			RYD_TO_EV * np.array(sig_sx), omega_ev, E_sc - efermi)
+			RYD_TO_EV * np.array(sig_x), omega_ev, E_sc - efermi)
 		print0(f"  QSGW: {int(qsgw['n_interp_clipped'])} clipped "
 			f"({100*qsgw['frac_interp_clipped']:.1f}%)")
 
@@ -641,31 +457,22 @@ def main(argv=None):
 	enk_dft, _ = get_enk_bandrange(wfn, sym,
 		band_slices.sigma_range, band_slices.sigma_range, nspinor=meta.nspinor)
 
-	# In PPM mode, replace sig_coh's band-diagonal with the dynamic
-	# Σ_c(E_DFT) so eqp0.dat's "sigC" column reports the on-shell
-	# dynamic correlation (directly comparable to BGW's (SX-X)+CH at
-	# Eo=E_DFT) instead of the static COHSEX Coulomb hole.  Off-diagonals
-	# are zeroed because we only have the diagonal interpolation here;
-	# the full Σ_c(ω, k, i, j) tensor remains in sigma_mnk.h5 for callers
-	# that need off-diagonals.  Rank-0 only — write_results runs only
-	# there, and sigma_c_at_dft_ev was computed only on rank 0.
-	if (
-		config.use_ppm_sigma
-		and meta.rank == 0
-		and sigma_c_at_dft_ev is not None
-	):
-		_sig_coh_eqp0 = np.zeros(np.asarray(sig_coh).shape, dtype=np.complex128)
-		_diag_ry = sigma_c_at_dft_ev / RYD_TO_EV
-		_nk, _nb = _diag_ry.shape
-		_idx = np.arange(_nb)
-		_sig_coh_eqp0[:, _idx, _idx] = _diag_ry
-		sig_coh = _sig_coh_eqp0
+	# PPM mode: feed the writer the on-shell diag(Σ_c(E_DFT)) (Ry) so the
+	# eqp0.dat "sigC" column reports dynamic correlation directly comparable
+	# to BGW's (SX-X)+CH at Eo=E_DFT.  Off-diagonals stay zero — the full
+	# Σ_c(ω, k, i, j) tensor is in sigma_mnk.h5 for callers that need them.
+	sigma_c_diag_at_dft_ry = (
+		sigma_c_at_dft_ev / RYD_TO_EV
+		if (config.use_ppm_sigma and meta.rank == 0 and sigma_c_at_dft_ev is not None)
+		else None
+	)
 
 	# ---- Output ----
 	results = GWResults(
 		sig_sx=np.array(sig_sx),
 		sig_coh=np.array(sig_coh),
 		sig_h=np.array(sig_h),
+		sig_x=np.array(sig_x),
 		E_qp_ry=np.array(E_full),
 		U_qp=np.array(U_full),
 		E_dft_ry=np.array(enk_dft),
@@ -674,6 +481,7 @@ def main(argv=None):
 		band_stop=band_slices.b3,
 		use_ppm=config.use_ppm_sigma,
 		self_consistent=config.self_consistent,
+		sigma_c_diag_at_dft_ry=sigma_c_diag_at_dft_ry,
 		sigma_xc_at_dft_ev=sigma_xc_at_dft_ev,
 		sigma_omega_h5_path=sigma_omega_h5_path,
 		tensors_filename=tensors_filename,
