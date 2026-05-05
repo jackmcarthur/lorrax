@@ -751,18 +751,37 @@ def solve_zeta_from_L_q(
         Z_col = Z_q
         del Z_q
     else:
-        # Donation on Z_q is the key — the caller `del Z_q` immediately
-        # after this block, so XLA can alias the input buffer for the
-        # output (2× tile theoretical minimum).  Without donation SPMD
-        # hits an Involuntary full rematerialization going from
-        # P(None,'x','y') → P(None,None,('x','y')) because both mesh
-        # axes need to re-shard at once.  Measured at Si 4×4×4 60Ry
-        # (nq=64, μ=2400, B_r=12672, 2×2 mesh):
-        #   direct, no donate: 31.14 GB/dev (temp 15.57 GB, Involuntary Remat)
-        #   direct, donate:    15.57 GB/dev (temp 7.79 GB) -- 50% reduction
-        @partial(jax.jit, donate_argnums=(0,))
+        # Reshard P(None,'x','y') → P(None,None,('x','y')): drop x on μ
+        # axis, add x on ν axis.  SPMD can't plan this as a single
+        # all-to-all (both mesh axes change at once on the data axes) and
+        # falls into Involuntary Full Rematerialization — replicates the
+        # full (nq, μ, ν) tensor, ~16× the per-device shard.  At Si 4×4×4
+        # 60Ry 2×2 mesh that was 15.57 GB/dev (temp 7.79 GB) even WITH
+        # donation; at CrI3 16-GPU 4×4 mesh it was a 33.86 GB request
+        # → OOM.
+        #
+        # Stage via P('x', None, 'y') — park x on the leading nq axis as
+        # an intermediate.  Each step then only moves x by ONE mesh
+        # position (axis 1 → axis 0, then axis 0 → axis 2): two pure
+        # all-to-alls, no all-gather inflation, per-device shard size
+        # constant throughout.  Same pattern as
+        # ``w_isdf._get_w_solve_fn`` (V/χ reshard) and
+        # ``load_wfns.get_sharded_wfns_rchunk_slice`` (FFT→pair-density
+        # reshard) — see those sites for the full sharding-history
+        # rationale.
+        #
+        # ``out_shardings`` is load-bearing: without it XLA may treat
+        # the second ``with_sharding_constraint`` as a hint and silently
+        # leave the result at the staged sharding (see load_wfns line
+        # ~417 for the same trap).  Donation lets XLA alias the input
+        # buffer through the chain.
+        _stage_sharding = NamedSharding(mesh_xy, P('x', None, 'y'))
+
+        @partial(jax.jit, donate_argnums=(0,), out_shardings=_target_sharding)
         def _reshard_z(z):
-            return jax.lax.with_sharding_constraint(z, _target_sharding)
+            return jax.lax.with_sharding_constraint(
+                jax.lax.with_sharding_constraint(z, _stage_sharding),
+                _target_sharding)
         Z_col = _reshard_z(Z_q)
         # No-op when called inside an outer jit (tracer has no
         # block_until_ready and the outer jit syncs at its boundary).
@@ -965,12 +984,19 @@ def _make_fit_one_rchunk_kernel(
             P_r = _accumulate(P_r, r_cls, psi_r_rmuT_X_fit,
                               norms_r, psi_bc_Y, bc_size)
 
-        # 3. ZCT + reshard + solve
+        # 3. ZCT + reshard + solve.  Pass Z_q to solve_zeta_from_L_q
+        # un-resharded; the solve's ``_reshard_z`` sub-jit handles the
+        # P(None,'x','y') → P(None,None,('x','y')) reshard via the
+        # two-step staging through ('x', None, 'y').  Doing the reshard
+        # here as inline ``with_sharding_constraint`` calls tied XLA's
+        # hands inside the outer kernel jit — measured CrI3 16-GPU peak
+        # actually went UP because XLA materialised both the source and
+        # the staged intermediate concurrently.  The sub-jit boundary
+        # inside ``solve_zeta_from_L_q`` decouples the reshard scheduler
+        # from the kernel body.
         Z_q = compute_ZCT_from_left_right_zchunk(P_l, P_r, kgrid, mesh_xy)
-        z_col_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
-        Z_col = jax.lax.with_sharding_constraint(Z_q, z_col_shard)
         zeta = solve_zeta_from_L_q(
-            L_q, Z_col, mesh_xy, q_chunk_size, vertex_mu_L=vertex_mu_L)
+            L_q, Z_q, mesh_xy, q_chunk_size, vertex_mu_L=vertex_mu_L)
         return zeta
 
     return _kernel
