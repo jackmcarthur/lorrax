@@ -863,11 +863,13 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		print_fn(f"    [bispinor] WARNING: forwarding only V_blocks[(0,0)] "
 		         f"to downstream Σ — the 9 transverse tiles are computed "
 		         f"and logged but DISCARDED until Σ-projection lands.")
-		V_q_raw = V_blocks[(0, 0)]
-		# Broadcast to (1, npol, npol, nkx, nky, nkz, μ, μ) like the
-		# non-bispinor return.
+		V_q_raw_flat = V_blocks[(0, 0)]
+		# Reshape (nq, μ, μ) → (nkx, nky, nkz, μ, μ); the lorentz driver
+		# returns flat-q shape, the non-bispinor compute_all_V_q returns
+		# kgrid-shape directly.  Match the latter for downstream Σ.
 		nkx, nky, nkz = meta.kgrid
 		n_rmu_0 = int(n_rmu_by_channel[0])
+		V_q_raw = V_q_raw_flat.reshape(nkx, nky, nkz, n_rmu_0, n_rmu_0)
 		V_qmunu = jnp.array(jnp.broadcast_to(
 			V_q_raw[None, None, None],
 			(1, meta.npol, meta.npol, nkx, nky, nkz, n_rmu_0, n_rmu_0)))

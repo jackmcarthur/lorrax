@@ -139,8 +139,13 @@ class PsiGStore:
                 self._host_tiles[(x, y)] = np.empty(
                     self._per_rank_shape, dtype=np.complex128)
 
+        # Bispinor: when meta.nspinor=4 and the reader is 2-spinor, ask the
+        # reader to apply the kinetic-balance lift on the FFT box so the
+        # host tile gets 4 spinor components per band.
+        _bispinor = (int(self.meta.nspinor) == 4
+                     and int(getattr(self.reader, 'nspinor', 4)) == 2)
         for bc_idx, bc_range in enumerate(self.band_chunk_ranges):
-            psi_G_bc = self.reader.coeffs_gspace(bc_range)
+            psi_G_bc = self.reader.coeffs_gspace(bc_range, bispinor=_bispinor)
             b_lo = self._bc_band_offsets[bc_idx]
             b_hi = self._bc_band_offsets[bc_idx + 1]
             for shard in psi_G_bc.addressable_shards:

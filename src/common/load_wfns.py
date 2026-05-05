@@ -356,11 +356,17 @@ def get_sharded_wfns_rchunk_slice(
         # No intermediate replicated shard — use two-step all-gather + all-to-all
         # to avoid materializing the full array on every device.
         
-        # Pre-compute phase grids and kvecs ONCE in closure
-        fx_cached = jnp.arange(nx, dtype=jnp.float64)[None, :, None, None] / nx
-        fy_cached = jnp.arange(ny, dtype=jnp.float64)[None, None, :, None] / ny
-        fz_cached = jnp.arange(nz, dtype=jnp.float64)[None, None, None, :] / nz
-        kvecs_cached = jnp.asarray(kvecs_frac)
+        # Pre-compute phase grids and kvecs ONCE in closure.  Use NUMPY for
+        # closure-captured values: when this cache builder runs inside an
+        # outer jit's trace (which fit_one_rchunk does), ``jnp.asarray``
+        # produces a tracer that the closure captures.  After that outer
+        # trace closes the tracer is dead, and re-using the cached jit
+        # raises ``UnexpectedTracerError`` on the next call.  Numpy
+        # closures get baked as constants by JAX at compile time.
+        fx_cached = np.arange(nx, dtype=np.float64)[None, :, None, None] / nx
+        fy_cached = np.arange(ny, dtype=np.float64)[None, None, :, None] / ny
+        fz_cached = np.arange(nz, dtype=np.float64)[None, None, None, :] / nz
+        kvecs_cached = np.asarray(kvecs_frac, dtype=np.float64)
         n_rtot_cached = n_rtot
         
         # r_chunk_size is static (from cache key), r_start is dynamic
