@@ -36,11 +36,14 @@ import subprocess
 
 
 _DISTRIBUTED_SENTINEL = "_LORRAX_JAX_DISTRIBUTED_DONE"
+_PRINT_GATED_SENTINEL = "_LORRAX_PRINT_GATED_TO_RANK0"
 
 __all__ = [
     "set_default_env",
     "init_jax_distributed",
     "fallback_to_cpu_if_no_gpu_backend",
+    "gate_print_to_rank0",
+    "tee_stdout_to_file",
 ]
 
 
@@ -106,6 +109,80 @@ def _resolve_coordinator_address() -> str:
     return f"{host}:12355"
 
 
+def gate_print_to_rank0() -> None:
+    """Override ``builtins.print`` so only rank 0 emits to stdout/stderr.
+
+    Without this, every rank's ``print(...)`` lands in the run log,
+    producing N×-duplicated output (16× on a 4-node × 4-GPU run).
+    Drivers can opt out by NOT calling this (the gating is one-shot;
+    safe to call multiple times — the ``_LORRAX_PRINT_GATED_TO_RANK0``
+    env sentinel guards against double-wrapping which would push every
+    rank-0 print through two predicate layers).
+
+    Call AFTER :func:`init_jax_distributed` (this routine is auto-called
+    at the tail of that function for the multi-process path; this
+    standalone entry exists for callers that don't go through
+    ``init_jax_distributed`` but still want rank-0-only logging).
+    """
+    if os.environ.get(_PRINT_GATED_SENTINEL):
+        return
+    import builtins
+    import jax
+
+    _orig_print = builtins.print
+
+    def _print0(*a, **k):
+        if jax.process_index() == 0:
+            k.setdefault("flush", True)
+            _orig_print(*a, **k)
+
+    builtins.print = _print0
+    os.environ[_PRINT_GATED_SENTINEL] = "1"
+
+
+def tee_stdout_to_file(path: str | os.PathLike) -> None:
+    """Mirror stdout + stderr to ``path`` (rank 0 only) while keeping
+    them on the terminal.  Useful when a driver wants its run log to
+    land in the run_dir instead of relying on whatever shell wrapper
+    captures the output.
+
+    Call AFTER :func:`init_jax_distributed` so only rank 0 writes the
+    file (otherwise N ranks race-write the same path).  Single-process
+    runs always write.
+
+    The file is opened ``'w'`` (truncate) and line-buffered.  Subsequent
+    ``print(...)`` calls land in both terminal and file; tracebacks
+    via stderr also land there.
+    """
+    import sys
+    import jax
+
+    if jax.process_count() > 1 and jax.process_index() != 0:
+        return
+
+    p = str(path)
+    parent = os.path.dirname(os.path.abspath(p))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    f = open(p, 'w', buffering=1)  # line-buffered
+
+    class _Tee:
+        def __init__(self, *streams):
+            self._streams = streams
+        def write(self, data):
+            for s in self._streams:
+                s.write(data)
+                s.flush()
+        def flush(self):
+            for s in self._streams:
+                s.flush()
+        def isatty(self):
+            return False
+
+    sys.stdout = _Tee(sys.__stdout__, f)
+    sys.stderr = _Tee(sys.__stderr__, f)
+
+
 def init_jax_distributed() -> None:
     """Call ``jax.distributed.initialize()`` idempotently.
 
@@ -123,6 +200,10 @@ def init_jax_distributed() -> None:
     derived from CUDA_VISIBLE_DEVICES.  First try that; on failure
     fall back to the explicit ``(coordinator_address, num_processes,
     process_id)`` form.
+
+    On the multi-process path, automatically gates ``builtins.print``
+    to rank 0 (see :func:`gate_print_to_rank0`) so the run log isn't
+    N× duplicated.  Single-process runs leave ``print`` untouched.
     """
     if os.environ.get(_DISTRIBUTED_SENTINEL):
         return
@@ -140,6 +221,7 @@ def init_jax_distributed() -> None:
     try:
         jax.distributed.initialize(**init_kwargs)
         os.environ[_DISTRIBUTED_SENTINEL] = "1"
+        gate_print_to_rank0()
         return
     except Exception:
         pass
@@ -150,6 +232,7 @@ def init_jax_distributed() -> None:
         process_id=_resolve_proc_id(),
     )
     os.environ[_DISTRIBUTED_SENTINEL] = "1"
+    gate_print_to_rank0()
 
 
 def nccl_warmup(mesh_xy) -> None:
