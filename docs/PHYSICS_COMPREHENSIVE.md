@@ -201,7 +201,7 @@ $$C_q(\mu, \nu) = \text{FFT}_{\mathbf{R}}\left[C_{\mathbf{R}}(\mu, \nu)\right]$$
 
 **Sharding**: $C_q(\mu_X, \nu_Y)$ is 2D tiled for blocked Cholesky.
 
-**Implementation**: `compute_CCT_from_left_right()` (spin-traced) and `compute_CCT_from_left_right_spin_matrix()` (explicit $P_{ab}$ channels) in `common/isdf_fitting.py`. Choose via `isdf_pair_mode = "spin_traced" | "spin_matrix_frobenius"` in `cohsex.in`.
+**Implementation**: `compute_CCT_from_left_right()` (spin-traced) in `common/isdf_fitting.py`.  Only the spin-traced path is currently wired to the GW driver; the explicit $P_{ab}$-channel variant lives behind `accumulate_pair_density_spin_traced` for the bispinor four-density work but is not yet exposed via a `cohsex.in` flag.
 
 ### 4.4 Stage 3: Cholesky Factorization
 

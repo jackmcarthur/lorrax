@@ -7,6 +7,10 @@ import os
 
 import numpy as np
 
+from common.units import RYD_TO_EV
+from .gw_config import LorraxConfig
+
+
 @dataclass(frozen=True)
 class PPMSigmaRuntimeOptions:
     """Resolved PPM sigma options parsed once in the GW driver."""
@@ -31,7 +35,6 @@ class PPMSigmaRuntimeOptions:
     ppm_static_cohsex_check: bool
     sigma_debug_quadrature: bool
     sigma_debug_quadrature_samples: int
-    sigma_munu_h5_path: str
     sigma_kij_h5_path: str
     write_w_copies_debug: bool
     w_copies_debug_file: str
@@ -45,79 +48,53 @@ def _resolve_input_path(input_dir: str, path: str) -> str:
     return path
 
 
-def build_ppm_sigma_runtime_options(config, *, input_dir: str, ryd2ev: float) -> PPMSigmaRuntimeOptions:
-    """Build PPM sigma runtime options from LorraxConfig (or legacy params dict)."""
+def build_ppm_sigma_runtime_options(
+    config: LorraxConfig, *, input_dir: str
+) -> PPMSigmaRuntimeOptions:
+    """Build PPM sigma runtime options from a ``LorraxConfig``."""
 
-    def _g(key, default=None):
-        """Get from config object (attribute) or dict (key)."""
-        if isinstance(config, dict):
-            return config.get(key, default)
-        return getattr(config, key, default)
-
-    omega_p_ry = float(_g("ppm_omega_p", 2.0))
-    ppm_fallback = float(_g("ppm_fallback_omega", 2.0))
-    omega_min_ev = float(_g("sigma_omega_min_ev", -5.0))
-    omega_max_ev = float(_g("sigma_omega_max_ev", 5.0))
-    omega_step_ev = float(_g("sigma_omega_step_ev", 0.25))
-    sigma_regularization_ev = float(_g("sigma_regularization_ev", 0.25))
-    sigma_edge_factor = float(_g("sigma_window_edge_factor", 1.5))
-    sigma_omega_batch_size = int(max(1, _g("sigma_omega_batch_size", 4)))
-    sigma_omega_accumulation = str(_g("sigma_omega_accumulation", "auto")).strip().lower()
-    ppm_sigma_scale = float(_g("ppm_sigma_scale", 1.0))
-    ppm_sigma_flip_neg = bool(_g("ppm_sigma_flip_neg", False))
-    ppm_invalid_mode = str(_g("ppm_invalid_mode", "static_limit")).strip().lower()
-    sigma_debug_split_contrib = bool(_g("sigma_debug_split_contrib", False))
-    sigma_freq_debug_output = bool(_g("sigma_freq_debug_output", True))
-    fermi_reference = str(_g("fermi_reference", "midgap")).strip().lower()
-    sigma_at_dft_extrapolate = bool(_g("sigma_at_dft_extrapolate", False))
-    sigma_at_dft_energies = bool(_g("sigma_at_dft_energies", False))
-    ppm_sigma_debug_static_norm = bool(_g("ppm_sigma_debug_static_norm", False))
-    ppm_static_cohsex_check = bool(_g("ppm_static_cohsex_check", False))
-    sigma_debug_quadrature = bool(_g("sigma_debug_quadrature", False))
-    sigma_debug_quadrature_samples = int(_g("sigma_debug_quadrature_samples", 200))
-    sigma_munu_h5_path = str(_g("sigma_munu_h5_file", "") or "").strip()
-    sigma_kij_h5_path = str(_g("sigma_kij_h5_file", "") or "").strip()
-    write_w_copies_debug = bool(_g("write_w_copies_debug", False))
-    w_copies_debug_file = str(_g("w_copies_debug_file", "w_copies_debug.h5") or "").strip()
-    sigma_freq_debug_file = str(_g("sigma_freq_debug_file", "sigma_freq_debug.dat") or "").strip()
-
-    if omega_step_ev <= 0.0:
+    if config.sigma_omega_step_ev <= 0.0:
         raise ValueError("sigma_omega_step_ev must be > 0.")
-    if omega_max_ev < omega_min_ev:
+    if config.sigma_omega_max_ev < config.sigma_omega_min_ev:
         raise ValueError("sigma_omega_max_ev must be >= sigma_omega_min_ev.")
-    if fermi_reference not in ("vbm", "midgap"):
+    if config.fermi_reference not in ("vbm", "midgap"):
         raise ValueError("fermi_reference must be 'vbm' or 'midgap'.")
 
-    n_omega = int(np.floor((omega_max_ev - omega_min_ev) / omega_step_ev + 0.5)) + 1
-    omega_grid_ev = omega_min_ev + omega_step_ev * np.arange(n_omega, dtype=np.float64)
-    omega_grid_ry = omega_grid_ev / ryd2ev
-    sigma_regularization_ry = sigma_regularization_ev / ryd2ev
+    n_omega = int(np.floor(
+        (config.sigma_omega_max_ev - config.sigma_omega_min_ev)
+        / config.sigma_omega_step_ev + 0.5
+    )) + 1
+    omega_grid_ev = (
+        config.sigma_omega_min_ev
+        + config.sigma_omega_step_ev * np.arange(n_omega, dtype=np.float64)
+    )
+    omega_grid_ry = omega_grid_ev / RYD_TO_EV
+    sigma_regularization_ry = config.sigma_regularization_ev / RYD_TO_EV
 
     return PPMSigmaRuntimeOptions(
-        omega_p_ry=omega_p_ry,
-        ppm_fallback=ppm_fallback,
+        omega_p_ry=float(config.ppm_omega_p),
+        ppm_fallback=float(config.ppm_fallback_omega),
         omega_grid_ev=omega_grid_ev,
         omega_grid_ry=omega_grid_ry,
         sigma_regularization_ry=sigma_regularization_ry,
-        sigma_edge_factor=sigma_edge_factor,
-        sigma_omega_batch_size=sigma_omega_batch_size,
-        sigma_omega_accumulation=sigma_omega_accumulation,
-        ppm_sigma_scale=ppm_sigma_scale,
-        ppm_sigma_flip_neg=ppm_sigma_flip_neg,
-        ppm_invalid_mode=ppm_invalid_mode,
-        sigma_debug_split_contrib=sigma_debug_split_contrib,
-        sigma_freq_debug_output=sigma_freq_debug_output,
-        fermi_reference=fermi_reference,
-        sigma_at_dft_extrapolate=sigma_at_dft_extrapolate,
-        sigma_at_dft_energies=sigma_at_dft_energies,
-        ppm_sigma_debug_static_norm=ppm_sigma_debug_static_norm,
-        ppm_static_cohsex_check=ppm_static_cohsex_check,
-        sigma_debug_quadrature=sigma_debug_quadrature,
-        sigma_debug_quadrature_samples=sigma_debug_quadrature_samples,
-        sigma_munu_h5_path=_resolve_input_path(input_dir, sigma_munu_h5_path),
-        sigma_kij_h5_path=_resolve_input_path(input_dir, sigma_kij_h5_path),
-        write_w_copies_debug=write_w_copies_debug,
-        w_copies_debug_file=_resolve_input_path(input_dir, w_copies_debug_file),
-        sigma_freq_debug_file=_resolve_input_path(input_dir, sigma_freq_debug_file),
-        use_ffi_io=bool(_g("use_ffi_io", False)),
+        sigma_edge_factor=float(config.sigma_window_edge_factor),
+        sigma_omega_batch_size=int(max(1, config.sigma_omega_batch_size)),
+        sigma_omega_accumulation=str(config.sigma_omega_accumulation).strip().lower(),
+        ppm_sigma_scale=float(config.ppm_sigma_scale),
+        ppm_sigma_flip_neg=bool(config.ppm_sigma_flip_neg),
+        ppm_invalid_mode=str(config.ppm_invalid_mode).strip().lower(),
+        sigma_debug_split_contrib=bool(config.sigma_debug_split_contrib),
+        sigma_freq_debug_output=bool(config.sigma_freq_debug_output),
+        fermi_reference=str(config.fermi_reference).strip().lower(),
+        sigma_at_dft_extrapolate=bool(config.sigma_at_dft_extrapolate),
+        sigma_at_dft_energies=bool(config.sigma_at_dft_energies),
+        ppm_sigma_debug_static_norm=bool(config.ppm_sigma_debug_static_norm),
+        ppm_static_cohsex_check=bool(config.ppm_static_cohsex_check),
+        sigma_debug_quadrature=bool(config.sigma_debug_quadrature),
+        sigma_debug_quadrature_samples=int(config.sigma_debug_quadrature_samples),
+        sigma_kij_h5_path=_resolve_input_path(input_dir, str(config.sigma_kij_h5_file or "").strip()),
+        write_w_copies_debug=bool(config.write_w_copies_debug),
+        w_copies_debug_file=_resolve_input_path(input_dir, str(config.w_copies_debug_file or "").strip()),
+        sigma_freq_debug_file=_resolve_input_path(input_dir, str(config.sigma_freq_debug_file or "").strip()),
+        use_ffi_io=bool(config.use_ffi_io),
     )

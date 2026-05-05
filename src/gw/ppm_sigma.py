@@ -62,6 +62,7 @@ import numpy as np
 import h5py
 
 from common import jax_profile
+from common.units import RYD_TO_EV
 from .minimax_config import MinimaxConfig, SigmaQuadratureConfig
 from .minimax_screening import (
     MinimaxNodes,
@@ -1509,13 +1510,12 @@ def compute_sigma_c_ppm_omega_grid(
     n_total_modes = int(jax.device_get(state.n_total_modes))
     n_invalid = int(jax.device_get(state.n_invalid))
 
-    ryd2ev = 13.6056980659
-    omega_step_ev = float(omega_req[1] - omega_req[0]) * ryd2ev if omega_req.size > 1 else 0.0
+    omega_step_ev = float(omega_req[1] - omega_req[0]) * RYD_TO_EV if omega_req.size > 1 else 0.0
     print_fn(
         f"  Σc(ω) grid: "
-        f"{float(np.min(omega_req)) * ryd2ev:.3f}..{float(np.max(omega_req)) * ryd2ev:.3f} eV, "
+        f"{float(np.min(omega_req)) * RYD_TO_EV:.3f}..{float(np.max(omega_req)) * RYD_TO_EV:.3f} eV, "
         f"Nω={omega_req.size}, Δω={omega_step_ev:.3f} eV, "
-        f"ξ={float(regularization_width_ry) * ryd2ev:.3f} eV"
+        f"ξ={float(regularization_width_ry) * RYD_TO_EV:.3f} eV"
     )
     if n_invalid:
         print_fn(
@@ -1568,7 +1568,7 @@ def compute_sigma_c_ppm_omega_grid(
         o_chunks = max(1, min(omega_batch_size, n_omega))
         h5_kij = h5py.File(kij_stream_path, "w")
         h5_kij.create_dataset("omega_ry", data=np.asarray(omega_req, dtype=np.float64))
-        h5_kij.create_dataset("omega_ev", data=np.asarray(omega_req * ryd2ev, dtype=np.float64))
+        h5_kij.create_dataset("omega_ev", data=np.asarray(omega_req * RYD_TO_EV, dtype=np.float64))
         dset_sigma_kij = h5_kij.create_dataset(
             "sigma_c_kij_ry",
             shape=(n_omega, nk_proj, nb_proj, nb_proj),
@@ -1643,11 +1643,10 @@ def compute_sigma_c_ppm_omega_grid(
         if h5_kij is not None:
             h5_kij.close()
 
-    ryd2ev = 13.6056980659
     sigma_kij_req = None if sigma_kij_host is None else jnp.asarray(sigma_kij_host, dtype=jnp.complex128)
     return SigmaOmegaResult(
         omega_ry=np.asarray(omega_req, dtype=np.float64),
-        omega_ev=np.asarray(omega_req * ryd2ev, dtype=np.float64),
+        omega_ev=np.asarray(omega_req * RYD_TO_EV, dtype=np.float64),
         sigma_c_kij=sigma_kij_req,
         sigma_kij_h5_path=kij_stream_path,
     )

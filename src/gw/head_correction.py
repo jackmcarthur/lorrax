@@ -27,6 +27,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+from common.units import RYD_TO_EV
+
 
 @dataclass(frozen=True)
 class HeadSample:
@@ -439,9 +441,6 @@ def fit_head_gn_from_samples(head_static: HeadSample, head_imag: HeadSample,
     )
 
 
-_RY2EV = 13.6056980659
-
-
 # ---------------------------------------------------------------------------
 # Exact static COHSEX head
 # ---------------------------------------------------------------------------
@@ -663,7 +662,7 @@ def format_head_diagnostics(head: HeadGNParams, cell_volume: float) -> str:
         f"  W^c(q→0, ω=0)      = {head.wc_head_0:12.3f} a.u.",
         f"  W^c(q→0, ω=iωp)    = {head.wc_head_iwp:12.3f} a.u.  [ωp={head.omega_p:.4f} Ry]",
         f"  Ω_h²               = {head.omega_h_sq:12.6f} Ry²",
-        f"  Ω_h                = {head.omega_h:12.6f} Ry  ({head.omega_h * _RY2EV:.6f} eV)",
+        f"  Ω_h                = {head.omega_h:12.6f} Ry  ({head.omega_h * RYD_TO_EV:.6f} eV)",
         f"  B_h                = {head.B_h:12.6f} Ry² · a.u.",
         f"  R_h                = {head.R_h:12.6f} Ry · a.u.",
     ]

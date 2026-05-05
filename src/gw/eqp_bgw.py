@@ -67,8 +67,7 @@ from typing import Optional
 import h5py
 import numpy as np
 
-
-_RYD2EV = 13.6056980659
+from common.units import RYD_TO_EV
 
 
 def _lorrax_version() -> str:
@@ -271,7 +270,7 @@ def make_eqp_bgw(
 
 	# DFT energies on the IBZ wedge for the sigma window (eV)
 	# energies_ry shape (nspin=1, nk_irr, nb_total); take spin 0.
-	e_dft_ev = energies_ry[0, :, band_start:band_stop] * _RYD2EV
+	e_dft_ev = energies_ry[0, :, band_start:band_stop] * RYD_TO_EV
 	if e_dft_ev.shape != (nk_irr, nb_window):
 		raise ValueError(
 			f"WFN energies shape {energies_ry.shape} inconsistent with "
@@ -297,7 +296,7 @@ def make_eqp_bgw(
 	if kin_full.ndim != 3:
 		raise ValueError(f"kin_ion dataset must be (nk, nb, nb); got {kin_full.shape}")
 	kin_irr = kin_full[kirr_to_kfull, band_start:band_stop, band_start:band_stop]
-	kin_ion_diag_ev = np.real(np.diagonal(kin_irr, axis1=1, axis2=2)) * _RYD2EV
+	kin_ion_diag_ev = np.real(np.diagonal(kin_irr, axis1=1, axis2=2)) * RYD_TO_EV
 
 	# sigma_mnk.h5: σ_x, σ_c(ω), V_H, ω axis (all already in eV, ω relative to E_F)
 	with h5py.File(sigma_mnk_path, "r") as sf:

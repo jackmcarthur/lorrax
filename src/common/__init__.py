@@ -1,5 +1,6 @@
 from .meta import Meta
 from .load_wfns import get_enk_bandrange
+from .units import RYD_TO_EV, EV_TO_RYD
 
 # Re-export I/O classes for backward compatibility (prefer io imports)
 from .wfnreader import WFNReader

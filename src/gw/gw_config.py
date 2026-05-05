@@ -18,6 +18,8 @@ from pathlib import Path
 
 import numpy as np
 
+from common.units import RYD_TO_EV
+
 
 # ---------------------------------------------------------------------------
 #  Defaults — single source of truth for every input key
@@ -39,7 +41,6 @@ _DEFAULTS = {
     "sigma_kij_h5_file": "",
     # Core flags
     "restart": True,
-    "x_only": False,
     "do_screened": True,
     "bispinor": False,
     "do_G0": True,
@@ -324,7 +325,6 @@ class LorraxConfig:
 
     # --- Core flags ---
     restart: bool
-    x_only: bool
     do_screened: bool
     bispinor: bool
     do_G0: bool
@@ -444,11 +444,10 @@ class LorraxConfig:
     @property
     def omega_grid_ry(self):
         """Sigma frequency grid in Rydberg."""
-        ryd2ev = 13.6056980659
         return np.arange(
-            self.sigma_omega_min_ev / ryd2ev,
-            (self.sigma_omega_max_ev + 0.5 * self.sigma_omega_step_ev) / ryd2ev,
-            self.sigma_omega_step_ev / ryd2ev,
+            self.sigma_omega_min_ev / RYD_TO_EV,
+            (self.sigma_omega_max_ev + 0.5 * self.sigma_omega_step_ev) / RYD_TO_EV,
+            self.sigma_omega_step_ev / RYD_TO_EV,
         )
 
     @property
@@ -482,8 +481,6 @@ class LorraxConfig:
         if isdf_memory_mode not in ("auto", "high_mem", "low_mem"):
             raise ValueError(f"isdf_memory_mode={isdf_memory_mode!r} invalid; "
                              f"expected auto|high_mem|low_mem")
-        if params["x_only"] and params["do_screened"]:
-            raise ValueError("x_only and do_screened cannot both be True.")
 
         # --- Memory auto-detection ---
         memory_per_device_gb = float(params.get("memory_per_device_gb", 0.0))
@@ -538,7 +535,6 @@ class LorraxConfig:
             sigma_kij_h5_file=str(_get("sigma_kij_h5_file") or ""),
             # Core flags
             restart=bool(_get("restart")),
-            x_only=bool(_get("x_only")),
             do_screened=bool(_get("do_screened")),
             bispinor=bool(_get("bispinor")),
             do_G0=bool(_get("do_G0")),

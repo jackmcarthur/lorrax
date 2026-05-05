@@ -11,6 +11,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from common.units import RYD_TO_EV
+
 # ---------------------------------------------------------------------------
 # Results container
 # ---------------------------------------------------------------------------
@@ -145,9 +147,6 @@ def print_system_summary(
 # Result writer  (QE ``punch('all')`` pattern)
 # ---------------------------------------------------------------------------
 
-_RYD2EV = 13.6056980659
-
-
 def write_results(
     results: GWResults,
     output_file: str,
@@ -186,7 +185,7 @@ def write_results(
         write_qp_rotations_h5,
     )
 
-    r2e = _RYD2EV
+    r2e = RYD_TO_EV
 
     # BGW-style degenerate-set averaging: replace the diagonal of each
     # Σ matrix with the mean over each contiguous degenerate group of

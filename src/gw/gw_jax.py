@@ -65,12 +65,11 @@ from .wavefunction_bundle import BandSlices
 from mixing.acceleration import (
     rcrop_nojit, hermitian_to_upper_flat, upper_flat_to_hermitian
 )
-from common import Meta
+from common import Meta, RYD_TO_EV
 from common import jax_profile
 import common.timing as timing
 import contextlib
 import h5py
-import builtins
 
 
 
@@ -108,7 +107,6 @@ def _compute_static_head(config, input_dir, wfn, sym, meta, do_screened, print0)
 
 
 def main(argv=None):
-	global sym
 	argp = argparse.ArgumentParser(description="COHSEX self-energy driver")
 	argp.add_argument(
 		"-i",
@@ -117,21 +115,21 @@ def main(argv=None):
 		help="Input file",
 	)
 	args = argp.parse_args(argv)
-	
-	# Gate prints to rank 0
-	_orig_print = builtins.print
+
+	# Rank-gated print used as ``print_fn=`` throughout the driver.  We do
+	# NOT clobber ``builtins.print`` — that historically affected every
+	# imported library, including ones that legitimately want to write
+	# from non-zero ranks (logging, error paths).
 	def print0(*a, **k):
 		if jax.process_index() == 0:
 			k.setdefault("flush", True)
-			_orig_print(*a, **k)
-	builtins.print = print0
- 
+			print(*a, **k)
+
 	# ========================================================================
 	# CONFIGURATION
 	# ========================================================================
 	config = LorraxConfig.from_input_file(args.input, print_fn=print0)
 	input_dir = config.input_dir
-	ryd2ev = 13.6056980659
 
 	# ========================================================================
 	# INITIALIZATION
@@ -183,7 +181,6 @@ def main(argv=None):
 		device_kind=device_names, print_fn=print0,
 	)
 
-	global wfn
 	wfn = WFNReader(config.wfn_file)
 	sym = symmetry_maps.SymMaps(wfn)
 	_, centroid_indices, _n_rmu = load_centroids(config.centroids_file, wfn.fft_grid)
@@ -384,7 +381,7 @@ def main(argv=None):
 	# QE basis-dependent splitting within degenerate manifolds shows up
 	# as a few-meV spread across symmetry-equivalent bands.
 	from .degen_average import average_within_degenerate_sets
-	sig_x_diag = np.real(np.diagonal(np.asarray(sig_x), axis1=1, axis2=2)) * ryd2ev
+	sig_x_diag = np.real(np.diagonal(np.asarray(sig_x), axis1=1, axis2=2)) * RYD_TO_EV
 	if not config.no_degen_averaging:
 		_enk_sigma_ry, _ = get_enk_bandrange(
 			wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
@@ -409,7 +406,7 @@ def main(argv=None):
 		if config.self_consistent:
 			raise NotImplementedError("use_ppm_sigma not supported with self_consistent.")
 
-		ppm_options = build_ppm_sigma_runtime_options(config, input_dir=input_dir, ryd2ev=ryd2ev)
+		ppm_options = build_ppm_sigma_runtime_options(config, input_dir=input_dir)
 		_ppm_label = "HL-PPM" if str(getattr(config, "ppm_model", "gn")).strip().lower() == "hl" else "GN-PPM"
 		print_section(f"{_ppm_label} + FREQUENCY-INTEGRATED SIGMA", print0)
 
@@ -530,7 +527,7 @@ def main(argv=None):
 				_head_gn = fit_head_with_fixed_omega_from_sample(
 					_head_static, omega_h_ry=float(_head_omega_override))
 				print0(f"  PPM head: Ω_h override = {float(_head_omega_override):.6f} Ry "
-				       f"({float(_head_omega_override)*ryd2ev:.4f} eV)")
+				       f"({float(_head_omega_override)*RYD_TO_EV:.4f} eV)")
 			elif ppm_model == "hl":
 				# BGW-style analytic head pole: Ω_h² = ω_p² / (1 − ε_head⁻¹).
 				# ω_p² = 16π · N_e / V_cell in Ry² (Hartree-AU energies → Ry² has factor 4 → 16π).
@@ -538,7 +535,7 @@ def main(argv=None):
 				_head_gn = fit_head_hl_analytic_from_sample(
 					_head_static, omega_p_sq_ry=_omega_p_sq_ry)
 				print0(f"  HL head: ω_p (analytic, BGW-style) = {_omega_p_sq_ry**0.5:.6f} Ry "
-				       f"({(_omega_p_sq_ry**0.5)*ryd2ev:.4f} eV)")
+				       f"({(_omega_p_sq_ry**0.5)*RYD_TO_EV:.4f} eV)")
 			else:
 				_head_probe = resolve_head_sample(
 					_head_params, input_dir, wfn, sym, meta, print0,
@@ -565,9 +562,9 @@ def main(argv=None):
 					cell_volume=float(meta.cell_volume),
 					nk_tot=int(meta.nk_tot),
 				)
-				_head_max_ev = float(np.max(np.abs(_head_sigma_kij_ry))) * ryd2ev
+				_head_max_ev = float(np.max(np.abs(_head_sigma_kij_ry))) * RYD_TO_EV
 				print0(f"  Σ_c head shift: max|Σ^head_diag| = {_head_max_ev:.4f} eV "
-				       f"(on-shell occ band → {-_head_gn.R_h/(_head_gn.omega_h * meta.cell_volume * meta.nk_tot) * ryd2ev:+.4f} eV)")
+				       f"(on-shell occ band → {-_head_gn.R_h/(_head_gn.omega_h * meta.cell_volume * meta.nk_tot) * RYD_TO_EV:+.4f} eV)")
 				sigma_c_omega = sigma_c_omega + jnp.asarray(_head_sigma_kij_ry, dtype=jnp.complex128)
 
 			# Evaluate Σ_c at DFT energies
@@ -579,7 +576,7 @@ def main(argv=None):
 				enk_dft, _ = get_enk_bandrange(wfn, sym,
 					band_slices.sigma_range,
 					band_slices.sigma_range, nspinor=meta.nspinor)
-				enk_dft_ev = np.asarray(enk_dft) * ryd2ev
+				enk_dft_ev = np.asarray(enk_dft) * RYD_TO_EV
 				n_occ = min(meta.nelec, enk_dft_ev.shape[1])
 				vbm_ev = float(np.max(enk_dft_ev[:, :n_occ]))
 				cbm_ev = float(np.min(enk_dft_ev[:, n_occ:])) if n_occ < enk_dft_ev.shape[1] else vbm_ev
@@ -590,17 +587,17 @@ def main(argv=None):
 				# Interpolate diagonal Σ_c(ω) at each DFT energy
 				omega_ev = np.asarray(ppm_options.omega_grid_ev, dtype=np.float64)
 				if sigma_c_omega is not None:
-					sig_c_diag = np.diagonal(np.asarray(sigma_c_omega), axis1=2, axis2=3) * ryd2ev
+					sig_c_diag = np.diagonal(np.asarray(sigma_c_omega), axis1=2, axis2=3) * RYD_TO_EV
 				else:
 					with h5py.File(sigma_omega.sigma_kij_h5_path, "r") as h5:
 						sig_c_diag = np.diagonal(
-							np.asarray(h5["sigma_c_kij_ry"], dtype=np.complex128), axis1=2, axis2=3) * ryd2ev
+							np.asarray(h5["sigma_c_kij_ry"], dtype=np.complex128), axis1=2, axis2=3) * RYD_TO_EV
 				nk, nb = sig_c_diag.shape[1], sig_c_diag.shape[2]
 				sigma_c_at_dft_ev = np.array([
 					[complex(np.interp(omega_dft_rel_ev[ik, ib], omega_ev, np.real(sig_c_diag[:, ik, ib])),
 					         np.interp(omega_dft_rel_ev[ik, ib], omega_ev, np.imag(sig_c_diag[:, ik, ib])))
 					 for ib in range(nb)] for ik in range(nk)], dtype=np.complex128)
-				sig_x_diag_ev = np.diagonal(np.asarray(sig_x), axis1=1, axis2=2) * ryd2ev
+				sig_x_diag_ev = np.diagonal(np.asarray(sig_x), axis1=1, axis2=2) * RYD_TO_EV
 				sigma_xc_at_dft_ev = sig_x_diag_ev + sigma_c_at_dft_ev
 
 			# Replace static COHSEX with PPM results
@@ -617,9 +614,9 @@ def main(argv=None):
 			if sigma_c_omega is not None:
 				write_sigma_omega_h5(
 					sigma_omega_h5_path, ppm_options.omega_grid_ev, None,
-					sigma_c_kij_ev=ryd2ev * sigma_c_omega,
-					sigma_sx_kij_ev=ryd2ev * sig_sx,
-					hartree_kij_ev=ryd2ev * sig_h,
+					sigma_c_kij_ev=RYD_TO_EV * sigma_c_omega,
+					sigma_sx_kij_ev=RYD_TO_EV * sig_sx,
+					hartree_kij_ev=RYD_TO_EV * sig_h,
 					mesh=mesh_xy,
 					use_ffi_io=getattr(config, "use_ffi_io", False))
 			elif meta.rank == 0 and sigma_omega.sigma_kij_h5_path:
@@ -631,11 +628,11 @@ def main(argv=None):
 							h5_out.create_dataset("omega_ev", data=np.asarray(ppm_options.omega_grid_ev, dtype=np.float64))
 							dset_out = h5_out.create_dataset("sigma_c_kij_ev",
 								shape=dset_c.shape, dtype=np.complex128, chunks=(batch, max(1, min(4, nk)), nb, nb))
-							h5_out.create_dataset("sigma_sx_kij_ev", data=ryd2ev * np.array(sig_sx))
-							h5_out.create_dataset("hartree_kij_ev", data=ryd2ev * np.array(sig_h))
+							h5_out.create_dataset("sigma_sx_kij_ev", data=RYD_TO_EV * np.array(sig_sx))
+							h5_out.create_dataset("hartree_kij_ev", data=RYD_TO_EV * np.array(sig_h))
 							for ibeg in range(0, n_omega, batch):
 								dset_out[ibeg:min(ibeg+batch, n_omega)] = \
-									ryd2ev * np.array(dset_c[ibeg:min(ibeg+batch, n_omega)], dtype=np.complex128)
+									RYD_TO_EV * np.array(dset_c[ibeg:min(ibeg+batch, n_omega)], dtype=np.complex128)
 
 	# ---- QP Hamiltonian: H_QP = (H_DFT - V_xc) + V_H + Σ_xc ----
 	sigma_total = sig_sx + sig_coh + sig_h
@@ -645,16 +642,16 @@ def main(argv=None):
 	if config.use_ppm_sigma and meta.rank == 0 and sigma_omega_h5_path and os.path.exists(sigma_omega_h5_path):
 		H_qp = np.array(kin_ion + sigma_total)
 		H_qp = 0.5 * (H_qp + np.conj(np.swapaxes(H_qp, -1, -2)))
-		E_qp_ev = np.linalg.eigvalsh(H_qp) * ryd2ev
+		E_qp_ev = np.linalg.eigvalsh(H_qp) * RYD_TO_EV
 
 		# Diagonal fixed-point: E = diag(H0) + Re Σ_xc(E)
-		h0_diag_ev = np.real(np.diagonal(np.array(kin_ion + sig_h), axis1=1, axis2=2)) * ryd2ev
+		h0_diag_ev = np.real(np.diagonal(np.array(kin_ion + sig_h), axis1=1, axis2=2)) * RYD_TO_EV
 		occ_idx = min(meta.nelec, E_qp_ev.shape[1] - 1)
 		vbm = float(np.max(E_qp_ev[:, occ_idx]))
 		cbm = float(np.min(E_qp_ev[:, occ_idx + 1])) if occ_idx + 1 < E_qp_ev.shape[1] else vbm
 		efermi = 0.5 * (vbm + cbm)
 		omega_ev = np.asarray(ppm_options.omega_grid_ev, dtype=np.float64)
-		sigma_xc_diag = np.real(load_sigma_xc_diag_from_h5(sigma_omega_h5_path, ryd2ev * np.array(sig_sx)))
+		sigma_xc_diag = np.real(load_sigma_xc_diag_from_h5(sigma_omega_h5_path, RYD_TO_EV * np.array(sig_sx)))
 		E_sc, conv, n_iter = solve_diagonal_sigma_fixed_point(
 			h0_diag_ev - efermi, sigma_xc_diag, omega_ev, max_iter=120, tol_ev=1e-7, mixing=0.6)
 		# In-grid test is against DFT energy (the Sigma(omega) grid is indexed
@@ -687,7 +684,7 @@ def main(argv=None):
 		print0(f"  Diagonal SC: {n_in}/{in_grid.size} states in grid, {n_iter} iterations")
 
 		qsgw = build_qsgw_sigma_xc_from_h5(sigma_omega_h5_path,
-			ryd2ev * np.array(sig_sx), omega_ev, E_sc - efermi)
+			RYD_TO_EV * np.array(sig_sx), omega_ev, E_sc - efermi)
 		print0(f"  QSGW: {int(qsgw['n_interp_clipped'])} clipped "
 			f"({100*qsgw['frac_interp_clipped']:.1f}%)")
 
@@ -756,7 +753,7 @@ def main(argv=None):
 		and sigma_c_at_dft_ev is not None
 	):
 		_sig_coh_eqp0 = np.zeros(np.asarray(sig_coh).shape, dtype=np.complex128)
-		_diag_ry = sigma_c_at_dft_ev / ryd2ev
+		_diag_ry = sigma_c_at_dft_ev / RYD_TO_EV
 		_nk, _nb = _diag_ry.shape
 		_idx = np.arange(_nb)
 		_sig_coh_eqp0[:, _idx, _idx] = _diag_ry
