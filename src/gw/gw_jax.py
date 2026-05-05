@@ -187,9 +187,19 @@ def main(argv=None):
 	)
 	V_qmunu = isdf.V_qmunu
 	wfns = isdf.wf_bundle
+	wfns_current = getattr(isdf, 'wf_bundle_current', None)
+
+	# Bispinor branches early.  V_qmunu is a dict[(μ_L,ν_L), Array] when
+	# bispinor; the screened (χ₀ → W) path is not yet wired for the
+	# 10-tile structure (W needs its own Lorentz tile build).  For
+	# x_only bispinor we go straight to ``compute_cohsex_sigma_bispinor``.
+	_bispinor_dispatch = isinstance(V_qmunu, dict)
 
 	# --- Screening: χ₀ → W = (1 − Vχ)⁻¹ V ---
-	V_q = flatten_V_qmunu(V_qmunu)
+	if _bispinor_dispatch:
+		V_q = None  # not used in bispinor x_only path
+	else:
+		V_q = flatten_V_qmunu(V_qmunu)
 	if config.do_screened:
 		with timing.section("gw_jax.chi0_W"):
 			with jax_profile.trace_section("chi0_W"):
@@ -224,7 +234,7 @@ def main(argv=None):
 					W_q.block_until_ready()
 
 	if not config.do_screened:
-		W_q = V_q  # unscreened: W = V
+		W_q = V_q  # unscreened: W = V (None for bispinor x_only)
 
 	# ── Persist W0_qmunu + q=0 head scalars to the restart file ──────────
 	# Downstream consumers (BSE, future Σ-builders) reload these and apply
@@ -286,16 +296,41 @@ def main(argv=None):
 	# ---- Static COHSEX: Σ_SX, Σ_COH, V_H + bare Σ_X ----
 	import gc; gc.collect()
 	with timing.section("gw_jax.sigma"):
-		cohsex = compute_cohsex_sigma(
-			wfns, V_q, W_q, meta, mesh_xy,
-			Gij=Gij, do_screened=config.do_screened,
-			static_head_terms=static_head_terms,
-			compute_bare_x=True,
-		)
-	sig_sx  = cohsex["sig_sx"]
-	sig_coh = cohsex["sig_coh"]
-	sig_h   = cohsex["sig_h"]
-	sig_x   = cohsex["sig_x"]
+		if _bispinor_dispatch:
+			# Bispinor x_only: Σ_X^B over the 10 V_q^{μ_L,ν_L} tiles.
+			# The (0,0) tile uses ``wfns`` (charge centroid bundle); the
+			# 9 transverse tiles use ``wfns_current``.  Σ_SX/Σ_COH for
+			# bispinor needs a 10-tile W (not yet wired) so we error
+			# loudly if do_screened is true here.
+			from .cohsex_sigma import compute_cohsex_sigma_bispinor
+			cohsex = compute_cohsex_sigma_bispinor(
+				wfns_charge=wfns, wfns_current=wfns_current,
+				V_blocks=V_qmunu, W_q=W_q,
+				meta=meta, mesh_xy=mesh_xy,
+				Gij=Gij, do_screened=config.do_screened,
+				static_head_terms=static_head_terms,
+				compute_bare_x=True,
+				print_fn=print0,
+			)
+			# sig_sx / sig_coh / sig_h are None here for x_only bispinor.
+			# Fill with zero placeholders so the downstream summation
+			# below remains a single jnp.add of like-shaped arrays.
+			_zero = jnp.zeros_like(cohsex["sig_x"])
+			sig_sx  = cohsex["sig_sx"]  if cohsex["sig_sx"]  is not None else _zero
+			sig_coh = cohsex["sig_coh"] if cohsex["sig_coh"] is not None else _zero
+			sig_h   = cohsex["sig_h"]   if cohsex["sig_h"]   is not None else _zero
+			sig_x   = cohsex["sig_x"]
+		else:
+			cohsex = compute_cohsex_sigma(
+				wfns, V_q, W_q, meta, mesh_xy,
+				Gij=Gij, do_screened=config.do_screened,
+				static_head_terms=static_head_terms,
+				compute_bare_x=True,
+			)
+			sig_sx  = cohsex["sig_sx"]
+			sig_coh = cohsex["sig_coh"]
+			sig_h   = cohsex["sig_h"]
+			sig_x   = cohsex["sig_x"]
 
 	# Print bare Σ_X diagonal for ISDF quality assessment.  Apply BGW-style
 	# degenerate-set averaging (mirrors Sigma/shiftenergy.f90) unless

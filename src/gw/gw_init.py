@@ -562,14 +562,67 @@ def get_bandranges(nv, nc, nband, nelec):
 	return nvrange, ncrange, nsigmarange, n_fullrange, n_valrange
 
 
+def load_current_centroid_wfns(wfn, sym, meta, cfg, mesh_xy, band_slices, chunks):
+	"""Load current-density centroid set + the centroid wavefunctions.
+
+	Used by both ``fit_zeta`` (for the bispinor 3-channel current zeta
+	loop) and ``prepare_isdf_and_wavefunctions`` (to build the second
+	wavefunction bundle on the current centroids).  Sharing this loader
+	keeps the centroid ψ in memory ONCE — both consumers reuse the same
+	host-resident centroid arrays.
+
+	Returns ``SimpleNamespace(centroid_indices, meta_curr, psi_rmu_Y,
+	psi_rmuT_X)`` or ``None`` when bispinor is off / no current centroids
+	file is configured.
+	"""
+	if not (cfg.bispinor and cfg.paths.centroids_file_current):
+		return None
+	import dataclasses
+	from common.load_wfns import load_centroids_band_chunked
+	from file_io.centroids import load_centroids
+
+	_, cents_curr_idx, n_rmu_curr = load_centroids(
+		cfg.paths.centroids_file_current, meta.fft_grid)
+	# Round n_rmu_jax to n_proc, matching Meta.from_system convention.
+	n_rmu_curr_jax = ((n_rmu_curr + meta.n_proc - 1) // meta.n_proc) * meta.n_proc
+	meta_curr = dataclasses.replace(
+		meta, n_rmu=int(n_rmu_curr), n_rmu_jax=int(n_rmu_curr_jax))
+
+	with timing.section("gw_jax.load_centroid_wfns_current"):
+		psi_curr_rmu_Y, psi_curr_rmuT_X = load_centroids_band_chunked(
+			wfn, sym, meta_curr,
+			jnp.asarray(cents_curr_idx, dtype=jnp.int32),
+			cfg.bispinor, mesh_xy,
+			band_range=band_slices.full_range,
+			band_chunk_size=chunks['band_chunk'],
+		)
+
+	return SimpleNamespace(
+		centroid_indices=jnp.asarray(cents_curr_idx, dtype=jnp.int32),
+		meta=meta_curr,
+		psi_rmu_Y=psi_curr_rmu_Y,
+		psi_rmuT_X=psi_curr_rmuT_X,
+	)
+
+
 def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
-             psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print):
+             psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print,
+             current_centroid_data=None):
 	"""Fit ISDF interpolation vectors ζ and write to HDF5.
 
 	The caller supplies (a) the full-range centroid wavefunctions
 	(``psi_rmu_Y`` / ``psi_rmuT_X``, spanning [b0, b4) as returned by
 	``load_centroids_band_chunked``) and (b) the chunk plan from
 	:func:`compute_optimal_chunks`.  Returns ``(zeta_h5_path, mem_est)``.
+
+	``current_centroid_data`` (optional) — pre-loaded SimpleNamespace from
+	:func:`load_current_centroid_wfns`.  When ``cfg.bispinor`` is on and
+	``cfg.paths.centroids_file_current`` is set, fit_zeta uses the
+	pre-loaded current centroids ψ for the 3-channel γ̃^{1,2,3} fit; if
+	None, fit_zeta loads them itself (legacy single-shot path).  Sharing
+	the load with the caller lets the same host arrays drive both the
+	zeta fit AND the second wavefunction bundle build (Σ_X^B), avoiding
+	a 4 GB/process duplicate.
 	"""
 	from common.isdf_fitting import fit_zeta_chunked_to_h5
 
@@ -657,29 +710,23 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# at ``cfg.paths.centroids_file_current`` and is auto-derived from
 	# ``cfg.paths.centroids_file`` when bispinor=True (see gw_config).
 	if cfg.bispinor and cfg.paths.centroids_file_current:
-		import dataclasses
 		import gc
-		from common.load_wfns import load_centroids_band_chunked
-		from file_io.centroids import load_centroids
 		from common import isdf_fitting as _isdf
+
+		# Reuse pre-loaded current-centroid wfns when the caller passed
+		# them (typical: prepare_isdf_and_wavefunctions does the load
+		# once and shares with the bundle builder).  Fall back to loading
+		# here if called standalone.
+		if current_centroid_data is None:
+			current_centroid_data = load_current_centroid_wfns(
+				wfn, sym, meta, cfg, mesh_xy, band_slices, chunks)
+		cents_curr_idx = current_centroid_data.centroid_indices
+		meta_curr = current_centroid_data.meta
+		psi_curr_rmu_Y = current_centroid_data.psi_rmu_Y
+		psi_curr_rmuT_X = current_centroid_data.psi_rmuT_X
 
 		print_fn(f"\n  [bispinor] fitting ζ^{{μ_L=1,2,3}} on current-density "
 		         f"centroids: {cfg.paths.centroids_file_current}")
-		_, cents_curr_idx, n_rmu_curr = load_centroids(
-			cfg.paths.centroids_file_current, meta.fft_grid)
-		# Round n_rmu_jax to n_proc, matching Meta.from_system convention.
-		n_rmu_curr_jax = ((n_rmu_curr + meta.n_proc - 1) // meta.n_proc) * meta.n_proc
-		meta_curr = dataclasses.replace(
-			meta, n_rmu=int(n_rmu_curr), n_rmu_jax=int(n_rmu_curr_jax))
-
-		with timing.section("gw_jax.load_centroid_wfns_current"):
-			psi_curr_rmu_Y, psi_curr_rmuT_X = load_centroids_band_chunked(
-				wfn, sym, meta_curr,
-				jnp.asarray(cents_curr_idx, dtype=jnp.int32),
-				cfg.bispinor, mesh_xy,
-				band_range=band_slices.full_range,
-				band_chunk_size=chunks['band_chunk'],
-			)
 
 		# Caches in isdf_fitting close over tracers from the enclosing
 		# jit at first compile.  Re-using compiled fns from a fresh
@@ -879,38 +926,19 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		while G0.ndim > 1:
 			G0 = G0[0]
 
-		# TODO(bispinor-sigma): downstream Σ^B integration not yet wired.
-		# sigma_sx / sigma_coh consume V_qmunu shaped
-		# ``(1, npol, npol, nkx, nky, nkz, μ, μ)`` — a SINGLE Lorentz
-		# channel.  Until the Σ-projection is upgraded to walk all 10
-		# V^{μ_L, ν_L} tiles, we forward only the (0,0) block (charge
-		# channel) so the rest of the pipeline runs through unchanged.
-		# This produces the SAME Σ as a non-bispinor μ_L=0-only run on
-		# the bispinor centroid set + lifted ψ — useful as an end-to-end
-		# smoke test, NOT as a physical bispinor result.
-		print_fn(f"    [bispinor] WARNING: forwarding only V_blocks[(0,0)] "
-		         f"to downstream Σ — the 9 transverse tiles are computed "
-		         f"and logged but DISCARDED until Σ-projection lands.")
-		V_q_raw_flat = V_blocks[(0, 0)]
-		# Reshape (nq, μ, μ) → (nkx, nky, nkz, μ, μ); the lorentz driver
-		# returns flat-q shape, the non-bispinor compute_all_V_q returns
-		# kgrid-shape directly.  Match the latter for downstream Σ.
+		# Reshape every tile (nq, n_rmu_L, n_rmu_R) → (nkx, nky, nkz, ...)
+		# to match the kgrid-shape downstream Σ_X^B walks over.  Tile
+		# centroid counts can differ across (μ_L, ν_L) when the charge
+		# and current centroid sets disagree (e.g. CrI3 1800 vs 1808),
+		# so we keep them as a dict instead of stacking.
 		nkx, nky, nkz = meta.kgrid
-		n_rmu_0 = int(n_rmu_by_channel[0])
-		V_q_raw = V_q_raw_flat.reshape(nkx, nky, nkz, n_rmu_0, n_rmu_0)
-		# DO NOT wrap the broadcast in ``jnp.array(...)``: for bispinor
-		# npol=4 that materialises a (1, 4, 4, ...) tensor 16× the
-		# (nkx, nky, nkz, μ, μ) base, which on CrI3 16-GPU is a 30 GB
-		# allocation that OOMs ``save_restart_state_per_proc``'s
-		# ``V_qmunu[..., vx0:vx1, vy0:vy1]`` slice.  Keep it as a view
-		# — downstream consumers (Σ, the slice in save_restart) only
-		# materialise their per-q / per-μ slabs which are 16× smaller.
-		# Non-bispinor (npol=1) was unaffected by the materialisation
-		# because its broadcast is shape-preserving.
-		V_qmunu = jnp.broadcast_to(
-			V_q_raw[None, None, None],
-			(1, meta.npol, meta.npol, nkx, nky, nkz, n_rmu_0, n_rmu_0))
-		return V_qmunu, G0
+		V_blocks_kgrid: dict = {}
+		for (mu_L, nu_L), block in V_blocks.items():
+			n_rmu_L = int(block.shape[-2])
+			n_rmu_R = int(block.shape[-1])
+			V_blocks_kgrid[(int(mu_L), int(nu_L))] = block.reshape(
+				nkx, nky, nkz, n_rmu_L, n_rmu_R)
+		return V_blocks_kgrid, G0
 
 	# Single dispatcher: ``compute_all_V_q`` selects the right kernel from
 	# the SlabIO backend (PHDF5_FFI → mesh-parallel ζ reads + outer jit,
@@ -1034,11 +1062,20 @@ def prepare_isdf_and_wavefunctions(
 					band_chunk_size=chunks['band_chunk'],
 				)
 
+			# Bispinor: load the current-density centroid ψ ONCE here;
+			# share with fit_zeta (3-channel γ̃^{1,2,3} loop) AND the
+			# wfns_current bundle build below so Σ_X^B's per-tile pair
+			# densities are local on (μ_X, μ_Y) sharding without a second
+			# host-side load.  None on non-bispinor / no current file.
+			current_centroid_data = load_current_centroid_wfns(
+				wfn, sym, meta, cfg, mesh_xy, band_slices, chunks)
+
 			zeta_path, mem_est = fit_zeta(
 				wfn, sym, meta, centroid_indices, mesh_xy,
 				cfg, band_slices, tmp_dir,
-				psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print0)
-			V_qmunu, G0 = compute_V_q(
+				psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print0,
+				current_centroid_data=current_centroid_data)
+			V_q_or_blocks, G0 = compute_V_q(
 				zeta_path, wfn, meta, mesh_xy, cfg,
 				mem_est=mem_est, print_fn=print0,
 				bgw_v_grid_fn=bgw_v_grid_fn)
@@ -1047,10 +1084,25 @@ def prepare_isdf_and_wavefunctions(
 				wfn, sym, band_slices.full_range,
 				(band_slices.b1, band_slices.b3), nspinor=meta.nspinor)
 
-			# Flush V_q / G0 / enk + W0 placeholder immediately.
+			# Flush V_q / G0 / enk + W0 placeholder immediately.  For
+			# bispinor V_q is a dict of 10 tiles; ``write_restart_state_to_h5``
+			# only consumes a single rank-N V_qmunu, so we use the (0,0)
+			# tile broadcast as a *placeholder* in the restart file (it
+			# preserves the layout the legacy restart loader expects).
+			# The dict itself is held in memory and threaded into Σ_X^B
+			# below — restart-loaded bispinor runs need to recompute V_q
+			# from disk-backed zeta files (skipping fit_zeta), not load
+			# tiles from the restart h5.
+			V_qmunu_for_restart = V_q_or_blocks
+			if isinstance(V_q_or_blocks, dict):
+				_v00 = V_q_or_blocks[(0, 0)]
+				_n00 = int(_v00.shape[-1])
+				V_qmunu_for_restart = jnp.broadcast_to(
+					_v00[None, None, None],
+					(1, meta.npol, meta.npol, *meta.kgrid, _n00, _n00))
 			write_restart_state_to_h5(
 				tensors_filename,
-				V_qmunu=V_qmunu, G0_mu_nu=G0, enk_full=enk_full,
+				V_qmunu=V_qmunu_for_restart, G0_mu_nu=G0, enk_full=enk_full,
 				init_W0=True, mesh=mesh_xy, backend=cfg.backend.slab_io,
 				mode="w",
 			)
@@ -1061,6 +1113,20 @@ def prepare_isdf_and_wavefunctions(
 					psi_rmu_Y=psi_rmu_Y, psi_rmuT_X=psi_rmuT_X,
 					enk_full=enk_full, print_fn=print0)
 
+				wfns_current = None
+				if current_centroid_data is not None:
+					# Second bundle on the current centroid set — same 4
+					# sharded copies (xn / xr / yn / yr) so Σ_X^B's
+					# transverse-tile contractions stay local on the
+					# (μ_X, μ_Y) axes.  Built AFTER fit_zeta so the
+					# centroid-ψ host arrays are still resident.
+					wfns_current = build_wavefunction_bundle(
+						wfn, sym, current_centroid_data.meta,
+						band_slices, mesh_xy,
+						psi_rmu_Y=current_centroid_data.psi_rmu_Y,
+						psi_rmuT_X=current_centroid_data.psi_rmuT_X,
+						enk_full=enk_full, print_fn=print0)
+
 			# Append ψ to the now-open restart file.
 			write_restart_state_to_h5(
 				tensors_filename,
@@ -1069,19 +1135,29 @@ def prepare_isdf_and_wavefunctions(
 			)
 		save_restart_state_per_proc(
 			os.path.join(tmp_dir, "isdf_tensors"),
-			V_qmunu, None, wfns.psi_yr, wfns.enk, meta, mesh_xy)
-		V_qmunu.block_until_ready()
+			V_qmunu_for_restart, None, wfns.psi_yr, wfns.enk, meta, mesh_xy)
+		V_qmunu_for_restart.block_until_ready()
 		print0("  Chunked ISDF path complete")
 	else:
 		from file_io import load_restart_state_from_h5
 		with timing.section("gw_jax.restart_load"):
 			rs = load_restart_state_from_h5(
 				tensors_filename, mesh_xy, band_slices=band_slices)
-			V_qmunu = rs.V_qmunu
+			V_q_or_blocks = rs.V_qmunu
 			print0("  Loaded restart tensors from H5.")
 			wfns = build_wavefunction_bundle(
 				wfn, sym, meta, band_slices, mesh_xy,
 				psi_rmu_Y=rs.psi_rmu_Y, psi_rmuT_X=rs.psi_rmuT_X,
 				enk_full=rs.enk_full, print_fn=print0)
+			# Restart path doesn't currently rebuild wfns_current — Σ_X^B
+			# would need to recompute V_q from disk-backed zeta files
+			# anyway (the restart format only stores one V_qmunu).  When
+			# we add a bispinor restart format this should populate from
+			# the saved current-centroid ψ.
+			wfns_current = None
 
-	return SimpleNamespace(V_qmunu=V_qmunu, wf_bundle=wfns)
+	return SimpleNamespace(
+		V_qmunu=V_q_or_blocks,
+		wf_bundle=wfns,
+		wf_bundle_current=wfns_current,
+	)
