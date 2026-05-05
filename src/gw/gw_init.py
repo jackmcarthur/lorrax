@@ -21,7 +21,7 @@ from common import jax_profile
 
 def compute_optimal_chunks(
     meta, mesh_xy, memory_budget_gb: float,
-    target_utilization: float = 0.97,
+    target_utilization: float = 0.80,
     verbose: bool = True,
     n_b_left: int | None = None, n_b_right: int | None = None,
     r_chunk_override: int | None = None,
@@ -279,12 +279,20 @@ def compute_optimal_chunks(
         del use_cache  # no longer drives memory sizing
         base = m_centroids + m_L_q
         # CALIBRATION: subtract the runtime-overhead floor (allocator pool
-        # + NCCL/cuFFT buffers + persistent jit caches; ~0.8 GB on this
-        # stack) from the per-cr headroom so the auto-picked cr leaves
-        # room for the constant overhead too.  Without this, auto-picked
-        # cr saturates the budget and a downstream OOM trips on the next
-        # JIT compile that NCCL grows the ring buffer for.
-        _RUNTIME_OVERHEAD_FOR_HEADROOM = 0.8e9
+        # + NCCL/cuFFT buffers + persistent jit caches; cuFFT plan-cache
+        # growth across r-chunks; XLA fragmentation that prevents finding
+        # contiguous space for the next-call's largest single buffer) from
+        # the per-cr headroom so the auto-picked cr leaves room for the
+        # overhead too.  Without this, auto-picked cr saturates the budget
+        # and a downstream OOM trips on a single-buffer alloc.
+        #
+        # 2026-05-04: scaled with the budget after observing CrI3 60 Ry
+        # bispinor OOMs at both 8 GPU (chunker pred=29.1 GB, OOM at single
+        # 25.4 GiB alloc) and 16 GPU (chunker pred=29.1 GB, OOM at 17.7
+        # GiB single alloc).  XLA needs free contiguous memory for the
+        # next call's largest transient *on top of* the current peak —
+        # 5 % of the budget covers it across the scales we've measured.
+        _RUNTIME_OVERHEAD_FOR_HEADROOM = max(0.8e9, 0.05 * memory_budget_gb * 1e9)
         headroom = m_budget - base - _RUNTIME_OVERHEAD_FOR_HEADROOM
         if headroom <= c_solve:
             return None
@@ -339,6 +347,50 @@ def compute_optimal_chunks(
         )
 
     fft_inloop = _fft_inloop_bytes(band_chunk)
+
+    # ===== Budget split: cap FFT workspace at WFN_WORKSPACE_FRAC of budget =====
+    #
+    # 2026-05-04: ported the budget-split policy from
+    # ``aot_memory_model.choose_chunks_heuristic`` (the AOT-default chooser)
+    # into this default heuristic chunker so production runs get the same
+    # behavior without the ``use_aot_chunk_chooser`` flag.
+    #
+    # Why: the prior policy sized ``band_chunk`` against the FULL FFT
+    # headroom (``m_budget − m_centroids_full``) and only shrank it when
+    # ``_find_r_chunk`` returned None (cr ≤ 0).  At production scale (CrI3
+    # 60Ry on 8 GPU) that meant ``fft_inloop`` ate ~22 GB of the 24 GB
+    # working budget at band_chunk=16 — feasible by a thread, but it left
+    # only ~1.5 GB for the cr-linear stages, forcing chunk_r=4584 (246
+    # chunks × 4 bispinor channels = ~16 hour wall time).
+    #
+    # The new policy reserves ``WFN_WORKSPACE_FRAC × m_budget`` for the
+    # FFT workspace (driving ``band_chunk``) and leaves the rest for the
+    # cr-linear stages (driving ``chunk_r``).  ``band_chunk`` is halved
+    # until ``fft_inloop ≤ wfn_workspace_cap`` or until it hits the
+    # mesh-divisibility floor (band_chunk = p, one band per device).
+    # Small systems where the FFT is naturally tiny (MoS2 60Ry small)
+    # don't notice the cap (it's non-binding); large systems where the
+    # FFT was the bottleneck now get a proportional reservation.
+    #
+    # FRAC=0.30 covers CrI3 60Ry (fft_inloop ≈ 11 GB at band_chunk=8 fits
+    # 0.30×24 = 7.2 GB cap if we hit minimum band_chunk; the cap is
+    # advisory — we accept the floor when band_chunk = p is the smallest
+    # mesh-divisible value).  Lower FRAC reserves more for cr-linear
+    # stages but risks band_chunk hitting min ≥ band_chunk_p; higher
+    # FRAC keeps band_chunk too coarse and shrinks chunk_r.  See
+    # MEMORY_MODEL.md for the calibration data.
+    WFN_WORKSPACE_FRAC = 0.30
+    wfn_workspace_cap = WFN_WORKSPACE_FRAC * m_budget
+    while fft_inloop > wfn_workspace_cap and bpd > 1:
+        bpd = max(1, bpd // 2)
+        band_chunk = min(nb, bpd * p)
+        bpd = max(1, -(-band_chunk // p))
+        fft_inloop = _fft_inloop_bytes(band_chunk)
+        if verbose:
+            print(f"    Capping band_chunk to {band_chunk} (bands/device={bpd}) "
+                  f"to keep FFT workspace ≤ {wfn_workspace_cap/1e9:.1f} GB "
+                  f"({100*WFN_WORKSPACE_FRAC:.0f}% of budget)")
+
     result = _find_r_chunk(True, fft_inloop, r_chunk_override) or \
              _find_r_chunk(False, fft_inloop, r_chunk_override)
     while result is None and bpd > 1:
@@ -347,7 +399,8 @@ def compute_optimal_chunks(
         bpd = max(1, -(-band_chunk // p))
         fft_inloop = _fft_inloop_bytes(band_chunk)
         if verbose:
-            print(f"    Reducing band_chunk to {band_chunk} (bands/device={bpd})")
+            print(f"    Reducing band_chunk to {band_chunk} (bands/device={bpd}) "
+                  f"to fit cr-linear stages within remaining budget")
         result = _find_r_chunk(True, fft_inloop, r_chunk_override) or \
                  _find_r_chunk(False, fft_inloop, r_chunk_override)
     if result is None:
@@ -376,11 +429,13 @@ def compute_optimal_chunks(
     # pool, NCCL ring buffers, cuFFT plan caches, persistent compiled-
     # jit memory, and the kernel working set.  The heuristic above
     # models only the working set; the MoS2 4-GPU sweep shows a
-    # consistent ~0.8 GB gap that's independent of cr.  Add it as a
-    # single per-rank constant.  CrI3 16-GPU spot-checks show the same
-    # ~0.8-1.0 GB floor.  See sweep_results.json + bispinor pipeline
-    # report 2026-05-04 for the data source.
-    RUNTIME_OVERHEAD_BYTES = 0.8e9
+    # consistent ~0.8 GB gap that's independent of cr.  CrI3 60 Ry
+    # bispinor at 8/16 GPU showed XLA needing extra contiguous space
+    # for the next call's largest transient buffer (~17 GB single alloc)
+    # which fragmentation prevents when the persistent peak is too tight.
+    # 2026-05-04: scale the floor with budget — 5% of budget tracks the
+    # observed 1.5 GB at 30 GB / 0.5 GB at 10 GB pattern.
+    RUNTIME_OVERHEAD_BYTES = max(0.8e9, 0.05 * memory_budget_gb * 1e9)
 
     # CALIBRATION: the post-loop solve runs as a JAX scan over q-points
     # inside one jit body (see ``_solve_zeta_per_q_chunk_with_full_L_q``);

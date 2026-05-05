@@ -490,10 +490,10 @@ class LorraxConfig:
 
         # --- Chunk utilization from env ---
         try:
-            chunk_utilization = float(os.environ.get("ISDF_CHUNK_TARGET_UTILIZATION", "0.97"))
+            chunk_utilization = float(os.environ.get("ISDF_CHUNK_TARGET_UTILIZATION", "0.80"))
         except Exception:
-            chunk_utilization = 0.97
-        chunk_utilization = max(0.85, min(1.0, chunk_utilization))
+            chunk_utilization = 0.80
+        chunk_utilization = max(0.50, min(1.0, chunk_utilization))
 
         # --- ZCT stage cap from env ---
         import jax
