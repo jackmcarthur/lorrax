@@ -6,6 +6,7 @@
 """
 import os
 import math
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import jax
@@ -16,6 +17,116 @@ import h5py
 
 import common.timing as timing
 from common import jax_profile
+
+
+# ---------------------------------------------------------------------------
+# Memory model — internal helpers for ``compute_optimal_chunks``.
+#
+# The chunk-loop peak is described by five ``moments``: each is a snapshot of
+# concurrently-live device buffers at a distinct point in the r-chunk loop.
+# Every moment cost is linear in ``cr`` (the r-chunk size), so closed-form
+# inversion gives ``cr_max`` per moment without any iterative search.  The
+# functions and small dataclass below break the model up so each piece is
+# individually readable / testable; the public driver is unchanged.
+# ---------------------------------------------------------------------------
+
+_BYTES_C128 = 16.0
+_FFT_COPIES = 3   # cuFFT input + output + scratch (lower bound)
+_ZCT_ADDITIONAL_COEF = 3   # ZCT temp + output past the 2 persistent P_l/P_r
+                           # accumulators (AOT-measured; see scripts/validate_fft_workspaces.py)
+
+
+def _bytes_c128(*dims, shard: int = 1) -> float:
+    """Bytes for a complex128 array of shape ``dims`` per-device after sharding."""
+    result = _BYTES_C128
+    for d in dims:
+        result *= d
+    return result / shard
+
+
+@dataclass(frozen=True)
+class _ChunkAlphas:
+    """Per-cr byte coefficients for the five r-chunk moments.
+
+    Each ``α_*`` is the bytes-per-cr live in one moment after sharding.  ``c_solve``
+    is the cr-independent overhead for the per-q triangular solve (replicated L
+    + 3× full L slabs).  ``m_psi_G_bc`` is the transient per-bc ψ(G) slab on
+    device during one bc's FFT.
+    """
+    α_pair: float
+    α_psi_Y_bc: float
+    α_zcol: float
+    α_z_slice: float
+    α_gather: float
+    c_solve: float
+    m_psi_G_bc: float
+
+
+def _build_chunk_alphas(*, nk, ns, mu, nq, band_chunk, p_x, p_y, p, nr) -> _ChunkAlphas:
+    return _ChunkAlphas(
+        α_pair=_bytes_c128(nk, mu, shard=p_x * p_y),
+        α_psi_Y_bc=_bytes_c128(nk, band_chunk, ns, shard=p_y),
+        α_zcol=_bytes_c128(nq, mu, shard=p),
+        α_z_slice=_bytes_c128(mu, shard=p),
+        α_gather=_bytes_c128(mu, shard=p) + 2 * _bytes_c128(mu),
+        c_solve=_bytes_c128(mu, mu, shard=p_x * p_x) + 3 * _bytes_c128(mu, mu),
+        m_psi_G_bc=_bytes_c128(nk, band_chunk, ns, nr, shard=p),
+    )
+
+
+def _fft_moment(cr, base, fft_inloop_bytes, a: _ChunkAlphas):
+    """Peak during one bc-iteration's FFT + reshard + accumulate.
+
+    Live: base + 2× pair-density accumulators + the FFT workspace + the
+    post-reshard ψ_bc_Y slab.
+    """
+    return base + 2 * a.α_pair * cr + fft_inloop_bytes + a.α_psi_Y_bc * cr
+
+
+def _zct_moment(cr, base, a: _ChunkAlphas):
+    """Peak during the ZCT stage: 2 persistent + 3 transient pair-density buffers."""
+    return base + (2 + _ZCT_ADDITIONAL_COEF) * a.α_pair * cr
+
+
+def _reshard_moment(cr, base, a: _ChunkAlphas):
+    """Peak during Z_q → Z_col reshard (input + output + NCCL scratch)."""
+    return base + 3 * a.α_zcol * cr
+
+
+def _solve_moment(cr, base, q_batch, a: _ChunkAlphas):
+    """Peak during per-q-batch triangular solve."""
+    return base + 2 * a.α_zcol * cr + q_batch * (2 * a.α_z_slice * cr + a.c_solve)
+
+
+def _gather_moment(cr, base, q_gather, a: _ChunkAlphas):
+    """Peak during q-gather + H5 write."""
+    return base + a.α_zcol * cr + q_gather * a.α_gather * cr
+
+
+def _max_cr_per_stage(headroom, fft_cost_in_loop, a: _ChunkAlphas, *,
+                      nr_max, m_budget, m_zct_cap) -> dict:
+    """Closed-form max feasible ``cr`` for each moment (linear inversion).
+
+    Each moment is ``base + α·cr + c`` so ``cr ≤ (headroom − c) / α``; the
+    caller takes the minimum over moments.  Returns a per-stage dict so the
+    bottleneck can be reported.
+    """
+    # Optional soft cap on zct stage (env override for tight-memory systems).
+    denom_fft = 2 * a.α_pair + a.α_psi_Y_bc
+    denom_zct = (2 + _ZCT_ADDITIONAL_COEF) * a.α_pair
+    denom_solve = 2 * a.α_zcol + 2 * a.α_z_slice
+    limits = {
+        'fft':     (headroom - fft_cost_in_loop) / denom_fft if denom_fft > 0 else nr_max,
+        'zct':     headroom / denom_zct if denom_zct > 0 else nr_max,
+        'reshard': headroom / (3 * a.α_zcol) if a.α_zcol > 0 else nr_max,
+        'solve':   ((headroom - a.c_solve) / denom_solve) if denom_solve > 0 else nr_max,
+        'gather':  headroom / (a.α_zcol + a.α_gather) if (a.α_zcol + a.α_gather) > 0 else nr_max,
+    }
+    if m_zct_cap is not None and a.α_pair > 0:
+        zct_headroom = m_zct_cap - (m_budget - headroom)
+        if zct_headroom > 0:
+            limits['zct'] = min(limits['zct'], zct_headroom / denom_zct)
+    return limits
 
 
 
@@ -55,21 +166,16 @@ def compute_optimal_chunks(
     if memory_budget_gb <= 0:
         raise ValueError("memory_per_device_gb must be > 0.")
 
-    B = 16.0  # bytes per complex128
     p_x, p_y = mesh_xy.devices.shape
     p = p_x * p_y
     nb = meta.band_edges[4] - meta.band_edges[0]  # b4 - b0
     nb_l = int(n_b_left) if n_b_left is not None else nb
     nb_r = int(n_b_right) if n_b_right is not None else nb
-    nk, ns, mu, nq, nr = float(meta.nk_tot), float(meta.nspinor), float(meta.n_rmu), float(meta.nk_tot), float(meta.n_rtot)
-    nx, ny, nz = meta.fft_grid
-
-    def _mem(*dims, shard=1):
-        """complex128 array bytes: 16 · ∏(dims) / shard."""
-        result = B
-        for d in dims:
-            result *= d
-        return result / shard
+    nk = float(meta.nk_tot)
+    ns = float(meta.nspinor)
+    mu = float(meta.n_rmu)
+    nq = float(meta.nk_tot)
+    nr = float(meta.n_rtot)
 
     m_budget = memory_budget_gb * 1e9 * target_utilization
     m_zct_cap = float(zct_stage_cap_gb) * 1e9 if zct_stage_cap_gb and zct_stage_cap_gb > 0 else None
@@ -77,204 +183,104 @@ def compute_optimal_chunks(
     # ---- Persistent arrays (always resident during chunk loop) ----
     # Centroids: left/right × X-sharded + Y-sharded copies.
     # "full" = during initial load (all nb bands); "persist" = after slicing to nb_l + nb_r.
-    m_centroids_full = _mem(nk, ns, mu, nb, shard=p_y) + _mem(nk, ns, mu, nb, shard=p_x)
-    m_centroids = _mem(nk, ns, mu, nb_l + nb_r, shard=p_y) + _mem(nk, ns, mu, nb_l + nb_r, shard=p_x)
+    m_centroids_full = (
+        _bytes_c128(nk, ns, mu, nb, shard=p_y)
+        + _bytes_c128(nk, ns, mu, nb, shard=p_x)
+    )
+    m_centroids = (
+        _bytes_c128(nk, ns, mu, nb_l + nb_r, shard=p_y)
+        + _bytes_c128(nk, ns, mu, nb_l + nb_r, shard=p_x)
+    )
     if m_centroids_full + m_centroids > m_budget:
         raise ValueError(
             f"Centroid storage requires {(m_centroids_full + m_centroids)/1e9:.2f} GB/device "
             f"but only {memory_budget_gb:.2f} GB allocated.")
 
     # ---- Band-chunked FFT (centroid extraction, runs before chunk loop) ----
-    # ψ(G) → IFFT → ψ(r).  FFT_COPIES=3 is the nominal lower bound (input +
-    # output + one scratch); the *actual* per-rank peak (incl. cuFFT plan-
-    # specific workspace) is measured exactly via query_fft_peak_bytes
-    # below when we have a candidate bpd.  This pre-loop sizing loop uses
-    # the nominal 3× to set bpd_max.
-    FFT_COPIES = 3
-    m_phase = _mem(nk, nr)
+    # ψ(G) → IFFT → ψ(r).  ``_FFT_COPIES`` is the nominal lower bound (input +
+    # output + one scratch); the in-loop FFT cost is queried exactly via
+    # ``query_fft_peak_bytes`` below.  This pre-loop sizing uses the nominal
+    # 3× to set ``bpd_max``.
+    m_phase = _bytes_c128(nk, nr)
     headroom_fft = m_budget - m_centroids_full
     if headroom_fft <= m_phase:
         raise ValueError("Insufficient memory for even a single-band FFT chunk.")
-    one_band = FFT_COPIES * _mem(nk, ns, nr)
+    one_band = _FFT_COPIES * _bytes_c128(nk, ns, nr)
     bpd_max = max(1, int((headroom_fft - m_phase) / one_band))
     band_chunk = min(nb, bpd_max * p)
     bpd = max(1, -(-band_chunk // p))  # ceil div matching read_Gvecs_to_devices
-    peak_centroid_fft_stage = m_centroids_full + FFT_COPIES * _mem(nk, bpd, ns, nr) + m_phase
+    peak_centroid_fft_stage = (
+        m_centroids_full + _FFT_COPIES * _bytes_c128(nk, bpd, ns, nr) + m_phase
+    )
 
     # ---- C_q build (pair density → C_q → L_q, runs before chunk loop) ----
-    stage_cct = m_centroids + 2 * _mem(nk, mu, mu, shard=p_x * p_y) + _mem(nq, mu, mu, shard=p_x * p_y)
+    stage_cct = (
+        m_centroids
+        + 2 * _bytes_c128(nk, mu, mu, shard=p_x * p_y)
+        + _bytes_c128(nq, mu, mu, shard=p_x * p_y)
+    )
     if stage_cct > m_budget:
         raise ValueError(f"C_q build requires {stage_cct/1e9:.2f} GB/device — exceeds budget.")
-    m_L_q = _mem(nq, mu, mu, shard=p_x * p_y)  # L_q persists; same size as C_q
+    m_L_q = _bytes_c128(nq, mu, mu, shard=p_x * p_y)  # L_q persists; same size as C_q
 
-    # ψ(G) lives on HOST (per-rank band-sharded) and is fetched into the
-    # jit one bc at a time via io_callback; no persistent device residency.
-    # Only the currently active bc's ψ(G) is on device — captured in
-    # the fft_moment term below.
+    # ψ(G) lives on HOST (per-rank band-sharded) and is fetched into the jit
+    # one bc at a time via io_callback; no persistent device residency.
+    # Only the currently active bc's ψ(G) is on device — captured in the
+    # ``_fft_moment`` term.  See ``_build_chunk_alphas`` and the moment
+    # functions at module top for the full memory model.
 
-    # ======================================================================
-    #  Chunk-loop memory model — five moments, each grounded in a buffer
-    #  visible in the fit_one_rchunk HLO dump.
-    #
-    #  ψ(G) arrives via io_callback, gets FFT'd to ψ(r)-box, resharded to
-    #  an r-chunk slab ψ_bc_Y, then einsum'd into P_l/P_r accumulators.
-    #  ZCT is 2× ifftn + 1× fftn over kgrid on the pair-density tensor.
-    #  Then reshard Z_q → Z_col → solve L_q · zeta = Z_col, per-q-batch.
-    #  Finally q_gather copies are replicated + written to H5.
-    # ======================================================================
-    α_pair     = _mem(nk, mu, shard=p_x * p_y)      # P_l/P_r per unit cr
-    α_psi_Y_bc = _mem(nk, band_chunk, ns, shard=p_y) # ψ_bc_Y per unit cr, post-reshard (Y-sharded on r-axis)
-    α_zcol     = _mem(nq, mu, shard=p)              # Z_col per unit cr
-    α_z_slice  = _mem(mu, shard=p)                  # per-q Z-slice per cr
-    α_gather   = _mem(mu, shard=p) + 2 * _mem(mu)   # q-gather: sharded + replicated copy + NCCL
-
-    # Per-bc transient ψ(G) slab (one bc on device during its FFT only):
-    m_psi_G_bc = _mem(nk, band_chunk, ns, nr, shard=p)
-    # Replicated-L temps during Cholesky solve (L_batch_rep + 3× L_full):
-    c_solve    = _mem(mu, mu, shard=p_x * p_x) + 3 * _mem(mu, mu)
-
-    # ZCT adds 3·α_pair·cr on top of the persistent P_l/P_r accumulators.
-    # MEASURED: AOT-compiling compute_ZCT_from_left_right_zchunk as a
-    # standalone kernel gives arg=2·α_pair·cr (P_l + P_r inputs),
-    # temp=2·α_pair·cr (internal working buffers), out=1·α_pair·cr
-    # (Z_q).  Inside fit_one_rchunk the 2 args are already live as
-    # the persistent accumulators, so the ADDITIONAL live set at the
-    # ZCT peak is temp+out = 3·α_pair·cr.  The old (4 + 3)=7· fudge
-    # over-counted by 2 (no donation credit + over-estimated cuFFT
-    # scratch).  Validated across kgrids (3,3,1), (10,10,10) and
-    # multiple cr values — ratio of measured temp to 4·α_pair·cr was
-    # uniform 0.5 → coefficient is 2·α_pair·cr for temp + 1 for out
-    # = 3 total additional.  See scripts/validate_fft_workspaces.py.
-    ZCT_ADDITIONAL_COEF = 3
-
-    def _fft_moment(cr, base, fft_inloop_bytes):
-        """Peak during one bc-iteration's FFT + reshard + accumulate.
-
-        Live simultaneously:
-          - base (persistent centroids + L_q)
-          - 2 pair-density accumulators (P_l, P_r) — kept across bc-loop
-          - FFT workspace for the wfn FFT (input + output + cuFFT scratch,
-            all captured by ``fft_inloop_bytes`` from query_fft_peak_bytes)
-          - post-reshard ψ_bc_Y slab — still live until the pair einsum
-            folds it in (α_psi_Y_bc · cr)
-        """
-        return base + 2 * α_pair * cr + fft_inloop_bytes + α_psi_Y_bc * cr
-
-    def _zct_moment(cr, base):
-        """Peak during the ZCT stage.
-
-        Live simultaneously:
-          - base (persistent)
-          - 2 pair-density accumulators (P_l, P_r — persistent across bc-loop)
-          - 3 additional pair-density-sized buffers for ZCT's internal
-            working set + Z_q output (AOT-measured, see ZCT_ADDITIONAL_COEF)
-        """
-        return base + (2 + ZCT_ADDITIONAL_COEF) * α_pair * cr
-
-    def _reshard_moment(cr, base):
-        """Peak during the Z_q → Z_col reshard.
-
-        Z_col has size α_zcol·cr; the reshard needs input + output.
-        FUDGE: coefficient 3 covers (input + output + NCCL scratch).
-        TODO: AOT-measure an isolated reshard jit to calibrate.
-        """
-        return base + 3 * α_zcol * cr
-
-    def _solve_moment(cr, base, q_batch):
-        """Peak during per-q-batch triangular solve.
-
-        Z_col (input) + zeta_acc (donation-compatible output, same size).
-        Per-q-batch replicated L slab lives inside the solve jit.
-        """
-        return base + 2 * α_zcol * cr + q_batch * (2 * α_z_slice * cr + c_solve)
-
-    def _gather_moment(cr, base, q_gather):
-        """Peak during q-gather + H5 write.
-
-        Z_col sharded + q_gather replicated copies (one per q being
-        written) + NCCL scratch.
-        """
-        return base + α_zcol * cr + q_gather * α_gather * cr
-
-    def _max_cr(headroom, fft_cost_per_k):
-        """Invert each MOMENT's linear cost to get max feasible cr.
-
-        One inversion per distinct live-range snapshot.  The bc-loop's
-        ``fft_moment`` and ``zct_moment`` are the two real in-loop peaks;
-        reshard / solve / gather are post-loop moments with their own
-        linear cr-dependence.
-        """
-        # fft_moment: base + 2·α_pair·cr + fft_inloop + α_psi_Y_bc·cr
-        #   → cr ≤ (headroom - fft_inloop) / (2·α_pair + α_psi_Y_bc)
-        denom_fft = 2 * α_pair + α_psi_Y_bc
-        # zct_moment: base + (2 + ZCT_ADDITIONAL_COEF)·α_pair·cr
-        denom_zct = (2 + ZCT_ADDITIONAL_COEF) * α_pair
-        limits = {
-            'fft':     (headroom - fft_cost_per_k) / denom_fft if denom_fft > 0 else nr,
-            'zct':     headroom / denom_zct if denom_zct > 0 else nr,
-            'reshard': headroom / (3 * α_zcol) if α_zcol > 0 else nr,
-            # solve/gather live post-loop and have extra per-q terms; size
-            # them against their cr-linear part (the 2·α_zcol + α_zcol
-            # components dominate; per-q batch costs are capped below).
-            'solve':   (headroom - c_solve) / (2 * α_zcol + 2 * α_z_slice) if (2 * α_zcol + 2 * α_z_slice) > 0 else nr,
-            'gather':  headroom / (α_zcol + α_gather) if (α_zcol + α_gather) > 0 else nr,
-        }
-        # Optional soft cap on zct stage (env override for tight-memory systems)
-        if m_zct_cap is not None and α_pair > 0:
-            zct_headroom = m_zct_cap - (m_budget - headroom)
-            if zct_headroom > 0:
-                limits['zct'] = min(limits['zct'], zct_headroom / denom_zct)
-        return limits
-
-    # Per-k centroid-load FFT cost — used only for k_batch sizing.  The
-    # in-loop FFT workspace cost is queried separately via
-    # query_fft_peak_bytes (see below).
-    fft_per_k = FFT_COPIES * _mem(bpd, ns, nr) + _mem(nr)
+    alphas = _build_chunk_alphas(
+        nk=nk, ns=ns, mu=mu, nq=nq,
+        band_chunk=band_chunk, p_x=p_x, p_y=p_y, p=p, nr=nr,
+    )
 
     def _eval_stages(cr, base, fft_inloop):
-        """Forward-evaluate each moment at a given cr."""
-        m_zcol = α_zcol * cr
-        m_solve_per_q = 2 * α_z_slice * cr + c_solve
-        m_gather_per_q = α_gather * cr
-        # Note: fft_inloop already includes the input (=m_psi_G_bc), output,
-        # and cuFFT scratch via query_fft_peak_bytes.  Don't add m_psi_G_bc
-        # on top — that was double-counting the argument buffer.
+        """Forward-evaluate each moment at a given cr.
+
+        Returns ``(stages_dict, m_zcol, m_solve_per_q, m_gather_per_q, k_batch)``.
+        Note: ``fft_inloop`` already includes the input (=m_psi_G_bc), output,
+        and cuFFT scratch via ``query_fft_peak_bytes``.
+        """
+        m_zcol = alphas.α_zcol * cr
+        m_solve_per_q = 2 * alphas.α_z_slice * cr + alphas.c_solve
+        m_gather_per_q = alphas.α_gather * cr
         stages = {
-            'fft':     _fft_moment(cr, base, fft_inloop),
-            'zct':     _zct_moment(cr, base),
-            'reshard': _reshard_moment(cr, base),
-            'solve':   base + 2 * m_zcol + m_solve_per_q,  # q_batch=1 in AOT
-            'gather':  base + m_zcol + m_gather_per_q,      # q_gather=1 for sizing
+            'fft':     _fft_moment(cr, base, fft_inloop, alphas),
+            'zct':     _zct_moment(cr, base, alphas),
+            'reshard': _reshard_moment(cr, base, alphas),
+            'solve':   base + 2 * m_zcol + m_solve_per_q,    # q_batch=1 in AOT
+            'gather':  base + m_zcol + m_gather_per_q,        # q_gather=1 for sizing
         }
         # k_batch sizing — uses per-k FFT cost to pack as many k's as
-        # headroom allows.  Kept from the old model; only matters for
-        # centroid-load FFT, which is a separate pre-loop stage.
-        fft_head = m_budget - base - (2 * α_pair + α_psi_Y_bc) * cr
+        # headroom allows.  Only matters for centroid-load FFT, which is a
+        # separate pre-loop stage.
+        fft_per_k = _FFT_COPIES * _bytes_c128(bpd, ns, nr) + _bytes_c128(nr)
+        fft_head = m_budget - base - (2 * alphas.α_pair + alphas.α_psi_Y_bc) * cr
         k_batch = 1
         if fft_per_k > 0 and fft_head > fft_per_k:
             k_batch = min(int(nk), max(1, int(fft_head * 0.5 / fft_per_k)))
         return stages, m_zcol, m_solve_per_q, m_gather_per_q, k_batch
 
-    def _find_r_chunk(use_cache, fft_inloop, override=None):
-        """Compute optimal cr from direct formula, round down to p-divisible.
+    def _find_r_chunk(fft_inloop, override=None):
+        """Compute optimal cr from closed-form moment inversion.
 
-        Persistent device residency at the fit_one_rchunk call site:
-        centroids (L + R copies on X, Y shards) + L_q (sharded).  The
-        ψ(G) cache is host-only now and pulled per-bc via io_callback,
-        so it doesn't enter ``base``.  ``use_cache`` is retained for
-        callsite symmetry but no longer affects memory sizing (left for
-        the caller to decide ``gspace_mode``).
+        Persistent device residency: centroids (L + R copies on X, Y shards)
+        + L_q (sharded).  The ψ(G) cache is host-only now and pulled per-bc
+        via io_callback, so it doesn't enter ``base``.
         """
-        del use_cache  # no longer drives memory sizing
         base = m_centroids + m_L_q
         headroom = m_budget - base
-        if headroom <= c_solve:
+        if headroom <= alphas.c_solve:
             return None
         if override and override > 0:
             cr = min(int(override), int(nr))
         else:
-            cr = min(int(nr), max(0, int(min(_max_cr(headroom, fft_inloop).values()))))
-        pt = p_x * p_y  # cr must be divisible by total device count for solve sharding
+            limits = _max_cr_per_stage(
+                headroom, fft_inloop, alphas,
+                nr_max=nr, m_budget=m_budget, m_zct_cap=m_zct_cap,
+            )
+            cr = min(int(nr), max(0, int(min(limits.values()))))
+        pt = p_x * p_y  # cr must be divisible by p_total for solve sharding
         if pt > 1 and cr > 0:
             cr -= cr % pt
         if cr <= 0:
@@ -321,8 +327,7 @@ def compute_optimal_chunks(
         )
 
     fft_inloop = _fft_inloop_bytes(band_chunk)
-    result = _find_r_chunk(True, fft_inloop, r_chunk_override) or \
-             _find_r_chunk(False, fft_inloop, r_chunk_override)
+    result = _find_r_chunk(fft_inloop, r_chunk_override)
     while result is None and bpd > 1:
         bpd = max(1, bpd // 2)
         band_chunk = min(nb, bpd * p)
@@ -330,8 +335,7 @@ def compute_optimal_chunks(
         fft_inloop = _fft_inloop_bytes(band_chunk)
         if verbose:
             print(f"    Reducing band_chunk to {band_chunk} (bands/device={bpd})")
-        result = _find_r_chunk(True, fft_inloop, r_chunk_override) or \
-                 _find_r_chunk(False, fft_inloop, r_chunk_override)
+        result = _find_r_chunk(fft_inloop, r_chunk_override)
     if result is None:
         raise ValueError("Unable to find r-chunk that fits the memory budget.")
 

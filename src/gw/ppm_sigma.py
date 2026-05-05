@@ -61,6 +61,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 import h5py
 
+import enum
+
 from common import jax_profile
 from common.units import RYD_TO_EV
 from .minimax_config import MinimaxConfig, SigmaQuadratureConfig
@@ -73,6 +75,59 @@ from .minimax_screening import (
     solve_phase_minimax_bandwidth,
 )
 from . import w_isdf
+
+
+class _AccumMode(enum.Enum):
+    """How Σ_c(ω, k, m, n) is materialised inside the τ-loop.
+
+    ``KIJ_HOST`` keeps Σ as per-rank numpy tiles matching the (m_X, n_Y)
+    shard layout of σ^τ; the full (n_ω, n_k, n_b, n_b) buffer never lives
+    on any GPU.  Default for typical ω grids.
+
+    ``KIJ_STREAM`` writes per-(τ × ω-batch) contributions directly to an
+    ``sigma_c_kij_ry`` HDF5 dataset.  Single-process only (multi-process
+    falls back to KIJ_HOST because the read-modify-write storm is a real
+    perf problem at scale).  Useful when the kij accumulator blows the
+    GPU budget.
+    """
+    KIJ_HOST = "kij_host"
+    KIJ_STREAM = "kij_stream"
+
+
+def _select_accum_mode(
+    requested: str, *,
+    sigma_kij_h5_path: str | None,
+    kij_bytes: float,
+    n_proc: int,
+) -> _AccumMode:
+    """Map ``omega_accumulation`` (``auto`` / ``kij`` / ``kij_stream``) to a mode.
+
+    - "kij"      → KIJ_HOST
+    - "kij_stream" → KIJ_STREAM if a path is set AND single-process,
+                     else KIJ_HOST (safety fallback)
+    - "auto"     → KIJ_HOST if no path AND grid fits in 0.5 GiB host buffer,
+                   otherwise KIJ_STREAM (with the same multi-process safety)
+    """
+    requested = str(requested).strip().lower()
+    if requested not in ("auto", "kij", "kij_stream"):
+        raise ValueError("omega_accumulation must be one of: auto, kij, kij_stream.")
+
+    if requested == "kij":
+        return _AccumMode.KIJ_HOST
+
+    if requested == "auto":
+        small_grid = kij_bytes <= 0.5 * 1024**3
+        if sigma_kij_h5_path is None and small_grid:
+            return _AccumMode.KIJ_HOST
+        # Fall through: large grid OR a stream path is set → try streaming.
+
+    # requested == "kij_stream" or auto-selected streaming
+    if not sigma_kij_h5_path or n_proc != 1:
+        # Multi-process: read-modify-write storm is too expensive (~hundreds
+        # of collective MPI-IO round-trips per branch).  Fall back to host
+        # accumulation until we wire the collective-flush variant.
+        return _AccumMode.KIJ_HOST
+    return _AccumMode.KIJ_STREAM
 
 
 @dataclass(frozen=True)
@@ -1523,43 +1578,32 @@ def compute_sigma_c_ppm_omega_grid(
             f"({100.0 * n_invalid / max(n_total_modes, 1):.2f}%)"
         )
 
-    # Accumulation mode
+    # Decide accumulation mode + allocate any backing storage.
     nk_proj = int(psi_proj_xr.shape[0])
     nb_proj = int(psi_proj_xr.shape[1])
-    kij_bytes = float(omega_req.size * nk_proj * nb_proj * nb_proj * 16)
-    use_kij_accum = omega_accumulation == "kij"
-    use_kij_stream = omega_accumulation == "kij_stream"
-    if omega_accumulation == "auto":
-        use_kij_accum = (sigma_kij_h5_path is None) and (kij_bytes <= 0.5 * 1024**3)
-        use_kij_stream = not use_kij_accum
-    if use_kij_stream and not sigma_kij_h5_path:
-        use_kij_stream = False
-        use_kij_accum = True
-
     n_omega = int(omega_req.size)
+    kij_bytes = float(n_omega * nk_proj * nb_proj * nb_proj * 16)
+    accum_mode = _select_accum_mode(
+        omega_accumulation,
+        sigma_kij_h5_path=sigma_kij_h5_path,
+        kij_bytes=kij_bytes,
+        n_proc=int(jax.process_count()),
+    )
+    streaming = (accum_mode == _AccumMode.KIJ_STREAM)
 
-    # Stream mode is a fine-grained read-modify-write accumulator that
-    # fires once per (tau_node × omega_batch); at multi-process scale
-    # every call is a collective MPI-IO or rank-0 h5py round-trip, and
-    # there are hundreds of them — so it's a real perf problem under
-    # the current structure.  Until we refactor to accumulate on GPU
-    # and stream out at branch granularity, fall back to the accum
-    # path in multi-process runs.
-    use_ffi_io = bool(getattr(ppm_options, 'use_ffi_io', False))
-    if use_kij_stream and jax.process_count() != 1:
-        use_kij_stream = False
-        use_kij_accum = True
-
-    sigma_kij_host = None if use_kij_stream else np.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=np.complex128)
+    sigma_kij_host = (
+        None if streaming
+        else np.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=np.complex128)
+    )
 
     # Single-process stream-mode file setup.  The accumulator pattern
     # itself is unchanged from pre-SlabIO (rank-0 h5py); the final
-    # sigma_mnk.h5 copy-over is already migrated via
-    # write_sigma_omega_h5 in gw_jax.py.
+    # sigma_mnk.h5 copy-over now lives in
+    # ``file_io.copy_sigma_kij_h5_to_omega_h5`` (called by gw_jax.main).
     kij_stream_path = None
     h5_kij = None
     dset_sigma_kij = None
-    if use_kij_stream and sigma_kij_h5_path and jax.process_index() == 0:
+    if streaming and jax.process_index() == 0:
         kij_stream_path = str(sigma_kij_h5_path)
         kij_dir = os.path.dirname(os.path.abspath(kij_stream_path))
         if kij_dir:
@@ -1579,9 +1623,6 @@ def compute_sigma_c_ppm_omega_grid(
         h5_kij.attrs["layout"] = "omega,k,i,j"
 
     try:
-        if not (use_kij_accum or use_kij_stream):
-            raise RuntimeError("Internal error: no valid Σc(ω) accumulation path selected.")
-
         def _accumulate_kij_stream(global_idx: np.ndarray, contrib_batch: jax.Array) -> None:
             if dset_sigma_kij is None:
                 return
@@ -1605,7 +1646,7 @@ def compute_sigma_c_ppm_omega_grid(
             meta=meta,
             print_fn=print_fn,
             omega_batch_size=omega_batch_size,
-            stream_writer=_accumulate_kij_stream if use_kij_stream else None,
+            stream_writer=_accumulate_kij_stream if streaming else None,
             use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
         )
 
@@ -1632,7 +1673,7 @@ def compute_sigma_c_ppm_omega_grid(
             key = tuple(br.omega_idx.tolist())
             per_half[key] = (per_half[key] + sigma_kij) if key in per_half else sigma_kij
 
-        if not use_kij_stream:
+        if not streaming:
             # _ReduceScatterGpuAccumulator returns Σ sharded (m_X, n_Y), so the
             # host copy needs a cross-process gather rather than jax.device_get.
             # _to_host_np falls back to device_get for single-process / replicated.
