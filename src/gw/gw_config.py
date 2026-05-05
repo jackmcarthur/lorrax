@@ -151,6 +151,11 @@ _DEFAULTS = {
     # File paths
     "wfn_file": "WFN.h5",
     "centroids_file": "centroids_frac.txt",
+    # Bispinor-only second centroid file (Gordon-decomposed Pauli current
+    # weight kmeans, used for μ_L=1,2,3 Lorentz channels).  Auto-derived
+    # from ``centroids_file`` ("<...>.txt" → "<...>_current.txt") when
+    # bispinor=True and this is left empty.  Ignored for non-bispinor runs.
+    "centroids_file_current": "",
     "kin_ion_file": "kin_ion.h5",
     # Three human-readable text outputs (always written):
     #   sigma_diag.dat — LORRAX-native per-(k,n) Σ-decomposition dump.
@@ -457,6 +462,11 @@ class FilePaths:
     """Output filenames + non-WFN inputs.  Resolved to absolute paths."""
     wfn_file: str
     centroids_file: str
+    # Bispinor-only second centroid file; ``None`` for non-bispinor runs.
+    # Auto-derived from ``centroids_file`` when bispinor=True and the user
+    # hasn't supplied an explicit override (replaces "<...>.txt" →
+    # "<...>_current.txt").
+    centroids_file_current: str | None
     kin_ion_file: str
     sigma_diag_file: str
     eqp0_file: str
@@ -828,10 +838,30 @@ class LorraxConfig:
         def _g(key):
             return params.get(key, _DEFAULTS.get(key))
 
+        # Bispinor-only second centroid file (Gordon-current kmeans) for
+        # μ_L=1,2,3 channels.  Auto-derive when bispinor is on and the
+        # user didn't supply an explicit override.
+        _bispinor = bool(_g("bispinor"))
+        _centroids_file = str(_g("centroids_file"))
+        _centroids_file_current = None
+        if _bispinor:
+            _explicit = str(_g("centroids_file_current") or "").strip()
+            if _explicit:
+                _centroids_file_current = _explicit
+            else:
+                # "<base>.txt" → "<base>_current.txt".  If centroids_file
+                # has no .txt suffix, just append "_current".
+                _stem, _dot, _ext = _centroids_file.rpartition(".")
+                if _dot:
+                    _centroids_file_current = f"{_stem}_current.{_ext}"
+                else:
+                    _centroids_file_current = f"{_centroids_file}_current"
+
         # --- Build sub-dataclasses ---
         paths = FilePaths(
             wfn_file=str(_g("wfn_file")),
-            centroids_file=str(_g("centroids_file")),
+            centroids_file=_centroids_file,
+            centroids_file_current=_centroids_file_current,
             kin_ion_file=str(_g("kin_ion_file")),
             sigma_diag_file=str(_g("sigma_diag_file")),
             eqp0_file=str(_g("eqp0_file")),

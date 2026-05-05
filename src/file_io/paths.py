@@ -18,12 +18,13 @@ def resolve_input_paths(params: dict, input_dir: str) -> dict:
 		return path if os.path.isabs(path) else os.path.join(input_dir, path)
 	
 	path_keys = [
-		"wfn_file", "centroids_file", "kin_ion_file",
+		"wfn_file", "centroids_file", "centroids_file_current",
+		"kin_ion_file",
 		"sigma_diag_file", "eqp0_file", "eqp1_file",
 	]
 	for key in path_keys:
-		if key in params:
+		if key in params and params[key]:
 			params[key] = _resolve_path(params[key])
-	
+
 	return params
 

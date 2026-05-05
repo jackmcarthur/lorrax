@@ -260,6 +260,7 @@ def read_Gvecs_to_devices(
                     jnp.asarray(sym.unfolded_kpts[k_idx], dtype=jnp.float64),
                     jnp.asarray(wfn.bvec, dtype=jnp.float64),
                     jnp.asarray(psi_Gspace_local),
+                    float(wfn.alat),
                 ))
     
     # Phase 2: Scatter to FFT box (NumPy advanced indexing)
