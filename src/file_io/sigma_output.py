@@ -15,9 +15,13 @@ def write_sigma_to_file(
 	sx_label: str = "sigSX",
 	corr_label: str = "sigCOH",
 	total_label: str = "sigTOT",
+	sigma_x_charge_kij_eV=None,
+	sigma_x_transverse_kij_eV=None,
+	hartree_charge_kij_eV=None,
+	hartree_transverse_kij_eV=None,
 ):
 	"""Write self-energy components to file.
-	
+
 	Args:
 		sigma_sx_kij_eV: Exchange-like self-energy in eV, shape (nk, nb, nb)
 		filename: Output file path
@@ -26,6 +30,13 @@ def write_sigma_to_file(
 		sx_label: Text label for first self-energy column
 		corr_label: Text label for second self-energy column
 		total_label: Text label for the sum of first and second columns
+		sigma_x_charge_kij_eV: bispinor only — Σ_X^B (0,0)-tile (charge
+			channel) contribution in eV.  Emitted as a ``sigX_q`` column.
+		sigma_x_transverse_kij_eV: bispinor only — Σ_X^B summed over the 9
+			transverse (i,j ∈ {1,2,3}) tiles in eV.  ``sigX_T`` column.
+		hartree_charge_kij_eV: bispinor only — μ_L=0 Hartree channel (eV).
+		hartree_transverse_kij_eV: bispinor only — Σ over μ_L∈{1,2,3} of
+			V_H^{μ_L} (eV).
 	"""
 	nk, nbands, _ = sigma_sx_kij_eV.shape
 
@@ -35,11 +46,30 @@ def write_sigma_to_file(
 	if dirname:
 		os.makedirs(dirname, exist_ok=True)
 
+	def _fmt_re_im(arr, k, n, label):
+		v_re = float(np.real(arr[k, n, n]))
+		v_im = float(np.imag(arr[k, n, n]))
+		s = f"  {label}={v_re:>12.6f}"
+		if abs(v_im) > 1e-10:
+			s += f"+{v_im:>10.6f}i"
+		else:
+			s += "            "
+		return s
+
 	with open(abs_path, "w") as f:
 		# Write header with units
 		f.write(provenance_header())
 		f.write("# Sigma output (all in eV)\n")
 		f.write(f"# {total_label} = {sx_label} + {corr_label}\n")
+		if (sigma_x_charge_kij_eV is not None
+				or sigma_x_transverse_kij_eV is not None
+				or hartree_charge_kij_eV is not None
+				or hartree_transverse_kij_eV is not None):
+			f.write("# bispinor breakdown columns:\n")
+			f.write("#   sigX_q   = Σ_X^B (0,0)-tile (charge channel)\n")
+			f.write("#   sigX_T   = Σ_X^B summed over 9 transverse (i,j) tiles\n")
+			f.write("#   VH_q     = Hartree μ_L=0 (charge channel)\n")
+			f.write("#   VH_T     = Hartree Σ over μ_L∈{1,2,3} (transverse channels)\n")
 		for k in range(nk):
 			f.write(f"\nk-point {k}:\n")
 			f.write("-" * 100 + "\n")
@@ -51,7 +81,7 @@ def write_sigma_to_file(
 					line += f"+{sx_im:>10.6f}i"
 				else:
 					line += "            "
-				
+
 				if sigma_coh_kij_eV is not None:
 					coh_re = float(np.real(sigma_coh_kij_eV[k, n, n]))
 					coh_im = float(np.imag(sigma_coh_kij_eV[k, n, n]))
@@ -68,14 +98,25 @@ def write_sigma_to_file(
 						line += f"+{total_im:>10.6f}i"
 					else:
 						line += "            "
-				
+
 				if hartree_kij_eV is not None:
 					hv_re = float(np.real(hartree_kij_eV[k, n, n]))
 					hv_im = float(np.imag(hartree_kij_eV[k, n, n]))
 					line += f"  VH={hv_re:>12.6f}"
 					if abs(hv_im) > 1e-10:
 						line += f"+{hv_im:>10.6f}i"
-				
+					else:
+						line += "            "
+
+				if sigma_x_charge_kij_eV is not None:
+					line += _fmt_re_im(sigma_x_charge_kij_eV, k, n, "sigX_q")
+				if sigma_x_transverse_kij_eV is not None:
+					line += _fmt_re_im(sigma_x_transverse_kij_eV, k, n, "sigX_T")
+				if hartree_charge_kij_eV is not None:
+					line += _fmt_re_im(hartree_charge_kij_eV, k, n, "VH_q")
+				if hartree_transverse_kij_eV is not None:
+					line += _fmt_re_im(hartree_transverse_kij_eV, k, n, "VH_T")
+
 				f.write(line + "\n")
 
 

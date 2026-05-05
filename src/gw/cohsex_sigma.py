@@ -551,7 +551,10 @@ def compute_sigma_h_lorentz(
             V_H[mu] = contrib if mu not in V_H else V_H[mu] + contrib
 
     # Step 3: project each μ_L into band space with the matching bundle.
-    sig_h = None
+    # Track charge (μ_L=0) and transverse (μ_L>0) channels separately so
+    # the sigma_diag writer can break out the bispinor-specific column.
+    sig_h_charge = None
+    sig_h_transverse = None
     contributions: dict[int, float] = {}
     with mesh_xy:
         for mu_L, V_H_mu in V_H.items():
@@ -565,13 +568,25 @@ def compute_sigma_h_lorentz(
             except Exception:
                 tr = float('nan')
             contributions[mu_L] = tr
-            sig_h = contrib if sig_h is None else (sig_h + contrib)
+            if mu_L == 0:
+                sig_h_charge = contrib if sig_h_charge is None else (sig_h_charge + contrib)
+            else:
+                sig_h_transverse = contrib if sig_h_transverse is None else (sig_h_transverse + contrib)
 
     print_fn(f"\n  Σ_H^B (bispinor) per-μ_L diagonal trace contributions:")
     for mu_L, tr in sorted(contributions.items()):
         print_fn(f"      μ_L={mu_L}: tr Σ_H = {tr:+.6f} eV  "
                  f"(bundle = {'charge' if mu_L == 0 else 'current'})")
-    return sig_h
+
+    if sig_h_charge is None and sig_h_transverse is None:
+        raise ValueError("compute_sigma_h_lorentz: V_blocks empty; nothing assembled.")
+    if sig_h_charge is None:
+        sig_h_total = sig_h_transverse
+    elif sig_h_transverse is None:
+        sig_h_total = sig_h_charge
+    else:
+        sig_h_total = sig_h_charge + sig_h_transverse
+    return sig_h_total, sig_h_charge, sig_h_transverse
 
 
 def compute_sigma_x_lorentz(
@@ -603,7 +618,13 @@ def compute_sigma_x_lorentz(
 
     Returns
     -------
-    sig_x   (nk, nb_sigma, nb_sigma)  bispinor bare exchange Σ_X^B.
+    sig_x_total       (nk, nb_sigma, nb_sigma)  full Σ_X^B = charge + transverse.
+    sig_x_charge      (nk, nb_sigma, nb_sigma)  (0,0)-tile only — matches the
+                                                 non-bispinor scalar Σ_X.
+    sig_x_transverse  (nk, nb_sigma, nb_sigma)  sum of the 9 transverse
+                                                 (i,j) tiles (i,j ∈ {1,2,3}).
+                                                 ``None`` if no transverse
+                                                 tiles are present.
     """
     if Gij is None:
         Gij = build_Gij(meta, mesh_xy)
@@ -627,12 +648,13 @@ def compute_sigma_x_lorentz(
     nkx, nky, nkz = meta.kgrid
     nq = nkx * nky * nkz
 
-    sig_x = None
+    sig_x_charge = None
+    sig_x_transverse = None
     contributions: dict[tuple[int, int], float] = {}
 
     def _consume_tile(mu_L: int, nu_L: int, bundle):
         """Add tile (μ_L, ν_L)'s contribution to the running sum."""
-        nonlocal sig_x
+        nonlocal sig_x_charge, sig_x_transverse
         block = V_blocks[(mu_L, nu_L)]
         # flatten kgrid axes back to flat-q for the V_FFT5D_SPEC helper
         block_flat = block.reshape(nq, *block.shape[-2:])
@@ -648,7 +670,10 @@ def compute_sigma_x_lorentz(
         except Exception:
             tr = float('nan')
         contributions[(mu_L, nu_L)] = tr
-        sig_x = contrib if sig_x is None else (sig_x + contrib)
+        if (mu_L, nu_L) == (0, 0):
+            sig_x_charge = contrib if sig_x_charge is None else (sig_x_charge + contrib)
+        else:
+            sig_x_transverse = contrib if sig_x_transverse is None else (sig_x_transverse + contrib)
 
     with mesh_xy:
         for mu_L, nu_L in _BISPINOR_TILES_CHARGE:
@@ -666,7 +691,16 @@ def compute_sigma_x_lorentz(
     print_fn(f"\n  Σ_X^B (bispinor) per-tile diagonal trace contributions:")
     for (m, n), tr in sorted(contributions.items()):
         print_fn(f"      ({m},{n}): tr Σ = {tr:+.6f} eV")
-    return sig_x
+
+    if sig_x_charge is None and sig_x_transverse is None:
+        raise ValueError("compute_sigma_x_lorentz: V_blocks empty; nothing assembled.")
+    if sig_x_charge is None:
+        sig_x_total = sig_x_transverse
+    elif sig_x_transverse is None:
+        sig_x_total = sig_x_charge
+    else:
+        sig_x_total = sig_x_charge + sig_x_transverse
+    return sig_x_total, sig_x_charge, sig_x_transverse
 
 
 def compute_cohsex_sigma_bispinor(
@@ -705,24 +739,34 @@ def compute_cohsex_sigma_bispinor(
     # charge bundle for μ_L=0 and current for μ_L∈{1,2,3}.  The
     # gauge-zero (0,i)/(i,0) tiles are absent from V_blocks and skipped
     # naturally.  See ``compute_sigma_h_lorentz`` for the derivation.
-    sig_h = compute_sigma_h_lorentz(
+    sig_h, sig_h_charge, sig_h_transverse = compute_sigma_h_lorentz(
         wfns_charge, wfns_current, V_blocks, meta, mesh_xy,
         Gij=Gij, print_fn=print_fn)
 
     sig_x = None
+    sig_x_charge = None
+    sig_x_transverse = None
     if compute_bare_x:
-        sig_x = compute_sigma_x_lorentz(
+        sig_x, sig_x_charge, sig_x_transverse = compute_sigma_x_lorentz(
             wfns_charge, wfns_current, V_blocks, meta, mesh_xy,
             Gij=Gij, print_fn=print_fn)
         if static_head_terms is not None:
+            # The q=0 head correction is part of the (0,0) bare-Coulomb
+            # tile, so it folds into the charge channel only.
             x_head, _ = static_head_terms_to_kij(
                 static_head_terms, nk_tot=meta.nk_tot, do_screened=False)
             rep = NamedSharding(mesh_xy, P(None, None, None))
-            sig_x = sig_x + jax.device_put(x_head, rep)
+            x_head = jax.device_put(x_head, rep)
+            sig_x = sig_x + x_head
+            sig_x_charge = sig_x_charge + x_head if sig_x_charge is not None else x_head
 
     return {
-        "sig_sx":  None,
-        "sig_coh": None,
-        "sig_h":   sig_h,
-        "sig_x":   sig_x,
+        "sig_sx":            None,
+        "sig_coh":           None,
+        "sig_h":             sig_h,
+        "sig_h_charge":      sig_h_charge,
+        "sig_h_transverse":  sig_h_transverse,
+        "sig_x":             sig_x,
+        "sig_x_charge":      sig_x_charge,
+        "sig_x_transverse":  sig_x_transverse,
     }

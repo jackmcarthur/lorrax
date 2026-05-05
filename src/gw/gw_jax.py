@@ -320,6 +320,10 @@ def main(argv=None):
 			sig_coh = cohsex["sig_coh"] if cohsex["sig_coh"] is not None else _zero
 			sig_h   = cohsex["sig_h"]   if cohsex["sig_h"]   is not None else _zero
 			sig_x   = cohsex["sig_x"]
+			sig_x_charge_b     = cohsex.get("sig_x_charge")
+			sig_x_transverse_b = cohsex.get("sig_x_transverse")
+			sig_h_charge_b     = cohsex.get("sig_h_charge")
+			sig_h_transverse_b = cohsex.get("sig_h_transverse")
 		else:
 			cohsex = compute_cohsex_sigma(
 				wfns, V_q, W_q, meta, mesh_xy,
@@ -331,6 +335,8 @@ def main(argv=None):
 			sig_coh = cohsex["sig_coh"]
 			sig_h   = cohsex["sig_h"]
 			sig_x   = cohsex["sig_x"]
+			sig_x_charge_b = sig_x_transverse_b = None
+			sig_h_charge_b = sig_h_transverse_b = None
 
 	# Print bare Σ_X diagonal for ISDF quality assessment.  Apply BGW-style
 	# degenerate-set averaging (mirrors Sigma/shiftenergy.f90) unless
@@ -519,6 +525,10 @@ def main(argv=None):
 		sig_coh=np.array(sig_coh),
 		sig_h=np.array(sig_h),
 		sig_x=np.array(sig_x),
+		sig_x_charge=(np.array(sig_x_charge_b) if sig_x_charge_b is not None else None),
+		sig_x_transverse=(np.array(sig_x_transverse_b) if sig_x_transverse_b is not None else None),
+		sig_h_charge=(np.array(sig_h_charge_b) if sig_h_charge_b is not None else None),
+		sig_h_transverse=(np.array(sig_h_transverse_b) if sig_h_transverse_b is not None else None),
 		E_qp_ry=np.array(E_full),
 		U_qp=np.array(U_full),
 		E_dft_ry=np.array(enk_dft),

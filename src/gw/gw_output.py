@@ -92,6 +92,16 @@ class GWResults:
     sigma_omega_h5_path: str | None = None
     tensors_filename: str | None = None
 
+    # Bispinor-only Σ_X / Σ_H decomposition.  ``sig_x_charge`` is the (0,0)
+    # Lorentz tile alone (= the non-bispinor scalar Σ_X) and ``sig_x_transverse``
+    # is the sum of the 9 transverse (i,j ∈ {1,2,3}) tiles.  ``sig_h_charge``
+    # / ``sig_h_transverse`` decompose the bispinor Hartree similarly across
+    # μ_L=0 vs μ_L>0.  ``None`` outside the bispinor path.
+    sig_x_charge: np.ndarray | None = None
+    sig_x_transverse: np.ndarray | None = None
+    sig_h_charge: np.ndarray | None = None
+    sig_h_transverse: np.ndarray | None = None
+
 
 # ---------------------------------------------------------------------------
 # Banner / summary  (QE ``summary()`` pattern)
@@ -252,6 +262,12 @@ def write_results(
     sig_h_out = r2e * results.sig_h
     sig_x_out = r2e * results.sig_x  # always populated; needed for eqp{0,1}
 
+    # Bispinor breakdown columns (None outside the bispinor path).
+    sig_x_q_out = (r2e * results.sig_x_charge) if results.sig_x_charge is not None else None
+    sig_x_T_out = (r2e * results.sig_x_transverse) if results.sig_x_transverse is not None else None
+    sig_h_q_out = (r2e * results.sig_h_charge) if results.sig_h_charge is not None else None
+    sig_h_T_out = (r2e * results.sig_h_transverse) if results.sig_h_transverse is not None else None
+
     # BGW-style degenerate-set averaging: replace the diagonal of each
     # Σ matrix with the mean over each contiguous degenerate group of
     # DFT eigenvalues.  Mirrors Sigma/shiftenergy.f90 (lines 86-122).
@@ -263,6 +279,14 @@ def write_results(
         corr_out  = apply_to_matrix_diagonals(corr_out,  e_kn_ry, degen_avg_tol_ry)
         sig_h_out = apply_to_matrix_diagonals(sig_h_out, e_kn_ry, degen_avg_tol_ry)
         sig_x_out = apply_to_matrix_diagonals(sig_x_out, e_kn_ry, degen_avg_tol_ry)
+        if sig_x_q_out is not None:
+            sig_x_q_out = apply_to_matrix_diagonals(sig_x_q_out, e_kn_ry, degen_avg_tol_ry)
+        if sig_x_T_out is not None:
+            sig_x_T_out = apply_to_matrix_diagonals(sig_x_T_out, e_kn_ry, degen_avg_tol_ry)
+        if sig_h_q_out is not None:
+            sig_h_q_out = apply_to_matrix_diagonals(sig_h_q_out, e_kn_ry, degen_avg_tol_ry)
+        if sig_h_T_out is not None:
+            sig_h_T_out = apply_to_matrix_diagonals(sig_h_T_out, e_kn_ry, degen_avg_tol_ry)
 
     write_sigma_to_file(
         sx_out,
@@ -272,6 +296,10 @@ def write_results(
         sx_label="sigX" if results.use_ppm else "sigSX",
         corr_label="sigC" if results.use_ppm else "sigCOH",
         total_label="sigXC" if results.use_ppm else "sigTOT",
+        sigma_x_charge_kij_eV=sig_x_q_out,
+        sigma_x_transverse_kij_eV=sig_x_T_out,
+        hartree_charge_kij_eV=sig_h_q_out,
+        hartree_transverse_kij_eV=sig_h_T_out,
     )
 
     # ── BGW-format eqp0.dat / eqp1.dat ────────────────────────────────────
