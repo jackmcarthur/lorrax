@@ -621,6 +621,78 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			print_fn(f"    γ (runtime / AOT-pred) = {gamma:.3f}  "
 			         f"(AOT predicted {aot_peak_gb:.2f} GB)")
 
+	# ── Bispinor: fit ζ^{μ_L=1,2,3} on the current-density centroid set ──
+	# Same kernel, swapping in γ̃^i vertex; sequential calls keep peak
+	# memory at the scalar-fit level.  Output paths follow the convention
+	# zeta_q_mu{1,2,3}.h5 next to the scalar zeta_q.h5.  The current-
+	# density centroid file (kmeans on Σ_{n,k,i}|j^Gordon_{n,k,i}|²) lives
+	# at ``cfg.paths.centroids_file_current`` and is auto-derived from
+	# ``cfg.paths.centroids_file`` when bispinor=True (see gw_config).
+	if cfg.bispinor and cfg.paths.centroids_file_current:
+		import dataclasses
+		import gc
+		from common.load_wfns import load_centroids_band_chunked
+		from file_io.centroids import load_centroids
+		from common import isdf_fitting as _isdf
+
+		print_fn(f"\n  [bispinor] fitting ζ^{{μ_L=1,2,3}} on current-density "
+		         f"centroids: {cfg.paths.centroids_file_current}")
+		_, cents_curr_idx, n_rmu_curr = load_centroids(
+			cfg.paths.centroids_file_current, meta.fft_grid)
+		# Round n_rmu_jax to n_proc, matching Meta.from_system convention.
+		n_rmu_curr_jax = ((n_rmu_curr + meta.n_proc - 1) // meta.n_proc) * meta.n_proc
+		meta_curr = dataclasses.replace(
+			meta, n_rmu=int(n_rmu_curr), n_rmu_jax=int(n_rmu_curr_jax))
+
+		with timing.section("gw_jax.load_centroid_wfns_current"):
+			psi_curr_rmu_Y, psi_curr_rmuT_X = load_centroids_band_chunked(
+				wfn, sym, meta_curr,
+				jnp.asarray(cents_curr_idx, dtype=jnp.int32),
+				cfg.bispinor, mesh_xy,
+				band_range=band_slices.full_range,
+				band_chunk_size=chunks['band_chunk'],
+			)
+
+		# Caches in isdf_fitting close over tracers from the enclosing
+		# jit at first compile.  Re-using compiled fns from a fresh
+		# fit_zeta_chunked_to_h5 invocation triggers UnexpectedTracerError
+		# because closures hold values from a now-closed trace scope.
+		# Clear before each new channel.
+		def _drop_traced_caches():
+			_isdf._fit_one_rchunk_cache.clear()
+			_isdf._compute_pair_density_cache.clear()
+			_isdf._accum_pair_density_cache.clear()
+			_isdf._compute_pair_density_vertex_cache.clear()
+			_isdf._accum_pair_density_vertex_cache.clear()
+			jax.clear_caches()
+			gc.collect()
+
+		for mu_L in (1, 2, 3):
+			_drop_traced_caches()
+			zeta_mu_path = os.path.join(tmp_dir, f"zeta_q_mu{mu_L}.h5")
+			print_fn(f"  [bispinor] μ_L={mu_L} → {zeta_mu_path}")
+			with timing.section(f"gw_jax.zeta_fit_chunked_mu{mu_L}"), \
+			     jax_profile.trace_section(f"zeta_fit_mu{mu_L}"):
+				fit_zeta_chunked_to_h5(
+					wfn=wfn, sym=sym, meta=meta_curr,
+					centroid_indices=jnp.asarray(cents_curr_idx, dtype=jnp.int32),
+					mesh_xy=mesh_xy,
+					chunk_r=chunks['chunk_r'], output_file=zeta_mu_path,
+					psi_rmu_Y=psi_curr_rmu_Y, psi_rmuT_X=psi_curr_rmuT_X,
+					band_chunk_size=chunks['band_chunk'],
+					q_chunk_size=chunks['q_chunk'],
+					q_gather_size=chunks.get('q_gather', 0),
+					bispinor=cfg.bispinor,
+					band_range_left=band_range_left,
+					band_range_right=band_range_right,
+					k_chunk_size=chunks.get('k_chunk', 0),
+					band_norms=_band_norms,
+					slab_io_backend=cfg.backend.slab_io,
+					gspace_mode=cfg.gspace_mode,
+					vertex_mu_L=mu_L,
+				)
+
+
 	return zeta_h5_path, mem_est
 
 
@@ -684,6 +756,123 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		print_fn(f"    V_q q batches: {q_batch}")
 
 	from file_io.slab_io import SlabIO
+
+	# Bispinor branch: full Lorentz V^{μ_L, ν_L}_q tensor over four ζ files.
+	# Returns ``(V_blocks: dict[(μ_L, ν_L), Array], G0)`` instead of a single
+	# rank-3 V_qmunu.  Σ-projection upgrade lives downstream — see
+	# gw_jax.main + projection_kernel for the bispinor consumer site.
+	if cfg.bispinor:
+		from .v_q_lorentz import compute_all_V_q_lorentz_sharded
+		from .compute_vcoul import make_v_munu_chunked_kernel
+
+		zeta_dir = os.path.dirname(zeta_h5_path)
+		channel_paths = {
+			0: zeta_h5_path,
+			1: os.path.join(zeta_dir, "zeta_q_mu1.h5"),
+			2: os.path.join(zeta_dir, "zeta_q_mu2.h5"),
+			3: os.path.join(zeta_dir, "zeta_q_mu3.h5"),
+		}
+		for ch, p in channel_paths.items():
+			if not os.path.exists(p):
+				raise FileNotFoundError(
+					f"compute_V_q (bispinor): channel {ch} ζ-file missing: {p}")
+
+		# Centroid counts may differ across channels (scalar = 1800,
+		# transverse = 1808 in CrI3 4-density).  SlabIO doesn't expose
+		# dataset shape, so peek with h5py rank-0 then broadcast.
+		_n_rmu_by_ch_local = np.zeros(4, dtype=np.int64)
+		if jax.process_index() == 0:
+			for ch, p in channel_paths.items():
+				with h5py.File(p, 'r') as _f:
+					_n_rmu_by_ch_local[ch] = int(_f['zeta_q'].shape[2])
+		_n_rmu_jax = jax.experimental.multihost_utils.broadcast_one_to_all(
+			jnp.asarray(_n_rmu_by_ch_local, dtype=jnp.int64))
+		n_rmu_by_channel = {ch: int(jax.device_get(_n_rmu_jax)[ch])
+		                    for ch in (0, 1, 2, 3)}
+		print_fn(f"    V_q (bispinor) channels: n_rmu={n_rmu_by_channel}")
+
+		coulomb_kernels = make_v_munu_chunked_kernel(
+			meta.fft_grid[0], meta.fft_grid[1], meta.fft_grid[2],
+			meta.kgrid[0], meta.kgrid[1], meta.kgrid[2],
+			bvec, meta.cell_volume, meta.sys_dim,
+			bdot=np.asarray(wfn.bdot, dtype=np.float64) if meta.sys_dim == 0 else None,
+			mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
+			vcoul_cutoff_ry=vcoul_cutoff_ry,
+		)
+
+		with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
+			ios = []
+			try:
+				for ch in (0, 1, 2, 3):
+					ios.append(SlabIO(channel_paths[ch], mode='r',
+					                  mesh=mesh_xy, backend=cfg.backend.slab_io))
+				zeta_io_by_channel = {ch: ios[ch] for ch in (0, 1, 2, 3)}
+				with mesh_xy:
+					V_blocks, G0_all = compute_all_V_q_lorentz_sharded(
+						zeta_io_by_channel=zeta_io_by_channel,
+						coulomb_kernels=coulomb_kernels,
+						mesh_xy=mesh_xy,
+						kgrid=meta.kgrid, fft_grid=meta.fft_grid,
+						bvec=bvec, cell_volume=meta.cell_volume,
+						n_rmu_by_channel=n_rmu_by_channel,
+						sys_dim=meta.sys_dim,
+						bdot=np.asarray(wfn.bdot, dtype=np.float64) if meta.sys_dim == 0 else None,
+						mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
+						bare_coulomb_cutoff=vcoul_cutoff_ry,
+						bgw_v_grid_fn=bgw_v_grid_fn,
+						budget_bytes=m_budget,
+					)
+			finally:
+				for io in ios:
+					try:
+						io.close()
+					except Exception:
+						pass
+
+		G0_gathered = jax.experimental.multihost_utils.process_allgather(G0_all)
+		if G0_gathered.ndim == 5 and G0_gathered.shape[0] == 1:
+			G0_gathered = G0_gathered[0]
+		if jax.process_index() == 0:
+			with h5py.File(zeta_h5_path, 'a') as f:
+				if 'g0_mu' in f:
+					del f['g0_mu']
+				f.create_dataset('g0_mu', data=np.asarray(G0_gathered))
+		jax.experimental.multihost_utils.sync_global_devices("g0_write")
+
+		print_fn(f"\n  V_q (bispinor) computed:")
+		print_fn(f"    {len(V_blocks)} non-zero (μ_L, ν_L) tiles "
+		         f"(7 unique kernel + 3 hermitian-transpose; "
+		         f"6 zero by Coulomb gauge).")
+		for (m, n), block in sorted(V_blocks.items()):
+			tr = float(jnp.trace(block[0]).real)
+			print_fn(f"      ({m},{n}) shape={block.shape}, V_q=0 trace={tr:.4f}")
+
+		G0 = G0_gathered
+		while G0.ndim > 1:
+			G0 = G0[0]
+
+		# TODO(bispinor-sigma): downstream Σ^B integration not yet wired.
+		# sigma_sx / sigma_coh consume V_qmunu shaped
+		# ``(1, npol, npol, nkx, nky, nkz, μ, μ)`` — a SINGLE Lorentz
+		# channel.  Until the Σ-projection is upgraded to walk all 10
+		# V^{μ_L, ν_L} tiles, we forward only the (0,0) block (charge
+		# channel) so the rest of the pipeline runs through unchanged.
+		# This produces the SAME Σ as a non-bispinor μ_L=0-only run on
+		# the bispinor centroid set + lifted ψ — useful as an end-to-end
+		# smoke test, NOT as a physical bispinor result.
+		print_fn(f"    [bispinor] WARNING: forwarding only V_blocks[(0,0)] "
+		         f"to downstream Σ — the 9 transverse tiles are computed "
+		         f"and logged but DISCARDED until Σ-projection lands.")
+		V_q_raw = V_blocks[(0, 0)]
+		# Broadcast to (1, npol, npol, nkx, nky, nkz, μ, μ) like the
+		# non-bispinor return.
+		nkx, nky, nkz = meta.kgrid
+		n_rmu_0 = int(n_rmu_by_channel[0])
+		V_qmunu = jnp.array(jnp.broadcast_to(
+			V_q_raw[None, None, None],
+			(1, meta.npol, meta.npol, nkx, nky, nkz, n_rmu_0, n_rmu_0)))
+		return V_qmunu, G0
+
 	# Single dispatcher: ``compute_all_V_q`` selects the right kernel from
 	# the SlabIO backend (PHDF5_FFI → mesh-parallel ζ reads + outer jit,
 	# H5PY_ALLGATHER → replicated rank-0 read with μ-chunking + optional
