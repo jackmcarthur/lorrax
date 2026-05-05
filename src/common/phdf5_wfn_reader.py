@@ -107,7 +107,37 @@ class PhdfWfnReader:
         nb = b_hi - b_lo
         if nb % self._world_size:
             raise ValueError(
-                f"band count {nb} not divisible by world={self._world_size}")
+                f"band count {nb} not divisible by world={self._world_size} — "
+                f"caller must pre-pad band_range (see common.meta.Meta.from_system "
+                f"for the driver-level pad).")
+
+        # Common path: file holds every requested band.
+        if b_hi <= self.nbands:
+            return self._coeffs_gspace_aligned(b_lo, b_hi, k_ids)
+
+        # File-short path: pad target exceeds wfn.nbands.  Split the
+        # request into a fast collective bulk read of the largest
+        # world-aligned in-file slice + a small replicated remainder
+        # (≤ world-1 in-file "tail" bands plus pure-zero padding).
+        # The remainder is handled by ``_coeffs_gspace_replicated_tail``;
+        # all three pieces are concatenated along the band axis and
+        # resharded to the canonical layout.
+        n_in_file = max(0, int(self.nbands) - int(b_lo))
+        n_aligned = (n_in_file // self._world_size) * self._world_size
+        return self._coeffs_gspace_with_short_tail(
+            b_lo, b_hi, n_aligned, k_ids)
+
+    def _coeffs_gspace_aligned(
+        self,
+        b_lo: int,
+        b_hi: int,
+        k_ids: Sequence[int] | None,
+    ) -> jax.Array:
+        """Fast path: collective FFI read assuming ``b_hi <= self.nbands``
+        and ``(b_hi - b_lo) % world == 0``.  This is the body the
+        public ``coeffs_gspace`` ran before pad-past-file support; the
+        sharded output layout is identical."""
+        nb = b_hi - b_lo
         bands_per_rank = nb // self._world_size
 
         k_ids = (np.arange(self.nk_full, dtype=np.int32) if k_ids is None
@@ -155,6 +185,155 @@ class PhdfWfnReader:
         psi_G = self._fft_box_kernel(n_k, bands_per_rank)(
             cnk_at_full, g_index_for_ids)
         return psi_G
+
+    def _coeffs_gspace_with_short_tail(
+        self,
+        b_lo: int,
+        b_hi: int,
+        n_aligned: int,
+        k_ids: Sequence[int] | None,
+    ) -> jax.Array:
+        """File-short path.  Bulk: collective FFI read of ``[b_lo,
+        b_lo + n_aligned)``.  Tail: replicated h5py read of
+        ``[b_lo + n_aligned, min(b_hi, self.nbands))`` (≤ world-1 bands).
+        Zero-pad: ``[min(b_hi, self.nbands), b_hi)`` (no read).  Stitch
+        via ``jnp.concatenate`` along the band axis + reshard to the
+        canonical ``P(None, ('x','y'), None, None, None, None)`` layout.
+
+        Cost: one extra h5py read (≤ world-1 bands × n_k × ngkmax —
+        kilobytes) per band-chunk that crosses the file boundary, plus
+        one all-to-all-shape reshard at the concat boundary.  Negligible
+        compared to the bulk FFI read."""
+        nb_total = b_hi - b_lo
+        n_in_file = max(0, int(self.nbands) - int(b_lo))
+        n_tail = n_in_file - n_aligned
+        n_zero = nb_total - n_in_file
+        assert n_tail >= 0 and n_zero >= 0
+        assert n_aligned + n_tail + n_zero == nb_total
+
+        if k_ids is None:
+            k_ids = np.arange(self.nk_full, dtype=np.int32)
+        else:
+            k_ids = np.asarray(k_ids, dtype=np.int32)
+        n_k = len(k_ids)
+
+        nx, ny, nz = (int(v) for v in self.fft_grid)
+        ns = int(self.nspinor)
+        rep_shard = NamedSharding(self.mesh, P())
+        final_shard = NamedSharding(
+            self.mesh, P(None, ('x', 'y'), None, None, None, None))
+
+        parts = []
+
+        # 1. Bulk via FFI (skip if n_aligned == 0).
+        if n_aligned > 0:
+            parts.append(
+                self._coeffs_gspace_aligned(b_lo, b_lo + n_aligned, k_ids))
+
+        # 2. Replicated tail via h5py + on-device unfold + fft_box.
+        if n_tail > 0:
+            parts.append(self._coeffs_gspace_replicated_tail(
+                b_lo + n_aligned, b_lo + n_aligned + n_tail, k_ids))
+
+        # 3. Pure-zero pad past wfn.nbands.
+        if n_zero > 0:
+            zero_block = jax.device_put(
+                jnp.zeros((n_k, n_zero, ns, nx, ny, nz), dtype=jnp.complex128),
+                rep_shard)
+            parts.append(zero_block)
+
+        full = jnp.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
+        return jax.lax.with_sharding_constraint(full, final_shard)
+
+    def _coeffs_gspace_replicated_tail(
+        self,
+        b_lo: int,
+        b_hi: int,
+        k_ids: np.ndarray,
+    ) -> jax.Array:
+        """Read ``[b_lo, b_hi)`` (1 ≤ count < world bands) via h5py, then
+        run the same unfold + fft-box pipeline as the FFI path but
+        replicated across all ranks.  Handles both nosym (ntran == 1,
+        identity unfold) and sym (ntran > 1, full TR conjugation + τ
+        phase + U_spinor rotation) files.  Output shape
+        ``(n_k, b_hi - b_lo, nspinor, nx, ny, nz)`` complex128, sharded
+        ``P()`` (replicated)."""
+        import h5py
+        n_tail = int(b_hi - b_lo)
+        n_k = len(k_ids)
+        nx, ny, nz = (int(v) for v in self.fft_grid)
+        ns = int(self.nspinor)
+
+        # Mirror the bulk path's IBZ-k dedup so the unfold inputs share
+        # the same layout as the sharded ``_make_unfold_kernel`` body.
+        # For nosym files this just decays to the identity (n_reads =
+        # n_k, position_in_reads = identity, U = I, phase = 1, tr_mask
+        # all False).
+        ibz_per_id = self._ibz_per_full_k[k_ids]
+        unique_ibz, ibz_inv = np.unique(ibz_per_id, return_inverse=True)
+        file_order = np.argsort(
+            self.kpt_starts[unique_ibz], kind="stable").astype(np.int32)
+        ibz_file_sorted = unique_ibz[file_order]
+        position_in_reads = np.argsort(
+            file_order, kind="stable")[ibz_inv].astype(np.int32)
+        n_reads = int(len(ibz_file_sorted))
+
+        # Read each unique IBZ k's tail bands via h5py.  All ranks read
+        # independently — small (≤ world-1 bands × n_reads × ngkmax,
+        # kilobytes) so concurrent file opens don't contend.
+        cnk_at_ibz_np = np.zeros(
+            (n_tail, ns, n_reads, self.ngkmax, 2), dtype=np.float64)
+        with h5py.File(self.path, "r") as f:
+            coeffs = f["wfns/coeffs"]
+            for ri, ibz in enumerate(ibz_file_sorted):
+                ngk = int(self.ngk[ibz])
+                start = int(self.kpt_starts[ibz])
+                cnk_at_ibz_np[:, :, ri, :ngk, :] = coeffs[
+                    b_lo:b_hi, :, start:start + ngk, :]
+
+        cnk_at_ibz = jnp.asarray(cnk_at_ibz_np)
+
+        # Apply unfold IBZ → full BZ.  Same body as the sharded
+        # ``_make_unfold_kernel._per_rank``; we just don't wrap it in
+        # shard_map because the input is already replicated.
+        if self.ntran == 1:
+            # Nosym fast path: identity unfold = jnp.take along the
+            # k axis.  Skip the U/phase/TR multiplies entirely.
+            cnk_at_full = jnp.take(
+                cnk_at_ibz, jnp.asarray(position_in_reads), axis=2)
+        else:
+            k_ids_dev = jax.device_put(jnp.asarray(k_ids), self._rep1d)
+            U_k, phase_k, tr_mask_k = self._sym_tables_for_ids(k_ids_dev)
+            position_dev = jax.device_put(
+                jnp.asarray(position_in_reads), self._rep1d)
+            cnk_at_full = _unfold_replicated_body(
+                cnk_at_ibz, U_k, phase_k, tr_mask_k, position_dev)
+        # cnk_at_full: (n_tail, ns, n_k, ngkmax, 2) f64
+
+        # Re/im → complex, transpose to (n_k, n_tail, ns, ngkmax) for
+        # the per-k gather.
+        cnk = cnk_at_full[..., 0] + 1j * cnk_at_full[..., 1]
+        cnk = jnp.transpose(cnk, (2, 0, 1, 3))
+        # Append a zero G-slot so the sentinel index ngkmax gathers zero
+        # — same trick as ``make_fft_box_kernel`` uses.
+        zero_slot = jnp.zeros((n_k, n_tail, ns, 1), dtype=jnp.complex128)
+        cnk_padded = jnp.concatenate([cnk, zero_slot], axis=-1)
+        # Shape: (n_k, n_tail, ns, ngkmax+1)
+
+        # Per-k gather via vmap.  ``g_index_dev`` lives on device with
+        # shape (n_k_full, nx, ny, nz); slice down to the caller's k_ids.
+        g_index_for_ids = jnp.take(
+            self._g_index_dev, jnp.asarray(k_ids), axis=0)   # (n_k, nx, ny, nz)
+
+        def _gather_one_k(cnk_k_padded, g_idx_k):
+            # cnk_k_padded: (n_tail, ns, ngkmax+1); g_idx_k: (nx, ny, nz)
+            # → (n_tail, ns, nx, ny, nz)
+            return jnp.take(cnk_k_padded, g_idx_k, axis=2)
+        gathered = jax.vmap(_gather_one_k, in_axes=(0, 0))(
+            cnk_padded, g_index_for_ids)
+        # Shape: (n_k, n_tail, ns, nx, ny, nz) — canonical layout.
+        return jax.device_put(
+            gathered, NamedSharding(self.mesh, P()))
 
     # =====================================================================
     #  Setup phases
@@ -450,3 +629,30 @@ def _make_unfold_kernel(
         check_rep=False,
     )
     return jax.jit(sharded)
+
+
+@jax.jit
+def _unfold_replicated_body(
+    cnk_at_ibz,           # (nb, ns, n_reads, ngkmax, 2) f64 — replicated
+    U_per_k,              # (n_k, ns, ns) c128
+    phase_per_k,          # (n_k, ngkmax) c128
+    tr_mask_per_k,        # (n_k,) bool
+    position_in_reads,    # (n_k,) int32 — IBZ slab serving each full-BZ k
+):
+    """Replicated equivalent of ``_make_unfold_kernel._per_rank``.
+
+    Same math (TR conjugation → τ phase → U_spinor rotation → re/im
+    repack) but runs on a fully replicated band axis with no
+    ``shard_map`` wrapper.  Used for the small "tail" of the
+    pad-past-file path in :meth:`PhdfWfnReader._coeffs_gspace_replicated_tail`.
+    Bands are independent across the unfold body, so the replicated
+    output is bit-equivalent to running the sharded kernel with the
+    same inputs gathered across ranks."""
+    cnk = cnk_at_ibz[..., 0] + 1j * cnk_at_ibz[..., 1]
+    # (nb, ns, n_reads, ngkmax) → (nb, ns, n_k, ngkmax)
+    cnk = jnp.take(cnk, position_in_reads, axis=2)
+    cnk = jnp.where(
+        tr_mask_per_k[None, None, :, None], jnp.conj(cnk), cnk)
+    cnk = cnk * phase_per_k[None, None, :, :]
+    cnk = jnp.einsum("kac,bckg->bakg", U_per_k, cnk)
+    return jnp.stack([cnk.real, cnk.imag], axis=-1)

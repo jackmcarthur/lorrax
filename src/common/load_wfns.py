@@ -108,7 +108,19 @@ def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, nspinor=2):
     band_hi = int(bandrange[1])
     nb = band_hi - band_lo
     irk_to_k = np.asarray(sym.irk_to_k_map)
-    en_irk = np.asarray(wfn.energies[0, :, band_lo:band_hi], dtype=np.float64)
+    # Handle file-short case (band_hi > nbnd in WFN.h5): read what's
+    # available, sentinel-fill the rest so f_n=step(E_F-e)=0 for padded
+    # bands.  Using a finite "max(real e) + 1 Ry" instead of ∞ keeps
+    # PPM resolvent arithmetic 1/(ω - e + iη) safe under fp warnings.
+    nb_in_file = int(wfn.energies.shape[2])
+    band_hi_eff = min(band_hi, nb_in_file)
+    en_irk = np.asarray(
+        wfn.energies[0, :, band_lo:band_hi_eff], dtype=np.float64)
+    if band_hi_eff < band_hi:
+        sentinel = float(np.asarray(wfn.energies[0, :, :]).max()) + 1.0
+        pad = np.full((en_irk.shape[0], band_hi - band_hi_eff), sentinel,
+                      dtype=np.float64)
+        en_irk = np.concatenate([en_irk, pad], axis=1)
     enk = en_irk[irk_to_k, :]                                   # (nk_full, nb)
 
     # Weighting heuristic: 1/sqrt(Ec - E) for conduction, 1/sqrt(E - Ev) for
@@ -192,10 +204,15 @@ def read_Gvecs_to_devices(
         return local_slot, offset
 
     # Pre-compute which bands this process owns (avoids checking every band per k-point)
+    # Only iterate bands that actually exist in the WFN file; band slots
+    # past wfn.nbands stay at the np.zeros pre-fill (caller's pad above
+    # the file's nbnd, e.g. nband padded > wfn.nbands).
+    nbands_in_file = int(getattr(wfn, 'nbands', bandrange[1]))
+    nb_real = max(0, min(nb, nbands_in_file - bandrange[0]))
     with timing.section("load_wfns.precompute_owned"):
         owned_band_indices = []  # global band indices
         local_band_indices = []  # where they go in local buffer
-        for j in range(nb):
+        for j in range(nb_real):
             placement = place_band_into_local(j)
             if placement is not None:
                 local_slot, offset = placement
@@ -912,6 +929,18 @@ def load_centroids_band_chunked(
 
                 del global_psi_Gtot, psi_rmu_kchunk, psi_rmuT_kchunk
                 gc.collect()
+
+    # Band-axis pad: when meta.b_id_4 was rounded up so the band axis
+    # divides the device mesh, the trailing rows here may contain real
+    # ψ(r_μ) read from the WFN file for bands the user did NOT request.
+    # Zero them so every downstream pair-density / Σ contraction sees no
+    # contribution from the pad.  See common.meta.Meta.from_system.
+    nb_user_in_range = max(0, meta.b_id_4_user - b_start)
+    if nb_user_in_range < nb_total:
+        zero_y = jnp.zeros_like(psi_rmu_all[:, nb_user_in_range:nb_total, :, :])
+        zero_x = jnp.zeros_like(psi_rmuT_all[:, :, nb_user_in_range:nb_total, :])
+        psi_rmu_all = psi_rmu_all.at[:, nb_user_in_range:nb_total, :, :].set(zero_y)
+        psi_rmuT_all = psi_rmuT_all.at[:, :, nb_user_in_range:nb_total, :].set(zero_x)
 
     # Cached reader stays alive — see ``_get_phdf5_reader``.
     return psi_rmu_all, psi_rmuT_all

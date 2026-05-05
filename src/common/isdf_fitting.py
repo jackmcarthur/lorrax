@@ -829,7 +829,13 @@ def _band_norms_slice(
     if band_norms is None:
         return jnp.ones((nb,), dtype=jnp.float64)
     lo, hi = band_range
-    return jnp.maximum(jnp.asarray(band_norms[lo:hi], dtype=jnp.float64), 1.0)
+    n_avail = max(0, min(int(band_norms.shape[0]) - lo, hi - lo))
+    sliced = np.zeros((hi - lo,), dtype=np.float64)
+    if n_avail > 0:
+        sliced[:n_avail] = np.asarray(band_norms[lo:lo + n_avail], dtype=np.float64)
+    # max(1, 0) = 1 → padded entries divide ψ by 1, leaving the zeroed
+    # ψ at zero.  No divide-by-zero hazard for [n_avail:nb] tail.
+    return jnp.maximum(jnp.asarray(sliced), 1.0)
 
 
 # ψ(G) no longer enters the jit as a tuple of arguments.  It lives on

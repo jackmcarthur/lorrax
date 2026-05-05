@@ -17,7 +17,7 @@ class Meta:
     b_id_1: int
     b_id_2: int
     b_id_3: int
-    b_id_4: int
+    b_id_4: int               # padded upper bound: divisible by world; used everywhere shapes matter
     fft_grid: tuple
     cell_volume: float
     n_rtot: int
@@ -34,6 +34,7 @@ class Meta:
     nbnd_jax: int
     n_rtot_jax: int
     n_rmu_jax: int
+    b_id_4_user: int = 0      # original user-supplied nband; b_id_4_user == b_id_4 when no pad. Output writers slice to this.
 
     def __post_init__(self):
         self.nelec = self.b_id_2
@@ -87,7 +88,24 @@ class Meta:
         b_id_1 = int(wfn.nelec - nval)
         b_id_2 = int(wfn.nelec)
         b_id_3 = int(wfn.nelec + ncond)
-        b_id_4 = int(nband)
+        # b_id_4 is the padded upper bound: rounded up so the band axis
+        # divides the device mesh.  Sharded readers + Cholesky tiles +
+        # FFT helpers all assume b_id_4 - b_id_0 % world_size == 0.
+        # Output writers slice back to b_id_4_user (the user's nband).
+        # ψ(G) for bands in [b_id_4_user, b_id_4) is forced to zero in
+        # load_centroids_band_chunked; energies use a finite sentinel; pair
+        # densities / Σ_X / Σ_C therefore see zero contribution from pads.
+        b_id_4_user = int(nband)
+        world_size = int(jax.device_count())
+        b_id_4 = _round_up(b_id_4_user, world_size)
+        # Both readers handle pad-past-file:
+        #   - ``read_Gvecs_to_devices`` (legacy path): pre-zeroed buffer
+        #     + capped iteration drop bands past wfn.nbands.
+        #   - ``phdf5_wfn_reader.coeffs_gspace`` (phdf5 path): bulk FFI
+        #     read up to the largest world-aligned slice within the
+        #     file, then a small replicated tail via h5py + a pure-zero
+        #     pad for slots past wfn.nbands.
+        # No cap needed here.
         fft_grid = tuple(int(x) for x in wfn.fft_grid)
         cell_volume = float(wfn.cell_volume)
         n_rtot = int(np.prod(fft_grid))
@@ -124,4 +142,5 @@ class Meta:
             nbnd_jax,
             n_rtot_jax,
             n_rmu_jax,
+            b_id_4_user=b_id_4_user,
         )

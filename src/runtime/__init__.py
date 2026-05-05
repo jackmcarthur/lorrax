@@ -184,12 +184,11 @@ def nccl_warmup(mesh_xy) -> None:
     # over the given axes lowers to the right psum; ``jax.lax.psum`` isn't
     # callable from top-level jit (needs shard_map/pmap context), so we
     # route the warmup through the implicit-reduction path instead.
-    shape1d = (max(1, mesh_xy.shape[mesh_xy.axis_names[0]]),)
     shape2d = tuple(mesh_xy.shape[ax] for ax in mesh_xy.axis_names)
-    warm_specs = []
-    warm_specs.append((shape2d, P(*mesh_xy.axis_names)))   # full-mesh psum
+    warm_specs = [(shape2d, P(*mesh_xy.axis_names))]       # full-mesh psum
     for ax in mesh_xy.axis_names:
-        warm_specs.append((shape1d, P(ax)))                # per-axis psum
+        n_ax = int(mesh_xy.shape[ax])
+        warm_specs.append(((n_ax,), P(ax)))                # per-axis psum
     for shape, spec in warm_specs:
         sharding = NamedSharding(mesh_xy, spec)
         x = jax.device_put(jnp.ones(shape, dtype=jnp.float64), sharding)
