@@ -326,6 +326,16 @@ class _FfiBackend:
             )
             self._ds_ids[name] = ds_id
 
+        if os.environ.get("LORRAX_FFI_DEBUG_SHARDS"):
+            import sys
+            local_shapes = [tuple(s.data.shape) for s in A.addressable_shards]
+            sys.__stdout__.write(
+                f"[ffi-debug proc={jax.process_index()}] "
+                f"name={name} shape={tuple(A.shape)} dtype={A.dtype} "
+                f"spec={getattr(A.sharding, 'spec', None)} "
+                f"offset={off} gshape={gshape} local_shapes={local_shapes}\n")
+            sys.__stdout__.flush()
+
         ds_id = self._ds_ids[name]
         ctx_handle = self.fh
         mesh_shape = tuple(self.mesh.shape[ax] for ax in self.mesh.axis_names)
@@ -388,6 +398,8 @@ class _FfiBackend:
         with self._pending_cv:
             self._dispatch_pending += 1
         self._dispatch_queue.put(_task)
+        if os.environ.get("LORRAX_WRITE_SYNC"):
+            self._drain_pending()
 
     # ------------------------------------------------------------------
     def read_slab(
