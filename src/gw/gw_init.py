@@ -639,21 +639,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	"""
 	from common.isdf_fitting import fit_zeta_chunked_to_h5
 
-	# ISDF left/right band windows (pair density needs asymmetric ranges).
-	# Cap the right-side upper at meta.b_id_4_user (= user's nband), NOT
-	# band_slices.b4 (= mesh-padded upper).  The pad-safety contract zeros
-	# the centroid-extracted ψ for bands in [b_id_4_user, b_id_4), but ψ(G)
-	# flowing through PsiGStore is NOT zeroed for those slots — the file
-	# holds real DFT data there.  Letting band_range_right span up to b4
-	# (e.g. CrI3 nband=150 world=16 → b4=160) lets the R-side pair-density
-	# einsum pick up that real DFT data on pad slots [150, 160), poisoning
-	# ζ → V_q → Σ_X by 6+ orders of magnitude (CrI3 Σ_X = -200 MeV/band
-	# instead of -30 eV/band).  When no pad is needed (e.g. MoS2 nband=32
-	# world=4), b_id_4_user == band_slices.b4 and the cap is a no-op.
-	# See reports/cri3_sigma_blowup_2026-05-05/.
-	b_right_hi = int(meta.b_id_4_user)
+	# ISDF left/right band windows (pair density needs asymmetric ranges)
 	band_range_left = (band_slices.b0, band_slices.b3)   # all val + sigma cond
-	band_range_right = (band_slices.b1, b_right_hi)       # sigma val + all cond (capped to user's nband)
+	band_range_right = (band_slices.b1, band_slices.b4)   # sigma val + all cond
 
 	mem_est = chunks.get('memory_estimate', {})
 	aot_peak_gb = None  # filled in below if the AOT model is available
