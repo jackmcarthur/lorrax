@@ -172,6 +172,7 @@ def compute_optimal_chunks(
     verbose: bool = True,
     n_b_left: int | None = None, n_b_right: int | None = None,
     r_chunk_override: int | None = None,
+    band_chunk_override: int | None = None,
     zct_stage_cap_gb: float | None = None,
 ) -> dict:
     """Derive ISDF chunk sizes that fit within the per-device memory budget.
@@ -244,6 +245,14 @@ def compute_optimal_chunks(
     one_band = _FFT_COPIES * _bytes_c128(nk, ns, nr)
     bpd_max = max(1, int((headroom_fft - m_phase) / one_band))
     band_chunk = min(nb, bpd_max * p)
+    if band_chunk_override is not None and band_chunk_override > 0:
+        # Override is interpreted as BANDS PER DEVICE (bpd).  The internal
+        # ``band_chunk`` is the total = bpd × p; multiply here so the user-
+        # facing knob matches the per-GPU memory model the user reasons
+        # about.  bpd=1 ⇒ total band_chunk=p (the smallest meaningful
+        # value on a p-rank mesh).
+        bpd_req = max(1, int(band_chunk_override))
+        band_chunk = min(int(nb), bpd_req * p)
     bpd = max(1, -(-band_chunk // p))  # ceil div matching read_Gvecs_to_devices
     peak_centroid_fft_stage = (
         m_centroids_full + _FFT_COPIES * _bytes_c128(nk, bpd, ns, nr) + m_phase
@@ -379,7 +388,11 @@ def compute_optimal_chunks(
 
     fft_inloop = _fft_inloop_bytes(band_chunk)
     result = _find_r_chunk(fft_inloop, r_chunk_override)
-    while result is None and bpd > 1:
+    # Skip the halving loop when the user pinned band_chunk — they're
+    # asking for that specific value (e.g. to cap HLO graph complexity
+    # for XLA's host-side compiler), so it must not get auto-shrunk to
+    # something even smaller.
+    while result is None and bpd > 1 and band_chunk_override in (None, 0):
         bpd = max(1, bpd // 2)
         band_chunk = min(nb, bpd * p)
         bpd = max(1, -(-band_chunk // p))
@@ -1049,6 +1062,7 @@ def prepare_isdf_and_wavefunctions(
 				n_b_left=band_slices.b3 - band_slices.b0,
 				n_b_right=band_slices.b4 - band_slices.b1,
 				r_chunk_override=mem.r_chunk_override if mem.r_chunk_override > 0 else None,
+				band_chunk_override=mem.band_chunk_size if mem.band_chunk_size > 0 else None,
 				zct_stage_cap_gb=mem.zct_stage_cap_gb,
 			)
 
