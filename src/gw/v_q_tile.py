@@ -495,6 +495,10 @@ def compute_V_q_tile(
               f"predicted peak/rank={chooser_choice['per_rank_peak']/1e9:.2f} GB "
               f"(V_ref+g0_ref={chooser_choice['ref_bytes']/1e9:.2f} GB)")
 
+    wants_g0 = g0_acc is not None
+    g0_work = g0_acc if wants_g0 else _make_g0_dummy(
+        mesh_xy, nq_total, n_rmu_L)
+
     kgrid_arr = np.array([nkx, nky, nkz], dtype=np.float64)
     _read_spec = P(None, None, ('x', 'y'))
 
@@ -552,8 +556,8 @@ def compute_V_q_tile(
                     mesh=mesh_xy, partition_spec=_read_spec)
                 v_per_G_b, phase_b = _v_phase_batch(qvecs, pad_to=actual)
                 if same_zeta:
-                    V_acc, g0_acc = kernel(
-                        V_acc, _g0_or_dummy(g0_acc, mesh_xy, nq_total, n_rmu_L),
+                    V_acc, g0_work = kernel(
+                        V_acc, g0_work,
                         zeta_L, v_per_G_b, phase_b,
                         jnp.int32(q_cursor), jnp.int32(0), jnp.int32(0))
                 else:
@@ -563,8 +567,8 @@ def compute_V_q_tile(
                         dtype=np.complex128,
                         offset=(q_flat0, 0, 0),
                         mesh=mesh_xy, partition_spec=_read_spec)
-                    V_acc, _ = kernel(
-                        V_acc, _g0_or_dummy(g0_acc, mesh_xy, nq_total, n_rmu_L),
+                    V_acc, g0_work = kernel(
+                        V_acc, g0_work,
                         zeta_L, zeta_R, v_per_G_b, phase_b,
                         jnp.int32(q_cursor), jnp.int32(0), jnp.int32(0))
                     del zeta_R
@@ -618,15 +622,11 @@ def compute_V_q_tile(
                                     q_chunk=1, mu_size=mu_size, nu_size=nu_size,
                                     n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R,
                                     same_zeta=True, write_g0=do_write_g0)
-                                V_acc, g0_acc_filled = k(
-                                    V_acc,
-                                    _g0_or_dummy(g0_acc, mesh_xy,
-                                                 nq_total, n_rmu_L),
+                                V_acc, g0_work = k(
+                                    V_acc, g0_work,
                                     zeta_mu, v_per_G_b, phase_b,
                                     jnp.int32(q_flat),
                                     jnp.int32(mu_lo), jnp.int32(nu_lo))
-                                if g0_acc is not None:
-                                    g0_acc = g0_acc_filled
                             else:
                                 zeta_nu = zeta_R_io.read_slab(
                                     'zeta_q',
@@ -640,10 +640,8 @@ def compute_V_q_tile(
                                     q_chunk=1, mu_size=mu_size, nu_size=nu_size,
                                     n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R,
                                     same_zeta=False, write_g0=False)
-                                V_acc, _ = k(
-                                    V_acc,
-                                    _g0_or_dummy(g0_acc, mesh_xy,
-                                                 nq_total, n_rmu_L),
+                                V_acc, g0_work = k(
+                                    V_acc, g0_work,
                                     zeta_mu, zeta_nu, v_per_G_b, phase_b,
                                     jnp.int32(q_flat),
                                     jnp.int32(mu_lo), jnp.int32(nu_lo))
@@ -652,20 +650,18 @@ def compute_V_q_tile(
                     vq_progress.step()
             vq_progress.finish()
 
-    return V_acc, g0_acc
+    return V_acc, (g0_work if wants_g0 else None)
 
 
-def _g0_or_dummy(g0_acc, mesh_xy, nq_total, n_rmu_L):
-    """Return ``g0_acc`` if non-None, else a fresh sharded dummy.
+def _make_g0_dummy(mesh_xy, nq_total, n_rmu_L):
+    """Return a sharded dummy ``g0`` accumulator for tiles without a head.
 
     The unified kernel always takes a g0_acc argument (the JIT signature
     has both V_acc and g0_acc in ``donate_argnums=(0, 1)``).  When the
-    caller doesn't want the head term we pass a dummy zero slab so the
-    JIT signature is uniform; the kernel either ignores it
-    (``write_g0=False``) or writes into it (which we discard on return).
+    caller doesn't want the head term we carry one dummy zero slab through
+    the tile loop so donation ownership stays explicit without allocating
+    a fresh unused array for every block.
     """
-    if g0_acc is not None:
-        return g0_acc
     g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
 
     @partial(jax.jit, out_shardings=g0_sh)
