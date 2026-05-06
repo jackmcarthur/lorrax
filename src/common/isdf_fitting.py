@@ -538,12 +538,12 @@ def compute_L_q_from_CCT(
     factor.  Downstream :func:`solve_zeta_from_L_q` then does two
     triangular solves per-q.
 
-    For ``vertex_mu_L != 0`` (transverse Lorentz channels γ̃^i, i∈{1,2,3})
-    the CCT is Hermitian but **indefinite** — Cholesky NaNs and the LU
-    fallback in :func:`solve_zeta_from_L_q` is required.  In this case
-    we skip the factorization here and pass C_q through unchanged; the
-    solve routine consumes it via ``jnp.linalg.solve`` which does
-    LU + back-solve internally.
+    The ``vertex_mu_L != 0`` indefinite-CCT path is kept only for old
+    restart/debug artifacts.  Production Lorentz ζ fits should build
+    the system matrix from the scalar pair-density metric and put the
+    γ̃ vertex only on the RHS ZCT.  That keeps the interpolation metric
+    positive-definite and avoids amplifying nearly null transverse
+    current modes.
 
     The artifact return type does NOT change with ``vertex_mu_L`` — both
     branches return a (nq, n_rmu, n_rmu) array sharded
@@ -635,12 +635,10 @@ def solve_zeta_from_L_q(
     (``L y = Z`` then ``L^H ζ = y``).  Bit-identical to the historical
     fast path.
 
-    For ``vertex_mu_L != 0`` ``L_q`` is the *unfactored* CCT matrix
-    (transverse-channel γ̃^i CCT is Hermitian but indefinite, so
-    Cholesky is invalid).  The inner solve dispatches to
-    ``jnp.linalg.solve`` (LU with partial pivoting + back-solve in one
-    shot).  Per-q matrices are small enough that explicit
-    ``lu_factor`` + ``lu_solve`` reuse buys nothing.
+    The LU branch for ``vertex_mu_L != 0`` remains available for legacy
+    debug artifacts.  New Lorentz ζ fits pass ``vertex_mu_L=0`` here:
+    the scalar Cholesky metric is reused while the γ̃ vertex enters only
+    the RHS ``Z_q``.
 
     Uses q-chunked all-gather strategy: gather B_q matrices at a time,
     then solve all B_q systems in parallel using vmap.
@@ -920,6 +918,11 @@ def _make_fit_one_rchunk_kernel(
         )
         for bc_range in band_chunk_ranges
     ]
+    vertex_matrix = None
+    if int(vertex_mu_L) != 0:
+        # Resolve the tiny gamma matrix before tracing _kernel.  Importing
+        # gamma_matrices from inside the JIT body leaks traced module globals.
+        vertex_matrix = _gamma_tilde_matrix(int(vertex_mu_L))
 
     @jax.jit
     def _kernel(
@@ -967,8 +970,8 @@ def _make_fit_one_rchunk_kernel(
             if vertex_mu_L == 0:
                 return accumulate_pair_density_spin_traced(
                     P_acc, psi_L_bc, psi_R_bc, mesh_xy)
-            return accumulate_pair_density_lorentz(
-                P_acc, psi_L_bc, psi_R_bc, vertex_mu_L, mesh_xy)
+            return accumulate_pair_density_with_vertex(
+                P_acc, psi_L_bc, psi_R_bc, vertex_matrix, mesh_xy)
 
         # --- 2. Stream band-chunks: fetch ψ(G) per-bc from host via
         #       io_callback, FFT + reshard, accumulate pair density.
@@ -995,8 +998,11 @@ def _make_fit_one_rchunk_kernel(
         # inside ``solve_zeta_from_L_q`` decouples the reshard scheduler
         # from the kernel body.
         Z_q = compute_ZCT_from_left_right_zchunk(P_l, P_r, kgrid, mesh_xy)
+        # L_q is always the scalar Cholesky interpolation metric.  The
+        # Lorentz channel, when present, has already been applied while
+        # accumulating P_l/P_r and therefore Z_q.
         zeta = solve_zeta_from_L_q(
-            L_q, Z_q, mesh_xy, q_chunk_size, vertex_mu_L=vertex_mu_L)
+            L_q, Z_q, mesh_xy, q_chunk_size, vertex_mu_L=0)
         return zeta
 
     return _kernel
@@ -1241,21 +1247,22 @@ def fit_zeta_chunked_to_h5(
             print(f"  Pseudobands normalization: {n_weighted} weighted, "
                   f"{n_zero} zero-weight (skipped)")
 
-    # ========== STEP 2: Compute CCT (C_q) from left/right pair densities ==========
-    # Uses normalized copies for fitting (equal-weight pair densities).
-    # γ̃^0 = I_4, so vertex_mu_L=0 is the standard spin-traced path; non-zero
-    # μ_L swaps in compute_pair_density_lorentz (ns=4 only).
+    # ========== STEP 2: Compute CCT (C_q) from scalar left/right pair densities ==========
+    # The ISDF interpolation metric must stay the scalar, positive-definite
+    # pair-density overlap.  Lorentz vertices are applied only to the RHS ZCT
+    # inside fit_one_rchunk.  Building C_q from γ̃^i current densities makes
+    # the system indefinite and can catastrophically amplify null current
+    # modes (observed for CrI3).
     with timing.section("zeta_fit.CCT"):
         if vertex_mu_L == 0:
             print(f"  Computing pair densities P_l, P_r (spin_traced)")
-            P_l_k = compute_pair_density_spin_traced(psi_l_rmuT_X_fit, psi_l_rmu_Y_fit, mesh_xy)
-            P_r_k = compute_pair_density_spin_traced(psi_r_rmuT_X_fit, psi_r_rmu_Y_fit, mesh_xy)
         else:
-            print(f"  Computing pair densities P_l, P_r (γ̃^{vertex_mu_L} vertex)")
-            P_l_k = compute_pair_density_lorentz(
-                psi_l_rmuT_X_fit, psi_l_rmu_Y_fit, vertex_mu_L, mesh_xy)
-            P_r_k = compute_pair_density_lorentz(
-                psi_r_rmuT_X_fit, psi_r_rmu_Y_fit, vertex_mu_L, mesh_xy)
+            print(f"  Computing pair densities P_l, P_r (spin_traced metric; "
+                  f"γ̃^{vertex_mu_L} RHS)")
+        P_l_k = compute_pair_density_spin_traced(
+            psi_l_rmuT_X_fit, psi_l_rmu_Y_fit, mesh_xy)
+        P_r_k = compute_pair_density_spin_traced(
+            psi_r_rmuT_X_fit, psi_r_rmu_Y_fit, mesh_xy)
         P_l_k.block_until_ready()
         P_r_k.block_until_ready()
         C_q = compute_CCT_from_left_right(P_l_k, P_r_k, kgrid, mesh_xy)
@@ -1275,10 +1282,10 @@ def fit_zeta_chunked_to_h5(
         if int(vertex_mu_L) == 0:
             print(f"  Computing L_q = chol(C_q)")
         else:
-            print(f"  Skipping Cholesky (vertex_mu_L={vertex_mu_L} CCT is "
-                  f"indefinite); will LU-solve per q-batch")
+            print(f"  Computing L_q = chol(C_q) from scalar metric "
+                  f"(vertex_mu_L={vertex_mu_L} uses γ̃ RHS only)")
         L_q = compute_L_q_from_CCT(
-            C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L))
+            C_q_flat, mesh_xy, vertex_mu_L=0)
         L_q.block_until_ready()
         print(f"  L_q: {L_q.shape}")
 

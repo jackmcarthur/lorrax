@@ -42,7 +42,10 @@ gamma5 = jnp.array([[0, 0, 1, 0],
 
 def _to_sparse(mat):
     """Return row indices, column indices, and values of nonzero entries."""
-    r, c = jnp.nonzero(mat)
+    # All gamma matrices in this module have exactly four non-zero entries.
+    # Keep the size static so this module is safe to import while JAX is
+    # tracing a caller.
+    r, c = jnp.nonzero(mat, size=4)
     return r, c, mat[r, c]
 
 
