@@ -52,7 +52,39 @@ def _to_sparse(mat):
 gammas = [gamma0, gamma1, gamma2, gamma3]
 gammas_sparse = [_to_sparse(g) for g in gammas]
 
+# γ̃^μ are signed/permuted identity matrices.  These arrays encode
+# left multiplication by rows: (γψ)_a = phase[a] * ψ[perm[a]].
+gamma_left_perms = jnp.array([
+    [0, 1, 2, 3],
+    [3, 2, 1, 0],
+    [3, 2, 1, 0],
+    [2, 3, 0, 1],
+], dtype=jnp.int32)
+gamma_left_phases = jnp.array([
+    [1, 1, 1, 1],
+    [1, 1, 1, 1],
+    [-1j, 1j, -1j, 1j],
+    [1, -1, 1, -1],
+], dtype=jnp.complex128)
+
+# Right multiplication by columns: (Gγ)_d = phase[d] * G[..., perm[d]].
+gamma_right_perms = jnp.array([
+    [0, 1, 2, 3],
+    [3, 2, 1, 0],
+    [3, 2, 1, 0],
+    [2, 3, 0, 1],
+], dtype=jnp.int32)
+gamma_right_phases = jnp.array([
+    [1, 1, 1, 1],
+    [1, 1, 1, 1],
+    [1j, -1j, 1j, -1j],
+    [1, -1, 1, -1],
+], dtype=jnp.complex128)
+
 __all__ = [
     "sigma_x", "sigma_y", "sigma_z",
     "gamma0", "gamma1", "gamma2", "gamma3", "gamma5",
+    "gammas", "gammas_sparse",
+    "gamma_left_perms", "gamma_left_phases",
+    "gamma_right_perms", "gamma_right_phases",
 ]

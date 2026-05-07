@@ -17,6 +17,7 @@ def test_reshard_mu_to_r_uses_all_to_all_and_profiles(tmp_path: Path) -> None:
 
     script = f"""
 import json
+from functools import partial
 from pathlib import Path
 import numpy as np
 import jax
@@ -31,7 +32,7 @@ mesh = Mesh(np.array(devices).reshape(2, 2), ('x', 'y'))
 src = NamedSharding(mesh, P(None, ('x', 'y'), None))   # A_q[mu_XY, r]
 dst = NamedSharding(mesh, P(None, None, ('x', 'y')))   # A_q[mu, r_XY]
 
-@jax.jit(in_shardings=src, out_shardings=dst)
+@partial(jax.jit, in_shardings=src, out_shardings=dst)
 def reshard(a):
     return jax.lax.with_sharding_constraint(a, dst)
 

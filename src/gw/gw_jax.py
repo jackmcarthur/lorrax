@@ -189,10 +189,11 @@ def main(argv=None):
 	wfns = isdf.wf_bundle
 	wfns_current = getattr(isdf, 'wf_bundle_current', None)
 
-	# Bispinor branches early.  V_qmunu is a dict[(μ_L,ν_L), Array] when
-	# bispinor; the screened (χ₀ → W) path is not yet wired for the
-	# 10-tile structure (W needs its own Lorentz tile build).  For
-	# x_only bispinor we go straight to ``compute_cohsex_sigma_bispinor``.
+	# Bispinor branches early.  Bispinor V is a ragged Lorentz block map
+	# ``dict[(μ_L,ν_L), Array]`` rather than dense ``V[pol1,pol2,μ,ν]``:
+	# charge and current channels may use different centroid counts.  The
+	# screened (χ₀ → W) path is not yet wired for the 10-tile structure, so
+	# x_only bispinor goes straight to ``compute_cohsex_sigma_bispinor``.
 	_bispinor_dispatch = isinstance(V_qmunu, dict)
 
 	# --- Screening: χ₀ → W = (1 − Vχ)⁻¹ V ---

@@ -289,22 +289,28 @@ _BISPINOR_TILES_CURRENT: tuple[tuple[int, int], ...] = (
 )
 
 
-def _gamma_tilde_4x4(mu_lorentz: int) -> jax.Array:
-    """Return γ̃^{μ_L} as a (4, 4) c128 jnp array.  Re-uses the
-    convention from :mod:`common.gamma_matrices` (matrices stored
-    are already γ^0 γ^μ; see header note in that module)."""
-    from common.gamma_matrices import gamma0, gamma1, gamma2, gamma3
-    return (gamma0, gamma1, gamma2, gamma3)[int(mu_lorentz)]
+def _gamma_left_perm_phase(mu_lorentz: int):
+    """Permutation form of left multiplication: ``(γψ)_a = phase[a] ψ[perm[a]]``."""
+    from common.gamma_matrices import gamma_left_perms, gamma_left_phases
+    mu = int(mu_lorentz)
+    return gamma_left_perms[mu], gamma_left_phases[mu]
+
+
+def _gamma_right_perm_phase(mu_lorentz: int):
+    """Permutation form of right multiplication: ``(Gγ)_d = phase[d] G[..., perm[d]]``."""
+    from common.gamma_matrices import gamma_right_perms, gamma_right_phases
+    mu = int(mu_lorentz)
+    return gamma_right_perms[mu], gamma_right_phases[mu]
 
 
 def _make_sigma_x_lorentz_kernel(mesh_xy: Mesh, kgrid, nk_tot: int):
     """Cached factory: bispinor bare-X kernel for ONE (μ_L, ν_L) tile.
 
-    Returns ``f(wfns, Gij, V_block, gamma_mu_L, gamma_nu_L) → Σ contribution``
+    Returns ``f(..., V_block, γ_mu_perm, γ_mu_phase, γ_nu_perm, γ_nu_phase)``
     that sums into the running total.  Shares the convolve/project
     primitives with :func:`_make_cohsex_kernels`; the only difference
-    is the γ̃ multiplication on the (β, γ) axes of ``build_G``'s output
-    before the convolve.
+    is the γ̃ row/column permutation on the (β, γ) axes of ``build_G``'s
+    output before the convolve.
     """
     cache_key = (id(mesh_xy), tuple(int(x) for x in kgrid))
     if cache_key in _sigma_x_lorentz_cache:
@@ -320,7 +326,8 @@ def _make_sigma_x_lorentz_kernel(mesh_xy: Mesh, kgrid, nk_tot: int):
     @jax.jit
     def _sigma_x_lorentz_one_tile(
         psi_xn_sigma, psi_yr_sigma, psi_xr_sigma, psi_yn_sigma,
-        Gij, V_block, gamma_mu, gamma_nu,
+        Gij, V_block,
+        gamma_mu_perm, gamma_mu_phase, gamma_nu_perm, gamma_nu_phase,
     ):
         """Single-tile contribution: build G, multiply γ̃, convolve, project.
 
@@ -331,7 +338,7 @@ def _make_sigma_x_lorentz_kernel(mesh_xy: Mesh, kgrid, nk_tot: int):
             psi_yn_sigma    (nk, s, μ_Y, nb_sigma)   from bundle.yn(s.sigma)
             Gij             (nk, nb_sigma, nb_sigma) occupation projector
             V_block         (nq, μ_X, μ_Y)           single Lorentz tile of V
-            gamma_mu, gamma_nu   (4, 4) c128         γ̃^{μ_L}, γ̃^{ν_L}
+            gamma_*_perm/phase                       γ̃ permutation factors
 
         Returns Σ contribution shape (nk, m, n) — the SIGNED contribution
         for this tile (caller accumulates and applies the overall −1).
@@ -340,13 +347,13 @@ def _make_sigma_x_lorentz_kernel(mesh_xy: Mesh, kgrid, nk_tot: int):
         #                                          ψ*(k, j, γ, μ_Y)
         G_base = build_G(psi_xn_sigma, psi_yr_sigma, Gij=Gij)
 
-        # Insert γ̃ on the (β, γ) axes:
+        # Insert γ̃ on the (β, γ) axes by row/column permutation:
         # G_lorentz[k, α, μ_X, δ, μ_Y]
         #   = Σ_{β, γ} γ̃^{μ_L}_{αβ} G_base[k, β, μ_X, γ, μ_Y] γ̃^{ν_L}_{γδ}
-        G_lorentz = jnp.einsum(
-            'ab, kbxgy, gd -> kaxdy',
-            gamma_mu, G_base, gamma_nu,
-            optimize=True)
+        G_lorentz = jnp.take(G_base, gamma_mu_perm, axis=1)
+        G_lorentz = G_lorentz * gamma_mu_phase[None, :, None, None, None]
+        G_lorentz = jnp.take(G_lorentz, gamma_nu_perm, axis=3)
+        G_lorentz = G_lorentz * gamma_nu_phase[None, None, None, :, None]
 
         # Convolution Σ = +FFT[ G_lorentz(R) · V_block(R) / √Nk ]
         # (positive prefactor; the overall −1 sits at the call site).
@@ -408,9 +415,10 @@ _rho_lorentz_cache: dict[tuple[object, ...], object] = {}
 def _make_rho_lorentz_kernel(mesh_xy: Mesh):
     """Cached factory for the band-summed 4-density at centroids.
 
-    Returns ``f(psi_yr_sigma, Gij, gamma_tilde) → ρ^{ν_L}(μ_Y)`` of shape
-    ``(n_rmu_Y,)``, sharded ``P('y')``, complex128 (mathematically real
-    for Hermitian γ̃ but kept c128 to match V's dtype downstream).
+    Returns ``f(psi_yr_sigma, Gij, gamma_perm, gamma_phase) → ρ^{ν_L}(μ_Y)``
+    of shape ``(n_rmu_Y,)``, sharded ``P('y')``, complex128
+    (mathematically real for Hermitian γ̃ but kept c128 to match V's
+    dtype downstream).
 
     Reuses the structure of the scalar Hartree's ρ-build but inserts γ̃
     between the conjugated and direct ψ on the spinor axes:
@@ -425,18 +433,21 @@ def _make_rho_lorentz_kernel(mesh_xy: Mesh):
 
     psi_y_sh = NamedSharding(mesh_xy, P(None, None, None, 'y'))
     Gij_sh   = NamedSharding(mesh_xy, P(None, None, None))
-    gamma_sh = NamedSharding(mesh_xy, P())
+    gamma_perm_sh = NamedSharding(mesh_xy, P())
+    gamma_phase_sh = NamedSharding(mesh_xy, P())
     rho_sh   = NamedSharding(mesh_xy, P('y'))
 
     @partial(
         jax.jit,
-        in_shardings=(psi_y_sh, Gij_sh, gamma_sh),
+        in_shardings=(psi_y_sh, Gij_sh, gamma_perm_sh, gamma_phase_sh),
         out_shardings=rho_sh,
     )
-    def _rho_lorentz(psi_yr_sigma, Gij, gamma_tilde):
+    def _rho_lorentz(psi_yr_sigma, Gij, gamma_perm, gamma_phase):
+        gamma_psi = jnp.take(psi_yr_sigma, gamma_perm, axis=2)
+        gamma_psi = gamma_psi * gamma_phase[None, None, :, None]
         rho = jnp.einsum(
-            'kiay, ab, kjby, kij -> y',
-            jnp.conj(psi_yr_sigma), gamma_tilde, psi_yr_sigma, Gij,
+            'kiay, kjay, kij -> y',
+            jnp.conj(psi_yr_sigma), gamma_psi, Gij,
             optimize=True)
         # Hermitian γ̃ ⇒ ρ is real-valued; .real denoises the einsum, then
         # cast back to c128 to keep V·ρ on the c128 path.
@@ -456,7 +467,7 @@ def _make_sigma_h_lorentz_kernel(mesh_xy: Mesh, nk_tot: int):
       ρ is P('y'), result V_H is P('x')).  Accumulates into the
       caller's per-μ_L V_H sum.
 
-    * ``project_v_h(psi_xr_sigma, gamma_tilde, V_H_mu_L)`` — final
+    * ``project_v_h(psi_xr_sigma, gamma_perm, gamma_phase, V_H_mu_L)`` — final
       Σ_H^{(μ_L)} band projection with γ̃^{μ_L} between the two outer
       ψ's spinor axes.  Local product over (m,n,α,β,μ_X).
     """
@@ -469,7 +480,8 @@ def _make_sigma_h_lorentz_kernel(mesh_xy: Mesh, nk_tot: int):
     rho_sh    = NamedSharding(mesh_xy, P('y'))
     V_H_sh    = NamedSharding(mesh_xy, P('x'))
     psi_x_sh  = NamedSharding(mesh_xy, P(None, None, None, 'x'))
-    gamma_sh  = NamedSharding(mesh_xy, P())
+    gamma_perm_sh = NamedSharding(mesh_xy, P())
+    gamma_phase_sh = NamedSharding(mesh_xy, P())
     rep_3d    = NamedSharding(mesh_xy, P(None, None, None))
 
     inv_nk = 1.0 / float(nk_tot)
@@ -484,13 +496,15 @@ def _make_sigma_h_lorentz_kernel(mesh_xy: Mesh, nk_tot: int):
 
     @partial(
         jax.jit,
-        in_shardings=(psi_x_sh, gamma_sh, V_H_sh),
+        in_shardings=(psi_x_sh, gamma_perm_sh, gamma_phase_sh, V_H_sh),
         out_shardings=rep_3d,
     )
-    def project_v_h(psi_xr_sigma, gamma_tilde, V_H_mu_L):
+    def project_v_h(psi_xr_sigma, gamma_perm, gamma_phase, V_H_mu_L):
+        gamma_psi = jnp.take(psi_xr_sigma, gamma_perm, axis=2)
+        gamma_psi = gamma_psi * gamma_phase[None, None, :, None]
         return jnp.einsum(
-            'kmax, ab, x, knbx -> kmn',
-            jnp.conj(psi_xr_sigma), gamma_tilde, V_H_mu_L, psi_xr_sigma,
+            'kmax, x, knax -> kmn',
+            jnp.conj(psi_xr_sigma), V_H_mu_L, gamma_psi,
             optimize=True)
 
     out = (apply_v_q0_to_rho, project_v_h)
@@ -526,18 +540,21 @@ def compute_sigma_h_lorentz(
         mesh_xy, int(meta.nk_tot))
 
     rep = NamedSharding(mesh_xy, P())
-    gammas = {mu: jax.device_put(_gamma_tilde_4x4(mu), rep)
-              for mu in (0, 1, 2, 3)}
+    gamma_left = {
+        mu: tuple(jax.device_put(x, rep) for x in _gamma_left_perm_phase(mu))
+        for mu in (0, 1, 2, 3)
+    }
 
     s_charge = wfns_charge.slices
     s_current = wfns_current.slices
 
     # Step 1: ρ^{ν_L}(μ_Y) per Lorentz channel, on the matching bundle.
     with mesh_xy:
-        rho = {0: rho_kernel(wfns_charge.yr(s_charge.sigma), Gij, gammas[0])}
+        rho = {0: rho_kernel(
+            wfns_charge.yr(s_charge.sigma), Gij, *gamma_left[0])}
         for nu in (1, 2, 3):
             rho[nu] = rho_kernel(
-                wfns_current.yr(s_current.sigma), Gij, gammas[nu])
+                wfns_current.yr(s_current.sigma), Gij, *gamma_left[nu])
 
     # Step 2: V_H^{μ_L}(μ_X) = Σ_ν_L V^{μ_L,ν_L}_{q=0}(μ_X, μ_Y) ρ^{ν_L}(μ_Y) / N_k
     # accumulated per μ_L from the (μ_L, ν_L) dict entries that exist
@@ -561,7 +578,7 @@ def compute_sigma_h_lorentz(
             bundle = wfns_charge if mu_L == 0 else wfns_current
             s = bundle.slices
             contrib = project_v_h(
-                bundle.xr(s.sigma), gammas[mu_L], V_H_mu)
+                bundle.xr(s.sigma), *gamma_left[mu_L], V_H_mu)
             contrib.block_until_ready()
             try:
                 tr = float(jnp.einsum('kmm->', contrib).real)
@@ -636,10 +653,16 @@ def compute_sigma_x_lorentz(
 
     kernel = _make_sigma_x_lorentz_kernel(mesh_xy, meta.kgrid, int(meta.nk_tot))
 
-    # Pre-stage γ̃ matrices on the mesh (replicated, tiny).
+    # Pre-stage γ̃ permutation factors on the mesh (replicated, tiny).
     rep = NamedSharding(mesh_xy, P())
-    gammas = {mu_L: jax.device_put(_gamma_tilde_4x4(mu_L), rep)
-              for mu_L in (0, 1, 2, 3)}
+    gamma_left = {
+        mu_L: tuple(jax.device_put(x, rep) for x in _gamma_left_perm_phase(mu_L))
+        for mu_L in (0, 1, 2, 3)
+    }
+    gamma_right = {
+        mu_L: tuple(jax.device_put(x, rep) for x in _gamma_right_perm_phase(mu_L))
+        for mu_L in (0, 1, 2, 3)
+    }
 
     # Reshape every V_blocks[(μ_L, ν_L)] from kgrid-shape to flat-q for
     # the (k, μ, μ) → 5D V_q FFT helper.  V_blocks were stored kgrid-shape
@@ -663,7 +686,7 @@ def compute_sigma_x_lorentz(
             bundle.xn(s.sigma), bundle.yr(s.sigma),
             bundle.xr(s.sigma), bundle.yn(s.sigma),
             Gij, block_flat,
-            gammas[mu_L], gammas[nu_L])
+            *gamma_left[mu_L], *gamma_right[nu_L])
         contrib.block_until_ready()
         try:
             tr = float(jnp.einsum('kmm->', contrib).real)
