@@ -21,6 +21,7 @@ from typing import Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.experimental.shard_map import shard_map
 from jax.experimental import multihost_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -389,7 +390,10 @@ class _FfiBackend:
         # Enqueue dispatch onto the Python worker thread.  Main thread
         # returns in ~0.2ms; the worker thread calls ``sm(A, offset)``
         # in FIFO order.  The offset Buffer is tiny (ndim × 8 bytes).
-        offset_arr = jnp.asarray(off, dtype=jnp.int64)
+        offset_arr = jax.device_put(
+            np.asarray(off, dtype=np.int64),
+            NamedSharding(self.mesh, P()),
+        )
 
         def _task():
             tok = sm(A, offset_arr)
