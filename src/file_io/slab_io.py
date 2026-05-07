@@ -169,6 +169,9 @@ class SlabIO:
         """
         self._backend.write_attr(name, value)
 
+    # Padding contract for sharded producers: make ``A.shape`` divisible
+    # by the mesh, but pass ``valid_shape`` for the logical prefix that
+    # should reach disk.  The padded tail of ``A`` is ignored.
     def write_slab(
         self,
         name: str,
@@ -205,6 +208,9 @@ class SlabIO:
             dtype=dtype, chunks=chunks, k_chunk_size=k_chunk_size,
         )
 
+    # Padding contract for sharded consumers: request a mesh-divisible
+    # physical ``shape`` and pass smaller ``valid_shape`` for the file
+    # prefix to populate.  The returned padded tail is zero-filled.
     def read_slab(
         self,
         name: str,

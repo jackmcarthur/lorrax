@@ -278,6 +278,9 @@ static void async_worker(
 }
 
 // ---- Dispatch ------------------------------------------------------------
+// Padding contract: A.dimensions() is the equal-block physical shard.
+// valid_shape is the logical file prefix; ranks past that prefix write
+// an empty selection, and the last valid rank writes a clipped prefix.
 // NOTE on ``offset_base`` being a Buffer rather than an Attr: offset
 // changes per chunk (0, r, 2r, 3r for zeta) and FFI Attrs are baked
 // into the XLA compile at dispatch time, so a fresh compile is needed

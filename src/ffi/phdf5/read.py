@@ -92,6 +92,8 @@ def _register_and_open_dataset(fh: int, ds_name: str) -> int:
 # =============================================================================
 #  Low-level FFI call wrappers (one per handler)
 # =============================================================================
+# Low-level padding contract: out_struct is the physical equal-block
+# shard; valid_shape is the logical file prefix that C++ reads.
 def ffi_read_call(
     out_struct: jax.ShapeDtypeStruct,
     offset_base: jax.Array,

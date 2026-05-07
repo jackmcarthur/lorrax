@@ -150,6 +150,9 @@ static ffi::Error ReadImpl(
     return ffi::Error::Success();
 }
 
+// Padding contract: A_out dimensions are the equal-block physical
+// output shape. valid_shape is the logical file prefix to read; ranks
+// outside it get zeros, and edge ranks read clipped hyperslabs.
 static ffi::Error ReadDispatch(
     cudaStream_t stream,
     ffi::Buffer<ffi::DataType::S64> offset_buf,   // shape (ndim,)

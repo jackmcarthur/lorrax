@@ -29,6 +29,8 @@ __all__ = ["write_sharded_slab", "ffi_write_call"]
 _FFI_TARGET = "lorrax_phdf5_write"
 
 
+# Low-level padding contract: A_local is the physical equal-block shard;
+# valid_shape is the logical global slab prefix that C++ clips against.
 def ffi_write_call(
     A_local: jax.Array,
     offset_base: jax.Array,

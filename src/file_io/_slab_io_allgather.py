@@ -132,6 +132,8 @@ class _AllgatherBackend:
         _barrier(f"slab_io_write_attr/{name}")
 
     # ------------------------------------------------------------------
+    # Same padding contract as PHDF5: gather the physical padded slab,
+    # but rank 0 writes only the ``valid_shape`` prefix.
     def write_slab(
         self,
         name: str,
@@ -194,6 +196,8 @@ class _AllgatherBackend:
         _barrier(f"slab_io_write/{name}")
 
     # ------------------------------------------------------------------
+    # Read the logical ``valid_shape`` prefix and embed it into a
+    # zero-filled physical ``shape`` for padded sharded consumers.
     def read_slab(
         self,
         name: str,
