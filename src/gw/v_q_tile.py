@@ -69,13 +69,20 @@ from common.fft_helpers import make_sharded_fftn_3d
 # at the predicted 41 GB because stage (b) actually controls when n_rtot
 # >> n_G.  Take ``max(a, b)`` to size q_chunk.
 #
-# The FFT stage's overlap coefficient is env-tunable for A/B testing.  The
-# default 2.0 assumes the post-(reshape × phase) intermediate stays alive
-# alongside the FFT input; setting ``LORRAX_V_Q_FFT_COEF=1.0`` assumes XLA
-# fuses the phase multiply into the FFT input copy (no live overlap), which
-# roughly doubles the achievable q_chunk on systems where (b) dominates.
+# The FFT stage's overlap coefficient is env-tunable for A/B testing and
+# for distinct-ζ tile callers.  The default 5.0 reflects the cuFFT
+# workspace measured-but-not-cheaply-known footprint: input ζ slab + the
+# post-(reshape × phase) intermediate alive alongside the FFT scratch
+# (cuFFT plans for mixed-radix 75×75×200 typically allocate 2-3× the
+# input as scratch on top of the input + output buffers).
+# ``query_fft_peak_bytes`` in fft_helpers gives the AOT-exact value per
+# shape; we'd need to call it at chooser time, paying a ~1 s compile per
+# unique shape.  For now an over-conservative flat 5× covers same-ζ; the
+# ``_choose_v_q_chunks`` distinct-ζ path doubles this further (10×) since
+# both ζ_L_disk and ζ_R_disk are alive simultaneously at the kernel input
+# boundary.  Override with ``LORRAX_V_Q_FFT_COEF=<float>`` for A/B tests.
 _Q_COMPUTE_COEF_GATHER = 4.4
-_Q_COMPUTE_COEF_FFT = float(os.environ.get('LORRAX_V_Q_FFT_COEF', '2.0'))
+_Q_COMPUTE_COEF_FFT = float(os.environ.get('LORRAX_V_Q_FFT_COEF', '5.0'))
 
 
 def _choose_v_q_chunks(
@@ -87,6 +94,7 @@ def _choose_v_q_chunks(
     p_x: int,
     p_y: int,
     n_rtot: int | None = None,
+    same_zeta: bool = True,
 ) -> dict:
     """Pick (q_chunk, μ_chunk) per the memory model documented above.
 
@@ -113,9 +121,15 @@ def _choose_v_q_chunks(
 
     v_per_q_bytes = N_zeta * n_G  # sqrt_v(q+G) replicated per rank
 
+    # Distinct ζ_L vs ζ_R: both disk slabs alive simultaneously at the
+    # kernel input boundary, so the FFT-stage footprint doubles.  XLA can
+    # free one buffer as the FFT consumes it, but the peak before either
+    # FFT starts already has both buffers alive.
+    fft_coef = _Q_COMPUTE_COEF_FFT * (1.0 if same_zeta else 2.0)
+
     one_q_gather = _Q_COMPUTE_COEF_GATHER * N_zeta * n_rmu * n_G / p_min
     if n_rtot is not None and n_rtot > 0:
-        one_q_fft = _Q_COMPUTE_COEF_FFT * N_zeta * n_rmu * float(n_rtot) / p_prod
+        one_q_fft = fft_coef * N_zeta * n_rmu * float(n_rtot) / p_prod
     else:
         one_q_fft = 0.0
     one_q_bytes = max(one_q_gather, one_q_fft)
@@ -127,9 +141,11 @@ def _choose_v_q_chunks(
         mu_chunk_max_gather = int(
             (B_compute - v_per_q_bytes) * p_min / (2.0 * N_zeta * n_G))
         if n_rtot is not None and n_rtot > 0:
+            # Use the same same/distinct-aware coefficient for the tiled
+            # μ × ν Case B FFT-stage cap.
             mu_chunk_max_fft = int(
                 (B_compute - v_per_q_bytes) * p_prod /
-                (2.0 * N_zeta * float(n_rtot)))
+                (fft_coef * N_zeta * float(n_rtot)))
         else:
             mu_chunk_max_fft = mu_chunk_max_gather
         mu_chunk_max = max(1, min(mu_chunk_max_gather, mu_chunk_max_fft))
@@ -161,7 +177,7 @@ def _choose_v_q_chunks(
         n_mu_blocks = (int(n_rmu) + mu_chunk - 1) // mu_chunk
         peak_gather = 2.0 * N_zeta * mu_chunk * n_G / p_min
         if n_rtot is not None and n_rtot > 0:
-            peak_fft = 2.0 * N_zeta * mu_chunk * float(n_rtot) / p_prod
+            peak_fft = fft_coef * N_zeta * mu_chunk * float(n_rtot) / p_prod
         else:
             peak_fft = 0.0
         peak = max(peak_gather, peak_fft) + v_per_q_bytes + ref_bytes
@@ -535,10 +551,9 @@ def compute_V_q_tile(
         chooser_choice = _choose_v_q_chunks(
             n_rmu=max(n_rmu_L, n_rmu_R), n_G=n_G_sph, n_q_total=nq_total,
             budget_bytes=budget_bytes, p_x=p_x, p_y=p_y,
-            n_rtot=n_rtot,
+            n_rtot=n_rtot, same_zeta=same_zeta,
         )
 
-    tiled = bool(chooser_choice['tiled'])
     q_chunk = int(chooser_choice['q_chunk'])
     mu_chunk = int(chooser_choice['mu_chunk'])
     n_mu_blocks_L = int(chooser_choice.get('n_mu_blocks_L',
@@ -547,9 +562,8 @@ def compute_V_q_tile(
                                             chooser_choice['n_mu_blocks']))
 
     if verbose and jax.process_index() == 0:
-        kind = 'tiled (Case B)' if tiled else 'one-shot (Case A)'
         z_kind = 'same ζ' if same_zeta else 'distinct ζ_L/ζ_R'
-        print(f"  V_q tile: mesh={p_x}x{p_y}, {kind}, {z_kind}, "
+        print(f"  V_q tile: mesh={p_x}x{p_y}, {z_kind}, "
               f"q_chunk={q_chunk}, μ_chunk={mu_chunk} "
               f"({n_mu_blocks_L}×{n_mu_blocks_R} blocks), "
               f"aligned={chooser_choice.get('aligned', False)}, "
@@ -568,13 +582,19 @@ def compute_V_q_tile(
 
     wants_g0 = g0_acc is not None
     if g0_acc is None and same_zeta:
-        # Caller didn't pre-allocate but we'll let them know by allocating
-        # and returning — the head term defaults to "wanted" for V^{0,0}.
+        # Caller didn't pre-allocate but the head term defaults to "wanted"
+        # for V^{0,0}; allocate it.  Distinct-ζ off-diagonal callers pass
+        # ``g0_acc=None`` explicitly to opt out — they get a cheap dummy
+        # below (one alloc; reused across the whole tile loop).
         @partial(jax.jit, out_shardings=g0_sh_full)
         def _init_g0():
             return jnp.zeros((nq_total, n_rmu_L), dtype=jnp.complex128)
         g0_acc = _init_g0()
         wants_g0 = True
+    # Distinct-ζ off-diagonal tiles still need *some* g0 buffer flowing
+    # through the kernel signature (donate_argnums tracks position 1), so
+    # we allocate a single small dummy zero slab and reuse it across all
+    # iterations — XLA donates and returns the same buffer in-place.
     g0_work = g0_acc if wants_g0 else _make_g0_dummy(
         mesh_xy, nq_total, n_rmu_L)
 
