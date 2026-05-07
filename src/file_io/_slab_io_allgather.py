@@ -20,6 +20,8 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import multihost_utils
 
+from ._slab_io_ffi import _normalize_slab_request, _normalize_valid_shape
+
 
 def _rank0() -> bool:
     return jax.process_index() == 0
@@ -137,6 +139,7 @@ class _AllgatherBackend:
         *,
         offset: Sequence[int] | None = None,
         global_shape: Sequence[int] | None = None,
+        valid_shape: Sequence[int] | None = None,
         dtype=None,
         chunks: Sequence[int] | None = None,
         k_chunk_size: int | None = None,
@@ -147,13 +150,13 @@ class _AllgatherBackend:
         ``shape = global_shape`` (defaults to A.shape) and the caller's
         ``chunks`` / ``dtype``.
         """
-        local_shape = tuple(A.shape)
-        off = tuple(offset) if offset is not None else tuple([0] * len(local_shape))
-        gshape = tuple(global_shape) if global_shape is not None else local_shape
-        if len(off) != len(gshape) or len(off) != len(local_shape):
-            raise ValueError(
-                f"slab rank mismatch: offset {off}, "
-                f"global_shape {gshape}, local {local_shape}")
+        off, local_shape, gshape = _normalize_slab_request(
+            op="write_slab", name=name, offset=offset,
+            slab_shape=A.shape, global_shape=global_shape,
+            check_bounds=False)
+        vshape = _normalize_valid_shape(
+            op="write_slab", name=name, valid_shape=valid_shape,
+            slab_shape=local_shape, offset=off, global_shape=gshape)
 
         # Gather once; rank 0 then owns the full slab.
         host = _to_host(A)
@@ -167,26 +170,27 @@ class _AllgatherBackend:
                     chunks=tuple(chunks) if chunks else None,
                 )
             dset = self._file[name]
-            slicer = tuple(slice(o, o + s) for o, s in zip(off, local_shape))
-            if k_chunk_size and len(local_shape) >= 2 and local_shape[1] > k_chunk_size:
+            slicer = tuple(slice(o, o + s) for o, s in zip(off, vshape))
+            src_slicer = tuple(slice(0, s) for s in vshape)
+            if k_chunk_size and len(vshape) >= 2 and vshape[1] > k_chunk_size:
                 # Chunk along axis=1 (matches the legacy sigma k_chunk
                 # pattern, which streams the write to keep rank-0 memory
                 # sane for very large omega-dim).
                 k = k_chunk_size
-                for k0 in range(0, local_shape[1], k):
-                    k1 = min(k0 + k, local_shape[1])
+                for k0 in range(0, vshape[1], k):
+                    k1 = min(k0 + k, vshape[1])
                     sub = tuple(
-                        slice(off[i], off[i] + local_shape[i]) if i != 1
+                        slice(off[i], off[i] + vshape[i]) if i != 1
                         else slice(off[1] + k0, off[1] + k1)
                         for i in range(len(off))
                     )
                     idx_src = tuple(
-                        slice(None) if i != 1 else slice(k0, k1)
-                        for i in range(len(local_shape))
+                        slice(0, vshape[i]) if i != 1 else slice(k0, k1)
+                        for i in range(len(vshape))
                     )
                     dset[sub] = np.asarray(host[idx_src], dtype=dtype)
             else:
-                dset[slicer] = np.asarray(host, dtype=dtype)
+                dset[slicer] = np.asarray(host[src_slicer], dtype=dtype)
         _barrier(f"slab_io_write/{name}")
 
     # ------------------------------------------------------------------
@@ -197,6 +201,7 @@ class _AllgatherBackend:
         shape: Sequence[int] | None = None,
         dtype=None,
         offset: Sequence[int] | None = None,
+        valid_shape: Sequence[int] | None = None,
         mesh=None,
         as_numpy: bool = False,
         partition_spec=None,
@@ -226,10 +231,17 @@ class _AllgatherBackend:
             self._read_file = h5py.File(self.path, 'r')
         dset = self._read_file[name]
         full_shape = tuple(dset.shape) if shape is None else tuple(shape)
-        off = tuple(offset) if offset is not None else tuple([0] * len(full_shape))
-        slicer = tuple(slice(o, o + s) for o, s in zip(off, full_shape))
-        host = np.asarray(dset[slicer], dtype=dtype) if dtype \
-               else np.asarray(dset[slicer])
+        off, out_shape, _ = _normalize_slab_request(
+            op="read_slab", name=name, offset=offset,
+            slab_shape=full_shape, global_shape=None, check_bounds=False)
+        vshape = _normalize_valid_shape(
+            op="read_slab", name=name, valid_shape=valid_shape,
+            slab_shape=out_shape, offset=off, global_shape=None)
+        slicer = tuple(slice(o, o + s) for o, s in zip(off, vshape))
+        read_host = np.asarray(dset[slicer], dtype=dtype) if dtype \
+                    else np.asarray(dset[slicer])
+        host = np.zeros(out_shape, dtype=read_host.dtype)
+        host[tuple(slice(0, s) for s in vshape)] = read_host
         # Return-numpy fast path: skip the H2D+D2H round-trip that the
         # default jax.Array return forces — crucial for V_q which reads
         # many small hyperslabs straight into host numpy stacks.

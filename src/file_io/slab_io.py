@@ -29,9 +29,12 @@ Three primitives:
   SlabIO(...) as io: io.X(...)``.
 
 All methods accept an ``offset`` N-tuple giving where the local slab
-lands in the dataset.  ``global_shape`` defaults to ``A.shape`` for
-whole-dataset writes; pass it explicitly when writing a sub-slab of
-a larger dataset (e.g. one ω-batch of Σ_c(ω,k,i,j)).
+lands in the dataset.  ``valid_shape`` defaults to ``A.shape`` for
+ordinary writes; pass a smaller prefix when ``A`` is padded for even
+sharding but the padded tail should not be written. ``global_shape``
+defaults to ``A.shape`` for whole-dataset writes; pass it explicitly
+when writing a sub-slab of a larger dataset (e.g. one ω-batch of
+Σ_c(ω,k,i,j)).
 """
 from __future__ import annotations
 
@@ -173,6 +176,7 @@ class SlabIO:
         *,
         offset: Sequence[int] | None = None,
         global_shape: Sequence[int] | None = None,
+        valid_shape: Sequence[int] | None = None,
         dtype=None,
         chunks: Sequence[int] | None = None,
         k_chunk_size: int | None = None,
@@ -184,10 +188,10 @@ class SlabIO:
         FFI path; ignored on the allgather path (which gathers the
         whole thing to rank 0).
 
-        ``offset`` (default all zeros) + ``A.shape`` define the
-        hyperslab.  ``global_shape`` only matters at dataset creation
-        time; if the dataset already exists it's validated against
-        the file.
+        ``offset`` (default all zeros) + ``valid_shape`` define the
+        logical hyperslab.  ``valid_shape`` defaults to ``A.shape``;
+        pass a smaller prefix when the physical array is padded for
+        sharding but the padded tail should not be written.
 
         ``k_chunk_size`` is an allgather-backend-only knob that
         streams the rank-0 write along axis 1 to keep memory bounded
@@ -197,6 +201,7 @@ class SlabIO:
         self._backend.write_slab(
             name, A,
             offset=offset, global_shape=global_shape,
+            valid_shape=valid_shape,
             dtype=dtype, chunks=chunks, k_chunk_size=k_chunk_size,
         )
 
@@ -207,6 +212,7 @@ class SlabIO:
         shape: Sequence[int] | None = None,
         dtype=None,
         offset: Sequence[int] | None = None,
+        valid_shape: Sequence[int] | None = None,
         mesh=None,
         partition_spec=None,
         as_numpy: bool = False,
@@ -220,14 +226,21 @@ class SlabIO:
         trip).  On the FFI path, returns a sharded array with
         ``partition_spec`` on ``mesh`` (``as_numpy`` still forces a
         host ndarray via ``device_get``).
+
+        ``shape`` is the physical output shape and may include padding.
+        ``valid_shape`` is the logical file extent to read into the
+        prefix of that output; padded tail elements are zero-filled.
+        Defaults to ``shape``.
         """
         if self.use_ffi_io:
             arr = self._backend.read_slab(
                 name, shape=shape, dtype=dtype, offset=offset,
+                valid_shape=valid_shape,
                 mesh=mesh or self.mesh, partition_spec=partition_spec)
         else:
             arr = self._backend.read_slab(
                 name, shape=shape, dtype=dtype, offset=offset,
+                valid_shape=valid_shape,
                 mesh=mesh, as_numpy=as_numpy,
                 partition_spec=partition_spec)
         if as_numpy and not isinstance(arr, np.ndarray):
@@ -262,6 +275,7 @@ def write_slab(
     *,
     offset: Sequence[int] | None = None,
     global_shape: Sequence[int] | None = None,
+    valid_shape: Sequence[int] | None = None,
     mesh=None,
     mode: str = "a",
     chunks: Sequence[int] | None = None,
@@ -277,7 +291,9 @@ def write_slab(
         io.create_dataset(
             ds_name, shape=gshape, dtype=A.dtype,
             chunks=chunks, attrs=attrs)
-        io.write_slab(ds_name, A, offset=offset, global_shape=gshape)
+        io.write_slab(
+            ds_name, A, offset=offset, global_shape=gshape,
+            valid_shape=valid_shape)
 
 
 def read_slab(
@@ -287,6 +303,7 @@ def read_slab(
     shape: Sequence[int] | None = None,
     dtype=None,
     offset: Sequence[int] | None = None,
+    valid_shape: Sequence[int] | None = None,
     mesh=None,
     partition_spec=None,
     backend=None,
@@ -297,6 +314,7 @@ def read_slab(
                 backend=backend, use_ffi_io=use_ffi_io) as io:
         return io.read_slab(
             ds_name, shape=shape, dtype=dtype, offset=offset,
+            valid_shape=valid_shape,
             mesh=mesh, partition_spec=partition_spec)
 
 

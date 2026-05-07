@@ -59,12 +59,13 @@ static ffi::Error ReadImpl(
     PhdfCtx* ctx,
     T* d_dst,
     const std::vector<hsize_t>& offset,
-    const std::vector<hsize_t>& count,
+    const std::vector<hsize_t>& file_count,
+    const std::vector<hsize_t>& mem_dims,
     hid_t ds_id)
 {
     const int rank = (int)offset.size();
     size_t n_local_elts = 1;
-    for (auto c : count) n_local_elts *= (size_t)c;
+    for (auto c : mem_dims) n_local_elts *= (size_t)c;
     const size_t bytes = n_local_elts * sizeof(T);
 
     if (!ensure_pinned(ctx, bytes)) {
@@ -72,6 +73,7 @@ static ffi::Error ReadImpl(
         os << "phdf5 read: cudaMallocHost(" << bytes << ") failed";
         return ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str());
     }
+    std::memset(ctx->pinned_buf, 0, bytes);
 
     hid_t dset = ds_id;
     hid_t native_type = dt::h5_native_type<T>();
@@ -85,18 +87,40 @@ static ffi::Error ReadImpl(
         return ffi::Error(ffi::ErrorCode::kInternal,
                           "phdf5 read: H5Dget_space failed");
     }
-    if (H5Sselect_hyperslab(filespace, H5S_SELECT_SET,
-                             offset.data(), nullptr,
-                             count.data(),  nullptr) < 0) {
-        H5Sclose(filespace);
-        return ffi::Error(ffi::ErrorCode::kInternal,
-                          "phdf5 read: H5Sselect_hyperslab failed");
-    }
-    hid_t memspace = H5Screate_simple(rank, count.data(), nullptr);
+    hid_t memspace = H5Screate_simple(rank, mem_dims.data(), nullptr);
     if (memspace < 0) {
         H5Sclose(filespace);
         return ffi::Error(ffi::ErrorCode::kInternal,
                           "phdf5 read: H5Screate_simple(memspace) failed");
+    }
+    bool empty_selection = false;
+    for (auto c : file_count) {
+        if (c == 0) empty_selection = true;
+    }
+    if (empty_selection) {
+        if (H5Sselect_none(filespace) < 0 || H5Sselect_none(memspace) < 0) {
+            H5Sclose(memspace);
+            H5Sclose(filespace);
+            return ffi::Error(ffi::ErrorCode::kInternal,
+                              "phdf5 read: H5Sselect_none failed");
+        }
+    } else if (H5Sselect_hyperslab(filespace, H5S_SELECT_SET,
+                             offset.data(), nullptr,
+                             file_count.data(),  nullptr) < 0) {
+        H5Sclose(memspace);
+        H5Sclose(filespace);
+        return ffi::Error(ffi::ErrorCode::kInternal,
+                          "phdf5 read: H5Sselect_hyperslab failed");
+    } else {
+        std::vector<hsize_t> mem_start((size_t)rank, 0);
+        if (H5Sselect_hyperslab(memspace, H5S_SELECT_SET,
+                                mem_start.data(), nullptr,
+                                file_count.data(), nullptr) < 0) {
+            H5Sclose(memspace);
+            H5Sclose(filespace);
+            return ffi::Error(ffi::ErrorCode::kInternal,
+                              "phdf5 read: H5Sselect_hyperslab(mem) failed");
+        }
     }
 
     hid_t dxpl = ctx->use_collective_read ? ctx->dxpl_coll : ctx->dxpl_indep;
@@ -129,6 +153,7 @@ static ffi::Error ReadImpl(
 static ffi::Error ReadDispatch(
     cudaStream_t stream,
     ffi::Buffer<ffi::DataType::S64> offset_buf,   // shape (ndim,)
+    ffi::Buffer<ffi::DataType::S64> valid_shape_buf, // shape (ndim,)
     ffi::Result<ffi::AnyBuffer> A_out,
     int64_t ctx_handle,
     int64_t ds_id,
@@ -146,10 +171,13 @@ static ffi::Error ReadDispatch(
     const size_t N = dims.size();
     if (offset_buf.dimensions().size() != 1 ||
         (size_t)offset_buf.dimensions()[0] != N ||
+        valid_shape_buf.dimensions().size() != 1 ||
+        (size_t)valid_shape_buf.dimensions()[0] != N ||
         axis_count_per_dim.size() != N) {
         std::ostringstream os;
         os << "phdf5 read: rank mismatch  A.ndim=" << N
            << " offset_buf.ndim=" << offset_buf.dimensions().size()
+           << " valid_shape_buf.ndim=" << valid_shape_buf.dimensions().size()
            << " axis_count_per_dim.size=" << axis_count_per_dim.size();
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
     }
@@ -164,12 +192,30 @@ static ffi::Error ReadDispatch(
            << cudaGetErrorString(ce_off);
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
+    std::vector<int64_t> valid_shape_host(N);
+    cudaError_t ce_valid = cudaMemcpy(valid_shape_host.data(),
+                                      valid_shape_buf.untyped_data(),
+                                      N * sizeof(int64_t),
+                                      cudaMemcpyDeviceToHost);
+    if (ce_valid != cudaSuccess) {
+        std::ostringstream os;
+        os << "phdf5 read: cudaMemcpy(valid_shape) failed: "
+           << cudaGetErrorString(ce_valid);
+        return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+    }
 
     std::vector<int64_t> coord = unravel_rank(ctx->rank, mesh_shape);
-    std::vector<hsize_t> offset(N), count(N);
+    std::vector<hsize_t> offset(N), file_count(N), mem_dims(N);
     size_t flat_idx = 0;
     for (size_t d = 0; d < N; ++d) {
-        count[d] = (hsize_t)dims[d];
+        if (offset_host[d] < 0 || valid_shape_host[d] < 0) {
+            std::ostringstream os;
+            os << "phdf5 read: negative offset/valid_shape at dim " << d
+               << " offset=" << offset_host[d]
+               << " valid_shape=" << valid_shape_host[d];
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+        }
+        mem_dims[d] = (hsize_t)dims[d];
         offset[d] = (hsize_t)offset_host[d];
         int64_t na = axis_count_per_dim[d];
         int64_t rank_coord = 0;
@@ -185,7 +231,15 @@ static ffi::Error ReadDispatch(
             rank_coord += coord[ax] * stride_acc;
             stride_acc *= mesh_shape[ax];
         }
-        offset[d] += rank_coord * count[d];
+        int64_t local_start = rank_coord * (int64_t)mem_dims[d];
+        if (local_start >= valid_shape_host[d]) {
+            file_count[d] = 0;
+        } else {
+            int64_t remaining = valid_shape_host[d] - local_start;
+            file_count[d] = (hsize_t)(
+                remaining < (int64_t)mem_dims[d] ? remaining : (int64_t)mem_dims[d]);
+        }
+        offset[d] += (hsize_t)local_start;
         flat_idx += (size_t)na;
     }
 
@@ -194,27 +248,27 @@ static ffi::Error ReadDispatch(
         case ffi::DataType::F32:
             return ReadImpl<float>(stream, ctx,
                 static_cast<float*>(A_out->untyped_data()),
-                offset, count, (hid_t)ds_id);
+                offset, file_count, mem_dims, (hid_t)ds_id);
         case ffi::DataType::F64:
             return ReadImpl<double>(stream, ctx,
                 static_cast<double*>(A_out->untyped_data()),
-                offset, count, (hid_t)ds_id);
+                offset, file_count, mem_dims, (hid_t)ds_id);
         case ffi::DataType::S32:
             return ReadImpl<int32_t>(stream, ctx,
                 static_cast<int32_t*>(A_out->untyped_data()),
-                offset, count, (hid_t)ds_id);
+                offset, file_count, mem_dims, (hid_t)ds_id);
         case ffi::DataType::S64:
             return ReadImpl<int64_t>(stream, ctx,
                 static_cast<int64_t*>(A_out->untyped_data()),
-                offset, count, (hid_t)ds_id);
+                offset, file_count, mem_dims, (hid_t)ds_id);
         case ffi::DataType::C64:
             return ReadImpl<std::complex<float>>(stream, ctx,
                 static_cast<std::complex<float>*>(A_out->untyped_data()),
-                offset, count, (hid_t)ds_id);
+                offset, file_count, mem_dims, (hid_t)ds_id);
         case ffi::DataType::C128:
             return ReadImpl<std::complex<double>>(stream, ctx,
                 static_cast<std::complex<double>*>(A_out->untyped_data()),
-                offset, count, (hid_t)ds_id);
+                offset, file_count, mem_dims, (hid_t)ds_id);
         default: {
             std::ostringstream os;
             os << "phdf5 read: unsupported dtype " << static_cast<int>(dtype);
@@ -906,6 +960,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     PhdfReadFfi, lorrax_ffi::phdf5::ReadDispatch,
     xla::ffi::Ffi::Bind()
         .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()
         .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()
         .Ret<xla::ffi::AnyBuffer>()
         .Attr<int64_t>("ctx_handle")
