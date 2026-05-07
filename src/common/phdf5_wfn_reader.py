@@ -24,6 +24,7 @@ Usage
         psi_G = wfn.coeffs_gspace(band_range=(0, 80))              # all full-BZ k
         psi_G = wfn.coeffs_gspace(band_range=(0, 80),
                                   k_ids=[5, 12, 0, 3])              # subset
+        psi_G4 = wfn.coeffs_gspace(band_range=(0, 80), bispinor=True)
 """
 from __future__ import annotations
 
@@ -87,6 +88,7 @@ class PhdfWfnReader:
         band_range: tuple[int, int],
         *,
         k_ids: Sequence[int] | None = None,
+        bispinor: bool = False,
     ) -> jax.Array:
         """G-space FFT box for one band chunk, at a set of full-BZ k-points.
 
@@ -102,6 +104,11 @@ class PhdfWfnReader:
         the relevant symmetry unfold (``U_spinor × τ-phase × optional
         TR conjugation``) on device.  k_ids may be in any order — the
         output k axis is returned in the caller's requested order.
+
+        When ``bispinor=True`` and the WFN file stores two spinor
+        components, the reader appends the two small components on the
+        FFT box after the PHDF5 read using the same
+        ``(alpha/2) sigma.(k+G)`` formula as the legacy path.
         """
         b_lo, b_hi = band_range
         nb = b_hi - b_lo
@@ -113,7 +120,8 @@ class PhdfWfnReader:
 
         # Common path: file holds every requested band.
         if b_hi <= self.nbands:
-            return self._coeffs_gspace_aligned(b_lo, b_hi, k_ids)
+            psi_G = self._coeffs_gspace_aligned(b_lo, b_hi, k_ids)
+            return self._maybe_expand_bispinor(psi_G, k_ids, bispinor)
 
         # File-short path: pad target exceeds wfn.nbands.  Split the
         # request into a fast collective bulk read of the largest
@@ -124,8 +132,9 @@ class PhdfWfnReader:
         # resharded to the canonical layout.
         n_in_file = max(0, int(self.nbands) - int(b_lo))
         n_aligned = (n_in_file // self._world_size) * self._world_size
-        return self._coeffs_gspace_with_short_tail(
+        psi_G = self._coeffs_gspace_with_short_tail(
             b_lo, b_hi, n_aligned, k_ids)
+        return self._maybe_expand_bispinor(psi_G, k_ids, bispinor)
 
     def _coeffs_gspace_aligned(
         self,
@@ -140,21 +149,8 @@ class PhdfWfnReader:
         nb = b_hi - b_lo
         bands_per_rank = nb // self._world_size
 
-        k_ids = (np.arange(self.nk_full, dtype=np.int32) if k_ids is None
-                 else np.asarray(k_ids, dtype=np.int32))
+        k_ids, ibz_file_sorted, position_in_reads = self._k_read_order(k_ids)
         n_k = len(k_ids)
-
-        # Which IBZ k-points do we need to read?  Dedupe and sort by
-        # file offset (the ascending-file-offset sort is required by
-        # H5S_SELECT_OR; see read_kchunk_union_sharded docstring).
-        ibz_per_id = self._ibz_per_full_k[k_ids]
-        unique_ibz, ibz_inv = np.unique(ibz_per_id, return_inverse=True)
-        file_order = np.argsort(
-            self.kpt_starts[unique_ibz], kind="stable").astype(np.int32)
-        ibz_file_sorted = unique_ibz[file_order]
-        # Position of each k_id in ibz_file_sorted.
-        position_in_reads = np.argsort(file_order, kind="stable")[ibz_inv]
-        position_in_reads = position_in_reads.astype(np.int32)
 
         # Read unique IBZ k slabs.
         offsets, counts = self._hyperslab_table(
@@ -167,13 +163,13 @@ class PhdfWfnReader:
         k_ids_dev = jax.device_put(jnp.asarray(k_ids), self._rep1d)
 
         # Unfold to full-BZ: expand along k axis + τ phase + U_spinor +
-        # optional TR conjugation, all on device.  Skipped entirely for
-        # nosym files (ntran == 1), where file-k == full-BZ-k,
-        # ``position_in_reads`` is identity, U is identity, phase is 1,
-        # and no TR conjugation applies — all of which the ``fft_box``
-        # kernel handles directly from the union-read output.
+        # optional TR conjugation, all on device.  For nosym files
+        # (ntran == 1), file-k == full-BZ-k and no phase/rotation/TR is
+        # needed, but the union read is still in ascending file-offset
+        # order.  Reorder/duplicate its k axis to match the caller's
+        # requested k_ids before pairing with g_index_for_ids.
         if self.ntran == 1:
-            cnk_at_full = cnk_at_ibz
+            cnk_at_full = jnp.take(cnk_at_ibz, position_in_reads, axis=2)
         else:
             U_k, phase_k, tr_mask_k = self._sym_tables_for_ids(k_ids_dev)
             cnk_at_full = self._unfold_kernel(n_reads, n_k, bands_per_rank)(
@@ -266,16 +262,7 @@ class PhdfWfnReader:
 
         # Mirror the bulk path's IBZ-k dedup so the unfold inputs share
         # the same layout as the sharded ``_make_unfold_kernel`` body.
-        # For nosym files this just decays to the identity (n_reads =
-        # n_k, position_in_reads = identity, U = I, phase = 1, tr_mask
-        # all False).
-        ibz_per_id = self._ibz_per_full_k[k_ids]
-        unique_ibz, ibz_inv = np.unique(ibz_per_id, return_inverse=True)
-        file_order = np.argsort(
-            self.kpt_starts[unique_ibz], kind="stable").astype(np.int32)
-        ibz_file_sorted = unique_ibz[file_order]
-        position_in_reads = np.argsort(
-            file_order, kind="stable")[ibz_inv].astype(np.int32)
+        k_ids, ibz_file_sorted, position_in_reads = self._k_read_order(k_ids)
         n_reads = int(len(ibz_file_sorted))
 
         # Read each unique IBZ k's tail bands via h5py.  All ranks read
@@ -399,6 +386,8 @@ class PhdfWfnReader:
         )
         self._sym = SymMaps(wfn_stub)
         self.nk_full = int(self._sym.nk_tot)
+        self._kpoints_full = np.asarray(
+            self._sym.unfolded_kpts, dtype=np.float64)
 
         self._ibz_per_full_k = np.asarray(
             self._sym.irk_to_k_map, dtype=np.int32)
@@ -459,6 +448,21 @@ class PhdfWfnReader:
             jnp.asarray(self._phase_per_full_k), phase_sharding)
         self._tr_mask_dev = jax.device_put(
             jnp.asarray(self._tr_mask_per_full_k), tr_sharding)
+        self._kpoints_full_dev = jax.device_put(
+            jnp.asarray(self._kpoints_full), self._rep2d)
+        self._bvec_dev = jax.device_put(
+            jnp.asarray(self.bvec), self._rep2d)
+        self._g_fft_frac_dev = jax.device_put(
+            jnp.asarray(self._build_fft_g_fractional_grid()), self._rep4d)
+
+    def _build_fft_g_fractional_grid(self) -> np.ndarray:
+        """Integer reciprocal coordinates for every FFT-box cell."""
+        axes = [
+            np.rint(np.fft.fftfreq(int(n)) * int(n)).astype(np.float64)
+            for n in self.fft_grid
+        ]
+        gx, gy, gz = np.meshgrid(*axes, indexing="ij")
+        return np.stack([gx, gy, gz], axis=-1)
 
     def _build_g_index(self) -> np.ndarray:
         """``g_index[nk_full, nx, ny, nz]`` mapping each FFT-box cell to
@@ -499,6 +503,41 @@ class PhdfWfnReader:
     # =====================================================================
     #  Per-call helpers
     # =====================================================================
+    def _k_read_order(
+        self, k_ids: Sequence[int] | None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Map requested full-BZ k IDs to sorted unique IBZ file reads.
+
+        Returns ``(k_ids, ibz_file_sorted, position_in_reads)`` where
+        ``position_in_reads[i]`` is the slab in ``ibz_file_sorted`` that
+        serves ``k_ids[i]``.  PHDF5 union reads must visit file windows
+        in ascending packed-G order; downstream unfold/gather code uses
+        ``position_in_reads`` to restore the caller's requested order and
+        to duplicate slabs when several full-BZ k-points share one IBZ
+        file k-point.
+        """
+        if k_ids is None:
+            k_ids_arr = np.arange(self.nk_full, dtype=np.int32)
+        else:
+            k_ids_arr = np.asarray(k_ids, dtype=np.int32)
+        if k_ids_arr.ndim != 1:
+            raise ValueError("k_ids must be a 1-D sequence of full-BZ indices")
+        if k_ids_arr.size == 0:
+            raise ValueError("k_ids must contain at least one k-point")
+        if np.any((k_ids_arr < 0) | (k_ids_arr >= self.nk_full)):
+            raise ValueError(
+                f"k_ids must lie in [0, {self.nk_full}); got "
+                f"min={int(k_ids_arr.min())} max={int(k_ids_arr.max())}")
+
+        ibz_per_id = self._ibz_per_full_k[k_ids_arr]
+        unique_ibz, ibz_inv = np.unique(ibz_per_id, return_inverse=True)
+        file_order = np.argsort(
+            self.kpt_starts[unique_ibz], kind="stable").astype(np.int32)
+        ibz_file_sorted = unique_ibz[file_order].astype(np.int32)
+        position_in_reads = np.argsort(
+            file_order, kind="stable")[ibz_inv].astype(np.int32)
+        return k_ids_arr, ibz_file_sorted, position_in_reads
+
     def _hyperslab_table(
         self, b_lo: int, bands_per_rank: int, ibz_file_sorted: np.ndarray,
     ) -> tuple[jax.Array, jax.Array]:
@@ -530,6 +569,23 @@ class PhdfWfnReader:
             jnp.take(self._phase_dev,   k_ids_dev, axis=0),
             jnp.take(self._tr_mask_dev, k_ids_dev, axis=0),
         )
+
+    def _maybe_expand_bispinor(
+        self,
+        psi_G: jax.Array,
+        k_ids: Sequence[int] | None,
+        bispinor: bool,
+    ) -> jax.Array:
+        if not bispinor:
+            return psi_G
+        if self.nspinor != 2:
+            raise ValueError(
+                "PHDF5 bispinor expansion requires a two-spinor WFN file; "
+                f"got nspinor={self.nspinor}")
+        k_ids_arr, _, _ = self._k_read_order(k_ids)
+        k_ids_dev = jax.device_put(jnp.asarray(k_ids_arr), self._rep1d)
+        kvecs_dev = jnp.take(self._kpoints_full_dev, k_ids_dev, axis=0)
+        return self._bispinor_fftbox_kernel(len(k_ids_arr))(psi_G, kvecs_dev)
 
     # =====================================================================
     #  Jitted-callable cache
@@ -575,6 +631,37 @@ class PhdfWfnReader:
             nspinor=self.nspinor,
             fft_grid=self.fft_grid,
         )
+
+    @lru_cache(maxsize=16)
+    def _bispinor_fftbox_kernel(self, n_k: int):
+        final_shard = NamedSharding(
+            self.mesh, P(None, ('x', 'y'), None, None, None, None))
+        g_frac = self._g_fft_frac_dev
+        bvec = self._bvec_dev
+
+        @jax.jit
+        def _expand(psi_G, kvecs):
+            # p_cart[k, x, y, z, :] = (G + k)_crystal @ bvec.
+            p_frac = g_frac[None, :, :, :, :] + kvecs[:, None, None, None, :]
+            p_cart = jnp.einsum("kxyzc,cd->kxyzd", p_frac, bvec)
+            px = p_cart[..., 0]
+            py = p_cart[..., 1]
+            pz = p_cart[..., 2]
+
+            up = psi_G[:, :, 0, :, :, :]
+            dn = psi_G[:, :, 1, :, :, :]
+            halfalpha = jnp.complex128(0.00364867628215)
+            small0 = halfalpha * (
+                pz[:, None, :, :, :] * up
+                + (px - 1j * py)[:, None, :, :, :] * dn)
+            small1 = halfalpha * (
+                (px + 1j * py)[:, None, :, :, :] * up
+                - pz[:, None, :, :, :] * dn)
+            small = jnp.stack([small0, small1], axis=2)
+            out = jnp.concatenate([psi_G, small], axis=2)
+            return jax.lax.with_sharding_constraint(out, final_shard)
+
+        return _expand
 
 
 # =============================================================================

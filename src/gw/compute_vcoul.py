@@ -1351,6 +1351,7 @@ def _choose_v_q_chunks(
     budget_bytes: float,
     p_x: int,
     p_y: int,
+    n_rtot: int | None = None,
 ) -> dict:
     """Pick (q_chunk, μ_chunk) per the memory model documented above.
 
@@ -1382,23 +1383,49 @@ def _choose_v_q_chunks(
     # sqrt_v(q+G) table lives replicated on each rank.
     v_per_q_bytes = N_zeta * n_G
 
-    # Per-q compute footprint: nominally (two gathered ζ copies +
-    # workspace) = 3 × μ × G / P_min.  Empirical AOT measurement
-    # across (MoS2, Si 10³) × (4, 8, 16, 28, 35 GB) showed a consistent
-    # 1.45× under-prediction — the FFT+gather pipeline holds additional
-    # XLA-scheduled transients we can't enumerate without HLO.  Bumping
-    # the coefficient to 4.4× matches AOT peak to within ~5%.
-    Q_COMPUTE_COEF = 4.4
-    # Case A check: can we hold *one* q's worth of gathered μ×G?
-    one_q_bytes = Q_COMPUTE_COEF * N_zeta * n_rmu * n_G / p_min
+    # Per-q compute footprint has TWO stages with different working axes:
+    #
+    #   (a) Gathered/post-sphere stage: tensor (Q, μ, n_G) sharded on
+    #       one mesh axis (P_min) after the with_sharding_constraint
+    #       gather.  Empirically calibrated 4.4× transient on
+    #       (MoS2, Si 10³); see git log for AOT measurements.
+    #
+    #   (b) FFT stage: tensor (Q, μ, n_rtot) sharded on P_prod (μ on
+    #       ('x','y')).  Input ζ from disk and the post-``* phase``
+    #       intermediate are alive simultaneously → 2× overlap before
+    #       the FFT writes its output.  When n_rtot >> n_G (CrI3:
+    #       n_rtot/n_G ≈ 18×, vs MoS2/Si: ~5–8×) this stage dominates.
+    #
+    # Pre-2026-05-06 the chooser only modeled (a); CrI3 4×4×6 with
+    # μ=1500, n_rtot=1.125M ran into 78 GB OOM at predicted-41 GB.
+    # Take max(a, b) so whichever is dominant on this system controls
+    # q_chunk.
+    Q_COMPUTE_COEF_GATHER = 4.4
+    Q_COMPUTE_COEF_FFT = 2.0  # input ζ + post-(× phase) intermediate
+    one_q_gather = Q_COMPUTE_COEF_GATHER * N_zeta * n_rmu * n_G / p_min
+    if n_rtot is not None and n_rtot > 0:
+        one_q_fft = Q_COMPUTE_COEF_FFT * N_zeta * n_rmu * float(n_rtot) / p_prod
+    else:
+        one_q_fft = 0.0
+    one_q_bytes = max(one_q_gather, one_q_fft)
+    # Case A check: can we hold *one* q's worth (whichever stage dominates)?
     slack_after_one_q = B_compute - (one_q_bytes + v_per_q_bytes)
     if slack_after_one_q < 0:
         # Case B — single q, tile μ×ν.
         # Two concurrent gathered slabs of (μ_chunk × N_G) plus a small
-        # contract workspace:  2·N_zeta·μ_chunk·N_G / p_min ≤ B_compute − v_per_q
-        mu_chunk_max = max(
-            1, int((B_compute - v_per_q_bytes) * p_min /
-                   (2.0 * N_zeta * n_G)))
+        # contract workspace:  2·N_zeta·μ_chunk·N_G / p_min ≤ B_compute − v_per_q.
+        # Also bound by the FFT stage on (μ_chunk × n_rtot) sharded P_prod,
+        # with the same 2× input/intermediate overlap as Case A.  Take the
+        # tighter of the two μ_chunk caps so whichever stage dominates wins.
+        mu_chunk_max_gather = int(
+            (B_compute - v_per_q_bytes) * p_min / (2.0 * N_zeta * n_G))
+        if n_rtot is not None and n_rtot > 0:
+            mu_chunk_max_fft = int(
+                (B_compute - v_per_q_bytes) * p_prod /
+                (2.0 * N_zeta * float(n_rtot)))
+        else:
+            mu_chunk_max_fft = mu_chunk_max_gather
+        mu_chunk_max = max(1, min(mu_chunk_max_gather, mu_chunk_max_fft))
         mu_chunk_max = min(int(n_rmu), int(mu_chunk_max))
 
         # CONSERVATIVE CHOICE of μ_chunk — must simultaneously satisfy:
@@ -1434,7 +1461,12 @@ def _choose_v_q_chunks(
             mu_chunk = max(snap, mu_chunk_max - (mu_chunk_max % snap))
 
         n_mu_blocks = (int(n_rmu) + mu_chunk - 1) // mu_chunk
-        peak = 2.0 * N_zeta * mu_chunk * n_G / p_min + v_per_q_bytes + ref_bytes
+        peak_gather = 2.0 * N_zeta * mu_chunk * n_G / p_min
+        if n_rtot is not None and n_rtot > 0:
+            peak_fft = 2.0 * N_zeta * mu_chunk * float(n_rtot) / p_prod
+        else:
+            peak_fft = 0.0
+        peak = max(peak_gather, peak_fft) + v_per_q_bytes + ref_bytes
         return dict(
             q_chunk=1, mu_chunk=int(mu_chunk), n_mu_blocks=int(n_mu_blocks),
             tiled=True, aligned=aligned,
@@ -1814,9 +1846,11 @@ def _compute_all_V_q_sharded(
 
     if budget_bytes is None:
         budget_bytes = 24.0e9
+    n_rtot_chooser = int(fft_grid[0]) * int(fft_grid[1]) * int(fft_grid[2])
     choice = _choose_v_q_chunks(
         n_rmu=n_rmu, n_G=n_G_sph, n_q_total=nq_total,
         budget_bytes=budget_bytes, p_x=p_x, p_y=p_y,
+        n_rtot=n_rtot_chooser,
     )
     # Debug knob: force Case B at a caller-specified μ-chunk so the tile
     # path can be exercised on systems that otherwise land in Case A.

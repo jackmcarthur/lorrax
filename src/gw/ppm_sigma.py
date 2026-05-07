@@ -1199,11 +1199,15 @@ def _build_windows_for_branch(
     if omega_nonneg_ry.size == 0:
         return []
 
+    print(f"  [DBG-PPM-WIN] {log_tag} pre E_A allgather rank={jax.process_index()}", flush=True)
     E_A_host = _to_host_np(E_A, dtype=np.float64, tiled=False)
+    print(f"  [DBG-PPM-WIN] {log_tag} post E_A shape={E_A_host.shape} rank={jax.process_index()}", flush=True)
     base_A_host = _to_host_np(base_mask_A, dtype=bool, tiled=False)
+    print(f"  [DBG-PPM-WIN] {log_tag} post base_A shape={base_A_host.shape} rank={jax.process_index()}", flush=True)
 
     _, mask_B_all_count, mask_B_all_min, mask_B_all_max = _masked_stats_device(
         Omega_q, base_mask_B)
+    print(f"  [DBG-PPM-WIN] {log_tag} post masked_stats rank={jax.process_index()}", flush=True)
 
     omega_max = float(np.max(omega_nonneg_ry))
     if kernel_sign == +1 and omega_max > 1.0e-14:
@@ -1435,11 +1439,13 @@ def _run_sigma_branch(
     if not windows:
         return jnp.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), []
 
+    print(f"  [DBG-PPM] _run_sigma_branch[{log_tag}] post-windows nwin={len(windows)} rank={jax.process_index()}", flush=True)
     omega_vec = jnp.asarray(omega_nonneg_ry, dtype=jnp.float64)
     tau_kernel = _get_sigma_tau_kernel(
         mesh_xy=mesh_xy,
         kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
     )
+    print(f"  [DBG-PPM] _run_sigma_branch[{log_tag}] tau_kernel ready rank={jax.process_index()}", flush=True)
 
     if stream_writer is None:
         # Σ_c(ω,k,m,n) lives as per-rank numpy tiles matching σ(τ)'s
@@ -1578,6 +1584,7 @@ def compute_sigma_c_ppm_omega_grid(
             f"({100.0 * n_invalid / max(n_total_modes, 1):.2f}%)"
         )
 
+    print_fn(f"  [DBG-PPM] post-print rank={jax.process_index()}/{jax.process_count()}", flush=True) if False else print(f"  [DBG-PPM] post-print rank={jax.process_index()}/{jax.process_count()}", flush=True)
     # Decide accumulation mode + allocate any backing storage.
     nk_proj = int(psi_proj_xr.shape[0])
     nb_proj = int(psi_proj_xr.shape[1])
@@ -1662,7 +1669,9 @@ def compute_sigma_c_ppm_omega_grid(
         # Sum cond+val per ω-half before gathering to host.  Preserves the
         # original traversal order so reduction ordering stays bit-identical.
         per_half: dict[tuple, jax.Array] = {}
-        for br in branches:
+        print(f"  [DBG-PPM] entering branches loop, n={len(branches)} rank={jax.process_index()}", flush=True)
+        for _bi, br in enumerate(branches):
+            print(f"  [DBG-PPM] branch {_bi} {br.tag} start rank={jax.process_index()}", flush=True)
             sigma_kij, _ = _run_sigma_branch(
                 omega_nonneg_ry=br.omega_abs, omega_global_idx=br.omega_idx,
                 E_A=br.E_A, base_mask_A=br.base_mask_A,

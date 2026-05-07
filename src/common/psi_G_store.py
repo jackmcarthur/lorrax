@@ -33,6 +33,7 @@ sole caller.
 from __future__ import annotations
 
 from functools import partial
+import os
 from typing import Literal
 
 import numpy as np
@@ -286,23 +287,23 @@ class RereadPsiGStore(PsiGStore):
 def build_psi_G_store(
     *,
     wfn,
+    sym,
     mesh_xy: Mesh,
     meta,
     band_chunk_ranges,
+    bispinor: bool = False,
     mode: Literal["host_cache", "file_reread"] = "host_cache",
 ) -> PsiGStore:
     """Construct the ψ(G) store matching ``mode``.
 
-    Both modes drive their phdf5 reads through
-    :class:`common.phdf5_wfn_reader.PhdfWfnReader` — the only difference
-    is whether the host tiles stay resident between r-chunks.
+    The normal multi-GPU path drives reads through
+    :class:`common.phdf5_wfn_reader.PhdfWfnReader`.  CPU runs cannot use
+    that CUDA-only FFI reader, and small developer environments may not
+    have its native dependencies loaded, so ``host_cache`` falls back to
+    the canonical h5py ``WFNReader`` path when PHDF5 is unavailable.
     """
-    from common.load_wfns import _get_phdf5_reader
-    wfn_path = getattr(wfn, "_filename", None)
-    if wfn_path is None:
-        raise ValueError(
-            "ψ(G) stores require a phdf5-backed wfn; wfn._filename is unset")
-    reader = _get_phdf5_reader(wfn_path, mesh_xy)
+    reader = _build_gspace_reader(
+        wfn=wfn, sym=sym, meta=meta, mesh_xy=mesh_xy, bispinor=bispinor)
     if mode == "host_cache":
         return HostPsiGStore(
             reader=reader, mesh_xy=mesh_xy,
@@ -313,3 +314,85 @@ def build_psi_G_store(
             band_chunk_ranges=band_chunk_ranges, meta=meta)
     raise ValueError(
         f"ψ(G) store mode must be 'host_cache' or 'file_reread', got {mode!r}")
+
+
+class _LegacyGspaceReader:
+    """Adapter exposing ``coeffs_gspace`` via ``read_Gvecs_to_devices``."""
+
+    def __init__(self, *, wfn, sym, meta, mesh_xy: Mesh, bispinor: bool):
+        self.wfn = wfn
+        self.sym = sym
+        self.meta = meta
+        self.mesh_xy = mesh_xy
+        self.bispinor = bool(bispinor)
+
+    def coeffs_gspace(
+        self,
+        band_range: tuple[int, int],
+        *,
+        k_ids=None,
+    ) -> jax.Array:
+        if k_ids is not None:
+            k_ids_np = np.asarray(k_ids, dtype=np.int64)
+            if not np.array_equal(k_ids_np, np.arange(int(self.meta.nk_tot))):
+                raise ValueError(
+                    "legacy ψ(G) fallback only supports full k-point order")
+        from common.load_wfns import read_Gvecs_to_devices
+        psi_G, _ = read_Gvecs_to_devices(
+            self.wfn, self.sym, band_range, self.meta, self.bispinor,
+            self.mesh_xy)
+        return psi_G
+
+    def close(self) -> None:
+        pass
+
+
+class _Phdf5GspaceReader:
+    """Adapter that carries the driver's bispinor flag into PHDF5 reads."""
+
+    def __init__(self, reader, *, bispinor: bool):
+        self.reader = reader
+        self.bispinor = bool(bispinor)
+
+    def coeffs_gspace(
+        self,
+        band_range: tuple[int, int],
+        *,
+        k_ids=None,
+    ) -> jax.Array:
+        return self.reader.coeffs_gspace(
+            band_range, k_ids=k_ids, bispinor=self.bispinor)
+
+    def close(self) -> None:
+        # The underlying PHDF5 reader is cached by common.load_wfns and
+        # may be shared by other users in this process.
+        pass
+
+
+def _build_gspace_reader(*, wfn, sym, meta, mesh_xy: Mesh, bispinor: bool):
+    """Choose the PHDF5 reader when usable, otherwise the h5py fallback."""
+    force = str(os.environ.get("LORRAX_GSPACE_READER", "auto")).strip().lower()
+    if force not in {"auto", "phdf5", "legacy"}:
+        raise ValueError(
+            "LORRAX_GSPACE_READER must be 'auto', 'phdf5', or 'legacy'")
+    if force == "legacy" or (force == "auto" and jax.default_backend() == "cpu"):
+        return _LegacyGspaceReader(
+            wfn=wfn, sym=sym, meta=meta, mesh_xy=mesh_xy, bispinor=bispinor)
+
+    wfn_path = getattr(wfn, "_filename", None)
+    if wfn_path is None:
+        if force == "phdf5":
+            raise ValueError(
+                "ψ(G) PHDF5 reader requires wfn._filename, but it is unset")
+        return _LegacyGspaceReader(
+            wfn=wfn, sym=sym, meta=meta, mesh_xy=mesh_xy, bispinor=bispinor)
+
+    try:
+        from common.load_wfns import _get_phdf5_reader
+        return _Phdf5GspaceReader(
+            _get_phdf5_reader(wfn_path, mesh_xy), bispinor=bispinor)
+    except (FileNotFoundError, OSError):
+        if force == "phdf5":
+            raise
+        return _LegacyGspaceReader(
+            wfn=wfn, sym=sym, meta=meta, mesh_xy=mesh_xy, bispinor=bispinor)

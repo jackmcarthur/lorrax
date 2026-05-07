@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -76,7 +77,7 @@ def _parse_eqp_rows(path: Path) -> np.ndarray:
 
 
 @pytest.mark.regression
-def test_gw_jax_matches_reference():
+def test_gw_jax_matches_reference(tmp_path):
     platform = _requested_platform()
     if platform in {"gpu", "cuda"} and not _gpu_available():
         pytest.skip("CUDA GPU not available for requested ISDF_COHSEX_TEST_PLATFORM=gpu.")
@@ -84,7 +85,22 @@ def test_gw_jax_matches_reference():
     assert INPUT_FILE.exists(), f"Missing regression input: {INPUT_FILE}"
     assert REFERENCE_FILE.exists(), f"Missing regression reference: {REFERENCE_FILE}"
 
-    OUTPUT_FILE.unlink(missing_ok=True)
+    run_dir = tmp_path / "cohsex_debug"
+    shutil.copytree(
+        CASE_DIR,
+        run_dir,
+        ignore=shutil.ignore_patterns(
+            "tmp",
+            "eqp_test.dat",
+            "eqp0_test.dat",
+            "eqp1_test.dat",
+            "sigma_diag.dat",
+            "eqp0.dat",
+            "eqp1.dat",
+        ),
+    )
+    input_file = run_dir / INPUT_FILE.name
+    output_file = run_dir / OUTPUT_FILE.name
 
     env = os.environ.copy()
     cache_dir = Path(env.get("JAX_COMPILATION_CACHE_DIR", str(REPO_ROOT / ".pytest_jax_cache")))
@@ -112,10 +128,10 @@ def test_gw_jax_matches_reference():
     else:
         env["PYTHONPATH"] = src_path
 
-    cmd = [sys.executable, "-m", "gw.gw_jax", "-i", INPUT_FILE.name]
+    cmd = [sys.executable, "-m", "gw.gw_jax", "-i", input_file.name]
     result = subprocess.run(
         cmd,
-        cwd=CASE_DIR,
+        cwd=run_dir,
         env=env,
         capture_output=True,
         text=True,
@@ -130,15 +146,15 @@ def test_gw_jax_matches_reference():
             f"stderr:\n{result.stderr}"
         )
 
-    assert OUTPUT_FILE.exists(), f"Expected output file was not written: {OUTPUT_FILE}"
+    assert output_file.exists(), f"Expected output file was not written: {output_file}"
 
     ref_text = REFERENCE_FILE.read_text()
-    out_text = OUTPUT_FILE.read_text()
+    out_text = output_file.read_text()
     if out_text == ref_text:
         return
 
     ref_rows = _parse_eqp_rows(REFERENCE_FILE)
-    out_rows = _parse_eqp_rows(OUTPUT_FILE)
+    out_rows = _parse_eqp_rows(output_file)
     assert out_rows.shape == ref_rows.shape, (
         f"Row-count mismatch: output shape {out_rows.shape}, reference shape {ref_rows.shape}"
     )

@@ -93,15 +93,17 @@ def build_mesh(world: int) -> Mesh:
     return Mesh(np.asarray(jax.devices()).reshape(p, q), axis_names=("x", "y"))
 
 
-def meta_stub(wfn, sym) -> types.SimpleNamespace:
+def meta_stub(wfn, sym, *, bispinor: bool = False) -> types.SimpleNamespace:
     """Minimal Meta-like object with the fields both consumers read."""
     fft_grid = tuple(int(x) for x in wfn.fft_grid)
+    nspinor_wfnfile = int(wfn.nspinor)
     return types.SimpleNamespace(
         fft_grid=fft_grid,
-        nspinor=int(wfn.nspinor),
-        nspinor_wfnfile=int(wfn.nspinor),
+        nspinor=4 if bispinor else nspinor_wfnfile,
+        nspinor_wfnfile=nspinor_wfnfile,
         nk_tot=int(sym.nk_tot),
         kgrid=tuple(int(x) for x in wfn.kgrid),
+        b_id_4_user=int(wfn.nbands),
     )
 
 
@@ -122,16 +124,16 @@ def pick_centroids(wfn, n: int, seed: int = 42) -> np.ndarray:
 #  Comparisons
 # =============================================================================
 def run_centroids(wfn_path: str, mesh: Mesh, n_centroids: int, band_range,
-                  k_chunk_size: int | None = None):
+                  k_chunk_size: int | None = None, *, bispinor: bool = False):
     wfn = WFNReader(wfn_path)
     sym = SymMaps(wfn)
-    meta = meta_stub(wfn, sym)
+    meta = meta_stub(wfn, sym, bispinor=bispinor)
     centroids = jnp.asarray(pick_centroids(wfn, n_centroids))
 
     args = dict(
         wfn=wfn, sym=sym, meta=meta,
         centroid_indices=centroids,
-        bispinor=False, mesh_xy=mesh,
+        bispinor=bispinor, mesh_xy=mesh,
         band_range=band_range,
         band_chunk_size=band_range[1] - band_range[0],
         k_chunk_size=k_chunk_size,
@@ -156,16 +158,16 @@ def run_centroids(wfn_path: str, mesh: Mesh, n_centroids: int, band_range,
 
 
 def run_rchunk(wfn_path: str, mesh: Mesh, r_range, band_range,
-               k_chunk_size: int = 0):
+               k_chunk_size: int = 0, *, bispinor: bool = False):
     wfn = WFNReader(wfn_path)
     sym = SymMaps(wfn)
-    meta = meta_stub(wfn, sym)
+    meta = meta_stub(wfn, sym, bispinor=bispinor)
 
     args = dict(
         wfn=wfn, sym=sym, meta=meta, mesh_xy=mesh,
         band_range=band_range,
         r_start=r_range[0], r_end=r_range[1],
-        bispinor=False,
+        bispinor=bispinor,
         band_chunk_size=band_range[1] - band_range[0],
         k_chunk_size=k_chunk_size,
     )
@@ -196,6 +198,8 @@ def main() -> int:
                     help="length of r-chunk (contiguous flattened-xyz range).")
     ap.add_argument("--skip-kchunk", action="store_true",
                     help="skip the k-chunked-read variant of the test.")
+    ap.add_argument("--bispinor", action="store_true",
+                    help="compare the 4-component small-spinor expansion.")
     args = ap.parse_args()
 
     world = jax.process_count()
@@ -216,23 +220,28 @@ def main() -> int:
     k_chunk_size = max(1, (nk_tot + 1) // 2)
 
     log(f"world={world}  wfn={args.wfn}  band_range={band_range}  "
-        f"nk_tot={nk_tot}  k_chunk_size={k_chunk_size}")
+        f"nk_tot={nk_tot}  k_chunk_size={k_chunk_size}  "
+        f"bispinor={args.bispinor}")
 
     tol = 1e-12
 
     log("\n--- all-k read ---")
-    d_centroids = run_centroids(args.wfn, mesh, args.n_centroids, band_range)
-    d_rchunk = run_rchunk(args.wfn, mesh, (0, args.n_rcells), band_range)
+    d_centroids = run_centroids(
+        args.wfn, mesh, args.n_centroids, band_range,
+        bispinor=args.bispinor)
+    d_rchunk = run_rchunk(
+        args.wfn, mesh, (0, args.n_rcells), band_range,
+        bispinor=args.bispinor)
     worst = max(d_centroids, d_rchunk)
 
     if not args.skip_kchunk and nk_tot > 1:
         log("\n--- k-chunked read ---")
         d_centroids_k = run_centroids(
             args.wfn, mesh, args.n_centroids, band_range,
-            k_chunk_size=k_chunk_size)
+            k_chunk_size=k_chunk_size, bispinor=args.bispinor)
         d_rchunk_k = run_rchunk(
             args.wfn, mesh, (0, args.n_rcells), band_range,
-            k_chunk_size=k_chunk_size)
+            k_chunk_size=k_chunk_size, bispinor=args.bispinor)
         worst = max(worst, d_centroids_k, d_rchunk_k)
 
     log("\nPASS" if worst <= tol else "\nFAIL")

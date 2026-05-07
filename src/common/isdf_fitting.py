@@ -541,8 +541,22 @@ def solve_zeta_from_L_q(
         # (nq=64, μ=2400, B_r=12672, 2×2 mesh):
         #   direct, no donate: 31.14 GB/dev (temp 15.57 GB, Involuntary Remat)
         #   direct, donate:    15.57 GB/dev (temp 7.79 GB) -- 50% reduction
+        # Two-step reshard via P('x',None,'y') intermediate.  Direct
+        # P(None,'x','y') → P(None,None,('x','y')) moves both mesh axes
+        # at once on the (μ, ν) data axes, which SPMD can't plan as a
+        # single all-to-all and falls into Involuntary Full
+        # Rematerialization (the full nq×μ×ν tensor materialised on
+        # every device, ~16× per-device shard).  Staging through
+        # P('x', None, 'y') parks 'x' on the leading nq axis so each
+        # with_sharding_constraint moves only one mesh axis — two pure
+        # all-to-alls, no all-gather inflation.  Same pattern as
+        # w_isdf._get_w_solve_fn (V/χ reshard).  See lorrax_B commit
+        # c0307a0 for the original Si 4×4×4 result (HLO peak
+        # 68.94 → 29.94 GB on the same kernel compile).
+        intermediate_shard = NamedSharding(mesh_xy, P('x', None, 'y'))
         @partial(jax.jit, donate_argnums=(0,))
         def _reshard_z(z):
+            z = jax.lax.with_sharding_constraint(z, intermediate_shard)
             return jax.lax.with_sharding_constraint(z, _target_sharding)
         Z_col = _reshard_z(Z_q)
         # No-op when called inside an outer jit (tracer has no
@@ -742,11 +756,18 @@ def _make_fit_one_rchunk_kernel(
             P_r = _accumulate(P_r, r_cls, psi_r_rmuT_X_fit,
                               norms_r, psi_bc_Y, bc_size)
 
-        # 3. ZCT + reshard + solve
+        # 3. ZCT + solve.  Pass Z_q UN-RESHARDED — the inline
+        # ``with_sharding_constraint`` here was inside this outer kernel
+        # jit and tied XLA's hands on the two-step reshard (P('x',None,'y')
+        # intermediate cancels with all-to-all chains across consumer
+        # ops in the fused trace, forcing Involuntary Full Rematerialization
+        # of the full (nq, μ, ν) tensor).  Letting solve_zeta_from_L_q's
+        # sub-jit boundary handle the reshard (with its own two-step staging)
+        # decouples the reshard scheduler from the kernel body and matches
+        # the load_wfns separate-jit pattern.  Same pattern as lorrax_B
+        # commit c0307a0.
         Z_q = compute_ZCT_from_left_right_zchunk(P_l, P_r, kgrid, mesh_xy)
-        z_col_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
-        Z_col = jax.lax.with_sharding_constraint(Z_q, z_col_shard)
-        zeta = solve_zeta_from_L_q(L_q, Z_col, mesh_xy, q_chunk_size)
+        zeta = solve_zeta_from_L_q(L_q, Z_q, mesh_xy, q_chunk_size)
         return zeta
 
     return _kernel
@@ -1102,8 +1123,9 @@ def fit_zeta_chunked_to_h5(
     # via io_callback.  See :mod:`common.psi_G_store` for details.
     from common.psi_G_store import build_psi_G_store
     psi_G_store = build_psi_G_store(
-        wfn=wfn, mesh_xy=mesh_xy, meta=meta,
+        wfn=wfn, sym=sym, mesh_xy=mesh_xy, meta=meta,
         band_chunk_ranges=band_chunk_ranges,
+        bispinor=bispinor,
         mode=gspace_mode,
     )
 

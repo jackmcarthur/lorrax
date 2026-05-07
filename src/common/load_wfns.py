@@ -542,7 +542,8 @@ def iter_psi_rchunk_bandwise(
     for bc_range in band_chunk_ranges:
         if nk_batch >= nk_tot:
             if phdf5_reader is not None:
-                gtot = phdf5_reader.coeffs_gspace(bc_range)
+                gtot = phdf5_reader.coeffs_gspace(
+                    bc_range, bispinor=bispinor)
             else:
                 gtot, _ = read_Gvecs_to_devices(
                     wfn, sym, bc_range, meta, bispinor, mesh_xy)
@@ -564,7 +565,8 @@ def iter_psi_rchunk_bandwise(
                 sub_meta = _make_kchunk_meta(meta, k0, k1)
                 if phdf5_reader is not None:
                     k_ids = np.arange(k0, k1, dtype=np.int32)
-                    psi_k_gtot = phdf5_reader.coeffs_gspace(bc_range, k_ids=k_ids)
+                    psi_k_gtot = phdf5_reader.coeffs_gspace(
+                        bc_range, k_ids=k_ids, bispinor=bispinor)
                 else:
                     psi_k_gtot, _ = read_Gvecs_to_devices(
                         wfn, sym, bc_range, sub_meta, bispinor, mesh_xy,
@@ -887,7 +889,8 @@ def load_centroids_band_chunked(
         if not needs_k_chunking:
             # Band-chunked only (all k at once).
             if phdf5_reader is not None:
-                global_psi_Gtot = phdf5_reader.coeffs_gspace(bc_range)
+                global_psi_Gtot = phdf5_reader.coeffs_gspace(
+                    bc_range, bispinor=bispinor)
             else:
                 global_psi_Gtot, _ = read_Gvecs_to_devices(
                     wfn, sym, bc_range, meta, bispinor, mesh_xy)
@@ -912,7 +915,8 @@ def load_centroids_band_chunked(
                 # Load G-space for this k-chunk × band-chunk
                 if phdf5_reader is not None:
                     k_ids = np.arange(kc_start, kc_end, dtype=np.int32)
-                    global_psi_Gtot = phdf5_reader.coeffs_gspace(bc_range, k_ids=k_ids)
+                    global_psi_Gtot = phdf5_reader.coeffs_gspace(
+                        bc_range, k_ids=k_ids, bispinor=bispinor)
                 else:
                     global_psi_Gtot, _ = read_Gvecs_to_devices(
                         wfn, sym, bc_range, meta_kchunk, bispinor, mesh_xy,

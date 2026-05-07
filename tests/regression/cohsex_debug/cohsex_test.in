@@ -6,11 +6,16 @@ bispinor = false
 wfn_file = WFNsmall.h5
 centroids_file = centroids_frac_60.txt
 output_file = eqp_test.dat
+sigma_diag_file = eqp_test.dat
+eqp0_file = eqp0_test.dat
+eqp1_file = eqp1_test.dat
 nval = 4
 ncond = 4
 nband = 40
 sys_dim = 2
 screening_method = minimax
+use_ffi_io = false
+no_degen_averaging = true
 
 K_POINTS {crystal_b}
 5
