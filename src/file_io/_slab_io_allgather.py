@@ -199,8 +199,9 @@ class _AllgatherBackend:
         offset: Sequence[int] | None = None,
         mesh=None,
         as_numpy: bool = False,
+        partition_spec=None,
     ) -> jax.Array:
-        """Read a hyperslab into a replicated JAX array.
+        """Read a hyperslab into a JAX array.
 
         Every process reads the hyperslab independently via its OWN
         h5py handle (a second file descriptor, opened in 'r' mode for
@@ -211,8 +212,14 @@ class _AllgatherBackend:
         overhead that dominates for the many small reads in the V_q
         loop).
 
-        Returns a ``jax.Array`` replicated on ``mesh`` (or a plain
-        host-backed JAX array if no mesh is given).
+        ``partition_spec`` (optional): when set, the result is placed on
+        the mesh with this PartitionSpec instead of being replicated.
+        Lets the unified V_q tile driver call ``read_slab(...,
+        partition_spec=P(None,None,('x','y')))`` regardless of backend —
+        the FFI backend reads sharded directly, this backend reads the
+        full slab on every rank then ``device_put``s with the requested
+        sharding.  Each rank loads the same data and JAX scatters at
+        ``device_put`` time.
         """
         # Per-rank cached 'r' handle; one h5py.File per SlabIO lifetime.
         if self._read_file is None:
@@ -229,11 +236,11 @@ class _AllgatherBackend:
         if as_numpy:
             return host
 
-        arr = jnp.asarray(host)
         if mesh is not None:
             from jax.sharding import NamedSharding, PartitionSpec as P
-            arr = jax.device_put(arr, NamedSharding(mesh, P()))
-        return arr
+            spec = partition_spec if partition_spec is not None else P()
+            return jax.device_put(host, NamedSharding(mesh, spec))
+        return jnp.asarray(host)
 
     # ------------------------------------------------------------------
     def accumulate_slab(

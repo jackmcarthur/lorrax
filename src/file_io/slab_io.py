@@ -228,7 +228,8 @@ class SlabIO:
         else:
             arr = self._backend.read_slab(
                 name, shape=shape, dtype=dtype, offset=offset,
-                mesh=mesh, as_numpy=as_numpy)
+                mesh=mesh, as_numpy=as_numpy,
+                partition_spec=partition_spec)
         if as_numpy and not isinstance(arr, np.ndarray):
             arr = np.asarray(jax.device_get(arr))
         return arr

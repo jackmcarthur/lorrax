@@ -629,7 +629,10 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 
 	bvec = np.asarray(wfn.blat * wfn.bvec, dtype=np.float64)
 
-	# V_q memory model: 2 zeta reads + 1 FFT workspace = 3× (μ × n_G × 16 bytes)
+	# V_q memory budget (per rank).  The unified V_q tile chooser inside
+	# ``compute_all_V_q`` derives q_chunk and μ_chunk from this budget and
+	# the system geometry (n_rmu, n_G, n_rtot, mesh shape) directly — no
+	# need for the caller to pre-compute legacy μ/q-batch hints.
 	if mem_est is None:
 		mem_est = {}
 	budget_gb = float(mem_est.get('available_vcoul_gb', cfg.memory.per_device_gb))
@@ -639,24 +642,6 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	except Exception:
 		pass
 	m_budget = max(0.1, budget_gb) * 1e9
-	m_per_mu = 3 * 16 * meta.n_rtot
-	mu_chunk = max(1, min(meta.n_rmu, int(m_budget / m_per_mu)))
-	q_batch = 1
-	if mu_chunk >= meta.n_rmu and meta.nk_tot > 1:
-		q_batch = max(1, min(4, meta.nk_tot, int(m_budget // max(1.0, 2.0 * 16 * meta.n_rmu * meta.n_rtot))))
-
-	# get_device_memory_info reports this rank's free HBM, which can
-	# differ across ranks (pool fragmentation, non-symmetric allocations
-	# before this point) → mu_chunk + q_batch can diverge across ranks.
-	# _compute_all_V_q_replicated then branches on (n_chunks == 1) at
-	# line ~884; divergent branches across ranks deadlock on the first
-	# collective inside one branch (observed 2026-04-18 w/ FFI read).
-	# Fix: broadcast rank 0's numbers to every rank so they agree.
-	if jax.process_count() > 1:
-		_mq = jnp.asarray([int(mu_chunk), int(q_batch)], dtype=jnp.int64)
-		_mq = jax.experimental.multihost_utils.broadcast_one_to_all(_mq)
-		mu_chunk = int(jax.device_get(_mq)[0])
-		q_batch = int(jax.device_get(_mq)[1])
 
 	# Default to ecutwfc — matches BGW's screened_coulomb_cutoff convention
 	# (BGW truncates the pair-density v(q+G) sphere at ecutwfc).  The previous
@@ -670,15 +655,11 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		print_fn(f"    V_q bare cutoff: {vcoul_cutoff_ry:.1f} Ry")
 
 	print_fn(f"    V_q budget:    {budget_gb:.2f} GB")
-	print_fn(f"    V_q mu chunks: {mu_chunk}")
-	if q_batch > 1:
-		print_fn(f"    V_q q batches: {q_batch}")
 
 	from file_io.slab_io import SlabIO
-	# Single dispatcher: ``compute_all_V_q`` selects the right kernel from
-	# the SlabIO backend (PHDF5_FFI → mesh-parallel ζ reads + outer jit,
-	# H5PY_ALLGATHER → replicated rank-0 read with μ-chunking + optional
-	# q-batching).
+	# Single dispatcher routes to the unified V_q tile driver (one inner
+	# kernel handles same/distinct ζ × Case A/B; one outer driver handles
+	# both PHDF5/FFI and h5py-allgather backends).
 	with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
 		with SlabIO(zeta_h5_path, mode='r', mesh=mesh_xy,
 		            backend=cfg.backend.slab_io) as zeta_io:
@@ -695,9 +676,6 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 					mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
 					bare_coulomb_cutoff=vcoul_cutoff_ry,
 					bgw_v_grid_fn=bgw_v_grid_fn,
-					mu_chunk_size=mu_chunk,
-					q_batch_size=(q_batch if mu_chunk >= meta.n_rmu
-					              else None),
 					budget_bytes=m_budget,
 				)
 
