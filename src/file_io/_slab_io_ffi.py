@@ -119,6 +119,91 @@ def _replicated_sharding(mesh: Mesh, ndim: int) -> NamedSharding:
     return NamedSharding(mesh, P(*([None] * ndim)))
 
 
+def _replicated_i64_vector(values: Sequence[int], mesh: Mesh) -> jax.Array:
+    """Small int64 control buffer, explicitly replicated on ``mesh``.
+
+    Do not rely on JAX's default placement for these vectors: the PHDF5
+    write path passes offsets through a cached jitted shard_map, and an
+    implicitly placed offset buffer once arrived in C++ with dimensions
+    permuted in the real CrI3 driver.  Replicating the control buffer is
+    both the intended semantics and the safest JIT cache key.
+    """
+    return jax.device_put(
+        np.asarray(tuple(int(v) for v in values), dtype=np.int64),
+        NamedSharding(mesh, P()),
+    )
+
+
+def _normalize_slab_request(
+    *,
+    op: str,
+    name: str,
+    offset: Sequence[int] | None,
+    slab_shape: Sequence[int],
+    global_shape: Sequence[int] | None,
+    check_bounds: bool = True,
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    """Return ``(offset, slab_shape, global_shape)`` after basic checks."""
+    shape = tuple(int(s) for s in slab_shape)
+    if not shape:
+        raise ValueError(f"{op} {name!r}: slab shape must be non-empty")
+    if any(s < 0 for s in shape):
+        raise ValueError(f"{op} {name!r}: negative slab shape {shape}")
+
+    off = tuple(int(o) for o in (offset if offset is not None
+                                else (0,) * len(shape)))
+    gshape = tuple(int(s) for s in (global_shape if global_shape is not None
+                                   else shape))
+
+    if len(off) != len(shape) or len(gshape) != len(shape):
+        raise ValueError(
+            f"{op} {name!r}: rank mismatch offset={off}, "
+            f"slab_shape={shape}, global_shape={gshape}")
+    if any(o < 0 for o in off):
+        raise ValueError(f"{op} {name!r}: negative offset {off}")
+    if any(g < 0 for g in gshape):
+        raise ValueError(f"{op} {name!r}: negative global shape {gshape}")
+
+    if check_bounds:
+        over = [
+            (i, off[i], shape[i], gshape[i])
+            for i in range(len(shape))
+            if off[i] + shape[i] > gshape[i]
+        ]
+        if over:
+            details = ", ".join(
+                f"dim {i}: {o}+{s}>{g}" for i, o, s, g in over)
+            raise ValueError(
+                f"{op} {name!r}: slab exceeds global shape ({details})")
+    return off, shape, gshape
+
+
+def _validate_block_divisible(
+    *,
+    op: str,
+    name: str,
+    shape: Sequence[int],
+    axis_count_per_dim: Sequence[int],
+    axis_flat: Sequence[int],
+    mesh_shape: Sequence[int],
+) -> None:
+    """Reject sharded dimensions that cannot form equal block shards."""
+    flat_idx = 0
+    for d, size in enumerate(tuple(int(s) for s in shape)):
+        na = int(axis_count_per_dim[d])
+        div = 1
+        axes = []
+        for k in range(na):
+            ax = int(axis_flat[flat_idx + k])
+            axes.append(ax)
+            div *= int(mesh_shape[ax])
+        flat_idx += na
+        if div > 1 and size % div:
+            raise ValueError(
+                f"{op} {name!r}: dimension {d} size {size} is not "
+                f"divisible by mesh axes {axes} product {div}")
+
+
 # ---------------------------------------------------------------------------
 # Backend
 # ---------------------------------------------------------------------------
@@ -317,8 +402,14 @@ class _FfiBackend:
 
         axis_count_per_dim, axis_flat = _sharding_to_axis_info(
             A.sharding, A.ndim)
-        off = tuple(offset) if offset is not None else tuple([0] * A.ndim)
-        gshape = tuple(global_shape) if global_shape is not None else tuple(A.shape)
+        off, slab_shape, gshape = _normalize_slab_request(
+            op="write_slab", name=name, offset=offset,
+            slab_shape=A.shape, global_shape=global_shape)
+        mesh_shape = tuple(self.mesh.shape[ax] for ax in self.mesh.axis_names)
+        _validate_block_divisible(
+            op="write_slab", name=name, shape=slab_shape,
+            axis_count_per_dim=axis_count_per_dim,
+            axis_flat=axis_flat, mesh_shape=mesh_shape)
 
         if name not in self._ds_ids:
             ds_id = self._loader.phdf5_ensure_dataset(
@@ -339,7 +430,6 @@ class _FfiBackend:
 
         ds_id = self._ds_ids[name]
         ctx_handle = self.fh
-        mesh_shape = tuple(self.mesh.shape[ax] for ax in self.mesh.axis_names)
         in_specs = A.sharding.spec  # PartitionSpec
 
         # ── shard_map cache ──
@@ -390,10 +480,7 @@ class _FfiBackend:
         # Enqueue dispatch onto the Python worker thread.  Main thread
         # returns in ~0.2ms; the worker thread calls ``sm(A, offset)``
         # in FIFO order.  The offset Buffer is tiny (ndim × 8 bytes).
-        offset_arr = jax.device_put(
-            np.asarray(off, dtype=np.int64),
-            NamedSharding(self.mesh, P()),
-        )
+        offset_arr = _replicated_i64_vector(off, self.mesh)
 
         def _task():
             tok = sm(A, offset_arr)
@@ -421,22 +508,31 @@ class _FfiBackend:
         from ffi.phdf5.read import ffi_read_call
 
         mesh = mesh or self.mesh
-        off = tuple(offset) if offset is not None else tuple([0] * len(shape))
+        if shape is None:
+            raise ValueError(
+                f"read_slab {name!r}: shape is required for FFI reads")
+        off, read_shape, _ = _normalize_slab_request(
+            op="read_slab", name=name, offset=offset,
+            slab_shape=shape, global_shape=None, check_bounds=False)
 
         # Default: fully replicated.  Caller can provide partition_spec
         # to shard the read.
         if partition_spec is None:
-            partition_spec = P(*([None] * len(shape)))
+            partition_spec = P(*([None] * len(read_shape)))
         sharding = NamedSharding(mesh, partition_spec)
         axis_count_per_dim, axis_flat = _sharding_to_axis_info(
-            sharding, len(shape))
+            sharding, len(read_shape))
         mesh_shape = tuple(mesh.shape[ax] for ax in mesh.axis_names)
+        _validate_block_divisible(
+            op="read_slab", name=name, shape=read_shape,
+            axis_count_per_dim=axis_count_per_dim,
+            axis_flat=axis_flat, mesh_shape=mesh_shape)
 
         # Per-rank output shape: divide by the product of the mesh
         # sizes of all axes sharding that dim.
-        local_shape = list(shape)
+        local_shape = list(read_shape)
         _flat_idx = 0
-        for d in range(len(shape)):
+        for d in range(len(read_shape)):
             na = axis_count_per_dim[d]
             if na > 0:
                 div = 1
@@ -483,7 +579,7 @@ class _FfiBackend:
             sm = jax.jit(sm_bare)
             self._sm_cache[cache_key] = sm
 
-        offset_arr = jnp.asarray(off, dtype=jnp.int64)
+        offset_arr = _replicated_i64_vector(off, mesh)
         result = sm(offset_arr)
         result.block_until_ready()
         return result
