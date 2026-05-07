@@ -32,6 +32,7 @@ _FFI_TARGET = "lorrax_phdf5_write"
 def ffi_write_call(
     A_local: jax.Array,
     offset_base: jax.Array,
+    valid_shape: jax.Array,
     *,
     ctx_handle: int,
     ds_id: int,
@@ -41,10 +42,11 @@ def ffi_write_call(
 ) -> jax.Array:
     """Low-level FFI call for one rank's local shard.  Returns token.
 
-    ``offset_base`` is a jax.Array of shape (ndim,) dtype int64 — passed
+    ``offset_base`` and ``valid_shape`` are jax.Arrays of shape (ndim,)
+    dtype int64 — passed
     as a traced Buffer input (not an FFI Attr) so that shard_map closures
     compile ONCE per dataset-ndim-dtype-sharding tuple and re-dispatch
-    across chunks with different offsets.  Without this, each chunk
+    across chunks with different offsets or logical extents.  Without this, each chunk
     triggers a fresh ~400 ms XLA compile for the FFI body (measured at
     MoS2 3x3 scale, see reports/zeta_offset_runtime_2026-04-19/).
 
@@ -57,6 +59,7 @@ def ffi_write_call(
     return jax.ffi.ffi_call(_FFI_TARGET, token_spec, has_side_effect=True)(
         A_local,
         offset_base,
+        valid_shape,
         ctx_handle=int(ctx_handle),
         ds_id=int(ds_id),
         mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
@@ -72,6 +75,7 @@ def write_sharded_slab(
     *,
     mesh: Mesh,
     global_shape: tuple[int, int] | None = None,
+    valid_shape: tuple[int, int] | None = None,
 ) -> jax.Array:
     """Write a 2-D P('x','y')-sharded JAX array to an open HDF5 dataset.
 
@@ -84,10 +88,26 @@ def write_sharded_slab(
         raise NotImplementedError(
             "write_sharded_slab is 2-D only; use file_io.slab_io for N-D")
     p, q = validate_mesh_2d(mesh)
-    n_rows, n_cols = (global_shape if global_shape is not None else A.shape)
-    if n_rows % p or n_cols % q:
+    phys_rows, phys_cols = (int(A.shape[0]), int(A.shape[1]))
+    valid_rows, valid_cols = (
+        tuple(int(s) for s in valid_shape)
+        if valid_shape is not None else (phys_rows, phys_cols)
+    )
+    n_rows, n_cols = (
+        tuple(int(s) for s in global_shape)
+        if global_shape is not None else (valid_rows, valid_cols)
+    )
+    if phys_rows % p or phys_cols % q:
         raise ValueError(
-            f"global shape ({n_rows},{n_cols}) must divide mesh ({p},{q})")
+            f"physical shape ({phys_rows},{phys_cols}) must divide mesh ({p},{q})")
+    if valid_rows > phys_rows or valid_cols > phys_cols:
+        raise ValueError(
+            f"valid_shape ({valid_rows},{valid_cols}) exceeds physical "
+            f"shape ({phys_rows},{phys_cols})")
+    if valid_rows > n_rows or valid_cols > n_cols:
+        raise ValueError(
+            f"valid_shape ({valid_rows},{valid_cols}) exceeds dataset "
+            f"shape ({n_rows},{n_cols})")
     get_lib()
 
     ds_id = ffi_loader.phdf5_ensure_dataset(
@@ -95,10 +115,11 @@ def write_sharded_slab(
         str(jnp.dtype(A.dtype).name))
 
     offset_array = jnp.zeros((2,), dtype=jnp.int64)
+    valid_shape_arr = jnp.asarray((valid_rows, valid_cols), dtype=jnp.int64)
 
-    def _per_rank(A_local, offset_local):
+    def _per_rank(A_local, offset_local, valid_shape_local):
         return ffi_write_call(
-            A_local, offset_local,
+            A_local, offset_local, valid_shape_local,
             ctx_handle=int(fh),
             ds_id=int(ds_id),
             mesh_shape=(p, q),
@@ -108,6 +129,6 @@ def write_sharded_slab(
 
     return shard_map(
         _per_rank, mesh=mesh,
-        in_specs=(P("x", "y"), P()), out_specs=P(),
+        in_specs=(P("x", "y"), P(), P()), out_specs=P(),
         check_rep=False,
-    )(A, offset_array)
+    )(A, offset_array, valid_shape_arr)

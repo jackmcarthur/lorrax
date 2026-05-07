@@ -155,7 +155,8 @@ static void async_worker(
     hid_t ds_id,
     hid_t native_type,
     std::vector<hsize_t> offset,
-    std::vector<hsize_t> count,
+    std::vector<hsize_t> file_count,
+    std::vector<hsize_t> mem_dims,
     void* pinned_buf,
     bool wait_for_d2h,
     ffi::Promise promise)
@@ -190,8 +191,10 @@ static void async_worker(
         return;
     }
     bool out_of_bounds = false;
+    bool empty_selection = false;
     for (int d = 0; d < rank; ++d) {
-        if (offset[(size_t)d] + count[(size_t)d] > extent[(size_t)d]) {
+        if (file_count[(size_t)d] == 0) empty_selection = true;
+        if (offset[(size_t)d] + file_count[(size_t)d] > extent[(size_t)d]) {
             out_of_bounds = true;
         }
     }
@@ -199,11 +202,12 @@ static void async_worker(
     if (debug || out_of_bounds) {
         std::fprintf(stderr,
             "[phdf5-write rank=%d ds=%s id=%lld] extent=%s offset=%s count=%s "
-            "collective=%d oob=%d\n",
+            "mem_dims=%s collective=%d oob=%d empty=%d\n",
             ctx->rank, h5_object_name(ds_id).c_str(), (long long)ds_id,
             vec_to_string(extent).c_str(), vec_to_string(offset).c_str(),
-            vec_to_string(count).c_str(), ctx->use_collective_write ? 1 : 0,
-            out_of_bounds ? 1 : 0);
+            vec_to_string(file_count).c_str(), vec_to_string(mem_dims).c_str(),
+            ctx->use_collective_write ? 1 : 0,
+            out_of_bounds ? 1 : 0, empty_selection ? 1 : 0);
         std::fflush(stderr);
     }
     if (out_of_bounds) {
@@ -212,27 +216,49 @@ static void async_worker(
            << " ds=" << h5_object_name(ds_id)
            << " extent=" << vec_to_string(extent)
            << " offset=" << vec_to_string(offset)
-           << " count=" << vec_to_string(count)
+           << " count=" << vec_to_string(file_count)
            << " rank=" << ctx->rank;
         H5Sclose(filespace);
         promise.SetError(ffi::Error(ffi::ErrorCode::kInternal, os.str()));
         return;
     }
-    if (H5Sselect_hyperslab(filespace, H5S_SELECT_SET,
-                             offset.data(), nullptr,
-                             count.data(),  nullptr) < 0) {
-        if (debug) H5Eprint2(H5E_DEFAULT, stderr);
-        H5Sclose(filespace);
-        promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
-                          "phdf5 async write: H5Sselect_hyperslab failed"));
-        return;
-    }
-    hid_t memspace = H5Screate_simple(rank, count.data(), nullptr);
+    hid_t memspace = H5Screate_simple(rank, mem_dims.data(), nullptr);
     if (memspace < 0) {
         H5Sclose(filespace);
         promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
                           "phdf5 async write: H5Screate_simple(memspace) failed"));
         return;
+    }
+
+    if (empty_selection) {
+        if (H5Sselect_none(filespace) < 0 || H5Sselect_none(memspace) < 0) {
+            H5Sclose(memspace);
+            H5Sclose(filespace);
+            promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
+                              "phdf5 async write: H5Sselect_none failed"));
+            return;
+        }
+    } else if (H5Sselect_hyperslab(filespace, H5S_SELECT_SET,
+                             offset.data(), nullptr,
+                             file_count.data(),  nullptr) < 0) {
+        if (debug) H5Eprint2(H5E_DEFAULT, stderr);
+        H5Sclose(memspace);
+        H5Sclose(filespace);
+        promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
+                          "phdf5 async write: H5Sselect_hyperslab failed"));
+        return;
+    } else {
+        std::vector<hsize_t> mem_start((size_t)rank, 0);
+        if (H5Sselect_hyperslab(memspace, H5S_SELECT_SET,
+                                mem_start.data(), nullptr,
+                                file_count.data(), nullptr) < 0) {
+            if (debug) H5Eprint2(H5E_DEFAULT, stderr);
+            H5Sclose(memspace);
+            H5Sclose(filespace);
+            promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
+                              "phdf5 async write: H5Sselect_hyperslab(mem) failed"));
+            return;
+        }
     }
 
     hid_t dxpl = ctx->use_collective_write ? ctx->dxpl_coll : ctx->dxpl_indep;
@@ -264,6 +290,7 @@ static ffi::Future WriteDispatch(
     cudaStream_t xla_stream,
     ffi::AnyBuffer A,
     ffi::Buffer<ffi::DataType::S64> offset_buf,   // shape (ndim,)
+    ffi::Buffer<ffi::DataType::S64> valid_shape_buf, // shape (ndim,)
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> token_out,
     int64_t ctx_handle,
     int64_t ds_id,
@@ -288,10 +315,13 @@ static ffi::Future WriteDispatch(
     const size_t N = dims.size();
     if (offset_buf.dimensions().size() != 1 ||
         (size_t)offset_buf.dimensions()[0] != N ||
+        valid_shape_buf.dimensions().size() != 1 ||
+        (size_t)valid_shape_buf.dimensions()[0] != N ||
         axis_count_per_dim.size() != N) {
         std::ostringstream os;
         os << "phdf5 write: rank mismatch  A.ndim=" << N
            << " offset_buf.ndim=" << offset_buf.dimensions().size()
+           << " valid_shape_buf.ndim=" << valid_shape_buf.dimensions().size()
            << " axis_count_per_dim.size=" << axis_count_per_dim.size();
         return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str()));
     }
@@ -307,12 +337,30 @@ static ffi::Future WriteDispatch(
            << cudaGetErrorString(ce_off);
         return fail(ffi::Error(ffi::ErrorCode::kInternal, os.str()));
     }
+    std::vector<int64_t> valid_shape_host(N);
+    cudaError_t ce_valid = cudaMemcpy(valid_shape_host.data(),
+                                      valid_shape_buf.untyped_data(),
+                                      N * sizeof(int64_t),
+                                      cudaMemcpyDeviceToHost);
+    if (ce_valid != cudaSuccess) {
+        std::ostringstream os;
+        os << "phdf5 write: cudaMemcpy(valid_shape) failed: "
+           << cudaGetErrorString(ce_valid);
+        return fail(ffi::Error(ffi::ErrorCode::kInternal, os.str()));
+    }
 
     std::vector<int64_t> coord = unravel_rank(ctx->rank, mesh_shape);
-    std::vector<hsize_t> offset(N), count(N);
+    std::vector<hsize_t> offset(N), file_count(N), mem_dims(N);
     size_t flat_idx = 0;
     for (size_t d = 0; d < N; ++d) {
-        count[d] = (hsize_t)dims[d];
+        if (offset_host[d] < 0 || valid_shape_host[d] < 0) {
+            std::ostringstream os;
+            os << "phdf5 write: negative offset/valid_shape at dim " << d
+               << " offset=" << offset_host[d]
+               << " valid_shape=" << valid_shape_host[d];
+            return fail(ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str()));
+        }
+        mem_dims[d] = (hsize_t)dims[d];
         offset[d] = (hsize_t)offset_host[d];
         int64_t na = axis_count_per_dim[d];
         // Dim d is sharded over `na` mesh axes; leftmost is slowest,
@@ -330,7 +378,15 @@ static ffi::Future WriteDispatch(
             rank_coord += coord[ax] * stride_acc;
             stride_acc *= mesh_shape[ax];
         }
-        offset[d] += rank_coord * count[d];
+        int64_t local_start = rank_coord * (int64_t)mem_dims[d];
+        if (local_start >= valid_shape_host[d]) {
+            file_count[d] = 0;
+        } else {
+            int64_t remaining = valid_shape_host[d] - local_start;
+            file_count[d] = (hsize_t)(
+                remaining < (int64_t)mem_dims[d] ? remaining : (int64_t)mem_dims[d]);
+        }
+        offset[d] += (hsize_t)local_start;
         flat_idx += (size_t)na;
     }
 
@@ -379,7 +435,7 @@ static ffi::Future WriteDispatch(
     }
 
     size_t n_local_elts = 1;
-    for (auto c : count) n_local_elts *= (size_t)c;
+    for (auto c : mem_dims) n_local_elts *= (size_t)c;
     const size_t bytes = n_local_elts * elt_bytes;
 
     // Reuse ``ctx->pinned_buf``, growing on demand.  Safe because the
@@ -429,12 +485,14 @@ static ffi::Future WriteDispatch(
 
     auto task = [ctx, dset, native_type,
                  offset = std::move(offset),
-                 count  = std::move(count),
+                 file_count = std::move(file_count),
+                 mem_dims = std::move(mem_dims),
                  pinned_buf,
                  promise = std::move(promise)]() mutable
     {
         async_worker(ctx, dset, native_type,
-                     std::move(offset), std::move(count),
+                     std::move(offset), std::move(file_count),
+                     std::move(mem_dims),
                      pinned_buf, /*wait_for_d2h=*/true,
                      std::move(promise));
     };
@@ -458,6 +516,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
         .Arg<xla::ffi::AnyBuffer>()
         .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // offset_base
+        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // valid_shape
         .Ret<xla::ffi::Buffer<xla::ffi::DataType::S32>>()
         .Attr<int64_t>("ctx_handle")
         .Attr<int64_t>("ds_id")

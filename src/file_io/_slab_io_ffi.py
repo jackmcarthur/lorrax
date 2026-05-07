@@ -178,6 +178,57 @@ def _normalize_slab_request(
     return off, shape, gshape
 
 
+def _normalize_valid_shape(
+    *,
+    op: str,
+    name: str,
+    valid_shape: Sequence[int] | None,
+    slab_shape: Sequence[int],
+    offset: Sequence[int],
+    global_shape: Sequence[int] | None = None,
+) -> tuple[int, ...]:
+    """Return the logical on-file extent inside a possibly padded slab.
+
+    ``slab_shape`` is the physical JAX array shape.  ``valid_shape`` is
+    the prefix of that array that should map to file data; omitted means
+    the whole slab is valid.  The valid shape itself need not be
+    divisible by the mesh because the C++ FFI clips the last rank(s).
+    """
+    shape = tuple(int(s) for s in slab_shape)
+    vshape = tuple(int(s) for s in (valid_shape if valid_shape is not None
+                                    else shape))
+    off = tuple(int(o) for o in offset)
+    if len(vshape) != len(shape):
+        raise ValueError(
+            f"{op} {name!r}: valid_shape rank mismatch "
+            f"valid_shape={vshape}, slab_shape={shape}")
+    if any(s < 0 for s in vshape):
+        raise ValueError(f"{op} {name!r}: negative valid_shape {vshape}")
+    too_large = [
+        (i, vshape[i], shape[i])
+        for i in range(len(shape))
+        if vshape[i] > shape[i]
+    ]
+    if too_large:
+        details = ", ".join(f"dim {i}: {v}>{s}"
+                            for i, v, s in too_large)
+        raise ValueError(
+            f"{op} {name!r}: valid_shape exceeds slab shape ({details})")
+    if global_shape is not None:
+        gshape = tuple(int(s) for s in global_shape)
+        over = [
+            (i, off[i], vshape[i], gshape[i])
+            for i in range(len(shape))
+            if off[i] + vshape[i] > gshape[i]
+        ]
+        if over:
+            details = ", ".join(
+                f"dim {i}: {o}+{s}>{g}" for i, o, s, g in over)
+            raise ValueError(
+                f"{op} {name!r}: valid slab exceeds global shape ({details})")
+    return vshape
+
+
 def _validate_block_divisible(
     *,
     op: str,
@@ -388,6 +439,7 @@ class _FfiBackend:
         *,
         offset: Sequence[int] | None = None,
         global_shape: Sequence[int] | None = None,
+        valid_shape: Sequence[int] | None = None,
         dtype=None,
         chunks: Sequence[int] | None = None,
         k_chunk_size: int | None = None,
@@ -404,7 +456,11 @@ class _FfiBackend:
             A.sharding, A.ndim)
         off, slab_shape, gshape = _normalize_slab_request(
             op="write_slab", name=name, offset=offset,
-            slab_shape=A.shape, global_shape=global_shape)
+            slab_shape=A.shape, global_shape=global_shape,
+            check_bounds=False)
+        vshape = _normalize_valid_shape(
+            op="write_slab", name=name, valid_shape=valid_shape,
+            slab_shape=slab_shape, offset=off, global_shape=gshape)
         mesh_shape = tuple(self.mesh.shape[ax] for ax in self.mesh.axis_names)
         _validate_block_divisible(
             op="write_slab", name=name, shape=slab_shape,
@@ -425,7 +481,8 @@ class _FfiBackend:
                 f"[ffi-debug proc={jax.process_index()}] "
                 f"name={name} shape={tuple(A.shape)} dtype={A.dtype} "
                 f"spec={getattr(A.sharding, 'spec', None)} "
-                f"offset={off} gshape={gshape} local_shapes={local_shapes}\n")
+                f"offset={off} valid_shape={vshape} gshape={gshape} "
+                f"local_shapes={local_shapes}\n")
             sys.__stdout__.flush()
 
         ds_id = self._ds_ids[name]
@@ -445,14 +502,14 @@ class _FfiBackend:
         )
         sm = self._sm_cache.get(cache_key)
         if sm is None:
-            def _per_rank(A_local, offset_local,
+            def _per_rank(A_local, offset_local, valid_shape_local,
                           _ds_id=int(ds_id),
                           _mesh_shape=mesh_shape,
                           _axis_count=axis_count_per_dim,
                           _axis_flat=axis_flat,
                           _ctx_handle=int(ctx_handle)):
                 return ffi_write_call(
-                    A_local, offset_local,
+                    A_local, offset_local, valid_shape_local,
                     ctx_handle=_ctx_handle,
                     ds_id=_ds_id,
                     mesh_shape=_mesh_shape,
@@ -461,7 +518,7 @@ class _FfiBackend:
                 )
             sm_bare = shard_map(
                 _per_rank, mesh=self.mesh,
-                in_specs=(in_specs, P()), out_specs=P(),
+                in_specs=(in_specs, P(), P()), out_specs=P(),
                 check_rep=False,
             )
             # DIAGNOSTIC: LORRAX_WRITE_NO_JIT=1 bypasses the jax.jit
@@ -481,9 +538,10 @@ class _FfiBackend:
         # returns in ~0.2ms; the worker thread calls ``sm(A, offset)``
         # in FIFO order.  The offset Buffer is tiny (ndim × 8 bytes).
         offset_arr = _replicated_i64_vector(off, self.mesh)
+        valid_shape_arr = _replicated_i64_vector(vshape, self.mesh)
 
         def _task():
-            tok = sm(A, offset_arr)
+            tok = sm(A, offset_arr, valid_shape_arr)
             tok.block_until_ready()
 
         with self._pending_cv:
@@ -500,6 +558,7 @@ class _FfiBackend:
         shape: Sequence[int],
         dtype,
         offset: Sequence[int] | None = None,
+        valid_shape: Sequence[int] | None = None,
         mesh: Mesh | None = None,
         partition_spec: P | None = None,
         as_numpy: bool = False,  # accepted for signature compatibility;
@@ -514,6 +573,9 @@ class _FfiBackend:
         off, read_shape, _ = _normalize_slab_request(
             op="read_slab", name=name, offset=offset,
             slab_shape=shape, global_shape=None, check_bounds=False)
+        vshape = _normalize_valid_shape(
+            op="read_slab", name=name, valid_shape=valid_shape,
+            slab_shape=read_shape, offset=off, global_shape=None)
 
         # Default: fully replicated.  Caller can provide partition_spec
         # to shard the read.
@@ -555,7 +617,7 @@ class _FfiBackend:
         )
         sm = self._sm_cache.get(cache_key)
         if sm is None:
-            def _per_rank(offset_local,
+            def _per_rank(offset_local, valid_shape_local,
                           _ds_id=int(ds_id),
                           _mesh_shape=mesh_shape,
                           _axis_count=axis_count_per_dim,
@@ -565,6 +627,7 @@ class _FfiBackend:
                 return ffi_read_call(
                     _out_struct,
                     offset_local,
+                    valid_shape_local,
                     ctx_handle=_ctx_handle,
                     ds_id=_ds_id,
                     mesh_shape=_mesh_shape,
@@ -573,14 +636,15 @@ class _FfiBackend:
                 )
             sm_bare = shard_map(
                 _per_rank, mesh=mesh,
-                in_specs=(P(),), out_specs=partition_spec,
+                in_specs=(P(), P()), out_specs=partition_spec,
                 check_rep=False,
             )
             sm = jax.jit(sm_bare)
             self._sm_cache[cache_key] = sm
 
         offset_arr = _replicated_i64_vector(off, mesh)
-        result = sm(offset_arr)
+        valid_shape_arr = _replicated_i64_vector(vshape, mesh)
+        result = sm(offset_arr, valid_shape_arr)
         result.block_until_ready()
         return result
 
