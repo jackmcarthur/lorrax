@@ -272,15 +272,24 @@ def _make_V_q_tile_kernel(
     _local_fftn_3d = make_sharded_fftn_3d(
         mesh_xy, blk_xy_5d_spec, blk_xy_5d_spec)
 
-    def _fft_and_sphere(zeta_rtot_mu, phase_batch):
-        """Local transpose + 3-D FFT + sphere pick (NO v multiply).
-
-        Returns (zeta_G, g0_blk).  ``g0_blk`` is the G=(0,0,0) column
-        (shape (Q, μ_per_rank), μ-XY-sharded).  ``zeta_G`` is the
-        sphere-gathered slab (shape (Q, μ_per_rank, n_G_sph), μ-XY-sharded).
-        """
+    # ------------------------------------------------------------------
+    # Top-level read+FFT+sphere helper.
+    #
+    # Takes a ζ slab in the disk layout ``P(None, None, ('x','y'))``
+    # (μ flat-sharded across the (x,y) mesh axes), reshards μ → leading
+    # second axis with the same flat ('x','y') sharding ``P(None,
+    # ('x','y'), None)``, runs the 5-D μ-XY-sharded FFT (custom-
+    # partitioned cuFFT plan), and gathers onto the flat-index G sphere.
+    # Returns ``(zeta_G, g0_blk)``:
+    #   zeta_G : (Q, μ_per_rank, n_G_sph)  P(None, ('x','y'), None)
+    #   g0_blk : (Q, μ_per_rank)            P(None, ('x','y'))
+    #
+    # No v(K) multiply here — that is applied once on the L side post-
+    # gather (see the kernel body below).
+    # ------------------------------------------------------------------
+    def _zeta_disk_to_G(zeta_disk, phase_batch):
         zeta_mu_r = jax.lax.with_sharding_constraint(
-            jnp.transpose(zeta_rtot_mu, (0, 2, 1)), blk_xy_sh)
+            jnp.transpose(zeta_disk, (0, 2, 1)), blk_xy_sh)
         Q, mu_per_rank, _ = zeta_mu_r.shape
         zeta_5d = jax.lax.with_sharding_constraint(
             zeta_mu_r.reshape(Q, mu_per_rank, nx, ny, nz) * phase_batch,
@@ -296,46 +305,69 @@ def _make_V_q_tile_kernel(
         zeta_G = jax.lax.with_sharding_constraint(zeta_G, blk_xy_sh)
         return zeta_G, g0_blk
 
+    # ------------------------------------------------------------------
+    # Shared kernel body.  ``same_zeta`` is a Python-static bool — when
+    # True, the second ζ_R G-space form is just an alias of ζ_L_G
+    # (single read + single FFT path).  When False, ζ_R is read+FFT'd
+    # independently from a distinct file.  Everything after the read
+    # branch is identical (two one-axis gathers, one-sided v multiply,
+    # einsum, DUS write).
+    # ------------------------------------------------------------------
+    def _kernel_body(V_acc, g0_acc,
+                     zeta_L_disk, zeta_R_disk_or_None,
+                     v_per_G_batch, phase_batch,
+                     q_lo_dyn, mu_lo_dyn, nu_lo_dyn):
+        zeta_L_G, g0_mu = _zeta_disk_to_G(zeta_L_disk, phase_batch)
+        if same_zeta:
+            zeta_R_G = zeta_L_G                       # static reuse
+        else:
+            zeta_R_G, _ = _zeta_disk_to_G(
+                zeta_R_disk_or_None, phase_batch)     # second read+FFT
+
+        zeta_mu_X = jax.lax.with_sharding_constraint(zeta_L_G, blk_x_sh)
+        zeta_nu_Y = jax.lax.with_sharding_constraint(zeta_R_G, blk_y_sh)
+
+        # One-sided v(K) multiply on the L (μ) side — handles signed
+        # transverse-projector weights for bispinor off-diagonal tiles;
+        # bit-identical to symmetric-√v for V^{0,0}.
+        zeta_mu_X = jax.lax.with_sharding_constraint(
+            zeta_mu_X * v_per_G_batch[:, None, :], blk_x_sh)
+
+        V_block = jnp.einsum('qmG,qnG->qmn',
+                             jnp.conj(zeta_mu_X), zeta_nu_Y,
+                             optimize=True)
+        V_block = jax.lax.with_sharding_constraint(V_block, V_sh)
+
+        V_new = jax.lax.dynamic_update_slice(
+            V_acc, V_block, (q_lo_dyn, mu_lo_dyn, nu_lo_dyn))
+        V_new = jax.lax.with_sharding_constraint(V_new, V_sh)
+
+        if write_g0:
+            g0_mu = jax.lax.with_sharding_constraint(g0_mu, g0_sh)
+            g0_new = jax.lax.dynamic_update_slice(
+                g0_acc, g0_mu, (q_lo_dyn, mu_lo_dyn))
+            g0_new = jax.lax.with_sharding_constraint(g0_new, g0_sh)
+        else:
+            g0_new = g0_acc
+        return V_new, g0_new
+
+    # Two jit signatures — same/distinct ζ differ only in argument count.
+    # The bodies share ``_kernel_body`` via the Python-static ``same_zeta``
+    # flag; XLA gets the right HLO either way.
     if same_zeta:
-        # Single ζ input — one FFT, two gathers from the same source.
         @partial(jax.jit,
                  in_shardings=(V_sh, g0_sh, zeta_disk_sh,
                                v_per_G_sh, phase_sh, rep, rep, rep),
                  out_shardings=(V_sh, g0_sh),
                  donate_argnums=(0, 1))
         def _kernel(V_acc, g0_acc,
-                    zeta_mu_disk,
+                    zeta_L_disk,
                     v_per_G_batch, phase_batch,
                     q_lo_dyn, mu_lo_dyn, nu_lo_dyn):
-            zeta_G, g0_mu = _fft_and_sphere(zeta_mu_disk, phase_batch)
-
-            zeta_mu_X = jax.lax.with_sharding_constraint(zeta_G, blk_x_sh)
-            zeta_nu_Y = jax.lax.with_sharding_constraint(zeta_G, blk_y_sh)
-
-            # One-sided v(K) multiply on the L (μ) side — handles signed
-            # transverse-projector weights for bispinor (off-diagonal call
-            # sites; here it's just v(q+G) for V^{0,0}).
-            zeta_mu_X = jax.lax.with_sharding_constraint(
-                zeta_mu_X * v_per_G_batch[:, None, :], blk_x_sh)
-
-            V_block = jnp.einsum('qmG,qnG->qmn',
-                                 jnp.conj(zeta_mu_X), zeta_nu_Y,
-                                 optimize=True)
-            V_block = jax.lax.with_sharding_constraint(V_block, V_sh)
-
-            V_new = jax.lax.dynamic_update_slice(
-                V_acc, V_block, (q_lo_dyn, mu_lo_dyn, nu_lo_dyn))
-            V_new = jax.lax.with_sharding_constraint(V_new, V_sh)
-
-            if write_g0:
-                g0_mu = jax.lax.with_sharding_constraint(g0_mu, g0_sh)
-                g0_new = jax.lax.dynamic_update_slice(
-                    g0_acc, g0_mu, (q_lo_dyn, mu_lo_dyn))
-                g0_new = jax.lax.with_sharding_constraint(g0_new, g0_sh)
-            else:
-                g0_new = g0_acc
-            return V_new, g0_new
-
+            return _kernel_body(
+                V_acc, g0_acc, zeta_L_disk, None,
+                v_per_G_batch, phase_batch,
+                q_lo_dyn, mu_lo_dyn, nu_lo_dyn)
     else:
         assert not write_g0, (
             "write_g0=True is only valid when same_zeta=True (V^{0,0} "
@@ -348,27 +380,13 @@ def _make_V_q_tile_kernel(
                  out_shardings=(V_sh, g0_sh),
                  donate_argnums=(0, 1))
         def _kernel(V_acc, g0_acc,
-                    zeta_mu_disk, zeta_nu_disk,
+                    zeta_L_disk, zeta_R_disk,
                     v_per_G_batch, phase_batch,
                     q_lo_dyn, mu_lo_dyn, nu_lo_dyn):
-            zeta_mu_G, _ = _fft_and_sphere(zeta_mu_disk, phase_batch)
-            zeta_nu_G, _ = _fft_and_sphere(zeta_nu_disk, phase_batch)
-
-            zeta_mu_X = jax.lax.with_sharding_constraint(zeta_mu_G, blk_x_sh)
-            zeta_nu_Y = jax.lax.with_sharding_constraint(zeta_nu_G, blk_y_sh)
-
-            zeta_mu_X = jax.lax.with_sharding_constraint(
-                zeta_mu_X * v_per_G_batch[:, None, :], blk_x_sh)
-
-            V_block = jnp.einsum('qmG,qnG->qmn',
-                                 jnp.conj(zeta_mu_X), zeta_nu_Y,
-                                 optimize=True)
-            V_block = jax.lax.with_sharding_constraint(V_block, V_sh)
-
-            V_new = jax.lax.dynamic_update_slice(
-                V_acc, V_block, (q_lo_dyn, mu_lo_dyn, nu_lo_dyn))
-            V_new = jax.lax.with_sharding_constraint(V_new, V_sh)
-            return V_new, g0_acc
+            return _kernel_body(
+                V_acc, g0_acc, zeta_L_disk, zeta_R_disk,
+                v_per_G_batch, phase_batch,
+                q_lo_dyn, mu_lo_dyn, nu_lo_dyn)
 
     _kernel.zeta_disk_sh = zeta_disk_sh
     _kernel.V_sh = V_sh
@@ -591,122 +609,82 @@ def compute_V_q_tile(
     # PHDF5 backend lands the slab directly in μ-on-XY layout; allgather
     # backend rank-0 reads then ``device_put``s with the same sharding.
     # Either way the kernel input is properly sharded.
-    if not tiled:
-        # === Case A — one read per q-batch.
-        q_coords = [(qx, qy, qz) for qx in range(nkx)
-                    for qy in range(nky) for qz in range(nkz)]
-        batches = [q_coords[i:i + q_chunk]
-                   for i in range(0, nq_total, q_chunk)]
+    #
+    # === Single nested loop covering both Case A (q-batched, μ_chunk=N_μ,
+    # n_mu_blocks=1) and Case B (q_chunk=1, μ-tiled, n_mu_blocks≥1).  The
+    # chooser sets ``q_chunk`` and ``mu_chunk`` such that exactly one of
+    # ``q_chunk > 1`` or ``n_mu_blocks > 1`` is true, never both.  The
+    # ``on_diag`` static check picks the single-FFT (single-read) path
+    # only when ``same_zeta`` AND the μ/ν blocks coincide; off-diagonal
+    # iterations always read+FFT a second ζ.
+    q_coords = [(qx, qy, qz) for qx in range(nkx)
+                for qy in range(nky) for qz in range(nkz)]
+    q_batches = [q_coords[i:i + q_chunk]
+                 for i in range(0, nq_total, q_chunk)]
+    mu_blocks = [(i * mu_chunk, min(mu_chunk, n_rmu_L - i * mu_chunk))
+                 for i in range(n_mu_blocks_L)]
+    nu_blocks = [(j * mu_chunk, min(mu_chunk, n_rmu_R - j * mu_chunk))
+                 for j in range(n_mu_blocks_R)]
 
-        with timing.section(timing_label):
-            q_cursor = 0
-            for batch in batches:
-                actual = len(batch)
-                kernel = _make_V_q_tile_kernel(
-                    sphere_idx=sphere_idx, n_G_sph=n_G_sph,
-                    fft_shape=fft_grid, mesh_xy=mesh_xy,
-                    q_chunk=actual, mu_size=n_rmu_L, nu_size=n_rmu_R,
-                    n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R,
-                    same_zeta=same_zeta,
-                    write_g0=(same_zeta and wants_g0))
-                qvecs = [_qvec_wrap(*c) for c in batch]
-                q_flat0 = batch[0][0] * (nky * nkz) + batch[0][1] * nkz + batch[0][2]
+    with timing.section(timing_label):
+        q_cursor = 0
+        for q_batch in q_batches:
+            actual = len(q_batch)
+            qvecs = [_qvec_wrap(*c) for c in q_batch]
+            v_per_G_b, phase_b = _v_phase_batch(qvecs, pad_to=actual)
+            q_flat0 = (q_batch[0][0] * (nky * nkz) +
+                       q_batch[0][1] * nkz + q_batch[0][2])
 
-                zeta_L = zeta_L_io.read_slab(
+            for mu_i, (mu_lo, mu_size) in enumerate(mu_blocks):
+                zeta_mu = zeta_L_io.read_slab(
                     'zeta_q',
-                    shape=(actual, n_rtot, n_rmu_L),
+                    shape=(actual, n_rtot, mu_size),
                     dtype=np.complex128,
-                    offset=(q_flat0, 0, 0),
+                    offset=(q_flat0, 0, mu_lo),
                     mesh=mesh_xy, partition_spec=_read_spec)
-                v_per_G_b, phase_b = _v_phase_batch(qvecs, pad_to=actual)
-                if same_zeta:
-                    V_acc, g0_work = kernel(
-                        V_acc, g0_work,
-                        zeta_L, v_per_G_b, phase_b,
-                        jnp.int32(q_cursor), jnp.int32(0), jnp.int32(0))
-                else:
-                    zeta_R = zeta_R_io.read_slab(
-                        'zeta_q',
-                        shape=(actual, n_rtot, n_rmu_R),
-                        dtype=np.complex128,
-                        offset=(q_flat0, 0, 0),
-                        mesh=mesh_xy, partition_spec=_read_spec)
-                    V_acc, g0_work = kernel(
-                        V_acc, g0_work,
-                        zeta_L, zeta_R, v_per_G_b, phase_b,
-                        jnp.int32(q_cursor), jnp.int32(0), jnp.int32(0))
-                    del zeta_R
-                del zeta_L
-                q_cursor += actual
-                for _ in range(actual):
-                    vq_progress.step()
-            vq_progress.finish()
-
-    else:
-        # === Case B — single q, μ × ν tile loop.  Diagonal blocks reuse
-        # the ζ_μ slab as ζ_ν (single-FFT, on_diag path); off-diagonal
-        # blocks read both.  ``write_g0`` is static per kernel.
-        with timing.section(timing_label):
-            for qx in range(nkx):
-              for qy in range(nky):
-                for qz in range(nkz):
-                    q_flat = qx * (nky * nkz) + qy * nkz + qz
-                    qvec_wrapped = _qvec_wrap(qx, qy, qz)
-                    v_per_G_b, phase_b = _v_phase_batch(
-                        [qvec_wrapped], pad_to=1)
-
-                    for mu_i in range(n_mu_blocks_L):
-                        mu_lo = mu_i * mu_chunk
-                        mu_size = min(mu_chunk, n_rmu_L - mu_lo)
-                        zeta_mu = zeta_L_io.read_slab(
+                for nu_j, (nu_lo, nu_size) in enumerate(nu_blocks):
+                    on_diag = (
+                        same_zeta and mu_i == nu_j and
+                        mu_lo == nu_lo and mu_size == nu_size
+                    )
+                    do_write_g0 = same_zeta and wants_g0 and on_diag
+                    if on_diag:
+                        # Single-read, single-FFT path — ζ_μ aliases ζ_ν.
+                        kernel = _make_V_q_tile_kernel(
+                            sphere_idx=sphere_idx, n_G_sph=n_G_sph,
+                            fft_shape=fft_grid, mesh_xy=mesh_xy,
+                            q_chunk=actual, mu_size=mu_size, nu_size=nu_size,
+                            n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R,
+                            same_zeta=True, write_g0=do_write_g0)
+                        V_acc, g0_work = kernel(
+                            V_acc, g0_work,
+                            zeta_mu, v_per_G_b, phase_b,
+                            jnp.int32(q_cursor),
+                            jnp.int32(mu_lo), jnp.int32(nu_lo))
+                    else:
+                        # Distinct ζ_R — second read + second FFT.
+                        zeta_nu = zeta_R_io.read_slab(
                             'zeta_q',
-                            shape=(1, n_rtot, mu_size),
+                            shape=(actual, n_rtot, nu_size),
                             dtype=np.complex128,
-                            offset=(q_flat, 0, mu_lo),
+                            offset=(q_flat0, 0, nu_lo),
                             mesh=mesh_xy, partition_spec=_read_spec)
-                        for nu_j in range(n_mu_blocks_R):
-                            nu_lo = nu_j * mu_chunk
-                            nu_size = min(mu_chunk, n_rmu_R - nu_lo)
-                            on_diag = (
-                                same_zeta and mu_i == nu_j and
-                                mu_lo == nu_lo and mu_size == nu_size
-                            )
-                            do_write_g0 = (
-                                same_zeta and wants_g0 and on_diag
-                            )
-                            if on_diag:
-                                k = _make_V_q_tile_kernel(
-                                    sphere_idx=sphere_idx, n_G_sph=n_G_sph,
-                                    fft_shape=fft_grid, mesh_xy=mesh_xy,
-                                    q_chunk=1, mu_size=mu_size, nu_size=nu_size,
-                                    n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R,
-                                    same_zeta=True, write_g0=do_write_g0)
-                                V_acc, g0_work = k(
-                                    V_acc, g0_work,
-                                    zeta_mu, v_per_G_b, phase_b,
-                                    jnp.int32(q_flat),
-                                    jnp.int32(mu_lo), jnp.int32(nu_lo))
-                            else:
-                                zeta_nu = zeta_R_io.read_slab(
-                                    'zeta_q',
-                                    shape=(1, n_rtot, nu_size),
-                                    dtype=np.complex128,
-                                    offset=(q_flat, 0, nu_lo),
-                                    mesh=mesh_xy, partition_spec=_read_spec)
-                                k = _make_V_q_tile_kernel(
-                                    sphere_idx=sphere_idx, n_G_sph=n_G_sph,
-                                    fft_shape=fft_grid, mesh_xy=mesh_xy,
-                                    q_chunk=1, mu_size=mu_size, nu_size=nu_size,
-                                    n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R,
-                                    same_zeta=False, write_g0=False)
-                                V_acc, g0_work = k(
-                                    V_acc, g0_work,
-                                    zeta_mu, zeta_nu, v_per_G_b, phase_b,
-                                    jnp.int32(q_flat),
-                                    jnp.int32(mu_lo), jnp.int32(nu_lo))
-                                del zeta_nu
-                        del zeta_mu
-                    vq_progress.step()
-            vq_progress.finish()
+                        kernel = _make_V_q_tile_kernel(
+                            sphere_idx=sphere_idx, n_G_sph=n_G_sph,
+                            fft_shape=fft_grid, mesh_xy=mesh_xy,
+                            q_chunk=actual, mu_size=mu_size, nu_size=nu_size,
+                            n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R,
+                            same_zeta=False, write_g0=False)
+                        V_acc, g0_work = kernel(
+                            V_acc, g0_work,
+                            zeta_mu, zeta_nu, v_per_G_b, phase_b,
+                            jnp.int32(q_cursor),
+                            jnp.int32(mu_lo), jnp.int32(nu_lo))
+                        del zeta_nu
+                del zeta_mu
+            q_cursor += actual
+            for _ in range(actual):
+                vq_progress.step()
+        vq_progress.finish()
 
     return V_acc, (g0_work if wants_g0 else None)
