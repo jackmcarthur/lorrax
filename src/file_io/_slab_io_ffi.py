@@ -178,6 +178,8 @@ def _normalize_slab_request(
     return off, shape, gshape
 
 
+# ``valid_shape`` is the logical file prefix inside a padded physical
+# slab.  It may be ragged; only the physical slab must divide the mesh.
 def _normalize_valid_shape(
     *,
     op: str,
@@ -432,6 +434,8 @@ class _FfiBackend:
         return ds_id
 
     # ------------------------------------------------------------------
+    # FFI write padding contract: shard ``A`` with equal local blocks,
+    # then let C++ clip each rank's file hyperslab to ``valid_shape``.
     def write_slab(
         self,
         name: str,
@@ -551,6 +555,8 @@ class _FfiBackend:
             self._drain_pending()
 
     # ------------------------------------------------------------------
+    # FFI read padding contract: output ``shape`` is equal-block
+    # sharded; C++ reads only ``valid_shape`` and zero-fills the rest.
     def read_slab(
         self,
         name: str,
