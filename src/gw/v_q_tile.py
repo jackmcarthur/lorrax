@@ -646,22 +646,43 @@ def compute_V_q_tile(
     nu_blocks = [(j * mu_chunk, min(mu_chunk, n_rmu_R - j * mu_chunk))
                  for j in range(n_mu_blocks_R)]
 
+    # Per-stage timing breakdown (env-gated).  Set
+    # ``LORRAX_V_Q_TIME_STAGES=1`` to get a per-batch breakdown of read
+    # vs kernel time.  Each iter calls ``block_until_ready`` only once at
+    # the end of the kernel block to keep the read-then-async-dispatch
+    # pattern intact while still attributing wall to the right stage.
+    _time_stages = bool(int(os.environ.get('LORRAX_V_Q_TIME_STAGES', '0') or 0))
+    import time as _time
+    t_read = 0.0
+    t_kernel = 0.0
+    t_vphase = 0.0
+
     with timing.section(timing_label):
         q_cursor = 0
         for q_batch in q_batches:
             actual = len(q_batch)
             qvecs = [_qvec_wrap(*c) for c in q_batch]
+            if _time_stages:
+                _t0 = _time.perf_counter()
             v_per_G_b, phase_b = _v_phase_batch(qvecs, pad_to=actual)
+            if _time_stages:
+                jax.block_until_ready(v_per_G_b)
+                t_vphase += _time.perf_counter() - _t0
             q_flat0 = (q_batch[0][0] * (nky * nkz) +
                        q_batch[0][1] * nkz + q_batch[0][2])
 
             for mu_i, (mu_lo, mu_size) in enumerate(mu_blocks):
+                if _time_stages:
+                    _t0 = _time.perf_counter()
                 zeta_mu = zeta_L_io.read_slab(
                     'zeta_q',
                     shape=(actual, n_rtot, mu_size),
                     dtype=np.complex128,
                     offset=(q_flat0, 0, mu_lo),
                     mesh=mesh_xy, partition_spec=_read_spec)
+                if _time_stages:
+                    jax.block_until_ready(zeta_mu)
+                    t_read += _time.perf_counter() - _t0
                 for nu_j, (nu_lo, nu_size) in enumerate(nu_blocks):
                     on_diag = (
                         same_zeta and mu_i == nu_j and
@@ -676,35 +697,57 @@ def compute_V_q_tile(
                             q_chunk=actual, mu_size=mu_size, nu_size=nu_size,
                             n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R,
                             same_zeta=True, write_g0=do_write_g0)
+                        if _time_stages:
+                            _t0 = _time.perf_counter()
                         V_acc, g0_work = kernel(
                             V_acc, g0_work,
                             zeta_mu, v_per_G_b, phase_b,
                             jnp.int32(q_cursor),
                             jnp.int32(mu_lo), jnp.int32(nu_lo))
+                        if _time_stages:
+                            jax.block_until_ready(V_acc)
+                            t_kernel += _time.perf_counter() - _t0
                     else:
                         # Distinct ζ_R — second read + second FFT.
+                        if _time_stages:
+                            _t0 = _time.perf_counter()
                         zeta_nu = zeta_R_io.read_slab(
                             'zeta_q',
                             shape=(actual, n_rtot, nu_size),
                             dtype=np.complex128,
                             offset=(q_flat0, 0, nu_lo),
                             mesh=mesh_xy, partition_spec=_read_spec)
+                        if _time_stages:
+                            jax.block_until_ready(zeta_nu)
+                            t_read += _time.perf_counter() - _t0
                         kernel = _make_V_q_tile_kernel(
                             sphere_idx=sphere_idx, n_G_sph=n_G_sph,
                             fft_shape=fft_grid, mesh_xy=mesh_xy,
                             q_chunk=actual, mu_size=mu_size, nu_size=nu_size,
                             n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R,
                             same_zeta=False, write_g0=False)
+                        if _time_stages:
+                            _t0 = _time.perf_counter()
                         V_acc, g0_work = kernel(
                             V_acc, g0_work,
                             zeta_mu, zeta_nu, v_per_G_b, phase_b,
                             jnp.int32(q_cursor),
                             jnp.int32(mu_lo), jnp.int32(nu_lo))
+                        if _time_stages:
+                            jax.block_until_ready(V_acc)
+                            t_kernel += _time.perf_counter() - _t0
                         del zeta_nu
                 del zeta_mu
             q_cursor += actual
             for _ in range(actual):
                 vq_progress.step()
         vq_progress.finish()
+
+    if _time_stages and verbose and jax.process_index() == 0:
+        total = t_read + t_kernel + t_vphase
+        print(f"  V_q tile stage breakdown (host-blocked, "
+              f"under-counts overlap):  read={t_read:.1f}s  "
+              f"kernel={t_kernel:.1f}s  v+phase={t_vphase:.1f}s  "
+              f"total={total:.1f}s")
 
     return V_acc, (g0_work if wants_g0 else None)
