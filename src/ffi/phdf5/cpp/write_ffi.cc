@@ -112,6 +112,35 @@ static std::vector<int64_t> unravel_rank(
     return coord;
 }
 
+template <typename T>
+static std::string vec_to_string(const std::vector<T>& v)
+{
+    std::ostringstream os;
+    os << "[";
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (i) os << ",";
+        os << v[i];
+    }
+    os << "]";
+    return os.str();
+}
+
+static bool write_debug_enabled()
+{
+    const char* env = std::getenv("LORRAX_PHDF5_WRITE_DEBUG");
+    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+static std::string h5_object_name(hid_t id)
+{
+    ssize_t n = H5Iget_name(id, nullptr, 0);
+    if (n <= 0) return "<unknown>";
+    std::string name((size_t)n + 1, '\0');
+    H5Iget_name(id, name.data(), (size_t)n + 1);
+    name.resize((size_t)n);
+    return name;
+}
+
 // Run H5Dwrite on the ctx writer thread.  If ``wait_for_d2h`` is
 // true, first cudaEventSynchronize on the ctx's reusable d2h_event
 // so the pinned host buffer is valid.  We deliberately DO NOT
@@ -141,9 +170,58 @@ static void async_worker(
                           "phdf5 async write: H5Dget_space failed"));
         return;
     }
+    int file_rank = H5Sget_simple_extent_ndims(filespace);
+    if (file_rank != rank) {
+        std::ostringstream os;
+        os << "phdf5 async write: dataset rank mismatch"
+           << " ds=" << h5_object_name(ds_id)
+           << " file_rank=" << file_rank
+           << " write_rank=" << rank;
+        H5Sclose(filespace);
+        promise.SetError(ffi::Error(ffi::ErrorCode::kInternal, os.str()));
+        return;
+    }
+    std::vector<hsize_t> extent((size_t)rank, 0);
+    std::vector<hsize_t> max_extent((size_t)rank, 0);
+    if (H5Sget_simple_extent_dims(filespace, extent.data(), max_extent.data()) < 0) {
+        H5Sclose(filespace);
+        promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
+                          "phdf5 async write: H5Sget_simple_extent_dims failed"));
+        return;
+    }
+    bool out_of_bounds = false;
+    for (int d = 0; d < rank; ++d) {
+        if (offset[(size_t)d] + count[(size_t)d] > extent[(size_t)d]) {
+            out_of_bounds = true;
+        }
+    }
+    bool debug = write_debug_enabled();
+    if (debug || out_of_bounds) {
+        std::fprintf(stderr,
+            "[phdf5-write rank=%d ds=%s id=%lld] extent=%s offset=%s count=%s "
+            "collective=%d oob=%d\n",
+            ctx->rank, h5_object_name(ds_id).c_str(), (long long)ds_id,
+            vec_to_string(extent).c_str(), vec_to_string(offset).c_str(),
+            vec_to_string(count).c_str(), ctx->use_collective_write ? 1 : 0,
+            out_of_bounds ? 1 : 0);
+        std::fflush(stderr);
+    }
+    if (out_of_bounds) {
+        std::ostringstream os;
+        os << "phdf5 async write: hyperslab out of bounds"
+           << " ds=" << h5_object_name(ds_id)
+           << " extent=" << vec_to_string(extent)
+           << " offset=" << vec_to_string(offset)
+           << " count=" << vec_to_string(count)
+           << " rank=" << ctx->rank;
+        H5Sclose(filespace);
+        promise.SetError(ffi::Error(ffi::ErrorCode::kInternal, os.str()));
+        return;
+    }
     if (H5Sselect_hyperslab(filespace, H5S_SELECT_SET,
                              offset.data(), nullptr,
                              count.data(),  nullptr) < 0) {
+        if (debug) H5Eprint2(H5E_DEFAULT, stderr);
         H5Sclose(filespace);
         promise.SetError(ffi::Error(ffi::ErrorCode::kInternal,
                           "phdf5 async write: H5Sselect_hyperslab failed"));
@@ -160,6 +238,7 @@ static void async_worker(
     hid_t dxpl = ctx->use_collective_write ? ctx->dxpl_coll : ctx->dxpl_indep;
     herr_t st = H5Dwrite(ds_id, native_type, memspace, filespace, dxpl,
                          pinned_buf);
+    if (st < 0 && debug) H5Eprint2(H5E_DEFAULT, stderr);
 
     H5Sclose(memspace);
     H5Sclose(filespace);
