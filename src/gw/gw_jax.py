@@ -713,6 +713,7 @@ def main(argv=None):
 		sigma_xc_at_dft_ev=sigma_xc_at_dft_ev,
 		sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,
 		omega_rel_ev=omega_rel_ev,
+		efermi_ev=efermi_dft_ev,
 		sigma_omega_h5_path=sigma_omega_h5_path,
 		tensors_filename=tensors_filename,
 	)
