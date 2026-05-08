@@ -189,6 +189,10 @@ def main(argv=None):
 	wfns = isdf.wf_bundle
 
 	# --- Screening: χ₀ → W = (1 − Vχ)⁻¹ V ---
+	# V_qmunu is already flat-q ``(nq, μ, μ)``; downstream consumers
+	# bind ``V_q`` to that array directly.  ``flatten_V_qmunu`` is kept
+	# as a back-compat no-op for restart paths that may still feed in
+	# the legacy 8-D layout.
 	V_q = flatten_V_qmunu(V_qmunu)
 	if config.do_screened:
 		with timing.section("gw_jax.chi0_W"):

@@ -618,9 +618,14 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None):
 	"""Compute bare Coulomb V_qmunu from zeta HDF5 and write G0 back.
 
-	Returns (V_qmunu, G0) where V_qmunu has shape (1, npol, npol, nq, μ, μ)
-	(flat-q) and G0 is (n_rmu,) ζ_μ(G=0) at q=0.  Downstream consumers
-	that need the 3-D-k form reshape inside ``common.fft_helpers.make_flat_k_fft``.
+	Returns (V_qmunu, G0) where V_qmunu has shape (nq, μ, μ) (flat-q)
+	and G0 is (n_rmu,) ζ_μ(G=0) at q=0.  Downstream consumers that need
+	the 3-D-k form reshape inside ``common.fft_helpers.make_flat_k_fft``.
+
+	The legacy ``(1, npol, npol, …)`` leading axes are gone — bispinor
+	will introduce a structured ``V_q_bispinor`` NamedTuple (CC, CT, TT)
+	rather than packing all polarisation tiles into a uniform tensor,
+	because charge and transverse channels use different μ counts.
 	"""
 	from .compute_vcoul import compute_all_V_q
 
@@ -692,12 +697,12 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 			f.create_dataset('g0_mu', data=np.asarray(G0_gathered))
 	jax.experimental.multihost_utils.sync_global_devices("g0_write")
 
-	# Add polarization axes: (nq, μ, μ) → (1, npol, npol, nq, μ, μ).
-	# Flat-q convention: keep the q axis 1-D throughout; consumers that
-	# need the (nkx, nky, nkz) form reshape inside an FFT helper.
-	V_qmunu = jnp.array(jnp.broadcast_to(
-		V_q_raw[None, None, None],
-		(1, meta.npol, meta.npol, meta.nk_tot, meta.n_rmu, meta.n_rmu)))
+	# Scalar V_qmunu is just (nq, μ, μ).  The (1, npol, npol) leading
+	# axes of the legacy 8-D layout were never used in scalar mode and
+	# have no place once bispinor switches to a structured tile container
+	# (CC + CT(3) + TT(3,3) NamedTuple) since the μ counts differ across
+	# polarisation tiles.  See agent/v_q_perf design discussion 2026-05-08.
+	V_qmunu = V_q_raw
 
 	G0 = G0_gathered
 	while G0.ndim > 1:
@@ -705,7 +710,8 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 
 	print_fn(f"\n  V_q computed:")
 	print_fn(f"    Shape: {V_qmunu.shape}")
-	print_fn(f"    V_q=0 trace: {jnp.trace(V_q_raw[0, 0, 0]).real:.4f}")
+	# V_q_raw is now flat-q (nq, μ, μ); q=0 slab is V_q_raw[0].
+	print_fn(f"    V_q=0 trace: {jnp.trace(V_q_raw[0]).real:.4f}")
 	return V_qmunu, G0
 
 
@@ -791,12 +797,14 @@ def prepare_isdf_and_wavefunctions(
 				wfn, sym, band_slices.full_range,
 				(band_slices.b1, band_slices.b3), nspinor=meta.nspinor)
 
-			# Flush V_q / G0 / enk + W0 placeholder immediately.
+			# Flush V_q / G0 / enk + W0 placeholder immediately.  Pass
+			# kgrid so BSE downstream can recover the (nkx, nky, nkz)
+			# split from flat-q V_qmunu without re-reading the WFN.
 			write_restart_state_to_h5(
 				tensors_filename,
 				V_qmunu=V_qmunu, G0_mu_nu=G0, enk_full=enk_full,
 				init_W0=True, mesh=mesh_xy, backend=cfg.backend.slab_io,
-				mode="w",
+				mode="w", kgrid=tuple(int(v) for v in meta.kgrid),
 			)
 
 			with timing.section("gw_jax.wavefunction_setup"):

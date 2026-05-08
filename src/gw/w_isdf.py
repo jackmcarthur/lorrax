@@ -423,16 +423,24 @@ def resolve_minimax_energy_reference(
 # ---------------------------------------------------------------------------
 
 def flatten_V_qmunu(V_qmunu):
-    """Strip the ``(1, npol, npol)`` leading axes; output is flat-q
-    ``(nq, μ, μ)``.
+    """Strip the legacy ``(1, npol, npol, …)`` leading axes if present;
+    pass through if already flat-q ``(nq, μ, μ)``.
 
-    ``V_qmunu`` is now produced flat-q by ``compute_all_V_q`` (the q
-    axis is 1-D throughout the gw/cohsex pipeline; consumers that need
-    the 3-D-k form reshape inside ``common.fft_helpers.make_flat_k_fft``).
-    This helper is kept as a thin shim for back-compat with old restart
-    files / call sites that still index against the 6-D shape.
+    ``V_qmunu`` is now produced flat-q by ``compute_all_V_q``
+    (``(nq, μ, μ)``).  This helper is kept as a back-compat shim for
+    restart files written under the old 8-D ``(1, npol, npol, nkx, nky,
+    nkz, μ, μ)`` layout — strips the polarisation axes AND flattens the
+    k-grid.  In the new flat-q world it's a no-op.
     """
-    return jnp.asarray(V_qmunu)[0, 0, 0]
+    arr = jnp.asarray(V_qmunu)
+    if arr.ndim == 8:
+        # Legacy (1, npol, npol, nkx, nky, nkz, μ, μ) → flat-q (nq, μ, μ).
+        return arr[0, 0, 0].reshape(-1, arr.shape[-2], arr.shape[-1])
+    if arr.ndim == 6:
+        # Transitional (1, npol, npol, nq, μ, μ) → flat-q (nq, μ, μ).
+        return arr[0, 0, 0]
+    # Already flat-q (3-D).
+    return arr
 
 
 def build_static_quadrature(wfns, minimax_config, *, print_fn=None):

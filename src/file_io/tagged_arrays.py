@@ -26,6 +26,7 @@ def write_restart_state_to_h5(
     backend=None,
     use_ffi_io: bool | None = None,
     mode: str = "w",
+    kgrid: tuple[int, int, int] | None = None,
 ):
     """Write (subset of) canonical restart state via SlabIO.
 
@@ -48,6 +49,13 @@ def write_restart_state_to_h5(
                 backend=backend, use_ffi_io=use_ffi_io) as io:
         if mode == "w":
             io.write_attr("restart_format_version", np.int64(2))
+        # kgrid attr lets BSE recover the (nkx,nky,nkz) split from
+        # flat-q V_qmunu / W0_qmunu without re-opening the WFN.  Stored
+        # as a length-3 int64 dataset (the SlabIO ``write_attr`` path
+        # accepts list/tuple).  Optional: callers that don't pass it
+        # leave the attr unset; BSE falls back to reading WFN.
+        if kgrid is not None and mode == "w":
+            io.write_attr("kgrid", np.asarray(kgrid, dtype=np.int64))
 
         def _write(name, arr):
             if arr is None:
@@ -203,17 +211,24 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None):
     from types import SimpleNamespace
     V_qmunu, S_qmunu, psi_full_y_raw, enk_full, V0_noG0_munu, G0_mu_nu = read_restart_state_from_h5(filename)
 
-    # V_qmunu is now flat-q ``(1, npol, npol, nq, μ, μ)`` (was 8-D
-    # ``(1, npol, npol, nkx, nky, nkz, μ, μ)`` before the flat-q
-    # convention change); μ × μ are still the trailing two axes that
-    # carry the (x, y) sharding.
-    x4y5_6 = NamedSharding(mesh_xy, P(None, None, None, None, "x", "y"))
+    # V_qmunu is now flat-q ``(nq, μ, μ)``.  Earlier formats had leading
+    # ``(1, npol, npol)`` axes (and even earlier, the ``(nkx, nky, nkz)``
+    # split); both are gone in the new gw/cohsex pipeline.  μ × μ are
+    # still the trailing two axes that carry the (x, y) sharding.
+    x1y2_3 = NamedSharding(mesh_xy, P(None, "x", "y"))
     x3y4_5 = NamedSharding(mesh_xy, P(None, None, None, "x", "y"))
     y3_psi_Y = NamedSharding(mesh_xy, P(None, None, None, "y"))
     x1_psi_X = NamedSharding(mesh_xy, P(None, "x", None, None))
     replicated_2 = NamedSharding(mesh_xy, P(None, None))
 
-    V_qmunu = jax.lax.with_sharding_constraint(V_qmunu, x4y5_6)
+    # Back-compat: handle restarts written under the old 8-D layout by
+    # collapsing leading axes; the new 3-D form passes through.
+    if V_qmunu.ndim == 8:
+        V_qmunu = jnp.asarray(V_qmunu)[0, 0, 0].reshape(
+            -1, V_qmunu.shape[-2], V_qmunu.shape[-1])
+    elif V_qmunu.ndim == 6:
+        V_qmunu = jnp.asarray(V_qmunu)[0, 0, 0]
+    V_qmunu = jax.lax.with_sharding_constraint(V_qmunu, x1y2_3)
     if S_qmunu is not None:
         S_qmunu = jax.lax.with_sharding_constraint(S_qmunu, x3y4_5)
     if V0_noG0_munu is not None:

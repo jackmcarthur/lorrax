@@ -81,8 +81,31 @@ from common.fft_helpers import make_sharded_fftn_3d
 # ``_choose_v_q_chunks`` distinct-ζ path doubles this further (10×) since
 # both ζ_L_disk and ζ_R_disk are alive simultaneously at the kernel input
 # boundary.  Override with ``LORRAX_V_Q_FFT_COEF=<float>`` for A/B tests.
-_Q_COMPUTE_COEF_GATHER = 4.4
 _Q_COMPUTE_COEF_FFT = float(os.environ.get('LORRAX_V_Q_FFT_COEF', '5.0'))
+
+
+def _gather_stage_per_q_bytes(*, n_rmu: int, n_G: int,
+                              p_x: int, p_y: int) -> float:
+    """Per-rank, per-Q peak memory of the gather + contract stage.
+
+    Three sharded slabs are alive simultaneously at the contract: the
+    post-sphere ζ_G ``(Q, μ/p_prod, n_G)``, plus the two one-axis-gathered
+    slabs ζ_μ_X ``(Q, μ/p_x, n_G)`` and ζ_ν_Y ``(Q, μ/p_y, n_G)``.  Sum
+    of per-rank live bytes per Q is
+
+        N_zeta · μ · n_G · (1/p_x + 1/p_y + 1/(p_x · p_y))
+
+    No magic constant: the formula is just "three slabs alive at
+    contract time".  Replaces the legacy empirical coefficient
+    ``_Q_COMPUTE_COEF_GATHER = 4.4`` (calibrated on MoS2 / Si 10³ on a
+    different mesh and over-predicting on CrI3 by ~2× — it never bit
+    perf because the FFT stage dominates ``max(gather, fft)``, but it
+    was the last system-specific magic in the chooser).
+    """
+    return 16.0 * float(n_rmu) * float(n_G) * (
+        1.0 / float(p_x) + 1.0 / float(p_y) +
+        1.0 / (float(p_x) * float(p_y))
+    )
 
 
 _v_q_aot_cache: dict = {}
@@ -183,7 +206,9 @@ def _choose_v_q_chunks(
                               (no collective on update)
     """
     N_zeta = 16.0  # c128
-    p_min = float(min(int(p_x), int(p_y)))
+    # p_min was the conservative gather divisor used by the legacy
+    # _Q_COMPUTE_COEF_GATHER heuristic; gone now that the gather stage
+    # is modelled analytically as 1/p_x + 1/p_y + 1/(p_x·p_y).
     p_prod = float(int(p_x) * int(p_y))
 
     # Accumulator reservation (V_ref + g0_ref, per-rank sharded bytes).
@@ -200,7 +225,9 @@ def _choose_v_q_chunks(
     # FFT starts already has both buffers alive.
     fft_coef = _Q_COMPUTE_COEF_FFT * (1.0 if same_zeta else 2.0)
 
-    one_q_gather = _Q_COMPUTE_COEF_GATHER * N_zeta * n_rmu * n_G / p_min
+    one_q_gather = _gather_stage_per_q_bytes(
+        n_rmu=int(n_rmu), n_G=int(n_G),
+        p_x=int(p_x), p_y=int(p_y))
 
     # Prefer the AOT (slope, intercept) model from XLA memory_analysis
     # over the flat ``_Q_COMPUTE_COEF_FFT`` heuristic.  Models the FFT
@@ -235,10 +262,14 @@ def _choose_v_q_chunks(
     B_compute_after_fixed = B_compute - fft_workspace_fixed
     slack_after_one_q = B_compute_after_fixed - (one_q_bytes + v_per_q_bytes)
     if slack_after_one_q < 0:
-        # Case B — single q, tile μ × ν.
+        # Case B — single q, tile μ × ν.  Gather-stage budget on μ_chunk:
+        # peak_gather(μ_chunk) = (1/p_x + 1/p_y + 1/(p_x·p_y)) · 16 · μ_chunk · n_G
+        gather_per_mu_row = _gather_stage_per_q_bytes(
+            n_rmu=1, n_G=int(n_G),
+            p_x=int(p_x), p_y=int(p_y))
         mu_chunk_max_gather = int(
-            (B_compute_after_fixed - v_per_q_bytes) * p_min /
-            (2.0 * N_zeta * n_G))
+            (B_compute_after_fixed - v_per_q_bytes) /
+            max(1.0, gather_per_mu_row))
         if aot_slope is not None:
             # AOT-exact FFT slope scales linearly with μ (batch dim of
             # the FFT) at fixed Q=1; divide by n_rmu to get the per-μ-row
@@ -281,7 +312,9 @@ def _choose_v_q_chunks(
             mu_chunk = max(snap, mu_chunk_max - (mu_chunk_max % snap))
 
         n_mu_blocks = (int(n_rmu) + mu_chunk - 1) // mu_chunk
-        peak_gather = 2.0 * N_zeta * mu_chunk * n_G / p_min
+        peak_gather = _gather_stage_per_q_bytes(
+            n_rmu=int(mu_chunk), n_G=int(n_G),
+            p_x=int(p_x), p_y=int(p_y))
         if aot_slope is not None:
             peak_fft = (aot_slope / max(1, int(n_rmu))) * mu_chunk + fft_workspace_fixed
         elif n_rtot is not None and n_rtot > 0:
