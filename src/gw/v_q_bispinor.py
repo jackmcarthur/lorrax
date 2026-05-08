@@ -290,15 +290,28 @@ def compute_V_q_bispinor_to_h5(
             f"(CC + 3 TT-diag + 3 TT-off) to {output_h5_path}"
         )
 
-    with SlabIO(output_h5_path, mode="w", mesh=mesh_xy,
+    # SlabIO's FFI backend ``encode``s the path string for the C call,
+    # so cast Path → str before passing through.
+    #
+    # Per-tile open/close: the PHDF5 backend's async writer thread + new
+    # dataset creation can race when several distinct-shape datasets are
+    # written through one open SlabIO context (we hit
+    # ``MPI_File_set_view: Invalid datatype`` on the third tile of an
+    # initial run).  Reopening the file in mode='a' between tiles forces
+    # the writer to drain + H5Fclose, which cleanly resets the MPI-IO
+    # datatype cache.  Cost: 7 extra collective open+close pairs (~ms
+    # each), negligible vs the kernel + read time.
+    output_path_str = str(output_h5_path)
+
+    # First open: write the numeric metadata + truncate any prior file.
+    with SlabIO(output_path_str, mode="w", mesh=mesh_xy,
                 backend=backend, use_ffi_io=use_ffi_io) as io:
-        # Numeric metadata via SlabIO.write_attr (back-end agnostic).
-        # Strings + JSON go via h5py post-close (rank 0 only) — see below.
         io.write_attr("kgrid", np.asarray(kgrid, dtype=np.int64))
         io.write_attr("n_rmu_C", np.int64(n_rmu_C))
         io.write_attr("n_rmu_T", np.int64(n_rmu_T))
         io.write_attr("n_q_total", np.int64(nq_total))
 
+    if True:
         for tile_idx, (mu_L, nu_L) in enumerate(UNIQUE_TILES):
             same_zeta = (mu_L == nu_L)
             zeta_L = zeta_C_io if mu_L == 0 else zeta_T_ios[mu_L - 1]
@@ -362,17 +375,22 @@ def compute_V_q_bispinor_to_h5(
             )
 
             # === Stream this tile to disk ====================================
+            # Per-tile open in mode='a' so each write fully drains before
+            # the next dataset is created.
             name = tile_dataset_name(mu_L, nu_L)
             v_shape = tuple(int(s) for s in V_acc.shape)
-            io.create_dataset(name, shape=v_shape, dtype=V_acc.dtype)
-            io.write_slab(name, V_acc, global_shape=v_shape)
+            with SlabIO(output_path_str, mode='a', mesh=mesh_xy,
+                        backend=backend, use_ffi_io=use_ffi_io) as tile_io:
+                tile_io.create_dataset(
+                    name, shape=v_shape, dtype=V_acc.dtype)
+                tile_io.write_slab(name, V_acc, global_shape=v_shape)
 
-            if wants_g0 and g0_acc is not None:
-                g0_shape = tuple(int(s) for s in g0_acc.shape)
-                io.create_dataset(
-                    f"{name}_g0", shape=g0_shape, dtype=g0_acc.dtype)
-                io.write_slab(
-                    f"{name}_g0", g0_acc, global_shape=g0_shape)
+                if wants_g0 and g0_acc is not None:
+                    g0_shape = tuple(int(s) for s in g0_acc.shape)
+                    tile_io.create_dataset(
+                        f"{name}_g0", shape=g0_shape, dtype=g0_acc.dtype)
+                    tile_io.write_slab(
+                        f"{name}_g0", g0_acc, global_shape=g0_shape)
 
             # Free device memory before the next tile.  The kernel cache
             # in v_q_tile holds the compiled artifact for this shape; it
@@ -433,7 +451,7 @@ class BispinorVqReader:
         import h5py
         self._filename = Path(filename)
         self._mesh = mesh_xy
-        self._io = SlabIO(self._filename, mode="r", mesh=mesh_xy,
+        self._io = SlabIO(str(self._filename), mode="r", mesh=mesh_xy,
                           backend=backend, use_ffi_io=use_ffi_io)
         self._io.__enter__()
 
@@ -476,6 +494,11 @@ class BispinorVqReader:
             sharding,
         )
 
+    def _tile_shape(self, mu_L: int, nu_L: int) -> tuple[int, int, int]:
+        n_L = self.n_rmu_C if mu_L == 0 else self.n_rmu_T
+        n_R = self.n_rmu_C if nu_L == 0 else self.n_rmu_T
+        return (self.n_q_total, n_L, n_R)
+
     def get_tile(self, mu_L: int, nu_L: int) -> jax.Array:
         """Return V^{μ_L, ν_L}_q as a sharded JAX array (n_q, n_L, n_R) c128."""
         if not (0 <= mu_L <= 3 and 0 <= nu_L <= 3):
@@ -486,14 +509,17 @@ class BispinorVqReader:
         spec = P(None, 'x', 'y')
         if (mu_L, nu_L) in HERMITIAN_PAIRS:
             companion = HERMITIAN_PAIRS[(mu_L, nu_L)]
+            comp_shape = self._tile_shape(*companion)
             V_companion = self._io.read_slab(
                 tile_dataset_name(*companion),
+                shape=comp_shape, dtype=jnp.complex128,
                 mesh=self._mesh, partition_spec=spec)
             # Hermitian: V[j,i](q,μ,ν) = V[i,j](q,ν,μ)*
             return jnp.conj(jnp.swapaxes(V_companion, -1, -2))
         # Direct read (member of UNIQUE_TILES)
         return self._io.read_slab(
             tile_dataset_name(mu_L, nu_L),
+            shape=self._tile_shape(mu_L, nu_L), dtype=jnp.complex128,
             mesh=self._mesh, partition_spec=spec)
 
     def get_g0_CC(self) -> jax.Array | None:
@@ -501,6 +527,8 @@ class BispinorVqReader:
         try:
             return self._io.read_slab(
                 tile_dataset_name(0, 0) + "_g0",
+                shape=(self.n_q_total, self.n_rmu_C),
+                dtype=jnp.complex128,
                 mesh=self._mesh,
                 partition_spec=P(None, 'x'))
         except Exception:
