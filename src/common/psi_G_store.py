@@ -49,6 +49,40 @@ from jax.sharding import Mesh, PartitionSpec as P
 _PSI_G_SPEC = P(None, ('x', 'y'), None, None, None, None)
 
 
+def _zero_user_band_pad_in_shard(
+    shard_data: np.ndarray,
+    *,
+    bc_range: tuple[int, int],
+    shard_band_slice: slice,
+    user_band_stop: int,
+) -> np.ndarray:
+    """Zero locally-owned padded bands inside one ψ(G) shard.
+
+    ``Meta.b_id_4`` may be larger than the user's requested ``nband`` so
+    the band axis divides the device mesh.  A phdf5 read can still return
+    real DFT coefficients for those padded slots when the WFN file has
+    enough bands.  The centroid loader zeros them after extraction; this
+    helper applies the same contract to the host ψ(G) cache used by the
+    r-chunk ζ fit.
+    """
+    b0, _ = (int(bc_range[0]), int(bc_range[1]))
+    s0 = 0 if shard_band_slice.start is None else int(shard_band_slice.start)
+    s1 = shard_data.shape[1] if shard_band_slice.stop is None else int(shard_band_slice.stop)
+    step = 1 if shard_band_slice.step is None else int(shard_band_slice.step)
+    if step != 1:
+        raise ValueError(
+            f"ψ(G) shard band slice must be contiguous; got {shard_band_slice!r}")
+
+    local_global_bands = b0 + np.arange(s0, s1, dtype=np.int64)
+    pad_mask = local_global_bands >= int(user_band_stop)
+    if not np.any(pad_mask):
+        return shard_data
+
+    out = np.array(shard_data, copy=True)
+    out[:, pad_mask, :, :, :, :] = 0.0
+    return out
+
+
 def _mesh_device_coords(mesh: Mesh) -> dict:
     """Map ``id(device) → (x_idx, y_idx)`` for every device in the mesh.
 
@@ -147,7 +181,14 @@ class PsiGStore:
             for shard in psi_G_bc.addressable_shards:
                 x, y = self._coords[id(shard.device)]
                 tile = self._host_tiles[(x, y)]
-                tile[:, b_lo:b_hi, :, :, :, :] = np.asarray(shard.data)
+                shard_band_slice = shard.index[1]
+                data = _zero_user_band_pad_in_shard(
+                    np.asarray(shard.data),
+                    bc_range=bc_range,
+                    shard_band_slice=shard_band_slice,
+                    user_band_stop=int(getattr(self.meta, "b_id_4_user", self.meta.b_id_4)),
+                )
+                tile[:, b_lo:b_hi, :, :, :, :] = data
             del psi_G_bc  # release device memory before next bc
 
     def _clear_tiles(self) -> None:

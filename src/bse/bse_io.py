@@ -276,9 +276,51 @@ def _read_wq_sharded(
     local_coords, grid_x, grid_y = _get_local_mesh_coords(mesh_xy)
     local_x, local_y = _get_local_axis_coords(local_coords)
     _assert_local_block(local_coords, local_x, local_y)
-    n_rmu = dset.shape[6]
-    n_rnu = dset.shape[7]
-    nkx, nky, nkz = dset.shape[3:6]
+    # Dataset axis-shape compat shim — handle three layouts:
+    # 8-D legacy ``(1, npol, npol, nkx, nky, nkz, μ, ν)``,
+    # 6-D transitional ``(1, npol, npol, nq, μ, ν)``,
+    # 3-D flat-q ``(nq, μ, ν)``.  Only the first carries kgrid in the
+    # shape; for the others the caller must pass kgrid via ``input_file``
+    # → WFN.  Internal BSE work below stays in the
+    # ``(μ, μ, nkx, nky, nkz)`` form, so we convert on read.
+    if dset.ndim == 8:
+        n_rmu = int(dset.shape[6])
+        n_rnu = int(dset.shape[7])
+        nkx, nky, nkz = (int(s) for s in dset.shape[3:6])
+        _read_munu_slab = lambda mu0, mu1, nu0, nu1: np.transpose(
+            dset[0, 0, 0, :, :, :, mu0:mu1, nu0:nu1], (3, 4, 0, 1, 2))
+    else:
+        if dset.ndim == 6:
+            n_rmu = int(dset.shape[-2])
+            n_rnu = int(dset.shape[-1])
+            nq = int(dset.shape[3])
+            _flat = lambda mu0, mu1, nu0, nu1: np.asarray(
+                dset[0, 0, 0, :, mu0:mu1, nu0:nu1])
+        else:  # 3-D flat-q
+            n_rmu = int(dset.shape[-2])
+            n_rnu = int(dset.shape[-1])
+            nq = int(dset.shape[0])
+            _flat = lambda mu0, mu1, nu0, nu1: np.asarray(
+                dset[:, mu0:mu1, nu0:nu1])
+        # Caller must supply kgrid; bse_io can't read WFN here without
+        # threading input_file in, so accept it as a ``dset.attrs['kgrid']``
+        # if present, or ask the caller to provide.
+        if 'kgrid' in dset.attrs:
+            nkx, nky, nkz = (int(v) for v in dset.attrs['kgrid'])
+        else:
+            raise ValueError(
+                "_load_per_axis_padded_w_block: V/W dataset is flat-q but "
+                "no 'kgrid' attribute on the dataset; restart writer must "
+                "annotate kgrid for BSE to recover the (nkx, nky, nkz) "
+                "form.  Tracked as a follow-up; needs the writer side "
+                "(tagged_arrays.write_restart_state_to_h5) to add the attr.")
+        if nkx * nky * nkz != nq:
+            raise ValueError(
+                f"kgrid {nkx}×{nky}×{nkz} ≠ nq={nq}")
+        _read_munu_slab = (lambda mu0, mu1, nu0, nu1:
+            _flat(mu0, mu1, nu0, nu1)
+            .reshape(nkx, nky, nkz, mu1 - mu0, nu1 - nu0)
+            .transpose(3, 4, 0, 1, 2))
 
     local_mu = mu_per_x * len(local_x)
     local_nu = nu_per_y * len(local_y)
@@ -294,8 +336,7 @@ def _read_wq_sharded(
             nu_end = min(nu_start + nu_per_y, n_rnu)
             if nu_start >= n_rnu:
                 continue
-            slab = dset[0, 0, 0, :, :, :, mu_start:mu_end, nu_start:nu_end]
-            slab = np.transpose(slab, (3, 4, 0, 1, 2))
+            slab = _read_munu_slab(mu_start, mu_end, nu_start, nu_end)
             if slab.shape[0] < mu_per_x or slab.shape[1] < nu_per_y:
                 pad_mu = mu_per_x - slab.shape[0]
                 pad_nu = nu_per_y - slab.shape[1]
@@ -343,9 +384,30 @@ def load_bse_data_from_restart_sharded(
         psi_full_dset = f["psi_full_y"]
         enk_full = np.asarray(f["enk_full"][:])
 
-        nkx, nky, nkz = vq_dset.shape[3:6]
-        n_rmu = int(vq_dset.shape[6])
-        n_rnu = int(vq_dset.shape[7])
+        # Same axis-shape compat shim as ``_load_per_axis_padded_w_block``.
+        if vq_dset.ndim == 8:
+            nkx, nky, nkz = (int(s) for s in vq_dset.shape[3:6])
+            n_rmu = int(vq_dset.shape[6])
+            n_rnu = int(vq_dset.shape[7])
+        else:
+            n_rmu = int(vq_dset.shape[-2])
+            n_rnu = int(vq_dset.shape[-1])
+            if 'kgrid' in vq_dset.attrs:
+                nkx, nky, nkz = (int(v) for v in vq_dset.attrs['kgrid'])
+            elif 'kgrid' in f:
+                kgrid_vals = np.asarray(f['kgrid'][:]).reshape(-1)
+                nkx, nky, nkz = (int(kgrid_vals[0]), int(kgrid_vals[1]),
+                                  int(kgrid_vals[2]))
+            elif input_file is not None:
+                from file_io import WFNReader
+                _wfn = WFNReader(_parse_wfn_path(input_file))
+                nkx, nky, nkz = (int(_wfn.kgrid[0]), int(_wfn.kgrid[1]),
+                                  int(_wfn.kgrid[2]))
+            else:
+                raise ValueError(
+                    "load_bse_data_from_restart_sharded: flat-q V_qmunu "
+                    "needs kgrid; restart file has no top-level 'kgrid' "
+                    "dataset and no input_file passed to fall back to WFN.")
         if n_rmu != n_rnu:
             raise ValueError("Expected square μ/ν dimensions in V_qmunu")
 
@@ -771,9 +833,44 @@ def _load_ring_subset(
             print(f"BSE: q=0 head injected (rank-1 in μν, V_cell={cell_volume:.2f}): "
                   f"{v_str}, {w_str}")
 
-    nkx, nky, nkz = V_qmunu.shape[3:6]
+    # V_qmunu axis-shape compatibility shim:
+    #   * legacy 8-D ``(1, npol, npol, nkx, nky, nkz, μ, μ)`` — read kgrid
+    #     directly from the shape;
+    #   * legacy 6-D ``(1, npol, npol, nq, μ, μ)`` — strip leading axes
+    #     and read kgrid from the WFN;
+    #   * new flat-q 3-D ``(nq, μ, μ)`` — read kgrid from the WFN.
+    # Internal BSE machinery still wants ``W_q`` shaped as
+    # ``(μ, μ, nkx, nky, nkz)``; we reshape after normalising V_qmunu.
+    if V_qmunu.ndim == 8:
+        nkx, nky, nkz = V_qmunu.shape[3:6]
+        n_rmu = int(V_qmunu.shape[-1])
+        V_qmunu_flat = jnp.asarray(V_qmunu)[0, 0, 0].reshape(
+            -1, n_rmu, n_rmu)
+        if W0_qmunu is not None:
+            W0_qmunu_flat = jnp.asarray(W0_qmunu)[0, 0, 0].reshape(
+                -1, n_rmu, n_rmu)
+        else:
+            W0_qmunu_flat = None
+    else:
+        if input_file is None:
+            raise ValueError(
+                "BSE: flat-q V_qmunu requires input_file to resolve "
+                "kgrid from the WFN")
+        from file_io import WFNReader
+        _wfn = WFNReader(_parse_wfn_path(input_file))
+        nkx, nky, nkz = (int(_wfn.kgrid[0]), int(_wfn.kgrid[1]), int(_wfn.kgrid[2]))
+        n_rmu = int(V_qmunu.shape[-1])
+        if V_qmunu.ndim == 6:
+            V_qmunu_flat = jnp.asarray(V_qmunu)[0, 0, 0]
+            W0_qmunu_flat = (jnp.asarray(W0_qmunu)[0, 0, 0]
+                              if W0_qmunu is not None else None)
+        else:
+            V_qmunu_flat = jnp.asarray(V_qmunu)  # already (nq, μ, μ)
+            W0_qmunu_flat = (jnp.asarray(W0_qmunu)
+                              if W0_qmunu is not None else None)
+    V_qmunu = V_qmunu_flat
+    W0_qmunu = W0_qmunu_flat
     nk = nkx * nky * nkz
-    n_rmu = int(V_qmunu.shape[-1])
     lcm_xy = math.lcm(px, py)
     n_rmu_pad = ((n_rmu + lcm_xy - 1) // lcm_xy) * lcm_xy
 
@@ -801,10 +898,15 @@ def _load_ring_subset(
     psi_c, n_cond_pad = _pad_axis_to_multiple(psi_c, axis=1, multiple=px)
     eps_v, _ = _pad_axis_to_multiple(eps_v, axis=1, multiple=py)
     eps_c, _ = _pad_axis_to_multiple(eps_c, axis=1, multiple=px)
-    V_q0 = V_qmunu[0, 0, 0, 0, 0, 0, :, :]
+    # V_qmunu is now flat-q (nq, μ, μ) post-shim; q=0 is V_qmunu[0].
+    V_q0 = V_qmunu[0]
     V_q0 = _pad_last_two_axes(V_q0, n_rmu_pad)
     W_src = W0_qmunu if W0_qmunu is not None else V_qmunu
-    W_q = W_src[0, 0, 0, :, :, :, :, :].transpose(3, 4, 0, 1, 2)
+    # W_src: (nq, μ, μ).  Reshape flat-q → 3-D-k and transpose to the
+    # ``(μ, μ, nkx, nky, nkz)`` layout the downstream BSE machinery
+    # consumes.  This is the ONE place the 3-D-k form materialises
+    # inside BSE; elsewhere we keep flat-q.
+    W_q = W_src.reshape(nkx, nky, nkz, n_rmu, n_rmu).transpose(3, 4, 0, 1, 2)
     W_q = _pad_first_two_axes(W_q, n_rmu_pad)
 
     key = jax.random.PRNGKey(0)

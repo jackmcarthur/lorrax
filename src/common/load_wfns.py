@@ -684,9 +684,15 @@ def get_sharded_wfns_centroids(
     nb = b_end - b_start
     n_rmu = len(centroid_indices)
     
-    # Cache key
+    # Cache key.  The compiled gather closes over the centroid positions, so
+    # different centroid files with the same count must not share a closure.
+    centroid_indices_np = np.asarray(jax.device_get(centroid_indices), dtype=np.int64)
+    centroids_hash = hash((centroid_indices_np.shape, centroid_indices_np.tobytes()))
     kvecs_hash = hash(kvecs_frac.tobytes())
-    cache_key = ('centroid_extract', id(mesh_xy), nk_tot, nspinor, n_rmu, nx, ny, nz, kvecs_hash)
+    cache_key = (
+        'centroid_extract', id(mesh_xy), nk_tot, nspinor, n_rmu,
+        nx, ny, nz, kvecs_hash, centroids_hash,
+    )
     
     if cache_key not in _centroid_extract_cache:
         out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
@@ -708,7 +714,7 @@ def get_sharded_wfns_centroids(
         n_rtot_cached = n_rtot
         
         # Pre-compute centroid linear indices (int64 for XLA compatibility)
-        centroids = jnp.asarray(centroid_indices, dtype=jnp.int64)
+        centroids = jnp.asarray(centroid_indices_np, dtype=jnp.int64)
         centroid_lin = (centroids[:, 0] * (ny * nz) + centroids[:, 1] * nz + centroids[:, 2]).astype(jnp.int64)
         
         # The band axis is padded to be divisible by p_x*p_y for the FFT.

@@ -92,9 +92,12 @@ def _register_and_open_dataset(fh: int, ds_name: str) -> int:
 # =============================================================================
 #  Low-level FFI call wrappers (one per handler)
 # =============================================================================
+# Low-level padding contract: out_struct is the physical equal-block
+# shard; valid_shape is the logical file prefix that C++ reads.
 def ffi_read_call(
     out_struct: jax.ShapeDtypeStruct,
     offset_base: jax.Array,
+    valid_shape: jax.Array,
     *,
     ctx_handle: int,
     ds_id: int,
@@ -104,13 +107,15 @@ def ffi_read_call(
 ) -> jax.Array:
     """Single-hyperslab read — one H5Dread of one rectangle.
 
-    ``offset_base`` is a ``(ndim,)`` int64 ``jax.Array`` passed as a
-    runtime buffer (not an FFI Attr), so the shard_map closure compiles
-    ONCE per ``(dataset, ndim, dtype, sharding)`` tuple and re-dispatches
-    across chunks with different offsets.
+    ``offset_base`` and ``valid_shape`` are ``(ndim,)`` int64
+    ``jax.Array`` buffers passed at runtime (not as FFI Attrs), so the
+    shard_map closure compiles ONCE per ``(dataset, ndim, dtype,
+    sharding)`` tuple and re-dispatches across chunks with different
+    offsets or logical extents.
     """
     return jax.ffi.ffi_call(_TARGET_READ, out_struct)(
         offset_base,
+        valid_shape,
         ctx_handle=int(ctx_handle),
         ds_id=int(ds_id),
         mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
@@ -205,10 +210,11 @@ def read_sharded_slab(
     local_shape = (n_rows // p, n_cols // q)
     out_struct = jax.ShapeDtypeStruct(local_shape, jnp.dtype(dtype))
     offset_zero = jnp.zeros((2,), dtype=jnp.int64)
+    valid_shape = jnp.asarray((n_rows, n_cols), dtype=jnp.int64)
 
-    def _per_rank(offset_local):
+    def _per_rank(offset_local, valid_shape_local):
         return ffi_read_call(
-            out_struct, offset_local,
+            out_struct, offset_local, valid_shape_local,
             ctx_handle=int(fh), ds_id=int(ds_id),
             mesh_shape=(p, q),
             axis_count_per_dim=(1, 1),
@@ -217,9 +223,9 @@ def read_sharded_slab(
 
     return shard_map(
         _per_rank, mesh=mesh,
-        in_specs=(P(),), out_specs=P("x", "y"),
+        in_specs=(P(), P()), out_specs=P("x", "y"),
         check_rep=False,
-    )(offset_zero)
+    )(offset_zero, valid_shape)
 
 
 def read_kchunk_sharded(

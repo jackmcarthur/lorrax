@@ -74,13 +74,27 @@ def _build_chunk_alphas(*, nk, ns, mu, nq, band_chunk, p_x, p_y, p, nr) -> _Chun
     )
 
 
-def _fft_moment(cr, base, fft_inloop_bytes, a: _ChunkAlphas):
-    """Peak during one bc-iteration's FFT + reshard + accumulate.
+def _fft_moment(cr, base, fft_inloop_bytes, a: _ChunkAlphas, *, n_bc: int = 1):
+    """Peak across the bc-loop's FFT + reshard + accumulate.
 
-    Live: base + 2× pair-density accumulators + the FFT workspace + the
-    post-reshard ψ_bc_Y slab.
+    Live during a single bc-iteration: base + 2× pair-density accumulators
+    + the FFT workspace + the post-reshard ψ_bc_Y slab.
+
+    BUT: ``_make_fit_one_rchunk_kernel`` Python-unrolls the bc-loop
+    (``for bc_idx in band_chunk_ranges`` over ``n_bc`` iterations) inside
+    one giant jit, so XLA sees n_bc separate ``io_callback + FFT +
+    reshard + accumulate`` traces.  The FFT workspace itself can be
+    reused iter-to-iter (one cuFFT plan, scratch reused), but each
+    iter's post-reshard ψ_bc_Y is a distinct buffer the scheduler can
+    keep live concurrently with later iters' to overlap fetch with
+    accumulate — measured cumulative live across unroll matches
+    ``n_bc · α_psi_Y_bc · cr`` on CrI3 16-GPU (was missing 17 GB at
+    chunk_r=112016, band_chunk=16, n_bc=5).
+
+    Pass ``n_bc=1`` to recover the per-iter peak (the legacy model);
+    pass ``n_bc = nb / band_chunk`` to honour the unroll cost.
     """
-    return base + 2 * a.α_pair * cr + fft_inloop_bytes + a.α_psi_Y_bc * cr
+    return base + 2 * a.α_pair * cr + fft_inloop_bytes + n_bc * a.α_psi_Y_bc * cr
 
 
 def _zct_moment(cr, base, a: _ChunkAlphas):
@@ -104,15 +118,19 @@ def _gather_moment(cr, base, q_gather, a: _ChunkAlphas):
 
 
 def _max_cr_per_stage(headroom, fft_cost_in_loop, a: _ChunkAlphas, *,
-                      nr_max, m_budget, m_zct_cap) -> dict:
+                      nr_max, m_budget, m_zct_cap, n_bc: int = 1) -> dict:
     """Closed-form max feasible ``cr`` for each moment (linear inversion).
 
     Each moment is ``base + α·cr + c`` so ``cr ≤ (headroom − c) / α``; the
     caller takes the minimum over moments.  Returns a per-stage dict so the
     bottleneck can be reported.
+
+    ``n_bc`` honours the Python-unrolled bc-loop cost in the FFT moment
+    (cumulative ψ_bc_Y across n_bc iters live concurrent under XLA's
+    fused jit) — see :func:`_fft_moment` for the full rationale.
     """
     # Optional soft cap on zct stage (env override for tight-memory systems).
-    denom_fft = 2 * a.α_pair + a.α_psi_Y_bc
+    denom_fft = 2 * a.α_pair + n_bc * a.α_psi_Y_bc
     denom_zct = (2 + _ZCT_ADDITIONAL_COEF) * a.α_pair
     denom_solve = 2 * a.α_zcol + 2 * a.α_z_slice
     limits = {
@@ -234,18 +252,22 @@ def compute_optimal_chunks(
         band_chunk=band_chunk, p_x=p_x, p_y=p_y, p=p, nr=nr,
     )
 
-    def _eval_stages(cr, base, fft_inloop):
+    def _eval_stages(cr, base, fft_inloop, n_bc):
         """Forward-evaluate each moment at a given cr.
 
         Returns ``(stages_dict, m_zcol, m_solve_per_q, m_gather_per_q, k_batch)``.
         Note: ``fft_inloop`` already includes the input (=m_psi_G_bc), output,
         and cuFFT scratch via ``query_fft_peak_bytes``.
+
+        ``n_bc`` is the number of bc-iterations the kernel's Python-unrolled
+        bc-loop emits — fed into ``_fft_moment`` so the cumulative ψ_bc_Y
+        live across iters is honoured.
         """
         m_zcol = alphas.α_zcol * cr
         m_solve_per_q = 2 * alphas.α_z_slice * cr + alphas.c_solve
         m_gather_per_q = alphas.α_gather * cr
         stages = {
-            'fft':     _fft_moment(cr, base, fft_inloop, alphas),
+            'fft':     _fft_moment(cr, base, fft_inloop, alphas, n_bc=n_bc),
             'zct':     _zct_moment(cr, base, alphas),
             'reshard': _reshard_moment(cr, base, alphas),
             'solve':   base + 2 * m_zcol + m_solve_per_q,    # q_batch=1 in AOT
@@ -253,7 +275,9 @@ def compute_optimal_chunks(
         }
         # k_batch sizing — uses per-k FFT cost to pack as many k's as
         # headroom allows.  Only matters for centroid-load FFT, which is a
-        # separate pre-loop stage.
+        # separate pre-loop stage.  The k_batch sizing models a SINGLE bc
+        # iter (one centroid load), not the cumulative bc-unroll, so this
+        # term keeps the legacy 1× α_psi_Y_bc.
         fft_per_k = _FFT_COPIES * _bytes_c128(bpd, ns, nr) + _bytes_c128(nr)
         fft_head = m_budget - base - (2 * alphas.α_pair + alphas.α_psi_Y_bc) * cr
         k_batch = 1
@@ -272,12 +296,16 @@ def compute_optimal_chunks(
         headroom = m_budget - base
         if headroom <= alphas.c_solve:
             return None
+        # bc-loop is Python-unrolled inside the fit_one_rchunk kernel;
+        # n_bc copies of psi_bc_Y stack across XLA's fused trace.
+        n_bc = max(1, -(-int(nb) // int(band_chunk)))
         if override and override > 0:
             cr = min(int(override), int(nr))
         else:
             limits = _max_cr_per_stage(
                 headroom, fft_inloop, alphas,
                 nr_max=nr, m_budget=m_budget, m_zct_cap=m_zct_cap,
+                n_bc=n_bc,
             )
             cr = min(int(nr), max(0, int(min(limits.values()))))
         pt = p_x * p_y  # cr must be divisible by p_total for solve sharding
@@ -285,7 +313,7 @@ def compute_optimal_chunks(
             cr -= cr % pt
         if cr <= 0:
             return None
-        stages, m_zcol, m_spq, m_gpq, k_batch = _eval_stages(cr, base, fft_inloop)
+        stages, m_zcol, m_spq, m_gpq, k_batch = _eval_stages(cr, base, fft_inloop, n_bc)
         return {
             'chunk_r': cr, 'peak': max(stages.values()),
             'bottleneck': max(stages, key=stages.get), 'stages': stages,
@@ -590,8 +618,14 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None):
 	"""Compute bare Coulomb V_qmunu from zeta HDF5 and write G0 back.
 
-	Returns (V_qmunu, G0) where V_qmunu has shape (1, npol, npol, nkx, nky, nkz, μ, μ)
-	and G0 is (n_rmu,) ζ_μ(G=0) at q=0.
+	Returns (V_qmunu, G0) where V_qmunu has shape (nq, μ, μ) (flat-q)
+	and G0 is (n_rmu,) ζ_μ(G=0) at q=0.  Downstream consumers that need
+	the 3-D-k form reshape inside ``common.fft_helpers.make_flat_k_fft``.
+
+	The legacy ``(1, npol, npol, …)`` leading axes are gone — bispinor
+	will introduce a structured ``V_q_bispinor`` NamedTuple (CC, CT, TT)
+	rather than packing all polarisation tiles into a uniform tensor,
+	because charge and transverse channels use different μ counts.
 	"""
 	from .compute_vcoul import compute_all_V_q
 
@@ -601,7 +635,10 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 
 	bvec = np.asarray(wfn.blat * wfn.bvec, dtype=np.float64)
 
-	# V_q memory model: 2 zeta reads + 1 FFT workspace = 3× (μ × n_G × 16 bytes)
+	# V_q memory budget (per rank).  The unified V_q tile chooser inside
+	# ``compute_all_V_q`` derives q_chunk and μ_chunk from this budget and
+	# the system geometry (n_rmu, n_G, n_rtot, mesh shape) directly — no
+	# need for the caller to pre-compute legacy μ/q-batch hints.
 	if mem_est is None:
 		mem_est = {}
 	budget_gb = float(mem_est.get('available_vcoul_gb', cfg.memory.per_device_gb))
@@ -611,24 +648,6 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	except Exception:
 		pass
 	m_budget = max(0.1, budget_gb) * 1e9
-	m_per_mu = 3 * 16 * meta.n_rtot
-	mu_chunk = max(1, min(meta.n_rmu, int(m_budget / m_per_mu)))
-	q_batch = 1
-	if mu_chunk >= meta.n_rmu and meta.nk_tot > 1:
-		q_batch = max(1, min(4, meta.nk_tot, int(m_budget // max(1.0, 2.0 * 16 * meta.n_rmu * meta.n_rtot))))
-
-	# get_device_memory_info reports this rank's free HBM, which can
-	# differ across ranks (pool fragmentation, non-symmetric allocations
-	# before this point) → mu_chunk + q_batch can diverge across ranks.
-	# _compute_all_V_q_replicated then branches on (n_chunks == 1) at
-	# line ~884; divergent branches across ranks deadlock on the first
-	# collective inside one branch (observed 2026-04-18 w/ FFI read).
-	# Fix: broadcast rank 0's numbers to every rank so they agree.
-	if jax.process_count() > 1:
-		_mq = jnp.asarray([int(mu_chunk), int(q_batch)], dtype=jnp.int64)
-		_mq = jax.experimental.multihost_utils.broadcast_one_to_all(_mq)
-		mu_chunk = int(jax.device_get(_mq)[0])
-		q_batch = int(jax.device_get(_mq)[1])
 
 	# Default to ecutwfc — matches BGW's screened_coulomb_cutoff convention
 	# (BGW truncates the pair-density v(q+G) sphere at ecutwfc).  The previous
@@ -642,15 +661,11 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		print_fn(f"    V_q bare cutoff: {vcoul_cutoff_ry:.1f} Ry")
 
 	print_fn(f"    V_q budget:    {budget_gb:.2f} GB")
-	print_fn(f"    V_q mu chunks: {mu_chunk}")
-	if q_batch > 1:
-		print_fn(f"    V_q q batches: {q_batch}")
 
 	from file_io.slab_io import SlabIO
-	# Single dispatcher: ``compute_all_V_q`` selects the right kernel from
-	# the SlabIO backend (PHDF5_FFI → mesh-parallel ζ reads + outer jit,
-	# H5PY_ALLGATHER → replicated rank-0 read with μ-chunking + optional
-	# q-batching).
+	# Single dispatcher routes to the unified V_q tile driver (one inner
+	# kernel handles same/distinct ζ × Case A/B; one outer driver handles
+	# both PHDF5/FFI and h5py-allgather backends).
 	with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
 		with SlabIO(zeta_h5_path, mode='r', mesh=mesh_xy,
 		            backend=cfg.backend.slab_io) as zeta_io:
@@ -667,9 +682,6 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 					mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
 					bare_coulomb_cutoff=vcoul_cutoff_ry,
 					bgw_v_grid_fn=bgw_v_grid_fn,
-					mu_chunk_size=mu_chunk,
-					q_batch_size=(q_batch if mu_chunk >= meta.n_rmu
-					              else None),
 					budget_bytes=m_budget,
 				)
 
@@ -685,10 +697,12 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 			f.create_dataset('g0_mu', data=np.asarray(G0_gathered))
 	jax.experimental.multihost_utils.sync_global_devices("g0_write")
 
-	# Add polarization axes: (nkx, nky, nkz, μ, μ) → (1, npol, npol, nkx, nky, nkz, μ, μ)
-	nkx, nky, nkz = meta.kgrid
-	V_qmunu = jnp.array(jnp.broadcast_to(
-		V_q_raw[None, None, None], (1, meta.npol, meta.npol, nkx, nky, nkz, meta.n_rmu, meta.n_rmu)))
+	# Scalar V_qmunu is just (nq, μ, μ).  The (1, npol, npol) leading
+	# axes of the legacy 8-D layout were never used in scalar mode and
+	# have no place once bispinor switches to a structured tile container
+	# (CC + CT(3) + TT(3,3) NamedTuple) since the μ counts differ across
+	# polarisation tiles.  See agent/v_q_perf design discussion 2026-05-08.
+	V_qmunu = V_q_raw
 
 	G0 = G0_gathered
 	while G0.ndim > 1:
@@ -696,7 +710,8 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 
 	print_fn(f"\n  V_q computed:")
 	print_fn(f"    Shape: {V_qmunu.shape}")
-	print_fn(f"    V_q=0 trace: {jnp.trace(V_q_raw[0, 0, 0]).real:.4f}")
+	# V_q_raw is now flat-q (nq, μ, μ); q=0 slab is V_q_raw[0].
+	print_fn(f"    V_q=0 trace: {jnp.trace(V_q_raw[0]).real:.4f}")
 	return V_qmunu, G0
 
 
@@ -782,12 +797,14 @@ def prepare_isdf_and_wavefunctions(
 				wfn, sym, band_slices.full_range,
 				(band_slices.b1, band_slices.b3), nspinor=meta.nspinor)
 
-			# Flush V_q / G0 / enk + W0 placeholder immediately.
+			# Flush V_q / G0 / enk + W0 placeholder immediately.  Pass
+			# kgrid so BSE downstream can recover the (nkx, nky, nkz)
+			# split from flat-q V_qmunu without re-reading the WFN.
 			write_restart_state_to_h5(
 				tensors_filename,
 				V_qmunu=V_qmunu, G0_mu_nu=G0, enk_full=enk_full,
 				init_W0=True, mesh=mesh_xy, backend=cfg.backend.slab_io,
-				mode="w",
+				mode="w", kgrid=tuple(int(v) for v in meta.kgrid),
 			)
 
 			with timing.section("gw_jax.wavefunction_setup"):
