@@ -429,23 +429,25 @@ def main(argv=None):
 		# the on-device ``sigma_c_omega`` plus replicated (sig_x, sig_h),
 		# so a future outer QSGW iteration loop can pass refreshed inputs
 		# in without touching the disk.
-		omega_grid_ev = np.asarray(ppm_options.omega_grid_ev, dtype=np.float64)
+		# All quantities below are in **Rydberg** until the scissor's print
+		# summary and final eV outputs.  Σ_c(ω) lives natively in Ry on the
+		# Ry ω-grid; mixing that with eV-converted h0/Σ_x is a footgun.
+		omega_grid_ry = np.asarray(ppm_options.omega_grid_ry, dtype=np.float64)
 
-		# Diagonal Σ_c(ω, k, n) replicated on host (a few MB).
-		sigma_c_diag_w_kn_ev = np.asarray(extract_sigma_diag_replicated(
-			ppm_outputs.sigma_c_omega, mesh_xy)) * RYD_TO_EV
-		sigma_x_diag_kn_ev = (
-			np.real(np.diagonal(np.asarray(sig_x), axis1=1, axis2=2)) * RYD_TO_EV)
-		sigma_xc_diag_w_kn_ev = sigma_c_diag_w_kn_ev + sigma_x_diag_kn_ev[None, :, :]
+		# Diagonal Σ_c(ω, k, n) and Σ_x(k, n) replicated on host, in Ry.
+		sigma_c_diag_w_kn_ry = np.asarray(extract_sigma_diag_replicated(
+			ppm_outputs.sigma_c_omega, mesh_xy))
+		sigma_x_diag_kn_ry = np.real(
+			np.diagonal(np.asarray(sig_x), axis1=1, axis2=2))
+		sigma_xc_diag_w_kn_ry = sigma_c_diag_w_kn_ry + sigma_x_diag_kn_ry[None, :, :]
 
-		# Diagonal Σ(E) fixed point (host NumPy, vectorised).
-		h0_diag_ev = (
-			np.real(np.diagonal(np.asarray(kin_ion + sig_h), axis1=1, axis2=2))
-			* RYD_TO_EV)
-		efermi = float(efermi_dft_ev)
-		E_sc_rel_ev, _, n_iter = solve_diagonal_sigma_fixed_point(
-			h0_diag_ev - efermi, sigma_xc_diag_w_kn_ev, omega_grid_ev,
-			max_iter=120, tol_ev=1e-7, mixing=0.6,
+		# Diagonal Σ(E) fixed point in Ry.
+		h0_diag_ry = np.real(
+			np.diagonal(np.asarray(kin_ion + sig_h), axis1=1, axis2=2))
+		efermi_ry = float(efermi_dft_ev) / RYD_TO_EV
+		E_sc_rel_ry, _, n_iter = solve_diagonal_sigma_fixed_point(
+			h0_diag_ry - efermi_ry, sigma_xc_diag_w_kn_ry, omega_grid_ry,
+			max_iter=120, tol_ev=1.0e-7 / RYD_TO_EV, mixing=0.6,
 		)
 
 		# Per-band scissor for out-of-grid bands.  A band is "in-grid" iff
@@ -458,9 +460,9 @@ def main(argv=None):
 		# zeroth-order QP correction = 0 estimate); the older fallback
 		# of using ``eigvalsh(H_qp)`` was unreliable for pseudobands.
 		from .scissor import classify_bands_in_grid, fit_scissor
-		E_dft_rel_ev = np.asarray(omega_dft_rel_ev, dtype=np.float64)
+		E_dft_rel_ry = np.asarray(omega_dft_rel_ev, dtype=np.float64) / RYD_TO_EV
 		band_in_grid, in_grid_kn_band = classify_bands_in_grid(
-			E_dft_rel_ev, float(omega_grid_ev[0]), float(omega_grid_ev[-1]))
+			E_dft_rel_ry, float(omega_grid_ry[0]), float(omega_grid_ry[-1]))
 		n_bands_in = int(band_in_grid.sum())
 		n_bands_total = int(band_in_grid.size)
 		print0(
@@ -471,26 +473,32 @@ def main(argv=None):
 			and 0 < n_bands_in < n_bands_total
 		):
 			occ_mask_kn = np.broadcast_to(
-				np.arange(E_sc_rel_ev.shape[1])[None, :] < meta.nelec,
-				E_sc_rel_ev.shape).astype(bool)
+				np.arange(E_sc_rel_ry.shape[1])[None, :] < meta.nelec,
+				E_sc_rel_ry.shape).astype(bool)
+			# Fit in eV so the printed slopes/intercepts are human-readable.
 			fit = fit_scissor(
-				E_dft_rel_ev, np.real(E_sc_rel_ev - E_dft_rel_ev),
+				E_dft_rel_ry * RYD_TO_EV,
+				np.real(E_sc_rel_ry - E_dft_rel_ry) * RYD_TO_EV,
 				valence_mask_kn=occ_mask_kn,
 				fit_mask_kn=in_grid_kn_band,
 			)
 			print0(f"  Scissor fit: {fit.summary()}")
-			extrap_rel = E_dft_rel_ev + fit.predict(E_dft_rel_ev, occ_mask_kn)
-			E_sc_rel_ev = np.where(in_grid_kn_band, E_sc_rel_ev, extrap_rel)
+			extrap_rel_ry = E_dft_rel_ry + fit.predict(
+				E_dft_rel_ry * RYD_TO_EV, occ_mask_kn) / RYD_TO_EV
+			E_sc_rel_ry = np.where(in_grid_kn_band, E_sc_rel_ry, extrap_rel_ry)
 		else:
-			E_sc_rel_ev = np.where(in_grid_kn_band, E_sc_rel_ev, E_dft_rel_ev)
-		E_sc_ev = E_sc_rel_ev + efermi
+			E_sc_rel_ry = np.where(in_grid_kn_band, E_sc_rel_ry, E_dft_rel_ry)
+		E_sc_rel_ev = E_sc_rel_ry * RYD_TO_EV
+		E_sc_ev = E_sc_rel_ev + (efermi_ry * RYD_TO_EV)
 
 		# QSGW Σ_xc^QSGW: sharded ω-tensor + replicated E_sc → replicated Σ_xc.
+		# Build kernel takes ω-grid and evaluation energies in **eV**; we
+		# convert at the seam (kernel internals convert; result is Ry).
 		sig_x_rep = jax.device_put(jnp.asarray(sig_x),
 			NamedSharding(mesh_xy, P(None, None, None)))
 		sigma_xc_qsgw_kij_ry, qsgw_diag = build_qsgw_sigma_xc(
 			ppm_outputs.sigma_c_omega, sig_x_rep,
-			omega_grid_ev, E_sc_rel_ev, mesh_xy,
+			omega_grid_ry * RYD_TO_EV, E_sc_rel_ev, mesh_xy,
 		)
 		print0(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
 			f"({100*qsgw_diag['frac_clipped']:.1f}%)")
@@ -553,9 +561,49 @@ def main(argv=None):
 
 	sigma_c_diag_at_dft_ry = (
 		sigma_c_at_dft_ev / RYD_TO_EV
-		if (mode.is_dynamic and meta.rank == 0 and sigma_c_at_dft_ev is not None)
+		if (mode.is_dynamic and sigma_c_at_dft_ev is not None)
 		else None
 	)
+
+	# ---- Optional Σ-decomposition debug table (rank-0, all in eV) ----
+	# Single seam at the H-build output: dumps the diagonal pieces that
+	# feed E_QP so a downstream investigator can verify
+	# E_QP ≟ kin_ion + V_H + Σ_xc(E_DFT).  Only PPM-mode columns
+	# (Σ_c(0), Σ_c(E_DFT)) are emitted in dynamic modes; static modes
+	# emit Σ_SX, Σ_COH instead.
+	if meta.rank == 0 and config.debug.sigma_freq_debug_output:
+		from file_io import write_sigma_freq_debug_table
+		_e_dft_ev_full = np.asarray(enk_dft, dtype=np.float64) * RYD_TO_EV
+		_kin_diag_ev = np.real(
+			np.diagonal(np.asarray(kin_ion), axis1=1, axis2=2)) * RYD_TO_EV
+		_v_h_diag_ev = np.real(
+			np.diagonal(np.asarray(sig_h), axis1=1, axis2=2)) * RYD_TO_EV
+		_sig_x_diag_ev = np.real(
+			np.diagonal(np.asarray(sig_x), axis1=1, axis2=2)) * RYD_TO_EV
+		_e_qp_ev = np.asarray(E_full, dtype=np.float64) * RYD_TO_EV
+		_cols = [
+			("E_dft", _e_dft_ev_full),
+			("Edft-Ef", _e_dft_ev_full - float(efermi_dft_ev or 0.0)),
+			("kin_ion", _kin_diag_ev),
+			("V_H", _v_h_diag_ev),
+			("x_bare", _sig_x_diag_ev),
+		]
+		if mode.is_dynamic and sigma_c_omega_diag_ev is not None:
+			_w0 = sigma_c_omega_diag_ev.shape[0] // 2
+			_cols.append(("sig_c(0)", sigma_c_omega_diag_ev[_w0]))
+			if sigma_c_at_dft_ev is not None:
+				_cols.append(("sig_c(Edft)", sigma_c_at_dft_ev))
+		else:
+			_cols.append(
+				("sex_0", np.real(np.diagonal(
+					np.asarray(sig_sx), axis1=1, axis2=2)) * RYD_TO_EV))
+			_cols.append(
+				("coh_0", np.real(np.diagonal(
+					np.asarray(sig_coh), axis1=1, axis2=2)) * RYD_TO_EV))
+		_cols.append(("E_qp", _e_qp_ev))
+		write_sigma_freq_debug_table(
+			config.debug.sigma_freq_debug_file, _cols)
+		print0(f"  Sigma freq debug: {config.debug.sigma_freq_debug_file}")
 
 	# ---- Output ----
 	results = GWResults(

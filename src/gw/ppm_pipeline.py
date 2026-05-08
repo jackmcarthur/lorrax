@@ -177,19 +177,21 @@ def _eval_sigma_c_at_dft_energies(
     sigma_omega: 'object', *,                          # noqa: F821 (forward decl)
     ppm_options: PPMSigmaRuntimeOptions,
     sig_x: jax.Array,
-    band_slices, wfn, sym, meta,
+    band_slices, wfn, sym, meta, mesh_xy,
     print_fn,
 ):
-    """On rank 0, interpolate diag(Σ_c)(ω) at each DFT energy.
+    """Interpolate diag(Σ_c)(ω) at each DFT energy on all ranks.
+
+    Pulls the replicated diagonal of Σ_c(ω, k, m, n) via
+    :func:`qsgw_utils.extract_sigma_diag_replicated` (cheap allgather of
+    the diagonal only, ~MB) so the result is consistent across ranks —
+    required by the post-Σ flow in ``gw_jax`` which now runs on all
+    ranks.  The streamed-mode fallback (``sigma_c_omega is None``) uses
+    a single rank-0 h5 read followed by an MPI broadcast.
 
     Returns ``(sigma_c_at_dft_ev, sigma_xc_at_dft_ev, omega_dft_rel_ev,
-    efermi_dft_ev)``.  Off-rank-0 returns ``(None, None, None, None)``.
+    efermi_dft_ev)``, all replicated.
     """
-    if meta.rank != 0:
-        return None, None, None, None
-
-    import h5py
-
     enk_dft, _ = get_enk_bandrange(
         wfn, sym, band_slices.sigma_range,
         band_slices.sigma_range, nspinor=meta.nspinor)
@@ -209,28 +211,42 @@ def _eval_sigma_c_at_dft_energies(
 
     omega_ev = np.asarray(ppm_options.omega_grid_ev, dtype=np.float64)
     if sigma_c_omega is not None:
-        sig_c_diag = np.diagonal(
-            np.asarray(sigma_c_omega), axis1=2, axis2=3) * RYD_TO_EV
+        from .qsgw_utils import extract_sigma_diag_replicated
+        sig_c_diag = (
+            np.asarray(extract_sigma_diag_replicated(sigma_c_omega, mesh_xy))
+            * RYD_TO_EV)
     else:
-        with h5py.File(sigma_omega.sigma_kij_h5_path, "r") as h5:
-            sig_c_diag = np.diagonal(
-                np.asarray(h5["sigma_c_kij_ry"], dtype=np.complex128),
-                axis1=2, axis2=3,
-            ) * RYD_TO_EV
+        # Streamed mode: rank-0 reads, then broadcast to all ranks.
+        import h5py
+        if meta.rank == 0:
+            with h5py.File(sigma_omega.sigma_kij_h5_path, "r") as h5:
+                sig_c_diag = np.diagonal(
+                    np.asarray(h5["sigma_c_kij_ry"], dtype=np.complex128),
+                    axis1=2, axis2=3,
+                ) * RYD_TO_EV
+        else:
+            sig_c_diag = np.zeros(
+                (omega_ev.size, *enk_dft_ev.shape), dtype=np.complex128)
+        from jax.experimental.multihost_utils import broadcast_one_to_all
+        sig_c_diag = np.asarray(broadcast_one_to_all(sig_c_diag))
 
-    nk, nb = sig_c_diag.shape[1], sig_c_diag.shape[2]
-    sigma_c_at_dft_ev = np.array([
-        [
-            complex(
-                np.interp(omega_dft_rel_ev[ik, ib], omega_ev,
-                          np.real(sig_c_diag[:, ik, ib])),
-                np.interp(omega_dft_rel_ev[ik, ib], omega_ev,
-                          np.imag(sig_c_diag[:, ik, ib])),
-            )
-            for ib in range(nb)
-        ]
-        for ik in range(nk)
-    ], dtype=np.complex128)
+    # Vectorised linear interpolation over ω at each (k, n) eval point.
+    n_omega = omega_ev.size
+    nk, nb = enk_dft_ev.shape
+    eval_clamped = np.clip(omega_dft_rel_ev, float(omega_ev[0]), float(omega_ev[-1]))
+    idx_hi = np.clip(
+        np.searchsorted(omega_ev, eval_clamped, side="left"), 1, n_omega - 1)
+    idx_lo = idx_hi - 1
+    omega_lo_kn = omega_ev[idx_lo]
+    omega_hi_kn = omega_ev[idx_hi]
+    denom = np.where(omega_hi_kn > omega_lo_kn, omega_hi_kn - omega_lo_kn, 1.0)
+    w_hi = (eval_clamped - omega_lo_kn) / denom
+    w_lo = 1.0 - w_hi
+    k_idx = np.arange(nk)[:, None]
+    n_idx = np.arange(nb)[None, :]
+    sig_lo = sig_c_diag[idx_lo, k_idx, n_idx]
+    sig_hi = sig_c_diag[idx_hi, k_idx, n_idx]
+    sigma_c_at_dft_ev = w_lo * sig_lo + w_hi * sig_hi
 
     sig_x_diag_ev = np.diagonal(np.asarray(sig_x), axis1=1, axis2=2) * RYD_TO_EV
     sigma_xc_at_dft_ev = sig_x_diag_ev + sigma_c_at_dft_ev
@@ -380,7 +396,7 @@ def compute_ppm_sigma_pipeline(
             wfn=wfn, sym=sym, meta=meta, print_fn=print_fn,
         )
 
-        # Step 6: diag(Σ_c) at DFT energies (rank-0 only)
+        # Step 6: diag(Σ_c) at DFT energies (replicated across ranks)
         (sigma_c_at_dft_ev,
          sigma_xc_at_dft_ev,
          omega_dft_rel_ev,
@@ -388,6 +404,7 @@ def compute_ppm_sigma_pipeline(
             sigma_c_omega, sigma_omega,
             ppm_options=ppm_options, sig_x=sig_x,
             band_slices=band_slices, wfn=wfn, sym=sym, meta=meta,
+            mesh_xy=mesh_xy,
             print_fn=print_fn,
         )
 

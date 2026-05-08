@@ -137,16 +137,25 @@ def extract_sigma_diag_replicated(
     """Pull ``Σ[..., n, n]`` from a sharded matrix-valued ω-tensor.
 
     Input ``sigma_w_kij`` is sharded ``P(None, None, 'x', 'y')`` for
-    ``(nω, nk, nb, nb)``; the diagonal contraction is per-device on the
-    diagonal blocks of the (m, n) tile and the result is allgathered to
-    a fully replicated ``(nω, nk, nb)`` array — small (≲ a few MB) and
-    cheap to keep replicated.
+    ``(nω, nk, nb, nb)``.  The (m, n) axes are on **different** mesh
+    axes, so a naive ``einsum('...ii->...i')`` computes a per-shard
+    block-diagonal which is the global diagonal only on the
+    ``ix == iy`` shards — off-diagonal mesh shards silently produce
+    garbage off-diagonal values.  We sidestep that by forcing an
+    allgather of the full ω-tensor onto each device before the trace.
+
+    Memory note: the materialised tensor is ``nω · nk · nb² · 16 B``
+    per device (≈ 270 MB for MoS2 4×4×1, 80 bands, 41 ω-points).  Fits
+    comfortably in the 28 GB device budget; a shard_map specialisation
+    for the very-large-system case is left for follow-up.
     """
     rep_3d = NamedSharding(mesh_xy, P(None, None, None))
+    rep_4d = NamedSharding(mesh_xy, P(None, None, None, None))
 
     @jax.jit
     def _extract(M):
-        diag = jnp.einsum("...ii->...i", M)
+        M_full = jax.lax.with_sharding_constraint(M, rep_4d)
+        diag = jnp.einsum("...ii->...i", M_full)
         return jax.lax.with_sharding_constraint(diag, rep_3d)
 
     return _extract(sigma_w_kij)
