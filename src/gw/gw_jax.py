@@ -567,13 +567,19 @@ def main(argv=None):
 
 	# ---- Optional Σ-decomposition debug table (rank-0, all in eV) ----
 	# Single seam at the H-build output: dumps the diagonal pieces that
-	# feed E_QP so a downstream investigator can verify
-	# E_QP ≟ kin_ion + V_H + Σ_xc(E_DFT).  Head corrections are exposed
-	# as their own columns where applicable: PPM mode adds
-	# ``sig_c_head(Edft)``; static modes add ``x_head``, ``sex_head``,
-	# ``coh_head`` from the BGW-style q→0 head terms.
+	# feed the BGW-format ``eqp0`` (Σ_tot at E_DFT) and ``eqp1`` (the same
+	# Σ_tot − E_DFT extrapolated by the Z-factor central-difference slope
+	# of dRe[Σ_c]/dω at E=E_DFT).  By construction
+	# ``eqp0 ≟ kin_ion + V_H + x_bare + sig_c(Edft).Re`` exactly, and
+	# ``eqp1 ≟ E_DFT + Z·(eqp0 − E_DFT)`` with Z=1 in static modes
+	# (degenerate eqp1==eqp0).  Head corrections are also exposed as
+	# their own columns: ``x_head`` (always when the head is computed)
+	# and either ``sig_c_head(Edft)`` (PPM) or ``sex_head/coh_head``
+	# (static, screened mode).
 	if meta.rank == 0 and config.debug.sigma_freq_debug_output:
 		from file_io import write_sigma_freq_debug_table
+		from .eqp_bgw import (
+			compute_eqp_diag, compute_z_factor_from_omega_grid)
 		_e_dft_ev_full = np.asarray(enk_dft, dtype=np.float64) * RYD_TO_EV
 		_kin_diag_ev = np.real(
 			np.diagonal(np.asarray(kin_ion), axis1=1, axis2=2)) * RYD_TO_EV
@@ -581,7 +587,6 @@ def main(argv=None):
 			np.diagonal(np.asarray(sig_h), axis1=1, axis2=2)) * RYD_TO_EV
 		_sig_x_diag_ev = np.real(
 			np.diagonal(np.asarray(sig_x), axis1=1, axis2=2)) * RYD_TO_EV
-		_e_qp_ev = np.asarray(E_full, dtype=np.float64) * RYD_TO_EV
 		_nk, _nb = _e_dft_ev_full.shape
 		# Static-COHSEX q→0 head: band-diagonal ``(nb,)`` shifts applied
 		# in-place to Σ_x / Σ_SX / Σ_COH inside ``cohsex_sigma``.  The
@@ -607,7 +612,20 @@ def main(argv=None):
 				_broadcast_head_diag_to_kij(static_head_terms.sigma_x_diag),
 			))
 		if mode.is_dynamic and sigma_c_at_dft_ev is not None:
-			_cols.append(("sig_c(Edft)", sigma_c_at_dft_ev))
+			# Compute Σ_c(E_DFT) + Z via the SAME recipe the eqp{0,1}.dat
+			# writer uses, so the freq_debug sig_c(Edft) column and the
+			# eqp0/eqp1 columns are bit-consistent.  PPM pipeline's own
+			# interp produces a numerically slightly different value (~10
+			# meV) due to a different vectorisation path.
+			_e_dft_rel_ev = np.asarray(omega_dft_rel_ev, dtype=np.float64)
+			_sigma_c_at_dft_for_eqp, _z_factor = (
+				compute_z_factor_from_omega_grid(
+					sigma_c_omega_diag_ev=np.asarray(
+						sigma_c_omega_diag_ev, dtype=np.complex128),
+					omega_rel_ev=np.asarray(omega_rel_ev, dtype=np.float64),
+					e_dft_rel_ev=_e_dft_rel_ev,
+				))
+			_cols.append(("sig_c(Edft)", _sigma_c_at_dft_for_eqp))
 			# PPM analytic head interpolated at the same E_DFT − E_F used
 			# for ``sig_c(Edft)`` (same ω-grid, same linear-interp recipe
 			# → cancellation analyses work column-by-column).
@@ -652,7 +670,27 @@ def main(argv=None):
 					"coh_head",
 					_broadcast_head_diag_to_kij(static_head_terms.sigma_coh_diag),
 				))
-		_cols.append(("E_qp", _e_qp_ev))
+		# eqp0 / eqp1 — same math as the eqp{0,1}.dat writer.  In PPM
+		# mode (Σ_c, Z) were already computed above for the
+		# ``sig_c(Edft)`` column; in static modes the combined Σ_SX +
+		# Σ_COH plays the role of Σ_c(E_DFT) and Z = 1 so eqp1 == eqp0.
+		if mode.is_dynamic and sigma_c_at_dft_ev is not None:
+			pass  # reuses _sigma_c_at_dft_for_eqp / _z_factor from above
+		else:
+			_sigma_c_at_dft_for_eqp = np.real(np.diagonal(
+				np.asarray(sig_sx + sig_coh), axis1=1, axis2=2)) * RYD_TO_EV
+			_z_factor = None
+		_eqp0_ev, _eqp1_ev = compute_eqp_diag(
+			kin_ion_diag_ev=_kin_diag_ev,
+			hartree_diag_ev=_v_h_diag_ev,
+			sigma_x_diag_ev=_sig_x_diag_ev,
+			sigma_c_at_dft_diag_ev=np.asarray(
+				_sigma_c_at_dft_for_eqp, dtype=np.complex128),
+			e_dft_ev=_e_dft_ev_full,
+			z_factor=_z_factor,
+		)
+		_cols.append(("eqp0", _eqp0_ev.astype(np.float64)))
+		_cols.append(("eqp1", _eqp1_ev.astype(np.float64)))
 		write_sigma_freq_debug_table(
 			config.debug.sigma_freq_debug_file, _cols)
 		print0(f"  Sigma freq debug: {config.debug.sigma_freq_debug_file}")
