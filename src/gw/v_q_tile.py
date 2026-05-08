@@ -214,11 +214,19 @@ def _aot_full_kernel_peak(
 
         compiled = kernel.lower(*specs).compile(
             compiler_options={"xla_gpu_memory_limit_slop_factor": 10000})
-        m = compiled.memory_analysis()
-        peak = (int(m.temp_size_in_bytes)
-                + int(m.argument_size_in_bytes)
-                + int(m.output_size_in_bytes)
-                - int(m.alias_size_in_bytes))
+        # AOT GPU peak = XLA-visible buffers + cuFFT plan scratch.  The
+        # cuFFT scratch is queried via cufftGetSize on jaxlib's loaded
+        # libcufft.so (see runtime.aot_memory) — no slope+intercept guess.
+        from runtime.aot_memory import aot_kernel_peak_bytes
+        breakdown = aot_kernel_peak_bytes(compiled)
+        if (bool(int(os.environ.get('LORRAX_V_Q_AOT_VERBOSE', '0') or 0))
+                and jax.process_index() == 0):
+            print(f"  V_q full-kernel AOT breakdown q_chunk={q_chunk}: "
+                  f"compiled={breakdown.compiled_peak/1e9:.2f} GB + "
+                  f"cuFFT scratch={breakdown.cufft_scratch/1e9:.2f} GB "
+                  f"= {breakdown.total/1e9:.2f} GB "
+                  f"({len(breakdown.fft_specs)} fft op(s))")
+        peak = breakdown.total
         _v_q_full_kernel_aot_cache[cache_key] = peak
         return peak
     except Exception:
