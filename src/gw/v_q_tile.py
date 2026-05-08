@@ -217,6 +217,9 @@ def _choose_v_q_chunks(
         # Linear-in-Q variable footprint per rank (ζ_disk slab).  The
         # fixed workspace is added once below in the q_chunk equation.
         one_q_fft = float(aot_slope)
+        if bool(int(os.environ.get('LORRAX_V_Q_AOT_VERBOSE', '0') or 0)) and jax.process_index() == 0:
+            print(f"  V_q AOT FFT model: slope={aot_slope/1e9:.3f} GB/Q, "
+                  f"intercept={aot_intercept/1e9:.3f} GB (fixed workspace)")
     elif n_rtot is not None and n_rtot > 0:
         one_q_fft = fft_coef * N_zeta * n_rmu * float(n_rtot) / p_prod
     else:
@@ -662,6 +665,17 @@ def compute_V_q_tile(
             n_rtot=n_rtot, same_zeta=same_zeta,
             mesh_xy=mesh_xy, fft_grid=fft_grid,  # enable AOT FFT peak
         )
+    # Diagnostic env override: force a specific q_chunk in Case A,
+    # bypassing the chooser's memory model.  Useful for stress-testing
+    # whether the chooser leaves headroom on the table.
+    _force_q = int(os.environ.get('LORRAX_V_Q_Q_CHUNK', '0') or 0)
+    if _force_q > 0 and _force_q <= nq_total and not chooser_choice.get('tiled'):
+        _orig_q_chunk = int(chooser_choice.get('q_chunk', 0))
+        chooser_choice = dict(chooser_choice)
+        chooser_choice['q_chunk'] = _force_q
+        if jax.process_index() == 0:
+            print(f"  [LORRAX_V_Q_Q_CHUNK] forcing q_chunk={_force_q} "
+                  f"(chooser had {_orig_q_chunk})")
 
     q_chunk = int(chooser_choice['q_chunk'])
     mu_chunk = int(chooser_choice['mu_chunk'])
