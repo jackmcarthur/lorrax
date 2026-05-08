@@ -109,6 +109,142 @@ def _gather_stage_per_q_bytes(*, n_rmu: int, n_G: int,
 
 
 _v_q_aot_cache: dict = {}
+_v_q_full_kernel_aot_cache: dict = {}
+
+
+def _aot_full_kernel_peak(
+    *,
+    q_chunk: int,
+    mu_size: int,
+    nu_size: int,
+    n_rmu_L: int,
+    n_rmu_R: int,
+    nq_total: int,
+    n_rtot: int,
+    n_G_sph: int,
+    fft_grid: tuple[int, int, int],
+    sphere_idx,
+    mesh_xy: Mesh,
+    same_zeta: bool,
+    write_g0: bool,
+) -> int | None:
+    """AOT-compile the *full* production V_q tile kernel and return
+    per-rank peak bytes from XLA ``compiled.memory_analysis()``.
+
+    This captures everything inside the kernel boundary at once: the
+    ζ_disk inputs, the FFT input + output + cuFFT plan workspace, the
+    sphere-pick output, the two one-axis gathered ζ_X/ζ_Y slabs, the
+    contract V_block, the DUS update on V_acc/g0_acc, and any aliasing
+    XLA negotiates between them.  Replaces the standalone-FFT
+    ``_aot_fft_model`` measurement (which captured only the FFT
+    primitive's input + output + workspace and missed the production
+    kernel's surrounding live buffers + aliasing).
+
+    Cost: one ``jit.lower(*specs).compile()`` per unique shape (~1-2 s
+    on the V_q kernel's HLO size).  Cached by shape + same_zeta +
+    write_g0 in ``_v_q_full_kernel_aot_cache``.
+
+    The chooser uses this for shrink-retry sizing: if peak > budget,
+    drop the unused cache entries at the end (the production run only
+    keeps the final selected shape's compiled object).
+
+    Returns ``None`` on AOT-compile failure — caller falls back to the
+    slope+intercept FFT model.
+    """
+    p_x = int(mesh_xy.shape['x'])
+    p_y = int(mesh_xy.shape['y'])
+    cache_key = (
+        int(q_chunk), int(mu_size), int(nu_size),
+        int(n_rmu_L), int(n_rmu_R), int(nq_total),
+        int(n_rtot), int(n_G_sph), tuple(int(s) for s in fft_grid),
+        p_x, p_y, bool(same_zeta), bool(write_g0),
+    )
+    hit = _v_q_full_kernel_aot_cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    try:
+        kernel = _make_V_q_tile_kernel(
+            sphere_idx=sphere_idx, n_G_sph=n_G_sph,
+            fft_shape=tuple(int(s) for s in fft_grid),
+            mesh_xy=mesh_xy,
+            q_chunk=int(q_chunk),
+            mu_size=int(mu_size), nu_size=int(nu_size),
+            n_rmu_L=int(n_rmu_L), n_rmu_R=int(n_rmu_R),
+            same_zeta=bool(same_zeta), write_g0=bool(write_g0))
+
+        # Specs must mirror the kernel's in_shardings exactly.
+        V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+        g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
+        zeta_disk_sh = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
+        v_per_G_sh = NamedSharding(mesh_xy, P(None, None))
+        phase_sh = NamedSharding(mesh_xy, P(None, None, None, None, None))
+        rep = NamedSharding(mesh_xy, P())
+        nx, ny, nz = (int(s) for s in fft_grid)
+
+        # All shapes match what the kernel's signature expects.
+        V_acc_spec = jax.ShapeDtypeStruct(
+            (int(nq_total), int(n_rmu_L), int(n_rmu_R)),
+            jnp.complex128, sharding=V_sh)
+        g0_acc_spec = jax.ShapeDtypeStruct(
+            (int(nq_total), int(n_rmu_L)),
+            jnp.complex128, sharding=g0_sh)
+        zeta_L_spec = jax.ShapeDtypeStruct(
+            (int(q_chunk), int(n_rtot), int(mu_size)),
+            jnp.complex128, sharding=zeta_disk_sh)
+        v_per_G_spec = jax.ShapeDtypeStruct(
+            (int(q_chunk), int(n_G_sph)),
+            jnp.complex128, sharding=v_per_G_sh)
+        phase_spec = jax.ShapeDtypeStruct(
+            (int(q_chunk), 1, nx, ny, nz),
+            jnp.complex128, sharding=phase_sh)
+        int_spec = jax.ShapeDtypeStruct((), jnp.int32, sharding=rep)
+
+        if same_zeta:
+            specs = (V_acc_spec, g0_acc_spec,
+                     zeta_L_spec, v_per_G_spec, phase_spec,
+                     int_spec, int_spec, int_spec)
+        else:
+            zeta_R_spec = jax.ShapeDtypeStruct(
+                (int(q_chunk), int(n_rtot), int(nu_size)),
+                jnp.complex128, sharding=zeta_disk_sh)
+            specs = (V_acc_spec, g0_acc_spec,
+                     zeta_L_spec, zeta_R_spec, v_per_G_spec, phase_spec,
+                     int_spec, int_spec, int_spec)
+
+        compiled = kernel.lower(*specs).compile(
+            compiler_options={"xla_gpu_memory_limit_slop_factor": 10000})
+        m = compiled.memory_analysis()
+        peak = (int(m.temp_size_in_bytes)
+                + int(m.argument_size_in_bytes)
+                + int(m.output_size_in_bytes)
+                - int(m.alias_size_in_bytes))
+        _v_q_full_kernel_aot_cache[cache_key] = peak
+        return peak
+    except Exception:
+        return None
+
+
+def _drop_unused_v_q_kernel_cache_entries(
+    keep_cache_keys: set[tuple],
+) -> int:
+    """Drop entries from ``_v_q_tile_kernel_cache`` whose cache_key is
+    NOT in ``keep_cache_keys``.
+
+    Called by the chooser after shrink-retry settles on a final
+    ``q_chunk`` / ``mu_chunk``: the AOT compiles for unused candidate
+    shapes leak into the cache via ``_make_V_q_tile_kernel``'s
+    populate-on-build, so we scrub them.  Returns the count dropped.
+
+    Note: JAX's internal pjit/lower compile cache also holds these
+    artifacts; we don't reach inside that.  The Python-level
+    LORRAX kernel cache that we own is the one we clean.
+    """
+    stale = [k for k in _v_q_tile_kernel_cache
+             if k not in keep_cache_keys]
+    for k in stale:
+        _v_q_tile_kernel_cache.pop(k, None)
+    return len(stale)
 
 
 def _aot_fft_model(
@@ -191,6 +327,8 @@ def _choose_v_q_chunks(
     same_zeta: bool = True,
     mesh_xy: Mesh | None = None,
     fft_grid: tuple[int, int, int] | None = None,
+    sphere_idx=None,
+    write_g0: bool = True,
 ) -> dict:
     """Pick (q_chunk, μ_chunk) per the memory model documented above.
 
@@ -336,6 +474,76 @@ def _choose_v_q_chunks(
     q_chunk = max(1, min(n_q_total, q_max))
     peak = (q_chunk * one_q_bytes + q_chunk * v_per_q_bytes
             + fft_workspace_fixed + ref_bytes)
+
+    # Optional: AOT-compile the *full* production kernel at the chosen
+    # q_chunk and read its memory_analysis() — this captures the actual
+    # peak including everything XLA tracks (cuFFT scratch, gather temps,
+    # contract intermediates, DUS overlap, alias choices XLA makes
+    # inside the production kernel that the standalone-FFT measurement
+    # misses).  Shrink-retry if over budget.  Default-on; opt out with
+    # ``LORRAX_V_Q_AOT_FULL_KERNEL=0`` (e.g. to debug the AOT path
+    # itself, or in environments where the AOT compile fails).
+    _aot_full = bool(int(os.environ.get('LORRAX_V_Q_AOT_FULL_KERNEL', '1') or 0))
+    if (_aot_full and mesh_xy is not None and fft_grid is not None
+            and n_rtot is not None and n_rtot > 0):
+        cache_keys_visited: set[tuple] = set()
+        _aot_verbose = bool(int(os.environ.get(
+            'LORRAX_V_Q_AOT_VERBOSE', '0') or 0)) and jax.process_index() == 0
+        attempt_q = int(q_chunk)
+        verified_q = None
+        verified_peak = None
+        # Up to 4 shrink attempts before falling back to the cheap
+        # analytical pick.
+        for _ in range(4):
+            if attempt_q < 1:
+                break
+            # The cache key in _v_q_tile_kernel_cache uses (n_rmu, n_rmu)
+            # for ν_size=μ_size=N_μ in Case A.
+            cache_keys_visited.add((
+                'unified', id(mesh_xy), int(attempt_q),
+                int(n_rmu), int(n_rmu),
+                int(n_rmu), int(n_rmu), int(n_G),
+                tuple(int(s) for s in fft_grid),
+                id(sphere_idx), bool(same_zeta), bool(write_g0),
+            ))
+            full_peak = _aot_full_kernel_peak(
+                q_chunk=attempt_q,
+                mu_size=int(n_rmu), nu_size=int(n_rmu),
+                n_rmu_L=int(n_rmu), n_rmu_R=int(n_rmu),
+                nq_total=int(n_q_total),
+                n_rtot=int(n_rtot), n_G_sph=int(n_G),
+                fft_grid=tuple(int(s) for s in fft_grid),
+                sphere_idx=sphere_idx,
+                mesh_xy=mesh_xy,
+                same_zeta=bool(same_zeta), write_g0=bool(write_g0))
+            if full_peak is None:
+                break  # AOT failed — fall back to analytical pick
+            if _aot_verbose:
+                print(f"  V_q full-kernel AOT: q_chunk={attempt_q} "
+                      f"predicted peak/rank={full_peak/1e9:.2f} GB "
+                      f"(budget={budget_bytes/1e9:.2f} GB)")
+            if float(full_peak) <= float(budget_bytes):
+                verified_q = attempt_q
+                verified_peak = full_peak
+                break
+            # Shrink; aim for ~0.7× of current attempt rounded down.
+            new_attempt = max(1, int(attempt_q * 0.7))
+            if new_attempt >= attempt_q:
+                new_attempt = attempt_q - 1
+            attempt_q = new_attempt
+        if verified_q is not None:
+            # Drop kernel-cache entries we built but won't use.
+            keep = {(
+                'unified', id(mesh_xy), int(verified_q),
+                int(n_rmu), int(n_rmu),
+                int(n_rmu), int(n_rmu), int(n_G),
+                tuple(int(s) for s in fft_grid),
+                id(sphere_idx), bool(same_zeta), bool(write_g0),
+            )}
+            _drop_unused_v_q_kernel_cache_entries(keep)
+            q_chunk = verified_q
+            peak = float(verified_peak) + ref_bytes
+        # else: fall through with the analytically-picked q_chunk + peak.
     return dict(
         q_chunk=q_chunk, mu_chunk=int(n_rmu), n_mu_blocks=1,
         tiled=False, aligned=True,
@@ -687,6 +895,13 @@ def compute_V_q_tile(
     else:
         n_G_sph = fft_grid[0] * fft_grid[1] * fft_grid[2]
 
+    # ``wants_g0`` is needed by the chooser's full-kernel AOT path
+    # (kernel cache key includes ``write_g0``), so we resolve it here
+    # before calling the chooser; the same value is reused below to
+    # decide whether to allocate g0_acc and to drive the per-iter
+    # ``do_write_g0`` static flag.
+    wants_g0 = (g0_acc is not None) or same_zeta
+
     if chooser_choice is None:
         if budget_bytes is None:
             raise ValueError(
@@ -697,6 +912,8 @@ def compute_V_q_tile(
             budget_bytes=budget_bytes, p_x=p_x, p_y=p_y,
             n_rtot=n_rtot, same_zeta=same_zeta,
             mesh_xy=mesh_xy, fft_grid=fft_grid,  # enable AOT FFT peak
+            sphere_idx=sphere_idx,
+            write_g0=(same_zeta and wants_g0),
         )
     # Diagnostic env override: force a specific q_chunk in Case A,
     # bypassing the chooser's memory model.  Useful for stress-testing
