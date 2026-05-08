@@ -21,6 +21,17 @@ correlation at this scissor-corrected E_QP.  No matrix-level diagonal-add
 is exposed because the post-self-energy plumbing keeps H replicated, so a
 plain ``H.at[:, idx, idx].add(diag)`` suffices when the caller wants one.
 
+Per-band classification
+-----------------------
+A band ``n`` is **in-grid** iff ``E_DFT[k, n]`` lies inside ``[ω_min, ω_max]``
+for **every** k.  If any single k for that band lies outside the window the
+whole band is treated as out-of-grid — the diagonal Σ(E) fixed-point clipped
+Σ_c at the ω-boundary for the offending k, which contaminates the QP
+correction at neighbouring k via the band's k-dispersion.  Per-band
+classification gives a discontinuity-free scissor: out-of-grid bands receive
+the affine law uniformly across k, and the fit itself is restricted to data
+from in-grid bands so the contaminated points never enter.
+
 Units and layout
 ----------------
 - Energies: eV.  The caller decides whether to work in absolute or
@@ -89,6 +100,41 @@ class ScissorFit:
             f"cond: α={self.slope_c:+.4f}, β={self.intercept_c:+.4f} eV, "
             f"n={self.n_fit_c}, rmse={self.rmse_c_ev:.3f} eV)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Per-band in-grid classification
+# ---------------------------------------------------------------------------
+
+def classify_bands_in_grid(
+    E_kn_ev: np.ndarray,
+    omega_min_ev: float,
+    omega_max_ev: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(band_in_grid, kn_in_grid_band)``.
+
+    A band is **in-grid** iff ``E_kn`` lies in ``[ω_min, ω_max]`` for every k.
+
+    Parameters
+    ----------
+    E_kn_ev : np.ndarray, (nk, nb)
+        Per-(k, n) energies, same reference as the ω-grid.
+    omega_min_ev, omega_max_ev : float
+        Σ_c(ω) grid bounds.
+
+    Returns
+    -------
+    band_in_grid : np.ndarray, (nb,) of bool
+        True for bands whose every k lies in the window.
+    kn_in_grid_band : np.ndarray, (nk, nb) of bool
+        ``band_in_grid`` broadcast to ``(nk, nb)`` for ``np.where`` callers.
+    """
+    E = np.asarray(E_kn_ev, dtype=np.float64)
+    in_window_kn = (E >= float(omega_min_ev)) & (E <= float(omega_max_ev))
+    band_in_grid = np.all(in_window_kn, axis=0)
+    kn_in_grid_band = np.broadcast_to(
+        band_in_grid[None, :], E.shape).astype(bool)
+    return band_in_grid, kn_in_grid_band
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +228,7 @@ def extrapolate_delta_e(
 
 __all__ = [
     "ScissorFit",
-    "fit_scissor",
+    "classify_bands_in_grid",
     "extrapolate_delta_e",
+    "fit_scissor",
 ]

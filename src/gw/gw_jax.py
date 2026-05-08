@@ -448,27 +448,41 @@ def main(argv=None):
 			max_iter=120, tol_ev=1e-7, mixing=0.6,
 		)
 
-		# Scissor for out-of-grid bands.  Default fallback (no scissor) is
-		# E_DFT, not the unreliable pseudoband eigvalsh — see the comment
-		# block previously at gw_jax.py:388-390 for context.
+		# Per-band scissor for out-of-grid bands.  A band is "in-grid" iff
+		# E_DFT[k, n] lies in [ω_min, ω_max] for every k; if any single k
+		# is outside, the band gets the scissor uniformly across k (the
+		# diagonal solver clipped Σ_c at the ω-boundary for the offending
+		# k, which would otherwise contaminate the band's k-dispersion).
+		# The scissor itself is fitted on in-grid bands only.  Default
+		# fallback when the scissor flag is off: E_DFT (the natural
+		# zeroth-order QP correction = 0 estimate); the older fallback
+		# of using ``eigvalsh(H_qp)`` was unreliable for pseudobands.
+		from .scissor import classify_bands_in_grid, fit_scissor
 		E_dft_rel_ev = np.asarray(omega_dft_rel_ev, dtype=np.float64)
-		in_grid = (
-			(E_dft_rel_ev >= omega_grid_ev[0]) & (E_dft_rel_ev <= omega_grid_ev[-1]))
-		n_in = int(np.count_nonzero(in_grid))
-		if config.ppm.sigma_at_dft_extrapolate and np.any(in_grid) and np.any(~in_grid):
-			from .scissor import fit_scissor
+		band_in_grid, in_grid_kn_band = classify_bands_in_grid(
+			E_dft_rel_ev, float(omega_grid_ev[0]), float(omega_grid_ev[-1]))
+		n_bands_in = int(band_in_grid.sum())
+		n_bands_total = int(band_in_grid.size)
+		print0(
+			f"  Diagonal SC: {n_bands_in}/{n_bands_total} bands fully in grid, "
+			f"{n_iter} iterations")
+		if (
+			config.ppm.sigma_at_dft_extrapolate
+			and 0 < n_bands_in < n_bands_total
+		):
 			occ_mask_kn = np.broadcast_to(
 				np.arange(E_sc_rel_ev.shape[1])[None, :] < meta.nelec,
 				E_sc_rel_ev.shape).astype(bool)
 			fit = fit_scissor(
 				E_dft_rel_ev, np.real(E_sc_rel_ev - E_dft_rel_ev),
-				valence_mask_kn=occ_mask_kn, fit_mask_kn=in_grid)
+				valence_mask_kn=occ_mask_kn,
+				fit_mask_kn=in_grid_kn_band,
+			)
 			print0(f"  Scissor fit: {fit.summary()}")
 			extrap_rel = E_dft_rel_ev + fit.predict(E_dft_rel_ev, occ_mask_kn)
-			E_sc_rel_ev = np.where(in_grid, E_sc_rel_ev, extrap_rel)
+			E_sc_rel_ev = np.where(in_grid_kn_band, E_sc_rel_ev, extrap_rel)
 		else:
-			E_sc_rel_ev = np.where(in_grid, E_sc_rel_ev, E_dft_rel_ev)
-		print0(f"  Diagonal SC: {n_in}/{in_grid.size} states in grid, {n_iter} iterations")
+			E_sc_rel_ev = np.where(in_grid_kn_band, E_sc_rel_ev, E_dft_rel_ev)
 		E_sc_ev = E_sc_rel_ev + efermi
 
 		# QSGW Σ_xc^QSGW: sharded ω-tensor + replicated E_sc → replicated Σ_xc.
