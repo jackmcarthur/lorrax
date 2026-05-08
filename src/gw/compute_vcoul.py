@@ -687,10 +687,12 @@ def compute_all_V_q(
         timing_label="compute_all_V_q_sharded",
     )
 
-    V_qmunu = V_acc.reshape(nkx, nky, nkz, n_rmu, n_rmu)
-    g0_mu_all = g0_acc.reshape(nkx, nky, nkz, n_rmu)
+    # Flat-q convention: keep the q axis 1-D throughout.  Downstream
+    # callers that need the 3-D-k form reshape inside an FFT helper
+    # (see ``common.fft_helpers.make_flat_k_fft``).  Sharding stays on
+    # the trailing μ × μ axes.
     V_qmunu = jax.lax.with_sharding_constraint(
-        V_qmunu, NamedSharding(mesh_xy, P(None, None, None, 'x', 'y')))
+        V_acc, NamedSharding(mesh_xy, P(None, 'x', 'y')))
     g0_mu_all = jax.lax.with_sharding_constraint(
-        g0_mu_all, NamedSharding(mesh_xy, P(None, None, None, 'x')))
+        g0_acc, NamedSharding(mesh_xy, P(None, 'x')))
     return V_qmunu, g0_mu_all

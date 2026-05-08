@@ -771,6 +771,14 @@ def _load_ring_subset(
             print(f"BSE: q=0 head injected (rank-1 in μν, V_cell={cell_volume:.2f}): "
                   f"{v_str}, {w_str}")
 
+    # TODO: lorrax_A's gw/cohsex pipeline now produces V_qmunu in flat-q
+    # form (1, npol, npol, nq, μ, μ) — the (nkx, nky, nkz) split is
+    # gone.  This BSE reader still assumes the legacy 8-D
+    # (1, npol, npol, nkx, nky, nkz, μ, μ) layout.  Restart files
+    # written by the new gw/cohsex flow will not load through this
+    # reader unless the kgrid is supplied externally and the indexing
+    # below is updated to flat-q.  Tracked separately from the
+    # agent/v_q_perf consolidation since BSE is experimental.
     nkx, nky, nkz = V_qmunu.shape[3:6]
     nk = nkx * nky * nkz
     n_rmu = int(V_qmunu.shape[-1])

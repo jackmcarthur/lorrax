@@ -203,13 +203,17 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None):
     from types import SimpleNamespace
     V_qmunu, S_qmunu, psi_full_y_raw, enk_full, V0_noG0_munu, G0_mu_nu = read_restart_state_from_h5(filename)
 
-    x6y7_8 = NamedSharding(mesh_xy, P(None, None, None, None, None, None, "x", "y"))
+    # V_qmunu is now flat-q ``(1, npol, npol, nq, μ, μ)`` (was 8-D
+    # ``(1, npol, npol, nkx, nky, nkz, μ, μ)`` before the flat-q
+    # convention change); μ × μ are still the trailing two axes that
+    # carry the (x, y) sharding.
+    x4y5_6 = NamedSharding(mesh_xy, P(None, None, None, None, "x", "y"))
     x3y4_5 = NamedSharding(mesh_xy, P(None, None, None, "x", "y"))
     y3_psi_Y = NamedSharding(mesh_xy, P(None, None, None, "y"))
     x1_psi_X = NamedSharding(mesh_xy, P(None, "x", None, None))
     replicated_2 = NamedSharding(mesh_xy, P(None, None))
 
-    V_qmunu = jax.lax.with_sharding_constraint(V_qmunu, x6y7_8)
+    V_qmunu = jax.lax.with_sharding_constraint(V_qmunu, x4y5_6)
     if S_qmunu is not None:
         S_qmunu = jax.lax.with_sharding_constraint(S_qmunu, x3y4_5)
     if V0_noG0_munu is not None:

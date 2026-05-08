@@ -618,8 +618,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None):
 	"""Compute bare Coulomb V_qmunu from zeta HDF5 and write G0 back.
 
-	Returns (V_qmunu, G0) where V_qmunu has shape (1, npol, npol, nkx, nky, nkz, μ, μ)
-	and G0 is (n_rmu,) ζ_μ(G=0) at q=0.
+	Returns (V_qmunu, G0) where V_qmunu has shape (1, npol, npol, nq, μ, μ)
+	(flat-q) and G0 is (n_rmu,) ζ_μ(G=0) at q=0.  Downstream consumers
+	that need the 3-D-k form reshape inside ``common.fft_helpers.make_flat_k_fft``.
 	"""
 	from .compute_vcoul import compute_all_V_q
 
@@ -691,10 +692,12 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 			f.create_dataset('g0_mu', data=np.asarray(G0_gathered))
 	jax.experimental.multihost_utils.sync_global_devices("g0_write")
 
-	# Add polarization axes: (nkx, nky, nkz, μ, μ) → (1, npol, npol, nkx, nky, nkz, μ, μ)
-	nkx, nky, nkz = meta.kgrid
+	# Add polarization axes: (nq, μ, μ) → (1, npol, npol, nq, μ, μ).
+	# Flat-q convention: keep the q axis 1-D throughout; consumers that
+	# need the (nkx, nky, nkz) form reshape inside an FFT helper.
 	V_qmunu = jnp.array(jnp.broadcast_to(
-		V_q_raw[None, None, None], (1, meta.npol, meta.npol, nkx, nky, nkz, meta.n_rmu, meta.n_rmu)))
+		V_q_raw[None, None, None],
+		(1, meta.npol, meta.npol, meta.nk_tot, meta.n_rmu, meta.n_rmu)))
 
 	G0 = G0_gathered
 	while G0.ndim > 1:

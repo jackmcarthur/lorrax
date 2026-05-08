@@ -423,8 +423,16 @@ def resolve_minimax_energy_reference(
 # ---------------------------------------------------------------------------
 
 def flatten_V_qmunu(V_qmunu):
-    """Strip (1,npol,npol) leading axes and flatten k-grid → flat-q (nq, μ, μ)."""
-    return jnp.asarray(V_qmunu)[0, 0, 0].reshape(-1, V_qmunu.shape[-2], V_qmunu.shape[-1])
+    """Strip the ``(1, npol, npol)`` leading axes; output is flat-q
+    ``(nq, μ, μ)``.
+
+    ``V_qmunu`` is now produced flat-q by ``compute_all_V_q`` (the q
+    axis is 1-D throughout the gw/cohsex pipeline; consumers that need
+    the 3-D-k form reshape inside ``common.fft_helpers.make_flat_k_fft``).
+    This helper is kept as a thin shim for back-compat with old restart
+    files / call sites that still index against the 6-D shape.
+    """
+    return jnp.asarray(V_qmunu)[0, 0, 0]
 
 
 def build_static_quadrature(wfns, minimax_config, *, print_fn=None):
