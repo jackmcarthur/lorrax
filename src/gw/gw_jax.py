@@ -583,6 +583,17 @@ def main(argv=None):
 			np.diagonal(np.asarray(sig_x), axis1=1, axis2=2)) * RYD_TO_EV
 		_e_qp_ev = np.asarray(E_full, dtype=np.float64) * RYD_TO_EV
 		_nk, _nb = _e_dft_ev_full.shape
+		# Static-COHSEX q→0 head: band-diagonal ``(nb,)`` shifts applied
+		# in-place to Σ_x / Σ_SX / Σ_COH inside ``cohsex_sigma``.  The
+		# bare-X piece (``sigma_x_diag``) is added in PPM mode too (since
+		# Σ_x is static there as well), so ``x_head`` is emitted whenever
+		# the head was computed.  ``sex_head`` / ``coh_head`` are
+		# screened-channel pieces that only apply when ``do_screened``.
+		def _broadcast_head_diag_to_kij(diag_n_ry: np.ndarray) -> np.ndarray:
+			return np.broadcast_to(
+				np.real(np.asarray(diag_n_ry)) * RYD_TO_EV, (_nk, _nb)
+			).astype(np.float64)
+
 		_cols = [
 			("E_dft", _e_dft_ev_full),
 			("Edft-Ef", _e_dft_ev_full - float(efermi_dft_ev or 0.0)),
@@ -590,11 +601,16 @@ def main(argv=None):
 			("V_H", _v_h_diag_ev),
 			("x_bare", _sig_x_diag_ev),
 		]
+		if static_head_terms is not None:
+			_cols.append((
+				"x_head",
+				_broadcast_head_diag_to_kij(static_head_terms.sigma_x_diag),
+			))
 		if mode.is_dynamic and sigma_c_at_dft_ev is not None:
 			_cols.append(("sig_c(Edft)", sigma_c_at_dft_ev))
-			# Head correction interpolated at the same E_DFT-E_F as Σ_c
-			# (same ω-grid, same linear-interp recipe → cancellation
-			# analyses work column-by-column).
+			# PPM analytic head interpolated at the same E_DFT − E_F used
+			# for ``sig_c(Edft)`` (same ω-grid, same linear-interp recipe
+			# → cancellation analyses work column-by-column).
 			head_w_kn_ry = (
 				ppm_outputs.head_sigma_diag_w_kn_ry
 				if ppm_outputs is not None else None)
@@ -627,24 +643,15 @@ def main(argv=None):
 			_cols.append(
 				("coh_0", np.real(np.diagonal(
 					np.asarray(sig_coh), axis1=1, axis2=2)) * RYD_TO_EV))
-			# Static-COHSEX q→0 head pieces — band-diagonal (nb,) shifts
-			# applied uniformly at every k, broadcast here for the table.
-			if static_head_terms is not None:
-				_x_head = np.broadcast_to(
-					np.asarray(static_head_terms.sigma_x_diag) * RYD_TO_EV,
-					(_nk, _nb))
-				_cols.append(("x_head", np.real(_x_head).astype(np.float64)))
-				if config.do_screened:
-					_sx_head = np.broadcast_to(
-						np.asarray(static_head_terms.sigma_sx_diag) * RYD_TO_EV,
-						(_nk, _nb))
-					_coh_head = np.broadcast_to(
-						np.asarray(static_head_terms.sigma_coh_diag) * RYD_TO_EV,
-						(_nk, _nb))
-					_cols.append(("sex_head",
-					              np.real(_sx_head).astype(np.float64)))
-					_cols.append(("coh_head",
-					              np.real(_coh_head).astype(np.float64)))
+			if static_head_terms is not None and config.do_screened:
+				_cols.append((
+					"sex_head",
+					_broadcast_head_diag_to_kij(static_head_terms.sigma_sx_diag),
+				))
+				_cols.append((
+					"coh_head",
+					_broadcast_head_diag_to_kij(static_head_terms.sigma_coh_diag),
+				))
 		_cols.append(("E_qp", _e_qp_ev))
 		write_sigma_freq_debug_table(
 			config.debug.sigma_freq_debug_file, _cols)
