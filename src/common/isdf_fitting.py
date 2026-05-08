@@ -1193,6 +1193,14 @@ def fit_zeta_chunked_to_h5(
     import h5py
 
     nx, ny, nz = meta.fft_grid
+    # ``n_rmu`` is the logical centroid count — used everywhere in
+    # this function for in-memory shapes (ψ_rmu, pair densities, CCT,
+    # ζ accumulator).  Every sharding on this axis here is single-
+    # mesh-axis (``'x'`` alone or ``'y'`` alone), so divisibility is
+    # only n_rmu / max(mesh.x, mesh.y), not the product.  The
+    # mesh-product divisibility kicks in only at the V_q read; SlabIO
+    # auto-pads the on-disk dataset to handle that across the jit
+    # boundary.
     n_rmu = meta.n_rmu
     n_rtot = meta.n_rtot
     nk_tot = meta.nk_tot
@@ -1334,17 +1342,11 @@ def fit_zeta_chunked_to_h5(
         if use_ffi_io:
             zeta_io = SlabIO(output_file, mode='w', mesh=mesh_xy,
                              backend=slab_io_backend)
-            # ``partition_spec`` lets SlabIO auto-round n_rmu up to a
-            # mesh-divisible extent; the cached logical shape is then
-            # used as ``valid_shape`` on every write_slab call so the
-            # padded tail stays zero on disk.  Drivers pass logical
-            # ``n_rmu``; SlabIO handles the rest.
             zeta_io.create_dataset(
                 'zeta_q',
                 shape=(nq, n_rtot, n_rmu),
                 dtype=np.complex128,
                 chunks=(1, n_rchunk, n_rmu),
-                partition_spec=P(None, None, ('x', 'y')),
             )
         else:
             with SlabIO(output_file, mode='w', mesh=mesh_xy,
@@ -1354,7 +1356,6 @@ def fit_zeta_chunked_to_h5(
                     shape=(nq, n_rtot, n_rmu),
                     dtype=np.complex128,
                     chunks=(1, n_rchunk, n_rmu),
-                    partition_spec=P(None, None, ('x', 'y')),
                 )
             zeta_io = None
 
@@ -1550,14 +1551,10 @@ def fit_zeta_chunked_to_h5(
                     # fat contiguous strips (one per q, full n_rmu +
                     # rank's n_rchunk/4 rows).
                     zeta_chunk_write = zeta_chunk.transpose(0, 2, 1)
-                    # SlabIO auto-picks-up ``global_shape`` (= dataset's
-                    # physical extent, possibly padded for mesh) and
-                    # ``valid_shape`` (= dataset's logical extent clipped
-                    # to this chunk's offset).  Drivers don't need to
-                    # know about the logical/physical split.
                     zeta_io.write_slab(
                         'zeta_q', zeta_chunk_write,
-                        offset=(0, r_start, 0))
+                        offset=(0, r_start, 0),
+                        global_shape=(nq, n_rtot, n_rmu))
                 else:
                     # Allgather path: gather once per q-chunk on every rank,
                     # queue the per-q hyperslab writes on rank 0's

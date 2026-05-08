@@ -823,6 +823,15 @@ def load_centroids_band_chunked(
     Returns:
         psi_rmu_Y: (nk, nb, ns, n_rmu) with P(None, None, None, 'y')
         psi_rmuT_X: (nk, n_rmu, nb, ns) with P(None, 'x', None, None)
+
+    n_rmu divisibility: the kernels here shard the n_rmu axis by a
+    single mesh axis (``'x'`` alone in psi_rmuT_X, ``'y'`` alone in
+    psi_rmu_Y) — so n_rmu only needs to divide one axis size, not the
+    product.  ``mesh.x = mesh.y = 4`` and 668 / 4 = 167 ✓; no padding
+    needed at this layer.  The undivisibility shows up only at the
+    V_q read where the trailing axis is sharded by the *product*
+    ``('x', 'y')`` = 16; SlabIO's auto-pad on the on-disk dataset
+    closes that gap (see ``file_io.slab_io.create_dataset``).
     """
     b_start, b_end = band_range
     nb_total = b_end - b_start

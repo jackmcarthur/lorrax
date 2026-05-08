@@ -53,38 +53,6 @@ __all__ = [
 ]
 
 
-def _pad_shape_to_mesh(shape, partition_spec, mesh) -> tuple[int, ...]:
-    """Round each dim up so the resulting shape divides cleanly into
-    a sharded layout on ``mesh`` with the given ``partition_spec``.
-
-    A dim sharded by mesh axis ``a`` (or by a tuple ``(a, b)``) must be
-    divisible by ``mesh.shape[a]`` (or the product of mesh sizes).
-    Unsharded dims pass through unchanged.
-
-    Logical → physical example, mesh ``{'x': 4, 'y': 4}``,
-    spec ``P(None, None, 'y')``, shape ``(9, 60, 668)``:
-    ``668 % 4 = 0``? no → 668 → 672.  Returns ``(9, 60, 672)``.
-
-    The driver writes a 668-wide JAX array, marks ``valid_shape=668``;
-    the file holds a 672-wide dataset whose tail 4 columns are zero.
-    Readers see the 672 physical extent + the 668 logical bound.
-    """
-    physical = list(int(s) for s in shape)
-    for d, axis in enumerate(partition_spec):
-        if axis is None:
-            continue
-        axes = (axis,) if isinstance(axis, str) else tuple(axis)
-        prod = 1
-        for ax in axes:
-            prod *= int(mesh.shape[ax])
-        if prod <= 1:
-            continue
-        rem = physical[d] % prod
-        if rem:
-            physical[d] += (prod - rem)
-    return tuple(physical)
-
-
 def _normalize_slab_backend(backend, use_ffi_io):
     """Resolve ``(backend, use_ffi_io)`` to a :class:`SlabIOBackend`.
 
@@ -193,53 +161,19 @@ class SlabIO:
         dtype,
         chunks: Sequence[int] | None = None,
         attrs: dict | None = None,
-        partition_spec=None,
-    ) -> tuple[int, ...]:
-        """Pre-create a dataset.
+    ) -> None:
+        """Pre-create a dataset with the given shape + dtype + chunks.
 
-        If ``partition_spec`` is supplied, each axis is rounded up to a
-        multiple of the mesh-axis-product that shards it (so the FFI
-        backend's ``_validate_block_divisible`` always passes).  The
-        original (logical) shape is stored as an HDF5 attribute on the
-        dataset and made available to readers via ``valid_shape``.
-        Drivers thus pass their natural logical shape and never
-        compute padded counts themselves.
-
-        Returns the *physical* shape that was actually created (== the
-        input ``shape`` when no padding is needed).  Callers that want
-        the padded dim sizes (e.g. to allocate JAX accumulators that
-        match the file's physical extent) can use the return value.
+        Padding policy: SlabIO writes ``A`` at exactly the dataset's
+        shape; pass ``valid_shape`` on ``write_slab`` for chunk writes
+        or to clip a padded ``A`` down to a smaller logical extent.
+        Driver-side padding/unpadding is the caller's responsibility
+        (see ``runtime.padding`` in the agent/padding-refactor branch);
+        files always store the logical shape so they can be re-read
+        on a different mesh size.
         """
-        physical_shape = tuple(int(s) for s in shape)
-        logical_shape: tuple[int, ...] | None = None
-        if partition_spec is not None and self.mesh is not None:
-            physical_shape = _pad_shape_to_mesh(
-                shape, partition_spec, self.mesh)
-            if physical_shape != tuple(int(s) for s in shape):
-                logical_shape = tuple(int(s) for s in shape)
-
-        # Stash logical shape on the dataset's attrs so readers can
-        # recover ``valid_shape`` automatically.  The FFI backend
-        # routes attrs through its deferred-write path; allgather
-        # writes them eagerly via h5py.
-        attrs = dict(attrs) if attrs else {}
-        if logical_shape is not None:
-            attrs["_lorrax_logical_shape"] = np.asarray(
-                logical_shape, dtype=np.int64)
-
         self._backend.create_dataset(
-            name, shape=physical_shape, dtype=dtype,
-            chunks=chunks, attrs=attrs)
-        # Always cache the physical shape so subsequent ``write_slab``
-        # calls don't have to repeat it as ``global_shape``.
-        self._physical_shapes = getattr(self, "_physical_shapes", {})
-        self._physical_shapes[name] = physical_shape
-        if logical_shape is not None:
-            # Cache logical shape so ``write_slab`` can pick it up as
-            # ``valid_shape`` without driver-level bookkeeping.
-            self._logical_shapes = getattr(self, "_logical_shapes", {})
-            self._logical_shapes[name] = logical_shape
-        return physical_shape
+            name, shape=shape, dtype=dtype, chunks=chunks, attrs=attrs)
 
     def write_attr(self, name: str, value) -> None:
         """Write a small rank-0-only dataset (e.g. omega_ev).
@@ -280,36 +214,7 @@ class SlabIO:
         streams the rank-0 write along axis 1 to keep memory bounded
         for large-omega writes (matches the legacy sigma_output
         k_chunk pattern).  Ignored by the FFI backend.
-
-        Padding auto-pickup: when ``valid_shape`` is omitted and
-        ``create_dataset`` was called with ``partition_spec=`` (which
-        auto-padded the dataset shape to mesh-divisibility), the
-        cached logical shape is used as ``valid_shape`` so only the
-        unpadded prefix reaches disk.  Drivers thus don't need to
-        track the logical/physical split themselves.
         """
-        if global_shape is None:
-            cached_phys = getattr(self, "_physical_shapes", {}).get(name)
-            if cached_phys is not None:
-                global_shape = cached_phys
-        if valid_shape is None:
-            cached_logical = getattr(self, "_logical_shapes", {}).get(name)
-            if cached_logical is not None:
-                # Clip A's physical shape per-axis to ``logical[d] −
-                # offset[d]`` so chunk writes only hit the unpadded
-                # prefix of the dataset's logical extent.  Where the
-                # logical and physical agree, this is a no-op.
-                A_shape = tuple(int(s) for s in getattr(A, "shape", ()))
-                ndim = len(cached_logical)
-                offs = (
-                    tuple(int(o) for o in offset)
-                    if offset is not None else (0,) * ndim
-                )
-                valid_shape = tuple(
-                    min(int(A_shape[d]) if d < len(A_shape) else int(cached_logical[d]),
-                        int(cached_logical[d]) - int(offs[d]))
-                    for d in range(ndim)
-                )
         self._backend.write_slab(
             name, A,
             offset=offset, global_shape=global_shape,
