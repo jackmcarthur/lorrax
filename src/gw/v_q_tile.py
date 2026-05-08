@@ -85,6 +85,9 @@ _Q_COMPUTE_COEF_GATHER = 4.4
 _Q_COMPUTE_COEF_FFT = float(os.environ.get('LORRAX_V_Q_FFT_COEF', '5.0'))
 
 
+_v_q_aot_cache: dict = {}
+
+
 def _aot_fft_model(
     *,
     n_rmu: int,
@@ -92,58 +95,63 @@ def _aot_fft_model(
     mesh_xy: Mesh,
     same_zeta: bool,
 ) -> tuple[int, int] | None:
-    """AOT-measure the FFT stage memory and split into a Q-linear input
-    cost + a Q-fixed workspace overhead.
+    """AOT-measure the V_q production-kernel FFT stage memory and split
+    into a Q-linear cost + Q-fixed workspace overhead.
 
-    Returns ``(per_q_input_bytes, fixed_workspace_bytes)`` per rank; the
-    chooser models the FFT-stage peak at q_chunk Q as
+    Compiles a tiny ``shard_map`` jit using ``make_sharded_fftn_3d`` —
+    the SAME primitive the production ``_make_V_q_tile_kernel`` uses
+    (NOT ``make_jittable_local_fftn_3d``, which compiles a different
+    HLO with 3 sequential 1D-FFT plans and a different memory profile).
+    Reads ``compiled.memory_analysis()`` and returns
+    (slope, intercept) such that
 
-        peak_fft(Q) = Q · per_q_input + fixed_workspace
+        peak_fft_per_rank(Q) = slope · Q + intercept
 
-    Rationale: ``query_fft_peak_bytes`` returns
-    (input + output + workspace − alias) for a STANDALONE
-    ``jnp.fft.fftn`` jit, where input/output are both alive (no
-    aliasing).  In the production V_q kernel the FFT output is
-    immediately consumed by ``sphere_pick`` and freed before the gather
-    runs, and XLA aliases the FFT input with the post-(× phase)
-    intermediate — so the production-peak model has 1× input alive
-    during the FFT, not 2×.  The cuFFT plan's workspace is mostly
-    fixed-per-plan (a function of FFT axis sizes 75×75×200, not the
-    batch dim Q), so it doesn't scale with q_chunk.
+    Method: measure at Q=1 and Q=2; take slope = peak(2) − peak(1) and
+    intercept = peak(1) − slope.  Caches by (n_rmu, fft_grid,
+    p_x, p_y, same_zeta).
 
-    Method: AOT-compile at Q=1 and Q=2, take the slope = per-Q variable
-    cost (≈ 1× input on the production-kernel side), and the intercept
-    = fixed workspace.  Two compiles ≈ 2 s amortised over the V_q tile
-    runtime; ``query_fft_peak_bytes`` caches by shape so repeated
-    chooser calls hit the cache.
-
-    Distinct-ζ tiles double the per-Q variable cost (both ζ_L_disk and
-    ζ_R_disk alive at the kernel boundary, regardless of FFT
-    scheduling).  Workspace stays the same (cuFFT plans serialised).
+    Distinct-ζ tiles double the slope (two ζ_disk inputs alive at the
+    kernel boundary).  The cuFFT plan workspace stays the same.
 
     Returns ``None`` on AOT-compile failure — caller falls back to the
     flat heuristic.
     """
+    p_x = int(mesh_xy.shape['x'])
+    p_y = int(mesh_xy.shape['y'])
+    cache_key = (int(n_rmu), tuple(int(s) for s in fft_grid),
+                 p_x, p_y, bool(same_zeta))
+    hit = _v_q_aot_cache.get(cache_key)
+    if hit is not None:
+        return hit
+
     try:
-        from common.fft_helpers import query_fft_peak_bytes
-        sharding = NamedSharding(
-            mesh_xy, P(None, ('x', 'y'), None, None, None))
-        peak_q1 = int(query_fft_peak_bytes(
-            input_shape=(1, n_rmu, *fft_grid),
-            fft_axes=(-3, -2, -1), sharding=sharding,
-        ))
-        peak_q2 = int(query_fft_peak_bytes(
-            input_shape=(2, n_rmu, *fft_grid),
-            fft_axes=(-3, -2, -1), sharding=sharding,
-        ))
-        # Linear regression on two points: peak(Q) = slope·Q + intercept
+        spec = P(None, ('x', 'y'), None, None, None)
+        sharding = NamedSharding(mesh_xy, spec)
+        # Production primitive — single shard_map'd 3-D cuFFT plan.
+        local_fftn = make_sharded_fftn_3d(mesh_xy, spec, spec)
+        jit_fft = jax.jit(local_fftn, out_shardings=sharding)
+
+        def _peak_at_Q(Q: int) -> int:
+            in_spec = jax.ShapeDtypeStruct(
+                (Q, n_rmu, *fft_grid), jnp.complex128, sharding=sharding)
+            compiled = jit_fft.lower(in_spec).compile(
+                compiler_options={"xla_gpu_memory_limit_slop_factor": 10000})
+            m = compiled.memory_analysis()
+            return (int(m.temp_size_in_bytes)
+                    + int(m.argument_size_in_bytes)
+                    + int(m.output_size_in_bytes)
+                    - int(m.alias_size_in_bytes))
+
+        peak_q1 = _peak_at_Q(1)
+        peak_q2 = _peak_at_Q(2)
         slope = max(0, peak_q2 - peak_q1)            # Q-linear cost
         intercept = max(0, peak_q1 - slope)          # Q-fixed workspace
         if not same_zeta:
-            # Distinct ζ doubles the Q-linear input footprint at the
-            # kernel boundary; workspace stays the same (single FFT plan).
             slope *= 2
-        return slope, intercept
+        result = (slope, intercept)
+        _v_q_aot_cache[cache_key] = result
+        return result
     except Exception:
         return None
 
