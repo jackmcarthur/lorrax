@@ -568,9 +568,10 @@ def main(argv=None):
 	# ---- Optional Σ-decomposition debug table (rank-0, all in eV) ----
 	# Single seam at the H-build output: dumps the diagonal pieces that
 	# feed E_QP so a downstream investigator can verify
-	# E_QP ≟ kin_ion + V_H + Σ_xc(E_DFT).  Only PPM-mode columns
-	# (Σ_c(0), Σ_c(E_DFT)) are emitted in dynamic modes; static modes
-	# emit Σ_SX, Σ_COH instead.
+	# E_QP ≟ kin_ion + V_H + Σ_xc(E_DFT).  Head corrections are exposed
+	# as their own columns where applicable: PPM mode adds
+	# ``sig_c_head(Edft)``; static modes add ``x_head``, ``sex_head``,
+	# ``coh_head`` from the BGW-style q→0 head terms.
 	if meta.rank == 0 and config.debug.sigma_freq_debug_output:
 		from file_io import write_sigma_freq_debug_table
 		_e_dft_ev_full = np.asarray(enk_dft, dtype=np.float64) * RYD_TO_EV
@@ -581,6 +582,7 @@ def main(argv=None):
 		_sig_x_diag_ev = np.real(
 			np.diagonal(np.asarray(sig_x), axis1=1, axis2=2)) * RYD_TO_EV
 		_e_qp_ev = np.asarray(E_full, dtype=np.float64) * RYD_TO_EV
+		_nk, _nb = _e_dft_ev_full.shape
 		_cols = [
 			("E_dft", _e_dft_ev_full),
 			("Edft-Ef", _e_dft_ev_full - float(efermi_dft_ev or 0.0)),
@@ -588,11 +590,36 @@ def main(argv=None):
 			("V_H", _v_h_diag_ev),
 			("x_bare", _sig_x_diag_ev),
 		]
-		if mode.is_dynamic and sigma_c_omega_diag_ev is not None:
-			_w0 = sigma_c_omega_diag_ev.shape[0] // 2
-			_cols.append(("sig_c(0)", sigma_c_omega_diag_ev[_w0]))
-			if sigma_c_at_dft_ev is not None:
-				_cols.append(("sig_c(Edft)", sigma_c_at_dft_ev))
+		if mode.is_dynamic and sigma_c_at_dft_ev is not None:
+			_cols.append(("sig_c(Edft)", sigma_c_at_dft_ev))
+			# Head correction interpolated at the same E_DFT-E_F as Σ_c
+			# (same ω-grid, same linear-interp recipe → cancellation
+			# analyses work column-by-column).
+			head_w_kn_ry = (
+				ppm_outputs.head_sigma_diag_w_kn_ry
+				if ppm_outputs is not None else None)
+			if head_w_kn_ry is not None:
+				_omega_ry = np.asarray(ppm_options.omega_grid_ry, np.float64)
+				_eval_ry = (np.asarray(omega_dft_rel_ev, np.float64)
+				            / RYD_TO_EV)
+				_n_omega = _omega_ry.size
+				_e_clamped = np.clip(_eval_ry, _omega_ry[0], _omega_ry[-1])
+				_idx_hi = np.clip(np.searchsorted(
+					_omega_ry, _e_clamped, side="left"), 1, _n_omega - 1)
+				_idx_lo = _idx_hi - 1
+				_w_hi = ((_e_clamped - _omega_ry[_idx_lo])
+				         / np.where(_omega_ry[_idx_hi] > _omega_ry[_idx_lo],
+				                    _omega_ry[_idx_hi] - _omega_ry[_idx_lo],
+				                    1.0))
+				_w_lo = 1.0 - _w_hi
+				_k_idx = np.arange(_nk)[:, None]
+				_n_idx = np.arange(_nb)[None, :]
+				_lo = head_w_kn_ry[_idx_lo, _k_idx, _n_idx]
+				_hi = head_w_kn_ry[_idx_hi, _k_idx, _n_idx]
+				_cols.append((
+					"sig_c_head(Edft)",
+					(_w_lo * _lo + _w_hi * _hi) * RYD_TO_EV,
+				))
 		else:
 			_cols.append(
 				("sex_0", np.real(np.diagonal(
@@ -600,6 +627,24 @@ def main(argv=None):
 			_cols.append(
 				("coh_0", np.real(np.diagonal(
 					np.asarray(sig_coh), axis1=1, axis2=2)) * RYD_TO_EV))
+			# Static-COHSEX q→0 head pieces — band-diagonal (nb,) shifts
+			# applied uniformly at every k, broadcast here for the table.
+			if static_head_terms is not None:
+				_x_head = np.broadcast_to(
+					np.asarray(static_head_terms.sigma_x_diag) * RYD_TO_EV,
+					(_nk, _nb))
+				_cols.append(("x_head", np.real(_x_head).astype(np.float64)))
+				if config.do_screened:
+					_sx_head = np.broadcast_to(
+						np.asarray(static_head_terms.sigma_sx_diag) * RYD_TO_EV,
+						(_nk, _nb))
+					_coh_head = np.broadcast_to(
+						np.asarray(static_head_terms.sigma_coh_diag) * RYD_TO_EV,
+						(_nk, _nb))
+					_cols.append(("sex_head",
+					              np.real(_sx_head).astype(np.float64)))
+					_cols.append(("coh_head",
+					              np.real(_coh_head).astype(np.float64)))
 		_cols.append(("E_qp", _e_qp_ev))
 		write_sigma_freq_debug_table(
 			config.debug.sigma_freq_debug_file, _cols)

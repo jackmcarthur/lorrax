@@ -57,6 +57,10 @@ class PPMOutputs:
     efermi_dft_ev: float | None
     sigma_omega_h5_path: str
     ppm_options: PPMSigmaRuntimeOptions
+    # Diagonal of the analytic q→0 head added to ``sigma_c_omega`` — kept
+    # separately for diagnostic printing (the head is band-diagonal so the
+    # decomposition is lossless).  ``None`` when no head was injected.
+    head_sigma_diag_w_kn_ry: np.ndarray | None = None
 
 
 def _build_probe_quadrature(quad, config, *, print_fn):
@@ -132,10 +136,19 @@ def _inject_analytic_head(
     band_slices,
     wfn, sym, meta,
     print_fn,
-) -> jax.Array | None:
-    """Add the analytic q→0, G=G'=0 head to Σ^c(ω) on rank 0."""
+) -> tuple[jax.Array | None, np.ndarray | None]:
+    """Add the analytic q→0, G=G'=0 head to Σ^c(ω) on rank 0.
+
+    Returns
+    -------
+    sigma_c_omega_with_head, head_sigma_diag_w_kn_ry
+        Post-head Σ_c (same shape as input) and the band-diagonal of the
+        head-only contribution ``(nω, nk, nb)`` in Ry (head is diagonal in
+        band so this is a lossless decomposition).  Both are ``None`` when
+        the input ``sigma_c_omega`` is ``None``.
+    """
     if sigma_c_omega is None:
-        return None
+        return None, None
     from .head_correction import compute_ppm_head_sigma_kij
 
     enk_full, _ = get_enk_bandrange(
@@ -169,7 +182,12 @@ def _inject_analytic_head(
         f"  Σ_c head shift: max|Σ^head_diag| = {head_max_ev:.4f} eV "
         f"(on-shell occ band → {on_shell_occ:+.4f} eV)"
     )
-    return sigma_c_omega + jnp.asarray(head_sigma_kij_ry, dtype=jnp.complex128)
+    head_diag_w_kn_ry = np.diagonal(
+        np.asarray(head_sigma_kij_ry), axis1=2, axis2=3)
+    return (
+        sigma_c_omega + jnp.asarray(head_sigma_kij_ry, dtype=jnp.complex128),
+        head_diag_w_kn_ry,
+    )
 
 
 def _eval_sigma_c_at_dft_energies(
@@ -390,7 +408,7 @@ def compute_ppm_sigma_pipeline(
             head_resolver, config=config, meta=meta,
             probe_omega=probe_omega, print_fn=print_fn,
         )
-        sigma_c_omega = _inject_analytic_head(
+        sigma_c_omega, head_sigma_diag_w_kn_ry = _inject_analytic_head(
             sigma_c_omega, head_gn,
             ppm_options=ppm_options, band_slices=band_slices,
             wfn=wfn, sym=sym, meta=meta, print_fn=print_fn,
@@ -424,4 +442,5 @@ def compute_ppm_sigma_pipeline(
         efermi_dft_ev=efermi_dft_ev,
         sigma_omega_h5_path=sigma_omega_h5_path,
         ppm_options=ppm_options,
+        head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
     )
