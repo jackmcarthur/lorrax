@@ -151,6 +151,11 @@ _DEFAULTS = {
     # File paths
     "wfn_file": "WFN.h5",
     "centroids_file": "centroids_frac.txt",
+    # Optional second centroid file used by the bispinor pipeline:
+    # μ_L=1,2,3 (transverse) ζ-fits use Gordon-current-density centroids
+    # rather than the charge-density centroids in ``centroids_file``.
+    # Empty string == "not set" (cfg.centroids_file_current is None then).
+    "centroids_file_current": "",
     "kin_ion_file": "kin_ion.h5",
     # Three human-readable text outputs (always written):
     #   sigma_diag.dat — LORRAX-native per-(k,n) Σ-decomposition dump.
@@ -457,6 +462,9 @@ class FilePaths:
     """Output filenames + non-WFN inputs.  Resolved to absolute paths."""
     wfn_file: str
     centroids_file: str
+    # Bispinor: optional Gordon-current-density centroid file for μ_L=1,2,3.
+    # ``None`` falls back to the scalar charge-only path (CC tile only).
+    centroids_file_current: str | None
     kin_ion_file: str
     sigma_diag_file: str
     eqp0_file: str
@@ -829,9 +837,12 @@ class LorraxConfig:
             return params.get(key, _DEFAULTS.get(key))
 
         # --- Build sub-dataclasses ---
+        cents_curr = _g("centroids_file_current")
+        cents_curr_resolved = str(cents_curr) if cents_curr else None
         paths = FilePaths(
             wfn_file=str(_g("wfn_file")),
             centroids_file=str(_g("centroids_file")),
+            centroids_file_current=cents_curr_resolved,
             kin_ion_file=str(_g("kin_ion_file")),
             sigma_diag_file=str(_g("sigma_diag_file")),
             eqp0_file=str(_g("eqp0_file")),

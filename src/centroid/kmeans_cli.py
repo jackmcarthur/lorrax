@@ -96,6 +96,26 @@ def build_parser() -> argparse.ArgumentParser:
                         "FFI loader instead of the default WFNReader. "
                         "Necessary for WFN.h5 files that don't fit in host "
                         "RAM. Default off.")
+    p.add_argument("--density-mode",
+                   choices=("scalar", "current"),
+                   default="scalar",
+                   help="Which scalar field to use as the kmeans weight. "
+                        "'scalar' (default) is the standard charge density "
+                        "ρ(r), the right weight for charge-channel ISDF "
+                        "(γ̃^0).  'current' is the squared Gordon-decomposed "
+                        "Pauli current Σ_{n,k,i}(j^Gordon_{n,k,i})², the "
+                        "right weight for the i-channel ISDF (γ̃^{1,2,3}) "
+                        "in the bispinor pipeline.  Output files are "
+                        "written with distinguishing suffixes ('' / "
+                        "'_current') and a header comment naming the "
+                        "density, so a downstream gw_jax run can read both "
+                        "files unambiguously.")
+    p.add_argument("--out-suffix", type=str, default=None,
+                   help="Suffix appended to the output filename.  Default "
+                        "is '' for --density-mode scalar and '_current' "
+                        "for --density-mode current; pass explicitly to "
+                        "override (e.g. multiple current-mode runs at "
+                        "different N_c).")
     return p
 
 
@@ -188,11 +208,20 @@ def main():
             print(dense_warn)
 
     with timing.section("setup.charge_density"):
-        charge_density = get_charge_density(
-            wfn=wfn, sym=sym,
-            source=args.rho_source,
-            save_dir=args.qe_save,
-        )
+        if args.density_mode == "current":
+            from .current_density import build_current_density
+            # n_occ convention: nelec for FR (nspinor=2), nelec/2 for scalar
+            # (nspinor=1 — restricted Kohn-Sham, two electrons per band).
+            n_occ = int(wfn.nelec) if int(wfn.nspinor) == 2 else int(wfn.nelec) // 2
+            print(f"  density-mode=current: building bispinor j² weight "
+                  f"with n_occ={n_occ} (nspinor_wfn={int(wfn.nspinor)})")
+            charge_density = build_current_density(wfn, sym, n_occ)
+        else:
+            charge_density = get_charge_density(
+                wfn=wfn, sym=sym,
+                source=args.rho_source,
+                save_dir=args.qe_save,
+            )
     fft_grid = tuple(int(x) for x in charge_density.shape)
     if fft_grid != tuple(int(x) for x in wfn.fft_grid):
         raise ValueError(
@@ -318,10 +347,26 @@ def main():
         n_unique = centroid_indices.shape[0]
         print(f"After pruning: {n_unique} centroids (rank={rank})")
 
-    out_file = f"centroids_frac_{n_unique}.txt"
+    # Default suffix follows --density-mode unless the user overrode it.
+    out_suffix = (args.out_suffix
+                  if args.out_suffix is not None
+                  else ("" if args.density_mode == "scalar" else "_current"))
+    out_file = f"centroids_frac_{n_unique}{out_suffix}.txt"
+    if args.density_mode == "scalar":
+        density_label = "scalar charge density ρ(r)"
+    else:
+        density_label = ("Gordon-decomposed Pauli current "
+                         "Σ_{n,k,i}(j^Gordon_{n,k,i}(r))²")
+    header = (
+        f"x y z (snapped to FFT grid {fft_grid}, {n_unique} unique)\n"
+        f"density: {args.density_mode}\n"
+        f"weight: {density_label}\n"
+        f"intended channels: "
+        f"{'γ̃^0 (charge) ISDF' if args.density_mode == 'scalar' else 'γ̃^{1,2,3} (current) ISDF'}"
+    )
     np.savetxt(
         out_file, centroids_snapped,
-        header=f"x y z (snapped to FFT grid {fft_grid}, {n_unique} unique)",
+        header=header,
         fmt="%.6f", delimiter=" ", comments="# ",
     )
     print(f"Saved centroids to {out_file}")

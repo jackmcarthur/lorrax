@@ -50,6 +50,7 @@ from .load_wfns import (
 
 # Cache for pair density jitted functions
 _compute_pair_density_cache = {}
+_compute_pair_density_vertex_cache = {}
 
 
 
@@ -140,6 +141,174 @@ def accumulate_pair_density_spin_traced(
 
 		_accum_pair_density_cache[cache_key] = _accum
 	return _accum_pair_density_cache[cache_key](P_accum, psi_rmuT_X, psi_rcol_Y)
+
+
+# ============================================================================
+# Vertex-weighted pair density (bispinor Lorentz channels)
+# ============================================================================
+# For the bispinor (Dirac–Hartree–Fock–Breit) pipeline, the four Lorentz
+# channels μ_L ∈ {0, 1, 2, 3} fit ζ on the same centroid set but with
+# different vertex matrices γ̃^{μ_L} = γ^0 γ^{μ_L}.  The spin-traced
+# pair density above is the special case μ_L = 0, ns = 2 (γ̃^0 = I).
+# These helpers generalise to arbitrary (ns, ns) vertex matrices.
+# See ``docs/BISPINOR_DHFB_DESIGN.md`` §4 for the math.
+
+def compute_pair_density_with_vertex(
+	psi_rmuT_X: jax.Array,
+	psi_rmu_Y: jax.Array,
+	vertex: jax.Array,
+	mesh_xy: Mesh,
+) -> jax.Array:
+	"""Compute vertex-weighted pair density.
+
+	    P^V_k(μ, ν) = Σ_{n, αβ} ψ*_{n,k,α}(r_μ) V_{αβ} ψ_{n,k,β}(r_ν)
+
+	Args:
+	    psi_rmuT_X: (nk, n_rmu, nb, ns) with P(None, 'x', None, None);
+	        already conjugated.
+	    psi_rmu_Y: (nk, nb, ns, n_rmu) with P(None, None, None, 'y').
+	    vertex:     (ns, ns) complex; replicated.  Pass ``jnp.eye(ns)`` to
+	        recover the identity-vertex / spin-traced result.
+	    mesh_xy:   2-D device mesh.
+
+	Returns:
+	    P_k: (nk, n_rmu, n_rmu) with P(None, 'x', 'y').
+	"""
+	nk, n_rmu, nb, ns = psi_rmuT_X.shape
+	if vertex.shape != (ns, ns):
+		raise ValueError(
+			f"vertex shape {vertex.shape} does not match spinor axis ns={ns}"
+		)
+	cache_key = ('vertex', id(mesh_xy), nk, n_rmu, nb, ns)
+
+	if cache_key not in _compute_pair_density_vertex_cache:
+		x1_4 = NamedSharding(mesh_xy, P(None, 'x', None, None))
+		y3_4 = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+		v_rep = NamedSharding(mesh_xy, P())
+		xy_out = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+
+		@partial(jax.jit, in_shardings=(x1_4, y3_4, v_rep), out_shardings=xy_out)
+		def _compute_P_vertex(psi_L, psi_R, V):
+			# (k, μ, n, α) · (α, β) · (k, n, β, ν) → (k, μ, ν)
+			return jnp.einsum('kmna,ab,knbv->kmv', psi_L, V, psi_R, optimize=True)
+
+		_compute_pair_density_vertex_cache[cache_key] = _compute_P_vertex
+
+	return _compute_pair_density_vertex_cache[cache_key](psi_rmuT_X, psi_rmu_Y, vertex)
+
+
+_accum_pair_density_vertex_cache = {}
+
+
+def accumulate_pair_density_with_vertex(
+	P_accum: jax.Array,
+	psi_rmuT_X: jax.Array,
+	psi_rcol_Y: jax.Array,
+	vertex: jax.Array,
+	mesh_xy: Mesh,
+) -> jax.Array:
+	"""``P_accum += Σ_{n, αβ} ψ*_{n,α}(r_μ) V_{αβ} ψ_{n,β}(r_col)`` in one JIT.
+
+	Vertex-weighted analogue of ``accumulate_pair_density_spin_traced``.
+	Layout / sharding rules match :func:`compute_pair_density_with_vertex`;
+	``P_accum`` is donated.
+	"""
+	nk, n_rmu, nb, ns = psi_rmuT_X.shape
+	_, _, _, n_col = psi_rcol_Y.shape
+	if vertex.shape != (ns, ns):
+		raise ValueError(
+			f"vertex shape {vertex.shape} does not match spinor axis ns={ns}"
+		)
+	cache_key = ('vertex_accum', id(mesh_xy), nk, n_rmu, nb, ns, n_col)
+	if cache_key not in _accum_pair_density_vertex_cache:
+		P_sharding = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+		L_sharding = NamedSharding(mesh_xy, P(None, 'x', None, None))
+		R_sharding = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+		v_rep = NamedSharding(mesh_xy, P())
+
+		@partial(jax.jit,
+				 in_shardings=(P_sharding, L_sharding, R_sharding, v_rep),
+				 out_shardings=P_sharding,
+				 donate_argnums=(0,))
+		def _accum(P_in, psi_L, psi_R, V):
+			return P_in + jnp.einsum('kmna,ab,knbv->kmv', psi_L, V, psi_R, optimize=True)
+
+		_accum_pair_density_vertex_cache[cache_key] = _accum
+	return _accum_pair_density_vertex_cache[cache_key](P_accum, psi_rmuT_X, psi_rcol_Y, vertex)
+
+
+def _gamma_tilde_matrix(mu_lorentz: int) -> jax.Array:
+	"""Return γ̃^{μ_L} ≡ γ^0 γ^{μ_L} as a (4, 4) complex jnp array.
+
+	Uses the ``common.gamma_matrices`` storage convention (the matrices in
+	that module are already γ^0 γ^μ — see the convention note at top of
+	that file and §2.2 of ``docs/BISPINOR_DHFB_DESIGN.md``).
+	"""
+	from .gamma_matrices import gamma0, gamma1, gamma2, gamma3
+	if mu_lorentz == 0:
+		return gamma0
+	if mu_lorentz == 1:
+		return gamma1
+	if mu_lorentz == 2:
+		return gamma2
+	if mu_lorentz == 3:
+		return gamma3
+	raise ValueError(f"mu_lorentz must be in 0..3, got {mu_lorentz}")
+
+
+def compute_pair_density_lorentz(
+	psi_rmuT_X: jax.Array,
+	psi_rmu_Y: jax.Array,
+	mu_lorentz: int,
+	mesh_xy: Mesh,
+) -> jax.Array:
+	"""Lorentz-channel pair density for bispinor (ns=4) wavefunctions.
+
+	    P^{μ_L}_k(μ_c, ν_c) = Σ_{n, αβ} Ψ*_{n,k,α}(r_{μ_c}) (γ̃^{μ_L})_{αβ}
+	                         Ψ_{n,k,β}(r_{ν_c})
+
+	Phase-1 of the bispinor extension fits four ζ bases, one per μ_L ∈ {0,1,2,3},
+	on the same centroid set; this helper builds the corresponding pair-density
+	inputs.  See ``docs/BISPINOR_DHFB_DESIGN.md`` §4.
+
+	Args:
+	    psi_rmuT_X, psi_rmu_Y: as in :func:`compute_pair_density_with_vertex`
+	        but with ``ns == 4`` (bispinor).
+	    mu_lorentz: 0..3 — Lorentz vertex index.
+	    mesh_xy: 2-D device mesh.
+
+	Returns:
+	    P^{μ_L}_k: (nk, n_rmu, n_rmu) complex on P(None, 'x', 'y').
+	"""
+	ns = psi_rmuT_X.shape[3]
+	if ns != 4:
+		raise ValueError(
+			f"compute_pair_density_lorentz requires bispinor wavefunctions "
+			f"(ns=4); got ns={ns}.  For 2-component spinors the existing "
+			f"compute_pair_density_spin_traced is the right helper."
+		)
+	vertex = _gamma_tilde_matrix(mu_lorentz)
+	return compute_pair_density_with_vertex(psi_rmuT_X, psi_rmu_Y, vertex, mesh_xy)
+
+
+def accumulate_pair_density_lorentz(
+	P_accum: jax.Array,
+	psi_rmuT_X: jax.Array,
+	psi_rcol_Y: jax.Array,
+	mu_lorentz: int,
+	mesh_xy: Mesh,
+) -> jax.Array:
+	"""Band-chunk accumulator for :func:`compute_pair_density_lorentz`."""
+	ns = psi_rmuT_X.shape[3]
+	if ns != 4:
+		raise ValueError(
+			f"accumulate_pair_density_lorentz requires bispinor wavefunctions "
+			f"(ns=4); got ns={ns}."
+		)
+	vertex = _gamma_tilde_matrix(mu_lorentz)
+	return accumulate_pair_density_with_vertex(
+		P_accum, psi_rmuT_X, psi_rcol_Y, vertex, mesh_xy
+	)
 
 
 # Cache for ISDF pipeline jitted functions
@@ -366,20 +535,49 @@ def compute_L_q_from_CCT(
     C_q: jax.Array,
     mesh_xy: Mesh,
     block_size: int = None,
+    vertex_mu_L: int = 0,
 ) -> jax.Array:
     """
-    Compute Cholesky factor L_q from CCT matrix using 2D blocked algorithm.
+    Compute system-matrix L_q from CCT matrix.
+
+    For ``vertex_mu_L == 0`` (standard spin-traced path) the CCT is
+    Hermitian positive-definite (modulo numerical noise); we run the
+    optimized 2D blocked Cholesky and return the lower-triangular
+    factor.  Downstream :func:`solve_zeta_from_L_q` then does two
+    triangular solves per-q.
+
+    For ``vertex_mu_L != 0`` (transverse Lorentz channels γ̃^i, i∈{1,2,3})
+    the CCT is Hermitian but **indefinite** — Cholesky NaNs and the LU
+    fallback in :func:`solve_zeta_from_L_q` is required.  In this case
+    we skip the factorization here and pass C_q through unchanged; the
+    solve routine consumes it via ``jnp.linalg.solve`` on a per-q-batch
+    basis (one LU per call, small enough that explicit
+    ``lu_factor`` + ``lu_solve`` reuse buys nothing).
+
+    Note: the artifact return type does NOT change with ``vertex_mu_L``
+    — both branches return a (nq, n_rmu, n_rmu) array sharded
+    ``P(None, 'x', 'y')``.  Only its semantic interpretation differs
+    (Cholesky factor vs system matrix).
 
     Args:
         C_q: (nq, n_rmu, n_rmu) CCT matrix, sharded P(None, 'x', 'y')
         mesh_xy: 2D device mesh
         block_size: Tile block size (auto if None)
+        vertex_mu_L: Lorentz vertex index (0 = spin-traced PSD path,
+                     1/2/3 = transverse indefinite path).
 
     Returns:
-        L_q: (nq, n_rmu, n_rmu) Cholesky factor, sharded P(None, 'x', 'y')
+        L_q: (nq, n_rmu, n_rmu) Cholesky factor (μ_L=0) or unmodified
+             C_q (μ_L=1,2,3), sharded P(None, 'x', 'y')
     """
     nq, n_rmu, n_rmu2 = C_q.shape
     assert n_rmu == n_rmu2, f"C_q must be square, got {n_rmu} x {n_rmu2}"
+
+    # Indefinite-CCT path: skip the Cholesky outright.  ``solve_zeta_from_L_q``
+    # consumes C_q directly via ``jnp.linalg.solve`` (LU + back-solve internally).
+    if int(vertex_mu_L) != 0:
+        L_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+        return jax.lax.with_sharding_constraint(C_q, L_shard)
 
     Pr = mesh_xy.shape['x']
     Pc = mesh_xy.shape['y']
@@ -435,23 +633,44 @@ def solve_zeta_from_L_q(
     Z_q: jax.Array,
     mesh_xy: Mesh,
     q_chunk_size: int = 1,
+    vertex_mu_L: int = 0,
 ) -> jax.Array:
     """
-    Solve for zeta_q given pre-computed Cholesky factor L_q.
+    Solve for zeta_q given pre-computed system matrix from
+    :func:`compute_L_q_from_CCT`.
 
-    Uses q-chunked all-gather strategy: gather B_q L matrices at a time,
+    For ``vertex_mu_L == 0`` ``L_q`` is the lower-triangular Cholesky
+    factor of CCT and the inner solve is two triangular substitutions
+    (``L y = Z`` then ``L^H ζ = y``).  This is the historical fast
+    path — bit-identical to the previous implementation.
+
+    For ``vertex_mu_L != 0`` ``L_q`` is the *unfactored* CCT matrix
+    (transverse-channel γ̃^i CCT is Hermitian but indefinite, so
+    Cholesky is invalid).  The inner solve dispatches to
+    ``jnp.linalg.solve`` which performs an LU decomposition with
+    partial pivoting and a back-solve in one shot.  Per-q matrices are
+    small enough that explicit ``lu_factor`` + ``lu_solve`` reuse
+    buys nothing — both batched ``jnp.linalg.solve`` and the
+    triangular path see the same shard_map'd, q-chunked, batched-vmap
+    structure with identical input/output shardings.
+
+    Uses q-chunked all-gather strategy: gather B_q matrices at a time,
     then solve all B_q systems in parallel using vmap.
 
     Memory trade-off:
-    - q_chunk_size=1: Minimum memory (one L replicated at a time)
-    - q_chunk_size=nq: Maximum parallelism (all L replicated)
+    - q_chunk_size=1: Minimum memory (one matrix replicated at a time)
+    - q_chunk_size=nq: Maximum parallelism (all matrices replicated)
 
     Args:
-        L_q: (nq, n_rmu, n_rmu) Cholesky factor, sharded P(None, 'x', 'y')
+        L_q: (nq, n_rmu, n_rmu) Cholesky factor (μ_L=0) or raw CCT
+             (μ_L=1,2,3), sharded P(None, 'x', 'y')
         Z_q: (nq, n_rmu, n_zchunk) ZCT matrix, sharded P(None, 'x', 'y')
              or P(None, None, ('x','y')) if caller already resharded
         mesh_xy: 2D device mesh
         q_chunk_size: Number of q-points to solve simultaneously (default 1)
+        vertex_mu_L: Lorentz vertex index — selects Cholesky-back-solve
+                     vs jnp.linalg.solve.  Output sharding is identical
+                     in both branches.
 
     Returns:
         zeta_q: (nq, n_rmu, n_zchunk) solution, sharded P(None, None, ('x','y'))
@@ -470,14 +689,22 @@ def solve_zeta_from_L_q(
     q_batch = min(q_chunk_size, nq)
     nq_padded = ((nq + q_batch - 1) // q_batch) * q_batch
 
-    # Cache key for solve function (includes q_chunk_size and padded size)
-    cache_key = ('solve_from_L', id(mesh_xy), nq, n_rmu, n_zchunk_padded, q_chunk_size)
+    use_lu = (int(vertex_mu_L) != 0)
+
+    # Cache key for solve function (includes q_chunk_size and padded size).
+    # ``use_lu`` partitions the cache so the Cholesky and LU compiles
+    # don't collide on the same key.
+    cache_key = ('solve_from_L', id(mesh_xy), nq, n_rmu,
+                 n_zchunk_padded, q_chunk_size, bool(use_lu))
 
     if cache_key not in _solve_cache:
         @partial(shard_map, mesh=mesh_xy,
                  in_specs=(P(None, None), P(None, ('x', 'y'))),
                  out_specs=P(None, ('x', 'y')))
         def _sharded_cho_solve(L: jax.Array, Z_cols: jax.Array) -> jax.Array:
+            if use_lu:
+                # Indefinite CCT: jnp.linalg.solve does LU + back-solve.
+                return jnp.linalg.solve(L, Z_cols)
             y = jax.scipy.linalg.solve_triangular(L, Z_cols, lower=True)
             zeta = jax.scipy.linalg.solve_triangular(L.conj().T, y, lower=False)
             return zeta
@@ -488,6 +715,10 @@ def solve_zeta_from_L_q(
                  out_specs=P(None, None, ('x', 'y')))
         def _sharded_cho_solve_batch(L_batch: jax.Array, Z_batch: jax.Array) -> jax.Array:
             """Solve (B_q, n_rmu, n_rmu) @ (B_q, n_rmu, n_cols) -> (B_q, n_rmu, n_cols)"""
+            if use_lu:
+                # jnp.linalg.solve is natively batched on the leading axis;
+                # JAX dispatches one LU factorization per q internally.
+                return jnp.linalg.solve(L_batch, Z_batch)
             def solve_single(L, Z):
                 y = jax.scipy.linalg.solve_triangular(L, Z, lower=True)
                 return jax.scipy.linalg.solve_triangular(L.conj().T, y, lower=False)
@@ -629,6 +860,7 @@ def _make_fit_one_rchunk_kernel(
     q_chunk_size: int,
     kvecs_frac,
     psi_G_store,
+    vertex_mu_L: int = 0,
 ):
     """Factory: returns a ``jax.jit``'d fit_one_rchunk callable closing
     over every piece of static structure + a :class:`PsiGStore` that
@@ -739,8 +971,11 @@ def _make_fit_one_rchunk_kernel(
                                       ).at[dst_lo:dst_hi].set(
                     norms[cen_lo:cen_hi])
             psi_R_bc = psi_bc_Y / norm_slice[None, :, None, None]
-            return accumulate_pair_density_spin_traced(
-                P_acc, psi_L_bc, psi_R_bc, mesh_xy)
+            if vertex_mu_L == 0:
+                return accumulate_pair_density_spin_traced(
+                    P_acc, psi_L_bc, psi_R_bc, mesh_xy)
+            return accumulate_pair_density_lorentz(
+                P_acc, psi_L_bc, psi_R_bc, vertex_mu_L, mesh_xy)
 
         # --- 2. Stream band-chunks: fetch ψ(G) per-bc from host via
         #       io_callback, FFT + reshard, accumulate pair density.
@@ -767,7 +1002,8 @@ def _make_fit_one_rchunk_kernel(
         # the load_wfns separate-jit pattern.  Same pattern as lorrax_B
         # commit c0307a0.
         Z_q = compute_ZCT_from_left_right_zchunk(P_l, P_r, kgrid, mesh_xy)
-        zeta = solve_zeta_from_L_q(L_q, Z_q, mesh_xy, q_chunk_size)
+        zeta = solve_zeta_from_L_q(
+            L_q, Z_q, mesh_xy, q_chunk_size, vertex_mu_L=vertex_mu_L)
         return zeta
 
     return _kernel
@@ -791,6 +1027,7 @@ def fit_one_rchunk(
     actual_n_rchunk: int,
     q_chunk_size: int,
     kvecs_frac: np.ndarray,
+    vertex_mu_L: int = 0,
 ):
     """Entry point for the r-chunk body jit.  Caches one compiled kernel
     per distinct static configuration.
@@ -811,6 +1048,7 @@ def fit_one_rchunk(
         tuple(meta.fft_grid),
         hash(kvecs_frac.tobytes()),
         id(psi_G_store),
+        int(vertex_mu_L),
     )
     fn = _fit_one_rchunk_cache.get(cache_key)
     if fn is None:
@@ -824,6 +1062,7 @@ def fit_one_rchunk(
             q_chunk_size,
             kvecs_frac,
             psi_G_store,
+            vertex_mu_L=int(vertex_mu_L),
         )
         _fit_one_rchunk_cache[cache_key] = fn
     return fn(
@@ -887,9 +1126,19 @@ def fit_zeta_chunked_to_h5(
     band_norms: np.ndarray | None = None,
     slab_io_backend=None,
     gspace_mode: str = "host_cache",
+    vertex_mu_L: int = 0,
 ):
     """
     Full zeta fitting pipeline with r-chunk loop and HDF5 output.
+
+    For ``vertex_mu_L == 0`` (default) this is the standard spin-traced
+    path used by the charge-channel ISDF fit — bit-identical to the
+    pre-bispinor implementation.  For ``vertex_mu_L ∈ {1, 2, 3}`` the
+    pair-density helpers contract through the Lorentz vertex γ̃^{μ_L}
+    instead of the identity, and ``compute_L_q_from_CCT`` /
+    ``solve_zeta_from_L_q`` switch from Cholesky to LU because the
+    transverse-channel CCT is indefinite.  See
+    ``docs/BISPINOR_DHFB_DESIGN.md`` for the math.
 
     Workflow:
     1. Slice pre-loaded centroid wavefunctions into left/right halves.
@@ -1009,11 +1258,18 @@ def fit_zeta_chunked_to_h5(
                   f"{n_zero} zero-weight (skipped)")
 
     # ========== STEP 2: Compute CCT (C_q) from left/right pair densities ==========
-    # Uses normalized copies for fitting (equal-weight pair densities)
+    # Uses normalized copies for fitting (equal-weight pair densities).
+    # γ̃^0 = I_4, so vertex_mu_L=0 is the standard spin-traced path; non-zero
+    # vertex_mu_L threads γ̃^{μ_L} into the contraction (bispinor only).
     with timing.section("zeta_fit.CCT"):
-        print(f"  Computing pair densities P_l, P_r (spin_traced)")
-        P_l_k = compute_pair_density_spin_traced(psi_l_rmuT_X_fit, psi_l_rmu_Y_fit, mesh_xy)
-        P_r_k = compute_pair_density_spin_traced(psi_r_rmuT_X_fit, psi_r_rmu_Y_fit, mesh_xy)
+        if vertex_mu_L == 0:
+            print(f"  Computing pair densities P_l, P_r (spin_traced)")
+            P_l_k = compute_pair_density_spin_traced(psi_l_rmuT_X_fit, psi_l_rmu_Y_fit, mesh_xy)
+            P_r_k = compute_pair_density_spin_traced(psi_r_rmuT_X_fit, psi_r_rmu_Y_fit, mesh_xy)
+        else:
+            print(f"  Computing pair densities P_l, P_r (γ̃^{vertex_mu_L} vertex)")
+            P_l_k = compute_pair_density_lorentz(psi_l_rmuT_X_fit, psi_l_rmu_Y_fit, vertex_mu_L, mesh_xy)
+            P_r_k = compute_pair_density_lorentz(psi_r_rmuT_X_fit, psi_r_rmu_Y_fit, vertex_mu_L, mesh_xy)
         P_l_k.block_until_ready()
         P_r_k.block_until_ready()
         C_q = compute_CCT_from_left_right(P_l_k, P_r_k, kgrid, mesh_xy)
@@ -1028,10 +1284,17 @@ def fit_zeta_chunked_to_h5(
         flat_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
         C_q_flat = jax.lax.with_sharding_constraint(C_q_flat, flat_shard)
 
-    # ========== STEP 3: Compute L_q = chol(C_q) once ==========
+    # ========== STEP 3: Compute L_q from CCT ==========
+    # μ_L=0: Cholesky factor (CCT positive-definite).
+    # μ_L≠0: passthrough; solve_zeta_from_L_q switches to LU at solve time.
     with timing.section("zeta_fit.cholesky"):
-        print(f"  Computing L_q = chol(C_q)")
-        L_q = compute_L_q_from_CCT(C_q_flat, mesh_xy)
+        if int(vertex_mu_L) == 0:
+            print(f"  Computing L_q = chol(C_q)")
+        else:
+            print(f"  Skipping Cholesky (vertex_mu_L={vertex_mu_L} CCT is "
+                  f"indefinite); LU solve will run at fit time")
+        L_q = compute_L_q_from_CCT(
+            C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L))
         L_q.block_until_ready()
         print(f"  L_q: {L_q.shape}")
 
@@ -1241,6 +1504,7 @@ def fit_zeta_chunked_to_h5(
                         actual_n_rchunk=actual_n_rchunk,
                         q_chunk_size=q_chunk_size,
                         kvecs_frac=kvecs_frac,
+                        vertex_mu_L=int(vertex_mu_L),
                     )
                     zeta_chunk.block_until_ready()
             finally:

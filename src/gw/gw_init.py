@@ -612,6 +612,78 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			print_fn(f"    γ (runtime / AOT-pred) = {gamma:.3f}  "
 			         f"(AOT predicted {aot_peak_gb:.2f} GB)")
 
+	# ── Bispinor: fit ζ^{μ_L=1,2,3} on the current-density centroid set ──
+	# Same kernel as the charge channel, swapping in the γ̃^i vertex.  Three
+	# sequential calls keep peak GPU memory at the scalar-fit level.  Output
+	# paths follow the convention zeta_q_mu{1,2,3}.h5 next to zeta_q.h5.
+	if cfg.bispinor and getattr(cfg.paths, 'centroids_file_current', None):
+		import dataclasses
+		from common.load_wfns import load_centroids_band_chunked
+		from file_io.centroids import load_centroids
+
+		cents_curr_path = cfg.paths.centroids_file_current
+		print_fn(f"\n  [bispinor] fitting ζ^{{μ_L=1,2,3}} on current-density "
+		         f"centroids: {cents_curr_path}")
+		_, cents_curr_idx, n_rmu_curr = load_centroids(
+			cents_curr_path, meta.fft_grid)
+		# Round n_rmu_jax to n_proc, matching Meta.from_system convention.
+		n_rmu_curr_jax = ((n_rmu_curr + meta.n_proc - 1) // meta.n_proc) * meta.n_proc
+		meta_curr = dataclasses.replace(
+			meta, n_rmu=int(n_rmu_curr), n_rmu_jax=int(n_rmu_curr_jax))
+
+		with timing.section("gw_jax.load_centroid_wfns_current"):
+			psi_curr_rmu_Y, psi_curr_rmuT_X = load_centroids_band_chunked(
+				wfn, sym, meta_curr,
+				jnp.asarray(cents_curr_idx, dtype=jnp.int32),
+				cfg.bispinor, mesh_xy,
+				band_range=band_slices.full_range,
+				band_chunk_size=chunks['band_chunk'],
+			)
+
+		# isdf_fitting / load_wfns caches close over tracers from the
+		# enclosing jit at first compile.  Reusing those compiled fns from
+		# a fresh fit_zeta_chunked_to_h5 invocation triggers
+		# UnexpectedTracerError because the closures hold values from a
+		# now-closed trace scope.  Clear before each channel.
+		import gc
+		from common import isdf_fitting as _isdf, load_wfns as _lw
+
+		def _drop_traced_caches():
+			_isdf._fit_one_rchunk_cache.clear()
+			_isdf._compute_pair_density_cache.clear()
+			_isdf._accum_pair_density_cache.clear()
+			_isdf._compute_pair_density_vertex_cache.clear()
+			_isdf._accum_pair_density_vertex_cache.clear()
+			if hasattr(_lw, '_rchunk_slice_cache'):
+				_lw._rchunk_slice_cache.clear()
+			jax.clear_caches()
+			gc.collect()
+
+		for mu_L in (1, 2, 3):
+			_drop_traced_caches()
+			zeta_mu_path = os.path.join(tmp_dir, f"zeta_q_mu{mu_L}.h5")
+			print_fn(f"  [bispinor] μ_L={mu_L} → {zeta_mu_path}")
+			with timing.section(f"gw_jax.zeta_fit_chunked_mu{mu_L}"), \
+			     jax_profile.trace_section(f"zeta_fit_mu{mu_L}"):
+				fit_zeta_chunked_to_h5(
+					wfn=wfn, sym=sym, meta=meta_curr,
+					centroid_indices=jnp.asarray(cents_curr_idx, dtype=jnp.int32),
+					mesh_xy=mesh_xy,
+					chunk_r=chunks['chunk_r'], output_file=zeta_mu_path,
+					psi_rmu_Y=psi_curr_rmu_Y, psi_rmuT_X=psi_curr_rmuT_X,
+					band_chunk_size=chunks['band_chunk'],
+					q_chunk_size=chunks['q_chunk'],
+					q_gather_size=chunks.get('q_gather', 0),
+					bispinor=cfg.bispinor,
+					band_range_left=band_range_left,
+					band_range_right=band_range_right,
+					k_chunk_size=chunks.get('k_chunk', 0),
+					band_norms=_band_norms,
+					slab_io_backend=cfg.backend.slab_io,
+					gspace_mode=cfg.gspace_mode,
+					vertex_mu_L=mu_L,
+				)
+
 	return zeta_h5_path, mem_est
 
 
@@ -663,27 +735,109 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	print_fn(f"    V_q budget:    {budget_gb:.2f} GB")
 
 	from file_io.slab_io import SlabIO
-	# Single dispatcher routes to the unified V_q tile driver (one inner
-	# kernel handles same/distinct ζ × Case A/B; one outer driver handles
-	# both PHDF5/FFI and h5py-allgather backends).
-	with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
-		with SlabIO(zeta_h5_path, mode='r', mesh=mesh_xy,
-		            backend=cfg.backend.slab_io) as zeta_io:
-			with mesh_xy:
-				V_q_raw, G0_all = compute_all_V_q(
-					zeta_io,
-					kgrid=meta.kgrid, fft_grid=meta.fft_grid,
-					bvec=bvec, cell_volume=meta.cell_volume,
-					mesh_xy=mesh_xy,
-					n_rmu=meta.n_rmu, n_rtot=meta.n_rtot,
-					sys_dim=meta.sys_dim,
-					bdot=np.asarray(wfn.bdot, dtype=np.float64)
-						if meta.sys_dim == 0 else None,
-					mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
-					bare_coulomb_cutoff=vcoul_cutoff_ry,
-					bgw_v_grid_fn=bgw_v_grid_fn,
-					budget_bytes=m_budget,
-				)
+
+	# ── Bispinor branch ────────────────────────────────────────────────
+	# When cfg.bispinor is set AND the 4-channel ζ files were produced by
+	# fit_zeta (zeta_q.h5 + zeta_q_mu{1,2,3}.h5), dispatch to the
+	# 7-tile orchestrator that streams V^{μ_L,ν_L}_q to a dedicated
+	# HDF5 file.  The CC tile (μ_L = ν_L = 0) is bit-identical to the
+	# scalar charge V_q (verified by tests/test_v_q_bispinor_orchestrator),
+	# so we read it back from the bispinor file as the scalar V_qmunu /
+	# G0 the downstream restart_state writer expects.  Σ_X^B / Σ_H^B
+	# consumers will read the TT tiles directly via BispinorVqReader.
+	zeta_dir = os.path.dirname(zeta_h5_path)
+	zeta_T_paths = [
+		os.path.join(zeta_dir, f"zeta_q_mu{mu_L}.h5") for mu_L in (1, 2, 3)
+	]
+	bispinor_ready = (
+		cfg.bispinor and all(os.path.exists(p) for p in zeta_T_paths)
+	)
+	if cfg.bispinor and not bispinor_ready:
+		print_fn(
+			f"  [bispinor] cfg.bispinor=True but transverse ζ files "
+			f"not all present at {zeta_dir}/zeta_q_mu{{1,2,3}}.h5 — "
+			f"falling back to scalar V_q.  Did fit_zeta receive "
+			f"cfg.centroids_file_current?"
+		)
+
+	if bispinor_ready:
+		from .v_q_bispinor import (
+			compute_V_q_bispinor_to_h5, BispinorVqReader, tile_dataset_name,
+		)
+		from .compute_vcoul import make_v_munu_chunked_kernel
+
+		bispinor_h5_path = os.path.join(zeta_dir, "v_q_bispinor.h5")
+		print_fn(f"\n  [bispinor] V_q^{{μ_L,ν_L}} → {bispinor_h5_path}")
+
+		# Charge-channel n_rmu (== meta.n_rmu).  Transverse n_rmu_T comes
+		# from the dataset shape on disk — read it from one of the ζ_T
+		# files.
+		with h5py.File(zeta_T_paths[0], 'r') as f:
+			n_rmu_T = int(f['zeta_q'].shape[-1])
+		n_rmu_C = int(meta.n_rmu)
+
+		coulomb_kernels = make_v_munu_chunked_kernel(
+			meta.fft_grid[0], meta.fft_grid[1], meta.fft_grid[2],
+			meta.kgrid[0], meta.kgrid[1], meta.kgrid[2],
+			bvec, meta.cell_volume,
+			sys_dim=meta.sys_dim,
+			bdot=np.asarray(wfn.bdot, dtype=np.float64)
+				if meta.sys_dim == 0 else None,
+			mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
+			vcoul_cutoff_ry=vcoul_cutoff_ry,
+		)
+
+		with timing.section("gw_jax.V_q_compute"), \
+		     jax_profile.trace_section("V_q_compute_bispinor"):
+			with SlabIO(zeta_h5_path, mode='r', mesh=mesh_xy,
+			            backend=cfg.backend.slab_io) as zc, \
+			     SlabIO(zeta_T_paths[0], mode='r', mesh=mesh_xy,
+			            backend=cfg.backend.slab_io) as zt1, \
+			     SlabIO(zeta_T_paths[1], mode='r', mesh=mesh_xy,
+			            backend=cfg.backend.slab_io) as zt2, \
+			     SlabIO(zeta_T_paths[2], mode='r', mesh=mesh_xy,
+			            backend=cfg.backend.slab_io) as zt3:
+				with mesh_xy:
+					compute_V_q_bispinor_to_h5(
+						zeta_C_io=zc, zeta_T_ios=(zt1, zt2, zt3),
+						output_h5_path=bispinor_h5_path,
+						coulomb_kernels=coulomb_kernels,
+						mesh_xy=mesh_xy, kgrid=meta.kgrid,
+						fft_grid=meta.fft_grid, bvec=bvec,
+						n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T,
+						budget_bytes=m_budget,
+						backend=cfg.backend.slab_io,
+					)
+
+		# Read CC tile + g0 back for downstream restart-state writer.
+		# The TT tiles stay on disk; Σ_X^B / Σ_H^B will consume them
+		# via BispinorVqReader once those paths land.
+		with BispinorVqReader(bispinor_h5_path, mesh_xy,
+		                      backend=cfg.backend.slab_io) as reader:
+			V_q_raw = reader.get_tile(0, 0)
+			G0_all = reader.get_g0_CC()
+	else:
+		# Single dispatcher routes to the unified V_q tile driver (one
+		# inner kernel handles same/distinct ζ × Case A/B; one outer
+		# driver handles both PHDF5/FFI and h5py-allgather backends).
+		with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
+			with SlabIO(zeta_h5_path, mode='r', mesh=mesh_xy,
+			            backend=cfg.backend.slab_io) as zeta_io:
+				with mesh_xy:
+					V_q_raw, G0_all = compute_all_V_q(
+						zeta_io,
+						kgrid=meta.kgrid, fft_grid=meta.fft_grid,
+						bvec=bvec, cell_volume=meta.cell_volume,
+						mesh_xy=mesh_xy,
+						n_rmu=meta.n_rmu, n_rtot=meta.n_rtot,
+						sys_dim=meta.sys_dim,
+						bdot=np.asarray(wfn.bdot, dtype=np.float64)
+							if meta.sys_dim == 0 else None,
+						mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
+						bare_coulomb_cutoff=vcoul_cutoff_ry,
+						bgw_v_grid_fn=bgw_v_grid_fn,
+						budget_bytes=m_budget,
+					)
 
 	# Write G0 = ζ_μ(G=0) at q=0 back to zeta file via SlabIO's deferred
 	# attr path (small; rank-0-only after MPI-IO file is closed).
