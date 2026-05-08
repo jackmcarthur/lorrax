@@ -14,9 +14,12 @@ by a pair of affine laws, refit at each SC iteration — one for valence bands
     ΔE_v(E) = α_v · E + β_v
     ΔE_c(E) = α_c · E + β_c
 
-The scissor enters the Hamiltonian as a diagonal addition — no off-diagonal
-coupling is introduced for the out-of-grid bands, matching the first-order
-scissor approximation.
+The scissor is applied at the **eigenvalue level** in the diagonal Σ(E)
+fixed-point: out-of-grid bands receive E_QP = E_DFT + (α·E_DFT + β); the
+QSGW Σ_xc that enters the QP Hamiltonian then evaluates the dynamic
+correlation at this scissor-corrected E_QP.  No matrix-level diagonal-add
+is exposed because the post-self-energy plumbing keeps H replicated, so a
+plain ``H.at[:, idx, idx].add(diag)`` suffices when the caller wants one.
 
 Units and layout
 ----------------
@@ -25,21 +28,13 @@ Units and layout
   as long as inputs at fit time and apply time share the same reference.
 - Per-band arrays: ``(nk, nb)``.  Fit / extrapolate are pure NumPy since the
   fit consumes O(nk·nb_σ) scalars.
-- Hamiltonian update accepts a JAX array ``H[k, m, n]`` sharded as
-  ``P(None, 'x', 'y')`` on a 2-D ``('x', 'y')`` device mesh.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Union
 
 import numpy as np
-
-import jax
-import jax.numpy as jnp
-from jax import lax
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 
 # ---------------------------------------------------------------------------
@@ -185,91 +180,8 @@ def extrapolate_delta_e(
     return np.where(ig, dE, fit.predict(E_kn_ev, valence_mask_kn))
 
 
-# ---------------------------------------------------------------------------
-# Sharded Hamiltonian-diagonal add
-# ---------------------------------------------------------------------------
-
-def add_diag_to_H_kmn(
-    H_kmn: jax.Array,
-    diag_kn: Union[np.ndarray, jax.Array],
-    mesh_xy: Mesh,
-) -> jax.Array:
-    """Add a per-(k, n) diagonal ``d[k, n]`` into ``H[k, m, n]`` at m == n.
-
-    Parameters
-    ----------
-    H_kmn : jax.Array, shape (nk, nb, nb)
-        Complex Hamiltonian sharded as ``P(None, 'x', 'y')`` on ``mesh_xy``.
-    diag_kn : array, shape (nk, nb)
-        Per-band diagonal to add.  Replicated across devices (small — nk·nb
-        scalars, typically ≲ 100 kB).  Real or complex; cast to H's dtype.
-    mesh_xy : Mesh
-        2-D device mesh with named axes ('x', 'y').
-
-    Returns
-    -------
-    H_kmn with the diagonal added, same sharding.
-
-    Notes
-    -----
-    Implemented with ``shard_map`` so each device touches only the diagonal
-    elements it owns inside its local (bm × bn) block.  Off-diagonal process
-    blocks apply a masked no-op.  Requires ``nb % x_size == 0`` and
-    ``nb % y_size == 0``; pad ``H`` and ``diag_kn`` first if ``nb_sigma`` is
-    not divisible.
-    """
-    from jax.experimental.shard_map import shard_map
-
-    x_size, y_size = mesh_xy.devices.shape
-    if H_kmn.ndim != 3:
-        raise ValueError(f"H_kmn must be 3-D (nk, nb, nb); got {H_kmn.shape}.")
-    nk, nb, nb2 = H_kmn.shape
-    if nb != nb2:
-        raise ValueError(f"H_kmn must be square in (m, n); got {H_kmn.shape}.")
-    if nb % x_size != 0 or nb % y_size != 0:
-        raise ValueError(
-            f"add_diag_to_H_kmn requires nb ({nb}) divisible by both x_size "
-            f"({x_size}) and y_size ({y_size}); pad H first."
-        )
-    bm = nb // x_size
-    bn = nb // y_size
-
-    d = jnp.asarray(diag_kn, dtype=H_kmn.dtype)
-    if d.shape != (nk, nb):
-        raise ValueError(f"diag_kn must have shape ({nk}, {nb}); got {tuple(d.shape)}.")
-    d_rep = jax.device_put(d, NamedSharding(mesh_xy, P(None, None)))
-
-    def _local_add(H_local, d_full):
-        # H_local: (nk, bm, bn); d_full: (nk, nb) fully replicated.
-        # Scatter the nb diagonal contributions onto the shard-local block;
-        # entries whose global diagonal index doesn't land on this shard are
-        # zeroed via `valid` and thus contribute nothing to the .at[].add.
-        ix = lax.axis_index('x')
-        iy = lax.axis_index('y')
-        j = jnp.arange(nb)
-        local_row = j - ix * bm
-        local_col = j - iy * bn
-        valid = (
-            (local_row >= 0) & (local_row < bm) &
-            (local_col >= 0) & (local_col < bn)
-        )
-        r_safe = jnp.clip(local_row, 0, bm - 1)
-        c_safe = jnp.clip(local_col, 0, bn - 1)
-        contrib = jnp.where(valid[None, :], d_full, jnp.zeros_like(d_full))
-        return H_local.at[:, r_safe, c_safe].add(contrib)
-
-    return shard_map(
-        _local_add,
-        mesh=mesh_xy,
-        in_specs=(P(None, 'x', 'y'), P(None, None)),
-        out_specs=P(None, 'x', 'y'),
-        check_rep=False,
-    )(H_kmn, d_rep)
-
-
 __all__ = [
     "ScissorFit",
     "fit_scissor",
     "extrapolate_delta_e",
-    "add_diag_to_H_kmn",
 ]

@@ -48,10 +48,10 @@ from .cohsex_sigma import (
 	_add_static_head,
 )
 from .qsgw_utils import (
+	build_qsgw_sigma_xc,
+	extract_sigma_diag_replicated,
 	print_scf_diagnostics,
 	solve_diagonal_sigma_fixed_point,
-	load_sigma_xc_diag_from_h5,
-	build_qsgw_sigma_xc_from_h5,
 )
 from .head_correction import (
 	HeadResolver,
@@ -352,75 +352,32 @@ def main(argv=None):
 	sigma_xc_at_dft_ev  = ppm_outputs.sigma_xc_at_dft_ev  if ppm_outputs else None
 	omega_dft_rel_ev    = ppm_outputs.omega_dft_rel_ev    if ppm_outputs else None
 	efermi_dft_ev       = ppm_outputs.efermi_dft_ev       if ppm_outputs else None
-	# ω-grid Σ_c diagonal for the BGW eqp1.dat Z-factor (PPM modes only).
-	# ppm_outputs.sigma_c_omega is (n_omega, nk_full, nb, nb) Ry, post-head;
-	# we hand the diagonal in eV to the writer which then central-diffs it.
-	if ppm_outputs is not None and ppm_outputs.sigma_c_omega is not None:
-		sigma_c_omega_diag_ev = (
-			np.diagonal(np.asarray(ppm_outputs.sigma_c_omega),
-			            axis1=2, axis2=3) * RYD_TO_EV
-		)
-		omega_rel_ev = np.asarray(ppm_outputs.ppm_options.omega_grid_ev)
-	else:
-		sigma_c_omega_diag_ev = None
-		omega_rel_ev = None
 	ppm_options         = ppm_outputs.ppm_options         if ppm_outputs else None
 
 	# ---- QP Hamiltonian: H_QP = (H_DFT - V_xc) + V_H + Σ_xc ----
-	sigma_total = sig_sx + sig_coh + sig_h
-	kin_ion = load_kin_ion_submatrix(config.paths.kin_ion_file, band_slices.b0, band_slices.b3)
+	#
+	# Sharding: kin_ion + all four static-COHSEX components (Σ_SX, Σ_COH,
+	# V_H, Σ_X) are loaded **fully replicated** on the device mesh.  The
+	# only sharded object surviving past this point is the dynamic-Σ_c
+	# ω-tensor produced by ``compute_ppm_sigma_pipeline``, which is
+	# collapsed into a replicated Σ_xc^QSGW by ``build_qsgw_sigma_xc``
+	# below.  This lets the rest of post-processing (eigh, scissor,
+	# eqp output) operate on replicated arrays without resharding seams.
+	kin_ion = load_kin_ion_submatrix(
+		config.paths.kin_ion_file, band_slices.b0, band_slices.b3,
+		mesh=mesh_xy, backend=config.backend.slab_io,
+	)
 
-	# Dynamic-mode diagonal self-consistency + QSGW (rank 0 only)
-	if mode.is_dynamic and meta.rank == 0 and sigma_omega_h5_path and os.path.exists(sigma_omega_h5_path):
-		H_qp = np.array(kin_ion + sigma_total)
-		H_qp = 0.5 * (H_qp + np.conj(np.swapaxes(H_qp, -1, -2)))
-		E_qp_ev = np.linalg.eigvalsh(H_qp) * RYD_TO_EV
-
-		# Diagonal fixed-point: E = diag(H0) + Re Σ_xc(E)
-		h0_diag_ev = np.real(np.diagonal(np.array(kin_ion + sig_h), axis1=1, axis2=2)) * RYD_TO_EV
-		occ_idx = min(meta.nelec, E_qp_ev.shape[1] - 1)
-		vbm = float(np.max(E_qp_ev[:, occ_idx]))
-		cbm = float(np.min(E_qp_ev[:, occ_idx + 1])) if occ_idx + 1 < E_qp_ev.shape[1] else vbm
-		efermi = 0.5 * (vbm + cbm)
-		omega_ev = np.asarray(ppm_options.omega_grid_ev, dtype=np.float64)
-		# PPM mode: Σ_xc(ω) = Σ_x_bare + Σ_c(ω); the H5 file holds Σ_c only.
-		sigma_xc_diag = np.real(load_sigma_xc_diag_from_h5(sigma_omega_h5_path, RYD_TO_EV * np.array(sig_x)))
-		E_sc, conv, n_iter = solve_diagonal_sigma_fixed_point(
-			h0_diag_ev - efermi, sigma_xc_diag, omega_ev, max_iter=120, tol_ev=1e-7, mixing=0.6)
-		# In-grid test is against DFT energy (the Sigma(omega) grid is indexed
-		# by omega = E - E_F and is only meaningful where E_DFT lies inside it).
-		# QP eigenvalues from H_qp diagonalization are unreliable here because
-		# pseudobands' non-unit-norm coefficients give eigvalsh(H_qp) garbage
-		# values for the compressed high-energy states.
-		E_dft_rel_ev = np.asarray(omega_dft_rel_ev, dtype=np.float64)
-		E_qp_rel_ev = E_qp_ev - efermi
-		in_grid = (E_dft_rel_ev >= omega_ev[0]) & (E_dft_rel_ev <= omega_ev[-1])
-		n_in = int(np.count_nonzero(in_grid))
-
-		if config.ppm.sigma_at_dft_extrapolate and np.any(in_grid) and np.any(~in_grid):
-			# Scissor: ΔE_n = E_QP_n − E_DFT_n fit against E_DFT, separate
-			# slopes/intercepts for valence and conduction.  Out-of-grid bands
-			# get E_QP = E_DFT + (α·E_DFT + β) using the fitted line.
-			from .scissor import fit_scissor
-			nb_sc = E_sc.shape[1]
-			occ_mask_kn = (np.arange(nb_sc)[None, :] < meta.nelec)
-			occ_mask_kn = np.broadcast_to(occ_mask_kn, E_sc.shape).astype(bool)
-			delta_e_measured = np.real(E_sc - E_dft_rel_ev)
-			fit = fit_scissor(E_dft_rel_ev, delta_e_measured,
-							  valence_mask_kn=occ_mask_kn,
-							  fit_mask_kn=in_grid)
-			print0(f"  Scissor fit: {fit.summary()}")
-			extrap_rel = E_dft_rel_ev + fit.predict(E_dft_rel_ev, occ_mask_kn)
-			E_sc = np.where(in_grid, E_sc, extrap_rel) + efermi
-		else:
-			E_sc = np.where(in_grid, E_sc, E_qp_rel_ev) + efermi
-		print0(f"  Diagonal SC: {n_in}/{in_grid.size} states in grid, {n_iter} iterations")
-
-		qsgw = build_qsgw_sigma_xc_from_h5(sigma_omega_h5_path,
-			RYD_TO_EV * np.array(sig_x), omega_ev, E_sc - efermi)
-		print0(f"  QSGW: {int(qsgw['n_interp_clipped'])} clipped "
-			f"({100*qsgw['frac_interp_clipped']:.1f}%)")
-
+	# ---- Mode-pivoted Σ_xc dispatch.  All branches yield ``sigma_total``
+	# replicated on the mesh as Σ_xc + V_H (Ry).
+	#
+	# History note (kept here because it explains a specific decision and
+	# is not yet captured anywhere else): the analytic q→0 head injected
+	# at the end of ``compute_ppm_sigma_pipeline`` was re-added in
+	# 2026-04-25 after being removed in 1542342 (Apr-10).  Magnitude is
+	# ±W^c(0)/(2·V_cell·N_k) on-shell — ~1.24 eV/band on Si 4×4×4 60b.
+	# See reports/mos2_kgrid_gnppm_head_convergence_2026-4-10/.
+	E_sc_ev = None
 	if config.self_consistent:
 		# SC-COHSEX iteration — reuse the cached jit'd kernels directly so
 		# the fixed-point driver can vary Gij.
@@ -446,6 +403,7 @@ def main(argv=None):
 			sx_new, coh_new = _add_head(sx_new, coh_new)
 			return hermitian_to_upper_flat(sx_new + coh_new + h_new).flatten()
 
+		sigma_total = sig_sx + sig_coh + sig_h
 		result = rcrop_nojit(
 			lambda x: _sc_step(x) - x,
 			hermitian_to_upper_flat(sigma_total).flatten(),
@@ -454,21 +412,114 @@ def main(argv=None):
 		sigma_total = upper_flat_to_hermitian(result.x.reshape(nk, n_upper), meta.nb_sigma)
 
 		# Final sigma components from converged Gij
-		H = 0.5 * ((kin_ion + sigma_total) + jnp.conj(jnp.swapaxes(kin_ion + sigma_total, -1, -2)))
-		E_full, U_full = jax.vmap(jnp.linalg.eigh, in_axes=0)(H)
+		H_for_diag = 0.5 * ((kin_ion + sigma_total) + jnp.conj(jnp.swapaxes(kin_ion + sigma_total, -1, -2)))
+		_, U_diag = jax.vmap(jnp.linalg.eigh, in_axes=0)(H_for_diag)
 		f = (jnp.arange(meta.nb_sigma) < meta.nelec).astype(jnp.float64)
-		Gij_final = jnp.einsum('kim,m,kjm->kij', U_full, f, jnp.conj(U_full), optimize=True)
-		print_scf_diagnostics(Gij_final, U_full, meta.nelec, meta.nb_sigma, print0)
+		Gij_final = jnp.einsum('kim,m,kjm->kij', U_diag, f, jnp.conj(U_diag), optimize=True)
+		print_scf_diagnostics(Gij_final, U_diag, meta.nelec, meta.nb_sigma, print0)
 		with mesh_xy:
 			sig_sx  = sigma_sx_k(wfns, Gij_final, W_q)
 			sig_coh = sigma_coh_k(wfns, W_q, V_q)
 			sig_h   = hartree_k(wfns, Gij_final, V_q)
 		sig_sx, sig_coh = _add_head(sig_sx, sig_coh)
-	else:
-		H = 0.5 * ((kin_ion + sigma_total) + jnp.conj(jnp.swapaxes(kin_ion + sigma_total, -1, -2)))
-		E_full, U_full = jax.vmap(jnp.linalg.eigh, in_axes=0)(H)
+		sigma_total = sig_sx + sig_coh + sig_h
+	elif mode.is_dynamic and ppm_outputs is not None and ppm_outputs.sigma_c_omega is not None:
+		# G0W0/QSGW: diagonal-Σ(E) fixed point (with optional scissor) →
+		# QSGW Σ_xc^QSGW.  Restart-friendly: this whole block consumes only
+		# the on-device ``sigma_c_omega`` plus replicated (sig_x, sig_h),
+		# so a future outer QSGW iteration loop can pass refreshed inputs
+		# in without touching the disk.
+		omega_grid_ev = np.asarray(ppm_options.omega_grid_ev, dtype=np.float64)
 
-	# ---- DFT and QP energies ----
+		# Diagonal Σ_c(ω, k, n) replicated on host (a few MB).
+		sigma_c_diag_w_kn_ev = np.asarray(extract_sigma_diag_replicated(
+			ppm_outputs.sigma_c_omega, mesh_xy)) * RYD_TO_EV
+		sigma_x_diag_kn_ev = (
+			np.real(np.diagonal(np.asarray(sig_x), axis1=1, axis2=2)) * RYD_TO_EV)
+		sigma_xc_diag_w_kn_ev = sigma_c_diag_w_kn_ev + sigma_x_diag_kn_ev[None, :, :]
+
+		# Diagonal Σ(E) fixed point (host NumPy, vectorised).
+		h0_diag_ev = (
+			np.real(np.diagonal(np.asarray(kin_ion + sig_h), axis1=1, axis2=2))
+			* RYD_TO_EV)
+		efermi = float(efermi_dft_ev)
+		E_sc_rel_ev, _, n_iter = solve_diagonal_sigma_fixed_point(
+			h0_diag_ev - efermi, sigma_xc_diag_w_kn_ev, omega_grid_ev,
+			max_iter=120, tol_ev=1e-7, mixing=0.6,
+		)
+
+		# Scissor for out-of-grid bands.  Default fallback (no scissor) is
+		# E_DFT, not the unreliable pseudoband eigvalsh — see the comment
+		# block previously at gw_jax.py:388-390 for context.
+		E_dft_rel_ev = np.asarray(omega_dft_rel_ev, dtype=np.float64)
+		in_grid = (
+			(E_dft_rel_ev >= omega_grid_ev[0]) & (E_dft_rel_ev <= omega_grid_ev[-1]))
+		n_in = int(np.count_nonzero(in_grid))
+		if config.ppm.sigma_at_dft_extrapolate and np.any(in_grid) and np.any(~in_grid):
+			from .scissor import fit_scissor
+			occ_mask_kn = np.broadcast_to(
+				np.arange(E_sc_rel_ev.shape[1])[None, :] < meta.nelec,
+				E_sc_rel_ev.shape).astype(bool)
+			fit = fit_scissor(
+				E_dft_rel_ev, np.real(E_sc_rel_ev - E_dft_rel_ev),
+				valence_mask_kn=occ_mask_kn, fit_mask_kn=in_grid)
+			print0(f"  Scissor fit: {fit.summary()}")
+			extrap_rel = E_dft_rel_ev + fit.predict(E_dft_rel_ev, occ_mask_kn)
+			E_sc_rel_ev = np.where(in_grid, E_sc_rel_ev, extrap_rel)
+		else:
+			E_sc_rel_ev = np.where(in_grid, E_sc_rel_ev, E_dft_rel_ev)
+		print0(f"  Diagonal SC: {n_in}/{in_grid.size} states in grid, {n_iter} iterations")
+		E_sc_ev = E_sc_rel_ev + efermi
+
+		# QSGW Σ_xc^QSGW: sharded ω-tensor + replicated E_sc → replicated Σ_xc.
+		sig_x_rep = jax.device_put(jnp.asarray(sig_x),
+			NamedSharding(mesh_xy, P(None, None, None)))
+		sigma_xc_qsgw_kij_ry, qsgw_diag = build_qsgw_sigma_xc(
+			ppm_outputs.sigma_c_omega, sig_x_rep,
+			omega_grid_ev, E_sc_rel_ev, mesh_xy,
+		)
+		print0(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
+			f"({100*qsgw_diag['frac_clipped']:.1f}%)")
+		sigma_total = sigma_xc_qsgw_kij_ry + sig_h
+	else:
+		# Static modes (X_ONLY, COHSEX) and dynamic-streamed fallback.
+		sigma_total = sig_sx + sig_coh + sig_h
+
+	# ---- BGW-style degenerate-set averaging at the H-build seam ----
+	# Mirrors Sigma/shiftenergy.f90; replaces the previous per-component
+	# averaging at the writer.  Applied to:
+	#   - sigma_total's diagonal           → consistent E_qp from eigh
+	#   - sig_sx, sig_coh, sig_h, sig_x    → consistent sigma_diag.dat
+	#   - sigma_c_at_dft_ev (1-D)          → consistent eqp.dat ``sigC``
+	# Off-diagonals are preserved.  The averaging is cheap (a host loop
+	# over k of contiguous degeneracy groups) so the redundancy across
+	# components is not a perf concern.
+	if not config.no_degen_averaging:
+		from .degen_average import (
+			apply_to_matrix_diagonals,
+			average_within_degenerate_sets,
+		)
+		_enk_sigma_ry, _ = get_enk_bandrange(
+			wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
+			nspinor=meta.nspinor)
+		_e_kn_ry = np.asarray(_enk_sigma_ry, dtype=np.float64)
+		_tol = float(config.degen_avg_tol_ry)
+		_dav_rep = NamedSharding(mesh_xy, P(None, None, None))
+		def _dav(M):
+			return jax.device_put(jnp.asarray(apply_to_matrix_diagonals(
+				np.asarray(M), _e_kn_ry, _tol)), _dav_rep)
+		sigma_total = _dav(sigma_total)
+		sig_sx, sig_coh, sig_h, sig_x = _dav(sig_sx), _dav(sig_coh), _dav(sig_h), _dav(sig_x)
+		if sigma_c_at_dft_ev is not None:
+			sigma_c_at_dft_ev = average_within_degenerate_sets(
+				np.asarray(sigma_c_at_dft_ev, dtype=np.complex128),
+				_e_kn_ry, _tol)
+
+	# ---- Single H-build + diagonalization on replicated arrays ----
+	H = 0.5 * ((kin_ion + sigma_total) + jnp.conj(jnp.swapaxes(kin_ion + sigma_total, -1, -2)))
+	E_full, U_full = jax.vmap(jnp.linalg.eigh, in_axes=0)(H)
+
+	# ---- DFT energies for the writer ----
 	enk_dft, _ = get_enk_bandrange(wfn, sym,
 		band_slices.sigma_range, band_slices.sigma_range, nspinor=meta.nspinor)
 
@@ -476,6 +527,16 @@ def main(argv=None):
 	# eqp0.dat "sigC" column reports dynamic correlation directly comparable
 	# to BGW's (SX-X)+CH at Eo=E_DFT.  Off-diagonals stay zero — the full
 	# Σ_c(ω, k, i, j) tensor is in sigma_mnk.h5 for callers that need them.
+	# Σ_c diagonal on the ω-grid: feed the eqp1.dat writer's central-diff
+	# Z-factor.  Pulled from the on-device sharded tensor when available.
+	if ppm_outputs is not None and ppm_outputs.sigma_c_omega is not None:
+		sigma_c_omega_diag_ev = np.asarray(extract_sigma_diag_replicated(
+			ppm_outputs.sigma_c_omega, mesh_xy)) * RYD_TO_EV
+		omega_rel_ev = np.asarray(ppm_options.omega_grid_ev)
+	else:
+		sigma_c_omega_diag_ev = None
+		omega_rel_ev = None
+
 	sigma_c_diag_at_dft_ry = (
 		sigma_c_at_dft_ev / RYD_TO_EV
 		if (mode.is_dynamic and meta.rank == 0 and sigma_c_at_dft_ev is not None)
@@ -504,6 +565,8 @@ def main(argv=None):
 		tensors_filename=tensors_filename,
 	)
 	if meta.rank == 0:
+		# Degen averaging was applied once at the H-build seam upstream;
+		# the writer just serializes the already-averaged Σ components.
 		write_results(
 			results,
 			sigma_diag_file=config.paths.sigma_diag_file,
@@ -516,8 +579,6 @@ def main(argv=None):
 			kpoints_reduced=np.array(wfn.kpoints, dtype=np.float64),
 			kirr_to_kfull=np.array(sym.kirr_fullids, dtype=np.int32),
 			print_fn=print0,
-			no_degen_averaging=config.no_degen_averaging,
-			degen_avg_tol_ry=config.degen_avg_tol_ry,
 		)
 	if jax.process_index() == 0:
 		timing.report(print_fn=print0, title="--- Timing ---")

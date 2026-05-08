@@ -182,8 +182,6 @@ def write_results(
     kirr_to_kfull: np.ndarray | None = None,
     print_fn=print,
     *,
-    no_degen_averaging: bool = False,
-    degen_avg_tol_ry: float = 1.0e-6,
     eqp_dE_ev: float = 0.5,
 ):
     """Serialize all GW outputs — the unified ``punch('all')`` gateway.
@@ -200,6 +198,10 @@ def write_results(
 
     5. ``eqp_g0w0.dat``    — explicit Re/Im of (H₀ + Σ_xc(E_DFT)) for
        hand-debugging convergence.
+
+    BGW-style degenerate-set averaging is applied **upstream** at the
+    H-build seam in :mod:`gw.gw_jax`, so the writer just serializes
+    whatever ``GWResults`` carries — no re-averaging here.
 
     Parameters
     ----------
@@ -251,18 +253,6 @@ def write_results(
     corr_out  = r2e * corr_arr
     sig_h_out = r2e * results.sig_h
     sig_x_out = r2e * results.sig_x  # always populated; needed for eqp{0,1}
-
-    # BGW-style degenerate-set averaging: replace the diagonal of each
-    # Σ matrix with the mean over each contiguous degenerate group of
-    # DFT eigenvalues.  Mirrors Sigma/shiftenergy.f90 (lines 86-122).
-    # Off-diagonal entries are preserved.
-    if not no_degen_averaging:
-        from .degen_average import apply_to_matrix_diagonals
-        e_kn_ry = np.asarray(results.E_dft_ry, dtype=np.float64)
-        sx_out    = apply_to_matrix_diagonals(sx_out,    e_kn_ry, degen_avg_tol_ry)
-        corr_out  = apply_to_matrix_diagonals(corr_out,  e_kn_ry, degen_avg_tol_ry)
-        sig_h_out = apply_to_matrix_diagonals(sig_h_out, e_kn_ry, degen_avg_tol_ry)
-        sig_x_out = apply_to_matrix_diagonals(sig_x_out, e_kn_ry, degen_avg_tol_ry)
 
     write_sigma_to_file(
         sx_out,
