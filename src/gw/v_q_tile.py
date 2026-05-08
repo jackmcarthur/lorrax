@@ -85,43 +85,65 @@ _Q_COMPUTE_COEF_GATHER = 4.4
 _Q_COMPUTE_COEF_FFT = float(os.environ.get('LORRAX_V_Q_FFT_COEF', '5.0'))
 
 
-def _aot_one_q_fft_bytes(
+def _aot_fft_model(
     *,
     n_rmu: int,
     fft_grid: tuple[int, int, int],
     mesh_xy: Mesh,
     same_zeta: bool,
-) -> int | None:
-    """AOT-measure the per-q FFT stage peak via XLA memory_analysis.
+) -> tuple[int, int] | None:
+    """AOT-measure the FFT stage memory and split into a Q-linear input
+    cost + a Q-fixed workspace overhead.
 
-    Compiles a tiny ``jnp.fft.fftn`` jit with shape ``(1, n_rmu, *fft_grid)``
-    and ``P(None, ('x','y'), None, None, None)`` sharding — exactly the
-    primitive used inside ``_make_V_q_tile_kernel._zeta_disk_to_G``.  The
-    returned value is the per-rank "input + workspace + output − alias"
-    for ONE q-point's FFT pass; the chooser scales linearly with Q to
-    size q_chunk.  Caches by shape via ``query_fft_peak_bytes``'s own
-    cache.
+    Returns ``(per_q_input_bytes, fixed_workspace_bytes)`` per rank; the
+    chooser models the FFT-stage peak at q_chunk Q as
 
-    Distinct-ζ tiles double the result (two ζ_disk inputs alive at the
-    kernel boundary, even if the FFTs themselves are scheduled
-    sequentially).
+        peak_fft(Q) = Q · per_q_input + fixed_workspace
 
-    Returns ``None`` if the AOT compile fails (older JAX without sharded
-    custom_partitioning, etc.) — the caller falls back to the flat
-    ``_Q_COMPUTE_COEF_FFT`` heuristic.
+    Rationale: ``query_fft_peak_bytes`` returns
+    (input + output + workspace − alias) for a STANDALONE
+    ``jnp.fft.fftn`` jit, where input/output are both alive (no
+    aliasing).  In the production V_q kernel the FFT output is
+    immediately consumed by ``sphere_pick`` and freed before the gather
+    runs, and XLA aliases the FFT input with the post-(× phase)
+    intermediate — so the production-peak model has 1× input alive
+    during the FFT, not 2×.  The cuFFT plan's workspace is mostly
+    fixed-per-plan (a function of FFT axis sizes 75×75×200, not the
+    batch dim Q), so it doesn't scale with q_chunk.
+
+    Method: AOT-compile at Q=1 and Q=2, take the slope = per-Q variable
+    cost (≈ 1× input on the production-kernel side), and the intercept
+    = fixed workspace.  Two compiles ≈ 2 s amortised over the V_q tile
+    runtime; ``query_fft_peak_bytes`` caches by shape so repeated
+    chooser calls hit the cache.
+
+    Distinct-ζ tiles double the per-Q variable cost (both ζ_L_disk and
+    ζ_R_disk alive at the kernel boundary, regardless of FFT
+    scheduling).  Workspace stays the same (cuFFT plans serialised).
+
+    Returns ``None`` on AOT-compile failure — caller falls back to the
+    flat heuristic.
     """
     try:
         from common.fft_helpers import query_fft_peak_bytes
         sharding = NamedSharding(
             mesh_xy, P(None, ('x', 'y'), None, None, None))
-        per_q = int(query_fft_peak_bytes(
+        peak_q1 = int(query_fft_peak_bytes(
             input_shape=(1, n_rmu, *fft_grid),
-            fft_axes=(-3, -2, -1),
-            sharding=sharding,
+            fft_axes=(-3, -2, -1), sharding=sharding,
         ))
+        peak_q2 = int(query_fft_peak_bytes(
+            input_shape=(2, n_rmu, *fft_grid),
+            fft_axes=(-3, -2, -1), sharding=sharding,
+        ))
+        # Linear regression on two points: peak(Q) = slope·Q + intercept
+        slope = max(0, peak_q2 - peak_q1)            # Q-linear cost
+        intercept = max(0, peak_q1 - slope)          # Q-fixed workspace
         if not same_zeta:
-            per_q *= 2
-        return per_q
+            # Distinct ζ doubles the Q-linear input footprint at the
+            # kernel boundary; workspace stays the same (single FFT plan).
+            slope *= 2
+        return slope, intercept
     except Exception:
         return None
 
@@ -172,38 +194,47 @@ def _choose_v_q_chunks(
 
     one_q_gather = _Q_COMPUTE_COEF_GATHER * N_zeta * n_rmu * n_G / p_min
 
-    # Prefer the AOT-exact per-q FFT peak from XLA's memory_analysis when
-    # mesh + fft_grid are available — it captures the actual cuFFT
-    # workspace footprint per shape, replacing the flat
-    # ``_Q_COMPUTE_COEF_FFT`` heuristic.  Fall back to the heuristic when
-    # AOT compile is unavailable.
-    one_q_fft_aot = None
+    # Prefer the AOT (slope, intercept) model from XLA memory_analysis
+    # over the flat ``_Q_COMPUTE_COEF_FFT`` heuristic.  Models the FFT
+    # stage as ``Q · per_q_input + fixed_workspace`` per rank.
+    aot_slope = aot_intercept = None
     if (mesh_xy is not None and fft_grid is not None and
             n_rtot is not None and n_rtot > 0):
-        one_q_fft_aot = _aot_one_q_fft_bytes(
+        aot = _aot_fft_model(
             n_rmu=int(n_rmu), fft_grid=tuple(int(s) for s in fft_grid),
             mesh_xy=mesh_xy, same_zeta=bool(same_zeta))
-    if one_q_fft_aot is not None:
-        one_q_fft = float(one_q_fft_aot)
+        if aot is not None:
+            aot_slope, aot_intercept = aot
+    if aot_slope is not None:
+        # Linear-in-Q variable footprint per rank (ζ_disk slab).  The
+        # fixed workspace is added once below in the q_chunk equation.
+        one_q_fft = float(aot_slope)
     elif n_rtot is not None and n_rtot > 0:
         one_q_fft = fft_coef * N_zeta * n_rmu * float(n_rtot) / p_prod
     else:
         one_q_fft = 0.0
     one_q_bytes = max(one_q_gather, one_q_fft)
+    # Q-fixed FFT workspace (cuFFT plan scratch) — only present when we
+    # ran the AOT measurement; the heuristic path doesn't separate it.
+    fft_workspace_fixed = float(aot_intercept) if aot_intercept is not None else 0.0
 
     # Case A check: can we hold *one* q's worth (whichever stage dominates)?
-    slack_after_one_q = B_compute - (one_q_bytes + v_per_q_bytes)
+    # When the AOT model provides a fixed workspace, subtract it from the
+    # compute budget once — it doesn't scale with q_chunk.
+    B_compute_after_fixed = B_compute - fft_workspace_fixed
+    slack_after_one_q = B_compute_after_fixed - (one_q_bytes + v_per_q_bytes)
     if slack_after_one_q < 0:
         # Case B — single q, tile μ × ν.
         mu_chunk_max_gather = int(
-            (B_compute - v_per_q_bytes) * p_min / (2.0 * N_zeta * n_G))
-        if one_q_fft_aot is not None:
-            # AOT-exact FFT peak scales linearly with μ (batch dim of the
-            # FFT); divide by n_rmu to get peak per μ-row, then divide
-            # the slack by that.
+            (B_compute_after_fixed - v_per_q_bytes) * p_min /
+            (2.0 * N_zeta * n_G))
+        if aot_slope is not None:
+            # AOT-exact FFT slope scales linearly with μ (batch dim of
+            # the FFT) at fixed Q=1; divide by n_rmu to get the per-μ-row
+            # variable cost, then size mu_chunk to the remaining slack.
             mu_chunk_max_fft = int(
-                (B_compute - v_per_q_bytes) /
-                (one_q_fft_aot / max(1, int(n_rmu))))
+                (B_compute_after_fixed - v_per_q_bytes) /
+                (aot_slope / max(1, int(n_rmu))))
         elif n_rtot is not None and n_rtot > 0:
             # Use the same same/distinct-aware coefficient for the tiled
             # μ × ν Case B FFT-stage cap.
@@ -240,8 +271,8 @@ def _choose_v_q_chunks(
 
         n_mu_blocks = (int(n_rmu) + mu_chunk - 1) // mu_chunk
         peak_gather = 2.0 * N_zeta * mu_chunk * n_G / p_min
-        if one_q_fft_aot is not None:
-            peak_fft = (one_q_fft_aot / max(1, int(n_rmu))) * mu_chunk
+        if aot_slope is not None:
+            peak_fft = (aot_slope / max(1, int(n_rmu))) * mu_chunk + fft_workspace_fixed
         elif n_rtot is not None and n_rtot > 0:
             peak_fft = fft_coef * N_zeta * mu_chunk * float(n_rtot) / p_prod
         else:
@@ -253,11 +284,14 @@ def _choose_v_q_chunks(
             per_rank_peak=peak, ref_bytes=ref_bytes,
         )
 
-    # Case A — fit at least one q with full μ.  Maximise q_chunk in B_compute.
-    q_max = int((B_compute - v_per_q_bytes * max(1, n_q_total)) /
-                one_q_bytes) if one_q_bytes > 0 else n_q_total
+    # Case A — fit at least one q with full μ.  Maximise q_chunk in
+    # the post-fixed-workspace budget: q_chunk · (per_q_var + v_per_q)
+    # ≤ B_compute_after_fixed.
+    q_max = int(B_compute_after_fixed /
+                (one_q_bytes + v_per_q_bytes)) if one_q_bytes > 0 else n_q_total
     q_chunk = max(1, min(n_q_total, q_max))
-    peak = q_chunk * one_q_bytes + q_chunk * v_per_q_bytes + ref_bytes
+    peak = (q_chunk * one_q_bytes + q_chunk * v_per_q_bytes
+            + fft_workspace_fixed + ref_bytes)
     return dict(
         q_chunk=q_chunk, mu_chunk=int(n_rmu), n_mu_blocks=1,
         tiled=False, aligned=True,
