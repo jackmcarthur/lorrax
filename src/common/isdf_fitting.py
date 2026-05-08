@@ -1334,11 +1334,17 @@ def fit_zeta_chunked_to_h5(
         if use_ffi_io:
             zeta_io = SlabIO(output_file, mode='w', mesh=mesh_xy,
                              backend=slab_io_backend)
+            # ``partition_spec`` lets SlabIO auto-round n_rmu up to a
+            # mesh-divisible extent; the cached logical shape is then
+            # used as ``valid_shape`` on every write_slab call so the
+            # padded tail stays zero on disk.  Drivers pass logical
+            # ``n_rmu``; SlabIO handles the rest.
             zeta_io.create_dataset(
                 'zeta_q',
                 shape=(nq, n_rtot, n_rmu),
                 dtype=np.complex128,
                 chunks=(1, n_rchunk, n_rmu),
+                partition_spec=P(None, None, ('x', 'y')),
             )
         else:
             with SlabIO(output_file, mode='w', mesh=mesh_xy,
@@ -1348,6 +1354,7 @@ def fit_zeta_chunked_to_h5(
                     shape=(nq, n_rtot, n_rmu),
                     dtype=np.complex128,
                     chunks=(1, n_rchunk, n_rmu),
+                    partition_spec=P(None, None, ('x', 'y')),
                 )
             zeta_io = None
 
@@ -1543,10 +1550,14 @@ def fit_zeta_chunked_to_h5(
                     # fat contiguous strips (one per q, full n_rmu +
                     # rank's n_rchunk/4 rows).
                     zeta_chunk_write = zeta_chunk.transpose(0, 2, 1)
+                    # SlabIO auto-picks-up ``global_shape`` (= dataset's
+                    # physical extent, possibly padded for mesh) and
+                    # ``valid_shape`` (= dataset's logical extent clipped
+                    # to this chunk's offset).  Drivers don't need to
+                    # know about the logical/physical split.
                     zeta_io.write_slab(
                         'zeta_q', zeta_chunk_write,
-                        offset=(0, r_start, 0),
-                        global_shape=(nq, n_rtot, n_rmu))
+                        offset=(0, r_start, 0))
                 else:
                     # Allgather path: gather once per q-chunk on every rank,
                     # queue the per-q hyperslab writes on rank 0's

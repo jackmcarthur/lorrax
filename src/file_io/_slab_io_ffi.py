@@ -359,6 +359,13 @@ class _FfiBackend:
         chunks: Sequence[int] | None = None,
         attrs: dict | None = None,
     ) -> None:
+        # ``phdf5_ensure_dataset`` is a collective HDF5 op (H5Dcreate)
+        # that goes through the same MPI file handle as the writer
+        # thread's H5Dwrite.  If we issue it while the writer is still
+        # in flight, MPI's datatype-cache state on the file handle
+        # interleaves and the next H5Dwrite trips ``MPI_File_set_view:
+        # Invalid datatype``.  Drain first.
+        self._drain_pending()
         ds_id = self._loader.phdf5_ensure_dataset(
             self.fh, name, tuple(int(s) for s in shape),
             str(jnp.dtype(dtype).name),
@@ -422,9 +429,38 @@ class _FfiBackend:
             raise err
 
     # ------------------------------------------------------------------
+    def _introspect_dataset(self, name: str) -> tuple[tuple[int, ...], "np.dtype"]:
+        """Return ``(shape, dtype)`` of an existing dataset.
+
+        Uses h5py for the metadata read (cheap, parallel-safe with
+        ``HDF5_USE_FILE_LOCKING=FALSE`` already set process-wide).
+        Cached so repeated lookups for the same name are free.
+
+        Symmetry with the allgather backend: callers don't have to
+        pre-compute shape just because the FFI write thunk needs it
+        as an FFI attr — we look it up here.
+        """
+        cache = getattr(self, "_introspect_cache", None)
+        if cache is None:
+            cache = {}
+            self._introspect_cache = cache
+        if name in cache:
+            return cache[name]
+        import h5py
+        with h5py.File(self.path, "r") as f:
+            ds = f[name]
+            shape = tuple(int(s) for s in ds.shape)
+            dtype = np.dtype(ds.dtype)
+        cache[name] = (shape, dtype)
+        return shape, dtype
+
     def _ds_id(self, name: str, readonly: bool = False) -> int:
         if name in self._ds_ids:
             return self._ds_ids[name]
+        # ``phdf5_open_dataset_ro`` is collective on the file handle
+        # — same MPI rendezvous + datatype-cache hazard as
+        # ``phdf5_ensure_dataset`` (see :meth:`create_dataset`).
+        self._drain_pending()
         if readonly:
             ds_id = self._loader.phdf5_open_dataset_ro(self.fh, name)
         else:
@@ -560,8 +596,8 @@ class _FfiBackend:
         self,
         name: str,
         *,
-        shape: Sequence[int],
-        dtype,
+        shape: Sequence[int] | None = None,
+        dtype=None,
         offset: Sequence[int] | None = None,
         valid_shape: Sequence[int] | None = None,
         mesh: Mesh | None = None,
@@ -572,9 +608,18 @@ class _FfiBackend:
         from ffi.phdf5.read import ffi_read_call
 
         mesh = mesh or self.mesh
-        if shape is None:
-            raise ValueError(
-                f"read_slab {name!r}: shape is required for FFI reads")
+        if shape is None or dtype is None:
+            # Symmetry with the allgather backend: callers that don't
+            # need padding shouldn't have to compute shape themselves.
+            # Cheap h5py introspect (collective-free, locking off);
+            # the result is also the file's intrinsic shape, which is
+            # what the kernel will read into when valid_shape isn't
+            # set.
+            ds_shape, ds_dtype = self._introspect_dataset(name)
+            if shape is None:
+                shape = ds_shape
+            if dtype is None:
+                dtype = ds_dtype
         off, read_shape, _ = _normalize_slab_request(
             op="read_slab", name=name, offset=offset,
             slab_shape=shape, global_shape=None, check_bounds=False)
