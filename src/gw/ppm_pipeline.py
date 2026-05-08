@@ -155,13 +155,10 @@ def _inject_analytic_head(
         wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
         nspinor=meta.nspinor)
     enk_full_np = np.asarray(enk_full, dtype=np.float64)
+    # Canonical mid-gap E_F from WFNReader (computed once at WFN load
+    # over the full set of bands stored in WFN.h5; band-window-independent).
+    efermi_ry = float(wfn.efermi)
     n_occ = min(meta.nelec, enk_full_np.shape[1])
-    vbm_ry = float(np.max(enk_full_np[:, :n_occ]))
-    cbm_ry = (
-        float(np.min(enk_full_np[:, n_occ:]))
-        if n_occ < enk_full_np.shape[1] else vbm_ry
-    )
-    efermi_ry = 0.5 * (vbm_ry + cbm_ry)
 
     head_sigma_kij_ry = compute_ppm_head_sigma_kij(
         head_gn,
@@ -214,13 +211,11 @@ def _eval_sigma_c_at_dft_energies(
         wfn, sym, band_slices.sigma_range,
         band_slices.sigma_range, nspinor=meta.nspinor)
     enk_dft_ev = np.asarray(enk_dft) * RYD_TO_EV
-    n_occ = min(meta.nelec, enk_dft_ev.shape[1])
-    vbm_ev = float(np.max(enk_dft_ev[:, :n_occ]))
-    cbm_ev = (
-        float(np.min(enk_dft_ev[:, n_occ:]))
-        if n_occ < enk_dft_ev.shape[1] else vbm_ev
-    )
-    efermi_dft_ev = 0.5 * (vbm_ev + cbm_ev)
+    # Single source of truth for the mid-gap E_F: WFNReader computes it
+    # once at WFN load (``wfn.efermi`` in Ry).  Don't recompute here.
+    vbm_ev = float(wfn.vbm) * RYD_TO_EV
+    cbm_ev = float(wfn.cbm) * RYD_TO_EV
+    efermi_dft_ev = float(wfn.efermi) * RYD_TO_EV
     omega_dft_rel_ev = enk_dft_ev - efermi_dft_ev
     print_fn(
         f"  E_F(midgap) = {efermi_dft_ev:.6f} eV  "
