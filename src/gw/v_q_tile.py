@@ -85,6 +85,47 @@ _Q_COMPUTE_COEF_GATHER = 4.4
 _Q_COMPUTE_COEF_FFT = float(os.environ.get('LORRAX_V_Q_FFT_COEF', '5.0'))
 
 
+def _aot_one_q_fft_bytes(
+    *,
+    n_rmu: int,
+    fft_grid: tuple[int, int, int],
+    mesh_xy: Mesh,
+    same_zeta: bool,
+) -> int | None:
+    """AOT-measure the per-q FFT stage peak via XLA memory_analysis.
+
+    Compiles a tiny ``jnp.fft.fftn`` jit with shape ``(1, n_rmu, *fft_grid)``
+    and ``P(None, ('x','y'), None, None, None)`` sharding — exactly the
+    primitive used inside ``_make_V_q_tile_kernel._zeta_disk_to_G``.  The
+    returned value is the per-rank "input + workspace + output − alias"
+    for ONE q-point's FFT pass; the chooser scales linearly with Q to
+    size q_chunk.  Caches by shape via ``query_fft_peak_bytes``'s own
+    cache.
+
+    Distinct-ζ tiles double the result (two ζ_disk inputs alive at the
+    kernel boundary, even if the FFTs themselves are scheduled
+    sequentially).
+
+    Returns ``None`` if the AOT compile fails (older JAX without sharded
+    custom_partitioning, etc.) — the caller falls back to the flat
+    ``_Q_COMPUTE_COEF_FFT`` heuristic.
+    """
+    try:
+        from common.fft_helpers import query_fft_peak_bytes
+        sharding = NamedSharding(
+            mesh_xy, P(None, ('x', 'y'), None, None, None))
+        per_q = int(query_fft_peak_bytes(
+            input_shape=(1, n_rmu, *fft_grid),
+            fft_axes=(-3, -2, -1),
+            sharding=sharding,
+        ))
+        if not same_zeta:
+            per_q *= 2
+        return per_q
+    except Exception:
+        return None
+
+
 def _choose_v_q_chunks(
     *,
     n_rmu: int,
@@ -95,6 +136,8 @@ def _choose_v_q_chunks(
     p_y: int,
     n_rtot: int | None = None,
     same_zeta: bool = True,
+    mesh_xy: Mesh | None = None,
+    fft_grid: tuple[int, int, int] | None = None,
 ) -> dict:
     """Pick (q_chunk, μ_chunk) per the memory model documented above.
 
@@ -128,7 +171,21 @@ def _choose_v_q_chunks(
     fft_coef = _Q_COMPUTE_COEF_FFT * (1.0 if same_zeta else 2.0)
 
     one_q_gather = _Q_COMPUTE_COEF_GATHER * N_zeta * n_rmu * n_G / p_min
-    if n_rtot is not None and n_rtot > 0:
+
+    # Prefer the AOT-exact per-q FFT peak from XLA's memory_analysis when
+    # mesh + fft_grid are available — it captures the actual cuFFT
+    # workspace footprint per shape, replacing the flat
+    # ``_Q_COMPUTE_COEF_FFT`` heuristic.  Fall back to the heuristic when
+    # AOT compile is unavailable.
+    one_q_fft_aot = None
+    if (mesh_xy is not None and fft_grid is not None and
+            n_rtot is not None and n_rtot > 0):
+        one_q_fft_aot = _aot_one_q_fft_bytes(
+            n_rmu=int(n_rmu), fft_grid=tuple(int(s) for s in fft_grid),
+            mesh_xy=mesh_xy, same_zeta=bool(same_zeta))
+    if one_q_fft_aot is not None:
+        one_q_fft = float(one_q_fft_aot)
+    elif n_rtot is not None and n_rtot > 0:
         one_q_fft = fft_coef * N_zeta * n_rmu * float(n_rtot) / p_prod
     else:
         one_q_fft = 0.0
@@ -140,7 +197,14 @@ def _choose_v_q_chunks(
         # Case B — single q, tile μ × ν.
         mu_chunk_max_gather = int(
             (B_compute - v_per_q_bytes) * p_min / (2.0 * N_zeta * n_G))
-        if n_rtot is not None and n_rtot > 0:
+        if one_q_fft_aot is not None:
+            # AOT-exact FFT peak scales linearly with μ (batch dim of the
+            # FFT); divide by n_rmu to get peak per μ-row, then divide
+            # the slack by that.
+            mu_chunk_max_fft = int(
+                (B_compute - v_per_q_bytes) /
+                (one_q_fft_aot / max(1, int(n_rmu))))
+        elif n_rtot is not None and n_rtot > 0:
             # Use the same same/distinct-aware coefficient for the tiled
             # μ × ν Case B FFT-stage cap.
             mu_chunk_max_fft = int(
@@ -176,7 +240,9 @@ def _choose_v_q_chunks(
 
         n_mu_blocks = (int(n_rmu) + mu_chunk - 1) // mu_chunk
         peak_gather = 2.0 * N_zeta * mu_chunk * n_G / p_min
-        if n_rtot is not None and n_rtot > 0:
+        if one_q_fft_aot is not None:
+            peak_fft = (one_q_fft_aot / max(1, int(n_rmu))) * mu_chunk
+        elif n_rtot is not None and n_rtot > 0:
             peak_fft = fft_coef * N_zeta * mu_chunk * float(n_rtot) / p_prod
         else:
             peak_fft = 0.0
@@ -552,6 +618,7 @@ def compute_V_q_tile(
             n_rmu=max(n_rmu_L, n_rmu_R), n_G=n_G_sph, n_q_total=nq_total,
             budget_bytes=budget_bytes, p_x=p_x, p_y=p_y,
             n_rtot=n_rtot, same_zeta=same_zeta,
+            mesh_xy=mesh_xy, fft_grid=fft_grid,  # enable AOT FFT peak
         )
 
     q_chunk = int(chooser_choice['q_chunk'])
