@@ -285,7 +285,6 @@ _DEFAULTS = {
     # Debug
     "debug_hartree": False,
     "debug_omega": None,
-    "sigma_debug_split_contrib": False,
     "sigma_freq_debug_output": False,
     "ppm_sigma_debug_static_norm": False,
     "ppm_static_cohsex_check": False,
@@ -589,7 +588,6 @@ class DebugConfig:
     """Debug-only flags + auxiliary output filenames."""
     debug_hartree: bool
     debug_omega: float | None
-    sigma_debug_split_contrib: bool
     sigma_freq_debug_output: bool
     ppm_sigma_debug_static_norm: bool
     ppm_static_cohsex_check: bool
@@ -912,7 +910,6 @@ class LorraxConfig:
         debug = DebugConfig(
             debug_hartree=bool(_g("debug_hartree")),
             debug_omega=_g("debug_omega"),
-            sigma_debug_split_contrib=bool(_g("sigma_debug_split_contrib")),
             sigma_freq_debug_output=bool(_g("sigma_freq_debug_output")),
             ppm_sigma_debug_static_norm=bool(_g("ppm_sigma_debug_static_norm")),
             ppm_static_cohsex_check=bool(_g("ppm_static_cohsex_check")),

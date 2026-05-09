@@ -1,30 +1,95 @@
-"""Utilities for diagonal Sigma(E) fixed points, QSGW, and SC-COHSEX diagnostics."""
+"""Diagonal-Σ(E) fixed point, QSGW Σ_xc build, and SC-COHSEX diagnostics.
+
+The post-self-energy plumbing in ``gw_jax`` operates on **replicated**
+``(nk, nb, nb)`` arrays uniformly; the only object that must remain
+sharded is the dynamic correlation ``Σ_c(ω, k, m_X, n_Y)`` produced by
+``ppm_sigma`` because its ω-axis fan-out makes the full tensor too
+large to replicate.  Everything in this module is structured around
+that seam:
+
+- :func:`solve_diagonal_sigma_fixed_point` runs on host NumPy with
+  vectorised linear interpolation over the (nk, nb) energy grid.  Its
+  input ``Σ_diag(ω, k, n)`` is small enough to live replicated.
+- :func:`build_qsgw_sigma_xc` is a JIT'd JAX kernel that takes the
+  on-device sharded ``Σ_c(ω)`` and the QP energies ``E_kn`` (replicated)
+  and returns the Hermitised QSGW Σ_xc replicated on the mesh.  No disk
+  round-trip; restart-friendly because the same kernel can be re-called
+  with a refreshed ``Σ_c(ω)`` and ``E_kn`` at every QSGW iteration.
+"""
 
 from __future__ import annotations
 
-import h5py
 import numpy as np
-import jax.numpy as jnp
 
+import jax
+import jax.numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+
+# ---------------------------------------------------------------------------
+# Vectorised per-(k, n) ω-axis linear interpolation — shared helper
+# ---------------------------------------------------------------------------
+
+def interp_along_omega(
+    values_w_kn: np.ndarray,
+    omega_grid: np.ndarray,
+    eval_kn: np.ndarray,
+) -> np.ndarray:
+    """Linearly interpolate ``values_w_kn[ω, k, n]`` along the ω-axis at
+    per-(k, n) points ``eval_kn[k, n]`` (with edge clamping).
+
+    Vectorised over (k, n) — one ``np.searchsorted`` + two fancy-index
+    gathers, no Python loops.  Used by the diag-Σ(E) fixed point, the
+    Σ_c(E_DFT) eqp.dat extractor, the Z-factor central difference, and
+    the freq_debug head-correction column.
+
+    Parameters
+    ----------
+    values_w_kn : (nω, nk, nb), real or complex
+    omega_grid : (nω,), monotonically increasing
+    eval_kn : (nk, nb), the per-(k, n) ω-evaluation points
+
+    Returns
+    -------
+    out : (nk, nb), same dtype as ``values_w_kn``
+    """
+    omega = np.asarray(omega_grid, dtype=np.float64)
+    eval_arr = np.asarray(eval_kn, dtype=np.float64)
+    n_omega = omega.size
+    eval_clamped = np.clip(eval_arr, float(omega[0]), float(omega[-1]))
+    idx_hi = np.clip(
+        np.searchsorted(omega, eval_clamped, side="left"), 1, n_omega - 1)
+    idx_lo = idx_hi - 1
+    omega_lo = omega[idx_lo]
+    omega_hi = omega[idx_hi]
+    denom = np.where(omega_hi > omega_lo, omega_hi - omega_lo, 1.0)
+    w_hi = (eval_clamped - omega_lo) / denom
+    w_lo = 1.0 - w_hi
+    nk, nb = eval_arr.shape
+    k_idx = np.arange(nk)[:, None]
+    n_idx = np.arange(nb)[None, :]
+    return w_lo * values_w_kn[idx_lo, k_idx, n_idx] + w_hi * values_w_kn[idx_hi, k_idx, n_idx]
+
+
+# ---------------------------------------------------------------------------
+# SC-COHSEX diagnostics
+# ---------------------------------------------------------------------------
 
 def print_scf_diagnostics(Gij_final, U_full, nelec, nb_sigma, print_fn=print):
-	"""Print Gij trace, U unitarity, and mixing diagnostics for SC-COHSEX."""
-	Gij_trace = float(jnp.real(jnp.trace(Gij_final[0])))
-	print_fn(f"[SC] Gij trace at k=0: {Gij_trace:.4f} (should be {nelec})")
-	unitarity_err = float(jnp.max(jnp.abs(
-		jnp.einsum('kim,kin->kmn', jnp.conj(U_full[0:1]), U_full[0:1])[0] - jnp.eye(nb_sigma))))
-	print_fn(f"[SC] U unitarity error at k=0: {unitarity_err:.2e}")
-	U_diag = jnp.abs(jnp.diagonal(U_full[0]))
-	print_fn(f"[SC] |U| diagonal[:5] at k=0: {np.array(U_diag[:5])}")
+    """Print Gij trace, U unitarity, and mixing diagnostics for SC-COHSEX."""
+    Gij_trace = float(jnp.real(jnp.trace(Gij_final[0])))
+    print_fn(f"[SC] Gij trace at k=0: {Gij_trace:.4f} (should be {nelec})")
+    unitarity_err = float(jnp.max(jnp.abs(
+        jnp.einsum('kim,kin->kmn', jnp.conj(U_full[0:1]), U_full[0:1])[0]
+        - jnp.eye(nb_sigma))))
+    print_fn(f"[SC] U unitarity error at k=0: {unitarity_err:.2e}")
+    U_diag = jnp.abs(jnp.diagonal(U_full[0]))
+    print_fn(f"[SC] |U| diagonal[:5] at k=0: {np.array(U_diag[:5])}")
 
 
-def _interp_complex_on_grid(omega_ev: np.ndarray, values_omega: np.ndarray, x_ev: float) -> complex:
-    """Linear interpolation with edge clamping for one complex-valued frequency trace."""
-    xr = float(np.clip(x_ev, float(omega_ev[0]), float(omega_ev[-1])))
-    v_re = np.interp(xr, omega_ev, np.real(values_omega))
-    v_im = np.interp(xr, omega_ev, np.imag(values_omega))
-    return complex(v_re, v_im)
-
+# ---------------------------------------------------------------------------
+# Diagonal-Σ(E) fixed point  (host NumPy, vectorised)
+# ---------------------------------------------------------------------------
 
 def solve_diagonal_sigma_fixed_point(
     h0_diag_ev: np.ndarray,
@@ -35,277 +100,222 @@ def solve_diagonal_sigma_fixed_point(
     tol_ev: float = 1.0e-6,
     mixing: float = 0.6,
 ) -> tuple[np.ndarray, np.ndarray, int]:
-    """Solve E = h0 + Re Sigma(E) for each (k,n) in the diagonal approximation.
+    """Solve E = h0 + Re Σ(E) per (k, n) by linear mixing.
+
+    Vectorised over (k, n): each iteration performs one ``np.searchsorted``
+    + two fancy-index gathers over the ω-axis, no Python (k, n) loop.
 
     Parameters
     ----------
-    h0_diag_ev
-        Base one-body diagonal term (typically diag(kin_ion + V_H)) with shape (nk, nb).
-    sigma_omega_diag_ev
-        Diagonal Sigma_xc(omega) values with shape (n_omega, nk, nb) in eV.
-    omega_ev
-        Frequency grid in eV (monotonic increasing).
-    """
-    omega_ev = np.asarray(omega_ev, dtype=np.float64)
-    h0_diag_ev = np.asarray(h0_diag_ev, dtype=np.float64)
-    sigma_omega_diag_ev = np.asarray(sigma_omega_diag_ev, dtype=np.complex128)
-    if sigma_omega_diag_ev.ndim != 3:
-        raise ValueError("sigma_omega_diag_ev must have shape (n_omega, nk, nb).")
-    if h0_diag_ev.shape != sigma_omega_diag_ev.shape[1:]:
-        raise ValueError(
-            f"Shape mismatch: h0_diag_ev={h0_diag_ev.shape} vs sigma_omega_diag_ev={sigma_omega_diag_ev.shape}"
-        )
+    h0_diag_ev : (nk, nb)
+        Static one-body diagonal (typically ``diag(kin_ion + V_H)``) in eV.
+    sigma_omega_diag_ev : (nω, nk, nb), complex
+        Diagonal Σ_xc(ω) in eV.  Caller is responsible for adding the
+        static Σ_x diagonal to the dynamic Σ_c diagonal before invocation.
+    omega_ev : (nω,)
+        ω-grid in eV, monotonically increasing.
 
-    i0 = int(np.argmin(np.abs(omega_ev)))
-    E = h0_diag_ev + np.real(sigma_omega_diag_ev[i0])
-    converged = np.zeros_like(E, dtype=bool)
+    Returns
+    -------
+    E : (nk, nb)
+        Converged QP eigenvalues in eV.  Bands whose final fixed-point
+        argument lies outside ``[ω_min, ω_max]`` are clipped at the grid
+        edge for the Σ evaluation; callers should patch out-of-grid bands
+        via the scissor (see :mod:`gw.scissor`) if a flatter extrapolation
+        is desired.
+    converged : (nk, nb), bool
+        Per-band convergence flag from the final iteration.
+    n_iter : int
+        Iterations performed (≤ ``max_iter``).
+    """
+    h0 = np.asarray(h0_diag_ev, dtype=np.float64)
+    sigma_w = np.asarray(sigma_omega_diag_ev, dtype=np.complex128)
+    omega = np.asarray(omega_ev, dtype=np.float64)
+    if sigma_w.ndim != 3:
+        raise ValueError("sigma_omega_diag_ev must have shape (nω, nk, nb).")
+    if h0.shape != sigma_w.shape[1:]:
+        raise ValueError(
+            f"shape mismatch: h0={h0.shape}, sigma_w={sigma_w.shape}")
+
+    i0 = int(np.argmin(np.abs(omega)))
+    E = h0 + np.real(sigma_w[i0])
     mix = float(np.clip(mixing, 0.0, 1.0))
 
     for it in range(max_iter):
-        E_new = np.empty_like(E)
-        for ik in range(E.shape[0]):
-            for ib in range(E.shape[1]):
-                sig = _interp_complex_on_grid(omega_ev, sigma_omega_diag_ev[:, ik, ib], E[ik, ib])
-                E_new[ik, ib] = h0_diag_ev[ik, ib] + float(np.real(sig))
+        sig_at_E = interp_along_omega(sigma_w, omega, E)
+        E_new = h0 + np.real(sig_at_E)
         E_next = (1.0 - mix) * E + mix * E_new
         diff = np.abs(E_next - E)
-        converged = diff < tol_ev
         E = E_next
-        if bool(np.all(converged)):
-            return E, converged, it + 1
-    return E, converged, max_iter
+        if bool(np.all(diff < tol_ev)):
+            return E, diff < tol_ev, it + 1
+    return E, np.abs(E_new - E) < tol_ev, max_iter
 
+
+# ---------------------------------------------------------------------------
+# Σ diagonal extraction from sharded Σ_c(ω, k, m_X, n_Y)
+# ---------------------------------------------------------------------------
+
+def extract_sigma_diag_replicated(
+    sigma_w_kij: jax.Array,
+    mesh_xy: Mesh,
+) -> jax.Array:
+    """Pull ``Σ[..., n, n]`` from a sharded matrix-valued ω-tensor.
+
+    Input ``sigma_w_kij`` is sharded ``P(None, None, 'x', 'y')`` for
+    ``(nω, nk, nb, nb)``.  The (m, n) axes are on **different** mesh
+    axes, so a naive ``einsum('...ii->...i')`` computes a per-shard
+    block-diagonal which is the global diagonal only on the
+    ``ix == iy`` shards — off-diagonal mesh shards silently produce
+    garbage off-diagonal values.  We sidestep that by forcing an
+    allgather of the full ω-tensor onto each device before the trace.
+
+    Memory note: the materialised tensor is ``nω · nk · nb² · 16 B``
+    per device (≈ 270 MB for MoS2 4×4×1, 80 bands, 41 ω-points).  Fits
+    comfortably in the 28 GB device budget; a shard_map specialisation
+    for the very-large-system case is left for follow-up.
+    """
+    rep_3d = NamedSharding(mesh_xy, P(None, None, None))
+    rep_4d = NamedSharding(mesh_xy, P(None, None, None, None))
+
+    @jax.jit
+    def _extract(M):
+        M_full = jax.lax.with_sharding_constraint(M, rep_4d)
+        diag = jnp.einsum("...ii->...i", M_full)
+        return jax.lax.with_sharding_constraint(diag, rep_3d)
+
+    return _extract(sigma_w_kij)
+
+
+# ---------------------------------------------------------------------------
+# QSGW Σ_xc build — sharded ω-tensor + replicated E_kn → replicated (k, m, n)
+# ---------------------------------------------------------------------------
 
 def build_qsgw_sigma_xc(
-    sigma_xc_omega_kij_ev: np.ndarray,
+    sigma_c_omega_ry: jax.Array,
+    sigma_x_kij_ry: jax.Array,
     omega_ev: np.ndarray,
-    qp_energies_kn_ev: np.ndarray,
-    *,
-    return_diagnostics: bool = False,
-) -> np.ndarray | tuple[np.ndarray, dict[str, float]]:
-    """Build static Hermitian QSGW Sigma_xc from dynamic Sigma_xc(omega).
+    e_qp_kn_ev: np.ndarray,
+    mesh_xy: Mesh,
+) -> tuple[jax.Array, dict[str, float]]:
+    """Build the static Hermitian QSGW Σ_xc[k, m, n].
 
-    Implements:
-      Sigma_xc^QSGW_ij(k) = 1/2 * [ Re Sigma_ij(k, E_i(k)) + Re Sigma_ij(k, E_j(k)) ]
-    where Re denotes Hermitian part.
+    Implements the standard QSGW ansatz
 
-    Note: this uses fixed-point (nonlinear) QP energies when available; we do
-    not apply a linearized Z*(Sigma - V_xc) correction in the QSGW utilities.
+        Σ_xc^QSGW_ij(k) = ½[ Σ_xc_ij(k, E_i(k)) + Σ_xc_ij(k, E_j(k)) ]ʰ
+
+    where ``[·]ʰ`` denotes the Hermitian part (real-symmetrisation against
+    interpolation noise).  Σ_xc = Σ_c + Σ_x; Σ_x is ω-independent so it
+    is added once after the Σ_c(ω) interpolation.
+
+    Energy domain
+    -------------
+    ``omega_ev`` and ``e_qp_kn_ev`` must share a common reference (typically
+    Fermi-relative — ω-grid is centered on E_F by construction in
+    ``ppm_pipeline``, and ``E_qp - E_F`` is what the diagonal fixed point
+    produces after applying the scissor).
+
+    Sharding
+    --------
+    - ``sigma_c_omega_ry`` is consumed in place at its native sharding
+      ``P(None, None, 'x', 'y')``; the per-shard ``take_along_axis``
+      gather is local because the ω-axis (over which we interp) is fully
+      replicated and ``e_qp_kn_ev`` is broadcast to all shards.
+    - The intermediate ``A``, ``B`` arrays inherit ``P(None, 'x', 'y')``
+      sharding for ``(k, m, n)``.
+    - The final result is forced replicated via
+      ``with_sharding_constraint`` before Hermitisation, so the
+      ``½(M + M†)`` step doesn't generate cross-shard transpose comms.
+
+    Returns
+    -------
+    sigma_xc_qsgw_kij_ry : jax.Array, (nk, nb, nb), complex128, replicated.
+    diagnostics : dict with ``n_clipped`` (count of ``E_kn`` outside
+        ``[ω_min, ω_max]`` clamped to the grid) and ``omega_min/max_ev``.
     """
-    sigma = np.asarray(sigma_xc_omega_kij_ev, dtype=np.complex128)
     omega = np.asarray(omega_ev, dtype=np.float64)
-    E = np.asarray(qp_energies_kn_ev, dtype=np.float64)
-    if sigma.ndim != 4:
-        raise ValueError("sigma_xc_omega_kij_ev must have shape (n_omega, nk, nb, nb).")
-    n_omega, nk, nb, nb2 = sigma.shape
-    if nb != nb2:
-        raise ValueError("sigma_xc_omega_kij_ev last two dims must be square.")
+    E = np.asarray(e_qp_kn_ev, dtype=np.float64)
+    if sigma_c_omega_ry.ndim != 4:
+        raise ValueError(
+            f"sigma_c_omega_ry must have shape (nω, nk, nb, nb); "
+            f"got {sigma_c_omega_ry.shape}.")
+    if sigma_x_kij_ry.ndim != 3:
+        raise ValueError(
+            f"sigma_x_kij_ry must have shape (nk, nb, nb); "
+            f"got {sigma_x_kij_ry.shape}.")
+    n_omega, nk, nb, nb2 = sigma_c_omega_ry.shape
+    if nb != nb2 or sigma_x_kij_ry.shape != (nk, nb, nb):
+        raise ValueError(
+            f"shape mismatch: sigma_c={sigma_c_omega_ry.shape}, "
+            f"sigma_x={sigma_x_kij_ry.shape}")
     if E.shape != (nk, nb):
-        raise ValueError(f"qp_energies_kn_ev must have shape ({nk}, {nb}).")
+        raise ValueError(
+            f"e_qp_kn_ev must have shape ({nk}, {nb}); got {E.shape}.")
 
-    sigma_qsgw = np.zeros((nk, nb, nb), dtype=np.complex128)
-
+    # Linear-interp index/weight arrays, host-side then pushed replicated.
     omega_lo = float(omega[0])
     omega_hi = float(omega[-1])
     E_clamped = np.clip(E, omega_lo, omega_hi)
-    clipped = int(np.count_nonzero(E_clamped != E))
-
-    for ik in range(nk):
-        # "Re" in QSGW corresponds to the Hermitian part of Sigma(omega).
-        sigma_h_omega = 0.5 * (sigma[:, ik] + np.conj(np.swapaxes(sigma[:, ik], -1, -2)))
-
-        # Interpolate the full Hermitian matrix at each quasiparticle energy E_i(k).
-        e_eval = E_clamped[ik]
-        idx_hi = np.searchsorted(omega, e_eval, side="left")
-        idx_hi = np.clip(idx_hi, 1, n_omega - 1)
-        idx_lo = idx_hi - 1
-        omega_lo_i = omega[idx_lo]
-        omega_hi_i = omega[idx_hi]
-        denom = np.where(omega_hi_i > omega_lo_i, omega_hi_i - omega_lo_i, 1.0)
-        weight_hi = (e_eval - omega_lo_i) / denom
-        weight_lo = 1.0 - weight_hi
-
-        sigma_eval = (
-            weight_lo[:, None, None] * sigma_h_omega[idx_lo, :, :]
-            + weight_hi[:, None, None] * sigma_h_omega[idx_hi, :, :]
-        )
-
-        # A[i,j] = Sigma_ij(E_i), B[i,j] = Sigma_ij(E_j)
-        band_idx = np.arange(nb)
-        A = sigma_eval[band_idx, band_idx, :]
-        B = sigma_eval[band_idx, :, band_idx].T
-        sigma_qsgw[ik] = 0.5 * (A + B)
-
-    # Enforce exact Hermiticity against interpolation noise.
-    sigma_qsgw = 0.5 * (sigma_qsgw + np.conj(np.swapaxes(sigma_qsgw, -1, -2)))
-    if return_diagnostics:
-        total_evals = float(nk * nb)
-        diagnostics = {
-            "n_interp_clipped": float(clipped),
-            "frac_interp_clipped": (float(clipped) / total_evals) if total_evals > 0 else 0.0,
-            "omega_min_ev": float(omega[0]),
-            "omega_max_ev": float(omega[-1]),
-        }
-        return sigma_qsgw, diagnostics
-    return sigma_qsgw
-
-
-def load_sigma_xc_diag_from_h5(
-    sigma_h5_path: str,
-    sigma_sx_kij_ev: np.ndarray,
-    *,
-    sigma_c_dataset: str = "sigma_c_kij_ev",
-    k_chunk_size: int = 16,
-    band_block_size: int = 128,
-) -> np.ndarray:
-    """Load diagonal Sigma_xc(omega,k,n) from HDF5 without materializing the full matrix."""
-
-    sigma_sx_diag_ev = np.diagonal(np.asarray(sigma_sx_kij_ev, dtype=np.complex128), axis1=1, axis2=2)
-
-    with h5py.File(sigma_h5_path, "r") as h5:
-        dset_c = h5[sigma_c_dataset]
-        n_omega, nk, nb, nb2 = dset_c.shape
-        if nb != nb2:
-            raise ValueError(f"{sigma_c_dataset} must be square in band indices.")
-        if sigma_sx_diag_ev.shape != (nk, nb):
-            raise ValueError(
-                f"sigma_sx_kij_ev diagonal shape {sigma_sx_diag_ev.shape} incompatible with HDF5 shape {(nk, nb)}"
-            )
-
-        sigma_xc_diag_ev = np.empty((n_omega, nk, nb), dtype=np.complex128)
-        k_chunk = max(1, int(k_chunk_size))
-        b_chunk = max(1, int(band_block_size))
-
-        for k0 in range(0, nk, k_chunk):
-            k1 = min(k0 + k_chunk, nk)
-            for b0 in range(0, nb, b_chunk):
-                b1 = min(b0 + b_chunk, nb)
-                block = np.asarray(dset_c[:, k0:k1, b0:b1, b0:b1], dtype=np.complex128)
-                sigma_c_diag = np.diagonal(block, axis1=2, axis2=3)
-                sigma_xc_diag_ev[:, k0:k1, b0:b1] = sigma_c_diag + sigma_sx_diag_ev[None, k0:k1, b0:b1]
-
-    return sigma_xc_diag_ev
-
-
-def _interp_rows_on_grid(values_omega_ij: np.ndarray, eval_ev: np.ndarray, omega_ev: np.ndarray) -> np.ndarray:
-    """Interpolate rows of a frequency-dependent matrix block at row-specific energies.
-
-    Parameters
-    ----------
-    values_omega_ij
-        Shape (n_omega, n_row, n_col).
-    eval_ev
-        Shape (n_row,), evaluation energy for each row.
-    omega_ev
-        Monotonic frequency grid.
-    """
-    eval_ev = np.asarray(eval_ev, dtype=np.float64)
-    idx_hi = np.searchsorted(omega_ev, eval_ev, side="left")
-    idx_hi = np.clip(idx_hi, 1, len(omega_ev) - 1)
+    n_clipped = int(np.count_nonzero(E_clamped != E))
+    idx_hi = np.clip(np.searchsorted(omega, E_clamped, side="left"),
+                     1, n_omega - 1)
     idx_lo = idx_hi - 1
-    omega_lo = omega_ev[idx_lo]
-    omega_hi = omega_ev[idx_hi]
-    denom = np.where(omega_hi > omega_lo, omega_hi - omega_lo, 1.0)
-    weight_hi = (eval_ev - omega_lo) / denom
-    weight_lo = 1.0 - weight_hi
-    row_idx = np.arange(values_omega_ij.shape[1])
-    return (
-        weight_lo[:, None] * values_omega_ij[idx_lo, row_idx, :]
-        + weight_hi[:, None] * values_omega_ij[idx_hi, row_idx, :]
+    ω_lo = omega[idx_lo]
+    ω_hi = omega[idx_hi]
+    denom = np.where(ω_hi > ω_lo, ω_hi - ω_lo, 1.0)
+    w_hi = (E_clamped - ω_lo) / denom
+    w_lo = 1.0 - w_hi
+
+    rep_2d = NamedSharding(mesh_xy, P(None, None))
+    rep_3d = NamedSharding(mesh_xy, P(None, None, None))
+    idx_lo_j = jax.device_put(jnp.asarray(idx_lo, dtype=jnp.int32), rep_2d)
+    idx_hi_j = jax.device_put(jnp.asarray(idx_hi, dtype=jnp.int32), rep_2d)
+    w_lo_j   = jax.device_put(jnp.asarray(w_lo, dtype=jnp.complex128), rep_2d)
+    w_hi_j   = jax.device_put(jnp.asarray(w_hi, dtype=jnp.complex128), rep_2d)
+
+    @jax.jit
+    def _kernel(sig_w, sig_x, ilo, ihi, wlo, whi):
+        # ilo/ihi/wlo/whi: (nk, nb) replicated; sig_w: (nω, nk, nb_m_X, nb_n_Y).
+        # A[k, m, n] = Σ_c[idx[k, m], k, m, n] (interp at E_m(k))
+        # B[k, m, n] = Σ_c[idx[k, n], k, m, n] (interp at E_n(k))
+        full = sig_w.shape  # (nω, nk, nb, nb)
+
+        ilo_m = jnp.broadcast_to(ilo[None, :, :, None], full)
+        ihi_m = jnp.broadcast_to(ihi[None, :, :, None], full)
+        A_lo = jnp.take_along_axis(sig_w, ilo_m, axis=0)[0]
+        A_hi = jnp.take_along_axis(sig_w, ihi_m, axis=0)[0]
+        A = wlo[:, :, None] * A_lo + whi[:, :, None] * A_hi
+
+        ilo_n = jnp.broadcast_to(ilo[None, :, None, :], full)
+        ihi_n = jnp.broadcast_to(ihi[None, :, None, :], full)
+        B_lo = jnp.take_along_axis(sig_w, ilo_n, axis=0)[0]
+        B_hi = jnp.take_along_axis(sig_w, ihi_n, axis=0)[0]
+        B = wlo[:, None, :] * B_lo + whi[:, None, :] * B_hi
+
+        # Half-sum, then add static Σ_x and force replicated before
+        # Hermitisation (avoids a sharded transpose).
+        M = 0.5 * (A + B) + sig_x
+        M = jax.lax.with_sharding_constraint(M, rep_3d)
+        return 0.5 * (M + jnp.conj(jnp.swapaxes(M, -1, -2)))
+
+    sigma_xc_qsgw = _kernel(
+        sigma_c_omega_ry, sigma_x_kij_ry,
+        idx_lo_j, idx_hi_j, w_lo_j, w_hi_j,
     )
+    sigma_xc_qsgw.block_until_ready()
 
-
-def build_qsgw_sigma_xc_from_h5(
-    sigma_h5_path: str,
-    sigma_sx_kij_ev: np.ndarray,
-    omega_ev: np.ndarray,
-    qp_energies_kn_ev: np.ndarray,
-    *,
-    sigma_c_dataset: str = "sigma_c_kij_ev",
-    output_dataset: str = "sigma_xc_qsgw_kij_ev",
-    k_chunk_size: int = 1,
-    band_block_size: int = 128,
-) -> dict[str, float]:
-    """Build static Hermitian QSGW Sigma_xc directly from chunked HDF5 reads.
-
-    This avoids materializing the full dynamic `(omega,k,m,n)` tensor on host memory.
-    """
-
-    sigma_sx = np.asarray(sigma_sx_kij_ev, dtype=np.complex128)
-    omega = np.asarray(omega_ev, dtype=np.float64)
-    E = np.asarray(qp_energies_kn_ev, dtype=np.float64)
-    if sigma_sx.ndim != 3:
-        raise ValueError("sigma_sx_kij_ev must have shape (nk, nb, nb).")
-
-    nk, nb, nb2 = sigma_sx.shape
-    if nb != nb2:
-        raise ValueError("sigma_sx_kij_ev must be square in band indices.")
-    if E.shape != (nk, nb):
-        raise ValueError(f"qp_energies_kn_ev must have shape ({nk}, {nb}).")
-
-    omega_lo = float(omega[0])
-    omega_hi = float(omega[-1])
-    E_clamped = np.clip(E, omega_lo, omega_hi)
-    clipped = int(np.count_nonzero(E_clamped != E))
-
-    with h5py.File(sigma_h5_path, "a") as h5:
-        dset_c = h5[sigma_c_dataset]
-        n_omega, nk_h5, nb_h5, nb2_h5 = dset_c.shape
-        if (nk_h5, nb_h5, nb2_h5) != (nk, nb, nb):
-            raise ValueError(
-                f"{sigma_c_dataset} shape {(nk_h5, nb_h5, nb2_h5)} incompatible with sigma_sx {sigma_sx.shape}"
-            )
-        if output_dataset in h5:
-            del h5[output_dataset]
-        dset_out = h5.create_dataset(
-            output_dataset,
-            shape=(nk, nb, nb),
-            dtype=np.complex128,
-            chunks=(max(1, min(int(k_chunk_size), nk)), max(1, min(int(band_block_size), nb)), max(1, min(int(band_block_size), nb))),
-        )
-
-        k_chunk = max(1, int(k_chunk_size))
-        b_chunk = max(1, int(band_block_size))
-
-        for k0 in range(0, nk, k_chunk):
-            k1 = min(k0 + k_chunk, nk)
-            for i0 in range(0, nb, b_chunk):
-                i1 = min(i0 + b_chunk, nb)
-                for j0 in range(0, nb, b_chunk):
-                    j1 = min(j0 + b_chunk, nb)
-                    block_c_ij = np.asarray(dset_c[:, k0:k1, i0:i1, j0:j1], dtype=np.complex128)
-                    block_x_ij = sigma_sx[k0:k1, i0:i1, j0:j1][None, ...]
-                    block_xc_ij = block_c_ij + block_x_ij
-                    if i0 == j0:
-                        block_h_ij = 0.5 * (
-                            block_xc_ij + np.conj(np.swapaxes(block_xc_ij, -1, -2))
-                        )
-                    else:
-                        block_c_ji = np.asarray(dset_c[:, k0:k1, j0:j1, i0:i1], dtype=np.complex128)
-                        block_x_ji = sigma_sx[k0:k1, j0:j1, i0:i1][None, ...]
-                        block_xc_ji = block_c_ji + block_x_ji
-                        block_h_ij = 0.5 * (
-                            block_xc_ij + np.conj(np.swapaxes(block_xc_ji, -1, -2))
-                        )
-
-                    out_block = np.empty((k1 - k0, i1 - i0, j1 - j0), dtype=np.complex128)
-                    for kk in range(k1 - k0):
-                        eval_rows = E_clamped[k0 + kk, i0:i1]
-                        eval_cols = E_clamped[k0 + kk, j0:j1]
-                        sigma_h_omega = block_h_ij[:, kk, :, :]
-                        row_eval = _interp_rows_on_grid(sigma_h_omega, eval_rows, omega)
-                        col_eval = _interp_rows_on_grid(np.swapaxes(sigma_h_omega, 1, 2), eval_cols, omega).T
-                        out_block[kk] = 0.5 * (row_eval + col_eval)
-                    dset_out[k0:k1, i0:i1, j0:j1] = out_block
-
-    total_evals = float(nk * nb)
-    return {
-        "n_interp_clipped": float(clipped),
-        "frac_interp_clipped": (float(clipped) / total_evals) if total_evals > 0 else 0.0,
+    diagnostics = {
+        "n_clipped": float(n_clipped),
+        "frac_clipped": float(n_clipped) / float(nk * nb) if nk * nb else 0.0,
         "omega_min_ev": omega_lo,
         "omega_max_ev": omega_hi,
     }
+    return sigma_xc_qsgw, diagnostics
 
+
+# ---------------------------------------------------------------------------
+# QP-energy comparison plot
+# ---------------------------------------------------------------------------
 
 def plot_qp_energy_comparison(
     output_png: str,
@@ -314,7 +324,7 @@ def plot_qp_energy_comparison(
     e_dyn0_kn_ev: np.ndarray,
     e_diag_sc_kn_ev: np.ndarray,
 ) -> str:
-    """Create a simple comparison plot of QP energies."""
+    """Scatter + k=0 trend of QP energies for the three approximations."""
     import matplotlib.pyplot as plt
 
     x = np.asarray(e_ref_kn_ev, dtype=np.float64).reshape(-1)
@@ -324,26 +334,35 @@ def plot_qp_energy_comparison(
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
     axes[0].scatter(x, y_static, s=10, alpha=0.6, label="Static COHSEX")
-    axes[0].scatter(x, y_dyn0, s=10, alpha=0.6, label="Bare X + Sigma_c(0)")
-    axes[0].scatter(x, y_diag, s=10, alpha=0.6, label="Diagonal SC Sigma(E)")
+    axes[0].scatter(x, y_dyn0, s=10, alpha=0.6, label="Bare X + Σ_c(0)")
+    axes[0].scatter(x, y_diag, s=10, alpha=0.6, label="Diagonal SC Σ(E)")
     mn = float(min(np.min(x), np.min(y_static), np.min(y_dyn0), np.min(y_diag)))
     mx = float(max(np.max(x), np.max(y_static), np.max(y_dyn0), np.max(y_diag)))
     axes[0].plot([mn, mx], [mn, mx], "k--", lw=1)
     axes[0].set_xlabel("Reference energy (eV)")
     axes[0].set_ylabel("QP energy (eV)")
     axes[0].legend(fontsize=8)
-    axes[0].set_title("All (k,n)")
+    axes[0].set_title("All (k, n)")
 
-    # k=0 band trend
     b = np.arange(e_ref_kn_ev.shape[1])
     axes[1].plot(b, e_static_kn_ev[0], "-o", ms=3, label="Static COHSEX")
-    axes[1].plot(b, e_dyn0_kn_ev[0], "-o", ms=3, label="Bare X + Sigma_c(0)")
-    axes[1].plot(b, e_diag_sc_kn_ev[0], "-o", ms=3, label="Diagonal SC Sigma(E)")
+    axes[1].plot(b, e_dyn0_kn_ev[0], "-o", ms=3, label="Bare X + Σ_c(0)")
+    axes[1].plot(b, e_diag_sc_kn_ev[0], "-o", ms=3, label="Diagonal SC Σ(E)")
     axes[1].set_xlabel("Band index")
-    axes[1].set_ylabel("Energy at k=0 (eV)")
+    axes[1].set_ylabel("Energy at k = 0 (eV)")
     axes[1].set_title("k = 0")
     axes[1].legend(fontsize=8)
 
     fig.savefig(output_png, dpi=160)
     plt.close(fig)
     return output_png
+
+
+__all__ = [
+    "build_qsgw_sigma_xc",
+    "extract_sigma_diag_replicated",
+    "interp_along_omega",
+    "plot_qp_energy_comparison",
+    "print_scf_diagnostics",
+    "solve_diagonal_sigma_fixed_point",
+]

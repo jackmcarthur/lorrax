@@ -635,7 +635,7 @@ def resolve_n_occ(
 
     if input_file is not None:
         try:
-            from common.wfnreader import WFNReader
+            from file_io import WFNReader
             wfn_path = _parse_wfn_path(input_file)
             if os.path.exists(wfn_path):
                 w = WFNReader(wfn_path)
@@ -707,7 +707,7 @@ def apply_eqp_corrections(
     enk_qp = enk_full.copy()
 
     if input_file is not None:
-        from common.wfnreader import WFNReader
+        from file_io import WFNReader
         from common.symmetry_maps import SymMaps
 
         wfn_path = _parse_wfn_path(input_file)

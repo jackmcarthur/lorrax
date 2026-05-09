@@ -124,98 +124,82 @@ def write_eqp_g0w0(
 
 
 def write_sigma_freq_debug_table(
-	filepath,
-	*,
-	energies_dft_ev,
-	omega_rel_dft_ev,
-	kin_ion_diag_ev,
-	sigma_sex_static_diag_ev,
-	sigma_coh_static_diag_ev,
-	sigma_x_diag_ev,
-	sigma_c_w0_diag_ev,
-	sigma_c_plus_edft_ev,
-	sigma_c_minus_edft_ev,
-	sigma_c_invalid_static_diag_ev,
-	sigma_c_edft_ev,
-):
-	"""Write per-(k,n) diagonal sigma decomposition used for GN-PPM debugging.
+	filepath: str,
+	columns: list[tuple[str, np.ndarray]],
+) -> str:
+	"""Write a per-(k, n) decomposition table.
 
-	All arrays are expected with shape (nk, nb). Values are written in eV.
+	Each entry in ``columns`` is a ``(name, array)`` pair, where ``array``
+	has shape ``(nk, nb)`` and is real or complex.  Real arrays produce one
+	column; complex arrays produce two adjacent ``Re/Im`` sub-columns.  All
+	values are assumed to already be in eV — the caller does the Ry→eV
+	conversion at the seam (consistent with the rule "internals in Ry, eV
+	only at print").
+
+	The first row is a comment header naming all columns; subsequent rows
+	are tab-separated numerical values, one per ``(k, n)`` pair, with k
+	and n as the leading two integer columns.
+
+	Returns
+	-------
+	The absolute path written.
 	"""
-	fields = [
-		np.asarray(energies_dft_ev, dtype=np.float64),
-		np.asarray(omega_rel_dft_ev, dtype=np.float64),
-		np.asarray(kin_ion_diag_ev, dtype=np.complex128),
-		np.asarray(sigma_sex_static_diag_ev, dtype=np.complex128),
-		np.asarray(sigma_coh_static_diag_ev, dtype=np.complex128),
-		np.asarray(sigma_x_diag_ev, dtype=np.complex128),
-		np.asarray(sigma_c_w0_diag_ev, dtype=np.complex128),
-		np.asarray(sigma_c_plus_edft_ev, dtype=np.complex128),
-		np.asarray(sigma_c_minus_edft_ev, dtype=np.complex128),
-		np.asarray(sigma_c_invalid_static_diag_ev, dtype=np.complex128),
-		np.asarray(sigma_c_edft_ev, dtype=np.complex128),
-	]
-	ref_shape = fields[0].shape
-	for arr in fields[1:]:
-		if arr.shape != ref_shape:
-			raise ValueError(f"sigma freq debug shape mismatch: {arr.shape} vs {ref_shape}")
-	nk, nb = ref_shape
+	if not columns:
+		raise ValueError("write_sigma_freq_debug_table: ``columns`` is empty.")
+
+	arrays = [(name, np.asarray(arr)) for name, arr in columns]
+	nk, nb = arrays[0][1].shape
+	for name, arr in arrays:
+		if arr.shape != (nk, nb):
+			raise ValueError(
+				f"column {name!r}: shape {arr.shape} != ({nk}, {nb})")
+
+	# Column header — Re/Im split for complex arrays.
+	header = ["k", "n"]
+	for name, arr in arrays:
+		if np.iscomplexobj(arr):
+			header += [f"{name}.Re", f"{name}.Im"]
+		else:
+			header.append(name)
 
 	abs_path = os.path.abspath(filepath)
 	dirname = os.path.dirname(abs_path)
 	if dirname:
 		os.makedirs(dirname, exist_ok=True)
 
+	col_w = 16
+
+	def _hdr(name: str) -> str:
+		return f"{name:<{col_w}s}"
+
+	def _val(x) -> str:
+		if isinstance(x, complex) or np.iscomplexobj(x):
+			# Should never reach here — complex columns are split above.
+			x = float(np.real(x))
+		fx = float(x)
+		if np.isnan(fx):
+			return f"{'nan':>{col_w}s}"
+		return f"{fx:>+{col_w}.6f}"
+
 	with open(abs_path, "w") as f:
 		f.write(provenance_header())
-		sep = "\t\t"
-		col_w = 15
-		cols = [
-			"k",
-			"n",
-			"Edft-Ef",
-			"E_dft",
-			"kin_ion",
-			"sex_0",
-			"coh_0",
-			"x_bare",
-			"sig_c(0)",
-			"sig_c+(w)",
-			"sig_c-(w)",
-			"sig_c_invld(0)",
-			"sig_c(Edft)",
-		]
-		def _h(name: str) -> str:
-			return f"{name:<{col_w}}"
-		def _r(x: float) -> str:
-			if np.isnan(x):
-				return f"{'nan':>{col_w}}"
-			return f"{x:>{col_w}.3f}"
-		def _i(x: int) -> str:
-			return f"{x:>{col_w}d}"
-		f.write("# Sigma frequency debug decomposition (all energies in eV)\n")
-		f.write("# " + sep.join(_h(c) for c in cols) + "\n")
+		f.write(
+			"# Sigma frequency debug decomposition (per-(k, n) diagonals; all "
+			"energies in eV).\n"
+		)
+		f.write("# " + "\t".join(_hdr(h) for h in header) + "\n")
 		for ik in range(nk):
 			f.write(f"\nk-point {ik}:\n")
-			f.write(sep.join(_h(c) for c in cols) + "\n")
 			for ib in range(nb):
-				row = [
-					_i(ik),
-					_i(ib),
-					_r(float(fields[1][ik, ib])),
-					_r(float(fields[0][ik, ib])),
-					_r(float(np.real(fields[2][ik, ib]))),
-					_r(float(np.real(fields[3][ik, ib]))),
-					_r(float(np.real(fields[4][ik, ib]))),
-					_r(float(np.real(fields[5][ik, ib]))),
-					_r(float(np.real(fields[6][ik, ib]))),
-					_r(float(np.real(fields[7][ik, ib]))),
-					_r(float(np.real(fields[8][ik, ib]))),
-					_r(float(np.real(fields[9][ik, ib]))),
-					_r(float(np.real(fields[10][ik, ib]))),
-				]
-				line = sep.join(row)
-				f.write(line + "\n")
+				row = [f"{ik:>{col_w}d}", f"{ib:>{col_w}d}"]
+				for name, arr in arrays:
+					v = arr[ik, ib]
+					if np.iscomplexobj(arr):
+						row += [_val(v.real), _val(v.imag)]
+					else:
+						row.append(_val(v))
+				f.write("\t".join(row) + "\n")
+
 	return abs_path
 
 

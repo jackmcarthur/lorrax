@@ -247,6 +247,126 @@ def build_wavefunctions(
 
 
 # ---------------------------------------------------------------------------
+# Self-consistent QSGW: rotate the bundle into a new band basis
+# ---------------------------------------------------------------------------
+
+@jax.jit
+def _rotate_psi_xn(psi_xn: jax.Array, U: jax.Array) -> jax.Array:
+    # ψ'_xn[k, s, μ, n] = Σ_m ψ_xn[k, s, μ, m] · U[k, m, n]
+    return jnp.einsum('ksum,kmn->ksun', psi_xn, U, optimize=True)
+
+
+@jax.jit
+def _rotate_psi_xr(psi_xr: jax.Array, U: jax.Array) -> jax.Array:
+    # ψ'_xr[k, n, s, μ] = Σ_m U[k, m, n] · ψ_xr[k, m, s, μ]
+    return jnp.einsum('kmn,kmsu->knsu', U, psi_xr, optimize=True)
+
+
+@jax.jit
+def _rotate_psi_yr(psi_yr: jax.Array, U: jax.Array) -> jax.Array:
+    return jnp.einsum('kmn,kmsu->knsu', U, psi_yr, optimize=True)
+
+
+@jax.jit
+def _rotate_psi_yn(psi_yn: jax.Array, U: jax.Array) -> jax.Array:
+    return jnp.einsum('ksum,kmn->ksun', psi_yn, U, optimize=True)
+
+
+def rotate_wavefunctions(
+    wfns_dft: Wavefunctions,
+    U_dft_to_qp_active: jax.Array,
+    *,
+    enk_active_new: jax.Array,
+    efermi: float | None,
+    mesh_xy: Mesh,
+    active_slice: slice | None = None,
+) -> Wavefunctions:
+    """Return a new ``Wavefunctions`` bundle with the **active subspace**
+    rotated by ``U_dft_to_qp_active[k, m, n] = ⟨DFT_m | QP_n⟩``.
+
+    Active / inactive partition
+    ---------------------------
+    The ``active_slice`` (default: ``wfns_dft.slices.sigma`` — the QP
+    evaluation window) selects a contiguous band block ``[start, stop)``
+    where the QP Hamiltonian has full off-diagonal Σ and we apply the
+    band-mixing unitary.  Bands **outside** that window keep their DFT
+    wavefunctions and DFT energies untouched; their QP corrections come
+    from the scissor extrapolation downstream.  This avoids rotating ψ
+    for bands the QP calculation never touched (which is both wasteful
+    and physically wrong since we have no Σ for them).
+
+    Validation
+    ----------
+    Errors if ``active_slice`` extends past ``wfns_dft.slices.sigma`` —
+    that would imply we're rotating bands the calculation can't have
+    produced QP-basis information for.
+
+    Parameters
+    ----------
+    wfns_dft
+        The original DFT bundle (preserved unchanged across iterations).
+    U_dft_to_qp_active
+        Per-k unitary on the active block, shape ``(nk, nb_active, nb_active)``.
+    enk_active_new
+        New eigenvalues on the active block, shape ``(nk, nb_active)``.
+    efermi
+        Fermi level; used to rebuild ``occ``.
+    mesh_xy
+        2-D device mesh; sharding of the four ψ copies is preserved.
+    active_slice
+        Contiguous active band block.  Defaults to ``wfns_dft.slices.sigma``.
+    """
+    sigma_slice = wfns_dft.slices.sigma
+    if active_slice is None:
+        active_slice = sigma_slice
+    a_lo = int(active_slice.start or 0)
+    a_hi = int(active_slice.stop)
+    s_lo = int(sigma_slice.start or 0)
+    s_hi = int(sigma_slice.stop)
+    if a_lo < s_lo or a_hi > s_hi:
+        raise ValueError(
+            f"rotate_wavefunctions: active_slice [{a_lo}, {a_hi}) leaks "
+            f"outside the σ-window [{s_lo}, {s_hi}); we have no QP basis "
+            f"information for bands beyond the protected window.")
+    nb_active = a_hi - a_lo
+    if U_dft_to_qp_active.shape[-2:] != (nb_active, nb_active):
+        raise ValueError(
+            f"rotate_wavefunctions: U shape {U_dft_to_qp_active.shape} "
+            f"inconsistent with active block size {nb_active}.")
+
+    # Pull the active sub-blocks via the bundle's jit'd accessors (cached),
+    # rotate, then dynamic-update-slice back into a copy of the full ψ.
+    with mesh_xy:
+        psi_xn_act = _rotate_psi_xn(wfns_dft.xn(active_slice), U_dft_to_qp_active)
+        psi_xr_act = _rotate_psi_xr(wfns_dft.xr(active_slice), U_dft_to_qp_active)
+        psi_yr_act = _rotate_psi_yr(wfns_dft.yr(active_slice), U_dft_to_qp_active)
+        psi_yn_act = _rotate_psi_yn(wfns_dft.yn(active_slice), U_dft_to_qp_active)
+
+        # Reassemble — bands outside the active block stay DFT.
+        psi_xn = jax.lax.dynamic_update_slice_in_dim(
+            wfns_dft.psi_xn, psi_xn_act, a_lo, axis=-1)
+        psi_xr = jax.lax.dynamic_update_slice_in_dim(
+            wfns_dft.psi_xr, psi_xr_act, a_lo, axis=1)
+        psi_yr = jax.lax.dynamic_update_slice_in_dim(
+            wfns_dft.psi_yr, psi_yr_act, a_lo, axis=1)
+        psi_yn = jax.lax.dynamic_update_slice_in_dim(
+            wfns_dft.psi_yn, psi_yn_act, a_lo, axis=-1)
+
+        # enk: copy DFT, replace the active block with the new eigenvalues.
+        enk_full = wfns_dft.enk.at[:, active_slice].set(
+            jnp.asarray(enk_active_new, dtype=wfns_dft.enk.dtype))
+        rep2 = NamedSharding(mesh_xy, P(None, None))
+        enk_full = jax.lax.with_sharding_constraint(enk_full, rep2)
+        occ_full = jax.lax.with_sharding_constraint(
+            _build_occ(enk_full, wfns_dft.slices, efermi), rep2)
+
+    return Wavefunctions(
+        psi_xn=psi_xn, psi_xr=psi_xr, psi_yr=psi_yr, psi_yn=psi_yn,
+        enk=enk_full, occ=occ_full, slices=wfns_dft.slices,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Band-basis projection — Σ_mn(k) = Σ_{s,μ,s',μ'} ψ*_m(s,μ) Σ(s,μ,s',μ') ψ_n(s',μ')
 #
 # Lives here because the only state these contractions need is the (xr, yn)

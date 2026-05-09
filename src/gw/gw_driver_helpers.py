@@ -28,7 +28,6 @@ class PPMSigmaRuntimeOptions:
     ppm_sigma_scale: float
     ppm_sigma_flip_neg: bool
     ppm_invalid_mode: str
-    sigma_debug_split_contrib: bool
     sigma_freq_debug_output: bool
     fermi_reference: str
     sigma_at_dft_extrapolate: bool
@@ -263,7 +262,6 @@ def build_ppm_sigma_runtime_options(
         ppm_sigma_scale=float(ppm.sigma_scale),
         ppm_sigma_flip_neg=bool(ppm.sigma_flip_neg),
         ppm_invalid_mode=str(ppm.invalid_mode).strip().lower(),
-        sigma_debug_split_contrib=bool(debug.sigma_debug_split_contrib),
         sigma_freq_debug_output=bool(debug.sigma_freq_debug_output),
         fermi_reference=str(ppm.fermi_reference).strip().lower(),
         sigma_at_dft_extrapolate=bool(ppm.sigma_at_dft_extrapolate),

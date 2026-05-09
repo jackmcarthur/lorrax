@@ -57,7 +57,7 @@ _maybe_init_jax_distributed()
 from jax.experimental import multihost_utils
 from jax.sharding import Mesh, PartitionSpec as P
 
-from common.wfnreader import WFNReader
+from file_io import WFNReader
 from common.symmetry_maps import SymMaps
 from common.load_wfns import read_Gvecs_to_devices
 from common.fft_helpers import make_jittable_local_ifftn_3d

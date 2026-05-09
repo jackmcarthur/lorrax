@@ -189,7 +189,13 @@ def compute_cohsex_sigma(
         sig_h    (nk, nb_sigma, nb_sigma)  Hartree
         sig_x    (nk, nb_sigma, nb_sigma)  bare exchange + head, or None
 
-    All arrays are sharded consistently with their upstream kernels.
+    All four returned arrays are pinned to **fully-replicated** sharding
+    ``P(None, None, None)`` so the post-self-energy plumbing in
+    ``gw_jax`` can operate on replicated H_kmn without resharding seams.
+    They are small (``nk · nb_sigma² · 16 B`` ≲ tens of MB) so replication
+    is essentially free; the heavy ω-grid Σ_c tensor stays sharded
+    upstream in ``ppm_sigma`` and is only collapsed into a replicated
+    Σ_xc^QSGW after the energy-domain contraction.
     """
     if Gij is None:
         Gij = build_Gij(meta, mesh_xy)
@@ -199,6 +205,8 @@ def compute_cohsex_sigma(
     sigma_sx_k, sigma_coh_k, hartree_k = _make_cohsex_kernels(
         mesh_xy, kgrid, nk_tot)
 
+    rep = NamedSharding(mesh_xy, P(None, None, None))
+
     with mesh_xy:
         sig_sx  = sigma_sx_k(wfns, Gij, W_q)
         sig_coh = sigma_coh_k(wfns, W_q, V_q)
@@ -207,6 +215,9 @@ def compute_cohsex_sigma(
             sig_sx, sig_coh,
             static_head_terms=static_head_terms,
             meta=meta, mesh_xy=mesh_xy, do_screened=do_screened)
+        sig_sx  = jax.lax.with_sharding_constraint(sig_sx,  rep)
+        sig_coh = jax.lax.with_sharding_constraint(sig_coh, rep)
+        sig_h   = jax.lax.with_sharding_constraint(sig_h,   rep)
         sig_sx.block_until_ready()
         sig_coh.block_until_ready()
         sig_h.block_until_ready()
@@ -215,12 +226,12 @@ def compute_cohsex_sigma(
     if compute_bare_x:
         with mesh_xy:
             sig_x = sigma_sx_k(wfns, Gij, V_q)
-        sig_x.block_until_ready()
         if static_head_terms is not None:
             x_head, _ = static_head_terms_to_kij(
                 static_head_terms, nk_tot=meta.nk_tot, do_screened=False)
-            rep = NamedSharding(mesh_xy, P(None, None, None))
             sig_x = sig_x + jax.device_put(x_head, rep)
+        sig_x = jax.lax.with_sharding_constraint(sig_x, rep)
+        sig_x.block_until_ready()
 
         # Bispinor bare exchange: add Σ^B (transverse-only sum over
         # (i, j) ∈ {1, 2, 3}²) to sig_x.  No-op when ``wfns_transverse``

@@ -38,12 +38,6 @@ from .ppm_sigma import (
     fit_ppm,
     precompile_sigma,
 )
-from .w_isdf import (
-    build_imag_quadrature,
-    build_real_quadrature,
-    compute_chi0,
-    solve_w,
-)
 
 
 @dataclass(frozen=True)
@@ -57,24 +51,10 @@ class PPMOutputs:
     efermi_dft_ev: float | None
     sigma_omega_h5_path: str
     ppm_options: PPMSigmaRuntimeOptions
-
-
-def _build_probe_quadrature(quad, config, *, print_fn):
-    """Return (probe_omega, quad_probe) for the GN (imag) or HL (real) path."""
-    is_hl = config.compute_mode is ComputeMode.HL_PPM
-    if is_hl:
-        probe_omega = complex(float(config.ppm.omega_p), 0.0)
-        quad_probe = build_real_quadrature(
-            quad, float(config.ppm.omega_p),
-            config.minimax_config, print_fn=print_fn,
-        )
-    else:
-        probe_omega = 1j * float(config.ppm.omega_p)
-        quad_probe = build_imag_quadrature(
-            quad, config.ppm.omega_p,
-            config.minimax_config, print_fn=print_fn,
-        )
-    return probe_omega, quad_probe
+    # Diagonal of the analytic q→0 head added to ``sigma_c_omega`` — kept
+    # separately for diagnostic printing (the head is band-diagonal so the
+    # decomposition is lossless).  ``None`` when no head was injected.
+    head_sigma_diag_w_kn_ry: np.ndarray | None = None
 
 
 def _fit_head_correction(
@@ -132,23 +112,29 @@ def _inject_analytic_head(
     band_slices,
     wfn, sym, meta,
     print_fn,
-) -> jax.Array | None:
-    """Add the analytic q→0, G=G'=0 head to Σ^c(ω) on rank 0."""
+) -> tuple[jax.Array | None, np.ndarray | None]:
+    """Add the analytic q→0, G=G'=0 head to Σ^c(ω) on rank 0.
+
+    Returns
+    -------
+    sigma_c_omega_with_head, head_sigma_diag_w_kn_ry
+        Post-head Σ_c (same shape as input) and the band-diagonal of the
+        head-only contribution ``(nω, nk, nb)`` in Ry (head is diagonal in
+        band so this is a lossless decomposition).  Both are ``None`` when
+        the input ``sigma_c_omega`` is ``None``.
+    """
     if sigma_c_omega is None:
-        return None
+        return None, None
     from .head_correction import compute_ppm_head_sigma_kij
 
     enk_full, _ = get_enk_bandrange(
         wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
         nspinor=meta.nspinor)
     enk_full_np = np.asarray(enk_full, dtype=np.float64)
+    # Canonical mid-gap E_F from WFNReader (computed once at WFN load
+    # over the full set of bands stored in WFN.h5; band-window-independent).
+    efermi_ry = float(wfn.efermi)
     n_occ = min(meta.nelec, enk_full_np.shape[1])
-    vbm_ry = float(np.max(enk_full_np[:, :n_occ]))
-    cbm_ry = (
-        float(np.min(enk_full_np[:, n_occ:]))
-        if n_occ < enk_full_np.shape[1] else vbm_ry
-    )
-    efermi_ry = 0.5 * (vbm_ry + cbm_ry)
 
     head_sigma_kij_ry = compute_ppm_head_sigma_kij(
         head_gn,
@@ -169,7 +155,12 @@ def _inject_analytic_head(
         f"  Σ_c head shift: max|Σ^head_diag| = {head_max_ev:.4f} eV "
         f"(on-shell occ band → {on_shell_occ:+.4f} eV)"
     )
-    return sigma_c_omega + jnp.asarray(head_sigma_kij_ry, dtype=jnp.complex128)
+    head_diag_w_kn_ry = np.diagonal(
+        np.asarray(head_sigma_kij_ry), axis1=2, axis2=3)
+    return (
+        sigma_c_omega + jnp.asarray(head_sigma_kij_ry, dtype=jnp.complex128),
+        head_diag_w_kn_ry,
+    )
 
 
 def _eval_sigma_c_at_dft_energies(
@@ -177,30 +168,30 @@ def _eval_sigma_c_at_dft_energies(
     sigma_omega: 'object', *,                          # noqa: F821 (forward decl)
     ppm_options: PPMSigmaRuntimeOptions,
     sig_x: jax.Array,
-    band_slices, wfn, sym, meta,
+    band_slices, wfn, sym, meta, mesh_xy,
     print_fn,
 ):
-    """On rank 0, interpolate diag(Σ_c)(ω) at each DFT energy.
+    """Interpolate diag(Σ_c)(ω) at each DFT energy on all ranks.
+
+    Pulls the replicated diagonal of Σ_c(ω, k, m, n) via
+    :func:`qsgw_utils.extract_sigma_diag_replicated` (cheap allgather of
+    the diagonal only, ~MB) so the result is consistent across ranks —
+    required by the post-Σ flow in ``gw_jax`` which now runs on all
+    ranks.  The streamed-mode fallback (``sigma_c_omega is None``) uses
+    a single rank-0 h5 read followed by an MPI broadcast.
 
     Returns ``(sigma_c_at_dft_ev, sigma_xc_at_dft_ev, omega_dft_rel_ev,
-    efermi_dft_ev)``.  Off-rank-0 returns ``(None, None, None, None)``.
+    efermi_dft_ev)``, all replicated.
     """
-    if meta.rank != 0:
-        return None, None, None, None
-
-    import h5py
-
     enk_dft, _ = get_enk_bandrange(
         wfn, sym, band_slices.sigma_range,
         band_slices.sigma_range, nspinor=meta.nspinor)
     enk_dft_ev = np.asarray(enk_dft) * RYD_TO_EV
-    n_occ = min(meta.nelec, enk_dft_ev.shape[1])
-    vbm_ev = float(np.max(enk_dft_ev[:, :n_occ]))
-    cbm_ev = (
-        float(np.min(enk_dft_ev[:, n_occ:]))
-        if n_occ < enk_dft_ev.shape[1] else vbm_ev
-    )
-    efermi_dft_ev = 0.5 * (vbm_ev + cbm_ev)
+    # Single source of truth for the mid-gap E_F: WFNReader computes it
+    # once at WFN load (``wfn.efermi`` in Ry).  Don't recompute here.
+    vbm_ev = float(wfn.vbm) * RYD_TO_EV
+    cbm_ev = float(wfn.cbm) * RYD_TO_EV
+    efermi_dft_ev = float(wfn.efermi) * RYD_TO_EV
     omega_dft_rel_ev = enk_dft_ev - efermi_dft_ev
     print_fn(
         f"  E_F(midgap) = {efermi_dft_ev:.6f} eV  "
@@ -209,28 +200,28 @@ def _eval_sigma_c_at_dft_energies(
 
     omega_ev = np.asarray(ppm_options.omega_grid_ev, dtype=np.float64)
     if sigma_c_omega is not None:
-        sig_c_diag = np.diagonal(
-            np.asarray(sigma_c_omega), axis1=2, axis2=3) * RYD_TO_EV
+        from .qsgw_utils import extract_sigma_diag_replicated
+        sig_c_diag = (
+            np.asarray(extract_sigma_diag_replicated(sigma_c_omega, mesh_xy))
+            * RYD_TO_EV)
     else:
-        with h5py.File(sigma_omega.sigma_kij_h5_path, "r") as h5:
-            sig_c_diag = np.diagonal(
-                np.asarray(h5["sigma_c_kij_ry"], dtype=np.complex128),
-                axis1=2, axis2=3,
-            ) * RYD_TO_EV
+        # Streamed mode: rank-0 reads, then broadcast to all ranks.
+        import h5py
+        if meta.rank == 0:
+            with h5py.File(sigma_omega.sigma_kij_h5_path, "r") as h5:
+                sig_c_diag = np.diagonal(
+                    np.asarray(h5["sigma_c_kij_ry"], dtype=np.complex128),
+                    axis1=2, axis2=3,
+                ) * RYD_TO_EV
+        else:
+            sig_c_diag = np.zeros(
+                (omega_ev.size, *enk_dft_ev.shape), dtype=np.complex128)
+        from jax.experimental.multihost_utils import broadcast_one_to_all
+        sig_c_diag = np.asarray(broadcast_one_to_all(sig_c_diag))
 
-    nk, nb = sig_c_diag.shape[1], sig_c_diag.shape[2]
-    sigma_c_at_dft_ev = np.array([
-        [
-            complex(
-                np.interp(omega_dft_rel_ev[ik, ib], omega_ev,
-                          np.real(sig_c_diag[:, ik, ib])),
-                np.interp(omega_dft_rel_ev[ik, ib], omega_ev,
-                          np.imag(sig_c_diag[:, ik, ib])),
-            )
-            for ib in range(nb)
-        ]
-        for ik in range(nk)
-    ], dtype=np.complex128)
+    from .qsgw_utils import interp_along_omega
+    sigma_c_at_dft_ev = interp_along_omega(
+        sig_c_diag, omega_ev, omega_dft_rel_ev)
 
     sig_x_diag_ev = np.diagonal(np.asarray(sig_x), axis1=1, axis2=2) * RYD_TO_EV
     sigma_xc_at_dft_ev = sig_x_diag_ev + sigma_c_at_dft_ev
@@ -291,7 +282,8 @@ def compute_ppm_sigma_pipeline(
     *,
     wfns,
     V_q: jax.Array,
-    W_q: jax.Array,
+    W_static_q: jax.Array,
+    W_probe_q: jax.Array,
     sig_x: jax.Array,
     sig_h: jax.Array,
     quad,
@@ -306,26 +298,28 @@ def compute_ppm_sigma_pipeline(
     input_dir: str,
     print_fn=print,
 ) -> PPMOutputs:
-    """Run the GN/HL-PPM dynamic Σ^c(ω) pipeline end-to-end.
+    """Run the GN/HL-PPM dynamic Σ^c(ω) pipeline given pre-computed W's.
+
+    Both ``W_static_q`` (W at ω=0) and ``W_probe_q`` (W at the GN-PPM
+    iω_p / HL-PPM Ω) must be supplied by the caller.  In the SC
+    iteration map the caller is :func:`gw.screening.compute_screening`
+    which evaluates them once per iteration; in one-shot main() the
+    same helper is invoked at the screening seam.  Decoupling the
+    probe-frequency χ₀+W solve from this pipeline lets future Σ
+    schemes (CD, spectral, …) share the same screening planner.
 
     Sequences (with timing.section + xprof annotations):
 
-        1. Build the probe-frequency quadrature (HL: real ω; GN: iω_p).
-        2. Compute χ₀(probe) and W(probe) via the static screening solver.
-        3. Two-point PPM pole fit (B_q, Ω_q).
-        4. Precompile + run Σ^c(ω, k, m, n) over the windowed minimax grid.
-        5. Inject the analytic q→0 head correction.
-        6. Interpolate diag(Σ_c) at DFT energies (rank-0 only).
-        7. Write sigma_mnk.h5 (eV units).
+        1. Two-point PPM pole fit (B_q, Ω_q) from (W_static, W_probe).
+        2. Precompile + run Σ^c(ω, k, m, n) over the windowed minimax grid.
+        3. Inject the analytic q→0 head correction.
+        4. Interpolate diag(Σ_c) at DFT energies (rank-0 only).
+        5. Write sigma_mnk.h5 (eV units).
     """
     from . import w_isdf  # for ensure_compilation_cache + cache hit timings
 
     if not config.do_screened:
         raise ValueError("PPM Σ^c pipeline requires do_screened=true.")
-    if config.self_consistent:
-        raise NotImplementedError(
-            "PPM Σ^c pipeline does not yet support self_consistent=true."
-        )
 
     ppm_options = build_ppm_sigma_runtime_options(config, input_dir=input_dir)
     label = "HL-PPM" if config.compute_mode is ComputeMode.HL_PPM else "GN-PPM"
@@ -333,32 +327,25 @@ def compute_ppm_sigma_pipeline(
     print_section(f"{label} + FREQUENCY-INTEGRATED SIGMA", print_fn)
 
     with timing.section("gw_jax.ppm_sigma"):
-        # Step 1–2: probe-frequency W
-        probe_omega, quad_probe = _build_probe_quadrature(
-            quad, config, print_fn=print_fn)
-        chi0_probe = compute_chi0(
-            wfns, quad_probe, meta, mesh_xy, energy_reference=e_ref)
-        # Block BEFORE solve_w so chi0_probe compute time isn't folded
-        # into the W-solve wall, and so solve_w can donate χ₀'s buffer.
-        chi0_probe.block_until_ready()
-        Wiwp_q = solve_w(
-            V_q, chi0_probe, meta, mesh_xy,
-            solver=config.backend.screening_solver,
+        # Probe frequency for the PPM fit — recovered from the configured
+        # ω_p (real-axis Ω for HL, iω_p for GN).  The screening planner
+        # used the same convention to pick W_probe_q's evaluation point.
+        is_hl = config.compute_mode is ComputeMode.HL_PPM
+        probe_omega = (
+            complex(float(config.ppm.omega_p), 0.0) if is_hl
+            else 1j * float(config.ppm.omega_p)
         )
-        del chi0_probe
-        Wiwp_q.block_until_ready()
 
-        # Step 3: PPM pole fit
+        # Step 1: PPM pole fit
         ppm = fit_ppm(
-            W_q, Wiwp_q, V_q, probe_omega, mesh_xy,
+            W_static_q, W_probe_q, V_q, probe_omega, mesh_xy,
             fallback_omega=config.ppm.fallback_omega,
             n_nodes_static=quad.node_count,
             print_fn=print_fn,
             model_label=label,
         )
-        del Wiwp_q
 
-        # Step 4: precompile + run Σ^c(ω, k, m, n)
+        # Step 2: precompile + run Σ^c(ω, k, m, n)
         with timing.section("sigma.compile"):
             precompile_sigma(wfns, ppm, meta, mesh_xy)
         with timing.section("sigma.exec"), profile_section("sigma_ppm", print_fn=print_fn):
@@ -369,18 +356,18 @@ def compute_ppm_sigma_pipeline(
             )
         sigma_c_omega = sigma_omega.sigma_c_kij  # None if streamed
 
-        # Step 5: q→0 head injection (analytic, mini-BZ-averaged)
+        # Step 3: q→0 head injection (analytic, mini-BZ-averaged)
         head_gn = _fit_head_correction(
             head_resolver, config=config, meta=meta,
             probe_omega=probe_omega, print_fn=print_fn,
         )
-        sigma_c_omega = _inject_analytic_head(
+        sigma_c_omega, head_sigma_diag_w_kn_ry = _inject_analytic_head(
             sigma_c_omega, head_gn,
             ppm_options=ppm_options, band_slices=band_slices,
             wfn=wfn, sym=sym, meta=meta, print_fn=print_fn,
         )
 
-        # Step 6: diag(Σ_c) at DFT energies (rank-0 only)
+        # Step 4: diag(Σ_c) at DFT energies (replicated across ranks)
         (sigma_c_at_dft_ev,
          sigma_xc_at_dft_ev,
          omega_dft_rel_ev,
@@ -388,10 +375,11 @@ def compute_ppm_sigma_pipeline(
             sigma_c_omega, sigma_omega,
             ppm_options=ppm_options, sig_x=sig_x,
             band_slices=band_slices, wfn=wfn, sym=sym, meta=meta,
+            mesh_xy=mesh_xy,
             print_fn=print_fn,
         )
 
-        # Step 7: write sigma_mnk.h5
+        # Step 5: write sigma_mnk.h5
         sigma_omega_h5_path = _write_sigma_omega_h5(
             sigma_c_omega, sigma_omega,
             ppm_options=ppm_options, sig_x=sig_x, sig_h=sig_h,
@@ -407,4 +395,5 @@ def compute_ppm_sigma_pipeline(
         efermi_dft_ev=efermi_dft_ev,
         sigma_omega_h5_path=sigma_omega_h5_path,
         ppm_options=ppm_options,
+        head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
     )

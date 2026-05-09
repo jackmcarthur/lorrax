@@ -46,7 +46,7 @@ _init_once()
 from jax.experimental import multihost_utils
 from jax.sharding import Mesh
 
-from common.wfnreader import WFNReader
+from file_io import WFNReader
 from common.symmetry_maps import SymMaps
 from common.load_wfns import (
     load_centroids_band_chunked, get_psi_rchunk, _close_phdf5_readers)

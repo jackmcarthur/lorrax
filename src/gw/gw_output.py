@@ -89,6 +89,10 @@ class GWResults:
     # relative to the DFT mid-gap E_F.  None in static modes ⇒ Z=1.
     sigma_c_omega_diag_ev: np.ndarray | None = None
     omega_rel_ev: np.ndarray | None = None
+    # Mid-gap Fermi level computed once in ``ppm_pipeline`` from
+    # ``meta.nelec`` (NOT from the sigma-window band count).  Required
+    # by the eqp.dat writer in PPM modes; ``None`` in static modes.
+    efermi_ev: float | None = None
     sigma_omega_h5_path: str | None = None
     tensors_filename: str | None = None
 
@@ -182,8 +186,6 @@ def write_results(
     kirr_to_kfull: np.ndarray | None = None,
     print_fn=print,
     *,
-    no_degen_averaging: bool = False,
-    degen_avg_tol_ry: float = 1.0e-6,
     eqp_dE_ev: float = 0.5,
 ):
     """Serialize all GW outputs — the unified ``punch('all')`` gateway.
@@ -200,6 +202,10 @@ def write_results(
 
     5. ``eqp_g0w0.dat``    — explicit Re/Im of (H₀ + Σ_xc(E_DFT)) for
        hand-debugging convergence.
+
+    BGW-style degenerate-set averaging is applied **upstream** at the
+    H-build seam in :mod:`gw.gw_jax`, so the writer just serializes
+    whatever ``GWResults`` carries — no re-averaging here.
 
     Parameters
     ----------
@@ -252,18 +258,6 @@ def write_results(
     sig_h_out = r2e * results.sig_h
     sig_x_out = r2e * results.sig_x  # always populated; needed for eqp{0,1}
 
-    # BGW-style degenerate-set averaging: replace the diagonal of each
-    # Σ matrix with the mean over each contiguous degenerate group of
-    # DFT eigenvalues.  Mirrors Sigma/shiftenergy.f90 (lines 86-122).
-    # Off-diagonal entries are preserved.
-    if not no_degen_averaging:
-        from .degen_average import apply_to_matrix_diagonals
-        e_kn_ry = np.asarray(results.E_dft_ry, dtype=np.float64)
-        sx_out    = apply_to_matrix_diagonals(sx_out,    e_kn_ry, degen_avg_tol_ry)
-        corr_out  = apply_to_matrix_diagonals(corr_out,  e_kn_ry, degen_avg_tol_ry)
-        sig_h_out = apply_to_matrix_diagonals(sig_h_out, e_kn_ry, degen_avg_tol_ry)
-        sig_x_out = apply_to_matrix_diagonals(sig_x_out, e_kn_ry, degen_avg_tol_ry)
-
     write_sigma_to_file(
         sx_out,
         sigma_diag_file,
@@ -309,21 +303,23 @@ def write_results(
 
     # E_DFT relative to mid-gap E_F (matches gw_jax convention).  Only
     # needed when there is a finite ω-grid to interpolate against.
+    # ``results.efermi_ev`` is the canonical value computed once upstream
+    # in ``ppm_pipeline._eval_sigma_c_at_dft_energies`` from the actual
+    # number of occupied bands (``meta.nelec``); the writer used to
+    # recompute it from ``band_stop - band_start`` which silently treats
+    # every sigma-window band as occupied → efermi = top-of-window-band.
     sigma_c_omega_diag_ev_irr = None
     e_dft_rel_ev_irr = None
     if results.sigma_c_omega_diag_ev is not None and results.omega_rel_ev is not None:
-        # ``sigma_c_omega_diag_ev`` is (n_omega, nk_full, nb).  Subset.
         sigma_c_omega_diag_ev_irr = np.asarray(
             results.sigma_c_omega_diag_ev, dtype=np.complex128
         )[:, irr_idx, :]
-        n_occ = int(min(e_dft_ev_full.shape[1], results.band_stop - results.band_start))
-        vbm_ev = float(np.max(e_dft_ev_irr[:, :n_occ]))
-        cbm_ev = (
-            float(np.min(e_dft_ev_irr[:, n_occ:]))
-            if n_occ < e_dft_ev_irr.shape[1] else vbm_ev
-        )
-        efermi_ev = 0.5 * (vbm_ev + cbm_ev)
-        e_dft_rel_ev_irr = e_dft_ev_irr - efermi_ev
+        if results.efermi_ev is None:
+            raise ValueError(
+                "write_results: results.efermi_ev required for PPM Z-factor; "
+                "fill GWResults.efermi_ev from ppm_outputs.efermi_dft_ev."
+            )
+        e_dft_rel_ev_irr = e_dft_ev_irr - float(results.efermi_ev)
 
     write_eqp_bgw_in_memory(
         eqp0_path=eqp0_file, eqp1_path=eqp1_file,
