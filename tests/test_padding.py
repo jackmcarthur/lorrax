@@ -272,8 +272,12 @@ def test_compute_L_q_indivisible_logical_n_rmu(mesh_2x2):
     (P('x','y'), P(('x','y')), P('x') alone).  C_q is built at logical
     n_rmu=7, zero-padded to n_rmu_padded=8 so the boundary sharding
     P(None, 'x', 'y') is admissible, then handed to compute_L_q_from_CCT
-    with n_rmu_logical=7.  Output L is at logical extent and reproduces
-    the logical PSD matrix to fp64 noise.
+    with n_rmu_logical=7.  Output L is at PADDED extent (8×8) with the
+    Cholesky factor of G_log in the leading logical block and IDENTITY
+    in the pad block — this is what downstream solve_zeta_from_L_q's
+    in_shardings expect at the n_rmu_padded boundary, while still
+    producing the correct logical solution (Z's pad rows are zero, so
+    the back-solve produces zeta_pad = 0 by construction).
     """
     from common.isdf_fitting import compute_L_q_from_CCT
 
@@ -287,17 +291,29 @@ def test_compute_L_q_indivisible_logical_n_rmu(mesh_2x2):
         jnp.asarray(G_pad), NamedSharding(mesh_2x2, P(None, 'x', 'y')))
 
     L = compute_L_q_from_CCT(G_sharded, mesh_2x2, n_rmu_logical=n_log)
-    assert L.shape == (nq, n_log, n_log), (
-        f"L should be at logical extent, got {L.shape}")
+    assert L.shape == (nq, n_pad, n_pad), (
+        f"L should be at padded extent, got {L.shape}")
 
     L_np = np.asarray(L)
-    # L is lower triangular by Cholesky's contract.
+    # L is lower triangular by Cholesky's contract (padded block of
+    # identity preserves lower-triangular structure).
     np.testing.assert_array_equal(np.triu(L_np, k=1),
-                                  np.zeros((nq, n_log, n_log), dtype=L_np.dtype))
-    # L L^H == G at logical extent.
-    G_hat = np.einsum('qij,qkj->qik', L_np, L_np.conj())
+                                  np.zeros((nq, n_pad, n_pad), dtype=L_np.dtype))
+    # Logical block: L_log L_log^H == G_log to fp64 noise.
+    L_log = L_np[:, :n_log, :n_log]
+    G_hat = np.einsum('qij,qkj->qik', L_log, L_log.conj())
     scale = float(np.max(np.abs(G_log)))
     np.testing.assert_allclose(G_hat, G_log, atol=1e-10 * scale, rtol=1e-10)
+    # Pad block: identity matrix (one per q).
+    pad_block = L_np[:, n_log:, n_log:]
+    expected_pad = np.broadcast_to(
+        np.eye(n_pad - n_log, dtype=L_np.dtype), pad_block.shape)
+    np.testing.assert_array_equal(pad_block, expected_pad)
+    # Off-diagonal pad blocks are zero (block-diagonal structure).
+    np.testing.assert_array_equal(L_np[:, :n_log, n_log:],
+                                  np.zeros((nq, n_log, n_pad - n_log), dtype=L_np.dtype))
+    np.testing.assert_array_equal(L_np[:, n_log:, :n_log],
+                                  np.zeros((nq, n_pad - n_log, n_log), dtype=L_np.dtype))
 
 
 def test_compute_L_q_legacy_divisible_path_unchanged():
@@ -337,11 +353,14 @@ def test_compute_L_q_legacy_divisible_path_unchanged():
 
 
 def test_compute_L_q_indivisible_indefinite_path(mesh_2x2):
-    """vertex_mu_L != 0 path: passthrough with logical-slice when padded.
+    """vertex_mu_L != 0 path: passthrough with logical-slice + identity-pad.
 
     The transverse channel CCT is indefinite; compute_L_q_from_CCT
-    skips the factorisation and returns C_q for downstream LU.  At
-    padded boundary the slice-to-logical step still runs.
+    skips the factorisation and returns the (un-factored) CCT for
+    downstream LU.  At padded boundary the slice extracts the logical
+    block, then ``_embed_logical_in_padded`` re-embeds with identity
+    in the pad block so downstream ``solve_zeta_from_L_q``'s
+    in_shardings see a divisible n_rmu_padded extent.
     """
     from common.isdf_fitting import compute_L_q_from_CCT
 
@@ -359,8 +378,19 @@ def test_compute_L_q_indivisible_indefinite_path(mesh_2x2):
 
     out = compute_L_q_from_CCT(
         H_sharded, mesh_2x2, vertex_mu_L=1, n_rmu_logical=n_log)
-    assert out.shape == (nq, n_log, n_log)
-    np.testing.assert_array_equal(np.asarray(out), H_log)
+    assert out.shape == (nq, n_pad, n_pad)
+    out_np = np.asarray(out)
+    # Logical block matches the input H_log byte-for-byte.
+    np.testing.assert_array_equal(out_np[:, :n_log, :n_log], H_log)
+    # Pad block is identity, off-diagonal pad blocks are zero.
+    pad_block = out_np[:, n_log:, n_log:]
+    expected_pad = np.broadcast_to(
+        np.eye(n_pad - n_log, dtype=out_np.dtype), pad_block.shape)
+    np.testing.assert_array_equal(pad_block, expected_pad)
+    np.testing.assert_array_equal(out_np[:, :n_log, n_log:],
+                                  np.zeros((nq, n_log, n_pad - n_log), dtype=out_np.dtype))
+    np.testing.assert_array_equal(out_np[:, n_log:, :n_log],
+                                  np.zeros((nq, n_pad - n_log, n_log), dtype=out_np.dtype))
 
 
 def test_compute_L_q_logical_exceeds_input_raises(mesh_2x2):

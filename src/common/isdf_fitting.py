@@ -531,6 +531,65 @@ _chol_2d_cache = {}
 # Full zeta fitting pipeline with z-chunk loop and HDF5 output
 # ============================================================================
 
+
+def _embed_logical_in_padded(
+    L_log: jax.Array,
+    *,
+    n_rmu_padded: int,
+    mesh_xy: Mesh,
+    identity_pad: bool = True,
+) -> jax.Array:
+    """Embed a logical-extent factor (L_q or CCT) into a padded square
+    matrix with identity in the pad block.
+
+    Given ``L_log: (nq, n_log, n_log)`` returns
+    ``L_pad: (nq, n_pad, n_pad)`` with the leading logical block equal
+    to ``L_log`` and the pad block equal to ``I_pad`` (when
+    ``identity_pad=True``).  Off-diagonal padded blocks are zero.
+
+    Why the identity pad:  downstream ``solve_zeta_from_L_q`` and the
+    LU/cho_solve helpers have ``in_shardings=P(None,'x','y')``
+    committed at the jit boundary.  At indivisible logical n_rmu
+    (e.g. prime 661 on a 4×4 mesh) those input boundaries reject
+    ``(nq, 661, 661)`` for failing 661 % 4 == 0; we need to hand them
+    a divisible padded shape.  Z_q likewise lives at padded extent
+    with zero pad rows (bilinear in zero-padded ψ).  Padding L with
+    identity in the pad block preserves the logical solve byte-
+    identically:
+
+        L_pad y_pad = Z_pad
+          = [L_log 0; 0 I] [y_log; y'] = [Z_log; 0]
+          ⇒ L_log y_log = Z_log  (logical solve unchanged)
+          ⇒ I y' = 0             (pad rows of y are zero)
+
+    so ``zeta_pad = [zeta_log; 0]``.  This is NOT ridge regularisation
+    on C_q (the user's first-prompt no-go) — chol still runs on the
+    LOGICAL block; identity-pad is a downstream block-diagonal
+    structural choice on the post-factor matrix that lets the
+    boundary-checked back-solver run at the n_rmu_padded extent its
+    ``in_shardings`` declare.  Output sharding is ``P(None, 'x', 'y')``
+    (n_rmu_padded is mesh-divisible by construction).
+    """
+    nq, n_log, n_log2 = L_log.shape
+    if n_log != n_log2:
+        raise ValueError(f"_embed_logical_in_padded expects square L_log; got {L_log.shape}")
+    if n_rmu_padded < n_log:
+        raise ValueError(
+            f"n_rmu_padded={n_rmu_padded} < logical extent {n_log}")
+    pad = n_rmu_padded - n_log
+    if pad == 0:
+        return jax.lax.with_sharding_constraint(
+            L_log, NamedSharding(mesh_xy, P(None, 'x', 'y')))
+    L_pad = jnp.pad(L_log, ((0, 0), (0, pad), (0, pad)))
+    if identity_pad:
+        idx = jnp.arange(n_rmu_padded)
+        pad_diag_mask = (idx >= n_log).astype(L_log.dtype)
+        eye_pad = jnp.diag(pad_diag_mask)
+        L_pad = L_pad + eye_pad[None, :, :]
+    return jax.lax.with_sharding_constraint(
+        L_pad, NamedSharding(mesh_xy, P(None, 'x', 'y')))
+
+
 def compute_L_q_from_CCT(
     C_q: jax.Array,
     mesh_xy: Mesh,
@@ -618,12 +677,19 @@ def compute_L_q_from_CCT(
     # consumes C_q directly via ``jnp.linalg.solve`` (LU + back-solve internally).
     if int(vertex_mu_L) != 0:
         if n_rmu_logical < n_rmu:
-            # Slice to logical and replicate; the LU back-solve runs at
-            # logical extent so the indefinite-system contract matches.
+            # Slice to logical and replicate; LU back-solve runs at
+            # logical extent.  Then embed the logical block into a
+            # PADDED-extent matrix with identity in the pad block so
+            # the downstream solver's committed ``in_shardings`` see
+            # a divisible n_rmu_padded shape.  See
+            # ``_embed_logical_in_padded`` for the math.
             C_q_log = jax.lax.slice(
                 C_q, [0, 0, 0], [nq, n_rmu_logical, n_rmu_logical])
-            return jax.lax.with_sharding_constraint(
+            C_q_log = jax.lax.with_sharding_constraint(
                 C_q_log, NamedSharding(mesh_xy, P(None, None, None)))
+            return _embed_logical_in_padded(
+                C_q_log, n_rmu_padded=n_rmu, mesh_xy=mesh_xy,
+                identity_pad=True)
         L_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
         return jax.lax.with_sharding_constraint(C_q, L_shard)
 
@@ -631,15 +697,20 @@ def compute_L_q_from_CCT(
     # This intentionally bypasses the 2D-blocked kernel — the logical extent
     # may not factor cleanly across the mesh (prime n_rmu_logical = 661 is
     # the motivating case), and the per-q matrix is small enough at
-    # production sizes (≲ 16 MB) that replication is cheap.
+    # production sizes (≲ 16 MB) that replication is cheap.  After the
+    # chol we embed L_log into a PADDED matrix with identity in the
+    # pad block (see ``_embed_logical_in_padded``) so downstream
+    # consumers (``solve_zeta_from_L_q`` etc.) see the n_rmu_padded
+    # extent their committed in_shardings declare.
     if n_rmu_logical < n_rmu:
         C_q_log = jax.lax.slice(
             C_q, [0, 0, 0], [nq, n_rmu_logical, n_rmu_logical])
         C_q_log = jax.lax.with_sharding_constraint(
             C_q_log, NamedSharding(mesh_xy, P(None, None, None)))
         L_q_log = jnp.linalg.cholesky(C_q_log)
-        return jax.lax.with_sharding_constraint(
-            L_q_log, NamedSharding(mesh_xy, P(None, None, None)))
+        return _embed_logical_in_padded(
+            L_q_log, n_rmu_padded=n_rmu, mesh_xy=mesh_xy,
+            identity_pad=True)
 
     Pr = mesh_xy.shape['x']
     Pc = mesh_xy.shape['y']
@@ -983,7 +1054,17 @@ def _make_fit_one_rchunk_kernel(
     from .load_wfns import get_sharded_wfns_rchunk_slice
 
     nk_tot = meta.nk_tot
-    n_rmu = meta.n_rmu
+    # In-memory shapes throughout this kernel use the PADDED μ extent.
+    # ψ enters at padded (Phase 3a's load_centroids contract); all
+    # bilinear consumers / WSCs / inner-jit boundary checks see
+    # n_rmu_padded == ∏ p_a (mesh-divisible by construction).  L_q is
+    # also at padded extent (compute_L_q_from_CCT embeds the
+    # logical-extent factor with identity in the pad block — pad rows
+    # of zeta come out as zero, logical block byte-identical to a
+    # pure-logical solve).  meta.n_rmu (logical) is used only at the
+    # SlabIO valid_shape= seam in fit_zeta_chunked_to_h5 so on-disk
+    # extent stays logical and round-trips across mesh sizes.
+    n_rmu = meta.n_rmu_padded
     nspinor = meta.nspinor
     kgrid = meta.kgrid
 
@@ -1032,28 +1113,28 @@ def _make_fit_one_rchunk_kernel(
         norms_r,
         r_start_dyn,
     ):
-        # ψ inputs arrive at PADDED n_rmu (load_centroids_band_chunked
-        # output, Phase 3a).  Slice the μ axis to LOGICAL n_rmu at
-        # kernel entry so the interior CCT / Z_q / cho_solve operate
-        # on the non-singular logical block.  Pad rows of ψ are zero
-        # (Phase 3a invariant), so dropping them is exact.  The slice
-        # is an intermediate inside this jit; per-microbench-Test-2/6
-        # verified XLA SPMD handles the resulting uneven sharding via
-        # collective-permute, no all-gather inflation.
-        # ψ_l/r_rmuT_X_fit shape: (nk, n_rmu, nb, ns); μ on axis 1.
-        if psi_l_rmuT_X_fit.shape[1] != n_rmu:
-            psi_l_rmuT_X_fit = jax.lax.slice(
-                psi_l_rmuT_X_fit,
-                (0, 0, 0, 0),
-                (psi_l_rmuT_X_fit.shape[0], n_rmu,
-                 psi_l_rmuT_X_fit.shape[2], psi_l_rmuT_X_fit.shape[3]),
-            )
-            psi_r_rmuT_X_fit = jax.lax.slice(
-                psi_r_rmuT_X_fit,
-                (0, 0, 0, 0),
-                (psi_r_rmuT_X_fit.shape[0], n_rmu,
-                 psi_r_rmuT_X_fit.shape[2], psi_r_rmuT_X_fit.shape[3]),
-            )
+        # ψ enters at PADDED n_rmu (load_centroids_band_chunked
+        # output, Phase 3a).  All in-memory arrays here — P_l, P_r,
+        # ψ_L_bc, ψ_R_bc, Z_q — operate at PADDED extent so the inner
+        # ``accumulate_pair_density_*`` / ``compute_ZCT`` /
+        # ``solve_zeta_from_L_q`` jits' committed
+        # ``in_shardings=P(None, 'x', 'y')`` boundaries see divisible
+        # shapes (n_rmu_padded ≡ ∏ p_a is divisible by every relevant
+        # mesh axis).  L_q comes in at the same PADDED extent —
+        # ``compute_L_q_from_CCT`` runs the chol on the LOGICAL block
+        # and embeds the factor into a padded matrix with identity in
+        # the pad block (see ``_embed_logical_in_padded``); the
+        # back-solve then produces zeta with zero in pad rows, logical
+        # block byte-identical to a pure-logical solve.  zeta is
+        # returned at padded extent; the SlabIO write uses
+        # ``valid_shape=meta.n_rmu`` so on-disk extent stays logical.
+        #
+        # An earlier attempt sliced ψ to logical at this entry; that
+        # path failed because nested ``@jax.jit(in_shardings=...)``
+        # boundaries (accumulate_pair_density_*) enforce divisibility
+        # on their input arrays even when called from inside an outer
+        # jit — distinct from ``with_sharding_constraint`` which
+        # tolerates uneven shapes inside a jit.
 
         # --- 1. Pair-density accumulators (one r-chunk wide) ---
         def _zero_P():
@@ -1583,17 +1664,21 @@ def fit_zeta_chunked_to_h5(
                 if item is None:
                     break
                 zeta_data, r_start, r_end, chunk_id, q_start, q_end = item
-                # zeta_data is already a host numpy array of shape
-                # (q_end-q_start, n_rmu, r_end-r_start) in the order
-                # the shard_map produced.  Dataset on disk is
-                # (nq, n_rtot, n_rmu) — swap the last two axes at
-                # write time.  h5py is happy with a non-contiguous
-                # source (stride-swap view); it linearizes internally.
+                # zeta_data is a host numpy array of shape
+                # (q_end-q_start, n_rmu_padded, r_end-r_start) in the
+                # order the shard_map produced.  Dataset on disk is
+                # (nq, n_rtot, n_rmu_logical) — swap the last two
+                # axes at write time AND slice the μ axis to logical
+                # extent so on-disk extent stays logical (Phase 3a/3b
+                # contract: pad rows of zeta are zero; on-disk
+                # round-trips across mesh sizes).
                 with h5py.File(output_file, 'a') as f:
                     for i, q_flat in enumerate(range(q_start, q_end)):
-                        # zeta_data[i] is (n_rmu, r_chunk) → transpose
-                        # to (r_chunk, n_rmu) to match file layout.
-                        f['zeta_q'][q_flat, r_start:r_end, :] = zeta_data[i].T
+                        # zeta_data[i] is (n_rmu_padded, r_chunk) →
+                        # transpose to (r_chunk, n_rmu_padded) → slice
+                        # to logical (n_rmu) on the last axis.
+                        f['zeta_q'][q_flat, r_start:r_end, :] = (
+                            zeta_data[i].T[:, :n_rmu])
                 write_queue.task_done()
         except Exception as e:
             write_error[0] = e
@@ -1704,11 +1789,21 @@ def fit_zeta_chunked_to_h5(
                     # strips (old (nq, n_rmu, n_rtot) layout) to 1000
                     # fat contiguous strips (one per q, full n_rmu +
                     # rank's n_rchunk/4 rows).
+                    # zeta_chunk is at PADDED μ extent
+                    # (n_rmu_padded); the on-disk dataset was created
+                    # at LOGICAL (n_rmu).  ``valid_shape=(...,n_rmu)``
+                    # clips the trailing μ pad slots on write, so
+                    # on-disk extent stays logical for cross-mesh
+                    # round-trip.  Pad rows are zero (identity-pad of
+                    # L_q ⇒ zero pad rows of zeta by back-solve).
                     zeta_chunk_write = zeta_chunk.transpose(0, 2, 1)
+                    actual_q = int(zeta_chunk_write.shape[0])
                     zeta_io.write_slab(
                         'zeta_q', zeta_chunk_write,
                         offset=(0, r_start, 0),
-                        global_shape=(nq, n_rtot, n_rmu))
+                        global_shape=(nq, n_rtot, n_rmu),
+                        valid_shape=(actual_q, actual_n_rchunk, n_rmu),
+                    )
                 else:
                     # Allgather path: gather once per q-chunk on every rank,
                     # queue the per-q hyperslab writes on rank 0's
