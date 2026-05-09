@@ -718,15 +718,16 @@ def solve_zeta_from_L_q(
     (``L y = Z`` then ``L^H ζ = y``).  This is the historical fast
     path — bit-identical to the previous implementation.
 
-    For ``vertex_mu_L != 0`` ``L_q`` is the *unfactored* CCT matrix
-    (transverse-channel γ̃^i CCT is Hermitian but indefinite, so
-    Cholesky is invalid).  The inner solve dispatches to
-    ``jnp.linalg.solve`` which performs an LU decomposition with
-    partial pivoting and a back-solve in one shot.  Per-q matrices are
-    small enough that explicit ``lu_factor`` + ``lu_solve`` reuse
-    buys nothing — both batched ``jnp.linalg.solve`` and the
-    triangular path see the same shard_map'd, q-chunked, batched-vmap
-    structure with identical input/output shardings.
+    For ``vertex_mu_L != 0`` ``L_q`` is the *unfactored* CCT^μ matrix
+    (transverse-channel γ̃^i CCT is Hermitian but **indefinite and
+    rank-deficient** — TRS in non-magnetic ground states gives near-
+    null transverse-current modes that a naïve LU through CCT^μ
+    amplifies by 10^4–10^6, blowing σ^B up to nonsense on MoS2/CrI3).
+    The correct solver is the **Hermitian eigendecomposition
+    pseudoinverse**:  CCT^μ = U Λ U^H (Λ real, can be negative); we
+    invert only modes with |λ| > rcond·max|λ| and drop the rest.  This
+    is the unique min-norm LSQ solution and handles both indefiniteness
+    and the null-mode rank deficiency in one step.
 
     Uses q-chunked all-gather strategy: gather B_q matrices at a time,
     then solve all B_q systems in parallel using vmap.
@@ -763,22 +764,41 @@ def solve_zeta_from_L_q(
     q_batch = min(q_chunk_size, nq)
     nq_padded = ((nq + q_batch - 1) // q_batch) * q_batch
 
-    use_lu = (int(vertex_mu_L) != 0)
+    use_pinv = (int(vertex_mu_L) != 0)
+    # rcond for null-mode cutoff: drop eigenmodes with |λ| < rcond·max|λ|.
+    # 1e-10 is well below the conditioning floor of CCT^μ for systems
+    # we care about (charge channel has ~10^4 dynamic range; transverse
+    # null modes are ~10^-14 below the bulk).  Tunable via env if needed.
+    PINV_RCOND = 1e-10
+
+    def _hermitian_pinv_solve_single(L: jax.Array, Z: jax.Array) -> jax.Array:
+        """Solve L · ζ = Z where L is Hermitian indefinite.
+
+        L = U Λ U^H (eigh; Λ real); drop |λ| < rcond·max|λ| modes,
+        invert the rest.  Equivalent to the SVD pseudoinverse for
+        Hermitian matrices but cheaper (eigh on Hermitian is half
+        the work of SVD on general).
+        """
+        lam, U = jnp.linalg.eigh(L)                      # λ real, can be ±
+        lam_max = jnp.max(jnp.abs(lam))
+        keep = jnp.abs(lam) > PINV_RCOND * lam_max
+        lam_inv = jnp.where(keep, 1.0 / jnp.where(keep, lam, 1.0), 0.0)
+        return U @ (lam_inv[..., None] * (U.conj().T @ Z))
 
     # Cache key for solve function (includes q_chunk_size and padded size).
-    # ``use_lu`` partitions the cache so the Cholesky and LU compiles
+    # ``use_pinv`` partitions the cache so the Cholesky and pinv compiles
     # don't collide on the same key.
     cache_key = ('solve_from_L', id(mesh_xy), nq, n_rmu,
-                 n_zchunk_padded, q_chunk_size, bool(use_lu))
+                 n_zchunk_padded, q_chunk_size, bool(use_pinv))
 
     if cache_key not in _solve_cache:
         @partial(shard_map, mesh=mesh_xy,
                  in_specs=(P(None, None), P(None, ('x', 'y'))),
                  out_specs=P(None, ('x', 'y')))
         def _sharded_cho_solve(L: jax.Array, Z_cols: jax.Array) -> jax.Array:
-            if use_lu:
-                # Indefinite CCT: jnp.linalg.solve does LU + back-solve.
-                return jnp.linalg.solve(L, Z_cols)
+            if use_pinv:
+                # Indefinite CCT^μ: Hermitian eigendecomposition pseudoinverse.
+                return _hermitian_pinv_solve_single(L, Z_cols)
             y = jax.scipy.linalg.solve_triangular(L, Z_cols, lower=True)
             zeta = jax.scipy.linalg.solve_triangular(L.conj().T, y, lower=False)
             return zeta
@@ -789,10 +809,11 @@ def solve_zeta_from_L_q(
                  out_specs=P(None, None, ('x', 'y')))
         def _sharded_cho_solve_batch(L_batch: jax.Array, Z_batch: jax.Array) -> jax.Array:
             """Solve (B_q, n_rmu, n_rmu) @ (B_q, n_rmu, n_cols) -> (B_q, n_rmu, n_cols)"""
-            if use_lu:
-                # jnp.linalg.solve is natively batched on the leading axis;
-                # JAX dispatches one LU factorization per q internally.
-                return jnp.linalg.solve(L_batch, Z_batch)
+            if use_pinv:
+                # eigh is natively batched on the leading axis; one
+                # eigendecomposition per q internally.  Same vmap structure
+                # as the Cholesky path so reshard plans are identical.
+                return jax.vmap(_hermitian_pinv_solve_single)(L_batch, Z_batch)
             def solve_single(L, Z):
                 y = jax.scipy.linalg.solve_triangular(L, Z, lower=True)
                 return jax.scipy.linalg.solve_triangular(L.conj().T, y, lower=False)
@@ -1099,14 +1120,12 @@ def _make_fit_one_rchunk_kernel(
         # the load_wfns separate-jit pattern.  Same pattern as lorrax_B
         # commit c0307a0.
         Z_q = compute_ZCT_from_left_right_zchunk(P_l, P_r, kgrid, mesh_xy)
-        # L_q is always the charge-channel Cholesky factor (see step 3
-        # of ``fit_zeta_chunked_to_h5``).  γ̃^μ has already been folded
-        # into Z_q via the per-chunk ``accumulate_pair_density_lorentz``
-        # above.  Hardcode vertex_mu_L=0 here so the back-solve uses
-        # the Cholesky path on the (well-conditioned) charge L_q
-        # regardless of which Lorentz channel we're fitting.
+        # L_q for μ_L=0 is the Cholesky factor (Cholesky back-solve);
+        # for μ_L≠0 it's the raw indefinite CCT (SVD-pinv back-solve).
+        # ``solve_zeta_from_L_q`` dispatches via the same vertex_mu_L
+        # flag we passed in.
         zeta = solve_zeta_from_L_q(
-            L_q, Z_q, mesh_xy, q_chunk_size, vertex_mu_L=0)
+            L_q, Z_q, mesh_xy, q_chunk_size, vertex_mu_L=vertex_mu_L)
         return zeta
 
     return _kernel
@@ -1306,9 +1325,8 @@ def fit_zeta_chunked_to_h5(
     # ``compute_L_q_from_CCT`` slices internally to logical via the
     # ``n_rmu_logical=`` kwarg (Phase 3b-Cholesky) so the factorization
     # sees a non-singular matrix at its true extent.  zeta_q on disk
-    # has logical extent — fit_one_rchunk slices ψ to logical at jit
-    # entry and returns ζ at logical extent, matching the dataset
-    # created at ``shape=(nq, n_rtot, n_rmu)`` below.
+    # has logical extent (SlabIO ``valid_shape=`` clips the padded
+    # output before write).
     n_rmu = meta.n_rmu                      # logical
     n_rmu_padded = meta.n_rmu_padded        # padded
     n_rtot = meta.n_rtot
@@ -1375,40 +1393,39 @@ def fit_zeta_chunked_to_h5(
                   f"{n_zero} zero-weight (skipped)")
 
     # ========== STEP 2: Compute CCT (C_q) from left/right pair densities ==========
-    # The CCT/L_q is the *interpolation metric* — it tells the back-solve
-    # how the centroid basis spans the centroid-pair-density space.  This
-    # metric must be the SAME across all 4 Lorentz channels, otherwise ζ^μ
-    # for transverse channels is fit through a different (indefinite,
-    # ill-conditioned) basis and acquires huge magnitudes that blow up
-    # V^{i,j} downstream by 10^4–10^6 (see report §3 of
-    # ``cri3_sigma_blowup_2026-05-05`` and the agent-B reference impl
-    # ``v_q_lorentz.py`` lines 1001–1005).
-    #
-    # Therefore C_q (and L_q from it) is ALWAYS built from the charge
-    # (γ̃^0 = I_4, spin-traced) pair density, regardless of vertex_mu_L.
-    # The γ̃^{μ_L} vertex enters only the Z_q construction in step 5
-    # below, via ``accumulate_pair_density_lorentz`` inside the per-chunk
-    # kernel.
-    # Force-eager-import gamma_matrices so the module's top-level
+    # γ̃^0 = I_4 → vertex_mu_L=0 is the standard spin-traced path.  For
+    # vertex_mu_L ∈ {1,2,3} the γ̃^μ vertex is folded into both P_l and
+    # P_r so C_q is the proper per-channel interpolation metric for the
+    # Lorentz pair density.  CCT^μ for transverse channels is Hermitian
+    # indefinite and rank-deficient: TRS in non-magnetic ground states
+    # gives near-null transverse-current modes that would be amplified
+    # by 10^4–10^6 if we naively LU-solved through them (the original
+    # MoS2 σ^B blowup).  The robust solver in :func:`solve_zeta_from_L_q`
+    # uses an SVD pseudoinverse with rcond cutoff to drop those null
+    # modes instead of inverting through them — the unique min-norm LSQ
+    # solution.
+    # Force-eager-import gamma_matrices so its module-level
     # ``gammas_sparse = [_to_sparse(g) for g in gammas]`` (which calls
-    # ``jnp.nonzero``) runs OUTSIDE any JIT trace.  Without this, the
-    # first reference comes from inside the per-chunk kernel jit and
-    # triggers a ConcretizationTypeError because jnp.nonzero needs
-    # concrete shape.  Cheap (4-element list construction) and runs
-    # only on first call.
+    # ``jnp.nonzero``) runs OUTSIDE any JIT trace; otherwise the first
+    # reference comes from inside the per-chunk kernel jit and trips
+    # a ConcretizationTypeError.
     if int(vertex_mu_L) != 0:
         from . import gamma_matrices as _gm  # noqa: F401  (warm import)
 
     with timing.section("zeta_fit.CCT"):
-        print(f"  Computing pair densities P_l, P_r (spin_traced) for L_q metric")
         # ψ inputs at PADDED n_rmu (Phase 3a's load_centroids contract).
         # Pair density / CCT operate at padded; the trailing μ pad rows
-        # of ψ are zero (Phase 3a invariant), so the bilinear einsum
-        # zero-pads the corresponding rows of P_l/P_r and rows+cols of
-        # C_q.  Cholesky doesn't see those zeros — the n_rmu_logical=
-        # kwarg below slices to the leading logical block.
-        P_l_k = compute_pair_density_spin_traced(psi_l_rmuT_X_fit, psi_l_rmu_Y_fit, mesh_xy)
-        P_r_k = compute_pair_density_spin_traced(psi_r_rmuT_X_fit, psi_r_rmu_Y_fit, mesh_xy)
+        # of ψ are zero so the bilinear einsum zero-pads the corresponding
+        # rows of P_l/P_r and rows+cols of C_q — the back-solve sees only
+        # logical extent (see step 3).
+        if vertex_mu_L == 0:
+            print(f"  Computing pair densities P_l, P_r (spin_traced)")
+            P_l_k = compute_pair_density_spin_traced(psi_l_rmuT_X_fit, psi_l_rmu_Y_fit, mesh_xy)
+            P_r_k = compute_pair_density_spin_traced(psi_r_rmuT_X_fit, psi_r_rmu_Y_fit, mesh_xy)
+        else:
+            print(f"  Computing pair densities P_l, P_r (γ̃^{vertex_mu_L} vertex)")
+            P_l_k = compute_pair_density_lorentz(psi_l_rmuT_X_fit, psi_l_rmu_Y_fit, vertex_mu_L, mesh_xy)
+            P_r_k = compute_pair_density_lorentz(psi_r_rmuT_X_fit, psi_r_rmu_Y_fit, vertex_mu_L, mesh_xy)
         P_l_k.block_until_ready()
         P_r_k.block_until_ready()
         C_q = compute_CCT_from_left_right(P_l_k, P_r_k, kgrid, mesh_xy)
@@ -1427,25 +1444,19 @@ def fit_zeta_chunked_to_h5(
         C_q_flat = jax.lax.with_sharding_constraint(C_q_flat, flat_shard)
 
     # ========== STEP 3: Compute L_q from CCT ==========
-    # Always Cholesky — the CCT here is built from the charge channel
-    # (PSD), so this works for every vertex_mu_L.  The γ̃ vertex enters
-    # only the per-chunk Z_q construction; ζ^μ = L_q^{-1} Z_q^μ at solve
-    # time uses the same (charge) L_q across channels.
-    #
-    # ``n_rmu_logical=n_rmu`` triggers the slice-then-replicate-then-
-    # dense-Cholesky path inside compute_L_q_from_CCT (Phase 3b-Chol).
-    # When n_rmu == n_rmu_padded (mesh-divisible centroid count) this
-    # is a no-op slice and falls through to the legacy 2D-blocked
-    # path; when n_rmu < n_rmu_padded (e.g. n_rmu=661 prime padded to
-    # 672) it slices to the logical block — which is non-singular by
-    # construction — and runs a dense replicated Cholesky.  Returns
-    # L_q at LOGICAL extent (replicated when padded path taken,
-    # P(None,'x','y') otherwise).
+    # μ_L=0 (charge): C_q is PSD → 2D-blocked Cholesky factor L_q.
+    # μ_L=1,2,3 (transverse): C_q is Hermitian indefinite — skip the
+    # factorization and pass the slice through; the per-chunk
+    # solve_zeta_from_L_q dispatches to an SVD pseudoinverse with
+    # rcond cutoff (drops null transverse-current modes that would
+    # otherwise be amplified by 10^4–10^6).
     with timing.section("zeta_fit.cholesky"):
-        print(f"  Computing L_q = chol(C_q)  (charge-channel metric, "
-              f"reused for all vertex_mu_L)")
+        if int(vertex_mu_L) == 0:
+            print(f"  Computing L_q = chol(C_q)  [PSD, charge channel]")
+        else:
+            print(f"  Pass through C_q  [γ̃^{vertex_mu_L} indefinite — SVD pinv solve]")
         L_q = compute_L_q_from_CCT(
-            C_q_flat, mesh_xy, vertex_mu_L=0, n_rmu_logical=n_rmu)
+            C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L), n_rmu_logical=n_rmu)
         L_q.block_until_ready()
         print(f"  L_q: {L_q.shape}")
 
