@@ -898,6 +898,34 @@ def compute_V_q_tile(
             f"compute_V_q_tile: same_zeta=True requires n_rmu_L == n_rmu_R, "
             f"got {n_rmu_L} vs {n_rmu_R}.")
 
+    # n_rmu_L / n_rmu_R as passed by callers are LOGICAL centroid counts
+    # (the on-disk extent of zeta_q).  We pad each to the mesh device-
+    # product (``p_x · p_y``) so every interior sharding — single-axis
+    # P(None, 'x', None), product P(None, ('x','y'), None), the V output
+    # P(None, 'x', 'y'), the disk read P(None, None, ('x','y')) — divides
+    # cleanly without any in-jit uneven-WSC fallbacks.  Trailing pad
+    # rows/cols are zero-filled (SlabIO reads ``valid_shape=`` zero-fill;
+    # internal allocs start at jnp.zeros).  Output V_acc is returned at
+    # PADDED extent; callers carry the logical sizes alongside and pass
+    # ``valid_shape=(..., n_rmu_L_logical, n_rmu_R_logical)`` to SlabIO
+    # writes so on-disk extent stays logical and round-trips across
+    # process counts.  Mirrors the band-axis pattern (Meta.b_id_4_user
+    # vs Meta.b_id_4) at common/meta.py:99-100 + load_wfns.py:952-959.
+    _proc_devices = p_x * p_y
+    n_rmu_L_logical = int(n_rmu_L)
+    n_rmu_R_logical = int(n_rmu_R)
+    def _round_up_to_mesh(n: int) -> int:
+        rem = n % _proc_devices
+        return n + ((_proc_devices - rem) if rem else 0)
+    n_rmu_L = _round_up_to_mesh(n_rmu_L_logical)
+    n_rmu_R = _round_up_to_mesh(n_rmu_R_logical)
+    if (n_rmu_L != n_rmu_L_logical or n_rmu_R != n_rmu_R_logical) \
+            and verbose and jax.process_index() == 0:
+        print(f"  V_q tile: padding μ for sharding — "
+              f"n_rmu_L={n_rmu_L_logical}→{n_rmu_L}, "
+              f"n_rmu_R={n_rmu_R_logical}→{n_rmu_R} "
+              f"(mesh={p_x}×{p_y}={_proc_devices}-divisible)")
+
     if sphere_idx is not None:
         n_G_sph = int(np.asarray(sphere_idx).shape[0])
     else:
@@ -1055,9 +1083,18 @@ def compute_V_q_tile(
             for mu_i, (mu_lo, mu_size) in enumerate(mu_blocks):
                 if _time_stages:
                     _t0 = _time.perf_counter()
+                # ``valid_shape`` clips to the LOGICAL on-disk extent.
+                # For interior μ-blocks fully within the logical range
+                # this is mu_size (no clip).  For the last block when
+                # padding ran past the logical extent, the residual is
+                # max(0, n_rmu_L_logical - mu_lo); SlabIO reads the
+                # logical prefix and zero-fills the padded tail.
+                mu_valid = max(0, min(int(mu_size),
+                                      n_rmu_L_logical - int(mu_lo)))
                 zeta_mu = zeta_L_io.read_slab(
                     'zeta_q',
                     shape=(actual, n_rtot, mu_size),
+                    valid_shape=(actual, n_rtot, mu_valid),
                     dtype=np.complex128,
                     offset=(q_flat0, 0, mu_lo),
                     mesh=mesh_xy, partition_spec=_read_spec)
@@ -1092,9 +1129,12 @@ def compute_V_q_tile(
                         # Distinct ζ_R — second read + second FFT.
                         if _time_stages:
                             _t0 = _time.perf_counter()
+                        nu_valid = max(0, min(int(nu_size),
+                                              n_rmu_R_logical - int(nu_lo)))
                         zeta_nu = zeta_R_io.read_slab(
                             'zeta_q',
                             shape=(actual, n_rtot, nu_size),
+                            valid_shape=(actual, n_rtot, nu_valid),
                             dtype=np.complex128,
                             offset=(q_flat0, 0, nu_lo),
                             mesh=mesh_xy, partition_spec=_read_spec)

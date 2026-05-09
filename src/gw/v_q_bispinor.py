@@ -367,28 +367,37 @@ def compute_V_q_bispinor_to_h5(
             )
 
             # === Stream this tile to disk ====================================
-            # The dataset is written at the kernel's actual μ × ν shape.
-            # When n_rmu_T isn't mesh-divisible (e.g. 668 on 4×4 mesh,
-            # n_rmu_T axis sharded by ('x','y') product = 16), the V_q
-            # tile kernel itself currently requires divisibility — that
-            # padding is the next agent's job (see the padding-refactor
-            # branch).  For now this code assumes n_rmu_T pre-padded to
-            # mesh-divisible by the caller / a truncation hack on the
-            # centroid file.
+            # ``compute_V_q_tile`` returns V_acc at the PADDED μ extent
+            # (rounded to mesh_xy.shape product) so all interior
+            # shardings divide cleanly.  We write only the LOGICAL
+            # prefix to disk via SlabIO ``valid_shape`` — the file's
+            # on-disk extent is always logical, so it round-trips
+            # across any process count regardless of how the writing
+            # job padded internally.  Mirror of the band-axis seam at
+            # ``common/meta.py:99`` (b_id_4 padded vs b_id_4_user
+            # logical for output writers).
             name = tile_dataset_name(mu_L, nu_L)
-            v_shape = tuple(int(s) for s in V_acc.shape)
+            v_padded_shape = tuple(int(s) for s in V_acc.shape)
+            v_logical_shape = (int(v_padded_shape[0]), n_rmu_L, n_rmu_R)
             with SlabIO(output_h5_path, mode='a', mesh=mesh_xy,
                         backend=backend, use_ffi_io=use_ffi_io) as tile_io:
                 tile_io.create_dataset(
-                    name, shape=v_shape, dtype=V_acc.dtype)
-                tile_io.write_slab(name, V_acc, global_shape=v_shape)
+                    name, shape=v_logical_shape, dtype=V_acc.dtype)
+                tile_io.write_slab(
+                    name, V_acc,
+                    global_shape=v_logical_shape,
+                    valid_shape=v_logical_shape)
 
                 if wants_g0 and g0_acc is not None:
-                    g0_shape = tuple(int(s) for s in g0_acc.shape)
+                    g0_padded_shape = tuple(int(s) for s in g0_acc.shape)
+                    g0_logical_shape = (int(g0_padded_shape[0]), n_rmu_L)
                     tile_io.create_dataset(
-                        f"{name}_g0", shape=g0_shape, dtype=g0_acc.dtype)
+                        f"{name}_g0", shape=g0_logical_shape,
+                        dtype=g0_acc.dtype)
                     tile_io.write_slab(
-                        f"{name}_g0", g0_acc, global_shape=g0_shape)
+                        f"{name}_g0", g0_acc,
+                        global_shape=g0_logical_shape,
+                        valid_shape=g0_logical_shape)
 
             # Free device memory before the next tile.  The kernel cache
             # in v_q_tile holds the compiled artifact for this shape; it
