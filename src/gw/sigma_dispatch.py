@@ -91,7 +91,7 @@ def compute_sigma_xc(
     *,
     wfns,
     V_q: jax.Array,
-    W_q: jax.Array,
+    W_by_role: dict,
     e_qp_ev: np.ndarray | None,
     static_head_terms,
     head_resolver,
@@ -107,17 +107,32 @@ def compute_sigma_xc(
     print_fn: Callable = print,
 ) -> SigmaResult:
     """One-line entry point: build the full Σ_xc + V_H given the current
-    wfn bundle and screened W.
+    wfn bundle and screened W's.
 
     Parameters
     ----------
     mode
-        Compute-mode pivot.  Determines which Σ kernel chain runs.
+        Compute-mode pivot.  Determines which Σ kernel chain runs and
+        which roles in ``W_by_role`` are consulted.
     wfns
         ``Wavefunctions`` bundle in the *current* QP basis (or DFT basis
         for the iter-0 / one-shot call).
-    V_q, W_q
-        Bare and screened Coulomb in flat-q ISDF basis.
+    V_q
+        Bare Coulomb in flat-q ISDF basis.
+    W_by_role
+        Screened-Coulomb dict produced by
+        :func:`gw.screening.compute_screening`, keyed by symbolic role.
+        Conventional roles consumed here:
+
+        * ``"static"`` — W(ω = 0).  Used by COHSEX (Σ_SX, Σ_COH) and as
+          the ω-zero anchor for the PPM two-point fit.
+        * ``"probe"``  — W at the GN/HL probe frequency.  Used by PPM
+          for the second fit point.
+
+        ``X_ONLY`` ignores ``W_by_role`` entirely.  Adding a new mode
+        means picking the role labels it needs in
+        :func:`gw.screening.screening_requests_for` and reading them
+        here — no plumbing changes elsewhere.
     e_qp_ev
         Per-(k, n) QP energies (eV) used by the PPM QSGW build to evaluate
         Σ_c(E_m, E_n).  Required for PPM modes; ignored for static.
@@ -140,10 +155,14 @@ def compute_sigma_xc(
     from .ppm_pipeline import compute_ppm_sigma_pipeline
     from .qsgw_utils import build_qsgw_sigma_xc
 
-    # All static channels first — they're cheap and produce sig_x/V_H
-    # which both static and PPM need.
+    # Static channels first — sig_h (V_H) and sig_x (bare exchange) are
+    # used by every mode (PPM modes consume them in the QSGW build);
+    # sig_sx / sig_coh use W(ω=0) and only matter for static modes.
+    # X_ONLY: no static W needed → fall back to the bare V proxy so the
+    # cohsex kernel still runs (sig_sx / sig_coh are discarded).
+    W_static = W_by_role.get("static", V_q)
     cohsex = compute_cohsex_sigma(
-        wfns, V_q, W_q, meta, mesh_xy,
+        wfns, V_q, W_static, meta, mesh_xy,
         Gij=None,                                # default DFT-occ projector
         do_screened=config.do_screened,
         static_head_terms=static_head_terms,
@@ -171,15 +190,21 @@ def compute_sigma_xc(
             sigma_coh_kij_ry=sig_coh,
         )
 
-    # Dynamic modes: GN_PPM / HL_PPM.
+    # Dynamic PPM modes: need W_static + W_probe.
     if e_qp_ev is None:
         raise ValueError(
             f"compute_sigma_xc: PPM mode {mode!r} requires e_qp_ev "
             "(QP energies for the QSGW Σ_c evaluation).")
+    if "probe" not in W_by_role:
+        raise KeyError(
+            f"compute_sigma_xc: PPM mode {mode!r} requires "
+            f"W_by_role['probe'] (set by screening_requests_for).")
 
     ppm_outputs = compute_ppm_sigma_pipeline(
         wfns=wfns,
-        V_q=V_q, W_q=W_q, sig_x=sig_x, sig_h=sig_h,
+        V_q=V_q,
+        W_static_q=W_static, W_probe_q=W_by_role["probe"],
+        sig_x=sig_x, sig_h=sig_h,
         quad=quad, e_ref=e_ref,
         config=config, meta=meta, mesh_xy=mesh_xy,
         head_resolver=head_resolver,

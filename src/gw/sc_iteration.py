@@ -259,8 +259,17 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     Pure function — no side effects on ``inputs.wfns_dft``.  All
     derived quantities (E_qp, U_qp, efermi) are recomputed each call;
     the only carried state is ``H_qp_dft`` on the active subspace.
+
+    Screening is mode-orthogonal: each iteration asks the configured Σ
+    scheme which W's it needs (via :func:`gw.screening.screening_requests_for`),
+    evaluates them in one pass (:func:`gw.screening.compute_screening`),
+    and hands the resulting ``{role → W_q}`` dict to
+    :func:`gw.sigma_dispatch.compute_sigma_xc`.  No ``compute_chi0``
+    call lives here directly — adding a new Σ scheme that wants extra
+    W frequencies is purely a screening_requests_for + compute_sigma_xc
+    change.
     """
-    from .w_isdf import compute_chi0, solve_w
+    from .screening import compute_screening, screening_requests_for
 
     n_occ = int(inputs.meta.nelec)
     E_qp_ry, U_qp, efermi_ry = _diagonalize_and_get_efermi(
@@ -276,22 +285,21 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         active_slice=inputs.band_slices.sigma,
     )
 
-    # Re-solve W using the rotated wfns (cached jits dispatch with new
-    # values; XLA cache hit on iteration ≥ 2).
-    if inputs.config.do_screened:
-        chi0_q = compute_chi0(
-            wfns_qp, inputs.quad, inputs.meta, inputs.mesh_xy,
-            energy_reference=inputs.e_ref)
-        W_q = solve_w(inputs.V_q, chi0_q, inputs.meta, inputs.mesh_xy,
-                      solver=inputs.config.backend.screening_solver)
-        del chi0_q
-    else:
-        W_q = inputs.V_q
+    # Per-mode screening: solve W at every frequency the Σ scheme needs.
+    # XLA cache hits on iteration ≥ 2 (same shapes, new values).
+    requests = screening_requests_for(
+        inputs.config.compute_mode, inputs.config)
+    W_by_role = compute_screening(
+        wfns_qp, inputs.V_q, requests,
+        quad=inputs.quad, e_ref=inputs.e_ref,
+        config=inputs.config, meta=inputs.meta, mesh_xy=inputs.mesh_xy,
+        print_fn=inputs.print_fn,
+    )
 
     # Σ_xc dispatch — mode-orthogonal.
     sigma_result = compute_sigma_xc(
         inputs.config.compute_mode,
-        wfns=wfns_qp, V_q=inputs.V_q, W_q=W_q,
+        wfns=wfns_qp, V_q=inputs.V_q, W_by_role=W_by_role,
         e_qp_ev=np.asarray(E_qp_ry) * RYD_TO_EV,
         static_head_terms=inputs.static_head_terms,
         head_resolver=inputs.head_resolver,

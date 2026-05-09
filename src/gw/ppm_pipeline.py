@@ -38,12 +38,6 @@ from .ppm_sigma import (
     fit_ppm,
     precompile_sigma,
 )
-from .w_isdf import (
-    build_imag_quadrature,
-    build_real_quadrature,
-    compute_chi0,
-    solve_w,
-)
 
 
 @dataclass(frozen=True)
@@ -61,24 +55,6 @@ class PPMOutputs:
     # separately for diagnostic printing (the head is band-diagonal so the
     # decomposition is lossless).  ``None`` when no head was injected.
     head_sigma_diag_w_kn_ry: np.ndarray | None = None
-
-
-def _build_probe_quadrature(quad, config, *, print_fn):
-    """Return (probe_omega, quad_probe) for the GN (imag) or HL (real) path."""
-    is_hl = config.compute_mode is ComputeMode.HL_PPM
-    if is_hl:
-        probe_omega = complex(float(config.ppm.omega_p), 0.0)
-        quad_probe = build_real_quadrature(
-            quad, float(config.ppm.omega_p),
-            config.minimax_config, print_fn=print_fn,
-        )
-    else:
-        probe_omega = 1j * float(config.ppm.omega_p)
-        quad_probe = build_imag_quadrature(
-            quad, config.ppm.omega_p,
-            config.minimax_config, print_fn=print_fn,
-        )
-    return probe_omega, quad_probe
 
 
 def _fit_head_correction(
@@ -306,7 +282,8 @@ def compute_ppm_sigma_pipeline(
     *,
     wfns,
     V_q: jax.Array,
-    W_q: jax.Array,
+    W_static_q: jax.Array,
+    W_probe_q: jax.Array,
     sig_x: jax.Array,
     sig_h: jax.Array,
     quad,
@@ -321,17 +298,23 @@ def compute_ppm_sigma_pipeline(
     input_dir: str,
     print_fn=print,
 ) -> PPMOutputs:
-    """Run the GN/HL-PPM dynamic Σ^c(ω) pipeline end-to-end.
+    """Run the GN/HL-PPM dynamic Σ^c(ω) pipeline given pre-computed W's.
+
+    Both ``W_static_q`` (W at ω=0) and ``W_probe_q`` (W at the GN-PPM
+    iω_p / HL-PPM Ω) must be supplied by the caller.  In the SC
+    iteration map the caller is :func:`gw.screening.compute_screening`
+    which evaluates them once per iteration; in one-shot main() the
+    same helper is invoked at the screening seam.  Decoupling the
+    probe-frequency χ₀+W solve from this pipeline lets future Σ
+    schemes (CD, spectral, …) share the same screening planner.
 
     Sequences (with timing.section + xprof annotations):
 
-        1. Build the probe-frequency quadrature (HL: real ω; GN: iω_p).
-        2. Compute χ₀(probe) and W(probe) via the static screening solver.
-        3. Two-point PPM pole fit (B_q, Ω_q).
-        4. Precompile + run Σ^c(ω, k, m, n) over the windowed minimax grid.
-        5. Inject the analytic q→0 head correction.
-        6. Interpolate diag(Σ_c) at DFT energies (rank-0 only).
-        7. Write sigma_mnk.h5 (eV units).
+        1. Two-point PPM pole fit (B_q, Ω_q) from (W_static, W_probe).
+        2. Precompile + run Σ^c(ω, k, m, n) over the windowed minimax grid.
+        3. Inject the analytic q→0 head correction.
+        4. Interpolate diag(Σ_c) at DFT energies (rank-0 only).
+        5. Write sigma_mnk.h5 (eV units).
     """
     from . import w_isdf  # for ensure_compilation_cache + cache hit timings
 
@@ -344,32 +327,25 @@ def compute_ppm_sigma_pipeline(
     print_section(f"{label} + FREQUENCY-INTEGRATED SIGMA", print_fn)
 
     with timing.section("gw_jax.ppm_sigma"):
-        # Step 1–2: probe-frequency W
-        probe_omega, quad_probe = _build_probe_quadrature(
-            quad, config, print_fn=print_fn)
-        chi0_probe = compute_chi0(
-            wfns, quad_probe, meta, mesh_xy, energy_reference=e_ref)
-        # Block BEFORE solve_w so chi0_probe compute time isn't folded
-        # into the W-solve wall, and so solve_w can donate χ₀'s buffer.
-        chi0_probe.block_until_ready()
-        Wiwp_q = solve_w(
-            V_q, chi0_probe, meta, mesh_xy,
-            solver=config.backend.screening_solver,
+        # Probe frequency for the PPM fit — recovered from the configured
+        # ω_p (real-axis Ω for HL, iω_p for GN).  The screening planner
+        # used the same convention to pick W_probe_q's evaluation point.
+        is_hl = config.compute_mode is ComputeMode.HL_PPM
+        probe_omega = (
+            complex(float(config.ppm.omega_p), 0.0) if is_hl
+            else 1j * float(config.ppm.omega_p)
         )
-        del chi0_probe
-        Wiwp_q.block_until_ready()
 
-        # Step 3: PPM pole fit
+        # Step 1: PPM pole fit
         ppm = fit_ppm(
-            W_q, Wiwp_q, V_q, probe_omega, mesh_xy,
+            W_static_q, W_probe_q, V_q, probe_omega, mesh_xy,
             fallback_omega=config.ppm.fallback_omega,
             n_nodes_static=quad.node_count,
             print_fn=print_fn,
             model_label=label,
         )
-        del Wiwp_q
 
-        # Step 4: precompile + run Σ^c(ω, k, m, n)
+        # Step 2: precompile + run Σ^c(ω, k, m, n)
         with timing.section("sigma.compile"):
             precompile_sigma(wfns, ppm, meta, mesh_xy)
         with timing.section("sigma.exec"), profile_section("sigma_ppm", print_fn=print_fn):
@@ -380,7 +356,7 @@ def compute_ppm_sigma_pipeline(
             )
         sigma_c_omega = sigma_omega.sigma_c_kij  # None if streamed
 
-        # Step 5: q→0 head injection (analytic, mini-BZ-averaged)
+        # Step 3: q→0 head injection (analytic, mini-BZ-averaged)
         head_gn = _fit_head_correction(
             head_resolver, config=config, meta=meta,
             probe_omega=probe_omega, print_fn=print_fn,
@@ -391,7 +367,7 @@ def compute_ppm_sigma_pipeline(
             wfn=wfn, sym=sym, meta=meta, print_fn=print_fn,
         )
 
-        # Step 6: diag(Σ_c) at DFT energies (replicated across ranks)
+        # Step 4: diag(Σ_c) at DFT energies (replicated across ranks)
         (sigma_c_at_dft_ev,
          sigma_xc_at_dft_ev,
          omega_dft_rel_ev,
@@ -403,7 +379,7 @@ def compute_ppm_sigma_pipeline(
             print_fn=print_fn,
         )
 
-        # Step 7: write sigma_mnk.h5
+        # Step 5: write sigma_mnk.h5
         sigma_omega_h5_path = _write_sigma_omega_h5(
             sigma_c_omega, sigma_omega,
             ppm_options=ppm_options, sig_x=sig_x, sig_h=sig_h,

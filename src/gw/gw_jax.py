@@ -233,9 +233,10 @@ def main(argv=None):
 	# config's override fields first before falling back to s_tensor/epshead.
 	if config.do_screened and os.path.exists(tensors_filename):
 		from file_io import write_w0_qmunu_to_h5, write_head_scalars_to_h5
-		nkx, nky, nkz = (int(x) for x in meta.kgrid)
-		W_q_8d = W_q.reshape(1, 1, 1, nkx, nky, nkz, W_q.shape[-2], W_q.shape[-1])
-		write_w0_qmunu_to_h5(tensors_filename, W_q_8d,
+		# W_q is flat-q ``(nq, μ, μ)`` — same convention as V_qmunu
+		# post the V_qmunu→flat-q refactor.  bse_io.py's reader handles
+		# this 3-D layout (and the legacy 8-D one).
+		write_w0_qmunu_to_h5(tensors_filename, W_q,
 		                     mesh=mesh_xy, backend=config.backend.slab_io)
 		head_static = head_resolver.at(0.0 + 0.0j)
 		if config.compute_mode.is_dynamic:
@@ -334,9 +335,25 @@ def main(argv=None):
 	# QSGW iteration map calls compute_sigma_xc internally each step
 	# and would re-do this work on iter 1.
 	if mode.is_dynamic and not config.self_consistent:
+		# Mode-orthogonal screening: ask the scheme which W's it needs
+		# (PPM modes need a probe-frequency W in addition to the static
+		# one already in W_q), evaluate them in one pass, and hand the
+		# {role → W_q} dict to the Σ build.
+		from .screening import compute_screening, screening_requests_for
+		_requests = [r for r in screening_requests_for(mode, config)
+		             if r.role != "static"]   # static W already solved above
+		_W_extra = compute_screening(
+			wfns, V_q, _requests,
+			quad=quad, e_ref=e_ref,
+			config=config, meta=meta, mesh_xy=mesh_xy,
+			print_fn=print0,
+		)
 		ppm_outputs = compute_ppm_sigma_pipeline(
 			wfns=wfns,
-			V_q=V_q, W_q=W_q, sig_x=sig_x, sig_h=sig_h,
+			V_q=V_q,
+			W_static_q=W_q,
+			W_probe_q=_W_extra["probe"],
+			sig_x=sig_x, sig_h=sig_h,
 			quad=quad, e_ref=e_ref,
 			config=config, meta=meta, mesh_xy=mesh_xy,
 			head_resolver=head_resolver,
