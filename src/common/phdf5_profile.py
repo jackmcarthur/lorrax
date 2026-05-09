@@ -46,7 +46,7 @@ from jax.sharding import Mesh
 
 from common import jax_profile
 from common.phdf5_wfn_reader import PhdfWfnReader
-from common.wfnreader import WFNReader
+from file_io import WFNReader
 from common.symmetry_maps import SymMaps
 from common.load_wfns import load_centroids_band_chunked
 import types

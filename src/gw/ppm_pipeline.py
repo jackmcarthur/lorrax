@@ -243,23 +243,9 @@ def _eval_sigma_c_at_dft_energies(
         from jax.experimental.multihost_utils import broadcast_one_to_all
         sig_c_diag = np.asarray(broadcast_one_to_all(sig_c_diag))
 
-    # Vectorised linear interpolation over ω at each (k, n) eval point.
-    n_omega = omega_ev.size
-    nk, nb = enk_dft_ev.shape
-    eval_clamped = np.clip(omega_dft_rel_ev, float(omega_ev[0]), float(omega_ev[-1]))
-    idx_hi = np.clip(
-        np.searchsorted(omega_ev, eval_clamped, side="left"), 1, n_omega - 1)
-    idx_lo = idx_hi - 1
-    omega_lo_kn = omega_ev[idx_lo]
-    omega_hi_kn = omega_ev[idx_hi]
-    denom = np.where(omega_hi_kn > omega_lo_kn, omega_hi_kn - omega_lo_kn, 1.0)
-    w_hi = (eval_clamped - omega_lo_kn) / denom
-    w_lo = 1.0 - w_hi
-    k_idx = np.arange(nk)[:, None]
-    n_idx = np.arange(nb)[None, :]
-    sig_lo = sig_c_diag[idx_lo, k_idx, n_idx]
-    sig_hi = sig_c_diag[idx_hi, k_idx, n_idx]
-    sigma_c_at_dft_ev = w_lo * sig_lo + w_hi * sig_hi
+    from .qsgw_utils import interp_along_omega
+    sigma_c_at_dft_ev = interp_along_omega(
+        sig_c_diag, omega_ev, omega_dft_rel_ev)
 
     sig_x_diag_ev = np.diagonal(np.asarray(sig_x), axis1=1, axis2=2) * RYD_TO_EV
     sigma_xc_at_dft_ev = sig_x_diag_ev + sigma_c_at_dft_ev

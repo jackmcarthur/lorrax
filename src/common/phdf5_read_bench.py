@@ -7,7 +7,7 @@ a file to read), then measure two read paths:
       reads a slice into host memory.  Two sub-variants:
         (H-full) f['A'][:]   — every rank reads the WHOLE dataset, then
                                slices in-memory.  Matches
-                               src/common/wfnreader.py:59 which does
+                               src/file_io/wfnreader.py:59 which does
                                self.coeffs = self._file['wfns/coeffs'][:]
                                on every process.
         (H-slab) f['A'][rs:re, cs:ce]  — every rank reads only its own

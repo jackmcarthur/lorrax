@@ -9,7 +9,7 @@
 # fractional-translation phase has to be threaded in explicitly.
 import numpy as np
 import jax.numpy as jnp
-from .wfnreader import WFNReader
+from file_io import WFNReader
 
 
 class SymMaps:

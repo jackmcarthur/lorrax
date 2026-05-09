@@ -27,6 +27,51 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 
 # ---------------------------------------------------------------------------
+# Vectorised per-(k, n) ω-axis linear interpolation — shared helper
+# ---------------------------------------------------------------------------
+
+def interp_along_omega(
+    values_w_kn: np.ndarray,
+    omega_grid: np.ndarray,
+    eval_kn: np.ndarray,
+) -> np.ndarray:
+    """Linearly interpolate ``values_w_kn[ω, k, n]`` along the ω-axis at
+    per-(k, n) points ``eval_kn[k, n]`` (with edge clamping).
+
+    Vectorised over (k, n) — one ``np.searchsorted`` + two fancy-index
+    gathers, no Python loops.  Used by the diag-Σ(E) fixed point, the
+    Σ_c(E_DFT) eqp.dat extractor, the Z-factor central difference, and
+    the freq_debug head-correction column.
+
+    Parameters
+    ----------
+    values_w_kn : (nω, nk, nb), real or complex
+    omega_grid : (nω,), monotonically increasing
+    eval_kn : (nk, nb), the per-(k, n) ω-evaluation points
+
+    Returns
+    -------
+    out : (nk, nb), same dtype as ``values_w_kn``
+    """
+    omega = np.asarray(omega_grid, dtype=np.float64)
+    eval_arr = np.asarray(eval_kn, dtype=np.float64)
+    n_omega = omega.size
+    eval_clamped = np.clip(eval_arr, float(omega[0]), float(omega[-1]))
+    idx_hi = np.clip(
+        np.searchsorted(omega, eval_clamped, side="left"), 1, n_omega - 1)
+    idx_lo = idx_hi - 1
+    omega_lo = omega[idx_lo]
+    omega_hi = omega[idx_hi]
+    denom = np.where(omega_hi > omega_lo, omega_hi - omega_lo, 1.0)
+    w_hi = (eval_clamped - omega_lo) / denom
+    w_lo = 1.0 - w_hi
+    nk, nb = eval_arr.shape
+    k_idx = np.arange(nk)[:, None]
+    n_idx = np.arange(nb)[None, :]
+    return w_lo * values_w_kn[idx_lo, k_idx, n_idx] + w_hi * values_w_kn[idx_hi, k_idx, n_idx]
+
+
+# ---------------------------------------------------------------------------
 # SC-COHSEX diagnostics
 # ---------------------------------------------------------------------------
 
@@ -88,36 +133,17 @@ def solve_diagonal_sigma_fixed_point(
     omega = np.asarray(omega_ev, dtype=np.float64)
     if sigma_w.ndim != 3:
         raise ValueError("sigma_omega_diag_ev must have shape (nω, nk, nb).")
-    n_omega, nk, nb = sigma_w.shape
-    if h0.shape != (nk, nb):
+    if h0.shape != sigma_w.shape[1:]:
         raise ValueError(
             f"shape mismatch: h0={h0.shape}, sigma_w={sigma_w.shape}")
-
-    omega_lo = float(omega[0])
-    omega_hi = float(omega[-1])
-    k_idx = np.arange(nk)[:, None]
-    n_idx = np.arange(nb)[None, :]
-
-    def _sigma_at(E_kn: np.ndarray) -> np.ndarray:
-        Ec = np.clip(E_kn, omega_lo, omega_hi)
-        idx_hi = np.clip(np.searchsorted(omega, Ec, side="left"), 1, n_omega - 1)
-        idx_lo = idx_hi - 1
-        ω_lo = omega[idx_lo]
-        ω_hi = omega[idx_hi]
-        denom = np.where(ω_hi > ω_lo, ω_hi - ω_lo, 1.0)
-        w_hi = (Ec - ω_lo) / denom
-        w_lo = 1.0 - w_hi
-        # Σ_diag(ω) is (nω, nk, nb); fancy-index along ω with per-(k, n) idx.
-        sig_lo = sigma_w[idx_lo, k_idx, n_idx]
-        sig_hi = sigma_w[idx_hi, k_idx, n_idx]
-        return w_lo * sig_lo + w_hi * sig_hi
 
     i0 = int(np.argmin(np.abs(omega)))
     E = h0 + np.real(sigma_w[i0])
     mix = float(np.clip(mixing, 0.0, 1.0))
 
     for it in range(max_iter):
-        E_new = h0 + np.real(_sigma_at(E))
+        sig_at_E = interp_along_omega(sigma_w, omega, E)
+        E_new = h0 + np.real(sig_at_E)
         E_next = (1.0 - mix) * E + mix * E_new
         diff = np.abs(E_next - E)
         E = E_next
@@ -335,6 +361,7 @@ def plot_qp_energy_comparison(
 __all__ = [
     "build_qsgw_sigma_xc",
     "extract_sigma_diag_replicated",
+    "interp_along_omega",
     "plot_qp_energy_comparison",
     "print_scf_diagnostics",
     "solve_diagonal_sigma_fixed_point",

@@ -37,7 +37,7 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(script_dir)
 sys.path.insert(0, os.path.join(project_root, "src"))
 
-from common.wfnreader import WFNReader
+from file_io import WFNReader
 from common.symmetry_maps import SymMaps
 
 

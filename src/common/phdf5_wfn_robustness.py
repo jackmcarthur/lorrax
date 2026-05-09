@@ -51,7 +51,7 @@ _init_distributed_once()
 from common.load_wfns import read_Gvecs_to_devices
 from common.phdf5_wfn_reader import PhdfWfnReader
 from common.symmetry_maps import SymMaps
-from common.wfnreader import WFNReader
+from file_io import WFNReader
 
 
 def _log(msg: str) -> None:

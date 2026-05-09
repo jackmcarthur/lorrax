@@ -633,26 +633,16 @@ def main(argv=None):
 				ppm_outputs.head_sigma_diag_w_kn_ry
 				if ppm_outputs is not None else None)
 			if head_w_kn_ry is not None:
-				_omega_ry = np.asarray(ppm_options.omega_grid_ry, np.float64)
+				from .qsgw_utils import interp_along_omega
 				_eval_ry = (np.asarray(omega_dft_rel_ev, np.float64)
 				            / RYD_TO_EV)
-				_n_omega = _omega_ry.size
-				_e_clamped = np.clip(_eval_ry, _omega_ry[0], _omega_ry[-1])
-				_idx_hi = np.clip(np.searchsorted(
-					_omega_ry, _e_clamped, side="left"), 1, _n_omega - 1)
-				_idx_lo = _idx_hi - 1
-				_w_hi = ((_e_clamped - _omega_ry[_idx_lo])
-				         / np.where(_omega_ry[_idx_hi] > _omega_ry[_idx_lo],
-				                    _omega_ry[_idx_hi] - _omega_ry[_idx_lo],
-				                    1.0))
-				_w_lo = 1.0 - _w_hi
-				_k_idx = np.arange(_nk)[:, None]
-				_n_idx = np.arange(_nb)[None, :]
-				_lo = head_w_kn_ry[_idx_lo, _k_idx, _n_idx]
-				_hi = head_w_kn_ry[_idx_hi, _k_idx, _n_idx]
 				_cols.append((
 					"sig_c_head(Edft)",
-					(_w_lo * _lo + _w_hi * _hi) * RYD_TO_EV,
+					interp_along_omega(
+						head_w_kn_ry,
+						np.asarray(ppm_options.omega_grid_ry, np.float64),
+						_eval_ry,
+					) * RYD_TO_EV,
 				))
 		else:
 			_cols.append(

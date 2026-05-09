@@ -189,7 +189,7 @@ def main():
     import argparse
     import sys
     sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parent.parent))
-    from common.wfnreader import WFNReader
+    from file_io import WFNReader
 
     parser = argparse.ArgumentParser(
         description="Compute cell-box-truncated Coulomb potential and compare with BGW vcoul"

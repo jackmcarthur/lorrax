@@ -159,23 +159,13 @@ def compute_z_factor_from_omega_grid(
 			f"({omega_rel_ev.size}, {nk}, {nb})"
 		)
 
-	sig_c_re = np.real(sigma_c_omega_diag_ev)
-	sig_c_im = np.imag(sigma_c_omega_diag_ev)
-
-	def _interp_at(omega_query_ev: np.ndarray) -> np.ndarray:
-		out = np.empty((nk, nb), dtype=np.complex128)
-		for ik in range(nk):
-			for ib in range(nb):
-				w = float(omega_query_ev[ik, ib])
-				out[ik, ib] = complex(
-					np.interp(w, omega_rel_ev, sig_c_re[:, ik, ib]),
-					np.interp(w, omega_rel_ev, sig_c_im[:, ik, ib]),
-				)
-		return out
-
-	sigma_c_at_dft = _interp_at(e_dft_rel_ev)
-	sigma_c_plus = _interp_at(e_dft_rel_ev + dE_ev)
-	sigma_c_minus = _interp_at(e_dft_rel_ev - dE_ev)
+	from .qsgw_utils import interp_along_omega
+	sigma_c_at_dft = interp_along_omega(
+		sigma_c_omega_diag_ev, omega_rel_ev, e_dft_rel_ev)
+	sigma_c_plus = interp_along_omega(
+		sigma_c_omega_diag_ev, omega_rel_ev, e_dft_rel_ev + dE_ev)
+	sigma_c_minus = interp_along_omega(
+		sigma_c_omega_diag_ev, omega_rel_ev, e_dft_rel_ev - dE_ev)
 
 	# Central-difference dRe[Σ_c]/dω at E_DFT
 	dsigma_dE = (np.real(sigma_c_plus) - np.real(sigma_c_minus)) / (2.0 * dE_ev)

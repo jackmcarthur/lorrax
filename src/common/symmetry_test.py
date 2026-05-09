@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 
-from .wfnreader import WFNReader
+from file_io import WFNReader
 from .symmetry_maps import SymMaps
 
 
