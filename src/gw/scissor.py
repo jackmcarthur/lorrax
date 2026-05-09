@@ -54,51 +54,65 @@ import numpy as np
 
 @dataclass(frozen=True)
 class ScissorFit:
-    """Affine scissor-shift law fit to ΔE vs E for valence and conduction.
+    """Affine scissor-shift law fit to ``E_QP = α·E_DFT + β`` for
+    valence and conduction.
+
+    α is the **stretching factor**:
+
+    - α = 1   ⇔  rigid shift  (E_QP = E_DFT + β)
+    - α > 1   ⇔  the band manifold is stretched (gap opens further)
+    - α < 1   ⇔  the band manifold is compressed (gap closes)
 
     Attributes
     ----------
-    slope_v, intercept_v : float
-        ΔE_v(E) = slope_v · E + intercept_v, in eV.
-    slope_c, intercept_c : float
+    alpha_v, beta_v_ev : float
+        Valence stretching factor and intercept (eV), so
+        ``E_QP_v(E) = alpha_v · E + beta_v_ev``.
+    alpha_c, beta_c_ev : float
         Analogous for conduction.
     n_fit_v, n_fit_c : int
         Number of (k, n) points used in each fit.
     rmse_v_ev, rmse_c_ev : float
-        Fit residual RMSE in eV (0 when the fit has fewer than 2 points).
+        Fit residual RMSE on the QP correction ΔE = E_QP − E_DFT, in eV.
+        0 when the fit has fewer than 2 points.
     """
 
-    slope_v: float
-    intercept_v: float
-    slope_c: float
-    intercept_c: float
+    alpha_v: float
+    beta_v_ev: float
+    alpha_c: float
+    beta_c_ev: float
     n_fit_v: int
     n_fit_c: int
     rmse_v_ev: float
     rmse_c_ev: float
 
     def predict(self, E_ev: np.ndarray, valence_mask: np.ndarray) -> np.ndarray:
-        """Evaluate the scissor law at each (k, n).
+        """Evaluate the scissor **correction** ΔE = E_QP − E_DFT at each (k, n).
+
+        Returns ``ΔE = (α − 1) · E + β`` so callers can add it to their
+        DFT energies to get E_QP — same usage as before, just clearer
+        semantics on the stored α.
 
         Parameters
         ----------
         E_ev : np.ndarray, (nk, nb)
-            Input energies, same reference as was used at fit time.
+            Input DFT energies, same reference as at fit time.
         valence_mask : np.ndarray, (nk, nb) of bool
             True where the valence law applies; False → conduction.
         """
         E = np.asarray(E_ev, dtype=np.float64)
         vm = np.asarray(valence_mask, dtype=bool)
-        v_pred = self.slope_v * E + self.intercept_v
-        c_pred = self.slope_c * E + self.intercept_c
-        return np.where(vm, v_pred, c_pred)
+        delta_v = (self.alpha_v - 1.0) * E + self.beta_v_ev
+        delta_c = (self.alpha_c - 1.0) * E + self.beta_c_ev
+        return np.where(vm, delta_v, delta_c)
 
     def summary(self) -> str:
         return (
-            f"ScissorFit(val: α={self.slope_v:+.4f}, β={self.intercept_v:+.4f} eV, "
+            f"ScissorFit(val: α={self.alpha_v:+.4f}, β={self.beta_v_ev:+.4f} eV, "
             f"n={self.n_fit_v}, rmse={self.rmse_v_ev:.3f} eV; "
-            f"cond: α={self.slope_c:+.4f}, β={self.intercept_c:+.4f} eV, "
-            f"n={self.n_fit_c}, rmse={self.rmse_c_ev:.3f} eV)"
+            f"cond: α={self.alpha_c:+.4f}, β={self.beta_c_ev:+.4f} eV, "
+            f"n={self.n_fit_c}, rmse={self.rmse_c_ev:.3f} eV)  "
+            f"[α=1 ⇔ rigid shift]"
         )
 
 
@@ -218,7 +232,6 @@ def fit_scissor(
     order_qp = np.argsort(E_qp, axis=1)
     E_dft_sorted = E_dft[rows, order_dft]
     E_qp_sorted = E_qp[rows, order_qp]
-    dE_sorted = E_qp_sorted - E_dft_sorted
 
     # Masks live in DFT-band-identity space; reorder by DFT permutation.
     vm_sorted = vm[rows, order_dft]
@@ -226,12 +239,23 @@ def fit_scissor(
 
     mask_v = vm_sorted & fm_sorted
     mask_c = (~vm_sorted) & fm_sorted
-    slope_v, int_v, rmse_v = _ols_line(E_dft_sorted[mask_v], dE_sorted[mask_v])
-    slope_c, int_c, rmse_c = _ols_line(E_dft_sorted[mask_c], dE_sorted[mask_c])
+
+    # Fit E_QP = α · E_DFT + β directly so α reads as the stretching factor
+    # (α = 1 ⇒ rigid shift).  RMSE is reported on the QP correction
+    # ΔE = E_QP − E_DFT for human readability ("the residual error in
+    # predicting how much GW shifts each band").
+    alpha_v, beta_v, _ = _ols_line(E_dft_sorted[mask_v], E_qp_sorted[mask_v])
+    alpha_c, beta_c, _ = _ols_line(E_dft_sorted[mask_c], E_qp_sorted[mask_c])
+    resid_v = (E_qp_sorted - E_dft_sorted)[mask_v] - (
+        (alpha_v - 1.0) * E_dft_sorted[mask_v] + beta_v)
+    resid_c = (E_qp_sorted - E_dft_sorted)[mask_c] - (
+        (alpha_c - 1.0) * E_dft_sorted[mask_c] + beta_c)
+    rmse_v = float(np.sqrt(np.mean(resid_v * resid_v))) if resid_v.size else 0.0
+    rmse_c = float(np.sqrt(np.mean(resid_c * resid_c))) if resid_c.size else 0.0
 
     return ScissorFit(
-        slope_v=slope_v, intercept_v=int_v,
-        slope_c=slope_c, intercept_c=int_c,
+        alpha_v=alpha_v, beta_v_ev=beta_v,
+        alpha_c=alpha_c, beta_c_ev=beta_c,
         n_fit_v=int(mask_v.sum()), n_fit_c=int(mask_c.sum()),
         rmse_v_ev=rmse_v, rmse_c_ev=rmse_c,
     )
