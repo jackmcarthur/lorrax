@@ -640,10 +640,21 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		         f"centroids: {cents_curr_path}")
 		_, cents_curr_idx, n_rmu_curr = load_centroids(
 			cents_curr_path, meta.fft_grid)
-		# Round n_rmu_jax to n_proc, matching Meta.from_system convention.
+		# Round n_rmu_jax to n_proc (legacy field, host-count divisor).
 		n_rmu_curr_jax = ((n_rmu_curr + meta.n_proc - 1) // meta.n_proc) * meta.n_proc
+		# n_rmu_padded uses world_size (= ∏ p_a over the device mesh).
+		# Without this refresh the bispinor transverse fit_zeta inherits
+		# the charge-channel padded extent, and the C_q reshape at
+		# isdf_fitting.py:1442 trips a TypeError when the transverse
+		# centroid count differs from the charge count.
+		_world_size = int(jax.device_count())
+		n_rmu_curr_padded = ((n_rmu_curr + _world_size - 1) // _world_size) * _world_size
 		meta_curr = dataclasses.replace(
-			meta, n_rmu=int(n_rmu_curr), n_rmu_jax=int(n_rmu_curr_jax))
+			meta,
+			n_rmu=int(n_rmu_curr),
+			n_rmu_jax=int(n_rmu_curr_jax),
+			n_rmu_padded=int(n_rmu_curr_padded),
+		)
 
 		with timing.section("gw_jax.load_centroid_wfns_current"):
 			psi_curr_rmu_Y, psi_curr_rmuT_X = load_centroids_band_chunked(

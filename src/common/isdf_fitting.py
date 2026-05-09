@@ -1011,6 +1011,29 @@ def _make_fit_one_rchunk_kernel(
         norms_r,
         r_start_dyn,
     ):
+        # ψ inputs arrive at PADDED n_rmu (load_centroids_band_chunked
+        # output, Phase 3a).  Slice the μ axis to LOGICAL n_rmu at
+        # kernel entry so the interior CCT / Z_q / cho_solve operate
+        # on the non-singular logical block.  Pad rows of ψ are zero
+        # (Phase 3a invariant), so dropping them is exact.  The slice
+        # is an intermediate inside this jit; per-microbench-Test-2/6
+        # verified XLA SPMD handles the resulting uneven sharding via
+        # collective-permute, no all-gather inflation.
+        # ψ_l/r_rmuT_X_fit shape: (nk, n_rmu, nb, ns); μ on axis 1.
+        if psi_l_rmuT_X_fit.shape[1] != n_rmu:
+            psi_l_rmuT_X_fit = jax.lax.slice(
+                psi_l_rmuT_X_fit,
+                (0, 0, 0, 0),
+                (psi_l_rmuT_X_fit.shape[0], n_rmu,
+                 psi_l_rmuT_X_fit.shape[2], psi_l_rmuT_X_fit.shape[3]),
+            )
+            psi_r_rmuT_X_fit = jax.lax.slice(
+                psi_r_rmuT_X_fit,
+                (0, 0, 0, 0),
+                (psi_r_rmuT_X_fit.shape[0], n_rmu,
+                 psi_r_rmuT_X_fit.shape[2], psi_r_rmuT_X_fit.shape[3]),
+            )
+
         # --- 1. Pair-density accumulators (one r-chunk wide) ---
         def _zero_P():
             return jax.lax.with_sharding_constraint(
@@ -1273,15 +1296,21 @@ def fit_zeta_chunked_to_h5(
     import h5py
 
     nx, ny, nz = meta.fft_grid
-    # ``n_rmu`` is the logical centroid count — used everywhere in
-    # this function for in-memory shapes (ψ_rmu, pair densities, CCT,
-    # ζ accumulator).  Every sharding on this axis here is single-
-    # mesh-axis (``'x'`` alone or ``'y'`` alone), so divisibility is
-    # only n_rmu / max(mesh.x, mesh.y), not the product.  The
-    # mesh-product divisibility kicks in only at the V_q read; SlabIO
-    # auto-pads the on-disk dataset to handle that across the jit
-    # boundary.
-    n_rmu = meta.n_rmu
+    # Two μ extents flow through this function (see common/meta.py:38):
+    # ``n_rmu`` is the LOGICAL centroid count from the centroid file;
+    # ``n_rmu_padded`` rounds up to ``world_size = ∏ p_a`` so any
+    # single- or product-axis sharding on the μ dim divides cleanly.
+    # ψ is delivered at PADDED extent by ``load_centroids_band_chunked``
+    # (Phase 3a) — pad rows zero — and stays there through the
+    # in-memory pair-density / CCT chain.  The Cholesky in
+    # ``compute_L_q_from_CCT`` slices internally to logical via the
+    # ``n_rmu_logical=`` kwarg (Phase 3b-Cholesky) so the factorization
+    # sees a non-singular matrix at its true extent.  zeta_q on disk
+    # has logical extent — fit_one_rchunk slices ψ to logical at jit
+    # entry and returns ζ at logical extent, matching the dataset
+    # created at ``shape=(nq, n_rtot, n_rmu)`` below.
+    n_rmu = meta.n_rmu                      # logical
+    n_rmu_padded = meta.n_rmu_padded        # padded
     n_rtot = meta.n_rtot
     nk_tot = meta.nk_tot
     kgrid = meta.kgrid
@@ -1372,19 +1401,28 @@ def fit_zeta_chunked_to_h5(
 
     with timing.section("zeta_fit.CCT"):
         print(f"  Computing pair densities P_l, P_r (spin_traced) for L_q metric")
+        # ψ inputs at PADDED n_rmu (Phase 3a's load_centroids contract).
+        # Pair density / CCT operate at padded; the trailing μ pad rows
+        # of ψ are zero (Phase 3a invariant), so the bilinear einsum
+        # zero-pads the corresponding rows of P_l/P_r and rows+cols of
+        # C_q.  Cholesky doesn't see those zeros — the n_rmu_logical=
+        # kwarg below slices to the leading logical block.
         P_l_k = compute_pair_density_spin_traced(psi_l_rmuT_X_fit, psi_l_rmu_Y_fit, mesh_xy)
         P_r_k = compute_pair_density_spin_traced(psi_r_rmuT_X_fit, psi_r_rmu_Y_fit, mesh_xy)
         P_l_k.block_until_ready()
         P_r_k.block_until_ready()
         C_q = compute_CCT_from_left_right(P_l_k, P_r_k, kgrid, mesh_xy)
         C_q.block_until_ready()
-        # C_q: (nqx, nqy, nqz, n_rmu, n_rmu)
+        # C_q: (nqx, nqy, nqz, n_rmu_padded, n_rmu_padded) with zero
+        # pad rows/cols.
 
         # Free pair densities - only needed for C_q
         del P_l_k, P_r_k
 
-        # Flatten for Cholesky
-        C_q_flat = C_q.reshape(nq, n_rmu, n_rmu)
+        # Flatten for Cholesky.  Reshape uses padded extent (the
+        # in-memory shape); compute_L_q_from_CCT slices to logical
+        # internally via ``n_rmu_logical=``.
+        C_q_flat = C_q.reshape(nq, n_rmu_padded, n_rmu_padded)
         flat_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
         C_q_flat = jax.lax.with_sharding_constraint(C_q_flat, flat_shard)
 
@@ -1393,11 +1431,21 @@ def fit_zeta_chunked_to_h5(
     # (PSD), so this works for every vertex_mu_L.  The γ̃ vertex enters
     # only the per-chunk Z_q construction; ζ^μ = L_q^{-1} Z_q^μ at solve
     # time uses the same (charge) L_q across channels.
+    #
+    # ``n_rmu_logical=n_rmu`` triggers the slice-then-replicate-then-
+    # dense-Cholesky path inside compute_L_q_from_CCT (Phase 3b-Chol).
+    # When n_rmu == n_rmu_padded (mesh-divisible centroid count) this
+    # is a no-op slice and falls through to the legacy 2D-blocked
+    # path; when n_rmu < n_rmu_padded (e.g. n_rmu=661 prime padded to
+    # 672) it slices to the logical block — which is non-singular by
+    # construction — and runs a dense replicated Cholesky.  Returns
+    # L_q at LOGICAL extent (replicated when padded path taken,
+    # P(None,'x','y') otherwise).
     with timing.section("zeta_fit.cholesky"):
         print(f"  Computing L_q = chol(C_q)  (charge-channel metric, "
               f"reused for all vertex_mu_L)")
         L_q = compute_L_q_from_CCT(
-            C_q_flat, mesh_xy, vertex_mu_L=0)
+            C_q_flat, mesh_xy, vertex_mu_L=0, n_rmu_logical=n_rmu)
         L_q.block_until_ready()
         print(f"  L_q: {L_q.shape}")
 
