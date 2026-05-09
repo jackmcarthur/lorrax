@@ -596,6 +596,17 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			gspace_mode=cfg.gspace_mode,
 		)
 
+	# Diagnostic: peek at ζ^0 (charge) q=0 max magnitude.
+	try:
+		import h5py
+		with h5py.File(zeta_h5_path, 'r') as f:
+			dsname = next(iter(f.keys()))
+			arr0 = f[dsname][0]
+			print_fn(f"  [diag] ζ^{{μ_L=0}} q=0: max|ζ|={float(np.abs(arr0).max()):.3e}, "
+			         f"L2={float(np.sqrt((np.abs(arr0)**2).sum())):.3e}")
+	except Exception as exc:
+		print_fn(f"  [diag] ζ^0 peek failed: {exc}")
+
 	budget_gb = mem_est.get('budget_gb', cfg.memory.per_device_gb)
 	if peak_bytes > 0:
 		peak_gb = peak_bytes / 1e9
@@ -686,6 +697,18 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					gspace_mode=cfg.gspace_mode,
 					vertex_mu_L=mu_L,
 				)
+			# Diagnostic: peek at ζ q=0 max magnitude for comparison to
+			# agent-B's MoS2 reference (commit 69e8863):
+			# ζ_charge max ~ 21, ζ_current max ~ 800–4880.
+			try:
+				import h5py
+				with h5py.File(zeta_mu_path, 'r') as f:
+					dsname = next(iter(f.keys()))
+					arr0 = f[dsname][0]
+					print_fn(f"  [diag] ζ^{{μ_L={mu_L}}} q=0: max|ζ|={float(np.abs(arr0).max()):.3e}, "
+					         f"L2={float(np.sqrt((np.abs(arr0)**2).sum())):.3e}")
+			except Exception as exc:
+				print_fn(f"  [diag] ζ^{{μ_L={mu_L}}} peek failed: {exc}")
 
 		# Surface the transverse-centroid ψ to the caller so it can build
 		# the second Wfns bundle for σ^B without re-loading from WFN.h5.

@@ -167,15 +167,25 @@ def compute_sigma_x_bispinor(
     sigma_sx_k, _, _ = _make_cohsex_kernels(mesh_xy, meta.kgrid, nk_tot)
 
     sig_x_b = None
+    contributions: dict[tuple[int, int], float] = {}
     with BispinorVqReader(bispinor_v_q_path, mesh_xy,
                           backend=backend, use_ffi_io=use_ffi_io) as reader:
         for i in _TRANSVERSE_INDICES:
             for j in _TRANSVERSE_INDICES:
-                if verbose and jax.process_index() == 0:
-                    print_fn(f"  Σ^B tile (μ_L={i}, ν_L={j})")
                 wfns_ij = _wfns_with_lorentz_vertices(wfns_transverse, i, j)
                 V_ij = reader.get_tile(i, j)
                 contrib = sigma_sx_k(wfns_ij, Gij, V_ij)
+                contrib.block_until_ready()
+                # Per-tile diagonal trace (eV) for diagnostic comparison
+                # against agent-B's MoS2 reference values (commit 69e8863).
+                from common import RYD_TO_EV
+                try:
+                    tr = float(jnp.einsum('kmm->', contrib).real) * RYD_TO_EV
+                except Exception:
+                    tr = float('nan')
+                contributions[(i, j)] = tr
+                if verbose and jax.process_index() == 0:
+                    print_fn(f"  Σ^B tile (μ_L={i}, ν_L={j}): tr Σ = {tr:+.6f} eV")
                 sig_x_b = contrib if sig_x_b is None else sig_x_b + contrib
 
     if sig_x_b is None:  # pragma: no cover — should never happen

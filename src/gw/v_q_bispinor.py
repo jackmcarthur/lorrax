@@ -366,6 +366,19 @@ def compute_V_q_bispinor_to_h5(
                 timing_label=f"V_q_bispinor[{mu_L},{nu_L}]",
             )
 
+            # Diagnostic: peek at V[q=0] max magnitude for comparison to
+            # agent-B's MoS2 reference (``cri3_sigma_blowup`` report):
+            # post-fix MoS2 V^{0,0}[q=0] ≈ 7e7, V^{i,i} ≈ 1e6 (transverse
+            # projector + scalar L_q metric).  Uses jnp.max as a fully
+            # replicated scalar reduction so it works across any sharding.
+            try:
+                v0_max = float(jnp.max(jnp.abs(V_acc[0])))
+                if verbose and jax.process_index() == 0:
+                    print_fn(f"    [diag] V^{{{mu_L},{nu_L}}}[q=0] max|V|={v0_max:.3e}")
+            except Exception as exc:
+                if verbose and jax.process_index() == 0:
+                    print_fn(f"    [diag] V^{{{mu_L},{nu_L}}}[q=0] peek failed: {exc}")
+
             # === Stream this tile to disk ====================================
             # ``compute_V_q_tile`` returns V_acc at the PADDED μ extent
             # (rounded to mesh_xy.shape product) so all interior

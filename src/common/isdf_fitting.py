@@ -1076,8 +1076,14 @@ def _make_fit_one_rchunk_kernel(
         # the load_wfns separate-jit pattern.  Same pattern as lorrax_B
         # commit c0307a0.
         Z_q = compute_ZCT_from_left_right_zchunk(P_l, P_r, kgrid, mesh_xy)
+        # L_q is always the charge-channel Cholesky factor (see step 3
+        # of ``fit_zeta_chunked_to_h5``).  γ̃^μ has already been folded
+        # into Z_q via the per-chunk ``accumulate_pair_density_lorentz``
+        # above.  Hardcode vertex_mu_L=0 here so the back-solve uses
+        # the Cholesky path on the (well-conditioned) charge L_q
+        # regardless of which Lorentz channel we're fitting.
         zeta = solve_zeta_from_L_q(
-            L_q, Z_q, mesh_xy, q_chunk_size, vertex_mu_L=vertex_mu_L)
+            L_q, Z_q, mesh_xy, q_chunk_size, vertex_mu_L=0)
         return zeta
 
     return _kernel
@@ -1340,18 +1346,34 @@ def fit_zeta_chunked_to_h5(
                   f"{n_zero} zero-weight (skipped)")
 
     # ========== STEP 2: Compute CCT (C_q) from left/right pair densities ==========
-    # Uses normalized copies for fitting (equal-weight pair densities).
-    # γ̃^0 = I_4, so vertex_mu_L=0 is the standard spin-traced path; non-zero
-    # vertex_mu_L threads γ̃^{μ_L} into the contraction (bispinor only).
+    # The CCT/L_q is the *interpolation metric* — it tells the back-solve
+    # how the centroid basis spans the centroid-pair-density space.  This
+    # metric must be the SAME across all 4 Lorentz channels, otherwise ζ^μ
+    # for transverse channels is fit through a different (indefinite,
+    # ill-conditioned) basis and acquires huge magnitudes that blow up
+    # V^{i,j} downstream by 10^4–10^6 (see report §3 of
+    # ``cri3_sigma_blowup_2026-05-05`` and the agent-B reference impl
+    # ``v_q_lorentz.py`` lines 1001–1005).
+    #
+    # Therefore C_q (and L_q from it) is ALWAYS built from the charge
+    # (γ̃^0 = I_4, spin-traced) pair density, regardless of vertex_mu_L.
+    # The γ̃^{μ_L} vertex enters only the Z_q construction in step 5
+    # below, via ``accumulate_pair_density_lorentz`` inside the per-chunk
+    # kernel.
+    # Force-eager-import gamma_matrices so the module's top-level
+    # ``gammas_sparse = [_to_sparse(g) for g in gammas]`` (which calls
+    # ``jnp.nonzero``) runs OUTSIDE any JIT trace.  Without this, the
+    # first reference comes from inside the per-chunk kernel jit and
+    # triggers a ConcretizationTypeError because jnp.nonzero needs
+    # concrete shape.  Cheap (4-element list construction) and runs
+    # only on first call.
+    if int(vertex_mu_L) != 0:
+        from . import gamma_matrices as _gm  # noqa: F401  (warm import)
+
     with timing.section("zeta_fit.CCT"):
-        if vertex_mu_L == 0:
-            print(f"  Computing pair densities P_l, P_r (spin_traced)")
-            P_l_k = compute_pair_density_spin_traced(psi_l_rmuT_X_fit, psi_l_rmu_Y_fit, mesh_xy)
-            P_r_k = compute_pair_density_spin_traced(psi_r_rmuT_X_fit, psi_r_rmu_Y_fit, mesh_xy)
-        else:
-            print(f"  Computing pair densities P_l, P_r (γ̃^{vertex_mu_L} vertex)")
-            P_l_k = compute_pair_density_lorentz(psi_l_rmuT_X_fit, psi_l_rmu_Y_fit, vertex_mu_L, mesh_xy)
-            P_r_k = compute_pair_density_lorentz(psi_r_rmuT_X_fit, psi_r_rmu_Y_fit, vertex_mu_L, mesh_xy)
+        print(f"  Computing pair densities P_l, P_r (spin_traced) for L_q metric")
+        P_l_k = compute_pair_density_spin_traced(psi_l_rmuT_X_fit, psi_l_rmu_Y_fit, mesh_xy)
+        P_r_k = compute_pair_density_spin_traced(psi_r_rmuT_X_fit, psi_r_rmu_Y_fit, mesh_xy)
         P_l_k.block_until_ready()
         P_r_k.block_until_ready()
         C_q = compute_CCT_from_left_right(P_l_k, P_r_k, kgrid, mesh_xy)
@@ -1367,16 +1389,15 @@ def fit_zeta_chunked_to_h5(
         C_q_flat = jax.lax.with_sharding_constraint(C_q_flat, flat_shard)
 
     # ========== STEP 3: Compute L_q from CCT ==========
-    # μ_L=0: Cholesky factor (CCT positive-definite).
-    # μ_L≠0: passthrough; solve_zeta_from_L_q switches to LU at solve time.
+    # Always Cholesky — the CCT here is built from the charge channel
+    # (PSD), so this works for every vertex_mu_L.  The γ̃ vertex enters
+    # only the per-chunk Z_q construction; ζ^μ = L_q^{-1} Z_q^μ at solve
+    # time uses the same (charge) L_q across channels.
     with timing.section("zeta_fit.cholesky"):
-        if int(vertex_mu_L) == 0:
-            print(f"  Computing L_q = chol(C_q)")
-        else:
-            print(f"  Skipping Cholesky (vertex_mu_L={vertex_mu_L} CCT is "
-                  f"indefinite); LU solve will run at fit time")
+        print(f"  Computing L_q = chol(C_q)  (charge-channel metric, "
+              f"reused for all vertex_mu_L)")
         L_q = compute_L_q_from_CCT(
-            C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L))
+            C_q_flat, mesh_xy, vertex_mu_L=0)
         L_q.block_until_ready()
         print(f"  L_q: {L_q.shape}")
 
