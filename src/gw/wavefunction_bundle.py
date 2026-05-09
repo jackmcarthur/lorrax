@@ -247,6 +247,73 @@ def build_wavefunctions(
 
 
 # ---------------------------------------------------------------------------
+# Self-consistent QSGW: rotate the bundle into a new band basis
+# ---------------------------------------------------------------------------
+
+@jax.jit
+def _rotate_psi_xn(psi_xn: jax.Array, U: jax.Array) -> jax.Array:
+    # ψ'_xn[k, s, μ, n] = Σ_m ψ_xn[k, s, μ, m] · U[k, m, n]
+    return jnp.einsum('ksum,kmn->ksun', psi_xn, U, optimize=True)
+
+
+@jax.jit
+def _rotate_psi_xr(psi_xr: jax.Array, U: jax.Array) -> jax.Array:
+    # ψ'_xr[k, n, s, μ] = Σ_m U[k, m, n] · ψ_xr[k, m, s, μ]
+    return jnp.einsum('kmn,kmsu->knsu', U, psi_xr, optimize=True)
+
+
+@jax.jit
+def _rotate_psi_yr(psi_yr: jax.Array, U: jax.Array) -> jax.Array:
+    return jnp.einsum('kmn,kmsu->knsu', U, psi_yr, optimize=True)
+
+
+@jax.jit
+def _rotate_psi_yn(psi_yn: jax.Array, U: jax.Array) -> jax.Array:
+    return jnp.einsum('ksum,kmn->ksun', psi_yn, U, optimize=True)
+
+
+def rotate_wavefunctions(
+    wfns_dft: Wavefunctions,
+    U_dft_to_qp: jax.Array,
+    *,
+    enk_new: jax.Array,
+    efermi: float | None,
+    mesh_xy: Mesh,
+) -> Wavefunctions:
+    """Return a new ``Wavefunctions`` bundle in the band basis defined by
+    ``U_dft_to_qp[k, m, n] = ⟨DFT_m | QP_n⟩``.
+
+    All four ψ copies are rotated:  ψ'_n(r) = Σ_m U_mn ψ_m(r).  Sharding
+    of the (μ_X, μ_Y) axes is preserved because the rotation only mixes
+    the band axis; XLA propagates the sharding of the input through the
+    einsum unchanged.
+
+    ``enk_new`` is the new (sorted) eigenvalue array on the QP basis.  A
+    fresh occupation array is built from ``efermi`` (None ⇒ use
+    ``slices.occ`` to mark the lowest n_occ bands as occupied; same
+    convention as :func:`build_wavefunctions`).
+
+    Cheap and shape-stable: jit'd kernels are cached and re-dispatched
+    each iteration.  Pure function — does not mutate ``wfns_dft``.
+    """
+    with mesh_xy:
+        psi_xn = _rotate_psi_xn(wfns_dft.psi_xn, U_dft_to_qp)
+        psi_xr = _rotate_psi_xr(wfns_dft.psi_xr, U_dft_to_qp)
+        psi_yr = _rotate_psi_yr(wfns_dft.psi_yr, U_dft_to_qp)
+        psi_yn = _rotate_psi_yn(wfns_dft.psi_yn, U_dft_to_qp)
+        rep2 = NamedSharding(mesh_xy, P(None, None))
+        enk_full = jax.lax.with_sharding_constraint(
+            jnp.asarray(enk_new, dtype=wfns_dft.enk.dtype), rep2)
+        occ_full = jax.lax.with_sharding_constraint(
+            _build_occ(enk_full, wfns_dft.slices, efermi), rep2)
+
+    return Wavefunctions(
+        psi_xn=psi_xn, psi_xr=psi_xr, psi_yr=psi_yr, psi_yn=psi_yn,
+        enk=enk_full, occ=occ_full, slices=wfns_dft.slices,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Band-basis projection — Σ_mn(k) = Σ_{s,μ,s',μ'} ψ*_m(s,μ) Σ(s,μ,s',μ') ψ_n(s',μ')
 #
 # Lives here because the only state these contractions need is the (xr, yn)
