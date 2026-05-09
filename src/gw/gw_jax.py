@@ -476,9 +476,13 @@ def main(argv=None):
 				np.arange(E_sc_rel_ry.shape[1])[None, :] < meta.nelec,
 				E_sc_rel_ry.shape).astype(bool)
 			# Fit in eV so the printed slopes/intercepts are human-readable.
+			# Sort-and-pair semantics (per-k argsort on each of E_DFT and
+			# E_QP independently) live inside ``fit_scissor`` and are
+			# robust to QSGW reorderings; one-shot G0W0 has no
+			# reordering and the sort is a no-op.
 			fit = fit_scissor(
 				E_dft_rel_ry * RYD_TO_EV,
-				np.real(E_sc_rel_ry - E_dft_rel_ry) * RYD_TO_EV,
+				E_sc_rel_ry * RYD_TO_EV,
 				valence_mask_kn=occ_mask_kn,
 				fit_mask_kn=in_grid_kn_band,
 			)

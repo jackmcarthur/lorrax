@@ -161,41 +161,73 @@ def _ols_line(x: np.ndarray, y: np.ndarray) -> tuple[float, float, float]:
 
 
 def fit_scissor(
-    E_kn_ev: np.ndarray,
-    delta_e_kn_ev: np.ndarray,
+    E_dft_kn_ev: np.ndarray,
+    E_qp_kn_ev: np.ndarray,
     valence_mask_kn: np.ndarray,
     fit_mask_kn: np.ndarray,
 ) -> ScissorFit:
-    """Fit valence / conduction scissor lines to (E, ΔE) samples.
+    """Fit valence / conduction scissor lines to (E_DFT, ΔE) samples.
+
+    **Sort-and-pair** semantics: at each k, both ``E_DFT_kn_ev`` and
+    ``E_qp_kn_ev`` are sorted ascending **independently**, then paired
+    by sorted index.  The fit pair is
+
+        ``( E_DFT_sorted[k, p],
+            E_qp_sorted[k, p] − E_DFT_sorted[k, p] )``
+
+    i.e. the p-th lowest QP eigenvalue at k vs. the p-th lowest DFT
+    eigenvalue at k.  This is robust to QP reorderings (where the QSGW
+    diagonalisation places eigenvalues in an order that does not match
+    the DFT band labels) — band identity is dropped in favour of
+    energy-sorted matching, which is the right pairing for a scissor
+    fit (a smooth function of E).
+
+    The ``valence_mask_kn`` / ``fit_mask_kn`` are also reordered by
+    the **DFT** sort permutation (since "occupied" and "in-window" are
+    properties tied to the DFT band each E_DFT_sorted[k, p] came from).
 
     Parameters
     ----------
-    E_kn_ev : np.ndarray, (nk, nb)
-        Input energy per (k, n), usually ``E_DFT − E_F`` in eV.
-    delta_e_kn_ev : np.ndarray, (nk, nb), real or complex
-        QP correction (E_GW − E_DFT) in eV.  Complex inputs are reduced to
-        the real part, matching ``solve_diagonal_sigma_fixed_point``.
+    E_dft_kn_ev : np.ndarray, (nk, nb)
+        DFT eigenvalues per (k, n).  Pre-shifted by the caller's
+        choice of reference (typically E_F-relative).
+    E_qp_kn_ev : np.ndarray, (nk, nb), real or complex
+        QP eigenvalues per (k, n) at the corresponding state.  Complex
+        inputs are reduced to the real part, matching the convention of
+        ``solve_diagonal_sigma_fixed_point``.
     valence_mask_kn : np.ndarray, (nk, nb) of bool
         True for occupied bands (at DFT occupation), False for conduction.
     fit_mask_kn : np.ndarray, (nk, nb) of bool
-        True where the point is trusted enough to enter the fit — typically
-        "E_kn lies inside the Σ(ω) grid AND the diagonal fixed point
-        converged".  Applied independently within valence and conduction.
+        True where the point is trusted enough to enter the fit —
+        typically "E_kn lies inside the Σ(ω) grid".  Applied
+        independently within valence and conduction.
     """
-    E = np.asarray(E_kn_ev, dtype=np.float64)
-    dE = np.real(np.asarray(delta_e_kn_ev, dtype=np.complex128))
+    E_dft = np.asarray(E_dft_kn_ev, dtype=np.float64)
+    E_qp = np.real(np.asarray(E_qp_kn_ev, dtype=np.complex128))
     vm = np.asarray(valence_mask_kn, dtype=bool)
     fm = np.asarray(fit_mask_kn, dtype=bool)
-    if not (E.shape == dE.shape == vm.shape == fm.shape):
+    if not (E_dft.shape == E_qp.shape == vm.shape == fm.shape):
         raise ValueError(
-            f"shape mismatch: E={E.shape} dE={dE.shape} "
+            f"shape mismatch: E_DFT={E_dft.shape} E_QP={E_qp.shape} "
             f"valence={vm.shape} fit={fm.shape}"
         )
 
-    mask_v = vm & fm
-    mask_c = (~vm) & fm
-    slope_v, int_v, rmse_v = _ols_line(E[mask_v], dE[mask_v])
-    slope_c, int_c, rmse_c = _ols_line(E[mask_c], dE[mask_c])
+    nk = E_dft.shape[0]
+    rows = np.arange(nk)[:, None]
+    order_dft = np.argsort(E_dft, axis=1)
+    order_qp = np.argsort(E_qp, axis=1)
+    E_dft_sorted = E_dft[rows, order_dft]
+    E_qp_sorted = E_qp[rows, order_qp]
+    dE_sorted = E_qp_sorted - E_dft_sorted
+
+    # Masks live in DFT-band-identity space; reorder by DFT permutation.
+    vm_sorted = vm[rows, order_dft]
+    fm_sorted = fm[rows, order_dft]
+
+    mask_v = vm_sorted & fm_sorted
+    mask_c = (~vm_sorted) & fm_sorted
+    slope_v, int_v, rmse_v = _ols_line(E_dft_sorted[mask_v], dE_sorted[mask_v])
+    slope_c, int_c, rmse_c = _ols_line(E_dft_sorted[mask_c], dE_sorted[mask_c])
 
     return ScissorFit(
         slope_v=slope_v, intercept_v=int_v,
