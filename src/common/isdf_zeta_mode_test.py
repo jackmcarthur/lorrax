@@ -1,6 +1,6 @@
 """Correctness test for the isdf_fitting memory_mode abstraction.
 
-Exercises compute_L_q_from_CCT + solve_zeta_from_L_q in both ``high_mem``
+Exercises factor_c_q + solve_zeta in both ``high_mem``
 (legacy JAX replicate-L vmap trsm) and ``low_mem`` (batched cuSOLVERMp
 potrf+potrs on per-X-row sub-comm) modes on the same random HPD input.
 
@@ -45,7 +45,7 @@ _init()
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental import multihost_utils
-from common.isdf_fitting import compute_L_q_from_CCT, solve_zeta_from_L_q
+from common.isdf_fitting import factor_c_q, solve_zeta
 
 
 def _log(s):
@@ -91,7 +91,7 @@ def _parse_mesh(s):
 def _run_mode(mode, A, B, mesh):
     """Factor + solve once; return gathered zeta."""
     t0 = time.perf_counter()
-    factor = compute_L_q_from_CCT(A, mesh, memory_mode=mode)
+    factor = factor_c_q(A, mesh, memory_mode=mode)
     factor.block_until_ready()
     dt_f = time.perf_counter() - t0
 
@@ -105,7 +105,7 @@ def _run_mode(mode, A, B, mesh):
     B_col.block_until_ready()
 
     t0 = time.perf_counter()
-    zeta = solve_zeta_from_L_q(factor, B_col, mesh, q_chunk_size=1024)
+    zeta = solve_zeta(factor, B_col, mesh, q_chunk_size=1024)
     zeta.block_until_ready()
     dt_s = time.perf_counter() - t0
 

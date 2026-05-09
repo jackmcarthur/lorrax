@@ -535,8 +535,11 @@ def choose_chunks_heuristic(
     base_Lq       = 16.0 * n_k * mu * mu / P      # sharded L_q
     base_persistent = base_centroid + base_psiG + base_Lq
 
-    # Dominant chunk_r-linear term: pair_temp_count × 16·n_k·μ·cr/P
-    cr_per_byte = pair_temp_count * 16.0 * n_k * mu / P
+    # Dominant chunk_r-linear term: pair_temp_count × 16·n_k·μ·cr/P,
+    # scaled by n_s² because the unified open-spin pair density is rank-5
+    # ``(n_k, n_s, n_s, μ, cr)`` for ALL channels (charge γ̃^0=I and
+    # transverse γ̃^i=α^i alike — see :mod:`common.isdf_fitting`).
+    cr_per_byte = pair_temp_count * 16.0 * n_k * (n_s ** 2) * mu / P
 
     headroom = rchunk_budget - base_persistent
     if headroom <= 0:

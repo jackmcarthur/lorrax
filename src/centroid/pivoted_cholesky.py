@@ -12,10 +12,10 @@ valence-conduction pair-product space the ISDF fit will actually use.
 
 Architectural map to ``common/isdf_fitting.py``:
 
-    compute_pair_density_spin_traced  ←→  per-k P^{(v/c)}(a, b)
-                                          (same einsum, just evaluated at
-                                          candidates r̃_a not chosen r_μ)
-    compute_CCT_from_left_right       ←→  k→q FFT of the cross-product
+    pair_density                      ←→  per-k open-spin P^{(v/c)}_{αβ}(a,b)
+                                          (rank-5; same einsum at candidates
+                                          r̃_a not chosen r_μ)
+    c_q_from_pair                     ←→  k→q FFT of the cross-product
                                           → at q=0 this is just sum_k
     (nothing)                         ←→  pivoted_cholesky_select  (new)
 
@@ -856,8 +856,8 @@ def build_gram_q0_via_loadwfns(
     from common.meta import Meta
     from common.load_wfns import load_centroids_band_chunked
     from common.isdf_fitting import (
-        compute_pair_density_spin_traced,
-        compute_gram_q0_from_left_right,
+        pair_density,
+        gram_q0_from_pair,
     )
 
     # Resolve windows.
@@ -955,7 +955,7 @@ def build_gram_q0_via_loadwfns(
             psi_l_rmuT_X = psi_l_rmuT_X / norms_l_j[None, None, :, None]
         psi_l_rmu_Y.block_until_ready()
     with timing.section("left.pair"):
-        P_l_k = compute_pair_density_spin_traced(psi_l_rmuT_X, psi_l_rmu_Y, mesh_xy)
+        P_l_k = pair_density(psi_l_rmuT_X, psi_l_rmu_Y, mesh_xy)
         P_l_k.block_until_ready()
     del psi_l_rmu_Y, psi_l_rmuT_X
 
@@ -970,12 +970,13 @@ def build_gram_q0_via_loadwfns(
             psi_r_rmuT_X = psi_r_rmuT_X / norms_r_j[None, None, :, None]
         psi_r_rmu_Y.block_until_ready()
     with timing.section("right.pair"):
-        P_r_k = compute_pair_density_spin_traced(psi_r_rmuT_X, psi_r_rmu_Y, mesh_xy)
+        P_r_k = pair_density(psi_r_rmuT_X, psi_r_rmu_Y, mesh_xy)
         P_r_k.block_until_ready()
     del psi_r_rmu_Y, psi_r_rmuT_X
 
-    # ---- q=0 Gram: sum_k w_k · conj(P_l_k) · P_r_k ----
+    # ---- q=0 Gram: sum_k w_k · Σ_{αβ} conj(P_l_k,αβ) · P_r_k,αβ ----
+    # γ̃ identity (charge channel) — open-spin Frobenius reduction.
     with timing.section("q0_sum"):
-        G = compute_gram_q0_from_left_right(P_l_k, P_r_k, kw, mesh_xy)
+        G = gram_q0_from_pair(P_l_k, P_r_k, kw, mesh_xy=mesh_xy)
         G.block_until_ready()
     return G

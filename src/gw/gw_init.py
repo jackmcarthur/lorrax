@@ -63,8 +63,11 @@ class _ChunkAlphas:
 
 
 def _build_chunk_alphas(*, nk, ns, mu, nq, band_chunk, p_x, p_y, p, nr) -> _ChunkAlphas:
+    # α_pair scales by ns² because the unified open-spin pair density is
+    # rank-5 ``(nk, ns, ns, μ, cr)`` for ALL channels (charge γ̃^0=I and
+    # transverse γ̃^i=α^i alike — see :mod:`common.isdf_fitting`).
     return _ChunkAlphas(
-        α_pair=_bytes_c128(nk, mu, shard=p_x * p_y),
+        α_pair=_bytes_c128(nk, ns, ns, mu, shard=p_x * p_y),
         α_psi_Y_bc=_bytes_c128(nk, band_chunk, ns, shard=p_y),
         α_zcol=_bytes_c128(nq, mu, shard=p),
         α_z_slice=_bytes_c128(mu, shard=p),
@@ -534,7 +537,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	``load_centroids_band_chunked``) and (b) the chunk plan from
 	:func:`compute_optimal_chunks`.  Returns ``(zeta_h5_path, mem_est)``.
 	"""
-	from common.isdf_fitting import fit_zeta_chunked_to_h5
+	from common.isdf_fitting import fit_zeta_to_h5
 
 	# ISDF left/right band windows (pair density needs asymmetric ranges)
 	band_range_left = (band_slices.b0, band_slices.b3)   # all val + sigma cond
@@ -579,7 +582,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	_band_norms = getattr(wfn, 'band_norms', None)
 
 	with timing.section("gw_jax.zeta_fit_chunked"), jax_profile.trace_section("zeta_fit"):
-		peak_bytes = fit_zeta_chunked_to_h5(
+		peak_bytes = fit_zeta_to_h5(
 			wfn=wfn, sym=sym, meta=meta,
 			centroid_indices=centroid_indices, mesh_xy=mesh_xy,
 			chunk_r=chunks['chunk_r'], output_file=zeta_h5_path,
@@ -667,7 +670,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 
 		# isdf_fitting / load_wfns caches close over tracers from the
 		# enclosing jit at first compile.  Reusing those compiled fns from
-		# a fresh fit_zeta_chunked_to_h5 invocation triggers
+		# a fresh fit_zeta_to_h5 invocation triggers
 		# UnexpectedTracerError because the closures hold values from a
 		# now-closed trace scope.  Clear before each channel.
 		import gc
@@ -675,10 +678,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 
 		def _drop_traced_caches():
 			_isdf._fit_one_rchunk_cache.clear()
-			_isdf._compute_pair_density_cache.clear()
+			_isdf._pair_density_cache.clear()
 			_isdf._accum_pair_density_cache.clear()
-			_isdf._compute_pair_density_vertex_cache.clear()
-			_isdf._accum_pair_density_vertex_cache.clear()
 			if hasattr(_lw, '_rchunk_slice_cache'):
 				_lw._rchunk_slice_cache.clear()
 			jax.clear_caches()
@@ -690,7 +691,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			print_fn(f"  [bispinor] μ_L={mu_L} → {zeta_mu_path}")
 			with timing.section(f"gw_jax.zeta_fit_chunked_mu{mu_L}"), \
 			     jax_profile.trace_section(f"zeta_fit_mu{mu_L}"):
-				fit_zeta_chunked_to_h5(
+				fit_zeta_to_h5(
 					wfn=wfn, sym=sym, meta=meta_curr,
 					centroid_indices=jnp.asarray(cents_curr_idx, dtype=jnp.int32),
 					mesh_xy=mesh_xy,
@@ -864,6 +865,17 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		                      backend=cfg.backend.slab_io) as reader:
 			V_q_raw = reader.get_tile(0, 0)
 			G0_all = reader.get_g0_CC()
+		# V_q_raw is on disk at LOGICAL n_rmu (the orchestrator strips
+		# the V-tile pad before write).  In-memory ψ flows at PADDED
+		# n_rmu so the σ_X kernel can broadcast V across G's μ axis.
+		# Pad V_q_raw with zeros to match — pad rows of ψ are zero
+		# (Phase 3a invariant), so zero-padding V is exact.
+		if int(V_q_raw.shape[-1]) < int(meta.n_rmu_padded):
+			pad = int(meta.n_rmu_padded) - int(V_q_raw.shape[-1])
+			V_q_raw = jnp.pad(V_q_raw, ((0, 0), (0, pad), (0, pad)))
+		if G0_all is not None and int(G0_all.shape[-1]) < int(meta.n_rmu_padded):
+			G0_all = jnp.pad(G0_all,
+			                 ((0, 0), (0, int(meta.n_rmu_padded) - int(G0_all.shape[-1]))))
 	else:
 		# Single dispatcher routes to the unified V_q tile driver (one
 		# inner kernel handles same/distinct ζ × Case A/B; one outer

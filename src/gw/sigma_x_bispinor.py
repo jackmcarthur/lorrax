@@ -59,54 +59,43 @@ from .v_q_bispinor import BispinorVqReader
 _TRANSVERSE_INDICES = (1, 2, 3)
 
 
-def _apply_gamma_left_to_xn(gamma: jax.Array, psi_xn: jax.Array) -> jax.Array:
-    """Left-multiply ``γ`` on the spin axis of ``psi_xn``.
-
-    psi_xn shape (nk, s, μ_X, n) with ns = 4 (bispinor).
-    Output ``γ ψ`` keeps the same layout; spin axis 1 is rewritten.
-
-        out[k, β, x, n] = Σ_s γ[β, s] · ψ_xn[k, s, x, n]
-    """
-    return jnp.einsum('bs,ksxn->kbxn', gamma, psi_xn, optimize=True)
-
-
-def _apply_gamma_left_to_yr(gamma: jax.Array, psi_yr: jax.Array) -> jax.Array:
-    """Left-multiply ``γ`` on the spin axis of ``psi_yr``.
-
-    psi_yr shape (nk, n, s, μ_Y) with ns = 4 (bispinor).
-    Spin axis is axis 2; the einsum below rewrites it.
-
-        out[k, n, β, μ] = Σ_s γ[β, s] · ψ_yr[k, n, s, μ]
-
-    Note: ``build_G`` internally applies ``jnp.conj(psi_yr)`` before
-    contracting on the spin axis ``t``.  Folding γ̃^j (Hermitian) into
-    psi_yr here yields ``conj(γ̃^j ψ) = γ̃^j^T ψ*`` which, when
-    contracted with ``psi_yn[k, t, μ_Y, n]`` on axis t, gives the
-    correct ``ψ†_{yr} γ̃^j ψ_{yn}`` Hermitian sandwich.  γ̃^j Hermitian
-    is essential for this identity; α^i and I_4 both qualify.
-    """
-    return jnp.einsum('bs,knsx->knbx', gamma, psi_yr, optimize=True)
-
-
 def _wfns_with_lorentz_vertices(wfns, mu_L: int, nu_L: int):
     """Return a Wavefunctions clone with γ̃^{μ_L} folded into psi_xn
-    (left vertex) and γ̃^{ν_L} folded into psi_yr (right vertex).
+    (left vertex axis 1) and γ̃^{ν_L} folded into psi_yr (right vertex
+    axis 2) via :func:`common.gamma_matrices.gamma_apply` — a gather
+    + per-element phase multiply, no 4×4 matmul (every γ̃^μ is a
+    monomial matrix with values ∈ {±1, ±i}).
 
-    For (μ_L, ν_L) = (0, 0) this is a trivial copy (γ̃^0 = I_4).
+    For (μ_L, ν_L) = (0, 0) γ̃^0 = I_4 (perm = identity, phase = 1)
+    so ``gamma_apply`` is a no-op — but we still short-circuit to
+    return the same array objects (avoids unnecessary copies on the
+    PSD scalar path).
 
-    psi_xr / psi_yn are passed through unchanged; the vertex sits on
-    the build_G side of the kernel chain and the project side
-    contracts the OUTPUT bands without further γ̃ insertions (the
-    internal-band γ̃ matrices are absorbed into G already).
+    psi_xr / psi_yn pass through unchanged; the γ̃ vertex sits on the
+    build_G side of the kernel chain — see the module docstring.
+
+    Note: ``build_G`` internally applies ``jnp.conj(psi_yr)`` before
+    contracting on the spin axis.  Folding γ̃^ν (Hermitian) into
+    psi_yr here yields ``conj(γ̃^ν ψ) = (γ̃^ν)* ψ* = (γ̃^ν)^T ψ*``,
+    which contracts with ``psi_yn`` to give the correct
+    ``ψ†_{yr} γ̃^ν ψ_{yn}`` Hermitian sandwich.  Required: γ̃^ν
+    Hermitian — γ̃^0 = I_4 and γ̃^i = α^i both qualify.
     """
-    from common.isdf_fitting import _gamma_tilde_matrix
-    gamma_mu = _gamma_tilde_matrix(mu_L)
-    gamma_nu = _gamma_tilde_matrix(nu_L)
+    from common.gamma_matrices import gamma_perm_phase, gamma_apply
 
-    psi_xn_new = (wfns.psi_xn if mu_L == 0
-                  else _apply_gamma_left_to_xn(gamma_mu, wfns.psi_xn))
-    psi_yr_new = (wfns.psi_yr if nu_L == 0
-                  else _apply_gamma_left_to_yr(gamma_nu, wfns.psi_yr))
+    if mu_L == 0:
+        psi_xn_new = wfns.psi_xn
+    else:
+        perm, phase = gamma_perm_phase(mu_L)
+        # psi_xn shape (nk, s, μ_X, n); spin axis = 1.
+        psi_xn_new = gamma_apply(wfns.psi_xn, perm, phase, axis=1)
+
+    if nu_L == 0:
+        psi_yr_new = wfns.psi_yr
+    else:
+        perm, phase = gamma_perm_phase(nu_L)
+        # psi_yr shape (nk, n, s, μ_Y); spin axis = 2.
+        psi_yr_new = gamma_apply(wfns.psi_yr, perm, phase, axis=2)
 
     return dataclasses.replace(wfns, psi_xn=psi_xn_new, psi_yr=psi_yr_new)
 
@@ -166,6 +155,22 @@ def compute_sigma_x_bispinor(
     nk_tot = int(meta.nk_tot)
     sigma_sx_k, _, _ = _make_cohsex_kernels(mesh_xy, meta.kgrid, nk_tot)
 
+    # ψ is delivered at PADDED n_rmu (load_centroids_band_chunked rounds
+    # to mesh-product); V tiles on disk are at LOGICAL extent.  Pad V to
+    # match ψ's μ-axis so the convolve broadcasts correctly.  Pad rows
+    # of ψ are zero (Phase 3a invariant), so zero-padding V is exact.
+    n_rmu_T_padded = int(wfns_transverse.psi_yr.shape[-1])
+
+    def _pad_V_to_padded(V_logical: jax.Array) -> jax.Array:
+        n_l = int(V_logical.shape[-2])
+        n_r = int(V_logical.shape[-1])
+        if n_l == n_rmu_T_padded and n_r == n_rmu_T_padded:
+            return V_logical
+        return jnp.pad(
+            V_logical,
+            ((0, 0), (0, n_rmu_T_padded - n_l), (0, n_rmu_T_padded - n_r)),
+        )
+
     sig_x_b = None
     contributions: dict[tuple[int, int], float] = {}
     with BispinorVqReader(bispinor_v_q_path, mesh_xy,
@@ -173,7 +178,7 @@ def compute_sigma_x_bispinor(
         for i in _TRANSVERSE_INDICES:
             for j in _TRANSVERSE_INDICES:
                 wfns_ij = _wfns_with_lorentz_vertices(wfns_transverse, i, j)
-                V_ij = reader.get_tile(i, j)
+                V_ij = _pad_V_to_padded(reader.get_tile(i, j))
                 contrib = sigma_sx_k(wfns_ij, Gij, V_ij)
                 contrib.block_until_ready()
                 # Per-tile diagonal trace (eV) for diagnostic comparison

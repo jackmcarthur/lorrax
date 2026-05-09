@@ -17,53 +17,56 @@ import jax
 import jax.numpy as jnp
 
 
-def test_gamma0_is_identity_so_left_fold_is_noop():
-    """γ̃^0 = I_4 (per the LORRAX storage convention).  Folding γ̃^0
-    into psi_xn must return the input array unchanged."""
-    from src.gw.sigma_x_bispinor import _apply_gamma_left_to_xn
-    from src.common.isdf_fitting import _gamma_tilde_matrix
+def test_gamma0_perm_phase_is_identity():
+    """γ̃^0 = I_4: perm = (0,1,2,3), phase = (1,1,1,1).  Applying it
+    via gamma_apply must leave any tensor unchanged on its spin axis."""
+    from src.common.gamma_matrices import gamma_perm_phase, gamma_apply
 
-    gamma0 = _gamma_tilde_matrix(0)
-    np.testing.assert_array_equal(np.asarray(gamma0), np.eye(4))
+    perm, phase = gamma_perm_phase(0)
+    np.testing.assert_array_equal(np.asarray(perm), np.arange(4))
+    np.testing.assert_array_equal(np.asarray(phase), np.ones(4, dtype=np.complex128))
 
     rng = np.random.default_rng(0)
     psi_xn = jnp.asarray(
         (rng.standard_normal((2, 4, 5, 3)) + 1j * rng.standard_normal((2, 4, 5, 3)))
         .astype(np.complex128))
-    out = _apply_gamma_left_to_xn(gamma0, psi_xn)
+    out = gamma_apply(psi_xn, perm, phase, axis=1)
     np.testing.assert_allclose(np.asarray(out), np.asarray(psi_xn), atol=1e-15)
 
 
-def test_gamma_left_fold_is_matmul_on_spin_axis():
-    """``_apply_gamma_left_to_xn(γ, ψ)[k, β, μ, n]`` must equal
-    ``Σ_α γ[β, α] ψ[k, α, μ, n]``."""
-    from src.gw.sigma_x_bispinor import _apply_gamma_left_to_xn
+def test_gamma_apply_matches_dense_matmul_xn_axis():
+    """``gamma_apply(ψ, perm, phase, axis=1)`` must equal
+    ``Σ_α γ̃[β, α] ψ[k, α, μ, n]`` for every γ̃^μ ∈ {γ̃^0..3}."""
+    from src.common.gamma_matrices import (
+        gamma_perm_phase, gamma_apply, gamma0, gamma1, gamma2, gamma3,
+    )
 
     rng = np.random.default_rng(1)
-    gamma = jnp.asarray((rng.standard_normal((4, 4))
-                         + 1j * rng.standard_normal((4, 4))).astype(np.complex128))
     psi = jnp.asarray((rng.standard_normal((2, 4, 3, 7))
                        + 1j * rng.standard_normal((2, 4, 3, 7))).astype(np.complex128))
+    for mu, gamma_dense in enumerate([gamma0, gamma1, gamma2, gamma3]):
+        perm, phase = gamma_perm_phase(mu)
+        out = gamma_apply(psi, perm, phase, axis=1)
+        ref = np.einsum('bs,ksxn->kbxn', np.asarray(gamma_dense), np.asarray(psi))
+        np.testing.assert_allclose(np.asarray(out), ref, atol=1e-14,
+                                   err_msg=f"γ̃^{mu} mismatch on psi_xn axis")
 
-    out = _apply_gamma_left_to_xn(gamma, psi)
-    # Reference: matmul on the spin axis (axis 1 of psi).
-    ref = np.einsum('bs,ksxn->kbxn', np.asarray(gamma), np.asarray(psi))
-    np.testing.assert_allclose(np.asarray(out), ref, atol=1e-14)
 
-
-def test_gamma_yr_fold_is_matmul_on_spin_axis():
-    """psi_yr has shape (nk, n, s, μ_Y); γ̃ folds via axis 2."""
-    from src.gw.sigma_x_bispinor import _apply_gamma_left_to_yr
+def test_gamma_apply_matches_dense_matmul_yr_axis():
+    """psi_yr has shape (nk, n, s, μ_Y); γ̃ applies on axis 2."""
+    from src.common.gamma_matrices import (
+        gamma_perm_phase, gamma_apply, gamma0, gamma1, gamma2, gamma3,
+    )
 
     rng = np.random.default_rng(2)
-    gamma = jnp.asarray((rng.standard_normal((4, 4))
-                         + 1j * rng.standard_normal((4, 4))).astype(np.complex128))
     psi = jnp.asarray((rng.standard_normal((2, 7, 4, 3))
                        + 1j * rng.standard_normal((2, 7, 4, 3))).astype(np.complex128))
-
-    out = _apply_gamma_left_to_yr(gamma, psi)
-    ref = np.einsum('bs,knsx->knbx', np.asarray(gamma), np.asarray(psi))
-    np.testing.assert_allclose(np.asarray(out), ref, atol=1e-14)
+    for mu, gamma_dense in enumerate([gamma0, gamma1, gamma2, gamma3]):
+        perm, phase = gamma_perm_phase(mu)
+        out = gamma_apply(psi, perm, phase, axis=2)
+        ref = np.einsum('bs,knsx->knbx', np.asarray(gamma_dense), np.asarray(psi))
+        np.testing.assert_allclose(np.asarray(out), ref, atol=1e-14,
+                                   err_msg=f"γ̃^{mu} mismatch on psi_yr axis")
 
 
 def test_wfns_replace_no_op_for_00():

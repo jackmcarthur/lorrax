@@ -245,7 +245,7 @@ def test_valid_shape_from_pad_meta_axis_out_of_range_raises():
 
 
 # ---------------------------------------------------------------------------
-# compute_L_q_from_CCT: Cholesky on a logical n_rmu that doesn't divide the mesh
+# factor_c_q: Cholesky on a logical n_rmu that doesn't divide the mesh
 # ---------------------------------------------------------------------------
 #
 # Wired in by the n_rmu padding refactor: n_rmu may be logically prime (661)
@@ -271,15 +271,15 @@ def test_compute_L_q_indivisible_logical_n_rmu(mesh_2x2):
     7 is the smallest n_rmu that fails 2x2 mesh divisibility in every spec
     (P('x','y'), P(('x','y')), P('x') alone).  C_q is built at logical
     n_rmu=7, zero-padded to n_rmu_padded=8 so the boundary sharding
-    P(None, 'x', 'y') is admissible, then handed to compute_L_q_from_CCT
+    P(None, 'x', 'y') is admissible, then handed to factor_c_q
     with n_rmu_logical=7.  Output L is at PADDED extent (8×8) with the
     Cholesky factor of G_log in the leading logical block and IDENTITY
-    in the pad block — this is what downstream solve_zeta_from_L_q's
+    in the pad block — this is what downstream solve_zeta's
     in_shardings expect at the n_rmu_padded boundary, while still
     producing the correct logical solution (Z's pad rows are zero, so
     the back-solve produces zeta_pad = 0 by construction).
     """
-    from common.isdf_fitting import compute_L_q_from_CCT
+    from common.isdf_fitting import factor_c_q
 
     n_log, n_pad, nq = 7, 8, 2
     rng = np.random.default_rng(42)
@@ -290,7 +290,7 @@ def test_compute_L_q_indivisible_logical_n_rmu(mesh_2x2):
     G_sharded = jax.device_put(
         jnp.asarray(G_pad), NamedSharding(mesh_2x2, P(None, 'x', 'y')))
 
-    L = compute_L_q_from_CCT(G_sharded, mesh_2x2, n_rmu_logical=n_log)
+    L = factor_c_q(G_sharded, mesh_2x2, n_rmu_logical=n_log)
     assert L.shape == (nq, n_pad, n_pad), (
         f"L should be at padded extent, got {L.shape}")
 
@@ -328,7 +328,7 @@ def test_compute_L_q_legacy_divisible_path_unchanged():
     on real GPUs via the integration tests.  This test guards the public
     contract: ``n_rmu_logical=None`` is a no-op vs ``n_rmu_logical=n``.
     """
-    from common.isdf_fitting import compute_L_q_from_CCT
+    from common.isdf_fitting import factor_c_q
 
     devs = jax.devices()[:1]
     mesh_1x1 = Mesh(np.asarray(devs).reshape(1, 1), axis_names=("x", "y"))
@@ -339,7 +339,7 @@ def test_compute_L_q_legacy_divisible_path_unchanged():
     G_sharded = jax.device_put(
         jnp.asarray(G), NamedSharding(mesh_1x1, P(None, 'x', 'y')))
 
-    L_default = compute_L_q_from_CCT(G_sharded, mesh_1x1)
+    L_default = factor_c_q(G_sharded, mesh_1x1)
     assert L_default.shape == (nq, n, n)
     G_hat = np.einsum('qij,qkj->qik',
                       np.asarray(L_default), np.asarray(L_default).conj())
@@ -347,7 +347,7 @@ def test_compute_L_q_legacy_divisible_path_unchanged():
     np.testing.assert_allclose(G_hat, G, atol=1e-10 * scale, rtol=1e-10)
 
     # n_rmu_logical=n_rmu_input is equivalent to None.  Same answer.
-    L_explicit = compute_L_q_from_CCT(G_sharded, mesh_1x1, n_rmu_logical=n)
+    L_explicit = factor_c_q(G_sharded, mesh_1x1, n_rmu_logical=n)
     np.testing.assert_array_equal(
         np.asarray(L_default), np.asarray(L_explicit))
 
@@ -355,14 +355,14 @@ def test_compute_L_q_legacy_divisible_path_unchanged():
 def test_compute_L_q_indivisible_indefinite_path(mesh_2x2):
     """vertex_mu_L != 0 path: passthrough with logical-slice + identity-pad.
 
-    The transverse channel CCT is indefinite; compute_L_q_from_CCT
+    The transverse channel CCT is indefinite; factor_c_q
     skips the factorisation and returns the (un-factored) CCT for
     downstream LU.  At padded boundary the slice extracts the logical
     block, then ``_embed_logical_in_padded`` re-embeds with identity
-    in the pad block so downstream ``solve_zeta_from_L_q``'s
+    in the pad block so downstream ``solve_zeta``'s
     in_shardings see a divisible n_rmu_padded extent.
     """
-    from common.isdf_fitting import compute_L_q_from_CCT
+    from common.isdf_fitting import factor_c_q
 
     n_log, n_pad, nq = 7, 8, 2
     rng = np.random.default_rng(11)
@@ -376,7 +376,7 @@ def test_compute_L_q_indivisible_indefinite_path(mesh_2x2):
     H_sharded = jax.device_put(
         jnp.asarray(H_pad), NamedSharding(mesh_2x2, P(None, 'x', 'y')))
 
-    out = compute_L_q_from_CCT(
+    out = factor_c_q(
         H_sharded, mesh_2x2, vertex_mu_L=1, n_rmu_logical=n_log)
     assert out.shape == (nq, n_pad, n_pad)
     out_np = np.asarray(out)
@@ -395,9 +395,9 @@ def test_compute_L_q_indivisible_indefinite_path(mesh_2x2):
 
 def test_compute_L_q_logical_exceeds_input_raises(mesh_2x2):
     """n_rmu_logical > input dim is a programmer error; raise."""
-    from common.isdf_fitting import compute_L_q_from_CCT
+    from common.isdf_fitting import factor_c_q
 
     G = jnp.asarray(_make_psd_complex(np.random.default_rng(0), 8))
     G_sharded = jax.device_put(G, NamedSharding(mesh_2x2, P(None, 'x', 'y')))
     with pytest.raises(ValueError, match="exceeds input extent"):
-        compute_L_q_from_CCT(G_sharded, mesh_2x2, n_rmu_logical=9)
+        factor_c_q(G_sharded, mesh_2x2, n_rmu_logical=9)

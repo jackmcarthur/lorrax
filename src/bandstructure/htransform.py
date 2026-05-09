@@ -24,7 +24,7 @@ from common import Meta
 from common.load_wfns import (
     get_enk_bandrange, load_centroids_band_chunked, iter_psi_rchunk_bandwise,
 )
-from common.isdf_fitting import compute_L_q_from_CCT
+from common.isdf_fitting import factor_c_q
 from common.fft_helpers import make_flat_k_ifftn
 
 
@@ -50,7 +50,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     Single ('x','y') mesh throughout. ψ at centroids comes from
     ``load_centroids_band_chunked``; ψ at full r is streamed via
     ``iter_psi_rchunk_bandwise`` (band+r chunked, sharded on 'y'). G is built
-    sharded ``P('x','y')`` and Cholesky-factored via ``compute_L_q_from_CCT``
+    sharded ``P('x','y')`` and Cholesky-factored via ``factor_c_q``
     so the 1×1-mesh dense path and the 2D-blocked distributed path both work.
 
     Args:
@@ -175,11 +175,11 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     log_fn(f"  G accumulation: {chunk_count} chunk(s), {time.time()-t2:.2f}s")
 
     # ── 4. Cholesky on G ──
-    # FFI seam: gw_jax's compute_L_q_from_CCT (which has dual 1×1-dense /
+    # FFI seam: gw_jax's factor_c_q (which has dual 1×1-dense /
     # 2D-blocked paths) is the natural drop-in for distributed scaling, but
     # its 1e-14·trace ridge is calibrated for ISDF's huge-trace C_q matrices
     # and biases htransform's small-trace G by ~1e-5. Use raw Cholesky for
-    # numerical parity with the legacy pipeline; swap to compute_L_q_from_CCT
+    # numerical parity with the legacy pipeline; swap to factor_c_q
     # (or its FFI variant) when n_μ scales to where rank-deficiency dominates.
     t3 = time.time()
     L = jnp.linalg.cholesky(G)
