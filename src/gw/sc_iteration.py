@@ -19,6 +19,40 @@ Anderson mixing composes meaningfully).  Every iteration:
 The iteration map is a pure function: ``state → state``.  The body has
 no closure capture of mutable bundles; it composes trivially with rcrop
 Anderson mixing or future ``jax.lax.scan`` migration.
+
+Active / inactive partition
+---------------------------
+The carry ``H_qp_dft`` is sized ``(nk, nb_active, nb_active)`` where
+the **active subspace** is ``band_slices.sigma = [b0, b3)`` — the bands
+``kin_ion.h5`` was generated for and the bands :mod:`cohsex_sigma` /
+:mod:`ppm_pipeline` compute Σ for.  Bands above ``b3`` keep their DFT
+ψ + DFT energies throughout SC iteration; their QP corrections come
+from the scissor extrapolation downstream (see :mod:`gw.scissor`).
+
+Robustness assumptions for the active-space partition:
+
+- **Insulator with sorted DFT bands**: robust.  ψ rotation within the
+  active subspace preserves orthonormality with the inactive bands
+  (block-diagonal U on nb_full).
+- **Active block aligned with kin_ion file**: validated by the shape
+  match ``kin_ion.shape[1:] == (nb_sigma, nb_sigma)`` at iteration
+  init time.
+- **Metals or near-gap-closure systems**: NOT robust — rotation may
+  push an active "valence" band above the active "conduction" band's
+  energy, or above an inactive band's energy.  ``occ`` is rebuilt
+  per-band-vs-efermi so it stays correct, but downstream consumers
+  (chi0's slices.val/cond split) assume a strict val/cond ordering.
+  Add a re-sort + re-occupy step here if/when metals are supported.
+- **Carry over multiple iterations**: ``U_qp`` is recomputed from the
+  carry each iteration, so there's no accumulated U-product drift.
+
+TODO (per design discussion 2026-05-08): inactive bands above ``b3``
+that are themselves entirely within the Σ_c(ω) grid bounds at every k
+should receive a *diagonal* Σ correction at each SC iteration (no
+off-diagonals — they're never mixed with active bands).  Bands fully
+outside the ω-grid keep the scissor extrapolation.  The "best
+determined Σ for an inactive band that straddles the ω-grid edge after
+SC updates" is undecided; flagged for a separate design pass.
 """
 
 from __future__ import annotations
@@ -122,15 +156,70 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
 # Iteration map
 # ---------------------------------------------------------------------------
 
-@jax.jit
-def _diagonalize_and_get_efermi(H: jax.Array, n_occ: int) -> tuple[
-    jax.Array, jax.Array, jax.Array]:
-    """Hermitise + eigh; return (E, U, efermi_ry)."""
-    H_herm = 0.5 * (H + jnp.conj(jnp.swapaxes(H, -1, -2)))
-    E, U = jax.vmap(jnp.linalg.eigh)(H_herm)
+def _make_kshard_eigh(mesh_xy: Mesh, *, eigvalsh_only: bool):
+    """Return a jit'd eigh that briefly k-shards the input over the mesh
+    so each device only does its slice of the per-k diagonalisations,
+    then allgathers the eigenvalues (and U if requested) back to
+    replicated.  Pure perf hint — the math is identical to running
+    ``vmap(eigh)`` on the replicated input.
+
+    ``mesh_xy.size`` must divide ``nk``; otherwise the resharding fails.
+    """
+    rep_H = NamedSharding(mesh_xy, P(None, None, None))
+    rep_E = NamedSharding(mesh_xy, P(None, None))
+    rep_U = NamedSharding(mesh_xy, P(None, None, None))
+    k_shard_3d = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
+
+    if eigvalsh_only:
+        @jax.jit
+        def _f(H):
+            H_k = jax.lax.with_sharding_constraint(H, k_shard_3d)
+            H_h = 0.5 * (H_k + jnp.conj(jnp.swapaxes(H_k, -1, -2)))
+            E = jax.vmap(jnp.linalg.eigvalsh)(H_h)
+            return jax.lax.with_sharding_constraint(E, rep_E)
+        return _f
+    else:
+        @jax.jit
+        def _f(H):
+            H_k = jax.lax.with_sharding_constraint(H, k_shard_3d)
+            H_h = 0.5 * (H_k + jnp.conj(jnp.swapaxes(H_k, -1, -2)))
+            E, U = jax.vmap(jnp.linalg.eigh)(H_h)
+            E = jax.lax.with_sharding_constraint(E, rep_E)
+            U = jax.lax.with_sharding_constraint(U, rep_U)
+            return E, U
+        return _f
+
+
+# Kernel cache: one (eigh, eigvalsh) pair per mesh.  Re-used across all
+# SC iterations so the JIT cost is paid once.
+_KSHARD_EIGH_CACHE: dict[int, tuple] = {}
+
+
+def _kshard_eigh_kernels(mesh_xy: Mesh) -> tuple:
+    key = id(mesh_xy)
+    pair = _KSHARD_EIGH_CACHE.get(key)
+    if pair is None:
+        pair = (
+            _make_kshard_eigh(mesh_xy, eigvalsh_only=False),
+            _make_kshard_eigh(mesh_xy, eigvalsh_only=True),
+        )
+        _KSHARD_EIGH_CACHE[key] = pair
+    return pair
+
+
+def _diagonalize_and_get_efermi(
+    H: jax.Array, n_occ: int, mesh_xy: Mesh,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Hermitise + eigh + midgap E_F.  Returns (E, U, efermi_ry).
+
+    Per-k eighs are briefly k-sharded over the device mesh so each
+    device only does ``nk / mesh_size`` of them.  The midgap reduction
+    runs on the gathered E (small, replicated).
+    """
+    eigh_kshard, _ = _kshard_eigh_kernels(mesh_xy)
+    E, U = eigh_kshard(H)
     vbm = jnp.max(E[:, :n_occ])
-    cbm = jnp.where(n_occ < E.shape[1],
-                    jnp.min(E[:, n_occ:]), vbm)
+    cbm = jnp.where(n_occ < E.shape[1], jnp.min(E[:, n_occ:]), vbm)
     efermi = 0.5 * (vbm + cbm)
     return E, U, efermi
 
@@ -152,7 +241,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
 
     n_occ = int(inputs.meta.nelec)
     E_qp_ry, U_qp, efermi_ry = _diagonalize_and_get_efermi(
-        state.H_qp_dft, n_occ)
+        state.H_qp_dft, n_occ, inputs.mesh_xy)
 
     # Rotate the active subspace of the DFT bundle to this iteration's QP
     # basis.  Bands outside ``slices.sigma`` keep their DFT ψ + DFT energy
@@ -207,12 +296,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
 # Driver
 # ---------------------------------------------------------------------------
 
-@jax.jit
-def _eigvalsh_per_k(H: jax.Array) -> jax.Array:
-    H_herm = 0.5 * (H + jnp.conj(jnp.swapaxes(H, -1, -2)))
-    return jax.vmap(jnp.linalg.eigvalsh)(H_herm)
-
-
 def run_self_consistency(
     state_init: SCState,
     inputs: SCInputs,
@@ -224,8 +307,8 @@ def run_self_consistency(
 
     The iteration carry holds only ``H_qp_dft``; convergence is judged
     on the **eigenvalues** of consecutive H matrices (recomputed each
-    iteration) so the carry never gets out of sync with a separately-
-    tracked E array.
+    iteration via the same k-sharded eigvalsh kernel as the main map)
+    so the carry never gets out of sync with a separately-tracked E.
 
     Returns
     -------
@@ -236,15 +319,16 @@ def run_self_consistency(
         ``max_iter == 1`` (one-shot G0W0).
     """
     print_fn = inputs.print_fn
+    _, eigvalsh_kshard = _kshard_eigh_kernels(inputs.mesh_xy)
     state = state_init
     rms_history: list[float] = []
-    E_prev_ev = np.asarray(_eigvalsh_per_k(state.H_qp_dft)) * RYD_TO_EV
+    E_prev_ev = np.asarray(eigvalsh_kshard(state.H_qp_dft)) * RYD_TO_EV
 
     for it in range(max_iter):
         state_new = gw_iteration_map(state, inputs)
         if it == 0 and max_iter == 1:
             return state_new, rms_history
-        E_new_ev = np.asarray(_eigvalsh_per_k(state_new.H_qp_dft)) * RYD_TO_EV
+        E_new_ev = np.asarray(eigvalsh_kshard(state_new.H_qp_dft)) * RYD_TO_EV
         rms = float(np.sqrt(np.mean((E_new_ev - E_prev_ev) ** 2)))
         rms_history.append(rms)
         print_fn(f"  SC iter {state_new.iteration}: RMS ΔE = {rms:.6f} eV")
