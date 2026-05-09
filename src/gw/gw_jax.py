@@ -44,13 +44,10 @@ from .ppm_pipeline import compute_ppm_sigma_pipeline
 from .cohsex_sigma import (
 	build_Gij,
 	compute_cohsex_sigma,
-	get_cohsex_kernels,
-	_add_static_head,
 )
 from .qsgw_utils import (
 	build_qsgw_sigma_xc,
 	extract_sigma_diag_replicated,
-	print_scf_diagnostics,
 	solve_diagonal_sigma_fixed_point,
 )
 from .head_correction import (
@@ -60,9 +57,6 @@ from .head_correction import (
 	format_static_head_diagnostics,
 )
 from .wavefunction_bundle import BandSlices
-from mixing.acceleration import (
-    rcrop_nojit, hermitian_to_upper_flat, upper_flat_to_hermitian
-)
 from common import Meta, RYD_TO_EV
 from common import jax_profile
 import common.timing as timing
@@ -336,7 +330,10 @@ def main(argv=None):
 	# See reports/mos2_kgrid_gnppm_head_convergence_2026-4-10/.
 	mode = config.compute_mode
 	ppm_outputs = None
-	if mode.is_dynamic:
+	# Skip the standalone PPM pipeline when running SC-dynamic — the
+	# QSGW iteration map calls compute_sigma_xc internally each step
+	# and would re-do this work on iter 1.
+	if mode.is_dynamic and not config.self_consistent:
 		ppm_outputs = compute_ppm_sigma_pipeline(
 			wfns=wfns,
 			V_q=V_q, W_q=W_q, sig_x=sig_x, sig_h=sig_h,
@@ -378,51 +375,125 @@ def main(argv=None):
 	# ±W^c(0)/(2·V_cell·N_k) on-shell — ~1.24 eV/band on Si 4×4×4 60b.
 	# See reports/mos2_kgrid_gnppm_head_convergence_2026-4-10/.
 	E_sc_ev = None
+	sc_rms_history: list[float] = []
 	if config.self_consistent:
-		# SC-COHSEX iteration — reuse the cached jit'd kernels directly so
-		# the fixed-point driver can vary Gij.
-		sigma_sx_k, sigma_coh_k, hartree_k = get_cohsex_kernels(meta, mesh_xy)
-		def _add_head(a, b):
-			return _add_static_head(
-				a, b, static_head_terms=static_head_terms,
-				meta=meta, mesh_xy=mesh_xy, do_screened=config.do_screened)
-		n_upper = meta.nb_sigma * (meta.nb_sigma + 1) // 2
-		nk = meta.nk_tot
+		# SC-GW iteration map — mode-agnostic.  Each step rotates ψ via
+		# U_qp from eigh(H_qp_dft), then recomputes χ₀ → W → Σ_xc via
+		# the mode-orthogonal compute_sigma_xc dispatch (X_ONLY / COHSEX
+		# / GN_PPM / HL_PPM all use the same map).  The carry is just
+		# H_qp_dft on the active subspace; convergence is judged on RMS
+		# ΔE between consecutive eigvalsh.
+		from .sc_iteration import (
+			SCInputs, make_initial_state_from_dft, run_self_consistency)
+		from .band_partition import BandPartition
+		from .scissor import classify_bands_in_grid
+		from types import SimpleNamespace
 
-		def _sc_step(sigma_upper_flat):
-			sigma_full = upper_flat_to_hermitian(
-				sigma_upper_flat.reshape(nk, n_upper), meta.nb_sigma)
-			H = 0.5 * ((kin_ion + sigma_full) + jnp.conj(jnp.swapaxes(kin_ion + sigma_full, -1, -2)))
-			_, U = jax.vmap(jnp.linalg.eigh, in_axes=0)(H)
-			f = (jnp.arange(meta.nb_sigma) < meta.nelec).astype(jnp.float64)
-			Gij_new = jnp.einsum('kim,m,kjm->kij', U, f, jnp.conj(U), optimize=True)
-			with mesh_xy:
-				sx_new = sigma_sx_k(wfns, Gij_new, W_q)
-				coh_new = sigma_coh_k(wfns, W_q, V_q)
-				h_new = hartree_k(wfns, Gij_new, V_q)
-			sx_new, coh_new = _add_head(sx_new, coh_new)
-			return hermitian_to_upper_flat(sx_new + coh_new + h_new).flatten()
+		_enk_active, _ = get_enk_bandrange(
+			wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
+			nspinor=meta.nspinor)
+		_e_dft_active_kn_ry = jnp.asarray(
+			np.asarray(_enk_active, dtype=np.float64))
+		_nb_active = _e_dft_active_kn_ry.shape[1]
+		_val_mask_active = jnp.broadcast_to(
+			jnp.arange(_nb_active) < int(meta.nelec),
+			_e_dft_active_kn_ry.shape)
 
-		sigma_total = sig_sx + sig_coh + sig_h
-		result = rcrop_nojit(
-			lambda x: _sc_step(x) - x,
-			hermitian_to_upper_flat(sigma_total).flatten(),
-			m=3, maxit=40, tol=1e-5,
-			print_fn=print0 if meta.rank == 0 else None)
-		sigma_total = upper_flat_to_hermitian(result.x.reshape(nk, n_upper), meta.nb_sigma)
+		# In-range mask: bands whose E_DFT lies inside [σ_ω_min, σ_ω_max]
+		# at *every* k.  Bands outside the ω-grid get the per-iteration
+		# scissor (otherwise their Σ_c is clamped at the grid edge → the
+		# QSGW H-build feeds garbage diagonals that explode the iteration).
+		_efermi_ev = float(wfn.efermi) * RYD_TO_EV
+		_omega_min_ev = float(config.ppm.omega_min_ev) + _efermi_ev
+		_omega_max_ev = float(config.ppm.omega_max_ev) + _efermi_ev
+		_e_dft_ev = np.asarray(_enk_active, dtype=np.float64) * RYD_TO_EV
+		_band_in_grid, _ = classify_bands_in_grid(
+			_e_dft_ev, _omega_min_ev, _omega_max_ev)
+		_in_range = jnp.asarray(_band_in_grid, dtype=bool)
+		# Default protected = in-range: these bands carry full off-diag Σ.
+		# Out-of-range bands take the scissor, no off-diag mixing.
+		_protected = _in_range
+		print0(
+			f"  SC partition: protected/in-range = {int(_band_in_grid.sum())}"
+			f"/{int(_band_in_grid.size)} bands"
+		)
+		_partition = BandPartition(
+			protected_mask=_protected, in_range_mask=_in_range)
+		_partition.warn_if_protected_outside_grid(print_fn=print0)
 
-		# Final sigma components from converged Gij
-		H_for_diag = 0.5 * ((kin_ion + sigma_total) + jnp.conj(jnp.swapaxes(kin_ion + sigma_total, -1, -2)))
-		_, U_diag = jax.vmap(jnp.linalg.eigh, in_axes=0)(H_for_diag)
-		f = (jnp.arange(meta.nb_sigma) < meta.nelec).astype(jnp.float64)
-		Gij_final = jnp.einsum('kim,m,kjm->kij', U_diag, f, jnp.conj(U_diag), optimize=True)
-		print_scf_diagnostics(Gij_final, U_diag, meta.nelec, meta.nb_sigma, print0)
-		with mesh_xy:
-			sig_sx  = sigma_sx_k(wfns, Gij_final, W_q)
-			sig_coh = sigma_coh_k(wfns, W_q, V_q)
-			sig_h   = hartree_k(wfns, Gij_final, V_q)
-		sig_sx, sig_coh = _add_head(sig_sx, sig_coh)
-		sigma_total = sig_sx + sig_coh + sig_h
+		# ω-grid bounds for the dynamic per-iteration in_range refresh.
+		# Only meaningful for dynamic compute modes; pass None for static.
+		_omega_min_ry = (
+			_omega_min_ev / RYD_TO_EV if mode.is_dynamic else None)
+		_omega_max_ry = (
+			_omega_max_ev / RYD_TO_EV if mode.is_dynamic else None)
+
+		_sc_inputs = SCInputs(
+			wfns_dft=wfns, V_q=V_q, kin_ion_dft=kin_ion,
+			quad=quad, e_ref=e_ref,
+			static_head_terms=static_head_terms,
+			head_resolver=head_resolver,
+			config=config, meta=meta, mesh_xy=mesh_xy,
+			sym=sym, wfn=wfn,
+			band_slices=band_slices, input_dir=input_dir,
+			partition=_partition,
+			e_dft_active_kn_ry=_e_dft_active_kn_ry,
+			valence_mask_active_kn=_val_mask_active,
+			partition_omega_min_ry=_omega_min_ry,
+			partition_omega_max_ry=_omega_max_ry,
+			print_fn=print0,
+		)
+		_state_init = make_initial_state_from_dft(_sc_inputs)
+		# TODO: plumb max_iter / tol_ev through config; env vars for now
+		# so the first end-to-end QSGW test can vary them without rebuild.
+		_max_iter = int(os.environ.get("LORRAX_SC_MAX_ITER", "20"))
+		_tol_ev = float(os.environ.get("LORRAX_SC_TOL_EV", "1.0e-4"))
+		_accel = os.environ.get("LORRAX_SC_ACCEL", "rcrop")
+		_history_depth = int(os.environ.get("LORRAX_SC_DEPTH", "5"))
+		_mixing = float(os.environ.get("LORRAX_SC_MIXING", "1.0"))
+		print0(f"  SC: mode={mode.value}, max_iter={_max_iter}, "
+		       f"tol={_tol_ev:.1e} eV, accel={_accel}"
+		       + (f", depth={_history_depth}" if _accel == "rcrop"
+		          else f", α={_mixing:.2f}"))
+		_state_final, sc_rms_history = run_self_consistency(
+			_state_init, _sc_inputs,
+			max_iter=_max_iter, tol_ev=_tol_ev,
+			accelerator=_accel,
+			history_depth=_history_depth,
+			mixing=_mixing,
+		)
+		_sigma_result = _state_final.last_sigma_result
+		print0(
+			f"  SC done: {len(sc_rms_history)} iterations"
+			+ (f", final RMS ΔE = {sc_rms_history[-1]:.4e} eV"
+				if sc_rms_history else " (one-shot)"))
+
+		# Plumb the final SigmaResult into the names the writer + freq_debug
+		# block use downstream.  Static modes leave the dynamic fields None;
+		# dynamic modes populate sigma_c_omega / sigma_c_at_dft_diag_ev /
+		# omega_dft_rel_ev / etc.
+		sig_h = _sigma_result.v_h_kij_ry
+		sig_x = _sigma_result.sigma_x_kij_ry
+		sigma_total = _sigma_result.sigma_xc_kij_ry + sig_h
+		if _sigma_result.sigma_sx_kij_ry is not None:
+			sig_sx = _sigma_result.sigma_sx_kij_ry
+			sig_coh = _sigma_result.sigma_coh_kij_ry
+		sigma_c_at_dft_ev = _sigma_result.sigma_c_at_dft_diag_ev
+		omega_dft_rel_ev = _sigma_result.omega_dft_rel_ev
+		efermi_dft_ev = float(wfn.efermi) * RYD_TO_EV
+		sigma_omega_h5_path = _sigma_result.sigma_omega_h5_path
+		if _sigma_result.omega_grid_ev is not None:
+			ppm_options = SimpleNamespace(
+				omega_grid_ev=_sigma_result.omega_grid_ev,
+				omega_grid_ry=_sigma_result.omega_grid_ry,
+			)
+			ppm_outputs = SimpleNamespace(
+				sigma_c_omega=_sigma_result.sigma_c_omega_kij_ry,
+				head_sigma_diag_w_kn_ry=_sigma_result.head_sigma_diag_w_kn_ry,
+			)
+		if sigma_c_at_dft_ev is not None:
+			sigma_xc_at_dft_ev = sigma_c_at_dft_ev + np.real(np.diagonal(
+				np.asarray(sig_x), axis1=1, axis2=2)) * RYD_TO_EV
 	elif mode.is_dynamic and ppm_outputs is not None and ppm_outputs.sigma_c_omega is not None:
 		# G0W0/QSGW: diagonal-Σ(E) fixed point (with optional scissor) →
 		# QSGW Σ_xc^QSGW.  Restart-friendly: this whole block consumes only

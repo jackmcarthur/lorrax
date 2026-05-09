@@ -114,6 +114,14 @@ class SCInputs:
     partition: BandPartition
     e_dft_active_kn_ry: jax.Array      # (nk, nb_active) DFT energies for scissor fit
     valence_mask_active_kn: jax.Array  # (nk, nb_active) bool — for scissor val/cond split
+    # Σ_c(ω) grid bounds in Ry, ABSOLUTE (not E_F-relative).  Used to
+    # demote bands whose current-iter E_QP has flown outside the grid
+    # to "out-of-range" each iteration (so the partition's scissor
+    # override kicks in instead of plumbing clamped Σ_c into the next
+    # iteration).  ``None`` for static modes where the grid does not
+    # apply — the static partition mask is used unchanged.
+    partition_omega_min_ry: float | None = None
+    partition_omega_max_ry: float | None = None
     print_fn: Callable = print
 
 
@@ -304,7 +312,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     H_qp_dft_full = inputs.kin_ion_dft + delta_h_dft
     scissor_E_qp_kn_ry = _scissor_E_qp_for_outofrange(
         H_qp_dft_full, inputs.e_dft_active_kn_ry,
-        inputs.valence_mask_active_kn, inputs.partition,
+        inputs.valence_mask_active_kn,
+        inputs.partition.in_range_mask,
     )
     H_qp_dft_new = apply_band_partition(
         H_qp_dft_full,
@@ -324,11 +333,37 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
 # Per-iteration scissor refit for non-protected out-of-range bands
 # ---------------------------------------------------------------------------
 
+def _dynamic_in_range_mask(
+    H_qp_dft_full: jax.Array,
+    partition: BandPartition,
+    *,
+    omega_min_ry: float | None,
+    omega_max_ry: float | None,
+) -> jax.Array:
+    """Per-iteration in-range mask from the current H_full diagonal.
+
+    A band is in-range iff ``Re[H_full[k, n, n]]`` lies in
+    ``[ω_min, ω_max]`` for every k.  Falls back to the static
+    ``partition.in_range_mask`` when ω-bounds were not configured
+    (e.g. static-mode SC where the grid is irrelevant).
+    """
+    if omega_min_ry is None or omega_max_ry is None:
+        return partition.in_range_mask
+    H_diag_ry = np.real(np.asarray(jnp.diagonal(
+        H_qp_dft_full, axis1=1, axis2=2)))
+    in_window_kn = (
+        (H_diag_ry >= float(omega_min_ry))
+        & (H_diag_ry <= float(omega_max_ry))
+    )
+    band_in_grid = np.all(in_window_kn, axis=0)
+    return jnp.asarray(band_in_grid, dtype=bool)
+
+
 def _scissor_E_qp_for_outofrange(
     H_qp_dft_full: jax.Array,
     e_dft_kn_ry: jax.Array,
     valence_mask_kn: jax.Array,
-    partition: BandPartition,
+    in_range_mask: jax.Array,
 ) -> jax.Array:
     """Return ``E_QP_scissor[k, n]`` for use as the diagonal of bands
     that are out of the ω-grid range.
@@ -344,7 +379,7 @@ def _scissor_E_qp_for_outofrange(
     is one ``np.diagonal`` call.
     """
     e_dft_np = np.asarray(e_dft_kn_ry, dtype=np.float64)
-    in_range = np.asarray(partition.in_range_mask, dtype=bool)
+    in_range = np.asarray(in_range_mask, dtype=bool)
     # Fast path: nothing to extrapolate.
     if bool(in_range.all()):
         return e_dft_kn_ry
@@ -375,6 +410,9 @@ def run_self_consistency(
     *,
     max_iter: int = 1,
     tol_ev: float = 1.0e-4,
+    accelerator: str = "rcrop",
+    history_depth: int = 5,
+    mixing: float = 1.0,
 ) -> tuple[SCState, list[float]]:
     """Iterate ``gw_iteration_map`` until ``max_iter`` or RMS ΔE < ``tol_ev``.
 
@@ -382,6 +420,25 @@ def run_self_consistency(
     on the **eigenvalues** of consecutive H matrices (recomputed each
     iteration via the same k-sharded eigvalsh kernel as the main map)
     so the carry never gets out of sync with a separately-tracked E.
+
+    Parameters
+    ----------
+    accelerator
+        ``"rcrop"`` (default) — Anderson-style restart-CROP acceleration
+        from :mod:`mixing.acceleration`.  Order ``history_depth``.
+        Required for QSGW on dense band manifolds: the Jacobian's
+        cycle-direction eigenvalue is typically ≲ −3 for systems with
+        many bands near the gap (PPM ω-grid stiffness), which means a
+        plain fixed-point hits a 2-cycle and even α=0.5 linear damping
+        only shrinks the cycle amplitude rather than killing it.
+        ``"linear"`` — plain α-mixing with damping ``mixing``.  Useful
+        for diagnosis (very small α reaches the fixed point monotonically
+        but is slow).
+    history_depth
+        rCROP history depth (only used when ``accelerator="rcrop"``).
+        ``m=5`` is BGW's QSGW default.
+    mixing
+        Linear damping coefficient when ``accelerator="linear"``.
 
     Returns
     -------
@@ -391,26 +448,193 @@ def run_self_consistency(
         RMS ΔE_n (eV) at each iteration ≥ 1; empty list when
         ``max_iter == 1`` (one-shot G0W0).
     """
+    import os
     print_fn = inputs.print_fn
     _, eigvalsh_kshard = _kshard_eigh_kernels(inputs.mesh_xy)
+    _dump_dir = os.environ.get("LORRAX_SC_DUMP_DIR")
+
+    # One-shot fast path: no acceleration needed.
+    if max_iter == 1:
+        state_new = gw_iteration_map(state_init, inputs)
+        return state_new, []
+
+    if accelerator == "rcrop":
+        return _run_rcrop(
+            state_init, inputs,
+            max_iter=max_iter, tol_ev=tol_ev,
+            history_depth=history_depth,
+            eigvalsh_kshard=eigvalsh_kshard,
+            print_fn=print_fn,
+            dump_dir=_dump_dir,
+        )
+    if accelerator == "linear":
+        return _run_linear_mixing(
+            state_init, inputs,
+            max_iter=max_iter, tol_ev=tol_ev, mixing=mixing,
+            eigvalsh_kshard=eigvalsh_kshard,
+            print_fn=print_fn,
+            dump_dir=_dump_dir,
+        )
+    raise ValueError(
+        f"run_self_consistency: unknown accelerator={accelerator!r} "
+        f"(expected 'rcrop' or 'linear').")
+
+
+def _run_linear_mixing(
+    state_init: SCState, inputs: SCInputs, *,
+    max_iter: int, tol_ev: float, mixing: float,
+    eigvalsh_kshard, print_fn, dump_dir,
+) -> tuple[SCState, list[float]]:
+    """Plain α-mixing fixed point.  Diagnostic / fallback path."""
     state = state_init
     rms_history: list[float] = []
     E_prev_ev = np.asarray(eigvalsh_kshard(state.H_qp_dft)) * RYD_TO_EV
+    _e_history: list[np.ndarray] = [E_prev_ev.copy()]
+    if mixing != 1.0:
+        print_fn(f"  SC mixing α = {mixing:.3f} (linear)")
 
     for it in range(max_iter):
         state_new = gw_iteration_map(state, inputs)
-        if it == 0 and max_iter == 1:
-            return state_new, rms_history
+        if mixing != 1.0:
+            H_mixed = (
+                mixing * state_new.H_qp_dft
+                + (1.0 - mixing) * state.H_qp_dft
+            )
+            state_new = SCState(
+                H_qp_dft=H_mixed,
+                iteration=state_new.iteration,
+                last_sigma_result=state_new.last_sigma_result,
+            )
         E_new_ev = np.asarray(eigvalsh_kshard(state_new.H_qp_dft)) * RYD_TO_EV
         rms = float(np.sqrt(np.mean((E_new_ev - E_prev_ev) ** 2)))
         rms_history.append(rms)
-        print_fn(f"  SC iter {state_new.iteration}: RMS ΔE = {rms:.6f} eV")
+        _e_history.append(E_new_ev.copy())
+        rms2 = (
+            float(np.sqrt(np.mean((E_new_ev - _e_history[-3]) ** 2)))
+            if len(_e_history) >= 3 else float("nan"))
+        print_fn(
+            f"  SC iter {state_new.iteration}: "
+            f"RMS ΔE_{{k,k-1}} = {rms:.6f} eV, "
+            f"ΔE_{{k,k-2}} = {rms2:.6f} eV"
+        )
         state = state_new
         E_prev_ev = E_new_ev
         if rms < tol_ev:
             break
 
+    _maybe_dump_e_history(dump_dir, _e_history, print_fn)
     return state, rms_history
+
+
+def _run_rcrop(
+    state_init: SCState, inputs: SCInputs, *,
+    max_iter: int, tol_ev: float, history_depth: int,
+    eigvalsh_kshard, print_fn, dump_dir,
+) -> tuple[SCState, list[float]]:
+    """rCROP (Anderson-style) accelerated fixed point.
+
+    Wraps :func:`mixing.acceleration.rcrop_nojit` around the iteration
+    map.  rCROP makes **two** ``gw_iteration_map`` calls per
+    rCROP-iteration (one for the trial step, one for the
+    real-residual evaluation); ``max_iter`` here is the rCROP iteration
+    count, not the underlying pipeline call count.
+
+    Convergence tolerance is converted from per-band RMS ΔE (eV) to a
+    flat L2-norm-of-residual on H_flat (Ry) the rCROP solver expects::
+
+        ‖H_new − H_old‖_2 / √(nk · nb²) ≈ RMS-per-element ≈ RMS ΔE / RYD_TO_EV
+    """
+    from mixing.acceleration import rcrop_nojit
+
+    H0 = state_init.H_qp_dft
+    nk, nb, _ = H0.shape
+    n_elem = nk * nb * nb
+    print_fn(
+        f"  SC rCROP: history_depth={history_depth}, "
+        f"max_iter={max_iter}, tol={tol_ev:.1e} eV/band-RMS")
+
+    # Bookkeeping for per-iteration printing + final SigmaResult capture.
+    _e_history: list[np.ndarray] = [
+        np.asarray(eigvalsh_kshard(H0)) * RYD_TO_EV]
+    _last_sigma: list = [None]
+    _iter_idx = [0]
+    rms_history: list[float] = []
+
+    def residual_fn(H_flat: jnp.ndarray) -> jnp.ndarray:
+        H = H_flat.reshape(H0.shape)
+        # rCROP's mixing combinations don't preserve Hermitisation
+        # exactly (numeric drift); re-Hermitise before feeding the
+        # iteration map so eigh stays well-defined.
+        H = 0.5 * (H + jnp.conj(jnp.swapaxes(H, -1, -2)))
+        state_in = SCState(
+            H_qp_dft=H, iteration=_iter_idx[0],
+            last_sigma_result=_last_sigma[0])
+        state_out = gw_iteration_map(state_in, inputs)
+        _last_sigma[0] = state_out.last_sigma_result
+        # Track per-call eigenvalue RMS so the user sees progress in the
+        # same shape the linear path prints.
+        E_new = np.asarray(eigvalsh_kshard(state_out.H_qp_dft)) * RYD_TO_EV
+        rms = float(np.sqrt(np.mean((E_new - _e_history[-1]) ** 2)))
+        rms_history.append(rms)
+        _e_history.append(E_new.copy())
+        rms2 = (
+            float(np.sqrt(np.mean((E_new - _e_history[-3]) ** 2)))
+            if len(_e_history) >= 3 else float("nan"))
+        print_fn(
+            f"  SC rCROP call {len(rms_history)}: "
+            f"RMS ΔE_{{k,k-1}} = {rms:.6f} eV, "
+            f"ΔE_{{k,k-2}} = {rms2:.6f} eV"
+        )
+        _iter_idx[0] += 1
+        return (state_out.H_qp_dft - H).flatten()
+
+    # rCROP residual tolerance: ‖f‖₂ ≤ tol_ry · √(n_elem) ⇔ per-element
+    # RMS ≤ tol_ry.  Convert RMS ΔE in eV → Ry first.
+    tol_ry = tol_ev / RYD_TO_EV
+    tol_resid = float(np.sqrt(n_elem)) * tol_ry
+
+    result = rcrop_nojit(
+        residual_fn,
+        np.asarray(H0).flatten(),
+        m=history_depth,
+        maxit=max_iter,
+        tol=tol_resid,
+        print_fn=None,  # we print our own RMS-ΔE history above
+    )
+    print_fn(
+        f"  SC rCROP done: {result.iterations} iterations, "
+        f"converged={bool(result.converged)}, "
+        f"final ‖residual‖₂ = {float(result.residual_norms[-1]):.4e} Ry")
+
+    # Final state: use the last x from rCROP (Hermitised) and the last
+    # captured SigmaResult so the writer downstream has the full
+    # frequency-grid Σ_c, head pieces, etc.
+    H_final = jnp.asarray(result.x).reshape(H0.shape)
+    H_final = 0.5 * (H_final + jnp.conj(jnp.swapaxes(H_final, -1, -2)))
+    state_final = SCState(
+        H_qp_dft=H_final,
+        iteration=_iter_idx[0],
+        last_sigma_result=_last_sigma[0],
+    )
+    _maybe_dump_e_history(dump_dir, _e_history, print_fn)
+    return state_final, rms_history
+
+
+def _maybe_dump_e_history(
+    dump_dir: str | None,
+    e_history: list[np.ndarray],
+    print_fn,
+) -> None:
+    if not dump_dir:
+        return
+    import os
+    os.makedirs(dump_dir, exist_ok=True)
+    np.save(os.path.join(dump_dir, "e_history_kn_ev.npy"),
+            np.stack(e_history, axis=0))
+    print_fn(
+        f"  SC dump: saved {len(e_history)} eigenvalue snapshots to "
+        f"{dump_dir}/e_history_kn_ev.npy (shape (iter, k, n))"
+    )
 
 
 __all__ = [

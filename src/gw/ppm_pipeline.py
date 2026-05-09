@@ -337,10 +337,6 @@ def compute_ppm_sigma_pipeline(
 
     if not config.do_screened:
         raise ValueError("PPM Σ^c pipeline requires do_screened=true.")
-    if config.self_consistent:
-        raise NotImplementedError(
-            "PPM Σ^c pipeline does not yet support self_consistent=true."
-        )
 
     ppm_options = build_ppm_sigma_runtime_options(config, input_dir=input_dir)
     label = "HL-PPM" if config.compute_mode is ComputeMode.HL_PPM else "GN-PPM"
