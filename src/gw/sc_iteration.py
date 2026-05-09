@@ -72,14 +72,19 @@ class SCInputs:
 class SCState:
     """State carried across self-consistent iterations.
 
-    The iteration "carry" is ``H_qp_dft`` in the **original DFT band
-    basis**; everything else is for diagnostics and final output.
+    The iteration "carry" is **just** ``H_qp_dft_active`` — the QP
+    Hamiltonian on the protected active subspace
+    (``slices.sigma`` of the wfn bundle), in the original DFT basis.
+    Everything else (``E_qp``, ``U_dft_to_qp``, ``efermi``) is derivable
+    by the next iteration's first step (``vmap(eigh)``), so we don't
+    carry redundant state — that would let convergence checks read
+    inconsistent (E, H) pairs if anyone forgot to keep them in sync.
+
+    ``last_sigma_result`` is purely for the final output writer (eqp.dat,
+    sigma_diag.dat, freq_debug.dat); it does not feed the next iteration.
     """
 
-    H_qp_dft: jax.Array              # (nk, nb, nb) Ry, in DFT basis
-    enk_qp_ev: np.ndarray            # (nk, nb) eV — eigenvalues this iter
-    U_dft_to_qp: jax.Array           # (nk, nb, nb) — U[k, m, n] = ⟨DFT_m|QP_n⟩
-    efermi_ev: float
+    H_qp_dft: jax.Array              # (nk, nb_active, nb_active) Ry, DFT basis
     iteration: int
     last_sigma_result: SigmaResult | None = None
 
@@ -89,10 +94,11 @@ class SCState:
 # ---------------------------------------------------------------------------
 
 def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
-    """``H_qp_dft^(0) = diag(E_DFT)`` so that iteration 1's ``eigh`` returns
-    ``(E_DFT, U=I)`` and the first Σ-pipeline call uses the unrotated DFT
-    wfns.  This makes "one iteration of QSGW" exactly equivalent to a
-    one-shot G0W0 build at E=E_DFT.
+    """``H_qp_dft^(0) = diag(E_DFT)`` on the active subspace.
+
+    Iteration 1's ``eigh`` of a diagonal matrix returns ``(E_DFT, U=I)``
+    so the first Σ-pipeline call uses the unrotated DFT wfns and "one
+    iteration of QSGW" reduces exactly to one-shot G0W0 at E=E_DFT.
     """
     from common.load_wfns import get_enk_bandrange
     enk_dft, _ = get_enk_bandrange(
@@ -100,20 +106,14 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
         inputs.band_slices.sigma_range, inputs.band_slices.sigma_range,
         nspinor=inputs.meta.nspinor)
     enk_dft_ry = np.asarray(enk_dft, dtype=np.float64)
-    nk, nb = enk_dft_ry.shape
-    H0 = np.zeros((nk, nb, nb), dtype=np.complex128)
-    idx = np.arange(nb)
+    nk, nb_active = enk_dft_ry.shape
+    H0 = np.zeros((nk, nb_active, nb_active), dtype=np.complex128)
+    idx = np.arange(nb_active)
     for k in range(nk):
         H0[k, idx, idx] = enk_dft_ry[k]
     rep = NamedSharding(inputs.mesh_xy, P(None, None, None))
-    H0_dev = jax.device_put(jnp.asarray(H0), rep)
-    U_dev = jax.device_put(
-        jnp.broadcast_to(jnp.eye(nb, dtype=jnp.complex128), (nk, nb, nb)), rep)
     return SCState(
-        H_qp_dft=H0_dev,
-        enk_qp_ev=enk_dft_ry * RYD_TO_EV,
-        U_dft_to_qp=U_dev,
-        efermi_ev=float(inputs.wfn.efermi) * RYD_TO_EV,
+        H_qp_dft=jax.device_put(jnp.asarray(H0), rep),
         iteration=0,
     )
 
@@ -144,26 +144,28 @@ def _rotate_to_dft_basis(O_qp: jax.Array, U: jax.Array) -> jax.Array:
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     """One self-consistent QSGW step in the DFT basis.
 
-    Pure function — no side effects on ``inputs.wfns_dft``.
+    Pure function — no side effects on ``inputs.wfns_dft``.  All
+    derived quantities (E_qp, U_qp, efermi) are recomputed each call;
+    the only carried state is ``H_qp_dft`` on the active subspace.
     """
     from .w_isdf import compute_chi0, solve_w
 
     n_occ = int(inputs.meta.nelec)
     E_qp_ry, U_qp, efermi_ry = _diagonalize_and_get_efermi(
         state.H_qp_dft, n_occ)
-    enk_qp_ev = np.asarray(E_qp_ry) * RYD_TO_EV
-    efermi_ev = float(efermi_ry) * RYD_TO_EV
 
-    # Rotate the ORIGINAL DFT bundle to the QP basis at this iteration.
-    # ψ_QP[..., n] = Σ_m U_qp[..., m, n] · ψ_DFT[..., m].
+    # Rotate the active subspace of the DFT bundle to this iteration's QP
+    # basis.  Bands outside ``slices.sigma`` keep their DFT ψ + DFT energy
+    # (their QP corrections come from the scissor extrapolation downstream).
     wfns_qp = rotate_wavefunctions(
         inputs.wfns_dft, U_qp,
-        enk_new=E_qp_ry, efermi=float(efermi_ry),
+        enk_active_new=E_qp_ry, efermi=float(efermi_ry),
         mesh_xy=inputs.mesh_xy,
+        active_slice=inputs.band_slices.sigma,
     )
 
-    # Re-solve W using the rotated wfns (cached jits will dispatch with
-    # the new values; XLA cache hit on the second iteration onward).
+    # Re-solve W using the rotated wfns (cached jits dispatch with new
+    # values; XLA cache hit on iteration ≥ 2).
     if inputs.config.do_screened:
         chi0_q = compute_chi0(
             wfns_qp, inputs.quad, inputs.meta, inputs.mesh_xy,
@@ -178,7 +180,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     sigma_result = compute_sigma_xc(
         inputs.config.compute_mode,
         wfns=wfns_qp, V_q=inputs.V_q, W_q=W_q,
-        e_qp_ev=enk_qp_ev,
+        e_qp_ev=np.asarray(E_qp_ry) * RYD_TO_EV,
         static_head_terms=inputs.static_head_terms,
         head_resolver=inputs.head_resolver,
         quad=inputs.quad, e_ref=inputs.e_ref,
@@ -196,9 +198,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
 
     return SCState(
         H_qp_dft=H_qp_dft_new,
-        enk_qp_ev=enk_qp_ev,
-        U_dft_to_qp=U_qp,
-        efermi_ev=efermi_ev,
         iteration=state.iteration + 1,
         last_sigma_result=sigma_result,
     )
@@ -207,6 +206,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
+
+@jax.jit
+def _eigvalsh_per_k(H: jax.Array) -> jax.Array:
+    H_herm = 0.5 * (H + jnp.conj(jnp.swapaxes(H, -1, -2)))
+    return jax.vmap(jnp.linalg.eigvalsh)(H_herm)
+
 
 def run_self_consistency(
     state_init: SCState,
@@ -217,32 +222,34 @@ def run_self_consistency(
 ) -> tuple[SCState, list[float]]:
     """Iterate ``gw_iteration_map`` until ``max_iter`` or RMS ΔE < ``tol_ev``.
 
+    The iteration carry holds only ``H_qp_dft``; convergence is judged
+    on the **eigenvalues** of consecutive H matrices (recomputed each
+    iteration) so the carry never gets out of sync with a separately-
+    tracked E array.
+
     Returns
     -------
     state_final
         Last :class:`SCState` produced.
     rms_history
-        RMS ΔE_n (eV) at each iteration ≥ 1; empty list when ``max_iter == 1``
-        (one-shot G0W0).
+        RMS ΔE_n (eV) at each iteration ≥ 1; empty list when
+        ``max_iter == 1`` (one-shot G0W0).
     """
     print_fn = inputs.print_fn
     state = state_init
     rms_history: list[float] = []
+    E_prev_ev = np.asarray(_eigvalsh_per_k(state.H_qp_dft)) * RYD_TO_EV
 
     for it in range(max_iter):
         state_new = gw_iteration_map(state, inputs)
         if it == 0 and max_iter == 1:
-            # One-shot path: skip the convergence check; the caller wants
-            # the iter-1 state as a G0W0 zeroth-order build.
             return state_new, rms_history
-
-        rms = float(np.sqrt(np.mean(
-            (state_new.enk_qp_ev - state.enk_qp_ev) ** 2)))
+        E_new_ev = np.asarray(_eigvalsh_per_k(state_new.H_qp_dft)) * RYD_TO_EV
+        rms = float(np.sqrt(np.mean((E_new_ev - E_prev_ev) ** 2)))
         rms_history.append(rms)
-        print_fn(
-            f"  SC iter {state_new.iteration}: RMS ΔE = {rms:.6f} eV  "
-            f"(E_F = {state_new.efermi_ev:+.4f} eV)")
+        print_fn(f"  SC iter {state_new.iteration}: RMS ΔE = {rms:.6f} eV")
         state = state_new
+        E_prev_ev = E_new_ev
         if rms < tol_ev:
             break
 
