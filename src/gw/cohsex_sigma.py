@@ -157,6 +157,10 @@ def compute_cohsex_sigma(
     do_screened: bool = True,
     static_head_terms=None,
     compute_bare_x: bool = True,
+    wfns_transverse=None,
+    bispinor_v_q_path=None,
+    backend=None,
+    use_ffi_io: bool | None = None,
 ) -> dict:
     """Evaluate static COHSEX self-energy components.
 
@@ -217,6 +221,23 @@ def compute_cohsex_sigma(
                 static_head_terms, nk_tot=meta.nk_tot, do_screened=False)
             rep = NamedSharding(mesh_xy, P(None, None, None))
             sig_x = sig_x + jax.device_put(x_head, rep)
+
+        # Bispinor bare exchange: add Σ^B (transverse-only sum over
+        # (i, j) ∈ {1, 2, 3}²) to sig_x.  No-op when ``wfns_transverse``
+        # or ``bispinor_v_q_path`` is missing.  See
+        # ``gw.sigma_x_bispinor`` and ``BISPINOR_DHFB_DESIGN.md`` §3.
+        if wfns_transverse is not None and bispinor_v_q_path is not None:
+            from .sigma_x_bispinor import compute_sigma_x_bispinor
+            with mesh_xy:
+                sig_x_b = compute_sigma_x_bispinor(
+                    wfns_transverse=wfns_transverse,
+                    Gij=Gij,
+                    bispinor_v_q_path=bispinor_v_q_path,
+                    meta=meta, mesh_xy=mesh_xy,
+                    backend=backend, use_ffi_io=use_ffi_io,
+                )
+            sig_x_b.block_until_ready()
+            sig_x = sig_x + sig_x_b
 
     return {
         "sig_sx":  sig_sx,

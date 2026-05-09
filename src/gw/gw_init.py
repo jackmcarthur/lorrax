@@ -612,6 +612,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			print_fn(f"    γ (runtime / AOT-pred) = {gamma:.3f}  "
 			         f"(AOT predicted {aot_peak_gb:.2f} GB)")
 
+	# Default: no transverse-channel ψ to surface to the caller.
+	transverse_wfn_data = None
+
 	# ── Bispinor: fit ζ^{μ_L=1,2,3} on the current-density centroid set ──
 	# Same kernel as the charge channel, swapping in the γ̃^i vertex.  Three
 	# sequential calls keep peak GPU memory at the scalar-fit level.  Output
@@ -684,7 +687,18 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					vertex_mu_L=mu_L,
 				)
 
-	return zeta_h5_path, mem_est
+		# Surface the transverse-centroid ψ to the caller so it can build
+		# the second Wfns bundle for σ^B without re-loading from WFN.h5.
+		# Keeping these arrays alive across the return is intentional —
+		# they're the only way the σ^B kernel can sample ψ at r_{μ_T}.
+		transverse_wfn_data = {
+			'psi_rmu_Y':       psi_curr_rmu_Y,
+			'psi_rmuT_X':      psi_curr_rmuT_X,
+			'meta':            meta_curr,
+			'centroid_indices': jnp.asarray(cents_curr_idx, dtype=jnp.int32),
+		}
+
+	return zeta_h5_path, mem_est, transverse_wfn_data
 
 
 def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None):
@@ -938,7 +952,7 @@ def prepare_isdf_and_wavefunctions(
 					band_chunk_size=chunks['band_chunk'],
 				)
 
-			zeta_path, mem_est = fit_zeta(
+			zeta_path, mem_est, transverse_wfn_data = fit_zeta(
 				wfn, sym, meta, centroid_indices, mesh_xy,
 				cfg, band_slices, tmp_dir,
 				psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print0)
@@ -967,6 +981,22 @@ def prepare_isdf_and_wavefunctions(
 					psi_rmu_Y=psi_rmu_Y, psi_rmuT_X=psi_rmuT_X,
 					enk_full=enk_full, print_fn=print0)
 
+				# Bispinor: build a second Wfns bundle on the
+				# transverse centroid set so Σ^B can sample ψ at
+				# r_{μ_T} without re-reading WFN.h5.
+				wfns_transverse = None
+				if transverse_wfn_data is not None:
+					wfns_transverse = build_wavefunction_bundle(
+						wfn, sym,
+						transverse_wfn_data['meta'],
+						band_slices, mesh_xy,
+						psi_rmu_Y=transverse_wfn_data['psi_rmu_Y'],
+						psi_rmuT_X=transverse_wfn_data['psi_rmuT_X'],
+						enk_full=enk_full, print_fn=print0)
+					print0(f"  [bispinor] σ^B-side Wfns built on "
+					       f"n_rmu_T={transverse_wfn_data['meta'].n_rmu} "
+					       f"transverse centroids")
+
 			# Append ψ to the now-open restart file.
 			write_restart_state_to_h5(
 				tensors_filename,
@@ -989,5 +1019,14 @@ def prepare_isdf_and_wavefunctions(
 				wfn, sym, meta, band_slices, mesh_xy,
 				psi_rmu_Y=rs.psi_rmu_Y, psi_rmuT_X=rs.psi_rmuT_X,
 				enk_full=rs.enk_full, print_fn=print0)
+			# Restart path doesn't yet round-trip the transverse
+			# Wfns through the restart file; bispinor restart will
+			# need a second psi_full_y dataset (per-channel).  Mark
+			# as not-yet-supported so consumers fail loud.
+			wfns_transverse = None
 
-	return SimpleNamespace(V_qmunu=V_qmunu, wf_bundle=wfns)
+	return SimpleNamespace(
+		V_qmunu=V_qmunu,
+		wf_bundle=wfns,
+		wf_bundle_transverse=wfns_transverse,
+	)

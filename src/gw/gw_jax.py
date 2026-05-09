@@ -187,6 +187,14 @@ def main(argv=None):
 	)
 	V_qmunu = isdf.V_qmunu
 	wfns = isdf.wf_bundle
+	# Bispinor: σ^B reads V^{i,j} tiles from v_q_bispinor.h5 and
+	# samples ψ at the transverse-centroid Wfns bundle (None when
+	# bispinor=False or centroids_file_current is unset).
+	wfns_transverse = getattr(isdf, 'wf_bundle_transverse', None)
+	bispinor_v_q_path = (
+		os.path.join(tmp_dir, 'v_q_bispinor.h5')
+		if wfns_transverse is not None else None
+	)
 
 	# --- Screening: χ₀ → W = (1 − Vχ)⁻¹ V ---
 	# V_qmunu is already flat-q ``(nq, μ, μ)``; downstream consumers
@@ -239,9 +247,14 @@ def main(argv=None):
 	# config's override fields first before falling back to s_tensor/epshead.
 	if config.do_screened and os.path.exists(tensors_filename):
 		from file_io import write_w0_qmunu_to_h5, write_head_scalars_to_h5
-		nkx, nky, nkz = (int(x) for x in meta.kgrid)
-		W_q_8d = W_q.reshape(1, 1, 1, nkx, nky, nkz, W_q.shape[-2], W_q.shape[-1])
-		write_w0_qmunu_to_h5(tensors_filename, W_q_8d,
+		# W_q is already flat-q (nq, μ, μ).  The W0_qmunu placeholder
+		# created by ``write_restart_state_to_h5(init_W0=True)`` is
+		# rank-3 (sized from V_qmunu), so we write W_q at flat-q.
+		# Previously this reshaped to legacy 8-D and tripped
+		# ``phdf5 async write: dataset rank mismatch ds=/W0_qmunu
+		# file_rank=3 write_rank=8``.  Downstream (BSE) consumers
+		# of W0_qmunu were already updated to flat-q in commit a052a1c.
+		write_w0_qmunu_to_h5(tensors_filename, W_q,
 		                     mesh=mesh_xy, backend=config.backend.slab_io)
 		head_static = head_resolver.at(0.0 + 0.0j)
 		if config.compute_mode.is_dynamic:
@@ -295,6 +308,9 @@ def main(argv=None):
 			Gij=Gij, do_screened=config.do_screened,
 			static_head_terms=static_head_terms,
 			compute_bare_x=True,
+			wfns_transverse=wfns_transverse,
+			bispinor_v_q_path=bispinor_v_q_path,
+			backend=config.backend.slab_io,
 		)
 	sig_sx  = cohsex["sig_sx"]
 	sig_coh = cohsex["sig_coh"]
