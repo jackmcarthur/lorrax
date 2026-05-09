@@ -67,7 +67,9 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.units import RYD_TO_EV
+from .band_partition import BandPartition, apply_band_partition
 from .gw_config import ComputeMode
+from .scissor import fit_scissor
 from .sigma_dispatch import SigmaResult, compute_sigma_xc
 from .wavefunction_bundle import (
     BandSlices, Wavefunctions, rotate_wavefunctions)
@@ -83,6 +85,16 @@ class SCInputs:
 
     The wfn bundle here is the **original DFT bundle** — the iteration
     map rotates copies of it on demand and never mutates it.
+
+    ``partition`` is the active-subspace band classification
+    (protected / non-protected-in-range / out-of-range).  Default
+    ``BandPartition.all_protected(nb_active)`` reduces the masking step
+    to the identity, so existing one-shot paths are unchanged until
+    the partition is configured deliberately.
+
+    ``e_dft_active_kn_ry`` and ``valence_mask_active_kn`` feed the
+    per-iteration scissor refit; they are constant across iterations
+    (DFT band identities + occupation labels don't move).
     """
 
     wfns_dft: Wavefunctions
@@ -99,6 +111,9 @@ class SCInputs:
     wfn: object              # WFNReader (for vbm/efermi anchor + paths)
     band_slices: BandSlices
     input_dir: str
+    partition: BandPartition
+    e_dft_active_kn_ry: jax.Array      # (nk, nb_active) DFT energies for scissor fit
+    valence_mask_active_kn: jax.Array  # (nk, nb_active) bool — for scissor val/cond split
     print_fn: Callable = print
 
 
@@ -280,16 +295,74 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         print_fn=inputs.print_fn,
     )
 
-    # Rotate (V_H + Σ_xc) back to DFT basis and re-form H_qp_dft.
+    # Rotate (V_H + Σ_xc) back to DFT basis and form the *full* QSGW H
+    # (as if every band were protected); the partition step below masks
+    # off non-protected off-diagonals and overrides out-of-range
+    # diagonals with the per-iteration scissor.
     delta_h_qp = sigma_result.v_h_kij_ry + sigma_result.sigma_xc_kij_ry
     delta_h_dft = _rotate_to_dft_basis(delta_h_qp, U_qp)
-    H_qp_dft_new = inputs.kin_ion_dft + delta_h_dft
+    H_qp_dft_full = inputs.kin_ion_dft + delta_h_dft
+    scissor_E_qp_kn_ry = _scissor_E_qp_for_outofrange(
+        H_qp_dft_full, inputs.e_dft_active_kn_ry,
+        inputs.valence_mask_active_kn, inputs.partition,
+    )
+    H_qp_dft_new = apply_band_partition(
+        H_qp_dft_full,
+        protected_mask=inputs.partition.protected_mask,
+        in_range_mask=inputs.partition.in_range_mask,
+        scissor_E_qp_kn=scissor_E_qp_kn_ry,
+    )
 
     return SCState(
         H_qp_dft=H_qp_dft_new,
         iteration=state.iteration + 1,
         last_sigma_result=sigma_result,
     )
+
+
+# ---------------------------------------------------------------------------
+# Per-iteration scissor refit for non-protected out-of-range bands
+# ---------------------------------------------------------------------------
+
+def _scissor_E_qp_for_outofrange(
+    H_qp_dft_full: jax.Array,
+    e_dft_kn_ry: jax.Array,
+    valence_mask_kn: jax.Array,
+    partition: BandPartition,
+) -> jax.Array:
+    """Return ``E_QP_scissor[k, n]`` for use as the diagonal of bands
+    that are out of the ω-grid range.
+
+    Mechanism: take the diagonal of ``H_qp_dft_full`` (the candidate
+    QP energies if the iteration kept all off-diagonals), restrict to
+    in-range bands as the scissor's reference set, fit α/β per
+    val/cond, then evaluate ``E_QP = α·E_DFT + β`` for every (k, n).
+    The masking primitive will use this only at out-of-range entries.
+
+    Short-circuits to ``E_DFT`` (no correction) when every band is
+    in-range — the all-protected default — so the per-iteration cost
+    is one ``np.diagonal`` call.
+    """
+    e_dft_np = np.asarray(e_dft_kn_ry, dtype=np.float64)
+    in_range = np.asarray(partition.in_range_mask, dtype=bool)
+    # Fast path: nothing to extrapolate.
+    if bool(in_range.all()):
+        return e_dft_kn_ry
+
+    H_diag_np = np.real(np.asarray(jnp.diagonal(
+        H_qp_dft_full, axis1=1, axis2=2)))
+    in_range_kn = np.broadcast_to(
+        in_range[None, :], e_dft_np.shape).astype(bool)
+    fit = fit_scissor(
+        e_dft_np * RYD_TO_EV,
+        H_diag_np * RYD_TO_EV,
+        valence_mask_kn=np.asarray(valence_mask_kn, dtype=bool),
+        fit_mask_kn=in_range_kn,
+    )
+    # ΔE = (α − 1) · E + β; E_QP = E_DFT + ΔE.
+    delta_ev = fit.predict(
+        e_dft_np * RYD_TO_EV, np.asarray(valence_mask_kn, dtype=bool))
+    return jnp.asarray((e_dft_np + delta_ev / RYD_TO_EV))
 
 
 # ---------------------------------------------------------------------------
