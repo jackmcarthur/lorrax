@@ -536,6 +536,7 @@ def compute_L_q_from_CCT(
     mesh_xy: Mesh,
     block_size: int = None,
     vertex_mu_L: int = 0,
+    n_rmu_logical: int | None = None,
 ) -> jax.Array:
     """
     Compute system-matrix L_q from CCT matrix.
@@ -554,30 +555,91 @@ def compute_L_q_from_CCT(
     basis (one LU per call, small enough that explicit
     ``lu_factor`` + ``lu_solve`` reuse buys nothing).
 
+    Padded-input path (``n_rmu_logical < C_q.shape[-1]``):
+    n_rmu may be padded to mesh divisibility at the boundary so the
+    ``P(None, 'x', 'y')`` input sharding is admissible at any logical
+    centroid count (e.g. n_rmu_logical = 661 prime → padded to 672 on a
+    4×4 mesh).  In that case the trailing pad rows/cols of C_q are zero
+    by Phase 3a's ``load_centroids_band_chunked`` contract, which makes
+    the *padded* matrix singular — Cholesky on it would NaN.  We avoid
+    that by slicing C_q to its leading logical block inside the JIT and
+    running a dense replicated Cholesky on the logical n_rmu × n_rmu
+    matrix; output is at logical extent.
+
+    Why dense (not 2D-blocked) for the padded case: at production
+    n_rmu ≲ 1000 the per-q matrix is ≤ 16 MB, replication is cheap,
+    and a pivoted/blocked sharded Cholesky of a *logical* prime n_rmu
+    has no valid block decomposition (``lcm(p_x, p_y)`` doesn't divide
+    a prime).  Pivoted Cholesky on the *padded* matrix would also work
+    (zero rows would fall to the end of the pivot order, leaving the
+    leading logical block intact) but introduces a permutation the
+    downstream ``solve_triangular`` back-solve does not consume.  The
+    slice-then-dense-Cholesky path is the simplest correct
+    implementation and matches the back-solve's contract — the
+    triangular solve sees a square unpermuted L at logical extent.
+    See ``reports/padding_phase3_handoff_2026-05-08/report.md`` for
+    the design rationale.
+
     Note: the artifact return type does NOT change with ``vertex_mu_L``
-    — both branches return a (nq, n_rmu, n_rmu) array sharded
-    ``P(None, 'x', 'y')``.  Only its semantic interpretation differs
-    (Cholesky factor vs system matrix).
+    — both branches return a ``(nq, n_rmu_logical, n_rmu_logical)``
+    array (replicated when the padded path is taken, ``P(None, 'x',
+    'y')`` otherwise).  The caller is responsible for re-padding when
+    the back-solve expects padded input.
 
     Args:
-        C_q: (nq, n_rmu, n_rmu) CCT matrix, sharded P(None, 'x', 'y')
-        mesh_xy: 2D device mesh
-        block_size: Tile block size (auto if None)
+        C_q: (nq, n_rmu_padded, n_rmu_padded) CCT matrix, sharded
+            ``P(None, 'x', 'y')`` (padded-input path) or
+            ``(nq, n_rmu, n_rmu)`` (legacy unpadded path).
+        mesh_xy: 2D device mesh.
+        block_size: Tile block size (auto if None).  Ignored on the
+            padded-input path.
         vertex_mu_L: Lorentz vertex index (0 = spin-traced PSD path,
-                     1/2/3 = transverse indefinite path).
+            1/2/3 = transverse indefinite path).
+        n_rmu_logical: Logical centroid count.  When given and strictly
+            less than ``C_q.shape[-1]``, the padded path runs (slice +
+            dense Cholesky at logical extent).  ``None`` (default) keeps
+            the historical behaviour: input == output extent.
 
     Returns:
-        L_q: (nq, n_rmu, n_rmu) Cholesky factor (μ_L=0) or unmodified
-             C_q (μ_L=1,2,3), sharded P(None, 'x', 'y')
+        L_q: ``(nq, n_rmu, n_rmu)`` at logical extent (= padded extent
+        when ``n_rmu_logical`` is None or equal to the input dim).
+        Cholesky factor for ``vertex_mu_L == 0``; passthrough CCT for
+        ``vertex_mu_L ≠ 0``.
     """
     nq, n_rmu, n_rmu2 = C_q.shape
     assert n_rmu == n_rmu2, f"C_q must be square, got {n_rmu} x {n_rmu2}"
+    if n_rmu_logical is None:
+        n_rmu_logical = n_rmu
+    if n_rmu_logical > n_rmu:
+        raise ValueError(
+            f"n_rmu_logical={n_rmu_logical} exceeds input extent {n_rmu}")
 
     # Indefinite-CCT path: skip the Cholesky outright.  ``solve_zeta_from_L_q``
     # consumes C_q directly via ``jnp.linalg.solve`` (LU + back-solve internally).
     if int(vertex_mu_L) != 0:
+        if n_rmu_logical < n_rmu:
+            # Slice to logical and replicate; the LU back-solve runs at
+            # logical extent so the indefinite-system contract matches.
+            C_q_log = jax.lax.slice(
+                C_q, [0, 0, 0], [nq, n_rmu_logical, n_rmu_logical])
+            return jax.lax.with_sharding_constraint(
+                C_q_log, NamedSharding(mesh_xy, P(None, None, None)))
         L_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
         return jax.lax.with_sharding_constraint(C_q, L_shard)
+
+    # Padded-input path: slice to logical and run a dense replicated Cholesky.
+    # This intentionally bypasses the 2D-blocked kernel — the logical extent
+    # may not factor cleanly across the mesh (prime n_rmu_logical = 661 is
+    # the motivating case), and the per-q matrix is small enough at
+    # production sizes (≲ 16 MB) that replication is cheap.
+    if n_rmu_logical < n_rmu:
+        C_q_log = jax.lax.slice(
+            C_q, [0, 0, 0], [nq, n_rmu_logical, n_rmu_logical])
+        C_q_log = jax.lax.with_sharding_constraint(
+            C_q_log, NamedSharding(mesh_xy, P(None, None, None)))
+        L_q_log = jnp.linalg.cholesky(C_q_log)
+        return jax.lax.with_sharding_constraint(
+            L_q_log, NamedSharding(mesh_xy, P(None, None, None)))
 
     Pr = mesh_xy.shape['x']
     Pc = mesh_xy.shape['y']
@@ -597,10 +659,22 @@ def compute_L_q_from_CCT(
         L_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
         return jax.lax.with_sharding_constraint(L_q_dense, L_shard)
 
-    if block_size is None:
-        block_size, J = compute_block_size_for_2d_cholesky(n_rmu, Pr, Pc)
-    else:
-        J = n_rmu // block_size
+    # 2D-blocked path: requires n_rmu divisible into mesh-friendly tiles.
+    # If it isn't (e.g. prime n_rmu) the caller should pad to mesh-product
+    # divisibility and pass ``n_rmu_logical`` to take the padded-input
+    # branch above instead.
+    try:
+        if block_size is None:
+            block_size, J = compute_block_size_for_2d_cholesky(n_rmu, Pr, Pc)
+        else:
+            J = n_rmu // block_size
+    except ValueError as exc:
+        raise ValueError(
+            f"compute_L_q_from_CCT: n_rmu={n_rmu} is not 2D-blocked-Cholesky "
+            f"compatible with mesh {Pr}×{Pc} ({exc}). Pass C_q at a "
+            f"mesh-divisible padded extent and set n_rmu_logical=<actual> "
+            f"to take the dense-replicated logical-extent path."
+        ) from exc
 
     # Get or build cached Cholesky function
     cache_key = ('chol_2d', id(mesh_xy), J, block_size)

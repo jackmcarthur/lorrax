@@ -242,3 +242,132 @@ def test_valid_shape_from_pad_meta_axis_out_of_range_raises():
     pm = (PadAxis(axis=5, logical=4, padded=8, mesh_axes=("x",)),)
     with pytest.raises(ValueError, match="out of range"):
         valid_shape_from_pad_meta((3, 8), pm)
+
+
+# ---------------------------------------------------------------------------
+# compute_L_q_from_CCT: Cholesky on a logical n_rmu that doesn't divide the mesh
+# ---------------------------------------------------------------------------
+#
+# Wired in by the n_rmu padding refactor: n_rmu may be logically prime (661)
+# or otherwise non-mesh-divisible.  C_q is delivered at the *padded* extent
+# (zero rows/cols in the trailing block) and Cholesky must run on the leading
+# logical block — never on the padded matrix (which is singular by
+# construction, NOT to be ridge-regularised) and never on a 2D-blocked
+# decomposition (which doesn't exist for prime n_rmu).  See
+# ``reports/padding_phase3_handoff_2026-05-08/report.md`` for the rationale.
+
+
+def _make_psd_complex(rng, n: int, nq: int = 1, ridge: float = 0.05):
+    """Random Hermitian PSD complex128 matrix(es) of shape (nq, n, n)."""
+    A = (rng.standard_normal((nq, n, n))
+         + 1j * rng.standard_normal((nq, n, n))).astype(np.complex128)
+    G = np.einsum('qij,qkj->qik', A, A.conj()) + ridge * np.eye(n)[None]
+    return 0.5 * (G + G.conj().transpose(0, 2, 1))
+
+
+def test_compute_L_q_indivisible_logical_n_rmu(mesh_2x2):
+    """Cholesky path for prime/uneven n_rmu_logical at padded boundary.
+
+    7 is the smallest n_rmu that fails 2x2 mesh divisibility in every spec
+    (P('x','y'), P(('x','y')), P('x') alone).  C_q is built at logical
+    n_rmu=7, zero-padded to n_rmu_padded=8 so the boundary sharding
+    P(None, 'x', 'y') is admissible, then handed to compute_L_q_from_CCT
+    with n_rmu_logical=7.  Output L is at logical extent and reproduces
+    the logical PSD matrix to fp64 noise.
+    """
+    from common.isdf_fitting import compute_L_q_from_CCT
+
+    n_log, n_pad, nq = 7, 8, 2
+    rng = np.random.default_rng(42)
+    G_log = _make_psd_complex(rng, n_log, nq=nq)
+    G_pad = np.zeros((nq, n_pad, n_pad), dtype=np.complex128)
+    G_pad[:, :n_log, :n_log] = G_log
+
+    G_sharded = jax.device_put(
+        jnp.asarray(G_pad), NamedSharding(mesh_2x2, P(None, 'x', 'y')))
+
+    L = compute_L_q_from_CCT(G_sharded, mesh_2x2, n_rmu_logical=n_log)
+    assert L.shape == (nq, n_log, n_log), (
+        f"L should be at logical extent, got {L.shape}")
+
+    L_np = np.asarray(L)
+    # L is lower triangular by Cholesky's contract.
+    np.testing.assert_array_equal(np.triu(L_np, k=1),
+                                  np.zeros((nq, n_log, n_log), dtype=L_np.dtype))
+    # L L^H == G at logical extent.
+    G_hat = np.einsum('qij,qkj->qik', L_np, L_np.conj())
+    scale = float(np.max(np.abs(G_log)))
+    np.testing.assert_allclose(G_hat, G_log, atol=1e-10 * scale, rtol=1e-10)
+
+
+def test_compute_L_q_legacy_divisible_path_unchanged():
+    """When n_rmu_logical is None (default), the historic dense / 2D-blocked
+    path is taken.  Smoke check on a 1×1 mesh (the dense-Cholesky branch):
+    divisible n_rmu factors and L L^H reproduces C to fp64 noise.  Same
+    answer with n_rmu_logical=n_rmu.
+
+    We intentionally use a 1×1 mesh here.  The 2D-blocked shard_map+scan
+    kernel does not currently lower on the JAX 0.9 CPU host-platform-device
+    runtime (see ``cholesky_2d_single`` comment); it's exercised at runtime
+    on real GPUs via the integration tests.  This test guards the public
+    contract: ``n_rmu_logical=None`` is a no-op vs ``n_rmu_logical=n``.
+    """
+    from common.isdf_fitting import compute_L_q_from_CCT
+
+    devs = jax.devices()[:1]
+    mesh_1x1 = Mesh(np.asarray(devs).reshape(1, 1), axis_names=("x", "y"))
+
+    n, nq = 8, 2
+    rng = np.random.default_rng(7)
+    G = _make_psd_complex(rng, n, nq=nq)
+    G_sharded = jax.device_put(
+        jnp.asarray(G), NamedSharding(mesh_1x1, P(None, 'x', 'y')))
+
+    L_default = compute_L_q_from_CCT(G_sharded, mesh_1x1)
+    assert L_default.shape == (nq, n, n)
+    G_hat = np.einsum('qij,qkj->qik',
+                      np.asarray(L_default), np.asarray(L_default).conj())
+    scale = float(np.max(np.abs(G)))
+    np.testing.assert_allclose(G_hat, G, atol=1e-10 * scale, rtol=1e-10)
+
+    # n_rmu_logical=n_rmu_input is equivalent to None.  Same answer.
+    L_explicit = compute_L_q_from_CCT(G_sharded, mesh_1x1, n_rmu_logical=n)
+    np.testing.assert_array_equal(
+        np.asarray(L_default), np.asarray(L_explicit))
+
+
+def test_compute_L_q_indivisible_indefinite_path(mesh_2x2):
+    """vertex_mu_L != 0 path: passthrough with logical-slice when padded.
+
+    The transverse channel CCT is indefinite; compute_L_q_from_CCT
+    skips the factorisation and returns C_q for downstream LU.  At
+    padded boundary the slice-to-logical step still runs.
+    """
+    from common.isdf_fitting import compute_L_q_from_CCT
+
+    n_log, n_pad, nq = 7, 8, 2
+    rng = np.random.default_rng(11)
+    # Indefinite Hermitian: A + A^H without PSD-ifying.
+    A = (rng.standard_normal((nq, n_log, n_log))
+         + 1j * rng.standard_normal((nq, n_log, n_log))).astype(np.complex128)
+    H_log = 0.5 * (A + A.conj().transpose(0, 2, 1))
+    H_pad = np.zeros((nq, n_pad, n_pad), dtype=np.complex128)
+    H_pad[:, :n_log, :n_log] = H_log
+
+    H_sharded = jax.device_put(
+        jnp.asarray(H_pad), NamedSharding(mesh_2x2, P(None, 'x', 'y')))
+
+    out = compute_L_q_from_CCT(
+        H_sharded, mesh_2x2, vertex_mu_L=1, n_rmu_logical=n_log)
+    assert out.shape == (nq, n_log, n_log)
+    np.testing.assert_array_equal(np.asarray(out), H_log)
+
+
+def test_compute_L_q_logical_exceeds_input_raises(mesh_2x2):
+    """n_rmu_logical > input dim is a programmer error; raise."""
+    from common.isdf_fitting import compute_L_q_from_CCT
+
+    G = jnp.asarray(_make_psd_complex(np.random.default_rng(0), 8))
+    G_sharded = jax.device_put(G, NamedSharding(mesh_2x2, P(None, 'x', 'y')))
+    with pytest.raises(ValueError, match="exceeds input extent"):
+        compute_L_q_from_CCT(G_sharded, mesh_2x2, n_rmu_logical=9)
