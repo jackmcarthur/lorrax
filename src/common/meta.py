@@ -21,7 +21,7 @@ class Meta:
     fft_grid: tuple
     cell_volume: float
     n_rtot: int
-    n_rmu: int
+    n_rmu: int                # logical centroid count from the centroid file (== n_rmu_user)
     npol: int
     nfreq: int
     nspin: int
@@ -33,7 +33,16 @@ class Meta:
     nk_tot: int
     nbnd_jax: int
     n_rtot_jax: int
-    n_rmu_jax: int
+    n_rmu_jax: int            # legacy: round_up(n_rmu, n_proc).  n_proc is the host count
+                              # which is the wrong divisor for sharding constraints; kept for
+                              # back-compat with callers that still reference it.  Use
+                              # ``n_rmu_padded`` instead.
+    n_rmu_padded: int = 0     # n_rmu rounded up to ``world_size`` (= jax.device_count() = ∏ p_a
+                              # over the device mesh).  Worst-case sharding divisor — any
+                              # single- or product-axis PartitionSpec on the μ dim divides this.
+                              # Mirrors the band-axis pattern (b_id_4 padded vs b_id_4_user
+                              # logical).  Output writers + SlabIO valid_shape= use n_rmu;
+                              # in-memory shardings use n_rmu_padded.
     b_id_4_user: int = 0      # original user-supplied nband; b_id_4_user == b_id_4 when no pad. Output writers slice to this.
 
     def __post_init__(self):
@@ -118,6 +127,10 @@ class Meta:
         nbnd_jax = _round_up(b_id_4, n_proc)
         n_rtot_jax = _round_up(n_rtot, n_proc)
         n_rmu_jax = _round_up(n_rmu, n_proc)
+        # n_rmu_padded uses world_size (== ∏ p_a over the device mesh), the
+        # worst-case divisor for any single- or product-axis PartitionSpec on
+        # the μ dim.  Parallel to b_id_4's use of world_size (line 100).
+        n_rmu_padded = _round_up(n_rmu, world_size)
         return cls(
             rank,
             n_proc,
@@ -142,5 +155,6 @@ class Meta:
             nbnd_jax,
             n_rtot_jax,
             n_rmu_jax,
+            n_rmu_padded=n_rmu_padded,
             b_id_4_user=b_id_4_user,
         )

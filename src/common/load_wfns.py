@@ -675,6 +675,8 @@ def get_sharded_wfns_centroids(
         psi_rmu_Y: (nk, nb, ns, n_rmu) with P(None, None, None, 'y')
         psi_rmuT_X: (nk, n_rmu, nb, ns) with P(None, 'x', None, None)
     """
+    from runtime.padding import round_up_to_mesh_product
+
     nk_tot = meta.nk_tot
     nspinor = meta.nspinor
     fft_grid = meta.fft_grid
@@ -683,14 +685,24 @@ def get_sharded_wfns_centroids(
     b_start, b_end = band_range
     nb = b_end - b_start
     n_rmu = len(centroid_indices)
-    
+    # Pad μ to ``world_size`` (= ∏ p_a over the device mesh).  The output
+    # sharding ``out_Y = P(None, None, None, 'y')`` is single-axis 'y' on
+    # the μ dim and the input/output of this jit is a top-level boundary,
+    # so n_rmu must divide p_y.  Padding to world_size satisfies any
+    # single-axis or product-axis spec on the μ dim with one rule.  Pad
+    # rows are zero (jnp.pad after the gather), so downstream
+    # pair-density / Σ contractions see no contribution from the pad.
+    # Mirrors the band-axis pattern (``b_id_4`` padded vs ``b_id_4_user``
+    # logical) at common/meta.py:99-100 and load_wfns.py:952-959.
+    n_rmu_padded = round_up_to_mesh_product(n_rmu, mesh_xy)
+
     # Cache key.  The compiled gather closes over the centroid positions, so
     # different centroid files with the same count must not share a closure.
     centroid_indices_np = np.asarray(jax.device_get(centroid_indices), dtype=np.int64)
     centroids_hash = hash((centroid_indices_np.shape, centroid_indices_np.tobytes()))
     kvecs_hash = hash(kvecs_frac.tobytes())
     cache_key = (
-        'centroid_extract', id(mesh_xy), nk_tot, nspinor, n_rmu,
+        'centroid_extract', id(mesh_xy), nk_tot, nspinor, n_rmu, n_rmu_padded,
         nx, ny, nz, kvecs_hash, centroids_hash,
     )
     
@@ -744,6 +756,18 @@ def get_sharded_wfns_centroids(
             psi_rtot = psi_r.reshape(nk_tot, nb_padded, nspinor, -1)
             psi_rmu = jnp.take(psi_rtot, centroid_lin, axis=3)
             # psi_rmu: (nk, nb_padded, ns, n_rmu) sharded {-, XY, -, -}
+
+            # μ-axis pad: the gather outputs at logical ``n_rmu``; the
+            # output sharding ``out_Y = P(None, None, None, 'y')`` is a
+            # top-level boundary that requires divisibility, so we
+            # zero-pad axis 3 up to ``n_rmu_padded`` here.  Pad rows are
+            # zero, ensuring downstream bilinear consumers (pair density,
+            # CCT, Σ_X) see no contribution from the pad.
+            if n_rmu_padded > n_rmu:
+                psi_rmu = jnp.pad(
+                    psi_rmu,
+                    ((0, 0), (0, 0), (0, 0), (0, n_rmu_padded - n_rmu)),
+                )
 
             # Two-step reshard on the PADDED array (divisible by both p_x and p_y):
             # Step 1: {-,XY,-,-} → {-,Y,-,-} (all-gather along X)
@@ -875,9 +899,19 @@ def load_centroids_band_chunked(
     out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
     out_X = NamedSharding(mesh_xy, P(None, 'x', None, None))
 
-    # Allocate output arrays for all bands and k-points
-    psi_rmu_all = jnp.zeros((nk_tot, nb_total, nspinor, n_rmu), dtype=jnp.complex128)
-    psi_rmuT_all = jnp.zeros((nk_tot, n_rmu, nb_total, nspinor), dtype=jnp.complex128)
+    # Allocate output arrays at PADDED n_rmu so the single-axis output
+    # shardings (``P(None, None, None, 'y')`` / ``P(None, 'x', None,
+    # None)``) divide cleanly even when the centroid file's logical n_rmu
+    # doesn't divide max(p_x, p_y).  Pad rows are zero (jnp.zeros) and
+    # the per-chunk ``.at[...].set(psi_rmu_chunk)`` writes use the chunk
+    # at PADDED n_rmu (the kernel pads internally, see
+    # get_sharded_wfns_centroids).  Logical n_rmu remains in
+    # ``meta.n_rmu``; downstream callers slice psi to logical at jit
+    # entry to keep CCT non-singular for the Cholesky/LU.
+    from runtime.padding import round_up_to_mesh_product
+    n_rmu_padded = round_up_to_mesh_product(n_rmu, mesh_xy)
+    psi_rmu_all = jnp.zeros((nk_tot, nb_total, nspinor, n_rmu_padded), dtype=jnp.complex128)
+    psi_rmuT_all = jnp.zeros((nk_tot, n_rmu_padded, nb_total, nspinor), dtype=jnp.complex128)
     psi_rmu_all = jax.lax.with_sharding_constraint(psi_rmu_all, out_Y)
     psi_rmuT_all = jax.lax.with_sharding_constraint(psi_rmuT_all, out_X)
 
