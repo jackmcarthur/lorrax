@@ -67,9 +67,24 @@ LORRAX_SHIFTER_MODULES="gpu,mpich"
 # silently give singleton MPI_COMM_WORLD with shifter-mpich.
 LORRAX_MPI_TYPE_DEFAULT="cray_shasta"
 
-# NVHPC subdir under /lorrax_nvhpc/ that contains math_libs/<cuda>/lib64
-# with libcusolverMp + libcal (must match the stage_nvhpc.sh layout).
-LORRAX_NVHPC_SUBPATH="25.5_cuda12.9/math_libs/12.9/lib64"
+# cuSolverMp lib subdir under /lorrax_nvhpc/.  Must contain
+# math_libs/<cuda>/lib64/libcusolverMp.so + the matching
+# math_libs/<cuda>/targets/x86_64-linux/include/cusolverMp.h.
+#
+# 0.7.2_cuda12.9: standalone PyPI wheel ``nvidia-cusolvermp-cu12==0.7.2.888``
+# extracted into /pscratch/sd/j/jackm/lorrax_nvhpc/0.7.2_cuda12.9/...  This
+# is the working baseline: it includes the CAL→NCCL ABI fix (release 0.7.0)
+# AND the race-condition follow-up (release 0.7.2) so distributed LU on a
+# 2D process grid actually returns correct answers.  Validated on Px=Py=2
+# at machine precision for getrf/getrs across multiple (N, NRHS) configs.
+#
+# 25.5_cuda12.9: the older NVHPC-25.5 install, cuSolverMp 0.6.0.  Kept
+# alongside 0.7.2 for fallback; load with LORRAX_NVHPC_SUBPATH override
+# in a shell.  0.6.0 silently returns wrong answers for getrf/getrs on
+# any Px>1 AND Py>1 mesh — the patched FFI prints a runtime warning
+# (see src/ffi/cusolvermp/cpp/context.cc) but the warning can't fix the
+# bug.  Use 1xN / Nx1 mesh if you must run 0.6.0.
+LORRAX_NVHPC_SUBPATH="0.7.2_cuda12.9/math_libs/12.9/lib64"
 
 # Where Shifter bind-mounts Cray MPICH libs inside the container when
 # --module=mpich is active.  Standard NERSC layout.
