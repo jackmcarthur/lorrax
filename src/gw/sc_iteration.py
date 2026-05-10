@@ -57,7 +57,8 @@ SC updates" is undecided; flagged for a separate design pass.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
@@ -68,7 +69,6 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.units import RYD_TO_EV
 from .band_partition import BandPartition, apply_band_partition
-from .gw_config import ComputeMode
 from .scissor import fit_scissor
 from .sigma_dispatch import SigmaResult, compute_sigma_xc
 from .wavefunction_bundle import (
@@ -114,14 +114,6 @@ class SCInputs:
     partition: BandPartition
     e_dft_active_kn_ry: jax.Array      # (nk, nb_active) DFT energies for scissor fit
     valence_mask_active_kn: jax.Array  # (nk, nb_active) bool — for scissor val/cond split
-    # Σ_c(ω) grid bounds in Ry, ABSOLUTE (not E_F-relative).  Used to
-    # demote bands whose current-iter E_QP has flown outside the grid
-    # to "out-of-range" each iteration (so the partition's scissor
-    # override kicks in instead of plumbing clamped Σ_c into the next
-    # iteration).  ``None`` for static modes where the grid does not
-    # apply — the static partition mask is used unchanged.
-    partition_omega_min_ry: float | None = None
-    partition_omega_max_ry: float | None = None
     print_fn: Callable = print
 
 
@@ -129,13 +121,13 @@ class SCInputs:
 class SCState:
     """State carried across self-consistent iterations.
 
-    The iteration "carry" is **just** ``H_qp_dft_active`` — the QP
-    Hamiltonian on the protected active subspace
-    (``slices.sigma`` of the wfn bundle), in the original DFT basis.
-    Everything else (``E_qp``, ``U_dft_to_qp``, ``efermi``) is derivable
-    by the next iteration's first step (``vmap(eigh)``), so we don't
-    carry redundant state — that would let convergence checks read
-    inconsistent (E, H) pairs if anyone forgot to keep them in sync.
+    The iteration "carry" is **just** ``H_qp_dft`` — the QP Hamiltonian
+    on the active subspace (``slices.sigma`` of the wfn bundle), in
+    the original DFT basis.  Everything else (``E_qp``, ``U_dft_to_qp``,
+    ``efermi``) is derivable by the next iteration's first step
+    (``vmap(eigh)``), so we don't carry redundant state — that would
+    let convergence checks read inconsistent (E, H) pairs if anyone
+    forgot to keep them in sync.
 
     ``last_sigma_result`` is purely for the final output writer (eqp.dat,
     sigma_diag.dat, freq_debug.dat); it does not feed the next iteration.
@@ -164,10 +156,10 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
         nspinor=inputs.meta.nspinor)
     enk_dft_ry = np.asarray(enk_dft, dtype=np.float64)
     nk, nb_active = enk_dft_ry.shape
-    H0 = np.zeros((nk, nb_active, nb_active), dtype=np.complex128)
-    idx = np.arange(nb_active)
-    for k in range(nk):
-        H0[k, idx, idx] = enk_dft_ry[k]
+    # Per-k diagonal of E_DFT_kn — broadcast cast to complex128 for the
+    # iteration carry.
+    H0 = (enk_dft_ry[:, :, None] * np.eye(nb_active)[None, :, :]).astype(
+        np.complex128)
     rep = NamedSharding(inputs.mesh_xy, P(None, None, None))
     return SCState(
         H_qp_dft=jax.device_put(jnp.asarray(H0), rep),
@@ -188,7 +180,6 @@ def _make_kshard_eigh(mesh_xy: Mesh, *, eigvalsh_only: bool):
 
     ``mesh_xy.size`` must divide ``nk``; otherwise the resharding fails.
     """
-    rep_H = NamedSharding(mesh_xy, P(None, None, None))
     rep_E = NamedSharding(mesh_xy, P(None, None))
     rep_U = NamedSharding(mesh_xy, P(None, None, None))
     k_shard_3d = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
@@ -341,32 +332,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
 # Per-iteration scissor refit for non-protected out-of-range bands
 # ---------------------------------------------------------------------------
 
-def _dynamic_in_range_mask(
-    H_qp_dft_full: jax.Array,
-    partition: BandPartition,
-    *,
-    omega_min_ry: float | None,
-    omega_max_ry: float | None,
-) -> jax.Array:
-    """Per-iteration in-range mask from the current H_full diagonal.
-
-    A band is in-range iff ``Re[H_full[k, n, n]]`` lies in
-    ``[ω_min, ω_max]`` for every k.  Falls back to the static
-    ``partition.in_range_mask`` when ω-bounds were not configured
-    (e.g. static-mode SC where the grid is irrelevant).
-    """
-    if omega_min_ry is None or omega_max_ry is None:
-        return partition.in_range_mask
-    H_diag_ry = np.real(np.asarray(jnp.diagonal(
-        H_qp_dft_full, axis1=1, axis2=2)))
-    in_window_kn = (
-        (H_diag_ry >= float(omega_min_ry))
-        & (H_diag_ry <= float(omega_max_ry))
-    )
-    band_in_grid = np.all(in_window_kn, axis=0)
-    return jnp.asarray(band_in_grid, dtype=bool)
-
-
 def _scissor_E_qp_for_outofrange(
     H_qp_dft_full: jax.Array,
     e_dft_kn_ry: jax.Array,
@@ -456,7 +421,6 @@ def run_self_consistency(
         RMS ΔE_n (eV) at each iteration ≥ 1; empty list when
         ``max_iter == 1`` (one-shot G0W0).
     """
-    import os
     print_fn = inputs.print_fn
     _, eigvalsh_kshard = _kshard_eigh_kernels(inputs.mesh_xy)
     _dump_dir = os.environ.get("LORRAX_SC_DUMP_DIR")
@@ -635,7 +599,6 @@ def _maybe_dump_e_history(
 ) -> None:
     if not dump_dir:
         return
-    import os
     os.makedirs(dump_dir, exist_ok=True)
     np.save(os.path.join(dump_dir, "e_history_kn_ev.npy"),
             np.stack(e_history, axis=0))
@@ -700,8 +663,6 @@ def dump_qp_wfn_artifacts(
 
     Returns ``(qp_wfn_path, qp_rotations_path, efermi_ry)``.
     """
-    import os
-    import jax
     from file_io.qp_wfn import write_qp_rotations_h5, write_qp_wfn_h5
 
     enk_qp_ry, U_kmn, efermi_ry = final_qp_eigenstates(

@@ -79,7 +79,6 @@ class SigmaResult:
     omega_grid_ry: np.ndarray | None = None
     head_sigma_diag_w_kn_ry: np.ndarray | None = None
     sigma_omega_h5_path: str | None = None
-    qsgw_n_clipped: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -155,23 +154,25 @@ def compute_sigma_xc(
     from .ppm_pipeline import compute_ppm_sigma_pipeline
     from .qsgw_utils import build_qsgw_sigma_xc
 
-    # Static channels first — sig_h (V_H) and sig_x (bare exchange) are
-    # used by every mode (PPM modes consume them in the QSGW build);
-    # sig_sx / sig_coh use W(ω=0) and only matter for static modes.
-    # X_ONLY: no static W needed → fall back to the bare V proxy so the
-    # cohsex kernel still runs (sig_sx / sig_coh are discarded).
+    # Static channels: sig_h (V_H) and sig_x (bare exchange) are used by
+    # every mode (PPM modes consume them in the QSGW build).
+    # sig_sx / sig_coh use W(ω=0) and only matter for COHSEX, so disable
+    # the screened-channel kernels for X_ONLY / PPM modes — those would
+    # otherwise pay an SX + COH evaluation per SC iteration only to
+    # discard the result.
     W_static = W_by_role.get("static", V_q)
+    needs_screened_static = (mode is ComputeMode.COHSEX)
     cohsex = compute_cohsex_sigma(
         wfns, V_q, W_static, meta, mesh_xy,
         Gij=None,                                # default DFT-occ projector
-        do_screened=config.do_screened,
+        do_screened=needs_screened_static,
         static_head_terms=static_head_terms,
         compute_bare_x=True,
     )
-    sig_sx = cohsex["sig_sx"]
-    sig_coh = cohsex["sig_coh"]
     sig_h = cohsex["sig_h"]
     sig_x = cohsex["sig_x"]
+    sig_sx = cohsex["sig_sx"]                    # zero placeholders when not screened
+    sig_coh = cohsex["sig_coh"]
 
     if mode is ComputeMode.X_ONLY:
         sigma_xc = sig_x
@@ -239,7 +240,6 @@ def compute_sigma_xc(
         omega_grid_ry=ppm_outputs.ppm_options.omega_grid_ry,
         head_sigma_diag_w_kn_ry=ppm_outputs.head_sigma_diag_w_kn_ry,
         sigma_omega_h5_path=ppm_outputs.sigma_omega_h5_path,
-        qsgw_n_clipped=int(qsgw_diag["n_clipped"]),
     )
 
 

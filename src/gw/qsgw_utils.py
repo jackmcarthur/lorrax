@@ -72,22 +72,6 @@ def interp_along_omega(
 
 
 # ---------------------------------------------------------------------------
-# SC-COHSEX diagnostics
-# ---------------------------------------------------------------------------
-
-def print_scf_diagnostics(Gij_final, U_full, nelec, nb_sigma, print_fn=print):
-    """Print Gij trace, U unitarity, and mixing diagnostics for SC-COHSEX."""
-    Gij_trace = float(jnp.real(jnp.trace(Gij_final[0])))
-    print_fn(f"[SC] Gij trace at k=0: {Gij_trace:.4f} (should be {nelec})")
-    unitarity_err = float(jnp.max(jnp.abs(
-        jnp.einsum('kim,kin->kmn', jnp.conj(U_full[0:1]), U_full[0:1])[0]
-        - jnp.eye(nb_sigma))))
-    print_fn(f"[SC] U unitarity error at k=0: {unitarity_err:.2e}")
-    U_diag = jnp.abs(jnp.diagonal(U_full[0]))
-    print_fn(f"[SC] |U| diagonal[:5] at k=0: {np.array(U_diag[:5])}")
-
-
-# ---------------------------------------------------------------------------
 # Diagonal-Σ(E) fixed point  (host NumPy, vectorised)
 # ---------------------------------------------------------------------------
 
@@ -363,6 +347,5 @@ __all__ = [
     "extract_sigma_diag_replicated",
     "interp_along_omega",
     "plot_qp_energy_comparison",
-    "print_scf_diagnostics",
     "solve_diagonal_sigma_fixed_point",
 ]

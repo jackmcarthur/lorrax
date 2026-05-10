@@ -399,14 +399,6 @@ def main(argv=None):
 
 	# ---- Mode-pivoted Σ_xc dispatch.  All branches yield ``sigma_total``
 	# replicated on the mesh as Σ_xc + V_H (Ry).
-	#
-	# History note (kept here because it explains a specific decision and
-	# is not yet captured anywhere else): the analytic q→0 head injected
-	# at the end of ``compute_ppm_sigma_pipeline`` was re-added in
-	# 2026-04-25 after being removed in 1542342 (Apr-10).  Magnitude is
-	# ±W^c(0)/(2·V_cell·N_k) on-shell — ~1.24 eV/band on Si 4×4×4 60b.
-	# See reports/mos2_kgrid_gnppm_head_convergence_2026-4-10/.
-	E_sc_ev = None
 	sc_rms_history: list[float] = []
 	if config.self_consistent:
 		# SC-GW iteration map — mode-agnostic.  Each step rotates ψ via
@@ -416,7 +408,8 @@ def main(argv=None):
 		# H_qp_dft on the active subspace; convergence is judged on RMS
 		# ΔE between consecutive eigvalsh.
 		from .sc_iteration import (
-			SCInputs, make_initial_state_from_dft, run_self_consistency)
+			SCInputs, dump_qp_wfn_artifacts,
+			make_initial_state_from_dft, run_self_consistency)
 		from .band_partition import BandPartition
 		from .scissor import classify_bands_in_grid
 		from types import SimpleNamespace
@@ -453,13 +446,6 @@ def main(argv=None):
 			protected_mask=_protected, in_range_mask=_in_range)
 		_partition.warn_if_protected_outside_grid(print_fn=print0)
 
-		# ω-grid bounds for the dynamic per-iteration in_range refresh.
-		# Only meaningful for dynamic compute modes; pass None for static.
-		_omega_min_ry = (
-			_omega_min_ev / RYD_TO_EV if mode.is_dynamic else None)
-		_omega_max_ry = (
-			_omega_max_ev / RYD_TO_EV if mode.is_dynamic else None)
-
 		_sc_inputs = SCInputs(
 			wfns_dft=wfns, V_q=V_q, kin_ion_dft=kin_ion,
 			quad=quad, e_ref=e_ref,
@@ -471,8 +457,6 @@ def main(argv=None):
 			partition=_partition,
 			e_dft_active_kn_ry=_e_dft_active_kn_ry,
 			valence_mask_active_kn=_val_mask_active,
-			partition_omega_min_ry=_omega_min_ry,
-			partition_omega_max_ry=_omega_max_ry,
 			print_fn=print0,
 		)
 		_state_init = make_initial_state_from_dft(_sc_inputs)
@@ -502,7 +486,6 @@ def main(argv=None):
 
 		# Post-SC: dump the QP-rotated WFN_qp.h5 (drop-in replacement for
 		# downstream BSE / restart paths) and the (U, E_qp) companion.
-		from .sc_iteration import dump_qp_wfn_artifacts
 		dump_qp_wfn_artifacts(
 			_state_final, n_occ=int(meta.nelec), mesh_xy=mesh_xy,
 			wfn=wfn, band_slices=band_slices, kgrid=meta.kgrid,
@@ -510,15 +493,20 @@ def main(argv=None):
 		)
 
 		# Plumb the final SigmaResult into the names the writer + freq_debug
-		# block use downstream.  Static modes leave the dynamic fields None;
-		# dynamic modes populate sigma_c_omega / sigma_c_at_dft_diag_ev /
-		# omega_dft_rel_ev / etc.
+		# block use downstream.  Static modes populate sigma_sx / sigma_coh;
+		# dynamic modes set them to zero placeholders here so the writer's
+		# degen averaging + cohsex-diagonal columns don't silently read the
+		# pre-SC outer-scope values (which were computed in the DFT basis
+		# and are no longer in the QP basis after SC).
 		sig_h = _sigma_result.v_h_kij_ry
 		sig_x = _sigma_result.sigma_x_kij_ry
 		sigma_total = _sigma_result.sigma_xc_kij_ry + sig_h
-		if _sigma_result.sigma_sx_kij_ry is not None:
-			sig_sx = _sigma_result.sigma_sx_kij_ry
-			sig_coh = _sigma_result.sigma_coh_kij_ry
+		sig_sx = (_sigma_result.sigma_sx_kij_ry
+		          if _sigma_result.sigma_sx_kij_ry is not None
+		          else jnp.zeros_like(sig_x))
+		sig_coh = (_sigma_result.sigma_coh_kij_ry
+		           if _sigma_result.sigma_coh_kij_ry is not None
+		           else jnp.zeros_like(sig_x))
 		sigma_c_at_dft_ev = _sigma_result.sigma_c_at_dft_diag_ev
 		omega_dft_rel_ev = _sigma_result.omega_dft_rel_ev
 		efermi_dft_ev = float(wfn.efermi) * RYD_TO_EV
@@ -605,7 +593,6 @@ def main(argv=None):
 		else:
 			E_sc_rel_ry = np.where(in_grid_kn_band, E_sc_rel_ry, E_dft_rel_ry)
 		E_sc_rel_ev = E_sc_rel_ry * RYD_TO_EV
-		E_sc_ev = E_sc_rel_ev + (efermi_ry * RYD_TO_EV)
 
 		# QSGW Σ_xc^QSGW: sharded ω-tensor + replicated E_sc → replicated Σ_xc.
 		# Build kernel takes ω-grid and evaluation energies in **eV**; we

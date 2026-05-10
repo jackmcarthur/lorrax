@@ -119,6 +119,16 @@ def write_qp_wfn_h5(
 
     Spinors: handled identically per (k, s) — the rotation is in band
     space and does not mix spinor components.
+
+    Occupations: ``ifmin`` / ``ifmax`` are inherited from the source
+    WFN via :class:`WFNWriter` (which sets ``ifmax = nelec`` on every
+    k).  Safe whenever the SC iteration preserves the overall
+    valence/conduction band ordering — which holds for insulators with
+    QP shifts smaller than the gap.  For metals or near-gap-closure
+    systems, an SC update can permute occupied vs. empty bands; the
+    output ``occ`` array would then be wrong and would need to be
+    recomputed from the QP energies + a fresh midgap E_F before
+    handing the file to a downstream consumer that trusts ``occ``.
     """
     from .wfn_writer import WFNWriter
 
@@ -157,10 +167,11 @@ def write_qp_wfn_h5(
             # Rotate the active block in band space:
             #   c_qp[n, s, G] = Σ_m U[ik, m, n] · c_dft[m+band_start, s, G]
             c_active_dft = c_all_dft[band_start:band_stop]   # (nb_a, nspinor, ngk)
-            c_active_qp = np.einsum(
+            # Overwrite the active block of ``c_all_dft`` in place — the
+            # array is freshly allocated by ``get_cnk_batch`` (it does
+            # ``raw[..., 0] + 1j * raw[..., 1]``), so no aliasing risk.
+            c_all_dft[band_start:band_stop] = np.einsum(
                 'mn,msg->nsg', U_kmn[ik], c_active_dft, optimize=True)
-            c_all_qp = c_all_dft.copy()
-            c_all_qp[band_start:band_stop] = c_active_qp
-            w.write_k(ik, enk_full_ry[ik], c_all_qp)
+            w.write_k(ik, enk_full_ry[ik], c_all_dft)
 
 

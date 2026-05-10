@@ -261,30 +261,8 @@ def fit_scissor(
     )
 
 
-# ---------------------------------------------------------------------------
-# Extrapolate to full bandrange
-# ---------------------------------------------------------------------------
-
-def extrapolate_delta_e(
-    E_kn_ev: np.ndarray,
-    delta_e_kn_ev: np.ndarray,
-    valence_mask_kn: np.ndarray,
-    in_grid_mask_kn: np.ndarray,
-    fit: ScissorFit,
-) -> np.ndarray:
-    """Return ΔE over the full bandrange.
-
-    In-grid bands keep their measured ΔE; out-of-grid bands get
-    ``fit.predict(E, valence_mask)``.
-    """
-    dE = np.real(np.asarray(delta_e_kn_ev, dtype=np.complex128))
-    ig = np.asarray(in_grid_mask_kn, dtype=bool)
-    return np.where(ig, dE, fit.predict(E_kn_ev, valence_mask_kn))
-
-
 __all__ = [
     "ScissorFit",
     "classify_bands_in_grid",
-    "extrapolate_delta_e",
     "fit_scissor",
 ]
