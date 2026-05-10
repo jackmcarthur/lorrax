@@ -539,12 +539,34 @@ def _identity_pad_block_diagonal(
     return jax.lax.with_sharding_constraint(M_id_pad, sharding)
 
 
+def _resolve_solver_kind_charge(mesh_xy: Mesh) -> str:
+    """Decide whether the charge-channel ζ-fit should use the cuSolverMp
+    distributed potrf+potrs path or the in-tree shard_map 2D-blocked
+    Cholesky + per-q triangular solve.
+
+    Opt-in via env var (default off).  cuSolverMp wins on 2D meshes by
+    avoiding the L_q all-gather inside the per-q-batch solve loop; on
+    1×1 / 1×N / N×1 meshes the wins are marginal so we keep the
+    legacy path.
+    """
+    if os.environ.get('LORRAX_USE_CUSOLVERMP_CHARGE_FACTOR', '0') != '1':
+        return 'sharded_cholesky'
+    if mesh_xy.devices.size == 1:
+        return 'sharded_cholesky'
+    px = int(mesh_xy.shape['x'])
+    py = int(mesh_xy.shape['y'])
+    if px == 1 or py == 1:
+        return 'sharded_cholesky'
+    return 'cusolvermp_cholesky'
+
+
 def factor_c_q(
     C_q: jax.Array,
     mesh_xy: Mesh,
     block_size: int = None,
     vertex_mu_L: int = 0,
     n_rmu_logical: int | None = None,
+    solver_kind: str = 'auto',
 ) -> jax.Array:
     """
     Compute system-matrix L_q from CCT matrix.
@@ -632,6 +654,24 @@ def factor_c_q(
     if int(vertex_mu_L) != 0:
         return C_q
 
+    if solver_kind == 'auto':
+        solver_kind = _resolve_solver_kind_charge(mesh_xy)
+
+    if solver_kind == 'cusolvermp_cholesky':
+        # Distributed Cholesky via cuSolverMp potrf — no comm-axis
+        # reshard on the way in (C_q is already P(None, 'x', 'y'),
+        # which is exactly cuSolverMp's expected layout).  Returns
+        # the raw L sharded P(None, 'y', 'x'); the inner transpose
+        # is part of the row-major → col-major translation done
+        # inside batched_distributed_cholesky's shard_map.  The
+        # downstream solve_zeta with solver_kind='cusolvermp_cholesky'
+        # rebuilds the CusolverMpBatchedLowerL handle from the array
+        # + the (mesh, n, Px, Py) closure and dispatches to potrs.
+        # See src/ffi/cusolvermp/batched.py for the handle layout.
+        from ffi.cusolvermp import batched_distributed_cholesky
+        L_handle = batched_distributed_cholesky(C_q, mesh=mesh_xy)
+        return L_handle.raw
+
     Pr = mesh_xy.shape['x']
     Pc = mesh_xy.shape['y']
 
@@ -700,6 +740,7 @@ def solve_zeta(
     mesh_xy: Mesh,
     q_chunk_size: int = 1,
     vertex_mu_L: int = 0,
+    solver_kind: str = 'auto',
 ) -> jax.Array:
     """
     Solve for zeta_q given pre-computed system matrix from
@@ -743,6 +784,58 @@ def solve_zeta(
     """
     nq, n_rmu, _ = L_q.shape
     _, _, n_zchunk = Z_q.shape
+
+    if solver_kind == 'auto':
+        # vertex_mu_L≠0 wants LU regardless of factor path; charge channel
+        # follows the factor-side decision (cuSolverMp or shard_map chol).
+        if int(vertex_mu_L) != 0:
+            solver_kind = 'lu'
+        else:
+            solver_kind = _resolve_solver_kind_charge(mesh_xy)
+
+    if solver_kind == 'cusolvermp_cholesky':
+        # Distributed potrs via cuSolverMp.  Z_q stays at P(None,'x','y')
+        # — no reshard on the way in.  Output lands at the same sharding;
+        # we then reshard back to P(None, None, ('x','y')) to keep the
+        # downstream SlabIO writer contract identical to the legacy
+        # path.  The win over the legacy path is avoiding the per-q-batch
+        # all-gather of L_q (P(None,'x','y') → P(None,None) inside the
+        # solve loop); the Z input reshard is also skipped.
+        from ffi.cusolvermp import batched_distributed_potrs, CusolverMpBatchedLowerL
+        Px = int(mesh_xy.shape['x'])
+        Py = int(mesh_xy.shape['y'])
+        # Pad Z's last dim to a multiple of Py (potrs requirement); zero
+        # columns produce zero ζ columns, harmless.
+        n_zchunk_padded = ((n_zchunk + Py - 1) // Py) * Py
+        needs_padding_cmp = (n_zchunk_padded != n_zchunk)
+        if needs_padding_cmp:
+            Z_q = jnp.pad(Z_q, ((0, 0), (0, 0), (0, n_zchunk_padded - n_zchunk)),
+                          mode='constant')
+        # Rebuild the opaque handle.  L_q came in as raw sharded
+        # P(None,'y','x'); we re-attach the (mesh, n, mb, nb, nbatch)
+        # metadata that the handle dataclass needs.  mb/nb match
+        # batched_distributed_cholesky's choice (N/Px, N/Py).
+        L_handle = CusolverMpBatchedLowerL(
+            raw=L_q, mesh=mesh_xy, n=int(n_rmu),
+            mb=int(n_rmu) // Px, nb=int(n_rmu) // Py, nbatch=int(nq),
+        )
+        zeta_xy = batched_distributed_potrs(L_handle, Z_q, mesh=mesh_xy)
+        # Reshard P(None,'x','y') → P(None, None, ('x','y')) so the
+        # downstream rchunk writer sees the same sharding it has always
+        # seen.  Same two-step staging pattern as the legacy path's
+        # Z reshard (single-step direct reshard triggers SPMD's
+        # Involuntary Full Rematerialization).  See lorrax_B commit
+        # c0307a0 for the original rationale.
+        target_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
+        intermediate_shard = NamedSharding(mesh_xy, P('x', None, 'y'))
+        @partial(jax.jit, donate_argnums=(0,))
+        def _reshard_out(z):
+            z = jax.lax.with_sharding_constraint(z, intermediate_shard)
+            return jax.lax.with_sharding_constraint(z, target_shard)
+        zeta_out = _reshard_out(zeta_xy)
+        if needs_padding_cmp:
+            return zeta_out[:, :, :n_zchunk]
+        return zeta_out
 
     # Compute padding needed for even sharding across all devices
     total_devices = mesh_xy.devices.size
@@ -955,6 +1048,7 @@ def _make_fit_one_rchunk_kernel(
     kvecs_frac,
     psi_G_store,
     vertex_mu_L: int = 0,
+    solver_kind: str = 'auto',
 ):
     """Factory: returns a ``jax.jit``'d fit_one_rchunk callable closing
     over every piece of static structure + a :class:`PsiGStore` that
@@ -1139,9 +1233,12 @@ def _make_fit_one_rchunk_kernel(
                                 kgrid=kgrid, mesh_xy=mesh_xy)
         # L_q for μ_L=0 is the Cholesky factor (Cholesky back-solve);
         # for μ_L≠0 it's the raw indefinite CCT^μ_L (LU + ridge solve).
-        # ``solve_zeta`` dispatches via the vertex_mu_L flag.
+        # ``solve_zeta`` dispatches via the vertex_mu_L flag + solver_kind
+        # closure (charge channel: cusolvermp_cholesky or sharded_cholesky;
+        # transverse channels: lu).
         zeta = solve_zeta(
-            L_q, Z_q, mesh_xy, q_chunk_size, vertex_mu_L=vertex_mu_L)
+            L_q, Z_q, mesh_xy, q_chunk_size,
+            vertex_mu_L=vertex_mu_L, solver_kind=solver_kind)
         return zeta
 
     return _kernel
@@ -1166,6 +1263,7 @@ def fit_one_rchunk(
     q_chunk_size: int,
     kvecs_frac: np.ndarray,
     vertex_mu_L: int = 0,
+    solver_kind: str = 'auto',
 ):
     """Entry point for the r-chunk body jit.  Caches one compiled kernel
     per distinct static configuration.
@@ -1187,6 +1285,7 @@ def fit_one_rchunk(
         hash(kvecs_frac.tobytes()),
         id(psi_G_store),
         int(vertex_mu_L),
+        str(solver_kind),
     )
     fn = _fit_one_rchunk_cache.get(cache_key)
     if fn is None:
@@ -1201,6 +1300,7 @@ def fit_one_rchunk(
             kvecs_frac,
             psi_G_store,
             vertex_mu_L=int(vertex_mu_L),
+            solver_kind=str(solver_kind),
         )
         _fit_one_rchunk_cache[cache_key] = fn
     return fn(
@@ -1265,6 +1365,7 @@ def fit_zeta_to_h5(
     slab_io_backend=None,
     gspace_mode: str = "host_cache",
     vertex_mu_L: int = 0,
+    solver_kind: str = 'auto',
 ):
     """
     Full zeta fitting pipeline with r-chunk loop and HDF5 output.
@@ -1469,12 +1570,25 @@ def fit_zeta_to_h5(
     # rcond cutoff (drops null transverse-current modes that would
     # otherwise be amplified by 10^4–10^6).
     with timing.section("zeta_fit.cholesky"):
-        if int(vertex_mu_L) == 0:
-            print(f"  Computing L_q = chol(C_q)  [PSD, charge channel]")
+        # Resolve solver_kind once up here so the banner reflects what
+        # actually runs.  ``factor_c_q`` and the rchunk kernel also
+        # default ``auto`` to the same resolver if we don't pass through.
+        if solver_kind == 'auto':
+            if int(vertex_mu_L) != 0:
+                _resolved_solver_kind = 'lu'
+            else:
+                _resolved_solver_kind = _resolve_solver_kind_charge(mesh_xy)
         else:
-            print(f"  Pass through C_q  [γ̃^{vertex_mu_L} indefinite — pivoted-LU + ridge solve]")
+            _resolved_solver_kind = solver_kind
+        if int(vertex_mu_L) == 0:
+            print(f"  Computing L_q = chol(C_q)  [PSD, charge channel, "
+                  f"path={_resolved_solver_kind}]")
+        else:
+            print(f"  Pass through C_q  [γ̃^{vertex_mu_L} indefinite — "
+                  f"path={_resolved_solver_kind}]")
         L_q = factor_c_q(
-            C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L), n_rmu_logical=n_rmu)
+            C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
+            n_rmu_logical=n_rmu, solver_kind=_resolved_solver_kind)
         L_q.block_until_ready()
         print(f"  L_q: {L_q.shape}")
 
@@ -1689,6 +1803,7 @@ def fit_zeta_to_h5(
                         q_chunk_size=q_chunk_size,
                         kvecs_frac=kvecs_frac,
                         vertex_mu_L=int(vertex_mu_L),
+                        solver_kind=_resolved_solver_kind,
                     )
                     zeta_chunk.block_until_ready()
             finally:
