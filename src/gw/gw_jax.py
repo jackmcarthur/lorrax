@@ -376,12 +376,25 @@ def main(argv=None):
 			input_dir=input_dir,
 			print_fn=print0,
 		)
+	# Post-PPM seam: extract every downstream-consumed field into a bare
+	# local, so the writer / freq_debug / SC branch all read uniform names
+	# regardless of whether the data came from a one-shot ``ppm_outputs``,
+	# from a converged SC ``SigmaResult``, or is None (static modes).
 	sigma_omega_h5_path = ppm_outputs.sigma_omega_h5_path if ppm_outputs else None
 	sigma_c_at_dft_ev   = ppm_outputs.sigma_c_at_dft_ev   if ppm_outputs else None
 	sigma_xc_at_dft_ev  = ppm_outputs.sigma_xc_at_dft_ev  if ppm_outputs else None
 	omega_dft_rel_ev    = ppm_outputs.omega_dft_rel_ev    if ppm_outputs else None
 	efermi_dft_ev       = ppm_outputs.efermi_dft_ev       if ppm_outputs else None
-	ppm_options         = ppm_outputs.ppm_options         if ppm_outputs else None
+	sigma_c_omega       = ppm_outputs.sigma_c_omega       if ppm_outputs else None
+	head_sigma_diag_w_kn_ry = (
+		ppm_outputs.head_sigma_diag_w_kn_ry if ppm_outputs else None)
+	omega_grid_ev = (
+		np.asarray(ppm_outputs.ppm_options.omega_grid_ev, dtype=np.float64)
+		if ppm_outputs else None)
+	omega_grid_ry = (
+		np.asarray(ppm_outputs.ppm_options.omega_grid_ry, dtype=np.float64)
+		if ppm_outputs else None)
+	del ppm_outputs                              # all fields now in bare locals
 
 	# ---- QP Hamiltonian: H_QP = (H_DFT - V_xc) + V_H + Σ_xc ----
 	#
@@ -408,11 +421,10 @@ def main(argv=None):
 		# H_qp_dft on the active subspace; convergence is judged on RMS
 		# ΔE between consecutive eigvalsh.
 		from .sc_iteration import (
-			SCInputs, dump_qp_wfn_artifacts,
+			SCInputs, dump_qp_wfn_artifacts, dump_sigma_omega_h5_final,
 			make_initial_state_from_dft, run_self_consistency)
 		from .band_partition import BandPartition
 		from .scissor import classify_bands_in_grid
-		from types import SimpleNamespace
 
 		_enk_active, _ = get_enk_bandrange(
 			wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
@@ -484,20 +496,24 @@ def main(argv=None):
 			+ (f", final RMS ΔE = {sc_rms_history[-1]:.4e} eV"
 				if sc_rms_history else " (one-shot)"))
 
-		# Post-SC: dump the QP-rotated WFN_qp.h5 (drop-in replacement for
-		# downstream BSE / restart paths) and the (U, E_qp) companion.
+		# Post-SC dumps: WFN_qp.h5 (drop-in BSE / restart input),
+		# qp_wfn_rotations.h5 ((U, E_qp) companion), and the converged
+		# sigma_mnk.h5 (intermediate iterations skipped the H5 write,
+		# so this is the single end-of-run write).
 		dump_qp_wfn_artifacts(
 			_state_final, n_occ=int(meta.nelec), mesh_xy=mesh_xy,
 			wfn=wfn, band_slices=band_slices, kgrid=meta.kgrid,
 			output_dir=input_dir, print_fn=print0,
 		)
+		sigma_omega_h5_path = dump_sigma_omega_h5_final(
+			_state_final, config=config, meta=meta, mesh_xy=mesh_xy,
+			input_dir=input_dir, print_fn=print0,
+		)
 
-		# Plumb the final SigmaResult into the names the writer + freq_debug
-		# block use downstream.  Static modes populate sigma_sx / sigma_coh;
-		# dynamic modes set them to zero placeholders here so the writer's
-		# degen averaging + cohsex-diagonal columns don't silently read the
-		# pre-SC outer-scope values (which were computed in the DFT basis
-		# and are no longer in the QP basis after SC).
+		# Overwrite the post-PPM-seam bare locals from the converged
+		# SigmaResult.  Same names and shapes as the one-shot path, so
+		# the downstream writer / freq_debug code is identical for SC
+		# and one-shot.  PPM-only fields stay None for static SC modes.
 		sig_h = _sigma_result.v_h_kij_ry
 		sig_x = _sigma_result.sigma_x_kij_ry
 		sigma_total = _sigma_result.sigma_xc_kij_ry + sig_h
@@ -510,20 +526,19 @@ def main(argv=None):
 		sigma_c_at_dft_ev = _sigma_result.sigma_c_at_dft_diag_ev
 		omega_dft_rel_ev = _sigma_result.omega_dft_rel_ev
 		efermi_dft_ev = float(wfn.efermi) * RYD_TO_EV
-		sigma_omega_h5_path = _sigma_result.sigma_omega_h5_path
-		if _sigma_result.omega_grid_ev is not None:
-			ppm_options = SimpleNamespace(
-				omega_grid_ev=_sigma_result.omega_grid_ev,
-				omega_grid_ry=_sigma_result.omega_grid_ry,
-			)
-			ppm_outputs = SimpleNamespace(
-				sigma_c_omega=_sigma_result.sigma_c_omega_kij_ry,
-				head_sigma_diag_w_kn_ry=_sigma_result.head_sigma_diag_w_kn_ry,
-			)
+		sigma_c_omega = _sigma_result.sigma_c_omega_kij_ry
+		head_sigma_diag_w_kn_ry = _sigma_result.head_sigma_diag_w_kn_ry
+		omega_grid_ev = (
+			np.asarray(_sigma_result.omega_grid_ev, dtype=np.float64)
+			if _sigma_result.omega_grid_ev is not None else None)
+		omega_grid_ry = (
+			np.asarray(_sigma_result.omega_grid_ry, dtype=np.float64)
+			if _sigma_result.omega_grid_ry is not None else None)
+		# (sigma_omega_h5_path was set above by dump_sigma_omega_h5_final.)
 		if sigma_c_at_dft_ev is not None:
 			sigma_xc_at_dft_ev = sigma_c_at_dft_ev + np.real(np.diagonal(
 				np.asarray(sig_x), axis1=1, axis2=2)) * RYD_TO_EV
-	elif mode.is_dynamic and ppm_outputs is not None and ppm_outputs.sigma_c_omega is not None:
+	elif mode.is_dynamic and sigma_c_omega is not None:
 		# G0W0/QSGW: diagonal-Σ(E) fixed point (with optional scissor) →
 		# QSGW Σ_xc^QSGW.  Restart-friendly: this whole block consumes only
 		# the on-device ``sigma_c_omega`` plus replicated (sig_x, sig_h),
@@ -532,11 +547,10 @@ def main(argv=None):
 		# All quantities below are in **Rydberg** until the scissor's print
 		# summary and final eV outputs.  Σ_c(ω) lives natively in Ry on the
 		# Ry ω-grid; mixing that with eV-converted h0/Σ_x is a footgun.
-		omega_grid_ry = np.asarray(ppm_options.omega_grid_ry, dtype=np.float64)
 
 		# Diagonal Σ_c(ω, k, n) and Σ_x(k, n) replicated on host, in Ry.
 		sigma_c_diag_w_kn_ry = np.asarray(extract_sigma_diag_replicated(
-			ppm_outputs.sigma_c_omega, mesh_xy))
+			sigma_c_omega, mesh_xy))
 		sigma_x_diag_kn_ry = np.real(
 			np.diagonal(np.asarray(sig_x), axis1=1, axis2=2))
 		sigma_xc_diag_w_kn_ry = sigma_c_diag_w_kn_ry + sigma_x_diag_kn_ry[None, :, :]
@@ -600,7 +614,7 @@ def main(argv=None):
 		sig_x_rep = jax.device_put(jnp.asarray(sig_x),
 			NamedSharding(mesh_xy, P(None, None, None)))
 		sigma_xc_qsgw_kij_ry, qsgw_diag = build_qsgw_sigma_xc(
-			ppm_outputs.sigma_c_omega, sig_x_rep,
+			sigma_c_omega, sig_x_rep,
 			omega_grid_ry * RYD_TO_EV, E_sc_rel_ev, mesh_xy,
 		)
 		print0(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
@@ -654,10 +668,10 @@ def main(argv=None):
 	# Σ_c(ω, k, i, j) tensor is in sigma_mnk.h5 for callers that need them.
 	# Σ_c diagonal on the ω-grid: feed the eqp1.dat writer's central-diff
 	# Z-factor.  Pulled from the on-device sharded tensor when available.
-	if ppm_outputs is not None and ppm_outputs.sigma_c_omega is not None:
+	if sigma_c_omega is not None:
 		sigma_c_omega_diag_ev = np.asarray(extract_sigma_diag_replicated(
-			ppm_outputs.sigma_c_omega, mesh_xy)) * RYD_TO_EV
-		omega_rel_ev = np.asarray(ppm_options.omega_grid_ev)
+			sigma_c_omega, mesh_xy)) * RYD_TO_EV
+		omega_rel_ev = omega_grid_ev
 	else:
 		sigma_c_omega_diag_ev = None
 		omega_rel_ev = None
@@ -732,18 +746,15 @@ def main(argv=None):
 			# PPM analytic head interpolated at the same E_DFT − E_F used
 			# for ``sig_c(Edft)`` (same ω-grid, same linear-interp recipe
 			# → cancellation analyses work column-by-column).
-			head_w_kn_ry = (
-				ppm_outputs.head_sigma_diag_w_kn_ry
-				if ppm_outputs is not None else None)
-			if head_w_kn_ry is not None:
+			if head_sigma_diag_w_kn_ry is not None:
 				from .qsgw_utils import interp_along_omega
 				_eval_ry = (np.asarray(omega_dft_rel_ev, np.float64)
 				            / RYD_TO_EV)
 				_cols.append((
 					"sig_c_head(Edft)",
 					interp_along_omega(
-						head_w_kn_ry,
-						np.asarray(ppm_options.omega_grid_ry, np.float64),
+						head_sigma_diag_w_kn_ry,
+						omega_grid_ry,
 						_eval_ry,
 					) * RYD_TO_EV,
 				))

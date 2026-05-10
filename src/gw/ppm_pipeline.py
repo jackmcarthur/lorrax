@@ -296,6 +296,7 @@ def compute_ppm_sigma_pipeline(
     wfn,
     sym,
     input_dir: str,
+    write_sigma_omega_h5: bool = True,
     print_fn=print,
 ) -> PPMOutputs:
     """Run the GN/HL-PPM dynamic Σ^c(ω) pipeline given pre-computed W's.
@@ -379,13 +380,22 @@ def compute_ppm_sigma_pipeline(
             print_fn=print_fn,
         )
 
-        # Step 5: write sigma_mnk.h5
-        sigma_omega_h5_path = _write_sigma_omega_h5(
-            sigma_c_omega, sigma_omega,
-            ppm_options=ppm_options, sig_x=sig_x, sig_h=sig_h,
-            config=config, input_dir=input_dir,
-            meta=meta, mesh_xy=mesh_xy,
-        )
+        # Step 5: write sigma_mnk.h5 (skipped on intermediate SC iters
+        # — the SC driver writes once at convergence using the captured
+        # sigma_c_omega from the final SigmaResult).
+        if write_sigma_omega_h5:
+            sigma_omega_h5_path = _write_sigma_omega_h5(
+                sigma_c_omega, sigma_omega,
+                ppm_options=ppm_options, sig_x=sig_x, sig_h=sig_h,
+                config=config, input_dir=input_dir,
+                meta=meta, mesh_xy=mesh_xy,
+            )
+        else:
+            import os
+            sigma_omega_h5_path = config.paths.sigma_omega_h5_file
+            if not os.path.isabs(sigma_omega_h5_path):
+                sigma_omega_h5_path = os.path.join(
+                    input_dir, sigma_omega_h5_path)
 
     return PPMOutputs(
         sigma_c_omega=sigma_c_omega,

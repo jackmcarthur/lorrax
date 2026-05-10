@@ -103,6 +103,7 @@ def compute_sigma_xc(
     wfn,
     band_slices,
     input_dir: str,
+    write_sigma_omega_h5: bool = True,
     print_fn: Callable = print,
 ) -> SigmaResult:
     """One-line entry point: build the full Σ_xc + V_H given the current
@@ -216,6 +217,7 @@ def compute_sigma_xc(
         head_resolver=head_resolver,
         band_slices=band_slices, wfn=wfn, sym=sym,
         input_dir=input_dir,
+        write_sigma_omega_h5=write_sigma_omega_h5,
         print_fn=print_fn,
     )
 

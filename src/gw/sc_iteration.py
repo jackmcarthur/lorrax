@@ -287,7 +287,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         print_fn=inputs.print_fn,
     )
 
-    # Σ_xc dispatch — mode-orthogonal.
+    # Σ_xc dispatch — mode-orthogonal.  ``write_sigma_omega_h5=False``
+    # so intermediate SC iterations don't thrash sigma_mnk.h5; the
+    # converged tensor is written once after run_self_consistency
+    # returns (see ``dump_sigma_omega_h5_final``).
     sigma_result = compute_sigma_xc(
         inputs.config.compute_mode,
         wfns=wfns_qp, V_q=inputs.V_q, W_by_role=W_by_role,
@@ -299,6 +302,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         sym=inputs.sym, wfn=inputs.wfn,
         band_slices=inputs.band_slices,
         input_dir=inputs.input_dir,
+        write_sigma_omega_h5=False,
         print_fn=inputs.print_fn,
     )
 
@@ -634,6 +638,51 @@ def final_qp_eigenstates(
     )
 
 
+def dump_sigma_omega_h5_final(
+    state: SCState, *,
+    config,
+    meta,
+    mesh_xy: Mesh,
+    input_dir: str,
+    print_fn: Callable = print,
+) -> str | None:
+    """Write the converged ``sigma_mnk.h5`` once after SC convergence.
+
+    Pulls the full ω-grid Σ_c tensor from ``state.last_sigma_result``
+    (which the iteration map captures from each
+    :func:`compute_sigma_xc` call but does NOT write to disk during SC
+    iterations — see the ``write_sigma_omega_h5=False`` flag in
+    :func:`gw_iteration_map`).  Replaces ~30 redundant per-iteration
+    writes with a single end-of-run write.
+
+    Returns the on-disk path (or ``None`` for static modes that didn't
+    populate a Σ_c(ω) tensor).
+    """
+    sigma_result = state.last_sigma_result
+    if sigma_result is None or sigma_result.sigma_c_omega_kij_ry is None:
+        return None
+    from .ppm_pipeline import _write_sigma_omega_h5
+    from .gw_driver_helpers import build_ppm_sigma_runtime_options
+    from types import SimpleNamespace
+
+    ppm_options = build_ppm_sigma_runtime_options(config, input_dir=input_dir)
+    # _write_sigma_omega_h5 accepts an ``sigma_omega`` object whose
+    # only consulted attribute is ``sigma_kij_h5_path`` (used by the
+    # streamed-fallback branch); the in-memory branch we always hit
+    # here doesn't read it.  Stub it for shape compatibility.
+    sigma_omega_stub = SimpleNamespace(sigma_kij_h5_path=None)
+    path = _write_sigma_omega_h5(
+        sigma_result.sigma_c_omega_kij_ry, sigma_omega_stub,
+        ppm_options=ppm_options,
+        sig_x=sigma_result.sigma_x_kij_ry,
+        sig_h=sigma_result.v_h_kij_ry,
+        config=config, input_dir=input_dir,
+        meta=meta, mesh_xy=mesh_xy,
+    )
+    print_fn(f"  Σ_c(ω) tensor: {path}")
+    return path
+
+
 def dump_qp_wfn_artifacts(
     state: SCState, *,
     n_occ: int,
@@ -702,4 +751,5 @@ __all__ = [
     "run_self_consistency",
     "final_qp_eigenstates",
     "dump_qp_wfn_artifacts",
+    "dump_sigma_omega_h5_final",
 ]
