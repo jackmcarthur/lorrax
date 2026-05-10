@@ -23,6 +23,30 @@ BUILD_DIR="${SCRIPT_DIR}/build"
 NVHPC_ROOT="${LORRAX_NVHPC_ROOT:-/lorrax_nvhpc/25.5_cuda12.9}"
 NVHPC_CUDA="${LORRAX_NVHPC_CUDA:-12.9}"
 
+# MPI stack sanity check.  The CMake config (see CMakeLists.txt ~L283-305)
+# reads LORRAX_MPI_INCLUDE_DIR + LORRAX_MPICH_LIB_DIR and silently falls
+# back to /opt/hpcx/ompi/lib if either is unset.  That fallback links the
+# FFI against HPC-X OpenMPI (DT_NEEDED libmpi.so.40), which then races
+# the Cray MPICH bind-mount at runtime — see KNOWN_SANDBOX_ERRORS.md
+# 2026-05-10.  This script is normally invoked via run_shifter.sh which
+# exports both vars; fail loudly when they're missing instead of producing
+# a silently-broken .so.  Set LORRAX_FFI_ALLOW_DEFAULT_MPI=1 to opt out
+# (e.g. for the OpenMPI build path on non-Cray sites).
+if [[ -z "${LORRAX_FFI_ALLOW_DEFAULT_MPI:-}" ]]; then
+    if [[ -z "${LORRAX_MPI_INCLUDE_DIR:-}" || -z "${LORRAX_MPICH_LIB_DIR:-}" ]]; then
+        echo "[build] ERROR: LORRAX_MPI_INCLUDE_DIR / LORRAX_MPICH_LIB_DIR not set." >&2
+        echo "[build]   include='${LORRAX_MPI_INCLUDE_DIR:-<unset>}'" >&2
+        echo "[build]   libdir ='${LORRAX_MPICH_LIB_DIR:-<unset>}'"   >&2
+        echo "[build] Without these CMake falls back to HPC-X OpenMPI at /opt/hpcx/ompi" >&2
+        echo "[build] and the produced .so will have DT_NEEDED libmpi.so.40 — which is" >&2
+        echo "[build] the wrong SONAME for Cray MPICH and segfaults the runtime path" >&2
+        echo "[build] (see KNOWN_SANDBOX_ERRORS.md 2026-05-10)." >&2
+        echo "[build] Invoke via src/ffi/common/cpp/run_shifter.sh, which exports both," >&2
+        echo "[build] or set LORRAX_FFI_ALLOW_DEFAULT_MPI=1 to bypass this check." >&2
+        exit 2
+    fi
+fi
+
 echo "[build] NVHPC_ROOT = ${NVHPC_ROOT}"
 echo "[build] CUDA sub   = ${NVHPC_CUDA}"
 echo "[build] sources    = ${SCRIPT_DIR}"

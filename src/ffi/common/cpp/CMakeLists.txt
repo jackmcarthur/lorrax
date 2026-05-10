@@ -300,9 +300,30 @@ if(NOT DEFINED LORRAX_MPICH_LIB_DIR AND DEFINED ENV{LORRAX_MPICH_LIB_DIR})
 endif()
 if(NOT DEFINED LORRAX_MPICH_LIB_DIR)
     # Default chases the OpenMPI path (verified default) so bare cmake
-    # runs inside a shifter-gpu container still find something.
+    # runs inside a shifter-gpu container still find something.  This is
+    # ONLY appropriate for the LORRAX_PHDF5_MPI_STACK=openmpi build path;
+    # on Cray/MPICH sites it produces DT_NEEDED libmpi.so.40 which can't
+    # be resolved at runtime under --module=mpich (see KNOWN_SANDBOX_ERRORS
+    # 2026-05-10).  build.sh refuses to run if LORRAX_MPICH_LIB_DIR is
+    # unset; cmake-by-hand callers should pass -DLORRAX_MPICH_LIB_DIR=...
+    # explicitly.
+    message(WARNING
+        "LORRAX_MPICH_LIB_DIR not set — falling back to /opt/hpcx/ompi/lib "
+        "(HPC-X OpenMPI).  This is correct only for the OpenMPI build "
+        "path; on Cray/MPICH sites invoke build.sh via run_shifter.sh so "
+        "LORRAX_MPICH_LIB_DIR=/opt/udiImage/modules/mpich is exported.")
     set(LORRAX_MPICH_LIB_DIR "/opt/hpcx/ompi/lib" CACHE PATH "MPI runtime lib dir")
 endif()
+# NOTE on SONAME resolution: cmake's find_library follows the libmpi.so
+# symlink, and the linker records the target's SONAME as DT_NEEDED.  On
+# Cray Perlmutter the symlink chain inside the container is
+#   /opt/udiImage/modules/mpich/libmpi.so → libmpi_gnu_91.so.12.0.0
+# with SONAME `libmpi_gnu_91.so.12`, so the FFI ends up with DT_NEEDED
+# libmpi_gnu_91.so.12 — the actual Cray MPICH ABI tag.  HDF5's own
+# DT_NEEDED is `libmpi_gnu_123.so.12` (a filename alias provided by the
+# Cray phdf5 stage); the staged dir contains a symlink mapping that
+# filename onto the same MPICH library, so both resolve to one process-
+# global libmpi.
 find_library(LORRAX_MPI_LIBRARY
     NAMES mpi
     HINTS "${LORRAX_MPICH_LIB_DIR}"
