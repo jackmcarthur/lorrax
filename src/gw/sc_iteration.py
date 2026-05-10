@@ -645,10 +645,100 @@ def _maybe_dump_e_history(
     )
 
 
+def final_qp_eigenstates(
+    state: SCState, *, n_occ: int, mesh_xy: Mesh,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Diagonalise the converged ``state.H_qp_dft`` and return the QP eigenstates.
+
+    Returned arrays are host-side numpy (not jax.Array) since the
+    typical consumers (WFN_qp.h5 writer, eqp.dat tooling) operate on
+    NumPy.  Use this once after :func:`run_self_consistency` to extract
+    the (E_qp_ry, U_qp, efermi_ry) needed for downstream rotation +
+    serialisation.
+
+    Returns
+    -------
+    enk_qp_ry : (nk, nb_active) float64
+    U_kmn     : (nk, nb_active, nb_active) complex128, ``U[k, m, n] = ⟨DFT_m | QP_n⟩``
+    efermi_ry : float, midgap of the converged eigenvalues
+    """
+    E_ry, U, efermi_ry = _diagonalize_and_get_efermi(
+        state.H_qp_dft, n_occ, mesh_xy)
+    return (
+        np.asarray(E_ry, dtype=np.float64),
+        np.asarray(U, dtype=np.complex128),
+        float(efermi_ry),
+    )
+
+
+def dump_qp_wfn_artifacts(
+    state: SCState, *,
+    n_occ: int,
+    mesh_xy: Mesh,
+    wfn,                                 # WFNReader (source of base coeffs + crystal)
+    band_slices,
+    kgrid,                               # (nkx, nky, nkz)
+    output_dir: str,
+    print_fn: Callable = print,
+) -> tuple[str, str, float]:
+    """Post-SC artifact dump: WFN_qp.h5 + qp_wfn_rotations.h5.
+
+    Diagonalises the converged ``state.H_qp_dft`` once, then writes:
+
+    * ``WFN_qp.h5`` — full BGW-format wavefunction file with active-block
+      ψ rotated by ``U`` and active-block energies replaced by ``E_qp``;
+      bands outside the active block keep their DFT values.
+      Drop-in replacement for downstream BSE / restart paths that read
+      a WFN.h5.
+    * ``qp_wfn_rotations.h5`` — small companion file containing just
+      ``(U, E_qp)`` for tools that prefer to apply the rotation
+      themselves.
+
+    Both files are rank-0-only writes (h5py is single-writer); a
+    multihost barrier follows so the caller can rely on both files
+    existing on every rank when this function returns.
+
+    Returns ``(qp_wfn_path, qp_rotations_path, efermi_ry)``.
+    """
+    import os
+    import jax
+    from file_io.qp_wfn import write_qp_rotations_h5, write_qp_wfn_h5
+
+    enk_qp_ry, U_kmn, efermi_ry = final_qp_eigenstates(
+        state, n_occ=n_occ, mesh_xy=mesh_xy)
+    qp_wfn_path = os.path.join(output_dir, "WFN_qp.h5")
+    qp_rot_path = os.path.join(output_dir, "qp_wfn_rotations.h5")
+    if jax.process_index() == 0:
+        write_qp_wfn_h5(
+            qp_wfn_path, wfn=wfn,
+            U_kmn=U_kmn, enk_active_qp_ry=enk_qp_ry,
+            band_start=band_slices.b0, band_stop=band_slices.b3,
+        )
+        write_qp_rotations_h5(
+            qp_rot_path,
+            U_mnk=U_kmn,
+            E_qp_nk=enk_qp_ry * 0.5,                       # Ry → Hartree
+            band_start=band_slices.b0, band_stop=band_slices.b3,
+            kpoints_crys=np.asarray(wfn.kpoints, dtype=np.float64),
+            nkx=int(kgrid[0]), nky=int(kgrid[1]), nkz=int(kgrid[2]),
+        )
+    try:
+        from jax.experimental import multihost_utils as _mh
+        _mh.sync_global_devices("qp_wfn_h5_write")
+    except Exception:
+        pass
+    print_fn(f"  QP WFN:       {qp_wfn_path}")
+    print_fn(f"  QP rotations: {qp_rot_path}")
+    print_fn(f"  Final E_F (midgap, eV): {efermi_ry * RYD_TO_EV:.6f}")
+    return qp_wfn_path, qp_rot_path, efermi_ry
+
+
 __all__ = [
     "SCInputs",
     "SCState",
     "gw_iteration_map",
     "make_initial_state_from_dft",
     "run_self_consistency",
+    "final_qp_eigenstates",
+    "dump_qp_wfn_artifacts",
 ]

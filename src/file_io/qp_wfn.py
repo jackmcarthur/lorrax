@@ -1,4 +1,14 @@
-"""QP wavefunction rotation matrix I/O."""
+"""QP wavefunction rotation matrix I/O.
+
+Two writers live here:
+
+* :func:`write_qp_rotations_h5` — small ``(U, E_qp)`` companion file used
+  by tools that want to apply the QP rotation themselves.
+* :func:`write_qp_wfn_h5` — full BGW-compatible ``WFN.h5`` with ψ already
+  rotated and energies replaced.  This is the canonical "QP WFN" output
+  consumed by downstream BSE / restart paths that just want a WFN.h5
+  drop-in replacement.
+"""
 import numpy as np
 import h5py
 
@@ -70,4 +80,87 @@ def write_qp_rotations_h5(
                 'kirr_to_kfull[ik_red] gives the index into kpoints_crys/U_mnk/E_qp_nk '
                 'for the reduced k-point ik_red from WFN.h5'
             )
+
+
+# ---------------------------------------------------------------------------
+# Full WFN.h5 with rotated ψ + replaced energies
+# ---------------------------------------------------------------------------
+
+def write_qp_wfn_h5(
+    output_path: str,
+    wfn,                                    # WFNReader (also serves as `crystal` for the writer)
+    U_kmn: np.ndarray,                      # (nk, nb_active, nb_active)  ⟨DFT_m | QP_n⟩
+    enk_active_qp_ry: np.ndarray,           # (nk, nb_active)             E_QP for active block, Ry
+    band_start: int,
+    band_stop: int,
+) -> None:
+    """Write a BGW-compatible WFN.h5 with QP-rotated ψ and replaced energies.
+
+    For each k:
+      * Bands ``[band_start, band_stop)`` (the "active" block):
+          ``c_qp[n, s, G] = Σ_m U[k, m, n] · c_dft[m, s, G]``
+          ``E[n] ← enk_active_qp_ry[k, n - band_start]``
+      * All other bands keep their DFT coefficients and DFT energies
+        unchanged — the SC iteration only touched the active subspace.
+
+    The ``wfn`` argument is a :class:`~file_io.wfnreader.WFNReader` and
+    is reused as the ``crystal`` source for :class:`WFNWriter` (it
+    exposes the same ``nspin``, ``nspinor``, ``nelec``, ``ecutwfc``,
+    ``ecutrho``, ``fft_grid``, ``avec``, ``bdot``, … attributes the
+    writer reads).
+
+    Notes
+    -----
+    Symmetry & k-mesh: the rotation is on the irreducible-k WFN —
+    output is on the same irreducible-k grid as the input, with the
+    ``mtrx`` / ``tnp`` blocks copied through.  Symmetry-equivalent
+    full-zone wavefunctions are reconstructed by downstream consumers
+    (BSE, etc.) via the same maps as for the input WFN.
+
+    Spinors: handled identically per (k, s) — the rotation is in band
+    space and does not mix spinor components.
+    """
+    from .wfn_writer import WFNWriter
+
+    nb_active = int(band_stop - band_start)
+    if U_kmn.shape != (wfn.nkpts, nb_active, nb_active):
+        raise ValueError(
+            f"write_qp_wfn_h5: U shape {U_kmn.shape} inconsistent with "
+            f"(nk={wfn.nkpts}, nb_active={nb_active}).")
+    if enk_active_qp_ry.shape != (wfn.nkpts, nb_active):
+        raise ValueError(
+            f"write_qp_wfn_h5: enk_active_qp_ry shape "
+            f"{enk_active_qp_ry.shape} inconsistent with "
+            f"(nk={wfn.nkpts}, nb_active={nb_active}).")
+
+    # G-vectors per k from the source WFN.
+    gvecs_per_k = [wfn.get_gvec_nk(ik) for ik in range(wfn.nkpts)]
+    # Eigenvalues are stored as (nspin, nk, nbands) in BGW convention;
+    # the writer accepts (nk, nbands) via _el[0, ik] = eigenvalues.
+    enk_full_ry = np.array(wfn.energies[0], dtype=np.float64).copy()  # (nk, nbands)
+    enk_full_ry[:, band_start:band_stop] = np.asarray(
+        enk_active_qp_ry, dtype=np.float64)
+
+    with WFNWriter(
+        output_path, wfn,
+        kpoints=np.asarray(wfn.kpoints, dtype=np.float64),
+        weights=np.asarray(wfn.kweights, dtype=np.float64),
+        kgrid=tuple(int(x) for x in wfn.kgrid),
+        nbands=int(wfn.nbands),
+        gvecs_per_k=gvecs_per_k,
+        nosym=False,
+        shift=tuple(float(x) for x in wfn.shift),
+    ) as w:
+        for ik in range(wfn.nkpts):
+            # All-band DFT coefficients at this k: (nbands, nspinor, ngk_k)
+            c_all_dft = wfn.get_cnk_batch(ik, np.arange(wfn.nbands))
+            # Rotate the active block in band space:
+            #   c_qp[n, s, G] = Σ_m U[ik, m, n] · c_dft[m+band_start, s, G]
+            c_active_dft = c_all_dft[band_start:band_stop]   # (nb_a, nspinor, ngk)
+            c_active_qp = np.einsum(
+                'mn,msg->nsg', U_kmn[ik], c_active_dft, optimize=True)
+            c_all_qp = c_all_dft.copy()
+            c_all_qp[band_start:band_stop] = c_active_qp
+            w.write_k(ik, enk_full_ry[ik], c_all_qp)
+
 
