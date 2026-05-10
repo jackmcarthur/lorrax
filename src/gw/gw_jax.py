@@ -500,6 +500,15 @@ def main(argv=None):
 			+ (f", final RMS ΔE = {sc_rms_history[-1]:.4e} eV"
 				if sc_rms_history else " (one-shot)"))
 
+		# Post-SC: dump the QP-rotated WFN_qp.h5 (drop-in replacement for
+		# downstream BSE / restart paths) and the (U, E_qp) companion.
+		from .sc_iteration import dump_qp_wfn_artifacts
+		dump_qp_wfn_artifacts(
+			_state_final, n_occ=int(meta.nelec), mesh_xy=mesh_xy,
+			wfn=wfn, band_slices=band_slices, kgrid=meta.kgrid,
+			output_dir=input_dir, print_fn=print0,
+		)
+
 		# Plumb the final SigmaResult into the names the writer + freq_debug
 		# block use downstream.  Static modes leave the dynamic fields None;
 		# dynamic modes populate sigma_c_omega / sigma_c_at_dft_diag_ev /
