@@ -143,10 +143,21 @@ PhdfCtx* open_ctx(const std::string& path, int p, int q,
     ctx->align_threshold = (align_mb > 0) ? (size_t)align_mb << 20 : 0;
     ctx->align_length    = ctx->align_threshold;
 
-    // Duplicate MPI_COMM_WORLD so HDF5's internal splits/teardown don't
-    // affect other MPI users in the process.
-    MPI_Comm_dup(MPI_COMM_WORLD, &ctx->comm);
-    ctx->owns_comm = true;
+    // Pass MPI_COMM_WORLD straight through to H5Pset_fapl_mpio.  HDF5's
+    // MPI-IO VFD takes its OWN ``MPI_Comm_dup`` of the comm internally
+    // (per H5Pset_fapl_mpio docs) and frees it on file close, so an
+    // outer dup here is redundant work.  It has also proven fragile in
+    // the Shifter container: the dup landed in HPC-X OpenMPI's
+    // ``ompi_comm_dup_with_info`` → UCX path on a 2026-05-10 allocation
+    // where ``--module=mpich`` failed to fully shadow HPC-X with Cray
+    // MPICH, segfaulting before any HDF5 code ran.  With the dup gone
+    // we never reach OpenMPI's PMIx-derived endpoint state in this
+    // open path; HDF5's own internal dup happens later under the
+    // VFD's normal init sequence which has been robust.  See
+    // KNOWN_SANDBOX_ERRORS.md (2026-05-10) for the underlying
+    // ``--module=mpich`` shadowing investigation.
+    ctx->comm = MPI_COMM_WORLD;
+    ctx->owns_comm = false;
 
     // --- MPI_Info hints for ROMIO/MPI-IO.  Per the NERSC I/O guide,
     // collective buffering ("two-phase I/O") aggregates rank-local writes
