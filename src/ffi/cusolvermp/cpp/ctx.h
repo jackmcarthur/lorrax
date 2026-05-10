@@ -28,6 +28,12 @@ struct LorraxCusolverMpCtx {
     bool grid_layout_col_major = true;
     int local_device_id = 0;
 
+    // Loaded-library version, MAJOR*1000 + MINOR*100 + PATCH (e.g. 600,
+    // 720, 800).  Read once at create_context via cusolverMpGetVersion.
+    // Used to dispatch CAL vs NCCL comm path in cusolverMpCreateDeviceGrid
+    // and cublasMpGridCreate (the parameter type changed at 0.7.0).
+    int cusolvermp_version = 0;
+
     // owned resources
     ncclComm_t          nccl_comm  = nullptr;
     cudaStream_t        stream     = nullptr;

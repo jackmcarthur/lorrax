@@ -175,41 +175,127 @@ int64_t create_context(int rank, int world_size,
         cusolverMpCreate(&ctx->handle, ctx->local_device_id, ctx->stream),
         "cusolverMpCreate");
 
-    // Single process grid used for all matrices this context will solve
-    // (p × q).  Larger matrices can reuse the same grid across many
-    // FFI calls.
+    // -- Version detection: cusolverMpCreateDeviceGrid's third argument
+    //    changed from cal_comm_t (≤0.6.x) to ncclComm_t (≥0.7.0).  Both
+    //    are opaque pointers so the C compiler doesn't catch the mismatch;
+    //    runtime symptom on 0.7+ with a CAL pointer is rank-asymmetric
+    //    "cusolverMpGetrs status=7" with all per-rank info=0.  See
+    //    https://docs.nvidia.com/cuda/cusolvermp/usage/initialization/cal_to_nccl.html
+    //
+    //    The same FFI binary supports BOTH paths: detect the loaded
+    //    library version via cusolverMpGetVersion (an int returned as
+    //    MAJOR*1000 + MINOR*100 + PATCH, e.g. 600/700/720/800), choose
+    //    the correct comm type, and warn on known-broken combinations.
+    int mp_version = 0;
+    throw_if_cusolver(cusolverMpGetVersion(ctx->handle, &mp_version),
+                      "cusolverMpGetVersion");
+    ctx->cusolvermp_version = mp_version;
+    const int mp_major = mp_version / 1000;
+    const int mp_minor = (mp_version / 100) % 10;
+    const int mp_patch = mp_version % 100;
+    const bool use_nccl_comm_path = (mp_version >= 700);
+
+    // NCCL version (returned as e.g. 22603 = 2.26.3, encoded
+    // major*10000 + minor*100 + patch).  Used to flag the known
+    // ncclCommWindowRegister symbol gap that cusolverMp 0.8+ requires.
+    int nccl_version = 0;
+    (void)ncclGetVersion(&nccl_version);
+    const int nccl_major = nccl_version / 10000;
+    const int nccl_minor = (nccl_version / 100) % 100;
+    const int nccl_patch = nccl_version % 100;
+
+    // Rank-0 startup banner so misconfigurations are visible without
+    // having to grep through XLA traces.
+    if (rank == 0) {
+        std::fprintf(stderr,
+            "[lorrax cusolverMp] library %d.%d.%d, NCCL %d.%d.%d, "
+            "comm path: %s, grid: %dx%d (%s)\n",
+            mp_major, mp_minor, mp_patch,
+            nccl_major, nccl_minor, nccl_patch,
+            use_nccl_comm_path ? "NCCL" : "CAL",
+            p, q, grid_layout_col_major ? "col-major" : "row-major");
+    }
+
+    // Actionable warnings for known-broken combinations:
+    //   * 0.6.x + Px>1 AND Py>1: getrf/getrs returns silent wrong answers.
+    //     Reproduced 2026-05-09 across (N, NRHS) on a 2x2 mesh; the
+    //     cuSolverMp 0.7.0 release notes' "non-square grid" fix is in
+    //     fact the CAL→NCCL ABI shift below and applies to ALL 2D grids
+    //     (square or not) once the comm type is correct.  1×N and N×1
+    //     are unaffected because the broken degenerate-block-cyclic path
+    //     isn't triggered there.
+    //   * 0.8.0 + NCCL < 2.27: dlopen fails with "undefined symbol:
+    //     ncclCommWindowRegister".  We can't reach this point if the
+    //     symbol is missing (load fails before this constructor runs),
+    //     but a soft warning at NCCL < 2.27 is still useful for any
+    //     future cusolverMp ≥ 0.8 binary.
+    if (rank == 0) {
+        if (mp_version < 700 && p > 1 && q > 1) {
+            std::fprintf(stderr,
+                "[lorrax cusolverMp] WARNING: cuSolverMp %d.%d.%d on a 2D "
+                "process grid (%dx%d) has a known correctness bug in "
+                "getrf/getrs that returns wrong answers silently.  "
+                "Use a 1xN or Nx1 mesh, or upgrade to ≥0.7.0 (where the "
+                "comm-handle ABI shifts from CAL to NCCL).\n",
+                mp_major, mp_minor, mp_patch, p, q);
+        }
+        if (mp_version >= 800 && nccl_version < 22700) {
+            std::fprintf(stderr,
+                "[lorrax cusolverMp] WARNING: cuSolverMp %d.%d.%d expects "
+                "NCCL ≥ 2.27 (ncclCommWindowRegister); loaded NCCL %d.%d.%d "
+                "is too old.  Stage NCCL ≥ 2.27 ahead of the container's "
+                "bundled libnccl.so.2 to use this version.\n",
+                mp_major, mp_minor, mp_patch,
+                nccl_major, nccl_minor, nccl_patch);
+        }
+    }
+
     cusolverMpGridMapping_t layout = grid_layout_col_major
         ? CUSOLVERMP_GRID_MAPPING_COL_MAJOR
         : CUSOLVERMP_GRID_MAPPING_ROW_MAJOR;
-    // Build a real cal_comm via cal_comm_create, plumbing the three
-    // required allgather/req_test/req_free callbacks to NCCL.  This is the
-    // canonical non-MPI path — far cleaner than the reinterpret_cast trick
-    // that the NVIDIA mp_syevd.c sample uses (that trick relies on C's
-    // lax pointer conversion plus an MPI-initialised libcal, neither of
-    // which applies in a JAX-only Python process).
-    ctx->shim.nccl_comm = ctx->nccl_comm;
-    ctx->shim.stream    = ctx->stream;
-    cal_comm_create_params_t cp{};
-    cp.allgather    = &cal_nccl_allgather;
-    cp.req_test     = &cal_nccl_req_test;
-    cp.req_free     = &cal_nccl_req_free;
-    cp.data         = &ctx->shim;
-    cp.nranks       = world_size;
-    cp.rank         = rank;
-    cp.local_device = ctx->local_device_id;
-    calError_t cal_st = cal_comm_create(cp, &ctx->cal_comm);
-    if (cal_st != CAL_OK) {
-        std::ostringstream os;
-        os << "cal_comm_create failed: calError=" << (int)cal_st;
-        throw std::runtime_error(os.str());
-    }
 
-    throw_if_cusolver(
-        cusolverMpCreateDeviceGrid(ctx->handle, &ctx->grid,
-                                   ctx->cal_comm,
-                                   /*numRowDevices=*/p,
-                                   /*numColDevices=*/q, layout),
-        "cusolverMpCreateDeviceGrid");
+    if (!use_nccl_comm_path) {
+        // 0.6.x: cusolverMpCreateDeviceGrid takes cal_comm_t.  Build a
+        // real cal_comm via cal_comm_create, plumbing the three required
+        // allgather/req_test/req_free callbacks to NCCL.
+        ctx->shim.nccl_comm = ctx->nccl_comm;
+        ctx->shim.stream    = ctx->stream;
+        cal_comm_create_params_t cp{};
+        cp.allgather    = &cal_nccl_allgather;
+        cp.req_test     = &cal_nccl_req_test;
+        cp.req_free     = &cal_nccl_req_free;
+        cp.data         = &ctx->shim;
+        cp.nranks       = world_size;
+        cp.rank         = rank;
+        cp.local_device = ctx->local_device_id;
+        calError_t cal_st = cal_comm_create(cp, &ctx->cal_comm);
+        if (cal_st != CAL_OK) {
+            std::ostringstream os;
+            os << "cal_comm_create failed: calError=" << (int)cal_st;
+            throw std::runtime_error(os.str());
+        }
+        throw_if_cusolver(
+            cusolverMpCreateDeviceGrid(ctx->handle, &ctx->grid,
+                                       reinterpret_cast<cal_comm_t>(ctx->cal_comm),
+                                       /*numRowDevices=*/p,
+                                       /*numColDevices=*/q, layout),
+            "cusolverMpCreateDeviceGrid");
+    } else {
+        // 0.7+: cusolverMpCreateDeviceGrid takes ncclComm_t directly.
+        // The cast is needed because the system cusolverMp.h on this
+        // box may declare the parameter as cal_comm_t (depending on
+        // which SDK we're built against), but the LOADED library
+        // dereferences it as ncclComm_t — we pass the right object
+        // and let the linker do its thing.  cal_comm_t and ncclComm_t
+        // are both opaque pointers at the ABI level.
+        throw_if_cusolver(
+            cusolverMpCreateDeviceGrid(
+                ctx->handle, &ctx->grid,
+                reinterpret_cast<cal_comm_t>(ctx->nccl_comm),
+                /*numRowDevices=*/p,
+                /*numColDevices=*/q, layout),
+            "cusolverMpCreateDeviceGrid");
+    }
 
     // Device buffer for d_info (int) used by every Syevd call.
     throw_if_cuda(cudaMalloc(&ctx->d_info, sizeof(int)), "cudaMalloc(d_info)");
@@ -259,15 +345,22 @@ void destroy_context(int64_t ctx_handle) {
     delete ctx;
 }
 
-// Lazy init for cuBLASMp.  Reuses the cuSOLVERMp ctx's CAL comm and stream
-// so there is no additional NCCL bootstrap.  First call in a process may
-// take a few milliseconds; subsequent calls are no-ops.
+// Lazy init for cuBLASMp.  Reuses the cuSOLVERMp ctx's stream and comm.
+// cublasMpGridCreate's communicator-parameter ABI shifted from cal_comm_t
+// to ncclComm_t at the same time cuSolverMp's did (0.7.0).  We follow
+// the same dispatch as the cuSolverMp grid: CAL for ≤0.6.x, NCCL for
+// ≥0.7.0.  See create_context() above for the full rationale.
 void ensure_cublasmp(LorraxCusolverMpCtx* ctx) {
     if (ctx->cublasmp_handle && ctx->cublasmp_grid) return;
-    if (!ctx->cal_comm) {
+    const bool use_nccl_comm_path = (ctx->cusolvermp_version >= 700);
+    if (!use_nccl_comm_path && !ctx->cal_comm) {
         throw std::runtime_error(
             "ensure_cublasmp: cuSOLVERMp ctx has no CAL comm — "
             "cuBLASMp must be initialised after cuSOLVERMp.");
+    }
+    if (use_nccl_comm_path && !ctx->nccl_comm) {
+        throw std::runtime_error(
+            "ensure_cublasmp: cuSOLVERMp ctx has no NCCL comm.");
     }
     if (!ctx->cublasmp_handle) {
         throw_if_cublasmp(
@@ -278,9 +371,14 @@ void ensure_cublasmp(LorraxCusolverMpCtx* ctx) {
         cublasMpGridLayout_t layout = ctx->grid_layout_col_major
             ? CUBLASMP_GRID_LAYOUT_COL_MAJOR
             : CUBLASMP_GRID_LAYOUT_ROW_MAJOR;
+        // cal_comm_t / ncclComm_t are both opaque pointers; cast to the
+        // declared header type and pass the correct concrete object.
+        cal_comm_t comm_arg = use_nccl_comm_path
+            ? reinterpret_cast<cal_comm_t>(ctx->nccl_comm)
+            : ctx->cal_comm;
         throw_if_cublasmp(
             cublasMpGridCreate(ctx->p, ctx->q, layout,
-                                ctx->cal_comm, &ctx->cublasmp_grid),
+                                comm_arg, &ctx->cublasmp_grid),
             "cublasMpGridCreate");
     }
 }
