@@ -293,6 +293,11 @@ _DEFAULTS = {
     "write_w_copies_debug": False,
     "w_copies_debug_file": "",
     "sigma_freq_debug_file": "sigma_freq_debug.dat",
+    # QP wavefunction file dump.  Default True: end-of-run write of
+    # ``WFN_qp.h5`` (BGW format, ψ rotated by the final U, energies
+    # replaced by E_QP).  Fires for both one-shot and SC; set False to
+    # skip the ~10s of MB write when only eqp.dat is wanted.
+    "write_wfn_h5": True,
     # BSE interpolation setup (htransform-driven fine-k wfn recovery; see
     # ``bandstructure.bse_setup.compute_wfns_fi``).
     "get_centroids_fi": False,   # Gate; if True, compute fine-grid wfns at coarse centroids.
@@ -596,6 +601,7 @@ class DebugConfig:
     write_w_copies_debug: bool
     w_copies_debug_file: str
     sigma_freq_debug_file: str
+    write_wfn_h5: bool
 
 
 @dataclass(frozen=True)
@@ -918,6 +924,7 @@ class LorraxConfig:
             write_w_copies_debug=bool(_g("write_w_copies_debug")),
             w_copies_debug_file=str(_g("w_copies_debug_file") or ""),
             sigma_freq_debug_file=str(_g("sigma_freq_debug_file")),
+            write_wfn_h5=bool(_g("write_wfn_h5")),
         )
         bse = BSEConfig(
             get_centroids_fi=bool(_g("get_centroids_fi")),

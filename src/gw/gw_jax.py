@@ -499,12 +499,25 @@ def main(argv=None):
 		# Post-SC dumps: WFN_qp.h5 (drop-in BSE / restart input),
 		# qp_wfn_rotations.h5 ((U, E_qp) companion), and the converged
 		# sigma_mnk.h5 (intermediate iterations skipped the H5 write,
-		# so this is the single end-of-run write).
-		dump_qp_wfn_artifacts(
+		# so this is the single end-of-run write).  WFN_qp.h5 uses
+		# ``final_qp_eigenstates(state_final.H_qp_dft)`` which is the
+		# converged DFT-basis H — so its eigenvalues + U are the *true*
+		# QP eigenstates of the SC fixed point.  The basis-mixed
+		# rebuild + eigh at the post-Σ seam below (line ~660) gives a
+		# DIFFERENT (incorrect) U / E for SC mode because
+		# ``_sigma_result.sigma_xc_kij_ry`` lives in QP basis but
+		# ``kin_ion`` is DFT basis — fixed below by overriding
+		# ``sigma_total`` with ``state_final.H_qp_dft - kin_ion``.
+		from .sc_iteration import final_qp_eigenstates
+		_enk_qp_active_ry, _U_kmn, _efermi_final_ry = final_qp_eigenstates(
 			_state_final, n_occ=int(meta.nelec), mesh_xy=mesh_xy,
-			wfn=wfn, band_slices=band_slices, kgrid=meta.kgrid,
-			output_dir=input_dir, print_fn=print0,
 		)
+		if config.debug.write_wfn_h5:
+			dump_qp_wfn_artifacts(
+				_state_final, n_occ=int(meta.nelec), mesh_xy=mesh_xy,
+				wfn=wfn, band_slices=band_slices, kgrid=meta.kgrid,
+				output_dir=input_dir, print_fn=print0,
+			)
 		sigma_omega_h5_path = dump_sigma_omega_h5_final(
 			_state_final, config=config, meta=meta, mesh_xy=mesh_xy,
 			input_dir=input_dir, print_fn=print0,
@@ -514,13 +527,28 @@ def main(argv=None):
 		# SigmaResult.  Same names and shapes as the one-shot path, so
 		# the downstream writer / freq_debug code is identical for SC
 		# and one-shot.  PPM-only fields stay None for static SC modes.
-		sig_h = _sigma_result.v_h_kij_ry
-		sig_x = _sigma_result.sigma_x_kij_ry
-		sigma_total = _sigma_result.sigma_xc_kij_ry + sig_h
-		sig_sx = (_sigma_result.sigma_sx_kij_ry
+		#
+		# CRITICAL: ``_sigma_result.{v_h_kij_ry, sigma_x_kij_ry,
+		# sigma_xc_kij_ry}`` live in the **QP basis** (compute_sigma_xc
+		# was called with the rotated wfn bundle).  Downstream code
+		# (post-Σ H build + eigh, writer, freq_debug) is written for
+		# DFT-basis matrices — kin_ion is DFT basis throughout — so we
+		# must rotate every QP-basis SigmaResult field back to DFT via
+		# the converged U from ``final_qp_eigenstates`` before plumbing
+		# into the bare locals.  Without this, the line-660 eigh sees
+		# ``kin_ion`` (DFT) + ``sigma_xc`` (QP) and produces nonsense
+		# eigenvalues for eqp0.dat (off by tens of eV per band on MoS2).
+		from .sc_iteration import _rotate_to_dft_basis
+		_U_jax = jnp.asarray(_U_kmn)
+		sig_h = _rotate_to_dft_basis(_sigma_result.v_h_kij_ry, _U_jax)
+		sig_x = _rotate_to_dft_basis(_sigma_result.sigma_x_kij_ry, _U_jax)
+		_sigma_xc_dft = _rotate_to_dft_basis(
+			_sigma_result.sigma_xc_kij_ry, _U_jax)
+		sigma_total = _sigma_xc_dft + sig_h
+		sig_sx = (_rotate_to_dft_basis(_sigma_result.sigma_sx_kij_ry, _U_jax)
 		          if _sigma_result.sigma_sx_kij_ry is not None
 		          else jnp.zeros_like(sig_x))
-		sig_coh = (_sigma_result.sigma_coh_kij_ry
+		sig_coh = (_rotate_to_dft_basis(_sigma_result.sigma_coh_kij_ry, _U_jax)
 		           if _sigma_result.sigma_coh_kij_ry is not None
 		           else jnp.zeros_like(sig_x))
 		sigma_c_at_dft_ev = _sigma_result.sigma_c_at_dft_diag_ev
@@ -661,6 +689,28 @@ def main(argv=None):
 	# ---- DFT energies for the writer ----
 	enk_dft, _ = get_enk_bandrange(wfn, sym,
 		band_slices.sigma_range, band_slices.sigma_range, nspinor=meta.nspinor)
+
+	# ---- One-shot WFN_qp.h5 dump (drop-in BSE / restart input).  SC
+	# already wrote its own WFN_qp.h5 above via dump_qp_wfn_artifacts
+	# (using state_final.H_qp_dft) — same physics, slightly different
+	# numerics from the post-Σ-seam eigh path.  Skip the second write
+	# in SC to avoid clobbering.
+	if config.debug.write_wfn_h5 and not config.self_consistent:
+		from file_io.qp_wfn import write_qp_wfn_h5
+		_qp_wfn_path = os.path.join(input_dir, "WFN_qp.h5")
+		if jax.process_index() == 0:
+			write_qp_wfn_h5(
+				_qp_wfn_path, wfn=wfn,
+				U_kmn=np.asarray(U_full, dtype=np.complex128),
+				enk_active_qp_ry=np.asarray(E_full, dtype=np.float64),
+				band_start=band_slices.b0, band_stop=band_slices.b3,
+			)
+		try:
+			from jax.experimental import multihost_utils as _mh
+			_mh.sync_global_devices("oneshot_qp_wfn_h5_write")
+		except Exception:
+			pass
+		print0(f"  QP WFN (one-shot): {_qp_wfn_path}")
 
 	# PPM mode: feed the writer the on-shell diag(Σ_c(E_DFT)) (Ry) so the
 	# eqp0.dat "sigC" column reports dynamic correlation directly comparable

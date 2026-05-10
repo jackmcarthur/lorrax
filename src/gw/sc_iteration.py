@@ -752,4 +752,5 @@ __all__ = [
     "final_qp_eigenstates",
     "dump_qp_wfn_artifacts",
     "dump_sigma_omega_h5_final",
+    "_rotate_to_dft_basis",       # used by main() to rotate SC SigmaResult fields
 ]

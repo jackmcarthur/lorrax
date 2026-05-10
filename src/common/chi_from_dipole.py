@@ -9,6 +9,85 @@ Public API
 - compute_S_omega(dipole_cart, deltaE, f_nk, cell_volume, nk_tot, nspin, nspinor, omegas, eta=0.0)
 """
 
+
+# ============================================================================
+# WARNING: this S(ω) is in the DFT basis only — must be re-derived for SC GW
+# ============================================================================
+#
+# The three inputs ``dipole_cart``, ``deltaE``, ``f_nk`` are all evaluated
+# from a single *fixed* basis: the DFT eigenstates that wrote ``dipole.h5``.
+# Concretely:
+#
+#   dipole_cart[α, k, m, n] = ⟨ψ^DFT_m,k | v_α | ψ^DFT_n,k⟩      (3, nk, nb, nb)
+#   deltaE[k, m, n]         = E^DFT_n,k − E^DFT_m,k               (nk, nb, nb)
+#   f_nk[k, n]              = occupation at DFT eigenvalue        (nk, nb)
+#
+# For a one-shot G0W0 / single-cycle QSGW, this is fine — the bra/ket states
+# v_α is sandwiched between are the DFT eigenstates the rest of the pipeline
+# also uses.  But every quantity here is wrong as soon as the pipeline
+# rotates ψ to the QP basis (i.e. SC GW with U ≠ 1):
+#
+#   1. Basis-change of the velocity matrix
+#      With U[k, m, n] = ⟨DFT_m,k | QP_n,k⟩ from eigh(H_qp_dft):
+#
+#          V_α^QP(k)_{mn} = Σ_{pq} U^*(k)_{pm} V_α^DFT(k)_{pq} U(k)_{qn}
+#                         = (U(k)^† V_α^DFT(k) U(k))_{mn}
+#
+#      einsum: 'kpm,akpq,kqn->akmn' with (np.conj(U), v_dft, U).  This is
+#      the OPPOSITE direction of ``sc_iteration._rotate_to_dft_basis``,
+#      which does U·O·U^† to bring Σ from QP back to DFT.  The dipole is
+#      naturally a DFT-basis operator that we want to express in QP basis,
+#      hence the dagger is on the left.
+#
+#   2. Energy denominators
+#      ΔE in the dipole formula appears in the denominator
+#      ΔE · (ω² − ΔE²); if ΔE keeps DFT values while V is QP-rotated, the
+#      head spectrum mis-aligns with the actual QP transitions by the QP
+#      shifts.  After SC convergence, ΔE_QP[k, m, n] = E_QP[k, n] − E_QP[k, m]
+#      should be used.
+#
+#   3. Occupations
+#      For an insulator that stays insulating across SC, f_nk does not
+#      change (still 1 for n < nelec, 0 otherwise — by sorted band index).
+#      For metals or near-gap-closure systems where SC can swap valence
+#      and conduction near E_F, f_nk must be rebuilt from E_QP vs. the
+#      converged E_F^QP.
+#
+#   4. Self-energy contribution to the velocity operator (TODO, separate)
+#      v = p/m + (i/ℏ)[r, V_KS].  At the GW level the KS potential is
+#      replaced by V_H + Σ(ω), so the velocity operator itself acquires a
+#      Σ-derivative piece that dipole.h5 does NOT capture.  The full
+#      "GW-level dipole" is therefore not just U^† v^DFT U — it has an
+#      additional ⟨m|∂Σ/∂k|n⟩-like term that needs a separate evaluation
+#      in the QP basis.  Rotating the existing DFT dipoles is the
+#      necessary first step but isn't sufficient for full QSGW
+#      consistency.
+#
+# Consequences for the SC head correction in compute_ppm_sigma_pipeline:
+#
+#   - HeadResolver.at(ω) caches S(ω) computed at iteration 1's basis
+#     (which is DFT for the iteration-0 init we use today).  The SC loop
+#     reuses these cached samples for all subsequent iterations, so the
+#     analytic head_gn is fitted to DFT-basis transitions and never
+#     refreshed.  For an insulator with QP shifts ≪ gap this is a small
+#     error (~ few percent on each head value, propagating to ~10s of
+#     meV per band); for systems near gap closure it is wrong.
+#
+#   - The proper SC fix is to (a) refresh dipole_cart per-iteration via
+#     the rotation above, (b) recompute deltaE from the iter's E_QP, (c)
+#     refresh f_nk from E_QP vs. E_F^QP, (d) invalidate HeadResolver's
+#     cache and reseed at the requested ω's.  Cleanest factoring is to
+#     hold the FULL "GW-level dipole" (point 4 above) on SCInputs and
+#     update it in lockstep with the H_qp_dft carry.  Until this is done,
+#     SC GW results carry an O(QP-shift / gap) systematic on the head.
+#
+# This file is intentionally NOT modified to do any of (1)-(4); the
+# above is a roadmap for whoever does the full GW-level dipole update
+# (it has to also include the Σ-derivative piece, which is a separate
+# computation outside this module).
+# ============================================================================
+
+
 import functools
 
 import numpy as np
