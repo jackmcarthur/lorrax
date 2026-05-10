@@ -150,28 +150,33 @@ def compute_sigma_xc(
     -------
     :class:`SigmaResult` populated per the mode.
     """
-    from .cohsex_sigma import compute_cohsex_sigma
+    from .cohsex_sigma import compute_cohsex_sigma, compute_v_h_sigma_x
     from .ppm_pipeline import compute_ppm_sigma_pipeline
     from .qsgw_utils import build_qsgw_sigma_xc
 
-    # Static channels: sig_h (V_H) and sig_x (bare exchange) are used by
-    # every mode (PPM modes consume them in the QSGW build).
-    # sig_sx / sig_coh use W(ω=0) and only matter for COHSEX, so disable
-    # the screened-channel kernels for X_ONLY / PPM modes — those would
-    # otherwise pay an SX + COH evaluation per SC iteration only to
-    # discard the result.
+    # Static channels: sig_h (V_H) and sig_x (bare exchange) are needed
+    # by every mode; sig_sx / sig_coh use W(ω=0) and only matter for
+    # COHSEX.  Route to a separate top-level entry point for the
+    # V-only path so PPM / X_ONLY modes never invoke the W-touching
+    # kernels and the two paths each get their own jit-cached graph.
     W_static = W_by_role.get("static", V_q)
-    needs_screened_static = (mode is ComputeMode.COHSEX)
-    cohsex = compute_cohsex_sigma(
-        wfns, V_q, W_static, meta, mesh_xy,
-        Gij=None,                                # default DFT-occ projector
-        do_screened=needs_screened_static,
-        static_head_terms=static_head_terms,
-        compute_bare_x=True,
-    )
+    if mode is ComputeMode.COHSEX:
+        cohsex = compute_cohsex_sigma(
+            wfns, V_q, W_static, meta, mesh_xy,
+            Gij=None,                            # default DFT-occ projector
+            do_screened=True,
+            static_head_terms=static_head_terms,
+            compute_bare_x=True,
+        )
+    else:
+        cohsex = compute_v_h_sigma_x(
+            wfns, V_q, meta, mesh_xy,
+            Gij=None,
+            static_head_terms=static_head_terms,
+        )
     sig_h = cohsex["sig_h"]
     sig_x = cohsex["sig_x"]
-    sig_sx = cohsex["sig_sx"]                    # zero placeholders when not screened
+    sig_sx = cohsex["sig_sx"]                    # zero placeholders for V-only path
     sig_coh = cohsex["sig_coh"]
 
     if mode is ComputeMode.X_ONLY:

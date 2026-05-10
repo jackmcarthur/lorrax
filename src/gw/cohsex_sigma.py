@@ -258,6 +258,82 @@ def compute_cohsex_sigma(
     }
 
 
+def compute_v_h_sigma_x(
+    wfns,
+    V_q: jax.Array,
+    meta,
+    mesh_xy: Mesh,
+    *,
+    Gij: jax.Array | None = None,
+    static_head_terms=None,
+    wfns_transverse=None,
+    bispinor_v_q_path=None,
+    backend=None,
+    use_ffi_io: bool | None = None,
+) -> dict:
+    """Two-kernel V-only path: ``sig_h`` (Hartree) + ``sig_x`` (bare exchange).
+
+    Skips the screened SX/COH kernels entirely — used by callers that
+    don't need them (X_ONLY mode, and PPM modes via the dispatcher,
+    which gets its dynamic Σ_c straight from
+    :mod:`gw.ppm_pipeline`).  Each kernel is the same jit'd primitive
+    used by :func:`compute_cohsex_sigma`, just called from a Python
+    entry that won't ever invoke ``sigma_sx_k(W_q)`` or
+    ``sigma_coh_k(W_q, V_q)`` and so saves two flat-q convolutions per
+    call (≈ the ``W_q`` cost on each, roughly half the cohsex_sigma
+    wall on dense band manifolds).
+
+    Returned dict mirrors :func:`compute_cohsex_sigma`'s contract with
+    ``sig_sx`` / ``sig_coh`` set to zero placeholders so downstream
+    ``cohsex["sig_sx"]`` accesses don't have to special-case None.
+
+    Bispinor: identical to ``compute_cohsex_sigma``'s ``compute_bare_x``
+    branch — Σ^B is added to ``sig_x`` when both ``wfns_transverse``
+    and ``bispinor_v_q_path`` are supplied.
+    """
+    if Gij is None:
+        Gij = build_Gij(meta, mesh_xy)
+    sigma_sx_k, _, hartree_k = _make_cohsex_kernels(
+        mesh_xy, meta.kgrid, int(meta.nk_tot))
+    rep = NamedSharding(mesh_xy, P(None, None, None))
+
+    with mesh_xy:
+        sig_h = hartree_k(wfns, Gij, V_q)
+        sig_x = sigma_sx_k(wfns, Gij, V_q)
+        sig_h = jax.lax.with_sharding_constraint(sig_h, rep)
+        sig_x = jax.lax.with_sharding_constraint(sig_x, rep)
+        sig_h.block_until_ready()
+        sig_x.block_until_ready()
+
+    if static_head_terms is not None:
+        x_head, _ = static_head_terms_to_kij(
+            static_head_terms, nk_tot=meta.nk_tot, do_screened=False)
+        sig_x = sig_x + jax.device_put(x_head, rep)
+        sig_x = jax.lax.with_sharding_constraint(sig_x, rep)
+        sig_x.block_until_ready()
+
+    if wfns_transverse is not None and bispinor_v_q_path is not None:
+        from .sigma_x_bispinor import compute_sigma_x_bispinor
+        with mesh_xy:
+            sig_x_b = compute_sigma_x_bispinor(
+                wfns_transverse=wfns_transverse,
+                Gij=Gij,
+                bispinor_v_q_path=bispinor_v_q_path,
+                meta=meta, mesh_xy=mesh_xy,
+                backend=backend, use_ffi_io=use_ffi_io,
+            )
+        sig_x_b.block_until_ready()
+        sig_x = sig_x + sig_x_b
+
+    zero_kij = jnp.zeros_like(sig_x)
+    return {
+        "sig_sx":  zero_kij,
+        "sig_coh": zero_kij,
+        "sig_h":   sig_h,
+        "sig_x":   sig_x,
+    }
+
+
 def get_cohsex_kernels(meta, mesh_xy: Mesh):
     """Return the three jit'd (sigma_sx, sigma_coh, hartree) kernels.
 
