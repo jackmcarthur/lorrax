@@ -483,64 +483,60 @@ _chol_2d_cache = {}
 # ============================================================================
 
 
-def _embed_logical_in_padded(
-    L_log: jax.Array,
+def _identity_pad_block_diagonal(
+    M: jax.Array,
     *,
-    n_rmu_padded: int,
+    n_rmu_logical: int,
     mesh_xy: Mesh,
-    identity_pad: bool = True,
 ) -> jax.Array:
-    """Embed a logical-extent factor (L_q or CCT) into a padded square
-    matrix with identity in the pad block.
+    """Add identity to the pad-block diagonal of a square N_μ² matrix.
 
-    Given ``L_log: (nq, n_log, n_log)`` returns
-    ``L_pad: (nq, n_pad, n_pad)`` with the leading logical block equal
-    to ``L_log`` and the pad block equal to ``I_pad`` (when
-    ``identity_pad=True``).  Off-diagonal padded blocks are zero.
+    ``M`` has shape ``(nq, n_rmu, n_rmu)`` at PADDED μ extent with
+    zero pad rows/cols (the Phase 3a contract: bilinear in zero-padded
+    ψ ⇒ M's pad rows/cols are exact zeros).  This helper adds 1 to the
+    diagonal entries in positions ``[n_rmu_logical, n_rmu)``, leaving
+    the logical block exactly intact.  Result: ``M_id_pad =
+    block_diag(M_log, I_pad)`` — block-diagonal with the input's
+    logical block on top-left and identity on bottom-right.
 
-    Why the identity pad:  downstream ``solve_zeta`` and the
-    LU/cho_solve helpers have ``in_shardings=P(None,'x','y')``
-    committed at the jit boundary.  At indivisible logical n_rmu
-    (e.g. prime 661 on a 4×4 mesh) those input boundaries reject
-    ``(nq, 661, 661)`` for failing 661 % 4 == 0; we need to hand them
-    a divisible padded shape.  Z_q likewise lives at padded extent
-    with zero pad rows (bilinear in zero-padded ψ).  Padding L with
-    identity in the pad block preserves the logical solve byte-
-    identically:
+    Why this matters:  Cholesky and LU on the identity-padded matrix
+    produce factorisations whose **logical block is bit-identical** to
+    the factorisation of the un-padded logical-only matrix.  The
+    standard recursion for ``L[i, j]`` (Cholesky) and the column-
+    pivoting LU never read across the zero off-diagonal pad blocks,
+    and ``√1 = 1`` exactly in IEEE 754 so the pad-block factor is
+    exactly identity.  The downstream back-solve sees ``Z`` with zero
+    pad rows (bilinear in zero-padded ψ ⇒ zero pad rows), and
+    ``[L_log 0; 0 I][y_log; y_pad] = [Z_log; 0]`` gives
+    ``y_pad = 0`` and ``y_log = L_log⁻¹ Z_log`` — logical solve
+    unchanged.
 
-        L_pad y_pad = Z_pad
-          = [L_log 0; 0 I] [y_log; y'] = [Z_log; 0]
-          ⇒ L_log y_log = Z_log  (logical solve unchanged)
-          ⇒ I y' = 0             (pad rows of y are zero)
+    This is NOT ridge regularisation on C_q (which would corrupt the
+    logical block).  The identity is added ONLY to the pad-block
+    diagonal; the logical block is untouched.
 
-    so ``zeta_pad = [zeta_log; 0]``.  Output sharding is
-    ``P(None, 'x', 'y')`` (n_rmu_padded is mesh-divisible by
-    construction).
+    Output sharding is ``P(None, 'x', 'y')`` (n_rmu_padded is
+    mesh-divisible by construction so single-axis sharding on each
+    μ-dim works at any padded extent).  When ``n_rmu_logical ==
+    n_rmu`` (no pad), the function is a no-op pass-through with the
+    sharding constraint reapplied.
     """
-    nq, n_log, n_log2 = L_log.shape
-    if n_log != n_log2:
-        raise ValueError(f"_embed_logical_in_padded expects square L_log; got {L_log.shape}")
-    if n_rmu_padded < n_log:
+    nq, n_rmu, n_rmu2 = M.shape
+    if n_rmu != n_rmu2:
+        raise ValueError(f"_identity_pad_block_diagonal expects square M; got {M.shape}")
+    if n_rmu_logical > n_rmu:
         raise ValueError(
-            f"n_rmu_padded={n_rmu_padded} < logical extent {n_log}")
-    pad = n_rmu_padded - n_log
-    if pad == 0:
-        return jax.lax.with_sharding_constraint(
-            L_log, NamedSharding(mesh_xy, P(None, 'x', 'y')))
-    # Pad with zeros first, then add identity on the pad-block diagonal.
-    L_pad = jnp.pad(L_log, ((0, 0), (0, pad), (0, pad)))
-    if identity_pad:
-        # Diagonal mask that is 1 only on positions [n_log:n_pad] of the
-        # square diagonal (and 0 in the logical block).  Broadcast over
-        # the q axis.
-        idx = jnp.arange(n_rmu_padded)
-        pad_diag_mask = (idx >= n_log).astype(L_log.dtype)
-        # Build a (n_pad, n_pad) diagonal matrix whose only nonzeros
-        # sit on the pad-block diagonal.
-        eye_pad = jnp.diag(pad_diag_mask)
-        L_pad = L_pad + eye_pad[None, :, :]
-    return jax.lax.with_sharding_constraint(
-        L_pad, NamedSharding(mesh_xy, P(None, 'x', 'y')))
+            f"n_rmu_logical={n_rmu_logical} > input extent {n_rmu}")
+    sharding = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    if n_rmu_logical == n_rmu:
+        return jax.lax.with_sharding_constraint(M, sharding)
+    # Build a (n_rmu, n_rmu) diagonal matrix whose only non-zeros sit
+    # on positions ``[n_rmu_logical, n_rmu)`` of the diagonal.
+    idx = jnp.arange(n_rmu)
+    pad_diag_mask = (idx >= n_rmu_logical).astype(M.dtype)
+    eye_pad = jnp.diag(pad_diag_mask)
+    M_id_pad = M + eye_pad[None, :, :]
+    return jax.lax.with_sharding_constraint(M_id_pad, sharding)
 
 
 def factor_c_q(
@@ -570,53 +566,49 @@ def factor_c_q(
     Padded-input path (``n_rmu_logical < C_q.shape[-1]``):
     n_rmu may be padded to mesh divisibility at the boundary so the
     ``P(None, 'x', 'y')`` input sharding is admissible at any logical
-    centroid count (e.g. n_rmu_logical = 661 prime → padded to 672 on a
-    4×4 mesh).  In that case the trailing pad rows/cols of C_q are zero
-    by Phase 3a's ``load_centroids_band_chunked`` contract, which makes
-    the *padded* matrix singular — Cholesky on it would NaN.  We avoid
-    that by slicing C_q to its leading logical block inside the JIT and
-    running a dense replicated Cholesky on the logical n_rmu × n_rmu
-    matrix; output is at logical extent.
+    centroid count (e.g. n_rmu_logical = 661 prime → padded to 672 on
+    a 4×4 mesh).  By the Phase 3a contract the trailing pad rows/cols
+    of C_q are exact zeros (bilinear in zero-padded ψ).  We add
+    identity ONLY to the pad-block diagonal in-place — turning C_q
+    into a block-diagonal ``[C_log 0; 0 I_pad]`` matrix — and then
+    run the same sharded Cholesky / LU path the divisible case uses.
+    Cholesky / LU of an identity-padded matrix produces a factor
+    whose logical block is bit-identical to the factor of the
+    logical-only matrix (the recursion never reads across zero
+    off-diagonal pad blocks, and ``√1 = 1`` exactly).  The pad-block
+    factor is exactly identity; the back-solve's pad rows of ζ come
+    out as zero (because Z's pad rows are zero by the same bilinear
+    argument); logical block of ζ is unchanged.
 
-    Why dense (not 2D-blocked) for the padded case: at production
-    n_rmu ≲ 1000 the per-q matrix is ≤ 16 MB, replication is cheap,
-    and a pivoted/blocked sharded Cholesky of a *logical* prime n_rmu
-    has no valid block decomposition (``lcm(p_x, p_y)`` doesn't divide
-    a prime).  Pivoted Cholesky on the *padded* matrix would also work
-    (zero rows would fall to the end of the pivot order, leaving the
-    leading logical block intact) but introduces a permutation the
-    downstream ``solve_triangular`` back-solve does not consume.  The
-    slice-then-dense-Cholesky path is the simplest correct
-    implementation and matches the back-solve's contract — the
-    triangular solve sees a square unpermuted L at logical extent.
-    See ``reports/padding_phase3_handoff_2026-05-08/report.md`` for
-    the design rationale.
+    This is NOT ridge regularisation of C_q.  The logical block is
+    untouched; identity is added ONLY to the pad-block diagonal.
 
-    Note: the artifact return type does NOT change with ``vertex_mu_L``
-    — both branches return a ``(nq, n_rmu_logical, n_rmu_logical)``
-    array (replicated when the padded path is taken, ``P(None, 'x',
-    'y')`` otherwise).  The caller is responsible for re-padding when
-    the back-solve expects padded input.
+    Output sharding is ``P(None, 'x', 'y')`` natively at the padded
+    extent — no replication, no slice + embed gymnastics, the chol
+    stays sharded across the mesh.
 
     Args:
-        C_q: (nq, n_rmu_padded, n_rmu_padded) CCT matrix, sharded
-            ``P(None, 'x', 'y')`` (padded-input path) or
-            ``(nq, n_rmu, n_rmu)`` (legacy unpadded path).
+        C_q: (nq, n_rmu, n_rmu) CCT matrix at PADDED μ extent, sharded
+            ``P(None, 'x', 'y')``.  ``n_rmu == n_rmu_padded`` (== ∏ p_a
+            of the device mesh) so the existing 2D-blocked path
+            applies.
         mesh_xy: 2D device mesh.
-        block_size: Tile block size (auto if None).  Ignored on the
-            padded-input path.
+        block_size: Tile block size (auto if None).
         vertex_mu_L: Lorentz vertex index (0 = spin-traced PSD path,
             1/2/3 = transverse indefinite path).
-        n_rmu_logical: Logical centroid count.  When given and strictly
-            less than ``C_q.shape[-1]``, the padded path runs (slice +
-            dense Cholesky at logical extent).  ``None`` (default) keeps
-            the historical behaviour: input == output extent.
+        n_rmu_logical: Logical centroid count.  When given and
+            strictly less than ``C_q.shape[-1]``, the pad-block
+            diagonal is set to identity before factorisation.
+            ``None`` (default) skips the identity-pad: input == output
+            extent and the matrix is assumed to be PSD on its full
+            extent (legacy mesh-divisible path).
 
     Returns:
-        L_q: ``(nq, n_rmu, n_rmu)`` at logical extent (= padded extent
-        when ``n_rmu_logical`` is None or equal to the input dim).
-        Cholesky factor for ``vertex_mu_L == 0``; passthrough CCT for
-        ``vertex_mu_L ≠ 0``.
+        L_q: ``(nq, n_rmu, n_rmu)`` at PADDED extent, sharded
+        ``P(None, 'x', 'y')``.  Cholesky factor for
+        ``vertex_mu_L == 0`` (block-diagonal ``[L_log 0; 0 I_pad]``
+        when n_rmu_logical < n_rmu); passthrough identity-padded CCT
+        for ``vertex_mu_L ≠ 0``.
     """
     nq, n_rmu, n_rmu2 = C_q.shape
     assert n_rmu == n_rmu2, f"C_q must be square, got {n_rmu} x {n_rmu2}"
@@ -626,50 +618,19 @@ def factor_c_q(
         raise ValueError(
             f"n_rmu_logical={n_rmu_logical} exceeds input extent {n_rmu}")
 
-    # Indefinite-CCT path: skip the Cholesky outright.  ``solve_zeta``
-    # consumes C_q directly via ``jnp.linalg.solve`` (LU + back-solve internally).
-    if int(vertex_mu_L) != 0:
-        if n_rmu_logical < n_rmu:
-            # Slice to logical and replicate; LU back-solve runs at
-            # logical extent.  Embed the logical block into a PADDED-
-            # extent matrix with identity in the pad block so the
-            # downstream solver sees the same n_rmu_padded shape its
-            # in_shardings declare.  The pad-block ``I`` is
-            # mathematically equivalent to a logical-only solve: Z's
-            # pad rows are zero (bilinear in zero-padded ψ), so
-            # ``I · y_pad = 0`` ⇒ ``y_pad = 0`` and the logical block
-            # solution is unchanged.  This is NOT ridge regularisation
-            # on C_q (the factored matrix); it is a structural pad on
-            # the post-factor L (here, the un-factored CCT) to match
-            # the back-solve's expected shape.
-            C_q_log = jax.lax.slice(
-                C_q, [0, 0, 0], [nq, n_rmu_logical, n_rmu_logical])
-            C_q_log = jax.lax.with_sharding_constraint(
-                C_q_log, NamedSharding(mesh_xy, P(None, None, None)))
-            return _embed_logical_in_padded(
-                C_q_log, n_rmu_padded=n_rmu, mesh_xy=mesh_xy,
-                identity_pad=True)
-        L_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-        return jax.lax.with_sharding_constraint(C_q, L_shard)
+    # Pad-block identity in-place.  No-op when n_rmu_logical == n_rmu.
+    # See ``_identity_pad_block_diagonal`` for why the logical block of
+    # the resulting factorisation is bit-identical to a logical-only
+    # factorisation.
+    C_q = _identity_pad_block_diagonal(
+        C_q, n_rmu_logical=n_rmu_logical, mesh_xy=mesh_xy)
 
-    # Padded-input path: slice to logical and run a dense replicated Cholesky.
-    # This intentionally bypasses the 2D-blocked kernel — the logical extent
-    # may not factor cleanly across the mesh (prime n_rmu_logical = 661 is
-    # the motivating case), and the per-q matrix is small enough at
-    # production sizes (≲ 16 MB) that replication is cheap.  After Cholesky
-    # we embed L_log into a PADDED matrix with identity in the pad block so
-    # downstream consumers (``solve_zeta`` etc.) see the
-    # n_rmu_padded extent their committed in_shardings declare.  See the
-    # vertex_mu_L != 0 branch above for the full rationale.
-    if n_rmu_logical < n_rmu:
-        C_q_log = jax.lax.slice(
-            C_q, [0, 0, 0], [nq, n_rmu_logical, n_rmu_logical])
-        C_q_log = jax.lax.with_sharding_constraint(
-            C_q_log, NamedSharding(mesh_xy, P(None, None, None)))
-        L_q_log = jnp.linalg.cholesky(C_q_log)
-        return _embed_logical_in_padded(
-            L_q_log, n_rmu_padded=n_rmu, mesh_xy=mesh_xy,
-            identity_pad=True)
+    # Indefinite-CCT path: skip the Cholesky outright.  ``solve_zeta``
+    # consumes C_q directly via the SVD pseudoinverse / pivoted-LU
+    # branch.  After identity-pad the matrix is non-singular at the
+    # padded extent; the indefinite logical block is untouched.
+    if int(vertex_mu_L) != 0:
+        return C_q
 
     Pr = mesh_xy.shape['x']
     Pc = mesh_xy.shape['y']
@@ -690,9 +651,10 @@ def factor_c_q(
         return jax.lax.with_sharding_constraint(L_q_dense, L_shard)
 
     # 2D-blocked path: requires n_rmu divisible into mesh-friendly tiles.
-    # If it isn't (e.g. prime n_rmu) the caller should pad to mesh-product
-    # divisibility and pass ``n_rmu_logical`` to take the padded-input
-    # branch above instead.
+    # The caller is expected to pass C_q at PADDED μ extent
+    # (n_rmu_padded ≡ ∏ p_a is mesh-product divisible), in which case
+    # this always succeeds.  ``n_rmu_logical`` only adjusts the
+    # identity-pad above; it doesn't affect this code path.
     try:
         if block_size is None:
             block_size, J = compute_block_size_for_2d_cholesky(n_rmu, Pr, Pc)
@@ -701,9 +663,9 @@ def factor_c_q(
     except ValueError as exc:
         raise ValueError(
             f"factor_c_q: n_rmu={n_rmu} is not 2D-blocked-Cholesky "
-            f"compatible with mesh {Pr}×{Pc} ({exc}). Pass C_q at a "
-            f"mesh-divisible padded extent and set n_rmu_logical=<actual> "
-            f"to take the dense-replicated logical-extent path."
+            f"compatible with mesh {Pr}×{Pc} ({exc}). Pass C_q at "
+            f"PADDED μ extent (round up to ∏ p_a = world_size) so "
+            f"the 2D-blocked path applies."
         ) from exc
 
     # Get or build cached Cholesky function
