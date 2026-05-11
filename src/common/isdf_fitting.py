@@ -882,7 +882,10 @@ def solve_zeta(
     q_batch = min(q_chunk_size, nq)
     nq_padded = ((nq + q_batch - 1) // q_batch) * q_batch
 
-    use_lu = (int(vertex_mu_L) != 0)
+    # Dispatch on solver_kind (already resolved above) — independent of
+    # vertex_mu_L so the rchunk kernel cache can collapse transverse
+    # channels with the same solver_kind into a single compile.
+    use_lu = (solver_kind == 'lu')
     # ``use_lu`` selects a pivoted-LU back-solve for transverse channels
     # (γ̃^i, i∈{1,2,3}).  CCT^μ for those channels is Hermitian but
     # indefinite (γ̃^i ⊗ γ̃^i has both signs of eigenvalue), so Cholesky
@@ -1081,7 +1084,7 @@ def _make_fit_one_rchunk_kernel(
     q_chunk_size: int,
     kvecs_frac,
     psi_G_store,
-    vertex_mu_L: int = 0,
+    is_charge: bool = True,
     solver_kind: str = 'auto',
 ):
     """Factory: returns a ``jax.jit``'d fit_one_rchunk callable closing
@@ -1168,6 +1171,8 @@ def _make_fit_one_rchunk_kernel(
         norms_l,
         norms_r,
         r_start_dyn,
+        gamma_perm,
+        gamma_phase,
     ):
         # ψ enters at PADDED n_rmu (load_centroids_band_chunked output,
         # Phase 3a).  All in-memory arrays here — P_l, P_r, ψ_L_bc,
@@ -1255,24 +1260,23 @@ def _make_fit_one_rchunk_kernel(
         # the load_wfns separate-jit pattern.  Same pattern as lorrax_B
         # commit c0307a0.
         # γ̃^μ_L applied on BOTH P-sides at the post-IFFT contraction
-        # step (γ̃·γ̃ reduce).  P_l/P_r are rank-5 (k, a, b, μ, r);
-        # ``z_q_from_pair`` drops the spin rank to give Z_q at the same
-        # (nq, μ, r) shape across all channels.  Charge channel passes
-        # gamma_L=gamma_R=None, transverse passes the perm/phase tuple.
-        if vertex_mu_L == 0:
+        # step (γ̃·γ̃ reduce).  ``is_charge`` is a closure bool — Python
+        # if resolved at trace time — so charge and transverse get
+        # distinct HLO branches, but all three transverse channels share
+        # one compile (gamma_perm/gamma_phase are runtime inputs, baked
+        # nowhere into the HLO).
+        if is_charge:
             Z_q = z_q_from_pair(P_l, P_r, kgrid=kgrid, mesh_xy=mesh_xy)
         else:
-            gamma_mu = _gamma_perm_phase_mu(vertex_mu_L)
+            gamma_mu = (gamma_perm, gamma_phase)
             Z_q = z_q_from_pair(P_l, P_r, gamma_mu, gamma_mu,
                                 kgrid=kgrid, mesh_xy=mesh_xy)
-        # L_q for μ_L=0 is the Cholesky factor (Cholesky back-solve);
-        # for μ_L≠0 it's the raw indefinite CCT^μ_L (LU + ridge solve).
-        # ``solve_zeta`` dispatches via the vertex_mu_L flag + solver_kind
-        # closure (charge channel: cusolvermp_cholesky or sharded_cholesky;
-        # transverse channels: lu).
+        # ``solver_kind`` is resolved upstream (sharded_cholesky /
+        # cusolvermp_cholesky for charge; lu / cusolvermp_lu for
+        # transverse).  solve_zeta dispatches purely on solver_kind.
         zeta = solve_zeta(
             L_q, Z_q, mesh_xy, q_chunk_size,
-            vertex_mu_L=vertex_mu_L, solver_kind=solver_kind)
+            solver_kind=solver_kind)
         return zeta
 
     return _kernel
@@ -1307,6 +1311,13 @@ def fit_one_rchunk(
     inside the bc-loop.  The cache key includes ``id(psi_G_store)`` to
     avoid reusing a compile built against a different store.
     """
+    # vertex_mu_L splits into two runtime/closure pieces: a structural
+    # ``is_charge`` (Python bool — keys the cache, separates the chol
+    # branch from the gamma-fold branch) and the gamma matrix
+    # ``(perm, phase)`` (runtime jit args — μ=1/2/3 all reuse the same
+    # compiled HLO since the values never appear as static constants).
+    is_charge = (int(vertex_mu_L) == 0)
+    gamma_perm, gamma_phase = _gamma_perm_phase_mu(vertex_mu_L)
     cache_key = (
         id(mesh_xy),
         actual_n_rchunk,
@@ -1318,7 +1329,7 @@ def fit_one_rchunk(
         tuple(meta.fft_grid),
         hash(kvecs_frac.tobytes()),
         id(psi_G_store),
-        int(vertex_mu_L),
+        bool(is_charge),
         str(solver_kind),
     )
     fn = _fit_one_rchunk_cache.get(cache_key)
@@ -1333,7 +1344,7 @@ def fit_one_rchunk(
             q_chunk_size,
             kvecs_frac,
             psi_G_store,
-            vertex_mu_L=int(vertex_mu_L),
+            is_charge=bool(is_charge),
             solver_kind=str(solver_kind),
         )
         _fit_one_rchunk_cache[cache_key] = fn
@@ -1344,6 +1355,8 @@ def fit_one_rchunk(
         norms_l,
         norms_r,
         r_start_dyn,
+        gamma_perm,
+        gamma_phase,
     )
 
 
