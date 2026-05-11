@@ -272,6 +272,40 @@ class WfnLoader:
         return self._gvecs_raw[start:end]
 
     # ------------------------------------------------------------------
+    # G-flat → FFT-box index (zero-sentinel gather table)
+    # ------------------------------------------------------------------
+    def box_index(self, *, k: KSpec = "full_bz") -> np.ndarray:
+        """Return ``(n_k, nx, ny, nz)`` int32 — for each FFT-box cell, the
+        index along the ψ(G) axis to gather from.  Empty cells take the
+        sentinel value ``ngkmax``; downstream transforms append a zero
+        slot at that position so empty cells gather zero (see
+        :func:`common.wfn_transforms.to_box`).
+
+        Cached per (k-set, ``self.fft_grid``).  Reuses
+        :func:`common.gvec_fft_box.build_g_index_for_fft_box` so the
+        algorithm lives in one place.
+        """
+        cache_key = ("box_index", *self._k_cache_key(k))
+        if cache_key in self._gvecs_cache:
+            return self._gvecs_cache[cache_key]
+
+        from common.gvec_fft_box import build_g_index_for_fft_box
+
+        gvecs = self.gvecs(k=k)                                # (n_k, ngkmax, 3)
+        ngk_v = self.ngk_valid(k=k)                            # (n_k,)
+        # Strip pad rows back to per-k logical extent so the index
+        # builder doesn't see zero-padded gvecs (which would map to
+        # (0,0,0) and clobber the real Γ slot).
+        gvecs_per_k = [
+            gvecs[j, : int(ngk_v[j])] for j in range(int(gvecs.shape[0]))
+        ]
+        g_index = build_g_index_for_fft_box(
+            gvecs_per_k, tuple(int(s) for s in self.fft_grid),
+            int(self.ngkmax))
+        self._gvecs_cache[cache_key] = g_index
+        return g_index
+
+    # ------------------------------------------------------------------
     # Sharding + padding
     # ------------------------------------------------------------------
     def _default_sharding(
