@@ -568,6 +568,7 @@ def compute_all_V_q(
     verbose: bool = True,
     sym=None,
     centroid_indices: np.ndarray | None = None,
+    use_g_flat_zeta: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Compute V_qmunu(q,μ,ν) and g0_μ(q) at q=0 from a sharded ζ HDF5.
 
@@ -735,6 +736,7 @@ def compute_all_V_q(
         verbose=verbose,
         timing_label="compute_all_V_q_sharded",
         q_list_kgrid_int=q_list_for_tile,
+        use_g_flat_zeta=use_g_flat_zeta,
     )
 
     # IBZ orchestration: post-loop unfold V_q_ibz → V_q_full via the

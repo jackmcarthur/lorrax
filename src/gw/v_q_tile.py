@@ -771,6 +771,161 @@ def _make_V_q_tile_kernel(
     return _kernel
 
 
+_v_q_tile_gflat_kernel_cache: dict = {}
+
+
+def _make_V_q_tile_kernel_Gflat(
+    *,
+    n_G_sph: int,
+    g0_sphere_idx: int,
+    mesh_xy: Mesh,
+    q_chunk: int,
+    mu_size: int,
+    nu_size: int,
+    n_rmu_L: int,
+    n_rmu_R: int,
+    same_zeta: bool,
+    write_g0: bool,
+):
+    """V_q tile kernel — G-flat ζ input variant.
+
+    Identical mathematics to :func:`_make_V_q_tile_kernel` except the ζ
+    inputs are already in G-flat layout (the FFT + per-q phase + sphere
+    gather happen upstream in :class:`file_io.zeta_reader.ZetaReader`
+    rather than inside this kernel).
+
+    Per-kernel work shrinks to:
+      * an optional shard cast to ``P(None, 'x', None)`` / ``P(None, 'y', None)``
+        for the μ / ν halves of the contraction,
+      * a one-sided ``v(K)`` multiply on the L side,
+      * the ``einsum('qmG,qnG->qmn')`` contraction with one-axis gathers,
+      * (optional) g0 gather at ``G_idx = g0_sphere_idx``.
+
+    Parameters
+    ----------
+    n_G_sph : int
+        Post-cutoff G-vector count (the trailing axis of the input ζ_G).
+    g0_sphere_idx : int
+        Index in ``[0, n_G_sph)`` of the G = (0, 0, 0) entry.  The
+        reader builds ζ_G on a sphere ``sphere_idx`` whose 0th entry
+        is conventionally Γ; if a different convention is used,
+        pass that index here.  Only consulted when ``write_g0`` is set.
+    mesh_xy, q_chunk, mu_size, nu_size, n_rmu_L, n_rmu_R,
+    same_zeta, write_g0
+        Mirror the r-space kernel's parameters.
+
+    Returns
+    -------
+    A jit-compiled kernel with signature::
+
+        same_zeta=True:
+          kernel(V_acc, g0_acc, zeta_L_G, v_per_G_batch,
+                 q_lo_dyn, mu_lo_dyn, nu_lo_dyn) -> (V_acc', g0_acc')
+
+        same_zeta=False:
+          kernel(V_acc, g0_acc, zeta_L_G, zeta_R_G, v_per_G_batch,
+                 q_lo_dyn, mu_lo_dyn, nu_lo_dyn) -> (V_acc', g0_acc')
+
+    plus the convenience attributes ``zeta_G_sh``, ``V_sh``, ``g0_sh``.
+    """
+    cache_key = (
+        'gflat', id(mesh_xy), q_chunk, mu_size, nu_size,
+        n_rmu_L, n_rmu_R, n_G_sph,
+        bool(same_zeta), bool(write_g0),
+        int(g0_sphere_idx) if write_g0 else -1,
+    )
+    hit = _v_q_tile_gflat_kernel_cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    blk_xy_sh = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
+    blk_x_sh = NamedSharding(mesh_xy, P(None, 'x', None))
+    blk_y_sh = NamedSharding(mesh_xy, P(None, 'y', None))
+    V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
+    v_per_G_sh = NamedSharding(mesh_xy, P(None, None))
+    rep = NamedSharding(mesh_xy, P())
+
+    def _kernel_body(V_acc, g0_acc,
+                     zeta_L_G, zeta_R_G_or_None,
+                     v_per_G_batch,
+                     q_lo_dyn, mu_lo_dyn, nu_lo_dyn):
+        # Already G-flat with μ on the ('x','y') product axis.
+        zeta_L_G = jax.lax.with_sharding_constraint(zeta_L_G, blk_xy_sh)
+        if same_zeta:
+            zeta_R_G = zeta_L_G
+        else:
+            zeta_R_G = jax.lax.with_sharding_constraint(
+                zeta_R_G_or_None, blk_xy_sh)
+
+        # Re-shard for the einsum's two-axis split.
+        zeta_mu_X = jax.lax.with_sharding_constraint(zeta_L_G, blk_x_sh)
+        zeta_nu_Y = jax.lax.with_sharding_constraint(zeta_R_G, blk_y_sh)
+
+        # One-sided v(K) multiply.
+        zeta_mu_X = jax.lax.with_sharding_constraint(
+            zeta_mu_X * v_per_G_batch[:, None, :], blk_x_sh)
+
+        V_block = jnp.einsum('qmG,qnG->qmn',
+                              jnp.conj(zeta_mu_X), zeta_nu_Y,
+                              optimize=True)
+        V_block = jax.lax.with_sharding_constraint(V_block, V_sh)
+        V_new = jax.lax.dynamic_update_slice(
+            V_acc, V_block, (q_lo_dyn, mu_lo_dyn, nu_lo_dyn))
+        V_new = jax.lax.with_sharding_constraint(V_new, V_sh)
+
+        if write_g0:
+            # ζ_L(G=0) = entry at sphere index ``g0_sphere_idx``.
+            g0_mu = zeta_L_G[:, :, int(g0_sphere_idx)]
+            g0_mu = jax.lax.with_sharding_constraint(g0_mu, g0_sh)
+            g0_new = jax.lax.dynamic_update_slice(
+                g0_acc, g0_mu, (q_lo_dyn, mu_lo_dyn))
+            g0_new = jax.lax.with_sharding_constraint(g0_new, g0_sh)
+        else:
+            g0_new = g0_acc
+
+        return V_new, g0_new
+
+    if same_zeta:
+        @partial(jax.jit,
+                 in_shardings=(V_sh, g0_sh, blk_xy_sh, v_per_G_sh,
+                                rep, rep, rep),
+                 out_shardings=(V_sh, g0_sh),
+                 donate_argnums=(0, 1))
+        def _kernel(V_acc, g0_acc, zeta_L_G,
+                    v_per_G_batch,
+                    q_lo_dyn, mu_lo_dyn, nu_lo_dyn):
+            return _kernel_body(
+                V_acc, g0_acc, zeta_L_G, None,
+                v_per_G_batch,
+                q_lo_dyn, mu_lo_dyn, nu_lo_dyn)
+    else:
+        assert not write_g0, (
+            "write_g0=True is only valid when same_zeta=True (V^{0,0} "
+            "self-contraction); bispinor V^{μ_L,ν_L} L≠R head is "
+            "not defined."
+        )
+
+        @partial(jax.jit,
+                 in_shardings=(V_sh, g0_sh, blk_xy_sh, blk_xy_sh,
+                                v_per_G_sh, rep, rep, rep),
+                 out_shardings=(V_sh, g0_sh),
+                 donate_argnums=(0, 1))
+        def _kernel(V_acc, g0_acc, zeta_L_G, zeta_R_G,
+                    v_per_G_batch,
+                    q_lo_dyn, mu_lo_dyn, nu_lo_dyn):
+            return _kernel_body(
+                V_acc, g0_acc, zeta_L_G, zeta_R_G,
+                v_per_G_batch,
+                q_lo_dyn, mu_lo_dyn, nu_lo_dyn)
+
+    _kernel.zeta_G_sh = blk_xy_sh
+    _kernel.V_sh = V_sh
+    _kernel.g0_sh = g0_sh
+    _v_q_tile_gflat_kernel_cache[cache_key] = _kernel
+    return _kernel
+
+
 def _make_g0_dummy(mesh_xy, nq_total, n_rmu_L):
     """Sharded dummy g0 accumulator for tiles without a head.
 
@@ -813,6 +968,7 @@ def compute_V_q_tile(
     verbose: bool = True,
     timing_label: str = "compute_V_q_tile",
     q_list_kgrid_int: np.ndarray | None = None,
+    use_g_flat_zeta: bool = False,
 ):
     """Outer driver for the unified V_q tile.
 
@@ -872,6 +1028,16 @@ def compute_V_q_tile(
         AND ``zeta_q`` read offsets — the caller is responsible for
         ensuring ζ on disk is indexed in the same order (typically
         an IBZ subset via ``SymMaps.find_irreducible_qpoints()``).
+    use_g_flat_zeta : bool
+        Opt-in (default False) to consume ζ in **G-flat** layout via
+        the new :class:`file_io.zeta_reader.ZetaReader` read path —
+        the FFT + per-q phase + sphere gather happen in the reader
+        rather than inside the V_q kernel.  When True,
+        ``zeta_L_io`` / ``zeta_R_io`` must be :class:`ZetaReader`
+        instances (the legacy r-space path expects raw
+        :class:`SlabIO` handles).  The dispatch is internal — the
+        kernel call signature differs between the two paths but
+        callers don't see it.
 
     Returns
     -------
@@ -1115,13 +1281,23 @@ def compute_V_q_tile(
                 # logical prefix and zero-fills the padded tail.
                 mu_valid = max(0, min(int(mu_size),
                                       n_rmu_L_logical - int(mu_lo)))
-                zeta_mu = zeta_L_io.read_slab(
-                    'zeta_q',
-                    shape=(actual, n_rtot, mu_size),
-                    valid_shape=(actual, n_rtot, mu_valid),
-                    dtype=np.complex128,
-                    offset=(q_flat0, 0, mu_lo),
-                    mesh=mesh_xy, partition_spec=_read_spec)
+                if use_g_flat_zeta:
+                    # ζ_L delivered G-flat by the reader (FFT + phase +
+                    # sphere happen inside :meth:`ZetaReader.read_zeta_G_slab`).
+                    zeta_mu = zeta_L_io.read_zeta_G_slab(
+                        q_offset=q_flat0, q_count=actual,
+                        mu_offset=mu_lo, mu_count=mu_size,
+                        phase_batch=phase_b,
+                        sphere_idx=sphere_idx,
+                        mesh=mesh_xy, valid_mu=mu_valid)
+                else:
+                    zeta_mu = zeta_L_io.read_slab(
+                        'zeta_q',
+                        shape=(actual, n_rtot, mu_size),
+                        valid_shape=(actual, n_rtot, mu_valid),
+                        dtype=np.complex128,
+                        offset=(q_flat0, 0, mu_lo),
+                        mesh=mesh_xy, partition_spec=_read_spec)
                 if _time_stages:
                     jax.block_until_ready(zeta_mu)
                     t_read += _time.perf_counter() - _t0
@@ -1132,52 +1308,96 @@ def compute_V_q_tile(
                     )
                     do_write_g0 = same_zeta and wants_g0 and on_diag
                     if on_diag:
-                        # Single-read, single-FFT path — ζ_μ aliases ζ_ν.
-                        kernel = _make_V_q_tile_kernel(
-                            sphere_idx=sphere_idx, n_G_sph=n_G_sph,
-                            fft_shape=fft_grid, mesh_xy=mesh_xy,
-                            q_chunk=actual, mu_size=mu_size, nu_size=nu_size,
-                            n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R,
-                            same_zeta=True, write_g0=do_write_g0)
-                        if _time_stages:
-                            _t0 = _time.perf_counter()
-                        V_acc, g0_work = kernel(
-                            V_acc, g0_work,
-                            zeta_mu, v_per_G_b, phase_b,
-                            jnp.int32(q_cursor),
-                            jnp.int32(mu_lo), jnp.int32(nu_lo))
+                        # Single-read path — ζ_μ aliases ζ_ν.
+                        if use_g_flat_zeta:
+                            kernel = _make_V_q_tile_kernel_Gflat(
+                                n_G_sph=n_G_sph,
+                                g0_sphere_idx=0,
+                                mesh_xy=mesh_xy,
+                                q_chunk=actual, mu_size=mu_size,
+                                nu_size=nu_size,
+                                n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R,
+                                same_zeta=True, write_g0=do_write_g0)
+                            if _time_stages:
+                                _t0 = _time.perf_counter()
+                            V_acc, g0_work = kernel(
+                                V_acc, g0_work,
+                                zeta_mu, v_per_G_b,
+                                jnp.int32(q_cursor),
+                                jnp.int32(mu_lo), jnp.int32(nu_lo))
+                        else:
+                            kernel = _make_V_q_tile_kernel(
+                                sphere_idx=sphere_idx, n_G_sph=n_G_sph,
+                                fft_shape=fft_grid, mesh_xy=mesh_xy,
+                                q_chunk=actual, mu_size=mu_size,
+                                nu_size=nu_size,
+                                n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R,
+                                same_zeta=True, write_g0=do_write_g0)
+                            if _time_stages:
+                                _t0 = _time.perf_counter()
+                            V_acc, g0_work = kernel(
+                                V_acc, g0_work,
+                                zeta_mu, v_per_G_b, phase_b,
+                                jnp.int32(q_cursor),
+                                jnp.int32(mu_lo), jnp.int32(nu_lo))
                         if _time_stages:
                             jax.block_until_ready(V_acc)
                             t_kernel += _time.perf_counter() - _t0
                     else:
-                        # Distinct ζ_R — second read + second FFT.
+                        # Distinct ζ_R — second read.
                         if _time_stages:
                             _t0 = _time.perf_counter()
                         nu_valid = max(0, min(int(nu_size),
                                               n_rmu_R_logical - int(nu_lo)))
-                        zeta_nu = zeta_R_io.read_slab(
-                            'zeta_q',
-                            shape=(actual, n_rtot, nu_size),
-                            valid_shape=(actual, n_rtot, nu_valid),
-                            dtype=np.complex128,
-                            offset=(q_flat0, 0, nu_lo),
-                            mesh=mesh_xy, partition_spec=_read_spec)
+                        if use_g_flat_zeta:
+                            zeta_nu = zeta_R_io.read_zeta_G_slab(
+                                q_offset=q_flat0, q_count=actual,
+                                mu_offset=nu_lo, mu_count=nu_size,
+                                phase_batch=phase_b,
+                                sphere_idx=sphere_idx,
+                                mesh=mesh_xy, valid_mu=nu_valid)
+                        else:
+                            zeta_nu = zeta_R_io.read_slab(
+                                'zeta_q',
+                                shape=(actual, n_rtot, nu_size),
+                                valid_shape=(actual, n_rtot, nu_valid),
+                                dtype=np.complex128,
+                                offset=(q_flat0, 0, nu_lo),
+                                mesh=mesh_xy, partition_spec=_read_spec)
                         if _time_stages:
                             jax.block_until_ready(zeta_nu)
                             t_read += _time.perf_counter() - _t0
-                        kernel = _make_V_q_tile_kernel(
-                            sphere_idx=sphere_idx, n_G_sph=n_G_sph,
-                            fft_shape=fft_grid, mesh_xy=mesh_xy,
-                            q_chunk=actual, mu_size=mu_size, nu_size=nu_size,
-                            n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R,
-                            same_zeta=False, write_g0=False)
-                        if _time_stages:
-                            _t0 = _time.perf_counter()
-                        V_acc, g0_work = kernel(
-                            V_acc, g0_work,
-                            zeta_mu, zeta_nu, v_per_G_b, phase_b,
-                            jnp.int32(q_cursor),
-                            jnp.int32(mu_lo), jnp.int32(nu_lo))
+                        if use_g_flat_zeta:
+                            kernel = _make_V_q_tile_kernel_Gflat(
+                                n_G_sph=n_G_sph,
+                                g0_sphere_idx=0,
+                                mesh_xy=mesh_xy,
+                                q_chunk=actual, mu_size=mu_size,
+                                nu_size=nu_size,
+                                n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R,
+                                same_zeta=False, write_g0=False)
+                            if _time_stages:
+                                _t0 = _time.perf_counter()
+                            V_acc, g0_work = kernel(
+                                V_acc, g0_work,
+                                zeta_mu, zeta_nu, v_per_G_b,
+                                jnp.int32(q_cursor),
+                                jnp.int32(mu_lo), jnp.int32(nu_lo))
+                        else:
+                            kernel = _make_V_q_tile_kernel(
+                                sphere_idx=sphere_idx, n_G_sph=n_G_sph,
+                                fft_shape=fft_grid, mesh_xy=mesh_xy,
+                                q_chunk=actual, mu_size=mu_size,
+                                nu_size=nu_size,
+                                n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R,
+                                same_zeta=False, write_g0=False)
+                            if _time_stages:
+                                _t0 = _time.perf_counter()
+                            V_acc, g0_work = kernel(
+                                V_acc, g0_work,
+                                zeta_mu, zeta_nu, v_per_G_b, phase_b,
+                                jnp.int32(q_cursor),
+                                jnp.int32(mu_lo), jnp.int32(nu_lo))
                         if _time_stages:
                             jax.block_until_ready(V_acc)
                             t_kernel += _time.perf_counter() - _t0

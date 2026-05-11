@@ -889,9 +889,13 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		# Single dispatcher routes to the unified V_q tile driver (one
 		# inner kernel handles same/distinct ζ × Case A/B; one outer
 		# driver handles both PHDF5/FFI and h5py-allgather backends).
+		# ``ZetaReader`` is the V_q reader of record after C3 — the FFT
+		# moves out of the V_q kernel and into the reader's
+		# ``read_zeta_G_slab`` path (``use_g_flat_zeta=True``).
+		from file_io.zeta_reader import ZetaReader
 		with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
-			with SlabIO(zeta_h5_path, mode='r', mesh=mesh_xy,
-			            backend=cfg.backend.slab_io) as zeta_io:
+			with ZetaReader(zeta_h5_path, mesh=mesh_xy,
+			                backend=cfg.backend.slab_io) as zeta_io:
 				with mesh_xy:
 					V_q_raw, G0_all = compute_all_V_q(
 						zeta_io,
@@ -911,6 +915,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 							np.asarray(jax.device_get(centroid_indices),
 							           dtype=np.int32)
 							if centroid_indices is not None else None),
+						use_g_flat_zeta=True,
 					)
 
 	# Write G0 = ζ_μ(G=0) at q=0 back to zeta file via SlabIO's deferred
