@@ -542,6 +542,8 @@ def make_v_munu_chunked_kernel(
 from .v_q_tile import (
     compute_V_q_tile as _compute_V_q_tile,
     _choose_v_q_chunks,
+    _unfold_v_q_ibz_to_full,
+    _unfold_g0_ibz_to_full,
 )
 
 
@@ -564,6 +566,8 @@ def compute_all_V_q(
     q_batch_size: int | None = None,    # legacy arg (allgather path); ignored
     budget_bytes: float | None = None,
     verbose: bool = True,
+    sym=None,
+    centroid_indices: np.ndarray | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Compute V_qmunu(q,μ,ν) and g0_μ(q) at q=0 from a sharded ζ HDF5.
 
@@ -582,7 +586,52 @@ def compute_all_V_q(
     the kernel.
     """
     nkx, nky, nkz = kgrid
-    nq_total = nkx * nky * nkz
+    nq_full = nkx * nky * nkz
+
+    # IBZ orchestration: when ``sym`` is provided AND the centroid set
+    # is orbit-closed under the WFN sym group, compute V_q only at IBZ
+    # q's and unfold to full BZ via the centroid-double-permute (no
+    # τ-phase — V_q is bilinear in ζ).  Without ``sym`` (or when
+    # closure fails), fall back to full-BZ iteration so legacy callers
+    # and centroid files produced with ``kmeans_cli --no-orbit`` keep
+    # working.
+    use_ibz = False
+    q_irr_kgrid_int = None
+    q_full_to_irr_idx = None
+    q_full_to_irr_sym = None
+    sym_perm = None
+    nq_total = nq_full
+    q_list_for_tile = None
+
+    if sym is not None and centroid_indices is not None:
+        from centroid.orbit_syms import compute_centroid_sym_perm
+        n_tran = int(np.asarray(sym.sym_matrices).shape[0])
+        centroid_idx_np = np.asarray(centroid_indices, dtype=np.int32)
+        try:
+            sym_perm = compute_centroid_sym_perm(
+                centroid_idx_np,
+                sym_matrices=np.asarray(sym.sym_matrices[:n_tran]),
+                translations=np.asarray(sym.translations[:n_tran]),
+                fft_grid=np.asarray(fft_grid, dtype=np.int32),
+            )
+        except RuntimeError as exc:
+            if verbose and jax.process_index() == 0:
+                print(f"  V_q tile: centroid orbit closure failed — "
+                      f"falling back to full-BZ iteration.  Reason: "
+                      f"{exc.args[0].splitlines()[0] if exc.args else exc}")
+            sym_perm = None
+
+        if sym_perm is not None:
+            (q_irr_kgrid_int, q_full_to_irr_idx,
+             q_full_to_irr_sym, _q_irr_full_idx
+             ) = sym.find_irreducible_qpoints()
+            nq_total = int(q_irr_kgrid_int.shape[0])
+            q_list_for_tile = q_irr_kgrid_int
+            use_ibz = True
+            if verbose and jax.process_index() == 0:
+                print(f"  V_q tile: iterating IBZ q ({nq_total} / "
+                      f"{nq_full} full-BZ); post-loop unfold via "
+                      f"centroid perm.")
 
     # Build sphere_idx + per-q (sqrt_v, phase) callable from the Coulomb
     # factory; this is the only piece that depends on Coulomb
@@ -685,7 +734,27 @@ def compute_all_V_q(
         bgw_v_grid_overlay_fn=bgw_overlay_fn,
         verbose=verbose,
         timing_label="compute_all_V_q_sharded",
+        q_list_kgrid_int=q_list_for_tile,
     )
+
+    # IBZ orchestration: post-loop unfold V_q_ibz → V_q_full via the
+    # centroid-double-permute (eq. 3 of the report).  g0 is unfolded
+    # for completeness, but only the Γ slot is consumed downstream.
+    if use_ibz:
+        V_acc = _unfold_v_q_ibz_to_full(
+            V_acc,
+            full_to_irr_idx=q_full_to_irr_idx,
+            full_to_irr_sym=q_full_to_irr_sym,
+            sym_perm=sym_perm,
+            mesh_xy=mesh_xy,
+        )
+        g0_acc = _unfold_g0_ibz_to_full(
+            g0_acc,
+            full_to_irr_idx=q_full_to_irr_idx,
+            full_to_irr_sym=q_full_to_irr_sym,
+            sym_perm=sym_perm,
+            mesh_xy=mesh_xy,
+        )
 
     # Flat-q convention: keep the q axis 1-D throughout.  Downstream
     # callers that need the 3-D-k form reshape inside an FFT helper

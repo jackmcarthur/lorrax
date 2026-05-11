@@ -1413,6 +1413,7 @@ def fit_zeta_to_h5(
     gspace_mode: str = "host_cache",
     vertex_mu_L: int = 0,
     solver_kind: str = 'auto',
+    write_ibz_only: bool = True,
 ):
     """
     Full zeta fitting pipeline with r-chunk loop and HDF5 output.
@@ -1641,7 +1642,58 @@ def fit_zeta_to_h5(
         gc.collect()
         jax.clear_caches()  # Clear JAX function caches that may hold array refs
 
-    # ========== STEP 4a: Write mf_header + isdf_header (rank 0) ==========
+    # ========== STEP 4a: q-IBZ reduction + header writes (rank 0) ==========
+    # When ``write_ibz_only=True`` (default), ζ is written for IBZ q's
+    # only.  V_q at the full BZ is recovered by the reader / V_q
+    # orchestrator using sym data from ``mf_header`` (see report.md
+    # §2.4).  The on-disk ``zeta_q`` leading axis is ``n_q_disk``
+    # rather than ``n_q_full``; the chunk loop slices
+    # ``zeta_chunk[q_irr_full_idx]`` before writing.
+    #
+    # When ``write_ibz_only=False`` (bispinor μ_L>0 caller for now,
+    # until the bispinor V_q orchestrator gains IBZ support), the
+    # full-BZ axis is preserved on disk for back-compatibility.
+    #
+    # Auto-fallback: if the centroid set isn't orbit-closed under the
+    # WFN sym group (typical for ``kmeans_cli --no-orbit`` outputs),
+    # the V_q unfold can't reconstruct full-BZ V_q from the IBZ
+    # representation, so we keep the full-BZ axis on disk too.  The
+    # closure check uses the same helper that the V_q consumer would.
+    if write_ibz_only:
+        try:
+            from centroid.orbit_syms import (
+                compute_centroid_sym_perm as _check_perm,
+            )
+            _cent_idx_for_check = np.asarray(
+                jax.device_get(centroid_indices), dtype=np.int32)
+            _ntran_check = int(np.asarray(sym.sym_matrices).shape[0])
+            _check_perm(
+                _cent_idx_for_check,
+                sym_matrices=np.asarray(sym.sym_matrices[:_ntran_check]),
+                translations=np.asarray(sym.translations[:_ntran_check]),
+                fft_grid=np.asarray(meta.fft_grid, dtype=np.int32),
+            )
+        except RuntimeError as _exc:
+            if jax.process_index() == 0:
+                _first = (_exc.args[0].splitlines()[0]
+                          if _exc.args else str(_exc))
+                print(f"  q-IBZ reduction: centroid orbit closure failed "
+                      f"— falling back to full-BZ on disk.  Reason: "
+                      f"{_first}")
+            write_ibz_only = False
+
+    if write_ibz_only:
+        (q_irr_kgrid_int, _q_full_to_irr_idx,
+         _q_full_to_irr_sym, q_irr_full_idx) = sym.find_irreducible_qpoints()
+        n_q_disk = int(q_irr_full_idx.shape[0])
+        print(f"  q-IBZ reduction: {n_q_disk} IBZ q-points / {nq} full-BZ "
+              f"(disk shrink {nq / max(1, n_q_disk):.1f}×)")
+    else:
+        q_irr_full_idx = None
+        n_q_disk = nq
+        print(f"  q axis on disk: full BZ ({nq} q-points) "
+              f"(write_ibz_only=False or closure check failed)")
+
     # ``zeta_q.h5`` carries the BGW-style ``mf_header`` verbatim from
     # the source WFN so any downstream consumer (the new
     # :class:`file_io.zeta_reader.ZetaReader`, or anything else that
@@ -1735,7 +1787,7 @@ def fit_zeta_to_h5(
                              backend=slab_io_backend)
             zeta_io.create_dataset(
                 'zeta_q',
-                shape=(nq, n_rtot, n_rmu),
+                shape=(n_q_disk, n_rtot, n_rmu),
                 dtype=np.complex128,
                 chunks=(1, n_rchunk, n_rmu),
             )
@@ -1744,7 +1796,7 @@ def fit_zeta_to_h5(
                         backend=slab_io_backend) as _zeta_create_io:
                 _zeta_create_io.create_dataset(
                     'zeta_q',
-                    shape=(nq, n_rtot, n_rmu),
+                    shape=(n_q_disk, n_rtot, n_rmu),
                     dtype=np.complex128,
                     chunks=(1, n_rchunk, n_rmu),
                 )
@@ -1918,43 +1970,63 @@ def fit_zeta_to_h5(
                 psi_G_store.end_rchunk()
             t_fit_total += time.perf_counter() - t0
 
-            # 6e. Q-chunked allgather → host copy → async HDF5 write.
+            # 6e. IBZ-slice → allgather (or FFI) → HDF5 write.
+            # ``zeta_chunk`` is computed at full BZ q (the FFT in
+            # ``solve_zeta`` naturally outputs all q's).  We slice to
+            # IBZ rows here so the disk image is IBZ-only.  The
+            # compute side stays full-BZ until a future optimization
+            # threads IBZ through the solve.
+            #
             # The allgather replicates zeta slices: per-device output is
             # (q_gather, n_rmu, chunk_r) which at large chunk_r can be huge.
             # Chunking over q keeps each allgather under memory limits.
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.h5_write"):
+                # IBZ subset (still on device, same sharding on the
+                # μ/r axes — the leading axis just gathers IBZ rows).
+                # ``jnp.asarray(q_irr_full_idx)`` is replicated; the
+                # gather is a single device-side scatter, microseconds.
+                # In full-BZ mode (write_ibz_only=False) this is a
+                # no-op alias to keep the downstream write path
+                # uniform.
+                if write_ibz_only:
+                    zeta_chunk_ibz = zeta_chunk[
+                        jnp.asarray(q_irr_full_idx, dtype=jnp.int32)]
+                else:
+                    zeta_chunk_ibz = zeta_chunk
+                del zeta_chunk
+
                 # Each allgather produces a FULLY REPLICATED output per device:
                 # q_gather × n_rmu × chunk_r × 16 bytes, plus NCCL temp of same size.
                 # Cap to keep replicated output + NCCL under available memory.
                 _bytes_per_q_replicated = 2 * n_rmu * actual_n_rchunk * 16
-                _safe_q_gather = max(1, min(nq, int(10 * 1024**3 / max(1, _bytes_per_q_replicated))))
+                _safe_q_gather = max(1, min(n_q_disk,
+                    int(10 * 1024**3 / max(1, _bytes_per_q_replicated))))
                 if q_gather_size > 0:
-                    _q_gather = min(nq, q_gather_size, _safe_q_gather)
+                    _q_gather = min(n_q_disk, q_gather_size, _safe_q_gather)
                 else:
                     _q_gather = _safe_q_gather
 
                 if use_ffi_io:
-                    # FFI path: zeta_chunk is (nq, n_rmu_padded,
-                    # chunk_r), dataset is (nq, n_rtot, n_rmu) at
-                    # LOGICAL extent.  Transpose the last two axes so
-                    # the slab matches disk layout, then SlabIO
-                    # ``valid_shape=`` clips the trailing pad slots
-                    # off axis -1 on write (zeta_chunk's pad rows are
-                    # zero by construction — pad block of L_q is
-                    # identity, so the back-solve produces zeta_pad =
-                    # 0).  Disk extent stays logical for cross-mesh
-                    # round-trip.
+                    # FFI path: zeta_chunk_ibz is (n_q_disk,
+                    # n_rmu_padded, chunk_r), dataset is
+                    # (n_q_disk, n_rtot, n_rmu) at LOGICAL extent.
+                    # Transpose the last two axes so the slab matches
+                    # disk layout, then SlabIO ``valid_shape=`` clips
+                    # the trailing pad slots off axis -1 on write
+                    # (zeta pad rows are zero by construction — pad
+                    # block of L_q is identity, so the back-solve
+                    # produces zeta_pad = 0).
                     # The transpose is a JAX metadata-only operation
                     # (shard axis 'chunk_r' / sharded → axis 1 of the
                     # post-transpose tensor; NamedSharding updates in
                     # place, no data motion).
-                    zeta_chunk_write = zeta_chunk.transpose(0, 2, 1)
+                    zeta_chunk_write = zeta_chunk_ibz.transpose(0, 2, 1)
                     actual_q = int(zeta_chunk_write.shape[0])
                     zeta_io.write_slab(
                         'zeta_q', zeta_chunk_write,
                         offset=(0, r_start, 0),
-                        global_shape=(nq, n_rtot, n_rmu),
+                        global_shape=(n_q_disk, n_rtot, n_rmu),
                         valid_shape=(actual_q, actual_n_rchunk, n_rmu),
                     )
                 else:
@@ -1967,9 +2039,9 @@ def fit_zeta_to_h5(
                     # thread stall per chunk is roughly (cross-rank NCCL
                     # time) + (PCIe D2H).  First chunk eats an extra ~1 s
                     # of NCCL/XLA first-collective setup.
-                    for _q0 in range(0, nq, _q_gather):
-                        _q1 = min(_q0 + _q_gather, nq)
-                        _slice = zeta_chunk[_q0:_q1]
+                    for _q0 in range(0, n_q_disk, _q_gather):
+                        _q1 = min(_q0 + _q_gather, n_q_disk)
+                        _slice = zeta_chunk_ibz[_q0:_q1]
                         _gathered = jax.experimental.multihost_utils.process_allgather(
                             _slice, tiled=False)
                         if jax.process_index() == 0:
@@ -1986,7 +2058,7 @@ def fit_zeta_to_h5(
                 # rank 0's writer thread flushes to disk.  Final
                 # sync_global_devices("zeta_writes_complete") at the
                 # bottom of this function serves as the rendezvous.
-                del zeta_chunk
+                del zeta_chunk_ibz
             t_write_total += time.perf_counter() - t0
             r_progress.step()
 
@@ -2024,7 +2096,9 @@ def fit_zeta_to_h5(
     # Per-stage timing breakdown.  ``fit`` is the fused fit_one_rchunk jit;
     # ``H5`` is the allgather+write (or FFI write_slab).  Everything else
     # lives inside the jit — see xprof for the intra-jit breakdown.
-    print(f"  Zeta output: {output_file}  shape: ({nqx},{nqy},{nqz},{n_rmu},{n_rtot})")
+    print(f"  Zeta output: {output_file}  shape: "
+          f"(n_q_disk={n_q_disk} of {nqx}·{nqy}·{nqz}={nq} full-BZ, "
+          f"n_rtot={n_rtot}, n_rmu={n_rmu})")
     print(f"  Timing ({num_chunks} r-chunks, {t_chunks_total:.1f}s total):")
     for label, t in [("fit", t_fit_total), ("H5", t_write_total)]:
         print(f"    {label:<6} {t:6.2f}s  {100*t/t_chunks_total:4.1f}%")

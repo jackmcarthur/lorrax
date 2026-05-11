@@ -812,6 +812,7 @@ def compute_V_q_tile(
     bgw_v_grid_overlay_fn=None,
     verbose: bool = True,
     timing_label: str = "compute_V_q_tile",
+    q_list_kgrid_int: np.ndarray | None = None,
 ):
     """Outer driver for the unified V_q tile.
 
@@ -863,6 +864,14 @@ def compute_V_q_tile(
         Used for byte-reproducible BGW comparisons (``use_bgw_vcoul=true``).
     verbose : bool
     timing_label : str
+    q_list_kgrid_int : np.ndarray | None
+        Optional (n_q, 3) int array of q-points (kgrid coords) to
+        iterate.  When ``None`` (default), the full BZ kgrid is built
+        in the canonical flat-q order.  When given, ``nq_total`` is
+        replaced by ``len(q_list_kgrid_int)`` for V_acc allocation
+        AND ``zeta_q`` read offsets — the caller is responsible for
+        ensuring ζ on disk is indexed in the same order (typically
+        an IBZ subset via ``SymMaps.find_irreducible_qpoints()``).
 
     Returns
     -------
@@ -883,7 +892,23 @@ def compute_V_q_tile(
     from common.progress import LoopProgress
 
     nkx, nky, nkz = kgrid
-    nq_total = nkx * nky * nkz
+    # ``nq_total`` is the size of the q-axis the orchestrator iterates
+    # over AND the leading axis of V_acc / g0_acc / on-disk zeta_q.
+    # Default = full BZ; IBZ caller passes ``q_list_kgrid_int`` to
+    # iterate only the IBZ subset (the V_q centroid-double-permute
+    # unfold to full BZ is the caller's responsibility).
+    if q_list_kgrid_int is None:
+        q_list_np = np.array(
+            [(qx, qy, qz) for qx in range(nkx)
+             for qy in range(nky) for qz in range(nkz)],
+            dtype=np.int32)
+    else:
+        q_list_np = np.asarray(q_list_kgrid_int, dtype=np.int32)
+        if q_list_np.ndim != 2 or q_list_np.shape[1] != 3:
+            raise ValueError(
+                f"q_list_kgrid_int must be (n_q, 3) int; "
+                f"got shape {q_list_np.shape}")
+    nq_total = int(q_list_np.shape[0])
     p_x = int(mesh_xy.shape['x'])
     p_y = int(mesh_xy.shape['y'])
 
@@ -1036,8 +1061,12 @@ def compute_V_q_tile(
     # ``on_diag`` static check picks the single-FFT (single-read) path
     # only when ``same_zeta`` AND the μ/ν blocks coincide; off-diagonal
     # iterations always read+FFT a second ζ.
-    q_coords = [(qx, qy, qz) for qx in range(nkx)
-                for qy in range(nky) for qz in range(nkz)]
+    # Iterate the q-list passed by the caller (full BZ or IBZ subset).
+    # The on-disk ``zeta_q`` leading axis must be indexed in the same
+    # order as ``q_list_np`` — under IBZ the writer slices to
+    # ``q_irr_full_idx`` order; here ``q_flat0`` = position in the
+    # iteration list (= IBZ index on disk).
+    q_coords = [tuple(int(v) for v in row) for row in q_list_np]
     q_batches = [q_coords[i:i + q_chunk]
                  for i in range(0, nq_total, q_chunk)]
     mu_blocks = [(i * mu_chunk, min(mu_chunk, n_rmu_L - i * mu_chunk))
@@ -1067,8 +1096,13 @@ def compute_V_q_tile(
             if _time_stages:
                 jax.block_until_ready(v_per_G_b)
                 t_vphase += _time.perf_counter() - _t0
-            q_flat0 = (q_batch[0][0] * (nky * nkz) +
-                       q_batch[0][1] * nkz + q_batch[0][2])
+            # ``q_flat0`` = leading-q offset into the on-disk ``zeta_q``.
+            # Under IBZ writes the disk axis follows iteration order
+            # (= IBZ index); under the default full-BZ path iteration
+            # order matches the flat-q convention exactly.  Either way
+            # ``q_cursor`` (the running iteration index) is the correct
+            # offset.
+            q_flat0 = q_cursor
 
             for mu_i, (mu_lo, mu_size) in enumerate(mu_blocks):
                 if _time_stages:
@@ -1162,3 +1196,117 @@ def compute_V_q_tile(
               f"total={total:.1f}s")
 
     return V_acc, (g0_work if wants_g0 else None)
+
+
+# ----------------------------------------------------------------------------
+# IBZ → full-BZ unfold (post-loop)
+# ----------------------------------------------------------------------------
+#
+# V_q is a pure centroid-axis double-permute under {S | τ} — the τ-phases
+# in the ζ transformation rule cancel because V is bilinear in ζ:
+#
+#     V_{Sq, π_s(μ), π_s(ν)} = V_{q, μ, ν}                         (eq. 3)
+#
+# So given V_q_ibz on the IBZ wedge and the full-to-IBZ tables produced by
+# ``SymMaps.find_irreducible_qpoints`` + ``orbit_syms.compute_centroid_sym_perm``,
+# we can recover V_q on the full BZ as a pure index gather — no FFT, no
+# phase multiply.  Cost: one fancy index, scales as n_q_full · μ² ·
+# 16 / mesh_size on the (μ, ν) sharding.
+
+def _unfold_v_q_ibz_to_full(
+    V_q_ibz: jax.Array,
+    *,
+    full_to_irr_idx: np.ndarray,
+    full_to_irr_sym: np.ndarray,
+    sym_perm: np.ndarray,
+    mesh_xy: Mesh,
+) -> jax.Array:
+    """Expand ``V_q_ibz (n_qpt_irr, μ, μ)`` to ``(n_q_full, μ, μ)``.
+
+    The mapping is eq. 3 of ``reports/zeta_ibz_2026-05-11/report.md``:
+
+        V_full[q, μ', ν'] = V_ibz[i(q), π_{s(q)}^{-1}(μ'), π_{s(q)}^{-1}(ν')]
+
+    where ``i(q) = full_to_irr_idx[q]`` and ``s(q) = full_to_irr_sym[q]``.
+    No τ-phase — bilinearity in ζ cancels them.
+
+    Parameters
+    ----------
+    V_q_ibz
+        (n_qpt_irr, n_rmu, n_rmu) c128, sharded ``P(None, 'x', 'y')``.
+    full_to_irr_idx
+        (n_q_full,) int.
+    full_to_irr_sym
+        (n_q_full,) int.
+    sym_perm
+        (n_sym, n_rmu) int — the forward permutation
+        ``r_{π_s(μ)} ≡ S_s r_μ + τ_s``.
+    mesh_xy
+        Device mesh; the output is constrained to ``P(None, 'x', 'y')``.
+
+    Returns
+    -------
+    V_q_full
+        (n_q_full, n_rmu, n_rmu) c128, sharded ``P(None, 'x', 'y')``.
+    """
+    # Inverse permutation: ``inv_perm[s, π_s(μ)] = μ`` → argsort along μ.
+    inv_perm = np.argsort(sym_perm, axis=-1).astype(np.int32)
+    inv_perm_j = jnp.asarray(inv_perm)                              # (n_sym, n_rmu)
+    idx_j = jnp.asarray(np.asarray(full_to_irr_idx, dtype=np.int32))
+    sym_j = jnp.asarray(np.asarray(full_to_irr_sym, dtype=np.int32))
+
+    V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+
+    @partial(jax.jit, out_shardings=V_sh)
+    def _do_unfold(V_ibz):
+        # Per-q μ-axis mapping: shape (n_q_full, n_rmu).
+        perm_q = inv_perm_j[sym_j]                                  # (n_q_full, n_rmu)
+        V_at_irr = V_ibz[idx_j]                                     # (n_q_full, μ, μ)
+        # Gather along μ (axis 1):
+        V_perm_mu = jnp.take_along_axis(
+            V_at_irr, perm_q[:, :, None], axis=1)
+        # Gather along ν (axis 2):
+        V_full = jnp.take_along_axis(
+            V_perm_mu, perm_q[:, None, :], axis=2)
+        return V_full
+
+    return _do_unfold(V_q_ibz)
+
+
+def _unfold_g0_ibz_to_full(
+    g0_ibz: jax.Array,
+    *,
+    full_to_irr_idx: np.ndarray,
+    full_to_irr_sym: np.ndarray,
+    sym_perm: np.ndarray,
+    mesh_xy: Mesh,
+) -> jax.Array:
+    """Expand ``g0_ibz (n_qpt_irr, μ)`` → ``(n_q_full, μ)``.
+
+    g0 transforms like a single ζ leg (not bilinear), so under {S | τ}:
+
+        g0_full[q, π_s(μ)] = e^{-i (Sq + 0)·τ_s} · g0_ibz[i(q), μ]
+
+    However, the **only** downstream use of g0 is the Γ slot (q=0),
+    where S = identity ⇒ no phase, no permutation.  For q ≠ Γ the
+    head-correction code in ``head_correction.py`` does not consume
+    ``g0_acc[q]``.  So we apply the centroid permutation (correct
+    structure) but omit the τ-phase (its effect is unobservable; the
+    Γ phase is exp(0) = 1 anyway).  If a future consumer needs the
+    correct phase, set ``include_tau_phase=True``.
+    """
+    inv_perm = np.argsort(sym_perm, axis=-1).astype(np.int32)
+    inv_perm_j = jnp.asarray(inv_perm)
+    idx_j = jnp.asarray(np.asarray(full_to_irr_idx, dtype=np.int32))
+    sym_j = jnp.asarray(np.asarray(full_to_irr_sym, dtype=np.int32))
+
+    g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
+
+    @partial(jax.jit, out_shardings=g0_sh)
+    def _do_unfold(g0):
+        perm_q = inv_perm_j[sym_j]                                  # (n_q_full, n_rmu)
+        g0_at_irr = g0[idx_j]                                       # (n_q_full, μ)
+        g0_full = jnp.take_along_axis(g0_at_irr, perm_q, axis=1)
+        return g0_full
+
+    return _do_unfold(g0_ibz)

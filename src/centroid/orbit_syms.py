@@ -202,3 +202,139 @@ def unfold_orbit_unique(reps_np, Rinv, tau, tol=1e-6) -> np.ndarray:
     return flat
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Centroid orbit permutation π_s : r_{π_s(μ)} = S_s r_μ + τ_s  (mod 1)
+# ─────────────────────────────────────────────────────────────────────────
+
+def compute_centroid_sym_perm(
+    r_mu_fft_idx: np.ndarray,
+    sym_matrices: np.ndarray,
+    translations: np.ndarray,
+    fft_grid: np.ndarray | tuple[int, int, int],
+    *,
+    validate: bool = True,
+) -> np.ndarray:
+    """Build π_s such that ``r_{π_s(μ)} ≡ S_s r_μ + τ_s`` on the FFT grid.
+
+    The forward direction: S_s and τ_s acting on real space.  In the
+    BGW convention used elsewhere in LORRAX, real-space r transforms
+    via ``Rinv = S^{-1}`` (column-vector form), so ``S r + τ`` in
+    column form is equivalent to ``r @ Rinv.T + τ`` in row form.  We
+    use the row-form throughout for vectorisation.
+
+    Parameters
+    ----------
+    r_mu_fft_idx
+        (n_rmu, 3) int32 — centroid positions as integer FFT-grid
+        indices ``[0, FFTgrid[a])``.
+    sym_matrices
+        (n_sym, 3, 3) int — BGW ``mtrx``.  These act on G-vectors
+        (column convention); for r-space we use the inverse.  We
+        compute ``Rinv = inv(S)`` here so callers can pass either
+        ``wfn.sym_matrices[:ntran]`` or a pre-sliced ``R_grid``.
+    translations
+        (n_sym, 3) float — BGW ``tnp``.  Fractional translation is
+        ``τ_frac = translations / (2π)``.
+    fft_grid
+        (3,) int — FFT grid extents.  Centroid positions must be
+        commensurate with this grid AND with the τ × fft_grid product
+        (otherwise the rounded image won't land on a grid point —
+        that's the orbit-closure failure mode).
+    validate
+        If True, asserts every row of the result is a permutation
+        ``[0, n_rmu)``.  Set False only for offline diagnostics where
+        the closure failure is the thing you want to inspect.
+
+    Returns
+    -------
+    sym_perm
+        (n_sym, n_rmu) int32 — ``sym_perm[s, μ] = ν`` iff
+        ``r_ν ≡ S_s r_μ + τ_s`` on the FFT grid.
+
+    Raises
+    ------
+    RuntimeError
+        If orbit closure fails: i.e. for some (s, μ) the image of r_μ
+        under {S_s | τ_s} doesn't land on any other centroid in the
+        table.  Caller should regenerate the centroid set with
+        ``kmeans_cli`` in orbit-aware mode, or pass identity-only sym.
+    """
+    fft_grid_np = np.asarray(fft_grid, dtype=np.int64).reshape(3)
+    idx = np.asarray(r_mu_fft_idx, dtype=np.int64)
+    if idx.ndim != 2 or idx.shape[1] != 3:
+        raise ValueError(
+            f"r_mu_fft_idx must be (n_rmu, 3); got {idx.shape}")
+    n_rmu = int(idx.shape[0])
+
+    S = np.asarray(sym_matrices, dtype=np.int64)
+    if S.ndim != 3 or S.shape[1:] != (3, 3):
+        raise ValueError(
+            f"sym_matrices must be (n_sym, 3, 3); got {S.shape}")
+    n_sym = int(S.shape[0])
+
+    tau_frac = (np.asarray(translations, dtype=np.float64)[:n_sym]
+                / (2.0 * np.pi))                              # (n_sym, 3)
+
+    # Convert centroid FFT indices to fractional coords for the
+    # transformation, then back to FFT indices after wrap.
+    r_frac = idx.astype(np.float64) / fft_grid_np[None, :]    # (n_rmu, 3)
+
+    # Row-vector form: r' = r @ S.T + τ  → ``S r + τ`` in column form.
+    # (NB: ``S`` here is what BGW calls ``mtrx``; the centroid r really
+    # transforms by ``Rinv = inv(S)``.  Compute Rinv on host.)
+    Rinv = np.rint(np.linalg.inv(S)).astype(np.int64)          # (n_sym, 3, 3)
+
+    # images[s, μ] = r_μ @ Rinv[s].T + τ[s]   (mod 1)
+    images = np.einsum('rj,sij->sri', r_frac, Rinv.astype(np.float64)) \
+             + tau_frac[:, None, :]
+    images = images - np.floor(images)                          # (n_sym, n_rmu, 3) in [0, 1)
+
+    # Snap back to FFT-grid integers.  If τ × FFTgrid isn't integer to
+    # roundoff, this rounding will land on a half-grid point and the
+    # subsequent dict lookup will fail — that's the right error signal.
+    img_idx = np.rint(images * fft_grid_np[None, None, :]).astype(np.int64)
+    img_idx = img_idx % fft_grid_np[None, None, :]              # wrap residual
+
+    # Build a fast lookup from FFT-grid triple → centroid index.
+    radix1 = fft_grid_np[1] * fft_grid_np[2]
+    radix2 = fft_grid_np[2]
+    def _flat(idx_arr):
+        return idx_arr[..., 0] * radix1 + idx_arr[..., 1] * radix2 \
+               + idx_arr[..., 2]
+    cent_flat = _flat(idx)                                       # (n_rmu,)
+    img_flat = _flat(img_idx)                                    # (n_sym, n_rmu)
+
+    flat_to_mu = -np.ones(int(fft_grid_np.prod()), dtype=np.int64)
+    flat_to_mu[cent_flat] = np.arange(n_rmu, dtype=np.int64)
+
+    sym_perm = flat_to_mu[img_flat]                              # (n_sym, n_rmu)
+
+    if validate:
+        bad = (sym_perm < 0)
+        if bad.any():
+            bad_s, bad_mu = np.where(bad)
+            ex_s, ex_mu = int(bad_s[0]), int(bad_mu[0])
+            ex_idx = img_idx[ex_s, ex_mu].tolist()
+            raise RuntimeError(
+                f"compute_centroid_sym_perm: centroid orbit closure "
+                f"failed.  sym {ex_s} maps centroid μ={ex_mu} "
+                f"(at fft_idx {idx[ex_mu].tolist()}) to fft_idx "
+                f"{ex_idx}, which is NOT in the centroid table.  "
+                f"Total failures: {int(bad.sum())} / {n_sym * n_rmu}.  "
+                f"Regenerate centroids with orbit-aware kmeans or fall "
+                f"back to identity-only sym."
+            )
+        # Each row should be a permutation.  Cheap O(n_sym · n_rmu) check.
+        for s in range(n_sym):
+            if np.unique(sym_perm[s]).size != n_rmu:
+                raise RuntimeError(
+                    f"compute_centroid_sym_perm: sym_perm[{s}] is not a "
+                    f"permutation — two distinct centroids map to the "
+                    f"same image under sym {s}.  Likely cause: τ × "
+                    f"fft_grid is not integer, so the rounded image "
+                    f"collides with a different centroid.  Check "
+                    f"``validate_atomic_symmetries`` on the WFN.")
+
+    return sym_perm.astype(np.int32)
+
+

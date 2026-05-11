@@ -581,6 +581,12 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# Band norms for pseudobands normalization (1.0 for deterministic bands)
 	_band_norms = getattr(wfn, 'band_norms', None)
 
+	# IBZ-only writes (default True) are skipped when bispinor mode is
+	# on: ``compute_V_q_bispinor_to_h5`` still iterates full-BZ q's and
+	# reads the charge ζ file at full-BZ offsets.  Once that
+	# orchestrator gains IBZ support, this can flip to ``True`` for
+	# bispinor too.
+	_write_ibz_only_charge = not bool(cfg.bispinor)
 	with timing.section("gw_jax.zeta_fit_chunked"), jax_profile.trace_section("zeta_fit"):
 		peak_bytes = fit_zeta_to_h5(
 			wfn=wfn, sym=sym, meta=meta,
@@ -597,6 +603,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			band_norms=_band_norms,
 			slab_io_backend=cfg.backend.slab_io,
 			gspace_mode=cfg.gspace_mode,
+			write_ibz_only=_write_ibz_only_charge,
 		)
 
 	# Diagnostic: peek at ζ^0 (charge) q=0 max magnitude.
@@ -707,6 +714,10 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					slab_io_backend=cfg.backend.slab_io,
 					gspace_mode=cfg.gspace_mode,
 					vertex_mu_L=mu_L,
+					# TODO(bispinor-ibz): port compute_V_q_bispinor_to_h5
+					# to consume IBZ-only ζ + post-loop unfold, then
+					# drop this opt-out.
+					write_ibz_only=False,
 				)
 			# Diagnostic: peek at ζ q=0 max magnitude for comparison to
 			# agent-B's MoS2 reference (commit 69e8863):
@@ -734,7 +745,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	return zeta_h5_path, mem_est, transverse_wfn_data
 
 
-def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None):
+def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None, sym=None, centroid_indices=None):
 	"""Compute bare Coulomb V_qmunu from zeta HDF5 and write G0 back.
 
 	Returns (V_qmunu, G0) where V_qmunu has shape (nq, μ, μ) (flat-q)
@@ -895,6 +906,11 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 						bare_coulomb_cutoff=vcoul_cutoff_ry,
 						bgw_v_grid_fn=bgw_v_grid_fn,
 						budget_bytes=m_budget,
+						sym=sym,
+						centroid_indices=(
+							np.asarray(jax.device_get(centroid_indices),
+							           dtype=np.int32)
+							if centroid_indices is not None else None),
 					)
 
 	# Write G0 = ζ_μ(G=0) at q=0 back to zeta file via SlabIO's deferred
@@ -1003,7 +1019,8 @@ def prepare_isdf_and_wavefunctions(
 			V_qmunu, G0 = compute_V_q(
 				zeta_path, wfn, meta, mesh_xy, cfg,
 				mem_est=mem_est, print_fn=print0,
-				bgw_v_grid_fn=bgw_v_grid_fn)
+				bgw_v_grid_fn=bgw_v_grid_fn,
+				sym=sym, centroid_indices=centroid_indices)
 
 			enk_full, _ = get_enk_bandrange(
 				wfn, sym, band_slices.full_range,
