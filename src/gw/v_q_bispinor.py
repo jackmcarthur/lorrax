@@ -284,11 +284,6 @@ def compute_V_q_bispinor_to_h5(
 
     # ----- Open output (collective) and write metadata ---------------------
     nq_total = int(np.prod(kgrid))
-    if jax.process_index() == 0 and verbose:
-        print_fn(
-            f"  V_q bispinor: writing {len(UNIQUE_TILES)} unique tiles "
-            f"(CC + 3 TT-diag + 3 TT-off) to {output_h5_path}"
-        )
 
     # First open: write the numeric metadata + truncate any prior file.
     # Per-tile open/close below: kept as a defense-in-depth against any
@@ -329,16 +324,6 @@ def compute_V_q_bispinor_to_h5(
                 mu_L=mu_L, nu_L=nu_L,
             )
 
-            if jax.process_index() == 0 and verbose:
-                kind = ("CC" if (mu_L, nu_L) == (0, 0)
-                        else f"TT[{mu_L},{nu_L}]"
-                        + (" (diag)" if mu_L == nu_L else " (off-diag)"))
-                print_fn(
-                    f"  V_q bispinor tile {tile_idx + 1}/{len(UNIQUE_TILES)}: "
-                    f"{kind}  same_zeta={same_zeta}  "
-                    f"n_rmu_L={n_rmu_L}  n_rmu_R={n_rmu_R}  "
-                    f"write_g0={wants_g0}"
-                )
 
             # === Same primitive as the scalar V_q ============================
             # For all tiles: ``g0_acc=None`` and let the driver auto-allocate
@@ -365,19 +350,6 @@ def compute_V_q_bispinor_to_h5(
                 verbose=verbose,
                 timing_label=f"V_q_bispinor[{mu_L},{nu_L}]",
             )
-
-            # Diagnostic: peek at V[q=0] max magnitude for comparison to
-            # agent-B's MoS2 reference (``cri3_sigma_blowup`` report):
-            # post-fix MoS2 V^{0,0}[q=0] ≈ 7e7, V^{i,i} ≈ 1e6 (transverse
-            # projector + scalar L_q metric).  Uses jnp.max as a fully
-            # replicated scalar reduction so it works across any sharding.
-            try:
-                v0_max = float(jnp.max(jnp.abs(V_acc[0])))
-                if verbose and jax.process_index() == 0:
-                    print_fn(f"    [diag] V^{{{mu_L},{nu_L}}}[q=0] max|V|={v0_max:.3e}")
-            except Exception as exc:
-                if verbose and jax.process_index() == 0:
-                    print_fn(f"    [diag] V^{{{mu_L},{nu_L}}}[q=0] peek failed: {exc}")
 
             # === Stream this tile to disk ====================================
             # ``compute_V_q_tile`` returns V_acc at the PADDED μ extent

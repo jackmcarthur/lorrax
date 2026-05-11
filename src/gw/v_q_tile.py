@@ -970,16 +970,6 @@ def compute_V_q_tile(
     n_mu_blocks_R = int(chooser_choice.get('n_mu_blocks_R',
                                             chooser_choice['n_mu_blocks']))
 
-    if verbose and jax.process_index() == 0:
-        z_kind = 'same ζ' if same_zeta else 'distinct ζ_L/ζ_R'
-        print(f"  V_q tile: mesh={p_x}x{p_y}, {z_kind}, "
-              f"q_chunk={q_chunk}, μ_chunk={mu_chunk} "
-              f"({n_mu_blocks_L}×{n_mu_blocks_R} blocks), "
-              f"aligned={chooser_choice.get('aligned', False)}, "
-              f"N_μ_L={n_rmu_L}, N_μ_R={n_rmu_R}, N_G={n_G_sph}, "
-              f"predicted peak/rank={chooser_choice['per_rank_peak']/1e9:.2f} GB "
-              f"(V_ref+g0_ref={chooser_choice['ref_bytes']/1e9:.2f} GB)")
-
     # Allocate accumulators if caller didn't.
     V_sh_full = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     g0_sh_full = NamedSharding(mesh_xy, P(None, 'x'))
