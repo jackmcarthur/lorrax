@@ -178,7 +178,7 @@ def _aot_full_kernel_peak(
         g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
         zeta_disk_sh = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
         v_per_G_sh = NamedSharding(mesh_xy, P(None, None))
-        phase_sh = NamedSharding(mesh_xy, P(None, None, None, None, None))
+        qvec_sh = NamedSharding(mesh_xy, P(None, None))
         rep = NamedSharding(mesh_xy, P())
         nx, ny, nz = (int(s) for s in fft_grid)
 
@@ -195,21 +195,21 @@ def _aot_full_kernel_peak(
         v_per_G_spec = jax.ShapeDtypeStruct(
             (int(q_chunk), int(n_G_sph)),
             jnp.complex128, sharding=v_per_G_sh)
-        phase_spec = jax.ShapeDtypeStruct(
-            (int(q_chunk), 1, nx, ny, nz),
-            jnp.complex128, sharding=phase_sh)
+        qvec_spec = jax.ShapeDtypeStruct(
+            (int(q_chunk), 3),
+            jnp.float64, sharding=qvec_sh)
         int_spec = jax.ShapeDtypeStruct((), jnp.int32, sharding=rep)
 
         if same_zeta:
             specs = (V_acc_spec, g0_acc_spec,
-                     zeta_L_spec, v_per_G_spec, phase_spec,
+                     zeta_L_spec, v_per_G_spec, qvec_spec,
                      int_spec, int_spec, int_spec)
         else:
             zeta_R_spec = jax.ShapeDtypeStruct(
                 (int(q_chunk), int(n_rtot), int(nu_size)),
                 jnp.complex128, sharding=zeta_disk_sh)
             specs = (V_acc_spec, g0_acc_spec,
-                     zeta_L_spec, zeta_R_spec, v_per_G_spec, phase_spec,
+                     zeta_L_spec, zeta_R_spec, v_per_G_spec, qvec_spec,
                      int_spec, int_spec, int_spec)
 
         compiled = kernel.lower(*specs).compile(
@@ -640,7 +640,7 @@ def _make_V_q_tile_kernel(
     blk_y_sh = NamedSharding(mesh_xy, P(None, 'y', None))
     V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
-    phase_sh = NamedSharding(mesh_xy, P(None, None, None, None, None))  # (Q,1,nx,ny,nz)
+    qvec_sh = NamedSharding(mesh_xy, P(None, None))                       # (Q, 3) — replaced 4D phase_batch
     v_per_G_sh = NamedSharding(mesh_xy, P(None, None))                    # (Q, n_G_sph)
     zeta_disk_sh = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
     rep = NamedSharding(mesh_xy, P())
@@ -663,13 +663,27 @@ def _make_V_q_tile_kernel(
     # No v(K) multiply here — that is applied once on the L side post-
     # gather (see the kernel body below).
     # ------------------------------------------------------------------
-    def _zeta_disk_to_G(zeta_disk, phase_batch):
+    def _zeta_disk_to_G(zeta_disk, qvec_batch_frac):
+        """ζ_q,μ(r) → ζ_q,μ(G) on the sphere, with separable per-q
+        Bloch phase ``exp(-2πi q·r)`` applied before the 3D FFT.
+
+        ``qvec_batch_frac`` is ``(Q, 3)`` fractional q in BGW
+        wrapped-to-(-kgrid/2, kgrid/2) units — the same form the
+        outer driver builds via ``_qvec_wrap`` divided by ``kgrid``
+        (see :func:`common.wfn_transforms.apply_bloch_phase` for the
+        formula).  The 4D ``(Q, 1, nx, ny, nz)`` phase that used to
+        live here is now applied as three 1D-broadcast multiplies —
+        scratch memory drops from ``Q·nx·ny·nz`` to
+        ``Q·(nx+ny+nz)``.
+        """
+        from common.wfn_transforms import apply_bloch_phase
         zeta_mu_r = jax.lax.with_sharding_constraint(
             jnp.transpose(zeta_disk, (0, 2, 1)), blk_xy_sh)
         Q, mu_per_rank, _ = zeta_mu_r.shape
-        zeta_5d = jax.lax.with_sharding_constraint(
-            zeta_mu_r.reshape(Q, mu_per_rank, nx, ny, nz) * phase_batch,
-            blk_xy_5d_sh)
+        zeta_5d = zeta_mu_r.reshape(Q, mu_per_rank, nx, ny, nz)
+        zeta_5d = apply_bloch_phase(
+            zeta_5d, qvec_batch_frac, (nx, ny, nz), sign=-1)
+        zeta_5d = jax.lax.with_sharding_constraint(zeta_5d, blk_xy_5d_sh)
         zeta_box = _local_fftn_3d(zeta_5d)
         zeta_box = jax.lax.with_sharding_constraint(
             zeta_box.reshape(Q, mu_per_rank, n_rtot), blk_xy_sh)
@@ -691,14 +705,14 @@ def _make_V_q_tile_kernel(
     # ------------------------------------------------------------------
     def _kernel_body(V_acc, g0_acc,
                      zeta_L_disk, zeta_R_disk_or_None,
-                     v_per_G_batch, phase_batch,
+                     v_per_G_batch, qvec_batch_frac,
                      q_lo_dyn, mu_lo_dyn, nu_lo_dyn):
-        zeta_L_G, g0_mu = _zeta_disk_to_G(zeta_L_disk, phase_batch)
+        zeta_L_G, g0_mu = _zeta_disk_to_G(zeta_L_disk, qvec_batch_frac)
         if same_zeta:
             zeta_R_G = zeta_L_G                       # static reuse
         else:
             zeta_R_G, _ = _zeta_disk_to_G(
-                zeta_R_disk_or_None, phase_batch)     # second read+FFT
+                zeta_R_disk_or_None, qvec_batch_frac) # second read+FFT
 
         zeta_mu_X = jax.lax.with_sharding_constraint(zeta_L_G, blk_x_sh)
         zeta_nu_Y = jax.lax.with_sharding_constraint(zeta_R_G, blk_y_sh)
@@ -733,16 +747,16 @@ def _make_V_q_tile_kernel(
     if same_zeta:
         @partial(jax.jit,
                  in_shardings=(V_sh, g0_sh, zeta_disk_sh,
-                               v_per_G_sh, phase_sh, rep, rep, rep),
+                               v_per_G_sh, qvec_sh, rep, rep, rep),
                  out_shardings=(V_sh, g0_sh),
                  donate_argnums=(0, 1))
         def _kernel(V_acc, g0_acc,
                     zeta_L_disk,
-                    v_per_G_batch, phase_batch,
+                    v_per_G_batch, qvec_batch_frac,
                     q_lo_dyn, mu_lo_dyn, nu_lo_dyn):
             return _kernel_body(
                 V_acc, g0_acc, zeta_L_disk, None,
-                v_per_G_batch, phase_batch,
+                v_per_G_batch, qvec_batch_frac,
                 q_lo_dyn, mu_lo_dyn, nu_lo_dyn)
     else:
         assert not write_g0, (
@@ -752,16 +766,16 @@ def _make_V_q_tile_kernel(
 
         @partial(jax.jit,
                  in_shardings=(V_sh, g0_sh, zeta_disk_sh, zeta_disk_sh,
-                               v_per_G_sh, phase_sh, rep, rep, rep),
+                               v_per_G_sh, qvec_sh, rep, rep, rep),
                  out_shardings=(V_sh, g0_sh),
                  donate_argnums=(0, 1))
         def _kernel(V_acc, g0_acc,
                     zeta_L_disk, zeta_R_disk,
-                    v_per_G_batch, phase_batch,
+                    v_per_G_batch, qvec_batch_frac,
                     q_lo_dyn, mu_lo_dyn, nu_lo_dyn):
             return _kernel_body(
                 V_acc, g0_acc, zeta_L_disk, zeta_R_disk,
-                v_per_G_batch, phase_batch,
+                v_per_G_batch, qvec_batch_frac,
                 q_lo_dyn, mu_lo_dyn, nu_lo_dyn)
 
     _kernel.zeta_disk_sh = zeta_disk_sh
@@ -953,7 +967,6 @@ def compute_V_q_tile(
     zeta_L_io,
     zeta_R_io=None,
     v_per_G_fn,
-    phase_fn,
     sphere_idx,
     fft_grid: tuple[int, int, int],
     mesh_xy: Mesh,
@@ -989,9 +1002,6 @@ def compute_V_q_tile(
         ``v(q+G)`` (real, ≥ 0) and the math is bit-identical to the old
         symmetric-√v form.  For bispinor V^{μ_L, ν_L} it is
         ``v(K) · t_{μ_L, ν_L}(K)`` with signed transverse-projector ``t``.
-    phase_fn : callable((Q,3) qvec_np) -> jnp.ndarray (Q, 1, nx, ny, nz) c128
-        Per-q FFT-box phase factor ``exp(-2πi q·r)``.  Independent of the
-        v side (factored out so any Coulomb dimensionality plugs in).
     sphere_idx : jax.Array | None
         G-sphere indices into the flat FFT box, or None when no cutoff.
     fft_grid : (nx, ny, nz)
@@ -1195,9 +1205,16 @@ def compute_V_q_tile(
         qvec = np.array([qx, qy, qz], dtype=np.float64)
         return np.where(qvec > kgrid_arr / 2, qvec - kgrid_arr, qvec)
 
-    def _v_phase_batch(qvec_list, pad_to: int):
-        """Build (v_per_G, phase) for a batch of q's, with optional pad
-        and optional BGW vcoul overlay.  Both outputs are jax arrays.
+    def _v_qvec_batch(qvec_list, pad_to: int):
+        """Build ``(v_per_G, qvec_batch_frac)`` for a batch of q's, with
+        optional pad and optional BGW vcoul overlay.
+
+        ``qvec_batch_frac`` is the fractional q-vector ``(Q, 3)`` in
+        BGW wrapped-to-(-nk/2, nk/2) units divided by ``kgrid`` —
+        consumed by :func:`common.wfn_transforms.apply_bloch_phase`
+        (sign=-1) inside the kernel.  The 4D ``(Q, 1, nx, ny, nz)``
+        phase that used to flow through here is gone; the kernel
+        builds it separably from this tiny ``(Q, 3)`` array.
         """
         n_actual = len(qvec_list)
         qvec_np = np.stack([np.asarray(qw, dtype=np.float64)
@@ -1206,10 +1223,11 @@ def compute_V_q_tile(
             pad = np.tile(qvec_np[0:1], (pad_to - n_actual, 1))
             qvec_np = np.concatenate([qvec_np, pad], axis=0)
         v_per_G = v_per_G_fn(qvec_np)        # (Q, n_G_sph) c128
-        phase = phase_fn(qvec_np)            # (Q, 1, nx, ny, nz) c128
         if bgw_v_grid_overlay_fn is not None:
             v_per_G = bgw_v_grid_overlay_fn(qvec_np, v_per_G)
-        return v_per_G, phase
+        # Apply_bloch_phase expects fractional q's (kgrid-units).
+        qvec_frac = qvec_np / kgrid_arr[None, :]
+        return v_per_G, jnp.asarray(qvec_frac)
 
     vq_progress = LoopProgress(
         nq_total, print, title="V_q tile",
@@ -1258,7 +1276,7 @@ def compute_V_q_tile(
             qvecs = [_qvec_wrap(*c) for c in q_batch]
             if _time_stages:
                 _t0 = _time.perf_counter()
-            v_per_G_b, phase_b = _v_phase_batch(qvecs, pad_to=actual)
+            v_per_G_b, qvec_b = _v_qvec_batch(qvecs, pad_to=actual)
             if _time_stages:
                 jax.block_until_ready(v_per_G_b)
                 t_vphase += _time.perf_counter() - _t0
@@ -1287,7 +1305,7 @@ def compute_V_q_tile(
                     zeta_mu = zeta_L_io.read_zeta_G_slab(
                         q_offset=q_flat0, q_count=actual,
                         mu_offset=mu_lo, mu_count=mu_size,
-                        phase_batch=phase_b,
+                        qvec_batch_frac=qvec_b,
                         sphere_idx=sphere_idx,
                         mesh=mesh_xy, valid_mu=mu_valid)
                 else:
@@ -1337,7 +1355,7 @@ def compute_V_q_tile(
                                 _t0 = _time.perf_counter()
                             V_acc, g0_work = kernel(
                                 V_acc, g0_work,
-                                zeta_mu, v_per_G_b, phase_b,
+                                zeta_mu, v_per_G_b, qvec_b,
                                 jnp.int32(q_cursor),
                                 jnp.int32(mu_lo), jnp.int32(nu_lo))
                         if _time_stages:
@@ -1353,7 +1371,7 @@ def compute_V_q_tile(
                             zeta_nu = zeta_R_io.read_zeta_G_slab(
                                 q_offset=q_flat0, q_count=actual,
                                 mu_offset=nu_lo, mu_count=nu_size,
-                                phase_batch=phase_b,
+                                qvec_batch_frac=qvec_b,
                                 sphere_idx=sphere_idx,
                                 mesh=mesh_xy, valid_mu=nu_valid)
                         else:
@@ -1395,7 +1413,7 @@ def compute_V_q_tile(
                                 _t0 = _time.perf_counter()
                             V_acc, g0_work = kernel(
                                 V_acc, g0_work,
-                                zeta_mu, zeta_nu, v_per_G_b, phase_b,
+                                zeta_mu, zeta_nu, v_per_G_b, qvec_b,
                                 jnp.int32(q_cursor),
                                 jnp.int32(mu_lo), jnp.int32(nu_lo))
                         if _time_stages:

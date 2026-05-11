@@ -668,16 +668,12 @@ def compute_all_V_q(
         # (sqrt_v is non-negative real cast to c128).
         return sqrt_v_batch * sqrt_v_batch
 
-    def phase_fn(qvec_np_batch):
-        """Pre-stack qvec batch → vmap → (Q, 1, nx, ny, nz) c128 phase.
-
-        ``get_sqrt_v_and_phase`` returns phase shaped (1, nx, ny, nz);
-        vmap adds the leading Q axis, giving (Q, 1, nx, ny, nz) — the
-        layout the kernel expects.
-        """
-        qvec_arr = jnp.asarray(qvec_np_batch, dtype=jnp.float64)
-        _, phase_batch = _vmapped_sqrt_v_phase(qvec_arr)
-        return phase_batch
+    # ``phase_fn`` is gone — the V_q kernel now builds the per-q FFT-box
+    # phase ``exp(-2πi q·r)`` separably inside ``_zeta_disk_to_G``/
+    # ``zeta_reader._do_disk_to_G`` via
+    # ``common.wfn_transforms.apply_bloch_phase`` (one source of truth).
+    # The qvec batch is threaded through directly as a tiny (Q, 3)
+    # array; no more 4D ``(Q, 1, nx, ny, nz)`` phase materialisation.
 
     # Optional BGW vcoul overlay — host-side replacement of native v(q+G)
     # with BGW's MC-averaged values for byte-reproducible comparison.
@@ -721,7 +717,6 @@ def compute_all_V_q(
         zeta_L_io=zeta_io,
         zeta_R_io=None,                  # same_zeta=True (V^{0,0})
         v_per_G_fn=v_per_G_fn,
-        phase_fn=phase_fn,
         sphere_idx=sphere_idx,
         fft_grid=fft_grid,
         mesh_xy=mesh_xy,

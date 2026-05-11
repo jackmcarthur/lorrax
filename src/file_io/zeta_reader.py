@@ -215,7 +215,7 @@ class ZetaReader:
         q_count: int,
         mu_offset: int,
         mu_count: int,
-        phase_batch: jax.Array,
+        qvec_batch_frac: jax.Array,
         sphere_idx: jax.Array | None,
         mesh: Mesh | None = None,
         valid_mu: int | None = None,
@@ -226,7 +226,8 @@ class ZetaReader:
         1. Read r-space slab ``(Q, n_rtot, μ)`` via :class:`SlabIO`
            (same async-dispatch semantics as today).
         2. Transpose to ``(Q, μ, n_rtot)``; reshape to
-           ``(Q, μ, nx, ny, nz)``; multiply by per-q phase.
+           ``(Q, μ, nx, ny, nz)``; apply separable per-q Bloch phase
+           ``exp(-2πi q·r)`` via :func:`common.wfn_transforms.apply_bloch_phase`.
         3. 3D FFT over the spatial axes (μ-sharded).
         4. Sphere gather to ``(Q, μ/p_prod, n_G_sph)``.
 
@@ -244,9 +245,13 @@ class ZetaReader:
             index.
         mu_offset, mu_count : int
             Slab range along the μ axis (centroid axis).
-        phase_batch : jax.Array
-            ``(Q, 1, nx, ny, nz)`` complex128 — the per-q FFT-box
-            phase factor.  Replicated.
+        qvec_batch_frac : jax.Array
+            ``(Q, 3)`` fractional q-vectors in kgrid units (BGW
+            wrapped-to-(-nk/2, nk/2) divided by kgrid).  Used to apply
+            the per-q FFT-box phase separably.  Replaces the legacy
+            ``(Q, 1, nx, ny, nz)`` ``phase_batch`` argument — the 4D
+            phase is gone; scratch memory drops from ``Q·nx·ny·nz``
+            to ``Q·(nx+ny+nz)``.
         sphere_idx : jax.Array | None
             Flat-FFT indices that define the G-sphere (or None to
             keep the full FFT box).
@@ -266,9 +271,9 @@ class ZetaReader:
             mesh=mesh, valid_mu=valid_mu,
         )
 
-        # Step 2-4 — FFT + sphere gather.  Implementation matches
-        # ``_zeta_disk_to_G`` in ``gw.v_q_tile`` (extracted here so the
-        # V_q kernel can drop its in-kernel FFT).
+        # Step 2-4 — FFT + sphere gather.  Same algorithm as the
+        # ``_zeta_disk_to_G`` helper inside ``gw.v_q_tile``; both share
+        # the unified separable-phase application.
         nx, ny, nz = (int(s) for s in self.fft_grid)
         n_rtot = nx * ny * nz
         if sphere_idx is not None:
@@ -279,7 +284,7 @@ class ZetaReader:
                      if sphere_idx is not None else None)
 
         return _do_disk_to_G(
-            zeta_disk, phase_batch,
+            zeta_disk, qvec_batch_frac,
             mesh_xy=mesh, fft_shape=(nx, ny, nz),
             n_G_sph=n_G_sph, sphere_idx=sphere_jx,
         )
@@ -295,20 +300,24 @@ _disk_to_G_cache: dict = {}
 
 def _do_disk_to_G(
     zeta_disk: jax.Array,
-    phase_batch: jax.Array,
+    qvec_batch_frac: jax.Array,
     *,
     mesh_xy: Mesh,
     fft_shape: tuple[int, int, int],
     n_G_sph: int,
     sphere_idx: jax.Array | None,
 ) -> jax.Array:
-    """r-space ζ slab + per-q phase → G-flat ζ (FFT + sphere gather).
+    """r-space ζ slab + per-q fractional q-vec → G-flat ζ.
 
-    Cached by ``(mesh_xy, shape, n_G_sph, sphere_idx)`` — same surface
-    as ``_make_V_q_tile_kernel``'s internal helper but pulled out as a
-    standalone JIT so the V_q kernel doesn't have to import it inline.
+    Pipeline: transpose → reshape to ``(Q, μ, nx, ny, nz)`` → apply
+    separable per-q Bloch phase ``exp(-2πi q·r)`` via
+    :func:`common.wfn_transforms.apply_bloch_phase` → 3D FFT (μ-sharded)
+    → sphere gather.
+
+    Cached by ``(mesh_xy, shape, n_G_sph, sphere_idx)``.
     """
     from common.fft_helpers import make_sharded_fftn_3d
+    from common.wfn_transforms import apply_bloch_phase
 
     nx, ny, nz = (int(s) for s in fft_shape)
     n_rtot = nx * ny * nz
@@ -330,21 +339,22 @@ def _do_disk_to_G(
         local_fftn = make_sharded_fftn_3d(
             mesh_xy, P(None, ('x', 'y'), None, None, None),
             P(None, ('x', 'y'), None, None, None))
-        phase_sh = NamedSharding(mesh_xy, P(None, None, None, None, None))
+        qvec_sh = NamedSharding(mesh_xy, P(None, None))
         zeta_disk_sh = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
 
         @partial(
             jax.jit,
-            in_shardings=(zeta_disk_sh, phase_sh),
+            in_shardings=(zeta_disk_sh, qvec_sh),
             out_shardings=blk_xy_sh,
         )
-        def _f(z, ph):
+        def _f(z, qvec_frac):
             # (Q, n_rtot, mu) → (Q, mu, n_rtot) → (Q, mu, nx, ny, nz)
             z = jax.lax.with_sharding_constraint(
                 jnp.transpose(z, (0, 2, 1)), blk_xy_sh)
             Qd, mu_d, _ = z.shape
-            z5 = jax.lax.with_sharding_constraint(
-                z.reshape(Qd, mu_d, nx, ny, nz) * ph, blk_xy_5d_sh)
+            z5 = z.reshape(Qd, mu_d, nx, ny, nz)
+            z5 = apply_bloch_phase(z5, qvec_frac, (nx, ny, nz), sign=-1)
+            z5 = jax.lax.with_sharding_constraint(z5, blk_xy_5d_sh)
             box = local_fftn(z5)
             box = jax.lax.with_sharding_constraint(
                 box.reshape(Qd, mu_d, n_rtot), blk_xy_sh)
@@ -357,7 +367,7 @@ def _do_disk_to_G(
         _disk_to_G_cache[key] = _f
         fn = _f
 
-    return fn(zeta_disk, phase_batch)
+    return fn(zeta_disk, qvec_batch_frac)
 
 
 __all__ = ['ZetaReader']

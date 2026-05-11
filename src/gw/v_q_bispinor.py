@@ -277,10 +277,10 @@ def compute_V_q_bispinor_to_h5(
         sqrt_v_batch, _ = _vmapped_sqrt_v_phase(qvec_arr_jax)
         return sqrt_v_batch * sqrt_v_batch              # = v(K)
 
-    def phase_fn(qvec_np_batch):
-        qvec_arr = jnp.asarray(qvec_np_batch, dtype=jnp.float64)
-        _, phase_batch = _vmapped_sqrt_v_phase(qvec_arr)
-        return phase_batch
+    # ``phase_fn`` is gone — see ``compute_V_q_tile`` docstring.  The
+    # per-q FFT-box phase ``exp(-2πi q·r)`` is applied separably by
+    # ``apply_bloch_phase`` inside ``_zeta_disk_to_G`` /
+    # ``zeta_reader._do_disk_to_G``.
 
     # ----- Open output (collective) and write metadata ---------------------
     nq_total = int(np.prod(kgrid))
@@ -335,7 +335,6 @@ def compute_V_q_bispinor_to_h5(
                 zeta_L_io=zeta_L,
                 zeta_R_io=None if same_zeta else zeta_R,
                 v_per_G_fn=v_per_G_fn,
-                phase_fn=phase_fn,
                 sphere_idx=sphere_idx,
                 fft_grid=fft_grid,
                 mesh_xy=mesh_xy,

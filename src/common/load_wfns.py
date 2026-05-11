@@ -281,26 +281,21 @@ def get_sharded_wfns_rchunk_slice(
     
     if cache_key not in _rchunk_slice_cache:
         out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
-        
+
         local_ifftn = make_sharded_ifftn_3d(
             mesh_xy,
             P(None, ('x', 'y'), None, None, None, None),
             P(None, ('x', 'y'), None, None, None, None)
         )
-        
+
         # No intermediate replicated shard — use two-step all-gather + all-to-all
         # to avoid materializing the full array on every device.
-        
-        # Pre-compute phase grids and kvecs ONCE in closure
-        fx_cached = jnp.arange(nx, dtype=jnp.float64)[None, :, None, None] / nx
-        fy_cached = jnp.arange(ny, dtype=jnp.float64)[None, None, :, None] / ny
-        fz_cached = jnp.arange(nz, dtype=jnp.float64)[None, None, None, :] / nz
         kvecs_cached = jnp.asarray(kvecs_frac)
         n_rtot_cached = n_rtot
-        
+
         # r_chunk_size is static (from cache key), r_start is dynamic
         r_chunk_size_static = r_chunk_size
-        
+
         band_shard = P(None, ('x', 'y'), None, None)
 
         @partial(jax.jit, static_argnames=('nb_static',))
@@ -308,15 +303,10 @@ def get_sharded_wfns_rchunk_slice(
             """FFT + phase + r-slice. Returns band-sharded r-chunk.
             Resharding happens in a SEPARATE call to prevent XLA from
             rematerializing the FFT to satisfy the output layout."""
+            from common.wfn_transforms import apply_bloch_phase
             psi_r = local_ifftn(psi_G)
-            phase_spatial = jnp.exp(
-                2j * jnp.pi * (
-                    kvecs_cached[:, 0:1, None, None] * fx_cached
-                    + kvecs_cached[:, 1:2, None, None] * fy_cached
-                    + kvecs_cached[:, 2:3, None, None] * fz_cached
-                )
-            )
-            psi_r = psi_r * phase_spatial[:, None, None, :, :, :]
+            psi_r = apply_bloch_phase(
+                psi_r, kvecs_cached, (nx, ny, nz))
             psi_r = psi_r * jnp.sqrt(n_rtot_cached)
 
             # Keep padded band count (divisible by mesh size)

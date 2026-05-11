@@ -217,6 +217,36 @@ def test_pad_rows_dont_leak_into_box(synth_loader):
 # Shape sanity for non-trivial nspinor and uneven k counts
 # ---------------------------------------------------------------------------
 
+def test_apply_bloch_phase_matches_4d_reference():
+    """The separable 1D-factor application of exp(2πi k·r) must
+    byte-match an explicit 4D-construction reference."""
+    from common.wfn_transforms import apply_bloch_phase
+
+    rng = np.random.default_rng(7)
+    n_k, nb, ns = 3, 2, 2
+    nx, ny, nz = 5, 7, 4
+    psi_r_box = (rng.standard_normal((n_k, nb, ns, nx, ny, nz))
+                 + 1j * rng.standard_normal((n_k, nb, ns, nx, ny, nz)))
+    kvecs = rng.standard_normal((n_k, 3))
+
+    # Reference: explicit 4D phase (the implementation we removed).
+    fx = np.arange(nx) / nx
+    fy = np.arange(ny) / ny
+    fz = np.arange(nz) / nz
+    phase4d = np.exp(
+        2j * np.pi * (
+            kvecs[:, 0, None, None, None] * fx[None, :, None, None]
+            + kvecs[:, 1, None, None, None] * fy[None, None, :, None]
+            + kvecs[:, 2, None, None, None] * fz[None, None, None, :]
+        )
+    )
+    expected = psi_r_box * phase4d[:, None, None, :, :, :]
+
+    got = np.asarray(apply_bloch_phase(
+        jnp.asarray(psi_r_box), jnp.asarray(kvecs), (nx, ny, nz)))
+    np.testing.assert_allclose(got, expected, atol=1e-13, rtol=0)
+
+
 def test_to_box_shape(synth_loader):
     psi = synth_loader.load(bands=(0, 3), k="full_bz")
     g_index = synth_loader.box_index(k="full_bz")
