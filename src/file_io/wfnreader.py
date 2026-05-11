@@ -11,37 +11,58 @@
 import h5py as h5
 import numpy as np
 
+from .mf_header import read_mf_header_from_file
+
 class WFNReader:
     def __init__(self, filename):
         """Initialize WFNReader with WFN file."""
         self._filename = filename
         self._file = h5.File(filename, 'r')
-        
-        # Read all header information from mf_header
-        # Version and flavor
-        self.version = self._file['mf_header/versionnumber'][()]
-        self.flavor = self._file['mf_header/flavor'][()]
-        
-        # Kpoints group
-        self.nspin = self._file['mf_header/kpoints/nspin'][()]
-        self.nspinor = self._file['mf_header/kpoints/nspinor'][()]
+
+        # mf_header — read via the shared module so the on-disk schema
+        # lives in one place (file_io/mf_header.py).  Every attribute
+        # this class historically exposed is mirrored 1:1 from
+        # :class:`MfHeader`.
+        hdr = read_mf_header_from_file(self._file)
+        self.version = hdr.version
+        self.flavor = hdr.flavor
         # Current workflows assume two-component Pauli spinors.  Support for the
         # four-component formalism under development will hook in here once the
         # wavefunction files expose the extra components.  Metadata related to
         # CTSP grids will also be parsed here when available in future files.
-        self.nkpts = self._file['mf_header/kpoints/nrk'][()]  # nrk = number of k-points
-        self.nbands = self._file['mf_header/kpoints/mnband'][()]  # mnband = number of bands
-        self.ngkmax = self._file['mf_header/kpoints/ngkmax'][()]
-        self.ecutwfc = self._file['mf_header/kpoints/ecutwfc'][()]
-        self.kgrid = self._file['mf_header/kpoints/kgrid'][:]
-        self.shift = self._file['mf_header/kpoints/shift'][:]
-        self.ngk = self._file['mf_header/kpoints/ngk'][:]
-        self.ifmin = self._file['mf_header/kpoints/ifmin'][:]
-        self.ifmax = self._file['mf_header/kpoints/ifmax'][:]
-        self.kweights = self._file['mf_header/kpoints/w'][:]
-        self.kpoints = self._file['mf_header/kpoints/rk'][:]
-        self.energies = self._file['mf_header/kpoints/el'][:]
-        self.occs = self._file['mf_header/kpoints/occ'][:]
+        self.nspin = hdr.nspin
+        self.nspinor = hdr.nspinor
+        self.nkpts = hdr.nkpts
+        self.nbands = hdr.nbands
+        self.ngkmax = hdr.ngkmax
+        self.ecutwfc = hdr.ecutwfc
+        self.kgrid = hdr.kgrid
+        self.shift = hdr.shift
+        self.ngk = hdr.ngk
+        self.ifmin = hdr.ifmin
+        self.ifmax = hdr.ifmax
+        self.kweights = hdr.kweights
+        self.kpoints = hdr.kpoints
+        self.energies = hdr.energies
+        self.occs = hdr.occs
+        self.ng = hdr.ng
+        self.ecutrho = hdr.ecutrho
+        self.fft_grid = hdr.fft_grid
+        self.ntran = hdr.ntran
+        self.cell_symmetry = hdr.cell_symmetry
+        self.sym_matrices = hdr.sym_matrices
+        self.translations = hdr.translations
+        self.cell_volume = hdr.cell_volume
+        self.recip_volume = hdr.recip_volume
+        self.alat = hdr.alat
+        self.blat = hdr.blat
+        self.nat = hdr.nat
+        self.avec = hdr.avec
+        self.bvec = hdr.bvec
+        self.adot = hdr.adot
+        self.bdot = hdr.bdot
+        self.atom_types = hdr.atom_types
+        self.atom_positions = hdr.atom_positions
 
         # Number of occupied bands (ifmax is 1-based occupied-band index in WFN files).
         if np.size(self.ifmax) > 0:
@@ -58,41 +79,14 @@ class WFNReader:
         else:
             self.cbm = float(self.vbm)
             self.efermi = float(self.vbm)
-        
-        # Gspace group
-        self.ng = self._file['mf_header/gspace/ng'][()]
-        self.ecutrho = self._file['mf_header/gspace/ecutrho'][()]
-        self.fft_grid = self._file['mf_header/gspace/FFTgrid'][:]
-        self.fft_grid = np.asarray(self.fft_grid, dtype=np.int32)
 
+        # /wfns/* — not part of mf_header; WFN-specific datasets.
         self.gvecs = self._file['wfns/gvecs'][()]
         self.coeffs = self._file['wfns/coeffs'][:]
-        
-        # Symmetry group
-        self.ntran = self._file['mf_header/symmetry/ntran'][()]
-        self.cell_symmetry = self._file['mf_header/symmetry/cell_symmetry'][()]
-        self.sym_matrices = self._file['mf_header/symmetry/mtrx'][:]
-        self.translations = self._file['mf_header/symmetry/tnp'][:]
-        
-        # preprocessing sym_matrices, which always have length 48 and fortran order
-        #self.sym_matrices = np.asarray(self.sym_matrices[:self.ntran])#.transpose(0,2,1))
 
-        # Crystal group
-        self.cell_volume = self._file['mf_header/crystal/celvol'][()]
-        self.recip_volume = self._file['mf_header/crystal/recvol'][()]
-        self.alat = self._file['mf_header/crystal/alat'][()]
-        self.blat = self._file['mf_header/crystal/blat'][()]
-        self.nat = self._file['mf_header/crystal/nat'][()]
-        self.avec = self._file['mf_header/crystal/avec'][:]
-        self.bvec = self._file['mf_header/crystal/bvec'][:]
-        self.adot = self._file['mf_header/crystal/adot'][:]
-        self.bdot = self._file['mf_header/crystal/bdot'][:]
-        self.atom_types = self._file['mf_header/crystal/atyp'][:]
-        self.atom_positions = self._file['mf_header/crystal/apos'][:]
         # this is one correct way to get the atomic positions in crystal coordinates (they're in units of alat, cartesian)
         self.atom_crys = np.einsum('ij,kj->ki',np.linalg.inv(self.avec).T, self.atom_positions)
 
-        
         # Calculate k-point starts
         self.kpt_starts = np.zeros(self.nkpts, dtype=np.int64)
         for ik in range(1, self.nkpts):

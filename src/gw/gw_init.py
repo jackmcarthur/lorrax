@@ -603,8 +603,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	try:
 		import h5py
 		with h5py.File(zeta_h5_path, 'r') as f:
-			dsname = next(iter(f.keys()))
-			arr0 = f[dsname][0]
+			arr0 = f['zeta_q'][0]
 			print_fn(f"  [diag] ζ^{{μ_L=0}} q=0: max|ζ|={float(np.abs(arr0).max()):.3e}, "
 			         f"L2={float(np.sqrt((np.abs(arr0)**2).sum())):.3e}")
 	except Exception as exc:
@@ -715,8 +714,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			try:
 				import h5py
 				with h5py.File(zeta_mu_path, 'r') as f:
-					dsname = next(iter(f.keys()))
-					arr0 = f[dsname][0]
+					arr0 = f['zeta_q'][0]
 					print_fn(f"  [diag] ζ^{{μ_L={mu_L}}} q=0: max|ζ|={float(np.abs(arr0).max()):.3e}, "
 					         f"L2={float(np.sqrt((np.abs(arr0)**2).sum())):.3e}")
 			except Exception as exc:

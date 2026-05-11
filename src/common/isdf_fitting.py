@@ -1641,7 +1641,67 @@ def fit_zeta_to_h5(
         gc.collect()
         jax.clear_caches()  # Clear JAX function caches that may hold array refs
 
-    # ========== STEP 4: Create HDF5 file ==========
+    # ========== STEP 4a: Write mf_header + isdf_header (rank 0) ==========
+    # ``zeta_q.h5`` carries the BGW-style ``mf_header`` verbatim from
+    # the source WFN so any downstream consumer (the new
+    # :class:`file_io.zeta_reader.ZetaReader`, or anything else that
+    # speaks the WFN.h5 header) sees the same crystal / k-grid / G-grid
+    # / symmetry view.  ``isdf_header`` holds ζ-specific metadata only
+    # — centroids in FFT-grid + fractional coords, density label,
+    # ``vertex_mu_L``.  Everything sym-derivable (q-IBZ list, centroid
+    # orbit permutation, G-sphere) is rebuilt at read time via
+    # ``SymMaps`` + ``orbit_syms`` and is *not* stored.
+    #
+    # Sequence: rank 0 pre-stripes the file, writes both header groups
+    # in mode='w' (truncate), closes.  Then SlabIO re-opens with
+    # mode='a' so the headers survive and ``create_dataset('zeta_q')``
+    # appends rather than truncates.
+    from file_io.slab_io import SlabIO
+    from file_io.mf_header import copy_mf_header
+    from file_io.isdf_header import IsdfHeader, write_isdf_header
+    from file_io._slab_io_ffi import _lustre_prestripe
+
+    _wfn_src_path = getattr(wfn, '_filename', None)
+    if _wfn_src_path is None:
+        raise ValueError(
+            "fit_zeta_to_h5: wfn must expose '_filename' (the source "
+            "WFN.h5 path) so mf_header can be copied verbatim into "
+            "zeta_q.h5.")
+
+    # Centroid FFT-grid indices for the isdf_header.  ``centroid_indices``
+    # may be a jax.Array on device; pull to host as int32 (n_rmu, 3).
+    _cent_idx_np = np.asarray(jax.device_get(centroid_indices),
+                              dtype=np.int32)
+    if _cent_idx_np.shape != (n_rmu, 3):
+        raise ValueError(
+            f"fit_zeta_to_h5: centroid_indices has shape "
+            f"{_cent_idx_np.shape}, expected ({n_rmu}, 3).")
+    _density_label = 'scalar' if int(vertex_mu_L) == 0 else 'current'
+    _isdf_hdr = IsdfHeader.build(
+        r_mu_fft_idx=_cent_idx_np,
+        fft_grid=meta.fft_grid,
+        density=_density_label,
+        vertex_mu_L=int(vertex_mu_L),
+    )
+
+    with timing.section("zeta_fit.write_headers"):
+        if jax.process_index() == 0:
+            # Pre-stripe the file (delete + lfs setstripe).  Idempotent
+            # no-op on non-Lustre filesystems.  Must happen before any
+            # h5py create so the stripe layout survives ``H5Fcreate``.
+            stripe_count = int(
+                os.environ.get("LORRAX_PHDF5_STRIPE_COUNT", "16"))
+            stripe_size = os.environ.get(
+                "LORRAX_PHDF5_STRIPE_SIZE_FS", "4M")
+            _lustre_prestripe(output_file, stripe_count=stripe_count,
+                              stripe_size=stripe_size)
+            # Create file with mf_header, then append isdf_header.
+            copy_mf_header(_wfn_src_path, output_file, dst_mode='w')
+            write_isdf_header(output_file, _isdf_hdr, mode='a')
+        jax.experimental.multihost_utils.sync_global_devices(
+            "zeta_fit_headers_written")
+
+    # ========== STEP 4b: SlabIO appends zeta_q to the pre-created file ==========
     # zeta_q is stored flat-q: shape (nq, n_rmu, n_rtot) with
     # q_flat = qx*nqy*nqz + qy*nqz + qz.  Flat-q is the ongoing
     # convention across LORRAX; see file_io.slab_io docs.  Chunk by
@@ -1653,7 +1713,11 @@ def fit_zeta_to_h5(
     # allgather backend doesn't need a long-lived handle (rank 0 writes
     # from a Python worker using plain h5py) so we keep the old
     # create-then-reopen pattern for that path.
-    from file_io.slab_io import SlabIO
+    #
+    # mode='a' (not 'w') so the pre-written mf_header + isdf_header
+    # are preserved.  SlabIO's FFI prestripe step is skipped on 'a'
+    # — we already striped above.
+    #
     # Dataset layout ``(nq, n_rtot, n_rmu)`` — NOT ``(nq, n_rmu, n_rtot)``.
     # Rationale: per-r-chunk writes span the full innermost axis (n_rmu)
     # under this layout, so each ``(q, r)`` row is contiguous on disk.
@@ -1667,7 +1731,7 @@ def fit_zeta_to_h5(
     # (n_rmu, n_rtot) expectation — ~50 µs per q, negligible.
     with timing.section("zeta_fit.open_file"):
         if use_ffi_io:
-            zeta_io = SlabIO(output_file, mode='w', mesh=mesh_xy,
+            zeta_io = SlabIO(output_file, mode='a', mesh=mesh_xy,
                              backend=slab_io_backend)
             zeta_io.create_dataset(
                 'zeta_q',
@@ -1676,7 +1740,7 @@ def fit_zeta_to_h5(
                 chunks=(1, n_rchunk, n_rmu),
             )
         else:
-            with SlabIO(output_file, mode='w', mesh=mesh_xy,
+            with SlabIO(output_file, mode='a', mesh=mesh_xy,
                         backend=slab_io_backend) as _zeta_create_io:
                 _zeta_create_io.create_dataset(
                     'zeta_q',
