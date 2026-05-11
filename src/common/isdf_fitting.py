@@ -1110,8 +1110,6 @@ def _make_fit_one_rchunk_kernel(
     band-chunk pair-density streaming loop (Python-unrolled at trace),
     the ZCT, the Z_q→Z_col reshard, and the Cholesky solve.
     """
-    from .load_wfns import get_sharded_wfns_rchunk_slice
-
     nk_tot = meta.nk_tot
     # In-memory shapes throughout this kernel use the PADDED μ extent.
     # ψ enters at padded (Phase 3a's load_centroids contract); all
