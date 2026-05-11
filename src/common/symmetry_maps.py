@@ -41,6 +41,7 @@ class SymMaps:
             # Trivial identity-only symmetry path
             self.sym_matrices = np.eye(3, dtype=np.int32)[None, :, :]
             self.sym_mats_k = self.sym_matrices.transpose(0, 2, 1).copy()
+            self.translations = np.zeros((1, 3), dtype=np.float64)
 
             # In no-symmetry case, unfolded grid equals irreducible grid
             self.unfolded_kpts = np.asarray(wfn.kpoints, dtype=float)
@@ -109,6 +110,13 @@ class SymMaps:
 
         self.sym_matrices = wfn.sym_matrices[:wfn.ntran] # these apply to real space coords as sym_matrices[i] @ [rx,ry,rz]
         self.sym_mats_k = self.sym_matrices[:wfn.ntran].transpose(0,2,1).copy()  # these apply to k-points as sym_mats_k[i] @ [kx,ky,kz]
+        # BGW non-symmorphic translations (``tnp``).  Carried so
+        # downstream callers (orbit-aware centroid sym perm, q-IBZ
+        # unfold) don't need to re-thread the WFNReader through every
+        # API.  Slice to ``[:ntran]`` to match ``sym_matrices`` —
+        # legacy WFN files pad ``tnp`` to length 48.
+        self.translations = np.asarray(
+            wfn.translations[:wfn.ntran], dtype=np.float64)
         
         # Add time-reversal symmetry (k → -k) combined with each spatial symmetry
         # This is needed because QE uses time-reversal to reduce k-points, but doesn't

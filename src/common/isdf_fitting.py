@@ -1667,10 +1667,12 @@ def fit_zeta_to_h5(
             _cent_idx_for_check = np.asarray(
                 jax.device_get(centroid_indices), dtype=np.int32)
             _ntran_check = int(np.asarray(sym.sym_matrices).shape[0])
+            # ``sym.sym_matrices`` holds the spatial ops; the fractional
+            # translations live on WFNReader (BGW WFN.h5 layout).
             _check_perm(
                 _cent_idx_for_check,
                 sym_matrices=np.asarray(sym.sym_matrices[:_ntran_check]),
-                translations=np.asarray(sym.translations[:_ntran_check]),
+                translations=np.asarray(wfn.translations[:_ntran_check]),
                 fft_grid=np.asarray(meta.fft_grid, dtype=np.int32),
             )
         except RuntimeError as _exc:
