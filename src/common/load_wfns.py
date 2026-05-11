@@ -65,14 +65,26 @@ def load_kpoint_fftbox(wfn, sym, meta, k_idx, nb):
     """Load a single k-point's wavefunction into the FFT box on GPU.
 
     Returns jax array of shape (nb, nspinor, nx, ny, nz), ~0.55 GiB for 12x12.
+
+    Migrated to :class:`file_io.wfn_loader.WfnLoader` + ``to_box``.  ``sym``
+    is unused (the loader's full-BZ unfold is internal to ``load(k=[k_idx])``);
+    kept in the signature for caller-API back-compat.
     """
-    nx, ny, nz = meta.fft_grid
-    band_indices = np.arange(nb)
-    gvecs_k = np.asarray(sym.get_gvecs_kfull(wfn, k_idx))
-    cnk = sym.get_cnk_fullzone_batch(wfn, band_indices, k_idx)
-    psi = np.zeros((nb, meta.nspinor, nx, ny, nz), dtype=np.complex128)
-    psi[:, :meta.nspinor_wfnfile, gvecs_k[:, 0], gvecs_k[:, 1], gvecs_k[:, 2]] = cnk
-    return jnp.asarray(psi)
+    del sym
+    from file_io.wfn_loader import WfnLoader
+    from common.wfn_transforms import to_box
+
+    with WfnLoader(wfn._filename) as loader:
+        psi = loader.load(bands=(0, int(nb)), k=[int(k_idx)],
+                          sharding=None)               # (1, nb, nspinor_wfn, ngkmax)
+        # Pad nspinor to meta.nspinor (e.g. wfn nspinor=2 but caller wants
+        # bispinor 4-spinor zero-padded for downstream slot alignment).
+        if int(meta.nspinor) > int(loader.nspinor):
+            ns_pad = int(meta.nspinor) - int(loader.nspinor)
+            psi = jnp.pad(psi, ((0, 0), (0, 0), (0, ns_pad), (0, 0)))
+        psi_box = to_box(psi, loader.box_index(k=[int(k_idx)]),
+                          tuple(int(s) for s in meta.fft_grid))
+        return psi_box[0]                                # strip the singleton k-axis
 
 
 def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, nspinor=2):
