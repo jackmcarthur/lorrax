@@ -32,7 +32,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
 
-from file_io import WFNReader
+from file_io import WfnLoader as WFNReader
 from common import symmetry_maps, Meta
 from common.load_wfns import read_Gvecs_to_devices
 from file_io.qe_save_reader import CrystalData

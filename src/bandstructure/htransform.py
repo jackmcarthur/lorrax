@@ -18,7 +18,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 from functools import partial
 
-from file_io import WFNReader
+from file_io import WfnLoader as WFNReader
 from common import symmetry_maps
 from common import Meta
 from common.load_wfns import (

@@ -393,9 +393,8 @@ def build_psi_G_store(
     ``mf_header``.
     """
     del sym
-    from file_io.wfn_loader import WfnLoader
-
-    loader = WfnLoader(wfn._filename, mesh=mesh_xy)
+    loader = wfn  # reuse top-level WfnLoader; opening a second one would
+                  # re-slurp wfns/coeffs into host RAM.
     if mode == "host_cache":
         return HostPsiGStore(
             loader=loader, mesh_xy=mesh_xy,

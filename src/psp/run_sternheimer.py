@@ -64,7 +64,7 @@ init_jax_distributed()
 
 from common import Meta, symmetry_maps
 from common.load_wfns import load_kpoint_fftbox
-from file_io import WFNReader
+from file_io import WfnLoader as WFNReader
 from psp.dft_operators import setup_H_k_from_kvec
 from psp.h_dft import make_apply_H
 from psp.pseudos import load_pseudopotentials

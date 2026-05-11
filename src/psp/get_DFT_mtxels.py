@@ -65,7 +65,7 @@ except ImportError:
     _sys.path.append(str(_Path(__file__).resolve().parents[2]))  # .../src
     from psp.upf.normalize import normalize_dataclass
     from psp.upf.load_upf import load_upf
-    from file_io import WFNReader
+    from file_io import WfnLoader as WFNReader
     from common import symmetry_maps
     from common.load_wfns import read_Gvecs_to_devices
     from common import Meta

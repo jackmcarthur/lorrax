@@ -79,6 +79,7 @@ class WfnLoader:
         backend: Literal["auto", "eager", "phdf5"] = "auto",
     ) -> None:
         self._path = str(path)
+        self._filename = self._path  # legacy WFNReader compat
         self._mesh = mesh
 
         if backend == "auto":
@@ -134,6 +135,25 @@ class WfnLoader:
         self.bdot = hdr.bdot
         self.atom_types = hdr.atom_types
         self.atom_positions = hdr.atom_positions
+        # Cartesian-→-crystal: same expression legacy WFNReader exposed.
+        self.atom_crys = np.einsum(
+            'ij,kj->ki', np.linalg.inv(self.avec).T, self.atom_positions)
+
+        # Derived band-fill metadata — same names WFNReader exposed.
+        # ``ifmax`` is the 1-based index of the highest occupied band.
+        if np.size(self.ifmax) > 0:
+            self.nelec = int(np.max(self.ifmax))
+        else:
+            self.nelec = int(np.sum(self.occs[0, 0] > 0.5))
+        _nb = int(self.energies.shape[-1])
+        _occ_idx = max(0, min(self.nelec - 1, _nb - 1))
+        self.vbm = float(np.max(self.energies[:, :, _occ_idx]))
+        if _occ_idx + 1 < _nb:
+            self.cbm = float(np.min(self.energies[:, :, _occ_idx + 1]))
+            self.efermi = 0.5 * (self.vbm + self.cbm)
+        else:
+            self.cbm = float(self.vbm)
+            self.efermi = float(self.vbm)
 
         # Eager-backend state: slurp wfns/* into host RAM.  Same memory
         # behaviour as the legacy WFNReader.

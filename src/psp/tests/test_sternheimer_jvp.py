@@ -46,7 +46,7 @@ import jax.numpy as jnp
 
 from common import Meta, symmetry_maps
 from common.load_wfns import load_kpoint_fftbox
-from file_io import WFNReader
+from file_io import WfnLoader as WFNReader
 from psp.dft_operators import setup_H_k_from_kvec
 from psp.pseudos import load_pseudopotentials
 from psp.run_sternheimer import (

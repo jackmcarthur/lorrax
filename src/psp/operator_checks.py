@@ -24,7 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from file_io import WFNReader
+from file_io import WfnLoader as WFNReader
 
 
 @dataclass(frozen=True)

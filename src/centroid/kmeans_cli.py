@@ -21,7 +21,7 @@ from jax.sharding import Mesh
 from runtime import init_jax_distributed
 init_jax_distributed()
 
-from file_io import WFNReader
+from file_io import WfnLoader as WFNReader
 from common import symmetry_maps, timing
 
 from .charge_density import get_charge_density

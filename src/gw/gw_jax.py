@@ -133,7 +133,7 @@ def main(argv=None):
 		device_kind=device_names, print_fn=print0,
 	)
 
-	wfn = WFNReader(config.paths.wfn_file)
+	wfn = WFNReader(config.paths.wfn_file, mesh=mesh_xy)
 	sym = symmetry_maps.SymMaps(wfn)
 	_, centroid_indices, _n_rmu = load_centroids(config.paths.centroids_file, wfn.fft_grid)
 	tmp_dir = os.path.join(input_dir, "tmp")

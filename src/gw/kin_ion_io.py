@@ -23,7 +23,7 @@ import jax
 import jax.numpy as jnp
 import h5py
 
-from file_io import WFNReader
+from file_io import WfnLoader as WFNReader
 from common import symmetry_maps, Meta
 from common.load_wfns import load_kpoint_fftbox
 import common.timing as timing

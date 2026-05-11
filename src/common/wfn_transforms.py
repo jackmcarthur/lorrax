@@ -96,7 +96,12 @@ def _box_kernel(psi: jax.Array, g_index: jax.Array, *, ngkmax: int) -> jax.Array
     flat_index = (
         jnp.arange(n_k, dtype=jnp.int32)[:, None, None, None] * k_stride
         + g_index)                                                # (n_k, nx, ny, nz)
-    gathered = jnp.take(psi_flat, flat_index, axis=2)             # (nb, ns, n_k, nx, ny, nz)
+    # ``mode='clip'`` skips the OOB ``_where`` mask jnp.take inserts under
+    # the default ``mode='fill'``.  By construction ``flat_index`` is in
+    # range (psi was padded with a zero slot at index ``ngkmax``), so the
+    # clip is a no-op on the values — and avoids the per-shape ``_where``
+    # retraces (8 cache misses in MoS2 3×3 profile before this change).
+    gathered = jnp.take(psi_flat, flat_index, axis=2, mode='clip')  # (nb, ns, n_k, nx, ny, nz)
     return jnp.transpose(gathered, (2, 0, 1, 3, 4, 5))
 
 
@@ -140,7 +145,32 @@ def _maybe_constrain(arr: jax.Array, sharding: NamedSharding | None) -> jax.Arra
 
 
 # ---------------------------------------------------------------------------
-# Public transforms
+# Sharding signature key — used to keep the jit caches small and stable.
+# ---------------------------------------------------------------------------
+
+def _sharding_key(psi: jax.Array) -> tuple:
+    """Hashable signature of psi's sharding (mesh identity + spec).
+
+    Used as part of the jit-cache key for the public transforms so two
+    arrays with identical mesh + PartitionSpec hit the same compiled
+    XLA module, while a different mesh forces a fresh compile."""
+    sh = getattr(psi, "sharding", None)
+    if sh is None:
+        return ("no_sharding",)
+    mesh_id = id(getattr(sh, "mesh", None))
+    spec = tuple(getattr(sh, "spec", ()))
+    return (mesh_id, spec)
+
+
+# ---------------------------------------------------------------------------
+# Public transforms — shape-keyed jit caches.  Each public ``to_X`` looks
+# up a compiled closure that fuses (gather → optional IFFT → optional
+# Bloch-phase → optional slice/gather → sharding constraint) into ONE XLA
+# module per (input shape, fft_grid, extra-arg shape, sharding) key.
+#
+# Mirrors the cache pattern that the old ``get_sharded_wfns_rchunk_slice``
+# / ``get_sharded_wfns_centroids`` used (``_rchunk_slice_cache`` /
+# ``_centroid_extract_cache`` in ``load_wfns.py``).
 # ---------------------------------------------------------------------------
 
 def to_box(
@@ -150,25 +180,24 @@ def to_box(
 ) -> jax.Array:
     """Scatter G-flat ψ into the FFT box.
 
-    Parameters
-    ----------
-    psi : (n_k, nb, nspinor, ngkmax) c128
-        Output of :meth:`WfnLoader.load`.  Sharding (band axis on
-        ``('x','y')`` or replicated) is preserved on the output.
-    g_index : (n_k, nx, ny, nz) int32
-        Output of :meth:`WfnLoader.box_index`.  Sentinel value ``ngkmax``
-        flags empty FFT-box cells; gather produces zero there.
-    fft_grid : (nx, ny, nz)
-        Used only for shape validation (must equal g_index's spatial dims).
-
-    Returns
-    -------
-    psi_box : (n_k, nb, nspinor, nx, ny, nz) c128
+    Sharding (band axis on ``('x','y')`` or replicated) is preserved.
+    ``g_index`` (output of :meth:`WfnLoader.box_index`) uses sentinel
+    ``ngkmax`` to flag empty FFT-box cells (zero on gather).
     """
     ngkmax = int(psi.shape[-1])
+    fft_grid_t = tuple(int(s) for s in fft_grid)
+    out_sharding = _output_sharding(psi, n_extra_axes=3)
+    key = (psi.shape, tuple(g_index.shape), ngkmax, fft_grid_t,
+           _sharding_key(psi), out_sharding)
+    fn = _BOX_KERNEL_CACHE.get(key)
+    if fn is None:
+        @jax.jit
+        def fn(psi_, g_index_):
+            out = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
+            return _maybe_constrain(out, out_sharding)
+        _BOX_KERNEL_CACHE[key] = fn
     g_index_j = jnp.asarray(g_index, dtype=jnp.int32)
-    out = _box_kernel(psi, g_index_j, ngkmax=ngkmax)
-    return _maybe_constrain(out, _output_sharding(psi, n_extra_axes=3))
+    return fn(psi, g_index_j)
 
 
 def to_rbox(
@@ -179,34 +208,43 @@ def to_rbox(
     norm: str = "backward",
     kvecs_frac: np.ndarray | jax.Array | None = None,
 ) -> jax.Array:
-    """Scatter ψ to the FFT box and IFFT to r-space.
+    """Scatter ψ → FFT box → IFFT to r-space (+ optional Bloch phase).
 
-    Same shape as :func:`to_box`; the trailing three axes are now real-
-    space.  The IFFT is over axes ``(-3, -2, -1)``; ``norm`` is forwarded
-    to :func:`jnp.fft.ifftn` (``'backward'`` matches ``np.fft.ifftn``'s
-    default = ``1/N``; ``'ortho'`` = ``1/√N`` on both directions, used
-    by the centroid pivoted-Cholesky path).
-
-    Optional ``kvecs_frac`` (n_k, 3) applies the Bloch phase
-    ``exp(2πi k·r)`` after the IFFT, converting the periodic part
-    ``u_nk(r)`` = IFFT(c_nk(G)) into the full Bloch state
-    ``ψ_nk(r) = exp(2πi k·r) · u_nk(r)`` — matches the convention
-    used everywhere ψ_r is the downstream consumer (ISDF r-chunk fit,
-    kin_ion matrix elements).  Default ``None`` skips the phase
-    (e.g. when only ``|ψ|²`` is wanted as in centroid charge density).
-
-    Memory: this still materialises the FFT box.  For consumers that
-    only need ψ at a centroid list or a flat-r slab, prefer
-    :func:`to_rmu` / :func:`to_rchunk`.
+    ``norm`` is forwarded to :func:`jnp.fft.ifftn` (``'backward'`` =
+    ``1/N``; ``'ortho'`` = ``1/√N`` on both directions, used by the
+    centroid pivoted-Cholesky path).  ``kvecs_frac`` (n_k, 3) optionally
+    applies ``exp(+2πi k·r)`` after the IFFT (set to ``None`` for the
+    ``|ψ|²``-only path).  Output materialises the full FFT box; prefer
+    :func:`to_rmu`/:func:`to_rchunk` for centroid / slab consumers.
     """
-    psi_box = to_box(psi, g_index, fft_grid)
-    psi_r_box = jnp.fft.ifftn(psi_box, axes=(-3, -2, -1), norm=norm)
-    if kvecs_frac is not None:
-        psi_r_box = apply_bloch_phase(
-            psi_r_box,
-            jnp.asarray(kvecs_frac, dtype=jnp.float64),
-            tuple(int(s) for s in fft_grid))
-    return psi_r_box
+    ngkmax = int(psi.shape[-1])
+    fft_grid_t = tuple(int(s) for s in fft_grid)
+    kvecs_shape = (None if kvecs_frac is None
+                   else tuple(int(s) for s in np.shape(kvecs_frac)))
+    out_sharding = _output_sharding(psi, n_extra_axes=3)
+    key = (psi.shape, tuple(g_index.shape), ngkmax, fft_grid_t, norm,
+           kvecs_shape, _sharding_key(psi), out_sharding)
+    fn = _RBOX_KERNEL_CACHE.get(key)
+    if fn is None:
+        if kvecs_frac is None:
+            @jax.jit
+            def fn(psi_, g_index_):
+                box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
+                out = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+                return _maybe_constrain(out, out_sharding)
+            _RBOX_KERNEL_CACHE[key] = fn
+        else:
+            @jax.jit
+            def fn(psi_, g_index_, kvecs_):
+                box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
+                rb = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+                rb = apply_bloch_phase(rb, kvecs_, fft_grid_t)
+                return _maybe_constrain(rb, out_sharding)
+            _RBOX_KERNEL_CACHE[key] = fn
+    g_index_j = jnp.asarray(g_index, dtype=jnp.int32)
+    if kvecs_frac is None:
+        return fn(psi, g_index_j)
+    return fn(psi, g_index_j, jnp.asarray(kvecs_frac, dtype=jnp.float64))
 
 
 def to_rmu(
@@ -220,24 +258,43 @@ def to_rmu(
 ) -> jax.Array:
     """ψ in r-space at the centroid FFT-grid indices ``r_mu``.
 
-    Parameters
-    ----------
-    psi, g_index, fft_grid
-        As :func:`to_box`.
-    r_mu : (n_rmu, 3) int32
-        Centroid positions as FFT-grid indices in ``[0, fft_grid[a])``.
-    norm, kvecs_frac
-        Forwarded to :func:`to_rbox`.
-
-    Returns
-    -------
-    psi_at_rmu : (n_k, nb, nspinor, n_rmu) c128
-        Band-axis sharding preserved.
+    ``r_mu`` is ``(n_rmu, 3)`` int32 (positions in ``[0, fft_grid[a])``);
+    other args as :func:`to_rbox`.  Output ``(n_k, nb, nspinor, n_rmu)``
+    with band-axis sharding preserved.
     """
-    psi_r_box = to_rbox(psi, g_index, fft_grid, norm=norm, kvecs_frac=kvecs_frac)
+    ngkmax = int(psi.shape[-1])
+    fft_grid_t = tuple(int(s) for s in fft_grid)
+    n_rmu = int(np.shape(r_mu)[0])
+    kvecs_shape = (None if kvecs_frac is None
+                   else tuple(int(s) for s in np.shape(kvecs_frac)))
+    out_sharding = _output_sharding(psi, n_extra_axes=1)
+    key = (psi.shape, tuple(g_index.shape), ngkmax, fft_grid_t, n_rmu,
+           norm, kvecs_shape, _sharding_key(psi), out_sharding)
+    fn = _RMU_KERNEL_CACHE.get(key)
+    if fn is None:
+        if kvecs_frac is None:
+            @jax.jit
+            def fn(psi_, g_index_, r_mu_):
+                box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
+                rb = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+                out = rb[:, :, :, r_mu_[:, 0], r_mu_[:, 1], r_mu_[:, 2]]
+                return _maybe_constrain(out, out_sharding)
+            _RMU_KERNEL_CACHE[key] = fn
+        else:
+            @jax.jit
+            def fn(psi_, g_index_, r_mu_, kvecs_):
+                box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
+                rb = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+                rb = apply_bloch_phase(rb, kvecs_, fft_grid_t)
+                out = rb[:, :, :, r_mu_[:, 0], r_mu_[:, 1], r_mu_[:, 2]]
+                return _maybe_constrain(out, out_sharding)
+            _RMU_KERNEL_CACHE[key] = fn
+    g_index_j = jnp.asarray(g_index, dtype=jnp.int32)
     r_mu_j = jnp.asarray(r_mu, dtype=jnp.int32)
-    out = psi_r_box[:, :, :, r_mu_j[:, 0], r_mu_j[:, 1], r_mu_j[:, 2]]
-    return _maybe_constrain(out, _output_sharding(psi, n_extra_axes=1))
+    if kvecs_frac is None:
+        return fn(psi, g_index_j, r_mu_j)
+    return fn(psi, g_index_j, r_mu_j,
+              jnp.asarray(kvecs_frac, dtype=jnp.float64))
 
 
 def to_rchunk(
@@ -252,30 +309,51 @@ def to_rchunk(
 ) -> jax.Array:
     """ψ in r-space on a contiguous flat-r slab ``[r0, r0 + r_len)``.
 
-    Flat-r convention: ``r_flat = rx * ny * nz + ry * nz + rz`` (matches
-    C-order reshape of ``(nx, ny, nz)``).  Used by the ISDF r-chunk
-    loop where the consumer wants a strip of the full FFT box without
-    materialising the rest.
-
-    Returns
-    -------
-    psi_rchunk : (n_k, nb, nspinor, r_len) c128
-        Band-axis sharding preserved.
+    Flat-r convention: ``r_flat = rx * ny * nz + ry * nz + rz``.  ``r0``
+    may be a Python int (bounds-checked) or a traced scalar (caller's
+    responsibility).
     """
-    nx, ny, nz = (int(s) for s in fft_grid)
+    ngkmax = int(psi.shape[-1])
+    fft_grid_t = tuple(int(s) for s in fft_grid)
+    nx, ny, nz = fft_grid_t
     n_rtot = nx * ny * nz
-    # r0 may be a Python int (driver-time check) or a jax scalar tracer
-    # (when ``to_rchunk`` is called inside an outer jit).  Skip the
-    # bounds check on traced values; caller is responsible.
+    r_len_i = int(r_len)
     if isinstance(r0, (int, np.integer)):
-        if r0 < 0 or r0 + r_len > n_rtot:
+        if r0 < 0 or int(r0) + r_len_i > n_rtot:
             raise ValueError(
-                f"to_rchunk: [{r0}, {r0 + r_len}) out of [0, {n_rtot})")
-    psi_r_box = to_rbox(psi, g_index, fft_grid, norm=norm,
-                        kvecs_frac=kvecs_frac)
-    psi_r_flat = psi_r_box.reshape(*psi_r_box.shape[:3], n_rtot)
-    out = jax.lax.dynamic_slice_in_dim(psi_r_flat, r0, int(r_len), axis=-1)
-    return _maybe_constrain(out, _output_sharding(psi, n_extra_axes=1))
+                f"to_rchunk: [{int(r0)}, {int(r0) + r_len_i}) out of [0, {n_rtot})")
+    kvecs_shape = (None if kvecs_frac is None
+                   else tuple(int(s) for s in np.shape(kvecs_frac)))
+    out_sharding = _output_sharding(psi, n_extra_axes=1)
+    key = (psi.shape, tuple(g_index.shape), ngkmax, fft_grid_t, r_len_i,
+           norm, kvecs_shape, _sharding_key(psi), out_sharding)
+    fn = _RCHUNK_KERNEL_CACHE.get(key)
+    if fn is None:
+        if kvecs_frac is None:
+            @jax.jit
+            def fn(psi_, g_index_, r0_):
+                box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
+                rb = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+                rb_flat = rb.reshape(*rb.shape[:3], n_rtot)
+                out = jax.lax.dynamic_slice_in_dim(rb_flat, r0_, r_len_i, axis=-1)
+                return _maybe_constrain(out, out_sharding)
+            _RCHUNK_KERNEL_CACHE[key] = fn
+        else:
+            @jax.jit
+            def fn(psi_, g_index_, r0_, kvecs_):
+                box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
+                rb = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+                rb = apply_bloch_phase(rb, kvecs_, fft_grid_t)
+                rb_flat = rb.reshape(*rb.shape[:3], n_rtot)
+                out = jax.lax.dynamic_slice_in_dim(rb_flat, r0_, r_len_i, axis=-1)
+                return _maybe_constrain(out, out_sharding)
+            _RCHUNK_KERNEL_CACHE[key] = fn
+    g_index_j = jnp.asarray(g_index, dtype=jnp.int32)
+    r0_arg = (jnp.int32(int(r0)) if isinstance(r0, (int, np.integer)) else r0)
+    if kvecs_frac is None:
+        return fn(psi, g_index_j, r0_arg)
+    return fn(psi, g_index_j, r0_arg,
+              jnp.asarray(kvecs_frac, dtype=jnp.float64))
 
 
 # ---------------------------------------------------------------------------

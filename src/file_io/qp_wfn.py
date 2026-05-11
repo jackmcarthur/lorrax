@@ -146,40 +146,42 @@ def write_qp_wfn_h5(
     # All-band IBZ coefficients + per-k G-vectors via the unified loader.
     # qp_wfn is a one-shot host-mutate-write path; everything stays on
     # the host (sharding=None forces replicated → host numpy view).
-    from .wfn_loader import WfnLoader
-
     enk_full_ry = np.array(wfn.energies[0], dtype=np.float64).copy()  # (nk, nbands)
     enk_full_ry[:, band_start:band_stop] = np.asarray(
         enk_active_qp_ry, dtype=np.float64)
 
-    with WfnLoader(wfn._filename) as loader:
-        psi_all = np.asarray(loader.load(
-            bands=(0, int(wfn.nbands)), k="ibz", sharding=None))   # (nk, nb, ns, ngkmax)
-        gvecs_full = loader.gvecs(k="ibz")                          # (nk, ngkmax, 3)
-        ngk_v = loader.ngk_valid(k="ibz")                           # (nk,)
-        gvecs_per_k = [gvecs_full[ik, : int(ngk_v[ik])]
-                       for ik in range(int(wfn.nkpts))]
+    # The top-level WfnLoader carries the device mesh; ``.load`` is a
+    # collective on the phdf5 backend, so it MUST be called by every rank
+    # even though only rank-0 writes the file.  We open a fresh
+    # mesh-less WfnLoader (eager backend) here so the rank-0 write does
+    # not need the other ranks at all — qp_wfn is a one-shot
+    # end-of-run dump and the re-slurp cost is paid once.
+    from .wfn_loader import WfnLoader
+    loader = WfnLoader(wfn._filename)
+    psi_all = np.asarray(loader.load(
+        bands=(0, int(wfn.nbands)), k="ibz", sharding=None))   # (nk, nb, ns, ngkmax)
+    gvecs_full = loader.gvecs(k="ibz")                          # (nk, ngkmax, 3)
+    ngk_v = loader.ngk_valid(k="ibz")                           # (nk,)
+    gvecs_per_k = [gvecs_full[ik, : int(ngk_v[ik])]
+                   for ik in range(int(wfn.nkpts))]
+    loader.close()
 
-        with WFNWriter(
-            output_path, wfn,
-            kpoints=np.asarray(wfn.kpoints, dtype=np.float64),
-            weights=np.asarray(wfn.kweights, dtype=np.float64),
-            kgrid=tuple(int(x) for x in wfn.kgrid),
-            nbands=int(wfn.nbands),
-            gvecs_per_k=gvecs_per_k,
-            nosym=False,
-            shift=tuple(float(x) for x in wfn.shift),
-        ) as w:
-            for ik in range(int(wfn.nkpts)):
-                n = int(ngk_v[ik])
-                # Fresh writable copy — slice of psi_all is a view; we
-                # mutate in place below.
-                c_all_dft = psi_all[ik, :, :, :n].copy()           # (nbands, ns, ngk)
-                # Rotate the active block in band space:
-                #   c_qp[n, s, G] = Σ_m U[ik, m, n] · c_dft[m+band_start, s, G]
-                c_active_dft = c_all_dft[band_start:band_stop]      # view
-                c_all_dft[band_start:band_stop] = np.einsum(
-                    "mn,msg->nsg", U_kmn[ik], c_active_dft, optimize=True)
-                w.write_k(ik, enk_full_ry[ik], c_all_dft)
+    with WFNWriter(
+        output_path, wfn,
+        kpoints=np.asarray(wfn.kpoints, dtype=np.float64),
+        weights=np.asarray(wfn.kweights, dtype=np.float64),
+        kgrid=tuple(int(x) for x in wfn.kgrid),
+        nbands=int(wfn.nbands),
+        gvecs_per_k=gvecs_per_k,
+        nosym=False,
+        shift=tuple(float(x) for x in wfn.shift),
+    ) as w:
+        for ik in range(int(wfn.nkpts)):
+            n = int(ngk_v[ik])
+            c_all_dft = psi_all[ik, :, :, :n].copy()           # (nbands, ns, ngk)
+            c_active_dft = c_all_dft[band_start:band_stop]      # view
+            c_all_dft[band_start:band_stop] = np.einsum(
+                "mn,msg->nsg", U_kmn[ik], c_active_dft, optimize=True)
+            w.write_k(ik, enk_full_ry[ik], c_all_dft)
 
 

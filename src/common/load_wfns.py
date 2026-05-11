@@ -14,53 +14,6 @@ from .fft_helpers import (
 )
 
 
-# Module-level PhdfWfnReader cache — see ``_get_phdf5_reader`` below.
-# Keyed by (wfn file path, Mesh).  Cached readers own MPI+HDF5 handles
-# and the JIT closures for the gather/unfold kernels; first call of a
-# new reader pays ~100 ms of XLA tracing/compile, subsequent calls
-# reuse the compiled artefacts.  Tests may call ``_close_phdf5_readers``
-# to tear these down explicitly.
-_PHDF5_READER_CACHE: dict[tuple[str, int], object] = {}
-
-
-def _get_phdf5_reader(filename: str, mesh: Mesh):
-    """Return a cached :class:`PhdfWfnReader` for ``(filename, mesh)``,
-    constructing one on first request.  Subsequent calls with the same
-    key hit the in-process JIT cache on ``_fft_box_kernel`` /
-    ``_unfold_kernel`` — the caller avoids paying XLA compile on every
-    ``load_centroids_band_chunked`` / ``get_psi_rchunk`` invocation."""
-    key = (str(filename), id(mesh))
-    reader = _PHDF5_READER_CACHE.get(key)
-    if reader is None:
-        from common.phdf5_wfn_reader import PhdfWfnReader
-        reader = PhdfWfnReader(filename, mesh=mesh)
-        _PHDF5_READER_CACHE[key] = reader
-    return reader
-
-
-def _close_phdf5_readers() -> None:
-    """Close every cached reader and drop them.  For tests that want a
-    clean slate; production code should leave them alive for the
-    process lifetime."""
-    for reader in _PHDF5_READER_CACHE.values():
-        reader.close()
-    _PHDF5_READER_CACHE.clear()
-
-
-def _make_kchunk_meta(meta: Meta, kc_start: int, kc_end: int):
-    """Create a shallow copy of Meta with nk_tot adjusted for a k-chunk.
-
-    The returned object shares all attributes with the original except
-    nk_tot, which is set to the chunk size. This lets read_Gvecs_to_devices
-    and get_sharded_wfns_centroids process a subset of k-points using the
-    same code paths.
-    """
-    from copy import copy
-    meta_chunk = copy(meta)
-    meta_chunk.nk_tot = kc_end - kc_start
-    return meta_chunk
-
-
 def load_kpoint_fftbox(wfn, sym, meta, k_idx, nb):
     """Load a single k-point's wavefunction into the FFT box on GPU.
 
@@ -71,20 +24,17 @@ def load_kpoint_fftbox(wfn, sym, meta, k_idx, nb):
     kept in the signature for caller-API back-compat.
     """
     del sym
-    from file_io.wfn_loader import WfnLoader
     from common.wfn_transforms import to_box
 
-    with WfnLoader(wfn._filename) as loader:
-        psi = loader.load(bands=(0, int(nb)), k=[int(k_idx)],
-                          sharding=None)               # (1, nb, nspinor_wfn, ngkmax)
-        # Pad nspinor to meta.nspinor (e.g. wfn nspinor=2 but caller wants
-        # bispinor 4-spinor zero-padded for downstream slot alignment).
-        if int(meta.nspinor) > int(loader.nspinor):
-            ns_pad = int(meta.nspinor) - int(loader.nspinor)
-            psi = jnp.pad(psi, ((0, 0), (0, 0), (0, ns_pad), (0, 0)))
-        psi_box = to_box(psi, loader.box_index(k=[int(k_idx)]),
-                          tuple(int(s) for s in meta.fft_grid))
-        return psi_box[0]                                # strip the singleton k-axis
+    loader = wfn  # reuse top-level WfnLoader; do NOT re-open (would re-slurp coeffs)
+    psi = loader.load(bands=(0, int(nb)), k=[int(k_idx)],
+                      sharding=None)               # (1, nb, nspinor_wfn, ngkmax)
+    if int(meta.nspinor) > int(loader.nspinor):
+        ns_pad = int(meta.nspinor) - int(loader.nspinor)
+        psi = jnp.pad(psi, ((0, 0), (0, 0), (0, ns_pad), (0, 0)))
+    psi_box = to_box(psi, loader.box_index(k=[int(k_idx)]),
+                      tuple(int(s) for s in meta.fft_grid))
+    return psi_box[0]                                # strip the singleton k-axis
 
 
 def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, nspinor=2):
@@ -189,7 +139,6 @@ def read_Gvecs_to_devices(
     ``to_rchunk`` per r-chunk instead of holding the FFT box.
     """
     del sym
-    from file_io.wfn_loader import WfnLoader
     from common.wfn_transforms import to_box
 
     b_lo, b_hi = int(bandrange[0]), int(bandrange[1])
@@ -201,26 +150,19 @@ def read_Gvecs_to_devices(
 
     sharding = P(None, ("x", "y"), None, None)
 
-    loader = WfnLoader(wfn._filename, mesh=mesh_xy)
-    try:
-        psi_G_flat = loader.load(
-            bands=(b_lo, b_hi), k=k, sharding=sharding,
-            bispinor=bool(bispinor),
-        )
-        # Pad spinor axis to ``meta.nspinor`` when the caller's meta
-        # configuration exceeds the loader's output spinor count.
-        # ``bispinor=True`` already produces 4-spinor; this guards a
-        # meta config that wants extra zero-padded components.
-        ns_after_lift = 4 if bispinor else int(loader.nspinor)
-        if int(meta.nspinor) > ns_after_lift:
-            ns_pad = int(meta.nspinor) - ns_after_lift
-            psi_G_flat = jnp.pad(
-                psi_G_flat, ((0, 0), (0, 0), (0, ns_pad), (0, 0)))
-        psi_box = to_box(psi_G_flat, loader.box_index(k=k),
-                          tuple(int(s) for s in meta.fft_grid))
-        return psi_box, nb_logical
-    finally:
-        loader.close()
+    loader = wfn  # reuse top-level WfnLoader
+    psi_G_flat = loader.load(
+        bands=(b_lo, b_hi), k=k, sharding=sharding,
+        bispinor=bool(bispinor),
+    )
+    ns_after_lift = 4 if bispinor else int(loader.nspinor)
+    if int(meta.nspinor) > ns_after_lift:
+        ns_pad = int(meta.nspinor) - ns_after_lift
+        psi_G_flat = jnp.pad(
+            psi_G_flat, ((0, 0), (0, 0), (0, ns_pad), (0, 0)))
+    psi_box = to_box(psi_G_flat, loader.box_index(k=k),
+                      tuple(int(s) for s in meta.fft_grid))
+    return psi_box, nb_logical
 
 
 
@@ -371,10 +313,6 @@ def iter_psi_rchunk_bandwise(
     band_chunk_size: int = 16,
     k_chunk_size: int = 0,
     band_chunk_ranges: list[tuple[int, int]] | None = None,
-    cached_gspace: list[tuple[jax.Array, tuple[int, int]]] | None = None,
-    kvecs_frac: np.ndarray | None = None,
-    *,
-    use_phdf5: bool = False,
 ):
     """Generator: yield ``(bc_range, psi_bc_Y)`` one band chunk at a time.
 
@@ -392,17 +330,19 @@ def iter_psi_rchunk_bandwise(
     no out-of-range einsums ever dispatch.  When None, contiguous
     chunks of ``band_chunk_size`` are built from ``band_range``.
 
-    With ``cached_gspace`` (from :func:`load_gspace_for_bands`), the
-    G-space load is skipped and only the FFT + r-chunk extract
-    happens per call — cached entries must share exactly the same
-    ``bc_range`` keys as the yielded sequence.
+    Migrated to :class:`file_io.wfn_loader.WfnLoader` + ``to_rchunk``.
+    ``sym`` is unused (loader builds its own SymMaps).  The retired
+    ``cached_gspace`` / ``kvecs_frac`` / ``use_phdf5`` parameters have
+    been dropped — PsiGStore is the in-process g_flat cache;
+    WfnLoader's ``backend='auto'`` picks phdf5/eager.
     """
-    if kvecs_frac is None:
-        kgrid = np.array(meta.kgrid)
-        kvecs_frac = sym.kvecs_asints / kgrid[None, :]
+    del sym
+    from common.wfn_transforms import to_rchunk
+
     b_start, b_end = band_range
-    nk_tot = meta.nk_tot
+    nk_tot = int(meta.nk_tot)
     nk_batch = nk_tot if k_chunk_size <= 0 else min(k_chunk_size, nk_tot)
+    n_rchunk = int(r_end - r_start)
 
     if band_chunk_ranges is None:
         nb_total = b_end - b_start
@@ -413,12 +353,9 @@ def iter_psi_rchunk_bandwise(
             for i in range(num_band_chunks)
         ]
 
-    # JIT'd zero-allocator used by the k-chunked paths to avoid the
-    # double-allocation trap (``jnp.zeros`` at top-level creates a
-    # fully replicated intermediate on every device before the
-    # sharding constraint can redistribute — OOM at Si-10³-class
-    # sizes).  Memoised by shape so the N-1 full k-batches + last
-    # remainder produce at most two compile entries.
+    # JIT'd zero-allocator used by the k-chunked path (memoised by
+    # shape).  Keeps the top-level ``jnp.zeros`` from being
+    # rematerialised replicated on every device.
     out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
     _zeros_Y_cache: dict = {}
     def _zeros_Y(shape):
@@ -430,143 +367,53 @@ def iter_psi_rchunk_bandwise(
             _zeros_Y_cache[shape] = fn
         return fn()
 
-    if cached_gspace is not None:
-        by_range = {tuple(bc_range): gtot for (gtot, bc_range) in cached_gspace}
-        for bc_range in band_chunk_ranges:
-            gtot = by_range.get(tuple(bc_range))
-            if gtot is None:
-                raise KeyError(
-                    f"cached_gspace has no entry for bc_range={bc_range}; "
-                    f"available={list(by_range.keys())}")
-            if nk_batch >= nk_tot:
-                psi_bc_Y = get_sharded_wfns_rchunk_slice(
-                    gtot, meta, r_start, r_end - r_start, kvecs_frac, mesh_xy, bc_range)
-                yield bc_range, psi_bc_Y
-            else:
-                # K-chunk the FFT on the cached full-k G-space so the
-                # per-device FFT peak stays bounded (the full-k FFT
-                # workspace is ~4× nk_tot × nb × nx*ny*nz at this bc
-                # and can blow the budget on Si-10³-class systems).
-                n_rchunk = r_end - r_start
-                nb_chunk = bc_range[1] - bc_range[0]
-                nspinor = meta.nspinor
-                psi_bc_Y_full = _zeros_Y(
-                    (nk_tot, nb_chunk, nspinor, n_rchunk))
-                for k0 in range(0, nk_tot, nk_batch):
-                    k1 = min(k0 + nk_batch, nk_tot)
-                    sub_meta = _make_kchunk_meta(meta, k0, k1)
-                    psi_k_chunk = get_sharded_wfns_rchunk_slice(
-                        gtot[k0:k1], sub_meta, r_start, r_end - r_start,
-                        kvecs_frac[k0:k1], mesh_xy, bc_range)
-                    psi_bc_Y_full = psi_bc_Y_full.at[k0:k1, :, :, :].set(psi_k_chunk)
-                    del psi_k_chunk
-                yield bc_range, psi_bc_Y_full
-        return
+    sharding_load = P(None, ('x', 'y'), None, None)
 
-    phdf5_reader = (_get_phdf5_reader(wfn._filename, mesh_xy)
-                    if use_phdf5 else None)
+    loader = wfn  # reuse top-level WfnLoader
+    g_index_full = loader.box_index(k="full_bz")
+    sym_loader = loader._ensure_sym()
+    kgrid_arr = np.asarray(meta.kgrid, dtype=np.float64)
+    kvecs_frac_full = (
+        np.asarray(sym_loader.kvecs_asints, dtype=np.float64)
+        / kgrid_arr[None, :])
+
     for bc_range in band_chunk_ranges:
         if nk_batch >= nk_tot:
-            if phdf5_reader is not None:
-                gtot = phdf5_reader.coeffs_gspace(
-                    bc_range, bispinor=bispinor)
-            else:
-                gtot, _ = read_Gvecs_to_devices(
-                    wfn, sym, bc_range, meta, bispinor, mesh_xy)
-            psi_bc_Y = get_sharded_wfns_rchunk_slice(
-                gtot, meta, r_start, r_end - r_start, kvecs_frac, mesh_xy, bc_range)
-            del gtot
+            psi_G_flat = loader.load(
+                bands=bc_range, k="full_bz",
+                sharding=sharding_load, bispinor=bispinor)
+            psi_bc_Y = to_rchunk(
+                psi_G_flat, g_index_full, meta.fft_grid,
+                int(r_start), n_rchunk, norm="ortho",
+                kvecs_frac=jnp.asarray(kvecs_frac_full))
+            psi_bc_Y = jax.lax.with_sharding_constraint(psi_bc_Y, out_Y)
+            del psi_G_flat
             yield bc_range, psi_bc_Y
         else:
-            # K-chunked: concat per-k slabs into a full-k band-chunk
-            # tensor before yielding so downstream consumers see the
-            # same shape contract as the all-k path.
-            n_rchunk = r_end - r_start
             nb_chunk = bc_range[1] - bc_range[0]
             nspinor = meta.nspinor
             psi_bc_Y_full = _zeros_Y(
                 (nk_tot, nb_chunk, nspinor, n_rchunk))
             for k0 in range(0, nk_tot, nk_batch):
                 k1 = min(k0 + nk_batch, nk_tot)
-                sub_meta = _make_kchunk_meta(meta, k0, k1)
-                if phdf5_reader is not None:
-                    k_ids = np.arange(k0, k1, dtype=np.int32)
-                    psi_k_gtot = phdf5_reader.coeffs_gspace(
-                        bc_range, k_ids=k_ids, bispinor=bispinor)
-                else:
-                    psi_k_gtot, _ = read_Gvecs_to_devices(
-                        wfn, sym, bc_range, sub_meta, bispinor, mesh_xy,
-                        k_range=(k0, k1))
-                psi_k_chunk = get_sharded_wfns_rchunk_slice(
-                    psi_k_gtot, sub_meta, r_start, r_end - r_start,
-                    kvecs_frac[k0:k1], mesh_xy, bc_range)
-                psi_bc_Y_full = psi_bc_Y_full.at[k0:k1, :, :, :].set(psi_k_chunk)
-                del psi_k_chunk, psi_k_gtot
+                k_ids = list(range(k0, k1))
+                psi_G_flat = loader.load(
+                    bands=bc_range, k=k_ids,
+                    sharding=sharding_load, bispinor=bispinor)
+                psi_k_chunk = to_rchunk(
+                    psi_G_flat,
+                    g_index_full[k0:k1],
+                    meta.fft_grid, int(r_start), n_rchunk,
+                    norm="ortho",
+                    kvecs_frac=jnp.asarray(kvecs_frac_full[k0:k1]))
+                psi_k_chunk = jax.lax.with_sharding_constraint(
+                    psi_k_chunk, out_Y)
+                psi_bc_Y_full = psi_bc_Y_full.at[
+                    k0:k1, :, :, :].set(psi_k_chunk)
+                del psi_G_flat, psi_k_chunk
             yield bc_range, psi_bc_Y_full
 
 
-def get_psi_rchunk(
-    wfn, sym, meta, mesh_xy, band_range, r_start, r_end, bispinor,
-    band_chunk_size: int = 16,
-    k_chunk_size: int = 0,
-    cached_gspace: list[tuple[jax.Array, tuple[int, int]]] | None = None,
-    kvecs_frac: np.ndarray | None = None,
-    *,
-    use_phdf5: bool = False,
-) -> jax.Array:
-    """Extract the r-chunk in real space as a single full-band-range
-    tensor.
-
-    Thin wrapper around :func:`iter_psi_rchunk_bandwise` that
-    pre-allocates ``(nk, nb_total, ns, n_rchunk)`` and fills it from
-    the generator.  Prefer the generator directly when the
-    downstream can accumulate band-chunk contributions incrementally
-    (e.g. pair-density construction) — streaming keeps only one band
-    chunk's r-chunk shard live at a time instead of the full-band
-    tensor.
-
-    Args:
-        wfn, sym: WFNReader and SymMaps (unused if cached_gspace is provided)
-        meta: Meta object
-        mesh_xy: Device mesh
-        band_range: (b_start, b_end)
-        r_start, r_end: R-index range (contiguous in flattened xyz)
-        bispinor: bispinor flag (unused if cached_gspace is provided)
-        band_chunk_size: Bands to FFT at once
-        k_chunk_size: K-points per batch (0 = all at once)
-        cached_gspace: Pre-loaded G-space from load_gspace_for_bands()
-        kvecs_frac: (nk, 3) k-vectors in fractional coords. If None,
-            computed from sym.kvecs_asints / meta.kgrid.
-
-    Returns:
-        psi_rchunk_Y: (nk, nb, ns, n_rchunk) with P(None, None, None, 'y')
-    """
-    b_start, b_end = band_range
-    nb_total = b_end - b_start
-    nk_tot = meta.nk_tot
-    nspinor = meta.nspinor
-    n_rchunk = r_end - r_start
-
-    out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
-    psi_rchunk_all = jnp.zeros((nk_tot, nb_total, nspinor, n_rchunk),
-                               dtype=jnp.complex128)
-    psi_rchunk_all = jax.lax.with_sharding_constraint(psi_rchunk_all, out_Y)
-
-    for bc_range, psi_bc_Y in iter_psi_rchunk_bandwise(
-        wfn, sym, meta, mesh_xy, band_range, r_start, r_end, bispinor,
-        band_chunk_size=band_chunk_size, k_chunk_size=k_chunk_size,
-        cached_gspace=cached_gspace, kvecs_frac=kvecs_frac,
-        use_phdf5=use_phdf5,
-    ):
-        local_lo = bc_range[0] - b_start
-        local_hi = bc_range[1] - b_start
-        psi_rchunk_all = psi_rchunk_all.at[:, local_lo:local_hi, :, :].set(psi_bc_Y)
-        del psi_bc_Y
-
-    return psi_rchunk_all
-
-
-# Backward compatibility alias
 # ============================================================================
 # Unified band-chunked FFT backend for centroid and z-chunk extraction
 # ============================================================================
@@ -783,18 +630,20 @@ def load_centroids_band_chunked(
     ``('x', 'y')`` = 16; SlabIO's auto-pad on the on-disk dataset
     closes that gap (see ``file_io.slab_io.create_dataset``).
     """
+    del use_phdf5  # WfnLoader's backend='auto' picks phdf5 when it's safe
+    del sym        # WfnLoader builds its own SymMaps lazily
+    from common.wfn_transforms import to_rmu
+    from runtime.padding import round_up_to_mesh_product
+
     b_start, b_end = band_range
     nb_total = b_end - b_start
-    nk_tot = meta.nk_tot
-    nspinor = meta.nspinor
-    n_rmu = len(centroid_indices)
+    nk_tot = int(meta.nk_tot)
+    nspinor = int(meta.nspinor)
+    n_rmu = int(centroid_indices.shape[0])
+    centroid_idx_np = np.asarray(centroid_indices, dtype=np.int32)
 
-    # Auto-detect k_chunk_size from memory budget if not specified.
-    #
-    # Single-GPU: FFT peak is 4× the shard (input + output + 2 staging).
-    # Multi-GPU: collective buffers for the {-,XY,-,-} → {-,-,-,Y} reshard
-    # add ~5× more, giving ~9× total. Measured on Si 4×4×4, 4 A100 GPUs
-    # (see runs/Si/04_si_4x4x4_memory_assay/assay_report.md).
+    # k_chunk_size autodetect — bound the FFT-box transient peak inside
+    # to_rmu (the only place a full r-box exists in the new pipeline).
     if k_chunk_size is None:
         n_rtot = meta.fft_grid[0] * meta.fft_grid[1] * meta.fft_grid[2]
         n_devices = jax.device_count()
@@ -812,46 +661,67 @@ def load_centroids_band_chunked(
     k_chunk_size = min(k_chunk_size, nk_tot)
     num_k_chunks = (nk_tot + k_chunk_size - 1) // k_chunk_size
     needs_k_chunking = num_k_chunks > 1
-
     if needs_k_chunking:
         print(f"  K-point chunking: {num_k_chunks} chunks of {k_chunk_size} "
               f"(total {nk_tot} k-points)")
 
-    # Get k-vectors
-    kgrid = np.array(meta.kgrid)
-    kvecs_frac = sym.kvecs_asints / kgrid[None, :]
-
-    # Output shardings
+    # Output shardings + accumulators.  Same final layout as before:
+    # psi_rmu_Y has the centroid axis on 'y'; psi_rmuT_X has it on 'x'.
     out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
     out_X = NamedSharding(mesh_xy, P(None, 'x', None, None))
+    stage_Y_4d = NamedSharding(mesh_xy, P(None, 'y', None, None))
 
-    # Allocate output arrays at PADDED n_rmu so the single-axis output
-    # shardings (``P(None, None, None, 'y')`` / ``P(None, 'x', None,
-    # None)``) divide cleanly even when the centroid file's logical n_rmu
-    # doesn't divide max(p_x, p_y).  Pad rows are zero (jnp.zeros) and
-    # the per-chunk ``.at[...].set(psi_rmu_chunk)`` writes use the chunk
-    # at PADDED n_rmu (the kernel pads internally, see
-    # get_sharded_wfns_centroids).  Logical n_rmu remains in
-    # ``meta.n_rmu``; downstream callers slice psi to logical at jit
-    # entry to keep CCT non-singular for the Cholesky/LU.
-    from runtime.padding import round_up_to_mesh_product
     n_rmu_padded = round_up_to_mesh_product(n_rmu, mesh_xy)
-    psi_rmu_all = jnp.zeros((nk_tot, nb_total, nspinor, n_rmu_padded), dtype=jnp.complex128)
-    psi_rmuT_all = jnp.zeros((nk_tot, n_rmu_padded, nb_total, nspinor), dtype=jnp.complex128)
+    psi_rmu_all = jnp.zeros(
+        (nk_tot, nb_total, nspinor, n_rmu_padded), dtype=jnp.complex128)
+    psi_rmuT_all = jnp.zeros(
+        (nk_tot, n_rmu_padded, nb_total, nspinor), dtype=jnp.complex128)
     psi_rmu_all = jax.lax.with_sharding_constraint(psi_rmu_all, out_Y)
     psi_rmuT_all = jax.lax.with_sharding_constraint(psi_rmuT_all, out_X)
 
-    # Process bands in chunks
-    num_band_chunks = (nb_total + band_chunk_size - 1) // band_chunk_size
+    # Reshard helper: ``to_rmu`` returns ``(nk, nb_padded, ns, n_rmu)``
+    # with the band axis sharded on ('x', 'y').  Downstream consumers
+    # want the n_rmu axis sharded (P(None, None, None, 'y') for psi_rmu_Y
+    # and P(None, 'x', None, None) for the conjugate-transposed
+    # psi_rmuT_X).  Cached per (nb_chunk_padded, nk_chunk) shape so
+    # repeated band-chunk × k-chunk calls share the compiled jit.
+    _reshard_cache: dict = {}
 
-    # PHDF5 path: pull a cached parallel-HDF5 reader keyed by (path,
-    # mesh).  Cached readers own the FFI MPI+HDF5 handles and the JIT
-    # closures for the unfold/gather kernels; construction-time work
-    # (~100 ms of XLA tracing/compile on first call for a new
-    # band-chunk shape) is amortised across every subsequent call in
-    # the process.  Wired for both the all-k and k-chunked paths.
-    phdf5_reader = (_get_phdf5_reader(wfn._filename, mesh_xy)
-                    if use_phdf5 else None)
+    def _make_reshard_fn(nb_chunk_padded: int, nk_chunk: int):
+        key = (int(nb_chunk_padded), int(nk_chunk))
+        fn = _reshard_cache.get(key)
+        if fn is not None:
+            return fn
+
+        @jax.jit
+        def _reshard(psi_rmu_band):
+            # Input: (nk_chunk, nb_chunk_padded, ns, n_rmu) band-sharded.
+            if n_rmu_padded > n_rmu:
+                psi_rmu_band = jnp.pad(
+                    psi_rmu_band,
+                    ((0, 0), (0, 0), (0, 0), (0, n_rmu_padded - n_rmu)),
+                )
+            # Two-step reshard {-,XY,-,-} → {-,Y,-,-} → {-,-,-,Y}.
+            psi_rmu = jax.lax.with_sharding_constraint(psi_rmu_band, stage_Y_4d)
+            psi_rmu = jax.lax.with_sharding_constraint(psi_rmu, out_Y)
+            # Conjugate-transpose for pair density.
+            psi_rmuT = jnp.conj(psi_rmu.transpose(0, 3, 1, 2))
+            psi_rmuT = jax.lax.with_sharding_constraint(psi_rmuT, out_X)
+            return psi_rmu, psi_rmuT
+
+        _reshard_cache[key] = _reshard
+        return _reshard
+
+    num_band_chunks = (nb_total + band_chunk_size - 1) // band_chunk_size
+    sharding_load = P(None, ('x', 'y'), None, None)
+
+    loader = wfn  # reuse top-level WfnLoader
+    g_index_full = loader.box_index(k="full_bz")
+    sym_loader = loader._ensure_sym()
+    kgrid_arr = np.asarray(meta.kgrid, dtype=np.float64)
+    kvecs_frac_full = (
+        np.asarray(sym_loader.kvecs_asints, dtype=np.float64)
+        / kgrid_arr[None, :])
 
     for bc_idx in range(num_band_chunks):
         bc_start = b_start + bc_idx * band_chunk_size
@@ -862,64 +732,61 @@ def load_centroids_band_chunked(
         local_bc_end = local_bc_start + nb_chunk
 
         if not needs_k_chunking:
-            # Band-chunked only (all k at once).
-            if phdf5_reader is not None:
-                global_psi_Gtot = phdf5_reader.coeffs_gspace(
-                    bc_range, bispinor=bispinor)
-            else:
-                global_psi_Gtot, _ = read_Gvecs_to_devices(
-                    wfn, sym, bc_range, meta, bispinor, mesh_xy)
-            psi_rmu_chunk, psi_rmuT_chunk = get_sharded_wfns_centroids(
-                global_psi_Gtot, meta, centroid_indices, kvecs_frac, mesh_xy, bc_range)
-            psi_rmu_all = psi_rmu_all.at[:, local_bc_start:local_bc_end, :, :].set(psi_rmu_chunk)
-            psi_rmuT_all = psi_rmuT_all.at[:, :, local_bc_start:local_bc_end, :].set(psi_rmuT_chunk)
-            del global_psi_Gtot, psi_rmu_chunk, psi_rmuT_chunk
+            psi_G_flat = loader.load(
+                bands=bc_range, k="full_bz",
+                sharding=sharding_load, bispinor=bispinor)
+            psi_rmu_band = to_rmu(
+                psi_G_flat, g_index_full, meta.fft_grid,
+                centroid_idx_np, norm="ortho",
+                kvecs_frac=jnp.asarray(kvecs_frac_full))
+            nb_padded_chunk = int(psi_rmu_band.shape[1])
+            reshard_fn = _make_reshard_fn(nb_padded_chunk, nk_tot)
+            psi_rmu_chunk, psi_rmuT_chunk = reshard_fn(psi_rmu_band)
+            psi_rmu_chunk = psi_rmu_chunk[:, :nb_chunk, :, :]
+            psi_rmuT_chunk = psi_rmuT_chunk[:, :, :nb_chunk, :]
+            psi_rmu_all = psi_rmu_all.at[
+                :, local_bc_start:local_bc_end, :, :].set(psi_rmu_chunk)
+            psi_rmuT_all = psi_rmuT_all.at[
+                :, :, local_bc_start:local_bc_end, :].set(psi_rmuT_chunk)
+            del psi_G_flat, psi_rmu_band, psi_rmu_chunk, psi_rmuT_chunk
         else:
-            # K-chunked path: process k-points in batches
             for kc_idx in range(num_k_chunks):
                 kc_start = kc_idx * k_chunk_size
                 kc_end = min(kc_start + k_chunk_size, nk_tot)
                 nk_chunk = kc_end - kc_start
+                k_ids = list(range(kc_start, kc_end))
 
-                # Create a temporary Meta-like object with the k-chunk's nk_tot
-                # so that read_Gvecs_to_devices and get_sharded_wfns_centroids
-                # operate on the chunk only.
-                meta_kchunk = _make_kchunk_meta(meta, kc_start, kc_end)
-                kvecs_frac_chunk = kvecs_frac[kc_start:kc_end]
-
-                # Load G-space for this k-chunk × band-chunk
-                if phdf5_reader is not None:
-                    k_ids = np.arange(kc_start, kc_end, dtype=np.int32)
-                    global_psi_Gtot = phdf5_reader.coeffs_gspace(
-                        bc_range, k_ids=k_ids, bispinor=bispinor)
-                else:
-                    global_psi_Gtot, _ = read_Gvecs_to_devices(
-                        wfn, sym, bc_range, meta_kchunk, bispinor, mesh_xy,
-                        k_range=(kc_start, kc_end))
-
-                # FFT and extract centroids
-                psi_rmu_kchunk, psi_rmuT_kchunk = get_sharded_wfns_centroids(
-                    global_psi_Gtot, meta_kchunk, centroid_indices,
-                    kvecs_frac_chunk, mesh_xy, bc_range)
-
-                # Accumulate into full output
-                psi_rmu_all = psi_rmu_all.at[kc_start:kc_end, local_bc_start:local_bc_end, :, :].set(psi_rmu_kchunk)
-                psi_rmuT_all = psi_rmuT_all.at[kc_start:kc_end, :, local_bc_start:local_bc_end, :].set(psi_rmuT_kchunk)
-
-                del global_psi_Gtot, psi_rmu_kchunk, psi_rmuT_kchunk
+                psi_G_flat = loader.load(
+                    bands=bc_range, k=k_ids,
+                    sharding=sharding_load, bispinor=bispinor)
+                kvecs_chunk = kvecs_frac_full[kc_start:kc_end]
+                g_index_chunk = g_index_full[kc_start:kc_end]
+                psi_rmu_band = to_rmu(
+                    psi_G_flat, g_index_chunk, meta.fft_grid,
+                    centroid_idx_np, norm="ortho",
+                    kvecs_frac=jnp.asarray(kvecs_chunk))
+                nb_padded_chunk = int(psi_rmu_band.shape[1])
+                reshard_fn = _make_reshard_fn(nb_padded_chunk, nk_chunk)
+                psi_rmu_kchunk, psi_rmuT_kchunk = reshard_fn(psi_rmu_band)
+                psi_rmu_kchunk = psi_rmu_kchunk[:, :nb_chunk, :, :]
+                psi_rmuT_kchunk = psi_rmuT_kchunk[:, :, :nb_chunk, :]
+                psi_rmu_all = psi_rmu_all.at[
+                    kc_start:kc_end, local_bc_start:local_bc_end, :, :
+                ].set(psi_rmu_kchunk)
+                psi_rmuT_all = psi_rmuT_all.at[
+                    kc_start:kc_end, :, local_bc_start:local_bc_end, :
+                ].set(psi_rmuT_kchunk)
+                del psi_G_flat, psi_rmu_band, psi_rmu_kchunk, psi_rmuT_kchunk
                 gc.collect()
 
-    # Band-axis pad: when meta.b_id_4 was rounded up so the band axis
-    # divides the device mesh, the trailing rows here may contain real
-    # ψ(r_μ) read from the WFN file for bands the user did NOT request.
-    # Zero them so every downstream pair-density / Σ contraction sees no
-    # contribution from the pad.  See common.meta.Meta.from_system.
+    # Zero user-band-pad rows (unchanged contract).
     nb_user_in_range = max(0, meta.b_id_4_user - b_start)
     if nb_user_in_range < nb_total:
         zero_y = jnp.zeros_like(psi_rmu_all[:, nb_user_in_range:nb_total, :, :])
         zero_x = jnp.zeros_like(psi_rmuT_all[:, :, nb_user_in_range:nb_total, :])
-        psi_rmu_all = psi_rmu_all.at[:, nb_user_in_range:nb_total, :, :].set(zero_y)
-        psi_rmuT_all = psi_rmuT_all.at[:, :, nb_user_in_range:nb_total, :].set(zero_x)
+        psi_rmu_all = psi_rmu_all.at[
+            :, nb_user_in_range:nb_total, :, :].set(zero_y)
+        psi_rmuT_all = psi_rmuT_all.at[
+            :, :, nb_user_in_range:nb_total, :].set(zero_x)
 
-    # Cached reader stays alive — see ``_get_phdf5_reader``.
     return psi_rmu_all, psi_rmuT_all

@@ -11,7 +11,13 @@ This module contains:
 - kin_ion: Kinetic + ionic Hamiltonian I/O
 """
 
-from .wfnreader import WFNReader
+from .wfn_loader import WfnLoader
+# Back-compat alias: every active caller uses ``WFNReader(path)`` as a
+# pure-metadata accessor today.  ``WfnLoader`` covers that surface 1:1
+# (mf_header attributes mirrored verbatim; ``_filename`` exposed for
+# callers that thread it).  This shim lets the existing import sites
+# stay; a follow-up commit will sweep them to ``WfnLoader`` directly.
+WFNReader = WfnLoader
 from .qe_save_reader import CrystalData
 from .wfn_writer import WFNWriter
 from .epsreader import EPSReader

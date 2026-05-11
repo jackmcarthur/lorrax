@@ -399,7 +399,7 @@ def load_bse_data_from_restart_sharded(
                 nkx, nky, nkz = (int(kgrid_vals[0]), int(kgrid_vals[1]),
                                   int(kgrid_vals[2]))
             elif input_file is not None:
-                from file_io import WFNReader
+                from file_io import WfnLoader as WFNReader
                 _wfn = WFNReader(_parse_wfn_path(input_file))
                 nkx, nky, nkz = (int(_wfn.kgrid[0]), int(_wfn.kgrid[1]),
                                   int(_wfn.kgrid[2]))
@@ -492,7 +492,7 @@ def load_bse_data_from_restart_sharded(
         # cell_volume: caller may pass directly; otherwise pull from WFN.
         if cell_volume is None and input_file is not None:
             try:
-                from file_io import WFNReader
+                from file_io import WfnLoader as WFNReader
                 cell_volume = float(WFNReader(_parse_wfn_path(input_file)).cell_volume)
             except Exception as exc:
                 print(f"BSE sharded load: cell_volume unresolved ({exc}); skipping head")
@@ -635,7 +635,7 @@ def resolve_n_occ(
 
     if input_file is not None:
         try:
-            from file_io import WFNReader
+            from file_io import WfnLoader as WFNReader
             wfn_path = _parse_wfn_path(input_file)
             if os.path.exists(wfn_path):
                 w = WFNReader(wfn_path)
@@ -707,7 +707,7 @@ def apply_eqp_corrections(
     enk_qp = enk_full.copy()
 
     if input_file is not None:
-        from file_io import WFNReader
+        from file_io import WfnLoader as WFNReader
         from common.symmetry_maps import SymMaps
 
         wfn_path = _parse_wfn_path(input_file)
@@ -816,7 +816,7 @@ def _load_ring_subset(
         from gw.head_correction import apply_q0_head_rank1
         # Pull cell_volume from the WFN — head update needs the 1/V_cell
         # scaling (see scripts/checks/sigma_direct_check.py for the canonical convention).
-        from file_io import WFNReader
+        from file_io import WfnLoader as WFNReader
         wfn = WFNReader(_parse_wfn_path(input_file)) if input_file else None
         cell_volume = float(wfn.cell_volume) if wfn is not None else None
         if cell_volume is None:
@@ -856,7 +856,7 @@ def _load_ring_subset(
             raise ValueError(
                 "BSE: flat-q V_qmunu requires input_file to resolve "
                 "kgrid from the WFN")
-        from file_io import WFNReader
+        from file_io import WfnLoader as WFNReader
         _wfn = WFNReader(_parse_wfn_path(input_file))
         nkx, nky, nkz = (int(_wfn.kgrid[0]), int(_wfn.kgrid[1]), int(_wfn.kgrid[2]))
         n_rmu = int(V_qmunu.shape[-1])
