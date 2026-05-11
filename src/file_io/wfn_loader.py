@@ -276,7 +276,22 @@ class WfnLoader:
         else:
             sym = self._ensure_sym()
             for j, nk in enumerate(k_idxs):
-                g_rot = sym.get_gvecs_kfull(self, int(nk))  # reuses existing impl
+                # Inlines the former ``sym.get_gvecs_kfull`` body — see
+                # the unfold derivation in ``test_wfn_loader_eager.py``
+                # ``test_gvecs_full_bz_matches_legacy``.  Each full-BZ k
+                # rotates its IBZ-source G-list by ``sym_krep`` and
+                # subtracts the BGW umklapp ``kg0``.
+                nk_int = int(nk)
+                sym_idx = int(sym.irk_sym_map[nk_int])
+                kbar = int(sym.irk_to_k_map[nk_int])
+                sym_krep = np.asarray(
+                    sym.sym_mats_k[sym_idx], dtype=np.int32)
+                start = int(self._kpt_starts[kbar])
+                end = start + int(self.ngk[kbar])
+                k_gvecs = self._gvecs_raw[start:end]
+                Gkk = sym._get_umklapp_vector(
+                    self, nk_int, sym_idx, kbar, sym_krep)
+                g_rot = np.einsum('ij,kj->ki', sym_krep, k_gvecs) - Gkk
                 out[j, : g_rot.shape[0]] = g_rot
         self._gvecs_cache[key] = out
         return out

@@ -104,15 +104,6 @@ def _legacy_psi_ibz(wfn: WFNReader, band_range, k_idxs) -> list[np.ndarray]:
     return [wfn.get_cnk_batch(int(ik), band_idx) for ik in k_idxs]
 
 
-def _legacy_psi_full_bz(wfn: WFNReader, sym: SymMaps, band_range,
-                        k_idxs) -> list[np.ndarray]:
-    """Reproduce loader.load(k='full_bz') via legacy SymMaps unfold."""
-    b_lo, b_hi = band_range
-    band_idx = np.arange(b_lo, b_hi)
-    return [sym.get_cnk_fullzone_batch(wfn, band_idx, int(nk))
-            for nk in k_idxs]
-
-
 # ---------------------------------------------------------------------------
 
 def _wfn_path() -> str | None:
@@ -191,37 +182,14 @@ def test_gvecs_ibz_matches_legacy(wfn_path):
 # Full BZ unfold
 # ---------------------------------------------------------------------------
 
-def test_load_full_bz_matches_sym_unfold(wfn_path):
-    legacy = WFNReader(wfn_path)
-    sym = SymMaps(legacy)
-    with WfnLoader(wfn_path) as loader:
-        b_hi = min(4, int(legacy.nbands))
-        band_range = (0, b_hi)
-        k_idxs = np.arange(int(sym.nk_tot))
-
-        psi = np.asarray(loader.load(bands=band_range, k="full_bz"))
-        ngk_valid = loader.ngk_valid(k="full_bz")
-        ref = _legacy_psi_full_bz(legacy, sym, band_range, k_idxs)
-        got = _ngk_valid_strip(psi, ngk_valid)
-
-        for j, (r, g) in enumerate(zip(ref, got)):
-            np.testing.assert_allclose(
-                g, r, atol=1e-14, rtol=0,
-                err_msg=f"nk={j} sym_idx={int(sym.irk_sym_map[j])}")
-
-
-def test_gvecs_full_bz_matches_legacy(wfn_path):
-    legacy = WFNReader(wfn_path)
-    sym = SymMaps(legacy)
-    with WfnLoader(wfn_path) as loader:
-        gvecs = loader.gvecs(k="full_bz")
-        ngk_valid = loader.ngk_valid(k="full_bz")
-        for nk in range(int(sym.nk_tot)):
-            ref = sym.get_gvecs_kfull(legacy, int(nk))
-            np.testing.assert_array_equal(
-                gvecs[nk, : int(ngk_valid[nk])], ref,
-                err_msg=f"nk={nk}")
-
+# Retired in P5: ``test_load_full_bz_matches_sym_unfold`` and
+# ``test_gvecs_full_bz_matches_legacy`` compared the loader to
+# ``SymMaps.get_cnk_fullzone[_batch]`` / ``get_gvecs_kfull`` —
+# all three reference helpers were deleted from SymMaps once they had
+# no remaining callers.  The full-BZ unfold path is now validated by:
+#   - ``test_bispinor_lift_matches_legacy`` (below) — exercises ``k='full_bz'``
+#   - ``common/wfn_loader_backend_parity_test.py`` (phdf5 vs eager)
+#   - the MoS2 3x3 xonly GW smoke (eqp0.dat bit-identical to reference)
 
 # ---------------------------------------------------------------------------
 # Padding contract

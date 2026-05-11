@@ -31,7 +31,25 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from functools import partial
+from functools import partial, lru_cache
+
+
+# Per-WFN-path cache of full-BZ G-vectors (replaces
+# ``sym.get_gvecs_kfull`` per-k calls in compute_valence_density).  The
+# loader's eager backend slurps ``wfns/coeffs`` once per path; cheap
+# vs. building SymMaps per call.
+@lru_cache(maxsize=4)
+def _wfn_loader_for_path(path: str):
+    from file_io.wfn_loader import WfnLoader
+    return WfnLoader(path)
+
+
+def _gvecs_full_cache(wfn):
+    return _wfn_loader_for_path(wfn._filename).gvecs(k="full_bz")
+
+
+def _ngk_full_cache(wfn):
+    return _wfn_loader_for_path(wfn._filename).ngk_valid(k="full_bz")
 # Support both `python -m psp.get_DFT_mtxels` and direct script execution
 try:
     from .normalize import normalize_dataclass
@@ -211,7 +229,8 @@ def compute_valence_density(wfn_k, sym, wfn):
                 jnp.real(jnp.conj(psi_r) * psi_r), axis=(0, 1)
             )
         else:
-            gvecs_k = np.asarray(sym.get_gvecs_kfull(wfn, ik))
+            # gvecs_k = sym.get_gvecs_kfull(wfn, ik)  # legacy
+            gvecs_k = np.asarray(_gvecs_full_cache(wfn)[ik, : int(_ngk_full_cache(wfn)[ik])])
             Gx = jnp.asarray(gvecs_k[:, 0], dtype=jnp.int32)
             Gy = jnp.asarray(gvecs_k[:, 1], dtype=jnp.int32)
             Gz = jnp.asarray(gvecs_k[:, 2], dtype=jnp.int32)

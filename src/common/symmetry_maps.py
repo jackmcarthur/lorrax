@@ -1,12 +1,11 @@
-# TODO(fractional translations): ``get_gvecs_kfull`` applies only the
-# integer rotation+umklapp part (S·G − kg0) — no τ phase.  That is
-# correct when the G-list is consumed by scalar functions of |q+G| (e.g.
-# v(q+G) in file_io/read_bgw_vcoul.fill_v_grid_for_q).  Any routine that
-# pairs these G-indices with wavefunction coefficients must pick them
-# up via ``get_cnk_fullzone`` (or reapply the τ phase + spinor rotation
-# + time-reversal conjugation it performs).  If we add new callers that
-# touch coefficients without going through ``get_cnk_fullzone``, the
-# fractional-translation phase has to be threaded in explicitly.
+# Note (fractional translations): the public wfn-unfold helpers
+# ``get_gvecs_kfull`` / ``get_cnk_fullzone[_batch]`` lived here until
+# P5; that whole pipeline now lives inside
+# ``file_io.wfn_loader.WfnLoader`` (eager + phdf5 backends, both
+# applying U_spinor + τ phase + TR conjugation in one place).  This
+# module retains the sym-table construction (kpoint_map, R_grid,
+# unfolded_kpts, …) and the kfull-symmap / q-IBZ helpers used by the
+# GW driver.
 import numpy as np
 import jax.numpy as jnp
 from file_io import WFNReader
@@ -735,13 +734,6 @@ class SymMaps:
         
         return kfull_symmap
 
-    def _get_symmetry_context(self, nk):
-        """Return the symmetry data used to unfold a full-zone k-point."""
-        sym_idx = int(self.irk_sym_map[nk])
-        kbar_idx = int(self.irk_to_k_map[nk])
-        sym_krep = np.asarray(self.sym_mats_k[sym_idx], dtype=np.int32)
-        return sym_idx, kbar_idx, sym_krep
-
     def _get_umklapp_vector(self, wfn, nk, sym_idx, kbar_idx, sym_krep):
         """Return BGW's kg0 for the selected full-zone k-point.
 
@@ -766,132 +758,6 @@ class SymMaps:
                 f"k_full={k_full}, S*kbar={skbar}, kg0={kg0}"
             )
         return kg0
-
-    def _get_fractional_translation_phase(
-        self,
-        wfn,
-        nk,
-        sym_idx,
-        kbar_idx,
-        sym_krep,
-        k_gvecs=None,
-    ):
-        """Return BGW-style non-symmorphic phase factors for unfolded coeffs.
-
-        For ordinary WFN unfolding, BGW multiplies each coefficient by
-            exp[-i (G_target + kg0) · tau]
-        where tau is stored in the WFN header as ``tnp`` and ``kg0`` is the
-        symmetry umklapp taking ``S kbar`` back into the target first-BZ k.
-
-        Since
-            G_target = S G_source - kg0 ,
-        the phase can be evaluated equivalently as
-            exp[-i (S G_source) · tau] .
-        This is the form used below because LORRAX reads coefficients on the
-        source irreducible-zone G-list before rotating them into the full zone.
-        """
-        if sym_idx >= len(self.sym_matrices):
-            return None
-
-        tau = np.asarray(wfn.translations[sym_idx], dtype=np.float64)
-        if not np.any(np.abs(tau) > 1e-12):
-            return None
-
-        if k_gvecs is None:
-            k_gvecs = wfn.get_gvec_nk(kbar_idx)
-
-        # Keep the BGW kg0 convention explicit in this path as a guardrail for
-        # the phase algebra, even though it cancels in the final expression.
-        _ = self._get_umklapp_vector(wfn, nk, sym_idx, kbar_idx, sym_krep)
-
-        rotated_source_g = np.einsum(
-            'ij,gj->gi',
-            sym_krep,
-            np.asarray(k_gvecs, dtype=np.int32),
-        )
-        phase_arg = np.asarray(rotated_source_g, dtype=np.float64) @ tau
-        return np.exp(-1j * phase_arg)
-
-    def get_gvecs_kfull(self,wfn,nk):
-        # nb: band index
-        # nk: index of k in sym.unfolded_kpts
-        # relationship: u_n(kbar{S|tau}) (G) = u_nkbar(G{S|tau} - G_S), apparently..
-        # (S.T@G = G@S)
-
-        sym_idx, kbar_idx, sym_krep = self._get_symmetry_context(nk)
-        
-        #wfn_kG = wfn.get_cnk(kbar_idx,nb)
-        k_gvecs = wfn.get_gvec_nk(kbar_idx)
-        Gkk = self._get_umklapp_vector(wfn, nk, sym_idx, kbar_idx, sym_krep)
-
-        k_gvecs_rot = np.einsum('ij,kj->ki', sym_krep.astype(np.int32), k_gvecs) # kgrid.x says sym 9 maps k to kbar
-        k_gvecs_rot -= Gkk
-        #wfn_kG = np.einsum('jk,kl->jl', self.U_spinor[sym_idx], wfn_kG)
-        #wfn_kGgrid = np.zeros((2,*wfn.fft_grid),dtype=np.complex128)
-        #for ispin in range(2):
-        #    fftbox[ispin,k_gvecs_rot[:,0],k_gvecs_rot[:,1],k_gvecs_rot[:,2]] = wfn_kG[ispin]
-        return k_gvecs_rot
-    
-    def get_cnk_fullzone(self,wfn,nb,nk):
-        sym_idx, kbar_idx, sym_krep = self._get_symmetry_context(nk)
-
-        k_gvecs = None
-        wfn_kG = wfn.get_cnk(kbar_idx,nb)
-        
-        # For time-reversal symmetries (sym_idx >= ntran), apply complex conjugation
-        # Time-reversal: ψ_{n,-k}(r) = ψ*_{nk}(r), so u_{n,-k}(G) = u*_{nk}(-G)
-        ntran = len(self.sym_matrices)  # Number of spatial symmetries
-        if sym_idx >= ntran:
-            wfn_kG = np.conj(wfn_kG)
-        else:
-            phase = self._get_fractional_translation_phase(
-                wfn,
-                nk,
-                sym_idx,
-                kbar_idx,
-                sym_krep,
-                k_gvecs=k_gvecs,
-            )
-            if phase is not None:
-                wfn_kG = wfn_kG * phase[None, :]
-        
-        wfn_kG = np.einsum('jk,kl->jl', self.U_spinor[sym_idx], wfn_kG)
-        return wfn_kG
-
-    def get_cnk_fullzone_batch(self, wfn, band_indices, nk):
-        """Apply symmetry operations to multiple bands at once (vectorized).
-        
-        Args:
-            wfn: WFNReader instance
-            band_indices: array-like of band indices
-            nk: index of k-point in unfolded grid
-            
-        Returns:
-            np.ndarray: Rotated coefficients of shape (nb, 2, ngk)
-        """
-        sym_idx, kbar_idx, sym_krep = self._get_symmetry_context(nk)
-        
-        # Batch read from WFN: (nb, 2, ngk)
-        cnk_batch = wfn.get_cnk_batch(kbar_idx, band_indices)
-        
-        # Time-reversal conjugation if needed
-        ntran = len(self.sym_matrices)
-        if sym_idx >= ntran:
-            cnk_batch = np.conj(cnk_batch)
-        else:
-            phase = self._get_fractional_translation_phase(
-                wfn,
-                nk,
-                sym_idx,
-                kbar_idx,
-                sym_krep,
-            )
-            if phase is not None:
-                cnk_batch = cnk_batch * phase[None, None, :]
-        
-        # Vectorized spinor rotation: U[j,k] @ cnk[n,k,l] -> result[n,j,l]
-        # U_spinor is (2, 2), cnk_batch is (nb, 2, ngk)
-        return np.einsum('jk,nkl->njl', self.U_spinor[sym_idx], cnk_batch)
 
     def find_qpoint_index(self, q_ext, tol=1e-6):
         """Find index of q-point in unfolded k-points list.
