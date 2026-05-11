@@ -16,12 +16,15 @@ Backends
 ``backend='auto'`` (default) picks the lightest path that works:
 
 - **eager** (host h5py + numpy unfold + ``device_put``): single-process,
-  CPU JAX, or small files.  This is the only backend P1 implements.
+  CPU JAX, or small files.
 - **phdf5** (collective parallel-HDF5 FFI + on-device unfold): multi-rank
-  GPU, large files that don't fit in host RAM.  P2.
+  GPU + 2-D mesh + FFI .so loadable.  Reuses the same union-read +
+  unfold kernel that powered the legacy ``PhdfWfnReader.coeffs_gspace``
+  path, but stops one step short of the FFT-box scatter so the output
+  stays G-flat (the loader's defining layout).
 
 Both backends produce **byte-identical** output for the same ``(bands, k,
-sharding, bispinor)`` request.
+sharding, bispinor)`` request — that's the P2 test contract.
 
 Public surface
 --------------
@@ -52,6 +55,7 @@ import h5py as h5
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from .mf_header import read_mf_header_from_file
@@ -79,15 +83,19 @@ class WfnLoader:
 
         if backend == "auto":
             backend = self._auto_pick_backend()
-        if backend == "phdf5":
-            raise NotImplementedError(
-                "WfnLoader: phdf5 backend lands in P2; use backend='eager'."
-            )
-        if backend != "eager":
+        if backend not in ("eager", "phdf5"):
             raise ValueError(f"unknown backend {backend!r}")
+        if backend == "phdf5" and mesh is None:
+            raise ValueError(
+                "WfnLoader: backend='phdf5' requires a Mesh; pass mesh=...")
         self.backend = backend
 
         self._file = h5.File(self._path, "r")
+
+        # phdf5 collective context (lazy on first load).  Held here so
+        # the file is kept open for the loader's lifetime.
+        self._phdf5_ctx: int | None = None
+        self._phdf5_static_dev: dict | None = None
 
         # mf_header surface — same names WFNReader exposes (drop-in compat).
         hdr = read_mf_header_from_file(self._file)
@@ -150,6 +158,14 @@ class WfnLoader:
             except Exception:
                 pass
             self._file = None
+        ctx = getattr(self, "_phdf5_ctx", None)
+        if ctx is not None:
+            try:
+                from ffi.phdf5 import close_file
+                close_file(ctx)
+            except Exception:
+                pass
+            self._phdf5_ctx = None
 
     def __enter__(self) -> "WfnLoader":
         return self
@@ -164,8 +180,28 @@ class WfnLoader:
     # Backend selection
     # ------------------------------------------------------------------
     def _auto_pick_backend(self) -> str:
-        # P1 only has eager.  P2 will check for FFI .so + multi-rank + mesh.
-        return "eager"
+        """Pick the lightest backend that works.
+
+        Rules:
+          * Mesh missing → eager (single-device / laptop / pytest).
+          * Single-process JAX → eager (no benefit from collective FFI).
+          * Multi-process JAX + mesh provided + FFI .so loadable → phdf5.
+          * Anything else → eager.
+        """
+        if self._mesh is None:
+            return "eager"
+        try:
+            if int(jax.process_count()) <= 1:
+                return "eager"
+        except Exception:
+            return "eager"
+        try:
+            from ffi.common.ffi_loader import get_lib
+            get_lib()
+            from ffi.phdf5 import open_file as _of  # noqa: F401
+            return "phdf5"
+        except Exception:
+            return "eager"
 
     # ------------------------------------------------------------------
     # k-set resolution
@@ -350,6 +386,196 @@ class WfnLoader:
     # ------------------------------------------------------------------
     # The main load
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # phdf5 backend — collective FFI read + on-device unfold
+    # ------------------------------------------------------------------
+    def _ensure_phdf5_static(self) -> dict:
+        """Lazy build of the per-full-BZ-k symmetry tables on device.
+
+        Builds once per ``WfnLoader`` instance; subsequent ``load()``
+        calls reuse the staged arrays.  Mirrors
+        ``PhdfWfnReader._build_symmetry_tables`` +
+        ``_compute_phases_all_full_k`` + ``_device_put_static_tables``
+        but without the FFT-box machinery (which lives downstream in
+        ``wfn_transforms``).
+        """
+        if self._phdf5_static_dev is not None:
+            return self._phdf5_static_dev
+
+        from ffi.phdf5 import open_file
+
+        sym = self._ensure_sym()
+        nk_full = int(sym.nk_tot)
+        ngkmax = int(self.ngkmax)
+        ibz_per_full = np.asarray(sym.irk_to_k_map, dtype=np.int32)[:nk_full]
+        sym_idx_per_full = np.asarray(sym.irk_sym_map, dtype=np.int32)[:nk_full]
+        n_tran = int(sym.sym_matrices.shape[0])
+        tr_mask = (sym_idx_per_full >= n_tran).astype(np.bool_)
+        U_per = np.asarray(sym.U_spinor)[sym_idx_per_full]            # (nk_full, ns, ns)
+
+        # τ-phase per full-BZ k on the ibz-source ngkmax-padded G-list.
+        # For TR-image k's, set to 1 (TR conjugation is applied
+        # separately in the unfold kernel; matches PhdfWfnReader).
+        phase = np.ones((nk_full, ngkmax), dtype=np.complex128)
+        for nk in range(nk_full):
+            s = int(sym_idx_per_full[nk])
+            if s >= n_tran:
+                continue
+            tau = np.asarray(sym.translations[s], dtype=np.float64)
+            if not np.any(np.abs(tau) > 1e-12):
+                continue
+            ibz = int(ibz_per_full[nk])
+            ngk_k = int(self.ngk[ibz])
+            start = int(self._kpt_starts[ibz])
+            g_bar = self._gvecs_raw[start:start + ngk_k]
+            rotated = (np.asarray(sym.sym_mats_k[s], dtype=np.int32) @ g_bar.T).T
+            phase[nk, :ngk_k] = np.exp(
+                -1j * rotated.astype(np.float64) @ tau)
+
+        # Open the phdf5 collective context lazily.
+        if self._phdf5_ctx is None:
+            self._phdf5_ctx = open_file(self._path, mesh=self._mesh, mode="r")
+
+        # Device-stage the static tables once.  Sharding choice mirrors
+        # ``PhdfWfnReader._device_put_static_tables`` — all replicated
+        # since they're per-full-BZ-k metadata, not per-band data.
+        rep0 = NamedSharding(self._mesh, P())
+        rep1 = NamedSharding(self._mesh, P(None))
+        rep2 = NamedSharding(self._mesh, P(None, None))
+        rep3 = NamedSharding(self._mesh, P(None, None, None))
+        self._phdf5_static_dev = {
+            "ibz_per_full": jax.device_put(jnp.asarray(ibz_per_full), rep1),
+            "sym_idx_per_full": jax.device_put(
+                jnp.asarray(sym_idx_per_full), rep1),
+            "tr_mask_per_full": jax.device_put(jnp.asarray(tr_mask), rep1),
+            "U_per_full": jax.device_put(jnp.asarray(U_per), rep3),
+            "phase_per_full": jax.device_put(jnp.asarray(phase), rep2),
+            "n_tran": n_tran,
+            "nk_full": nk_full,
+        }
+        return self._phdf5_static_dev
+
+    def _phdf5_build(
+        self,
+        *,
+        b_lo: int,
+        b_hi: int,
+        k_idxs: np.ndarray,
+        unfold: bool,
+        nb_padded: int,
+        out_sharding: NamedSharding,
+    ) -> jax.Array:
+        """Collective FFI read + on-device unfold → G-flat ψ.
+
+        Output: ``(n_k, nb_padded, nspinor, ngkmax)`` c128 sharded as
+        ``out_sharding`` (typically ``P(None, ('x','y'), None, None)``).
+        """
+        from ffi.phdf5.read import read_kchunk_union_sharded
+
+        static = self._ensure_phdf5_static()
+        ctx = self._phdf5_ctx
+        assert ctx is not None
+        p_x = int(self._mesh.shape["x"])
+        p_y = int(self._mesh.shape["y"])
+        world = p_x * p_y
+        ns = int(self.nspinor)
+        ngkmax = int(self.ngkmax)
+        ngktot = int(np.sum(self.ngk))
+        nb = nb_padded
+        if nb % world:
+            raise ValueError(
+                f"_phdf5_build: nb_padded={nb} not divisible by world={world}; "
+                "this is a loader bug — _default_sharding should have padded.")
+        bands_per_rank = nb // world
+        b_lo_logical = int(b_lo)
+        b_hi_logical = int(b_hi)
+
+        # Determine the union of IBZ k-points to read, and the position
+        # of each requested k in that union.
+        if unfold:
+            ibz_per_full = np.asarray(static["ibz_per_full"])
+            ibz_per_k = ibz_per_full[np.asarray(k_idxs, dtype=np.int32)]
+        else:
+            # k_idxs are already IBZ indices.
+            ibz_per_k = np.asarray(k_idxs, dtype=np.int32)
+
+        ibz_unique_sorted = np.unique(ibz_per_k).astype(np.int32)
+        n_reads = int(ibz_unique_sorted.size)
+        # ``position_in_reads[j]`` = where ibz_per_k[j] sits in the
+        # ascending-sorted union (the dim along which read_kchunk_union
+        # returns its concatenated output).
+        position_in_reads = np.searchsorted(
+            ibz_unique_sorted, ibz_per_k).astype(np.int32)
+        n_k = int(len(k_idxs))
+
+        # Hyperslab offsets/counts for the union read.
+        # Dataset layout: (mnband, nspinor, ngktot, 2) f64; kchunk_axis=2.
+        offsets = np.stack([
+            [b_lo_logical, 0, int(self._kpt_starts[ibz]), 0]
+            for ibz in ibz_unique_sorted
+        ], axis=0).astype(np.int64)
+        counts = np.stack([
+            [bands_per_rank, ns, int(self.ngk[ibz]), 2]
+            for ibz in ibz_unique_sorted
+        ], axis=0).astype(np.int64)
+
+        # Handle short-band tail: the FFI read needs (b_hi - b_lo) bands
+        # in-file.  For requests that exceed wfn.nbands, we'd need a
+        # h5py + replicated tail path (see
+        # PhdfWfnReader._coeffs_gspace_with_short_tail).  For P2 we
+        # raise on this case; the GW driver doesn't request
+        # past-file bands today.
+        if b_hi_logical > int(self.nbands):
+            raise NotImplementedError(
+                f"_phdf5_build: pad-past-file ({b_hi_logical} > "
+                f"nbands={int(self.nbands)}) not yet supported on the "
+                "phdf5 backend.  File a P2.1 if needed; the eager "
+                "backend handles it via zero-fill.")
+
+        rep1 = NamedSharding(self._mesh, P(None))
+        rep2 = NamedSharding(self._mesh, P(None, None))
+        offsets_dev = jax.device_put(jnp.asarray(offsets), rep2)
+        counts_dev = jax.device_put(jnp.asarray(counts), rep2)
+        position_in_reads_dev = jax.device_put(
+            jnp.asarray(position_in_reads), rep1)
+
+        reader = read_kchunk_union_sharded(
+            ctx, "wfns/coeffs",
+            n_kchunk=n_reads,
+            kchunk_axis=2,
+            file_global_shape=(int(self.nbands), ns, ngktot, 2),
+            per_rank_file_shape=(bands_per_rank, ns, ngkmax, 2),
+            dtype=np.float64,
+            mesh=self._mesh,
+            file_partition_spec=P(("x", "y"), None, None, None),
+        )
+        cnk_at_ibz = reader(offsets_dev, counts_dev)
+        # cnk_at_ibz layout: per-rank
+        # (bands_per_rank, ns, n_reads, ngkmax, 2) f64 sharded
+        # P(('x','y'), None, None, None, None).
+
+        # On-device unfold + transpose to WfnLoader's G-flat layout.
+        unfold_jit = _phdf5_unfold_kernel(
+            self._mesh, n_reads=n_reads, n_k=n_k, bands_per_rank=bands_per_rank,
+            nspinor=ns, ngkmax=ngkmax, unfold=unfold)
+
+        if unfold:
+            U_k = jnp.take(static["U_per_full"],
+                           jnp.asarray(k_idxs, dtype=jnp.int32), axis=0)
+            phase_k = jnp.take(static["phase_per_full"],
+                                jnp.asarray(k_idxs, dtype=jnp.int32), axis=0)
+            tr_mask_k = jnp.take(static["tr_mask_per_full"],
+                                  jnp.asarray(k_idxs, dtype=jnp.int32), axis=0)
+            psi = unfold_jit(cnk_at_ibz, U_k, phase_k, tr_mask_k,
+                              position_in_reads_dev)
+        else:
+            psi = unfold_jit(cnk_at_ibz, position_in_reads_dev)
+
+        # psi shape after the kernel: (n_k, nb_padded, ns, ngkmax) c128
+        # with band-axis sharding propagated from the read.
+        return jax.lax.with_sharding_constraint(psi, out_sharding)
+
+    # ------------------------------------------------------------------
     def load(
         self,
         *,
@@ -394,6 +620,18 @@ class WfnLoader:
         named_sharding, p_band = self._default_sharding(
             sharding, n_k=len(k_idxs))
         nb_padded = self._pad_to(nb_logical, p_band)
+
+        if self.backend == "phdf5":
+            # phdf5 path requires a NamedSharding to express the
+            # collective output layout.  Caller passed sharding=None on
+            # a phdf5 loader → replicate output (rare in production but
+            # used by bit-equality tests).
+            if named_sharding is None:
+                named_sharding = NamedSharding(
+                    self._mesh, P(*([None] * 4)))
+            return self._phdf5_build(
+                b_lo=b_lo, b_hi=b_hi, k_idxs=k_idxs, unfold=unfold,
+                nb_padded=nb_padded, out_sharding=named_sharding)
 
         psi_np = self._eager_build(
             b_lo=b_lo, b_hi=b_hi, k_idxs=k_idxs, unfold=unfold,
@@ -496,3 +734,89 @@ class WfnLoader:
             cnk = np.einsum("jk,nkl->njl", U_per[sym_idx], cnk)     # spinor rotate
             out[j, :nb_logical, :, :ngk_k] = cnk
         return out
+
+
+# ---------------------------------------------------------------------------
+# phdf5 unfold-and-relayout kernel (module-level so the JIT cache
+# survives multiple ``load()`` calls at the same shape signature)
+# ---------------------------------------------------------------------------
+
+_PHDF5_UNFOLD_CACHE: dict = {}
+
+
+def _phdf5_unfold_kernel(
+    mesh: Mesh,
+    *,
+    n_reads: int,
+    n_k: int,
+    bands_per_rank: int,
+    nspinor: int,
+    ngkmax: int,
+    unfold: bool,
+):
+    """Jitted shard_map that takes the FFI's re/im-packed IBZ read and
+    returns G-flat ψ in WfnLoader's output layout.
+
+    Steps inside the kernel (mirroring ``PhdfWfnReader._make_unfold_kernel``
+    but rearranged to emit ``(n_k, nb_padded, ns, ngkmax)`` c128 directly
+    instead of the FFT-box-bound ``(bpr, ns, n_k, ngkmax, 2)``):
+
+      1. Re/im → c128.
+      2. ``jnp.take(axis=2, indices=position_in_reads)`` expands the
+         IBZ-union axis to the full requested k-set.
+      3. If ``unfold``: apply ``where(tr_mask, conj, identity)`` then
+         multiply by τ-phase then ``U_spinor`` spinor rotation.  If not
+         ``unfold`` (IBZ raw mode): skip steps 3.
+      4. Transpose ``(bpr, ns, n_k, ngkmax) → (n_k, bpr, ns, ngkmax)``;
+         the rank's ``bpr`` slab becomes the local shard of the global
+         band axis.
+
+    Output sharding ``P(None, ('x','y'), None, None)`` on global shape
+    ``(n_k, nb_padded, ns, ngkmax)``.
+    """
+    key = (
+        "phdf5_unfold", id(mesh), int(n_reads), int(n_k),
+        int(bands_per_rank), int(nspinor), int(ngkmax), bool(unfold),
+    )
+    hit = _PHDF5_UNFOLD_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    if unfold:
+        def _per_rank(cnk_at_ibz, U_per_k, phase_per_k, tr_mask_per_k,
+                       position_in_reads):
+            cnk = cnk_at_ibz[..., 0] + 1j * cnk_at_ibz[..., 1]
+            cnk = jnp.take(cnk, position_in_reads, axis=2)
+            cnk = jnp.where(
+                tr_mask_per_k[None, None, :, None], jnp.conj(cnk), cnk)
+            cnk = cnk * phase_per_k[None, None, :, :]
+            cnk = jnp.einsum("kac,bckg->bakg", U_per_k, cnk)
+            # (bpr, ns, n_k, ngkmax) → (n_k, bpr, ns, ngkmax)
+            return jnp.transpose(cnk, (2, 0, 1, 3))
+
+        in_specs = (
+            P(("x", "y"), None, None, None, None),     # cnk_at_ibz
+            P(None, None, None),                        # U_per_k
+            P(None, None),                              # phase_per_k
+            P(None),                                    # tr_mask_per_k
+            P(None),                                    # position_in_reads
+        )
+    else:
+        # IBZ raw: skip unfold; just take(position_in_reads) and convert.
+        def _per_rank(cnk_at_ibz, position_in_reads):  # type: ignore[misc]
+            cnk = cnk_at_ibz[..., 0] + 1j * cnk_at_ibz[..., 1]
+            cnk = jnp.take(cnk, position_in_reads, axis=2)
+            return jnp.transpose(cnk, (2, 0, 1, 3))
+
+        in_specs = (
+            P(("x", "y"), None, None, None, None),     # cnk_at_ibz
+            P(None),                                    # position_in_reads
+        )
+
+    out_specs = P(None, ("x", "y"), None, None)        # (n_k, bpr→band, ns, ngkmax)
+    jitted = jax.jit(shard_map(
+        _per_rank, mesh=mesh, in_specs=in_specs, out_specs=out_specs,
+        check_rep=False,
+    ))
+    _PHDF5_UNFOLD_CACHE[key] = jitted
+    return jitted

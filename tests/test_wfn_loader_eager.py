@@ -256,11 +256,12 @@ def test_iterator_chunks_band_axis(synth_wfn_path):
 # Backend
 # ---------------------------------------------------------------------------
 
-def test_phdf5_backend_not_implemented_in_p1(synth_wfn_path):
-    with pytest.raises(NotImplementedError, match="phdf5"):
+def test_phdf5_backend_requires_mesh(synth_wfn_path):
+    with pytest.raises(ValueError, match="requires a Mesh"):
         WfnLoader(synth_wfn_path, backend="phdf5")
 
 
-def test_auto_backend_resolves_to_eager(synth_wfn_path):
+def test_auto_backend_resolves_to_eager_on_single_process(synth_wfn_path):
+    # Single-rank pytest: even with a mesh, auto should pick eager.
     with WfnLoader(synth_wfn_path, backend="auto") as loader:
         assert loader.backend == "eager"
