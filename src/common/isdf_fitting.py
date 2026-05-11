@@ -830,13 +830,10 @@ def solve_zeta(
         # Two-step reshard via P('x', None, 'y'); single-step
         # P(None,'x','y') → P(None, None, ('x','y')) triggers SPMD
         # Involuntary Full Rematerialization.
-        target_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
-        intermediate_shard = NamedSharding(mesh_xy, P('x', None, 'y'))
-        @partial(jax.jit, donate_argnums=(0,))
-        def _reshard_out(z):
-            z = jax.lax.with_sharding_constraint(z, intermediate_shard)
-            return jax.lax.with_sharding_constraint(z, target_shard)
-        zeta_out = _reshard_out(zeta_xy)
+        zeta_xy = jax.lax.with_sharding_constraint(
+            zeta_xy, NamedSharding(mesh_xy, P('x', None, 'y')))
+        zeta_out = jax.lax.with_sharding_constraint(
+            zeta_xy, NamedSharding(mesh_xy, P(None, None, ('x', 'y'))))
         if needs_padding:
             return zeta_out[:, :, :n_zchunk]
         return zeta_out
@@ -865,13 +862,11 @@ def solve_zeta(
         eye_n = jnp.eye(n_rmu, dtype=L_q.dtype)[None, :, :]
         A_q = L_q + ridge * eye_n
         zeta_xy = batched_distributed_solve_lu(A_q, Z_q, mesh=mesh_xy)
-        target_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
-        intermediate_shard = NamedSharding(mesh_xy, P('x', None, 'y'))
-        @partial(jax.jit, donate_argnums=(0,))
-        def _reshard_out_lu(z):
-            z = jax.lax.with_sharding_constraint(z, intermediate_shard)
-            return jax.lax.with_sharding_constraint(z, target_shard)
-        zeta_out = _reshard_out_lu(zeta_xy)
+        # Two-step reshard same rationale as the cholesky branch.
+        zeta_xy = jax.lax.with_sharding_constraint(
+            zeta_xy, NamedSharding(mesh_xy, P('x', None, 'y')))
+        zeta_out = jax.lax.with_sharding_constraint(
+            zeta_xy, NamedSharding(mesh_xy, P(None, None, ('x', 'y'))))
         if needs_padding:
             return zeta_out[:, :, :n_zchunk]
         return zeta_out
