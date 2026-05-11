@@ -162,7 +162,7 @@ def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, nspinor=2):
 from .bispinor_init import get_small_psi_component  # noqa: F401 — re-export for callers
 
 
-def read_Gvecs_to_devices(
+def read_Gvecs_to_devices_legacy(
     wfn, sym, bandrange, meta: Meta, bispinor: bool, mesh_xy: Mesh,
     k_range: tuple[int, int] | None = None,
 ):
@@ -297,6 +297,65 @@ def read_Gvecs_to_devices(
     return global_psi_Gtot, nb
 
 
+def read_Gvecs_to_devices(
+    wfn, sym, bandrange, meta: Meta, bispinor: bool, mesh_xy: Mesh,
+    k_range: tuple[int, int] | None = None,
+):
+    """G-space wfns on a 2-D mesh, band-sharded, scattered to FFT box.
+
+    Returns ``(global_psi_Gtot, nb_logical)`` where ``global_psi_Gtot``
+    has shape ``(nk, nb_padded, nspinor, nx, ny, nz)`` sharded
+    ``P(None, ('x','y'), None, None, None, None)`` — same contract as
+    the legacy implementation (kept available as ``read_Gvecs_to_devices_legacy``
+    for one release if a caller needs to bisect).
+
+    The migrated body is thin: :class:`file_io.wfn_loader.WfnLoader`
+    + :func:`common.wfn_transforms.to_box`.  Symmetry unfold, τ-phase,
+    TR conjugation, spinor rotation, band-axis padding/sharding, and
+    the bispinor lift all happen inside ``WfnLoader.load``.  ``sym``
+    is unused (the loader builds its own SymMaps lazily); kept in
+    the signature so existing callers don't have to change.
+
+    Memory note: this function still materialises the FFT-box
+    representation for caller back-compat.  The g_flat path
+    (:meth:`WfnLoader.load` directly) is ~6-11% the size of the FFT
+    box — when the PsiGStore → PsiGCache rewrite lands (next P4c
+    sub-step), the GW driver hot loop will consume g_flat and call
+    ``to_rchunk`` per r-chunk instead of holding the FFT box.
+    """
+    del sym
+    from file_io.wfn_loader import WfnLoader
+    from common.wfn_transforms import to_box
+
+    b_lo, b_hi = int(bandrange[0]), int(bandrange[1])
+    nb_logical = b_hi - b_lo
+    if k_range is None:
+        k = "full_bz"
+    else:
+        k = list(range(int(k_range[0]), int(k_range[1])))
+
+    sharding = P(None, ("x", "y"), None, None)
+
+    loader = WfnLoader(wfn._filename, mesh=mesh_xy)
+    try:
+        psi_G_flat = loader.load(
+            bands=(b_lo, b_hi), k=k, sharding=sharding,
+            bispinor=bool(bispinor),
+        )
+        # Pad spinor axis to ``meta.nspinor`` when the caller's meta
+        # configuration exceeds the loader's output spinor count.
+        # ``bispinor=True`` already produces 4-spinor; this guards a
+        # meta config that wants extra zero-padded components.
+        ns_after_lift = 4 if bispinor else int(loader.nspinor)
+        if int(meta.nspinor) > ns_after_lift:
+            ns_pad = int(meta.nspinor) - ns_after_lift
+            psi_G_flat = jnp.pad(
+                psi_G_flat, ((0, 0), (0, 0), (0, ns_pad), (0, 0)))
+        psi_box = to_box(psi_G_flat, loader.box_index(k=k),
+                          tuple(int(s) for s in meta.fft_grid))
+        return psi_box, nb_logical
+    finally:
+        loader.close()
 
 
 

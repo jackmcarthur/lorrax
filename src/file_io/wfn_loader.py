@@ -599,13 +599,14 @@ class WfnLoader:
 
         ``bispinor=True`` lifts the small spinor components via
         ``(α/2) σ·(k+G) ψ_L``.  ``nspinor_out`` is then 4; else 2 (or
-        the file's ``nspinor``).  P1 raises ``NotImplementedError`` for
-        ``bispinor=True``; lands in P2 alongside phdf5.
+        the file's ``nspinor``).  Requires the WFN file to have
+        ``nspinor == 2`` (BGW Pauli convention); ``ValueError``
+        otherwise.
         """
-        if bispinor:
-            raise NotImplementedError(
-                "WfnLoader: bispinor lift lands in P2; in P1 use the "
-                "legacy load_wfns path for current-density runs.")
+        if bispinor and int(self.nspinor) != 2:
+            raise ValueError(
+                f"WfnLoader.load(bispinor=True) requires a 2-spinor WFN; "
+                f"file has nspinor={int(self.nspinor)}.")
 
         b_lo, b_hi = int(bands[0]), int(bands[1])
         nb_logical = b_hi - b_lo
@@ -621,21 +622,48 @@ class WfnLoader:
             sharding, n_k=len(k_idxs))
         nb_padded = self._pad_to(nb_logical, p_band)
 
+        # Backends produce 2-spinor ψ in the canonical layout
+        # ``(n_k, nb_padded, nspinor, ngkmax)`` c128.  The optional
+        # bispinor lift below promotes the spinor axis 2 → 4 in one
+        # k-vectorised pass (eager: numpy → jnp; phdf5: stays on
+        # device).  Eager output is host-staged at the end via
+        # ``device_put``; the bispinor-True case routes through
+        # ``jnp`` for the lift but follows the same staging path.
         if self.backend == "phdf5":
             # phdf5 path requires a NamedSharding to express the
             # collective output layout.  Caller passed sharding=None on
             # a phdf5 loader → replicate output (rare in production but
-            # used by bit-equality tests).
+            # used by bit-equality tests).  Spinor axis size is 4 when
+            # bispinor=True.
+            ns_out = 4 if bispinor else int(self.nspinor)
             if named_sharding is None:
                 named_sharding = NamedSharding(
                     self._mesh, P(*([None] * 4)))
-            return self._phdf5_build(
+            elif bispinor:
+                # Rebuild the sharding for the post-lift shape — only
+                # the spinor axis count changes; partition spec is the
+                # same string set.
+                pass  # NamedSharding doesn't care about exact dim sizes
+            psi = self._phdf5_build(
                 b_lo=b_lo, b_hi=b_hi, k_idxs=k_idxs, unfold=unfold,
                 nb_padded=nb_padded, out_sharding=named_sharding)
+            if bispinor:
+                psi = self._apply_bispinor_lift(
+                    psi, k=k, k_idxs=k_idxs, unfold=unfold,
+                    sharding=named_sharding)
+            return psi
 
         psi_np = self._eager_build(
             b_lo=b_lo, b_hi=b_hi, k_idxs=k_idxs, unfold=unfold,
             nb_padded=nb_padded)
+
+        if bispinor:
+            psi_j = jnp.asarray(psi_np)
+            psi_j = self._apply_bispinor_lift(
+                psi_j, k=k, k_idxs=k_idxs, unfold=unfold, sharding=None)
+            if named_sharding is None:
+                return psi_j
+            return jax.device_put(psi_j, named_sharding)
 
         if named_sharding is None:
             return jnp.asarray(psi_np)
@@ -662,6 +690,53 @@ class WfnLoader:
             yield (bc_lo, bc_hi), self.load(
                 bands=(bc_lo, bc_hi), k=k, sharding=sharding,
                 bispinor=bispinor)
+
+    # ------------------------------------------------------------------
+    # Bispinor lift (G-flat)
+    # ------------------------------------------------------------------
+    def _apply_bispinor_lift(
+        self,
+        psi_2: jax.Array,
+        *,
+        k: KSpec,
+        k_idxs: np.ndarray,
+        unfold: bool,
+        sharding: NamedSharding | None,
+    ) -> jax.Array:
+        """ψ (2-spinor) → ψ (4-spinor) by appending the small components.
+
+        Computes the lower-2 spinor components via
+        ``(α/2) σ·(k+G) ψ_L`` on G-flat directly — no FFT box.  Sharding
+        propagates through (the lift is k-vectorised + band-broadcast;
+        no cross-rank op).  Matches the legacy
+        :func:`common.bispinor_init.get_small_psi_component` byte-for-byte
+        but is vectorised across k.
+
+        Pad rows of ψ are zero → small components of pad rows are also
+        zero (clean propagation, no per-k mask needed).
+
+        ``unfold`` tells us which kvec table to use: raw IBZ
+        (``wfn.kpoints``, k_idxs are IBZ indices) vs full-BZ
+        (``sym.unfolded_kpts``, k_idxs are full-BZ indices).
+        """
+        gvecs = np.asarray(self.gvecs(k=k))                  # (n_k, ngkmax, 3) int
+        if unfold:
+            sym = self._ensure_sym()
+            kvecs_np = np.asarray(
+                sym.unfolded_kpts, dtype=np.float64)[
+                    np.asarray(k_idxs, dtype=np.int32)]
+        else:
+            kvecs_np = np.asarray(
+                self.kpoints, dtype=np.float64)[
+                    np.asarray(k_idxs, dtype=np.int32)]
+        bvec = np.asarray(self.bvec, dtype=np.float64)
+        return _bispinor_lift_kernel(
+            psi_2,
+            jnp.asarray(gvecs, dtype=jnp.float64),
+            jnp.asarray(kvecs_np),
+            jnp.asarray(bvec),
+            sharding=sharding,
+        )
 
     # ------------------------------------------------------------------
     # Eager unfold core
@@ -734,6 +809,63 @@ class WfnLoader:
             cnk = np.einsum("jk,nkl->njl", U_per[sym_idx], cnk)     # spinor rotate
             out[j, :nb_logical, :, :ngk_k] = cnk
         return out
+
+
+# ---------------------------------------------------------------------------
+# Bispinor small-component lift kernel
+# ---------------------------------------------------------------------------
+#
+# 2-spinor ψ (..., 2, ngkmax) → 4-spinor ψ (..., 4, ngkmax) via
+# (α/2) σ · (k+G) ψ_L applied to the upper components.  Matches the
+# legacy :func:`common.bispinor_init.get_small_psi_component` math
+# exactly but is vectorised across k.
+
+# Half the fine-structure constant α (Hartree units, matches
+# common.bispinor_init).
+_HALFALPHA = 0.00364867628215
+
+
+def _bispinor_lift_kernel(
+    psi_2: jax.Array,
+    gvecs: jax.Array,
+    kvecs: jax.Array,
+    bvec: jax.Array,
+    *,
+    sharding: NamedSharding | None,
+) -> jax.Array:
+    """Append small components → 4-spinor ψ.
+
+    psi_2: (n_k, nb, 2, ngkmax) c128
+    gvecs: (n_k, ngkmax, 3)  float64 (already cast)
+    kvecs: (n_k, 3)          float64
+    bvec : (3, 3)            float64
+    """
+    halfalpha = jnp.complex128(_HALFALPHA)
+
+    # (k + G) in cartesian, per (k, g).
+    pkG = gvecs + kvecs[:, None, :]                         # (n_k, ngkmax, 3)
+    p_cart = pkG @ bvec                                      # (n_k, ngkmax, 3)
+    px = p_cart[..., 0].astype(jnp.complex128)
+    py = p_cart[..., 1].astype(jnp.complex128)
+    pz = p_cart[..., 2].astype(jnp.complex128)
+
+    # σ·p as a (2, 2) Pauli-contraction stacked per (k, g):
+    #   [[ pz, px - i*py],
+    #    [px + i*py, -pz]]
+    sdp = jnp.stack(
+        [jnp.stack([pz,  px - 1j * py], axis=-1),
+         jnp.stack([px + 1j * py, -pz], axis=-1)],
+        axis=-2,
+    )                                                        # (n_k, ngkmax, 2, 2)
+
+    # ψ_S[k, b, i, g] = halfalpha · Σ_j σ·p[k, g, i, j] · ψ_L[k, b, j, g]
+    psi_S = halfalpha * jnp.einsum(
+        "kgij,kbjg->kbig", sdp, psi_2[:, :, 0:2, :])
+
+    out = jnp.concatenate([psi_2, psi_S], axis=2)            # (n_k, nb, 4, ngkmax)
+    if sharding is not None:
+        out = jax.lax.with_sharding_constraint(out, sharding)
+    return out
 
 
 # ---------------------------------------------------------------------------
