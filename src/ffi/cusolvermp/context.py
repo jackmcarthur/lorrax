@@ -54,10 +54,11 @@ def _mesh_key(mesh: Mesh, col_major: bool) -> MeshKey:
     return (int(p), int(q), bool(col_major))
 
 
-def _broadcast_unique_id(size_bytes: int,
-                         *, key: str = "lorrax_ffi/cusolvermp/nccl_unique_id/v0"
-                         ) -> np.ndarray:
-    """Broadcast an ncclUniqueId from rank 0 to all JAX processes."""
+def _broadcast_unique_id(size_bytes: int, *, key: str) -> np.ndarray:
+    """Broadcast an ncclUniqueId from rank 0 to all JAX processes.
+    The key namespace must be unique per (p, q, layout) so multiple
+    cuSolverMp contexts can coexist in one process.
+    """
     ffi_loader.get_lib()
     buf = np.zeros(size_bytes, dtype=np.uint8)
     if int(jax.process_index()) == 0:
@@ -79,7 +80,9 @@ def _make_ctx(mesh: Mesh, col_major: bool) -> int:
             f"per grid cell in this scaffolding.")
 
     uid_nbytes = ffi_loader.nccl_unique_id_bytes()
-    uid = _broadcast_unique_id(uid_nbytes)
+    uid_key = (f"lorrax_ffi/cusolvermp/nccl_unique_id/v0"
+               f"/{p}x{q}/{'col' if col_major else 'row'}")
+    uid = _broadcast_unique_id(uid_nbytes, key=uid_key)
 
     ctx = ffi_loader.create_cusolvermp_context(
         rank=rank, world_size=world,
