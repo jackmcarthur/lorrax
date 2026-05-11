@@ -96,27 +96,26 @@ def gather_wfn_at_candidates(
             throughout (matches the gw_jax data path's precision).
     """
     del sym  # reserved; see docstring
-    nx, ny, nz = (int(x) for x in wfn.fft_grid)
-    nspinor = int(wfn.nspinor)
-    nb = int(band_end - band_start)
-    M = int(cand_idx.shape[0])
-    band_indices = np.arange(band_start, band_end)
-    ix = np.asarray(cand_idx[:, 0], dtype=np.int64) % nx
-    iy = np.asarray(cand_idx[:, 1], dtype=np.int64) % ny
-    iz = np.asarray(cand_idx[:, 2], dtype=np.int64) % nz
+    from file_io.wfn_loader import WfnLoader
+    from common.wfn_transforms import to_rmu
 
-    # IFFT in complex128, host-stage in complex128 — no fp32 downcast on
-    # the way to the device. Matches load_wfns' precision.
-    psi_out = np.zeros((wfn.nkpts, nb, nspinor, M), dtype=np.complex128)
-    for ik in range(wfn.nkpts):
-        gvecs_k = np.asarray(wfn.get_gvec_nk(ik))  # (ngk, 3)
-        cnk = wfn.get_cnk_batch(ik, band_indices)  # (nb, nspinor, ngk)
-        # Scatter → FFT box, iFFT, gather at M candidate points.
-        box = np.zeros((nb, nspinor, nx, ny, nz), dtype=np.complex128)
-        box[:, :, gvecs_k[:, 0], gvecs_k[:, 1], gvecs_k[:, 2]] = cnk
-        psi_r = np.fft.ifftn(box, axes=(-3, -2, -1), norm='ortho')
-        psi_out[ik] = psi_r[..., ix, iy, iz]
-    return jnp.asarray(psi_out)
+    # Reduce ``cand_idx`` mod fft_grid to match the convention to_rmu
+    # expects (FFT-grid indices in ``[0, fft_grid[a])``).
+    nx, ny, nz = (int(x) for x in wfn.fft_grid)
+    cand_mod = np.stack([
+        np.asarray(cand_idx[:, 0], dtype=np.int64) % nx,
+        np.asarray(cand_idx[:, 1], dtype=np.int64) % ny,
+        np.asarray(cand_idx[:, 2], dtype=np.int64) % nz,
+    ], axis=-1).astype(np.int32)
+
+    # WfnLoader (eager) + to_rmu: IBZ raw → IFFT → gather at candidates.
+    # ``norm='ortho'`` matches the legacy convention (1/√N on both
+    # directions); pivoted-Cholesky selection is scale-invariant
+    # but we preserve byte-for-byte numerics anyway.
+    with WfnLoader(wfn._filename) as loader:
+        psi = loader.load(bands=(band_start, band_end), k="ibz")
+        return to_rmu(psi, loader.box_index(k="ibz"), loader.fft_grid,
+                      cand_mod, norm="ortho")
 
 
 # ═══════════════════════════════════════════════════════════════════════

@@ -133,35 +133,42 @@ def build_current_density(wfn, sym, n_occ: int, *,
                + (j_z_n + 0.5 * curl_z) ** 2)
         return jnp.sum(out, axis=0)
 
-    band_indices = np.arange(n_occ)
     t0 = time.perf_counter()
     rho_curr = jnp.zeros(fft_grid, dtype=jnp.float64)
     last_log = t0
 
-    for ik in range(nk_full):
-        gvecs_k = np.asarray(sym.get_gvecs_kfull(wfn, ik))
-        kvec_frac = np.asarray(sym.unfolded_kpts[ik], dtype=np.float64)
-        K_cart = _build_K_cart(gvecs_k, kvec_frac, bvec_dimless, alat)
-        cnk = sym.get_cnk_fullzone_batch(wfn, band_indices, ik)
-        # cnk: (n_occ, ns_wfn, ngk)
+    # WfnLoader covers per-k unfold (U_spinor + τ-phase + TRS-conj) +
+    # G-vector rotation in one place; the per-ik loop stays so the
+    # full ψ_all × full-BZ-k slab never has to fit in host RAM.
+    from file_io.wfn_loader import WfnLoader
+    with WfnLoader(wfn._filename) as loader:
+        gvecs_full = loader.gvecs(k="full_bz")        # (nk_full, ngkmax, 3)
+        ngk_valid = loader.ngk_valid(k="full_bz")     # (nk_full,)
+        for ik in range(nk_full):
+            n = int(ngk_valid[ik])
+            gvecs_k = gvecs_full[ik, :n]
+            kvec_frac = np.asarray(sym.unfolded_kpts[ik], dtype=np.float64)
+            K_cart = _build_K_cart(gvecs_k, kvec_frac, bvec_dimless, alat)
 
-        ngk = gvecs_k.shape[0]
-        psi_G_k_np = np.zeros((n_occ, 2, ngk), dtype=np.complex128)
-        psi_G_k_np[:, :nspinor_wfn, :] = cnk
+            psi_k = loader.load(
+                bands=(0, n_occ), k=[ik], sharding=None)   # (1, n_occ, ns, ngkmax)
+            psi_G_k_np = np.zeros((n_occ, 2, n), dtype=np.complex128)
+            psi_G_k_np[:, :nspinor_wfn, :] = np.asarray(
+                psi_k[0, :, :, :n])
 
-        rho_curr = rho_curr + _kpt_contrib(
-            jnp.asarray(psi_G_k_np),
-            jnp.asarray(K_cart, dtype=jnp.complex128),
-            jnp.asarray(gvecs_k[:, 0], dtype=jnp.int32),
-            jnp.asarray(gvecs_k[:, 1], dtype=jnp.int32),
-            jnp.asarray(gvecs_k[:, 2], dtype=jnp.int32),
-        )
+            rho_curr = rho_curr + _kpt_contrib(
+                jnp.asarray(psi_G_k_np),
+                jnp.asarray(K_cart, dtype=jnp.complex128),
+                jnp.asarray(gvecs_k[:, 0], dtype=jnp.int32),
+                jnp.asarray(gvecs_k[:, 1], dtype=jnp.int32),
+                jnp.asarray(gvecs_k[:, 2], dtype=jnp.int32),
+            )
 
-        if verbose and (time.perf_counter() - last_log > 5.0):
-            rho_curr.block_until_ready()
-            last_log = time.perf_counter()
-            print(f"    [j^Gordon] {ik+1}/{nk_full} k-points "
-                  f"after {last_log - t0:.1f}s", flush=True)
+            if verbose and (time.perf_counter() - last_log > 5.0):
+                rho_curr.block_until_ready()
+                last_log = time.perf_counter()
+                print(f"    [j^Gordon] {ik+1}/{nk_full} k-points "
+                      f"after {last_log - t0:.1f}s", flush=True)
 
     rho_curr.block_until_ready()
     rho_curr = rho_curr / nk_full

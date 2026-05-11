@@ -175,20 +175,23 @@ def to_rbox(
     psi: jax.Array,
     g_index: np.ndarray | jax.Array,
     fft_grid: Sequence[int],
+    *,
+    norm: str = "backward",
 ) -> jax.Array:
     """Scatter ψ to the FFT box and IFFT to r-space.
 
     Same shape as :func:`to_box`; the trailing three axes are now real-
-    space.  The IFFT is over axes ``(-3, -2, -1)`` with ``norm='backward'``
-    (matches ``np.fft.ifftn`` default; consistent with the rest of
-    LORRAX where ``ψ_r = IFFT(ψ_G_box)``).
+    space.  The IFFT is over axes ``(-3, -2, -1)``; ``norm`` is forwarded
+    to :func:`jnp.fft.ifftn` (``'backward'`` matches ``np.fft.ifftn``'s
+    default = ``1/N``; ``'ortho'`` = ``1/√N`` on both directions, used
+    by the centroid pivoted-Cholesky path).
 
     Memory: this still materialises the FFT box.  For consumers that
     only need ψ at a centroid list or a flat-r slab, prefer
     :func:`to_rmu` / :func:`to_rchunk`.
     """
     psi_box = to_box(psi, g_index, fft_grid)
-    return jnp.fft.ifftn(psi_box, axes=(-3, -2, -1))
+    return jnp.fft.ifftn(psi_box, axes=(-3, -2, -1), norm=norm)
 
 
 def to_rmu(
@@ -196,6 +199,8 @@ def to_rmu(
     g_index: np.ndarray | jax.Array,
     fft_grid: Sequence[int],
     r_mu: np.ndarray | jax.Array,
+    *,
+    norm: str = "backward",
 ) -> jax.Array:
     """ψ in r-space at the centroid FFT-grid indices ``r_mu``.
 
@@ -205,13 +210,15 @@ def to_rmu(
         As :func:`to_box`.
     r_mu : (n_rmu, 3) int32
         Centroid positions as FFT-grid indices in ``[0, fft_grid[a])``.
+    norm
+        Forwarded to :func:`to_rbox`.
 
     Returns
     -------
     psi_at_rmu : (n_k, nb, nspinor, n_rmu) c128
         Band-axis sharding preserved.
     """
-    psi_r_box = to_rbox(psi, g_index, fft_grid)
+    psi_r_box = to_rbox(psi, g_index, fft_grid, norm=norm)
     r_mu_j = jnp.asarray(r_mu, dtype=jnp.int32)
     out = psi_r_box[:, :, :, r_mu_j[:, 0], r_mu_j[:, 1], r_mu_j[:, 2]]
     return _maybe_constrain(out, _output_sharding(psi, n_extra_axes=1))
@@ -223,6 +230,8 @@ def to_rchunk(
     fft_grid: Sequence[int],
     r0: int,
     r_len: int,
+    *,
+    norm: str = "backward",
 ) -> jax.Array:
     """ψ in r-space on a contiguous flat-r slab ``[r0, r0 + r_len)``.
 
@@ -241,7 +250,7 @@ def to_rchunk(
     if r0 < 0 or r0 + r_len > n_rtot:
         raise ValueError(
             f"to_rchunk: [{r0}, {r0 + r_len}) out of [0, {n_rtot})")
-    psi_r_box = to_rbox(psi, g_index, fft_grid)
+    psi_r_box = to_rbox(psi, g_index, fft_grid, norm=norm)
     psi_r_flat = psi_r_box.reshape(*psi_r_box.shape[:3], n_rtot)
     out = jax.lax.dynamic_slice_in_dim(psi_r_flat, int(r0), int(r_len), axis=-1)
     return _maybe_constrain(out, _output_sharding(psi, n_extra_axes=1))

@@ -79,28 +79,21 @@ def rho_from_qe_save(save_dir: str | os.PathLike) -> np.ndarray:
 def _load_wfn_k_fftbox_ibz(wfn: WFNReader, n_val: int) -> jnp.ndarray:
     """Load IBZ wavefunctions into the FFT box, shape (nk_irr, n_val, nspinor, Nx, Ny, Nz).
 
-    Uses ``wfn.get_cnk_batch`` (raw irreducible coefficients) and scatters
-    onto the QE FFT grid via the per-k G-vector list — no fractional-
+    Raw IBZ coefficients scattered onto the QE FFT grid — no fractional-
     translation phase is applied because we only want |ψ|² downstream and
     phases drop out of the modulus.
-    """
-    nx, ny, nz = (int(x) for x in wfn.fft_grid)
-    nspinor = int(wfn.nspinor)
-    band_indices = np.arange(n_val)
 
-    # Pre-allocate one host buffer; fill in a Python k-loop (nk_irr is small).
-    # Note: numpy fancy-indexing with three index arrays + two slice axes
-    # moves the "advanced" axis to the FRONT, so ``psi[ik, :, :, Gx, Gy, Gz]``
-    # has target shape ``(ngk, n_val, nspinor)``. We transpose ``cnk`` from
-    # ``(n_val, nspinor, ngk)`` to match.
-    psi = np.zeros((wfn.nkpts, n_val, nspinor, nx, ny, nz), dtype=np.complex128)
-    for ik in range(wfn.nkpts):
-        gvecs_k = np.asarray(wfn.get_gvec_nk(ik))                      # (ngk, 3)
-        cnk = wfn.get_cnk_batch(ik, band_indices)                      # (n_val, nspinor, ngk)
-        psi[ik, :, :, gvecs_k[:, 0], gvecs_k[:, 1], gvecs_k[:, 2]] = (
-            np.asarray(cnk).transpose(2, 0, 1)
-        )
-    return jnp.asarray(psi)
+    Uses :class:`file_io.wfn_loader.WfnLoader` (eager backend) plus
+    :func:`common.wfn_transforms.to_box`.  P5 will switch the caller to
+    pass a ``WfnLoader`` directly so this transient construction goes
+    away.
+    """
+    from file_io.wfn_loader import WfnLoader
+    from common.wfn_transforms import to_box
+
+    with WfnLoader(wfn._filename) as loader:
+        psi = loader.load(bands=(0, n_val), k="ibz")
+        return to_box(psi, loader.box_index(k="ibz"), loader.fft_grid)
 
 
 def rho_from_wfn_ibz(
