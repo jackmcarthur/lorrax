@@ -84,6 +84,20 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Override pivoted-Cholesky n_val (default = wfn.nelec).")
     p.add_argument("--prune-n-cond", type=int, default=None,
                    help="Override pivoted-Cholesky n_cond (default = n_val).")
+    p.add_argument("--prune-window", choices=("v_x_c", "v_x_vc", "vc_x_vc"),
+                   default="v_x_vc",
+                   help="Pivoted-Cholesky Gram band-window pair. "
+                        "'v_x_c' (legacy) = left (0, n_val), right (n_val, "
+                        "n_val+n_cond) — only val×cond pair densities. "
+                        "'v_x_vc' (default) = left (0, n_val), right (0, "
+                        "n_val+n_cond) — adds val×val (and val×cond), so "
+                        "the centroids also span the |ψ_v|² and ψ_v*ψ_v' "
+                        "diagonals that V_H / G_RI projections need. "
+                        "'vc_x_vc' = left = right = (0, n_val+n_cond) — "
+                        "full σ-window square Gram, also includes c×c "
+                        "pair densities (|ψ_c|² diagonals). n_cond should "
+                        "be the input file's ``ncond`` (σ-protected band "
+                        "count), not the full ``nband`` summed over.")
     p.add_argument("--orbit", action="store_true",
                    help="Symmetry-adapted k-means: store orbit representatives,"
                         " unfold via the WFN's spatial sym ops at output. Final"
@@ -333,14 +347,38 @@ def main():
                         if orbit_id_arr is not None else N_c)
         print(f"\nPivoted-Cholesky prune: {n_unique} → {N_c}"
               f"{f' (target {n_orbit_keep} orbits)' if orbit_id_arr is not None else ''}")
+        # Resolve n_val/n_cond defaults the same way the legacy path did
+        # so we can compute explicit band ranges for the v×(v+c) variant.
+        _n_val_eff = (int(args.prune_n_val) if args.prune_n_val is not None
+                      else int(wfn.nelec))
+        _nb_total = int(wfn.nbands)
+        _n_cond_eff = (int(args.prune_n_cond) if args.prune_n_cond is not None
+                       else min(_n_val_eff, _nb_total - _n_val_eff))
+        _max_band = _n_val_eff + _n_cond_eff
+        _prune_kwargs: dict = dict(
+            wfn=wfn, sym=sym, cand_idx=centroid_indices,
+            n_keep=n_orbit_keep, mesh=mesh,
+            orbit_id=orbit_id_arr,
+            use_phdf5=args.use_phdf5,
+        )
+        if args.prune_window == "v_x_vc":
+            _prune_kwargs["band_range_left"] = (0, _n_val_eff)
+            _prune_kwargs["band_range_right"] = (0, _max_band)
+            print(f"  prune window: v×(v+c)  left=(0,{_n_val_eff}) "
+                  f"right=(0,{_max_band})  [covers |ψ_v|² + v×c]")
+        elif args.prune_window == "vc_x_vc":
+            _prune_kwargs["band_range_left"] = (0, _max_band)
+            _prune_kwargs["band_range_right"] = (0, _max_band)
+            print(f"  prune window: (v+c)×(v+c)  left=right=(0,{_max_band})"
+                  f"  [full σ-window square Gram, covers |ψ_c|² too]")
+        else:
+            _prune_kwargs["n_val"] = _n_val_eff
+            _prune_kwargs["n_cond"] = _n_cond_eff
+            print(f"  prune window: v×c  left=(0,{_n_val_eff}) "
+                  f"right=({_n_val_eff},{_max_band})  [legacy]")
         with timing.section("prune"):
             keep_idx, rank, *_ = prune_candidates_by_pivoted_cholesky(
-                wfn, sym, centroid_indices,
-                n_keep=n_orbit_keep, mesh=mesh,
-                n_val=args.prune_n_val,
-                n_cond=args.prune_n_cond,
-                orbit_id=orbit_id_arr,
-                use_phdf5=args.use_phdf5,
+                **_prune_kwargs,
             )
         centroid_indices = np.asarray(keep_idx, dtype=np.int64)
         centroids_snapped = centroid_indices.astype(float) / np.asarray(fft_grid)
