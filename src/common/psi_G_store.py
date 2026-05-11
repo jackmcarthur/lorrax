@@ -1,39 +1,40 @@
-"""Host-resident ψ(G) store with io_callback-based on-device slicing.
+"""Host-resident ψ(G-flat) store with on-demand FFT-to-r-chunk fetches.
 
-The ISDF fit kernel consumes ψ(G) one band-chunk (and potentially one
-k-chunk) at a time inside a Python-unrolled bc-loop.  Keeping the full
-ψ(G) tensor on device as a tuple of jit arguments holds every band-chunk
-live for the entire jit execution — at Si 10³ scale that's 8 × 422 MiB
-of persistent device memory for data most of the kernel isn't even
-looking at.
+The ISDF fit kernel consumes ψ(r) one band-chunk × one r-chunk at a
+time inside a Python-unrolled bc-loop.  Holding ψ in full FFT-box
+representation on host costs ``nb · ns · nx · ny · nz`` complex128 per
+rank — for CrI3-class systems that's tens of GB.  Holding ψ in G-flat
+representation instead costs ``nb · ns · ngkmax`` per rank, which is
+~6-11% of the box for typical GW grids.
 
-This module stores the full ``(nk, nb_total, ns, nx, ny, nz)`` ψ(G)
-tensor on the HOST in per-rank n_XY band-sharded layout — each process's
-host memory holds one ``(nk, nb_local, ns, nx, ny, nz)`` contiguous tile
-per locally-addressable (x, y) mesh cell, where ``nb_local = nb_total / P``
-and ``P = p_x · p_y``.  Inside the jit body, :meth:`PsiGStore.fetch_psi_G`
-pulls any ``(band_range, k_range)`` slice onto device by local tile
-slicing — no cross-rank communication, no persistent device residency.
+This rewrite (P4c) replaces the legacy g_box host-cache with a
+**g_flat host-cache + on-demand to_rchunk** pipeline:
 
-Two lifecycle modes:
+* :class:`PsiGStore` stores per-rank tiles of shape
+  ``(nk, nb_local, ns, ngkmax)`` instead of ``(nk, nb_local, ns, nx,
+  ny, nz)``.
+* :meth:`PsiGStore.fetch_psi_rchunk` pulls a g_flat slice via
+  ``io_callback`` and immediately calls
+  :func:`common.wfn_transforms.to_rchunk` on device — the FFT box is
+  never materialised as a persistent buffer.
 
-* :class:`HostPsiGStore`   – one phdf5 read at startup fills the host
-                             tiles; reused across every r-chunk of the
-                             fit.  Host footprint stays resident for
-                             the full run.
-* :class:`RereadPsiGStore` – ``begin_rchunk`` repopulates the host
-                             tiles via a fresh phdf5 read; ``end_rchunk``
-                             frees them.  Zero persistent host residency
-                             between r-chunks; trades disk I/O for RAM.
+Lifecycle modes are unchanged:
 
-Only the two options above exist — the old device-resident-tuple cache
-and phdf5-per-bc paths are gone.  See ``common.isdf_fitting`` for the
-sole caller.
+* :class:`HostPsiGStore`   – populate once at construction, keep
+                             resident for the full run.  Host
+                             footprint = ``nk · nb_total · ns ·
+                             ngkmax · 16 / P`` bytes per process.
+* :class:`RereadPsiGStore` – ``begin_rchunk`` repopulates; ``end_rchunk``
+                             frees.  Zero persistent residency between
+                             r-chunks.
+
+The reader adapters (legacy h5py vs phdf5) collapse to a single
+:class:`file_io.wfn_loader.WfnLoader` whose ``backend='auto'`` picks the
+right path.
 """
 from __future__ import annotations
 
 from functools import partial
-import os
 from typing import Literal
 
 import numpy as np
@@ -41,12 +42,13 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import io_callback
 from jax.experimental.shard_map import shard_map
-from jax.sharding import Mesh, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 
-# Sharding spec for the ψ(G) tensor that the production kernel expects.
-# (nk, nb, ns, nx, ny, nz) with the band axis flat-sharded over (x, y).
-_PSI_G_SPEC = P(None, ('x', 'y'), None, None, None, None)
+# Sharding spec for the ψ(G-flat) tile that the production kernel
+# consumes after io_callback.  (n_k, nb, ns, ngkmax) with the band axis
+# flat-sharded over (x, y).
+_PSI_G_FLAT_SPEC = P(None, ('x', 'y'), None, None)
 
 
 def _zero_user_band_pad_in_shard(
@@ -56,14 +58,14 @@ def _zero_user_band_pad_in_shard(
     shard_band_slice: slice,
     user_band_stop: int,
 ) -> np.ndarray:
-    """Zero locally-owned padded bands inside one ψ(G) shard.
+    """Zero locally-owned padded bands inside one ψ(G-flat) shard.
 
     ``Meta.b_id_4`` may be larger than the user's requested ``nband`` so
-    the band axis divides the device mesh.  A phdf5 read can still return
+    the band axis divides the device mesh.  The loader can still return
     real DFT coefficients for those padded slots when the WFN file has
     enough bands.  The centroid loader zeros them after extraction; this
-    helper applies the same contract to the host ψ(G) cache used by the
-    r-chunk ζ fit.
+    helper applies the same contract to the host ψ(G-flat) cache used
+    by the r-chunk ζ fit.
     """
     b0, _ = (int(bc_range[0]), int(bc_range[1]))
     s0 = 0 if shard_band_slice.start is None else int(shard_band_slice.start)
@@ -71,7 +73,7 @@ def _zero_user_band_pad_in_shard(
     step = 1 if shard_band_slice.step is None else int(shard_band_slice.step)
     if step != 1:
         raise ValueError(
-            f"ψ(G) shard band slice must be contiguous; got {shard_band_slice!r}")
+            f"ψ(G-flat) shard band slice must be contiguous; got {shard_band_slice!r}")
 
     local_global_bands = b0 + np.arange(s0, s1, dtype=np.int64)
     pad_mask = local_global_bands >= int(user_band_stop)
@@ -79,17 +81,12 @@ def _zero_user_band_pad_in_shard(
         return shard_data
 
     out = np.array(shard_data, copy=True)
-    out[:, pad_mask, :, :, :, :] = 0.0
+    out[:, pad_mask, :, :] = 0.0
     return out
 
 
 def _mesh_device_coords(mesh: Mesh) -> dict:
-    """Map ``id(device) → (x_idx, y_idx)`` for every device in the mesh.
-
-    Used at host-tile build time: each addressable shard of a sharded
-    jax.Array carries its own ``shard.device``; we need its (x, y) cell
-    so the tile is indexed the same way the in-jit fetch will query it.
-    """
+    """Map ``id(device) → (x_idx, y_idx)`` for every device in the mesh."""
     coords = {}
     devs = np.asarray(mesh.devices)
     for idx, dev in np.ndenumerate(devs):
@@ -98,84 +95,93 @@ def _mesh_device_coords(mesh: Mesh) -> dict:
 
 
 class PsiGStore:
-    """Host-resident ψ(G) store with on-device slice fetches.
+    """Host-resident ψ(G-flat) store with on-device FFT-to-r-chunk fetches.
 
-    Each locally-addressable mesh cell ``(x, y)`` owns one contiguous
-    host tile of shape ``(nk, nb_local, ns, nx, ny, nz)`` where
-    ``nb_local = nb_total / P``.  The band axis inside each tile is
-    ordered by band-chunk (bc) — block 0 holds bc 0's local bands,
-    block 1 holds bc 1's local bands, and so on — so a contiguous
-    bc_range maps to a contiguous band slice inside the tile.
+    Per locally-addressable mesh cell ``(x, y)`` owns one contiguous
+    host tile of shape ``(nk, nb_local, ns, ngkmax)``.  The band axis
+    inside each tile is ordered by band-chunk (bc) — block 0 holds
+    bc 0's local bands, block 1 holds bc 1's local bands, and so on.
+    For CrI3-scale, the new shape is ~14× smaller than the legacy
+    g_box ``(nk, nb_local, ns, nx, ny, nz)`` shape.
 
-    :meth:`fetch_psi_G` produces a sharded jax.Array for any
-    ``(band_range, k_range)`` window by slicing each rank's tile
-    locally and gathering via ``shard_map`` + ``io_callback``.  No
-    cross-rank communication; each rank contributes only its own
-    ``(x, y)`` slab.
-
-    Subclasses supply the ``begin_rchunk`` / ``end_rchunk`` lifecycle
-    hooks that decide when the tiles are populated/cleared.
+    :meth:`fetch_psi_rchunk` pulls a g_flat slice via ``io_callback``
+    then immediately calls :func:`common.wfn_transforms.to_rchunk` on
+    device.  The FFT box never lives as a persistent buffer — it's a
+    transient inside the jit.  Output sharding is band-axis on
+    ``('x','y')``; consumers downstream see the same (n_k, nb, ns,
+    n_rchunk) layout the legacy ``get_sharded_wfns_rchunk_slice``
+    produced.
     """
 
     def __init__(
         self,
         *,
-        reader,
+        loader,
         mesh_xy: Mesh,
         band_chunk_ranges: tuple[tuple[int, int], ...],
         meta,
+        bispinor: bool = False,
     ):
-        self.reader = reader
+        self.loader = loader
         self.mesh = mesh_xy
         self.band_chunk_ranges = tuple(tuple(bc) for bc in band_chunk_ranges)
         self.meta = meta
+        self.bispinor = bool(bispinor)
 
         nk = int(meta.nk_tot)
         ns = int(meta.nspinor)
-        nx, ny, nz = (int(d) for d in meta.fft_grid)
+        ngkmax = int(loader.ngkmax)
         p = int(mesh_xy.shape['x']) * int(mesh_xy.shape['y'])
 
-        # Per-bc local band count: bands_per_device for ONE bc.  Each rank
-        # gets ``bc_size / P`` bands per bc after sharded read.  Enforced
-        # by ``PhdfWfnReader.coeffs_gspace`` (raises if bc_size % P != 0).
+        # Per-bc local band count: bands_per_device for ONE bc.
         bpd_per_bc = [(b_hi - b_lo) // p for (b_lo, b_hi) in self.band_chunk_ranges]
         self._bpd_per_bc = tuple(bpd_per_bc)
 
-        # Within each rank's tile the band axis is stacked in bc-order:
-        # offsets[i] .. offsets[i+1] holds this rank's slab for bc i.
+        # Within each rank's tile the band axis is stacked in bc-order.
         offsets = [0]
         for bpd in bpd_per_bc:
             offsets.append(offsets[-1] + bpd)
         self._bc_band_offsets = tuple(offsets)
         self._nb_local = offsets[-1]
-        self._per_rank_shape = (nk, self._nb_local, ns, nx, ny, nz)
+        self._per_rank_shape = (nk, self._nb_local, ns, ngkmax)
 
         self._dtype = jnp.complex128
         self._coords = _mesh_device_coords(mesh_xy)
         # host_tiles[(x, y)] = one contiguous numpy array of shape
-        # _per_rank_shape, or None before begin_rchunk fills it.
+        # _per_rank_shape, or absent before begin_rchunk fills it.
         self._host_tiles: dict = {}
 
-    # ---------------------------------------------------------------------
-    # Population (subclasses decide when this is called)
-    # ---------------------------------------------------------------------
-    def _populate_from_reader(self) -> None:
-        """Stack per-bc phdf5 reads into each rank's contiguous host tile.
+        # Cache the box index (g_index) and Bloch-phase ingredients on
+        # device once — they're shared across every fetch_psi_rchunk
+        # call regardless of which band-chunk or r-chunk is asked for.
+        self._g_index_dev: jax.Array | None = None
+        self._kvecs_frac_dev: jax.Array | None = None
 
-        One read per band-chunk is collective across all ranks (phdf5
-        semantics); we peel off each rank's addressable shard, copy to
-        host, and write it into the ``(x, y)`` tile at the bc's offset
-        slot.  After the final read every rank's tile is fully populated.
+    # ---------------------------------------------------------------------
+    # Population — pulls from the WfnLoader, scatters into per-(x,y) tiles.
+    # ---------------------------------------------------------------------
+    def _populate_from_loader(self) -> None:
+        """One ``loader.load(bands=bc)`` per band-chunk, then split the
+        returned sharded jax.Array into per-(x, y) tiles on host.
+
+        ``loader.load`` is a collective on the FFI backend or a
+        broadcast-then-device-put on the eager backend; either way each
+        rank's local shard of the (band-sharded) output is what we
+        actually need to copy into the host tile.
         """
-        # Allocate tiles on first population.  Re-use buffers across
-        # begin_rchunk calls to avoid repeated alloc/free churn.
+        # Allocate tiles on first population.
         for (x, y) in self._coords.values():
             if (x, y) not in self._host_tiles:
                 self._host_tiles[(x, y)] = np.empty(
                     self._per_rank_shape, dtype=np.complex128)
 
+        sharding_spec = P(None, ('x', 'y'), None, None)
         for bc_idx, bc_range in enumerate(self.band_chunk_ranges):
-            psi_G_bc = self.reader.coeffs_gspace(bc_range)
+            psi_G_bc = self.loader.load(
+                bands=bc_range, k="full_bz",
+                sharding=sharding_spec,
+                bispinor=self.bispinor,
+            )
             b_lo = self._bc_band_offsets[bc_idx]
             b_hi = self._bc_band_offsets[bc_idx + 1]
             for shard in psi_G_bc.addressable_shards:
@@ -188,8 +194,22 @@ class PsiGStore:
                     shard_band_slice=shard_band_slice,
                     user_band_stop=int(getattr(self.meta, "b_id_4_user", self.meta.b_id_4)),
                 )
-                tile[:, b_lo:b_hi, :, :, :, :] = data
+                tile[:, b_lo:b_hi, :, :] = data
             del psi_G_bc  # release device memory before next bc
+
+        # Stage box_index + kvecs once on device; reused across every
+        # fetch.  These don't depend on the band range or r-chunk.
+        if self._g_index_dev is None:
+            rep = NamedSharding(self.mesh, P(*([None] * 4)))
+            self._g_index_dev = jax.device_put(
+                jnp.asarray(self.loader.box_index(k="full_bz")), rep)
+            kgrid = np.asarray(self.meta.kgrid, dtype=np.float64)
+            sym = self.loader._ensure_sym()
+            kvecs_frac = np.asarray(
+                sym.kvecs_asints, dtype=np.float64) / kgrid[None, :]
+            self._kvecs_frac_dev = jax.device_put(
+                jnp.asarray(kvecs_frac),
+                NamedSharding(self.mesh, P(None, None)))
 
     def _clear_tiles(self) -> None:
         self._host_tiles.clear()
@@ -208,52 +228,65 @@ class PsiGStore:
         host tiles before the next r-chunk."""
 
     def close(self) -> None:
-        """Release all host tiles and drop the reader reference."""
+        """Release all host tiles and drop the loader reference."""
         self._clear_tiles()
 
     # ---------------------------------------------------------------------
     # In-jit fetch
     # ---------------------------------------------------------------------
     def _bc_index(self, band_range: tuple[int, int]) -> int:
-        """Map a global ``band_range`` to its band-chunk index.
-
-        The kernel's bc-loop iterates ``self.band_chunk_ranges`` in
-        order; every fetch asks for one of those exact ranges.  We
-        look it up rather than accepting arbitrary ranges so the tile
-        offset table is definitely correct.  If future callers want
-        arbitrary band windows they can extend this lookup.
-        """
+        """Map a global ``band_range`` to its band-chunk index."""
         key = (int(band_range[0]), int(band_range[1]))
         for i, bc in enumerate(self.band_chunk_ranges):
             if bc == key:
                 return i
         raise ValueError(
             f"band_range {band_range} not in band_chunk_ranges; "
-            f"fetch_psi_G only supports the pre-declared bc ranges")
+            f"fetch_psi_rchunk only supports the pre-declared bc ranges")
 
-    def fetch_psi_G(
+    def fetch_psi_rchunk(
         self,
         band_range: tuple[int, int],
+        r_start_dyn,
+        r_chunk_size: int,
+        *,
         k_range: tuple[int, int] | None = None,
     ) -> jax.Array:
-        """Return a sharded jax.Array holding ψ(G) for this slice.
+        """ψ(r-chunk) for the given band-chunk × r-chunk window.
 
-        Layout:
-            global shape = ``(nk_slice, bc_size, ns, nx, ny, nz)``
-            sharding     = ``P(None, ('x','y'), None, None, None, None)``
-            where ``nk_slice = nk`` (full k, default) or ``k_range[1] - k_range[0]``.
+        Pipeline (each step happens inside the same jit fragment so
+        XLA can fuse them):
 
-        Implementation: each locally-addressable shard runs a
-        ``shard_map`` body that ``io_callback``s into the host tile and
-        returns the pre-sliced numpy view.  No cross-rank traffic; each
-        rank reads only its own ``(x, y)`` tile.
+          1. ``io_callback`` pulls each rank's host tile slice
+             ``(nk_slice, bc_size_local, ns, ngkmax)`` directly onto
+             device, sharded ``P(None, ('x','y'), None, None)``.
+          2. :func:`common.wfn_transforms.to_rchunk` scatters to the
+             FFT box, IFFTs, applies the per-k Bloch phase
+             ``exp(+2πi k·r)`` separably, and slices the flat-r slab
+             ``[r_start, r_start + r_chunk_size)``.  Uses
+             ``norm='ortho'`` to match the legacy
+             :func:`common.load_wfns.get_sharded_wfns_rchunk_slice`
+             scale convention (``1/√N``).
 
-        ``band_range`` must be one of the pre-declared
-        ``band_chunk_ranges`` — the kernel's bc-loop only ever asks for
-        those.  ``k_range`` is optional and defaults to the full k axis;
-        callers can pass a narrower range to support future k-chunking
-        without changing this interface.
+        Output shape ``(nk_slice, bc_size, ns, r_chunk_size)`` c128,
+        sharded ``P(None, ('x','y'), None, None)``.
+
+        Parameters
+        ----------
+        band_range
+            One of the pre-declared ``band_chunk_ranges``.
+        r_start_dyn
+            ``int`` or jax scalar tracer; flat-r start index.  Tracer
+            is fine — ``to_rchunk`` only requires ``r_chunk_size`` to
+            be static.
+        r_chunk_size
+            Static int — width of the r slab.
+        k_range
+            Optional ``(k_lo, k_hi)`` for k-chunking; defaults to
+            the full k axis.
         """
+        from common.wfn_transforms import to_rchunk
+
         bc_idx = self._bc_index(band_range)
         b_lo = self._bc_band_offsets[bc_idx]
         b_hi = self._bc_band_offsets[bc_idx + 1]
@@ -263,14 +296,15 @@ class PsiGStore:
 
         nk_slice = k_hi - k_lo
         bpd = b_hi - b_lo
-        ns, nx, ny, nz = self._per_rank_shape[2:]
-        per_rank_out_shape = (nk_slice, bpd, ns, nx, ny, nz)
+        ns = self._per_rank_shape[2]
+        ngkmax = self._per_rank_shape[3]
+        per_rank_out_shape = (nk_slice, bpd, ns, ngkmax)
         dtype = self._dtype
-        tiles = self._host_tiles  # closure capture
+        tiles = self._host_tiles
 
         def _slice_local_tile(x_idx, y_idx):
             tile = tiles[(int(x_idx), int(y_idx))]
-            return tile[k_lo:k_hi, b_lo:b_hi, :, :, :, :]
+            return tile[k_lo:k_hi, b_lo:b_hi, :, :]
 
         out_sds = jax.ShapeDtypeStruct(per_rank_out_shape, dtype)
 
@@ -278,7 +312,7 @@ class PsiGStore:
             shard_map,
             mesh=self.mesh,
             in_specs=(),
-            out_specs=_PSI_G_SPEC,
+            out_specs=_PSI_G_FLAT_SPEC,
             check_rep=False,
         )
         def _pull():
@@ -287,39 +321,51 @@ class PsiGStore:
             return io_callback(
                 _slice_local_tile, out_sds, x_idx, y_idx, ordered=True)
 
-        return _pull()
+        psi_G_flat = _pull()
+
+        # Slice the kvecs to match the k_range, then dispatch to_rchunk.
+        kvecs_frac = self._kvecs_frac_dev[k_lo:k_hi]
+        return to_rchunk(
+            psi_G_flat,
+            self._g_index_dev[k_lo:k_hi] if k_range is not None
+                else self._g_index_dev,
+            tuple(int(s) for s in self.meta.fft_grid),
+            r_start_dyn, int(r_chunk_size),
+            kvecs_frac=kvecs_frac,
+            norm="ortho",
+        )
 
 
 class HostPsiGStore(PsiGStore):
-    """ψ(G) loaded once, kept resident on host for the full run.
+    """ψ(G-flat) loaded once, kept resident on host for the full run.
 
-    Best when host RAM can hold ``nb_total · nk · ns · nr · 16 / P``
-    bytes per process comfortably.  Per-rank footprint: for Si 10³ this
-    is 3.32 GB per process; for MoS2 3×3 it is 0.26 GB.
+    Per-rank footprint: ``nk · nb_total · ns · ngkmax · 16 / P`` bytes.
+    For CrI3 80 Ry 6x6 with ngkmax≈70k, 1000 bands, 4 spinor (bispinor),
+    16-GPU mesh: ~28 GB / process — fits comfortably on Perlmutter
+    HBM80 hosts.  Same system in g_box form would be ~400 GB / process
+    (won't fit).  ~14× smaller than the legacy host-resident layout.
     """
 
-    def __init__(self, *, reader, mesh_xy, band_chunk_ranges, meta):
+    def __init__(self, *, loader, mesh_xy, band_chunk_ranges, meta,
+                  bispinor: bool = False):
         super().__init__(
-            reader=reader, mesh_xy=mesh_xy,
-            band_chunk_ranges=band_chunk_ranges, meta=meta)
-        self._populate_from_reader()
+            loader=loader, mesh_xy=mesh_xy,
+            band_chunk_ranges=band_chunk_ranges, meta=meta,
+            bispinor=bispinor)
+        self._populate_from_loader()
         if jax.process_index() == 0:
             tile_gb = self._per_rank_shape_bytes() / 1e9
-            print(f"  ψ(G) host cache: {tile_gb:.2f} GB/process resident")
+            print(f"  ψ(G-flat) host cache: {tile_gb:.2f} GB/process resident")
 
     def _per_rank_shape_bytes(self) -> int:
         return int(np.prod(self._per_rank_shape)) * 16  # complex128
 
 
 class RereadPsiGStore(PsiGStore):
-    """ψ(G) re-read from phdf5 at every r-chunk; freed between.
-
-    Use when host RAM can't hold the full tile.  Every r-chunk pays one
-    full phdf5 collective read; host residency is zero between r-chunks.
-    """
+    """ψ(G-flat) re-read from the loader at every r-chunk; freed between."""
 
     def begin_rchunk(self, r_start: int, r_end: int) -> None:
-        self._populate_from_reader()
+        self._populate_from_loader()
 
     def end_rchunk(self) -> None:
         self._clear_tiles()
@@ -335,105 +381,30 @@ def build_psi_G_store(
     bispinor: bool = False,
     mode: Literal["host_cache", "file_reread"] = "host_cache",
 ) -> PsiGStore:
-    """Construct the ψ(G) store matching ``mode``.
+    """Construct the ψ(G-flat) store matching ``mode``.
 
-    The normal multi-GPU path drives reads through
-    :class:`common.phdf5_wfn_reader.PhdfWfnReader`.  CPU runs cannot use
-    that CUDA-only FFI reader, and small developer environments may not
-    have its native dependencies loaded, so ``host_cache`` falls back to
-    the canonical h5py ``WFNReader`` path when PHDF5 is unavailable.
+    Single backend choice: :class:`file_io.wfn_loader.WfnLoader`.
+    ``backend='auto'`` picks the FFI phdf5 path when multi-rank GPU +
+    mesh + .so present; falls back to eager h5py otherwise.  CPU and
+    single-process tests get the eager path automatically.
+
+    ``sym`` is kept in the signature for caller-API back-compat but is
+    ignored — the loader builds its own ``SymMaps`` lazily from the WFN's
+    ``mf_header``.
     """
-    reader = _build_gspace_reader(
-        wfn=wfn, sym=sym, meta=meta, mesh_xy=mesh_xy, bispinor=bispinor)
+    del sym
+    from file_io.wfn_loader import WfnLoader
+
+    loader = WfnLoader(wfn._filename, mesh=mesh_xy)
     if mode == "host_cache":
         return HostPsiGStore(
-            reader=reader, mesh_xy=mesh_xy,
-            band_chunk_ranges=band_chunk_ranges, meta=meta)
+            loader=loader, mesh_xy=mesh_xy,
+            band_chunk_ranges=band_chunk_ranges, meta=meta,
+            bispinor=bispinor)
     if mode == "file_reread":
         return RereadPsiGStore(
-            reader=reader, mesh_xy=mesh_xy,
-            band_chunk_ranges=band_chunk_ranges, meta=meta)
+            loader=loader, mesh_xy=mesh_xy,
+            band_chunk_ranges=band_chunk_ranges, meta=meta,
+            bispinor=bispinor)
     raise ValueError(
-        f"ψ(G) store mode must be 'host_cache' or 'file_reread', got {mode!r}")
-
-
-class _LegacyGspaceReader:
-    """Adapter exposing ``coeffs_gspace`` via ``read_Gvecs_to_devices``."""
-
-    def __init__(self, *, wfn, sym, meta, mesh_xy: Mesh, bispinor: bool):
-        self.wfn = wfn
-        self.sym = sym
-        self.meta = meta
-        self.mesh_xy = mesh_xy
-        self.bispinor = bool(bispinor)
-
-    def coeffs_gspace(
-        self,
-        band_range: tuple[int, int],
-        *,
-        k_ids=None,
-    ) -> jax.Array:
-        if k_ids is not None:
-            k_ids_np = np.asarray(k_ids, dtype=np.int64)
-            if not np.array_equal(k_ids_np, np.arange(int(self.meta.nk_tot))):
-                raise ValueError(
-                    "legacy ψ(G) fallback only supports full k-point order")
-        from common.load_wfns import read_Gvecs_to_devices
-        psi_G, _ = read_Gvecs_to_devices(
-            self.wfn, self.sym, band_range, self.meta, self.bispinor,
-            self.mesh_xy)
-        return psi_G
-
-    def close(self) -> None:
-        pass
-
-
-class _Phdf5GspaceReader:
-    """Adapter that carries the driver's bispinor flag into PHDF5 reads."""
-
-    def __init__(self, reader, *, bispinor: bool):
-        self.reader = reader
-        self.bispinor = bool(bispinor)
-
-    def coeffs_gspace(
-        self,
-        band_range: tuple[int, int],
-        *,
-        k_ids=None,
-    ) -> jax.Array:
-        return self.reader.coeffs_gspace(
-            band_range, k_ids=k_ids, bispinor=self.bispinor)
-
-    def close(self) -> None:
-        # The underlying PHDF5 reader is cached by common.load_wfns and
-        # may be shared by other users in this process.
-        pass
-
-
-def _build_gspace_reader(*, wfn, sym, meta, mesh_xy: Mesh, bispinor: bool):
-    """Choose the PHDF5 reader when usable, otherwise the h5py fallback."""
-    force = str(os.environ.get("LORRAX_GSPACE_READER", "auto")).strip().lower()
-    if force not in {"auto", "phdf5", "legacy"}:
-        raise ValueError(
-            "LORRAX_GSPACE_READER must be 'auto', 'phdf5', or 'legacy'")
-    if force == "legacy" or (force == "auto" and jax.default_backend() == "cpu"):
-        return _LegacyGspaceReader(
-            wfn=wfn, sym=sym, meta=meta, mesh_xy=mesh_xy, bispinor=bispinor)
-
-    wfn_path = getattr(wfn, "_filename", None)
-    if wfn_path is None:
-        if force == "phdf5":
-            raise ValueError(
-                "ψ(G) PHDF5 reader requires wfn._filename, but it is unset")
-        return _LegacyGspaceReader(
-            wfn=wfn, sym=sym, meta=meta, mesh_xy=mesh_xy, bispinor=bispinor)
-
-    try:
-        from common.load_wfns import _get_phdf5_reader
-        return _Phdf5GspaceReader(
-            _get_phdf5_reader(wfn_path, mesh_xy), bispinor=bispinor)
-    except (FileNotFoundError, OSError):
-        if force == "phdf5":
-            raise
-        return _LegacyGspaceReader(
-            wfn=wfn, sym=sym, meta=meta, mesh_xy=mesh_xy, bispinor=bispinor)
+        f"ψ(G-flat) store mode must be 'host_cache' or 'file_reread', got {mode!r}")

@@ -1240,10 +1240,13 @@ def _make_fit_one_rchunk_kernel(
         #       Each bc's ψ(G) is live only during its own iteration.
         for bc_idx, (bc_range, l_cls, r_cls) in enumerate(bc_classify):
             bc_size = bc_range[1] - bc_range[0]
-            psi_bc_G = psi_G_store.fetch_psi_G(bc_range)
-            psi_bc_Y = get_sharded_wfns_rchunk_slice(
-                psi_bc_G, meta, r_start_dyn, actual_n_rchunk,
-                kvecs_frac, mesh_xy, bc_range)
+            # ψ(r-chunk) directly via g_flat host cache + on-device
+            # to_rchunk (FFT box never materialised as a persistent
+            # buffer).  Bloch phase + kvecs lookup happen inside
+            # ``fetch_psi_rchunk`` — caller's ``kvecs_frac`` arg is
+            # no longer needed at this site.
+            psi_bc_Y = psi_G_store.fetch_psi_rchunk(
+                bc_range, r_start_dyn, actual_n_rchunk)
             P_l = _accumulate(P_l, l_cls, psi_l_rmuT_X_fit,
                               norms_l, psi_bc_Y, bc_size)
             P_r = _accumulate(P_r, r_cls, psi_r_rmuT_X_fit,
