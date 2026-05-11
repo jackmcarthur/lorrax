@@ -554,15 +554,30 @@ def _resolve_solver_kind_charge(mesh_xy: Mesh) -> str:
     return 'cusolvermp_cholesky'
 
 
+def _resolve_solver_kind_transverse(mesh_xy: Mesh) -> str:
+    """Pick the transverse-channel ζ-fit solver: cuSolverMp distributed
+    getrf+getrs vs the in-tree per-q ``jnp.linalg.solve`` + ridge.
+    Opt-in via ``LORRAX_USE_CUSOLVERMP_LU``; only true 2D meshes select
+    cuSolverMp (1×N / N×1 / 1×1 stay legacy).
+    """
+    if os.environ.get('LORRAX_USE_CUSOLVERMP_LU', '0') != '1':
+        return 'lu'
+    px = int(mesh_xy.shape['x'])
+    py = int(mesh_xy.shape['y'])
+    if px <= 1 or py <= 1:
+        return 'lu'
+    return 'cusolvermp_lu'
+
+
 def _resolve_solver_kind(mesh_xy: Mesh, vertex_mu_L: int, solver_kind: str) -> str:
     """Single source of truth for the ``auto`` resolution.  Transverse
-    channels (γ̃^i, μ_L≠0) always take 'lu' (CCT^μ is indefinite);
-    charge channel defers to :func:`_resolve_solver_kind_charge`.
+    channels (γ̃^i, μ_L≠0) take ``_resolve_solver_kind_transverse``;
+    charge channel takes ``_resolve_solver_kind_charge``.
     """
     if solver_kind != 'auto':
         return solver_kind
     if int(vertex_mu_L) != 0:
-        return 'lu'
+        return _resolve_solver_kind_transverse(mesh_xy)
     return _resolve_solver_kind_charge(mesh_xy)
 
 
@@ -779,8 +794,10 @@ def solve_zeta(
         solver_kind: 'auto' (default) defers to :func:`_resolve_solver_kind`;
                      explicit values are 'sharded_cholesky' (legacy 2D
                      blocked chol + per-q triangular solve), 'lu' (per-q
-                     pivoted-LU for transverse channels), or
-                     'cusolvermp_cholesky' (distributed potrs via FFI).
+                     pivoted-LU for transverse channels),
+                     'cusolvermp_cholesky' (distributed potrs via FFI),
+                     or 'cusolvermp_lu' (distributed getrf+getrs via FFI
+                     for the transverse channels).
 
     Returns:
         zeta_q: (nq, n_rmu, n_zchunk) solution, sharded P(None, None, ('x','y'))
@@ -820,6 +837,41 @@ def solve_zeta(
             z = jax.lax.with_sharding_constraint(z, intermediate_shard)
             return jax.lax.with_sharding_constraint(z, target_shard)
         zeta_out = _reshard_out(zeta_xy)
+        if needs_padding:
+            return zeta_out[:, :, :n_zchunk]
+        return zeta_out
+
+    if solver_kind == 'cusolvermp_lu':
+        # Distributed getrf+getrs for the transverse channels.  L_q here
+        # is the *unfactored* CCT^μ (Hermitian indefinite) — factor_c_q
+        # passes it through.  Same input sharding, output reshard, and
+        # column padding pattern as the cholesky branch.
+        from ffi.cusolvermp import batched_distributed_solve_lu
+        Px = int(mesh_xy.shape['x'])
+        Py = int(mesh_xy.shape['y'])
+        # getrs descB requires NRHS % Py == 0; zero-pad columns produce
+        # zero ζ columns and get trimmed on return.
+        n_zchunk_padded = ((n_zchunk + Py - 1) // Py) * Py
+        needs_padding = (n_zchunk_padded != n_zchunk)
+        if needs_padding:
+            Z_q = jnp.pad(Z_q, ((0, 0), (0, 0), (0, n_zchunk_padded - n_zchunk)),
+                          mode='constant')
+        # Per-q ridge ε·|tr(L)|/n_rmu — same lift as the legacy 'lu'
+        # branch, to keep TRS-paired near-zero modes above the LU
+        # stability floor without perturbing well-conditioned ones.
+        LU_RIDGE = 1e-12
+        trace_per_q = jnp.einsum('qii->q', L_q)
+        ridge = (LU_RIDGE * jnp.abs(trace_per_q) / n_rmu)[:, None, None]
+        eye_n = jnp.eye(n_rmu, dtype=L_q.dtype)[None, :, :]
+        A_q = L_q + ridge * eye_n
+        zeta_xy = batched_distributed_solve_lu(A_q, Z_q, mesh=mesh_xy)
+        target_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
+        intermediate_shard = NamedSharding(mesh_xy, P('x', None, 'y'))
+        @partial(jax.jit, donate_argnums=(0,))
+        def _reshard_out_lu(z):
+            z = jax.lax.with_sharding_constraint(z, intermediate_shard)
+            return jax.lax.with_sharding_constraint(z, target_shard)
+        zeta_out = _reshard_out_lu(zeta_xy)
         if needs_padding:
             return zeta_out[:, :, :n_zchunk]
         return zeta_out

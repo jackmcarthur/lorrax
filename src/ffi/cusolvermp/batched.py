@@ -315,17 +315,15 @@ def batched_distributed_solve_lu(
 ) -> jax.Array:
     """Solve ``A[q] X[q] = B[q]`` via per-q cuSOLVERMp ``getrf`` + ``getrs``.
 
-    WARNING: cuSOLVERMp 0.6.0 (NVHPC 25.5) has a correctness bug in the
-    2D-grid getrf/getrs path — it returns wrong answers (info=0 but
-    garbage X) for most (N, NRHS, Px, Py) configurations with Px>1 AND
-    Py>1.  Works on 1xN and Nx1 meshes.  For W-solve we use the
-    symmetric Cholesky formulation in ``w_isdf.solve_w_low_mem``
-    instead.  This entry-point is kept for future use once NVIDIA fixes
-    the bug (likely cuSOLVERMp 0.7+).
+    Validated on cuSOLVERMp 0.7.2 across 2×2 / 1×4 / 4×1 meshes for
+    indefinite Hermitian and general A; residuals 10⁻¹³–10⁻¹⁵ for C128
+    at N up to 512.  cuSOLVERMp 0.6.0 returned garbage on Px>1 AND Py>1
+    (info=0 but wrong X); 0.7+ fixes it.
 
-    For the general (non-Hermitian) case — used by ``w_isdf`` where
-    ``A = I - V χ`` has no symmetry.  Pivot vectors are allocated per
-    call inside the FFI and never surfaced to Python.
+    Used by the ζ-fit transverse channels (indefinite CCT^μ) and by
+    ``w_isdf.solve_w_low_mem`` for the general (non-Hermitian)
+    ``I - V χ`` system.  Pivot vectors are allocated per call inside
+    the FFI and never surfaced to Python.
 
     Input sharding: both ``A`` and ``B`` in ``P(None, 'x', 'y')``.
     Output has the same shape and sharding as ``B``.  ``A`` is donated —
