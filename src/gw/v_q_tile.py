@@ -1559,6 +1559,115 @@ def _unfold_v_q_ibz_to_full(
     return _do_unfold(V_q_ibz)
 
 
+def _unfold_v_q_ij_ibz_to_full(
+    V_q_ij_ibz: jax.Array,
+    *,
+    full_to_irr_idx: np.ndarray,
+    full_to_irr_sym: np.ndarray,
+    sym_perm: np.ndarray,
+    R_cart: np.ndarray,
+    mesh_xy: Mesh,
+) -> jax.Array:
+    """Expand a transverse-channel ``V_q_ij`` from IBZ to full BZ.
+
+    Unlike the scalar Coulomb case (where the kernel is rotation-invariant
+    in ``|q+G|`` and only centroid permutation survives), the transverse
+    Coulomb kernel ``v_ij(K) ∝ (δ_ij − K_i K_j/|K|²)/|K|²`` is a rank-2
+    Cartesian tensor; under any orthogonal sym ``R``::
+
+        v_ij(R K) = R_{ia} R_{jb} v_ab(K) .
+
+    The bilinear ``V_q^{ij}(μ, ν)`` therefore unfolds to::
+
+        V^{ij}_{Sq}(π_S μ, π_S ν) = Σ_{a,b} R^{ia}(S) R^{jb}(S)
+                                     V^{ab}_q(μ, ν).
+
+    Non-symmorphic translation phases still cancel by the bilinearity in
+    ζ (same argument as the scalar case).  Time-reversal symmetry adds a
+    conjugation on the one-leg ζ — irrelevant here because the kernel
+    itself is even in ``K``.
+
+    Parameters
+    ----------
+    V_q_ij_ibz
+        ``(n_q_ibz, 3, 3, n_rmu, n_rmu)`` c128, sharded
+        ``P(None, None, None, 'x', 'y')``.  Polarization axes are
+        Cartesian.
+    full_to_irr_idx
+        ``(n_q_full,)`` int.  Map full-BZ q → IBZ parent.
+    full_to_irr_sym
+        ``(n_q_full,)`` int.  Sym index ``s`` such that
+        ``S_s · q_irr ≡ q_full`` (mod kgrid).
+    sym_perm
+        ``(n_sym, n_rmu)`` int — forward centroid permutation
+        ``r_{π_s(μ)} ≡ S_s r_μ + τ_s``.
+    R_cart
+        ``(n_sym, 3, 3)`` Cartesian rotation matrices.  ``R_cart[s]``
+        is the action of sym ``s`` on Cartesian r-space (no τ part —
+        the τ-phase drops out of the bilinear V).
+    mesh_xy
+        Device mesh; output is constrained to
+        ``P(None, None, None, 'x', 'y')``.
+
+    Returns
+    -------
+    V_q_ij_full
+        ``(n_q_full, 3, 3, n_rmu, n_rmu)`` c128, sharded
+        ``P(None, None, None, 'x', 'y')``.
+    """
+    # Centroid inverse permutation, padded to the input's μ-extent
+    # (same logic as ``_unfold_v_q_ibz_to_full``).
+    inv_perm = np.argsort(sym_perm, axis=-1).astype(np.int32)
+    n_rmu_logical = int(inv_perm.shape[-1])
+    n_rmu_padded = int(V_q_ij_ibz.shape[-1])
+    if n_rmu_padded > n_rmu_logical:
+        pad_block = np.arange(
+            n_rmu_logical, n_rmu_padded, dtype=np.int32)
+        pad_block = np.broadcast_to(
+            pad_block, (inv_perm.shape[0], n_rmu_padded - n_rmu_logical))
+        inv_perm = np.concatenate([inv_perm, pad_block], axis=-1)
+    elif n_rmu_padded != n_rmu_logical:
+        raise ValueError(
+            f"_unfold_v_q_ij_ibz_to_full: V_q_ij_ibz μ-extent "
+            f"{n_rmu_padded} smaller than sym_perm logical extent "
+            f"{n_rmu_logical}; pad invariant violated.")
+    inv_perm_j = jnp.asarray(inv_perm)
+    idx_j = jnp.asarray(np.asarray(full_to_irr_idx, dtype=np.int32))
+    sym_j = jnp.asarray(np.asarray(full_to_irr_sym, dtype=np.int32))
+    R_j = jnp.asarray(np.asarray(R_cart, dtype=np.float64))
+
+    V_sh = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
+
+    @partial(jax.jit, out_shardings=V_sh)
+    def _do_unfold(V_ibz):
+        # Step 1: gather along q-axis (IBZ parent for each full q).
+        V_at_irr = V_ibz[idx_j]                # (n_q_full, 3, 3, μ, μ)
+
+        # Step 2: centroid double-permute on (μ, ν) axes.  Same
+        # ``mode='promise_in_bounds'`` workaround as the scalar
+        # ``_unfold_v_q_ibz_to_full`` (avoids the XLA s32/s64
+        # ``take_along_axis`` broadcast verifier failure on shard_map
+        # + x64; see ``49b7f84`` for the bug history).
+        perm_q = inv_perm_j[sym_j]             # (n_q_full, n_rmu_padded)
+        V_perm_mu = jnp.take_along_axis(
+            V_at_irr, perm_q[:, None, None, :, None], axis=3,
+            mode='promise_in_bounds')          # (n_q_full, 3, 3, μ, μ)
+        V_perm_nu = jnp.take_along_axis(
+            V_perm_mu, perm_q[:, None, None, None, :], axis=4,
+            mode='promise_in_bounds')
+
+        # Step 3: polarization mixing R·V·Rᵀ on the Cartesian indices.
+        # V_full[q, i, j, μ, ν] = Σ_{a,b} R[s(q), i, a] R[s(q), j, b]
+        #                          V_perm_nu[q, a, b, μ, ν]
+        R_q = R_j[sym_j]                       # (n_q_full, 3, 3)
+        V_full = jnp.einsum(
+            'qia,qjb,qabmn->qijmn',
+            R_q, R_q, V_perm_nu, optimize=True)
+        return V_full
+
+    return _do_unfold(V_q_ij_ibz)
+
+
 def _unfold_g0_ibz_to_full(
     g0_ibz: jax.Array,
     *,
