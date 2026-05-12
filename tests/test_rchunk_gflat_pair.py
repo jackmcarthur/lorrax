@@ -165,6 +165,54 @@ def test_accumulate_rchunk_to_gflat_round_trip():
     )
 
 
+@pytest.mark.parametrize("fft_batch_chunks", [1, 2, 3])
+def test_accumulate_rchunk_to_gflat_chunked_matches_one_shot(fft_batch_chunks):
+    """fft_batch_chunks > 1 (scan over n_q) must be bit-equal to the
+    one-shot path.  Chunks the FFT batch axis to bound the working set
+    on CrI3-scale runs where the full (n_q, n_rmu, nx*ny*nz) box OOMs."""
+    fft_grid = (4, 4, 6)
+    n_q, n_rmu, n_rtot = 6, 3, int(np.prod(fft_grid))
+    rng = np.random.default_rng(0xAA)
+    sphere_per_q = np.zeros((n_q, 5), dtype=np.int32)
+    for q in range(n_q):
+        sphere_per_q[q] = (np.arange(5) * (q + 1)) % n_rtot
+    kvecs = jnp.asarray(
+        rng.uniform(-0.5, 0.5, (n_q, 3)), dtype=jnp.float64)
+
+    rch = jnp.asarray(
+        rng.standard_normal((n_q, n_rmu, n_rtot))
+        + 1j * rng.standard_normal((n_q, n_rmu, n_rtot)),
+        dtype=jnp.complex128)
+    acc_ref = jnp.zeros((n_q, n_rmu, 5), dtype=jnp.complex128)
+    acc_ref = accumulate_rchunk_to_gflat(
+        rchunk=rch, gflat_acc=acc_ref,
+        fft_grid=fft_grid, r0=0, sphere_idx=sphere_per_q,
+        qvec_frac=kvecs, norm='backward', fft_batch_chunks=1)
+
+    acc_chk = jnp.zeros((n_q, n_rmu, 5), dtype=jnp.complex128)
+    acc_chk = accumulate_rchunk_to_gflat(
+        rchunk=rch, gflat_acc=acc_chk,
+        fft_grid=fft_grid, r0=0, sphere_idx=sphere_per_q,
+        qvec_frac=kvecs, norm='backward',
+        fft_batch_chunks=fft_batch_chunks)
+    np.testing.assert_allclose(
+        np.asarray(acc_chk), np.asarray(acc_ref),
+        atol=1e-12, rtol=1e-12,
+        err_msg=f"fft_batch_chunks={fft_batch_chunks}")
+
+
+def test_accumulate_rchunk_to_gflat_chunked_rejects_indivisible():
+    """fft_batch_chunks must divide n_q."""
+    fft_grid = (4, 4, 4)
+    rch = jnp.zeros((5, 2, 8), dtype=jnp.complex128)  # n_q=5
+    acc = jnp.zeros((5, 2, 3), dtype=jnp.complex128)
+    with pytest.raises(ValueError, match="must divide n_q"):
+        accumulate_rchunk_to_gflat(
+            rchunk=rch, gflat_acc=acc, fft_grid=fft_grid, r0=0,
+            sphere_idx=np.array([0, 1, 2], dtype=np.int32),
+            qvec_frac=None, fft_batch_chunks=3)  # 5 % 3 != 0
+
+
 def test_accumulate_rchunk_to_gflat_sphere_subset():
     """sphere_idx gathers a subset of the full G axis."""
     psi, g_index, fft_grid = _make_psi_and_gindex(

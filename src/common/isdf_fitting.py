@@ -2108,6 +2108,31 @@ def fit_zeta_to_h5(
                 dtype=jnp.complex128),
             out_shardings=_gflat_acc_sharding,
         )()
+        # FFT-batch chunking inside accumulate_rchunk_to_gflat.  The
+        # one-shot FFT box ``(n_q, n_rmu, nx, ny, nz)`` is fine on
+        # small systems (MoS2 ~ 2 GB) but OOMs on CrI3-scale runs
+        # (75×75×200 FFT × 1500 centroids ⇒ ~17.5 GB per intermediate,
+        # ×4-5 live copies during the FFT chain ⇒ ~100 GB single-device
+        # allocation request seen on first CrI3 attempt).  Default to
+        # the largest divisor of n_q ≤ n_q so the per-chunk FFT box
+        # is bounded by ``(1, n_rmu, nx, ny, nz)``.  ``LORRAX_GFLAT_FFT_BATCH_CHUNKS=N``
+        # overrides; ``N`` must divide ``n_q_disk``.
+        _env_chunks = int(os.environ.get(
+            'LORRAX_GFLAT_FFT_BATCH_CHUNKS', '0') or 0)
+        if _env_chunks > 0:
+            if n_q_disk % _env_chunks != 0:
+                raise ValueError(
+                    f"LORRAX_GFLAT_FFT_BATCH_CHUNKS={_env_chunks} does "
+                    f"not divide n_q_disk={n_q_disk}.")
+            _gflat_fft_batch_chunks = _env_chunks
+        else:
+            # Largest n that divides n_q_disk (we want max chunking by
+            # default to minimise the FFT-box transient).
+            _gflat_fft_batch_chunks = n_q_disk
+        if jax.process_index() == 0:
+            print(f"  G-flat ζ FFT batch chunks: {_gflat_fft_batch_chunks} "
+                  f"(n_q_disk={n_q_disk}; per-chunk FFT box "
+                  f"= {n_q_disk // _gflat_fft_batch_chunks} q × n_rmu × {n_rtot})")
         _q_irr_frac_dev = jax.device_put(
             jnp.asarray(q_irr_frac, dtype=jnp.float64),
             NamedSharding(mesh_xy, P(None, None)))
@@ -2188,6 +2213,7 @@ def fit_zeta_to_h5(
                         sphere_idx=_gflat_sphere_idx_padded,
                         qvec_frac=_q_irr_frac_dev,
                         norm='backward',
+                        fft_batch_chunks=_gflat_fft_batch_chunks,
                     )
                     del zeta_chunk_ibz
                     t_write_total += time.perf_counter() - t0
