@@ -752,16 +752,24 @@ def _reshard_zeta_mu_X_r_Y_to_mu_XY(zeta: jax.Array, mesh_xy: Mesh) -> jax.Array
 
     Single mesh axis ``'y'`` moves from the r-axis to the μ-axis (where
     it joins ``'x'`` to form a flat tuple).  All other shardings stay.
-    XLA's spmd-partitioner emits this as a single all-to-all on ``'y'``
-    between data axes 1 and 2 — no replication, no all-gather.
 
-    The downstream consumer is ``accumulate_rchunk_to_gflat``, whose
-    FFT box and gflat-accumulator both live at ``P(None, ('x','y'),
-    None)``; landing ζ in that layout here means the FFT runs
-    sharding-preserving (no further reshard, no replicated FFT box).
+    Downstream consumer ``accumulate_rchunk_to_gflat`` wants ζ
+    μ-flat-sharded so the FFT box and gflat-accumulator both live at
+    ``P(None, ('x','y'), None)``; landing ζ in that layout here means
+    the FFT runs sharding-preserving (no further reshard, no
+    replicated FFT box).
+
+    Note on overhead: tried both ``@jax.jit(donate_argnums=(0,))``
+    closure-wrapping (matching the ``_reshard_z`` pattern above) and a
+    module-level decorator with ``static_argnums``.  Neither flipped
+    XLA's ``is_sync`` flag on the emitted all-to-all from ``true`` to
+    ``false``, and runtime cost was the same either way (~3 ms/call in
+    the trace).  The bare ``with_sharding_constraint`` is the simplest
+    form for the same emitted HLO; trace shows the reshard is not on
+    the critical path at MoS2 3×3 scale.
     """
-    target = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
-    return jax.lax.with_sharding_constraint(zeta, target)
+    return jax.lax.with_sharding_constraint(
+        zeta, NamedSharding(mesh_xy, P(None, ('x', 'y'), None)))
 
 
 def _reshard_zeta_r_XY_to_mu_XY(zeta: jax.Array, mesh_xy: Mesh) -> jax.Array:
@@ -777,15 +785,11 @@ def _reshard_zeta_r_XY_to_mu_XY(zeta: jax.Array, mesh_xy: Mesh) -> jax.Array:
 
       Step 1  (q_, μ_, r_XY) → (q_, μ_X, r_Y)   ['x' moves r → μ]
       Step 2  (q_, μ_X, r_Y) → (q_, μ_XY, r_)   ['y' moves r → μ]
-
-    Same staging discipline as the Z_q two-step reshard above (see the
-    comment around `_reshard_z` at the top of `solve_zeta` — single-step
-    cross-axis reshards trigger SPMD Involuntary Full Rematerialization).
     """
-    mid = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    out = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
-    zeta = jax.lax.with_sharding_constraint(zeta, mid)
-    return jax.lax.with_sharding_constraint(zeta, out)
+    zeta = jax.lax.with_sharding_constraint(
+        zeta, NamedSharding(mesh_xy, P(None, 'x', 'y')))
+    return jax.lax.with_sharding_constraint(
+        zeta, NamedSharding(mesh_xy, P(None, ('x', 'y'), None)))
 
 
 def solve_zeta(

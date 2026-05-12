@@ -184,13 +184,18 @@ def _sharding_key(psi: jax.Array) -> tuple:
 
     Used as part of the jit-cache key for the public transforms so two
     arrays with identical mesh + PartitionSpec hit the same compiled
-    XLA module, while a different mesh forces a fresh compile."""
-    sh = getattr(psi, "sharding", None)
-    if sh is None:
-        return ("no_sharding",)
-    mesh_id = id(getattr(sh, "mesh", None))
-    spec = tuple(getattr(sh, "spec", ()))
-    return (mesh_id, spec)
+    XLA module, while a different mesh forces a fresh compile.
+
+    ``spec`` is normalized to ``psi.ndim`` length: JAX sometimes trims
+    trailing ``None`` entries on PartitionSpec (so ``P(None, ('x','y'))``
+    and ``P(None, ('x','y'), None)`` are semantically equal but compare
+    as different tuples).  Without the normalization the same kernel
+    recompiles each time JAX hands back a trimmed spec — 11 extra
+    ``_kernel`` compiles observed at MoS2 3×3 bispinor, adding ~7 s of
+    wall time before this fix.  ``_spec_of`` above already does the
+    same normalization for the in-body sharding derivation."""
+    return (id(getattr(getattr(psi, "sharding", None), "mesh", None)),
+            _spec_of(psi))
 
 
 # ---------------------------------------------------------------------------
