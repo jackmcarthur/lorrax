@@ -36,6 +36,14 @@ def single_device_mesh():
                  axis_names=('x', 'y'))
 
 
+# Convenience module-level mesh for tests that don't already take the
+# ``single_device_mesh`` fixture as a parameter.  Public transforms
+# require ``mesh`` — for single-device runs the 1×1 trivial mesh is the
+# right thing to pass.
+MESH = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
+             axis_names=('x', 'y'))
+
+
 def _make_psi_and_gindex(n_k=2, n_band=3, n_spinor=2, fft_grid=(4, 4, 5),
                          ngkmax=20, seed=0xABCD):
     """Synthetic ψ + g_index suitable for to_rchunk."""
@@ -114,7 +122,7 @@ def test_to_rchunk_phase_after_slice_matches_direct_formula():
     for r0, r_len in [(0, 10), (20, 30), (n_rtot - 15, 15)]:
         ref = rb_flat[..., r0:r0 + r_len]
         got = to_rchunk(psi, g_index, fft_grid, r0, r_len,
-                          norm='ortho', kvecs_frac=kvecs)
+                          mesh=MESH, norm='ortho', kvecs_frac=kvecs)
         np.testing.assert_allclose(
             np.asarray(got), np.asarray(ref),
             atol=1e-11, rtol=1e-11,
@@ -147,11 +155,12 @@ def test_accumulate_rchunk_to_gflat_round_trip():
     r_chunk = 8
     for r0 in range(0, n_rtot, r_chunk):
         r_len = min(r_chunk, n_rtot - r0)
-        rchunk = to_rchunk(psi, g_index, fft_grid, r0, r_len, norm='ortho')
+        rchunk = to_rchunk(psi, g_index, fft_grid, r0, r_len,
+                            mesh=MESH, norm='ortho')
         # Need n_q == n_k for the accumulate signature; treat the
         # leading axis of rchunk as the "q" axis here.
         gflat_acc = accumulate_rchunk_to_gflat(
-            rchunk, gflat_acc,
+            rchunk, gflat_acc, mesh=MESH,
             fft_grid=fft_grid, r0=r0, sphere_idx=None,
             qvec_frac=None, norm='ortho',
         )
@@ -188,13 +197,13 @@ def test_accumulate_rchunk_to_gflat_chunked_matches_one_shot(fft_batch_chunks):
         dtype=jnp.complex128)
     acc_ref = jnp.zeros((n_q, n_rmu, 5), dtype=jnp.complex128)
     acc_ref = accumulate_rchunk_to_gflat(
-        rchunk=rch, gflat_acc=acc_ref,
+        rchunk=rch, gflat_acc=acc_ref, mesh=MESH,
         fft_grid=fft_grid, r0=0, sphere_idx=sphere_per_q,
         qvec_frac=kvecs, norm='backward', fft_batch_chunks=1)
 
     acc_chk = jnp.zeros((n_q, n_rmu, 5), dtype=jnp.complex128)
     acc_chk = accumulate_rchunk_to_gflat(
-        rchunk=rch, gflat_acc=acc_chk,
+        rchunk=rch, gflat_acc=acc_chk, mesh=MESH,
         fft_grid=fft_grid, r0=0, sphere_idx=sphere_per_q,
         qvec_frac=kvecs, norm='backward',
         fft_batch_chunks=fft_batch_chunks)
@@ -220,7 +229,8 @@ def test_accumulate_rchunk_to_gflat_chunked_rejects_indivisible(
             NamedSharding(single_device_mesh, P(None, ('x', 'y'), None)))
         with pytest.raises(ValueError, match="must divide n_mu_local"):
             accumulate_rchunk_to_gflat(
-                rchunk=rch, gflat_acc=acc, fft_grid=fft_grid, r0=0,
+                rchunk=rch, gflat_acc=acc, mesh=single_device_mesh,
+                fft_grid=fft_grid, r0=0,
                 sphere_idx=np.array([0, 1, 2], dtype=np.int32),
                 qvec_frac=None, fft_batch_chunks=3)
 
@@ -244,9 +254,10 @@ def test_accumulate_rchunk_to_gflat_sphere_subset():
     gflat_acc = jnp.zeros((n_k, nb, ns, 20), dtype=jnp.complex128)
     for r0 in range(0, n_rtot, 16):
         r_len = min(16, n_rtot - r0)
-        rchunk = to_rchunk(psi, g_index, fft_grid, r0, r_len, norm='ortho')
+        rchunk = to_rchunk(psi, g_index, fft_grid, r0, r_len,
+                            mesh=MESH, norm='ortho')
         gflat_acc = accumulate_rchunk_to_gflat(
-            rchunk, gflat_acc,
+            rchunk, gflat_acc, mesh=MESH,
             fft_grid=fft_grid, r0=r0, sphere_idx=sphere_idx,
             norm='ortho',
         )

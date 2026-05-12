@@ -931,13 +931,12 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 				coulomb_kernels = make_v_munu_chunked_kernel(
 					meta.fft_grid[0], meta.fft_grid[1], meta.fft_grid[2],
 					meta.kgrid[0], meta.kgrid[1], meta.kgrid[2],
-					bvec, meta.cell_volume,
+					bvec, meta.cell_volume, mesh_xy,
 					sys_dim=meta.sys_dim,
 					bdot=np.asarray(wfn.bdot, dtype=np.float64)
 						if meta.sys_dim == 0 else None,
 					mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
 					vcoul_cutoff_ry=vcoul_cutoff_ry,
-					mesh_xy=mesh_xy,
 				)
 				with SlabIO(zeta_h5_path, mode='r', mesh=mesh_xy,
 				            backend=cfg.backend.slab_io) as zc, \

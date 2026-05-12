@@ -114,8 +114,10 @@ def gather_wfn_at_candidates(
     # but we preserve byte-for-byte numerics anyway.
     with WfnLoader(wfn._filename) as loader:
         psi = loader.load(bands=(band_start, band_end), k="ibz")
+        mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
+                     axis_names=('x', 'y'))
         return to_rmu(psi, loader.box_index(k="ibz"), loader.fft_grid,
-                      cand_mod, norm="ortho")
+                      cand_mod, mesh=mesh, norm="ortho")
 
 
 # ═══════════════════════════════════════════════════════════════════════

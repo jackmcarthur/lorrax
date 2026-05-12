@@ -197,11 +197,12 @@ def make_v_munu_chunked_kernel(
     nkz: int,
     bvec: np.ndarray,
     cell_volume: float,
+    mesh_xy: Mesh,
+    *,
     sys_dim: int = 2,
     bdot: np.ndarray | None = None,
     mc_average_vcoul_body: bool = True,
     vcoul_cutoff_ry: float | None = None,
-    mesh_xy=None,
 ):
     """
     Factory for jitted kernels that compute V_q blocks from zeta chunks.
@@ -235,18 +236,11 @@ def make_v_munu_chunked_kernel(
 
     # Local 3-D FFT helper for the ``(B_μ, fft_nx, fft_ny, fft_nz)`` box.
     # ``make_sharded_fftn_3d`` runs cuFFT per-rank on the μ shard via
-    # shard_map so XLA never sees the un-sharded box.  Test-bench
-    # fallback: a trivial 1×1 mesh + replicated spec.
-    if mesh_xy is not None:
-        _box_spec = P(('x', 'y'), None, None, None)
-        _local_fftn = make_sharded_fftn_3d(
-            mesh_xy, _box_spec, _box_spec, norm=None, axes=(-3, -2, -1))
-    else:
-        _trivial_mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
-                              axis_names=('x', 'y'))
-        _box_spec = P(None, None, None, None)
-        _local_fftn = make_sharded_fftn_3d(
-            _trivial_mesh, _box_spec, _box_spec, norm=None, axes=(-3, -2, -1))
+    # shard_map so XLA never sees the un-sharded box.  Callers pass a
+    # 1×1 mesh in single-device contexts — same code path.
+    _box_spec = P(('x', 'y'), None, None, None)
+    _local_fftn = make_sharded_fftn_3d(
+        mesh_xy, _box_spec, _box_spec, norm=None, axes=(-3, -2, -1))
 
     # Precompute static grid data
     fx, fy, fz = exp_ikr_fftbox(fft_nx, fft_ny, fft_nz)
@@ -925,10 +919,10 @@ def compute_all_V_q(
     # dimensionality (3D/2D slab/0D box).
     kernels = make_v_munu_chunked_kernel(
         fft_grid[0], fft_grid[1], fft_grid[2], nkx, nky, nkz,
-        bvec, cell_volume, sys_dim, bdot=bdot,
+        bvec, cell_volume, mesh_xy,
+        sys_dim=sys_dim, bdot=bdot,
         mc_average_vcoul_body=mc_average_vcoul_body,
         vcoul_cutoff_ry=bare_coulomb_cutoff,
-        mesh_xy=mesh_xy,
     )
     sphere_idx = kernels.sphere_idx
     n_G_sph = int(kernels.n_sph)

@@ -88,12 +88,16 @@ def _load_wfn_k_fftbox_ibz(wfn: WFNReader, n_val: int) -> jnp.ndarray:
     pass a ``WfnLoader`` directly so this transient construction goes
     away.
     """
+    from jax.sharding import Mesh
     from file_io.wfn_loader import WfnLoader
     from common.wfn_transforms import to_box
 
     with WfnLoader(wfn._filename) as loader:
         psi = loader.load(bands=(0, n_val), k="ibz")
-        return to_box(psi, loader.box_index(k="ibz"), loader.fft_grid)
+        mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
+                     axis_names=('x', 'y'))
+        return to_box(psi, loader.box_index(k="ibz"), loader.fft_grid,
+                       mesh=mesh)
 
 
 def rho_from_wfn_ibz(

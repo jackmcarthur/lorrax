@@ -15,10 +15,19 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from jax.sharding import Mesh
+
 from common.wfn_transforms import to_box, to_rbox, to_rmu, to_rchunk
 from file_io.wfn_loader import WfnLoader
 
 from tests.test_wfn_loader_eager import _synth_wfn, _MOS2_WFN
+
+
+# Every public transform in this module takes a ``mesh`` kwarg.  For
+# the single-device test bench we use a 1×1 mesh — same code path as
+# multi-rank production, no None branches anywhere.
+MESH = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
+             axis_names=('x', 'y'))
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +87,7 @@ def _check_to_box(loader, k_spec):
     b_hi = min(4, int(loader.nbands))
     psi = loader.load(bands=(0, b_hi), k=k_spec)
     g_index = loader.box_index(k=k_spec)
-    psi_box = np.asarray(to_box(psi, g_index, loader.fft_grid))
+    psi_box = np.asarray(to_box(psi, g_index, loader.fft_grid, mesh=MESH))
 
     psi_ref = _np_scatter_to_box(
         np.asarray(psi),
@@ -110,7 +119,7 @@ def test_to_box_empty_cells_are_zero(synth_loader):
     b_hi = min(3, int(synth_loader.nbands))
     psi = synth_loader.load(bands=(0, b_hi), k="ibz")
     g_index = synth_loader.box_index(k="ibz")
-    psi_box = np.asarray(to_box(psi, g_index, synth_loader.fft_grid))
+    psi_box = np.asarray(to_box(psi, g_index, synth_loader.fft_grid, mesh=MESH))
     ngkmax = int(synth_loader.ngkmax)
 
     # An FFT-box cell is empty iff g_index[k, x, y, z] == ngkmax.
@@ -128,8 +137,8 @@ def test_to_box_empty_cells_are_zero(synth_loader):
 def test_to_rbox_matches_ifft_of_to_box(synth_loader):
     psi = synth_loader.load(bands=(0, 3), k="full_bz")
     g_index = synth_loader.box_index(k="full_bz")
-    psi_box = np.asarray(to_box(psi, g_index, synth_loader.fft_grid))
-    psi_r_box = np.asarray(to_rbox(psi, g_index, synth_loader.fft_grid))
+    psi_box = np.asarray(to_box(psi, g_index, synth_loader.fft_grid, mesh=MESH))
+    psi_r_box = np.asarray(to_rbox(psi, g_index, synth_loader.fft_grid, mesh=MESH))
     expected = np.fft.ifftn(psi_box, axes=(-3, -2, -1))
     np.testing.assert_allclose(psi_r_box, expected, atol=1e-13, rtol=0)
 
@@ -151,8 +160,8 @@ def test_to_rmu_matches_rbox_take(synth_loader):
         rng.integers(0, nz, size=n_rmu),
     ], axis=-1).astype(np.int32)
 
-    psi_rmu = np.asarray(to_rmu(psi, g_index, synth_loader.fft_grid, r_mu))
-    psi_r_box = np.asarray(to_rbox(psi, g_index, synth_loader.fft_grid))
+    psi_rmu = np.asarray(to_rmu(psi, g_index, synth_loader.fft_grid, r_mu, mesh=MESH))
+    psi_r_box = np.asarray(to_rbox(psi, g_index, synth_loader.fft_grid, mesh=MESH))
     expected = psi_r_box[:, :, :, r_mu[:, 0], r_mu[:, 1], r_mu[:, 2]]
     np.testing.assert_allclose(psi_rmu, expected, atol=1e-14, rtol=0)
 
@@ -169,9 +178,9 @@ def test_to_rchunk_matches_rbox_flat_slab(synth_loader):
 
     r0, r_len = nx * ny + 2, 12  # arbitrary slab
     psi_rchunk = np.asarray(to_rchunk(
-        psi, g_index, synth_loader.fft_grid, r0, r_len))
+        psi, g_index, synth_loader.fft_grid, r0, r_len, mesh=MESH))
 
-    psi_r_box = np.asarray(to_rbox(psi, g_index, synth_loader.fft_grid))
+    psi_r_box = np.asarray(to_rbox(psi, g_index, synth_loader.fft_grid, mesh=MESH))
     expected = psi_r_box.reshape(*psi_r_box.shape[:3], n_rtot)[
         :, :, :, r0:r0 + r_len]
     np.testing.assert_allclose(psi_rchunk, expected, atol=1e-14, rtol=0)
@@ -182,7 +191,7 @@ def test_to_rchunk_rejects_out_of_bounds(synth_loader):
     g_index = synth_loader.box_index(k="ibz")
     nx, ny, nz = (int(s) for s in synth_loader.fft_grid)
     with pytest.raises(ValueError):
-        to_rchunk(psi, g_index, synth_loader.fft_grid, nx * ny * nz - 2, 10)
+        to_rchunk(psi, g_index, synth_loader.fft_grid, nx * ny * nz - 2, 10, mesh=MESH)
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +207,7 @@ def test_pad_rows_dont_leak_into_box(synth_loader):
     with the raw IBZ slab, and pad columns are inert."""
     psi = synth_loader.load(bands=(0, 4), k="ibz")
     g_index = synth_loader.box_index(k="ibz")
-    psi_box = np.asarray(to_box(psi, g_index, synth_loader.fft_grid))
+    psi_box = np.asarray(to_box(psi, g_index, synth_loader.fft_grid, mesh=MESH))
 
     # Reconstruct the box from raw IBZ coefficients (bypassing loader's
     # padding logic).
@@ -251,6 +260,6 @@ def test_to_box_shape(synth_loader):
     psi = synth_loader.load(bands=(0, 3), k="full_bz")
     g_index = synth_loader.box_index(k="full_bz")
     nx, ny, nz = (int(s) for s in synth_loader.fft_grid)
-    out = to_box(psi, g_index, synth_loader.fft_grid)
+    out = to_box(psi, g_index, synth_loader.fft_grid, mesh=MESH)
     assert out.shape == (psi.shape[0], psi.shape[1], psi.shape[2], nx, ny, nz)
     assert out.dtype == jnp.complex128

@@ -32,8 +32,14 @@ def load_kpoint_fftbox(wfn, sym, meta, k_idx, nb):
     if int(meta.nspinor) > int(loader.nspinor):
         ns_pad = int(meta.nspinor) - int(loader.nspinor)
         psi = jnp.pad(psi, ((0, 0), (0, 0), (0, ns_pad), (0, 0)))
+    # Single-rank legacy helper: build the 1×1 trivial mesh inline so
+    # ``to_box`` runs through the same mesh-required code path as the
+    # multi-rank callers.
+    _mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
+                  axis_names=('x', 'y'))
     psi_box = to_box(psi, loader.box_index(k=[int(k_idx)]),
-                      tuple(int(s) for s in meta.fft_grid))
+                      tuple(int(s) for s in meta.fft_grid),
+                      mesh=_mesh)
     return psi_box[0]                                # strip the singleton k-axis
 
 
@@ -161,7 +167,8 @@ def read_Gvecs_to_devices(
         psi_G_flat = jnp.pad(
             psi_G_flat, ((0, 0), (0, 0), (0, ns_pad), (0, 0)))
     psi_box = to_box(psi_G_flat, loader.box_index(k=k),
-                      tuple(int(s) for s in meta.fft_grid))
+                      tuple(int(s) for s in meta.fft_grid),
+                      mesh=mesh_xy)
     return psi_box, nb_logical
 
 
@@ -384,7 +391,7 @@ def iter_psi_rchunk_bandwise(
                 sharding=sharding_load, bispinor=bispinor)
             psi_bc_Y = to_rchunk(
                 psi_G_flat, g_index_full, meta.fft_grid,
-                int(r_start), n_rchunk, norm="ortho",
+                int(r_start), n_rchunk, mesh=mesh_xy, norm="ortho",
                 kvecs_frac=jnp.asarray(kvecs_frac_full))
             psi_bc_Y = jax.lax.with_sharding_constraint(psi_bc_Y, out_Y)
             del psi_G_flat
@@ -404,7 +411,7 @@ def iter_psi_rchunk_bandwise(
                     psi_G_flat,
                     g_index_full[k0:k1],
                     meta.fft_grid, int(r_start), n_rchunk,
-                    norm="ortho",
+                    mesh=mesh_xy, norm="ortho",
                     kvecs_frac=jnp.asarray(kvecs_frac_full[k0:k1]))
                 psi_k_chunk = jax.lax.with_sharding_constraint(
                     psi_k_chunk, out_Y)
