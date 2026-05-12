@@ -45,11 +45,21 @@ from typing import Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.experimental.shard_map import shard_map
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import NamedSharding, PartitionSpec as P
 
+from .fft_helpers import apply_local_fft
 
-__all__ = ["to_box", "to_rbox", "to_rmu", "to_rchunk", "apply_bloch_phase"]
+__all__ = [
+    "to_box",
+    "to_rbox",
+    "to_rmu",
+    "to_rchunk",
+    "apply_bloch_phase",
+    "apply_bloch_phase_flat_points",
+    "apply_bloch_phase_flat_rchunk",
+    "extract_flat_rchunk",
+    "embed_flat_rchunk",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +154,74 @@ def _maybe_constrain(arr: jax.Array, sharding: NamedSharding | None) -> jax.Arra
     return jax.lax.with_sharding_constraint(arr, sharding)
 
 
+def _flat_points_to_coords(
+    r_flat: jax.Array,
+    fft_grid: tuple[int, int, int],
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    nx, ny, nz = (int(s) for s in fft_grid)
+    del nx
+    yz = ny * nz
+    rx = r_flat // yz
+    rem = r_flat % yz
+    ry = rem // nz
+    rz = rem % nz
+    return rx, ry, rz
+
+
+def apply_bloch_phase_flat_points(
+    values: jax.Array,
+    kvecs_frac: jax.Array,
+    r_flat: jax.Array,
+    fft_grid: tuple[int, int, int],
+    *,
+    sign: int = 1,
+) -> jax.Array:
+    """Apply ``exp(sign · 2πi k·r)`` on a flat-r point list only."""
+    nx, ny, nz = (int(s) for s in fft_grid)
+    r_flat = jnp.asarray(r_flat, dtype=jnp.int32)
+    rx, ry, rz = _flat_points_to_coords(r_flat, fft_grid)
+    phase_arg = (
+        kvecs_frac[:, 0:1] * (rx[None, :] / nx)
+        + kvecs_frac[:, 1:2] * (ry[None, :] / ny)
+        + kvecs_frac[:, 2:3] * (rz[None, :] / nz)
+    )
+    phase = jnp.exp(jnp.complex128(int(sign) * 2j * jnp.pi) * phase_arg)
+    n_mid = values.ndim - 2
+    phase = phase.reshape(phase.shape[0], *((1,) * n_mid), phase.shape[1])
+    return values * phase
+
+
+def apply_bloch_phase_flat_rchunk(
+    values: jax.Array,
+    kvecs_frac: jax.Array,
+    fft_grid: tuple[int, int, int],
+    r0,
+    *,
+    sign: int = 1,
+) -> jax.Array:
+    """Apply the Bloch phase on a contiguous flat-r slab only."""
+    r_len = int(values.shape[-1])
+    r_flat = jnp.arange(r_len, dtype=jnp.int32) + jnp.asarray(r0, dtype=jnp.int32)
+    return apply_bloch_phase_flat_points(
+        values, kvecs_frac, r_flat, fft_grid, sign=sign)
+
+
+def extract_flat_rchunk(box: jax.Array, r0, r_len: int) -> jax.Array:
+    """Flatten the trailing FFT-box axes and slice a contiguous r slab."""
+    n_rtot = int(np.prod(np.asarray(box.shape[-3:], dtype=np.int64)))
+    box_flat = box.reshape(*box.shape[:-3], n_rtot)
+    return jax.lax.dynamic_slice_in_dim(box_flat, r0, int(r_len), axis=-1)
+
+
+def embed_flat_rchunk(chunk: jax.Array, fft_grid: tuple[int, int, int], r0) -> jax.Array:
+    """Embed a flat-r slab into a zero-padded FFT box with trailing 3D axes."""
+    nx, ny, nz = (int(s) for s in fft_grid)
+    n_rtot = nx * ny * nz
+    flat = jnp.zeros((*chunk.shape[:-1], n_rtot), dtype=chunk.dtype)
+    flat = jax.lax.dynamic_update_slice_in_dim(flat, chunk, r0, axis=-1)
+    return flat.reshape(*chunk.shape[:-1], nx, ny, nz)
+
+
 # ---------------------------------------------------------------------------
 # Sharding signature key — used to keep the jit caches small and stable.
 # ---------------------------------------------------------------------------
@@ -207,6 +285,7 @@ def to_rbox(
     *,
     norm: str = "backward",
     kvecs_frac: np.ndarray | jax.Array | None = None,
+    fft_batch_chunks: int = 1,
 ) -> jax.Array:
     """Scatter ψ → FFT box → IFFT to r-space (+ optional Bloch phase).
 
@@ -223,21 +302,25 @@ def to_rbox(
                    else tuple(int(s) for s in np.shape(kvecs_frac)))
     out_sharding = _output_sharding(psi, n_extra_axes=3)
     key = (psi.shape, tuple(g_index.shape), ngkmax, fft_grid_t, norm,
-           kvecs_shape, _sharding_key(psi), out_sharding)
+           kvecs_shape, int(fft_batch_chunks), _sharding_key(psi), out_sharding)
     fn = _RBOX_KERNEL_CACHE.get(key)
     if fn is None:
         if kvecs_frac is None:
             @jax.jit
             def fn(psi_, g_index_):
                 box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
-                out = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+                out = apply_local_fft(
+                    box, fft_kind="ifftn", axes=(-3, -2, -1), norm=norm,
+                    fft_batch_chunks=fft_batch_chunks)
                 return _maybe_constrain(out, out_sharding)
             _RBOX_KERNEL_CACHE[key] = fn
         else:
             @jax.jit
             def fn(psi_, g_index_, kvecs_):
                 box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
-                rb = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+                rb = apply_local_fft(
+                    box, fft_kind="ifftn", axes=(-3, -2, -1), norm=norm,
+                    fft_batch_chunks=fft_batch_chunks)
                 rb = apply_bloch_phase(rb, kvecs_, fft_grid_t)
                 return _maybe_constrain(rb, out_sharding)
             _RBOX_KERNEL_CACHE[key] = fn
@@ -255,6 +338,7 @@ def to_rmu(
     *,
     norm: str = "backward",
     kvecs_frac: np.ndarray | jax.Array | None = None,
+    fft_batch_chunks: int = 1,
 ) -> jax.Array:
     """ψ in r-space at the centroid FFT-grid indices ``r_mu``.
 
@@ -265,35 +349,46 @@ def to_rmu(
     ngkmax = int(psi.shape[-1])
     fft_grid_t = tuple(int(s) for s in fft_grid)
     n_rmu = int(np.shape(r_mu)[0])
+    r_mu_flat = (
+        np.asarray(r_mu)[..., 0] * fft_grid_t[1] * fft_grid_t[2]
+        + np.asarray(r_mu)[..., 1] * fft_grid_t[2]
+        + np.asarray(r_mu)[..., 2]
+    )
     kvecs_shape = (None if kvecs_frac is None
                    else tuple(int(s) for s in np.shape(kvecs_frac)))
     out_sharding = _output_sharding(psi, n_extra_axes=1)
     key = (psi.shape, tuple(g_index.shape), ngkmax, fft_grid_t, n_rmu,
-           norm, kvecs_shape, _sharding_key(psi), out_sharding)
+           norm, kvecs_shape, int(fft_batch_chunks), _sharding_key(psi),
+           out_sharding)
     fn = _RMU_KERNEL_CACHE.get(key)
     if fn is None:
         if kvecs_frac is None:
             @jax.jit
             def fn(psi_, g_index_, r_mu_):
                 box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
-                rb = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+                rb = apply_local_fft(
+                    box, fft_kind="ifftn", axes=(-3, -2, -1), norm=norm,
+                    fft_batch_chunks=fft_batch_chunks)
                 out = rb[:, :, :, r_mu_[:, 0], r_mu_[:, 1], r_mu_[:, 2]]
                 return _maybe_constrain(out, out_sharding)
             _RMU_KERNEL_CACHE[key] = fn
         else:
             @jax.jit
-            def fn(psi_, g_index_, r_mu_, kvecs_):
+            def fn(psi_, g_index_, r_mu_, r_mu_flat_, kvecs_):
                 box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
-                rb = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
-                rb = apply_bloch_phase(rb, kvecs_, fft_grid_t)
+                rb = apply_local_fft(
+                    box, fft_kind="ifftn", axes=(-3, -2, -1), norm=norm,
+                    fft_batch_chunks=fft_batch_chunks)
                 out = rb[:, :, :, r_mu_[:, 0], r_mu_[:, 1], r_mu_[:, 2]]
+                out = apply_bloch_phase_flat_points(
+                    out, kvecs_, r_mu_flat_, fft_grid_t)
                 return _maybe_constrain(out, out_sharding)
             _RMU_KERNEL_CACHE[key] = fn
     g_index_j = jnp.asarray(g_index, dtype=jnp.int32)
     r_mu_j = jnp.asarray(r_mu, dtype=jnp.int32)
     if kvecs_frac is None:
         return fn(psi, g_index_j, r_mu_j)
-    return fn(psi, g_index_j, r_mu_j,
+    return fn(psi, g_index_j, r_mu_j, jnp.asarray(r_mu_flat, dtype=jnp.int32),
               jnp.asarray(kvecs_frac, dtype=jnp.float64))
 
 
@@ -306,6 +401,7 @@ def to_rchunk(
     *,
     norm: str = "backward",
     kvecs_frac: np.ndarray | jax.Array | None = None,
+    fft_batch_chunks: int = 1,
 ) -> jax.Array:
     """ψ in r-space on a contiguous flat-r slab ``[r0, r0 + r_len)``.
 
@@ -326,26 +422,29 @@ def to_rchunk(
                    else tuple(int(s) for s in np.shape(kvecs_frac)))
     out_sharding = _output_sharding(psi, n_extra_axes=1)
     key = (psi.shape, tuple(g_index.shape), ngkmax, fft_grid_t, r_len_i,
-           norm, kvecs_shape, _sharding_key(psi), out_sharding)
+           norm, kvecs_shape, int(fft_batch_chunks), _sharding_key(psi),
+           out_sharding)
     fn = _RCHUNK_KERNEL_CACHE.get(key)
     if fn is None:
         if kvecs_frac is None:
             @jax.jit
             def fn(psi_, g_index_, r0_):
                 box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
-                rb = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
-                rb_flat = rb.reshape(*rb.shape[:3], n_rtot)
-                out = jax.lax.dynamic_slice_in_dim(rb_flat, r0_, r_len_i, axis=-1)
+                rb = apply_local_fft(
+                    box, fft_kind="ifftn", axes=(-3, -2, -1), norm=norm,
+                    fft_batch_chunks=fft_batch_chunks)
+                out = extract_flat_rchunk(rb, r0_, r_len_i)
                 return _maybe_constrain(out, out_sharding)
             _RCHUNK_KERNEL_CACHE[key] = fn
         else:
             @jax.jit
             def fn(psi_, g_index_, r0_, kvecs_):
                 box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
-                rb = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
-                rb = apply_bloch_phase(rb, kvecs_, fft_grid_t)
-                rb_flat = rb.reshape(*rb.shape[:3], n_rtot)
-                out = jax.lax.dynamic_slice_in_dim(rb_flat, r0_, r_len_i, axis=-1)
+                rb = apply_local_fft(
+                    box, fft_kind="ifftn", axes=(-3, -2, -1), norm=norm,
+                    fft_batch_chunks=fft_batch_chunks)
+                out = extract_flat_rchunk(rb, r0_, r_len_i)
+                out = apply_bloch_phase_flat_rchunk(out, kvecs_, fft_grid_t, r0_)
                 return _maybe_constrain(out, out_sharding)
             _RCHUNK_KERNEL_CACHE[key] = fn
     g_index_j = jnp.asarray(g_index, dtype=jnp.int32)

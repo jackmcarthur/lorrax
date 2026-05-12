@@ -219,6 +219,7 @@ class ZetaReader:
         sphere_idx: jax.Array | None,
         mesh: Mesh | None = None,
         valid_mu: int | None = None,
+        fft_batch_chunks: int = 1,
     ) -> jax.Array:
         """Read ζ in G-flat layout.
 
@@ -287,6 +288,7 @@ class ZetaReader:
             zeta_disk, qvec_batch_frac,
             mesh_xy=mesh, fft_shape=(nx, ny, nz),
             n_G_sph=n_G_sph, sphere_idx=sphere_jx,
+            fft_batch_chunks=fft_batch_chunks,
         )
 
 
@@ -306,6 +308,7 @@ def _do_disk_to_G(
     fft_shape: tuple[int, int, int],
     n_G_sph: int,
     sphere_idx: jax.Array | None,
+    fft_batch_chunks: int = 1,
 ) -> jax.Array:
     """r-space ζ slab + per-q fractional q-vec → G-flat ζ.
 
@@ -329,7 +332,7 @@ def _do_disk_to_G(
 
     key = (
         id(mesh_xy), Q, mu_total, nx, ny, nz, int(n_G_sph),
-        id(sphere_idx),
+        id(sphere_idx), int(fft_batch_chunks),
     )
     fn = _disk_to_G_cache.get(key)
     if fn is None:
@@ -338,7 +341,8 @@ def _do_disk_to_G(
             mesh_xy, P(None, ('x', 'y'), None, None, None))
         local_fftn = make_sharded_fftn_3d(
             mesh_xy, P(None, ('x', 'y'), None, None, None),
-            P(None, ('x', 'y'), None, None, None))
+            P(None, ('x', 'y'), None, None, None),
+            fft_batch_chunks=fft_batch_chunks)
         qvec_sh = NamedSharding(mesh_xy, P(None, None))
         zeta_disk_sh = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
 

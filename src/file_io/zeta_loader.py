@@ -218,6 +218,7 @@ class ZetaLoader:
         qvec_frac: jax.Array | None = None,
         sphere_idx: jax.Array | None = None,
         valid_mu: int | None = None,
+        fft_batch_chunks: int = 1,
     ) -> jax.Array:
         """Read a ζ window.
 
@@ -300,6 +301,7 @@ class ZetaLoader:
             mesh_xy=self._mesh, fft_shape=(nx, ny, nz),
             n_G_sph=n_G_sph,
             sphere_idx=jnp.asarray(sphere_idx, dtype=jnp.int32),
+            fft_batch_chunks=fft_batch_chunks,
         )
 
     # ------------------------------------------------------------------

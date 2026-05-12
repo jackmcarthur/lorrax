@@ -3,6 +3,7 @@ from typing import Callable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
@@ -34,6 +35,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 _fft_workspace_cache: dict = {}
 
 
+def _prod(shape: tuple[int, ...]) -> int:
+    return math.prod(int(s) for s in shape)
+
+
 def _normalize_local_fft_axes(rank: int, axes: tuple[int, ...]) -> tuple[int, ...]:
     normalized = tuple(ax if ax >= 0 else rank + ax for ax in axes)
     if len(set(normalized)) != len(normalized):
@@ -60,17 +65,90 @@ def _validate_local_fft_specs(in_spec: P, out_spec: P, axes: tuple[int, ...]) ->
     return fft_axes
 
 
+def _validate_fft_batch_chunks(fft_batch_chunks: int) -> int:
+    chunks = int(fft_batch_chunks)
+    if chunks < 1:
+        raise ValueError(f"fft_batch_chunks must be >= 1, got {fft_batch_chunks}.")
+    return chunks
+
+
+def _apply_local_fft_chunked(
+    x: jax.Array,
+    *,
+    fft_op,
+    fft_axes: tuple[int, ...],
+    norm: str | None,
+    fft_batch_chunks: int,
+) -> jax.Array:
+    batch_axes = tuple(ax for ax in range(x.ndim) if ax not in fft_axes)
+    perm = batch_axes + fft_axes
+    inv_perm = tuple(int(i) for i in np.argsort(np.asarray(perm)))
+    x_perm = jnp.transpose(x, perm)
+
+    batch_shape = tuple(int(x.shape[ax]) for ax in batch_axes)
+    fft_shape = tuple(int(x.shape[ax]) for ax in fft_axes)
+    batch_size = _prod(batch_shape) if batch_shape else 1
+    chunk_count = _validate_fft_batch_chunks(fft_batch_chunks)
+    chunk_batch = max(1, -(-batch_size // chunk_count))
+    padded_batch = chunk_batch * chunk_count
+
+    x_flat = x_perm.reshape(batch_size, *fft_shape)
+    if padded_batch != batch_size:
+        pad_width = ((0, padded_batch - batch_size),) + ((0, 0),) * len(fft_shape)
+        x_flat = jnp.pad(x_flat, pad_width)
+    x_chunks = x_flat.reshape(chunk_count, chunk_batch, *fft_shape)
+    chunk_fft_axes = tuple(range(1, 1 + len(fft_axes)))
+
+    def _fft_chunk(_, chunk):
+        return None, fft_op(chunk, axes=chunk_fft_axes, norm=norm)
+
+    _, y_chunks = jax.lax.scan(_fft_chunk, None, x_chunks, unroll=1)
+    y_flat = y_chunks.reshape(padded_batch, *fft_shape)[:batch_size]
+    y_perm = y_flat.reshape(*batch_shape, *fft_shape) if batch_shape else y_flat.reshape(*fft_shape)
+    return jnp.transpose(y_perm, inv_perm)
+
+
+def apply_local_fft(
+    x: jax.Array,
+    *,
+    fft_kind: str,
+    axes: tuple[int, ...],
+    norm: str | None = None,
+    fft_batch_chunks: int = 1,
+) -> jax.Array:
+    """Run a local FFT on ``x`` with optional chunking over non-FFT axes."""
+    if fft_kind not in ("ifftn", "fftn"):
+        raise ValueError(f"Unsupported fft_kind={fft_kind!r}")
+    fft_axes = _normalize_local_fft_axes(x.ndim, axes)
+    fft_op = jnp.fft.ifftn if fft_kind == "ifftn" else jnp.fft.fftn
+    chunk_count = _validate_fft_batch_chunks(fft_batch_chunks)
+    if chunk_count == 1:
+        return fft_op(x, axes=fft_axes, norm=norm)
+    return _apply_local_fft_chunked(
+        x,
+        fft_op=fft_op,
+        fft_axes=fft_axes,
+        norm=norm,
+        fft_batch_chunks=chunk_count,
+    )
+
+
 def _make_local_fft_impl(
     *,
     fft_kind: str,
     norm: str | None,
     fft_axes: tuple[int, ...],
+    fft_batch_chunks: int,
 ):
     """Return the device-local FFT implementation used by every helper."""
-    if fft_kind not in ("ifftn", "fftn"):
-        raise ValueError(f"Unsupported fft_kind={fft_kind!r}")
-    fft_op = jnp.fft.ifftn if fft_kind == "ifftn" else jnp.fft.fftn
-    return lambda x: fft_op(x, axes=fft_axes, norm=norm)
+    chunk_count = _validate_fft_batch_chunks(fft_batch_chunks)
+    return lambda x: apply_local_fft(
+        x,
+        fft_kind=fft_kind,
+        axes=fft_axes,
+        norm=norm,
+        fft_batch_chunks=chunk_count,
+    )
 
 
 def _make_sharded_fft(
@@ -81,6 +159,7 @@ def _make_sharded_fft(
     fft_kind: str,
     norm: str | None,
     axes: tuple[int, ...],
+    fft_batch_chunks: int,
 ):
     """shard_map local FFT preserving sharding on replicated FFT axes."""
     fft_axes = _validate_local_fft_specs(in_spec, out_spec, axes)
@@ -88,6 +167,7 @@ def _make_sharded_fft(
         fft_kind=fft_kind,
         norm=norm,
         fft_axes=fft_axes,
+        fft_batch_chunks=fft_batch_chunks,
     )
     return shard_map(local_fft, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec)
 
@@ -98,8 +178,10 @@ def _query_fft_peak_bytes_impl(
     fft_axes: tuple[int, ...],
     sharding: NamedSharding,
     dtype,
+    fft_batch_chunks: int,
 ) -> int:
     mesh = sharding.mesh
+    chunk_count = _validate_fft_batch_chunks(fft_batch_chunks)
     key = (
         tuple(input_shape),
         tuple(fft_axes),
@@ -107,6 +189,7 @@ def _query_fft_peak_bytes_impl(
         jnp.dtype(dtype).str,
         tuple(mesh.axis_names),
         tuple(int(mesh.shape[a]) for a in mesh.axis_names),
+        chunk_count,
     )
     hit = _fft_workspace_cache.get(key)
     if hit is not None:
@@ -121,6 +204,7 @@ def _query_fft_peak_bytes_impl(
         fft_kind="fftn",
         norm=None,
         axes=tuple(fft_axes),
+        fft_batch_chunks=chunk_count,
     )
     jit_fft = jax.jit(local_fftn, out_shardings=sharding)
 
@@ -154,6 +238,7 @@ def query_fft_peak_bytes(
     fft_axes: tuple[int, ...],
     sharding: NamedSharding,
     dtype=jnp.complex128,
+    fft_batch_chunks: int = 1,
 ) -> int:
     """AOT-compile the default local FFT path and return per-rank peak bytes."""
     return _query_fft_peak_bytes_impl(
@@ -161,6 +246,7 @@ def query_fft_peak_bytes(
         fft_axes=fft_axes,
         sharding=sharding,
         dtype=dtype,
+        fft_batch_chunks=fft_batch_chunks,
     )
 
 
@@ -220,9 +306,12 @@ def make_jittable_local_ifftn_3d(
     *,
     norm: str | None = None,
     axes: tuple[int, int, int] = (-3, -2, -1),
+    fft_batch_chunks: int = 1,
 ):
     """Legacy name kept as an alias for the production shard_map helper."""
-    return make_sharded_ifftn_3d(mesh, in_spec, out_spec, norm=norm, axes=axes)
+    return make_sharded_ifftn_3d(
+        mesh, in_spec, out_spec, norm=norm, axes=axes,
+        fft_batch_chunks=fft_batch_chunks)
 
 
 def make_jittable_local_fftn_3d(
@@ -232,9 +321,12 @@ def make_jittable_local_fftn_3d(
     *,
     norm: str | None = None,
     axes: tuple[int, int, int] = (-3, -2, -1),
+    fft_batch_chunks: int = 1,
 ):
     """Legacy name kept as an alias for the production shard_map helper."""
-    return make_sharded_fftn_3d(mesh, in_spec, out_spec, norm=norm, axes=axes)
+    return make_sharded_fftn_3d(
+        mesh, in_spec, out_spec, norm=norm, axes=axes,
+        fft_batch_chunks=fft_batch_chunks)
 
 
 def make_sharded_ifftn_3d(
@@ -244,6 +336,7 @@ def make_sharded_ifftn_3d(
     *,
     norm: str | None = None,
     axes: tuple[int, int, int] = (-3, -2, -1),
+    fft_batch_chunks: int = 1,
 ):
     """
     Uses shard_map to run IFFT independently on each device's local data.
@@ -256,6 +349,7 @@ def make_sharded_ifftn_3d(
         fft_kind="ifftn",
         norm=norm,
         axes=axes,
+        fft_batch_chunks=fft_batch_chunks,
     )
 
 
@@ -266,6 +360,7 @@ def make_sharded_fftn_3d(
     *,
     norm: str | None = None,
     axes: tuple[int, int, int] = (-3, -2, -1),
+    fft_batch_chunks: int = 1,
 ):
     """Forward shard_map local FFT."""
     return _make_sharded_fft(
@@ -275,6 +370,7 @@ def make_sharded_fftn_3d(
         fft_kind="fftn",
         norm=norm,
         axes=axes,
+        fft_batch_chunks=fft_batch_chunks,
     )
 
 
@@ -297,6 +393,7 @@ def make_flat_k_fft(
     kind: str,
     norm: str | None = "ortho",
     out_spec: P | None = None,
+    fft_batch_chunks: int = 1,
 ) -> Callable:
     """Return a flat-k FFT: ``(nk, *trail) -> (nk, *trail)``."""
     nkx, nky, nkz = (int(v) for v in kgrid)
@@ -306,11 +403,13 @@ def make_flat_k_fft(
     if kind == "ifftn":
         inner = make_sharded_ifftn_3d(
             mesh, spec, out_spec if out_spec is not None else spec,
-            norm=norm, axes=(0, 1, 2))
+            norm=norm, axes=(0, 1, 2),
+            fft_batch_chunks=fft_batch_chunks)
     elif kind == "fftn":
         inner = make_sharded_fftn_3d(
             mesh, spec, out_spec if out_spec is not None else spec,
-            norm=norm, axes=(0, 1, 2))
+            norm=norm, axes=(0, 1, 2),
+            fft_batch_chunks=fft_batch_chunks)
     else:
         raise ValueError(f"kind must be 'ifftn' or 'fftn', got {kind!r}")
 
@@ -330,10 +429,12 @@ def make_flat_k_ifftn(
     *,
     norm: str | None = "ortho",
     out_spec: P | None = None,
+    fft_batch_chunks: int = 1,
 ) -> Callable:
     """Flat-k IFFT ``(nk, *trail) -> (nk, *trail)``.  See :func:`make_flat_k_fft`."""
     return make_flat_k_fft(mesh, kgrid, spec, kind="ifftn",
-                           norm=norm, out_spec=out_spec)
+                           norm=norm, out_spec=out_spec,
+                           fft_batch_chunks=fft_batch_chunks)
 
 
 def make_flat_k_fftn(
@@ -343,7 +444,9 @@ def make_flat_k_fftn(
     *,
     norm: str | None = "ortho",
     out_spec: P | None = None,
+    fft_batch_chunks: int = 1,
 ) -> Callable:
     """Flat-k FFT ``(nk, *trail) -> (nk, *trail)``.  See :func:`make_flat_k_fft`."""
     return make_flat_k_fft(mesh, kgrid, spec, kind="fftn",
-                           norm=norm, out_spec=out_spec)
+                           norm=norm, out_spec=out_spec,
+                           fft_batch_chunks=fft_batch_chunks)

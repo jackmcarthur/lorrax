@@ -15,7 +15,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from common.wfn_transforms import to_box, to_rbox, to_rmu, to_rchunk
+from common.wfn_transforms import (
+    apply_bloch_phase_flat_points,
+    apply_bloch_phase_flat_rchunk,
+    embed_flat_rchunk,
+    extract_flat_rchunk,
+    to_box,
+    to_rbox,
+    to_rmu,
+    to_rchunk,
+)
 from file_io.wfn_loader import WfnLoader
 
 from tests.test_wfn_loader_eager import _synth_wfn, _MOS2_WFN
@@ -68,6 +77,17 @@ def _np_scatter_to_box(
         for g in range(n):
             out[k, :, :, gv[g, 0], gv[g, 1], gv[g, 2]] = psi[k, :, :, g]
     return out
+
+
+def _kvecs_for_loader(loader, k_spec) -> np.ndarray:
+    k_idxs, unfold = loader._resolve_k(k_spec)
+    if unfold:
+        return np.asarray(loader._ensure_sym().unfolded_kpts, dtype=np.float64)[
+            np.asarray(k_idxs, dtype=np.int32)
+        ]
+    return np.asarray(loader.kpoints, dtype=np.float64)[
+        np.asarray(k_idxs, dtype=np.int32)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +177,29 @@ def test_to_rmu_matches_rbox_take(synth_loader):
     np.testing.assert_allclose(psi_rmu, expected, atol=1e-14, rtol=0)
 
 
+def test_to_rmu_with_phase_matches_rbox_take(synth_loader):
+    psi = synth_loader.load(bands=(0, 3), k="full_bz")
+    g_index = synth_loader.box_index(k="full_bz")
+    nx, ny, nz = (int(s) for s in synth_loader.fft_grid)
+
+    rng = np.random.default_rng(11)
+    n_rmu = 5
+    r_mu = np.stack([
+        rng.integers(0, nx, size=n_rmu),
+        rng.integers(0, ny, size=n_rmu),
+        rng.integers(0, nz, size=n_rmu),
+    ], axis=-1).astype(np.int32)
+
+    psi_rmu = np.asarray(to_rmu(
+        psi, g_index, synth_loader.fft_grid, r_mu,
+        kvecs_frac=_kvecs_for_loader(synth_loader, "full_bz")))
+    psi_r_box = np.asarray(to_rbox(
+        psi, g_index, synth_loader.fft_grid,
+        kvecs_frac=_kvecs_for_loader(synth_loader, "full_bz")))
+    expected = psi_r_box[:, :, :, r_mu[:, 0], r_mu[:, 1], r_mu[:, 2]]
+    np.testing.assert_allclose(psi_rmu, expected, atol=1e-14, rtol=0)
+
+
 # ---------------------------------------------------------------------------
 # to_rchunk vs flat-r slice of to_rbox
 # ---------------------------------------------------------------------------
@@ -175,6 +218,39 @@ def test_to_rchunk_matches_rbox_flat_slab(synth_loader):
     expected = psi_r_box.reshape(*psi_r_box.shape[:3], n_rtot)[
         :, :, :, r0:r0 + r_len]
     np.testing.assert_allclose(psi_rchunk, expected, atol=1e-14, rtol=0)
+
+
+def test_to_rchunk_with_phase_matches_rbox_flat_slab(synth_loader):
+    psi = synth_loader.load(bands=(0, 3), k="full_bz")
+    g_index = synth_loader.box_index(k="full_bz")
+    nx, ny, nz = (int(s) for s in synth_loader.fft_grid)
+    n_rtot = nx * ny * nz
+
+    r0, r_len = nx * ny + 1, 13
+    psi_rchunk = np.asarray(to_rchunk(
+        psi, g_index, synth_loader.fft_grid, r0, r_len,
+        kvecs_frac=_kvecs_for_loader(synth_loader, "full_bz")))
+
+    psi_r_box = np.asarray(to_rbox(
+        psi, g_index, synth_loader.fft_grid,
+        kvecs_frac=_kvecs_for_loader(synth_loader, "full_bz")))
+    expected = psi_r_box.reshape(*psi_r_box.shape[:3], n_rtot)[
+        :, :, :, r0:r0 + r_len]
+    np.testing.assert_allclose(psi_rchunk, expected, atol=1e-14, rtol=0)
+
+
+def test_to_rchunk_chunked_fft_matches_default(synth_loader):
+    psi = synth_loader.load(bands=(0, 3), k="full_bz")
+    g_index = synth_loader.box_index(k="full_bz")
+    r0, r_len = 5, 17
+    default = np.asarray(to_rchunk(
+        psi, g_index, synth_loader.fft_grid, r0, r_len,
+        kvecs_frac=_kvecs_for_loader(synth_loader, "full_bz")))
+    chunked = np.asarray(to_rchunk(
+        psi, g_index, synth_loader.fft_grid, r0, r_len,
+        kvecs_frac=_kvecs_for_loader(synth_loader, "full_bz"),
+        fft_batch_chunks=3))
+    np.testing.assert_allclose(chunked, default, atol=1e-14, rtol=0)
 
 
 def test_to_rchunk_rejects_out_of_bounds(synth_loader):
@@ -245,6 +321,40 @@ def test_apply_bloch_phase_matches_4d_reference():
     got = np.asarray(apply_bloch_phase(
         jnp.asarray(psi_r_box), jnp.asarray(kvecs), (nx, ny, nz)))
     np.testing.assert_allclose(got, expected, atol=1e-13, rtol=0)
+
+
+def test_flat_rchunk_helpers_match_box_flatten_and_phase():
+    from common.wfn_transforms import apply_bloch_phase
+
+    rng = np.random.default_rng(13)
+    n_k, nb, ns = 3, 2, 2
+    nx, ny, nz = 5, 4, 3
+    n_rtot = nx * ny * nz
+    r0, r_len = 7, 11
+    box = (rng.standard_normal((n_k, nb, ns, nx, ny, nz))
+           + 1j * rng.standard_normal((n_k, nb, ns, nx, ny, nz)))
+    kvecs = rng.standard_normal((n_k, 3))
+
+    got_chunk = np.asarray(extract_flat_rchunk(jnp.asarray(box), jnp.int32(r0), r_len))
+    expected_chunk = box.reshape(n_k, nb, ns, n_rtot)[..., r0:r0 + r_len]
+    np.testing.assert_allclose(got_chunk, expected_chunk, atol=1e-14, rtol=0)
+
+    reembedded = np.asarray(embed_flat_rchunk(
+        jnp.asarray(expected_chunk), (nx, ny, nz), jnp.int32(r0)))
+    expected_reembedded = np.zeros_like(box)
+    expected_reembedded.reshape(n_k, nb, ns, n_rtot)[..., r0:r0 + r_len] = expected_chunk
+    np.testing.assert_allclose(reembedded, expected_reembedded, atol=1e-14, rtol=0)
+
+    flat_idx = np.arange(r0, r0 + r_len, dtype=np.int32)
+    phased_points = np.asarray(apply_bloch_phase_flat_points(
+        jnp.asarray(expected_chunk), jnp.asarray(kvecs), jnp.asarray(flat_idx), (nx, ny, nz)))
+    phased_chunk = np.asarray(apply_bloch_phase_flat_rchunk(
+        jnp.asarray(expected_chunk), jnp.asarray(kvecs), (nx, ny, nz), jnp.int32(r0)))
+    box_phased = np.asarray(apply_bloch_phase(
+        jnp.asarray(box), jnp.asarray(kvecs), (nx, ny, nz)))
+    expected_phase = box_phased.reshape(n_k, nb, ns, n_rtot)[..., r0:r0 + r_len]
+    np.testing.assert_allclose(phased_points, expected_phase, atol=5e-7, rtol=0)
+    np.testing.assert_allclose(phased_chunk, expected_phase, atol=5e-7, rtol=0)
 
 
 def test_to_box_shape(synth_loader):
