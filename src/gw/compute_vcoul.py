@@ -241,29 +241,20 @@ def make_v_munu_chunked_kernel(
     # enlarged by ``|q_max|_cart`` so one q=0-centered sphere covers every
     # per-q ball {G : |q+G|² ≤ cutoff}: G outside it has |q+G| > √cutoff at
     # every q, so sqrt_v = 0 there and the full-box contract is recovered
-    # exactly.  Numpy construction (consistent with the FFT-grid helpers
-    # above — avoid extra pjit compiles at factory time).
-    if vcoul_cutoff_ry is not None and sys_dim in (2, 3):
-        import itertools
-        _corners_frac = (np.array(list(itertools.product([-0.5, 0.5], repeat=3)))
-                         / np.array([nkx, nky, nkz], dtype=np.float64))
-        _q_max_cart = float(np.max(np.linalg.norm(
-            _corners_frac @ np.asarray(bvec, dtype=np.float64), axis=1)))
-        _sphere_r2 = (float(np.sqrt(vcoul_cutoff_ry)) + _q_max_cart) ** 2
-        _gx = (np.fft.fftfreq(fft_nx) * fft_nx).astype(np.float64)
-        _gy = (np.fft.fftfreq(fft_ny) * fft_ny).astype(np.float64)
-        _gz = (np.fft.fftfreq(fft_nz) * fft_nz).astype(np.float64)
-        _Gc = np.stack(np.meshgrid(_gx, _gy, _gz, indexing='ij'), axis=-1) \
-            @ np.asarray(bvec, dtype=np.float64)
-        _sph_mask = np.sum(_Gc * _Gc, axis=-1).reshape(-1) <= _sphere_r2
-        # G=(0,0,0) is flat-index 0 in fftfreq order; sphere_idx[0] must
-        # equal 0 so ``g0_chunk = ζ̃_flat[:, 0]`` stays valid below.
-        assert bool(_sph_mask[0])
-        sphere_idx = jnp.asarray(np.nonzero(_sph_mask)[0].astype(np.int32))
-        n_sph = int(sphere_idx.size)
-    else:
-        sphere_idx = None
-        n_sph = n_G
+    # exactly.  Single source of truth for the construction lives in
+    # :func:`common.coulomb_sphere.compute_bare_coulomb_sphere_idx` —
+    # the G-flat ζ writer (``common.isdf_fitting``) calls the same helper
+    # so writer-side and consumer-side spheres match bit-for-bit.
+    from common.coulomb_sphere import compute_bare_coulomb_sphere_idx
+    _sphere_np, n_sph = compute_bare_coulomb_sphere_idx(
+        fft_grid=(fft_nx, fft_ny, fft_nz),
+        bvec=np.asarray(bvec, dtype=np.float64),
+        kgrid=(nkx, nky, nkz),
+        vcoul_cutoff_ry=vcoul_cutoff_ry,
+        sys_dim=sys_dim,
+    )
+    sphere_idx = (jnp.asarray(_sphere_np, dtype=jnp.int32)
+                   if _sphere_np is not None else None)
 
     if sys_dim == 0:
         # 0D cell box truncation: precompute √v on the full FFT grid via

@@ -1447,6 +1447,7 @@ def fit_zeta_to_h5(
     vertex_mu_L: int = 0,
     solver_kind: str = 'auto',
     write_ibz_only: bool = True,
+    vcoul_cutoff_ry: float | None = None,
 ):
     """
     Full zeta fitting pipeline with r-chunk loop and HDF5 output.
@@ -1746,15 +1747,19 @@ def fit_zeta_to_h5(
         print(f"  q axis on disk: full BZ ({nq} q-points) "
               f"(write_ibz_only=False or closure check failed)")
 
-    # ---- Phase C1b: G-flat on-disk format toggle -----------------
+    # ---- Phase C: G-flat on-disk format toggle -----------------
     # When ``LORRAX_WRITE_G_FLAT_ZETA=1`` is set, the writer
     # accumulates each r-chunk's contribution into a persistent
     # G-flat buffer via ``common.wfn_transforms.accumulate_rchunk_to_gflat``
     # and writes the final tensor as ``zeta_q_G`` (shape
-    # ``(n_q_disk, n_rmu, n_G_sph)``).  The full r-space ζ_q is never
-    # materialised on disk or as a persistent device buffer.  For
-    # Phase C1b ``n_G_sph = n_rtot`` (full flat-FFT axis); Phase C2
-    # narrows to the bare-Coulomb sphere via ``build_master_gvec_list``.
+    # ``(n_q_disk, n_rmu, ngkmax)``).  The full r-space ζ_q is never
+    # materialised on disk or as a persistent device buffer.  When
+    # ``vcoul_cutoff_ry`` is provided we build the per-q WFN.h5-style
+    # sphere ``{G : |q+G|² ≤ cutoff}``, pad to a uniform ``ngkmax``
+    # with the sentinel Miller index ``(-nx/2, -ny/2, -nz/2)``, and
+    # store both the coeffs and the per-q components on disk.  Without
+    # a cutoff the writer falls back to the full flat-FFT axis
+    # (n_G_sph = n_rtot) — slow disk path, kept for sanity checks.
     write_g_flat_zeta = bool(int(os.environ.get(
         'LORRAX_WRITE_G_FLAT_ZETA', '0')))
     if write_g_flat_zeta and q_irr_frac is None:
@@ -1764,6 +1769,37 @@ def fit_zeta_to_h5(
         _kgrid_arr_for_qfrac = np.asarray(meta.kgrid, dtype=np.float64)
         q_irr_frac = (_bgw_wrap_q(sym.kvecs_asints)
                        / _kgrid_arr_for_qfrac[None, :])
+
+    # Build the per-q WFN.h5-style sphere when a cutoff is available.
+    # The output is host numpy; the writer threads ``sphere_idx_padded``
+    # through ``accumulate_rchunk_to_gflat`` and stashes the components
+    # / ngk / cutoff into the isdf_header below.
+    _gflat_sphere_idx_padded = None      # (n_q_disk, ngkmax) int32
+    _gflat_gvec_components = None        # (n_q_disk, 3, ngkmax) int32
+    _gflat_ngk_per_q = None              # (n_q_disk,) int32
+    _gflat_ngkmax = None
+    if write_g_flat_zeta and vcoul_cutoff_ry is not None \
+            and int(meta.sys_dim) != 0:
+        from common.coulomb_sphere import compute_per_q_bare_coulomb_components
+        _bvec_for_sphere = np.asarray(
+            wfn.blat * wfn.bvec, dtype=np.float64)
+        _sphere_pkg = compute_per_q_bare_coulomb_components(
+            fft_grid=meta.fft_grid,
+            bvec=_bvec_for_sphere,
+            q_irr_frac=q_irr_frac,
+            vcoul_cutoff_ry=float(vcoul_cutoff_ry),
+            sys_dim=int(meta.sys_dim),
+        )
+        _gflat_sphere_idx_padded = _sphere_pkg["sphere_idx_padded"]
+        _gflat_gvec_components = _sphere_pkg["gvec_components_padded"]
+        _gflat_ngk_per_q = _sphere_pkg["ngk_per_q"]
+        _gflat_ngkmax = int(_sphere_pkg["ngkmax"])
+        if jax.process_index() == 0:
+            print(
+                f"  G-flat ζ sphere: ngkmax={_gflat_ngkmax}, "
+                f"min ngk={int(_gflat_ngk_per_q.min())}, "
+                f"max ngk={int(_gflat_ngk_per_q.max())} "
+                f"({_gflat_ngkmax / float(n_rtot):.3%} of n_rtot)")
 
     # ``zeta_q.h5`` carries the BGW-style ``mf_header`` verbatim from
     # the source WFN so any downstream consumer (the new
@@ -1800,13 +1836,26 @@ def fit_zeta_to_h5(
             f"fit_zeta_to_h5: centroid_indices has shape "
             f"{_cent_idx_np.shape}, expected ({n_rmu}, 3).")
     _density_label = 'scalar' if int(vertex_mu_L) == 0 else 'current'
-    _isdf_hdr = IsdfHeader.build(
+    _hdr_kwargs = dict(
         r_mu_fft_idx=_cent_idx_np,
         fft_grid=meta.fft_grid,
         density=_density_label,
         vertex_mu_L=int(vertex_mu_L),
         zeta_layout=('G_flat' if write_g_flat_zeta else 'r_space'),
     )
+    if write_g_flat_zeta and _gflat_gvec_components is not None:
+        _hdr_kwargs.update(
+            gvec_components=_gflat_gvec_components,
+            ngk_per_q=_gflat_ngk_per_q,
+            bare_coulomb_cutoff_ry=float(vcoul_cutoff_ry),
+        )
+    elif write_g_flat_zeta:
+        raise ValueError(
+            "G-flat ζ writer is enabled (LORRAX_WRITE_G_FLAT_ZETA=1) "
+            "but no bare-Coulomb sphere was built — pass "
+            "vcoul_cutoff_ry to fit_zeta_to_h5 (or unset the env var "
+            "to fall back to the r-space layout).")
+    _isdf_hdr = IsdfHeader.build(**_hdr_kwargs)
 
     with timing.section("zeta_fit.write_headers"):
         if jax.process_index() == 0:
@@ -1855,11 +1904,14 @@ def fit_zeta_to_h5(
     # (n_rmu, n_rtot) expectation — ~50 µs per q, negligible.
     with timing.section("zeta_fit.open_file"):
         if write_g_flat_zeta:
-            # Phase C1b: ``zeta_q_G`` dataset (n_q_disk, n_rmu, n_G_sph).
-            # ``n_G_sph = n_rtot`` for now — Phase C2 narrows to the
-            # bare-Coulomb sphere.  Chunking: one row per q × full μ ×
-            # full G_sph keeps per-q reads contiguous (V_q hot loop).
-            _n_G_sph = n_rtot
+            # G-flat layout: ``zeta_q_G`` dataset (n_q_disk, n_rmu, ngkmax)
+            # — WFN.h5 ``wfns/coeffs`` style with a fixed ``ngkmax``
+            # padded G axis.  Per-q components live in
+            # ``isdf_header/gvec_components`` (already serialised by the
+            # write_isdf_header call above).  Chunking: one row per q
+            # × full μ × full ngkmax keeps per-q reads contiguous.
+            _n_G_sph = (int(_gflat_ngkmax)
+                         if _gflat_ngkmax is not None else n_rtot)
             if use_ffi_io:
                 zeta_io = SlabIO(output_file, mode='a', mesh=mesh_xy,
                                  backend=slab_io_backend)
@@ -2025,11 +2077,15 @@ def fit_zeta_to_h5(
     # norms_l_jax / norms_r_jax were built in STEP 1 above — reuse them
     # as the uniform-shape (nb,) inputs to the fit_one_rchunk jit.
 
-    # ---- Phase C1b: G-flat accumulator (zero-init, μ-sharded) ----
-    # Persistent buffer: (n_q_disk, n_rmu_padded, n_G_sph) c128 with
+    # ---- G-flat accumulator (zero-init, μ-sharded) ----
+    # Persistent buffer: (n_q_disk, n_rmu_padded, ngkmax) c128 with
     # μ sharded across ('x', 'y') so each rank holds n_rmu/p per q.
     # Donated to ``accumulate_rchunk_to_gflat`` each iter; in-place add.
+    # When the per-q sphere isn't available (no vcoul_cutoff_ry) we
+    # fall back to the full flat-FFT axis n_rtot — slow, kept for
+    # smoke / sanity tests.
     gflat_acc = None
+    _gflat_acc_n_G = None
     if write_g_flat_zeta:
         from common.wfn_transforms import accumulate_rchunk_to_gflat
         # μ allocated at PADDED extent so the ('x','y') sharding
@@ -2039,10 +2095,13 @@ def fit_zeta_to_h5(
         # because the back-solve produces zeta_pad = 0 (L_q's pad
         # block is identity).
         _n_rmu_padded = int(meta.n_rmu_padded)
+        _gflat_acc_n_G = (int(_gflat_ngkmax)
+                           if _gflat_ngkmax is not None else n_rtot)
         _gflat_acc_sharding = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
         gflat_acc = jax.jit(
             lambda: jnp.zeros(
-                (n_q_disk, _n_rmu_padded, n_rtot), dtype=jnp.complex128),
+                (n_q_disk, _n_rmu_padded, _gflat_acc_n_G),
+                dtype=jnp.complex128),
             out_shardings=_gflat_acc_sharding,
         )()
         _q_irr_frac_dev = jax.device_put(
@@ -2122,7 +2181,7 @@ def fit_zeta_to_h5(
                     gflat_acc = accumulate_rchunk_to_gflat(
                         rchunk=zeta_chunk_ibz, gflat_acc=gflat_acc,
                         fft_grid=meta.fft_grid, r0=r_start,
-                        sphere_idx=None,   # Phase C2 narrows to a sphere
+                        sphere_idx=_gflat_sphere_idx_padded,
                         qvec_frac=_q_irr_frac_dev,
                         norm='backward',
                     )
@@ -2205,13 +2264,28 @@ def fit_zeta_to_h5(
     # all-time high water.
     _track_peak()
 
-    # ---- Phase C1b: write the accumulated G-flat ζ_q ----
+    # ---- Phase C: write the accumulated G-flat ζ_q ----
     # One collective write of the persistent ``(n_q_disk, n_rmu,
-    # n_G_sph)`` tensor to disk.  The r-space per-chunk write loop
+    # ngkmax)`` tensor to disk.  The r-space per-chunk write loop
     # already short-circuited at ``continue``, so this is the ONLY
     # write that happens when ``write_g_flat_zeta`` is True.
     if write_g_flat_zeta:
         with timing.section("zeta_fit.write_g_flat"):
+            # Pad slot zero-fill (WFN.h5 ``coeffs = 0`` convention).
+            # The per-q gather inside ``accumulate_rchunk_to_gflat`` read
+            # the sentinel ``(-nx/2, -ny/2, -nz/2)`` flat-FFT slot into
+            # every pad position; those values are physical (not zero)
+            # so we mask them here.  Logical slots ``[..., :ngk[q]]``
+            # carry the real coeffs and are untouched.
+            if _gflat_ngk_per_q is not None:
+                _ngk_dev = jax.device_put(
+                    jnp.asarray(_gflat_ngk_per_q, dtype=jnp.int32),
+                    NamedSharding(mesh_xy, P(None)))
+                _g_axis = jnp.arange(int(gflat_acc.shape[-1]),
+                                      dtype=jnp.int32)        # (ngkmax,)
+                _mask = (_g_axis[None, None, :] < _ngk_dev[:, None, None])
+                gflat_acc = jnp.where(
+                    _mask, gflat_acc, jnp.zeros_like(gflat_acc))
             jax.block_until_ready(gflat_acc)
             _n_G_sph = int(gflat_acc.shape[-1])
             if use_ffi_io:

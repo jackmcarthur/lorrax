@@ -432,9 +432,22 @@ def accumulate_rchunk_to_gflat(
         Python int or jax-scalar — flat-r start of the slab in
         ``[0, nx·ny·nz)``.
     sphere_idx
-        Static ``(n_G_sph,)`` int32 flat-FFT indices to gather the
-        G-sphere subset.  ``None`` keeps the whole flat-FFT axis
-        (``n_G_sph = nx·ny·nz``).
+        Static int32 flat-FFT indices to gather the G-sphere subset.
+        Two shapes:
+
+        * ``(n_G_sph,)`` — a **shared** sphere applied to every q.
+          Same gather index for all q; cheap ``jnp.take`` on the
+          trailing axis.
+        * ``(n_q, ngkmax)`` — a **per-q** sphere (WFN.h5-style padded
+          layout).  ``n_q`` must match ``rchunk.shape[0]`` and
+          ``gflat_acc.shape[0]``.  Each q gets its own gather row;
+          pad slots within a row are sentinel flat-FFT indices whose
+          coeffs will be zeroed by the caller post-loop.  Compiles
+          to ``take_along_axis`` with ``mode='promise_in_bounds'``
+          to keep XLA's x64+shard_map verifier happy (sphere_idx is
+          guaranteed in-bounds by construction).
+
+        ``None`` keeps the whole flat-FFT axis (``n_G_sph = nx·ny·nz``).
     qvec_frac
         Optional ``(n_q, 3)`` fractional q-vectors.  When given, the
         pre-FFT slab is multiplied by ``exp(-2πi q·r)`` on the slab
@@ -460,9 +473,25 @@ def accumulate_rchunk_to_gflat(
     if sphere_idx is None:
         n_G_sph = n_rtot
         sphere_id = None
+        sphere_per_q = False
+        sphere_arr = None
     else:
         sphere_arr = np.asarray(sphere_idx, dtype=np.int32)
-        n_G_sph = int(sphere_arr.shape[0])
+        if sphere_arr.ndim == 1:
+            n_G_sph = int(sphere_arr.shape[0])
+            sphere_per_q = False
+        elif sphere_arr.ndim == 2:
+            n_G_sph = int(sphere_arr.shape[1])
+            sphere_per_q = True
+            if int(sphere_arr.shape[0]) != int(rchunk.shape[0]):
+                raise ValueError(
+                    f"accumulate_rchunk_to_gflat: per-q sphere_idx has "
+                    f"shape {sphere_arr.shape} but rchunk has "
+                    f"n_q={int(rchunk.shape[0])}.")
+        else:
+            raise ValueError(
+                f"accumulate_rchunk_to_gflat: sphere_idx must be 1-D "
+                f"(shared) or 2-D (per-q); got shape {sphere_arr.shape}.")
         sphere_id = id(sphere_arr.tobytes())
 
     qvec_shape = (None if qvec_frac is None
@@ -471,7 +500,7 @@ def accumulate_rchunk_to_gflat(
     key = (
         tuple(int(s) for s in rchunk.shape),
         tuple(int(s) for s in gflat_acc.shape),
-        fft_grid_t, r_len_i, n_G_sph, sphere_id,
+        fft_grid_t, r_len_i, n_G_sph, sphere_id, sphere_per_q,
         norm, qvec_shape,
         _sharding_key(rchunk), _sharding_key(gflat_acc),
     )
@@ -484,6 +513,24 @@ def accumulate_rchunk_to_gflat(
         else:
             sphere_const = None
 
+        def _gather_sphere(G_flat):
+            """Per-q OR shared gather on the trailing axis of G_flat."""
+            if sphere_const is None:
+                return G_flat
+            if not sphere_per_q:
+                return jnp.take(G_flat, sphere_const, axis=-1)
+            # Per-q gather: sphere_const has shape (n_q, ngkmax) and
+            # G_flat has shape (n_q, *mid, n_rtot).  Broadcast the
+            # sphere across any mid axes for take_along_axis.
+            n_mid_axes = G_flat.ndim - 2
+            sphere_b = sphere_const.reshape(
+                sphere_const.shape[0],
+                *((1,) * n_mid_axes),
+                sphere_const.shape[1],
+            )
+            return jnp.take_along_axis(
+                G_flat, sphere_b, axis=-1, mode='promise_in_bounds')
+
         if qvec_frac is None:
             @partial(jax.jit, donate_argnums=(1,))
             def fn(rch_, acc_, r0_):
@@ -495,11 +542,7 @@ def accumulate_rchunk_to_gflat(
                 box = pad_buf.reshape(*rch_.shape[:-1], nx, ny, nz)
                 G_box = jnp.fft.fftn(box, axes=(-3, -2, -1), norm=norm)
                 G_flat = G_box.reshape(*rch_.shape[:-1], n_rtot)
-                if sphere_const is not None:
-                    contrib = jnp.take(G_flat, sphere_const, axis=-1)
-                else:
-                    contrib = G_flat
-                return acc_ + contrib
+                return acc_ + _gather_sphere(G_flat)
             _RCHUNK_TO_GFLAT_CACHE[key] = fn
         else:
             @partial(jax.jit, donate_argnums=(1,))
@@ -514,11 +557,7 @@ def accumulate_rchunk_to_gflat(
                 box = pad_buf.reshape(*rch_.shape[:-1], nx, ny, nz)
                 G_box = jnp.fft.fftn(box, axes=(-3, -2, -1), norm=norm)
                 G_flat = G_box.reshape(*rch_.shape[:-1], n_rtot)
-                if sphere_const is not None:
-                    contrib = jnp.take(G_flat, sphere_const, axis=-1)
-                else:
-                    contrib = G_flat
-                return acc_ + contrib
+                return acc_ + _gather_sphere(G_flat)
             _RCHUNK_TO_GFLAT_CACHE[key] = fn
 
     r0_arg = (jnp.int32(int(r0)) if isinstance(r0, (int, np.integer)) else r0)

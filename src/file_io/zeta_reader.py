@@ -126,6 +126,11 @@ class ZetaReader:
         self.r_mu_fft_idx = isdf.r_mu_fft_idx
         self.r_mu_crystal = isdf.r_mu_crystal
         self.n_rmu = isdf.n_rmu
+        # G-flat metadata surface — None on r-space files.
+        self.gvec_components = isdf.gvec_components
+        self.ngk_per_q = isdf.ngk_per_q
+        self.bare_coulomb_cutoff_ry = isdf.bare_coulomb_cutoff_ry
+        self.ngkmax_zeta = isdf.ngkmax
 
         # ---- Capture on-disk q-axis size (IBZ vs full-BZ) ---------------
         # We poke the file directly here rather than going through SlabIO —
@@ -291,11 +296,18 @@ class ZetaReader:
                      if sphere_idx is not None else None)
 
         if self.zeta_layout == 'G_flat':
-            # Phase C1c: file is already G-flat.  Read the
-            # (q_count, mu_count, n_G_sph_disk) slab directly and
-            # narrow to the caller's sphere subset.  ``qvec_batch_frac``
-            # is ignored — the per-q phase is already baked into the
-            # on-disk tensor by the writer.
+            # File is already G-flat.  Read the (q_count, mu_count,
+            # ngkmax) slab directly.  ``qvec_batch_frac`` is ignored
+            # — the per-q phase is already baked into the on-disk
+            # tensor by the writer.  The G-axis on disk is now a
+            # **per-q** WFN.h5-style sphere of size ``ngkmax``
+            # (positions vary per q via ``isdf_header/gvec_components``),
+            # so a single shared ``sphere_idx`` can NOT be used to
+            # narrow with one ``jnp.take`` — that would pick the same
+            # disk position for every q, which is per-q wrong.
+            # The proper per-q scatter to a consumer's shared sphere
+            # via the components table belongs in the V_q wrapper and
+            # is not implemented here yet.
             n_G_sph_disk = int(self.n_G_sph_disk)
             valid_count = (mu_count if valid_mu is None else int(valid_mu))
             zeta_g_disk = self._slab_io.read_slab(
@@ -308,7 +320,13 @@ class ZetaReader:
                 partition_spec=P(None, ('x', 'y'), None),
             )
             if sphere_jx is not None and n_G_sph != n_G_sph_disk:
-                return jnp.take(zeta_g_disk, sphere_jx, axis=-1)
+                raise NotImplementedError(
+                    "ZetaReader.read_zeta_G_slab: on-disk per-q sphere "
+                    f"(ngkmax={n_G_sph_disk}) ≠ caller's shared sphere "
+                    f"(n_G_sph={n_G_sph}).  Per-q → shared-sphere "
+                    "scatter via gvec_components is not yet wired into "
+                    "the V_q hot loop; pass sphere_idx=None to consume "
+                    "the raw slab, or refit with the r-space writer.")
             return zeta_g_disk
 
         # Legacy 'r_space' path: read r-space slab + FFT + sphere gather.

@@ -30,6 +30,13 @@ What lives in ``isdf_header``
   decide whether to reuse the on-disk ζ or refit.  Legacy files that
   lack the field are treated as ``True`` (they pre-date the flag and
   were always written atomically at end-of-fit).
+- ``zeta_layout`` (scalar str): ``'r_space'`` (legacy) or ``'G_flat'``.
+  In G-flat mode the writer produces an extra metadata block —
+  ``ngkmax``, ``ngk`` (per-q logical sphere size), ``gvec_components``
+  (per-q Miller indices padded with sentinel ``(-nx/2, -ny/2, -nz/2)``)
+  and ``bare_coulomb_cutoff_ry``.  These mirror the WFN.h5 ``wfns``
+  group layout with the ragged G-axis replaced by a fixed
+  ``ngkmax``-padded axis.
 """
 
 from __future__ import annotations
@@ -62,13 +69,39 @@ class IsdfHeader:
                                  # qvec_frac=, sphere_idx=)``.
                                  # 'G_flat' (Phase C of zeta migration): on-disk
                                  # dataset is ``zeta_q_G`` shape (n_q_disk,
-                                 # n_rmu, n_G_sph), already FFT'd + sphere-
-                                 # gathered by the writer.  Legacy files that
-                                 # lack this field default to 'r_space'.
+                                 # n_rmu, ngkmax), already FFT'd + sphere-
+                                 # gathered by the writer with the per-q
+                                 # ``|q+G|² ≤ bare_coulomb_cutoff_ry`` sphere
+                                 # padded to a uniform ``ngkmax`` (WFN.h5
+                                 # ``wfns`` layout, non-ragged).  Pad slots
+                                 # carry zero coeffs and sentinel components.
+                                 # Legacy files that lack this field default
+                                 # to 'r_space'.
+
+    # G-flat metadata (None when ``zeta_layout == 'r_space'``).
+    gvec_components: np.ndarray | None = None
+                                 # (n_q_disk, 3, ngkmax) int32 — per-q Miller
+                                 # indices in the ``wfns/gvecs`` style.  Pad
+                                 # slots carry ``(-nx/2, -ny/2, -nz/2)``.
+    ngk_per_q: np.ndarray | None = None
+                                 # (n_q_disk,) int32 — per-q logical sphere
+                                 # size.  ``zeta_q_G[q, :, ngk[q]:]`` is zero
+                                 # by construction.
+    bare_coulomb_cutoff_ry: float | None = None
+                                 # Bare Coulomb cutoff used to build the per-q
+                                 # sphere.  Stashed so a consumer that wants
+                                 # to verify or rebuild the sphere can do so
+                                 # without trusting the components table.
 
     @property
     def n_rmu(self) -> int:
         return int(self.r_mu_fft_idx.shape[0])
+
+    @property
+    def ngkmax(self) -> int | None:
+        if self.gvec_components is None:
+            return None
+        return int(self.gvec_components.shape[-1])
 
     @classmethod
     def build(
@@ -80,6 +113,9 @@ class IsdfHeader:
         vertex_mu_L: int,
         zeta_is_done: bool = False,
         zeta_layout: str = 'r_space',
+        gvec_components: np.ndarray | None = None,
+        ngk_per_q: np.ndarray | None = None,
+        bare_coulomb_cutoff_ry: float | None = None,
     ) -> 'IsdfHeader':
         """Build a header from centroid FFT-grid indices.
 
@@ -89,7 +125,8 @@ class IsdfHeader:
         the final chunk is on disk.  ``zeta_layout`` defaults to
         ``'r_space'`` (the legacy on-disk format); the
         ``accumulate_rchunk_to_gflat`` writer path sets it to
-        ``'G_flat'``.
+        ``'G_flat'``.  In G-flat mode, ``gvec_components`` /
+        ``ngk_per_q`` / ``bare_coulomb_cutoff_ry`` are required.
         """
         if zeta_layout not in ('r_space', 'G_flat'):
             raise ValueError(
@@ -101,6 +138,33 @@ class IsdfHeader:
                 f"r_mu_fft_idx must be (n_rmu, 3); got {idx.shape}")
         fg = np.asarray(fft_grid, dtype=np.float64).reshape(3)
         crystal = idx.astype(np.float64) / fg[None, :]
+
+        # G-flat metadata coercion / validation.
+        gv = None
+        nk = None
+        cutoff = None
+        if zeta_layout == 'G_flat':
+            if gvec_components is None or ngk_per_q is None \
+                    or bare_coulomb_cutoff_ry is None:
+                raise ValueError(
+                    "zeta_layout='G_flat' requires gvec_components, "
+                    "ngk_per_q, and bare_coulomb_cutoff_ry.")
+            gv = np.asarray(gvec_components, dtype=np.int32)
+            nk = np.asarray(ngk_per_q, dtype=np.int32)
+            cutoff = float(bare_coulomb_cutoff_ry)
+            if gv.ndim != 3 or gv.shape[1] != 3:
+                raise ValueError(
+                    f"gvec_components must be (n_q, 3, ngkmax); got "
+                    f"{gv.shape}")
+            if nk.shape != (gv.shape[0],):
+                raise ValueError(
+                    f"ngk_per_q must be (n_q,)={gv.shape[0]}; got "
+                    f"{nk.shape}")
+            if int(nk.max()) > int(gv.shape[-1]):
+                raise ValueError(
+                    f"max(ngk_per_q)={int(nk.max())} > ngkmax="
+                    f"{int(gv.shape[-1])}.")
+
         return cls(
             density=str(density),
             vertex_mu_L=int(vertex_mu_L),
@@ -108,6 +172,9 @@ class IsdfHeader:
             r_mu_crystal=crystal,
             zeta_is_done=bool(zeta_is_done),
             zeta_layout=str(zeta_layout),
+            gvec_components=gv,
+            ngk_per_q=nk,
+            bare_coulomb_cutoff_ry=cutoff,
         )
 
 
@@ -125,6 +192,13 @@ def _read_group(f: h5.File) -> IsdfHeader:
                  else True)
     zeta_layout = (_decode_str(g['zeta_layout'][()]) if 'zeta_layout' in g
                    else 'r_space')
+    # G-flat metadata (only present when zeta_layout == 'G_flat').
+    gv = (np.asarray(g['gvec_components'][:], dtype=np.int32)
+          if 'gvec_components' in g else None)
+    nk = (np.asarray(g['ngk'][:], dtype=np.int32)
+          if 'ngk' in g else None)
+    cutoff = (float(g['bare_coulomb_cutoff_ry'][()])
+              if 'bare_coulomb_cutoff_ry' in g else None)
     return IsdfHeader(
         density=_decode_str(g['density'][()]),
         vertex_mu_L=int(g['vertex_mu_L'][()]),
@@ -132,6 +206,9 @@ def _read_group(f: h5.File) -> IsdfHeader:
         r_mu_crystal=np.asarray(g['centroids/r_mu_crystal'][:], dtype=np.float64),
         zeta_is_done=zeta_done,
         zeta_layout=zeta_layout,
+        gvec_components=gv,
+        ngk_per_q=nk,
+        bare_coulomb_cutoff_ry=cutoff,
     )
 
 
@@ -180,6 +257,15 @@ def write_isdf_header(
         c = g.create_group('centroids')
         c.create_dataset('r_mu_fft_idx', data=header.r_mu_fft_idx)
         c.create_dataset('r_mu_crystal', data=header.r_mu_crystal)
+        # G-flat metadata — only written when present.
+        if header.gvec_components is not None:
+            g.create_dataset('gvec_components', data=header.gvec_components)
+        if header.ngk_per_q is not None:
+            g.create_dataset('ngk', data=header.ngk_per_q)
+        if header.bare_coulomb_cutoff_ry is not None:
+            g.create_dataset(
+                'bare_coulomb_cutoff_ry',
+                data=np.float64(header.bare_coulomb_cutoff_ry))
 
 
 def mark_zeta_done(path: str | Path) -> None:

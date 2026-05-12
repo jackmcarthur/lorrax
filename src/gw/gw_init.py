@@ -587,6 +587,16 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# orchestrator gains IBZ support, this can flip to ``True`` for
 	# bispinor too.
 	_write_ibz_only_charge = not bool(cfg.bispinor)
+	# G-flat ζ writer (LORRAX_WRITE_G_FLAT_ZETA=1) needs the same bare
+	# Coulomb cutoff that the V_q kernel uses so the per-q on-disk
+	# sphere matches the consumer-side sphere bit-for-bit.  Computed
+	# from cfg.head.bare_coulomb_cutoff below; pass the resolved value
+	# down.  Default is ``ecutwfc`` (matches BGW's
+	# ``screened_coulomb_cutoff`` default).
+	if cfg.head.bare_coulomb_cutoff is None:
+		_zeta_vcoul_cutoff = float(wfn.ecutwfc)
+	else:
+		_zeta_vcoul_cutoff = float(cfg.head.bare_coulomb_cutoff)
 	with timing.section("gw_jax.zeta_fit_chunked"), jax_profile.trace_section("zeta_fit"):
 		peak_bytes = fit_zeta_to_h5(
 			wfn=wfn, sym=sym, meta=meta,
@@ -604,6 +614,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			slab_io_backend=cfg.backend.slab_io,
 			gspace_mode=cfg.gspace_mode,
 			write_ibz_only=_write_ibz_only_charge,
+			vcoul_cutoff_ry=_zeta_vcoul_cutoff,
 		)
 
 	# Diagnostic: peek at ζ^0 (charge) q=0 max magnitude.
@@ -718,6 +729,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					# to consume IBZ-only ζ + post-loop unfold, then
 					# drop this opt-out.
 					write_ibz_only=False,
+					vcoul_cutoff_ry=_zeta_vcoul_cutoff,
 				)
 			# Diagnostic: peek at ζ q=0 max magnitude for comparison to
 			# agent-B's MoS2 reference (commit 69e8863):

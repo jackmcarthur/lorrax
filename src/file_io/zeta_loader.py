@@ -99,12 +99,18 @@ class ZetaLoader:
         self.backend = backend
 
         # Read both headers in one open; reused by load() for shape probes.
+        # Dataset name depends on layout: ``zeta_q`` (r-space, legacy)
+        # vs ``zeta_q_G`` (G-flat — WFN.h5 ``coeffs`` style, padded to
+        # ``ngkmax``).
         with h5.File(self._path, "r") as f:
             mf = read_mf_header_from_file(f)
             isdf = read_isdf_header_from_file(f)
-            zeta_shape = tuple(int(x) for x in f["zeta_q"].shape)
+            _ds_name = ('zeta_q_G' if isdf.zeta_layout == 'G_flat'
+                         else 'zeta_q')
+            zeta_shape = tuple(int(x) for x in f[_ds_name].shape)
         self._mf = mf
         self._isdf = isdf
+        self._zeta_dataset_name = _ds_name
 
         # mf_header attribute surface — same names ZetaReader exposes
         # (drop-in source for callers).
@@ -153,10 +159,23 @@ class ZetaLoader:
         self.zeta_is_done = bool(isdf.zeta_is_done)
         self.zeta_layout = str(isdf.zeta_layout)   # 'r_space' | 'G_flat'
 
-        # On-disk q-axis classification.
+        # G-flat metadata surface (None for r-space files).
+        self.gvec_components = isdf.gvec_components
+        self.ngk_per_q = isdf.ngk_per_q
+        self.bare_coulomb_cutoff_ry = isdf.bare_coulomb_cutoff_ry
+        self.ngkmax_zeta = isdf.ngkmax   # WFN.h5-style padded G-axis size
+
+        # On-disk q-axis classification.  Dataset shape differs by layout:
+        #   r-space: (n_q_disk, n_rtot,        n_rmu) — n_rtot at axis 1
+        #   G-flat:  (n_q_disk, n_rmu_padded,  ngkmax) — μ at axis 1
+        # so ``n_rtot_disk`` is meaningful only for the r-space case.
         self.n_q_on_disk = int(zeta_shape[0])
-        self.n_rtot_disk = int(zeta_shape[1])
-        self.n_rmu_disk = int(zeta_shape[2])
+        if self.zeta_layout == 'G_flat':
+            self.n_rtot_disk = None
+            self.n_rmu_disk = int(zeta_shape[1])
+        else:
+            self.n_rtot_disk = int(zeta_shape[1])
+            self.n_rmu_disk = int(zeta_shape[2])
         self.n_q_full = int(np.prod(self.kgrid))
         self.q_layout: Literal["ibz", "full_bz"] = (
             "full_bz" if self.n_q_on_disk == self.n_q_full else "ibz")
@@ -268,6 +287,35 @@ class ZetaLoader:
             sharding = (P(None, None, ('x', 'y')) if layout == 'r_space'
                         else P(None, ('x', 'y'), None))
 
+        # --- Disk-native G-flat: read direct, no FFT ------------------
+        # When the on-disk layout already IS G-flat (writer ran with
+        # LORRAX_WRITE_G_FLAT_ZETA=1), the slab on disk is
+        # ``(Q, μ, ngkmax)`` — WFN.h5 ``coeffs`` style.  Reading
+        # ``layout='r_space'`` would require an inverse FFT we don't
+        # support yet; ``layout='G_flat'`` returns the slab as-is
+        # (caller's sphere_idx / qvec_frac are accepted for API
+        # symmetry but only used to scatter into the consumer's
+        # shared sphere downstream).
+        if self.zeta_layout == 'G_flat':
+            if layout == 'r_space':
+                raise NotImplementedError(
+                    "ZetaLoader.load(layout='r_space') on a G-flat "
+                    "on-disk file would require an inverse FFT; not "
+                    "implemented.  Consume the file with "
+                    "layout='G_flat' instead.")
+            if need_unfold:
+                raise NotImplementedError(
+                    "ZetaLoader.load(q='full_bz') on a G-flat "
+                    "on-disk file: IBZ→full unfold for G-flat ζ_q "
+                    "is not yet wired (needs rotation of per-q "
+                    "components + the R·V·Rᵀ transverse path).  "
+                    "Use q='ibz' and unfold in the V_q consumer.")
+            return self._read_g_flat_disk(
+                q_indices=q_indices,
+                mu_lo=mu_lo, mu_count=mu_count, valid_mu=valid_count,
+                partition_spec=sharding,
+            )
+
         # --- r-space read (the disk-native layout) --------------------
         zeta_r = self._read_r_space(
             q_indices=q_indices,
@@ -335,11 +383,15 @@ class ZetaLoader:
         return arr, False
 
     def _resolve_mu(self, mu) -> tuple[int, int]:
+        # μ extent on disk: r-space layout puts μ at axis 2,
+        # G-flat layout puts μ at axis 1; both use ``self.n_rmu_disk``
+        # which is set layout-aware in __init__.
+        n_rmu_disk = int(self.n_rmu_disk)
         if mu is None:
-            return 0, self.n_rmu_disk
+            return 0, n_rmu_disk
         if isinstance(mu, slice):
             start = 0 if mu.start is None else int(mu.start)
-            stop = self.n_rmu_disk if mu.stop is None else int(mu.stop)
+            stop = n_rmu_disk if mu.stop is None else int(mu.stop)
             if mu.step not in (None, 1):
                 raise ValueError(f"mu slice must have step 1; got {mu.step}")
             return start, stop
@@ -471,6 +523,50 @@ class ZetaLoader:
             return z_full
 
         return _unfold(zeta_ibz)
+
+    def _read_g_flat_disk(
+        self,
+        *,
+        q_indices: np.ndarray,
+        mu_lo: int,
+        mu_count: int,
+        valid_mu: int,
+        partition_spec: P,
+    ) -> jax.Array:
+        """Read a G-flat ζ slab ``(Q, μ, ngkmax)`` from ``zeta_q_G``.
+
+        Pad slots at ``j ≥ ngk[q]`` are zero by writer construction,
+        so the caller can ignore them.  Per-q sphere lookup tables
+        (``self.gvec_components``, ``self.ngk_per_q``) tell the V_q
+        consumer where each disk-axis entry lives in Miller-index space.
+        """
+        ngkmax = int(self.ngkmax_zeta)
+        if _is_contiguous(q_indices):
+            q_offset = int(q_indices[0])
+            q_count = int(q_indices.size)
+            return self._slab_io.read_slab(
+                'zeta_q_G',
+                shape=(q_count, mu_count, ngkmax),
+                valid_shape=(q_count, valid_mu, ngkmax),
+                dtype=np.complex128,
+                offset=(q_offset, mu_lo, 0),
+                mesh=self._mesh,
+                partition_spec=partition_spec,
+            )
+
+        rows = []
+        for qi in q_indices:
+            row = self._slab_io.read_slab(
+                'zeta_q_G',
+                shape=(1, mu_count, ngkmax),
+                valid_shape=(1, valid_mu, ngkmax),
+                dtype=np.complex128,
+                offset=(int(qi), mu_lo, 0),
+                mesh=self._mesh,
+                partition_spec=partition_spec,
+            )
+            rows.append(row)
+        return jnp.concatenate(rows, axis=0)
 
     def _read_r_space(
         self,

@@ -111,6 +111,12 @@ def test_zeta_layout_round_trip(tmp_path):
         fft_grid=(8, 8, 8),
         density='scalar', vertex_mu_L=0,
         zeta_is_done=True, zeta_layout='G_flat',
+        # G-flat layout now carries the per-q sphere metadata
+        # (WFN.h5 ``coeffs`` style); supply trivial values for the
+        # round-trip test.
+        gvec_components=np.zeros((1, 3, 4), dtype=np.int32),
+        ngk_per_q=np.array([4], dtype=np.int32),
+        bare_coulomb_cutoff_ry=30.0,
     )
     write_isdf_header(str(out_g), g_hdr, mode='a')
     hdr_g = read_isdf_header(str(out_g))
