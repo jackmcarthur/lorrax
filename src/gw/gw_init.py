@@ -706,6 +706,11 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			n_rmu_jax=int(n_rmu_curr_jax),
 			n_rmu_padded=int(n_rmu_curr_padded),
 		)
+		# ``sys_dim`` is set dynamically on ``meta`` by gw_jax.main
+		# (Meta has no sys_dim field), so dataclasses.replace doesn't
+		# carry it over.  Copy it explicitly — fit_zeta_to_h5 reads
+		# meta.sys_dim when building the per-q G-flat sphere.
+		meta_curr.sys_dim = meta.sys_dim
 
 		with timing.section("gw_jax.load_centroid_wfns_current"):
 			psi_curr_rmu_Y, psi_curr_rmuT_X = load_centroids_band_chunked(
