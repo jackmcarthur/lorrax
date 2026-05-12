@@ -644,19 +644,47 @@ def load_centroids_band_chunked(
 
     # k_chunk_size autodetect — bound the FFT-box transient peak inside
     # to_rmu (the only place a full r-box exists in the new pipeline).
+    #
+    # NB: we cost per-k against ``nb_padded`` (NOT ``bands_per_shard``).
+    # XLA empirically materialises the (n_k, nb_padded, ns, nx, ny, nz)
+    # FFT box UNSHARDED on every rank at CrI3 6×6×1 80 Ry scale — the
+    # band-axis ``with_sharding_constraint`` and the
+    # ``make_jittable_local_ifftn_3d`` helper both fail to keep the box
+    # sharded once XLA's FFT planner pulls the gather + IFFT into a
+    # single fused HLO module.  Sizing per_k against the unsharded
+    # ``nb_padded`` extent ensures the chunker picks ``k_chunk_size``
+    # small enough that even the worst-case unsharded box fits.  Costs
+    # ~16× more headroom on a 2-D 4×4 mesh than the sharded estimate
+    # but avoids the 40 GB OOM seen on CrI3 6×6 (matched what we see
+    # in HLO rematerialization warnings: peak ≈ 4·box_unsharded).
     if k_chunk_size is None:
         n_rtot = meta.fft_grid[0] * meta.fft_grid[1] * meta.fft_grid[2]
         n_devices = jax.device_count()
         nb_chunk = min(band_chunk_size, nb_total)
         bands_per_shard = (nb_chunk + n_devices - 1) // n_devices
+        nb_padded = bands_per_shard * n_devices
 
         peak_copies = 4 if n_devices == 1 else 9
         gpu_mem_bytes = 36e9
         if hasattr(meta, 'memory_per_device_gb') and meta.memory_per_device_gb > 0:
             gpu_mem_bytes = meta.memory_per_device_gb * 1e9
 
-        per_k_bytes = bands_per_shard * nspinor * n_rtot * 16 * peak_copies
+        per_k_bytes = nb_padded * nspinor * n_rtot * 16 * peak_copies
         k_chunk_size = max(1, min(int(gpu_mem_bytes / per_k_bytes), nk_tot))
+        # Round k_chunk_size DOWN so that ``nb_chunk × k_chunk_size`` is
+        # a multiple of ``n_devices``.  Otherwise the (band, k) plane
+        # sharded across the mesh leaves some ranks with zero elements
+        # to read, and the PHDF5 FFI reader's hyperslab selection then
+        # fails with "selection + offset not within extent" (seen on
+        # CrI3 6×6×1 80 Ry with nb_chunk=4 + auto k_chunk=6 on a 4×4
+        # mesh — last y-rank got 0 k-points to read).
+        from math import gcd
+        _step = max(1, n_devices // max(1, gcd(nb_chunk, n_devices)))
+        if k_chunk_size > _step:
+            k_chunk_size = (k_chunk_size // _step) * _step
+        else:
+            k_chunk_size = _step
+        k_chunk_size = max(1, min(k_chunk_size, nk_tot))
 
     k_chunk_size = min(k_chunk_size, nk_tot)
     num_k_chunks = (nk_tot + k_chunk_size - 1) // k_chunk_size
