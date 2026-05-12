@@ -2091,6 +2091,14 @@ def fit_zeta_to_h5(
     with timing.section("zeta_fit.sync_global"):
         jax.experimental.multihost_utils.sync_global_devices("zeta_writes_complete")
 
+    # Flip ``isdf_header/zeta_is_done`` to True now that every chunk
+    # has drained to disk.  Restart paths key off this flag to decide
+    # whether the on-disk ζ is trustable; flipping it here (after the
+    # global sync above) guarantees every rank's writes are durable.
+    if jax.process_index() == 0:
+        from file_io.isdf_header import mark_zeta_done
+        mark_zeta_done(output_file)
+
     # Free the host tiles (host_cache mode only; file_reread's tiles
     # are already empty after the final end_rchunk).  The phdf5 reader
     # itself is cached at module level and survives.
