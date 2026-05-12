@@ -175,26 +175,50 @@ class PsiGStore:
                 self._host_tiles[(x, y)] = np.empty(
                     self._per_rank_shape, dtype=np.complex128)
 
+        # Prefetched band-chunk schedule.  ``loader.load`` returns a
+        # stream-async jax.Array, so we issue bc[i+1]'s collective phdf5
+        # read BEFORE we touch bc[i]'s output — XLA / the FFI driver
+        # overlap bc[i+1]'s I/O with bc[i]'s ``shard_to_host`` copy
+        # (which is itself a synchronous D2H per addressable shard).
+        # Depth = 1; the wfn read time is comparable to one bc's host
+        # copy time on PCIe-Gen4 + parallel HDF5, so deeper queueing
+        # gains little and risks holding extra device buffers.
+        from common import timing
         sharding_spec = P(None, ('x', 'y'), None, None)
-        for bc_idx, bc_range in enumerate(self.band_chunk_ranges):
-            psi_G_bc = self.loader.load(
-                bands=bc_range, k="full_bz",
+        n_bc = len(self.band_chunk_ranges)
+        with timing.section("psi_G_store.populate.loader_load"):
+            pending_psi = self.loader.load(
+                bands=self.band_chunk_ranges[0], k="full_bz",
                 sharding=sharding_spec,
                 bispinor=self.bispinor,
             )
+        for bc_idx, bc_range in enumerate(self.band_chunk_ranges):
+            psi_G_bc = pending_psi
+            # Issue bc[i+1]'s load first so its phdf5 read overlaps
+            # with bc[i]'s ``shard_to_host`` D2H below.
+            if bc_idx + 1 < n_bc:
+                with timing.section("psi_G_store.populate.loader_load"):
+                    pending_psi = self.loader.load(
+                        bands=self.band_chunk_ranges[bc_idx + 1], k="full_bz",
+                        sharding=sharding_spec,
+                        bispinor=self.bispinor,
+                    )
+            else:
+                pending_psi = None
             b_lo = self._bc_band_offsets[bc_idx]
             b_hi = self._bc_band_offsets[bc_idx + 1]
-            for shard in psi_G_bc.addressable_shards:
-                x, y = self._coords[id(shard.device)]
-                tile = self._host_tiles[(x, y)]
-                shard_band_slice = shard.index[1]
-                data = _zero_user_band_pad_in_shard(
-                    np.asarray(shard.data),
-                    bc_range=bc_range,
-                    shard_band_slice=shard_band_slice,
-                    user_band_stop=int(getattr(self.meta, "b_id_4_user", self.meta.b_id_4)),
-                )
-                tile[:, b_lo:b_hi, :, :] = data
+            with timing.section("psi_G_store.populate.shard_to_host"):
+                for shard in psi_G_bc.addressable_shards:
+                    x, y = self._coords[id(shard.device)]
+                    tile = self._host_tiles[(x, y)]
+                    shard_band_slice = shard.index[1]
+                    data = _zero_user_band_pad_in_shard(
+                        np.asarray(shard.data),
+                        bc_range=bc_range,
+                        shard_band_slice=shard_band_slice,
+                        user_band_stop=int(getattr(self.meta, "b_id_4_user", self.meta.b_id_4)),
+                    )
+                    tile[:, b_lo:b_hi, :, :] = data
             del psi_G_bc  # release device memory before next bc
 
         # Stage box_index + kvecs once on device; reused across every
