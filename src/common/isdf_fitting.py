@@ -1086,6 +1086,7 @@ def _make_fit_one_rchunk_kernel(
     psi_G_store,
     is_charge: bool = True,
     solver_kind: str = 'auto',
+    q_irr_full_idx: np.ndarray | None = None,
 ):
     """Factory: returns a ``jax.jit``'d fit_one_rchunk callable closing
     over every piece of static structure + a :class:`PsiGStore` that
@@ -1160,6 +1161,15 @@ def _make_fit_one_rchunk_kernel(
         )
         for bc_range in band_chunk_ranges
     ]
+
+    # Closure-side IBZ row indices (Phase B).  None → full-BZ solve
+    # (back-compat for ``write_ibz_only=False``).  Otherwise a static
+    # jax int32 array baked into the jit's HLO.
+    if q_irr_full_idx is not None:
+        q_irr_idx_j = jnp.asarray(
+            np.asarray(q_irr_full_idx, dtype=np.int32))
+    else:
+        q_irr_idx_j = None
 
     @jax.jit
     def _kernel(
@@ -1272,11 +1282,27 @@ def _make_fit_one_rchunk_kernel(
             gamma_mu = (gamma_perm, gamma_phase)
             Z_q = z_q_from_pair(P_l, P_r, gamma_mu, gamma_mu,
                                 kgrid=kgrid, mesh_xy=mesh_xy)
+        # IBZ-only solve (Phase B of PLAN_zeta_g_flat_migration.md):
+        # the FFT-built C_q and Z_q are naturally full-BZ, but the
+        # triangular solve has no inter-q coupling, so we gather IBZ
+        # rows of L_q and Z_q here and solve only those.  Output
+        # ``zeta`` is (n_q_ibz, n_rmu, n_rchunk) — caller writes it
+        # directly with no post-solve slice.
+        #
+        # When ``q_irr_full_idx`` is None (write_ibz_only=False
+        # codepath; centroid orbit closure failed) the gather is a
+        # no-op identity and the full-BZ solve runs as before.
+        if q_irr_idx_j is not None:
+            L_q_for_solve = L_q[q_irr_idx_j]
+            Z_q_for_solve = Z_q[q_irr_idx_j]
+        else:
+            L_q_for_solve = L_q
+            Z_q_for_solve = Z_q
         # ``solver_kind`` is resolved upstream (sharded_cholesky /
         # cusolvermp_cholesky for charge; lu / cusolvermp_lu for
         # transverse).  solve_zeta dispatches purely on solver_kind.
         zeta = solve_zeta(
-            L_q, Z_q, mesh_xy, q_chunk_size,
+            L_q_for_solve, Z_q_for_solve, mesh_xy, q_chunk_size,
             solver_kind=solver_kind)
         return zeta
 
@@ -1303,6 +1329,7 @@ def fit_one_rchunk(
     kvecs_frac: np.ndarray,
     vertex_mu_L: int = 0,
     solver_kind: str = 'auto',
+    q_irr_full_idx: np.ndarray | None = None,
 ):
     """Entry point for the r-chunk body jit.  Caches one compiled kernel
     per distinct static configuration.
@@ -1332,6 +1359,10 @@ def fit_one_rchunk(
         id(psi_G_store),
         bool(is_charge),
         str(solver_kind),
+        (None if q_irr_full_idx is None
+         else (int(q_irr_full_idx.shape[0]),
+               hash(np.asarray(q_irr_full_idx,
+                               dtype=np.int32).tobytes()))),
     )
     fn = _fit_one_rchunk_cache.get(cache_key)
     if fn is None:
@@ -1347,6 +1378,7 @@ def fit_one_rchunk(
             psi_G_store,
             is_charge=bool(is_charge),
             solver_kind=str(solver_kind),
+            q_irr_full_idx=q_irr_full_idx,
         )
         _fit_one_rchunk_cache[cache_key] = fn
     return fn(
@@ -1964,6 +1996,7 @@ def fit_zeta_to_h5(
                         kvecs_frac=kvecs_frac,
                         vertex_mu_L=int(vertex_mu_L),
                         solver_kind=_resolved_solver_kind,
+                        q_irr_full_idx=q_irr_full_idx,   # Phase B: gather inside the kernel
                     )
                     zeta_chunk.block_until_ready()
             finally:
@@ -1985,18 +2018,14 @@ def fit_zeta_to_h5(
             # Chunking over q keeps each allgather under memory limits.
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.h5_write"):
-                # IBZ subset (still on device, same sharding on the
-                # μ/r axes — the leading axis just gathers IBZ rows).
-                # ``jnp.asarray(q_irr_full_idx)`` is replicated; the
-                # gather is a single device-side scatter, microseconds.
-                # In full-BZ mode (write_ibz_only=False) this is a
-                # no-op alias to keep the downstream write path
-                # uniform.
-                if write_ibz_only:
-                    zeta_chunk_ibz = zeta_chunk[
-                        jnp.asarray(q_irr_full_idx, dtype=jnp.int32)]
-                else:
-                    zeta_chunk_ibz = zeta_chunk
+                # Phase B: ``zeta_chunk`` is already IBZ-shape
+                # (n_q_disk, n_rmu, n_rchunk) — the gather happens
+                # inside ``fit_one_rchunk`` before the triangular
+                # solve.  No post-solve slice needed.  In full-BZ
+                # mode (q_irr_full_idx=None) the kernel returns
+                # full-BZ shape and we still alias to keep the
+                # downstream write path uniform.
+                zeta_chunk_ibz = zeta_chunk
                 del zeta_chunk
 
                 # Each allgather produces a FULLY REPLICATED output per device:
