@@ -531,17 +531,57 @@ def accumulate_rchunk_to_gflat(
             return jnp.take_along_axis(
                 G_flat, sphere_b, axis=-1, mode='promise_in_bounds')
 
+        # Capture the input sharding so intermediates inherit it (the
+        # μ-sharded inputs land at ``P(*, ('x','y'), *)`` and JAX zero-
+        # init / reshape / fftn don't always preserve the metadata).
+        # Without this, CrI3-scale runs blow up to ~100 GB on a single
+        # device from unsharded ``pad_buf`` / ``box`` intermediates.
+        _in_sh = getattr(rchunk, "sharding", None)
+        if _in_sh is not None and hasattr(_in_sh, "mesh"):
+            _mesh = _in_sh.mesh
+            _spec = tuple(getattr(_in_sh, "spec", ()))
+            # μ axis (axis -2 of the rchunk) is sharded; spatial axis
+            # -1 should not be.  Build the 3-D (q, μ, r) and 5-D
+            # (q, μ, nx, ny, nz) variants explicitly.  Use ``None``s
+            # to match rchunk.ndim positions.
+            _mu_spec = _spec[-2] if len(_spec) >= 2 else None
+            _sh3d = NamedSharding(
+                _mesh, P(*((None,) * (len(_spec) - 2)), _mu_spec, None))
+            _sh5d = NamedSharding(
+                _mesh,
+                P(*((None,) * (len(_spec) - 2)), _mu_spec, None, None, None))
+        else:
+            _sh3d = None
+            _sh5d = None
+
+        def _shard3(x):
+            return (x if _sh3d is None
+                    else jax.lax.with_sharding_constraint(x, _sh3d))
+
+        def _shard5(x):
+            return (x if _sh5d is None
+                    else jax.lax.with_sharding_constraint(x, _sh5d))
+
         if qvec_frac is None:
             @partial(jax.jit, donate_argnums=(1,))
             def fn(rch_, acc_, r0_):
-                # Pad slab → full flat-r buffer (zeros).
+                # Pad slab → full flat-r buffer (zeros).  ``with_sharding_constraint``
+                # threads the input's μ-sharding through the unsharded
+                # ``jnp.zeros`` and the subsequent reshape / FFT / gather
+                # — without it XLA replicates the (n_q, n_rmu, n_rtot)
+                # buffer on every rank.
                 pad_buf = jnp.zeros(
                     (*rch_.shape[:-1], n_rtot), dtype=rch_.dtype)
+                pad_buf = _shard3(pad_buf)
                 pad_buf = jax.lax.dynamic_update_slice_in_dim(
                     pad_buf, rch_, r0_, axis=-1)
+                pad_buf = _shard3(pad_buf)
                 box = pad_buf.reshape(*rch_.shape[:-1], nx, ny, nz)
+                box = _shard5(box)
                 G_box = jnp.fft.fftn(box, axes=(-3, -2, -1), norm=norm)
+                G_box = _shard5(G_box)
                 G_flat = G_box.reshape(*rch_.shape[:-1], n_rtot)
+                G_flat = _shard3(G_flat)
                 return acc_ + _gather_sphere(G_flat)
             _RCHUNK_TO_GFLAT_CACHE[key] = fn
         else:
@@ -550,13 +590,19 @@ def accumulate_rchunk_to_gflat(
                 # Phase-on-slice: multiply only the r_len cells we keep.
                 rch_phased = apply_bloch_phase_on_slice(
                     rch_, qvec_, fft_grid_t, r0_, r_len_i, sign=-1)
+                rch_phased = _shard3(rch_phased)
                 pad_buf = jnp.zeros(
                     (*rch_.shape[:-1], n_rtot), dtype=rch_.dtype)
+                pad_buf = _shard3(pad_buf)
                 pad_buf = jax.lax.dynamic_update_slice_in_dim(
                     pad_buf, rch_phased, r0_, axis=-1)
+                pad_buf = _shard3(pad_buf)
                 box = pad_buf.reshape(*rch_.shape[:-1], nx, ny, nz)
+                box = _shard5(box)
                 G_box = jnp.fft.fftn(box, axes=(-3, -2, -1), norm=norm)
+                G_box = _shard5(G_box)
                 G_flat = G_box.reshape(*rch_.shape[:-1], n_rtot)
+                G_flat = _shard3(G_flat)
                 return acc_ + _gather_sphere(G_flat)
             _RCHUNK_TO_GFLAT_CACHE[key] = fn
 
