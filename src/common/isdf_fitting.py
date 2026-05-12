@@ -747,6 +747,47 @@ def factor_c_q(
 _solve_cache = {}
 
 
+def _reshard_zeta_mu_X_r_Y_to_mu_XY(zeta: jax.Array, mesh_xy: Mesh) -> jax.Array:
+    """Reshard (q_, μ_X, r_Y) → (q_, μ_XY, r_) for the cuSolverMp branches.
+
+    Single mesh axis ``'y'`` moves from the r-axis to the μ-axis (where
+    it joins ``'x'`` to form a flat tuple).  All other shardings stay.
+    XLA's spmd-partitioner emits this as a single all-to-all on ``'y'``
+    between data axes 1 and 2 — no replication, no all-gather.
+
+    The downstream consumer is ``accumulate_rchunk_to_gflat``, whose
+    FFT box and gflat-accumulator both live at ``P(None, ('x','y'),
+    None)``; landing ζ in that layout here means the FFT runs
+    sharding-preserving (no further reshard, no replicated FFT box).
+    """
+    target = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
+    return jax.lax.with_sharding_constraint(zeta, target)
+
+
+def _reshard_zeta_r_XY_to_mu_XY(zeta: jax.Array, mesh_xy: Mesh) -> jax.Array:
+    """Reshard (q_, μ_, r_XY) → (q_, μ_XY, r_) for the shard_map branch.
+
+    The shard_map triangular-solve naturally lands ζ at
+    ``P(None, None, ('x','y'))`` because the solve is parallelised over
+    r-columns.  The downstream FFT wants μ-sharded.  Two mesh axes have
+    to move on the (μ, r) data axes; SPMD's all-to-all planner only
+    handles one mesh axis at a time, so we stage through the cuSolverMp
+    intermediate ``P(None, 'x', 'y')`` to keep every step a single-axis
+    all-to-all primitive ``(a_X, b) → (a, b_X)``:
+
+      Step 1  (q_, μ_, r_XY) → (q_, μ_X, r_Y)   ['x' moves r → μ]
+      Step 2  (q_, μ_X, r_Y) → (q_, μ_XY, r_)   ['y' moves r → μ]
+
+    Same staging discipline as the Z_q two-step reshard above (see the
+    comment around `_reshard_z` at the top of `solve_zeta` — single-step
+    cross-axis reshards trigger SPMD Involuntary Full Rematerialization).
+    """
+    mid = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    out = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
+    zeta = jax.lax.with_sharding_constraint(zeta, mid)
+    return jax.lax.with_sharding_constraint(zeta, out)
+
+
 def solve_zeta(
     L_q: jax.Array,
     Z_q: jax.Array,
@@ -800,7 +841,12 @@ def solve_zeta(
                      for the transverse channels).
 
     Returns:
-        zeta_q: (nq, n_rmu, n_zchunk) solution, sharded P(None, None, ('x','y'))
+        zeta_q: (nq, n_rmu, n_zchunk) solution, sharded P(None, ('x','y'), None)
+                — μ-axis flat-sharded across the ('x','y') mesh product,
+                r-axis replicated.  This is the layout the downstream
+                G-flat FFT (``accumulate_rchunk_to_gflat``) wants:
+                each rank owns a μ-slab over the full r-extent, so the
+                per-rank cuFFT runs locally without resharding.
     """
     nq, n_rmu, _ = L_q.shape
     _, _, n_zchunk = Z_q.shape
@@ -809,8 +855,10 @@ def solve_zeta(
 
     if solver_kind == 'cusolvermp_cholesky':
         # Distributed potrs: Z stays at P(None,'x','y'), no input reshard
-        # and no all-gather of L.  Output reshards to P(None, None,
-        # ('x','y')) for the downstream SlabIO writer.
+        # and no all-gather of L.  Output reshards to P(None, ('x','y'),
+        # None) so the downstream G-flat accumulator receives ζ
+        # μ-flat-sharded (the FFT layout it actually wants — see
+        # accumulate_rchunk_to_gflat / common.wfn_transforms).
         from ffi.cusolvermp import batched_distributed_potrs, CusolverMpBatchedLowerL
         Px = int(mesh_xy.shape['x'])
         Py = int(mesh_xy.shape['y'])
@@ -827,13 +875,11 @@ def solve_zeta(
             mb=int(n_rmu) // Px, nb=int(n_rmu) // Py, nbatch=int(nq),
         )
         zeta_xy = batched_distributed_potrs(L_handle, Z_q, mesh=mesh_xy)
-        # Two-step reshard via P('x', None, 'y'); single-step
-        # P(None,'x','y') → P(None, None, ('x','y')) triggers SPMD
-        # Involuntary Full Rematerialization.
-        zeta_xy = jax.lax.with_sharding_constraint(
-            zeta_xy, NamedSharding(mesh_xy, P('x', None, 'y')))
-        zeta_out = jax.lax.with_sharding_constraint(
-            zeta_xy, NamedSharding(mesh_xy, P(None, None, ('x', 'y'))))
+        # Natural potrs output sharding: P(None, 'x', 'y') = (q_, μ_X, r_Y).
+        # Target: P(None, ('x','y'), None) = (q_, μ_XY, r_).
+        # Single mesh axis 'y' moves from r-axis to μ-axis (joining 'x'
+        # there) — one all-to-all on 'y' between data axes 1 and 2.
+        zeta_out = _reshard_zeta_mu_X_r_Y_to_mu_XY(zeta_xy, mesh_xy)
         if needs_padding:
             return zeta_out[:, :, :n_zchunk]
         return zeta_out
@@ -862,11 +908,8 @@ def solve_zeta(
         eye_n = jnp.eye(n_rmu, dtype=L_q.dtype)[None, :, :]
         A_q = L_q + ridge * eye_n
         zeta_xy = batched_distributed_solve_lu(A_q, Z_q, mesh=mesh_xy)
-        # Two-step reshard same rationale as the cholesky branch.
-        zeta_xy = jax.lax.with_sharding_constraint(
-            zeta_xy, NamedSharding(mesh_xy, P('x', None, 'y')))
-        zeta_out = jax.lax.with_sharding_constraint(
-            zeta_xy, NamedSharding(mesh_xy, P(None, None, ('x', 'y'))))
+        # Reshard rationale identical to the cholesky branch above.
+        zeta_out = _reshard_zeta_mu_X_r_Y_to_mu_XY(zeta_xy, mesh_xy)
         if needs_padding:
             return zeta_out[:, :, :n_zchunk]
         return zeta_out
@@ -1024,6 +1067,9 @@ def solve_zeta(
     if q_batch >= nq:
         result = helpers.solve_all_at_once(L_q, Z_col)
         del Z_col
+        # Reshard r_XY → μ_XY so the downstream G-flat FFT runs
+        # sharding-preserving (see _reshard_zeta_r_XY_to_mu_XY).
+        result = _reshard_zeta_r_XY_to_mu_XY(result, mesh_xy)
         if needs_padding:
             return result[:, :, :n_zchunk]
         return result
@@ -1045,6 +1091,9 @@ def solve_zeta(
 
     del Z_col
 
+    # Reshard r_XY → μ_XY so the downstream G-flat FFT runs
+    # sharding-preserving (see _reshard_zeta_r_XY_to_mu_XY).
+    zeta = _reshard_zeta_r_XY_to_mu_XY(zeta, mesh_xy)
     if needs_padding:
         return zeta[:, :, :n_zchunk]
     return zeta
@@ -2108,23 +2157,28 @@ def fit_zeta_to_h5(
                 dtype=jnp.complex128),
             out_shardings=_gflat_acc_sharding,
         )()
-        # FFT-batch chunking inside accumulate_rchunk_to_gflat.  The
-        # kernel chunks the μ axis (axis 1) of ``zeta_chunk_ibz`` into
-        # ``fft_batch_chunks`` sub-batches under a ``jax.lax.scan``.
-        # ``with_sharding_constraint`` on each chunk's pad_buf / box /
-        # G_box keeps the per-rank workload at ``(n_q, mu_chunk /
-        # p_prod, n_rtot)`` where ``mu_chunk = n_rmu_padded /
-        # n_chunks``.  The per-rank FFT box transient is then bounded
-        # by ``(n_q × mu_chunk/p_prod × n_rtot × 16 B)``.
+        # FFT-batch chunking inside accumulate_rchunk_to_gflat.  Now
+        # that ζ arrives μ-flat-sharded (``P(None, ('x','y'), None)``,
+        # see ``solve_zeta``), each rank carries only ``n_rmu_padded /
+        # mesh.size`` rows of the μ axis.  The per-rank FFT box
+        # ``(n_q, n_mu_local, n_rtot)`` is already bounded by the
+        # per-rank μ extent — μ-chunking no longer reduces the per-rank
+        # working set and would *introduce* an all-gather on the μ-axis
+        # every scan iteration (because the body's
+        # ``dynamic_slice_in_dim(rch_, start, _mu_chunk, axis=1)`` with
+        # runtime ``start`` cuts across the μ-shard).
         #
-        # Default rule (matches the user's "n_rchunks batches"
-        # heuristic): pick the largest divisor of ``n_mu_local =
-        # n_rmu_padded / p_prod`` that is ≤ ``num_chunks`` (the outer
-        # r-chunk count).  Since one outer r-chunk's worth of memory
-        # is known to fit (that's why the outer loop chunks at that
-        # rate), dividing the FFT box by the same factor also fits.
-        # Env override ``LORRAX_GFLAT_FFT_BATCH_CHUNKS=N`` selects a
-        # specific N (must divide n_mu_local).
+        # Default: one-shot (``n_batch_chunks = 1``).  The scan body
+        # then runs once with ``start = 0`` and the dynamic slice is a
+        # no-op metadata pass-through — no μ-axis collective.
+        #
+        # If the per-rank FFT box is still too large at extreme scale
+        # (e.g. CrI3 6×6×1 80 Ry, where ``(n_q · n_mu_local · n_rtot
+        # · 16 B) > budget``), the right knob is **r-axis chunking
+        # inside the kernel** (chunk the FFT-box r-axis sequentially),
+        # not μ-axis chunking — μ is already split across ranks.
+        # Followup: thread an ``LORRAX_GFLAT_R_BATCH_CHUNKS`` knob into
+        # ``accumulate_rchunk_to_gflat``.
         _p_prod = int(jax.device_count())
         if int(meta.n_rmu_padded) % _p_prod != 0:
             raise ValueError(
@@ -2134,6 +2188,10 @@ def fit_zeta_to_h5(
         _env_chunks = int(os.environ.get(
             'LORRAX_GFLAT_FFT_BATCH_CHUNKS', '0') or 0)
         if _env_chunks > 0:
+            # Env override left in place as an escape hatch.  Must still
+            # divide ``n_mu_local`` for the underlying scan to slice
+            # within shard boundaries (though see caveat above re μ-axis
+            # gathers when ``_env_chunks > 1`` with μ-sharded rchunk).
             if _n_mu_local % _env_chunks != 0:
                 raise ValueError(
                     f"LORRAX_GFLAT_FFT_BATCH_CHUNKS={_env_chunks} does "
@@ -2141,12 +2199,7 @@ def fit_zeta_to_h5(
                     f"(= n_rmu_padded/{_p_prod}).")
             _gflat_fft_batch_chunks = _env_chunks
         else:
-            # Largest divisor of n_mu_local that is ≤ num_chunks.
             _gflat_fft_batch_chunks = 1
-            for _c in range(min(num_chunks, _n_mu_local), 0, -1):
-                if _n_mu_local % _c == 0:
-                    _gflat_fft_batch_chunks = _c
-                    break
         if jax.process_index() == 0:
             print(f"  G-flat ζ FFT batch chunks: "
                   f"{_gflat_fft_batch_chunks} "
