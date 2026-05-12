@@ -149,46 +149,42 @@ def _maybe_constrain(arr: jax.Array, sharding: NamedSharding | None) -> jax.Arra
 
 
 # ---------------------------------------------------------------------------
-# Local-FFT helper — the only FFT primitive used in this module.
+# Local-FFT helper — the one FFT primitive used in this module.
 # ---------------------------------------------------------------------------
 #
 # Plain ``jnp.fft.(i)fftn`` on a sharded tensor lets XLA's planner do
 # whatever it likes — at CrI3 6×6×1 80 Ry it inserts an all-gather and
 # emits a global FFT, blowing past the per-rank HBM ceiling (the
-# original 121 GB OOM in ``to_rmu``).  ``make_jittable_local_(i)fftn_3d``
-# wraps cuFFT in a ``custom_partitioning`` primitive that XLA treats as
-# opaque, so the FFT runs per-rank-locally with no resharding.  No
-# ``jnp.fft.*`` is called from this module — every FFT goes through
-# this helper.
-#
-# Replicated test-bench inputs get a trivial 1×1 mesh so the same code
-# path covers both single-device and multi-rank runs.
+# original 121 GB OOM in ``to_rmu``).  ``make_sharded_*fftn_3d`` wraps
+# cuFFT in a shard_map so the FFT runs per-rank-locally with no
+# resharding; every FFT in this module goes through ``_local_box_fft``.
+
 def _local_box_fft(psi: jax.Array, *, kind: str, norm: str,
                    mesh: Mesh | None = None):
-    """Return a callable ``f(box) -> (i)fftn(box, axes=(-3,-2,-1))`` that
-    runs per-rank-locally on a tensor whose shape is ``psi.shape[:-1] +
-    (nx, ny, nz)`` and whose sharding preserves psi's leading layout
-    with the three FFT axes replicated.  ``kind`` is ``'fftn'`` or
-    ``'ifftn'``.  Built on the canonical ``make_sharded_*fftn_3d``
-    shard_map helpers — every FFT in this module goes through one of
-    these; no ``jnp.fft.*`` ever runs on a sharded array.
-    Callers operating inside another jit (where ``psi`` is a tracer
-    whose sharding doesn't carry mesh) must pass ``mesh=`` explicitly."""
+    """Sharded local FFT for the box ``psi.shape[:-1] + (nx, ny, nz)``.
+
+    Returns a callable ``f(box) -> (i)fftn(box, axes=(-3, -2, -1))`` whose
+    output sharding preserves psi's leading layout (FFT axes replicated).
+    ``kind`` is ``'fftn'`` or ``'ifftn'``.
+
+    Mesh resolution order: explicit ``mesh=`` arg → ``psi.sharding.mesh``
+    → trivial 1×1 mesh (test-bench fallback).  Callers operating inside
+    another jit (where ``psi`` is a tracer whose sharding doesn't carry
+    mesh) must pass ``mesh=`` explicitly.
+    """
     from common.fft_helpers import (
         make_sharded_ifftn_3d, make_sharded_fftn_3d)
     sh = getattr(psi, "sharding", None)
-    if mesh is not None:
-        m = mesh
-        spec = (P(*tuple(sh.spec)[:-1], None, None, None)
-                if (sh is not None and hasattr(sh, "spec"))
-                else P(*([None] * (psi.ndim + 2))))
-    elif sh is not None and hasattr(sh, "mesh") and sh.mesh is not None:
-        m = sh.mesh
-        spec = P(*tuple(sh.spec)[:-1], None, None, None)
-    else:
-        m = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
-                 axis_names=('x', 'y'))
-        spec = P(*([None] * (psi.ndim + 2)))
+    sh_mesh = getattr(sh, "mesh", None) if sh is not None else None
+    m = mesh or sh_mesh or Mesh(
+        np.asarray(jax.devices()[:1]).reshape(1, 1), axis_names=('x', 'y'))
+    # Spec: preserve psi's leading layout (if it has one) and replicate
+    # the three appended FFT axes.  Inputs without a real sharding fall
+    # back to fully replicated.
+    leading = (tuple(sh.spec)[:-1]
+               if sh is not None and hasattr(sh, "spec") and sh_mesh is not None
+               else (None,) * (psi.ndim - 1))
+    spec = P(*leading, None, None, None)
     factory = (make_sharded_ifftn_3d if kind == 'ifftn'
                else make_sharded_fftn_3d)
     return factory(m, spec, spec, norm=norm, axes=(-3, -2, -1))
@@ -600,43 +596,31 @@ def accumulate_rchunk_to_gflat(
             return jnp.take_along_axis(
                 G_flat, sphere_b, axis=-1, mode='promise_in_bounds')
 
-        # Sharding extracted from the input.  Per-chunk intermediates
-        # use ``with_sharding_constraint`` to inherit the μ-shard so
-        # ``jnp.zeros`` / reshape don't materialise replicated tensors
-        # (~100 GB single-device at CrI3 scale).  The FFT itself goes
-        # through :func:`_local_box_fft` below so XLA can't insert an
-        # all-gather around it.
+        # Per-chunk intermediates need ``with_sharding_constraint`` so
+        # ``jnp.zeros`` / reshape inherit the μ-shard — otherwise XLA
+        # materialises replicated tensors (~100 GB single-device at CrI3
+        # scale).  The FFT itself goes through ``_local_box_fft`` which
+        # uses ``make_sharded_*fftn_3d`` directly.
         _in_sh = getattr(rchunk, "sharding", None)
-        if _in_sh is not None and hasattr(_in_sh, "mesh"):
+        if (_in_sh is not None
+                and getattr(_in_sh, "mesh", None) is not None
+                and len(getattr(_in_sh, "spec", ())) >= 2):
             _mesh = _in_sh.mesh
-            _spec = tuple(getattr(_in_sh, "spec", ()))
-            _mu_spec = _spec[-2] if len(_spec) >= 2 else None
-            _p_prod = 1
-            for _ax in _mesh.axis_names:
-                _p_prod *= int(_mesh.shape[_ax])
-            _sh3d = NamedSharding(
-                _mesh, P(*((None,) * (len(_spec) - 2)), _mu_spec, None))
-            _sh5d = NamedSharding(
-                _mesh,
-                P(*((None,) * (len(_spec) - 2)), _mu_spec, None, None, None))
+            _spec = tuple(_in_sh.spec)
+            _leading = _spec[:-2]  # everything before the μ axis
+            _mu_spec = _spec[-2]
+            _p_prod = int(np.prod([_mesh.shape[a] for a in _mesh.axis_names]))
+            _sh_3d = NamedSharding(_mesh, P(*_leading, _mu_spec, None))
+            _sh_5d = NamedSharding(
+                _mesh, P(*_leading, _mu_spec, None, None, None))
         else:
-            _sh3d = None
-            _sh5d = None
+            _sh_3d = _sh_5d = None
             _p_prod = 1
 
-        def _shard3(x):
-            return (x if _sh3d is None
-                    else jax.lax.with_sharding_constraint(x, _sh3d))
+        def _shard3(x): return _maybe_constrain(x, _sh_3d)
+        def _shard5(x): return _maybe_constrain(x, _sh_5d)
 
-        def _shard5(x):
-            return (x if _sh5d is None
-                    else jax.lax.with_sharding_constraint(x, _sh5d))
-
-        # Local FFT — same drop-in pattern as :func:`to_rmu` / :func:`to_rbox`.
-        # shard_map emits a per-rank cuFFT call on the already-μ-sharded
-        # box; XLA never sees the unsharded form.
-        local_fftn = _local_box_fft(rchunk, kind='fftn', norm=norm,
-                                     mesh=mesh)
+        local_fftn = _local_box_fft(rchunk, kind='fftn', norm=norm, mesh=mesh)
 
         # μ-axis chunking.  ``n_batch_chunks`` must divide
         # ``n_mu_local = n_mu_padded / p_prod`` so each chunk's
