@@ -50,6 +50,7 @@ adding that in a follow-up commit alongside the ``q='full_bz'`` test.
 """
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 from typing import Literal, Sequence
 
@@ -254,7 +255,7 @@ class ZetaLoader:
             raise RuntimeError("ZetaLoader: file already closed")
 
         # --- q axis ---------------------------------------------------
-        q_indices = self._resolve_q(q)
+        q_indices, need_unfold = self._resolve_q(q)
 
         # --- μ axis ---------------------------------------------------
         mu_lo, mu_hi = self._resolve_mu(mu)
@@ -273,6 +274,14 @@ class ZetaLoader:
             partition_spec=sharding if layout == 'r_space'
                             else P(None, None, ('x', 'y')),
         )
+
+        # --- IBZ → full-BZ unfold (q='full_bz' on an IBZ-on-disk file) ---
+        if need_unfold:
+            zeta_r = self._unfold_q_full_bz(
+                zeta_r, mu_lo=mu_lo, mu_count=mu_count,
+                partition_spec=(sharding if layout == 'r_space'
+                                else P(None, None, ('x', 'y'))),
+            )
 
         if layout == 'r_space':
             return zeta_r
@@ -296,19 +305,22 @@ class ZetaLoader:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
-    def _resolve_q(self, q: QSpec) -> np.ndarray:
+    def _resolve_q(self, q: QSpec) -> tuple[np.ndarray, bool]:
+        """Resolve ``q`` into ``(disk_row_indices, need_full_bz_unfold)``.
+
+        ``need_full_bz_unfold = True`` means the caller asked for
+        ``q='full_bz'`` against an IBZ-on-disk file; the ``.load`` path
+        will then expand the IBZ rows via the symmetry tables.
+        """
         if isinstance(q, str):
             if q == 'ibz':
-                return np.arange(self.n_q_on_disk, dtype=np.int32)
+                return np.arange(self.n_q_on_disk, dtype=np.int32), False
             if q == 'full_bz':
                 if self.q_layout == 'full_bz':
-                    return np.arange(self.n_q_on_disk, dtype=np.int32)
-                raise NotImplementedError(
-                    "ZetaLoader.load(q='full_bz') for an IBZ-on-disk file "
-                    "requires the r-grid symmetry permutation; "
-                    "see the Pass-2 plan in the module docstring.  Use "
-                    "q='ibz' + post-V_q unfold "
-                    "(gw.v_q_tile._unfold_v_q_ibz_to_full) for now.")
+                    # Disk is already full-BZ; one row per q.
+                    return np.arange(self.n_q_on_disk, dtype=np.int32), False
+                # IBZ on disk; we need every IBZ row (the unfold reads them all).
+                return np.arange(self.n_q_on_disk, dtype=np.int32), True
             raise ValueError(f"q string must be 'ibz' or 'full_bz'; got {q!r}")
         arr = np.asarray(q, dtype=np.int32)
         if arr.ndim != 1:
@@ -319,7 +331,7 @@ class ZetaLoader:
             raise ValueError(
                 f"q indices out of [0, {self.n_q_on_disk}); got "
                 f"min={int(arr.min())}, max={int(arr.max())}")
-        return arr
+        return arr, False
 
     def _resolve_mu(self, mu) -> tuple[int, int]:
         if mu is None:
@@ -332,6 +344,132 @@ class ZetaLoader:
             return start, stop
         lo, hi = mu
         return int(lo), int(hi)
+
+    def _ensure_sym(self):
+        """Lazily build a :class:`common.symmetry_maps.SymMaps` from our
+        mf_header attributes.  Cached on the instance."""
+        sym = getattr(self, "_sym_cache", None)
+        if sym is not None:
+            return sym
+        from common.symmetry_maps import SymMaps
+        sym = SymMaps(self)
+        self._sym_cache = sym
+        return sym
+
+    def _full_bz_unfold_tables(self):
+        """Build the host-side tables used by :meth:`_unfold_q_full_bz`:
+        ``(full_to_irr_idx, full_to_irr_sym, r_perm, mu_perm)``.
+
+        Raises ``NotImplementedError`` if the IBZ wedge requires
+        time-reversal symmetry to reach some full-BZ q — TR support
+        will land in a follow-up alongside the spinor-conjugate path.
+        """
+        cached = getattr(self, "_full_bz_tables", None)
+        if cached is not None:
+            return cached
+        from centroid.orbit_syms import (
+            compute_centroid_sym_perm, compute_rgrid_sym_perm)
+
+        sym = self._ensure_sym()
+        ntran = int(self.ntran)
+        # find_irreducible_qpoints uses sym_mats_k which includes TR
+        # (the trailing ntran entries are -sym_mats_k).  TR mapping is
+        # not yet handled — bail loudly if any q needs it.
+        _, full_to_irr_idx, full_to_irr_sym, q_irr_full_idx = (
+            sym.find_irreducible_qpoints())
+        if int(np.max(full_to_irr_sym)) >= ntran:
+            tr_q = int(np.argmax(full_to_irr_sym >= ntran))
+            raise NotImplementedError(
+                f"ZetaLoader.load(q='full_bz'): full-BZ q[{tr_q}] needs "
+                f"time-reversal symmetry to reach its IBZ parent "
+                f"(sym index {int(full_to_irr_sym[tr_q])} ≥ ntran={ntran}).  "
+                f"TR maps ζ(r) → ζ*(r) and is not yet wired into the "
+                f"unfold.  Workaround: regenerate the IBZ with TR off "
+                f"(``find_irreducible_qpoints`` slicing to ``[:ntran]``) "
+                f"or fall back to ``q='ibz'`` + post-V_q unfold.")
+
+        # Sanity: do the IBZ row indices on disk match q_irr_full_idx?
+        # The writer stores rows in q_irr_full_idx order
+        # (isdf_fitting.py:1689); the reader reads them in the same
+        # order.  We don't need to permute disk rows — but we DO need
+        # to remap full_to_irr_idx (which is an index into the
+        # find_irreducible_qpoints IBZ wedge, identical to the writer's
+        # ordering by construction).
+
+        r_perm = compute_rgrid_sym_perm(
+            sym.sym_matrices, sym.translations, self.fft_grid)
+        mu_perm = compute_centroid_sym_perm(
+            self.r_mu_fft_idx, sym.sym_matrices,
+            sym.translations, self.fft_grid)
+
+        out = (full_to_irr_idx.astype(np.int32),
+               full_to_irr_sym.astype(np.int32),
+               r_perm.astype(np.int32),
+               mu_perm.astype(np.int32))
+        self._full_bz_tables = out
+        return out
+
+    def _unfold_q_full_bz(
+        self,
+        zeta_ibz: jax.Array,
+        *,
+        mu_lo: int,
+        mu_count: int,
+        partition_spec: P,
+    ) -> jax.Array:
+        """Expand IBZ ζ to full-BZ ζ via r/μ permutation gathers.
+
+        Math (eq. 3 of ``reports/zeta_ibz_2026-05-11/report.md``)::
+
+            ζ_full[q, r_new, μ_new] = ζ_ibz[i(q),
+                                             r_perm[s(q), r_new],
+                                             inv_mu_perm[s(q), μ_new]]
+
+        No τ-phase: ζ inside the V_q bilinear contracts out the phase
+        (the user-facing ZetaLoader returns the same convention).  The
+        gather runs inside a jit cached by output shape + sharding.
+        """
+        full_to_irr_idx, full_to_irr_sym, r_perm, mu_perm = (
+            self._full_bz_unfold_tables())
+        n_q_full = int(self.n_q_full)
+        n_rtot = int(self.n_rtot_disk)
+
+        # Slice mu_perm columns to the requested μ window.
+        mu_slice = slice(mu_lo, mu_lo + mu_count)
+        # inv_mu[s, μ_new] = μ_old such that mu_perm[s, μ_old] = μ_new.
+        inv_mu_full = np.argsort(mu_perm, axis=-1).astype(np.int32)  # (n_sym, n_rmu)
+        # When μ window != full μ axis, inv_mu needs to be clipped to
+        # the requested μ_new range AND map back into the SAME window
+        # on the IBZ side (otherwise we'd be gathering out-of-window).
+        # For the common case ``mu = None`` (full μ), no slicing.
+        if mu_count != int(mu_perm.shape[1]):
+            raise NotImplementedError(
+                "ZetaLoader.load(q='full_bz', mu=<partial>): partial-μ "
+                "unfold isn't supported yet — μ permutation can mix "
+                "in-window and out-of-window indices.  Pass mu=None "
+                "for the whole μ axis, or use q='ibz' + post-V_q unfold.")
+        inv_mu = inv_mu_full
+
+        idx_j = jnp.asarray(full_to_irr_idx)            # (n_q_full,)
+        sym_j = jnp.asarray(full_to_irr_sym)            # (n_q_full,)
+        r_perm_j = jnp.asarray(r_perm)                  # (n_sym, n_rtot)
+        inv_mu_j = jnp.asarray(inv_mu)                  # (n_sym, n_rmu)
+
+        out_sharding = NamedSharding(self._mesh, partition_spec)
+
+        @partial(jax.jit, out_shardings=out_sharding)
+        def _unfold(z):
+            # z: (n_q_ibz, n_rtot, n_rmu); pick parent rows first.
+            z_at_irr = z[idx_j]                          # (n_q_full, n_rtot, n_rmu)
+            r_gather = r_perm_j[sym_j]                   # (n_q_full, n_rtot)
+            mu_gather = inv_mu_j[sym_j]                  # (n_q_full, n_rmu)
+            z_r = jnp.take_along_axis(
+                z_at_irr, r_gather[:, :, None], axis=1)
+            z_full = jnp.take_along_axis(
+                z_r, mu_gather[:, None, :], axis=2)
+            return z_full
+
+        return _unfold(zeta_ibz)
 
     def _read_r_space(
         self,
