@@ -1717,17 +1717,53 @@ def fit_zeta_to_h5(
                       f"{_first}")
             write_ibz_only = False
 
+    # BGW Brillouin-zone wrap used by the V_q kernel
+    # (``_qvec_wrap`` at ``gw/v_q_tile.py:1204``): ``q > kgrid/2 → q
+    # − kgrid``.  The writer must match so the per-q phase
+    # ``exp(-2πi (q/kgrid)·r)`` baked into the G-flat output is the
+    # convention the consumer expects.
+    def _bgw_wrap_q(q_int_kgrid: np.ndarray) -> np.ndarray:
+        kg = np.asarray(meta.kgrid, dtype=np.float64)
+        q = np.asarray(q_int_kgrid, dtype=np.float64)
+        return np.where(q > kg / 2, q - kg, q)
+
     if write_ibz_only:
         (q_irr_kgrid_int, _q_full_to_irr_idx,
          _q_full_to_irr_sym, q_irr_full_idx) = sym.find_irreducible_qpoints()
         n_q_disk = int(q_irr_full_idx.shape[0])
+        # IBZ fractional q-vectors for the G-flat accumulator (Phase C1b).
+        # BGW wrap THEN divide by kgrid so the writer's per-q phase
+        # matches the V_q kernel's ``apply_bloch_phase`` convention.
+        _kgrid_arr_for_qfrac = np.asarray(meta.kgrid, dtype=np.float64)
+        q_irr_frac = (_bgw_wrap_q(q_irr_kgrid_int)
+                       / _kgrid_arr_for_qfrac[None, :])
         print(f"  q-IBZ reduction: {n_q_disk} IBZ q-points / {nq} full-BZ "
               f"(disk shrink {nq / max(1, n_q_disk):.1f}×)")
     else:
         q_irr_full_idx = None
+        q_irr_frac = None
         n_q_disk = nq
         print(f"  q axis on disk: full BZ ({nq} q-points) "
               f"(write_ibz_only=False or closure check failed)")
+
+    # ---- Phase C1b: G-flat on-disk format toggle -----------------
+    # When ``LORRAX_WRITE_G_FLAT_ZETA=1`` is set, the writer
+    # accumulates each r-chunk's contribution into a persistent
+    # G-flat buffer via ``common.wfn_transforms.accumulate_rchunk_to_gflat``
+    # and writes the final tensor as ``zeta_q_G`` (shape
+    # ``(n_q_disk, n_rmu, n_G_sph)``).  The full r-space ζ_q is never
+    # materialised on disk or as a persistent device buffer.  For
+    # Phase C1b ``n_G_sph = n_rtot`` (full flat-FFT axis); Phase C2
+    # narrows to the bare-Coulomb sphere via ``build_master_gvec_list``.
+    write_g_flat_zeta = bool(int(os.environ.get(
+        'LORRAX_WRITE_G_FLAT_ZETA', '0')))
+    if write_g_flat_zeta and q_irr_frac is None:
+        # Full-BZ q-vectors with BGW wrap, then / kgrid — same convention
+        # the V_q kernel's ``_zeta_disk_to_G`` consumed via
+        # ``_qvec_wrap``.
+        _kgrid_arr_for_qfrac = np.asarray(meta.kgrid, dtype=np.float64)
+        q_irr_frac = (_bgw_wrap_q(sym.kvecs_asints)
+                       / _kgrid_arr_for_qfrac[None, :])
 
     # ``zeta_q.h5`` carries the BGW-style ``mf_header`` verbatim from
     # the source WFN so any downstream consumer (the new
@@ -1769,6 +1805,7 @@ def fit_zeta_to_h5(
         fft_grid=meta.fft_grid,
         density=_density_label,
         vertex_mu_L=int(vertex_mu_L),
+        zeta_layout=('G_flat' if write_g_flat_zeta else 'r_space'),
     )
 
     with timing.section("zeta_fit.write_headers"):
@@ -1817,7 +1854,32 @@ def fit_zeta_to_h5(
     # transposes the returned array on GPU to match the kernel's
     # (n_rmu, n_rtot) expectation — ~50 µs per q, negligible.
     with timing.section("zeta_fit.open_file"):
-        if use_ffi_io:
+        if write_g_flat_zeta:
+            # Phase C1b: ``zeta_q_G`` dataset (n_q_disk, n_rmu, n_G_sph).
+            # ``n_G_sph = n_rtot`` for now — Phase C2 narrows to the
+            # bare-Coulomb sphere.  Chunking: one row per q × full μ ×
+            # full G_sph keeps per-q reads contiguous (V_q hot loop).
+            _n_G_sph = n_rtot
+            if use_ffi_io:
+                zeta_io = SlabIO(output_file, mode='a', mesh=mesh_xy,
+                                 backend=slab_io_backend)
+                zeta_io.create_dataset(
+                    'zeta_q_G',
+                    shape=(n_q_disk, n_rmu, _n_G_sph),
+                    dtype=np.complex128,
+                    chunks=(1, n_rmu, _n_G_sph),
+                )
+            else:
+                with SlabIO(output_file, mode='a', mesh=mesh_xy,
+                            backend=slab_io_backend) as _zeta_create_io:
+                    _zeta_create_io.create_dataset(
+                        'zeta_q_G',
+                        shape=(n_q_disk, n_rmu, _n_G_sph),
+                        dtype=np.complex128,
+                        chunks=(1, n_rmu, _n_G_sph),
+                    )
+                zeta_io = None
+        elif use_ffi_io:
             zeta_io = SlabIO(output_file, mode='a', mesh=mesh_xy,
                              backend=slab_io_backend)
             zeta_io.create_dataset(
@@ -1963,6 +2025,30 @@ def fit_zeta_to_h5(
     # norms_l_jax / norms_r_jax were built in STEP 1 above — reuse them
     # as the uniform-shape (nb,) inputs to the fit_one_rchunk jit.
 
+    # ---- Phase C1b: G-flat accumulator (zero-init, μ-sharded) ----
+    # Persistent buffer: (n_q_disk, n_rmu_padded, n_G_sph) c128 with
+    # μ sharded across ('x', 'y') so each rank holds n_rmu/p per q.
+    # Donated to ``accumulate_rchunk_to_gflat`` each iter; in-place add.
+    gflat_acc = None
+    if write_g_flat_zeta:
+        from common.wfn_transforms import accumulate_rchunk_to_gflat
+        # μ allocated at PADDED extent so the ('x','y') sharding
+        # divides cleanly (same pad-then-clip-on-write pattern the
+        # r-space path uses; see ``meta.n_rmu_padded`` and the
+        # SlabIO ``valid_shape=`` argument below).  Pad rows are zero
+        # because the back-solve produces zeta_pad = 0 (L_q's pad
+        # block is identity).
+        _n_rmu_padded = int(meta.n_rmu_padded)
+        _gflat_acc_sharding = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
+        gflat_acc = jax.jit(
+            lambda: jnp.zeros(
+                (n_q_disk, _n_rmu_padded, n_rtot), dtype=jnp.complex128),
+            out_shardings=_gflat_acc_sharding,
+        )()
+        _q_irr_frac_dev = jax.device_put(
+            jnp.asarray(q_irr_frac, dtype=jnp.float64),
+            NamedSharding(mesh_xy, P(None, None)))
+
     with timing.section("zeta_fit.chunk_loop"):
         for chunk_idx in range(num_chunks):
             r_start = chunk_idx * chunk_r
@@ -2027,6 +2113,23 @@ def fit_zeta_to_h5(
                 # downstream write path uniform.
                 zeta_chunk_ibz = zeta_chunk
                 del zeta_chunk
+
+                # Phase C1b: G-flat accumulator branch.  Accumulate
+                # this r-chunk's contribution into ``gflat_acc`` and
+                # skip the per-chunk SlabIO write.  After the loop
+                # the full accumulator is written once.
+                if write_g_flat_zeta:
+                    gflat_acc = accumulate_rchunk_to_gflat(
+                        rchunk=zeta_chunk_ibz, gflat_acc=gflat_acc,
+                        fft_grid=meta.fft_grid, r0=r_start,
+                        sphere_idx=None,   # Phase C2 narrows to a sphere
+                        qvec_frac=_q_irr_frac_dev,
+                        norm='backward',
+                    )
+                    del zeta_chunk_ibz
+                    t_write_total += time.perf_counter() - t0
+                    r_progress.step()
+                    continue
 
                 # Each allgather produces a FULLY REPLICATED output per device:
                 # q_gather × n_rmu × chunk_r × 16 bytes, plus NCCL temp of same size.
@@ -2101,6 +2204,44 @@ def fit_zeta_to_h5(
     # allocator keeps the peak reservation so this reads close to the
     # all-time high water.
     _track_peak()
+
+    # ---- Phase C1b: write the accumulated G-flat ζ_q ----
+    # One collective write of the persistent ``(n_q_disk, n_rmu,
+    # n_G_sph)`` tensor to disk.  The r-space per-chunk write loop
+    # already short-circuited at ``continue``, so this is the ONLY
+    # write that happens when ``write_g_flat_zeta`` is True.
+    if write_g_flat_zeta:
+        with timing.section("zeta_fit.write_g_flat"):
+            jax.block_until_ready(gflat_acc)
+            _n_G_sph = int(gflat_acc.shape[-1])
+            if use_ffi_io:
+                # On-disk extent is LOGICAL n_rmu; in-memory buffer
+                # is PADDED ``n_rmu_padded``.  SlabIO ``valid_shape=``
+                # clips the trailing μ pad rows on write — same trick
+                # the r-space writer uses (those rows are zero).
+                zeta_io.write_slab(
+                    'zeta_q_G', gflat_acc,
+                    offset=(0, 0, 0),
+                    global_shape=(n_q_disk, n_rmu, _n_G_sph),
+                    valid_shape=(n_q_disk, n_rmu, _n_G_sph),
+                )
+            else:
+                # allgather backend: same per-q allgather pattern as
+                # the r-space write loop, but only once (not per
+                # chunk).  The full tensor is at most a few GB
+                # replicated; for CrI3 scale the FFI backend is
+                # mandatory anyway.
+                _gathered = jax.experimental.multihost_utils.process_allgather(
+                    gflat_acc, tiled=False)
+                if jax.process_index() == 0:
+                    _g = np.asarray(_gathered)
+                    if _g.ndim == 4 and _g.shape[0] == 1:
+                        _g = _g[0]
+                    import h5py as _h5
+                    with _h5.File(output_file, 'a') as _f:
+                        _f['zeta_q_G'][...] = _g
+                del _gathered
+        del gflat_acc
 
     # Drain the rank-0 writer queue (allgather backend only; FFI path
     # writes are already fully flushed by the synchronous SlabIO calls).

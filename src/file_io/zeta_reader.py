@@ -121,6 +121,8 @@ class ZetaReader:
         # isdf_header attributes.
         self.density = isdf.density
         self.vertex_mu_L = isdf.vertex_mu_L
+        self.zeta_is_done = bool(isdf.zeta_is_done)
+        self.zeta_layout = str(isdf.zeta_layout)   # 'r_space' | 'G_flat'
         self.r_mu_fft_idx = isdf.r_mu_fft_idx
         self.r_mu_crystal = isdf.r_mu_crystal
         self.n_rmu = isdf.n_rmu
@@ -130,14 +132,29 @@ class ZetaReader:
         # SlabIO is a write-or-collective-read object, and we only want
         # the dataset shape metadata.  Reopened for the actual data
         # reads via the SlabIO handle below.
+        # Dataset name depends on layout: legacy r-space files store
+        # ``zeta_q`` shape (n_q, n_rtot, n_rmu); G-flat files store
+        # ``zeta_q_G`` shape (n_q, n_rmu, n_G_sph).
+        _ds_name = ('zeta_q_G' if self.zeta_layout == 'G_flat'
+                    else 'zeta_q')
         with h5.File(self._path, "r") as f:
-            self._zeta_disk_shape = tuple(int(x) for x in f["zeta_q"].shape)
+            self._zeta_disk_shape = tuple(int(x) for x in f[_ds_name].shape)
+        self._zeta_dataset_name = _ds_name
         self.n_q_on_disk = self._zeta_disk_shape[0]
-        self.n_rtot_disk = self._zeta_disk_shape[1]
-        # n_rmu_disk may exceed isdf_header.n_rmu when the file was
-        # written with logical n_rmu but mu-padded; for now expect
-        # equality (Phase 3 writes clipped to logical).
-        self.n_rmu_disk = self._zeta_disk_shape[2]
+        if self.zeta_layout == 'G_flat':
+            # G_flat layout: shape (n_q, n_rmu, n_G_sph).  The
+            # ``n_rtot_disk`` attribute is kept for r-space callers;
+            # we expose n_G_sph for G-flat consumers and leave
+            # n_rtot_disk = n_rtot (computed from fft_grid) for
+            # compatibility with code that probes the on-disk r-extent.
+            nx, ny, nz = (int(s) for s in self.fft_grid)
+            self.n_rtot_disk = nx * ny * nz
+            self.n_rmu_disk = self._zeta_disk_shape[1]
+            self.n_G_sph_disk = self._zeta_disk_shape[2]
+        else:
+            self.n_rtot_disk = self._zeta_disk_shape[1]
+            self.n_rmu_disk = self._zeta_disk_shape[2]
+            self.n_G_sph_disk = None
 
         # ---- SlabIO handle ---------------------------------------------
         self._slab_io = SlabIO(self._path, mode=mode, mesh=mesh,
@@ -264,16 +281,6 @@ class ZetaReader:
         if mesh is None:
             mesh = self._mesh
 
-        # Step 1 — r-space slab.
-        zeta_disk = self.read_zeta_r_slab(
-            q_offset=q_offset, q_count=q_count,
-            mu_offset=mu_offset, mu_count=mu_count,
-            mesh=mesh, valid_mu=valid_mu,
-        )
-
-        # Step 2-4 — FFT + sphere gather.  Same algorithm as the
-        # ``_zeta_disk_to_G`` helper inside ``gw.v_q_tile``; both share
-        # the unified separable-phase application.
         nx, ny, nz = (int(s) for s in self.fft_grid)
         n_rtot = nx * ny * nz
         if sphere_idx is not None:
@@ -282,6 +289,34 @@ class ZetaReader:
             n_G_sph = n_rtot
         sphere_jx = (jnp.asarray(sphere_idx, dtype=jnp.int32)
                      if sphere_idx is not None else None)
+
+        if self.zeta_layout == 'G_flat':
+            # Phase C1c: file is already G-flat.  Read the
+            # (q_count, mu_count, n_G_sph_disk) slab directly and
+            # narrow to the caller's sphere subset.  ``qvec_batch_frac``
+            # is ignored — the per-q phase is already baked into the
+            # on-disk tensor by the writer.
+            n_G_sph_disk = int(self.n_G_sph_disk)
+            valid_count = (mu_count if valid_mu is None else int(valid_mu))
+            zeta_g_disk = self._slab_io.read_slab(
+                self._zeta_dataset_name,
+                shape=(int(q_count), int(mu_count), n_G_sph_disk),
+                valid_shape=(int(q_count), int(valid_count), n_G_sph_disk),
+                dtype=np.complex128,
+                offset=(int(q_offset), int(mu_offset), 0),
+                mesh=mesh,
+                partition_spec=P(None, ('x', 'y'), None),
+            )
+            if sphere_jx is not None and n_G_sph != n_G_sph_disk:
+                return jnp.take(zeta_g_disk, sphere_jx, axis=-1)
+            return zeta_g_disk
+
+        # Legacy 'r_space' path: read r-space slab + FFT + sphere gather.
+        zeta_disk = self.read_zeta_r_slab(
+            q_offset=q_offset, q_count=q_count,
+            mu_offset=mu_offset, mu_count=mu_count,
+            mesh=mesh, valid_mu=valid_mu,
+        )
 
         return _do_disk_to_G(
             zeta_disk, qvec_batch_frac,
