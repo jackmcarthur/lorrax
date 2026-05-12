@@ -1501,8 +1501,32 @@ def _unfold_v_q_ibz_to_full(
         return V_q_ibz
 
     # Inverse permutation: ``inv_perm[s, π_s(μ)] = μ`` → argsort along μ.
+    # ``sym_perm`` is built from the LOGICAL centroid set (size
+    # ``n_rmu_logical``).  ``V_q_ibz`` arrives at the PADDED extent
+    # ``n_rmu_padded = ceil(n_rmu_logical / world_size) * world_size``
+    # so the V_q kernel's μ/ν shardings divide the mesh cleanly.  We
+    # pad ``inv_perm`` to that same padded extent with identity
+    # entries (pad μ rows map to themselves), so the gather output
+    # matches V_q_ibz's μ/ν extents and the ``P(None, 'x', 'y')``
+    # output sharding constraint is satisfied.  Pad ζ rows are zero
+    # by construction (SlabIO valid_shape= zero-fill) so the unfolded
+    # V_full has zero values on those rows — same on-disk-logical
+    # contract as the V_q kernel itself.
     inv_perm = np.argsort(sym_perm, axis=-1).astype(np.int32)
-    inv_perm_j = jnp.asarray(inv_perm)                              # (n_sym, n_rmu)
+    n_rmu_logical = int(inv_perm.shape[-1])
+    n_rmu_padded = int(V_q_ibz.shape[-1])
+    if n_rmu_padded > n_rmu_logical:
+        pad_block = np.arange(
+            n_rmu_logical, n_rmu_padded, dtype=np.int32)
+        pad_block = np.broadcast_to(
+            pad_block, (inv_perm.shape[0], n_rmu_padded - n_rmu_logical))
+        inv_perm = np.concatenate([inv_perm, pad_block], axis=-1)
+    elif n_rmu_padded != n_rmu_logical:
+        raise ValueError(
+            f"_unfold_v_q_ibz_to_full: V_q_ibz μ-extent "
+            f"{n_rmu_padded} smaller than sym_perm logical extent "
+            f"{n_rmu_logical}; pad invariant violated.")
+    inv_perm_j = jnp.asarray(inv_perm)
     idx_j = jnp.asarray(np.asarray(full_to_irr_idx, dtype=np.int32))
     sym_j = jnp.asarray(np.asarray(full_to_irr_sym, dtype=np.int32))
 
@@ -1510,15 +1534,26 @@ def _unfold_v_q_ibz_to_full(
 
     @partial(jax.jit, out_shardings=V_sh)
     def _do_unfold(V_ibz):
-        # Per-q μ-axis mapping: shape (n_q_full, n_rmu).
-        perm_q = inv_perm_j[sym_j]                                  # (n_q_full, n_rmu)
+        # Per-q μ-axis mapping: shape (n_q_full, n_rmu_padded).
+        perm_q = inv_perm_j[sym_j]                                  # (n_q_full, n_rmu_padded)
         V_at_irr = V_ibz[idx_j]                                     # (n_q_full, μ, μ)
-        # Gather along μ (axis 1):
+        # ``mode='promise_in_bounds'`` skips the
+        # ``_normalize_index``-driven OOB ``select`` that
+        # ``take_along_axis`` runs under the default ``mode='fill'``.
+        # That helper introduces a comparison ``index < 0`` + a fill
+        # constant; under shard_map+x64 the constant gets emitted as
+        # ``s32`` while XLA promotes the comparison's broadcast to
+        # ``s64`` (the HLO verifier ``SameElementType`` failure at
+        # ``hlo_verifier.cc:1247``).  ``perm_q`` is an in-range
+        # permutation by construction, so the bounds check is
+        # gratuitous; ``promise_in_bounds`` lowers directly to a
+        # ``lax.gather`` with no extra constant.
         V_perm_mu = jnp.take_along_axis(
-            V_at_irr, perm_q[:, :, None], axis=1)
-        # Gather along ν (axis 2):
+            V_at_irr, perm_q[:, :, None], axis=1,
+            mode='promise_in_bounds')
         V_full = jnp.take_along_axis(
-            V_perm_mu, perm_q[:, None, :], axis=2)
+            V_perm_mu, perm_q[:, None, :], axis=2,
+            mode='promise_in_bounds')
         return V_full
 
     return _do_unfold(V_q_ibz)
@@ -1546,26 +1581,47 @@ def _unfold_g0_ibz_to_full(
     Γ phase is exp(0) = 1 anyway).  If a future consumer needs the
     correct phase, set ``include_tau_phase=True``.
     """
-    # Trivial-IBZ short-circuit; see _unfold_v_q_ibz_to_full for details.
+    # Trivial-IBZ short-circuit (ntran=1, no centroid permutation, no
+    # μ-pad).  See ``_unfold_v_q_ibz_to_full`` for the rationale; we
+    # keep the same guard here so the no-op pass-through doesn't even
+    # dispatch a jit.
     idx_np = np.asarray(full_to_irr_idx)
     sym_np = np.asarray(full_to_irr_sym)
     if (idx_np.shape[0] == int(g0_ibz.shape[0])
             and np.array_equal(idx_np, np.arange(idx_np.shape[0]))
-            and np.all(sym_np == 0)):
+            and np.all(sym_np == 0)
+            and int(g0_ibz.shape[-1]) == int(np.asarray(sym_perm).shape[-1])):
         return g0_ibz
 
+    # Pad ``inv_perm`` to the input's μ-extent (same logic as
+    # ``_unfold_v_q_ibz_to_full``); g0 carries the padded μ count
+    # from the V_q kernel.
     inv_perm = np.argsort(sym_perm, axis=-1).astype(np.int32)
+    n_rmu_logical = int(inv_perm.shape[-1])
+    n_rmu_padded = int(g0_ibz.shape[-1])
+    full_to_irr_idx = np.asarray(full_to_irr_idx, dtype=np.int32)
+    full_to_irr_sym = np.asarray(full_to_irr_sym, dtype=np.int32)
+    if n_rmu_padded > n_rmu_logical:
+        pad_block = np.arange(
+            n_rmu_logical, n_rmu_padded, dtype=np.int32)
+        pad_block = np.broadcast_to(
+            pad_block, (inv_perm.shape[0], n_rmu_padded - n_rmu_logical))
+        inv_perm = np.concatenate([inv_perm, pad_block], axis=-1)
     inv_perm_j = jnp.asarray(inv_perm)
-    idx_j = jnp.asarray(np.asarray(full_to_irr_idx, dtype=np.int32))
-    sym_j = jnp.asarray(np.asarray(full_to_irr_sym, dtype=np.int32))
+    idx_j = jnp.asarray(full_to_irr_idx)
+    sym_j = jnp.asarray(full_to_irr_sym)
 
     g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
 
     @partial(jax.jit, out_shardings=g0_sh)
     def _do_unfold(g0):
-        perm_q = inv_perm_j[sym_j]                                  # (n_q_full, n_rmu)
+        perm_q = inv_perm_j[sym_j]                                  # (n_q_full, n_rmu_padded)
         g0_at_irr = g0[idx_j]                                       # (n_q_full, μ)
-        g0_full = jnp.take_along_axis(g0_at_irr, perm_q, axis=1)
+        # ``mode='promise_in_bounds'`` to skip the take_along_axis
+        # OOB-fill helper that breaks under shard_map+x64; same fix
+        # as ``_unfold_v_q_ibz_to_full``.
+        g0_full = jnp.take_along_axis(
+            g0_at_irr, perm_q, axis=1, mode='promise_in_bounds')
         return g0_full
 
     return _do_unfold(g0_ibz)
