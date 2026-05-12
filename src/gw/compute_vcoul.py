@@ -201,6 +201,7 @@ def make_v_munu_chunked_kernel(
     bdot: np.ndarray | None = None,
     mc_average_vcoul_body: bool = True,
     vcoul_cutoff_ry: float | None = None,
+    mesh_xy=None,
 ):
     """
     Factory for jitted kernels that compute V_q blocks from zeta chunks.
@@ -231,6 +232,21 @@ def make_v_munu_chunked_kernel(
         return _v_munu_kernel_cache[cache_key]
 
     n_G = fft_nx * fft_ny * fft_nz
+
+    # Local 3-D FFT helper for the ``(B_μ, fft_nx, fft_ny, fft_nz)`` box.
+    # ``make_sharded_fftn_3d`` runs cuFFT per-rank on the μ shard via
+    # shard_map so XLA never sees the un-sharded box.  Test-bench
+    # fallback: a trivial 1×1 mesh + replicated spec.
+    if mesh_xy is not None:
+        _box_spec = P(('x', 'y'), None, None, None)
+        _local_fftn = make_sharded_fftn_3d(
+            mesh_xy, _box_spec, _box_spec, norm=None, axes=(-3, -2, -1))
+    else:
+        _trivial_mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
+                              axis_names=('x', 'y'))
+        _box_spec = P(None, None, None, None)
+        _local_fftn = make_sharded_fftn_3d(
+            _trivial_mesh, _box_spec, _box_spec, norm=None, axes=(-3, -2, -1))
 
     # Precompute static grid data
     fx, fy, fz = exp_ikr_fftbox(fft_nx, fft_ny, fft_nz)
@@ -424,9 +440,9 @@ def make_v_munu_chunked_kernel(
         """FFT zeta and weight by √v.  Output trailing axis is ``n_G`` when
         ``sphere_idx is None`` else ``n_sph``.  NOT JIT'd - outer JIT fuses."""
         B_mu = zeta_r.shape[0]
-        zeta_G_flat = jnp.fft.fftn(
-            zeta_r.reshape(B_mu, fft_nx, fft_ny, fft_nz) * phase,
-            axes=(-3, -2, -1)).reshape(B_mu, n_G)
+        zeta_G_flat = _local_fftn(
+            zeta_r.reshape(B_mu, fft_nx, fft_ny, fft_nz) * phase
+        ).reshape(B_mu, n_G)
         g0_chunk = zeta_G_flat[:, 0]  # G=(0,0,0) is flat-index 0; sphere_idx[0]==0.
         if sphere_idx is None:
             return zeta_G_flat * sqrt_v.reshape(1, -1), g0_chunk
@@ -912,6 +928,7 @@ def compute_all_V_q(
         bvec, cell_volume, sys_dim, bdot=bdot,
         mc_average_vcoul_body=mc_average_vcoul_body,
         vcoul_cutoff_ry=bare_coulomb_cutoff,
+        mesh_xy=mesh_xy,
     )
     sphere_idx = kernels.sphere_idx
     n_G_sph = int(kernels.n_sph)

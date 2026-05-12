@@ -2236,6 +2236,7 @@ def fit_zeta_to_h5(
                         qvec_frac=_q_irr_frac_dev,
                         norm='backward',
                         fft_batch_chunks=_gflat_fft_batch_chunks,
+                        mesh=mesh_xy,
                     )
                     del zeta_chunk_ibz
                     t_write_total += time.perf_counter() - t0

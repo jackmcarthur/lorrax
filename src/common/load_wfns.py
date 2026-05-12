@@ -671,20 +671,6 @@ def load_centroids_band_chunked(
 
         per_k_bytes = nb_padded * nspinor * n_rtot * 16 * peak_copies
         k_chunk_size = max(1, min(int(gpu_mem_bytes / per_k_bytes), nk_tot))
-        # Round k_chunk_size DOWN so that ``nb_chunk × k_chunk_size`` is
-        # a multiple of ``n_devices``.  Otherwise the (band, k) plane
-        # sharded across the mesh leaves some ranks with zero elements
-        # to read, and the PHDF5 FFI reader's hyperslab selection then
-        # fails with "selection + offset not within extent" (seen on
-        # CrI3 6×6×1 80 Ry with nb_chunk=4 + auto k_chunk=6 on a 4×4
-        # mesh — last y-rank got 0 k-points to read).
-        from math import gcd
-        _step = max(1, n_devices // max(1, gcd(nb_chunk, n_devices)))
-        if k_chunk_size > _step:
-            k_chunk_size = (k_chunk_size // _step) * _step
-        else:
-            k_chunk_size = _step
-        k_chunk_size = max(1, min(k_chunk_size, nk_tot))
 
     k_chunk_size = min(k_chunk_size, nk_tot)
     num_k_chunks = (nk_tot + k_chunk_size - 1) // k_chunk_size
@@ -777,7 +763,8 @@ def load_centroids_band_chunked(
                 psi_rmu_band = to_rmu(
                     psi_G_flat, g_index_full, meta.fft_grid,
                     centroid_idx_np, norm="ortho",
-                    kvecs_frac=jnp.asarray(kvecs_frac_full))
+                    kvecs_frac=jnp.asarray(kvecs_frac_full),
+                    mesh=mesh_xy)
                 jax.block_until_ready(psi_rmu_band)
             nb_padded_chunk = int(psi_rmu_band.shape[1])
             reshard_fn = _make_reshard_fn(nb_padded_chunk, nk_tot)
@@ -806,7 +793,8 @@ def load_centroids_band_chunked(
                 psi_rmu_band = to_rmu(
                     psi_G_flat, g_index_chunk, meta.fft_grid,
                     centroid_idx_np, norm="ortho",
-                    kvecs_frac=jnp.asarray(kvecs_chunk))
+                    kvecs_frac=jnp.asarray(kvecs_chunk),
+                    mesh=mesh_xy)
                 nb_padded_chunk = int(psi_rmu_band.shape[1])
                 reshard_fn = _make_reshard_fn(nb_padded_chunk, nk_chunk)
                 psi_rmu_kchunk, psi_rmuT_kchunk = reshard_fn(psi_rmu_band)

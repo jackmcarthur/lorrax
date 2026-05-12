@@ -60,6 +60,7 @@ class VqMuChunkKernel(AotKernel):
         )
 
     def build_callable(self, sys, knobs, mesh):
+        from common.fft_helpers import make_sharded_fftn_3d
         nx, ny, nz = sys.kgrid if sys.kgrid else (1, 1, 1)
         # Use n_r as the flat product; assume the AotKernel caller set
         # kgrid to fft_grid (we reuse the SysDims.kgrid field as the
@@ -67,12 +68,18 @@ class VqMuChunkKernel(AotKernel):
         fft_nx, fft_ny, fft_nz = nx, ny, nz
         n_G = fft_nx * fft_ny * fft_nz
 
+        # Canonical sharded FFT helper — replicated box at this scale.
+        _box_spec = P(None, None, None, None)
+        _local_fftn = make_sharded_fftn_3d(
+            mesh, _box_spec, _box_spec, norm=None, axes=(-3, -2, -1))
+
         @jax.jit
         def _fft_weight_contract_diag(zeta_r, sqrt_v, phase):
             B_mu = zeta_r.shape[0]
-            zeta_G = jnp.fft.fftn(
-                zeta_r.reshape(B_mu, fft_nx, fft_ny, fft_nz) * phase.reshape(fft_nx, fft_ny, fft_nz),
-                axes=(-3, -2, -1)).reshape(B_mu, n_G)
+            zeta_G = _local_fftn(
+                zeta_r.reshape(B_mu, fft_nx, fft_ny, fft_nz)
+                * phase.reshape(fft_nx, fft_ny, fft_nz)
+            ).reshape(B_mu, n_G)
             zeta_weighted = zeta_G * sqrt_v.astype(jnp.complex128).reshape(1, -1)
             V_ii = jnp.einsum("mG,nG->mn", jnp.conj(zeta_weighted), zeta_weighted,
                               optimize=True)

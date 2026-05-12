@@ -66,25 +66,8 @@ def _build_chunk_alphas(*, nk, ns, mu, nq, band_chunk, p_x, p_y, p, nr) -> _Chun
     # α_pair scales by ns² because the unified open-spin pair density is
     # rank-5 ``(nk, ns, ns, μ, cr)`` for ALL channels (charge γ̃^0=I and
     # transverse γ̃^i=α^i alike — see :mod:`common.isdf_fitting`).
-    #
-    # NB: ``α_pair`` is intentionally costed WITHOUT the (p_x · p_y)
-    # shard divisor.  At MoS2 3×3 scale XLA shards the (nk, ns, ns, μ, cr)
-    # pair-density buffer cleanly across the ('x', 'y') mesh; at CrI3
-    # 6×6×1 80 Ry scale (FFT 75·75·200, n_q=36, μ=1504) it does not —
-    # the IFFT inside ``z_q_from_pair`` triggers an all-gather of the
-    # full unsharded P_l + P_r before the gamma contract, producing the
-    # 121 GB OOM that the per-rank sharded sizing under-predicts.
-    # Costing α_pair unsharded ensures the chunker picks a cr small
-    # enough that the unsharded P_l + P_r still fits in the budget.
-    # ``LORRAX_TRUST_PAIR_SHARD=1`` reverts to the per-rank sharded
-    # sizing — use only on systems where the ZCT pipeline empirically
-    # stays sharded end-to-end (small n_q · μ · cr).
-    import os as _os
-    _pair_shard = (p_x * p_y
-                   if _os.environ.get('LORRAX_TRUST_PAIR_SHARD', '0') == '1'
-                   else 1)
     return _ChunkAlphas(
-        α_pair=_bytes_c128(nk, ns, ns, mu, shard=_pair_shard),
+        α_pair=_bytes_c128(nk, ns, ns, mu, shard=p_x * p_y),
         α_psi_Y_bc=_bytes_c128(nk, band_chunk, ns, shard=p_y),
         α_zcol=_bytes_c128(nq, mu, shard=p),
         α_z_slice=_bytes_c128(mu, shard=p),
@@ -954,6 +937,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 						if meta.sys_dim == 0 else None,
 					mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
 					vcoul_cutoff_ry=vcoul_cutoff_ry,
+					mesh_xy=mesh_xy,
 				)
 				with SlabIO(zeta_h5_path, mode='r', mesh=mesh_xy,
 				            backend=cfg.backend.slab_io) as zc, \

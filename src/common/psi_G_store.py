@@ -353,7 +353,8 @@ class PsiGStore:
             return to_rchunk(
                 psi_G_flat, g_index_full, fft_grid_t,
                 r_start_dyn, int(r_chunk_size),
-                kvecs_frac=kvecs_frac_full, norm="ortho")
+                kvecs_frac=kvecs_frac_full, norm="ortho",
+                mesh=self.mesh)
         # Python-loop k-chunk + concatenate.  Each iter's FFT box is
         # ``(_k_chunk, bpd, ns, *fft_grid)`` so XLA's worst-case
         # unsharded materialisation is bounded.
@@ -363,7 +364,8 @@ class PsiGStore:
             slabs.append(to_rchunk(
                 psi_G_flat[k0:k1], g_index_full[k0:k1], fft_grid_t,
                 r_start_dyn, int(r_chunk_size),
-                kvecs_frac=kvecs_frac_full[k0:k1], norm="ortho"))
+                kvecs_frac=kvecs_frac_full[k0:k1], norm="ortho",
+                mesh=self.mesh))
         return jnp.concatenate(slabs, axis=0)
 
 
