@@ -149,6 +149,43 @@ def _maybe_constrain(arr: jax.Array, sharding: NamedSharding | None) -> jax.Arra
 
 
 # ---------------------------------------------------------------------------
+# Local-IFFT helper: each rank's band shard runs cuFFT independently.
+# ---------------------------------------------------------------------------
+#
+# ``jnp.fft.ifftn`` on a band-sharded tensor doesn't always lower to a
+# per-shard FFT — XLA may insert an all-gather and run a global FFT,
+# blowing past the per-rank HBM ceiling (seen on CrI3 6×6×1 80 Ry, where
+# the centroid-extraction IFFT requested 121 GB).  We wrap the IFFT in a
+# ``custom_partitioning`` op (via :func:`make_jittable_local_ifftn_3d`)
+# so XLA sees an opaque "local IFFT on these axes" primitive and emits
+# per-rank cuFFT calls with no resharding.  Falls back to plain
+# ``jnp.fft.ifftn`` when the input has no mesh sharding (test bench /
+# single-device).
+def _box_sharding_of(psi: jax.Array) -> NamedSharding | None:
+    """NamedSharding for the FFT box ``psi.shape[:-1] + (nx, ny, nz)``
+    that preserves psi's band shard and keeps the FFT axes replicated.
+    ``None`` if psi has no mesh sharding."""
+    sh = getattr(psi, "sharding", None)
+    if sh is None or not hasattr(sh, "mesh"):
+        return None
+    psi_spec = tuple(getattr(sh, "spec", ()))
+    return NamedSharding(sh.mesh, P(*psi_spec[:-1], None, None, None))
+
+
+def _make_box_ifftn(psi: jax.Array, *, norm: str):
+    """Return ``f(box) -> ifftn(box, axes=(-3,-2,-1), norm=norm)`` that
+    runs per-rank-local on a band-sharded ``psi``.  ``box`` is what
+    :func:`_box_kernel` produces from ``psi`` — i.e. ``psi.shape[:-1] +
+    (nx, ny, nz)``."""
+    from common.fft_helpers import make_jittable_local_ifftn_3d
+    box_sh = _box_sharding_of(psi)
+    if box_sh is None:
+        return lambda box: jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+    return make_jittable_local_ifftn_3d(
+        box_sh.mesh, box_sh.spec, box_sh.spec, norm=norm, axes=(-3, -2, -1))
+
+
+# ---------------------------------------------------------------------------
 # Sharding signature key — used to keep the jit caches small and stable.
 # ---------------------------------------------------------------------------
 
@@ -230,18 +267,22 @@ def to_rbox(
            kvecs_shape, _sharding_key(psi), out_sharding)
     fn = _RBOX_KERNEL_CACHE.get(key)
     if fn is None:
+        ifftn = _make_box_ifftn(psi, norm=norm)
+        box_sh = _box_sharding_of(psi)
         if kvecs_frac is None:
             @jax.jit
             def fn(psi_, g_index_):
-                box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
-                out = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+                box = _maybe_constrain(
+                    _box_kernel(psi_, g_index_, ngkmax=ngkmax), box_sh)
+                out = _maybe_constrain(ifftn(box), box_sh)
                 return _maybe_constrain(out, out_sharding)
             _RBOX_KERNEL_CACHE[key] = fn
         else:
             @jax.jit
             def fn(psi_, g_index_, kvecs_):
-                box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
-                rb = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+                box = _maybe_constrain(
+                    _box_kernel(psi_, g_index_, ngkmax=ngkmax), box_sh)
+                rb = _maybe_constrain(ifftn(box), box_sh)
                 rb = apply_bloch_phase(rb, kvecs_, fft_grid_t)
                 return _maybe_constrain(rb, out_sharding)
             _RBOX_KERNEL_CACHE[key] = fn
@@ -276,19 +317,23 @@ def to_rmu(
            norm, kvecs_shape, _sharding_key(psi), out_sharding)
     fn = _RMU_KERNEL_CACHE.get(key)
     if fn is None:
+        ifftn = _make_box_ifftn(psi, norm=norm)
+        box_sh = _box_sharding_of(psi)
         if kvecs_frac is None:
             @jax.jit
             def fn(psi_, g_index_, r_mu_):
-                box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
-                rb = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+                box = _maybe_constrain(
+                    _box_kernel(psi_, g_index_, ngkmax=ngkmax), box_sh)
+                rb = _maybe_constrain(ifftn(box), box_sh)
                 out = rb[:, :, :, r_mu_[:, 0], r_mu_[:, 1], r_mu_[:, 2]]
                 return _maybe_constrain(out, out_sharding)
             _RMU_KERNEL_CACHE[key] = fn
         else:
             @jax.jit
             def fn(psi_, g_index_, r_mu_, kvecs_):
-                box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
-                rb = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+                box = _maybe_constrain(
+                    _box_kernel(psi_, g_index_, ngkmax=ngkmax), box_sh)
+                rb = _maybe_constrain(ifftn(box), box_sh)
                 rb = apply_bloch_phase(rb, kvecs_, fft_grid_t)
                 out = rb[:, :, :, r_mu_[:, 0], r_mu_[:, 1], r_mu_[:, 2]]
                 return _maybe_constrain(out, out_sharding)
@@ -333,11 +378,14 @@ def to_rchunk(
            norm, kvecs_shape, _sharding_key(psi), out_sharding)
     fn = _RCHUNK_KERNEL_CACHE.get(key)
     if fn is None:
+        ifftn = _make_box_ifftn(psi, norm=norm)
+        box_sh = _box_sharding_of(psi)
         if kvecs_frac is None:
             @jax.jit
             def fn(psi_, g_index_, r0_):
-                box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
-                rb = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+                box = _maybe_constrain(
+                    _box_kernel(psi_, g_index_, ngkmax=ngkmax), box_sh)
+                rb = _maybe_constrain(ifftn(box), box_sh)
                 rb_flat = rb.reshape(*rb.shape[:3], n_rtot)
                 out = jax.lax.dynamic_slice_in_dim(rb_flat, r0_, r_len_i, axis=-1)
                 return _maybe_constrain(out, out_sharding)
@@ -350,8 +398,9 @@ def to_rchunk(
                 # Mathematically equivalent (multiplication commutes
                 # with slicing along r); cuts the per-r phase work from
                 # n_k·nx·ny·nz to n_k·r_len.
-                box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
-                rb = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+                box = _maybe_constrain(
+                    _box_kernel(psi_, g_index_, ngkmax=ngkmax), box_sh)
+                rb = _maybe_constrain(ifftn(box), box_sh)
                 rb_flat = rb.reshape(*rb.shape[:3], n_rtot)
                 slab = jax.lax.dynamic_slice_in_dim(rb_flat, r0_, r_len_i, axis=-1)
                 slab = apply_bloch_phase_on_slice(

@@ -1097,6 +1097,16 @@ def prepare_isdf_and_wavefunctions(
 				r_chunk_override=mem.r_chunk_override if mem.r_chunk_override > 0 else None,
 				zct_stage_cap_gb=mem.zct_stage_cap_gb,
 			)
+			# User-supplied ``band_chunk_size`` (cohsex.in) acts as an
+			# UPPER cap on the heuristic chooser's pick.  Lets the user
+			# force tighter band chunking when the chooser's
+			# replicated-FFT-box sizing over-predicts headroom (seen on
+			# CrI3 6×6×1 80 Ry: chooser picks band_chunk=nb_total but
+			# XLA actually materialises the FFT box unsharded → 121 GB
+			# OOM in to_rmu).  ``band_chunk_size <= 0`` disables the cap.
+			if mem.band_chunk_size > 0:
+				chunks['band_chunk'] = min(
+					int(chunks['band_chunk']), int(mem.band_chunk_size))
 
 			# Load centroid ψ once for the full [b0, b4) range; reused by
 			# both the zeta fit (sliced into halves internally) and the
