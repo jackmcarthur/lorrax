@@ -175,15 +175,13 @@ class PsiGStore:
                 self._host_tiles[(x, y)] = np.empty(
                     self._per_rank_shape, dtype=np.complex128)
 
-        # TODO(perf, scale-only): real async-IO via a dedicated reader
-        # thread + ``queue.Queue`` (mirror of
-        # ``_slab_io_ffi._dispatch_loop`` at
-        # file_io/_slab_io_ffi.py:339-410).  The naive Python-level
-        # reorder (issue bc[i+1]'s ``loader.load`` before ``shard_to_host``
-        # of bc[i]) does NOT give overlap — the phdf5 FFI's host-side read
-        # blocks before returning, confirmed in xprof: H2D overlap_frac
-        # stayed 0.000.  A daemon-thread variant (HDF5 releases the GIL
-        # during I/O) is the path forward at CrI3 / large-bc scale.
+        # NOTE: an AsyncWfnReader (file_io/wfn_loader.py) is available
+        # and was tried here to pipeline ``loader.load(bc+1)`` against
+        # bc[i]'s shard_to_host copy.  At MoS2 3×3 scale, xprof shows
+        # H2D/compute overlap_frac = 0.000 even with depth-2 prefetch
+        # — XLA's stream scheduler doesn't pipeline our H2D against
+        # compute here.  Keep the synchronous path until either scale
+        # grows (CrI3) or the broader async-reader story comes back.
         from common import timing
         sharding_spec = P(None, ('x', 'y'), None, None)
         for bc_idx, bc_range in enumerate(self.band_chunk_ranges):
