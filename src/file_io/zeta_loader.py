@@ -151,6 +151,7 @@ class ZetaLoader:
         self.r_mu_crystal = isdf.r_mu_crystal
         self.n_rmu = int(isdf.n_rmu)
         self.zeta_is_done = bool(isdf.zeta_is_done)
+        self.zeta_layout = str(isdf.zeta_layout)   # 'r_space' | 'G_flat'
 
         # On-disk q-axis classification.
         self.n_q_on_disk = int(zeta_shape[0])

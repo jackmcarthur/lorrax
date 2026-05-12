@@ -94,6 +94,49 @@ def test_legacy_files_without_flag_read_as_done(tmp_path):
     assert hdr.zeta_is_done is True
 
 
+def test_zeta_layout_round_trip(tmp_path):
+    """``zeta_layout`` round-trips for both 'r_space' (default) and 'G_flat'."""
+    out_r = _build_zeta_h5(tmp_path, n_q_disk=2)
+    hdr_r = read_isdf_header(out_r)
+    assert hdr_r.zeta_layout == 'r_space'
+
+    # Build a synthetic G-flat header to confirm round-trip.
+    out_g = tmp_path / 'zeta_q_g.h5'
+    from file_io.mf_header import copy_mf_header
+    wfn_path = str(tmp_path / 'WFN.h5')
+    _make_fake_wfn(wfn_path)
+    copy_mf_header(wfn_path, str(out_g), dst_mode='w')
+    g_hdr = IsdfHeader.build(
+        r_mu_fft_idx=np.zeros((4, 3), dtype=np.int32),
+        fft_grid=(8, 8, 8),
+        density='scalar', vertex_mu_L=0,
+        zeta_is_done=True, zeta_layout='G_flat',
+    )
+    write_isdf_header(str(out_g), g_hdr, mode='a')
+    hdr_g = read_isdf_header(str(out_g))
+    assert hdr_g.zeta_layout == 'G_flat'
+
+
+def test_zeta_layout_legacy_default(tmp_path):
+    """Files without ``zeta_layout`` read as 'r_space'."""
+    out = _build_zeta_h5(tmp_path, n_q_disk=2)
+    with h5py.File(out, 'a') as f:
+        del f['isdf_header/zeta_layout']
+    hdr = read_isdf_header(out)
+    assert hdr.zeta_layout == 'r_space'
+
+
+def test_zeta_layout_rejects_garbage(tmp_path):
+    """build() rejects non-{'r_space','G_flat'} values."""
+    with pytest.raises(ValueError, match="zeta_layout must be"):
+        IsdfHeader.build(
+            r_mu_fft_idx=np.zeros((1, 3), dtype=np.int32),
+            fft_grid=(4, 4, 4),
+            density='scalar', vertex_mu_L=0,
+            zeta_layout='bogus',
+        )
+
+
 # ---------------------------------------------------------------------------
 # .load surface
 # ---------------------------------------------------------------------------

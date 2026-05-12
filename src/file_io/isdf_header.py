@@ -54,6 +54,17 @@ class IsdfHeader:
                                  # final ``mark_zeta_done`` call.  Defaulted
                                  # ``True`` for in-memory construction so
                                  # synthetic test headers don't need to set it.
+    zeta_layout: str = 'r_space'  # 'r_space' | 'G_flat'.
+                                 # 'r_space' (legacy default): on-disk dataset
+                                 # is ``zeta_q`` shape (n_q_disk, n_rtot, n_rmu),
+                                 # consumer applies forward FFT + sphere gather
+                                 # via ``ZetaLoader.load(layout='G_flat',
+                                 # qvec_frac=, sphere_idx=)``.
+                                 # 'G_flat' (Phase C of zeta migration): on-disk
+                                 # dataset is ``zeta_q_G`` shape (n_q_disk,
+                                 # n_rmu, n_G_sph), already FFT'd + sphere-
+                                 # gathered by the writer.  Legacy files that
+                                 # lack this field default to 'r_space'.
 
     @property
     def n_rmu(self) -> int:
@@ -68,14 +79,22 @@ class IsdfHeader:
         density: str,
         vertex_mu_L: int,
         zeta_is_done: bool = False,
+        zeta_layout: str = 'r_space',
     ) -> 'IsdfHeader':
         """Build a header from centroid FFT-grid indices.
 
         ``r_mu_crystal`` is derived as ``r_mu_fft_idx / fft_grid``.
         ``zeta_is_done`` defaults ``False`` for the writer path — the
         writer flips it to ``True`` via :func:`mark_zeta_done` after
-        the final chunk is on disk.
+        the final chunk is on disk.  ``zeta_layout`` defaults to
+        ``'r_space'`` (the legacy on-disk format); the
+        ``accumulate_rchunk_to_gflat`` writer path sets it to
+        ``'G_flat'``.
         """
+        if zeta_layout not in ('r_space', 'G_flat'):
+            raise ValueError(
+                f"zeta_layout must be 'r_space' or 'G_flat'; got "
+                f"{zeta_layout!r}")
         idx = np.asarray(r_mu_fft_idx, dtype=np.int32)
         if idx.ndim != 2 or idx.shape[1] != 3:
             raise ValueError(
@@ -88,6 +107,7 @@ class IsdfHeader:
             r_mu_fft_idx=idx,
             r_mu_crystal=crystal,
             zeta_is_done=bool(zeta_is_done),
+            zeta_layout=str(zeta_layout),
         )
 
 
@@ -98,16 +118,20 @@ class IsdfHeader:
 def _read_group(f: h5.File) -> IsdfHeader:
     g = f[_GROUP]
     # Legacy files predate the ``zeta_is_done`` field; treat as ``True``
-    # (they were always written atomically at end-of-fit).  New files
-    # carry the field explicitly.
+    # (they were always written atomically at end-of-fit).  Legacy files
+    # also predate ``zeta_layout``; treat as ``'r_space'``.  New files
+    # carry both fields explicitly.
     zeta_done = (bool(g['zeta_is_done'][()]) if 'zeta_is_done' in g
                  else True)
+    zeta_layout = (_decode_str(g['zeta_layout'][()]) if 'zeta_layout' in g
+                   else 'r_space')
     return IsdfHeader(
         density=_decode_str(g['density'][()]),
         vertex_mu_L=int(g['vertex_mu_L'][()]),
         r_mu_fft_idx=np.asarray(g['centroids/r_mu_fft_idx'][:], dtype=np.int32),
         r_mu_crystal=np.asarray(g['centroids/r_mu_crystal'][:], dtype=np.float64),
         zeta_is_done=zeta_done,
+        zeta_layout=zeta_layout,
     )
 
 
@@ -152,6 +176,7 @@ def write_isdf_header(
         g.create_dataset('density', data=np.bytes_(header.density))
         g.create_dataset('vertex_mu_L', data=np.int32(header.vertex_mu_L))
         g.create_dataset('zeta_is_done', data=np.bool_(header.zeta_is_done))
+        g.create_dataset('zeta_layout', data=np.bytes_(header.zeta_layout))
         c = g.create_group('centroids')
         c.create_dataset('r_mu_fft_idx', data=header.r_mu_fft_idx)
         c.create_dataset('r_mu_crystal', data=header.r_mu_crystal)
