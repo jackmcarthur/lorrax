@@ -206,9 +206,11 @@ def test_accumulate_rchunk_to_gflat_chunked_matches_one_shot(fft_batch_chunks):
 
 def test_accumulate_rchunk_to_gflat_chunked_rejects_indivisible(
         single_device_mesh):
-    """fft_batch_chunks must divide n_mu_padded (axis-1 chunking)."""
+    """fft_batch_chunks must divide n_mu_local = n_mu_padded / p_prod
+    (so each chunk's per-rank shard stays integer-sized)."""
     fft_grid = (4, 4, 4)
-    # n_mu_padded = 2. fft_batch_chunks=3 doesn't divide 2.
+    # p_prod = 1 (single device) → n_mu_local = n_mu_padded = 2.
+    # fft_batch_chunks=3 doesn't divide 2.
     with single_device_mesh:
         rch = jax.device_put(
             jnp.zeros((5, 2, 8), dtype=jnp.complex128),
@@ -216,7 +218,7 @@ def test_accumulate_rchunk_to_gflat_chunked_rejects_indivisible(
         acc = jax.device_put(
             jnp.zeros((5, 2, 3), dtype=jnp.complex128),
             NamedSharding(single_device_mesh, P(None, ('x', 'y'), None)))
-        with pytest.raises(ValueError, match="must divide n_mu_padded"):
+        with pytest.raises(ValueError, match="must divide n_mu_local"):
             accumulate_rchunk_to_gflat(
                 rchunk=rch, gflat_acc=acc, fft_grid=fft_grid, r0=0,
                 sphere_idx=np.array([0, 1, 2], dtype=np.int32),
