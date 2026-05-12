@@ -335,16 +335,36 @@ class PsiGStore:
         psi_G_flat = _pull()
 
         # Slice the kvecs to match the k_range, then dispatch to_rchunk.
-        kvecs_frac = self._kvecs_frac_dev[k_lo:k_hi]
-        return to_rchunk(
-            psi_G_flat,
-            self._g_index_dev[k_lo:k_hi] if k_range is not None
-                else self._g_index_dev,
-            tuple(int(s) for s in self.meta.fft_grid),
-            r_start_dyn, int(r_chunk_size),
-            kvecs_frac=kvecs_frac,
-            norm="ortho",
-        )
+        # K-chunk INSIDE the fetch: the FFT box ``(nk_slice, bpd, ns, nx,
+        # ny, nz)`` is the dominant transient in ``fit_one_rchunk`` and
+        # XLA empirically materialises it unsharded at CrI3 6×6 80 Ry
+        # scale.  Chunking by k caps the per-call box to
+        # ``(_k_chunk, bpd, ns, nx, ny, nz)`` regardless of how many k
+        # are in ``nk_slice`` — at the cost of a Python loop unrolled
+        # at trace.  ``LORRAX_PSIG_KCHUNK`` overrides the default cap.
+        import os as _os
+        _kc_env = int(_os.environ.get('LORRAX_PSIG_KCHUNK', '0') or 0)
+        _k_chunk = max(1, _kc_env) if _kc_env > 0 else nk_slice
+        kvecs_frac_full = self._kvecs_frac_dev[k_lo:k_hi]
+        g_index_full = (self._g_index_dev[k_lo:k_hi] if k_range is not None
+                        else self._g_index_dev)
+        fft_grid_t = tuple(int(s) for s in self.meta.fft_grid)
+        if _k_chunk >= nk_slice:
+            return to_rchunk(
+                psi_G_flat, g_index_full, fft_grid_t,
+                r_start_dyn, int(r_chunk_size),
+                kvecs_frac=kvecs_frac_full, norm="ortho")
+        # Python-loop k-chunk + concatenate.  Each iter's FFT box is
+        # ``(_k_chunk, bpd, ns, *fft_grid)`` so XLA's worst-case
+        # unsharded materialisation is bounded.
+        slabs = []
+        for k0 in range(0, nk_slice, _k_chunk):
+            k1 = min(k0 + _k_chunk, nk_slice)
+            slabs.append(to_rchunk(
+                psi_G_flat[k0:k1], g_index_full[k0:k1], fft_grid_t,
+                r_start_dyn, int(r_chunk_size),
+                kvecs_frac=kvecs_frac_full[k0:k1], norm="ortho"))
+        return jnp.concatenate(slabs, axis=0)
 
 
 class HostPsiGStore(PsiGStore):
