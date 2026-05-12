@@ -723,51 +723,42 @@ def load_centroids_band_chunked(
         np.asarray(sym_loader.kvecs_asints, dtype=np.float64)
         / kgrid_arr[None, :])
 
-    # Prefetched band-chunk schedule (all-k path).  loader.load returns
-    # an XLA-stream-async jax.Array; by issuing bc[i+1]'s load BEFORE
-    # we touch bc[i]'s output, XLA can overlap bc[i+1]'s phdf5 read /
-    # band-unfold with bc[i]'s on-device to_rmu + reshard.  Depth = 1
-    # is enough — the loader's read time is comparable to one chunk's
-    # GPU work; queueing more would just pile pending buffers.
-    #
-    # NOTE: ``block_until_ready`` is intentionally NOT called inside
-    # the timing sections so async dispatch is preserved.  Per-call
-    # wall time is recovered from xprof events on the H2D / FFI stream.
-    if not needs_k_chunking:
-        # Pre-issue bc[0]'s load.
-        bc_starts = [b_start + i * band_chunk_size for i in range(num_band_chunks)]
-        bc_ends = [min(s + band_chunk_size, b_end) for s in bc_starts]
-        with timing.section("load_centroids.loader_load"):
-            pending_psi_G = loader.load(
-                bands=(bc_starts[0], bc_ends[0]), k="full_bz",
-                sharding=sharding_load, bispinor=bispinor)
-        for bc_idx in range(num_band_chunks):
-            bc_start, bc_end = bc_starts[bc_idx], bc_ends[bc_idx]
-            nb_chunk = bc_end - bc_start
-            local_bc_start = bc_idx * band_chunk_size
-            local_bc_end = local_bc_start + nb_chunk
+    # TODO(perf, scale-only): real async-IO via a dedicated reader thread
+    # + ``queue.Queue`` (mirror of the ``_slab_io_ffi._dispatch_loop``
+    # write-side pattern at file_io/_slab_io_ffi.py:339-410).  The
+    # phdf5 FFI releases the GIL inside ``read_kchunk_union_sharded``,
+    # so a daemon thread can issue ``loader.load(bc+1)`` while the main
+    # thread runs ``to_rmu`` on bc[i].  A naive Python-level reorder
+    # (issue bc[i+1]'s load before touching bc[i]) gives ZERO overlap on
+    # the FFI path — confirmed in xprof: H2D overlap_frac stayed 0.000
+    # — because the FFI call itself blocks per-rank.  At MoS2 3×3 scale
+    # the I/O is sub-100 ms anyway; the thread-based prefetch only pays
+    # off at CrI3-scale runs with many band chunks.
+    for bc_idx in range(num_band_chunks):
+        bc_start = b_start + bc_idx * band_chunk_size
+        bc_end = min(bc_start + band_chunk_size, b_end)
+        bc_range = (bc_start, bc_end)
+        nb_chunk = bc_end - bc_start
+        local_bc_start = bc_idx * band_chunk_size
+        local_bc_end = local_bc_start + nb_chunk
 
-            psi_G_flat = pending_psi_G
-            # Issue bc[i+1]'s load BEFORE touching bc[i]; the FFI is
-            # XLA-stream-async so its read overlaps with bc[i]'s compute.
-            if bc_idx + 1 < num_band_chunks:
-                with timing.section("load_centroids.loader_load"):
-                    pending_psi_G = loader.load(
-                        bands=(bc_starts[bc_idx + 1], bc_ends[bc_idx + 1]),
-                        k="full_bz",
-                        sharding=sharding_load, bispinor=bispinor)
-            else:
-                pending_psi_G = None
-
+        if not needs_k_chunking:
+            with timing.section("load_centroids.loader_load"):
+                psi_G_flat = loader.load(
+                    bands=bc_range, k="full_bz",
+                    sharding=sharding_load, bispinor=bispinor)
+                jax.block_until_ready(psi_G_flat)
             with timing.section("load_centroids.to_rmu"):
                 psi_rmu_band = to_rmu(
                     psi_G_flat, g_index_full, meta.fft_grid,
                     centroid_idx_np, norm="ortho",
                     kvecs_frac=jnp.asarray(kvecs_frac_full))
+                jax.block_until_ready(psi_rmu_band)
             nb_padded_chunk = int(psi_rmu_band.shape[1])
             reshard_fn = _make_reshard_fn(nb_padded_chunk, nk_tot)
             with timing.section("load_centroids.reshard"):
                 psi_rmu_chunk, psi_rmuT_chunk = reshard_fn(psi_rmu_band)
+                jax.block_until_ready(psi_rmuT_chunk)
             psi_rmu_chunk = psi_rmu_chunk[:, :nb_chunk, :, :]
             psi_rmuT_chunk = psi_rmuT_chunk[:, :, :nb_chunk, :]
             psi_rmu_all = psi_rmu_all.at[
@@ -775,14 +766,7 @@ def load_centroids_band_chunked(
             psi_rmuT_all = psi_rmuT_all.at[
                 :, :, local_bc_start:local_bc_end, :].set(psi_rmuT_chunk)
             del psi_G_flat, psi_rmu_band, psi_rmu_chunk, psi_rmuT_chunk
-    else:
-        for bc_idx in range(num_band_chunks):
-            bc_start = b_start + bc_idx * band_chunk_size
-            bc_end = min(bc_start + band_chunk_size, b_end)
-            bc_range = (bc_start, bc_end)
-            nb_chunk = bc_end - bc_start
-            local_bc_start = bc_idx * band_chunk_size
-            local_bc_end = local_bc_start + nb_chunk
+        else:
             for kc_idx in range(num_k_chunks):
                 kc_start = kc_idx * k_chunk_size
                 kc_end = min(kc_start + k_chunk_size, nk_tot)

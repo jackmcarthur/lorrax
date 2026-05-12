@@ -175,36 +175,25 @@ class PsiGStore:
                 self._host_tiles[(x, y)] = np.empty(
                     self._per_rank_shape, dtype=np.complex128)
 
-        # Prefetched band-chunk schedule.  ``loader.load`` returns a
-        # stream-async jax.Array, so we issue bc[i+1]'s collective phdf5
-        # read BEFORE we touch bc[i]'s output — XLA / the FFI driver
-        # overlap bc[i+1]'s I/O with bc[i]'s ``shard_to_host`` copy
-        # (which is itself a synchronous D2H per addressable shard).
-        # Depth = 1; the wfn read time is comparable to one bc's host
-        # copy time on PCIe-Gen4 + parallel HDF5, so deeper queueing
-        # gains little and risks holding extra device buffers.
+        # TODO(perf, scale-only): real async-IO via a dedicated reader
+        # thread + ``queue.Queue`` (mirror of
+        # ``_slab_io_ffi._dispatch_loop`` at
+        # file_io/_slab_io_ffi.py:339-410).  The naive Python-level
+        # reorder (issue bc[i+1]'s ``loader.load`` before ``shard_to_host``
+        # of bc[i]) does NOT give overlap — the phdf5 FFI's host-side read
+        # blocks before returning, confirmed in xprof: H2D overlap_frac
+        # stayed 0.000.  A daemon-thread variant (HDF5 releases the GIL
+        # during I/O) is the path forward at CrI3 / large-bc scale.
         from common import timing
         sharding_spec = P(None, ('x', 'y'), None, None)
-        n_bc = len(self.band_chunk_ranges)
-        with timing.section("psi_G_store.populate.loader_load"):
-            pending_psi = self.loader.load(
-                bands=self.band_chunk_ranges[0], k="full_bz",
-                sharding=sharding_spec,
-                bispinor=self.bispinor,
-            )
         for bc_idx, bc_range in enumerate(self.band_chunk_ranges):
-            psi_G_bc = pending_psi
-            # Issue bc[i+1]'s load first so its phdf5 read overlaps
-            # with bc[i]'s ``shard_to_host`` D2H below.
-            if bc_idx + 1 < n_bc:
-                with timing.section("psi_G_store.populate.loader_load"):
-                    pending_psi = self.loader.load(
-                        bands=self.band_chunk_ranges[bc_idx + 1], k="full_bz",
-                        sharding=sharding_spec,
-                        bispinor=self.bispinor,
-                    )
-            else:
-                pending_psi = None
+            with timing.section("psi_G_store.populate.loader_load"):
+                psi_G_bc = self.loader.load(
+                    bands=bc_range, k="full_bz",
+                    sharding=sharding_spec,
+                    bispinor=self.bispinor,
+                )
+                jax.block_until_ready(psi_G_bc)
             b_lo = self._bc_band_offsets[bc_idx]
             b_hi = self._bc_band_offsets[bc_idx + 1]
             with timing.section("psi_G_store.populate.shard_to_host"):
