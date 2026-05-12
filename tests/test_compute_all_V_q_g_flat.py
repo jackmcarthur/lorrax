@@ -215,7 +215,7 @@ def test_compute_all_V_q_g_flat_rejects_r_space_loader(
     from tests.test_zeta_loader import _build_zeta_h5
     out = _build_zeta_h5(tmp_path, n_q_disk=2)
     with ZetaLoader(out, mesh=single_device_mesh) as loader:
-        with pytest.raises(ValueError, match="zeta_layout must be 'G_flat'"):
+        with pytest.raises(ValueError, match="layout must be 'G_flat'"):
             compute_all_V_q_g_flat(
                 loader,
                 kgrid=(2, 3, 4),

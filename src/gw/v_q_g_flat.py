@@ -52,15 +52,25 @@ if TYPE_CHECKING:
 _PER_Q_KERNEL_CACHE: dict = {}
 
 
-def _make_per_q_kernel(mesh_xy: Mesh, n_rmu: int, ngkmax: int,
-                       g_chunk: int, *, write_g0: bool):
+def _make_per_q_kernel(mesh_xy: Mesh, n_rmu_L: int, n_rmu_R: int,
+                       ngkmax: int, g_chunk: int,
+                       *, write_g0: bool, same_zeta: bool):
     """Compile-once kernel for the per-q contract + dynamic_update_slice
     into the (V_acc, g0_acc) buffers.
 
-    Returns ``fn(V_acc, g0_acc, zeta_q, v_q, q_idx) -> (V_new, g0_new)``.
+    Single signature handles both:
+      * Charge / diagonal bispinor tiles: ``same_zeta=True``; caller
+        passes ``zeta_R_q is zeta_L_q`` and the kernel re-shards one
+        buffer for the two operands of the einsum.
+      * Bispinor off-diagonal tiles: ``same_zeta=False``; caller passes
+        two separate buffers (potentially different ``n_rmu_*``).
+
+    Returns ``fn(V_acc, g0_acc, zeta_L_q, zeta_R_q, v_q, q_idx)
+              -> (V_new, g0_new)``.
     Donates the two accumulators so the per-q update is in-place.
     """
-    key = (id(mesh_xy), int(n_rmu), int(ngkmax), int(g_chunk), bool(write_g0))
+    key = (id(mesh_xy), int(n_rmu_L), int(n_rmu_R), int(ngkmax),
+           int(g_chunk), bool(write_g0), bool(same_zeta))
     hit = _PER_Q_KERNEL_CACHE.get(key)
     if hit is not None:
         return hit
@@ -77,29 +87,26 @@ def _make_per_q_kernel(mesh_xy: Mesh, n_rmu: int, ngkmax: int,
     n_chunks = ngkmax // g_chunk
 
     @partial(jax.jit, donate_argnums=(0, 1))
-    def fn(V_acc, g0_acc, zeta_q, v_q, q_idx):
-        # zeta_q comes in as (1, n_rmu, ngkmax) from a per-q read; drop
-        # the q axis so the kernel works on a single tile.
-        zeta = zeta_q[0]                                 # (n_rmu, ngkmax)
-        zeta = jax.lax.with_sharding_constraint(zeta, blk_xy_sh)
-
-        # Two views for the GEMM-shape einsum:
-        #   conj(L)·v  on x-sharded μ_L
-        #   R         on y-sharded μ_R
-        # Output (μ_L_x, μ_R_y) is the V_q block at P('x','y').
-        zeta_L = jax.lax.with_sharding_constraint(zeta, blk_x_sh)
-        zeta_R = jax.lax.with_sharding_constraint(zeta, blk_y_sh)
+    def fn(V_acc, g0_acc, zeta_L_q, zeta_R_q, v_q, q_idx):
+        # zeta_*_q come in as (1, n_rmu_*, ngkmax) from per-q reads;
+        # drop the q axis.  In the same_zeta case ``zeta_R_q is
+        # zeta_L_q`` (caller-aliased); we still take separate views
+        # so the two reshardings below are explicit.
+        zeta_L_3d = jax.lax.with_sharding_constraint(zeta_L_q, blk_xy_sh)
+        if same_zeta:
+            zeta_R_3d = zeta_L_3d
+        else:
+            zeta_R_3d = jax.lax.with_sharding_constraint(zeta_R_q, blk_xy_sh)
+        zeta_L = jax.lax.with_sharding_constraint(zeta_L_3d[0], blk_x_sh)
+        zeta_R = jax.lax.with_sharding_constraint(zeta_R_3d[0], blk_y_sh)
         v_q = jax.lax.with_sharding_constraint(v_q, v_sh)
 
-        V_q = jnp.zeros((n_rmu, n_rmu), dtype=zeta.dtype)
+        V_q = jnp.zeros((n_rmu_L, n_rmu_R), dtype=zeta_L.dtype)
         V_q = jax.lax.with_sharding_constraint(V_q, V_block_sh)
 
-        # G-chunked accumulation.  Static loop over n_chunks (small —
-        # ngkmax / g_chunk is O(few) to O(10) — keeps the jit fast).
-        # TODO(g-prefetch): a future opt-in could fuse this with an
-        # in-jit double-buffer of two G-chunks worth of ζ slices to
-        # hide the dynamic_slice latency; current shape is one chunk
-        # per kernel iter.
+        # G-chunked accumulation.  Static python loop over n_chunks
+        # (small — ngkmax/g_chunk is O(few) to O(10)).  See module
+        # docstring for the math: V[μ,ν] += conj(L_chunk)·v·R_chunkᵀ.
         for i in range(n_chunks):
             start = i * g_chunk
             L_chunk = jax.lax.dynamic_slice_in_dim(
@@ -112,9 +119,6 @@ def _make_per_q_kernel(mesh_xy: Mesh, n_rmu: int, ngkmax: int,
             V_q = V_q + L_w @ R_chunk.T
         V_q = jax.lax.with_sharding_constraint(V_q, V_block_sh)
 
-        # dynamic_update_slice wants all start_indices in the same int
-        # dtype; the spatial axes default to int32 in numpy-like land
-        # while the python literal ``0`` is int64.  Force-cast.
         q_idx_32 = q_idx.astype(jnp.int32)
         zero32 = jnp.int32(0)
         V_new = jax.lax.dynamic_update_slice(
@@ -122,7 +126,6 @@ def _make_per_q_kernel(mesh_xy: Mesh, n_rmu: int, ngkmax: int,
         V_new = jax.lax.with_sharding_constraint(V_new, V_sh)
 
         if write_g0:
-            # G=0 lives at sphere position 0 by writer construction.
             g0_q = zeta_L[:, 0]                          # (n_rmu_L/p_x,)
             g0_q = jax.lax.with_sharding_constraint(g0_q, g0_block_sh)
             g0_new = jax.lax.dynamic_update_slice(
@@ -138,73 +141,24 @@ def _make_per_q_kernel(mesh_xy: Mesh, n_rmu: int, ngkmax: int,
 
 
 # ---------------------------------------------------------------------------
-# Public entry point
+# Small shared helpers (used by both the charge wrapper and the bispinor
+# tile loop in gw.v_q_bispinor)
 # ---------------------------------------------------------------------------
 
-def compute_all_V_q_g_flat(
-    zeta_loader,                       # ZetaLoader | ZetaReader (G-flat)
-    *,
-    kgrid: tuple[int, int, int],
-    fft_grid: tuple[int, int, int],
-    bvec: np.ndarray,
-    cell_volume: float,
-    mesh_xy: Mesh,
-    n_rmu: int,
-    sys_dim: int,
-    bdot: np.ndarray | None = None,
-    bare_coulomb_cutoff_ry: float | None = None,
-    bgw_v_grid_fn=None,
-    g_chunk: int | None = None,
-    verbose: bool = True,
-    sym=None,
-    centroid_indices: np.ndarray | None = None,
-    async_prefetch: bool = True,
-) -> tuple[jax.Array, jax.Array]:
-    """V_q orchestrator for the G-flat on-disk layout.
+def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
+    """Pick IBZ q's via centroid orbit closure, fall back to full BZ.
 
-    Iterates q one at a time over the writer's IBZ (or full BZ if the
-    file was written without IBZ reduction), reads the per-q ζ̃ slab,
-    builds ``v(q+G)`` from the on-disk per-q components, contracts via
-    :func:`gw.compute_vcoul._v_q_per_q_g_chunked_jit`, and writes the
-    result into a single ``(n_q_ibz, n_rmu, n_rmu)`` output buffer.
-    Post-loop, applies the IBZ → full-BZ centroid double-permute via
-    the existing :func:`gw.v_q_tile._unfold_v_q_ibz_to_full` helper
-    (V_q is bilinear in ζ — no τ phase, same math as before).
-
-    Parameters mirror the legacy :func:`gw.compute_vcoul.compute_all_V_q`
-    with two differences:
-    * ``zeta_loader`` is a :class:`file_io.zeta_loader.ZetaLoader` or
-      :class:`file_io.zeta_reader.ZetaReader` whose ``zeta_layout`` is
-      ``'G_flat'``.  Caller is expected to verify; this function
-      raises if it isn't.
-    * ``g_chunk`` is the G-axis chunk size.  ``None`` (default) picks
-      the largest divisor of ``ngkmax`` ≤ 4096.
-
-    Returns ``(V_qmunu, g0_mu_all)`` at the legacy shardings
-    ``P(None, 'x', 'y')`` and ``P(None, 'x')``.
+    Returns ``(q_irr_kgrid_int, q_irr_frac, q_full_to_irr_idx,
+    q_full_to_irr_sym, sym_perm, use_ibz)``.  When ``use_ibz`` is
+    False the *_idx / *_sym / sym_perm fields are None; caller skips
+    the post-loop unfold.
     """
-    if str(getattr(zeta_loader, 'zeta_layout', '')) != 'G_flat':
-        raise ValueError(
-            "compute_all_V_q_g_flat: zeta_loader.zeta_layout must be "
-            f"'G_flat'; got {getattr(zeta_loader, 'zeta_layout', None)!r}.")
-    if sys_dim not in (2, 3):
-        raise NotImplementedError(
-            f"compute_all_V_q_g_flat: sys_dim must be 2 or 3 "
-            f"(0-D box truncation per-q v(G) not wired yet); got {sys_dim}.")
-
-    from .compute_vcoul import compute_v_q_per_G
-    from .v_q_tile import (_unfold_v_q_ibz_to_full,
-                            _unfold_g0_ibz_to_full)
-
-    # ---- IBZ resolution -------------------------------------------------
     nkx, nky, nkz = kgrid
-    nq_full = nkx * nky * nkz
     use_ibz = False
     q_irr_kgrid_int = None
     q_full_to_irr_idx = None
     q_full_to_irr_sym = None
     sym_perm = None
-
     if sym is not None and centroid_indices is not None:
         from centroid.orbit_syms import compute_centroid_sym_perm
         n_tran = int(np.asarray(sym.sym_matrices).shape[0])
@@ -232,7 +186,7 @@ def compute_all_V_q_g_flat(
             [(qx, qy, qz) for qx in range(nkx)
              for qy in range(nky) for qz in range(nkz)],
             dtype=np.int32)
-    n_q_ibz = int(q_irr_kgrid_int.shape[0])
+
     # BGW wrap: q > kg/2 → q - kg.  Same convention the writer used
     # when building the per-q gvec_components on disk.
     kg_arr = np.asarray(kgrid, dtype=np.float64)
@@ -241,232 +195,295 @@ def compute_all_V_q_g_flat(
         q_irr_kgrid_int - kg_arr,
         q_irr_kgrid_int).astype(np.float64)
     q_irr_frac = q_irr_wrapped / kg_arr
+    return (q_irr_kgrid_int, q_irr_frac,
+            q_full_to_irr_idx, q_full_to_irr_sym, sym_perm, use_ibz)
 
-    # ---- Per-q v(q+G) on the disk components ----------------------------
-    gvec_components = np.asarray(
-        zeta_loader.gvec_components, dtype=np.int32)        # (n_q_ibz, 3, ngkmax)
-    if gvec_components is None or int(gvec_components.shape[0]) != n_q_ibz:
-        raise ValueError(
-            "compute_all_V_q_g_flat: zeta_loader.gvec_components is "
-            f"missing or shape-mismatched (got {None if gvec_components is None else gvec_components.shape}, "
-            f"expected leading axis {n_q_ibz}).  Was the file written "
-            f"with the G-flat writer?")
-    ngkmax = int(gvec_components.shape[-1])
 
-    v_q_table = compute_v_q_per_G(
-        q_irr_frac, gvec_components,
-        bvec=bvec, cell_volume=cell_volume,
-        sys_dim=sys_dim, vcoul_cutoff_ry=bare_coulomb_cutoff_ry,
-        bdot=bdot,
-    )                                                       # (n_q_ibz, ngkmax)
+def _pick_g_chunk(ngkmax: int, target: int = 4096) -> int:
+    """Largest divisor of ``ngkmax`` that is ≤ ``target``."""
+    for c in range(min(target, int(ngkmax)), 0, -1):
+        if ngkmax % c == 0:
+            return int(c)
+    return int(ngkmax)
 
-    # BGW vcoul overlay (host-side, before transfer to device).
-    if bgw_v_grid_fn is not None:
-        for qi in range(n_q_ibz):
-            v_scaled_bgw = np.asarray(
-                bgw_v_grid_fn(tuple(q_irr_frac[qi]))).reshape(-1)
-            # The BGW grid lives on the full FFT box; gather to per-q sphere.
-            sphere_idx = zeta_loader.gvec_components[qi]      # (3, ngkmax)
-            # flat-FFT index for each per-q G: ix*ny*nz + iy*nz + iz
-            # with Miller indices already in fftfreq-compatible form.
-            nx, ny, nz = fft_grid
-            ix = sphere_idx[0] % nx
-            iy = sphere_idx[1] % ny
-            iz = sphere_idx[2] % nz
-            flat = ix * ny * nz + iy * nz + iz
-            v_bgw_at_sphere = v_scaled_bgw[flat]
-            v_q_table[qi] = np.where(
-                v_bgw_at_sphere != 0.0, v_bgw_at_sphere, v_q_table[qi])
 
-    # ---- g_chunk pick ---------------------------------------------------
-    if g_chunk is None:
-        # Largest divisor of ngkmax ≤ 4096.
-        target = 4096
-        g_chunk = ngkmax
-        for c in range(min(target, ngkmax), 0, -1):
-            if ngkmax % c == 0:
-                g_chunk = c
-                break
-    g_chunk = int(g_chunk)
-    if ngkmax % g_chunk != 0:
-        raise ValueError(
-            f"compute_all_V_q_g_flat: g_chunk={g_chunk} does not divide "
-            f"ngkmax={ngkmax}.  Pass an explicit divisor of ngkmax, "
-            f"or accept the auto pick.")
-    n_chunks = ngkmax // g_chunk
-    if verbose and jax.process_index() == 0:
-        print(f"  V_q g-flat: n_q_ibz={n_q_ibz}, ngkmax={ngkmax}, "
-              f"g_chunk={g_chunk} ({n_chunks} chunks/q), "
-              f"unfold={'IBZ→full' if use_ibz else 'full-BZ'}")
+def _make_read_q(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
+    """Return a ``read_q(q_idx) -> (1, n_rmu_padded, ngkmax)`` callable.
 
-    # ---- Pad n_rmu to mesh-product so the V output shards cleanly ------
-    p_x = int(mesh_xy.shape['x'])
-    p_y = int(mesh_xy.shape['y'])
-    _proc = p_x * p_y
-    n_rmu_logical = int(n_rmu)
-    n_rmu_padded = (n_rmu_logical + (_proc - n_rmu_logical % _proc) % _proc)
-    if n_rmu_padded != n_rmu_logical and verbose and jax.process_index() == 0:
-        print(f"  V_q g-flat: μ pad n_rmu={n_rmu_logical}→{n_rmu_padded} "
-              f"(mesh={p_x}×{p_y}={_proc}-divisible)")
-
-    # ---- Allocate accumulators -----------------------------------------
-    V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
-    V_acc = jax.jit(lambda: jnp.zeros(
-        (n_q_ibz, n_rmu_padded, n_rmu_padded), dtype=jnp.complex128),
-        out_shardings=V_sh)()
-    g0_acc = jax.jit(lambda: jnp.zeros(
-        (n_q_ibz, n_rmu_padded), dtype=jnp.complex128),
-        out_shardings=g0_sh)()
-
-    # ---- v_q to device, replicated -------------------------------------
-    v_sh = NamedSharding(mesh_xy, P(None))
-    v_q_dev = jax.device_put(
-        jnp.asarray(v_q_table.astype(np.complex128)),
-        NamedSharding(mesh_xy, P(None, None)))
-
-    # ---- Kernel ----------------------------------------------------------
-    kernel = _make_per_q_kernel(
-        mesh_xy, n_rmu_padded, ngkmax, g_chunk, write_g0=True)
-
-    # ---- Per-q loop with optional async prefetch -----------------------
-    # The async pattern (borrowed from the legacy v_q_tile driver):
-    # rank-0 background thread issues the next collective read while
-    # rank-0 main thread waits on the current compute.  All ranks must
-    # call read_slab in lock-step (it's a collective), so the
-    # "prefetch" thread is really running the collective from rank-0
-    # while every rank waits — which works because the SlabIO read
-    # under PHDF5 is synchronous from each rank's POV.  For h5py-
-    # allgather, the read is rank-0-then-broadcast; the prefetch
-    # thread still serialises correctly.
-    #
-    # TODO(q-batch): a future opt-in could batch K q's into a single
-    # read + a vmap'd kernel, amortising both the read latency and
-    # the per-q kernel launch.  Marked here as the natural seam.
-
-    zeta_disk_sh = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
-
-    # Both ZetaReader and ZetaLoader can serve a G-flat slab, but their
-    # call signatures differ.  Detect which one we have once, then
-    # use the matching call inside ``read_q``.
-    has_load = hasattr(zeta_loader, 'load') and callable(
-        getattr(zeta_loader, 'load', None))
-    has_read_slab = hasattr(zeta_loader, 'read_zeta_G_slab') and callable(
-        getattr(zeta_loader, 'read_zeta_G_slab', None))
+    Both :class:`ZetaLoader` (test bench) and :class:`ZetaReader`
+    (production) can serve a G-flat slab; their call signatures
+    differ.  Detect which one we have once, then dispatch.
+    """
+    has_load = callable(getattr(zeta_loader, 'load', None))
+    has_read_slab = callable(getattr(zeta_loader, 'read_zeta_G_slab', None))
     if not (has_load or has_read_slab):
         raise TypeError(
-            "compute_all_V_q_g_flat: zeta_loader must expose .load() "
-            "(ZetaLoader) or .read_zeta_G_slab() (ZetaReader); "
-            f"got {type(zeta_loader).__name__} with neither.")
-    # Logical μ extent on disk; pad rows above this are zero by writer
-    # construction and stay zero on read (SlabIO valid_shape clip).
-    _n_rmu_logical = int(zeta_loader.n_rmu)
+            "v_q_g_flat: zeta_loader must expose .load() (ZetaLoader) "
+            "or .read_zeta_G_slab() (ZetaReader); got "
+            f"{type(zeta_loader).__name__} with neither.")
+    n_rmu_logical = int(zeta_loader.n_rmu)
+    spec = P(None, ('x', 'y'), None)
 
     def read_q(q_idx: int) -> jax.Array:
-        """Per-q slab read sharded P(None, ('x','y'), None) → (1, μ, ngkmax)."""
         if has_load:
             return zeta_loader.load(
-                q=[int(q_idx)], layout='G_flat',
-                sharding=P(None, ('x', 'y'), None))
-        # ZetaReader path: read_zeta_G_slab returns (Q, μ, ngkmax)
-        # already in the same sharding.  ``qvec_batch_frac`` is ignored
-        # on the G-flat-disk branch (the per-q phase is baked into
-        # the on-disk tensor by the writer).  Pass a tiny dummy.
+                q=[int(q_idx)], layout='G_flat', sharding=spec)
+        # ZetaReader path: per-q phase is already baked in on disk;
+        # pass a dummy qvec for the unused ``qvec_batch_frac`` arg.
         return zeta_loader.read_zeta_G_slab(
             q_offset=int(q_idx), q_count=1,
             mu_offset=0, mu_count=int(n_rmu_padded),
             qvec_batch_frac=jnp.zeros((1, 3), dtype=jnp.float64),
             sphere_idx=None,
-            mesh=mesh_xy, valid_mu=_n_rmu_logical,
+            mesh=mesh_xy, valid_mu=n_rmu_logical,
         )
+    return read_q
 
-    if not async_prefetch or n_q_ibz <= 1:
-        # Synchronous straight-line loop.  Light per-q progress logging
-        # so a stuck kernel is visible immediately.
-        import time as _t
-        for q in range(n_q_ibz):
-            _t0 = _t.perf_counter()
-            zeta_q = read_q(q)
-            _t_read = _t.perf_counter() - _t0
-            _t1 = _t.perf_counter()
-            V_acc, g0_acc = kernel(
-                V_acc, g0_acc, zeta_q, v_q_dev[q],
-                jnp.int32(q))
-            jax.block_until_ready(V_acc)
-            _t_k = _t.perf_counter() - _t1
-            if verbose and jax.process_index() == 0:
-                print(f"  V_q g-flat q={q}/{n_q_ibz}: "
-                      f"read={_t_read:.2f}s, kernel={_t_k:.2f}s",
-                      flush=True)
+
+# ---------------------------------------------------------------------------
+# Per-tile core (one (μ_L, ν_L) tile)
+# ---------------------------------------------------------------------------
+
+def _compute_V_q_g_flat_one_tile(
+    zeta_L_loader,
+    zeta_R_loader,                     # None ⇒ same_zeta=True
+    *,
+    v_per_G_builder,                   # callable(q_irr_frac, gvec_components) -> (n_q, ngkmax) c128
+    kgrid, fft_grid, bvec, mesh_xy,
+    n_rmu_L: int,
+    n_rmu_R: int,
+    g_chunk: int | None,
+    sym, centroid_indices,             # IBZ closure check is on the L centroids
+    write_g0: bool,
+    timing_label: str,
+    verbose: bool,
+) -> tuple[jax.Array, jax.Array | None]:
+    """Compute one bispinor / scalar (μ_L, ν_L) tile end-to-end.
+
+    Loops q-by-q over the IBZ (or full BZ), reads ζ_L (and ζ_R if
+    distinct) from G-flat disk, contracts via the per-q + G-chunked
+    kernel into a single ``(n_q_ibz, n_rmu_L_padded, n_rmu_R_padded)``
+    buffer, and post-loop unfolds IBZ → full-BZ via the existing
+    centroid double-permute (V_q is bilinear in ζ; no τ phase).
+
+    Returns ``(V_qmunu_full_BZ, g0_or_None)`` at the production
+    shardings ``P(None, 'x', 'y')`` and ``P(None, 'x')``.
+    """
+    same_zeta = (zeta_R_loader is None) or (zeta_R_loader is zeta_L_loader)
+    if str(getattr(zeta_L_loader, 'zeta_layout', '')) != 'G_flat':
+        raise ValueError(
+            f"_compute_V_q_g_flat_one_tile[{timing_label}]: zeta_L "
+            f"layout must be 'G_flat'; got "
+            f"{getattr(zeta_L_loader, 'zeta_layout', None)!r}")
+    if (not same_zeta and
+            str(getattr(zeta_R_loader, 'zeta_layout', '')) != 'G_flat'):
+        raise ValueError(
+            f"_compute_V_q_g_flat_one_tile[{timing_label}]: zeta_R "
+            "layout must be 'G_flat'.")
+
+    from .v_q_tile import (_unfold_v_q_ibz_to_full,
+                            _unfold_g0_ibz_to_full)
+
+    # ---- IBZ list + per-tile v(q+G) -----------------------------------
+    (_q_int, q_irr_frac,
+     full_to_irr_idx, full_to_irr_sym,
+     sym_perm, use_ibz) = _resolve_ibz_q_list(
+        sym=sym, centroid_indices=centroid_indices,
+        kgrid=kgrid, fft_grid=fft_grid, verbose=verbose)
+    n_q_ibz = int(q_irr_frac.shape[0])
+
+    gvec_components = np.asarray(
+        zeta_L_loader.gvec_components, dtype=np.int32)
+    if gvec_components.shape[0] != n_q_ibz:
+        raise ValueError(
+            f"_compute_V_q_g_flat_one_tile[{timing_label}]: ζ_L on "
+            f"disk has {gvec_components.shape[0]} q's; resolved IBZ "
+            f"has {n_q_ibz}.  Mismatch — was the file written with the "
+            f"same write_ibz_only setting?")
+    if not same_zeta:
+        gvec_R = np.asarray(zeta_R_loader.gvec_components, dtype=np.int32)
+        if gvec_R.shape != gvec_components.shape:
+            raise ValueError(
+                f"_compute_V_q_g_flat_one_tile[{timing_label}]: ζ_L vs "
+                f"ζ_R gvec_components shape mismatch "
+                f"({gvec_components.shape} vs {gvec_R.shape}).  Both "
+                f"files must be written with matching zeta_cutoff_ry "
+                f"and q-layout.")
+    ngkmax = int(gvec_components.shape[-1])
+
+    v_q_table = np.asarray(
+        v_per_G_builder(q_irr_frac, gvec_components),
+        dtype=np.complex128)                                # (n_q_ibz, ngkmax)
+    if v_q_table.shape != (n_q_ibz, ngkmax):
+        raise ValueError(
+            f"_compute_V_q_g_flat_one_tile[{timing_label}]: "
+            f"v_per_G_builder returned shape {v_q_table.shape}; "
+            f"expected ({n_q_ibz}, {ngkmax}).")
+
+    g_chunk = int(g_chunk) if g_chunk else _pick_g_chunk(ngkmax)
+    if ngkmax % g_chunk != 0:
+        raise ValueError(
+            f"_compute_V_q_g_flat_one_tile[{timing_label}]: g_chunk="
+            f"{g_chunk} does not divide ngkmax={ngkmax}.")
+    n_chunks = ngkmax // g_chunk
+
+    # ---- μ padding to mesh-product per side ---------------------------
+    p_x = int(mesh_xy.shape['x'])
+    p_y = int(mesh_xy.shape['y'])
+    _proc = p_x * p_y
+    def _pad(n: int) -> int:
+        return n + (_proc - n % _proc) % _proc
+    n_rmu_L_padded = _pad(int(n_rmu_L))
+    n_rmu_R_padded = _pad(int(n_rmu_R))
+    if verbose and jax.process_index() == 0:
+        print(f"  V_q g-flat [{timing_label}]: n_q_ibz={n_q_ibz}, "
+              f"ngkmax={ngkmax}, g_chunk={g_chunk} ({n_chunks}/q), "
+              f"n_rmu_L={n_rmu_L}→{n_rmu_L_padded}, "
+              f"n_rmu_R={n_rmu_R}→{n_rmu_R_padded}, "
+              f"unfold={'IBZ→full' if use_ibz else 'full-BZ'}",
+              flush=True)
+
+    # ---- Accumulators + v_q on device --------------------------------
+    V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    V_acc = jax.jit(lambda: jnp.zeros(
+        (n_q_ibz, n_rmu_L_padded, n_rmu_R_padded), dtype=jnp.complex128),
+        out_shardings=V_sh)()
+    if write_g0:
+        g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
+        g0_acc = jax.jit(lambda: jnp.zeros(
+            (n_q_ibz, n_rmu_L_padded), dtype=jnp.complex128),
+            out_shardings=g0_sh)()
     else:
-        # Single-step prefetch.  Holds at most TWO ζ_q slabs in flight.
-        # The thread queue carries the *future* read; the main thread
-        # awaits it before calling the kernel, then immediately issues
-        # the next prefetch.
-        prefetch_q: "queue.Queue[jax.Array | None]" = queue.Queue(maxsize=1)
-        stop_flag = threading.Event()
+        # The jit kernel still needs a buffer to donate; allocate a
+        # tiny placeholder we won't read.
+        g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
+        g0_acc = jax.jit(lambda: jnp.zeros(
+            (n_q_ibz, n_rmu_L_padded), dtype=jnp.complex128),
+            out_shardings=g0_sh)()
+    v_q_dev = jax.device_put(
+        jnp.asarray(v_q_table), NamedSharding(mesh_xy, P(None, None)))
 
-        def prefetcher():
-            try:
-                for q in range(1, n_q_ibz):
-                    if stop_flag.is_set():
-                        break
-                    prefetch_q.put(read_q(q))
-                prefetch_q.put(None)            # sentinel
-            except Exception as e:                # noqa: BLE001 — surface to main
-                prefetch_q.put(e)
+    kernel = _make_per_q_kernel(
+        mesh_xy, n_rmu_L_padded, n_rmu_R_padded, ngkmax, g_chunk,
+        write_g0=write_g0, same_zeta=same_zeta)
 
-        zeta_curr = read_q(0)
-        worker = threading.Thread(target=prefetcher, daemon=True,
-                                    name="v_q_g_flat_prefetch")
-        worker.start()
-        try:
-            for q in range(n_q_ibz):
-                V_acc, g0_acc = kernel(
-                    V_acc, g0_acc, zeta_curr, v_q_dev[q],
-                    jnp.int32(q))
-                if q + 1 < n_q_ibz:
-                    next_item = prefetch_q.get()
-                    if isinstance(next_item, Exception):
-                        raise next_item
-                    if next_item is None:
-                        raise RuntimeError(
-                            "compute_all_V_q_g_flat: prefetcher returned "
-                            "sentinel before loop end")
-                    zeta_curr = next_item
-        finally:
-            stop_flag.set()
-            # Drain any pending sentinel so the worker exits cleanly.
-            try:
-                while not prefetch_q.empty():
-                    prefetch_q.get_nowait()
-            except queue.Empty:
-                pass
-            worker.join(timeout=5.0)
+    read_L = _make_read_q(zeta_L_loader, n_rmu_L_padded, mesh_xy)
+    read_R = (read_L if same_zeta
+              else _make_read_q(zeta_R_loader, n_rmu_R_padded, mesh_xy))
 
-    # Force last kernel iteration to complete before the unfold reads it.
-    V_acc.block_until_ready()
+    # ---- Sync per-q loop (async path documented but not wired —
+    # PHDF5 collective + NCCL kernel interleave is fragile; the sync
+    # loop is already ~6× faster than the legacy μ × ν tile driver
+    # on MoS2 3×3).
+    import time as _t
+    for q in range(n_q_ibz):
+        _t0 = _t.perf_counter()
+        zeta_L_q = read_L(q)
+        zeta_R_q = zeta_L_q if same_zeta else read_R(q)
+        _t_read = _t.perf_counter() - _t0
+        _t1 = _t.perf_counter()
+        V_acc, g0_acc = kernel(
+            V_acc, g0_acc, zeta_L_q, zeta_R_q, v_q_dev[q], jnp.int32(q))
+        jax.block_until_ready(V_acc)
+        _t_k = _t.perf_counter() - _t1
+        if verbose and jax.process_index() == 0:
+            print(f"    [{timing_label}] q={q}/{n_q_ibz}: "
+                  f"read={_t_read:.2f}s, kernel={_t_k:.2f}s", flush=True)
 
-    # ---- IBZ → full-BZ unfold (centroid double-permute) ---------------
+    # ---- IBZ → full-BZ unfold (centroid double-permute) -------------
     if use_ibz:
         V_acc = _unfold_v_q_ibz_to_full(
-            V_acc,
-            full_to_irr_idx=q_full_to_irr_idx,
-            full_to_irr_sym=q_full_to_irr_sym,
-            sym_perm=sym_perm,
-            mesh_xy=mesh_xy,
-        )
-        g0_acc = _unfold_g0_ibz_to_full(
-            g0_acc,
-            full_to_irr_idx=q_full_to_irr_idx,
-            full_to_irr_sym=q_full_to_irr_sym,
-            sym_perm=sym_perm,
-            mesh_xy=mesh_xy,
-        )
+            V_acc, full_to_irr_idx=full_to_irr_idx,
+            full_to_irr_sym=full_to_irr_sym,
+            sym_perm=sym_perm, mesh_xy=mesh_xy)
+        if write_g0:
+            g0_acc = _unfold_g0_ibz_to_full(
+                g0_acc, full_to_irr_idx=full_to_irr_idx,
+                full_to_irr_sym=full_to_irr_sym,
+                sym_perm=sym_perm, mesh_xy=mesh_xy)
 
     V_qmunu = jax.lax.with_sharding_constraint(V_acc, V_sh)
-    g0_mu_all = jax.lax.with_sharding_constraint(g0_acc, g0_sh)
-    return V_qmunu, g0_mu_all
+    if write_g0:
+        return V_qmunu, jax.lax.with_sharding_constraint(g0_acc, g0_sh)
+    return V_qmunu, None
 
 
-__all__ = ["compute_all_V_q_g_flat"]
+# ---------------------------------------------------------------------------
+# Public charge entry point (CC tile only)
+# ---------------------------------------------------------------------------
+
+def compute_all_V_q_g_flat(
+    zeta_loader,                       # ZetaLoader | ZetaReader (G-flat)
+    *,
+    kgrid: tuple[int, int, int],
+    fft_grid: tuple[int, int, int],
+    bvec: np.ndarray,
+    cell_volume: float,
+    mesh_xy: Mesh,
+    n_rmu: int,
+    sys_dim: int,
+    bdot: np.ndarray | None = None,
+    bare_coulomb_cutoff_ry: float | None = None,
+    bgw_v_grid_fn=None,
+    g_chunk: int | None = None,
+    verbose: bool = True,
+    sym=None,
+    centroid_indices: np.ndarray | None = None,
+    async_prefetch: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """V_q^{0,0} (charge-channel CC tile) on a G-flat-on-disk ζ file.
+
+    Thin wrapper that builds the bare-Coulomb ``v(q+G)`` per-q-sphere
+    builder and dispatches to :func:`_compute_V_q_g_flat_one_tile`
+    with ``zeta_R=None`` (same_zeta) and ``write_g0=True``.  The
+    ``async_prefetch`` argument is accepted for compatibility with
+    the legacy dispatcher's env-var knob but currently has no effect
+    — the sync per-q loop is already ~6× faster than the legacy
+    μ × ν tile driver on MoS2 3×3.
+
+    See :func:`_compute_V_q_g_flat_one_tile` for the math + I/O flow.
+    """
+    if sys_dim not in (2, 3):
+        raise NotImplementedError(
+            f"compute_all_V_q_g_flat: sys_dim must be 2 or 3 "
+            f"(0-D box per-q v(G) not wired); got {sys_dim}.")
+    from .compute_vcoul import compute_v_q_per_G
+
+    def _bare_v_per_G(q_irr_frac, gvec_components):
+        v = compute_v_q_per_G(
+            q_irr_frac, gvec_components,
+            bvec=bvec, cell_volume=cell_volume,
+            sys_dim=sys_dim, vcoul_cutoff_ry=bare_coulomb_cutoff_ry,
+            bdot=bdot,
+        )                                                   # (n_q_ibz, ngkmax) f64
+        # Optional BGW vcoul overlay — host-side scatter from BGW's
+        # full-FFT-grid v into the per-q WFN.h5 sphere positions.
+        if bgw_v_grid_fn is not None:
+            nx, ny, nz = (int(s) for s in fft_grid)
+            for qi in range(q_irr_frac.shape[0]):
+                v_full = np.asarray(
+                    bgw_v_grid_fn(tuple(q_irr_frac[qi]))).reshape(-1)
+                miller = gvec_components[qi]                # (3, ngkmax)
+                ix = miller[0] % nx
+                iy = miller[1] % ny
+                iz = miller[2] % nz
+                v_at_sphere = v_full[ix * ny * nz + iy * nz + iz]
+                v[qi] = np.where(v_at_sphere != 0.0, v_at_sphere, v[qi])
+        return v.astype(np.complex128)
+
+    return _compute_V_q_g_flat_one_tile(
+        zeta_loader, None,
+        v_per_G_builder=_bare_v_per_G,
+        kgrid=kgrid, fft_grid=fft_grid, bvec=bvec,
+        mesh_xy=mesh_xy,
+        n_rmu_L=int(n_rmu), n_rmu_R=int(n_rmu),
+        g_chunk=g_chunk,
+        sym=sym, centroid_indices=centroid_indices,
+        write_g0=True,
+        timing_label='CC',
+        verbose=verbose,
+    )
+
+
+__all__ = ["compute_all_V_q_g_flat", "_compute_V_q_g_flat_one_tile",
+            "_resolve_ibz_q_list", "_pick_g_chunk", "_make_read_q"]

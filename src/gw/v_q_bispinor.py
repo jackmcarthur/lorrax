@@ -175,6 +175,68 @@ def _make_v_per_G_for_tile(
 
 
 # ---------------------------------------------------------------------------
+# Per-tile v(q+G) builder for the G-flat path
+# ---------------------------------------------------------------------------
+#
+# Returns a ``v_per_G_builder(q_irr_frac, gvec_components) -> (n_q, ngkmax)``
+# closure that ``_compute_V_q_g_flat_one_tile`` consumes.  Math is the same
+# as ``_make_v_per_G_for_tile`` (legacy shared-sphere); the difference is
+# the per-q sphere comes from the writer's ``gvec_components`` table.
+
+def _make_per_q_v_builder_for_tile(
+    *,
+    mu_L: int, nu_L: int,
+    bvec: np.ndarray, cell_volume: float, sys_dim: int,
+    vcoul_cutoff_ry: float | None,
+    bdot: np.ndarray | None = None,
+    eps_K2: float = 1e-30,
+):
+    """Return ``builder(q_irr_frac, gvec_components) → (n_q, ngkmax) c128``.
+
+    CC tile (μ_L=ν_L=0): bare Coulomb ``v(q+G)`` (real, ≥0).
+    TT diagonal (i=j): ``v(q+G) · (1 − K̂_i²)``.
+    TT off-diagonal (i≠j): ``v(q+G) · (−K̂_i K̂_j)``.
+
+    The ``K̂`` factor uses ``K2_safe = max(|q+G|², eps_K2)`` to keep
+    the per-q-Γ slot finite; at K=0 the bare ``v`` is already zero
+    (compute_v_q_per_G guards ``denom_zero``), so the product is zero
+    regardless of t.  Head correction at q=Γ flows through the CC
+    tile's ``g0_acc``; transverse tiles intentionally omit it.
+    """
+    from .compute_vcoul import compute_v_q_per_G
+
+    is_CC = (mu_L == 0 and nu_L == 0)
+    if not is_CC:
+        if not (1 <= mu_L <= 3 and 1 <= nu_L <= 3):
+            raise ValueError(
+                f"_make_per_q_v_builder_for_tile: TT tile indices must "
+                f"satisfy 1 ≤ μ_L, ν_L ≤ 3; got ({mu_L}, {nu_L}).")
+        i, j = mu_L - 1, nu_L - 1
+    bvec_f = np.asarray(bvec, dtype=np.float64)
+
+    def builder(q_irr_frac, gvec_components):
+        v = compute_v_q_per_G(
+            q_irr_frac, gvec_components,
+            bvec=bvec_f, cell_volume=cell_volume,
+            sys_dim=sys_dim, vcoul_cutoff_ry=vcoul_cutoff_ry,
+            bdot=bdot,
+        )                                                # (n_q, ngkmax) f64
+        if is_CC:
+            return v.astype(np.complex128)
+        # K_cart[q, a, g] = sum_b bvec[b, a] · (q + G)[q, b, g]
+        qG_frac = (q_irr_frac[:, :, None]
+                    + np.asarray(gvec_components, dtype=np.float64))
+        K_cart = np.einsum('ba,qbg->qag', bvec_f, qG_frac)
+        K2 = np.sum(K_cart * K_cart, axis=1)             # (n_q, ngkmax)
+        K2_safe = np.where(K2 > eps_K2, K2, 1.0)
+        Khat_ij = K_cart[:, i] * K_cart[:, j] / K2_safe
+        t = (1.0 - Khat_ij) if i == j else -Khat_ij
+        return (v * t).astype(np.complex128)
+
+    return builder
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -410,6 +472,173 @@ def compute_V_q_bispinor_to_h5(
     except Exception:
         pass
 
+    return output_h5_path
+
+
+# ---------------------------------------------------------------------------
+# G-flat bispinor orchestrator
+# ---------------------------------------------------------------------------
+
+def compute_V_q_bispinor_g_flat_to_h5(
+    *,
+    zeta_C_loader,                              # ZetaReader/Loader, charge ζ (G-flat)
+    zeta_T_loaders: tuple,                      # length-3 ZetaReader/Loader, μ_L=1,2,3 (G-flat)
+    output_h5_path: Path | str,
+    mesh_xy: Mesh,
+    kgrid: tuple[int, int, int],
+    fft_grid: tuple[int, int, int],
+    bvec: np.ndarray,
+    cell_volume: float,
+    sys_dim: int,
+    n_rmu_C: int,
+    n_rmu_T: int,
+    bare_coulomb_cutoff_ry: float | None = None,
+    bdot: np.ndarray | None = None,
+    g_chunk: int | None = None,
+    bgw_v_grid_fn=None,                         # only meaningful for the CC tile
+    backend=None,
+    use_ffi_io: bool | None = None,
+    print_fn=print,
+    verbose: bool = True,
+) -> Path:
+    """Stream the 7 unique bispinor V_q^{μ_L, ν_L} tiles to HDF5 via the
+    G-flat per-q + G-chunked path.
+
+    Each tile shares the same orchestration as the scalar charge V_q —
+    one q at a time, one per-tile ``v(q+G)`` table, contract via the
+    G-chunked kernel into ``(n_q_full, n_rmu_L, n_rmu_R)``, write the
+    tile, free the buffer.  Sharing comes from
+    :func:`gw.v_q_g_flat._compute_V_q_g_flat_one_tile`; this function
+    is just the 7-tile loop + per-tile HDF5 plumbing.
+
+    Bispinor ζ files are written full-BZ (see ``gw_init.fit_zeta``
+    `write_ibz_only=False` for the transverse μ_L=1..3 channels and
+    charge under ``cfg.bispinor=True``), so we don't pass ``sym`` /
+    ``centroid_indices``; the helper iterates the full BZ.
+
+    On-disk layout matches :func:`compute_V_q_bispinor_to_h5`
+    (legacy) — the reader :class:`BispinorVqReader` opens both
+    formats interchangeably.
+    """
+    from file_io.slab_io import SlabIO
+    import h5py
+    import json
+    from .v_q_g_flat import _compute_V_q_g_flat_one_tile
+
+    output_h5_path = Path(output_h5_path)
+    if len(zeta_T_loaders) != 3:
+        raise ValueError(
+            f"zeta_T_loaders must be length 3 (μ_L=1,2,3); "
+            f"got {len(zeta_T_loaders)}.")
+    nq_total = int(np.prod(kgrid))
+
+    # File creation + metadata (rank-0 + collective sync via SlabIO).
+    with SlabIO(output_h5_path, mode="w", mesh=mesh_xy,
+                backend=backend, use_ffi_io=use_ffi_io) as io:
+        io.write_attr("kgrid", np.asarray(kgrid, dtype=np.int64))
+        io.write_attr("n_rmu_C", np.int64(n_rmu_C))
+        io.write_attr("n_rmu_T", np.int64(n_rmu_T))
+        io.write_attr("n_q_total", np.int64(nq_total))
+
+    for tile_idx, (mu_L, nu_L) in enumerate(UNIQUE_TILES):
+        same_zeta = (mu_L == nu_L)
+        loader_L = zeta_C_loader if mu_L == 0 else zeta_T_loaders[mu_L - 1]
+        loader_R = (None if same_zeta
+                    else (zeta_C_loader if nu_L == 0
+                           else zeta_T_loaders[nu_L - 1]))
+        n_rmu_L = n_rmu_C if mu_L == 0 else n_rmu_T
+        n_rmu_R = n_rmu_C if nu_L == 0 else n_rmu_T
+        write_g0 = (mu_L == 0 and nu_L == 0)
+
+        v_builder = _make_per_q_v_builder_for_tile(
+            mu_L=mu_L, nu_L=nu_L,
+            bvec=bvec, cell_volume=cell_volume, sys_dim=sys_dim,
+            vcoul_cutoff_ry=bare_coulomb_cutoff_ry, bdot=bdot,
+        )
+        # BGW vcoul overlay only meaningful on the CC tile; transverse
+        # tiles are pure projector applications.  Wrap the builder.
+        if write_g0 and bgw_v_grid_fn is not None:
+            _base = v_builder
+            nx, ny, nz = (int(s) for s in fft_grid)
+
+            def _v_builder_with_bgw(q_irr_frac, gvec_components,
+                                     _base=_base, nx=nx, ny=ny, nz=nz):
+                v = np.asarray(_base(q_irr_frac, gvec_components))
+                for qi in range(q_irr_frac.shape[0]):
+                    v_full = np.asarray(
+                        bgw_v_grid_fn(tuple(q_irr_frac[qi]))).reshape(-1)
+                    miller = gvec_components[qi]
+                    flat = ((miller[0] % nx) * ny * nz
+                              + (miller[1] % ny) * nz
+                              + (miller[2] % nz))
+                    v_at = v_full[flat]
+                    v[qi] = np.where(v_at != 0.0, v_at, v[qi])
+                return v
+            v_builder = _v_builder_with_bgw
+
+        if verbose and jax.process_index() == 0:
+            print_fn(f"  [bispinor g-flat] tile "
+                     f"{tile_idx + 1}/{len(UNIQUE_TILES)} "
+                     f"(μ_L={mu_L}, ν_L={nu_L})  n_rmu_L={n_rmu_L} "
+                     f"n_rmu_R={n_rmu_R}  same_zeta={same_zeta}")
+
+        V_acc, g0_acc = _compute_V_q_g_flat_one_tile(
+            loader_L, loader_R,
+            v_per_G_builder=v_builder,
+            kgrid=kgrid, fft_grid=fft_grid, bvec=bvec,
+            mesh_xy=mesh_xy,
+            n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R,
+            g_chunk=g_chunk,
+            sym=None, centroid_indices=None,           # full-BZ on disk
+            write_g0=write_g0,
+            timing_label=tile_dataset_name(mu_L, nu_L),
+            verbose=verbose,
+        )
+
+        # Stream this tile to disk at logical extent; padded μ trail
+        # rows are zero by writer construction and SlabIO's
+        # ``valid_shape=`` clips them on write so files round-trip
+        # across process counts regardless of internal padding.
+        name = tile_dataset_name(mu_L, nu_L)
+        v_padded_shape = tuple(int(s) for s in V_acc.shape)
+        v_logical_shape = (int(v_padded_shape[0]), n_rmu_L, n_rmu_R)
+        with SlabIO(output_h5_path, mode='a', mesh=mesh_xy,
+                    backend=backend, use_ffi_io=use_ffi_io) as tile_io:
+            tile_io.create_dataset(
+                name, shape=v_logical_shape, dtype=V_acc.dtype)
+            tile_io.write_slab(
+                name, V_acc,
+                global_shape=v_logical_shape,
+                valid_shape=v_logical_shape)
+            if write_g0 and g0_acc is not None:
+                g0_padded_shape = tuple(int(s) for s in g0_acc.shape)
+                g0_logical_shape = (int(g0_padded_shape[0]), n_rmu_L)
+                tile_io.create_dataset(
+                    f"{name}_g0", shape=g0_logical_shape,
+                    dtype=g0_acc.dtype)
+                tile_io.write_slab(
+                    f"{name}_g0", g0_acc,
+                    global_shape=g0_logical_shape,
+                    valid_shape=g0_logical_shape)
+        del V_acc, g0_acc
+
+    # Format string + tile-layout JSON — rank-0 post-close write so
+    # the BispinorVqReader can h5-open without rank coordination.
+    if jax.process_index() == 0:
+        with h5py.File(output_h5_path, "a") as f:
+            f.create_dataset("v_qmunu_format",
+                             data=np.bytes_(V_QMUNU_FORMAT))
+            f.attrs["unique_tiles"] = json.dumps(
+                [list(t) for t in UNIQUE_TILES])
+            f.attrs["zero_tiles"] = json.dumps(
+                [list(t) for t in sorted(ZERO_TILES)])
+            f.attrs["hermitian_pairs"] = json.dumps(
+                [[list(k), list(v)] for k, v in HERMITIAN_PAIRS.items()])
+    try:
+        from jax.experimental import multihost_utils as _mh
+        _mh.sync_global_devices("v_q_bispinor_g_flat_tile_layout_meta")
+    except Exception:
+        pass
     return output_h5_path
 
 
