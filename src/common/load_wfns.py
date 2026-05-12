@@ -723,17 +723,14 @@ def load_centroids_band_chunked(
         np.asarray(sym_loader.kvecs_asints, dtype=np.float64)
         / kgrid_arr[None, :])
 
-    # TODO(perf, scale-only): real async-IO via a dedicated reader thread
-    # + ``queue.Queue`` (mirror of the ``_slab_io_ffi._dispatch_loop``
-    # write-side pattern at file_io/_slab_io_ffi.py:339-410).  The
-    # phdf5 FFI releases the GIL inside ``read_kchunk_union_sharded``,
-    # so a daemon thread can issue ``loader.load(bc+1)`` while the main
-    # thread runs ``to_rmu`` on bc[i].  A naive Python-level reorder
-    # (issue bc[i+1]'s load before touching bc[i]) gives ZERO overlap on
-    # the FFI path — confirmed in xprof: H2D overlap_frac stayed 0.000
-    # — because the FFI call itself blocks per-rank.  At MoS2 3×3 scale
-    # the I/O is sub-100 ms anyway; the thread-based prefetch only pays
-    # off at CrI3-scale runs with many band chunks.
+    # NOTE: an AsyncWfnReader (file_io/wfn_loader.py) is available and
+    # was tried here to pipeline ``loader.load(bc+1)`` against bc[i]'s
+    # ``to_rmu``.  At MoS2 3×3 scale, the GPU H2D/compute overlap
+    # measured by xprof stayed exactly 0.000 even with depth-2
+    # prefetch and forced 3 band chunks — XLA's stream scheduler
+    # doesn't pipeline our H2D against compute here.  Keep the
+    # synchronous path; revisit the async pattern when scale grows
+    # (CrI3) or when the wider zeta/V_q async-reader story lands.
     for bc_idx in range(num_band_chunks):
         bc_start = b_start + bc_idx * band_chunk_size
         bc_end = min(bc_start + band_chunk_size, b_end)
