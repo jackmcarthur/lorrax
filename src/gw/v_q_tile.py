@@ -1487,6 +1487,19 @@ def _unfold_v_q_ibz_to_full(
     V_q_full
         (n_q_full, n_rmu, n_rmu) c128, sharded ``P(None, 'x', 'y')``.
     """
+    # Trivial-IBZ short-circuit. When ntran=1 (e.g. nosym runs) the IBZ is
+    # already the full BZ — full_to_irr_idx is identity, full_to_irr_sym
+    # is all zeros, sym_perm is identity. The take_along_axis path below
+    # is then a no-op but its sharded codegen has been observed to trip
+    # an XLA HLO verifier dtype mismatch (s64 broadcast vs s32 operand
+    # on a 2×2 mesh), so bypass it entirely.
+    idx_np = np.asarray(full_to_irr_idx)
+    sym_np = np.asarray(full_to_irr_sym)
+    if (idx_np.shape[0] == int(V_q_ibz.shape[0])
+            and np.array_equal(idx_np, np.arange(idx_np.shape[0]))
+            and np.all(sym_np == 0)):
+        return V_q_ibz
+
     # Inverse permutation: ``inv_perm[s, π_s(μ)] = μ`` → argsort along μ.
     inv_perm = np.argsort(sym_perm, axis=-1).astype(np.int32)
     inv_perm_j = jnp.asarray(inv_perm)                              # (n_sym, n_rmu)
@@ -1533,6 +1546,14 @@ def _unfold_g0_ibz_to_full(
     Γ phase is exp(0) = 1 anyway).  If a future consumer needs the
     correct phase, set ``include_tau_phase=True``.
     """
+    # Trivial-IBZ short-circuit; see _unfold_v_q_ibz_to_full for details.
+    idx_np = np.asarray(full_to_irr_idx)
+    sym_np = np.asarray(full_to_irr_sym)
+    if (idx_np.shape[0] == int(g0_ibz.shape[0])
+            and np.array_equal(idx_np, np.arange(idx_np.shape[0]))
+            and np.all(sym_np == 0)):
+        return g0_ibz
+
     inv_perm = np.argsort(sym_perm, axis=-1).astype(np.int32)
     inv_perm_j = jnp.asarray(inv_perm)
     idx_j = jnp.asarray(np.asarray(full_to_irr_idx, dtype=np.int32))
