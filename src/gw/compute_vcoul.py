@@ -814,20 +814,40 @@ def compute_all_V_q(
 ) -> tuple[jax.Array, jax.Array]:
     """Compute V_qmunu(q,μ,ν) and g0_μ(q) at q=0 from a sharded ζ HDF5.
 
-    Single dispatcher; routes to :func:`gw.v_q_tile.compute_V_q_tile` for
-    the actual work.  Builds the ``v_per_G_fn`` and ``phase_fn`` closures
-    from ``make_v_munu_chunked_kernel`` so the unified driver only sees
-    geometry-agnostic callables — Coulomb dimensionality (3D/2D/0D) plugs
-    in via the ``sys_dim`` flag here.
+    Dispatcher with two paths:
 
-    Parameters mirror the old API.  ``mu_chunk_size`` / ``q_batch_size`` are
-    kept for back-compat but ignored — the chooser inside the unified
-    driver picks both from ``budget_bytes``.
+    * On-disk ``ζ`` in **G-flat** layout (writer ran with
+      ``LORRAX_WRITE_G_FLAT_ZETA=1``): routes to
+      :func:`gw.v_q_g_flat.compute_all_V_q_g_flat` — per-q, G-chunked
+      contract on the writer's per-q WFN.h5-style sphere.  No FFT,
+      no shared-sphere conversion, no μ × ν tiling; the chooser
+      collapses to "pick g_chunk".
 
-    The IO backend is determined by how ``zeta_io`` was opened (PHDF5/FFI
-    vs h5py-allgather); both paths land ζ in the same sharded layout for
-    the kernel.
+    * On-disk ``ζ`` in **r-space** layout (legacy default): routes to
+      :func:`gw.v_q_tile.compute_V_q_tile` — the older driver that
+      handles FFT + sphere gather + μ × ν tiling inline.  Kept as a
+      fallback while r-space ζ files remain in production use.
+
+    Parameters mirror the old API; ``mu_chunk_size`` / ``q_batch_size``
+    are kept for back-compat with r-space callers but ignored on the
+    G-flat path (where the chooser is essentially trivial).
     """
+    # G-flat dispatch — when the loader carries the new per-q sphere
+    # components, hand off to the rewritten orchestrator.
+    if getattr(zeta_io, 'zeta_layout', None) == 'G_flat':
+        from .v_q_g_flat import compute_all_V_q_g_flat
+        return compute_all_V_q_g_flat(
+            zeta_io,
+            kgrid=kgrid, fft_grid=fft_grid,
+            bvec=bvec, cell_volume=cell_volume,
+            mesh_xy=mesh_xy, n_rmu=n_rmu,
+            sys_dim=sys_dim, bdot=bdot,
+            bare_coulomb_cutoff_ry=bare_coulomb_cutoff,
+            bgw_v_grid_fn=bgw_v_grid_fn,
+            verbose=verbose, sym=sym,
+            centroid_indices=centroid_indices,
+        )
+
     nkx, nky, nkz = kgrid
     nq_full = nkx * nky * nkz
 
