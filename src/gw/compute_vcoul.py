@@ -538,6 +538,257 @@ from .v_q_tile import (
 )
 
 
+# ============================================================================
+# Per-q, G-chunked V_q kernel (consumes G-flat zeta on the per-q sphere)
+# ============================================================================
+#
+# This is the new V_q contraction:
+#
+#     V_q[μ,ν] = Σ_G  conj(ζ̃_q,μ(G)) · v(q+G) · ζ̃_q,ν(G)
+#
+# computed *one q at a time* with the G-axis chunked into Gchunk-sized
+# slices.  Compared with the legacy ``fft_and_weight → contract_block``
+# path (compute_vcoul.py:419-454) it has three properties the user
+# asked for:
+#
+# 1. No FFT-and-gather inside V_q.  ζ̃ comes in already on the per-q
+#    WFN.h5-style sphere produced by ``isdf_fitting.fit_zeta_to_h5``
+#    in G-flat mode — the writer's per-q ``ngk[q]`` G-list is the
+#    contract domain, padded uniformly to ``ngkmax`` with ζ̃ = 0 at
+#    pad slots (so the pad contribution to V_q is exactly zero).
+# 2. Contiguous G access.  Each Gchunk contracts via a single
+#    GEMM-shaped einsum ``'mG,nG->mn'`` on small (n_rmu × G_chunk)
+#    blocks — far better cache behaviour than the legacy whole-sphere
+#    contract at once.
+# 3. Independent of the shared-sphere convention.  No ``sphere_idx``
+#    plumbing; the per-q G-list IS the sphere, and v(q+G) is evaluated
+#    at those Miller indices.
+#
+# Sharding: ``zeta_q_L`` / ``zeta_q_R`` arrive sharded along μ
+# (P('x', None) or product P(('x','y'), None)); ``v_q`` is replicated;
+# the output ``V`` is sharded P('x', 'y').  XLA collapses the per-chunk
+# einsum into one reduction per Gchunk; the trailing accumulator add
+# is in-place under jit (donated).
+#
+# Outer q loop (and the disk reads producing ζ_q from
+# ``ZetaLoader.load(layout='G_flat')``) live in the driver — this
+# kernel is one q.  Q-batching could be re-introduced in a follow-up;
+# the comment in the loop marks the natural seam.
+
+
+@partial(jax.jit, donate_argnums=(0,), static_argnums=(4,))
+def _v_q_per_q_g_chunked_jit(
+    V_acc: jax.Array,            # (n_rmu_L, n_rmu_R) c128 — donated
+    zeta_q_L: jax.Array,         # (n_rmu_L, ngkmax)  c128
+    zeta_q_R: jax.Array,         # (n_rmu_R, ngkmax)  c128
+    v_q: jax.Array,              # (ngkmax,) c128
+    g_chunk: int,                # static
+) -> jax.Array:
+    """Inner kernel: V += conj(ζ_L) · v · ζ_Rᵀ, G-chunked.
+
+    See module-level docstring above for the full math + memory model.
+    """
+    ngkmax = int(zeta_q_L.shape[-1])
+
+    def body(start, V):
+        # jax.lax.dynamic_slice keeps a single compile shape regardless
+        # of where the chunk lands; the trailing chunk is sized to fit
+        # by the outer python loop (no dynamic chunk size).
+        L_chunk = jax.lax.dynamic_slice_in_dim(
+            zeta_q_L, start, g_chunk, axis=-1)        # (n_rmu_L, g_chunk)
+        R_chunk = jax.lax.dynamic_slice_in_dim(
+            zeta_q_R, start, g_chunk, axis=-1)        # (n_rmu_R, g_chunk)
+        v_chunk = jax.lax.dynamic_slice_in_dim(
+            v_q, start, g_chunk, axis=0)              # (g_chunk,)
+        # Pre-multiply v into L (real ≥ 0 for bare Coulomb; signed /
+        # complex for bispinor transverse — both fine).
+        L_weighted = jnp.conj(L_chunk) * v_chunk[None, :]
+        return V + L_weighted @ R_chunk.T            # (n_rmu_L, n_rmu_R)
+
+    # Whole-Gchunk strides (the python caller pads ngkmax to a multiple
+    # of g_chunk via zeta's writer-side pad slots ζ=0, so no remainder
+    # branch is needed inside the jit).
+    n_chunks = ngkmax // g_chunk
+    V = V_acc
+    for i in range(n_chunks):
+        V = body(i * g_chunk, V)
+    return V
+
+
+def compute_v_q_per_q_g_chunked(
+    zeta_q_L: jax.Array,
+    zeta_q_R: jax.Array,
+    v_q: jax.Array,
+    *,
+    g_chunk: int = 4096,
+    V_acc: jax.Array | None = None,
+) -> jax.Array:
+    """V_q[μν] = Σ_G ζ̃*_μ(G) v(G) ζ̃_ν(G) for a single q, G-chunked.
+
+    Parameters
+    ----------
+    zeta_q_L : ``(n_rmu_L, ngkmax)`` c128
+        ζ̃ on the per-q WFN.h5-style sphere (writer's G-flat layout).
+        Pad slots ``j ≥ ngk[q]`` carry ζ̃ = 0 — they contribute zero
+        to the contract regardless of what ``v_q`` does there.
+    zeta_q_R : ``(n_rmu_R, ngkmax)`` c128
+        Right operand.  Pass the same array as ``zeta_q_L`` for the
+        diagonal V^{0,0} case (single-ζ); pass a separate buffer for
+        bispinor off-diagonal tiles V^{μ_L, ν_L}.
+    v_q : ``(ngkmax,)`` c128
+        Per-G Coulomb weight.  Bare Coulomb is real ≥ 0; bispinor
+        transverse projector tiles are signed / complex.  Pad slots
+        are don't-care (ζ̃ = 0 there).
+    g_chunk : int
+        Number of G's per inner contraction.  Caller pads ``ngkmax``
+        up to a multiple of ``g_chunk`` (typical: pad with the
+        WFN.h5 sentinel slot, ζ̃ = 0).  Memory-wise: this kernel's
+        peak intermediate is ``n_rmu_L · g_chunk`` complex128 plus
+        the (n_rmu_L, n_rmu_R) accumulator.  TODO(q-batch): an outer
+        ``vmap`` over a small q-chunk would amortize the kernel's
+        launch overhead; currently the driver runs one q at a time.
+    V_acc : ``(n_rmu_L, n_rmu_R)`` c128 or None
+        Donated accumulator.  Pass ``None`` to allocate a fresh
+        zero-init buffer matching the sharding of ``zeta_q_L`` /
+        ``zeta_q_R`` (P('x', 'y') if both are P(('x','y'), None)).
+
+    Returns
+    -------
+    V : ``(n_rmu_L, n_rmu_R)`` c128
+        ``V_acc + Σ_G  conj(ζ̃_L(G)) · v(G) · ζ̃_R(G)``.
+
+    Sharding & dtype notes
+    ----------------------
+    All inputs are c128.  v_q can be passed as float64 and is cast
+    by the caller before reaching this function.  No internal
+    sharding constraints — the jit inherits the caller's input
+    shardings and emits the matching output sharding.
+    """
+    n_rmu_L = int(zeta_q_L.shape[0])
+    n_rmu_R = int(zeta_q_R.shape[0])
+    ngkmax = int(zeta_q_L.shape[-1])
+    if int(zeta_q_R.shape[-1]) != ngkmax:
+        raise ValueError(
+            f"compute_v_q_per_q_g_chunked: zeta_q_L.ngkmax={ngkmax} ≠ "
+            f"zeta_q_R.ngkmax={int(zeta_q_R.shape[-1])}")
+    if int(v_q.shape[0]) != ngkmax:
+        raise ValueError(
+            f"compute_v_q_per_q_g_chunked: v_q.ngkmax={int(v_q.shape[0])} "
+            f"≠ ζ.ngkmax={ngkmax}")
+    g_chunk = int(g_chunk)
+    if ngkmax % g_chunk != 0:
+        raise ValueError(
+            f"compute_v_q_per_q_g_chunked: ngkmax ({ngkmax}) must be a "
+            f"multiple of g_chunk ({g_chunk}); pad the trailing slots "
+            f"with ζ̃ = 0 to satisfy this (the writer's per-q sentinel "
+            f"pad already does this when ngkmax is chosen by the "
+            f"caller as a multiple of g_chunk).")
+
+    if V_acc is None:
+        V_acc = jnp.zeros(
+            (n_rmu_L, n_rmu_R), dtype=zeta_q_L.dtype)
+    if v_q.dtype != zeta_q_L.dtype:
+        v_q = v_q.astype(zeta_q_L.dtype)
+
+    return _v_q_per_q_g_chunked_jit(V_acc, zeta_q_L, zeta_q_R, v_q, g_chunk)
+
+
+def compute_v_q_per_G(
+    q_irr_frac: np.ndarray,
+    gvec_components: np.ndarray,
+    *,
+    bvec: np.ndarray,
+    cell_volume: float,
+    sys_dim: int,
+    vcoul_cutoff_ry: float | None = None,
+    bdot: np.ndarray | None = None,
+) -> np.ndarray:
+    """Compute ``v(q+G)`` at the per-q WFN.h5-style G-list.
+
+    Mirrors the formula inside ``make_v_munu_chunked_kernel.get_sqrt_v_and_phase``
+    but operates on a per-q ``gvec_components`` table (instead of the
+    full FFT grid) — the writer's ``isdf_header/gvec_components`` is
+    exactly the input the consumer needs.  Returns one ``(ngkmax,)``
+    row of ``v(q+G)`` per q in ``q_irr_frac``.
+
+    Pad slots in ``gvec_components`` (sentinel Miller index
+    ``(-nx/2, -ny/2, -nz/2)``) get whatever ``v`` is at that
+    position — caller need not zero them because the contract uses
+    ζ̃ = 0 at those slots.
+
+    Parameters
+    ----------
+    q_irr_frac : ``(n_q, 3)`` float64
+        Fractional q-vectors in BGW-wrap convention (already divided
+        by kgrid).
+    gvec_components : ``(n_q, 3, ngkmax)`` int32
+        Per-q Miller indices from ``isdf_header.gvec_components``.
+    bvec, cell_volume, sys_dim, vcoul_cutoff_ry, bdot
+        Same conventions as ``make_v_munu_chunked_kernel``.
+        ``vcoul_cutoff_ry`` zeroes ``v`` at G's with |q+G|² past
+        the cutoff (== V_q's bare-Coulomb cutoff; may be < the
+        ζ-sphere cutoff that built ``gvec_components``).
+
+    Returns
+    -------
+    v_q_per_G : ``(n_q, ngkmax)`` float64
+        ``v(q+G)`` evaluated at every (q, G) in the components table.
+
+    Notes
+    -----
+    This is a *host-side* helper — the per-q ``v(q+G)`` is built once
+    at consumer setup and pushed to device.  Not jitted; not sharded.
+    For very large ngkmax this could be vectorised across q on device,
+    but it's a one-shot cost per V_q run.
+    """
+    if sys_dim not in (0, 2, 3):
+        raise NotImplementedError(
+            f"compute_v_q_per_G: sys_dim must be 0 / 2 / 3; got {sys_dim}")
+    q_irr_frac = np.asarray(q_irr_frac, dtype=np.float64).reshape(-1, 3)
+    gvec = np.asarray(gvec_components, dtype=np.float64)         # (n_q, 3, ngkmax)
+    if gvec.ndim != 3 or gvec.shape[1] != 3:
+        raise ValueError(
+            f"gvec_components must be (n_q, 3, ngkmax); got {gvec.shape}")
+    n_q, _, ngkmax = gvec.shape
+    bvec_f = np.asarray(bvec, dtype=np.float64)
+    fact = 1.0 / float(cell_volume)
+
+    if sys_dim == 2:
+        zc = float(np.pi / float(bvec_f[2, 2]))
+    out = np.zeros((n_q, ngkmax), dtype=np.float64)
+
+    for qi in range(n_q):
+        qf = q_irr_frac[qi]
+        # gvec[qi]: (3, ngkmax) -> per-G Miller; (q + G) in fractional.
+        qG_frac = qf[:, None] + gvec[qi]                          # (3, ngkmax)
+        qG_cart = bvec_f.T @ qG_frac                              # (3, ngkmax)
+        denom = np.sum(qG_cart * qG_cart, axis=0)                 # (ngkmax,)
+        denom_zero = denom < 1e-12
+        denom_safe = np.where(denom_zero, 1.0, denom)
+        if sys_dim == 3:
+            v_reg = 8.0 * np.pi / denom_safe
+            v = np.where(denom_zero, 0.0, v_reg * fact)
+        elif sys_dim == 2:
+            kxy = np.sqrt(qG_cart[0]**2 + qG_cart[1]**2)
+            kz = qG_cart[2]
+            f2d = 1.0 - np.exp(-zc * kxy) * np.cos(kz * zc)
+            v_reg = (8.0 * np.pi / denom_safe) * f2d
+            v = np.where(denom_zero, 0.0, v_reg * fact)
+        else:
+            # sys_dim == 0: caller passes ``bdot`` and we'd build the
+            # FFT-grid sqrt_v0d here; not yet wired to per-q lookup.
+            raise NotImplementedError(
+                "compute_v_q_per_G: sys_dim=0 path not wired — the 0-D "
+                "box truncation builds v on the full FFT grid via "
+                "compute_sqrt_vcoul_0d; the per-q gather would map "
+                "components → flat-FFT index → v(G).  Plumb when "
+                "needed.")
+        if vcoul_cutoff_ry is not None:
+            v = np.where(denom > float(vcoul_cutoff_ry), 0.0, v)
+        out[qi] = v
+    return out
+
+
 def compute_all_V_q(
     zeta_io,
     *,
