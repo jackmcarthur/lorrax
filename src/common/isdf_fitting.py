@@ -2109,30 +2109,52 @@ def fit_zeta_to_h5(
             out_shardings=_gflat_acc_sharding,
         )()
         # FFT-batch chunking inside accumulate_rchunk_to_gflat.  The
-        # one-shot FFT box ``(n_q, n_rmu, nx, ny, nz)`` is fine on
-        # small systems (MoS2 ~ 2 GB) but OOMs on CrI3-scale runs
-        # (75×75×200 FFT × 1500 centroids ⇒ ~17.5 GB per intermediate,
-        # ×4-5 live copies during the FFT chain ⇒ ~100 GB single-device
-        # allocation request seen on first CrI3 attempt).  Default to
-        # the largest divisor of n_q ≤ n_q so the per-chunk FFT box
-        # is bounded by ``(1, n_rmu, nx, ny, nz)``.  ``LORRAX_GFLAT_FFT_BATCH_CHUNKS=N``
-        # overrides; ``N`` must divide ``n_q_disk``.
+        # kernel chunks the μ axis (axis 1) of ``zeta_chunk_ibz`` into
+        # ``fft_batch_chunks`` sub-batches under a ``jax.lax.scan``.
+        # ``with_sharding_constraint`` on each chunk's pad_buf / box /
+        # G_box keeps the per-rank workload at ``(n_q, mu_chunk /
+        # p_prod, n_rtot)`` where ``mu_chunk = n_rmu_padded /
+        # n_chunks``.  The per-rank FFT box transient is then bounded
+        # by ``(n_q × mu_chunk/p_prod × n_rtot × 16 B)``.
+        #
+        # Default rule (matches the user's "n_rchunks batches"
+        # heuristic): pick the largest divisor of ``n_mu_local =
+        # n_rmu_padded / p_prod`` that is ≤ ``num_chunks`` (the outer
+        # r-chunk count).  Since one outer r-chunk's worth of memory
+        # is known to fit (that's why the outer loop chunks at that
+        # rate), dividing the FFT box by the same factor also fits.
+        # Env override ``LORRAX_GFLAT_FFT_BATCH_CHUNKS=N`` selects a
+        # specific N (must divide n_mu_local).
+        _p_prod = int(jax.device_count())
+        if int(meta.n_rmu_padded) % _p_prod != 0:
+            raise ValueError(
+                f"isdf_fitting: n_rmu_padded={meta.n_rmu_padded} not "
+                f"divisible by device count {_p_prod}.")
+        _n_mu_local = int(meta.n_rmu_padded) // _p_prod
         _env_chunks = int(os.environ.get(
             'LORRAX_GFLAT_FFT_BATCH_CHUNKS', '0') or 0)
         if _env_chunks > 0:
-            if n_q_disk % _env_chunks != 0:
+            if _n_mu_local % _env_chunks != 0:
                 raise ValueError(
                     f"LORRAX_GFLAT_FFT_BATCH_CHUNKS={_env_chunks} does "
-                    f"not divide n_q_disk={n_q_disk}.")
+                    f"not divide n_mu_local={_n_mu_local} "
+                    f"(= n_rmu_padded/{_p_prod}).")
             _gflat_fft_batch_chunks = _env_chunks
         else:
-            # Largest n that divides n_q_disk (we want max chunking by
-            # default to minimise the FFT-box transient).
-            _gflat_fft_batch_chunks = n_q_disk
+            # Largest divisor of n_mu_local that is ≤ num_chunks.
+            _gflat_fft_batch_chunks = 1
+            for _c in range(min(num_chunks, _n_mu_local), 0, -1):
+                if _n_mu_local % _c == 0:
+                    _gflat_fft_batch_chunks = _c
+                    break
         if jax.process_index() == 0:
-            print(f"  G-flat ζ FFT batch chunks: {_gflat_fft_batch_chunks} "
-                  f"(n_q_disk={n_q_disk}; per-chunk FFT box "
-                  f"= {n_q_disk // _gflat_fft_batch_chunks} q × n_rmu × {n_rtot})")
+            print(f"  G-flat ζ FFT batch chunks: "
+                  f"{_gflat_fft_batch_chunks} "
+                  f"(n_mu_local={_n_mu_local} on {_p_prod} ranks; "
+                  f"per-chunk FFT box: {n_q_disk} q × "
+                  f"{_n_mu_local // _gflat_fft_batch_chunks} μ_local × "
+                  f"{n_rtot} = "
+                  f"{n_q_disk * (_n_mu_local // _gflat_fft_batch_chunks) * n_rtot * 16 / 1e9:.2f} GB)")
         _q_irr_frac_dev = jax.device_put(
             jnp.asarray(q_irr_frac, dtype=jnp.float64),
             NamedSharding(mesh_xy, P(None, None)))

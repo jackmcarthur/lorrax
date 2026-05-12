@@ -167,11 +167,14 @@ def test_accumulate_rchunk_to_gflat_round_trip():
 
 @pytest.mark.parametrize("fft_batch_chunks", [1, 2, 3])
 def test_accumulate_rchunk_to_gflat_chunked_matches_one_shot(fft_batch_chunks):
-    """fft_batch_chunks > 1 (scan over n_q) must be bit-equal to the
-    one-shot path.  Chunks the FFT batch axis to bound the working set
-    on CrI3-scale runs where the full (n_q, n_rmu, nx*ny*nz) box OOMs."""
+    """fft_batch_chunks > 1 (scan over the μ axis) must be bit-equal to
+    the one-shot path.  Chunks the FFT batch axis to bound the working
+    set on CrI3-scale runs where the full (n_q, n_rmu, nx*ny*nz) box
+    OOMs.  ``n_rmu = 6`` is divisible by every parametrised chunk count
+    so the divisor check on n_mu_local (= n_rmu / p_prod = 6 here)
+    passes for all of {1, 2, 3}."""
     fft_grid = (4, 4, 6)
-    n_q, n_rmu, n_rtot = 6, 3, int(np.prod(fft_grid))
+    n_q, n_rmu, n_rtot = 6, 6, int(np.prod(fft_grid))
     rng = np.random.default_rng(0xAA)
     sphere_per_q = np.zeros((n_q, 5), dtype=np.int32)
     for q in range(n_q):
@@ -201,16 +204,23 @@ def test_accumulate_rchunk_to_gflat_chunked_matches_one_shot(fft_batch_chunks):
         err_msg=f"fft_batch_chunks={fft_batch_chunks}")
 
 
-def test_accumulate_rchunk_to_gflat_chunked_rejects_indivisible():
-    """fft_batch_chunks must divide n_q."""
+def test_accumulate_rchunk_to_gflat_chunked_rejects_indivisible(
+        single_device_mesh):
+    """fft_batch_chunks must divide n_mu_padded (axis-1 chunking)."""
     fft_grid = (4, 4, 4)
-    rch = jnp.zeros((5, 2, 8), dtype=jnp.complex128)  # n_q=5
-    acc = jnp.zeros((5, 2, 3), dtype=jnp.complex128)
-    with pytest.raises(ValueError, match="must divide n_q"):
-        accumulate_rchunk_to_gflat(
-            rchunk=rch, gflat_acc=acc, fft_grid=fft_grid, r0=0,
-            sphere_idx=np.array([0, 1, 2], dtype=np.int32),
-            qvec_frac=None, fft_batch_chunks=3)  # 5 % 3 != 0
+    # n_mu_padded = 2. fft_batch_chunks=3 doesn't divide 2.
+    with single_device_mesh:
+        rch = jax.device_put(
+            jnp.zeros((5, 2, 8), dtype=jnp.complex128),
+            NamedSharding(single_device_mesh, P(None, ('x', 'y'), None)))
+        acc = jax.device_put(
+            jnp.zeros((5, 2, 3), dtype=jnp.complex128),
+            NamedSharding(single_device_mesh, P(None, ('x', 'y'), None)))
+        with pytest.raises(ValueError, match="must divide n_mu_padded"):
+            accumulate_rchunk_to_gflat(
+                rchunk=rch, gflat_acc=acc, fft_grid=fft_grid, r0=0,
+                sphere_idx=np.array([0, 1, 2], dtype=np.int32),
+                qvec_frac=None, fft_batch_chunks=3)
 
 
 def test_accumulate_rchunk_to_gflat_sphere_subset():

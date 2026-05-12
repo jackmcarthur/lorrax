@@ -457,18 +457,24 @@ def accumulate_rchunk_to_gflat(
     norm
         Forwarded to :func:`jnp.fft.fftn`.
     fft_batch_chunks
-        Split the leading ``n_q × n_rmu`` (collapsed) batch axis into
-        this many sub-chunks before forming the FFT box.  Default 1
-        materialises the full ``(n_q, n_rmu, nx, ny, nz)`` FFT box in
-        memory — fine for MoS2 (~few GB) but **OOMs at CrI3 scale**
-        (17.5 GB per intermediate × 4-5 live copies during the
-        forward FFT + reshape + gather chain).  Setting
+        Split the μ axis (axis 1) of ``rchunk`` into this many
+        sub-chunks before forming the FFT box.  Default 1
+        materialises the full ``(n_q, n_rmu_padded, nx, ny, nz)`` FFT
+        box in memory — fine for MoS2 (~few GB) but **OOMs at CrI3
+        scale** (17.5 GB per intermediate × 4-5 live copies during
+        the forward FFT + reshape + gather chain).  Setting
         ``fft_batch_chunks = n_rchunks`` (or higher) caps the working
         set to one rchunk's worth of memory — by construction known
         to fit, since the upstream r-chunk loop produces exactly that
-        much data per iteration.  Implemented via ``jax.lax.scan``
-        over the batch axis with the gather + accumulate fused
-        per-chunk so the full FFT box is never materialised.
+        much data per iteration.  Chunking on the μ axis (rather than
+        n_q) handles the n_q=1 case (Γ-only debug runs) and aligns
+        with the already-μ-sharded sharding contract so each
+        per-chunk pad_buf / box / G_box is naturally decomposed
+        across ranks by the ``with_sharding_constraint`` calls.
+        Must divide ``n_rmu_padded``.  Implemented via
+        ``jax.lax.scan`` over the chunk axis with the gather +
+        accumulate fused per-chunk so the full FFT box is never
+        materialised.
 
     Returns
     -------
@@ -577,20 +583,22 @@ def accumulate_rchunk_to_gflat(
             return (x if _sh5d is None
                     else jax.lax.with_sharding_constraint(x, _sh5d))
 
-        # Chunked path: fold the leading n_q axis into ``n_batch_chunks``
-        # sub-chunks of size ``q_chunk = n_q // n_batch_chunks``.  Each
-        # sub-chunk's FFT box is (q_chunk, μ, nx, ny, nz) — 1/n_chunks
-        # the working set of the one-shot path.  For CrI3 J_3x3 (n_q=9,
-        # μ=1504, FFT 45×45×120), one-shot's 17.5 GB FFT box → 5.9 GB
-        # per chunk at n_batch_chunks=9, fits on 80 GB devices once
-        # μ-sharded.  ``jax.lax.scan`` compiles the chunk body once
-        # and reuses it.
-        _n_q_kernel = int(rchunk.shape[0])
-        if n_batch_chunks > 1 and _n_q_kernel % n_batch_chunks != 0:
+        # Chunked path: fold the μ axis (axis 1) into ``n_batch_chunks``
+        # sub-chunks of size ``mu_chunk = n_mu_padded // n_batch_chunks``.
+        # Each sub-chunk's FFT box is (n_q, mu_chunk, nx, ny, nz) —
+        # 1/n_chunks the working set of the one-shot path.  Chunking on
+        # the μ axis (not n_q) handles the n_q=1 case (Γ-only debug
+        # runs), and aligns with the already-μ-sharded sharding contract
+        # so each per-chunk pad_buf / box / G_box is naturally
+        # decomposed across ranks by the with_sharding_constraint calls
+        # below.  ``jax.lax.scan`` compiles the chunk body once and
+        # reuses it.
+        _n_mu_kernel = int(rchunk.shape[1])
+        if n_batch_chunks > 1 and _n_mu_kernel % n_batch_chunks != 0:
             raise ValueError(
                 f"accumulate_rchunk_to_gflat: fft_batch_chunks="
-                f"{n_batch_chunks} must divide n_q={_n_q_kernel}.")
-        _q_chunk = _n_q_kernel // n_batch_chunks
+                f"{n_batch_chunks} must divide n_mu_padded={_n_mu_kernel}.")
+        _mu_chunk = _n_mu_kernel // n_batch_chunks
 
         def _per_chunk_contrib(rch_phased, sphere_slice_or_none):
             """Pad → FFT → sphere gather for one (q_chunk, ..., r_len) sub-batch."""
@@ -650,38 +658,31 @@ def accumulate_rchunk_to_gflat(
                     return acc_ + _gather_sphere(G_flat)
 
                 def body(acc, i):
-                    start = i * _q_chunk
+                    start = i * _mu_chunk
                     rch_chunk = jax.lax.dynamic_slice_in_dim(
-                        rch_, start, _q_chunk, axis=0)
+                        rch_, start, _mu_chunk, axis=1)
+                    rch_chunk = _shard3(rch_chunk)
                     pad_buf = jnp.zeros(
-                        (_q_chunk, *rch_.shape[1:-1], n_rtot),
+                        (rch_.shape[0], _mu_chunk, *rch_.shape[2:-1], n_rtot),
                         dtype=rch_.dtype)
+                    pad_buf = _shard3(pad_buf)
                     pad_buf = jax.lax.dynamic_update_slice_in_dim(
                         pad_buf, rch_chunk, r0_, axis=-1)
+                    pad_buf = _shard3(pad_buf)
                     box = pad_buf.reshape(
-                        _q_chunk, *rch_.shape[1:-1], nx, ny, nz)
+                        rch_.shape[0], _mu_chunk, *rch_.shape[2:-1], nx, ny, nz)
+                    box = _shard5(box)
                     G_box = jnp.fft.fftn(
                         box, axes=(-3, -2, -1), norm=norm)
+                    G_box = _shard5(G_box)
                     G_flat = G_box.reshape(
-                        _q_chunk, *rch_.shape[1:-1], n_rtot)
-                    if sphere_const is None:
-                        contrib = G_flat
-                    elif not sphere_per_q:
-                        contrib = jnp.take(G_flat, sphere_const, axis=-1)
-                    else:
-                        sphere_chunk = jax.lax.dynamic_slice_in_dim(
-                            sphere_const, start, _q_chunk, axis=0)
-                        n_mid = G_flat.ndim - 2
-                        sphere_b = sphere_chunk.reshape(
-                            _q_chunk, *((1,) * n_mid),
-                            sphere_chunk.shape[1])
-                        contrib = jnp.take_along_axis(
-                            G_flat, sphere_b, axis=-1,
-                            mode='promise_in_bounds')
+                        rch_.shape[0], _mu_chunk, *rch_.shape[2:-1], n_rtot)
+                    G_flat = _shard3(G_flat)
+                    contrib = _gather_sphere(G_flat)
                     acc_chunk = jax.lax.dynamic_slice_in_dim(
-                        acc, start, _q_chunk, axis=0)
+                        acc, start, _mu_chunk, axis=1)
                     acc = jax.lax.dynamic_update_slice_in_dim(
-                        acc, acc_chunk + contrib, start, axis=0)
+                        acc, acc_chunk + contrib, start, axis=1)
                     return acc, None
                 acc_, _ = jax.lax.scan(
                     body, acc_, jnp.arange(n_batch_chunks, dtype=jnp.int32))
@@ -709,43 +710,36 @@ def accumulate_rchunk_to_gflat(
                     return acc_ + _gather_sphere(G_flat)
 
                 def body(acc, i):
-                    start = i * _q_chunk
+                    start = i * _mu_chunk
                     rch_chunk = jax.lax.dynamic_slice_in_dim(
-                        rch_, start, _q_chunk, axis=0)
-                    qvec_chunk = jax.lax.dynamic_slice_in_dim(
-                        qvec_, start, _q_chunk, axis=0)
+                        rch_, start, _mu_chunk, axis=1)
+                    rch_chunk = _shard3(rch_chunk)
+                    # qvec is per-q (n_q, 3); same for all μ chunks.
                     rch_phased = apply_bloch_phase_on_slice(
-                        rch_chunk, qvec_chunk, fft_grid_t, r0_, r_len_i,
+                        rch_chunk, qvec_, fft_grid_t, r0_, r_len_i,
                         sign=-1)
+                    rch_phased = _shard3(rch_phased)
                     pad_buf = jnp.zeros(
-                        (_q_chunk, *rch_.shape[1:-1], n_rtot),
+                        (rch_.shape[0], _mu_chunk, *rch_.shape[2:-1], n_rtot),
                         dtype=rch_.dtype)
+                    pad_buf = _shard3(pad_buf)
                     pad_buf = jax.lax.dynamic_update_slice_in_dim(
                         pad_buf, rch_phased, r0_, axis=-1)
+                    pad_buf = _shard3(pad_buf)
                     box = pad_buf.reshape(
-                        _q_chunk, *rch_.shape[1:-1], nx, ny, nz)
+                        rch_.shape[0], _mu_chunk, *rch_.shape[2:-1], nx, ny, nz)
+                    box = _shard5(box)
                     G_box = jnp.fft.fftn(
                         box, axes=(-3, -2, -1), norm=norm)
+                    G_box = _shard5(G_box)
                     G_flat = G_box.reshape(
-                        _q_chunk, *rch_.shape[1:-1], n_rtot)
-                    if sphere_const is None:
-                        contrib = G_flat
-                    elif not sphere_per_q:
-                        contrib = jnp.take(G_flat, sphere_const, axis=-1)
-                    else:
-                        sphere_chunk = jax.lax.dynamic_slice_in_dim(
-                            sphere_const, start, _q_chunk, axis=0)
-                        n_mid = G_flat.ndim - 2
-                        sphere_b = sphere_chunk.reshape(
-                            _q_chunk, *((1,) * n_mid),
-                            sphere_chunk.shape[1])
-                        contrib = jnp.take_along_axis(
-                            G_flat, sphere_b, axis=-1,
-                            mode='promise_in_bounds')
+                        rch_.shape[0], _mu_chunk, *rch_.shape[2:-1], n_rtot)
+                    G_flat = _shard3(G_flat)
+                    contrib = _gather_sphere(G_flat)
                     acc_chunk = jax.lax.dynamic_slice_in_dim(
-                        acc, start, _q_chunk, axis=0)
+                        acc, start, _mu_chunk, axis=1)
                     acc = jax.lax.dynamic_update_slice_in_dim(
-                        acc, acc_chunk + contrib, start, axis=0)
+                        acc, acc_chunk + contrib, start, axis=1)
                     return acc, None
                 acc_, _ = jax.lax.scan(
                     body, acc_, jnp.arange(n_batch_chunks, dtype=jnp.int32))
