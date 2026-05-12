@@ -129,7 +129,7 @@ class ZetaReader:
         # G-flat metadata surface — None on r-space files.
         self.gvec_components = isdf.gvec_components
         self.ngk_per_q = isdf.ngk_per_q
-        self.bare_coulomb_cutoff_ry = isdf.bare_coulomb_cutoff_ry
+        self.zeta_cutoff_ry = isdf.zeta_cutoff_ry
         self.ngkmax_zeta = isdf.ngkmax
 
         # ---- Capture on-disk q-axis size (IBZ vs full-BZ) ---------------

@@ -1447,7 +1447,7 @@ def fit_zeta_to_h5(
     vertex_mu_L: int = 0,
     solver_kind: str = 'auto',
     write_ibz_only: bool = True,
-    vcoul_cutoff_ry: float | None = None,
+    zeta_cutoff_ry: float | None = None,
 ):
     """
     Full zeta fitting pipeline with r-chunk loop and HDF5 output.
@@ -1773,12 +1773,16 @@ def fit_zeta_to_h5(
     # Build the per-q WFN.h5-style sphere when a cutoff is available.
     # The output is host numpy; the writer threads ``sphere_idx_padded``
     # through ``accumulate_rchunk_to_gflat`` and stashes the components
-    # / ngk / cutoff into the isdf_header below.
+    # / ngk / cutoff into the isdf_header below.  ``zeta_cutoff_ry``
+    # — distinct from V_q's bare-Coulomb cutoff — defines the per-q
+    # sphere on disk.  Caller (``gw_init.fit_zeta``) validates
+    # ``zeta_cutoff_ry ≥ bare_coulomb_cutoff_ry`` so V_q has every G
+    # it needs.
     _gflat_sphere_idx_padded = None      # (n_q_disk, ngkmax) int32
     _gflat_gvec_components = None        # (n_q_disk, 3, ngkmax) int32
     _gflat_ngk_per_q = None              # (n_q_disk,) int32
     _gflat_ngkmax = None
-    if write_g_flat_zeta and vcoul_cutoff_ry is not None \
+    if write_g_flat_zeta and zeta_cutoff_ry is not None \
             and int(meta.sys_dim) != 0:
         from common.coulomb_sphere import compute_per_q_bare_coulomb_components
         _bvec_for_sphere = np.asarray(
@@ -1787,7 +1791,7 @@ def fit_zeta_to_h5(
             fft_grid=meta.fft_grid,
             bvec=_bvec_for_sphere,
             q_irr_frac=q_irr_frac,
-            vcoul_cutoff_ry=float(vcoul_cutoff_ry),
+            vcoul_cutoff_ry=float(zeta_cutoff_ry),
             sys_dim=int(meta.sys_dim),
         )
         _gflat_sphere_idx_padded = _sphere_pkg["sphere_idx_padded"]
@@ -1847,14 +1851,14 @@ def fit_zeta_to_h5(
         _hdr_kwargs.update(
             gvec_components=_gflat_gvec_components,
             ngk_per_q=_gflat_ngk_per_q,
-            bare_coulomb_cutoff_ry=float(vcoul_cutoff_ry),
+            zeta_cutoff_ry=float(zeta_cutoff_ry),
         )
     elif write_g_flat_zeta:
         raise ValueError(
             "G-flat ζ writer is enabled (LORRAX_WRITE_G_FLAT_ZETA=1) "
-            "but no bare-Coulomb sphere was built — pass "
-            "vcoul_cutoff_ry to fit_zeta_to_h5 (or unset the env var "
-            "to fall back to the r-space layout).")
+            "but no ζ sphere was built — pass zeta_cutoff_ry to "
+            "fit_zeta_to_h5 (or unset the env var to fall back to "
+            "the r-space layout).")
     _isdf_hdr = IsdfHeader.build(**_hdr_kwargs)
 
     with timing.section("zeta_fit.write_headers"):

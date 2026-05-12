@@ -12,7 +12,7 @@ Covers:
    the caller post-loop.
 3. ``IsdfHeader`` round-trip — write a G-flat header to HDF5, read it
    back, verify ``gvec_components`` / ``ngk_per_q`` /
-   ``bare_coulomb_cutoff_ry`` are bit-exact.
+   ``zeta_cutoff_ry`` are bit-exact.
 """
 from __future__ import annotations
 
@@ -181,14 +181,14 @@ def test_isdf_header_g_flat_round_trip(tmp_path):
         density='scalar', vertex_mu_L=0,
         zeta_is_done=True, zeta_layout='G_flat',
         gvec_components=gv, ngk_per_q=ngk,
-        bare_coulomb_cutoff_ry=42.0,
+        zeta_cutoff_ry=42.0,
     )
     with h5py.File(path, 'w') as f:
         pass
     write_isdf_header(str(path), hdr, mode='a')
     rb = read_isdf_header(str(path))
     assert rb.zeta_layout == 'G_flat'
-    assert rb.bare_coulomb_cutoff_ry == 42.0
+    assert rb.zeta_cutoff_ry == 42.0
     np.testing.assert_array_equal(rb.gvec_components, gv)
     np.testing.assert_array_equal(rb.ngk_per_q, ngk)
     assert rb.ngkmax == 7
@@ -214,5 +214,5 @@ def test_isdf_header_r_space_drops_metadata():
     )
     assert hdr.gvec_components is None
     assert hdr.ngk_per_q is None
-    assert hdr.bare_coulomb_cutoff_ry is None
+    assert hdr.zeta_cutoff_ry is None
     assert hdr.ngkmax is None

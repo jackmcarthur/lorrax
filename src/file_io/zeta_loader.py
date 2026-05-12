@@ -162,7 +162,7 @@ class ZetaLoader:
         # G-flat metadata surface (None for r-space files).
         self.gvec_components = isdf.gvec_components
         self.ngk_per_q = isdf.ngk_per_q
-        self.bare_coulomb_cutoff_ry = isdf.bare_coulomb_cutoff_ry
+        self.zeta_cutoff_ry = isdf.zeta_cutoff_ry
         self.ngkmax_zeta = isdf.ngkmax   # WFN.h5-style padded G-axis size
 
         # On-disk q-axis classification.  Dataset shape differs by layout:

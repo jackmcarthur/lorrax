@@ -231,6 +231,12 @@ _DEFAULTS = {
                                    # auto → high_mem for back-compat.
     "mc_average_vcoul_body": True,
     "bare_coulomb_cutoff": None,
+    # ζ-sphere cutoff (Ry).  When the writer emits zeta_q_G with per-q
+    # WFN.h5-style spheres, this is the cutoff used to define the per-q
+    # G-list.  Defaults to ecutwfc (mirrors the bare-Coulomb default);
+    # max value is ecutrho.  Must be ≥ bare_coulomb_cutoff (V_q can't
+    # use ζ̃(q+G) at G's the writer didn't store).
+    "zeta_cutoff": None,
     # BGW vcoul override (for diagnostic BGW-vs-LORRAX comparison)
     "use_bgw_vcoul": False,
     "bgw_vcoul_file": "",
@@ -494,6 +500,7 @@ class HeadConfig:
     whead_imfreq: float | None    # explicit override W_h[iω_p]
     mc_average_vcoul_body: bool
     bare_coulomb_cutoff: float | None
+    zeta_cutoff: float | None
     use_bgw_vcoul: bool
     bgw_vcoul_file: str | None
     bgw_vcoul_sym_wfn: str | None
@@ -862,6 +869,7 @@ class LorraxConfig:
             whead_imfreq=_g("whead_imfreq"),
             mc_average_vcoul_body=bool(_g("mc_average_vcoul_body")),
             bare_coulomb_cutoff=_g("bare_coulomb_cutoff"),
+            zeta_cutoff=_g("zeta_cutoff"),
             use_bgw_vcoul=bool(_g("use_bgw_vcoul")),
             bgw_vcoul_file=(str(_g("bgw_vcoul_file")) or None),
             bgw_vcoul_sym_wfn=(str(_g("bgw_vcoul_sym_wfn")) or None),

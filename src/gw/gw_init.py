@@ -587,16 +587,44 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# orchestrator gains IBZ support, this can flip to ``True`` for
 	# bispinor too.
 	_write_ibz_only_charge = not bool(cfg.bispinor)
-	# G-flat ζ writer (LORRAX_WRITE_G_FLAT_ZETA=1) needs the same bare
-	# Coulomb cutoff that the V_q kernel uses so the per-q on-disk
-	# sphere matches the consumer-side sphere bit-for-bit.  Computed
-	# from cfg.head.bare_coulomb_cutoff below; pass the resolved value
-	# down.  Default is ``ecutwfc`` (matches BGW's
-	# ``screened_coulomb_cutoff`` default).
-	if cfg.head.bare_coulomb_cutoff is None:
-		_zeta_vcoul_cutoff = float(wfn.ecutwfc)
-	else:
-		_zeta_vcoul_cutoff = float(cfg.head.bare_coulomb_cutoff)
+	# Two cutoffs control the bare-Coulomb / ζ-sphere construction:
+	#   * ``bare_coulomb_cutoff_ry`` — V_q's sqrt_v(q+G) mask.
+	#   * ``zeta_cutoff_ry``         — the on-disk per-q ζ sphere
+	#                                   (writer's ``ngk[q]`` is taken
+	#                                   from this).
+	# Both default to ``wfn.ecutwfc`` (matches BGW's
+	# ``screened_coulomb_cutoff`` default), and both have an upper
+	# bound of ``wfn.ecutrho`` (the density grid is the largest cutoff
+	# the FFT box can represent).  ``zeta_cutoff_ry`` must be
+	# ≥ ``bare_coulomb_cutoff_ry`` — V_q reads ζ̃ at every G inside its
+	# bare-Coulomb sphere, so anything the V_q kernel needs has to be
+	# stored on disk.
+	def _resolve_cutoff(val, label, hi):
+		if val is None:
+			return float(wfn.ecutwfc)
+		v = float(val)
+		if v > hi + 1e-9:
+			raise ValueError(
+				f"{label} = {v} Ry exceeds ecutrho = {hi} Ry "
+				f"(the FFT grid can't represent G's past ecutrho).")
+		return v
+
+	_ecutrho = float(wfn.ecutrho)
+	_zeta_vcoul_cutoff = _resolve_cutoff(
+		cfg.head.bare_coulomb_cutoff, "bare_coulomb_cutoff", _ecutrho)
+	_zeta_cutoff = _resolve_cutoff(
+		cfg.head.zeta_cutoff, "zeta_cutoff", _ecutrho)
+	if _zeta_vcoul_cutoff > _zeta_cutoff + 1e-9:
+		raise ValueError(
+			f"bare_coulomb_cutoff = {_zeta_vcoul_cutoff} Ry > "
+			f"zeta_cutoff = {_zeta_cutoff} Ry.  The V_q kernel reads "
+			f"ζ̃(q+G) at every G inside its sphere; ζ must be stored at "
+			f"least as wide.  Increase zeta_cutoff (≤ ecutrho = "
+			f"{_ecutrho} Ry) or lower bare_coulomb_cutoff.")
+	print_fn(
+		f"    cutoffs: zeta = {_zeta_cutoff:.1f} Ry, "
+		f"bare-Coulomb = {_zeta_vcoul_cutoff:.1f} Ry  "
+		f"(ecutwfc={float(wfn.ecutwfc):.1f}, ecutrho={_ecutrho:.1f})")
 	with timing.section("gw_jax.zeta_fit_chunked"), jax_profile.trace_section("zeta_fit"):
 		peak_bytes = fit_zeta_to_h5(
 			wfn=wfn, sym=sym, meta=meta,
@@ -614,7 +642,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			slab_io_backend=cfg.backend.slab_io,
 			gspace_mode=cfg.gspace_mode,
 			write_ibz_only=_write_ibz_only_charge,
-			vcoul_cutoff_ry=_zeta_vcoul_cutoff,
+			zeta_cutoff_ry=_zeta_cutoff,
 		)
 
 	# Diagnostic: peek at ζ^0 (charge) q=0 max magnitude.
@@ -729,7 +757,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					# to consume IBZ-only ζ + post-loop unfold, then
 					# drop this opt-out.
 					write_ibz_only=False,
-					vcoul_cutoff_ry=_zeta_vcoul_cutoff,
+					zeta_cutoff_ry=_zeta_cutoff,
 				)
 			# Diagnostic: peek at ζ q=0 max magnitude for comparison to
 			# agent-B's MoS2 reference (commit 69e8863):
@@ -791,17 +819,17 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		pass
 	m_budget = max(0.1, budget_gb) * 1e9
 
-	# Default to ecutwfc — matches BGW's screened_coulomb_cutoff convention
-	# (BGW truncates the pair-density v(q+G) sphere at ecutwfc).  The previous
-	# default of 4·ecutwfc was the strict mathematical cutoff for ψ*ψ but
-	# produced a ~4% V_μν body offset vs BGW's vcoul.dat on Si 4×4×4.
+	# Resolved earlier in :func:`fit_zeta` (line ~589) via the shared
+	# ``_resolve_cutoff`` helper — defaults to ``wfn.ecutwfc``, max
+	# ``wfn.ecutrho``, validated against the ζ-sphere cutoff.  Hoist
+	# the resolved value here rather than re-resolving so the two call
+	# sites stay in sync (this is the V_q half of the same number
+	# zeta_fit wrote into ``isdf_header/zeta_cutoff_ry``).
 	if cfg.head.bare_coulomb_cutoff is None:
 		vcoul_cutoff_ry = float(wfn.ecutwfc)
-		print_fn(f"    V_q bare cutoff: {vcoul_cutoff_ry:.1f} Ry (auto: ecutwfc)")
 	else:
 		vcoul_cutoff_ry = float(cfg.head.bare_coulomb_cutoff)
-		print_fn(f"    V_q bare cutoff: {vcoul_cutoff_ry:.1f} Ry")
-
+	print_fn(f"    V_q bare cutoff: {vcoul_cutoff_ry:.1f} Ry")
 	print_fn(f"    V_q budget:    {budget_gb:.2f} GB")
 
 	from file_io.slab_io import SlabIO
