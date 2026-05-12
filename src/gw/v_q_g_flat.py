@@ -346,19 +346,58 @@ def compute_all_V_q_g_flat(
 
     zeta_disk_sh = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
 
+    # Both ZetaReader and ZetaLoader can serve a G-flat slab, but their
+    # call signatures differ.  Detect which one we have once, then
+    # use the matching call inside ``read_q``.
+    has_load = hasattr(zeta_loader, 'load') and callable(
+        getattr(zeta_loader, 'load', None))
+    has_read_slab = hasattr(zeta_loader, 'read_zeta_G_slab') and callable(
+        getattr(zeta_loader, 'read_zeta_G_slab', None))
+    if not (has_load or has_read_slab):
+        raise TypeError(
+            "compute_all_V_q_g_flat: zeta_loader must expose .load() "
+            "(ZetaLoader) or .read_zeta_G_slab() (ZetaReader); "
+            f"got {type(zeta_loader).__name__} with neither.")
+    # Logical μ extent on disk; pad rows above this are zero by writer
+    # construction and stay zero on read (SlabIO valid_shape clip).
+    _n_rmu_logical = int(zeta_loader.n_rmu)
+
     def read_q(q_idx: int) -> jax.Array:
-        """Synchronous per-q slab read sharded P(None, ('x','y'), None)."""
-        return zeta_loader.load(
-            q=[int(q_idx)], layout='G_flat',
-            sharding=P(None, ('x', 'y'), None))
+        """Per-q slab read sharded P(None, ('x','y'), None) → (1, μ, ngkmax)."""
+        if has_load:
+            return zeta_loader.load(
+                q=[int(q_idx)], layout='G_flat',
+                sharding=P(None, ('x', 'y'), None))
+        # ZetaReader path: read_zeta_G_slab returns (Q, μ, ngkmax)
+        # already in the same sharding.  ``qvec_batch_frac`` is ignored
+        # on the G-flat-disk branch (the per-q phase is baked into
+        # the on-disk tensor by the writer).  Pass a tiny dummy.
+        return zeta_loader.read_zeta_G_slab(
+            q_offset=int(q_idx), q_count=1,
+            mu_offset=0, mu_count=int(n_rmu_padded),
+            qvec_batch_frac=jnp.zeros((1, 3), dtype=jnp.float64),
+            sphere_idx=None,
+            mesh=mesh_xy, valid_mu=_n_rmu_logical,
+        )
 
     if not async_prefetch or n_q_ibz <= 1:
-        # Synchronous straight-line loop.
+        # Synchronous straight-line loop.  Light per-q progress logging
+        # so a stuck kernel is visible immediately.
+        import time as _t
         for q in range(n_q_ibz):
+            _t0 = _t.perf_counter()
             zeta_q = read_q(q)
+            _t_read = _t.perf_counter() - _t0
+            _t1 = _t.perf_counter()
             V_acc, g0_acc = kernel(
                 V_acc, g0_acc, zeta_q, v_q_dev[q],
                 jnp.int32(q))
+            jax.block_until_ready(V_acc)
+            _t_k = _t.perf_counter() - _t1
+            if verbose and jax.process_index() == 0:
+                print(f"  V_q g-flat q={q}/{n_q_ibz}: "
+                      f"read={_t_read:.2f}s, kernel={_t_k:.2f}s",
+                      flush=True)
     else:
         # Single-step prefetch.  Holds at most TWO ζ_q slabs in flight.
         # The thread queue carries the *future* read; the main thread

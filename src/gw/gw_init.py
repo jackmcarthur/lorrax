@@ -645,12 +645,15 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			zeta_cutoff_ry=_zeta_cutoff,
 		)
 
-	# Diagnostic: peek at ζ^0 (charge) q=0 max magnitude.
+	# Diagnostic: peek at ζ^0 (charge) q=0 max magnitude.  Dataset
+	# name varies by layout (legacy r-space → ``zeta_q``; G-flat →
+	# ``zeta_q_G``); pick by what's actually in the file.
 	try:
 		import h5py
 		with h5py.File(zeta_h5_path, 'r') as f:
-			arr0 = f['zeta_q'][0]
-			print_fn(f"  [diag] ζ^{{μ_L=0}} q=0: max|ζ|={float(np.abs(arr0).max()):.3e}, "
+			ds = 'zeta_q_G' if 'zeta_q_G' in f else 'zeta_q'
+			arr0 = f[ds][0]
+			print_fn(f"  [diag] ζ^{{μ_L=0}} ({ds}) q=0: max|ζ|={float(np.abs(arr0).max()):.3e}, "
 			         f"L2={float(np.sqrt((np.abs(arr0)**2).sum())):.3e}")
 	except Exception as exc:
 		print_fn(f"  [diag] ζ^0 peek failed: {exc}")

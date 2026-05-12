@@ -833,9 +833,16 @@ def compute_all_V_q(
     G-flat path (where the chooser is essentially trivial).
     """
     # G-flat dispatch — when the loader carries the new per-q sphere
-    # components, hand off to the rewritten orchestrator.
+    # components, hand off to the rewritten orchestrator.  Async
+    # prefetch defaults to OFF here: the prefetcher's collective read
+    # on the PHDF5 FFI backend has to interleave correctly with the
+    # per-q kernel's NCCL collectives, and a simple sync loop is
+    # easier to debug.  Re-enable via env once the kernel is profile-
+    # validated.
     if getattr(zeta_io, 'zeta_layout', None) == 'G_flat':
         from .v_q_g_flat import compute_all_V_q_g_flat
+        _async = bool(int(os.environ.get(
+            'LORRAX_V_Q_G_FLAT_ASYNC_PREFETCH', '0')))
         return compute_all_V_q_g_flat(
             zeta_io,
             kgrid=kgrid, fft_grid=fft_grid,
@@ -846,6 +853,7 @@ def compute_all_V_q(
             bgw_v_grid_fn=bgw_v_grid_fn,
             verbose=verbose, sym=sym,
             centroid_indices=centroid_indices,
+            async_prefetch=_async,
         )
 
     nkx, nky, nkz = kgrid
