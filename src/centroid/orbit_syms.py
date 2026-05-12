@@ -338,3 +338,117 @@ def compute_centroid_sym_perm(
     return sym_perm.astype(np.int32)
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Full FFT-grid orbit permutation — used by ZetaLoader's q='full_bz' unfold.
+# ─────────────────────────────────────────────────────────────────────────
+
+def compute_rgrid_sym_perm(
+    sym_matrices: np.ndarray,
+    translations: np.ndarray,
+    fft_grid: np.ndarray | tuple[int, int, int],
+    *,
+    validate: bool = True,
+) -> np.ndarray:
+    """Build the per-sym r-grid permutation table over the FULL FFT grid.
+
+    Returns ``sym_perm[s, r_new] = r_old`` such that
+    ``r_{r_new} ≡ S_s · r_{r_old} + τ_s`` on the FFT grid, where ``r_*``
+    indexes the flat FFT grid in C-order
+    (``r_flat = i_x * ny * nz + i_y * nz + i_z``).  This is the gather
+    table the caller wants when expanding an IBZ-q ζ tensor onto the
+    full BZ: ``ζ_full[q, r_new, μ] = ζ_ibz[i(q), sym_perm[s(q), r_new],
+    π_{s(q)}^{-1}(μ)]``.
+
+    Math
+    ----
+    Same convention as :func:`compute_centroid_sym_perm`: BGW's
+    ``mtrx`` acts on G-vectors; real-space r transforms by
+    ``Rinv = inv(S)``.  We compute the forward image
+    ``r' = Rinv · r + τ`` for every grid point, snap back to the FFT
+    grid, and invert the resulting permutation so the output is a
+    pull-back (``sym_perm[s, r_new] = r_old``) suitable for
+    ``take_along_axis(zeta, sym_perm[s, :], axis=r)``.
+
+    Failure mode
+    ------------
+    The orbit-closure assertion is automatic for the full FFT grid IF
+    ``τ × fft_grid`` is integer (i.e. the fractional translation lands
+    on a discrete grid point).  When it doesn't, the rounding step here
+    will collide images — that's the right error signal.  In practice
+    QE outputs satisfy this commensurability; if a future workflow
+    breaks it, the loader will refuse rather than silently corrupt.
+
+    Parameters
+    ----------
+    sym_matrices, translations, fft_grid
+        Same meaning as :func:`compute_centroid_sym_perm`.  ``translations``
+        is BGW's ``tnp`` (``τ_frac = tnp / (2π)``).
+    validate
+        If True, asserts every row of the result is a permutation of
+        ``[0, n_rtot)``.
+
+    Returns
+    -------
+    sym_perm
+        ``(n_sym, n_rtot) int32`` — gather indices along the flat-r axis.
+    """
+    fg = np.asarray(fft_grid, dtype=np.int64).reshape(3)
+    nx, ny, nz = int(fg[0]), int(fg[1]), int(fg[2])
+    n_rtot = nx * ny * nz
+
+    S = np.asarray(sym_matrices, dtype=np.int64)
+    if S.ndim != 3 or S.shape[1:] != (3, 3):
+        raise ValueError(
+            f"sym_matrices must be (n_sym, 3, 3); got {S.shape}")
+    n_sym = int(S.shape[0])
+    tau_frac = (np.asarray(translations, dtype=np.float64)[:n_sym]
+                / (2.0 * np.pi))                                # (n_sym, 3)
+
+    # Enumerate every grid point as (i_x, i_y, i_z) in flat C-order.
+    ix, iy, iz = np.meshgrid(
+        np.arange(nx), np.arange(ny), np.arange(nz), indexing='ij')
+    r_idx = np.stack([ix.reshape(-1), iy.reshape(-1), iz.reshape(-1)],
+                       axis=1).astype(np.int64)                  # (n_rtot, 3)
+    r_frac = r_idx.astype(np.float64) / fg[None, :]              # (n_rtot, 3)
+
+    # Real-space transform uses Rinv = inv(S).
+    Rinv = np.rint(np.linalg.inv(S)).astype(np.int64)            # (n_sym, 3, 3)
+
+    # images[s, r] = r @ Rinv[s].T + τ[s]  (mod 1)
+    images = (np.einsum('rj,sij->sri', r_frac, Rinv.astype(np.float64))
+              + tau_frac[:, None, :])
+    images = images - np.floor(images)                            # in [0, 1)
+
+    img_idx = np.rint(images * fg[None, None, :]).astype(np.int64)
+    img_idx = img_idx % fg[None, None, :]                         # wrap residual
+
+    radix1 = ny * nz
+    radix2 = nz
+    img_flat = (img_idx[..., 0] * radix1
+                + img_idx[..., 1] * radix2
+                + img_idx[..., 2])                                # (n_sym, n_rtot)
+
+    # ``img_flat[s, r_old]`` is the destination index ``r_new`` of
+    # the forward image: ``r_{r_new} ≡ S_s · r_{r_old} + τ_s``.
+    # Invert to get the gather table: ``sym_perm[s, r_new] = r_old``.
+    sym_perm = np.empty_like(img_flat)
+    base = np.arange(n_rtot, dtype=np.int64)
+    for s in range(n_sym):
+        sym_perm[s, img_flat[s]] = base
+
+    if validate:
+        for s in range(n_sym):
+            if np.unique(sym_perm[s]).size != n_rtot:
+                raise RuntimeError(
+                    f"compute_rgrid_sym_perm: sym_perm[{s}] is not a "
+                    f"permutation of [0, n_rtot={n_rtot}).  Likely cause: "
+                    f"τ × fft_grid is not integer for sym {s} "
+                    f"(τ_frac={tau_frac[s].tolist()}, "
+                    f"τ×fft_grid={(tau_frac[s] * fg).tolist()}).  Off-grid "
+                    f"fractional translations are not yet supported by the "
+                    f"ζ full-BZ unfold path."
+                )
+
+    return sym_perm.astype(np.int32)
+
+
