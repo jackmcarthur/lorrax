@@ -134,39 +134,45 @@ def test_to_rchunk_phase_after_slice_matches_direct_formula():
 def test_accumulate_rchunk_to_gflat_round_trip():
     """Walk r-axis in chunks via to_rchunk; accumulate back into G_flat
     via accumulate_rchunk_to_gflat; verify the sum equals a direct
-    forward FFT of the IFFT (i.e. the original G-flat input)."""
+    forward FFT of the IFFT (i.e. the original G-flat input).
+
+    ``accumulate_rchunk_to_gflat`` is strict ``(n_q, n_rmu, r_len)``; we
+    fold (n_band, n_spinor) into a single μ axis to match.  Identity
+    per-q sphere keeps the whole flat-FFT axis so we can compare
+    against the direct ``_box_kernel`` reference element-wise."""
     psi, g_index, fft_grid = _make_psi_and_gindex(
         n_k=2, n_band=3, n_spinor=2, fft_grid=(4, 4, 6))
     nx, ny, nz = fft_grid
     n_rtot = nx * ny * nz
     n_k, nb, ns, ngkmax = psi.shape
+    n_mu = nb * ns
 
     # Reference: IFFT then FFT round-trip (with no phase) returns the
     # input box up to numerical noise.  We test the no-phase path so
     # we can compare contributions cleanly.
     from common.wfn_transforms import _box_kernel
-    box_ref = _box_kernel(psi, g_index, ngkmax=ngkmax)    # (n_k, nb, ns, nx, ny, nz)
-    box_flat_ref = box_ref.reshape(n_k, nb, ns, n_rtot)
+    box_flat_ref = _box_kernel(psi, g_index, ngkmax=ngkmax).reshape(
+        n_k, n_mu, n_rtot)
+
+    # Identity sphere: sphere[q, i] = i, ngkmax = n_rtot.  Same indices
+    # per q, but stored in the (n_q, ngkmax) shape the new API requires.
+    sphere_id = np.tile(np.arange(n_rtot, dtype=np.int32)[None, :], (n_k, 1))
 
     # Walk r in chunks; for each, IFFT-and-slice via to_rchunk, then
     # forward-FFT-and-add-to-Gflat via accumulate_rchunk_to_gflat.
-    n_G_sph = n_rtot           # keep the whole flat-FFT axis for the test
-    gflat_acc = jnp.zeros((n_k, nb, ns, n_G_sph), dtype=jnp.complex128)
+    gflat_acc = jnp.zeros((n_k, n_mu, n_rtot), dtype=jnp.complex128)
     r_chunk = 8
     for r0 in range(0, n_rtot, r_chunk):
         r_len = min(r_chunk, n_rtot - r0)
-        rchunk = to_rchunk(psi, g_index, fft_grid, r0, r_len,
-                            mesh=MESH, norm='ortho')
-        # Need n_q == n_k for the accumulate signature; treat the
-        # leading axis of rchunk as the "q" axis here.
+        rchunk_4d = to_rchunk(psi, g_index, fft_grid, r0, r_len,
+                               mesh=MESH, norm='ortho')   # (n_k, nb, ns, r_len)
+        rchunk = rchunk_4d.reshape(n_k, n_mu, r_len)
         gflat_acc = accumulate_rchunk_to_gflat(
             rchunk, gflat_acc, mesh=MESH,
-            fft_grid=fft_grid, r0=r0, sphere_idx=None,
+            fft_grid=fft_grid, r0=r0, sphere_idx=sphere_id,
             qvec_frac=None, norm='ortho',
         )
 
-    # Compare element-wise.  Round-trip of IFFT then FFT is identity
-    # up to numerical roundoff.
     np.testing.assert_allclose(
         np.asarray(gflat_acc),
         np.asarray(box_flat_ref),
@@ -174,14 +180,14 @@ def test_accumulate_rchunk_to_gflat_round_trip():
     )
 
 
-@pytest.mark.parametrize("fft_batch_chunks", [1, 2, 3])
-def test_accumulate_rchunk_to_gflat_chunked_matches_one_shot(fft_batch_chunks):
-    """fft_batch_chunks > 1 (scan over the μ axis) must be bit-equal to
-    the one-shot path.  Chunks the FFT batch axis to bound the working
-    set on CrI3-scale runs where the full (n_q, n_rmu, nx*ny*nz) box
-    OOMs.  ``n_rmu = 6`` is divisible by every parametrised chunk count
-    so the divisor check on n_mu_local (= n_rmu / p_prod = 6 here)
-    passes for all of {1, 2, 3}."""
+# chunk_size ∈ {None one-shot, divisors of N=36, a non-divisor (7) that
+# exercises the zero-pad path}.
+@pytest.mark.parametrize("chunk_size", [None, 12, 9, 7, 4])
+def test_accumulate_rchunk_to_gflat_chunked_matches_one_shot(chunk_size):
+    """``chunk_size != None`` must be bit-equal to one-shot.  The
+    flat-axis chunker zero-pads ``N = n_q · n_mu_local`` up to a
+    multiple of chunk_size, so ANY positive integer chunk size is
+    valid (no divisibility constraint on n_q or n_mu_local)."""
     fft_grid = (4, 4, 6)
     n_q, n_rmu, n_rtot = 6, 6, int(np.prod(fft_grid))
     rng = np.random.default_rng(0xAA)
@@ -195,70 +201,50 @@ def test_accumulate_rchunk_to_gflat_chunked_matches_one_shot(fft_batch_chunks):
         rng.standard_normal((n_q, n_rmu, n_rtot))
         + 1j * rng.standard_normal((n_q, n_rmu, n_rtot)),
         dtype=jnp.complex128)
-    acc_ref = jnp.zeros((n_q, n_rmu, 5), dtype=jnp.complex128)
     acc_ref = accumulate_rchunk_to_gflat(
-        rchunk=rch, gflat_acc=acc_ref, mesh=MESH,
-        fft_grid=fft_grid, r0=0, sphere_idx=sphere_per_q,
-        qvec_frac=kvecs, norm='backward', fft_batch_chunks=1)
-
-    acc_chk = jnp.zeros((n_q, n_rmu, 5), dtype=jnp.complex128)
+        rchunk=rch, gflat_acc=jnp.zeros((n_q, n_rmu, 5), dtype=jnp.complex128),
+        mesh=MESH, fft_grid=fft_grid, r0=0,
+        sphere_idx=sphere_per_q, qvec_frac=kvecs, norm='backward',
+        chunk_size=None)
     acc_chk = accumulate_rchunk_to_gflat(
-        rchunk=rch, gflat_acc=acc_chk, mesh=MESH,
-        fft_grid=fft_grid, r0=0, sphere_idx=sphere_per_q,
-        qvec_frac=kvecs, norm='backward',
-        fft_batch_chunks=fft_batch_chunks)
+        rchunk=rch, gflat_acc=jnp.zeros((n_q, n_rmu, 5), dtype=jnp.complex128),
+        mesh=MESH, fft_grid=fft_grid, r0=0,
+        sphere_idx=sphere_per_q, qvec_frac=kvecs, norm='backward',
+        chunk_size=chunk_size)
     np.testing.assert_allclose(
         np.asarray(acc_chk), np.asarray(acc_ref),
         atol=1e-12, rtol=1e-12,
-        err_msg=f"fft_batch_chunks={fft_batch_chunks}")
-
-
-def test_accumulate_rchunk_to_gflat_chunked_rejects_indivisible(
-        single_device_mesh):
-    """fft_batch_chunks must divide n_mu_local = n_mu_padded / p_prod
-    (so each chunk's per-rank shard stays integer-sized)."""
-    fft_grid = (4, 4, 4)
-    # p_prod = 1 (single device) → n_mu_local = n_mu_padded = 2.
-    # fft_batch_chunks=3 doesn't divide 2.
-    with single_device_mesh:
-        rch = jax.device_put(
-            jnp.zeros((5, 2, 8), dtype=jnp.complex128),
-            NamedSharding(single_device_mesh, P(None, ('x', 'y'), None)))
-        acc = jax.device_put(
-            jnp.zeros((5, 2, 3), dtype=jnp.complex128),
-            NamedSharding(single_device_mesh, P(None, ('x', 'y'), None)))
-        with pytest.raises(ValueError, match="must divide n_mu_local"):
-            accumulate_rchunk_to_gflat(
-                rchunk=rch, gflat_acc=acc, mesh=single_device_mesh,
-                fft_grid=fft_grid, r0=0,
-                sphere_idx=np.array([0, 1, 2], dtype=np.int32),
-                qvec_frac=None, fft_batch_chunks=3)
+        err_msg=f"chunk_size={chunk_size}")
 
 
 def test_accumulate_rchunk_to_gflat_sphere_subset():
-    """sphere_idx gathers a subset of the full G axis."""
+    """Per-q sphere_idx gathers a subset of the full G axis."""
     psi, g_index, fft_grid = _make_psi_and_gindex(
         n_k=1, n_band=1, n_spinor=1, fft_grid=(4, 4, 4))
     nx, ny, nz = fft_grid
     n_rtot = nx * ny * nz
     n_k, nb, ns, ngkmax = psi.shape
+    n_mu = nb * ns
 
     rng = np.random.default_rng(0xCAFE)
-    sphere_idx = rng.choice(n_rtot, size=20, replace=False).astype(np.int32)
-    sphere_idx.sort()
+    # Same indices for every q, but stored 2-D as the new API requires.
+    sphere_1d = np.sort(rng.choice(n_rtot, size=20, replace=False).astype(np.int32))
+    sphere_per_q = np.tile(sphere_1d[None, :], (n_k, 1))
 
     from common.wfn_transforms import _box_kernel
-    box_ref = _box_kernel(psi, g_index, ngkmax=ngkmax)
-    ref = box_ref.reshape(n_k, nb, ns, n_rtot)[..., sphere_idx]
+    box_ref = _box_kernel(psi, g_index, ngkmax=ngkmax).reshape(
+        n_k, n_mu, n_rtot)
+    ref = box_ref[..., sphere_1d]
 
-    gflat_acc = jnp.zeros((n_k, nb, ns, 20), dtype=jnp.complex128)
+    gflat_acc = jnp.zeros((n_k, n_mu, 20), dtype=jnp.complex128)
     for r0 in range(0, n_rtot, 16):
         r_len = min(16, n_rtot - r0)
         rchunk = to_rchunk(psi, g_index, fft_grid, r0, r_len,
-                            mesh=MESH, norm='ortho')
+                            mesh=MESH, norm='ortho').reshape(
+                                n_k, n_mu, r_len)
         gflat_acc = accumulate_rchunk_to_gflat(
             rchunk, gflat_acc, mesh=MESH,
-            fft_grid=fft_grid, r0=r0, sphere_idx=sphere_idx,
+            fft_grid=fft_grid, r0=r0, sphere_idx=sphere_per_q,
             norm='ortho',
         )
 

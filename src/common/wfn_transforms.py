@@ -438,236 +438,187 @@ def accumulate_rchunk_to_gflat(
     mesh: Mesh,
     fft_grid: Sequence[int],
     r0,
-    sphere_idx: np.ndarray | jax.Array | None,
+    sphere_idx: np.ndarray | jax.Array,
     qvec_frac: np.ndarray | jax.Array | None = None,
     norm: str = "backward",
-    fft_batch_chunks: int = 1,
+    chunk_size: int | None = None,
 ) -> jax.Array:
     """Add ``FFT(pad(phase(rchunk)))[sphere_idx]`` into ``gflat_acc``.
+
+    Shapes / shardings (mesh = ``('x', 'y')`` of size ``P = p_x · p_y``)::
+
+        rchunk    : (n_q, n_rmu_padded, r_len)   P(None, ('x','y'), None)
+        gflat_acc : (n_q, n_rmu_padded, ngkmax)  P(None, ('x','y'), None)
+
+    ``n_rmu_padded`` must be a multiple of ``mesh.size`` (rounded up at
+    :class:`common.meta.Meta` construction).  Each rank owns a
+    ``n_mu_local = n_rmu_padded / P`` block of μ-rows over the full
+    ``(n_q, r_len)`` extent.
+
+    Algorithm — inside a single ``shard_map`` over ``('x','y')``:
+
+      1. Flatten ``(n_q, n_mu_local) → N = n_q · n_mu_local`` rows.
+      2. Zero-pad ``N → ⌈N / cs⌉ · cs`` so the chunk count is exact.
+      3. ``lax.scan`` over chunks of ``cs`` rows.  Each iteration:
+         a. ``q_row[cs] = (i·cs + arange(cs)) // n_mu_local`` —
+            which q each row belongs to.  Clipped to ``[0, n_q)``;
+            padding rows land on q = n_q - 1 but their data is zero
+            (zero-pad) so the contrib they produce is zero — no
+            contamination of ``acc``.
+         b. Slab → FFT box via ``dynamic_update_slice_in_dim`` at
+            offset ``r0``.
+         c. Per-q Bloch phase, if ``qvec_frac`` given: separable
+            ``exp(-2πi q · r)`` factors, pre-computed per q at trace
+            time, gathered per row by ``q_row``.
+         d. ``jnp.fft.fftn`` on the trailing 3 axes — data is
+            per-rank-local on the entire FFT box (FFT axes are
+            replicated by sharding contract), so plain ``fftn`` runs
+            local cuFFT with no resharding.
+         e. ``jnp.take_along_axis`` gathers the per-q sphere indices
+            (``sphere_idx[q_row]``) along the trailing flat-r axis.
+         f. Accumulate into ``acc`` at offset ``i·cs``.
+
+    Chunking is on the flat ``(q · μ_local)`` axis so the chunk size
+    is a free integer — no divisibility constraint on either n_q or
+    n_mu_local.  Defaults to one-shot (``cs = N``); the scan compiles
+    to a single iteration that XLA folds away.
 
     Parameters
     ----------
     rchunk
-        Trailing shape ``(n_q, ..., r_len)`` c128.  Leading axis is
-        the q-axis used to look up the per-q Bloch phase.
-        Intermediate axes (e.g. μ, spinor) are broadcast through the
-        FFT and the phase.
+        ``(n_q, n_rmu_padded, r_len)`` c128, μ-flat-sharded.
     gflat_acc
-        Trailing shape ``(n_q, ..., n_G_sph)`` c128.  Same leading
-        axes as ``rchunk``; trailing axis is the G-sphere subset.
-        Donated to the inner jit — its buffer is reused in place.
+        ``(n_q, n_rmu_padded, ngkmax)`` c128, μ-flat-sharded.
+        Donated by the inner jit — its buffer is reused in place.
+    mesh
+        Process mesh with named axes ``'x'`` and ``'y'``.
     fft_grid
-        Static ``(nx, ny, nz)``.  Defines the flat-r enumeration
-        (``r = rx·ny·nz + ry·nz + rz``) and the FFT shape.
+        Static ``(nx, ny, nz)``.
     r0
         Python int or jax-scalar — flat-r start of the slab in
         ``[0, nx·ny·nz)``.
     sphere_idx
-        Static int32 flat-FFT indices to gather the G-sphere subset.
-        Two shapes:
-
-        * ``(n_G_sph,)`` — a **shared** sphere applied to every q.
-          Same gather index for all q; cheap ``jnp.take`` on the
-          trailing axis.
-        * ``(n_q, ngkmax)`` — a **per-q** sphere (WFN.h5-style padded
-          layout).  ``n_q`` must match ``rchunk.shape[0]`` and
-          ``gflat_acc.shape[0]``.  Each q gets its own gather row;
-          pad slots within a row are sentinel flat-FFT indices whose
-          coeffs will be zeroed by the caller post-loop.  Compiles
-          to ``take_along_axis`` with ``mode='promise_in_bounds'``
-          to keep XLA's x64+shard_map verifier happy (sphere_idx is
-          guaranteed in-bounds by construction).
-
-        ``None`` keeps the whole flat-FFT axis (``n_G_sph = nx·ny·nz``).
+        ``(n_q, ngkmax)`` int32 flat-FFT indices.  Every q has the
+        same ``ngkmax`` axis length with potentially different index
+        lists per q; pad slots within a row use a sentinel flat-FFT
+        index whose coeffs the caller zeroes post-loop.
     qvec_frac
         Optional ``(n_q, 3)`` fractional q-vectors.  When given, the
-        pre-FFT slab is multiplied by ``exp(-2πi q·r)`` on the slab
-        (matches the convention used by V_q's
-        ``_zeta_disk_to_G``).  ``None`` skips the phase.
+        FFT box is multiplied by ``exp(-2πi q · r)`` per row
+        (separable in x/y/z; pre-computed once per q).
     norm
         Forwarded to :func:`jnp.fft.fftn`.
-    fft_batch_chunks
-        Split the μ axis (axis 1) of ``rchunk`` into this many
-        sub-chunks before forming the FFT box.  Default 1
-        materialises the full ``(n_q, n_rmu_padded, nx, ny, nz)`` FFT
-        box in memory — fine for MoS2 (~few GB) but **OOMs at CrI3
-        scale** (17.5 GB per intermediate × 4-5 live copies during
-        the forward FFT + reshape + gather chain).  Setting
-        ``fft_batch_chunks = n_rchunks`` (or higher) caps the working
-        set to one rchunk's worth of memory — by construction known
-        to fit, since the upstream r-chunk loop produces exactly that
-        much data per iteration.  Chunking on the μ axis (rather than
-        n_q) handles the n_q=1 case (Γ-only debug runs) and aligns
-        with the already-μ-sharded sharding contract so each
-        per-chunk pad_buf / box / G_box is naturally decomposed
-        across ranks by the ``with_sharding_constraint`` calls.
-        Must divide ``n_rmu_padded``.  Implemented via
-        ``jax.lax.scan`` over the chunk axis with the gather +
-        accumulate fused per-chunk so the full FFT box is never
-        materialised.
+    chunk_size
+        Rows per scan iteration along the flat ``(q · μ_local)``
+        axis.  Default ``None`` ⇒ one-shot.  Memory bound:
+        ``chunk_size · n_rtot · 16 B`` for the per-iteration FFT box.
 
     Returns
     -------
-    Updated ``gflat_acc`` (same shape, same sharding).  Donation makes
-    the update in-place under jit; outside-jit callers should rebind.
+    Updated ``gflat_acc`` (same shape, same sharding).
     """
     fft_grid_t = tuple(int(s) for s in fft_grid)
     nx, ny, nz = fft_grid_t
     n_rtot = nx * ny * nz
-    r_len_i = int(rchunk.shape[-1])
-    if isinstance(r0, (int, np.integer)):
-        if r0 < 0 or int(r0) + r_len_i > n_rtot:
-            raise ValueError(
-                f"accumulate_rchunk_to_gflat: r-slab "
-                f"[{int(r0)}, {int(r0) + r_len_i}) out of [0, {n_rtot})")
-    if sphere_idx is None:
-        n_G_sph = n_rtot
-        sphere_id = None
-        sphere_per_q = False
-        sphere_arr = None
-    else:
-        sphere_arr = np.asarray(sphere_idx, dtype=np.int32)
-        if sphere_arr.ndim == 1:
-            n_G_sph = int(sphere_arr.shape[0])
-            sphere_per_q = False
-        elif sphere_arr.ndim == 2:
-            n_G_sph = int(sphere_arr.shape[1])
-            sphere_per_q = True
-            if int(sphere_arr.shape[0]) != int(rchunk.shape[0]):
-                raise ValueError(
-                    f"accumulate_rchunk_to_gflat: per-q sphere_idx has "
-                    f"shape {sphere_arr.shape} but rchunk has "
-                    f"n_q={int(rchunk.shape[0])}.")
-        else:
-            raise ValueError(
-                f"accumulate_rchunk_to_gflat: sphere_idx must be 1-D "
-                f"(shared) or 2-D (per-q); got shape {sphere_arr.shape}.")
-        # Content-based hash — id() of the temporary tobytes() can be
-        # reused after the temp is GC'd, producing cache collisions.
-        sphere_id = hash(sphere_arr.tobytes())
+    n_q       = int(rchunk.shape[0])
+    n_rmu_pad = int(rchunk.shape[1])
+    r_len_i   = int(rchunk.shape[-1])
+    p_prod    = int(np.prod([mesh.shape[a] for a in mesh.axis_names]))
+    if n_rmu_pad % p_prod != 0:
+        raise ValueError(
+            f"accumulate_rchunk_to_gflat: n_rmu_padded={n_rmu_pad} not "
+            f"divisible by mesh.size={p_prod}.")
+    n_mu_local = n_rmu_pad // p_prod
+    N          = n_q * n_mu_local
+
+    sphere_arr = np.asarray(sphere_idx, dtype=np.int32)
+    if sphere_arr.ndim != 2 or int(sphere_arr.shape[0]) != n_q:
+        raise ValueError(
+            f"accumulate_rchunk_to_gflat: sphere_idx must be (n_q, ngkmax); "
+            f"got shape {sphere_arr.shape}, expected n_q={n_q}.")
+    ngkmax  = int(sphere_arr.shape[-1])
+
+    if isinstance(r0, (int, np.integer)) and (int(r0) < 0 or int(r0) + r_len_i > n_rtot):
+        raise ValueError(
+            f"accumulate_rchunk_to_gflat: r-slab "
+            f"[{int(r0)}, {int(r0) + r_len_i}) out of [0, {n_rtot}).")
+
+    cs       = int(chunk_size if chunk_size else N)
+    n_chunks = (N + cs - 1) // cs
+    pad_N    = n_chunks * cs - N
 
     qvec_shape = (None if qvec_frac is None
                   else tuple(int(s) for s in np.shape(qvec_frac)))
+    sphere_id  = hash(sphere_arr.tobytes())
 
-    n_batch_chunks = max(1, int(fft_batch_chunks))
     key = (
         tuple(int(s) for s in rchunk.shape),
         tuple(int(s) for s in gflat_acc.shape),
-        fft_grid_t, r_len_i, n_G_sph, sphere_id, sphere_per_q,
-        norm, qvec_shape, n_batch_chunks,
+        fft_grid_t, r_len_i, ngkmax, sphere_id,
+        norm, qvec_shape, cs, n_chunks, pad_N,
         _sharding_key(rchunk), _sharding_key(gflat_acc),
     )
     fn = _RCHUNK_TO_GFLAT_CACHE.get(key)
     if fn is None:
-        # Static closure: per-q or shared sphere index baked in.
-        sphere_const = (jnp.asarray(sphere_arr, dtype=jnp.int32)
-                        if sphere_idx is not None else None)
-
-        def _gather_sphere(G_flat):
-            """Per-q or shared gather on the trailing axis of G_flat.
-
-            Shared sphere (1-D, ngkmax,) → ``jnp.take``.  Per-q sphere
-            (2-D, n_q × ngkmax) → ``take_along_axis`` with the sphere
-            broadcast across the middle (μ, ...) axes of G_flat.
-            """
-            if sphere_const is None:
-                return G_flat
-            if not sphere_per_q:
-                return jnp.take(G_flat, sphere_const, axis=-1)
-            n_mid_axes = G_flat.ndim - 2
-            sphere_b = sphere_const.reshape(
-                sphere_const.shape[0],
-                *((1,) * n_mid_axes),
-                sphere_const.shape[1],
-            )
-            return jnp.take_along_axis(
-                G_flat, sphere_b, axis=-1, mode='promise_in_bounds')
-
-        # Per-chunk intermediates need ``with_sharding_constraint`` so
-        # ``jnp.zeros`` / reshape inherit the μ-shard — otherwise XLA
-        # materialises replicated tensors (~100 GB single-device at
-        # CrI3 scale).  The FFT itself runs through ``_local_box_fft``.
-        _spec = _spec_of(rchunk)
-        _leading = _spec[:-2]
-        _mu_spec = _spec[-2]
-        _p_prod = int(np.prod([mesh.shape[a] for a in mesh.axis_names]))
-        _sh_3d = NamedSharding(mesh, P(*_leading, _mu_spec, None))
-        _sh_5d = NamedSharding(
-            mesh, P(*_leading, _mu_spec, None, None, None))
-
-        def _shard3(x): return _maybe_constrain(x, _sh_3d)
-        def _shard5(x): return _maybe_constrain(x, _sh_5d)
-
-        local_fftn = _local_box_fft(rchunk, mesh, kind='fftn', norm=norm)
-
-        # μ-axis chunking.  ``n_batch_chunks`` must divide
-        # ``n_mu_local = n_mu_padded / p_prod`` so each chunk's
-        # per-rank shard stays integer-sized.  Chunking on μ (not n_q)
-        # handles the n_q=1 case (Γ-only debug runs) and aligns with
-        # the μ-sharded layout so each per-chunk pad_buf / box / G_box
-        # is naturally decomposed across ranks by ``_shard3`` /
-        # ``_shard5`` below.  ``n_batch_chunks=1`` is a length-1 scan
-        # that XLA's loop optimiser folds away — same emitted HLO as
-        # an inline body, with no extra trace work.
-        _n_mu_padded = int(rchunk.shape[1])
-        _n_mu_local = _n_mu_padded // _p_prod
-        if n_batch_chunks > 1 and _n_mu_local % n_batch_chunks != 0:
-            raise ValueError(
-                f"accumulate_rchunk_to_gflat: fft_batch_chunks="
-                f"{n_batch_chunks} must divide n_mu_local="
-                f"{_n_mu_local} (= n_mu_padded/{_p_prod}).")
-        _mu_chunk = _n_mu_padded // n_batch_chunks
-
-        # Single scan body for every path: phase (if qvec_) → pad at
-        # r0 → FFT box → forward FFT → flatten → sphere gather →
-        # accumulate into the corresponding μ slice of ``acc``.  The
-        # ``qvec_ is None`` branch folds away at trace time.
-        def _chunk_body(acc, i, rch_, r0_, qvec_):
-            start = i * _mu_chunk
-            rch_chunk = _shard3(jax.lax.dynamic_slice_in_dim(
-                rch_, start, _mu_chunk, axis=1))
-            if qvec_ is not None:
-                rch_chunk = _shard3(apply_bloch_phase_on_slice(
-                    rch_chunk, qvec_, fft_grid_t, r0_, r_len_i, sign=-1))
-            box_shape = (rch_.shape[0], _mu_chunk, *rch_.shape[2:-1])
-            pad_buf = _shard3(jnp.zeros(
-                (*box_shape, n_rtot), dtype=rch_.dtype))
-            pad_buf = _shard3(jax.lax.dynamic_update_slice_in_dim(
-                pad_buf, rch_chunk, r0_, axis=-1))
-            box = _shard5(pad_buf.reshape(*box_shape, nx, ny, nz))
-            G_box = local_fftn(box)
-            G_flat = _shard3(G_box.reshape(*box_shape, n_rtot))
-            contrib = _gather_sphere(G_flat)
-            acc_chunk = jax.lax.dynamic_slice_in_dim(
-                acc, start, _mu_chunk, axis=1)
-            return jax.lax.dynamic_update_slice_in_dim(
-                acc, acc_chunk + contrib, start, axis=1), None
-
-        # Two thin wrappers (one per qvec presence) because ``None``
-        # can't be a traced jit arg; both fall through to the same
-        # scan over ``_chunk_body``.
-        _iters = jnp.arange(n_batch_chunks, dtype=jnp.int32)
-        if qvec_frac is None:
-            @partial(jax.jit, donate_argnums=(1,))
-            def fn(rch_, acc_, r0_):
-                acc_, _ = jax.lax.scan(
-                    lambda a, i: _chunk_body(a, i, rch_, r0_, None),
-                    acc_, _iters)
-                return acc_
+        # Per-q tables baked into the closure as constants.
+        sphere_c = jnp.asarray(sphere_arr, dtype=jnp.int32)
+        if qvec_frac is not None:
+            qv = jnp.asarray(np.asarray(qvec_frac), dtype=jnp.float64)
+            _ph = lambda q_axis, n: jnp.exp(
+                -2j * jnp.pi * q_axis[:, None] * (jnp.arange(n) / n)[None, :])
+            phx, phy, phz = _ph(qv[:, 0], nx), _ph(qv[:, 1], ny), _ph(qv[:, 2], nz)
         else:
-            @partial(jax.jit, donate_argnums=(1,))
-            def fn(rch_, acc_, r0_, qvec_):
-                acc_, _ = jax.lax.scan(
-                    lambda a, i: _chunk_body(a, i, rch_, r0_, qvec_),
-                    acc_, _iters)
-                return acc_
+            phx = phy = phz = None
+
+        # Sharding: μ is the only sharded axis on both rchunk and
+        # gflat_acc.  P(None, ('x','y'), None) is enforced by the
+        # caller; the shard_map below sees per-rank slabs.
+        in_spec  = P(None, ('x', 'y'), None)
+        out_spec = P(None, ('x', 'y'), None)
+
+        @partial(shard_map, mesh=mesh,
+                 in_specs=(in_spec, in_spec, P()),
+                 out_specs=out_spec,
+                 check_rep=False)
+        def _kernel(rch_, acc_, r0_):
+            # Per-rank: (n_q, n_mu_local, r_len) / (n_q, n_mu_local, ngkmax).
+            rch_flat = rch_.reshape(N, r_len_i)
+            acc_flat = acc_.reshape(N, ngkmax)
+            if pad_N:
+                rch_flat = jnp.pad(rch_flat, ((0, pad_N), (0, 0)))
+                acc_flat = jnp.pad(acc_flat, ((0, pad_N), (0, 0)))
+
+            def body(acc, i):
+                i0    = i * cs
+                sub   = jax.lax.dynamic_slice_in_dim(rch_flat, i0, cs, axis=0)
+                q_row = jnp.clip(
+                    (i0 + jnp.arange(cs)) // n_mu_local, 0, n_q - 1)
+                buf = jnp.zeros((cs, n_rtot), dtype=sub.dtype)
+                buf = jax.lax.dynamic_update_slice_in_dim(buf, sub, r0_, axis=-1)
+                box = buf.reshape(cs, nx, ny, nz)
+                if phx is not None:
+                    box = (box
+                           * phx[q_row][:, :, None, None]
+                           * phy[q_row][:, None, :, None]
+                           * phz[q_row][:, None, None, :])
+                G = jnp.fft.fftn(box, axes=(-3, -2, -1), norm=norm).reshape(cs, n_rtot)
+                contrib = jnp.take_along_axis(
+                    G, sphere_c[q_row], axis=-1, mode='promise_in_bounds')
+                acc_sub = jax.lax.dynamic_slice_in_dim(acc, i0, cs, axis=0)
+                return jax.lax.dynamic_update_slice_in_dim(
+                    acc, acc_sub + contrib, i0, axis=0), None
+
+            acc_flat, _ = jax.lax.scan(
+                body, acc_flat, jnp.arange(n_chunks, dtype=jnp.int32))
+            if pad_N:
+                acc_flat = acc_flat[:N]
+            return acc_flat.reshape(n_q, n_mu_local, ngkmax)
+
+        fn = jax.jit(_kernel, donate_argnums=(1,))
         _RCHUNK_TO_GFLAT_CACHE[key] = fn
 
     r0_arg = (jnp.int32(int(r0)) if isinstance(r0, (int, np.integer)) else r0)
-    if qvec_frac is None:
-        return fn(rchunk, gflat_acc, r0_arg)
-    return fn(rchunk, gflat_acc, r0_arg,
-              jnp.asarray(qvec_frac, dtype=jnp.float64))
+    return fn(rchunk, gflat_acc, r0_arg)
 
 
 # ---------------------------------------------------------------------------

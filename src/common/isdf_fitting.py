@@ -2157,57 +2157,29 @@ def fit_zeta_to_h5(
                 dtype=jnp.complex128),
             out_shardings=_gflat_acc_sharding,
         )()
-        # FFT-batch chunking inside accumulate_rchunk_to_gflat.  Now
-        # that ζ arrives μ-flat-sharded (``P(None, ('x','y'), None)``,
-        # see ``solve_zeta``), each rank carries only ``n_rmu_padded /
-        # mesh.size`` rows of the μ axis.  The per-rank FFT box
-        # ``(n_q, n_mu_local, n_rtot)`` is already bounded by the
-        # per-rank μ extent — μ-chunking no longer reduces the per-rank
-        # working set and would *introduce* an all-gather on the μ-axis
-        # every scan iteration (because the body's
-        # ``dynamic_slice_in_dim(rch_, start, _mu_chunk, axis=1)`` with
-        # runtime ``start`` cuts across the μ-shard).
+        # Flat-axis chunking inside ``accumulate_rchunk_to_gflat``.
+        # The kernel runs inside a ``shard_map`` over ``('x','y')`` and
+        # chunks the per-rank flat ``(n_q · n_mu_local)`` axis into
+        # rows-per-scan-iteration of ``chunk_size``.  Memory bound:
+        # ``chunk_size · n_rtot · 16 B`` for the per-iteration FFT box.
         #
-        # Default: one-shot (``n_batch_chunks = 1``).  The scan body
-        # then runs once with ``start = 0`` and the dynamic slice is a
-        # no-op metadata pass-through — no μ-axis collective.
-        #
-        # If the per-rank FFT box is still too large at extreme scale
-        # (e.g. CrI3 6×6×1 80 Ry, where ``(n_q · n_mu_local · n_rtot
-        # · 16 B) > budget``), the right knob is **r-axis chunking
-        # inside the kernel** (chunk the FFT-box r-axis sequentially),
-        # not μ-axis chunking — μ is already split across ranks.
-        # Followup: thread an ``LORRAX_GFLAT_R_BATCH_CHUNKS`` knob into
-        # ``accumulate_rchunk_to_gflat``.
-        _p_prod = int(jax.device_count())
-        if int(meta.n_rmu_padded) % _p_prod != 0:
-            raise ValueError(
-                f"isdf_fitting: n_rmu_padded={meta.n_rmu_padded} not "
-                f"divisible by device count {_p_prod}.")
-        _n_mu_local = int(meta.n_rmu_padded) // _p_prod
-        _env_chunks = int(os.environ.get(
-            'LORRAX_GFLAT_FFT_BATCH_CHUNKS', '0') or 0)
-        if _env_chunks > 0:
-            # Env override left in place as an escape hatch.  Must still
-            # divide ``n_mu_local`` for the underlying scan to slice
-            # within shard boundaries (though see caveat above re μ-axis
-            # gathers when ``_env_chunks > 1`` with μ-sharded rchunk).
-            if _n_mu_local % _env_chunks != 0:
-                raise ValueError(
-                    f"LORRAX_GFLAT_FFT_BATCH_CHUNKS={_env_chunks} does "
-                    f"not divide n_mu_local={_n_mu_local} "
-                    f"(= n_rmu_padded/{_p_prod}).")
-            _gflat_fft_batch_chunks = _env_chunks
-        else:
-            _gflat_fft_batch_chunks = 1
+        # Default ``None`` (one-shot) is fine when the full per-rank
+        # box ``N · n_rtot · 16 B`` fits — MoS2 3×3 at 4 ranks: 1.1 GB.
+        # For CrI3-class FFT grids set ``LORRAX_GFLAT_CHUNK_SIZE`` to
+        # an integer; the kernel zero-pads N up to a multiple of the
+        # chunk size so any value works (no divisibility constraint
+        # on either n_q or n_mu_local).
+        _env_cs = int(os.environ.get('LORRAX_GFLAT_CHUNK_SIZE', '0') or 0)
+        _gflat_chunk_size = _env_cs if _env_cs > 0 else None
         if jax.process_index() == 0:
-            print(f"  G-flat ζ FFT batch chunks: "
-                  f"{_gflat_fft_batch_chunks} "
-                  f"(n_mu_local={_n_mu_local} on {_p_prod} ranks; "
-                  f"per-chunk FFT box: {n_q_disk} q × "
-                  f"{_n_mu_local // _gflat_fft_batch_chunks} μ_local × "
-                  f"{n_rtot} = "
-                  f"{n_q_disk * (_n_mu_local // _gflat_fft_batch_chunks) * n_rtot * 16 / 1e9:.2f} GB)")
+            _p_prod = int(jax.device_count())
+            _n_mu_local = int(meta.n_rmu_padded) // _p_prod
+            _N = n_q_disk * _n_mu_local
+            _cs = _gflat_chunk_size or _N
+            print(f"  G-flat ζ accumulator: N={_N} rows/rank "
+                  f"(n_q={n_q_disk} × n_mu_local={_n_mu_local}); "
+                  f"chunk_size={_cs} → "
+                  f"per-iter FFT box {_cs * n_rtot * 16 / 1e9:.2f} GB/rank")
         _q_irr_frac_dev = jax.device_put(
             jnp.asarray(q_irr_frac, dtype=jnp.float64),
             NamedSharding(mesh_xy, P(None, None)))
@@ -2288,7 +2260,7 @@ def fit_zeta_to_h5(
                         sphere_idx=_gflat_sphere_idx_padded,
                         qvec_frac=_q_irr_frac_dev,
                         norm='backward',
-                        fft_batch_chunks=_gflat_fft_batch_chunks,
+                        chunk_size=_gflat_chunk_size,
                         mesh=mesh_xy,
                     )
                     del zeta_chunk_ibz

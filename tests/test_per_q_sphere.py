@@ -144,13 +144,16 @@ def test_accumulate_per_q_sphere_matches_reference():
         sphere_per_q[q] = (np.arange(ngkmax) * (q + 1)) % n_rtot
 
     # Walk r in chunks and accumulate.
+    from jax.sharding import Mesh
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
+                axis_names=('x', 'y'))
     acc = jnp.zeros((n_q, n_rmu, ngkmax), dtype=jnp.complex128)
     chunk = 8
     for r0 in range(0, n_rtot, chunk):
         r1 = min(r0 + chunk, n_rtot)
         acc = accumulate_rchunk_to_gflat(
             rchunk=rch_full[:, :, r0:r1], gflat_acc=acc,
-            fft_grid=fft_grid, r0=r0,
+            mesh=mesh, fft_grid=fft_grid, r0=r0,
             sphere_idx=sphere_per_q,
             qvec_frac=None, norm='backward',
         )
