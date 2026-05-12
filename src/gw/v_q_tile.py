@@ -1524,23 +1524,25 @@ def _unfold_v_q_ibz_to_full(
         # Per-q μ-axis mapping: shape (n_q_full, n_rmu_padded).
         perm_q = inv_perm_j[sym_j]                                  # (n_q_full, n_rmu_padded)
         V_at_irr = V_ibz[idx_j]                                     # (n_q_full, μ, μ)
-        # Gather along μ (axis 1):
+        # ``mode='promise_in_bounds'`` skips the
+        # ``_normalize_index``-driven OOB ``select`` that
+        # ``take_along_axis`` runs under the default ``mode='fill'``.
+        # That helper introduces a comparison ``index < 0`` + a fill
+        # constant; under shard_map+x64 the constant gets emitted as
+        # ``s32`` while XLA promotes the comparison's broadcast to
+        # ``s64`` (the HLO verifier ``SameElementType`` failure at
+        # ``hlo_verifier.cc:1247``).  ``perm_q`` is an in-range
+        # permutation by construction, so the bounds check is
+        # gratuitous; ``promise_in_bounds`` lowers directly to a
+        # ``lax.gather`` with no extra constant.
         V_perm_mu = jnp.take_along_axis(
-            V_at_irr, perm_q[:, :, None], axis=1)
-        # Gather along ν (axis 2):
+            V_at_irr, perm_q[:, :, None], axis=1,
+            mode='promise_in_bounds')
         V_full = jnp.take_along_axis(
-            V_perm_mu, perm_q[:, None, :], axis=2)
+            V_perm_mu, perm_q[:, None, :], axis=2,
+            mode='promise_in_bounds')
         return V_full
 
-    # XLA bug (pre-existing, also encountered by the parallel agent on
-    # main): ``jnp.take_along_axis`` on a sharded axis under
-    # ``jax_enable_x64=True`` emits a mixed-dtype broadcast (s64 vs
-    # s32 from the gather decomposition), which the HLO verifier
-    # rejects at ``hlo_verifier.cc:1247`` ``SameElementType``.  The fix
-    # needs a ``lax.gather`` rewrite that controls the index dtype
-    # explicitly — orthogonal to the IBZ-write / orbit-aware-kmeans
-    # work.  Replicating V_ibz to dodge the bug would also work but is
-    # O(n_q_full × μ²) memory per rank and not scalable to CrI3.
     return _do_unfold(V_q_ibz)
 
 
@@ -1601,7 +1603,11 @@ def _unfold_g0_ibz_to_full(
     def _do_unfold(g0):
         perm_q = inv_perm_j[sym_j]                                  # (n_q_full, n_rmu_padded)
         g0_at_irr = g0[idx_j]                                       # (n_q_full, μ)
-        g0_full = jnp.take_along_axis(g0_at_irr, perm_q, axis=1)
+        # ``mode='promise_in_bounds'`` to skip the take_along_axis
+        # OOB-fill helper that breaks under shard_map+x64; same fix
+        # as ``_unfold_v_q_ibz_to_full``.
+        g0_full = jnp.take_along_axis(
+            g0_at_irr, perm_q, axis=1, mode='promise_in_bounds')
         return g0_full
 
     return _do_unfold(g0_ibz)
