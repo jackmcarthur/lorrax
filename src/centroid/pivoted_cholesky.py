@@ -866,8 +866,19 @@ def build_gram_q0_via_loadwfns(
                 "Must supply either (n_val, n_cond) or "
                 "(band_range_left, band_range_right)"
             )
+        # v×(v+c) default: left = (0, n_val), right = (0, n_val+n_cond).
+        # The centroids that prune-Cholesky picks then span the val×val
+        # diagonals that V_H and any G_RI band-diagonal projection
+        # consume, on top of the val×cond pair densities χ₀/W/Σ_xc need.
+        # On MoS2 4×4 this cut V_H |err| at the CBM ~3× vs the legacy
+        # v×c window (right=(n_val, n_val+n_cond)) at the same centroid
+        # count.  Σ_xc is unaffected since the (v+c) right pool is a
+        # superset of the legacy cond range; conditioning of the Gram
+        # only improves (more PSD contributions).  Callers needing the
+        # strict legacy v×c Gram should pass ``band_range_left=(0,nval)``
+        # and ``band_range_right=(nval, nval+ncond)`` explicitly.
         left_range = (0, int(n_val))
-        right_range = (int(n_val), int(n_val) + int(n_cond))
+        right_range = (0, int(n_val) + int(n_cond))
     else:
         left_range = (int(band_range_left[0]), int(band_range_left[1]))
         right_range = (int(band_range_right[0]), int(band_range_right[1]))
