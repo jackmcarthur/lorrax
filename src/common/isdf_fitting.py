@@ -1981,14 +1981,10 @@ def fit_zeta_to_h5(
     kgrid_arr = np.array(meta.kgrid)
     kvecs_frac = sym.kvecs_asints / kgrid_arr[None, :]
 
-    # Env-var override: forces the slow path (re-read WFN.h5 per
-    # r-chunk) even when memory would allow host caching.  Useful for
-    # probing the scaling regime where wavefunctions don't fit in host
-    # memory (multi-TB WFN.h5).  LORRAX_GSPACE_MODE=file_reread to
-    # override the caller's default.
-    _gspace_mode_override = os.environ.get("LORRAX_GSPACE_MODE")
-    if _gspace_mode_override:
-        gspace_mode = _gspace_mode_override
+    # ``gspace_mode`` (cohsex.in ``gspace_mode``; see
+    # ``GspaceIO`` enum): ``host_cache`` is the default; ``file_reread``
+    # rebuilds the per-rank host ψ(G) buffer at each r-chunk for
+    # multi-TB WFN.h5 systems that can't hold ψ(G) resident.
 
     # Uniform band chunks over [b_full_start, b_full_end]: N-1 of
     # size ``band_chunk_size`` plus one remainder chunk.  This gives
