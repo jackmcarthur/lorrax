@@ -615,15 +615,14 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		print_fn(gflat_plan.format())
 	chunks['band_chunk'] = int(gflat_plan.band_chunk)
 	chunks['chunk_r'] = int(gflat_plan.r_chunk)
-	chunks['gflat_chunk_size'] = gflat_plan.gflat_chunk_size
 	chunks['gflat_hwm_gb'] = gflat_plan.hwm_bytes / 1e9
-	# Propagate gflat_chunk_size to the accumulator via env (fit_zeta
-	# reads LORRAX_GFLAT_CHUNK_SIZE).  Only set if the model picked a
-	# non-default value and the user hasn't overridden it.
-	if (gflat_plan.gflat_chunk_size is not None
-	        and not os.environ.get('LORRAX_GFLAT_CHUNK_SIZE')):
-		os.environ['LORRAX_GFLAT_CHUNK_SIZE'] = str(
-			int(gflat_plan.gflat_chunk_size))
+	# Cohsex.in ``gflat_chunk_size`` overrides the planner's pick.  When
+	# user set 0 (the default) we adopt the planner's recommendation; a
+	# non-zero cohsex value wins.
+	chunks['gflat_chunk_size'] = (
+		int(cfg.memory.gflat_chunk_size) if cfg.memory.gflat_chunk_size > 0
+		else (int(gflat_plan.gflat_chunk_size)
+		      if gflat_plan.gflat_chunk_size is not None else 0))
 
 	zeta_h5_path = os.path.join(tmp_dir, "zeta_q.h5")
 	print_fn(f"\n  Chunked ISDF fitting:")
@@ -698,6 +697,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			gspace_mode=cfg.gspace_mode,
 			cusolvermp_charge=cfg.backend.cusolvermp_charge,
 			cusolvermp_lu=cfg.backend.cusolvermp_lu,
+			psig_k_chunk_size=int(cfg.memory.psig_k_chunk_size),
+			gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
 			write_ibz_only=_write_ibz_only_charge,
 			zeta_cutoff_ry=_zeta_cutoff,
 		)
@@ -820,6 +821,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					gspace_mode=cfg.gspace_mode,
 					cusolvermp_charge=cfg.backend.cusolvermp_charge,
 					cusolvermp_lu=cfg.backend.cusolvermp_lu,
+					psig_k_chunk_size=int(cfg.memory.psig_k_chunk_size),
+					gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
 					vertex_mu_L=mu_L,
 					# TODO(bispinor-ibz): port compute_V_q_bispinor_to_h5
 					# to consume IBZ-only ζ + post-loop unfold, then
@@ -983,6 +986,8 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 							bare_coulomb_cutoff_ry=vcoul_cutoff_ry,
 							bdot=(np.asarray(wfn.bdot, dtype=np.float64)
 							       if meta.sys_dim == 0 else None),
+							g_chunk=(int(cfg.memory.vq_g_chunk_size)
+							         if cfg.memory.vq_g_chunk_size > 0 else None),
 							backend=cfg.backend.slab_io,
 							print_fn=print_fn,
 						)
@@ -1067,6 +1072,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 							           dtype=np.int32)
 							if centroid_indices is not None else None),
 						use_g_flat_zeta=True,
+						g_chunk_size=int(cfg.memory.vq_g_chunk_size),
 					)
 
 	# Write G0 = ζ_μ(G=0) at q=0 back to zeta file via SlabIO's deferred

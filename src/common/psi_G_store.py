@@ -121,12 +121,17 @@ class PsiGStore:
         band_chunk_ranges: tuple[tuple[int, int], ...],
         meta,
         bispinor: bool = False,
+        k_chunk_size: int = 0,
     ):
         self.loader = loader
         self.mesh = mesh_xy
         self.band_chunk_ranges = tuple(tuple(bc) for bc in band_chunk_ranges)
         self.meta = meta
         self.bispinor = bool(bispinor)
+        # Inner k-axis chunker for ``fetch_psi_rchunk``.  0 = no chunking
+        # (one shot over all k); >0 caps the per-fetch FFT box transient
+        # at large n_k.  Set from cohsex.in ``psig_k_chunk_size``.
+        self._k_chunk_size = int(k_chunk_size)
 
         nk = int(meta.nk_tot)
         ns = int(meta.nspinor)
@@ -346,10 +351,8 @@ class PsiGStore:
         # scale.  Chunking by k caps the per-call box to
         # ``(_k_chunk, bpd, ns, nx, ny, nz)`` regardless of how many k
         # are in ``nk_slice`` — at the cost of a Python loop unrolled
-        # at trace.  ``LORRAX_PSIG_KCHUNK`` overrides the default cap.
-        import os as _os
-        _kc_env = int(_os.environ.get('LORRAX_PSIG_KCHUNK', '0') or 0)
-        _k_chunk = max(1, _kc_env) if _kc_env > 0 else nk_slice
+        # at trace.  Cohsex.in ``psig_k_chunk_size`` overrides the cap.
+        _k_chunk = max(1, self._k_chunk_size) if self._k_chunk_size > 0 else nk_slice
         kvecs_frac_full = self._kvecs_frac_dev[k_lo:k_hi]
         g_index_full = (self._g_index_dev[k_lo:k_hi] if k_range is not None
                         else self._g_index_dev)
@@ -385,11 +388,11 @@ class HostPsiGStore(PsiGStore):
     """
 
     def __init__(self, *, loader, mesh_xy, band_chunk_ranges, meta,
-                  bispinor: bool = False):
+                  bispinor: bool = False, k_chunk_size: int = 0):
         super().__init__(
             loader=loader, mesh_xy=mesh_xy,
             band_chunk_ranges=band_chunk_ranges, meta=meta,
-            bispinor=bispinor)
+            bispinor=bispinor, k_chunk_size=k_chunk_size)
         self._populate_from_loader()
         if jax.process_index() == 0:
             tile_gb = self._per_rank_shape_bytes() / 1e9
@@ -418,6 +421,7 @@ def build_psi_G_store(
     band_chunk_ranges,
     bispinor: bool = False,
     mode: Literal["host_cache", "file_reread"] = "host_cache",
+    k_chunk_size: int = 0,
 ) -> PsiGStore:
     """Construct the ψ(G-flat) store matching ``mode``.
 
@@ -437,11 +441,11 @@ def build_psi_G_store(
         return HostPsiGStore(
             loader=loader, mesh_xy=mesh_xy,
             band_chunk_ranges=band_chunk_ranges, meta=meta,
-            bispinor=bispinor)
+            bispinor=bispinor, k_chunk_size=k_chunk_size)
     if mode == "file_reread":
         return RereadPsiGStore(
             loader=loader, mesh_xy=mesh_xy,
             band_chunk_ranges=band_chunk_ranges, meta=meta,
-            bispinor=bispinor)
+            bispinor=bispinor, k_chunk_size=k_chunk_size)
     raise ValueError(
         f"ψ(G-flat) store mode must be 'host_cache' or 'file_reread', got {mode!r}")

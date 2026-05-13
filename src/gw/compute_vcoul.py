@@ -821,6 +821,7 @@ def compute_all_V_q(
     sym=None,
     centroid_indices: np.ndarray | None = None,
     use_g_flat_zeta: bool = False,
+    g_chunk_size: int = 0,              # 0 = auto _pick_g_chunk(ngkmax)
 ) -> tuple[jax.Array, jax.Array]:
     """Compute V_qmunu(q,μ,ν) and g0_μ(q) at q=0 from a sharded ζ HDF5.
 
@@ -862,6 +863,7 @@ def compute_all_V_q(
             sys_dim=sys_dim, bdot=bdot,
             bare_coulomb_cutoff_ry=bare_coulomb_cutoff,
             bgw_v_grid_fn=bgw_v_grid_fn,
+            g_chunk=(int(g_chunk_size) if g_chunk_size > 0 else None),
             verbose=verbose, sym=sym,
             centroid_indices=centroid_indices,
             async_prefetch=_async,

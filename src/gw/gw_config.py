@@ -223,6 +223,22 @@ _DEFAULTS = {
     #   "analytic"  – regressed-fit analytic chooser (alternate model
     #                 over the same artifacts).
     "chunk_chooser_mode": "heuristic",
+    # Inner k-axis chunker in ``psi_G_store.fetch_psi_rchunk``.  Bounds
+    # the per-fetch FFT box ``(k_chunk, bc, ns, n_rtot)`` to avoid XLA
+    # materialising it unsharded at CrI3 6×6 80 Ry scale.
+    # 0 (default) = no inner k-chunking (one shot over all k).
+    "psig_k_chunk_size": 0,
+    # ``accumulate_rchunk_to_gflat`` flat-axis chunker.  Bounds the
+    # per-scan-iter FFT box ``chunk_size · n_rtot``.
+    # 0 (default) = one-shot; the gflat memory model overrides this
+    # at runtime when its planner picks a smaller value, but cohsex.in
+    # > 0 wins over the planner.
+    "gflat_chunk_size": 0,
+    # V_q inner G-axis GEMM chunk size.  Bounds the per-q ``lax.scan``
+    # working set inside the per-q V_q kernel.
+    # 0 (default) = auto (``_pick_g_chunk(ngkmax)`` → largest divisor
+    # of ngkmax ≤ 4096).
+    "vq_g_chunk_size": 0,
     # ζ-fit solver path overrides (3-state).  Default ``auto`` picks
     # cuSolverMp on true 2D meshes (p_x ≥ 2 AND p_y ≥ 2) and the
     # JAX/CUDA fallback otherwise.  Force a path with ``on`` / ``off``.
@@ -590,6 +606,9 @@ class MemoryConfig:
     zct_stage_cap_gb: float | None
     use_aot_chunk_chooser: bool
     chunk_chooser_mode: str       # "heuristic" | "analytic"
+    psig_k_chunk_size: int        # 0 = no inner k-chunking
+    gflat_chunk_size: int         # 0 = one-shot (or planner-picked)
+    vq_g_chunk_size: int          # 0 = auto _pick_g_chunk(ngkmax)
 
 
 @dataclass(frozen=True)
@@ -939,6 +958,9 @@ class LorraxConfig:
             zct_stage_cap_gb=zct_stage_cap_gb,
             use_aot_chunk_chooser=bool(_g("use_aot_chunk_chooser")),
             chunk_chooser_mode=str(_g("chunk_chooser_mode")).strip().lower(),
+            psig_k_chunk_size=int(_g("psig_k_chunk_size")),
+            gflat_chunk_size=int(_g("gflat_chunk_size")),
+            vq_g_chunk_size=int(_g("vq_g_chunk_size")),
         )
         backend = BackendConfig(
             slab_io=(

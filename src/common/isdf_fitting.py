@@ -1478,6 +1478,8 @@ def fit_zeta_to_h5(
     solver_kind: str = 'auto',
     cusolvermp_charge: str = "auto",
     cusolvermp_lu: str = "auto",
+    psig_k_chunk_size: int = 0,
+    gflat_chunk_size: int = 0,
     write_ibz_only: bool = True,
     zeta_cutoff_ry: float | None = None,
 ):
@@ -2014,6 +2016,7 @@ def fit_zeta_to_h5(
         band_chunk_ranges=band_chunk_ranges,
         bispinor=bispinor,
         mode=gspace_mode,
+        k_chunk_size=int(psig_k_chunk_size),
     )
 
     # ========== STEP 6: Loop over chunks ==========
@@ -2088,14 +2091,13 @@ def fit_zeta_to_h5(
     # scan-iteration of ``chunk_size``.  Memory bound:
     # ``chunk_size · n_rtot · 16 B`` for the per-iteration FFT box.
     #
-    # Default ``None`` (one-shot) is fine when the full per-rank box
-    # ``N · n_rtot · 16 B`` fits — MoS2 3×3 at 4 ranks: 1.1 GB.  For
-    # CrI3-class FFT grids set ``LORRAX_GFLAT_CHUNK_SIZE`` to an
-    # integer; the kernel zero-pads N up to a multiple of the chunk
+    # ``gflat_chunk_size = 0`` ⇒ one-shot (fine when the full per-rank
+    # box ``N · n_rtot · 16 B`` fits; MoS2 3×3 at 4 ranks: 1.1 GB).
+    # For CrI3-class FFT grids set cohsex.in ``gflat_chunk_size`` to
+    # an integer; the kernel zero-pads N up to a multiple of the chunk
     # size so any value works (no divisibility constraint on either
     # n_q or n_mu_local).
-    _env_cs = int(os.environ.get('LORRAX_GFLAT_CHUNK_SIZE', '0') or 0)
-    _gflat_chunk_size = _env_cs if _env_cs > 0 else None
+    _gflat_chunk_size = int(gflat_chunk_size) if gflat_chunk_size else None
     if jax.process_index() == 0:
         _p_prod = int(jax.device_count())
         _n_mu_local = int(meta.n_rmu_padded) // _p_prod
