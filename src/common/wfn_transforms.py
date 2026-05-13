@@ -593,19 +593,37 @@ def accumulate_rchunk_to_gflat(
                 rch_flat = jnp.pad(rch_flat, ((0, pad_N), (0, 0)))
                 acc_flat = jnp.pad(acc_flat, ((0, pad_N), (0, 0)))
 
+            # ----- Phase-on-slice setup (loop-invariant across the scan) -----
+            # The per-q Bloch phase ``exp(-2πi q·r)`` is applied only to the
+            # ``r_len`` slab cells (not to the zero-padded box) — saves
+            # ``(n_rtot - r_len) / n_rtot`` of the phase-multiply traffic.
+            # Decode r0_ + j into (rx, ry, rz) once outside ``body`` since
+            # r0_ is loop-invariant within the scan (the scan iterates over
+            # rows of the flat (q · μ_local) axis, not r-chunks).
+            if phx is not None:
+                r_idx_slab = r0_ + jnp.arange(r_len_i, dtype=jnp.int32)
+                ny_nz = jnp.int32(ny * nz)
+                rx_slab = r_idx_slab // ny_nz
+                ry_slab = (r_idx_slab // jnp.int32(nz)) % jnp.int32(ny)
+                rz_slab = r_idx_slab %  jnp.int32(nz)
+
             def body(acc, i):
                 i0    = i * cs
                 sub   = jax.lax.dynamic_slice_in_dim(rch_flat, i0, cs, axis=0)
                 q_row = jnp.clip(
                     (i0 + jnp.arange(cs)) // n_mu_local, 0, n_q - 1)
+                if phx is not None:
+                    # Per-q Bloch phase on the slab only: gather (cs, r_len)
+                    # from each axis's (n_q, n_*) table via the (cs,) q_row
+                    # and the (r_len,) slab-cell indices.  XLA fuses these
+                    # three gather+multiply ops into one pointwise pass.
+                    phx_q = phx[q_row][:, rx_slab]     # (cs, r_len)
+                    phy_q = phy[q_row][:, ry_slab]
+                    phz_q = phz[q_row][:, rz_slab]
+                    sub = sub * phx_q * phy_q * phz_q
                 buf = jnp.zeros((cs, n_rtot), dtype=sub.dtype)
                 buf = jax.lax.dynamic_update_slice_in_dim(buf, sub, r0_, axis=-1)
                 box = buf.reshape(cs, nx, ny, nz)
-                if phx is not None:
-                    box = (box
-                           * phx[q_row][:, :, None, None]
-                           * phy[q_row][:, None, :, None]
-                           * phz[q_row][:, None, None, :])
                 G = jnp.fft.fftn(box, axes=(-3, -2, -1), norm=norm).reshape(cs, n_rtot)
                 contrib = jnp.take_along_axis(
                     G, sphere_c[q_row], axis=-1, mode='promise_in_bounds')
