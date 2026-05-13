@@ -141,6 +141,10 @@ class PsiGStore:
         # Per-bc local band count: bands_per_device for ONE bc.
         bpd_per_bc = [(b_hi - b_lo) // p for (b_lo, b_hi) in self.band_chunk_ranges]
         self._bpd_per_bc = tuple(bpd_per_bc)
+        # Padded uniform per-bc band count — used by ``_slice_local_tile_bc``
+        # so an ``io_callback`` inside a ``lax.scan`` body sees a static
+        # return shape regardless of which bc the traced index resolves to.
+        self._bpd_max = max(bpd_per_bc) if bpd_per_bc else 0
 
         # Within each rank's tile the band axis is stacked in bc-order.
         offsets = [0]
@@ -255,6 +259,62 @@ class PsiGStore:
     # ---------------------------------------------------------------------
     # In-jit fetch
     # ---------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # Path D scaffolding — host-tile slicer that takes a traced bc_idx.
+    # ---------------------------------------------------------------------
+    # The existing ``fetch_psi_rchunk`` resolves ``band_range → bc_idx``
+    # statically before building the jit, then closes over per-bc
+    # ``(b_lo, b_hi)`` in its ``_slice_local_tile`` callback.  To run the
+    # bc-loop *inside* a ``lax.scan`` body (Path D from
+    # ``reports/zeta_rchunk_memory_model_2026-05-13/agent_2_structural_fix.md``
+    # §4a), the slicer instead receives a TRACED ``bc_idx`` int32 scalar
+    # via ``io_callback`` and must return a uniform-shape array.  We pad
+    # short bcs (the final bc whose width is < band_chunk) with zeros
+    # so every callback call returns ``(nk, bpd_max, ns, ngkmax)``; the
+    # downstream consumer applies an explicit band-mask to zero out the
+    # padded rows before they enter the pair-density einsum (so they
+    # contribute zero mathematically — see Path D §4c).
+    #
+    # NOT yet wired into the kernel — the consumer (rewrite of
+    # ``c_q_from_psi_sm`` / ``z_q_from_psi_sm``) is Path D §4c, deferred.
+    # This helper is checked in early so it can be unit-tested
+    # independently of the larger refactor.
+
+    def _slice_local_tile_bc(self, x_idx, y_idx, bc_idx) -> np.ndarray:
+        """Per-rank host-tile slice for a single bc, padded to uniform shape.
+
+        Parameters
+        ----------
+        x_idx, y_idx
+            ``jax.lax.axis_index('x') / ('y')`` int32 scalars (resolved
+            to Python ints inside the io_callback host function).
+        bc_idx
+            Traced int32 scalar in ``[0, len(band_chunk_ranges))``.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``(nk, bpd_max, ns, ngkmax)`` c128.  The first
+            ``bpd_per_bc[bc_idx]`` band rows hold the real bc data; the
+            remaining ``bpd_max - bpd_per_bc[bc_idx]`` rows are zero
+            (math-neutral when consumed under a band mask).
+
+        The static return shape is what ``io_callback`` requires for
+        the scan body to trace.
+        """
+        x, y, bc = int(x_idx), int(y_idx), int(bc_idx)
+        if not 0 <= bc < len(self.band_chunk_ranges):
+            raise ValueError(
+                f"_slice_local_tile_bc: bc_idx={bc} not in "
+                f"[0, {len(self.band_chunk_ranges)})")
+        tile = self._host_tiles[(x, y)]
+        b_lo = self._bc_band_offsets[bc]
+        b_hi = self._bc_band_offsets[bc + 1]
+        nk, _, ns, ngkmax = tile.shape
+        out = np.zeros((nk, self._bpd_max, ns, ngkmax), dtype=tile.dtype)
+        out[:, : b_hi - b_lo, :, :] = tile[:, b_lo:b_hi, :, :]
+        return out
+
     def _bc_index(self, band_range: tuple[int, int]) -> int:
         """Map a global ``band_range`` to its band-chunk index."""
         key = (int(band_range[0]), int(band_range[1]))

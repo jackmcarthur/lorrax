@@ -17,7 +17,8 @@ import pytest
 
 from jax.sharding import Mesh
 
-from common.wfn_transforms import to_box, to_rbox, to_rmu, to_rchunk
+from common.wfn_transforms import (
+    to_box, to_rbox, to_rmu, to_rchunk, to_rchunk_inner)
 from file_io.wfn_loader import WfnLoader
 
 from tests.test_wfn_loader_eager import _synth_wfn, _MOS2_WFN
@@ -192,6 +193,76 @@ def test_to_rchunk_rejects_out_of_bounds(synth_loader):
     nx, ny, nz = (int(s) for s in synth_loader.fft_grid)
     with pytest.raises(ValueError):
         to_rchunk(psi, g_index, synth_loader.fft_grid, nx * ny * nz - 2, 10, mesh=MESH)
+
+
+# ---------------------------------------------------------------------------
+# to_rchunk_inner (Path D §4b scaffolding) — must match to_rchunk
+# numerically when called on the same per-rank-local inputs.  Tested
+# both without and with the Bloch phase, since the two paths take
+# different branches inside to_rchunk's shard_map body.
+# ---------------------------------------------------------------------------
+
+def test_to_rchunk_inner_matches_to_rchunk_no_phase(synth_loader):
+    """to_rchunk_inner is the shard_map-less body of to_rchunk.  On a
+    1×1 mesh the wrapper is trivial, so per-rank-local output must
+    agree to floating point."""
+    psi = synth_loader.load(bands=(0, 3), k="full_bz")
+    g_index = synth_loader.box_index(k="full_bz")
+    nx, ny, nz = (int(s) for s in synth_loader.fft_grid)
+    r0, r_len = nx * ny + 2, 12
+
+    psi_inner = np.asarray(to_rchunk_inner(
+        psi, jnp.asarray(g_index, dtype=jnp.int32),
+        synth_loader.fft_grid, r0, r_len, norm="backward"))
+    psi_wrapped = np.asarray(to_rchunk(
+        psi, g_index, synth_loader.fft_grid, r0, r_len, mesh=MESH,
+        norm="backward"))
+    np.testing.assert_allclose(psi_inner, psi_wrapped, atol=1e-14, rtol=0)
+
+
+def test_to_rchunk_inner_matches_to_rchunk_with_phase(synth_loader):
+    """Bloch-phase branch — apply_bloch_phase_on_slice should run
+    identically inside vs outside the shard_map wrapper."""
+    psi = synth_loader.load(bands=(0, 3), k="full_bz")
+    g_index = synth_loader.box_index(k="full_bz")
+    nk = int(psi.shape[0])
+    nx, ny, nz = (int(s) for s in synth_loader.fft_grid)
+    r0, r_len = nx * ny + 2, 12
+
+    rng = np.random.default_rng(0)
+    kvecs_frac = rng.uniform(-0.5, 0.5, size=(nk, 3)).astype(np.float64)
+
+    psi_inner = np.asarray(to_rchunk_inner(
+        psi, jnp.asarray(g_index, dtype=jnp.int32),
+        synth_loader.fft_grid, r0, r_len,
+        kvecs_frac=jnp.asarray(kvecs_frac, dtype=jnp.float64),
+        norm="backward"))
+    psi_wrapped = np.asarray(to_rchunk(
+        psi, g_index, synth_loader.fft_grid, r0, r_len, mesh=MESH,
+        kvecs_frac=kvecs_frac, norm="backward"))
+    np.testing.assert_allclose(psi_inner, psi_wrapped, atol=1e-14, rtol=0)
+
+
+def test_to_rchunk_inner_traced_r0(synth_loader):
+    """The r0 arg must accept a traced scalar — the eventual Path D
+    consumer will pass ``r_start_dyn`` (a jit input) here."""
+    psi = synth_loader.load(bands=(0, 3), k="full_bz")
+    g_index = synth_loader.box_index(k="full_bz")
+    nx, ny, nz = (int(s) for s in synth_loader.fft_grid)
+    r_len = 12
+
+    @jax.jit
+    def fn(psi_, g_index_, r0_):
+        return to_rchunk_inner(psi_, g_index_, synth_loader.fft_grid,
+                                r0_, r_len, norm="backward")
+
+    r0_val = nx * ny + 2
+    r0 = jnp.int32(r0_val)
+    out = np.asarray(fn(psi, jnp.asarray(g_index, dtype=jnp.int32), r0))
+    expected = np.asarray(to_rchunk(
+        psi, g_index, synth_loader.fft_grid, r0_val, r_len, mesh=MESH,
+        norm="backward"))
+    np.testing.assert_allclose(out, expected, atol=1e-14, rtol=0)
 
 
 # ---------------------------------------------------------------------------

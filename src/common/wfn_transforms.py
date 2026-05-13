@@ -335,6 +335,82 @@ def to_rmu(
               jnp.asarray(kvecs_frac, dtype=jnp.float64))
 
 
+def to_rchunk_inner(
+    psi: jax.Array,
+    g_index: jax.Array,
+    fft_grid: Sequence[int],
+    r0,
+    r_len: int,
+    *,
+    norm: str = "backward",
+    kvecs_frac: jax.Array | None = None,
+) -> jax.Array:
+    """Per-rank-local body of :func:`to_rchunk`: G-flat → FFT-box → IFFT
+    → r-slice → optional Bloch phase.
+
+    No ``shard_map`` wrapper.  Callable from inside another shard_map's
+    body or a ``lax.scan`` body — the caller is responsible for any
+    sharding context.  Inputs and outputs are all per-rank-local arrays.
+
+    Path D scaffolding (see
+    ``reports/zeta_rchunk_memory_model_2026-05-13/agent_2_structural_fix.md``
+    §4b).  Not yet wired into the production fit kernel — the consumer
+    refactor (§4c, rewrite of ``c_q_from_psi_sm`` / ``z_q_from_psi_sm``
+    with a ``lax.scan`` over bcs inside their shard_map bodies) is
+    deferred to a follow-up session.  This helper is checked in early
+    so it can be unit-tested independently.
+
+    Mathematically identical to the body of :func:`to_rchunk`; the only
+    difference is that this version does not enter a shard_map.
+
+    Inputs
+    ------
+    psi
+        Shape ``(..., ngkmax)`` c128 — caller's responsibility to have
+        already partitioned data across ranks if running under a
+        shard_map.  The leading axes must contain exactly 3 dims before
+        the trailing ``ngkmax`` so the post-IFFT reshape lands at
+        ``(..., n_rtot)`` — typically ``(nk_local, nb_local, ns,
+        ngkmax)``.
+    g_index
+        Shape ``(..., ngkmax)`` int32 — flat box indices for each
+        G-vector per k.  Same broadcast contract as :func:`to_rchunk`.
+    fft_grid
+        ``(nx, ny, nz)``.
+    r0
+        Python int or traced int32 scalar — flat-r start index.
+    r_len
+        Static int — width of the r slab.
+    norm
+        FFT normalization, same conventions as ``jnp.fft.ifftn``.
+    kvecs_frac
+        Optional ``(..., 3)`` float64 — when provided, the Bloch
+        phase ``exp(+2πi k·r)`` is applied on the sliced slab via
+        :func:`apply_bloch_phase_on_slice`.
+
+    Output
+    ------
+    jax.Array
+        Shape ``(..., r_len)`` c128.
+    """
+    ngkmax = int(psi.shape[-1])
+    fft_grid_t = tuple(int(s) for s in fft_grid)
+    nx, ny, nz = fft_grid_t
+    n_rtot = nx * ny * nz
+    r_len_i = int(r_len)
+
+    box = _box_kernel(psi, g_index, ngkmax=ngkmax)
+    rb = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+    # Reshape (..., nx, ny, nz) → (..., n_rtot).  Same contract as
+    # to_rchunk._local_rchunk: assumes 3 leading axes before the spatial.
+    rb_flat = rb.reshape(*rb.shape[:3], n_rtot)
+    slab = jax.lax.dynamic_slice_in_dim(rb_flat, r0, r_len_i, axis=-1)
+    if kvecs_frac is not None:
+        slab = apply_bloch_phase_on_slice(
+            slab, kvecs_frac, fft_grid_t, r0, r_len_i)
+    return slab
+
+
 def to_rchunk(
     psi: jax.Array,
     g_index: np.ndarray | jax.Array,
