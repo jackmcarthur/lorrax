@@ -721,21 +721,23 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				band_chunk_size=chunks['band_chunk'],
 			)
 
-		# isdf_fitting / load_wfns caches close over tracers from the
-		# enclosing jit at first compile.  Reusing those compiled fns from
-		# a fresh fit_zeta_to_h5 invocation triggers
-		# UnexpectedTracerError because the closures hold values from a
-		# now-closed trace scope.  Clear before each channel.
+		# Per-channel cache hygiene.  The 2026-05-04 bispinor branch needed
+		# ``jax.clear_caches()`` here because the original ζ-fit cached
+		# functions closed over tracers from the enclosing jit (the
+		# UnexpectedTracerError surface).  After the 2026-05-08 open-spin
+		# consolidation (commit ce28d50), the cached helpers only capture
+		# static config (Mesh, shape, kgrid) — no tracer leaks remain.
+		#
+		# Keeping the surgical drop on ``_fit_one_rchunk_cache`` (whose
+		# cache key includes ``id(psi_G_store)`` and would never hit
+		# across channels anyway — drop = memory hygiene, not a workaround).
+		# The pair-density caches are intentionally preserved so the three
+		# transverse channels share the same n_rmu=n_rmu_current compile.
 		import gc
-		from common import isdf_fitting as _isdf, load_wfns as _lw
+		from common import isdf_fitting as _isdf
 
 		def _drop_traced_caches():
 			_isdf._fit_one_rchunk_cache.clear()
-			_isdf._pair_density_cache.clear()
-			_isdf._accum_pair_density_cache.clear()
-			if hasattr(_lw, '_rchunk_slice_cache'):
-				_lw._rchunk_slice_cache.clear()
-			jax.clear_caches()
 			gc.collect()
 
 		for mu_L in (1, 2, 3):
