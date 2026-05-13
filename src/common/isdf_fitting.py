@@ -569,43 +569,51 @@ def c_q_from_psi_sm(
 			# bands replicated):
 			#   psi_l_X_ : (nk, n_rmu_local, nb_l, ns)
 			#   psi_l_Y_ : (nk, nb_l, ns, n_col_local)
-			# Build rank-5 pair densities LOCALLY, then IFFT + contract +
-			# FFT — all local per rank.  The single ``kmna,knbr->kabmr``
-			# einsum lowers to a batched cuBLAS gemm that batches ns² in
-			# the M / N axes; that's the cache-friendly layout and runs
-			# fastest.  An ns²-unrolled version (4 rank-3 ``kmn,knr->kmr``
-			# gemms) dropped the per-rank peak by ~3% but cost ~15% in
-			# walltime, so the single-einsum form wins overall.
+			#
+			# Einsum output order matters for memory: the gemm naturally
+			# produces ``(k, ns_l · col_local, ns_r · μ_local)`` with the
+			# bitcast factoring as ``(k, ns_l, col_local, μ_local, ns_r)``.
+			# We pick output spec ``'karmb'`` (k, ns_l, col, μ, ns_r) so
+			# the rank-7 reshape that feeds the IFFT is a pure bitcast —
+			# no extra 4-GiB buffer for the rank-3 → rank-7 transpose
+			# (which the natural ``'kabmr'`` order forced).  Verified
+			# from HLO: dropped one of the three rank-5 lifetime slots.
 			mu_loc = psi_l_X_.shape[1]
 			col_loc = psi_l_Y_.shape[3]
 			P_l = jnp.einsum(
-				'kmna,knbr->kabmr', psi_l_X_, psi_l_Y_, optimize=True)
+				'kmna,knbr->karmb', psi_l_X_, psi_l_Y_, optimize=True)
 			P_r = jnp.einsum(
-				'kmna,knbr->kabmr', psi_r_X_, psi_r_Y_, optimize=True)
-			# Reshape (nk → nkx·nky·nkz) for the local 3D IFFT.
-			P_l_3d = P_l.reshape(nkx, nky, nkz, ns, ns, mu_loc, col_loc)
+				'kmna,knbr->karmb', psi_r_X_, psi_r_Y_, optimize=True)
+			# Split k → (kx, ky, kz) — bitcast given the above layout.
+			# Rank-7: (kx, ky, kz, ns_l, col, μ, ns_r).
+			P_l_3d = P_l.reshape(nkx, nky, nkz, ns, col_loc, mu_loc, ns)
 			del P_l
 			P_l_R = jnp.fft.ifftn(P_l_3d, axes=(0, 1, 2), norm='forward')
 			P_l_R_conj = jnp.conj(P_l_R)
 			del P_l_3d, P_l_R
-			P_r_3d = P_r.reshape(nkx, nky, nkz, ns, ns, mu_loc, col_loc)
+			P_r_3d = P_r.reshape(nkx, nky, nkz, ns, col_loc, mu_loc, ns)
 			del P_r
 			P_r_R = jnp.fft.ifftn(P_r_3d, axes=(0, 1, 2), norm='forward')
 			del P_r_3d
-			# γ̃·γ̃·conj(P_l_R)·P_r_R, reduce over spin axes (3, 4)
-			# of the rank-7 form.  Returns rank-5
-			# (nkx, nky, nkz, μ_local, col_local).
+			# Reduce over the spin axes (3=ns_l, 6=ns_r) of the rank-7
+			# form.  Output rank-5: (kx, ky, kz, col, μ).
 			C_R = gamma_double_contract(
 				P_l_R_conj, P_r_R,
 				perm_L=None if _lhs_id else perm_L_,
 				phase_L=None if _lhs_id else phase_L_,
 				perm_R=None if _rhs_id else perm_R_,
 				phase_R=None if _rhs_id else phase_R_,
-				spin_axes=(3, 4),
+				spin_axes=(3, 6),
 			)
 			del P_l_R_conj, P_r_R
 			C_q_3d = jnp.fft.fftn(C_R, axes=(0, 1, 2), norm='forward')
-			return C_q_3d.reshape(nkx * nky * nkz, mu_loc, col_loc)
+			# Reshape back to (nk, col, μ); transpose final two axes
+			# to satisfy out_spec ``P(None, 'x', 'y')`` for (nk, μ, col).
+			# This transpose acts on the rank-3 reduced form (~16 MB),
+			# not the rank-5 pair density.
+			return jnp.transpose(
+				C_q_3d.reshape(nkx * nky * nkz, col_loc, mu_loc),
+				(0, 2, 1))
 
 		@jax.jit
 		def fn(psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, pL, phL, pR, phR):
@@ -673,22 +681,22 @@ def z_q_from_psi_sm(
 		         check_rep=False)
 		def _local(psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_,
 		           perm_L_, phase_L_, perm_R_, phase_R_):
-			# Same layout / IFFT / contract / FFT pattern as
-			# c_q_from_psi_sm; ``col`` here is the r-chunk extent
-			# (not n_rmu).  See c_q_from_psi_sm._local for the
-			# performance / memory rationale.
+			# Einsum spec ``'karmb'`` matches cuBLAS's natural gemm
+			# output factoring ``(k, ns_l, col, μ, ns_r)`` so the
+			# rank-7 reshape is a bitcast.  See c_q_from_psi_sm._local
+			# for full commentary.  ``col`` here is the r-chunk extent.
 			mu_loc = psi_l_X_.shape[1]
 			z_loc = psi_l_Y_.shape[3]
 			P_l = jnp.einsum(
-				'kmna,knbr->kabmr', psi_l_X_, psi_l_Y_, optimize=True)
+				'kmna,knbr->karmb', psi_l_X_, psi_l_Y_, optimize=True)
 			P_r = jnp.einsum(
-				'kmna,knbr->kabmr', psi_r_X_, psi_r_Y_, optimize=True)
-			P_l_3d = P_l.reshape(nkx, nky, nkz, ns, ns, mu_loc, z_loc)
+				'kmna,knbr->karmb', psi_r_X_, psi_r_Y_, optimize=True)
+			P_l_3d = P_l.reshape(nkx, nky, nkz, ns, z_loc, mu_loc, ns)
 			del P_l
 			P_l_R = jnp.fft.ifftn(P_l_3d, axes=(0, 1, 2), norm='forward')
 			P_l_R_conj = jnp.conj(P_l_R)
 			del P_l_3d, P_l_R
-			P_r_3d = P_r.reshape(nkx, nky, nkz, ns, ns, mu_loc, z_loc)
+			P_r_3d = P_r.reshape(nkx, nky, nkz, ns, z_loc, mu_loc, ns)
 			del P_r
 			P_r_R = jnp.fft.ifftn(P_r_3d, axes=(0, 1, 2), norm='forward')
 			del P_r_3d
@@ -698,11 +706,13 @@ def z_q_from_psi_sm(
 				phase_L=None if _lhs_id else phase_L_,
 				perm_R=None if _rhs_id else perm_R_,
 				phase_R=None if _rhs_id else phase_R_,
-				spin_axes=(3, 4),
+				spin_axes=(3, 6),
 			)
 			del P_l_R_conj, P_r_R
 			Z_q_3d = jnp.fft.fftn(Z_R, axes=(0, 1, 2), norm='forward')
-			return Z_q_3d.reshape(nkx * nky * nkz, mu_loc, z_loc)
+			return jnp.transpose(
+				Z_q_3d.reshape(nkx * nky * nkz, z_loc, mu_loc),
+				(0, 2, 1))
 
 		@jax.jit
 		def fn(psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, pL, phL, pR, phR):
