@@ -12,6 +12,7 @@ sharded dim.  See ``ffi/phdf5/cpp/write_ffi.cc`` for the C++ side.
 """
 from __future__ import annotations
 
+import functools
 import os
 import queue
 import shutil
@@ -258,6 +259,74 @@ def _validate_block_divisible(
 
 
 # ---------------------------------------------------------------------------
+# Module-level shard_map kernel factories (read / write)
+# ---------------------------------------------------------------------------
+#
+# A jit'd shard_map per ``(mesh, sharding, ctx_handle, ds_id, mesh_shape,
+# axis layout, dtype/shape)`` signature.  Caching at module scope means
+# all ``_FfiBackend`` instances share one cache — re-opening the same
+# file, or opening any file with a matching FFI signature, reuses the
+# compile.  The closure is built INSIDE the cached factory so its
+# Python ``id()`` is stable per cache entry (vs ``functools.partial``,
+# which constructs a fresh wrapper each call and defeats JAX's
+# trace-cache identity test).
+#
+# FFI attrs (``ctx_handle``, ``ds_id``, mesh layout) remain compile-time
+# constants — distinct ``(file, dataset)`` tuples genuinely produce
+# distinct HLO modules (the FFI handler picks the dataset by ``ds_id``).
+# Coalescing across files would require making those attrs runtime args
+# on the C++ side, which is out of scope for this refactor.
+
+@functools.lru_cache(maxsize=None)
+def _get_read_sm(mesh, partition_spec, *,
+                 ds_id, ctx_handle, mesh_shape,
+                 axis_count_per_dim, axis_flat, out_struct):
+    """One H5Dread per rank.  Returns a jit'd shard_map; identity-stable
+    via lru_cache so JAX's trace cache hits on repeat invocation."""
+    from ffi.phdf5.read import ffi_read_call
+
+    def _per_rank(offset_local, valid_shape_local):
+        return ffi_read_call(
+            out_struct, offset_local, valid_shape_local,
+            ctx_handle=ctx_handle, ds_id=ds_id,
+            mesh_shape=mesh_shape,
+            axis_count_per_dim=axis_count_per_dim,
+            axis_flat=axis_flat,
+        )
+    sm_bare = shard_map(
+        _per_rank, mesh=mesh,
+        in_specs=(P(), P()), out_specs=partition_spec,
+        check_rep=False,
+    )
+    return jax.jit(sm_bare)
+
+
+@functools.lru_cache(maxsize=None)
+def _get_write_sm(mesh, in_specs, *,
+                  ds_id, ctx_handle, mesh_shape,
+                  axis_count_per_dim, axis_flat, no_jit):
+    """One H5Dwrite per rank.  ``LORRAX_WRITE_NO_JIT=1`` (passed via
+    ``no_jit``) skips the jit wrapper — diagnostic for chasing the
+    jit-argument-retention buffer leak on long write loops."""
+    from ffi.phdf5.write import ffi_write_call
+
+    def _per_rank(A_local, offset_local, valid_shape_local):
+        return ffi_write_call(
+            A_local, offset_local, valid_shape_local,
+            ctx_handle=ctx_handle, ds_id=ds_id,
+            mesh_shape=mesh_shape,
+            axis_count_per_dim=axis_count_per_dim,
+            axis_flat=axis_flat,
+        )
+    sm_bare = shard_map(
+        _per_rank, mesh=mesh,
+        in_specs=(in_specs, P(), P()), out_specs=P(),
+        check_rep=False,
+    )
+    return sm_bare if no_jit else jax.jit(sm_bare)
+
+
+# ---------------------------------------------------------------------------
 # Backend
 # ---------------------------------------------------------------------------
 class _FfiBackend:
@@ -310,10 +379,12 @@ class _FfiBackend:
         # every rank dispatches in the same order, which is the MPI-IO
         # collective rendezvous requirement.  See
         # ``reports/session_2026-04-18_async_probe/report.md``.
-        # Cache of compiled shard_map closures keyed on the full FFI
-        # attr + shape/dtype signature, so repeat writes at identical
-        # signatures reuse the jit cache instead of recompiling.
-        self._sm_cache: dict = {}
+        # Compiled shard_map cache lives at module level — see
+        # ``_get_read_sm`` / ``_get_write_sm``.  Instance no longer
+        # carries its own ``_sm_cache``; the module-level lru_cache is
+        # shared across all _FfiBackend instances, so re-opening the
+        # same (or another) file with matching FFI signature reuses
+        # the cached compile.
         # Bound the write-dispatch queue to prevent GPU memory growth
         # across chunks.  Each queued ``_task`` closure captures its
         # input ``A`` (the jax.Array being written) by Python reference
@@ -484,8 +555,6 @@ class _FfiBackend:
         chunks: Sequence[int] | None = None,
         k_chunk_size: int | None = None,
     ) -> None:
-        from ffi.phdf5.write import ffi_write_call
-
         if not isinstance(A, jax.Array):
             A = jnp.asarray(A)
         # Ensure placement: if not sharded on our mesh, put as replicated.
@@ -530,50 +599,17 @@ class _FfiBackend:
         ctx_handle = self.fh
         in_specs = A.sharding.spec  # PartitionSpec
 
-        # ── shard_map cache ──
-        # Keyed on everything that's a compile-time FFI attr + array
-        # shape/dtype/sharding, so repeat writes at identical signatures
-        # reuse the compiled module.  ``offset_base`` is now a RUNTIME
-        # Buffer (not an Attr), so it's intentionally NOT in the key —
-        # chunks with different offsets hit the same cached compile.
-        cache_key = (
-            int(ctx_handle), int(ds_id), mesh_shape,
-            axis_count_per_dim, axis_flat,
-            A.shape, str(A.dtype), in_specs,
+        # Module-level lru_cache shared across all _FfiBackend instances.
+        # Keys on the FFI signature (ctx_handle / ds_id / mesh / sharding);
+        # offset is a RUNTIME arg so different chunks reuse one compile.
+        sm = _get_write_sm(
+            self.mesh, in_specs,
+            ds_id=int(ds_id), ctx_handle=int(ctx_handle),
+            mesh_shape=mesh_shape,
+            axis_count_per_dim=axis_count_per_dim,
+            axis_flat=axis_flat,
+            no_jit=bool(os.environ.get('LORRAX_WRITE_NO_JIT')),
         )
-        sm = self._sm_cache.get(cache_key)
-        if sm is None:
-            def _per_rank(A_local, offset_local, valid_shape_local,
-                          _ds_id=int(ds_id),
-                          _mesh_shape=mesh_shape,
-                          _axis_count=axis_count_per_dim,
-                          _axis_flat=axis_flat,
-                          _ctx_handle=int(ctx_handle)):
-                return ffi_write_call(
-                    A_local, offset_local, valid_shape_local,
-                    ctx_handle=_ctx_handle,
-                    ds_id=_ds_id,
-                    mesh_shape=_mesh_shape,
-                    axis_count_per_dim=_axis_count,
-                    axis_flat=_axis_flat,
-                )
-            sm_bare = shard_map(
-                _per_rank, mesh=self.mesh,
-                in_specs=(in_specs, P(), P()), out_specs=P(),
-                check_rep=False,
-            )
-            # DIAGNOSTIC: LORRAX_WRITE_NO_JIT=1 bypasses the jax.jit
-            # wrapper — tests whether jit's argument-retention cache is
-            # what's leaking ~1 zeta_chunk/rank per write.
-            if os.environ.get('LORRAX_WRITE_NO_JIT'):
-                sm = sm_bare
-            else:
-                # Wrap in jax.jit so the trace+compile is cached at the
-                # JAX jit level.  Without this, shard_map re-traces on each
-                # call even though we reuse the same ``sm`` object — visible
-                # in the HLO dump as multiple identical-signature modules.
-                sm = jax.jit(sm_bare)
-            self._sm_cache[cache_key] = sm
 
         # Enqueue dispatch onto the Python worker thread.  Main thread
         # returns in ~0.2ms; the worker thread calls ``sm(A, offset)``
@@ -605,8 +641,6 @@ class _FfiBackend:
         as_numpy: bool = False,  # accepted for signature compatibility;
         # the public SlabIO.read_slab handles the numpy conversion.
     ) -> jax.Array:
-        from ffi.phdf5.read import ffi_read_call
-
         mesh = mesh or self.mesh
         if shape is None or dtype is None:
             # Symmetry with the allgather backend: callers that don't
@@ -657,40 +691,15 @@ class _FfiBackend:
         ds_id = self._ds_id(name, readonly=True)
         ctx_handle = self.fh
 
-        # Cache key: same as writes, plus the local_shape + partition_spec
-        # (since reads are parameterised by output shape + sharding spec).
-        cache_key = (
-            "read", int(ctx_handle), int(ds_id), mesh_shape,
-            axis_count_per_dim, axis_flat,
-            tuple(local_shape), str(jnp.dtype(dtype)),
-            partition_spec,
+        # Module-level lru_cache shared across all _FfiBackend instances.
+        sm = _get_read_sm(
+            mesh, partition_spec,
+            ds_id=int(ds_id), ctx_handle=int(ctx_handle),
+            mesh_shape=mesh_shape,
+            axis_count_per_dim=axis_count_per_dim,
+            axis_flat=axis_flat,
+            out_struct=out_struct,
         )
-        sm = self._sm_cache.get(cache_key)
-        if sm is None:
-            def _per_rank(offset_local, valid_shape_local,
-                          _ds_id=int(ds_id),
-                          _mesh_shape=mesh_shape,
-                          _axis_count=axis_count_per_dim,
-                          _axis_flat=axis_flat,
-                          _ctx_handle=int(ctx_handle),
-                          _out_struct=out_struct):
-                return ffi_read_call(
-                    _out_struct,
-                    offset_local,
-                    valid_shape_local,
-                    ctx_handle=_ctx_handle,
-                    ds_id=_ds_id,
-                    mesh_shape=_mesh_shape,
-                    axis_count_per_dim=_axis_count,
-                    axis_flat=_axis_flat,
-                )
-            sm_bare = shard_map(
-                _per_rank, mesh=mesh,
-                in_specs=(P(), P()), out_specs=partition_spec,
-                check_rep=False,
-            )
-            sm = jax.jit(sm_bare)
-            self._sm_cache[cache_key] = sm
 
         offset_arr = _replicated_i64_vector(off, mesh)
         valid_shape_arr = _replicated_i64_vector(vshape, mesh)
