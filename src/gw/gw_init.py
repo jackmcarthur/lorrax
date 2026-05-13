@@ -571,57 +571,52 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		print_fn=print_fn, rank0=_rank0,
 	)
 
-	# G-flat memory model (2026-05-12).  Overrides band_chunk + chunk_r
-	# when the new write_g_flat_zeta path is active — replaces the
-	# legacy six-stage moment model for that code path with a clean
-	# four-peak (A: centroid load · B: CCT/chol · C: fit_one_rchunk ·
-	# D: accumulate) model.  Reports a per-rank HBM HWM estimate
+	# G-flat memory model.  Picks band_chunk + chunk_r + gflat_chunk_size
+	# via a four-peak (A: centroid load · B: CCT/chol · C: fit_one_rchunk
+	# · D: accumulate) model.  Reports a per-rank HBM HWM estimate
 	# alongside the chunk plan so the log shows the budget utilisation.
-	# Leaves q_chunk / q_gather / k_chunk on the legacy chunker (the
-	# G-flat path doesn't materially change those).
-	_write_g_flat_zeta = os.environ.get(
-		'LORRAX_WRITE_G_FLAT_ZETA', '1') != '0'
-	if _write_g_flat_zeta:
-		from gw.gflat_memory_model import plan_gflat_chunks
-		nb_total_chunker = (band_range_left[1] - band_range_left[0]
-		                    + band_range_right[1] - band_range_right[0])
-		# Q-axis on disk: IBZ size when write_ibz_only is on, else nk.
-		# At this point we haven't computed n_q_ibz yet; the IBZ subset
-		# is built later in fit_zeta_to_h5.  Use a conservative full-BZ
-		# estimate (over-counts gflat_acc slightly on bispinor; the
-		# transverse path always writes IBZ-only).
-		_nq_disk_est = int(meta.nk_tot)
-		_ngkmax_est = int(getattr(meta, 'ngkmax', 0)) or int(0.06 * meta.n_rtot)
-		gflat_plan = plan_gflat_chunks(
-			meta=meta, mesh_xy=mesh_xy,
-			nb_total=nb_total_chunker,
-			ngkmax=_ngkmax_est, n_q_disk=_nq_disk_est,
-			budget_gb=float(cfg.memory.per_device_gb),
-			target_utilization=0.80,
-			fft_box_factor=4.0,
-			is_bispinor=bool(cfg.bispinor),
-			max_chunks=64,
-			r_chunk_override=(
-				int(cfg.memory.r_chunk_override)
-				if cfg.memory.r_chunk_override > 0 else None),
-			band_chunk_override=(
-				int(cfg.memory.band_chunk_size)
-				if cfg.memory.band_chunk_size > 0 else None),
-		)
-		if _rank0:
-			print_fn("")
-			print_fn(gflat_plan.format())
-		chunks['band_chunk'] = int(gflat_plan.band_chunk)
-		chunks['chunk_r'] = int(gflat_plan.r_chunk)
-		chunks['gflat_chunk_size'] = gflat_plan.gflat_chunk_size
-		chunks['gflat_hwm_gb'] = gflat_plan.hwm_bytes / 1e9
-		# Propagate gflat_chunk_size to the accumulator via env (fit_zeta
-		# reads LORRAX_GFLAT_CHUNK_SIZE).  Only set if the model picked a
-		# non-default value and the user hasn't overridden it.
-		if (gflat_plan.gflat_chunk_size is not None
-		        and not os.environ.get('LORRAX_GFLAT_CHUNK_SIZE')):
-			os.environ['LORRAX_GFLAT_CHUNK_SIZE'] = str(
-				int(gflat_plan.gflat_chunk_size))
+	# Leaves q_chunk / k_chunk on the legacy chunker (the G-flat path
+	# doesn't materially change those).
+	from gw.gflat_memory_model import plan_gflat_chunks
+	nb_total_chunker = (band_range_left[1] - band_range_left[0]
+	                    + band_range_right[1] - band_range_right[0])
+	# Q-axis on disk: IBZ size when write_ibz_only is on, else nk.  At
+	# this point we haven't computed n_q_ibz yet; the IBZ subset is
+	# built later in fit_zeta_to_h5.  Use a conservative full-BZ
+	# estimate (over-counts gflat_acc slightly on bispinor; the
+	# transverse path always writes IBZ-only).
+	_nq_disk_est = int(meta.nk_tot)
+	_ngkmax_est = int(getattr(meta, 'ngkmax', 0)) or int(0.06 * meta.n_rtot)
+	gflat_plan = plan_gflat_chunks(
+		meta=meta, mesh_xy=mesh_xy,
+		nb_total=nb_total_chunker,
+		ngkmax=_ngkmax_est, n_q_disk=_nq_disk_est,
+		budget_gb=float(cfg.memory.per_device_gb),
+		target_utilization=0.80,
+		fft_box_factor=4.0,
+		is_bispinor=bool(cfg.bispinor),
+		max_chunks=64,
+		r_chunk_override=(
+			int(cfg.memory.r_chunk_override)
+			if cfg.memory.r_chunk_override > 0 else None),
+		band_chunk_override=(
+			int(cfg.memory.band_chunk_size)
+			if cfg.memory.band_chunk_size > 0 else None),
+	)
+	if _rank0:
+		print_fn("")
+		print_fn(gflat_plan.format())
+	chunks['band_chunk'] = int(gflat_plan.band_chunk)
+	chunks['chunk_r'] = int(gflat_plan.r_chunk)
+	chunks['gflat_chunk_size'] = gflat_plan.gflat_chunk_size
+	chunks['gflat_hwm_gb'] = gflat_plan.hwm_bytes / 1e9
+	# Propagate gflat_chunk_size to the accumulator via env (fit_zeta
+	# reads LORRAX_GFLAT_CHUNK_SIZE).  Only set if the model picked a
+	# non-default value and the user hasn't overridden it.
+	if (gflat_plan.gflat_chunk_size is not None
+	        and not os.environ.get('LORRAX_GFLAT_CHUNK_SIZE')):
+		os.environ['LORRAX_GFLAT_CHUNK_SIZE'] = str(
+			int(gflat_plan.gflat_chunk_size))
 
 	zeta_h5_path = os.path.join(tmp_dir, "zeta_q.h5")
 	print_fn(f"\n  Chunked ISDF fitting:")
@@ -687,7 +682,6 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			psi_rmu_Y=psi_rmu_Y, psi_rmuT_X=psi_rmuT_X,
 			band_chunk_size=chunks['band_chunk'],
 			q_chunk_size=chunks['q_chunk'],
-			q_gather_size=chunks.get('q_gather', 0),
 			bispinor=cfg.bispinor,
 			band_range_left=band_range_left,
 			band_range_right=band_range_right,
@@ -808,7 +802,6 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					psi_rmu_Y=psi_curr_rmu_Y, psi_rmuT_X=psi_curr_rmuT_X,
 					band_chunk_size=chunks['band_chunk'],
 					q_chunk_size=chunks['q_chunk'],
-					q_gather_size=chunks.get('q_gather', 0),
 					bispinor=cfg.bispinor,
 					band_range_left=band_range_left,
 					band_range_right=band_range_right,

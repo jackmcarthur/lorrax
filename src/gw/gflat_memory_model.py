@@ -1,13 +1,6 @@
 """G-flat ζ + V_q memory model — pick chunk sizes near the budget.
 
-Designed for the post-2026-05-12 ``write_g_flat_zeta=True`` pipeline.
-The legacy ``compute_optimal_chunks`` (six-stage moment model in
-``gw_init``) targets the r-space ζ-on-disk + per-chunk H5 write path
-and is increasingly mis-tuned for the current code.  This module is a
-clean replacement keyed on what the G-flat pipeline actually does.
-
-Four per-rank HBM peaks across :func:`isdf_fitting.fit_zeta_to_h5`
-under ``write_g_flat_zeta=True``:
+Four per-rank HBM peaks across :func:`isdf_fitting.fit_zeta_to_h5`:
 
     Peak A — band-chunked centroid load (pre-loop).
         ψ(G) → IFFT → sample at r_μ.  The ψ(r) FFT box transient is

@@ -826,17 +826,18 @@ def compute_all_V_q(
 
     Dispatcher with two paths:
 
-    * On-disk ``ζ`` in **G-flat** layout (writer ran with
-      ``LORRAX_WRITE_G_FLAT_ZETA=1``): routes to
+    * On-disk ``ζ`` in **G-flat** layout (the only thing
+      :func:`fit_zeta_to_h5` writes): routes to
       :func:`gw.v_q_g_flat.compute_all_V_q_g_flat` — per-q, G-chunked
       contract on the writer's per-q WFN.h5-style sphere.  No FFT,
       no shared-sphere conversion, no μ × ν tiling; the chooser
       collapses to "pick g_chunk".
 
-    * On-disk ``ζ`` in **r-space** layout (legacy default): routes to
+    * On-disk ``ζ`` in **r-space** layout: routes to
       :func:`gw.v_q_tile.compute_V_q_tile` — the older driver that
-      handles FFT + sphere gather + μ × ν tiling inline.  Kept as a
-      fallback while r-space ζ files remain in production use.
+      handles FFT + sphere gather + μ × ν tiling inline.  Reachable
+      only for legacy r-space ζ files; not exercised by the current
+      writer.
 
     Parameters mirror the old API; ``mu_chunk_size`` / ``q_batch_size``
     are kept for back-compat with r-space callers but ignored on the

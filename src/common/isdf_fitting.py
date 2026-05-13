@@ -1,7 +1,5 @@
 import gc
 import os
-import queue
-import threading
 import time
 from types import SimpleNamespace
 from functools import partial
@@ -1473,7 +1471,6 @@ def fit_zeta_to_h5(
     band_range_left: tuple[int, int] | None = None,
     band_range_right: tuple[int, int] | None = None,
     k_chunk_size: int = 0,
-    q_gather_size: int = 0,
     band_norms: np.ndarray | None = None,
     slab_io_backend=None,
     gspace_mode: str = "host_cache",
@@ -1544,7 +1541,6 @@ def fit_zeta_to_h5(
     if slab_io_backend is None:
         slab_io_backend = SlabIOBackend.H5PY_ALLGATHER
     use_ffi_io = (slab_io_backend is SlabIOBackend.PHDF5_FFI)
-    import h5py
 
     nx, ny, nz = meta.fft_grid
     # Two μ extents flow through this function (see common/meta.py:38):
@@ -1797,22 +1793,20 @@ def fit_zeta_to_h5(
         print(f"  q axis on disk: full BZ ({nq} q-points) "
               f"(write_ibz_only=False or closure check failed)")
 
-    # ---- Phase C: G-flat on-disk format toggle -----------------
-    # When ``LORRAX_WRITE_G_FLAT_ZETA=1`` is set, the writer
-    # accumulates each r-chunk's contribution into a persistent
-    # G-flat buffer via ``common.wfn_transforms.accumulate_rchunk_to_gflat``
-    # and writes the final tensor as ``zeta_q_G`` (shape
+    # ---- G-flat on-disk format ---------------------------------
+    # The writer accumulates each r-chunk's contribution into a
+    # persistent G-flat buffer via
+    # ``common.wfn_transforms.accumulate_rchunk_to_gflat`` and writes
+    # the final tensor as ``zeta_q_G`` (shape
     # ``(n_q_disk, n_rmu, ngkmax)``).  The full r-space ζ_q is never
     # materialised on disk or as a persistent device buffer.  When
-    # ``vcoul_cutoff_ry`` is provided we build the per-q WFN.h5-style
+    # ``zeta_cutoff_ry`` is provided we build the per-q WFN.h5-style
     # sphere ``{G : |q+G|² ≤ cutoff}``, pad to a uniform ``ngkmax``
     # with the sentinel Miller index ``(-nx/2, -ny/2, -nz/2)``, and
     # store both the coeffs and the per-q components on disk.  Without
     # a cutoff the writer falls back to the full flat-FFT axis
     # (n_G_sph = n_rtot) — slow disk path, kept for sanity checks.
-    write_g_flat_zeta = bool(int(os.environ.get(
-        'LORRAX_WRITE_G_FLAT_ZETA', '0')))
-    if write_g_flat_zeta and q_irr_frac is None:
+    if q_irr_frac is None:
         # Full-BZ q-vectors with BGW wrap, then / kgrid — same convention
         # the V_q kernel's ``_zeta_disk_to_G`` consumed via
         # ``_qvec_wrap``.
@@ -1832,8 +1826,7 @@ def fit_zeta_to_h5(
     _gflat_gvec_components = None        # (n_q_disk, 3, ngkmax) int32
     _gflat_ngk_per_q = None              # (n_q_disk,) int32
     _gflat_ngkmax = None
-    if write_g_flat_zeta and zeta_cutoff_ry is not None \
-            and int(meta.sys_dim) != 0:
+    if zeta_cutoff_ry is not None and int(meta.sys_dim) != 0:
         from common.coulomb_sphere import compute_per_q_bare_coulomb_components
         _bvec_for_sphere = np.asarray(
             wfn.blat * wfn.bvec, dtype=np.float64)
@@ -1895,20 +1888,17 @@ def fit_zeta_to_h5(
         fft_grid=meta.fft_grid,
         density=_density_label,
         vertex_mu_L=int(vertex_mu_L),
-        zeta_layout=('G_flat' if write_g_flat_zeta else 'r_space'),
+        zeta_layout='G_flat',
     )
-    if write_g_flat_zeta and _gflat_gvec_components is not None:
-        _hdr_kwargs.update(
-            gvec_components=_gflat_gvec_components,
-            ngk_per_q=_gflat_ngk_per_q,
-            zeta_cutoff_ry=float(zeta_cutoff_ry),
-        )
-    elif write_g_flat_zeta:
+    if _gflat_gvec_components is None:
         raise ValueError(
-            "G-flat ζ writer is enabled (LORRAX_WRITE_G_FLAT_ZETA=1) "
-            "but no ζ sphere was built — pass zeta_cutoff_ry to "
-            "fit_zeta_to_h5 (or unset the env var to fall back to "
-            "the r-space layout).")
+            "G-flat ζ writer requires a ζ sphere — pass "
+            "zeta_cutoff_ry to fit_zeta_to_h5.")
+    _hdr_kwargs.update(
+        gvec_components=_gflat_gvec_components,
+        ngk_per_q=_gflat_ngk_per_q,
+        zeta_cutoff_ry=float(zeta_cutoff_ry),
+    )
     _isdf_hdr = IsdfHeader.build(**_hdr_kwargs)
 
     with timing.section("zeta_fit.write_headers"):
@@ -1957,51 +1947,31 @@ def fit_zeta_to_h5(
     # transposes the returned array on GPU to match the kernel's
     # (n_rmu, n_rtot) expectation — ~50 µs per q, negligible.
     with timing.section("zeta_fit.open_file"):
-        if write_g_flat_zeta:
-            # G-flat layout: ``zeta_q_G`` dataset (n_q_disk, n_rmu, ngkmax)
-            # — WFN.h5 ``wfns/coeffs`` style with a fixed ``ngkmax``
-            # padded G axis.  Per-q components live in
-            # ``isdf_header/gvec_components`` (already serialised by the
-            # write_isdf_header call above).  Chunking: one row per q
-            # × full μ × full ngkmax keeps per-q reads contiguous.
-            _n_G_sph = (int(_gflat_ngkmax)
-                         if _gflat_ngkmax is not None else n_rtot)
-            if use_ffi_io:
-                zeta_io = SlabIO(output_file, mode='a', mesh=mesh_xy,
-                                 backend=slab_io_backend)
-                zeta_io.create_dataset(
-                    'zeta_q_G',
-                    shape=(n_q_disk, n_rmu, _n_G_sph),
-                    dtype=np.complex128,
-                    chunks=(1, n_rmu, _n_G_sph),
-                )
-            else:
-                with SlabIO(output_file, mode='a', mesh=mesh_xy,
-                            backend=slab_io_backend) as _zeta_create_io:
-                    _zeta_create_io.create_dataset(
-                        'zeta_q_G',
-                        shape=(n_q_disk, n_rmu, _n_G_sph),
-                        dtype=np.complex128,
-                        chunks=(1, n_rmu, _n_G_sph),
-                    )
-                zeta_io = None
-        elif use_ffi_io:
+        # G-flat layout: ``zeta_q_G`` dataset (n_q_disk, n_rmu, ngkmax)
+        # — WFN.h5 ``wfns/coeffs`` style with a fixed ``ngkmax`` padded
+        # G axis.  Per-q components live in
+        # ``isdf_header/gvec_components`` (already serialised by the
+        # write_isdf_header call above).  Chunking: one row per q ×
+        # full μ × full ngkmax keeps per-q reads contiguous.
+        _n_G_sph = (int(_gflat_ngkmax)
+                     if _gflat_ngkmax is not None else n_rtot)
+        if use_ffi_io:
             zeta_io = SlabIO(output_file, mode='a', mesh=mesh_xy,
                              backend=slab_io_backend)
             zeta_io.create_dataset(
-                'zeta_q',
-                shape=(n_q_disk, n_rtot, n_rmu),
+                'zeta_q_G',
+                shape=(n_q_disk, n_rmu, _n_G_sph),
                 dtype=np.complex128,
-                chunks=(1, n_rchunk, n_rmu),
+                chunks=(1, n_rmu, _n_G_sph),
             )
         else:
             with SlabIO(output_file, mode='a', mesh=mesh_xy,
                         backend=slab_io_backend) as _zeta_create_io:
                 _zeta_create_io.create_dataset(
-                    'zeta_q',
-                    shape=(n_q_disk, n_rtot, n_rmu),
+                    'zeta_q_G',
+                    shape=(n_q_disk, n_rmu, _n_G_sph),
                     dtype=np.complex128,
-                    chunks=(1, n_rchunk, n_rmu),
+                    chunks=(1, n_rmu, _n_G_sph),
                 )
             zeta_io = None
 
@@ -2055,50 +2025,10 @@ def fit_zeta_to_h5(
     t_write_total = 0.0
     t_chunk_start = time.perf_counter()
 
-    # Per-chunk writes go through zeta_io (SlabIO).  On the allgather
-    # backend we keep the old async-writer pattern: main thread does
-    # the allgather, rank-0 background thread does the h5py hyperslab
-    # writes — this hides the h5 latency behind the next chunk's GPU
-    # compute.  On the FFI backend, writes are collective so all ranks
-    # must enter in lock-step; the synchronous SlabIO.write_slab call
-    # from the main thread is the right shape (H5Dwrite's host-block
-    # doesn't stall the CUDA stream, so the next chunk's build still
-    # overlaps).
-    write_queue = queue.Queue()
-    write_error = [None]
-
-    def writer_worker():
-        """Rank-0 background thread: dequeue + h5py hyperslab writes."""
-        try:
-            while True:
-                item = write_queue.get()
-                if item is None:
-                    break
-                zeta_data, r_start, r_end, chunk_id, q_start, q_end = item
-                # zeta_data is a host numpy array of shape
-                # (q_end-q_start, n_rmu_padded, r_end-r_start) in the
-                # order the shard_map produced.  Dataset on disk is
-                # (nq, n_rtot, n_rmu_logical) — swap the last two
-                # axes at write time AND slice the μ axis to logical
-                # extent so on-disk extent stays logical (Phase 3a/3b
-                # contract: pad rows of zeta are zero; on-disk
-                # round-trips across mesh sizes).
-                with h5py.File(output_file, 'a') as f:
-                    for i, q_flat in enumerate(range(q_start, q_end)):
-                        # zeta_data[i] is (n_rmu_padded, r_chunk) →
-                        # transpose to (r_chunk, n_rmu_padded) → slice
-                        # to logical (n_rmu) on the last axis.
-                        f['zeta_q'][q_flat, r_start:r_end, :] = (
-                            zeta_data[i].T[:, :n_rmu])
-                write_queue.task_done()
-        except Exception as e:
-            write_error[0] = e
-            write_queue.task_done()
-
-    writer_thread = None
-    if not use_ffi_io and jax.process_index() == 0:
-        writer_thread = threading.Thread(target=writer_worker, daemon=True)
-        writer_thread.start()
+    # Per-chunk: ``accumulate_rchunk_to_gflat`` adds the chunk's
+    # contribution into the donated ``gflat_acc`` in place; no
+    # per-chunk SlabIO write.  The single ``zeta_q_G`` write happens
+    # once after the loop.
 
     # Peak GPU memory tracker — reports the all-time high-water mark (peak_bytes_in_use).
     # This is the number that determines whether you OOM: it includes JIT caches and
@@ -2138,54 +2068,48 @@ def fit_zeta_to_h5(
     # When the per-q sphere isn't available (no vcoul_cutoff_ry) we
     # fall back to the full flat-FFT axis n_rtot — slow, kept for
     # smoke / sanity tests.
-    gflat_acc = None
-    _gflat_acc_n_G = None
-    if write_g_flat_zeta:
-        from common.wfn_transforms import accumulate_rchunk_to_gflat
-        # μ allocated at PADDED extent so the ('x','y') sharding
-        # divides cleanly (same pad-then-clip-on-write pattern the
-        # r-space path uses; see ``meta.n_rmu_padded`` and the
-        # SlabIO ``valid_shape=`` argument below).  Pad rows are zero
-        # because the back-solve produces zeta_pad = 0 (L_q's pad
-        # block is identity).
-        _n_rmu_padded = int(meta.n_rmu_padded)
-        _gflat_acc_n_G = (int(_gflat_ngkmax)
-                           if _gflat_ngkmax is not None else n_rtot)
-        _gflat_acc_sharding = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
-        gflat_acc = jax.jit(
-            lambda: jnp.zeros(
-                (n_q_disk, _n_rmu_padded, _gflat_acc_n_G),
-                dtype=jnp.complex128),
-            out_shardings=_gflat_acc_sharding,
-        )()
-        # Flat-axis chunking inside ``accumulate_rchunk_to_gflat``.
-        # The kernel runs inside a ``shard_map`` over ``('x','y')`` and
-        # chunks the per-rank flat ``(n_q · n_mu_local)`` axis into
-        # rows-per-scan-iteration of ``chunk_size``.  Memory bound:
-        # ``chunk_size · n_rtot · 16 B`` for the per-iteration FFT box.
-        #
-        # Default ``None`` (one-shot) is fine when the full per-rank
-        # box ``N · n_rtot · 16 B`` fits — MoS2 3×3 at 4 ranks: 1.1 GB.
-        # For CrI3-class FFT grids set ``LORRAX_GFLAT_CHUNK_SIZE`` to
-        # an integer; the kernel zero-pads N up to a multiple of the
-        # chunk size so any value works (no divisibility constraint
-        # on either n_q or n_mu_local).
-        _env_cs = int(os.environ.get('LORRAX_GFLAT_CHUNK_SIZE', '0') or 0)
-        _gflat_chunk_size = _env_cs if _env_cs > 0 else None
-        if jax.process_index() == 0:
-            _p_prod = int(jax.device_count())
-            _n_mu_local = int(meta.n_rmu_padded) // _p_prod
-            _N = n_q_disk * _n_mu_local
-            _cs = _gflat_chunk_size or _N
-            print(f"  G-flat ζ accumulator: N={_N} rows/rank "
-                  f"(n_q={n_q_disk} × n_mu_local={_n_mu_local}); "
-                  f"chunk_size={_cs} → "
-                  f"per-iter FFT box {_cs * n_rtot * 16 / 1e9:.2f} GB/rank")
-        # Numpy → replicated: avoid the ``jnp.asarray`` wrap that would
-        # single-device-stage and turn device_put into an all-reduce.
-        _q_irr_frac_dev = jax.device_put(
-            np.asarray(q_irr_frac, dtype=np.float64),
-            NamedSharding(mesh_xy, P(None, None)))
+    from common.wfn_transforms import accumulate_rchunk_to_gflat
+    # μ allocated at PADDED extent so the ('x','y') sharding divides
+    # cleanly.  Pad rows are zero because the back-solve produces
+    # zeta_pad = 0 (L_q's pad block is identity).
+    _n_rmu_padded = int(meta.n_rmu_padded)
+    _gflat_acc_n_G = (int(_gflat_ngkmax)
+                       if _gflat_ngkmax is not None else n_rtot)
+    _gflat_acc_sharding = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
+    gflat_acc = jax.jit(
+        lambda: jnp.zeros(
+            (n_q_disk, _n_rmu_padded, _gflat_acc_n_G),
+            dtype=jnp.complex128),
+        out_shardings=_gflat_acc_sharding,
+    )()
+    # Flat-axis chunking inside ``accumulate_rchunk_to_gflat``.  The
+    # kernel runs inside a ``shard_map`` over ``('x','y')`` and chunks
+    # the per-rank flat ``(n_q · n_mu_local)`` axis into rows-per-
+    # scan-iteration of ``chunk_size``.  Memory bound:
+    # ``chunk_size · n_rtot · 16 B`` for the per-iteration FFT box.
+    #
+    # Default ``None`` (one-shot) is fine when the full per-rank box
+    # ``N · n_rtot · 16 B`` fits — MoS2 3×3 at 4 ranks: 1.1 GB.  For
+    # CrI3-class FFT grids set ``LORRAX_GFLAT_CHUNK_SIZE`` to an
+    # integer; the kernel zero-pads N up to a multiple of the chunk
+    # size so any value works (no divisibility constraint on either
+    # n_q or n_mu_local).
+    _env_cs = int(os.environ.get('LORRAX_GFLAT_CHUNK_SIZE', '0') or 0)
+    _gflat_chunk_size = _env_cs if _env_cs > 0 else None
+    if jax.process_index() == 0:
+        _p_prod = int(jax.device_count())
+        _n_mu_local = int(meta.n_rmu_padded) // _p_prod
+        _N = n_q_disk * _n_mu_local
+        _cs = _gflat_chunk_size or _N
+        print(f"  G-flat ζ accumulator: N={_N} rows/rank "
+              f"(n_q={n_q_disk} × n_mu_local={_n_mu_local}); "
+              f"chunk_size={_cs} → "
+              f"per-iter FFT box {_cs * n_rtot * 16 / 1e9:.2f} GB/rank")
+    # Numpy → replicated: avoid the ``jnp.asarray`` wrap that would
+    # single-device-stage and turn device_put into an all-reduce.
+    _q_irr_frac_dev = jax.device_put(
+        np.asarray(q_irr_frac, dtype=np.float64),
+        NamedSharding(mesh_xy, P(None, None)))
 
     with timing.section("zeta_fit.chunk_loop"):
         for chunk_idx in range(num_chunks):
@@ -2234,107 +2158,25 @@ def fit_zeta_to_h5(
             # 6e. IBZ-slice → allgather (or FFI) → HDF5 write.
             # ``zeta_chunk`` is computed at full BZ q (the FFT in
             # ``solve_zeta`` naturally outputs all q's).  We slice to
-            # IBZ rows here so the disk image is IBZ-only.  The
-            # compute side stays full-BZ until a future optimization
-            # threads IBZ through the solve.
-            #
-            # The allgather replicates zeta slices: per-device output is
-            # (q_gather, n_rmu, chunk_r) which at large chunk_r can be huge.
-            # Chunking over q keeps each allgather under memory limits.
+            # Phase B: ``zeta_chunk`` is already IBZ-shape
+            # (n_q_disk, n_rmu, n_rchunk) — the gather happens inside
+            # ``fit_one_rchunk`` before the triangular solve.  In
+            # full-BZ mode (q_irr_full_idx=None) the kernel returns
+            # full-BZ shape.  Accumulate this r-chunk's contribution
+            # into ``gflat_acc`` in place; the full ``zeta_q_G`` is
+            # written once after the loop.
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.h5_write"):
-                # Phase B: ``zeta_chunk`` is already IBZ-shape
-                # (n_q_disk, n_rmu, n_rchunk) — the gather happens
-                # inside ``fit_one_rchunk`` before the triangular
-                # solve.  No post-solve slice needed.  In full-BZ
-                # mode (q_irr_full_idx=None) the kernel returns
-                # full-BZ shape and we still alias to keep the
-                # downstream write path uniform.
-                zeta_chunk_ibz = zeta_chunk
+                gflat_acc = accumulate_rchunk_to_gflat(
+                    rchunk=zeta_chunk, gflat_acc=gflat_acc,
+                    fft_grid=meta.fft_grid, r0=r_start,
+                    sphere_idx=_gflat_sphere_idx_padded,
+                    qvec_frac=_q_irr_frac_dev,
+                    norm='backward',
+                    chunk_size=_gflat_chunk_size,
+                    mesh=mesh_xy,
+                )
                 del zeta_chunk
-
-                # Phase C1b: G-flat accumulator branch.  Accumulate
-                # this r-chunk's contribution into ``gflat_acc`` and
-                # skip the per-chunk SlabIO write.  After the loop
-                # the full accumulator is written once.
-                if write_g_flat_zeta:
-                    gflat_acc = accumulate_rchunk_to_gflat(
-                        rchunk=zeta_chunk_ibz, gflat_acc=gflat_acc,
-                        fft_grid=meta.fft_grid, r0=r_start,
-                        sphere_idx=_gflat_sphere_idx_padded,
-                        qvec_frac=_q_irr_frac_dev,
-                        norm='backward',
-                        chunk_size=_gflat_chunk_size,
-                        mesh=mesh_xy,
-                    )
-                    del zeta_chunk_ibz
-                    t_write_total += time.perf_counter() - t0
-                    r_progress.step()
-                    continue
-
-                # Each allgather produces a FULLY REPLICATED output per device:
-                # q_gather × n_rmu × chunk_r × 16 bytes, plus NCCL temp of same size.
-                # Cap to keep replicated output + NCCL under available memory.
-                _bytes_per_q_replicated = 2 * n_rmu * actual_n_rchunk * 16
-                _safe_q_gather = max(1, min(n_q_disk,
-                    int(10 * 1024**3 / max(1, _bytes_per_q_replicated))))
-                if q_gather_size > 0:
-                    _q_gather = min(n_q_disk, q_gather_size, _safe_q_gather)
-                else:
-                    _q_gather = _safe_q_gather
-
-                if use_ffi_io:
-                    # FFI path: zeta_chunk_ibz is (n_q_disk,
-                    # n_rmu_padded, chunk_r), dataset is
-                    # (n_q_disk, n_rtot, n_rmu) at LOGICAL extent.
-                    # Transpose the last two axes so the slab matches
-                    # disk layout, then SlabIO ``valid_shape=`` clips
-                    # the trailing pad slots off axis -1 on write
-                    # (zeta pad rows are zero by construction — pad
-                    # block of L_q is identity, so the back-solve
-                    # produces zeta_pad = 0).
-                    # The transpose is a JAX metadata-only operation
-                    # (shard axis 'chunk_r' / sharded → axis 1 of the
-                    # post-transpose tensor; NamedSharding updates in
-                    # place, no data motion).
-                    zeta_chunk_write = zeta_chunk_ibz.transpose(0, 2, 1)
-                    actual_q = int(zeta_chunk_write.shape[0])
-                    zeta_io.write_slab(
-                        'zeta_q', zeta_chunk_write,
-                        offset=(0, r_start, 0),
-                        global_shape=(n_q_disk, n_rtot, n_rmu),
-                        valid_shape=(actual_q, actual_n_rchunk, n_rmu),
-                    )
-                else:
-                    # Allgather path: gather once per q-chunk on every rank,
-                    # queue the per-q hyperslab writes on rank 0's
-                    # background thread so the h5py I/O is hidden behind
-                    # the next chunk's GPU compute.  process_allgather is
-                    # itself a blocking D2H+collective — there is no async
-                    # allgather-to-host API in JAX today — so the main
-                    # thread stall per chunk is roughly (cross-rank NCCL
-                    # time) + (PCIe D2H).  First chunk eats an extra ~1 s
-                    # of NCCL/XLA first-collective setup.
-                    for _q0 in range(0, n_q_disk, _q_gather):
-                        _q1 = min(_q0 + _q_gather, n_q_disk)
-                        _slice = zeta_chunk_ibz[_q0:_q1]
-                        _gathered = jax.experimental.multihost_utils.process_allgather(
-                            _slice, tiled=False)
-                        if jax.process_index() == 0:
-                            _g = np.asarray(_gathered)
-                            if _g.ndim == 4 and _g.shape[0] == 1:
-                                _g = _g[0]
-                            write_queue.put((_g, r_start, r_end, chunk_idx, _q0, _q1))
-                        del _gathered, _slice
-
-                # No per-chunk sync_global_devices here: the
-                # allgather is itself a collective so all ranks are
-                # already aligned at this point, and we want the main
-                # thread free to start next chunk's GPU compute while
-                # rank 0's writer thread flushes to disk.  Final
-                # sync_global_devices("zeta_writes_complete") at the
-                # bottom of this function serves as the rendezvous.
-                del zeta_chunk_ibz
             t_write_total += time.perf_counter() - t0
             r_progress.step()
 
@@ -2346,67 +2188,53 @@ def fit_zeta_to_h5(
     # all-time high water.
     _track_peak()
 
-    # ---- Phase C: write the accumulated G-flat ζ_q ----
+    # ---- Write the accumulated G-flat ζ_q ----
     # One collective write of the persistent ``(n_q_disk, n_rmu,
-    # ngkmax)`` tensor to disk.  The r-space per-chunk write loop
-    # already short-circuited at ``continue``, so this is the ONLY
-    # write that happens when ``write_g_flat_zeta`` is True.
-    if write_g_flat_zeta:
-        with timing.section("zeta_fit.write_g_flat"):
-            # Pad slot zero-fill (WFN.h5 ``coeffs = 0`` convention).
-            # The per-q gather inside ``accumulate_rchunk_to_gflat`` read
-            # the sentinel ``(-nx/2, -ny/2, -nz/2)`` flat-FFT slot into
-            # every pad position; those values are physical (not zero)
-            # so we mask them here.  Logical slots ``[..., :ngk[q]]``
-            # carry the real coeffs and are untouched.
-            if _gflat_ngk_per_q is not None:
-                _ngk_dev = jax.device_put(
-                    np.asarray(_gflat_ngk_per_q, dtype=np.int32),
-                    NamedSharding(mesh_xy, P(None)))
-                _g_axis = jnp.arange(int(gflat_acc.shape[-1]),
-                                      dtype=jnp.int32)        # (ngkmax,)
-                _mask = (_g_axis[None, None, :] < _ngk_dev[:, None, None])
-                gflat_acc = jnp.where(
-                    _mask, gflat_acc, jnp.zeros_like(gflat_acc))
-            jax.block_until_ready(gflat_acc)
-            _n_G_sph = int(gflat_acc.shape[-1])
-            if use_ffi_io:
-                # On-disk extent is LOGICAL n_rmu; in-memory buffer
-                # is PADDED ``n_rmu_padded``.  SlabIO ``valid_shape=``
-                # clips the trailing μ pad rows on write — same trick
-                # the r-space writer uses (those rows are zero).
-                zeta_io.write_slab(
-                    'zeta_q_G', gflat_acc,
-                    offset=(0, 0, 0),
-                    global_shape=(n_q_disk, n_rmu, _n_G_sph),
-                    valid_shape=(n_q_disk, n_rmu, _n_G_sph),
-                )
-            else:
-                # allgather backend: same per-q allgather pattern as
-                # the r-space write loop, but only once (not per
-                # chunk).  The full tensor is at most a few GB
-                # replicated; for CrI3 scale the FFI backend is
-                # mandatory anyway.
-                _gathered = jax.experimental.multihost_utils.process_allgather(
-                    gflat_acc, tiled=False)
-                if jax.process_index() == 0:
-                    _g = np.asarray(_gathered)
-                    if _g.ndim == 4 and _g.shape[0] == 1:
-                        _g = _g[0]
-                    import h5py as _h5
-                    with _h5.File(output_file, 'a') as _f:
-                        _f['zeta_q_G'][...] = _g
-                del _gathered
-        del gflat_acc
-
-    # Drain the rank-0 writer queue (allgather backend only; FFI path
-    # writes are already fully flushed by the synchronous SlabIO calls).
-    if jax.process_index() == 0 and writer_thread is not None:
-        write_queue.join()
-        write_queue.put(None)
-        writer_thread.join()
-        if write_error[0] is not None:
-            raise RuntimeError(f"Async writer failed: {write_error[0]}")
+    # ngkmax)`` tensor to disk.
+    with timing.section("zeta_fit.write_g_flat"):
+        # Pad slot zero-fill (WFN.h5 ``coeffs = 0`` convention).  The
+        # per-q gather inside ``accumulate_rchunk_to_gflat`` read the
+        # sentinel ``(-nx/2, -ny/2, -nz/2)`` flat-FFT slot into every
+        # pad position; those values are physical (not zero) so we
+        # mask them here.  Logical slots ``[..., :ngk[q]]`` carry the
+        # real coeffs and are untouched.
+        if _gflat_ngk_per_q is not None:
+            _ngk_dev = jax.device_put(
+                np.asarray(_gflat_ngk_per_q, dtype=np.int32),
+                NamedSharding(mesh_xy, P(None)))
+            _g_axis = jnp.arange(int(gflat_acc.shape[-1]),
+                                  dtype=jnp.int32)        # (ngkmax,)
+            _mask = (_g_axis[None, None, :] < _ngk_dev[:, None, None])
+            gflat_acc = jnp.where(
+                _mask, gflat_acc, jnp.zeros_like(gflat_acc))
+        jax.block_until_ready(gflat_acc)
+        _n_G_sph = int(gflat_acc.shape[-1])
+        if use_ffi_io:
+            # On-disk extent is LOGICAL n_rmu; in-memory buffer is
+            # PADDED ``n_rmu_padded``.  SlabIO ``valid_shape=`` clips
+            # the trailing μ pad rows on write (they are zero by
+            # construction — L_q's pad block is identity).
+            zeta_io.write_slab(
+                'zeta_q_G', gflat_acc,
+                offset=(0, 0, 0),
+                global_shape=(n_q_disk, n_rmu, _n_G_sph),
+                valid_shape=(n_q_disk, n_rmu, _n_G_sph),
+            )
+        else:
+            # allgather backend: one per-q gather (not per chunk).
+            # The full tensor is at most a few GB replicated; for
+            # CrI3 scale the FFI backend is mandatory anyway.
+            _gathered = jax.experimental.multihost_utils.process_allgather(
+                gflat_acc, tiled=False)
+            if jax.process_index() == 0:
+                _g = np.asarray(_gathered)
+                if _g.ndim == 4 and _g.shape[0] == 1:
+                    _g = _g[0]
+                import h5py as _h5
+                with _h5.File(output_file, 'a') as _f:
+                    _f['zeta_q_G'][...] = _g
+            del _gathered
+    del gflat_acc
 
     # Close the SlabIO handle (FFI path only; allgather path never
     # opened one after STEP 4).

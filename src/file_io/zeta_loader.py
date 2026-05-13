@@ -288,11 +288,10 @@ class ZetaLoader:
                         else P(None, ('x', 'y'), None))
 
         # --- Disk-native G-flat: read direct, no FFT ------------------
-        # When the on-disk layout already IS G-flat (writer ran with
-        # LORRAX_WRITE_G_FLAT_ZETA=1), the slab on disk is
-        # ``(Q, μ, ngkmax)`` — WFN.h5 ``coeffs`` style.  Reading
-        # ``layout='r_space'`` would require an inverse FFT we don't
-        # support yet; ``layout='G_flat'`` returns the slab as-is
+        # The current writer always produces G-flat on disk
+        # — slab on disk is ``(Q, μ, ngkmax)``, WFN.h5 ``coeffs`` style.
+        # Reading ``layout='r_space'`` would require an inverse FFT
+        # we don't support yet; ``layout='G_flat'`` returns the slab as-is
         # (caller's sphere_idx / qvec_frac are accepted for API
         # symmetry but only used to scatter into the consumer's
         # shared sphere downstream).
