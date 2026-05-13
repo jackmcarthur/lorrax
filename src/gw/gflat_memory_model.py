@@ -76,6 +76,27 @@ def _round_pow2_down(n: int) -> int:
     return 1 << (int(n).bit_length() - 1)
 
 
+def _bytes_centroids_LR(nk: int, ns: int, mu: int, nb_total: int,
+                        p_x: int, p_y: int) -> float:
+    """Per-rank c128 bytes for both persistent centroid copies (L+R).
+
+    The two copies have *different* mesh-axis shardings:
+
+      * ``psi_rmu_Y``  — shape ``(nk, n_band, ns, μ_Y)``,  μ on ``'y'``;
+        per-rank bytes ``= nk · nb_total · ns · μ · 16 / p_y``.
+      * ``psi_rmuT_X`` — shape ``(nk, μ_X, n_band, ns)``,  μ on ``'x'``;
+        per-rank bytes ``= nk · μ · nb_total · ns · 16 / p_x``.
+
+    The older formula ``2 * _bytes_c128(nk, ns, mu, nb_total, shard=p_xy)``
+    (with ``p_xy = p_x · p_y``) over-credited the sharding by a factor
+    of roughly ``√P`` on a balanced mesh — both copies live concurrently
+    on disjoint mesh axes, so the correct divisor is the per-axis
+    ``p_x`` / ``p_y``, not the joint ``p_xy``.
+    """
+    return (_bytes_c128(nk, nb_total, ns, mu, shard=p_y)
+            + _bytes_c128(nk, mu, nb_total, ns, shard=p_x))
+
+
 def _largest_divisor_le(n: int, cap: int) -> int:
     """Largest divisor of ``n`` that is ≤ ``cap``.  Falls back to ``cap``."""
     cap = max(1, int(cap))
@@ -155,33 +176,44 @@ def _peak_B_cct_chol(*, nk, ns, nq, mu, p, p_xy) -> dict:
     }
 
 
-def _peak_C_fit_one_rchunk(*, nk, ns, nq, mu, n_rtot, r_chunk,
-                           band_chunk, n_bc, p, p_x, p_y, p_xy,
+def _peak_C_fit_one_rchunk(*, nk, ns, nq, mu, nb_total, n_rtot, r_chunk,
+                           band_chunk, n_bc, psig_k_chunk, band_fft_slots,
+                           p, p_x, p_y, p_xy,
                            fft_box_factor, pair_density_slots,
                            is_charge_channel) -> dict:
     """Per-r-chunk fit_one_rchunk fused-jit peak.
 
     bc-loop is Python-unrolled inside the kernel, so n_bc copies of the
-    psi_bc_Y slab stack across XLA's fused trace.
+    psi_bc_Y slab stack across XLA's fused trace.  Verified at
+    CrI3 6×6 80 Ry on 4×4 mesh (2026-05-13 HLO dump,
+    ``module_0408.jit__kernel``): 58 concurrent live FFT-box slots
+    (= ``n_bc · band_fft_slots`` with ``S_fft ≈ 3`` shape variants),
+    each ``c128[psig_k_chunk, band_chunk, ns, nx, ny, nz]`` sized
+    **per rank with no mesh sharding**.  XLA's BufferAssignment cannot
+    alias them because adjacent bc-iterations have overlapping lifetimes.
 
-    ``pair_density_slots`` is the **XLA-BufferAssignment-determined**
-    count of concurrent rank-5
-    ``c128[nk, ns², n_rmu_local, r_chunk_local]`` tensors live at peak
-    inside the monolithic ``c_q_from_psi_sm`` / ``z_q_from_psi_sm``
-    shard_map.  Read from XLA's per-kernel
-    ``-memory-usage-report.txt`` dump as the number of distinct
-    preallocated-temp slots holding a P-pair-shaped value.
+    Two distinct peak terms emerge:
 
-    Default = 3: ``P_l_R_conj``, ``P_r_R``, plus one XLA scratch.
-    Verified on MoS2 3×3 bispinor / 2×2 mesh.  If XLA changes its
-    buffer assignment in a future version, count slots in a fresh
-    ``module_NNNN.jit__kernel.sm_*.memory-usage-report.txt`` and
-    update the defaults below.
+      * ``P_pair_concurrent_slots`` — ``pair_density_slots`` rank-5
+        c128 buffers, sharded on ``p_xy``.  HLO-verified default 3
+        (``P_l_R_conj``, ``P_r_R``, one XLA scratch).  Scales linearly
+        with ``r_chunk``.
+
+      * ``band_fft_unsharded`` — the Python-unrolled FFT-box pool.
+        Scales as ``nb_total · S_fft · psig_k_chunk_eff · ns · n_rtot``
+        per rank (band_chunk-independent in total; structural).  Only
+        ``psig_k_chunk_size`` reduces it linearly; the structural cure
+        is to convert the bc-loop to ``lax.fori_loop``.
+
+    If XLA changes its buffer assignment in a future version, count
+    slots in a fresh ``module_NNNN.jit__kernel.sm_*.memory-usage-report.txt``
+    and update ``pair_density_slots`` / ``band_fft_slots`` defaults
+    accordingly.
     """
     # Persistent during the chunk loop (not just one iter):
     persistent = {
         "centroids_persist":
-            2 * _bytes_c128(nk, ns, mu, nk, shard=p_xy),  # L+R approx
+            _bytes_centroids_LR(nk, ns, mu, nb_total, p_x, p_y),
         "L_q":
             _bytes_c128(nq, mu, mu, shard=p_xy),
         "gflat_acc":
@@ -194,11 +226,21 @@ def _peak_C_fit_one_rchunk(*, nk, ns, nq, mu, n_rtot, r_chunk,
     # module_0510 dump where slot 1 holds both a P_pair and the
     # band-chunk FFT box across non-overlapping lifetimes).
     slots = pair_density_slots
+    k_chunk_eff = (int(psig_k_chunk) if psig_k_chunk and int(psig_k_chunk) > 0
+                   else int(nk))
+    # ``n_bc · band_chunk`` ≥ nb_total (equality when band_chunk divides
+    # nb_total).  Use the exact ceil-padded product so we don't under-count
+    # when nb_total isn't divisible.
+    nb_padded = n_bc * band_chunk
     transient = {
         "P_pair_concurrent_slots":
             slots * _bytes_c128(nk, ns, ns, mu, r_chunk, shard=p_xy),
         "zeta_out":
             _bytes_c128(nq, mu, r_chunk, shard=p),
+        "band_fft_unsharded":
+            # UNSHARDED on every rank — confirmed by 2026-05-13 HLO dump.
+            # band_chunk-independent in total since n_bc · band_chunk = nb_total.
+            band_fft_slots * k_chunk_eff * nb_padded * ns * n_rtot * 16,
     }
     out = {f"C.{k}": v for k, v in persistent.items() if v > 0}
     out.update({f"C.{k}": v for k, v in transient.items()})
@@ -241,6 +283,8 @@ def plan_gflat_chunks(
     budget_gb: float,
     target_utilization: float = 0.80,
     fft_box_factor: float = 4.0,
+    psig_k_chunk: int = 0,
+    band_fft_slots: int = 3,
     pair_density_slots_transverse: int = 3,
     pair_density_slots_charge: int = 3,
     is_bispinor: bool = True,
@@ -284,6 +328,41 @@ def plan_gflat_chunks(
     budget = budget_gb * 1e9
     target = budget * target_utilization
 
+    # Effective inner-k chunk for the band-load FFT box (cohsex.in
+    # ``psig_k_chunk_size``).  Zero / unset → no inner chunking → use all k.
+    k_chunk_eff = (int(psig_k_chunk) if psig_k_chunk and int(psig_k_chunk) > 0
+                   else int(nk))
+
+    # ---- Structural feasibility check: band-FFT unsharded pool ------------
+    # ``fit_one_rchunk`` Python-unrolls its bc-loop, pinning
+    # ``n_bc · band_fft_slots`` concurrent live FFT-box slots, each
+    # ``c128[k_chunk_eff, band_chunk, ns, nx, ny, nz]`` sized per rank with
+    # NO mesh sharding (XLA's BufferAssignment cannot alias overlapping
+    # lifetimes from the Python unroll).  Total per rank is
+    # ``nb_total · band_fft_slots · k_chunk_eff · ns · n_rtot · 16`` — and
+    # this is *band_chunk-independent in total* (n_bc · band_chunk ≥
+    # nb_total).  No chunk knob in this planner reduces it; the only knobs
+    # are ``psig_k_chunk_size`` (linear) and the structural switch from
+    # Python-unrolled bc-loop to ``lax.fori_loop``.
+    band_fft_pool = (int(nb_total) * int(band_fft_slots)
+                     * int(k_chunk_eff) * int(ns) * int(n_rtot) * 16)
+    if band_fft_pool > budget:
+        raise ValueError(
+            f"plan_gflat_chunks: unsharded band-FFT pool requires "
+            f"{band_fft_pool/1e9:.2f} GB/rank, but per-device budget is "
+            f"only {budget/1e9:.2f} GB/rank.  This term is "
+            f"band_chunk-independent (n_bc · band_chunk = nb_total) and "
+            f"unsharded across the ({p_x}×{p_y}) mesh.\n"
+            f"  Mitigations:\n"
+            f"    1. Lower cohsex.in `psig_k_chunk_size` (currently "
+            f"k_chunk_eff={k_chunk_eff}; each halving cuts this term ~2×).\n"
+            f"    2. Narrow `nval`/`ncond` so nb_total={nb_total} drops.\n"
+            f"    3. Structural: convert fit_one_rchunk's bc-loop to "
+            f"`lax.fori_loop` so XLA aliases the {band_fft_slots} slot "
+            f"variants × {math.ceil(nb_total/max(1,k_chunk_eff))} bc "
+            f"iters into a single slot."
+        )
+
     # ---- 1. band_chunk -----------------------------------------------------
     if band_chunk_override and band_chunk_override > 0:
         band_chunk = int(band_chunk_override)
@@ -313,8 +392,9 @@ def plan_gflat_chunks(
     # Constant part of Peak C: centroids + L_q.  (FFT box and Z_q
     # share the rank-5 slots; they don't add an independent term.)
     c_C_const = (
-        2 * _bytes_c128(nk, ns, mu, nb_total, shard=p_xy)
+        _bytes_centroids_LR(nk, ns, mu, nb_total, p_x, p_y)
         + _bytes_c128(nq, mu, mu, shard=p_xy)
+        + band_fft_pool                     # unsharded — see feasibility check
     )
     headroom_C = max(0.0, target - c_C_const)
 
@@ -346,9 +426,7 @@ def plan_gflat_chunks(
     # FFT box per-rank: gflat_chunk_size * n_rtot * 16 * factor.
     persistent_D = _bytes_c128(nq_disk, mu, ngkmax, shard=p_xy)
     transient_zeta_D = _bytes_c128(nq_disk, mu, r_chunk, shard=p_xy)
-    centroids_persist = (
-        2 * _bytes_c128(nk, ns, mu, nb_total, shard=p_xy)
-    )
+    centroids_persist = _bytes_centroids_LR(nk, ns, mu, nb_total, p_x, p_y)
     # We assume centroids + L_q stay live during the accumulate call.
     base_D = (
         centroids_persist
@@ -379,9 +457,11 @@ def plan_gflat_chunks(
         nk=nk, ns=ns, nq=nq, mu=mu, p=p, p_xy=p_xy,
     )
     peak_C = _peak_C_fit_one_rchunk(
-        nk=nk, ns=ns, nq=nq, mu=mu, n_rtot=n_rtot, r_chunk=r_chunk,
-        band_chunk=band_chunk, n_bc=n_bc, p=p, p_x=p_x, p_y=p_y,
-        p_xy=p_xy, fft_box_factor=fft_box_factor,
+        nk=nk, ns=ns, nq=nq, mu=mu, nb_total=nb_total, n_rtot=n_rtot,
+        r_chunk=r_chunk, band_chunk=band_chunk, n_bc=n_bc,
+        psig_k_chunk=k_chunk_eff, band_fft_slots=band_fft_slots,
+        p=p, p_x=p_x, p_y=p_y, p_xy=p_xy,
+        fft_box_factor=fft_box_factor,
         pair_density_slots=pair_density_slots,
         is_charge_channel=(not is_bispinor),
     )

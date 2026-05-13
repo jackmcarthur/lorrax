@@ -601,6 +601,10 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		budget_gb=float(cfg.memory.per_device_gb),
 		target_utilization=0.80,
 		fft_box_factor=4.0,
+		# Pass cohsex.in psig_k_chunk_size so the planner can model the
+		# Python-unrolled band-FFT pool (band_chunk-independent, unsharded;
+		# only this knob reduces it linearly — HLO-verified 2026-05-13).
+		psig_k_chunk=int(getattr(cfg.memory, 'psig_k_chunk_size', 0)),
 		is_bispinor=bool(cfg.bispinor),
 		max_chunks=64,
 		r_chunk_override=(
