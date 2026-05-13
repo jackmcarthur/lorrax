@@ -673,8 +673,8 @@ def main(argv=None):
 		_tol = float(config.degen_avg_tol_ry)
 		_dav_rep = NamedSharding(mesh_xy, P(None, None, None))
 		def _dav(M):
-			return jax.device_put(jnp.asarray(apply_to_matrix_diagonals(
-				np.asarray(M), _e_kn_ry, _tol)), _dav_rep)
+			return jax.device_put(apply_to_matrix_diagonals(
+				np.asarray(M), _e_kn_ry, _tol), _dav_rep)
 		sigma_total = _dav(sigma_total)
 		sig_sx, sig_coh, sig_h, sig_x = _dav(sig_sx), _dav(sig_coh), _dav(sig_h), _dav(sig_x)
 		if sigma_c_at_dft_ev is not None:

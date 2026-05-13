@@ -2265,8 +2265,10 @@ def fit_zeta_to_h5(
                   f"(n_q={n_q_disk} × n_mu_local={_n_mu_local}); "
                   f"chunk_size={_cs} → "
                   f"per-iter FFT box {_cs * n_rtot * 16 / 1e9:.2f} GB/rank")
+        # Numpy → replicated: avoid the ``jnp.asarray`` wrap that would
+        # single-device-stage and turn device_put into an all-reduce.
         _q_irr_frac_dev = jax.device_put(
-            jnp.asarray(q_irr_frac, dtype=jnp.float64),
+            np.asarray(q_irr_frac, dtype=np.float64),
             NamedSharding(mesh_xy, P(None, None)))
 
     with timing.section("zeta_fit.chunk_loop"):
@@ -2443,7 +2445,7 @@ def fit_zeta_to_h5(
             # carry the real coeffs and are untouched.
             if _gflat_ngk_per_q is not None:
                 _ngk_dev = jax.device_put(
-                    jnp.asarray(_gflat_ngk_per_q, dtype=jnp.int32),
+                    np.asarray(_gflat_ngk_per_q, dtype=np.int32),
                     NamedSharding(mesh_xy, P(None)))
                 _g_axis = jnp.arange(int(gflat_acc.shape[-1]),
                                       dtype=jnp.int32)        # (ngkmax,)

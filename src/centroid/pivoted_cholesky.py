@@ -417,7 +417,7 @@ def prune_candidates_by_pivoted_cholesky(
             piv, L, rank, d_final, d_taken, trR_over_trG = select_step(G)
         else:
             orbit_id_jax = jax.device_put(
-                jnp.asarray(orbit_id, dtype=jnp.int32),
+                np.asarray(orbit_id, dtype=np.int32),
                 NamedSharding(mesh, PartitionSpec(select_axis)),
             )
             piv, L, rank, d_final, d_taken, trR_over_trG = select_step(G, orbit_id_jax)

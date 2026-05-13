@@ -479,13 +479,16 @@ class WfnLoader:
         rep1 = NamedSharding(self._mesh, P(None))
         rep2 = NamedSharding(self._mesh, P(None, None))
         rep3 = NamedSharding(self._mesh, P(None, None, None))
+        # Pass numpy directly to ``device_put``; ``jnp.asarray`` wrapped
+        # in this position used to single-device-stage the host array
+        # first, forcing device_put → replicated to fire an all-reduce
+        # broadcast.  See psi_G_store: same fix.
         self._phdf5_static_dev = {
-            "ibz_per_full": jax.device_put(jnp.asarray(ibz_per_full), rep1),
-            "sym_idx_per_full": jax.device_put(
-                jnp.asarray(sym_idx_per_full), rep1),
-            "tr_mask_per_full": jax.device_put(jnp.asarray(tr_mask), rep1),
-            "U_per_full": jax.device_put(jnp.asarray(U_per), rep3),
-            "phase_per_full": jax.device_put(jnp.asarray(phase), rep2),
+            "ibz_per_full": jax.device_put(ibz_per_full, rep1),
+            "sym_idx_per_full": jax.device_put(sym_idx_per_full, rep1),
+            "tr_mask_per_full": jax.device_put(tr_mask, rep1),
+            "U_per_full": jax.device_put(U_per, rep3),
+            "phase_per_full": jax.device_put(phase, rep2),
             "n_tran": n_tran,
             "nk_full": nk_full,
         }
@@ -570,10 +573,11 @@ class WfnLoader:
 
         rep1 = NamedSharding(self._mesh, P(None))
         rep2 = NamedSharding(self._mesh, P(None, None))
-        offsets_dev = jax.device_put(jnp.asarray(offsets), rep2)
-        counts_dev = jax.device_put(jnp.asarray(counts), rep2)
-        position_in_reads_dev = jax.device_put(
-            jnp.asarray(position_in_reads), rep1)
+        # Numpy → replicated device_put; bare numpy skips the
+        # single-device staging that triggers an all-reduce broadcast.
+        offsets_dev = jax.device_put(offsets, rep2)
+        counts_dev = jax.device_put(counts, rep2)
+        position_in_reads_dev = jax.device_put(position_in_reads, rep1)
 
         reader = read_kchunk_union_sharded(
             ctx, "wfns/coeffs",
@@ -703,7 +707,7 @@ class WfnLoader:
 
         if named_sharding is None:
             return jnp.asarray(psi_np)
-        return jax.device_put(jnp.asarray(psi_np), named_sharding)
+        return jax.device_put(psi_np, named_sharding)
 
     # ------------------------------------------------------------------
     # Iterator: band chunks

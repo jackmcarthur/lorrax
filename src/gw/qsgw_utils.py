@@ -252,10 +252,12 @@ def build_qsgw_sigma_xc(
 
     rep_2d = NamedSharding(mesh_xy, P(None, None))
     rep_3d = NamedSharding(mesh_xy, P(None, None, None))
-    idx_lo_j = jax.device_put(jnp.asarray(idx_lo, dtype=jnp.int32), rep_2d)
-    idx_hi_j = jax.device_put(jnp.asarray(idx_hi, dtype=jnp.int32), rep_2d)
-    w_lo_j   = jax.device_put(jnp.asarray(w_lo, dtype=jnp.complex128), rep_2d)
-    w_hi_j   = jax.device_put(jnp.asarray(w_hi, dtype=jnp.complex128), rep_2d)
+    # Numpy → replicated; ``jnp.asarray`` wrap would force a
+    # single-device staging that turns device_put into an all-reduce.
+    idx_lo_j = jax.device_put(idx_lo.astype(np.int32), rep_2d)
+    idx_hi_j = jax.device_put(idx_hi.astype(np.int32), rep_2d)
+    w_lo_j   = jax.device_put(w_lo.astype(np.complex128), rep_2d)
+    w_hi_j   = jax.device_put(w_hi.astype(np.complex128), rep_2d)
 
     @jax.jit
     def _kernel(sig_w, sig_x, ilo, ihi, wlo, whi):

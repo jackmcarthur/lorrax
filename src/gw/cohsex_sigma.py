@@ -48,7 +48,7 @@ def build_Gij(meta, mesh_xy: Mesh) -> jax.Array:
     nocc = min(meta.nelec, meta.nb_sigma)
     Gij = np.zeros((meta.nk_tot, meta.nb_sigma, meta.nb_sigma), dtype=np.complex128)
     Gij[:, :nocc, :nocc] = np.eye(nocc, dtype=np.complex128)
-    return jax.device_put(jnp.asarray(Gij), NamedSharding(mesh_xy, P(None, None, None)))
+    return jax.device_put(Gij, NamedSharding(mesh_xy, P(None, None, None)))
 
 
 # ---------------------------------------------------------------------------

@@ -389,7 +389,7 @@ def _compute_V_q_g_flat_one_tile(
             (n_q_ibz, n_rmu_L_padded), dtype=jnp.complex128),
             out_shardings=g0_sh)()
     v_q_dev = jax.device_put(
-        jnp.asarray(v_q_table), NamedSharding(mesh_xy, P(None, None)))
+        v_q_table, NamedSharding(mesh_xy, P(None, None)))
 
     kernel = _make_per_q_kernel(
         mesh_xy, n_rmu_L_padded, n_rmu_R_padded, ngkmax, g_chunk,

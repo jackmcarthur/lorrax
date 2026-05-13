@@ -469,9 +469,9 @@ def load_bse_data_from_restart_sharded(
                 G0_pad = np.zeros((n_rmu_pad,), dtype=np.complex128)
                 G0_pad[:G0_full.size] = G0_full
                 G0_full = G0_pad
-            g0_X = jax.device_put(jnp.asarray(G0_full),
+            g0_X = jax.device_put(G0_full,
                                   NamedSharding(mesh_xy, P("x")))
-            g0_Y = jax.device_put(jnp.asarray(G0_full),
+            g0_Y = jax.device_put(G0_full,
                                   NamedSharding(mesh_xy, P("y")))
             vhead_restart = (complex(f["vhead"][()])
                              if "vhead" in f else None)

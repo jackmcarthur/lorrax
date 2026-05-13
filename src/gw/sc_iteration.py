@@ -162,7 +162,7 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
         np.complex128)
     rep = NamedSharding(inputs.mesh_xy, P(None, None, None))
     return SCState(
-        H_qp_dft=jax.device_put(jnp.asarray(H0), rep),
+        H_qp_dft=jax.device_put(H0, rep),
         iteration=0,
     )
 
