@@ -840,6 +840,7 @@ def solve_zeta(
     q_chunk_size: int = 1,
     vertex_mu_L: int = 0,
     solver_kind: str = 'auto',
+    cct_trace_per_q: jax.Array | None = None,
 ) -> jax.Array:
     """
     Solve for zeta_q given pre-computed system matrix from
@@ -947,8 +948,15 @@ def solve_zeta(
         # Per-q ridge ε·|tr(L)|/n_rmu — same lift as the legacy 'lu'
         # branch, to keep TRS-paired near-zero modes above the LU
         # stability floor without perturbing well-conditioned ones.
+        # ``cct_trace_per_q`` is precomputed once per channel by the
+        # caller (fit_zeta_to_h5) — the trace doesn't change across
+        # r-chunks since L_q is the per-channel CCT.  Computing it
+        # inline here re-fires an all-reduce across the (μ_X, ν_Y)
+        # sharding on every r-chunk: ~17 s GPU stream time on MoS2
+        # 3×3 bispinor at our default chunk count.
         LU_RIDGE = 1e-12
-        trace_per_q = jnp.einsum('qii->q', L_q)
+        trace_per_q = (cct_trace_per_q if cct_trace_per_q is not None
+                       else jnp.einsum('qii->q', L_q))
         ridge = (LU_RIDGE * jnp.abs(trace_per_q) / n_rmu)[:, None, None]
         eye_n = jnp.eye(n_rmu, dtype=L_q.dtype)[None, :, :]
         A_q = L_q + ridge * eye_n
@@ -1275,6 +1283,7 @@ def _make_fit_one_rchunk_kernel(
         r_start_dyn,
         gamma_perm,
         gamma_phase,
+        cct_trace_per_q,
     ):
         # ψ enters at PADDED n_rmu (load_centroids_band_chunked output,
         # Phase 3a).  All in-memory arrays here — P_l, P_r, ψ_L_bc,
@@ -1389,15 +1398,24 @@ def _make_fit_one_rchunk_kernel(
         if q_irr_idx_j is not None:
             L_q_for_solve = L_q[q_irr_idx_j]
             Z_q_for_solve = Z_q[q_irr_idx_j]
+            cct_trace_for_solve = (
+                cct_trace_per_q[q_irr_idx_j]
+                if cct_trace_per_q is not None else None)
         else:
             L_q_for_solve = L_q
             Z_q_for_solve = Z_q
+            cct_trace_for_solve = cct_trace_per_q
         # ``solver_kind`` is resolved upstream (sharded_cholesky /
         # cusolvermp_cholesky for charge; lu / cusolvermp_lu for
         # transverse).  solve_zeta dispatches purely on solver_kind.
+        # ``cct_trace_for_solve`` is precomputed once per channel in
+        # fit_zeta_to_h5 (the all-reduce on L_q[q,i,i] is invariant
+        # across r-chunks; computing it here would refire the
+        # ~5–17 s of GPU stream time per channel that we measured).
         zeta = solve_zeta(
             L_q_for_solve, Z_q_for_solve, mesh_xy, q_chunk_size,
-            solver_kind=solver_kind)
+            solver_kind=solver_kind,
+            cct_trace_per_q=cct_trace_for_solve)
         return zeta
 
     return _kernel
@@ -1424,6 +1442,7 @@ def fit_one_rchunk(
     vertex_mu_L: int = 0,
     solver_kind: str = 'auto',
     q_irr_full_idx: np.ndarray | None = None,
+    cct_trace_per_q: jax.Array | None = None,
 ):
     """Entry point for the r-chunk body jit.  Caches one compiled kernel
     per distinct static configuration.
@@ -1475,6 +1494,12 @@ def fit_one_rchunk(
             q_irr_full_idx=q_irr_full_idx,
         )
         _fit_one_rchunk_cache[cache_key] = fn
+    # cct_trace_per_q is None for the charge channel (Cholesky path
+    # ignores it); pass a tiny placeholder so the jit signature is
+    # uniform across channels.
+    if cct_trace_per_q is None:
+        cct_trace_per_q = jnp.zeros((int(meta.nk_tot),),
+                                    dtype=jnp.complex128)
     return fn(
         psi_l_rmuT_X_fit,
         psi_r_rmuT_X_fit,
@@ -1484,6 +1509,7 @@ def fit_one_rchunk(
         r_start_dyn,
         gamma_perm,
         gamma_phase,
+        cct_trace_per_q,
     )
 
 
@@ -1761,6 +1787,20 @@ def fit_zeta_to_h5(
             n_rmu_logical=n_rmu, solver_kind=_resolved_solver_kind)
         L_q.block_until_ready()
         print(f"  L_q: {L_q.shape}")
+
+    # Pre-compute per-q trace of L_q ONCE per channel.  Only the
+    # transverse (LU) path uses it (for the ridge ``ε·|tr(L)|/n_rmu``
+    # before each per-q LU solve).  Computing inside solve_zeta means an
+    # all-reduce across the (mu/p_x, mu/p_y) mesh sharding fires on every
+    # r-chunk — 17 s of GPU stream time on MoS2 3×3 bispinor across 4
+    # r-chunks × 3 transverse channels.  L_q (which is CCT for the LU
+    # path) doesn't change across r-chunks, so the trace is invariant.
+    if int(vertex_mu_L) != 0:
+        with timing.section("zeta_fit.trace_L_q"):
+            cct_trace_per_q = jnp.einsum('qii->q', L_q)
+            cct_trace_per_q.block_until_ready()
+    else:
+        cct_trace_per_q = None
 
     # Free C_q to reclaim GPU memory before z-chunk loop
     # (P_k_mumu was already deleted above)
@@ -2263,6 +2303,7 @@ def fit_zeta_to_h5(
                         vertex_mu_L=int(vertex_mu_L),
                         solver_kind=_resolved_solver_kind,
                         q_irr_full_idx=q_irr_full_idx,   # Phase B: gather inside the kernel
+                        cct_trace_per_q=cct_trace_per_q,
                     )
                     zeta_chunk.block_until_ready()
             finally:
