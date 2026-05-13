@@ -404,11 +404,8 @@ class _FfiBackend:
         #   K=2:           12.91 → 16.47 GB (flat) / 97 s zeta_fit
         #   K=4:           12.91 → 18.50 GB (flat) / 92 s zeta_fit
         # K=2 gives identical throughput to K=4 on this system (writer
-        # saturates) while saving 2 × zeta_chunk/rank — picked as the
-        # default.  Override via ``LORRAX_WRITE_QUEUE_MAXSIZE``; 0 =
-        # legacy unbounded (not recommended).
-        _qmax = int(os.environ.get('LORRAX_WRITE_QUEUE_MAXSIZE', '2'))
-        self._dispatch_queue: queue.Queue = queue.Queue(maxsize=_qmax)
+        # saturates) while saving 2 × zeta_chunk/rank.
+        self._dispatch_queue: queue.Queue = queue.Queue(maxsize=2)
         self._dispatch_pending: int = 0          # protected by _pending_mu
         self._pending_mu = threading.Lock()
         self._pending_cv = threading.Condition(self._pending_mu)
