@@ -104,10 +104,13 @@ def _make_per_q_kernel(mesh_xy: Mesh, n_rmu_L: int, n_rmu_R: int,
         V_q = jnp.zeros((n_rmu_L, n_rmu_R), dtype=zeta_L.dtype)
         V_q = jax.lax.with_sharding_constraint(V_q, V_block_sh)
 
-        # G-chunked accumulation.  Static python loop over n_chunks
-        # (small — ngkmax/g_chunk is O(few) to O(10)).  See module
-        # docstring for the math: V[μ,ν] += conj(L_chunk)·v·R_chunkᵀ.
-        for i in range(n_chunks):
+        # G-chunked accumulation via ``lax.scan`` — compiles once and
+        # executes n_chunks times.  Replaces the historical static
+        # Python loop, which unrolled the HLO ``n_chunks ×`` and grew
+        # compile time linearly with the system size (CrI3 6×6 80 Ry
+        # has n_chunks ~ 14; MoS2 3×3 has 1).  See module docstring
+        # for the math: ``V[μ,ν] += conj(L_chunk) · v · R_chunkᵀ``.
+        def _g_chunk_body(V_carry, i):
             start = i * g_chunk
             L_chunk = jax.lax.dynamic_slice_in_dim(
                 zeta_L, start, g_chunk, axis=-1)        # (n_rmu_L/p_x, g_chunk)
@@ -116,7 +119,9 @@ def _make_per_q_kernel(mesh_xy: Mesh, n_rmu_L: int, n_rmu_R: int,
             v_chunk = jax.lax.dynamic_slice_in_dim(
                 v_q, start, g_chunk, axis=0)            # (g_chunk,)
             L_w = jnp.conj(L_chunk) * v_chunk[None, :]
-            V_q = V_q + L_w @ R_chunk.T
+            return V_carry + L_w @ R_chunk.T, None
+        V_q, _ = jax.lax.scan(
+            _g_chunk_body, V_q, jnp.arange(n_chunks, dtype=jnp.int32))
         V_q = jax.lax.with_sharding_constraint(V_q, V_block_sh)
 
         q_idx_32 = q_idx.astype(jnp.int32)
@@ -213,6 +218,13 @@ def _make_read_q(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
     Both :class:`ZetaLoader` (test bench) and :class:`ZetaReader`
     (production) can serve a G-flat slab; their call signatures
     differ.  Detect which one we have once, then dispatch.
+
+    Also exposes ``read_all_ibz(n_q_ibz) -> (n_q_ibz, n_rmu_padded, ngkmax)``
+    as a single-call batched variant.  Used by the V_q tile orchestrator
+    to read the whole IBZ slab once at the start, avoiding the
+    ``n_q_ibz`` separate ``read_slab`` calls (each of which produces a
+    distinct ``_FfiBackend.read_slab.<locals>._per_rank`` closure id and
+    triggers a JAX trace cache miss).
     """
     has_load = callable(getattr(zeta_loader, 'load', None))
     has_read_slab = callable(getattr(zeta_loader, 'read_zeta_G_slab', None))
@@ -237,6 +249,22 @@ def _make_read_q(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
             sphere_idx=None,
             mesh=mesh_xy, valid_mu=n_rmu_logical,
         )
+
+    def read_all_ibz(n_q_ibz: int) -> jax.Array:
+        """Single batched read of all IBZ q's → ``(n_q_ibz, n_rmu_padded, ngkmax)``."""
+        if has_load:
+            return zeta_loader.load(
+                q=list(range(int(n_q_ibz))), layout='G_flat', sharding=spec)
+        return zeta_loader.read_zeta_G_slab(
+            q_offset=0, q_count=int(n_q_ibz),
+            mu_offset=0, mu_count=int(n_rmu_padded),
+            qvec_batch_frac=jnp.zeros((int(n_q_ibz), 3), dtype=jnp.float64),
+            sphere_idx=None,
+            mesh=mesh_xy, valid_mu=n_rmu_logical,
+        )
+
+    # Attach the batched variant onto ``read_q`` so callers can pick.
+    read_q.read_all_ibz = read_all_ibz
     return read_q
 
 
@@ -371,24 +399,52 @@ def _compute_V_q_g_flat_one_tile(
     read_R = (read_L if same_zeta
               else _make_read_q(zeta_R_loader, n_rmu_R_padded, mesh_xy))
 
-    # ---- Sync per-q loop (async path documented but not wired —
-    # PHDF5 collective + NCCL kernel interleave is fragile; the sync
-    # loop is already ~6× faster than the legacy μ × ν tile driver
-    # on MoS2 3×3).
+    # ---- Pre-read all IBZ ζ̃ slabs in ONE batched call ---------------
+    # The historical per-q PHDF5 read inside the kernel loop interleaved
+    # with NCCL collectives and was the root cause of the async-prefetch
+    # deadlock.  At MoS2 3×3 the full ζ̃_L is ~50 MB / rank; at CrI3 6×6
+    # 80 Ry it's ~0.8 GB / rank — both comfortable.
+    #
+    # 2026-05-12: switched from ``concatenate([read_L(q) for q in ...])``
+    # (n_q_ibz separate ``read_slab`` calls; each one created a fresh
+    # ``_per_rank`` closure and triggered a JAX trace-cache miss in the
+    # FFI shard_map dispatch) to ONE batched ``read_all_ibz`` call.
+    # Net effect on MoS2 3×3 bispinor: 63 read_slab calls (9 q × 7 tiles)
+    # → 7 calls; the corresponding ``jit__per_rank`` retraces drop from
+    # ~63 to 7.
     import time as _t
+    _read_t0 = _t.perf_counter()
+    zeta_L_all = read_L.read_all_ibz(n_q_ibz)               # (n_q_ibz, n_rmu_L_padded, ngkmax)
+    if same_zeta:
+        zeta_R_all = zeta_L_all
+    else:
+        zeta_R_all = read_R.read_all_ibz(n_q_ibz)
+    jax.block_until_ready(zeta_L_all)
+    if not same_zeta:
+        jax.block_until_ready(zeta_R_all)
+    _read_total = _t.perf_counter() - _read_t0
+    if verbose and jax.process_index() == 0:
+        print(f"    [{timing_label}] pre-read all {n_q_ibz} IBZ ζ̃ slabs "
+              f"(1 batched call): {_read_total:.2f}s", flush=True)
+
+    # ---- Sync per-q kernel loop on device-resident ζ̃ ---------------
     for q in range(n_q_ibz):
-        _t0 = _t.perf_counter()
-        zeta_L_q = read_L(q)
-        zeta_R_q = zeta_L_q if same_zeta else read_R(q)
-        _t_read = _t.perf_counter() - _t0
         _t1 = _t.perf_counter()
+        zeta_L_q = jax.lax.dynamic_slice_in_dim(
+            zeta_L_all, q, 1, axis=0)                       # (1, n_rmu_L_padded, ngkmax)
+        zeta_R_q = (zeta_L_q if same_zeta
+                    else jax.lax.dynamic_slice_in_dim(
+                        zeta_R_all, q, 1, axis=0))
         V_acc, g0_acc = kernel(
             V_acc, g0_acc, zeta_L_q, zeta_R_q, v_q_dev[q], jnp.int32(q))
         jax.block_until_ready(V_acc)
         _t_k = _t.perf_counter() - _t1
         if verbose and jax.process_index() == 0:
             print(f"    [{timing_label}] q={q}/{n_q_ibz}: "
-                  f"read={_t_read:.2f}s, kernel={_t_k:.2f}s", flush=True)
+                  f"kernel={_t_k:.2f}s", flush=True)
+    del zeta_L_all
+    if not same_zeta:
+        del zeta_R_all
 
     # ---- IBZ → full-BZ unfold (centroid double-permute) -------------
     if use_ibz:
