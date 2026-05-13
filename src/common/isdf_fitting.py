@@ -528,7 +528,7 @@ def _identity_pad_block_diagonal(
     return jax.lax.with_sharding_constraint(M_id_pad, sharding)
 
 
-def _resolve_solver_kind_charge(mesh_xy: Mesh) -> str:
+def _resolve_solver_kind_charge(mesh_xy: Mesh, override: str = "auto") -> str:
     """Pick the charge-channel ζ-fit solver: cuSolverMp distributed
     potrf+potrs vs the in-tree shard_map 2D-blocked Cholesky + per-q
     triangular solve.
@@ -546,27 +546,25 @@ def _resolve_solver_kind_charge(mesh_xy: Mesh) -> str:
     difference ~0.5 s, within run-to-run noise.  We accept the small
     overhead for the larger-scale win.
 
-    Override via env var:
-      ``LORRAX_USE_CUSOLVERMP_CHARGE_FACTOR=0`` → force sharded.
-      ``LORRAX_USE_CUSOLVERMP_CHARGE_FACTOR=1`` → force cuSolverMp
-        (still falls back on 1D meshes).
-    Unset → default policy (cuSolverMp on true 2D, sharded otherwise).
+    Override via cohsex.in ``cusolvermp_charge``:
+      ``off`` → force sharded.
+      ``on``  → force cuSolverMp (still falls back on 1D meshes).
+      ``auto`` (default) → cuSolverMp on true 2D, sharded otherwise.
     """
     px = int(mesh_xy.shape['x'])
     py = int(mesh_xy.shape['y'])
     is_2d = (px >= 2 and py >= 2)
 
-    env = os.environ.get('LORRAX_USE_CUSOLVERMP_CHARGE_FACTOR')
-    if env == '0':
+    if override == 'off':
         return 'sharded_cholesky'
-    if env == '1':
+    if override == 'on':
         return 'cusolvermp_cholesky' if is_2d else 'sharded_cholesky'
 
-    # Unset → default policy.
+    # auto (or unrecognised) → default policy.
     return 'cusolvermp_cholesky' if is_2d else 'sharded_cholesky'
 
 
-def _resolve_solver_kind_transverse(mesh_xy: Mesh) -> str:
+def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto") -> str:
     """Pick the transverse-channel ζ-fit solver: cuSolverMp distributed
     getrf+getrs vs the in-tree per-q ``jnp.linalg.solve`` + ridge.
 
@@ -580,26 +578,28 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh) -> str:
     2×2 mesh).  At CrI3 6×6 80 Ry (n_rmu≈1800, 4×4 mesh) the cuSolverMp
     path is the right tool.
 
-    Override via env var:
-      ``LORRAX_USE_CUSOLVERMP_LU=0`` → force per-q ``jnp.linalg.solve``.
-      ``LORRAX_USE_CUSOLVERMP_LU=1`` → force cuSolverMp (still falls
-        back on 1D meshes).
-    Unset → default policy (cuSolverMp on true 2D, legacy otherwise).
+    Override via cohsex.in ``cusolvermp_lu``:
+      ``off`` → force per-q ``jnp.linalg.solve``.
+      ``on``  → force cuSolverMp (still falls back on 1D meshes).
+      ``auto`` (default) → cuSolverMp on true 2D, legacy otherwise.
     """
     px = int(mesh_xy.shape['x'])
     py = int(mesh_xy.shape['y'])
     is_2d = (px >= 2 and py >= 2)
 
-    env = os.environ.get('LORRAX_USE_CUSOLVERMP_LU')
-    if env == '0':
+    if override == 'off':
         return 'lu'
-    if env == '1':
+    if override == 'on':
         return 'cusolvermp_lu' if is_2d else 'lu'
 
     return 'cusolvermp_lu' if is_2d else 'lu'
 
 
-def _resolve_solver_kind(mesh_xy: Mesh, vertex_mu_L: int, solver_kind: str) -> str:
+def _resolve_solver_kind(
+    mesh_xy: Mesh, vertex_mu_L: int, solver_kind: str,
+    cusolvermp_charge: str = "auto",
+    cusolvermp_lu: str = "auto",
+) -> str:
     """Single source of truth for the ``auto`` resolution.  Transverse
     channels (γ̃^i, μ_L≠0) take ``_resolve_solver_kind_transverse``;
     charge channel takes ``_resolve_solver_kind_charge``.
@@ -607,8 +607,8 @@ def _resolve_solver_kind(mesh_xy: Mesh, vertex_mu_L: int, solver_kind: str) -> s
     if solver_kind != 'auto':
         return solver_kind
     if int(vertex_mu_L) != 0:
-        return _resolve_solver_kind_transverse(mesh_xy)
-    return _resolve_solver_kind_charge(mesh_xy)
+        return _resolve_solver_kind_transverse(mesh_xy, cusolvermp_lu)
+    return _resolve_solver_kind_charge(mesh_xy, cusolvermp_charge)
 
 
 def factor_c_q(
@@ -1476,6 +1476,8 @@ def fit_zeta_to_h5(
     gspace_mode: str = "host_cache",
     vertex_mu_L: int = 0,
     solver_kind: str = 'auto',
+    cusolvermp_charge: str = "auto",
+    cusolvermp_lu: str = "auto",
     write_ibz_only: bool = True,
     zeta_cutoff_ry: float | None = None,
 ):
@@ -1687,7 +1689,9 @@ def fit_zeta_to_h5(
         # Resolve once so the banner reflects what actually runs and
         # downstream callees skip their own 'auto' fallback.
         _resolved_solver_kind = _resolve_solver_kind(
-            mesh_xy, int(vertex_mu_L), solver_kind)
+            mesh_xy, int(vertex_mu_L), solver_kind,
+            cusolvermp_charge=cusolvermp_charge,
+            cusolvermp_lu=cusolvermp_lu)
         if int(vertex_mu_L) == 0:
             print(f"  Computing L_q = chol(C_q)  [PSD, charge channel, "
                   f"path={_resolved_solver_kind}]")

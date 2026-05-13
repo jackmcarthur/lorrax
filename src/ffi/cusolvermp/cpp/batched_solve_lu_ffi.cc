@@ -14,10 +14,11 @@
 //
 // **Resolved in cuSOLVERMp 0.7.2** (current default; see
 // ``stage_pypi.sh``).  Validated end-to-end on the MoS2 3×3 D3h
-// bispinor smoke (2×2 mesh, transverse γ̃^i channels via
-// ``LORRAX_USE_CUSOLVERMP_LU=1``) — eqp0 matches the legacy per-q
-// ``jnp.linalg.solve`` path to float ULP.  See
-// ``isdf_fitting._resolve_solver_kind_transverse`` for the dispatch.
+// bispinor smoke (2×2 mesh, transverse γ̃^i channels) — eqp0
+// matches the legacy per-q ``jnp.linalg.solve`` path to float ULP.
+// See ``isdf_fitting._resolve_solver_kind_transverse`` for the
+// dispatch (default ``auto`` → cuSolverMp on true 2D meshes; override
+// via cohsex.in ``cusolvermp_lu``).
 //
 // (Earlier 0.6.0-era workaround in w_isdf's low_mem W-solve — the
 // symmetric Cholesky identity ``W = X (I − X† χ X)⁻¹ X†`` — is no

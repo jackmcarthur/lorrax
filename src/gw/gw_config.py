@@ -216,6 +216,25 @@ _DEFAULTS = {
     # Requires fit artifacts at
     # src/gw/aot_memory_model/artifacts/fit_one_rchunk__current__*.json.
     "use_aot_chunk_chooser": False,
+    # When ``use_aot_chunk_chooser`` is True, ``chunk_chooser_mode``
+    # picks between the AOT chooser variants:
+    #   "heuristic" – default; per-stage byte heuristic over the AOT
+    #                 fit artifacts.
+    #   "analytic"  – regressed-fit analytic chooser (alternate model
+    #                 over the same artifacts).
+    "chunk_chooser_mode": "heuristic",
+    # ζ-fit solver path overrides (3-state).  Default ``auto`` picks
+    # cuSolverMp on true 2D meshes (p_x ≥ 2 AND p_y ≥ 2) and the
+    # JAX/CUDA fallback otherwise.  Force a path with ``on`` / ``off``.
+    "cusolvermp_charge": "auto",   # auto | on | off  → cusolvermp_cholesky | sharded_cholesky
+    "cusolvermp_lu":     "auto",   # auto | on | off  → cusolvermp_lu | lu
+    # γ̃-double-contract kernel variant inside the monolithic pair
+    # pipeline (see ``common.gamma_matrices.gamma_double_contract``).
+    # Math identical across all three; differ in HLO structure.
+    #   "take"   – jnp.take + element-wise phase mul (default).
+    #   "einsum" – materialise the sparse γ̃ and contract via einsum.
+    #   "scan"   – lax.scan over the (a, b) spin axis pairs.
+    "gamma_contract_mode": "take",
     # Memory / chunking
     "memory_per_device_gb": 0.0,  # 0 = auto-detect
     "chunk_size": -1,
@@ -570,6 +589,7 @@ class MemoryConfig:
     r_chunk_override: int         # 0 = auto
     zct_stage_cap_gb: float | None
     use_aot_chunk_chooser: bool
+    chunk_chooser_mode: str       # "heuristic" | "analytic"
 
 
 @dataclass(frozen=True)
@@ -585,13 +605,19 @@ class BackendConfig:
     slab_io: SlabIOBackend
     gspace_io: GspaceIO
     screening_solver: ScreeningSolver
+    cusolvermp_charge: str    # "auto" | "on" | "off"
+    cusolvermp_lu: str        # "auto" | "on" | "off"
+    gamma_contract_mode: str  # "take" | "einsum" | "scan"
 
     def summary(self) -> str:
         """One-line "what's active" for the run banner."""
         return (
             f"backend: slab_io={self.slab_io.value}, "
             f"gspace_io={self.gspace_io.value}, "
-            f"screening_solver={self.screening_solver.value}"
+            f"screening_solver={self.screening_solver.value}, "
+            f"cusolvermp_charge={self.cusolvermp_charge}, "
+            f"cusolvermp_lu={self.cusolvermp_lu}, "
+            f"gamma_contract={self.gamma_contract_mode}"
         )
 
 
@@ -912,6 +938,7 @@ class LorraxConfig:
             r_chunk_override=int(_g("r_chunk_size")),
             zct_stage_cap_gb=zct_stage_cap_gb,
             use_aot_chunk_chooser=bool(_g("use_aot_chunk_chooser")),
+            chunk_chooser_mode=str(_g("chunk_chooser_mode")).strip().lower(),
         )
         backend = BackendConfig(
             slab_io=(
@@ -920,6 +947,9 @@ class LorraxConfig:
             ),
             gspace_io=GspaceIO(str(_g("gspace_mode")).strip().lower()),
             screening_solver=_LEGACY_ISDF_MEMORY_MODE[isdf_memory_mode],
+            cusolvermp_charge=str(_g("cusolvermp_charge")).strip().lower(),
+            cusolvermp_lu=str(_g("cusolvermp_lu")).strip().lower(),
+            gamma_contract_mode=str(_g("gamma_contract_mode")).strip().lower(),
         )
         debug = DebugConfig(
             debug_hartree=bool(_g("debug_hartree")),

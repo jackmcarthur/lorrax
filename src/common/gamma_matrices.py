@@ -1,4 +1,3 @@
-import os
 
 import jax
 import jax.numpy as jnp
@@ -259,8 +258,9 @@ def gamma_double_contract(
     to mean γ̃_L = I_4 (and/or γ̃_R = I_4); both None ⇒ pure
     Σ_{αβ} P_l_conj · P_r Frobenius reduction (charge channel).
 
-    Three implementation strategies, selected via the env var
-    ``LORRAX_GAMMA_CONTRACT_MODE``:
+    Three implementation strategies, selected via cohsex.in
+    ``gamma_contract_mode`` (set once at config-build time by
+    ``set_gamma_contract_mode``):
 
       * ``take``   (default) — ``jnp.take`` + multiply chain (the
                    historical impl; ~5 concurrent rank-5 slots).
@@ -283,15 +283,34 @@ def gamma_double_contract(
 
     Output: same shape as P_l_conj minus the two spin axes.
     """
-    mode = os.environ.get("LORRAX_GAMMA_CONTRACT_MODE", "take").lower()
-    if mode == "einsum":
+    if _GAMMA_CONTRACT_MODE == "einsum":
         return _gamma_double_contract_einsum(
             P_l_conj, P_r, perm_L, phase_L, perm_R, phase_R, spin_axes)
-    if mode == "scan":
+    if _GAMMA_CONTRACT_MODE == "scan":
         return _gamma_double_contract_scan(
             P_l_conj, P_r, perm_L, phase_L, perm_R, phase_R, spin_axes)
     return _gamma_double_contract_take(
         P_l_conj, P_r, perm_L, phase_L, perm_R, phase_R, spin_axes)
+
+
+# Module-level mode set at config-build time via
+# :func:`set_gamma_contract_mode`.  Default ``take`` matches the
+# historical path; cohsex.in ``gamma_contract_mode`` overrides it.
+_GAMMA_CONTRACT_MODE: str = "take"
+
+
+def set_gamma_contract_mode(mode: str) -> None:
+    """Set the global γ̃-double-contract kernel variant (``take`` |
+    ``einsum`` | ``scan``).  Called once by the driver from
+    ``cfg.backend.gamma_contract_mode``.  Mutating this after kernels
+    have been traced will not retroactively re-trace them.
+    """
+    global _GAMMA_CONTRACT_MODE
+    m = str(mode).strip().lower()
+    if m not in ("take", "einsum", "scan"):
+        raise ValueError(
+            f"gamma_contract_mode={mode!r} not in (take, einsum, scan)")
+    _GAMMA_CONTRACT_MODE = m
 
 
 __all__ = [

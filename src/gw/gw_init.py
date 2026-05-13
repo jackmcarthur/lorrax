@@ -416,8 +416,8 @@ def _apply_aot_chunk_model(
 
     - ``cfg.memory.use_aot_chunk_chooser=True``: the AOT chooser picks
       ``chunk_r`` and ``band_chunk``; the heuristic's existing values are
-      overridden.  ``LORRAX_CHOOSER_MODE=analytic`` swaps the regressed-fit
-      analytic chooser in for the default 20/80 heuristic.
+      overridden.  ``cfg.memory.chunk_chooser_mode=analytic`` swaps the
+      regressed-fit analytic chooser in for the default 20/80 heuristic.
     - ``cfg.memory.use_aot_chunk_chooser=False``: the AOT *predictor* runs
       alongside the heuristic and prints its predicted peak — used for γ
       calibration against the runtime nvidia-smi sample taken inside
@@ -461,9 +461,10 @@ def _apply_aot_chunk_model(
     aot_mesh = MeshSpec(p_x=int(p_x), p_y=int(p_y))
 
     if mem.use_aot_chunk_chooser:
-        # 20/80 heuristic is the default — no DoE deps.  Falls back to the
-        # regressed-fit analytic chooser when LORRAX_CHOOSER_MODE=analytic.
-        chooser_mode = os.environ.get("LORRAX_CHOOSER_MODE", "heuristic")
+        # 20/80 heuristic is the default — no DoE deps.  Cohsex.in
+        # ``chunk_chooser_mode=analytic`` swaps in the regressed-fit
+        # analytic chooser instead.
+        chooser_mode = mem.chunk_chooser_mode
         budget_bytes = (
             mem.per_device_gb * 1e9 * mem.chunk_target_utilization
         )
@@ -538,6 +539,12 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	:func:`compute_optimal_chunks`.  Returns ``(zeta_h5_path, mem_est)``.
 	"""
 	from common.isdf_fitting import fit_zeta_to_h5
+	from common.gamma_matrices import set_gamma_contract_mode
+	# Honour cohsex.in ``gamma_contract_mode`` for the γ̃·γ̃ kernel
+	# inside the monolithic pair pipeline.  Mode is module-level (the
+	# γ̃ contract sits inside shard_map bodies so threading a kwarg
+	# through every call would be churn for no benefit).
+	set_gamma_contract_mode(cfg.backend.gamma_contract_mode)
 
 	# ISDF left/right band windows (pair density needs asymmetric ranges)
 	band_range_left = (band_slices.b0, band_slices.b3)   # all val + sigma cond
@@ -689,6 +696,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			band_norms=_band_norms,
 			slab_io_backend=cfg.backend.slab_io,
 			gspace_mode=cfg.gspace_mode,
+			cusolvermp_charge=cfg.backend.cusolvermp_charge,
+			cusolvermp_lu=cfg.backend.cusolvermp_lu,
 			write_ibz_only=_write_ibz_only_charge,
 			zeta_cutoff_ry=_zeta_cutoff,
 		)
@@ -809,6 +818,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					band_norms=_band_norms,
 					slab_io_backend=cfg.backend.slab_io,
 					gspace_mode=cfg.gspace_mode,
+					cusolvermp_charge=cfg.backend.cusolvermp_charge,
+					cusolvermp_lu=cfg.backend.cusolvermp_lu,
 					vertex_mu_L=mu_L,
 					# TODO(bispinor-ibz): port compute_V_q_bispinor_to_h5
 					# to consume IBZ-only ζ + post-loop unfold, then
