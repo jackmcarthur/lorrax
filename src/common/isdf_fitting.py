@@ -486,29 +486,34 @@ _chol_2d_cache = {}
 
 # ============================================================================
 # Monolithic shard_map pair pipelines — pair density + IFFT + γ̃·γ̃ + FFT
-# fused into ONE shard_map.  Gated by ``LORRAX_PAIR_PIPELINE_SHARDMAP=1``.
+# fused into ONE shard_map.  Default-on; override with
+# ``LORRAX_PAIR_PIPELINE_SHARDMAP=0`` to fall back to the legacy chain
+# (kept around because pivoted-Cholesky centroid selection still calls
+# ``pair_density`` + ``c_q_from_pair`` directly outside this codepath).
 # ============================================================================
 #
-# The default ``c_q_from_pair`` / ``z_q_from_pair`` pipelines chain three
-# sub-jits (``_ifft_conj`` + ``_ifft_contract_fft``, with the FFT helpers
-# adding their own shard_map regions inside).  XLA materialises a global
-# rank-5 pair-density buffer between them; that buffer reshapes to a
-# rank-3 fused form ``(nk, ns·col, ns·μ)`` for cache locality which
-# *cannot* be represented as a contiguous PartitionSpec (the fused axis
-# mixes a replicated ``ns`` with a sharded ``μ`` or ``col``).  XLA falls
-# back to replicating the rank-3 buffer per rank — 4× the sharded
-# footprint on a 2×2 mesh (5 concurrent lifetime slots × 4.16 GiB at
-# MoS2 3×3 bispinor, where the model expected ~1.14 GiB each).
+# Legacy ``c_q_from_pair`` / ``z_q_from_pair`` chains three sub-jits
+# (``_ifft_conj`` + ``_ifft_contract_fft``, with FFT helpers adding their
+# own shard_map regions inside).  Between them XLA materialises a global
+# rank-5 pair-density value, and for each pair-density-shaped value
+# across the lifetime — pair-density einsum output, IFFT outputs (P_l_R,
+# P_r_R), gamma-contract take intermediate — XLA's BufferAssignment
+# lands at 5 concurrent rank-5 lifetime slots (~4 GiB each at MoS2 3×3
+# bispinor: ``nk · ns² · n_rmu_local · col_local · 16``), pegging the
+# kernel preallocated-temp peak at 21 GiB on a 28 GiB budget.
 #
 # These ``_sm`` variants take the wavefunction tensors directly
-# (skipping the global rank-5 pair-density buffer) and fold the entire
-# pair-density → IFFT → γ̃·γ̃ → FFT pipeline into one ``shard_map``.
-# Inside that region everything is local-per-rank, the FFTs run via
-# direct ``jnp.fft.ifftn`` / ``jnp.fft.fftn`` calls (no nested
-# ``make_flat_k_*`` helper — see commentary on ``LORRAX_PSIG_RCHUNK_SHARDMAP``
-# for the same approach on ``to_rchunk_shard_map``).  No nested
-# shard_maps, no helper boundary that could let XLA re-globalise the
-# pair density.
+# (skipping the standalone rank-5 pair-density buffer) and fold the
+# entire pair-density → IFFT → γ̃·γ̃ → FFT pipeline into one
+# ``shard_map``.  Inside that region everything is local-per-rank and
+# the FFTs run via direct ``jnp.fft.ifftn`` / ``jnp.fft.fftn`` calls
+# (no nested ``make_flat_k_*`` helper — see
+# ``wfn_transforms.to_rchunk_shard_map`` for the same approach).  No
+# nested shard_maps, no helper boundary that could let XLA re-globalise
+# the pair density.  Drops the slot count from 5 → 3 (the two saved are
+# the standalone IFFT outputs + the gamma-contract intermediate),
+# reducing the kernel peak from 21.45 GiB → 13.11 GiB on the MoS2
+# bispinor reference (a ~40% drop) with comparable wall time.
 
 
 def c_q_from_psi_sm(
@@ -564,37 +569,19 @@ def c_q_from_psi_sm(
 			# bands replicated):
 			#   psi_l_X_ : (nk, n_rmu_local, nb_l, ns)
 			#   psi_l_Y_ : (nk, nb_l, ns, n_col_local)
-			# Build rank-5 pair densities LOCALLY — they never appear as
-			# a global value, so XLA can't reshape them to the rank-3
-			# fused-replicated form.
-			#
-			# Why the ns² unroll: the single rank-5 einsum
-			# ``'kmna,knbr->kabmr'`` lowers to a batched cuBLAS gemm
-			# with M = ns_l · n_col_local and N = ns_r · n_rmu_local —
-			# but XLA's gemm planner then promotes ns_l, ns_r out of the
-			# batch and into the M/N axes as ``ns² · col_local`` and
-			# ``ns² · n_rmu_local`` (the same axes appear on both sides
-			# of the fused gemm result, which is silly).  That 4×
-			# blow-up makes the per-rank intermediate the same size it
-			# would be unsharded.  Splitting into ns² rank-3 gemms
-			# ``'kmn,knr->kmr'`` (each producing a clean (k, μ_local,
-			# col_local) result) prevents the fusion — same total
-			# launches, no spin-axis batching in the gemm.
+			# Build rank-5 pair densities LOCALLY, then IFFT + contract +
+			# FFT — all local per rank.  The single ``kmna,knbr->kabmr``
+			# einsum lowers to a batched cuBLAS gemm that batches ns² in
+			# the M / N axes; that's the cache-friendly layout and runs
+			# fastest.  An ns²-unrolled version (4 rank-3 ``kmn,knr->kmr``
+			# gemms) dropped the per-rank peak by ~3% but cost ~15% in
+			# walltime, so the single-einsum form wins overall.
 			mu_loc = psi_l_X_.shape[1]
 			col_loc = psi_l_Y_.shape[3]
-			pair_shape = (nkx * nky * nkz, ns, ns, mu_loc, col_loc)
-			P_l = jnp.zeros(pair_shape, dtype=psi_l_X_.dtype)
-			P_r = jnp.zeros(pair_shape, dtype=psi_r_X_.dtype)
-			for _a in range(ns):
-				for _b in range(ns):
-					P_l = P_l.at[:, _a, _b].set(jnp.einsum(
-						'kmn,knr->kmr',
-						psi_l_X_[..., _a], psi_l_Y_[:, :, _b, :],
-						optimize=True))
-					P_r = P_r.at[:, _a, _b].set(jnp.einsum(
-						'kmn,knr->kmr',
-						psi_r_X_[..., _a], psi_r_Y_[:, :, _b, :],
-						optimize=True))
+			P_l = jnp.einsum(
+				'kmna,knbr->kabmr', psi_l_X_, psi_l_Y_, optimize=True)
+			P_r = jnp.einsum(
+				'kmna,knbr->kabmr', psi_r_X_, psi_r_Y_, optimize=True)
 			# Reshape (nk → nkx·nky·nkz) for the local 3D IFFT.
 			P_l_3d = P_l.reshape(nkx, nky, nkz, ns, ns, mu_loc, col_loc)
 			del P_l
@@ -686,25 +673,16 @@ def z_q_from_psi_sm(
 		         check_rep=False)
 		def _local(psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_,
 		           perm_L_, phase_L_, perm_R_, phase_R_):
-			# See c_q_from_psi_sm._local for the (ns_l, ns_r) unroll
-			# rationale: a single rank-5 einsum lowers to a cuBLAS gemm
-			# whose planner promotes ns² out of the batch, 4×'ing the
-			# per-rank footprint vs. the truly-sharded form.
+			# Same layout / IFFT / contract / FFT pattern as
+			# c_q_from_psi_sm; ``col`` here is the r-chunk extent
+			# (not n_rmu).  See c_q_from_psi_sm._local for the
+			# performance / memory rationale.
 			mu_loc = psi_l_X_.shape[1]
 			z_loc = psi_l_Y_.shape[3]
-			pair_shape = (nkx * nky * nkz, ns, ns, mu_loc, z_loc)
-			P_l = jnp.zeros(pair_shape, dtype=psi_l_X_.dtype)
-			P_r = jnp.zeros(pair_shape, dtype=psi_r_X_.dtype)
-			for _a in range(ns):
-				for _b in range(ns):
-					P_l = P_l.at[:, _a, _b].set(jnp.einsum(
-						'kmn,knr->kmr',
-						psi_l_X_[..., _a], psi_l_Y_[:, :, _b, :],
-						optimize=True))
-					P_r = P_r.at[:, _a, _b].set(jnp.einsum(
-						'kmn,knr->kmr',
-						psi_r_X_[..., _a], psi_r_Y_[:, :, _b, :],
-						optimize=True))
+			P_l = jnp.einsum(
+				'kmna,knbr->kabmr', psi_l_X_, psi_l_Y_, optimize=True)
+			P_r = jnp.einsum(
+				'kmna,knbr->kabmr', psi_r_X_, psi_r_Y_, optimize=True)
 			P_l_3d = P_l.reshape(nkx, nky, nkz, ns, ns, mu_loc, z_loc)
 			del P_l
 			P_l_R = jnp.fft.ifftn(P_l_3d, axes=(0, 1, 2), norm='forward')
@@ -1624,7 +1602,7 @@ def _make_fit_one_rchunk_kernel(
         # fused-replicated buffer that pegs the kernel peak (5 slots ×
         # 4.16 GiB on MoS2 3×3 bispinor) cannot form.
         _use_pair_pipe_sm = (
-            os.environ.get('LORRAX_PAIR_PIPELINE_SHARDMAP', '0') == '1')
+            os.environ.get('LORRAX_PAIR_PIPELINE_SHARDMAP', '1') != '0')
         if _use_pair_pipe_sm:
             del P_l, P_r  # zeros no longer needed
             _b0 = int(band_range_full[0])
@@ -2050,7 +2028,7 @@ def fit_zeta_to_h5(
         chan_label = ("charge γ̃^0=I" if vertex_mu_L == 0
                       else f"transverse γ̃^{vertex_mu_L}")
         _use_pair_pipe_sm = (
-            os.environ.get('LORRAX_PAIR_PIPELINE_SHARDMAP', '0') == '1')
+            os.environ.get('LORRAX_PAIR_PIPELINE_SHARDMAP', '1') != '0')
         if _use_pair_pipe_sm:
             # Monolithic shard_map path — see c_q_from_psi_sm docstring.
             # Skips the global rank-5 P_l/P_r materialisation that XLA
