@@ -50,7 +50,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 
 __all__ = [
-    "to_box", "to_rbox", "to_rmu", "to_rchunk", "to_rchunk_shard_map",
+    "to_box", "to_rbox", "to_rmu", "to_rchunk",
     "apply_bloch_phase", "apply_bloch_phase_on_slice",
     "accumulate_rchunk_to_gflat",
 ]
@@ -64,7 +64,6 @@ _BOX_KERNEL_CACHE: dict = {}
 _RBOX_KERNEL_CACHE: dict = {}
 _RMU_KERNEL_CACHE: dict = {}
 _RCHUNK_KERNEL_CACHE: dict = {}
-_RCHUNK_SHARD_MAP_KERNEL_CACHE: dict = {}
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +351,13 @@ def to_rchunk(
     Flat-r convention: ``r_flat = rx * ny * nz + ry * nz + rz``.  ``r0``
     may be a Python int (bounds-checked) or a traced scalar (caller's
     responsibility).
+
+    The full G-flat gather → FFT-box → IFFT → r-slice (→ Bloch phase)
+    pipeline runs inside one ``shard_map`` region.  Keeping it
+    inside the manual per-rank region prevents XLA SPMD from
+    reconstructing the full logical band axis between ``PsiGStore``'s
+    ``io_callback`` and the local FFT — verified to remove ~506 MiB
+    all-gathers from the HLO at MoS2 3×3 / 4×A100.
     """
     ngkmax = int(psi.shape[-1])
     fft_grid_t = tuple(int(s) for s in fft_grid)
@@ -361,74 +367,7 @@ def to_rchunk(
     if isinstance(r0, (int, np.integer)):
         if r0 < 0 or int(r0) + r_len_i > n_rtot:
             raise ValueError(
-                f"to_rchunk: [{int(r0)}, {int(r0) + r_len_i}) out of [0, {n_rtot})")
-    kvecs_shape = (None if kvecs_frac is None
-                   else tuple(int(s) for s in np.shape(kvecs_frac)))
-    out_sharding = _output_sharding(psi, mesh, n_extra_axes=1)
-    key = (psi.shape, tuple(g_index.shape), ngkmax, fft_grid_t, r_len_i,
-           norm, kvecs_shape, _sharding_key(psi), out_sharding)
-    fn = _RCHUNK_KERNEL_CACHE.get(key)
-    if fn is None:
-        ifftn = _local_box_fft(psi, mesh, kind='ifftn', norm=norm)
-        if kvecs_frac is None:
-            @jax.jit
-            def fn(psi_, g_index_, r0_):
-                rb = ifftn(_box_kernel(psi_, g_index_, ngkmax=ngkmax))
-                rb_flat = rb.reshape(*rb.shape[:3], n_rtot)
-                out = jax.lax.dynamic_slice_in_dim(rb_flat, r0_, r_len_i, axis=-1)
-                return _maybe_constrain(out, out_sharding)
-            _RCHUNK_KERNEL_CACHE[key] = fn
-        else:
-            @jax.jit
-            def fn(psi_, g_index_, r0_, kvecs_):
-                # Phase-after-slice: IFFT → flatten → slice → phase on
-                # the r_len-cell slab (not on the full nx·ny·nz box).
-                # Mathematically equivalent (multiplication commutes
-                # with slicing along r); cuts the per-r phase work from
-                # n_k·nx·ny·nz to n_k·r_len.
-                rb = ifftn(_box_kernel(psi_, g_index_, ngkmax=ngkmax))
-                rb_flat = rb.reshape(*rb.shape[:3], n_rtot)
-                slab = jax.lax.dynamic_slice_in_dim(rb_flat, r0_, r_len_i, axis=-1)
-                slab = apply_bloch_phase_on_slice(
-                    slab, kvecs_, fft_grid_t, r0_, r_len_i)
-                return _maybe_constrain(slab, out_sharding)
-            _RCHUNK_KERNEL_CACHE[key] = fn
-    g_index_j = jnp.asarray(g_index, dtype=jnp.int32)
-    r0_arg = (jnp.int32(int(r0)) if isinstance(r0, (int, np.integer)) else r0)
-    if kvecs_frac is None:
-        return fn(psi, g_index_j, r0_arg)
-    return fn(psi, g_index_j, r0_arg,
-              jnp.asarray(kvecs_frac, dtype=jnp.float64))
-
-
-def to_rchunk_shard_map(
-    psi: jax.Array,
-    g_index: np.ndarray | jax.Array,
-    fft_grid: Sequence[int],
-    r0,
-    r_len: int,
-    *,
-    mesh: Mesh,
-    norm: str = "backward",
-    kvecs_frac: np.ndarray | jax.Array | None = None,
-) -> jax.Array:
-    """Shard-local variant of :func:`to_rchunk`.
-
-    This is intentionally a near-copy of :func:`to_rchunk`, but the whole
-    G-flat gather → FFT-box → IFFT → r-slice pipeline runs inside one
-    ``shard_map`` region.  Keeping the full transform inside the manual
-    per-rank region prevents XLA SPMD from reconstructing the full logical
-    band axis between ``PsiGStore``'s ``io_callback`` and the local FFT.
-    """
-    ngkmax = int(psi.shape[-1])
-    fft_grid_t = tuple(int(s) for s in fft_grid)
-    nx, ny, nz = fft_grid_t
-    n_rtot = nx * ny * nz
-    r_len_i = int(r_len)
-    if isinstance(r0, (int, np.integer)):
-        if r0 < 0 or int(r0) + r_len_i > n_rtot:
-            raise ValueError(
-                f"to_rchunk_shard_map: [{int(r0)}, {int(r0) + r_len_i}) "
+                f"to_rchunk: [{int(r0)}, {int(r0) + r_len_i}) "
                 f"out of [0, {n_rtot})")
 
     psi_spec = P(*_spec_of(psi))
@@ -437,7 +376,7 @@ def to_rchunk_shard_map(
                    else tuple(int(s) for s in np.shape(kvecs_frac)))
     key = (psi.shape, tuple(g_index.shape), ngkmax, fft_grid_t, r_len_i,
            norm, kvecs_shape, _sharding_key(psi), out_spec, id(mesh))
-    fn = _RCHUNK_SHARD_MAP_KERNEL_CACHE.get(key)
+    fn = _RCHUNK_KERNEL_CACHE.get(key)
     if fn is None:
         if kvecs_frac is None:
             @partial(
@@ -467,6 +406,8 @@ def to_rchunk_shard_map(
                 check_rep=False,
             )
             def _local_rchunk(psi_l, g_index_l, r0_l, kvecs_l):
+                # Phase-after-slice: IFFT → flatten → slice → phase on
+                # the r_len-cell slab (not on the full nx·ny·nz box).
                 box_l = _box_kernel(psi_l, g_index_l, ngkmax=ngkmax)
                 rb_l = jnp.fft.ifftn(box_l, axes=(-3, -2, -1), norm=norm)
                 rb_flat_l = rb_l.reshape(*rb_l.shape[:3], n_rtot)
@@ -478,7 +419,7 @@ def to_rchunk_shard_map(
             @jax.jit
             def fn(psi_, g_index_, r0_, kvecs_):
                 return _local_rchunk(psi_, g_index_, r0_, kvecs_)
-        _RCHUNK_SHARD_MAP_KERNEL_CACHE[key] = fn
+        _RCHUNK_KERNEL_CACHE[key] = fn
 
     g_index_j = jnp.asarray(g_index, dtype=jnp.int32)
     r0_arg = (jnp.int32(int(r0)) if isinstance(r0, (int, np.integer)) else r0)

@@ -507,8 +507,8 @@ _chol_2d_cache = {}
 # entire pair-density → IFFT → γ̃·γ̃ → FFT pipeline into one
 # ``shard_map``.  Inside that region everything is local-per-rank and
 # the FFTs run via direct ``jnp.fft.ifftn`` / ``jnp.fft.fftn`` calls
-# (no nested ``make_flat_k_*`` helper — see
-# ``wfn_transforms.to_rchunk_shard_map`` for the same approach).  No
+# (no nested ``make_flat_k_*`` helper — same approach as
+# ``wfn_transforms.to_rchunk``).  No
 # nested shard_maps, no helper boundary that could let XLA re-globalise
 # the pair density.  Drops the slot count from 5 → 3 (the two saved are
 # the standalone IFFT outputs + the gamma-contract intermediate),

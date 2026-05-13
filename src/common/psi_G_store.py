@@ -301,7 +301,7 @@ class PsiGStore:
             Optional ``(k_lo, k_hi)`` for k-chunking; defaults to
             the full k axis.
         """
-        from common.wfn_transforms import to_rchunk, to_rchunk_shard_map
+        from common.wfn_transforms import to_rchunk
 
         bc_idx = self._bc_index(band_range)
         b_lo = self._bc_band_offsets[bc_idx]
@@ -350,15 +350,12 @@ class PsiGStore:
         import os as _os
         _kc_env = int(_os.environ.get('LORRAX_PSIG_KCHUNK', '0') or 0)
         _k_chunk = max(1, _kc_env) if _kc_env > 0 else nk_slice
-        _use_full_shardmap = (
-            _os.environ.get('LORRAX_PSIG_RCHUNK_SHARDMAP', '0') == '1')
-        _to_rchunk = to_rchunk_shard_map if _use_full_shardmap else to_rchunk
         kvecs_frac_full = self._kvecs_frac_dev[k_lo:k_hi]
         g_index_full = (self._g_index_dev[k_lo:k_hi] if k_range is not None
                         else self._g_index_dev)
         fft_grid_t = tuple(int(s) for s in self.meta.fft_grid)
         if _k_chunk >= nk_slice:
-            return _to_rchunk(
+            return to_rchunk(
                 psi_G_flat, g_index_full, fft_grid_t,
                 r_start_dyn, int(r_chunk_size),
                 kvecs_frac=kvecs_frac_full, norm="ortho",
@@ -369,7 +366,7 @@ class PsiGStore:
         slabs = []
         for k0 in range(0, nk_slice, _k_chunk):
             k1 = min(k0 + _k_chunk, nk_slice)
-            slabs.append(_to_rchunk(
+            slabs.append(to_rchunk(
                 psi_G_flat[k0:k1], g_index_full[k0:k1], fft_grid_t,
                 r_start_dyn, int(r_chunk_size),
                 kvecs_frac=kvecs_frac_full[k0:k1], norm="ortho",
