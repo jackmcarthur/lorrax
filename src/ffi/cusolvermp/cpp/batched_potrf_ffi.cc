@@ -26,6 +26,7 @@
 
 #include <cuda_runtime.h>
 #include <cusolverMp.h>
+#include <nvtx3/nvToolsExt.h>
 
 #include "xla/ffi/api/ffi.h"
 
@@ -40,9 +41,17 @@ using lorrax_ffi::cusolvermp::LorraxCusolverMpCtx;
 using lorrax_ffi::cusolvermp::ensure_workspace;
 namespace mp = lorrax_ffi::cusolvermp::mp;
 
+struct NvtxRange {
+    explicit NvtxRange(const char* name) { nvtxRangePushA(name); }
+    ~NvtxRange() { nvtxRangePop(); }
+    NvtxRange(const NvtxRange&) = delete;
+    NvtxRange& operator=(const NvtxRange&) = delete;
+};
+
 static ffi::Error cross_stream_wait_pooled(cudaStream_t waiter,
                                            cudaStream_t signaller,
                                            cudaEvent_t  ev) {
+    NvtxRange range("potrf.cross_stream_wait");
     LORRAX_CUDA_CHECK(cudaEventRecord(ev, signaller));
     LORRAX_CUDA_CHECK(cudaStreamWaitEvent(waiter, ev, 0));
     return ffi::Error::Success();
@@ -70,6 +79,7 @@ static ffi::Error BatchedPotrfImpl(
     // equal — skip the memcpy entirely.  At Si scale this saves ~1 GB
     // of transient VRAM per rank for potrf and ~1.7 GB for potrs.
     if (d_L_out != static_cast<const T*>(d_A_in)) {
+        NvtxRange range("potrf.copy_A_to_L");
         LORRAX_CUDA_CHECK(cudaMemcpyAsync(
             d_L_out, d_A_in,
             nq * slice_elems * sizeof(T),
@@ -77,16 +87,23 @@ static ffi::Error BatchedPotrfImpl(
     }
 
     cusolverMpMatrixDescriptor_t descA = nullptr;
-    LORRAX_LIB_CHECK(
-        cusolverMpCreateMatrixDesc(&descA, ctx->grid,
-                                   mp::CudaDataTypeOf<T>::value,
-                                   n, n, mb, nb, 0, 0, lld_A),
-        CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(A)");
+    {
+        NvtxRange range("potrf.CreateMatrixDesc");
+        LORRAX_LIB_CHECK(
+            cusolverMpCreateMatrixDesc(&descA, ctx->grid,
+                                       mp::CudaDataTypeOf<T>::value,
+                                       n, n, mb, nb, 0, 0, lld_A),
+            CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(A)");
+    }
 
     size_t d_ws = 0, h_ws = 0;
-    cusolverStatus_t mp_st = mp::PotrfBufferSize<T>(
-        ctx->handle, CUBLAS_FILL_MODE_LOWER, n,
-        d_L_out, 1, 1, descA, &d_ws, &h_ws);
+    cusolverStatus_t mp_st = CUSOLVER_STATUS_SUCCESS;
+    {
+        NvtxRange range("potrf.BufferSize");
+        mp_st = mp::PotrfBufferSize<T>(
+            ctx->handle, CUBLAS_FILL_MODE_LOWER, n,
+            d_L_out, 1, 1, descA, &d_ws, &h_ws);
+    }
     if (mp_st != CUSOLVER_STATUS_SUCCESS) {
         cusolverMpDestroyMatrixDesc(descA);
         std::ostringstream os;
@@ -94,6 +111,7 @@ static ffi::Error BatchedPotrfImpl(
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
     try {
+        NvtxRange range("potrf.ensure_workspace");
         ensure_workspace(ctx, d_ws, h_ws);
     } catch (const std::exception& ex) {
         cusolverMpDestroyMatrixDesc(descA);
@@ -101,6 +119,10 @@ static ffi::Error BatchedPotrfImpl(
     }
 
     for (int64_t q = 0; q < nq; ++q) {
+        char tag[64];
+        std::snprintf(tag, sizeof(tag), "potrf.Potrf[q=%lld]",
+                      static_cast<long long>(q));
+        NvtxRange range(tag);
         T* slice_ptr = d_L_out + q * slice_elems;
         mp_st = mp::Potrf<T>(
             ctx->handle, CUBLAS_FILL_MODE_LOWER, n,
@@ -116,7 +138,10 @@ static ffi::Error BatchedPotrfImpl(
         }
     }
 
-    cusolverMpDestroyMatrixDesc(descA);
+    {
+        NvtxRange range("potrf.DestroyMatrixDesc");
+        cusolverMpDestroyMatrixDesc(descA);
+    }
 
     FFI_RETURN_IF_ERROR(cross_stream_wait_pooled(
         xla_stream, ctx->stream, ctx->ev_ctx_out));

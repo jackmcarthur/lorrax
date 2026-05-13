@@ -24,6 +24,7 @@
 
 #include <cuda_runtime.h>
 #include <cusolverMp.h>
+#include <nvtx3/nvToolsExt.h>
 
 #include "xla/ffi/api/ffi.h"
 
@@ -38,9 +39,17 @@ using lorrax_ffi::cusolvermp::LorraxCusolverMpCtx;
 using lorrax_ffi::cusolvermp::ensure_workspace;
 namespace mp = lorrax_ffi::cusolvermp::mp;
 
+struct NvtxRange {
+    explicit NvtxRange(const char* name) { nvtxRangePushA(name); }
+    ~NvtxRange() { nvtxRangePop(); }
+    NvtxRange(const NvtxRange&) = delete;
+    NvtxRange& operator=(const NvtxRange&) = delete;
+};
+
 static ffi::Error cross_stream_wait_pooled(cudaStream_t waiter,
                                            cudaStream_t signaller,
                                            cudaEvent_t  ev) {
+    NvtxRange range("potrs.cross_stream_wait");
     LORRAX_CUDA_CHECK(cudaEventRecord(ev, signaller));
     LORRAX_CUDA_CHECK(cudaStreamWaitEvent(waiter, ev, 0));
     return ffi::Error::Success();
@@ -70,6 +79,7 @@ static ffi::Error BatchedPotrsImpl(
     // ffi_call gives us B === X (XLA reuses the buffer).  See
     // batched_potrf_ffi.cc for the rationale.
     if (d_X_out != static_cast<const T*>(d_B_in)) {
+        NvtxRange range("potrs.copy_B_to_X");
         LORRAX_CUDA_CHECK(cudaMemcpyAsync(
             d_X_out, d_B_in,
             nq * B_slice * sizeof(T),
@@ -77,23 +87,33 @@ static ffi::Error BatchedPotrsImpl(
     }
 
     cusolverMpMatrixDescriptor_t descA = nullptr, descB = nullptr;
-    LORRAX_LIB_CHECK(
-        cusolverMpCreateMatrixDesc(&descA, ctx->grid,
-                                   mp::CudaDataTypeOf<T>::value,
-                                   n, n, mb_a, nb_a, 0, 0, lld_A),
-        CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(A)");
-    LORRAX_LIB_CHECK(
-        cusolverMpCreateMatrixDesc(&descB, ctx->grid,
-                                   mp::CudaDataTypeOf<T>::value,
-                                   n, mrhs, mb_b, nb_b, 0, 0, lld_B),
-        CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(B)");
+    {
+        NvtxRange range("potrs.CreateMatrixDesc[A]");
+        LORRAX_LIB_CHECK(
+            cusolverMpCreateMatrixDesc(&descA, ctx->grid,
+                                       mp::CudaDataTypeOf<T>::value,
+                                       n, n, mb_a, nb_a, 0, 0, lld_A),
+            CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(A)");
+    }
+    {
+        NvtxRange range("potrs.CreateMatrixDesc[B]");
+        LORRAX_LIB_CHECK(
+            cusolverMpCreateMatrixDesc(&descB, ctx->grid,
+                                       mp::CudaDataTypeOf<T>::value,
+                                       n, mrhs, mb_b, nb_b, 0, 0, lld_B),
+            CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(B)");
+    }
 
     size_t d_ws = 0, h_ws = 0;
-    cusolverStatus_t mp_st = mp::PotrsBufferSize<T>(
-        ctx->handle, CUBLAS_FILL_MODE_LOWER, n, mrhs,
-        d_L,     1, 1, descA,
-        d_X_out, 1, 1, descB,
-        &d_ws, &h_ws);
+    cusolverStatus_t mp_st = CUSOLVER_STATUS_SUCCESS;
+    {
+        NvtxRange range("potrs.BufferSize");
+        mp_st = mp::PotrsBufferSize<T>(
+            ctx->handle, CUBLAS_FILL_MODE_LOWER, n, mrhs,
+            d_L,     1, 1, descA,
+            d_X_out, 1, 1, descB,
+            &d_ws, &h_ws);
+    }
     if (mp_st != CUSOLVER_STATUS_SUCCESS) {
         cusolverMpDestroyMatrixDesc(descA);
         cusolverMpDestroyMatrixDesc(descB);
@@ -102,6 +122,7 @@ static ffi::Error BatchedPotrsImpl(
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
     try {
+        NvtxRange range("potrs.ensure_workspace");
         ensure_workspace(ctx, d_ws, h_ws);
     } catch (const std::exception& ex) {
         cusolverMpDestroyMatrixDesc(descA);
@@ -110,6 +131,10 @@ static ffi::Error BatchedPotrsImpl(
     }
 
     for (int64_t q = 0; q < nq; ++q) {
+        char tag[64];
+        std::snprintf(tag, sizeof(tag), "potrs.Potrs[q=%lld]",
+                      static_cast<long long>(q));
+        NvtxRange range(tag);
         T* A_slice_ptr = const_cast<T*>(d_L) + q * A_slice;
         T* X_slice_ptr = d_X_out + q * B_slice;
         mp_st = mp::Potrs<T>(
@@ -128,8 +153,14 @@ static ffi::Error BatchedPotrsImpl(
         }
     }
 
-    cusolverMpDestroyMatrixDesc(descA);
-    cusolverMpDestroyMatrixDesc(descB);
+    {
+        NvtxRange range("potrs.DestroyMatrixDesc[A]");
+        cusolverMpDestroyMatrixDesc(descA);
+    }
+    {
+        NvtxRange range("potrs.DestroyMatrixDesc[B]");
+        cusolverMpDestroyMatrixDesc(descB);
+    }
 
     FFI_RETURN_IF_ERROR(cross_stream_wait_pooled(
         xla_stream, ctx->stream, ctx->ev_ctx_out));

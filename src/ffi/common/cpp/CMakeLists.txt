@@ -423,6 +423,7 @@ target_include_directories(lorrax_ffi PRIVATE
     "${CUSOLVERMP_INCLUDE}"
     "${NCCL_INCLUDE}"
     "${CUDA_TOOLKIT_ROOT}/include"
+    "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/include"
     "${HDF5_INCLUDE_DIRS}"
     "${LORRAX_MPI_INCLUDE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}"
