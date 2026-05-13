@@ -47,6 +47,7 @@ P-roadmap
 """
 from __future__ import annotations
 
+import functools
 import types
 from pathlib import Path
 from typing import Iterator, Literal, Sequence
@@ -860,6 +861,44 @@ class WfnLoader:
 _HALFALPHA = 0.00364867628215
 
 
+@functools.lru_cache(maxsize=None)
+def _get_bispinor_lift_jit(sharding: NamedSharding | None):
+    """Cache one jit'd copy of the bispinor lift per output sharding.
+
+    Without this, each call to ``_bispinor_lift_kernel`` traces every
+    inner ``jnp`` op (``broadcast_in_dim``, ``_take``, ``concatenate``…)
+    through pjit's per-op cache.  The parent function id is stable but
+    JAX's "tracing context" comparison fires on calls from different
+    enclosing scopes, blowing the cache.  Wrapping the whole body in a
+    single ``jax.jit`` collapses all inner ops into one cached compile.
+    """
+    @jax.jit
+    def _kernel(psi_2, gvecs, kvecs, bvec):
+        halfalpha = jnp.complex128(_HALFALPHA)
+        # (k + G) in cartesian, per (k, g).
+        pkG = gvecs + kvecs[:, None, :]                          # (n_k, ngkmax, 3)
+        p_cart = pkG @ bvec                                       # (n_k, ngkmax, 3)
+        px = p_cart[..., 0].astype(jnp.complex128)
+        py = p_cart[..., 1].astype(jnp.complex128)
+        pz = p_cart[..., 2].astype(jnp.complex128)
+        # σ·p as a (2, 2) Pauli-contraction stacked per (k, g):
+        #   [[ pz, px - i*py],
+        #    [px + i*py, -pz]]
+        sdp = jnp.stack(
+            [jnp.stack([pz,  px - 1j * py], axis=-1),
+             jnp.stack([px + 1j * py, -pz], axis=-1)],
+            axis=-2,
+        )                                                         # (n_k, ngkmax, 2, 2)
+        # ψ_S[k, b, i, g] = halfalpha · Σ_j σ·p[k, g, i, j] · ψ_L[k, b, j, g]
+        psi_S = halfalpha * jnp.einsum(
+            "kgij,kbjg->kbig", sdp, psi_2[:, :, 0:2, :])
+        out = jnp.concatenate([psi_2, psi_S], axis=2)             # (n_k, nb, 4, ngkmax)
+        if sharding is not None:
+            out = jax.lax.with_sharding_constraint(out, sharding)
+        return out
+    return _kernel
+
+
 def _bispinor_lift_kernel(
     psi_2: jax.Array,
     gvecs: jax.Array,
@@ -875,42 +914,22 @@ def _bispinor_lift_kernel(
     kvecs: (n_k, 3)          float64
     bvec : (3, 3)            float64
     """
-    halfalpha = jnp.complex128(_HALFALPHA)
-
-    # (k + G) in cartesian, per (k, g).
-    pkG = gvecs + kvecs[:, None, :]                         # (n_k, ngkmax, 3)
-    p_cart = pkG @ bvec                                      # (n_k, ngkmax, 3)
-    px = p_cart[..., 0].astype(jnp.complex128)
-    py = p_cart[..., 1].astype(jnp.complex128)
-    pz = p_cart[..., 2].astype(jnp.complex128)
-
-    # σ·p as a (2, 2) Pauli-contraction stacked per (k, g):
-    #   [[ pz, px - i*py],
-    #    [px + i*py, -pz]]
-    sdp = jnp.stack(
-        [jnp.stack([pz,  px - 1j * py], axis=-1),
-         jnp.stack([px + 1j * py, -pz], axis=-1)],
-        axis=-2,
-    )                                                        # (n_k, ngkmax, 2, 2)
-
-    # ψ_S[k, b, i, g] = halfalpha · Σ_j σ·p[k, g, i, j] · ψ_L[k, b, j, g]
-    psi_S = halfalpha * jnp.einsum(
-        "kgij,kbjg->kbig", sdp, psi_2[:, :, 0:2, :])
-
-    out = jnp.concatenate([psi_2, psi_S], axis=2)            # (n_k, nb, 4, ngkmax)
-    if sharding is not None:
-        out = jax.lax.with_sharding_constraint(out, sharding)
-    return out
+    return _get_bispinor_lift_jit(sharding)(psi_2, gvecs, kvecs, bvec)
 
 
 # ---------------------------------------------------------------------------
 # phdf5 unfold-and-relayout kernel (module-level so the JIT cache
 # survives multiple ``load()`` calls at the same shape signature)
 # ---------------------------------------------------------------------------
+#
+# ``@functools.lru_cache`` keys on the static shape signature; the
+# closure ``_per_rank`` is defined INSIDE the cached factory so its
+# Python ``id()`` is stable per cache entry.  Repeat invocations with
+# the same signature reuse the same closure, which lets JAX's
+# trace-cache hit on every inner op (``_where``, ``_take``,
+# ``broadcast_in_dim`` …) instead of re-tracing them on each call.
 
-_PHDF5_UNFOLD_CACHE: dict = {}
-
-
+@functools.lru_cache(maxsize=None)
 def _phdf5_unfold_kernel(
     mesh: Mesh,
     *,
@@ -933,7 +952,7 @@ def _phdf5_unfold_kernel(
          IBZ-union axis to the full requested k-set.
       3. If ``unfold``: apply ``where(tr_mask, conj, identity)`` then
          multiply by τ-phase then ``U_spinor`` spinor rotation.  If not
-         ``unfold`` (IBZ raw mode): skip steps 3.
+         ``unfold`` (IBZ raw mode): skip step 3.
       4. Transpose ``(bpr, ns, n_k, ngkmax) → (n_k, bpr, ns, ngkmax)``;
          the rank's ``bpr`` slab becomes the local shard of the global
          band axis.
@@ -941,14 +960,6 @@ def _phdf5_unfold_kernel(
     Output sharding ``P(None, ('x','y'), None, None)`` on global shape
     ``(n_k, nb_padded, ns, ngkmax)``.
     """
-    key = (
-        "phdf5_unfold", id(mesh), int(n_reads), int(n_k),
-        int(bands_per_rank), int(nspinor), int(ngkmax), bool(unfold),
-    )
-    hit = _PHDF5_UNFOLD_CACHE.get(key)
-    if hit is not None:
-        return hit
-
     if unfold:
         def _per_rank(cnk_at_ibz, U_per_k, phase_per_k, tr_mask_per_k,
                        position_in_reads):
@@ -981,12 +992,10 @@ def _phdf5_unfold_kernel(
         )
 
     out_specs = P(None, ("x", "y"), None, None)        # (n_k, bpr→band, ns, ngkmax)
-    jitted = jax.jit(shard_map(
+    return jax.jit(shard_map(
         _per_rank, mesh=mesh, in_specs=in_specs, out_specs=out_specs,
         check_rep=False,
     ))
-    _PHDF5_UNFOLD_CACHE[key] = jitted
-    return jitted
 
 
 # ===========================================================================

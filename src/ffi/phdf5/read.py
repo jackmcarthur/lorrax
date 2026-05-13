@@ -32,6 +32,7 @@ building blocks.
 """
 from __future__ import annotations
 
+import functools
 from typing import Callable, Sequence
 
 import jax
@@ -313,6 +314,31 @@ def read_kchunk_union_sharded(
     kchunk_axis: int,
     file_global_shape: Sequence[int],
     per_rank_file_shape: Sequence[int],
+    dtype,
+    mesh: Mesh,
+    file_partition_spec: P,
+) -> Callable[[jax.Array, jax.Array], jax.Array]:
+    """See ``_read_kchunk_union_sharded_cached`` for impl; this wrapper
+    normalises Sequence args to tuples for lru_cache hashability."""
+    return _read_kchunk_union_sharded_cached(
+        int(fh), str(ds_name),
+        n_kchunk=int(n_kchunk), kchunk_axis=int(kchunk_axis),
+        file_global_shape=tuple(int(s) for s in file_global_shape),
+        per_rank_file_shape=tuple(int(s) for s in per_rank_file_shape),
+        dtype=jnp.dtype(dtype),
+        mesh=mesh, file_partition_spec=file_partition_spec,
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _read_kchunk_union_sharded_cached(
+    fh: int,
+    ds_name: str,
+    *,
+    n_kchunk: int,
+    kchunk_axis: int,
+    file_global_shape: tuple,
+    per_rank_file_shape: tuple,
     dtype,
     mesh: Mesh,
     file_partition_spec: P,
