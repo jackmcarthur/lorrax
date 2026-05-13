@@ -483,16 +483,14 @@ def _choose_v_q_chunks(
     peak = (q_chunk * one_q_bytes + q_chunk * v_per_q_bytes
             + fft_workspace_fixed + ref_bytes)
 
-    # Optional: AOT-compile the *full* production kernel at the chosen
-    # q_chunk and read its memory_analysis() — this captures the actual
-    # peak including everything XLA tracks (cuFFT scratch, gather temps,
+    # AOT-compile the *full* production kernel at the chosen q_chunk
+    # and read its memory_analysis() — this captures the actual peak
+    # including everything XLA tracks (cuFFT scratch, gather temps,
     # contract intermediates, DUS overlap, alias choices XLA makes
     # inside the production kernel that the standalone-FFT measurement
-    # misses).  Shrink-retry if over budget.  Default-on; opt out with
-    # ``LORRAX_V_Q_AOT_FULL_KERNEL=0`` (e.g. to debug the AOT path
-    # itself, or in environments where the AOT compile fails).
-    _aot_full = bool(int(os.environ.get('LORRAX_V_Q_AOT_FULL_KERNEL', '1') or 0))
-    if (_aot_full and mesh_xy is not None and fft_grid is not None
+    # misses).  Shrink-retry if over budget.  Skipped only when the
+    # prerequisites aren't available (e.g. unit tests with no mesh).
+    if (mesh_xy is not None and fft_grid is not None
             and n_rtot is not None and n_rtot > 0):
         cache_keys_visited: set[tuple] = set()
         _aot_verbose = bool(int(os.environ.get(
