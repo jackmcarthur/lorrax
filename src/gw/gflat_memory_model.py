@@ -172,56 +172,18 @@ def _peak_C_fit_one_rchunk(*, nk, ns, nq, mu, n_rtot, r_chunk,
     psi_bc_Y slab stack across XLA's fused trace.
 
     ``pair_density_slots`` is the **XLA-BufferAssignment-determined**
-    count of concurrent rank-5 ``c128[nk, ns², n_rmu_local, r_chunk_local]``
-    tensors that need to live simultaneously.  This is NOT a free
-    parameter — it's read from XLA's per-kernel
+    count of concurrent rank-5
+    ``c128[nk, ns², n_rmu_local, r_chunk_local]`` tensors live at peak
+    inside the monolithic ``c_q_from_psi_sm`` / ``z_q_from_psi_sm``
+    shard_map.  Read from XLA's per-kernel
     ``-memory-usage-report.txt`` dump as the number of distinct
     preallocated-temp slots holding a P-pair-shaped value.
 
-    Verified from MoS2 3×3 bispinor 2×2 mesh, band_chunk=16,
-    r_chunk=12128 (XLA dumps from
-    ``runs/MoS2/00_mos2_3x3_cohsex/D_perf_after_2026-05-12``):
-
-      transverse — module_0510.jit__kernel
-        Total preallocated-temp = 21.45 GiB = 5 slots × 4.16 GiB each.
-        Each slot holds one ``c128[9, 24256, 1280]`` ≡ rank-5 P_pair
-        (= ``nk · ns² · n_rmu_local · r_chunk_local``, n_rmu=656).
-        Across the 5 slots, 14 distinct values share lifetimes; the
-        concurrent peak is 5.
-
-      charge — module_0210.jit__kernel
-        Total preallocated-temp = 20.93 GiB = 5 slots × 4.16 GiB each.
-        Same 5-slot structure (n_rmu=640 so slightly smaller per slot).
-        Despite the ``perm_L=None`` / ``perm_R=None`` short-circuits in
-        ``gamma_double_contract``, XLA's BufferAssignment still lands
-        at 5 concurrent slots — the savings from skipping the gather
-        rebuffer aren't visible at the BufferAssignment level (XLA
-        likely sees the same WrappedFun call structure either way).
-
-      ⇒ ``pair_density_slots = 5`` for BOTH channels at MoS2 3×3.
-
-    Linear scaling check on transverse: at r_chunk=26440 (2× the above)
-    we measured 47.38 GiB peak vs the model's 22.65 GiB at r_chunk=12128
-    — ratio 2.09× vs r_chunk ratio 2.18×, matching the linear-in-r_chunk
-    expectation to within 5%.
-
-    Source of the 5 slots (dataflow analysis):
-      P_l, P_r (band-chunk accumulators; donated through IFFT).
-      ``c_q_from_pair`` / ``z_q_from_pair`` IFFT both to R-space; the
-      ``donate_argnums=(0,)`` on ``_ifft_conj`` lets P_l → P_l_R share
-      storage (slot 1), and ``donate_argnums=(0,1)`` on
-      ``_ifft_contract_fft`` lets P_r → P_r_R share (slot 2).
-      The contract output ``C_Rt`` is rank-3 (small, doesn't take a slot).
-      The remaining 3 slots come from XLA intermediates during the
-      IFFT and contract — not reducible from the Python side without
-      restructuring the kernel.
-
-    Recalibration procedure: if XLA changes its buffer assignment in a
-    future version, count slots in a fresh
-    ``module_NNNN.jit__kernel.sm_*.memory-usage-report.txt`` from a
-    profiled run — look for the ``Allocations sorted by size with their
-    values`` section, count distinct lifetime offsets that hold a
-    rank-5 P_pair-shaped value.
+    Default = 3: ``P_l_R_conj``, ``P_r_R``, plus one XLA scratch.
+    Verified on MoS2 3×3 bispinor / 2×2 mesh.  If XLA changes its
+    buffer assignment in a future version, count slots in a fresh
+    ``module_NNNN.jit__kernel.sm_*.memory-usage-report.txt`` and
+    update the defaults below.
     """
     # Persistent during the chunk loop (not just one iter):
     persistent = {
@@ -286,8 +248,8 @@ def plan_gflat_chunks(
     budget_gb: float,
     target_utilization: float = 0.80,
     fft_box_factor: float = 4.0,
-    pair_density_slots_transverse: int = 5,
-    pair_density_slots_charge: int = 5,
+    pair_density_slots_transverse: int = 3,
+    pair_density_slots_charge: int = 3,
     is_bispinor: bool = True,
     max_chunks: int = 64,
     r_chunk_override: int | None = None,

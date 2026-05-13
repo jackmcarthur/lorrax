@@ -15,8 +15,7 @@ Architectural map to ``common/isdf_fitting.py``:
     pair_density                      ←→  per-k open-spin P^{(v/c)}_{αβ}(a,b)
                                           (rank-5; same einsum at candidates
                                           r̃_a not chosen r_μ)
-    c_q_from_pair                     ←→  k→q FFT of the cross-product
-                                          → at q=0 this is just sum_k
+    gram_q0_from_pair                 ←→  q=0 cross-product (no k→q FFT)
     (nothing)                         ←→  pivoted_cholesky_select  (new)
 
 This module is deliberately single-device for the first cut per the md's

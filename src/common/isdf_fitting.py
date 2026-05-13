@@ -55,7 +55,8 @@ from .load_wfns import (
 # Single rank-5 pair-density path used by every channel (charge γ̃^0 = I_4
 # AND transverse γ̃^i = α^i).  The (αβ) spin axes stay OPEN through the
 # pair-density and IFFT steps; γ̃·γ̃ contraction happens at the post-IFFT
-# reduction inside :func:`c_q_from_pair` and :func:`z_q_from_pair`.
+# reduction inside :func:`c_q_from_psi_sm` / :func:`z_q_from_psi_sm`
+# (and at q=0 inside :func:`gram_q0_from_pair`).
 #
 # For γ̃^0 = γ̃^0 = I_4, ``gamma_double_contract`` short-circuits to the
 # Σ_{αβ} P_l_conj·P_r Frobenius reduction (no gather, no phase mul) — see
@@ -67,16 +68,14 @@ from .load_wfns import (
 #                              · γ̃^{μ_L}_{αα'} γ̃^{ν_L}_{ββ'}
 #                              · P_{α'β'}(μ,ν;k)
 #
-# Memory cost: rank-5 P is ns²=16× the historical spin-traced rank-3 P,
-# but only at the (k, a, b, μ, ν) carrier — the band-chunk accumulator
-# streams over n so peak memory is bounded.  The basis-quality
-# improvement (each ψ_α*ψ_β interpolated cleanly rather than the
-# post-cancellation Σ_α ψ_α*ψ_α) was worth the trade for the bispinor
-# pipeline; we now use it for the charge channel too so both paths
-# share one set of helpers.
+# The :func:`pair_density` standalone (rank-5 P_k_ab carrier) is kept
+# for ``centroid.pivoted_cholesky``'s q=0 valence-conduction Gram —
+# its caller can hold the full P_k_ab in HBM at the centroid-selection
+# stage.  The hot CCT/ZCT path in :func:`fit_zeta_to_h5` never
+# materialises P_k_ab globally; everything happens inside the
+# monolithic shard_map kernels below.
 
 _pair_density_cache = {}
-_accum_pair_density_cache = {}
 _pair_pipeline_sm_cache = {}
 
 
@@ -117,168 +116,17 @@ def pair_density(
 	return _pair_density_cache[cache_key](psi_rmuT_X, psi_rcol_Y)
 
 
-def accum_pair_density(
-	P_accum: jax.Array,
-	psi_rmuT_X: jax.Array,
-	psi_rcol_Y: jax.Array,
-	mesh_xy: Mesh,
-) -> jax.Array:
-	"""Band-chunk streaming accumulator for :func:`pair_density`.
-
-	    P_accum += Σ_n ψ*_{n,a}(μ) ψ_{n,b}(col)        (open spin (a,b))
-
-	Input shardings mirror :func:`pair_density`; ``P_accum`` lives on
-	``P(None, None, None, 'x', 'y')`` and is donated.
-	"""
-	nk, n_rmu, nb, ns = psi_rmuT_X.shape
-	_, _, _, n_col = psi_rcol_Y.shape
-	cache_key = ('pair_density_accum', id(mesh_xy), nk, n_rmu, nb, ns, n_col)
-	if cache_key not in _accum_pair_density_cache:
-		P_sharding = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-		L_sharding = NamedSharding(mesh_xy, P(None, 'x', None, None))
-		R_sharding = NamedSharding(mesh_xy, P(None, None, None, 'y'))
-
-		@partial(jax.jit,
-				 in_shardings=(P_sharding, L_sharding, R_sharding),
-				 out_shardings=P_sharding,
-				 donate_argnums=(0,))
-		def _accum(P_in: jax.Array, psi_L: jax.Array, psi_R: jax.Array) -> jax.Array:
-			return P_in + jnp.einsum('kmna,knbr->kabmr', psi_L, psi_R, optimize=True)
-
-		_accum_pair_density_cache[cache_key] = _accum
-	return _accum_pair_density_cache[cache_key](P_accum, psi_rmuT_X, psi_rcol_Y)
-
-
 # Cache for ISDF pipeline jitted functions
 _isdf_pipeline_cache = {}
 
 
 
 # ============================================================================
-# Left/Right CCT and ZCT (matching gw_jax physics)
+# q=0 Gram matrix for pivoted-Cholesky centroid selection
 # ============================================================================
-# gw_jax uses separate left and right wavefunctions:
-#   - Left:  bands 0 to b3 (all occupied + sigma conduction)
-#   - Right: bands 0 to b4 (all occupied + all conduction up to nband)
-#
-# CCT: C_q(μ,ν) = Σ_k exp(iq·k) [Σ_n,s ψ_l,n,k,s(μ) ψ*_l,n,k,s(ν)]* × [Σ_m,s ψ*_r,m,k,s(μ) ψ_r,m,k,s(ν)]
-#    = FFT_k→q[ conj(P_l_R) ⊙ P_r_R ] where P_l_R = IFFT(P_l_k), P_r_R = IFFT(P_r_k)
-#
-# ZCT follows the same pattern for (μ, r) instead of (μ, ν).
-
-def c_q_from_pair(
-	P_l_k_ab: jax.Array,
-	P_r_k_ab: jax.Array,
-	gamma_L: tuple[jax.Array, jax.Array] | None = None,
-	gamma_R: tuple[jax.Array, jax.Array] | None = None,
-	*,
-	kgrid: tuple[int, int, int],
-	mesh_xy: Mesh,
-) -> jax.Array:
-	"""C_q from open-spin pair densities with optional γ̃ insertions.
-
-	    C_q^{μ_L, ν_L}(μ, ν)
-	      = FFT_k→q[ Σ_{αβα'β'} γ̃^{μ_L}_{αα'} γ̃^{ν_L}_{ββ'}
-	                 · conj(IFFT(P_l_{αβ}))(R; μ, ν)
-	                 · IFFT(P_r_{α'β'})(R; μ, ν) ]
-
-	γ̃ identity short-circuit: pass ``gamma_L=None`` (or ``gamma_R=None``)
-	to mean γ̃_L = I_4 (or γ̃_R = I_4); the corresponding gather + phase
-	multiply is skipped at JIT trace time.  Both None → charge channel,
-	pure Σ_{αβ} P_l_conj·P_r reduction.
-
-	γ̃^μ are monomial (one non-zero per row/column, value ∈ {±1, ±i}),
-	so each non-identity spin contraction is one ``jnp.take`` +
-	element-wise phase multiply, not a 4×4 matmul.
-
-	Inputs:
-	    P_l_k_ab, P_r_k_ab : (nk, ns, ns, n_rmu, n_col) c128, sharded
-	                        ``P(None, None, None, 'x', 'y')``.
-	    gamma_L, gamma_R   : ``(perm, phase)`` tuples or ``None``.
-	                        Build perm/phase via
-	                        :func:`common.gamma_matrices.gamma_perm_phase`.
-	    kgrid              : (nkx, nky, nkz).
-	    mesh_xy            : 2-D device mesh.
-
-	Output:
-	    C_q : (nq, n_rmu, n_col) c128, sharded ``P(None, 'x', 'y')``.
-	"""
-	nkx, nky, nkz = kgrid
-	nk, ns1, ns2, n_rmu, n_col = P_l_k_ab.shape
-	assert n_col == n_rmu, (
-		f"CCT expects square centroid columns, got n_col={n_col}, n_rmu={n_rmu}"
-	)
-	assert P_r_k_ab.shape == P_l_k_ab.shape, (
-		f"P_l/P_r shape mismatch: {P_l_k_ab.shape} vs {P_r_k_ab.shape}"
-	)
-	lhs_id = gamma_L is None
-	rhs_id = gamma_R is None
-
-	cache_key = ('c_q_from_pair', id(mesh_xy), nk, ns1, ns2, n_rmu,
-	             nkx, nky, nkz, lhs_id, rhs_id)
-
-	if cache_key not in _isdf_pipeline_cache:
-		spin_spec = P(None, None, None, 'x', 'y')   # (nk, a, b, μ, μ)
-		scalar_spec = P(None, 'x', 'y')             # (nk, μ, μ)
-		spin_flat_shard = NamedSharding(mesh_xy, spin_spec)
-		scalar_flat_shard = NamedSharding(mesh_xy, scalar_spec)
-		# 3-D k-grid forms (the FFT helpers prepend (nkx,nky,nkz) → (nk,)).
-		fft_spin_3d = P(None, None, None, None, None, 'x', 'y')
-		fft_scalar_3d = P(None, None, None, 'x', 'y')
-		local_ifftn_spin   = make_flat_k_ifftn(mesh_xy, kgrid, fft_spin_3d,   norm='forward')
-		local_fftn_scalar  = make_flat_k_fftn( mesh_xy, kgrid, fft_scalar_3d, norm='forward')
-
-		rep = NamedSharding(mesh_xy, P())
-
-		@partial(jax.jit, in_shardings=spin_flat_shard, out_shardings=spin_flat_shard,
-		         donate_argnums=(0,))
-		def _ifft_conj(P_l: jax.Array) -> jax.Array:
-			return jnp.conj(local_ifftn_spin(P_l))
-
-		# Closed-over Python bools — compile-time branches in
-		# gamma_double_contract via None-passthrough.
-		_lhs_id = lhs_id
-		_rhs_id = rhs_id
-
-		@partial(jax.jit,
-		         in_shardings=(spin_flat_shard, spin_flat_shard,
-		                       rep, rep, rep, rep),
-		         out_shardings=scalar_flat_shard,
-		         donate_argnums=(0, 1))
-		def _ifft_contract_fft(P_r, P_l_Rt_conj, perm_L_, phase_L_, perm_R_, phase_R_):
-			P_r_Rt = local_ifftn_spin(P_r)
-			C_Rt = gamma_double_contract(
-				P_l_Rt_conj, P_r_Rt,
-				perm_L=None if _lhs_id else perm_L_,
-				phase_L=None if _lhs_id else phase_L_,
-				perm_R=None if _rhs_id else perm_R_,
-				phase_R=None if _rhs_id else phase_R_,
-				spin_axes=(1, 2),
-			)
-			return local_fftn_scalar(C_Rt)
-
-		def _c_q_kernel(P_l, P_r, pL, phL, pR, phR):
-			P_l_Rt_conj = _ifft_conj(P_l)
-			return _ifft_contract_fft(P_r, P_l_Rt_conj, pL, phL, pR, phR)
-
-		_isdf_pipeline_cache[cache_key] = _c_q_kernel
-
-	# Identity-side perm/phase still passed (kernel ignores them via flags),
-	# so the JIT signature stays uniform across charge / transverse paths.
-	if lhs_id:
-		perm_L = jnp.arange(ns1, dtype=jnp.int32)
-		phase_L = jnp.ones(ns1, dtype=jnp.complex128)
-	else:
-		perm_L, phase_L = gamma_L
-	if rhs_id:
-		perm_R = jnp.arange(ns2, dtype=jnp.int32)
-		phase_R = jnp.ones(ns2, dtype=jnp.complex128)
-	else:
-		perm_R, phase_R = gamma_R
-
-	return _isdf_pipeline_cache[cache_key](
-		P_l_k_ab, P_r_k_ab, perm_L, phase_L, perm_R, phase_R)
-
+# Drops the k→q FFT pair from the CCT formula: at q=0 the k-sum IS
+# the answer.  Used by :mod:`centroid.pivoted_cholesky` to score
+# candidate centroids on valence × conduction pair products.
 
 def gram_q0_from_pair(
 	P_v_k: jax.Array,
@@ -296,14 +144,14 @@ def gram_q0_from_pair(
 	    G(μ,ν) = Σ_k w_k · [Σ_{αβα'β'} γ̃^{μ_L}_{αα'} γ̃^{ν_L}_{ββ'}
 	                          · P_v_{αβ}(μ,ν;k)*  · P_c_{α'β'}(μ,ν;k)]
 
-	γ̃ identity short-circuit: same convention as :func:`c_q_from_pair` —
-	pass ``gamma_L=None`` (and/or ``gamma_R=None``) for charge / left-only /
-	right-only sides.  Both None → Σ_{αβ} P_v* · P_c, the historical
-	pivoted-Cholesky candidate Gram in open-spin form.
+	γ̃ identity short-circuit: pass ``gamma_L=None`` (and/or
+	``gamma_R=None``) for charge / left-only / right-only sides.
+	Both None → Σ_{αβ} P_v* · P_c, the historical pivoted-Cholesky
+	candidate Gram in open-spin form.  γ̃^μ is monomial — each non-
+	identity contraction is one ``jnp.take`` + element-wise phase
+	multiply, not a 4×4 matmul.
 
-	Compared to :func:`c_q_from_pair`, this drops the k→q FFT pair: at
-	q=0 the k-sum IS the answer, no convolution is needed.  Used by
-	:mod:`centroid.pivoted_cholesky`.
+	Used by :mod:`centroid.pivoted_cholesky`.
 
 	Args:
 		P_v_k: (nk, ns, ns, n_rmu, n_rmu) complex, valence open-spin pair
@@ -371,106 +219,6 @@ def gram_q0_from_pair(
 		P_v_k, P_c_k, k_weights, perm_L, phase_L, perm_R, phase_R)
 
 
-def z_q_from_pair(
-	P_l_k_ab_muz: jax.Array,
-	P_r_k_ab_muz: jax.Array,
-	gamma_L: tuple[jax.Array, jax.Array] | None = None,
-	gamma_R: tuple[jax.Array, jax.Array] | None = None,
-	*,
-	kgrid: tuple[int, int, int],
-	mesh_xy: Mesh,
-) -> jax.Array:
-	"""Z_q from open-spin pair densities on (μ, r-chunk) with optional γ̃.
-
-	    Z_q^{μ_L, ν_L}(μ, r) =
-	        FFT_k→q[ Σ_{αβα'β'} γ̃^{μ_L}_{αα'} γ̃^{ν_L}_{ββ'}
-	                 · conj(IFFT(P_l_{αβ}))(R; μ, r)
-	                 · IFFT(P_r_{α'β'})(R; μ, r) ]
-
-	γ̃ identity short-circuit: same convention as :func:`c_q_from_pair`
-	(``None`` = γ̃ = I_4 on that side).
-
-	Inputs:
-	    P_l_k_ab_muz, P_r_k_ab_muz : (nk, ns, ns, n_rmu, n_zchunk) c128
-	                                 sharded ``P(None, None, None, 'x', 'y')``.
-	    gamma_L, gamma_R           : ``(perm, phase)`` tuples or ``None``.
-	    kgrid                      : (nkx, nky, nkz).
-	    mesh_xy                    : 2-D device mesh.
-
-	Output:
-	    Z_q : (nq, n_rmu, n_zchunk) c128, sharded ``P(None, 'x', 'y')``.
-	"""
-	nkx, nky, nkz = kgrid
-	nk, ns1, ns2, n_rmu, n_zchunk = P_l_k_ab_muz.shape
-	assert nk == nkx * nky * nkz, (
-		f"P_l_k_ab_muz flat-k dim {nk} does not match kgrid product {nkx*nky*nkz}"
-	)
-	assert P_r_k_ab_muz.shape == P_l_k_ab_muz.shape, (
-		f"P_l/P_r shape mismatch: {P_l_k_ab_muz.shape} vs {P_r_k_ab_muz.shape}"
-	)
-	lhs_id = gamma_L is None
-	rhs_id = gamma_R is None
-
-	cache_key = ('z_q_from_pair', id(mesh_xy), nk, ns1, ns2, n_rmu, n_zchunk,
-	             lhs_id, rhs_id)
-
-	if cache_key not in _isdf_pipeline_cache:
-		spin_spec = P(None, None, None, 'x', 'y')   # (nk, a, b, μ, z)
-		scalar_spec = P(None, 'x', 'y')             # (nk, μ, z)
-		spin_flat_shard = NamedSharding(mesh_xy, spin_spec)
-		scalar_flat_shard = NamedSharding(mesh_xy, scalar_spec)
-		spec_spin_3d = P(None, None, None, None, None, 'x', 'y')
-		spec_scalar_3d = P(None, None, None, 'x', 'y')
-		local_ifftn_spin   = make_flat_k_ifftn(mesh_xy, kgrid, spec_spin_3d,   norm='forward')
-		local_fftn_scalar  = make_flat_k_fftn( mesh_xy, kgrid, spec_scalar_3d, norm='forward')
-		rep = NamedSharding(mesh_xy, P())
-
-		@partial(jax.jit, in_shardings=spin_flat_shard, out_shardings=spin_flat_shard,
-		         donate_argnums=(0,))
-		def _left_ifft_conj(P_l: jax.Array) -> jax.Array:
-			return jnp.conj(local_ifftn_spin(P_l))
-
-		_lhs_id = lhs_id
-		_rhs_id = rhs_id
-
-		@partial(jax.jit,
-		         in_shardings=(spin_flat_shard, spin_flat_shard,
-		                       rep, rep, rep, rep),
-		         out_shardings=scalar_flat_shard,
-		         donate_argnums=(0, 1))
-		def _right_ifft_contract_fft(P_r, P_l_Rt_conj, perm_L_, phase_L_, perm_R_, phase_R_):
-			P_r_Rt = local_ifftn_spin(P_r)
-			Z_Rt = gamma_double_contract(
-				P_l_Rt_conj, P_r_Rt,
-				perm_L=None if _lhs_id else perm_L_,
-				phase_L=None if _lhs_id else phase_L_,
-				perm_R=None if _rhs_id else perm_R_,
-				phase_R=None if _rhs_id else phase_R_,
-				spin_axes=(1, 2),
-			)
-			return local_fftn_scalar(Z_Rt)
-
-		def _z_q_kernel(P_l, P_r, pL, phL, pR, phR):
-			P_l_Rt_conj = _left_ifft_conj(P_l)
-			return _right_ifft_contract_fft(P_r, P_l_Rt_conj, pL, phL, pR, phR)
-
-		_isdf_pipeline_cache[cache_key] = _z_q_kernel
-
-	if lhs_id:
-		perm_L = jnp.arange(ns1, dtype=jnp.int32)
-		phase_L = jnp.ones(ns1, dtype=jnp.complex128)
-	else:
-		perm_L, phase_L = gamma_L
-	if rhs_id:
-		perm_R = jnp.arange(ns2, dtype=jnp.int32)
-		phase_R = jnp.ones(ns2, dtype=jnp.complex128)
-	else:
-		perm_R, phase_R = gamma_R
-
-	return _isdf_pipeline_cache[cache_key](
-		P_l_k_ab_muz, P_r_k_ab_muz, perm_L, phase_L, perm_R, phase_R)
-
-
 # ============================================================================
 # 2D Blocked Cholesky Solver - memory efficient for large n_rmu
 # ============================================================================
@@ -486,34 +234,23 @@ _chol_2d_cache = {}
 
 # ============================================================================
 # Monolithic shard_map pair pipelines — pair density + IFFT + γ̃·γ̃ + FFT
-# fused into ONE shard_map.  Default-on; override with
-# ``LORRAX_PAIR_PIPELINE_SHARDMAP=0`` to fall back to the legacy chain
-# (kept around because pivoted-Cholesky centroid selection still calls
-# ``pair_density`` + ``c_q_from_pair`` directly outside this codepath).
+# fused into ONE shard_map.  Take wavefunction tensors directly
+# (skipping the standalone rank-5 pair-density buffer); inside the
+# shard_map region everything is local-per-rank and the FFTs run via
+# direct ``jnp.fft.ifftn`` / ``jnp.fft.fftn`` calls (no nested
+# ``make_flat_k_*`` helper — same approach as
+# ``wfn_transforms.to_rchunk``).  No nested shard_maps, no helper
+# boundary that could let XLA re-globalise the pair density.
+#
+# Why monolithic: a decomposed chain (pair density → IFFT → γ̃-contract
+# → FFT each as its own jit) lands at 5 concurrent rank-5 pair-density
+# slots in XLA's BufferAssignment (~4 GiB each at MoS2 3×3 bispinor:
+# ``nk · ns² · n_rmu_local · col_local · 16``), pegging the kernel
+# preallocated-temp peak at 21 GiB on a 28 GiB budget.  Folding into
+# one shard_map drops the slot count to 3 (saving the standalone IFFT
+# outputs + the gamma-contract intermediate), bringing the kernel peak
+# to 13 GiB.
 # ============================================================================
-#
-# Legacy ``c_q_from_pair`` / ``z_q_from_pair`` chains three sub-jits
-# (``_ifft_conj`` + ``_ifft_contract_fft``, with FFT helpers adding their
-# own shard_map regions inside).  Between them XLA materialises a global
-# rank-5 pair-density value, and for each pair-density-shaped value
-# across the lifetime — pair-density einsum output, IFFT outputs (P_l_R,
-# P_r_R), gamma-contract take intermediate — XLA's BufferAssignment
-# lands at 5 concurrent rank-5 lifetime slots (~4 GiB each at MoS2 3×3
-# bispinor: ``nk · ns² · n_rmu_local · col_local · 16``), pegging the
-# kernel preallocated-temp peak at 21 GiB on a 28 GiB budget.
-#
-# These ``_sm`` variants take the wavefunction tensors directly
-# (skipping the standalone rank-5 pair-density buffer) and fold the
-# entire pair-density → IFFT → γ̃·γ̃ → FFT pipeline into one
-# ``shard_map``.  Inside that region everything is local-per-rank and
-# the FFTs run via direct ``jnp.fft.ifftn`` / ``jnp.fft.fftn`` calls
-# (no nested ``make_flat_k_*`` helper — same approach as
-# ``wfn_transforms.to_rchunk``).  No
-# nested shard_maps, no helper boundary that could let XLA re-globalise
-# the pair density.  Drops the slot count from 5 → 3 (the two saved are
-# the standalone IFFT outputs + the gamma-contract intermediate),
-# reducing the kernel peak from 21.45 GiB → 13.11 GiB on the MoS2
-# bispinor reference (a ~40% drop) with comparable wall time.
 
 
 def c_q_from_psi_sm(
@@ -527,7 +264,7 @@ def c_q_from_psi_sm(
 	kgrid: tuple[int, int, int],
 	mesh_xy: Mesh,
 ) -> jax.Array:
-	"""``c_q_from_pair`` from psi inputs directly, inside one shard_map.
+	"""C_q built from ψ directly inside one monolithic shard_map.
 
 	Inputs:
 	    psi_l_X, psi_r_X : (nk, n_rmu, nb, ns) sharded ``P(None, 'x', None, None)``
@@ -649,7 +386,7 @@ def z_q_from_psi_sm(
 	kgrid: tuple[int, int, int],
 	mesh_xy: Mesh,
 ) -> jax.Array:
-	"""``z_q_from_pair`` from psi inputs directly, inside one shard_map.
+	"""Z_q built from ψ directly inside one monolithic shard_map.
 
 	Identical structure to :func:`c_q_from_psi_sm` but ``n_col`` is the
 	r-chunk extent (not n_rmu), and the L / R bands may have different
@@ -1482,42 +1219,6 @@ def _make_fit_one_rchunk_kernel(
     nspinor = meta.nspinor
     kgrid = meta.kgrid
 
-    l_lo, l_hi = band_range_left
-    r_lo, r_hi = band_range_right
-
-    P_sharding = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    L_slice_shard = NamedSharding(mesh_xy, P(None, 'x', None, None))
-
-    # Classify each band-chunk against the L and R endpoint ranges at
-    # trace time.  Status codes (``'skip' | 'direct' | 'pad'``) dispatch
-    # the Python if-branch inside _kernel below so the jit body only
-    # emits the ops that matter for this bc.
-    #
-    #   skip   — bc_range is entirely outside [rs, re); the contribution
-    #            is dropped at trace (no ops emitted).
-    #   direct — bc_range ⊆ [rs, re); straight slice of the centroid
-    #            copy, no zero-padding needed.
-    #   pad    — bc_range straddles an endpoint; slot the overlapping
-    #            bands into a zero-padded bc_size-wide buffer so the
-    #            pair-density einsum still hits the uniform jit cache.
-    def _classify(rs, re, bc_lo, bc_hi):
-        ol_lo = max(bc_lo, rs)
-        ol_hi = min(bc_hi, re)
-        if ol_hi <= ol_lo:
-            return 'skip', None
-        if ol_lo == bc_lo and ol_hi == bc_hi:
-            return 'direct', (ol_lo - rs, ol_hi - rs)
-        return 'pad', (ol_lo - rs, ol_hi - rs, ol_lo - bc_lo, ol_hi - bc_lo)
-
-    bc_classify = [
-        (
-            bc_range,
-            _classify(l_lo, l_hi, bc_range[0], bc_range[1]),
-            _classify(r_lo, r_hi, bc_range[0], bc_range[1]),
-        )
-        for bc_range in band_chunk_ranges
-    ]
-
     # Closure-side IBZ row indices (Phase B).  None → full-BZ solve
     # (back-compat for ``write_ibz_only=False``).  Otherwise a static
     # jax int32 array baked into the jit's HLO.
@@ -1555,134 +1256,48 @@ def _make_fit_one_rchunk_kernel(
         # returned at padded extent; the SlabIO write uses
         # ``valid_shape=meta.n_rmu`` so on-disk extent stays logical.
 
-        # --- 1. Pair-density accumulators (one r-chunk wide) ---
-        # Open-spin rank-5 accumulator for ALL channels (charge γ̃^0=I and
-        # transverse γ̃^i=α^i).  Shape (nk, ns, ns, n_rmu, n_zchunk),
-        # sharding P(None, None, None, 'x', 'y').  γ̃^μ_L (or identity for
-        # charge) is applied at the Z_q post-IFFT contraction step inside
-        # ``z_q_from_pair``.
-        P_acc_shape = (nk_tot, nspinor, nspinor, n_rmu, actual_n_rchunk)
-        P_acc_sharding = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-
-        def _zero_P():
-            return jax.lax.with_sharding_constraint(
-                jnp.zeros(P_acc_shape, dtype=jnp.complex128),
-                P_acc_sharding)
-        P_l = _zero_P()
-        P_r = _zero_P()
-
-        # Pair-density bc-contribution — shared for the L and R sides.
-        # ``cls`` is the _classify tuple for THIS side; ``psi_centroid``
-        # is psi_l_rmuT_X_fit (for L) or psi_r_rmuT_X_fit (for R);
-        # ``norms`` is the matching clamped weights.  Returns the
-        # updated accumulator (P_l or P_r).
-        def _accumulate(P_acc, cls, psi_centroid, norms, psi_bc_Y, bc_size):
-            tag, payload = cls
-            if tag == 'skip':
-                return P_acc
-            if tag == 'direct':
-                lo, hi = payload
-                psi_L_bc = psi_centroid[:, :, lo:hi, :]
-                norm_slice = norms[lo:hi]
-            else:  # 'pad' — straddles an endpoint
-                cen_lo, cen_hi, dst_lo, dst_hi = payload
-                psi_L_bc = jax.lax.with_sharding_constraint(
-                    jnp.zeros((nk_tot, n_rmu, bc_size, nspinor),
-                              dtype=jnp.complex128),
-                    L_slice_shard)
-                psi_L_bc = psi_L_bc.at[:, :, dst_lo:dst_hi, :].set(
-                    psi_centroid[:, :, cen_lo:cen_hi, :])
-                norm_slice = jnp.ones((bc_size,), dtype=jnp.float64
-                                      ).at[dst_lo:dst_hi].set(
-                    norms[cen_lo:cen_hi])
-            psi_R_bc = psi_bc_Y / norm_slice[None, :, None, None]
-            # γ̃^μ_L (charge: identity) deferred to z_q_from_pair below.
-            return accum_pair_density(
-                P_acc, psi_L_bc, psi_R_bc, mesh_xy)
-
-        # --- 2. Stream band-chunks: fetch ψ(G) per-bc from host via
-        #       io_callback, FFT + reshard, accumulate pair density.
-        #       Each bc's ψ(G) is live only during its own iteration.
-        # When ``LORRAX_PAIR_PIPELINE_SHARDMAP=1`` we skip the rank-5
-        # P_l/P_r accumulator entirely: fetch all bcs, concatenate
-        # ψ_Y along the band axis, slice into L / R band ranges, and
-        # call ``z_q_from_psi_sm`` which fuses pair density + IFFT +
+        # --- Pair density + IFFT + γ̃·γ̃ + FFT, all in one shard_map.
+        # Fetch ψ_Y per-bc via io_callback, concatenate along the band
+        # axis, slice into L / R band ranges, and call
+        # ``z_q_from_psi_sm`` which fuses pair density + IFFT +
         # γ̃·γ̃ + FFT inside one monolithic shard_map.  The rank-5 pair
         # density never exists as a global XLA value, so the rank-3
-        # fused-replicated buffer that pegs the kernel peak (5 slots ×
-        # 4.16 GiB on MoS2 3×3 bispinor) cannot form.
-        _use_pair_pipe_sm = (
-            os.environ.get('LORRAX_PAIR_PIPELINE_SHARDMAP', '1') != '0')
-        if _use_pair_pipe_sm:
-            del P_l, P_r  # zeros no longer needed
-            _b0 = int(band_range_full[0])
-            _l_lo = int(band_range_left[0]) - _b0
-            _l_hi = int(band_range_left[1]) - _b0
-            _r_lo = int(band_range_right[0]) - _b0
-            _r_hi = int(band_range_right[1]) - _b0
-            psi_Y_parts = []
-            for bc_idx, (bc_range, _l_cls, _r_cls) in enumerate(bc_classify):
-                psi_Y_parts.append(psi_G_store.fetch_psi_rchunk(
-                    bc_range, r_start_dyn, actual_n_rchunk))
-            psi_Y_full = jnp.concatenate(psi_Y_parts, axis=1)
-            del psi_Y_parts
-            # Per-side band slices + norm divide.  norms_l / norms_r
-            # are sized to the side's band range, so they apply 1:1 to
-            # the corresponding slice of psi_Y_full.
-            psi_l_Y_sm = (psi_Y_full[:, _l_lo:_l_hi, :, :]
-                          / norms_l[None, :, None, None])
-            psi_r_Y_sm = (psi_Y_full[:, _r_lo:_r_hi, :, :]
-                          / norms_r[None, :, None, None])
-            del psi_Y_full
-            if is_charge:
-                Z_q = z_q_from_psi_sm(
-                    psi_l_rmuT_X_fit, psi_l_Y_sm,
-                    psi_r_rmuT_X_fit, psi_r_Y_sm,
-                    kgrid=kgrid, mesh_xy=mesh_xy)
-            else:
-                gamma_mu = (gamma_perm, gamma_phase)
-                Z_q = z_q_from_psi_sm(
-                    psi_l_rmuT_X_fit, psi_l_Y_sm,
-                    psi_r_rmuT_X_fit, psi_r_Y_sm,
-                    gamma_mu, gamma_mu,
-                    kgrid=kgrid, mesh_xy=mesh_xy)
+        # fused-replicated buffer that pegged the kernel peak under
+        # the legacy chain (5 slots × 4.16 GiB on MoS2 3×3 bispinor)
+        # cannot form.  γ̃^μ_L applied on BOTH P-sides at the
+        # post-IFFT contraction step (γ̃·γ̃ reduce); charge channel
+        # passes ``gamma_mu=None`` for the identity short-circuit.
+        _b0 = int(band_range_full[0])
+        _l_lo = int(band_range_left[0]) - _b0
+        _l_hi = int(band_range_left[1]) - _b0
+        _r_lo = int(band_range_right[0]) - _b0
+        _r_hi = int(band_range_right[1]) - _b0
+        psi_Y_parts = []
+        for bc_range in band_chunk_ranges:
+            psi_Y_parts.append(psi_G_store.fetch_psi_rchunk(
+                bc_range, r_start_dyn, actual_n_rchunk))
+        psi_Y_full = jnp.concatenate(psi_Y_parts, axis=1)
+        del psi_Y_parts
+        # Per-side band slices + norm divide.  norms_l / norms_r are
+        # sized to the side's band range, so they apply 1:1 to the
+        # corresponding slice of psi_Y_full.
+        psi_l_Y_sm = (psi_Y_full[:, _l_lo:_l_hi, :, :]
+                      / norms_l[None, :, None, None])
+        psi_r_Y_sm = (psi_Y_full[:, _r_lo:_r_hi, :, :]
+                      / norms_r[None, :, None, None])
+        del psi_Y_full
+        if is_charge:
+            Z_q = z_q_from_psi_sm(
+                psi_l_rmuT_X_fit, psi_l_Y_sm,
+                psi_r_rmuT_X_fit, psi_r_Y_sm,
+                kgrid=kgrid, mesh_xy=mesh_xy)
         else:
-            for bc_idx, (bc_range, l_cls, r_cls) in enumerate(bc_classify):
-                bc_size = bc_range[1] - bc_range[0]
-                # ψ(r-chunk) directly via g_flat host cache + on-device
-                # to_rchunk (FFT box never materialised as a persistent
-                # buffer).  Bloch phase + kvecs lookup happen inside
-                # ``fetch_psi_rchunk`` — caller's ``kvecs_frac`` arg is
-                # no longer needed at this site.
-                psi_bc_Y = psi_G_store.fetch_psi_rchunk(
-                    bc_range, r_start_dyn, actual_n_rchunk)
-                P_l = _accumulate(P_l, l_cls, psi_l_rmuT_X_fit,
-                                  norms_l, psi_bc_Y, bc_size)
-                P_r = _accumulate(P_r, r_cls, psi_r_rmuT_X_fit,
-                                  norms_r, psi_bc_Y, bc_size)
-
-            # 3. ZCT + solve.  Pass Z_q UN-RESHARDED — the inline
-            # ``with_sharding_constraint`` here was inside this outer kernel
-            # jit and tied XLA's hands on the two-step reshard (P('x',None,'y')
-            # intermediate cancels with all-to-all chains across consumer
-            # ops in the fused trace, forcing Involuntary Full Rematerialization
-            # of the full (nq, μ, ν) tensor).  Letting solve_zeta's
-            # sub-jit boundary handle the reshard (with its own two-step staging)
-            # decouples the reshard scheduler from the kernel body and matches
-            # the load_wfns separate-jit pattern.  Same pattern as lorrax_B
-            # commit c0307a0.
-            # γ̃^μ_L applied on BOTH P-sides at the post-IFFT contraction
-            # step (γ̃·γ̃ reduce).  ``is_charge`` is a closure bool — Python
-            # if resolved at trace time — so charge and transverse get
-            # distinct HLO branches, but all three transverse channels share
-            # one compile (gamma_perm/gamma_phase are runtime inputs, baked
-            # nowhere into the HLO).
-            if is_charge:
-                Z_q = z_q_from_pair(P_l, P_r, kgrid=kgrid, mesh_xy=mesh_xy)
-            else:
-                gamma_mu = (gamma_perm, gamma_phase)
-                Z_q = z_q_from_pair(P_l, P_r, gamma_mu, gamma_mu,
-                                    kgrid=kgrid, mesh_xy=mesh_xy)
+            gamma_mu = (gamma_perm, gamma_phase)
+            Z_q = z_q_from_psi_sm(
+                psi_l_rmuT_X_fit, psi_l_Y_sm,
+                psi_r_rmuT_X_fit, psi_r_Y_sm,
+                gamma_mu, gamma_mu,
+                kgrid=kgrid, mesh_xy=mesh_xy)
         # IBZ-only solve (Phase B of PLAN_zeta_g_flat_migration.md):
         # the FFT-built C_q and Z_q are naturally full-BZ, but the
         # triangular solve has no inter-q coupling, so we gather IBZ
@@ -2031,45 +1646,29 @@ def fit_zeta_to_h5(
 
     with timing.section("zeta_fit.CCT"):
         # ψ inputs at PADDED n_rmu (Phase 3a's load_centroids contract).
-        # Open-spin rank-5 P_l/P_r for ALL channels — γ̃·γ̃ reduction
-        # happens inside ``c_q_from_pair`` (None = γ̃^0 = I_4 for charge,
-        # (perm, phase) = γ̃^μ for transverse).  Output C_q is rank-3
-        # (k, μ, ν), same as the historical scalar path.
+        # Monolithic shard_map pipeline: open-spin pair density + IFFT
+        # + γ̃·γ̃ + FFT fused inside one shard_map.  The rank-5
+        # P_l/P_r pair density never exists as a global XLA value, so
+        # the rank-3 fused-replicated reshape that pegged the kernel
+        # peak under the legacy chain cannot form.  γ̃^μ_L applied at
+        # the post-IFFT contraction step (charge: identity short-
+        # circuit; transverse: (perm, phase) tuple).  Output C_q is
+        # rank-3 (k, μ, ν).
         chan_label = ("charge γ̃^0=I" if vertex_mu_L == 0
                       else f"transverse γ̃^{vertex_mu_L}")
-        _use_pair_pipe_sm = (
-            os.environ.get('LORRAX_PAIR_PIPELINE_SHARDMAP', '1') != '0')
-        if _use_pair_pipe_sm:
-            # Monolithic shard_map path — see c_q_from_psi_sm docstring.
-            # Skips the global rank-5 P_l/P_r materialisation that XLA
-            # would otherwise reshape to rank-3 fused-replicated.
-            print(f"  Computing C_q via shard_map pipeline (open-spin, {chan_label})")
-            if vertex_mu_L == 0:
-                C_q = c_q_from_psi_sm(
-                    psi_l_rmuT_X_fit, psi_l_rmu_Y_fit,
-                    psi_r_rmuT_X_fit, psi_r_rmu_Y_fit,
-                    kgrid=kgrid, mesh_xy=mesh_xy)
-            else:
-                gamma_mu = _gamma_perm_phase_mu(vertex_mu_L)
-                C_q = c_q_from_psi_sm(
-                    psi_l_rmuT_X_fit, psi_l_rmu_Y_fit,
-                    psi_r_rmuT_X_fit, psi_r_rmu_Y_fit,
-                    gamma_mu, gamma_mu,
-                    kgrid=kgrid, mesh_xy=mesh_xy)
+        print(f"  Computing C_q via shard_map pipeline (open-spin, {chan_label})")
+        if vertex_mu_L == 0:
+            C_q = c_q_from_psi_sm(
+                psi_l_rmuT_X_fit, psi_l_rmu_Y_fit,
+                psi_r_rmuT_X_fit, psi_r_rmu_Y_fit,
+                kgrid=kgrid, mesh_xy=mesh_xy)
         else:
-            print(f"  Computing pair densities P_l, P_r (open-spin, {chan_label})")
-            P_l_k = pair_density(psi_l_rmuT_X_fit, psi_l_rmu_Y_fit, mesh_xy)
-            P_r_k = pair_density(psi_r_rmuT_X_fit, psi_r_rmu_Y_fit, mesh_xy)
-            P_l_k.block_until_ready()
-            P_r_k.block_until_ready()
-            if vertex_mu_L == 0:
-                C_q = c_q_from_pair(P_l_k, P_r_k, kgrid=kgrid, mesh_xy=mesh_xy)
-            else:
-                gamma_mu = _gamma_perm_phase_mu(vertex_mu_L)
-                C_q = c_q_from_pair(P_l_k, P_r_k, gamma_mu, gamma_mu,
-                                    kgrid=kgrid, mesh_xy=mesh_xy)
-            # Free pair densities - only needed for C_q
-            del P_l_k, P_r_k
+            gamma_mu = _gamma_perm_phase_mu(vertex_mu_L)
+            C_q = c_q_from_psi_sm(
+                psi_l_rmuT_X_fit, psi_l_rmu_Y_fit,
+                psi_r_rmuT_X_fit, psi_r_rmu_Y_fit,
+                gamma_mu, gamma_mu,
+                kgrid=kgrid, mesh_xy=mesh_xy)
         C_q.block_until_ready()
         # C_q: (nqx, nqy, nqz, n_rmu_padded, n_rmu_padded) with zero
         # pad rows/cols.
