@@ -2,33 +2,27 @@
 // world-wide (Px, Py) grid.  Does getrf followed immediately by getrs,
 // per q-slice, so callers never see the pivot vector.
 //
-// *** KNOWN BUG — cuSOLVERMp 0.6.0 (NVHPC 25.5) 2D-grid LU incorrectness ***
+// *** Historical note — 2D-grid LU was broken in 0.6.0, fixed in 0.7.2 ***
 //
-// On a true 2D process grid (Px > 1 AND Py > 1), this handler returns
-// wrong answers for most (N, NRHS) configurations: status=SUCCESS and
-// info=0 from both Getrf and Getrs, but X buffer contains garbage
-// (residual |AX-B|/|B| ≈ 0.3–0.5).  The bug is inside cuSOLVERMp —
-// potrf/potrs on the same ctx/grid/descriptor-setup work correctly at
-// all tested sizes.  Pass/fail sample on a 2×2 grid:
-//    N=64, nrhs=2   PASS
-//    N=128, nrhs=8  PASS     (occasional sweet spots)
-//    N=128, nrhs=1..128 all other values: FAIL
-// Works correctly on 1×N and N×1 meshes for all sizes — it is specifically
-// the 2D distributed LU path that is broken.
+// On cuSOLVERMp 0.6.0 (NVHPC 25.5) this handler returned wrong answers
+// for most (N, NRHS) configurations on true 2D process grids: status=
+// SUCCESS and info=0 from both Getrf and Getrs, but X buffer contained
+// garbage (residual |AX-B|/|B| ≈ 0.3–0.5).  The Cholesky path
+// (potrf/potrs) on the same ctx/grid/descriptor-setup worked correctly
+// at all tested sizes — the bug was specific to the 2D distributed LU
+// kernel in cuSOLVERMp itself.
 //
-// Debugging attempts that did NOT fix it: grid layout (ROW vs COL
-// major), ipiv size (LOCr+MB vs LOCc+NB vs both), pivoting off
-// (d_ipiv=NULL), shared vs separate getrf/getrs workspaces, zeroing
-// ipiv beforehand, XLA DCE guards (returning A_factored as output),
-// materialising jnp.transpose.  Reference: NVIDIA mp_getrf_getrs.c
-// sample and documented APIs all match this handler's usage.
+// **Resolved in cuSOLVERMp 0.7.2** (current default; see
+// ``stage_pypi.sh``).  Validated end-to-end on the MoS2 3×3 D3h
+// bispinor smoke (2×2 mesh, transverse γ̃^i channels via
+// ``LORRAX_USE_CUSOLVERMP_LU=1``) — eqp0 matches the legacy per-q
+// ``jnp.linalg.solve`` path to float ULP.  See
+// ``isdf_fitting._resolve_solver_kind_transverse`` for the dispatch.
 //
-// Upstream status: cuSOLVERMp release notes show later versions (0.7+)
-// list getrf correctness fixes.  Re-test when we upgrade NVHPC.
-//
-// Workaround: w_isdf's low_mem W-solve uses the symmetric Cholesky
-// identity W = X (I − X† χ X)⁻¹ X† instead (X = Cholesky(V)), routing
-// entirely through the working potrf/potrs kernels.
+// (Earlier 0.6.0-era workaround in w_isdf's low_mem W-solve — the
+// symmetric Cholesky identity ``W = X (I − X† χ X)⁻¹ X†`` — is no
+// longer required on 0.7.2 but is retained because it has favourable
+// memory characteristics for the W solve.)
 //
 // Sharding contract:
 //   A : (Nq, N, N)       P(None, 'x', 'y')  — Python pre-transposes the

@@ -542,31 +542,72 @@ def _identity_pad_block_diagonal(
 def _resolve_solver_kind_charge(mesh_xy: Mesh) -> str:
     """Pick the charge-channel ζ-fit solver: cuSolverMp distributed
     potrf+potrs vs the in-tree shard_map 2D-blocked Cholesky + per-q
-    triangular solve.  Opt-in via ``LORRAX_USE_CUSOLVERMP_CHARGE_FACTOR``;
-    only true 2D meshes select cuSolverMp (1×N / N×1 / 1×1 stay legacy).
+    triangular solve.
+
+    Default policy (2026-05-12): use cuSolverMp on **true 2D meshes**
+    (px≥2 AND py≥2); the in-tree ``sharded_cholesky`` runs many small
+    NCCL all-reduces per panel which become the dominant GPU stream
+    consumer at production scale (CrI3 6×6 80 Ry n_rmu≈1500 sees ~tens
+    of seconds in the panel loop).  cuSolverMp bundles the whole
+    distributed Cholesky into one FFI call per q.
+
+    Tradeoff: at small scales (MoS2 3×3, n_rmu=640, 2×2 mesh) the FFI
+    setup overhead exceeds the savings — measured cholesky 3.6 s
+    (cuSolverMp) vs 1.3 s (sharded) on a 2×2 mesh.  Total wall
+    difference ~0.5 s, within run-to-run noise.  We accept the small
+    overhead for the larger-scale win.
+
+    Override via env var:
+      ``LORRAX_USE_CUSOLVERMP_CHARGE_FACTOR=0`` → force sharded.
+      ``LORRAX_USE_CUSOLVERMP_CHARGE_FACTOR=1`` → force cuSolverMp
+        (still falls back on 1D meshes).
+    Unset → default policy (cuSolverMp on true 2D, sharded otherwise).
     """
-    if os.environ.get('LORRAX_USE_CUSOLVERMP_CHARGE_FACTOR', '0') != '1':
-        return 'sharded_cholesky'
     px = int(mesh_xy.shape['x'])
     py = int(mesh_xy.shape['y'])
-    if px <= 1 or py <= 1:
+    is_2d = (px >= 2 and py >= 2)
+
+    env = os.environ.get('LORRAX_USE_CUSOLVERMP_CHARGE_FACTOR')
+    if env == '0':
         return 'sharded_cholesky'
-    return 'cusolvermp_cholesky'
+    if env == '1':
+        return 'cusolvermp_cholesky' if is_2d else 'sharded_cholesky'
+
+    # Unset → default policy.
+    return 'cusolvermp_cholesky' if is_2d else 'sharded_cholesky'
 
 
 def _resolve_solver_kind_transverse(mesh_xy: Mesh) -> str:
     """Pick the transverse-channel ζ-fit solver: cuSolverMp distributed
     getrf+getrs vs the in-tree per-q ``jnp.linalg.solve`` + ridge.
-    Opt-in via ``LORRAX_USE_CUSOLVERMP_LU``; only true 2D meshes select
-    cuSolverMp (1×N / N×1 / 1×1 stay legacy).
+
+    Default policy (2026-05-12): mirrors the charge-channel resolver —
+    use cuSolverMp on **true 2D meshes** (px≥2 AND py≥2).  cuSolverMp
+    0.7.2 fixes the earlier 2D-grid getrf/getrs correctness bug
+    (validated end-to-end on MoS2 3×3 bispinor at 2×2 mesh; see
+    ``src/ffi/cusolvermp/cpp/batched_solve_lu_ffi.cc`` for history).
+
+    Tradeoff: small FFI setup overhead at MoS2 scale (n_rmu=656,
+    2×2 mesh).  At CrI3 6×6 80 Ry (n_rmu≈1800, 4×4 mesh) the cuSolverMp
+    path is the right tool.
+
+    Override via env var:
+      ``LORRAX_USE_CUSOLVERMP_LU=0`` → force per-q ``jnp.linalg.solve``.
+      ``LORRAX_USE_CUSOLVERMP_LU=1`` → force cuSolverMp (still falls
+        back on 1D meshes).
+    Unset → default policy (cuSolverMp on true 2D, legacy otherwise).
     """
-    if os.environ.get('LORRAX_USE_CUSOLVERMP_LU', '0') != '1':
-        return 'lu'
     px = int(mesh_xy.shape['x'])
     py = int(mesh_xy.shape['y'])
-    if px <= 1 or py <= 1:
+    is_2d = (px >= 2 and py >= 2)
+
+    env = os.environ.get('LORRAX_USE_CUSOLVERMP_LU')
+    if env == '0':
         return 'lu'
-    return 'cusolvermp_lu'
+    if env == '1':
+        return 'cusolvermp_lu' if is_2d else 'lu'
+
+    return 'cusolvermp_lu' if is_2d else 'lu'
 
 
 def _resolve_solver_kind(mesh_xy: Mesh, vertex_mu_L: int, solver_kind: str) -> str:
