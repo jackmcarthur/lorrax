@@ -247,6 +247,120 @@ def unfold_v_q(
     return _do_unfold(V_q_ibz)
 
 
+# i·σ_y (time-reversal spinor factor in the SOC convention T = iσ_y K).
+_I_SIGMA_Y = np.array([[0.0, 1.0], [-1.0, 0.0]], dtype=np.complex128)
+
+
+def unfold_psi(
+    cnk_kbar,
+    *,
+    sym_idx,
+    n_sym_spatial,
+    g_kbar,
+    sym_mats_k,
+    translations,
+    U_spinor_spatial,
+):
+    """ψ at one full-BZ k from ψ at its IBZ representative ``kbar``.
+
+    Pure-numpy / host-side. Handles spatial AND TRS-augmented sym rows;
+    the bispinor TRS rule lives here (and ONLY here in PR3+).
+
+    Math:
+        For spatial sym (sym_idx < n_sym_spatial, op {S|τ}, S = sym_mats_k[sym_idx]):
+            ψ_full(G_rot) = exp(-i (S·G_kbar)·τ) · U_spinor(S) · ψ_kbar(G_kbar)
+            where G_rot = S·G_kbar + kg0 (umklapp; caller handles G_rot bookkeeping
+            via WfnLoader.gvecs and friends — this helper only computes the
+            spinor + phase factors).
+
+        For TRS-augmented sym (sym_idx ≥ n_sym_spatial, op T∘{S|τ}, T = iσ_y K):
+            ψ_full(G_rot) = (iσ_y · conj(U_spinor(S)))
+                            · exp(+i (S·G_kbar)·τ)
+                            · conj(ψ_kbar(G_kbar))
+        Equivalently: ψ_full = iσ_y · conj(spatial-form), per the per-element
+        derivation in ``reports/trs_sym_audit_2026-05-14/pr3_design.md``.
+
+        Implementation note: ``sym_mats_k[sym_idx]`` already encodes the
+        ±S sign (TRS rows are ``-S``). Computing
+        ``rotated = sym_mats_k[sym_idx] @ G_kbar`` and then
+        ``exp(-i rotated·τ)`` gives ``exp(+i S·G_kbar · τ)`` automatically
+        for TRS rows — no separate sign branch on the phase. Order:
+        apply phase AFTER conj on the TRS branch so the conj doesn't
+        invert the phase sign.
+
+    Parameters
+    ----------
+    cnk_kbar : (nb, ns, ngk) complex
+        IBZ ψ coefficients on the IBZ G-list. ``ns`` is the spinor axis;
+        ``ns = 1`` for non-SOC (the spinor rotation is a no-op then), ``ns = 2``
+        for SOC.
+    sym_idx : int
+        Row in ``sym_mats_k`` (length ``2·n_sym_spatial``).
+    n_sym_spatial : int
+        Count of spatial-only sym ops (= wfn.ntran). TRS rows are
+        ``[n_sym_spatial, 2·n_sym_spatial)``.
+    g_kbar : (ngk, 3) int
+        IBZ G-list (ψ_kbar's G axis).
+    sym_mats_k : (2·n_sym_spatial, 3, 3) int
+        TRS-augmented sym matrices acting on k/q (and G).
+    translations : (n_sym_spatial, 3) float
+        BGW fractional translations τ_s. Length ``n_sym_spatial`` — TRS rows
+        do not have a separate τ; they reuse the spatial τ with the right sign
+        baked into the formula above.
+    U_spinor_spatial : (n_sym_spatial, 2, 2) complex
+        Spatial-only spinor rotation matrices. The TRS-row spinor is computed
+        inside this helper as ``iσ_y · conj(U_spinor_spatial[s])``.
+
+    Returns
+    -------
+    cnk_full : (nb, ns, ngk) complex
+        ψ at the full-BZ k, returned on the IBZ G-axis (i.e. cnk_full[b, σ, g]
+        corresponds to the G-vector ``sym_mats_k[sym_idx] @ g_kbar[g]`` in the
+        full-k basis). The caller's G-rebuild (``WfnLoader.gvecs``) and umklapp
+        handling are independent.
+    """
+    sym_idx = int(sym_idx)
+    n_sym_spatial = int(n_sym_spatial)
+    is_trs = sym_idx >= n_sym_spatial
+    s_spatial = sym_idx - n_sym_spatial if is_trs else sym_idx
+
+    S_full = np.asarray(sym_mats_k[sym_idx], dtype=np.int32)
+    cnk = np.asarray(cnk_kbar)
+    g_bar = np.asarray(g_kbar)
+
+    # τ-phase: uses sym_mats_k[sym_idx] (which already has ±S sign baked in
+    # for TRS), and the spatial τ. For spatial: phase = exp(-i (S·G_kbar)·τ).
+    # For TRS (sym_mats_k = -S): the same formula gives exp(+i (S·G_kbar)·τ),
+    # which is the conj(spatial-phase) the TRS rule requires.
+    tau = np.asarray(translations[s_spatial], dtype=np.float64)
+    has_tau = bool(np.any(np.abs(tau) > 1e-12))
+    if has_tau:
+        rotated = (S_full @ g_bar.T).T.astype(np.float64)              # (ngk, 3)
+        phase = np.exp(-1j * (rotated @ tau))                          # (ngk,)
+    else:
+        phase = None
+
+    if is_trs:
+        # TRS rule: ψ_full = iσ_y · conj(U_s · ψ_kbar · phase_spatial)
+        #         = (iσ_y · conj(U_s)) · conj(ψ_kbar) · conj(phase_spatial)
+        # We compute phase via sym_mats_k[TRS row]=-S so it equals
+        # conj(phase_spatial) already. Apply conj on cnk first, THEN phase
+        # (else the conj would re-invert the phase sign).
+        cnk = np.conj(cnk)
+        if phase is not None:
+            cnk = cnk * phase[None, None, :]
+        U_eff = _I_SIGMA_Y @ np.conj(np.asarray(U_spinor_spatial[s_spatial]))
+    else:
+        if phase is not None:
+            cnk = cnk * phase[None, None, :]
+        U_eff = np.asarray(U_spinor_spatial[s_spatial])
+
+    # Spinor rotation. For ns=1 (non-SOC), U_eff is the 1×1 identity and
+    # this einsum is a no-op (callers can still pass it without special-casing).
+    cnk = np.einsum("jk,nkl->njl", U_eff, cnk)
+    return cnk
+
+
 class SymMaps:
     def __init__(self, wfn):
         """
@@ -413,8 +527,18 @@ class SymMaps:
         self.Rinv_grid = np.rint(np.linalg.inv(self.R_grid)).astype(np.int32)
 
         
+        # ``R_cart`` covers the full ``2·ntran``-row sym_mats_k (kept for
+        # any caller that needs cartesian-frame rotations e.g. for current
+        # density / transverse channels). ``U_spinor`` is restricted to the
+        # SPATIAL half: the TRS-row spinor is ``iσ_y · conj(U_spinor[s])``
+        # (computed inside ``unfold_psi`` and similar consumers). Before
+        # 2026-05-14 this array was length 2·ntran with the TRS half
+        # computed wrong by ``get_spinor_rotations(-S_spatial)``'s
+        # det<0→-R flip; restricting to length ntran here makes the bug
+        # unreachable by construction. See ``reports/trs_sym_audit_2026-05-14``
+        # Site #6 for the per-element derivation.
         self.R_cart = self.syms_crystal_to_cartesian(wfn)
-        self.U_spinor = self.get_spinor_rotations(wfn, self.R_cart)
+        self.U_spinor = self.get_spinor_rotations(wfn, self.R_cart[:wfn.ntran])
         self.kq_map = self.get_kminusq_map(wfn, self.unfolded_kpts)
         self.kqfull_map = self.get_kminusqfull_map(wfn, self.unfolded_kpts)
         self.kfull_symmap = self.get_kfull_symmap(wfn, self.unfolded_kpts)
@@ -595,16 +719,10 @@ class SymMaps:
                     irk_to_k_map[ikfull] = ikbar
                     irk_sym_map[ikfull] = matches[0]
 
-        n_tr = int(np.sum(irk_sym_map >= ntran))
-        if n_tr > 0:
-            import warnings
-            warnings.warn(
-                f"SymMaps: {n_tr}/{len(full_kpts)} full-BZ k-points require "
-                f"time-reversal symmetry for unfolding. Non-symmorphic phases "
-                f"are NOT applied for these k-points. Use noinv=.true. in QE "
-                f"to avoid this."
-            )
-
+        # Note: TRS-augmented sym indices (irk_sym_map >= ntran) are now
+        # handled correctly by ``unfold_psi`` (PR3, 2026-05-14). The
+        # previous warning about "non-symmorphic phases are NOT applied
+        # for these k-points" is obsolete.
         return irk_to_k_map, irk_sym_map
 
     def validate_atomic_symmetries(self, wfn, tol=1e-6):

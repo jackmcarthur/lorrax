@@ -447,17 +447,40 @@ class WfnLoader:
         sym_idx_per_full = np.asarray(sym.sym_idx_k, dtype=np.int32)[:nk_full]
         n_tran = int(sym.sym_matrices.shape[0])
         tr_mask = (sym_idx_per_full >= n_tran).astype(np.bool_)
-        U_per = np.asarray(sym.U_spinor)[sym_idx_per_full]            # (nk_full, ns, ns)
+
+        # Per-k spinor rotation matrix. For spatial rows (s < ntran):
+        # ``U_per[k] = sym.U_spinor[s]``. For TRS rows (s >= ntran):
+        # ``U_per[k] = iσ_y · conj(sym.U_spinor[s_spatial])`` per the
+        # bispinor TRS rule (T = iσ_y K). See ``common.symmetry_maps.unfold_psi``
+        # and ``reports/trs_sym_audit_2026-05-14`` Sites #5–#7.
+        # ``sym.U_spinor`` is length ``ntran`` (PR3); the TRS-augmented
+        # half is computed here on demand.
+        from common.symmetry_maps import _I_SIGMA_Y
+        U_spatial = np.asarray(sym.U_spinor)                            # (ntran, 2, 2)
+        s_spatial_idx = sym_idx_per_full % n_tran                        # (nk_full,)
+        U_per_spatial = U_spatial[s_spatial_idx]                         # (nk_full, 2, 2)
+        # TRS form: iσ_y · conj(U_spatial[s_spatial]); broadcast over k.
+        U_per_trs = np.einsum(
+            'ij,kjl->kil', _I_SIGMA_Y, np.conj(U_per_spatial))           # (nk_full, 2, 2)
+        U_per = np.where(
+            tr_mask[:, None, None], U_per_trs, U_per_spatial)            # (nk_full, 2, 2)
 
         # τ-phase per full-BZ k on the ibz-source ngkmax-padded G-list.
-        # For TR-image k's, set to 1 (TR conjugation is applied
-        # separately in the unfold kernel; matches PhdfWfnReader).
+        # Use the SAME formula for spatial and TRS rows:
+        #   phase = exp(-i (sym_mats_k[s] · G_kbar) · τ_{s_spatial})
+        # For TRS rows ``sym_mats_k[s] = -S_spatial`` so the formula yields
+        # ``exp(+i (S_spatial · G_kbar) · τ)``, which is ``conj`` of the
+        # spatial-row phase. Combined with the downstream kernel's
+        # ``where(tr_mask, conj(cnk), cnk)`` step, the per-element TRS rule
+        # ``ψ_full = (iσ_y · conj(U)) · conj(ψ_kbar) · conj(phase_spatial)``
+        # is reproduced. Pre-PR3 the TRS rows were set to 1 (skipped the
+        # phase entirely) — that bug fired on non-symmorphic non-inversion
+        # bispinor systems.
         phase = np.ones((nk_full, ngkmax), dtype=np.complex128)
         for nk in range(nk_full):
             s = int(sym_idx_per_full[nk])
-            if s >= n_tran:
-                continue
-            tau = np.asarray(sym.translations[s], dtype=np.float64)
+            s_spatial = s - n_tran if s >= n_tran else s
+            tau = np.asarray(sym.translations[s_spatial], dtype=np.float64)
             if not np.any(np.abs(tau) > 1e-12):
                 continue
             ibz = int(ibz_per_full[nk])
@@ -821,32 +844,29 @@ class WfnLoader:
             return out
 
         # Full-BZ unfold path.
+        from common.symmetry_maps import unfold_psi
         sym = self._ensure_sym()
         ntran = int(sym.sym_matrices.shape[0])
-        U_per = np.asarray(sym.U_spinor)
         for j, nk in enumerate(k_idxs):
             nk_int = int(nk)
             sym_idx = int(sym.sym_idx_k[nk_int])
             kbar = int(sym.irr_idx_k[nk_int])
-            sym_krep = np.asarray(sym.sym_mats_k[sym_idx], dtype=np.int32)
             ngk_k = int(self.ngk[kbar])
 
             start = int(self._kpt_starts[kbar])
             end = start + ngk_k
             raw = self._coeffs_raw[b_lo:b_hi, :, start:end, :]
             cnk = raw[..., 0] + 1j * raw[..., 1]                    # (nb, ns, ngk_k)
-
-            if sym_idx >= ntran:
-                cnk = np.conj(cnk)
-            else:
-                tau = np.asarray(self.translations[sym_idx], dtype=np.float64)
-                if np.any(np.abs(tau) > 1e-12):
-                    g_bar = self._gvecs_raw[start:end]              # (ngk_k, 3)
-                    rotated = (sym_krep @ g_bar.T).T                # (ngk_k, 3)
-                    phase = np.exp(-1j * rotated.astype(np.float64) @ tau)
-                    cnk = cnk * phase[None, None, :]
-
-            cnk = np.einsum("jk,nkl->njl", U_per[sym_idx], cnk)     # spinor rotate
+            g_bar = self._gvecs_raw[start:end]                      # (ngk_k, 3)
+            cnk = unfold_psi(
+                cnk,
+                sym_idx=sym_idx,
+                n_sym_spatial=ntran,
+                g_kbar=g_bar,
+                sym_mats_k=sym.sym_mats_k,
+                translations=self.translations,
+                U_spinor_spatial=sym.U_spinor,
+            )
             out[j, :nb_logical, :, :ngk_k] = cnk
         return out
 
