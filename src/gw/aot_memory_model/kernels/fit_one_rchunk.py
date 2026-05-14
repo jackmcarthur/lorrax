@@ -1,16 +1,17 @@
 """fit_one_rchunk: driver-level AOT of the per-r-chunk zeta fit body.
 
-Mirrors ``common.isdf_fitting.fit_one_rchunk`` — the jit that covers the
-FFT+reshard per band-chunk, pair-density streaming (spin-traced), ZCT,
+Mirrors ``common.isdf_fitting.fit_one_rchunk`` — the jit that covers
+the full ψ(G) → ψ(rchunk) transform (one shard_map+scan via
+``gflat_to_rchunk``), pair-density streaming (spin-traced), ZCT,
 Z-col reshard, and Cholesky solve, all in one HLO.  AOT-lowering this
 captures the driver-level memory high-water mark including *coexisting*
-buffers (G-space cache + centroid copies + L_q + live P_l/P_r +
-per-bc FFT outputs), which per-stage kernels cannot model.
+buffers (ψ(G) device tensor + centroid copies + L_q + live P_l/P_r +
+per-scan-iter FFT box), which per-stage kernels cannot model.
 
 Input shapes (all complex128 unless noted):
-    [ψ(G) is NO LONGER a jit arg.  Each bc's ψ(G) is fetched from the
-     host via io_callback inside the jit body — see
-     common.psi_G_store.PsiGStore.fetch_psi_G.]
+    [ψ(G) is NO LONGER a jit arg.  ψ(G) lives on host; the jit body
+     pulls it once via ``PsiGStore.psi_G_device_full`` (a shard_map +
+     io_callback) and feeds it into ``gflat_to_rchunk``.]
     psi_l_rmuT_X_fit : (n_k, n_rmu, n_b_l, n_s) on P(None, None, 'x', None)
     psi_r_rmuT_X_fit : (n_k, n_rmu, n_b_r, n_s) on P(None, None, 'x', None)
     L_q              : (n_q, n_rmu, n_rmu) on P(None, 'x', 'y')
@@ -26,11 +27,12 @@ Key primitives dominating driver-level peak (observed empirically):
                  (ZCT stage) — 4 concurrent pair-density-sized temps.
   * ``Pacc``   = 16 · n_k · n_rmu · B_r / (p_x · p_y)
                  (P_l + P_r accumulators, 2 copies, persistent across bc loop).
-  * ``psiBc``  = 16 · n_k · bc_size · n_s · n_r / (p_x · p_y)
-                 (per-bc FFT output, superseded by next bc but alive during
-                  accumulate) — this and ``psi_r_y`` are the bc-step peaks.
-  * ``rchunk_y`` = 16 · n_k · bc_size · n_s · B_r / p_y
-                 (reshard stage).
+  * ``psi_Y_full`` = 16 · n_k · n_b · n_s · B_r / (p_x · p_y)
+                 (full per-rank ψ(rchunk) tensor produced by
+                 ``gflat_to_rchunk``; alive during the pair-density step).
+  * ``fft_box``  = 16 · cs · n_s · n_r
+                 (per-scan-iter FFT box inside ``gflat_to_rchunk``;
+                 aliased across scan iters by XLA — a single slot).
   * ``psi_cent`` = 16 · n_k · n_rmu · (n_b_l + n_b_r) · n_s / p_x
                  (centroid copies: always alive, cheap-ish).
   * ``L_q_shard`` = 16 · n_q · n_rmu^2 / (p_x · p_y)
@@ -40,14 +42,16 @@ Knobs:
     * ``chunk_r``  (r-slab width; primary DoE axis for driver peak)
     * ``band_chunk`` (bc_size for the streaming pair-density)
 
-Note: the production kernel fetches ψ(G) per band-chunk from a
-host-side :class:`common.psi_G_store.PsiGStore` via io_callback inside
-its bc-loop.  For AOT memory analysis we plug in an
-``_AotStubPsiGStore`` whose ``fetch_psi_G`` returns zeros of the
-correct per-device shape, so the compiled HLO has the same io_callback
--> FFT -> accumulate structure as production.  The io_callback does not
+Note: the production kernel pulls the full ψ(G) tile from a host-side
+:class:`common.psi_G_store.PsiGStore` via the lazy
+``psi_G_device_full`` property, then runs one ``gflat_to_rchunk`` call
+for the full (k · n_local) flat axis.  For AOT memory analysis we plug
+in an ``_AotStubPsiGStore`` whose ``psi_G_device_full`` returns zeros
+of the correct per-device shape via the same shard_map + io_callback
+pattern as production, so the compiled HLO has the same
+io_callback → ``gflat_to_rchunk`` structure.  The io_callback does not
 itself allocate persistent device memory — the peak it contributes is
-captured in the single-bc ψ(G) live during FFT (``psiG_bc`` primitive).
+captured in the per-scan-iter FFT box (``fft_box`` primitive).
 """
 from __future__ import annotations
 
@@ -66,34 +70,43 @@ from ..core import AotKernel, Knobs, MeshSpec, SysDims, register_kernel
 class _AotStubPsiGStore:
     """AOT-only :class:`common.psi_G_store.PsiGStore` stand-in.
 
-    ``fetch_psi_G`` returns a sharded jax.Array of zeros in the same
-    shape/sharding the production store produces, so the HLO emitted
-    by ``_make_fit_one_rchunk_kernel`` is structurally identical to
-    production — same io_callback + FFT + pair-density sequence, same
-    ``memory_analysis`` — without needing a real WFN.h5 on hand.
+    Mirrors the surface the production ``_make_fit_one_rchunk_kernel``
+    consumes after the Path D rewrite: ``psi_G_device_full`` returns a
+    sharded zero tensor in ``(nk, nb_local_total, ns, ngkmax)`` layout
+    via the same shard_map+io_callback the real store uses, plus
+    ``g_index`` / ``kvecs_frac`` as device-resident replicated tensors.
     Strictly for AOT peak measurement; never actually executed.
     """
 
-    def __init__(self, mesh: Mesh, meta, band_chunk_ranges):
+    def __init__(self, mesh: Mesh, meta, band_chunk_ranges, ngkmax: int):
         self.mesh = mesh
         self.band_chunk_ranges = band_chunk_ranges
         p = int(mesh.shape['x']) * int(mesh.shape['y'])
-        bc_uniform = band_chunk_ranges[0][1] - band_chunk_ranges[0][0]
-        assert bc_uniform % p == 0, \
-            f"band_chunk={bc_uniform} must divide total devices {p}"
+        nb_total = int(band_chunk_ranges[-1][1] - band_chunk_ranges[0][0])
+        assert nb_total % p == 0, (
+            f"nb_total={nb_total} must divide total devices {p}")
+        nb_local = nb_total // p
+        nk = int(meta.nk_tot)
+        ns = int(meta.nspinor)
         nx, ny, nz = meta.fft_grid
-        self._per_device_shape = (
-            int(meta.nk_tot), bc_uniform // p, int(meta.nspinor), nx, ny, nz)
+        self._per_device_shape = (nk, nb_local, ns, int(ngkmax))
+        self._g_index_shape    = (nk, nx, ny, nz)
+        self._kvecs_shape      = (nk, 3)
+        self._psi_G_device_full = None
+        self._g_index_dev = None
+        self._kvecs_frac_dev = None
 
     def begin_rchunk(self, *_): pass
     def end_rchunk(self): pass
     def close(self): pass
 
-    def fetch_psi_G(self, band_range, k_range=None):
-        del band_range, k_range
+    @property
+    def psi_G_device_full(self):
+        if self._psi_G_device_full is not None:
+            return self._psi_G_device_full
         per_dev = self._per_device_shape
         out_sds = jax.ShapeDtypeStruct(per_dev, jnp.complex128)
-        spec = P(None, ('x', 'y'), None, None, None, None)
+        spec = P(None, ('x', 'y'), None, None)
         zeros = np.zeros(per_dev, dtype=np.complex128)
 
         def _cb(_x, _y):
@@ -105,7 +118,24 @@ class _AotStubPsiGStore:
             x = jax.lax.axis_index('x')
             y = jax.lax.axis_index('y')
             return io_callback(_cb, out_sds, x, y, ordered=True)
-        return _sm()
+        self._psi_G_device_full = _sm()
+        return self._psi_G_device_full
+
+    @property
+    def g_index(self):
+        if self._g_index_dev is None:
+            rep = NamedSharding(self.mesh, P(*([None] * 4)))
+            self._g_index_dev = jax.device_put(
+                np.zeros(self._g_index_shape, dtype=np.int32), rep)
+        return self._g_index_dev
+
+    @property
+    def kvecs_frac(self):
+        if self._kvecs_frac_dev is None:
+            rep = NamedSharding(self.mesh, P(None, None))
+            self._kvecs_frac_dev = jax.device_put(
+                np.zeros(self._kvecs_shape, dtype=np.float64), rep)
+        return self._kvecs_frac_dev
 
 _B = 16.0
 
@@ -425,12 +455,18 @@ class FitOneRChunkKernel(AotKernel):
         q_chunk_size = 1
 
         # ψ(G) is no longer a jit arg — provide a stub PsiGStore whose
-        # ``fetch_psi_G`` returns zeros of the right per-device shape.
-        # This gives the AOT compile the same graph structure the
-        # production kernel emits (one io_callback per bc, one FFT per
-        # bc, one pair-density accumulate per bc), without needing an
-        # actual WFN.h5 file open on the DoE driver.
-        stub_store = _AotStubPsiGStore(mesh, meta, band_chunk_ranges)
+        # ``psi_G_device_full`` property returns zeros of the right
+        # per-device shape via the production shard_map+io_callback
+        # pattern.  This gives the AOT compile the same graph structure
+        # the production kernel emits (one io_callback for the full ψ(G)
+        # tile, one ``gflat_to_rchunk`` shard_map+scan, one pair-density
+        # accumulate, one Cholesky solve), without needing an actual
+        # WFN.h5 file open on the DoE driver.  ``ngkmax`` is taken from
+        # ``sys.n_g`` when set; otherwise we default to a fraction of
+        # the FFT-box volume that keeps the AOT model conservative.
+        ngkmax_aot = int(getattr(sys, "n_g", 0) or max(1, n_r_total // 16))
+        stub_store = _AotStubPsiGStore(
+            mesh, meta, band_chunk_ranges, ngkmax=ngkmax_aot)
         kernel = _make_fit_one_rchunk_kernel(
             mesh, meta, band_chunk_ranges,
             band_range_left, band_range_right, band_range_full,

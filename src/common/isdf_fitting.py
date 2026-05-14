@@ -44,6 +44,7 @@ from .load_wfns import (
     read_Gvecs_to_devices,
     load_centroids_band_chunked,
 )
+from .wfn_transforms import gflat_to_rchunk
 
 
 # ============================================================================
@@ -1178,6 +1179,7 @@ def _make_fit_one_rchunk_kernel(
     is_charge: bool = True,
     solver_kind: str = 'auto',
     q_irr_full_idx: np.ndarray | None = None,
+    gflat_to_rchunk_chunk_size: int | None = None,
 ):
     """Factory: returns a ``jax.jit``'d fit_one_rchunk callable closing
     over every piece of static structure + a :class:`PsiGStore` that
@@ -1255,27 +1257,35 @@ def _make_fit_one_rchunk_kernel(
         # ``valid_shape=meta.n_rmu`` so on-disk extent stays logical.
 
         # --- Pair density + IFFT + γ̃·γ̃ + FFT, all in one shard_map.
-        # Fetch ψ_Y per-bc via io_callback, concatenate along the band
-        # axis, slice into L / R band ranges, and call
-        # ``z_q_from_psi_sm`` which fuses pair density + IFFT +
-        # γ̃·γ̃ + FFT inside one monolithic shard_map.  The rank-5 pair
-        # density never exists as a global XLA value, so the rank-3
-        # fused-replicated buffer that pegged the kernel peak under
-        # the legacy chain (5 slots × 4.16 GiB on MoS2 3×3 bispinor)
-        # cannot form.  γ̃^μ_L applied on BOTH P-sides at the
-        # post-IFFT contraction step (γ̃·γ̃ reduce); charge channel
-        # passes ``gamma_mu=None`` for the identity short-circuit.
+        # Pull the full ψ(G) tile from the host store (one io_callback,
+        # all bcs) then call ``gflat_to_rchunk`` — the structural twin
+        # of ``accumulate_rchunk_to_gflat``.  Single shard_map+scan over
+        # chunks of the per-rank ``(nk · nb_local)`` flat axis: XLA
+        # aliases the per-iter FFT box across iters, so the
+        # FFT-box-class slot count for ``ψ(G) → ψ(rchunk)`` collapses
+        # from ``n_bc · n_kchunk`` (58 in the lorrax_A HLO findings at
+        # CrI3 6×6 80 Ry) to ≤ 3.  Down-stream ``z_q_from_psi_sm``
+        # fuses pair density + IFFT + γ̃·γ̃ + FFT inside one monolithic
+        # shard_map; the rank-5 pair density never exists as a global
+        # XLA value.  γ̃^μ_L applied on BOTH P-sides at the post-IFFT
+        # contraction step (γ̃·γ̃ reduce); charge channel passes
+        # ``gamma_mu=None`` for the identity short-circuit.
         _b0 = int(band_range_full[0])
         _l_lo = int(band_range_left[0]) - _b0
         _l_hi = int(band_range_left[1]) - _b0
         _r_lo = int(band_range_right[0]) - _b0
         _r_hi = int(band_range_right[1]) - _b0
-        psi_Y_parts = []
-        for bc_range in band_chunk_ranges:
-            psi_Y_parts.append(psi_G_store.fetch_psi_rchunk(
-                bc_range, r_start_dyn, actual_n_rchunk))
-        psi_Y_full = jnp.concatenate(psi_Y_parts, axis=1)
-        del psi_Y_parts
+        psi_Y_full = gflat_to_rchunk(
+            psi_G_store.psi_G_device_full,
+            psi_G_store.g_index,
+            mesh=mesh_xy,
+            fft_grid=meta.fft_grid,
+            r0=r_start_dyn,
+            r_len=actual_n_rchunk,
+            kvecs_frac=psi_G_store.kvecs_frac,
+            norm="ortho",
+            chunk_size=gflat_to_rchunk_chunk_size,
+        )
         # Per-side band slices + norm divide.  norms_l / norms_r are
         # sized to the side's band range, so they apply 1:1 to the
         # corresponding slice of psi_Y_full.
@@ -1354,6 +1364,7 @@ def fit_one_rchunk(
     solver_kind: str = 'auto',
     q_irr_full_idx: np.ndarray | None = None,
     cct_trace_per_q: jax.Array | None = None,
+    gflat_to_rchunk_chunk_size: int | None = None,
 ):
     """Entry point for the r-chunk body jit.  Caches one compiled kernel
     per distinct static configuration.
@@ -1370,6 +1381,8 @@ def fit_one_rchunk(
     # compiled HLO since the values never appear as static constants).
     is_charge = (int(vertex_mu_L) == 0)
     gamma_perm, gamma_phase = _gamma_perm_phase_mu(vertex_mu_L)
+    _gflat_to_rchunk_cs = (int(gflat_to_rchunk_chunk_size)
+                            if gflat_to_rchunk_chunk_size else None)
     cache_key = (
         id(mesh_xy),
         actual_n_rchunk,
@@ -1387,6 +1400,7 @@ def fit_one_rchunk(
          else (int(q_irr_full_idx.shape[0]),
                hash(np.asarray(q_irr_full_idx,
                                dtype=np.int32).tobytes()))),
+        _gflat_to_rchunk_cs,
     )
     fn = _fit_one_rchunk_cache.get(cache_key)
     if fn is None:
@@ -1403,6 +1417,7 @@ def fit_one_rchunk(
             is_charge=bool(is_charge),
             solver_kind=str(solver_kind),
             q_irr_full_idx=q_irr_full_idx,
+            gflat_to_rchunk_chunk_size=_gflat_to_rchunk_cs,
         )
         _fit_one_rchunk_cache[cache_key] = fn
     # cct_trace_per_q is None for the charge channel (Cholesky path
@@ -1478,8 +1493,8 @@ def fit_zeta_to_h5(
     solver_kind: str = 'auto',
     cusolvermp_charge: str = "auto",
     cusolvermp_lu: str = "auto",
-    psig_k_chunk_size: int = 0,
     gflat_chunk_size: int = 0,
+    gflat_to_rchunk_chunk_size: int = 0,
     write_ibz_only: bool = True,
     zeta_cutoff_ry: float | None = None,
 ):
@@ -2016,7 +2031,6 @@ def fit_zeta_to_h5(
         band_chunk_ranges=band_chunk_ranges,
         bispinor=bispinor,
         mode=gspace_mode,
-        k_chunk_size=int(psig_k_chunk_size),
     )
 
     # ========== STEP 6: Loop over chunks ==========
@@ -2148,6 +2162,8 @@ def fit_zeta_to_h5(
                         solver_kind=_resolved_solver_kind,
                         q_irr_full_idx=q_irr_full_idx,   # Phase B: gather inside the kernel
                         cct_trace_per_q=cct_trace_per_q,
+                        gflat_to_rchunk_chunk_size=int(gflat_to_rchunk_chunk_size)
+                            if gflat_to_rchunk_chunk_size else None,
                     )
                     zeta_chunk.block_until_ready()
             finally:
