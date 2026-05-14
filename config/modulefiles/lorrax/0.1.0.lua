@@ -126,9 +126,18 @@ setenv("HDF5_USE_FILE_LOCKING", "FALSE")
 -- fixed-size BFC pool.  NCCL / cuSOLVERMp / SLATE then share VRAM with
 -- XLA cleanly.  At MEM_FRACTION=0.95 with BFC, NCCL starves and surfaces
 -- as `NCCL error 1 unhandled cuda error` inside cusolverMpSyevd.
+--
+-- Allocator selection: `cuda_async` enables CUDA's stream-ordered
+-- memory pool (cudaMallocAsync).  Unlike BFC, freed memory is returned
+-- to the device pool, so a JAX peak in phase 1 doesn't permanently
+-- starve cuSOLVERMp workspaces in phase 2.  Previously this file set
+-- both XLA_PYTHON_CLIENT_ALLOCATOR=platform AND TF_GPU_ALLOCATOR=
+-- cuda_malloc_async; the JAX-prefixed name wins in current XLA, so the
+-- `platform` (eager cudaMalloc/Free, "very slow, debug-only" per JAX
+-- docs) allocator was actually active.  See
+-- https://docs.jax.dev/en/latest/gpu_memory_allocation.html
 setenv("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-setenv("XLA_PYTHON_CLIENT_ALLOCATOR",   "platform")
-setenv("TF_GPU_ALLOCATOR",              "cuda_malloc_async")
+setenv("XLA_PYTHON_CLIENT_ALLOCATOR",   "cuda_async")
 
 -- =========================================================================
 --  PYTHONPATH + container LD_LIBRARY_PATH
