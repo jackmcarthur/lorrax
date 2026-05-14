@@ -138,7 +138,9 @@ def build_sternheimer_source(
         scattered into a zero-padded box, NOT the real-space wavefunction.
     Gkminq_int : (ngk_p, 3) int32
         Integer G-vectors of the (k-q) G-sphere (from
-        ``sym.get_gvecs_kfull(wfn, ik_kminq)``).
+        ``wfn.gvecs(k="full_bz")[ik_kminq, :wfn.ngk_valid(k="full_bz")[ik_kminq]]``;
+        previously ``sym.get_gvecs_kfull(wfn, ik_kminq)`` before the P5
+        WfnLoader migration).
     V_pert_real : (nx, ny, nz) complex — e^{-iq·r} for density response.
     Q_kminq : callable, projector onto conduction subspace at k-q.
 

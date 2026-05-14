@@ -744,6 +744,19 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# Same kernel as the charge channel, swapping in the γ̃^i vertex.  Three
 	# sequential calls keep peak GPU memory at the scalar-fit level.  Output
 	# paths follow the convention zeta_q_mu{1,2,3}.h5 next to zeta_q.h5.
+	#
+	# Loud-fail guard: if cfg.bispinor=True the transverse ζ fit MUST run,
+	# otherwise downstream V_q silently falls back to scalar V_q and then
+	# crashes on a full-BZ vs IBZ shape mismatch (ζ_T written by bispinor
+	# mode is full-BZ; scalar V_q expects IBZ-only).  See the 2026-05-14
+	# CrI3 30 Ry test-bed KNOWN_SANDBOX_ERRORS entry.
+	if cfg.bispinor and not getattr(cfg.paths, 'centroids_file_current', None):
+		raise ValueError(
+			"Bispinor calculation requires centroids_file_current in cohsex.in "
+			"(set to the path of a current-density kmeans output, e.g. "
+			"centroids_frac_NNN_current.txt from "
+			"`centroid.kmeans_cli --density-mode current ...`)."
+		)
 	if cfg.bispinor and getattr(cfg.paths, 'centroids_file_current', None):
 		import dataclasses
 		from common.load_wfns import load_centroids_band_chunked

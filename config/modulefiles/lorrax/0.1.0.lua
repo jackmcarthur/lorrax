@@ -321,7 +321,7 @@ set_shell_function("lxpre", [[
                 shifter ]] .. shifter_args .. [[ ]] .. in_container_sh .. [["
 
     echo "=== [1/3] ISDF centroids (n=$ncentroids) ==="
-    $step python3 -u -m centroid.kmeans_isdf "$ncentroids" --no-plot --seed 42 \
+    $step python3 -u -m centroid.kmeans_cli "$ncentroids" --seed 42 \
         || { echo "FAILED: centroid generation"; return 1; }
 
     echo "=== [2/3] Dipole matrix elements ==="

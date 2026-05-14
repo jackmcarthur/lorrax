@@ -59,7 +59,7 @@ This produces centroids concentrated in regions of **high electronic density** (
 Typical ratio: $n_\mu \approx 10 \times n_{\text{bands}}$ for convergence.
 
 **Files**:
-- Generation: `src/centroid/kmeans_isdf.py`
+- Generation: `src/centroid/kmeans_cli.py` (CLI) backed by `src/centroid/kmeans_isdf.py` (algorithm)
 - Storage: `centroids_frac.h5` (fractional coordinates)
 - Loading: `src/file_io/centroids.py`
 
@@ -823,7 +823,7 @@ Everything runs on a single 2-D mesh `Mesh(devices, ('x', 'y'))` built in `gw_ja
 ### Preparation
 
 1. DFT wavefunctions: `pw2bgw.x` → `WFN.h5`, `WFNq.h5`
-2. Centroid selection: `lxpre cohsex.in 640` (runs `centroid.kmeans_isdf`, `psp.get_dipole_mtxels`, `gw.kin_ion_io` in sequence) → `centroids_frac.h5`, `dipole.h5`, `kin_ion.h5`
+2. Centroid selection: `lxpre cohsex.in 640` (runs `centroid.kmeans_cli`, `psp.get_dipole_mtxels`, `gw.kin_ion_io` in sequence) → `centroids_frac.h5`, `dipole.h5`, `kin_ion.h5`
 3. Input file: `cohsex.in` with band ranges, memory budget, head source, ISDF pair mode, GN-PPM flags
 
 ### GW calculation (one-shot)
