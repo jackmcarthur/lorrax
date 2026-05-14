@@ -169,11 +169,18 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
         n_tran = int(np.asarray(sym.sym_matrices).shape[0])
         cent_idx = np.asarray(centroid_indices, dtype=np.int32)
         try:
+            # ``extend_trs=True`` so ``sym_perm`` has shape
+            # ``(2·n_tran, n_rmu)`` — the second half duplicates the
+            # spatial rows and is indexed by the TRS-augmented sym
+            # values returned by ``find_irreducible_qpoints``.  See
+            # ``compute_centroid_sym_perm`` docstring and the audit
+            # report (``reports/trs_sym_audit_2026-05-14``).
             sym_perm = compute_centroid_sym_perm(
                 cent_idx,
                 sym_matrices=np.asarray(sym.sym_matrices[:n_tran]),
                 translations=np.asarray(sym.translations[:n_tran]),
                 fft_grid=np.asarray(fft_grid, dtype=np.int32),
+                extend_trs=True,
             )
         except RuntimeError as exc:
             if verbose and jax.process_index() == 0:
@@ -448,15 +455,22 @@ def _compute_V_q_g_flat_one_tile(
 
     # ---- IBZ → full-BZ unfold (centroid double-permute) -------------
     if use_ibz:
+        # ``sym_perm`` came from ``compute_centroid_sym_perm(..., extend_trs=True)``
+        # so its shape[0] is ``2·ntran``; the second half encodes the
+        # TRS-augmented rows (centroid permutation unchanged under TRS,
+        # but the unfold helper conjugates V_q at TRS-tagged q's).
+        n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
         V_acc = _unfold_v_q_ibz_to_full(
             V_acc, full_to_irr_idx=full_to_irr_idx,
             full_to_irr_sym=full_to_irr_sym,
-            sym_perm=sym_perm, mesh_xy=mesh_xy)
+            sym_perm=sym_perm, mesh_xy=mesh_xy,
+            n_sym_spatial=n_sym_spatial)
         if write_g0:
             g0_acc = _unfold_g0_ibz_to_full(
                 g0_acc, full_to_irr_idx=full_to_irr_idx,
                 full_to_irr_sym=full_to_irr_sym,
-                sym_perm=sym_perm, mesh_xy=mesh_xy)
+                sym_perm=sym_perm, mesh_xy=mesh_xy,
+                n_sym_spatial=n_sym_spatial)
 
     V_qmunu = jax.lax.with_sharding_constraint(V_acc, V_sh)
     if write_g0:

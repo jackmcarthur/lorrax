@@ -892,11 +892,18 @@ def compute_all_V_q(
         n_tran = int(np.asarray(sym.sym_matrices).shape[0])
         centroid_idx_np = np.asarray(centroid_indices, dtype=np.int32)
         try:
+            # ``extend_trs=True`` so ``sym_perm`` has shape
+            # ``(2·n_tran, n_rmu)`` — the second half duplicates the
+            # spatial rows and is indexed by the TRS-augmented sym
+            # values returned by ``find_irreducible_qpoints``.  See
+            # ``compute_centroid_sym_perm`` docstring and the audit
+            # report (``reports/trs_sym_audit_2026-05-14``).
             sym_perm = compute_centroid_sym_perm(
                 centroid_idx_np,
                 sym_matrices=np.asarray(sym.sym_matrices[:n_tran]),
                 translations=np.asarray(sym.translations[:n_tran]),
                 fft_grid=np.asarray(fft_grid, dtype=np.int32),
+                extend_trs=True,
             )
         except RuntimeError as exc:
             if verbose and jax.process_index() == 0:
@@ -1022,12 +1029,17 @@ def compute_all_V_q(
     # centroid-double-permute (eq. 3 of the report).  g0 is unfolded
     # for completeness, but only the Γ slot is consumed downstream.
     if use_ibz:
+        # ``sym_perm`` was built with ``extend_trs=True`` → shape
+        # (2·ntran, n_rmu); the unfold helper applies a TRS-row conj
+        # when ``full_to_irr_sym ≥ n_sym_spatial``.
+        n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
         V_acc = _unfold_v_q_ibz_to_full(
             V_acc,
             full_to_irr_idx=q_full_to_irr_idx,
             full_to_irr_sym=q_full_to_irr_sym,
             sym_perm=sym_perm,
             mesh_xy=mesh_xy,
+            n_sym_spatial=n_sym_spatial,
         )
         g0_acc = _unfold_g0_ibz_to_full(
             g0_acc,
@@ -1035,6 +1047,7 @@ def compute_all_V_q(
             full_to_irr_sym=q_full_to_irr_sym,
             sym_perm=sym_perm,
             mesh_xy=mesh_xy,
+            n_sym_spatial=n_sym_spatial,
         )
 
     # Flat-q convention: keep the q axis 1-D throughout.  Downstream

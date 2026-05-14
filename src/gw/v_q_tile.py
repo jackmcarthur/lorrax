@@ -1456,6 +1456,7 @@ def _unfold_v_q_ibz_to_full(
     full_to_irr_sym: np.ndarray,
     sym_perm: np.ndarray,
     mesh_xy: Mesh,
+    n_sym_spatial: int | None = None,
 ) -> jax.Array:
     """Expand ``V_q_ibz (n_qpt_irr, μ, μ)`` to ``(n_q_full, μ, μ)``.
 
@@ -1466,6 +1467,26 @@ def _unfold_v_q_ibz_to_full(
     where ``i(q) = full_to_irr_idx[q]`` and ``s(q) = full_to_irr_sym[q]``.
     No τ-phase — bilinearity in ζ cancels them.
 
+    TRS-augmented rows
+    ------------------
+    ``find_irreducible_qpoints`` (in ``SymMaps``) returns sym indices
+    over the TRS-augmented table ``sym_mats_k`` of length ``2·ntran``,
+    so ``full_to_irr_sym`` values may lie in ``[ntran, 2·ntran)`` for
+    q's that fold to their IBZ parent only via time-reversal.  For the
+    scalar (charge-channel) V_q the TRS rule is:
+
+        V_{full}^{q, π_s(μ), π_s(ν)} = conj( V_{ibz}^{i(q), μ, ν} )
+                                     = V_{ibz}^{i(q), ν, μ}     (Hermiticity)
+
+    (See per-element derivation: ζ_{-q,μ}(G) = ζ*_{q,μ}(-G) combined
+    with v(|q+G|) real-and-even-in-K gives the conj/transpose on the
+    μν legs of the bilinear.)  Concretely we apply ``conj`` after the
+    centroid double-permute on rows where ``full_to_irr_sym ≥ ntran``.
+    The centroid permutation itself is unchanged under TRS (r is
+    fixed); ``sym_perm`` rows ``[ntran:]`` duplicate ``[:ntran]``.
+    Callers should build ``sym_perm`` via
+    ``compute_centroid_sym_perm(..., extend_trs=True)``.
+
     Parameters
     ----------
     V_q_ibz
@@ -1473,12 +1494,27 @@ def _unfold_v_q_ibz_to_full(
     full_to_irr_idx
         (n_q_full,) int.
     full_to_irr_sym
-        (n_q_full,) int.
+        (n_q_full,) int.  Values in ``[0, 2·ntran)`` (TRS-augmented
+        table); a row index ``s`` with ``s ≥ ntran`` denotes the
+        time-reversed image of the bare spatial op ``s mod ntran``.
     sym_perm
-        (n_sym, n_rmu) int — the forward permutation
-        ``r_{π_s(μ)} ≡ S_s r_μ + τ_s``.
+        (n_sym_perm, n_rmu) int — the forward permutation
+        ``r_{π_s(μ)} ≡ S_s r_μ + τ_s``.  Must have
+        ``n_sym_perm ≥ max(full_to_irr_sym) + 1`` (i.e. ``2·ntran`` when
+        any TR-augmented sym is exercised); we raise a clear error
+        otherwise rather than relying on JAX's silent OOB clamp.
     mesh_xy
         Device mesh; the output is constrained to ``P(None, 'x', 'y')``.
+    n_sym_spatial
+        Optional explicit ``ntran`` (number of spatial-only sym ops).
+        When provided, every ``full_to_irr_sym`` value ``≥ n_sym_spatial``
+        is treated as TRS-augmented and an extra ``conj`` is applied to
+        the unfolded V_q at that q.  When ``None`` (default), the code
+        infers a no-TRS contract from a length-``n_sym_perm`` table; in
+        that case any TRS-augmented index hits the hard-fail guard
+        below.  Production callers (V_q g-flat, V_q tile) pass
+        ``n_sym_spatial=ntran`` whenever they built ``sym_perm`` via
+        ``compute_centroid_sym_perm(..., extend_trs=True)``.
 
     Returns
     -------
@@ -1497,6 +1533,38 @@ def _unfold_v_q_ibz_to_full(
             and np.array_equal(idx_np, np.arange(idx_np.shape[0]))
             and np.all(sym_np == 0)):
         return V_q_ibz
+
+    # TRS-aware bounds check on the sym table.  Two contracts:
+    #   * ``n_sym_spatial is None``: legacy / no-TRS-claim caller.
+    #     ``sym_perm`` must have one row per distinct sym index actually
+    #     used; raise if anything else.  This catches the
+    #     pre-2026-05-14 bug where a length-ntran ``sym_perm`` was
+    #     handed to a consumer that received TRS-augmented sym indices.
+    #   * ``n_sym_spatial == ntran``: caller built ``sym_perm`` via
+    #     ``compute_centroid_sym_perm(..., extend_trs=True)``;
+    #     ``sym_perm`` has shape ``(2·ntran, n_rmu)``; values
+    #     ``≥ ntran`` activate the TRS conj branch.
+    n_sym_perm = int(np.asarray(sym_perm).shape[0])
+    max_sym = int(sym_np.max()) if sym_np.size else -1
+    if max_sym >= n_sym_perm:
+        raise ValueError(
+            f"_unfold_v_q_ibz_to_full: full_to_irr_sym contains value "
+            f"{max_sym} (TRS-augmented row index) but sym_perm has only "
+            f"{n_sym_perm} rows.  This is the TRS-blind sym handling "
+            f"bug — build sym_perm via "
+            f"``compute_centroid_sym_perm(..., extend_trs=True)`` so it "
+            f"covers the TRS-augmented half of ``sym_mats_k``, and pass "
+            f"``n_sym_spatial=ntran`` to this helper.  See "
+            f"``reports/trs_sym_audit_2026-05-14/agent_1_scope_report.md``"
+            f" Site #1.")
+    if n_sym_spatial is not None:
+        if int(n_sym_spatial) * 2 != n_sym_perm:
+            raise ValueError(
+                f"_unfold_v_q_ibz_to_full: n_sym_spatial={n_sym_spatial} "
+                f"is inconsistent with sym_perm.shape[0]={n_sym_perm} — "
+                f"when n_sym_spatial is provided, sym_perm must have "
+                f"shape (2·n_sym_spatial, n_rmu) (from "
+                f"``compute_centroid_sym_perm(..., extend_trs=True)``).")
 
     # Inverse permutation: ``inv_perm[s, π_s(μ)] = μ`` → argsort along μ.
     # ``sym_perm`` is built from the LOGICAL centroid set (size
@@ -1528,6 +1596,20 @@ def _unfold_v_q_ibz_to_full(
     idx_j = jnp.asarray(np.asarray(full_to_irr_idx, dtype=np.int32))
     sym_j = jnp.asarray(np.asarray(full_to_irr_sym, dtype=np.int32))
 
+    # TRS mask: rows of ``full_to_irr_sym`` referring to the
+    # TRS-augmented half of ``sym_mats_k`` (s ≥ ntran) get an extra
+    # complex conjugation on the unfolded V_q (see docstring).  We
+    # require the caller to pass ``n_sym_spatial`` explicitly when
+    # using extend_trs=True; without it, no TRS branch is taken
+    # (and the hard-fail guard above already caught the inconsistent
+    # case where TRS sym values exist but no TRS-extended sym_perm
+    # was provided).
+    if n_sym_spatial is not None:
+        trs_mask_np = (sym_np >= int(n_sym_spatial))
+    else:
+        trs_mask_np = np.zeros(sym_np.shape, dtype=bool)
+    trs_mask_j = jnp.asarray(trs_mask_np)
+
     V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
     @partial(jax.jit, out_shardings=V_sh)
@@ -1552,6 +1634,13 @@ def _unfold_v_q_ibz_to_full(
         V_full = jnp.take_along_axis(
             V_perm_mu, perm_q[:, None, :], axis=2,
             mode='promise_in_bounds')
+        # TRS rows: apply complex conjugation per the per-element
+        # rule V_{full}^{TRS-q, μ, ν} = conj(V_{ibz}^{parent, μ_irr, ν_irr})
+        # = V_{ibz}^{parent, ν_irr, μ_irr} (Hermiticity).  We compute
+        # the conj-form here because it's a single mask · conj op
+        # without an extra μν-transpose gather.
+        V_full = jnp.where(
+            trs_mask_j[:, None, None], jnp.conj(V_full), V_full)
         return V_full
 
     return _do_unfold(V_q_ibz)
@@ -1673,6 +1762,7 @@ def _unfold_g0_ibz_to_full(
     full_to_irr_sym: np.ndarray,
     sym_perm: np.ndarray,
     mesh_xy: Mesh,
+    n_sym_spatial: int | None = None,
 ) -> jax.Array:
     """Expand ``g0_ibz (n_qpt_irr, μ)`` → ``(n_q_full, μ)``.
 
@@ -1687,6 +1777,14 @@ def _unfold_g0_ibz_to_full(
     structure) but omit the τ-phase (its effect is unobservable; the
     Γ phase is exp(0) = 1 anyway).  If a future consumer needs the
     correct phase, set ``include_tau_phase=True``.
+
+    TRS-augmented rows: g0 is a single ζ leg, so the TRS rule is a
+    plain conjugation: ``g0_{full}^{TRS-q, π_s(μ)} = conj(g0_{ibz}^{i(q), μ})``.
+    Pass ``n_sym_spatial=ntran`` along with a
+    ``compute_centroid_sym_perm(..., extend_trs=True)`` table to enable
+    the conj branch.  Without ``n_sym_spatial``, no TRS conj is
+    applied; any TRS-augmented sym index in ``full_to_irr_sym`` then
+    hits the hard-fail guard below.
     """
     # Trivial-IBZ short-circuit (ntran=1, no centroid permutation, no
     # μ-pad).  See ``_unfold_v_q_ibz_to_full`` for the rationale; we
@@ -1699,6 +1797,23 @@ def _unfold_g0_ibz_to_full(
             and np.all(sym_np == 0)
             and int(g0_ibz.shape[-1]) == int(np.asarray(sym_perm).shape[-1])):
         return g0_ibz
+
+    # TRS-aware bounds check, mirroring ``_unfold_v_q_ibz_to_full``.
+    n_sym_perm = int(np.asarray(sym_perm).shape[0])
+    max_sym = int(sym_np.max()) if sym_np.size else -1
+    if max_sym >= n_sym_perm:
+        raise ValueError(
+            f"_unfold_g0_ibz_to_full: full_to_irr_sym contains value "
+            f"{max_sym} (TRS-augmented row index) but sym_perm has only "
+            f"{n_sym_perm} rows.  Build sym_perm via "
+            f"``compute_centroid_sym_perm(..., extend_trs=True)`` to "
+            f"cover the TRS-augmented half of ``sym_mats_k``, and pass "
+            f"``n_sym_spatial=ntran`` here.")
+    if n_sym_spatial is not None and int(n_sym_spatial) * 2 != n_sym_perm:
+        raise ValueError(
+            f"_unfold_g0_ibz_to_full: n_sym_spatial={n_sym_spatial} is "
+            f"inconsistent with sym_perm.shape[0]={n_sym_perm}.  "
+            f"sym_perm must have shape (2·n_sym_spatial, n_rmu).")
 
     # Pad ``inv_perm`` to the input's μ-extent (same logic as
     # ``_unfold_v_q_ibz_to_full``); g0 carries the padded μ count
@@ -1718,6 +1833,13 @@ def _unfold_g0_ibz_to_full(
     idx_j = jnp.asarray(full_to_irr_idx)
     sym_j = jnp.asarray(full_to_irr_sym)
 
+    # TRS mask: same convention as ``_unfold_v_q_ibz_to_full``.
+    if n_sym_spatial is not None:
+        trs_mask_np = (sym_np >= int(n_sym_spatial))
+    else:
+        trs_mask_np = np.zeros(sym_np.shape, dtype=bool)
+    trs_mask_j = jnp.asarray(trs_mask_np)
+
     g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
 
     @partial(jax.jit, out_shardings=g0_sh)
@@ -1729,6 +1851,9 @@ def _unfold_g0_ibz_to_full(
         # as ``_unfold_v_q_ibz_to_full``.
         g0_full = jnp.take_along_axis(
             g0_at_irr, perm_q, axis=1, mode='promise_in_bounds')
+        # TRS rows: ζ-leg conjugation (g0 is a single ζ leg, not
+        # bilinear, so the TRS conj does NOT cancel — apply it).
+        g0_full = jnp.where(trs_mask_j[:, None], jnp.conj(g0_full), g0_full)
         return g0_full
 
     return _do_unfold(g0_ibz)

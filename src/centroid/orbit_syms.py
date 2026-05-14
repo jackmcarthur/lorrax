@@ -213,6 +213,7 @@ def compute_centroid_sym_perm(
     fft_grid: np.ndarray | tuple[int, int, int],
     *,
     validate: bool = True,
+    extend_trs: bool = False,
 ) -> np.ndarray:
     """Build π_s such that ``r_{π_s(μ)} ≡ S_s r_μ + τ_s`` on the FFT grid.
 
@@ -244,12 +245,34 @@ def compute_centroid_sym_perm(
         If True, asserts every row of the result is a permutation
         ``[0, n_rmu)``.  Set False only for offline diagnostics where
         the closure failure is the thing you want to inspect.
+    extend_trs
+        If True, return a ``(2·n_sym, n_rmu)`` table whose rows
+        ``[n_sym:]`` duplicate rows ``[:n_sym]``.  This is the
+        TRS-augmented variant: under time-reversal symmetry, real-space
+        centroid coordinates r_μ are unchanged (TRS acts on momenta and
+        complex-conjugates ψ, but leaves r fixed), so the permutation
+        for a TRS-augmented op ``K ∘ {S | τ}`` coincides with the
+        permutation for the bare spatial op ``{S | τ}``.  Pass
+        ``extend_trs=True`` whenever the caller's ``full_to_irr_sym``
+        values may exceed ``n_sym`` (i.e. come from
+        ``SymMaps.find_irreducible_qpoints`` which uses the
+        TRS-augmented ``sym_mats_k``).  See Agent 1's scope report at
+        ``reports/trs_sym_audit_2026-05-14/agent_1_scope_report.md``
+        Site #1 for the bug this option closes.
 
     Returns
     -------
     sym_perm
-        (n_sym, n_rmu) int32 — ``sym_perm[s, μ] = ν`` iff
-        ``r_ν ≡ S_s r_μ + τ_s`` on the FFT grid.
+        ``(n_sym, n_rmu)`` int32 by default; ``(2·n_sym, n_rmu)`` int32
+        when ``extend_trs=True``.  ``sym_perm[s, μ] = ν`` iff
+        ``r_ν ≡ S_s r_μ + τ_s`` on the FFT grid.  For
+        ``s ∈ [n_sym, 2·n_sym)`` the TRS-augmented row duplicates
+        ``s - n_sym`` (TRS keeps r fixed).  The ζ-leg complex
+        conjugation under TRS — for V_q bilinear in ζ this becomes
+        ``V_{TRS-q, μ, ν} = conj(V_{q, μ, ν}) = V_{q, ν, μ}`` (last
+        equality by V_q Hermiticity) — is applied at the V_q-unfold
+        level (see ``gw.v_q_tile._unfold_v_q_ibz_to_full``), NOT in
+        ``sym_perm`` itself.
 
     Raises
     ------
@@ -335,7 +358,19 @@ def compute_centroid_sym_perm(
                     f"collides with a different centroid.  Check "
                     f"``validate_atomic_symmetries`` on the WFN.")
 
-    return sym_perm.astype(np.int32)
+    sym_perm = sym_perm.astype(np.int32)
+    if extend_trs:
+        # TRS keeps r fixed; the augmented rows duplicate the spatial
+        # rows.  Doubling here makes ``sym_perm`` index-compatible with
+        # the TRS-augmented ``full_to_irr_sym`` values returned by
+        # ``SymMaps.find_irreducible_qpoints`` (which range over
+        # ``[0, 2·ntran)``).  Without this, a downstream gather of
+        # ``inv_perm[s]`` for ``s ≥ ntran`` silently clips to the last
+        # spatial row under JAX ``mode='promise_in_bounds'``, producing
+        # wrong V_q at every TRS-folded q (the headline bug — see
+        # ``reports/trs_sym_audit_2026-05-14/agent_1_scope_report.md``).
+        sym_perm = np.concatenate([sym_perm, sym_perm.copy()], axis=0)
+    return sym_perm
 
 
 # ─────────────────────────────────────────────────────────────────────────
