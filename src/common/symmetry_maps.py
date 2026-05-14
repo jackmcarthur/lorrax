@@ -189,11 +189,13 @@ def unfold_v_q(
             f"has only {n_sym_perm} rows.  Build sym_perm via "
             f"``compute_centroid_sym_perm(..., extend_trs=True)`` so it "
             f"covers the TRS-augmented half of ``sym_mats_k``.")
-    if int(n_sym_spatial) * 2 != n_sym_perm:
+    trs_used = max_sym >= int(n_sym_spatial)
+    if trs_used and int(n_sym_spatial) * 2 != n_sym_perm:
         raise ValueError(
-            f"unfold_v_q: n_sym_spatial={n_sym_spatial} is inconsistent "
-            f"with sym_perm.shape[0]={n_sym_perm} — sym_perm must have "
-            f"shape (2·n_sym_spatial, n_rmu).")
+            f"unfold_v_q: sym_idx uses TRS-augmented rows (max={max_sym} ≥ "
+            f"n_sym_spatial={n_sym_spatial}) but sym_perm.shape[0]="
+            f"{n_sym_perm} ≠ 2·n_sym_spatial.  Build sym_perm via "
+            f"``compute_centroid_sym_perm(..., extend_trs=True)``.")
 
     # Inverse permutation: inv_perm[s, π_s(μ)] = μ → argsort along μ.
     # sym_perm is built from the LOGICAL centroid set (size n_rmu_logical).

@@ -46,6 +46,7 @@ def test_unfold_v_q_identity_sym_is_noop():
         sym_idx=full_to_irr_sym,
         sym_perm=sym_perm,
         mesh_xy=mesh,
+        n_sym_spatial=1,                       # identity-only, no TRS
     )
     np.testing.assert_array_equal(np.asarray(V_full), np.asarray(V_ibz))
 
@@ -78,6 +79,7 @@ def test_unfold_v_q_under_permutation():
         sym_idx=full_to_irr_sym,
         sym_perm=sym_perm,
         mesh_xy=mesh,
+        n_sym_spatial=2,                       # 2 spatial ops, no TRS rows used
     ))
     assert V_full.shape == (n_q_full, n_rmu, n_rmu)
 
@@ -125,6 +127,7 @@ def test_unfold_v_q_round_trip_against_eq3():
         sym_idx=full_to_irr_sym,
         sym_perm=sym_perm,
         mesh_xy=mesh,
+        n_sym_spatial=2,                       # 2 spatial ops (inversion), no TRS
     ))
 
     # Eq. 3:  V_full[Sq, π_s(μ), π_s(ν)] = V_full[q, μ, ν]
@@ -146,8 +149,8 @@ def test_unfold_g0_identity_sym_is_noop():
 
     g0_full = _unfold_g0_ibz_to_full(
         g0_ibz,
-        irr_idx=np.arange(nq, dtype=np.int32),
-        sym_idx=np.zeros(nq, dtype=np.int32),
+        full_to_irr_idx=np.arange(nq, dtype=np.int32),
+        full_to_irr_sym=np.zeros(nq, dtype=np.int32),
         sym_perm=np.arange(n_rmu, dtype=np.int32)[None, :],
         mesh_xy=mesh,
     )
@@ -172,8 +175,8 @@ def test_unfold_g0_permutes_mu_axis():
 
     g0_full = np.asarray(_unfold_g0_ibz_to_full(
         g0_ibz,
-        irr_idx=full_to_irr_idx,
-        sym_idx=full_to_irr_sym,
+        full_to_irr_idx=full_to_irr_idx,
+        full_to_irr_sym=full_to_irr_sym,
         sym_perm=sym_perm,
         mesh_xy=mesh,
     ))
