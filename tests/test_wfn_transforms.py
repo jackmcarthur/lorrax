@@ -18,7 +18,8 @@ import pytest
 from jax.sharding import Mesh
 
 from common.wfn_transforms import (
-    to_box, to_rbox, to_rmu, to_rchunk, to_rchunk_inner)
+    to_box, to_rbox, to_rmu, to_rchunk, to_rchunk_inner,
+    gflat_to_rchunk)
 from file_io.wfn_loader import WfnLoader
 
 from tests.test_wfn_loader_eager import _synth_wfn, _MOS2_WFN
@@ -263,6 +264,106 @@ def test_to_rchunk_inner_traced_r0(synth_loader):
         psi, g_index, synth_loader.fft_grid, r0_val, r_len, mesh=MESH,
         norm="backward"))
     np.testing.assert_allclose(out, expected, atol=1e-14, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# gflat_to_rchunk (Path D structural fix) — must match the current
+# bc-loop + concat path.  Three flavours, mirroring the design's §6a
+# checklist: no-phase / with-phase / chunked-vs-oneshot.
+# ---------------------------------------------------------------------------
+
+
+def _gflat_to_rchunk_reference(
+    psi_G, g_index, fft_grid, r0, r_len, *,
+    band_chunks, kvecs_frac=None, norm="ortho",
+):
+    """Reference path: per-bc ``to_rchunk`` calls then ``jnp.concatenate``
+    along the band axis — what production code does today."""
+    parts = []
+    for (b_lo, b_hi) in band_chunks:
+        parts.append(to_rchunk(
+            psi_G[:, b_lo:b_hi, :, :], g_index, fft_grid, r0, r_len,
+            mesh=MESH, kvecs_frac=kvecs_frac, norm=norm))
+    return jnp.concatenate(parts, axis=1)
+
+
+def test_gflat_to_rchunk_no_phase(synth_loader):
+    """One shard_map+scan call equals the bc-loop + concatenate path
+    (no Bloch phase) to floating-point precision."""
+    nb = min(8, int(synth_loader.nbands))
+    psi = synth_loader.load(bands=(0, nb), k="full_bz")
+    g_index = synth_loader.box_index(k="full_bz")
+    nx, ny, nz = (int(s) for s in synth_loader.fft_grid)
+    r0, r_len = nx * ny + 2, 12
+
+    band_chunks = [(0, 4), (4, nb)]
+    ref = np.asarray(_gflat_to_rchunk_reference(
+        psi, g_index, synth_loader.fft_grid, r0, r_len,
+        band_chunks=band_chunks, kvecs_frac=None, norm="ortho"))
+
+    out = np.asarray(gflat_to_rchunk(
+        psi, g_index, mesh=MESH, fft_grid=synth_loader.fft_grid,
+        r0=r0, r_len=r_len, kvecs_frac=None, norm="ortho",
+        chunk_size=None))
+    np.testing.assert_allclose(out, ref, rtol=1e-10, atol=1e-12)
+
+
+def test_gflat_to_rchunk_with_phase(synth_loader):
+    """Bloch-phase branch — ``apply_bloch_phase_on_slice`` semantics
+    (sign=+1) must match identically inside the scan body."""
+    nb = min(8, int(synth_loader.nbands))
+    psi = synth_loader.load(bands=(0, nb), k="full_bz")
+    g_index = synth_loader.box_index(k="full_bz")
+    nk = int(psi.shape[0])
+    nx, ny, nz = (int(s) for s in synth_loader.fft_grid)
+    r0, r_len = nx * ny + 2, 12
+
+    rng = np.random.default_rng(0)
+    kvecs_frac = rng.uniform(-0.5, 0.5, size=(nk, 3)).astype(np.float64)
+
+    band_chunks = [(0, 3), (3, 6), (6, nb)]
+    ref = np.asarray(_gflat_to_rchunk_reference(
+        psi, g_index, synth_loader.fft_grid, r0, r_len,
+        band_chunks=band_chunks, kvecs_frac=kvecs_frac, norm="ortho"))
+
+    out = np.asarray(gflat_to_rchunk(
+        psi, g_index, mesh=MESH, fft_grid=synth_loader.fft_grid,
+        r0=r0, r_len=r_len, kvecs_frac=kvecs_frac, norm="ortho",
+        chunk_size=None))
+    np.testing.assert_allclose(out, ref, rtol=1e-10, atol=1e-12)
+
+
+def test_gflat_to_rchunk_chunked_matches_oneshot(synth_loader):
+    """chunk_size sweep — every choice (incl. one that triggers
+    zero-padding) must produce the same output to ULP precision."""
+    nb = min(6, int(synth_loader.nbands))
+    psi = synth_loader.load(bands=(0, nb), k="full_bz")
+    g_index = synth_loader.box_index(k="full_bz")
+    nk = int(psi.shape[0])
+    nx, ny, nz = (int(s) for s in synth_loader.fft_grid)
+    r0, r_len = nx * ny + 2, 12
+
+    rng = np.random.default_rng(1)
+    kvecs_frac = rng.uniform(-0.5, 0.5, size=(nk, 3)).astype(np.float64)
+
+    # 1×1 mesh ⇒ nb_local = nb; flat axis N = nk · nb.
+    nb_local = nb  # MESH is 1×1
+    N = nk * nb_local
+    one_shot = np.asarray(gflat_to_rchunk(
+        psi, g_index, mesh=MESH, fft_grid=synth_loader.fft_grid,
+        r0=r0, r_len=r_len, kvecs_frac=kvecs_frac, norm="ortho",
+        chunk_size=None))
+
+    # Sweep cs across a divisor, a non-divisor (forces pad_N>0), and a
+    # cs > N (single iter, also pads).
+    for cs in (1, 3, N, N + 1):
+        chunked = np.asarray(gflat_to_rchunk(
+            psi, g_index, mesh=MESH, fft_grid=synth_loader.fft_grid,
+            r0=r0, r_len=r_len, kvecs_frac=kvecs_frac, norm="ortho",
+            chunk_size=cs))
+        np.testing.assert_allclose(
+            chunked, one_shot, rtol=1e-10, atol=1e-12,
+            err_msg=f"chunk_size={cs} disagrees with one-shot")
 
 
 # ---------------------------------------------------------------------------
