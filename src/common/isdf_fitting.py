@@ -505,12 +505,20 @@ def z_q_from_psi_sm(
 			[hi for (_lo, hi) in bcr], dtype=np.int32)
 		# psi_l_X / psi_r_X are sized to their L/R window; per-bc slice
 		# offset within them is `bc.lo - L_lo_g` / `bc.lo - R_lo_g`,
-		# which can be NEGATIVE when bc starts below the window.  We
-		# pre-pad psi_l_X / psi_r_X at the front with `front_pad_*`
-		# zero rows so the offset is always non-negative.  Pad rows
-		# correspond to global bands [window_lo - front_pad,
-		# window_lo); the L/R mask zeros their contribution to the
-		# einsum (math-neutral).
+		# which can be NEGATIVE when bc starts below the window AND
+		# the slice (offset, offset+bpd_max_global) can extend PAST
+		# the window when bc spans the upper boundary or the final bc
+		# is short.  We pre-pad psi_l_X / psi_r_X at BOTH ends with
+		# zero rows so that the dynamic_slice never goes out of
+		# bounds — which would otherwise trigger XLA's silent clamp
+		# (start clamped to ``axis_size - slice_size``), producing
+		# *physically wrong bands* that the L/R mask CANNOT recover
+		# (the mask's index assumes the slice covers
+		# ``[bc.lo, bc.lo+bpd_max_global)`` but the clamp returns
+		# something else).  See round6_discussion.md:506 BLOCKER from
+		# Agent 4.  Pad rows correspond to out-of-window global bands;
+		# the L/R mask zeros their contribution to the einsum
+		# (math-neutral) — same contract as the front-pad rows.
 		front_pad_l = max(
 			(max(0, L_lo_g - lo) for (lo, _hi) in bcr), default=0)
 		front_pad_r = max(
@@ -522,6 +530,17 @@ def z_q_from_psi_sm(
 		_psi_r_X_bc_offset_np = np.asarray(
 			[lo - R_lo_g + front_pad_r for (lo, _hi) in bcr],
 			dtype=np.int32)
+		# Back-pad: the slice (offset, offset+bpd_max_global) must fit
+		# entirely within the padded array (front_pad + nb + back_pad).
+		# The largest end-offset across all bcs determines the back-pad.
+		_max_end_l = int(max(
+			(off + bpd_max_global for off in _psi_l_X_bc_offset_np),
+			default=0))
+		_max_end_r = int(max(
+			(off + bpd_max_global for off in _psi_r_X_bc_offset_np),
+			default=0))
+		back_pad_l = max(0, _max_end_l - (front_pad_l + nb_l))
+		back_pad_r = max(0, _max_end_r - (front_pad_r + nb_r))
 		ngkmax = int(_psi_G_store._per_rank_shape[3])
 
 		# Slicer needs static `out_sds`; close over the padded shape.
@@ -574,14 +593,22 @@ def z_q_from_psi_sm(
 			# X-side offset would otherwise be negative; bands at
 			# position [0, front_pad) are zeros, masked-zero in the
 			# einsum).  Static front_pad_* baked at trace.
-			if front_pad_l > 0:
+			# Pad both ends.  Front-pad covers bc.lo < window_lo
+			# (negative offset case); back-pad covers
+			# bc.lo + bpd_max_global > window_lo + nb (out-of-bounds
+			# end case — XLA's dynamic_slice would otherwise silently
+			# clamp the start, producing wrong bands the L/R mask
+			# can't recover; see round6_discussion.md:506 BLOCKER).
+			if front_pad_l > 0 or back_pad_l > 0:
 				psi_l_X_padded = jnp.pad(
-					psi_l_X_, ((0, 0), (0, 0), (front_pad_l, 0), (0, 0)))
+					psi_l_X_,
+					((0, 0), (0, 0), (front_pad_l, back_pad_l), (0, 0)))
 			else:
 				psi_l_X_padded = psi_l_X_
-			if front_pad_r > 0:
+			if front_pad_r > 0 or back_pad_r > 0:
 				psi_r_X_padded = jnp.pad(
-					psi_r_X_, ((0, 0), (0, 0), (front_pad_r, 0), (0, 0)))
+					psi_r_X_,
+					((0, 0), (0, 0), (front_pad_r, back_pad_r), (0, 0)))
 			else:
 				psi_r_X_padded = psi_r_X_
 
