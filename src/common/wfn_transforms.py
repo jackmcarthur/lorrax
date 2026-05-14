@@ -51,8 +51,9 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 __all__ = [
     "to_box", "to_rbox", "to_rmu", "to_rchunk",
+    "to_rmu_inner", "to_rchunk_inner",
     "apply_bloch_phase", "apply_bloch_phase_on_slice",
-    "gflat_to_rchunk",
+    "gflat_to_rmu", "gflat_to_rchunk",
     "accumulate_rchunk_to_gflat",
 ]
 
@@ -762,6 +763,329 @@ def gflat_to_rchunk(
 
     r0_arg = (jnp.int32(int(r0)) if isinstance(r0, (int, np.integer)) else r0)
     return fn(psi_G, r0_arg)
+
+
+# ---------------------------------------------------------------------------
+# G-flat → r-centroid helpers.  ``to_rmu_inner`` is the pure-jax body of
+# :func:`to_rmu` (callable from inside another shard_map or scan body),
+# and ``gflat_to_rmu`` is the bc-scan-inside-shard_map twin of
+# :func:`gflat_to_rchunk` for the centroid-sample direction.
+# ---------------------------------------------------------------------------
+#
+# Same Defect 1 / Defect 3 family as the r-slab pair: the legacy
+# centroid-load path bc-loops outside ``to_rmu`` and ``to_rmu`` itself
+# materialises an unsharded ``c128[nk, band_chunk, ns, nx, ny, nz]``
+# FFT box on every rank (Peak A in the planner — single slot, but the
+# §0 principle treats unsharded-on-every-rank as a violation regardless
+# of slot count).  ``gflat_to_rmu`` collapses both the bc-loop AND the
+# inner unsharded FFT box into one shard_map + lax.scan, mirroring
+# :func:`gflat_to_rchunk` modulo the r-slab → centroid-sample swap.
+
+def to_rmu_inner(
+    psi: jax.Array,
+    g_index: jax.Array,
+    fft_grid: Sequence[int],
+    r_mu: jax.Array,
+    *,
+    norm: str = "backward",
+    kvecs_frac: jax.Array | None = None,
+) -> jax.Array:
+    """Per-rank-local body of :func:`to_rmu`: G-flat → FFT-box → IFFT
+    → centroid sample → optional Bloch phase.
+
+    No ``shard_map`` wrapper.  Callable from inside another shard_map's
+    body or a ``lax.scan`` body — the caller is responsible for any
+    sharding context.  Inputs and outputs are all per-rank-local arrays.
+
+    Mirror of :func:`to_rchunk_inner` for the centroid-sample direction.
+    Mathematically identical to the body of :func:`to_rmu`; the only
+    difference is that this version does not enter a shard_map.
+
+    Inputs
+    ------
+    psi
+        Shape ``(..., ngkmax)`` c128 — caller's responsibility to have
+        already partitioned data across ranks if running under a
+        shard_map.  Leading axes must contain exactly 3 dims before the
+        trailing ``ngkmax`` so the post-IFFT reshape lands at
+        ``(..., nx, ny, nz)`` — typically ``(nk_local, nb_local, ns,
+        ngkmax)``.
+    g_index
+        Shape ``(..., ngkmax)`` int32 — flat box indices for each
+        G-vector per k.  Same broadcast contract as :func:`to_rmu`.
+    fft_grid
+        ``(nx, ny, nz)``.
+    r_mu
+        Shape ``(n_rmu, 3)`` int32 — FFT-grid coordinates of the
+        centroid sample points.
+    norm
+        FFT normalization, same conventions as ``jnp.fft.ifftn``.
+    kvecs_frac
+        Optional ``(n_k, 3)`` float64 — when provided, the Bloch
+        phase ``exp(+2πi k·r)`` is applied to the full FFT box via
+        :func:`apply_bloch_phase` before the centroid gather (same as
+        :func:`to_rmu`'s body).
+
+    Output
+    ------
+    jax.Array
+        Shape ``(..., n_rmu)`` c128.
+    """
+    ngkmax = int(psi.shape[-1])
+    fft_grid_t = tuple(int(s) for s in fft_grid)
+    box = _box_kernel(psi, g_index, ngkmax=ngkmax)
+    rb = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+    if kvecs_frac is not None:
+        rb = apply_bloch_phase(rb, kvecs_frac, fft_grid_t)
+    # Gather centroid cells: trailing (nx, ny, nz) → (n_rmu,).
+    out = rb[..., r_mu[:, 0], r_mu[:, 1], r_mu[:, 2]]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Structural fix: shard_map + scan over chunks of the flat (nk · nb_local)
+# axis, mirroring :func:`gflat_to_rchunk` but with the centroid-sample
+# gather in place of the r-slab slice.  Inside the scan body XLA's
+# allocator aliases the per-iter FFT box across iters, so the slot count
+# for that buffer-class collapses to 1 — and inside the shard_map the
+# FFT box is per-rank-local (NOT replicated on every rank) so the
+# unsharded-FFT-box violation in the legacy ``to_rmu`` path is closed.
+
+_GFLAT_TO_RMU_CACHE: dict = {}
+
+
+def gflat_to_rmu(
+    psi_G: jax.Array,
+    g_index: np.ndarray | jax.Array,
+    r_mu: np.ndarray | jax.Array,
+    *,
+    mesh: Mesh,
+    fft_grid: Sequence[int],
+    kvecs_frac: np.ndarray | jax.Array | None = None,
+    norm: str = "backward",
+    chunk_size: int | None = None,
+) -> jax.Array:
+    """ψ(G-flat) → ψ at centroid grid points, fused over all (k, n).
+
+    Shapes / shardings (mesh = ``('x', 'y')`` of size ``P = p_x · p_y``)::
+
+        psi_G   : (nk, nb_total, ns, ngkmax)  P(None, ('x','y'), None, None)
+        return  : (nk, nb_total, ns, n_rmu)   P(None, ('x','y'), None, None)
+
+    ``nb_total`` must be divisible by ``mesh.size``.  Each rank owns a
+    ``nb_local = nb_total / P`` block of bands across the full
+    ``(nk, ns, ngkmax)`` extent and writes the same band block to the
+    output.
+
+    Algorithm — inside a single ``shard_map`` over ``('x','y')``:
+
+      1. Flatten per-rank ``(nk, nb_local) → N = nk · nb_local`` rows so
+         every row is a single ``(k, n)`` pair.
+      2. Zero-pad ``N → ⌈N / cs⌉ · cs`` so the chunk count is exact.
+      3. ``lax.scan`` over chunks of ``cs`` rows.  Each iteration:
+         a. ``k_row[cs] = (i·cs + arange(cs)) // nb_local`` —
+            which k each row belongs to.  Clipped to ``[0, nk)``;
+            padding rows land on k = nk - 1 but their data is zero
+            (zero-pad) so the centroid samples they produce are
+            zero and get truncated in ``out_flat[:N]``.
+         b. ``_box_kernel(sub[cs, 1, ns, ngkmax], g_index[k_row])``
+            scatters G-sphere coeffs into a per-row FFT box
+            ``(cs, 1, ns, nx, ny, nz)``.  Singleton ``nb`` axis is
+            squeezed.
+         c. ``jnp.fft.ifftn`` on the trailing 3 axes — per-rank-local
+            cuFFT, no resharding.
+         d. Gather centroid cells: ``rb[:, :, r_mu[:,0], r_mu[:,1],
+            r_mu[:,2]]`` → ``(cs, ns, n_rmu)``.
+         e. Optional per-row Bloch phase ``exp(+2πi k·r_mu)`` applied
+            on the *gathered cells only* (not on the full box) —
+            ``apply_bloch_phase``-equivalent under the gather, but
+            scratch drops from ``(cs · n_rtot)`` to ``(cs · n_rmu)``.
+         f. ``dynamic_update_slice_in_dim`` writes the row block into
+            ``out_flat`` at offset ``i·cs``.
+
+    Chunking is on the flat ``(k · n_local)`` axis so the chunk size
+    is a free integer — no divisibility constraint on either nk or
+    nb_local.  Defaults to one-shot (``cs = N``); the scan compiles to a
+    single iteration that XLA folds away.  Per-iteration FFT-box
+    transient is ``cs · ns · n_rtot · 16`` bytes — choose ``chunk_size``
+    to bound this against the per-rank HBM budget.
+
+    Parameters
+    ----------
+    psi_G
+        ``(nk, nb_total, ns, ngkmax)`` c128, band-flat-sharded.
+    g_index
+        ``(nk, nx, ny, nz)`` int32 — flat-FFT-box indices.  Sentinel
+        value ``ngkmax`` flags empty box cells (zero on gather).
+        Replicated.
+    r_mu
+        ``(n_rmu, 3)`` int32 — FFT-grid coordinates of the centroid
+        sample points.  Replicated.
+    mesh
+        Process mesh with named axes ``'x'`` and ``'y'``.
+    fft_grid
+        Static ``(nx, ny, nz)``.
+    kvecs_frac
+        Optional ``(nk, 3)`` fractional k-vectors.  When given, the
+        gathered samples are multiplied by ``exp(+2πi k·r_mu)`` per
+        ``(k, r_mu)`` pair (separable in x/y/z; pre-computed once per
+        k).  ``None`` skips the phase.
+    norm
+        Forwarded to :func:`jnp.fft.ifftn`.  Defaults to ``"backward"``
+        to match the legacy :func:`to_rmu` default; centroid-load
+        callers typically pass ``"ortho"``.
+    chunk_size
+        Rows per scan iteration along the flat ``(k · n_local)``
+        axis.  Default ``None`` ⇒ one-shot.  Memory bound:
+        ``chunk_size · ns · n_rtot · 16 B`` for the per-iteration FFT
+        box.
+
+    Returns
+    -------
+    ``(nk, nb_total, ns, n_rmu)`` c128 with ``P(None, ('x','y'),
+    None, None)`` sharding.
+    """
+    fft_grid_t = tuple(int(s) for s in fft_grid)
+    nx, ny, nz = fft_grid_t
+    n_rtot = nx * ny * nz
+    nk        = int(psi_G.shape[0])
+    nb_total  = int(psi_G.shape[1])
+    ns        = int(psi_G.shape[2])
+    ngkmax    = int(psi_G.shape[3])
+    r_mu_arr  = np.ascontiguousarray(np.asarray(r_mu, dtype=np.int32))
+    if r_mu_arr.ndim != 2 or int(r_mu_arr.shape[1]) != 3:
+        raise ValueError(
+            f"gflat_to_rmu: r_mu must be (n_rmu, 3); got shape "
+            f"{r_mu_arr.shape}.")
+    n_rmu     = int(r_mu_arr.shape[0])
+    p_prod    = int(np.prod([mesh.shape[a] for a in mesh.axis_names]))
+    if nb_total % p_prod != 0:
+        raise ValueError(
+            f"gflat_to_rmu: nb_total={nb_total} not divisible by "
+            f"mesh.size={p_prod}.")
+    nb_local = nb_total // p_prod
+    N        = nk * nb_local
+
+    g_arr = np.asarray(g_index, dtype=np.int32)
+    if g_arr.ndim != 4 or int(g_arr.shape[0]) != nk:
+        raise ValueError(
+            f"gflat_to_rmu: g_index must be (nk, nx, ny, nz); got "
+            f"shape {g_arr.shape}, expected nk={nk}.")
+    if tuple(int(s) for s in g_arr.shape[1:]) != fft_grid_t:
+        raise ValueError(
+            f"gflat_to_rmu: g_index trailing shape {g_arr.shape[1:]} "
+            f"≠ fft_grid {fft_grid_t}.")
+
+    # r_mu range check (Python int values; replicated, OK to validate
+    # at trace time).
+    if (np.any(r_mu_arr[:, 0] < 0) or np.any(r_mu_arr[:, 0] >= nx)
+            or np.any(r_mu_arr[:, 1] < 0) or np.any(r_mu_arr[:, 1] >= ny)
+            or np.any(r_mu_arr[:, 2] < 0) or np.any(r_mu_arr[:, 2] >= nz)):
+        raise ValueError(
+            f"gflat_to_rmu: r_mu has out-of-range coords for "
+            f"fft_grid {fft_grid_t}.")
+
+    cs       = int(chunk_size if chunk_size else N)
+    n_chunks = (N + cs - 1) // cs
+    pad_N    = n_chunks * cs - N
+
+    if kvecs_frac is None:
+        kvecs_shape = None
+        kvecs_id = None
+    else:
+        kvecs_arr = np.ascontiguousarray(np.asarray(kvecs_frac, dtype=np.float64))
+        kvecs_shape = tuple(int(s) for s in kvecs_arr.shape)
+        # Content-hash kvecs — same lesson as gflat_to_rchunk: the
+        # per-k phase tables (phx/phy/phz) bake into the cached
+        # closure, so shape-only keying would silently reuse stale
+        # tables when a different caller passes new kvecs_frac.
+        kvecs_id = hash(kvecs_arr.tobytes())
+    g_index_id = hash(g_arr.tobytes())
+    r_mu_id    = hash(r_mu_arr.tobytes())
+
+    key = (
+        tuple(int(s) for s in psi_G.shape),
+        fft_grid_t, n_rmu, r_mu_id, ngkmax, g_index_id,
+        norm, kvecs_shape, kvecs_id, cs, n_chunks, pad_N,
+        _sharding_key(psi_G),
+    )
+    fn = _GFLAT_TO_RMU_CACHE.get(key)
+    if fn is None:
+        # Per-k phase tables and centroid-coord constants baked into the
+        # closure.  r_mu is replicated so we can index the per-row
+        # phases by r_mu directly inside the scan body.
+        g_index_c = jnp.asarray(g_arr, dtype=jnp.int32)
+        r_mu_c    = jnp.asarray(r_mu_arr, dtype=jnp.int32)
+        if kvecs_frac is not None:
+            kv = jnp.asarray(np.asarray(kvecs_frac), dtype=jnp.float64)
+            # Forward Bloch phase: sign = +1 (post-IFFT, ψ = exp(+2πi k·r)·u).
+            _ph = lambda k_axis, n: jnp.exp(
+                +2j * jnp.pi * k_axis[:, None] * (jnp.arange(n) / n)[None, :])
+            phx, phy, phz = _ph(kv[:, 0], nx), _ph(kv[:, 1], ny), _ph(kv[:, 2], nz)
+            # Per-centroid 1D-phase columns: (nk, n_rmu) each.
+            phx_rmu_all = phx[:, r_mu_c[:, 0]]    # (nk, n_rmu)
+            phy_rmu_all = phy[:, r_mu_c[:, 1]]
+            phz_rmu_all = phz[:, r_mu_c[:, 2]]
+        else:
+            phx_rmu_all = phy_rmu_all = phz_rmu_all = None
+
+        in_spec  = P(None, ('x', 'y'), None, None)
+        out_spec = P(None, ('x', 'y'), None, None)
+
+        @partial(shard_map, mesh=mesh,
+                 in_specs=(in_spec,),
+                 out_specs=out_spec,
+                 check_rep=False)
+        def _kernel(psi_):
+            # Per-rank: (nk, nb_local, ns, ngkmax).
+            psi_flat = psi_.reshape(N, ns, ngkmax)
+            if pad_N:
+                psi_flat = jnp.pad(
+                    psi_flat, ((0, pad_N), (0, 0), (0, 0)))
+            out_flat = jnp.zeros(
+                (N + pad_N, ns, n_rmu), dtype=psi_.dtype)
+
+            def body(out, i):
+                i0    = i * cs
+                sub   = jax.lax.dynamic_slice_in_dim(
+                    psi_flat, i0, cs, axis=0)            # (cs, ns, ngkmax)
+                k_row = jnp.clip(
+                    (i0 + jnp.arange(cs)) // nb_local, 0, nk - 1)  # (cs,)
+                # Singleton-nb reshape so _box_kernel's (n_k, nb, ns,
+                # ngkmax) contract takes (cs, 1, ns, ngkmax) per row.
+                # Per-row g_index gather: (cs, nx, ny, nz).
+                sub4 = sub.reshape(cs, 1, ns, ngkmax)
+                g_per_row = g_index_c[k_row]
+                box = _box_kernel(
+                    sub4, g_per_row, ngkmax=ngkmax)      # (cs, 1, ns, nx, ny, nz)
+                box = box.reshape(cs, ns, nx, ny, nz)
+                rb = jnp.fft.ifftn(box, axes=(-3, -2, -1), norm=norm)
+                # Centroid gather — (cs, ns, n_rmu).
+                samples = rb[:, :, r_mu_c[:, 0], r_mu_c[:, 1], r_mu_c[:, 2]]
+                if phx_rmu_all is not None:
+                    # Per-row Bloch phase at the gathered centroid
+                    # cells — apply_bloch_phase is multiplicative on the
+                    # spatial axes, so applying it post-gather is
+                    # algebraically identical to applying it on the
+                    # full FFT box before gather (cf. gflat_to_rchunk's
+                    # phase-on-slice pattern).
+                    phx_q = phx_rmu_all[k_row]           # (cs, n_rmu)
+                    phy_q = phy_rmu_all[k_row]
+                    phz_q = phz_rmu_all[k_row]
+                    samples = samples * (phx_q * phy_q * phz_q)[:, None, :]
+                return jax.lax.dynamic_update_slice_in_dim(
+                    out, samples, i0, axis=0), None
+
+            out_flat, _ = jax.lax.scan(
+                body, out_flat, jnp.arange(n_chunks, dtype=jnp.int32))
+            if pad_N:
+                out_flat = out_flat[:N]
+            return out_flat.reshape(nk, nb_local, ns, n_rmu)
+
+        fn = jax.jit(_kernel)
+        _GFLAT_TO_RMU_CACHE[key] = fn
+
+    return fn(psi_G)
 
 
 # ---------------------------------------------------------------------------
