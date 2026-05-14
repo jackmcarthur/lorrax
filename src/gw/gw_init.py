@@ -624,26 +624,11 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		else (int(gflat_plan.gflat_chunk_size)
 		      if gflat_plan.gflat_chunk_size is not None else 0))
 
-	# ``gflat_to_rchunk`` chunk size — forward ψ(G)→ψ(rchunk) inside
-	# _make_fit_one_rchunk_kernel._kernel.  Per-iter FFT box on each rank
-	# is ``cs · ns · n_rtot · 16`` bytes; cap at ~50% of the per-device
-	# budget so two scan iters fit comfortably.  Cohsex.in > 0 wins;
-	# otherwise auto-pick from ``cfg.memory.per_device_gb``.  When the
-	# auto pick lands at ≥ N (the per-rank flat (k · nb_local) row
-	# count), pass 0 ⇒ helper defaults to one-shot (single scan iter,
-	# folded away by XLA).
-	if cfg.memory.gflat_to_rchunk_chunk_size > 0:
-		chunks['gflat_to_rchunk_chunk_size'] = int(cfg.memory.gflat_to_rchunk_chunk_size)
-	else:
-		_p_prod = int(jax.device_count())
-		_nb_local = int(meta.b_id_4) // _p_prod
-		_N_rows = int(meta.nk_tot) * _nb_local
-		_ns = int(meta.nspinor)
-		_box_bytes_per_row = _ns * int(meta.n_rtot) * 16
-		_budget_bytes = int(0.5 * float(cfg.memory.per_device_gb) * (1 << 30))
-		_cs_auto = max(1, _budget_bytes // max(1, _box_bytes_per_row))
-		chunks['gflat_to_rchunk_chunk_size'] = (
-			0 if _cs_auto >= _N_rows else int(_cs_auto))
+	# Round 6 deleted the ``gflat_to_rchunk_chunk_size`` cohsex knob —
+	# the new ``z_q_from_psi_sm`` streaming-scan body has no
+	# user-facing chunk size (per-iter FFT box is bounded by the
+	# rank's bpd_per_bc · ns · n_rtot · 16, set by the planner-picked
+	# ``band_chunk_size``).
 
 	zeta_h5_path = os.path.join(tmp_dir, "zeta_q.h5")
 	print_fn(f"\n  Chunked ISDF fitting:")
@@ -652,8 +637,6 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	print_fn(f"    Q chunks:    {chunks['q_chunk']}")
 	if chunks.get('gflat_chunk_size') is not None:
 		print_fn(f"    GFlat cs:    {chunks['gflat_chunk_size']}")
-	if chunks.get('gflat_to_rchunk_chunk_size'):
-		print_fn(f"    G→r cs:      {chunks['gflat_to_rchunk_chunk_size']}")
 	print_fn(f"    Zeta output: {zeta_h5_path}")
 
 	# Band norms for pseudobands normalization (1.0 for deterministic bands)
@@ -721,7 +704,6 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			cusolvermp_charge=cfg.backend.cusolvermp_charge,
 			cusolvermp_lu=cfg.backend.cusolvermp_lu,
 			gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
-			gflat_to_rchunk_chunk_size=int(chunks.get('gflat_to_rchunk_chunk_size', 0)),
 			write_ibz_only=_write_ibz_only_charge,
 			zeta_cutoff_ry=_zeta_cutoff,
 		)
@@ -845,7 +827,6 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					cusolvermp_charge=cfg.backend.cusolvermp_charge,
 					cusolvermp_lu=cfg.backend.cusolvermp_lu,
 					gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
-					gflat_to_rchunk_chunk_size=int(chunks.get('gflat_to_rchunk_chunk_size', 0)),
 					vertex_mu_L=mu_L,
 					# TODO(bispinor-ibz): port compute_V_q_bispinor_to_h5
 					# to consume IBZ-only ζ + post-loop unfold, then

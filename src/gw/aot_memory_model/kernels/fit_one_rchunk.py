@@ -1,17 +1,17 @@
 """fit_one_rchunk: driver-level AOT of the per-r-chunk zeta fit body.
 
 Mirrors ``common.isdf_fitting.fit_one_rchunk`` — the jit that covers
-the full ψ(G) → ψ(rchunk) transform (one shard_map+scan via
-``gflat_to_rchunk``), pair-density streaming (spin-traced), ZCT,
-Z-col reshard, and Cholesky solve, all in one HLO.  AOT-lowering this
-captures the driver-level memory high-water mark including *coexisting*
-buffers (ψ(G) device tensor + centroid copies + L_q + live P_l/P_r +
-per-scan-iter FFT box), which per-stage kernels cannot model.
+the full streaming pair-density loop (one shard_map+scan in
+``z_q_from_psi_sm``), Z-col reshard, and Cholesky solve, all in one
+HLO.  AOT-lowering this captures the driver-level memory high-water
+mark including *coexisting* buffers (centroid copies + L_q + rank-5
+P_l/P_r carries + per-scan-iter FFT box), which per-stage kernels
+cannot model.
 
 Input shapes (all complex128 unless noted):
     [ψ(G) is NO LONGER a jit arg.  ψ(G) lives on host; the jit body
-     pulls it once via ``PsiGStore.psi_G_device_full`` (a shard_map +
-     io_callback) and feeds it into ``gflat_to_rchunk``.]
+     pulls one bc per scan iter via ``PsiGStore._slice_local_tile_bc``
+     (an io_callback inside ``z_q_from_psi_sm._local``'s scan body).]
     psi_l_rmuT_X_fit : (n_k, n_rmu, n_b_l, n_s) on P(None, None, 'x', None)
     psi_r_rmuT_X_fit : (n_k, n_rmu, n_b_r, n_s) on P(None, None, 'x', None)
     L_q              : (n_q, n_rmu, n_rmu) on P(None, 'x', 'y')
@@ -26,15 +26,18 @@ Key primitives dominating driver-level peak (observed empirically):
   * ``PrBc``   = 16 · B_r · (4·n_k + n_q) · n_rmu / (p_x · p_y)
                  (ZCT stage) — 4 concurrent pair-density-sized temps.
   * ``Pacc``   = 16 · n_k · n_rmu · B_r / (p_x · p_y)
-                 (P_l + P_r accumulators, 2 copies, persistent across bc loop).
-  * ``psi_Y_full`` = 16 · n_k · n_b · n_s · B_r / (p_x · p_y)
-                 (full per-rank ψ(rchunk) tensor produced by
-                 ``gflat_to_rchunk``; alive during the pair-density step).
-  * ``fft_box``  = 16 · cs · n_s · n_r
-                 (per-scan-iter FFT box inside ``gflat_to_rchunk``;
-                 aliased across scan iters by XLA — a single slot).
+                 (P_l + P_r rank-5 carries, alive across the bc-scan;
+                 2 carries → 2× this term).
+  * ``psi_Y_bc_local`` = 16 · n_k · bpd_per_bc · n_s · r_loc
+                 (per-iter ψ(rchunk) slab returned by
+                 ``to_rchunk_inner`` inside the bc-scan body — aliased
+                 across iters by XLA's scan-internal allocator, single
+                 slot).
+  * ``fft_box``  = 16 · n_k · bpd_per_bc · n_s · n_r
+                 (per-iter FFT box inside ``to_rchunk_inner`` —
+                 aliased across iters, single slot).
   * ``psi_cent`` = 16 · n_k · n_rmu · (n_b_l + n_b_r) · n_s / p_x
-                 (centroid copies: always alive, cheap-ish).
+                 (centroid copies: always alive).
   * ``L_q_shard`` = 16 · n_q · n_rmu^2 / (p_x · p_y)
                  (L factor: always alive).
 
@@ -42,16 +45,15 @@ Knobs:
     * ``chunk_r``  (r-slab width; primary DoE axis for driver peak)
     * ``band_chunk`` (bc_size for the streaming pair-density)
 
-Note: the production kernel pulls the full ψ(G) tile from a host-side
-:class:`common.psi_G_store.PsiGStore` via the lazy
-``psi_G_device_full`` property, then runs one ``gflat_to_rchunk`` call
-for the full (k · n_local) flat axis.  For AOT memory analysis we plug
-in an ``_AotStubPsiGStore`` whose ``psi_G_device_full`` returns zeros
-of the correct per-device shape via the same shard_map + io_callback
-pattern as production, so the compiled HLO has the same
-io_callback → ``gflat_to_rchunk`` structure.  The io_callback does not
-itself allocate persistent device memory — the peak it contributes is
-captured in the per-scan-iter FFT box (``fft_box`` primitive).
+Note: production pulls each bc via ``_slice_local_tile_bc`` (an
+io_callback inside the scan body inside the shard_map).  For AOT
+memory analysis we plug in an ``_AotStubPsiGStore`` whose
+``_slice_local_tile_bc`` returns zeros of the correct per-rank padded
+shape ``(nk, _bpd_max, ns, ngkmax)``, so the compiled HLO has the
+same io_callback → IFFT → all_gather → einsum structure as
+production.  The io_callback does not allocate persistent device
+memory; the peak it contributes is the per-scan-iter slab
+(``psi_Y_bc_local`` primitive), aliased across iters.
 """
 from __future__ import annotations
 
@@ -71,55 +73,46 @@ class _AotStubPsiGStore:
     """AOT-only :class:`common.psi_G_store.PsiGStore` stand-in.
 
     Mirrors the surface the production ``_make_fit_one_rchunk_kernel``
-    consumes after the Path D rewrite: ``psi_G_device_full`` returns a
-    sharded zero tensor in ``(nk, nb_local_total, ns, ngkmax)`` layout
-    via the same shard_map+io_callback the real store uses, plus
-    ``g_index`` / ``kvecs_frac`` as device-resident replicated tensors.
-    Strictly for AOT peak measurement; never actually executed.
+    consumes after the Round 6 streaming-scan rewrite: the
+    ``z_q_from_psi_sm`` body pulls one bc per scan iter via
+    ``_slice_local_tile_bc(x_idx, y_idx, bc_idx)`` (returns
+    ``(nk, _bpd_max, ns, ngkmax)`` zeros), then ``g_index`` /
+    ``kvecs_frac`` as device-resident replicated tensors.  Strictly for
+    AOT peak measurement; never actually executed.
     """
 
     def __init__(self, mesh: Mesh, meta, band_chunk_ranges, ngkmax: int):
         self.mesh = mesh
-        self.band_chunk_ranges = band_chunk_ranges
+        self.band_chunk_ranges = tuple(tuple(bc) for bc in band_chunk_ranges)
         p = int(mesh.shape['x']) * int(mesh.shape['y'])
-        nb_total = int(band_chunk_ranges[-1][1] - band_chunk_ranges[0][0])
-        assert nb_total % p == 0, (
-            f"nb_total={nb_total} must divide total devices {p}")
-        nb_local = nb_total // p
         nk = int(meta.nk_tot)
         ns = int(meta.nspinor)
         nx, ny, nz = meta.fft_grid
-        self._per_device_shape = (nk, nb_local, ns, int(ngkmax))
-        self._g_index_shape    = (nk, nx, ny, nz)
-        self._kvecs_shape      = (nk, 3)
-        self._psi_G_device_full = None
-        self._g_index_dev = None
+        # bpd_per_bc / _bpd_max / _bc_band_offsets mirror the production
+        # PsiGStore layout (host tile bc-stacked over P ranks).
+        bpd_per_bc = [(b_hi - b_lo) // p for (b_lo, b_hi) in self.band_chunk_ranges]
+        self._bpd_per_bc = tuple(bpd_per_bc)
+        self._bpd_max = max(bpd_per_bc) if bpd_per_bc else 0
+        offsets = [0]
+        for bpd in bpd_per_bc:
+            offsets.append(offsets[-1] + bpd)
+        self._bc_band_offsets = tuple(offsets)
+        self._per_rank_shape = (nk, offsets[-1], ns, int(ngkmax))
+        self._g_index_shape  = (nk, nx, ny, nz)
+        self._kvecs_shape    = (nk, 3)
+        self._g_index_dev    = None
         self._kvecs_frac_dev = None
+        self._zero_slab = np.zeros(
+            (nk, self._bpd_max, ns, int(ngkmax)), dtype=np.complex128)
 
     def begin_rchunk(self, *_): pass
     def end_rchunk(self): pass
     def close(self): pass
 
-    @property
-    def psi_G_device_full(self):
-        if self._psi_G_device_full is not None:
-            return self._psi_G_device_full
-        per_dev = self._per_device_shape
-        out_sds = jax.ShapeDtypeStruct(per_dev, jnp.complex128)
-        spec = P(None, ('x', 'y'), None, None)
-        zeros = np.zeros(per_dev, dtype=np.complex128)
-
-        def _cb(_x, _y):
-            return zeros
-
-        @partial(shard_map, mesh=self.mesh,
-                 in_specs=(), out_specs=spec, check_rep=False)
-        def _sm():
-            x = jax.lax.axis_index('x')
-            y = jax.lax.axis_index('y')
-            return io_callback(_cb, out_sds, x, y, ordered=True)
-        self._psi_G_device_full = _sm()
-        return self._psi_G_device_full
+    def _slice_local_tile_bc(self, x_idx, y_idx, bc_idx) -> np.ndarray:
+        # AOT model: contents don't matter (peak measurement only); just
+        # the right shape every iter.
+        return self._zero_slab
 
     @property
     def g_index(self):

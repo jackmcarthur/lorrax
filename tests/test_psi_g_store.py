@@ -51,11 +51,11 @@ def test_zero_user_band_pad_in_shard_rejects_strided_band_slice():
 
 
 # ---------------------------------------------------------------------------
-# psi_G_device_full lazy property — Path D integration consumer entry point.
-# Built without going through HostPsiGStore so the test stays free of WfnLoader
-# / Meta plumbing: subclasses PsiGStore, populates _host_tiles directly with a
-# random ψ(G) tile, and verifies the round-trip through the io_callback
-# shard_map.
+# _slice_local_tile_bc — per-iter host-tile slicer used by the io_callback
+# inside the new c_q_from_psi_sm / z_q_from_psi_sm scan body (Round 6).
+# Built without going through HostPsiGStore so the test stays free of
+# WfnLoader / Meta plumbing: subclasses PsiGStore, populates _host_tiles
+# directly with a random multi-bc ψ(G) tile, and exercises the slicer.
 # ---------------------------------------------------------------------------
 
 
@@ -64,15 +64,12 @@ class _FakePsiGStore(PsiGStore):
 
     Caller hands in a single per-rank tile (shape ``(nk, nb_local, ns,
     ngkmax)``) — installed into ``_host_tiles`` for every (x, y) cell in
-    the mesh. ``begin_rchunk`` / ``end_rchunk`` are no-ops; ``end_rchunk``
-    here triggers ``_clear_tiles`` so the cache-invalidation path is
-    exercised by the test.
+    the mesh — plus a ``band_chunk_ranges`` tuple that defines the
+    bc-stacked band layout.  bc-band offsets and ``_bpd_max`` are
+    derived from ``band_chunk_ranges`` exactly as production code does.
     """
 
-    def __init__(self, *, mesh_xy, tile, ngkmax):
-        # Bypass the parent __init__ — we don't have a loader/meta. Set the
-        # subset of fields ``psi_G_device_full`` reads.  Single bc per the
-        # whole local axis: bc_band_offsets = [0, nb_local].
+    def __init__(self, *, mesh_xy, tile, band_chunk_ranges):
         self.mesh = mesh_xy
         self._dtype = tile.dtype
         from common.psi_G_store import _mesh_device_coords
@@ -81,72 +78,89 @@ class _FakePsiGStore(PsiGStore):
         self._host_tiles = {(x, y): tile.copy() for (x, y) in self._coords.values()}
         self._g_index_dev = None
         self._kvecs_frac_dev = None
-        self._psi_G_device_full = None
-        # One synthetic band-chunk spanning the whole local axis — matches the
-        # production layout when all bands fit in a single bc.
-        self.band_chunk_ranges = ((0, self._per_rank_shape[1]),)
-        self._bc_band_offsets = (0, self._per_rank_shape[1])
+        self.band_chunk_ranges = tuple(tuple(bc) for bc in band_chunk_ranges)
+        # Mesh size = 1 here; bpd_per_bc[i] = (b_hi - b_lo) // 1 = bc_size.
+        bpd_per_bc = [(b_hi - b_lo) for (b_lo, b_hi) in self.band_chunk_ranges]
+        self._bpd_per_bc = tuple(bpd_per_bc)
+        self._bpd_max = max(bpd_per_bc) if bpd_per_bc else 0
+        offsets = [0]
+        for bpd in bpd_per_bc:
+            offsets.append(offsets[-1] + bpd)
+        self._bc_band_offsets = tuple(offsets)
 
     def end_rchunk(self) -> None:
         self._clear_tiles()
 
 
-def test_psi_G_device_full_round_trips_host_tile():
+def test_slice_local_tile_bc_returns_correct_band_window():
+    """Slicer returns each bc's bands of the host tile, padded to bpd_max."""
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
                  axis_names=('x', 'y'))
-    nk, nb_local, ns, ngkmax = 3, 4, 2, 7
+    nk, ns, ngkmax = 3, 2, 5
+    band_chunks = ((0, 4), (4, 8), (8, 10))             # last bc short (bpd=2 vs 4)
+    bpd_max = 4
+    nb_local = 4 + 4 + 2
     rng = np.random.default_rng(11)
     tile = (rng.standard_normal((nk, nb_local, ns, ngkmax))
             + 1j * rng.standard_normal((nk, nb_local, ns, ngkmax))).astype(
         np.complex128)
 
-    store = _FakePsiGStore(mesh_xy=mesh, tile=tile, ngkmax=ngkmax)
-    out = store.psi_G_device_full
-    assert out.shape == tile.shape
-    np.testing.assert_array_equal(np.asarray(out), tile)
+    store = _FakePsiGStore(mesh_xy=mesh, tile=tile, band_chunk_ranges=band_chunks)
+    assert store._bpd_max == bpd_max
 
-    # Lazy + cached: second access returns the same jax.Array (no re-pull).
-    out2 = store.psi_G_device_full
-    assert out2 is out
+    # bc 0: bands [0, 4) — full
+    out0 = store._slice_local_tile_bc(0, 0, 0)
+    assert out0.shape == (nk, bpd_max, ns, ngkmax)
+    np.testing.assert_array_equal(out0[:, :4, :, :], tile[:, 0:4, :, :])
+
+    # bc 1: bands [4, 8) — full
+    out1 = store._slice_local_tile_bc(0, 0, 1)
+    np.testing.assert_array_equal(out1[:, :4, :, :], tile[:, 4:8, :, :])
+
+    # bc 2: bands [8, 10) — short; pad rows must be exactly zero (math-neutral)
+    out2 = store._slice_local_tile_bc(0, 0, 2)
+    assert out2.shape == (nk, bpd_max, ns, ngkmax)
+    np.testing.assert_array_equal(out2[:, :2, :, :], tile[:, 8:10, :, :])
+    assert np.all(out2[:, 2:, :, :] == 0.0)             # pad-rows EXACTLY zero
+    assert out2[:, 2:, :, :].dtype == np.complex128
 
 
-def test_psi_G_device_full_invalidated_by_clear_tiles():
+def test_slice_local_tile_bc_traced_bc_idx_inputs():
+    """Slicer accepts traced int32 scalars (the io_callback contract); resolved
+    to Python ints inside the host fn."""
+    import jax.numpy as jnp_local                       # noqa
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
                  axis_names=('x', 'y'))
-    nk, nb_local, ns, ngkmax = 2, 3, 1, 5
-    rng = np.random.default_rng(12)
-    tile = (rng.standard_normal((nk, nb_local, ns, ngkmax))
-            + 1j * rng.standard_normal((nk, nb_local, ns, ngkmax))).astype(
-        np.complex128)
-    store = _FakePsiGStore(mesh_xy=mesh, tile=tile, ngkmax=ngkmax)
+    nk, ns, ngkmax = 2, 1, 3
+    band_chunks = ((0, 2), (2, 4))
+    tile = np.arange(nk * 4 * ns * ngkmax, dtype=np.complex128).reshape(
+        nk, 4, ns, ngkmax)
 
-    out1 = store.psi_G_device_full
-    np.testing.assert_array_equal(np.asarray(out1), tile)
-
-    # Repopulate the host tile with new data, clear the device cache, then
-    # the next access must re-pull and reflect the new tile.
-    new_tile = (rng.standard_normal((nk, nb_local, ns, ngkmax))
-                + 1j * rng.standard_normal((nk, nb_local, ns, ngkmax))).astype(
-        np.complex128)
-    for k in store._host_tiles:
-        store._host_tiles[k] = new_tile.copy()
-    store.end_rchunk()                                  # triggers _clear_tiles
-    assert store._psi_G_device_full is None             # invalidated
-    # Re-populate and re-pull.
-    for k in list(store._coords.values()):
-        store._host_tiles[k] = new_tile.copy()
-    out2 = store.psi_G_device_full
-    np.testing.assert_array_equal(np.asarray(out2), new_tile)
-    assert out2 is not out1
+    store = _FakePsiGStore(mesh_xy=mesh, tile=tile, band_chunk_ranges=band_chunks)
+    # Traced int32 scalars (what io_callback would pass).
+    x_idx = np.int32(0)
+    y_idx = np.int32(0)
+    bc_idx = np.int32(1)
+    out = store._slice_local_tile_bc(x_idx, y_idx, bc_idx)
+    np.testing.assert_array_equal(out[:, :2, :, :], tile[:, 2:4, :, :])
 
 
-def test_psi_G_device_full_raises_when_tiles_empty():
+def test_slice_local_tile_bc_rejects_out_of_range_bc():
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
                  axis_names=('x', 'y'))
-    nk, nb_local, ns, ngkmax = 1, 1, 1, 3
-    tile = np.zeros((nk, nb_local, ns, ngkmax), dtype=np.complex128)
-    store = _FakePsiGStore(mesh_xy=mesh, tile=tile, ngkmax=ngkmax)
-    store._host_tiles.clear()                           # simulate before begin_rchunk
-    store._psi_G_device_full = None
-    with pytest.raises(RuntimeError, match="begin_rchunk"):
-        _ = store.psi_G_device_full
+    nk, ns, ngkmax = 2, 1, 3
+    tile = np.zeros((nk, 4, ns, ngkmax), dtype=np.complex128)
+    store = _FakePsiGStore(mesh_xy=mesh, tile=tile,
+                            band_chunk_ranges=((0, 2), (2, 4)))
+    with pytest.raises(ValueError, match=r"bc_idx=2 not in"):
+        store._slice_local_tile_bc(0, 0, 2)
+
+
+def test_psi_G_device_full_property_removed():
+    """Round 6 deleted the buggy lazy property + field.  Confirm absence."""
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
+                 axis_names=('x', 'y'))
+    tile = np.zeros((1, 1, 1, 1), dtype=np.complex128)
+    store = _FakePsiGStore(mesh_xy=mesh, tile=tile, band_chunk_ranges=((0, 1),))
+    assert not hasattr(store, "psi_G_device_full")
+    assert not hasattr(store, "_psi_G_device_full")
