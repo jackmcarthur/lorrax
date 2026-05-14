@@ -918,13 +918,22 @@ def accumulate_rchunk_to_gflat(
 
     qvec_shape = (None if qvec_frac is None
                   else tuple(int(s) for s in np.shape(qvec_frac)))
+    # Content-hash qvec_frac so two callers with the same shape but
+    # different q-grids don't silently collide on a cached fn whose
+    # closure holds stale phx/phy/phz tables.  Mirrors the sphere_id
+    # pattern below and gflat_to_rchunk's kvecs_id.  Masked in
+    # production because q-grid is constant per run, but a latent
+    # correctness hazard for any caller that varies qvec_frac
+    # at fixed shape.
+    qvec_id = (0 if qvec_frac is None
+               else hash(np.asarray(qvec_frac, dtype=np.float64).tobytes()))
     sphere_id  = hash(sphere_arr.tobytes())
 
     key = (
         tuple(int(s) for s in rchunk.shape),
         tuple(int(s) for s in gflat_acc.shape),
         fft_grid_t, r_len_i, ngkmax, sphere_id,
-        norm, qvec_shape, cs, n_chunks, pad_N,
+        norm, qvec_shape, qvec_id, cs, n_chunks, pad_N,
         _sharding_key(rchunk), _sharding_key(gflat_acc),
     )
     fn = _RCHUNK_TO_GFLAT_CACHE.get(key)
