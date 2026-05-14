@@ -317,8 +317,8 @@ def _compute_V_q_g_flat_one_tile(
             f"_compute_V_q_g_flat_one_tile[{timing_label}]: zeta_R "
             "layout must be 'G_flat'.")
 
-    from .v_q_tile import (_unfold_v_q_ibz_to_full,
-                            _unfold_g0_ibz_to_full)
+    from .v_q_tile import _unfold_g0_ibz_to_full
+    from common.symmetry_maps import unfold_v_q
 
     # ---- IBZ list + per-tile v(q+G) -----------------------------------
     (_q_int, q_irr_frac,
@@ -461,9 +461,8 @@ def _compute_V_q_g_flat_one_tile(
         # TRS-augmented rows (centroid permutation unchanged under TRS,
         # but the unfold helper conjugates V_q at TRS-tagged q's).
         n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
-        V_acc = _unfold_v_q_ibz_to_full(
-            V_acc, full_to_irr_idx=full_to_irr_idx,
-            full_to_irr_sym=full_to_irr_sym,
+        V_acc = unfold_v_q(
+            V_acc, irr_idx=full_to_irr_idx, sym_idx=full_to_irr_sym,
             sym_perm=sym_perm, mesh_xy=mesh_xy,
             n_sym_spatial=n_sym_spatial)
         if write_g0:

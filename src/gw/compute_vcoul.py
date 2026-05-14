@@ -543,9 +543,9 @@ def make_v_munu_chunked_kernel(
 from .v_q_tile import (
     compute_V_q_tile as _compute_V_q_tile,
     _choose_v_q_chunks,
-    _unfold_v_q_ibz_to_full,
     _unfold_g0_ibz_to_full,
 )
+from common.symmetry_maps import unfold_v_q
 
 
 # ============================================================================
@@ -1033,10 +1033,10 @@ def compute_all_V_q(
         # (2·ntran, n_rmu); the unfold helper applies a TRS-row conj
         # when ``full_to_irr_sym ≥ n_sym_spatial``.
         n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
-        V_acc = _unfold_v_q_ibz_to_full(
+        V_acc = unfold_v_q(
             V_acc,
-            full_to_irr_idx=q_full_to_irr_idx,
-            full_to_irr_sym=q_full_to_irr_sym,
+            irr_idx=q_full_to_irr_idx,
+            sym_idx=q_full_to_irr_sym,
             sym_perm=sym_perm,
             mesh_xy=mesh_xy,
             n_sym_spatial=n_sym_spatial,

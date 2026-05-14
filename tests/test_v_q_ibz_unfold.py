@@ -16,7 +16,8 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import pytest
 
-from gw.v_q_tile import _unfold_v_q_ibz_to_full, _unfold_g0_ibz_to_full
+from common.symmetry_maps import unfold_v_q
+from gw.v_q_tile import _unfold_g0_ibz_to_full
 
 
 def _single_device_mesh() -> Mesh:
@@ -39,10 +40,10 @@ def test_unfold_v_q_identity_sym_is_noop():
     full_to_irr_sym = np.zeros(nq, dtype=np.int32)
     sym_perm = np.arange(n_rmu, dtype=np.int32)[None, :]   # identity
 
-    V_full = _unfold_v_q_ibz_to_full(
+    V_full = unfold_v_q(
         V_ibz,
-        full_to_irr_idx=full_to_irr_idx,
-        full_to_irr_sym=full_to_irr_sym,
+        irr_idx=full_to_irr_idx,
+        sym_idx=full_to_irr_sym,
         sym_perm=sym_perm,
         mesh_xy=mesh,
     )
@@ -71,10 +72,10 @@ def test_unfold_v_q_under_permutation():
     full_to_irr_idx = np.array([0, 0, 1, 1, 0], dtype=np.int32)
     full_to_irr_sym = np.array([0, 1, 0, 1, 1], dtype=np.int32)
 
-    V_full = np.asarray(_unfold_v_q_ibz_to_full(
+    V_full = np.asarray(unfold_v_q(
         V_ibz,
-        full_to_irr_idx=full_to_irr_idx,
-        full_to_irr_sym=full_to_irr_sym,
+        irr_idx=full_to_irr_idx,
+        sym_idx=full_to_irr_sym,
         sym_perm=sym_perm,
         mesh_xy=mesh,
     ))
@@ -118,10 +119,10 @@ def test_unfold_v_q_round_trip_against_eq3():
     V_ibz = jax.device_put(jnp.asarray(V_ibz_np),
                             NamedSharding(mesh, P(None, 'x', 'y')))
 
-    V_full = np.asarray(_unfold_v_q_ibz_to_full(
+    V_full = np.asarray(unfold_v_q(
         V_ibz,
-        full_to_irr_idx=full_to_irr_idx,
-        full_to_irr_sym=full_to_irr_sym,
+        irr_idx=full_to_irr_idx,
+        sym_idx=full_to_irr_sym,
         sym_perm=sym_perm,
         mesh_xy=mesh,
     ))
@@ -145,8 +146,8 @@ def test_unfold_g0_identity_sym_is_noop():
 
     g0_full = _unfold_g0_ibz_to_full(
         g0_ibz,
-        full_to_irr_idx=np.arange(nq, dtype=np.int32),
-        full_to_irr_sym=np.zeros(nq, dtype=np.int32),
+        irr_idx=np.arange(nq, dtype=np.int32),
+        sym_idx=np.zeros(nq, dtype=np.int32),
         sym_perm=np.arange(n_rmu, dtype=np.int32)[None, :],
         mesh_xy=mesh,
     )
@@ -171,8 +172,8 @@ def test_unfold_g0_permutes_mu_axis():
 
     g0_full = np.asarray(_unfold_g0_ibz_to_full(
         g0_ibz,
-        full_to_irr_idx=full_to_irr_idx,
-        full_to_irr_sym=full_to_irr_sym,
+        irr_idx=full_to_irr_idx,
+        sym_idx=full_to_irr_sym,
         sym_perm=sym_perm,
         mesh_xy=mesh,
     ))

@@ -37,7 +37,7 @@ jax.config.update("jax_enable_x64", True)
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from centroid.orbit_syms import compute_centroid_sym_perm
-from gw.v_q_tile import _unfold_v_q_ibz_to_full
+from common.symmetry_maps import unfold_v_q
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +113,7 @@ def _make_mesh():
     return Mesh(devs, ('x', 'y'))
 
 
-def _hand_unfold_v_q(V_ibz, *, full_to_irr_idx, full_to_irr_sym,
+def _hand_unfold_v_q(V_ibz, *, irr_idx, sym_idx,
                      sym_perm, ntran):
     """Reference: pure numpy unfold with the per-q TRS conj rule.
 
@@ -123,12 +123,12 @@ def _hand_unfold_v_q(V_ibz, *, full_to_irr_idx, full_to_irr_sym,
         V_full[q, μ, ν] = conj(V_ibz[parent, π_s^{-1}(μ), π_s^{-1}(ν)])
     """
     inv_perm = np.argsort(sym_perm, axis=-1)
-    n_q_full = full_to_irr_idx.shape[0]
+    n_q_full = irr_idx.shape[0]
     n_rmu = V_ibz.shape[-1]
     V_full = np.zeros((n_q_full, n_rmu, n_rmu), dtype=V_ibz.dtype)
     for iq in range(n_q_full):
-        parent = int(full_to_irr_idx[iq])
-        s = int(full_to_irr_sym[iq])
+        parent = int(irr_idx[iq])
+        s = int(sym_idx[iq])
         perm_inv = inv_perm[s]               # length n_rmu
         is_trs = s >= ntran
         V_perm = V_ibz[parent][np.ix_(perm_inv, perm_inv)]
@@ -170,8 +170,8 @@ def test_unfold_v_q_ibz_to_full_handles_trs_rows():
 
     # Reference unfold.
     V_ref = _hand_unfold_v_q(
-        V_ibz, full_to_irr_idx=full_to_irr_idx,
-        full_to_irr_sym=full_to_irr_sym, sym_perm=sym_perm, ntran=ntran)
+        V_ibz, irr_idx=full_to_irr_idx,
+        sym_idx=full_to_irr_sym, sym_perm=sym_perm, ntran=ntran)
 
     # Codebase unfold.  ``n_sym_spatial=ntran`` opts into the TRS
     # branch (conj at rows where ``full_to_irr_sym ≥ ntran``).
@@ -179,10 +179,10 @@ def test_unfold_v_q_ibz_to_full_handles_trs_rows():
     V_sh = NamedSharding(mesh, P(None, 'x', 'y'))
     V_ibz_j = jax.device_put(V_ibz.astype(np.complex128), V_sh)
     V_full = np.asarray(jax.device_get(
-        _unfold_v_q_ibz_to_full(
+        unfold_v_q(
             V_ibz_j,
-            full_to_irr_idx=full_to_irr_idx,
-            full_to_irr_sym=full_to_irr_sym,
+            irr_idx=full_to_irr_idx,
+            sym_idx=full_to_irr_sym,
             sym_perm=sym_perm, mesh_xy=mesh,
             n_sym_spatial=ntran)))
 
@@ -214,12 +214,17 @@ def test_unfold_v_q_ibz_to_full_hard_fails_without_extend_trs():
     V_sh = NamedSharding(mesh, P(None, 'x', 'y'))
     V_ibz_j = jax.device_put(V_ibz, V_sh)
 
-    with pytest.raises(ValueError, match=r"TRS-augmented"):
-        _unfold_v_q_ibz_to_full(
+    # New API: n_sym_spatial is required. A length-ntran sym_perm
+    # is inconsistent with n_sym_spatial=ntran (which expects 2·ntran
+    # rows), so the consistency check raises before the OOB check.
+    # Either error message is acceptable — they both flag the bug.
+    with pytest.raises(ValueError, match=r"(TRS-augmented|inconsistent)"):
+        unfold_v_q(
             V_ibz_j,
-            full_to_irr_idx=full_to_irr_idx,
-            full_to_irr_sym=full_to_irr_sym,
-            sym_perm=sym_perm_legacy, mesh_xy=mesh)
+            irr_idx=full_to_irr_idx,
+            sym_idx=full_to_irr_sym,
+            sym_perm=sym_perm_legacy, mesh_xy=mesh,
+            n_sym_spatial=ntran)
 
 
 if __name__ == "__main__":

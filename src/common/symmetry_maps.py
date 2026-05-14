@@ -6,8 +6,12 @@
 # module retains the sym-table construction (kpoint_map, R_grid,
 # unfolded_kpts, …) and the kfull-symmap / q-IBZ helpers used by the
 # GW driver.
+from functools import partial
+
 import numpy as np
+import jax
 import jax.numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from file_io import WfnLoader as WFNReader
 
 
@@ -101,6 +105,144 @@ def find_irreducible_bz_points(full_kgrid_int, sym_mats_k, *, irr_kgrid_int=None
         sym_idx = sym_idx_pre
 
     return irr_idx, sym_idx, irr_out
+
+
+def unfold_v_q(
+    V_q_ibz,
+    *,
+    irr_idx,
+    sym_idx,
+    sym_perm,
+    mesh_xy,
+    n_sym_spatial,
+):
+    """Expand ``V_q_ibz`` over the IBZ to the full BZ.
+
+    The mapping is the pure centroid-axis double-permute under {S | τ} —
+    the τ-phases in the ζ transformation rule cancel because V is
+    bilinear in ζ:
+
+        V_full[q, μ', ν'] = V_ibz[i(q), π_{s(q)}^{-1}(μ'), π_{s(q)}^{-1}(ν')]
+
+    where ``i(q) = irr_idx[q]`` and ``s(q) = sym_idx[q]``.
+
+    TRS-augmented rows
+    ------------------
+    ``sym_idx`` values may be in ``[n_sym_spatial, 2·n_sym_spatial)`` for
+    q's that fold to their IBZ parent only via time reversal.  Per-element
+    derivation (``ζ_{-q,μ}(G) = ζ*_{q,μ}(-G)`` combined with ``v(|q+G|)``
+    real-and-even-in-K) gives, for the scalar (charge-channel) V_q::
+
+        V_full[TRS-q, π_s(μ), π_s(ν)] = conj(V_ibz[i(q), μ, ν])
+
+    For Hermitian V_q the conj equals the ν↔μ transpose; we implement
+    conj for clarity (and to keep the helper correct for any future
+    non-Hermitian channels).  The centroid permutation itself is
+    unchanged under TRS (r is fixed); ``sym_perm`` rows ``[ntran:]``
+    duplicate ``[:ntran]``.  Callers build ``sym_perm`` via
+    ``compute_centroid_sym_perm(..., extend_trs=True)`` and pass
+    ``n_sym_spatial=ntran``.
+
+    Parameters
+    ----------
+    V_q_ibz
+        ``(n_q_ibz, n_rmu, n_rmu)`` complex, sharded ``P(None,'x','y')``.
+    irr_idx
+        ``(n_q_full,)`` int — IBZ index per full-BZ q (``sym.irr_idx_q``).
+    sym_idx
+        ``(n_q_full,)`` int — sym row per full-BZ q (``sym.sym_idx_q``).
+        Values in ``[0, 2·n_sym_spatial)``.
+    sym_perm
+        ``(2·n_sym_spatial, n_rmu)`` int — centroid permutation table.
+        Must cover ``max(sym_idx)``; we raise a clear error otherwise
+        rather than relying on JAX's silent OOB clamp.
+    mesh_xy
+        Device mesh; the output is constrained to ``P(None,'x','y')``.
+    n_sym_spatial
+        ``ntran`` — count of spatial-only sym ops in ``sym_perm``'s
+        first half.  Used to identify TRS-augmented rows
+        (``sym_idx >= n_sym_spatial``) and apply the required ``conj``.
+
+    Returns
+    -------
+    V_q_full
+        ``(n_q_full, n_rmu, n_rmu)`` complex, sharded ``P(None,'x','y')``.
+    """
+    # Trivial-IBZ short-circuit. When ntran=1 (e.g. nosym runs) the IBZ is
+    # already the full BZ — irr_idx is identity, sym_idx is all zeros,
+    # sym_perm is identity. The take_along_axis path below is then a
+    # no-op but its sharded codegen has been observed to trip an XLA HLO
+    # verifier dtype mismatch (s64 broadcast vs s32 operand on a 2×2
+    # mesh), so bypass it entirely.
+    idx_np = np.asarray(irr_idx)
+    sym_np = np.asarray(sym_idx)
+    if (idx_np.shape[0] == int(V_q_ibz.shape[0])
+            and np.array_equal(idx_np, np.arange(idx_np.shape[0]))
+            and np.all(sym_np == 0)):
+        return V_q_ibz
+
+    n_sym_perm = int(np.asarray(sym_perm).shape[0])
+    max_sym = int(sym_np.max()) if sym_np.size else -1
+    if max_sym >= n_sym_perm:
+        raise ValueError(
+            f"unfold_v_q: sym_idx contains value {max_sym} but sym_perm "
+            f"has only {n_sym_perm} rows.  Build sym_perm via "
+            f"``compute_centroid_sym_perm(..., extend_trs=True)`` so it "
+            f"covers the TRS-augmented half of ``sym_mats_k``.")
+    if int(n_sym_spatial) * 2 != n_sym_perm:
+        raise ValueError(
+            f"unfold_v_q: n_sym_spatial={n_sym_spatial} is inconsistent "
+            f"with sym_perm.shape[0]={n_sym_perm} — sym_perm must have "
+            f"shape (2·n_sym_spatial, n_rmu).")
+
+    # Inverse permutation: inv_perm[s, π_s(μ)] = μ → argsort along μ.
+    # sym_perm is built from the LOGICAL centroid set (size n_rmu_logical).
+    # V_q_ibz arrives at the PADDED extent n_rmu_padded ≥ n_rmu_logical
+    # (round-up so the V_q kernel's μ/ν shardings divide the mesh).  Pad
+    # inv_perm with identity rows so the gather output matches V_q_ibz's
+    # μ/ν extents and the P(None,'x','y') output sharding is satisfied.
+    inv_perm = np.argsort(sym_perm, axis=-1).astype(np.int32)
+    n_rmu_logical = int(inv_perm.shape[-1])
+    n_rmu_padded = int(V_q_ibz.shape[-1])
+    if n_rmu_padded > n_rmu_logical:
+        pad_block = np.arange(n_rmu_logical, n_rmu_padded, dtype=np.int32)
+        pad_block = np.broadcast_to(
+            pad_block, (inv_perm.shape[0], n_rmu_padded - n_rmu_logical))
+        inv_perm = np.concatenate([inv_perm, pad_block], axis=-1)
+    elif n_rmu_padded != n_rmu_logical:
+        raise ValueError(
+            f"unfold_v_q: V_q_ibz μ-extent {n_rmu_padded} smaller than "
+            f"sym_perm logical extent {n_rmu_logical}; pad invariant "
+            f"violated.")
+    inv_perm_j = jnp.asarray(inv_perm)
+    idx_j = jnp.asarray(np.asarray(irr_idx, dtype=np.int32))
+    sym_j = jnp.asarray(np.asarray(sym_idx, dtype=np.int32))
+    trs_mask_j = jnp.asarray(sym_np >= int(n_sym_spatial))
+
+    V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+
+    @partial(jax.jit, out_shardings=V_sh)
+    def _do_unfold(V_ibz):
+        perm_q = inv_perm_j[sym_j]                          # (n_q_full, n_rmu)
+        V_at_irr = V_ibz[idx_j]                              # (n_q_full, μ, μ)
+        # ``promise_in_bounds`` skips the OOB-fill branch that under
+        # shard_map+x64 mints an s32/s64 mismatch in the HLO verifier
+        # (perm_q is permutation-by-construction, so the bounds check
+        # is gratuitous).
+        V_perm_mu = jnp.take_along_axis(
+            V_at_irr, perm_q[:, :, None], axis=1,
+            mode='promise_in_bounds')
+        V_full = jnp.take_along_axis(
+            V_perm_mu, perm_q[:, None, :], axis=2,
+            mode='promise_in_bounds')
+        # TRS rows: per-element rule
+        # V_full[TRS-q, μ, ν] = conj(V_ibz[parent, μ, ν])
+        # = V_ibz[parent, ν, μ] (by Hermiticity).
+        V_full = jnp.where(
+            trs_mask_j[:, None, None], jnp.conj(V_full), V_full)
+        return V_full
+
+    return _do_unfold(V_q_ibz)
 
 
 class SymMaps:
@@ -210,7 +352,13 @@ class SymMaps:
             self.q_irr_kgrid_int = self.kvecs_asints.copy()
             return
 
-        self.sym_matrices = wfn.sym_matrices[:wfn.ntran] # these apply to real space coords as sym_matrices[i] @ [rx,ry,rz]
+        # BGW convention: `mtrx` (= `sym_matrices` here) acts on G-vectors
+        # in column form: `G' = mtrx @ G`. For real-space coords the
+        # corresponding action uses `Rinv = inv(mtrx)`: `r' = Rinv @ r + τ`
+        # (see centroid/orbit_syms.compute_centroid_sym_perm at line 285,
+        # and BerkeleyGW/Common/symmetries.f90:189 which stores mtrx as
+        # invert(mtrx_inv) where mtrx_inv is the real-space rotation).
+        self.sym_matrices = wfn.sym_matrices[:wfn.ntran]
         self.sym_mats_k = self.sym_matrices[:wfn.ntran].transpose(0,2,1).copy()  # these apply to k-points as sym_mats_k[i] @ [kx,ky,kz]
         # BGW non-symmorphic translations (``tnp``).  Carried so
         # downstream callers (orbit-aware centroid sym perm, q-IBZ

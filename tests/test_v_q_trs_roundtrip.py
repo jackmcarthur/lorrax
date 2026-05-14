@@ -44,7 +44,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from centroid.orbit_syms import compute_centroid_sym_perm
 from common.symmetry_maps import SymMaps
-from gw.v_q_tile import _unfold_v_q_ibz_to_full
+from common.symmetry_maps import unfold_v_q
 
 
 # ===========================================================================
@@ -158,7 +158,7 @@ def _build_v_per_G(q_frac_wrapped, G_set):
     return 1.0 / np.maximum(norm2, 1e-6)
 
 
-def _unfold_zeta_proper(zeta_irr, *, full_to_irr_idx, full_to_irr_sym,
+def _unfold_zeta_proper(zeta_irr, *, irr_idx, sym_idx,
                         sym_perm, ntran, G_perm):
     """Build the canonical full-BZ ζ via the correct TRS-aware rule.
 
@@ -168,17 +168,15 @@ def _unfold_zeta_proper(zeta_irr, *, full_to_irr_idx, full_to_irr_sym,
         ``sym_mats_k`` (which already carries the -1 factor for TRS),
         so we use ``G_perm[s]`` unchanged for both cases.
     """
-    n_q_full = full_to_irr_idx.shape[0]
+    n_q_full = irr_idx.shape[0]
     n_rmu = zeta_irr.shape[1]
     n_g = zeta_irr.shape[2]
     zeta_full = np.zeros((n_q_full, n_rmu, n_g), dtype=np.complex128)
     G_perm_inv = np.argsort(G_perm, axis=-1)
     inv_sym_perm = np.argsort(sym_perm, axis=-1)
-    # ``inv_sym_perm`` may be length ntran (legacy) or 2·ntran (post-fix
-    # extend_trs).  Always index its spatial half via ``s % ntran``.
     for iq in range(n_q_full):
-        irr_i = int(full_to_irr_idx[iq])
-        s = int(full_to_irr_sym[iq])
+        irr_i = int(irr_idx[iq])
+        s = int(sym_idx[iq])
         s_spatial = s % ntran
         is_trs = s >= ntran
         for nu in range(n_rmu):
@@ -264,7 +262,7 @@ def test_v_q_trs_roundtrip():
     # Reference: unfold ζ properly, then contract.
     zeta_full = _unfold_zeta_proper(
         zeta_irr,
-        full_to_irr_idx=full_to_irr_idx, full_to_irr_sym=full_to_irr_sym,
+        irr_idx=full_to_irr_idx, sym_idx=full_to_irr_sym,
         sym_perm=geom["sym_perm"], ntran=ntran, G_perm=G_perm)
     V_ref = _compute_V(zeta_full, v_per_G_full)
 
@@ -276,18 +274,18 @@ def test_v_q_trs_roundtrip():
     # the unfolder which half of sym_perm/sym_mats_k is TRS.  Pre-fix
     # signatures don't accept it; fall back gracefully.
     unfold_kwargs = dict(
-        full_to_irr_idx=full_to_irr_idx,
-        full_to_irr_sym=full_to_irr_sym,
+        irr_idx=full_to_irr_idx,
+        sym_idx=full_to_irr_sym,
         sym_perm=geom["sym_perm"],
         mesh_xy=mesh_xy,
     )
     try:
         V_codebase = np.asarray(jax.device_get(
-            _unfold_v_q_ibz_to_full(
+            unfold_v_q(
                 V_q_ibz_j, n_sym_spatial=ntran, **unfold_kwargs)))
     except TypeError:
         V_codebase = np.asarray(jax.device_get(
-            _unfold_v_q_ibz_to_full(V_q_ibz_j, **unfold_kwargs)))
+            unfold_v_q(V_q_ibz_j, **unfold_kwargs)))
 
     # Per-q assertion.
     max_diff_per_q = np.max(np.abs(V_codebase - V_ref).reshape(n_q_full, -1),
