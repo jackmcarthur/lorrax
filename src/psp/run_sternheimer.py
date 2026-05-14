@@ -808,7 +808,7 @@ def _load_unfolded_wfns(wfn, sym, meta, nb_load: int, verbose: bool):
     """
     t0 = time.perf_counter()
     nk_full = int(sym.nk_tot)
-    irk_to_k = np.asarray(sym.irk_to_k_map)          # (nk_full,) IBZ index per full-BZ k
+    irk_to_k = np.asarray(sym.irr_idx_k)          # (nk_full,) IBZ index per full-BZ k
 
     # Pre-allocate the full-BZ FFT-box buffer.  For MoS2 3×3 with 9 k-points,
     # 26 occupied + 20 conduction = 46 bands, 72×72×108 grid, nspinor=2:

@@ -255,7 +255,7 @@ def compute_centroid_sym_perm(
         permutation for the bare spatial op ``{S | τ}``.  Pass
         ``extend_trs=True`` whenever the caller's ``full_to_irr_sym``
         values may exceed ``n_sym`` (i.e. come from
-        ``SymMaps.find_irreducible_qpoints`` which uses the
+        ``SymMaps.irr_idx_q / sym_idx_q`` which uses the
         TRS-augmented ``sym_mats_k``).  See Agent 1's scope report at
         ``reports/trs_sym_audit_2026-05-14/agent_1_scope_report.md``
         Site #1 for the bug this option closes.
@@ -363,7 +363,7 @@ def compute_centroid_sym_perm(
         # TRS keeps r fixed; the augmented rows duplicate the spatial
         # rows.  Doubling here makes ``sym_perm`` index-compatible with
         # the TRS-augmented ``full_to_irr_sym`` values returned by
-        # ``SymMaps.find_irreducible_qpoints`` (which range over
+        # ``SymMaps.irr_idx_q / sym_idx_q`` (which range over
         # ``[0, 2·ntran)``).  Without this, a downstream gather of
         # ``inv_perm[s]`` for ``s ≥ ntran`` silently clips to the last
         # spatial row under JAX ``mode='promise_in_bounds'``, producing

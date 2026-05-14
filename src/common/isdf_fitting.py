@@ -2073,8 +2073,8 @@ def fit_zeta_to_h5(
         return np.where(q > kg / 2, q - kg, q)
 
     if write_ibz_only:
-        (q_irr_kgrid_int, _q_full_to_irr_idx,
-         _q_full_to_irr_sym, q_irr_full_idx) = sym.find_irreducible_qpoints()
+        q_irr_kgrid_int = sym.q_irr_kgrid_int
+        q_irr_full_idx = sym.q_irr_full_idx
         n_q_disk = int(q_irr_full_idx.shape[0])
         # IBZ fractional q-vectors for the G-flat accumulator (Phase C1b).
         # BGW wrap THEN divide by kgrid so the writer's per-q phase

@@ -172,7 +172,7 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
             # ``extend_trs=True`` so ``sym_perm`` has shape
             # ``(2·n_tran, n_rmu)`` — the second half duplicates the
             # spatial rows and is indexed by the TRS-augmented sym
-            # values returned by ``find_irreducible_qpoints``.  See
+            # values returned by ``sym.irr_idx_q/sym_idx_q``.  See
             # ``compute_centroid_sym_perm`` docstring and the audit
             # report (``reports/trs_sym_audit_2026-05-14``).
             sym_perm = compute_centroid_sym_perm(
@@ -189,8 +189,9 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
                       f"{exc.args[0].splitlines()[0] if exc.args else exc}")
             sym_perm = None
         if sym_perm is not None:
-            (q_irr_kgrid_int, q_full_to_irr_idx,
-             q_full_to_irr_sym, _) = sym.find_irreducible_qpoints()
+            q_irr_kgrid_int = sym.q_irr_kgrid_int
+            q_full_to_irr_idx = sym.irr_idx_q
+            q_full_to_irr_sym = sym.sym_idx_q
             use_ibz = True
 
     if not use_ibz:

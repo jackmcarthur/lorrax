@@ -87,7 +87,7 @@ def _build_fixture(wfn_path: str, pseudo_dir: str, truncation_2d: bool,
         [load_kpoint_fftbox(wfn, sym, meta, ik, n_band) for ik in range(nk_full)],
         axis=0)
     en_full = jnp.asarray(
-        wfn.energies[0, np.asarray(sym.irk_to_k_map), :n_band])
+        wfn.energies[0, np.asarray(sym.irr_idx_k), :n_band])
     return dict(
         wfn=wfn, sym=sym, n_occ=n_occ, nk_full=nk_full, nspinor=nspinor,
         n_extra=n_band-n_occ, n_band=n_band,

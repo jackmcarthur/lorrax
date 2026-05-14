@@ -11,13 +11,109 @@ import jax.numpy as jnp
 from file_io import WfnLoader as WFNReader
 
 
+def find_irreducible_bz_points(full_kgrid_int, sym_mats_k, *, irr_kgrid_int=None):
+    """For each row of ``full_kgrid_int`` (a full-BZ point in integer kgrid
+    coords), find which IBZ point + ``sym_mats_k`` row maps onto it.
+
+    Args:
+        full_kgrid_int: ``(N_full, 3)`` int — full-BZ point set. The grid is
+            inferred as ``full_kgrid_int.max(axis=0) + 1``.
+        sym_mats_k: ``(n_sym, 3, 3)`` int — sym matrices acting on k-vectors in
+            kgrid-int form. Typically TRS-augmented ``[spatial, -spatial]`` with
+            ``n_sym = 2 * ntran``; ``is_trs`` is then ``sym_idx >= ntran``.
+        irr_kgrid_int: optional ``(N_irr, 3)`` int — pre-specified IBZ list.
+            If ``None``, the IBZ is derived as lex-smallest orbit representatives
+            (q-side use). If given, IBZ is fixed (k-side use, anchored to
+            ``wfn.kpoints``).
+
+    Returns:
+        irr_idx: ``(N_full,)`` int32 — IBZ row index for each full-BZ point.
+        sym_idx: ``(N_full,)`` int32 — sym_mats_k row mapping IBZ → full-BZ.
+        irr_kgrid_int_out: ``(N_irr, 3)`` int32 — IBZ list (echoes input if
+            given, else the derived lex-min set).
+    """
+    full = np.asarray(full_kgrid_int, dtype=np.int64)
+    Smk = np.asarray(sym_mats_k, dtype=np.int64)
+    n_full = int(full.shape[0])
+    n_sym = int(Smk.shape[0])
+    kg = (full.max(axis=0) + 1).astype(np.int64)
+
+    def _key(qs):
+        return ((qs[..., 0] * kg[1] + qs[..., 1]) * kg[2] + qs[..., 2])
+
+    full_keys = _key(full)
+
+    if irr_kgrid_int is None:
+        # Derive IBZ as lex-min orbit representatives over full_kgrid_int.
+        images = np.einsum('sij,qj->sqi', Smk, full) % kg[None, None, :]
+        image_keys = _key(images)
+        best_sym = np.argmin(image_keys, axis=0)
+        canon_keys = image_keys[best_sym, np.arange(n_full)]
+        _, first_idx = np.unique(canon_keys, return_index=True)
+        first_idx = np.sort(first_idx)
+        irr_keys = canon_keys[first_idx]
+        irr_out = full[first_idx].astype(np.int32)
+        key_to_irr = {int(k): i for i, k in enumerate(irr_keys)}
+        irr_idx = np.fromiter(
+            (key_to_irr[int(k)] for k in canon_keys),
+            dtype=np.int32, count=n_full,
+        )
+    else:
+        irr_int = np.asarray(irr_kgrid_int, dtype=np.int64) % kg[None, :]
+        irr_out = irr_int.astype(np.int32)
+        n_irr = int(irr_int.shape[0])
+        # Match existing find_symmetry_ops_simple behavior: outer iter over
+        # ikbar without break ⇒ HIGHEST ikbar with any match wins, then
+        # lowest sym for that ikbar. Preserves bit-equality with prior code.
+        irr_images = np.einsum('sij,qj->sqi', Smk, irr_int) % kg[None, None, :]
+        irr_image_keys = _key(irr_images)  # (n_sym, n_irr)
+        irr_idx = np.full(n_full, -1, dtype=np.int32)
+        sym_idx_pre = np.full(n_full, -1, dtype=np.int32)
+        for iq in range(n_full):
+            target = int(full_keys[iq])
+            for ikbar in range(n_irr):
+                matches = np.where(irr_image_keys[:, ikbar] == target)[0]
+                if matches.size > 0:
+                    irr_idx[iq] = ikbar
+                    sym_idx_pre[iq] = int(matches[0])
+        if np.any(irr_idx < 0):
+            bad = int(np.argmin(irr_idx))
+            raise RuntimeError(
+                f"find_irreducible_bz_points: full point at "
+                f"full_kgrid_int[{bad}]={full[bad].tolist()} has no preimage "
+                "under (sym_mats_k, irr_kgrid_int).")
+
+    # Compute sym_idx for the q-side branch (k-side has it from the inner loop).
+    if irr_kgrid_int is None:
+        sym_idx = np.zeros(n_full, dtype=np.int32)
+        irr_images_self = np.einsum('sij,qj->sqi', Smk, full[first_idx]) % kg[None, None, :]
+        irr_image_keys_self = _key(irr_images_self)
+        for iq in range(n_full):
+            target = int(full_keys[iq])
+            ihit = int(irr_idx[iq])
+            matches = np.where(irr_image_keys_self[:, ihit] == target)[0]
+            if matches.size == 0:
+                raise RuntimeError(
+                    f"find_irreducible_bz_points: no sym maps IBZ point "
+                    f"{irr_out[ihit].tolist()} to full point {full[iq].tolist()}.")
+            sym_idx[iq] = int(matches[0])
+    else:
+        sym_idx = sym_idx_pre
+
+    return irr_idx, sym_idx, irr_out
+
+
 class SymMaps:
     def __init__(self, wfn):
         """
         Initialize symmetry mappings for a given WFN file.
-        class variables are:
-        dict: irk_to_k_map[irk] = [k1, k2, k3, ...], kpt id's that map to irk
-        dict: irk_sym_map[irk] = [sym1, sym2, sym3, ...], sym op sym_matrices[sym1] maps irk to ik
+        class variables:
+        - irr_idx_k[ik_full] = IBZ index in wfn.kpoints for each full-BZ k
+        - sym_idx_k[ik_full] = sym_mats_k row mapping wfn.kpoints[irr_idx_k[ik_full]] → unfolded_kpts[ik_full]
+        - irr_idx_q[iq_full] = IBZ index in q_irr_kgrid_int for each full-BZ q
+        - sym_idx_q[iq_full] = sym_mats_k row mapping q_irr_kgrid_int[irr_idx_q[iq_full]] → kvecs_asints[iq_full]
+        - q_irr_kgrid_int[i_irr] = IBZ q in integer kgrid coords (lex-min representatives)
+        - q_irr_full_idx[i_irr] = full-BZ row index where this IBZ q lives in kvecs_asints
         U_spinor[sym_idx] is the spinor rotation matrix for the sym_idx-th symmetry operation.
         The matrices are currently 2x2 Pauli-spinor rotations; upcoming work
         will expand this to the 4-component formalism used in relativistic
@@ -48,8 +144,8 @@ class SymMaps:
             self.kpoint_map_ibz_ids = self.kpoint_map.copy()
 
             # Maps: each full k maps to itself; only identity symmetry
-            self.irk_to_k_map = np.arange(self.unfolded_kpts.shape[0], dtype=np.int32)
-            self.irk_sym_map = np.zeros(self.unfolded_kpts.shape[0], dtype=np.int32)
+            self.irr_idx_k = np.arange(self.unfolded_kpts.shape[0], dtype=np.int32)
+            self.sym_idx_k = np.zeros(self.unfolded_kpts.shape[0], dtype=np.int32)
 
             self.nk_tot = int(self.unfolded_kpts.shape[0])
             self.nk_red = int(getattr(wfn, 'nkpts', self.nk_tot))
@@ -105,6 +201,13 @@ class SymMaps:
                 self.kvecs_asints.shape[0],
                 self.kvecs_asints.shape[0],
             ).astype(np.int32)
+
+            # Trivial-sym q-IBZ: each full-BZ q is its own IBZ partner under identity.
+            n_full = int(self.kvecs_asints.shape[0])
+            self.irr_idx_q = np.arange(n_full, dtype=np.int32)
+            self.sym_idx_q = np.zeros(n_full, dtype=np.int32)
+            self.q_irr_full_idx = np.arange(n_full, dtype=np.int32)
+            self.q_irr_kgrid_int = self.kvecs_asints.copy()
             return
 
         self.sym_matrices = wfn.sym_matrices[:wfn.ntran] # these apply to real space coords as sym_matrices[i] @ [rx,ry,rz]
@@ -135,16 +238,16 @@ class SymMaps:
                 f"[0, {wfn.nkpts})"
             )
 
-        self.irk_to_k_map, self.irk_sym_map = self.find_symmetry_ops_simple(wfn, self.kpoint_map, self.unfolded_kpts)
-        
-        
+        self.irr_idx_k, self.sym_idx_k = self.find_symmetry_ops_simple(wfn, self.kpoint_map, self.unfolded_kpts)
+
+
         self.nk_tot = int(self.unfolded_kpts.shape[0])
         self.nk_red = int(wfn.nkpts)
 
         # Create mapping from irreducible k-points to full BZ indices
         self.kirr_fullids = np.zeros(self.nk_red, dtype=np.int32)
         for kirr in range(self.nk_red):
-            matches = np.where(self.irk_to_k_map == kirr)[0]
+            matches = np.where(self.irr_idx_k == kirr)[0]
             if matches.size == 0:
                 # Fallback: identity mapping if not found
                 self.kirr_fullids[kirr] = kirr
@@ -187,6 +290,23 @@ class SymMaps:
         for i, q in enumerate(self.all_unfolded_qpts):
             mask = (qpt_vecs == q).all(axis=2)
             self.all_unfolded_qpt_ids[mask] = i
+
+        # Eager q-IBZ reduction (was lazy in `find_irreducible_qpoints`; that
+        # method is gone — all consumers read these instance attrs directly).
+        # q lives on the same kgrid as k (q = k - k'), so we reuse
+        # ``sym_mats_k`` (which already includes time-reversal). Note that
+        # `is_trs[i_full] = sym_idx_q[i_full] >= ntran` is implicit; not stored.
+        irr_idx_q, sym_idx_q, q_irr_kgrid_int = find_irreducible_bz_points(
+            self.kvecs_asints, self.sym_mats_k, irr_kgrid_int=None,
+        )
+        self.irr_idx_q = irr_idx_q
+        self.sym_idx_q = sym_idx_q
+        self.q_irr_kgrid_int = q_irr_kgrid_int
+        # q_irr_full_idx[i_irr] = full-BZ row index for IBZ q i_irr.
+        # Derived as first-occurrence of i_irr in irr_idx_q (ordered to match
+        # the q_irr_kgrid_int row ordering).
+        _, first_occ = np.unique(irr_idx_q, return_index=True)
+        self.q_irr_full_idx = np.sort(first_occ).astype(np.int32)
 
 
     def get_qpt_id_from_kkp(self, kidx, kpidx):
@@ -337,127 +457,6 @@ class SymMaps:
 
         return irk_to_k_map, irk_sym_map
 
-    # ------------------------------------------------------------------
-    # q-IBZ reduction (computed lazily — same sym group as the WFN's
-    # k-IBZ).  q lives on the same kgrid as k (q = k - k'), so we reuse
-    # ``sym_mats_k`` (which already includes time-reversal) and ``kgrid``
-    # to fold the full-BZ q-set onto its IBZ wedge.
-    # ------------------------------------------------------------------
-    def find_irreducible_qpoints(self, kgrid: np.ndarray | None = None):
-        """Reduce the full-BZ q-grid to its IBZ under the WFN sym group.
-
-        Returns a 4-tuple of host numpy arrays:
-
-        - ``q_irr_kgrid_int``  ``(n_qpt_irr, 3)`` int32 — IBZ q's as
-          integer kgrid coordinates (0..kgrid[a]).  Ordered by
-          first-occurrence in the full-BZ list.
-        - ``q_full_to_irr_idx`` ``(n_q_full,)`` int32 — for each
-          full-BZ q (in ``self.kvecs_asints`` order), the index into
-          ``q_irr_kgrid_int`` of its IBZ partner.
-        - ``q_full_to_irr_sym`` ``(n_q_full,)`` int32 — index into
-          ``self.sym_mats_k`` of an operation ``S`` s.t.
-          ``S · q_irr ≡ q_full`` (mod kgrid).
-        - ``q_irr_full_idx``   ``(n_qpt_irr,)`` int32 — for each IBZ
-          q, its index into ``self.kvecs_asints`` (== the flat-q
-          index in ``q_flat = qx·nqy·nqz + qy·nqz + qz`` ordering).
-
-        Results are cached on ``self``.
-
-        Parameters
-        ----------
-        kgrid
-            Optional override of the kgrid (3,).  Defaults to the WFN's
-            kgrid captured at __init__ time via ``self.kvecs_asints``.
-
-        Notes
-        -----
-        - We compute everything in **integer kgrid coordinates** to
-          avoid float-tolerance pitfalls — q's live on the kgrid by
-          construction.
-        - ``sym_mats_k`` already includes time-reversal (k → -k on
-          every spatial op), so the resulting IBZ wedge is the smallest
-          possible under (spatial + TRS).  Callers that need to keep
-          TRS off the q-fold should reduce ``sym_mats_k`` to its
-          spatial-only slice before calling.
-        """
-        if hasattr(self, '_q_irr_table_cache'):
-            return self._q_irr_table_cache
-
-        if kgrid is None:
-            # Recover kgrid from self.kvecs_asints (it's max + 1 along
-            # each axis under the canonical layout).
-            kgrid = (self.kvecs_asints.max(axis=0) + 1).astype(np.int64)
-        kg = np.asarray(kgrid, dtype=np.int64).reshape(3)
-
-        full = np.asarray(self.kvecs_asints, dtype=np.int64)
-        n_q_full = int(full.shape[0])
-
-        # sym_mats_k acts on float fractional coords; for integer kgrid
-        # coords we apply the same matrix and wrap modulo kgrid.
-        Smk = np.asarray(self.sym_mats_k, dtype=np.int64)  # (n_sym, 3, 3)
-        n_sym = int(Smk.shape[0])
-
-        # Lex key for fast in-orbit min lookup: encode (qx, qy, qz) as
-        # a single int via mixed-radix kgrid.
-        radix = kg
-        def _key(qs):  # qs: (..., 3) int
-            return ((qs[..., 0] * radix[1] + qs[..., 1]) * radix[2]
-                    + qs[..., 2])
-
-        # All sym images of every full-BZ q: (n_sym, n_q_full, 3).
-        # S @ q, then wrap to [0, kgrid).
-        images = np.einsum('sij,qj->sqi', Smk, full)
-        images = images % radix[None, None, :]
-        keys = _key(images)                              # (n_sym, n_q_full)
-
-        # Canonical = lex-smallest image across sym axis, per full q.
-        best_sym = np.argmin(keys, axis=0)               # (n_q_full,)
-        canon_keys = keys[best_sym, np.arange(n_q_full)]  # (n_q_full,)
-
-        # IBZ list = unique canonical keys, ordered by first occurrence
-        # (preserves the canonical orientation).
-        _, first_idx = np.unique(canon_keys, return_index=True)
-        first_idx = np.sort(first_idx)
-        irr_keys = canon_keys[first_idx]                 # (n_qpt_irr,)
-        q_irr = full[first_idx]                          # (n_qpt_irr, 3)
-
-        # Map every full q to its IBZ index via the canonical key.
-        key_to_irr = {int(k): i for i, k in enumerate(irr_keys)}
-        q_full_to_irr_idx = np.fromiter(
-            (key_to_irr[int(k)] for k in canon_keys),
-            dtype=np.int32, count=n_q_full,
-        )
-
-        # For each full-BZ q, find a sym op s.t. S · q_irr ≡ q_full.
-        # Equivalent: search sym_mats_k for s with
-        # ``(Smk[s] @ q_irr[irr_idx]) mod kgrid == q_full``.
-        q_irr_keys = _key(q_irr)
-        # All sym images of every IBZ q: (n_sym, n_qpt_irr, 3) → keys
-        irr_images = np.einsum('sij,qj->sqi', Smk, q_irr) % radix[None, None, :]
-        irr_image_keys = _key(irr_images)                # (n_sym, n_qpt_irr)
-
-        q_full_to_irr_sym = np.zeros(n_q_full, dtype=np.int32)
-        for iq in range(n_q_full):
-            irr_idx = int(q_full_to_irr_idx[iq])
-            target = int(_key(full[iq:iq + 1])[0])
-            # Find ANY sym whose image of q_irr matches q_full.
-            matches = np.where(irr_image_keys[:, irr_idx] == target)[0]
-            if matches.size == 0:
-                raise RuntimeError(
-                    f"find_irreducible_qpoints: no sym op maps "
-                    f"q_irr[{irr_idx}]={q_irr[irr_idx].tolist()} to "
-                    f"q_full[{iq}]={full[iq].tolist()} — sym group "
-                    f"inconsistency.")
-            q_full_to_irr_sym[iq] = int(matches[0])
-
-        self._q_irr_table_cache = (
-            q_irr.astype(np.int32),
-            q_full_to_irr_idx,
-            q_full_to_irr_sym,
-            first_idx.astype(np.int32),
-        )
-        return self._q_irr_table_cache
-
     def validate_atomic_symmetries(self, wfn, tol=1e-6):
         """Return a list of failures for spatial symmetries acting on atoms."""
         atom_crys = np.asarray(wfn.atom_crys, dtype=np.float64)
@@ -510,8 +509,8 @@ class SymMaps:
                 )
                 continue
 
-            ik_irr = int(self.irk_to_k_map[ik_full])
-            sym_idx = int(self.irk_sym_map[ik_full])
+            ik_irr = int(self.irr_idx_k[ik_full])
+            sym_idx = int(self.sym_idx_k[ik_full])
             sym_krep = np.asarray(self.sym_mats_k[sym_idx], dtype=np.int32)
             kg0 = self._get_umklapp_vector(wfn, ik_full, sym_idx, ik_irr, sym_krep)
             mapped = sym_krep @ np.asarray(wfn.kpoints[ik_irr], dtype=np.float64) + kg0

@@ -717,7 +717,7 @@ def apply_eqp_corrections(
         assert nk_ibz == sym.nk_red
 
         for ik_full in range(nk_full):
-            ik_ibz = sym.irk_to_k_map[ik_full]
+            ik_ibz = sym.irr_idx_k[ik_full]
             for ib in range(min(nb_eqp, nb_full)):
                 if not np.isnan(e_qp_ibz[ik_ibz, ib]):
                     enk_qp[ik_full, ib] = e_qp_ibz[ik_ibz, ib] / ry_to_ev

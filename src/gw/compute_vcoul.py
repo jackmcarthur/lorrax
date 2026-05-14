@@ -895,7 +895,7 @@ def compute_all_V_q(
             # ``extend_trs=True`` so ``sym_perm`` has shape
             # ``(2·n_tran, n_rmu)`` — the second half duplicates the
             # spatial rows and is indexed by the TRS-augmented sym
-            # values returned by ``find_irreducible_qpoints``.  See
+            # values returned by ``sym.irr_idx_q/sym_idx_q``.  See
             # ``compute_centroid_sym_perm`` docstring and the audit
             # report (``reports/trs_sym_audit_2026-05-14``).
             sym_perm = compute_centroid_sym_perm(
@@ -913,9 +913,9 @@ def compute_all_V_q(
             sym_perm = None
 
         if sym_perm is not None:
-            (q_irr_kgrid_int, q_full_to_irr_idx,
-             q_full_to_irr_sym, _q_irr_full_idx
-             ) = sym.find_irreducible_qpoints()
+            q_irr_kgrid_int = sym.q_irr_kgrid_int
+            q_full_to_irr_idx = sym.irr_idx_q
+            q_full_to_irr_sym = sym.sym_idx_q
             nq_total = int(q_irr_kgrid_int.shape[0])
             q_list_for_tile = q_irr_kgrid_int
             use_ibz = True

@@ -1035,7 +1035,7 @@ def compute_V_q_tile(
         replaced by ``len(q_list_kgrid_int)`` for V_acc allocation
         AND ``zeta_q`` read offsets — the caller is responsible for
         ensuring ζ on disk is indexed in the same order (typically
-        an IBZ subset via ``SymMaps.find_irreducible_qpoints()``).
+        an IBZ subset via ``SymMaps.irr_idx_q / sym_idx_q``).
     use_g_flat_zeta : bool
         Opt-in (default False) to consume ζ in **G-flat** layout via
         the new :class:`file_io.zeta_reader.ZetaReader` read path —
@@ -1444,7 +1444,7 @@ def compute_V_q_tile(
 #     V_{Sq, π_s(μ), π_s(ν)} = V_{q, μ, ν}                         (eq. 3)
 #
 # So given V_q_ibz on the IBZ wedge and the full-to-IBZ tables produced by
-# ``SymMaps.find_irreducible_qpoints`` + ``orbit_syms.compute_centroid_sym_perm``,
+# ``SymMaps.irr_idx_q / sym_idx_q`` + ``orbit_syms.compute_centroid_sym_perm``,
 # we can recover V_q on the full BZ as a pure index gather — no FFT, no
 # phase multiply.  Cost: one fancy index, scales as n_q_full · μ² ·
 # 16 / mesh_size on the (μ, ν) sharding.
@@ -1469,7 +1469,7 @@ def _unfold_v_q_ibz_to_full(
 
     TRS-augmented rows
     ------------------
-    ``find_irreducible_qpoints`` (in ``SymMaps``) returns sym indices
+    ``sym.irr_idx_q/sym_idx_q`` (in ``SymMaps``) returns sym indices
     over the TRS-augmented table ``sym_mats_k`` of length ``2·ntran``,
     so ``full_to_irr_sym`` values may lie in ``[ntran, 2·ntran)`` for
     q's that fold to their IBZ parent only via time-reversal.  For the

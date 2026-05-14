@@ -1110,7 +1110,7 @@ def compute_dipole_all(wfn, sym, meta, vnl_plan, B, nb=None):
             )
 
             try:
-                k_red = int(sym.irk_to_k_map[ik])
+                k_red = int(sym.irr_idx_k[ik])
             except Exception:
                 k_red = int(ik)
             e_b = np.asarray(

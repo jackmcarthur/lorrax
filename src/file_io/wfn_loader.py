@@ -303,8 +303,8 @@ class WfnLoader:
                 # rotates its IBZ-source G-list by ``sym_krep`` and
                 # subtracts the BGW umklapp ``kg0``.
                 nk_int = int(nk)
-                sym_idx = int(sym.irk_sym_map[nk_int])
-                kbar = int(sym.irk_to_k_map[nk_int])
+                sym_idx = int(sym.sym_idx_k[nk_int])
+                kbar = int(sym.irr_idx_k[nk_int])
                 sym_krep = np.asarray(
                     sym.sym_mats_k[sym_idx], dtype=np.int32)
                 start = int(self._kpt_starts[kbar])
@@ -327,7 +327,7 @@ class WfnLoader:
             out = np.asarray(self.ngk[k_idxs], dtype=np.int32)
         else:
             sym = self._ensure_sym()
-            ibz_per_full = np.asarray(sym.irk_to_k_map, dtype=np.int32)
+            ibz_per_full = np.asarray(sym.irr_idx_k, dtype=np.int32)
             out = np.asarray(self.ngk[ibz_per_full[k_idxs]], dtype=np.int32)
         self._ngk_valid_cache[key] = out
         return out
@@ -443,8 +443,8 @@ class WfnLoader:
         sym = self._ensure_sym()
         nk_full = int(sym.nk_tot)
         ngkmax = int(self.ngkmax)
-        ibz_per_full = np.asarray(sym.irk_to_k_map, dtype=np.int32)[:nk_full]
-        sym_idx_per_full = np.asarray(sym.irk_sym_map, dtype=np.int32)[:nk_full]
+        ibz_per_full = np.asarray(sym.irr_idx_k, dtype=np.int32)[:nk_full]
+        sym_idx_per_full = np.asarray(sym.sym_idx_k, dtype=np.int32)[:nk_full]
         n_tran = int(sym.sym_matrices.shape[0])
         tr_mask = (sym_idx_per_full >= n_tran).astype(np.bool_)
         U_per = np.asarray(sym.U_spinor)[sym_idx_per_full]            # (nk_full, ns, ns)
@@ -826,8 +826,8 @@ class WfnLoader:
         U_per = np.asarray(sym.U_spinor)
         for j, nk in enumerate(k_idxs):
             nk_int = int(nk)
-            sym_idx = int(sym.irk_sym_map[nk_int])
-            kbar = int(sym.irk_to_k_map[nk_int])
+            sym_idx = int(sym.sym_idx_k[nk_int])
+            kbar = int(sym.irr_idx_k[nk_int])
             sym_krep = np.asarray(sym.sym_mats_k[sym_idx], dtype=np.int32)
             ngk_k = int(self.ngk[kbar])
 
