@@ -790,27 +790,68 @@ class SymMaps:
         return failures
 
     def syms_crystal_to_cartesian(self, wfn):
+        """Cartesian rotation matrix used as input to ``get_spinor_rotations``.
+
+        ``get_spinor_rotations`` runs Markley's quaternion algorithm and
+        requires ORTHOGONAL 3D rotation matrices. The matrix it consumes is
+        the cartesian image of LORRAX's ``mtrx`` (= ``sym_matrices``) — NOT
+        of ``mtrx.T`` (= ``sym_mats_k``), NOT of ``inv(mtrx)``.
+
+        Empirically verified against nosym ground truth on Si 4×4×4 SOC
+        (Fd-3m, 48 ops): U_spinor built from this R_cart reproduces nosym ψ
+        to ~3e-6 within the degenerate-subspace unitary gauge — five orders
+        of magnitude tighter than the pre-fix code. See
+        ``reports/trs_sym_audit_2026-05-14/algebraic_unfold_{cri3,si}.md``.
+
+        Conjugation formula (column form, ``r_cart = avec.T @ r_frac`` where
+        ``avec[i, :]`` is the i-th real-space lattice vector):
+
+            R_cart = avec.T @ mtrx @ inv(avec.T)
+                   = inv(bvec) @ mtrx @ bvec
+                   (the two are algebraically equivalent given
+                   ``avec @ bvec.T = I``, hence ``inv(bvec) = avec.T``)
+
+        This is the LORRAX convention for the "rotation in cartesian" that
+        the rest of the codebase consumes: it matches the G-space action
+        ``G_full = mtrx.T @ G_irr = sym_mats_k @ G_irr`` (column form) by
+        the relation ``R_cart^{-T} = avec.T @ mtrx.T @ inv(avec.T) = G-side
+        cartesian rotation``. For orthogonal R, ``R^{-T} = R``, so the two
+        are inverses of each other but both orthogonal; the spinor SU(2)
+        Markley algorithm needs the one returned here (i.e. ``mtrx``, not
+        ``mtrx.T`` or ``inv(mtrx)``).
+
+        Output covers the full TRS-augmented sym table: rows ``[:ntran]`` are
+        the spatial cartesian rotations; rows ``[ntran:]`` are ``-R_spatial``
+        (matches the convention that ``sym_mats_k[ntran:] = -sym_mats_k[:ntran]``;
+        TRS does not change the spatial rotation, it only adds a complex-conj /
+        iσ_y factor handled separately in ``unfold_psi``).
+
+        History
+        -------
+        Pre-fix (2026-05-14) this used ``inv(bvec) @ sym_mats_k @ bvec``
+        — wrong because ``sym_mats_k = mtrx.T`` instead of ``mtrx``. The
+        two matrices ``mtrx.T`` and ``mtrx`` give different SU(2) (one is
+        the adjoint of the other for orthogonal R), so U_spinor was wrong
+        on every system but the error CANCELLED in Σ_X for involutive
+        groups (MoS2 σ_h: mtrx = mtrx.T) and for cubic groups whose mtrx
+        entries are integer-orthogonal in crystal coords. CrI3 P-3 (hex,
+        non-involutive C3/S6) gave |R Rᵀ-I|∞ ≈ 3.5 → 6 eV Σ_X failure;
+        Si Fd-3m (non-symmorphic) gave 160 eV failure via a different
+        Σ_X-level amplification of the same wrong U_spinor.
+
+        The original code's ``# NOT SURE IF THESE SHOULD BE SYM_MATS_K OR
+        SYM_MATS TODO`` was the smoking-gun comment. Answer: SYM_MATRICES.
         """
-        Convert symmetry matrices from crystal to cartesian coordinates.
-        
-        Args:
-            sym_matrices_crys (numpy.ndarray): Symmetry matrices in crystal coords (nsym, 3, 3)
-            
-        Returns:
-            numpy.ndarray: Symmetry matrices in cartesian coordinates (nsym, 3, 3)
-        """
-        # Get blat and bvec from WFNReader
-        B_T = np.asarray(wfn.bvec)
-        
-        # Calculate (B^T)^-1
-        B_T_inv = np.linalg.inv(B_T)
-        
-        # Convert each symmetry matrix
-        # NOT SURE IF THESE SHOULD BE SYM_MATS_K OR SYM_MATS TODO
-        sym_matrices_cart = np.einsum('ij,njk,kl->nil', B_T_inv, self.sym_mats_k, B_T)
-        sym_matrices_cart = np.around(sym_matrices_cart, decimals=10)
-        
-        return sym_matrices_cart
+        A_T = np.asarray(wfn.avec).T
+        A_T_inv = np.linalg.inv(A_T)
+        # Spatial-only mtrx (length ntran). TRS-augmented rows are -R_spatial
+        # in cartesian (TRS doesn't change the spatial rotation).
+        mtrx = np.asarray(self.sym_matrices)
+        R_spatial = np.einsum('ij,njk,kl->nil', A_T, mtrx, A_T_inv)
+        R_spatial = np.around(R_spatial, decimals=10)
+        # Match the existing 2·ntran-row convention for downstream consumers.
+        R_full = np.concatenate([R_spatial, -R_spatial], axis=0)
+        return R_full
 
     def get_spinor_rotations(self, wfn, sym_matrices_cart):
         """
