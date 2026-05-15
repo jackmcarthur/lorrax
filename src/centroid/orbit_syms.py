@@ -302,13 +302,19 @@ def compute_centroid_sym_perm(
     # transformation, then back to FFT indices after wrap.
     r_frac = idx.astype(np.float64) / fft_grid_np[None, :]    # (n_rmu, 3)
 
-    # Row-vector form: r' = r @ S.T + τ  → ``S r + τ`` in column form.
-    # (NB: ``S`` here is what BGW calls ``mtrx``; the centroid r really
-    # transforms by ``Rinv = inv(S)``.  Compute Rinv on host.)
-    Rinv = np.rint(np.linalg.inv(S)).astype(np.int64)          # (n_sym, 3, 3)
-
-    # images[s, μ] = r_μ @ Rinv[s].T + τ[s]   (mod 1)
-    images = np.einsum('rj,sij->sri', r_frac, Rinv.astype(np.float64)) \
+    # LORRAX convention: real-space r transforms by S (= mtrx) directly,
+    # NOT by inv(S).  This is the convention used throughout the codebase:
+    # the G-action ``G' = mtrx @ G`` and the corresponding real-space
+    # action ``r' = mtrx @ r + τ`` (column form) give an SU(2) spinor that
+    # matches nosym ground truth (verified on Si + CrI3 algebraic unfold
+    # tests, 2026-05-14).  Pre-fix this used ``Rinv = inv(S)`` based on a
+    # mis-statement in ``symmetry_maps.py``'s docstring, producing
+    # inconsistent permutations vs U_spinor for non-involutive ops
+    # (CrI3 C3/S6 fired the bug; cubic Si and involutive MoS2 σ_h hid it
+    # because S.T = inv(S) holds for both classes).
+    #
+    # images[s, μ] = r_μ @ S[s].T + τ[s]   (mod 1)
+    images = np.einsum('rj,sij->sri', r_frac, S.astype(np.float64)) \
              + tau_frac[:, None, :]
     images = images - np.floor(images)                          # (n_sym, n_rmu, 3) in [0, 1)
 
