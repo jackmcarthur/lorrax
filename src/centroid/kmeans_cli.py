@@ -311,8 +311,13 @@ def main():
                 centroids_frac, fft_grid, deduplicate=False,
             )
             from .orbit_syms import unfold_orbit_unique_with_id
+            # Pass FORWARD sym S (= sym.R_grid = wfn.sym_matrices), not
+            # Rinv.  This matches the direction used by
+            # compute_centroid_sym_perm so the final centroid set passes
+            # closure validation in V_q-unfold consumers.  Required for
+            # non-symmorphic systems (Si Fd-3m); no-op for symmorphic.
             unfolded, orbit_id_arr = unfold_orbit_unique_with_id(
-                reps_snapped, np.asarray(Rinv), np.asarray(tau),
+                reps_snapped, np.asarray(R), np.asarray(tau),
             )
             print(f"\nUnfolded {centroids_frac.shape[0]} reps → "
                   f"{unfolded.shape[0]} distinct centroids (n_sym={n_sym})")

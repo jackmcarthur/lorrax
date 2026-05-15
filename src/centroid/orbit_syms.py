@@ -72,10 +72,19 @@ def identity_syms():
 
 @jax.jit
 def orbit_images(reps: jnp.ndarray,
-                 Rinv: jnp.ndarray,
+                 S: jnp.ndarray,
                  tau: jnp.ndarray) -> jnp.ndarray:
-    """Apply every sym op to every rep. Returns (n_sym, n_rep, 3) mod 1."""
-    return jax.vmap(lambda Ri, t: (reps @ Ri.T + t) % 1.0)(Rinv, tau)
+    """Apply forward sym op (S·r + τ, mod 1) to every rep.
+
+    Pass ``S = sym.R_grid`` (= ``wfn.sym_matrices``).  This matches
+    ``compute_centroid_sym_perm``'s direction so that downstream
+    closure validation succeeds on the same centroid set.  For
+    symmorphic systems (τ = 0) the choice of direction doesn't
+    matter (the group is closed under inversion).  For non-symmorphic
+    systems (Si Fd-3m, etc.) the forward direction IS required for
+    consistency with the V_q unfold path.
+    """
+    return jax.vmap(lambda Si, t: (reps @ Si.T + t) % 1.0)(S, tau)
 
 
 _CANON_INV = jnp.int64(10**12)
@@ -154,13 +163,18 @@ def snap_orbits_to_grid(reps_frac: np.ndarray,
 
 
 def unfold_orbit_unique_with_id(reps_np: np.ndarray,
-                                Rinv: np.ndarray,
+                                S: np.ndarray,
                                 tau: np.ndarray,
                                 tol: float = 1e-6,
                                 ) -> tuple[np.ndarray, np.ndarray]:
     """Unfold reps into all distinct orbit images; also return ``orbit_id``
     — a per-candidate integer that's the same for two candidates iff they
     lie in the same **physical** orbit under the WFN's sym group.
+
+    Pass ``S = wfn.sym_matrices`` (the forward sym matrix).  Direction
+    matches ``orbit_images`` and ``compute_centroid_sym_perm`` for
+    consistency with V_q unfold.  Critical for non-symmorphic systems
+    (τ ≠ 0); for symmorphic systems either direction gives the same set.
 
     orbit_id is the integer encoding of each candidate's canonical
     (lex-smallest) orbit member, then run through ``np.unique`` to make
@@ -169,11 +183,12 @@ def unfold_orbit_unique_with_id(reps_np: np.ndarray,
     orbit during Lloyd get identical orbit_ids, so PC sees them as one
     orbit (not two).
     """
-    Rinv = np.asarray(Rinv); tau = np.asarray(tau)
+    S = np.asarray(S); tau = np.asarray(tau)
     inv = np.int64(round(1.0 / tol))         # int! avoid fp64-precision loss at 1e18
 
     # 1. Unfold + dedupe at fp tolerance.
-    images = (np.einsum('ri,sji->srj', reps_np, Rinv) + tau[:, None, :]) % 1.0
+    # ``r @ S[s].T + τ[s]`` = forward S·r + τ in column form.
+    images = (np.einsum('ri,sji->srj', reps_np, S) + tau[:, None, :]) % 1.0
     flat = images.reshape(-1, 3)
     keys = np.round(flat * inv).astype(np.int64) % inv
     _, first_idx = np.unique(keys, axis=0, return_index=True)
@@ -181,7 +196,7 @@ def unfold_orbit_unique_with_id(reps_np: np.ndarray,
 
     # 2. For each unique candidate, compute its canonical (lex-min) orbit
     #    member, then dense-encode the canonical triples as orbit_id.
-    cand_imgs = (np.einsum('ci,sji->scj', flat, Rinv) + tau[:, None, :]) % 1.0
+    cand_imgs = (np.einsum('ci,sji->scj', flat, S) + tau[:, None, :]) % 1.0
     cand_keys = np.round(cand_imgs * inv).astype(np.int64) % inv     # (n_sym, n, 3)
     # Lex via np.lexsort on (z, y, x) — primary key first in argument order
     # is leftmost; lexsort treats the LAST key as primary. So pass (z, y, x)
