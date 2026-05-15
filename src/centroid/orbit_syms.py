@@ -358,8 +358,21 @@ def compute_centroid_sym_perm(
     r_shifted = r_frac[None, :, :] - tau_frac[:, None, :]            # (n_sym, n_rmu, 3)
     # images_raw[s, μ, i] = (mtrx[s] · r_shifted[s, μ])_i = sum_j S[s,i,j] r_shifted[s,μ,j]
     images_raw = np.einsum('sij,srj->sri', S.astype(np.float64), r_shifted)
-    L_wrap = np.floor(images_raw).astype(np.int8)                    # integer lattice wrap
-    images = images_raw - L_wrap.astype(np.float64)                  # in [0, 1)
+    # Snap to FFT-grid integers BEFORE floor.  Centroids live at
+    # multiples of 1/fft_grid; mtrx and τ are commensurate (BGW guarantee),
+    # so images_raw is also a multiple of 1/fft_grid up to 1e-17
+    # floating-point noise.  Naive ``np.floor`` flips an L component
+    # from 0 → -1 whenever the true integer part is 0 but a tiny
+    # negative noise hits np.floor's discontinuity — which produces a
+    # spurious exp(±iπ/2) phase in unfold_v_q.  Snapping fixes this
+    # cleanly; verified at ISDF noise floor on Si Fd-3m (24³ FFT,
+    # non-symmorphic τ) where the previous code gave 14/64 q's with
+    # rel err ~0.8 due to this exact off-by-one.
+    images_int = np.rint(images_raw * fft_grid_np[None, None, :]).astype(np.int64)
+    grid_per_axis = fft_grid_np[None, None, :]
+    L_wrap = (np.floor_divide(images_int, grid_per_axis)).astype(np.int8)
+    images_int_mod = images_int - L_wrap.astype(np.int64) * grid_per_axis
+    images = images_int_mod.astype(np.float64) / grid_per_axis.astype(np.float64)
 
     # Snap back to FFT-grid integers.  If τ × FFTgrid isn't integer to
     # roundoff, this rounding will land on a half-grid point and the

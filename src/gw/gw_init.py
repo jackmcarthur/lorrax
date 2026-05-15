@@ -647,7 +647,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# reads the charge ζ file at full-BZ offsets.  Once that
 	# orchestrator gains IBZ support, this can flip to ``True`` for
 	# bispinor too.
-	_write_ibz_only_charge = not bool(cfg.bispinor)
+	import os as _os_dbg
+	_write_ibz_only_charge = (not bool(cfg.bispinor)
+		and not bool(int(_os_dbg.environ.get('LORRAX_FORCE_FULL_BZ', '0'))))
 	# Two cutoffs control the bare-Coulomb / ζ-sphere construction:
 	#   * ``bare_coulomb_cutoff_ry`` — V_q's sqrt_v(q+G) mask.
 	#   * ``zeta_cutoff_ry``         — the on-disk per-q ζ sphere

@@ -30,6 +30,7 @@ output sharding ``P(None, 'x', 'y')`` matches.
 """
 from __future__ import annotations
 
+import os
 import queue
 import threading
 from functools import partial
@@ -169,7 +170,11 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
     q_full_to_irr_sym = None
     sym_perm = None
     L_table = None
-    if sym is not None and centroid_indices is not None:
+    # DEBUG: set LORRAX_FORCE_FULL_BZ=1 to bypass the IBZ cascade and
+    # compute V_q at all full-BZ q's directly.  Useful for isolating
+    # whether residuals come from unfold_v_q vs the rest of the pipeline.
+    _force_full_bz = bool(int(os.environ.get('LORRAX_FORCE_FULL_BZ', '0')))
+    if sym is not None and centroid_indices is not None and not _force_full_bz:
         from centroid.orbit_syms import compute_centroid_sym_perm
         n_tran = int(np.asarray(sym.sym_matrices).shape[0])
         cent_idx = np.asarray(centroid_indices, dtype=np.int32)
