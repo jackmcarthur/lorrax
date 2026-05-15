@@ -214,14 +214,27 @@ def compute_centroid_sym_perm(
     *,
     validate: bool = True,
     extend_trs: bool = False,
-) -> np.ndarray:
-    """Build π_s such that ``r_{π_s(μ)} ≡ S_s r_μ + τ_s`` on the FFT grid.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build (π_s, L_s) such that ``S_s r_μ + τ_s ≡ r_{π_s(μ)} + L_s,μ``
+    on the FFT grid, with ``L_s,μ ∈ ℤ³`` the integer lattice wrap.
 
-    The forward direction: S_s and τ_s acting on real space.  In the
-    BGW convention used elsewhere in LORRAX, real-space r transforms
-    via ``Rinv = S^{-1}`` (column-vector form), so ``S r + τ`` in
-    column form is equivalent to ``r @ Rinv.T + τ`` in row form.  We
-    use the row-form throughout for vectorisation.
+    The forward direction: S_s and τ_s acting on real space.  Per
+    ``reports/trs_sym_audit_2026-05-14/SYMMETRY_CONVENTIONS.md``,
+    ``wfn.sym_matrices`` IS the forward direct-space rotation U_s
+    (verified empirically; the prior reading of BGW source as
+    ``mtrx = inv(R)`` was wrong).  So ``S @ r + τ`` is the forward
+    physical sym; column-form ``S @ r`` is equivalent to row-form
+    ``r @ S.T``.  We use column-form via ``einsum('rj,sij->sri', ...)``.
+
+    The integer wrap ``L_s,μ`` is the per-centroid real-space lattice
+    translation needed when ``S r_μ + τ`` exits ``[0,1)³``.  V_q
+    transforms under sym + umklapp as
+
+        V_full[q1, μ, ν] = exp(2π i q · (L_μ − L_ν)) · V_ibz[parent, α(μ), α(ν)]
+
+    where ``α(μ) = π_s(μ)`` (the centroid permutation) and ``L_μ`` is
+    captured here.  Without this wrap the unfold is wrong for any q
+    requiring umklapp on a non-symmorphic or non-cubic system.
 
     Parameters
     ----------
@@ -273,6 +286,13 @@ def compute_centroid_sym_perm(
         equality by V_q Hermiticity) — is applied at the V_q-unfold
         level (see ``gw.v_q_tile._unfold_v_q_ibz_to_full``), NOT in
         ``sym_perm`` itself.
+    L_table
+        ``(n_sym, n_rmu, 3)`` int8 by default; ``(2·n_sym, n_rmu, 3)``
+        when ``extend_trs=True``.  ``L_table[s, μ] = floor(S r_μ + τ)``
+        — the integer real-space lattice vector by which the image
+        exits the unit cell.  TRS rows duplicate spatial rows (r is
+        fixed under TRS).  Used by ``unfold_v_q`` to build the
+        umklapp phase ``exp(2π i q · (L_μ − L_ν))``.
 
     Raises
     ------
@@ -302,17 +322,14 @@ def compute_centroid_sym_perm(
     # transformation, then back to FFT indices after wrap.
     r_frac = idx.astype(np.float64) / fft_grid_np[None, :]    # (n_rmu, 3)
 
-    # Forward-direction centroid permutation (math agent + 2 context-agent
-    # cross-check, 2026-05-14): π_s defined by r_{π_s(μ)} = S · r_μ + τ.
-    # The prior ``Rinv = inv(S)`` direction was wrong per the V_q transformation
-    # derivation; the bug self-cancels for involutive ops (MoS2 σ_h) and for
-    # cubic systems where mtrx is integer-orthogonal in crystal coords (Si),
-    # but fires on hex/trigonal/etc. with non-involutive ops (CrI3 C3/S6).
-    #
-    # images[s, μ] = r_μ @ S[s].T + τ[s]   (mod 1)
-    images = np.einsum('rj,sij->sri', r_frac, S.astype(np.float64)) \
-             + tau_frac[:, None, :]
-    images = images - np.floor(images)                          # (n_sym, n_rmu, 3) in [0, 1)
+    # Forward-direction centroid sym: images[s, μ] = S @ r_μ + τ (column form).
+    # We capture the integer lattice wrap L_s,μ = floor(images) BEFORE the
+    # mod-1 reduction; it feeds the umklapp phase exp(2π i q · (L_μ − L_ν))
+    # in unfold_v_q.  See SYMMETRY_CONVENTIONS.md for the derivation.
+    images_raw = np.einsum('rj,sij->sri', r_frac, S.astype(np.float64)) \
+                 + tau_frac[:, None, :]                              # (n_sym, n_rmu, 3)
+    L_wrap = np.floor(images_raw).astype(np.int8)                    # integer lattice wrap
+    images = images_raw - L_wrap.astype(np.float64)                  # in [0, 1)
 
     # Snap back to FFT-grid integers.  If τ × FFTgrid isn't integer to
     # roundoff, this rounding will land on a half-grid point and the
@@ -363,16 +380,18 @@ def compute_centroid_sym_perm(
     sym_perm = sym_perm.astype(np.int32)
     if extend_trs:
         # TRS keeps r fixed; the augmented rows duplicate the spatial
-        # rows.  Doubling here makes ``sym_perm`` index-compatible with
-        # the TRS-augmented ``full_to_irr_sym`` values returned by
-        # ``SymMaps.irr_idx_q / sym_idx_q`` (which range over
-        # ``[0, 2·ntran)``).  Without this, a downstream gather of
-        # ``inv_perm[s]`` for ``s ≥ ntran`` silently clips to the last
-        # spatial row under JAX ``mode='promise_in_bounds'``, producing
-        # wrong V_q at every TRS-folded q (the headline bug — see
+        # rows for BOTH sym_perm and L_wrap.  Doubling here makes the
+        # tables index-compatible with the TRS-augmented
+        # ``full_to_irr_sym`` values returned by ``SymMaps.irr_idx_q /
+        # sym_idx_q`` (which range over ``[0, 2·ntran)``).  Without
+        # this, a downstream gather of ``inv_perm[s]`` for ``s ≥
+        # ntran`` silently clips to the last spatial row under JAX
+        # ``mode='promise_in_bounds'``, producing wrong V_q at every
+        # TRS-folded q (the headline bug — see
         # ``reports/trs_sym_audit_2026-05-14/agent_1_scope_report.md``).
         sym_perm = np.concatenate([sym_perm, sym_perm.copy()], axis=0)
-    return sym_perm
+        L_wrap = np.concatenate([L_wrap, L_wrap.copy()], axis=0)
+    return sym_perm, L_wrap
 
 
 # ─────────────────────────────────────────────────────────────────────────

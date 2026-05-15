@@ -159,12 +159,13 @@ def test_centroid_sym_perm_identity_only_is_identity():
     """One-element sym group → π_0 = identity permutation."""
     fft_grid = (8, 8, 8)
     r_mu = np.array([[1, 2, 3], [4, 5, 6], [0, 0, 0]], dtype=np.int32)
-    perm = compute_centroid_sym_perm(
+    perm, L = compute_centroid_sym_perm(
         r_mu, sym_matrices=np.eye(3, dtype=int)[None],
         translations=np.zeros((1, 3)),
         fft_grid=fft_grid,
     )
     np.testing.assert_array_equal(perm, np.arange(3)[None])
+    np.testing.assert_array_equal(L, np.zeros((1, 3, 3), dtype=L.dtype))
 
 
 def test_centroid_sym_perm_under_inversion_closed_set():
@@ -173,7 +174,7 @@ def test_centroid_sym_perm_under_inversion_closed_set():
     sym = np.stack([np.eye(3, dtype=int),
                     -np.eye(3, dtype=int)], axis=0)
     r_mu = _orbit_close_centroids(fft_grid, sym).astype(np.int32)
-    perm = compute_centroid_sym_perm(
+    perm, _L = compute_centroid_sym_perm(
         r_mu, sym_matrices=sym,
         translations=np.zeros((2, 3)),
         fft_grid=fft_grid,
@@ -230,7 +231,7 @@ def test_centroid_sym_perm_with_nonsymmorphic_tau():
     r_mu = np.vstack(images).astype(np.int32)
     _, uidx = np.unique(r_mu, axis=0, return_index=True)
     r_mu = r_mu[np.sort(uidx)]
-    perm = compute_centroid_sym_perm(
+    perm, _L = compute_centroid_sym_perm(
         r_mu, sym_matrices=sym, translations=tau, fft_grid=fft_grid,
     )
     np.testing.assert_array_equal(perm[0], np.arange(r_mu.shape[0]))

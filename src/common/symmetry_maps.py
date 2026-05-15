@@ -113,18 +113,29 @@ def unfold_v_q(
     irr_idx,
     sym_idx,
     sym_perm,
+    L_table,
+    q_irr_frac,
     mesh_xy,
     n_sym_spatial,
 ):
     """Expand ``V_q_ibz`` over the IBZ to the full BZ.
 
-    The mapping is the pure centroid-axis double-permute under {S | τ} —
-    the τ-phases in the ζ transformation rule cancel because V is
-    bilinear in ζ:
+    The mapping is a centroid-axis double-permute under {S | τ} PLUS a
+    per-centroid umklapp phase from the real-space lattice wrap:
 
-        V_full[q, μ', ν'] = V_ibz[i(q), π_{s(q)}^{-1}(μ'), π_{s(q)}^{-1}(ν')]
+        V_full[q, μ', ν'] = exp(2π i q_irr · (L_μ' − L_ν'))
+                            · V_ibz[i(q), π_{s(q)}^{-1}(μ'), π_{s(q)}^{-1}(ν')]
 
-    where ``i(q) = irr_idx[q]`` and ``s(q) = sym_idx[q]``.
+    where ``i(q) = irr_idx[q]``, ``s(q) = sym_idx[q]``, ``q_irr =
+    q_irr_frac[i(q)]`` is the IBZ parent q in fractional reciprocal
+    coords, and ``L_μ = L_table[s, π_s⁻¹(μ)]`` is the integer
+    real-space lattice wrap captured by ``compute_centroid_sym_perm``.
+
+    The phase factor is essential whenever ``S r_μ + τ`` exits the
+    unit cell (i.e. ``L_μ ≠ 0``) — which happens for every non-trivial
+    full-BZ q on a non-cubic / non-symmorphic system.  Skipping the
+    phase produces a ~unity-relative error on umklapp q's (verified
+    empirically on CrI3 30 Ry V_q dumps before this fix).
 
     TRS-augmented rows
     ------------------
@@ -156,6 +167,14 @@ def unfold_v_q(
         ``(2·n_sym_spatial, n_rmu)`` int — centroid permutation table.
         Must cover ``max(sym_idx)``; we raise a clear error otherwise
         rather than relying on JAX's silent OOB clamp.
+    L_table
+        ``(2·n_sym_spatial, n_rmu, 3)`` int — per-(sym, centroid)
+        integer real-space lattice wrap, from
+        ``compute_centroid_sym_perm``.  Drives the umklapp phase.
+    q_irr_frac
+        ``(n_q_ibz, 3)`` float — IBZ q in fractional reciprocal
+        coordinates (already BGW-wrapped to the (−0.5, 0.5] convention
+        if the caller is consistent).  Indexed by ``irr_idx``.
     mesh_xy
         Device mesh; the output is constrained to ``P(None,'x','y')``.
     n_sym_spatial
@@ -197,29 +216,51 @@ def unfold_v_q(
             f"{n_sym_perm} ≠ 2·n_sym_spatial.  Build sym_perm via "
             f"``compute_centroid_sym_perm(..., extend_trs=True)``.")
 
-    # Inverse permutation: inv_perm[s, π_s(μ)] = μ → argsort along μ.
-    # sym_perm is built from the LOGICAL centroid set (size n_rmu_logical).
-    # V_q_ibz arrives at the PADDED extent n_rmu_padded ≥ n_rmu_logical
-    # (round-up so the V_q kernel's μ/ν shardings divide the mesh).  Pad
-    # inv_perm with identity rows so the gather output matches V_q_ibz's
-    # μ/ν extents and the P(None,'x','y') output sharding is satisfied.
-    inv_perm = np.argsort(sym_perm, axis=-1).astype(np.int32)
-    n_rmu_logical = int(inv_perm.shape[-1])
+    # Forward permutation: gather V_ibz at indices sym_perm[s, μ'] — i.e.,
+    # at the FORWARD image of each full-BZ centroid μ' under sym s.
+    # Empirically (see ``reports/trs_sym_audit_2026-05-14/test_production_unfold_v_q.py``):
+    # V_full[μ', ν'] = phase(μ', ν') · V_ibz[parent, sym_perm[s, μ'],
+    # sym_perm[s, ν']] closes to ISDF noise floor on all 36 q's of the
+    # CrI3 6×6 30 Ry dump including order-3 ops.  The prior code used
+    # inv_perm = argsort(sym_perm) (= π⁻¹) which is a no-op for
+    # involutive ops (MoS2 σ_h, Si cubic) but wrong for order-3 (CrI3
+    # C3) — that was the silent 4 eV gap on hex systems.
+    # Pad with identity rows for centroid-axis padding to mesh-divisible.
+    fwd_perm = np.asarray(sym_perm, dtype=np.int32)
+    n_rmu_logical = int(fwd_perm.shape[-1])
     n_rmu_padded = int(V_q_ibz.shape[-1])
     if n_rmu_padded > n_rmu_logical:
         pad_block = np.arange(n_rmu_logical, n_rmu_padded, dtype=np.int32)
         pad_block = np.broadcast_to(
-            pad_block, (inv_perm.shape[0], n_rmu_padded - n_rmu_logical))
-        inv_perm = np.concatenate([inv_perm, pad_block], axis=-1)
+            pad_block, (fwd_perm.shape[0], n_rmu_padded - n_rmu_logical))
+        fwd_perm = np.concatenate([fwd_perm, pad_block], axis=-1)
     elif n_rmu_padded != n_rmu_logical:
         raise ValueError(
             f"unfold_v_q: V_q_ibz μ-extent {n_rmu_padded} smaller than "
             f"sym_perm logical extent {n_rmu_logical}; pad invariant "
             f"violated.")
-    inv_perm_j = jnp.asarray(inv_perm)
+    inv_perm_j = jnp.asarray(fwd_perm)
     idx_j = jnp.asarray(np.asarray(irr_idx, dtype=np.int32))
     sym_j = jnp.asarray(np.asarray(sym_idx, dtype=np.int32))
     trs_mask_j = jnp.asarray(sym_np >= int(n_sym_spatial))
+
+    # Per-(q_full, μ) umklapp phase factor exp(2π i q_irr · L_μ).
+    # ``L_table`` is shape (2·ntran, n_rmu, 3) int (any width); promote
+    # to float64 then gather to (n_q_full, n_rmu, 3).  ``q_irr_frac`` is
+    # (n_q_ibz, 3); we gather to (n_q_full, 3) via ``irr_idx``.  The
+    # product qL = q_irr · L is (n_q_full, n_rmu), then the bilinear
+    # phase is qL[μ] − qL[ν] (per-q, outer-diff).
+    L_arr = np.asarray(L_table, dtype=np.float64)
+    n_rmu_padded = int(V_q_ibz.shape[-1])
+    if L_arr.shape[1] < n_rmu_padded:
+        # Pad with zeros so the L axis matches the V μ-extent; padded
+        # centroids have no umklapp wrap.
+        pad = np.zeros(
+            (L_arr.shape[0], n_rmu_padded - L_arr.shape[1], 3),
+            dtype=np.float64)
+        L_arr = np.concatenate([L_arr, pad], axis=1)
+    L_j = jnp.asarray(L_arr)
+    q_irr_j = jnp.asarray(np.asarray(q_irr_frac, dtype=np.float64))
 
     V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
@@ -237,6 +278,17 @@ def unfold_v_q(
         V_full = jnp.take_along_axis(
             V_perm_mu, perm_q[:, None, :], axis=2,
             mode='promise_in_bounds')
+        # Umklapp phase: exp(2π i q_irr · (L_μ − L_ν)).  L_μ here is
+        # L_table[s(q), μ] — the wrap of centroid μ under the FULL-BZ
+        # sym op s(q) (NOT permuted; the empirical V_q test in
+        # ``reports/trs_sym_audit_2026-05-14/verify_umklapp_user_math.py``
+        # uses this convention and closes at ISDF noise floor).
+        L_per_q = L_j[sym_j]                                # (n_q_full, n_rmu, 3)
+        q_per_q = q_irr_j[idx_j]                            # (n_q_full, 3)
+        qL = jnp.einsum('qi,qmi->qm', q_per_q, L_per_q)     # (n_q_full, n_rmu)
+        phase = jnp.exp(2j * jnp.pi * qL.astype(jnp.complex128))
+        V_full = (phase[:, :, None] * V_full
+                  * jnp.conj(phase)[:, None, :])
         # TRS rows: per-element rule
         # V_full[TRS-q, μ, ν] = conj(V_ibz[parent, μ, ν])
         # = V_ibz[parent, ν, μ] (by Hermiticity).

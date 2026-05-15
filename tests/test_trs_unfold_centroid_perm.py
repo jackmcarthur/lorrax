@@ -74,28 +74,31 @@ def test_compute_centroid_sym_perm_extend_trs_shape_and_content():
     n_sym = sym_matrices.shape[0]
     n_rmu = cent_idx.shape[0]
 
-    sp_default = compute_centroid_sym_perm(
+    sp_default, L_default = compute_centroid_sym_perm(
         cent_idx, sym_matrices, 2.0 * np.pi * translations, fft_grid,
         validate=True)
-    sp_trs = compute_centroid_sym_perm(
+    sp_trs, L_trs = compute_centroid_sym_perm(
         cent_idx, sym_matrices, 2.0 * np.pi * translations, fft_grid,
         validate=True, extend_trs=True)
 
     # Default: (ntran, n_rmu).
     assert sp_default.shape == (n_sym, n_rmu)
+    assert L_default.shape == (n_sym, n_rmu, 3)
 
     # Extended: (2·ntran, n_rmu) with rows[ntran:] duplicating rows[:ntran].
     assert sp_trs.shape == (2 * n_sym, n_rmu), (
         f"extend_trs=True must return (2·ntran, n_rmu); got {sp_trs.shape}")
     np.testing.assert_array_equal(sp_trs[:n_sym], sp_default)
     np.testing.assert_array_equal(sp_trs[n_sym:], sp_default)
+    np.testing.assert_array_equal(L_trs[:n_sym], L_default)
+    np.testing.assert_array_equal(L_trs[n_sym:], L_default)
 
 
 def test_compute_centroid_sym_perm_extend_trs_each_row_is_permutation():
     """Sanity: each row (including TRS half) is a permutation of [0, n_rmu)."""
     fft_grid, sym_matrices, translations, cent_idx = _build_geometry()
     n_rmu = cent_idx.shape[0]
-    sp = compute_centroid_sym_perm(
+    sp, _L = compute_centroid_sym_perm(
         cent_idx, sym_matrices, 2.0 * np.pi * translations, fft_grid,
         validate=True, extend_trs=True)
     for s in range(sp.shape[0]):
@@ -114,25 +117,29 @@ def _make_mesh():
 
 
 def _hand_unfold_v_q(V_ibz, *, irr_idx, sym_idx,
-                     sym_perm, ntran):
-    """Reference: pure numpy unfold with the per-q TRS conj rule.
+                     sym_perm, L_table, q_irr_frac, ntran):
+    """Reference: pure numpy unfold with TRS conj + L umklapp phase.
 
     For spatial s < ntran:
-        V_full[q, μ, ν] = V_ibz[parent, π_s^{-1}(μ), π_s^{-1}(ν)]
+        V_full[q, μ, ν] = exp(2π i q_irr · (L_μ − L_ν))
+                          · V_ibz[parent, π_s(μ), π_s(ν)]
     For TRS s ≥ ntran:
-        V_full[q, μ, ν] = conj(V_ibz[parent, π_s^{-1}(μ), π_s^{-1}(ν)])
+        V_full[q, μ, ν] = conj(V_full_spatial[q, μ, ν])
     """
-    inv_perm = np.argsort(sym_perm, axis=-1)
     n_q_full = irr_idx.shape[0]
     n_rmu = V_ibz.shape[-1]
     V_full = np.zeros((n_q_full, n_rmu, n_rmu), dtype=V_ibz.dtype)
     for iq in range(n_q_full):
         parent = int(irr_idx[iq])
         s = int(sym_idx[iq])
-        perm_inv = inv_perm[s]               # length n_rmu
+        perm_fwd = np.asarray(sym_perm[s])               # length n_rmu
         is_trs = s >= ntran
-        V_perm = V_ibz[parent][np.ix_(perm_inv, perm_inv)]
-        V_full[iq] = np.conj(V_perm) if is_trs else V_perm
+        V_perm = V_ibz[parent][np.ix_(perm_fwd, perm_fwd)]
+        L_s = np.asarray(L_table[s], dtype=np.float64)   # (n_rmu, 3)
+        qL = L_s @ q_irr_frac[parent]                     # (n_rmu,)
+        phase = np.exp(2j * np.pi * qL)
+        V_phase = phase[:, None] * V_perm * np.conj(phase)[None, :]
+        V_full[iq] = np.conj(V_phase) if is_trs else V_phase
     return V_full
 
 
@@ -145,7 +152,7 @@ def test_unfold_v_q_ibz_to_full_handles_trs_rows():
     ntran = sym_matrices.shape[0]
     n_rmu = cent_idx.shape[0]
 
-    sym_perm = compute_centroid_sym_perm(
+    sym_perm, L_table = compute_centroid_sym_perm(
         cent_idx, sym_matrices, 2.0 * np.pi * translations, fft_grid,
         validate=True, extend_trs=True)
 
@@ -168,10 +175,18 @@ def test_unfold_v_q_ibz_to_full_handles_trs_rows():
         + 1j * rng.standard_normal((n_q_ibz, n_rmu, n_rmu))
     V_ibz = 0.5 * (A + np.swapaxes(A.conj(), -1, -2))
 
+    # Synthetic q_irr_frac — pick values that exercise the L-phase
+    # (non-Γ q's so any non-zero L_μ produces a phase).
+    q_irr_frac = np.array([[0.0, 0.0, 0.0],   # parent 0 = Γ (phase trivial)
+                           [0.25, 0.0, 0.0],  # parent 1 — non-zero q
+                           [0.0, 0.5, 0.0]],  # parent 2 — non-zero q
+                          dtype=np.float64)
+
     # Reference unfold.
     V_ref = _hand_unfold_v_q(
         V_ibz, irr_idx=full_to_irr_idx,
-        sym_idx=full_to_irr_sym, sym_perm=sym_perm, ntran=ntran)
+        sym_idx=full_to_irr_sym, sym_perm=sym_perm,
+        L_table=L_table, q_irr_frac=q_irr_frac, ntran=ntran)
 
     # Codebase unfold.  ``n_sym_spatial=ntran`` opts into the TRS
     # branch (conj at rows where ``full_to_irr_sym ≥ ntran``).
@@ -183,7 +198,10 @@ def test_unfold_v_q_ibz_to_full_handles_trs_rows():
             V_ibz_j,
             irr_idx=full_to_irr_idx,
             sym_idx=full_to_irr_sym,
-            sym_perm=sym_perm, mesh_xy=mesh,
+            sym_perm=sym_perm,
+            L_table=L_table,
+            q_irr_frac=q_irr_frac,
+            mesh_xy=mesh,
             n_sym_spatial=ntran)))
 
     max_diff = float(np.max(np.abs(V_full - V_ref)))
@@ -201,7 +219,7 @@ def test_unfold_v_q_ibz_to_full_hard_fails_without_extend_trs():
     fft_grid, sym_matrices, translations, cent_idx = _build_geometry()
     ntran = sym_matrices.shape[0]
 
-    sym_perm_legacy = compute_centroid_sym_perm(
+    sym_perm_legacy, L_legacy = compute_centroid_sym_perm(
         cent_idx, sym_matrices, 2.0 * np.pi * translations, fft_grid,
         validate=True, extend_trs=False)         # length ntran rows!
 
@@ -213,6 +231,7 @@ def test_unfold_v_q_ibz_to_full_hard_fails_without_extend_trs():
     mesh = _make_mesh()
     V_sh = NamedSharding(mesh, P(None, 'x', 'y'))
     V_ibz_j = jax.device_put(V_ibz, V_sh)
+    q_irr_frac = np.zeros((1, 3), dtype=np.float64)
 
     # New API: n_sym_spatial is required. A length-ntran sym_perm
     # is inconsistent with n_sym_spatial=ntran (which expects 2·ntran
@@ -223,7 +242,10 @@ def test_unfold_v_q_ibz_to_full_hard_fails_without_extend_trs():
             V_ibz_j,
             irr_idx=full_to_irr_idx,
             sym_idx=full_to_irr_sym,
-            sym_perm=sym_perm_legacy, mesh_xy=mesh,
+            sym_perm=sym_perm_legacy,
+            L_table=L_legacy,
+            q_irr_frac=q_irr_frac,
+            mesh_xy=mesh,
             n_sym_spatial=ntran)
 
 

@@ -884,6 +884,7 @@ def compute_all_V_q(
     q_full_to_irr_idx = None
     q_full_to_irr_sym = None
     sym_perm = None
+    L_table = None
     nq_total = nq_full
     q_list_for_tile = None
 
@@ -898,7 +899,7 @@ def compute_all_V_q(
             # values returned by ``sym.irr_idx_q/sym_idx_q``.  See
             # ``compute_centroid_sym_perm`` docstring and the audit
             # report (``reports/trs_sym_audit_2026-05-14``).
-            sym_perm = compute_centroid_sym_perm(
+            sym_perm, L_table = compute_centroid_sym_perm(
                 centroid_idx_np,
                 sym_matrices=np.asarray(sym.sym_matrices[:n_tran]),
                 translations=np.asarray(sym.translations[:n_tran]),
@@ -911,6 +912,7 @@ def compute_all_V_q(
                       f"falling back to full-BZ iteration.  Reason: "
                       f"{exc.args[0].splitlines()[0] if exc.args else exc}")
             sym_perm = None
+            L_table = None
 
         if sym_perm is not None:
             q_irr_kgrid_int = sym.q_irr_kgrid_int
@@ -1031,13 +1033,24 @@ def compute_all_V_q(
     if use_ibz:
         # ``sym_perm`` was built with ``extend_trs=True`` → shape
         # (2·ntran, n_rmu); the unfold helper applies a TRS-row conj
-        # when ``full_to_irr_sym ≥ n_sym_spatial``.
+        # when ``full_to_irr_sym ≥ n_sym_spatial``, AND applies the
+        # per-centroid umklapp phase from ``L_table``.
         n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
+        # Need q_irr_frac (fractional reciprocal coords of IBZ q-list)
+        # for the umklapp phase.  q_irr_kgrid_int is in kgrid-integer
+        # units; wrap to (−0.5, 0.5] then divide by kgrid (same convention
+        # used by v_q_g_flat._resolve_ibz_q_list).
+        _kg_arr = np.asarray(sym.kgrid, dtype=np.float64)
+        _q_int = np.asarray(q_irr_kgrid_int, dtype=np.float64)
+        _q_wrap = np.where(_q_int > _kg_arr / 2, _q_int - _kg_arr, _q_int)
+        q_irr_frac_for_phase = _q_wrap / _kg_arr
         V_acc = unfold_v_q(
             V_acc,
             irr_idx=q_full_to_irr_idx,
             sym_idx=q_full_to_irr_sym,
             sym_perm=sym_perm,
+            L_table=L_table,
+            q_irr_frac=q_irr_frac_for_phase,
             mesh_xy=mesh_xy,
             n_sym_spatial=n_sym_spatial,
         )

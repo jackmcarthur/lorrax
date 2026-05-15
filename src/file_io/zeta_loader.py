@@ -445,7 +445,7 @@ class ZetaLoader:
 
         r_perm = compute_rgrid_sym_perm(
             sym.sym_matrices, sym.translations, self.fft_grid)
-        mu_perm = compute_centroid_sym_perm(
+        mu_perm, _mu_L = compute_centroid_sym_perm(
             self.r_mu_fft_idx, sym.sym_matrices,
             sym.translations, self.fft_grid)
 

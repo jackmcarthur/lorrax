@@ -154,9 +154,13 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
     """Pick IBZ q's via centroid orbit closure, fall back to full BZ.
 
     Returns ``(q_irr_kgrid_int, q_irr_frac, q_full_to_irr_idx,
-    q_full_to_irr_sym, sym_perm, use_ibz)``.  When ``use_ibz`` is
-    False the *_idx / *_sym / sym_perm fields are None; caller skips
-    the post-loop unfold.
+    q_full_to_irr_sym, sym_perm, L_table, use_ibz)``.  When
+    ``use_ibz`` is False the *_idx / *_sym / sym_perm / L_table fields
+    are None; caller skips the post-loop unfold.
+
+    ``L_table`` is the per-(sym, μ) integer real-space lattice wrap
+    captured by ``compute_centroid_sym_perm``; ``unfold_v_q`` uses it
+    to build the umklapp phase ``exp(2π i q · (L_μ − L_ν))``.
     """
     nkx, nky, nkz = kgrid
     use_ibz = False
@@ -164,6 +168,7 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
     q_full_to_irr_idx = None
     q_full_to_irr_sym = None
     sym_perm = None
+    L_table = None
     if sym is not None and centroid_indices is not None:
         from centroid.orbit_syms import compute_centroid_sym_perm
         n_tran = int(np.asarray(sym.sym_matrices).shape[0])
@@ -175,7 +180,7 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
             # values returned by ``sym.irr_idx_q/sym_idx_q``.  See
             # ``compute_centroid_sym_perm`` docstring and the audit
             # report (``reports/trs_sym_audit_2026-05-14``).
-            sym_perm = compute_centroid_sym_perm(
+            sym_perm, L_table = compute_centroid_sym_perm(
                 cent_idx,
                 sym_matrices=np.asarray(sym.sym_matrices[:n_tran]),
                 translations=np.asarray(sym.translations[:n_tran]),
@@ -188,6 +193,7 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
                       f"full-BZ iteration.  Reason: "
                       f"{exc.args[0].splitlines()[0] if exc.args else exc}")
             sym_perm = None
+            L_table = None
         if sym_perm is not None:
             q_irr_kgrid_int = sym.q_irr_kgrid_int
             q_full_to_irr_idx = sym.irr_idx_q
@@ -209,7 +215,7 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
         q_irr_kgrid_int).astype(np.float64)
     q_irr_frac = q_irr_wrapped / kg_arr
     return (q_irr_kgrid_int, q_irr_frac,
-            q_full_to_irr_idx, q_full_to_irr_sym, sym_perm, use_ibz)
+            q_full_to_irr_idx, q_full_to_irr_sym, sym_perm, L_table, use_ibz)
 
 
 def _pick_g_chunk(ngkmax: int, target: int = 4096) -> int:
@@ -323,7 +329,7 @@ def _compute_V_q_g_flat_one_tile(
     # ---- IBZ list + per-tile v(q+G) -----------------------------------
     (_q_int, q_irr_frac,
      full_to_irr_idx, full_to_irr_sym,
-     sym_perm, use_ibz) = _resolve_ibz_q_list(
+     sym_perm, L_table, use_ibz) = _resolve_ibz_q_list(
         sym=sym, centroid_indices=centroid_indices,
         kgrid=kgrid, fft_grid=fft_grid, verbose=verbose)
     n_q_ibz = int(q_irr_frac.shape[0])
@@ -460,11 +466,14 @@ def _compute_V_q_g_flat_one_tile(
         # so its shape[0] is ``2·ntran``; the second half encodes the
         # TRS-augmented rows (centroid permutation unchanged under TRS,
         # but the unfold helper conjugates V_q at TRS-tagged q's).
+        # ``L_table`` is the per-(sym, μ) integer lattice wrap; the
+        # umklapp phase ``exp(2π i q_irr · (L_μ − L_ν))`` is essential
+        # for non-cubic / non-symmorphic systems.
         n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
         V_acc = unfold_v_q(
             V_acc, irr_idx=full_to_irr_idx, sym_idx=full_to_irr_sym,
-            sym_perm=sym_perm, mesh_xy=mesh_xy,
-            n_sym_spatial=n_sym_spatial)
+            sym_perm=sym_perm, L_table=L_table, q_irr_frac=q_irr_frac,
+            mesh_xy=mesh_xy, n_sym_spatial=n_sym_spatial)
         if write_g0:
             g0_acc = _unfold_g0_ibz_to_full(
                 g0_acc, full_to_irr_idx=full_to_irr_idx,
