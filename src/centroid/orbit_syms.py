@@ -72,19 +72,24 @@ def identity_syms():
 
 @jax.jit
 def orbit_images(reps: jnp.ndarray,
-                 S: jnp.ndarray,
+                 Rinv: jnp.ndarray,
                  tau: jnp.ndarray) -> jnp.ndarray:
-    """Apply forward sym op (S·r + τ, mod 1) to every rep.
+    """Apply BGW r-action ``r' = Rinv·r + τ`` (mod 1) to every rep.
 
-    Pass ``S = sym.R_grid`` (= ``wfn.sym_matrices``).  This matches
-    ``compute_centroid_sym_perm``'s direction so that downstream
-    closure validation succeeds on the same centroid set.  For
-    symmorphic systems (τ = 0) the choice of direction doesn't
-    matter (the group is closed under inversion).  For non-symmorphic
-    systems (Si Fd-3m, etc.) the forward direction IS required for
-    consistency with the V_q unfold path.
+    BGW's space-group action on real-space points is
+    ``r' = mtrx⁻¹ · r + τ`` where ``mtrx = wfn.sym_matrices`` and
+    ``τ = wfn.translations / (2π)``.  Pass ``Rinv = inv(mtrx)`` (=
+    ``sym.Rinv_grid``).  Verified by ``validate_atomic_symmetries`` on
+    Si Fd-3m: 96/96 atom mappings pass with this convention,
+    48/96 with the wrong-direction ``mtrx · r + τ`` action.
+
+    For symmorphic systems (CrI3, MoS2: τ=0) the choice of matrix
+    direction is moot — both produce the same orbit set because the
+    group is closed under inversion.  For non-symmorphic systems
+    (Si Fd-3m glides), only the BGW convention closes the orbit
+    properly.
     """
-    return jax.vmap(lambda Si, t: (reps @ Si.T + t) % 1.0)(S, tau)
+    return jax.vmap(lambda Ri, t: (reps @ Ri.T + t) % 1.0)(Rinv, tau)
 
 
 _CANON_INV = jnp.int64(10**12)
@@ -163,7 +168,7 @@ def snap_orbits_to_grid(reps_frac: np.ndarray,
 
 
 def unfold_orbit_unique_with_id(reps_np: np.ndarray,
-                                S: np.ndarray,
+                                Rinv: np.ndarray,
                                 tau: np.ndarray,
                                 tol: float = 1e-6,
                                 ) -> tuple[np.ndarray, np.ndarray]:
@@ -171,10 +176,10 @@ def unfold_orbit_unique_with_id(reps_np: np.ndarray,
     — a per-candidate integer that's the same for two candidates iff they
     lie in the same **physical** orbit under the WFN's sym group.
 
-    Pass ``S = wfn.sym_matrices`` (the forward sym matrix).  Direction
-    matches ``orbit_images`` and ``compute_centroid_sym_perm`` for
-    consistency with V_q unfold.  Critical for non-symmorphic systems
-    (τ ≠ 0); for symmorphic systems either direction gives the same set.
+    Pass ``Rinv = inv(wfn.sym_matrices) = sym.Rinv_grid``.  BGW's
+    r-action is ``r' = Rinv · r + τ``; this matches the direction used
+    by ``orbit_images``, ``compute_centroid_sym_perm``, and
+    ``validate_atomic_symmetries``.
 
     orbit_id is the integer encoding of each candidate's canonical
     (lex-smallest) orbit member, then run through ``np.unique`` to make
@@ -183,12 +188,12 @@ def unfold_orbit_unique_with_id(reps_np: np.ndarray,
     orbit during Lloyd get identical orbit_ids, so PC sees them as one
     orbit (not two).
     """
-    S = np.asarray(S); tau = np.asarray(tau)
+    Rinv = np.asarray(Rinv); tau = np.asarray(tau)
     inv = np.int64(round(1.0 / tol))         # int! avoid fp64-precision loss at 1e18
 
     # 1. Unfold + dedupe at fp tolerance.
-    # ``r @ S[s].T + τ[s]`` = forward S·r + τ in column form.
-    images = (np.einsum('ri,sji->srj', reps_np, S) + tau[:, None, :]) % 1.0
+    # ``r @ Rinv[s].T + τ[s]`` = Rinv·r + τ in column form (BGW r-action).
+    images = (np.einsum('ri,sji->srj', reps_np, Rinv) + tau[:, None, :]) % 1.0
     flat = images.reshape(-1, 3)
     keys = np.round(flat * inv).astype(np.int64) % inv
     _, first_idx = np.unique(keys, axis=0, return_index=True)
@@ -196,7 +201,7 @@ def unfold_orbit_unique_with_id(reps_np: np.ndarray,
 
     # 2. For each unique candidate, compute its canonical (lex-min) orbit
     #    member, then dense-encode the canonical triples as orbit_id.
-    cand_imgs = (np.einsum('ci,sji->scj', flat, S) + tau[:, None, :]) % 1.0
+    cand_imgs = (np.einsum('ci,sji->scj', flat, Rinv) + tau[:, None, :]) % 1.0
     cand_keys = np.round(cand_imgs * inv).astype(np.int64) % inv     # (n_sym, n, 3)
     # Lex via np.lexsort on (z, y, x) — primary key first in argument order
     # is leftmost; lexsort treats the LAST key as primary. So pass (z, y, x)
@@ -230,26 +235,32 @@ def compute_centroid_sym_perm(
     validate: bool = True,
     extend_trs: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Build (π_s, L_s) such that ``S_s r_μ + τ_s ≡ r_{π_s(μ)} + L_s,μ``
-    on the FFT grid, with ``L_s,μ ∈ ℤ³`` the integer lattice wrap.
+    """Build (α_s, L_s) for the BGW-convention r-action ``r' = inv(mtrx)·r + τ``.
 
-    The forward direction: S_s and τ_s acting on real space.  Per
-    ``reports/trs_sym_audit_2026-05-14/SYMMETRY_CONVENTIONS.md``,
-    ``wfn.sym_matrices`` IS the forward direct-space rotation U_s
-    (verified empirically; the prior reading of BGW source as
-    ``mtrx = inv(R)`` was wrong).  So ``S @ r + τ`` is the forward
-    physical sym; column-form ``S @ r`` is equivalent to row-form
-    ``r @ S.T``.  We use column-form via ``einsum('rj,sij->sri', ...)``.
+    For each target centroid μ and sym op s, compute the **source**
+    centroid α(μ) and integer real-space lattice wrap L_μ such that
 
-    The integer wrap ``L_s,μ`` is the per-centroid real-space lattice
-    translation needed when ``S r_μ + τ`` exits ``[0,1)³``.  V_q
-    transforms under sym + umklapp as
+        y_μ = mtrx · (x_μ − τ) = x_{α(μ)} + L_μ,     L_μ ∈ ℤ³.
 
-        V_full[q1, μ, ν] = exp(2π i q · (L_μ − L_ν)) · V_ibz[parent, α(μ), α(ν)]
+    Here ``mtrx = sym_matrices[s]``, ``x_μ = centroid frac coords``,
+    ``τ = translations[s] / (2π)``.  ``mtrx`` is BGW's stored matrix
+    (acts on G-vectors; BGW's r-action is ``r' = mtrx⁻¹·r + τ``).
+    Confirmed by ``validate_atomic_symmetries``: 96/96 Si atom mappings
+    pass with this convention; the wrong direction ``mtrx·r + τ`` gives
+    48/96 and breaks Si Fd-3m closure (see
+    ``reports/trs_sym_audit_2026-05-14/SYMMETRY_CONVENTIONS.md``).
 
-    where ``α(μ) = π_s(μ)`` (the centroid permutation) and ``L_μ`` is
-    captured here.  Without this wrap the unfold is wrong for any q
-    requiring umklapp on a non-symmorphic or non-cubic system.
+    The user-math formula for the V_q unfold then reads:
+
+        V_full[q1, μ', ν'] = exp(2π i q · (L_{μ'} − L_{ν'}))
+                             · V_ibz[parent, α(μ'), α(ν')]
+
+    where q = IBZ parent q in fractional reciprocal coords.  ``unfold_v_q``
+    consumes ``sym_perm = α`` and ``L_table = L`` directly (no argsort).
+    For symmorphic systems (τ=0), both α and its inverse give the same
+    orbit set (group closed under inversion), so the choice of "α" vs
+    "π" direction is irrelevant; for non-symmorphic systems (Si Fd-3m
+    glides) the α direction is required for the orbit to close.
 
     Parameters
     ----------
@@ -337,12 +348,16 @@ def compute_centroid_sym_perm(
     # transformation, then back to FFT indices after wrap.
     r_frac = idx.astype(np.float64) / fft_grid_np[None, :]    # (n_rmu, 3)
 
-    # Forward-direction centroid sym: images[s, μ] = S @ r_μ + τ (column form).
-    # We capture the integer lattice wrap L_s,μ = floor(images) BEFORE the
-    # mod-1 reduction; it feeds the umklapp phase exp(2π i q · (L_μ − L_ν))
-    # in unfold_v_q.  See SYMMETRY_CONVENTIONS.md for the derivation.
-    images_raw = np.einsum('rj,sij->sri', r_frac, S.astype(np.float64)) \
-                 + tau_frac[:, None, :]                              # (n_sym, n_rmu, 3)
+    # User-spec source-centroid + lattice-wrap decomposition:
+    #   y_μ = mtrx · (x_μ − τ) = x_{α(μ)} + L_μ, with L_μ ∈ ℤ³.
+    # BGW r-action ``r' = mtrx⁻¹ · r + τ`` ⇒ the SOURCE of x_μ under this
+    # action is mtrx·(x_μ−τ); the integer part is the lattice wrap that
+    # produces the umklapp phase exp(2π i q · L_μ) on ζ; the fractional
+    # part mod 1 is the centroid index α(μ) we permute by.  See
+    # SYMMETRY_CONVENTIONS.md.
+    r_shifted = r_frac[None, :, :] - tau_frac[:, None, :]            # (n_sym, n_rmu, 3)
+    # images_raw[s, μ, i] = (mtrx[s] · r_shifted[s, μ])_i = sum_j S[s,i,j] r_shifted[s,μ,j]
+    images_raw = np.einsum('sij,srj->sri', S.astype(np.float64), r_shifted)
     L_wrap = np.floor(images_raw).astype(np.int8)                    # integer lattice wrap
     images = images_raw - L_wrap.astype(np.float64)                  # in [0, 1)
 
