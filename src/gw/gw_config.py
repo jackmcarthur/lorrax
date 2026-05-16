@@ -182,6 +182,13 @@ _DEFAULTS = {
     "compute_mode": "auto",
     "do_screened": True,
     "bispinor": False,
+    # Enable IBZ cascade for bispinor V_q / W_q.  Requires bispinor=True.
+    # Default False until end-to-end validation gates land (Σ^B
+    # sym-vs-nosym <1 meV).  When True, the bispinor ζ̃ writes IBZ-only,
+    # the V_q orchestrator iterates IBZ q's per tile, post-loop unfolds
+    # via ``unfold_v_q`` and then applies the 3-vector Lorentz mixing
+    # via ``unfold_v_q_bispinor_lorentz`` (``reports/bispinor_ibz_2026-05-16``).
+    "bispinor_use_ibz": False,
     "do_G0": True,
     "self_consistent": False,
     "use_ppm_sigma": False,
@@ -697,6 +704,11 @@ class LorraxConfig:
     compute_mode_raw: str         # "auto" | one of ComputeMode.value strings
     do_screened: bool
     bispinor: bool
+    # When True, activate the IBZ cascade for bispinor V_q / W_q in
+    # parallel with the existing 2-comp charge path.  Requires
+    # ``bispinor=True``.  See derivation:
+    # ``reports/bispinor_ibz_2026-05-16/derivation.md``.
+    bispinor_use_ibz: bool
     do_G0: bool
     self_consistent: bool
     use_ppm_sigma: bool           # legacy mirror; ``compute_mode`` is canonical
@@ -996,6 +1008,7 @@ class LorraxConfig:
             compute_mode_raw=str(_g("compute_mode") or "auto").strip().lower(),
             do_screened=bool(_g("do_screened")),
             bispinor=bool(_g("bispinor")),
+            bispinor_use_ibz=bool(_g("bispinor_use_ibz")),
             do_G0=bool(_g("do_G0")),
             self_consistent=bool(_g("self_consistent")),
             use_ppm_sigma=bool(_g("use_ppm_sigma")),

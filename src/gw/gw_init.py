@@ -643,12 +643,14 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	_band_norms = getattr(wfn, 'band_norms', None)
 
 	# IBZ-only writes (default True) are skipped when bispinor mode is
-	# on: ``compute_V_q_bispinor_to_h5`` still iterates full-BZ q's and
-	# reads the charge ζ file at full-BZ offsets.  Once that
-	# orchestrator gains IBZ support, this can flip to ``True`` for
-	# bispinor too.
+	# on UNLESS ``bispinor_use_ibz=True`` activates the bispinor IBZ
+	# cascade (see derivation in
+	# ``reports/bispinor_ibz_2026-05-16/derivation.md``).  When the
+	# cascade is active, the bispinor V_q orchestrator iterates IBZ q's
+	# per tile and post-loop unfolds + Lorentz-mixes.
 	import os as _os_dbg
-	_write_ibz_only_charge = (not bool(cfg.bispinor)
+	_write_ibz_only_charge = ((not bool(cfg.bispinor)
+		or bool(getattr(cfg, 'bispinor_use_ibz', False)))
 		and not bool(int(_os_dbg.environ.get('LORRAX_FORCE_FULL_BZ', '0'))))
 	# Two cutoffs control the bare-Coulomb / ζ-sphere construction:
 	#   * ``bare_coulomb_cutoff_ry`` — V_q's sqrt_v(q+G) mask.
@@ -828,10 +830,13 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					cusolvermp_lu=cfg.backend.cusolvermp_lu,
 					gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
 					vertex_mu_L=mu_L,
-					# TODO(bispinor-ibz): port compute_V_q_bispinor_to_h5
-					# to consume IBZ-only ζ + post-loop unfold, then
-					# drop this opt-out.
-					write_ibz_only=False,
+					# Transverse ζ IBZ-write gated on the bispinor IBZ
+					# cascade flag — full-BZ on disk otherwise, since
+					# the bispinor V_q orchestrator only iterates IBZ
+					# q's when ``use_ibz`` is wired through.
+					write_ibz_only=(bool(cfg.bispinor)
+					                and bool(getattr(
+						                cfg, 'bispinor_use_ibz', False))),
 					zeta_cutoff_ry=_zeta_cutoff,
 				)
 		# Surface the transverse-centroid ψ to the caller so it can build
@@ -926,6 +931,26 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 			compute_V_q_bispinor_to_h5, BispinorVqReader, tile_dataset_name,
 		)
 		from .compute_vcoul import make_v_munu_chunked_kernel
+		from file_io.centroids import load_centroids as _load_centroids
+
+		# Reload the transverse centroid indices for the bispinor IBZ
+		# cascade.  fit_zeta loaded them earlier but didn't surface them
+		# to compute_V_q's signature; reloading is cheap (a text file
+		# read) and keeps the bispinor IBZ wiring local to this branch.
+		_bispinor_use_ibz = bool(getattr(cfg, 'bispinor_use_ibz', False))
+		if _bispinor_use_ibz:
+			_cents_curr_path = cfg.paths.centroids_file_current
+			_, _cent_T_idx_np, _ = _load_centroids(
+				_cents_curr_path, meta.fft_grid)
+			_cent_T_idx_for_orchestrator = np.asarray(
+				_cent_T_idx_np, dtype=np.int32)
+			_cent_C_idx_for_orchestrator = (
+				np.asarray(jax.device_get(centroid_indices),
+				           dtype=np.int32)
+				if centroid_indices is not None else None)
+		else:
+			_cent_T_idx_for_orchestrator = None
+			_cent_C_idx_for_orchestrator = None
 
 		bispinor_h5_path = os.path.join(zeta_dir, "v_q_bispinor.h5")
 		print_fn(f"\n  [bispinor] V_q^{{μ_L,ν_L}} → {bispinor_h5_path}")
@@ -982,6 +1007,10 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 							         if cfg.memory.vq_g_chunk_size > 0 else None),
 							backend=cfg.backend.slab_io,
 							print_fn=print_fn,
+							sym=sym if _bispinor_use_ibz else None,
+							centroid_C_idx=_cent_C_idx_for_orchestrator,
+							centroid_T_idx=_cent_T_idx_for_orchestrator,
+							use_ibz=_bispinor_use_ibz,
 						)
 			else:
 				# Legacy r-space path — μ × ν tile driver.

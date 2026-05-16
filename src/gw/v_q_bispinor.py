@@ -500,6 +500,11 @@ def compute_V_q_bispinor_g_flat_to_h5(
     use_ffi_io: bool | None = None,
     print_fn=print,
     verbose: bool = True,
+    # IBZ cascade plumbing (default disabled — must opt in via gw_init).
+    sym=None,
+    centroid_C_idx: np.ndarray | None = None,
+    centroid_T_idx: np.ndarray | None = None,
+    use_ibz: bool = False,
 ) -> Path:
     """Stream the 7 unique bispinor V_q^{μ_L, ν_L} tiles to HDF5 via the
     G-flat per-q + G-chunked path.
@@ -540,6 +545,47 @@ def compute_V_q_bispinor_g_flat_to_h5(
         io.write_attr("n_rmu_T", np.int64(n_rmu_T))
         io.write_attr("n_q_total", np.int64(nq_total))
 
+    # ------------------------------------------------------------------
+    # IBZ cascade plumbing.  When ``use_ibz=True`` the bispinor ζ̃ files
+    # were written IBZ-only (see ``gw_init.fit_zeta`` and
+    # ``isdf_fitting.fit_zeta_to_h5``); the per-tile kernel iterates the
+    # parent IBZ q-list and unfolds post-loop via ``unfold_v_q``.  Two
+    # centroid sets ⇒ two orbit-closure checks (CC ↔ charge, TT ↔
+    # transverse); they may diverge in principle but in practice are
+    # generated together by the user's ``kmeans_cli --orbit-aware`` run.
+    # If either set's closure check fails, fall back to full-BZ for the
+    # corresponding tiles and log loudly.  See derivation §A5.
+    # ------------------------------------------------------------------
+    from .v_q_g_flat import _resolve_ibz_q_list
+
+    def _ibz_tables_for(centroid_idx, label):
+        if not use_ibz or sym is None or centroid_idx is None:
+            return None, False
+        tables = _resolve_ibz_q_list(
+            sym=sym, centroid_indices=np.asarray(centroid_idx, dtype=np.int32),
+            kgrid=kgrid, fft_grid=fft_grid, verbose=False)
+        (_, _, _, _, _sym_perm, _L_table, _ok) = tables
+        if not _ok and verbose and jax.process_index() == 0:
+            print_fn(f"  [bispinor g-flat] {label}-centroid orbit closure "
+                     f"failed — falling back to full-BZ for {label} tiles.  "
+                     f"Regenerate centroids with ``kmeans_cli --orbit-aware`` "
+                     f"to enable the IBZ cascade.")
+        return tables, _ok
+
+    _ibz_C, _use_ibz_C = _ibz_tables_for(centroid_C_idx, 'charge')
+    _ibz_T, _use_ibz_T = _ibz_tables_for(centroid_T_idx, 'transverse')
+
+    # Buffer the 6 unique TT tiles post-unfold so we can apply the 3×3
+    # Lorentz mixing across them before writing.  CC tile streams straight
+    # to disk — no mixing.  Decision: write-time mixing keeps the on-disk
+    # format identical to the existing post-mix tiles (downstream Σ^B
+    # reads them unchanged via BispinorVqReader.get_tile).  Alternative
+    # (read-time mixing inside the reader) would require all 9 TT tiles
+    # to be in memory for any single get_tile(i, j) call — write-time
+    # mixing keeps the reader's per-tile contract clean.  See derivation
+    # §A5 (the algebraic identity for V^{i,j}_full[q]).
+    tt_buffer: dict[tuple[int, int], jax.Array] = {}
+
     for tile_idx, (mu_L, nu_L) in enumerate(UNIQUE_TILES):
         same_zeta = (mu_L == nu_L)
         loader_L = zeta_C_loader if mu_L == 0 else zeta_T_loaders[mu_L - 1]
@@ -549,6 +595,14 @@ def compute_V_q_bispinor_g_flat_to_h5(
         n_rmu_L = n_rmu_C if mu_L == 0 else n_rmu_T
         n_rmu_R = n_rmu_C if nu_L == 0 else n_rmu_T
         write_g0 = (mu_L == 0 and nu_L == 0)
+        is_CC = (mu_L == 0 and nu_L == 0)
+
+        # CC tile: charge-centroid orbit closure.  TT tiles: transverse-
+        # centroid orbit closure.  These are independent; either may
+        # fall back to full-BZ if its centroid set isn't orbit-closed.
+        _tile_use_ibz = _use_ibz_C if is_CC else _use_ibz_T
+        _tile_sym = sym if _tile_use_ibz else None
+        _tile_cent = (centroid_C_idx if is_CC else centroid_T_idx) if _tile_use_ibz else None
 
         v_builder = _make_per_q_v_builder_for_tile(
             mu_L=mu_L, nu_L=nu_L,
@@ -580,7 +634,8 @@ def compute_V_q_bispinor_g_flat_to_h5(
             print_fn(f"  [bispinor g-flat] tile "
                      f"{tile_idx + 1}/{len(UNIQUE_TILES)} "
                      f"(μ_L={mu_L}, ν_L={nu_L})  n_rmu_L={n_rmu_L} "
-                     f"n_rmu_R={n_rmu_R}  same_zeta={same_zeta}")
+                     f"n_rmu_R={n_rmu_R}  same_zeta={same_zeta}  "
+                     f"use_ibz={_tile_use_ibz}")
 
         V_acc, g0_acc = _compute_V_q_g_flat_one_tile(
             loader_L, loader_R,
@@ -588,38 +643,89 @@ def compute_V_q_bispinor_g_flat_to_h5(
             kgrid=kgrid, fft_grid=fft_grid, bvec=bvec,
             mesh_xy=mesh_xy,
             g_chunk=g_chunk,
-            sym=None, centroid_indices=None,           # full-BZ on disk
+            sym=_tile_sym, centroid_indices=_tile_cent,
             write_g0=write_g0,
             timing_label=tile_dataset_name(mu_L, nu_L),
             verbose=verbose,
         )
 
-        # Stream this tile to disk at logical extent; padded μ trail
-        # rows are zero by writer construction and SlabIO's
-        # ``valid_shape=`` clips them on write so files round-trip
-        # across process counts regardless of internal padding.
-        name = tile_dataset_name(mu_L, nu_L)
-        v_padded_shape = tuple(int(s) for s in V_acc.shape)
-        v_logical_shape = (int(v_padded_shape[0]), n_rmu_L, n_rmu_R)
-        with SlabIO(output_h5_path, mode='a', mesh=mesh_xy,
-                    backend=backend, use_ffi_io=use_ffi_io) as tile_io:
-            tile_io.create_dataset(
-                name, shape=v_logical_shape, dtype=V_acc.dtype)
-            tile_io.write_slab(
-                name, V_acc,
-                global_shape=v_logical_shape,
-                valid_shape=v_logical_shape)
-            if write_g0 and g0_acc is not None:
-                g0_padded_shape = tuple(int(s) for s in g0_acc.shape)
-                g0_logical_shape = (int(g0_padded_shape[0]), n_rmu_L)
+        if is_CC or not _use_ibz_T:
+            # Two cases stream straight to disk per-tile:
+            #   * CC tile — never Lorentz-mixed (γ̃^0 = I is invariant).
+            #   * TT tiles when the transverse IBZ cascade is off — the
+            #     unfold inside ``_compute_V_q_g_flat_one_tile`` was a
+            #     no-op (full-BZ path), no mixing needed.  Buffering all
+            #     6 TT tiles would inflate peak memory; we preserve the
+            #     pre-IBZ "free between tiles" behaviour exactly.
+            name = tile_dataset_name(mu_L, nu_L)
+            v_padded_shape = tuple(int(s) for s in V_acc.shape)
+            v_logical_shape = (int(v_padded_shape[0]), n_rmu_L, n_rmu_R)
+            with SlabIO(output_h5_path, mode='a', mesh=mesh_xy,
+                        backend=backend, use_ffi_io=use_ffi_io) as tile_io:
                 tile_io.create_dataset(
-                    f"{name}_g0", shape=g0_logical_shape,
-                    dtype=g0_acc.dtype)
+                    name, shape=v_logical_shape, dtype=V_acc.dtype)
                 tile_io.write_slab(
-                    f"{name}_g0", g0_acc,
-                    global_shape=g0_logical_shape,
-                    valid_shape=g0_logical_shape)
-        del V_acc, g0_acc
+                    name, V_acc,
+                    global_shape=v_logical_shape,
+                    valid_shape=v_logical_shape)
+                if write_g0 and g0_acc is not None:
+                    g0_padded_shape = tuple(int(s) for s in g0_acc.shape)
+                    g0_logical_shape = (int(g0_padded_shape[0]), n_rmu_L)
+                    tile_io.create_dataset(
+                        f"{name}_g0", shape=g0_logical_shape,
+                        dtype=g0_acc.dtype)
+                    tile_io.write_slab(
+                        f"{name}_g0", g0_acc,
+                        global_shape=g0_logical_shape,
+                        valid_shape=g0_logical_shape)
+            del V_acc, g0_acc
+        else:
+            # Buffer for post-loop Lorentz mixing (IBZ cascade active on
+            # the transverse centroid set).
+            tt_buffer[(mu_L, nu_L)] = V_acc
+            del g0_acc
+
+    # ------------------------------------------------------------------
+    # Lorentz mixing on the TT block.  Only runs when the transverse IBZ
+    # cascade is active — the 3×3 mixing is a no-op on full-BZ data
+    # because the per-q sym op is identity there.  See derivation §A5.
+    # ------------------------------------------------------------------
+    if _use_ibz_T and sym is not None and tt_buffer:
+        from common.symmetry_maps import unfold_v_q_bispinor_lorentz
+
+        # Synthesise the 3 Hermitian-redundant tiles (j, i) for i < j from
+        # the stored upper-triangle.  These are needed as INPUTS to the
+        # 3×3 contraction; we write only the 6 unique upper-triangle outputs.
+        tt_full_in: dict[tuple[int, int], jax.Array] = dict(tt_buffer)
+        for (j, i), (i_src, j_src) in HERMITIAN_PAIRS.items():
+            tt_full_in[(j, i)] = jnp.conj(
+                jnp.swapaxes(tt_buffer[(i_src, j_src)], -1, -2))
+
+        tt_mixed = unfold_v_q_bispinor_lorentz(
+            tt_full_in,
+            sym_idx=np.asarray(sym.sym_idx_q, dtype=np.int32),
+            R_proper_table=np.asarray(sym.R_proper, dtype=np.float64),
+            mesh_xy=mesh_xy,
+        )
+
+        # Write the 6 unique upper-triangle TT tiles post-mix.
+        for (mu_L, nu_L) in UNIQUE_TILES:
+            if mu_L == 0 and nu_L == 0:
+                continue
+            V_mix = tt_mixed[(mu_L, nu_L)]
+            name = tile_dataset_name(mu_L, nu_L)
+            v_padded_shape = tuple(int(s) for s in V_mix.shape)
+            v_logical_shape = (int(v_padded_shape[0]), n_rmu_T, n_rmu_T)
+            with SlabIO(output_h5_path, mode='a', mesh=mesh_xy,
+                        backend=backend, use_ffi_io=use_ffi_io) as tile_io:
+                tile_io.create_dataset(
+                    name, shape=v_logical_shape, dtype=V_mix.dtype)
+                tile_io.write_slab(
+                    name, V_mix,
+                    global_shape=v_logical_shape,
+                    valid_shape=v_logical_shape)
+        del tt_full_in, tt_mixed
+    del tt_buffer
 
     # Format string + tile-layout JSON — rank-0 post-close write so
     # the BispinorVqReader can h5-open without rank coordination.

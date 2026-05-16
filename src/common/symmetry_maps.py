@@ -473,6 +473,144 @@ def _get_unfold_v_q_jit(
     return _do_unfold
 
 
+def unfold_v_q_bispinor_lorentz(
+    V_tt_per_channel,
+    *,
+    sym_idx,
+    R_proper_table,
+    mesh_xy,
+):
+    """Apply the 3-vector Lorentz mixing on the bispinor TT-block tiles.
+
+    Operates on the (μ_L, ν_L) ∈ {1,2,3}² block of bispinor V_q tiles that
+    have already been passed through :func:`unfold_v_q` (centroid
+    double-permute + L-phase + TRS conj-wrap).  Implements the rule from
+    ``reports/bispinor_ibz_2026-05-16/derivation.md`` §A5::
+
+        V^{i,j}_mixed[q, μ, ν]
+            = Σ_{α, β ∈ {1,2,3}} R_proper[s(q), i-1, α-1]
+                                  · R_proper[s(q), j-1, β-1]
+                                  · V^{α,β}_unfolded[q, μ, ν]
+
+    where ``s(q) = sym_idx[q]`` and ``R_proper`` is the proper (det = +1)
+    Cartesian rotation table on ``SymMaps``.  TRS rows reuse the spatial
+    ``R_proper``: the σ-flip TRS sigma-sign on (μ_L, ν_L) ∈ {1,2,3}²
+    factorises as (−1)·(−1) = +1 on every stored UNIQUE_TILE and is
+    absorbed by the existing scalar ``unfold_v_q`` conj-wrap (derivation
+    §A4).
+
+    Parameters
+    ----------
+    V_tt_per_channel : dict[(i, j) -> jax.Array]
+        Dict keyed by ``(i, j)`` with ``i, j ∈ {1, 2, 3}`` (9 entries).
+        Each value is ``(n_q_full, μ, ν)`` complex128 already at full-BZ
+        shape, sharded ``P(None, 'x', 'y')``.  Callers may pass the 6
+        unique tiles + the 3 Hermitian-redundant tiles synthesised via
+        ``conj(swapaxes(V[i,j], -1, -2))``.
+    sym_idx : np.ndarray | jax.Array
+        ``(n_q_full,)`` int — ``SymMaps.sym_idx_q`` (TRS-augmented).
+    R_proper_table : np.ndarray
+        ``(2·n_sym_spatial, 3, 3)`` float64 — ``SymMaps.R_proper``.
+        Both spatial and TRS halves contain the same spatial ``R_proper``
+        per the derivation.
+    mesh_xy : jax.sharding.Mesh
+        Device mesh (used to lock the output sharding).
+
+    Returns
+    -------
+    dict[(i, j) -> jax.Array]
+        Same keys, same shapes, sharded ``P(None, 'x', 'y')``.
+    """
+    sym_arr = np.asarray(sym_idx, dtype=np.int32)
+    R_arr = np.asarray(R_proper_table, dtype=np.float64)
+    if R_arr.ndim != 3 or R_arr.shape[1:] != (3, 3):
+        raise ValueError(
+            f"unfold_v_q_bispinor_lorentz: R_proper_table must have shape "
+            f"(2·n_sym_spatial, 3, 3); got {R_arr.shape}.")
+    # Per-q 3×3 mixer baked into the jit closure as a constant — same
+    # caching pattern as ``unfold_v_q`` (small int + float table folded
+    # into HLO).  ``R_per_q[q]`` ∈ R^{3×3} is the spatial rotation that
+    # mixes the (1,2,3) Lorentz indices for full-BZ q.
+    R_per_q = R_arr[sym_arr]                                # (n_q_full, 3, 3)
+
+    # Build the 9×9 source array V_in[α, β] at full-BZ shape, contract,
+    # write back into the same 6 unique slots (plus 3 redundants).
+    keys_in = [(i, j) for i in (1, 2, 3) for j in (1, 2, 3)]
+    for k in keys_in:
+        if k not in V_tt_per_channel:
+            raise ValueError(
+                f"unfold_v_q_bispinor_lorentz: missing TT tile {k}; "
+                f"caller must supply all 9 (i, j) ∈ {{1,2,3}}² "
+                f"(use ``conj(swapaxes(.., -1, -2))`` to synthesise the "
+                f"Hermitian-redundant entries).")
+    sample = V_tt_per_channel[(1, 1)]
+    V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    R_dev = jnp.asarray(R_per_q)                            # closure constant
+
+    fn = _get_unfold_v_q_lorentz_jit(
+        V_shape=tuple(int(s) for s in sample.shape),
+        R_per_q_arr=R_per_q,
+        mesh_xy=mesh_xy,
+    )
+    # Stack input tiles in (α, β, q, μ, ν) layout; contract via einsum
+    # and unstack into the output dict.
+    V_in = jnp.stack(
+        [jnp.stack([V_tt_per_channel[(a, b)] for b in (1, 2, 3)], axis=0)
+         for a in (1, 2, 3)],
+        axis=0,
+    )                                                       # (3, 3, n_q, μ, ν)
+    V_out = fn(V_in)                                        # (3, 3, n_q, μ, ν)
+    return {
+        (i, j): jax.lax.with_sharding_constraint(V_out[i - 1, j - 1], V_sh)
+        for i in (1, 2, 3) for j in (1, 2, 3)
+    }
+
+
+_UNFOLD_V_Q_LORENTZ_JIT_CACHE: dict = {}
+
+
+def _get_unfold_v_q_lorentz_jit(*, V_shape, R_per_q_arr, mesh_xy):
+    """Cache the inner Lorentz-mix jit by (shape, R-table content).
+
+    Same content-keyed caching strategy as :func:`_get_unfold_v_q_jit`:
+    the R table is baked into the jit closure as a constant so XLA can
+    fold it into the HLO.  The cache key is the bytes-hash of the
+    table plus the V shape plus the mesh identity.
+    """
+    key = (
+        V_shape,
+        R_per_q_arr.shape, R_per_q_arr.tobytes(),
+        id(mesh_xy),
+    )
+    hit = _UNFOLD_V_Q_LORENTZ_JIT_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    R_per_q_j = jnp.asarray(R_per_q_arr)                    # (n_q_full, 3, 3)
+    V_sh = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
+    in_sh = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
+
+    @partial(jax.jit, in_shardings=in_sh, out_shardings=V_sh)
+    def _do_mix(V_in):
+        # V_in: (3, 3, n_q, μ, ν).  Derivation §A5 (in its own R_proper
+        # convention ``R_deriv = A.T · inv(mtrx) · inv(A.T)``):
+        #     V^{i,j} = Σ_{α,β} R_deriv^{i,α} · R_deriv^{j,β} · V^{α,β}.
+        # The LIVE ``R_per_q`` here is ``R_LORRAX`` (``A.T · mtrx ·
+        # inv(A.T)`` with the det-flip; see ``SymMaps.R_proper``
+        # docstring).  For orthogonal mtrx ``R_LORRAX = R_deriv.T``
+        # row-wise, so ``R_deriv^{i,α} = R_LORRAX^{α,i}`` and the
+        # contraction becomes
+        #     V^{i,j} = Σ R_LORRAX^{α,i}(q) · R_LORRAX^{β,j}(q) · V^{α,β}(q).
+        # In einsum letters with R indexed [q, row, col]:
+        return jnp.einsum(
+            'qai,qbj,abqmn->ijqmn',
+            R_per_q_j, R_per_q_j, V_in,
+        )
+
+    _UNFOLD_V_Q_LORENTZ_JIT_CACHE[key] = _do_mix
+    return _do_mix
+
+
 # i·σ_y (time-reversal spinor factor in the SOC convention T = iσ_y K).
 _I_SIGMA_Y = np.array([[0.0, 1.0], [-1.0, 0.0]], dtype=np.complex128)
 
@@ -639,6 +777,11 @@ class SymMaps:
             self.Rinv_grid = self.R_grid.copy()
             self.R_cart = self.R_grid.astype(float)
             self.U_spinor = np.eye(2, dtype=complex)[None, :, :]
+            # ``R_proper`` is the proper (det = +1) Cartesian rotation used
+            # by the bispinor 3-vector vertex mixing.  Identity case: a
+            # single 3×3 identity is its own proper part.  See
+            # ``reports/bispinor_ibz_2026-05-16/derivation.md`` §A2.
+            self.R_proper = np.eye(3, dtype=np.float64)[None, :, :]
 
             # Build direct integer-grid lookup for the identity/no-symmetry case.
             kgrid = np.asarray(wfn.kgrid, dtype=np.int32)
@@ -758,6 +901,40 @@ class SymMaps:
         # Site #6 for the per-element derivation.
         self.R_cart = self.syms_crystal_to_cartesian(wfn)
         self.U_spinor = self.get_spinor_rotations(wfn, self.R_cart[:wfn.ntran])
+        # ``R_proper[s]`` is the PROPER (det=+1) Cartesian rotation that
+        # mixes the bispinor 3-vector vertices ``γ̃^{1,2,3} = (σ_x, σ_y,
+        # σ_z)`` per the SO(3) image of ``U_spinor``'s SU(2) sandwich:
+        #   ``U_spinor[s]† σ^i U_spinor[s] = Σ_j R_proper[s]^{j,i} σ^j``.
+        # This is the SAME rotation matrix that ``get_spinor_rotations``
+        # consumes (``A · mtrx · A⁻¹`` with the det-flip — see
+        # ``syms_crystal_to_cartesian`` docstring), so ``R_proper`` is
+        # just ``R_cart`` with the same proper-flip that
+        # ``get_spinor_rotations`` applies internally at line 1069.
+        # Derivation: ``reports/bispinor_ibz_2026-05-16/derivation.md``
+        # §A2; mixing rule §A5
+        #   ``V^{i,j}_full[q] = R_proper^{i,α}(s) · R_proper^{j,β}(s) ·
+        #                       V^{α,β}_unfolded[q]``.
+        #
+        # NOTE: this differs from the OFFLINE fixture
+        # ``reports/bispinor_ibz_2026-05-16/cri3_R_proper.npz`` by a
+        # transpose on every row — the fixture follows the derivation
+        # TEXT (``O = A · U · A⁻¹``, ``U = mtrx⁻¹``), while the live
+        # code follows the σ-sandwich identity that LORRAX's actual
+        # ``U_spinor`` satisfies (built from ``A · mtrx · A⁻¹``).  The
+        # two are inverses of each other for orthogonal mtrx and pick
+        # up a transpose on the (i, j) indices of the §A5 formula.
+        #
+        # TRS half reuses the SPATIAL R_proper (NOT ``−R_spatial``): the
+        # σ-flip TRS sigma-sign on the (μ_L, ν_L) ∈ {1,2,3}² block
+        # factorises as (−1)·(−1) = +1 on every stored UNIQUE_TILE and
+        # is absorbed by the existing ``unfold_v_q`` conj-wrap.  See
+        # derivation §A4.
+        _R_spatial = np.asarray(self.R_cart[:wfn.ntran], dtype=np.float64)
+        _R_proper_spatial = np.where(
+            np.linalg.det(_R_spatial)[:, None, None] < 0,
+            -_R_spatial, _R_spatial)
+        self.R_proper = np.concatenate(
+            [_R_proper_spatial, _R_proper_spatial], axis=0)
         self.kq_map = self.get_kminusq_map(wfn, self.unfolded_kpts)
         self.kqfull_map = self.get_kminusqfull_map(wfn, self.unfolded_kpts)
 

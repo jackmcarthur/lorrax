@@ -205,7 +205,8 @@ def main(argv=None):
 		# centroid double-permute + L-phase + TRS conj under sym).
 		# Bispinor / explicit-full-BZ debug bypass match the V_q gate.
 		_use_ibz_w_requested = (
-			not bool(config.bispinor)
+			(not bool(config.bispinor)
+			 or bool(getattr(config, 'bispinor_use_ibz', False)))
 			and not bool(int(os.environ.get('LORRAX_FORCE_FULL_BZ', '0'))))
 		_ibz_tables = None
 		if _use_ibz_w_requested and getattr(sym, 'q_irr_full_idx', None) is not None:

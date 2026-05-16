@@ -2048,9 +2048,30 @@ def fit_zeta_to_h5(
                 fft_grid=np.asarray(meta.fft_grid, dtype=np.int32),
             )
         except RuntimeError as _exc:
+            # On the transverse bispinor channels (vertex_mu_L ∈ {1,2,3})
+            # ``write_ibz_only=True`` is set ONLY when the caller has
+            # explicitly opted into the bispinor IBZ cascade via
+            # ``cohsex.in: bispinor_use_ibz=true``.  Silently falling back
+            # to full-BZ on disk would create an inconsistency with the
+            # bispinor V_q orchestrator (which assumes ζ̃_T is IBZ-only
+            # when the cascade is on).  Loud-fail the run and tell the
+            # user how to regenerate centroids.
+            _first = (_exc.args[0].splitlines()[0]
+                      if _exc.args else str(_exc))
+            if int(vertex_mu_L) != 0:
+                raise RuntimeError(
+                    f"Bispinor transverse ζ̃^{{μ_L={int(vertex_mu_L)}}} "
+                    f"IBZ-write requested (bispinor_use_ibz=true), but the "
+                    f"transverse centroid set fails the orbit-closure "
+                    f"check under the WFN sym group: {_first}.  "
+                    f"Regenerate the transverse centroid file with "
+                    f"``centroid.kmeans_cli --density-mode current "
+                    f"--orbit-aware ...`` so the resulting set is closed "
+                    f"under the spatial sym group, or disable the "
+                    f"bispinor IBZ cascade with "
+                    f"``bispinor_use_ibz=false``."
+                ) from _exc
             if jax.process_index() == 0:
-                _first = (_exc.args[0].splitlines()[0]
-                          if _exc.args else str(_exc))
                 print(f"  q-IBZ reduction: centroid orbit closure failed "
                       f"— falling back to full-BZ on disk.  Reason: "
                       f"{_first}")
