@@ -11,6 +11,7 @@ from functools import partial
 import numpy as np
 import jax
 import jax.numpy as jnp
+from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from file_io import WfnLoader as WFNReader
 
@@ -370,39 +371,103 @@ def _get_unfold_v_q_jit(
     L_j = jnp.asarray(L_arr)
     q_irr_j = jnp.asarray(q_irr_arr)
     trs_mask_j = jnp.asarray(trs_mask_arr)
+    # Memory contract: never exceed 1× single-tile per rank.  Use
+    # ``shard_map`` + ``lax.all_to_all`` to redistribute axes between
+    # ranks volume-preservingly — at no point does any rank hold a
+    # full μ or ν axis (which would be Px× or Py× the single-tile
+    # memory).  The all_to_all calls split the OTHER big spatial axis
+    # (ν during the μ-permute step, μ during the ν-permute step), so
+    # this works for arbitrary Px·Py even when n_q < Px·Py.
+    n_rmu_padded = int(V_q_shape[-1])
+    Px = int(mesh_xy.shape['x'])
+    Py = int(mesh_xy.shape['y'])
+    if n_rmu_padded % (Px * Py) != 0:
+        raise ValueError(
+            f"unfold_v_q: n_rmu_padded={n_rmu_padded} must be divisible "
+            f"by Px*Py={Px*Py} for the all_to_all redistribution.  The "
+            f"μ-padding in Meta should already enforce this — check "
+            f"that meta.n_rmu_padded is mesh-divisible.")
     V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
     @partial(jax.jit, out_shardings=V_sh)
     def _do_unfold(V_ibz):
-        perm_q = fwd_perm_j[sym_j]                          # (n_q_full, n_rmu)
-        V_at_irr = V_ibz[idx_j]                              # (n_q_full, μ, μ)
-        # ``promise_in_bounds`` skips the OOB-fill branch that under
-        # shard_map+x64 mints an s32/s64 mismatch in the HLO verifier
-        # (perm_q is permutation-by-construction, so the bounds check
-        # is gratuitous).
-        V_perm_mu = jnp.take_along_axis(
-            V_at_irr, perm_q[:, :, None], axis=1,
-            mode='promise_in_bounds')
-        V_full = jnp.take_along_axis(
-            V_perm_mu, perm_q[:, None, :], axis=2,
-            mode='promise_in_bounds')
-        # Umklapp phase: exp(2π i q_irr · (L_μ − L_ν)).  L_μ here is
-        # L_table[s(q), μ] — the wrap of centroid μ under the FULL-BZ
-        # sym op s(q) (NOT permuted; the empirical V_q test in
-        # ``reports/trs_sym_audit_2026-05-14/verify_umklapp_user_math.py``
-        # uses this convention and closes at ISDF noise floor).
-        L_per_q = L_j[sym_j]                                # (n_q_full, n_rmu, 3)
-        q_per_q = q_irr_j[idx_j]                            # (n_q_full, 3)
-        qL = jnp.einsum('qi,qmi->qm', q_per_q, L_per_q)     # (n_q_full, n_rmu)
-        phase = jnp.exp(2j * jnp.pi * qL.astype(jnp.complex128))
-        V_full = (phase[:, :, None] * V_full
-                  * jnp.conj(phase)[:, None, :])
-        # TRS rows: per-element rule
-        # V_full[TRS-q, μ, ν] = conj(V_ibz[parent, μ, ν])
-        # = V_ibz[parent, ν, μ] (by Hermiticity).
-        V_full = jnp.where(
-            trs_mask_j[:, None, None], jnp.conj(V_full), V_full)
-        return V_full
+        @partial(shard_map, mesh=mesh_xy,
+                 in_specs=P(None, 'x', 'y'),
+                 out_specs=P(None, 'x', 'y'),
+                 check_rep=False)
+        def _kernel(V_ibz_local):
+            # V_ibz_local: (n_q_ibz, μ/Px, ν/Py)
+            perm_q = fwd_perm_j[sym_j]                      # (n_q_full, n_rmu)
+            # Gather q axis (replicated → local concat via idx_j).
+            V_at_irr = V_ibz_local[idx_j]                   # (n_q_full, μ/Px, ν/Py)
+
+            # μ permute on 'x'.  all_to_all redistributes:
+            #   split  ν (local, /Py)  → ν / (Py·Px)
+            #   concat μ (/Px sharded) → full μ
+            # Volume per rank: n_q · μ · ν / (Px·Py) — unchanged from 1× tile.
+            # Required: ν/Py divisible by Px (ensured by n_rmu_padded mod (Px·Py)=0).
+            if Px > 1:
+                V_x = jax.lax.all_to_all(
+                    V_at_irr, 'x', split_axis=2, concat_axis=1, tiled=True)
+                # (n_q_full, μ, ν/(Px·Py))
+                V_x_perm = jnp.take_along_axis(
+                    V_x, perm_q[:, :, None], axis=1,
+                    mode='promise_in_bounds')
+                V_perm_mu = jax.lax.all_to_all(
+                    V_x_perm, 'x', split_axis=1, concat_axis=2, tiled=True)
+                # (n_q_full, μ/Px, ν/Py)  — back to canonical
+            else:
+                V_perm_mu = jnp.take_along_axis(
+                    V_at_irr, perm_q[:, :, None], axis=1,
+                    mode='promise_in_bounds')
+
+            # ν permute on 'y'.  Mirror trick on the 'y' axis.
+            # Required: μ/Px divisible by Py.
+            if Py > 1:
+                V_y = jax.lax.all_to_all(
+                    V_perm_mu, 'y', split_axis=1, concat_axis=2, tiled=True)
+                # (n_q_full, μ/(Px·Py), ν)
+                V_y_perm = jnp.take_along_axis(
+                    V_y, perm_q[:, None, :], axis=2,
+                    mode='promise_in_bounds')
+                V_full_local = jax.lax.all_to_all(
+                    V_y_perm, 'y', split_axis=2, concat_axis=1, tiled=True)
+                # (n_q_full, μ/Px, ν/Py)  — back to canonical
+            else:
+                V_full_local = jnp.take_along_axis(
+                    V_perm_mu, perm_q[:, None, :], axis=2,
+                    mode='promise_in_bounds')
+
+            # Umklapp phase: exp(2π i q_irr · (L_μ − L_ν)).  L_μ here
+            # is L_table[s(q), μ] — wrap of centroid μ under sym op
+            # s(q) (NOT permuted).  See
+            # ``reports/trs_sym_audit_2026-05-14/verify_umklapp_user_math.py``.
+            # Phase tables are small (~n_q · n_rmu c128 bytes); compute
+            # replicated and slice this rank's μ_local / ν_local extent.
+            L_per_q = L_j[sym_j]                            # (n_q_full, n_rmu, 3)
+            q_per_q = q_irr_j[idx_j]                        # (n_q_full, 3)
+            qL = jnp.einsum('qi,qmi->qm', q_per_q, L_per_q) # (n_q_full, n_rmu)
+            phase = jnp.exp(2j * jnp.pi * qL.astype(jnp.complex128))
+            mu_local = n_rmu_padded // Px
+            nu_local = n_rmu_padded // Py
+            x_idx = jax.lax.axis_index('x')
+            y_idx = jax.lax.axis_index('y')
+            phase_mu = jax.lax.dynamic_slice_in_dim(
+                phase, x_idx * mu_local, mu_local, axis=1)  # (n_q, μ/Px)
+            phase_nu = jax.lax.dynamic_slice_in_dim(
+                phase, y_idx * nu_local, nu_local, axis=1)  # (n_q, ν/Py)
+            V_full_local = (phase_mu[:, :, None] * V_full_local
+                            * jnp.conj(phase_nu)[:, None, :])
+
+            # TRS rows: per-element rule
+            # V_full[TRS-q, μ, ν] = conj(V_ibz[parent, μ, ν])
+            # = V_ibz[parent, ν, μ] (by Hermiticity).
+            V_full_local = jnp.where(
+                trs_mask_j[:, None, None],
+                jnp.conj(V_full_local), V_full_local)
+            return V_full_local
+
+        return _kernel(V_ibz)
 
     _UNFOLD_V_Q_JIT_CACHE[key] = _do_unfold
     return _do_unfold
