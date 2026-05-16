@@ -292,11 +292,6 @@ def unfold_v_q(
             f"unfold_v_q: V_q_ibz μ-extent {n_rmu_padded} smaller than "
             f"sym_perm logical extent {n_rmu_logical}; pad invariant "
             f"violated.")
-    fwd_perm_j = jnp.asarray(fwd_perm)
-    idx_j = jnp.asarray(np.asarray(irr_idx, dtype=np.int32))
-    sym_j = jnp.asarray(np.asarray(sym_idx, dtype=np.int32))
-    trs_mask_j = jnp.asarray(sym_np >= int(n_sym_spatial))
-
     # Per-(q_full, μ) umklapp phase factor exp(2π i q_irr · L_μ).
     # ``L_table`` is shape (2·ntran, n_rmu, 3) int (any width); promote
     # to float64 then gather to (n_q_full, n_rmu, 3).  ``q_irr_frac`` is
@@ -312,43 +307,73 @@ def unfold_v_q(
             (L_arr.shape[0], n_rmu_padded - L_arr.shape[1], 3),
             dtype=np.float64)
         L_arr = np.concatenate([L_arr, pad], axis=1)
-    L_j = jnp.asarray(L_arr)
-    q_irr_j = jnp.asarray(np.asarray(q_irr_frac, dtype=np.float64))
 
-    # Tables are passed to the cached jit as runtime args (not closure
-    # captures) so the SAME compiled module serves every q-axis tensor
-    # of matching shape + sharding — V_q and W_q reuse one HLO instead
-    # of paying separate compile costs.
-    n_q_full = int(idx_j.shape[0])
+    # Sym tables are baked into the jit closure as constants — XLA folds
+    # them into the HLO, which is materially faster per call than
+    # marshalling them as runtime args (verified empirically: runtime-
+    # arg form was ~2× slower per call than closure form).  The cache
+    # keys on the content of the tables (via bytes hashes) so V_q's and
+    # W_q's calls with the same sym/centroid configuration share one
+    # compiled module without re-baking constants.
+    idx_arr = np.asarray(irr_idx, dtype=np.int32)
+    sym_arr = np.asarray(sym_idx, dtype=np.int32)
+    q_irr_arr = np.asarray(q_irr_frac, dtype=np.float64)
+    trs_mask_arr = (sym_arr >= int(n_sym_spatial))
     fn = _get_unfold_v_q_jit(
         V_q_shape=tuple(int(s) for s in V_q_ibz.shape),
-        n_q_full=n_q_full,
+        fwd_perm_arr=fwd_perm,
+        idx_arr=idx_arr,
+        sym_arr=sym_arr,
+        L_arr=L_arr,
+        q_irr_arr=q_irr_arr,
+        trs_mask_arr=trs_mask_arr,
+        n_sym_spatial=int(n_sym_spatial),
         mesh_xy=mesh_xy)
-    return fn(V_q_ibz, fwd_perm_j, idx_j, sym_j, L_j, q_irr_j, trs_mask_j)
+    return fn(V_q_ibz)
 
 
 _UNFOLD_V_Q_JIT_CACHE: dict = {}
 
 
-def _get_unfold_v_q_jit(*, V_q_shape, n_q_full, mesh_xy):
-    """Cache the inner ``_do_unfold`` jit by signature.
+def _get_unfold_v_q_jit(
+    *, V_q_shape, fwd_perm_arr, idx_arr, sym_arr, L_arr, q_irr_arr,
+    trs_mask_arr, n_sym_spatial, mesh_xy,
+):
+    """Cache the inner ``_do_unfold`` jit by (shape, sym table content).
 
-    V_q and W_q share the same (n_q_full, n_rmu, n_rmu) shape and
-    canonical ``P(None, 'x', 'y')`` sharding — the compiled HLO is
-    identical, so we want one cache entry serving both call sites.
-    The closure-captured-tables form ``unfold_v_q`` used previously
-    minted a fresh jit on every call (different closure object
-    identity → cache miss → ~200 ms compile per call).
+    V_q and W_q with the same sym / centroid configuration share the
+    same compiled HLO (cache hit on bytes-hash of the tables).  The
+    tables are baked into the jit closure as constants — runtime-arg
+    form was ~2× slower per call than closure-baked due to
+    per-invocation argument marshalling.
     """
-    key = (V_q_shape, int(n_q_full), id(mesh_xy))
+    key = (
+        V_q_shape,
+        fwd_perm_arr.shape, fwd_perm_arr.tobytes(),
+        idx_arr.tobytes(),
+        sym_arr.tobytes(),
+        L_arr.shape, L_arr.tobytes(),
+        q_irr_arr.tobytes(),
+        trs_mask_arr.tobytes(),
+        int(n_sym_spatial),
+        id(mesh_xy),
+    )
     hit = _UNFOLD_V_Q_JIT_CACHE.get(key)
     if hit is not None:
         return hit
 
+    # Promote to jax arrays once at trace-build time.  Closure capture
+    # makes these constants in the compiled HLO.
+    fwd_perm_j = jnp.asarray(fwd_perm_arr)
+    idx_j = jnp.asarray(idx_arr)
+    sym_j = jnp.asarray(sym_arr)
+    L_j = jnp.asarray(L_arr)
+    q_irr_j = jnp.asarray(q_irr_arr)
+    trs_mask_j = jnp.asarray(trs_mask_arr)
     V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
     @partial(jax.jit, out_shardings=V_sh)
-    def _do_unfold(V_ibz, fwd_perm_j, idx_j, sym_j, L_j, q_irr_j, trs_mask_j):
+    def _do_unfold(V_ibz):
         perm_q = fwd_perm_j[sym_j]                          # (n_q_full, n_rmu)
         V_at_irr = V_ibz[idx_j]                              # (n_q_full, μ, μ)
         # ``promise_in_bounds`` skips the OOB-fill branch that under
