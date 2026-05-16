@@ -59,13 +59,24 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
-# Kernel cache
+# Kernel cache — one signature-keyed cache for every jit factory in this
+# module.  Keys are ``(kernel_name, *signature_tuple)`` so different
+# factories never collide.  Replaces the per-factory ``_X_CACHE`` dicts
+# (and inline ``if fn is None: ... cache[key] = fn`` blocks) with one
+# central ``_cached_jit`` helper.
 # ---------------------------------------------------------------------------
 
-_BOX_KERNEL_CACHE: dict = {}
-_RBOX_KERNEL_CACHE: dict = {}
-_RMU_KERNEL_CACHE: dict = {}
-_RCHUNK_KERNEL_CACHE: dict = {}
+_KERNEL_CACHE: dict = {}
+
+
+def _cached_jit(name: str, key: tuple, build):
+    """Return ``_KERNEL_CACHE[(name, *key)]`` or build + cache it."""
+    full_key = (name, *key)
+    fn = _KERNEL_CACHE.get(full_key)
+    if fn is None:
+        fn = build()
+        _KERNEL_CACHE[full_key] = fn
+    return fn
 
 
 # ---------------------------------------------------------------------------
@@ -229,13 +240,15 @@ def to_box(
     out_sharding = _output_sharding(psi, mesh, n_extra_axes=3)
     key = (psi.shape, tuple(g_index.shape), ngkmax, fft_grid_t,
            _sharding_key(psi), out_sharding)
-    fn = _BOX_KERNEL_CACHE.get(key)
-    if fn is None:
+
+    def build():
         @jax.jit
         def fn(psi_, g_index_):
             out = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
             return _maybe_constrain(out, out_sharding)
-        _BOX_KERNEL_CACHE[key] = fn
+        return fn
+
+    fn = _cached_jit('to_box', key, build)
     g_index_j = jnp.asarray(g_index, dtype=jnp.int32)
     return fn(psi, g_index_j)
 
@@ -265,22 +278,23 @@ def to_rbox(
     out_sharding = _output_sharding(psi, mesh, n_extra_axes=3)
     key = (psi.shape, tuple(g_index.shape), ngkmax, fft_grid_t, norm,
            kvecs_shape, _sharding_key(psi), out_sharding)
-    fn = _RBOX_KERNEL_CACHE.get(key)
-    if fn is None:
+
+    def build():
         ifftn = _local_box_fft(psi, mesh, kind='ifftn', norm=norm)
         if kvecs_frac is None:
             @jax.jit
             def fn(psi_, g_index_):
                 box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
                 return _maybe_constrain(ifftn(box), out_sharding)
-            _RBOX_KERNEL_CACHE[key] = fn
-        else:
-            @jax.jit
-            def fn(psi_, g_index_, kvecs_):
-                box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
-                rb = apply_bloch_phase(ifftn(box), kvecs_, fft_grid_t)
-                return _maybe_constrain(rb, out_sharding)
-            _RBOX_KERNEL_CACHE[key] = fn
+            return fn
+        @jax.jit
+        def fn(psi_, g_index_, kvecs_):
+            box = _box_kernel(psi_, g_index_, ngkmax=ngkmax)
+            rb = apply_bloch_phase(ifftn(box), kvecs_, fft_grid_t)
+            return _maybe_constrain(rb, out_sharding)
+        return fn
+
+    fn = _cached_jit('to_rbox', key, build)
     g_index_j = jnp.asarray(g_index, dtype=jnp.int32)
     if kvecs_frac is None:
         return fn(psi, g_index_j)
@@ -311,8 +325,8 @@ def to_rmu(
     out_sharding = _output_sharding(psi, mesh, n_extra_axes=1)
     key = (psi.shape, tuple(g_index.shape), ngkmax, fft_grid_t, n_rmu,
            norm, kvecs_shape, _sharding_key(psi), out_sharding)
-    fn = _RMU_KERNEL_CACHE.get(key)
-    if fn is None:
+
+    def build():
         ifftn = _local_box_fft(psi, mesh, kind='ifftn', norm=norm)
         if kvecs_frac is None:
             @jax.jit
@@ -320,15 +334,16 @@ def to_rmu(
                 rb = ifftn(_box_kernel(psi_, g_index_, ngkmax=ngkmax))
                 out = rb[:, :, :, r_mu_[:, 0], r_mu_[:, 1], r_mu_[:, 2]]
                 return _maybe_constrain(out, out_sharding)
-            _RMU_KERNEL_CACHE[key] = fn
-        else:
-            @jax.jit
-            def fn(psi_, g_index_, r_mu_, kvecs_):
-                rb = ifftn(_box_kernel(psi_, g_index_, ngkmax=ngkmax))
-                rb = apply_bloch_phase(rb, kvecs_, fft_grid_t)
-                out = rb[:, :, :, r_mu_[:, 0], r_mu_[:, 1], r_mu_[:, 2]]
-                return _maybe_constrain(out, out_sharding)
-            _RMU_KERNEL_CACHE[key] = fn
+            return fn
+        @jax.jit
+        def fn(psi_, g_index_, r_mu_, kvecs_):
+            rb = ifftn(_box_kernel(psi_, g_index_, ngkmax=ngkmax))
+            rb = apply_bloch_phase(rb, kvecs_, fft_grid_t)
+            out = rb[:, :, :, r_mu_[:, 0], r_mu_[:, 1], r_mu_[:, 2]]
+            return _maybe_constrain(out, out_sharding)
+        return fn
+
+    fn = _cached_jit('to_rmu', key, build)
     g_index_j = jnp.asarray(g_index, dtype=jnp.int32)
     r_mu_j = jnp.asarray(r_mu, dtype=jnp.int32)
     if kvecs_frac is None:
@@ -454,8 +469,12 @@ def to_rchunk(
                    else tuple(int(s) for s in np.shape(kvecs_frac)))
     key = (psi.shape, tuple(g_index.shape), ngkmax, fft_grid_t, r_len_i,
            norm, kvecs_shape, _sharding_key(psi), out_spec, id(mesh))
-    fn = _RCHUNK_KERNEL_CACHE.get(key)
-    if fn is None:
+
+    def build():
+        # Per-rank body = ``to_rchunk_inner`` exactly: same _box_kernel +
+        # jnp.fft.ifftn + flat-reshape + dynamic-slice (+ phase-on-slice
+        # when kvecs_frac is set).  Hoisted as the single source of truth
+        # so future changes to the kernel land in one place.
         if kvecs_frac is None:
             @partial(
                 shard_map,
@@ -465,39 +484,33 @@ def to_rchunk(
                 check_rep=False,
             )
             def _local_rchunk(psi_l, g_index_l, r0_l):
-                box_l = _box_kernel(psi_l, g_index_l, ngkmax=ngkmax)
-                rb_l = jnp.fft.ifftn(box_l, axes=(-3, -2, -1), norm=norm)
-                rb_flat_l = rb_l.reshape(*rb_l.shape[:3], n_rtot)
-                return jax.lax.dynamic_slice_in_dim(
-                    rb_flat_l, r0_l, r_len_i, axis=-1)
+                return to_rchunk_inner(
+                    psi_l, g_index_l, fft_grid_t, r0_l, r_len_i, norm=norm)
 
             @jax.jit
             def fn(psi_, g_index_, r0_):
                 return _local_rchunk(psi_, g_index_, r0_)
-        else:
-            @partial(
-                shard_map,
-                mesh=mesh,
-                in_specs=(psi_spec, P(None, None, None, None), P(),
-                          P(None, None)),
-                out_specs=P(*out_spec),
-                check_rep=False,
-            )
-            def _local_rchunk(psi_l, g_index_l, r0_l, kvecs_l):
-                # Phase-after-slice: IFFT → flatten → slice → phase on
-                # the r_len-cell slab (not on the full nx·ny·nz box).
-                box_l = _box_kernel(psi_l, g_index_l, ngkmax=ngkmax)
-                rb_l = jnp.fft.ifftn(box_l, axes=(-3, -2, -1), norm=norm)
-                rb_flat_l = rb_l.reshape(*rb_l.shape[:3], n_rtot)
-                slab_l = jax.lax.dynamic_slice_in_dim(
-                    rb_flat_l, r0_l, r_len_i, axis=-1)
-                return apply_bloch_phase_on_slice(
-                    slab_l, kvecs_l, fft_grid_t, r0_l, r_len_i)
+            return fn
 
-            @jax.jit
-            def fn(psi_, g_index_, r0_, kvecs_):
-                return _local_rchunk(psi_, g_index_, r0_, kvecs_)
-        _RCHUNK_KERNEL_CACHE[key] = fn
+        @partial(
+            shard_map,
+            mesh=mesh,
+            in_specs=(psi_spec, P(None, None, None, None), P(),
+                      P(None, None)),
+            out_specs=P(*out_spec),
+            check_rep=False,
+        )
+        def _local_rchunk(psi_l, g_index_l, r0_l, kvecs_l):
+            return to_rchunk_inner(
+                psi_l, g_index_l, fft_grid_t, r0_l, r_len_i,
+                norm=norm, kvecs_frac=kvecs_l)
+
+        @jax.jit
+        def fn(psi_, g_index_, r0_, kvecs_):
+            return _local_rchunk(psi_, g_index_, r0_, kvecs_)
+        return fn
+
+    fn = _cached_jit('to_rchunk', key, build)
 
     g_index_j = jnp.asarray(g_index, dtype=jnp.int32)
     r0_arg = (jnp.int32(int(r0)) if isinstance(r0, (int, np.integer)) else r0)
@@ -593,8 +606,6 @@ def to_rmu_inner(
 # for that buffer-class collapses to 1 — and inside the shard_map the
 # FFT box is per-rank-local (NOT replicated on every rank) so the
 # unsharded-FFT-box violation in the legacy ``to_rmu`` path is closed.
-
-_GFLAT_TO_RMU_CACHE: dict = {}
 
 
 def gflat_to_rmu(
@@ -752,8 +763,8 @@ def gflat_to_rmu(
         norm, kvecs_shape, kvecs_id, cs, n_chunks, pad_N,
         _sharding_key(psi_G),
     )
-    fn = _GFLAT_TO_RMU_CACHE.get(key)
-    if fn is None:
+
+    def build():
         # Per-k phase tables and centroid-coord constants baked into the
         # closure.  r_mu is replicated so we can index the per-row
         # phases by r_mu directly inside the scan body.
@@ -825,9 +836,9 @@ def gflat_to_rmu(
                 out_flat = out_flat[:N]
             return out_flat.reshape(nk, nb_local, ns, n_rmu)
 
-        fn = jax.jit(_kernel)
-        _GFLAT_TO_RMU_CACHE[key] = fn
+        return jax.jit(_kernel)
 
+    fn = _cached_jit('gflat_to_rmu', key, build)
     return fn(psi_G)
 
 
@@ -863,9 +874,6 @@ def gflat_to_rmu(
 # Linearity over r means each r-chunk is an additive contribution:
 #     ζ_G += FFT_{r→G}( phase · pad_to_full(rchunk_slab) )[G_sph]
 # which is what this function accumulates.
-
-_RCHUNK_TO_GFLAT_CACHE: dict = {}
-
 
 def accumulate_rchunk_to_gflat(
     rchunk: jax.Array,
@@ -1003,8 +1011,8 @@ def accumulate_rchunk_to_gflat(
         norm, qvec_shape, qvec_id, cs, n_chunks, pad_N,
         _sharding_key(rchunk), _sharding_key(gflat_acc),
     )
-    fn = _RCHUNK_TO_GFLAT_CACHE.get(key)
-    if fn is None:
+
+    def build():
         # Per-q tables baked into the closure as constants.
         sphere_c = jnp.asarray(sphere_arr, dtype=jnp.int32)
         if qvec_frac is not None:
@@ -1077,9 +1085,9 @@ def accumulate_rchunk_to_gflat(
                 acc_flat = acc_flat[:N]
             return acc_flat.reshape(n_q, n_mu_local, ngkmax)
 
-        fn = jax.jit(_kernel, donate_argnums=(1,))
-        _RCHUNK_TO_GFLAT_CACHE[key] = fn
+        return jax.jit(_kernel, donate_argnums=(1,))
 
+    fn = _cached_jit('accumulate_rchunk_to_gflat', key, build)
     r0_arg = (jnp.int32(int(r0)) if isinstance(r0, (int, np.integer)) else r0)
     return fn(rchunk, gflat_acc, r0_arg)
 
