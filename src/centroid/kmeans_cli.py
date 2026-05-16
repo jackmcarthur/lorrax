@@ -311,6 +311,10 @@ def main():
                 centroids_frac, fft_grid, deduplicate=False,
             )
             from .orbit_syms import unfold_orbit_unique_with_id
+            # Pass Rinv = inv(mtrx).  BGW r-action is r' = Rinv·r + τ;
+            # this matches the direction used by compute_centroid_sym_perm
+            # and validate_atomic_symmetries.  No-op vs forward S on
+            # symmorphic systems (CrI3, MoS2); critical for Si Fd-3m.
             unfolded, orbit_id_arr = unfold_orbit_unique_with_id(
                 reps_snapped, np.asarray(Rinv), np.asarray(tau),
             )

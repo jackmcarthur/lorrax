@@ -13,10 +13,17 @@ This rewrite (P4c) replaces the legacy g_box host-cache with a
 * :class:`PsiGStore` stores per-rank tiles of shape
   ``(nk, nb_local, ns, ngkmax)`` instead of ``(nk, nb_local, ns, nx,
   ny, nz)``.
-* :meth:`PsiGStore.fetch_psi_rchunk` pulls a g_flat slice via
-  ``io_callback`` and immediately calls
-  :func:`common.wfn_transforms.to_rchunk` on device — the FFT box is
-  never materialised as a persistent buffer.
+* :meth:`PsiGStore._slice_local_tile_bc` returns one bc's per-rank
+  band slab via ``io_callback``, padded to ``(nk, _bpd_max, ns,
+  ngkmax)`` so the enclosing ``lax.scan`` body sees a static return
+  shape.  Consumers
+  (:func:`common.isdf_fitting.z_q_from_psi_sm`,
+  :func:`common.isdf_fitting.c_q_from_psi_sm`,
+  :func:`common.wfn_transforms.gflat_to_rmu`) iterate band-chunks
+  via ``lax.scan`` inside their ``shard_map`` body, pulling one bc
+  per iter via the slicer + per-iter ``lax.all_gather`` along the
+  band axis.  The FFT box is never materialised as a persistent
+  buffer — XLA's scan-internal allocator aliases it across iters.
 
 Lifecycle modes are unchanged:
 
@@ -104,13 +111,12 @@ class PsiGStore:
     For CrI3-scale, the new shape is ~14× smaller than the legacy
     g_box ``(nk, nb_local, ns, nx, ny, nz)`` shape.
 
-    :meth:`fetch_psi_rchunk` pulls a g_flat slice via ``io_callback``
-    then immediately calls :func:`common.wfn_transforms.to_rchunk` on
-    device.  The FFT box never lives as a persistent buffer — it's a
-    transient inside the jit.  Output sharding is band-axis on
-    ``('x','y')``; consumers downstream see the same (n_k, nb, ns,
-    n_rchunk) layout the legacy ``get_sharded_wfns_rchunk_slice``
-    produced.
+    :meth:`_slice_local_tile_bc` is the per-iter host-tile slicer used
+    by the ``io_callback`` inside the ``lax.scan`` body of the
+    consumers.  Returns one bc's per-rank slab padded to
+    ``(nk, _bpd_max, ns, ngkmax)`` so the scan body sees a static
+    output shape every iter; downstream all_gather + L/R band-mask
+    consumes it.
     """
 
     def __init__(
@@ -121,28 +127,34 @@ class PsiGStore:
         band_chunk_ranges: tuple[tuple[int, int], ...],
         meta,
         bispinor: bool = False,
-        k_chunk_size: int = 0,
     ):
         self.loader = loader
         self.mesh = mesh_xy
         self.band_chunk_ranges = tuple(tuple(bc) for bc in band_chunk_ranges)
         self.meta = meta
         self.bispinor = bool(bispinor)
-        # Inner k-axis chunker for ``fetch_psi_rchunk``.  0 = no chunking
-        # (one shot over all k); >0 caps the per-fetch FFT box transient
-        # at large n_k.  Set from cohsex.in ``psig_k_chunk_size``.
-        self._k_chunk_size = int(k_chunk_size)
 
         nk = int(meta.nk_tot)
         ns = int(meta.nspinor)
         ngkmax = int(loader.ngkmax)
         p = int(mesh_xy.shape['x']) * int(mesh_xy.shape['y'])
 
-        # Per-bc local band count: bands_per_device for ONE bc.
+        # Per-bc local band count: bands_per_device for ONE bc.  Used to
+        # compute the per-rank tile's band-axis offsets (bc-stacked
+        # ordering); the per-rank tile's full band axis is contiguous
+        # across all bcs and lives at ``self._per_rank_shape[1]``.
         bpd_per_bc = [(b_hi - b_lo) // p for (b_lo, b_hi) in self.band_chunk_ranges]
         self._bpd_per_bc = tuple(bpd_per_bc)
-
-        # Within each rank's tile the band axis is stacked in bc-order.
+        # Padded uniform per-bc local band count — used by
+        # ``_slice_local_tile_bc`` so an ``io_callback`` inside a
+        # ``lax.scan`` body sees a static return shape regardless of
+        # which bc the traced index resolves to.  Round 6 Phase 2
+        # restoration of the field originally added in commit
+        # ``cdd0fba`` (deleted in ``5cadd4b`` when the flat-axis path
+        # took over).  ``io_callback`` REQUIRES static ``out_sds`` at
+        # trace time; ``_bpd_max`` is the closure-static value the
+        # caller closes into ``ShapeDtypeStruct``.
+        self._bpd_max = max(bpd_per_bc) if bpd_per_bc else 0
         offsets = [0]
         for bpd in bpd_per_bc:
             offsets.append(offsets[-1] + bpd)
@@ -157,8 +169,8 @@ class PsiGStore:
         self._host_tiles: dict = {}
 
         # Cache the box index (g_index) and Bloch-phase ingredients on
-        # device once — they're shared across every fetch_psi_rchunk
-        # call regardless of which band-chunk or r-chunk is asked for.
+        # device once — they're shared across every io_callback call
+        # regardless of which band-chunk or r-chunk is asked for.
         self._g_index_dev: jax.Array | None = None
         self._kvecs_frac_dev: jax.Array | None = None
 
@@ -236,6 +248,89 @@ class PsiGStore:
         self._host_tiles.clear()
 
     # ---------------------------------------------------------------------
+    # Per-rank host-tile slice for one bc, padded to a static shape.
+    # ---------------------------------------------------------------------
+    # Round 6 Phase 2 restoration of the helper originally added in
+    # commit ``cdd0fba`` and removed in ``5cadd4b`` when the (now-buggy)
+    # flat-axis ``psi_G_device_full`` path took over.  Consumer is the
+    # io_callback inside ``z_q_from_psi_sm._local`` / ``c_q_from_psi_sm._local``'s
+    # ``lax.scan`` body (Round 5 unified plan §3.2 / §6.5).
+    #
+    # Static-shape contract: ``io_callback`` requires its ``out_sds`` to
+    # be static at trace time, AND ``lax.scan`` requires the body output
+    # shape to be uniform across iters.  ``_bpd_max = max(bpd_per_bc)``
+    # is closure-static at ``__init__``; short-final-bc bands are
+    # zero-padded to the same shape every iter.  The downstream L/R
+    # band-mask zeros out pad rows so they contribute mathematically zero
+    # to the pair-density einsum.
+    #
+    # NOTE the ``np.zeros`` (NOT ``np.empty``) on the pad-row buffer:
+    # the math-neutrality of pad rows depends on them being EXACTLY
+    # zero.  ``np.empty`` would leave garbage that the L/R mask might
+    # zero-out at the einsum but could still pollute IFFT precision.
+
+    def _slice_local_tile_bc(self, x_idx, y_idx, bc_idx) -> np.ndarray:
+        """Per-rank host-tile slice for one bc, padded to ``(nk, _bpd_max, ns, ngkmax)``.
+
+        Parameters
+        ----------
+        x_idx, y_idx
+            ``jax.lax.axis_index('x') / ('y')`` int32 scalars (resolved
+            to Python ints inside the io_callback host fn).
+        bc_idx
+            Traced int32 scalar in ``[0, len(band_chunk_ranges))``.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``(nk, _bpd_max, ns, ngkmax)`` c128.  The first
+            ``self._bpd_per_bc[bc]`` band rows hold the real bc data;
+            the remaining ``_bpd_max - bpd_per_bc[bc]`` rows are zero
+            (math-neutral when consumed under a band mask).
+
+        Lifetime contract: host tiles must remain valid for the full
+        duration of the enclosing kernel jit (the io_callback fires
+        asynchronously inside ``lax.scan``).  ``RereadPsiGStore.end_rchunk``
+        already runs **after** ``block_until_ready`` (see
+        ``isdf_fitting.py``'s ``finally:`` clause), so async callbacks
+        always complete before tiles are freed.
+        """
+        x, y, bc = int(x_idx), int(y_idx), int(bc_idx)
+        if not 0 <= bc < len(self.band_chunk_ranges):
+            raise ValueError(
+                f"_slice_local_tile_bc: bc_idx={bc} not in "
+                f"[0, {len(self.band_chunk_ranges)})")
+        tile = self._host_tiles[(x, y)]
+        b_lo = self._bc_band_offsets[bc]
+        b_hi = self._bc_band_offsets[bc + 1]
+        nk, _, ns, ngkmax = tile.shape
+        out = np.zeros((nk, self._bpd_max, ns, ngkmax), dtype=tile.dtype)
+        out[:, : b_hi - b_lo, :, :] = tile[:, b_lo:b_hi, :, :]
+        return out
+
+    @property
+    def g_index(self) -> jax.Array:
+        """Replicated ``(nk_tot, nx, ny, nz)`` int32 box-index tensor.
+
+        Staged on device by ``_populate_from_loader``; raises if accessed
+        before any ``begin_rchunk`` call.  Used by ``gflat_to_rchunk``.
+        """
+        if self._g_index_dev is None:
+            raise RuntimeError(
+                "g_index: not staged; call begin_rchunk (or use a populated "
+                "store) first")
+        return self._g_index_dev
+
+    @property
+    def kvecs_frac(self) -> jax.Array:
+        """Replicated ``(nk_tot, 3)`` float64 fractional k-vectors."""
+        if self._kvecs_frac_dev is None:
+            raise RuntimeError(
+                "kvecs_frac: not staged; call begin_rchunk (or use a populated "
+                "store) first")
+        return self._kvecs_frac_dev
+
+    # ---------------------------------------------------------------------
     # Lifecycle — subclasses override
     # ---------------------------------------------------------------------
     def begin_rchunk(self, r_start: int, r_end: int) -> None:
@@ -252,131 +347,6 @@ class PsiGStore:
         """Release all host tiles and drop the loader reference."""
         self._clear_tiles()
 
-    # ---------------------------------------------------------------------
-    # In-jit fetch
-    # ---------------------------------------------------------------------
-    def _bc_index(self, band_range: tuple[int, int]) -> int:
-        """Map a global ``band_range`` to its band-chunk index."""
-        key = (int(band_range[0]), int(band_range[1]))
-        for i, bc in enumerate(self.band_chunk_ranges):
-            if bc == key:
-                return i
-        raise ValueError(
-            f"band_range {band_range} not in band_chunk_ranges; "
-            f"fetch_psi_rchunk only supports the pre-declared bc ranges")
-
-    def fetch_psi_rchunk(
-        self,
-        band_range: tuple[int, int],
-        r_start_dyn,
-        r_chunk_size: int,
-        *,
-        k_range: tuple[int, int] | None = None,
-    ) -> jax.Array:
-        """ψ(r-chunk) for the given band-chunk × r-chunk window.
-
-        Pipeline (each step happens inside the same jit fragment so
-        XLA can fuse them):
-
-          1. ``io_callback`` pulls each rank's host tile slice
-             ``(nk_slice, bc_size_local, ns, ngkmax)`` directly onto
-             device, sharded ``P(None, ('x','y'), None, None)``.
-          2. :func:`common.wfn_transforms.to_rchunk` scatters to the
-             FFT box, IFFTs, applies the per-k Bloch phase
-             ``exp(+2πi k·r)`` separably, and slices the flat-r slab
-             ``[r_start, r_start + r_chunk_size)``.  Uses
-             ``norm='ortho'`` to match the legacy
-             :func:`common.load_wfns.get_sharded_wfns_rchunk_slice`
-             scale convention (``1/√N``).
-
-        Output shape ``(nk_slice, bc_size, ns, r_chunk_size)`` c128,
-        sharded ``P(None, ('x','y'), None, None)``.
-
-        Parameters
-        ----------
-        band_range
-            One of the pre-declared ``band_chunk_ranges``.
-        r_start_dyn
-            ``int`` or jax scalar tracer; flat-r start index.  Tracer
-            is fine — ``to_rchunk`` only requires ``r_chunk_size`` to
-            be static.
-        r_chunk_size
-            Static int — width of the r slab.
-        k_range
-            Optional ``(k_lo, k_hi)`` for k-chunking; defaults to
-            the full k axis.
-        """
-        from common.wfn_transforms import to_rchunk
-
-        bc_idx = self._bc_index(band_range)
-        b_lo = self._bc_band_offsets[bc_idx]
-        b_hi = self._bc_band_offsets[bc_idx + 1]
-        nk_total = int(self.meta.nk_tot)
-        k_lo, k_hi = (0, nk_total) if k_range is None else (
-            int(k_range[0]), int(k_range[1]))
-
-        nk_slice = k_hi - k_lo
-        bpd = b_hi - b_lo
-        ns = self._per_rank_shape[2]
-        ngkmax = self._per_rank_shape[3]
-        per_rank_out_shape = (nk_slice, bpd, ns, ngkmax)
-        dtype = self._dtype
-        tiles = self._host_tiles
-
-        def _slice_local_tile(x_idx, y_idx):
-            tile = tiles[(int(x_idx), int(y_idx))]
-            return tile[k_lo:k_hi, b_lo:b_hi, :, :]
-
-        out_sds = jax.ShapeDtypeStruct(per_rank_out_shape, dtype)
-
-        @partial(
-            shard_map,
-            mesh=self.mesh,
-            in_specs=(),
-            out_specs=_PSI_G_FLAT_SPEC,
-            check_rep=False,
-        )
-        def _pull():
-            x_idx = jax.lax.axis_index('x')
-            y_idx = jax.lax.axis_index('y')
-            return io_callback(
-                _slice_local_tile, out_sds, x_idx, y_idx, ordered=True)
-
-        psi_G_flat = _pull()
-
-        # Slice the kvecs to match the k_range, then dispatch to_rchunk.
-        # K-chunk INSIDE the fetch: the FFT box ``(nk_slice, bpd, ns, nx,
-        # ny, nz)`` is the dominant transient in ``fit_one_rchunk`` and
-        # XLA empirically materialises it unsharded at CrI3 6×6 80 Ry
-        # scale.  Chunking by k caps the per-call box to
-        # ``(_k_chunk, bpd, ns, nx, ny, nz)`` regardless of how many k
-        # are in ``nk_slice`` — at the cost of a Python loop unrolled
-        # at trace.  Cohsex.in ``psig_k_chunk_size`` overrides the cap.
-        _k_chunk = max(1, self._k_chunk_size) if self._k_chunk_size > 0 else nk_slice
-        kvecs_frac_full = self._kvecs_frac_dev[k_lo:k_hi]
-        g_index_full = (self._g_index_dev[k_lo:k_hi] if k_range is not None
-                        else self._g_index_dev)
-        fft_grid_t = tuple(int(s) for s in self.meta.fft_grid)
-        if _k_chunk >= nk_slice:
-            return to_rchunk(
-                psi_G_flat, g_index_full, fft_grid_t,
-                r_start_dyn, int(r_chunk_size),
-                kvecs_frac=kvecs_frac_full, norm="ortho",
-                mesh=self.mesh)
-        # Python-loop k-chunk + concatenate.  Each iter's FFT box is
-        # ``(_k_chunk, bpd, ns, *fft_grid)`` so XLA's worst-case
-        # unsharded materialisation is bounded.
-        slabs = []
-        for k0 in range(0, nk_slice, _k_chunk):
-            k1 = min(k0 + _k_chunk, nk_slice)
-            slabs.append(to_rchunk(
-                psi_G_flat[k0:k1], g_index_full[k0:k1], fft_grid_t,
-                r_start_dyn, int(r_chunk_size),
-                kvecs_frac=kvecs_frac_full[k0:k1], norm="ortho",
-                mesh=self.mesh))
-        return jnp.concatenate(slabs, axis=0)
-
-
 class HostPsiGStore(PsiGStore):
     """ψ(G-flat) loaded once, kept resident on host for the full run.
 
@@ -388,11 +358,11 @@ class HostPsiGStore(PsiGStore):
     """
 
     def __init__(self, *, loader, mesh_xy, band_chunk_ranges, meta,
-                  bispinor: bool = False, k_chunk_size: int = 0):
+                  bispinor: bool = False):
         super().__init__(
             loader=loader, mesh_xy=mesh_xy,
             band_chunk_ranges=band_chunk_ranges, meta=meta,
-            bispinor=bispinor, k_chunk_size=k_chunk_size)
+            bispinor=bispinor)
         self._populate_from_loader()
         if jax.process_index() == 0:
             tile_gb = self._per_rank_shape_bytes() / 1e9
@@ -421,7 +391,6 @@ def build_psi_G_store(
     band_chunk_ranges,
     bispinor: bool = False,
     mode: Literal["host_cache", "file_reread"] = "host_cache",
-    k_chunk_size: int = 0,
 ) -> PsiGStore:
     """Construct the ψ(G-flat) store matching ``mode``.
 
@@ -441,11 +410,11 @@ def build_psi_G_store(
         return HostPsiGStore(
             loader=loader, mesh_xy=mesh_xy,
             band_chunk_ranges=band_chunk_ranges, meta=meta,
-            bispinor=bispinor, k_chunk_size=k_chunk_size)
+            bispinor=bispinor)
     if mode == "file_reread":
         return RereadPsiGStore(
             loader=loader, mesh_xy=mesh_xy,
             band_chunk_ranges=band_chunk_ranges, meta=meta,
-            bispinor=bispinor, k_chunk_size=k_chunk_size)
+            bispinor=bispinor)
     raise ValueError(
         f"ψ(G-flat) store mode must be 'host_cache' or 'file_reread', got {mode!r}")

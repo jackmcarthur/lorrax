@@ -424,11 +424,11 @@ class ZetaLoader:
 
         sym = self._ensure_sym()
         ntran = int(self.ntran)
-        # find_irreducible_qpoints uses sym_mats_k which includes TR
+        # The eager q-IBZ tables on SymMaps use sym_mats_k which includes TR
         # (the trailing ntran entries are -sym_mats_k).  TR mapping is
         # not yet handled — bail loudly if any q needs it.
-        _, full_to_irr_idx, full_to_irr_sym, q_irr_full_idx = (
-            sym.find_irreducible_qpoints())
+        full_to_irr_idx = sym.irr_idx_q
+        full_to_irr_sym = sym.sym_idx_q
         if int(np.max(full_to_irr_sym)) >= ntran:
             tr_q = int(np.argmax(full_to_irr_sym >= ntran))
             raise NotImplementedError(
@@ -437,20 +437,15 @@ class ZetaLoader:
                 f"(sym index {int(full_to_irr_sym[tr_q])} ≥ ntran={ntran}).  "
                 f"TR maps ζ(r) → ζ*(r) and is not yet wired into the "
                 f"unfold.  Workaround: regenerate the IBZ with TR off "
-                f"(``find_irreducible_qpoints`` slicing to ``[:ntran]``) "
                 f"or fall back to ``q='ibz'`` + post-V_q unfold.")
 
-        # Sanity: do the IBZ row indices on disk match q_irr_full_idx?
-        # The writer stores rows in q_irr_full_idx order
-        # (isdf_fitting.py:1689); the reader reads them in the same
-        # order.  We don't need to permute disk rows — but we DO need
-        # to remap full_to_irr_idx (which is an index into the
-        # find_irreducible_qpoints IBZ wedge, identical to the writer's
-        # ordering by construction).
+        # Sanity: the IBZ row indices on disk match sym.q_irr_full_idx by
+        # construction — the writer stores rows in q_irr_full_idx order
+        # (isdf_fitting.py:1689); the reader reads them in the same order.
 
         r_perm = compute_rgrid_sym_perm(
             sym.sym_matrices, sym.translations, self.fft_grid)
-        mu_perm = compute_centroid_sym_perm(
+        mu_perm, _mu_L = compute_centroid_sym_perm(
             self.r_mu_fft_idx, sym.sym_matrices,
             sym.translations, self.fft_grid)
 

@@ -75,7 +75,7 @@ Console scripts (from `pyproject.toml`):
 ```toml
 lorrax-gw        = "gw.gw_jax:main"
 gw_jax           = "gw.gw_jax:main"          # alias
-lorrax-centroids = "centroid.kmeans_isdf:main"
+lorrax-centroids = "centroid.kmeans_cli:main"
 lorrax-bse       = "bse.bse_isdf:main"
 ```
 

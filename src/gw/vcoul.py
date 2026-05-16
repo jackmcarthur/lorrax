@@ -165,8 +165,8 @@ def compute_vcoul_comps_for_q(wfn, sym, meta: Meta, qvec_nonneg):
 	# Map to iq index using existing SymMaps API
 	iq = sym.find_qpoint_index(qvec_wrapped, tol=1e-6)
 	iq_cpu = int(iq) if not hasattr(iq, "get") else int(iq.get())
-	iqbar = sym.irk_to_k_map[iq_cpu]
-	Sq = sym.sym_mats_k[sym.irk_sym_map[iq_cpu]]
+	iqbar = sym.irr_idx_k[iq_cpu]
+	Sq = sym.sym_mats_k[sym.sym_idx_k[iq_cpu]]
 	G_Sq = np.round(qvec_wrapped - Sq @ wfn.kpoints[iqbar]).astype(jnp.float64)
 	vcoul_comps = np.einsum("ij,kj->ki", Sq.astype(jnp.int32), wfn.get_gvec_nk(iqbar)) - G_Sq[np.newaxis, :]
 	return iq_cpu, iqbar, qvec_wrapped, vcoul_comps.astype(jnp.int32)

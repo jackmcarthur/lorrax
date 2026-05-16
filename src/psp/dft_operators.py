@@ -137,9 +137,24 @@ def generate_gvectors_k(kpoint_idx, sym, wfn, meta):
     """G-vectors for one k-point via SymMaps (GW path).
 
     Returns (Gk_crys, kpoint_crys): (nG, 3) int and (3,) float.
+
+    Post-P5 migration: ``sym.get_gvecs_kfull`` moved into ``WfnLoader``;
+    re-fetch the full-BZ G-table from the loader and slice the single
+    requested k.  ``WfnLoader`` caches the table so this is cheap on
+    repeated calls.
     """
     kpoint_crys = jnp.asarray(sym.unfolded_kpts[kpoint_idx], dtype=jnp.float64)
-    Gk_crys = sym.get_gvecs_kfull(wfn, kpoint_idx)
+    from file_io.wfn_loader import WfnLoader as _WFNLoader
+    if isinstance(wfn, _WFNLoader):
+        loader = wfn
+    else:
+        # Legacy WFNReader fallback (kept for tests that still hold the
+        # old reader object).  Rebuild a loader against the same file.
+        loader = _WFNLoader(wfn._filename)
+    gvecs_full = loader.gvecs(k="full_bz")           # (n_full, ngkmax, 3) int32
+    ngk_full = loader.ngk_valid(k="full_bz")         # (n_full,) int32
+    nk = int(kpoint_idx)
+    Gk_crys = jnp.asarray(gvecs_full[nk, : int(ngk_full[nk])], dtype=jnp.int32)
     return Gk_crys, kpoint_crys
 
 
@@ -1110,7 +1125,7 @@ def compute_dipole_all(wfn, sym, meta, vnl_plan, B, nb=None):
             )
 
             try:
-                k_red = int(sym.irk_to_k_map[ik])
+                k_red = int(sym.irr_idx_k[ik])
             except Exception:
                 k_red = int(ik)
             e_b = np.asarray(

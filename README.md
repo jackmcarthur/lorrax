@@ -9,11 +9,11 @@ LORRAX is developed primarily by Jack McArthur (myself) and supervised by Prof. 
 The package requires as input the BerkeleyGW format wavefunction file `WFN.h5`. It is currently only compatible with full-spinor wavefunctions, but it can be used with wavefunction k-grids that are reduced by symmetry using BGW's `kgrid.x`. Symmetries are not used in the evaluation of the quasiparticle energies and will not reduce computational cost relative to unfolded k-grids.
 
 The main drivers are located in `src/`:
-- **ISDF initialization**: `isdf_init/kmeans_isdf.py` (k-means clustering for interpolation points)
+- **ISDF initialization**: `centroid/kmeans_isdf.py` (k-means algorithm) + `centroid/kmeans_cli.py` (CLI entrypoint, `python -m centroid.kmeans_cli`)
 - **Wavefunction loading**: `common/load_wfns.py` (ISDF basis fitting by least squares, memory bottlenecks)
 - **GW quasiparticle energies**: `gw_isdf/gw_jax.py` (main driver), `w_isdf.py` (screened interaction builder)
 
-Available as console commands: `gw_jax`, `lorrax-gw`, `kmeans_isdf`, `bse_isdf`.
+Available as console commands: `gw_jax`, `lorrax-gw`, `lorrax-centroids` (= `centroid.kmeans_cli`), `lorrax-bse`.
 
 ## Quick start
 

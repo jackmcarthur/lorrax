@@ -543,9 +543,9 @@ def make_v_munu_chunked_kernel(
 from .v_q_tile import (
     compute_V_q_tile as _compute_V_q_tile,
     _choose_v_q_chunks,
-    _unfold_v_q_ibz_to_full,
     _unfold_g0_ibz_to_full,
 )
+from common.symmetry_maps import unfold_v_q
 
 
 # ============================================================================
@@ -859,7 +859,7 @@ def compute_all_V_q(
             zeta_io,
             kgrid=kgrid, fft_grid=fft_grid,
             bvec=bvec, cell_volume=cell_volume,
-            mesh_xy=mesh_xy, n_rmu=n_rmu,
+            mesh_xy=mesh_xy,
             sys_dim=sys_dim, bdot=bdot,
             bare_coulomb_cutoff_ry=bare_coulomb_cutoff,
             bgw_v_grid_fn=bgw_v_grid_fn,
@@ -884,6 +884,7 @@ def compute_all_V_q(
     q_full_to_irr_idx = None
     q_full_to_irr_sym = None
     sym_perm = None
+    L_table = None
     nq_total = nq_full
     q_list_for_tile = None
 
@@ -892,11 +893,18 @@ def compute_all_V_q(
         n_tran = int(np.asarray(sym.sym_matrices).shape[0])
         centroid_idx_np = np.asarray(centroid_indices, dtype=np.int32)
         try:
-            sym_perm = compute_centroid_sym_perm(
+            # ``extend_trs=True`` so ``sym_perm`` has shape
+            # ``(2·n_tran, n_rmu)`` — the second half duplicates the
+            # spatial rows and is indexed by the TRS-augmented sym
+            # values returned by ``sym.irr_idx_q/sym_idx_q``.  See
+            # ``compute_centroid_sym_perm`` docstring and the audit
+            # report (``reports/trs_sym_audit_2026-05-14``).
+            sym_perm, L_table = compute_centroid_sym_perm(
                 centroid_idx_np,
                 sym_matrices=np.asarray(sym.sym_matrices[:n_tran]),
                 translations=np.asarray(sym.translations[:n_tran]),
                 fft_grid=np.asarray(fft_grid, dtype=np.int32),
+                extend_trs=True,
             )
         except RuntimeError as exc:
             if verbose and jax.process_index() == 0:
@@ -904,11 +912,12 @@ def compute_all_V_q(
                       f"falling back to full-BZ iteration.  Reason: "
                       f"{exc.args[0].splitlines()[0] if exc.args else exc}")
             sym_perm = None
+            L_table = None
 
         if sym_perm is not None:
-            (q_irr_kgrid_int, q_full_to_irr_idx,
-             q_full_to_irr_sym, _q_irr_full_idx
-             ) = sym.find_irreducible_qpoints()
+            q_irr_kgrid_int = sym.q_irr_kgrid_int
+            q_full_to_irr_idx = sym.irr_idx_q
+            q_full_to_irr_sym = sym.sym_idx_q
             nq_total = int(q_irr_kgrid_int.shape[0])
             q_list_for_tile = q_irr_kgrid_int
             use_ibz = True
@@ -1022,12 +1031,28 @@ def compute_all_V_q(
     # centroid-double-permute (eq. 3 of the report).  g0 is unfolded
     # for completeness, but only the Γ slot is consumed downstream.
     if use_ibz:
-        V_acc = _unfold_v_q_ibz_to_full(
+        # ``sym_perm`` was built with ``extend_trs=True`` → shape
+        # (2·ntran, n_rmu); the unfold helper applies a TRS-row conj
+        # when ``full_to_irr_sym ≥ n_sym_spatial``, AND applies the
+        # per-centroid umklapp phase from ``L_table``.
+        n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
+        # Need q_irr_frac (fractional reciprocal coords of IBZ q-list)
+        # for the umklapp phase.  q_irr_kgrid_int is in kgrid-integer
+        # units; wrap to (−0.5, 0.5] then divide by kgrid (same convention
+        # used by v_q_g_flat._resolve_ibz_q_list).
+        _kg_arr = np.asarray(sym.kgrid, dtype=np.float64)
+        _q_int = np.asarray(q_irr_kgrid_int, dtype=np.float64)
+        _q_wrap = np.where(_q_int > _kg_arr / 2, _q_int - _kg_arr, _q_int)
+        q_irr_frac_for_phase = _q_wrap / _kg_arr
+        V_acc = unfold_v_q(
             V_acc,
-            full_to_irr_idx=q_full_to_irr_idx,
-            full_to_irr_sym=q_full_to_irr_sym,
+            irr_idx=q_full_to_irr_idx,
+            sym_idx=q_full_to_irr_sym,
             sym_perm=sym_perm,
+            L_table=L_table,
+            q_irr_frac=q_irr_frac_for_phase,
             mesh_xy=mesh_xy,
+            n_sym_spatial=n_sym_spatial,
         )
         g0_acc = _unfold_g0_ibz_to_full(
             g0_acc,
@@ -1035,6 +1060,7 @@ def compute_all_V_q(
             full_to_irr_sym=q_full_to_irr_sym,
             sym_perm=sym_perm,
             mesh_xy=mesh_xy,
+            n_sym_spatial=n_sym_spatial,
         )
 
     # Flat-q convention: keep the q axis 1-D throughout.  Downstream

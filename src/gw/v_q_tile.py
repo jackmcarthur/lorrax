@@ -1035,7 +1035,7 @@ def compute_V_q_tile(
         replaced by ``len(q_list_kgrid_int)`` for V_acc allocation
         AND ``zeta_q`` read offsets — the caller is responsible for
         ensuring ζ on disk is indexed in the same order (typically
-        an IBZ subset via ``SymMaps.find_irreducible_qpoints()``).
+        an IBZ subset via ``SymMaps.irr_idx_q / sym_idx_q``).
     use_g_flat_zeta : bool
         Opt-in (default False) to consume ζ in **G-flat** layout via
         the new :class:`file_io.zeta_reader.ZetaReader` read path —
@@ -1444,118 +1444,10 @@ def compute_V_q_tile(
 #     V_{Sq, π_s(μ), π_s(ν)} = V_{q, μ, ν}                         (eq. 3)
 #
 # So given V_q_ibz on the IBZ wedge and the full-to-IBZ tables produced by
-# ``SymMaps.find_irreducible_qpoints`` + ``orbit_syms.compute_centroid_sym_perm``,
+# ``SymMaps.irr_idx_q / sym_idx_q`` + ``orbit_syms.compute_centroid_sym_perm``,
 # we can recover V_q on the full BZ as a pure index gather — no FFT, no
 # phase multiply.  Cost: one fancy index, scales as n_q_full · μ² ·
 # 16 / mesh_size on the (μ, ν) sharding.
-
-def _unfold_v_q_ibz_to_full(
-    V_q_ibz: jax.Array,
-    *,
-    full_to_irr_idx: np.ndarray,
-    full_to_irr_sym: np.ndarray,
-    sym_perm: np.ndarray,
-    mesh_xy: Mesh,
-) -> jax.Array:
-    """Expand ``V_q_ibz (n_qpt_irr, μ, μ)`` to ``(n_q_full, μ, μ)``.
-
-    The mapping is eq. 3 of ``reports/zeta_ibz_2026-05-11/report.md``:
-
-        V_full[q, μ', ν'] = V_ibz[i(q), π_{s(q)}^{-1}(μ'), π_{s(q)}^{-1}(ν')]
-
-    where ``i(q) = full_to_irr_idx[q]`` and ``s(q) = full_to_irr_sym[q]``.
-    No τ-phase — bilinearity in ζ cancels them.
-
-    Parameters
-    ----------
-    V_q_ibz
-        (n_qpt_irr, n_rmu, n_rmu) c128, sharded ``P(None, 'x', 'y')``.
-    full_to_irr_idx
-        (n_q_full,) int.
-    full_to_irr_sym
-        (n_q_full,) int.
-    sym_perm
-        (n_sym, n_rmu) int — the forward permutation
-        ``r_{π_s(μ)} ≡ S_s r_μ + τ_s``.
-    mesh_xy
-        Device mesh; the output is constrained to ``P(None, 'x', 'y')``.
-
-    Returns
-    -------
-    V_q_full
-        (n_q_full, n_rmu, n_rmu) c128, sharded ``P(None, 'x', 'y')``.
-    """
-    # Trivial-IBZ short-circuit. When ntran=1 (e.g. nosym runs) the IBZ is
-    # already the full BZ — full_to_irr_idx is identity, full_to_irr_sym
-    # is all zeros, sym_perm is identity. The take_along_axis path below
-    # is then a no-op but its sharded codegen has been observed to trip
-    # an XLA HLO verifier dtype mismatch (s64 broadcast vs s32 operand
-    # on a 2×2 mesh), so bypass it entirely.
-    idx_np = np.asarray(full_to_irr_idx)
-    sym_np = np.asarray(full_to_irr_sym)
-    if (idx_np.shape[0] == int(V_q_ibz.shape[0])
-            and np.array_equal(idx_np, np.arange(idx_np.shape[0]))
-            and np.all(sym_np == 0)):
-        return V_q_ibz
-
-    # Inverse permutation: ``inv_perm[s, π_s(μ)] = μ`` → argsort along μ.
-    # ``sym_perm`` is built from the LOGICAL centroid set (size
-    # ``n_rmu_logical``).  ``V_q_ibz`` arrives at the PADDED extent
-    # ``n_rmu_padded = ceil(n_rmu_logical / world_size) * world_size``
-    # so the V_q kernel's μ/ν shardings divide the mesh cleanly.  We
-    # pad ``inv_perm`` to that same padded extent with identity
-    # entries (pad μ rows map to themselves), so the gather output
-    # matches V_q_ibz's μ/ν extents and the ``P(None, 'x', 'y')``
-    # output sharding constraint is satisfied.  Pad ζ rows are zero
-    # by construction (SlabIO valid_shape= zero-fill) so the unfolded
-    # V_full has zero values on those rows — same on-disk-logical
-    # contract as the V_q kernel itself.
-    inv_perm = np.argsort(sym_perm, axis=-1).astype(np.int32)
-    n_rmu_logical = int(inv_perm.shape[-1])
-    n_rmu_padded = int(V_q_ibz.shape[-1])
-    if n_rmu_padded > n_rmu_logical:
-        pad_block = np.arange(
-            n_rmu_logical, n_rmu_padded, dtype=np.int32)
-        pad_block = np.broadcast_to(
-            pad_block, (inv_perm.shape[0], n_rmu_padded - n_rmu_logical))
-        inv_perm = np.concatenate([inv_perm, pad_block], axis=-1)
-    elif n_rmu_padded != n_rmu_logical:
-        raise ValueError(
-            f"_unfold_v_q_ibz_to_full: V_q_ibz μ-extent "
-            f"{n_rmu_padded} smaller than sym_perm logical extent "
-            f"{n_rmu_logical}; pad invariant violated.")
-    inv_perm_j = jnp.asarray(inv_perm)
-    idx_j = jnp.asarray(np.asarray(full_to_irr_idx, dtype=np.int32))
-    sym_j = jnp.asarray(np.asarray(full_to_irr_sym, dtype=np.int32))
-
-    V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-
-    @partial(jax.jit, out_shardings=V_sh)
-    def _do_unfold(V_ibz):
-        # Per-q μ-axis mapping: shape (n_q_full, n_rmu_padded).
-        perm_q = inv_perm_j[sym_j]                                  # (n_q_full, n_rmu_padded)
-        V_at_irr = V_ibz[idx_j]                                     # (n_q_full, μ, μ)
-        # ``mode='promise_in_bounds'`` skips the
-        # ``_normalize_index``-driven OOB ``select`` that
-        # ``take_along_axis`` runs under the default ``mode='fill'``.
-        # That helper introduces a comparison ``index < 0`` + a fill
-        # constant; under shard_map+x64 the constant gets emitted as
-        # ``s32`` while XLA promotes the comparison's broadcast to
-        # ``s64`` (the HLO verifier ``SameElementType`` failure at
-        # ``hlo_verifier.cc:1247``).  ``perm_q`` is an in-range
-        # permutation by construction, so the bounds check is
-        # gratuitous; ``promise_in_bounds`` lowers directly to a
-        # ``lax.gather`` with no extra constant.
-        V_perm_mu = jnp.take_along_axis(
-            V_at_irr, perm_q[:, :, None], axis=1,
-            mode='promise_in_bounds')
-        V_full = jnp.take_along_axis(
-            V_perm_mu, perm_q[:, None, :], axis=2,
-            mode='promise_in_bounds')
-        return V_full
-
-    return _do_unfold(V_q_ibz)
-
 
 def _unfold_v_q_ij_ibz_to_full(
     V_q_ij_ibz: jax.Array,
@@ -1673,6 +1565,7 @@ def _unfold_g0_ibz_to_full(
     full_to_irr_sym: np.ndarray,
     sym_perm: np.ndarray,
     mesh_xy: Mesh,
+    n_sym_spatial: int | None = None,
 ) -> jax.Array:
     """Expand ``g0_ibz (n_qpt_irr, μ)`` → ``(n_q_full, μ)``.
 
@@ -1687,6 +1580,14 @@ def _unfold_g0_ibz_to_full(
     structure) but omit the τ-phase (its effect is unobservable; the
     Γ phase is exp(0) = 1 anyway).  If a future consumer needs the
     correct phase, set ``include_tau_phase=True``.
+
+    TRS-augmented rows: g0 is a single ζ leg, so the TRS rule is a
+    plain conjugation: ``g0_{full}^{TRS-q, π_s(μ)} = conj(g0_{ibz}^{i(q), μ})``.
+    Pass ``n_sym_spatial=ntran`` along with a
+    ``compute_centroid_sym_perm(..., extend_trs=True)`` table to enable
+    the conj branch.  Without ``n_sym_spatial``, no TRS conj is
+    applied; any TRS-augmented sym index in ``full_to_irr_sym`` then
+    hits the hard-fail guard below.
     """
     # Trivial-IBZ short-circuit (ntran=1, no centroid permutation, no
     # μ-pad).  See ``_unfold_v_q_ibz_to_full`` for the rationale; we
@@ -1699,6 +1600,23 @@ def _unfold_g0_ibz_to_full(
             and np.all(sym_np == 0)
             and int(g0_ibz.shape[-1]) == int(np.asarray(sym_perm).shape[-1])):
         return g0_ibz
+
+    # TRS-aware bounds check, mirroring ``_unfold_v_q_ibz_to_full``.
+    n_sym_perm = int(np.asarray(sym_perm).shape[0])
+    max_sym = int(sym_np.max()) if sym_np.size else -1
+    if max_sym >= n_sym_perm:
+        raise ValueError(
+            f"_unfold_g0_ibz_to_full: full_to_irr_sym contains value "
+            f"{max_sym} (TRS-augmented row index) but sym_perm has only "
+            f"{n_sym_perm} rows.  Build sym_perm via "
+            f"``compute_centroid_sym_perm(..., extend_trs=True)`` to "
+            f"cover the TRS-augmented half of ``sym_mats_k``, and pass "
+            f"``n_sym_spatial=ntran`` here.")
+    if n_sym_spatial is not None and int(n_sym_spatial) * 2 != n_sym_perm:
+        raise ValueError(
+            f"_unfold_g0_ibz_to_full: n_sym_spatial={n_sym_spatial} is "
+            f"inconsistent with sym_perm.shape[0]={n_sym_perm}.  "
+            f"sym_perm must have shape (2·n_sym_spatial, n_rmu).")
 
     # Pad ``inv_perm`` to the input's μ-extent (same logic as
     # ``_unfold_v_q_ibz_to_full``); g0 carries the padded μ count
@@ -1718,6 +1636,13 @@ def _unfold_g0_ibz_to_full(
     idx_j = jnp.asarray(full_to_irr_idx)
     sym_j = jnp.asarray(full_to_irr_sym)
 
+    # TRS mask: same convention as ``_unfold_v_q_ibz_to_full``.
+    if n_sym_spatial is not None:
+        trs_mask_np = (sym_np >= int(n_sym_spatial))
+    else:
+        trs_mask_np = np.zeros(sym_np.shape, dtype=bool)
+    trs_mask_j = jnp.asarray(trs_mask_np)
+
     g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
 
     @partial(jax.jit, out_shardings=g0_sh)
@@ -1729,6 +1654,9 @@ def _unfold_g0_ibz_to_full(
         # as ``_unfold_v_q_ibz_to_full``.
         g0_full = jnp.take_along_axis(
             g0_at_irr, perm_q, axis=1, mode='promise_in_bounds')
+        # TRS rows: ζ-leg conjugation (g0 is a single ζ leg, not
+        # bilinear, so the TRS conj does NOT cancel — apply it).
+        g0_full = jnp.where(trs_mask_j[:, None], jnp.conj(g0_full), g0_full)
         return g0_full
 
     return _do_unfold(g0_ibz)

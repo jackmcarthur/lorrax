@@ -624,6 +624,12 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		else (int(gflat_plan.gflat_chunk_size)
 		      if gflat_plan.gflat_chunk_size is not None else 0))
 
+	# Round 6 deleted the ``gflat_to_rchunk_chunk_size`` cohsex knob —
+	# the new ``z_q_from_psi_sm`` streaming-scan body has no
+	# user-facing chunk size (per-iter FFT box is bounded by the
+	# rank's bpd_per_bc · ns · n_rtot · 16, set by the planner-picked
+	# ``band_chunk_size``).
+
 	zeta_h5_path = os.path.join(tmp_dir, "zeta_q.h5")
 	print_fn(f"\n  Chunked ISDF fitting:")
 	print_fn(f"    Band chunks: {chunks['band_chunk']}")
@@ -641,7 +647,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# reads the charge ζ file at full-BZ offsets.  Once that
 	# orchestrator gains IBZ support, this can flip to ``True`` for
 	# bispinor too.
-	_write_ibz_only_charge = not bool(cfg.bispinor)
+	import os as _os_dbg
+	_write_ibz_only_charge = (not bool(cfg.bispinor)
+		and not bool(int(_os_dbg.environ.get('LORRAX_FORCE_FULL_BZ', '0'))))
 	# Two cutoffs control the bare-Coulomb / ζ-sphere construction:
 	#   * ``bare_coulomb_cutoff_ry`` — V_q's sqrt_v(q+G) mask.
 	#   * ``zeta_cutoff_ry``         — the on-disk per-q ζ sphere
@@ -691,13 +699,11 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			bispinor=cfg.bispinor,
 			band_range_left=band_range_left,
 			band_range_right=band_range_right,
-			k_chunk_size=chunks.get('k_chunk', 0),
 			band_norms=_band_norms,
 			slab_io_backend=cfg.backend.slab_io,
 			gspace_mode=cfg.gspace_mode,
 			cusolvermp_charge=cfg.backend.cusolvermp_charge,
 			cusolvermp_lu=cfg.backend.cusolvermp_lu,
-			psig_k_chunk_size=int(cfg.memory.psig_k_chunk_size),
 			gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
 			write_ibz_only=_write_ibz_only_charge,
 			zeta_cutoff_ry=_zeta_cutoff,
@@ -739,6 +745,19 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# Same kernel as the charge channel, swapping in the γ̃^i vertex.  Three
 	# sequential calls keep peak GPU memory at the scalar-fit level.  Output
 	# paths follow the convention zeta_q_mu{1,2,3}.h5 next to zeta_q.h5.
+	#
+	# Loud-fail guard: if cfg.bispinor=True the transverse ζ fit MUST run,
+	# otherwise downstream V_q silently falls back to scalar V_q and then
+	# crashes on a full-BZ vs IBZ shape mismatch (ζ_T written by bispinor
+	# mode is full-BZ; scalar V_q expects IBZ-only).  See the 2026-05-14
+	# CrI3 30 Ry test-bed KNOWN_SANDBOX_ERRORS entry.
+	if cfg.bispinor and not getattr(cfg.paths, 'centroids_file_current', None):
+		raise ValueError(
+			"Bispinor calculation requires centroids_file_current in cohsex.in "
+			"(set to the path of a current-density kmeans output, e.g. "
+			"centroids_frac_NNN_current.txt from "
+			"`centroid.kmeans_cli --density-mode current ...`)."
+		)
 	if cfg.bispinor and getattr(cfg.paths, 'centroids_file_current', None):
 		import dataclasses
 		from common.load_wfns import load_centroids_band_chunked
@@ -815,13 +834,11 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					bispinor=cfg.bispinor,
 					band_range_left=band_range_left,
 					band_range_right=band_range_right,
-					k_chunk_size=chunks.get('k_chunk', 0),
-					band_norms=_band_norms,
+							band_norms=_band_norms,
 					slab_io_backend=cfg.backend.slab_io,
 					gspace_mode=cfg.gspace_mode,
 					cusolvermp_charge=cfg.backend.cusolvermp_charge,
 					cusolvermp_lu=cfg.backend.cusolvermp_lu,
-					psig_k_chunk_size=int(cfg.memory.psig_k_chunk_size),
 					gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
 					vertex_mu_L=mu_L,
 					# TODO(bispinor-ibz): port compute_V_q_bispinor_to_h5

@@ -638,7 +638,7 @@ def main(argv=None):
 
 		# ΔE matrix for this k from band energies
 		try:
-			k_red = int(sym.irk_to_k_map[i])
+			k_red = int(sym.irr_idx_k[i])
 		except Exception:
 			k_red = int(i)
 		energies = np.asarray(wfn.energies)

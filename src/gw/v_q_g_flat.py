@@ -30,6 +30,7 @@ output sharding ``P(None, 'x', 'y')`` matches.
 """
 from __future__ import annotations
 
+import os
 import queue
 import threading
 from functools import partial
@@ -154,9 +155,13 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
     """Pick IBZ q's via centroid orbit closure, fall back to full BZ.
 
     Returns ``(q_irr_kgrid_int, q_irr_frac, q_full_to_irr_idx,
-    q_full_to_irr_sym, sym_perm, use_ibz)``.  When ``use_ibz`` is
-    False the *_idx / *_sym / sym_perm fields are None; caller skips
-    the post-loop unfold.
+    q_full_to_irr_sym, sym_perm, L_table, use_ibz)``.  When
+    ``use_ibz`` is False the *_idx / *_sym / sym_perm / L_table fields
+    are None; caller skips the post-loop unfold.
+
+    ``L_table`` is the per-(sym, μ) integer real-space lattice wrap
+    captured by ``compute_centroid_sym_perm``; ``unfold_v_q`` uses it
+    to build the umklapp phase ``exp(2π i q · (L_μ − L_ν))``.
     """
     nkx, nky, nkz = kgrid
     use_ibz = False
@@ -164,16 +169,28 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
     q_full_to_irr_idx = None
     q_full_to_irr_sym = None
     sym_perm = None
-    if sym is not None and centroid_indices is not None:
+    L_table = None
+    # DEBUG: set LORRAX_FORCE_FULL_BZ=1 to bypass the IBZ cascade and
+    # compute V_q at all full-BZ q's directly.  Useful for isolating
+    # whether residuals come from unfold_v_q vs the rest of the pipeline.
+    _force_full_bz = bool(int(os.environ.get('LORRAX_FORCE_FULL_BZ', '0')))
+    if sym is not None and centroid_indices is not None and not _force_full_bz:
         from centroid.orbit_syms import compute_centroid_sym_perm
         n_tran = int(np.asarray(sym.sym_matrices).shape[0])
         cent_idx = np.asarray(centroid_indices, dtype=np.int32)
         try:
-            sym_perm = compute_centroid_sym_perm(
+            # ``extend_trs=True`` so ``sym_perm`` has shape
+            # ``(2·n_tran, n_rmu)`` — the second half duplicates the
+            # spatial rows and is indexed by the TRS-augmented sym
+            # values returned by ``sym.irr_idx_q/sym_idx_q``.  See
+            # ``compute_centroid_sym_perm`` docstring and the audit
+            # report (``reports/trs_sym_audit_2026-05-14``).
+            sym_perm, L_table = compute_centroid_sym_perm(
                 cent_idx,
                 sym_matrices=np.asarray(sym.sym_matrices[:n_tran]),
                 translations=np.asarray(sym.translations[:n_tran]),
                 fft_grid=np.asarray(fft_grid, dtype=np.int32),
+                extend_trs=True,
             )
         except RuntimeError as exc:
             if verbose and jax.process_index() == 0:
@@ -181,9 +198,11 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
                       f"full-BZ iteration.  Reason: "
                       f"{exc.args[0].splitlines()[0] if exc.args else exc}")
             sym_perm = None
+            L_table = None
         if sym_perm is not None:
-            (q_irr_kgrid_int, q_full_to_irr_idx,
-             q_full_to_irr_sym, _) = sym.find_irreducible_qpoints()
+            q_irr_kgrid_int = sym.q_irr_kgrid_int
+            q_full_to_irr_idx = sym.irr_idx_q
+            q_full_to_irr_sym = sym.sym_idx_q
             use_ibz = True
 
     if not use_ibz:
@@ -201,7 +220,7 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
         q_irr_kgrid_int).astype(np.float64)
     q_irr_frac = q_irr_wrapped / kg_arr
     return (q_irr_kgrid_int, q_irr_frac,
-            q_full_to_irr_idx, q_full_to_irr_sym, sym_perm, use_ibz)
+            q_full_to_irr_idx, q_full_to_irr_sym, sym_perm, L_table, use_ibz)
 
 
 def _pick_g_chunk(ngkmax: int, target: int = 4096) -> int:
@@ -212,19 +231,15 @@ def _pick_g_chunk(ngkmax: int, target: int = 4096) -> int:
     return int(ngkmax)
 
 
-def _make_read_q(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
-    """Return a ``read_q(q_idx) -> (1, n_rmu_padded, ngkmax)`` callable.
+def _make_read_all_ibz(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
+    """Return ``read_all_ibz(n_q_ibz) -> (n_q_ibz, n_rmu_padded, ngkmax)``.
 
     Both :class:`ZetaLoader` (test bench) and :class:`ZetaReader`
-    (production) can serve a G-flat slab; their call signatures
-    differ.  Detect which one we have once, then dispatch.
-
-    Also exposes ``read_all_ibz(n_q_ibz) -> (n_q_ibz, n_rmu_padded, ngkmax)``
-    as a single-call batched variant.  Used by the V_q tile orchestrator
-    to read the whole IBZ slab once at the start, avoiding the
-    ``n_q_ibz`` separate ``read_slab`` calls (each of which produces a
-    distinct ``_FfiBackend.read_slab.<locals>._per_rank`` closure id and
-    triggers a JAX trace cache miss).
+    (production) can serve a G-flat slab; their call signatures differ.
+    Detect which one we have once, then dispatch.  The batched single-
+    call form avoids the ``n_q_ibz`` separate ``read_slab`` closures
+    (each one a distinct ``_FfiBackend.read_slab.<locals>._per_rank``
+    closure id) that would each cost a JAX trace cache miss.
     """
     has_load = callable(getattr(zeta_loader, 'load', None))
     has_read_slab = callable(getattr(zeta_loader, 'read_zeta_G_slab', None))
@@ -236,22 +251,7 @@ def _make_read_q(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
     n_rmu_logical = int(zeta_loader.n_rmu)
     spec = P(None, ('x', 'y'), None)
 
-    def read_q(q_idx: int) -> jax.Array:
-        if has_load:
-            return zeta_loader.load(
-                q=[int(q_idx)], layout='G_flat', sharding=spec)
-        # ZetaReader path: per-q phase is already baked in on disk;
-        # pass a dummy qvec for the unused ``qvec_batch_frac`` arg.
-        return zeta_loader.read_zeta_G_slab(
-            q_offset=int(q_idx), q_count=1,
-            mu_offset=0, mu_count=int(n_rmu_padded),
-            qvec_batch_frac=jnp.zeros((1, 3), dtype=jnp.float64),
-            sphere_idx=None,
-            mesh=mesh_xy, valid_mu=n_rmu_logical,
-        )
-
     def read_all_ibz(n_q_ibz: int) -> jax.Array:
-        """Single batched read of all IBZ q's → ``(n_q_ibz, n_rmu_padded, ngkmax)``."""
         if has_load:
             return zeta_loader.load(
                 q=list(range(int(n_q_ibz))), layout='G_flat', sharding=spec)
@@ -263,9 +263,7 @@ def _make_read_q(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
             mesh=mesh_xy, valid_mu=n_rmu_logical,
         )
 
-    # Attach the batched variant onto ``read_q`` so callers can pick.
-    read_q.read_all_ibz = read_all_ibz
-    return read_q
+    return read_all_ibz
 
 
 # ---------------------------------------------------------------------------
@@ -278,8 +276,6 @@ def _compute_V_q_g_flat_one_tile(
     *,
     v_per_G_builder,                   # callable(q_irr_frac, gvec_components) -> (n_q, ngkmax) c128
     kgrid, fft_grid, bvec, mesh_xy,
-    n_rmu_L: int,
-    n_rmu_R: int,
     g_chunk: int | None,
     sym, centroid_indices,             # IBZ closure check is on the L centroids
     write_g0: bool,
@@ -298,6 +294,10 @@ def _compute_V_q_g_flat_one_tile(
     shardings ``P(None, 'x', 'y')`` and ``P(None, 'x')``.
     """
     same_zeta = (zeta_R_loader is None) or (zeta_R_loader is zeta_L_loader)
+    # ``n_rmu_*`` is the logical centroid count for each side — read off the
+    # loader so callers don't repeat themselves.
+    n_rmu_L = int(zeta_L_loader.n_rmu)
+    n_rmu_R = n_rmu_L if same_zeta else int(zeta_R_loader.n_rmu)
     if str(getattr(zeta_L_loader, 'zeta_layout', '')) != 'G_flat':
         raise ValueError(
             f"_compute_V_q_g_flat_one_tile[{timing_label}]: zeta_L "
@@ -309,13 +309,13 @@ def _compute_V_q_g_flat_one_tile(
             f"_compute_V_q_g_flat_one_tile[{timing_label}]: zeta_R "
             "layout must be 'G_flat'.")
 
-    from .v_q_tile import (_unfold_v_q_ibz_to_full,
-                            _unfold_g0_ibz_to_full)
+    from .v_q_tile import _unfold_g0_ibz_to_full
+    from common.symmetry_maps import unfold_v_q
 
     # ---- IBZ list + per-tile v(q+G) -----------------------------------
     (_q_int, q_irr_frac,
      full_to_irr_idx, full_to_irr_sym,
-     sym_perm, use_ibz) = _resolve_ibz_q_list(
+     sym_perm, L_table, use_ibz) = _resolve_ibz_q_list(
         sym=sym, centroid_indices=centroid_indices,
         kgrid=kgrid, fft_grid=fft_grid, verbose=verbose)
     n_q_ibz = int(q_irr_frac.shape[0])
@@ -376,18 +376,12 @@ def _compute_V_q_g_flat_one_tile(
     V_acc = jax.jit(lambda: jnp.zeros(
         (n_q_ibz, n_rmu_L_padded, n_rmu_R_padded), dtype=jnp.complex128),
         out_shardings=V_sh)()
-    if write_g0:
-        g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
-        g0_acc = jax.jit(lambda: jnp.zeros(
-            (n_q_ibz, n_rmu_L_padded), dtype=jnp.complex128),
-            out_shardings=g0_sh)()
-    else:
-        # The jit kernel still needs a buffer to donate; allocate a
-        # tiny placeholder we won't read.
-        g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
-        g0_acc = jax.jit(lambda: jnp.zeros(
-            (n_q_ibz, n_rmu_L_padded), dtype=jnp.complex128),
-            out_shardings=g0_sh)()
+    # ``g0_acc`` is also the donate-target when ``write_g0=False`` — the
+    # per-q kernel still needs the buffer; the contents are simply unread.
+    g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
+    g0_acc = jax.jit(lambda: jnp.zeros(
+        (n_q_ibz, n_rmu_L_padded), dtype=jnp.complex128),
+        out_shardings=g0_sh)()
     v_q_dev = jax.device_put(
         v_q_table, NamedSharding(mesh_xy, P(None, None)))
 
@@ -395,9 +389,9 @@ def _compute_V_q_g_flat_one_tile(
         mesh_xy, n_rmu_L_padded, n_rmu_R_padded, ngkmax, g_chunk,
         write_g0=write_g0, same_zeta=same_zeta)
 
-    read_L = _make_read_q(zeta_L_loader, n_rmu_L_padded, mesh_xy)
+    read_L = _make_read_all_ibz(zeta_L_loader, n_rmu_L_padded, mesh_xy)
     read_R = (read_L if same_zeta
-              else _make_read_q(zeta_R_loader, n_rmu_R_padded, mesh_xy))
+              else _make_read_all_ibz(zeta_R_loader, n_rmu_R_padded, mesh_xy))
 
     # ---- Pre-read all IBZ ζ̃ slabs in ONE batched call ---------------
     # The historical per-q PHDF5 read inside the kernel loop interleaved
@@ -414,11 +408,11 @@ def _compute_V_q_g_flat_one_tile(
     # ~63 to 7.
     import time as _t
     _read_t0 = _t.perf_counter()
-    zeta_L_all = read_L.read_all_ibz(n_q_ibz)               # (n_q_ibz, n_rmu_L_padded, ngkmax)
+    zeta_L_all = read_L(n_q_ibz)                            # (n_q_ibz, n_rmu_L_padded, ngkmax)
     if same_zeta:
         zeta_R_all = zeta_L_all
     else:
-        zeta_R_all = read_R.read_all_ibz(n_q_ibz)
+        zeta_R_all = read_R(n_q_ibz)
     jax.block_until_ready(zeta_L_all)
     if not same_zeta:
         jax.block_until_ready(zeta_R_all)
@@ -448,15 +442,24 @@ def _compute_V_q_g_flat_one_tile(
 
     # ---- IBZ → full-BZ unfold (centroid double-permute) -------------
     if use_ibz:
-        V_acc = _unfold_v_q_ibz_to_full(
-            V_acc, full_to_irr_idx=full_to_irr_idx,
-            full_to_irr_sym=full_to_irr_sym,
-            sym_perm=sym_perm, mesh_xy=mesh_xy)
+        # ``sym_perm`` came from ``compute_centroid_sym_perm(..., extend_trs=True)``
+        # so its shape[0] is ``2·ntran``; the second half encodes the
+        # TRS-augmented rows (centroid permutation unchanged under TRS,
+        # but the unfold helper conjugates V_q at TRS-tagged q's).
+        # ``L_table`` is the per-(sym, μ) integer lattice wrap; the
+        # umklapp phase ``exp(2π i q_irr · (L_μ − L_ν))`` is essential
+        # for non-cubic / non-symmorphic systems.
+        n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
+        V_acc = unfold_v_q(
+            V_acc, irr_idx=full_to_irr_idx, sym_idx=full_to_irr_sym,
+            sym_perm=sym_perm, L_table=L_table, q_irr_frac=q_irr_frac,
+            mesh_xy=mesh_xy, n_sym_spatial=n_sym_spatial)
         if write_g0:
             g0_acc = _unfold_g0_ibz_to_full(
                 g0_acc, full_to_irr_idx=full_to_irr_idx,
                 full_to_irr_sym=full_to_irr_sym,
-                sym_perm=sym_perm, mesh_xy=mesh_xy)
+                sym_perm=sym_perm, mesh_xy=mesh_xy,
+                n_sym_spatial=n_sym_spatial)
 
     V_qmunu = jax.lax.with_sharding_constraint(V_acc, V_sh)
     if write_g0:
@@ -476,7 +479,6 @@ def compute_all_V_q_g_flat(
     bvec: np.ndarray,
     cell_volume: float,
     mesh_xy: Mesh,
-    n_rmu: int,
     sys_dim: int,
     bdot: np.ndarray | None = None,
     bare_coulomb_cutoff_ry: float | None = None,
@@ -532,7 +534,6 @@ def compute_all_V_q_g_flat(
         v_per_G_builder=_bare_v_per_G,
         kgrid=kgrid, fft_grid=fft_grid, bvec=bvec,
         mesh_xy=mesh_xy,
-        n_rmu_L=int(n_rmu), n_rmu_R=int(n_rmu),
         g_chunk=g_chunk,
         sym=sym, centroid_indices=centroid_indices,
         write_g0=True,
@@ -542,4 +543,4 @@ def compute_all_V_q_g_flat(
 
 
 __all__ = ["compute_all_V_q_g_flat", "_compute_V_q_g_flat_one_tile",
-            "_resolve_ibz_q_list", "_pick_g_chunk", "_make_read_q"]
+            "_resolve_ibz_q_list", "_pick_g_chunk", "_make_read_all_ibz"]

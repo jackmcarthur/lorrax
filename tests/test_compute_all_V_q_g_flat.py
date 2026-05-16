@@ -146,7 +146,7 @@ def test_compute_all_V_q_g_flat_matches_einsum_reference(
                 kgrid=kgrid, fft_grid=fft_grid,
                 bvec=bvec, cell_volume=cell_volume,
                 mesh_xy=single_device_mesh,
-                n_rmu=n_rmu, sys_dim=sys_dim,
+                sys_dim=sys_dim,
                 bare_coulomb_cutoff_ry=cutoff,
                 async_prefetch=False,
                 sym=None,                # full-BZ iteration
@@ -187,7 +187,7 @@ def test_compute_all_V_q_g_flat_async_matches_sync(
                 kgrid=kgrid, fft_grid=fft_grid,
                 bvec=bvec, cell_volume=cell_volume,
                 mesh_xy=single_device_mesh,
-                n_rmu=n_rmu, sys_dim=sys_dim,
+                sys_dim=sys_dim,
                 bare_coulomb_cutoff_ry=cutoff,
                 async_prefetch=False,
             )
@@ -196,7 +196,7 @@ def test_compute_all_V_q_g_flat_async_matches_sync(
                 kgrid=kgrid, fft_grid=fft_grid,
                 bvec=bvec, cell_volume=cell_volume,
                 mesh_xy=single_device_mesh,
-                n_rmu=n_rmu, sys_dim=sys_dim,
+                sys_dim=sys_dim,
                 bare_coulomb_cutoff_ry=cutoff,
                 async_prefetch=True,
             )
@@ -223,5 +223,5 @@ def test_compute_all_V_q_g_flat_rejects_r_space_loader(
                 bvec=np.eye(3),
                 cell_volume=1.0,
                 mesh_xy=single_device_mesh,
-                n_rmu=4, sys_dim=2,
+                sys_dim=2,
             )

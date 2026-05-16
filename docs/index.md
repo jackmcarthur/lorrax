@@ -34,7 +34,7 @@ Then browse the `.md` files in `docs/api/` in your editor or on GitHub.
 
 - `src/gw/gw_jax.py`: COHSEX driver (JAX, sharded)
 - `src/gw/w_isdf.py`: static screening and chi0 helpers
-- `src/isdf/centroid/kmeans_isdf.py`: centroid selection
+- `src/centroid/kmeans_cli.py`: centroid-selection CLI (algorithm in `kmeans_isdf.py` next to it)
 - `src/isdf/common/wfnreader.py`: wavefunction I/O
 
 ### Frequency-Integration Docs

@@ -59,13 +59,6 @@ def build_real_space_syms(wfn, sym, validate: bool = True):
     return R, Rinv, tau
 
 
-def identity_syms():
-    """Dummy 1-element sym table — no symmetry, for non-orbit-aware callers."""
-    return (jnp.eye(3, dtype=jnp.int32)[None],
-            jnp.eye(3, dtype=jnp.int32)[None],
-            jnp.zeros((1, 3), dtype=jnp.float64))
-
-
 # ─────────────────────────────────────────────────────────────────────────
 # Orbit utilities
 # ─────────────────────────────────────────────────────────────────────────
@@ -74,7 +67,21 @@ def identity_syms():
 def orbit_images(reps: jnp.ndarray,
                  Rinv: jnp.ndarray,
                  tau: jnp.ndarray) -> jnp.ndarray:
-    """Apply every sym op to every rep. Returns (n_sym, n_rep, 3) mod 1."""
+    """Apply BGW r-action ``r' = Rinv·r + τ`` (mod 1) to every rep.
+
+    BGW's space-group action on real-space points is
+    ``r' = mtrx⁻¹ · r + τ`` where ``mtrx = wfn.sym_matrices`` and
+    ``τ = wfn.translations / (2π)``.  Pass ``Rinv = inv(mtrx)`` (=
+    ``sym.Rinv_grid``).  Verified by ``validate_atomic_symmetries`` on
+    Si Fd-3m: 96/96 atom mappings pass with this convention,
+    48/96 with the wrong-direction ``mtrx · r + τ`` action.
+
+    For symmorphic systems (CrI3, MoS2: τ=0) the choice of matrix
+    direction is moot — both produce the same orbit set because the
+    group is closed under inversion.  For non-symmorphic systems
+    (Si Fd-3m glides), only the BGW convention closes the orbit
+    properly.
+    """
     return jax.vmap(lambda Ri, t: (reps @ Ri.T + t) % 1.0)(Rinv, tau)
 
 
@@ -117,42 +124,6 @@ def canonicalize_orbit(reps: jnp.ndarray,
     )[0]
 
 
-def snap_orbits_to_grid(reps_frac: np.ndarray,
-                        fft_grid: tuple[int, int, int],
-                        Rinv: jnp.ndarray,
-                        tau: jnp.ndarray,
-                        ) -> tuple[np.ndarray, np.ndarray, int]:
-    """Snap fractional reps to the FFT grid, canonicalise to the
-    lex-smallest on-grid orbit member, then deduplicate **by orbit**.
-
-    Two reps that snap to different points but share an orbit are
-    counted as duplicates here (the older ``snap_centroids_to_grid``
-    only catches literal-point duplicates).
-
-    Requires the FFT grid to be commensurate with every τ in the sym
-    table — i.e. ``(τ × fft_grid)`` must be integer to roundoff. This
-    is checked by ``build_real_space_syms`` indirectly via
-    ``validate_atomic_symmetries`` (which would fail loudly if the
-    atom basis didn't close on the grid).
-
-    Returns
-    -------
-    indices : (n_unique, 3) int — canonical orbit reps as FFT indices.
-    frac    : (n_unique, 3) fp — same, as fractional coords.
-    n_dups  : number of orbit-duplicates dropped.
-    """
-    indices = np.round(reps_frac * np.array(fft_grid)).astype(int) % fft_grid
-    snapped = indices.astype(float) / fft_grid
-    canon = np.asarray(canonicalize_orbit(jnp.asarray(snapped), Rinv, tau))
-    canon_idx = np.round(canon * np.array(fft_grid)).astype(int) % fft_grid
-    unique_idx = np.unique(canon_idx, axis=0)
-    n_dups = canon_idx.shape[0] - unique_idx.shape[0]
-    if n_dups > 0:
-        print(f"snap_orbits_to_grid: {n_dups} orbit duplicates "
-              f"({canon_idx.shape[0]} → {unique_idx.shape[0]} unique orbits)")
-    return unique_idx, unique_idx.astype(float) / fft_grid, n_dups
-
-
 def unfold_orbit_unique_with_id(reps_np: np.ndarray,
                                 Rinv: np.ndarray,
                                 tau: np.ndarray,
@@ -161,6 +132,11 @@ def unfold_orbit_unique_with_id(reps_np: np.ndarray,
     """Unfold reps into all distinct orbit images; also return ``orbit_id``
     — a per-candidate integer that's the same for two candidates iff they
     lie in the same **physical** orbit under the WFN's sym group.
+
+    Pass ``Rinv = inv(wfn.sym_matrices) = sym.Rinv_grid``.  BGW's
+    r-action is ``r' = Rinv · r + τ``; this matches the direction used
+    by ``orbit_images``, ``compute_centroid_sym_perm``, and
+    ``validate_atomic_symmetries``.
 
     orbit_id is the integer encoding of each candidate's canonical
     (lex-smallest) orbit member, then run through ``np.unique`` to make
@@ -173,6 +149,7 @@ def unfold_orbit_unique_with_id(reps_np: np.ndarray,
     inv = np.int64(round(1.0 / tol))         # int! avoid fp64-precision loss at 1e18
 
     # 1. Unfold + dedupe at fp tolerance.
+    # ``r @ Rinv[s].T + τ[s]`` = Rinv·r + τ in column form (BGW r-action).
     images = (np.einsum('ri,sji->srj', reps_np, Rinv) + tau[:, None, :]) % 1.0
     flat = images.reshape(-1, 3)
     keys = np.round(flat * inv).astype(np.int64) % inv
@@ -196,12 +173,6 @@ def unfold_orbit_unique_with_id(reps_np: np.ndarray,
     return flat, orbit_id.astype(np.int32)
 
 
-def unfold_orbit_unique(reps_np, Rinv, tau, tol=1e-6) -> np.ndarray:
-    """Backwards-compatible wrapper: drops the orbit_id second return."""
-    flat, _ = unfold_orbit_unique_with_id(reps_np, Rinv, tau, tol=tol)
-    return flat
-
-
 # ─────────────────────────────────────────────────────────────────────────
 # Centroid orbit permutation π_s : r_{π_s(μ)} = S_s r_μ + τ_s  (mod 1)
 # ─────────────────────────────────────────────────────────────────────────
@@ -213,14 +184,34 @@ def compute_centroid_sym_perm(
     fft_grid: np.ndarray | tuple[int, int, int],
     *,
     validate: bool = True,
-) -> np.ndarray:
-    """Build π_s such that ``r_{π_s(μ)} ≡ S_s r_μ + τ_s`` on the FFT grid.
+    extend_trs: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build (α_s, L_s) for the BGW-convention r-action ``r' = inv(mtrx)·r + τ``.
 
-    The forward direction: S_s and τ_s acting on real space.  In the
-    BGW convention used elsewhere in LORRAX, real-space r transforms
-    via ``Rinv = S^{-1}`` (column-vector form), so ``S r + τ`` in
-    column form is equivalent to ``r @ Rinv.T + τ`` in row form.  We
-    use the row-form throughout for vectorisation.
+    For each target centroid μ and sym op s, compute the **source**
+    centroid α(μ) and integer real-space lattice wrap L_μ such that
+
+        y_μ = mtrx · (x_μ − τ) = x_{α(μ)} + L_μ,     L_μ ∈ ℤ³.
+
+    Here ``mtrx = sym_matrices[s]``, ``x_μ = centroid frac coords``,
+    ``τ = translations[s] / (2π)``.  ``mtrx`` is BGW's stored matrix
+    (acts on G-vectors; BGW's r-action is ``r' = mtrx⁻¹·r + τ``).
+    Confirmed by ``validate_atomic_symmetries``: 96/96 Si atom mappings
+    pass with this convention; the wrong direction ``mtrx·r + τ`` gives
+    48/96 and breaks Si Fd-3m closure (see
+    ``reports/trs_sym_audit_2026-05-14/SYMMETRY_CONVENTIONS.md``).
+
+    The user-math formula for the V_q unfold then reads:
+
+        V_full[q1, μ', ν'] = exp(2π i q · (L_{μ'} − L_{ν'}))
+                             · V_ibz[parent, α(μ'), α(ν')]
+
+    where q = IBZ parent q in fractional reciprocal coords.  ``unfold_v_q``
+    consumes ``sym_perm = α`` and ``L_table = L`` directly (no argsort).
+    For symmorphic systems (τ=0), both α and its inverse give the same
+    orbit set (group closed under inversion), so the choice of "α" vs
+    "π" direction is irrelevant; for non-symmorphic systems (Si Fd-3m
+    glides) the α direction is required for the orbit to close.
 
     Parameters
     ----------
@@ -244,12 +235,41 @@ def compute_centroid_sym_perm(
         If True, asserts every row of the result is a permutation
         ``[0, n_rmu)``.  Set False only for offline diagnostics where
         the closure failure is the thing you want to inspect.
+    extend_trs
+        If True, return a ``(2·n_sym, n_rmu)`` table whose rows
+        ``[n_sym:]`` duplicate rows ``[:n_sym]``.  This is the
+        TRS-augmented variant: under time-reversal symmetry, real-space
+        centroid coordinates r_μ are unchanged (TRS acts on momenta and
+        complex-conjugates ψ, but leaves r fixed), so the permutation
+        for a TRS-augmented op ``K ∘ {S | τ}`` coincides with the
+        permutation for the bare spatial op ``{S | τ}``.  Pass
+        ``extend_trs=True`` whenever the caller's ``full_to_irr_sym``
+        values may exceed ``n_sym`` (i.e. come from
+        ``SymMaps.irr_idx_q / sym_idx_q`` which uses the
+        TRS-augmented ``sym_mats_k``).  See Agent 1's scope report at
+        ``reports/trs_sym_audit_2026-05-14/agent_1_scope_report.md``
+        Site #1 for the bug this option closes.
 
     Returns
     -------
     sym_perm
-        (n_sym, n_rmu) int32 — ``sym_perm[s, μ] = ν`` iff
-        ``r_ν ≡ S_s r_μ + τ_s`` on the FFT grid.
+        ``(n_sym, n_rmu)`` int32 by default; ``(2·n_sym, n_rmu)`` int32
+        when ``extend_trs=True``.  ``sym_perm[s, μ] = ν`` iff
+        ``r_ν ≡ S_s r_μ + τ_s`` on the FFT grid.  For
+        ``s ∈ [n_sym, 2·n_sym)`` the TRS-augmented row duplicates
+        ``s - n_sym`` (TRS keeps r fixed).  The ζ-leg complex
+        conjugation under TRS — for V_q bilinear in ζ this becomes
+        ``V_{TRS-q, μ, ν} = conj(V_{q, μ, ν}) = V_{q, ν, μ}`` (last
+        equality by V_q Hermiticity) — is applied at the V_q-unfold
+        level (see ``gw.v_q_tile._unfold_v_q_ibz_to_full``), NOT in
+        ``sym_perm`` itself.
+    L_table
+        ``(n_sym, n_rmu, 3)`` int8 by default; ``(2·n_sym, n_rmu, 3)``
+        when ``extend_trs=True``.  ``L_table[s, μ] = floor(S r_μ + τ)``
+        — the integer real-space lattice vector by which the image
+        exits the unit cell.  TRS rows duplicate spatial rows (r is
+        fixed under TRS).  Used by ``unfold_v_q`` to build the
+        umklapp phase ``exp(2π i q · (L_μ − L_ν))``.
 
     Raises
     ------
@@ -279,15 +299,31 @@ def compute_centroid_sym_perm(
     # transformation, then back to FFT indices after wrap.
     r_frac = idx.astype(np.float64) / fft_grid_np[None, :]    # (n_rmu, 3)
 
-    # Row-vector form: r' = r @ S.T + τ  → ``S r + τ`` in column form.
-    # (NB: ``S`` here is what BGW calls ``mtrx``; the centroid r really
-    # transforms by ``Rinv = inv(S)``.  Compute Rinv on host.)
-    Rinv = np.rint(np.linalg.inv(S)).astype(np.int64)          # (n_sym, 3, 3)
-
-    # images[s, μ] = r_μ @ Rinv[s].T + τ[s]   (mod 1)
-    images = np.einsum('rj,sij->sri', r_frac, Rinv.astype(np.float64)) \
-             + tau_frac[:, None, :]
-    images = images - np.floor(images)                          # (n_sym, n_rmu, 3) in [0, 1)
+    # User-spec source-centroid + lattice-wrap decomposition:
+    #   y_μ = mtrx · (x_μ − τ) = x_{α(μ)} + L_μ, with L_μ ∈ ℤ³.
+    # BGW r-action ``r' = mtrx⁻¹ · r + τ`` ⇒ the SOURCE of x_μ under this
+    # action is mtrx·(x_μ−τ); the integer part is the lattice wrap that
+    # produces the umklapp phase exp(2π i q · L_μ) on ζ; the fractional
+    # part mod 1 is the centroid index α(μ) we permute by.  See
+    # SYMMETRY_CONVENTIONS.md.
+    r_shifted = r_frac[None, :, :] - tau_frac[:, None, :]            # (n_sym, n_rmu, 3)
+    # images_raw[s, μ, i] = (mtrx[s] · r_shifted[s, μ])_i = sum_j S[s,i,j] r_shifted[s,μ,j]
+    images_raw = np.einsum('sij,srj->sri', S.astype(np.float64), r_shifted)
+    # Snap to FFT-grid integers BEFORE floor.  Centroids live at
+    # multiples of 1/fft_grid; mtrx and τ are commensurate (BGW guarantee),
+    # so images_raw is also a multiple of 1/fft_grid up to 1e-17
+    # floating-point noise.  Naive ``np.floor`` flips an L component
+    # from 0 → -1 whenever the true integer part is 0 but a tiny
+    # negative noise hits np.floor's discontinuity — which produces a
+    # spurious exp(±iπ/2) phase in unfold_v_q.  Snapping fixes this
+    # cleanly; verified at ISDF noise floor on Si Fd-3m (24³ FFT,
+    # non-symmorphic τ) where the previous code gave 14/64 q's with
+    # rel err ~0.8 due to this exact off-by-one.
+    images_int = np.rint(images_raw * fft_grid_np[None, None, :]).astype(np.int64)
+    grid_per_axis = fft_grid_np[None, None, :]
+    L_wrap = (np.floor_divide(images_int, grid_per_axis)).astype(np.int8)
+    images_int_mod = images_int - L_wrap.astype(np.int64) * grid_per_axis
+    images = images_int_mod.astype(np.float64) / grid_per_axis.astype(np.float64)
 
     # Snap back to FFT-grid integers.  If τ × FFTgrid isn't integer to
     # roundoff, this rounding will land on a half-grid point and the
@@ -335,7 +371,21 @@ def compute_centroid_sym_perm(
                     f"collides with a different centroid.  Check "
                     f"``validate_atomic_symmetries`` on the WFN.")
 
-    return sym_perm.astype(np.int32)
+    sym_perm = sym_perm.astype(np.int32)
+    if extend_trs:
+        # TRS keeps r fixed; the augmented rows duplicate the spatial
+        # rows for BOTH sym_perm and L_wrap.  Doubling here makes the
+        # tables index-compatible with the TRS-augmented
+        # ``full_to_irr_sym`` values returned by ``SymMaps.irr_idx_q /
+        # sym_idx_q`` (which range over ``[0, 2·ntran)``).  Without
+        # this, a downstream gather of ``inv_perm[s]`` for ``s ≥
+        # ntran`` silently clips to the last spatial row under JAX
+        # ``mode='promise_in_bounds'``, producing wrong V_q at every
+        # TRS-folded q (the headline bug — see
+        # ``reports/trs_sym_audit_2026-05-14/agent_1_scope_report.md``).
+        sym_perm = np.concatenate([sym_perm, sym_perm.copy()], axis=0)
+        L_wrap = np.concatenate([L_wrap, L_wrap.copy()], axis=0)
+    return sym_perm, L_wrap
 
 
 # ─────────────────────────────────────────────────────────────────────────

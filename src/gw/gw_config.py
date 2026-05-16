@@ -223,11 +223,6 @@ _DEFAULTS = {
     #   "analytic"  – regressed-fit analytic chooser (alternate model
     #                 over the same artifacts).
     "chunk_chooser_mode": "heuristic",
-    # Inner k-axis chunker in ``psi_G_store.fetch_psi_rchunk``.  Bounds
-    # the per-fetch FFT box ``(k_chunk, bc, ns, n_rtot)`` to avoid XLA
-    # materialising it unsharded at CrI3 6×6 80 Ry scale.
-    # 0 (default) = no inner k-chunking (one shot over all k).
-    "psig_k_chunk_size": 0,
     # ``accumulate_rchunk_to_gflat`` flat-axis chunker.  Bounds the
     # per-scan-iter FFT box ``chunk_size · n_rtot``.
     # 0 (default) = one-shot; the gflat memory model overrides this
@@ -606,7 +601,6 @@ class MemoryConfig:
     zct_stage_cap_gb: float | None
     use_aot_chunk_chooser: bool
     chunk_chooser_mode: str       # "heuristic" | "analytic"
-    psig_k_chunk_size: int        # 0 = no inner k-chunking
     gflat_chunk_size: int         # 0 = one-shot (or planner-picked)
     vq_g_chunk_size: int          # 0 = auto _pick_g_chunk(ngkmax)
 
@@ -958,7 +952,6 @@ class LorraxConfig:
             zct_stage_cap_gb=zct_stage_cap_gb,
             use_aot_chunk_chooser=bool(_g("use_aot_chunk_chooser")),
             chunk_chooser_mode=str(_g("chunk_chooser_mode")).strip().lower(),
-            psig_k_chunk_size=int(_g("psig_k_chunk_size")),
             gflat_chunk_size=int(_g("gflat_chunk_size")),
             vq_g_chunk_size=int(_g("vq_g_chunk_size")),
         )

@@ -40,10 +40,9 @@ from .fft_helpers import (
     make_flat_k_fftn,
     compute_block_size_for_2d_cholesky,
 )
-from .load_wfns import (
-    read_Gvecs_to_devices,
-    load_centroids_band_chunked,
-)
+from .load_wfns import load_centroids_band_chunked
+from .wfn_transforms import to_rchunk_inner
+from jax.experimental import io_callback as _io_callback
 
 
 # ============================================================================
@@ -375,63 +374,348 @@ def c_q_from_psi_sm(
 
 def z_q_from_psi_sm(
 	psi_l_X: jax.Array,
-	psi_l_Y: jax.Array,
 	psi_r_X: jax.Array,
-	psi_r_Y: jax.Array,
+	psi_G_store,
+	*,
+	band_chunk_ranges: tuple[tuple[int, int], ...],
+	band_range_left: tuple[int, int],
+	band_range_right: tuple[int, int],
+	r_start_dyn,
+	r_chunk_size: int,
 	gamma_L: tuple[jax.Array, jax.Array] | None = None,
 	gamma_R: tuple[jax.Array, jax.Array] | None = None,
-	*,
 	kgrid: tuple[int, int, int],
 	mesh_xy: Mesh,
 ) -> jax.Array:
-	"""Z_q built from ψ directly inside one monolithic shard_map.
+	"""Z_q built from ψ via a streaming-scan pair density inside one shard_map.
 
-	Identical structure to :func:`c_q_from_psi_sm` but ``n_col`` is the
-	r-chunk extent (not n_rmu), and the L / R bands may have different
-	extents (``nb_l != nb_r`` in the general fit_one_rchunk case).
+	Round 6 redesign (`round5_unified_plan.md` §2.10 / §6.5).  Replaces
+	the all-at-once einsum that consumed pre-computed ``psi_l_Y`` /
+	``psi_r_Y`` with a ``lax.scan`` over band-chunks inside the
+	``shard_map`` body.  Per iter:
+
+	  1. ``io_callback`` pulls this rank's 1/P bands of bc ``i`` from
+	     :class:`PsiGStore`'s host tile (band-flat-sharded over the
+	     full ``('x','y')`` mesh).
+	  2. :func:`common.wfn_transforms.to_rchunk_inner` does the local
+	     IFFT + per-rank r-slab (``r0_local = r_start + axis_index('y')
+	     * r_loc``).
+	  3. ``lax.all_gather(axis_name=('x','y'), axis=1, tiled=True)``
+	     aligns the band axis with ``psi_l_X`` / ``psi_r_X``'s
+	     band-replicated layout.  IFFT-FIRST; gather-first would blow
+	     the FFT box to ~80 GB / rank.
+	  4. L/R per-bc band masks (mask approach — ``jnp.where`` on a
+	     rank-local axis).
+	  5. Two einsums into rank-5 carries ``(P_l_acc, P_r_acc)``.
+
+	Post-scan: existing IFFT(k) → γ̃·γ̃ → FFT(k) tail (byte-identical
+	to the pre-rewrite body — only the front of the body changes per
+	plan §2.7).
+
+	Inputs:
+	    psi_l_X, psi_r_X    : ``(nk, n_rmu, nb_l, ns)`` /
+	                          ``(nk, n_rmu, nb_r, ns)`` sharded
+	                          ``P(None, 'x', None, None)`` (μ on 'x',
+	                          bands replicated).
+	    psi_G_store         : :class:`PsiGStore` — closure-captured;
+	                          provides ``_slice_local_tile_bc`` /
+	                          ``g_index`` / ``kvecs_frac``.  NOT a jit
+	                          argument.
+	    band_chunk_ranges   : tuple of (b_lo, b_hi) global band indices.
+	    band_range_left     : (L_lo, L_hi) global L-window.  Must
+	                          satisfy nb_l == L_hi - L_lo.
+	    band_range_right    : (R_lo, R_hi) global R-window.
+	    fft_grid            : (nx, ny, nz).
+	    r_start_dyn         : int32 scalar — flat-r start of the chunk.
+	    r_chunk_size        : static int — full r-chunk extent.  Per
+	                          rank slab is ``r_chunk_size // p_y``.
+	    gamma_L, gamma_R    : ``(perm, phase)`` tuples or ``None``
+	                          (= γ̃^0 = I).
+	    kgrid               : (nkx, nky, nkz).
+	Output:
+	    Z_q                 : (nq, n_rmu, n_zchunk) sharded
+	                          ``P(None, 'x', 'y')``.
 	"""
+	from .psi_G_store import _PSI_G_FLAT_SPEC  # noqa: F401  (sharding contract)
+
+	fft_grid = tuple(int(s) for s in psi_G_store.meta.fft_grid)
 	nkx, nky, nkz = kgrid
 	nk = int(psi_l_X.shape[0])
 	n_rmu = int(psi_l_X.shape[1])
 	nb_l = int(psi_l_X.shape[2])
 	nb_r = int(psi_r_X.shape[2])
 	ns = int(psi_l_X.shape[3])
-	n_zchunk = int(psi_l_Y.shape[3])
+	n_zchunk = int(r_chunk_size)
+	p_x = int(mesh_xy.shape['x'])
+	p_y = int(mesh_xy.shape['y'])
+	if n_zchunk % p_y != 0:
+		raise ValueError(
+			f"z_q_from_psi_sm: r_chunk_size={n_zchunk} not divisible by "
+			f"p_y={p_y} (out_spec=P(None,'x','y') requires this).")
+	r_loc = n_zchunk // p_y
+
+	bcr = tuple((int(lo), int(hi)) for (lo, hi) in band_chunk_ranges)
+	L_lo_g = int(band_range_left[0]); L_hi_g = int(band_range_left[1])
+	R_lo_g = int(band_range_right[0]); R_hi_g = int(band_range_right[1])
+	if L_hi_g - L_lo_g != nb_l:
+		raise ValueError(
+			f"z_q_from_psi_sm: psi_l_X.shape[2]={nb_l} != L_hi - L_lo "
+			f"= {L_hi_g - L_lo_g}.")
+	if R_hi_g - R_lo_g != nb_r:
+		raise ValueError(
+			f"z_q_from_psi_sm: psi_r_X.shape[2]={nb_r} != R_hi - R_lo "
+			f"= {R_hi_g - R_lo_g}.")
+
 	lhs_id = gamma_L is None
 	rhs_id = gamma_R is None
 
-	cache_key = ('z_q_from_psi_sm', id(mesh_xy), nk, n_rmu, n_zchunk, ns,
-	             nb_l, nb_r, nkx, nky, nkz, lhs_id, rhs_id)
+	cache_key = (
+		'z_q_from_psi_sm_streaming', id(mesh_xy), id(psi_G_store),
+		nk, n_rmu, n_zchunk, ns, nb_l, nb_r, nkx, nky, nkz,
+		lhs_id, rhs_id, bcr, (L_lo_g, L_hi_g), (R_lo_g, R_hi_g),
+		tuple(int(s) for s in fft_grid),
+	)
 	if cache_key not in _pair_pipeline_sm_cache:
 		_lhs_id = lhs_id
 		_rhs_id = rhs_id
+		_psi_G_store = psi_G_store
+		fft_grid_t = tuple(int(s) for s in fft_grid)
+
+		# Static per-bc tables: global band-axis offsets for the
+		# bc-aligned scan body.  Each iter gathers ``bpd_max_global =
+		# P · _bpd_max`` bands (the bc's full band width), so the L/R
+		# masks index into a static-size axis.
+		P_total = p_x * p_y
+		bpd_max = int(_psi_G_store._bpd_max)
+		bpd_max_global = bpd_max * P_total          # padded global bc band count
+		n_bc = len(bcr)
+		# Per-bc tables.  Built as np arrays here (NOT jnp.asarray) so
+		# they enter the shard_map body via numpy → jnp lift inside the
+		# Manual-mode body.  Closure-captured Auto-sharded jax.Arrays
+		# inside a Manual-mode shard_map body trigger a mesh-context
+		# mismatch (same issue as kvecs_frac in the earlier debug);
+		# wrapping them as numpy constants and lifting inside the body
+		# treats them as concrete constants from the body's perspective.
+		_b_lo_global_np = np.asarray(
+			[lo for (lo, _hi) in bcr], dtype=np.int32)
+		_b_hi_global_np = np.asarray(
+			[hi for (_lo, hi) in bcr], dtype=np.int32)
+		# psi_l_X / psi_r_X are sized to their L/R window; per-bc slice
+		# offset within them is `bc.lo - L_lo_g` / `bc.lo - R_lo_g`,
+		# which can be NEGATIVE when bc starts below the window AND
+		# the slice (offset, offset+bpd_max_global) can extend PAST
+		# the window when bc spans the upper boundary or the final bc
+		# is short.  We pre-pad psi_l_X / psi_r_X at BOTH ends with
+		# zero rows so that the dynamic_slice never goes out of
+		# bounds — which would otherwise trigger XLA's silent clamp
+		# (start clamped to ``axis_size - slice_size``), producing
+		# *physically wrong bands* that the L/R mask CANNOT recover
+		# (the mask's index assumes the slice covers
+		# ``[bc.lo, bc.lo+bpd_max_global)`` but the clamp returns
+		# something else).  See round6_discussion.md:506 BLOCKER from
+		# Agent 4.  Pad rows correspond to out-of-window global bands;
+		# the L/R mask zeros their contribution to the einsum
+		# (math-neutral) — same contract as the front-pad rows.
+		front_pad_l = max(
+			(max(0, L_lo_g - lo) for (lo, _hi) in bcr), default=0)
+		front_pad_r = max(
+			(max(0, R_lo_g - lo) for (lo, _hi) in bcr), default=0)
+		# After front-pad, offset = bc.lo - L_lo_g + front_pad_l (always ≥ 0).
+		_psi_l_X_bc_offset_np = np.asarray(
+			[lo - L_lo_g + front_pad_l for (lo, _hi) in bcr],
+			dtype=np.int32)
+		_psi_r_X_bc_offset_np = np.asarray(
+			[lo - R_lo_g + front_pad_r for (lo, _hi) in bcr],
+			dtype=np.int32)
+		# Back-pad: the slice (offset, offset+bpd_max_global) must fit
+		# entirely within the padded array (front_pad + nb + back_pad).
+		# The largest end-offset across all bcs determines the back-pad.
+		_max_end_l = int(max(
+			(off + bpd_max_global for off in _psi_l_X_bc_offset_np),
+			default=0))
+		_max_end_r = int(max(
+			(off + bpd_max_global for off in _psi_r_X_bc_offset_np),
+			default=0))
+		back_pad_l = max(0, _max_end_l - (front_pad_l + nb_l))
+		back_pad_r = max(0, _max_end_r - (front_pad_r + nb_r))
+		ngkmax = int(_psi_G_store._per_rank_shape[3])
+
+		# Slicer needs static `out_sds`; close over the padded shape.
+		_per_rank_bc_shape = (nk, bpd_max, ns, ngkmax)
+		_slicer_out_sds = jax.ShapeDtypeStruct(
+			_per_rank_bc_shape, jnp.complex128)
+
+		def _slicer_host(x_idx, y_idx, bc_idx):
+			return _psi_G_store._slice_local_tile_bc(x_idx, y_idx, bc_idx)
+
 		L_spec = P(None, 'x', None, None)
-		R_spec = P(None, None, None, 'y')
 		out_spec = P(None, 'x', 'y')
+		# g_index, kvecs_frac: replicated.  Pass through shard_map's
+		# in_specs (NOT closure) so JAX sees Manual-mode-compatible
+		# access inside the body (closure-captured Auto-sharded arrays
+		# trip a mesh-context mismatch under multi-device shard_map).
+		g_index_spec    = P(None, None, None, None)
+		kvecs_frac_spec = P(None, None)
 
 		@partial(shard_map, mesh=mesh_xy,
-		         in_specs=(L_spec, R_spec, L_spec, R_spec,
-		                   P(), P(), P(), P()),
+		         in_specs=(L_spec, L_spec, P(), P(), P(), P(), P(),
+		                   g_index_spec, kvecs_frac_spec),
 		         out_specs=out_spec,
 		         check_rep=False)
-		def _local(psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_,
-		           perm_L_, phase_L_, perm_R_, phase_R_):
-			# Einsum spec ``'karmb'`` matches cuBLAS's natural gemm
-			# output factoring ``(k, ns_l, col, μ, ns_r)`` so the
-			# rank-7 reshape is a bitcast.  See c_q_from_psi_sm._local
-			# for full commentary.  ``col`` here is the r-chunk extent.
+		def _local(psi_l_X_, psi_r_X_, perm_L_, phase_L_,
+		           perm_R_, phase_R_, r_start_,
+		           g_index_dev, kvecs_frac_dev):
+			# Per-rank shapes:
+			#   psi_l_X_ : (nk, n_rmu_loc, nb_l, ns)   μ on 'x' (replicated bands)
+			#   psi_r_X_ : (nk, n_rmu_loc, nb_r, ns)
+			# Carry (rank-local, NO sharding annotation):
+			#   P_l_acc  : (nk, ns, r_loc, mu_loc, ns)
+			# r_loc = n_zchunk / p_y per §2.3 (out_spec='y' on n_zchunk).
+			x_idx = jax.lax.axis_index('x')
+			y_idx = jax.lax.axis_index('y')
 			mu_loc = psi_l_X_.shape[1]
-			z_loc = psi_l_Y_.shape[3]
-			P_l = jnp.einsum(
-				'kmna,knbr->karmb', psi_l_X_, psi_l_Y_, optimize=True)
-			P_r = jnp.einsum(
-				'kmna,knbr->karmb', psi_r_X_, psi_r_Y_, optimize=True)
-			P_l_3d = P_l.reshape(nkx, nky, nkz, ns, z_loc, mu_loc, ns)
+
+			# Lift per-bc static tables to jnp.array INSIDE the
+			# Manual-mode body so they're treated as Manual-mode
+			# concrete constants (vs Auto-sharded closure jax.Arrays
+			# which trip a mesh-context mismatch).
+			b_lo_global_arr = jnp.asarray(_b_lo_global_np)
+			b_hi_global_arr = jnp.asarray(_b_hi_global_np)
+			psi_l_X_bc_offset = jnp.asarray(_psi_l_X_bc_offset_np)
+			psi_r_X_bc_offset = jnp.asarray(_psi_r_X_bc_offset_np)
+
+			# Pre-pad psi_l_X_ / psi_r_X_ at the front with front_pad_*
+			# zero bands so the per-bc offset is always non-negative
+			# (handles the bc.lo < L_lo_g / R_lo_g case where the
+			# X-side offset would otherwise be negative; bands at
+			# position [0, front_pad) are zeros, masked-zero in the
+			# einsum).  Static front_pad_* baked at trace.
+			# Pad both ends.  Front-pad covers bc.lo < window_lo
+			# (negative offset case); back-pad covers
+			# bc.lo + bpd_max_global > window_lo + nb (out-of-bounds
+			# end case — XLA's dynamic_slice would otherwise silently
+			# clamp the start, producing wrong bands the L/R mask
+			# can't recover; see round6_discussion.md:506 BLOCKER).
+			if front_pad_l > 0 or back_pad_l > 0:
+				psi_l_X_padded = jnp.pad(
+					psi_l_X_,
+					((0, 0), (0, 0), (front_pad_l, back_pad_l), (0, 0)))
+			else:
+				psi_l_X_padded = psi_l_X_
+			if front_pad_r > 0 or back_pad_r > 0:
+				psi_r_X_padded = jnp.pad(
+					psi_r_X_,
+					((0, 0), (0, 0), (front_pad_r, back_pad_r), (0, 0)))
+			else:
+				psi_r_X_padded = psi_r_X_
+
+			# r-slab strategy: each y-rank ultimately owns ``r_loc``
+			# positions of the r-chunk (out_spec=P(None, 'x', 'y') on
+			# n_zchunk).  We CANNOT slice the r-axis per-rank BEFORE
+			# the all_gather over bands — that would mix r-slabs from
+			# different y-ranks at the same gathered band position
+			# (r-incoherence at the einsum).  Instead: per rank
+			# compute the FULL r-chunk in psi_Y_local, gather bands,
+			# THEN slice the r-axis to this y-rank's per-rank slab.
+			# Per-rank cost of full-r psi_Y_local is bigger by p_y vs
+			# the r_loc version, but XLA's scan-internal allocator
+			# aliases the per-iter slab across iters → single slot.
+			r0_y_offset = y_idx * jnp.int32(r_loc)
+
+			P_l_init = jnp.zeros(
+				(nk, ns, r_loc, mu_loc, ns), dtype=jnp.complex128)
+			P_r_init = jnp.zeros(
+				(nk, ns, r_loc, mu_loc, ns), dtype=jnp.complex128)
+
+			def body(carry, bc_idx):
+				P_l_acc, P_r_acc = carry
+				# (1) io_callback: this rank's 1/P bands of bc bc_idx.
+				#     ordered=False per §3.4 (lax.scan(unroll=1) gives
+				#     sequential per-rank execution at runtime; ordered
+				#     is a perf knob, not correctness).
+				psi_G_bc_local = _io_callback(
+					_slicer_host, _slicer_out_sds,
+					x_idx, y_idx, bc_idx,
+					ordered=False)
+				# (2) IFFT + FULL r-chunk slab (NOT per-rank r_loc — see
+				#     "r-slab strategy" comment above).  Local FFT box
+				#     per rank is c128[nk, bpd_max, ns, n_rtot] ·
+				#     cuFFT_scratch; the full-r slab is c128[nk,
+				#     bpd_max, ns, n_zchunk] per rank.  Both per-iter,
+				#     aliased across iters by XLA's scan-internal
+				#     allocator → single slot of each.
+				psi_Y_bc_local_full_r = to_rchunk_inner(
+					psi_G_bc_local, g_index_dev, fft_grid_t,
+					r_start_, n_zchunk,
+					kvecs_frac=kvecs_frac_dev, norm="ortho")
+				# (3) all_gather across both mesh axes along the band
+				#     axis.  IFFT-FIRST per §2.9 (gather-first → 80 GB
+				#     FFT box, infeasible).  Output: (nk, P·bpd_max,
+				#     ns, n_zchunk) on every rank.
+				psi_Y_bc_full_r = jax.lax.all_gather(
+					psi_Y_bc_local_full_r, axis_name=('x', 'y'),
+					axis=1, tiled=True)
+				# (3b) Slice the r-axis to THIS y-rank's r_loc slab.
+				#      MUST happen AFTER gather so the band axis +
+				#      r axis are coherent (each gathered band's r
+				#      values come from the SAME source rank's full
+				#      r-chunk computation).
+				psi_Y_bc = jax.lax.dynamic_slice_in_dim(
+					psi_Y_bc_full_r, r0_y_offset, r_loc, axis=3)
+				# (4) L/R global-index masks (mask approach per §2.5).
+				#     bc_valid handles short final bc (pad rows = zero).
+				g_axis = (b_lo_global_arr[bc_idx]
+				          + jnp.arange(bpd_max_global, dtype=jnp.int32))
+				bc_valid = g_axis < b_hi_global_arr[bc_idx]
+				l_mask = ((g_axis >= L_lo_g) & (g_axis < L_hi_g) & bc_valid)
+				r_mask = ((g_axis >= R_lo_g) & (g_axis < R_hi_g) & bc_valid)
+				psi_l_Y_bc = jnp.where(
+					l_mask[None, :, None, None], psi_Y_bc, 0)
+				psi_r_Y_bc = jnp.where(
+					r_mask[None, :, None, None], psi_Y_bc, 0)
+				# (5) psi_l_X / psi_r_X per-bc slice (band axis
+				#     replicated → purely local).  Static slice length
+				#     bpd_max_global so XLA can fold; offset traced.
+				#     Slice from the FRONT-PADDED psi_*_X_padded so the
+				#     offset is always non-negative even for bcs
+				#     starting below the L/R window start.
+				psi_l_X_bc = jax.lax.dynamic_slice_in_dim(
+					psi_l_X_padded, psi_l_X_bc_offset[bc_idx],
+					bpd_max_global, axis=2)
+				psi_l_X_bc = jnp.where(
+					l_mask[None, None, :, None], psi_l_X_bc, 0)
+				psi_r_X_bc = jax.lax.dynamic_slice_in_dim(
+					psi_r_X_padded, psi_r_X_bc_offset[bc_idx],
+					bpd_max_global, axis=2)
+				psi_r_X_bc = jnp.where(
+					r_mask[None, None, :, None], psi_r_X_bc, 0)
+				# (6) Two einsums into the carries (interleaved single
+				#     scan per §2.10; with the small carry the γ̃
+				#     contract dominates peak — serialization bought
+				#     nothing).
+				delta_P_l = jnp.einsum(
+					'kmna,knbr->karmb',
+					psi_l_X_bc, psi_l_Y_bc, optimize=True)
+				delta_P_r = jnp.einsum(
+					'kmna,knbr->karmb',
+					psi_r_X_bc, psi_r_Y_bc, optimize=True)
+				return (P_l_acc + delta_P_l, P_r_acc + delta_P_r), None
+
+			# DO NOT unroll — the FFT-box and psi_G_bc aliasing depends
+			# on per-iter sequential lifetime.  unroll=1 keeps the
+			# WhileOp atomic and lets XLA's scan-internal allocator
+			# reuse the slot (§3.5).
+			(P_l, P_r), _ = jax.lax.scan(
+				body, (P_l_init, P_r_init),
+				jnp.arange(n_bc, dtype=jnp.int32))
+
+			# Post-pair pipeline (byte-identical to today's tail per §2.7).
+			P_l_3d = P_l.reshape(nkx, nky, nkz, ns, r_loc, mu_loc, ns)
 			del P_l
 			P_l_R = jnp.fft.ifftn(P_l_3d, axes=(0, 1, 2), norm='forward')
 			P_l_R_conj = jnp.conj(P_l_R)
 			del P_l_3d, P_l_R
-			P_r_3d = P_r.reshape(nkx, nky, nkz, ns, z_loc, mu_loc, ns)
+			P_r_3d = P_r.reshape(nkx, nky, nkz, ns, r_loc, mu_loc, ns)
 			del P_r
 			P_r_R = jnp.fft.ifftn(P_r_3d, axes=(0, 1, 2), norm='forward')
 			del P_r_3d
@@ -446,13 +730,14 @@ def z_q_from_psi_sm(
 			del P_l_R_conj, P_r_R
 			Z_q_3d = jnp.fft.fftn(Z_R, axes=(0, 1, 2), norm='forward')
 			return jnp.transpose(
-				Z_q_3d.reshape(nkx * nky * nkz, z_loc, mu_loc),
+				Z_q_3d.reshape(nkx * nky * nkz, r_loc, mu_loc),
 				(0, 2, 1))
 
 		@jax.jit
-		def fn(psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, pL, phL, pR, phR):
-			return _local(psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_,
-			              pL, phL, pR, phR)
+		def fn(psi_l_X_, psi_r_X_, pL, phL, pR, phR, r_start_,
+		        g_index_, kvecs_frac_):
+			return _local(psi_l_X_, psi_r_X_, pL, phL, pR, phR, r_start_,
+			              g_index_, kvecs_frac_)
 
 		_pair_pipeline_sm_cache[cache_key] = fn
 
@@ -467,9 +752,17 @@ def z_q_from_psi_sm(
 	else:
 		perm_R, phase_R = gamma_R
 
+	r_start_arg = (jnp.int32(int(r_start_dyn))
+	                if isinstance(r_start_dyn, (int, np.integer))
+	                else r_start_dyn)
 	return _pair_pipeline_sm_cache[cache_key](
-		psi_l_X, psi_l_Y, psi_r_X, psi_r_Y,
-		perm_L, phase_L, perm_R, phase_R)
+		psi_l_X, psi_r_X, perm_L, phase_L, perm_R, phase_R, r_start_arg,
+		psi_G_store.g_index, psi_G_store.kvecs_frac)
+
+
+# Backward-compat shim removed — old z_q_from_psi_sm signature
+# (consumed pre-computed psi_l_Y / psi_r_Y) is gone.  Call sites
+# updated in `_make_fit_one_rchunk_kernel._kernel`.
 
 
 def _identity_pad_block_diagonal(
@@ -1254,48 +1547,39 @@ def _make_fit_one_rchunk_kernel(
         # returned at padded extent; the SlabIO write uses
         # ``valid_shape=meta.n_rmu`` so on-disk extent stays logical.
 
-        # --- Pair density + IFFT + γ̃·γ̃ + FFT, all in one shard_map.
-        # Fetch ψ_Y per-bc via io_callback, concatenate along the band
-        # axis, slice into L / R band ranges, and call
-        # ``z_q_from_psi_sm`` which fuses pair density + IFFT +
-        # γ̃·γ̃ + FFT inside one monolithic shard_map.  The rank-5 pair
-        # density never exists as a global XLA value, so the rank-3
-        # fused-replicated buffer that pegged the kernel peak under
-        # the legacy chain (5 slots × 4.16 GiB on MoS2 3×3 bispinor)
-        # cannot form.  γ̃^μ_L applied on BOTH P-sides at the
-        # post-IFFT contraction step (γ̃·γ̃ reduce); charge channel
-        # passes ``gamma_mu=None`` for the identity short-circuit.
-        _b0 = int(band_range_full[0])
-        _l_lo = int(band_range_left[0]) - _b0
-        _l_hi = int(band_range_left[1]) - _b0
-        _r_lo = int(band_range_right[0]) - _b0
-        _r_hi = int(band_range_right[1]) - _b0
-        psi_Y_parts = []
-        for bc_range in band_chunk_ranges:
-            psi_Y_parts.append(psi_G_store.fetch_psi_rchunk(
-                bc_range, r_start_dyn, actual_n_rchunk))
-        psi_Y_full = jnp.concatenate(psi_Y_parts, axis=1)
-        del psi_Y_parts
-        # Per-side band slices + norm divide.  norms_l / norms_r are
-        # sized to the side's band range, so they apply 1:1 to the
-        # corresponding slice of psi_Y_full.
-        psi_l_Y_sm = (psi_Y_full[:, _l_lo:_l_hi, :, :]
-                      / norms_l[None, :, None, None])
-        psi_r_Y_sm = (psi_Y_full[:, _r_lo:_r_hi, :, :]
-                      / norms_r[None, :, None, None])
-        del psi_Y_full
-        if is_charge:
-            Z_q = z_q_from_psi_sm(
-                psi_l_rmuT_X_fit, psi_l_Y_sm,
-                psi_r_rmuT_X_fit, psi_r_Y_sm,
-                kgrid=kgrid, mesh_xy=mesh_xy)
-        else:
-            gamma_mu = (gamma_perm, gamma_phase)
-            Z_q = z_q_from_psi_sm(
-                psi_l_rmuT_X_fit, psi_l_Y_sm,
-                psi_r_rmuT_X_fit, psi_r_Y_sm,
-                gamma_mu, gamma_mu,
-                kgrid=kgrid, mesh_xy=mesh_xy)
+        # --- Streaming pair density + IFFT + γ̃·γ̃ + FFT, all in one
+        # shard_map.  Round 6: ``z_q_from_psi_sm`` now pulls each bc
+        # from the host store via ``io_callback`` inside its
+        # ``lax.scan`` body, IFFTs locally, all-gathers the band axis,
+        # masks L/R per-bc, and einsums into rank-5 carries —
+        # eliminating the materialised ``psi_Y_full`` (the 30-GiB
+        # double-remat from Round 4's HLO read) and the boundary
+        # remat between the helper and the consumer.  γ̃^μ_L applied
+        # on BOTH P-sides at the post-IFFT contraction step (γ̃·γ̃
+        # reduce); charge channel passes ``gamma_mu=None`` for the
+        # identity short-circuit.
+        # Pre-multiply the L / R centroid copies by 1 / norms so the
+        # pair-density einsum sees the band-norm-scaled input without
+        # needing a per-bc divide inside the scan (algebraically
+        # identical: einsum is linear in psi_X · psi_Y, so dividing
+        # psi_X by norms gives the same scaled pair density as the
+        # original ψ_Y / norms; saves one band-axis broadcast per
+        # iter).
+        psi_l_X_scaled = psi_l_rmuT_X_fit / norms_l[None, None, :, None]
+        psi_r_X_scaled = psi_r_rmuT_X_fit / norms_r[None, None, :, None]
+        gamma_mu = None if is_charge else (gamma_perm, gamma_phase)
+        Z_q = z_q_from_psi_sm(
+            psi_l_X_scaled, psi_r_X_scaled, psi_G_store,
+            band_chunk_ranges=band_chunk_ranges,
+            band_range_left=band_range_left,
+            band_range_right=band_range_right,
+            r_start_dyn=r_start_dyn,
+            r_chunk_size=actual_n_rchunk,
+            gamma_L=gamma_mu,
+            gamma_R=gamma_mu,
+            kgrid=kgrid,
+            mesh_xy=mesh_xy,
+        )
         # IBZ-only solve (Phase B of PLAN_zeta_g_flat_migration.md):
         # the FFT-built C_q and Z_q are naturally full-BZ, but the
         # triangular solve has no inter-q coupling, so we gather IBZ
@@ -1359,9 +1643,10 @@ def fit_one_rchunk(
     per distinct static configuration.
 
     ``psi_G_store`` is captured in the jit closure (not a jit arg) so
-    the compiled kernel calls its ``fetch_psi_G`` method via io_callback
-    inside the bc-loop.  The cache key includes ``id(psi_G_store)`` to
-    avoid reusing a compile built against a different store.
+    the compiled kernel calls its ``_slice_local_tile_bc`` method via
+    io_callback inside ``z_q_from_psi_sm``'s scan body.  The cache key
+    includes ``id(psi_G_store)`` to avoid reusing a compile built against
+    a different store.
     """
     # vertex_mu_L splits into two runtime/closure pieces: a structural
     # ``is_charge`` (Python bool — keys the cache, separates the chol
@@ -1451,7 +1736,7 @@ def _band_norms_slice(
 # host, sharded n_XY over bands in per-rank tiles — each rank owns one
 # contiguous ``(nk, nb/P, ns, nx, ny, nz)`` numpy array — and the
 # kernel body slices per-bc (and optionally per-k) subsets via
-# :func:`common.psi_G_store.PsiGStore.fetch_psi_G`.  See that module
+# :func:`common.psi_G_store.PsiGStore._slice_local_tile_bc`.  See that module
 # for the two lifecycle modes (host_cache vs file_reread).
 
 
@@ -1470,15 +1755,14 @@ def fit_zeta_to_h5(
     bispinor: bool = True,
     band_range_left: tuple[int, int] | None = None,
     band_range_right: tuple[int, int] | None = None,
-    k_chunk_size: int = 0,
     band_norms: np.ndarray | None = None,
+    *,
     slab_io_backend=None,
     gspace_mode: str = "host_cache",
     vertex_mu_L: int = 0,
     solver_kind: str = 'auto',
     cusolvermp_charge: str = "auto",
     cusolvermp_lu: str = "auto",
-    psig_k_chunk_size: int = 0,
     gflat_chunk_size: int = 0,
     write_ibz_only: bool = True,
     zeta_cutoff_ry: float | None = None,
@@ -1781,8 +2065,8 @@ def fit_zeta_to_h5(
         return np.where(q > kg / 2, q - kg, q)
 
     if write_ibz_only:
-        (q_irr_kgrid_int, _q_full_to_irr_idx,
-         _q_full_to_irr_sym, q_irr_full_idx) = sym.find_irreducible_qpoints()
+        q_irr_kgrid_int = sym.q_irr_kgrid_int
+        q_irr_full_idx = sym.q_irr_full_idx
         n_q_disk = int(q_irr_full_idx.shape[0])
         # IBZ fractional q-vectors for the G-flat accumulator (Phase C1b).
         # BGW wrap THEN divide by kgrid so the writer's per-q phase
@@ -2016,7 +2300,6 @@ def fit_zeta_to_h5(
         band_chunk_ranges=band_chunk_ranges,
         bispinor=bispinor,
         mode=gspace_mode,
-        k_chunk_size=int(psig_k_chunk_size),
     )
 
     # ========== STEP 6: Loop over chunks ==========

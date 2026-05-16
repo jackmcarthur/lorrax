@@ -22,7 +22,7 @@ dependencies = [
 [project.scripts]
 lorrax-gw = "gw.gw_jax:main"
 gw_jax = "gw.gw_jax:main"
-lorrax-centroids = "centroid.kmeans_isdf:main"
+lorrax-centroids = "centroid.kmeans_cli:main"
 lorrax-bse = "bse.bse_isdf:main"
 
 [tool.uv]

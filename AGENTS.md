@@ -40,7 +40,7 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 | `src/file_io/sigma_output.py` | Σ output (eqp.dat, sigma.h5) | Output formats |
 | `src/ffi/` | XLA FFI bridge: `cusolvermp`, `cusolvermg`, `phdf5`, `slate` | Native-library entry points |
 | `src/solvers/` | Davidson, Lanczos, Chebyshev, pseudobands | Iterative eigensolvers |
-| `src/centroid/kmeans_isdf.py` | ISDF centroid generation (k-means) | Centroid count / quality |
+| `src/centroid/kmeans_cli.py` / `src/centroid/kmeans_isdf.py` | ISDF centroid generation — `kmeans_cli` is the CLI (`python -m centroid.kmeans_cli`); `kmeans_isdf` is the algorithm library, no `__main__` | Centroid count / quality |
 | `src/psp/` | Pseudopotentials, dipole / kin+ion generators | `dipole.h5` or `kin_ion.h5` issues |
 | `src/bse/` | Bethe–Salpeter equation (experimental) | Optical spectra |
 | `src/bandstructure/` | H-matrix interpolation (experimental) | Band-structure plots |
@@ -62,7 +62,7 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 
 ```bash
 # Preprocessing (centroids, dipole, kin+ion)
-uv run python -m centroid.kmeans_isdf -i cohsex.in 600
+uv run python -m centroid.kmeans_cli 600 --seed 42
 uv run python -m psp.get_dipole_mtxels -i cohsex.in
 uv run python -m gw.kin_ion_io -i cohsex.in
 

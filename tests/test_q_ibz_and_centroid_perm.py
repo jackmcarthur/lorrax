@@ -13,15 +13,15 @@ import numpy as np
 import pytest
 
 from centroid.orbit_syms import compute_centroid_sym_perm
-from common.symmetry_maps import SymMaps
+from common.symmetry_maps import SymMaps, find_irreducible_bz_points
 
 
 # ---------------------------------------------------------------------------
-# SymMaps stub
+# SymMaps stub — populates the eager q-IBZ attrs that __init__ would set.
 # ---------------------------------------------------------------------------
 
 def _sym_stub(kgrid, sym_mats_k):
-    """Build a SymMaps instance with just enough state for find_irreducible_qpoints."""
+    """Build a SymMaps-shaped object with the eager q-IBZ tables populated."""
     obj = object.__new__(SymMaps)
     kg = np.asarray(kgrid, dtype=np.int64)
     kx, ky, kz = np.meshgrid(np.arange(kg[0]), np.arange(kg[1]),
@@ -29,6 +29,11 @@ def _sym_stub(kgrid, sym_mats_k):
     obj.kvecs_asints = np.stack(
         [kx.flatten(), ky.flatten(), kz.flatten()], axis=1)
     obj.sym_mats_k = np.asarray(sym_mats_k, dtype=np.int64)
+    obj.irr_idx_q, obj.sym_idx_q, obj.q_irr_kgrid_int = find_irreducible_bz_points(
+        obj.kvecs_asints, obj.sym_mats_k, irr_kgrid_int=None,
+    )
+    _, first_occ = np.unique(obj.irr_idx_q, return_index=True)
+    obj.q_irr_full_idx = np.sort(first_occ).astype(np.int32)
     return obj
 
 
@@ -39,7 +44,7 @@ def _sym_stub(kgrid, sym_mats_k):
 def test_identity_only_keeps_full_bz():
     """No symmetry → IBZ = full BZ."""
     sym = _sym_stub(kgrid=(2, 2, 2), sym_mats_k=[np.eye(3, dtype=int)])
-    q_irr, full_to_irr_idx, full_to_irr_sym, q_irr_full_idx = sym.find_irreducible_qpoints()
+    q_irr = sym.q_irr_kgrid_int; full_to_irr_idx = sym.irr_idx_q; full_to_irr_sym = sym.sym_idx_q; q_irr_full_idx = sym.q_irr_full_idx
     assert q_irr.shape == (8, 3)
     np.testing.assert_array_equal(full_to_irr_idx, np.arange(8))
     np.testing.assert_array_equal(full_to_irr_sym, np.zeros(8))
@@ -53,7 +58,7 @@ def test_inversion_pairs_q_with_neg_q():
         kgrid=(2, 2, 2),
         sym_mats_k=[np.eye(3, dtype=int), -np.eye(3, dtype=int)],
     )
-    q_irr, full_to_irr_idx, full_to_irr_sym, q_irr_full_idx = sym.find_irreducible_qpoints()
+    q_irr = sym.q_irr_kgrid_int; full_to_irr_idx = sym.irr_idx_q; full_to_irr_sym = sym.sym_idx_q; q_irr_full_idx = sym.q_irr_full_idx
     # 2x2x2: q's are {0, 1}³.  Under q ≡ -q (mod 2), -1 = 1, so the
     # full grid is self-symmetric: every q maps to itself.  IBZ = 8.
     assert q_irr.shape == (8, 3)
@@ -69,7 +74,7 @@ def test_inversion_3x3x1_reduces():
         kgrid=(3, 3, 1),
         sym_mats_k=[np.eye(3, dtype=int), -np.eye(3, dtype=int)],
     )
-    q_irr, full_to_irr_idx, full_to_irr_sym, q_irr_full_idx = sym.find_irreducible_qpoints()
+    q_irr = sym.q_irr_kgrid_int; full_to_irr_idx = sym.irr_idx_q; full_to_irr_sym = sym.sym_idx_q; q_irr_full_idx = sym.q_irr_full_idx
     assert q_irr.shape == (5, 3)
     # Every full-BZ q must reach its IBZ partner under sym_mats_k[full_to_irr_sym].
     full = sym.kvecs_asints
@@ -89,7 +94,7 @@ def test_q_irr_full_idx_matches_kvecs_asints():
         kgrid=(3, 3, 1),
         sym_mats_k=[np.eye(3, dtype=int), -np.eye(3, dtype=int)],
     )
-    q_irr, _, _, q_irr_full_idx = sym.find_irreducible_qpoints()
+    q_irr = sym.q_irr_kgrid_int; q_irr_full_idx = sym.q_irr_full_idx
     assert q_irr_full_idx.shape == (q_irr.shape[0],)
     np.testing.assert_array_equal(
         sym.kvecs_asints[q_irr_full_idx], q_irr)
@@ -109,7 +114,7 @@ def test_full_bz_lookup_is_bijective_per_orbit():
             np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]]),   # C4^-1
         ],
     )
-    q_irr, full_to_irr_idx, full_to_irr_sym, q_irr_full_idx = sym.find_irreducible_qpoints()
+    q_irr = sym.q_irr_kgrid_int; full_to_irr_idx = sym.irr_idx_q; full_to_irr_sym = sym.sym_idx_q; q_irr_full_idx = sym.q_irr_full_idx
     full = sym.kvecs_asints
     kg = np.array([4, 4, 1], dtype=np.int64)
     for iq in range(full.shape[0]):
@@ -154,12 +159,13 @@ def test_centroid_sym_perm_identity_only_is_identity():
     """One-element sym group → π_0 = identity permutation."""
     fft_grid = (8, 8, 8)
     r_mu = np.array([[1, 2, 3], [4, 5, 6], [0, 0, 0]], dtype=np.int32)
-    perm = compute_centroid_sym_perm(
+    perm, L = compute_centroid_sym_perm(
         r_mu, sym_matrices=np.eye(3, dtype=int)[None],
         translations=np.zeros((1, 3)),
         fft_grid=fft_grid,
     )
     np.testing.assert_array_equal(perm, np.arange(3)[None])
+    np.testing.assert_array_equal(L, np.zeros((1, 3, 3), dtype=L.dtype))
 
 
 def test_centroid_sym_perm_under_inversion_closed_set():
@@ -168,7 +174,7 @@ def test_centroid_sym_perm_under_inversion_closed_set():
     sym = np.stack([np.eye(3, dtype=int),
                     -np.eye(3, dtype=int)], axis=0)
     r_mu = _orbit_close_centroids(fft_grid, sym).astype(np.int32)
-    perm = compute_centroid_sym_perm(
+    perm, _L = compute_centroid_sym_perm(
         r_mu, sym_matrices=sym,
         translations=np.zeros((2, 3)),
         fft_grid=fft_grid,
@@ -225,7 +231,7 @@ def test_centroid_sym_perm_with_nonsymmorphic_tau():
     r_mu = np.vstack(images).astype(np.int32)
     _, uidx = np.unique(r_mu, axis=0, return_index=True)
     r_mu = r_mu[np.sort(uidx)]
-    perm = compute_centroid_sym_perm(
+    perm, _L = compute_centroid_sym_perm(
         r_mu, sym_matrices=sym, translations=tau, fft_grid=fft_grid,
     )
     np.testing.assert_array_equal(perm[0], np.arange(r_mu.shape[0]))
