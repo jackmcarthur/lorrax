@@ -128,7 +128,6 @@ def test_unfold_psi_matches_hand_reference():
         cnk_codebase = unfold_psi(
             cnk_kbar,
             sym_idx=sym_idx,
-            n_sym_spatial=ntran,
             g_kbar=g_kbar,
             sym_mats_k=geom["sym_mats_k"],
             translations=geom["translations"],
@@ -167,7 +166,6 @@ def test_unfold_psi_identity_is_noop():
     out = unfold_psi(
         cnk,
         sym_idx=0,
-        n_sym_spatial=geom["ntran"],
         g_kbar=g_kbar,
         sym_mats_k=geom["sym_mats_k"],
         translations=geom["translations"],
@@ -191,7 +189,6 @@ def test_unfold_psi_trs_squared_is_identity_on_spinor():
     once = unfold_psi(
         cnk,
         sym_idx=geom["ntran"],   # TRS · identity = pure TRS
-        n_sym_spatial=geom["ntran"],
         g_kbar=g_kbar,
         sym_mats_k=geom["sym_mats_k"],
         translations=geom["translations"],
@@ -203,7 +200,6 @@ def test_unfold_psi_trs_squared_is_identity_on_spinor():
     twice = unfold_psi(
         once,
         sym_idx=geom["ntran"],
-        n_sym_spatial=geom["ntran"],
         g_kbar=-g_kbar,
         sym_mats_k=geom["sym_mats_k"],
         translations=geom["translations"],

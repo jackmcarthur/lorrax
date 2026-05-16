@@ -861,7 +861,6 @@ class WfnLoader:
             cnk = unfold_psi(
                 cnk,
                 sym_idx=sym_idx,
-                n_sym_spatial=ntran,
                 g_kbar=g_bar,
                 sym_mats_k=sym.sym_mats_k,
                 translations=self.translations,

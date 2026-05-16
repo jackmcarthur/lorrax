@@ -587,7 +587,6 @@ def compute_V_q_bispinor_g_flat_to_h5(
             v_per_G_builder=v_builder,
             kgrid=kgrid, fft_grid=fft_grid, bvec=bvec,
             mesh_xy=mesh_xy,
-            n_rmu_L=n_rmu_L, n_rmu_R=n_rmu_R,
             g_chunk=g_chunk,
             sym=None, centroid_indices=None,           # full-BZ on disk
             write_g0=write_g0,

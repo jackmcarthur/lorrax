@@ -276,8 +276,6 @@ def _compute_V_q_g_flat_one_tile(
     *,
     v_per_G_builder,                   # callable(q_irr_frac, gvec_components) -> (n_q, ngkmax) c128
     kgrid, fft_grid, bvec, mesh_xy,
-    n_rmu_L: int,
-    n_rmu_R: int,
     g_chunk: int | None,
     sym, centroid_indices,             # IBZ closure check is on the L centroids
     write_g0: bool,
@@ -296,6 +294,10 @@ def _compute_V_q_g_flat_one_tile(
     shardings ``P(None, 'x', 'y')`` and ``P(None, 'x')``.
     """
     same_zeta = (zeta_R_loader is None) or (zeta_R_loader is zeta_L_loader)
+    # ``n_rmu_*`` is the logical centroid count for each side — read off the
+    # loader so callers don't repeat themselves.
+    n_rmu_L = int(zeta_L_loader.n_rmu)
+    n_rmu_R = n_rmu_L if same_zeta else int(zeta_R_loader.n_rmu)
     if str(getattr(zeta_L_loader, 'zeta_layout', '')) != 'G_flat':
         raise ValueError(
             f"_compute_V_q_g_flat_one_tile[{timing_label}]: zeta_L "
@@ -477,7 +479,6 @@ def compute_all_V_q_g_flat(
     bvec: np.ndarray,
     cell_volume: float,
     mesh_xy: Mesh,
-    n_rmu: int,
     sys_dim: int,
     bdot: np.ndarray | None = None,
     bare_coulomb_cutoff_ry: float | None = None,
@@ -533,7 +534,6 @@ def compute_all_V_q_g_flat(
         v_per_G_builder=_bare_v_per_G,
         kgrid=kgrid, fft_grid=fft_grid, bvec=bvec,
         mesh_xy=mesh_xy,
-        n_rmu_L=int(n_rmu), n_rmu_R=int(n_rmu),
         g_chunk=g_chunk,
         sym=sym, centroid_indices=centroid_indices,
         write_g0=True,

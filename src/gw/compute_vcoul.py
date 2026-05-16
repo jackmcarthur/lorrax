@@ -859,7 +859,7 @@ def compute_all_V_q(
             zeta_io,
             kgrid=kgrid, fft_grid=fft_grid,
             bvec=bvec, cell_volume=cell_volume,
-            mesh_xy=mesh_xy, n_rmu=n_rmu,
+            mesh_xy=mesh_xy,
             sys_dim=sys_dim, bdot=bdot,
             bare_coulomb_cutoff_ry=bare_coulomb_cutoff,
             bgw_v_grid_fn=bgw_v_grid_fn,

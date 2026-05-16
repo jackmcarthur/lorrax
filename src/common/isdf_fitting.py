@@ -380,7 +380,6 @@ def z_q_from_psi_sm(
 	band_chunk_ranges: tuple[tuple[int, int], ...],
 	band_range_left: tuple[int, int],
 	band_range_right: tuple[int, int],
-	fft_grid: tuple[int, int, int],
 	r_start_dyn,
 	r_chunk_size: int,
 	gamma_L: tuple[jax.Array, jax.Array] | None = None,
@@ -439,6 +438,7 @@ def z_q_from_psi_sm(
 	"""
 	from .psi_G_store import _PSI_G_FLAT_SPEC  # noqa: F401  (sharding contract)
 
+	fft_grid = tuple(int(s) for s in psi_G_store.meta.fft_grid)
 	nkx, nky, nkz = kgrid
 	nk = int(psi_l_X.shape[0])
 	n_rmu = int(psi_l_X.shape[1])
@@ -1573,7 +1573,6 @@ def _make_fit_one_rchunk_kernel(
             band_chunk_ranges=band_chunk_ranges,
             band_range_left=band_range_left,
             band_range_right=band_range_right,
-            fft_grid=meta.fft_grid,
             r_start_dyn=r_start_dyn,
             r_chunk_size=actual_n_rchunk,
             gamma_L=gamma_mu,
@@ -1756,8 +1755,8 @@ def fit_zeta_to_h5(
     bispinor: bool = True,
     band_range_left: tuple[int, int] | None = None,
     band_range_right: tuple[int, int] | None = None,
-    k_chunk_size: int = 0,
     band_norms: np.ndarray | None = None,
+    *,
     slab_io_backend=None,
     gspace_mode: str = "host_cache",
     vertex_mu_L: int = 0,

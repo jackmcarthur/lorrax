@@ -310,7 +310,6 @@ def unfold_psi(
     cnk_kbar,
     *,
     sym_idx,
-    n_sym_spatial,
     g_kbar,
     sym_mats_k,
     translations,
@@ -375,7 +374,9 @@ def unfold_psi(
         handling are independent.
     """
     sym_idx = int(sym_idx)
-    n_sym_spatial = int(n_sym_spatial)
+    # ``sym_mats_k`` always has length ``2 · n_sym_spatial`` — the spatial
+    # half is followed by the TRS-augmented rows (-S).
+    n_sym_spatial = int(sym_mats_k.shape[0]) // 2
     is_trs = sym_idx >= n_sym_spatial
     s_spatial = sym_idx - n_sym_spatial if is_trs else sym_idx
 

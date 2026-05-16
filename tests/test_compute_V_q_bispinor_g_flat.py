@@ -239,7 +239,7 @@ def test_bispinor_CC_tile_matches_charge_orchestrator(
                 kgrid=kgrid, fft_grid=fft_grid,
                 bvec=bvec, cell_volume=cell_volume,
                 mesh_xy=single_device_mesh,
-                n_rmu=n_rmu_C, sys_dim=sys_dim,
+                sys_dim=sys_dim,
                 bare_coulomb_cutoff_ry=cutoff,
                 verbose=False, async_prefetch=False,
             )
