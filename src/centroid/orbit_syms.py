@@ -59,13 +59,6 @@ def build_real_space_syms(wfn, sym, validate: bool = True):
     return R, Rinv, tau
 
 
-def identity_syms():
-    """Dummy 1-element sym table — no symmetry, for non-orbit-aware callers."""
-    return (jnp.eye(3, dtype=jnp.int32)[None],
-            jnp.eye(3, dtype=jnp.int32)[None],
-            jnp.zeros((1, 3), dtype=jnp.float64))
-
-
 # ─────────────────────────────────────────────────────────────────────────
 # Orbit utilities
 # ─────────────────────────────────────────────────────────────────────────
@@ -131,42 +124,6 @@ def canonicalize_orbit(reps: jnp.ndarray,
     )[0]
 
 
-def snap_orbits_to_grid(reps_frac: np.ndarray,
-                        fft_grid: tuple[int, int, int],
-                        Rinv: jnp.ndarray,
-                        tau: jnp.ndarray,
-                        ) -> tuple[np.ndarray, np.ndarray, int]:
-    """Snap fractional reps to the FFT grid, canonicalise to the
-    lex-smallest on-grid orbit member, then deduplicate **by orbit**.
-
-    Two reps that snap to different points but share an orbit are
-    counted as duplicates here (the older ``snap_centroids_to_grid``
-    only catches literal-point duplicates).
-
-    Requires the FFT grid to be commensurate with every τ in the sym
-    table — i.e. ``(τ × fft_grid)`` must be integer to roundoff. This
-    is checked by ``build_real_space_syms`` indirectly via
-    ``validate_atomic_symmetries`` (which would fail loudly if the
-    atom basis didn't close on the grid).
-
-    Returns
-    -------
-    indices : (n_unique, 3) int — canonical orbit reps as FFT indices.
-    frac    : (n_unique, 3) fp — same, as fractional coords.
-    n_dups  : number of orbit-duplicates dropped.
-    """
-    indices = np.round(reps_frac * np.array(fft_grid)).astype(int) % fft_grid
-    snapped = indices.astype(float) / fft_grid
-    canon = np.asarray(canonicalize_orbit(jnp.asarray(snapped), Rinv, tau))
-    canon_idx = np.round(canon * np.array(fft_grid)).astype(int) % fft_grid
-    unique_idx = np.unique(canon_idx, axis=0)
-    n_dups = canon_idx.shape[0] - unique_idx.shape[0]
-    if n_dups > 0:
-        print(f"snap_orbits_to_grid: {n_dups} orbit duplicates "
-              f"({canon_idx.shape[0]} → {unique_idx.shape[0]} unique orbits)")
-    return unique_idx, unique_idx.astype(float) / fft_grid, n_dups
-
-
 def unfold_orbit_unique_with_id(reps_np: np.ndarray,
                                 Rinv: np.ndarray,
                                 tau: np.ndarray,
@@ -214,12 +171,6 @@ def unfold_orbit_unique_with_id(reps_np: np.ndarray,
     canonical_keys = cand_keys[s_idx, np.arange(n)]                  # (n, 3)
     _, orbit_id = np.unique(canonical_keys, axis=0, return_inverse=True)
     return flat, orbit_id.astype(np.int32)
-
-
-def unfold_orbit_unique(reps_np, Rinv, tau, tol=1e-6) -> np.ndarray:
-    """Backwards-compatible wrapper: drops the orbit_id second return."""
-    flat, _ = unfold_orbit_unique_with_id(reps_np, Rinv, tau, tol=tol)
-    return flat
 
 
 # ─────────────────────────────────────────────────────────────────────────

@@ -242,7 +242,7 @@ def unfold_v_q(
             f"unfold_v_q: V_q_ibz μ-extent {n_rmu_padded} smaller than "
             f"sym_perm logical extent {n_rmu_logical}; pad invariant "
             f"violated.")
-    inv_perm_j = jnp.asarray(fwd_perm)
+    fwd_perm_j = jnp.asarray(fwd_perm)
     idx_j = jnp.asarray(np.asarray(irr_idx, dtype=np.int32))
     sym_j = jnp.asarray(np.asarray(sym_idx, dtype=np.int32))
     trs_mask_j = jnp.asarray(sym_np >= int(n_sym_spatial))
@@ -269,7 +269,7 @@ def unfold_v_q(
 
     @partial(jax.jit, out_shardings=V_sh)
     def _do_unfold(V_ibz):
-        perm_q = inv_perm_j[sym_j]                          # (n_q_full, n_rmu)
+        perm_q = fwd_perm_j[sym_j]                          # (n_q_full, n_rmu)
         V_at_irr = V_ibz[idx_j]                              # (n_q_full, μ, μ)
         # ``promise_in_bounds`` skips the OOB-fill branch that under
         # shard_map+x64 mints an s32/s64 mismatch in the HLO verifier
@@ -437,9 +437,6 @@ class SymMaps:
         Args:
             wfn: WFNReader instance
         """
-        # Create k-point mappings
-        #self.sym_matrices, self.sym_mats_k = self.get_syms_from_kgridlog('kgrid.log')
-
         # get symmetry matrices from wfn file
         try:
             ntran = int(getattr(wfn, 'ntran', 1))
@@ -454,7 +451,6 @@ class SymMaps:
             # In no-symmetry case, unfolded grid equals irreducible grid
             self.unfolded_kpts = np.asarray(wfn.kpoints, dtype=float)
             self.kpoint_map = np.arange(self.unfolded_kpts.shape[0], dtype=np.int32)
-            self.kpoint_map_ibz_ids = self.kpoint_map.copy()
 
             # Maps: each full k maps to itself; only identity symmetry
             self.irr_idx_k = np.arange(self.unfolded_kpts.shape[0], dtype=np.int32)
@@ -501,7 +497,6 @@ class SymMaps:
                 kminusq_mod[:, :, 2],
             ]
             self.kq_map = self.kqfull_map.copy()
-            self.kfull_symmap = np.zeros((self.nk_tot, 1), dtype=np.int32)
 
             # Integer q enumerations for k' - k outside the first BZ.
             qpt_vecs = self.kvecs_asints[:, None, :] - self.kvecs_asints[None, :, :]
@@ -547,11 +542,8 @@ class SymMaps:
 
         # get the list of full zone k-points and the map from k_full to k_irr
         self.kpoint_map, self.unfolded_kpts = self.create_kpoint_symmetry_map(wfn)
-
-        # Keep an explicit alias for callers/debugging: this array is already
-        # indexed by full-grid k-point and stores the matching irreducible-k id.
-        self.kpoint_map_ibz_ids = np.asarray(self.kpoint_map, dtype=np.int32)
-        if np.any(self.kpoint_map_ibz_ids < 0) or np.any(self.kpoint_map_ibz_ids >= wfn.nkpts):
+        self.kpoint_map = np.asarray(self.kpoint_map, dtype=np.int32)
+        if np.any(self.kpoint_map < 0) or np.any(self.kpoint_map >= wfn.nkpts):
             raise ValueError(
                 "kpoint_map contains entries outside the irreducible-k range: "
                 f"[0, {wfn.nkpts})"
@@ -596,7 +588,6 @@ class SymMaps:
         self.U_spinor = self.get_spinor_rotations(wfn, self.R_cart[:wfn.ntran])
         self.kq_map = self.get_kminusq_map(wfn, self.unfolded_kpts)
         self.kqfull_map = self.get_kminusqfull_map(wfn, self.unfolded_kpts)
-        self.kfull_symmap = self.get_kfull_symmap(wfn, self.unfolded_kpts)
 
 
         # the above kq maps are for inputting some k and some q and getting k-q in the 1BZ, but it is actually necessary to store W_q on q outside 1BZ
@@ -644,37 +635,6 @@ class SymMaps:
         return np.where(np.all(self.all_unfolded_qpts == kpminkvec, axis=1))[0][0]
 
         
-
-    def get_syms_from_kgridlog(self,kgridfname):
-        # return the identity + the set of sym_matrices that unfold the k-points
-        # if \psi_nk(S^-1r) = psi_n(S^-1T.k)(r), Skbar + G_S = k
-        matrices = [np.eye(3, dtype=np.int32)]
-        parsing = False
-        
-        with open(kgridfname, 'r') as f:
-            for line in f:
-                if "symmetries that reduce the k-points" in line:
-                    parsing = True
-                    continue
-                
-                if parsing and line.strip():
-                    # Check if line starts with 'r' followed by numbers
-                    if line.strip().startswith('r'):
-                        # Extract the matrix elements
-                        parts = line.split('=')[1].strip().split()
-                        if len(parts) != 9:
-                            continue
-                        
-                        # Convert to integers and reshape to 3x3
-                        matrix = np.array([int(x) for x in parts]).reshape(3, 3)
-                        matrices.append(matrix)
-                    else:
-                        # Stop parsing if we hit a line that doesn't match format
-                        parsing = False
-        symmats = np.array(matrices, dtype=np.int32)
-        symmatskvecs = np.array([np.linalg.inv(mat).T for mat in symmats],dtype=np.int32) # correct crystal coord form to act on k
-        
-        return symmats, symmatskvecs
 
     @staticmethod
     def _wrap_to_bz(kpts):
@@ -1071,32 +1031,6 @@ class SymMaps:
 
         return kq_map
     
-    def get_kfull_symmap(self, wfn, full_kpts):
-        nk_full = len(full_kpts)
-        n_sym = self.sym_mats_k.shape[0]
-        kfull_symmap = np.zeros((nk_full, n_sym), dtype=np.int32)
-
-        # For each k-point in the full grid
-        for ik in range(nk_full):
-            # Apply all symmetry operations to this k-point
-            k_sym = np.einsum('ijk,k->ij', self.sym_mats_k, full_kpts[ik])
-            k_sym = k_sym % 1.0  # Wrap to first BZ
-            k_sym = np.where(k_sym > 0.99999, 0.0, k_sym)
-            
-            # For each symmetry operation
-            for isym in range(n_sym):
-                # Find which full k-point this maps to
-                diffs = np.abs(full_kpts - k_sym[isym][None, :])
-                diffs = np.sum(diffs, axis=1)  # Sum over coordinates
-                min_diff = np.min(diffs)
-                
-                if min_diff > 1e-8:
-                    raise ValueError(f"Symmetry-transformed k-point {k_sym[isym]} not found in k-point grid")
-                
-                kfull_symmap[ik, isym] = np.argmin(diffs)
-        
-        return kfull_symmap
-
     def _get_umklapp_vector(self, wfn, nk, sym_idx, kbar_idx, sym_krep):
         """Return BGW's kg0 for the selected full-zone k-point.
 

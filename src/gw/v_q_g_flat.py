@@ -231,19 +231,15 @@ def _pick_g_chunk(ngkmax: int, target: int = 4096) -> int:
     return int(ngkmax)
 
 
-def _make_read_q(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
-    """Return a ``read_q(q_idx) -> (1, n_rmu_padded, ngkmax)`` callable.
+def _make_read_all_ibz(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
+    """Return ``read_all_ibz(n_q_ibz) -> (n_q_ibz, n_rmu_padded, ngkmax)``.
 
     Both :class:`ZetaLoader` (test bench) and :class:`ZetaReader`
-    (production) can serve a G-flat slab; their call signatures
-    differ.  Detect which one we have once, then dispatch.
-
-    Also exposes ``read_all_ibz(n_q_ibz) -> (n_q_ibz, n_rmu_padded, ngkmax)``
-    as a single-call batched variant.  Used by the V_q tile orchestrator
-    to read the whole IBZ slab once at the start, avoiding the
-    ``n_q_ibz`` separate ``read_slab`` calls (each of which produces a
-    distinct ``_FfiBackend.read_slab.<locals>._per_rank`` closure id and
-    triggers a JAX trace cache miss).
+    (production) can serve a G-flat slab; their call signatures differ.
+    Detect which one we have once, then dispatch.  The batched single-
+    call form avoids the ``n_q_ibz`` separate ``read_slab`` closures
+    (each one a distinct ``_FfiBackend.read_slab.<locals>._per_rank``
+    closure id) that would each cost a JAX trace cache miss.
     """
     has_load = callable(getattr(zeta_loader, 'load', None))
     has_read_slab = callable(getattr(zeta_loader, 'read_zeta_G_slab', None))
@@ -255,22 +251,7 @@ def _make_read_q(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
     n_rmu_logical = int(zeta_loader.n_rmu)
     spec = P(None, ('x', 'y'), None)
 
-    def read_q(q_idx: int) -> jax.Array:
-        if has_load:
-            return zeta_loader.load(
-                q=[int(q_idx)], layout='G_flat', sharding=spec)
-        # ZetaReader path: per-q phase is already baked in on disk;
-        # pass a dummy qvec for the unused ``qvec_batch_frac`` arg.
-        return zeta_loader.read_zeta_G_slab(
-            q_offset=int(q_idx), q_count=1,
-            mu_offset=0, mu_count=int(n_rmu_padded),
-            qvec_batch_frac=jnp.zeros((1, 3), dtype=jnp.float64),
-            sphere_idx=None,
-            mesh=mesh_xy, valid_mu=n_rmu_logical,
-        )
-
     def read_all_ibz(n_q_ibz: int) -> jax.Array:
-        """Single batched read of all IBZ q's → ``(n_q_ibz, n_rmu_padded, ngkmax)``."""
         if has_load:
             return zeta_loader.load(
                 q=list(range(int(n_q_ibz))), layout='G_flat', sharding=spec)
@@ -282,9 +263,7 @@ def _make_read_q(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
             mesh=mesh_xy, valid_mu=n_rmu_logical,
         )
 
-    # Attach the batched variant onto ``read_q`` so callers can pick.
-    read_q.read_all_ibz = read_all_ibz
-    return read_q
+    return read_all_ibz
 
 
 # ---------------------------------------------------------------------------
@@ -395,18 +374,12 @@ def _compute_V_q_g_flat_one_tile(
     V_acc = jax.jit(lambda: jnp.zeros(
         (n_q_ibz, n_rmu_L_padded, n_rmu_R_padded), dtype=jnp.complex128),
         out_shardings=V_sh)()
-    if write_g0:
-        g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
-        g0_acc = jax.jit(lambda: jnp.zeros(
-            (n_q_ibz, n_rmu_L_padded), dtype=jnp.complex128),
-            out_shardings=g0_sh)()
-    else:
-        # The jit kernel still needs a buffer to donate; allocate a
-        # tiny placeholder we won't read.
-        g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
-        g0_acc = jax.jit(lambda: jnp.zeros(
-            (n_q_ibz, n_rmu_L_padded), dtype=jnp.complex128),
-            out_shardings=g0_sh)()
+    # ``g0_acc`` is also the donate-target when ``write_g0=False`` — the
+    # per-q kernel still needs the buffer; the contents are simply unread.
+    g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
+    g0_acc = jax.jit(lambda: jnp.zeros(
+        (n_q_ibz, n_rmu_L_padded), dtype=jnp.complex128),
+        out_shardings=g0_sh)()
     v_q_dev = jax.device_put(
         v_q_table, NamedSharding(mesh_xy, P(None, None)))
 
@@ -414,9 +387,9 @@ def _compute_V_q_g_flat_one_tile(
         mesh_xy, n_rmu_L_padded, n_rmu_R_padded, ngkmax, g_chunk,
         write_g0=write_g0, same_zeta=same_zeta)
 
-    read_L = _make_read_q(zeta_L_loader, n_rmu_L_padded, mesh_xy)
+    read_L = _make_read_all_ibz(zeta_L_loader, n_rmu_L_padded, mesh_xy)
     read_R = (read_L if same_zeta
-              else _make_read_q(zeta_R_loader, n_rmu_R_padded, mesh_xy))
+              else _make_read_all_ibz(zeta_R_loader, n_rmu_R_padded, mesh_xy))
 
     # ---- Pre-read all IBZ ζ̃ slabs in ONE batched call ---------------
     # The historical per-q PHDF5 read inside the kernel loop interleaved
@@ -433,11 +406,11 @@ def _compute_V_q_g_flat_one_tile(
     # ~63 to 7.
     import time as _t
     _read_t0 = _t.perf_counter()
-    zeta_L_all = read_L.read_all_ibz(n_q_ibz)               # (n_q_ibz, n_rmu_L_padded, ngkmax)
+    zeta_L_all = read_L(n_q_ibz)                            # (n_q_ibz, n_rmu_L_padded, ngkmax)
     if same_zeta:
         zeta_R_all = zeta_L_all
     else:
-        zeta_R_all = read_R.read_all_ibz(n_q_ibz)
+        zeta_R_all = read_R(n_q_ibz)
     jax.block_until_ready(zeta_L_all)
     if not same_zeta:
         jax.block_until_ready(zeta_R_all)
@@ -570,4 +543,4 @@ def compute_all_V_q_g_flat(
 
 
 __all__ = ["compute_all_V_q_g_flat", "_compute_V_q_g_flat_one_tile",
-            "_resolve_ibz_q_list", "_pick_g_chunk", "_make_read_q"]
+            "_resolve_ibz_q_list", "_pick_g_chunk", "_make_read_all_ibz"]

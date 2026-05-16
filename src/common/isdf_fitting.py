@@ -40,10 +40,7 @@ from .fft_helpers import (
     make_flat_k_fftn,
     compute_block_size_for_2d_cholesky,
 )
-from .load_wfns import (
-    read_Gvecs_to_devices,
-    load_centroids_band_chunked,
-)
+from .load_wfns import load_centroids_band_chunked
 from .wfn_transforms import to_rchunk_inner
 from jax.experimental import io_callback as _io_callback
 
@@ -766,10 +763,6 @@ def z_q_from_psi_sm(
 # Backward-compat shim removed — old z_q_from_psi_sm signature
 # (consumed pre-computed psi_l_Y / psi_r_Y) is gone.  Call sites
 # updated in `_make_fit_one_rchunk_kernel._kernel`.
-
-	return _pair_pipeline_sm_cache[cache_key](
-		psi_l_X, psi_l_Y, psi_r_X, psi_r_Y,
-		perm_L, phase_L, perm_R, phase_R)
 
 
 def _identity_pad_block_diagonal(
@@ -1744,7 +1737,7 @@ def _band_norms_slice(
 # host, sharded n_XY over bands in per-rank tiles — each rank owns one
 # contiguous ``(nk, nb/P, ns, nx, ny, nz)`` numpy array — and the
 # kernel body slices per-bc (and optionally per-k) subsets via
-# :func:`common.psi_G_store.PsiGStore.fetch_psi_G`.  See that module
+# :func:`common.psi_G_store.PsiGStore._slice_local_tile_bc`.  See that module
 # for the two lifecycle modes (host_cache vs file_reread).
 
 
