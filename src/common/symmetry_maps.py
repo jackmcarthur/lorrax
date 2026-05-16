@@ -107,6 +107,56 @@ def find_irreducible_bz_points(full_kgrid_int, sym_mats_k, *, irr_kgrid_int=None
     return irr_idx, sym_idx, irr_out
 
 
+def slice_q_full_to_ibz(arr_full, q_irr_full_idx, *, out_sharding=None):
+    """Slice a ``(n_q_full, ...)`` array to its IBZ rows.
+
+    The natural ``full BZ → IBZ`` companion to :func:`unfold_v_q`'s
+    ``IBZ → full BZ`` direction: this just picks the IBZ representative
+    q-points out of a full-BZ tensor.  No centroid permute, no L-phase,
+    no TRS conjugation — a pure row gather along axis 0.
+
+    Use it whenever a q-axis quantity is built at full BZ but only the
+    IBZ rows are needed for the downstream per-q step.  Two examples
+    on the same shape ``(n_q, n_rmu, n_rmu)`` sharded as
+    ``P(None, 'x', 'y')`` (q-axis replicated, μ on x, ν on y):
+
+    - ``isdf_fitting.fit_zeta_to_h5``: slice C_q before ``factor_c_q``
+      so Cholesky / LU runs only on the IBZ q-block, then ζ_q is solved
+      and stored at IBZ; downstream V_q unfolds via :func:`unfold_v_q`.
+    - W_q = ``(1 − v_q χ_q)^{-1} v_q``: slice the Hermitian object that
+      needs per-q inversion to IBZ before solve, then unfold via
+      :func:`unfold_v_q` for the q-axis consumers.
+
+    Sharding contract.  The gather along axis 0 leaves the trailing
+    (μ, ν) axes untouched, so XLA preserves whatever ``arr_full``
+    sharding came in.  Pass ``out_sharding`` to lock in an explicit
+    ``NamedSharding`` (typically ``P(None, 'x', 'y')`` for the
+    Cq / V_q / χ_q quantities) — this stabilises the JIT cache key so
+    repeat calls hit the same compiled module.
+
+    Parameters
+    ----------
+    arr_full : jax.Array
+        Shape ``(n_q_full, ...)``.
+    q_irr_full_idx : np.ndarray | jax.Array
+        ``(n_q_ibz,)`` int32 — full-BZ indices of the IBZ q-points.
+        Sourced from :attr:`SymMaps.q_irr_full_idx`.
+    out_sharding : jax.sharding.NamedSharding, optional
+        If given, the output is constrained to this sharding via
+        ``jax.lax.with_sharding_constraint``.
+
+    Returns
+    -------
+    arr_ibz : jax.Array
+        ``(n_q_ibz, ...)`` selected rows of ``arr_full``.
+    """
+    idx = jnp.asarray(np.asarray(q_irr_full_idx, dtype=np.int32))
+    out = arr_full[idx]
+    if out_sharding is not None:
+        out = jax.lax.with_sharding_constraint(out, out_sharding)
+    return out
+
+
 def unfold_v_q(
     V_q_ibz,
     *,

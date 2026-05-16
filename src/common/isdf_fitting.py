@@ -1590,12 +1590,15 @@ def _make_fit_one_rchunk_kernel(
         # When ``q_irr_full_idx`` is None (write_ibz_only=False
         # codepath; centroid orbit closure failed) the gather is a
         # no-op identity and the full-BZ solve runs as before.
+        # When set, L_q and cct_trace_per_q come in PRE-SLICED at IBZ
+        # rows (via ``symmetry_maps.slice_q_full_to_ibz`` upstream in
+        # ``fit_zeta_to_h5``) so Cholesky / LU only factored the IBZ
+        # blocks; only Z_q still needs the IBZ slice here since it's
+        # built at full BZ by the in-kernel scan.
         if q_irr_idx_j is not None:
-            L_q_for_solve = L_q[q_irr_idx_j]
+            L_q_for_solve = L_q
             Z_q_for_solve = Z_q[q_irr_idx_j]
-            cct_trace_for_solve = (
-                cct_trace_per_q[q_irr_idx_j]
-                if cct_trace_per_q is not None else None)
+            cct_trace_for_solve = cct_trace_per_q
         else:
             L_q_for_solve = L_q
             Z_q_for_solve = Z_q
@@ -1692,9 +1695,11 @@ def fit_one_rchunk(
         _fit_one_rchunk_cache[cache_key] = fn
     # cct_trace_per_q is None for the charge channel (Cholesky path
     # ignores it); pass a tiny placeholder so the jit signature is
-    # uniform across channels.
+    # uniform across channels.  Size it to match L_q's q-axis (IBZ
+    # extent when ``q_irr_full_idx`` is set; full BZ otherwise) — XLA
+    # would dead-arg-eliminate it anyway, but keep the spec honest.
     if cct_trace_per_q is None:
-        cct_trace_per_q = jnp.zeros((int(meta.nk_tot),),
+        cct_trace_per_q = jnp.zeros((int(L_q.shape[0]),),
                                     dtype=jnp.complex128)
     return fn(
         psi_l_rmuT_X_fit,
@@ -1963,6 +1968,20 @@ def fit_zeta_to_h5(
         C_q_flat = C_q.reshape(nq, n_rmu_padded, n_rmu_padded)
         flat_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
         C_q_flat = jax.lax.with_sharding_constraint(C_q_flat, flat_shard)
+
+        # IBZ cascade for the per-q factor: slice C_q to IBZ rows *before*
+        # ``factor_c_q`` runs so Cholesky / LU factors only ``n_q_ibz``
+        # blocks instead of all ``n_q_full``.  C_q has the same (n_q, μ, ν)
+        # shape as V_q, and Cholesky is per-q independent — slice-then-
+        # factor gives bit-equal L_q rows as factor-then-slice.  The
+        # downstream solve still produces ζ_q at IBZ, and V_q unfolds via
+        # ``common.symmetry_maps.unfold_v_q`` from IBZ → full BZ.  Same
+        # slice helper applies to χ_q for the W_q = (1 − v_q χ_q)^{-1} v_q
+        # path once that lands.
+        if write_ibz_only and getattr(sym, 'q_irr_full_idx', None) is not None:
+            from .symmetry_maps import slice_q_full_to_ibz
+            C_q_flat = slice_q_full_to_ibz(
+                C_q_flat, sym.q_irr_full_idx, out_sharding=flat_shard)
 
     # ========== STEP 3: Compute L_q from CCT ==========
     # μ_L=0 (charge): C_q is PSD → 2D-blocked Cholesky factor L_q.
