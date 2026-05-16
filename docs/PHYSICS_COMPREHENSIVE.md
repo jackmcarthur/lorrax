@@ -1,8 +1,8 @@
 # Interpolative Separable Density Fitting: Theory and Implementation
 
-**Consolidates**: `formalism.md`, `isdf_context.md`, `isdf_spin_galerkin_derivation.md`, `ZETA_FITTING_ALGORITHM.md`, `cohsex_jax_physics.md`
+**Consolidates**: `formalism.md`, `isdf_context.md`, `isdf_spin_galerkin_derivation.md`, `ZETA_FITTING_ALGORITHM.md`, `cohsex_jax_physics.md`. The detailed ζ + V_q algorithm/sharding doc that previously occupied §11 has been split out to [`ZETA_V_Q_ALGORITHMS.md`](ZETA_V_Q_ALGORITHMS.md); the symmetry conventions and unfold procedures (IBZ tables, `mtrx`/τ actions, `unfold_psi`, `unfold_v_q`, `compute_centroid_sym_perm`) now live in [`SYMMETRY_COMPREHENSIVE.md`](SYMMETRY_COMPREHENSIVE.md); the memory model (per-stage formulas, G-flat planner, AOT chooser) is in [`MEMORY_MODEL.md`](MEMORY_MODEL.md).
 
-**Status**: describes the current implementation in `src/common/isdf_fitting.py` (zeta pipeline), `src/gw/gw_jax.py` (driver), `src/gw/w_isdf.py` (χ₀ + W), `src/gw/ppm_sigma.py` (GN-PPM Σ^c(ω)), `src/gw/head_correction.py` (q→0 head), and `src/gw/greens_function_kernel.py` + `src/gw/projection_kernel.py` (leaf kernels). All physics arrays use the flat-k / flat-q convention (`(nk_tot, …)`); 3-D k-grid layout only appears inside `common/fft_helpers.py`.
+**Status (2026-05-15)**: describes the current implementation in `src/common/isdf_fitting.py` (zeta pipeline), `src/gw/gw_jax.py` (driver), `src/gw/w_isdf.py` (χ₀ + W), `src/gw/ppm_sigma.py` (GN-PPM Σ^c(ω)), `src/gw/head_correction.py` (q→0 head), and `src/gw/greens_function_kernel.py` + `src/gw/projection_kernel.py` (leaf kernels). All physics arrays use the flat-k / flat-q convention (`(nk_tot, …)`); 3-D k-grid layout only appears inside `common/fft_helpers.py`. The detailed ζ + V_q algorithms, sharding map, and IBZ cascade are in [`ZETA_V_Q_ALGORITHMS.md`](ZETA_V_Q_ALGORITHMS.md); §11 below is now a short pointer with the bispinor / G-flat quick-reference table preserved as an at-a-glance summary.
 
 ---
 
@@ -12,16 +12,23 @@ ISDF reduces GW computational cost by approximating pair-product densities with 
 
 ---
 
-> **Note (2026-05-12).** §3–5 below describe the historical **r-space
+> **Note (2026-05-15).** §3–5 below describe the historical **r-space
 > ζ-on-disk** path and the **spin-traced rank-3** pair-density form.
 > The current driver runs a **single rank-5 open-spin pair-density**
 > path (charge μ_L=0 via identity γ̃ short-circuit, transverse μ_L≠0 via
 > γ̃·γ̃ post-IFFT reduction) and the ζ-on-disk image lives in **G-flat**
 > layout on the per-q `(q+G)` sphere with **IBZ-only** q-axis (factor
 > ~`ntran` disk reduction). Per-r-chunk FFT-and-accumulate replaces the
-> per-r-chunk on-disk write. See **§11 below** for the math, shardings,
-> and code references of the current pipeline. §3–5 here remain accurate
-> for the conceptual / scalar / r-space narrative.
+> per-r-chunk on-disk write. The detailed math, shardings, communication
+> and code references for the current pipeline now live in
+> [`ZETA_V_Q_ALGORITHMS.md`](ZETA_V_Q_ALGORITHMS.md); the BGW symmetry
+> convention and the IBZ → full-BZ unfolds (`unfold_psi`, `unfold_v_q`,
+> centroid permutation tables) live in
+> [`SYMMETRY_COMPREHENSIVE.md`](SYMMETRY_COMPREHENSIVE.md); per-stage
+> memory formulas and the G-flat planner are in
+> [`MEMORY_MODEL.md`](MEMORY_MODEL.md). §3–5 here remain accurate for
+> the conceptual / scalar / r-space narrative; §11 below is a pointer
+> stub with a quick-reference table.
 
 ## 1. Wavefunctions and Notation
 
@@ -797,7 +804,7 @@ Everything runs on a single 2-D mesh `Mesh(devices, ('x', 'y'))` built in `gw_ja
 | `common/cholesky_2d.py` | 2D blocked Cholesky |
 | `common/fft_helpers.py` | Flat-k ↔ 3-D FFT helpers (custom_partitioning) |
 | `common/meta.py` | `Meta` system dataclass |
-| `common/symmetry_maps.py` | IBZ → full BZ unfolding, spinor rotations |
+| `common/symmetry_maps.py` | IBZ → full BZ unfolding, spinor rotations (TRS-augmented `SymMaps`; see [`SYMMETRY_COMPREHENSIVE.md`](SYMMETRY_COMPREHENSIVE.md) for the BGW `mtrx` / τ convention and the `unfold_psi` / `unfold_v_q` / `compute_centroid_sym_perm` procedures) |
 | `common/minimax.py`, `common/minimax_assets/` | Quadrature solvers + shipped tables |
 | `common/chi_from_dipole.py` | $S_{\alpha\beta}(\omega)$ from dipole mtxels |
 | `file_io/slab_io.py` | `SlabIO` — phdf5 writer (FFI + allgather backends) |
@@ -808,9 +815,11 @@ Everything runs on a single 2-D mesh `Mesh(devices, ('x', 'y'))` built in `gw_ja
 
 | Doc | Focus |
 |-----|-------|
-| **This file** | Theory + implementation + sharding map. §3–5 is the scalar / r-space narrative; §11 is the current rank-5 open-spin + G-flat ζ + bispinor Lorentz-tile pipeline |
+| **This file** | Theory + implementation + sharding map. §3–5 is the scalar / r-space narrative; §11 is a short pointer + quick-reference for the current G-flat ζ + bispinor V_q pipeline |
+| [`ZETA_V_Q_ALGORITHMS.md`](ZETA_V_Q_ALGORITHMS.md) | **Current source of truth** for the rank-5 open-spin pair density, scan-INSIDE-shard_map r-chunk loop, G-flat on-disk ζ̃, per-q G-chunked V_q kernel, IBZ cascade, and bispinor Lorentz-tile sectorization |
+| [`SYMMETRY_COMPREHENSIVE.md`](SYMMETRY_COMPREHENSIVE.md) | BGW `mtrx`/τ conventions, `SymMaps`/TRS-augmented table, `unfold_psi`, `compute_centroid_sym_perm`, `unfold_v_q`, symmorphic failure modes, sym-vs-nosym recipe |
 | [`CODEBASE_COMPREHENSIVE.md`](CODEBASE_COMPREHENSIVE.md) | Module map, call hierarchy, file formats |
-| [`MEMORY_MODEL.md`](MEMORY_MODEL.md) | Per-stage memory formulas, bottleneck arrays |
+| [`MEMORY_MODEL.md`](MEMORY_MODEL.md) | Per-stage memory formulas, G-flat planner, AOT chooser, bottleneck arrays |
 | [`MINIMAX_QUADRATURE.md`](MINIMAX_QUADRATURE.md) | CTSP theory, quadrature derivations |
 | [`GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md`](GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md) | GN-PPM Σ^c(ω) window derivations |
 | [`NEW_WINDOW_MINIMAX_GUIDELINES.md`](NEW_WINDOW_MINIMAX_GUIDELINES.md) | Minimax window placement rules |
@@ -862,860 +871,58 @@ See the `lorrax_sandbox` superproject `skills/execute_workflow/SKILL.md` for the
 
 ---
 
-## 11. Bispinor-aware G-flat pipeline (current)
-
-Companion to §3–5 above. §3–5 describes the historical **r-space
-ζ-on-disk** path and the **spin-traced rank-3** pair density. This
-section is the current source of truth for:
-
-* the **single rank-5 open-spin pair-density** path that runs for every
-  Lorentz channel (charge μ_L=0 and the three transverse μ_L∈{1,2,3});
-* the **G-flat ζ-on-disk** layout — ζ̃(q,μ,G) on the per-q `(q+G)` sphere —
-  built by `accumulate_rchunk_to_gflat` during the r-chunk loop;
-* the **IBZ-only on-disk q-axis** and the post-V_q symmetry unfold;
-* the **per-q G-chunked V_q kernel** and its bispinor extension to seven
-  unique `(μ_L, ν_L)` tiles.
-
-**Scope**: Phase-1 DHF + bare-Breit (the channels currently wired through
-`gw.gw_jax`). Σ^B (transverse bare-Breit) is documented for completeness
-in §11.10 but its detailed regression status lives in
-`reports/bispinor_theory_2026-05-09/report.md`.
-
-Source-of-truth citations are inlined as `file.py:line`. Cited shapes
-match the current code; cited shardings use the standard mesh
-`Mesh(devices, ('x','y'))` with `P = p_x · p_y`.
-
-### 11.1 Conventions
-
-#### γ̃-matrix convention (absorbed γ⁰)
-
-Following the absorbed convention (`gamma_matrices.py:16`), LORRAX uses
-
-$$\boxed{\tilde\gamma^\mu \equiv \gamma^0 \gamma^\mu, \qquad \tilde\gamma^0 = I_4,\quad \tilde\gamma^i = \alpha^i}$$
-
-so the bispinor pair density is `ρ^{μ_L} = Ψ† γ̃^{μ_L} Ψ` (no explicit
-`Ψ̄`). Every `γ̃^μ` is **monomial** — exactly one nonzero per row/column,
-value ∈ {±1, ±i}. The (perm, phase) decomposition
-
-$$\boxed{\tilde\gamma^\mu_{\alpha\beta} = \mathrm{phase}_\mu[\alpha] \cdot \delta_{\beta,\, \mathrm{perm}_\mu[\alpha]}}$$
-
-is precomputed at `gamma_matrices.py:85-87` (arrays `gammas_perm`,
-`gammas_phase`, both `(4, 4)`). Explicit tables:
-
-| μ | perm        | phase             | spectrum of γ̃^μ |
-|---|-------------|-------------------|------------------|
-| 0 | (0,1,2,3)   | (+1,+1,+1,+1)     | {+1,+1,+1,+1}    |
-| 1 | (3,2,1,0)   | (+1,+1,+1,+1)     | {+1,+1,−1,−1}    |
-| 2 | (3,2,1,0)   | (−i,+i,−i,+i)     | {+1,+1,−1,−1}    |
-| 3 | (2,3,0,1)   | (+1,−1,+1,−1)     | {+1,+1,−1,−1}    |
-
-#### Kinetic-balance lift
-
-`bispinor_init.py:12-41`. From the large-component wavefunction
-ψ_L,n,k(G) the small component is
-
-$$\boxed{\psi_{S,n,k}(G) = \tfrac{\alpha_{\mathrm{FS}}}{2}\,\big(\boldsymbol\sigma\cdot(k+G)_{\mathrm{cart}}\big)\,\psi_{L,n,k}(G)}$$
-
-with `halfalpha = α_FS / 2 = 1/(2·137.036) = 0.00364867628215`
-(`bispinor_init.py:30`). The bispinor is assembled L-then-S:
-
-$$\Psi(r) = \begin{pmatrix} \psi_L^\uparrow \\ \psi_L^\downarrow \\ \psi_S^\uparrow \\ \psi_S^\downarrow \end{pmatrix} \in \mathbb{C}^4, \qquad \mathtt{nspinor} = 4.$$
-
-Norm: `‖Ψ‖² = ‖ψ_L‖² · (1 + O(α_FS²))`. The lift is *not* renormalized
-post-construction — the O(α²) correction is below the Phase-1 truncation.
-
-#### Bispinor pair density and the ISDF approximation
-
-For vertex μ_L the pair density between (n_l, k) and (n_r, k+q) is
-
-$$\boxed{\rho^{\mu_L}_{n_l n_r, k, q}(r) = \sum_{\alpha\beta=1}^{4} \psi^*_{l,n_l,k,\alpha}(r)\,\tilde\gamma^{\mu_L}_{\alpha\beta}\,\psi_{r,n_r,k+q,\beta}(r)}$$
-
-Special cases: μ_L=0 (γ̃⁰=I_4) reduces to the **spin-traced charge
-density** `Σ_α ψ*_l ψ_r`; μ_L=i (γ̃^i=α^i) is the *i*-th component of the
-Dirac current `Ψ†α^iΨ` and is O(α_FS) by the kinetic-balance lift.
-
-ISDF (Dong–Hu–Lin) replaces the band-pair product by a centroid expansion
-**separable in (n_l, n_r)**:
-
-$$\boxed{\rho^{\mu_L}_{n_l n_r, k, q}(r) \;\approx\; \sum_{a=1}^{n_{r\mu}}\,\zeta^{\mu_L}_{q,a}(r)\,\rho^{\mu_L}_{n_l n_r, k, q}(r_a)}$$
-
-ζ depends on q and μ_L but **not** on the band pair. Two centroid files
-in production: charge (k-means on `Σ_n|ψ|²`) for μ_L=0, current
-(k-means on `Σ_i|j^{\mathrm{Gordon}}_i|²` with
-`j^{\mathrm{Gordon}} = \mathrm{Im}[\psi_L^\dagger\nabla\psi_L] +
-\tfrac12\nabla\times(\psi_L^\dagger\boldsymbol\sigma\psi_L)`) for μ_L=1,2,3.
-The three transverse channels share **one** current-centroid file.
-Counts `n_rmu_C` (charge) and `n_rmu_T` (current) are independent.
-
-#### Lattice conventions, units, FFT norms
-
-* **Bloch phase**: `ψ_{nk}(r) = Σ_G c_{nk}(G) e^{i(k+G)·r}`, with the
-  cell-periodic part `u_{nk}(r) = e^{-ik·r}ψ_{nk}(r) = Σ_G c_{nk}(G) e^{iG·r}`.
-  ζ is stored as the Bloch form ζ_{q,μ}(r) on the r-space path; on the
-  G-flat path the on-disk array is the **cell-periodic FFT** of the
-  Bloch ζ, i.e. ζ̃_{q,μ}(K=q+G) (see §11.6 for the explicit conversion).
-* **FFT-grid Miller indices**: `np.fft.fftfreq(N)*N` order. The flat-r
-  layout is `r_flat = rx·ny·nz + ry·nz + rz`.
-* **q-axis on disk**: `kgrid_int` BGW-wrapped (`q > kg/2 → q − kg`),
-  divided by kgrid; matches the writer's `q_irr_frac`
-  (`v_q_g_flat.py:192-197`).
-* **FFT norms**:
-  * Pair-density k-convolution (`c_q_from_pair`, `z_q_from_pair`):
-    `norm='forward'` on both IFFT_{k→R} and FFT_{R→q}
-    (`isdf_fitting.py:227-228`). This makes the convolution-theorem
-    identity `C_q = FFT(conj(IFFT(P_l)) ⊙ IFFT(P_r)) = Σ_k P_l^*_k P_{r,k+q}`
-    reproduce the direct sum without an extra prefactor.
-  * G-flat accumulator (`accumulate_rchunk_to_gflat`): `norm='backward'`
-    on the r→G forward FFT (`wfn_transforms.py:609`). Forward FFT applies
-    no 1/N factor; downstream V_q kernel absorbs the normalization
-    constant into its definition.
-* **Units**: Hartree atomic units internally; eV at output. Bohr⁻¹ for
-  reciprocal vectors `(k+G)·b`.
-
-#### Mesh, shardings, sizes
-
-`Mesh(devices.reshape(p_x, p_y), ('x','y'))`, `P = p_x · p_y`. Spec
-notation: `μ_X` = sharded on `'x'`, `μ_XY` = sharded on flat `('x','y')`,
-`μ_` = replicated.
-
-Typical → extreme:
-
-| Symbol | Range | Where it sits |
-|---|---|---|
-| `n_rtot = nx·ny·nz` | 5k–2M+ | FFT-box bottleneck; everything that materialises one must be chunkable |
-| `n_band` | 50–10k | per-channel left/right windows |
-| `n_rmu` | 500–100k (≈10·n_band) | centroid count; rounded up to `mesh.size` as `n_rmu_padded` |
-| `n_G_sph ≈ 0.05·n_rtot` | 1k–100k | per-q `(q+G)` sphere; padded to `ngkmax = max_q ngk[q]` |
-| `n_k, n_q` | 1–10000 | flat-k / flat-q |
-| `n_q_disk` | 1–n_q | IBZ subset (factor `≤ ntran` reduction) |
-
-### 11.2 Open-spin rank-5 pair density
-
-#### Definition
-
-`isdf_fitting.py:82-148`. The pair-density tensor with both spinor axes
-kept **open** is
-
-$$\boxed{P_{k,\alpha\beta}^{(\mathrm{open})}(\mu,\,\mathrm{col}) = \sum_n \psi^*_{n,k,\alpha}(r_\mu)\,\psi_{n,k,\beta}(r_{\mathrm{col}})}$$
-
-Einsum `'kmna,knbr->kabmr'` (`isdf_fitting.py:112, 145`).
-
-| Array | Shape | Sharding | Notes |
-|---|---|---|---|
-| `psi_rmuT_X` (left) | `(nk, n_rmu, nb, ns)` | `P(None, 'x', None, None)` | rank-4 |
-| `psi_rcol_Y` (right) | `(nk, nb, ns, n_col)` | `P(None, None, None, 'y')` | rank-4; `n_col = n_rmu` for CCT, `n_col = r_chunk` for ZCT |
-| `P_k,αβ` | `(nk, ns, ns, n_rmu, n_col)` | `P(None, None, None, 'x', 'y')` | rank-5 |
-
-For ns=4 (bispinor) the spin-pair index `(α, β)` runs over 16
-combinations. Memory cost is **16× the historical spin-traced rank-3
-form**, paid at the (k, a, b, μ, col) carrier. Band-chunked accumulation
-streams over n so peak memory is bounded; see `accum_pair_density`
-(`isdf_fitting.py:119-148`, donates `P_in`).
-
-#### Why rank-5 open-spin, not rank-3 spin-traced + γ̃-weighted
-
-The Schur form folds γ̃ into the spin-trace at construction time,
-`P^{\mathrm{Schur}}_k(\mu,\nu) = Σ_{n,\alpha\beta} ψ^*_{n,k,\alpha}(r_\mu)
-\tilde\gamma_{\alpha\beta} ψ_{n,k,\beta}(r_\nu)`. The resulting `C_q` is
-**indefinite** for γ̃^i (eigenvalues of `γ̃^* ⊗ γ̃` are products of
-γ̃-eigenvalues; for γ̃^i = α^i these are ±1 each, giving 8 modes of each
-sign on the 16-dim spin-pair index). Cholesky NaNs; naive LU blows up on
-near-null modes (1e17 trace on CrI3, pre-fix).
-
-The open-spin form keeps the γ̃ contraction at the spatial-point
-reduction (§11.3 below): γ̃ is contracted only **inside** the band-pair
-sum of magnitudes,
-
-$$\langle v | K_q | v \rangle = \sum_{n_l, n_r, k}\bigg|\sum_{\mu_c} v_{\mu_c}\,\tilde\rho^{\mu_L}_{n_l n_r, k, q}(r_{\mu_c})\bigg|^2 \;\geq\; 0,$$
-
-manifestly PSD for any μ_L. (The code still dispatches μ_L≠0 to pivoted
-LU + ridge — see §11.4.2; the conservatism is an open question
-documented in `reports/bispinor_theory_2026-05-09 §4.5`.)
-
-#### γ̃·γ̃ double contraction (`gamma_double_contract`)
-
-`gamma_matrices.py:128-164`. Collapses the rank-5 P pair to rank 3 by
-
-$$\boxed{[\tilde\gamma_L \cdot \tilde\gamma_R \cdot P_l^* P_r](\mu, \mathrm{col}) = \sum_{\alpha\beta}\mathrm{phase}_L[\alpha]\,\mathrm{phase}_R[\beta]\,P^*_{l,\alpha\beta}\,P_{r,\,\mathrm{perm}_L[\alpha],\,\mathrm{perm}_R[\beta]}}$$
-
-implemented as a `take`+`take` gather followed by an element-wise phase
-multiply and a sum on the two spin axes — no 4×4 matmul. `perm_L=None`
-(charge / left-identity short-circuit) skips the gather on that side;
-both None → pure Frobenius `Σ_{αβ} P_l^*·P_r` (charge channel; identical
-to the historical spin-traced form).
-
-### 11.3 CCT, ZCT, q=0 Gram on the full BZ
-
-#### `c_q_from_pair` — CCT matrix
-
-`isdf_fitting.py:168-279`. For each q,
-
-$$\boxed{C^{\mu_L \nu_L}_q(\mu,\,\nu) = \sum_k\, \big[\tilde\gamma_L \cdot \tilde\gamma_R \cdot P_l^* P_r\big]_{k,\,\mu,\,\nu}\,e^{-i\,q\cdot R(k)}}$$
-
-evaluated via FFT (k-convolution, `norm='forward'`):
-
-| Step | Output | Shape | Sharding |
-|---|---|---|---|
-| `_ifft_conj(P_l)` | `P_l^* in R` | `(nk, s, s', μ, ν)` | `P(None, None, None, 'x', 'y')` |
-| `local_ifftn_spin(P_r)` | `P_r in R` | same | same |
-| `gamma_double_contract(P_l*, P_r; γ̃_L, γ̃_R)` | rank-3 `C_R` | `(nk, μ, ν)` | `P(None, 'x', 'y')` |
-| `local_fftn_scalar(C_R)` | `C_q` | `(nq, μ, ν)` | `P(None, 'x', 'y')` |
-
-Donates `P_l` and `P_r` (`donate_argnums=(0,1)` at line 246) so each
-ifft + contract is in-place. Both pair-density inputs are at the same
-sharding `P(None, None, None, 'x', 'y')`. The k→R IFFT uses
-`make_flat_k_ifftn` (flat-k with `custom_partitioning`); the R→q FFT
-uses `make_flat_k_fftn`. q-axis on output is the full BZ — the IBZ
-subset is taken at write time (§11.6).
-
-#### `z_q_from_pair` — ZCT matrix on (μ, r-chunk)
-
-Same structure as above with `col = r_chunk` instead of `col = ν`.
-Output `Z_q^{μ_L ν_L}(μ, r)` shape `(nq, n_rmu, r_chunk)` at sharding
-`P(None, 'x', 'y')`.
-
-#### `gram_q0_from_pair` — q=0 valence-conduction Gram
-
-`isdf_fitting.py:282-370`. Used by `centroid.pivoted_cholesky` to pick
-centroids. At q=0 the k-sum **is** the answer (no convolution); the same
-γ̃·γ̃ reduction applies. Output `(n_rmu, n_rmu)` Hermitian PSD at
-`P('x','y')`. Symmetrized explicitly to suppress fp roundoff
-(`G = 0.5·(G + G^H)` at line 353).
-
-#### Channel dispatch in the fit driver
-
-`isdf_fitting.py:1862-1888` (legacy r-space) and `:1480` (G-flat).
-Single rank-5 path for both charge and transverse:
-
-```python
-gamma_perm_phase  = None if vertex_mu_L == 0 else gamma_perm_phase_mu(vertex_mu_L)
-gamma_L = gamma_R = gamma_perm_phase   # same vertex on both legs
-P_acc = pair_density_accum(P_acc, ψ_rmuT_X, ψ_rcol_Y, mesh_xy)   # band-chunk loop
-C_q   = c_q_from_pair(P_l_k_ab, P_r_k_ab, gamma_L, gamma_R, kgrid=…, mesh_xy=…)
-Z_q   = z_q_from_pair(P_l_k_ab_muz, P_r_k_ab_muz, gamma_L, gamma_R, kgrid=…, mesh_xy=…)
-```
-
-For μ_L=0 the `gamma_L/R = None` branches short-circuit the gather and
-phase mul at trace time — the kernel is byte-identical to a hypothetical
-"charge-only" path through the spin-traced rank-3 helpers. The 16× spin
-factor is a price paid uniformly.
-
-### 11.4 L_q factorization and per-q triangular / LU solve
-
-#### Cholesky (μ_L = 0)
-
-`isdf_fitting.py:921-1103`. `compute_L_q_from_CCT` runs 2D-blocked
-batched Cholesky (`cholesky_2d.cholesky_2d_batched`) on the tile layout
-`L_q[q, J_X, J_Y, b, b]` with sharding `P(None, 'x', 'y', None, None)`,
-returning the dense view at `P(None, 'x', 'y')`. Falls back to dense
-`jnp.linalg.cholesky` with a trace-proportional ridge `1e-14·|tr|/n` on
-1×1 meshes (line 1060). Per-q triangular solve in
-`solve_zeta_from_L_q` (`isdf_fitting.py:1110-1230`):
-
-```python
-# shard_map(in_specs=(P(None,None,None), P(None,None,('x','y'))),
-#           out_specs=P(None,None,('x','y')))
-y    = solve_triangular(L,        Z_cols, lower=True)
-zeta = solve_triangular(L.conj().T, y,    lower=False)
-```
-
-L is gathered to replicated inside the shard_map; each device solves
-its r-column shard. Python outer loop with `donate_argnums` keeps
-sequential GPU execution (fori_loop SPMD-replicates the sharded carry;
-scan(unroll=8) preallocates a 19 GB temp).
-
-#### Pivoted LU + ridge (μ_L ≠ 0)
-
-`isdf_fitting.py:1183-1202`. For transverse channels the code treats
-C_q as Hermitian indefinite (overcautious per §11.2 analysis; see
-`reports/bispinor_theory_2026-05-09 §4.5` for the open question):
-
-```python
-n = L.shape[-1]
-ridge = LU_RIDGE * jnp.abs(jnp.trace(L)) / n     # LU_RIDGE = 1e-12
-L_reg = L + ridge * jnp.eye(n, dtype=L.dtype)
-return jnp.linalg.solve(L_reg, Z)
-```
-
-Ridge `1e-12 · |tr(C_q)| / n_rmu` sits well below physically meaningful
-eigenvalues and above the partial-pivoting stability floor. JAX exposes
-no Bunch-Kaufman LDLᵀ, so pivoted LU (`jnp.linalg.solve` → `lu_solve`)
-is the practical Hermitian-indefinite path.
-
-LU is ~10% slower per chunk than Cholesky at CrI3 6×6 scale (16 GPUs,
-`r_chunk=25000`): Cholesky 9.7 s/chunk vs LU 9.8–10.7 s/chunk
-(`reports/bispinor_pipeline_2026-05-04 §3`).
-
-#### `solve_zeta` reshard discipline
-
-Solver native output → target sharding `P(None, ('x','y'), None)`
-(μ_XY, r_):
-
-| Solver | Native out spec | Reshard path |
-|---|---|---|
-| `cusolvermp_{cholesky,lu}` | `P(None, 'x', 'y')` | one step, single mesh axis 'y' moves r→μ |
-| `sharded_{cholesky,lu}` (shard_map fallback) | `P(None, None, ('x','y'))` | two steps via `P(None, 'x', 'y')`: 'x' then 'y' |
-
-Each step is a clean single-mesh-axis all-to-all
-(`_reshard_zeta_mu_X_r_Y_to_mu_XY` at `isdf_fitting.py` and the two-step
-variant). The reshard is the only collective in `solve_zeta`'s output
-path; ~3 ms/call. Trailing `('x','y')` placement is what
-`accumulate_rchunk_to_gflat` requires.
-
-### 11.5 r-chunk loop and the G-flat accumulator
-
-This is the part that has changed since
-`reports/bispinor_theory_2026-05-09`. The r-chunk loop no longer writes
-ζ in r-space to disk; instead each r-chunk's contribution is
-**FFT'd-and-accumulated** directly into a μ-sharded G-flat buffer.
-
-#### Math: linearity over r-chunks
-
-The cell-periodic-on-disk form is
-
-$$\boxed{\tilde\zeta_{q,\mu}(K) = \frac{1}{N_r}\sum_r e^{-iK\cdot r}\zeta_{q,\mu}(r) = \mathrm{FFT}_{r\to G}\!\Big[e^{-2\pi i\,q\cdot r}\,\zeta_{q,\mu}(r)\Big](G),\quad K = q + G}$$
-
-Since `FFT_{r→G}` is linear in the r-input, splitting r into disjoint
-chunks `r ∈ R_c = [r₀^c, r₀^c + r_len)` and summing,
-
-$$\tilde\zeta_{q,\mu}(K) = \sum_c \mathrm{FFT}_{r\to G}\!\Big[\mathrm{pad}_{R_c\to[0,n_{\mathrm{rtot}})}\!\big(e^{-2\pi i\,q\cdot r}\,\zeta_{q,\mu}(r)|_{r\in R_c}\big)\Big](G)$$
-
-Each chunk contributes additively. The r-chunk loop in
-`fit_zeta_to_h5` evaluates `ζ_{q,μ}(r)` only on `R_c` (the back-solve
-runs at r-chunk extent), multiplies by the per-q phase on the slab,
-zero-pads to the full FFT box, FFTs once, and adds the per-q sphere
-gather into `gflat_acc`. The r-space ζ-on-disk image is **never
-materialised** — its on-disk size (which was the bottleneck) is paid in
-FFT work instead: `n_rchunks×` chunked FFT boxes.
-
-#### `accumulate_rchunk_to_gflat`
-
-`common/wfn_transforms.py:439-626`. One `shard_map` over `('x','y')`; no
-cross-rank collectives in the body.
-
-```
-in  : rchunk    (n_q_disk, n_rmu_padded, r_len)     P(None, ('x','y'), None)
-      gflat_acc (n_q_disk, n_rmu_padded, ngkmax)    P(None, ('x','y'), None)   ← donated
-out : (n_q_disk, n_rmu_padded, ngkmax)              P(None, ('x','y'), None)
-```
-
-Per-rank body inside the shard_map (`wfn_transforms.py:584-620`):
-
-```python
-N = n_q · n_mu_local;   n_mu_local = n_rmu_padded / P
-rch_flat = rchunk.reshape(N, r_len)
-acc_flat = acc.reshape(N, ngkmax)
-zero-pad both to ⌈N/cs⌉ · cs along axis 0          # cs = chunk_size
-
-for i in range(n_chunks):                          # lax.scan, donated acc carry
-    sub      = dynamic_slice(rch_flat, i·cs, cs, axis=0)
-    q_row[cs] = clip((i·cs + arange(cs)) // n_mu_local, 0, n_q-1)
-    box      = zeros(cs, n_rtot).update_slice(sub, r0, axis=-1).reshape(cs, nx, ny, nz)
-    if qvec_frac:
-        box *= phx[q_row] · phy[q_row] · phz[q_row]    # separable e^{-2πi q·r}
-    G_box    = jnp.fft.fftn(box, axes=(-3,-2,-1), norm='backward')      # local cuFFT
-    contrib  = take_along_axis(G_box.reshape(cs, n_rtot), sphere_c[q_row], axis=-1)
-    acc_flat = dynamic_update_slice(acc_flat, slice(acc_flat,i·cs,cs) + contrib, i·cs)
-
-return acc_flat[:N].reshape(n_q, n_mu_local, ngkmax)
-```
-
-**Key invariants**:
-
-1. **Flat-axis chunking on `(q · μ_local)`**: cs is a free integer; no
-   divisibility constraint on n_q or n_mu_local. Pad rows
-   (`pad_N = ⌈N/cs⌉·cs − N`) are zero-padded → contribute zero, no
-   contamination of `acc`. `q_row ≥ n_q` from pad rows is clipped to
-   `n_q-1` but the slab is zero so the take is harmless.
-2. **Sharding contract**: μ is the only sharded axis on both `rchunk`
-   and `gflat_acc`. The r-axis and the G-sphere axis are replicated.
-   The FFT axes are entirely *per-rank-local*; `jnp.fft.fftn` inside the
-   shard_map dispatches local cuFFT, no resharding.
-3. **Per-q tables baked at trace time** (closure-replicated per rank):
-   * `sphere_c (n_q, ngkmax) int32` — per-q sphere into the flat FFT
-     box. `sphere_c[q, 0] == 0` (G=(0,0,0)) by construction
-     (`coulomb_sphere.py:197-204`); pad slots use the BZ-corner
-     sentinel `(nx/2, ny/2, nz/2)` which the writer zeroes post-loop
-     via `jnp.where` (see §11.5.4).
-   * `phx (n_q, nx)`, `phy (n_q, ny)`, `phz (n_q, nz)` — separable
-     `exp(-2πi q·r)` Bloch-phase factors.
-4. **Donation**: `gflat_acc` is `donate_argnums=(1,)` on the outer jit
-   (line 622); inside the shard_map's `lax.scan`, `acc_flat` is the
-   carry → donated by scan semantics.
-
-#### Chunker parameter
-
-`chunk_size` (rows per scan iter):
-* Default `None` ⇒ one-shot (`cs = N`, scan compiles to 1 iter that XLA
-  folds away).
-* Env override: `LORRAX_GFLAT_CHUNK_SIZE`.
-* Memory bound per rank: `chunk_size · n_rtot · 16 B` for the per-iter
-  FFT box (the only transient).
-* Suggested set: `chunk_size ≈ memory_budget_bytes / (n_rtot · 16) /
-  6` (~6× live-copy slack). Per-rank ~1 GB budget ⇒ `cs ≈ 8e7/n_rtot`.
-  At MoS2 3×3 (n_rtot=46k) one-shot fits; at CrI3 J_3x3 (n_rtot=243k)
-  `cs ≈ 300`; at CrI3 6×6 80 Ry (n_rtot=1.125 M) `cs ≈ 64`.
-
-#### Outer driver wiring (`fit_zeta_to_h5`)
-
-`isdf_fitting.py:2191-2273` (chunk loop), `:2330-…` (post-loop write).
-
-For each r-chunk:
-
-1. `psi_G_store.begin_rchunk(r_start, r_end)` — bring host ψ(G) tiles
-   into scope (file-reread mode) or no-op (host-cache mode).
-2. `fit_one_rchunk(…)` — one fused jit over: ψ(G) → ψ(r-slab) (band
-   chunked), pair-density accumulation (rank-5), C_q-product k→R→q
-   convolution (§11.3), `solve_zeta` (§11.4). Returns
-   `zeta_chunk (n_q_disk, n_rmu_padded, r_chunk)` at
-   `P(None, ('x','y'), None)`. (IBZ slicing happens *inside*
-   `fit_one_rchunk` before the solve — Phase B; the legacy full-BZ slice
-   path is still wired for the q_irr_full_idx=None case.)
-3. `gflat_acc = accumulate_rchunk_to_gflat(zeta_chunk_ibz, gflat_acc,
-   r0=r_start, sphere_idx=…, qvec_frac=…, chunk_size=…, mesh=…)` ←
-   donates `gflat_acc`, returns the updated buffer.
-4. `del zeta_chunk_ibz` — the only persistent ζ object is `gflat_acc`.
-
-Post-loop write (line ~2350):
-
-```python
-# Mask pad slots: per-q sphere has length ngk[q] ≤ ngkmax with sentinel pad.
-mask = (arange(ngkmax)[None, :] < ngk_per_q[:, None])         # (n_q_disk, ngkmax)
-gflat_acc = jnp.where(mask[:, None, :], gflat_acc, 0)         # zero-out pad
-zeta_io.write_slab('zeta_q_G', gflat_acc,
-                   valid_shape=(n_q_disk, n_rmu_logical, ngkmax))   # μ-pad clipped
-```
-
-`SlabIO.valid_shape=` clips the μ-pad on the write so on-disk extent is
-**logical** `n_rmu`. phdf5 FFI path when `use_ffi_io=true`; allgather
-fallback otherwise.
-
-#### Cost model (CrI3 6×6 80 Ry, 16 GPUs, 4×4 mesh)
-
-Per-rank c128 = 16 B, n_q_disk = 8 IBZ, n_rmu = 1504, n_rtot = 1.125 M,
-chunk_size = 64:
-
-| Object | Logical shape | Per-rank | Bytes/rank |
-|---|---|---|---|
-| `gflat_acc` (persistent) | `(8, 1504, ngkmax≈55k)` | `(8, 1504/16, 55k)` | 0.66 GB |
-| `rchunk` (per iter, donated) | `(8, 1504, r_chunk)` | `(8, 1504/16, r_chunk/4)` | depends on r_chunk |
-| Per-iter FFT box | `(cs, n_rtot)` | same (replicated G) | `cs · n_rtot · 16 = 1.15 GB` at cs=64 |
-
-The accumulator's per-iter peak (1.15 GB) is the new memory term added
-by the G-flat refactor. The r-space ζ-on-disk image it replaces was
-much larger (`n_q · n_rtot · n_rmu · 16` ≈ 80 GB for MoS2 3×3, ~ TB for
-CrI3 6×6) and lived entirely on disk; the new path keeps no r-space
-on-disk image at all (`zeta_q.h5` becomes a 1D sphere store).
-
-### 11.6 IBZ-only on-disk layout and ζ symmetry transformation
-
-`reports/zeta_ibz_2026-05-11/report.md` is the design document; this
-section captures the conventions and identities used by the writer and
-the unfold path.
-
-#### Bloch ↔ cell-periodic ↔ G-sphere
-
-Three forms of ζ, all equivalent up to a Bloch phase and an FFT:
-
-| Form | Symbol | Domain |
-|---|---|---|
-| Bloch (real-space, on-disk legacy) | `ζ_{q,μ}(r)` | `r ∈ [0, n_rtot)` |
-| Cell-periodic (transient) | `z_{q,μ}(r) = e^{-2πi q·r}\,ζ_{q,μ}(r)` | `r ∈ [0, n_rtot)` |
-| G-sphere (on-disk current) | `ζ̃_{q,μ}(K) = (1/N_r)\,\mathrm{FFT}_{r\to G}[z_{q,μ}(r)](K)` | `K ∈ \mathrm{sphere}(q)` |
-
-with `K = q + G`. The `accumulate_rchunk_to_gflat` body realises the
-last identity per r-chunk (linearity in r) up to the `norm='backward'`
-factor — the kernel that consumes ζ̃ in V_q absorbs the missing 1/N_r
-into the v(q+G) overlay.
-
-#### Symmetry transformation of ζ
-
-`WFN.h5` sym ops `{S | τ}`: `S = wfn.sym_matrices[s]` integer rotation
-in crystal coords (BGW `mtrx`); `τ = wfn.translations[s] / (2π)`
-fractional translation. Pair density transforms by
-
-$$\rho_{Sq}(SG) = e^{-i(Sq + SG)\cdot\tau}\,\rho_q(G).$$
-
-If centroids are closed under `{S|τ}` (orbit-aware k-means + grid-snap
-ensures `S r_μ + τ ≡ r_{π_s(μ)}` mod 1, with `π_s` the centroid
-permutation), the same transformation law lifts to ζ with a centroid
-permutation on the μ leg:
-
-$$\boxed{\tilde\zeta_{Sq,\,\pi_s(\mu)}(SG) = e^{-i(Sq + SG)\cdot\tau}\,\tilde\zeta_{q,\mu}(G)}\qquad\text{(eq. 1)}$$
-
-Inverse form (unfold IBZ → full BZ for a single q_full = S · q_irr):
-
-$$\tilde\zeta_{q_{\mathrm{full}},\,\nu}(G_{\mathrm{target}}) = e^{-i(q_{\mathrm{full}} + G_{\mathrm{target}})\cdot\tau_s}\,\tilde\zeta_{q_{\mathrm{irr}},\,\pi_{s}^{-1}(\nu)}(S^{-1} G_{\mathrm{target}}).$$
-
-The unfold needed for *V_q* (not ζ itself) avoids the τ-phase entirely
-because V is bilinear in ζ — see §11.9.
-
-#### IBZ resolution at runtime
-
-`v_q_g_flat.py:_resolve_ibz_q_list` (line 148-199). Inputs:
-`sym = wfn.symmetry` table; `centroid_indices = r_mu_fft_idx`. Steps:
-
-1. Try `centroid.orbit_syms.compute_centroid_sym_perm(centroid_indices,
-   sym_matrices, translations, fft_grid)` — validates that every sym op
-   permutes the centroid set; raises if not orbit-closed.
-2. If success: call `sym.find_irreducible_qpoints()` to get
-   `(q_irr_kgrid_int, full_to_irr_idx, full_to_irr_sym)` and set
-   `use_ibz = True`.
-3. If failure (orbit-closure violation, e.g. kmeans was run with
-   `--no-orbit`): fall back to `q_irr = full BZ`, `use_ibz = False`,
-   `sym_perm = None`. The post-V_q unfold becomes a no-op.
-
-The IBZ subset is `n_q_disk` rows on the on-disk q-axis of
-`zeta_q_G.h5`. Disk size shrinks by `n_q_full / n_qpt_irr` (e.g. 9× for
-CrI3 6×6×1 with `ntran=12`; 21× total combined with the r → G-sphere
-saving — see `gflat_e2e_bispinor_mos2_3x3_2026-05-11/report.md`).
-
-### 11.7 V_q kernel: per-q, G-chunked, with optional async prefetch
-
-#### Inner kernel
-
-`gw/v_q_g_flat.py::_make_per_q_kernel` (line 55-140). For one IBZ q:
-
-$$\boxed{V_q^{\mu_L \nu_L}[\mu_L^{(c)}, \nu_R^{(c)}] = \sum_{G \in \mathrm{sphere}(q)}\,\overline{\tilde\zeta_L^{\mu_L}(q, \mu_L^{(c)}, G)}\,v(q + G)\,t^{\mu_L \nu_L}(q + G)\,\tilde\zeta_R^{\nu_L}(q, \nu_R^{(c)}, G)}$$
-
-where `μ_L^{(c)}`, `ν_R^{(c)}` are the centroid indices (left and right
-side of the bilinear, distinct in the bispinor off-diagonal case where
-the two ζ-files have different centroid counts). `v(q+G)` is the
-scalar Coulomb (3-D: `4π/|q+G|²`; 2-D slab / 0-D box: dimension-aware
-truncation factor); `t^{μ_L ν_L}(q+G)` is the bispinor weight (§11.8).
-
-The kernel reads one (or two distinct) ζ-slabs per q, accumulates the
-GEMM in G-chunks of size `g_chunk` into a `(n_rmu_L, n_rmu_R)` block,
-and `dynamic_update_slice`s the result into the persistent
-`(n_q_ibz, μ, μ)` V-accumulator. Pseudocode (`v_q_g_flat.py:89-137`):
-
-```python
-@jax.jit(donate_argnums=(0, 1))
-def fn(V_acc, g0_acc, zeta_L_q, zeta_R_q, v_q, q_idx):
-    zeta_L_3d = with_sharding_constraint(zeta_L_q, P(('x','y'), None))   # disk read → q-flat
-    zeta_R_3d = zeta_L_3d if same_zeta else with_sharding_constraint(zeta_R_q, P(('x','y'), None))
-    zeta_L    = with_sharding_constraint(zeta_L_3d[0], P('x', None))     # μ_X
-    zeta_R    = with_sharding_constraint(zeta_R_3d[0], P('y', None))     # μ_Y
-
-    V_q = jnp.zeros((n_rmu_L, n_rmu_R), dtype=c128); V_q = wsc(V_q, P('x','y'))
-    for i in range(n_chunks):                                            # ngkmax // g_chunk
-        L_chunk = dynamic_slice(zeta_L, i·g_chunk, g_chunk, axis=-1)     # (μ_L/p_x, g_chunk)
-        R_chunk = dynamic_slice(zeta_R, i·g_chunk, g_chunk, axis=-1)     # (μ_R/p_y, g_chunk)
-        v_chunk = dynamic_slice(v_q,    i·g_chunk, g_chunk, axis=0)      # (g_chunk,) replicated
-        L_w     = conj(L_chunk) * v_chunk[None, :]
-        V_q     = V_q + L_w @ R_chunk.T
-
-    V_new = dynamic_update_slice(V_acc, V_q[None, :, :], (q_idx, 0, 0))
-    if write_g0:
-        g0_q = zeta_L[:, 0]                                              # ζ̃[μ, G=0] from sphere convention
-        g0_new = dynamic_update_slice(g0_acc, g0_q[None, :], (q_idx, 0))
-```
-
-#### Shardings
-
-| Array | Shape | Spec | Notes |
-|---|---|---|---|
-| `zeta_L_q` (post-read) | `(1, n_rmu_L, ngkmax)` | `P(None, ('x','y'), None)` | disk → device, μ-flat |
-| `zeta_L` (post-reshard) | `(n_rmu_L, ngkmax)` | `P('x', None)` | left leg of einsum |
-| `zeta_R` (post-reshard) | `(n_rmu_R, ngkmax)` | `P('y', None)` | right leg |
-| `v_q` per-q row | `(ngkmax,)` | `P(None)` | replicated per rank |
-| `V_q` (per-q tile) | `(n_rmu_L, n_rmu_R)` | `P('x', 'y')` | μ × ν tile |
-| `V_acc` | `(n_q_ibz, n_rmu_L, n_rmu_R)` | `P(None, 'x', 'y')` | persistent, donated |
-| `g0_acc` (CC only) | `(n_q_ibz, n_rmu_L)` | `P(None, 'x')` | persistent, donated |
-
-The two `with_sharding_constraint` calls on `zeta_L_q`, `zeta_R_q` move
-each ζ-slab from the disk-read sharding to the einsum-natural single-axis
-sharding. XLA emits an "Involuntary full rematerialization" warning on
-this reshard (`gflat_e2e_bispinor_mos2_3x3_2026-05-11 §"XLA SPMD"`); the
-cost is `ngkmax · n_rmu · 16 B` per q, dwarfed by the kernel.
-
-#### G-chunk parameter
-
-`g_chunk` (G-axis chunk size inside the inner kernel):
-* Default: `_pick_g_chunk(ngkmax, target=4096)` = largest divisor of
-  `ngkmax` that is ≤ 4096 (`v_q_g_flat.py:202-207`).
-* Constraint: `ngkmax % g_chunk == 0` (`:325`).
-* `n_chunks = ngkmax / g_chunk` is small (1 for MoS2 3×3 `ngkmax=1963`;
-  ~14 for CrI3 6×6 80 Ry `ngkmax ≈ 55k`).
-
-#### Async prefetch
-
-Documented but **opt-out** in production: `LORRAX_V_Q_G_FLAT_ASYNC_PREFETCH=1`
-enables a worker thread that reads `ζ̃_{q+1}` while compute thread
-contracts ζ̃_q. Deadlocks against the NCCL collective in the kernel under
-heavy mesh contention (see CHANGELOG 2026-05-11 "G-flat shakedown"). The
-sync per-q loop is already ~6× faster than the legacy μ × ν tile driver,
-so the prefetch optimization is shelved.
-
-### 11.8 V_q^{μ_L,ν_L} sectorization (Lorentz)
-
-#### Bare 4×4 photon propagator in Coulomb gauge
-
-`v_q_bispinor.py:9-14`. Coulomb gauge makes the bare-photon propagator
-**block-diagonal** in Lorentz indices:
-
-$$D^{\mu_L \nu_L}(K) = \begin{pmatrix} v(K) & 0 \\ 0 & v(K)\,t^{ij}(K) \end{pmatrix},\qquad t^{ij}(K) = \delta^{ij} - \hat K_i \hat K_j,\;\hat K = K / |K|.$$
-
-so out of the 16 = 4×4 blocks, 6 vanish identically by gauge.
-
-#### Block-by-block weight `t^{μ_L,ν_L}`
-
-`v_q_bispinor.py:127-174` (`_make_v_per_G_for_tile`):
-
-| Count | Sector | `same_zeta` | `t^{μ_L,ν_L}(K)` | Dataset |
-|---:|---|---|---|---|
-| 6 | (0,i), (i,0)    | — (not computed) | 0 | gauge-zero |
-| 1 | (0,0) CC        | True (n_rmu_C, n_rmu_C) | 1 (BGW v(q+G) overlay applies) | `V_qmunu_CC` |
-| 3 | (i,i) TT-diag   | True (n_rmu_T, n_rmu_T) | `1 − K̂_i²` | `V_qmunu_TT_ii` |
-| 3 | (i<j) TT-off    | False (n_rmu_T, n_rmu_T; same centroids, distinct ζ files) | `−K̂_iK̂_j` | `V_qmunu_TT_ij` |
-| 3 | (i>j) TT-Herm   | — (read as `conj(swap(V[i<j], μ,ν))`) | (Hermitian-redundant) | not stored |
-
-`UNIQUE_TILES` (`v_q_bispinor.py:57-61`) enumerates the 7 unique kernel
-calls; `HERMITIAN_PAIRS` (`:70-74`) maps `(j,i) → (i,j)` for the reader.
-The CC tile is the only one that materialises a `g0_acc` head term;
-transverse heads are killed by the projector at q=0, G=0 (axial limit).
-
-#### Per-tile `v_per_G_fn` closure
-
-`v_q_bispinor.py:161-172`:
-
-```python
-def v_per_G_fn(qvec_np_batch):
-    qvec_arr = jnp.asarray(qvec_np_batch, dtype=jnp.float64)
-    v        = base_v_per_G_fn(qvec_arr)                  # (Q, n_G_sph) c128
-    K_cart   = K_cart_batch_fn(qvec_arr)                  # (Q, n_G_sph, 3) f64
-    K2       = jnp.sum(K_cart * K_cart, axis=-1)
-    K2_safe  = jnp.where(K2 > eps_K2, K2, 1.0)            # guard q=0,G=0
-    Khat_ij  = K_cart[..., i] * K_cart[..., j] / K2_safe
-    t        = (1.0 - Khat_ij) if i == j else (-Khat_ij)
-    return v * t.astype(v.dtype)
-```
-
-Each tile bakes in its `(i, j)` indices at closure construction; the
-inner V_q kernel is `μ_L,ν_L`-agnostic and consumes `v_per_G_fn(q)` as
-an opaque `(Q, n_G_sph)` weight table.
-
-#### Identity reductions
-
-* **μ_L = ν_L = 0** (charge / CC tile): `t^{0,0} = 1`, the kernel is
-  byte-identical to the scalar charge-only V_q. The `gamma_L = gamma_R
-  = None` short-circuit in `c_q_from_pair`/`z_q_from_pair` means the
-  ζ-fit reduces to the historical spin-traced path (modulo the 16×
-  rank-5 carrier in the pair-density accumulator).
-* **α_FS → 0**: `ψ_S → 0`, so every γ̃^i contraction (off-block-diagonal
-  in L/S) vanishes. Σ^B → 0. The TT V_q^{i,j} tiles are nonzero but
-  multiply zero pair-density on the Σ side.
-
-### 11.9 IBZ → full BZ V_q unfold (post-loop)
-
-#### Bilinearity in ζ ⇒ no τ-phase
-
-Apply eq. 1 to both ζ-legs in the V_q definition (§11.7):
-
-```
-V_{Sq, π_s(μ), π_s(ν)} = Σ_{G_new} ζ̃*_{Sq, π_s(μ)}(G_new) v(Sq+G_new) t(Sq+G_new) ζ̃_{Sq, π_s(ν)}(G_new)
-                       = Σ_{G_new} [e^{-i(Sq+G_new)·τ} ζ̃_{q,μ}(S⁻¹G_new)]*
-                                    · v(Sq+G_new) · t(Sq+G_new)
-                                    · [e^{-i(Sq+G_new)·τ} ζ̃_{q,ν}(S⁻¹G_new)]
-                       = Σ_{G'}  ζ̃*_{q,μ}(G') · v(q+G') · t̃(q+G') · ζ̃_{q,ν}(G')        (rename G' = S⁻¹G_new)
-```
-
-τ-phases cancel `(+i)(−i)` exactly (V is bilinear in ζ). `v(q+G)` is
-rotation-invariant (depends only on `|K|²`); the survival of the
-transverse weight `t` under the change of variable depends on which
-tile we're in — see §11.9.2 vs §11.9.3.
-
-#### Scalar / CC and TT-diagonal: centroid double-permute only
-
-For these tiles the kernel weight `t(K)` is **rotation-invariant** in
-the scalar/CC sense:
-* CC: `t ≡ 1`.
-* TT-diagonal (i,i): `t(K) = 1 − K̂_i²` is **not** invariant under the
-  full point group when (i,i) is held fixed (a rotation about an axis
-  other than ı̂ mixes ı̂ with ĵ, k̂). The unfold for TT-diagonal is
-  therefore not the simple "pure centroid permute" case — it is a
-  **special case** of the off-diagonal unfold (§11.9.3) with i = j on
-  the rotated indices.
-
-For the scalar / CC tile (where `t ≡ 1`), eq. 3 holds without further
-restriction:
-
-$$\boxed{V_{q_{\mathrm{full}},\,\mu',\,\nu'} = V_{q_{\mathrm{irr}}[i(q_{\mathrm{full}})],\,\pi_{s(q_{\mathrm{full}})^{-1}}(\mu'),\,\pi_{s(q_{\mathrm{full}})^{-1}}(\nu')}}\qquad\text{(eq. 3)}$$
-
-Implementation: `v_q_tile.py::_unfold_v_q_ibz_to_full` (lines 1454-1559).
-Two `take_along_axis`'s on the (μ, ν) axes, `mode='promise_in_bounds'`
-(skips XLA's OOB bounds-check `select` which trips a `s32/s64` HLO
-verifier failure on shard_map+x64 — see commit 49b7f84 history).
-
-#### TT off-diagonal: Cartesian rotation on the (i,j) indices
-
-`v_q_tile.py::_unfold_v_q_ij_ibz_to_full` (lines 1562-…). Under sym
-op `R(S)` (the Cartesian rotation, **no** τ part — τ-phase already
-cancelled by bilinearity), the transverse projector transforms as a
-rank-2 Cartesian tensor:
-
-$$t^{ij}(R K) = R^{ia}(S)\,R^{jb}(S)\,t^{ab}(K).$$
-
-The bilinear V_q^{ij} therefore unfolds as
-
-$$\boxed{V_{Sq}^{ij}\!\big(\pi_S\mu,\,\pi_S\nu\big) = \sum_{a,b} R^{ia}(S)\,R^{jb}(S)\,V_q^{ab}(\mu,\,\nu)}\qquad\text{(eq. 4)}$$
-
-i.e. *Cartesian double-rotate* on the (i,j) outer indices **plus**
-centroid double-permute on (μ, ν). For TT-diagonal (i = j held fixed
-under R) the result is in general a **mixture** of the diagonal and
-off-diagonal IBZ tiles via `R^{ia} R^{ib} V^{ab}`; this is why the
-diagonal cannot in general be unfolded with the pure-permute identity
-of §11.9.2 unless the system has axis-aligned symmetries (point group
-generated by `σ_h ⊕ σ_v` etc.).
-
-**Implementation note**: in `gw.v_q_bispinor.compute_V_q_bispinor_g_flat_to_h5`
-the current code uses `_unfold_v_q_ibz_to_full` (the scalar / pure-permute
-unfold) for **every** tile including TT-diag and TT-off. This is
-correct only when the sym ops are axis-permuting on Cartesian
-coordinates (e.g. C_4 about ẑ for MoS2 3×3×1 — which the matched
-runs do satisfy by ntran-2 mirror only). For general symmetries
-(C_3v in MoS2, C_3 in CrI3) the polarization-mixing path
-`_unfold_v_q_ij_ibz_to_full` should be wired in — see §11.11 followups.
-
-#### R_cart materialisation
-
-`R_cart = sym.sym_matrices_cart` is built from the crystal-frame integer
-rotation `S = sym_matrices` by `R_cart = bvec.T @ S @ inv(bvec.T)` (or
-equivalently `R_cart = lattice^{-1} S lattice`, with the convention
-`R_cart`'s rows act on r-space cartesian column vectors). For
-non-orthogonal lattices (e.g. CrI3 hexagonal) `R_cart` is a true 3×3
-orthogonal matrix, not a permutation — this is the regime where
-§11.9.3's Cartesian mixing matters.
-
-`R_cart[s][:, :2]` for s = identity is `I_2`; for the C_3 generator
-about ẑ it is the 2-D rotation by 120° on (x, y) — fully entangling
-V_q^{11}, V_q^{12}, V_q^{22} on the unfold.
-
-### 11.10 Bispinor Σ glue (γ̃-fold into ψ)
-
-Out of scope for this section; see
-`reports/bispinor_theory_2026-05-09 §7` for the full Σ^B derivation
-and the γ̃-fold-into-ψ Hermitian identity that lets the unmodified
-scalar `sigma_sx_k(wfns_ij, G, V^{ij})` evaluate the bispinor bare-Breit
-matrix element. Brief recap:
-
-* **Σ^X^total** = Σ^X[CC] + Σ^B[Breit-9-tiles]:
-  * Σ^X[CC] reuses `cohsex_sigma.compute_cohsex_sigma(...,
-    compute_bare_x=True)` with V_q = V_qmunu_CC and the un-rewritten
-    bispinor wavefunctions (`cohsex_sigma.py:229-240`).
-  * Σ^B loops the 9 transverse `(i, j)` tiles
-    (`sigma_x_bispinor.py:189-205`); each iteration folds
-    `γ̃^i ψ_xn` and `γ̃^j ψ_yr` on the spin axis
-    (`_apply_gamma_left_to_xn`, `_apply_gamma_left_to_yr` at lines
-    62-88), reads V^{i,j}_q (with Hermitian-fill for i > j), and calls
-    the unmodified `sigma_sx_k(wfns_ij, Gij, V_ij)`.
-
-* **Identity-vertex regression**: replacing the (i,j) loop with a
-  single (0,0) call and γ̃=I_4 gives Σ^B byte-identical to the scalar
-  Σ_X (`BISPINOR_DHFB_DESIGN.md §7.1`).
-
-* **α_FS² scaling**: each (γ̃^i ψ_xn)_β is O(α_FS) entrywise (γ̃^i is
-  L↔S off-block-diagonal, ψ_S = O(α_FS) ψ_L), so Σ^B is O(α_FS²) — for
-  MoS2 valence (Σ_X[CC] ≈ −37 eV) the expected Σ^B per band is
-  ~−2 meV. CrI3 (heavy elements: Zα for Cr ≈ 0.18) scales to
-  ~−10 to −50 meV per band. See
-  `reports/bispinor_theory_2026-05-09 §10` for the current numerical
-  regression status.
-
-### 11.11 Open questions / followups
-
-1. **TT-diagonal and TT-offdiagonal unfold**: the current
-   `compute_V_q_bispinor_g_flat_to_h5` uses the scalar/pure-permute
-   `_unfold_v_q_ibz_to_full` for every tile. For general point groups
-   (C_3 in CrI3) the off-diagonal unfold needs
-   `_unfold_v_q_ij_ibz_to_full` (eq. 4 in §11.9.3) — currently
-   implemented but not wired into the bispinor orchestrator. The
-   TT-diagonal case is a special case of the same Cartesian-rotation
-   unfold and likewise needs to thread through.
-
-2. **Open-spin C_q^{i,i} definiteness**: §11.2 argues the open-spin Gram
-   is PSD by construction; the code dispatches all μ_L≠0 channels to
-   pivoted LU + ridge `1e-12 |tr|/n` "to be safe". A deterministic
-   check (eig(C_q^{1,1}) on MoS2 3×3) would settle whether the LU
-   branch is overcautious or whether there's a still-subtle indefinite
-   path. See `reports/bispinor_theory_2026-05-09 §4.5 / §12.1`.
-
-3. **CrI3 transverse residual blowup**: post LU+ridge, CrI3 Σ^B is
-   still ~10⁵× larger than the α_FS²·Σ_X[CC] expectation; the
-   2026-05-06 audit narrowed the cause to current-centroid ISDF basis
-   conditioning. Untested fixes: (a) rebuild current centroids from a
-   joint ρ_charge + W_curr weighting, (b) use the same centroid set
-   for all 4 channels.
-   `reports/bispinor_theory_2026-05-09 §10.4 / §12.3`.
-
-4. **Disk-read sharding**: the bispinor V_q kernel emits 8 "Involuntary
-   full rematerialization" SPMD warnings per tile-compile when the
-   disk-read shape (`devices=[P,1,1]`) lands at the kernel's preferred
-   `P(('x','y'), None)`. Functionally correct; performance loss is
-   ~20 MB / q / rank. Followup: have `ZetaReader.read_zeta_G_slab`
-   expose a `P(('x','y'), None)`-direct read variant.
-
-5. **G-flat accumulator under `band_chunk_size = 4` (CrI3 6×6 80 Ry)**:
-   the per-rank `n_rtot · 16 B` FFT-box transient is independent of
-   r_chunk, but XLA materialises the band-chunk FFT box unsharded in
-   `to_rmu` (`load_wfns.py:657` "16× safety margin"). Real fix is a
-   `with_sharding_constraint(box, P(None, ('x','y'), None, None, None, None))`
-   inside the per-bc FFT path; not yet wired. Documented in
-   `reports/zeta_v_q_g_flat_reference_2026-05-12 §10` (CrI3 validation
-   log).
-
-### 11.12 File pointers
-
-#### Source
-
-| File | Symbol | What |
-|---|---|---|
-| `src/common/isdf_fitting.py:82-148` | `pair_density`, `accum_pair_density` | rank-5 open-spin P_k,αβ(μ, col) |
-| `src/common/isdf_fitting.py:168-279` | `c_q_from_pair` | CCT with optional γ̃ insertions |
-| `src/common/isdf_fitting.py:373-…`   | `z_q_from_pair` | ZCT on (μ, r-chunk) with optional γ̃ |
-| `src/common/isdf_fitting.py:282-370` | `gram_q0_from_pair` | q=0 valence-conduction Gram for centroid selection |
-| `src/common/isdf_fitting.py:921-1103`| `compute_L_q_from_CCT` | Cholesky (μ_L=0) / passthrough (μ_L≠0) |
-| `src/common/isdf_fitting.py:1110-1230` | `solve_zeta_from_L_q` | per-q triangular solve (Cholesky) / `jnp.linalg.solve` (LU) |
-| `src/common/isdf_fitting.py:1480-…`  | `fit_zeta_to_h5` | top-level driver, r-chunk loop, G-flat accumulator |
-| `src/common/wfn_transforms.py:439-626` | `accumulate_rchunk_to_gflat` | r-chunk → G-sphere FFT-and-accumulate |
-| `src/common/wfn_transforms.py:649-686` | `apply_bloch_phase` | separable `exp(±2πi k·r)` |
-| `src/common/wfn_transforms.py:689-…`   | `apply_bloch_phase_on_slice` | same on a flat-r slab |
-| `src/common/gamma_matrices.py:18-87` | γ̃^μ tables, `gammas_perm`, `gammas_phase` |
-| `src/common/gamma_matrices.py:90-99` | `gamma_perm_phase(μ_L)` | (perm, phase) accessor |
-| `src/common/gamma_matrices.py:128-164` | `gamma_double_contract` | γ̃·γ̃ rank-5 → rank-3 reduction |
-| `src/common/bispinor_init.py:12-41`  | `get_small_psi_component` | ψ_S kinetic-balance lift |
-| `src/common/coulomb_sphere.py:120-247` | `compute_per_q_bare_coulomb_components` | per-q `(q+G)` sphere + sentinel pad |
-| `src/gw/v_q_g_flat.py:55-140`        | `_make_per_q_kernel` | G-chunked per-q V_q GEMM |
-| `src/gw/v_q_g_flat.py:148-199`       | `_resolve_ibz_q_list` | IBZ list + centroid orbit closure |
-| `src/gw/v_q_g_flat.py:247-408`       | `_compute_V_q_g_flat_one_tile` | per-tile end-to-end (read + kernel loop + unfold) |
-| `src/gw/v_q_g_flat.py:415-…`         | `compute_all_V_q_g_flat` | charge-channel public entry point |
-| `src/gw/v_q_bispinor.py:57-74`       | `UNIQUE_TILES`, `ZERO_TILES`, `HERMITIAN_PAIRS` |
-| `src/gw/v_q_bispinor.py:127-174`     | `_make_v_per_G_for_tile` | per-tile `v(K)·t^{i,j}(K)` closure |
-| `src/gw/v_q_bispinor.py:482-…`       | `compute_V_q_bispinor_g_flat_to_h5` | bispinor orchestrator |
-| `src/gw/v_q_bispinor.py:660-…`       | `BispinorVqReader` | tile reader (gauge-zero, Hermitian-redundant) |
-| `src/gw/v_q_tile.py:1454-1559`       | `_unfold_v_q_ibz_to_full` | scalar / pure centroid double-permute |
-| `src/gw/v_q_tile.py:1562-…`          | `_unfold_v_q_ij_ibz_to_full` | TT off-diagonal: + Cartesian R_iaR_jb mixing |
-| `src/gw/v_q_tile.py:1671-…`          | `_unfold_g0_ibz_to_full` | g0 head unfold |
-| `src/file_io/zeta_reader.py`         | `ZetaReader` | G-flat on-disk reader, per-q slab |
-| `src/file_io/slab_io.py`             | `SlabIO` | phdf5 writer with `valid_shape=` μ-pad clip |
-| `src/gw/sigma_x_bispinor.py:62-111`  | `_apply_gamma_left_to_xn`, `_apply_gamma_left_to_yr` | γ̃-fold into ψ |
-| `src/gw/sigma_x_bispinor.py:114-210` | `compute_sigma_x_bispinor` | 9-tile Σ^B orchestrator |
-
-#### Cross-refs
-
-| Doc | Focus |
-|---|---|
-| §3–5 above | Historical r-space ζ-on-disk + spin-traced rank-3 narrative |
-| §7 above | Sharding map (scalar / static-Σ shardings) |
-| [`MEMORY_MODEL.md`](MEMORY_MODEL.md) | Per-stage memory formulas (current memory model is stale w.r.t. G-flat refactor) |
-| `reports/zeta_v_q_g_flat_reference_2026-05-12/report.md` | Living engineering reference (donations, shardings, chunker envs, CrI3 validation log) |
-| `reports/bispinor_theory_2026-05-09/report.md` | Bispinor canonical math reference (conventions, Σ^B, definiteness analysis, numerical regime) |
-| `reports/zeta_ibz_2026-05-11/report.md` | IBZ-only ζ-on-disk schema design + symmetry derivations (eq. 1 + eq. 3 of §11.6 / §11.9) |
-| `reports/v_q_bispinor_plan_2026-05-08/report.md` | Lorentz tile sectorization + V_q_bispinor container layout |
-| `reports/bispinor_pipeline_2026-05-04/report.md` | MoS2 / CrI3 reference traces; LU branch milestone |
-| `reports/gflat_e2e_bispinor_mos2_3x3_2026-05-11/report.md` | First G-flat end-to-end bispinor; 21× disk-size win |
-
-### 11.13 Quick reference (bispinor / G-flat)
+## 11. Bispinor-aware G-flat pipeline (pointer)
+
+> **Note (2026-05-15).** The detailed algorithms, shardings, donations,
+> communication patterns, and code references that previously occupied
+> §11.1 – §11.12 have been **moved** out of this file. Maintaining the
+> single rank-5 open-spin pair density, the scan-INSIDE-shard_map
+> r-chunk loop, the G-flat on-disk ζ̃ layout, the per-q G-chunked V_q
+> kernel, the IBZ cascade, and the bispinor Lorentz-tile sectorization
+> in three separate documents proved redundant — the new layout is:
+>
+> | Topic | Document |
+> |---|---|
+> | Pair-density rank-5 construction, CCT/ZCT/Gram on the full BZ, L_q solve dispatch (Cholesky vs pivoted-LU + ridge), r-chunk loop, G-flat accumulator, per-q V_q kernel with G-chunking, async-prefetch status, bispinor tile sectorization, end-to-end shardings and donations | [`ZETA_V_Q_ALGORITHMS.md`](ZETA_V_Q_ALGORITHMS.md) |
+> | BGW `mtrx`/τ conventions, `SymMaps` and the TRS-augmented index table, `unfold_psi`, `compute_centroid_sym_perm` and the L-wrap, `unfold_v_q` (scalar / pure-permute and TT off-diagonal Cartesian mixing), symmorphic failure modes, sym-vs-nosym recipe, verified gates | [`SYMMETRY_COMPREHENSIVE.md`](SYMMETRY_COMPREHENSIVE.md) |
+> | Per-stage HBM footprints, G-flat planner (`plan_gflat_chunks`), heuristic legacy chooser, AOT NNLS chooser, binding-peak diagnostics, accumulator-FFT-box transient | [`MEMORY_MODEL.md`](MEMORY_MODEL.md) |
+>
+> §3–5 above remain the conceptual / scalar / r-space narrative; §7
+> remains the sharding map (static-Σ pipeline); §8 remains the file
+> table. The bispinor canonical math reference (γ̃-matrix conventions,
+> kinetic-balance lift, Σ^B derivation, open-spin definiteness analysis,
+> α_FS² scaling, CrI3 residual status) lives in
+> `reports/bispinor_theory_2026-05-09/report.md`.
+
+### 11.1 Summary (1-paragraph context)
+
+The bispinor-aware G-flat pipeline replaces the historical r-space
+ζ-on-disk path of §3–5 with: (i) a **single rank-5 open-spin pair
+density** `P_{k,αβ}(μ, col) = Σ_n ψ*_{n,k,α}(r_μ) ψ_{n,k,β}(r_col)`
+that handles the charge channel (μ_L=0 via γ̃=I short-circuit) and the
+three transverse channels (μ_L∈{1,2,3} via γ̃·γ̃ post-IFFT reduction)
+through one code path, (ii) a **scan-INSIDE-shard_map r-chunk loop**
+that streams ψ(G) from a host cache via `io_callback`, evaluates ζ on
+each r-slab, multiplies by the per-q Bloch phase, FFTs once, and
+accumulates the per-q `(q+G)`-sphere gather into a μ-sharded
+`gflat_acc`; (iii) **G-flat on-disk** layout `ζ̃_{q,μ}(K=q+G)` with the
+on-disk q-axis restricted to the **IBZ** subset (factor ~`ntran`
+reduction) when centroid orbits are closed under the space group; (iv)
+a **per-q G-chunked V_q kernel** that contracts
+`V_q^{μ_L ν_L}[μ,ν] = Σ_G ζ̃_L*(q,μ,G) v(q+G) t^{μ_L ν_L}(q+G) ζ̃_R(q,ν,G)`
+for the **seven unique** bispinor `(μ_L, ν_L)` tiles (CC + TT-diag-3 +
+TT-off-3); and (v) a **post-loop IBZ → full BZ unfold** that is a pure
+centroid double-permute for CC and a centroid double-permute composed
+with Cartesian double-rotation `R^{ia}(S) R^{jb}(S)` on the (i,j)
+Lorentz indices for TT-off. The 21× combined disk-size reduction
+(r → G-sphere ≈ 2×, full-BZ → IBZ q-axis up to `ntran`) lands all of
+MoS2 3×3 / CrI3 3×3 / CrI3 6×6 80 Ry on within-budget zeta caches.
+The full math, sharding, donation, and code-pointer detail is in
+[`ZETA_V_Q_ALGORITHMS.md`](ZETA_V_Q_ALGORITHMS.md); the ζ/V_q
+symmetry transformation derivations and unfold implementation choices
+are in [`SYMMETRY_COMPREHENSIVE.md`](SYMMETRY_COMPREHENSIVE.md).
+
+### 11.2 Quick reference (bispinor / G-flat)
 
 | Quantity | Formula |
 |---|---|
@@ -1734,6 +941,13 @@ matrix element. Brief recap:
 | V_q transverse weight | `t^{ij}(K) = δ^{ij} − K̂_i K̂_j` |
 | V_q scalar unfold (eq. 3) | `V_full[q,μ',ν'] = V_irr[i(q), π_{s(q)}⁻¹(μ'), π_{s(q)}⁻¹(ν')]` |
 | V_q TT-off unfold (eq. 4) | `V_{Sq}^{ij}(π_S μ, π_S ν) = Σ_{ab} R^{ia}(S) R^{jb}(S) V_q^{ab}(μ,ν)` |
+
+See [`ZETA_V_Q_ALGORITHMS.md`](ZETA_V_Q_ALGORITHMS.md) for the
+derivations behind each line, the source-of-truth `file.py:line`
+citations, and the per-array sharding specs; see
+[`SYMMETRY_COMPREHENSIVE.md`](SYMMETRY_COMPREHENSIVE.md) for the BGW
+`mtrx`/τ conventions that fix the meaning of `π_s`, `R(S)`, and the
+TRS-augmented index used by `unfold_v_q`.
 
 ---
 
