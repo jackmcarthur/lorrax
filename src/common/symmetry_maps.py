@@ -315,10 +315,40 @@ def unfold_v_q(
     L_j = jnp.asarray(L_arr)
     q_irr_j = jnp.asarray(np.asarray(q_irr_frac, dtype=np.float64))
 
+    # Tables are passed to the cached jit as runtime args (not closure
+    # captures) so the SAME compiled module serves every q-axis tensor
+    # of matching shape + sharding — V_q and W_q reuse one HLO instead
+    # of paying separate compile costs.
+    n_q_full = int(idx_j.shape[0])
+    fn = _get_unfold_v_q_jit(
+        V_q_shape=tuple(int(s) for s in V_q_ibz.shape),
+        n_q_full=n_q_full,
+        mesh_xy=mesh_xy)
+    return fn(V_q_ibz, fwd_perm_j, idx_j, sym_j, L_j, q_irr_j, trs_mask_j)
+
+
+_UNFOLD_V_Q_JIT_CACHE: dict = {}
+
+
+def _get_unfold_v_q_jit(*, V_q_shape, n_q_full, mesh_xy):
+    """Cache the inner ``_do_unfold`` jit by signature.
+
+    V_q and W_q share the same (n_q_full, n_rmu, n_rmu) shape and
+    canonical ``P(None, 'x', 'y')`` sharding — the compiled HLO is
+    identical, so we want one cache entry serving both call sites.
+    The closure-captured-tables form ``unfold_v_q`` used previously
+    minted a fresh jit on every call (different closure object
+    identity → cache miss → ~200 ms compile per call).
+    """
+    key = (V_q_shape, int(n_q_full), id(mesh_xy))
+    hit = _UNFOLD_V_Q_JIT_CACHE.get(key)
+    if hit is not None:
+        return hit
+
     V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
     @partial(jax.jit, out_shardings=V_sh)
-    def _do_unfold(V_ibz):
+    def _do_unfold(V_ibz, fwd_perm_j, idx_j, sym_j, L_j, q_irr_j, trs_mask_j):
         perm_q = fwd_perm_j[sym_j]                          # (n_q_full, n_rmu)
         V_at_irr = V_ibz[idx_j]                              # (n_q_full, μ, μ)
         # ``promise_in_bounds`` skips the OOB-fill branch that under
@@ -349,7 +379,8 @@ def unfold_v_q(
             trs_mask_j[:, None, None], jnp.conj(V_full), V_full)
         return V_full
 
-    return _do_unfold(V_q_ibz)
+    _UNFOLD_V_Q_JIT_CACHE[key] = _do_unfold
+    return _do_unfold
 
 
 # i·σ_y (time-reversal spinor factor in the SOC convention T = iσ_y K).
