@@ -632,8 +632,9 @@ under the WFN sym group `{S | τ}`. The closure check is
 
 When the cascade fires:
 
-* `n_q_disk = n_q_irr` (e.g. 8 for CrI3 6×6×1 with `ntran=12`; 2 for
-  MoS2 3×3 with `ntran=8`; 1 for Si 4×4×4 with full Oh).
+* `n_q_disk = n_q_irr` (e.g. 8 for CrI3 6×6×1 with `ntran=6`
+  spatial / 12 TRS-augmented; 2 for MoS2 3×3 with `ntran=8`; 8 for
+  Si 4×4×4 with `ntran=48`).
 * `zeta_q_G.h5` contains only the IBZ q's.
 * V_q is computed at the IBZ q's only.
 * `unfold_v_q` (post-loop) rotates each IBZ V_q row into all full-BZ
@@ -962,7 +963,7 @@ microseconds per call.
 
 `reports/gflat_e2e_bispinor_mos2_3x3_2026-05-11 §3-4`. WFN load +
 centroids 2.1 s; CCT 1.4 s; Cholesky 3.6 s; r-chunk loop (4 chunks)
-7.5 s; ζ write 1.2 s; V_q charge loop 1.8 s (9 IBZ × ~200 ms);
+7.5 s; ζ write 1.2 s; V_q charge loop 1.8 s (2 IBZ × ~0.9 s);
 unfold 0.4 s. Per-rank peak ~12.8 GB on 80 GB A100.
 
 ### 11.9.3 CrI3 6×6 30 Ry — q-loop dominates

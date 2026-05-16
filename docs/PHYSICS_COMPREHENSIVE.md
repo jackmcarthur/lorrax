@@ -939,8 +939,8 @@ are in [`SYMMETRY_COMPREHENSIVE.md`](SYMMETRY_COMPREHENSIVE.md).
 | ζ sym transform (eq. 1) | `ζ̃_{Sq, π_s(μ)}(SG) = e^{-i(Sq+SG)·τ} ζ̃_{q,μ}(G)` |
 | V_q (G-chunked) | `V_q^{μ_L ν_L}[μ,ν] = Σ_G conj(ζ̃_L^{μ_L}(q,μ,G)) v(q+G) t^{μ_L ν_L}(q+G) ζ̃_R^{ν_L}(q,ν,G)` |
 | V_q transverse weight | `t^{ij}(K) = δ^{ij} − K̂_i K̂_j` |
-| V_q scalar unfold (eq. 3) | `V_full[q,μ',ν'] = V_irr[i(q), π_{s(q)}⁻¹(μ'), π_{s(q)}⁻¹(ν')]` |
-| V_q TT-off unfold (eq. 4) | `V_{Sq}^{ij}(π_S μ, π_S ν) = Σ_{ab} R^{ia}(S) R^{jb}(S) V_q^{ab}(μ,ν)` |
+| V_q scalar unfold (charge) | `V_full[q,μ',ν'] = exp(2π i q_irr·(L_{s,μ'}−L_{s,ν'})) · V_irr[i(q), α_s(μ'), α_s(ν')]` with `α = sym_perm`, `L = L_table` (forward source-map; user-spec inverse form). |
+| V_q TT-off unfold (transverse, R_cart mixing) | `V_{Sq}^{ij}(α_s μ, α_s ν) = exp(2π i q_irr·(L_{s,μ}−L_{s,ν})) · Σ_{ab} R^{ia}(S) R^{jb}(S) V_q^{ab}(μ,ν)` |
 
 See [`ZETA_V_Q_ALGORITHMS.md`](ZETA_V_Q_ALGORITHMS.md) for the
 derivations behind each line, the source-of-truth `file.py:line`

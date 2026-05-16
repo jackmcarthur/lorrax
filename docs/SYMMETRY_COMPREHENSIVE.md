@@ -443,7 +443,7 @@ q_full_to_irr_sym = sym.sym_idx_q                # (n_q_full,)
 
 When `compute_centroid_sym_perm` succeeds, the cascade activates: $V_q$ is computed at only the IBZ q's (count $n_q^\text{ibz} \approx n_q^\text{full} / n_\text{tran}$) and then unfolded. When it fails (orbit-closure `RuntimeError`), `use_ibz=False` and $V_q$ is computed at every full-BZ q directly. The override `LORRAX_FORCE_FULL_BZ=1` forces the fallback for debugging.
 
-The IBZ cascade landed on 2026-05-11 (`project_lorrax_ibz_cascade.md`): generate centroids with orbit closure on, and V_q work collapses from $n_q^\text{full}$ to $n_q^\text{ibz}$ (~$n_\text{tran}$× reduction). CrI3 6×6: 36 → 7. MoS2 3×3: 9 → 2. Si 4×4×4: 64 → 8.
+The IBZ cascade landed on 2026-05-11 (`project_lorrax_ibz_cascade.md`): generate centroids with orbit closure on, and V_q work collapses from $n_q^\text{full}$ to $n_q^\text{ibz}$ (~$n_\text{tran}$× reduction). CrI3 6×6: 36 → 8. MoS2 3×3: 9 → 2. Si 4×4×4: 64 → 8.
 
 ---
 

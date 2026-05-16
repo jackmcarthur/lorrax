@@ -120,16 +120,19 @@ def unfold_v_q(
 ):
     """Expand ``V_q_ibz`` over the IBZ to the full BZ.
 
-    The mapping is a centroid-axis double-permute under {S | τ} PLUS a
-    per-centroid umklapp phase from the real-space lattice wrap:
+    The mapping is a centroid-axis double-gather (using the **source-map**
+    ``α(μ) = sym_perm[s, μ]`` returned by ``compute_centroid_sym_perm``)
+    plus a per-centroid umklapp phase from the real-space lattice wrap:
 
-        V_full[q, μ', ν'] = exp(2π i q_irr · (L_μ' − L_ν'))
-                            · V_ibz[i(q), π_{s(q)}^{-1}(μ'), π_{s(q)}^{-1}(ν')]
+        V_full[q, μ', ν'] = exp(2π i q_irr · (L_{s,μ'} − L_{s,ν'}))
+                            · V_ibz[i(q), α_{s}(μ'), α_{s}(ν')]
 
-    where ``i(q) = irr_idx[q]``, ``s(q) = sym_idx[q]``, ``q_irr =
-    q_irr_frac[i(q)]`` is the IBZ parent q in fractional reciprocal
-    coords, and ``L_μ = L_table[s, π_s⁻¹(μ)]`` is the integer
-    real-space lattice wrap captured by ``compute_centroid_sym_perm``.
+    where ``i(q) = irr_idx[q]``, ``s(q) = sym_idx[q]``,
+    ``q_irr = q_irr_frac[i(q)]`` is the IBZ parent q in fractional
+    reciprocal coords, and ``α_s(μ) = sym_perm[s, μ]``,
+    ``L_{s,μ} = L_table[s, μ]`` come from the source-map decomposition
+    ``y_μ = mtrx · (x_μ − τ) = x_{α(μ)} + L_μ`` (the user-spec inverse
+    form; see ``docs/SYMMETRY_COMPREHENSIVE.md`` §4 and §5).
 
     The phase factor is essential whenever ``S r_μ + τ`` exits the
     unit cell (i.e. ``L_μ ≠ 0``) — which happens for every non-trivial
