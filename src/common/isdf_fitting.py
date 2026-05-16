@@ -1519,6 +1519,57 @@ def _make_fit_one_rchunk_kernel(
     else:
         q_irr_idx_j = None
 
+    # ψ enters at PADDED n_rmu.  All in-memory arrays here operate at
+    # PADDED extent so the inner shard_map boundaries see divisible
+    # shapes (n_rmu_padded ≡ ∏ p_a).  The Cholesky factor L_q is at
+    # PADDED extent too (factor_c_q embeds the logical-extent factor
+    # with identity in the pad block); the back-solve produces zeta
+    # with zero pad rows, logical block byte-identical to a logical-
+    # only solve.  zeta is returned at padded extent; the SlabIO write
+    # uses valid_shape=meta.n_rmu so on-disk extent stays logical.
+
+    def z_q_phase(
+        psi_l_rmuT_X_fit, psi_r_rmuT_X_fit,
+        norms_l, norms_r, r_start_dyn, gamma_perm, gamma_phase,
+    ):
+        # Pre-multiply by 1/norms so the pair-density einsum sees the
+        # norm-scaled input without a per-bc divide inside the scan
+        # (algebraically identical: einsum is linear in psi_X·psi_Y).
+        psi_l_X_scaled = psi_l_rmuT_X_fit / norms_l[None, None, :, None]
+        psi_r_X_scaled = psi_r_rmuT_X_fit / norms_r[None, None, :, None]
+        gamma_mu = None if is_charge else (gamma_perm, gamma_phase)
+        # Round 6 streaming pair density + IFFT + γ̃·γ̃ + FFT — single
+        # shard_map; io_callback pulls per-bc ψ(G) from the host store
+        # inside the lax.scan body.  Output Z_q at FULL-BZ q-shape.
+        return z_q_from_psi_sm(
+            psi_l_X_scaled, psi_r_X_scaled, psi_G_store,
+            band_chunk_ranges=band_chunk_ranges,
+            band_range_left=band_range_left,
+            band_range_right=band_range_right,
+            r_start_dyn=r_start_dyn,
+            r_chunk_size=actual_n_rchunk,
+            gamma_L=gamma_mu,
+            gamma_R=gamma_mu,
+            kgrid=kgrid,
+            mesh_xy=mesh_xy,
+        )
+
+    def solve_phase(Z_q, L_q, cct_trace_per_q):
+        # IBZ-only solve (Phase B): L_q + cct_trace come in PRE-SLICED
+        # at IBZ rows (via ``symmetry_maps.slice_q_full_to_ibz``
+        # upstream in ``fit_zeta_to_h5``).  Z_q is built at full BZ by
+        # ``z_q_phase``, so it gets the IBZ slice here.  When
+        # ``q_irr_full_idx`` is None (write_ibz_only=False), all three
+        # arrays are full-BZ and the solve runs as before.
+        if q_irr_idx_j is not None:
+            Z_q_for_solve = Z_q[q_irr_idx_j]
+        else:
+            Z_q_for_solve = Z_q
+        return solve_zeta(
+            L_q, Z_q_for_solve, mesh_xy, q_chunk_size,
+            solver_kind=solver_kind,
+            cct_trace_per_q=cct_trace_per_q)
+
     @jax.jit
     def _kernel(
         psi_l_rmuT_X_fit,
@@ -1531,91 +1582,19 @@ def _make_fit_one_rchunk_kernel(
         gamma_phase,
         cct_trace_per_q,
     ):
-        # ψ enters at PADDED n_rmu (load_centroids_band_chunked output,
-        # Phase 3a).  All in-memory arrays here — P_l, P_r, ψ_L_bc,
-        # ψ_R_bc, Z_q — operate at PADDED extent so the inner
-        # ``accumulate_pair_density_*`` / ``compute_ZCT`` /
-        # ``solve_zeta`` jits' committed
-        # ``in_shardings=P(None, 'x', 'y')`` boundaries see divisible
-        # shapes (n_rmu_padded ≡ ∏ p_a is divisible by every relevant
-        # mesh axis).  The Cholesky factor L_q comes in at the same
-        # PADDED extent — ``factor_c_q`` runs the chol on
-        # the LOGICAL block and embeds the factor into a padded matrix
-        # with identity in the pad block (see ``_embed_logical_in_padded``);
-        # the back-solve produces zeta with zero in pad rows, logical
-        # block byte-identical to a pure-logical solve.  zeta is
-        # returned at padded extent; the SlabIO write uses
-        # ``valid_shape=meta.n_rmu`` so on-disk extent stays logical.
+        # Composed (z_q ∘ solve) under one ``@jax.jit`` — preserved for
+        # the AOT memory model path which lowers a single callable.
+        # Production ``fit_one_rchunk`` calls ``z_q_phase`` and
+        # ``solve_phase`` directly with ``timing.section`` between, so
+        # the per-r-chunk breakdown is host-visible.
+        Z_q = z_q_phase(
+            psi_l_rmuT_X_fit, psi_r_rmuT_X_fit,
+            norms_l, norms_r, r_start_dyn, gamma_perm, gamma_phase)
+        return solve_phase(Z_q, L_q, cct_trace_per_q)
 
-        # --- Streaming pair density + IFFT + γ̃·γ̃ + FFT, all in one
-        # shard_map.  Round 6: ``z_q_from_psi_sm`` now pulls each bc
-        # from the host store via ``io_callback`` inside its
-        # ``lax.scan`` body, IFFTs locally, all-gathers the band axis,
-        # masks L/R per-bc, and einsums into rank-5 carries —
-        # eliminating the materialised ``psi_Y_full`` (the 30-GiB
-        # double-remat from Round 4's HLO read) and the boundary
-        # remat between the helper and the consumer.  γ̃^μ_L applied
-        # on BOTH P-sides at the post-IFFT contraction step (γ̃·γ̃
-        # reduce); charge channel passes ``gamma_mu=None`` for the
-        # identity short-circuit.
-        # Pre-multiply the L / R centroid copies by 1 / norms so the
-        # pair-density einsum sees the band-norm-scaled input without
-        # needing a per-bc divide inside the scan (algebraically
-        # identical: einsum is linear in psi_X · psi_Y, so dividing
-        # psi_X by norms gives the same scaled pair density as the
-        # original ψ_Y / norms; saves one band-axis broadcast per
-        # iter).
-        psi_l_X_scaled = psi_l_rmuT_X_fit / norms_l[None, None, :, None]
-        psi_r_X_scaled = psi_r_rmuT_X_fit / norms_r[None, None, :, None]
-        gamma_mu = None if is_charge else (gamma_perm, gamma_phase)
-        Z_q = z_q_from_psi_sm(
-            psi_l_X_scaled, psi_r_X_scaled, psi_G_store,
-            band_chunk_ranges=band_chunk_ranges,
-            band_range_left=band_range_left,
-            band_range_right=band_range_right,
-            r_start_dyn=r_start_dyn,
-            r_chunk_size=actual_n_rchunk,
-            gamma_L=gamma_mu,
-            gamma_R=gamma_mu,
-            kgrid=kgrid,
-            mesh_xy=mesh_xy,
-        )
-        # IBZ-only solve (Phase B of PLAN_zeta_g_flat_migration.md):
-        # the FFT-built C_q and Z_q are naturally full-BZ, but the
-        # triangular solve has no inter-q coupling, so we gather IBZ
-        # rows of L_q and Z_q here and solve only those.  Output
-        # ``zeta`` is (n_q_ibz, n_rmu, n_rchunk) — caller writes it
-        # directly with no post-solve slice.
-        #
-        # When ``q_irr_full_idx`` is None (write_ibz_only=False
-        # codepath; centroid orbit closure failed) the gather is a
-        # no-op identity and the full-BZ solve runs as before.
-        # When set, L_q and cct_trace_per_q come in PRE-SLICED at IBZ
-        # rows (via ``symmetry_maps.slice_q_full_to_ibz`` upstream in
-        # ``fit_zeta_to_h5``) so Cholesky / LU only factored the IBZ
-        # blocks; only Z_q still needs the IBZ slice here since it's
-        # built at full BZ by the in-kernel scan.
-        if q_irr_idx_j is not None:
-            L_q_for_solve = L_q
-            Z_q_for_solve = Z_q[q_irr_idx_j]
-            cct_trace_for_solve = cct_trace_per_q
-        else:
-            L_q_for_solve = L_q
-            Z_q_for_solve = Z_q
-            cct_trace_for_solve = cct_trace_per_q
-        # ``solver_kind`` is resolved upstream (sharded_cholesky /
-        # cusolvermp_cholesky for charge; lu / cusolvermp_lu for
-        # transverse).  solve_zeta dispatches purely on solver_kind.
-        # ``cct_trace_for_solve`` is precomputed once per channel in
-        # fit_zeta_to_h5 (the all-reduce on L_q[q,i,i] is invariant
-        # across r-chunks; computing it here would refire the
-        # ~5–17 s of GPU stream time per channel that we measured).
-        zeta = solve_zeta(
-            L_q_for_solve, Z_q_for_solve, mesh_xy, q_chunk_size,
-            solver_kind=solver_kind,
-            cct_trace_per_q=cct_trace_for_solve)
-        return zeta
-
+    # Attach the un-fused phases so ``fit_one_rchunk`` can time them.
+    _kernel.z_q_phase = z_q_phase
+    _kernel.solve_phase = solve_phase
     return _kernel
 
 
@@ -1701,17 +1680,21 @@ def fit_one_rchunk(
     if cct_trace_per_q is None:
         cct_trace_per_q = jnp.zeros((int(L_q.shape[0]),),
                                     dtype=jnp.complex128)
-    return fn(
-        psi_l_rmuT_X_fit,
-        psi_r_rmuT_X_fit,
-        L_q,
-        norms_l,
-        norms_r,
-        r_start_dyn,
-        gamma_perm,
-        gamma_phase,
-        cct_trace_per_q,
-    )
+
+    # Call z_q and solve phases separately so each can be wrapped in
+    # ``timing.section`` for per-r-chunk breakdown.  ``block_until_ready``
+    # at each phase boundary is the cost of separating them — a few
+    # microseconds on small kernels, dominated by the per-phase work.
+    with timing.section("zeta_fit.chunk.z_q_build"):
+        Z_q = fn.z_q_phase(
+            psi_l_rmuT_X_fit, psi_r_rmuT_X_fit,
+            norms_l, norms_r, r_start_dyn,
+            gamma_perm, gamma_phase)
+        Z_q.block_until_ready()
+    with timing.section("zeta_fit.chunk.solve"):
+        zeta = fn.solve_phase(Z_q, L_q, cct_trace_per_q)
+        zeta.block_until_ready()
+    return zeta
 
 
 def _band_norms_slice(
