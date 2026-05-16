@@ -380,7 +380,13 @@ class FitOneRChunkKernel(AotKernel):
 
         # psi_bc_G is no longer a jit argument — the provider pulls each
         # bc from host via io_callback inside the jit body.  Specs cover
-        # only: psi_l_X, psi_r_X, L_q, norms_l, norms_r, r_start.
+        # the 9-arg production ``_kernel`` signature:
+        #   psi_l_X, psi_r_X, L_q, norms_l, norms_r, r_start,
+        #   gamma_perm, gamma_phase, cct_trace_per_q.
+        # For the charge-channel AOT measurement (is_charge=True), the
+        # γ̃ pair is unused inside the body (resolves to None at trace),
+        # but must still be present as a jit argument; shape (4,) per
+        # gamma_matrices.gamma_perm_phase.
         return (
             jax.ShapeDtypeStruct(
                 (nk, mu, nb, ns), jnp.complex128, sharding=cent_shard),
@@ -391,6 +397,9 @@ class FitOneRChunkKernel(AotKernel):
             jax.ShapeDtypeStruct((nb,), jnp.float64, sharding=rep),
             jax.ShapeDtypeStruct((nb,), jnp.float64, sharding=rep),
             jax.ShapeDtypeStruct((), jnp.int32),
+            jax.ShapeDtypeStruct((4,), jnp.int32, sharding=rep),
+            jax.ShapeDtypeStruct((4,), jnp.complex128, sharding=rep),
+            jax.ShapeDtypeStruct((nk,), jnp.float64, sharding=rep),
         )
 
     # ---------- callable ----------
@@ -468,9 +477,12 @@ class FitOneRChunkKernel(AotKernel):
         )
 
         # The factory returns the bare jit.  Wrap so the AOT specs'
-        # positional order matches: X + Y + L_q + norms + r_start.
-        def _apply(psi_l_X, psi_r_X, L_q, norms_l, norms_r, r_start):
+        # positional order matches the 9-arg production signature:
+        # X + Y + L_q + norms + r_start + γ̃ pair + cct_trace.
+        def _apply(psi_l_X, psi_r_X, L_q, norms_l, norms_r, r_start,
+                   gamma_perm, gamma_phase, cct_trace_per_q):
             return kernel(psi_l_X, psi_r_X, L_q,
-                          norms_l, norms_r, r_start)
+                          norms_l, norms_r, r_start,
+                          gamma_perm, gamma_phase, cct_trace_per_q)
 
         return jax.jit(_apply)
