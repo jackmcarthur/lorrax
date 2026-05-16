@@ -621,6 +621,15 @@ def gflat_to_rmu(
 ) -> jax.Array:
     """ψ(G-flat) → ψ at centroid grid points, fused over all (k, n).
 
+    Inverse-direction mirror of :func:`accumulate_rchunk_to_gflat`:
+    same scan-inside-shard_map scaffolding (XY-band/μ sharding,
+    flat-axis pad + scan in chunks of ``cs``, per-row body, truncate
+    output to N), differing only in (a) FFT direction — IFFT here,
+    FFT in the ζ writer; (b) phase site — post-gather separable
+    1D-Bloch here, pre-FFT phase-on-slab in the ζ writer; (c) gather
+    target — centroid grid cells here, G-sphere cells in the ζ writer.
+    Together they form the ψ↔ζ G-flat round-trip primitive.
+
     Shapes / shardings (mesh = ``('x', 'y')`` of size ``P = p_x · p_y``)::
 
         psi_G   : (nk, nb_total, ns, ngkmax)  P(None, ('x','y'), None, None)
@@ -888,6 +897,18 @@ def accumulate_rchunk_to_gflat(
     chunk_size: int | None = None,
 ) -> jax.Array:
     """Add ``FFT(pad(phase(rchunk)))[sphere_idx]`` into ``gflat_acc``.
+
+    Inverse-direction mirror of :func:`gflat_to_rmu`: same
+    scan-inside-shard_map scaffolding (XY-band/μ sharding, flat-axis
+    pad + scan in chunks of ``cs``, per-row body, truncate output to
+    N), differing only in (a) FFT direction — FFT here, IFFT in the ψ
+    reader; (b) phase site — pre-FFT phase-on-slab here, post-gather
+    separable 1D-Bloch in the ψ reader; (c) gather target — G-sphere
+    cells here, centroid grid cells in the ψ reader.  Together they
+    form the ψ↔ζ G-flat round-trip primitive — the user-spec mandate
+    that "ζ and ψ infrastructure are the same except how ngkmax is
+    padded in the G-sphere."  The padding difference is at the loader
+    layer (per-q ζ ngk vs per-k ψ ngk), not in this kernel.
 
     Shapes / shardings (mesh = ``('x', 'y')`` of size ``P = p_x · p_y``)::
 
