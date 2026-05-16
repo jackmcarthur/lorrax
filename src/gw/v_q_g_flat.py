@@ -31,8 +31,6 @@ output sharding ``P(None, 'x', 'y')`` matches.
 from __future__ import annotations
 
 import os
-import queue
-import threading
 from functools import partial
 from typing import TYPE_CHECKING
 
@@ -483,6 +481,7 @@ def compute_all_V_q_g_flat(
     bdot: np.ndarray | None = None,
     bare_coulomb_cutoff_ry: float | None = None,
     bgw_v_grid_fn=None,
+    mc_average_vcoul_body: bool = True,
     g_chunk: int | None = None,
     verbose: bool = True,
     sym=None,
@@ -505,7 +504,18 @@ def compute_all_V_q_g_flat(
         raise NotImplementedError(
             f"compute_all_V_q_g_flat: sys_dim must be 2 or 3 "
             f"(0-D box per-q v(G) not wired); got {sys_dim}.")
-    from .compute_vcoul import compute_v_q_per_G
+    from .compute_vcoul import compute_v_q_per_G, build_v_head_miniBZ_avg_3d
+
+    # 3D bulk: precompute the mini-BZ-averaged v(q, G=0) table once.
+    # The IBZ → full-BZ V_q unfold is bilinear in ζ and inherits this
+    # head value through ``unfold_v_q``'s centroid-permute + L-phase, so
+    # injecting at every IBZ q is sufficient — no separate full-BZ pass.
+    # 2D ``f2d → 0`` regularizes v at G=0 already; the MC flag is a 3D-
+    # only refinement and is silently no-op'd for sys_dim=2.
+    _v_head_table = None
+    if mc_average_vcoul_body and sys_dim == 3:
+        _v_head_table = build_v_head_miniBZ_avg_3d(
+            kgrid, bvec, cell_volume)
 
     def _bare_v_per_G(q_irr_frac, gvec_components):
         v = compute_v_q_per_G(
@@ -513,6 +523,7 @@ def compute_all_V_q_g_flat(
             bvec=bvec, cell_volume=cell_volume,
             sys_dim=sys_dim, vcoul_cutoff_ry=bare_coulomb_cutoff_ry,
             bdot=bdot,
+            v_head_miniBZ=_v_head_table,
         )                                                   # (n_q_ibz, ngkmax) f64
         # Optional BGW vcoul overlay — host-side scatter from BGW's
         # full-FFT-grid v into the per-q WFN.h5 sphere positions.

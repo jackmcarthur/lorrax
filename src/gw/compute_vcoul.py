@@ -303,38 +303,11 @@ def make_v_munu_chunked_kernel(
     nkz_f = jnp.float64(nkz)
 
     if sys_dim == 3:
-        # Precompute mini-BZ averaged v(q,G=0) for all q-points on the grid.
-        # For 3D bulk, the bare Coulomb 8π/|q|² varies rapidly near Gamma,
-        # so the point value at q differs from the average over the mini-BZ
-        # Voronoi cell. BGW handles this via MC averaging at every q-point
-        # (vcoul_generator with avgcut=∞ for 3D semiconductors).
-        # We replace v(q, G=0) with <v(q+δq, G=0)>_miniBZ for all q≠0.
-        from .vcoul import wrap_points_to_voronoi
-        _nmc = 2**18
-        _rng = np.random.RandomState(42)
-        _randvals = _rng.uniform(0, 1, (_nmc, 3))
-        _randcart = (_randvals @ bvec.T)
-        _wrapped = np.asarray(wrap_points_to_voronoi(
-            jnp.asarray(_randcart), bvec_j, nmax=1))
-        _kgrid_arr = np.array([nkx, nky, nkz], dtype=np.float64)
-        _randlims = bvec.T @ (np.diag(1.0 / _kgrid_arr) @ np.linalg.inv(bvec.T))
-        _dq_cart = (_randlims @ _wrapped.T).T  # (nmc, 3) mini-BZ offsets in Cartesian
-
-        _v_head_avg = np.zeros((nkx, nky, nkz), dtype=np.float64)
-        for qx in range(nkx):
-            for qy in range(nky):
-                for qz in range(nkz):
-                    qw = np.array([qx, qy, qz], dtype=np.float64)
-                    qw = np.where(qw > _kgrid_arr / 2, qw - _kgrid_arr, qw)
-                    q_frac = qw / _kgrid_arr
-                    q_cart = q_frac @ bvec
-                    if np.dot(q_cart, q_cart) < 1e-12:
-                        _v_head_avg[qx, qy, qz] = 0.0  # q=0 head handled separately
-                    else:
-                        shifted = q_cart[None, :] + _dq_cart  # (nmc, 3)
-                        denom = np.sum(shifted**2, axis=1)
-                        _v_head_avg[qx, qy, qz] = np.mean(8.0 * np.pi / denom)
-        _v_head_avg_j = jnp.asarray(_v_head_avg * (1.0 / cell_volume))
+        # 3D bulk: replace v(q, G=0) with <v(q+δq, G=0)>_miniBZ for all q≠0
+        # (see :func:`build_v_head_miniBZ_avg_3d`).
+        _v_head_avg = build_v_head_miniBZ_avg_3d(
+            (nkx, nky, nkz), bvec, cell_volume)
+        _v_head_avg_j = jnp.asarray(_v_head_avg)
 
         @jax.jit
         def get_sqrt_v_and_phase(qvec_wrapped: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -703,6 +676,55 @@ def compute_v_q_per_q_g_chunked(
     return _v_q_per_q_g_chunked_jit(V_acc, zeta_q_L, zeta_q_R, v_q, g_chunk)
 
 
+def build_v_head_miniBZ_avg_3d(
+    kgrid: tuple[int, int, int],
+    bvec: np.ndarray,
+    cell_volume: float,
+    *,
+    nmc: int = 2**18,
+    seed: int = 42,
+) -> np.ndarray:
+    """Mini-BZ-averaged bare Coulomb head ``<v(q+δq, G=0)>_miniBZ`` per q.
+
+    3D bulk only.  Returns ``(nkx, nky, nkz)`` real array of head values
+    in Rydberg / cell-volume units.  q=0 returns 0 (the actual head is
+    injected separately via a rank-1 correction in the Σ_X path).
+
+    The MC integration draws ``nmc`` (default 2¹⁸) points uniformly on
+    the Voronoi cell of the mini-BZ and averages ``8π/|q+δq|²``.  Both
+    the legacy ``make_v_munu_chunked_kernel.get_sqrt_v_and_phase`` and
+    the G-flat ``compute_all_V_q_g_flat`` consume this table — keep
+    them in lock-step.
+    """
+    from .vcoul import wrap_points_to_voronoi
+    nkx, nky, nkz = (int(s) for s in kgrid)
+    bvec_j = jnp.asarray(bvec, dtype=jnp.float64)
+    rng = np.random.RandomState(seed)
+    randvals = rng.uniform(0, 1, (nmc, 3))
+    randcart = (randvals @ bvec.T)
+    wrapped = np.asarray(wrap_points_to_voronoi(
+        jnp.asarray(randcart), bvec_j, nmax=1))
+    kgrid_arr = np.array([nkx, nky, nkz], dtype=np.float64)
+    randlims = bvec.T @ (np.diag(1.0 / kgrid_arr) @ np.linalg.inv(bvec.T))
+    dq_cart = (randlims @ wrapped.T).T  # (nmc, 3) mini-BZ offsets in Cartesian
+
+    v_head_avg = np.zeros((nkx, nky, nkz), dtype=np.float64)
+    for qx in range(nkx):
+        for qy in range(nky):
+            for qz in range(nkz):
+                qw = np.array([qx, qy, qz], dtype=np.float64)
+                qw = np.where(qw > kgrid_arr / 2, qw - kgrid_arr, qw)
+                q_frac = qw / kgrid_arr
+                q_cart = q_frac @ bvec
+                if np.dot(q_cart, q_cart) < 1e-12:
+                    v_head_avg[qx, qy, qz] = 0.0  # q=0 head handled separately
+                else:
+                    shifted = q_cart[None, :] + dq_cart  # (nmc, 3)
+                    denom = np.sum(shifted**2, axis=1)
+                    v_head_avg[qx, qy, qz] = np.mean(8.0 * np.pi / denom)
+    return v_head_avg * (1.0 / float(cell_volume))
+
+
 def compute_v_q_per_G(
     q_irr_frac: np.ndarray,
     gvec_components: np.ndarray,
@@ -712,6 +734,7 @@ def compute_v_q_per_G(
     sys_dim: int,
     vcoul_cutoff_ry: float | None = None,
     bdot: np.ndarray | None = None,
+    v_head_miniBZ: np.ndarray | None = None,
 ) -> np.ndarray:
     """Compute ``v(q+G)`` at the per-q WFN.h5-style G-list.
 
@@ -765,6 +788,16 @@ def compute_v_q_per_G(
 
     if sys_dim == 2:
         zc = float(np.pi / float(bvec_f[2, 2]))
+    if v_head_miniBZ is not None:
+        # Per-q grid index: round (q_frac * kgrid) and wrap modulo kgrid.
+        # ``v_head_miniBZ`` is indexed by integer (qx, qy, qz) on the
+        # k-grid (the table the legacy ``get_sqrt_v_and_phase`` consumes).
+        head_arr = np.asarray(v_head_miniBZ, dtype=np.float64)
+        if head_arr.ndim != 3:
+            raise ValueError(
+                f"v_head_miniBZ must be (nkx, nky, nkz); got shape "
+                f"{head_arr.shape}")
+        head_kgrid = np.array(head_arr.shape, dtype=np.float64)
     out = np.zeros((n_q, ngkmax), dtype=np.float64)
 
     for qi in range(n_q):
@@ -778,6 +811,17 @@ def compute_v_q_per_G(
         if sys_dim == 3:
             v_reg = 8.0 * np.pi / denom_safe
             v = np.where(denom_zero, 0.0, v_reg * fact)
+            if v_head_miniBZ is not None:
+                # Replace the G=0 entry (the (0,0,0) Miller slot) with the
+                # mini-BZ averaged head value for this q.  Same formula the
+                # legacy ``get_sqrt_v_and_phase`` uses; q=0 keeps v=0 by
+                # construction (the actual head is injected via a separate
+                # rank-1 path in Σ_X).
+                qx_i = int(np.round(qf[0] * head_kgrid[0])) % int(head_kgrid[0])
+                qy_i = int(np.round(qf[1] * head_kgrid[1])) % int(head_kgrid[1])
+                qz_i = int(np.round(qf[2] * head_kgrid[2])) % int(head_kgrid[2])
+                g0_mask = np.all(gvec[qi] == 0.0, axis=0)         # (ngkmax,)
+                v = np.where(g0_mask, head_arr[qx_i, qy_i, qz_i], v)
         elif sys_dim == 2:
             kxy = np.sqrt(qG_cart[0]**2 + qG_cart[1]**2)
             kz = qG_cart[2]
@@ -863,6 +907,7 @@ def compute_all_V_q(
             sys_dim=sys_dim, bdot=bdot,
             bare_coulomb_cutoff_ry=bare_coulomb_cutoff,
             bgw_v_grid_fn=bgw_v_grid_fn,
+            mc_average_vcoul_body=mc_average_vcoul_body,
             g_chunk=(int(g_chunk_size) if g_chunk_size > 0 else None),
             verbose=verbose, sym=sym,
             centroid_indices=centroid_indices,
