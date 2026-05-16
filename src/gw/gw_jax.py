@@ -197,6 +197,29 @@ def main(argv=None):
 	# the legacy 8-D layout.
 	V_q = flatten_V_qmunu(V_qmunu)
 	if config.do_screened:
+		# IBZ cascade for W = (1 − v χ₀)⁻¹ v: slice V_q, χ₀_q to IBZ
+		# rows before ``solve_w`` so the per-q Cholesky/LU factor runs
+		# only on ``n_q_ibz`` blocks; W_q comes out at IBZ shape and we
+		# unfold back to full BZ via the SAME helper V_q uses (it's the
+		# same physics — W is bilinear in centroids and rotates by
+		# centroid double-permute + L-phase + TRS conj under sym).
+		# Bispinor / explicit-full-BZ debug bypass match the V_q gate.
+		_use_ibz_w_requested = (
+			not bool(config.bispinor)
+			and not bool(int(os.environ.get('LORRAX_FORCE_FULL_BZ', '0'))))
+		_ibz_tables = None
+		if _use_ibz_w_requested and getattr(sym, 'q_irr_full_idx', None) is not None:
+			from .v_q_g_flat import _resolve_ibz_q_list
+			_ibz_tables = _resolve_ibz_q_list(
+				sym=sym, centroid_indices=centroid_indices,
+				kgrid=tuple(meta.kgrid),
+				fft_grid=tuple(meta.fft_grid),
+				verbose=False)
+			(_, _q_irr_frac, _full_to_irr_idx, _full_to_irr_sym,
+			 _sym_perm, _L_table, _use_ibz_w) = _ibz_tables
+		else:
+			_use_ibz_w = False
+
 		with timing.section("gw_jax.chi0_W"):
 			with jax_profile.trace_section("chi0_W"):
 				# Split compile vs exec for χ₀ and W.  Each section's
@@ -218,16 +241,52 @@ def main(argv=None):
 					chi0_q = compute_chi0(wfns, quad, meta, mesh_xy,
 					                      energy_reference=e_ref)
 					chi0_q.block_until_ready()
+				# IBZ slice on V_q and χ₀_q.  Both retain the canonical
+				# ``P(None, 'x', 'y')`` sharding; the helper locks it in.
+				if _use_ibz_w:
+					from common.symmetry_maps import slice_q_full_to_ibz
+					from jax.sharding import NamedSharding
+					_nat = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+					with timing.section("W.slice_to_ibz"):
+						V_q_solve = slice_q_full_to_ibz(
+							V_q, sym.q_irr_full_idx, out_sharding=_nat)
+						chi0_q_solve = slice_q_full_to_ibz(
+							chi0_q, sym.q_irr_full_idx, out_sharding=_nat)
+						del chi0_q
+						chi0_q_solve.block_until_ready()
+				else:
+					V_q_solve = V_q
+					chi0_q_solve = chi0_q
 				with timing.section("W.compile"):
-					precompile_solve_w(V_q, chi0_q, meta, mesh_xy,
+					precompile_solve_w(V_q_solve, chi0_q_solve, meta, mesh_xy,
 					                   solver=config.backend.screening_solver)
 				with timing.section("W.exec"):
-					W_q = solve_w(V_q, chi0_q, meta, mesh_xy,
+					W_q_solve = solve_w(V_q_solve, chi0_q_solve, meta, mesh_xy,
 					              solver=config.backend.screening_solver)
 					# χ₀ is donated inside solve_w — the reference is
-					# now invalid.  Do NOT touch ``chi0_q`` after this.
-					del chi0_q
-					W_q.block_until_ready()
+					# now invalid.  Do NOT touch ``chi0_q_solve`` after this.
+					del chi0_q_solve
+					W_q_solve.block_until_ready()
+				# IBZ → full-BZ unfold (centroid double-permute + L-phase
+				# + TRS conj) — same helper V_q uses.  Σ_COH/SX still
+				# iterate over the full BZ in the k-q sums.
+				if _use_ibz_w:
+					from common.symmetry_maps import unfold_v_q
+					with timing.section("W.unfold_to_full_bz"):
+						_n_sym_spatial = int(
+							np.asarray(_sym_perm).shape[0]) // 2
+						W_q = unfold_v_q(
+							W_q_solve,
+							irr_idx=_full_to_irr_idx,
+							sym_idx=_full_to_irr_sym,
+							sym_perm=_sym_perm, L_table=_L_table,
+							q_irr_frac=_q_irr_frac,
+							mesh_xy=mesh_xy,
+							n_sym_spatial=_n_sym_spatial)
+						del W_q_solve
+						W_q.block_until_ready()
+				else:
+					W_q = W_q_solve
 
 	if not config.do_screened:
 		W_q = V_q  # unscreened: W = V
