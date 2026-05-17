@@ -298,6 +298,28 @@ def plan_gflat_chunks(
         bc_cap = min(bc_cap, int(nb_total))
         # Round to power of 2 for divisibility-friendliness.
         band_chunk = _round_pow2_down(bc_cap)
+    # Mesh-floor: band axis is band-flat-sharded across all p_xy ranks
+    # inside ``PsiGStore`` (per-bc local band count
+    # ``bpd_per_bc = band_chunk // p_xy``).  When ``band_chunk < p_xy``
+    # each device gets zero bands per bc, and the downstream
+    # ``z_q_from_psi_sm._local`` ``all_gather(axis_name=('x','y'),
+    # axis=1, tiled=True)`` lowers to "all_gather_dim cannot be zero".
+    # Auto-bump to a multiple of p_xy (rounded up) so every device
+    # receives ≥ 1 band per bc.  The user-set value is a hint;
+    # correctness for the sharded band axis trumps the request.
+    band_chunk_pre = int(band_chunk)
+    if p_xy > 1 and band_chunk_pre % p_xy != 0:
+        band_chunk = ((band_chunk_pre + p_xy - 1) // p_xy) * p_xy
+    if band_chunk < p_xy:
+        band_chunk = p_xy
+    band_chunk = min(int(band_chunk), max(int(nb_total), p_xy))
+    if band_chunk != band_chunk_pre:
+        print(
+            f"  [gflat_memory_model] band_chunk_size bumped from "
+            f"{band_chunk_pre} to {band_chunk} to satisfy world_size="
+            f"{p_xy} (band axis is sharded across all mesh ranks; "
+            f"per-device bands per bc = band_chunk // world_size must "
+            f"be ≥ 1).")
     n_bc = max(1, math.ceil(nb_total / max(band_chunk, 1)))
 
     # ---- 2. r_chunk --------------------------------------------------------
