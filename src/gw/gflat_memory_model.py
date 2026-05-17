@@ -236,8 +236,9 @@ def _peak_C_fit_one_rchunk(*, nk, ns, nq, mu, n_rtot, r_chunk,
     return out
 
 
-def _peak_D_accumulate(*, nq_disk, mu, n_rtot, ngkmax, r_chunk,
-                       gflat_chunk_size, p, p_xy, fft_box_factor_D) -> dict:
+def _peak_D_accumulate(*, nk, ns, nq, nb_total, nq_disk, mu, n_rtot, ngkmax,
+                       r_chunk, gflat_chunk_size, p, p_xy,
+                       fft_box_factor_D) -> dict:
     """accumulate_rchunk_to_gflat peak — runs after fit_one_rchunk
     returns (its P_l/P_r are freed); ζ_chunk is the only fit_one_rchunk
     output still live.
@@ -249,17 +250,39 @@ def _peak_D_accumulate(*, nq_disk, mu, n_rtot, ngkmax, r_chunk,
     print (chunk_size=360 → 6.48 GB/rank = bare 1× box) shows cuFFT's
     out-of-place 3D fftn needs ~2× the box scratch, not 4× (which was
     calibrated for the 6-D centroid-load IFFT nest in Peak A).
+
+    Persistent terms (centroids_persist + L_q) added 2026-05-17 per the
+    refit bugfix: pre-refit's ``fft_box_factor=4`` accidentally
+    compensated for these caller-scope live tensors (``psi_l/r_rmuT_X_fit``
+    + ``L_q``) which sit in HBM throughout ``fit_zeta_to_h5`` (including
+    during the accumulate call); without them, the now-correct
+    ``factor_D=2.0`` exposes the gap and the picker over-shoots
+    ``gflat_chunk_size``.  HLO calibration at
+    ``agent_d_hlo_calibration.md`` M2 confirmed factor_D=2.0 for the
+    FFT-box scratch itself.
     """
-    # gflat_acc is the persistent G-flat ζ accumulator (μ-flat sharded
-    # across mesh).
     persistent = {
-        "gflat_acc": _bytes_c128(nq_disk, mu, ngkmax, shard=p_xy),
+        # Caller-scope persistent — live throughout the r-chunk loop
+        # including the accumulate call.  These never appeared in the
+        # original Peak D dict; the planner's ``fft_box_factor=4``
+        # silently absorbed them.
+        "centroids_persist":
+            2 * _bytes_c128(nk, ns, mu, nb_total, shard=p_xy),
+        "L_q":
+            _bytes_c128(nq, mu, mu, shard=p_xy),
+        # gflat_acc is the persistent G-flat ζ accumulator (μ-flat
+        # sharded across mesh).
+        "gflat_acc":
+            _bytes_c128(nq_disk, mu, ngkmax, shard=p_xy),
     }
     transient = {
         "zeta_chunk":
             _bytes_c128(nq_disk, mu, r_chunk, shard=p_xy),
         "accumulate_fft_box":
             _bytes_c128(gflat_chunk_size, n_rtot) * fft_box_factor_D,
+        # Note: cuFFT-internal workspace pointer scratch is NOT separate;
+        # XLA's planner folds it into the 2 box-sized slots (per
+        # agent_d_hlo_calibration.md M2).
         # Sphere/phase tables baked into closure: ~tens of MB; ignored.
     }
     out = {f"D.{k}": v for k, v in persistent.items()}
@@ -495,6 +518,7 @@ def plan_gflat_chunks(
         is_charge_channel=(not is_bispinor),
     )
     peak_D = _peak_D_accumulate(
+        nk=nk, ns=ns, nq=nq, nb_total=nb_total,
         nq_disk=nq_disk, mu=mu, n_rtot=n_rtot, ngkmax=ngkmax,
         r_chunk=r_chunk, gflat_chunk_size=cs_for_box, p=p, p_xy=p_xy,
         fft_box_factor_D=fft_box_factor_D,

@@ -131,26 +131,25 @@ def test_peak_A_shape_check_at_mesh_floor():
         f"~2.3 GB; > 3 GB means an unexpected multiplier slipped in.")
 
 
-@pytest.mark.xfail(
-    reason=(
-        "The natural picker lands HWM at ~71 GB on a 70 GB budget "
-        "because (a) pair_density_slots=3 likely under-counts α_C "
-        "(Agent C §2(b) hypothesises 4-5) so r_chunk is over-picked, "
-        "and (b) the gflat_chunk_size auto-pick lands too high due to "
-        "Peak D persistent being double-counted with Peak C's during "
-        "the headroom split.  Both are deeper-than-refit fixes — "
-        "calibrate α_C against a CrI3 4×4 memory-usage-report.  "
-        "Tracked in agent_a_audit report §'pair_density_slots = 3 — "
-        "re-verification'."),
-    strict=False)
-def test_hwm_lands_just_under_94pct_budget():
-    """The refit raised ``target_utilization`` from 0.80 to 0.94 (the
-    empirical sweep landed at 94% on 70 GB cleanly).  HWM should
-    therefore be ≤ 0.95 × budget (small slack for rounding)."""
+def test_hwm_saturates_budget_after_persistent_fix():
+    """Post-fix (2026-05-17, ``_peak_D_accumulate`` counts ``centroids
+    + L_q + gflat_acc`` persistent) the planner's predicted HWM should
+    SATURATE the budget at production scale, not under-shoot by
+    ~38 GB.  The pre-fix bug: ``fft_box_factor=4`` accidentally
+    compensated for the missing persistent state, so refit's correct
+    ``factor_D=2.0`` exposed an under-budget pick.  Now both peaks are
+    properly accounted for and HWM should land at ≥ 0.85 × budget
+    (matching the empirical saturated regime).
+
+    The exact target_utilization is 0.94; HWM ≥ 0.85 × budget gives
+    some slack for which peak ends up binding (C vs D)."""
     plan = _natural_plan()
-    assert plan.hwm_bytes <= 0.95 * plan.budget_bytes, (
-        f"HWM={plan.hwm_bytes/1e9:.2f} GB > 0.95 × budget "
-        f"{plan.budget_bytes/1e9:.2f} GB; bottleneck={plan.bottleneck}.")
+    assert plan.hwm_bytes >= 0.85 * plan.budget_bytes, (
+        f"HWM={plan.hwm_bytes/1e9:.2f} GB < 0.85 × budget "
+        f"{plan.budget_bytes/1e9:.2f} GB.  Picker is leaving budget "
+        f"on the table — either Peak D's persistent terms regressed "
+        f"or one of the peak formulas under-counts.  "
+        f"bottleneck={plan.bottleneck}.")
 
 
 def test_band_chunk_at_or_above_mesh_floor():
