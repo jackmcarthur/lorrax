@@ -433,11 +433,38 @@ def load_centroids_band_chunked(
     # CrI3 6×6 80 Ry scale (~50 GB total / mesh.size).  The band-pad
     # padding happens inside ``loader.load`` so ``nb_padded`` is the
     # mesh-aligned extent expected by ``gflat_to_rmu``.
+    #
+    # Past-mnband zero-pad (the contract promised by Meta docstring at
+    # ``common/meta.py:100-117``): ``b_id_4 = _round_up(b_id_4_user,
+    # world_size)`` may exceed the file's ``mnband`` whenever
+    # ``world_size`` rounds the user's band count past the file extent
+    # (CrI3 6×6 30Ry SOC: mnband=86, world_size=16 ⇒ b_id_4=96).
+    # ``WfnLoader.load`` validates ``b_hi <= self.nbands`` at
+    # ``file_io/wfn_loader.py:678``; without the cap below every rank
+    # raises at module init.  Cap the loader call at ``loader.nbands``
+    # and zero-pad the band axis up to ``nb_total = b_end - b_start``,
+    # preserving the (None, ('x','y'), None, None) sharding.  The pad
+    # rows are physically zero — same contract the user-band-pad zero
+    # block below applies to the (b_id_4_user, b_id_4) slots.
+    file_nbands = int(loader.nbands)
+    b_end_in_file = min(b_end, file_nbands)
     with timing.section("load_centroids.loader_load"):
         psi_G_flat = loader.load(
-            bands=band_range, k="full_bz",
+            bands=(b_start, b_end_in_file), k="full_bz",
             sharding=sharding_load, bispinor=bispinor)
         jax.block_until_ready(psi_G_flat)
+    nb_loaded = int(psi_G_flat.shape[1])
+    if nb_loaded < nb_total:
+        pad_bands = nb_total - nb_loaded
+        psi_G_flat = jnp.concatenate(
+            [psi_G_flat,
+             jnp.zeros(
+                 (psi_G_flat.shape[0], pad_bands,
+                  psi_G_flat.shape[2], psi_G_flat.shape[3]),
+                 dtype=psi_G_flat.dtype)],
+            axis=1)
+        psi_G_flat = jax.lax.with_sharding_constraint(
+            psi_G_flat, NamedSharding(mesh_xy, sharding_load))
     nb_padded = int(psi_G_flat.shape[1])
 
     # One shard_map + scan: full (nk, nb_padded) extent, centroid
