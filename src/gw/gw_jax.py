@@ -246,7 +246,6 @@ def main(argv=None):
 				# ``P(None, 'x', 'y')`` sharding; the helper locks it in.
 				if _use_ibz_w:
 					from common.symmetry_maps import slice_q_full_to_ibz
-					from jax.sharding import NamedSharding
 					_nat = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 					with timing.section("W.slice_to_ibz"):
 						V_q_solve = slice_q_full_to_ibz(
