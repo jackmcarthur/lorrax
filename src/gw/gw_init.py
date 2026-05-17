@@ -1212,6 +1212,15 @@ def prepare_isdf_and_wavefunctions(
 				wfn, sym, meta, centroid_indices, mesh_xy,
 				cfg, band_slices, tmp_dir,
 				psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print0)
+			# Profiling helper: LORRAX_EXIT_AFTER_ZETA=1 short-circuits
+			# the pipeline right after ζ-fit, before the expensive V_q
+			# stage.  Combine with LORRAX_MAX_RCHUNKS=N + LORRAX_RCHUNK_DEBUG=1
+			# for fast per-r-chunk timing sweeps.
+			if os.environ.get("LORRAX_EXIT_AFTER_ZETA"):
+				if jax.process_index() == 0:
+					print("[profile] LORRAX_EXIT_AFTER_ZETA set: "
+					      "exiting cleanly after fit_zeta.", flush=True)
+				raise SystemExit(0)
 			V_qmunu, G0 = compute_V_q(
 				zeta_path, wfn, meta, mesh_xy, cfg,
 				mem_est=mem_est, print_fn=print0,
