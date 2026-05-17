@@ -2341,6 +2341,54 @@ def fit_zeta_to_h5(
     t_write_total = 0.0
     t_chunk_start = time.perf_counter()
 
+    # ``LORRAX_MEM_DEBUG=1`` — runtime probe of process-wide HBM at
+    # r-chunk boundaries.  Three points per iter (start / after
+    # fit_one_rchunk / after accumulate) print the JAX/XLA allocator
+    # bytes_in_use+peak plus the top-10 ``jax.live_arrays()`` shapes.
+    # This is the only way to confirm whether centroids+L_q remain
+    # resident across the fit_one_rchunk → accumulate jit boundary —
+    # HLO's buffer-assignment.txt is per-jit and cannot prove
+    # cross-jit liveness (see reports/memory_model_refit_2026-05-17/
+    # agent_e_cross_jit_lifetime.md).  Cheap when unset (env-var
+    # check only; no JAX calls in the early-exit path).
+    def _mem_probe(label, *, only_rank0=True):
+        if not os.environ.get("LORRAX_MEM_DEBUG"):
+            return
+        if only_rank0 and jax.process_index() != 0:
+            return
+        dev = jax.devices()[0]
+        stats = dev.memory_stats() if hasattr(dev, "memory_stats") else {}
+        if stats is None:
+            stats = {}
+        bytes_in_use = stats.get("bytes_in_use", -1)
+        peak_bytes_in_use = stats.get("peak_bytes_in_use", -1)
+        live = jax.live_arrays()
+        by_shape = {}
+        total_live = 0
+        for arr in live:
+            if not hasattr(arr, "shape"):
+                continue
+            try:
+                sz = int(np.prod(arr.shape)) * arr.dtype.itemsize
+            except Exception:
+                continue
+            total_live += sz
+            key = (tuple(arr.shape), str(arr.dtype))
+            entry = by_shape.get(key)
+            if entry is None:
+                by_shape[key] = [1, sz]
+            else:
+                entry[0] += 1
+                entry[1] += sz
+        print(f"[mem_probe {label}] in_use={bytes_in_use/1e9:.2f} GB  "
+              f"peak={peak_bytes_in_use/1e9:.2f} GB  "
+              f"live_count={len(live)} live_total={total_live/1e9:.2f} GB",
+              flush=True)
+        top = sorted(by_shape.items(), key=lambda kv: -kv[1][1])[:10]
+        for (shape, dtype), (cnt, sz) in top:
+            print(f"[mem_probe {label}]   {dtype} {shape} x {cnt} = "
+                  f"{sz/1e9:.2f} GB", flush=True)
+
     # Per-chunk: ``accumulate_rchunk_to_gflat`` adds the chunk's
     # contribution into the donated ``gflat_acc`` in place; no
     # per-chunk SlabIO write.  The single ``zeta_q_G`` write happens
@@ -2437,6 +2485,7 @@ def fit_zeta_to_h5(
             psi_G_store.begin_rchunk(r_start, r_end)
 
             _dbg_rchunk = bool(os.environ.get("LORRAX_RCHUNK_DEBUG"))
+            _mem_probe(f"rchunk_start chunk={chunk_idx}")
             t0 = time.perf_counter()
             try:
                 with timing.section("zeta_fit.chunk.fit_one_rchunk"), \
@@ -2471,6 +2520,7 @@ def fit_zeta_to_h5(
                 psi_G_store.end_rchunk()
             _t_fit = time.perf_counter() - t0
             t_fit_total += _t_fit
+            _mem_probe(f"after_fit_one_rchunk chunk={chunk_idx}")
 
             # 6e. IBZ-slice → allgather (or FFI) → HDF5 write.
             # ``zeta_chunk`` is computed at full BZ q (the FFT in
@@ -2494,8 +2544,11 @@ def fit_zeta_to_h5(
                     mesh=mesh_xy,
                 )
                 del zeta_chunk
+                if os.environ.get("LORRAX_MEM_DEBUG"):
+                    jax.block_until_ready(gflat_acc)
             _t_write = time.perf_counter() - t0
             t_write_total += _t_write
+            _mem_probe(f"after_accumulate chunk={chunk_idx}")
             if _dbg_rchunk and jax.process_index() == 0:
                 print(f"[rchunk_dbg] chunk={chunk_idx+1}/{num_chunks} "
                       f"r=[{r_start},{r_end}) fit={_t_fit*1000:.0f}ms "
