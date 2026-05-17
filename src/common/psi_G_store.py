@@ -282,14 +282,15 @@ class PsiGStore:
         # Stage box_index + kvecs once on device; reused across every
         # fetch.  These don't depend on the band range or r-chunk.
         if self._g_index_dev is None:
-            rep = NamedSharding(self.mesh, P(*([None] * 4)))
-            # Pass numpy directly (no ``jnp.asarray`` wrap): the wrap
-            # makes a single-device jax.Array first, then device_put
-            # broadcasts to replicated via an all-reduce.  Numpy input
-            # to device_put(replicated) takes the per-process-local
-            # placement path — no comm.
-            self._g_index_dev = jax.device_put(
-                self.loader.box_index(k="full_bz"), rep)
+            # ``WfnLoader.box_index_dev`` deduplicates the device-resident
+            # ``(nk, nx, ny, nz) int32`` g_index across every
+            # ``psi_G_store`` instance that shares the same loader+mesh.
+            # Without this dedupe, every ``fit_zeta_to_h5`` channel
+            # (charge + 3 transverse on bispinor) device_put'd a fresh
+            # REPLICATED buffer (0.16 GB/rank each), accumulating to
+            # ~1.3 GB/rank wasted by V_q time (agent_h §3 Finding 3).
+            self._g_index_dev = self.loader.box_index_dev(
+                k="full_bz", mesh=self.mesh)
             kgrid = np.asarray(self.meta.kgrid, dtype=np.float64)
             sym = self.loader._ensure_sym()
             kvecs_frac = np.asarray(

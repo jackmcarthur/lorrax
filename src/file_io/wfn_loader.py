@@ -219,6 +219,20 @@ class WfnLoader:
         self._sym = None
         self._gvecs_cache: dict[tuple, np.ndarray] = {}
         self._ngk_valid_cache: dict[tuple, np.ndarray] = {}
+        # Device-resident g_index cache.  Sphere/g_index is a function of
+        # ``(k_set, fft_grid)`` only — identical across charge + transverse
+        # bispinor channels and across V_q tiles.  Caching the device copy
+        # here (not in ``psi_G_store._g_index_dev``, which dies with each
+        # ``fit_zeta_to_h5`` instance) deduplicates the (nk, nx, ny, nz)
+        # int32 buffer across the full GW pipeline.  Pre-fix:
+        # ``jax.device_put`` allocated a fresh REPLICATED buffer per
+        # ``psi_G_store`` construction → 1 buffer/channel × 4 channels =
+        # 4-8 leaked buffers ≈ 1.3 GB/rank wasted (agent_h §3 Finding 3).
+        # Post-fix: single shared device buffer per ``(k_cache_key, mesh)``.
+        # Keyed by ``(k_cache_key, id(mesh))`` so two ``WfnLoader``s on
+        # different meshes (rare) get distinct buffers; same loader+mesh
+        # always returns the same ``jax.Array``.
+        self._gvecs_dev_cache: dict[tuple, "jax.Array"] = {}
 
     # ------------------------------------------------------------------
     def close(self) -> None:
@@ -426,6 +440,70 @@ class WfnLoader:
             int(self.ngkmax))
         self._gvecs_cache[cache_key] = g_index
         return g_index
+
+    def box_index_dev(
+        self,
+        *,
+        k: KSpec = "full_bz",
+        mesh: "Mesh | None" = None,
+        sharding: "NamedSharding | PartitionSpec | None" = None,
+    ) -> "jax.Array":
+        """Return ``box_index(k=k)`` as a REPLICATED ``jax.Array`` on
+        ``mesh`` — but only do the ``device_put`` once per ``(k, mesh)``.
+
+        Fixes the sphere-idx replicated leak (agent_h §3 Finding 3):
+        every fresh ``psi_G_store._populate_from_loader`` used to call
+        ``jax.device_put(loader.box_index("full_bz"), ...)`` which
+        allocated a NEW REPLICATED ``(nk, nx, ny, nz) int32`` buffer
+        per channel (0.16 GB/rank each).  After 4 bispinor channels +
+        a couple of one-off calls the leak grew to 8 buffers ≈ 1.3
+        GB/rank.  Caching the ``jax.Array`` here means **every caller
+        for the same (k, mesh) gets the same device buffer**; the
+        XLA allocator references it once and Python GC retains it
+        through the loader's lifetime.
+
+        Parameters
+        ----------
+        k : KSpec
+            Same as :meth:`box_index` (defaults to ``"full_bz"`` — the
+            only path that's ever been observed to leak in production).
+        mesh : Mesh, optional
+            Device mesh to replicate over.  If absent, falls back to
+            ``self._mesh`` (the loader's own mesh, set at construction).
+            Raises if both are absent — there's no sensible single-device
+            fallback for a sharding-aware accessor.
+        sharding : NamedSharding | PartitionSpec, optional
+            For callers that need a non-default replicated layout.
+            Default ``None`` ⇒ ``NamedSharding(mesh, P(None, None, None, None))``
+            (the only layout used in production; centralised here so
+            future shape changes (e.g. 5-D ψ for bispinor) update one
+            site instead of three).
+        """
+        from jax.sharding import NamedSharding, PartitionSpec as P
+        mesh = mesh if mesh is not None else self._mesh
+        if mesh is None:
+            raise ValueError(
+                "box_index_dev: pass `mesh=` or construct the WfnLoader "
+                "with a mesh; cannot device_put without one.")
+        # Build the cache key.  ``id(mesh)`` is fine because the mesh
+        # outlives the loader in every production driver (the mesh is
+        # built once at top-of-main and threaded through every kernel).
+        cache_key = ("box_index_dev", *self._k_cache_key(k), id(mesh))
+        if cache_key in self._gvecs_dev_cache:
+            return self._gvecs_dev_cache[cache_key]
+        # Resolve the requested sharding (default = replicated 4-axis).
+        if sharding is None:
+            sharding = NamedSharding(mesh, P(None, None, None, None))
+        elif isinstance(sharding, P):
+            sharding = NamedSharding(mesh, sharding)
+        # Pass numpy directly to ``device_put`` — the per-process-local
+        # placement path avoids the all-reduce that ``jnp.asarray`` ->
+        # device_put(replicated) would otherwise trigger (same comment
+        # as in ``psi_G_store._populate_from_loader``).
+        g_idx_np = self.box_index(k=k)
+        dev = jax.device_put(g_idx_np, sharding)
+        self._gvecs_dev_cache[cache_key] = dev
+        return dev
 
     # ------------------------------------------------------------------
     # Sharding + padding
