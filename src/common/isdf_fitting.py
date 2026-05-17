@@ -1685,15 +1685,23 @@ def fit_one_rchunk(
     # ``timing.section`` for per-r-chunk breakdown.  ``block_until_ready``
     # at each phase boundary is the cost of separating them — a few
     # microseconds on small kernels, dominated by the per-phase work.
+    _dbg = bool(os.environ.get("LORRAX_RCHUNK_DEBUG"))
+    _t_z0 = time.perf_counter() if _dbg else 0.0
     with timing.section("zeta_fit.chunk.z_q_build"):
         Z_q = fn.z_q_phase(
             psi_l_rmuT_X_fit, psi_r_rmuT_X_fit,
             norms_l, norms_r, r_start_dyn,
             gamma_perm, gamma_phase)
         Z_q.block_until_ready()
+    _t_z = (time.perf_counter() - _t_z0) if _dbg else 0.0
+    _t_s0 = time.perf_counter() if _dbg else 0.0
     with timing.section("zeta_fit.chunk.solve"):
         zeta = fn.solve_phase(Z_q, L_q, cct_trace_per_q)
         zeta.block_until_ready()
+    _t_s = (time.perf_counter() - _t_s0) if _dbg else 0.0
+    if _dbg and jax.process_index() == 0:
+        print(f"[rchunk_dbg]   z_q_build={_t_z*1000:.0f}ms "
+              f"solve={_t_s*1000:.0f}ms", flush=True)
     return zeta
 
 
@@ -2428,6 +2436,7 @@ def fit_zeta_to_h5(
             # for this r-chunk.  host_cache mode: no-op.
             psi_G_store.begin_rchunk(r_start, r_end)
 
+            _dbg_rchunk = bool(os.environ.get("LORRAX_RCHUNK_DEBUG"))
             t0 = time.perf_counter()
             try:
                 with timing.section("zeta_fit.chunk.fit_one_rchunk"), \
@@ -2460,7 +2469,8 @@ def fit_zeta_to_h5(
                 # the host tiles are freed here and any still-pending
                 # io_callback would use-after-free.
                 psi_G_store.end_rchunk()
-            t_fit_total += time.perf_counter() - t0
+            _t_fit = time.perf_counter() - t0
+            t_fit_total += _t_fit
 
             # 6e. IBZ-slice → allgather (or FFI) → HDF5 write.
             # ``zeta_chunk`` is computed at full BZ q (the FFT in
@@ -2484,8 +2494,26 @@ def fit_zeta_to_h5(
                     mesh=mesh_xy,
                 )
                 del zeta_chunk
-            t_write_total += time.perf_counter() - t0
+            _t_write = time.perf_counter() - t0
+            t_write_total += _t_write
+            if _dbg_rchunk and jax.process_index() == 0:
+                print(f"[rchunk_dbg] chunk={chunk_idx+1}/{num_chunks} "
+                      f"r=[{r_start},{r_end}) fit={_t_fit*1000:.0f}ms "
+                      f"write={_t_write*1000:.0f}ms "
+                      f"total={(_t_fit+_t_write)*1000:.0f}ms", flush=True)
             r_progress.step()
+            # LORRAX_MAX_RCHUNKS=N: stop the r-chunk loop after N chunks
+            # for profiling/sweeping.  Clean python exit avoids the
+            # SLURM step-zombie issue you get from killing the python
+            # mid-run.  Off when unset.
+            _max_rchunks = os.environ.get("LORRAX_MAX_RCHUNKS")
+            if _max_rchunks and (chunk_idx + 1) >= int(_max_rchunks):
+                if jax.process_index() == 0:
+                    print(f"[rchunk_dbg] LORRAX_MAX_RCHUNKS={_max_rchunks} "
+                          f"reached after chunk {chunk_idx+1}; "
+                          f"breaking r-chunk loop for profiling.",
+                          flush=True)
+                break
 
 
     t_chunks_total = time.perf_counter() - t_chunk_start
