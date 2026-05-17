@@ -600,7 +600,33 @@ def plan_gflat_chunks(
          crossover at cs ~ 1000; see module-level constant).
       4. Pick ``band_chunk`` against Peak A's FFT-box transient.
 
-    Overrides take precedence and skip the corresponding step.
+    User-overrideable kwargs (each maps to a ``cohsex.in`` knob; the
+    cohsex value, when > 0, wins over the picker; per agent_j §5 the
+    planner was previously blind to ``gflat_chunk_size`` because the
+    override was applied AFTER ``plan_gflat_chunks`` returned —
+    threading it as a kwarg lets the planner recompute Peak D at the
+    overridden cs and warn if it exceeds the cap):
+
+      * ``r_chunk_override`` ← cohsex.in ``r_chunk_size`` (0 = picker)
+      * ``band_chunk_override`` ← cohsex.in ``band_chunk_size`` (0 = picker)
+      * ``gflat_chunk_size_override`` ← cohsex.in ``gflat_chunk_size``
+        (0 = picker; non-zero wins over the GFLAT_CHUNK_SIZE_CAP=100
+        safety cap, with a printed warning so the user knows the
+        runtime may OOM)
+      * ``target_utilization`` ← cohsex.in ``chunk_target_utilization``
+        (default 0.94 here; cohsex.in default 0.97)
+      * ``budget_gb`` ← cohsex.in ``memory_per_device_gb`` (0 ⇒ GPU
+        auto-detect happens upstream in MemoryConfig)
+
+    Non-user-overrideable kwargs (set by the caller, not the user):
+
+      * ``is_bispinor`` ← ``cfg.bispinor`` (affects the sphere-idx
+        leak count and pair_density_slots branch)
+      * ``use_ibz_T`` ← derived from sym + centroid orbit closure
+      * ``use_query_fft_peak_bytes`` ← AOT-measure FFT peak (off by
+        default; flips on when calibrating the planner)
+      * ``n_q_ibz`` ← IBZ q-count (defaults to full BZ for conservative
+        Peak E)
 
     Returns a :class:`GFlatChunkPlan` with HWM = max of {A, B, C, D, E}.
     """
@@ -676,6 +702,21 @@ def plan_gflat_chunks(
 
     if r_chunk_override and r_chunk_override > 0:
         r_chunk = min(int(r_chunk_override), n_rtot)
+        # Recompute Peak C transient at the override; warn if the
+        # picker would have chosen smaller (i.e. the override exceeds
+        # the C-headroom budget cap).
+        r_natural = (int(headroom_C / α_C) if α_C > 0 else n_rtot)
+        r_natural = max(min(mu, n_rtot), min(n_rtot, r_natural))
+        if p_xy > 1:
+            r_natural -= r_natural % p_xy
+            r_natural = max(r_natural, p_xy)
+        if r_chunk > r_natural:
+            peak_C_at_override = c_C_const + α_C * float(r_chunk)
+            print(
+                f"  [plan_gflat_chunks] WARNING: r_chunk overridden to "
+                f"{r_chunk} (cap was {r_natural}); Peak C at overridden "
+                f"r ≈ {peak_C_at_override/1e9:.2f} GB/dev (budget "
+                f"{budget/1e9:.2f} GB/dev).")
     else:
         r_lo = min(mu, n_rtot)
         r_from_budget = (int(headroom_C / α_C) if α_C > 0 else n_rtot)
@@ -713,6 +754,28 @@ def plan_gflat_chunks(
     fft_per_row = _bytes_c128(n_rtot) * fft_box_factor_D
     if gflat_chunk_size_override and gflat_chunk_size_override > 0:
         gflat_chunk_size = int(gflat_chunk_size_override)
+        # User-overrideable knob: warn (don't refuse) if the override
+        # exceeds the safe-regime cap.  Runtime will OOM if the user
+        # picks too aggressively (agent_f saw cs=1414 OOM at production
+        # CrI3 80Ry); we want the user to see WHY in the planner log
+        # rather than at runtime under a confusing cuFFT plan-creation
+        # error.  Per agent_j §1: the cs cap lives in the planner, not
+        # in the override path, so the user can knowingly opt out.
+        if gflat_chunk_size > GFLAT_CHUNK_SIZE_CAP:
+            # Recompute Peak D's FFT-box transient at the overridden cs
+            # so the printed peak reflects what the runtime will actually
+            # allocate (not the capped planner pick).  See _peak_D_accumulate
+            # below for the formula; replicated here as a quick estimate.
+            peak_D_at_override = (
+                base_D + fft_per_row * float(gflat_chunk_size))
+            print(
+                f"  [plan_gflat_chunks] WARNING: gflat_chunk_size "
+                f"overridden to {gflat_chunk_size} (cap was "
+                f"{GFLAT_CHUNK_SIZE_CAP}); past the cuFFT plan-algorithm "
+                f"crossover at cs ~ 1000 cuFFT scratch grows non-linearly "
+                f"(agent_f cs=1414 OOM verified).  Peak D at overridden "
+                f"cs ≈ {peak_D_at_override/1e9:.2f} GB/dev (budget "
+                f"{budget/1e9:.2f} GB/dev).")
     else:
         cs_from_budget = max(GFLAT_CHUNK_FLOOR,
                              int(headroom_D / max(fft_per_row, 1.0)))

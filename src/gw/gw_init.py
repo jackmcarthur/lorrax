@@ -594,11 +594,28 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# transverse path always writes IBZ-only).
 	_nq_disk_est = int(meta.nk_tot)
 	_ngkmax_est = int(getattr(meta, 'ngkmax', 0)) or int(0.06 * meta.n_rtot)
+	# Thread EVERY user-overrideable cohsex.in memory knob into the
+	# planner so its HWM estimate reflects what the runtime will
+	# actually allocate.  Per agent_j §5 (Round 3 finding): the prior
+	# code applied the ``cfg.memory.gflat_chunk_size`` override AFTER
+	# ``plan_gflat_chunks`` returned, so the planner's HWM was computed
+	# at the planner's own cs (capped at 100) rather than the runtime
+	# cs the user requested — under-predicting Peak D when the user
+	# overrode upward.  Round-4 fix: pass it as a kwarg so the planner
+	# warns if the override exceeds the safety cap.
 	gflat_plan = plan_gflat_chunks(
 		meta=meta, mesh_xy=mesh_xy,
 		nb_total=nb_total_chunker,
 		ngkmax=_ngkmax_est, n_q_disk=_nq_disk_est,
 		budget_gb=float(cfg.memory.per_device_gb),
+		# target_utilization=0.80 has been the only gflat-planner-call
+		# constant since the planner's introduction; the cohsex.in
+		# ``chunk_target_utilization`` knob (default 0.97) feeds the
+		# legacy ``compute_optimal_chunks`` path, NOT the gflat planner.
+		# The 0.80 here is hand-tuned to fit the bispinor 4-channel
+		# slack (centroid leftover, sphere-idx-pre-Round-4-leak, cuFFT
+		# scratch wiggle).  Wire it through MemoryConfig only when we
+		# add a separate ``gflat_target_utilization`` knob.
 		target_utilization=0.80,
 		fft_box_factor=4.0,
 		is_bispinor=bool(cfg.bispinor),
@@ -609,6 +626,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		band_chunk_override=(
 			int(cfg.memory.band_chunk_size)
 			if cfg.memory.band_chunk_size > 0 else None),
+		gflat_chunk_size_override=(
+			int(cfg.memory.gflat_chunk_size)
+			if cfg.memory.gflat_chunk_size > 0 else None),
 	)
 	if _rank0:
 		print_fn("")
@@ -616,13 +636,10 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	chunks['band_chunk'] = int(gflat_plan.band_chunk)
 	chunks['chunk_r'] = int(gflat_plan.r_chunk)
 	chunks['gflat_hwm_gb'] = gflat_plan.hwm_bytes / 1e9
-	# Cohsex.in ``gflat_chunk_size`` overrides the planner's pick.  When
-	# user set 0 (the default) we adopt the planner's recommendation; a
-	# non-zero cohsex value wins.
-	chunks['gflat_chunk_size'] = (
-		int(cfg.memory.gflat_chunk_size) if cfg.memory.gflat_chunk_size > 0
-		else (int(gflat_plan.gflat_chunk_size)
-		      if gflat_plan.gflat_chunk_size is not None else 0))
+	# ``gflat_plan.gflat_chunk_size`` now reflects the cohsex.in override
+	# when provided (the planner saw it via the kwarg above).  No
+	# post-planner override needed — the planner's pick IS the runtime cs.
+	chunks['gflat_chunk_size'] = int(gflat_plan.gflat_chunk_size)
 
 	# Round 6 deleted the ``gflat_to_rchunk_chunk_size`` cohsex knob —
 	# the new ``z_q_from_psi_sm`` streaming-scan body has no
