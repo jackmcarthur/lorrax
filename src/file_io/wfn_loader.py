@@ -68,6 +68,56 @@ __all__ = ["WfnLoader"]
 KSpec = Sequence[int] | Literal["ibz", "full_bz"]
 
 
+def _build_phdf5_clamped_counts(
+    *,
+    world: int,
+    bands_per_rank: int,
+    b_lo_logical: int,
+    mnband_file: int,
+    n_reads: int,
+    ngk_per_ibz_read: Sequence[int],
+    ns: int,
+) -> np.ndarray:
+    """Per-rank ``counts`` table for the kchunk-union phdf5 read,
+    clamped to the on-disk ``mnband_file`` band extent.
+
+    The C++ ``read_kchunk_union`` handler computes each rank's
+    band-axis file offset as
+    ``offset_band = b_lo_logical + rank_coord_band * bands_per_rank``,
+    where ``rank_coord_band = coord_x * p_y + coord_y`` for a 2-D
+    ``('x','y')`` mesh of shape ``(p_x, p_y)``.  Without clamping,
+    the tail rank can read past ``mnband_file`` whenever
+    ``(b_hi_logical - b_lo_logical)`` rounded up to ``world *
+    bands_per_rank`` extends past the file extent — H5Dread then
+    fails with "selection + offset not within extent".
+
+    This helper returns a ``(world * n_reads, 4) int64`` table whose
+    rank ``r``-slice ``[r*n_reads:(r+1)*n_reads, :]`` has the band-axis
+    count clamped to ``max(0, min(bands_per_rank, mnband_file -
+    (b_lo_logical + r * bands_per_rank)))``.  Ranks fully past EOF get
+    band_cnt=0 — their pinned-buffer pre-zero (in the C++ worker)
+    becomes a zero-filled rank tile, which is the correct semantics for
+    band-pad rows.
+
+    Sharded on the leading axis by ``('x','y')`` so each rank's
+    shard_map-local view is the ``(n_reads, 4)`` slice for its own
+    rank.  Rank-flattening matches the C++: outer loop over ``r``
+    in 0..world-1 corresponds to ``coord_x = r // p_y,
+    coord_y = r % p_y`` (leftmost-is-slowest in JAX's convention).
+    """
+    counts = np.zeros((world, n_reads, 4), dtype=np.int64)
+    for r in range(int(world)):
+        file_off_band = int(b_lo_logical) + r * int(bands_per_rank)
+        avail = max(0, int(mnband_file) - file_off_band)
+        band_cnt = min(int(bands_per_rank), avail)
+        for ki in range(int(n_reads)):
+            counts[r, ki, 0] = band_cnt
+            counts[r, ki, 1] = int(ns)
+            counts[r, ki, 2] = int(ngk_per_ibz_read[ki])
+            counts[r, ki, 3] = 2
+    return counts.reshape(int(world) * int(n_reads), 4)
+
+
 class WfnLoader:
     # ------------------------------------------------------------------
     # Lifecycle
@@ -576,30 +626,52 @@ class WfnLoader:
             [b_lo_logical, 0, int(self._kpt_starts[ibz]), 0]
             for ibz in ibz_unique_sorted
         ], axis=0).astype(np.int64)
-        counts = np.stack([
-            [bands_per_rank, ns, int(self.ngk[ibz]), 2]
-            for ibz in ibz_unique_sorted
-        ], axis=0).astype(np.int64)
+        # Per-rank counts: the C++ adds ``rank_coord_band * bands_per_rank``
+        # to ``offsets[:, 0]`` to get each rank's band-axis file offset.
+        # When ``mnband`` is not divisible by the global pad
+        # (``world * (b_hi_logical-b_lo_logical-mnband-tail)``), the
+        # tail-padded ranks would otherwise read past the on-disk band
+        # extent.  Build a per-rank ``counts`` table that clamps the
+        # band-axis count so each rank's [offset, offset+count) stays
+        # inside the file's [0, mnband) extent.  Ranks fully past the
+        # extent get count=0 on the band axis → no H5Dread bytes
+        # contributed; the C++ pre-zeros the pinned buffer so the
+        # rank's tile reads as exactly zero.
+        mnband_file = int(self.nbands)
+        ngk_per_ibz_read = tuple(int(self.ngk[ibz]) for ibz in ibz_unique_sorted)
+        counts_global = _build_phdf5_clamped_counts(
+            world=world,
+            bands_per_rank=bands_per_rank,
+            b_lo_logical=b_lo_logical,
+            mnband_file=mnband_file,
+            n_reads=n_reads,
+            ngk_per_ibz_read=ngk_per_ibz_read,
+            ns=ns,
+        )
 
-        # Handle short-band tail: the FFI read needs (b_hi - b_lo) bands
-        # in-file.  For requests that exceed wfn.nbands, we'd need a
-        # h5py + replicated tail path (see
-        # PhdfWfnReader._coeffs_gspace_with_short_tail).  For P2 we
-        # raise on this case; the GW driver doesn't request
-        # past-file bands today.
-        if b_hi_logical > int(self.nbands):
-            raise NotImplementedError(
-                f"_phdf5_build: pad-past-file ({b_hi_logical} > "
-                f"nbands={int(self.nbands)}) not yet supported on the "
-                "phdf5 backend.  File a P2.1 if needed; the eager "
-                "backend handles it via zero-fill.")
+        # The (pure) per-rank band-axis cap doubles as a precondition
+        # for the pad-past-file case: if ``b_hi_logical > mnband_file``,
+        # the per-rank clamp above produces band_cnt < bands_per_rank
+        # for the tail-rank(s); the C++ honours that (count is per-rank
+        # and ≤ per_rank_max[0]=bands_per_rank).  This makes the prior
+        # NotImplementedError-on-pad-past-file branch obsolete; the
+        # phdf5 backend now matches the eager backend's zero-fill
+        # behaviour on past-file pads.  We leave a sanity check for the
+        # extreme case where ``b_lo`` itself starts past EOF
+        # (nonsensical request that ``WfnLoader.load`` rejects upstream
+        # at lines 678-681, but defended here too).
+        if b_lo_logical >= mnband_file:
+            raise ValueError(
+                f"_phdf5_build: b_lo={b_lo_logical} >= mnband={mnband_file}; "
+                "entire band window past file extent")
 
         rep1 = NamedSharding(self._mesh, P(None))
         rep2 = NamedSharding(self._mesh, P(None, None))
-        # Numpy → replicated device_put; bare numpy skips the
+        counts_sharding = NamedSharding(self._mesh, P(("x", "y"), None))
+        # Numpy → replicated/sharded device_put; bare numpy skips the
         # single-device staging that triggers an all-reduce broadcast.
         offsets_dev = jax.device_put(offsets, rep2)
-        counts_dev = jax.device_put(counts, rep2)
+        counts_dev = jax.device_put(counts_global, counts_sharding)
         position_in_reads_dev = jax.device_put(position_in_reads, rep1)
 
         reader = read_kchunk_union_sharded(
@@ -611,6 +683,7 @@ class WfnLoader:
             dtype=np.float64,
             mesh=self._mesh,
             file_partition_spec=P(("x", "y"), None, None, None),
+            count_partition_spec=P(("x", "y"), None),
         )
         cnk_at_ibz = reader(offsets_dev, counts_dev)
         # cnk_at_ibz layout: per-rank

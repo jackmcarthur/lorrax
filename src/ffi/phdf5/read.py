@@ -317,9 +317,23 @@ def read_kchunk_union_sharded(
     dtype,
     mesh: Mesh,
     file_partition_spec: P,
+    count_partition_spec: P | None = None,
 ) -> Callable[[jax.Array, jax.Array], jax.Array]:
     """See ``_read_kchunk_union_sharded_cached`` for impl; this wrapper
-    normalises Sequence args to tuples for lru_cache hashability."""
+    normalises Sequence args to tuples for lru_cache hashability.
+
+    ``count_partition_spec`` (optional): partition spec for the
+    ``count_base`` argument.  Defaults to ``P()`` (fully replicated; all
+    ranks see the same global counts table, as the original API).  Pass
+    ``P(('x','y'), None)`` (or any other sharding on the leading
+    n_kchunk axis) when the caller wants per-rank counts — useful when
+    a rank's read window must be clamped to the on-disk file extent
+    (e.g. ``mnband`` not divisible by world_size).  The ``count_base``
+    global shape must then be ``(world * n_kchunk, ndim_file)``; each
+    rank receives its ``(n_kchunk, ndim_file)`` slice.
+    """
+    if count_partition_spec is None:
+        count_partition_spec = P()
     return _read_kchunk_union_sharded_cached(
         int(fh), str(ds_name),
         n_kchunk=int(n_kchunk), kchunk_axis=int(kchunk_axis),
@@ -327,6 +341,7 @@ def read_kchunk_union_sharded(
         per_rank_file_shape=tuple(int(s) for s in per_rank_file_shape),
         dtype=jnp.dtype(dtype),
         mesh=mesh, file_partition_spec=file_partition_spec,
+        count_partition_spec=count_partition_spec,
     )
 
 
@@ -342,6 +357,7 @@ def _read_kchunk_union_sharded_cached(
     dtype,
     mesh: Mesh,
     file_partition_spec: P,
+    count_partition_spec: P = P(),
 ) -> Callable[[jax.Array, jax.Array], jax.Array]:
     """Build a jitted ``f(offset_base, count_base) → array`` callable
     that issues **ONE** ``H5Dread`` for ``n_kchunk`` per-k windows via
@@ -416,6 +432,7 @@ def _read_kchunk_union_sharded_cached(
 
     return jax.jit(shard_map(
         _per_rank, mesh=mesh,
-        in_specs=(P(), P()), out_specs=out_partition_spec,
+        in_specs=(P(), count_partition_spec),
+        out_specs=out_partition_spec,
         check_rep=False,
     ))
