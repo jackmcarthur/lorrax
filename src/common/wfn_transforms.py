@@ -79,6 +79,41 @@ def _cached_jit(name: str, key: tuple, build):
     return fn
 
 
+# Module-level dedup for the device-resident ``(nk, nx, ny, nz) int32``
+# g_index buffer captured by ``build()`` closures.  Without this cache,
+# every distinct ``_cached_jit`` key (which changes per channel via
+# ``r_mu_id`` for centroid loads) would build a NEW compiled fn with a
+# NEW captured ``jnp.asarray(g_arr, dtype=jnp.int32)`` REPLICATED buffer
+# — leaking +1 buffer per channel from the centroid-load path on top of
+# the (now-fixed) ``psi_G_store._g_index_dev`` leak (agent_h §3 Finding
+# 3).  Keyed by content-hash of the numpy g_index so different k-sets
+# (full_bz vs ibz) get distinct buffers but identical numpy bytes share.
+_GINDEX_DEV_CACHE: dict = {}
+
+
+def _cached_gindex_dev(g_arr) -> "jax.Array":
+    """Cache the ``jnp.asarray(g_arr, dtype=jnp.int32)`` REPLICATED
+    device buffer by content hash.  See ``_GINDEX_DEV_CACHE`` comment.
+
+    Accepts either numpy ``np.ndarray`` or ``jax.Array``; if already a
+    jax.Array with int32 dtype the call is a no-op pass-through (see
+    ``jnp.asarray``'s identity contract).  Callers that pass a numpy
+    array end up sharing the device buffer across every cache_key
+    variant that has the same g_index bytes — the typical case for
+    centroid-load + ζ-fit + V_q in a single GW run.
+    """
+    if isinstance(g_arr, jax.Array):
+        return jnp.asarray(g_arr, dtype=jnp.int32)
+    key = ('g_index_dev', hash(g_arr.tobytes()),
+           tuple(int(s) for s in g_arr.shape))
+    hit = _GINDEX_DEV_CACHE.get(key)
+    if hit is not None:
+        return hit
+    dev = jnp.asarray(g_arr, dtype=jnp.int32)
+    _GINDEX_DEV_CACHE[key] = dev
+    return dev
+
+
 # ---------------------------------------------------------------------------
 # Shared kernel: G-flat ψ + g_index → FFT-box ψ (zero-sentinel gather)
 # ---------------------------------------------------------------------------
@@ -249,7 +284,7 @@ def to_box(
         return fn
 
     fn = _cached_jit('to_box', key, build)
-    g_index_j = jnp.asarray(g_index, dtype=jnp.int32)
+    g_index_j = _cached_gindex_dev(g_index)
     return fn(psi, g_index_j)
 
 
@@ -295,7 +330,7 @@ def to_rbox(
         return fn
 
     fn = _cached_jit('to_rbox', key, build)
-    g_index_j = jnp.asarray(g_index, dtype=jnp.int32)
+    g_index_j = _cached_gindex_dev(g_index)
     if kvecs_frac is None:
         return fn(psi, g_index_j)
     return fn(psi, g_index_j, jnp.asarray(kvecs_frac, dtype=jnp.float64))
@@ -344,7 +379,7 @@ def to_rmu(
         return fn
 
     fn = _cached_jit('to_rmu', key, build)
-    g_index_j = jnp.asarray(g_index, dtype=jnp.int32)
+    g_index_j = _cached_gindex_dev(g_index)
     r_mu_j = jnp.asarray(r_mu, dtype=jnp.int32)
     if kvecs_frac is None:
         return fn(psi, g_index_j, r_mu_j)
@@ -512,7 +547,7 @@ def to_rchunk(
 
     fn = _cached_jit('to_rchunk', key, build)
 
-    g_index_j = jnp.asarray(g_index, dtype=jnp.int32)
+    g_index_j = _cached_gindex_dev(g_index)
     r0_arg = (jnp.int32(int(r0)) if isinstance(r0, (int, np.integer)) else r0)
     if kvecs_frac is None:
         return fn(psi, g_index_j, r0_arg)
@@ -777,7 +812,7 @@ def gflat_to_rmu(
         # Per-k phase tables and centroid-coord constants baked into the
         # closure.  r_mu is replicated so we can index the per-row
         # phases by r_mu directly inside the scan body.
-        g_index_c = jnp.asarray(g_arr, dtype=jnp.int32)
+        g_index_c = _cached_gindex_dev(g_arr)
         r_mu_c    = jnp.asarray(r_mu_arr, dtype=jnp.int32)
         if kvecs_frac is not None:
             kv = jnp.asarray(np.asarray(kvecs_frac), dtype=jnp.float64)
@@ -1035,7 +1070,11 @@ def accumulate_rchunk_to_gflat(
 
     def build():
         # Per-q tables baked into the closure as constants.
-        sphere_c = jnp.asarray(sphere_arr, dtype=jnp.int32)
+        # Share the device-resident sphere idx across cache_key
+        # variants (different qvec/r_chunk metadata can build distinct
+        # closures, but the sphere idx itself is content-stable when
+        # the WFN is fixed).  Same dedup principle as for g_index above.
+        sphere_c = _cached_gindex_dev(sphere_arr)
         if qvec_frac is not None:
             qv = jnp.asarray(np.asarray(qvec_frac), dtype=jnp.float64)
             _ph = lambda q_axis, n: jnp.exp(
