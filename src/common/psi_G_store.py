@@ -221,6 +221,30 @@ class PsiGStore:
             # consumers is identical to the pre-fix path whenever
             # ``bc_end <= loader.nbands`` (this branch never fires).
             bc_end_in_file = min(bc_end, file_nbands)
+            nb_total = bc_end - bc_start
+            b_lo = self._bc_band_offsets[bc_idx]
+            b_hi = self._bc_band_offsets[bc_idx + 1]
+            # When the entire bc range starts at/past ``file_nbands`` the
+            # cap above collapses the load to an empty range
+            # ``(file_nbands, file_nbands)`` that ``WfnLoader.load``
+            # rejects.  This whole bc has only band-pad rows that the
+            # post-load ``_zero_user_band_pad_in_shard`` step would zero
+            # out anyway, AND the per-rank host-tile slice for these
+            # rows is empty (``bpd_per_bc[bc] == 0`` since
+            # ``nb_total < p`` for the all-pad tail bcs), so we can skip
+            # the load entirely.  The host_tile entries already pre-zero
+            # via ``np.empty`` of the bc-band span ``b_hi - b_lo == 0``
+            # — no write needed.
+            if bc_start >= bc_end_in_file:
+                # Fill this bc's per-rank tile span with zeros directly
+                # (no FFI call needed — the eager and phdf5 backends
+                # would both produce zero rows for an entirely-past-EOF
+                # band window, modulo the WfnLoader.load bounds check
+                # at file_io/wfn_loader.py:678).
+                if b_hi - b_lo > 0:
+                    for (x, y) in self._coords.values():
+                        self._host_tiles[(x, y)][:, b_lo:b_hi, :, :] = 0
+                continue
             with timing.section("psi_G_store.populate.loader_load"):
                 psi_G_bc = self.loader.load(
                     bands=(bc_start, bc_end_in_file), k="full_bz",
@@ -228,7 +252,6 @@ class PsiGStore:
                     bispinor=self.bispinor,
                 )
                 jax.block_until_ready(psi_G_bc)
-            nb_total = bc_end - bc_start
             nb_loaded = int(psi_G_bc.shape[1])
             if nb_loaded < nb_total:
                 pad_bands = nb_total - nb_loaded
@@ -242,8 +265,6 @@ class PsiGStore:
                 psi_G_bc = jax.lax.with_sharding_constraint(
                     psi_G_bc, NamedSharding(self.mesh, sharding_spec))
                 jax.block_until_ready(psi_G_bc)
-            b_lo = self._bc_band_offsets[bc_idx]
-            b_hi = self._bc_band_offsets[bc_idx + 1]
             with timing.section("psi_G_store.populate.shard_to_host"):
                 for shard in psi_G_bc.addressable_shards:
                     x, y = self._coords[id(shard.device)]
