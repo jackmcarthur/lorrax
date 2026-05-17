@@ -642,16 +642,13 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# Band norms for pseudobands normalization (1.0 for deterministic bands)
 	_band_norms = getattr(wfn, 'band_norms', None)
 
-	# IBZ-only writes (default True) are skipped when bispinor mode is
-	# on UNLESS ``bispinor_use_ibz=True`` activates the bispinor IBZ
-	# cascade (see derivation in
-	# ``reports/bispinor_ibz_2026-05-16/derivation.md``).  When the
-	# cascade is active, the bispinor V_q orchestrator iterates IBZ q's
-	# per tile and post-loop unfolds + Lorentz-mixes.
-	import os as _os_dbg
-	_write_ibz_only_charge = ((not bool(cfg.bispinor)
-		or bool(getattr(cfg, 'bispinor_use_ibz', False)))
-		and not bool(int(_os_dbg.environ.get('LORRAX_FORCE_FULL_BZ', '0'))))
+	# IBZ-only writes activate when sym is present, ``LORRAX_FORCE_FULL_BZ``
+	# is not set, and the charge centroid set passes orbit closure
+	# (checked downstream).  The bispinor V_q orchestrator consumes the
+	# IBZ-only ζ̃_C identically to the 2-comp path; see derivation in
+	# ``reports/bispinor_ibz_2026-05-16/derivation.md``.
+	_write_ibz_only_charge = not bool(int(
+		os.environ.get('LORRAX_FORCE_FULL_BZ', '0')))
 	# Two cutoffs control the bare-Coulomb / ζ-sphere construction:
 	#   * ``bare_coulomb_cutoff_ry`` — V_q's sqrt_v(q+G) mask.
 	#   * ``zeta_cutoff_ry``         — the on-disk per-q ζ sphere
@@ -830,13 +827,15 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					cusolvermp_lu=cfg.backend.cusolvermp_lu,
 					gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
 					vertex_mu_L=mu_L,
-					# Transverse ζ IBZ-write gated on the bispinor IBZ
-					# cascade flag — full-BZ on disk otherwise, since
-					# the bispinor V_q orchestrator only iterates IBZ
-					# q's when ``use_ibz`` is wired through.
+					# Transverse ζ IBZ-write activates whenever the
+					# bispinor V_q orchestrator iterates IBZ q's — same
+					# gate the charge ζ uses (LORRAX_FORCE_FULL_BZ off).
+					# Orbit-closure of the transverse centroid set is
+					# checked downstream in ``fit_zeta_to_h5``; failure
+					# is loud per the bispinor IBZ requirement.
 					write_ibz_only=(bool(cfg.bispinor)
-					                and bool(getattr(
-						                cfg, 'bispinor_use_ibz', False))),
+					                and not bool(int(os.environ.get(
+						                'LORRAX_FORCE_FULL_BZ', '0')))),
 					zeta_cutoff_ry=_zeta_cutoff,
 				)
 		# Surface the transverse-centroid ψ to the caller so it can build
@@ -937,8 +936,12 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		# cascade.  fit_zeta loaded them earlier but didn't surface them
 		# to compute_V_q's signature; reloading is cheap (a text file
 		# read) and keeps the bispinor IBZ wiring local to this branch.
-		_bispinor_use_ibz = bool(getattr(cfg, 'bispinor_use_ibz', False))
-		if _bispinor_use_ibz:
+		# Orbit-closure of the C/T centroid sets is checked inside
+		# ``_resolve_ibz_q_list`` (called per tile by the V_q
+		# orchestrator) and silently falls back to full-BZ on failure.
+		_use_ibz_bispinor = not bool(int(
+			os.environ.get('LORRAX_FORCE_FULL_BZ', '0')))
+		if _use_ibz_bispinor:
 			_cents_curr_path = cfg.paths.centroids_file_current
 			_, _cent_T_idx_np, _ = _load_centroids(
 				_cents_curr_path, meta.fft_grid)
@@ -1007,10 +1010,10 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 							         if cfg.memory.vq_g_chunk_size > 0 else None),
 							backend=cfg.backend.slab_io,
 							print_fn=print_fn,
-							sym=sym if _bispinor_use_ibz else None,
+							sym=sym if _use_ibz_bispinor else None,
 							centroid_C_idx=_cent_C_idx_for_orchestrator,
 							centroid_T_idx=_cent_T_idx_for_orchestrator,
-							use_ibz=_bispinor_use_ibz,
+							use_ibz=_use_ibz_bispinor,
 						)
 			else:
 				# Legacy r-space path — μ × ν tile driver.

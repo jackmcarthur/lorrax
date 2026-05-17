@@ -2022,9 +2022,9 @@ def fit_zeta_to_h5(
     # rather than ``n_q_full``; the chunk loop slices
     # ``zeta_chunk[q_irr_full_idx]`` before writing.
     #
-    # When ``write_ibz_only=False`` (bispinor μ_L>0 caller for now,
-    # until the bispinor V_q orchestrator gains IBZ support), the
-    # full-BZ axis is preserved on disk for back-compatibility.
+    # When ``write_ibz_only=False`` (caller forced full-BZ writes via
+    # ``LORRAX_FORCE_FULL_BZ=1``), the full-BZ axis is preserved on
+    # disk for back-compatibility.
     #
     # Auto-fallback: if the centroid set isn't orbit-closed under the
     # WFN sym group (typical for ``kmeans_cli --no-orbit`` outputs),
@@ -2049,27 +2049,26 @@ def fit_zeta_to_h5(
             )
         except RuntimeError as _exc:
             # On the transverse bispinor channels (vertex_mu_L ∈ {1,2,3})
-            # ``write_ibz_only=True`` is set ONLY when the caller has
-            # explicitly opted into the bispinor IBZ cascade via
-            # ``cohsex.in: bispinor_use_ibz=true``.  Silently falling back
+            # the bispinor V_q orchestrator assumes ζ̃_T is IBZ-only
+            # whenever the cascade is active (sym present and
+            # ``LORRAX_FORCE_FULL_BZ`` not set).  Silently falling back
             # to full-BZ on disk would create an inconsistency with the
-            # bispinor V_q orchestrator (which assumes ζ̃_T is IBZ-only
-            # when the cascade is on).  Loud-fail the run and tell the
-            # user how to regenerate centroids.
+            # orchestrator's per-tile IBZ iteration, so loud-fail the
+            # run and tell the user how to regenerate centroids or
+            # bypass the cascade.
             _first = (_exc.args[0].splitlines()[0]
                       if _exc.args else str(_exc))
             if int(vertex_mu_L) != 0:
                 raise RuntimeError(
                     f"Bispinor transverse ζ̃^{{μ_L={int(vertex_mu_L)}}} "
-                    f"IBZ-write requested (bispinor_use_ibz=true), but the "
-                    f"transverse centroid set fails the orbit-closure "
-                    f"check under the WFN sym group: {_first}.  "
-                    f"Regenerate the transverse centroid file with "
-                    f"``centroid.kmeans_cli --density-mode current "
-                    f"--orbit-aware ...`` so the resulting set is closed "
-                    f"under the spatial sym group, or disable the "
-                    f"bispinor IBZ cascade with "
-                    f"``bispinor_use_ibz=false``."
+                    f"IBZ-write requested, but the transverse centroid "
+                    f"set fails the orbit-closure check under the WFN "
+                    f"sym group: {_first}.  Regenerate the transverse "
+                    f"centroid file with ``centroid.kmeans_cli "
+                    f"--density-mode current --orbit-aware ...`` so the "
+                    f"resulting set is closed under the spatial sym "
+                    f"group, or bypass the bispinor IBZ cascade with "
+                    f"``LORRAX_FORCE_FULL_BZ=1``."
                 ) from _exc
             if jax.process_index() == 0:
                 print(f"  q-IBZ reduction: centroid orbit closure failed "

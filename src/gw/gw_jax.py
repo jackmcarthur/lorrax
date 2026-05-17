@@ -203,11 +203,11 @@ def main(argv=None):
 		# unfold back to full BZ via the SAME helper V_q uses (it's the
 		# same physics — W is bilinear in centroids and rotates by
 		# centroid double-permute + L-phase + TRS conj under sym).
-		# Bispinor / explicit-full-BZ debug bypass match the V_q gate.
-		_use_ibz_w_requested = (
-			(not bool(config.bispinor)
-			 or bool(getattr(config, 'bispinor_use_ibz', False)))
-			and not bool(int(os.environ.get('LORRAX_FORCE_FULL_BZ', '0'))))
+		# Explicit-full-BZ debug bypass matches the V_q gate; IBZ
+		# activation otherwise depends only on orbit-closure of the
+		# centroid set (checked downstream in ``_resolve_ibz_q_list``).
+		_use_ibz_w_requested = not bool(
+			int(os.environ.get('LORRAX_FORCE_FULL_BZ', '0')))
 		_ibz_tables = None
 		if _use_ibz_w_requested and getattr(sym, 'q_irr_full_idx', None) is not None:
 			from .v_q_g_flat import _resolve_ibz_q_list
