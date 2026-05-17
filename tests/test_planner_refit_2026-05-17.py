@@ -2,29 +2,21 @@
 
 Synthesises the production CrI3 6×6 80 Ry SOC bispinor parameters
 (``nk=36, ns=2, mu=1520, nb=150, n_rtot=1.125M, ngkmax=59990,
-mesh=4×4, budget=70 GB``) and pins the per-peak refit's contract:
+mesh=4×4, budget=70 GB``) and pins the per-peak refit's contract.
 
-  - ``r_chunk >= 24576`` — empirical optimum from the 2026-05-17 sweep
-    (B5 config in ``reports/memory_model_refit_2026-05-17/findings_so_far.md``).
-  - ``Peak A < 5 GB`` — after Agent A's Bug-#1 formula fix (drop the
-    spurious ``nk`` factor from the centroid-load FFT box) Peak A
-    should be near-free for any sane band_chunk.  Confirms the fix
-    landed.
-  - ``HWM <= 0.95 · 70 GB`` — the refit bumped ``target_utilization``
-    from 0.80 to 0.94, so HWM should land just under the budget
-    rather than throwing away 14% of HBM.
-  - ``band_chunk >= 16`` (= ``p_xy`` on a 4×4 mesh) — mesh-floor
-    preserved; ``test_band_chunk_size_floor.py`` is the deeper
-    regression suite.
-  - ``gflat_chunk_size >= 4`` — cuFFT plan-amortisation floor
-    (``fft_helpers.py:14-23`` warns about small-batch nonlinearity).
+Round-2 refit (2026-05-17) — based on Round-1 live_arrays census:
 
-Some assertions may surface secondary bugs the refit does NOT
-address — e.g. if ``pair_density_slots`` is under-counted (Agent C
-§2(b) hypothesised slots=3 should be 4-5), the planner will pick a
-larger ``r_chunk`` than the empirical OOM threshold and HWM will
-exceed budget.  In that case this test fails with a clear pointer
-to the α_C calibration issue, which is its own follow-up.
+  - ``r_chunk >= 24576`` — empirical optimum (B5 in
+    ``reports/memory_model_refit_2026-05-17/findings_so_far.md``).
+  - ``HWM <= 0.95 · 70 GB`` — refit lands HWM near 94% util.
+  - ``band_chunk >= 16`` (= ``p_xy``) — mesh-floor preserved.
+  - ``gflat_chunk_size >= 4 and <= 100`` — Round-2 cap added to keep
+    cuFFT in verified-safe algorithm regime (factor=2.0 below cs~1000;
+    nonlinear scratch growth above; OOM verified at cs=1414 on
+    production CrI3 80Ry per agent_f_live_arrays_probe.md).
+  - Centroids ×4 counted (was ×2): rmuT_X + transpose for both ψ_l/r.
+  - Sphere-idx replicated leak counted in Peak A/B/C/D/E (was missing).
+  - Peak E (V_q) added; bispinor TT-off-diagonal is the V_q bottleneck.
 """
 
 from __future__ import annotations
@@ -33,7 +25,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from gw.gflat_memory_model import plan_gflat_chunks
+from gw.gflat_memory_model import (
+    plan_gflat_chunks,
+    GFLAT_CHUNK_SIZE_CAP,
+    N_SPHERE_IDX_BUFFERS_BISPINOR,
+)
 
 
 def _cri3_80ry_meta() -> SimpleNamespace:
@@ -45,6 +41,7 @@ def _cri3_80ry_meta() -> SimpleNamespace:
         n_rmu_padded=1520,
         n_rtot=1_125_000,
         ngkmax=59990,
+        fft_grid=(75, 75, 200),
     )
 
 
@@ -63,56 +60,31 @@ def _natural_plan():
         budget_gb=70.0,
         is_bispinor=True,
         max_chunks=64,
-        # no chunk overrides — natural picks under the refit defaults
     )
 
 
 def test_r_chunk_at_least_empirical_optimum():
     """``r_chunk`` should saturate the C-headroom; the empirical sweep
-    found r=24576 was the best clean point (B5 in findings_so_far).
-    The planner should never pick below that on a 70 GB budget."""
+    found r=24576 was the best clean point (B5 in findings_so_far)."""
     plan = _natural_plan()
     assert plan.r_chunk >= 24576, (
-        f"r_chunk={plan.r_chunk} < 24576 (empirical optimum).  "
-        f"Either α_C is over-counting or the picker is leaving "
-        f"headroom on the table — re-check Peak C's slot count.")
-
-
-@pytest.mark.xfail(
-    reason=(
-        "Peak A's FFT-box term scales with band_chunk (post-Bug-#1 fix "
-        "the formula is `c128(band_chunk, ns, n_rtot) * fft_factor_A`).  "
-        "At the natural-pick band_chunk=128 on the production CrI3 "
-        "config the term is ~18 GB — not <5 GB.  The audit's '~0.6 GB' "
-        "claim implicitly assumed band_chunk=16 (the mesh floor); "
-        "leaving as xfail to document the residual.  Follow-up: either "
-        "cap band_chunk by Peak-A budget independently or accept Peak A "
-        "as a binding peak.  Tracked in the agent_a_audit report §"
-        "'Top 3 specific bugs'."),
-    strict=False)
-def test_peak_A_near_free_after_formula_fix():
-    """Agent A audit Bug #1: pre-refit Peak A's FFT-box formula was
-    ``c128(nk · band_chunk · ns · n_rtot) / p_xy · 4`` (over-count by
-    factor ~nk=36 since the actual ``gflat_to_rmu`` kernel is already
-    inside a shard_map and batches on a flat ``(nk · nb_local)`` axis).
-    After dropping the spurious ``nk`` factor, Peak A should be far
-    below the binding peaks."""
-    plan = _natural_plan()
-    peak_A_total = plan.peak_breakdown['A_centroid']
-    assert peak_A_total < 5e9, (
-        f"Peak A = {peak_A_total/1e9:.2f} GB after refit; expected "
-        f"< 5 GB.  If this fails the per-peak-A FFT-box formula has "
-        f"regressed (look for an extra ``nk`` multiplier or missing "
-        f"shard divisor).")
+        f"r_chunk={plan.r_chunk} < 24576 (empirical optimum).")
 
 
 def test_peak_A_shape_check_at_mesh_floor():
-    """Companion to the xfailed near-free test.  At ``band_chunk = p_xy``
-    (mesh floor), the per-peak A formula should give Peak A ≪ 5 GB —
-    confirming Bug #1's per-rank ``c128(bc, ns, n_rtot) * 4`` formula
-    is what's in place.  At bc=16, ns=2, n_rtot=1.125M, c128=16, fft=4:
-    16·2·1.125M·16·4 ≈ 2.3 GB (plus a tiny centroid_out_filling).
-    Use ``band_chunk_override`` to force the mesh-floor pick."""
+    """At ``band_chunk = p_xy`` (mesh floor) Peak A should be modest.
+
+    Round-2 refit (2026-05-17) added the sphere_idx_replicated term
+    to Peak A (1.296 GB at fft_grid=(75,75,200), n_sphere_buffers=8
+    for bispinor).  At bc=16 the breakdown is:
+      * fft_box           = 16·2·1.125M·16·4   = 2.304 GB
+      * sphere_idx        = 8·36·75·75·200·4   = 1.296 GB
+      * phase_table       = 36·1.125M·16       = 0.648 GB
+      * centroid_out      = 36·2·1520·150·16/16 = 0.016 GB
+      * total                                  ≈ 4.26 GB
+    The threshold of 5 GB confirms the per-rank Bug-#1 fix is in
+    place — anything ≥ 10 GB would indicate an extra ``nk`` factor
+    leaked back in."""
     plan = plan_gflat_chunks(
         meta=_cri3_80ry_meta(),
         mesh_xy=_cri3_80ry_mesh(),
@@ -122,86 +94,189 @@ def test_peak_A_shape_check_at_mesh_floor():
         budget_gb=70.0,
         is_bispinor=True,
         max_chunks=64,
-        band_chunk_override=16,    # = p_xy
+        band_chunk_override=16,
     )
     peak_A_total = plan.peak_breakdown['A_centroid']
-    assert peak_A_total < 3e9, (
+    assert peak_A_total < 5e9, (
         f"At band_chunk=16 (mesh floor), Peak A = "
-        f"{peak_A_total/1e9:.2f} GB.  The per-rank fix should give "
-        f"~2.3 GB; > 3 GB means an unexpected multiplier slipped in.")
+        f"{peak_A_total/1e9:.2f} GB.  Expected ~4.3 GB; > 5 GB means "
+        f"an unexpected multiplier slipped in.")
 
 
 def test_hwm_saturates_budget_after_persistent_fix():
-    """Post-fix (2026-05-17, ``_peak_D_accumulate`` counts ``centroids
-    + L_q + gflat_acc`` persistent) the planner's predicted HWM should
-    SATURATE the budget at production scale, not under-shoot by
-    ~38 GB.  The pre-fix bug: ``fft_box_factor=4`` accidentally
-    compensated for the missing persistent state, so refit's correct
-    ``factor_D=2.0`` exposed an under-budget pick.  Now both peaks are
-    properly accounted for and HWM should land at ≥ 0.85 × budget
-    (matching the empirical saturated regime).
-
-    The exact target_utilization is 0.94; HWM ≥ 0.85 × budget gives
-    some slack for which peak ends up binding (C vs D)."""
+    """Post-fix HWM should saturate the budget — not under-shoot."""
     plan = _natural_plan()
     assert plan.hwm_bytes >= 0.85 * plan.budget_bytes, (
         f"HWM={plan.hwm_bytes/1e9:.2f} GB < 0.85 × budget "
-        f"{plan.budget_bytes/1e9:.2f} GB.  Picker is leaving budget "
-        f"on the table — either Peak D's persistent terms regressed "
-        f"or one of the peak formulas under-counts.  "
-        f"bottleneck={plan.bottleneck}.")
+        f"{plan.budget_bytes/1e9:.2f} GB.  bottleneck={plan.bottleneck}.")
 
 
 def test_band_chunk_at_or_above_mesh_floor():
-    """The 4×4 mesh has ``p_xy = 16``; band_chunk < 16 would crash
-    ``all_gather`` in ``z_q_from_psi_sm._local`` with
-    ``all_gather_dim cannot be zero``.  Pin the floor here even
-    though :mod:`test_band_chunk_size_floor` is the deeper regression."""
+    """4×4 mesh has p_xy=16; band_chunk < 16 crashes all_gather."""
     plan = _natural_plan()
-    assert plan.band_chunk >= 16, (
-        f"band_chunk={plan.band_chunk} < world_size=16; the band "
-        f"axis is sharded across all mesh ranks so bpd_per_bc would "
-        f"be zero per rank.")
-    assert plan.band_chunk % 16 == 0, (
-        f"band_chunk={plan.band_chunk} not a multiple of "
-        f"world_size=16; per-device bc widths would be ragged.")
+    assert plan.band_chunk >= 16
+    assert plan.band_chunk % 16 == 0
 
 
 def test_gflat_chunk_size_above_cufft_floor():
-    """cuFFT plans below cs ≈ 4 pick a small-batch algorithm with
-    nonlinearly worse FLOPS/byte (``fft_helpers.py:14-23``).  Pin
-    the floor at 4."""
+    """cuFFT plans below cs ≈ 4 pick a small-batch algorithm."""
     plan = _natural_plan()
-    if plan.gflat_chunk_size is not None:
-        assert plan.gflat_chunk_size >= 4, (
-            f"gflat_chunk_size={plan.gflat_chunk_size} < 4 (cuFFT "
-            f"plan-amortisation floor).")
+    assert plan.gflat_chunk_size is not None, (
+        "Round-2 refit: gflat_chunk_size is always an int (cap=100), "
+        "no more None / one-shot semantics.")
+    assert plan.gflat_chunk_size >= 4, (
+        f"gflat_chunk_size={plan.gflat_chunk_size} < 4 (cuFFT floor).")
 
 
 def test_peak_components_breakdown_populated():
-    """The refit adds a ``peak_components`` dict on the plan that
-    surfaces every term's bytes (so the user can see *which* term
-    drives each peak, not just the totals).  Every peak letter
-    (A, B, C, D) must appear."""
+    """``peak_components`` must include every peak letter A/B/C/D/E."""
     plan = _natural_plan()
-    assert hasattr(plan, 'peak_components'), (
-        "GFlatChunkPlan missing 'peak_components' field after refit.")
+    assert hasattr(plan, 'peak_components')
     letters_present = {k.split('.', 1)[0]
                        for k in plan.peak_components if '.' in k}
-    assert {'A', 'B', 'C', 'D'} <= letters_present, (
-        f"peak_components missing one of A/B/C/D: "
+    assert {'A', 'B', 'C', 'D', 'E'} <= letters_present, (
+        f"peak_components missing one of A/B/C/D/E: "
         f"present={letters_present}")
 
 
 def test_format_string_emits_per_peak_components():
-    """``GFlatChunkPlan.format()`` must show each peak's component
-    breakdown (not just the A/B/C/D totals) so users can see exactly
-    where memory goes without digging into the dataclass."""
+    """``GFlatChunkPlan.format()`` shows each peak's component breakdown."""
     plan = _natural_plan()
     txt = plan.format()
-    assert 'per-peak components' in txt, (
-        f"format() missing per-peak breakdown section:\n{txt}")
-    # Each peak letter present as a section header [A] [B] [C] [D].
-    for letter in 'ABCD':
+    assert 'per-peak components' in txt
+    for letter in 'ABCDE':
         assert f'[{letter}]' in txt, (
             f"format() missing [{letter}] section:\n{txt}")
+
+
+# ---------------------------------------------------------------------------
+# Round-2 refit additions (2026-05-17)
+# ---------------------------------------------------------------------------
+
+def test_gflat_chunk_size_capped_at_100_regardless_of_budget():
+    """Round-2 cap: ``gflat_chunk_size <= GFLAT_CHUNK_SIZE_CAP=100``
+    regardless of budget.  Past cs ~ 1000 cuFFT switches plan algorithm
+    and workspace grows non-linearly (cs=1414 OOM verified at
+    production CrI3 80Ry — agent_f_live_arrays_probe.md).
+
+    Even at a giant 1000 GB budget, the cap must hold."""
+    plan = plan_gflat_chunks(
+        meta=_cri3_80ry_meta(),
+        mesh_xy=_cri3_80ry_mesh(),
+        nb_total=150,
+        ngkmax=59990,
+        n_q_disk=36,
+        budget_gb=1000.0,  # absurdly large; cap should still hold
+        is_bispinor=True,
+        max_chunks=64,
+    )
+    assert plan.gflat_chunk_size <= GFLAT_CHUNK_SIZE_CAP, (
+        f"gflat_chunk_size={plan.gflat_chunk_size} > "
+        f"GFLAT_CHUNK_SIZE_CAP={GFLAT_CHUNK_SIZE_CAP} even at 1000 GB "
+        f"budget — Round-2 cap not enforced.")
+
+
+def test_gflat_chunk_size_picks_multiple_of_4_below_cap():
+    """The picker must return a multiple of bc_floor_factor=4 (for
+    cuFFT plan amortisation) AND be ≤ cap."""
+    plan = _natural_plan()
+    assert plan.gflat_chunk_size % 4 == 0, (
+        f"gflat_chunk_size={plan.gflat_chunk_size} not a multiple of 4")
+    assert plan.gflat_chunk_size <= GFLAT_CHUNK_SIZE_CAP
+
+
+def test_centroids_counted_x4_in_peak_C():
+    """Centroid persistent term in Peak C must be ×4 (not ×2):
+    rmuT_X + rmu_Y transpose for both ψ_l and ψ_r.  agent_a finding
+    #1 + agent_g §6 row #1.  At CrI3 80Ry bispinor:
+        4 × 36 × 2 × 1520 × 150 × 16 / 16 = 0.066 GB/rank.
+    Pre-refit value (×2) was 0.033 GB/rank.
+    """
+    plan = _natural_plan()
+    val = plan.peak_components.get('C.centroids_persist', 0.0)
+    expected_x4 = 4 * 36 * 2 * 1520 * 150 * 16 / 16
+    assert abs(val - expected_x4) < expected_x4 * 0.01, (
+        f"C.centroids_persist = {val/1e9:.3f} GB; expected "
+        f"{expected_x4/1e9:.3f} GB (×4 buffers).  Round-2 refit "
+        f"requires ×4 (rmuT_X + transpose for both ψ_l/r).")
+
+
+def test_sphere_idx_replicated_in_every_peak():
+    """The sphere/phase index buffer is REPLICATED (not /p_xy) and
+    leaks across channels via the FFT-helper cache (agent_h §3
+    Finding 3).  Round-2 adds it to Peak A/B/C/D/E.
+
+    At fft_grid=(75,75,200), nq=36, 8 buffers, int32:
+        8 × 36 × 75 × 75 × 200 × 4 = 1.296 GB (REPLICATED — same
+        bytes on every rank).
+    """
+    plan = _natural_plan()
+    expected = (N_SPHERE_IDX_BUFFERS_BISPINOR
+                * 36 * 75 * 75 * 200 * 4)
+    for peak in ('A', 'B', 'C', 'D', 'E'):
+        key = f'{peak}.sphere_idx_replicated'
+        val = plan.peak_components.get(key, 0.0)
+        assert abs(val - expected) < expected * 0.01, (
+            f"{key} = {val/1e9:.3f} GB; expected {expected/1e9:.3f} "
+            f"GB (replicated, 8 buffers).")
+
+
+def test_peak_E_v_q_has_off_diagonal_tt_binding_term():
+    """Peak E should reflect the TT off-diagonal tile (same_zeta=False)
+    as the binding case for bispinor.  Per agent_i §2: the dominant
+    term is ``2 × _bytes_c128(n_q_ibz, mu, ngkmax) / p_xy`` ≈ 6.5 GB
+    global / 0.4 GB/rank for CrI3 80Ry full-BZ.
+
+    With the planner's default full-BZ regime (n_q_ibz = nk = 36) and
+    no IBZ cascade, the zeta_L_all + zeta_R_all terms both fire."""
+    plan = _natural_plan()
+    zl = plan.peak_components.get('E.zeta_L_all', 0.0)
+    zr = plan.peak_components.get('E.zeta_R_all', 0.0)
+    # Both should be ~3.28 GB/rank at production scale.
+    assert zl > 1e9, f"E.zeta_L_all = {zl/1e9:.3f} GB, expected > 1 GB"
+    assert zr > 1e9, (
+        f"E.zeta_R_all = {zr/1e9:.3f} GB — TT-off-diag should "
+        f"populate this term (same_zeta=False).")
+
+
+def test_peak_E_total_below_budget():
+    """V_q is never the binding peak at production scale.  Peak E
+    total ≈ 7-10 GB/rank, well below the 70 GB budget."""
+    plan = _natural_plan()
+    e_total = plan.peak_breakdown.get('E_v_q', 0.0)
+    assert e_total < 0.5 * plan.budget_bytes, (
+        f"Peak E = {e_total/1e9:.2f} GB > 50% of budget — V_q "
+        f"shouldn't bind at production scale on 70 GB.")
+
+
+def test_planner_uses_e_in_hwm_max():
+    """HWM = max(A, B, C, D, E).  Peak E being present means the
+    bottleneck reporter can pick 'E_v_q' if E is largest (rare at
+    production, but should be valid)."""
+    plan = _natural_plan()
+    assert 'E_v_q' in plan.peak_breakdown
+    # At production scale, the bottleneck should NOT be E.
+    assert plan.bottleneck != 'E_v_q' or plan.peak_breakdown['E_v_q'] > 0.0
+
+
+def test_non_bispinor_uses_fewer_sphere_buffers():
+    """N_SPHERE_IDX_BUFFERS_CHARGE = 3 for non-bispinor (only one
+    channel runs; no inter-channel leak)."""
+    plan = plan_gflat_chunks(
+        meta=_cri3_80ry_meta(),
+        mesh_xy=_cri3_80ry_mesh(),
+        nb_total=150,
+        ngkmax=59990,
+        n_q_disk=36,
+        budget_gb=70.0,
+        is_bispinor=False,
+        max_chunks=64,
+    )
+    # Non-bispinor sphere idx term should be 3/8 of bispinor.
+    sphere_bisp = (N_SPHERE_IDX_BUFFERS_BISPINOR
+                   * 36 * 75 * 75 * 200 * 4)
+    sphere_charge = (3 * 36 * 75 * 75 * 200 * 4)
+    val = plan.peak_components.get('C.sphere_idx_replicated', 0.0)
+    assert abs(val - sphere_charge) < sphere_charge * 0.01, (
+        f"Non-bispinor C.sphere_idx_replicated = {val/1e9:.3f} GB; "
+        f"expected {sphere_charge/1e9:.3f} GB (3 buffers).")

@@ -877,3 +877,75 @@ Pending: bispinor-transverse CCT path (Round-9); multi-node DoE sweep;
 See `reports/zeta_rchunk_memory_model_2026-05-13/PATH_D_PICKUP.md` →
 `round8_efficiency_audit.md` → `round5_unified_plan.md` for the
 mandatory pickup-reading order on this initiative.
+
+## Appendix: Persistent Arrays Verified by `jax.live_arrays()` Probes
+
+The Round-2 refit (commit `38xxxxx`, 2026-05-17) added per-array
+accounting to `gflat_memory_model.plan_gflat_chunks` based on
+`jax.live_arrays()` probes in `isdf_fitting.py` and `gw_init.py`.
+This appendix is the cheat-sheet for future agents: when
+`LORRAX_MEM_DEBUG=1` shows an unexpected shape in HBM, grep this
+table for the shape and you'll find the planner term to inspect.
+
+Quantitative measurements are for the production CrI3 6×6 80 Ry SOC
+bispinor on 16 GPUs (4×4 mesh, ``p_xy=16``, ``nk=36``, ``ns=2``,
+``mu=1520``, ``nb=150``, ``ngkmax=59990``, ``n_rtot=1.125M``,
+``fft_grid=(75, 75, 200)``). All probe data from
+`reports/memory_model_refit_2026-05-17/` (Agents F/G/H/I).
+
+### A. Persistent throughout ζ-fit (alive from `prepare_isdf` through `compute_V_q`)
+
+| live_arrays signature | meta-var formula | per-rank GB | allocation site | sharded? | planner term | smoking gun |
+|---|---|---|---|---|---|---|
+| ``c128 (nk, mu, nb, ns)`` ×4 buffers per channel (rmuT_X + transposed Y form, for both ψ_l and ψ_r) | ``4 × nk × ns × mu × nb_total × 16 / p_xy`` | 0.066 | ``common/load_wfns.py:474`` (``gflat_to_rmu`` fills psi_rmu_Y/X); transpose copy created at ``common/isdf_fitting.py: fit_zeta_to_h5`` step 1 (slice/divide-by-norms doubles each into a Y-form view) | μ-sharded on ``('x','y')`` | ``{B,C,D}.centroids_persist`` (and ``E.psi_centroids_persistent``) | Agent F probe 1B + Agent G §6 row #1: pre-refit counted ×2, runtime shows ×4 |
+| ``c128 (nq, mu, mu)`` | ``nq × mu × mu × 16 / p_xy`` | 0.083 | ``common/isdf_fitting.py: factor_c_q`` (step 3 of ``fit_zeta_to_h5``) | μ-sharded | ``{B,C,D}.L_q`` | Agent F probe 1A row 2: 1.33 GB global / 0.083 GB/rank |
+| ``c128 (nq_disk, mu, ngkmax)`` | ``nq_disk × mu × ngkmax × 16 / p_xy`` | 3.283 | ``common/isdf_fitting.py:2443`` (``jnp.zeros`` jit just before r-chunk loop) | μ-sharded | ``D.gflat_acc`` | Agent F probe 1A row 1: 52.52 GB global / 3.28 GB/rank |
+| ``int32 (nk, nx, ny, nz)`` ×N (N=3 charge / 8 bispinor) | ``N × nq × fft_grid_x × fft_grid_y × fft_grid_z × 4`` | 1.296 (REPLICATED) | ``common/gvec_fft_box.py:55`` (``g_index = np.full((nk, nx, ny, nz), ngkmax, dtype=np.int32)``); leaks via ``make_flat_k_fft`` cache between channels | **REPLICATED — not /p_xy** | ``{A,B,C,D,E}.sphere_idx_replicated`` | Agent H §3 Finding 3: 2→3→6→7→8 buffers measured across channels; same per-rank bytes as global |
+
+### B. fit_one_rchunk transient (alive only after fit returns, freed when accumulate consumes)
+
+| live_arrays signature | meta-var formula | per-rank GB | allocation site | sharded? | planner term | smoking gun |
+|---|---|---|---|---|---|---|
+| ``c128 (nq_disk, mu, r_chunk)`` | ``nq_disk × mu × r_chunk × 16 / p_xy`` | 1.16 (at r=21232) | ``common/isdf_fitting.py: fit_one_rchunk`` return | μ-sharded | ``D.zeta_chunk`` (transient) | Agent F probe 1B (+18.59 GB vs 1A); freed at probe 1C via ``donate_argnums=(1,)`` |
+
+### C. fit_one_rchunk inside-jit (XLA preallocated-temp; invisible to live_arrays)
+
+| live_arrays signature | meta-var formula | per-rank GB | allocation site | sharded? | planner term | smoking gun |
+|---|---|---|---|---|---|---|
+| ``c128 (nk, ns, ns, mu_local, r_loc)`` ×3 slots (aliased to P_l_R_conj / P_r_R / FFT box) | ``3 × nk × ns² × mu × r_chunk × 16 / p_xy`` | 14-20 (at r=21232-24576) | ``common/isdf_fitting.py:625-627`` (P_l_acc/P_r_acc) + ``isdf_fitting.py:713-720`` (P_l_R_conj reshape) | μ × r sharded | ``C.P_pair_concurrent_slots`` | Agent D M1: 3 distinct preallocated-temp slots × 20.04 GiB each in module_0438 |
+
+### D. accumulate_rchunk_to_gflat inside-jit
+
+| live_arrays signature | meta-var formula | per-rank GB | allocation site | sharded? | planner term | smoking gun |
+|---|---|---|---|---|---|---|
+| ``c128 (gflat_chunk_size, nx, ny, nz)`` + ``c128 (gflat_chunk_size, n_rtot)`` flat = 2 box-sized slots | ``factor_D × gflat_chunk_size × n_rtot × 16``, ``factor_D = 2.0`` | 0.036 (cs=1) → 3.6 (cs=100 cap) | ``common/wfn_transforms.py: accumulate_rchunk_to_gflat._kernel`` (lines 1057-1107) | XLA-internal | ``D.accumulate_fft_box`` | Agent D M2 module_0474: 2 box slots × 6.03 GiB at cs=360; Agent D M3 module_0363: 2 × 17 MB at cs=1; factor_D=2.0 confirmed at both |
+
+### E. V_q per-tile transient (allocated/freed per tile in `_compute_V_q_g_flat_one_tile`)
+
+| live_arrays signature | meta-var formula | per-rank GB | allocation site | sharded? | planner term | smoking gun |
+|---|---|---|---|---|---|---|
+| ``c128 (n_q_ibz, mu, ngkmax)`` (CC or TT diag) | ``n_q_ibz × mu × ngkmax × 16 / p_xy`` | 3.28 | ``gw/v_q_g_flat.py:372-384`` (zeta_L_all pre-loop) | μ-sharded | ``E.zeta_L_all`` | Agent I §2 binding term |
+| ``c128 (n_q_ibz, mu, ngkmax)`` second copy (TT off-diagonal only) | ``n_q_ibz × mu × ngkmax × 16 / p_xy`` | 3.28 (off-diag) / 0 (CC + diag) | ``gw/v_q_g_flat.py: same`` | μ-sharded | ``E.zeta_R_all`` | Agent I §2: doubles slab term for ``same_zeta=False`` |
+| ``c128 (mu, ngkmax)`` (resharded inside per-q kernel) | ``mu × ngkmax × 16 / p_x`` | 0.365 | ``gw/v_q_g_flat.py: _make_per_q_kernel.fn`` (reshard to ``P('x', None)``) | sharded /p_x (REPLICATED on y) | ``E.zeta_L_on_x_axis`` | Agent I §2 |
+| ``c128 (n_q_ibz, mu, mu)`` (V_acc; post-unfold piggybacks same slot) | ``n_q_ibz × mu × mu × 16 / p_xy`` | 0.083 | ``gw/v_q_g_flat.py:372`` | μ-sharded | ``E.V_acc`` + ``E.V_acc_full_BZ`` | Agent H probe P5: post-V_q live_total +1.33 GB global = V_qmunu_CC |
+| ``c128 (n_q_full, mu, mu)`` ×{9, 6} (Lorentz mix, bispinor IBZ-T only) | ``{9, 6} × nq × mu × mu × 16 / p_xy`` | 1.22 total | ``gw/v_q_bispinor.py:587-728`` (``unfold_v_q_bispinor_lorentz``) | μ-sharded | ``E.tt_full_in_9_tiles`` + ``E.tt_mixed_6_tiles`` | Agent I §4 |
+
+### How to use this appendix
+
+If `LORRAX_MEM_DEBUG=1` prints a `live_arrays()` row whose shape you
+don't recognise:
+
+1. Grep for the shape pattern (e.g. ``(36, 1520, 59990)``) in the
+   table above.
+2. The "planner term" column tells you which `_peak_*` helper in
+   `src/gw/gflat_memory_model.py` models it.
+3. The "smoking gun" column points to the report under
+   `reports/memory_model_refit_2026-05-17/` that first measured it.
+
+If the live_arrays-observed shape is NOT in the table, it's likely
+a new buffer the planner doesn't model — open an issue against
+`gflat_memory_model.py` and consider adding it. The procedure is:
+(a) identify allocation site via `id(arr.sharding.mesh)` + Python
+trace; (b) classify lifetime (alive across which peaks?); (c) add
+a term to the appropriate `_peak_*` dict.
+
