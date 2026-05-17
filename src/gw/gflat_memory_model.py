@@ -95,7 +95,8 @@ class GFlatChunkPlan:
     n_r_chunks: int
     gflat_chunk_size: Optional[int]   # None ⇒ one-shot
     hwm_bytes: float
-    peak_breakdown: dict              # name -> bytes
+    peak_breakdown: dict              # name -> bytes  (A/B/C/D totals)
+    peak_components: dict             # full per-term breakdown
     bottleneck: str                   # name of binding peak
     budget_bytes: float
 
@@ -111,11 +112,28 @@ class GFlatChunkPlan:
             f"    HWM estimate       = {hwm:.2f} GB/dev "
             f"({100 * hwm / max(bg, 1e-9):.0f}% of budget) "
             f"[bottleneck: {self.bottleneck}]",
-            f"    peak breakdown (GB/dev):",
+            f"    peak totals (GB/dev):",
         ]
         for name, b in sorted(self.peak_breakdown.items(),
                               key=lambda kv: -kv[1]):
             lines.append(f"      {name:.<24s} {b/1e9:>7.2f}")
+        # Per-peak component breakdown.  Self-explaining: shows exactly
+        # which term drives each peak (so users can target the actual
+        # binding term rather than guessing).
+        lines.append(f"    per-peak components (GB/dev):")
+        # Group components by peak letter (the prefix before the dot
+        # in the key) and emit in A→D order so the format is stable.
+        groups: dict[str, list[tuple[str, float]]] = {}
+        for k, v in self.peak_components.items():
+            if "." in k:
+                peak_letter, term = k.split(".", 1)
+            else:
+                peak_letter, term = "_misc", k
+            groups.setdefault(peak_letter, []).append((term, v))
+        for peak_letter in sorted(groups):
+            lines.append(f"      [{peak_letter}]")
+            for term, v in sorted(groups[peak_letter], key=lambda kv: -kv[1]):
+                lines.append(f"        {term:.<22s} {v/1e9:>7.3f}")
         return "\n".join(lines)
 
 
@@ -127,23 +145,35 @@ class GFlatChunkPlan:
 # log explain WHY each peak is what it is.
 
 def _peak_A_centroid_load(*, nk, ns, n_rtot, nb_per_load, band_chunk,
-                          mu, p, p_xy, fft_box_factor) -> dict:
+                          mu, p, p_xy, fft_box_factor_A) -> dict:
     """Pre-loop ψ(G) → r-space → centroid sample.  Runs once per channel
-    (charge + 3 transverse on bispinor)."""
-    return {
+    (charge + 3 transverse on bispinor).
+
+    FFT-box formula audited 2026-05-17 (Agent A audit, Bug #1).  The
+    actual ``gflat_to_rmu._kernel`` (wfn_transforms.py:611-851) batches
+    on a flat ``(nk · nb_local)`` axis INSIDE a shard_map.  Its
+    per-iter FFT box is ``c128[cs, ns, nx, ny, nz]`` where ``cs`` is
+    the planner-picked chunk size — **per-rank already**, no nk factor.
+    The pre-refit formula multiplied by ``nk`` (over-count ~36× on
+    CrI3 6×6) and additionally divided by ``p_xy`` (the kernel is
+    already inside shard_map so the box is per-rank natively).  Use
+    ``band_chunk`` as the proxy for ``cs`` (the centroid-load caller
+    picks ``cs`` from its own per-rank HBM budget; band_chunk is a
+    representative upper bound)."""
+    out = {
         "centroid_out_filling":
             _bytes_c128(nk, ns, mu, nb_per_load, shard=p),
         "phase_table":
             _bytes_c128(nk, n_rtot),
         "fft_box":
-            _bytes_c128(nk, band_chunk, ns, n_rtot, shard=p_xy)
-            * fft_box_factor,
+            _bytes_c128(band_chunk, ns, n_rtot) * fft_box_factor_A,
     }
+    return {f"A.{k}": v for k, v in out.items()}
 
 
 def _peak_B_cct_chol(*, nk, ns, nq, mu, p, p_xy) -> dict:
     """CCT/Cholesky pre-loop on (μ, ν) full-grid."""
-    return {
+    out = {
         "centroids_persistent":  # L+R copies, sharded
             2 * _bytes_c128(nk, ns, mu, ns, shard=p_xy),
         "P_l_plus_P_r_open_spin":
@@ -153,6 +183,7 @@ def _peak_B_cct_chol(*, nk, ns, nq, mu, p, p_xy) -> dict:
         "L_q":
             _bytes_c128(nq, mu, mu, shard=p_xy),
     }
+    return {f"B.{k}": v for k, v in out.items()}
 
 
 def _peak_C_fit_one_rchunk(*, nk, ns, nq, mu, n_rtot, r_chunk,
@@ -206,10 +237,19 @@ def _peak_C_fit_one_rchunk(*, nk, ns, nq, mu, n_rtot, r_chunk,
 
 
 def _peak_D_accumulate(*, nq_disk, mu, n_rtot, ngkmax, r_chunk,
-                       gflat_chunk_size, p, p_xy, fft_box_factor) -> dict:
+                       gflat_chunk_size, p, p_xy, fft_box_factor_D) -> dict:
     """accumulate_rchunk_to_gflat peak — runs after fit_one_rchunk
     returns (its P_l/P_r are freed); ζ_chunk is the only fit_one_rchunk
-    output still live."""
+    output still live.
+
+    Uses a per-peak ``fft_box_factor_D`` (default 2.0, vs Peak A's 4.0).
+    The accumulate kernel's FFT (wfn_transforms.py:1057-1107) is shape
+    ``c128[cs, nx, ny, nz]`` (no ns axis — ζ is spin-traced upstream)
+    with a small batch ``cs`` and huge spatial axes.  Runtime debug
+    print (chunk_size=360 → 6.48 GB/rank = bare 1× box) shows cuFFT's
+    out-of-place 3D fftn needs ~2× the box scratch, not 4× (which was
+    calibrated for the 6-D centroid-load IFFT nest in Peak A).
+    """
     # gflat_acc is the persistent G-flat ζ accumulator (μ-flat sharded
     # across mesh).
     persistent = {
@@ -219,7 +259,7 @@ def _peak_D_accumulate(*, nq_disk, mu, n_rtot, ngkmax, r_chunk,
         "zeta_chunk":
             _bytes_c128(nq_disk, mu, r_chunk, shard=p_xy),
         "accumulate_fft_box":
-            _bytes_c128(gflat_chunk_size, n_rtot) * fft_box_factor,
+            _bytes_c128(gflat_chunk_size, n_rtot) * fft_box_factor_D,
         # Sphere/phase tables baked into closure: ~tens of MB; ignored.
     }
     out = {f"D.{k}": v for k, v in persistent.items()}
@@ -239,8 +279,10 @@ def plan_gflat_chunks(
     ngkmax: int,
     n_q_disk: int,
     budget_gb: float,
-    target_utilization: float = 0.80,
-    fft_box_factor: float = 4.0,
+    target_utilization: float = 0.94,
+    fft_box_factor: float | None = None,    # legacy alias for fft_box_factor_A
+    fft_box_factor_A: float = 4.0,
+    fft_box_factor_D: float = 2.0,
     pair_density_slots_transverse: int = 3,
     pair_density_slots_charge: int = 3,
     is_bispinor: bool = True,
@@ -252,24 +294,44 @@ def plan_gflat_chunks(
     """Pick (band_chunk, r_chunk, gflat_chunk_size) to land near
     ``target_utilization · budget_gb`` per device.
 
-    Algorithm (deterministic, no iterative search):
+    Algorithm (deterministic, no iterative search; **r-first picker**
+    refit 2026-05-17 per the memory-model refit task — was band-first):
 
-      1. Compute persistent footprint (centroids + L_q + gflat_acc).
-      2. Pick ``band_chunk`` first — primary lever on Peak A / Peak C
-         FFT-box.  Maximize as power-of-2 divisor of nb_total subject
-         to the band-FFT box fitting in ``utilisation·budget`` minus
-         persistent.
-      3. Pick ``r_chunk`` — maximize subject to Peak C fitting after
-         band_chunk is fixed.  Lower-bounded by ``n_rmu``; upper-bounded
-         by ``n_rtot / max_chunks`` floor (i.e. r_chunk ≥ that), then
-         rounded down to a divisor of n_rtot when reasonable.
-      4. Pick ``gflat_chunk_size`` — set to one-shot if Peak D fits;
-         else binary-search down.
+      1. Compute persistent footprint (centroids + L_q + gflat_acc) and
+         the shared headroom ``H = target − persistent_common``.
+      2. Pick ``r_chunk`` first against Peak C's transient slope
+         (``α_C`` = pair_density_slots · per-r rank-5 bytes).  This is
+         the expensive axis — its iters are slow (solve dominates
+         per-chunk wall) — so we saturate it first.
+      3. Pick ``gflat_chunk_size`` against Peak D's transient.  Peak C
+         and Peak D transients do **not** coexist (the ``fit_one_rchunk``
+         fused jit returns + ``block_until_ready`` before
+         ``accumulate_rchunk_to_gflat`` runs — see
+         ``isdf_fitting.py:2442–2496``), so each draws from the same
+         shared headroom independently.
+      4. Pick ``band_chunk`` against Peak A's FFT-box transient
+         (centroid load pre-loop, runs once per channel; near-free
+         after the per-peak A formula fix that dropped the spurious
+         ``nk`` factor).
 
     Overrides take precedence and skip the corresponding step.
 
+    Per-peak ``fft_box_factor_{A,D}`` allow independent calibration of
+    the centroid-load 3D IFFT nest (Peak A, factor 4 — empirically
+    validated for 6-D ``(nk, B_b/P, ns, n_r)`` shards) vs the
+    accumulate flat-batch 3D FFT (Peak D, factor 2 — runtime debug
+    print at cs=360 → 6.48 GB/rank = bare 1× box, cuFFT scratch ~1×).
+    Passing ``fft_box_factor=`` is back-compatible: it sets the A
+    factor (legacy alias).
+
     Returns a :class:`GFlatChunkPlan` with HWM = max of {Peak A, B, C, D}.
     """
+    # Legacy alias: callers that still pass ``fft_box_factor=`` get the
+    # value routed to ``fft_box_factor_A`` (the legacy single-factor
+    # behaviour modelled the centroid-load IFFT nest).  ``fft_box_factor_D``
+    # keeps its per-peak default unless overridden separately.
+    if fft_box_factor is not None:
+        fft_box_factor_A = float(fft_box_factor)
     p_x = int(mesh_xy.shape['x'])
     p_y = int(mesh_xy.shape['y'])
     p_xy = p_x * p_y                                # mesh.size
@@ -284,59 +346,43 @@ def plan_gflat_chunks(
     budget = budget_gb * 1e9
     target = budget * target_utilization
 
-    # ---- 1. band_chunk -----------------------------------------------------
-    if band_chunk_override and band_chunk_override > 0:
-        band_chunk = int(band_chunk_override)
-    else:
-        # Cost of band_chunk's FFT box at Peak C:
-        # nk · bc · ns · n_rtot · 16 / p_xy · fft_box_factor
-        per_unit_bc = (_bytes_c128(nk, ns, n_rtot, shard=p_xy)
-                       * fft_box_factor)
-        # Budget for the FFT box: 50% of target (the rest goes to P_l,
-        # P_r, etc.).  Conservative; can be tuned.
-        bc_cap = max(1, int(0.5 * target / max(per_unit_bc, 1.0)))
-        bc_cap = min(bc_cap, int(nb_total))
-        # Round to power of 2 for divisibility-friendliness.
-        band_chunk = _round_pow2_down(bc_cap)
-    # Mesh-floor: band axis is band-flat-sharded across all p_xy ranks
-    # inside ``PsiGStore`` (per-bc local band count
-    # ``bpd_per_bc = band_chunk // p_xy``).  When ``band_chunk < p_xy``
-    # each device gets zero bands per bc, and the downstream
-    # ``z_q_from_psi_sm._local`` ``all_gather(axis_name=('x','y'),
-    # axis=1, tiled=True)`` lowers to "all_gather_dim cannot be zero".
-    # Auto-bump to a multiple of p_xy (rounded up) so every device
-    # receives ≥ 1 band per bc.  The user-set value is a hint;
-    # correctness for the sharded band axis trumps the request.
-    band_chunk_pre = int(band_chunk)
-    if p_xy > 1 and band_chunk_pre % p_xy != 0:
-        band_chunk = ((band_chunk_pre + p_xy - 1) // p_xy) * p_xy
-    if band_chunk < p_xy:
-        band_chunk = p_xy
-    band_chunk = min(int(band_chunk), max(int(nb_total), p_xy))
-    if band_chunk != band_chunk_pre:
-        print(
-            f"  [gflat_memory_model] band_chunk_size bumped from "
-            f"{band_chunk_pre} to {band_chunk} to satisfy world_size="
-            f"{p_xy} (band axis is sharded across all mesh ranks; "
-            f"per-device bands per bc = band_chunk // world_size must "
-            f"be ≥ 1).")
-    n_bc = max(1, math.ceil(nb_total / max(band_chunk, 1)))
+    # Picker order (r → gflat → band).  Per Agent C §1 (2026-05-17):
+    # Peak C and Peak D transients do NOT coexist — ``fit_one_rchunk``
+    # returns + ``block_until_ready`` before ``accumulate_rchunk_to_gflat``
+    # starts (``isdf_fitting.py:2442-2496``), so each peak's transient
+    # draws from the same shared headroom independently.  Joint
+    # optimisation is unnecessary; sequential picks against the SAME
+    # headroom suffice.  Order r_chunk → gflat_chunk_size → band_chunk
+    # because r is the expensive axis (slow-solve iters), gflat is the
+    # cheap middle axis, band is near-free after the per-peak A formula
+    # fix.
 
-    # ---- 2. r_chunk --------------------------------------------------------
-    # Cost at Peak C grows linearly in r_chunk via the dominant term —
-    # ``pair_density_slots`` concurrent rank-5 P_pair tensors (XLA's
-    # BufferAssignment-verified slot count).  Everything else (psi_bc_Y,
-    # FFT box, Z_q) fits inside the same slots when lifetimes don't
-    # overlap, so we don't double-count them here.
+    # Mesh-floor helper for band_chunk (used in step 3).
+    def _bump_band_chunk_to_mesh_floor(bc_in: int) -> int:
+        """Round bc up to a multiple of p_xy, floored at p_xy, capped
+        at max(nb_total, p_xy).  See ``test_band_chunk_size_floor.py``
+        for the all_gather_dim=0 regression motivating this contract."""
+        bc = int(bc_in)
+        if p_xy > 1 and bc % p_xy != 0:
+            bc = ((bc + p_xy - 1) // p_xy) * p_xy
+        if bc < p_xy:
+            bc = p_xy
+        return min(bc, max(int(nb_total), p_xy))
+
+    # ---- 1. r_chunk --------------------------------------------------------
+    # Pick r_chunk against Peak C's transient slope α_C = slots ·
+    # rank-5 P-pair bytes/row.  Shared headroom = target − persistent.
+    # Persistent during Peak C: centroids (L+R) + L_q.  (gflat_acc is
+    # alive too but its sole accounting lives at Peak D to avoid double
+    # counting — Peak C's max-sum already covers it via the persistent
+    # mass that's also in D's base.)
     pair_density_slots = (
         pair_density_slots_transverse if is_bispinor
         else pair_density_slots_charge)
     α_C = pair_density_slots * _bytes_c128(nk, ns, ns, mu, shard=p_xy)
-    # Constant part of Peak C: centroids + L_q.  (FFT box and Z_q
-    # share the rank-5 slots; they don't add an independent term.)
     c_C_const = (
-        2 * _bytes_c128(nk, ns, mu, nb_total, shard=p_xy)
-        + _bytes_c128(nq, mu, mu, shard=p_xy)
+        2 * _bytes_c128(nk, ns, mu, nb_total, shard=p_xy)  # centroids L+R
+        + _bytes_c128(nq, mu, mu, shard=p_xy)              # L_q
     )
     headroom_C = max(0.0, target - c_C_const)
 
@@ -346,32 +392,30 @@ def plan_gflat_chunks(
         # Lower bound: r_chunk ≥ μ (per user note — Σ_μν output dominates
         # any savings from finer chunking).
         r_lo = min(mu, n_rtot)
-        # Upper bound: r_chunk ≤ n_rtot / max_chunks_floor (so we don't
-        # blow up chunk count).  In practice we cap n_chunks ≤ max_chunks.
-        r_hi = n_rtot                       # absolute ceiling
-        # From the budget: r_chunk ≤ headroom / α_C.
+        # Upper bound from the budget: r_chunk ≤ headroom / α_C.
         r_from_budget = (int(headroom_C / α_C) if α_C > 0 else n_rtot)
-        r_chunk = max(r_lo, min(r_hi, r_from_budget))
-        # Enforce max_chunks cap.
+        r_chunk = max(r_lo, min(n_rtot, r_from_budget))
+        # Enforce max_chunks cap (so chunk count stays manageable for
+        # XLA's scan trace + Python overhead).
         r_chunk = max(r_chunk, math.ceil(n_rtot / max_chunks))
         r_chunk = min(r_chunk, n_rtot)
         # Round down to a multiple of p_xy so the (μ_XY, r_) sharding
-        # at the solve output divides cleanly (matches the existing
-        # chunker's rounding).
+        # at the solve output divides cleanly.
         if p_xy > 1:
             r_chunk -= r_chunk % p_xy
             r_chunk = max(r_chunk, p_xy)
     n_r_chunks = max(1, math.ceil(n_rtot / r_chunk))
 
-    # ---- 3. gflat_chunk_size ----------------------------------------------
-    # Peak D: gflat_acc + zeta_chunk + accumulate_fft_box × fft_factor.
-    # FFT box per-rank: gflat_chunk_size * n_rtot * 16 * factor.
+    # ---- 2. gflat_chunk_size ----------------------------------------------
+    # Pick gflat_chunk_size against Peak D's transient (independent of C
+    # because C's P-pair slots are freed before D allocates its FFT box).
+    # Peak D persistent base = gflat_acc + zeta_chunk(r_chunk) + the
+    # centroids+L_q that stay live for the rest of fit_zeta.
     persistent_D = _bytes_c128(nq_disk, mu, ngkmax, shard=p_xy)
     transient_zeta_D = _bytes_c128(nq_disk, mu, r_chunk, shard=p_xy)
     centroids_persist = (
         2 * _bytes_c128(nk, ns, mu, nb_total, shard=p_xy)
     )
-    # We assume centroids + L_q stay live during the accumulate call.
     base_D = (
         centroids_persist
         + _bytes_c128(nq, mu, mu, shard=p_xy)
@@ -379,15 +423,58 @@ def plan_gflat_chunks(
         + transient_zeta_D
     )
     headroom_D = max(0.0, target - base_D)
-    # One-shot box rows: N = nq_disk · mu / p_xy.
     cs_one_shot = max(1, int(math.ceil(nq_disk * mu / p_xy)))
-    fft_per_row = _bytes_c128(n_rtot) * fft_box_factor
+    fft_per_row = _bytes_c128(n_rtot) * fft_box_factor_D
+    # cuFFT plan-amortisation floor: below ~4 rows per batch the plan
+    # picks a small-batch algorithm with worse FLOPS/byte (fft_helpers
+    # has docstring warning at line 14-23).  Enforce gflat_chunk_size ≥ 4.
+    GFLAT_CHUNK_FLOOR = 4
     if gflat_chunk_size_override and gflat_chunk_size_override > 0:
         gflat_chunk_size = int(gflat_chunk_size_override)
     elif fft_per_row * cs_one_shot <= headroom_D:
         gflat_chunk_size = None  # one-shot fits
     else:
-        gflat_chunk_size = max(1, int(headroom_D / max(fft_per_row, 1.0)))
+        cs_from_budget = max(1, int(headroom_D / max(fft_per_row, 1.0)))
+        gflat_chunk_size = max(GFLAT_CHUNK_FLOOR, cs_from_budget)
+
+    # ---- 3. band_chunk -----------------------------------------------------
+    # Pick band_chunk against Peak A's FFT-box transient (centroid-load
+    # IFFT nest, runs once per channel in the pre-loop).  After the per-
+    # peak A formula fix (Bug #1 in Agent A audit) the box is just
+    # ``cs · ns · n_rtot · 16 · fft_box_factor_A`` per rank inside the
+    # shard_map — no nk factor — so this is near-free.
+    if band_chunk_override and band_chunk_override > 0:
+        band_chunk = _bump_band_chunk_to_mesh_floor(int(band_chunk_override))
+    else:
+        # Per-bc FFT-box cost (per-rank).  Compare to remaining headroom
+        # against persistent_C.  We split 50% so other Peak-C terms keep
+        # their slack — but with the formula fix, even 100% would
+        # rarely matter.  Empirical: at bc=32 the term is ~140 MB.
+        per_unit_bc = (_bytes_c128(ns, n_rtot)
+                       * fft_box_factor_A)
+        bc_cap = max(1, int(0.5 * target / max(per_unit_bc, 1.0)))
+        bc_cap = min(bc_cap, int(nb_total))
+        band_chunk = _round_pow2_down(bc_cap)
+        band_chunk_pre = band_chunk
+        band_chunk = _bump_band_chunk_to_mesh_floor(band_chunk)
+        if band_chunk != band_chunk_pre and band_chunk_pre < p_xy:
+            # Auto-pick path hit the mesh floor.  No print — that
+            # rounding is internal-detail.  Only the override path
+            # speaks up (covered below).
+            pass
+
+    # If the override path bumped the value, surface the change.
+    if band_chunk_override and band_chunk_override > 0:
+        bc_pre = int(band_chunk_override)
+        if band_chunk != bc_pre:
+            print(
+                f"  [gflat_memory_model] band_chunk_size bumped from "
+                f"{bc_pre} to {band_chunk} to satisfy world_size="
+                f"{p_xy} (band axis is sharded across all mesh ranks; "
+                f"per-device bands per bc = band_chunk // world_size must "
+                f"be ≥ 1).")
+
+    n_bc = max(1, math.ceil(nb_total / max(band_chunk, 1)))
 
     # ---- 4. Compute per-peak breakdowns + HWM -----------------------------
     cs_for_box = (gflat_chunk_size if gflat_chunk_size is not None
@@ -395,7 +482,7 @@ def plan_gflat_chunks(
     peak_A = _peak_A_centroid_load(
         nk=nk, ns=ns, n_rtot=n_rtot, nb_per_load=nb_total,
         band_chunk=band_chunk, mu=mu, p=p, p_xy=p_xy,
-        fft_box_factor=fft_box_factor,
+        fft_box_factor_A=fft_box_factor_A,
     )
     peak_B = _peak_B_cct_chol(
         nk=nk, ns=ns, nq=nq, mu=mu, p=p, p_xy=p_xy,
@@ -403,14 +490,14 @@ def plan_gflat_chunks(
     peak_C = _peak_C_fit_one_rchunk(
         nk=nk, ns=ns, nq=nq, mu=mu, n_rtot=n_rtot, r_chunk=r_chunk,
         band_chunk=band_chunk, n_bc=n_bc, p=p, p_x=p_x, p_y=p_y,
-        p_xy=p_xy, fft_box_factor=fft_box_factor,
+        p_xy=p_xy, fft_box_factor=fft_box_factor_A,
         pair_density_slots=pair_density_slots,
         is_charge_channel=(not is_bispinor),
     )
     peak_D = _peak_D_accumulate(
         nq_disk=nq_disk, mu=mu, n_rtot=n_rtot, ngkmax=ngkmax,
         r_chunk=r_chunk, gflat_chunk_size=cs_for_box, p=p, p_xy=p_xy,
-        fft_box_factor=fft_box_factor,
+        fft_box_factor_D=fft_box_factor_D,
     )
     A_total = sum(peak_A.values())
     B_total = sum(peak_B.values())
@@ -420,10 +507,13 @@ def plan_gflat_chunks(
                    'C_fit_one_rchunk': C_total, 'D_accumulate': D_total}
     bottleneck = max(peak_totals, key=peak_totals.get)
     hwm = peak_totals[bottleneck]
-    # Build the breakdown dict prefixed by peak.
-    breakdown = {}
+    # Per-component breakdown for the formatted log.  The _peak_X
+    # helpers already prefix each component key with the peak letter
+    # ("A.fft_box", "C.P_pair_concurrent_slots", etc.) so we just
+    # merge them into one dict.
+    peak_components: dict = {}
     for src in (peak_A, peak_B, peak_C, peak_D):
-        breakdown.update(src)
+        peak_components.update(src)
 
     return GFlatChunkPlan(
         band_chunk=int(band_chunk),
@@ -432,7 +522,8 @@ def plan_gflat_chunks(
         gflat_chunk_size=(None if gflat_chunk_size is None
                           else int(gflat_chunk_size)),
         hwm_bytes=float(hwm),
-        peak_breakdown=peak_totals,  # high-level: A/B/C/D totals
+        peak_breakdown=peak_totals,        # high-level: A/B/C/D totals
+        peak_components=peak_components,   # per-term breakdown
         bottleneck=bottleneck,
         budget_bytes=float(budget),
     )
