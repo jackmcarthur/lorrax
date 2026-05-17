@@ -201,13 +201,46 @@ class PsiGStore:
         # grows (CrI3) or the broader async-reader story comes back.
         from common import timing
         sharding_spec = P(None, ('x', 'y'), None, None)
+        file_nbands = int(self.loader.nbands)
         for bc_idx, bc_range in enumerate(self.band_chunk_ranges):
+            bc_start, bc_end = int(bc_range[0]), int(bc_range[1])
+            # Past-mnband zero-pad — same contract as
+            # ``load_centroids_band_chunked`` (commit 2129fad).  When
+            # ``world_size`` rounds ``b_id_4`` past the file's
+            # ``mnband`` (CrI3 6×6 30Ry SOC: mnband=86, world_size=16
+            # ⇒ b_id_4=96), the final bc range can exceed
+            # ``loader.nbands``.  ``WfnLoader.load`` rejects
+            # ``b_hi > nbands`` at ``file_io/wfn_loader.py:678``; cap
+            # the loader call and zero-pad the band axis up to
+            # ``bc_end - bc_start`` afterward, reapplying the
+            # ``(None, ('x', 'y'), None, None)`` sharding.  Pad rows
+            # are physically zero — the
+            # ``_zero_user_band_pad_in_shard`` post-step below would
+            # zero them anyway since their global band index
+            # ``>= user_band_stop``, so the contract for downstream
+            # consumers is identical to the pre-fix path whenever
+            # ``bc_end <= loader.nbands`` (this branch never fires).
+            bc_end_in_file = min(bc_end, file_nbands)
             with timing.section("psi_G_store.populate.loader_load"):
                 psi_G_bc = self.loader.load(
-                    bands=bc_range, k="full_bz",
+                    bands=(bc_start, bc_end_in_file), k="full_bz",
                     sharding=sharding_spec,
                     bispinor=self.bispinor,
                 )
+                jax.block_until_ready(psi_G_bc)
+            nb_total = bc_end - bc_start
+            nb_loaded = int(psi_G_bc.shape[1])
+            if nb_loaded < nb_total:
+                pad_bands = nb_total - nb_loaded
+                psi_G_bc = jnp.concatenate(
+                    [psi_G_bc,
+                     jnp.zeros(
+                         (psi_G_bc.shape[0], pad_bands,
+                          psi_G_bc.shape[2], psi_G_bc.shape[3]),
+                         dtype=psi_G_bc.dtype)],
+                    axis=1)
+                psi_G_bc = jax.lax.with_sharding_constraint(
+                    psi_G_bc, NamedSharding(self.mesh, sharding_spec))
                 jax.block_until_ready(psi_G_bc)
             b_lo = self._bc_band_offsets[bc_idx]
             b_hi = self._bc_band_offsets[bc_idx + 1]
