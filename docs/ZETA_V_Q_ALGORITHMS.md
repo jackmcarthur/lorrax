@@ -707,24 +707,69 @@ ISDF-noise-floor V_q dump and a ~unity-relative-error wrong V_q.
 See `reports/trs_sym_audit_2026-05-14/SYMMETRY_CONVENTIONS.md` for
 the empirical validation.
 
-Implementation (`symmetry_maps.py:267-298`): one `@jax.jit` with
-`out_shardings=V_sh`. Gather IBZ rows at `irr_idx` to produce
-`V_at_irr[n_q_full, μ, μ]`; apply two `take_along_axis` with
-`perm_q = sym_perm[sym_idx]` on axes 1 and 2 (μ', ν' double-permute)
-using `mode='promise_in_bounds'`; multiply by the per-(q, μ)
-umklapp phase `exp(2π i q_irr·L_μ)` outer-differenced over (μ, ν);
-conj-wrap the TRS-augmented rows.
+**Implementation** (`symmetry_maps.py`): a `@shard_map` body inside a
+content-hashed `@jax.jit` with `in_specs = out_specs = P(None,'x','y')`.
+The naive `take_along_axis` on a sharded μ (or ν) axis silently
+forces XLA to all-gather that axis (Px× or Py× single-tile peak per
+rank), which is unacceptable at large $P_x \cdot P_y$. The shard_map
+body replaces the all-gather with two volume-preserving
+`lax.all_to_all(tiled=True)` redistributions per spatial axis:
 
-`promise_in_bounds` skips XLA's OOB-fill branch; `perm_q` is
-permutation-by-construction so the bounds check is gratuitous, and
-the flag also dodges an HLO verifier `s32/s64` mismatch under
-shard_map+x64 (commit `49b7f84`).
+1. `all_to_all('x', split_axis=ν, concat_axis=μ)` — input
+   `(n_q, μ/P_x, ν/P_y)` → output `(n_q, μ, ν/(P_x · P_y))`. Each
+   rank now holds the full μ axis at the cost of an extra split on ν.
+   **Per-rank byte count is unchanged** (`n_q · μ · ν / (P_x · P_y)`):
+   it is a redistribution, not a broadcast.
+2. `take_along_axis(perm_q[:, :, None], axis=μ)` on the now-local μ
+   axis (no inter-rank traffic).
+3. `all_to_all('x', split_axis=μ, concat_axis=ν)` — reverse step (1)
+   back to the canonical sharding.
+4. Same triple on `'y'` for the ν permutation.
 
-**Trivial-IBZ short-circuit** (`symmetry_maps.py:189-201`): when
-`ntran=1` (e.g. nosym runs), the IBZ is already the full BZ —
-`irr_idx` is identity, `sym_idx` is all zeros. The helper returns
-`V_q_ibz` directly. This bypass is correct (no-op when the IBZ is
-the full BZ) and dodges the verifier issue.
+Per-rank peak memory stays at exactly **1× single-tile**
+(`n_q · n_rmu² / (P_x · P_y)`) for the entire unfold, regardless of
+`P_x · P_y` (including the case `P_x · P_y > n_q^\text{full}`, which
+breaks any q-axis-splitting design). Wire traffic per `all_to_all`
+is the standard $(P-1)/P$ × tile per rank — NCCL `ncclAllToAll` on
+GPU.
+
+The umklapp phase `exp(2π i q_irr · L_μ)` is computed replicated
+inside the body and applied via two `dynamic_slice_in_dim` calls
+indexed by `lax.axis_index('x')` and `lax.axis_index('y')` to pick
+this rank's μ-tile and ν-tile slices.
+
+`mode='promise_in_bounds'` skips XLA's OOB-fill branch (`perm_q` is
+permutation-by-construction so the check is gratuitous) and dodges
+an HLO verifier `s32/s64` mismatch under shard_map+x64.
+
+**Cache by signature.** `_get_unfold_v_q_jit` memoises the compiled
+HLO by `(V_q shape, sym-table bytes, mesh id)`. V_q's call and W_q's
+call (and any future caller at the same shape) share one compile.
+The sym tables are closure-captured (constant-folded by XLA); a
+runtime-args form is ~2× slower per call because JAX must marshal
+the tables every invocation.
+
+**Trivial-IBZ short-circuit**: when `ntran=1` (e.g. nosym runs), the
+IBZ is already the full BZ — `irr_idx` is identity, `sym_idx` is all
+zeros. The helper returns `V_q_ibz` directly without entering the
+shard_map. Nosym runs incur zero collective cost.
+
+**Callers.** Three call sites share this single helper:
+
+* `gw/v_q_g_flat.py` — V_q g-flat path (the canonical V_q computation).
+* `gw/v_q.py` — V_q legacy path (deprecation track).
+* `gw/gw_jax.py` — W_q. The chi0/W block slices `V_q_full` and
+  `chi0_q_full` to the IBZ via `slice_q_full_to_ibz` (same module),
+  factors $(1 - V_q \chi_q)$ and solves at IBZ q's only, then
+  unfolds the resulting $W_q$ with `unfold_v_q`. Wired 2026-05-16
+  with the same Cholesky/LU helpers used by V_q. Reduces the dominant
+  $W_q$ linalg cost by $\sim n_\text{tran}$×.
+
+`slice_q_full_to_ibz(arr_full, q_irr_full_idx, *, out_sharding=...)`
+is the IBZ-projection counterpart: a jit-cached gather along the q
+axis preserving the `P(None,'x','y')` sharding. Together
+`slice_q_full_to_ibz` + `unfold_v_q` form the IBZ↔full-BZ pair used
+end-to-end for both V_q and W_q.
 
 ---
 
@@ -790,8 +835,10 @@ for the ζ-fit kernel.
 | V_q ζ_L reshard (XY → 'x') | `v_q_g_flat.py:101` | `all_to_all` and an `all_reduce` (see §11.7.5) | ~50 MB / q (MoS2) → ~840 MB / q (CrI3 80 Ry) |
 | V_q ζ_R reshard (XY → 'y') | `v_q_g_flat.py:102` | `all_to_all` (skipped when `same_zeta=True`) | same |
 | V_q G-chunk inner GEMM | `v_q_g_flat.py:123` | **none** — local cuBLAS GEMM | n/a |
-| `unfold_v_q` x-axis gather | `symmetry_maps.py:275-277` | `all_gather` along 'x' axis | ~191 MB / call (CrI3 6×6) |
-| `unfold_v_q` y-axis gather | `symmetry_maps.py:278-280` | `all_gather` along 'y' axis | ~191 MB / call |
+| `unfold_v_q` μ-permute on 'x' | `symmetry_maps.py` (shard_map body) | 2× `all_to_all(tiled=True)` on `'x'` | (P_x−1)/P_x × tile per rank, peak 1× tile |
+| `unfold_v_q` ν-permute on 'y' | `symmetry_maps.py` (shard_map body) | 2× `all_to_all(tiled=True)` on `'y'` | (P_y−1)/P_y × tile per rank, peak 1× tile |
+| `slice_q_full_to_ibz` | `symmetry_maps.py` | local gather on q axis; no collective | n/a (q axis is replicated) |
+| W_q IBZ slice + unfold (gw_jax) | `gw/gw_jax.py` | same as `unfold_v_q` + `slice_q_full_to_ibz` above | identical to V_q's unfold |
 
 The ζ-fit band gather is the single biggest collective per-call: it
 fires once per bc-iter (10–25 iters per r-chunk × ~16 r-chunks at
@@ -856,9 +903,13 @@ production kernels:
 * No collective inside the V_q `_g_chunk_body` scan
   (`v_q_g_flat.py:114-123`). The G-axis contraction is a pure
   local GEMM.
-* No collective at the σ-output boundary of `unfold_v_q` beyond the
-  two `take_along_axis` gathers (the unfold uses a forward gather,
-  not a sum-reduce, on the centroid axes).
+* No `all_gather` or sum-reduce inside `unfold_v_q`. The original
+  implementation issued a full `all_gather` along μ and ν (Px× /
+  Py× single-tile peak per rank). The current design uses paired
+  `all_to_all(tiled=True)` redistributions that keep per-rank peak
+  at 1× tile and scale to arbitrary `Px·Py`, including the regime
+  `Px·Py > n_q^\text{full}`. See §11.6.3 for the design and
+  `symmetry_maps.py` for the body.
 
 The clean count is the **direct payoff** of the scan-INSIDE-shard_map
 discipline: every collective is a deliberate site (band gather, IBZ
@@ -1036,9 +1087,11 @@ per rank at `chunk_size=64`.
 | `gw/v_q_g_flat.py:499-569` | `compute_all_V_q_g_flat` | charge-channel public entry point |
 | `gw/v_q_bispinor.py:57-174` | `UNIQUE_TILES`, `_make_v_per_G_for_tile` | 7-tile enumeration + per-tile weight |
 | `gw/v_q_bispinor.py:482-…` | `compute_V_q_bispinor_g_flat_to_h5` | bispinor orchestrator |
-| `symmetry_maps.py:18-108` | `find_irreducible_bz_points` | IBZ k/q resolver |
-| `symmetry_maps.py:110-299` | `unfold_v_q` | IBZ → full BZ centroid double-permute + L-phase + TRS conj |
-| `symmetry_maps.py:416-…` | `SymMaps` | sym tables, IBZ index helpers |
+| `symmetry_maps.py` | `find_irreducible_bz_points` | IBZ k/q resolver |
+| `symmetry_maps.py` | `slice_q_full_to_ibz` | full-BZ → IBZ q-axis gather (sharding-preserving, jit-cached) |
+| `symmetry_maps.py` | `unfold_v_q` | IBZ → full BZ centroid double-permute + L-phase + TRS conj; shard_map + paired `all_to_all` for 1×-tile peak per rank |
+| `symmetry_maps.py` | `SymMaps` | sym tables, IBZ index helpers |
+| `gw/gw_jax.py` | chi0/W block | W_q = (1-V_qχ_q)⁻¹V_q solved at IBZ via `slice_q_full_to_ibz` + Cholesky/LU, unfolded with `unfold_v_q` |
 | `file_io/zeta_reader.py` | `ZetaReader` | G-flat per-q HDF5 slab reader |
 | `file_io/slab_io.py` | `SlabIO` | phdf5 writer with `valid_shape=` μ-pad clip |
 
