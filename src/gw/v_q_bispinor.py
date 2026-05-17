@@ -814,8 +814,9 @@ class BispinorVqReader:
         n_L = self.n_rmu_C if mu_L == 0 else self.n_rmu_T
         n_R = self.n_rmu_C if nu_L == 0 else self.n_rmu_T
         sharding = NamedSharding(self._mesh, P(None, 'x', 'y'))
+        n_L_p, n_R_p = self._padded_shape_LR(n_L, n_R)
         return jax.lax.with_sharding_constraint(
-            jnp.zeros((self.n_q_total, n_L, n_R), dtype=jnp.complex128),
+            jnp.zeros((self.n_q_total, n_L_p, n_R_p), dtype=jnp.complex128),
             sharding,
         )
 
@@ -824,8 +825,29 @@ class BispinorVqReader:
         n_R = self.n_rmu_C if nu_L == 0 else self.n_rmu_T
         return (self.n_q_total, n_L, n_R)
 
+    def _padded_shape_LR(self, n_L: int, n_R: int) -> tuple[int, int]:
+        """Round n_L, n_R up to the total mesh-product (``gx*gy``).  This
+        mirrors the write-side ``_round_up_to_mesh`` at
+        v_q_tile.py:1116-1118 (which pads to ``p_x*p_y``) and matches the
+        ψ-side μ extent built by ``load_centroids_band_chunked`` — so a
+        single pad here makes Σ^B's V tile broadcast against ψ with no
+        further padding step in sigma_x_bispinor.
+
+        Padding to ``gx*gy`` (rather than per-axis ``gx``/``gy``) is also
+        what makes sharded reads with spec P(None,'x','y') divide
+        cleanly under any 2D mesh factorisation."""
+        proc = int(self._mesh.shape['x']) * int(self._mesh.shape['y'])
+        def _pad(n):
+            rem = n % proc
+            return n + ((proc - rem) if rem else 0)
+        return _pad(int(n_L)), _pad(int(n_R))
+
     def get_tile(self, mu_L: int, nu_L: int) -> jax.Array:
-        """Return V^{μ_L, ν_L}_q as a sharded JAX array (n_q, n_L, n_R) c128."""
+        """Return V^{μ_L, ν_L}_q as a sharded JAX array (n_q, n_L_padded,
+        n_R_padded) c128.  When n_L/n_R aren't divisible by the mesh axis
+        size, the trailing μ rows are zero-padded — mirrors the write-side
+        invariant in v_q_tile._round_up_to_mesh and lets Σ^B run at any
+        process count without a runtime divisibility error."""
         if not (0 <= mu_L <= 3 and 0 <= nu_L <= 3):
             raise ValueError(f"Lorentz indices must be in {{0..3}}; got "
                              f"({mu_L}, {nu_L}).")
@@ -834,21 +856,33 @@ class BispinorVqReader:
         spec = P(None, 'x', 'y')
         if (mu_L, nu_L) in HERMITIAN_PAIRS:
             companion = HERMITIAN_PAIRS[(mu_L, nu_L)]
+            n_L_c, n_R_c = self._tile_shape(*companion)[1:]
+            n_L_p, n_R_p = self._padded_shape_LR(n_L_c, n_R_c)
             V_companion = self._io.read_slab(
                 tile_dataset_name(*companion),
+                shape=(self.n_q_total, n_L_p, n_R_p),
+                valid_shape=(self.n_q_total, n_L_c, n_R_c),
                 mesh=self._mesh, partition_spec=spec)
             # Hermitian: V[j,i](q,μ,ν) = V[i,j](q,ν,μ)*
             return jnp.conj(jnp.swapaxes(V_companion, -1, -2))
         # Direct read (member of UNIQUE_TILES)
+        n_L, n_R = self._tile_shape(mu_L, nu_L)[1:]
+        n_L_p, n_R_p = self._padded_shape_LR(n_L, n_R)
         return self._io.read_slab(
             tile_dataset_name(mu_L, nu_L),
+            shape=(self.n_q_total, n_L_p, n_R_p),
+            valid_shape=(self.n_q_total, n_L, n_R),
             mesh=self._mesh, partition_spec=spec)
 
     def get_g0_CC(self) -> jax.Array | None:
         """q=0 head for the charge channel only.  None if absent."""
         try:
+            n_L = int(self.n_rmu_C)
+            n_L_p, _ = self._padded_shape_LR(n_L, n_L)
             return self._io.read_slab(
                 tile_dataset_name(0, 0) + "_g0",
+                shape=(self.n_q_total, n_L_p),
+                valid_shape=(self.n_q_total, n_L),
                 mesh=self._mesh,
                 partition_spec=P(None, 'x'))
         except Exception:
