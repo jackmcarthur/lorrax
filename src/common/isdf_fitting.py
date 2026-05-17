@@ -29,6 +29,60 @@ def _mem_report(label):
     p = s.get('peak_bytes_in_use', 0) / 1e9
     if jax.process_index() == 0:
         print(f'  [MEM {label}] used={u:.3f} peak={p:.3f} GB', flush=True)
+
+
+def mem_probe(label, *, only_rank0=True):
+    """``LORRAX_MEM_DEBUG=1`` runtime probe of process-wide HBM at named sites.
+
+    Reports the JAX/XLA allocator ``bytes_in_use+peak`` plus the top-10
+    ``jax.live_arrays()`` shapes.  Module-level so both ``fit_zeta_to_h5``
+    (r-chunk loop) and ``gw_init.prepare_isdf_and_wavefunctions`` (V_q
+    sites) call the SAME helper — single source of truth for the full
+    ζ-fit + V_q HBM lifecycle map.  HLO buffer-assignment.txt is per-jit
+    and cannot prove cross-jit liveness; this fills the gap.  Cheap when
+    unset (env-var check only; no JAX calls in the early-exit path).
+
+    Round-0 (commit 5c884ac) wired this at three points per r-chunk in
+    fit_zeta_to_h5; Round-1 extends to zeta_fit_start, pre_rchunk_loop,
+    zeta_fit_end, pre_v_q, post_v_q for the full lifecycle.  See
+    reports/memory_model_refit_2026-05-17/.
+    """
+    if not os.environ.get("LORRAX_MEM_DEBUG"):
+        return
+    if only_rank0 and jax.process_index() != 0:
+        return
+    dev = jax.devices()[0]
+    stats = dev.memory_stats() if hasattr(dev, "memory_stats") else {}
+    if stats is None:
+        stats = {}
+    bytes_in_use = stats.get("bytes_in_use", -1)
+    peak_bytes_in_use = stats.get("peak_bytes_in_use", -1)
+    live = jax.live_arrays()
+    by_shape = {}
+    total_live = 0
+    for arr in live:
+        if not hasattr(arr, "shape"):
+            continue
+        try:
+            sz = int(np.prod(arr.shape)) * arr.dtype.itemsize
+        except Exception:
+            continue
+        total_live += sz
+        key = (tuple(arr.shape), str(arr.dtype))
+        entry = by_shape.get(key)
+        if entry is None:
+            by_shape[key] = [1, sz]
+        else:
+            entry[0] += 1
+            entry[1] += sz
+    print(f"[mem_probe {label}] in_use={bytes_in_use/1e9:.2f} GB  "
+          f"peak={peak_bytes_in_use/1e9:.2f} GB  "
+          f"live_count={len(live)} live_total={total_live/1e9:.2f} GB",
+          flush=True)
+    top = sorted(by_shape.items(), key=lambda kv: -kv[1][1])[:10]
+    for (shape, dtype), (cnt, sz) in top:
+        print(f"[mem_probe {label}]   {dtype} {shape} x {cnt} = "
+              f"{sz/1e9:.2f} GB", flush=True)
 from common import jax_profile
 from .cholesky_2d import (
     cholesky_2d_batched,
@@ -1826,6 +1880,13 @@ def fit_zeta_to_h5(
         slab_io_backend = SlabIOBackend.H5PY_ALLGATHER
     use_ffi_io = (slab_io_backend is SlabIOBackend.PHDF5_FFI)
 
+    # P0 — entry of ζ-fit.  Captures the persistent state set up by
+    # ``prepare_isdf_and_wavefunctions`` BEFORE ζ-fit starts: ψ at
+    # centroids (full [b0, b4) band range, both Y and X transposes),
+    # gflat_acc allocation will not have happened yet.  Forms the
+    # planner's "Peak C const" baseline.  Round-1 addition.
+    mem_probe("zeta_fit_start")
+
     nx, ny, nz = meta.fft_grid
     # Two μ extents flow through this function (see common/meta.py:38):
     # ``n_rmu`` is the LOGICAL centroid count from the centroid file;
@@ -2342,52 +2403,12 @@ def fit_zeta_to_h5(
     t_chunk_start = time.perf_counter()
 
     # ``LORRAX_MEM_DEBUG=1`` — runtime probe of process-wide HBM at
-    # r-chunk boundaries.  Three points per iter (start / after
-    # fit_one_rchunk / after accumulate) print the JAX/XLA allocator
-    # bytes_in_use+peak plus the top-10 ``jax.live_arrays()`` shapes.
-    # This is the only way to confirm whether centroids+L_q remain
-    # resident across the fit_one_rchunk → accumulate jit boundary —
-    # HLO's buffer-assignment.txt is per-jit and cannot prove
-    # cross-jit liveness (see reports/memory_model_refit_2026-05-17/
-    # agent_e_cross_jit_lifetime.md).  Cheap when unset (env-var
-    # check only; no JAX calls in the early-exit path).
-    def _mem_probe(label, *, only_rank0=True):
-        if not os.environ.get("LORRAX_MEM_DEBUG"):
-            return
-        if only_rank0 and jax.process_index() != 0:
-            return
-        dev = jax.devices()[0]
-        stats = dev.memory_stats() if hasattr(dev, "memory_stats") else {}
-        if stats is None:
-            stats = {}
-        bytes_in_use = stats.get("bytes_in_use", -1)
-        peak_bytes_in_use = stats.get("peak_bytes_in_use", -1)
-        live = jax.live_arrays()
-        by_shape = {}
-        total_live = 0
-        for arr in live:
-            if not hasattr(arr, "shape"):
-                continue
-            try:
-                sz = int(np.prod(arr.shape)) * arr.dtype.itemsize
-            except Exception:
-                continue
-            total_live += sz
-            key = (tuple(arr.shape), str(arr.dtype))
-            entry = by_shape.get(key)
-            if entry is None:
-                by_shape[key] = [1, sz]
-            else:
-                entry[0] += 1
-                entry[1] += sz
-        print(f"[mem_probe {label}] in_use={bytes_in_use/1e9:.2f} GB  "
-              f"peak={peak_bytes_in_use/1e9:.2f} GB  "
-              f"live_count={len(live)} live_total={total_live/1e9:.2f} GB",
-              flush=True)
-        top = sorted(by_shape.items(), key=lambda kv: -kv[1][1])[:10]
-        for (shape, dtype), (cnt, sz) in top:
-            print(f"[mem_probe {label}]   {dtype} {shape} x {cnt} = "
-                  f"{sz/1e9:.2f} GB", flush=True)
+    # named lifecycle sites.  The module-level ``mem_probe`` helper is
+    # reused so the r-chunk loop sites and the gw_init V_q sites all
+    # share one source of truth.  HLO's buffer-assignment.txt is per-jit
+    # and cannot prove cross-jit liveness — see
+    # reports/memory_model_refit_2026-05-17/agent_e_cross_jit_lifetime.md.
+    _mem_probe = mem_probe
 
     # Per-chunk: ``accumulate_rchunk_to_gflat`` adds the chunk's
     # contribution into the donated ``gflat_acc`` in place; no
@@ -2473,6 +2494,16 @@ def fit_zeta_to_h5(
     _q_irr_frac_dev = jax.device_put(
         np.asarray(q_irr_frac, dtype=np.float64),
         NamedSharding(mesh_xy, P(None, None)))
+
+    # P1 — pre r-chunk loop, after L_q computed AND gflat_acc allocated.
+    # This is the persistent baseline the planner's ``_peak_C_const``
+    # should match: centroids (ψ_l/ψ_r in both Y and X transposes), L_q
+    # (Cholesky factor at IBZ for charge / pass-through CCT for
+    # transverse), and the freshly-zeroed gflat_acc.  Round-1 addition.
+    if os.environ.get("LORRAX_MEM_DEBUG"):
+        jax.block_until_ready(gflat_acc)
+        jax.block_until_ready(L_q)
+    mem_probe("pre_rchunk_loop")
 
     with timing.section("zeta_fit.chunk_loop"):
         for chunk_idx in range(num_chunks):
@@ -2655,6 +2686,13 @@ def fit_zeta_to_h5(
     print(f"  Timing ({num_chunks} r-chunks, {t_chunks_total:.1f}s total):")
     for label, t in [("fit", t_fit_total), ("H5", t_write_total)]:
         print(f"    {label:<6} {t:6.2f}s  {100*t/t_chunks_total:4.1f}%")
+
+    # P3 — exit of ζ-fit.  Captures what's still alive after the chunk
+    # loop completes: gflat_acc was del'd above, zeta_chunk freed, but
+    # centroids (psi_l/psi_r) and L_q are still referenced by the
+    # caller's closure (they were passed in as args).  V_q runs next
+    # against this baseline.  Round-1 addition.
+    mem_probe("zeta_fit_end")
 
     # Return only peak-memory high-water mark; centroid wavefunctions
     # are not returned (see docstring — callers re-load them directly

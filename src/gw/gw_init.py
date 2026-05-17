@@ -1221,11 +1221,25 @@ def prepare_isdf_and_wavefunctions(
 					print("[profile] LORRAX_EXIT_AFTER_ZETA set: "
 					      "exiting cleanly after fit_zeta.", flush=True)
 				raise SystemExit(0)
+			# P4 — pre-V_q.  Whatever's still in HBM after fit_zeta
+			# returns forms the persistent baseline that V_q's transient
+			# peak stacks on top of.  Same env gate as the ζ-fit probes
+			# (LORRAX_MEM_DEBUG=1).  Round-1 addition.
+			from common.isdf_fitting import mem_probe as _mem_probe
+			_mem_probe("pre_v_q")
 			V_qmunu, G0 = compute_V_q(
 				zeta_path, wfn, meta, mesh_xy, cfg,
 				mem_est=mem_est, print_fn=print0,
 				bgw_v_grid_fn=bgw_v_grid_fn,
 				sym=sym, centroid_indices=centroid_indices)
+			# P5 — post-V_q.  V_q's transient peak just happened inside
+			# compute_V_q; this probe captures what survives (V_qmunu,
+			# G0) plus anything held over from ζ-fit.  Combined with P4
+			# and the V_q HLO buffer-assignment.txt this lets us model
+			# V_q's contribution to overall HBM peak.  Round-1 addition.
+			if os.environ.get("LORRAX_MEM_DEBUG"):
+				jax.block_until_ready(V_qmunu)
+			_mem_probe("post_v_q")
 
 			enk_full, _ = get_enk_bandrange(
 				wfn, sym, band_slices.full_range,
