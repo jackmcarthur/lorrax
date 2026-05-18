@@ -18,14 +18,18 @@ Five per-rank HBM peaks across :func:`isdf_fitting.fit_zeta_to_h5` and
         pair-density accumulators, CCT/ZCT k-convolution, solve.
         The fused jit holds:
           • centroids ×4 buffers (rmuT_X + rmu_Y transpose, L+R) + L_q
-            + sphere-idx replicated (persistent base)
+            + gflat_acc (resident across the r-chunk loop) + sphere-idx
+            replicated (persistent base)
           • P_l + P_r rank-5 accumulators on (μ, r_chunk)
           • IFFT'd P_l, P_r in R-space (rank-5)
           • Z_q intermediate before reshard
         ``pair_density_slots = 3`` (HLO-verified at CrI3 80Ry bispinor +
         Si 4×4×4 — see agent_d_hlo_calibration.md).  bc-loop is now
         ``lax.scan`` with ``unroll=1`` so n_bc no longer multiplies the
-        FFT-box term (Round-6 / commit f567aa0).
+        FFT-box term (Round-6 / commit f567aa0).  gflat_acc is charged
+        in BOTH Peak C and Peak D persistent bases (Round-10 / agent_q):
+        the two jits have isolated transient slots so this is correct,
+        not double-counting.
 
     Peak D — accumulate_rchunk_to_gflat (right after fit_one_rchunk).
         gflat_acc persistent.  Transient: per-scan-iter zero-padded
@@ -322,7 +326,7 @@ def _peak_B_cct_chol(*, nk, ns, nq, mu, nb_total, p, p_xy,
     return {f"B.{k}": v for k, v in out.items()}
 
 
-def _peak_C_fit_one_rchunk(*, nk, ns, nq, mu, n_rtot, r_chunk,
+def _peak_C_fit_one_rchunk(*, nk, ns, nq, nq_disk, mu, ngkmax, n_rtot, r_chunk,
                            band_chunk, n_bc, nb_total, p, p_x, p_y, p_xy,
                            fft_box_factor, pair_density_slots,
                            is_charge_channel, fft_grid,
@@ -348,13 +352,19 @@ def _peak_C_fit_one_rchunk(*, nk, ns, nq, mu, n_rtot, r_chunk,
     # live_arrays signature: c128 (nq, mu, mu) — sharded /p_xy
     #   lifetime class: persistent_throughout_zeta_fit (L_q Cholesky factor)
     #   source: common/isdf_fitting.py:factor_c_q (step 3 of fit_zeta_to_h5)
+    # gflat_acc is RESIDENT during fit_one_rchunk (separate jit from
+    # accumulate; the two jits each have isolated transient slots, so
+    # counting gflat_acc in BOTH Peak C persistent and Peak D persistent
+    # is correct — they don't double-count.  Verified by live_arrays
+    # census in agent_o_y3_95.out (Round-9b agent_q breakdown).
+    # live_arrays signature: c128(36, 1520, 59990) on every rank, sharded p_xy.
     persistent = {
         "centroids_persist":  # ×4 (L+R rmuT_X + rmu_Y transpose)
             4 * _bytes_c128(nk, ns, mu, nb_total, shard=p_xy),
         "L_q":
             _bytes_c128(nq, mu, mu, shard=p_xy),
         "gflat_acc":
-            0.0,  # see Peak D — accounted there to avoid double-count
+            _bytes_c128(nq_disk, mu, ngkmax, shard=p_xy),
         "sphere_idx_replicated":
             _sphere_idx_replicated_bytes(
                 nq=nq, fft_grid=fft_grid, n_buffers=n_sphere_buffers),
@@ -718,9 +728,13 @@ def plan_gflat_chunks(
     )
     # Centroids ×4 (not ×2) — agent_a finding #1 + agent_g census §6:
     # rmuT_X + rmu_Y transpose buffers for both ψ_l and ψ_r.
+    # gflat_acc is also RESIDENT during fit_one_rchunk (Round-10 / agent_q
+    # breakdown): the separate fit/accumulate jits have isolated transient
+    # slots, so gflat_acc must be charged against the C headroom too.
     c_C_const = (
         4 * _bytes_c128(nk, ns, mu, nb_total, shard=p_xy)
         + _bytes_c128(nq, mu, mu, shard=p_xy)
+        + _bytes_c128(nq_disk, mu, ngkmax, shard=p_xy)  # gflat_acc
         + _sphere_idx_replicated_bytes(
             nq=nq, fft_grid=fft_grid, n_buffers=n_sphere_buffers)
     )
@@ -858,7 +872,8 @@ def plan_gflat_chunks(
         fft_grid=fft_grid, n_sphere_buffers=n_sphere_buffers,
     )
     peak_C = _peak_C_fit_one_rchunk(
-        nk=nk, ns=ns, nq=nq, mu=mu, n_rtot=n_rtot, r_chunk=r_chunk,
+        nk=nk, ns=ns, nq=nq, nq_disk=nq_disk, mu=mu, ngkmax=ngkmax,
+        n_rtot=n_rtot, r_chunk=r_chunk,
         band_chunk=band_chunk, n_bc=n_bc, nb_total=nb_total,
         p=p, p_x=p_x, p_y=p_y, p_xy=p_xy,
         fft_box_factor=fft_box_factor_A,
