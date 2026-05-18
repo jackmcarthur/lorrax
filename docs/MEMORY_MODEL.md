@@ -878,6 +878,59 @@ See `reports/zeta_rchunk_memory_model_2026-05-13/PATH_D_PICKUP.md` →
 `round8_efficiency_audit.md` → `round5_unified_plan.md` for the
 mandatory pickup-reading order on this initiative.
 
+## Predicted-vs-realized faithfulness (Round-7 audit, 2026-05-17)
+
+The planner's `HWM_pred` is an **upper bound** on the in-jit transient
+peak assuming no XLA buffer aliasing/donation; it is intentionally
+conservative.  Round 7 (`agent_n_faithfulness_audit.md`) measured the
+spread between three metrics across cs ∈ {50, 100, 500, 1000} on the
+production 16-GPU CrI3 80 Ry SOC bispinor:
+
+| metric | what it sees | typical value |
+|---|---|---|
+| `HWM_pred` (planner) | upper-bound in-jit transient, no aliasing assumed | 22-66 GB/dev (depends on r_chunk) |
+| `jax.live_arrays()` sum, sharding-corrected | persistent + post-jit transient (XLA arena, no in-jit transients) | ~5-9 GB/rank |
+| `nvidia-smi memory.used` | true HBM, including everything outside the JAX arena | 7.75-8.67 GB/rank |
+
+**Key findings:**
+
+1. **HWM_pred is 7-8× higher than realized nvsmi peak.**  HWM_pred = 66.41
+   GB/dev at r=24576, but actual nvsmi observes only 8.67 GB/dev (12 % of
+   the 70 GB budget).  XLA's buffer aliasing/donation/remat saves the
+   remaining 57.74 GB/dev that the planner cannot see in static analysis.
+   The over-prediction errs toward safety: the planner cannot OOM-miss,
+   but it can pick chunk sizes more conservatively than needed.
+
+2. **JAX live_arrays view agrees with nvidia-smi to ~4%** when properly
+   sharding-corrected (sharded-globals / P + replicated-globals).  The
+   model's blind spot (constant ~3.6 GB/rank between raw `live_total/16`
+   and nvsmi) is **NOT** cuFFT-related; it's persistent JAX/XLA overhead
+   + CUDA context + NCCL collective buffers, which is cs-independent.
+
+3. **`gflat_chunk_size` cap of 100 is empirically very conservative.**
+   cs ∈ {50, 100, 500, 1000} all show identical nvsmi peak 8.67 GB/dev —
+   cuFFT does not blow up workspace in this range.  The agent_f cs=1414
+   hard-OOM remains the cliff, so the cap is safety not waste.  No
+   performance gain from raising cs (agent_d M3), so 100 stays.
+
+4. **`device.memory_stats()` returns `None` on the Perlmutter JAX 0.8 /
+   CUDA 12.9 stack.**  `peak_bytes_in_use` is unavailable; `_mem_probe`
+   in `common/isdf_fitting.py` (commit `6ba1fad`) falls back to
+   `nvidia-smi` for the local GPU and tracks a running peak.  This is
+   the only per-rank OOM-faithful metric on this stack.
+
+**Trust matrix for memory planning:**
+
+| chunk-sizing question | trustworthy metric | source |
+|---|---|---|
+| Will this config OOM? | nvsmi_peak < 0.95 × 80 GB | Round-7 X1-X6 all under 9 GB/dev |
+| What's the actual persistent state? | live_arrays sum (sharding-corrected) | Round-6 m1 sphere-idx audit |
+| What in-jit transient does XLA briefly allocate? | HWM_pred (upper bound, ~7× over) | Round-3 V1-V5 + Round-7 |
+| Where's the cuFFT cliff? | known: cs=1414 OOM, cs=1000 OK | Agent F + Round-7 X6 |
+
+See `reports/memory_model_refit_2026-05-17/agent_n_faithfulness_audit.md`
+for the full table and per-config nvsmi traces.
+
 ## Appendix: Persistent Arrays Verified by `jax.live_arrays()` Probes
 
 The Round-2 refit (commit `38xxxxx`, 2026-05-17) added per-array
