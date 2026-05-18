@@ -130,17 +130,29 @@ def _largest_divisor_le(n: int, cap: int) -> int:
 # vs cs=360's 21s/r-chunk).
 GFLAT_CHUNK_SIZE_CAP = 100
 
-# Replicated sphere/phase index buffer count, observed to accumulate in
-# the ``make_flat_k_fft`` cache as channels run.  agent_h_full_lifecycle.md
-# §3 Finding 3 measured:
-#   * 2 buffers after the bare centroid load (P0 charge zeta_fit_start)
-#   * 3 buffers after the first fit_zeta opens its r-chunk loop
-#     (P1 charge — adds the gflat-built sphere idx)
-#   * +1 buffer per subsequent channel (transverse 1→8 by μ_L=3)
-# By the time V_q runs, we observed 8 replicated copies.  We use the
-# worst-case (8) for bispinor 4-channel runs, 3 for non-bispinor.
-N_SPHERE_IDX_BUFFERS_BISPINOR = 8
-N_SPHERE_IDX_BUFFERS_CHARGE = 3
+# Replicated sphere/phase index buffer count.
+#
+# Pre-Round-4 (commit d1fcd20 + 94542c2): every fresh psi_G_store
+# instance device_put'd its own ``(nk, nx, ny, nz) int32`` g_index
+# buffer, and every fresh ``gflat_to_rmu`` build() closure baked its
+# own.  agent_h_full_lifecycle.md §3 Finding 3 measured 2→3→6→7→8
+# buffers across the bispinor 4-channel pipeline, costing ~1.3 GB/rank
+# of replicated waste by V_q time.
+#
+# Post-Round-4: two dedups land:
+#   1. ``file_io.wfn_loader.WfnLoader.box_index_dev`` caches the
+#      device-put once per ``(k_set, mesh)``; psi_G_store consumes it.
+#   2. ``common.wfn_transforms._cached_gindex_dev`` caches the
+#      ``jnp.asarray(g_arr, dtype=jnp.int32)`` by content hash so the
+#      per-channel ``gflat_to_rmu`` cache_key variants share one buffer.
+# With both dedups, the production GW pipeline uses ONE replicated
+# ``(nk, nx, ny, nz) i32`` buffer for the full run (k="full_bz" only —
+# no other k-set hits this path during fit_zeta + V_q).
+#
+# We keep these as named constants so future calibration / agent
+# probes have a single source of truth.  Verified post-fix count: 1.
+N_SPHERE_IDX_BUFFERS_BISPINOR = 1
+N_SPHERE_IDX_BUFFERS_CHARGE = 1
 
 
 @dataclasses.dataclass

@@ -75,13 +75,14 @@ def test_peak_A_shape_check_at_mesh_floor():
     """At ``band_chunk = p_xy`` (mesh floor) Peak A should be modest.
 
     Round-2 refit (2026-05-17) added the sphere_idx_replicated term
-    to Peak A (1.296 GB at fft_grid=(75,75,200), n_sphere_buffers=8
-    for bispinor).  At bc=16 the breakdown is:
-      * fft_box           = 16·2·1.125M·16·4   = 2.304 GB
-      * sphere_idx        = 8·36·75·75·200·4   = 1.296 GB
-      * phase_table       = 36·1.125M·16       = 0.648 GB
+    to Peak A.  Round-4 (commits d1fcd20 + 94542c2) cut the buffer
+    count from 8 to 1 by fixing the wfn_loader + wfn_transforms leaks
+    at their source.  At bc=16 the post-Round-4 breakdown is:
+      * fft_box           = 16·2·1.125M·16·4    = 2.304 GB
+      * phase_table       = 36·1.125M·16        = 0.648 GB
+      * sphere_idx        = 1·36·75·75·200·4    = 0.162 GB
       * centroid_out      = 36·2·1520·150·16/16 = 0.016 GB
-      * total                                  ≈ 4.26 GB
+      * total                                   ≈ 3.13 GB
     The threshold of 5 GB confirms the per-rank Bug-#1 fix is in
     place — anything ≥ 10 GB would indicate an extra ``nk`` factor
     leaked back in."""
@@ -202,13 +203,19 @@ def test_centroids_counted_x4_in_peak_C():
 
 
 def test_sphere_idx_replicated_in_every_peak():
-    """The sphere/phase index buffer is REPLICATED (not /p_xy) and
-    leaks across channels via the FFT-helper cache (agent_h §3
-    Finding 3).  Round-2 adds it to Peak A/B/C/D/E.
+    """The sphere/phase index buffer is REPLICATED (not /p_xy).  Pre-
+    Round-4 the make_flat_k_fft + psi_G_store paths each leaked a
+    fresh ``(nk, nx, ny, nz) i32`` buffer per channel (agent_h §3
+    Finding 3 measured 8 buffers by V_q time).
 
-    At fft_grid=(75,75,200), nq=36, 8 buffers, int32:
-        8 × 36 × 75 × 75 × 200 × 4 = 1.296 GB (REPLICATED — same
-        bytes on every rank).
+    Round-4 fix (commits d1fcd20 + 94542c2): the wfn_loader caches
+    one device buffer per (k_set, mesh) and wfn_transforms dedupes
+    captured closures by content hash, so the production pipeline
+    holds ONE replicated buffer for the full run.
+
+    At fft_grid=(75,75,200), nq=36, 1 buffer, int32:
+        1 × 36 × 75 × 75 × 200 × 4 = 0.162 GB (REPLICATED — same
+        bytes on every rank).  Down from 1.296 GB pre-fix.
     """
     plan = _natural_plan()
     expected = (N_SPHERE_IDX_BUFFERS_BISPINOR
@@ -218,7 +225,8 @@ def test_sphere_idx_replicated_in_every_peak():
         val = plan.peak_components.get(key, 0.0)
         assert abs(val - expected) < expected * 0.01, (
             f"{key} = {val/1e9:.3f} GB; expected {expected/1e9:.3f} "
-            f"GB (replicated, 8 buffers).")
+            f"GB (replicated, "
+            f"{N_SPHERE_IDX_BUFFERS_BISPINOR} buffers post-Round-4 fix).")
 
 
 def test_peak_E_v_q_has_off_diagonal_tt_binding_term():
@@ -260,8 +268,16 @@ def test_planner_uses_e_in_hwm_max():
 
 
 def test_non_bispinor_uses_fewer_sphere_buffers():
-    """N_SPHERE_IDX_BUFFERS_CHARGE = 3 for non-bispinor (only one
-    channel runs; no inter-channel leak)."""
+    """Post-Round-4 (commits d1fcd20 + 94542c2) the wfn_loader and
+    wfn_transforms dedups cap sphere_idx at 1 buffer for both bispinor
+    and non-bispinor — the leak source (per-channel device_put +
+    per-cache_key closure rebuild) is fixed at the source, not papered
+    over by a smaller per-channel multiplier.
+
+    N_SPHERE_IDX_BUFFERS_CHARGE was 3 pre-fix (1 from psi_G_store +
+    2 from wfn_transforms centroid_load).  Post-fix: 1.
+    """
+    from gw.gflat_memory_model import N_SPHERE_IDX_BUFFERS_CHARGE
     plan = plan_gflat_chunks(
         meta=_cri3_80ry_meta(),
         mesh_xy=_cri3_80ry_mesh(),
@@ -272,11 +288,10 @@ def test_non_bispinor_uses_fewer_sphere_buffers():
         is_bispinor=False,
         max_chunks=64,
     )
-    # Non-bispinor sphere idx term should be 3/8 of bispinor.
-    sphere_bisp = (N_SPHERE_IDX_BUFFERS_BISPINOR
-                   * 36 * 75 * 75 * 200 * 4)
-    sphere_charge = (3 * 36 * 75 * 75 * 200 * 4)
+    sphere_charge = (N_SPHERE_IDX_BUFFERS_CHARGE
+                     * 36 * 75 * 75 * 200 * 4)
     val = plan.peak_components.get('C.sphere_idx_replicated', 0.0)
     assert abs(val - sphere_charge) < sphere_charge * 0.01, (
         f"Non-bispinor C.sphere_idx_replicated = {val/1e9:.3f} GB; "
-        f"expected {sphere_charge/1e9:.3f} GB (3 buffers).")
+        f"expected {sphere_charge/1e9:.3f} GB "
+        f"({N_SPHERE_IDX_BUFFERS_CHARGE} buffer post-Round-4 fix).")
