@@ -705,6 +705,8 @@ def unfold_psi(
     else:
         phase = None
 
+    ns = int(cnk.shape[1])
+
     if is_trs:
         # TRS rule: ψ_full = iσ_y · conj(U_s · ψ_kbar · phase_spatial)
         #         = (iσ_y · conj(U_s)) · conj(ψ_kbar) · conj(phase_spatial)
@@ -714,14 +716,21 @@ def unfold_psi(
         cnk = np.conj(cnk)
         if phase is not None:
             cnk = cnk * phase[None, None, :]
+        if ns == 1:
+            # Non-SOC scalar: no spinor d.o.f.; TRS = complex conjugation only.
+            # ``iσ_y`` only acts on a 2-component spinor — skip the einsum.
+            return cnk
         U_eff = _I_SIGMA_Y @ np.conj(np.asarray(U_spinor_spatial[s_spatial]))
     else:
         if phase is not None:
             cnk = cnk * phase[None, None, :]
+        if ns == 1:
+            # Non-SOC scalar: spinor rotation is a no-op.
+            return cnk
         U_eff = np.asarray(U_spinor_spatial[s_spatial])
 
-    # Spinor rotation. For ns=1 (non-SOC), U_eff is the 1×1 identity and
-    # this einsum is a no-op (callers can still pass it without special-casing).
+    # Spinor rotation. ``U_eff`` is (ns, ns); for ns=1 we already returned above
+    # so this einsum is guaranteed to be a 2×2 spinor mix.
     cnk = np.einsum("jk,nkl->njl", U_eff, cnk)
     return cnk
 
