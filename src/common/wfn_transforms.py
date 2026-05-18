@@ -101,8 +101,22 @@ def _cached_gindex_dev(g_arr) -> "jax.Array":
     array end up sharing the device buffer across every cache_key
     variant that has the same g_index bytes — the typical case for
     centroid-load + ζ-fit + V_q in a single GW run.
+
+    **Round 6 canonical-accessor path:** when the caller has access
+    to ``WfnLoader.box_index_dev(k, mesh)`` (the loader's cached
+    device-resident sphere index — the canonical buffer shared with
+    psi_G_store), passing that ``jax.Array`` here returns it
+    unchanged.  This collapses the multi-buffer steady state observed
+    in Round 5 (3 distinct ``(nk, nx, ny, nz) i32`` device buffers
+    with identical content but distinct underlying allocations) to a
+    single canonical buffer.
     """
     if isinstance(g_arr, jax.Array):
+        # Already a device buffer.  ``jnp.asarray`` is identity when
+        # dtype already matches; explicit short-circuit makes the
+        # canonical-buffer path obvious to readers.
+        if g_arr.dtype == jnp.int32:
+            return g_arr
         return jnp.asarray(g_arr, dtype=jnp.int32)
     key = ('g_index_dev', hash(g_arr.tobytes()),
            tuple(int(s) for s in g_arr.shape))
@@ -112,6 +126,57 @@ def _cached_gindex_dev(g_arr) -> "jax.Array":
     dev = jnp.asarray(g_arr, dtype=jnp.int32)
     _GINDEX_DEV_CACHE[key] = dev
     return dev
+
+
+def _resolve_gindex_dev(g_index):
+    """Return ``(g_index_dev_jax, cache_id)`` for either a numpy array
+    or a ``jax.Array`` g_index — without a device→host roundtrip
+    when the caller has the canonical buffer in hand.
+
+    Round-6 canonical-accessor helper for the closure-bake call sites
+    (:func:`gflat_to_rmu`, :func:`accumulate_rchunk_to_gflat`).
+    Two-path logic:
+
+    * ``jax.Array`` input → assumed to be the canonical buffer (e.g.
+      ``WfnLoader.box_index_dev(k, mesh)``).  Returned unchanged;
+      ``cache_id`` uses ``id(g_index)``, stable across the process
+      lifetime for the canonical buffer.  ``cast`` to int32 only if
+      needed (no-op when dtype already matches).
+    * ``numpy.ndarray`` input → goes through :func:`_cached_gindex_dev`
+      (content-hash dedup → shared device buffer for matching bytes,
+      keyed in a private module dict).  ``cache_id`` uses the same
+      ``(hash, shape)`` tuple ``_cached_gindex_dev`` would derive.
+
+    The ``cache_id`` ends up in the ``_cached_jit`` key for the
+    closure-bake call sites so two unrelated g_index arrays of the
+    same shape don't share a compiled closure (which would silently
+    reuse stale baked-in indices).
+
+    Returns
+    -------
+    g_index_dev : jax.Array
+        Device-resident int32 (nk, nx, ny, nz) (or other) — the
+        canonical buffer if input was already a jax.Array, else the
+        ``_cached_gindex_dev`` result.
+    cache_id : Hashable
+        Identity tag suitable for use in a ``_cached_jit`` key.
+    """
+    if isinstance(g_index, jax.Array):
+        if g_index.dtype != jnp.int32:
+            # Edge case: caller's canonical buffer is non-int32.  Cast
+            # is cheap if dtype already matches (jnp.asarray returns
+            # identity), only fires when caller built a non-canonical
+            # buffer manually.  cache_id still keys on the source
+            # jax.Array's id to keep the canonical-buffer fast path.
+            g_index_dev = jnp.asarray(g_index, dtype=jnp.int32)
+        else:
+            g_index_dev = g_index
+        shape = tuple(int(s) for s in g_index.shape)
+        return g_index_dev, ('jax_id', id(g_index), shape)
+    g_arr = np.asarray(g_index, dtype=np.int32)
+    g_index_dev = _cached_gindex_dev(g_arr)
+    shape = tuple(int(s) for s in g_arr.shape)
+    return g_index_dev, ('np_hash', hash(g_arr.tobytes()), shape)
 
 
 # ---------------------------------------------------------------------------
@@ -764,14 +829,18 @@ def gflat_to_rmu(
     nb_local = nb_total // p_prod
     N        = nk * nb_local
 
-    g_arr = np.asarray(g_index, dtype=np.int32)
-    if g_arr.ndim != 4 or int(g_arr.shape[0]) != nk:
+    # Round-6 canonical-accessor path: accept either a numpy g_index
+    # OR the loader's cached ``WfnLoader.box_index_dev(...)`` jax.Array
+    # without a device→host roundtrip.  Validation uses ``.shape`` /
+    # ``.ndim`` (both supported by numpy and jax.Array natively).
+    g_shape = tuple(int(s) for s in np.shape(g_index))
+    if len(g_shape) != 4 or g_shape[0] != nk:
         raise ValueError(
             f"gflat_to_rmu: g_index must be (nk, nx, ny, nz); got "
-            f"shape {g_arr.shape}, expected nk={nk}.")
-    if tuple(int(s) for s in g_arr.shape[1:]) != fft_grid_t:
+            f"shape {g_shape}, expected nk={nk}.")
+    if g_shape[1:] != fft_grid_t:
         raise ValueError(
-            f"gflat_to_rmu: g_index trailing shape {g_arr.shape[1:]} "
+            f"gflat_to_rmu: g_index trailing shape {g_shape[1:]} "
             f"≠ fft_grid {fft_grid_t}.")
 
     # r_mu range check (Python int values; replicated, OK to validate
@@ -798,7 +867,9 @@ def gflat_to_rmu(
         # closure, so shape-only keying would silently reuse stale
         # tables when a different caller passes new kvecs_frac.
         kvecs_id = hash(kvecs_arr.tobytes())
-    g_index_id = hash(g_arr.tobytes())
+    # Round-6: resolve canonical device buffer + cache_id without a
+    # numpy roundtrip for jax.Array inputs.  See _resolve_gindex_dev.
+    g_index_dev_canonical, g_index_id = _resolve_gindex_dev(g_index)
     r_mu_id    = hash(r_mu_arr.tobytes())
 
     key = (
@@ -812,7 +883,6 @@ def gflat_to_rmu(
         # Per-k phase tables and centroid-coord constants baked into the
         # closure.  r_mu is replicated so we can index the per-row
         # phases by r_mu directly inside the scan body.
-        g_index_c = _cached_gindex_dev(g_arr)
         r_mu_c    = jnp.asarray(r_mu_arr, dtype=jnp.int32)
         if kvecs_frac is not None:
             kv = jnp.asarray(np.asarray(kvecs_frac), dtype=jnp.float64)
@@ -827,14 +897,28 @@ def gflat_to_rmu(
         else:
             phx_rmu_all = phy_rmu_all = phz_rmu_all = None
 
+        # Round-6: pass g_index through shard_map's in_specs (NOT
+        # closure capture) so the Auto-sharded NamedSharding-replicated
+        # canonical buffer from ``loader.box_index_dev(...)`` is
+        # Manual-mode-compatible inside the kernel.  Pre-Round-6 the
+        # closure captured a SingleDeviceSharding jax.Array (no-mesh)
+        # produced by ``_cached_gindex_dev``'s ``jnp.asarray`` — which
+        # left the wfn_transforms-side buffer DIVORCED from the
+        # WfnLoader-side canonical buffer (different sharding ⇒
+        # different device allocation).  Threading it as a shard_map
+        # input with ``P(None,None,None,None)`` matches the pattern
+        # already used by ``isdf_fitting._make_pair_pipeline_sm`` for
+        # the same buffer and ensures both sides share the canonical
+        # WfnLoader-cached device allocation.
         in_spec  = P(None, ('x', 'y'), None, None)
+        gidx_spec = P(None, None, None, None)
         out_spec = P(None, ('x', 'y'), None, None)
 
         @partial(shard_map, mesh=mesh,
-                 in_specs=(in_spec,),
+                 in_specs=(in_spec, gidx_spec),
                  out_specs=out_spec,
                  check_rep=False)
-        def _kernel(psi_):
+        def _kernel(psi_, g_index_):
             # Per-rank: (nk, nb_local, ns, ngkmax).
             psi_flat = psi_.reshape(N, ns, ngkmax)
             if pad_N:
@@ -853,7 +937,7 @@ def gflat_to_rmu(
                 # ngkmax) contract takes (cs, 1, ns, ngkmax) per row.
                 # Per-row g_index gather: (cs, nx, ny, nz).
                 sub4 = sub.reshape(cs, 1, ns, ngkmax)
-                g_per_row = g_index_c[k_row]
+                g_per_row = g_index_[k_row]
                 box = _box_kernel(
                     sub4, g_per_row, ngkmax=ngkmax)      # (cs, 1, ns, nx, ny, nz)
                 box = box.reshape(cs, ns, nx, ny, nz)
@@ -883,7 +967,7 @@ def gflat_to_rmu(
         return jax.jit(_kernel)
 
     fn = _cached_jit('gflat_to_rmu', key, build)
-    return fn(psi_G)
+    return fn(psi_G, g_index_dev_canonical)
 
 
 # ---------------------------------------------------------------------------

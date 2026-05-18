@@ -419,7 +419,17 @@ def load_centroids_band_chunked(
     sharding_load = P(None, ('x', 'y'), None, None)
 
     loader = wfn  # reuse top-level WfnLoader
-    g_index_full = loader.box_index(k="full_bz")
+    # Round-6 canonical accessor: pass the loader-cached device-resident
+    # sphere index directly to gflat_to_rmu so the captured-in-closure
+    # buffer IS the canonical one shared with psi_G_store's
+    # _g_index_dev.  Pre-Round-6 we passed the host numpy from
+    # loader.box_index(...) and let gflat_to_rmu's content-hash cache
+    # build its own device buffer — distinct sharding (no NamedSharding
+    # on the wfn_transforms path) meant the cached dedup didn't unify
+    # with box_index_dev's REPLICATED NamedSharding buffer.  Result: 3
+    # device buffers for the same (nk, nx, ny, nz) data (agent_l Round-5
+    # §2 measured live count = 3 at pre_rchunk_loop).
+    g_index_full = loader.box_index_dev(k="full_bz", mesh=mesh_xy)
     sym_loader = loader._ensure_sym()
     kgrid_arr = np.asarray(meta.kgrid, dtype=np.float64)
     kvecs_frac_full = (
