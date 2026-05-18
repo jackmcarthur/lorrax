@@ -139,41 +139,34 @@ GFLAT_CHUNK_SIZE_CAP = 100
 # buffers across the bispinor 4-channel pipeline, costing ~1.3 GB/rank
 # of replicated waste by V_q time.
 #
-# Round-4 (commits d1fcd20 + 94542c2): two dedups landed:
-#   1. ``file_io.wfn_loader.WfnLoader.box_index_dev`` caches the
-#      device-put once per ``(k_set, mesh)``; psi_G_store consumes it.
-#   2. ``common.wfn_transforms._cached_gindex_dev`` caches the
-#      ``jnp.asarray(g_arr, dtype=jnp.int32)`` by content hash so the
-#      per-channel ``gflat_to_rmu`` cache_key variants share one buffer.
-# Each dedup bounded growth WITHIN its source (no monotonic
-# accumulation across channels), but did NOT collapse the three
-# CONTENT-DISTINCT numpy sources to a single device buffer.
+# Round-4 (commits d1fcd20 + 94542c2): two per-source dedups landed —
+# ``WfnLoader.box_index_dev`` for psi_G_store + ``_cached_gindex_dev``
+# (content-hash) for wfn_transforms closures.  Each bounded growth
+# WITHIN its source (no monotonic accumulation across bispinor
+# channels) but did NOT collapse the loader-side and wfn_transforms-
+# side buffers — different sharding (NamedSharding-replicated vs
+# SingleDeviceSharding) ⇒ different device allocations from the same
+# underlying ``WfnLoader.box_index(k)`` numpy bytes.  Round-5 live
+# verify (agent_l_round5_liveverify.md §2) measured a steady-state of
+# 3 buffers, not 1.
 #
-# Round-5 live verify (agent_l_round5_liveverify.md): the post-Round-4
-# steady-state holds **3** buffers, not 1.  Three content-distinct
-# numpy sources produce 3 separate ``jax.Array`` instances because
-# ``_cached_gindex_dev`` keys on content-hash and the three numpy
-# arrays differ in bytes:
-#   * loader-side ``box_index_dev`` (one numpy array from
-#     ``WfnLoader.box_index(k="full_bz")`` via the ``_gvecs_cache``).
-#   * ``load_centroids_band_chunked`` → ``gflat_to_rmu`` charge centroid
-#     load — passes ``loader.box_index(k="full_bz")``, but the bytes
-#     differ from the loader-cached buffer's reference (see Round-6
-#     audit).
-#   * ``load_centroids_band_chunked`` → ``gflat_to_rmu`` transverse
-#     centroid load — distinct r_mu_id cache_key variant.
-# All three buffers have IDENTICAL shape ``(nk, nx, ny, nz) i32`` and
-# represent the same mathematical sphere index.  A future canonical
-# accessor refactor (``WfnLoader.sphere_idx_dev``) would collapse them
-# to 1; until then the planner must count 3 to match observed reality.
-#
-# Charge channel runs the same code path (one ``load_centroids`` call
-# + one ``build_psi_G_store``) so charge-only is also 3 buffers.
+# Round-6 (canonical-accessor refactor in ``common/load_wfns.py``
+# + ``common/wfn_transforms.py``, commits 9afa11e + da7b41f planner
+# bump): ``load_centroids_band_chunked`` now passes the loader's
+# device-resident ``box_index_dev(k, mesh)`` jax.Array directly to
+# ``gflat_to_rmu``, and ``gflat_to_rmu`` threads it through
+# ``shard_map``'s ``in_specs`` (Manual-mode-compatible) instead of
+# closure-capture.  All three pre-Round-6 sources now share the
+# WfnLoader-cached canonical allocation.  Round-6 live verify
+# (agent_m_round6.md) confirms the steady-state count is **1**
+# across both the charge channel and all 3 transverse bispinor
+# channels — no monotonic growth, no per-channel allocation.
 #
 # We keep these as named constants so future calibration / agent
-# probes have a single source of truth.
-N_SPHERE_IDX_BUFFERS_BISPINOR = 3
-N_SPHERE_IDX_BUFFERS_CHARGE = 3
+# probes have a single source of truth.  Verified post-Round-6
+# count: 1.
+N_SPHERE_IDX_BUFFERS_BISPINOR = 1
+N_SPHERE_IDX_BUFFERS_CHARGE = 1
 
 
 @dataclasses.dataclass
