@@ -1,5 +1,6 @@
 import gc
 import os
+import subprocess
 import time
 from types import SimpleNamespace
 from functools import partial
@@ -18,6 +19,14 @@ from .gamma_matrices import (
 )
 
 _MEM_PROFILE = bool(os.environ.get("LORRAX_MEM_PROFILE", ""))
+
+# Running max of nvidia-smi used MB across all probe points within a run
+# (this rank's GPU only).  jax.device_memory_stats() returns None on the
+# JAX 0.8 / CUDA 12.9 Perlmutter stack, so nvidia-smi is the only way to
+# observe the TRUE per-rank HBM peak including cuFFT plan workspace,
+# NCCL collective buffers, and other XLA-arena-external allocations.
+_NVSMI_PEAK_MB = 0
+_NVSMI_LAST_MB = 0
 
 def _mem_report(label):
     """Print per-device memory if LORRAX_MEM_PROFILE is set. Zero cost otherwise."""
@@ -44,8 +53,10 @@ def mem_probe(label, *, only_rank0=True):
 
     Round-0 (commit 5c884ac) wired this at three points per r-chunk in
     fit_zeta_to_h5; Round-1 extends to zeta_fit_start, pre_rchunk_loop,
-    zeta_fit_end, pre_v_q, post_v_q for the full lifecycle.  See
-    reports/memory_model_refit_2026-05-17/.
+    zeta_fit_end, pre_v_q, post_v_q for the full lifecycle.  Round-7
+    (faithfulness audit) adds the ``nvidia-smi`` per-rank true-HBM
+    sample — the *canonical* OOM-relevance metric since
+    ``device.memory_stats()`` returns ``None`` on this stack.
     """
     if not os.environ.get("LORRAX_MEM_DEBUG"):
         return
@@ -75,14 +86,45 @@ def mem_probe(label, *, only_rank0=True):
         else:
             entry[0] += 1
             entry[1] += sz
+    nvsmi_mb = _nvsmi_used_mb_local_gpu()
     print(f"[mem_probe {label}] in_use={bytes_in_use/1e9:.2f} GB  "
           f"peak={peak_bytes_in_use/1e9:.2f} GB  "
-          f"live_count={len(live)} live_total={total_live/1e9:.2f} GB",
+          f"live_count={len(live)} live_total={total_live/1e9:.2f} GB  "
+          f"nvsmi={nvsmi_mb/1024:.2f} GB nvsmi_peak={_NVSMI_PEAK_MB/1024:.2f} GB",
           flush=True)
     top = sorted(by_shape.items(), key=lambda kv: -kv[1][1])[:10]
     for (shape, dtype), (cnt, sz) in top:
         print(f"[mem_probe {label}]   {dtype} {shape} x {cnt} = "
               f"{sz/1e9:.2f} GB", flush=True)
+
+
+def _nvsmi_used_mb_local_gpu():
+    """Sample nvidia-smi for the local rank's GPU.  Returns used-MB int or 0.
+
+    Uses ``CUDA_VISIBLE_DEVICES`` (or falls back to GPU 0) to query just
+    this rank's GPU rather than the whole node.  Updates module-level
+    ``_NVSMI_PEAK_MB`` running max.  Silently returns 0 on any failure
+    (nvidia-smi missing, parse error, timeout) — never raises.
+    """
+    global _NVSMI_PEAK_MB, _NVSMI_LAST_MB
+    try:
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        if cvd:
+            gpu_idx = cvd.split(",")[0].strip()
+        else:
+            gpu_idx = "0"
+        out = subprocess.run(
+            ["nvidia-smi", f"--id={gpu_idx}",
+             "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        mb = int(out.stdout.strip().split("\n")[0])
+        _NVSMI_LAST_MB = mb
+        if mb > _NVSMI_PEAK_MB:
+            _NVSMI_PEAK_MB = mb
+        return mb
+    except Exception:
+        return 0
 from common import jax_profile
 from .cholesky_2d import (
     cholesky_2d_batched,
