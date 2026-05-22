@@ -5,23 +5,13 @@ Compares potrs output against numpy's direct solve.
 """
 from __future__ import annotations
 import os, sys
-os.environ.setdefault("JAX_ENABLE_X64", "1")
-os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
+from runtime import set_default_env, init_jax_distributed, fallback_to_cpu_if_no_gpu_backend
+set_default_env()
+init_jax_distributed()
 import numpy as np
 import jax
 import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
-
-_DIST = "_LORRAX_JAX_DISTRIBUTED_DONE"
-def _init():
-    if os.environ.get(_DIST): return
-    if int(os.environ.get("SLURM_NTASKS", "1")) > 1:
-        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-        init_kwargs = {"local_device_ids": [0]} if cvd and "," not in cvd else {}
-        try: jax.distributed.initialize(**init_kwargs)
-        except Exception: pass
-    os.environ[_DIST] = "1"
-_init()
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental import multihost_utils

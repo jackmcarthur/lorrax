@@ -13,8 +13,9 @@ import os
 import sys
 import time
 
-os.environ.setdefault("JAX_ENABLE_X64", "1")
-os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
+from runtime import set_default_env, init_jax_distributed, fallback_to_cpu_if_no_gpu_backend
+set_default_env()
+init_jax_distributed()
 
 import numpy as np
 import jax
@@ -34,15 +35,6 @@ def main() -> int:
                     help="Block sizes to sweep.")
     ap.add_argument("--repeats", type=int, default=3)
     args = ap.parse_args()
-
-    _DIST_SENTINEL = "_LORRAX_JAX_DISTRIBUTED_DONE"
-    if not os.environ.get(_DIST_SENTINEL):
-        if int(os.environ.get("SLURM_NTASKS", "1")) > 1:
-            try:
-                jax.distributed.initialize()
-            except Exception:
-                pass
-        os.environ[_DIST_SENTINEL] = "1"
 
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from ffi.cusolvermp import distributed_eigh
