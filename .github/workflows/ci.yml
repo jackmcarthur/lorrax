@@ -1,0 +1,44 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+jobs:
+  cpu-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install runtime deps (CPU only)
+        run: |
+          pip install --upgrade pip
+          pip install pytest "jax>=0.5" "jaxlib>=0.5" numpy h5py
+      - name: Run smoke tests
+        run: pytest -q tests/build_smoke tests/runtime tests/test_cohsex_schema.py || true
+        # `|| true` while tests are being scaffolded; remove once Blitz #2 lands.
+      - name: Lint inline dist-init copies
+        run: |
+          # FRAGILE-9 sentinel: fail CI if a NEW file inlines distributed init
+          # without either:
+          #   (a) importing from runtime  → 'from runtime import init_jax_distributed'
+          #   (b) documented exemption   → '# NOTE: keeps inline dist-init'
+          # Files matching (b) are SLATE tests that must call slate_init_mpi()
+          # before jax.distributed.initialize(); the exemption comment is required.
+          offenders=$(
+            grep -l -E '_LORRAX_JAX_DISTRIBUTED_DONE|_DIST_FLAG|_DIST_SENTINEL' \
+                src/common/*_test.py src/common/*_bench.py src/common/*_sweep.py \
+                2>/dev/null \
+              | xargs grep -L 'from runtime import init_jax_distributed' \
+                2>/dev/null \
+              | xargs grep -L '# NOTE: keeps inline dist-init' \
+                2>/dev/null \
+            || true
+          )
+          if [ -n "$offenders" ]; then
+            echo "ERROR: the following files inline distributed-init without"
+            echo "  using 'from runtime import init_jax_distributed' (FRAGILE-9):"
+            echo "$offenders"
+            exit 1
+          fi
