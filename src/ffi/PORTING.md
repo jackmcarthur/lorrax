@@ -111,6 +111,35 @@ For non-Shifter runtimes (Singularity/Apptainer): swap the
 (SLURM flags, `select_gpu.sh`, `in_container.sh`, LD_LIBRARY_PATH
 composition) is runtime-agnostic.
 
+### Container bind-mount paths (`LORRAX_CONTAINER_*_PATH`)
+
+The staged libraries are bind-mounted at `/lorrax_nvhpc`, `/lorrax_phdf5`,
+and `/lorrax_slate` inside the container by default.  These paths are baked
+into `liblorrax_ffi.so`'s `RPATH` at build time; changing them requires a
+rebuild.  On clusters where those paths conflict with existing directory
+layout (Apptainer images, Frontier, etc.), override before `cmake`:
+
+```bash
+export LORRAX_CONTAINER_NVHPC_PATH=/opt/lorrax/nvhpc
+export LORRAX_CONTAINER_PHDF5_PATH=/opt/lorrax/phdf5
+export LORRAX_CONTAINER_SLATE_PATH=/opt/lorrax/slate
+cmake -B build src/ffi/common/cpp   # picks up env vars automatically
+```
+
+The same vars control `--volume=<host>:<ct>` in both the modulefile and
+`run_shifter.sh`, so host-to-container mapping and RPATH stay consistent
+without extra flags.
+
+### Multi-user shared allocations
+
+The upstream `lorrax` module assumes one user per allocation.  For concurrent
+multi-agent or multi-user use of a single shared allocation, load the
+`lorrax_agent` sandbox overlay on top of the base module (see
+[`config/README.md`](../../config/README.md#multi-user-shared-allocations)).
+The overlay adds pool-aware `lxrun`, `lxattach`, `lxreap`, and an enhanced
+`lxstatus` — none of which belong in the upstream module because they depend
+on sandbox-local `lx_pool.py`.
+
 ## Cluster-specific: NERSC Perlmutter
 
 Shifter forbids `--volume` sources outside `/pscratch` and a handful

@@ -9,6 +9,42 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # ----------------------------------------------------------------------------
+#  Container bind-mount paths — these are baked into INSTALL_RPATH so the
+#  .so finds its deps (libcusolverMp, libhdf5, Cray libsci) at runtime inside
+#  the Shifter container without LD_LIBRARY_PATH.  Override at configure time
+#  for non-/lorrax_* container conventions (Apptainer, Frontier, etc.) either
+#  via -D... flags or the matching env vars (picked up automatically below).
+#
+#  Env vars (set by `module load lorrax` or manually):
+#    LORRAX_CONTAINER_NVHPC_PATH  container-side path for NVHPC bind-mount
+#    LORRAX_CONTAINER_PHDF5_PATH  container-side path for phdf5 bind-mount
+#    LORRAX_CONTAINER_SLATE_PATH  container-side path for SLATE  bind-mount
+# ----------------------------------------------------------------------------
+set(LORRAX_CONTAINER_NVHPC_PATH "/lorrax_nvhpc" CACHE PATH
+    "Container-side NVHPC bind-mount path (baked into .so RPATH)")
+set(LORRAX_CONTAINER_PHDF5_PATH "/lorrax_phdf5" CACHE PATH
+    "Container-side phdf5 bind-mount path (baked into .so RPATH)")
+set(LORRAX_CONTAINER_SLATE_PATH "/lorrax_slate"  CACHE PATH
+    "Container-side SLATE bind-mount path (baked into .so RPATH)")
+
+# Pick up env-var overrides at configure time so `cmake ..` inside a `module
+# load lorrax` shell propagates the right paths without needing -D flags.
+foreach(_ct_var LORRAX_CONTAINER_NVHPC_PATH LORRAX_CONTAINER_PHDF5_PATH
+                LORRAX_CONTAINER_SLATE_PATH)
+    if(DEFINED ENV{${_ct_var}})
+        set(${_ct_var} "$ENV{${_ct_var}}" CACHE PATH
+            "Container-side bind-mount path (from env)" FORCE)
+        message(STATUS "${_ct_var} overridden from env: ${${_ct_var}}")
+    endif()
+endforeach()
+unset(_ct_var)
+
+message(STATUS "Container paths for RPATH:")
+message(STATUS "  NVHPC : ${LORRAX_CONTAINER_NVHPC_PATH}")
+message(STATUS "  phdf5 : ${LORRAX_CONTAINER_PHDF5_PATH}")
+message(STATUS "  SLATE : ${LORRAX_CONTAINER_SLATE_PATH}")
+
+# ----------------------------------------------------------------------------
 # CUDA language (for .cu kernel translation units compiled by nvcc).  We
 # point CMAKE_CUDA_COMPILER at the container's nvcc so it matches the
 # toolkit whose headers/runtime we already use for the C++ TUs.  A100 =
@@ -66,7 +102,7 @@ else()
     if(NOT NVHPC_ROOT)
         file(GLOB _nvhpc_candidates
             "/opt/nvidia/hpc_sdk/Linux_x86_64/*"
-            "/lorrax_nvhpc/*"                        # Shifter bind-mount target
+            "${LORRAX_CONTAINER_NVHPC_PATH}/*"       # Shifter bind-mount target
             "/usr/local/nvhpc/Linux_x86_64/*")
         list(SORT _nvhpc_candidates ORDER DESCENDING)  # newest first
         foreach(_c ${_nvhpc_candidates})
@@ -255,10 +291,10 @@ endif()
 # override with -DHDF5_ROOT=... or $HDF5_ROOT / $HDF5_DIR env vars,
 # which CMake's find_package(HDF5) honours natively.
 if(NOT DEFINED HDF5_ROOT AND NOT DEFINED ENV{HDF5_ROOT} AND NOT DEFINED ENV{HDF5_DIR})
-    if(IS_DIRECTORY "/lorrax_phdf5/lib")
-        set(HDF5_ROOT "/lorrax_phdf5" CACHE PATH
+    if(IS_DIRECTORY "${LORRAX_CONTAINER_PHDF5_PATH}/lib")
+        set(HDF5_ROOT "${LORRAX_CONTAINER_PHDF5_PATH}" CACHE PATH
             "Root of parallel HDF5 install (bind-mounted stage by default)")
-        message(STATUS "HDF5: using bind-mounted stage at /lorrax_phdf5")
+        message(STATUS "HDF5: using bind-mounted stage at ${LORRAX_CONTAINER_PHDF5_PATH}")
     endif()
 endif()
 
@@ -412,10 +448,13 @@ add_library(lorrax_ffi SHARED ${LORRAX_FFI_SOURCES})
 set_target_properties(lorrax_ffi PROPERTIES
     OUTPUT_NAME "lorrax_ffi"
     PREFIX "lib"
-    # RPATH points at the NVHPC directory so the runtime linker finds
-    # libcusolverMp.so and libcal.so without LD_LIBRARY_PATH.
+    # RPATH points at the container-side bind-mount paths so the runtime
+    # linker finds libcusolverMp.so, libcal.so, libhdf5, and Cray libsci
+    # without LD_LIBRARY_PATH.  Paths are controlled by the
+    # LORRAX_CONTAINER_*_PATH cache variables (default /lorrax_*) so the
+    # .so is portable to clusters that use different bind-mount conventions.
     BUILD_WITH_INSTALL_RPATH ON
-    INSTALL_RPATH "${CUSOLVERMP_LIBDIR};${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/lib64;/lorrax_phdf5/lib;/lorrax_slate/lib;${LORRAX_SLATE_INSTALL_DIR}/lib64"
+    INSTALL_RPATH "${CUSOLVERMP_LIBDIR};${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/lib64;${LORRAX_CONTAINER_PHDF5_PATH}/lib;${LORRAX_CONTAINER_SLATE_PATH}/lib;${LORRAX_SLATE_INSTALL_DIR}/lib64"
 )
 
 target_include_directories(lorrax_ffi PRIVATE

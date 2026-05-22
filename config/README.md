@@ -212,6 +212,31 @@ config/
     └── run_gw.slurm           # batch job template
 ```
 
+## Multi-user shared allocations
+
+The upstream `lorrax` module assumes **one user per allocation**.  Each shell
+exports its own `SLURM_JOBID` (from `lxalloc`), and `lxrun` fires a new
+`srun` step against that job with no coordination.  When two agents (or two
+terminal sessions) call `lxrun` simultaneously against the same
+`SLURM_JOBID`, the `srun` steps contend for nodes and can pile on the same
+node, leaving others idle.
+
+For concurrent multi-user or multi-agent use of a single shared allocation,
+load the **`lorrax_agent` sandbox overlay** on top of the base module:
+
+```bash
+module load lorrax_A           # base module (your checkout)
+module load lorrax_agent       # pool-aware overlay (sandbox-local)
+lxattach                       # find existing lx-alloc-$USER allocation
+LORRAX_NNODES=2 lxrun python3 -u -m gw.gw_jax -i cohsex.in
+```
+
+The overlay adds `lxattach` (find a shared allocation), pool-aware
+`lxrun` (picks a free node, prints a status banner, fails fast on
+contention), `lxreap`, and an enhanced `lxstatus`.  None of those are in
+the upstream module because they depend on `lx_pool.py` — sandbox tooling
+that has no stable install path for a shared group installation.
+
 ## Porting to other clusters
 
 The Lua modulefile at `config/modulefiles/lorrax/0.1.0.lua` is
