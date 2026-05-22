@@ -50,9 +50,8 @@ struct LorraxCusolverMpCtx {
     cudaEvent_t  ev_xla_in  = nullptr;   // signal on xla_stream → wait on ctx
     cudaEvent_t  ev_ctx_out = nullptr;   // signal on ctx_stream → wait on xla
 
-    // per-call scratch reused across invocations
-    void*   d_workspace       = nullptr;
-    size_t  d_workspace_bytes = 0;
+    // per-call host scratch reused across invocations (device workspace is
+    // now allocated per-call via ffi::ScratchAllocator — JAX-managed pool)
     void*   h_workspace       = nullptr;
     size_t  h_workspace_bytes = 0;
     int*    d_info            = nullptr;
@@ -64,9 +63,6 @@ struct LorraxCusolverMpCtx {
     cublasMpHandle_t  cublasmp_handle = nullptr;
     cublasMpGrid_t    cublasmp_grid   = nullptr;
 };
-
-// Grow (d_workspace, h_workspace) if needed; keeps largest allocation.
-void ensure_workspace(LorraxCusolverMpCtx* ctx, size_t d_need, size_t h_need);
 
 // Lazy-initialise the cuBLASMp handle + grid, sharing the existing CAL
 // comm and CUDA stream with cuSOLVERMp.  No-op on repeat calls.  Callers

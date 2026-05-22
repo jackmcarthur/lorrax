@@ -63,7 +63,6 @@ namespace lorrax_ffi::cusolvermp_batched_solve_lu {
 
 namespace ffi = ::xla::ffi;
 using lorrax_ffi::cusolvermp::LorraxCusolverMpCtx;
-using lorrax_ffi::cusolvermp::ensure_workspace;
 namespace mp = lorrax_ffi::cusolvermp::mp;
 
 static ffi::Error cross_stream_wait_pooled(cudaStream_t waiter,
