@@ -38,7 +38,6 @@ namespace lorrax_ffi::cusolvermp_batched_potrf {
 
 namespace ffi = ::xla::ffi;
 using lorrax_ffi::cusolvermp::LorraxCusolverMpCtx;
-using lorrax_ffi::cusolvermp::ensure_workspace;
 namespace mp = lorrax_ffi::cusolvermp::mp;
 
 struct NvtxRange {
@@ -61,6 +60,7 @@ template <typename T>
 static ffi::Error BatchedPotrfImpl(
     int64_t nq, int64_t n, int64_t mb, int64_t nb,
     cudaStream_t xla_stream,
+    ffi::ScratchAllocator& scratch,
     LorraxCusolverMpCtx* ctx,
     const T* d_A_in, T* d_L_out)
 {
@@ -110,12 +110,32 @@ static ffi::Error BatchedPotrfImpl(
         os << "cusolverMpPotrf_bufferSize failed: status=" << (int)mp_st;
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
-    try {
-        NvtxRange range("potrf.ensure_workspace");
-        ensure_workspace(ctx, d_ws, h_ws);
-    } catch (const std::exception& ex) {
+
+    // Device workspace from XLA's scratch pool — plays nice with the JAX
+    // cuda_async pool (same rationale as eigh_ffi.cc:124-128).
+    // The workspace size depends on N, mb, nb but NOT on matrix contents,
+    // so one Allocate() outside the q-loop is sufficient; the same device
+    // buffer is reused for every q-slice without re-querying bufferSize.
+    auto ws_opt = scratch.Allocate(d_ws);
+    if (!ws_opt.has_value()) {
         cusolverMpDestroyMatrixDesc(descA);
-        return ffi::Error(ffi::ErrorCode::kResourceExhausted, ex.what());
+        std::ostringstream os;
+        os << "batched_potrf: XLA scratch allocator failed to provide "
+           << d_ws << " bytes";
+        return ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str());
+    }
+    void* d_workspace = *ws_opt;
+
+    // Host workspace stays on Ctx (scratch is device-only).
+    if (h_ws > ctx->h_workspace_bytes) {
+        if (ctx->h_workspace) std::free(ctx->h_workspace);
+        ctx->h_workspace = std::malloc(h_ws);
+        if (!ctx->h_workspace) {
+            cusolverMpDestroyMatrixDesc(descA);
+            return ffi::Error(ffi::ErrorCode::kInternal,
+                              "malloc(host_workspace) failed");
+        }
+        ctx->h_workspace_bytes = h_ws;
     }
 
     for (int64_t q = 0; q < nq; ++q) {
@@ -127,7 +147,7 @@ static ffi::Error BatchedPotrfImpl(
         mp_st = mp::Potrf<T>(
             ctx->handle, CUBLAS_FILL_MODE_LOWER, n,
             slice_ptr, 1, 1, descA,
-            ctx->d_workspace, ctx->d_workspace_bytes,
+            d_workspace, d_ws,
             ctx->h_workspace, ctx->h_workspace_bytes,
             ctx->d_info);
         if (mp_st != CUSOLVER_STATUS_SUCCESS) {
@@ -150,6 +170,7 @@ static ffi::Error BatchedPotrfImpl(
 
 static ffi::Error BatchedPotrfDispatch(
     cudaStream_t stream,
+    ffi::ScratchAllocator scratch,
     ffi::AnyBuffer A,
     ffi::Result<ffi::AnyBuffer> L_out,
     int64_t nq, int64_t n, int64_t mb, int64_t nb,
@@ -168,13 +189,13 @@ static ffi::Error BatchedPotrfDispatch(
     switch (dtype) {
         case ffi::DataType::F64:
             return BatchedPotrfImpl<double>(
-                nq, n, mb, nb, stream, ctx,
+                nq, n, mb, nb, stream, scratch, ctx,
                 static_cast<const double*>(A.untyped_data()),
                 static_cast<double*>(L_out->untyped_data()));
         case ffi::DataType::C128:
             using C128 = std::complex<double>;
             return BatchedPotrfImpl<C128>(
-                nq, n, mb, nb, stream, ctx,
+                nq, n, mb, nb, stream, scratch, ctx,
                 static_cast<const C128*>(A.untyped_data()),
                 static_cast<C128*>(L_out->untyped_data()));
         default: {
@@ -193,6 +214,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     lorrax_ffi::cusolvermp_batched_potrf::BatchedPotrfDispatch,
     xla::ffi::Ffi::Bind()
         .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<xla::ffi::ScratchAllocator>()
         .Arg<xla::ffi::AnyBuffer>()      // A
         .Ret<xla::ffi::AnyBuffer>()      // L
         .Attr<int64_t>("nq")

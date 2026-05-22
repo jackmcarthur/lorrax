@@ -309,9 +309,8 @@ int64_t create_context(int rank, int world_size,
                                            cudaEventDisableTiming),
                   "cudaEventCreate(ev_ctx_out)");
 
-    // Workspace scratchpads start empty; grown on demand in the FFI.
-    ctx->d_workspace = nullptr;
-    ctx->d_workspace_bytes = 0;
+    // Host workspace starts empty; grown on demand in the FFI.
+    // Device workspace is now allocated per-call via ffi::ScratchAllocator.
     ctx->h_workspace = nullptr;
     ctx->h_workspace_bytes = 0;
 
@@ -338,8 +337,7 @@ void destroy_context(int64_t ctx_handle) {
     if (ctx->ev_ctx_out) { cudaEventDestroy(ctx->ev_ctx_out);    ctx->ev_ctx_out = nullptr; }
     if (ctx->stream)   { cudaStreamDestroy(ctx->stream);         ctx->stream = nullptr; }
     if (ctx->nccl_comm){ ncclCommDestroy(ctx->nccl_comm);        ctx->nccl_comm = nullptr; }
-    if (ctx->d_info)  { cudaFree(ctx->d_info);                   ctx->d_info = nullptr; }
-    if (ctx->d_workspace) { cudaFree(ctx->d_workspace);          ctx->d_workspace = nullptr; }
+    if (ctx->d_info)      { cudaFree(ctx->d_info);                ctx->d_info = nullptr; }
     if (ctx->h_workspace) { free(ctx->h_workspace);              ctx->h_workspace = nullptr; }
 
     delete ctx;
@@ -382,24 +380,6 @@ void ensure_cublasmp(LorraxCusolverMpCtx* ctx) {
             "cublasMpGridCreate");
     }
 }
-
-// Grow workspace on demand; preserves the larger allocation on future calls.
-void ensure_workspace(LorraxCusolverMpCtx* ctx, size_t d_need, size_t h_need) {
-    if (d_need > ctx->d_workspace_bytes) {
-        if (ctx->d_workspace) cudaFree(ctx->d_workspace);
-        throw_if_cuda(cudaMalloc(&ctx->d_workspace, d_need),
-                      "cudaMalloc(d_workspace)");
-        ctx->d_workspace_bytes = d_need;
-    }
-    if (h_need > ctx->h_workspace_bytes) {
-        if (ctx->h_workspace) free(ctx->h_workspace);
-        ctx->h_workspace = malloc(h_need);
-        if (!ctx->h_workspace)
-            throw std::runtime_error("malloc(h_workspace) failed");
-        ctx->h_workspace_bytes = h_need;
-    }
-}
-
 
 // ----- smoke: ncclAllReduce on a device float buffer ---------------------
 int smoke_allreduce_sum(int64_t ctx_handle,
