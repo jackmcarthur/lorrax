@@ -21,34 +21,15 @@ import argparse
 import os
 import sys
 
-os.environ.setdefault("JAX_ENABLE_X64", "1")
-os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
+from runtime import set_default_env, init_jax_distributed, fallback_to_cpu_if_no_gpu_backend
+set_default_env()
+init_jax_distributed()
 
 import numpy as np
 import jax
 import jax.numpy as jnp
 
 jax.config.update("jax_enable_x64", True)
-
-
-_DIST_FLAG = "_LORRAX_JAX_DISTRIBUTED_DONE"
-
-
-def _bootstrap_jax_distributed() -> None:
-    if os.environ.get(_DIST_FLAG):
-        return
-    if int(os.environ.get("SLURM_NTASKS", "1")) > 1:
-        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-        one_gpu = cvd and "," not in cvd
-        kwargs = {"local_device_ids": [0]} if one_gpu else {}
-        try:
-            jax.distributed.initialize(**kwargs)
-        except Exception:
-            pass
-    os.environ[_DIST_FLAG] = "1"
-
-
-_bootstrap_jax_distributed()
 
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P

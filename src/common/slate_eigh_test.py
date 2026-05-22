@@ -25,6 +25,7 @@ import jax
 import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 
+# NOTE: keeps inline dist-init because SLATE lrx_slate_init_mpi() must run before jax.distributed
 _DIST = "_LORRAX_JAX_DISTRIBUTED_DONE"
 def _init():
     if os.environ.get(_DIST):

@@ -35,6 +35,7 @@ def _log(msg):
         print(msg, flush=True)
 
 
+# NOTE: keeps inline dist-init because init order is backend-dependent (slate needs local_device_ids=[0]; cusolvermp uses default all-visible-GPUs path)
 def _init_distributed(backend: str) -> None:
     """JAX distributed init — per-backend CUDA affinity assumptions."""
     if os.environ.get("_LORRAX_JAX_DISTRIBUTED_DONE"):
