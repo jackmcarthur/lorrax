@@ -22,15 +22,17 @@ jobs:
         run: |
           # FRAGILE-9 sentinel: fail CI if a NEW file inlines distributed init
           # without either:
-          #   (a) importing from runtime  → 'from runtime import init_jax_distributed'
+          #   (a) importing from runtime  → 'from runtime import ... init_jax_distributed ...'
           #   (b) documented exemption   → '# NOTE: keeps inline dist-init'
           # Files matching (b) are SLATE tests that must call slate_init_mpi()
           # before jax.distributed.initialize(); the exemption comment is required.
+          # Regex form of (a) tolerates combined imports like
+          #   `from runtime import set_default_env, init_jax_distributed, fallback_...`.
           offenders=$(
             grep -l -E '_LORRAX_JAX_DISTRIBUTED_DONE|_DIST_FLAG|_DIST_SENTINEL' \
                 src/common/*_test.py src/common/*_bench.py src/common/*_sweep.py \
                 2>/dev/null \
-              | xargs grep -L 'from runtime import init_jax_distributed' \
+              | xargs grep -L -E '^from runtime import .*init_jax_distributed' \
                 2>/dev/null \
               | xargs grep -L '# NOTE: keeps inline dist-init' \
                 2>/dev/null \
@@ -38,7 +40,7 @@ jobs:
           )
           if [ -n "$offenders" ]; then
             echo "ERROR: the following files inline distributed-init without"
-            echo "  using 'from runtime import init_jax_distributed' (FRAGILE-9):"
+            echo "  using 'from runtime import ... init_jax_distributed ...' (FRAGILE-9):"
             echo "$offenders"
             exit 1
           fi
