@@ -9,28 +9,23 @@
 #   (b) without SLURM_JOBID: run `shifter ... "$@"` directly (login node) —
 #       use only for compile steps that don't need a GPU.
 #
-# MPI STACK — pick one of:
+# MPI STACK — controlled by LORRAX_MPI_STACK (default: cray_mpich).
+# Stack constants are read from config/mpi_stacks/${LORRAX_MPI_STACK}.sh,
+# which is the single source of truth for LORRAX_MPI_TYPE_DEFAULT,
+# LORRAX_SHIFTER_MODULES, LORRAX_MPI_LIB_DIR_CT, LORRAX_MPI_INCLUDE_DIR_CT,
+# and LORRAX_GTL_PRELOAD.  To add a new stack, add a .sh + .cmake pair in
+# config/mpi_stacks/ — do not add another case block here.
 #
-#   LORRAX_PHDF5_MPI_STACK=mpich   (default as of 2026-04-20)
-#     - shifter --module=mpich bind-mounts Cray MPICH (libmpi.so.12)
-#     - phdf5 stage: copy of cray-hdf5-parallel (1.12, libmpi_gnu_*.so.12)
-#     - default LORRAX_FFI_PHDF5_DIR:
-#         /pscratch/sd/$USER/lorrax_phdf5_cray/stage
-#     - srun --mpi=pmi2
-#     - Perf (1 node / 4 GPUs / 4.29 GB C128): 3.79 GB/s, +24% over
-#       openmpi; at MoS2 3×3 scale within noise of openmpi.
-#     - Requires post-2026-04-20 defaults (indep writes + non-coll meta)
-#       to avoid ad_cray_write_coll.c:669 OOM at ≥ 1 GB/rank writes.
-#
-#   LORRAX_PHDF5_MPI_STACK=openmpi
-#     - container's HPC-X OpenMPI at /opt/hpcx/ompi satisfies libmpi.so.40
-#     - phdf5 stage: conda-forge HDF5 1.14 linked against openmpi
-#     - default LORRAX_FFI_PHDF5_DIR:
-#         /pscratch/sd/$USER/lorrax_phdf5_openmpi/stage
-#     - srun --mpi=pmix
-#     - Kept as fallback for non-Cray clusters.
+# Currently supported stacks:
+#   cray_mpich (default) — Shifter --module=mpich, --mpi=cray_shasta.
+#                          Used on Perlmutter (Cray Slingshot, A100).
+#                          Perf at 1 node / 4 GPUs / 4.29 GB C128:
+#                            3.79 GB/s (+24% over openmpi baseline).
+#   openmpi              — stub; not yet wired (see Blitz #3 follow-up).
+#                          Intended for Apptainer-based clusters.
 #
 # Other env:
+#   LORRAX_REPO            root of the lorrax checkout (auto-detected)
 #   LORRAX_FFI_NVHPC_DIR   host path to the staged nvhpc subset.
 #   LORRAX_FFI_IMAGE       shifter image tag.  Default: nvcr.io/nvidia/jax:25.04-py3
 #   LORRAX_NGPU            for srun-mode, # GPUs to request (default 1)
@@ -39,45 +34,52 @@
 
 set -euo pipefail
 
-MPI_STACK="${LORRAX_PHDF5_MPI_STACK:-mpich}"
+# Locate the repo root so we can find config/mpi_stacks/.
+# LORRAX_REPO may be set by the caller; if not, derive it from this script's
+# own path (src/ffi/common/cpp/ → four levels up).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+: "${LORRAX_REPO:="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"}"
 
-NVHPC_HOST="${LORRAX_FFI_NVHPC_DIR:-/pscratch/sd/j/jackm/lorrax_nvhpc}"
-IMAGE="${LORRAX_FFI_IMAGE:-nvcr.io/nvidia/jax:25.04-py3}"
-NGPU="${LORRAX_NGPU:-1}"
-NTASKS="${LORRAX_NTASKS:-${NGPU}}"
-NNODES="${LORRAX_NNODES:-1}"
+MPI_STACK="${LORRAX_MPI_STACK:-cray_mpich}"
+STACK_FILE="${LORRAX_REPO}/config/mpi_stacks/${MPI_STACK}.sh"
+if [[ ! -f "${STACK_FILE}" ]]; then
+    echo "run_shifter.sh: no stack file for LORRAX_MPI_STACK=${MPI_STACK}" >&2
+    echo "  Expected: ${STACK_FILE}" >&2
+    echo "  Available stacks: $(ls "${LORRAX_REPO}/config/mpi_stacks/"*.sh 2>/dev/null | xargs -n1 basename | sed 's/\.sh//' | tr '\n' ' ')" >&2
+    exit 2
+fi
+# Source the stack file; it exports LORRAX_MPI_STACK_NAME, LORRAX_MPI_TYPE_DEFAULT,
+# LORRAX_SHIFTER_MODULES, LORRAX_MPI_LIB_DIR_CT, LORRAX_MPI_INCLUDE_DIR_CT,
+# LORRAX_GTL_PRELOAD.
+# shellcheck source=/dev/null
+source "${STACK_FILE}"
 
-# Stack-specific defaults: phdf5 stage path, Shifter module list, inside-
-# container MPI include / lib paths, srun --mpi flavor.
-case "${MPI_STACK}" in
-    openmpi)
-        PHDF5_DEFAULT="/pscratch/sd/j/jackm/lorrax_phdf5_openmpi/stage"
-        SHIFTER_MODULES="gpu"
-        MPI_LIB_DIR_CT="/opt/hpcx/ompi/lib"
-        MPI_INCLUDE_DIR_CT="/opt/hpcx/ompi/include"
-        MPI_TYPE_DEFAULT="pmix"
-        ;;
-    mpich)
-        PHDF5_DEFAULT="/pscratch/sd/j/jackm/lorrax_phdf5_cray/stage"
-        SHIFTER_MODULES="gpu,mpich"
-        MPI_LIB_DIR_CT="/opt/udiImage/modules/mpich"
-        MPI_INCLUDE_DIR_CT="/lorrax_phdf5/include"  # staged MPICH headers
-        # --mpi=cray_shasta is the PMI protocol that shifter-mpich's libmpi
-        # speaks.  pmi2/pmix both produce singleton-MPI (each rank thinks
-        # world_size==1) — observed while bringing up slate FFI.  phdf5
-        # "worked" on pmi2 only because its default now uses independent
-        # I/O (each rank writes its own shard with no collective handshake
-        # — see src/ffi/phdf5/cpp/ctx.h), so it silently did the right
-        # thing despite singleton MPI.
-        MPI_TYPE_DEFAULT="cray_shasta"
-        ;;
-    *)
-        echo "run_shifter.sh: LORRAX_PHDF5_MPI_STACK=${MPI_STACK} not recognised; use 'openmpi' or 'mpich'." >&2
+# Validate that the stack file set the required variables (catches stub stacks
+# like openmpi.sh that are not yet wired).
+for _var in LORRAX_MPI_TYPE_DEFAULT LORRAX_SHIFTER_MODULES LORRAX_MPI_LIB_DIR_CT LORRAX_MPI_INCLUDE_DIR_CT; do
+    if [[ -z "${!_var:-}" ]]; then
+        echo "run_shifter.sh: stack '${MPI_STACK}' did not set ${_var}; is it a stub?" >&2
         exit 2
-        ;;
+    fi
+done
+unset _var
+
+# Stack-specific phdf5 stage path default (not in the .sh because it embeds
+# $USER and is deployment-specific rather than stack-architecture-specific).
+case "${MPI_STACK}" in
+    cray_mpich)
+        PHDF5_DEFAULT="/pscratch/sd/${USER}/lorrax_phdf5_cray/stage" ;;
+    openmpi)
+        PHDF5_DEFAULT="/pscratch/sd/${USER}/lorrax_phdf5_openmpi/stage" ;;
+    *)
+        PHDF5_DEFAULT="/pscratch/sd/${USER}/lorrax_phdf5_${MPI_STACK}/stage" ;;
 esac
 
 PHDF5_HOST="${LORRAX_FFI_PHDF5_DIR:-${PHDF5_DEFAULT}}"
+SHIFTER_MODULES="${LORRAX_SHIFTER_MODULES}"
+MPI_LIB_DIR_CT="${LORRAX_MPI_LIB_DIR_CT}"
+MPI_INCLUDE_DIR_CT="${LORRAX_MPI_INCLUDE_DIR_CT}"
+MPI_TYPE_DEFAULT="${LORRAX_MPI_TYPE_DEFAULT}"
 
 if [[ ! -d "${NVHPC_HOST}" ]]; then
     echo "run_shifter.sh: staged NVHPC dir ${NVHPC_HOST} does not exist."
@@ -115,7 +117,7 @@ fi
 # SONAME shims, including libmpi_gnu_123.so.12 reused by SLATE); NVHPC
 # (cusolverMp); stack's MPI runtime; darshan (libdarshan.so.0 via siteFs).
 LDLIB="${SLATE_INSTALL_HOST}/lib64:/lorrax_slate/lib:/lorrax_phdf5/lib:/lorrax_nvhpc/25.5_cuda12.9/math_libs/12.9/lib64:${MPI_LIB_DIR_CT}:/global/common/software/nersc9/darshan/default/lib"
-if [[ "${MPI_STACK}" == mpich ]]; then
+if [[ "${MPI_STACK}" == cray_mpich ]]; then
     # mpich module ships its own PMI/libfabric deps under dep/
     LDLIB="${LDLIB}:/opt/udiImage/modules/mpich/dep"
 fi
@@ -127,10 +129,14 @@ fi
 # not in our CUDA-12 container) while our Cray-module stage has the
 # CUDA-12-linked one.  LD_PRELOAD the staged version so it's already loaded
 # when SLATE asks for it.
+# LORRAX_GTL_PRELOAD is the container-side path defined in the stack file;
+# we only activate it if the host-side staging directory exists.
 SLATE_PRELOAD=""
-if [[ -f "${LORRAX_FFI_SLATE_DIR}/lib/libmpi_gtl_cuda.so.0" ]]; then
-    SLATE_PRELOAD="/lorrax_slate/lib/libmpi_gtl_cuda.so.0"
+_gtl_ct="${LORRAX_GTL_PRELOAD:-}"
+if [[ -n "${_gtl_ct}" && -d "${LORRAX_FFI_SLATE_DIR}" ]]; then
+    SLATE_PRELOAD="${_gtl_ct}"
 fi
+unset _gtl_ct
 
 SHIFTER_ARGS=(
     shifter --module="${SHIFTER_MODULES}" --image="${IMAGE}"
@@ -151,7 +157,7 @@ SHIFTER_ARGS=(
     # FFI build picks the right headers / library without guessing.
     --env=LORRAX_MPI_INCLUDE_DIR="${MPI_INCLUDE_DIR_CT}"
     --env=LORRAX_MPICH_LIB_DIR="${MPI_LIB_DIR_CT}"
-    --env=LORRAX_PHDF5_MPI_STACK="${MPI_STACK}"
+    --env=LORRAX_MPI_STACK="${MPI_STACK}"
 )
 
 if [[ -n "${SLURM_JOBID:-}" && -z "${SLURM_STEP_ID:-}" ]]; then

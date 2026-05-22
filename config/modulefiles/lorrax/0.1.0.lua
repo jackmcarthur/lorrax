@@ -69,10 +69,18 @@ local slurm_constraint      = "@LORRAX_SLURM_CONSTRAINT@"
 local gpus_per_node         = tonumber("@LORRAX_GPUS_PER_NODE@")
 
 -- Shifter + MPI stack.
-local shifter_modules       = "@LORRAX_SHIFTER_MODULES@"      -- "gpu,mpich"
-local default_mpi_type      = "@LORRAX_MPI_TYPE_DEFAULT@"     -- "cray_shasta"
+-- LORRAX_SHIFTER_MODULES and LORRAX_MPI_TYPE_DEFAULT are the single source
+-- of truth defined in config/mpi_stacks/<stack>.sh.  The install-time
+-- template values (@…@) serve as fallbacks when the env vars aren't set.
+-- If the stack .sh is sourced before `module load lorrax`, the env-var
+-- reading below picks up the sourced values automatically.
+local shifter_modules       = os.getenv("LORRAX_SHIFTER_MODULES")
+                              or "@LORRAX_SHIFTER_MODULES@"    -- "gpu,mpich"
+local default_mpi_type      = os.getenv("LORRAX_MPI_TYPE_DEFAULT")
+                              or "@LORRAX_MPI_TYPE_DEFAULT@"   -- "cray_shasta"
 local nvhpc_subpath         = "@LORRAX_NVHPC_SUBPATH@"
-local mpich_container_dir   = "@LORRAX_MPICH_CONTAINER_DIR@"  -- "/opt/udiImage/modules/mpich"
+local mpich_container_dir   = os.getenv("LORRAX_MPI_LIB_DIR_CT")
+                              or "@LORRAX_MPICH_CONTAINER_DIR@" -- "/opt/udiImage/modules/mpich"
 local darshan_lib_dir       = "@LORRAX_DARSHAN_LIB_DIR@"      -- may be ""
 
 -- Stage-dir defaults (NERSC $SCRATCH-based; overridable per-user).
@@ -177,24 +185,33 @@ local container_ldlib = table.concat(ldlib_parts, ":")
 -- measurably reduce the ~5 s shifter bring-up).  The real fast-iter win
 -- is `lxshell` (one shifter bring-up, many python invocations).
 
+-- GTL preload: from LORRAX_GTL_PRELOAD (set by sourcing the stack .sh) or
+-- the install-time default (cray_mpich canonical path).
+local gtl_preload = os.getenv("LORRAX_GTL_PRELOAD")
+                    or "/lorrax_slate/lib/libmpi_gtl_cuda.so.0"
+-- MPI include dir inside the container: from stack file or install-time patch.
+local mpi_include_dir_ct = os.getenv("LORRAX_MPI_INCLUDE_DIR_CT")
+                           or "/lorrax_phdf5/include"
+
 local shifter_env_parts = {
     "--env=PYTHONPATH=" .. pypath,
     "--env=HDF5_USE_FILE_LOCKING=FALSE",
     "--env=XLA_PYTHON_CLIENT_PREALLOCATE=false",
-    "--env=XLA_PYTHON_CLIENT_ALLOCATOR=platform",
-    "--env=TF_GPU_ALLOCATOR=cuda_malloc_async",
+    "--env=XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async",
     "--env=LD_LIBRARY_PATH=" .. container_ldlib,
     -- Shifter's mpich module ships libmpi_gtl_cuda.so.0 built against
     -- CUDA 11 (needs libcudart.so.11 we don't have).  LD_PRELOAD the
     -- staged CUDA-12 copy so the loader binds it first.
-    "--env=LD_PRELOAD=/lorrax_slate/lib/libmpi_gtl_cuda.so.0",
+    -- Path comes from LORRAX_GTL_PRELOAD (config/mpi_stacks/*.sh).
+    "--env=LD_PRELOAD=" .. gtl_preload,
     -- Cray MPICH GPU-Direct RDMA.  Shifter's --module=mpich explicitly
     -- unsets this per /etc/shifter/udiRoot.conf; in_container.sh
     -- re-asserts it inside, but passing via --env also covers one-off
     -- invocations that don't use in_container.sh (e.g. lxshell).
     "--env=MPICH_GPU_SUPPORT_ENABLED=1",
     "--env=JAX_COMPILATION_CACHE_DIR=" .. jax_cache_dir,
-    "--env=LORRAX_MPI_INCLUDE_DIR=/lorrax_phdf5/include",
+    -- MPI paths inside container, from config/mpi_stacks/*.sh single source.
+    "--env=LORRAX_MPI_INCLUDE_DIR=" .. mpi_include_dir_ct,
     "--env=LORRAX_MPICH_LIB_DIR=" .. mpich_container_dir,
 }
 

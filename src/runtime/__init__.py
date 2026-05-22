@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import warnings
 
 
 _DISTRIBUTED_SENTINEL = "_LORRAX_JAX_DISTRIBUTED_DONE"
@@ -139,17 +140,30 @@ def init_jax_distributed() -> None:
     init_kwargs = {"local_device_ids": list(range(n_local))} if n_local else {}
     try:
         jax.distributed.initialize(**init_kwargs)
-        os.environ[_DISTRIBUTED_SENTINEL] = "1"
-        return
     except Exception:
-        pass
+        jax.distributed.initialize(
+            coordinator_address=_resolve_coordinator_address(),
+            num_processes=proc_count,
+            process_id=_resolve_proc_id(),
+        )
 
-    jax.distributed.initialize(
-        coordinator_address=_resolve_coordinator_address(),
-        num_processes=proc_count,
-        process_id=_resolve_proc_id(),
-    )
     os.environ[_DISTRIBUTED_SENTINEL] = "1"
+
+    # Post-init sanity: catch the silent singleton-MPI bug caused by a wrong
+    # --mpi= value (e.g. pmi2/pmix with Shifter+cray_mpich produces one
+    # MPI_COMM_WORLD of size 1 per rank; JAX initialises fine against each
+    # singleton, but FFI collectives then misbehave silently).
+    # Promoted to a hard error after one release cycle.
+    expected = int(os.environ.get("SLURM_NTASKS", "1"))
+    actual = jax.process_count()
+    if actual != expected:
+        warnings.warn(
+            f"jax.process_count()={actual} != SLURM_NTASKS={expected}. "
+            f"This usually means --mpi= is wrong (singleton MPI_COMM_WORLDs) "
+            f"or jax.distributed.initialize() did not pick up the SLURM "
+            f"environment. FFI collectives will produce wrong results.",
+            RuntimeWarning, stacklevel=2,
+        )
 
 
 def nccl_warmup(mesh_xy) -> None:
