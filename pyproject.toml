@@ -1,3 +1,7 @@
+[build-system]
+requires = ["scikit-build-core>=0.11.0", "nanobind>=2.0.0", "cmake>=4.0.0", "ninja>=1.10.0"]
+build-backend = "scikit_build_core.build"
+
 [project]
 name = "lorrax"
 version = "0.1.0"
@@ -6,8 +10,12 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "h5py>=3.14.0",
-    "jax[cuda13]>=0.9.0",
-    "jaxlib>=0.9.0",
+    # JAX version and CUDA pairing come from the container/bind-mounts
+    # (nvcr.io/nvidia/jax:25.04-py3 ships JAX 0.5.x + CUDA 12.x).
+    # Do NOT add a cuda13/cuda12 extra here; it breaks installs inside
+    # the container where jax is already present with the right CUDA.
+    "jax>=0.5",
+    "jaxlib>=0.5",
     "matplotlib>=3.10.3",
     "mkdocs>=1.6.1",
     "mkdocs-material>=9.6.20",
@@ -38,8 +46,24 @@ common = [
 
 [tool.uv.workspace]
 members = [
-    
+
 ]
+
+[tool.scikit-build]
+# Delegate to the existing FFI CMakeLists.txt via a thin top-level wrapper.
+cmake.source-dir = "."
+cmake.build-type = "Release"
+
+# GPU-backend toggle anticipating future ROCm support (only "cuda" is wired
+# today).  Pass -DLORRAX_GPU_BACKEND=rocm on AMD clusters once the rocm
+# path exists.
+cmake.args = ["-DLORRAX_GPU_BACKEND=cuda"]
+
+# Install the built .so into ffi/common/cpp/ inside the wheel, where
+# ffi_loader.py's _candidate_paths() finds it via sys.path scan.
+wheel.packages = ["src/ffi", "src/common", "src/gw", "src/bse", "src/centroid",
+                  "src/bandstructure", "src/file_io", "src/mixing",
+                  "src/postprocess", "src/psp", "src/runtime", "src/solvers"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -56,16 +80,11 @@ dev = [
     "pydoc-markdown>=4.8.2",
     "pytest>=8.0.0",
 ]
+# JAX version comes from the container; this group is for local/non-container
+# environments only.  Do NOT add a cuda extra -- let the caller decide.
 jax = [
-    "jax[cuda13]>=0.9.0",
-    "jaxlib>=0.9.0",
-]
-build = [
-    "scikit-build-core>=0.11.0",
-    "cmake>=4.0.0",
-    "ninja>=1.10.0",
-    "pybind11>=3.0.0",
-    "nanobind>=2.0.0",
+    "jax>=0.5",
+    "jaxlib>=0.5",
 ]
 profile = [
     "tensorboard>=2.20.0",
