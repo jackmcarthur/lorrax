@@ -14,8 +14,11 @@ LORRAX 0.1.0 — JAX-based GW with ISDF compression, Shifter container.
 
 Commands
   lxalloc [N] [T]   Interactive GPU allocation (N nodes, default 1, T hrs).
-  lxrun <cmd>       Run <cmd> on LORRAX_NGPU ranks (default 4) inside the
-                    Shifter container.  Cray MPICH + 1 GPU per rank.
+  lxrun <cmd>       Run <cmd> on LORRAX_NNODES×LORRAX_NGPU ranks inside the
+                    Shifter container.  LORRAX_NGPU = GPUs per node (default
+                    4); LORRAX_NNODES = number of nodes (default 1).
+                    Cray MPICH + 1 GPU per rank.
+  lxstatus          Show running SLURM steps for the current SLURM_JOBID.
   lxshell           Single-rank pty shell inside the container; iterate
                     without paying ~5 s shifter bring-up per python call.
   lxpre <in> N      Preprocessing (centroids, dipoles, kin_ion).
@@ -24,6 +27,7 @@ Typical flow
   lxalloc
   lxrun python3 -u -m gw.gw_jax -i cohsex.in
   LORRAX_NGPU=1 lxrun python3 -u -m gw.gw_jax -i cohsex.in
+  LORRAX_NNODES=2 LORRAX_NGPU=8 lxrun python3 -u -m gw.gw_jax -i cohsex.in
   lxshell       # then `python3 -m common.slate_batched_test` etc.
 
 Stack
@@ -31,15 +35,21 @@ Stack
   select_gpu.sh (CUDA_VISIBLE_DEVICES=$SLURM_LOCALID), LD_PRELOAD the
   CUDA-12 libmpi_gtl_cuda, MPICH_GPU_SUPPORT_ENABLED=1.  SLATE,
   cuSOLVERMp, and Cray-HDF5 phdf5 all share this stack.
+  Multi-user shared allocations: load the sandbox lorrax_agent overlay
+  on top of this module for pool-aware lxrun + lxattach + lxreap.
 
 Overrides (set before `module load`)
-  LORRAX_FFI_NVHPC_DIR      default @LORRAX_FFI_NVHPC_DIR_DEFAULT@
-  LORRAX_FFI_PHDF5_DIR      default @LORRAX_FFI_PHDF5_DIR_DEFAULT@
-  LORRAX_FFI_SLATE_DIR      default @LORRAX_FFI_SLATE_DIR_DEFAULT@
-  LORRAX_SLATE_INSTALL_DIR  default @LORRAX_SLATE_INSTALL_DIR_DEFAULT@
-  LORRAX_MPI_TYPE           default @LORRAX_MPI_TYPE_DEFAULT@ (|none|pmi2|pmix)
-  LORRAX_NGPU               default 4 for lxrun, 1 for lxshell
-  JAX_COMPILATION_CACHE_DIR default $SCRATCH/.jax_cache
+  LORRAX_FFI_NVHPC_DIR           default @LORRAX_FFI_NVHPC_DIR_DEFAULT@
+  LORRAX_FFI_PHDF5_DIR           default @LORRAX_FFI_PHDF5_DIR_DEFAULT@
+  LORRAX_FFI_SLATE_DIR           default @LORRAX_FFI_SLATE_DIR_DEFAULT@
+  LORRAX_SLATE_INSTALL_DIR       default @LORRAX_SLATE_INSTALL_DIR_DEFAULT@
+  LORRAX_MPI_TYPE                default @LORRAX_MPI_TYPE_DEFAULT@ (|none|pmi2|pmix)
+  LORRAX_NGPU                    default 4 for lxrun, 1 for lxshell (GPUs per node)
+  LORRAX_NNODES                  default 1 for lxrun (number of nodes)
+  LORRAX_CONTAINER_NVHPC_PATH    container bind-mount target for NVHPC, default /lorrax_nvhpc
+  LORRAX_CONTAINER_PHDF5_PATH    container bind-mount target for phdf5, default /lorrax_phdf5
+  LORRAX_CONTAINER_SLATE_PATH    container bind-mount target for SLATE,  default /lorrax_slate
+  JAX_COMPILATION_CACHE_DIR      default $SCRATCH/.jax_cache
 
 Do NOT use bare `python` / `python3` — the module configures a Shifter
 container, not the host Python.  For non-Shifter local dev, use `uv run`.
@@ -118,6 +128,16 @@ local phdf5_host         = env_or("LORRAX_FFI_PHDF5_DIR",     default_phdf5_host
 local slate_host         = env_or("LORRAX_FFI_SLATE_DIR",     default_slate_host)
 local slate_install_host = env_or("LORRAX_SLATE_INSTALL_DIR", default_slate_install)
 
+-- Container-side bind-mount paths — parametrized so the .so RPATH and the
+-- shifter --volume= arguments can be adjusted for non-Perlmutter clusters
+-- (e.g. Apptainer on Frontier uses different mount conventions).
+-- Override these before `module load lorrax` if needed; the default
+-- /lorrax_* names are baked into the NVHPC stage scripts and CMakeLists
+-- INSTALL_RPATH defaults.
+local ct_nvhpc = env_or("LORRAX_CONTAINER_NVHPC_PATH", "/lorrax_nvhpc")
+local ct_phdf5 = env_or("LORRAX_CONTAINER_PHDF5_PATH", "/lorrax_phdf5")
+local ct_slate = env_or("LORRAX_CONTAINER_SLATE_PATH",  "/lorrax_slate")
+
 -- XLA persistent compile cache.  Amortises PTX JIT across JAX processes;
 -- does NOT cut the CUDA backend init itself.
 local jax_cache_dir = env_or("JAX_COMPILATION_CACHE_DIR",
@@ -159,16 +179,16 @@ end
 
 -- Container LD_LIBRARY_PATH — order matters:
 --   1. SLATE install (slate/blaspp/lapackpp built against cray libs)
---   2. /lorrax_slate : Cray libsci + libmpi_gtl_cuda + xpmem + lustreapi
---   3. /lorrax_phdf5 : Cray HDF5 (libmpi_gnu_*.so.12)
---   4. /lorrax_nvhpc : libcusolverMp + libcal
+--   2. ct_slate  (/lorrax_slate) : Cray libsci + libmpi_gtl_cuda + xpmem + lustreapi
+--   3. ct_phdf5  (/lorrax_phdf5) : Cray HDF5 (libmpi_gnu_*.so.12)
+--   4. ct_nvhpc  (/lorrax_nvhpc) : libcusolverMp + libcal
 --   5. Shifter's mpich bind-mount (libmpi.so.12 + PMI + libfabric deps)
 --   6. (optional) Darshan I/O profiling
 local ldlib_parts = {
     slate_install_host .. "/lib64",
-    "/lorrax_slate/lib",
-    "/lorrax_phdf5/lib",
-    "/lorrax_nvhpc/" .. nvhpc_subpath,
+    ct_slate .. "/lib",
+    ct_phdf5 .. "/lib",
+    ct_nvhpc .. "/" .. nvhpc_subpath,
     mpich_container_dir,
     mpich_container_dir .. "/dep",
 }
@@ -188,10 +208,10 @@ local container_ldlib = table.concat(ldlib_parts, ":")
 -- GTL preload: from LORRAX_GTL_PRELOAD (set by sourcing the stack .sh) or
 -- the install-time default (cray_mpich canonical path).
 local gtl_preload = os.getenv("LORRAX_GTL_PRELOAD")
-                    or "/lorrax_slate/lib/libmpi_gtl_cuda.so.0"
+                    or (ct_slate .. "/lib/libmpi_gtl_cuda.so.0")
 -- MPI include dir inside the container: from stack file or install-time patch.
 local mpi_include_dir_ct = os.getenv("LORRAX_MPI_INCLUDE_DIR_CT")
-                           or "/lorrax_phdf5/include"
+                           or (ct_phdf5 .. "/include")
 
 local shifter_env_parts = {
     "--env=PYTHONPATH=" .. pypath,
@@ -218,9 +238,9 @@ local shifter_env_parts = {
 local shifter_args = table.concat({
     "--image=" .. image,
     "--module=" .. shifter_modules,
-    "--volume=" .. nvhpc_host .. ":/lorrax_nvhpc",
-    "--volume=" .. phdf5_host .. ":/lorrax_phdf5",
-    "--volume=" .. slate_host .. ":/lorrax_slate",
+    "--volume=" .. nvhpc_host .. ":" .. ct_nvhpc,
+    "--volume=" .. phdf5_host .. ":" .. ct_phdf5,
+    "--volume=" .. slate_host .. ":" .. ct_slate,
     table.concat(shifter_env_parts, " "),
 }, " ")
 
@@ -238,6 +258,11 @@ setenv("LORRAX_FFI_PHDF5_HOST",    phdf5_host)
 setenv("LORRAX_FFI_SLATE_HOST",    slate_host)
 setenv("LORRAX_SLATE_INSTALL_DIR", slate_install_host)
 setenv("JAX_COMPILATION_CACHE_DIR", jax_cache_dir)
+-- Export container-side mount points so other tools (run_shifter.sh, build
+-- scripts) can read them without having to recompute the defaults.
+setenv("LORRAX_CONTAINER_NVHPC_PATH", ct_nvhpc)
+setenv("LORRAX_CONTAINER_PHDF5_PATH", ct_phdf5)
+setenv("LORRAX_CONTAINER_SLATE_PATH",  ct_slate)
 
 -- =========================================================================
 --  Shell functions
@@ -269,12 +294,16 @@ set_shell_function("lxalloc", [[
 ]], "")
 
 -- -------------------------------------------------------------------------
--- lxrun: run <cmd> on `LORRAX_NGPU` ranks (default 4) inside the container.
+-- lxrun: run <cmd> on `LORRAX_NNODES×LORRAX_NGPU` ranks inside the container.
 --   lxrun python3 -u -m gw.gw_jax -i cohsex.in
 --   LORRAX_NGPU=1 lxrun python3 -u -m common.slate_batched_test ...
+--   LORRAX_NNODES=2 LORRAX_NGPU=8 lxrun python3 -u -m gw.gw_jax -i cohsex.in
+--
+-- LORRAX_NGPU    = GPUs per node (also controls --gres=gpu:N on each node).
+-- LORRAX_NNODES  = number of nodes (default 1); total ranks = nnodes × ngpu.
 --
 -- Structure of the generated srun line:
---   srun --jobid=$JID --mpi=cray_shasta --gres=gpu:N -N 1 -n N \
+--   srun --jobid=$JID --mpi=cray_shasta --gres=gpu:N -N $nnodes -n $((nnodes*N)) \
 --        select_gpu.sh          # CUDA_VISIBLE_DEVICES=$SLURM_LOCALID
 --        shifter ...            # image + mounts + env + LD_PRELOAD
 --        in_container.sh        # re-assert MPICH_GPU_SUPPORT_ENABLED=1
@@ -292,7 +321,9 @@ set_shell_function("lxrun", [[
                       -S "${LORRAX_LUSTRE_STRIPE_SIZE:-4M}" \
                       "$PWD/tmp" >/dev/null 2>&1 || true
     fi
+    local nnodes="${LORRAX_NNODES:-1}"
     local ngpu="${LORRAX_NGPU:-]] .. gpus_per_node .. [[}"
+    local total_ranks=$((nnodes * ngpu))
     local mpitype="${LORRAX_MPI_TYPE:-]] .. default_mpi_type .. [[}"
     local mpiflag=""
     if [ "${mpitype}" != "none" ]; then
@@ -302,11 +333,34 @@ set_shell_function("lxrun", [[
     if [ -n "${SLURM_JOBID:-}" ] && [ -z "${SLURM_STEP_ID:-}" ]; then
         jobflag="--jobid=$SLURM_JOBID"
     fi
-    srun $jobflag $mpiflag --gres=gpu:${ngpu} -N 1 -n ${ngpu} \
+    srun $jobflag $mpiflag --gres=gpu:${ngpu} -N ${nnodes} -n ${total_ranks} \
         ]] .. select_gpu_sh .. [[ \
         shifter ]] .. shifter_args .. [[ \
         ]] .. in_container_sh .. [[ \
         "$@"
+]], "")
+
+-- -------------------------------------------------------------------------
+-- lxstatus: show running SLURM steps for the current allocation.
+--   lxstatus         # list steps under $SLURM_JOBID
+--
+-- Does NOT require lx_pool.py — this is the base (non-overlay) version.
+-- For pool-aware status with per-agent heartbeat ages, load lorrax_agent.
+
+set_shell_function("lxstatus", [[
+    if [ -z "${SLURM_JOBID:-}" ]; then
+        echo "lxstatus: SLURM_JOBID is not set." >&2
+        echo "  Run 'lxalloc' to get an allocation, or:" >&2
+        echo "  export SLURM_JOBID=<jobid>" >&2
+        return 1
+    fi
+    echo "=== SLURM steps for job ${SLURM_JOBID} ===" >&2
+    if ! squeue --steps -j "${SLURM_JOBID}" -o '%i|%j|%N|%M' 2>/dev/null; then
+        # Older SLURM: fall back to -s (--steps alias)
+        squeue -s -j "${SLURM_JOBID}" -o '%i|%j|%N|%M' 2>/dev/null \
+            || squeue -j "${SLURM_JOBID}" 2>/dev/null \
+            || { echo "lxstatus: squeue failed (SLURM_JOBID=${SLURM_JOBID})" >&2; return 1; }
+    fi
 ]], "")
 
 -- -------------------------------------------------------------------------

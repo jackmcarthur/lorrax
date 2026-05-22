@@ -76,10 +76,33 @@ case "${MPI_STACK}" in
 esac
 
 PHDF5_HOST="${LORRAX_FFI_PHDF5_DIR:-${PHDF5_DEFAULT}}"
+NVHPC_HOST="${LORRAX_FFI_NVHPC_DIR:-/pscratch/sd/${USER}/lorrax_nvhpc/stage}"
 SHIFTER_MODULES="${LORRAX_SHIFTER_MODULES}"
 MPI_LIB_DIR_CT="${LORRAX_MPI_LIB_DIR_CT}"
-MPI_INCLUDE_DIR_CT="${LORRAX_MPI_INCLUDE_DIR_CT}"
 MPI_TYPE_DEFAULT="${LORRAX_MPI_TYPE_DEFAULT}"
+
+# Container-side bind-mount paths — default to the /lorrax_* names used by
+# the NVHPC stage scripts and baked into the .so INSTALL_RPATH.  Override
+# via env vars for non-Perlmutter clusters (Apptainer, Frontier, etc.).
+CT_NVHPC="${LORRAX_CONTAINER_NVHPC_PATH:-/lorrax_nvhpc}"
+CT_PHDF5="${LORRAX_CONTAINER_PHDF5_PATH:-/lorrax_phdf5}"
+CT_SLATE="${LORRAX_CONTAINER_SLATE_PATH:-/lorrax_slate}"
+
+# Stack file sets LORRAX_MPI_INCLUDE_DIR_CT and LORRAX_GTL_PRELOAD as
+# container-side paths (e.g. /lorrax_phdf5/include, /lorrax_slate/lib/...).
+# If the container paths were overridden, re-derive the values by substituting
+# the default prefix — or use the CT_* vars directly as the authoritative path.
+MPI_INCLUDE_DIR_CT="${LORRAX_MPI_INCLUDE_DIR_CT:-${CT_PHDF5}/include}"
+# GTL preload: honour explicit env override (from user or module); otherwise
+# derive from CT_SLATE (the stack file's /lorrax_slate literal replaced by the
+# parametrized mount point).
+if [[ -n "${LORRAX_GTL_PRELOAD:-}" ]]; then
+    GTL_PRELOAD="${LORRAX_GTL_PRELOAD}"
+else
+    GTL_PRELOAD="${CT_SLATE}/lib/libmpi_gtl_cuda.so.0"
+fi
+
+IMAGE="${LORRAX_FFI_IMAGE:-nvcr.io/nvidia/jax:25.04-py3}"
 
 if [[ ! -d "${NVHPC_HOST}" ]]; then
     echo "run_shifter.sh: staged NVHPC dir ${NVHPC_HOST} does not exist."
@@ -98,25 +121,26 @@ fi
 : "${LORRAX_SITE:=/global/homes/j/jackm/scratchperl/.isdf/isdf_venvs/isdf_site}"
 PYPATH="${LORRAX_SRC}:${LORRAX_SITE}"
 
-# Staged third-party trees are bind-mounted inside the container at
-# stable paths: /lorrax_nvhpc, /lorrax_phdf5, /lorrax_slate.
-VOL_FLAGS=(--volume="${NVHPC_HOST}:/lorrax_nvhpc")
+# Staged third-party trees are bind-mounted inside the container.
+# Container-side paths are controlled by CT_NVHPC/CT_PHDF5/CT_SLATE
+# (default /lorrax_nvhpc, /lorrax_phdf5, /lorrax_slate).
+VOL_FLAGS=(--volume="${NVHPC_HOST}:${CT_NVHPC}")
 if [[ -d "${PHDF5_HOST}" ]]; then
-    VOL_FLAGS+=(--volume="${PHDF5_HOST}:/lorrax_phdf5")
+    VOL_FLAGS+=(--volume="${PHDF5_HOST}:${CT_PHDF5}")
 fi
 # SLATE stage: Cray libsci + libmpi_gtl_cuda + libxpmem + liblustreapi.
 # Populated by src/ffi/slate/scripts/stage_cray.sh.  Skipped if absent.
 : "${LORRAX_FFI_SLATE_DIR:=/pscratch/sd/j/jackm/lorrax_slate_cray/stage}"
 SLATE_INSTALL_HOST="${LORRAX_SLATE_INSTALL_DIR:-/global/homes/j/jackm/software/slate/install}"
 if [[ -d "${LORRAX_FFI_SLATE_DIR}" ]]; then
-    VOL_FLAGS+=(--volume="${LORRAX_FFI_SLATE_DIR}:/lorrax_slate")
+    VOL_FLAGS+=(--volume="${LORRAX_FFI_SLATE_DIR}:${CT_SLATE}")
 fi
 
 # LD_LIBRARY_PATH: slate install (libslate + bundled blaspp/lapackpp) + slate
 # cray-stack stage (libsci etc.) come first; then phdf5 stage (libhdf5 +
 # SONAME shims, including libmpi_gnu_123.so.12 reused by SLATE); NVHPC
 # (cusolverMp); stack's MPI runtime; darshan (libdarshan.so.0 via siteFs).
-LDLIB="${SLATE_INSTALL_HOST}/lib64:/lorrax_slate/lib:/lorrax_phdf5/lib:/lorrax_nvhpc/25.5_cuda12.9/math_libs/12.9/lib64:${MPI_LIB_DIR_CT}:/global/common/software/nersc9/darshan/default/lib"
+LDLIB="${SLATE_INSTALL_HOST}/lib64:${CT_SLATE}/lib:${CT_PHDF5}/lib:${CT_NVHPC}/25.5_cuda12.9/math_libs/12.9/lib64:${MPI_LIB_DIR_CT}:/global/common/software/nersc9/darshan/default/lib"
 if [[ "${MPI_STACK}" == cray_mpich ]]; then
     # mpich module ships its own PMI/libfabric deps under dep/
     LDLIB="${LDLIB}:/opt/udiImage/modules/mpich/dep"
@@ -132,11 +156,15 @@ fi
 # LORRAX_GTL_PRELOAD is the container-side path defined in the stack file;
 # we only activate it if the host-side staging directory exists.
 SLATE_PRELOAD=""
-_gtl_ct="${LORRAX_GTL_PRELOAD:-}"
-if [[ -n "${_gtl_ct}" && -d "${LORRAX_FFI_SLATE_DIR}" ]]; then
-    SLATE_PRELOAD="${_gtl_ct}"
+if [[ -n "${GTL_PRELOAD}" && -d "${LORRAX_FFI_SLATE_DIR}" ]]; then
+    SLATE_PRELOAD="${GTL_PRELOAD}"
 fi
-unset _gtl_ct
+
+# SLURM rank / GPU counts — LORRAX_NGPU is GPUs per node; LORRAX_NNODES is
+# nodes; LORRAX_NTASKS overrides total ranks if set explicitly.
+NGPU="${LORRAX_NGPU:-1}"
+NNODES="${LORRAX_NNODES:-1}"
+NTASKS="${LORRAX_NTASKS:-$((NNODES * NGPU))}"
 
 SHIFTER_ARGS=(
     shifter --module="${SHIFTER_MODULES}" --image="${IMAGE}"
