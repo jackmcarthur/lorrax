@@ -47,14 +47,19 @@ def _to_host(A: Any) -> np.ndarray:
         return A
     if jax.process_count() == 1:
         return np.asarray(jax.device_get(A))
-    gathered = multihost_utils.process_allgather(A, tiled=False)
+    # JAX 0.9 dropped tiled=False for global non-fully-addressable arrays;
+    # tiled=True concatenates the per-process shards along axis 0, which is
+    # the correct semantics here (LORRAX shards on ('x','y') along the
+    # leading axes; the concat reassembles the global array).  For arrays
+    # already replicated across processes tiled=True is a no-op.
+    gathered = multihost_utils.process_allgather(A, tiled=True)
     host = np.asarray(jax.device_get(gathered))
     try:
         expected = tuple(int(d) for d in A.shape)
     except Exception:
         expected = None
     if expected is not None and host.shape != expected:
-        # tiled=False commonly returns (world, *A.shape); flatten.
+        # Defensive: if a future JAX returns a leading process-axis, flatten.
         if host.ndim == len(expected) + 1 and host.shape[1:] == expected:
             host = host[0]
         else:
