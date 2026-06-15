@@ -37,38 +37,51 @@ def _barrier(tag: str) -> None:
 def _to_host(A: Any) -> np.ndarray:
     """Fully-replicated host ndarray for A, regardless of sharding.
 
-    For numpy / already-replicated inputs this is a cheap cast.  For
-    sharded JAX arrays it's ``process_allgather(tiled=True)`` followed
-    by ``device_get`` — the tiled gather concatenates per-process shards
-    along the leading axis, reassembling the global array.  The
-    defensive ``if host.ndim == A.ndim + 1`` strip below handles a
-    pre-0.9 ``tiled=False`` return shape if a future JAX restores that
-    semantic.
+    For numpy / already-replicated inputs this is a cheap cast.
+
+    For JAX arrays under multi-process, ``process_allgather(tiled=True)``
+    concatenates per-process LOCAL blocks along axis 0.  That gives three
+    distinct shapes depending on how A is distributed:
+
+    1. Sharded along axis 0 by ``process_count``: result shape ==
+       ``A.shape`` (axis 0 reassembled).  Return as-is.
+    2. Fully replicated across processes: each process holds the full
+       array, tiled returns ``(world * A.shape[0], *A.shape[1:])`` —
+       ``world`` identical copies stacked.  Take ``[:A.shape[0]]``.
+    3. Sharded along a non-leading axis (e.g. ``P(None, 'y')``): tiled
+       gives ``(world * local_axis_0, *A.shape[1:])``.  The local axis-0
+       length equals the GLOBAL axis-0 length here, so the shape is the
+       same as case 2 and the first-N slice is also correct (all replicas
+       on that axis-0 chunk agree).
+    4. Legacy ``tiled=False`` shape ``(world, *A.shape)`` from a future
+       JAX restoring the old API — collapse the leading process axis.
+
+    All four are handled below.  Other shape mismatches raise.
     """
     if isinstance(A, np.ndarray):
         return A
     if jax.process_count() == 1:
         return np.asarray(jax.device_get(A))
-    # JAX 0.9 dropped tiled=False for global non-fully-addressable arrays;
-    # tiled=True concatenates the per-process shards along axis 0, which is
-    # the correct semantics here (LORRAX shards on ('x','y') along the
-    # leading axes; the concat reassembles the global array).  For arrays
-    # already replicated across processes tiled=True is a no-op.
     gathered = multihost_utils.process_allgather(A, tiled=True)
     host = np.asarray(jax.device_get(gathered))
     try:
         expected = tuple(int(d) for d in A.shape)
     except Exception:
-        expected = None
-    if expected is not None and host.shape != expected:
-        # Defensive: if a future JAX returns a leading process-axis, flatten.
-        if host.ndim == len(expected) + 1 and host.shape[1:] == expected:
-            host = host[0]
-        else:
-            raise RuntimeError(
-                f"_to_host: unexpected gather shape {host.shape} for "
-                f"A.shape={expected}")
-    return host
+        return host
+    if host.shape == expected:
+        return host                                                # case 1
+    world = int(jax.process_count())
+    if (host.ndim == len(expected)
+            and host.shape[1:] == expected[1:]
+            and host.shape[0] == world * expected[0]):
+        return host[:expected[0]]                                  # case 2/3
+    if (host.ndim == len(expected) + 1
+            and host.shape[0] == world
+            and host.shape[1:] == expected):
+        return host[0]                                             # case 4
+    raise RuntimeError(
+        f"_to_host: unexpected gather shape {host.shape} for "
+        f"A.shape={expected} on world={world}")
 
 
 class _AllgatherBackend:
