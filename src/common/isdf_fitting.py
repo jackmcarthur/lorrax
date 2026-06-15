@@ -2685,19 +2685,13 @@ def fit_zeta_to_h5(
             # allgather backend: one per-q gather (not per chunk).
             # The full tensor is at most a few GB replicated; for
             # CrI3 scale the FFI backend is mandatory anyway.
-            # JAX 0.9 requires tiled=True for non-fully-addressable arrays
-            # (CPU multi-process); the defensive post-process below handles
-            # both tiled and non-tiled return shapes.
-            _gathered = jax.experimental.multihost_utils.process_allgather(
-                gflat_acc, tiled=True)
+            from file_io._slab_io_allgather import _to_host as _gather_to_host
+            _g = _gather_to_host(gflat_acc)
             if jax.process_index() == 0:
-                _g = np.asarray(_gathered)
-                if _g.ndim == 4 and _g.shape[0] == 1:
-                    _g = _g[0]
                 import h5py as _h5
                 with _h5.File(output_file, 'a') as _f:
                     _f['zeta_q_G'][...] = _g
-            del _gathered
+            del _g
     del gflat_acc
 
     # Close the SlabIO handle (FFI path only; allgather path never

@@ -1118,12 +1118,8 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 
 	# Write G0 = ζ_μ(G=0) at q=0 back to zeta file via SlabIO's deferred
 	# attr path (small; rank-0-only after MPI-IO file is closed).
-	# JAX 0.9 requires explicit tiled=True for non-fully-addressable arrays.
-	# The defensive shape post-process below handles either return shape.
-	G0_gathered = jax.experimental.multihost_utils.process_allgather(
-		G0_all, tiled=True)
-	if G0_gathered.ndim == 5 and G0_gathered.shape[0] == 1:
-		G0_gathered = G0_gathered[0]
+	from file_io._slab_io_allgather import _to_host as _gather_to_host
+	G0_gathered = _gather_to_host(G0_all)
 	if jax.process_index() == 0:
 		with h5py.File(zeta_h5_path, 'a') as f:
 			if 'g0_mu' in f:
