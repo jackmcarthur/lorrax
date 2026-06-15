@@ -955,15 +955,52 @@ class LorraxConfig:
             gflat_chunk_size=int(_g("gflat_chunk_size")),
             vq_g_chunk_size=int(_g("vq_g_chunk_size")),
         )
+        # Auto-route GPU FFIs off on the CPU backend.  The phdf5 FFI is
+        # CUDA-only at the C++ level (cudaMemcpyAsync D2H, cudaEvent sync
+        # — see ``src/ffi/phdf5/cpp/write_ffi.cc``).  cuSOLVERMp / cuBLASMp
+        # are similarly GPU-only.  When jax.default_backend() == "cpu" we
+        # silently downgrade ``use_ffi_io`` → h5py allgather and any
+        # ``cusolvermp_*`` setting → "off", routing the run through the
+        # in-tree JAX paths in ``_slab_io_allgather.py``, ``cholesky_2d.py``,
+        # and ``w_isdf._solve_w``.  Same ``cohsex.in`` works on both
+        # backends; no manual flag flipping needed.
+        _use_ffi_io = bool(_g("use_ffi_io"))
+        _cusolvermp_charge = str(_g("cusolvermp_charge")).strip().lower()
+        _cusolvermp_lu = str(_g("cusolvermp_lu")).strip().lower()
+        try:
+            import jax as _jax
+            _is_cpu_backend = _jax.default_backend() == "cpu"
+        except Exception:
+            _is_cpu_backend = False
+        if _is_cpu_backend:
+            if _use_ffi_io:
+                print_fn(
+                    "  [config] use_ffi_io=true requested but JAX backend "
+                    "is CPU; phdf5 FFI is CUDA-only.  Routing SlabIO "
+                    "through the h5py allgather (host) path."
+                )
+                _use_ffi_io = False
+            if _cusolvermp_charge != "off":
+                print_fn(
+                    f"  [config] cusolvermp_charge={_cusolvermp_charge} "
+                    "requested but JAX backend is CPU; cuSOLVERMp is "
+                    "CUDA-only.  Forcing 'off' (in-tree sharded_cholesky)."
+                )
+                _cusolvermp_charge = "off"
+            if _cusolvermp_lu != "off":
+                print_fn(
+                    f"  [config] cusolvermp_lu={_cusolvermp_lu} requested "
+                    "but JAX backend is CPU; cuSOLVERMp is CUDA-only.  "
+                    "Forcing 'off' (in-tree per-q jnp.linalg.solve)."
+                )
+                _cusolvermp_lu = "off"
         backend = BackendConfig(
-            slab_io=(
-                SlabIOBackend.PHDF5_FFI if bool(_g("use_ffi_io"))
-                else SlabIOBackend.H5PY_ALLGATHER
-            ),
+            slab_io=(SlabIOBackend.PHDF5_FFI if _use_ffi_io
+                     else SlabIOBackend.H5PY_ALLGATHER),
             gspace_io=GspaceIO(str(_g("gspace_mode")).strip().lower()),
             screening_solver=_LEGACY_ISDF_MEMORY_MODE[isdf_memory_mode],
-            cusolvermp_charge=str(_g("cusolvermp_charge")).strip().lower(),
-            cusolvermp_lu=str(_g("cusolvermp_lu")).strip().lower(),
+            cusolvermp_charge=_cusolvermp_charge,
+            cusolvermp_lu=_cusolvermp_lu,
             gamma_contract_mode=str(_g("gamma_contract_mode")).strip().lower(),
         )
         debug = DebugConfig(

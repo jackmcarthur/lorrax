@@ -1,13 +1,18 @@
 """Default SlabIO backend: process_allgather + rank-0 h5py.
 
-This is the fallback / default implementation — byte-identical to the
-hand-rolled pattern that used to live in every call site
-(``jax.experimental.multihost_utils.process_allgather(A, tiled=True)``
--> rank-0 ``h5py.File``).  Consolidated here so the slab_io public
-surface has one place to look for bugs, tuning, or convention changes.
+Canonical CPU SlabIO path.  ``gw_config.LorraxConfig.from_input_file``
+auto-routes ``use_ffi_io=true`` on the JAX CPU backend through this
+module (since the phdf5 FFI is CUDA-only at the C++ level — see
+``src/ffi/phdf5/cpp/write_ffi.cc``).  No CUDA dependency; works in any
+container with h5py + jax installed.
 
-Does NOT import ``ffi.phdf5``; works in any container with h5py +
-jax installed.  The FFI backend lives in ``_slab_io_ffi.py``.
+Pattern: every rank gathers the global array via
+``jax.experimental.multihost_utils.process_allgather(A, tiled=True)``,
+then rank-0 writes the hyperslab via serial h5py.  Slower than the FFI's
+collective MPI-IO at production scale (rank-0 disk bandwidth bottleneck,
+plus full-array gather memory) but byte-identical output.  The FFI
+backend lives in ``_slab_io_ffi.py`` and is selected on the GPU backend
+when ``use_ffi_io=true``.
 """
 from __future__ import annotations
 
