@@ -2,7 +2,7 @@
 
 This is the fallback / default implementation — byte-identical to the
 hand-rolled pattern that used to live in every call site
-(``jax.experimental.multihost_utils.process_allgather(A, tiled=False)``
+(``jax.experimental.multihost_utils.process_allgather(A, tiled=True)``
 -> rank-0 ``h5py.File``).  Consolidated here so the slab_io public
 surface has one place to look for bugs, tuning, or convention changes.
 
@@ -38,10 +38,12 @@ def _to_host(A: Any) -> np.ndarray:
     """Fully-replicated host ndarray for A, regardless of sharding.
 
     For numpy / already-replicated inputs this is a cheap cast.  For
-    sharded JAX arrays it's ``process_allgather(tiled=False)`` followed
-    by ``device_get`` and, if the gather added a leading process-axis
-    (``ndim == A.ndim + 1``), collapsing by taking the rank-0 copy —
-    all processes see identical data so any index works.
+    sharded JAX arrays it's ``process_allgather(tiled=True)`` followed
+    by ``device_get`` — the tiled gather concatenates per-process shards
+    along the leading axis, reassembling the global array.  The
+    defensive ``if host.ndim == A.ndim + 1`` strip below handles a
+    pre-0.9 ``tiled=False`` return shape if a future JAX restores that
+    semantic.
     """
     if isinstance(A, np.ndarray):
         return A

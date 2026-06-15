@@ -23,8 +23,14 @@ Five per-rank HBM peaks across :func:`isdf_fitting.fit_zeta_to_h5` and
           • P_l + P_r rank-5 accumulators on (μ, r_chunk)
           • IFFT'd P_l, P_r in R-space (rank-5)
           • Z_q intermediate before reshard
-        ``pair_density_slots = 3`` (HLO-verified at CrI3 80Ry bispinor +
-        Si 4×4×4 — see agent_d_hlo_calibration.md).  bc-loop is now
+        ``pair_density_slots`` is backend-aware: 3 on GPU XLA (HLO-verified
+        at CrI3 80Ry bispinor + Si 4×4×4 — see ``agent_d_hlo_calibration.md``)
+        and 4 on CPU XLA (HLO-verified at Si μ=384 scalar + bispinor charge +
+        bispinor transverse — see ``CPU_PLANNER_LANDED_2026-05-20.md``).  CPU
+        XLA's BufferAssignment heuristic schedules one extra concurrent
+        pair-density slot than GPU XLA does at the same algebraic structure.
+        Resolved via ``_default_pair_density_slots()`` from
+        ``jax.default_backend()``.  bc-loop is now
         ``lax.scan`` with ``unroll=1`` so n_bc no longer multiplies the
         FFT-box term (Round-6 / commit f567aa0).  gflat_acc is charged
         in BOTH Peak C and Peak D persistent bases (Round-10 / agent_q):
