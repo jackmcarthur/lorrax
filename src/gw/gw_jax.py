@@ -274,9 +274,10 @@ def main(argv=None):
 						if _use_ibz_w:
 							raise ValueError("bispinor supermatrix W is full-BZ only — set LORRAX_FORCE_FULL_BZ=1")
 						# ponytail: full-BZ supermatrix W; IBZ per-channel unfold is the upgrade.
-						from .w_bispinor import solve_w_bispinor
+						from .w_bispinor import solve_w_bispinor, build_chi_blocks
+						chi_blocks = build_chi_blocks(chi0_q_solve, wfns_transverse, quad, e_ref, meta, mesh_xy)
 						_W = solve_w_bispinor(
-							{(0, 0): V_q_solve, **w_ij_tiles}, {(0, 0): chi0_q_solve},
+							{(0, 0): V_q_solve, **w_ij_tiles}, chi_blocks,
 							meta, mesh_xy, solver=config.backend.screening_solver)
 						W_q_solve = _W[(0, 0)]
 						w_ij_tiles = {ij: _W[ij] for ij in _TT_PAIRS}

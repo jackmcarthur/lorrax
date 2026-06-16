@@ -565,7 +565,8 @@ def build_real_quadrature(quad, Omega, minimax_config, *, print_fn=None):
     return fused
 
 
-def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
+def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0,
+                 mu_L=0, nu_L=0):
     """Compute χ₀(q) from a wavefunction bundle and minimax quadrature.
 
     Returns flat-q array (nq, μ, μ).
@@ -604,11 +605,24 @@ def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
         alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
     )
 
+    # Channel-resolved χ^{μ_L,ν_L} (milestone B): fold the Lorentz vertex γ̃
+    # into the CONDUCTION ψ (the v→c ket) — γ̃^{μ_L} on the m-vertex (xn, spin
+    # axis 1), γ̃^{ν_L} on the n-vertex (yr, spin axis 2).  γ̃^0=I_4 ⇒ (0,0) is
+    # the scalar charge χ₀ unchanged (branch skipped).  Same fold + Hermitian-
+    # conj handling as Σ^B's _wfns_with_lorentz_vertices (γ̃ Hermitian).
+    psi_c_xn, psi_c_yr = wfns.xn(s.cond), wfns.yr(s.cond)
+    if mu_L or nu_L:
+        from common.gamma_matrices import gamma_perm_phase, gamma_apply
+        if mu_L:
+            psi_c_xn = gamma_apply(psi_c_xn, *gamma_perm_phase(mu_L), axis=1)
+        if nu_L:
+            psi_c_yr = gamma_apply(psi_c_yr, *gamma_perm_phase(nu_L), axis=2)
+
     kernel = _get_chi_minimax_kernel(mesh_xy, kgrid)
     return kernel(
         nodes,
         wfns.xn(s.val), wfns.yr(s.val),
-        wfns.yr(s.cond), wfns.xn(s.cond),
+        psi_c_yr, psi_c_xn,
         enk_v - jnp.asarray(eref, dtype=enk_v.dtype),
         enk_c - jnp.asarray(eref, dtype=enk_c.dtype),
         jnp.asarray(vmax, dtype=jnp.float64),

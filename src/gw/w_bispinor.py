@@ -57,6 +57,31 @@ def extract_blocks(super_mat: jax.Array, n_C: int, n_T: int) -> dict:
             for mu in range(4) for nu in range(4)}
 
 
+# Transverse χ channels: 6 unique (diagonal + upper) + 3 Hermitian companions.
+_TT_UNIQUE = ((1, 1), (2, 2), (3, 3), (1, 2), (1, 3), (2, 3))
+_TT_HERM = {(2, 1): (1, 2), (3, 1): (1, 3), (3, 2): (2, 3)}
+
+
+def build_chi_blocks(chi00, wfns_transverse, quad, e_ref, meta, mesh_xy) -> dict:
+    """Channel-resolved χ tiles for the screened bispinor W (milestone B).
+
+    Charge χ⁰⁰ is the scalar polarizability (passed in).  The 6 unique transverse
+    χ^{ij} are built by folding γ̃^i/γ̃^j into the conduction ψ (``compute_chi0``'s
+    ``mu_L``/``nu_L``), on the transverse centroid bundle; the 3 Hermitian
+    companions are filled by conj-swapaxes (χ^{ji}=conj(χ^{ij})ᵀ, exact for the
+    real static Laplace quad) so the V·χ supermatrix is Hermitian.  The
+    charge–current cross tiles χ^{0i}/χ^{i0} are left zero (later increment).
+    """
+    from .w_isdf import compute_chi0
+    chi = {(0, 0): chi00}
+    for (i, j) in _TT_UNIQUE:
+        chi[(i, j)] = compute_chi0(wfns_transverse, quad, meta, mesh_xy,
+                                   energy_reference=e_ref, mu_L=i, nu_L=j)
+    for (j, i), src in _TT_HERM.items():
+        chi[(j, i)] = jnp.conj(jnp.swapaxes(chi[src], -1, -2))
+    return chi
+
+
 def solve_w_bispinor(v_blocks: dict, chi_blocks: dict, meta, mesh_xy,
                      *, solver=None) -> dict:
     """Screened bispinor W tiles via the channel-blocked Dyson supermatrix.
