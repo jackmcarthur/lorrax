@@ -40,10 +40,10 @@ def assemble_supermatrix(blocks: dict, n_C: int, n_T: int) -> jax.Array:
     nq, dtype = int(ref.shape[0]), ref.dtype
     rows = []
     for mu in range(4):
-        cols = [blocks.get((mu, nu)) if blocks.get((mu, nu)) is not None
+        cols = [b if (b := blocks.get((mu, nu))) is not None
                 else jnp.zeros((nq, sizes[mu], sizes[nu]), dtype)
                 for nu in range(4)]
-        rows.append(jnp.concatenate([c.astype(dtype) for c in cols], axis=-1))
+        rows.append(jnp.concatenate(cols, axis=-1))
     return jnp.concatenate(rows, axis=-2)             # (nq, N, N)
 
 
@@ -58,7 +58,7 @@ def extract_blocks(super_mat: jax.Array, n_C: int, n_T: int) -> dict:
 
 
 def solve_w_bispinor(v_blocks: dict, chi_blocks: dict, meta, mesh_xy,
-                     n_C: int, n_T: int, *, solver=None) -> dict:
+                     *, solver=None) -> dict:
     """Screened bispinor W tiles via the channel-blocked Dyson supermatrix.
 
     Assembles V and χ as ``(nq, N, N)`` (missing blocks → zero), runs
@@ -66,6 +66,7 @@ def solve_w_bispinor(v_blocks: dict, chi_blocks: dict, meta, mesh_xy,
     ``chi_blocks={(0,0): chi00}`` only.
     """
     from .w_isdf import solve_w
+    n_C, n_T = v_blocks[(0, 0)].shape[-1], v_blocks[(1, 1)].shape[-1]
     v_super = assemble_supermatrix(v_blocks, n_C, n_T)
     chi_super = assemble_supermatrix(chi_blocks, n_C, n_T)
     return extract_blocks(solve_w(v_super, chi_super, meta, mesh_xy, solver=solver),

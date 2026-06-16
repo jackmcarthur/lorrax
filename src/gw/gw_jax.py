@@ -196,6 +196,15 @@ def main(argv=None):
 	# as a back-compat no-op for restart paths that may still feed in
 	# the legacy 8-D layout.
 	V_q = flatten_V_qmunu(V_qmunu)
+	# Bispinor: bare transverse V^{i,j} tiles — Σ^B operand for x_only,
+	# overwritten with screened W^{i,j} below when do_screened.
+	w_ij_tiles = None
+	_TT_PAIRS = [(i, j) for i in (1, 2, 3) for j in (1, 2, 3)]
+	if config.bispinor:
+		from .v_q_bispinor import BispinorVqReader
+		with BispinorVqReader(bispinor_v_q_path, mesh_xy,
+		                      backend=config.backend.slab_io) as _r:
+			w_ij_tiles = {ij: _r.get_tile(*ij) for ij in _TT_PAIRS}
 	if config.do_screened:
 		# IBZ cascade for W = (1 − v χ₀)⁻¹ v: slice V_q, χ₀_q to IBZ
 		# rows before ``solve_w`` so the per-q Cholesky/LU factor runs
@@ -261,8 +270,19 @@ def main(argv=None):
 					precompile_solve_w(V_q_solve, chi0_q_solve, meta, mesh_xy,
 					                   solver=config.backend.screening_solver)
 				with timing.section("W.exec"):
-					W_q_solve = solve_w(V_q_solve, chi0_q_solve, meta, mesh_xy,
-					              solver=config.backend.screening_solver)
+					if config.bispinor:
+						if _use_ibz_w:
+							raise ValueError("bispinor supermatrix W is full-BZ only — set LORRAX_FORCE_FULL_BZ=1")
+						# ponytail: full-BZ supermatrix W; IBZ per-channel unfold is the upgrade.
+						from .w_bispinor import solve_w_bispinor
+						_W = solve_w_bispinor(
+							{(0, 0): V_q_solve, **w_ij_tiles}, {(0, 0): chi0_q_solve},
+							meta, mesh_xy, solver=config.backend.screening_solver)
+						W_q_solve = _W[(0, 0)]
+						w_ij_tiles = {ij: _W[ij] for ij in _TT_PAIRS}
+					else:
+						W_q_solve = solve_w(V_q_solve, chi0_q_solve, meta, mesh_xy,
+						              solver=config.backend.screening_solver)
 					# χ₀ is donated inside solve_w — the reference is
 					# now invalid.  Do NOT touch ``chi0_q_solve`` after this.
 					del chi0_q_solve
@@ -362,8 +382,7 @@ def main(argv=None):
 			static_head_terms=static_head_terms,
 			compute_bare_x=True,
 			wfns_transverse=wfns_transverse,
-			bispinor_v_q_path=bispinor_v_q_path,
-			backend=config.backend.slab_io,
+			w_ij_tiles=w_ij_tiles,
 		)
 	sig_sx  = cohsex["sig_sx"]
 	sig_coh = cohsex["sig_coh"]

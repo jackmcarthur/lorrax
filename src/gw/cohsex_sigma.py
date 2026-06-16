@@ -158,9 +158,7 @@ def compute_cohsex_sigma(
     static_head_terms=None,
     compute_bare_x: bool = True,
     wfns_transverse=None,
-    bispinor_v_q_path=None,
-    backend=None,
-    use_ffi_io: bool | None = None,
+    w_ij_tiles=None,
 ) -> dict:
     """Evaluate static COHSEX self-energy components.
 
@@ -237,15 +235,14 @@ def compute_cohsex_sigma(
         # (i, j) ∈ {1, 2, 3}²) to sig_x.  No-op when ``wfns_transverse``
         # or ``bispinor_v_q_path`` is missing.  See
         # ``gw.sigma_x_bispinor`` and ``BISPINOR_DHFB_DESIGN.md`` §3.
-        if wfns_transverse is not None and bispinor_v_q_path is not None:
+        if wfns_transverse is not None and w_ij_tiles is not None:
             from .sigma_x_bispinor import compute_sigma_x_bispinor
             with mesh_xy:
                 sig_x_b = compute_sigma_x_bispinor(
                     wfns_transverse=wfns_transverse,
                     Gij=Gij,
-                    bispinor_v_q_path=bispinor_v_q_path,
+                    w_tiles=w_ij_tiles,
                     meta=meta, mesh_xy=mesh_xy,
-                    backend=backend, use_ffi_io=use_ffi_io,
                 )
             sig_x_b.block_until_ready()
             sig_x = sig_x + sig_x_b
@@ -267,9 +264,7 @@ def compute_v_h_sigma_x(
     Gij: jax.Array | None = None,
     static_head_terms=None,
     wfns_transverse=None,
-    bispinor_v_q_path=None,
-    backend=None,
-    use_ffi_io: bool | None = None,
+    w_ij_tiles=None,
 ) -> dict:
     """Two-kernel V-only path: ``sig_h`` (Hartree) + ``sig_x`` (bare exchange).
 
@@ -312,15 +307,14 @@ def compute_v_h_sigma_x(
         sig_x = jax.lax.with_sharding_constraint(sig_x, rep)
         sig_x.block_until_ready()
 
-    if wfns_transverse is not None and bispinor_v_q_path is not None:
+    if wfns_transverse is not None and w_ij_tiles is not None:
         from .sigma_x_bispinor import compute_sigma_x_bispinor
         with mesh_xy:
             sig_x_b = compute_sigma_x_bispinor(
                 wfns_transverse=wfns_transverse,
                 Gij=Gij,
-                bispinor_v_q_path=bispinor_v_q_path,
+                w_tiles=w_ij_tiles,
                 meta=meta, mesh_xy=mesh_xy,
-                backend=backend, use_ffi_io=use_ffi_io,
             )
         sig_x_b.block_until_ready()
         sig_x = sig_x + sig_x_b
