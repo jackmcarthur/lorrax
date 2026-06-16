@@ -230,6 +230,35 @@ def main(argv=None):
 		else:
 			_use_ibz_w = False
 
+		# Bispinor supermatrix W: the transverse Lorentz channels live
+		# on a SEPARATE (transverse) centroid set, so they need their
+		# own IBZ tables.  The supermatrix is a single LU over
+		# N = n_C + 3*n_T -- its q-axis must be ONE common length, so
+		# IBZ activation is all-or-nothing across the charge and
+		# transverse sets (``_use_ibz_super``).  Mirror gw_init's
+		# transverse-centroid provenance (gw_init.py:962-966).
+		_ibz_T = None
+		_use_ibz_super = False
+		if config.bispinor and _use_ibz_w:
+			_cents_curr = config.paths.centroids_file_current
+			if _cents_curr:
+				from .v_q_g_flat import _resolve_ibz_q_list
+				_, _cent_T_idx, _ = load_centroids(
+					_cents_curr, meta.fft_grid)
+				_ibz_T = _resolve_ibz_q_list(
+					sym=sym,
+					centroid_indices=np.asarray(_cent_T_idx, dtype=np.int32),
+					kgrid=tuple(meta.kgrid),
+					fft_grid=tuple(meta.fft_grid),
+					verbose=False)
+				_use_ibz_T = bool(_ibz_T[6])
+				_use_ibz_super = _use_ibz_w and _use_ibz_T
+		# For bispinor the supermatrix q-axis must be ONE length, so the
+		# CC-channel IBZ slice / unfold follow the joint super-gate (the
+		# CC and TT channels cannot disagree on IBZ-vs-full-BZ).
+		if config.bispinor:
+			_use_ibz_w = _use_ibz_super
+
 		with timing.section("gw_jax.chi0_W"):
 			with jax_profile.trace_section("chi0_W"):
 				# Split compile vs exec for χ₀ and W.  Each section's
@@ -271,14 +300,49 @@ def main(argv=None):
 					                   solver=config.backend.screening_solver)
 				with timing.section("W.exec"):
 					if config.bispinor:
-						if _use_ibz_w:
-							raise ValueError("bispinor supermatrix W is full-BZ only — set LORRAX_FORCE_FULL_BZ=1")
-						# ponytail: full-BZ supermatrix W; IBZ per-channel unfold is the upgrade.
 						from .w_bispinor import solve_w_bispinor, build_chi_blocks
-						chi_blocks = build_chi_blocks(chi0_q_solve, wfns, wfns_transverse, quad, e_ref, meta, mesh_xy)
+						# Milestone-A only on this branch: CC + TT χ tiles, no
+						# charge–current cross χ^{0i} (so W^{0i}=0).  The cross-block
+						# IBZ unfold (rectangular two-centroid-set permute +
+						# single-R + net-TRS(−1)) is underived — see
+						# unfold_bispinor_tiles.  Forcing Milestone-A for BOTH the
+						# IBZ and full-BZ paths keeps them comparing identical
+						# physics (the sym==nosym refactor-equivalence gate); the
+						# Milestone-B cross χ stays gated off until the cross-block
+						# unfold lands.
+						chi_blocks = build_chi_blocks(
+							chi0_q_solve, wfns, wfns_transverse, quad, e_ref,
+							meta, mesh_xy, milestone_a=True)
+						v_blocks = {(0, 0): V_q_solve, **w_ij_tiles}
+						if _use_ibz_super:
+							# Bring the TT V-tiles (read full-BZ from disk) and
+							# the TT χ tiles (built full-BZ in build_chi_blocks)
+							# onto the IBZ q-axis so the supermatrix LU runs on
+							# n_q_ibz blocks.  CC V_q_solve / χ (chi0_q_solve) are
+							# already IBZ-sliced above.  The q-axis index
+							# sym.q_irr_full_idx is shared across all channels
+							# (axis-0 gather only).
+							from common.symmetry_maps import slice_q_full_to_ibz
+							_nat = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+							_sl = lambda a: slice_q_full_to_ibz(
+								a, sym.q_irr_full_idx, out_sharding=_nat)
+							v_blocks = {(0, 0): V_q_solve,
+							            **{ij: _sl(w_ij_tiles[ij]) for ij in _TT_PAIRS}}
+							chi_blocks = {(0, 0): chi_blocks[(0, 0)],
+							              **{k: _sl(v) for k, v in chi_blocks.items()
+							                 if k != (0, 0)}}
 						_W = solve_w_bispinor(
-							{(0, 0): V_q_solve, **w_ij_tiles}, chi_blocks,
+							v_blocks, chi_blocks,
 							meta, mesh_xy, solver=config.backend.screening_solver)
+						if _use_ibz_super:
+							# IBZ → full-BZ: CC scalar unfold + TT (scalar + R⊗R)
+							# in one shared helper.  Cross blocks stay zero
+							# (Milestone-A); no scalar post-unfold below.
+							from common.symmetry_maps import unfold_bispinor_tiles
+							with timing.section("W.unfold_to_full_bz"):
+								_W = unfold_bispinor_tiles(
+									_W, sym=sym, ibz_C=_ibz_tables,
+									ibz_T=_ibz_T, mesh_xy=mesh_xy)
 						W_q_solve = _W[(0, 0)]
 						w_ij_tiles = {ij: _W[ij] for ij in _TT_PAIRS}
 					else:
@@ -291,7 +355,7 @@ def main(argv=None):
 				# IBZ → full-BZ unfold (centroid double-permute + L-phase
 				# + TRS conj) — same helper V_q uses.  Σ_COH/SX still
 				# iterate over the full BZ in the k-q sums.
-				if _use_ibz_w:
+				if _use_ibz_w and not config.bispinor:
 					from common.symmetry_maps import unfold_v_q
 					with timing.section("W.unfold_to_full_bz"):
 						_n_sym_spatial = int(

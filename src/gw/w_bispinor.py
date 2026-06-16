@@ -63,7 +63,7 @@ _TT_HERM = {(2, 1): (1, 2), (3, 1): (1, 3), (3, 2): (2, 3)}
 
 
 def build_chi_blocks(chi00, wfns_charge, wfns_transverse, quad, e_ref,
-                     meta, mesh_xy) -> dict:
+                     meta, mesh_xy, *, milestone_a: bool = False) -> dict:
     """Channel-resolved χ tiles for the screened bispinor W (milestone B).
 
     Charge χ⁰⁰ is the scalar polarizability (passed in).  The 6 unique transverse
@@ -72,6 +72,13 @@ def build_chi_blocks(chi00, wfns_charge, wfns_transverse, quad, e_ref,
     transverse n-vertex (yr) — giving rectangular n_C×n_T blocks.  The 3+3 Hermitian
     companions (χ^{ji}, χ^{i0}) are conj-swapaxes fills (χ^{νμ}=conj(χ^{μν})ᵀ, exact
     for the real static Laplace quad), so the V·χ supermatrix is Hermitian.
+
+    ``milestone_a=True`` skips the charge–current cross χ^{0i}/χ^{i0} blocks
+    (returns CC + TT only).  This is required for the bispinor IBZ→full-BZ
+    cascade: the cross-block IBZ unfold (rectangular two-centroid-set permute
+    + single-R + net-TRS(−1)) is underived (``unfold_bispinor_tiles`` handles
+    only CC + TT).  W^{0i} is then identically zero, matching the Milestone-A
+    physics (charge screening + bare Breit).
     """
     from .w_isdf import compute_chi0
     chi = {(0, 0): chi00}
@@ -80,11 +87,12 @@ def build_chi_blocks(chi00, wfns_charge, wfns_transverse, quad, e_ref,
                                    energy_reference=e_ref, mu_L=i, nu_L=j)
     for (j, i), src in _TT_HERM.items():
         chi[(j, i)] = jnp.conj(jnp.swapaxes(chi[src], -1, -2))
-    for i in (1, 2, 3):
-        chi[(0, i)] = compute_chi0(wfns_charge, quad, meta, mesh_xy,
-                                   energy_reference=e_ref, mu_L=0, nu_L=i,
-                                   wfns_n=wfns_transverse)
-        chi[(i, 0)] = jnp.conj(jnp.swapaxes(chi[(0, i)], -1, -2))
+    if not milestone_a:
+        for i in (1, 2, 3):
+            chi[(0, i)] = compute_chi0(wfns_charge, quad, meta, mesh_xy,
+                                       energy_reference=e_ref, mu_L=0, nu_L=i,
+                                       wfns_n=wfns_transverse)
+            chi[(i, 0)] = jnp.conj(jnp.swapaxes(chi[(0, i)], -1, -2))
     return chi
 
 

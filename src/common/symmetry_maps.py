@@ -611,6 +611,98 @@ def _get_unfold_v_q_lorentz_jit(*, V_shape, R_per_q_arr, mesh_xy):
     return _do_mix
 
 
+# Bispinor Lorentz-block tile bookkeeping, shared by the V_q-write path
+# (``gw.v_q_bispinor``) and the screened-W path (``gw.gw_jax``).
+_TT_UNIQUE_BISPINOR = ((1, 1), (2, 2), (3, 3), (1, 2), (1, 3), (2, 3))
+_TT_HERM_BISPINOR = {(2, 1): (1, 2), (3, 1): (1, 3), (3, 2): (2, 3)}
+
+
+def unfold_bispinor_tiles(tiles_ibz, *, sym, ibz_C, ibz_T, mesh_xy):
+    """IBZ → full-BZ unfold for the CC + TT bispinor Lorentz blocks.
+
+    Shared kernel for the bispinor IBZ→full-BZ unfold used by **both**
+    the V_q-write path (``gw.v_q_bispinor``, replacing its inline
+    sequence) and the screened-W path (``gw.gw_jax``).  The two paths
+    produce the SAME kind of object — a per-q Lorentz-channel tile that
+    is bilinear in centroids and rotates under symmetry by the centroid
+    double-permute + L-phase + TRS conj-wrap (``unfold_v_q``), with the
+    transverse channels additionally Cartesian-mixed by the proper
+    rotation R (``unfold_v_q_bispinor_lorentz``).  See
+    ``reports/bispinor_ibz_2026-05-16/derivation.md`` §A4–A5.
+
+    Only the **non-cross** blocks are handled here:
+
+    * ``(0, 0)`` charge×charge — scalar ``unfold_v_q`` with the **charge**
+      centroid tables (``ibz_C``).  γ̃⁰ = I is sym-invariant, no Lorentz
+      mix.
+    * ``(i, j)``, ``i, j ∈ {1,2,3}`` transverse×transverse — scalar
+      ``unfold_v_q`` (×9) with the **transverse** centroid tables
+      (``ibz_T``), then the 3×3 ``R⊗R`` Lorentz mix.  The 3 lower-triangle
+      inputs are synthesised from the stored upper triangle via
+      ``conj(swapaxes(.., -1, -2))`` before the mix.
+
+    The **cross** blocks ``(0, j)`` / ``(i, 0)`` are NOT handled (they are
+    zero in Milestone A, and their rectangular two-centroid-set unfold +
+    single-R + net-TRS(−1) is underived — see the module-level TODO and
+    ``derivation.md`` which stops at TT).  Callers must gate those off.
+
+    Parameters
+    ----------
+    tiles_ibz : dict[(μ_L, ν_L) -> jax.Array]
+        IBZ-shaped tiles.  Must contain ``(0, 0)`` (n_q_ibz, n_C, n_C)
+        and the 6 unique upper-triangle TT tiles (n_q_ibz, n_T, n_T).
+    sym : SymMaps
+        Provides ``irr_idx_q``, ``sym_idx_q``, ``q_irr_full_idx``,
+        ``R_proper``.
+    ibz_C, ibz_T : 7-tuple
+        ``_resolve_ibz_q_list`` output for the charge / transverse
+        centroid set: ``(_, q_irr_frac, full_to_irr_idx, full_to_irr_sym,
+        sym_perm, L_table, use_ibz)``.
+    mesh_xy : jax.sharding.Mesh
+
+    Returns
+    -------
+    dict[(μ_L, ν_L) -> jax.Array]
+        Full-BZ ``(0, 0)`` + 9 TT tiles ``(i, j)`` for i, j ∈ {1,2,3},
+        sharded ``P(None, 'x', 'y')``.
+    """
+    (_, _qC_frac, _C_idx, _C_sym, _C_perm, _C_L, _) = ibz_C
+    (_, _qT_frac, _T_idx, _T_sym, _T_perm, _T_L, _) = ibz_T
+    _nC_spatial = int(np.asarray(_C_perm).shape[0]) // 2
+    _nT_spatial = int(np.asarray(_T_perm).shape[0]) // 2
+
+    out = {}
+    # (0,0) charge×charge — scalar unfold, charge tables.
+    out[(0, 0)] = unfold_v_q(
+        tiles_ibz[(0, 0)],
+        irr_idx=_C_idx, sym_idx=_C_sym,
+        sym_perm=_C_perm, L_table=_C_L,
+        q_irr_frac=_qC_frac, mesh_xy=mesh_xy,
+        n_sym_spatial=_nC_spatial)
+
+    # (i,j) transverse×transverse — Stage A scalar unfold (transverse
+    # tables) on the 6 unique + 3 Hermitian-synthesised inputs, then
+    # Stage B R⊗R Lorentz mix.
+    tt_unf = {}
+    for ij in _TT_UNIQUE_BISPINOR:
+        tt_unf[ij] = unfold_v_q(
+            tiles_ibz[ij],
+            irr_idx=_T_idx, sym_idx=_T_sym,
+            sym_perm=_T_perm, L_table=_T_L,
+            q_irr_frac=_qT_frac, mesh_xy=mesh_xy,
+            n_sym_spatial=_nT_spatial)
+    for (j, i), src in _TT_HERM_BISPINOR.items():
+        tt_unf[(j, i)] = jnp.conj(jnp.swapaxes(tt_unf[src], -1, -2))
+
+    tt_mixed = unfold_v_q_bispinor_lorentz(
+        tt_unf,
+        sym_idx=np.asarray(sym.sym_idx_q, dtype=np.int32),
+        R_proper_table=np.asarray(sym.R_proper, dtype=np.float64),
+        mesh_xy=mesh_xy)
+    out.update(tt_mixed)
+    return out
+
+
 # i·σ_y (time-reversal spinor factor in the SOC convention T = iσ_y K).
 _I_SIGMA_Y = np.array([[0.0, 1.0], [-1.0, 0.0]], dtype=np.complex128)
 
