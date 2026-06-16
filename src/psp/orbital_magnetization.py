@@ -102,34 +102,37 @@ def velocity_at_k(wfn, sym, meta, vnl_setup, ik, nb):
 # ----------------------------------------------------------------------
 #  Modern-theory sum-over-states summand at one k
 # ----------------------------------------------------------------------
-def orbital_sum_at_k(v, eps, nocc, mu, deps_tol, mceil=None):
-    """Complex (Cx, Cy, Cz) = sum_{n occ} sum_{m!=n, m<mceil} cross * weight.
+def orbital_pieces_at_k(v, eps, nocc, deps_tol):
+    """mu-independent building blocks of the orbital-moment summand at one k.
 
-    cross_gamma[n,m] = eps_{gamma a b} v^a_nm v^b_mn, with the index map
-    v^a_nm = v[a, n, m] (bra n, ket m) and v^b_mn = v[b, m, n].  Therefore
-    cross_z = v[0]*v[1].T - v[1]*v[0].T  (element-wise (nb,nb) products), etc.
-    weight[n,m] = (eps_m + eps_n - 2 mu) / (eps_n - eps_m)^2, masked to 0 for
-    |eps_n-eps_m| <= deps_tol (removes m=n and degenerate denominators).
-    The physical prefactor (-1/2) and Im[.] are applied by the caller.
+    Returns (PA, PB), each (3, nb, nb) complex, with the per-(gamma, n, m) terms
+
+        PA[g,n,m] = occ[n] * cross_g[n,m] * (eps_n + eps_m) / (eps_n-eps_m)^2
+        PB[g,n,m] = occ[n] * cross_g[n,m] /               (eps_n-eps_m)^2
+
+    where cross_g[n,m] = eps_{g a b} v^a_nm v^b_mn, index map v^a_nm = v[a,n,m]
+    (bra n, ket m), so cross_z = v[0]*v[1].T - v[1]*v[0].T (element-wise).
+    The full summand at chemical potential mu is then linear in mu:
+
+        summand_g(mu)[n,m] = PA[g,n,m] - 2*mu*PB[g,n,m]
+
+    so ANY mu, the per-band breakdown (sum over m), and the band-ceiling
+    convergence (cumsum over m) all follow from one pass — no recomputation.
+    The (-1/2) prefactor and Im[.] are applied by the caller.  Degenerate /
+    diagonal denominators (|eps_n-eps_m| <= deps_tol) are masked to 0.
     """
     nb = v.shape[1]
-    vt = np.swapaxes(v, 1, 2)                       # vt[a, n, m] = v[a, m, n]
-    cz = v[0] * vt[1] - v[1] * vt[0]                # (nb, nb)
-    cx = v[1] * vt[2] - v[2] * vt[1]
-    cy = v[2] * vt[0] - v[0] * vt[2]
-
-    deps = eps[:, None] - eps[None, :]              # eps_n - eps_m
-    esum = eps[:, None] + eps[None, :] - 2.0 * mu
+    vt = np.swapaxes(v, 1, 2)                        # vt[a, n, m] = v[a, m, n]
+    cross = np.stack([v[1] * vt[2] - v[2] * vt[1],   # x  (eps_xab, ab=yz)
+                      v[2] * vt[0] - v[0] * vt[2],   # y  (ab=zx)
+                      v[0] * vt[1] - v[1] * vt[0]])   # z  (ab=xy)   (3,nb,nb)
+    deps = eps[:, None] - eps[None, :]               # eps_n - eps_m
     mask = np.abs(deps) > deps_tol
-    W = np.where(mask, esum / np.where(mask, deps, 1.0) ** 2, 0.0)
-
-    occ = np.zeros((nb, 1)); occ[:nocc, 0] = 1.0    # outer sum over occupied n
-    if mceil is not None and mceil < nb:
-        col = np.ones((1, nb)); col[0, mceil:] = 0.0  # inner m-sum ceiling
-        W = W * col
-    Wn = occ * W
-    return np.array([np.sum(Wn * cx), np.sum(Wn * cy), np.sum(Wn * cz)],
-                    dtype=np.complex128)
+    inv2 = np.where(mask, 1.0 / np.where(mask, deps, 1.0) ** 2, 0.0)  # 1/Delta^2
+    occ = np.zeros((nb, 1)); occ[:nocc, 0] = 1.0     # outer sum over occupied n
+    Wa = occ * ((eps[:, None] + eps[None, :]) * inv2)
+    Wb = occ * inv2
+    return cross * Wa[None], cross * Wb[None]         # PA, PB : (3, nb, nb)
 
 
 # ----------------------------------------------------------------------
@@ -282,6 +285,15 @@ def main(argv=None):
         vnl_setup = vnl_ops.build_vnl_setup(wfn, sym, meta, pseudos, nspinor=nspinor)
 
     # ---- per-k velocity matrices + spin density --------------------------
+    # PERF: this per-k loop is the wall-clock floor (~1-1.5 s/k).  The cost is
+    # load_kpoint_fftbox building the full (nb, ns, nx, ny, nz) FFT box and the
+    # projector build inside compute_vnl_velocity_cart.  To scale to dense
+    # k-grids (the velocity einsums are already @jax.jit):
+    #   (a) read coefficients DIRECTLY to the G-sphere (skip to_box) — the
+    #       einsums only need (nb, ns, nG); this also cuts peak memory ~30x.
+    #   (b) batch the projector/dZ build over k on the sphere representation
+    #       (jit/vmap build_vnl_kdata_from_kvec) instead of per-k host work.
+    # Boxes can't be batched across k (memory), but sphere-side work can.
     nk = int(sym.nk_tot)
     w_k = 1.0 / nk                                   # uniform full-BZ weight
     Vp = np.zeros((nk, 3, nbnd, nbnd), dtype=np.complex128)
@@ -356,21 +368,23 @@ def main(argv=None):
     print(f"\n[orbmag] spin moment  sum_occ <sigma_z> = {S_sum:+.4f}  -> "
           f"|m_spin| = {abs(m_spin_z):.3f} mu_B  (expect ~6 for CrI3)")
 
-    # ---- orbital moment --------------------------------------------------
-    C = np.zeros(3, dtype=np.complex128)
-    perband = np.zeros(nocc) if args.per_band else None
+    # ---- orbital moment: accumulate mu-independent pieces ONCE ----------
+    # PA, PB (3, nb, nb) so the summand at any mu is PA - 2*mu*PB.  Every
+    # diagnostic below is then a cheap reduction of these two arrays — no
+    # per-mu / per-band / per-ceiling recomputation.
+    PA = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
+    PB = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
     for ik in range(nk):
-        Ck = orbital_sum_at_k(V[ik], E[ik], nocc, mu, deps_tol)
-        C += w_k * Ck
-        if args.per_band:
-            for n in range(nocc):
-                cn = orbital_sum_at_k(V[ik], E[ik], n + 1, mu, deps_tol)[2] \
-                     - orbital_sum_at_k(V[ik], E[ik], n, mu, deps_tol)[2]
-                perband[n] += w_k * cn.imag
-    m_orb = -MU_B_PREFACTOR * C.imag                        # (3,) mu_B, file frame
+        pa, pb = orbital_pieces_at_k(V[ik], E[ik], nocc, deps_tol)
+        PA += w_k * pa
+        PB += w_k * pb
 
+    def C_of_mu(m):                                  # (3,) complex BZ+band sum
+        return (PA - 2.0 * m * PB).sum(axis=(1, 2))
+
+    m_orb = -MU_B_PREFACTOR * C_of_mu(mu).imag       # (3,) mu_B, file frame
     frame = 1.0 if m_spin_z >= 0 else -1.0
-    m_orb_par = float(frame * m_orb[2])                     # along spin-moment axis
+    m_orb_par = float(frame * m_orb[2])              # along spin-moment axis
 
     print("\n" + "=" * 64)
     print("ORBITAL MAGNETIC MOMENT  (per unit cell, mu_B)")
@@ -386,23 +400,21 @@ def main(argv=None):
     if args.mu_scan and nocc < nbnd:
         print("\n[orbmag] mu-scan (m_z, mu_B):")
         for label, m in [("VBM", VBM), ("midgap", 0.5 * (VBM + CBM)), ("CBM", CBM)]:
-            Cs = sum(w_k * orbital_sum_at_k(V[ik], E[ik], nocc, m, deps_tol)
-                     for ik in range(nk))
             print(f"   mu={m*RY2EV:8.4f} eV ({label:6s}):  "
-                  f"m_z = {-MU_B_PREFACTOR*float(Cs[2].imag):+.5f}")
+                  f"m_z = {-MU_B_PREFACTOR*float(C_of_mu(m)[2].imag):+.5f}")
 
     if args.convergence and not args.skip_vnl:
         print("\n[orbmag] convergence vs inner-m band ceiling (m_z, mu_B):")
-        ceilings = sorted(set([int(0.5*nbnd), int(0.7*nbnd), int(0.85*nbnd), nbnd]))
-        for mc in ceilings:
-            Cc = sum(w_k * orbital_sum_at_k(V[ik], E[ik], nocc, mu, deps_tol, mceil=mc)
-                     for ik in range(nk))
-            print(f"   mceil={mc:4d}:  m_z = {-MU_B_PREFACTOR*float(Cc[2].imag):+.5f}")
+        col_z = (PA[2] - 2.0 * mu * PB[2]).sum(axis=0)   # sum over occupied n
+        cum = np.cumsum(col_z)                           # partial sums over inner m
+        for mc in sorted(set([int(0.5*nbnd), int(0.7*nbnd), int(0.85*nbnd), nbnd])):
+            print(f"   mceil={mc:4d}:  m_z = {-MU_B_PREFACTOR*float(cum[mc-1].imag):+.5f}")
 
     if args.per_band:
-        m_par_band = frame * (-MU_B_PREFACTOR) * perband
+        band_z = (PA[2] - 2.0 * mu * PB[2]).sum(axis=1)  # per outer-n, sum over m
+        m_par_band = frame * (-MU_B_PREFACTOR) * band_z.imag
         print("\n[orbmag] per-occupied-band m_z (along spin axis, mu_B):")
-        order = np.argsort(np.abs(m_par_band))[::-1]
+        order = np.argsort(np.abs(m_par_band[:nocc]))[::-1]
         for n in order[:12]:
             print(f"   band {n:3d}: {m_par_band[n]:+.5f}")
 
