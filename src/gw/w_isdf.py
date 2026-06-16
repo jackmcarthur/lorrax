@@ -159,9 +159,11 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
         accumulate weighted by α; final back-FFT to q.  All collectives
         and dispatch happen inside one compiled graph — no Python loop.
         """
-        n_rmu = psi_v_xn.shape[2]
+        # χ_R is (nk, μ_m, μ_n): m from xn, n from yr — rectangular for the cross
+        # tile χ^{0i} (m=charge n_C, n=transverse n_T), square otherwise.
+        n_rmu_m, n_rmu_n = psi_v_xn.shape[2], psi_v_yr.shape[-1]
         chi_R_zero = jax.lax.with_sharding_constraint(
-            jnp.zeros((nk, n_rmu, n_rmu), dtype=jnp.complex128), _chi_R_shard)
+            jnp.zeros((nk, n_rmu_m, n_rmu_n), dtype=jnp.complex128), _chi_R_shard)
 
         def _body(chi_R_acc, xs):
             t_scalar, alpha_scalar = xs
@@ -566,7 +568,7 @@ def build_real_quadrature(quad, Omega, minimax_config, *, print_fn=None):
 
 
 def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0,
-                 mu_L=0, nu_L=0):
+                 mu_L=0, nu_L=0, wfns_n=None):
     """Compute χ₀(q) from a wavefunction bundle and minimax quadrature.
 
     Returns flat-q array (nq, μ, μ).
@@ -610,7 +612,12 @@ def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0,
     # axis 1), γ̃^{ν_L} on the n-vertex (yr, spin axis 2).  γ̃^0=I_4 ⇒ (0,0) is
     # the scalar charge χ₀ unchanged (branch skipped).  Same fold + Hermitian-
     # conj handling as Σ^B's _wfns_with_lorentz_vertices (γ̃ Hermitian).
-    psi_c_xn, psi_c_yr = wfns.xn(s.cond), wfns.yr(s.cond)
+    # ``wfns_n`` = the n-vertex (yr) bundle, possibly a different centroid set than
+    # the m-vertex (xn) — the cross tile χ^{0i} (m=charge, n=transverse).  Both G's
+    # keep xn-on-x / yr-on-y, so the spin-only contraction is no-reshard even when
+    # n_C ≠ n_T (rectangular).  Same bands ⇒ shared slices/energies.
+    wn = wfns if wfns_n is None else wfns_n
+    psi_c_xn, psi_c_yr = wfns.xn(s.cond), wn.yr(s.cond)
     if mu_L or nu_L:
         from common.gamma_matrices import gamma_perm_phase, gamma_apply
         if mu_L:
@@ -621,7 +628,7 @@ def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0,
     kernel = _get_chi_minimax_kernel(mesh_xy, kgrid)
     return kernel(
         nodes,
-        wfns.xn(s.val), wfns.yr(s.val),
+        wfns.xn(s.val), wn.yr(s.val),
         psi_c_yr, psi_c_xn,
         enk_v - jnp.asarray(eref, dtype=enk_v.dtype),
         enk_c - jnp.asarray(eref, dtype=enk_c.dtype),
