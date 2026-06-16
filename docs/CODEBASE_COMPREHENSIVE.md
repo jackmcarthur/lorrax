@@ -202,10 +202,13 @@ Reads `eps0mat.h5` / `epsmat.h5`. Used only by the `epshead` head source (`head_
 
 ### 2.7 `SlabIO` — `src/file_io/slab_io.py`
 
-Sharded HDF5 writer with two backends:
+Sharded HDF5 writer with three backends (selected by `SlabIOBackend` enum; the legacy `use_ffi_io: bool` setting maps to PHDF5_FFI/H5PY_ALLGATHER for back-compat):
 
-- `use_ffi_io=True` → `_slab_io_ffi.py` (parallel HDF5 via the phdf5 FFI); independent MPI-IO writes, non-collective metadata. Default.
-- `use_ffi_io=False` → `_slab_io_allgather.py` (all-gather then rank-0 h5py). Fallback for debugging.
+- `PHDF5_FFI` → `_slab_io_ffi.py` (parallel HDF5 via the phdf5 FFI; CUDA-only at the C++ level). Each rank writes its own hyperslab via independent MPI-IO collective writes. GPU backend default.
+- `PHDF5_HOST` → `_slab_io_mpi_host.py` (parallel HDF5 via mpi4py + h5py(parallel)). Same per-rank parallel-write semantics as PHDF5_FFI, minus the cudaMemcpy D2H. CPU backend default when the venv has mpi4py + h5py-parallel; spiritually identical to the FFI path.
+- `H5PY_ALLGATHER` → `_slab_io_allgather.py` (all-gather to rank 0 then serial h5py). Last-resort fallback for systems without parallel HDF5; slow at scale.
+
+The `LorraxConfig.from_input_file` builder auto-routes `use_ffi_io=true` to the right backend per `jax.default_backend()`: PHDF5_FFI on GPU, PHDF5_HOST on CPU (falls back to H5PY_ALLGATHER if mpi4py / h5py-parallel are missing — emits a one-line config log).
 
 Used for `zeta_q.h5` and `V_qmunu.h5` (big files), and for `sigma_mnk.h5` via `write_sigma_omega_h5`.
 
