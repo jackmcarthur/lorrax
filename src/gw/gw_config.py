@@ -84,13 +84,20 @@ class SlabIOBackend(str, enum.Enum):
     """How big sigma/zeta/restart HDF5 files are written.
 
     - ``PHDF5_FFI`` — every rank writes its hyperslab via the parallel-HDF5
-      FFI (collective MPI-IO).  Default.  ~5× faster than the rank-0 path
-      once Lustre striping is applied.
-    - ``H5PY_ALLGATHER`` — gather to rank 0 and write via h5py.  Fallback
-      for systems without the FFI ``.so`` built or for non-Lustre
-      filesystems.
+      FFI (collective MPI-IO).  GPU backend default.  ~5× faster than the
+      rank-0 path once Lustre striping is applied.  C++ side requires
+      CUDA (cudaMemcpyAsync D2H, cudaEvent sync); GPU-only.
+    - ``PHDF5_HOST`` — host-side equivalent of ``PHDF5_FFI``: each rank
+      writes its own hyperslab via parallel HDF5 driven by mpi4py +
+      h5py(parallel).  Spiritually identical to the FFI path minus the
+      cudaMemcpy.  CPU backend default when the venv has mpi4py +
+      h5py-parallel installed.
+    - ``H5PY_ALLGATHER`` — gather to rank 0 and write via serial h5py.
+      Last-resort fallback for systems without either parallel HDF5 or
+      the FFI.  Slow at scale (rank-0 disk bandwidth bottleneck).
     """
     PHDF5_FFI = "phdf5_ffi"
+    PHDF5_HOST = "phdf5_host"
     H5PY_ALLGATHER = "h5py_allgather"
 
 
@@ -804,8 +811,14 @@ class LorraxConfig:
 
     @property
     def use_ffi_io(self) -> bool:
-        """Legacy ``use_ffi_io: bool`` → ``backend.slab_io is PHDF5_FFI``."""
-        return self.backend.slab_io is SlabIOBackend.PHDF5_FFI
+        """Legacy ``use_ffi_io: bool`` semantic — True for either of the
+        per-rank-parallel-write PHDF5 backends (``PHDF5_FFI`` on GPU,
+        ``PHDF5_HOST`` on CPU), False for the allgather fallback.
+        Callers use this to branch between rank-0-gather and per-rank
+        local-shard code paths; both PHDF5 variants share the latter.
+        """
+        return self.backend.slab_io in (
+            SlabIOBackend.PHDF5_FFI, SlabIOBackend.PHDF5_HOST)
 
     @property
     def gspace_mode(self) -> str:
@@ -958,13 +971,17 @@ class LorraxConfig:
         # Auto-route GPU FFIs off on the CPU backend.  The phdf5 FFI is
         # CUDA-only at the C++ level (cudaMemcpyAsync D2H, cudaEvent sync
         # — see ``src/ffi/phdf5/cpp/write_ffi.cc``).  cuSOLVERMp / cuBLASMp
-        # are similarly GPU-only.  When jax.default_backend() == "cpu" we
-        # silently downgrade ``use_ffi_io`` → h5py allgather and any
-        # ``cusolvermp_*`` setting → "off", routing the run through the
-        # in-tree JAX paths in ``_slab_io_allgather.py``, ``cholesky_2d.py``,
-        # and ``w_isdf._solve_w``.  Same ``cohsex.in`` works on both
-        # backends; no manual flag flipping needed.
-        _use_ffi_io = bool(_g("use_ffi_io"))
+        # are similarly GPU-only.  On the CPU backend:
+        #
+        #   * ``use_ffi_io=true`` → ``SlabIOBackend.PHDF5_HOST`` (parallel
+        #     HDF5 via mpi4py + h5py-parallel — same per-rank collective
+        #     MPI-IO write as the FFI, no cudaMemcpy needed); falls back
+        #     to ``H5PY_ALLGATHER`` if the venv lacks mpi4py / h5py-parallel.
+        #   * ``cusolvermp_charge`` / ``cusolvermp_lu`` → ``"off"`` (in-tree
+        #     ``cholesky_2d`` and per-q ``jnp.linalg.solve`` paths).
+        #
+        # User-facing: same ``cohsex.in`` works on both backends.
+        _use_ffi_io_in = bool(_g("use_ffi_io"))
         _cusolvermp_charge = str(_g("cusolvermp_charge")).strip().lower()
         _cusolvermp_lu = str(_g("cusolvermp_lu")).strip().lower()
         try:
@@ -972,14 +989,33 @@ class LorraxConfig:
             _is_cpu_backend = _jax.default_backend() == "cpu"
         except Exception:
             _is_cpu_backend = False
+        _slab_io_choice = (SlabIOBackend.PHDF5_FFI if _use_ffi_io_in
+                           else SlabIOBackend.H5PY_ALLGATHER)
         if _is_cpu_backend:
-            if _use_ffi_io:
-                print_fn(
-                    "  [config] use_ffi_io=true requested but JAX backend "
-                    "is CPU; phdf5 FFI is CUDA-only.  Routing SlabIO "
-                    "through the h5py allgather (host) path."
-                )
-                _use_ffi_io = False
+            if _use_ffi_io_in:
+                try:
+                    import mpi4py  # noqa: F401
+                    import h5py
+                    _have_parallel_h5 = bool(h5py.get_config().mpi)
+                except Exception:
+                    _have_parallel_h5 = False
+                if _have_parallel_h5:
+                    print_fn(
+                        "  [config] use_ffi_io=true on CPU backend; "
+                        "phdf5 FFI is CUDA-only.  Routing SlabIO through "
+                        "PHDF5_HOST (mpi4py + h5py-parallel) — same "
+                        "per-rank collective MPI-IO write semantics."
+                    )
+                    _slab_io_choice = SlabIOBackend.PHDF5_HOST
+                else:
+                    print_fn(
+                        "  [config] use_ffi_io=true on CPU backend but "
+                        "venv lacks mpi4py / h5py-parallel; falling back "
+                        "to H5PY_ALLGATHER (rank-0 serial write — slow "
+                        "at scale).  Build h5py with HDF5_MPI=ON against "
+                        "the system's parallel HDF5 to get PHDF5_HOST."
+                    )
+                    _slab_io_choice = SlabIOBackend.H5PY_ALLGATHER
             if _cusolvermp_charge != "off":
                 print_fn(
                     f"  [config] cusolvermp_charge={_cusolvermp_charge} "
@@ -995,8 +1031,7 @@ class LorraxConfig:
                 )
                 _cusolvermp_lu = "off"
         backend = BackendConfig(
-            slab_io=(SlabIOBackend.PHDF5_FFI if _use_ffi_io
-                     else SlabIOBackend.H5PY_ALLGATHER),
+            slab_io=_slab_io_choice,
             gspace_io=GspaceIO(str(_g("gspace_mode")).strip().lower()),
             screening_solver=_LEGACY_ISDF_MEMORY_MODE[isdf_memory_mode],
             cusolvermp_charge=_cusolvermp_charge,

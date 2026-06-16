@@ -6,14 +6,19 @@ across the codebase.
 
 Two backends, selected by ``backend: SlabIOBackend``:
 
-- :attr:`SlabIOBackend.H5PY_ALLGATHER` (default) —
-  :mod:`file_io._slab_io_allgather`.  Gather to rank 0 via
-  ``jax.experimental.multihost_utils.process_allgather``, write with
-  plain ``h5py``.  Byte-identical to today's hand-rolled pattern.
-  Works anywhere ``h5py`` + ``jax`` work.
+- :attr:`SlabIOBackend.H5PY_ALLGATHER` — :mod:`file_io._slab_io_allgather`.
+  Gather to rank 0 via ``jax.experimental.multihost_utils.process_allgather``,
+  write with plain serial ``h5py``.  Last-resort fallback for systems
+  without parallel HDF5; slow at scale (rank-0 disk bandwidth limit).
 - :attr:`SlabIOBackend.PHDF5_FFI` — :mod:`file_io._slab_io_ffi`.
   Collective MPI-IO via ``ffi.phdf5``; each rank writes its own
   hyperslab directly.  Lazy import; only loads the FFI when selected.
+  CUDA-only at the C++ level (cudaMemcpyAsync D2H); GPU backend.
+- :attr:`SlabIOBackend.PHDF5_HOST` — :mod:`file_io._slab_io_mpi_host`.
+  Host-side equivalent of PHDF5_FFI: each rank writes its own hyperslab
+  via parallel HDF5 driven by mpi4py + h5py(parallel).  Spiritually
+  identical to the FFI path minus the cudaMemcpy.  CPU backend default
+  when the venv has mpi4py + h5py-parallel.
 
 The legacy ``use_ffi_io: bool`` kwarg is still accepted on every entry
 point and silently coerced via :func:`_normalize_slab_backend` — pass
@@ -74,6 +79,12 @@ def _normalize_slab_backend(backend, use_ffi_io):
         )
     if use_ffi_io is None:
         return SlabIOBackend.H5PY_ALLGATHER
+    # The legacy ``use_ffi_io=True`` boolean predates the host-side
+    # PHDF5 backend; on CPU runs the auto-router in
+    # ``LorraxConfig.from_input_file`` has already resolved this to a
+    # concrete backend enum.  Anyone still calling SlabIO directly with
+    # ``use_ffi_io=True`` (a few tests + ad-hoc scripts) intends the
+    # GPU FFI; preserve that mapping here.
     return (SlabIOBackend.PHDF5_FFI if bool(use_ffi_io)
             else SlabIOBackend.H5PY_ALLGATHER)
 
@@ -131,14 +142,23 @@ class SlabIO:
         self.backend = _normalize_slab_backend(backend, use_ffi_io)
         # Boolean shortcut still used internally by ``read_slab`` for
         # branch dispatch — kept as a derived attribute, not the source
-        # of truth.
-        self.use_ffi_io = (self.backend is SlabIOBackend.PHDF5_FFI)
-        if self.use_ffi_io:
+        # of truth.  Both PHDF5 variants follow the "per-rank parallel
+        # write" semantics that read_slab branches on; the allgather
+        # backend is the only one that needs the rank-0-gather code path.
+        self.use_ffi_io = (self.backend in (
+            SlabIOBackend.PHDF5_FFI, SlabIOBackend.PHDF5_HOST))
+        if self.backend is SlabIOBackend.PHDF5_FFI:
             if mesh is None:
                 raise ValueError(
                     "backend=SlabIOBackend.PHDF5_FFI requires mesh")
             from ._slab_io_ffi import _FfiBackend
             self._backend = _FfiBackend(self.path, mesh=mesh, mode=mode)
+        elif self.backend is SlabIOBackend.PHDF5_HOST:
+            if mesh is None:
+                raise ValueError(
+                    "backend=SlabIOBackend.PHDF5_HOST requires mesh")
+            from ._slab_io_mpi_host import _MpiHostBackend
+            self._backend = _MpiHostBackend(self.path, mesh=mesh, mode=mode)
         else:
             self._backend = _AllgatherBackend(self.path, mode=mode)
 

@@ -157,6 +157,14 @@ def setup_runtime(config: LorraxConfig, mesh_xy, *, print_fn=print) -> None:
             phdf5_init_mpi()
         except Exception as exc:
             print_fn(f"  [phdf5 init_mpi] skipped: {exc}")
+    elif config.backend.slab_io is SlabIOBackend.PHDF5_HOST:
+        # mpi4py initialises MPI on first import; do it here so the
+        # ~400 ms MPI_Init cost is amortised before the first SlabIO
+        # open (same rationale as the FFI's phdf5_init_mpi).
+        try:
+            from mpi4py import MPI  # noqa: F401
+        except Exception as exc:
+            print_fn(f"  [phdf5_host mpi4py init] skipped: {exc}")
 
     try:
         from common.jax_compile_cache import ensure_jax_compile_cache
