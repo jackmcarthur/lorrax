@@ -1,0 +1,72 @@
+"""Bispinor screened-W via the channel-blocked Dyson supermatrix.
+
+    W^{μ_L,ν_L}(q) = [ (δ − V·χ)^{-1} · V ]^{μ_L,ν_L}
+
+The compound vertex index is (Lorentz channel μ_L ∈ {0,1,2,3}) ⊗ (centroid r_μ);
+V and χ are 4×4-Lorentz-block supermatrices over it, size ``N = n_C + 3·n_T``
+(charge centroids n_C, three transverse channels sharing n_T each), laid out as
+
+    [ charge n_C | T1 n_T | T2 n_T | T3 n_T ].
+
+The inversion is :func:`gw.w_isdf.solve_w` *verbatim*: once V and χ are assembled
+as ``(nq, N, N)`` the bispinor solve is the existing scalar per-q LU at a larger
+matrix, inheriting its sharding, solver dispatch, and χ-prefactor.  Only the block
+assembly and W-tile extraction are bispinor-specific.
+
+Milestone A (charge screening + bare Breit) calls :func:`solve_w_bispinor` with χ
+populated only in the (0,0) charge block.  V·χ then has only its (0,0) block
+nonzero, so the result collapses to W⁰⁰=(I−V⁰⁰χ⁰⁰)^{-1}V⁰⁰ (scalar screened W),
+W^{ij}=V^{ij} (bare Breit), W^{0i}=W^{i0}=0.  Milestone B fills the zero χ-tiles
+with the un-traced channel χ (W^{0i} then ≠ 0); assembly/solve/extract unchanged.
+Gauge: V^{0i}=V^{i0}=0 (``v_q_bispinor.ZERO_TILES``), so those V blocks stay zero.
+"""
+
+from __future__ import annotations
+
+import jax
+import jax.numpy as jnp
+
+
+def assemble_supermatrix(blocks: dict, n_C: int, n_T: int) -> jax.Array:
+    """Assemble a ``(nq, N, N)`` Lorentz supermatrix from per-channel blocks.
+
+    ``blocks`` maps ``(μ_L, ν_L) → (nq, sz[μ_L], sz[ν_L])``; missing/None blocks
+    fill with zeros (gauge-zero V tiles; every non-(0,0) χ tile in milestone A).
+    """
+    sizes = [int(n_C), int(n_T), int(n_T), int(n_T)]
+    ref = next((b for b in blocks.values() if b is not None), None)
+    if ref is None:
+        raise ValueError("assemble_supermatrix: no non-None blocks provided")
+    nq, dtype = int(ref.shape[0]), ref.dtype
+    rows = []
+    for mu in range(4):
+        cols = [blocks.get((mu, nu)) if blocks.get((mu, nu)) is not None
+                else jnp.zeros((nq, sizes[mu], sizes[nu]), dtype)
+                for nu in range(4)]
+        rows.append(jnp.concatenate([c.astype(dtype) for c in cols], axis=-1))
+    return jnp.concatenate(rows, axis=-2)             # (nq, N, N)
+
+
+def extract_blocks(super_mat: jax.Array, n_C: int, n_T: int) -> dict:
+    """Inverse of :func:`assemble_supermatrix`: all 16 Lorentz blocks as
+    ``{(μ_L, ν_L): (nq, sz[μ_L], sz[ν_L])}`` (cheap slice views)."""
+    sizes = [int(n_C), int(n_T), int(n_T), int(n_T)]
+    off = [0, sizes[0], sizes[0] + sizes[1], sizes[0] + sizes[1] + sizes[2]]
+    return {(mu, nu): super_mat[:, off[mu]:off[mu] + sizes[mu],
+                                off[nu]:off[nu] + sizes[nu]]
+            for mu in range(4) for nu in range(4)}
+
+
+def solve_w_bispinor(v_blocks: dict, chi_blocks: dict, meta, mesh_xy,
+                     n_C: int, n_T: int, *, solver=None) -> dict:
+    """Screened bispinor W tiles via the channel-blocked Dyson supermatrix.
+
+    Assembles V and χ as ``(nq, N, N)`` (missing blocks → zero), runs
+    :func:`gw.w_isdf.solve_w`, returns all 16 W blocks.  Milestone A: pass
+    ``chi_blocks={(0,0): chi00}`` only.
+    """
+    from .w_isdf import solve_w
+    v_super = assemble_supermatrix(v_blocks, n_C, n_T)
+    chi_super = assemble_supermatrix(chi_blocks, n_C, n_T)
+    return extract_blocks(solve_w(v_super, chi_super, meta, mesh_xy, solver=solver),
+                          n_C, n_T)
