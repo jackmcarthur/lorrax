@@ -293,6 +293,7 @@ def prune_candidates_by_pivoted_cholesky(
     bispinor: bool = False,
     orbit_id: np.ndarray | None = None,
     use_phdf5: bool = False,
+    memory_per_device_gb: float | None = None,
 ):
     """End-to-end pruning: gather wfns → Gram → pivoted Cholesky → keep.
 
@@ -391,6 +392,7 @@ def prune_candidates_by_pivoted_cholesky(
             band_range_right=band_range_right,
             band_norms=band_norms,
             use_phdf5=use_phdf5,
+            memory_per_device_gb=memory_per_device_gb,
         )
         # Reshard ('x','y') → row-sharded for the column-major pivot scan.
         G = jax.lax.with_sharding_constraint(

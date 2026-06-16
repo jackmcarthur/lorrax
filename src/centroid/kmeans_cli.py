@@ -84,6 +84,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Override pivoted-Cholesky n_val (default = wfn.nelec).")
     p.add_argument("--prune-n-cond", type=int, default=None,
                    help="Override pivoted-Cholesky n_cond (default = n_val).")
+    p.add_argument("--prune-mem-gb", type=float, default=0.0,
+                   help="Per-device memory budget (GB) for the pivoted-Cholesky Gram FFT "
+                        "chunker. 0 (default) = auto-detect device HBM (legacy behavior). "
+                        "The auto-detected ~71 GB picks an FFT chunk cs~984 whose cuFFT "
+                        "batched plan needs ~16.5 GB scratch and OOMs on an 80 GB A100 under "
+                        "the platform allocator; set this to ~16-28 to shrink cs (∝ budget) "
+                        "so the cuFFT workspace fits.")
     p.add_argument("--prune-window", choices=("v_x_c", "v_x_vc", "vc_x_vc"),
                    default="v_x_vc",
                    help="Pivoted-Cholesky Gram band-window pair. "
@@ -364,6 +371,8 @@ def main():
             n_keep=n_orbit_keep, mesh=mesh,
             orbit_id=orbit_id_arr,
             use_phdf5=args.use_phdf5,
+            memory_per_device_gb=(float(args.prune_mem_gb)
+                                  if args.prune_mem_gb > 0 else None),
         )
         if args.prune_window == "v_x_vc":
             _prune_kwargs["band_range_left"] = (0, _n_val_eff)
