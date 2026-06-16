@@ -2031,6 +2031,51 @@ def fit_zeta_to_h5(
     if int(vertex_mu_L) != 0:
         from . import gamma_matrices as _gm  # noqa: F401  (warm import)
 
+    # ── Finalize write_ibz_only BEFORE any IBZ slicing (bug fix) ─────────
+    # The IBZ cascade slices C_q/L_q to IBZ rows in STEP 2/3 below, and
+    # slices Z_q to IBZ inside the per-r-chunk kernel; the two MUST agree.
+    # The orbit-closure auto-fallback can flip write_ibz_only=False when the
+    # centroid set isn't closed under the WFN sym group, so it must run HERE
+    # — before the C_q slice.  (Previously it ran after factor_c_q, so the
+    # charge channel sliced L_q to IBZ, then fell back, leaving L_q at IBZ
+    # while Z_q stayed full-BZ → the ``B.shape[0]=nq_full != Nq=nq_ibz``
+    # distributed-potrs crash.)  Transverse channels can't fall back (the
+    # V_q orchestrator assumes IBZ ζ̃_T), so they loud-fail with a hint.
+    if write_ibz_only and getattr(sym, 'q_irr_full_idx', None) is not None:
+        try:
+            from centroid.orbit_syms import (
+                compute_centroid_sym_perm as _check_perm,
+            )
+            _cent_idx_for_check = np.asarray(
+                jax.device_get(centroid_indices), dtype=np.int32)
+            _ntran_check = int(np.asarray(sym.sym_matrices).shape[0])
+            # ``sym.sym_matrices`` holds the spatial ops; the fractional
+            # translations live on WFNReader (BGW WFN.h5 layout).
+            _check_perm(
+                _cent_idx_for_check,
+                sym_matrices=np.asarray(sym.sym_matrices[:_ntran_check]),
+                translations=np.asarray(wfn.translations[:_ntran_check]),
+                fft_grid=np.asarray(meta.fft_grid, dtype=np.int32),
+            )
+        except RuntimeError as _exc:
+            _first = (_exc.args[0].splitlines()[0]
+                      if _exc.args else str(_exc))
+            if int(vertex_mu_L) != 0:
+                raise RuntimeError(
+                    f"Bispinor transverse zeta_T (mu_L={int(vertex_mu_L)}) "
+                    f"IBZ-write requested, but the transverse centroid set "
+                    f"fails the orbit-closure check under the WFN sym group: "
+                    f"{_first}.  Regenerate the transverse centroid file with "
+                    f"``centroid.kmeans_cli --density-mode current`` "
+                    f"(orbit-aware by default for ntran>1) so the set is "
+                    f"closed under the spatial sym group, or bypass the "
+                    f"bispinor IBZ cascade with ``LORRAX_FORCE_FULL_BZ=1``."
+                ) from _exc
+            if jax.process_index() == 0:
+                print(f"  q-IBZ reduction: centroid orbit closure failed "
+                      f"— falling back to full-BZ on disk.  Reason: {_first}")
+            write_ibz_only = False
+
     with timing.section("zeta_fit.CCT"):
         # ψ inputs at PADDED n_rmu (Phase 3a's load_centroids contract).
         # Monolithic shard_map pipeline: open-spin pair density + IFFT
@@ -2141,55 +2186,9 @@ def fit_zeta_to_h5(
     # ``LORRAX_FORCE_FULL_BZ=1``), the full-BZ axis is preserved on
     # disk for back-compatibility.
     #
-    # Auto-fallback: if the centroid set isn't orbit-closed under the
-    # WFN sym group (typical for ``kmeans_cli --no-orbit`` outputs),
-    # the V_q unfold can't reconstruct full-BZ V_q from the IBZ
-    # representation, so we keep the full-BZ axis on disk too.  The
-    # closure check uses the same helper that the V_q consumer would.
-    if write_ibz_only:
-        try:
-            from centroid.orbit_syms import (
-                compute_centroid_sym_perm as _check_perm,
-            )
-            _cent_idx_for_check = np.asarray(
-                jax.device_get(centroid_indices), dtype=np.int32)
-            _ntran_check = int(np.asarray(sym.sym_matrices).shape[0])
-            # ``sym.sym_matrices`` holds the spatial ops; the fractional
-            # translations live on WFNReader (BGW WFN.h5 layout).
-            _check_perm(
-                _cent_idx_for_check,
-                sym_matrices=np.asarray(sym.sym_matrices[:_ntran_check]),
-                translations=np.asarray(wfn.translations[:_ntran_check]),
-                fft_grid=np.asarray(meta.fft_grid, dtype=np.int32),
-            )
-        except RuntimeError as _exc:
-            # On the transverse bispinor channels (vertex_mu_L ∈ {1,2,3})
-            # the bispinor V_q orchestrator assumes ζ̃_T is IBZ-only
-            # whenever the cascade is active (sym present and
-            # ``LORRAX_FORCE_FULL_BZ`` not set).  Silently falling back
-            # to full-BZ on disk would create an inconsistency with the
-            # orchestrator's per-tile IBZ iteration, so loud-fail the
-            # run and tell the user how to regenerate centroids or
-            # bypass the cascade.
-            _first = (_exc.args[0].splitlines()[0]
-                      if _exc.args else str(_exc))
-            if int(vertex_mu_L) != 0:
-                raise RuntimeError(
-                    f"Bispinor transverse ζ̃^{{μ_L={int(vertex_mu_L)}}} "
-                    f"IBZ-write requested, but the transverse centroid "
-                    f"set fails the orbit-closure check under the WFN "
-                    f"sym group: {_first}.  Regenerate the transverse "
-                    f"centroid file with ``centroid.kmeans_cli "
-                    f"--density-mode current --orbit-aware ...`` so the "
-                    f"resulting set is closed under the spatial sym "
-                    f"group, or bypass the bispinor IBZ cascade with "
-                    f"``LORRAX_FORCE_FULL_BZ=1``."
-                ) from _exc
-            if jax.process_index() == 0:
-                print(f"  q-IBZ reduction: centroid orbit closure failed "
-                      f"— falling back to full-BZ on disk.  Reason: "
-                      f"{_first}")
-            write_ibz_only = False
+    # ``write_ibz_only`` was finalized above (before the C_q/L_q IBZ slice)
+    # by the orbit-closure auto-fallback, so the on-disk q-axis is IBZ when
+    # it is True and full-BZ when it fell back — nothing more to decide here.
 
     # BGW Brillouin-zone wrap used by the V_q kernel
     # (``_qvec_wrap`` at ``gw/v_q_tile.py:1204``): ``q > kgrid/2 → q
