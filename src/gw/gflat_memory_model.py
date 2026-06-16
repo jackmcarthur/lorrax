@@ -23,8 +23,14 @@ Five per-rank HBM peaks across :func:`isdf_fitting.fit_zeta_to_h5` and
           • P_l + P_r rank-5 accumulators on (μ, r_chunk)
           • IFFT'd P_l, P_r in R-space (rank-5)
           • Z_q intermediate before reshard
-        ``pair_density_slots = 3`` (HLO-verified at CrI3 80Ry bispinor +
-        Si 4×4×4 — see agent_d_hlo_calibration.md).  bc-loop is now
+        ``pair_density_slots`` is backend-aware: 3 on GPU XLA (HLO-verified
+        at CrI3 80Ry bispinor + Si 4×4×4 — see ``agent_d_hlo_calibration.md``)
+        and 4 on CPU XLA (HLO-verified at Si μ=384 scalar + bispinor charge +
+        bispinor transverse — see ``CPU_PLANNER_LANDED_2026-05-20.md``).  CPU
+        XLA's BufferAssignment heuristic schedules one extra concurrent
+        pair-density slot than GPU XLA does at the same algebraic structure.
+        Resolved via ``_default_pair_density_slots()`` from
+        ``jax.default_backend()``.  bc-loop is now
         ``lax.scan`` with ``unroll=1`` so n_bc no longer multiplies the
         FFT-box term (Round-6 / commit f567aa0).  gflat_acc is charged
         in BOTH Peak C and Peak D persistent bases (Round-10 / agent_q):
@@ -98,6 +104,35 @@ def _bytes_i32(*dims, shard: int = 1) -> float:
     for d in dims:
         n *= int(d)
     return _BYTES_PER_I32 * n / max(int(shard), 1)
+
+
+def _default_pair_density_slots() -> int:
+    """Default ``pair_density_slots`` for the current XLA backend.
+
+    GPU XLA's BufferAssignment schedules 3 concurrent pair-density slots
+    in ``fit_one_rchunk`` (HLO-calibrated on CrI3 80Ry bispinor + Si
+    4×4×4; see ``reports/memory_model_refit_2026-05-17/
+    agent_d_hlo_calibration.md``).  CPU XLA schedules 4 — one extra
+    concurrent live slot — at the same algebraic structure (verified at
+    Si μ=384 non-bispinor n=1/2/4 and bispinor charge+transverse channels
+    on 2×2 mesh; see ``reports/memory_model_nonbispinor_kgrid_2026-05-18/
+    CPU_OVERHEAD_DECOMP_2026-05-20.md``).  Per-slot bytes match the
+    planner's ``_bytes_c128(nk, ns², mu, r_chunk, /p_xy)`` formula
+    bit-exactly on both backends; only the slot count differs.
+
+    The FFT-scratch alternative was tested: band_chunk ∈ {32, 64, 120}
+    leaves the slot count and per-slot bytes unchanged on CPU.  The FFT
+    box shapes alias INTO the pair-density slots but do not size them.
+
+    Resolves at function-call time via ``jax.default_backend()`` so the
+    caller does not need to thread the backend through.  Falls back to 3
+    (the original GPU-only value) if jax is unimportable.
+    """
+    try:
+        import jax
+        return 4 if jax.default_backend() == "cpu" else 3
+    except Exception:
+        return 3
 
 
 def _round_pow2_down(n: int) -> int:
@@ -612,8 +647,8 @@ def plan_gflat_chunks(
     fft_box_factor: float | None = None,    # legacy alias for fft_box_factor_A
     fft_box_factor_A: float = 4.0,
     fft_box_factor_D: float = 2.0,
-    pair_density_slots_transverse: int = 3,
-    pair_density_slots_charge: int = 3,
+    pair_density_slots_transverse: int | None = None,
+    pair_density_slots_charge: int | None = None,
     is_bispinor: bool = True,
     max_chunks: int = 64,
     r_chunk_override: int | None = None,
@@ -719,6 +754,12 @@ def plan_gflat_chunks(
     # Pick r_chunk against Peak C's transient slope.  Two terms scale
     # with r_chunk: the P-pair concurrent slots (dominant) and the
     # zeta_out output (sized at full-mesh /p sharding).
+    # Resolve None defaults against the active XLA backend.
+    # GPU = 3 slots, CPU = 4 slots (see _default_pair_density_slots docstring).
+    if pair_density_slots_charge is None:
+        pair_density_slots_charge = _default_pair_density_slots()
+    if pair_density_slots_transverse is None:
+        pair_density_slots_transverse = _default_pair_density_slots()
     pair_density_slots = (
         pair_density_slots_transverse if is_bispinor
         else pair_density_slots_charge)

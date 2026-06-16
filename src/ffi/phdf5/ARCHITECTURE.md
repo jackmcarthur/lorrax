@@ -12,6 +12,19 @@ earlier in the investigation). Section 2.6 below refers to the first
 `MPI_Init_thread` cost; the number scales similarly on both stacks.
 Stack-specific tuning is in [`PORTING.md`](../PORTING.md).
 
+**CPU sibling**: this FFI is CUDA-only at the C++ level (cudaMemcpyAsync
+D2H, cudaEvent sync — ~97 CUDA call sites across `write_ffi.cc` +
+`read_ffi.cc`).  The host-side equivalent for JAX's CPU backend lives
+at `src/file_io/_slab_io_mpi_host.py` — same per-rank parallel MPI-IO
+write semantics via mpi4py + h5py(parallel), minus the cudaMemcpy
+(CPU XLA "device" memory IS host memory).  Both backends produce
+byte-identical output; the `SlabIO` interface is the same.  Selection
+is automatic from `LorraxConfig.from_input_file` based on
+`jax.default_backend()`.  The CPU path is synchronous (no Python
+worker thread) because there's no D2H to overlap and Cray MPICH's
+default `MPI_THREAD_SINGLE` deadlocks on cross-thread MPI-IO at
+`H5Fclose`; see `_slab_io_mpi_host.py` module docstring.
+
 ------------------------------------------------------------------------
 
 ## 1. The two-layer async write, in one diagram

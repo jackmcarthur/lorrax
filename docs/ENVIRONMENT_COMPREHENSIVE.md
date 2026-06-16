@@ -125,6 +125,70 @@ CUDA_VISIBLE_DEVICES=2,3 python -m gw.gw_jax -i cohsex.in   # restrict GPUs
 export XLA_FLAGS="--xla_force_host_platform_device_count=4"
 ```
 
+### 3.5 CPU multi-process MPI runs (production-quality)
+
+Validated end-to-end at Si 4×4×4 μ=384, x_only + full COHSEX, on
+Perlmutter Milan (1 node, 4 ranks × 8 threads).  Same `cohsex.in`
+works on both GPU and CPU backends; LORRAX auto-routes the FFI flags
+based on `jax.default_backend()` (see `gw.gw_config.LorraxConfig.
+from_input_file`).
+
+**Required dependencies** (one-time, inside the venv):
+
+```bash
+module load cray-hdf5-parallel/1.12.2.9 cray-mpich/9.0.1
+export MPICH_GPU_SUPPORT_ENABLED=0
+export MPICC=$(which mpicc) CC=$(which mpicc)
+export HDF5_MPI=ON HDF5_DIR=/opt/cray/pe/hdf5-parallel/1.12.2.9/gnu/12.3
+VIRTUAL_ENV=$LORRAX_VENV uv pip install --link-mode=copy \
+    --no-binary=mpi4py mpi4py
+VIRTUAL_ENV=$LORRAX_VENV uv pip install --link-mode=copy \
+    --no-binary=h5py --force-reinstall --no-deps h5py==3.16.0
+```
+
+Verify both have MPI built in:
+
+```bash
+$LORRAX_VENV/bin/python -c "
+from mpi4py import MPI; print('mpi4py + Cray MPICH OK')
+import h5py; assert h5py.get_config().mpi, 'h5py NOT built with MPI'
+print('h5py-parallel OK')"
+```
+
+**Launch recipe**:
+
+```bash
+salloc --nodes=1 --qos=interactive --constraint=cpu --time=04:00:00 \
+       --account=m2651 -J "lx-alloc-$USER" bash -c "sleep 100000" &
+# wait for RUNNING in squeue, then export SLURM_JOBID
+
+export JAX_PLATFORMS=cpu JAX_ENABLE_X64=1
+export OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 MKL_NUM_THREADS=8
+export MPICH_GPU_SUPPORT_ENABLED=0
+export PYTHONPATH=$LORRAX_SRC/src
+
+srun --jobid=$SLURM_JOBID -N 1 -n 4 -c 8 --cpu-bind=cores \
+     $LORRAX_VENV/bin/python -u -m gw.gw_jax -i cohsex.in
+```
+
+The `lxalloc` + `lxrun` shell helpers from the `lorrax_agent` overlay
+module support `LORRAX_PARTITION=cpu` to do the same thing more
+concisely; see the overlay's source for the GPU vs CPU branches.
+
+**What auto-routes on CPU**:
+
+| `cohsex.in` setting | CPU value | Routes to |
+|---|---|---|
+| `use_ffi_io = true` | (unchanged) | `_slab_io_mpi_host.py` (per-rank MPI-IO via mpi4py + h5py-parallel) |
+| `cusolvermp_charge = auto/on` | forced `off` | in-tree `cholesky_2d.sharded_cholesky` |
+| `cusolvermp_lu = auto/on` | forced `off` | per-q `jnp.linalg.solve` |
+| `pair_density_slots = 3` (GPU XLA) | 4 (CPU XLA) | `_default_pair_density_slots()` |
+
+The CPU path uses synchronous writes (no async writer thread) because
+the FFI's threaded design deadlocks at `H5Fclose` under Cray MPICH's
+default `MPI_THREAD_SINGLE`.  See `_slab_io_mpi_host.py` module
+docstring for the full rationale.
+
 ### 3.5 Memory inspection
 
 ```python

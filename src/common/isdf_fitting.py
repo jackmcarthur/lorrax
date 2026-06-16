@@ -1920,7 +1920,11 @@ def fit_zeta_to_h5(
     from gw.gw_config import SlabIOBackend
     if slab_io_backend is None:
         slab_io_backend = SlabIOBackend.H5PY_ALLGATHER
-    use_ffi_io = (slab_io_backend is SlabIOBackend.PHDF5_FFI)
+    # Treat both per-rank-parallel-write PHDF5 backends (FFI on GPU,
+    # mpi_host on CPU) as the "fast write" path; only H5PY_ALLGATHER
+    # uses the rank-0-gather code below.
+    use_ffi_io = slab_io_backend in (
+        SlabIOBackend.PHDF5_FFI, SlabIOBackend.PHDF5_HOST)
 
     # P0 — entry of ζ-fit.  Captures the persistent state set up by
     # ``prepare_isdf_and_wavefunctions`` BEFORE ζ-fit starts: ψ at
@@ -2685,16 +2689,13 @@ def fit_zeta_to_h5(
             # allgather backend: one per-q gather (not per chunk).
             # The full tensor is at most a few GB replicated; for
             # CrI3 scale the FFI backend is mandatory anyway.
-            _gathered = jax.experimental.multihost_utils.process_allgather(
-                gflat_acc, tiled=False)
+            from file_io._slab_io_allgather import _to_host as _gather_to_host
+            _g = _gather_to_host(gflat_acc)
             if jax.process_index() == 0:
-                _g = np.asarray(_gathered)
-                if _g.ndim == 4 and _g.shape[0] == 1:
-                    _g = _g[0]
                 import h5py as _h5
                 with _h5.File(output_file, 'a') as _f:
                     _f['zeta_q_G'][...] = _g
-            del _gathered
+            del _g
     del gflat_acc
 
     # Close the SlabIO handle (FFI path only; allgather path never

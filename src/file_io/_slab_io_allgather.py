@@ -1,13 +1,18 @@
 """Default SlabIO backend: process_allgather + rank-0 h5py.
 
-This is the fallback / default implementation — byte-identical to the
-hand-rolled pattern that used to live in every call site
-(``jax.experimental.multihost_utils.process_allgather(A, tiled=False)``
--> rank-0 ``h5py.File``).  Consolidated here so the slab_io public
-surface has one place to look for bugs, tuning, or convention changes.
+Canonical CPU SlabIO path.  ``gw_config.LorraxConfig.from_input_file``
+auto-routes ``use_ffi_io=true`` on the JAX CPU backend through this
+module (since the phdf5 FFI is CUDA-only at the C++ level — see
+``src/ffi/phdf5/cpp/write_ffi.cc``).  No CUDA dependency; works in any
+container with h5py + jax installed.
 
-Does NOT import ``ffi.phdf5``; works in any container with h5py +
-jax installed.  The FFI backend lives in ``_slab_io_ffi.py``.
+Pattern: every rank gathers the global array via
+``jax.experimental.multihost_utils.process_allgather(A, tiled=True)``,
+then rank-0 writes the hyperslab via serial h5py.  Slower than the FFI's
+collective MPI-IO at production scale (rank-0 disk bandwidth bottleneck,
+plus full-array gather memory) but byte-identical output.  The FFI
+backend lives in ``_slab_io_ffi.py`` and is selected on the GPU backend
+when ``use_ffi_io=true``.
 """
 from __future__ import annotations
 
@@ -37,31 +42,37 @@ def _barrier(tag: str) -> None:
 def _to_host(A: Any) -> np.ndarray:
     """Fully-replicated host ndarray for A, regardless of sharding.
 
-    For numpy / already-replicated inputs this is a cheap cast.  For
-    sharded JAX arrays it's ``process_allgather(tiled=False)`` followed
-    by ``device_get`` and, if the gather added a leading process-axis
-    (``ndim == A.ndim + 1``), collapsing by taking the rank-0 copy —
-    all processes see identical data so any index works.
+    Dispatch on stable ``jax.Array`` metadata rather than on the gather's
+    return shape:
+
+    * Plain numpy: return as-is.
+    * Single process (``process_count() == 1``): plain device_get.
+    * Multi-process JAX Array, ``A.is_fully_replicated``: every device
+      already holds the full array (e.g. a ``SingleDeviceSharding`` lift
+      of a numpy on every host).  Skip the gather entirely and return
+      ``A.addressable_data(0)``.  This both saves the identity-jit
+      reshard cost and avoids the Path-(D) ``(world * N0, *rest)``
+      stacking shape that ``process_allgather(tiled=True)`` returns for
+      fully-addressable inputs.
+    * Multi-process JAX Array, not fully replicated: this is always
+      non-fully-addressable under LORRAX's mesh-xy sharding (see
+      ``jax.Array`` docstring: "fully replicated is not equal to fully
+      addressable; a fully replicated array can span multiple hosts").
+      ``process_allgather(tiled=True)`` then takes Path (B) of
+      ``_handle_array_process_allgather`` — it identity-jits to ``P()``
+      and returns shape exactly ``A.shape``.  No post-process needed.
+
+    See ``reports/.../PROCESS_ALLGATHER_DESIGN_REVIEW_2026-05-20.md`` for
+    the full design rationale and the empirical sharding inventory.
     """
     if isinstance(A, np.ndarray):
         return A
     if jax.process_count() == 1:
         return np.asarray(jax.device_get(A))
-    gathered = multihost_utils.process_allgather(A, tiled=False)
-    host = np.asarray(jax.device_get(gathered))
-    try:
-        expected = tuple(int(d) for d in A.shape)
-    except Exception:
-        expected = None
-    if expected is not None and host.shape != expected:
-        # tiled=False commonly returns (world, *A.shape); flatten.
-        if host.ndim == len(expected) + 1 and host.shape[1:] == expected:
-            host = host[0]
-        else:
-            raise RuntimeError(
-                f"_to_host: unexpected gather shape {host.shape} for "
-                f"A.shape={expected}")
-    return host
+    if getattr(A, 'is_fully_replicated', False):
+        return np.asarray(A.addressable_data(0))
+    gathered = multihost_utils.process_allgather(A, tiled=True)
+    return np.asarray(jax.device_get(gathered))
 
 
 class _AllgatherBackend:
