@@ -241,6 +241,113 @@ def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
 
 
 # ----------------------------------------------------------------------
+#  Band-sum-free orbital magnetization (Sternheimer covariant derivative)
+# ----------------------------------------------------------------------
+def run_sternheimer_orbmag(wfn, sym, meta, vnl_setup, pseudos, nbnd, nocc,
+                           truncation_2d):
+    """Orbital magnetization WITHOUT an empty-band sum, via the covariant
+    derivative |∂̃_a u_v⟩ = Q_k ∂_{k_a} u_v solved from H, dH/dk and the
+    occupied projector (Sternheimer / DFPT linear response).
+
+    Per full-BZ k, per occupied band v: solve the Sternheimer equation (reusing
+    ``run_sternheimer.compute_kp_tangent_at_kvec``) for |∂̃_a u_v⟩ (a=x,y,z),
+    then the per-k orbital-moment AXIAL VECTOR
+        m_γ(k) = (−1/2) Im Σ_v ε_{γab} ⟨∂̃_a u_v|(H_k+ε_v−2μ)|∂̃_b u_v⟩.
+    The conduction manifold is summed exactly inside the Sternheimer inverse, so
+    the result is BAND-COUNT INDEPENDENT (no SOS tail).  μ-linear split:
+        cA from the (H_k+ε_v)-sandwich, cB from the overlap ⟨∂̃_a|∂̃_b⟩
+    ⇒ C_of_mu(μ) = cA − 2μ·cB, reusing the shared reporting verbatim.
+
+    Returns the same 7-tuple as :func:`run_ibz`.  V_scf (the local KS potential)
+    is reconstructed from the WFN's own density (`scf_potential`); no extra files.
+    """
+    import jax.numpy as jnp
+    from psp.dft_operators import (setup_H_k_from_kvec, apply_H_k_from_G,
+                                   compute_ngkmax)
+    from psp.run_sternheimer import (_psi_box_to_G_sphere,
+                                     compute_kp_tangent_at_kvec)
+    from psp.scf_potential import build_rho_val_from_wfn, build_dft_potentials
+    from solvers.sternheimer_precond import (compute_per_band_kinetic,
+                                             tpa_preconditioner_diag)
+
+    nk = int(sym.nk_tot)
+    w_k = 1.0 / nk
+    bdot = jnp.asarray(wfn.bdot, dtype=jnp.float64)
+    fft_grid = tuple(int(x) for x in wfn.fft_grid)
+
+    # --- V_scf = V_loc[UPF] + V_H[ρ_val] + V_xc[ρ_val] (rebuilt from the WFN) --
+    print("[orbmag-sternheimer] reconstructing V_scf from the WFN density "
+          "(full-BZ ρ_val; integral must equal nelec)...")
+    rho_val = build_rho_val_from_wfn(wfn, sym, meta, nocc, verbose=True)
+    V_scf, V_loc, _vnl2 = build_dft_potentials(
+        wfn, pseudos, rho_val, truncation_2d=truncation_2d, verbose=True)
+    ngkmax = int(compute_ngkmax(np.asarray(sym.unfolded_kpts, dtype=np.float64),
+                                np.asarray(wfn.bdot), float(wfn.ecutwfc), fft_grid))
+    # QE-DFPT level shift α_pv = 2(E_max − E_min) over occupied bands (all k)
+    en_occ = np.asarray(wfn.energies[0, :, :nocc], dtype=np.float64)
+    alpha_pv = jnp.asarray(2.0 * (float(en_occ.max()) - float(en_occ.min())),
+                           dtype=jnp.float64)
+
+    cA = np.zeros(3, dtype=np.complex128)
+    cB = np.zeros(3, dtype=np.complex128)
+    S_sum = 0.0
+    E = np.zeros((nk, nbnd), dtype=np.float64)
+    print(f"[orbmag-sternheimer] {nk} full-BZ k × {nocc} occ bands, "
+          f"α_pv={float(alpha_pv):.2f} Ry; solving Sternheimer (no band sum)...")
+
+    def _axial(M):                                       # M (nv,3,3) -> (3,) axial
+        A = M - jnp.swapaxes(M, 1, 2)
+        return jnp.stack([A[:, 1, 2], A[:, 2, 0], A[:, 0, 1]], axis=-1).sum(axis=0)
+
+    for ik in range(nk):
+        kv = np.asarray(sym.unfolded_kpts[ik], dtype=np.float64)
+        k_red = int(sym.irr_idx_k[ik])
+        eps_full = np.asarray(wfn.energies[0, k_red, :nbnd], dtype=np.float64)
+        E[ik] = eps_full
+        eps_v = jnp.asarray(eps_full[:nocc], dtype=jnp.float64)
+
+        box = load_kpoint_fftbox(wfn, sym, meta, ik, nbnd)     # unfolded ψ box
+        H_k = setup_H_k_from_kvec(kv, V_scf, vnl_setup, wfn, meta,
+                                  V_loc_r=V_loc, ngkmax=ngkmax)
+        Gk_int = jnp.stack([H_k.Gx, H_k.Gy, H_k.Gz], axis=-1).astype(jnp.int32)
+        maskf = H_k.mask[None, None, :]
+        U_val_G = (_psi_box_to_G_sphere(box, Gk_int)[:nocc]
+                   * maskf.astype(box.dtype))               # (nv, ns, nG)
+
+        K_bar_sq = compute_per_band_kinetic(U_val_G, H_k.T_diag)
+        precond = tpa_preconditioner_diag(H_k.T_diag, K_bar_sq)
+
+        # |∂̃_a u_v⟩ via Sternheimer — (3, nv, ns, nG), occupied only, no band sum
+        d = compute_kp_tangent_at_kvec(
+            kv, np.asarray(Gk_int), vnl_setup, V_scf, H_k.mask,
+            H_k.Gx, H_k.Gy, H_k.Gz, fft_grid, bdot, H_k.vnl_E,
+            U_val_G, eps_v, alpha_pv, precond, tol=1e-10, max_iter=200)
+
+        md = d * maskf.astype(d.dtype)
+
+        def _Heps(da):                                   # (H_k + ε_v) |∂̃_a u_v⟩
+            Hd = apply_H_k_from_G(da, H_k.T_diag, H_k.V_scf, H_k.Gx, H_k.Gy,
+                                  H_k.Gz, H_k.vnl_Z, H_k.vnl_E, H_k.mask)
+            return Hd + eps_v[:, None, None] * (da * maskf.astype(da.dtype))
+        opA = jax.vmap(_Heps)(d)                         # (3, nv, ns, nG)
+
+        M0 = jnp.einsum('avsG,bvsG->vab', jnp.conj(md), opA, optimize=True)
+        M1 = jnp.einsum('avsG,bvsG->vab', jnp.conj(md), md, optimize=True)
+        cA += w_k * np.asarray(_axial(M0))               # (H+ε) sandwich
+        cB += w_k * np.asarray(_axial(M1))               # overlap (the −2μ piece)
+
+        psi_np = np.asarray(U_val_G)
+        sz = (np.abs(psi_np[:, 0]) ** 2 - np.abs(psi_np[:, 1]) ** 2).sum(axis=1).real
+        S_sum += w_k * float(sz.sum())
+        if (ik + 1) % 6 == 0 or ik == nk - 1:
+            print(f"         k {ik+1}/{nk}")
+
+    z = np.zeros((nbnd, nbnd), dtype=np.complex128)
+    info = {"nk_ibz": nk, "nG": 0, "idx": [], "method": "sternheimer"}
+    return cA, cB, z, z, -1.0 * S_sum, E, info
+
+
+# ----------------------------------------------------------------------
 #  Hellmann-Feynman group-velocity check (fixes kinetic/nonlocal sign)
 # ----------------------------------------------------------------------
 def hf_group_velocity_check(Vp, Vnl, eps_grid, kcrys_grid, B, kgrid, nbands_show=8):
@@ -338,6 +445,15 @@ def main(argv=None):
                    help="Cartesian magnetization direction selecting the magnetic "
                         "point group (default +z = crystal c). Op g kept iff "
                         "det(R_g) R_g @ axis == axis.")
+    p.add_argument("--method", choices=["sos", "sternheimer"], default="sos",
+                   help="Evaluation route: 'sos' = direct sum-over-states (band-"
+                        "convergence pathological); 'sternheimer' = band-sum-free "
+                        "covariant derivative (occupied states only, no empty-band "
+                        "sum). Default sos.")
+    p.add_argument("--truncation-2d", dest="truncation_2d",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="2D slab Coulomb truncation in V_H when rebuilding V_scf "
+                        "(sternheimer mode). Default True (monolayer CrI3).")
     p.add_argument("--cpu", action="store_true",
                    help="Force JAX CPU backend (handled before jax import; "
                         "use when GPUs are occupied)")
@@ -405,7 +521,18 @@ def main(argv=None):
               "axial-vector unfold (faster + exact).")
 
     out_extra = {}                                   # branch-specific --out payload
-    if args.ibz:
+    if args.method == "sternheimer":
+        # ---- band-sum-free Sternheimer covariant-derivative branch -------
+        if vnl_setup is None:
+            sys.exit("[orbmag] ERROR: --method sternheimer needs the full KS H "
+                     "(no --skip-vnl).")
+        cA, cB, PA_band_z, PB_band_z, m_spin_z, E, info = run_sternheimer_orbmag(
+            wfn, sym, meta, vnl_setup, pseudos, nbnd, nocc, args.truncation_2d)
+
+        def C_of_mu(m):
+            return cA - 2.0 * m * cB
+        out_extra = {"cA": cA, "cB": cB, "method": "sternheimer"}
+    elif args.ibz:
         # ---- symmetry-reduced (IBZ) branch -------------------------------
         sign = 0 if args.skip_vnl else (-1 if args.vnl_sign == "minus" else +1)
         print(f"[orbmag] IBZ mode: v = p "
@@ -508,7 +635,10 @@ def main(argv=None):
     print(f"  orbital moment along spin axis: {m_orb_par:+.5f} mu_B  "
           f"({'PARALLEL' if m_orb_par>0 else 'ANTIPARALLEL'} to spin)")
     print(f"  spin moment |m_spin| = {abs(m_spin_z):.3f} mu_B")
-    if args.ibz:
+    if args.method == "sternheimer":
+        print(f"  [Sternheimer covariant-derivative: BAND-SUM-FREE, "
+              f"{info['nk_ibz']} full-BZ k, occupied-only]")
+    elif args.ibz:
         print(f"  [IBZ-symmetrized: nk_ibz={info['nk_ibz']}, |G|={info['nG']}, "
               f"magnetic-group ops {info['idx']}]")
     print("=" * 64)
@@ -519,14 +649,19 @@ def main(argv=None):
             print(f"   mu={m*RY2EV:8.4f} eV ({label:6s}):  "
                   f"m_z = {-MU_B_PREFACTOR*float(C_of_mu(m)[2].imag):+.5f}")
 
-    if args.convergence and not args.skip_vnl:
+    if args.method == "sternheimer" and (args.convergence or args.per_band):
+        print("\n[orbmag] (--convergence/--per-band N/A for sternheimer: the "
+              "result is BAND-COUNT INDEPENDENT by construction — the conduction "
+              "manifold is summed exactly inside the Sternheimer inverse.)")
+
+    if args.convergence and not args.skip_vnl and args.method != "sternheimer":
         print("\n[orbmag] convergence vs inner-m band ceiling (m_z, mu_B):")
         col_z = (PA_band_z - 2.0 * mu * PB_band_z).sum(axis=0)  # sum over occupied n
         cum = np.cumsum(col_z)                                  # partial sums over m
         for mc in sorted(set([int(0.5*nbnd), int(0.7*nbnd), int(0.85*nbnd), nbnd])):
             print(f"   mceil={mc:4d}:  m_z = {-MU_B_PREFACTOR*float(cum[mc-1].imag):+.5f}")
 
-    if args.per_band:
+    if args.per_band and args.method != "sternheimer":
         band_z = (PA_band_z - 2.0 * mu * PB_band_z).sum(axis=1)  # per outer-n
         m_par_band = frame * (-MU_B_PREFACTOR) * band_z.imag
         print("\n[orbmag] per-occupied-band m_z (along spin axis, mu_B):")
@@ -538,8 +673,10 @@ def main(argv=None):
         # colA_z/colB_z: z-component band-resolved columns (summed over occ n,
         # BZ-weighted) — cumsum over the inner-m index gives m_z vs band ceiling
         # (the band-convergence curve) at any mu, in either mode.
+        _mode = args.method if args.method == "sternheimer" else (
+            "ibz" if args.ibz else "full")
         np.savez_compressed(args.out, E=E, mu=mu, nocc=nocc, m_orb=m_orb,
-                            m_spin_z=m_spin_z, mode=("ibz" if args.ibz else "full"),
+                            m_spin_z=m_spin_z, mode=_mode,
                             colA_z=PA_band_z.sum(axis=0), colB_z=PB_band_z.sum(axis=0),
                             **out_extra)
         print(f"\n[orbmag] wrote {args.out}")
