@@ -55,7 +55,8 @@ if str(_SRC) not in sys.path:
 from file_io import WfnLoader as WFNReader
 from common import symmetry_maps, Meta
 from common.load_wfns import load_kpoint_fftbox
-from psp.dft_operators import generate_gvectors_k, gather_psi_G_from_crys
+from psp.dft_operators import (generate_gvectors_k, gather_psi_G_from_crys,
+                               momentum_matrix_k)
 from psp.get_dipole_mtxels import compute_p_operator_k, compute_vnl_velocity_cart
 from psp.pseudos import load_pseudopotentials, print_atomic_structure
 import psp.vnl_ops as vnl_ops
@@ -133,6 +134,110 @@ def orbital_pieces_at_k(v, eps, nocc, deps_tol):
     Wa = occ * ((eps[:, None] + eps[None, :]) * inv2)
     Wb = occ * inv2
     return cross * Wa[None], cross * Wb[None]         # PA, PB : (3, nb, nb)
+
+
+# ----------------------------------------------------------------------
+#  Symmetry-reduced (IBZ) mode: magnetic point group + axial-vector unfold
+# ----------------------------------------------------------------------
+def magnetic_point_group(sym, m_axis_cart, tol=1e-6):
+    """Cartesian rotations R_g and det(R_g) of the MAGNETIC point group.
+
+    Returns (R_mpg (|G|,3,3), det_mpg (|G|,), idx (|G|,)).  We take the
+    spatial-only half of sym.R_cart (rows [0,ntran); the [ntran:] half is the
+    time-reversal-augmented -R, symmetry_maps.py:~1217) and keep operation s
+    iff it preserves the magnetization AXIAL vector:  det(R_s) R_s @ m == m.
+    This drops time reversal AND the field-reversing unitary ops (vertical
+    mirrors, in-plane C2) that survive only as products with T — exactly the
+    magnetic point group QE uses to reduce a noncollinear FM k-grid.
+    """
+    ntran = int(sym.sym_matrices.shape[0])               # spatial-only count
+    Rc = np.asarray(sym.R_cart[:ntran], dtype=np.float64)  # (ntran,3,3) Cartesian
+    detR = np.linalg.det(Rc)                              # +1 proper / -1 improper
+    m = np.asarray(m_axis_cart, dtype=np.float64)
+    m = m / np.linalg.norm(m)
+    keep = np.array([np.allclose(detR[s] * (Rc[s] @ m), m, atol=tol)
+                     for s in range(ntran)])
+    idx = np.where(keep)[0]
+    return Rc[idx], detR[idx], idx
+
+
+def axial_projector(R_mpg, det_mpg):
+    """Pmat = (1/|G|) sum_g det(R_g) R_g — the (3,3) trivial-rep projector for
+    an AXIAL vector.  Real; idempotent on little-group-invariant input.  NB the
+    per-op R_cart differs from the velocity's K-frame rotation by a transpose,
+    but the group is closed under inverse so this projector is transpose-
+    invariant (test Pmat at the group level, not per op)."""
+    G = R_mpg.shape[0]
+    return (det_mpg[:, None, None] * R_mpg).sum(axis=0) / G   # (3,3) real
+
+
+def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
+    """Symmetry-reduced orbital-magnetization accumulation.
+
+    Loops the nrk STORED irreducible k-points (raw G-flat coefficients, NO
+    symmetry unfold of psi), builds v = 2(k+G) + sign*dV_NL/dk at each, forms
+    the mu-independent pieces, accumulates the IBZ-weighted (3,) sums and the
+    band-resolved (3,nb,nb) arrays, then symmetrizes with the magnetic-point-
+    group axial projector.  Returns the same interface as the full-BZ branch:
+    (cA, cB, PA_band_z, PB_band_z, m_spin_z, E, info).
+    """
+    import jax.numpy as jnp
+    nrk = int(wfn.nkpts)                                  # stored IBZ count (BGW nrk)
+    w_ibz = np.asarray(wfn.kweights, dtype=np.float64)    # IBZ weights, sum = 1
+    if abs(float(w_ibz.sum()) - 1.0) > 1e-6:
+        w_ibz = w_ibz / w_ibz.sum()
+    B = np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
+
+    R_mpg, det_mpg, idx_mpg = magnetic_point_group(sym, m_axis)
+    Pmat = axial_projector(R_mpg, det_mpg)
+    ntran = int(sym.sym_matrices.shape[0])
+    print(f"[orbmag-ibz] nk_ibz={nrk}  full-BZ={int(sym.nk_tot)}  "
+          f"|G|={len(idx_mpg)} of {ntran} spatial ops (T + field-reversing "
+          f"ops excluded)  mag-axis={tuple(float(x) for x in m_axis)}")
+    print(f"[orbmag-ibz] kept op indices {idx_mpg.tolist()}; "
+          f"Pmat@[0,0,1]={np.round(Pmat @ np.array([0,0,1.0]),4).tolist()} "
+          f"Pmat@[1,0,0]={np.round(Pmat @ np.array([1.0,0,0]),4).tolist()}")
+
+    psi_ibz = wfn.load(bands=(0, nbnd), k="ibz", sharding=None)  # (nrk,nb,ns,ngkmax)
+    gvecs_ibz = np.asarray(wfn.gvecs(k="ibz"))            # (nrk,ngkmax,3) raw sphere
+    ngk_v = np.asarray(wfn.ngk_valid(k="ibz"))           # (nrk,) valid G count
+
+    cA = np.zeros(3, dtype=np.complex128); cB = np.zeros(3, dtype=np.complex128)
+    PA_band = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
+    PB_band = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
+    S_sum = 0.0
+    E = np.zeros((nrk, nbnd), dtype=np.float64)
+    for i in range(nrk):
+        ng = int(ngk_v[i])
+        G_int = jnp.asarray(gvecs_ibz[i, :ng], dtype=jnp.int32)
+        psi_G = jnp.asarray(np.asarray(psi_ibz[i])[:, :, :ng])   # (nb,ns,ng)
+        k_crys = jnp.asarray(np.asarray(wfn.kpoints[i]), dtype=jnp.float64)
+        eps = np.asarray(wfn.energies[0, i, :nbnd], dtype=np.float64)
+        E[i] = eps
+        v = np.asarray(momentum_matrix_k(psi_G, G_int, k_crys, jnp.asarray(B)))
+        if sign != 0:
+            kdata = vnl_ops.build_vnl_kdata_from_kvec(
+                np.asarray(wfn.kpoints[i], dtype=float),
+                np.asarray(gvecs_ibz[i, :ng], dtype=int), vnl_setup, compute_dZ=True)
+            nsE = kdata.E_super.shape[0]
+            psi_phys = psi_G[:, :nsE, :] if psi_G.shape[1] > nsE else psi_G
+            v = v + sign * np.asarray(vnl_ops.vnl_velocity_matrix(
+                psi_phys, kdata.Z, kdata.dZ, kdata.E_super))
+        psi_np = np.asarray(psi_G)
+        sz = (np.abs(psi_np[:, 0]) ** 2 - np.abs(psi_np[:, 1]) ** 2).sum(axis=1).real
+        S_sum += w_ibz[i] * float(sz[:nocc].sum())
+        pa, pb = orbital_pieces_at_k(v, eps, nocc, deps_tol)
+        cA += w_ibz[i] * pa.sum(axis=(1, 2)); cB += w_ibz[i] * pb.sum(axis=(1, 2))
+        PA_band += w_ibz[i] * pa; PB_band += w_ibz[i] * pb
+        if (i + 1) % 6 == 0 or i == nrk - 1:
+            print(f"         k_ibz {i+1}/{nrk}")
+
+    cA = Pmat.astype(np.complex128) @ cA                 # symmetrize the (3,) vector
+    cB = Pmat.astype(np.complex128) @ cB
+    PA_band_z = np.einsum('a,anm->nm', Pmat[2], PA_band)  # z-row band-resolved
+    PB_band_z = np.einsum('a,anm->nm', Pmat[2], PB_band)
+    info = {"nk_ibz": nrk, "nG": len(idx_mpg), "idx": idx_mpg.tolist()}
+    return cA, cB, PA_band_z, PB_band_z, -1.0 * S_sum, E, info
 
 
 # ----------------------------------------------------------------------
@@ -224,6 +329,15 @@ def main(argv=None):
                         "Hellmann-Feynman group-velocity check (recommended)")
     p.add_argument("--skip-vnl", action="store_true",
                    help="DIAGNOSTIC: kinetic-only velocity (physically incomplete)")
+    p.add_argument("--ibz", action="store_true",
+                   help="Symmetry-reduced mode: loop the stored IBZ k-points "
+                        "(no psi unfold) and symmetrize the axial-vector moment "
+                        "density over the magnetic point group.")
+    p.add_argument("--mag-axis", type=float, nargs=3, default=(0.0, 0.0, 1.0),
+                   metavar=("MX", "MY", "MZ"),
+                   help="Cartesian magnetization direction selecting the magnetic "
+                        "point group (default +z = crystal c). Op g kept iff "
+                        "det(R_g) R_g @ axis == axis.")
     p.add_argument("--cpu", action="store_true",
                    help="Force JAX CPU backend (handled before jax import; "
                         "use when GPUs are occupied)")
@@ -284,103 +398,102 @@ def main(argv=None):
     if not args.skip_vnl:
         vnl_setup = vnl_ops.build_vnl_setup(wfn, sym, meta, pseudos, nspinor=nspinor)
 
-    # ---- per-k velocity matrices + spin density --------------------------
-    # PERF: this per-k loop is the wall-clock floor (~1-1.5 s/k).  The cost is
-    # load_kpoint_fftbox building the full (nb, ns, nx, ny, nz) FFT box and the
-    # projector build inside compute_vnl_velocity_cart.  To scale to dense
-    # k-grids (the velocity einsums are already @jax.jit):
-    #   (a) read coefficients DIRECTLY to the G-sphere (skip to_box) — the
-    #       einsums only need (nb, ns, nG); this also cuts peak memory ~30x.
-    #   (b) batch the projector/dZ build over k on the sphere representation
-    #       (jit/vmap build_vnl_kdata_from_kvec) instead of per-k host work.
-    # Boxes can't be batched across k (memory), but sphere-side work can.
-    nk = int(sym.nk_tot)
-    w_k = 1.0 / nk                                   # uniform full-BZ weight
-    Vp = np.zeros((nk, 3, nbnd, nbnd), dtype=np.complex128)
-    Vnl = np.zeros((nk, 3, nbnd, nbnd), dtype=np.complex128)
-    E = np.zeros((nk, nbnd), dtype=np.float64)
-    SZ = np.zeros((nk, nbnd), dtype=np.float64)
-    Kc = np.zeros((nk, 3), dtype=np.float64)
-    print(f"[orbmag] assembling velocity matrices over {nk} full-BZ k-points...")
-    for ik in range(nk):
-        vk, vnlk, eps, sz = velocity_at_k(wfn, sym, meta, vnl_setup, ik, nbnd)
-        Vp[ik], Vnl[ik], E[ik], SZ[ik] = vk, vnlk, eps, sz
-        Kc[ik] = np.asarray(sym.unfolded_kpts[ik], dtype=np.float64)
-        if (ik + 1) % 6 == 0 or ik == nk - 1:
-            print(f"         k {ik+1}/{nk}")
+    nrk = int(wfn.nkpts)
+    if not args.ibz and nrk < int(sym.nk_tot):
+        print(f"[orbmag] NOTE: WFN is symmetry-reduced (nrk={nrk} < nk_full="
+              f"{int(sym.nk_tot)}); pass --ibz for the magnetic-symmetry "
+              "axial-vector unfold (faster + exact).")
 
-    B = np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
+    out_extra = {}                                   # branch-specific --out payload
+    if args.ibz:
+        # ---- symmetry-reduced (IBZ) branch -------------------------------
+        sign = 0 if args.skip_vnl else (-1 if args.vnl_sign == "minus" else +1)
+        print(f"[orbmag] IBZ mode: v = p "
+              f"{'(kinetic only)' if sign==0 else ('+' if sign>0 else '-')+' vNL'}"
+              " (canonical p+vNL; HF FD-slope check is full-BZ-only)")
+        cA, cB, PA_band_z, PB_band_z, m_spin_z, E, info = run_ibz(
+            wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol,
+            np.asarray(args.mag_axis, dtype=np.float64), sign)
 
-    # ---- decide kinetic/nonlocal relative sign --------------------------
-    sign = +1
-    if args.skip_vnl:
-        sign = 0
+        def C_of_mu(m):                              # (3,) complex; already symmetrized
+            return cA - 2.0 * m * cB
+        out_extra = {"cA": cA, "cB": cB, "ibz_ops": np.asarray(info["idx"]),
+                     "sign": sign}
     else:
-        hf = hf_group_velocity_check(Vp, Vnl, E, Kc, B, wfn.kgrid)
-        print("\n[orbmag] Hellmann-Feynman group-velocity check "
-              f"({hf['nsamples']} band/k samples):")
-        print(f"         RMS |Re diag(v) - d eps/dk|:  "
-              f"p+vNL = {hf[1]:.4f}   p-vNL = {hf[-1]:.4f}  (Ry*Bohr)")
-        # PHYSICAL SIGN = p + vNL.  velocity_matrix_k = p + vnl_velocity_from_dZ,
-        # and vnl_velocity_from_dZ is bit-identical to vnl_velocity_matrix
-        # (= compute_vnl_velocity_cart).  Verified by an off-diagonal finite
-        # difference of <m|V_NL(k)|n>: compute_vnl_velocity_cart == +dV_NL/dk
-        # to ratio +1.000.  The nonlocal velocity is ~900x larger off-diagonal
-        # than on-diagonal, so the diagonal HF slope test is INSENSITIVE to the
-        # sign (it ties) — HF validates the kinetic part/units only.  Default
-        # to the proven canonical p+vNL; only flip on a large HF margin.
-        if args.vnl_sign != "auto":
-            chosen = args.vnl_sign
-        elif hf["nsamples"] > 0 and hf[-1] < 0.8 * hf[1]:
-            chosen = "minus"
-            print("         (HF strongly prefers p-vNL — unexpected; check sign)")
-        else:
-            chosen = "plus"
-            print("         (HF diagonal test insensitive to nonlocal sign; "
-                  "using canonical p+vNL — verified +dV_NL/dk off-diagonally)")
-        sign = +1 if chosen == "plus" else -1
-        print(f"         -> using v = p {'+' if sign>0 else '-'} vNL "
-              f"({'auto' if args.vnl_sign=='auto' else 'forced'})")
-        for (ik, n, vpls, vmin, gc, vp) in hf["detail"][:6]:
-            print(f"           k{ik:2d} n{n:3d}: FD={np.array2string(gc,precision=3)}  "
-                  f"p+vNL={np.array2string(vpls,precision=3)}  "
-                  f"p-vNL={np.array2string(vmin,precision=3)}")
+        # ---- full-BZ branch ----------------------------------------------
+        # PERF: per-k FFT-box load + projector build is the wall-clock floor;
+        # for dense grids prefer --ibz (loops nrk IBZ points, G-flat, no box).
+        nk = int(sym.nk_tot)
+        w_k = 1.0 / nk                               # uniform full-BZ weight
+        Vp = np.zeros((nk, 3, nbnd, nbnd), dtype=np.complex128)
+        Vnl = np.zeros((nk, 3, nbnd, nbnd), dtype=np.complex128)
+        E = np.zeros((nk, nbnd), dtype=np.float64)
+        SZ = np.zeros((nk, nbnd), dtype=np.float64)
+        Kc = np.zeros((nk, 3), dtype=np.float64)
+        print(f"[orbmag] assembling velocity matrices over {nk} full-BZ k-points...")
+        for ik in range(nk):
+            vk, vnlk, eps, sz = velocity_at_k(wfn, sym, meta, vnl_setup, ik, nbnd)
+            Vp[ik], Vnl[ik], E[ik], SZ[ik] = vk, vnlk, eps, sz
+            Kc[ik] = np.asarray(sym.unfolded_kpts[ik], dtype=np.float64)
+            if (ik + 1) % 6 == 0 or ik == nk - 1:
+                print(f"         k {ik+1}/{nk}")
+        B = np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
 
-    V = Vp + sign * Vnl                              # (nk,3,nb,nb) physical velocity
+        # decide kinetic/nonlocal sign (HF diagonal test; canonical p+vNL)
+        sign = 0
+        if not args.skip_vnl:
+            hf = hf_group_velocity_check(Vp, Vnl, E, Kc, B, wfn.kgrid)
+            print("\n[orbmag] Hellmann-Feynman group-velocity check "
+                  f"({hf['nsamples']} band/k samples):")
+            print(f"         RMS |Re diag(v) - d eps/dk|:  "
+                  f"p+vNL = {hf[1]:.4f}   p-vNL = {hf[-1]:.4f}  (Ry*Bohr)")
+            # Physical sign = p+vNL (canonical velocity_matrix_k); verified
+            # compute_vnl_velocity_cart == +dV_NL/dk off-diagonally (ratio 1.000).
+            # dV_NL/dk is ~900x larger off-diagonal, so the diagonal HF test ties
+            # — it validates kinetic part/units only.  Flip only on a large margin.
+            if args.vnl_sign != "auto":
+                chosen = args.vnl_sign
+            elif hf["nsamples"] > 0 and hf[-1] < 0.8 * hf[1]:
+                chosen = "minus"
+                print("         (HF strongly prefers p-vNL — unexpected; check sign)")
+            else:
+                chosen = "plus"
+                print("         (HF diagonal test insensitive to nonlocal sign; "
+                      "using canonical p+vNL — verified +dV_NL/dk off-diagonally)")
+            sign = +1 if chosen == "plus" else -1
+            print(f"         -> using v = p {'+' if sign>0 else '-'} vNL "
+                  f"({'auto' if args.vnl_sign=='auto' else 'forced'})")
+            for (ik, n, vpls, vmin, gc, vp) in hf["detail"][:6]:
+                print(f"           k{ik:2d} n{n:3d}: FD={np.array2string(gc,precision=3)}  "
+                      f"p+vNL={np.array2string(vpls,precision=3)}  "
+                      f"p-vNL={np.array2string(vmin,precision=3)}")
 
-    # ---- chemical potential ---------------------------------------------
+        V = Vp + sign * Vnl
+        PA = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
+        PB = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
+        for ik in range(nk):
+            pa, pb = orbital_pieces_at_k(V[ik], E[ik], nocc, deps_tol)
+            PA += w_k * pa
+            PB += w_k * pb
+        PA_band_z, PB_band_z = PA[2], PB[2]
+        m_spin_z = -1.0 * float((w_k * SZ[:, :nocc].sum(axis=1)).sum())
+
+        def C_of_mu(m):
+            return (PA - 2.0 * m * PB).sum(axis=(1, 2))
+        out_extra = {"Vp": Vp, "Vnl": Vnl, "SZ": SZ, "Kc": Kc, "sign": sign}
+
+    # ---- shared: chemical potential + reporting --------------------------
     VBM = float(E[:, nocc - 1].max())
     CBM = float(E[:, nocc].min()) if nocc < nbnd else VBM
-    if args.mu is not None:
-        mu = args.mu / RY2EV
-    else:
-        mu = 0.5 * (VBM + CBM)
+    mu = args.mu / RY2EV if args.mu is not None else 0.5 * (VBM + CBM)
     gap_eV = (CBM - VBM) * RY2EV
     print(f"\n[orbmag] VBM={VBM*RY2EV:.4f} eV  CBM={CBM*RY2EV:.4f} eV  "
           f"indirect gap={gap_eV:.4f} eV   mu={mu*RY2EV:.4f} eV ({mu:.5f} Ry)")
     if gap_eV < 0:
         print("         NOTE: negative indirect gap at this k-sampling -> the "
               "moment is mu-dependent (run --mu-scan).")
-
-    # ---- spin moment (calibration / axis) -------------------------------
-    S_sum = float((w_k * SZ[:, :nocc].sum(axis=1)).sum())  # sum_k w_k sum_occ <sz>
-    m_spin_z = -1.0 * S_sum                                 # mu_B, file frame
-    print(f"\n[orbmag] spin moment  sum_occ <sigma_z> = {S_sum:+.4f}  -> "
+    print(f"\n[orbmag] spin moment  sum_occ <sigma_z> = {-m_spin_z:+.4f}  -> "
           f"|m_spin| = {abs(m_spin_z):.3f} mu_B  (expect ~6 for CrI3)")
-
-    # ---- orbital moment: accumulate mu-independent pieces ONCE ----------
-    # PA, PB (3, nb, nb) so the summand at any mu is PA - 2*mu*PB.  Every
-    # diagnostic below is then a cheap reduction of these two arrays — no
-    # per-mu / per-band / per-ceiling recomputation.
-    PA = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
-    PB = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
-    for ik in range(nk):
-        pa, pb = orbital_pieces_at_k(V[ik], E[ik], nocc, deps_tol)
-        PA += w_k * pa
-        PB += w_k * pb
-
-    def C_of_mu(m):                                  # (3,) complex BZ+band sum
-        return (PA - 2.0 * m * PB).sum(axis=(1, 2))
 
     m_orb = -MU_B_PREFACTOR * C_of_mu(mu).imag       # (3,) mu_B, file frame
     frame = 1.0 if m_spin_z >= 0 else -1.0
@@ -395,6 +508,9 @@ def main(argv=None):
     print(f"  orbital moment along spin axis: {m_orb_par:+.5f} mu_B  "
           f"({'PARALLEL' if m_orb_par>0 else 'ANTIPARALLEL'} to spin)")
     print(f"  spin moment |m_spin| = {abs(m_spin_z):.3f} mu_B")
+    if args.ibz:
+        print(f"  [IBZ-symmetrized: nk_ibz={info['nk_ibz']}, |G|={info['nG']}, "
+              f"magnetic-group ops {info['idx']}]")
     print("=" * 64)
 
     if args.mu_scan and nocc < nbnd:
@@ -405,13 +521,13 @@ def main(argv=None):
 
     if args.convergence and not args.skip_vnl:
         print("\n[orbmag] convergence vs inner-m band ceiling (m_z, mu_B):")
-        col_z = (PA[2] - 2.0 * mu * PB[2]).sum(axis=0)   # sum over occupied n
-        cum = np.cumsum(col_z)                           # partial sums over inner m
+        col_z = (PA_band_z - 2.0 * mu * PB_band_z).sum(axis=0)  # sum over occupied n
+        cum = np.cumsum(col_z)                                  # partial sums over m
         for mc in sorted(set([int(0.5*nbnd), int(0.7*nbnd), int(0.85*nbnd), nbnd])):
             print(f"   mceil={mc:4d}:  m_z = {-MU_B_PREFACTOR*float(cum[mc-1].imag):+.5f}")
 
     if args.per_band:
-        band_z = (PA[2] - 2.0 * mu * PB[2]).sum(axis=1)  # per outer-n, sum over m
+        band_z = (PA_band_z - 2.0 * mu * PB_band_z).sum(axis=1)  # per outer-n
         m_par_band = frame * (-MU_B_PREFACTOR) * band_z.imag
         print("\n[orbmag] per-occupied-band m_z (along spin axis, mu_B):")
         order = np.argsort(np.abs(m_par_band[:nocc]))[::-1]
@@ -419,9 +535,9 @@ def main(argv=None):
             print(f"   band {n:3d}: {m_par_band[n]:+.5f}")
 
     if args.out:
-        np.savez_compressed(args.out, Vp=Vp, Vnl=Vnl, E=E, SZ=SZ, Kc=Kc,
-                            sign=sign, mu=mu, nocc=nocc, w_k=w_k,
-                            m_orb=m_orb, m_spin_z=m_spin_z)
+        np.savez_compressed(args.out, E=E, mu=mu, nocc=nocc, m_orb=m_orb,
+                            m_spin_z=m_spin_z, mode=("ibz" if args.ibz else "full"),
+                            **out_extra)
         print(f"\n[orbmag] wrote {args.out}")
 
 
