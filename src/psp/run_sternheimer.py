@@ -1119,7 +1119,7 @@ def run_sternheimer(
     rho_val = build_rho_val_from_wfn(wfn, sym, meta, n_occ, verbose=verbose)
     if verbose:
         print(f"\n── V_scf ──")
-    V_scf, V_loc, vnl_setup = build_dft_potentials(
+    V_scf, V_loc, vnl_setup, _ = build_dft_potentials(
         wfn, pseudos, rho_val,
         truncation_2d=truncation_2d, verbose=verbose)
 

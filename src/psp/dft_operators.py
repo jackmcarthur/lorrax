@@ -86,6 +86,10 @@ class HamiltonianK:
     nG: int                          # actual (unpadded) count
     fft_grid: tuple[int, int, int]
 
+    # xc magnetic field (noncollinear): adds (B·σ)|ψ⟩.  None for non-magnetic
+    # systems (m=0 ⇒ B=0), where it is skipped at JIT-trace time (bit-identical).
+    B_vec: jax.Array | None = None   # (3, nx, ny, nz) float64 Ry, or None
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Poisson solver
@@ -483,6 +487,7 @@ def setup_H_k(
     meta,
     V_loc_r: jax.Array | None = None,
     ngkmax: int | None = None,
+    B_vec: jax.Array | None = None,
 ) -> HamiltonianK:
     """Assemble all per-k Hamiltonian data (SymMaps path).
 
@@ -536,6 +541,7 @@ def setup_H_k(
         mask=mask,
         nG=nG_actual,
         fft_grid=tuple(int(x) for x in meta.fft_grid),
+        B_vec=B_vec,
     )
 
 
@@ -547,6 +553,7 @@ def setup_H_k_from_kvec(
     meta,
     V_loc_r: jax.Array | None = None,
     ngkmax: int | None = None,
+    B_vec: jax.Array | None = None,
 ) -> HamiltonianK:
     """Assemble per-k Hamiltonian data (standalone, no SymMaps / WFN.h5).
 
@@ -609,6 +616,7 @@ def setup_H_k_from_kvec(
         mask=mask,
         nG=nG_actual,
         fft_grid=tuple(int(x) for x in crystal.fft_grid),
+        B_vec=B_vec,
     )
 
 
@@ -616,9 +624,18 @@ def setup_H_k_from_kvec(
 #  Core fused JIT kernels
 # ═══════════════════════════════════════════════════════════════════════
 
+def _bsigma_psi(psi_r, B_vec):
+    """(B·σ)|ψ⟩ in real space.  psi_r: (...,2,nx,ny,nz); B_vec: (3,nx,ny,nz) Ry.
+    Returns the same-shape spinor box (B·σ = B_z σ_z + B_x σ_x + B_y σ_y)."""
+    up, dn = psi_r[:, 0], psi_r[:, 1]
+    s_up = B_vec[2] * up + (B_vec[0] - 1j * B_vec[1]) * dn       # (B·σ) row 0
+    s_dn = (B_vec[0] + 1j * B_vec[1]) * up - B_vec[2] * dn       # (B·σ) row 1
+    return jnp.stack([s_up, s_dn], axis=1)
+
+
 @functools.partial(jax.jit, donate_argnums=(0,))
-def apply_H_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
-    """H|ψ⟩ = (T + V_scf + V_NL)|ψ⟩.  Single fused JIT dispatch.
+def apply_H_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask, B_vec=None):
+    """H|ψ⟩ = (T + V_scf + B·σ + V_NL)|ψ⟩.  Single fused JIT dispatch.
 
     The input psi_box is **donated** (its buffer is reused by XLA).
     After this call the caller must not read psi_box.
@@ -651,6 +668,12 @@ def apply_H_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
         psi_r * V_scf, axes=(-3, -2, -1), norm='ortho'
     )[:, :, Gx, Gy, Gz] * mask_f
 
+    # ── B_xc: spin-dependent xc field (B·σ)|ψ⟩, real-space (magnetic only) ─
+    if B_vec is not None:                       # B_vec: (3, nx, ny, nz) float64 Ry
+        H_G = H_G + jnp.fft.fftn(_bsigma_psi(psi_r, B_vec),
+                                 axes=(-3, -2, -1), norm='ortho'
+                                 )[:, :, Gx, Gy, Gz] * mask_f
+
     # ── V_NL: Kleinman–Bylander (project → D → unproject) ───────────
     P = jnp.einsum('RG,vsG->Rsv', jnp.conj(vnl_Z), psi_G, optimize=True)
     D = jnp.einsum('stRQ,Qtv->Rsv', vnl_E, P, optimize=True)
@@ -664,12 +687,12 @@ def apply(psi_box: jax.Array, H_k: HamiltonianK) -> jax.Array:
     return apply_H_k(
         psi_box, H_k.T_diag, H_k.V_scf,
         H_k.Gx, H_k.Gy, H_k.Gz,
-        H_k.vnl_Z, H_k.vnl_E, H_k.mask,
+        H_k.vnl_Z, H_k.vnl_E, H_k.mask, H_k.B_vec,
     )
 
 
 @jax.jit
-def apply_H_k_from_G(psi_G, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
+def apply_H_k_from_G(psi_G, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask, B_vec=None):
     """H|ψ⟩ where the input is the **G-sphere** representation (not the FFT
     box).  Skips the redundant ``scatter→gather`` round trip used by
     ``_apply_A_inline``: callers that already have ψ in G-form (e.g. CG
@@ -704,6 +727,12 @@ def apply_H_k_from_G(psi_G, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
     Vpsi_box = jnp.fft.fftn(psi_r * V_scf, axes=(-3, -2, -1), norm='ortho')
     H_G = H_G + Vpsi_box[:, :, Gx, Gy, Gz] * mask_f
 
+    # B_xc path: (B·σ)ψ in real space for magnetic systems.  B_vec=None is a
+    # trace-time static → non-magnetic kernel is bit-identical (no extra ops).
+    if B_vec is not None:                       # B_vec: (3, nx, ny, nz) float64 Ry
+        Bpsi = jnp.fft.fftn(_bsigma_psi(psi_r, B_vec), axes=(-3, -2, -1), norm='ortho')
+        H_G = H_G + Bpsi[:, :, Gx, Gy, Gz] * mask_f
+
     # V_NL on the G-sphere directly.
     P = jnp.einsum('RG,vsG->Rsv', jnp.conj(vnl_Z), psi_G_m, optimize=True)
     D = jnp.einsum('stRQ,Qtv->Rsv', vnl_E, P, optimize=True)
@@ -713,7 +742,7 @@ def apply_H_k_from_G(psi_G, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
 
 
 @jax.jit
-def build_matrix_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
+def build_matrix_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask, B_vec=None):
     """Full ⟨m|H|n⟩ matrix at one k-point.  Returns (nb, nb) complex128."""
     import psp.vnl_ops as vnl_ops
 
@@ -735,6 +764,12 @@ def build_matrix_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
         'msG,nsG->mn', jnp.conj(psi_G), Vpsi_G, optimize=True,
     )
 
+    # B_xc: spin-dependent xc field (B·σ)|ψ⟩ (magnetic only; trace-time skip)
+    if B_vec is not None:
+        Bpsi_G = jnp.fft.fftn(_bsigma_psi(psi_r, B_vec),
+                              axes=(-3, -2, -1), norm='ortho')[:, :, Gx, Gy, Gz] * mask_f
+        H_mn = H_mn + jnp.einsum('msG,nsG->mn', jnp.conj(psi_G), Bpsi_G, optimize=True)
+
     # V_NL
     H_mn = H_mn + vnl_ops.vnl_matrix(psi_G, vnl_Z, vnl_E)
 
@@ -746,7 +781,7 @@ def matrix(psi_box: jax.Array, H_k: HamiltonianK) -> jax.Array:
     return build_matrix_k(
         psi_box, H_k.T_diag, H_k.V_scf,
         H_k.Gx, H_k.Gy, H_k.Gz,
-        H_k.vnl_Z, H_k.vnl_E, H_k.mask,
+        H_k.vnl_Z, H_k.vnl_E, H_k.mask, H_k.B_vec,
     )
 
 

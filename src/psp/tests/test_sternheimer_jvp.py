@@ -79,7 +79,7 @@ def _build_fixture(wfn_path: str, pseudo_dir: str, truncation_2d: bool,
                             nband=n_band, n_rmu=0, bispinor=False)
     pseudos = load_pseudopotentials(pseudo_dir)
     rho_val = build_rho_val_from_wfn(wfn, sym, meta, n_occ, verbose=False)
-    V_scf, V_loc, vnl_setup = build_dft_potentials(
+    V_scf, V_loc, vnl_setup, _ = build_dft_potentials(
         wfn, pseudos, rho_val, truncation_2d=truncation_2d, verbose=False)
     nk_full = int(sym.nk_tot)
     nspinor = int(wfn.nspinor)

@@ -46,9 +46,10 @@ def build_dft_potentials(
     rho_val: jax.Array,
     *,
     truncation_2d: bool,
+    m_vec: tuple | None = None,
     verbose: bool = True,
-) -> tuple[jax.Array, jax.Array, vnl_ops.VNLSetup]:
-    """Build (V_scf, V_loc, vnl_setup) on the FFT grid.
+) -> tuple[jax.Array, jax.Array, vnl_ops.VNLSetup, jax.Array | None]:
+    """Build (V_scf, V_loc, vnl_setup, B_vec) on the FFT grid.
 
     Parameters
     ----------
@@ -62,17 +63,22 @@ def build_dft_potentials(
         Real-space valence charge density in e/bohr³.
     truncation_2d : bool
         Apply 2D Coulomb truncation in V_H (slab geometries).
+    m_vec : (m_x, m_y, m_z) of (nx,ny,nz) float64, or None
+        Real-space magnetization (from ``build_magnetization_from_wfn``).  When
+        given, V_xc is the spin-polarized noncollinear potential: its charge
+        part V̄=½(V↑+V↓) goes into V_scf and the xc field B=½(V↑−V↓)·m̂ is
+        returned as ``B_vec`` for ``(B·σ)|ψ⟩`` in the Hamiltonian.  When None
+        (non-magnetic), the spin-unpolarized V_xc is used and B_vec is None —
+        bit-identical to the scalar path.
     verbose : bool
         Print timing.
 
     Returns
     -------
-    V_scf : (nx, ny, nz) float64
-        Combined local potential V_loc + V_H + V_xc.
-    V_loc : (nx, ny, nz) float64
-        Ionic local potential alone (kept separately for h_diag).
-    vnl_setup : vnl_ops.VNLSetup
-        Nonlocal-projector setup (radial tables + channel data).
+    V_scf : (nx, ny, nz) float64 — V_loc + V_H + V_xc (charge part).
+    V_loc : (nx, ny, nz) float64 — ionic local potential alone (for h_diag).
+    vnl_setup : vnl_ops.VNLSetup — nonlocal-projector setup.
+    B_vec : (3, nx, ny, nz) float64 Ry xc field, or None if non-magnetic.
     """
     fft_grid = mf.fft_grid
     nspinor = int(mf.nspinor)
@@ -89,6 +95,23 @@ def build_dft_potentials(
         jnp.asarray(mf.bdot, dtype=jnp.float64),
         jnp.asarray(mf.bvec, dtype=jnp.float64), mf.blat,
         truncation_2d=truncation_2d)
+
+    B_vec = None
+    if m_vec is not None:
+        # Noncollinear V_xc: local spin frame n↑/↓=(n±|m|)/2 (core nonmagnetic),
+        # V̄=½(V↑+V↓) replaces the scalar V_xc, B=½(V↑−V↓)·m̂ is the xc field.
+        from psp.xc import compute_V_xc_spin
+        m_x, m_y, m_z = (jnp.asarray(c, dtype=jnp.float64) for c in m_vec)
+        amag = jnp.sqrt(m_x ** 2 + m_y ** 2 + m_z ** 2)
+        n_tot = rho_val + rho_core
+        n_up, n_dn = (n_tot + amag) / 2, (n_tot - amag) / 2
+        V_up, V_dn = compute_V_xc_spin(
+            n_up, n_dn, jnp.fft.fftn(n_up), jnp.fft.fftn(n_dn), G_cart)
+        V_xc = 0.5 * (V_up + V_dn)
+        Bmag = 0.5 * (V_up - V_dn)
+        inv = jnp.where(amag > 1e-12, 1.0 / (amag + 1e-30), 0.0)
+        B_vec = jnp.stack([Bmag * m_x * inv, Bmag * m_y * inv, Bmag * m_z * inv], axis=0)
+
     V_scf = build_V_scf(V_loc, V_H, V_xc)
     vnl_setup = vnl_ops.build_vnl_setup(
         mf, pseudos=pseudos, nspinor=nspinor,
@@ -97,7 +120,7 @@ def build_dft_potentials(
     if verbose:
         print(f"  Potentials: {time.perf_counter()-t0:.2f}s")
 
-    return V_scf, V_loc, vnl_setup
+    return V_scf, V_loc, vnl_setup, B_vec
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -166,4 +189,49 @@ def build_rho_val_from_wfn(wfn, sym, meta, n_occ: int, *, verbose: bool = True) 
     return rho_r
 
 
-__all__ = ["build_dft_potentials", "build_rho_val_from_wfn"]
+def build_magnetization_from_wfn(wfn, sym, meta, n_occ: int, *, verbose: bool = True):
+    """Build m(r)=(m_x,m_y,m_z) from WFN.h5 via full-BZ Pauli sandwiches.
+
+        m_α(r) = (1/N_k) Σ_{k∈BZ} Σ_{v<n_occ} ψ_v†(r) σ_α ψ_v(r)
+
+    Mirror of ``build_rho_val_from_wfn`` (same load/IFFT/normalisation;
+    spin_factor=1) with |ψ|² replaced by the three Pauli sandwiches.  Only
+    defined for nspinor=2.  Returns three (nx,ny,nz) float64 arrays in e/bohr³
+    (same units as ρ_val), matching QE charge-density.hdf5 m_x/m_y/m_z.
+    """
+    from common.load_wfns import load_kpoint_fftbox
+    assert int(meta.nspinor) == 2, "magnetization needs nspinor=2 spinors"
+
+    nx, ny, nz = meta.fft_grid
+    N_grid = nx * ny * nz
+    vol = float(wfn.cell_volume)
+    nk_full = int(sym.nk_tot)
+
+    t0 = time.perf_counter()
+    mx = jnp.zeros((nx, ny, nz), dtype=jnp.float64)
+    my = jnp.zeros_like(mx)
+    mz = jnp.zeros_like(mx)
+    for ik in range(nk_full):
+        psi_box = load_kpoint_fftbox(wfn, sym, meta, ik, n_occ)
+        psi_r = jnp.fft.ifftn(psi_box, axes=(-3, -2, -1), norm='ortho')
+        up = psi_r[:, 0]
+        dn = psi_r[:, 1]
+        ud = jnp.sum(jnp.conj(up) * dn, axis=0)         # Σ_v conj(↑)·↓
+        mx = mx + 2.0 * jnp.real(ud)                    # σ_x: 2 Re
+        my = my + 2.0 * jnp.imag(ud)                    # σ_y: 2 Im
+        mz = mz + jnp.sum(jnp.abs(up) ** 2 - jnp.abs(dn) ** 2, axis=0)  # σ_z
+
+    f = (1.0 / nk_full) * (N_grid / vol)
+    mx, my, mz = mx * f, my * f, mz * f
+
+    if verbose:
+        amag = jnp.sqrt(mx ** 2 + my ** 2 + mz ** 2)
+        print(f"  |m| integral: {float(jnp.sum(amag)) * vol / N_grid:.4f} μ_B  "
+              f"net m_z: {float(jnp.sum(mz)) * vol / N_grid:.4f}  "
+              f"({time.perf_counter() - t0:.2f}s)")
+
+    return mx, my, mz
+
+
+__all__ = ["build_dft_potentials", "build_rho_val_from_wfn",
+           "build_magnetization_from_wfn"]

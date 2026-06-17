@@ -60,9 +60,10 @@ def _build_potentials(crystal, pseudos, verbose=True):
     """
     rho_val = jnp.asarray(crystal.load_charge_density()[0], dtype=jnp.float64)
     truncation_2d = crystal.assume_isolated == "2D"
-    return build_dft_potentials(
+    V_scf, V_loc, vnl_setup, _ = build_dft_potentials(
         crystal, pseudos, rho_val,
         truncation_2d=truncation_2d, verbose=verbose)
+    return V_scf, V_loc, vnl_setup
 
 
 # ═══════════════════════════════════════════════════════════════════════
