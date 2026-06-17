@@ -179,13 +179,20 @@ def compute_sigma_x_bispinor(
             contrib.block_until_ready()
             # Per-tile diagonal trace (eV) for diagnostic comparison
             # against agent-B's MoS2 reference values (commit 69e8863).
+            # NB: this is a SUM over all (k, band) diagonal entries — an
+            # eV-scale number that is NOT a per-band self-energy.  The
+            # physical Breit shift is per-band = tr / (nk·nb_sigma); it is
+            # α²-suppressed (~tens of meV) relative to the ~50 eV exchange.
             try:
                 tr = float(jnp.einsum('kmm->', contrib).real) * RYD_TO_EV
+                n_diag = int(contrib.shape[0]) * int(contrib.shape[1])
+                per_band_mev = 1e3 * tr / n_diag if n_diag else float('nan')
             except Exception:
-                tr = float('nan')
+                tr = float('nan'); per_band_mev = float('nan')
             contributions[(i, j)] = tr
             if verbose and jax.process_index() == 0:
-                print_fn(f"  Σ^B tile (μ_L={i}, ν_L={j}): tr Σ = {tr:+.6f} eV")
+                print_fn(f"  Σ^B tile (μ_L={i}, ν_L={j}): tr Σ = {tr:+.6f} eV "
+                         f"(per-band {per_band_mev:+.3f} meV)")
             sig_x_b = contrib if sig_x_b is None else sig_x_b + contrib
 
     if sig_x_b is None:  # pragma: no cover — should never happen
