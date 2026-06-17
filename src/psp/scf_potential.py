@@ -98,17 +98,29 @@ def build_dft_potentials(
 
     B_vec = None
     if m_vec is not None:
-        # Noncollinear V_xc: local spin frame n↑/↓=(n±|m|)/2 (core nonmagnetic),
-        # V̄=½(V↑+V↓) replaces the scalar V_xc, B=½(V↑−V↓)·m̂ is the xc field.
+        # Noncollinear V_xc.  Local spin frame n↑/↓=½(n±segni|m|), V̄=½(V↑+V↓) into
+        # V_scf, B=segni·½(V↑−V↓)·m̂ the xc field.  segni=sign(m·û) (û=net-moment
+        # axis) gives the SIGNED magnetization, which is smooth — using |m| directly
+        # puts gradient kinks where m flips sign (core polarization), and the FFT
+        # gradient rings there → corrupts the GGA σ → wrong B on those states (QE's
+        # segni, compute_rho.f90).  ponytail: û from the net moment assumes a
+        # dominant collinear axis — exact for FM/collinear (CrI3); revisit for AFM.
         from psp.xc import compute_V_xc_spin
         m_x, m_y, m_z = (jnp.asarray(c, dtype=jnp.float64) for c in m_vec)
         amag = jnp.sqrt(m_x ** 2 + m_y ** 2 + m_z ** 2)
+        M_net = jnp.array([m_x.sum(), m_y.sum(), m_z.sum()])
+        u_ax = M_net / (jnp.linalg.norm(M_net) + 1e-30)
+        segni = jnp.where(amag > 1e-12,
+                          jnp.sign(m_x * u_ax[0] + m_y * u_ax[1] + m_z * u_ax[2]), 1.0)
         n_tot = rho_val + rho_core
-        n_up, n_dn = (n_tot + amag) / 2, (n_tot - amag) / 2
-        V_up, V_dn = compute_V_xc_spin(
-            n_up, n_dn, jnp.fft.fftn(n_up), jnp.fft.fftn(n_dn), G_cart)
+        n_up, n_dn = (n_tot + segni * amag) / 2, (n_tot - segni * amag) / 2
+        # analytic-core gradient (precise-core trick, as the scalar path uses)
+        core_grid = jnp.real(jnp.fft.ifftn(rho_core_G))
+        rho_G_up = jnp.fft.fftn(n_up - core_grid / 2) + rho_core_G / 2
+        rho_G_dn = jnp.fft.fftn(n_dn - core_grid / 2) + rho_core_G / 2
+        V_up, V_dn = compute_V_xc_spin(n_up, n_dn, rho_G_up, rho_G_dn, G_cart)
         V_xc = 0.5 * (V_up + V_dn)
-        Bmag = 0.5 * (V_up - V_dn)
+        Bmag = 0.5 * segni * (V_up - V_dn)
         inv = jnp.where(amag > 1e-12, 1.0 / (amag + 1e-30), 0.0)
         B_vec = jnp.stack([Bmag * m_x * inv, Bmag * m_y * inv, Bmag * m_z * inv], axis=0)
 
