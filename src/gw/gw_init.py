@@ -529,6 +529,24 @@ def get_bandranges(nv, nc, nband, nelec):
 	return nvrange, ncrange, nsigmarange, n_fullrange, n_valrange
 
 
+def _transverse_meta(cfg, meta):
+	"""Transverse-centroid Meta (n_rmu = current-density centroid count) +
+	its centroid FFT indices.  Shared by the ζ-fit path and the restart
+	path so the σ^B Wfns bundle is sized identically.  n_rmu_padded uses
+	world_size (not n_proc) — the transverse extent differs from charge."""
+	import dataclasses
+	from file_io.centroids import load_centroids
+	_, cents_curr_idx, n_rmu_curr = load_centroids(
+		cfg.paths.centroids_file_current, meta.fft_grid)
+	n_proc = meta.n_proc; world = int(jax.device_count())
+	meta_curr = dataclasses.replace(
+		meta, n_rmu=int(n_rmu_curr),
+		n_rmu_jax=((int(n_rmu_curr)+n_proc-1)//n_proc)*n_proc,
+		n_rmu_padded=((int(n_rmu_curr)+world-1)//world)*world)
+	meta_curr.sys_dim = meta.sys_dim
+	return meta_curr, cents_curr_idx
+
+
 def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
              psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print):
 	"""Fit ISDF interpolation vectors ζ and write to HDF5.
@@ -762,35 +780,15 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			"`centroid.kmeans_cli --density-mode current ...`)."
 		)
 	if cfg.bispinor and getattr(cfg.paths, 'centroids_file_current', None):
-		import dataclasses
 		from common.load_wfns import load_centroids_band_chunked
-		from file_io.centroids import load_centroids
 
 		cents_curr_path = cfg.paths.centroids_file_current
 		print_fn(f"\n  [bispinor] fitting ζ^{{μ_L=1,2,3}} on current-density "
 		         f"centroids: {cents_curr_path}")
-		_, cents_curr_idx, n_rmu_curr = load_centroids(
-			cents_curr_path, meta.fft_grid)
-		# Round n_rmu_jax to n_proc (legacy field, host-count divisor).
-		n_rmu_curr_jax = ((n_rmu_curr + meta.n_proc - 1) // meta.n_proc) * meta.n_proc
-		# n_rmu_padded uses world_size (= ∏ p_a over the device mesh).
-		# Without this refresh the bispinor transverse fit_zeta inherits
-		# the charge-channel padded extent, and the C_q reshape at
-		# isdf_fitting.py:1442 trips a TypeError when the transverse
-		# centroid count differs from the charge count.
-		_world_size = int(jax.device_count())
-		n_rmu_curr_padded = ((n_rmu_curr + _world_size - 1) // _world_size) * _world_size
-		meta_curr = dataclasses.replace(
-			meta,
-			n_rmu=int(n_rmu_curr),
-			n_rmu_jax=int(n_rmu_curr_jax),
-			n_rmu_padded=int(n_rmu_curr_padded),
-		)
-		# ``sys_dim`` is set dynamically on ``meta`` by gw_jax.main
-		# (Meta has no sys_dim field), so dataclasses.replace doesn't
-		# carry it over.  Copy it explicitly — fit_zeta_to_h5 reads
-		# meta.sys_dim when building the per-q G-flat sphere.
-		meta_curr.sys_dim = meta.sys_dim
+		# Transverse-centroid Meta (n_rmu = current-density centroid
+		# count) + its FFT indices.  Factored into ``_transverse_meta``
+		# so the restart path sizes the σ^B Wfns bundle identically.
+		meta_curr, cents_curr_idx = _transverse_meta(cfg, meta)
 
 		with timing.section("gw_jax.load_centroid_wfns_current"):
 			psi_curr_rmu_Y, psi_curr_rmuT_X = load_centroids_band_chunked(
@@ -1293,10 +1291,16 @@ def prepare_isdf_and_wavefunctions(
 					       f"n_rmu_T={transverse_wfn_data['meta'].n_rmu} "
 					       f"transverse centroids")
 
-			# Append ψ to the now-open restart file.
+			# Append ψ to the now-open restart file.  On bispinor runs
+			# the transverse-centroid ψ rides along in the same append so
+			# the σ^B Wfns bundle can be rebuilt on restart.
 			write_restart_state_to_h5(
 				tensors_filename,
-				psi_full_y=wfns.psi_yr, mesh=mesh_xy,
+				psi_full_y=wfns.psi_yr,
+				psi_full_y_transverse=(
+					wfns_transverse.psi_yr
+					if wfns_transverse is not None else None),
+				mesh=mesh_xy,
 				backend=cfg.backend.slab_io, mode="a",
 			)
 		save_restart_state_per_proc(
@@ -1315,11 +1319,24 @@ def prepare_isdf_and_wavefunctions(
 				wfn, sym, meta, band_slices, mesh_xy,
 				psi_rmu_Y=rs.psi_rmu_Y, psi_rmuT_X=rs.psi_rmuT_X,
 				enk_full=rs.enk_full, print_fn=print0)
-			# Restart path doesn't yet round-trip the transverse
-			# Wfns through the restart file; bispinor restart will
-			# need a second psi_full_y dataset (per-channel).  Mark
-			# as not-yet-supported so consumers fail loud.
+			# Bispinor: rebuild the σ^B-side Wfns bundle from the
+			# round-tripped transverse-centroid ψ (psi_full_y_transverse).
+			# Sized via the same ``_transverse_meta`` the ζ-fit path used.
 			wfns_transverse = None
+			if cfg.bispinor and getattr(rs, 'psi_rmu_Y_transverse', None) is not None:
+				meta_curr_rs, _ = _transverse_meta(cfg, meta)
+				wfns_transverse = build_wavefunction_bundle(
+					wfn, sym, meta_curr_rs, band_slices, mesh_xy,
+					psi_rmu_Y=rs.psi_rmu_Y_transverse,
+					psi_rmuT_X=rs.psi_rmuT_X_transverse,
+					enk_full=rs.enk_full, print_fn=print0)
+				print0("  [bispinor] restart: σ^B Wfns rebuilt from "
+				       "psi_full_y_transverse")
+			elif cfg.bispinor:
+				print0("  [bispinor] WARNING: restart file predates the "
+				       "transverse round-trip (no psi_full_y_transverse "
+				       "dataset) → Σ^B will be SKIPPED.  Re-run without "
+				       "restart to regenerate the transverse ψ.")
 
 	return SimpleNamespace(
 		V_qmunu=V_qmunu,

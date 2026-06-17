@@ -16,6 +16,7 @@ def write_restart_state_to_h5(
     *,
     V_qmunu=None,
     psi_full_y=None,
+    psi_full_y_transverse=None,
     enk_full=None,
     S_qmunu=None,
     V0_noG0_munu=None,
@@ -69,6 +70,7 @@ def write_restart_state_to_h5(
         _write("V0_noG0_munu", V0_noG0_munu)
         _write("G0_mu_nu",     G0_mu_nu)
         _write("psi_full_y",   psi_full_y)
+        _write("psi_full_y_transverse", psi_full_y_transverse)
         _write("enk_full",     enk_full)
 
         # W0_qmunu: either write the real data or pre-allocate an
@@ -250,10 +252,31 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None):
     if enk_full is not None:
         enk_full = jax.lax.with_sharding_constraint(enk_full, replicated_2)
 
+    # Optional bispinor transverse-centroid ψ.  Round-tripped exactly like
+    # the charge psi above (same y3_psi_Y / x1_psi_X sharding objects) so the
+    # σ^B Wfns bundle can be rebuilt on restart.  Read out-of-band (the
+    # read_restart_state_from_h5 tuple is fixed); absent on pre-transverse
+    # restart files → both fields stay None and Σ^B is skipped downstream.
+    psi_rmu_Y_transverse = None
+    psi_rmuT_X_transverse = None
+    with h5py.File(filename, "r") as f:
+        psi_full_y_transverse_raw = (
+            jnp.asarray(f["psi_full_y_transverse"][:])
+            if "psi_full_y_transverse" in f else None)
+    if psi_full_y_transverse_raw is not None:
+        psi_rmu_Y_transverse = jax.lax.with_sharding_constraint(
+            psi_full_y_transverse_raw, y3_psi_Y)
+        psi_rmuT_X_transverse = jax.lax.with_sharding_constraint(
+            jnp.conj(psi_rmu_Y_transverse).transpose(0, 3, 1, 2),
+            x1_psi_X,
+        )
+
     return SimpleNamespace(
         V_qmunu=V_qmunu, S_qmunu=S_qmunu, V0_noG0_munu=V0_noG0_munu,
         G0_mu_nu=G0_mu_nu, enk_full=enk_full,
         psi_rmu_Y=psi_rmu_Y, psi_rmuT_X=psi_rmuT_X,
+        psi_rmu_Y_transverse=psi_rmu_Y_transverse,
+        psi_rmuT_X_transverse=psi_rmuT_X_transverse,
     )
 
 
