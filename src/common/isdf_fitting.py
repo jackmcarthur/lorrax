@@ -954,34 +954,34 @@ def _resolve_solver_kind_charge(mesh_xy: Mesh, override: str = "auto") -> str:
 
 
 def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto") -> str:
-    """Pick the transverse-channel ζ-fit solver: cuSolverMp distributed
-    getrf+getrs vs the in-tree per-q ``jnp.linalg.solve`` + ridge.
+    """Pick the transverse-channel ζ-fit solver.
 
-    Default policy (2026-05-12): mirrors the charge-channel resolver —
-    use cuSolverMp on **true 2D meshes** (px≥2 AND py≥2).  cuSolverMp
-    0.7.2 fixes the earlier 2D-grid getrf/getrs correctness bug
-    (validated end-to-end on MoS2 3×3 bispinor at 2×2 mesh; see
-    ``src/ffi/cusolvermp/cpp/batched_solve_lu_ffi.cc`` for history).
-
-    Tradeoff: small FFI setup overhead at MoS2 scale (n_rmu=656,
-    2×2 mesh).  At CrI3 6×6 80 Ry (n_rmu≈1800, 4×4 mesh) the cuSolverMp
-    path is the right tool.
+    Default is the in-tree per-q ``'lu'`` path, which for the transverse
+    γ̃^i channels uses a |λ|-truncated eigendecomposition pseudoinverse
+    (``_ridge_indef_solve``).  The transverse CCT is Hermitian **indefinite**
+    and the ill-conditioned TRS-paired near-null current modes must be
+    truncated by |eigenvalue| to keep the V_q tiles C3-covariant — a
+    +ridge cannot regularize an indefinite matrix (it shifts a small −λ
+    through zero → Σ^B blow-up).  The cuSolverMp ``getrf+getrs`` branch
+    uses exactly such a +ridge and is therefore NOT covariance-correct on
+    the transverse channel (CrI3 C3 Σ^B bug); it must be ported to the
+    PSD ``(LᴴL+δ²I)`` Cholesky-Tikhonov form before use.  Until then
+    ``auto`` routes transverse to the correct in-tree path; the transverse
+    block is small (≈3× fewer centroids than charge) so the per-q eigh is
+    cheap.  The large PSD **charge** CCT keeps its cuSolverMp Cholesky.
 
     Override via cohsex.in ``cusolvermp_lu``:
-      ``off`` → force per-q ``jnp.linalg.solve``.
-      ``on``  → force cuSolverMp (still falls back on 1D meshes).
-      ``auto`` (default) → cuSolverMp on true 2D, legacy otherwise.
+      ``off`` / ``auto`` → in-tree |λ|-truncated pseudoinverse (correct).
+      ``on``  → cuSolverMp getrf+getrs (NOT yet covariance-correct — opt-in
+                only for the LᴴL-Tikhonov port work).
     """
     px = int(mesh_xy.shape['x'])
     py = int(mesh_xy.shape['y'])
     is_2d = (px >= 2 and py >= 2)
 
-    if override == 'off':
-        return 'lu'
     if override == 'on':
         return 'cusolvermp_lu' if is_2d else 'lu'
-
-    return 'cusolvermp_lu' if is_2d else 'lu'
+    return 'lu'
 
 
 def _resolve_solver_kind(
@@ -1323,9 +1323,14 @@ def solve_zeta(
         if needs_padding:
             Z_q = jnp.pad(Z_q, ((0, 0), (0, 0), (0, n_zchunk_padded - n_zchunk)),
                           mode='constant')
-        # Per-q ridge ε·|tr(L)|/n_rmu — same lift as the legacy 'lu'
-        # branch, to keep TRS-paired near-zero modes above the LU
-        # stability floor without perturbing well-conditioned ones.
+        # Per-q ridge ε·|tr(L)|/n_rmu.  WARNING: a +ridge cannot regularize
+        # the Hermitian-INDEFINITE transverse CCT (shifts a small −λ through
+        # zero → Σ^B blow-up, empirically Σ^B_yy→−912 eV at ε=1e-4).  This
+        # distributed branch is therefore NOT covariance-correct on the
+        # transverse channel and must be ported to the ``(LᴴL+δ²I)``
+        # Cholesky-Tikhonov form (PSD, keeps cuSolverMp) before use; route
+        # transverse through the in-tree 'lu' |λ|-truncated pseudoinverse
+        # (``cusolvermp_lu=off``) until then.  ε kept tiny → inert.
         # ``cct_trace_per_q`` is precomputed once per channel by the
         # caller (fit_zeta_to_h5) — the trace doesn't change across
         # r-chunks since L_q is the per-channel CCT.  Computing it
@@ -1367,11 +1372,21 @@ def solve_zeta(
     # Hermitian indefinite, but JAX doesn't expose it; ``jnp.linalg.solve``
     # uses LU with partial pivoting which handles indefinite matrices
     # correctly as long as they aren't actually singular.  We keep a
-    # small ridge ``LU_RIDGE·trace/n_rmu`` on the diagonal to lift any
-    # near-zero modes from TRS-paired band cancellations safely above
-    # the LU stability floor — small enough not to perturb the
-    # well-conditioned modes.
+    # Legacy fixed ridge for the cuSolverMp-LU branch (large-transverse
+    # distributed path).  NOTE: a +ridge CANNOT regularize the Hermitian-
+    # INDEFINITE transverse CCT — it shifts a small −λ through zero and the
+    # solve blows up (empirically Σ^B_yy → −912 eV at ε=1e-4).  The in-tree
+    # 'lu' branch below instead uses a |λ|-based truncated pseudoinverse
+    # (correct for indefinite, cheap on the small transverse block).  Kept
+    # tiny here only so the distributed path stays numerically inert until
+    # ported to the (LᴴL+δ²I) Cholesky-Tikhonov form.
     LU_RIDGE = 1e-12
+    # Relative |λ| floor for the indefinite-CCT truncated pseudoinverse
+    # (``_ridge_indef_solve``).  Modes with |λ| < RCOND_INDEF·|λ|max are the
+    # ill-determined TRS-paired in-plane current directions (below the CCT's
+    # ~1e-4 covariance floor); dropping them (min-norm solution) consistently
+    # at every q keeps the V_q tiles C3-covariant.  Env-overridable.
+    RCOND_INDEF = float(os.environ.get('LORRAX_RCOND_INDEF', '1e-5'))
 
     # Cache key for solve function (includes q_chunk_size and padded size).
     # ``use_lu`` partitions the cache so the Cholesky and LU compiles
@@ -1380,17 +1395,27 @@ def solve_zeta(
                  n_zchunk_padded, q_chunk_size, bool(use_lu))
 
     def _ridge_indef_solve(L: jax.Array, Z: jax.Array) -> jax.Array:
-        """Solve (L + ε·tr(L)/n · I) · ζ = Z via pivoted LU.
+        """Min-norm solve of the Hermitian-INDEFINITE transverse CCT via a
+        relative-|λ| truncated-eigendecomposition pseudoinverse.
 
-        ε = ``LU_RIDGE`` (1e-12).  The shift sits well below any
-        physically meaningful eigenvalue but well above the partial-
-        pivoting floor, so LU stays stable on TRS-paired near-zero
-        modes without perturbing the rest of the spectrum.
+        A +ridge cannot regularize an indefinite matrix (it shifts a small
+        −λ through zero → blow-up).  Instead drop the ill-determined
+        near-null modes by *absolute eigenvalue*: |λ| < RCOND_INDEF·|λ|max.
+        These are the TRS-paired in-plane current directions below the
+        CCT's ~1e-4 covariance floor; a *relative* cutoff drops the SAME
+        physical subspace at every q (eigvecs at Sq are sym-images of those
+        at q ⇒ covariance-preserving), so the in-plane ζ̃ reconstruction is
+        q-consistent and the R⊗R IBZ unfold reproduces the full BZ (the
+        CrI3 C3 Σ^B bug; see ``reports/bispinor_tt_conditioning_2026-06-16``).
+        L is replicated here, so the per-q eigh is cheap — the transverse
+        block is small (≈3× fewer centroids than charge).
         """
-        n = L.shape[-1]
-        ridge = LU_RIDGE * jnp.abs(jnp.trace(L)) / n
-        L_reg = L + ridge * jnp.eye(n, dtype=L.dtype)
-        return jnp.linalg.solve(L_reg, Z)
+        w, V = jnp.linalg.eigh(L)                       # indefinite: real signed w
+        wmax = jnp.max(jnp.abs(w), axis=-1, keepdims=True)
+        winv = jnp.where(jnp.abs(w) >= RCOND_INDEF * wmax,
+                         1.0 / w, 0.0).astype(L.dtype)
+        VtZ = jnp.einsum('...ba,...br->...ar', jnp.conj(V), Z)   # V† Z
+        return jnp.einsum('...ca,...ar->...cr', V, winv[..., :, None] * VtZ)
 
     if cache_key not in _solve_cache:
         @partial(shard_map, mesh=mesh_xy,
