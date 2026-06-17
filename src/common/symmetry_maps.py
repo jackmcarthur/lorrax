@@ -559,6 +559,15 @@ def unfold_v_q_bispinor_lorentz(
          for a in (1, 2, 3)],
         axis=0,
     )                                                       # (3, 3, n_q, μ, ν)
+    # The jit declares explicit in_shardings P(None,None,None,'x','y'), so
+    # JAX won't auto-reshard a mismatched arg.  The bare G-flat tiles arrive
+    # P(None,'x','y') (→ stacked = P(None,None,None,'x','y'), matches), but
+    # the screened supermatrix-W tiles arrive fully replicated P() (small
+    # per-q blocks from the shard_map LU solve).  Constrain to the jit's
+    # input spec so both paths feed it correctly — a cheap local slice for
+    # the replicated screened case, a no-op for the already-sharded bare case.
+    V_in = jax.lax.with_sharding_constraint(
+        V_in, NamedSharding(mesh_xy, P(None, None, None, 'x', 'y')))
     V_out = fn(V_in)                                        # (3, 3, n_q, μ, ν)
     return {
         (i, j): jax.lax.with_sharding_constraint(V_out[i - 1, j - 1], V_sh)

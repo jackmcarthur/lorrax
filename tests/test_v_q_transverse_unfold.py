@@ -28,6 +28,7 @@ import pytest
 jax.config.update("jax_enable_x64", True)
 
 from gw.v_q_tile import _unfold_v_q_ij_ibz_to_full
+from common.symmetry_maps import unfold_v_q_bispinor_lorentz
 
 
 @pytest.fixture
@@ -133,6 +134,61 @@ def test_pi_over_two_z_rotation_mixes_xy_components(single_device_mesh):
         np.asarray(V_out[1]), V_ref,
         atol=1e-12, rtol=1e-12,
     )
+
+
+@pytest.mark.skipif(len(jax.devices()) < 4,
+                    reason="needs a ≥4-device 2×2 mesh to make P() vs "
+                           "P(None,'x','y') a real (crash-reproducing) distinction")
+def test_lorentz_unfold_accepts_replicated_screened_tiles():
+    """``unfold_v_q_bispinor_lorentz`` must accept BOTH input shardings.
+
+    Bare G-flat TT tiles arrive ``P(None,'x','y')``; screened supermatrix-W
+    tiles arrive fully replicated ``P()``.  The inner Lorentz-mix jit has
+    explicit ``in_shardings=P(None,None,None,'x','y')``, so the replicated
+    screened case crashed (ValueError, symmetry_maps.py:562) until the input
+    was constrained.  Verify both shardings unfold to the same hand-computed
+    ``Σ_ab R[a,i]R[b,j] V^{ab}`` reference.
+    """
+    mesh = Mesh(np.asarray(jax.devices()[:4]).reshape(2, 2),
+                axis_names=('x', 'y'))
+    n_q, n_rmu, n_sym = 6, 8, 3
+    rng = np.random.default_rng(0xB12)
+    tiles = {(i, j): jnp.asarray(
+                (rng.standard_normal((n_q, n_rmu, n_rmu))
+                 + 1j * rng.standard_normal((n_q, n_rmu, n_rmu))).astype(np.complex128))
+             for i in (1, 2, 3) for j in (1, 2, 3)}
+
+    def Rz(t):
+        c, s = np.cos(t), np.sin(t)
+        return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float64)
+    # (2·n_sym, 3, 3): spatial + TRS halves carry the same spatial R.
+    R_half = np.stack([np.eye(3), Rz(2*np.pi/3), Rz(4*np.pi/3)], axis=0)
+    R_tab = np.concatenate([R_half, R_half], axis=0)
+    sym_idx = np.array([0, 1, 2, 0, 1, 2], dtype=np.int32)
+
+    # Reference: V'^{ij}[q] = Σ_ab R[s(q),a,i] R[s(q),b,j] V^{ab}[q].
+    ref = {}
+    for i in (1, 2, 3):
+        for j in (1, 2, 3):
+            acc = np.zeros((n_q, n_rmu, n_rmu), complex)
+            for a in (1, 2, 3):
+                for b in (1, 2, 3):
+                    for q in range(n_q):
+                        R = R_tab[sym_idx[q]]
+                        acc[q] += R[a-1, i-1] * R[b-1, j-1] * np.asarray(tiles[(a, b)][q])
+            ref[(i, j)] = acc
+
+    def run(spec):
+        sh = NamedSharding(mesh, spec)
+        put = {k: jax.device_put(v, sh) for k, v in tiles.items()}
+        return unfold_v_q_bispinor_lorentz(
+            put, sym_idx=sym_idx, R_proper_table=R_tab, mesh_xy=mesh)
+
+    out_rep = run(P())                       # screened: replicated (used to crash)
+    out_shd = run(P(None, 'x', 'y'))         # bare: x,y-sharded
+    for k in ref:
+        np.testing.assert_allclose(np.asarray(out_rep[k]), ref[k], atol=1e-11)
+        np.testing.assert_allclose(np.asarray(out_shd[k]), ref[k], atol=1e-11)
 
 
 def test_padded_mu_pad_rows_are_passthrough(single_device_mesh):
