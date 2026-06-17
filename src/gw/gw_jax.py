@@ -199,12 +199,18 @@ def main(argv=None):
 	# Bispinor: bare transverse V^{i,j} tiles — Σ^B operand for x_only,
 	# overwritten with screened W^{i,j} below when do_screened.
 	w_ij_tiles = None
+	v_ij_tiles_bare = None
 	_TT_PAIRS = [(i, j) for i in (1, 2, 3) for j in (1, 2, 3)]
 	if config.bispinor:
 		from .v_q_bispinor import BispinorVqReader
 		with BispinorVqReader(bispinor_v_q_path, mesh_xy,
 		                      backend=config.backend.slab_io) as _r:
 			w_ij_tiles = {ij: _r.get_tile(*ij) for ij in _TT_PAIRS}
+		# Keep a handle on the BARE V^{ij} tiles before do_screened
+		# overwrites ``w_ij_tiles`` with screened W^{ij}.  Used to also
+		# evaluate the UNSCREENED Σ^B for the screened-vs-unscreened
+		# Breit comparison in the same run.
+		v_ij_tiles_bare = dict(w_ij_tiles)
 	if config.do_screened:
 		# IBZ cascade for W = (1 − v χ₀)⁻¹ v: slice V_q, χ₀_q to IBZ
 		# rows before ``solve_w`` so the per-q Cholesky/LU factor runs
@@ -448,11 +454,14 @@ def main(argv=None):
 			compute_bare_x=True,
 			wfns_transverse=wfns_transverse,
 			w_ij_tiles=w_ij_tiles,
+			v_ij_tiles=v_ij_tiles_bare,
 		)
 	sig_sx  = cohsex["sig_sx"]
 	sig_coh = cohsex["sig_coh"]
 	sig_h   = cohsex["sig_h"]
 	sig_x   = cohsex["sig_x"]
+	sig_x_b      = cohsex.get("sig_x_b")       # screened Σ^B (Breit), band-resolved
+	sig_x_b_bare = cohsex.get("sig_x_b_bare")  # unscreened Σ^B (Breit)
 
 	# Print bare Σ_X diagonal for ISDF quality assessment.  Apply BGW-style
 	# degenerate-set averaging (mirrors Sigma/shiftenergy.f90) unless
@@ -472,6 +481,34 @@ def main(argv=None):
 		)
 	print0(f"  Bare Σ_X diagonal (eV), k=0: "
 	       + "  ".join(f"{sig_x_diag[0, i]:.4f}" for i in range(min(8, sig_x_diag.shape[1]))))
+
+	# ---- Breit Σ_xc comparison: standard vs +Breit (screened / unscreened) ----
+	# Σ_xc(standard) = sigSX + sigCOH (charge channel).  The screened Σ^B uses
+	# the screened transverse W^{ij}; the unscreened one uses bare V^{ij}.  All
+	# band-resolved → breit_comparison.dat, with a k=0 summary to stdout.
+	if config.bispinor and sig_x_b is not None:
+		def _diag_ev(_a):
+			return np.real(np.diagonal(np.asarray(_a), axis1=1, axis2=2)) * RYD_TO_EV
+		_sx, _coh = _diag_ev(sig_sx), _diag_ev(sig_coh)
+		_std = _sx + _coh
+		_bscr = _diag_ev(sig_x_b)
+		_bbar = _diag_ev(sig_x_b_bare) if sig_x_b_bare is not None else np.zeros_like(_bscr)
+		if jax.process_index() == 0:
+			_p = os.path.join(input_dir, "breit_comparison.dat")
+			with open(_p, "w") as _f:
+				_f.write("# Breit Σ_xc comparison (eV).  std = sigSX + sigCOH (charge Σ_xc)\n")
+				_f.write("# screened = Σ^B from screened W^{ij}; unscr = Σ^B from bare V^{ij}\n")
+				_f.write("#  k    n     sigSX      sigCOH        std    SigB_scr   SigB_unscr   std+Bscr  std+Bunscr\n")
+				for _k in range(_std.shape[0]):
+					for _n in range(_std.shape[1]):
+						_f.write(f"{_k:4d} {_n:4d} {_sx[_k,_n]:11.5f} {_coh[_k,_n]:11.5f} "
+						         f"{_std[_k,_n]:11.5f} {_bscr[_k,_n]:11.6f} {_bbar[_k,_n]:11.6f} "
+						         f"{_std[_k,_n]+_bscr[_k,_n]:11.5f} {_std[_k,_n]+_bbar[_k,_n]:11.5f}\n")
+			print0(f"  Breit Σ_xc comparison written: {_p}")
+			print0("  k=0:  n |  Σ_xc std | +Breit_scr | +Breit_unscr | ΔB_scr(meV) | ΔB_unscr(meV)")
+			for _n in range(min(_std.shape[1], 20)):
+				print0(f"        {_n:2d} | {_std[0,_n]:9.4f} | {_std[0,_n]+_bscr[0,_n]:9.4f}  | "
+				       f"{_std[0,_n]+_bbar[0,_n]:9.4f}    | {1e3*_bscr[0,_n]:+8.2f}    | {1e3*_bbar[0,_n]:+8.2f}")
 
 	# ---- Mode-pivoted dispatch ----
 	# ``compute_mode`` is the single axis describing the self-energy ansatz
@@ -794,6 +831,12 @@ def main(argv=None):
 	else:
 		# Static modes (X_ONLY, COHSEX) and dynamic-streamed fallback.
 		sigma_total = sig_sx + sig_coh + sig_h
+		# Bispinor: fold the (screened) transverse Breit exchange Σ^B into
+		# the QP Σ_xc.  Without this the static-mode QP energies carry only
+		# the charge channel and silently drop the Breit term (which the
+		# dynamic/PPM path does include via sig_x).  α²-suppressed (~meV).
+		if sig_x_b is not None:
+			sigma_total = sigma_total + sig_x_b
 
 	# ---- BGW-style degenerate-set averaging at the H-build seam ----
 	# Mirrors Sigma/shiftenergy.f90; replaces the previous per-component

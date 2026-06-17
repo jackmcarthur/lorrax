@@ -159,6 +159,7 @@ def compute_cohsex_sigma(
     compute_bare_x: bool = True,
     wfns_transverse=None,
     w_ij_tiles=None,
+    v_ij_tiles=None,
 ) -> dict:
     """Evaluate static COHSEX self-energy components.
 
@@ -221,6 +222,8 @@ def compute_cohsex_sigma(
         sig_h.block_until_ready()
 
     sig_x = None
+    sig_x_b = None
+    sig_x_b_bare = None
     if compute_bare_x:
         with mesh_xy:
             sig_x = sigma_sx_k(wfns, Gij, V_q)
@@ -231,10 +234,15 @@ def compute_cohsex_sigma(
         sig_x = jax.lax.with_sharding_constraint(sig_x, rep)
         sig_x.block_until_ready()
 
-        # Bispinor bare exchange: add Σ^B (transverse-only sum over
-        # (i, j) ∈ {1, 2, 3}²) to sig_x.  No-op when ``wfns_transverse``
-        # or ``bispinor_v_q_path`` is missing.  See
-        # ``gw.sigma_x_bispinor`` and ``BISPINOR_DHFB_DESIGN.md`` §3.
+        # Bispinor transverse exchange Σ^B (sum over (i, j) ∈ {1, 2, 3}²).
+        # ``w_ij_tiles`` are the SCREENED W^{ij} on the do_screened path
+        # (bare V^{ij} on x_only).  ``v_ij_tiles``, when supplied, are the
+        # BARE V^{ij} — so we can also evaluate the UNSCREENED Σ^B in the
+        # same pass for the screened-vs-unscreened Breit comparison.  The
+        # screened Σ^B is folded into ``sig_x`` (and, downstream, the QP
+        # Σ_xc); the bare one is returned for diagnostics only.  No-op when
+        # ``wfns_transverse`` is missing.  See ``gw.sigma_x_bispinor`` and
+        # ``BISPINOR_DHFB_DESIGN.md`` §3.
         if wfns_transverse is not None and w_ij_tiles is not None:
             from .sigma_x_bispinor import compute_sigma_x_bispinor
             with mesh_xy:
@@ -246,12 +254,24 @@ def compute_cohsex_sigma(
                 )
             sig_x_b.block_until_ready()
             sig_x = sig_x + sig_x_b
+            if v_ij_tiles is not None:
+                with mesh_xy:
+                    sig_x_b_bare = compute_sigma_x_bispinor(
+                        wfns_transverse=wfns_transverse,
+                        Gij=Gij,
+                        w_tiles=v_ij_tiles,
+                        meta=meta, mesh_xy=mesh_xy,
+                        verbose=False,
+                    )
+                sig_x_b_bare.block_until_ready()
 
     return {
         "sig_sx":  sig_sx,
         "sig_coh": sig_coh,
         "sig_h":   sig_h,
         "sig_x":   sig_x,
+        "sig_x_b":      sig_x_b,       # screened Σ^B (None if not bispinor)
+        "sig_x_b_bare": sig_x_b_bare,  # unscreened Σ^B (None unless v_ij_tiles)
     }
 
 
