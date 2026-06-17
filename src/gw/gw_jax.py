@@ -509,6 +509,21 @@ def main(argv=None):
 			for _n in range(min(_std.shape[1], 20)):
 				print0(f"        {_n:2d} | {_std[0,_n]:9.4f} | {_std[0,_n]+_bscr[0,_n]:9.4f}  | "
 				       f"{_std[0,_n]+_bbar[0,_n]:9.4f}    | {1e3*_bscr[0,_n]:+8.2f}    | {1e3*_bbar[0,_n]:+8.2f}")
+			# Full Σ_mnk component matrices (off-diagonal included) for the
+			# self-consistent / basis-rotation analysis.  Each (nk, nb, nb)
+			# is tiny (~few MB); the diagonal alone (above) can't show the
+			# band mixing that QSGW's Hermitian Σ drives.
+			import h5py as _h5
+			_pc = os.path.join(input_dir, "sigma_components.h5")
+			with _h5.File(_pc, "w") as _hf:
+				_hf.create_dataset("sig_sx",       data=np.asarray(sig_sx))
+				_hf.create_dataset("sig_coh",      data=np.asarray(sig_coh))
+				_hf.create_dataset("sig_x_b",      data=np.asarray(sig_x_b))
+				if sig_x_b_bare is not None:
+					_hf.create_dataset("sig_x_b_bare", data=np.asarray(sig_x_b_bare))
+				_hf.attrs["units"] = "Rydberg; multiply by RYD_TO_EV for eV"
+				_hf.attrs["layout"] = "(nk, nb_sigma, nb_sigma); [k,m,n]"
+			print0(f"  Σ_mnk component matrices (full, off-diag) written: {_pc}")
 
 	# ---- Mode-pivoted dispatch ----
 	# ``compute_mode`` is the single axis describing the self-energy ansatz
