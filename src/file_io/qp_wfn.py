@@ -103,7 +103,7 @@ def write_qp_wfn_h5(
       * All other bands keep their DFT coefficients and DFT energies
         unchanged — the SC iteration only touched the active subspace.
 
-    The ``wfn`` argument is a :class:`~file_io.wfnreader.WFNReader` and
+    The ``wfn`` argument is a :class:`~file_io.wfn_loader.WfnLoader` and
     is reused as the ``crystal`` source for :class:`WFNWriter` (it
     exposes the same ``nspin``, ``nspinor``, ``nelec``, ``ecutwfc``,
     ``ecutrho``, ``fft_grid``, ``avec``, ``bdot``, … attributes the

@@ -22,7 +22,7 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 | `src/gw/head_correction.py` | q=0 head / wing correction | Head corrections |
 | `src/gw/vcoul.py`, `compute_vcoul.py`, `compute_vcoul_0d.py` | Coulomb potential (3D / 2D slab / 0D box) | Truncation, V_q build |
 | `src/gw/greens_function_kernel.py` | `build_G` occupied/all Green's function | G-matrix construction |
-| `src/gw/projection_kernel.py` | Σ_μν → Σ_ij band projection | Band-basis projection |
+| `src/gw/wavefunction_bundle.py` | `Wavefunctions` bundle + `project` / `project_ri` (Σ_μν → Σ_ij band projection) | Band-basis projection |
 | `src/gw/qsgw_utils.py` | QSGW fixed-point solver, Σ^xc I/O | Self-consistent GW |
 | `src/gw/kin_ion_io.py` | Kinetic + ionic Hamiltonian I/O | `kin_ion.h5` issues |
 | `src/common/isdf_fitting.py` | CCT/ZCT, pair-density kernels, zeta solve | Zeta fitting, pair density |
@@ -33,9 +33,8 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 | `src/common/symmetry_maps.py` | `SymMaps`: IBZ→full BZ unfolding, spinor rotations | Symmetry / k-point unfolding |
 | `src/common/minimax.py` | Minimax quadrature solvers | Quadrature node/weight issues |
 | `src/common/meta.py` | `Meta` system-parameters dataclass | k/q-grid, band ranges |
-| `src/common/phdf5_wfn_reader.py` | phdf5 (parallel HDF5) WFN reader | Async H5 reads |
+| `src/file_io/wfn_loader.py` | `WfnLoader`: canonical WFN.h5 reader; `backend='auto'` picks the phdf5 (parallel HDF5) async path | Wavefunction loading, async H5 reads |
 | `src/common/gpu_utils.py` | Host-side GPU memory detection | Chunk auto-sizing |
-| `src/file_io/wfnreader.py` | Canonical WFN.h5 reader (used by `gw_jax`) | Wavefunction loading |
 | `src/file_io/slab_io.py` | `SlabIO`: phdf5 writer wrapper for zeta_q / V_qmunu | Big HDF5 writes |
 | `src/file_io/sigma_output.py` | Σ output (eqp.dat, sigma.h5) | Output formats |
 | `src/ffi/` | XLA FFI bridge: `cusolvermp`, `cusolvermg`, `phdf5`, `slate` | Native-library entry points |

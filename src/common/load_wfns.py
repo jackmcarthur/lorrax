@@ -328,7 +328,7 @@ def load_centroids_band_chunked(
             When set, processes k-points in batches to control the size
             of the FFT box array (the dominant memory bottleneck).
         use_phdf5: If True, pull G-space wavefunctions through
-            :class:`common.phdf5_wfn_reader.PhdfWfnReader` (parallel HDF5
+            :class:`file_io.wfn_loader.WfnLoader` (parallel HDF5
             FFI + on-device symmetry unfold).  Default False keeps the
             legacy ``WFNReader`` + ``read_Gvecs_to_devices`` path so
             existing callers are unaffected.  The phdf5 path opens the

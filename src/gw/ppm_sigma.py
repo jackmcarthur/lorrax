@@ -425,7 +425,7 @@ def _project_tau_onto_omega(
 def _make_project_ri_reduce_scatter(mesh_xy: Mesh) -> Callable[..., jax.Array]:
     """Build a shard_map'd ψ* σ ψ that reduce-scatters the output.
 
-    Drop-in replacement for ``projection_kernel.project_ri`` at the tail of
+    Drop-in replacement for ``wavefunction_bundle.project_ri`` at the tail of
     ``_sigma_kij_kernel``.  Preserves the math exactly:
 
         Σ_mn(k) = Σ_{s, μ} Σ_{s', μ'}  ψ*_m(k, s, μ) · σ(k, s, μ, s', μ')

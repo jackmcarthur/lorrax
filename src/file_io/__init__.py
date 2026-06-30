@@ -1,7 +1,7 @@
 """I/O module for reading and writing various file formats.
 
 This module contains:
-- wfnreader: Reading BerkeleyGW WFN.h5 wavefunction files
+- wfn_loader: Reading BerkeleyGW WFN.h5 wavefunction files
 - wfn_writer: Writing BGW-compatible WFN.h5 from LORRAX NSCF
 - qe_save_reader: Reading QE .save directories (crystal + charge density)
 - epsreader: Reading epsilon/eps0mat.h5 dielectric files

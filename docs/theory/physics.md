@@ -2,7 +2,7 @@
 
 **Consolidates**: `isdf_context.md`, `isdf_spin_galerkin_derivation.md`, `ZETA_FITTING_ALGORITHM.md`, `cohsex_jax_physics.md`. The detailed ζ + V_q algorithm/sharding doc that previously occupied §11 has been split out to [`ZETA_V_Q_ALGORITHMS.md`](isdf-zeta-vq.md); the symmetry conventions and unfold procedures (IBZ tables, `mtrx`/τ actions, `unfold_psi`, `unfold_v_q`, `compute_centroid_sym_perm`) now live in [`SYMMETRY_COMPREHENSIVE.md`](symmetry.md); the memory model (per-stage formulas, G-flat planner, AOT chooser) is in [`MEMORY_MODEL.md`](../architecture/memory-model.md).
 
-**Status (2026-05-15)**: describes the current implementation in `src/common/isdf_fitting.py` (zeta pipeline), `src/gw/gw_jax.py` (driver), `src/gw/w_isdf.py` (χ₀ + W), `src/gw/ppm_sigma.py` (GN-PPM Σ^c(ω)), `src/gw/head_correction.py` (q→0 head), and `src/gw/greens_function_kernel.py` + `src/gw/projection_kernel.py` (leaf kernels). All physics arrays use the flat-k / flat-q convention (`(nk_tot, …)`); 3-D k-grid layout only appears inside `common/fft_helpers.py`. The detailed ζ + V_q algorithms, sharding map, and IBZ cascade are in [`ZETA_V_Q_ALGORITHMS.md`](isdf-zeta-vq.md); §11 below is now a short pointer with the bispinor / G-flat quick-reference table preserved as an at-a-glance summary.
+**Status (2026-05-15)**: describes the current implementation in `src/common/isdf_fitting.py` (zeta pipeline), `src/gw/gw_jax.py` (driver), `src/gw/w_isdf.py` (χ₀ + W), `src/gw/ppm_sigma.py` (GN-PPM Σ^c(ω)), `src/gw/head_correction.py` (q→0 head), and `src/gw/greens_function_kernel.py` + `src/gw/wavefunction_bundle.py` (leaf kernels). All physics arrays use the flat-k / flat-q convention (`(nk_tot, …)`); 3-D k-grid layout only appears inside `common/fft_helpers.py`. The detailed ζ + V_q algorithms, sharding map, and IBZ cascade are in [`ZETA_V_Q_ALGORITHMS.md`](isdf-zeta-vq.md); §11 below is now a short pointer with the bispinor / G-flat quick-reference table preserved as an at-a-glance summary.
 
 ---
 
@@ -584,7 +584,7 @@ temp = einsum('kiaμ, kaμbν -> kibν', ψ.conj(), Σ)  # (k, i, b, ν)
 **Implementation**:
 - Static kernels: `sigma_sx` / `sigma_coh` / `hartree` in `gw/gw_jax.py` (local `@jax.jit` closures that wrap `build_G` + `_convolve` + `project`).
 - `build_G`: `gw/greens_function_kernel.py` — unified builder for `G_ii^{occ}`, `G^{all}`, and phased `G(τ)`.
-- `project` / `project_ri`: `gw/projection_kernel.py` — the static path uses `project`; the GN-PPM σ^τ path uses a `shard_map`'d reduce-scatter variant (`_make_project_ri_reduce_scatter` in `gw/ppm_sigma.py`) that lands the output `(m_X, n_Y)`-sharded so downstream coeff·σ multiplies stay local.
+- `project` / `project_ri`: `gw/wavefunction_bundle.py` — the static path uses `project`; the GN-PPM σ^τ path uses a `shard_map`'d reduce-scatter variant (`_make_project_ri_reduce_scatter` in `gw/ppm_sigma.py`) that lands the output `(m_X, n_Y)`-sharded so downstream coeff·σ multiplies stay local.
 
 **Important frequency-dependent caveat**: for the windowed GN-PPM $\Sigma^c(\omega)$ pipeline, the per-window `Re`/`Im` projection must be taken before band projection. In general,
 
@@ -794,12 +794,11 @@ Everything runs on a single 2-D mesh `Mesh(devices, ('x', 'y'))` built in `gw_ja
 | `gw/minimax_screening.py` | Window construction + shipped-table lookup + PPM fit |
 | `gw/minimax_config.py` | `MinimaxConfig`, `SigmaQuadratureConfig` |
 | `gw/greens_function_kernel.py` | `build_G` unified Green's-function builder |
-| `gw/projection_kernel.py` | `project`, `project_ri` band-basis contractions |
 | `gw/head_correction.py` | q→0 head sample + exact static head terms |
 | `gw/vcoul.py`, `gw/compute_vcoul.py`, `gw/compute_vcoul_0d.py` | Coulomb kernel + V_q build |
 | `gw/qsgw_utils.py` | Diagonal Σ fixed-point + QSGW Σ^xc |
 | `gw/scissor.py` | Valence/conduction scissor extrapolation |
-| `gw/wavefunction_bundle.py` | `BandSlices`, `Wavefunctions` (4 sharded ψ copies) |
+| `gw/wavefunction_bundle.py` | `BandSlices`, `Wavefunctions` (4 sharded ψ copies); `project`, `project_ri` band-basis contractions |
 | `common/isdf_fitting.py` | CCT/ZCT kernels, Cholesky, ζ solve, full pipeline |
 | `common/cholesky_2d.py` | 2D blocked Cholesky |
 | `common/fft_helpers.py` | Flat-k ↔ 3-D FFT helpers (custom_partitioning) |

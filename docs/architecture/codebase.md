@@ -33,9 +33,8 @@ src/
 │   ├── w_isdf.py              χ₀ minimax kernel + W Dyson solve (flat-q)
 │   ├── ppm_sigma.py           GN-PPM build + Σ^c(ω) branch/window/τ pipeline
 │   ├── greens_function_kernel.py  build_G (single entry point)
-│   ├── projection_kernel.py   project, project_ri (band-space contractions)
 │   ├── head_correction.py     q→0 head sample + exact static head terms
-│   ├── wavefunction_bundle.py BandSlices + Wavefunctions (4 sharded ψ copies)
+│   ├── wavefunction_bundle.py BandSlices + Wavefunctions (4 sharded ψ copies); project, project_ri (band-space contractions)
 │   ├── vcoul.py               v(q+G), MC q=0 averages, 2D/3D/0D truncation
 │   ├── compute_vcoul.py       V_qμν from ζ (μ-chunked FFT + H5 prefetch)
 │   ├── compute_vcoul_0d.py    box-truncated Coulomb (molecules)
@@ -54,14 +53,11 @@ src/
 │   ├── chi_from_dipole.py     S(ω) tensor from dipole matrix elements
 │   ├── gamma_matrices.py      Pauli / bispinor helpers
 │   ├── bispinor_init.py       spinor → bispinor lift
-│   ├── phdf5_wfn_reader.py    parallel-HDF5 WFN reader (async)
 │   ├── jax_compile_cache.py   XLA persistent cache activator
 │   ├── jax_profile.py         annotation / trace_section context mgrs
 │   ├── gpu_utils.py           device-memory budget probes
 │   ├── progress.py            LoopProgress (rank-0 progress bar)
 │   ├── timing.py              named sections, aggregate report
-│   ├── wfnreader.py           host-side WFN.h5 reader (legacy / BSE)
-│   ├── epsreader.py           host-side EPS reader (legacy)
 │   ├── minimax.py             Laplace + imag-ω minimax solvers
 │   ├── minimax_assets/        shipped quadrature tables (npz + catalog.json)
 │   ├── slate_* / cusolvermp_eigh_test / cusolvermg_eigh_test
@@ -69,7 +65,7 @@ src/
 │   └── phdf5_*                phdf5 benchmarks + plumbing tests
 │
 ├── file_io/              # Canonical file-format I/O (used by gw_jax)
-│   ├── wfnreader.py           WFNReader (gw_jax's canonical reader)
+│   ├── wfn_loader.py          WfnLoader (gw_jax's canonical reader; WFNReader alias)
 │   ├── wfn_writer.py          BGW-compatible WFN.h5 writer
 │   ├── epsreader.py           EPSReader (eps0mat / epsmat)
 │   ├── qe_save_reader.py      CrystalData from QE .save
@@ -100,7 +96,7 @@ src/
 ├── centroid/             # ISDF centroid selection
 │   ├── kmeans_cli.py          CLI entrypoint: `python -m centroid.kmeans_cli`
 │   ├── kmeans_isdf.py         k-means algorithm (k-means++ init, charge-weighted)
-│   ├── get_charge_density.py  ρ(r) build for centroid weights
+│   ├── charge_density.py      ρ(r) build for centroid weights (get_charge_density)
 │   └── pivoted_cholesky.py    Cholesky-pruned candidate list
 │
 ├── psp/                  # Pseudopotentials + DFT operators
@@ -183,9 +179,9 @@ Built via `build_wavefunctions(psi_l_yr, psi_r_yr, ...)` or `build_wavefunctions
 
 Accessors: `wfns.xn(s.val)`, `wfns.xr(s.sigma)`, etc.
 
-### 2.4 `WFNReader` — `src/file_io/wfnreader.py`
+### 2.4 `WfnLoader` — `src/file_io/wfn_loader.py`
 
-Reads BerkeleyGW `WFN.h5`. Per-k raw reads return IBZ data without unfolding — all symmetry unfolding lives in `SymMaps`. Also has `band_norms` for pseudobands normalization. `src/common/wfnreader.py` is a legacy copy still used by BSE and some benchmarks; the GW driver uses the `file_io` one.
+Reads BerkeleyGW `WFN.h5`. Per-k raw reads return IBZ data without unfolding — all symmetry unfolding lives in `SymMaps`. `backend='auto'` (default) picks the eager or phdf5 (parallel HDF5) path. The legacy `WFNReader` / `PhdfWfnReader` readers (formerly in both `common/` and `file_io/`) were consolidated into this single class; `WFNReader` remains as a back-compat alias (`from file_io import WfnLoader as WFNReader`) used by the GW driver, BSE, and benchmarks.
 
 ### 2.5 `SymMaps` — `src/common/symmetry_maps.py`
 
@@ -530,7 +526,7 @@ main                                       [gw/gw_jax.py]
  ├─ sigma_sx / sigma_coh / hartree          [gw/gw_jax.py]
  │   ├─ build_G                              [gw/greens_function_kernel.py]
  │   ├─ _convolve (G·W/√Nk via IFFT/FFT)     [gw/gw_jax.py]
- │   └─ project                              [gw/projection_kernel.py]
+ │   └─ project                              [gw/wavefunction_bundle.py]
  └─ _compute_static_head                     [gw/gw_jax.py]
      └─ head_correction.resolve_head_sample  [gw/head_correction.py]
          ├─ EPSReader.epshead                [file_io/epsreader.py]
@@ -590,7 +586,7 @@ main                                       [gw/gw_jax.py]
 | **Minimax / sigma quad config** | `gw/minimax_config.py : MinimaxConfig`, `SigmaQuadratureConfig` |
 | **Build `Meta`** | `common/meta.py : Meta.from_system` |
 | **Build wavefunction bundle** | `gw/wavefunction_bundle.py : build_wavefunctions_from_full` |
-| **Load WFN.h5** | `file_io/wfnreader.py : WFNReader`; band-chunked FFT `common/load_wfns.py : load_centroids_band_chunked` |
+| **Load WFN.h5** | `file_io/wfn_loader.py : WfnLoader`; band-chunked FFT `common/load_wfns.py : load_centroids_band_chunked` |
 | **Symmetry unfolding** | `common/symmetry_maps.py : SymMaps.get_cnk_fullzone[_batch]` |
 | **Flat-k FFT helpers** | `common/fft_helpers.py : make_flat_k_fftn`, `make_flat_k_ifftn` |
 | **Pair density (spin-traced)** | `common/isdf_fitting.py : compute_pair_density_spin_traced` |
@@ -606,7 +602,7 @@ main                                       [gw/gw_jax.py]
 | **W Dyson solve** | `gw/w_isdf.py : solve_w`, `_get_w_solve_fn` |
 | **Static minimax lookup** | `gw/minimax_screening.py : build_static_minimax_window_pair` |
 | **Build G** | `gw/greens_function_kernel.py : build_G` |
-| **Σ band projection** | `gw/projection_kernel.py : project`, `project_ri` |
+| **Σ band projection** | `gw/wavefunction_bundle.py : project`, `project_ri` |
 | **Reduce-scatter projection** | `gw/ppm_sigma.py : _make_project_ri_reduce_scatter` |
 | **Static Σ_SX / Σ_COH / V_H** | `gw/gw_jax.py : sigma_sx`, `sigma_coh`, `hartree` |
 | **q→0 head resolution** | `gw/head_correction.py : resolve_head_sample` |

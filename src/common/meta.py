@@ -110,7 +110,7 @@ class Meta:
         # Both readers handle pad-past-file:
         #   - ``read_Gvecs_to_devices`` (legacy path): pre-zeroed buffer
         #     + capped iteration drop bands past wfn.nbands.
-        #   - ``phdf5_wfn_reader.coeffs_gspace`` (phdf5 path): bulk FFI
+        #   - ``WfnLoader.coeffs_gspace`` (phdf5 path): bulk FFI
         #     read up to the largest world-aligned slice within the
         #     file, then a small replicated tail via h5py + a pure-zero
         #     pad for slots past wfn.nbands.
