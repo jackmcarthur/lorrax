@@ -15,7 +15,7 @@
 #     - shifter --module=mpich bind-mounts Cray MPICH (libmpi.so.12)
 #     - phdf5 stage: copy of cray-hdf5-parallel (1.12, libmpi_gnu_*.so.12)
 #     - default LORRAX_FFI_PHDF5_DIR:
-#         /pscratch/sd/$USER/lorrax_phdf5_cray/stage
+#         $HOME/software/lorrax_phdf5_cray/stage
 #     - srun --mpi=pmi2
 #     - Perf (1 node / 4 GPUs / 4.29 GB C128): 3.79 GB/s, +24% over
 #       openmpi; at MoS2 3×3 scale within noise of openmpi.
@@ -26,7 +26,7 @@
 #     - container's HPC-X OpenMPI at /opt/hpcx/ompi satisfies libmpi.so.40
 #     - phdf5 stage: conda-forge HDF5 1.14 linked against openmpi
 #     - default LORRAX_FFI_PHDF5_DIR:
-#         /pscratch/sd/$USER/lorrax_phdf5_openmpi/stage
+#         $HOME/software/lorrax_phdf5_openmpi/stage
 #     - srun --mpi=pmix
 #     - Kept as fallback for non-Cray clusters.
 #

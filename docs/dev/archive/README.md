@@ -18,15 +18,15 @@ This folder contains older documentation that has been **superseded** by the com
 For up-to-date information, see:
 
 ### Primary Guides
-- **Physics/theory**: [`../PHYSICS_COMPREHENSIVE.md`](../PHYSICS_COMPREHENSIVE.md)
-- **Codebase structure**: [`../CODEBASE_COMPREHENSIVE.md`](../CODEBASE_COMPREHENSIVE.md)
-- **Environment setup**: [`../ENVIRONMENT_COMPREHENSIVE.md`](../ENVIRONMENT_COMPREHENSIVE.md)
+- **Physics/theory**: [`physics.md`](../../theory/physics.md)
+- **Codebase structure**: [`codebase.md`](../../architecture/codebase.md)
+- **Environment setup**: [`ENVIRONMENT_COMPREHENSIVE.md`](../../ENVIRONMENT_COMPREHENSIVE.md)
 
 ### Specialized Topics
-- **Memory model**: [`../MEMORY_MODEL.md`](../MEMORY_MODEL.md)
-- **CTSP quadrature / minimax**: [`../MINIMAX_QUADRATURE.md`](../MINIMAX_QUADRATURE.md)
+- **Memory model**: [`memory-model.md`](../../architecture/memory-model.md)
+- **CTSP quadrature / minimax**: [`minimax-quadrature.md`](../../theory/minimax-quadrature.md)
 
 ### Other Resources
-- **Advanced topics**: [`../advanced/`](../advanced/)
-- **Reference papers**: [`../references/`](../references/)
-- **Agent suggestions**: [`../AGENT_TODO.md`](../AGENT_TODO.md)
+- **Advanced topics**: [`advanced_README_legacy.md`](../notes/advanced_README_legacy.md)
+- **Reference papers**: [`misc/references/`](misc/references/)
+- **Agent suggestions**: [`AGENT_TODO.md`](../notes/AGENT_TODO.md)

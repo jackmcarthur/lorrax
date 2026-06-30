@@ -470,7 +470,7 @@ XlaRuntimeError: RESOURCE_EXHAUSTED: Out of memory
 1. Confirm `memory_per_device_gb` in `cohsex.in` matches GPU (28 on A100, 6 on RTX 5070).
 2. Reduce `chunk_bands` / `chunk_q` (or unset and let `gw_init.compute_optimal_chunks` auto-size).
 3. Inspect bottleneck: `common.gpu_utils.get_device_memory_info()` at a checkpoint, or `jax.local_devices()[0].memory_stats()`.
-4. Check `MEMORY_MODEL.md` for per-stage formulas.
+4. Check `architecture/memory-model.md` for per-stage formulas.
 
 ### 8.3 cuSOLVERMp `status=7` or NCCL "unhandled cuda error"
 
@@ -521,4 +521,4 @@ Canonical xprof triage: [`reports/ppm_sigma_profiling_2026-04-05/XPROF_TRACE_GUI
 - Memory model: [`MEMORY_MODEL.md`](architecture/memory-model.md)
 - Perlmutter cluster detail: [`../config/README.md`](../config/README.md)
 - FFI internals: [`../src/ffi/AGENTS.md`](../src/ffi/AGENTS.md)
-- Agent TODOs: [`AGENT_TODO.md`](dev/notes/AGENT_TODO.md)
+- Agent TODOs: see developer notes under `docs/dev/notes/AGENT_TODO.md`

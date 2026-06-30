@@ -20,5 +20,5 @@ This folder contains markdown conversions of reference papers and detailed mathe
 ## Primary Documentation
 
 For actual implementation and usage, see:
-- **Physics/theory**: [`../PHYSICS_COMPREHENSIVE.md`](../PHYSICS_COMPREHENSIVE.md)
-- **CTSP implementation**: [`../MINIMAX_QUADRATURE.md`](../MINIMAX_QUADRATURE.md)
+- **Physics/theory**: [`physics.md`](../../../../theory/physics.md)
+- **CTSP implementation**: [`minimax-quadrature.md`](../../../../theory/minimax-quadrature.md)

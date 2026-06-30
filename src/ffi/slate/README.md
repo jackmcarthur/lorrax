@@ -143,7 +143,7 @@ of scope; cuSOLVERMp is the answer if you need rectangular meshes.
 - `cpp/context.cc`      — `lrx_slate_{context,subrow_context}_create/destroy/init_mpi`.
 - `cpp/{eigh,potrf,trsm}_ffi.cc` — XLA FFI handlers per op.
 - `cpp/batched_{potrf,trsm}_ffi.cc` — batched variants (sub-row comm).
-- `scripts/stage_cray.sh` — populate `$SCRATCH/lorrax_slate_cray/stage`
+- `scripts/stage_cray.sh` — populate `$HOME/software/lorrax_slate_cray/stage`
   with libsci + libmpi_gtl_cuda + xpmem + lustreapi (run once per
   module update).
 

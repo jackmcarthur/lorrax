@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-: "${LORRAX_FFI_SLATE_DIR:=/pscratch/sd/${USER:0:1}/${USER}/lorrax_slate_cray/stage}"
+: "${LORRAX_FFI_SLATE_DIR:=$HOME/software/lorrax_slate_cray/stage}"
 
 mkdir -p "${LORRAX_FFI_SLATE_DIR}/lib"
 

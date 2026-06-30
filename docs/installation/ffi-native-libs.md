@@ -97,7 +97,8 @@ cmake --build build -j
 
 For an OpenMPI / non-Cray build, `build.sh` accepts `LORRAX_FFI_ALLOW_DEFAULT_MPI=1` so it
 does not hard-require the Cray-MPICH env vars; set `LORRAX_PHDF5_MPI_STACK=openmpi`
-accordingly. The build-time and runtime MPI stacks **must match** — a mismatch surfaces as
+accordingly (this variable is consumed by the build pipeline — run_shifter.sh / CMake — not
+by `build.sh` itself). The build-time and runtime MPI stacks **must match** — a mismatch surfaces as
 a runtime SONAME error / segfault, not a clean message.
 
 ## See also
