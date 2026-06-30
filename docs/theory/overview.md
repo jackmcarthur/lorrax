@@ -1,6 +1,6 @@
 ## ISDF + GW Formalism (COHSEX focus)
 
-This page summarizes the working equations used in this codebase. It is a condensed, renderable version of the notes in docs/misc/isdf_context.md.
+This page summarizes the working equations used in this codebase. It is a condensed, renderable version of the notes in docs/dev/archive/isdf_context.md.
 
 ### Wavefunctions and notation
 
@@ -51,7 +51,7 @@ then project back to band space Sigma_kij by contracting with psi. Screened exch
 - Wavefunction FFTs are performed once per window, then reduced to psi(r_mu)
 - q-loops materialize only the minimal data needed (zeta for one q at a time)
 
-For implementation details, see `src/gw_isdf/gw_jax.py` and `src/gw_isdf/w_isdf.py`.
+For implementation details, see `src/gw/gw_jax.py` and `src/gw/w_isdf.py`.
 
 
 
@@ -59,8 +59,8 @@ For implementation details, see `src/gw_isdf/gw_jax.py` and `src/gw_isdf/w_isdf.
 To do self consistent updates, we need to iterate the V_hartree and Sigma_GW contributions to the self energy until the wavefunctions remain unchanged.
 
 The DFT hamiltonian is K (kinetic E) + I (ionic local + nonlocal E) + H (hartree E) + Vxc.
-We use isdf.psp.kin_ion_io to write the K+I elements to file so we can update V_hartree+Sigma_GW ourselves.
+We use gw.kin_ion_io to write the K+I elements to file so we can update V_hartree+Sigma_GW ourselves.
 
-We also use the output of the interpolation-point finding code (kmeans clustering step weighted by the charge density) and the dipole matrix elements from isdf.psp.get_dipole_mtxels to calculate the "head correction" to the screened interaction W. Theoretically these should probably all be done on startup of cohsex_jax but they are all kind of slow (like 10+ seconds each) and we shouldn't do that until they have been profiled and highly optimized with JAX for performance.
+We also use the output of the interpolation-point finding code (kmeans clustering step weighted by the charge density) and the dipole matrix elements from psp.get_dipole_mtxels to calculate the "head correction" to the screened interaction W. Theoretically these should probably all be done on startup of gw.gw_jax but they are all kind of slow (like 10+ seconds each) and we shouldn't do that until they have been profiled and highly optimized with JAX for performance.
 
 The self consistent iterations right now are untested (alpha only, not converging well).

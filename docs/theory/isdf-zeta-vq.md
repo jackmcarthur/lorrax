@@ -7,7 +7,7 @@ IBZ cascade (ζ written for IBZ q's, V_q computed at IBZ q's, full BZ
 recovered post-loop by `unfold_v_q`).
 
 It replaces and extends the previous §11 of
-`PHYSICS_COMPREHENSIVE.md`. Companion to §3–5 (historical r-space
+`physics.md`. Companion to §3–5 (historical r-space
 ζ-on-disk) and to §7 (sharding summary). The math in §3–5 is still
 valid pointwise; the algorithm / sharding / I/O layer documented below
 has wholly replaced its r-space sibling for the GW driver path.
@@ -1099,8 +1099,8 @@ per rank at `chunk_size=64`.
 
 | Doc | Focus |
 |---|---|
-| §3–5, §7 of `PHYSICS_COMPREHENSIVE.md` | Historical r-space ζ-on-disk path; sharding map |
-| `MEMORY_MODEL.md` | Per-stage memory formulas + chunk-size selection rules |
+| §3–5, §7 of `physics.md` | Historical r-space ζ-on-disk path; sharding map |
+| `architecture/memory-model.md` | Per-stage memory formulas + chunk-size selection rules |
 | `reports/zeta_v_q_g_flat_reference_2026-05-12/report.md` | Living engineering reference: donations, shardings, chunker envs, CrI3 validation log |
 | `reports/zeta_rchunk_memory_model_2026-05-13/PATH_D_PICKUP.md` | Zero-replicated-intermediates principle; scan-INSIDE-shard_map context |
 | `reports/zeta_rchunk_memory_model_2026-05-13/round{5,6,8}_*.md` | Round 5 plan, Round 6 HLO audit, Round 8 unified-FFT design |

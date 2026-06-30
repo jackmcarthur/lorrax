@@ -635,6 +635,6 @@ main                                       [gw/gw_jax.py]
 - Memory model: [`MEMORY_MODEL.md`](memory-model.md)
 - Environment / Perlmutter: [`ENVIRONMENT_COMPREHENSIVE.md`](../ENVIRONMENT_COMPREHENSIVE.md), [`../config/README.md`](../../config/README.md)
 - FFI internals: [`../src/ffi/AGENTS.md`](../../src/ffi/AGENTS.md)
-- GN-PPM Σ details: [`GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md`](../dev/notes/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md)
-- Current BGW-vs-LORRAX status: [`SIGMA_FREQ_AUDIT_STATUS.md`](../dev/progress/SIGMA_FREQ_AUDIT_STATUS.md)
-- Agent todos: [`AGENT_TODO.md`](../dev/notes/AGENT_TODO.md)
+- GN-PPM Σ details: see developer notes under `docs/dev/notes/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md`
+- Current BGW-vs-LORRAX status: see developer notes under `docs/dev/progress/SIGMA_FREQ_AUDIT_STATUS.md`
+- Agent todos: see developer notes under `docs/dev/notes/AGENT_TODO.md`

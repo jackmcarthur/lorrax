@@ -1,6 +1,6 @@
 # Interpolative Separable Density Fitting: Theory and Implementation
 
-**Consolidates**: `formalism.md`, `isdf_context.md`, `isdf_spin_galerkin_derivation.md`, `ZETA_FITTING_ALGORITHM.md`, `cohsex_jax_physics.md`. The detailed ζ + V_q algorithm/sharding doc that previously occupied §11 has been split out to [`ZETA_V_Q_ALGORITHMS.md`](isdf-zeta-vq.md); the symmetry conventions and unfold procedures (IBZ tables, `mtrx`/τ actions, `unfold_psi`, `unfold_v_q`, `compute_centroid_sym_perm`) now live in [`SYMMETRY_COMPREHENSIVE.md`](symmetry.md); the memory model (per-stage formulas, G-flat planner, AOT chooser) is in [`MEMORY_MODEL.md`](../architecture/memory-model.md).
+**Consolidates**: `isdf_context.md`, `isdf_spin_galerkin_derivation.md`, `ZETA_FITTING_ALGORITHM.md`, `cohsex_jax_physics.md`. The detailed ζ + V_q algorithm/sharding doc that previously occupied §11 has been split out to [`ZETA_V_Q_ALGORITHMS.md`](isdf-zeta-vq.md); the symmetry conventions and unfold procedures (IBZ tables, `mtrx`/τ actions, `unfold_psi`, `unfold_v_q`, `compute_centroid_sym_perm`) now live in [`SYMMETRY_COMPREHENSIVE.md`](symmetry.md); the memory model (per-stage formulas, G-flat planner, AOT chooser) is in [`MEMORY_MODEL.md`](../architecture/memory-model.md).
 
 **Status (2026-05-15)**: describes the current implementation in `src/common/isdf_fitting.py` (zeta pipeline), `src/gw/gw_jax.py` (driver), `src/gw/w_isdf.py` (χ₀ + W), `src/gw/ppm_sigma.py` (GN-PPM Σ^c(ω)), `src/gw/head_correction.py` (q→0 head), and `src/gw/greens_function_kernel.py` + `src/gw/projection_kernel.py` (leaf kernels). All physics arrays use the flat-k / flat-q convention (`(nk_tot, …)`); 3-D k-grid layout only appears inside `common/fft_helpers.py`. The detailed ζ + V_q algorithms, sharding map, and IBZ cascade are in [`ZETA_V_Q_ALGORITHMS.md`](isdf-zeta-vq.md); §11 below is now a short pointer with the bispinor / G-flat quick-reference table preserved as an at-a-glance summary.
 
@@ -396,7 +396,7 @@ $$B_q \leq \frac{M_{\text{budget}} - M_{\text{base}} - 2 \times M_{Z_{\text{col}
 
 **Automatic sizing**: Function `compute_optimal_chunks()` in `gw/gw_init.py` solves this constraint system analytically, iteratively reducing chunk sizes until all stages fit, using `common.gpu_utils.get_device_memory_info()` to probe the per-device budget.
 
-**See**: `docs/MEMORY_MODEL.md` for detailed formulas and bottleneck arrays.
+**See**: `docs/architecture/memory-model.md` for detailed formulas and bottleneck arrays.
 
 ### 5.4 Key Sharding Techniques
 
@@ -493,7 +493,7 @@ $$\chi^0_{\ell m} = -\frac{2\gamma}{\sqrt{N_k} \, n_{\text{spin}} n_{\text{spino
 
 **Implementation**: `compute_chi0_minimax()` in `gw/w_isdf.py`. The cached `_get_chi_minimax_kernel()` (flat-k, compiled once per mesh × kgrid) builds $G^v(\tau)$ and $G^c(\tau)$ via `greens_function_kernel.build_G` with Laplace phases, IFFTs each to R-space using `make_flat_k_ifftn` (see §7.2 below for the swapped μ/ν ↔ 'x'/'y' assignment that keeps the output naturally sharded), contracts `einsum('Rambn,Rbnam->Rmn')`, accumulates `χ_R` over τ nodes in a donated fori-loop, and FFTs back to q. The outer `compute_chi0()` (`gw/w_isdf.py`) pulls the τ nodes and minimax weights from a `LaplaceMinimaxQuadrature` built by `common.minimax` (or loaded from `src/common/minimax_assets/` when `regenerate_minimax_tables = false`).
 
-**Reference**: Kim, Martyna & Ismail-Beigi, PRB 101, 035139 (2020). Full derivation in `docs/MINIMAX_QUADRATURE.md`. Windowing strategy in `docs/NEW_WINDOW_MINIMAX_GUIDELINES.md`.
+**Reference**: Kim, Martyna & Ismail-Beigi, PRB 101, 035139 (2020). Full derivation in `docs/theory/minimax-quadrature.md`. Windowing strategy in `docs/dev/notes/NEW_WINDOW_MINIMAX_GUIDELINES.md`.
 
 ### 6.4 Screened Interaction (Dyson Equation)
 
@@ -677,7 +677,7 @@ For a given branch the τ integrand decomposes into three regimes of the combine
 2. **Crossing stripe**: $E_A + \Omega \approx \omega$ — resonance. Uses a phase-minimax (HGL / `solve_phase_minimax_bandwidth`) quadrature and stores only $\text{Im}[\text{coeff} \cdot \sigma^\tau]$ (see `_combine_coeff_with_sigma_tau`, `project_code = "imag"`).
 3. **Tail slab**: $E_A + \Omega \ll \omega$ — wide energy bandwidth, covered by a second Laplace minimax with a tighter target error.
 
-`_build_three_sigma_windows` (host-side) builds the three `_SigmaWindow` specs per +ω branch; val and −ω branches use `_build_single_sigma_window`. See [`GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md`](../dev/notes/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md) for the full derivation of the window edges and error model.
+`_build_three_sigma_windows` (host-side) builds the three `_SigmaWindow` specs per +ω branch; val and −ω branches use `_build_single_sigma_window`. See the developer notes under `docs/dev/notes/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md` for the full derivation of the window edges and error model.
 
 #### 6.9.3 Per-τ kernel
 
@@ -821,9 +821,9 @@ Everything runs on a single 2-D mesh `Mesh(devices, ('x', 'y'))` built in `gw_ja
 | [`CODEBASE_COMPREHENSIVE.md`](../architecture/codebase.md) | Module map, call hierarchy, file formats |
 | [`MEMORY_MODEL.md`](../architecture/memory-model.md) | Per-stage memory formulas, G-flat planner, AOT chooser, bottleneck arrays |
 | [`MINIMAX_QUADRATURE.md`](minimax-quadrature.md) | CTSP theory, quadrature derivations |
-| [`GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md`](../dev/notes/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md) | GN-PPM Σ^c(ω) window derivations |
-| [`NEW_WINDOW_MINIMAX_GUIDELINES.md`](../dev/notes/NEW_WINDOW_MINIMAX_GUIDELINES.md) | Minimax window placement rules |
-| [`SIGMA_FREQ_AUDIT_STATUS.md`](../dev/progress/SIGMA_FREQ_AUDIT_STATUS.md) | Current BGW-vs-LORRAX comparison status |
+| `docs/dev/notes/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md` (developer notes) | GN-PPM Σ^c(ω) window derivations |
+| `docs/dev/notes/NEW_WINDOW_MINIMAX_GUIDELINES.md` (developer notes) | Minimax window placement rules |
+| `docs/dev/progress/SIGMA_FREQ_AUDIT_STATUS.md` (developer notes) | Current BGW-vs-LORRAX comparison status |
 
 ---
 

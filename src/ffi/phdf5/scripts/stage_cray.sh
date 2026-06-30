@@ -28,7 +28,7 @@
 
 set -euo pipefail
 
-: "${LORRAX_FFI_PHDF5_DIR:=/pscratch/sd/${USER:0:1}/${USER}/lorrax_phdf5_cray/stage}"
+: "${LORRAX_FFI_PHDF5_DIR:=$HOME/software/lorrax_phdf5_cray/stage}"
 
 # The cray-hdf5-parallel module's install root.  If env sets HDF5_DIR
 # (from `module load cray-hdf5-parallel`), prefer that.  Otherwise fall
