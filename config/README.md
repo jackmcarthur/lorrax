@@ -39,7 +39,7 @@ export SLURM_JOBID=<jobid>
 lxpre cohsex.in 640
 #   [1/3] python3 -m centroid.kmeans_cli 640 --seed 42  -> centroids_frac_640.txt
 #   [2/3] python3 -m psp.get_dipole_mtxels -i cohsex.in -> dipole.h5
-#   [3/3] python3 -m gw.kin_ion_io_chunked -i cohsex.in -> kin_ion.h5
+#   [3/3] python3 -m gw.kin_ion_io -i cohsex.in -> kin_ion.h5
 
 # GW calculation (4 GPUs, default)
 lxrun python3 -u -m gw.gw_jax -i cohsex.in

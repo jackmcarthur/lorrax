@@ -35,7 +35,7 @@ lxrun python3 -u -m gw.gw_jax -i cohsex.in   # 4-GPU GW
 
 1. `python3 -m centroid.kmeans_cli <N> --seed 42` → `centroids_frac_<N>.txt`
 2. `python3 -m psp.get_dipole_mtxels -i <in>` → `dipole.h5`
-3. `python3 -m gw.kin_ion_io_chunked -i <in>` → `kin_ion.h5`
+3. `python3 -m gw.kin_ion_io -i <in>` → `kin_ion.h5`
 
 ## Native FFI stack on Perlmutter
 
