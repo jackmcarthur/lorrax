@@ -1,54 +1,49 @@
-## LORRAX: Low-scaling Real-space Real-Axis eXcited state package
+# LORRAX
 
-LORRAX implements an efficient GW workflow accelerated by Interpolative Separable Density Fitting (ISDF). The main GW driver is called GWJAX (`gw.gw_jax`). It reads plane-wave DFT wavefunctions (WFN.h5) and computes quasiparticle corrections via static COHSEX or GN-PPM (Godby-Needs Generalized Plasmon Pole) frequency dependence.
+**LO**w-scaling **R**eal-space **R**eal-**A**xis e**X**cited state package — a JAX
+multi-GPU/CPU implementation of an $O(N^3)$-scaling GW formalism, accelerated by
+Interpolative Separable Density Fitting (ISDF) and real-frequency-axis integration.
+The main GW driver is **GWJAX** (`gw.gw_jax`): it reads BerkeleyGW-format plane-wave
+DFT wavefunctions (`WFN.h5`) and computes quasiparticle corrections via static COHSEX
+or GN-PPM (Godby–Needs Generalized Plasmon Pole) frequency dependence.
 
 - **Input**: DFT wavefunctions on a plane-wave grid, symmetry maps, and k-point sampling
-- **Core idea**: Replace dense charge-density products with a compact ISDF basis defined by centroids r_mu
-- **Outcome**: Exchange and screened-exchange self-energy matrix elements and band-edge corrections
+- **Core idea**: replace dense charge-density products with a compact ISDF basis defined by centroids $r_\mu$
+- **Outcome**: exchange and screened-exchange self-energy matrix elements and band-edge corrections
 
-### High-level pipeline
+## Try it in 60 seconds
 
-1. Charge density from selected bands → choose ISDF points r_mu via k-means/CVT
-2. Read wavefunctions cnk(G), FFT to real space psi_nk(r)
-3. For each q, construct zeta_q,mu(r) by solving C_q zeta_q = Z_q using least-squares
-4. Compute V_q,mu,nu from zeta_q,mu in G-space with the Coulomb kernel v_q(G)
-5. Build Green’s function G and (optionally) chi0 and screened interaction W
-6. Form sigma_X/SX/COH and project to band representation Sigma_kij
-
-See the theory references in [`PHYSICS_COMPREHENSIVE.md`](PHYSICS_COMPREHENSIVE.md). For a runnable worked example, see the bundled regression fixture under `tests/regression/cohsex_debug/`.
-
-### API reference
-
-The API reference is rendered by mkdocstrings as part of the documentation site. Build it with:
+The fastest way to confirm LORRAX works on your machine — runs a complete static-COHSEX
+calculation end-to-end on a fresh clone with **no GPU and no native (FFI) build**
+(the bundled fixture sets `use_ffi_io = false` and ships its own wavefunction):
 
 ```bash
-uv run mkdocs build      # writes the static site to site/
-uv run mkdocs serve      # live-reload preview at http://127.0.0.1:8000
+uv sync
+uv run python -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in
 ```
 
-### Key modules
+See the [Quickstart](quickstart.md) for the worked example, and
+[Installation](installation/index.md) for the GPU / distributed / from-source tracks.
 
-- `src/gw/gw_jax.py`: COHSEX driver (JAX, sharded)
-- `src/gw/w_isdf.py`: static screening and chi0 helpers
-- `src/centroid/kmeans_cli.py`: centroid-selection CLI (algorithm in `kmeans_isdf.py` next to it)
-- `src/common/load_wfns.py`: wavefunction loading + band-chunked FFT
+## High-level pipeline
 
-### Frequency-Integration Docs
+1. Charge density from selected bands → choose ISDF points $r_\mu$ via k-means/CVT
+2. Read wavefunctions $c_{nk}(G)$, FFT to real space $\psi_{nk}(r)$
+3. For each $q$, construct $\zeta_{q,\mu}(r)$ by solving $C_q \zeta_q = Z_q$ by least-squares
+4. Compute $V_{q,\mu,\nu}$ from $\zeta_{q,\mu}$ in G-space with the Coulomb kernel $v_q(G)$
+5. Build the Green's function $G$ and (optionally) $\chi_0$ and screened interaction $W$
+6. Form $\Sigma_{X/SX/COH}$ and project to the band representation $\Sigma_{kij}$
 
-- `docs/MINIMAX_QUADRATURE.md`: GL/HGL theory, minimax solver methods, and CTSP derivations
-- `docs/FREQ_INTEGRATION_REWRITE_PLAN.md`: rewrite blueprint for a unified chi/sigma frequency-integration engine
+## Documentation map
 
-### Getting started
+- **[Installation](installation/index.md)** — support matrix and the three install tracks
+- **[Quickstart](quickstart.md)** — the bundled fixture, run end-to-end
+- **Theory** — [overview](theory/overview.md), [physics](theory/physics.md),
+  [ISDF / zeta–V(q)](theory/isdf-zeta-vq.md),
+  [minimax quadrature](theory/minimax-quadrature.md), [symmetry](theory/symmetry.md)
+- **Architecture** — [codebase](architecture/codebase.md),
+  [memory model](architecture/memory-model.md), [multi-host](architecture/multihost.md)
 
-1. Create the environment (uv recommended) and run tests
-2. Provide WFN.h5 and centroids
-3. Run the COHSEX driver
-
-See the root README for full instructions.
-
-### Quick runs
-
-- Regression fixture:
-  - `python -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in`
-- Console entry point:
-  - `gw_jax -i tests/regression/cohsex_debug/cohsex_test.in`
+Developer notes, plans, progress logs, and the frozen archive live under `docs/dev/`
+(outside this rendered site). Contributors and coding agents should also read
+`AGENTS.md` in the repository root for the module map and coding standards.

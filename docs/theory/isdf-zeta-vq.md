@@ -126,7 +126,7 @@ else fall back to full-BZ).
 
 `reports/zeta_v_q_g_flat_reference_2026-05-12/report.md §5` is the
 living quantitative reference. Recap of the four workspaces that
-contest the per-rank HBM budget. See [`MEMORY_MODEL.md`](MEMORY_MODEL.md)
+contest the per-rank HBM budget. See [`MEMORY_MODEL.md`](../architecture/memory-model.md)
 for the full chunk-size selection rules.
 
 ### 11.2.1 ψ G-space slab cache (host RAM, replicated per process)
@@ -923,7 +923,7 @@ Python-unrolled bc loop).
 
 ## 11.8 Memory model — brief
 
-See [`MEMORY_MODEL.md`](MEMORY_MODEL.md) for the full per-stage
+See [`MEMORY_MODEL.md`](../architecture/memory-model.md) for the full per-stage
 formulas and chunk-size derivation.
 
 **Persistent pool** (fixed at problem-setup time):

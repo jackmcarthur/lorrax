@@ -49,12 +49,12 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 
 | Doc | What it covers |
 |-----|---------------|
-| `docs/PHYSICS_COMPREHENSIVE.md` | ISDF theory, GW equations, COHSEX, CTSP formalism |
-| `docs/CODEBASE_COMPREHENSIVE.md` | Module map, data flow, key classes, sharding patterns |
-| `docs/MEMORY_MODEL.md` | Per-stage memory formulas, chunk sizing, bottleneck arrays |
-| `docs/MINIMAX_QUADRATURE.md` | GL/HGL quadrature, error scaling, crossing windows |
-| `docs/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md` | PPM sigma pipeline: phases, windows, evaluation loop |
-| `docs/SIGMA_FREQ_AUDIT_STATUS.md` | Current BGW vs GWJAX comparison status, known offsets |
+| `docs/theory/physics.md` | ISDF theory, GW equations, COHSEX, CTSP formalism |
+| `docs/architecture/codebase.md` | Module map, data flow, key classes, sharding patterns |
+| `docs/architecture/memory-model.md` | Per-stage memory formulas, chunk sizing, bottleneck arrays |
+| `docs/theory/minimax-quadrature.md` | GL/HGL quadrature, error scaling, crossing windows |
+| `docs/dev/notes/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md` | PPM sigma pipeline: phases, windows, evaluation loop |
+| `docs/dev/progress/SIGMA_FREQ_AUDIT_STATUS.md` | Current BGW vs GWJAX comparison status, known offsets |
 
 ## How to run
 

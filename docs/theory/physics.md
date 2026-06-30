@@ -1,8 +1,8 @@
 # Interpolative Separable Density Fitting: Theory and Implementation
 
-**Consolidates**: `formalism.md`, `isdf_context.md`, `isdf_spin_galerkin_derivation.md`, `ZETA_FITTING_ALGORITHM.md`, `cohsex_jax_physics.md`. The detailed ζ + V_q algorithm/sharding doc that previously occupied §11 has been split out to [`ZETA_V_Q_ALGORITHMS.md`](ZETA_V_Q_ALGORITHMS.md); the symmetry conventions and unfold procedures (IBZ tables, `mtrx`/τ actions, `unfold_psi`, `unfold_v_q`, `compute_centroid_sym_perm`) now live in [`SYMMETRY_COMPREHENSIVE.md`](SYMMETRY_COMPREHENSIVE.md); the memory model (per-stage formulas, G-flat planner, AOT chooser) is in [`MEMORY_MODEL.md`](MEMORY_MODEL.md).
+**Consolidates**: `formalism.md`, `isdf_context.md`, `isdf_spin_galerkin_derivation.md`, `ZETA_FITTING_ALGORITHM.md`, `cohsex_jax_physics.md`. The detailed ζ + V_q algorithm/sharding doc that previously occupied §11 has been split out to [`ZETA_V_Q_ALGORITHMS.md`](isdf-zeta-vq.md); the symmetry conventions and unfold procedures (IBZ tables, `mtrx`/τ actions, `unfold_psi`, `unfold_v_q`, `compute_centroid_sym_perm`) now live in [`SYMMETRY_COMPREHENSIVE.md`](symmetry.md); the memory model (per-stage formulas, G-flat planner, AOT chooser) is in [`MEMORY_MODEL.md`](../architecture/memory-model.md).
 
-**Status (2026-05-15)**: describes the current implementation in `src/common/isdf_fitting.py` (zeta pipeline), `src/gw/gw_jax.py` (driver), `src/gw/w_isdf.py` (χ₀ + W), `src/gw/ppm_sigma.py` (GN-PPM Σ^c(ω)), `src/gw/head_correction.py` (q→0 head), and `src/gw/greens_function_kernel.py` + `src/gw/projection_kernel.py` (leaf kernels). All physics arrays use the flat-k / flat-q convention (`(nk_tot, …)`); 3-D k-grid layout only appears inside `common/fft_helpers.py`. The detailed ζ + V_q algorithms, sharding map, and IBZ cascade are in [`ZETA_V_Q_ALGORITHMS.md`](ZETA_V_Q_ALGORITHMS.md); §11 below is now a short pointer with the bispinor / G-flat quick-reference table preserved as an at-a-glance summary.
+**Status (2026-05-15)**: describes the current implementation in `src/common/isdf_fitting.py` (zeta pipeline), `src/gw/gw_jax.py` (driver), `src/gw/w_isdf.py` (χ₀ + W), `src/gw/ppm_sigma.py` (GN-PPM Σ^c(ω)), `src/gw/head_correction.py` (q→0 head), and `src/gw/greens_function_kernel.py` + `src/gw/projection_kernel.py` (leaf kernels). All physics arrays use the flat-k / flat-q convention (`(nk_tot, …)`); 3-D k-grid layout only appears inside `common/fft_helpers.py`. The detailed ζ + V_q algorithms, sharding map, and IBZ cascade are in [`ZETA_V_Q_ALGORITHMS.md`](isdf-zeta-vq.md); §11 below is now a short pointer with the bispinor / G-flat quick-reference table preserved as an at-a-glance summary.
 
 ---
 
@@ -21,12 +21,12 @@ ISDF reduces GW computational cost by approximating pair-product densities with 
 > ~`ntran` disk reduction). Per-r-chunk FFT-and-accumulate replaces the
 > per-r-chunk on-disk write. The detailed math, shardings, communication
 > and code references for the current pipeline now live in
-> [`ZETA_V_Q_ALGORITHMS.md`](ZETA_V_Q_ALGORITHMS.md); the BGW symmetry
+> [`ZETA_V_Q_ALGORITHMS.md`](isdf-zeta-vq.md); the BGW symmetry
 > convention and the IBZ → full-BZ unfolds (`unfold_psi`, `unfold_v_q`,
 > centroid permutation tables) live in
-> [`SYMMETRY_COMPREHENSIVE.md`](SYMMETRY_COMPREHENSIVE.md); per-stage
+> [`SYMMETRY_COMPREHENSIVE.md`](symmetry.md); per-stage
 > memory formulas and the G-flat planner are in
-> [`MEMORY_MODEL.md`](MEMORY_MODEL.md). §3–5 here remain accurate for
+> [`MEMORY_MODEL.md`](../architecture/memory-model.md). §3–5 here remain accurate for
 > the conceptual / scalar / r-space narrative; §11 below is a pointer
 > stub with a quick-reference table.
 
@@ -677,7 +677,7 @@ For a given branch the τ integrand decomposes into three regimes of the combine
 2. **Crossing stripe**: $E_A + \Omega \approx \omega$ — resonance. Uses a phase-minimax (HGL / `solve_phase_minimax_bandwidth`) quadrature and stores only $\text{Im}[\text{coeff} \cdot \sigma^\tau]$ (see `_combine_coeff_with_sigma_tau`, `project_code = "imag"`).
 3. **Tail slab**: $E_A + \Omega \ll \omega$ — wide energy bandwidth, covered by a second Laplace minimax with a tighter target error.
 
-`_build_three_sigma_windows` (host-side) builds the three `_SigmaWindow` specs per +ω branch; val and −ω branches use `_build_single_sigma_window`. See [`GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md`](GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md) for the full derivation of the window edges and error model.
+`_build_three_sigma_windows` (host-side) builds the three `_SigmaWindow` specs per +ω branch; val and −ω branches use `_build_single_sigma_window`. See [`GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md`](../dev/notes/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md) for the full derivation of the window edges and error model.
 
 #### 6.9.3 Per-τ kernel
 
@@ -804,7 +804,7 @@ Everything runs on a single 2-D mesh `Mesh(devices, ('x', 'y'))` built in `gw_ja
 | `common/cholesky_2d.py` | 2D blocked Cholesky |
 | `common/fft_helpers.py` | Flat-k ↔ 3-D FFT helpers (custom_partitioning) |
 | `common/meta.py` | `Meta` system dataclass |
-| `common/symmetry_maps.py` | IBZ → full BZ unfolding, spinor rotations (TRS-augmented `SymMaps`; see [`SYMMETRY_COMPREHENSIVE.md`](SYMMETRY_COMPREHENSIVE.md) for the BGW `mtrx` / τ convention and the `unfold_psi` / `unfold_v_q` / `compute_centroid_sym_perm` procedures) |
+| `common/symmetry_maps.py` | IBZ → full BZ unfolding, spinor rotations (TRS-augmented `SymMaps`; see [`SYMMETRY_COMPREHENSIVE.md`](symmetry.md) for the BGW `mtrx` / τ convention and the `unfold_psi` / `unfold_v_q` / `compute_centroid_sym_perm` procedures) |
 | `common/minimax.py`, `common/minimax_assets/` | Quadrature solvers + shipped tables |
 | `common/chi_from_dipole.py` | $S_{\alpha\beta}(\omega)$ from dipole mtxels |
 | `file_io/slab_io.py` | `SlabIO` — phdf5 writer (FFI + allgather backends) |
@@ -816,14 +816,14 @@ Everything runs on a single 2-D mesh `Mesh(devices, ('x', 'y'))` built in `gw_ja
 | Doc | Focus |
 |-----|-------|
 | **This file** | Theory + implementation + sharding map. §3–5 is the scalar / r-space narrative; §11 is a short pointer + quick-reference for the current G-flat ζ + bispinor V_q pipeline |
-| [`ZETA_V_Q_ALGORITHMS.md`](ZETA_V_Q_ALGORITHMS.md) | **Current source of truth** for the rank-5 open-spin pair density, scan-INSIDE-shard_map r-chunk loop, G-flat on-disk ζ̃, per-q G-chunked V_q kernel, IBZ cascade, and bispinor Lorentz-tile sectorization |
-| [`SYMMETRY_COMPREHENSIVE.md`](SYMMETRY_COMPREHENSIVE.md) | BGW `mtrx`/τ conventions, `SymMaps`/TRS-augmented table, `unfold_psi`, `compute_centroid_sym_perm`, `unfold_v_q`, symmorphic failure modes, sym-vs-nosym recipe |
-| [`CODEBASE_COMPREHENSIVE.md`](CODEBASE_COMPREHENSIVE.md) | Module map, call hierarchy, file formats |
-| [`MEMORY_MODEL.md`](MEMORY_MODEL.md) | Per-stage memory formulas, G-flat planner, AOT chooser, bottleneck arrays |
-| [`MINIMAX_QUADRATURE.md`](MINIMAX_QUADRATURE.md) | CTSP theory, quadrature derivations |
-| [`GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md`](GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md) | GN-PPM Σ^c(ω) window derivations |
-| [`NEW_WINDOW_MINIMAX_GUIDELINES.md`](NEW_WINDOW_MINIMAX_GUIDELINES.md) | Minimax window placement rules |
-| [`SIGMA_FREQ_AUDIT_STATUS.md`](SIGMA_FREQ_AUDIT_STATUS.md) | Current BGW-vs-LORRAX comparison status |
+| [`ZETA_V_Q_ALGORITHMS.md`](isdf-zeta-vq.md) | **Current source of truth** for the rank-5 open-spin pair density, scan-INSIDE-shard_map r-chunk loop, G-flat on-disk ζ̃, per-q G-chunked V_q kernel, IBZ cascade, and bispinor Lorentz-tile sectorization |
+| [`SYMMETRY_COMPREHENSIVE.md`](symmetry.md) | BGW `mtrx`/τ conventions, `SymMaps`/TRS-augmented table, `unfold_psi`, `compute_centroid_sym_perm`, `unfold_v_q`, symmorphic failure modes, sym-vs-nosym recipe |
+| [`CODEBASE_COMPREHENSIVE.md`](../architecture/codebase.md) | Module map, call hierarchy, file formats |
+| [`MEMORY_MODEL.md`](../architecture/memory-model.md) | Per-stage memory formulas, G-flat planner, AOT chooser, bottleneck arrays |
+| [`MINIMAX_QUADRATURE.md`](minimax-quadrature.md) | CTSP theory, quadrature derivations |
+| [`GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md`](../dev/notes/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md) | GN-PPM Σ^c(ω) window derivations |
+| [`NEW_WINDOW_MINIMAX_GUIDELINES.md`](../dev/notes/NEW_WINDOW_MINIMAX_GUIDELINES.md) | Minimax window placement rules |
+| [`SIGMA_FREQ_AUDIT_STATUS.md`](../dev/progress/SIGMA_FREQ_AUDIT_STATUS.md) | Current BGW-vs-LORRAX comparison status |
 
 ---
 
@@ -883,9 +883,9 @@ See the `lorrax_sandbox` superproject `skills/execute_workflow/SKILL.md` for the
 >
 > | Topic | Document |
 > |---|---|
-> | Pair-density rank-5 construction, CCT/ZCT/Gram on the full BZ, L_q solve dispatch (Cholesky vs pivoted-LU + ridge), r-chunk loop, G-flat accumulator, per-q V_q kernel with G-chunking, async-prefetch status, bispinor tile sectorization, end-to-end shardings and donations | [`ZETA_V_Q_ALGORITHMS.md`](ZETA_V_Q_ALGORITHMS.md) |
-> | BGW `mtrx`/τ conventions, `SymMaps` and the TRS-augmented index table, `unfold_psi`, `compute_centroid_sym_perm` and the L-wrap, `unfold_v_q` (scalar / pure-permute and TT off-diagonal Cartesian mixing), symmorphic failure modes, sym-vs-nosym recipe, verified gates | [`SYMMETRY_COMPREHENSIVE.md`](SYMMETRY_COMPREHENSIVE.md) |
-> | Per-stage HBM footprints, G-flat planner (`plan_gflat_chunks`), heuristic legacy chooser, AOT NNLS chooser, binding-peak diagnostics, accumulator-FFT-box transient | [`MEMORY_MODEL.md`](MEMORY_MODEL.md) |
+> | Pair-density rank-5 construction, CCT/ZCT/Gram on the full BZ, L_q solve dispatch (Cholesky vs pivoted-LU + ridge), r-chunk loop, G-flat accumulator, per-q V_q kernel with G-chunking, async-prefetch status, bispinor tile sectorization, end-to-end shardings and donations | [`ZETA_V_Q_ALGORITHMS.md`](isdf-zeta-vq.md) |
+> | BGW `mtrx`/τ conventions, `SymMaps` and the TRS-augmented index table, `unfold_psi`, `compute_centroid_sym_perm` and the L-wrap, `unfold_v_q` (scalar / pure-permute and TT off-diagonal Cartesian mixing), symmorphic failure modes, sym-vs-nosym recipe, verified gates | [`SYMMETRY_COMPREHENSIVE.md`](symmetry.md) |
+> | Per-stage HBM footprints, G-flat planner (`plan_gflat_chunks`), heuristic legacy chooser, AOT NNLS chooser, binding-peak diagnostics, accumulator-FFT-box transient | [`MEMORY_MODEL.md`](../architecture/memory-model.md) |
 >
 > §3–5 above remain the conceptual / scalar / r-space narrative; §7
 > remains the sharding map (static-Σ pipeline); §8 remains the file
@@ -918,9 +918,9 @@ Lorentz indices for TT-off. The 21× combined disk-size reduction
 (r → G-sphere ≈ 2×, full-BZ → IBZ q-axis up to `ntran`) lands all of
 MoS2 3×3 / CrI3 3×3 / CrI3 6×6 80 Ry on within-budget zeta caches.
 The full math, sharding, donation, and code-pointer detail is in
-[`ZETA_V_Q_ALGORITHMS.md`](ZETA_V_Q_ALGORITHMS.md); the ζ/V_q
+[`ZETA_V_Q_ALGORITHMS.md`](isdf-zeta-vq.md); the ζ/V_q
 symmetry transformation derivations and unfold implementation choices
-are in [`SYMMETRY_COMPREHENSIVE.md`](SYMMETRY_COMPREHENSIVE.md).
+are in [`SYMMETRY_COMPREHENSIVE.md`](symmetry.md).
 
 ### 11.2 Quick reference (bispinor / G-flat)
 
@@ -942,10 +942,10 @@ are in [`SYMMETRY_COMPREHENSIVE.md`](SYMMETRY_COMPREHENSIVE.md).
 | V_q scalar unfold (charge) | `V_full[q,μ',ν'] = exp(2π i q_irr·(L_{s,μ'}−L_{s,ν'})) · V_irr[i(q), α_s(μ'), α_s(ν')]` with `α = sym_perm`, `L = L_table` (forward source-map; user-spec inverse form). |
 | V_q TT-off unfold (transverse, R_cart mixing) | `V_{Sq}^{ij}(α_s μ, α_s ν) = exp(2π i q_irr·(L_{s,μ}−L_{s,ν})) · Σ_{ab} R^{ia}(S) R^{jb}(S) V_q^{ab}(μ,ν)` |
 
-See [`ZETA_V_Q_ALGORITHMS.md`](ZETA_V_Q_ALGORITHMS.md) for the
+See [`ZETA_V_Q_ALGORITHMS.md`](isdf-zeta-vq.md) for the
 derivations behind each line, the source-of-truth `file.py:line`
 citations, and the per-array sharding specs; see
-[`SYMMETRY_COMPREHENSIVE.md`](SYMMETRY_COMPREHENSIVE.md) for the BGW
+[`SYMMETRY_COMPREHENSIVE.md`](symmetry.md) for the BGW
 `mtrx`/τ conventions that fix the meaning of `π_s`, `R(S)`, and the
 TRS-augmented index used by `unfold_v_q`.
 

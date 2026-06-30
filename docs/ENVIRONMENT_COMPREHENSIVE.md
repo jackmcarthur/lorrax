@@ -1,6 +1,6 @@
 # Environment Setup & Configuration
 
-Dependencies, installation, JAX configuration, cluster usage, and troubleshooting. Read this for build and deployment issues. For code structure see [`CODEBASE_COMPREHENSIVE.md`](CODEBASE_COMPREHENSIVE.md). For Perlmutter specifically, [`config/README.md`](../config/README.md) is authoritative — this file summarises and cross-references.
+Dependencies, installation, JAX configuration, cluster usage, and troubleshooting. Read this for build and deployment issues. For code structure see [`CODEBASE_COMPREHENSIVE.md`](architecture/codebase.md). For Perlmutter specifically, [`config/README.md`](../config/README.md) is authoritative — this file summarises and cross-references.
 
 ---
 
@@ -26,8 +26,8 @@ Authoritative source: [`pyproject.toml`](../pyproject.toml). No docker images, n
 | Package | Version | Purpose |
 |---|---|---|
 | **Python** | ≥3.12 | Language runtime |
-| **jax[cuda13]** | ≥0.9.0 | Array ops, autodiff, GPU acceleration |
-| **jaxlib** | ≥0.9.0 | JAX backend |
+| **jax[cuda12]** | ≥0.5.3,<0.6 | Array ops, autodiff, GPU acceleration (matches the container + CUDA-12.9 FFI) |
+| **jaxlib** | ≥0.5.3,<0.6 | JAX backend |
 | **numpy** | ≥2.3.1 | Arrays, host-side I/O |
 | **scipy** | ≥1.16.0 | Linear algebra, FFTs (host) |
 | **h5py** | ≥3.14.0 | HDF5 I/O (host path) |
@@ -42,8 +42,8 @@ Declared under `[dependency-groups]` in `pyproject.toml`:
 | Group | Contents | When |
 |---|---|---|
 | `dev` | flake8, pytest | Everywhere |
-| `jax` | Explicit `jax[cuda13]` + jaxlib pin | If uv resolves without extras |
-| `build` | cmake, ninja, pybind11, nanobind, scikit-build-core | Building the FFI C++ shared object `liblorrax_ffi.so` (§5) |
+| `jax` | Explicit `jax[cuda12]` + jaxlib pin | If uv resolves without extras |
+| `build` | cmake, ninja, nanobind, scikit-build-core | Building the FFI C++ shared object `liblorrax_ffi.so` (§5) |
 | `profile` | tensorboard, tensorboard-plugin-profile, xprof | JAX/XProf traces |
 
 ### 1.3 Not dependencies
@@ -459,7 +459,7 @@ RuntimeError: No GPU/TPU found, falling back to CPU.
 1. `nvidia-smi` — are GPUs visible at all?
 2. `python -c "import jax; print(jax.default_backend())"` — should print `gpu`
 3. `echo $CUDA_VISIBLE_DEVICES` — inside Shifter this is set by `select_gpu.sh` to `$SLURM_LOCALID`
-4. `pip list | grep jax` — jaxlib must be the CUDA build (`jax[cuda13]`)
+4. `pip list | grep jax` — jaxlib must be the CUDA build (`jax[cuda12]`)
 
 ### 8.2 Out-of-memory
 
@@ -516,9 +516,9 @@ Canonical xprof triage: [`reports/ppm_sigma_profiling_2026-04-05/XPROF_TRACE_GUI
 
 ## Next Steps
 
-- Code structure: [`CODEBASE_COMPREHENSIVE.md`](CODEBASE_COMPREHENSIVE.md)
-- Physics / theory: [`PHYSICS_COMPREHENSIVE.md`](PHYSICS_COMPREHENSIVE.md)
-- Memory model: [`MEMORY_MODEL.md`](MEMORY_MODEL.md)
+- Code structure: [`CODEBASE_COMPREHENSIVE.md`](architecture/codebase.md)
+- Physics / theory: [`PHYSICS_COMPREHENSIVE.md`](theory/physics.md)
+- Memory model: [`MEMORY_MODEL.md`](architecture/memory-model.md)
 - Perlmutter cluster detail: [`../config/README.md`](../config/README.md)
 - FFI internals: [`../src/ffi/AGENTS.md`](../src/ffi/AGENTS.md)
-- Agent TODOs: [`AGENT_TODO.md`](AGENT_TODO.md)
+- Agent TODOs: [`AGENT_TODO.md`](dev/notes/AGENT_TODO.md)

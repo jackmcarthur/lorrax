@@ -67,8 +67,6 @@ markers = [
 [dependency-groups]
 dev = [
     "flake8>=7.3.0",
-    "pdoc>=15.0.4",
-    "pydoc-markdown>=4.8.2",
     "pytest>=8.0.0",
 ]
 jax = [

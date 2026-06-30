@@ -35,11 +35,12 @@ On NERSC Perlmutter: `module load lorrax` then use `lxrun` / `lxpre`. See [`conf
 
 Detailed physics, code architecture, and environment setup are in `docs/`:
 
-- **[`docs/PHYSICS_COMPREHENSIVE.md`](docs/PHYSICS_COMPREHENSIVE.md)** — ISDF theory, GW equations, ISDF basis (zeta) fitting, JAX sharding
-- **[`docs/CODEBASE_COMPREHENSIVE.md`](docs/CODEBASE_COMPREHENSIVE.md)** — Module map, data flow, key classes, entry points
+- **[`docs/theory/physics.md`](docs/theory/physics.md)** — ISDF theory, GW equations, ISDF basis (zeta) fitting, JAX sharding
+- **[`docs/architecture/codebase.md`](docs/architecture/codebase.md)** — Module map, data flow, key classes, entry points
 - **[`docs/ENVIRONMENT_COMPREHENSIVE.md`](docs/ENVIRONMENT_COMPREHENSIVE.md)** — Dependencies, installation, cluster usage, CUDA
-- **[`docs/MEMORY_MODEL.md`](docs/MEMORY_MODEL.md)** — Per-stage memory usage formulas for the ISDF basis construction, heavy chunked operations
-- **[`docs/MINIMAX_QUADRATURE.md`](docs/MINIMAX_QUADRATURE.md)** — Explanation of GW frequency integrals discretized via $\Sigma(omega) = \int dt e^{i \omega t} G(t)W(t)$, minimax quadrature 
-- **[`docs/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md`](docs/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md)** — GN-PPM sigma pipeline, most recent dev push
+- **[`docs/architecture/memory-model.md`](docs/architecture/memory-model.md)** — Per-stage memory usage formulas for the ISDF basis construction, heavy chunked operations
+- **[`docs/theory/minimax-quadrature.md`](docs/theory/minimax-quadrature.md)** — Explanation of GW frequency integrals discretized via $\Sigma(omega) = \int dt e^{i \omega t} G(t)W(t)$, minimax quadrature
+
+The documentation site is built with mkdocs (`uv run --extra docs mkdocs serve`); developer notes, plans, and the frozen archive live under `docs/dev/` (outside the rendered site).
 
 Contributors and coding agents working in this repository should also read [`AGENTS.md`](AGENTS.md) for the module map and coding standards.
