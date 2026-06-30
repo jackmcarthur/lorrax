@@ -1,6 +1,6 @@
 # Codebase Structure & Architecture
 
-**For AI agents**: module organization, key classes, data flow, file formats. Read this when working on implementation tasks. For physics/theory see [`PHYSICS_COMPREHENSIVE.md`](PHYSICS_COMPREHENSIVE.md); for environment setup see [`ENVIRONMENT_COMPREHENSIVE.md`](ENVIRONMENT_COMPREHENSIVE.md).
+Module organization, key classes, data flow, and file formats. Read this when working on implementation tasks. For physics/theory see [`PHYSICS_COMPREHENSIVE.md`](PHYSICS_COMPREHENSIVE.md); for environment setup see [`ENVIRONMENT_COMPREHENSIVE.md`](ENVIRONMENT_COMPREHENSIVE.md).
 
 ---
 

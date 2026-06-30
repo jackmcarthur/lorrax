@@ -15,27 +15,23 @@ LORRAX implements an efficient GW workflow accelerated by Interpolative Separabl
 5. Build Green’s function G and (optionally) chi0 and screened interaction W
 6. Form sigma_X/SX/COH and project to band representation Sigma_kij
 
-See formalism details in formalism.md. For runnable examples, see examples/.
+See the theory references in [`PHYSICS_COMPREHENSIVE.md`](PHYSICS_COMPREHENSIVE.md). For a runnable worked example, see the bundled regression fixture under `tests/regression/cohsex_debug/`.
 
-### API reference (Markdown-only)
+### API reference
 
-Generated Markdown lives under `docs/api/`.
-
-Generate locally (no server):
+The API reference is rendered by mkdocstrings as part of the documentation site. Build it with:
 
 ```bash
-uv add pdoc  # once per environment
-uv run -- bash docs/gen_api_docs.sh
+uv run mkdocs build      # writes the static site to site/
+uv run mkdocs serve      # live-reload preview at http://127.0.0.1:8000
 ```
-
-Then browse the `.md` files in `docs/api/` in your editor or on GitHub.
 
 ### Key modules
 
 - `src/gw/gw_jax.py`: COHSEX driver (JAX, sharded)
 - `src/gw/w_isdf.py`: static screening and chi0 helpers
 - `src/centroid/kmeans_cli.py`: centroid-selection CLI (algorithm in `kmeans_isdf.py` next to it)
-- `src/isdf/common/wfnreader.py`: wavefunction I/O
+- `src/common/load_wfns.py`: wavefunction loading + band-chunked FFT
 
 ### Frequency-Integration Docs
 
