@@ -22,11 +22,11 @@ LORRAX_INSTALL_ROOT=""
 #   pip install --target="$LORRAX_SITE_PACKAGES" \
 #       h5py scipy matplotlib contourpy cycler fonttools kiwisolver \
 #       packaging pillow pyparsing python-dateutil six
-LORRAX_SITE_PACKAGES="$HOME/scratchperl/.isdf/isdf_venvs/isdf_site"
+LORRAX_SITE_PACKAGES="$HOME/software/lorrax_site"
 
 # Extra PYTHONPATH entries for the Shifter container (colon-separated).  Use
 # for deps outside LORRAX src/ and site-packages.  Leave empty if not needed.
-LORRAX_DEPS="/pscratch/sd/j/jackm/lorrax_sandbox/sources"
+LORRAX_DEPS=""
 
 # Shifter container image.
 LORRAX_IMAGE="nvcr.io/nvidia/jax:25.04-py3"
