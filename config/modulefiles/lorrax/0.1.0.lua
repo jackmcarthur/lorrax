@@ -329,7 +329,7 @@ set_shell_function("lxpre", [[
         || { echo "FAILED: dipole matrix elements"; return 1; }
 
     echo "=== [3/3] Kinetic + ionic Hamiltonian ==="
-    $step python3 -u -m gw.kin_ion_io_chunked -i "$abs_input" \
+    $step python3 -u -m gw.kin_ion_io -i "$abs_input" \
         || { echo "FAILED: kin_ion"; return 1; }
 
     echo "=== Preprocessing complete ==="

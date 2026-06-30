@@ -24,7 +24,7 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 | `src/gw/greens_function_kernel.py` | `build_G` occupied/all Green's function | G-matrix construction |
 | `src/gw/projection_kernel.py` | Σ_μν → Σ_ij band projection | Band-basis projection |
 | `src/gw/qsgw_utils.py` | QSGW fixed-point solver, Σ^xc I/O | Self-consistent GW |
-| `src/gw/kin_ion_io.py`, `kin_ion_io_chunked.py` | Kinetic + ionic Hamiltonian I/O | `kin_ion.h5` issues |
+| `src/gw/kin_ion_io.py` | Kinetic + ionic Hamiltonian I/O | `kin_ion.h5` issues |
 | `src/common/isdf_fitting.py` | CCT/ZCT, pair-density kernels, zeta solve | Zeta fitting, pair density |
 | `src/common/load_wfns.py` | Wavefunction loading + band-chunked FFT | WFN load path |
 | `src/common/cholesky_2d.py` | 2D-blocked Cholesky for sharded CCT | Cholesky issues |

@@ -41,8 +41,7 @@ src/
 │   ├── compute_vcoul_0d.py    box-truncated Coulomb (molecules)
 │   ├── qsgw_utils.py          diagonal fixed-point + QSGW from sigma_mnk.h5
 │   ├── scissor.py             valence/conduction scissor fit (out-of-grid bands)
-│   ├── kin_ion_io.py          kinetic + ionic H matrix elements
-│   └── kin_ion_io_chunked.py  k-chunked variant
+│   └── kin_ion_io.py          kinetic + ionic H matrix elements
 │
 ├── common/               # Shared kernels + utilities
 │   ├── meta.py                Meta dataclass (system params, band edges)

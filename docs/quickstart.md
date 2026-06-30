@@ -41,7 +41,7 @@ For your own system you produce three preprocessing artifacts, then run GW:
 
 1. **Centroids** — `python -m centroid.kmeans_cli <N> --seed 42` → `centroids_frac_<N>.txt`
 2. **Dipoles** — `python -m psp.get_dipole_mtxels -i cohsex.in` → `dipole.h5`
-3. **Kinetic + ionic** — `python -m gw.kin_ion_io_chunked -i cohsex.in` → `kin_ion.h5`
+3. **Kinetic + ionic** — `python -m gw.kin_ion_io -i cohsex.in` → `kin_ion.h5`
 4. **GW** — `python -m gw.gw_jax -i cohsex.in`
 
 On NERSC Perlmutter, `lxpre cohsex.in <N>` runs steps 1–3 in one command; see
