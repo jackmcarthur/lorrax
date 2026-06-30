@@ -6,8 +6,8 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "h5py>=3.14.0",
-    "jax[cuda12]>=0.5.3,<0.6",
-    "jaxlib>=0.5.3,<0.6",
+    "jax[cuda13]>=0.9.0",
+    "jaxlib>=0.9.0",
     "matplotlib>=3.10.3",
     "numpy>=2.3.1",
     "scipy>=1.16.0",
@@ -24,21 +24,21 @@ docs = [
     "mkdocstrings>=0.30.1",
     "mkdocstrings-python>=1.18.2",
 ]
-# CUDA-12 GPU stack. Pinned to the JAX 0.5.x line that the production
-# Shifter image (nvcr.io/nvidia/jax:25.04-py3) ships and the FFI links
-# against (CUDA 12.9). The FFI XLA-FFI ABI is baked into the headers at
-# build time, so the JAX pin is intentionally narrow.
-#
-# NOTE: a CUDA-13 / JAX >=0.9 configuration is a separate, untested support
-# matrix row (use `jax[cuda13]>=0.9.0`); it is NOT the default because the
-# native FFI .so is currently built and validated against CUDA 12.9.
-cuda12 = ["jax[cuda12]>=0.5.3,<0.6"]
+# NOTE: the default GPU stack is CUDA 13 / JAX >=0.9 (see
+# [project.dependencies] `jax[cuda13]`). A CUDA-12 install path on the same
+# JAX 0.9 line (`jax[cuda12]>=0.9.0`) is a plausible future support-matrix
+# row but is not offered here yet, so no `cuda12` extra is defined.
 
 [project.scripts]
 lorrax-gw = "gw.gw_jax:main"
 gw_jax = "gw.gw_jax:main"
 lorrax-centroids = "centroid.kmeans_cli:main"
-lorrax-bse = "bse.bse_isdf:main"
+# NOTE: `lorrax-bse` was removed. Its former target `bse.bse_isdf:main` was
+# deleted (commit a0da0a5; it was a deprecation shim with no main()). The
+# current BSE driver `bse.bse_jax` keeps its CLI inside an
+# `if __name__ == "__main__":` block and exposes no importable `main()`, so it
+# cannot be wired as a console script without a source refactor. Re-add this
+# entry once `bse.bse_jax` (or a successor) gains a module-level `main()`.
 
 [tool.uv]
 package = true
@@ -70,8 +70,8 @@ dev = [
     "pytest>=8.0.0",
 ]
 jax = [
-    "jax[cuda12]>=0.5.3,<0.6",
-    "jaxlib>=0.5.3,<0.6",
+    "jax[cuda13]>=0.9.0",
+    "jaxlib>=0.9.0",
 ]
 build = [
     "scikit-build-core>=0.11.0",
