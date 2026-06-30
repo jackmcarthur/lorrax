@@ -345,8 +345,8 @@ if(NOT DEFINED LORRAX_SLATE_INSTALL_DIR AND DEFINED ENV{LORRAX_SLATE_INSTALL_DIR
         "SLATE install prefix")
 endif()
 if(NOT DEFINED LORRAX_SLATE_INSTALL_DIR)
-    set(LORRAX_SLATE_INSTALL_DIR "/global/homes/j/jackm/software/slate/install"
-        CACHE PATH "SLATE install prefix (default: host build on Perlmutter)")
+    set(LORRAX_SLATE_INSTALL_DIR "$ENV{HOME}/software/slate/install"
+        CACHE PATH "SLATE install prefix (default: host build under \$HOME/software/slate/install)")
 endif()
 
 # slateConfig.cmake internally find_dependency(blaspp, lapackpp), which

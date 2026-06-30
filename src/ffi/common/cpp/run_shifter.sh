@@ -92,9 +92,20 @@ if [[ ! -d "${NVHPC_HOST}" ]]; then
     exit 2
 fi
 
-: "${LORRAX_SRC:=/global/u2/j/jackm/software/lorrax/src}"
-: "${LORRAX_SITE:=/global/homes/j/jackm/scratchperl/.isdf/isdf_venvs/isdf_site}"
-PYPATH="${LORRAX_SRC}:${LORRAX_SITE}"
+# Derive the LORRAX src/ dir from this script's own location
+# (src/ffi/common/cpp/run_shifter.sh -> ../../.. = src) rather than a
+# hardcoded per-user path.  Override LORRAX_SRC to point elsewhere.
+_RUN_SHIFTER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+: "${LORRAX_SRC:=$(cd "${_RUN_SHIFTER_DIR}/../../.." && pwd)}"
+# Supplemental site-packages bind-mounted into the container.  No default:
+# this is site-specific (see config/perlmutter/site_config.sh
+# LORRAX_SITE_PACKAGES).  Empty = none.
+: "${LORRAX_SITE:=}"
+if [[ -n "${LORRAX_SITE}" ]]; then
+    PYPATH="${LORRAX_SRC}:${LORRAX_SITE}"
+else
+    PYPATH="${LORRAX_SRC}"
+fi
 
 # Staged third-party trees are bind-mounted inside the container at
 # stable paths: /lorrax_nvhpc, /lorrax_phdf5, /lorrax_slate.
@@ -105,7 +116,7 @@ fi
 # SLATE stage: Cray libsci + libmpi_gtl_cuda + libxpmem + liblustreapi.
 # Populated by src/ffi/slate/scripts/stage_cray.sh.  Skipped if absent.
 : "${LORRAX_FFI_SLATE_DIR:=$HOME/software/lorrax_slate_cray/stage}"
-SLATE_INSTALL_HOST="${LORRAX_SLATE_INSTALL_DIR:-/global/homes/j/jackm/software/slate/install}"
+SLATE_INSTALL_HOST="${LORRAX_SLATE_INSTALL_DIR:-$HOME/software/slate/install}"
 if [[ -d "${LORRAX_FFI_SLATE_DIR}" ]]; then
     VOL_FLAGS+=(--volume="${LORRAX_FFI_SLATE_DIR}:/lorrax_slate")
 fi
