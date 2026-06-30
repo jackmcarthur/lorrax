@@ -1,6 +1,6 @@
 # Codebase Structure & Architecture
 
-Module organization, key classes, data flow, and file formats. Read this when working on implementation tasks. For physics/theory see [`PHYSICS_COMPREHENSIVE.md`](PHYSICS_COMPREHENSIVE.md); for environment setup see [`ENVIRONMENT_COMPREHENSIVE.md`](ENVIRONMENT_COMPREHENSIVE.md).
+Module organization, key classes, data flow, and file formats. Read this when working on implementation tasks. For physics/theory see [`PHYSICS_COMPREHENSIVE.md`](../theory/physics.md); for environment setup see [`ENVIRONMENT_COMPREHENSIVE.md`](../ENVIRONMENT_COMPREHENSIVE.md).
 
 ---
 
@@ -404,7 +404,7 @@ GWResults → write_results → eqp.dat / eqp1.dat / sigma_mnk.h5 / qp_rotations
 
 ### 6.1 Input — `cohsex.in`
 
-Parsed by `LorraxConfig.from_input_file()`. Canonical reference: [`docs/docs_gwjax/COHSEX_INPUT.md`](../../docs/docs_gwjax/COHSEX_INPUT.md) in the sandbox (not in this repo) — covers every flag (band ranges, ISDF parameters, memory budget, screening knobs, head-correction policy, frequency grid, etc.).
+Parsed by `LorraxConfig.from_input_file()`. Canonical reference: [`docs/docs_gwjax/COHSEX_INPUT.md`](../../../docs/docs_gwjax/COHSEX_INPUT.md) in the sandbox (not in this repo) — covers every flag (band ranges, ISDF parameters, memory budget, screening knobs, head-correction policy, frequency grid, etc.).
 
 ### 6.2 Input — `centroids_frac.h5`
 
@@ -632,10 +632,10 @@ main                                       [gw/gw_jax.py]
 
 ## Next Steps
 
-- Physics / theory: [`PHYSICS_COMPREHENSIVE.md`](PHYSICS_COMPREHENSIVE.md)
-- Memory model: [`MEMORY_MODEL.md`](MEMORY_MODEL.md)
-- Environment / Perlmutter: [`ENVIRONMENT_COMPREHENSIVE.md`](ENVIRONMENT_COMPREHENSIVE.md), [`../config/README.md`](../config/README.md)
-- FFI internals: [`../src/ffi/AGENTS.md`](../src/ffi/AGENTS.md)
-- GN-PPM Σ details: [`GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md`](GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md)
-- Current BGW-vs-LORRAX status: [`SIGMA_FREQ_AUDIT_STATUS.md`](SIGMA_FREQ_AUDIT_STATUS.md)
-- Agent todos: [`AGENT_TODO.md`](AGENT_TODO.md)
+- Physics / theory: [`PHYSICS_COMPREHENSIVE.md`](../theory/physics.md)
+- Memory model: [`MEMORY_MODEL.md`](memory-model.md)
+- Environment / Perlmutter: [`ENVIRONMENT_COMPREHENSIVE.md`](../ENVIRONMENT_COMPREHENSIVE.md), [`../config/README.md`](../../config/README.md)
+- FFI internals: [`../src/ffi/AGENTS.md`](../../src/ffi/AGENTS.md)
+- GN-PPM Σ details: [`GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md`](../dev/notes/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md)
+- Current BGW-vs-LORRAX status: [`SIGMA_FREQ_AUDIT_STATUS.md`](../dev/progress/SIGMA_FREQ_AUDIT_STATUS.md)
+- Agent todos: [`AGENT_TODO.md`](../dev/notes/AGENT_TODO.md)

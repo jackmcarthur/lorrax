@@ -33,7 +33,7 @@ LORRAX has **three** chunk choosers that can run together:
    the heuristic's `q_chunk`, `q_gather`, `k_chunk`.  See
    [§AOT Memory Model](#aot-memory-model) below and the per-kernel
    artifact JSONs under
-   [`src/gw/aot_memory_model/artifacts/`](../src/gw/aot_memory_model/artifacts/).
+   [`src/gw/aot_memory_model/artifacts/`](../../src/gw/aot_memory_model/artifacts/).
 
 Conventions throughout this doc:
 
