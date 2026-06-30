@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# stage_cray.sh — populate a /pscratch dir with a copy of the host's
-# cray-hdf5-parallel module, plus a shim symlink that lets it load
-# inside Shifter when paired with --module=mpich.
+# stage_cray.sh — populate a staging dir (default $HOME/software, see
+# LORRAX_FFI_PHDF5_DIR below) with a copy of the host's cray-hdf5-parallel
+# module, plus a shim symlink that lets it load inside Shifter when paired
+# with --module=mpich.
 #
 # Why not just bind-mount /opt/cray directly?  Shifter at NERSC blocks
-# --volume from /opt/ system paths.  Why not bind-mount from $HOME?
-# Shifter's udiRoot.conf on Perlmutter only accepts --volume sources
-# under /pscratch (and a handful of other paths).  So we copy the
-# module to /pscratch, where Shifter is willing to bind-mount it.
+# --volume from /opt/ system paths (not in udiRoot.conf siteFs).  $HOME
+# (/global/homes -> /global/u1) and /global/common ARE valid siteFs
+# --volume sources (verified 2026-06-29), so we stage to $HOME/software —
+# off the purged $SCRATCH — and bind-mount from there.
 #
-# This is the default staged-deps target as of 2026-04-20.  Historical
+# Relocated to $HOME/software 2026-06-24 (was /pscratch).  Historical
 # note: we used to ship `stage_openmpi.sh` as default because Cray
 # MPICH's collective-write path (`ad_cray_write_coll.c:669`) OOMs at
 # ≥ 1 GB/rank.  That's worked around now by forcing independent writes
