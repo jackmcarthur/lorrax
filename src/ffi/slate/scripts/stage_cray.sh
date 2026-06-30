@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# stage_cray.sh — populate a /pscratch dir with copies of the Cray runtime
-# libs that SLATE's Cray-built .so's NEED but aren't in nvcr.io/nvidia/jax.
+# stage_cray.sh — populate a staging dir (default $HOME/software, see
+# LORRAX_FFI_SLATE_DIR below) with copies of the Cray runtime libs that
+# SLATE's Cray-built .so's NEED but aren't in nvcr.io/nvidia/jax.
 #
 # Why:
 #   SLATE is built against the host Cray PE (CC=cc CXX=CC FC=ftn) so it can
 #   use libsci for optimal BLAS/LAPACK and GPU-aware MPI via libmpi_gtl_cuda.
 #   Inside the Shifter container those libs live under /opt/cray, which
-#   Shifter forbids as a --volume source (NERSC siteFs only allows /pscratch
-#   /global/* /dvs_*).  The fix is the same as phdf5's stage_cray.sh: copy
-#   the libs once into /pscratch and bind-mount at runtime.
+#   Shifter forbids as a --volume source (NERSC siteFs allows /pscratch
+#   /global/* /dvs_* but not /opt).  The fix is the same as phdf5's
+#   stage_cray.sh: copy the libs once into $HOME/software (off purged
+#   $SCRATCH) and bind-mount at runtime.
 #
 # Run on a login node with the needed modules loaded:
 #
