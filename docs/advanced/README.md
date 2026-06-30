@@ -12,7 +12,7 @@ This folder contains documentation for advanced usage scenarios and specialized 
 
 ## Usage
 
-**For AI agents**: Read these only if:
+Read these only if:
 - Working on multi-node/multi-GPU parallelization → `jax_multihost.md`
 - Implementing or debugging GPP models → `HL_GPP_derivation.md`
 

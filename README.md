@@ -11,17 +11,23 @@ The package requires as input the BerkeleyGW format wavefunction file `WFN.h5`. 
 The main drivers are located in `src/`:
 - **ISDF initialization**: `centroid/kmeans_isdf.py` (k-means algorithm) + `centroid/kmeans_cli.py` (CLI entrypoint, `python -m centroid.kmeans_cli`)
 - **Wavefunction loading**: `common/load_wfns.py` (ISDF basis fitting by least squares, memory bottlenecks)
-- **GW quasiparticle energies**: `gw_isdf/gw_jax.py` (main driver), `w_isdf.py` (screened interaction builder)
+- **GW quasiparticle energies**: `gw/gw_jax.py` (main driver), `gw/w_isdf.py` (screened interaction builder)
 
 Available as console commands: `gw_jax`, `lorrax-gw`, `lorrax-centroids` (= `centroid.kmeans_cli`), `lorrax-bse`.
 
 ## Quick start
 
 ```bash
-uv sync
-uv run python -m pytest -q                                    # unit tests (~15s)
-uv run python -m gw.gw_jax -i cohsex.in                  # run GW calculation
+uv sync                                                       # editable install, no GPU/native build needed
+uv run python -m pytest -q                                    # regression smoke test (CPU, ~1-2 min)
+uv run python -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in   # run a GW calculation
 ```
+
+The third line runs a complete static-COHSEX calculation end-to-end on a fresh clone:
+the bundled fixture sets `use_ffi_io = false` and ships its own wavefunction, so it needs
+**no GPU and no native (FFI) build**. It is the fastest way to confirm LORRAX works on your
+machine. Everything distributed (sharded HDF5, distributed `eigh`, SLATE) additionally
+requires the native FFI stack — see [`docs/ENVIRONMENT_COMPREHENSIVE.md`](docs/ENVIRONMENT_COMPREHENSIVE.md).
 
 On NERSC Perlmutter: `module load lorrax` then use `lxrun` / `lxpre`. See [`config/README.md`](config/README.md).
 
@@ -36,4 +42,4 @@ Detailed physics, code architecture, and environment setup are in `docs/`:
 - **[`docs/MINIMAX_QUADRATURE.md`](docs/MINIMAX_QUADRATURE.md)** — Explanation of GW frequency integrals discretized via $\Sigma(omega) = \int dt e^{i \omega t} G(t)W(t)$, minimax quadrature 
 - **[`docs/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md`](docs/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md)** — GN-PPM sigma pipeline, most recent dev push
 
-For AI agents: read `AGENTS.md` first, then only the docs relevant to your task.
+Contributors and coding agents working in this repository should also read [`AGENTS.md`](AGENTS.md) for the module map and coding standards.

@@ -1,6 +1,6 @@
 # Environment Setup & Configuration
 
-**For AI agents**: Dependencies, installation, JAX configuration, cluster usage, and troubleshooting. Read this for build/deployment issues. For code structure see [`CODEBASE_COMPREHENSIVE.md`](CODEBASE_COMPREHENSIVE.md). For Perlmutter specifically, [`config/README.md`](../config/README.md) is authoritative — this file summarises and cross-references.
+Dependencies, installation, JAX configuration, cluster usage, and troubleshooting. Read this for build and deployment issues. For code structure see [`CODEBASE_COMPREHENSIVE.md`](CODEBASE_COMPREHENSIVE.md). For Perlmutter specifically, [`config/README.md`](../config/README.md) is authoritative — this file summarises and cross-references.
 
 ---
 
@@ -33,7 +33,7 @@ Authoritative source: [`pyproject.toml`](../pyproject.toml). No docker images, n
 | **h5py** | ≥3.14.0 | HDF5 I/O (host path) |
 | **matplotlib** | ≥3.10.3 | Plotting |
 | **xmlschema**, **xsdata** | ≥4.1.0, ≥25.7 | UPF pseudopotential parsing |
-| **mkdocs** / **mkdocs-material** / **mkdocstrings** | — | API docs (`tools/gen_api_docs.sh`) |
+| **mkdocs** / **mkdocs-material** / **mkdocstrings** | — | Documentation site + API reference (`mkdocs build`) |
 
 ### 1.2 Dependency groups
 
@@ -41,7 +41,7 @@ Declared under `[dependency-groups]` in `pyproject.toml`:
 
 | Group | Contents | When |
 |---|---|---|
-| `dev` | flake8, pytest, pdoc, pydoc-markdown | Everywhere |
+| `dev` | flake8, pytest | Everywhere |
 | `jax` | Explicit `jax[cuda13]` + jaxlib pin | If uv resolves without extras |
 | `build` | cmake, ninja, pybind11, nanobind, scikit-build-core | Building the FFI C++ shared object `liblorrax_ffi.so` (§5) |
 | `profile` | tensorboard, tensorboard-plugin-profile, xprof | JAX/XProf traces |
@@ -62,12 +62,11 @@ The following appear in older docs but are **removed or never required**:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh    # one-time
-cd /path/to/lorrax_X
-uv venv
-uv sync --no-install-project --locked
+cd $LORRAX_ROOT
+uv sync                                            # editable install of the project (puts src/ on sys.path)
 source .venv/bin/activate
-uv run python -m gw.gw_jax -i cohsex.in
-# or: uv run gw_jax -i cohsex.in
+uv run python -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in
+# or: uv run gw_jax -i tests/regression/cohsex_debug/cohsex_test.in
 ```
 
 Console scripts (from `pyproject.toml`):
@@ -91,7 +90,7 @@ See §4. The module bind-mounts `LORRAX_SITE_PACKAGES` into the container so the
 
 ### 3.1 Environment variables
 
-Set **before `import jax`**. `gw_jax.py` hard-defaults the two X64 / platform vars; everything else is set by `module load lorrax_X` (see `config/README.md`):
+Set **before `import jax`**. `gw_jax.py` hard-defaults the two X64 / platform vars; everything else is set by `module load lorrax` (see `config/README.md`):
 
 | Variable | Value | Purpose |
 |---|---|---|
@@ -209,20 +208,18 @@ vi config/perlmutter/site_config.sh          # edit account, QoS, paths
 bash config/perlmutter/install.sh
 ```
 
-Three parallel checkouts (A/B/C) with their own module names:
+To run several checkouts side-by-side, install each with a distinct module name:
 
 ```bash
-LORRAX_MODULE_NAME=lorrax_A bash /path/to/lorrax_A/config/perlmutter/install.sh
-LORRAX_MODULE_NAME=lorrax_B bash /path/to/lorrax_B/config/perlmutter/install.sh
-LORRAX_MODULE_NAME=lorrax_C bash /path/to/lorrax_C/config/perlmutter/install.sh
+LORRAX_MODULE_NAME=<module-name> bash $LORRAX_ROOT/config/perlmutter/install.sh
 ```
 
-`family("lorrax")` in the modulefile makes variants mutually exclusive within a shell; `module load lorrax_B` auto-swaps `lorrax_A` out. Separate shells are fully independent (own `LORRAX_ROOT`, own `lxalloc` allocation).
+`family("lorrax")` in the modulefile makes variants mutually exclusive within a shell; loading one auto-swaps the other out. Separate shells are fully independent (own `LORRAX_ROOT`, own `lxalloc` allocation).
 
 ### 4.2 Every session
 
 ```bash
-module load lorrax_X                    # X = A | B | C
+module load lorrax
 lxalloc                                 # 1 node / 4 GPUs / 2 h, exports SLURM_JOBID
 lxalloc 4                               # 4 nodes / 16 GPUs / 2 h
 lxalloc 1 4:00:00                       # custom time
@@ -256,7 +253,7 @@ Template at [`config/perlmutter/run_gw.slurm`](../config/perlmutter/run_gw.slurm
 #SBATCH -N 1 -C gpu -q regular -t 01:00:00 -A m2651
 #SBATCH --ntasks-per-node=4 --gpus-per-node=4
 
-module load lorrax_X
+module load lorrax
 lxrun python3 -u -m gw.gw_jax -i cohsex.in 2>&1 | tee gw.out
 ```
 
@@ -299,9 +296,9 @@ Pre-staged host-side directories bind-mount to fixed container paths:
 
 | Host path (override var) | Container mount | Contents |
 |---|---|---|
-| `$LORRAX_FFI_NVHPC_DIR` (default `$SCRATCH/lorrax_nvhpc`) | `/lorrax_nvhpc` | NVHPC 25.5 subset: `libcusolverMp.so.0`, `libcal` |
-| `$LORRAX_FFI_PHDF5_DIR` (default `$SCRATCH/lorrax_phdf5_cray/stage`) | `/lorrax_phdf5` | Cray HDF5 1.12 (libmpi_gnu_*.so.12) |
-| `$LORRAX_FFI_SLATE_DIR` (default `$SCRATCH/lorrax_slate_cray/stage`) | `/lorrax_slate` | Cray libsci + `libmpi_gtl_cuda.so.0` + xpmem + lustreapi |
+| `$LORRAX_FFI_NVHPC_DIR` (default `$HOME/software/lorrax_nvhpc`) | `/lorrax_nvhpc` | NVHPC 25.5 subset: `libcusolverMp.so.0`, `libcal` |
+| `$LORRAX_FFI_PHDF5_DIR` (default `$HOME/software/lorrax_phdf5_cray/stage`) | `/lorrax_phdf5` | Cray HDF5 1.12 (libmpi_gnu_*.so.12) |
+| `$LORRAX_FFI_SLATE_DIR` (default `$HOME/software/lorrax_slate_cray/stage`) | `/lorrax_slate` | Cray libsci + `libmpi_gtl_cuda.so.0` + xpmem + lustreapi |
 
 Container-side `LD_LIBRARY_PATH` (order matters):
 
@@ -316,9 +313,9 @@ $LORRAX_SLATE_INSTALL_DIR/lib64 : /lorrax_slate/lib : /lorrax_phdf5/lib :
 ### 5.3 Staging (one-time per cluster)
 
 ```bash
-src/ffi/cusolvermp/scripts/stage_nvhpc.sh   # ~100 MB → /pscratch
-src/ffi/phdf5/scripts/stage_cray.sh         # Cray HDF5 1.12 (default stack)
-src/ffi/phdf5/scripts/stage_openmpi.sh      # legacy OpenMPI stack (not unified)
+src/ffi/cusolvermp/scripts/stage_nvhpc.sh   # cuSolverMp + CAL (~100 MB)
+src/ffi/phdf5/scripts/stage_cray.sh         # Cray HDF5 1.12 — canonical default on Perlmutter
+src/ffi/phdf5/scripts/stage_openmpi.sh      # OpenMPI HDF5 — the portable stack for non-Cray clusters
 src/ffi/slate/scripts/stage_cray.sh         # libsci + GTL + xpmem
 ```
 
@@ -326,11 +323,15 @@ Staging copies are mandatory because Shifter's `udiRoot.conf` on Perlmutter forb
 
 ### 5.4 Building `liblorrax_ffi.so`
 
+> **Prereqs.** Before building, (a) the native stacks must be staged (`stage_nvhpc.sh` for cuSolverMp at minimum — see §5.3), and (b) you must hold a GPU allocation (`lxalloc`). `build.sh` fails loudly if `LORRAX_MPI_INCLUDE_DIR` / `LORRAX_MPICH_LIB_DIR` are unset, which `run_shifter.sh` sets for you.
+
 ```bash
 src/ffi/common/cpp/run_shifter.sh bash src/ffi/common/cpp/build.sh
 ```
 
 Output: `src/ffi/common/cpp/build/liblorrax_ffi.so`. CMake logs the resolved HDF5 / MPI paths — eyeball them to confirm the right stack.
+
+To build **outside** Shifter (a non-Cray cluster, native libs obtained independently), drive CMake directly with explicit `-D` overrides instead of `run_shifter.sh` — see [`src/ffi/PORTING.md`](../src/ffi/PORTING.md) and (once available) the Installation → FFI native libraries page.
 
 ### 5.5 MPI stack override
 
@@ -342,9 +343,9 @@ LORRAX_MPI_TYPE=pmix          # legacy OpenMPI path, not unified; has hung non-F
 
 `pmix` is opt-in and known to hang some non-FFI workloads — don't set it unconditionally.
 
-### 5.6 GPU-aware MPICH
+### 5.6 GPU-aware MPICH (Cray MPICH stack only)
 
-`module load lorrax_X` sets:
+`module load lorrax` sets:
 
 ```
 MPICH_GPU_SUPPORT_ENABLED=1
@@ -352,6 +353,8 @@ LD_PRELOAD=libmpi_gtl_cuda.so.0      # CUDA-12 copy for the container's MPICH
 ```
 
 This activates GPU-Direct RDMA for `MPI_*` collectives used by SLATE / CAL. `in_container.sh` re-asserts the env var inside Shifter after the image switch.
+
+These two knobs are **Cray-MPICH-specific** GPU-Direct mechanisms — they do not exist for OpenMPI/UCX. On an OpenMPI cluster, CUDA-awareness comes from CUDA-aware UCX (`UCX_*` / `OMPI_MCA_*` env); none of the `MPICH_*` / `libmpi_gtl_cuda` vars apply.
 
 ---
 
@@ -382,7 +385,7 @@ Rationale: `--gpus-per-task=1` breaks JAX's distributed topology sync. Each rank
 #SBATCH -N 2 -C gpu -q regular -t 04:00:00 -A m2651
 #SBATCH --ntasks-per-node=4 --gpus-per-node=4
 
-module load lorrax_X
+module load lorrax
 LORRAX_NNODES=2 LORRAX_NGPU=8 lxrun python3 -u -m gw.gw_jax -i cohsex.in
 ```
 
@@ -422,18 +425,20 @@ Port via `config/<cluster>/` (see [`config/README.md`](../config/README.md) §Po
 | `LORRAX_NVHPC_SUBPATH` | `25.5_cuda12.9/math_libs/12.9/lib64` |
 | `LORRAX_MPICH_CONTAINER_DIR` | `/opt/udiImage/modules/mpich` |
 | `LORRAX_DARSHAN_LIB_DIR` | (optional; empty to skip) |
-| `LORRAX_FFI_{NVHPC,PHDF5,SLATE}_DIR_DEFAULT` | under `$SCRATCH` |
+| `LORRAX_FFI_{NVHPC,PHDF5,SLATE}_DIR_DEFAULT` | under `$HOME/software` |
 | `LORRAX_SLATE_INSTALL_DIR_DEFAULT` | `$HOME/software/slate/install` |
 
 For non-Shifter runtimes (Apptainer, Singularity, bare venv) you need to swap the `shifter` invocation in `lxrun`/`lxshell`/`lxpre`. `select_gpu.sh`, `in_container.sh`, `LD_LIBRARY_PATH` composition, and SLURM defaults are portable.
 
 Bare-venv fallback (no container):
 
+> **Note.** This bare-venv example runs only the **pure-JAX** code path (centroids, load, serial GW). The distributed FFI features (cuSolverMp `eigh`, sharded HDF5, SLATE) additionally require building `liblorrax_ffi.so` against native libs you must obtain — see §5 and (once available) the Installation → FFI native libraries page. The `site_config.sh` stage knobs above assume Cray-PE modules to copy from.
+
 ```bash
 #!/bin/bash
 #SBATCH -N 1 --gres=gpu:4 -t 02:00:00
 module load cuda/12.3 python/3.12
-source /path/to/venv/bin/activate
+source $LORRAX_ROOT/.venv/bin/activate
 export JAX_ENABLE_X64=1 JAX_PLATFORMS=cuda,cpu
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PYTHON_CLIENT_ALLOCATOR=platform

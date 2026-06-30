@@ -1,8 +1,6 @@
-Absolutely — here is a cleaned-up, self-contained note that starts from the motivation, explains why a **coarse six-window partition** is the right choice given the new scaling, and then states the final routing clearly in your **raw-eigenvalue convention**.
-
----
-
 # Coarse windowing strategy for Laplace-transformed (\chi) and (\Sigma)
+
+A self-contained note on why a **coarse six-window partition** is the right choice given the new scaling, with the final routing stated in the **raw-eigenvalue convention**.
 
 ## Motivation
 

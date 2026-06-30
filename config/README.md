@@ -37,6 +37,9 @@ export SLURM_JOBID=<jobid>
 ```bash
 # Preprocessing (single-GPU, all 3 steps)
 lxpre cohsex.in 640
+#   [1/3] python3 -m centroid.kmeans_cli 640 --seed 42  -> centroids_frac_640.txt
+#   [2/3] python3 -m psp.get_dipole_mtxels -i cohsex.in -> dipole.h5
+#   [3/3] python3 -m gw.kin_ion_io_chunked -i cohsex.in -> kin_ion.h5
 
 # GW calculation (4 GPUs, default)
 lxrun python3 -u -m gw.gw_jax -i cohsex.in
@@ -106,9 +109,9 @@ the common tests auto-detect this via `CUDA_VISIBLE_DEVICES`).
 
 | Host path (override)                | Container mount   | Contents |
 |-------------------------------------|-------------------|----------|
-| `$LORRAX_FFI_NVHPC_DIR` (default `$SCRATCH/lorrax_nvhpc`)              | `/lorrax_nvhpc`   | NVHPC 25.5 subset: `libcusolverMp.so.0`, `libcal` |
-| `$LORRAX_FFI_PHDF5_DIR` (default `$SCRATCH/lorrax_phdf5_cray/stage`)   | `/lorrax_phdf5`   | Cray HDF5 1.12 (libmpi_gnu_*.so.12) |
-| `$LORRAX_FFI_SLATE_DIR` (default `$SCRATCH/lorrax_slate_cray/stage`)   | `/lorrax_slate`   | Cray libsci + `libmpi_gtl_cuda.so.0` + xpmem + lustreapi |
+| `$LORRAX_FFI_NVHPC_DIR` (default `$HOME/software/lorrax_nvhpc`)              | `/lorrax_nvhpc`   | NVHPC 25.5 subset: `libcusolverMp.so.0`, `libcal` |
+| `$LORRAX_FFI_PHDF5_DIR` (default `$HOME/software/lorrax_phdf5_cray/stage`)   | `/lorrax_phdf5`   | Cray HDF5 1.12 (libmpi_gnu_*.so.12) |
+| `$LORRAX_FFI_SLATE_DIR` (default `$HOME/software/lorrax_slate_cray/stage`)   | `/lorrax_slate`   | Cray libsci + `libmpi_gtl_cuda.so.0` + xpmem + lustreapi |
 
 Container-side `LD_LIBRARY_PATH` (in order):
 ```
@@ -124,9 +127,11 @@ cluster-specific (`LORRAX_NVHPC_SUBPATH`, `LORRAX_MPICH_CONTAINER_DIR`,
 **`LORRAX_MPI_TYPE`** override:
 
 ```bash
-LORRAX_MPI_TYPE=cray_shasta   # default — Cray MPICH PMI
+LORRAX_MPI_TYPE=cray_shasta   # default — Cray MPICH PMI (fastest on Perlmutter)
 LORRAX_MPI_TYPE=none          # disable --mpi flag (single-rank code)
-LORRAX_MPI_TYPE=pmix          # legacy OpenMPI path (not wired up)
+LORRAX_MPI_TYPE=pmix          # OpenMPI launch protocol — the correct choice on OpenMPI clusters
+                              #   (not the default because Cray MPICH is faster on Perlmutter;
+                              #    has hung some non-FFI workloads, so set it deliberately)
 ```
 
 ### Per-invocation cost & fast-iteration tips
@@ -154,19 +159,17 @@ itself is *not* the bottleneck — everything above it is.
   MPI integration needs `srun` on the outside (per upstream Shifter
   SLURM integration docs).
 
-## Multiple parallel checkouts (A/B/C agent sessions)
+## Multiple parallel checkouts
 
 To run several LORRAX checkouts side-by-side, install each with a distinct
 module name:
 
 ```bash
-LORRAX_MODULE_NAME=lorrax_A bash /path/to/lorrax_A/config/perlmutter/install.sh
-LORRAX_MODULE_NAME=lorrax_B bash /path/to/lorrax_B/config/perlmutter/install.sh
-LORRAX_MODULE_NAME=lorrax_C bash /path/to/lorrax_C/config/perlmutter/install.sh
+LORRAX_MODULE_NAME=<module-name> bash $LORRAX_ROOT/config/perlmutter/install.sh
 ```
 
 `family("lorrax")` in the modulefile makes variants mutually exclusive
-within a single shell: `module load lorrax_B` auto-swaps `lorrax_A` out.
+within a single shell: loading one variant auto-swaps the other out.
 Across separate shells each variant is fully independent (own
 `LORRAX_ROOT`, own `lxrun`, own `SLURM_JOBID` from `lxalloc`).
 
