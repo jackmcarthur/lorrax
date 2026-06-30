@@ -41,7 +41,7 @@ set -euo pipefail
 
 MPI_STACK="${LORRAX_PHDF5_MPI_STACK:-mpich}"
 
-NVHPC_HOST="${LORRAX_FFI_NVHPC_DIR:-/pscratch/sd/j/jackm/lorrax_nvhpc}"
+NVHPC_HOST="${LORRAX_FFI_NVHPC_DIR:-$HOME/software/lorrax_nvhpc}"
 IMAGE="${LORRAX_FFI_IMAGE:-nvcr.io/nvidia/jax:25.04-py3}"
 NGPU="${LORRAX_NGPU:-1}"
 NTASKS="${LORRAX_NTASKS:-${NGPU}}"
@@ -51,14 +51,14 @@ NNODES="${LORRAX_NNODES:-1}"
 # container MPI include / lib paths, srun --mpi flavor.
 case "${MPI_STACK}" in
     openmpi)
-        PHDF5_DEFAULT="/pscratch/sd/j/jackm/lorrax_phdf5_openmpi/stage"
+        PHDF5_DEFAULT="$HOME/software/lorrax_phdf5_openmpi/stage"
         SHIFTER_MODULES="gpu"
         MPI_LIB_DIR_CT="/opt/hpcx/ompi/lib"
         MPI_INCLUDE_DIR_CT="/opt/hpcx/ompi/include"
         MPI_TYPE_DEFAULT="pmix"
         ;;
     mpich)
-        PHDF5_DEFAULT="/pscratch/sd/j/jackm/lorrax_phdf5_cray/stage"
+        PHDF5_DEFAULT="$HOME/software/lorrax_phdf5_cray/stage"
         SHIFTER_MODULES="gpu,mpich"
         MPI_LIB_DIR_CT="/opt/udiImage/modules/mpich"
         MPI_INCLUDE_DIR_CT="/lorrax_phdf5/include"  # staged MPICH headers
@@ -104,7 +104,7 @@ if [[ -d "${PHDF5_HOST}" ]]; then
 fi
 # SLATE stage: Cray libsci + libmpi_gtl_cuda + libxpmem + liblustreapi.
 # Populated by src/ffi/slate/scripts/stage_cray.sh.  Skipped if absent.
-: "${LORRAX_FFI_SLATE_DIR:=/pscratch/sd/j/jackm/lorrax_slate_cray/stage}"
+: "${LORRAX_FFI_SLATE_DIR:=$HOME/software/lorrax_slate_cray/stage}"
 SLATE_INSTALL_HOST="${LORRAX_SLATE_INSTALL_DIR:-/global/homes/j/jackm/software/slate/install}"
 if [[ -d "${LORRAX_FFI_SLATE_DIR}" ]]; then
     VOL_FLAGS+=(--volume="${LORRAX_FFI_SLATE_DIR}:/lorrax_slate")
