@@ -72,7 +72,7 @@ LORRAX_MPI_TYPE_DEFAULT="cray_shasta"
 # math_libs/<cuda>/targets/x86_64-linux/include/cusolverMp.h.
 #
 # 0.7.2_cuda12.9: standalone PyPI wheel ``nvidia-cusolvermp-cu12==0.7.2.888``
-# extracted into /pscratch/sd/j/jackm/lorrax_nvhpc/0.7.2_cuda12.9/...  This
+# extracted into $HOME/software/lorrax_nvhpc/0.7.2_cuda12.9/...  This
 # is the working baseline: it includes the CAL→NCCL ABI fix (release 0.7.0)
 # AND the race-condition follow-up (release 0.7.2) so distributed LU on a
 # 2D process grid actually returns correct answers.  Validated on Px=Py=2
@@ -96,10 +96,12 @@ LORRAX_DARSHAN_LIB_DIR="/global/common/software/nersc9/darshan/default/lib"
 
 # Default host-side paths for the 3 FFI bind-mount stages.  Users can
 # override with LORRAX_FFI_{NVHPC,PHDF5,SLATE}_DIR before `module load`.
-# NERSC exports $SCRATCH for every user — use it as the default root.
-LORRAX_FFI_NVHPC_DIR_DEFAULT="$SCRATCH/lorrax_nvhpc"
-LORRAX_FFI_PHDF5_DIR_DEFAULT="$SCRATCH/lorrax_phdf5_cray/stage"
-LORRAX_FFI_SLATE_DIR_DEFAULT="$SCRATCH/lorrax_slate_cray/stage"
+# Relocated off $SCRATCH to $HOME/software 2026-06-24: scratch is purged on
+# inactivity, and these are small read-once libs that belong on non-purged $HOME
+# (matches LORRAX_SLATE_INSTALL_DIR_DEFAULT below).
+LORRAX_FFI_NVHPC_DIR_DEFAULT="$HOME/software/lorrax_nvhpc"
+LORRAX_FFI_PHDF5_DIR_DEFAULT="$HOME/software/lorrax_phdf5_cray/stage"
+LORRAX_FFI_SLATE_DIR_DEFAULT="$HOME/software/lorrax_slate_cray/stage"
 
 # Host SLATE install (bundled blaspp/lapackpp alongside).  Override with
 # LORRAX_SLATE_INSTALL_DIR before `module load`.
