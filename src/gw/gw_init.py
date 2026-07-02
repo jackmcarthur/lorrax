@@ -404,103 +404,6 @@ def compute_optimal_chunks(
     }
 
 
-def _apply_aot_chunk_model(
-    chunks: dict, cfg, meta, mesh_xy, *,
-    band_range_left: tuple[int, int],
-    band_range_right: tuple[int, int],
-    print_fn, rank0: bool,
-) -> float | None:
-    """Run the AOT chunk-chooser, optionally overriding ``chunks`` in place.
-
-    Two modes:
-
-    - ``cfg.memory.use_aot_chunk_chooser=True``: the AOT chooser picks
-      ``chunk_r`` and ``band_chunk``; the heuristic's existing values are
-      overridden.  ``cfg.memory.chunk_chooser_mode=analytic`` swaps the
-      regressed-fit analytic chooser in for the default 20/80 heuristic.
-    - ``cfg.memory.use_aot_chunk_chooser=False``: the AOT *predictor* runs
-      alongside the heuristic and prints its predicted peak — used for γ
-      calibration against the runtime nvidia-smi sample taken inside
-      ``fit_zeta``.
-
-    Returns the AOT-predicted peak in GB (or ``None`` if the AOT path
-    isn't importable; the heuristic still drives sizing in that case).
-    """
-    mem = cfg.memory
-    try:
-        from gw.aot_memory_model import (
-            predict_kernel_peak, SysDims, MeshSpec, Knobs,
-            choose_chunks_analytic, choose_chunks_heuristic,
-            describe_chunks,
-        )
-    except Exception as exc:
-        if mem.use_aot_chunk_chooser and rank0:
-            print_fn(
-                f"    AOT chooser FAILED ({exc!r}); falling back to heuristic."
-            )
-        return None
-
-    p_x, p_y = mesh_xy.devices.shape
-    # n_b = UNION range (bytes of psi_G cache / band-chunk FFT).
-    # n_b_sum = nb_L + nb_R (L+R pair-density work + centroid bytes).
-    # Symmetric production GW has nb_L == nb_R == nb_full so n_b_sum == 2·n_b;
-    # asymmetric windows (pseudobands, sub-valence, extra-cond) are handled.
-    nb_L = band_range_left[1] - band_range_left[0]
-    nb_R = band_range_right[1] - band_range_right[0]
-    nb_full = (max(band_range_left[1], band_range_right[1])
-               - min(band_range_left[0], band_range_right[0]))
-    aot_sys = SysDims(
-        kgrid=tuple(meta.kgrid),
-        fft_grid=tuple(meta.fft_grid),
-        n_rmu=int(meta.n_rmu),
-        n_s=int(meta.nspinor),
-        n_b=int(nb_full),
-        n_b_sum=int(nb_L + nb_R),
-        n_r=int(meta.n_rtot),
-    )
-    aot_mesh = MeshSpec(p_x=int(p_x), p_y=int(p_y))
-
-    if mem.use_aot_chunk_chooser:
-        # 20/80 heuristic is the default — no DoE deps.  Cohsex.in
-        # ``chunk_chooser_mode=analytic`` swaps in the regressed-fit
-        # analytic chooser instead.
-        chooser_mode = mem.chunk_chooser_mode
-        budget_bytes = (
-            mem.per_device_gb * 1e9 * mem.chunk_target_utilization
-        )
-        if chooser_mode == "analytic":
-            choice = choose_chunks_analytic(
-                aot_sys, aot_mesh, budget_bytes=budget_bytes,
-                kernel_name="fit_one_rchunk", tag="current",
-            )
-        else:
-            choice = choose_chunks_heuristic(
-                aot_sys, aot_mesh, budget_bytes=budget_bytes,
-            )
-        if rank0:
-            print_fn(f"    {describe_chunks(choice)}")
-        # Override chunk_r / band_chunk.  Keep q_chunk, q_gather, k_chunk
-        # from the heuristic — the AOT model doesn't cover them yet.
-        chunks['chunk_r'] = int(choice.chunk_r)
-        chunks['band_chunk'] = int(choice.band_chunk)
-        return choice.peak_bytes / 1e9
-
-    # Predict-only path: the AOT model logs its prediction next to the
-    # heuristic's pick so γ = runtime / AOT-pred can be computed downstream.
-    aot_peak_bytes = predict_kernel_peak(
-        "fit_one_rchunk", aot_sys,
-        Knobs.of(chunk_r=int(chunks['chunk_r']),
-                 band_chunk=int(chunks['band_chunk'])),
-        aot_mesh, tag="current",
-    )
-    if rank0:
-        print_fn(
-            f"    AOT fit_one_rchunk peak (driver-level): "
-            f"{aot_peak_bytes / 1e9:.2f} GB"
-        )
-    return aot_peak_bytes / 1e9
-
-
 def get_effective_chunk_size(chunk_size: int) -> int | None:
     """Convert chunk_size flag: -1=None (all bands), 0=auto (64), 1-2048=explicit."""
     if chunk_size == -1:
@@ -551,7 +454,6 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	band_range_right = (band_slices.b1, band_slices.b4)   # sigma val + all cond
 
 	mem_est = chunks.get('memory_estimate', {})
-	aot_peak_gb = None  # filled in below if the AOT model is available
 	_rank0 = (jax.process_index() == 0)
 	if _rank0 and mem_est:
 		print_fn(f"    Memory estimate: peak {mem_est['peak_estimate_gb']:.2f} GB "
@@ -561,23 +463,6 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			print_fn(f"    Per-stage: " + "  ".join(f"{k}={v:.2f}" for k, v in stages.items()) + " GB")
 
 	# AOT-derived driver-level peak + (optional) chunk-size override.
-	# Two responsibilities folded together for symmetry: when
-	# ``cfg.use_aot_chunk_chooser`` is set, the AOT chooser overrides
-	# chunk_r / band_chunk; otherwise the AOT model just *predicts* the
-	# peak alongside the heuristic for γ-calibration logging.  See
-	# ``_apply_aot_chunk_model``.
-	#
-	# CRITICAL: this block runs on EVERY rank.  Historically the rank-0
-	# guard caused mismatched ``band_chunk`` across ranks → mismatched
-	# NCCL buffers in ``_fft_gather_reshard`` → hang on the 2nd band
-	# chunk.  Only ``print_fn`` is rank-0-only.
-	aot_peak_gb = _apply_aot_chunk_model(
-		chunks, cfg, meta, mesh_xy,
-		band_range_left=band_range_left,
-		band_range_right=band_range_right,
-		print_fn=print_fn, rank0=_rank0,
-	)
-
 	# G-flat memory model.  Picks band_chunk + chunk_r + gflat_chunk_size
 	# via a four-peak (A: centroid load · B: CCT/chol · C: fit_one_rchunk
 	# · D: accumulate) model.  Reports a per-rank HBM HWM estimate
@@ -730,16 +615,6 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		peak_gb = peak_bytes / 1e9
 		print_fn(f"    GPU high-water mark: {peak_gb:.2f} GB / {budget_gb:.2f} GB budget "
 		         f"({100 * peak_gb / budget_gb:.0f}%)")
-		# γ calibration: runtime peak vs AOT-predicted peak.  γ > 1 means
-		# AOT under-predicts (expected for FFT-heavy kernels because
-		# cuFFT scratch is invisible to memory_analysis); γ < 1 means
-		# AOT over-predicts (often XLA remat triggered at runtime).
-		# Logged for manual tracking — wire a CLI to roll these into
-		# per-kernel γ calibration once we have enough data.
-		if aot_peak_gb is not None and aot_peak_gb > 0:
-			gamma = peak_gb / aot_peak_gb
-			print_fn(f"    γ (runtime / AOT-pred) = {gamma:.3f}  "
-			         f"(AOT predicted {aot_peak_gb:.2f} GB)")
 
 	# Default: no transverse-channel ψ to surface to the caller.
 	transverse_wfn_data = None

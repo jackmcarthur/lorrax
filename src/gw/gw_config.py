@@ -9,7 +9,7 @@ along the same axes the input file's section comments already use:
     config.minimax     — screening-minimax target error / max nodes / table mode
     config.ppm         — PPM model + sigma quadrature + on-shell σ_c options
     config.sigma_grid  — ω-grid for Σ_c(ω) output
-    config.memory      — chunk sizing + AOT chunk-chooser
+    config.memory      — chunk sizing
     config.backend     — FFI/IO backend selection (slab_io / gspace_io / screening_solver)
     config.debug       — debug-only flags & file paths
     config.bse         — BSE interpolation setup (htransform-driven)
@@ -219,20 +219,6 @@ _DEFAULTS = {
     #                   Zero persistent host residency (needed for
     #                   huge systems where host RAM can't hold ψ(G)).
     "gspace_mode": "host_cache",
-    # AOT-fit chunk chooser: replaces the per-stage byte heuristic in
-    # compute_optimal_chunks with the driver-level
-    # ``aot_memory_model.choose_chunks_aot`` — minimises total FLOPs
-    # subject to the predicted peak fitting under the memory budget.
-    # Requires fit artifacts at
-    # src/gw/aot_memory_model/artifacts/fit_one_rchunk__current__*.json.
-    "use_aot_chunk_chooser": False,
-    # When ``use_aot_chunk_chooser`` is True, ``chunk_chooser_mode``
-    # picks between the AOT chooser variants:
-    #   "heuristic" – default; per-stage byte heuristic over the AOT
-    #                 fit artifacts.
-    #   "analytic"  – regressed-fit analytic chooser (alternate model
-    #                 over the same artifacts).
-    "chunk_chooser_mode": "heuristic",
     # ``accumulate_rchunk_to_gflat`` flat-axis chunker.  Bounds the
     # per-scan-iter FFT box ``chunk_size · n_rtot``.
     # 0 (default) = one-shot; the gflat memory model overrides this
@@ -609,8 +595,6 @@ class MemoryConfig:
     band_chunk_size: int
     r_chunk_override: int         # 0 = auto
     zct_stage_cap_gb: float | None
-    use_aot_chunk_chooser: bool
-    chunk_chooser_mode: str       # "heuristic" | "analytic"
     gflat_chunk_size: int         # 0 = one-shot (or planner-picked)
     vq_g_chunk_size: int          # 0 = auto _pick_g_chunk(ngkmax)
 
@@ -966,8 +950,6 @@ class LorraxConfig:
             band_chunk_size=int(_g("band_chunk_size")),
             r_chunk_override=int(_g("r_chunk_size")),
             zct_stage_cap_gb=zct_stage_cap_gb,
-            use_aot_chunk_chooser=bool(_g("use_aot_chunk_chooser")),
-            chunk_chooser_mode=str(_g("chunk_chooser_mode")).strip().lower(),
             gflat_chunk_size=int(_g("gflat_chunk_size")),
             vq_g_chunk_size=int(_g("vq_g_chunk_size")),
         )
