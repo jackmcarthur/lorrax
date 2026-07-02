@@ -11,18 +11,24 @@ def write_sigma_to_file(
 	filename="eqp0.dat",
 	sigma_coh_kij_eV=None,
 	hartree_kij_eV=None,
+	energies_dft_ev=None,
 	*,
 	sx_label: str = "sigSX",
 	corr_label: str = "sigCOH",
 	total_label: str = "sigTOT",
 ):
 	"""Write self-energy components to file.
-	
+
 	Args:
 		sigma_sx_kij_eV: Exchange-like self-energy in eV, shape (nk, nb, nb)
 		filename: Output file path
 		sigma_coh_kij_eV: Correlation-like self-energy in eV, shape (nk, nb, nb)
 		hartree_kij_eV: Hartree matrix elements in eV, shape (nk, nb, nb)
+		energies_dft_ev: DFT (mean-field) band energies in eV, shape (nk, nb).
+			When given, an ``Eo=`` column is written per row so the file can be
+			aligned band-for-band against a BGW ``sigma_hp`` output (which lists
+			``Eo``) — the mean-field energy is the reference-free key that ties
+			LORRAX's band window to BGW's.
 		sx_label: Text label for first self-energy column
 		corr_label: Text label for second self-energy column
 		total_label: Text label for the sum of first and second columns
@@ -75,7 +81,12 @@ def write_sigma_to_file(
 					line += f"  VH={hv_re:>12.6f}"
 					if abs(hv_im) > 1e-10:
 						line += f"+{hv_im:>10.6f}i"
-				
+
+				# Trailing Eo= column (mean-field energy) — appended last so
+				# existing sigSX/sigCOH/sigTOT/VH parsers are unaffected.
+				if energies_dft_ev is not None:
+					line += f"  Eo={float(energies_dft_ev[k, n]):>12.6f}"
+
 				f.write(line + "\n")
 
 

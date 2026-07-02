@@ -263,6 +263,7 @@ def write_results(
         sigma_diag_file,
         sigma_coh_kij_eV=corr_out,
         hartree_kij_eV=sig_h_out,
+        energies_dft_ev=r2e * np.asarray(results.E_dft_ry, dtype=np.float64),
         sx_label="sigX" if results.use_ppm else "sigSX",
         corr_label="sigC" if results.use_ppm else "sigCOH",
         total_label="sigXC" if results.use_ppm else "sigTOT",
