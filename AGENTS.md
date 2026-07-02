@@ -90,8 +90,62 @@ See [`config/README.md`](config/README.md) for the full cluster reference. Docs:
 - Match existing formatting. Do not reformat unrelated lines.
 - Every function implementing a physics equation should reference what it is computing for human readability standards.
 
-### JAX sharding rules
+## CONVENTIONS (load before editing GW code)
 
+These are the norms that make the codebase legible to humans and one-shottable by models.
+They are enforced by review and the regression gate, not by ceremony. When a convention
+forces a bigger change than the task, flag it — don't silently violate it. See the refactor
+map at `lorrax_sandbox/reports/gw_refactor_map_2026-07-01/` (`MAP.md`, `FEATURES.md`) for how
+the pipeline is organized and where a new feature belongs.
+
+### Structure & style
+- **Procedural on plain arrays, not new API layers.** LORRAX is scientific code read by
+  physicists. Do not introduce classes/dataclasses/wrappers for what a function on numpy/jax
+  arrays does. No `BzIbzTable`, no `SymAction` object — augment the existing bundle/table with
+  an accessor instead. New abstractions cost human bandwidth; justify them or skip them.
+- **`main()` reads as a physics outline.** The driver is a sequence of named stage calls
+  (ζ-fit → V_q → χ₀/W → Σ → eqp), not inlined machinery. Machinery lives in the stage helper.
+- **Minimal signatures — pass bundles, not 15 arrays.** Thread `(wfns, meta, config/opts)`
+  bundles through stages. If a function takes >~6 positional arrays, it wants a bundle.
+- **Single source of truth. No parallel old/new paths.** Never add `fetch_X_dyn` beside
+  `fetch_X`, never leave a deprecated facade on the import path "for now". If you change a
+  routine, delete the old one in the same change. Duplicated logic (the cohsex.in parser ×3,
+  the eqp/Z math ×4) is a defect to collapse, not a pattern to extend.
+
+### JAX / arrays
+- **One FFT path: the sharded FFT helpers in `common/fft_helpers.py`.** Never call
+  `jnp.fft.*` directly in a stage kernel. All G↔r transforms go through the helper factories
+  so sharding, box placement, and Bloch phases stay consistent — and so the whole package can
+  be upgraded FFT→NUFFT in one place. A raw `jnp.fft` in a kernel is a bug.
+- **k/q dimensions are FLAT axes, never folded into the FFT grid.** Store and shard k-points
+  (and q-points) as an explicit leading flat axis; do the spatial FFT over the grid axes only.
+  This keeps the k-axis independent of the spatial transform so FFT→NUFFT and flat-k batching
+  (see `project_flat_k_chi0_pipeline`) stay drop-in. Do not reshape k into the FFT box.
+- **Big read-only host caches go through `io_callback`, never jit args.** ψ(G) and other large
+  read-only arrays live on host (`common/psi_G_store.py`) and are pulled per-slice inside the
+  jit via `io_callback`. Passing them as jit arguments replicates them on every device — an OOM.
+- **Sharding: mesh axes by name (`'x'`, `'y'`), always `NamedSharding`/`PartitionSpec`.** Never
+  hard-code mesh shapes. Let XLA move data — no `np.concatenate`, no host-side gathers.
+- **No replicated large intermediates.** We are memory-constrained; most large arrays only fit
+  tiled over the XY grid. Any op that rematerializes a large array on a subset of processors is
+  a defect to fix, not a budget to work around (`feedback_zero_replicated_intermediates_principle`).
+  Python-unrolled inner loops inside jit pile up N× unsharded slots — use `scan` *inside*
+  `shard_map`, not a naive `fori_loop` (`feedback_path_d_scaffolding_pattern`).
+
+### Symmetry
+- **One IBZ table + one sym-action helper.** ψ, ζ, V_q, W transform as the same kind of object
+  under space-group + TRS. Route every unfold through the canonical `SymMaps` table and a single
+  sym-action helper. Do not add per-object "rotate X at q" variants (there are historically ≥6;
+  they are being retired — `feedback_unified_sym_action`). TRS index handling must be explicit;
+  never silently clip or nearest-fallback an unmapped k (that was the TRS-blind bug).
+
+### Physics reporting
+- **Don't blame residuals on "ISDF rank" without evidence.** Plateau-shaped LORRAX-vs-BGW
+  disagreement rules out basis error — chase an algorithm/convention difference instead
+  (`feedback_no_isdf_rank_excuse`). Common convention gotchas live in `FLAGS.md` (`sys_dim`,
+  `bare_coulomb_cutoff`, velocity-operator sign).
+
+### JAX sharding rules (restated)
 - Never hard-code mesh shapes. Refer to mesh axes by name (`'x'`, `'y'`).
 - Use `NamedSharding` / `PartitionSpec` for all layouts. Let XLA handle communication, no `np.concatenate` or
   host-side gathers.
