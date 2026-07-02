@@ -754,22 +754,34 @@ def main(argv=None):
 	# (using state_final.H_qp_dft) — same physics, slightly different
 	# numerics from the post-Σ-seam eigh path.  Skip the second write
 	# in SC to avoid clobbering.
+	# The one-shot dump is an IBZ-only writer: it rotates the DFT bands the
+	# WFN carries coefficients for, so it needs Σ (hence U_full/E_full) on the
+	# same k-set as the WFN.  When Σ is unfolded to the full BZ (line 275) the
+	# eigh runs on nk_full > wfn.nkpts and this path cannot build the artifact
+	# — skip with a warning rather than crash the whole run (the writer would
+	# raise ValueError on the k-count mismatch).
 	if config.debug.write_wfn_h5 and not config.self_consistent:
-		from file_io.qp_wfn import write_qp_wfn_h5
-		_qp_wfn_path = os.path.join(input_dir, "WFN_qp.h5")
-		if jax.process_index() == 0:
-			write_qp_wfn_h5(
-				_qp_wfn_path, wfn=wfn,
-				U_kmn=np.asarray(U_full, dtype=np.complex128),
-				enk_active_qp_ry=np.asarray(E_full, dtype=np.float64),
-				band_start=band_slices.b0, band_stop=band_slices.b3,
-			)
-		try:
-			from jax.experimental import multihost_utils as _mh
-			_mh.sync_global_devices("oneshot_qp_wfn_h5_write")
-		except Exception:
-			pass
-		print0(f"  QP WFN (one-shot): {_qp_wfn_path}")
+		if int(U_full.shape[0]) != int(wfn.nkpts):
+			print0(
+				f"  QP WFN (one-shot): skipped — Σ on {int(U_full.shape[0])} "
+				f"k-points but WFN carries {int(wfn.nkpts)} (IBZ); the one-shot "
+				f"dump only supports IBZ-Σ. Set debug.write_wfn_h5=false to silence.")
+		else:
+			from file_io.qp_wfn import write_qp_wfn_h5
+			_qp_wfn_path = os.path.join(input_dir, "WFN_qp.h5")
+			if jax.process_index() == 0:
+				write_qp_wfn_h5(
+					_qp_wfn_path, wfn=wfn,
+					U_kmn=np.asarray(U_full, dtype=np.complex128),
+					enk_active_qp_ry=np.asarray(E_full, dtype=np.float64),
+					band_start=band_slices.b0, band_stop=band_slices.b3,
+				)
+			try:
+				from jax.experimental import multihost_utils as _mh
+				_mh.sync_global_devices("oneshot_qp_wfn_h5_write")
+			except Exception:
+				pass
+			print0(f"  QP WFN (one-shot): {_qp_wfn_path}")
 
 	# PPM mode: feed the writer the on-shell diag(Σ_c(E_DFT)) (Ry) so the
 	# eqp0.dat "sigC" column reports dynamic correlation directly comparable
