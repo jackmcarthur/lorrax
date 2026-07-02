@@ -1485,7 +1485,7 @@ def main(argv=None):
     truncation_2d = args.truncation_2d
     n_cond_bands = args.n_cond_bands
     if args.input:
-        from psp.get_DFT_mtxels import read_cohsex_input
+        from gw.gw_config import read_lorrax_input as read_cohsex_input
         input_path = Path(args.input).resolve()
         params = read_cohsex_input(str(input_path))
         if wfn_path is None:

@@ -90,81 +90,10 @@ except Exception:
  
 
 
-def read_cohsex_input(filename: str) -> dict:
-    """Parse input file, ignoring non-INI blocks like K_POINTS.
-
-    We locate the [cohsex] section, strip any embedded K_POINTS {crystal_b}
-    block before feeding to ConfigParser, and fall back to sensible defaults
-    if the section is missing. This mirrors the robust parser used in
-    `gw.gw_init.read_cohsex_input`.
-    """
-    with open(filename, 'r') as f:
-        lines = f.readlines()
-
-    # Find [cohsex] section bounds
-    start = None
-    for i, l in enumerate(lines):
-        if l.strip().lower().startswith('[cohsex]'):
-            start = i
-            break
-    if start is None:
-        # fallback: find first INI-like section
-        for i, l in enumerate(lines):
-            if re.match(r"\s*\[.*\]", l):
-                start = i
-                break
-    end = len(lines)
-
-    # Locate optional K_POINTS block (count line + segments lines)
-    kp_idx = None
-    for i, l in enumerate(lines):
-        if l.strip().lower().startswith('k_points'):
-            kp_idx = i
-            break
-    kp_end = None
-    if kp_idx is not None and kp_idx + 1 < len(lines):
-        try:
-            seg_count = int(lines[kp_idx + 1].strip().split()[0])
-        except Exception:
-            seg_count = 0
-        kp_end = min(len(lines), kp_idx + 2 + max(seg_count, 0))
-
-    if start is not None:
-        for j in range(start + 1, len(lines)):
-            if re.match(r"\s*\[.*\]", lines[j]):
-                end = j
-                break
-        # Remove K_POINTS block inside the section before parsing
-        if kp_idx is not None and (start <= kp_idx < end):
-            section_lines = lines[start:kp_idx] + lines[(kp_end if kp_end is not None else kp_idx+1):end]
-            ini_text = ''.join(section_lines)
-        else:
-            ini_text = ''.join(lines[start:end])
-        parser = configparser.ConfigParser()
-        parser.read_string(ini_text)
-        section = parser["cohsex"] if "cohsex" in parser else parser[parser.sections()[0]]
-        getb = section.getboolean
-        get = section.get
-        geti = section.getint
-        return {
-            "wfn_file": get("wfn_file", fallback="WFN.h5"),
-            "nval": geti("nval", fallback=5),
-            "ncond": geti("ncond", fallback=5),
-            "nband": geti("nband", fallback=100),
-            "bispinor": getb("bispinor", fallback=False),
-            "ecutrho_eV": section.getfloat("ecutrho", fallback=None),
-            "sys_dim": geti("sys_dim", fallback=3),
-        }
-    # Fallback defaults if no INI sections found
-    return {
-        "wfn_file": "WFN.h5",
-        "nval": 5,
-        "ncond": 5,
-        "nband": 100,
-        "bispinor": False,
-        "ecutrho_eV": None,
-        "sys_dim": 3,
-    }
+# NOTE: the cohsex.in parser lived here as a duplicate of
+# gw.gw_config.read_lorrax_input.  It was consolidated 2026-07-02 — all
+# consumers now import ``read_lorrax_input as read_cohsex_input`` from
+# gw.gw_config (single source of truth for the [cohsex] flag surface).
 
 
 def get_bandranges(nv, nc, nband, nelec):
@@ -798,7 +727,8 @@ def main(argv=None):
     
     timing.reset()
 
-    # Read input parameters
+    # Read input parameters (canonical parser — single source of truth)
+    from gw.gw_config import read_lorrax_input as read_cohsex_input
     print(f"\nReading input from: {args.input}")
     params = read_cohsex_input(args.input)
     
@@ -844,13 +774,14 @@ def main(argv=None):
     print(f"  FFT grid: {meta.fft_grid}")
     print(f"  Spinor components: {meta.nspinor}")
 
-    # If ecutrho provided, attach the rho FFT grid on the WFN object
-    ecutrho_eV = params.get("ecutrho_eV", None)
-    if ecutrho_eV is not None:
-        ecutrho_ry = float(ecutrho_eV)  # field is actually Ry despite the name
-        # Use 2× wavefunction grid as default rho grid
-        setattr(wfn, 'grid_rho', tuple(2 * n for n in meta.fft_grid))
-        print(f"  Using ecutrho = {ecutrho_ry:.3f} Ry; rho grid = {wfn.grid_rho}")
+    # Density-grid cutoff (Ry): explicit ``ecutrho`` from the input, else default
+    # to the WFN's own ``ecutwfc`` so the rho grid is always attached.
+    _ecutrho_in = params.get("ecutrho")
+    ecutrho_ry = float(_ecutrho_in) if _ecutrho_in is not None else float(wfn.ecutwfc)
+    setattr(wfn, 'grid_rho', tuple(2 * n for n in meta.fft_grid))  # 2× wavefunction grid
+    print(f"  Using ecutrho = {ecutrho_ry:.3f} Ry "
+          f"({'input' if _ecutrho_in is not None else 'default=WFN ecutwfc'}); "
+          f"rho grid = {wfn.grid_rho}")
     
     # Set up JAX device mesh
     total_devices = jax.process_count() * jax.local_device_count()

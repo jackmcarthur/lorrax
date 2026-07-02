@@ -31,7 +31,8 @@ import common.timing as timing
 from psp.pseudos import load_pseudopotentials, build_atom_pp_assignments
 from psp.dft_operators import generate_gvectors_k, vnl_matrix_from_kdata
 from psp.radial.build_projectors_qe import build_local_ionic_potential_on_G_total
-from psp.get_DFT_mtxels import read_cohsex_input, compute_kinetic_k, compute_local_V_k
+from gw.gw_config import read_lorrax_input as read_cohsex_input
+from psp.get_DFT_mtxels import compute_kinetic_k, compute_local_V_k
 from psp.operator_checks import validate_operator_inputs
 import psp.vnl_ops as vnl_ops
 

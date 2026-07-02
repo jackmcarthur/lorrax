@@ -155,6 +155,9 @@ _DEFAULTS = {
     "ncond": 5,
     "nband": 100,
     "sys_dim": 2,
+    # Density-grid cutoff (Ry) for the psp matrix-element tools (kin_ion /
+    # dipole).  None → the consumer defaults it to the WFN's own ``ecutwfc``.
+    "ecutrho": None,
     # File paths
     "wfn_file": "WFN.h5",
     "centroids_file": "centroids_frac.txt",
