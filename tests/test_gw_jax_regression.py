@@ -37,15 +37,17 @@ def _requested_platform() -> str:
     return platform
 
 
-def _parse_eqp_rows(path: Path) -> np.ndarray:
+def _parse_eqp_rows(path: Path, labels=("sigSX", "sigCOH", "sigTOT")) -> np.ndarray:
     float_re = r"([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
     imag_opt = rf"(?:\+\s*{float_re}i)?"  # optional imaginary part (not captured when absent)
-    # Match: n=<band> sigSX=<re>[+<im>i] sigCOH=<re>[+<im>i] sigTOT=<re>[+<im>i] VH=<re>[+<im>i]
+    a, b, c = labels  # COHSEX: sigSX/sigCOH/sigTOT ;  GN-PPM: sigX/sigC/sigXC
+    # Match: n=<band> <a>=<re>[+<im>i] <b>=<re>[+<im>i] <c>=<re>[+<im>i] VH=<re>[+<im>i]
+    # (a trailing Eo= column, if present, is ignored — the regex is unanchored.)
     data_re = re.compile(
         rf"n=\s*(\d+)\s+"
-        rf"sigSX=\s*{float_re}{imag_opt}\s+"
-        rf"sigCOH=\s*{float_re}{imag_opt}\s+"
-        rf"sigTOT=\s*{float_re}{imag_opt}\s+"
+        rf"{a}=\s*{float_re}{imag_opt}\s+"
+        rf"{b}=\s*{float_re}{imag_opt}\s+"
+        rf"{c}=\s*{float_re}{imag_opt}\s+"
         rf"VH=\s*{float_re}{imag_opt}"
     )
     kpt_re = re.compile(r"k-point\s+(\d+)\s*:")
@@ -72,35 +74,53 @@ def _parse_eqp_rows(path: Path) -> np.ndarray:
         rows.append([float(kpt), float(band), sx_re, coh_re, tot_re, vh_re, vh_im])
 
     if not rows:
-        raise ValueError(f"No COHSEX data rows were parsed from {path}")
+        raise ValueError(f"No Sigma data rows were parsed from {path}")
     return np.asarray(rows, dtype=np.float64)
 
 
+# (case_id, subdir, input_name, output_name, reference_name, sigma_labels)
+# COHSEX: static Σ (sigSX/sigCOH/sigTOT) on WFNsmall; GN-PPM: dynamic Σc
+# (sigX/sigC/sigXC) on a full MoS2 3×3 WFN (WFNsmall is incompatible with the
+# dynamic build_G path — see reports/gw_refactor_map_2026-07-01/BUGS_FOUND.md).
+_REG = REPO_ROOT / "tests" / "regression"
+_CASES = [
+    ("cohsex", _REG / "cohsex_debug", "cohsex_test.in", "eqp_test.dat",
+     "eqp_ref.dat", ("sigSX", "sigCOH", "sigTOT")),
+    ("gnppm", _REG / "gnppm_debug", "gnppm_test.in", "sigma_diag_gnppm_test.dat",
+     "sigma_diag_gnppm_ref.dat", ("sigX", "sigC", "sigXC")),
+]
+
+
 @pytest.mark.regression
-def test_gw_jax_matches_reference(tmp_path):
+@pytest.mark.parametrize(
+    "case_id,case_dir,input_name,output_name,ref_name,labels",
+    _CASES,
+    ids=[c[0] for c in _CASES],
+)
+def test_gw_jax_matches_reference(
+    tmp_path, case_id, case_dir, input_name, output_name, ref_name, labels
+):
     platform = _requested_platform()
     if platform in {"gpu", "cuda"} and not _gpu_available():
         pytest.skip("CUDA GPU not available for requested ISDF_COHSEX_TEST_PLATFORM=gpu.")
 
-    assert INPUT_FILE.exists(), f"Missing regression input: {INPUT_FILE}"
-    assert REFERENCE_FILE.exists(), f"Missing regression reference: {REFERENCE_FILE}"
+    input_src = case_dir / input_name
+    reference_file = case_dir / ref_name
+    assert input_src.exists(), f"Missing regression input: {input_src}"
+    assert reference_file.exists(), f"Missing regression reference: {reference_file}"
 
-    run_dir = tmp_path / "cohsex_debug"
+    run_dir = tmp_path / case_dir.name
     shutil.copytree(
-        CASE_DIR,
+        case_dir,
         run_dir,
         ignore=shutil.ignore_patterns(
-            "tmp",
-            "eqp_test.dat",
-            "eqp0_test.dat",
-            "eqp1_test.dat",
-            "sigma_diag.dat",
-            "eqp0.dat",
-            "eqp1.dat",
+            "tmp", output_name,
+            "eqp_test.dat", "eqp0_test.dat", "eqp1_test.dat",
+            "sigma_diag.dat", "eqp0.dat", "eqp1.dat",
         ),
     )
-    input_file = run_dir / INPUT_FILE.name
-    output_file = run_dir / OUTPUT_FILE.name
+    input_file = run_dir / input_name
+    output_file = run_dir / output_name
 
     env = os.environ.copy()
     cache_dir = Path(env.get("JAX_COMPILATION_CACHE_DIR", str(REPO_ROOT / ".pytest_jax_cache")))
@@ -135,12 +155,12 @@ def test_gw_jax_matches_reference(tmp_path):
         env=env,
         capture_output=True,
         text=True,
-        timeout=600,
+        timeout=900,
         check=False,
     )
     if result.returncode != 0:
         pytest.fail(
-            "COHSEX regression run failed.\n"
+            f"{case_id} regression run failed.\n"
             f"Command: {' '.join(cmd)}\n"
             f"stdout:\n{result.stdout}\n"
             f"stderr:\n{result.stderr}"
@@ -148,20 +168,19 @@ def test_gw_jax_matches_reference(tmp_path):
 
     assert output_file.exists(), f"Expected output file was not written: {output_file}"
 
-    ref_text = REFERENCE_FILE.read_text()
-    out_text = output_file.read_text()
-    if out_text == ref_text:
+    if output_file.read_text() == reference_file.read_text():
         return
 
-    ref_rows = _parse_eqp_rows(REFERENCE_FILE)
-    out_rows = _parse_eqp_rows(output_file)
+    ref_rows = _parse_eqp_rows(reference_file, labels)
+    out_rows = _parse_eqp_rows(output_file, labels)
     assert out_rows.shape == ref_rows.shape, (
         f"Row-count mismatch: output shape {out_rows.shape}, reference shape {ref_rows.shape}"
     )
 
-    # Compare only real-valued physics columns: kpt, band, sigSX, sigCOH, sigTOT, VH_re
-    # (exclude VH_imag which is noise-level and causes rtol issues when near zero)
+    # Compare only real-valued physics columns: kpt, band, <3 Σ components>, VH_re
+    # (exclude the imaginary/VH_imag noise-level parts; byte-identity above is the
+    # primary check, this atol path only absorbs GPU-nondeterministic last-ULP drift).
     try:
         np.testing.assert_allclose(out_rows[:, :6], ref_rows[:, :6], rtol=0.0, atol=1e-6)
     except AssertionError as exc:
-        pytest.fail(f"COHSEX output differs from reference beyond tolerance.\n{exc}")
+        pytest.fail(f"{case_id} output differs from reference beyond tolerance.\n{exc}")
