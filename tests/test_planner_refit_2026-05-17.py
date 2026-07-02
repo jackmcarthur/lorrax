@@ -28,7 +28,7 @@ import pytest
 from gw.gflat_memory_model import (
     plan_gflat_chunks,
     GFLAT_CHUNK_SIZE_CAP,
-    N_SPHERE_IDX_BUFFERS_BISPINOR,
+    N_SPHERE_IDX_BUFFERS,
 )
 
 
@@ -218,7 +218,7 @@ def test_sphere_idx_replicated_in_every_peak():
         bytes on every rank).  Down from 1.296 GB pre-fix.
     """
     plan = _natural_plan()
-    expected = (N_SPHERE_IDX_BUFFERS_BISPINOR
+    expected = (N_SPHERE_IDX_BUFFERS
                 * 36 * 75 * 75 * 200 * 4)
     for peak in ('A', 'B', 'C', 'D', 'E'):
         key = f'{peak}.sphere_idx_replicated'
@@ -226,7 +226,7 @@ def test_sphere_idx_replicated_in_every_peak():
         assert abs(val - expected) < expected * 0.01, (
             f"{key} = {val/1e9:.3f} GB; expected {expected/1e9:.3f} "
             f"GB (replicated, "
-            f"{N_SPHERE_IDX_BUFFERS_BISPINOR} buffers post-Round-4 fix).")
+            f"{N_SPHERE_IDX_BUFFERS} buffers post-Round-4 fix).")
 
 
 def test_peak_E_v_q_has_off_diagonal_tt_binding_term():
@@ -274,10 +274,10 @@ def test_non_bispinor_uses_fewer_sphere_buffers():
     per-cache_key closure rebuild) is fixed at the source, not papered
     over by a smaller per-channel multiplier.
 
-    N_SPHERE_IDX_BUFFERS_CHARGE was 3 pre-fix (1 from psi_G_store +
+    N_SPHERE_IDX_BUFFERS was 3 pre-fix (1 from psi_G_store +
     2 from wfn_transforms centroid_load).  Post-fix: 1.
     """
-    from gw.gflat_memory_model import N_SPHERE_IDX_BUFFERS_CHARGE
+    from gw.gflat_memory_model import N_SPHERE_IDX_BUFFERS
     plan = plan_gflat_chunks(
         meta=_cri3_80ry_meta(),
         mesh_xy=_cri3_80ry_mesh(),
@@ -288,10 +288,10 @@ def test_non_bispinor_uses_fewer_sphere_buffers():
         is_bispinor=False,
         max_chunks=64,
     )
-    sphere_charge = (N_SPHERE_IDX_BUFFERS_CHARGE
+    sphere_charge = (N_SPHERE_IDX_BUFFERS
                      * 36 * 75 * 75 * 200 * 4)
     val = plan.peak_components.get('C.sphere_idx_replicated', 0.0)
     assert abs(val - sphere_charge) < sphere_charge * 0.01, (
         f"Non-bispinor C.sphere_idx_replicated = {val/1e9:.3f} GB; "
         f"expected {sphere_charge/1e9:.3f} GB "
-        f"({N_SPHERE_IDX_BUFFERS_CHARGE} buffer post-Round-4 fix).")
+        f"({N_SPHERE_IDX_BUFFERS} buffer post-Round-4 fix).")

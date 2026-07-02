@@ -155,23 +155,10 @@ GFLAT_CHUNK_SIZE_CAP = 100
 # verify (agent_l_round5_liveverify.md §2) measured a steady-state of
 # 3 buffers, not 1.
 #
-# Round-6 (canonical-accessor refactor in ``common/load_wfns.py``
-# + ``common/wfn_transforms.py``, commits 9afa11e + da7b41f planner
-# bump): ``load_centroids_band_chunked`` now passes the loader's
-# device-resident ``box_index_dev(k, mesh)`` jax.Array directly to
-# ``gflat_to_rmu``, and ``gflat_to_rmu`` threads it through
-# ``shard_map``'s ``in_specs`` (Manual-mode-compatible) instead of
-# closure-capture.  All three pre-Round-6 sources now share the
-# WfnLoader-cached canonical allocation.  Round-6 live verify
-# (agent_m_round6.md) confirms the steady-state count is **1**
-# across both the charge channel and all 3 transverse bispinor
-# channels — no monotonic growth, no per-channel allocation.
-#
-# We keep these as named constants so future calibration / agent
-# probes have a single source of truth.  Verified post-Round-6
-# count: 1.
-N_SPHERE_IDX_BUFFERS_BISPINOR = 1
-N_SPHERE_IDX_BUFFERS_CHARGE = 1
+# Sphere-idx buffer count: one per rank — a single WfnLoader-cached
+# canonical allocation shared across the charge + all 3 transverse
+# bispinor channels (no per-channel growth).
+N_SPHERE_IDX_BUFFERS = 1
 
 
 @dataclasses.dataclass
@@ -395,9 +382,7 @@ def _peak_C_fit_one_rchunk(*, nk, ns, nq, nq_disk, mu, ngkmax, n_rtot, r_chunk,
 
 def _peak_D_accumulate(*, nk, ns, nq, nb_total, nq_disk, mu, n_rtot, ngkmax,
                        r_chunk, gflat_chunk_size, p, p_xy,
-                       fft_box_factor_D, fft_grid, n_sphere_buffers,
-                       use_query_fft_peak_bytes: bool = False,
-                       mesh_xy=None) -> dict:
+                       fft_box_factor_D, fft_grid, n_sphere_buffers) -> dict:
     """accumulate_rchunk_to_gflat peak — runs after fit_one_rchunk
     returns (its P_l/P_r are freed); ζ_chunk is the only fit_one_rchunk
     output still live.
@@ -408,13 +393,6 @@ def _peak_D_accumulate(*, nk, ns, nq, nb_total, nq_disk, mu, n_rtot, ngkmax,
     HLO calibration at agent_d_hlo_calibration M2 confirmed factor_D=2.0
     on cs=1 + cs=360 production runs (CrI3 6×6 80Ry bispinor).
 
-    When ``use_query_fft_peak_bytes`` is True, attempts to use
-    ``fft_helpers.query_fft_peak_bytes`` for an AOT-measured FFT peak
-    (XLA's ``memory_analysis()``).  Falls back to the constant
-    ``factor_D × box`` formula if the AOT compile fails.  Since
-    gflat_chunk_size is capped at 100 (well below the cuFFT algorithm
-    crossover at cs ~ 1000), this is mostly cosmetic — but it satisfies
-    the "HLO-traceable" principle for the FFT term.
     """
     # live_arrays signature: c128 (nk, ns, mu, nb_total) ×4 — sharded /p_xy
     #   lifetime class: persistent_throughout_zeta_fit
@@ -446,23 +424,6 @@ def _peak_D_accumulate(*, nk, ns, nq, nb_total, nq_disk, mu, n_rtot, ngkmax,
     #   verified in agent_d_hlo_calibration M2 module_0474 + M3 module_0363
     #   (2 box-sized slots × factor_D=2.0).
     fft_box_bytes = _bytes_c128(gflat_chunk_size, n_rtot) * fft_box_factor_D
-    if use_query_fft_peak_bytes and mesh_xy is not None:
-        try:
-            from common.fft_helpers import query_fft_peak_bytes
-            # Per-shape AOT measurement — gives the exact cuFFT scratch
-            # including plan workspace.  Falls back to factor_D=2.0 if
-            # the AOT compile fails (helper has its own 3× fallback at
-            # fft_helpers.py:87-99).
-            sharding = NamedSharding(
-                mesh_xy, P(None, None, None, None))  # cs replicated
-            measured = query_fft_peak_bytes(
-                input_shape=(int(gflat_chunk_size), *(int(v) for v in fft_grid)),
-                fft_axes=(1, 2, 3),
-                sharding=sharding,
-            )
-            fft_box_bytes = float(measured)
-        except Exception:
-            pass  # keep constant formula fallback
     transient = {
         "zeta_chunk":
             _bytes_c128(nq_disk, mu, r_chunk, shard=p_xy),
@@ -610,7 +571,6 @@ def plan_gflat_chunks(
     n_q_disk: int,
     budget_gb: float,
     target_utilization: float = 0.94,
-    fft_box_factor: float | None = None,    # legacy alias for fft_box_factor_A
     fft_box_factor_A: float = 4.0,
     fft_box_factor_D: float = 2.0,
     pair_density_slots_transverse: int | None = None,
@@ -621,7 +581,6 @@ def plan_gflat_chunks(
     band_chunk_override: int | None = None,
     gflat_chunk_size_override: int | None = None,
     use_ibz_T: bool = False,
-    use_query_fft_peak_bytes: bool = False,
     n_q_ibz: int | None = None,
 ) -> GFlatChunkPlan:
     """Pick (band_chunk, r_chunk, gflat_chunk_size) to land near
@@ -660,16 +619,11 @@ def plan_gflat_chunks(
       * ``is_bispinor`` ← ``cfg.bispinor`` (affects the sphere-idx
         leak count and pair_density_slots branch)
       * ``use_ibz_T`` ← derived from sym + centroid orbit closure
-      * ``use_query_fft_peak_bytes`` ← AOT-measure FFT peak (off by
-        default; flips on when calibrating the planner)
       * ``n_q_ibz`` ← IBZ q-count (defaults to full BZ for conservative
         Peak E)
 
     Returns a :class:`GFlatChunkPlan` with HWM = max of {A, B, C, D, E}.
     """
-    # Legacy alias.
-    if fft_box_factor is not None:
-        fft_box_factor_A = float(fft_box_factor)
     p_x = int(mesh_xy.shape['x'])
     p_y = int(mesh_xy.shape['y'])
     p_xy = p_x * p_y
@@ -686,11 +640,8 @@ def plan_gflat_chunks(
     # a SimpleNamespace meta working).
     fft_grid = tuple(getattr(meta, 'fft_grid', None) or
                      (int(round(n_rtot ** (1/3))),) * 3)
-    # Sphere-idx buffer count grows monotonically with channels.  At
-    # bispinor 4-channel V_q we measured 8 buffers; non-bispinor charge-
-    # only is 3.  Used in every peak (replicated leak persists).
-    n_sphere_buffers = (N_SPHERE_IDX_BUFFERS_BISPINOR if is_bispinor
-                        else N_SPHERE_IDX_BUFFERS_CHARGE)
+    # One replicated sphere-idx buffer per rank, charged in every peak.
+    n_sphere_buffers = N_SPHERE_IDX_BUFFERS
     # n_q_ibz for Peak E.  When the IBZ cascade is active for V_q,
     # per-tile zeta_L_all slabs shrink by n_q_full/n_q_ibz.  Default to
     # full BZ (conservative — matches the 0X_lorrax production run).
@@ -894,8 +845,6 @@ def plan_gflat_chunks(
         r_chunk=r_chunk, gflat_chunk_size=cs_for_box, p=p, p_xy=p_xy,
         fft_box_factor_D=fft_box_factor_D,
         fft_grid=fft_grid, n_sphere_buffers=n_sphere_buffers,
-        use_query_fft_peak_bytes=use_query_fft_peak_bytes,
-        mesh_xy=mesh_xy,
     )
     # ---- Peak E: V_q (dominant tile = TT off-diagonal, same_zeta=False)
     # CC tile: same_zeta=True, write_g0=True

@@ -502,7 +502,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		# scratch wiggle).  Wire it through MemoryConfig only when we
 		# add a separate ``gflat_target_utilization`` knob.
 		target_utilization=0.80,
-		fft_box_factor=4.0,
+		fft_box_factor_A=4.0,
 		is_bispinor=bool(cfg.bispinor),
 		max_chunks=64,
 		r_chunk_override=(
