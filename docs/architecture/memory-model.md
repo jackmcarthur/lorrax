@@ -24,16 +24,6 @@ LORRAX has **three** chunk choosers that can run together:
    `band_chunk` / `chunk_r` / introduces `gflat_chunk_size`.  Its
    `.format()` output is printed at the top of every `fit_zeta`.  See
    [§G-Flat Memory Model](#g-flat-memory-model) below.
-3. **AOT memory model (opt-in)** — `gw/aot_memory_model/`.  Per-kernel
-   NNLS fits of `memory_analysis()` peaks against dimensional primitives,
-   with an **analytic** closed-form chooser and a **20/80** heuristic
-   chooser that use those fits.  Enabled with
-   `use_aot_chunk_chooser: true` in `cohsex.in` (default `false`).  When
-   enabled, overrides the heuristic's `chunk_r` and `band_chunk`; keeps
-   the heuristic's `q_chunk`, `q_gather`, `k_chunk`.  See
-   [§AOT Memory Model](#aot-memory-model) below and the per-kernel
-   artifact JSONs under
-   [`src/gw/aot_memory_model/artifacts/`](../../src/gw/aot_memory_model/artifacts/).
 
 Conventions throughout this doc:
 
@@ -581,12 +571,8 @@ Run order in `gw_init.fit_zeta`:
    [§G-Flat Memory Model](#g-flat-memory-model).
 4. **μ-chunk (V_q driver)** sized from the formula above, clamped
    against a fresh `get_device_memory_gb` query.
-5. **AOT override (optional)**: if `use_aot_chunk_chooser = true`,
-   `choose_chunks_heuristic` or `choose_chunks_analytic` rewrites
-   `chunks['chunk_r']` / `chunks['band_chunk']` again.
-6. **Instrumentation**: planner returns `peak_estimate_gb`,
-   `bottleneck`, per-peak breakdown, and budget; AOT chooser adds
-   `ChunkChoice.note`.  Both surfaced on rank 0 of `gw.out`.
+5. **Instrumentation**: the planner returns `peak_estimate_gb`,
+   `bottleneck`, per-peak breakdown, and budget, surfaced on rank 0 of `gw.out`.
 
 ## Recipe — planning a run for a given budget
 
@@ -692,197 +678,18 @@ Recent corrections in `compute_optimal_chunks` (legacy heuristic):
 
 The G-flat planner supersedes these for `band_chunk` / `chunk_r`; the
 heuristic remains the authoritative chooser for `q_chunk` / `q_gather`
-/ `k_chunk`.  The **AOT memory model** below independently confirms
-the hand-derived coefficients by NNLS-fitting `memory_analysis()`
-against dimensional primitives — integer β's match the hand-derived
-hypotheses (ZCT `β[PrBr]=4`, load-wfn `β[psi_G]=3`, chi0 τ-step
-`β[Gbuf]=4`, `fit_one_rchunk` composite `β[pair]=4`).
+/ `k_chunk`.
 
-## AOT Memory Model
+## cuFFT plan scratch (live measurement)
 
-`src/gw/aot_memory_model/` (in-tree, entry points re-exported from the
-package `__init__`).
-
-The hand-derived formulas above are hypotheses about each stage's
-allocation set.  When XLA schedules something the hand-model missed —
-remat, allocator coalescing, a donation failure — the symptom is a
-runtime OOM at a `chunk_r` the heuristic claimed would fit.  The AOT
-tool addresses this by *measuring* each jit's peak via
-`jax.jit(f).lower(specs).compile().memory_analysis()` at many `(sys,
-knobs, mesh)` points, then NNLS-fitting a non-negative linear
-combination of dimensional primitives:
-
-```
-peak(sys, knobs, mesh) = intercept + Σ_i  β_i · T_i(sys, knobs, mesh)
-```
-
-Each primitive `T_i` is the bytes of one physical shard (e.g. `(n_k,
-n_rmu, B_r)/P`), and `β_i` counts concurrent copies at peak.  A clean
-fit gives integer β's with MB-range residual RMS — that's the signal
-the primitive set is complete.  Re-run the sweep when you modify a
-kernel; artifact JSONs are checked in so every agent sees the same
-formulas.
-
-### Architecture
-
-```
-aot_memory_model/
-├── core.py                 SysDims, MeshSpec, Knobs, AotKernel, aot_measure,
-│                           fit_nnls, predict_peak, save/load_fit
-├── cost.py                 Analogous FLOPs fit: fit_cost_nnls,
-│                           predict_flops_per_call, save/load_cost_fit
-├── chooser.py              choose_chunks_analytic (closed-form)
-│                           choose_chunks_heuristic (20/80 split)
-│                           choose_chunks_aot (grid search)
-├── doe.py                  build_doe_axes (one-at-a-time DoE generator)
-├── presets.py              points_<kernel>() — per-kernel sample points
-├── sweep.py                Rank-0 DoE driver: runs aot_measure + saves JSON
-├── predict_cli.py          CLI: `python -m gw.aot_memory_model.predict_cli …`
-├── kernels/                One module per covered jit (see table below)
-└── artifacts/              Checked-in *__current__{samples,fit,cost_fit}.json
-```
-
-### Covered kernels (as of 2026-04-20)
-
-| Kernel | Where in production | KNOBS | PRIMITIVES (fit β → integer count) |
-|---|---|---|---|
-| `cct_lr` | `common.isdf_fitting.compute_CCT_from_left_right` | — | `Pq` → 4 |
-| `zct_lr` | `common.isdf_fitting.compute_ZCT_from_left_right_zchunk` | `chunk_r` | `PrBr` → **4** |
-| `pair_density_traced` | `common.isdf_fitting.compute_pair_density_spin_traced` | — | `P`, `psiL`, `psiR` → 1,1,1 |
-| `chi0_tau_step` | `gw.w_isdf._get_chi_minimax_kernel._tau_step` | — | `Gbuf`→**4**, `chi`→1, `psi`→1 |
-| `solve_q` | `common.isdf_fitting.solve_zeta_from_L_q` | `chunk_r`, `q_chunk` | `Zcol`→3.6, `Lfull_rep`→2.4 (fractional — real-valued fit on a narrow DoE) |
-| `slab_write` | `file_io.slab_io.SlabIO.write_slab` | `chunk_r` | `slab` → 1 |
-| `load_psi_rchunk_fft` | `common.load_wfns.read_Gvecs_to_devices` + FFT | `k_chunk`, `band_chunk`, `chunk_r` | `psi_G`→**3**, `rchunk_xy`→1 |
-| `load_psi_rchunk_reshard` | `common.load_wfns.iter_psi_rchunk_bandwise` reshard | `k_chunk`, `band_chunk`, `chunk_r` | `rchunk_xy`→1, `rchunk_y`→**2** |
-| `sigma_kij` | `gw.ppm_sigma._get_sigma_kij_kernel` | — | `Gmid`→2.67, `Vmid`→2.33, `psi_X`→2, `psi_Y`→2, … |
-| `vq_mu_chunk` | `gw.compute_vcoul.make_v_munu_chunked_kernel` | `mu_chunk` | `zeta`→**3**, `vphase`→1.5, `out`→1 |
-| `fit_one_rchunk` | `common.isdf_fitting.fit_one_rchunk` (driver-level r-chunk body) | `chunk_r`, `band_chunk` | `pair`→**4**, `psiG_cache`→1, `centroid`→9, `Lq_rep`→1 |
-
-Primitives in **bold** confirm the hand-derived α coefficients.  The
-`fit_one_rchunk` composite kernel is the one the choosers consult — it
-AOT-lowers the entire per-r-chunk driver body (FFT + reshard +
-pair-density stream + ZCT + solve) in one HLO, so it captures
-*coexisting* buffers that per-stage fits miss.
-
-The post-Round-6 fused kernel is structurally different (single
-`z_q_from_psi_sm` shard_map+scan replacing the FFT-reshard-pair-ZCT
-chain); the existing `fit_one_rchunk` AOT fit is stale and should be
-re-sampled before re-enabling the AOT chooser as the default.  Pending
-work item (see
-`reports/zeta_rchunk_memory_model_2026-05-13/round8_efficiency_audit.md`
-§B5).
-
-### NNLS fits in practice
-
-The `sweep` module drives end-to-end fitting on rank 0 — runs a preset
-DoE and writes both `*_samples.json` and `*_fit.json` into
-`artifacts/`.  Sweeps must run inside `lxrun` because they need a real
-JAX mesh, even though the AOT lower/compile path allocates no GPU
-memory.  Programmatic API:
-
-```python
-from gw.aot_memory_model import (
-    SysDims, MeshSpec, Knobs, get_kernel, aot_measure, fit_nnls, save_fit
-)
-kernel = get_kernel("zct_lr")
-samples = [(sys, knobs, mesh,
-            aot_measure(kernel, sys, knobs, mesh)["total"])
-           for (sys, knobs, mesh) in points]
-fit = fit_nnls(kernel, samples)
-save_fit(fit, tag="current")
-```
-
-### Chooser modes
-
-`gw_init.fit_zeta` consults the AOT chooser when
-`cohsex.in :: use_aot_chunk_chooser = true`, picking one of three modes:
-
-**Heuristic (default, `LORRAX_CHOOSER_MODE=heuristic`)** —
-`choose_chunks_heuristic`.  No DoE lookups; splits the budget 20/80
-between wfn-FFT workspace and the r-chunk body, then sizes against
-two calibrated integer β's:
-
-```
-wfn_budget    = 0.20 · budget           # k_chunk · bc · (3·16·n_s·n_r/P) ≤ wfn_budget
-rchunk_budget = 0.80 · budget           # 4·16·n_k·n_rmu·cr/P + M_persistent ≤ rchunk_budget
-```
-
-The 3 is `β[psi_G]=3` from `load_psi_rchunk_fft`; the 4 is `β[pair]=4`
-from `zct_lr` + `fit_one_rchunk`.  Prefers `chunk_r` / `band_chunk`
-values that divide `n_rtot` / `n_b` so every loop iteration is one
-compile shape.
-
-**Analytic (`LORRAX_CHOOSER_MODE=analytic`)** — `choose_chunks_analytic`.
-Regroups the `fit_one_rchunk` β·T contributions into four scaling
-classes (`PRIMITIVE_CLASSES` in `kernels/fit_one_rchunk.py` assigns
-each primitive to `const` / `cr` / `bc` / `crbc`):
-
-```
-peak(chunk_r, bc) = α₀ + α_cr·chunk_r + α_bc·bc + α_crbc·(chunk_r·bc) ≤ M
-```
-
-Inverted in closed form per candidate `bc`; minimises total FLOPs via
-the companion `cost_fit`.  Also enforces the post-jit allgather bound
-(`16 · q_gather · n_rmu · cr` bytes per device).
-
-**Grid search** — `choose_chunks_aot`.  Coarse `(cr, bc)` grid +
-`predict_peak`.  For tests and manual exploration; not wired into the
-driver.
-
-### γ calibration
-
-`memory_analysis()` is an upper-bound *compiler* estimate — XLA
-schedules tighter at runtime, and NCCL / cuFFT scratch sits outside
-the reported peak.  Each `Fit` carries a scalar
-`γ = runtime_peak / aot_predicted` applied uniformly to intercept and
-all β·T terms (fresh fits start at `γ = 1.0`).  `gw_init.fit_zeta`
-prints `γ` after every ζ-fit so it can be updated manually; a CLI to
-roll it into the artifact JSON is still TODO.  Wildly optimistic
-prediction vs runtime is the post-Round-6 norm on small systems
-(e.g. Si 4×4×4 25 Ry / 2 GPUs measured γ ≈ 0.216 against the stale
-fit), since the AOT fits were calibrated on the pre-Round-6 kernel
-shape.
-
-### When to trust which chooser
-
-- **G-flat planner** (default for the ζ + V_q pipeline): closed-form,
-  microseconds, calibrated by HLO BufferAssignment slot counts.
-  Override only if HWM disagrees with runtime peak by more than ~10 %;
-  re-fit `pair_density_slots_*` from a fresh HLO memory-usage-report
-  and patch `gflat_memory_model._peak_C_fit_one_rchunk` defaults.
-- **Legacy heuristic** — α coefficients physically motivated and stable
-  across untested (system, mesh) combinations.  Authoritative for
-  `q_chunk` / `q_gather` / `k_chunk`.
-- **AOT 20/80 heuristic** — one free parameter (`wfn_workspace_frac`)
-  and intentionally conservative; useful for diagnosing "am I leaving
-  memory on the table?".
-- **AOT analytic** — maximally precise within the calibrated DoE range,
-  but can overfit on narrow sweeps (e.g. `solve_q` fractional β's from
-  7 points) and misses by ~10 % when extrapolating.  Not the default
-  until its `fit_one_rchunk` artifact is re-sampled against the
-  post-Round-6 fused kernel.
-
-### Status (2026-05-15)
-
-G-flat planner is the default and validated at Si 4×4×4 80 Ry (HWM
-24.21 GB predicted, runtime ~5 % off) and CrI3 6×6 80 Ry (HWM 13–15 GiB
-measured, ~3× reduction vs pre-Round-6).  AOT model is scaffolded and
-calibrated at MoS2 3×3 / Si 4×4×4 but its `fit_one_rchunk` artifact is
-**stale** against the post-Round-6 fused kernel; re-sampling is the
-[round8_efficiency_audit.md §B5] follow-up.  Known gaps: no multi-node
-DoE (some primitives are collinear at fixed `total_devices` — e.g.
-`Lq_sharded` vs `Lq_rep` fold into one coefficient — predictions beyond
-4 GPUs need validation); `q_chunk` / `q_gather` / `k_chunk` stay on the
-hand-heuristic; `γ` is manual, not persisted to JSON, and wired into
-the analytic chooser only.  Per-kernel DoE caveats live in the
-`.notes` fields of the `*_fit.json` artifacts.
-
-Pending: bispinor-transverse CCT path (Round-9); multi-node DoE sweep;
-`γ` persisted to JSON; `solve_q` `q_chunk` AOT-controlled.
-
-See `reports/zeta_rchunk_memory_model_2026-05-13/PATH_D_PICKUP.md` →
-`round8_efficiency_audit.md` → `round5_unified_plan.md` for the
-mandatory pickup-reading order on this initiative.
+The closed-form G-Flat model above does not see the cuFFT plan *workspace* XLA
+requests at runtime — it is invisible to `jax.live_arrays()` / `memory_analysis()`.
+That single real number is measured live by `src/runtime/aot_memory.py`
+(`aot_kernel_peak_bytes`, a `cufftGetSize*` query over the compiled HLO) and added
+to the V_q tile chooser's estimate. There is no offline fit / DOE / preset
+framework: the former `src/gw/aot_memory_model/` package was removed 2026-07-02
+(it was dead-by-clobber — `plan_gflat_chunks` always overwrote its chunk picks;
+see `reports/memplanner_cleanup_2026-07-02/PLAN.md`).
 
 ## Predicted-vs-realized faithfulness (Round-7 audit, 2026-05-17)
 
