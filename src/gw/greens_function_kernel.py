@@ -53,6 +53,12 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None):
     """
     phases = jnp.exp(-t * (enk - e_ref))
     if mask is not None:
+        # mask gates phases per (k, n), so it must share enk's shape.  Some Σ
+        # branches deliver it as (1, nk, nb) on a 1×1 processor mesh — the occ
+        # array carries a leading nspin axis that a 2×2 mesh squeezes but a 1×1
+        # mesh does not.  Reshape first so ``where`` can't broadcast phases up to
+        # 3-D and violate build_G's 'ksxn,kn,knty' contract (crashed GN-PPM on 1 GPU).
+        mask = jnp.reshape(mask, enk.shape)
         phases = jnp.where(mask, phases,
                            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
     return build_G(psi_xn, psi_yr, phases=phases)
