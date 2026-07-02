@@ -1,78 +1,44 @@
-"""G-flat ζ + V_q memory model — pick chunk sizes near the budget.
+"""G-flat ζ + V_q memory model — pick chunk sizes that fit the HBM budget.
 
-Five per-rank HBM peaks across :func:`isdf_fitting.fit_zeta_to_h5` and
-:func:`gw.v_q_g_flat.compute_V_q`:
+The sole production planner for ``band_chunk`` / ``r_chunk`` /
+``gflat_chunk_size``: it models five per-rank HBM peaks across
+:func:`isdf_fitting.fit_zeta_to_h5` and :func:`gw.v_q_g_flat.compute_V_q`,
+then picks the largest chunks whose predicted peak stays under
+``target_utilization · budget`` and returns a :class:`GFlatChunkPlan`.
 
-    Peak A — band-chunked centroid load (pre-loop).
-        ψ(G) → IFFT → sample at r_μ.  The ψ(r) FFT box transient is
-        the dominant cost, sharded on ('x','y').  Run once per channel.
-        Persistent here: only the centroid output being filled.
+Peaks (all sharded on the ('x','y') mesh; ``P = p_x·p_y``):
 
-    Peak B — CCT + Cholesky (pre-loop).
-        Pair density on (μ, ν) full-grid + C_q FFT + L_q factor.
-        Persistent: centroids (L+R copies).
-        Transient: P_l, P_r at full μ², C_q, L_q workspace.
+    A  band-chunked centroid load (pre-loop) — the ψ(G)→ψ(r) IFFT box
+       dominates; only the centroid output is persistent.
+    B  CCT + Cholesky (pre-loop) — full-(μ,ν) pair density + C_q FFT +
+       L_q factor (transient); centroids (L+R) persistent.
+    C  fit_one_rchunk (inside the r-chunk loop) — the fused jit holds
+       centroids×4 + L_q + gflat_acc + sphere-idx (persistent), the
+       P_l/P_r rank-5 (μ, r_chunk) accumulators, their R-space IFFTs, and
+       the pre-reshard Z_q.  Usually the binding peak.
+    D  accumulate_rchunk_to_gflat — gflat_acc persistent; transient is the
+       per-scan-iter zero-padded FFT box ``(cs, n_rtot)``, cs = gflat_chunk_size.
+    E  V_q per tile (post fit_zeta) — 7 sequential tiles (CC + 3 TT-diag +
+       3 TT-off-diag); TT-off-diagonal binds (two distinct ζ_all buffers).
 
-    Peak C — fit_one_rchunk (inside the r-chunk loop).
-        Per-bc ψ(G) → ψ(r_chunk) IFFT (now scan-INSIDE-shard_map),
-        pair-density accumulators, CCT/ZCT k-convolution, solve.
-        The fused jit holds:
-          • centroids ×4 buffers (rmuT_X + rmu_Y transpose, L+R) + L_q
-            + gflat_acc (resident across the r-chunk loop) + sphere-idx
-            replicated (persistent base)
-          • P_l + P_r rank-5 accumulators on (μ, r_chunk)
-          • IFFT'd P_l, P_r in R-space (rank-5)
-          • Z_q intermediate before reshard
-        ``pair_density_slots`` is backend-aware: 3 on GPU XLA (HLO-verified
-        at CrI3 80Ry bispinor + Si 4×4×4 — see ``agent_d_hlo_calibration.md``)
-        and 4 on CPU XLA (HLO-verified at Si μ=384 scalar + bispinor charge +
-        bispinor transverse — see ``CPU_PLANNER_LANDED_2026-05-20.md``).  CPU
-        XLA's BufferAssignment heuristic schedules one extra concurrent
-        pair-density slot than GPU XLA does at the same algebraic structure.
-        Resolved via ``_default_pair_density_slots()`` from
-        ``jax.default_backend()``.  bc-loop is now
-        ``lax.scan`` with ``unroll=1`` so n_bc no longer multiplies the
-        FFT-box term (Round-6 / commit f567aa0).  gflat_acc is charged
-        in BOTH Peak C and Peak D persistent bases (Round-10 / agent_q):
-        the two jits have isolated transient slots so this is correct,
-        not double-counting.
+Modeling constants worth knowing:
+  * ``pair_density_slots`` (Peak C): 3 on GPU XLA, 4 on CPU XLA — CPU's
+    BufferAssignment schedules one extra concurrent slot for the same
+    algebra; resolved from ``jax.default_backend()``.
+  * ``factor_D = 2.0`` (Peak D): cuFFT's out-of-place 3D fftn splits its
+    scratch across two box-sized slots.
+  * ``gflat_acc`` is charged in BOTH Peak C and Peak D persistent bases —
+    the two jits have isolated transient slots, so this is not double-counting.
 
-    Peak D — accumulate_rchunk_to_gflat (right after fit_one_rchunk).
-        gflat_acc persistent.  Transient: per-scan-iter zero-padded
-        FFT box ``(cs, n_rtot)`` where cs = gflat_chunk_size; ``factor_D
-        = 2.0`` for cuFFT's out-of-place 3D fftn (HLO-verified, the
-        scratch is split across 2 box-sized slots).
-
-    Peak E — V_q (per-tile, post fit_zeta).
-        ``compute_V_q_bispinor_g_flat_to_h5`` runs 7 sequential tiles
-        (CC + 3 TT-diag + 3 TT-off-diag).  Each tile pre-reads all IBZ
-        ζ̃ slabs, holds two resharded ζ copies inside the per-q kernel,
-        accumulates V_acc, then frees its transients before the next
-        tile.  TT-off-diagonal is the dominant peak (two distinct ζ_all
-        buffers).  Post-tile unfold runs at full-BZ shape but is small.
-        Bispinor IBZ cascade adds a 9-tile + 6-tile mix buffer.
-
-Chunker knobs:
-
-    band_chunk     — bc-size for the per-bc ψ(G)→ψ(r-chunk) IFFT inside
-                     fit_one_rchunk.  Primary lever on Peak A and Peak
-                     C's FFT-box term.  Must divide nb if possible
-                     (remainder handled but creates short tail).
-
-    r_chunk        — r-axis chunk count for the outer loop.  Lower-bounded
-                     by ``n_rmu`` (per user spec: the eventual Σ_μν output
-                     occupies ``n_rmu²·n_q·16`` bytes, so paying less
-                     than ``n_rmu`` work per chunk is wasted iteration
-                     overhead).  Upper-bounded by ``max_chunks``.
-
-    gflat_chunk_size — scan chunk size inside accumulate_rchunk_to_gflat.
-                       **CAPPED AT 100** (2026-05-17 refit).  Past
-                       cs ~ 1000, cuFFT switches plan algorithm and
-                       workspace grows non-linearly; cs=1414 OOM'd
-                       at production CrI3 80Ry.  ``None`` is no longer
-                       legal — the picker always returns an integer ≤ 100.
-
-Sharding shorthand throughout:  ``P = p_x · p_y`` (mesh size).
+Knobs:
+    band_chunk        bc-size for the per-bc ψ(G)→ψ(r-chunk) IFFT; primary
+                      lever on Peaks A and C.  Divides nb when possible.
+    r_chunk           outer r-axis chunk count; lower-bounded by ``n_rmu``
+                      (the Σ_μν output is ``n_rmu²·n_q·16`` B, so <n_rmu work
+                      per chunk is wasted overhead), upper-bounded by ``max_chunks``.
+    gflat_chunk_size  scan chunk inside accumulate; **capped at 100** — past
+                      cs~1000 cuFFT switches plan algorithm and workspace grows
+                      non-linearly (cs=1414 OOM'd at production CrI3 80Ry).
 """
 from __future__ import annotations
 
