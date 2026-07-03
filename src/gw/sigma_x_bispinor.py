@@ -141,7 +141,7 @@ def compute_sigma_x_bispinor(
 
     bispinor_v_q_path
         Path to ``v_q_bispinor.h5`` written by
-        :func:`gw.v_q_bispinor.compute_V_q_bispinor_to_h5`.
+        :func:`gw.v_q_bispinor.compute_V_q_bispinor_g_flat_to_h5`.
 
     meta, mesh_xy, backend, use_ffi_io
         Standard plumbing.

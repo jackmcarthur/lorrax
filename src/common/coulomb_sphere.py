@@ -5,7 +5,7 @@ Two surfaces, one source of truth for the radius condition
 
 * :func:`compute_bare_coulomb_sphere_idx` — a single, q=0-centered sphere
   enlarged by ``|q_max|_cart`` so it covers every per-q ball in the BZ.
-  Used by the V_q kernel (``gw.compute_vcoul.make_v_munu_chunked_kernel``)
+  Used by the G-flat V_q path (``gw.v_q_g_flat.compute_all_V_q_g_flat``)
   where one shared sphere keeps the consumer's gather contiguous and the
   ``sqrt_v`` mask zeroes out the slack G's exactly.
 
@@ -34,87 +34,6 @@ from __future__ import annotations
 import itertools
 
 import numpy as np
-
-
-def _fft_miller_axes(nx: int, ny: int, nz: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Per-axis integer Miller indices in numpy fftfreq order."""
-    return (
-        np.rint(np.fft.fftfreq(nx) * nx).astype(np.int32),
-        np.rint(np.fft.fftfreq(ny) * ny).astype(np.int32),
-        np.rint(np.fft.fftfreq(nz) * nz).astype(np.int32),
-    )
-
-
-def _q_max_cart(bvec_f: np.ndarray, kgrid: tuple[int, int, int]) -> float:
-    """``max_q |q|_cart`` over the actual BGW-wrapped q-list on ``kgrid``.
-
-    The earlier formulation used the corners of the Wigner-Seitz cell
-    of the q-grid (``±0.5/kgrid``) — wrong for the BGW q-list whenever
-    a q sits at ``q_frac = 1/2`` (even kgrid: ``q_int = K/2`` doesn't
-    wrap, leaving q_frac = 1/2; odd kgrid: max q_frac = (K-1)/(2K) >
-    1/(2K)).  This under-included G's near the sphere edge.
-
-    Per-axis the BGW wrap of integers ``[0, K)`` lands max ``|q_frac|``
-    at ``K // 2 / K`` (even K: 1/2 — the unwrapped K/2 entry) or
-    ``(K - 1) // 2 / K`` (odd K).  We enumerate the kgrid directly so
-    the bound is exact regardless of even/odd or mixed axes.
-    """
-    kg = np.asarray(kgrid, dtype=np.float64)
-    qi = np.stack(
-        np.meshgrid(*[np.arange(int(k), dtype=np.float64) for k in kgrid],
-                     indexing="ij"),
-        axis=-1).reshape(-1, 3)
-    qi_wrapped = np.where(qi > kg / 2, qi - kg, qi)
-    q_cart = (qi_wrapped / kg) @ bvec_f
-    return float(np.max(np.linalg.norm(q_cart, axis=1)))
-
-
-def compute_bare_coulomb_sphere_idx(
-    fft_grid,
-    bvec: np.ndarray,
-    kgrid,
-    vcoul_cutoff_ry: float | None,
-    *,
-    sys_dim: int = 3,
-) -> tuple[np.ndarray | None, int]:
-    """Return the **shared** sphere ``(sphere_idx, n_G_sph)``.
-
-    ``sphere_idx`` is a sorted int32 ``(n_G_sph,)`` array of flat-FFT
-    indices into ``[0, nx·ny·nz)`` (numpy fftfreq order) such that
-    ``|G_sph + q_max|² ≤ vcoul_cutoff_ry`` for every q in the BZ.
-    Returns ``(None, n_rtot)`` when no narrowing is requested
-    (``vcoul_cutoff_ry`` is None, or ``sys_dim == 0`` — the 0-D box
-    truncation has no analytic sphere reduction).
-    """
-    nx, ny, nz = (int(s) for s in fft_grid)
-    n_rtot = nx * ny * nz
-
-    if vcoul_cutoff_ry is None or sys_dim == 0:
-        return None, n_rtot
-
-    bvec_f = np.asarray(bvec, dtype=np.float64)
-    kgrid_t = tuple(int(k) for k in kgrid)
-    q_max_cart = _q_max_cart(bvec_f, kgrid_t)
-    sphere_r2 = (float(np.sqrt(vcoul_cutoff_ry)) + q_max_cart) ** 2
-
-    gx = (np.fft.fftfreq(nx) * nx).astype(np.float64)
-    gy = (np.fft.fftfreq(ny) * ny).astype(np.float64)
-    gz = (np.fft.fftfreq(nz) * nz).astype(np.float64)
-    G_cart = (np.stack(np.meshgrid(gx, gy, gz, indexing="ij"), axis=-1)
-              @ bvec_f)
-    mask = np.sum(G_cart * G_cart, axis=-1).reshape(-1) <= sphere_r2
-
-    # G=(0,0,0) sits at flat index 0 in fftfreq order; downstream
-    # head-correction math reads ``g0 = ζ̃[..., sphere_idx[0]]``
-    # under the convention that sphere_idx[0] == 0.
-    if not bool(mask[0]):
-        raise RuntimeError(
-            "compute_bare_coulomb_sphere_idx: G=(0,0,0) is not in the "
-            "sphere — this is impossible by construction "
-            "(0 + |q_max|)² = |q_max|² ≤ sphere_r²; check inputs.")
-    sphere_idx = np.asarray(
-        np.nonzero(mask)[0], dtype=np.int32)
-    return sphere_idx, int(sphere_idx.size)
 
 
 def compute_per_q_bare_coulomb_components(
@@ -248,6 +167,5 @@ def compute_per_q_bare_coulomb_components(
 
 
 __all__ = [
-    "compute_bare_coulomb_sphere_idx",
     "compute_per_q_bare_coulomb_components",
 ]

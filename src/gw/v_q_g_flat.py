@@ -307,7 +307,6 @@ def _compute_V_q_g_flat_one_tile(
             f"_compute_V_q_g_flat_one_tile[{timing_label}]: zeta_R "
             "layout must be 'G_flat'.")
 
-    from .v_q_tile import _unfold_g0_ibz_to_full
     from common.symmetry_maps import unfold_v_q
 
     # ---- IBZ list + per-tile v(q+G) -----------------------------------
@@ -555,3 +554,109 @@ def compute_all_V_q_g_flat(
 
 __all__ = ["compute_all_V_q_g_flat", "_compute_V_q_g_flat_one_tile",
             "_resolve_ibz_q_list", "_pick_g_chunk", "_make_read_all_ibz"]
+
+
+# Relocated from the deleted gw/v_q_tile.py (2026-07-02) — the only
+# survivor of the r-space tile subsystem; sole consumer is compute_all_V_q_g_flat.
+def _unfold_g0_ibz_to_full(
+    g0_ibz: jax.Array,
+    *,
+    full_to_irr_idx: np.ndarray,
+    full_to_irr_sym: np.ndarray,
+    sym_perm: np.ndarray,
+    mesh_xy: Mesh,
+    n_sym_spatial: int | None = None,
+) -> jax.Array:
+    """Expand ``g0_ibz (n_qpt_irr, μ)`` → ``(n_q_full, μ)``.
+
+    g0 transforms like a single ζ leg (not bilinear), so under {S | τ}:
+
+        g0_full[q, π_s(μ)] = e^{-i (Sq + 0)·τ_s} · g0_ibz[i(q), μ]
+
+    However, the **only** downstream use of g0 is the Γ slot (q=0),
+    where S = identity ⇒ no phase, no permutation.  For q ≠ Γ the
+    head-correction code in ``head_correction.py`` does not consume
+    ``g0_acc[q]``.  So we apply the centroid permutation (correct
+    structure) but omit the τ-phase (its effect is unobservable; the
+    Γ phase is exp(0) = 1 anyway).  If a future consumer needs the
+    correct phase, set ``include_tau_phase=True``.
+
+    TRS-augmented rows: g0 is a single ζ leg, so the TRS rule is a
+    plain conjugation: ``g0_{full}^{TRS-q, π_s(μ)} = conj(g0_{ibz}^{i(q), μ})``.
+    Pass ``n_sym_spatial=ntran`` along with a
+    ``compute_centroid_sym_perm(..., extend_trs=True)`` table to enable
+    the conj branch.  Without ``n_sym_spatial``, no TRS conj is
+    applied; any TRS-augmented sym index in ``full_to_irr_sym`` then
+    hits the hard-fail guard below.
+    """
+    # Trivial-IBZ short-circuit (ntran=1, no centroid permutation, no
+    # μ-pad).  See ``_unfold_v_q_ibz_to_full`` for the rationale; we
+    # keep the same guard here so the no-op pass-through doesn't even
+    # dispatch a jit.
+    idx_np = np.asarray(full_to_irr_idx)
+    sym_np = np.asarray(full_to_irr_sym)
+    if (idx_np.shape[0] == int(g0_ibz.shape[0])
+            and np.array_equal(idx_np, np.arange(idx_np.shape[0]))
+            and np.all(sym_np == 0)
+            and int(g0_ibz.shape[-1]) == int(np.asarray(sym_perm).shape[-1])):
+        return g0_ibz
+
+    # TRS-aware bounds check, mirroring ``_unfold_v_q_ibz_to_full``.
+    n_sym_perm = int(np.asarray(sym_perm).shape[0])
+    max_sym = int(sym_np.max()) if sym_np.size else -1
+    if max_sym >= n_sym_perm:
+        raise ValueError(
+            f"_unfold_g0_ibz_to_full: full_to_irr_sym contains value "
+            f"{max_sym} (TRS-augmented row index) but sym_perm has only "
+            f"{n_sym_perm} rows.  Build sym_perm via "
+            f"``compute_centroid_sym_perm(..., extend_trs=True)`` to "
+            f"cover the TRS-augmented half of ``sym_mats_k``, and pass "
+            f"``n_sym_spatial=ntran`` here.")
+    if n_sym_spatial is not None and int(n_sym_spatial) * 2 != n_sym_perm:
+        raise ValueError(
+            f"_unfold_g0_ibz_to_full: n_sym_spatial={n_sym_spatial} is "
+            f"inconsistent with sym_perm.shape[0]={n_sym_perm}.  "
+            f"sym_perm must have shape (2·n_sym_spatial, n_rmu).")
+
+    # Pad ``inv_perm`` to the input's μ-extent (same logic as
+    # ``_unfold_v_q_ibz_to_full``); g0 carries the padded μ count
+    # from the V_q kernel.
+    inv_perm = np.argsort(sym_perm, axis=-1).astype(np.int32)
+    n_rmu_logical = int(inv_perm.shape[-1])
+    n_rmu_padded = int(g0_ibz.shape[-1])
+    full_to_irr_idx = np.asarray(full_to_irr_idx, dtype=np.int32)
+    full_to_irr_sym = np.asarray(full_to_irr_sym, dtype=np.int32)
+    if n_rmu_padded > n_rmu_logical:
+        pad_block = np.arange(
+            n_rmu_logical, n_rmu_padded, dtype=np.int32)
+        pad_block = np.broadcast_to(
+            pad_block, (inv_perm.shape[0], n_rmu_padded - n_rmu_logical))
+        inv_perm = np.concatenate([inv_perm, pad_block], axis=-1)
+    inv_perm_j = jnp.asarray(inv_perm)
+    idx_j = jnp.asarray(full_to_irr_idx)
+    sym_j = jnp.asarray(full_to_irr_sym)
+
+    # TRS mask: same convention as ``_unfold_v_q_ibz_to_full``.
+    if n_sym_spatial is not None:
+        trs_mask_np = (sym_np >= int(n_sym_spatial))
+    else:
+        trs_mask_np = np.zeros(sym_np.shape, dtype=bool)
+    trs_mask_j = jnp.asarray(trs_mask_np)
+
+    g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
+
+    @partial(jax.jit, out_shardings=g0_sh)
+    def _do_unfold(g0):
+        perm_q = inv_perm_j[sym_j]                                  # (n_q_full, n_rmu_padded)
+        g0_at_irr = g0[idx_j]                                       # (n_q_full, μ)
+        # ``mode='promise_in_bounds'`` to skip the take_along_axis
+        # OOB-fill helper that breaks under shard_map+x64; same fix
+        # as ``_unfold_v_q_ibz_to_full``.
+        g0_full = jnp.take_along_axis(
+            g0_at_irr, perm_q, axis=1, mode='promise_in_bounds')
+        # TRS rows: ζ-leg conjugation (g0 is a single ζ leg, not
+        # bilinear, so the TRS conj does NOT cancel — apply it).
+        g0_full = jnp.where(trs_mask_j[:, None], jnp.conj(g0_full), g0_full)
+        return g0_full
+
+    return _do_unfold(g0_ibz)

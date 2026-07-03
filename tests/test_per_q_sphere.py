@@ -25,7 +25,6 @@ import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 
 from common.coulomb_sphere import (
-    compute_bare_coulomb_sphere_idx,
     compute_per_q_bare_coulomb_components,
 )
 from common.wfn_transforms import accumulate_rchunk_to_gflat
@@ -93,31 +92,6 @@ def test_per_q_sphere_matches_direct_enumeration():
         # Pad slots all carry the sentinel.
         for j in range(nk, ngkmax):
             np.testing.assert_array_equal(components[q_i, :, j], sentinel)
-
-
-def test_shared_sphere_supersets_every_per_q_sphere():
-    """The shared single sphere (radius √cut + |q_max|) must contain
-    every flat-FFT index in the per-q spheres."""
-    fft_grid = (8, 8, 12)
-    bvec = np.diag([0.7, 0.7, 0.3])
-    kgrid = (2, 2, 1)
-    cutoff = 10.0
-    q_int = np.array([(0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, 0)], dtype=int)
-    q_int_wrapped = np.where(
-        q_int > np.asarray(kgrid) / 2, q_int - np.asarray(kgrid), q_int)
-    q_frac = q_int_wrapped / np.asarray(kgrid)
-
-    per_q = compute_per_q_bare_coulomb_components(
-        fft_grid, bvec, q_frac, cutoff, sys_dim=2)
-    shared_idx, _ = compute_bare_coulomb_sphere_idx(
-        fft_grid, bvec, kgrid, cutoff, sys_dim=2)
-
-    shared_set = set(int(i) for i in shared_idx)
-    for q_i in range(len(q_frac)):
-        nk = int(per_q["ngk_per_q"][q_i])
-        per_q_set = set(int(i) for i in per_q["sphere_idx_padded"][q_i, :nk])
-        assert per_q_set.issubset(shared_set), (
-            f"q={q_i} per-q sphere not a subset of shared sphere")
 
 
 # ---------------------------------------------------------------------------

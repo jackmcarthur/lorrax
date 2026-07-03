@@ -827,9 +827,8 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 
 	if bispinor_ready:
 		from .v_q_bispinor import (
-			compute_V_q_bispinor_to_h5, BispinorVqReader, tile_dataset_name,
+			BispinorVqReader, tile_dataset_name,
 		)
-		from .compute_vcoul import make_v_munu_chunked_kernel
 		from file_io.centroids import load_centroids as _load_centroids
 
 		# Reload the transverse centroid indices for the bispinor IBZ
@@ -861,91 +860,50 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		# Charge-channel n_rmu (== meta.n_rmu).  Transverse n_rmu_T comes
 		# from the dataset shape on disk — read it from one of the ζ_T
 		# files.
-		# Detect the on-disk ζ layout from the charge file's isdf_header.
-		# In bispinor mode all four ζ files (charge + 3 transverse) are
-		# written by the same isdf_fitting.fit_zeta_to_h5 path, so they
-		# all share the layout: either both r-space (legacy
-		# v_q_bispinor.compute_V_q_bispinor_to_h5) or both G-flat
-		# (new gw.v_q_bispinor.compute_V_q_bispinor_g_flat_to_h5).
-		from file_io.isdf_header import read_isdf_header
-		_zeta_layout = read_isdf_header(zeta_h5_path).zeta_layout
-		_is_g_flat = (_zeta_layout == 'G_flat')
+		# n_rmu_T from the transverse ζ dataset shape on disk
+		# (fit_zeta_to_h5 writes all ζ files in G-flat layout).
 		with h5py.File(zeta_T_paths[0], 'r') as f:
-			n_rmu_T = int(
-				f['zeta_q_G'].shape[1] if _is_g_flat
-				else f['zeta_q'].shape[-1])
+			n_rmu_T = int(f['zeta_q_G'].shape[1])
 		n_rmu_C = int(meta.n_rmu)
 
 		with timing.section("gw_jax.V_q_compute"), \
 		     jax_profile.trace_section("V_q_compute_bispinor"):
-			if _is_g_flat:
-				# G-flat path: per-q + G-chunked, one orchestrator per
-				# four ζ files.  No legacy compute_V_q_tile chooser /
-				# μ × ν tiling / in-V_q FFT — see
-				# gw.v_q_bispinor.compute_V_q_bispinor_g_flat_to_h5.
-				from .v_q_bispinor import compute_V_q_bispinor_g_flat_to_h5
-				from file_io.zeta_reader import ZetaReader
-				with ZetaReader(zeta_h5_path, mesh=mesh_xy,
-				                backend=cfg.backend.slab_io) as zc, \
-				     ZetaReader(zeta_T_paths[0], mesh=mesh_xy,
-				                backend=cfg.backend.slab_io) as zt1, \
-				     ZetaReader(zeta_T_paths[1], mesh=mesh_xy,
-				                backend=cfg.backend.slab_io) as zt2, \
-				     ZetaReader(zeta_T_paths[2], mesh=mesh_xy,
-				                backend=cfg.backend.slab_io) as zt3:
-					with mesh_xy:
-						compute_V_q_bispinor_g_flat_to_h5(
-							zeta_C_loader=zc,
-							zeta_T_loaders=(zt1, zt2, zt3),
-							output_h5_path=bispinor_h5_path,
-							mesh_xy=mesh_xy, kgrid=meta.kgrid,
-							fft_grid=meta.fft_grid, bvec=bvec,
-							cell_volume=meta.cell_volume,
-							sys_dim=meta.sys_dim,
-							n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T,
-							bare_coulomb_cutoff_ry=vcoul_cutoff_ry,
-							bdot=(np.asarray(wfn.bdot, dtype=np.float64)
-							       if meta.sys_dim == 0 else None),
-							g_chunk=(int(cfg.memory.vq_g_chunk_size)
-							         if cfg.memory.vq_g_chunk_size > 0 else None),
-							backend=cfg.backend.slab_io,
-							print_fn=print_fn,
-							sym=sym if _use_ibz_bispinor else None,
-							centroid_C_idx=_cent_C_idx_for_orchestrator,
-							centroid_T_idx=_cent_T_idx_for_orchestrator,
-							use_ibz=_use_ibz_bispinor,
-						)
-			else:
-				# Legacy r-space path — μ × ν tile driver.
-				coulomb_kernels = make_v_munu_chunked_kernel(
-					meta.fft_grid[0], meta.fft_grid[1], meta.fft_grid[2],
-					meta.kgrid[0], meta.kgrid[1], meta.kgrid[2],
-					bvec, meta.cell_volume, mesh_xy,
-					sys_dim=meta.sys_dim,
-					bdot=np.asarray(wfn.bdot, dtype=np.float64)
-						if meta.sys_dim == 0 else None,
-					mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
-					vcoul_cutoff_ry=vcoul_cutoff_ry,
-				)
-				with SlabIO(zeta_h5_path, mode='r', mesh=mesh_xy,
-				            backend=cfg.backend.slab_io) as zc, \
-				     SlabIO(zeta_T_paths[0], mode='r', mesh=mesh_xy,
-				            backend=cfg.backend.slab_io) as zt1, \
-				     SlabIO(zeta_T_paths[1], mode='r', mesh=mesh_xy,
-				            backend=cfg.backend.slab_io) as zt2, \
-				     SlabIO(zeta_T_paths[2], mode='r', mesh=mesh_xy,
-				            backend=cfg.backend.slab_io) as zt3:
-					with mesh_xy:
-						compute_V_q_bispinor_to_h5(
-							zeta_C_io=zc, zeta_T_ios=(zt1, zt2, zt3),
-							output_h5_path=bispinor_h5_path,
-							coulomb_kernels=coulomb_kernels,
-							mesh_xy=mesh_xy, kgrid=meta.kgrid,
-							fft_grid=meta.fft_grid, bvec=bvec,
-							n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T,
-							budget_bytes=m_budget,
-							backend=cfg.backend.slab_io,
-						)
+			# G-flat path: per-q + G-chunked, one orchestrator per
+			# four ζ files.  No legacy compute_V_q_tile chooser /
+			# μ × ν tiling / in-V_q FFT — see
+			# gw.v_q_bispinor.compute_V_q_bispinor_g_flat_to_h5.
+			from .v_q_bispinor import compute_V_q_bispinor_g_flat_to_h5
+			from file_io.zeta_reader import ZetaReader
+			with ZetaReader(zeta_h5_path, mesh=mesh_xy,
+			                backend=cfg.backend.slab_io) as zc, \
+			     ZetaReader(zeta_T_paths[0], mesh=mesh_xy,
+			                backend=cfg.backend.slab_io) as zt1, \
+			     ZetaReader(zeta_T_paths[1], mesh=mesh_xy,
+			                backend=cfg.backend.slab_io) as zt2, \
+			     ZetaReader(zeta_T_paths[2], mesh=mesh_xy,
+			                backend=cfg.backend.slab_io) as zt3:
+				with mesh_xy:
+					compute_V_q_bispinor_g_flat_to_h5(
+						zeta_C_loader=zc,
+						zeta_T_loaders=(zt1, zt2, zt3),
+						output_h5_path=bispinor_h5_path,
+						mesh_xy=mesh_xy, kgrid=meta.kgrid,
+						fft_grid=meta.fft_grid, bvec=bvec,
+						cell_volume=meta.cell_volume,
+						sys_dim=meta.sys_dim,
+						n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T,
+						bare_coulomb_cutoff_ry=vcoul_cutoff_ry,
+						bdot=(np.asarray(wfn.bdot, dtype=np.float64)
+						       if meta.sys_dim == 0 else None),
+						g_chunk=(int(cfg.memory.vq_g_chunk_size)
+						         if cfg.memory.vq_g_chunk_size > 0 else None),
+						backend=cfg.backend.slab_io,
+						print_fn=print_fn,
+						sym=sym if _use_ibz_bispinor else None,
+						centroid_C_idx=_cent_C_idx_for_orchestrator,
+						centroid_T_idx=_cent_T_idx_for_orchestrator,
+						use_ibz=_use_ibz_bispinor,
+					)
 
 		# Read CC tile + g0 back for downstream restart-state writer.
 		# The TT tiles stay on disk; Σ_X^B / Σ_H^B will consume them
