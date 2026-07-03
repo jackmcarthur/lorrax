@@ -251,25 +251,15 @@ def build_wavefunctions(
 # ---------------------------------------------------------------------------
 
 @jax.jit
-def _rotate_psi_xn(psi_xn: jax.Array, U: jax.Array) -> jax.Array:
-    # ψ'_xn[k, s, μ, n] = Σ_m ψ_xn[k, s, μ, m] · U[k, m, n]
-    return jnp.einsum('ksum,kmn->ksun', psi_xn, U, optimize=True)
+def _rotate_psi_bandlast(psi: jax.Array, U: jax.Array) -> jax.Array:
+    # band-last layout (k,s,μ,n): ψ'[k,s,μ,n] = Σ_m ψ[k,s,μ,m]·U[k,m,n]  (xn, yn)
+    return jnp.einsum('ksum,kmn->ksun', psi, U, optimize=True)
 
 
 @jax.jit
-def _rotate_psi_xr(psi_xr: jax.Array, U: jax.Array) -> jax.Array:
-    # ψ'_xr[k, n, s, μ] = Σ_m U[k, m, n] · ψ_xr[k, m, s, μ]
-    return jnp.einsum('kmn,kmsu->knsu', U, psi_xr, optimize=True)
-
-
-@jax.jit
-def _rotate_psi_yr(psi_yr: jax.Array, U: jax.Array) -> jax.Array:
-    return jnp.einsum('kmn,kmsu->knsu', U, psi_yr, optimize=True)
-
-
-@jax.jit
-def _rotate_psi_yn(psi_yn: jax.Array, U: jax.Array) -> jax.Array:
-    return jnp.einsum('ksum,kmn->ksun', psi_yn, U, optimize=True)
+def _rotate_psi_bandfirst(psi: jax.Array, U: jax.Array) -> jax.Array:
+    # band-first layout (k,m,s,μ): ψ'[k,n,s,μ] = Σ_m U[k,m,n]·ψ[k,m,s,μ]  (xr, yr)
+    return jnp.einsum('kmn,kmsu->knsu', U, psi, optimize=True)
 
 
 def rotate_wavefunctions(
@@ -337,10 +327,10 @@ def rotate_wavefunctions(
     # Pull the active sub-blocks via the bundle's jit'd accessors (cached),
     # rotate, then dynamic-update-slice back into a copy of the full ψ.
     with mesh_xy:
-        psi_xn_act = _rotate_psi_xn(wfns_dft.xn(active_slice), U_dft_to_qp_active)
-        psi_xr_act = _rotate_psi_xr(wfns_dft.xr(active_slice), U_dft_to_qp_active)
-        psi_yr_act = _rotate_psi_yr(wfns_dft.yr(active_slice), U_dft_to_qp_active)
-        psi_yn_act = _rotate_psi_yn(wfns_dft.yn(active_slice), U_dft_to_qp_active)
+        psi_xn_act = _rotate_psi_bandlast(wfns_dft.xn(active_slice), U_dft_to_qp_active)
+        psi_xr_act = _rotate_psi_bandfirst(wfns_dft.xr(active_slice), U_dft_to_qp_active)
+        psi_yr_act = _rotate_psi_bandfirst(wfns_dft.yr(active_slice), U_dft_to_qp_active)
+        psi_yn_act = _rotate_psi_bandlast(wfns_dft.yn(active_slice), U_dft_to_qp_active)
 
         # Reassemble — bands outside the active block stay DFT.
         psi_xn = jax.lax.dynamic_update_slice_in_dim(
