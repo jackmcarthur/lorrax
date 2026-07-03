@@ -105,27 +105,44 @@ def _run_gw_jax(run_dir, input_name, platform, extra_env=None):
     )
 
 
-# (case_id, subdir, input_name, output_name, reference_name, sigma_labels)
+# (case_id, subdir, input_name, output_name, reference_name, sigma_labels, atol)
 # COHSEX: static Σ (sigSX/sigCOH/sigTOT) on WFNsmall; GN-PPM: dynamic Σc
 # (sigX/sigC/sigXC) on a full MoS2 3×3 WFN (WFNsmall is incompatible with the
 # dynamic build_G path — see reports/gw_refactor_map_2026-07-01/BUGS_FOUND.md).
+#
+# si_cohsex_3d is the FIRST BGW-anchored, sys_dim=3 e2e gate.  The two MoS2
+# cases above are 2D self-consistency freezes (their reference is a re-frozen
+# LORRAX number); this one exercises the 3D Coulomb/analytic-head path and its
+# frozen value is pinned to BerkeleyGW.  System: bulk Si 4×4×4 (nosoc), the run
+# proven to agree with BGW COHSEX at MAE 0.12 meV / max|Δ| 0.48 meV — see
+# reports/cohsex_si_444_gamma_agreement_2026-05-02/.  The exact 0.12-meV config
+# needs a 185 MB BGW vcoul-body dump (not git-committable), so the fixture uses
+# LORRAX's *native* finite-q Coulomb body (identical to BGW-noavg 4π/|q+G|²)
+# plus BGW's q→0 head as two scalars (vhead / whead_0freq).  Verified vs BGW
+# sigma_hp.log at Γ: sigCOH tracks to 0.22 meV, sigTOT to 3.2 meV spread —
+# matching the validated overlay run (see tests/regression/si_cohsex_debug/
+# README.md).  atol=1e-3 eV (1 meV): a physical bound above the 0.12 meV BGW
+# agreement, tight enough to catch a real 3D regression.  Two independent GPU
+# runs reproduce the reference bit-for-bit (max|Δ|=0).
 _REG = REPO_ROOT / "tests" / "regression"
 _CASES = [
     ("cohsex", _REG / "cohsex_debug", "cohsex_test.in", "eqp_test.dat",
-     "eqp_ref.dat", ("sigSX", "sigCOH", "sigTOT")),
+     "eqp_ref.dat", ("sigSX", "sigCOH", "sigTOT"), 1e-6),
     ("gnppm", _REG / "gnppm_debug", "gnppm_test.in", "sigma_diag_gnppm_test.dat",
-     "sigma_diag_gnppm_ref.dat", ("sigX", "sigC", "sigXC")),
+     "sigma_diag_gnppm_ref.dat", ("sigX", "sigC", "sigXC"), 1e-6),
+    ("si_cohsex_3d", _REG / "si_cohsex_debug", "cohsex_si_test.in",
+     "eqp_si_test.dat", "eqp_si_ref.dat", ("sigSX", "sigCOH", "sigTOT"), 1e-3),
 ]
 
 
 @pytest.mark.regression
 @pytest.mark.parametrize(
-    "case_id,case_dir,input_name,output_name,ref_name,labels",
+    "case_id,case_dir,input_name,output_name,ref_name,labels,atol",
     _CASES,
     ids=[c[0] for c in _CASES],
 )
 def test_gw_jax_matches_reference(
-    tmp_path, case_id, case_dir, input_name, output_name, ref_name, labels
+    tmp_path, case_id, case_dir, input_name, output_name, ref_name, labels, atol
 ):
     platform = _requested_platform()
     if platform in {"gpu", "cuda"} and not _gpu_available():
@@ -174,7 +191,7 @@ def test_gw_jax_matches_reference(
     # (exclude the imaginary/VH_imag noise-level parts; byte-identity above is the
     # primary check, this atol path only absorbs GPU-nondeterministic last-ULP drift).
     try:
-        np.testing.assert_allclose(out_rows[:, :6], ref_rows[:, :6], rtol=0.0, atol=1e-6)
+        np.testing.assert_allclose(out_rows[:, :6], ref_rows[:, :6], rtol=0.0, atol=atol)
     except AssertionError as exc:
         pytest.fail(f"{case_id} output differs from reference beyond tolerance.\n{exc}")
 

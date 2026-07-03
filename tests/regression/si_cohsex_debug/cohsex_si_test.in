@@ -1,0 +1,41 @@
+# LORRAX 3D COHSEX regression gate — Si 4x4x4 (nosoc, 8 IBZ k-points).
+# sys_dim=3 native Coulomb + analytic head path.  BGW head scalars injected
+# (vhead / whead_0freq) so the frozen value is anchored to BGW's q->0 head;
+# the finite-q body is LORRAX-native (matches BGW-noavg 4*pi/|q+G|^2).
+# See reports/cohsex_si_444_gamma_agreement_2026-05-02/ (system agrees with
+# BGW COHSEX at 0.12 meV in the full-vcoul-overlay config).
+[cohsex]
+
+restart = false
+centroids_file = centroids_frac_960.txt
+
+nval = 8
+ncond = 52
+nband = 60
+sys_dim = 3
+bare_coulomb_cutoff = 25.0
+
+x_only = false
+do_screened = true
+bispinor = false
+self_consistent = false
+
+use_ppm_sigma = false
+screening_method = minimax
+
+# BGW q->0 head overlay (scalars only; no 185 MB vcoul body dump).
+vhead = 3303.748102
+whead_0freq = 150.395600
+
+use_chunked_isdf = true
+memory_per_device_gb = 28
+
+sigma_at_dft_energies = true
+sigma_freq_debug_output = true
+sigma_debug_split_contrib = true
+fermi_reference = midgap
+
+wfn_file = WFN.h5
+output_file = eqp_si_test.dat
+sigma_diag_file = eqp_si_test.dat
+sigma_omega_h5_file = sigma_mnk.h5
