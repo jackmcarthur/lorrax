@@ -261,7 +261,7 @@ def compute_centroid_sym_perm(
         conjugation under TRS — for V_q bilinear in ζ this becomes
         ``V_{TRS-q, μ, ν} = conj(V_{q, μ, ν}) = V_{q, ν, μ}`` (last
         equality by V_q Hermiticity) — is applied at the V_q-unfold
-        level (see ``gw.v_q_tile._unfold_v_q_ibz_to_full``), NOT in
+        level (see ``common.symmetry_maps.unfold_v_q``), NOT in
         ``sym_perm`` itself.
     L_table
         ``(n_sym, n_rmu, 3)`` int8 by default; ``(2·n_sym, n_rmu, 3)``

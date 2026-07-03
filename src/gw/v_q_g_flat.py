@@ -1,8 +1,8 @@
 """V_q orchestrator for the G-flat ζ on-disk format.
 
-This is the post-G-flat rewrite of the V_q hot loop.  The legacy
-:func:`gw.v_q_tile.compute_V_q_tile` is replaced wholesale when the
-on-disk ζ is in WFN.h5-style per-q sphere layout — most of its
+This is the post-G-flat rewrite of the V_q hot loop.  It replaced the
+old r-space tile driver (``gw/v_q_tile.py``, deleted 2026-07-02) when
+the on-disk ζ is in WFN.h5-style per-q sphere layout — most of the old
 complexity (Case A/B chooser, ``μ × ν`` tiling, in-kernel FFT, shared
 sphere conversion) goes away because:
 
@@ -24,9 +24,9 @@ Math:
     V_q[μ, ν] = Σ_G  conj(ζ̃_{q,μ}(G)) · v(q+G) · ζ̃_{q,ν}(G)
     g0_μ(q)   = ζ̃_{q,μ}(G=0)               # = ζ̃[μ, 0] by sphere convention
 
-IBZ unfold runs post-loop via the existing helpers in ``v_q_tile``
-(``_unfold_v_q_ibz_to_full``, ``_unfold_g0_ibz_to_full``); the V_q
-output sharding ``P(None, 'x', 'y')`` matches.
+IBZ unfold runs post-loop via ``common.symmetry_maps.unfold_v_q`` (V_q)
+and the local :func:`_unfold_g0_ibz_to_full` (g0); the V_q output
+sharding ``P(None, 'x', 'y')`` matches.
 """
 from __future__ import annotations
 
@@ -273,7 +273,7 @@ def _compute_V_q_g_flat_one_tile(
     zeta_R_loader,                     # None ⇒ same_zeta=True
     *,
     v_per_G_builder,                   # callable(q_irr_frac, gvec_components) -> (n_q, ngkmax) c128
-    kgrid, fft_grid, bvec, mesh_xy,
+    kgrid, fft_grid, mesh_xy,
     g_chunk: int | None,
     sym, centroid_indices,             # IBZ closure check is on the L centroids
     write_g0: bool,
@@ -485,17 +485,14 @@ def compute_all_V_q_g_flat(
     verbose: bool = True,
     sym=None,
     centroid_indices: np.ndarray | None = None,
-    async_prefetch: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """V_q^{0,0} (charge-channel CC tile) on a G-flat-on-disk ζ file.
 
     Thin wrapper that builds the bare-Coulomb ``v(q+G)`` per-q-sphere
     builder and dispatches to :func:`_compute_V_q_g_flat_one_tile`
-    with ``zeta_R=None`` (same_zeta) and ``write_g0=True``.  The
-    ``async_prefetch`` argument is accepted for compatibility with
-    the legacy dispatcher's env-var knob but currently has no effect
-    — the sync per-q loop is already ~6× faster than the legacy
-    μ × ν tile driver on MoS2 3×3.
+    with ``zeta_R=None`` (same_zeta) and ``write_g0=True``.  The sync
+    per-q loop is already ~6× faster than the legacy μ × ν tile driver
+    on MoS2 3×3.
 
     See :func:`_compute_V_q_g_flat_one_tile` for the math + I/O flow.
     """
@@ -542,7 +539,7 @@ def compute_all_V_q_g_flat(
     return _compute_V_q_g_flat_one_tile(
         zeta_loader, None,
         v_per_G_builder=_bare_v_per_G,
-        kgrid=kgrid, fft_grid=fft_grid, bvec=bvec,
+        kgrid=kgrid, fft_grid=fft_grid,
         mesh_xy=mesh_xy,
         g_chunk=g_chunk,
         sym=sym, centroid_indices=centroid_indices,
@@ -590,7 +587,7 @@ def _unfold_g0_ibz_to_full(
     hits the hard-fail guard below.
     """
     # Trivial-IBZ short-circuit (ntran=1, no centroid permutation, no
-    # μ-pad).  See ``_unfold_v_q_ibz_to_full`` for the rationale; we
+    # μ-pad).  See ``unfold_v_q`` for the rationale; we
     # keep the same guard here so the no-op pass-through doesn't even
     # dispatch a jit.
     idx_np = np.asarray(full_to_irr_idx)
@@ -601,7 +598,7 @@ def _unfold_g0_ibz_to_full(
             and int(g0_ibz.shape[-1]) == int(np.asarray(sym_perm).shape[-1])):
         return g0_ibz
 
-    # TRS-aware bounds check, mirroring ``_unfold_v_q_ibz_to_full``.
+    # TRS-aware bounds check, mirroring ``unfold_v_q``.
     n_sym_perm = int(np.asarray(sym_perm).shape[0])
     max_sym = int(sym_np.max()) if sym_np.size else -1
     if max_sym >= n_sym_perm:
@@ -619,7 +616,7 @@ def _unfold_g0_ibz_to_full(
             f"sym_perm must have shape (2·n_sym_spatial, n_rmu).")
 
     # Pad ``inv_perm`` to the input's μ-extent (same logic as
-    # ``_unfold_v_q_ibz_to_full``); g0 carries the padded μ count
+    # ``unfold_v_q``); g0 carries the padded μ count
     # from the V_q kernel.
     inv_perm = np.argsort(sym_perm, axis=-1).astype(np.int32)
     n_rmu_logical = int(inv_perm.shape[-1])
@@ -636,7 +633,7 @@ def _unfold_g0_ibz_to_full(
     idx_j = jnp.asarray(full_to_irr_idx)
     sym_j = jnp.asarray(full_to_irr_sym)
 
-    # TRS mask: same convention as ``_unfold_v_q_ibz_to_full``.
+    # TRS mask: same convention as ``unfold_v_q``.
     if n_sym_spatial is not None:
         trs_mask_np = (sym_np >= int(n_sym_spatial))
     else:
@@ -651,7 +648,7 @@ def _unfold_g0_ibz_to_full(
         g0_at_irr = g0[idx_j]                                       # (n_q_full, μ)
         # ``mode='promise_in_bounds'`` to skip the take_along_axis
         # OOB-fill helper that breaks under shard_map+x64; same fix
-        # as ``_unfold_v_q_ibz_to_full``.
+        # as ``unfold_v_q``.
         g0_full = jnp.take_along_axis(
             g0_at_irr, perm_q, axis=1, mode='promise_in_bounds')
         # TRS rows: ζ-leg conjugation (g0 is a single ζ leg, not

@@ -309,7 +309,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
         V_acc, g0_acc = _compute_V_q_g_flat_one_tile(
             loader_L, loader_R,
             v_per_G_builder=v_builder,
-            kgrid=kgrid, fft_grid=fft_grid, bvec=bvec,
+            kgrid=kgrid, fft_grid=fft_grid,
             mesh_xy=mesh_xy,
             g_chunk=g_chunk,
             sym=_tile_sym, centroid_indices=_tile_cent,
@@ -496,8 +496,9 @@ class BispinorVqReader:
 
     def _padded_shape_LR(self, n_L: int, n_R: int) -> tuple[int, int]:
         """Round n_L, n_R up to the total mesh-product (``gx*gy``).  This
-        mirrors the write-side ``_round_up_to_mesh`` at
-        v_q_tile.py:1116-1118 (which pads to ``p_x*p_y``) and matches the
+        mirrors the write-side μ padding in
+        ``gw.v_q_g_flat._compute_V_q_g_flat_one_tile`` (its ``_pad``
+        helper, which also pads to ``p_x*p_y``) and matches the
         ψ-side μ extent built by ``load_centroids_band_chunked`` — so a
         single pad here makes Σ^B's V tile broadcast against ψ with no
         further padding step in sigma_x_bispinor.
@@ -515,8 +516,9 @@ class BispinorVqReader:
         """Return V^{μ_L, ν_L}_q as a sharded JAX array (n_q, n_L_padded,
         n_R_padded) c128.  When n_L/n_R aren't divisible by the mesh axis
         size, the trailing μ rows are zero-padded — mirrors the write-side
-        invariant in v_q_tile._round_up_to_mesh and lets Σ^B run at any
-        process count without a runtime divisibility error."""
+        μ padding in ``gw.v_q_g_flat._compute_V_q_g_flat_one_tile`` and
+        lets Σ^B run at any process count without a runtime divisibility
+        error."""
         if not (0 <= mu_L <= 3 and 0 <= nu_L <= 3):
             raise ValueError(f"Lorentz indices must be in {{0..3}}; got "
                              f"({mu_L}, {nu_L}).")

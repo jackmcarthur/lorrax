@@ -148,7 +148,6 @@ def test_compute_all_V_q_g_flat_matches_einsum_reference(
                 mesh_xy=single_device_mesh,
                 sys_dim=sys_dim,
                 bare_coulomb_cutoff_ry=cutoff,
-                async_prefetch=False,
                 sym=None,                # full-BZ iteration
                 centroid_indices=None,
             )
@@ -163,50 +162,6 @@ def test_compute_all_V_q_g_flat_matches_einsum_reference(
     # g0[μ,q] = ζ̃[q, μ, 0] (sphere convention: G=(0,0,0) at index 0).
     ref_g0 = zeta_disk[:, :, 0]
     np.testing.assert_allclose(g0, ref_g0, atol=1e-12, rtol=1e-12)
-
-
-def test_compute_all_V_q_g_flat_async_matches_sync(
-        tmp_path, single_device_mesh):
-    """async_prefetch=True must produce identical V_q / g0 as sync."""
-    fft_grid = (4, 4, 6)
-    kgrid = (2, 2, 1)
-    bvec = np.diag([0.8, 0.8, 0.3])
-    cutoff = 6.0
-    cell_volume = 50.0
-    n_rmu = 3
-    sys_dim = 2
-
-    path, *_ = _build_g_flat_zeta_file(
-        tmp_path, fft_grid=fft_grid, kgrid=kgrid, bvec=bvec,
-        cutoff=cutoff, n_rmu=n_rmu, sys_dim=sys_dim, seed=0xFADE)
-
-    with ZetaLoader(path, mesh=single_device_mesh) as loader:
-        with single_device_mesh:
-            V_sync, g0_sync = compute_all_V_q_g_flat(
-                loader,
-                kgrid=kgrid, fft_grid=fft_grid,
-                bvec=bvec, cell_volume=cell_volume,
-                mesh_xy=single_device_mesh,
-                sys_dim=sys_dim,
-                bare_coulomb_cutoff_ry=cutoff,
-                async_prefetch=False,
-            )
-            V_async, g0_async = compute_all_V_q_g_flat(
-                loader,
-                kgrid=kgrid, fft_grid=fft_grid,
-                bvec=bvec, cell_volume=cell_volume,
-                mesh_xy=single_device_mesh,
-                sys_dim=sys_dim,
-                bare_coulomb_cutoff_ry=cutoff,
-                async_prefetch=True,
-            )
-
-    np.testing.assert_allclose(
-        np.asarray(V_async), np.asarray(V_sync),
-        atol=1e-12, rtol=1e-12)
-    np.testing.assert_allclose(
-        np.asarray(g0_async), np.asarray(g0_sync),
-        atol=1e-12, rtol=1e-12)
 
 
 def test_compute_all_V_q_g_flat_rejects_r_space_loader(

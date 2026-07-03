@@ -307,13 +307,13 @@ $$\tilde{z}_{q,\mu}(\mathbf{G}) = \sqrt{v_{\mathbf{q}}(\mathbf{G})} \cdot z_{q,\
 
 $$V_{q,\mu\nu} = \sum_{\mathbf{G}} \tilde{z}^*_{q,\mu}(\mathbf{G}) \, \tilde{z}_{q,\nu}(\mathbf{G}) = \langle \tilde{z}_{q,\mu} | \tilde{z}_{q,\nu} \rangle$$
 
-**Memory**: $\zeta$ is loaded $\mu$-chunked and each q-batch is read from `zeta_q.h5` into a background thread while the previous batch computes on GPU (overlapped I/O, `ThreadPoolExecutor` in `compute_all_V_q_from_zeta_h5`). A single-chunk path vmaps the whole q-batch through one JIT.
+**Memory**: $\tilde{z}$ already lives on the per-q WFN.h5-style G-sphere on disk (G-flat layout). The orchestrator pre-reads all IBZ $\tilde{z}$ slabs in one batched call, then runs a sync per-q loop; the contract chunks over $\mathbf{G}$ (`g_chunk`), so the working set is bounded by one G-chunk plus the mesh-sharded $\zeta$ slabs — no FFT, no $\mu\times\nu$ tiling.
 
 **Output**: `V_qmunu` array, shape $(n_{qx}, n_{qy}, n_{qz}, n_\mu, n_\mu)$, sharded `P(None, None, None, 'x', 'y')`. Used directly in memory by the GW pipeline; not routinely persisted to disk.
 
 **Disk bottleneck**: The file `zeta_q.h5` has flat-q layout $(n_q, n_r, n_\mu)$ and is typically **10–100 GB**. Dataset layout puts $n_\mu$ innermost so per-r-chunk writes are contiguous (the earlier `(n_q, n_\mu, n_r)` layout was 8× slower on Perlmutter pscratch).
 
-**Implementation**: `compute_all_V_q_from_zeta_h5()` in `gw/compute_vcoul.py`. Q=0 divergence handled via Voronoi Monte Carlo in `gw/vcoul.py:compute_q0_averages`. Box truncation (0-D molecules) via `gw/compute_vcoul_0d.py`.
+**Implementation**: `compute_all_V_q()` dispatcher in `gw/compute_vcoul.py` → `gw/v_q_g_flat.py:compute_all_V_q_g_flat` (charge) / `gw/v_q_bispinor.py:compute_V_q_bispinor_g_flat_to_h5` (bispinor); per-q $v(q+G)$ built by `compute_v_q_per_G`. Q=0 divergence handled via Voronoi Monte Carlo in `gw/vcoul.py:compute_q0_averages`. Box truncation (0-D molecules) via `gw/compute_vcoul_0d.py`.
 
 ---
 

@@ -2190,8 +2190,8 @@ def fit_zeta_to_h5(
     # by the orbit-closure auto-fallback, so the on-disk q-axis is IBZ when
     # it is True and full-BZ when it fell back — nothing more to decide here.
 
-    # BGW Brillouin-zone wrap used by the V_q kernel
-    # (``_qvec_wrap`` at ``gw/v_q_tile.py:1204``): ``q > kgrid/2 → q
+    # BGW Brillouin-zone wrap (the local ``_bgw_wrap_q`` below, matching
+    # the convention the V_q consumer uses): ``q > kgrid/2 → q
     # − kgrid``.  The writer must match so the per-q phase
     # ``exp(-2πi (q/kgrid)·r)`` baked into the G-flat output is the
     # convention the consumer expects.
@@ -2234,8 +2234,8 @@ def fit_zeta_to_h5(
     # (n_G_sph = n_rtot) — slow disk path, kept for sanity checks.
     if q_irr_frac is None:
         # Full-BZ q-vectors with BGW wrap, then / kgrid — same convention
-        # the V_q kernel's ``_zeta_disk_to_G`` consumed via
-        # ``_qvec_wrap``.
+        # the V_q consumer's disk→G path (``zeta_reader._do_disk_to_G``)
+        # expects, via the local ``_bgw_wrap_q``.
         _kgrid_arr_for_qfrac = np.asarray(meta.kgrid, dtype=np.float64)
         q_irr_frac = (_bgw_wrap_q(sym.kvecs_asints)
                        / _kgrid_arr_for_qfrac[None, :])

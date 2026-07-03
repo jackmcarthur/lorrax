@@ -772,10 +772,10 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 
 	bvec = np.asarray(wfn.blat * wfn.bvec, dtype=np.float64)
 
-	# V_q memory budget (per rank).  The unified V_q tile chooser inside
-	# ``compute_all_V_q`` derives q_chunk and μ_chunk from this budget and
-	# the system geometry (n_rmu, n_G, n_rtot, mesh shape) directly — no
-	# need for the caller to pre-compute legacy μ/q-batch hints.
+	# V_q memory budget (per rank) — informational only.  The live
+	# G-flat V_q path bounds its working set with ``vq_g_chunk_size``
+	# (per-q G-chunk) and mesh-sharded ζ slabs; there is no byte-budget
+	# chooser to feed any more.  Kept for the log line below.
 	if mem_est is None:
 		mem_est = {}
 	budget_gb = float(mem_est.get('available_vcoul_gb', cfg.memory.per_device_gb))
@@ -784,7 +784,6 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		budget_gb = min(budget_gb, float(get_device_memory_info().get('budget_gb', budget_gb)))
 	except Exception:
 		pass
-	m_budget = max(0.1, budget_gb) * 1e9
 
 	# Resolved earlier in :func:`fit_zeta` (line ~589) via the shared
 	# ``_resolve_cutoff`` helper — defaults to ``wfn.ecutwfc``, max
@@ -805,11 +804,16 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	# When cfg.bispinor is set AND the 4-channel ζ files were produced by
 	# fit_zeta (zeta_q.h5 + zeta_q_mu{1,2,3}.h5), dispatch to the
 	# 7-tile orchestrator that streams V^{μ_L,ν_L}_q to a dedicated
-	# HDF5 file.  The CC tile (μ_L = ν_L = 0) is bit-identical to the
-	# scalar charge V_q (verified by tests/test_v_q_bispinor_orchestrator),
-	# so we read it back from the bispinor file as the scalar V_qmunu /
-	# G0 the downstream restart_state writer expects.  Σ_X^B / Σ_H^B
-	# consumers will read the TT tiles directly via BispinorVqReader.
+	# HDF5 file.  The CC tile (μ_L = ν_L = 0) matches the scalar charge
+	# V_q — bit-identically for every sandbox bispinor system, which is
+	# sys_dim=2: there the G=0 body is regularised by the 2D truncation
+	# (f2d→0) and the mini-BZ head-average is a no-op, so the CC builder's
+	# omission of ``v_head_miniBZ`` costs nothing.  (In 3D with
+	# mc_average_vcoul_body the two would diverge in one G=0 slot per
+	# q≠0 — not currently reachable; see v_q_bispinor CC builder.)  We
+	# read the CC tile back as the scalar V_qmunu / G0 the downstream
+	# restart_state writer expects.  Σ_X^B / Σ_H^B consumers will read
+	# the TT tiles directly via BispinorVqReader.
 	zeta_dir = os.path.dirname(zeta_h5_path)
 	zeta_T_paths = [
 		os.path.join(zeta_dir, f"zeta_q_mu{mu_L}.h5") for mu_L in (1, 2, 3)
@@ -924,12 +928,11 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 			G0_all = jnp.pad(G0_all,
 			                 ((0, 0), (0, int(meta.n_rmu_padded) - int(G0_all.shape[-1]))))
 	else:
-		# Single dispatcher routes to the unified V_q tile driver (one
-		# inner kernel handles same/distinct ζ × Case A/B; one outer
-		# driver handles both PHDF5/FFI and h5py-allgather backends).
-		# ``ZetaReader`` is the V_q reader of record after C3 — the FFT
-		# moves out of the V_q kernel and into the reader's
-		# ``read_zeta_G_slab`` path (``use_g_flat_zeta=True``).
+		# Scalar (non-bispinor) path.  ``compute_all_V_q`` dispatches on
+		# the on-disk ζ layout: G-flat (the only thing fit_zeta writes)
+		# routes to ``v_q_g_flat.compute_all_V_q_g_flat``; any other
+		# layout raises.  ``ZetaReader`` is the V_q reader of record —
+		# it serves the writer's per-q WFN.h5-style G-sphere directly.
 		from file_io.zeta_reader import ZetaReader
 		with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
 			with ZetaReader(zeta_h5_path, mesh=mesh_xy,
@@ -940,20 +943,17 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 						kgrid=meta.kgrid, fft_grid=meta.fft_grid,
 						bvec=bvec, cell_volume=meta.cell_volume,
 						mesh_xy=mesh_xy,
-						n_rmu=meta.n_rmu, n_rtot=meta.n_rtot,
 						sys_dim=meta.sys_dim,
 						bdot=np.asarray(wfn.bdot, dtype=np.float64)
 							if meta.sys_dim == 0 else None,
 						mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
 						bare_coulomb_cutoff=vcoul_cutoff_ry,
 						bgw_v_grid_fn=bgw_v_grid_fn,
-						budget_bytes=m_budget,
 						sym=sym,
 						centroid_indices=(
 							np.asarray(jax.device_get(centroid_indices),
 							           dtype=np.int32)
 							if centroid_indices is not None else None),
-						use_g_flat_zeta=True,
 						g_chunk_size=int(cfg.memory.vq_g_chunk_size),
 					)
 

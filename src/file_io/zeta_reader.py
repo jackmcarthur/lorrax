@@ -31,7 +31,7 @@ The reader transparently handles IBZ-only on-disk layouts (the writer's
 default after C2): ``read_zeta_q_count`` reports the actual on-disk q
 count.  Callers that loop over IBZ q's index directly into this axis;
 callers that loop over full-BZ q's must do the centroid-double-permute
-unfold post-V_q (see :func:`gw.v_q_tile._unfold_v_q_ibz_to_full`).
+unfold post-V_q (see :func:`common.symmetry_maps.unfold_v_q`).
 
 Lifecycle
 ---------

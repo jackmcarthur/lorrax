@@ -1,13 +1,7 @@
-"""Shared helpers to build bare-Coulomb G-sphere flat-FFT indices.
+"""Shared helper to build bare-Coulomb G-sphere flat-FFT indices.
 
-Two surfaces, one source of truth for the radius condition
+One source of truth for the radius condition
 ``|q + G|² ≤ bare_coulomb_cutoff``:
-
-* :func:`compute_bare_coulomb_sphere_idx` — a single, q=0-centered sphere
-  enlarged by ``|q_max|_cart`` so it covers every per-q ball in the BZ.
-  Used by the G-flat V_q path (``gw.v_q_g_flat.compute_all_V_q_g_flat``)
-  where one shared sphere keeps the consumer's gather contiguous and the
-  ``sqrt_v`` mask zeroes out the slack G's exactly.
 
 * :func:`compute_per_q_bare_coulomb_components` — a per-q sphere
   ``{G : |q + G|² ≤ cutoff}`` for every IBZ q, padded uniformly to

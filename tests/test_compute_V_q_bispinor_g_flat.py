@@ -241,7 +241,7 @@ def test_bispinor_CC_tile_matches_charge_orchestrator(
                 mesh_xy=single_device_mesh,
                 sys_dim=sys_dim,
                 bare_coulomb_cutoff_ry=cutoff,
-                verbose=False, async_prefetch=False,
+                verbose=False,
             )
     V_charge = np.asarray(V_charge)
     g0_charge = np.asarray(g0_charge)

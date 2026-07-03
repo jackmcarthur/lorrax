@@ -315,10 +315,10 @@ WFN.h5 + WFNq.h5 + centroids_frac.h5 + (eps0mat.h5, dipole.h5 optional)
 │           ├─ compute_ZCT_from_left_right_zchunk{_spin_matrix}          │
 │           ├─ solve_zeta_from_L_q             (triangular solve)       │
 │           └─ zeta_io.write_slab('zeta_q', ...)  via SlabIO            │
-│     compute_vcoul.compute_all_V_q_from_zeta_h5                        │
-│       ├─ μ-chunked FFT of ζ_q with √v(q+G) weight                     │
-│       ├─ overlapped H5 prefetch (batch N+1 while GPU computes N)      │
-│       └─ vmap'd per-q contract → V_qmunu                              │
+│     compute_vcoul.compute_all_V_q  (dispatcher → G-flat path)         │
+│       └─ v_q_g_flat.compute_all_V_q_g_flat                            │
+│           ├─ compute_v_q_per_G  (v(q+G) on per-q WFN.h5 sphere)       │
+│           └─ per-q, G-chunked contract → V_qmunu                      │
 │     build_wavefunctions(...) → Wavefunctions bundle                   │
 └──────────────────────────────────────────────────────────────────────┘
     │
@@ -506,9 +506,10 @@ prepare_isdf_and_wavefunctions          [gw/gw_init.py]
  │       ├─ compute_ZCT_from_left_right_zchunk    [common/isdf_fitting.py]
  │       ├─ solve_zeta_from_L_q             [common/isdf_fitting.py]
  │       └─ SlabIO.write_slab               [file_io/slab_io.py]
- └─ compute_all_V_q_from_zeta_h5          [gw/compute_vcoul.py]
-     ├─ make_v_munu_chunked_kernel         [gw/compute_vcoul.py]
-     └─ SlabIO.read_slab                   [file_io/slab_io.py]
+ └─ compute_all_V_q  (dispatcher)        [gw/compute_vcoul.py]
+     └─ compute_all_V_q_g_flat            [gw/v_q_g_flat.py]
+         ├─ compute_v_q_per_G             [gw/compute_vcoul.py]
+         └─ ZetaReader.read_slab          [file_io/zeta_reader.py]
 ```
 
 ### 8.2 Screening + static Σ
@@ -595,7 +596,7 @@ main                                       [gw/gw_jax.py]
 | **ZCT matrix (z-chunk)** | `common/isdf_fitting.py : compute_ZCT_from_left_right_zchunk` |
 | **ζ solve** | `common/isdf_fitting.py : solve_zeta_from_L_q` |
 | **Full ζ pipeline** | `common/isdf_fitting.py : fit_zeta_chunked_to_h5` |
-| **Compute V_q** | `gw/compute_vcoul.py : compute_all_V_q_from_zeta_h5` |
+| **Compute V_q** | `gw/compute_vcoul.py : compute_all_V_q` → `gw/v_q_g_flat.py : compute_all_V_q_g_flat` (charge) / `gw/v_q_bispinor.py : compute_V_q_bispinor_g_flat_to_h5` (bispinor) |
 | **Voronoi MC for q=0** | `gw/vcoul.py : compute_q0_averages` |
 | **Coulomb kernel + truncation** | `gw/vcoul.py : compute_V_qfullG_for_q` (`sys_dim=2` 2D slab, `3` 3D bulk, `0` box via `compute_vcoul_0d.py`) |
 | **χ₀ minimax kernel** | `gw/w_isdf.py : _get_chi_minimax_kernel`, `compute_chi0_minimax` |
