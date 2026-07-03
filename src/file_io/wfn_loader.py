@@ -172,9 +172,17 @@ class WfnLoader:
             self.cbm = float(self.vbm)
             self.efermi = float(self.vbm)
 
-        # Eager-backend state: slurp wfns/* into host RAM.  Same memory
-        # behaviour as the legacy WFNReader.
-        self._coeffs_raw = self._file["wfns/coeffs"][:]   # (nb, ns, ngktot, 2) f64
+        # Eager-backend state.  Only the eager path reads coeffs host-side;
+        # keep the dataset HANDLE (no read) and hyperslab the requested
+        # ``[b_lo:b_hi, :, start:end, :]`` block per-call in ``_eager_build``.
+        # The phdf5 backend reads coeffs collectively via the FFI, so it
+        # never touches this — slurping the whole ``(nb, ns, ngktot, 2)`` f64
+        # array unconditionally was pure waste + a latent OOM (a second,
+        # whole-array read on the exact multi-rank path where memory is
+        # tightest).  ``_gvecs_raw`` (ngktot,3) + ``_kpt_starts`` are cheap
+        # index metadata both backends use — keep those eager.
+        self._coeffs_ds = (
+            self._file["wfns/coeffs"] if self.backend == "eager" else None)
         self._gvecs_raw = self._file["wfns/gvecs"][:]     # (ngktot, 3) int
         # kpt_starts = cumulative (exclusive prefix) sum of ngk.
         self._kpt_starts = kpt_starts(self.ngk)
@@ -338,7 +346,7 @@ class WfnLoader:
                 start = int(self._kpt_starts[kbar])
                 end = start + int(self.ngk[kbar])
                 k_gvecs = self._gvecs_raw[start:end]
-                Gkk = sym._get_umklapp_vector(
+                Gkk = sym.get_umklapp_vector(
                     self, nk_int, sym_idx, kbar, sym_krep)
                 g_rot = np.einsum('ij,kj->ki', sym_krep, k_gvecs) - Gkk
                 out[j, : g_rot.shape[0]] = g_rot
@@ -540,22 +548,15 @@ class WfnLoader:
         n_tran = int(sym.sym_matrices.shape[0])
         tr_mask = (sym_idx_per_full >= n_tran).astype(np.bool_)
 
-        # Per-k spinor rotation matrix. For spatial rows (s < ntran):
-        # ``U_per[k] = sym.U_spinor[s]``. For TRS rows (s >= ntran):
-        # ``U_per[k] = iσ_y · conj(sym.U_spinor[s_spatial])`` per the
-        # bispinor TRS rule (T = iσ_y K). See ``common.symmetry_maps.unfold_psi``
-        # and ``reports/trs_sym_audit_2026-05-14`` Sites #5–#7.
-        # ``sym.U_spinor`` is length ``ntran`` (PR3); the TRS-augmented
-        # half is computed here on demand.
-        from common.symmetry_maps import _I_SIGMA_Y
-        U_spatial = np.asarray(sym.U_spinor)                            # (ntran, 2, 2)
-        s_spatial_idx = sym_idx_per_full % n_tran                        # (nk_full,)
-        U_per_spatial = U_spatial[s_spatial_idx]                         # (nk_full, 2, 2)
-        # TRS form: iσ_y · conj(U_spatial[s_spatial]); broadcast over k.
-        U_per_trs = np.einsum(
-            'ij,kjl->kil', _I_SIGMA_Y, np.conj(U_per_spatial))           # (nk_full, 2, 2)
-        U_per = np.where(
-            tr_mask[:, None, None], U_per_trs, U_per_spatial)            # (nk_full, 2, 2)
+        # Per-k spinor rotation matrix, single-sourced via the ψ-unfold
+        # spinor rule (spatial rows → ``sym.U_spinor[s]``; TRS rows →
+        # ``iσ_y · conj(sym.U_spinor[s − ntran])``, the T = iσ_y K rule).
+        # See ``common.symmetry_maps.{unfold_psi,trs_augment_U}`` and
+        # ``reports/trs_sym_audit_2026-05-14`` Sites #5–#7.  ``sym.U_spinor``
+        # is length ``ntran`` (PR3); the TRS half is built inside the helper.
+        from common.symmetry_maps import trs_augment_U
+        U_per = trs_augment_U(
+            sym.U_spinor, sym_idx_per_full, n_tran)                      # (nk_full, 2, 2)
 
         # τ-phase per full-BZ k on the ibz-source ngkmax-padded G-list.
         # Use the SAME formula for spatial and TRS rows:
@@ -568,20 +569,19 @@ class WfnLoader:
         # is reproduced. Pre-PR3 the TRS rows were set to 1 (skipped the
         # phase entirely) — that bug fired on non-symmorphic non-inversion
         # bispinor systems.
+        from common.symmetry_maps import tau_phase_row
         phase = np.ones((nk_full, ngkmax), dtype=np.complex128)
         for nk in range(nk_full):
             s = int(sym_idx_per_full[nk])
             s_spatial = s - n_tran if s >= n_tran else s
-            tau = np.asarray(sym.translations[s_spatial], dtype=np.float64)
-            if not np.any(np.abs(tau) > 1e-12):
-                continue
             ibz = int(ibz_per_full[nk])
             ngk_k = int(self.ngk[ibz])
             start = int(self._kpt_starts[ibz])
             g_bar = self._gvecs_raw[start:start + ngk_k]
-            rotated = (np.asarray(sym.sym_mats_k[s], dtype=np.int32) @ g_bar.T).T
-            phase[nk, :ngk_k] = np.exp(
-                -1j * rotated.astype(np.float64) @ tau)
+            ph = tau_phase_row(
+                sym.sym_mats_k[s], sym.translations[s_spatial], g_bar)
+            if ph is not None:
+                phase[nk, :ngk_k] = ph
 
         # Open the phdf5 collective context lazily.
         if self._phdf5_ctx is None:
@@ -953,7 +953,7 @@ class WfnLoader:
                 ibz = int(ik)
                 start = int(self._kpt_starts[ibz])
                 end = start + int(self.ngk[ibz])
-                raw = self._coeffs_raw[b_lo:b_hi, :, start:end, :]
+                raw = self._coeffs_ds[b_lo:b_hi, :, start:end, :]
                 out[j, :nb_logical, :, : end - start] = (
                     raw[..., 0] + 1j * raw[..., 1])
             return out
@@ -970,7 +970,7 @@ class WfnLoader:
 
             start = int(self._kpt_starts[kbar])
             end = start + ngk_k
-            raw = self._coeffs_raw[b_lo:b_hi, :, start:end, :]
+            raw = self._coeffs_ds[b_lo:b_hi, :, start:end, :]
             cnk = raw[..., 0] + 1j * raw[..., 1]                    # (nb, ns, ngk_k)
             g_bar = self._gvecs_raw[start:end]                      # (ngk_k, 3)
             cnk = unfold_psi(

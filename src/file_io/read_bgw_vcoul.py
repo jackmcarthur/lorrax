@@ -34,7 +34,7 @@ class BGWVcoulTable:
         """Find stored q_table symmetry-equivalent to q_frac.
 
         Uses BGW/LORRAX's `k_full = S · k_bar + kg0` convention (see
-        symmetry_maps.SymMaps._get_umklapp_vector).  Here the role of
+        symmetry_maps.SymMaps.get_umklapp_vector).  Here the role of
         "full" is played by q_frac (what LORRAX asks for) and "bar" by
         q_table (what BGW stored).
 

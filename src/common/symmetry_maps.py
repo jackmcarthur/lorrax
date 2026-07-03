@@ -615,6 +615,83 @@ def _get_unfold_v_q_lorentz_jit(*, V_shape, R_per_q_arr, mesh_xy):
 _I_SIGMA_Y = np.array([[0.0, 1.0], [-1.0, 0.0]], dtype=np.complex128)
 
 
+def trs_augment_U(U_spinor_spatial, sym_idx, n_tran):
+    """Per-op spinor rotation matrix with the TRS augmentation baked in.
+
+    Single source of the ψ-unfold spinor rule (see :func:`unfold_psi`).
+    For a spatial sym row (``sym_idx < n_tran``) the spinor rotation is just
+    ``U_spinor_spatial[sym_idx]``.  For a TRS-augmented row
+    (``sym_idx >= n_tran``, op ``T∘{S|τ}`` with ``T = iσ_y K``) it is
+    ``iσ_y · conj(U_spinor_spatial[sym_idx − n_tran])``.
+
+    Works for a scalar ``sym_idx`` (host per-single-k path in
+    :func:`unfold_psi`) or a 1-D array of ``sym_idx`` (device per-full-BZ-k
+    table build in ``WfnLoader._ensure_phdf5_static``).
+
+    Parameters
+    ----------
+    U_spinor_spatial : (n_tran, 2, 2) complex
+        Spatial-only spinor rotation matrices.
+    sym_idx : int or (nk,) int array
+        Row(s) in the TRS-augmented row space ``[0, 2·n_tran)``.
+    n_tran : int
+        Count of spatial-only sym ops.
+
+    Returns
+    -------
+    (2, 2) or (nk, 2, 2) complex
+        Effective spinor rotation(s).  Scalar ``sym_idx`` → ``(2, 2)``.
+    """
+    U_spatial = np.asarray(U_spinor_spatial)
+    idx = np.asarray(sym_idx)
+    scalar = idx.ndim == 0
+    idx1 = np.atleast_1d(idx)
+    # ``% n_tran`` folds a TRS row (idx ≥ n_tran) back to its spatial op;
+    # guard the degenerate no-symmetry case (n_tran == 0, single identity
+    # row) so it doesn't divide-by-zero — only idx == 0 is valid there and
+    # both spellings pick spatial op 0.
+    s_spatial = idx1 % (n_tran if n_tran else 1)
+    is_trs = idx1 >= n_tran
+    U_sp = U_spatial[s_spatial]                                    # (nk, 2, 2)
+    # iσ_y · conj(U_spatial[s_spatial]), broadcast over the leading axis.
+    U_trs = np.einsum('ij,kjl->kil', _I_SIGMA_Y, np.conj(U_sp))    # (nk, 2, 2)
+    out = np.where(is_trs[:, None, None], U_trs, U_sp)
+    return out[0] if scalar else out
+
+
+def tau_phase_row(sym_mat_k, tau, g_kbar):
+    """τ-phase ``exp(-i (S·G_kbar)·τ)`` for one sym row on its IBZ G-axis.
+
+    Single source of the ψ-unfold τ-phase rule (see :func:`unfold_psi`).
+    ``sym_mat_k`` is the TRS-augmented sym matrix ``sym_mats_k[sym_idx]`` —
+    for TRS rows it already carries the ``-S`` sign, so the same formula
+    yields ``exp(+i (S·G_kbar)·τ) = conj(spatial-phase)`` automatically.
+
+    Returns ``None`` when ``τ ≈ 0`` (the phase is identically 1 and callers
+    skip the multiply), matching both the host and device table builds.
+
+    Parameters
+    ----------
+    sym_mat_k : (3, 3) int
+        ``sym_mats_k[sym_idx]`` (TRS-augmented; carries the ±S sign).
+    tau : (3,) float
+        Spatial fractional translation ``translations[sym_idx % n_tran]``.
+    g_kbar : (ngk, 3) int
+        IBZ G-list of ψ_kbar.
+
+    Returns
+    -------
+    (ngk,) complex or None
+        The per-G phase, or ``None`` when ``τ`` is (numerically) zero.
+    """
+    tau = np.asarray(tau, dtype=np.float64)
+    if not np.any(np.abs(tau) > 1e-12):
+        return None
+    S = np.asarray(sym_mat_k, dtype=np.int32)
+    rotated = (S @ np.asarray(g_kbar).T).T.astype(np.float64)      # (ngk, 3)
+    return np.exp(-1j * (rotated @ tau))                          # (ngk,)
+
+
 def unfold_psi(
     cnk_kbar,
     *,
@@ -693,32 +770,25 @@ def unfold_psi(
     cnk = np.asarray(cnk_kbar)
     g_bar = np.asarray(g_kbar)
 
-    # τ-phase: uses sym_mats_k[sym_idx] (which already has ±S sign baked in
-    # for TRS), and the spatial τ. For spatial: phase = exp(-i (S·G_kbar)·τ).
-    # For TRS (sym_mats_k = -S): the same formula gives exp(+i (S·G_kbar)·τ),
-    # which is the conj(spatial-phase) the TRS rule requires.
-    tau = np.asarray(translations[s_spatial], dtype=np.float64)
-    has_tau = bool(np.any(np.abs(tau) > 1e-12))
-    if has_tau:
-        rotated = (S_full @ g_bar.T).T.astype(np.float64)              # (ngk, 3)
-        phase = np.exp(-1j * (rotated @ tau))                          # (ngk,)
-    else:
-        phase = None
+    # τ-phase: single-sourced in ``tau_phase_row``. ``S_full`` already has
+    # the ±S sign baked in for TRS rows, so the same formula yields
+    # ``conj(spatial-phase)`` there. Returns ``None`` when τ ≈ 0.
+    phase = tau_phase_row(S_full, translations[s_spatial], g_bar)
 
     if is_trs:
         # TRS rule: ψ_full = iσ_y · conj(U_s · ψ_kbar · phase_spatial)
         #         = (iσ_y · conj(U_s)) · conj(ψ_kbar) · conj(phase_spatial)
-        # We compute phase via sym_mats_k[TRS row]=-S so it equals
+        # ``phase`` is computed via sym_mats_k[TRS row]=-S so it equals
         # conj(phase_spatial) already. Apply conj on cnk first, THEN phase
         # (else the conj would re-invert the phase sign).
         cnk = np.conj(cnk)
         if phase is not None:
             cnk = cnk * phase[None, None, :]
-        U_eff = _I_SIGMA_Y @ np.conj(np.asarray(U_spinor_spatial[s_spatial]))
     else:
         if phase is not None:
             cnk = cnk * phase[None, None, :]
-        U_eff = np.asarray(U_spinor_spatial[s_spatial])
+    # Spinor rotation with the TRS augmentation single-sourced.
+    U_eff = trs_augment_U(U_spinor_spatial, sym_idx, n_sym_spatial)
 
     # Spinor rotation. For ns=1 (non-SOC), U_eff is the 1×1 identity and
     # this einsum is a no-op (callers can still pass it without special-casing).
@@ -1144,7 +1214,7 @@ class SymMaps:
             ik_irr = int(self.irr_idx_k[ik_full])
             sym_idx = int(self.sym_idx_k[ik_full])
             sym_krep = np.asarray(self.sym_mats_k[sym_idx], dtype=np.int32)
-            kg0 = self._get_umklapp_vector(wfn, ik_full, sym_idx, ik_irr, sym_krep)
+            kg0 = self.get_umklapp_vector(wfn, ik_full, sym_idx, ik_irr, sym_krep)
             mapped = sym_krep @ np.asarray(wfn.kpoints[ik_irr], dtype=np.float64) + kg0
             if np.max(np.abs(mapped - self.unfolded_kpts[ik_full])) > tol:
                 failures.append(
@@ -1380,7 +1450,7 @@ class SymMaps:
 
         return kq_map
     
-    def _get_umklapp_vector(self, wfn, nk, sym_idx, kbar_idx, sym_krep):
+    def get_umklapp_vector(self, wfn, nk, sym_idx, kbar_idx, sym_krep):
         """Return BGW's kg0 for the selected full-zone k-point.
 
         BGW defines the integer umklapp vector kg0 through
