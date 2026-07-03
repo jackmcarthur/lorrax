@@ -18,8 +18,6 @@ from common.gamma_matrices import (
     gamma_double_contract,
 )
 
-_MEM_PROFILE = bool(os.environ.get("LORRAX_MEM_PROFILE", ""))
-
 # Running max of nvidia-smi used MB across all probe points within a run
 # (this rank's GPU only).  jax.device_memory_stats() returns None on the
 # JAX 0.8 / CUDA 12.9 Perlmutter stack, so nvidia-smi is the only way to
@@ -27,18 +25,6 @@ _MEM_PROFILE = bool(os.environ.get("LORRAX_MEM_PROFILE", ""))
 # NCCL collective buffers, and other XLA-arena-external allocations.
 _NVSMI_PEAK_MB = 0
 _NVSMI_LAST_MB = 0
-
-def _mem_report(label):
-    """Print per-device memory if LORRAX_MEM_PROFILE is set. Zero cost otherwise."""
-    if not _MEM_PROFILE:
-        return
-    gc.collect()
-    s = jax.local_devices()[0].memory_stats()
-    u = s.get('bytes_in_use', 0) / 1e9
-    p = s.get('peak_bytes_in_use', 0) / 1e9
-    if jax.process_index() == 0:
-        print(f'  [MEM {label}] used={u:.3f} peak={p:.3f} GB', flush=True)
-
 
 def mem_probe(label, *, only_rank0=True):
     """``LORRAX_MEM_DEBUG=1`` runtime probe of process-wide HBM at named sites.
@@ -168,8 +154,11 @@ from jax.experimental import io_callback as _io_callback
 # materialises P_k_ab globally; everything happens inside the
 # monolithic shard_map kernels below.
 
-_pair_density_cache = {}
-_pair_pipeline_sm_cache = {}
+# Compiled-kernel caches (keyed by shape/dtype/sharding). Module-level so the
+# per-r-chunk loop reuses one traced kernel; do NOT rename `_fit_one_rchunk_cache`
+# (gw_init clears it by name between runs). See ISDF_MOVE_PLAN.md STEP 2.
+_pair_density_cache = {}  # pair-density kernel
+_pair_pipeline_sm_cache = {}  # pair-density shard_map pipeline kernel
 
 
 def pair_density(
@@ -210,7 +199,7 @@ def pair_density(
 
 
 # Cache for ISDF pipeline jitted functions
-_isdf_pipeline_cache = {}
+_isdf_pipeline_cache = {}  # ISDF pipeline (z_q/c_q from psi_sm) kernel
 
 
 
@@ -1163,7 +1152,7 @@ def factor_c_q(
 
 
 # Cache for solve function
-_solve_cache = {}
+_solve_cache = {}  # zeta-solve kernel
 
 
 def _reshard_zeta_mu_X_r_Y_to_mu_XY(zeta: jax.Array, mesh_xy: Mesh) -> jax.Array:
@@ -1550,7 +1539,7 @@ def solve_zeta(
 # (normalised to jnp.ones(nb) when absent so the shape is uniform), and
 # r_start as a scalar dynamic int.
 
-_fit_one_rchunk_cache: dict = {}
+_fit_one_rchunk_cache: dict = {}  # fused fit_one_rchunk kernel (cleared per-run by gw_init:703)
 
 
 def _make_fit_one_rchunk_kernel(
