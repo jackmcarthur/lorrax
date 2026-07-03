@@ -697,10 +697,10 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		# The pair-density caches are intentionally preserved so the three
 		# transverse channels share the same n_rmu=n_rmu_current compile.
 		import gc
-		from gw import isdf_fitting as _isdf
+		from isdf import core as _isdf_core
 
 		def _drop_traced_caches():
-			_isdf._fit_one_rchunk_cache.clear()
+			_isdf_core._fit_one_rchunk_cache.clear()
 			gc.collect()
 
 		for mu_L in (1, 2, 3):

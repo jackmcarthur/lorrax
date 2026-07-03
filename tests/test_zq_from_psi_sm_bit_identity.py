@@ -32,7 +32,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 jax.config.update("jax_enable_x64", True)
 
-from gw.isdf_fitting import z_q_from_psi_sm
+from isdf import z_q_from_psi_sm
 from common.gamma_matrices import gamma_double_contract
 from common.wfn_transforms import to_rchunk
 
@@ -408,7 +408,7 @@ def test_g1_1d_bispinor_gamma1():
     synth = _build_synth(ns=4)
     # γ̃^1 = γ0 · γ1 — pure-permutation matrix, computed from gamma_matrices.
     # Use the same `_gamma_perm_phase_mu` helper as production.
-    from gw.isdf_fitting import _gamma_perm_phase_mu
+    from isdf.core import _gamma_perm_phase_mu
     perm, phase = _gamma_perm_phase_mu(1)
     Z_new, Z_ref = _run_pair(
         synth,

@@ -288,7 +288,7 @@ def test_compute_L_q_indivisible_logical_n_rmu():
     Cholesky branch runs and the math contract is identical.  Real-
     GPU integration tests cover the sharded path.
     """
-    from gw.isdf_fitting import factor_c_q
+    from isdf import factor_c_q
 
     devs = jax.devices()[:1]
     mesh_1x1 = Mesh(np.asarray(devs).reshape(1, 1), axis_names=("x", "y"))
@@ -352,7 +352,7 @@ def test_compute_L_q_legacy_divisible_path_unchanged():
     on real GPUs via the integration tests.  This test guards the public
     contract: ``n_rmu_logical=None`` is a no-op vs ``n_rmu_logical=n``.
     """
-    from gw.isdf_fitting import factor_c_q
+    from isdf import factor_c_q
 
     devs = jax.devices()[:1]
     mesh_1x1 = Mesh(np.asarray(devs).reshape(1, 1), axis_names=("x", "y"))
@@ -386,7 +386,7 @@ def test_compute_L_q_indivisible_indefinite_path(mesh_2x2):
     mesh because no chol kernel runs in this branch — only the
     diagonal-add and a sharding constraint.
     """
-    from gw.isdf_fitting import factor_c_q
+    from isdf import factor_c_q
 
     n_log, n_pad, nq = 7, 8, 2
     rng = np.random.default_rng(11)
@@ -419,7 +419,7 @@ def test_compute_L_q_indivisible_indefinite_path(mesh_2x2):
 
 def test_compute_L_q_logical_exceeds_input_raises(mesh_2x2):
     """n_rmu_logical > input dim is a programmer error; raise."""
-    from gw.isdf_fitting import factor_c_q
+    from isdf import factor_c_q
 
     G = jnp.asarray(_make_psd_complex(np.random.default_rng(0), 8))
     G_sharded = jax.device_put(G, NamedSharding(mesh_2x2, P(None, 'x', 'y')))

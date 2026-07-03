@@ -855,7 +855,7 @@ def build_gram_q0_via_loadwfns(
     # we don't want to charge the single-device prune path for it.
     from common.meta import Meta
     from common.load_wfns import load_centroids_band_chunked
-    from gw.isdf_fitting import (
+    from isdf import (
         pair_density,
         gram_q0_from_pair,
     )
