@@ -646,7 +646,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		)
 	if cfg.bispinor and getattr(cfg.paths, 'centroids_file_current', None):
 		import dataclasses
-		from common.load_wfns import load_centroids_band_chunked
+		from common.wfn_transforms import load_centroids_band_chunked
 		from file_io.centroids import load_centroids
 
 		cents_curr_path = cfg.paths.centroids_file_current
@@ -994,7 +994,7 @@ def build_wavefunction_bundle(
 	arrays produced by ``load_centroids_band_chunked``.
 	"""
 	from .wavefunction_bundle import build_wavefunctions
-	from common.load_wfns import get_enk_bandrange
+	from common.wfn_transforms import get_enk_bandrange
 
 	if enk_full is None:
 		enk_full, _ = get_enk_bandrange(
@@ -1027,10 +1027,10 @@ def prepare_isdf_and_wavefunctions(
 	Returns SimpleNamespace(V_qmunu, wf_bundle).
 	"""
 	from file_io import write_restart_state_to_h5, save_restart_state_per_proc
-	from common.load_wfns import load_centroids_band_chunked
+	from common.wfn_transforms import load_centroids_band_chunked
 
 	if not cfg.restart:
-		from common.load_wfns import get_enk_bandrange
+		from common.wfn_transforms import get_enk_bandrange
 
 		with mesh_xy:
 			# Plan chunks (band/r/q sizes).

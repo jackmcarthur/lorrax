@@ -134,7 +134,7 @@ def build_rho_val_from_wfn(wfn, sym, meta, n_occ: int, *, verbose: bool = True) 
     -------
     rho_r : (nx, ny, nz) float64 — ρ_val in e/bohr³.
     """
-    from common.load_wfns import load_kpoint_fftbox
+    from common.wfn_transforms import load_kpoint_fftbox
 
     nx, ny, nz = meta.fft_grid
     N_grid = nx * ny * nz

@@ -854,7 +854,7 @@ def build_gram_q0_via_loadwfns(
     # Lazy imports — these modules pull in the full gw_jax dep chain and
     # we don't want to charge the single-device prune path for it.
     from common.meta import Meta
-    from common.load_wfns import load_centroids_band_chunked
+    from common.wfn_transforms import load_centroids_band_chunked
     from isdf import (
         pair_density,
         gram_q0_from_pair,

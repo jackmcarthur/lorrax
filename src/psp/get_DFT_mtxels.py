@@ -56,7 +56,7 @@ try:
     from .load_upf import load_upf
     from ..io import WFNReader
     from ..common import symmetry_maps
-    from ..common.load_wfns import read_Gvecs_to_devices
+    from ..common.wfn_transforms import read_Gvecs_to_devices
     from ..common import Meta
 except ImportError:
     # Fallback for direct script execution: add project `src` to sys.path and use absolute imports
@@ -67,7 +67,7 @@ except ImportError:
     from psp.upf.load_upf import load_upf
     from file_io import WfnLoader as WFNReader
     from common import symmetry_maps
-    from common.load_wfns import read_Gvecs_to_devices
+    from common.wfn_transforms import read_Gvecs_to_devices
     from common import Meta
 from psp.radial.build_projectors_qe import (
     build_local_ionic_potential_on_G_total,

@@ -149,7 +149,7 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
     so the first Σ-pipeline call uses the unrotated DFT wfns and "one
     iteration of QSGW" reduces exactly to one-shot G0W0 at E=E_DFT.
     """
-    from common.load_wfns import get_enk_bandrange
+    from common.wfn_transforms import get_enk_bandrange
     enk_dft, _ = get_enk_bandrange(
         inputs.wfn, inputs.sym,
         inputs.band_slices.sigma_range, inputs.band_slices.sigma_range,

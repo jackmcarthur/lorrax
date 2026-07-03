@@ -63,7 +63,7 @@ from runtime import init_jax_distributed
 init_jax_distributed()
 
 from common import Meta, symmetry_maps
-from common.load_wfns import load_kpoint_fftbox
+from common.wfn_transforms import load_kpoint_fftbox
 from file_io import WfnLoader as WFNReader
 from psp.dft_operators import setup_H_k_from_kvec
 from psp.h_dft import make_apply_H
@@ -134,7 +134,7 @@ def build_sternheimer_source(
     ----------
     U_box_k : (nv, nspinor, nx, ny, nz) complex
         Occupied orbitals at *source* k in **G-space FFT-box layout**: the
-        direct output of ``common.load_wfns.load_kpoint_fftbox`` — coefficients
+        direct output of ``common.wfn_transforms.load_kpoint_fftbox`` — coefficients
         scattered into a zero-padded box, NOT the real-space wavefunction.
     Gkminq_int : (ngk_p, 3) int32
         Integer G-vectors of the (k-q) G-sphere (from

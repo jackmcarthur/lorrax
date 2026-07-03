@@ -34,7 +34,7 @@ from jax.sharding import Mesh
 
 from file_io import WfnLoader as WFNReader
 from common import symmetry_maps, Meta
-from common.load_wfns import read_Gvecs_to_devices
+from common.wfn_transforms import read_Gvecs_to_devices
 from file_io.qe_save_reader import CrystalData
 from psp.get_DFT_mtxels import (
     load_pseudopotentials, build_atom_pp_assignments,

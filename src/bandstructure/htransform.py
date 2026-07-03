@@ -21,7 +21,7 @@ from functools import partial
 from file_io import WfnLoader as WFNReader
 from common import symmetry_maps
 from common import Meta
-from common.load_wfns import (
+from common.wfn_transforms import (
     get_enk_bandrange, load_centroids_band_chunked, iter_psi_rchunk_bandwise,
 )
 from isdf import factor_c_q

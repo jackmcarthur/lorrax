@@ -179,7 +179,7 @@ def fit_zeta_to_h5(
         psi_rmu_Y:  Centroid wavefunctions for the full [b0, b4) band range,
                     shape (nk, nb_full, ns, n_rmu), P(None, None, None, 'y'),
                     un-conjugated ψ.  Produced by
-                    :func:`common.load_wfns.load_centroids_band_chunked`.
+                    :func:`common.wfn_transforms.load_centroids_band_chunked`.
         psi_rmuT_X: Same centroid data transposed/sharded for the pair-density
                     kernel, shape (nk, n_rmu, nb_full, ns),
                     P(None, 'x', None, None), conjugated ψ*.

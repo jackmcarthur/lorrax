@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from common.units import RYD_TO_EV
-from common.load_wfns import get_enk_bandrange
+from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 
 from .gw_config import ComputeMode, LorraxConfig

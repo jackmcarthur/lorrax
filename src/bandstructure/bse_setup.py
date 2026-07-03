@@ -161,7 +161,7 @@ def compute_wfns_fi(
     energies_fi = _inv(lam_fi)
 
     # ── Reshard into the canonical (Y, X) wfn-bundle layout ──────────────
-    # Matches ``common.load_wfns.load_centroids_band_chunked``:
+    # Matches ``common.wfn_transforms.load_centroids_band_chunked``:
     #   psi_rmu_Y:  (nk, nb, ns, n_μ)   P(None, None, None, 'y')   — n_μ on Y
     #   psi_rmuT_X: (nk, n_μ, nb, ns)   P(None, 'x', None, None)   — n_μ on X
     out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))

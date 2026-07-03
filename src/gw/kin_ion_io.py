@@ -25,7 +25,7 @@ import h5py
 
 from file_io import WfnLoader as WFNReader
 from common import symmetry_maps, Meta
-from common.load_wfns import load_kpoint_fftbox
+from common.wfn_transforms import load_kpoint_fftbox
 import common.timing as timing
 
 from psp.pseudos import load_pseudopotentials, build_atom_pp_assignments

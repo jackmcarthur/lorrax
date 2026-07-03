@@ -26,7 +26,7 @@ import jax.numpy as jnp
 
 from file_io import WfnLoader as WFNReader
 from common import symmetry_maps, Meta
-from common.load_wfns import load_kpoint_fftbox
+from common.wfn_transforms import load_kpoint_fftbox
 from psp.radial_jax import (
     radial_weights,
     make_core_charge_table,

@@ -25,7 +25,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from file_io import WfnLoader as WFNReader
 from common import symmetry_maps
-from common.load_wfns import read_Gvecs_to_devices
+from common.wfn_transforms import read_Gvecs_to_devices
 from common import Meta
 from gw.gw_config import read_lorrax_input as read_cohsex_input
 from psp.pseudos import load_pseudopotentials, print_atomic_structure

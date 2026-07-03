@@ -1094,7 +1094,7 @@ def compute_dipole_all(wfn, sym, meta, vnl_plan, B, nb=None):
       deltaE : (nk, nb, nb) float64
     """
 
-    from common.load_wfns import load_kpoint_fftbox
+    from common.wfn_transforms import load_kpoint_fftbox
 
     if nb is None:
         nb = int(meta.b_id_4)

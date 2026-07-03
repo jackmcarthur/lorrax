@@ -22,7 +22,7 @@ from file_io import (
     load_kin_ion_submatrix, load_centroids,
 )
 from common import symmetry_maps
-from common.load_wfns import get_enk_bandrange
+from common.wfn_transforms import get_enk_bandrange
 from .gw_config import ComputeMode, LorraxConfig
 from .gw_init import (
 	get_effective_chunk_size,
