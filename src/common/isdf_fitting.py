@@ -2460,26 +2460,28 @@ def fit_zeta_to_h5(
     # per-chunk SlabIO write.  The single ``zeta_q_G`` write happens
     # once after the loop.
 
-    # Peak GPU memory tracker — reports the all-time high-water mark (peak_bytes_in_use).
-    # This is the number that determines whether you OOM: it includes JIT caches and
-    # prior-stage allocations, not just the chunk loop arrays.
-    # GPU high-water tracker.  The JAX CUDA PJRT on this stack returns
-    # None from ``memory_stats()``, so we fall back to a single
-    # nvidia-smi sample at the end of the chunk loop.  Sampled once
-    # (not per-chunk) because concurrent nvidia-smi from all 4 ranks
-    # inside the Shifter container has been observed to hang on some
-    # Perlmutter node types.
+    # GPU high-water tracker — the all-time ``peak_bytes_in_use``, which is what
+    # actually determines OOM (it includes JIT caches + prior-stage allocations,
+    # not just the chunk-loop arrays).  Prefer JAX's exact per-rank BFC-arena peak
+    # from ``memory_stats()``; fall back to THIS rank's nvidia-smi sample only if
+    # that's unavailable.  Two traps this avoids: (1) ``--id=0`` reads a *foreign*
+    # GPU on a multi-rank / shared node (``_nvsmi_used_mb_local_gpu`` honours
+    # CUDA_VISIBLE_DEVICES); (2) a single post-loop nvidia-smi sample MISSES the
+    # peak under the cudaMallocAsync allocator (freed transients already returned),
+    # so it is only a last-resort floor, never the reported number when stats work.
     _peak_bytes = 0
     def _track_peak():
         nonlocal _peak_bytes
         try:
-            import subprocess
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=memory.used",
-                 "--format=csv,nounits,noheader", "--id=0"],
-                text=True, timeout=2).strip()
-            mb = int(out.splitlines()[0])
-            _peak_bytes = max(_peak_bytes, mb * (1024 ** 2))
+            stats = jax.local_devices()[0].memory_stats() or {}
+            pk = int(stats.get("peak_bytes_in_use", 0) or 0)
+            if pk > 0:
+                _peak_bytes = max(_peak_bytes, pk)
+                return
+        except Exception:
+            pass
+        try:
+            _peak_bytes = max(_peak_bytes, _nvsmi_used_mb_local_gpu() * (1024 ** 2))
         except Exception:
             pass  # leave _peak_bytes = 0; caller suppresses the print
 

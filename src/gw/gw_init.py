@@ -613,8 +613,16 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	budget_gb = mem_est.get('budget_gb', cfg.memory.per_device_gb)
 	if peak_bytes > 0:
 		peak_gb = peak_bytes / 1e9
+		# peak_bytes_in_use only tracks the true peak under the BFC allocator.
+		# cuda_async (XLA_PYTHON_CLIENT_ALLOCATOR=platform — the FFI default)
+		# returns freed transients to its pool, so the reading under-reports;
+		# flag it rather than print a misleadingly-low % as if it were faithful.
+		_async = (os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR") == "platform"
+		          or os.environ.get("TF_GPU_ALLOCATOR") == "cuda_malloc_async")
+		_caveat = ("  [cuda_async under-reports — rerun with "
+		           "XLA_PYTHON_CLIENT_ALLOCATOR=default for the true peak]") if _async else ""
 		print_fn(f"    GPU high-water mark: {peak_gb:.2f} GB / {budget_gb:.2f} GB budget "
-		         f"({100 * peak_gb / budget_gb:.0f}%)")
+		         f"({100 * peak_gb / budget_gb:.0f}%){_caveat}")
 
 	# Default: no transverse-channel ψ to surface to the caller.
 	transverse_wfn_data = None
