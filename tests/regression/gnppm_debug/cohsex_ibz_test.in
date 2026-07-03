@@ -1,0 +1,17 @@
+[cohsex]
+restart = false
+centroids_file = centroids_frac_642.txt
+nval = 26
+ncond = 54
+nband = 80
+sys_dim = 2
+x_only = false
+do_screened = true
+bispinor = false
+screening_method = minimax
+no_degen_averaging = true
+use_chunked_isdf = true
+memory_per_device_gb = 28
+wfn_file = WFN.h5
+output_file = eqp0_ibzgate.dat
+sigma_diag_file = sigma_diag_ibzgate.dat
