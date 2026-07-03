@@ -124,6 +124,23 @@ def _run_gw_jax(run_dir, input_name, platform, extra_env=None):
 # README.md).  atol=1e-3 eV (1 meV): a physical bound above the 0.12 meV BGW
 # agreement, tight enough to catch a real 3D regression.  Two independent GPU
 # runs reproduce the reference bit-for-bit (max|Δ|=0).
+#
+# bispinor is the FIRST e2e gate on the bispinor path (nspinor=2, screened-
+# charge COHSEX Σ_SX+Σ_COH on W⁰⁰ plus bare Breit Σ^B).  It exercises the 4
+# ζ-channel / 7 V_q-tile / transverse-γ̃ machinery that the scalar gates never
+# touch.  System: MoS2 3×3 (nspinor=2), the run hand-validated in
+# reports/bispinor_screened_a_validation_2026-06-16/.  Σ^B is folded into the
+# sigSX column, so the sigma_diag labels are the same sigSX/sigCOH/sigTOT as
+# scalar COHSEX (the bispinor path does NOT emit separate Σ^B columns).  The
+# fixture WFN.h5 is the source 82-band WFN truncated to 34 bands (52 MB, > the
+# nband=32 window) — verified BIT-IDENTICAL to the full-WFN run (bands above 32
+# never enter the COHSEX/ζ window).  Runs on 1 GPU (LORRAX_NGPU=1) at
+# memory_per_device_gb=30, so the standard pytest harness drives it.  The IBZ
+# closure check fails on this non-orbit-closed centroid set so the run is
+# full-BZ-direct; Σ_X/Σ^B is covariant (IBZ-unfold == full-BZ-direct, see
+# reports/bispinor_tt_conditioning_2026-06-16/), so the frozen value is a valid
+# regression freeze.  atol=1e-6: pure freeze (deterministic run, bit-identical
+# on reruns; 1e-6 only absorbs GPU-nondeterministic last-ULP drift).
 _REG = REPO_ROOT / "tests" / "regression"
 _CASES = [
     ("cohsex", _REG / "cohsex_debug", "cohsex_test.in", "eqp_test.dat",
@@ -132,6 +149,9 @@ _CASES = [
      "sigma_diag_gnppm_ref.dat", ("sigX", "sigC", "sigXC"), 1e-6),
     ("si_cohsex_3d", _REG / "si_cohsex_debug", "cohsex_si_test.in",
      "eqp_si_test.dat", "eqp_si_ref.dat", ("sigSX", "sigCOH", "sigTOT"), 1e-3),
+    ("bispinor", _REG / "bispinor_debug", "bispinor_test.in",
+     "sigma_diag_bispinor_test.dat", "sigma_diag_bispinor_ref.dat",
+     ("sigSX", "sigCOH", "sigTOT"), 1e-6),
 ]
 
 

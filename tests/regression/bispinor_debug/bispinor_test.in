@@ -1,0 +1,31 @@
+[cohsex]
+# Bispinor e2e regression gate (MoS2 3x3, nspinor=2).
+# Screened-charge COHSEX (Σ_SX + Σ_COH on charge W⁰⁰) + bare Breit Σ^B.
+# 4 ζ channels, 7 V_q tiles, transverse γ̃ centroids.  Σ^B is folded into
+# the sigSX column of sigma_diag (same labels as scalar COHSEX).
+# Frozen from a clean run of the 34-band truncated fixture WFN.
+wfn_file = WFN.h5
+nval = 4
+ncond = 4
+nband = 32
+sys_dim = 2
+bispinor = true
+
+centroids_file = centroids_frac_640.txt
+centroids_file_current = centroids_frac_668_current.txt
+
+memory_per_device_gb = 30.0
+
+restart = false
+max_r_chunks = -1
+
+x_only = false
+do_screened = true
+screening = cohsex
+
+# Explicit head bypass (no dipole.h5 / eps0mat.h5): both heads = 0.
+vhead = 0.0
+whead_0freq = 0.0
+
+output_file = sigma_diag_bispinor_test.dat
+sigma_diag_file = sigma_diag_bispinor_test.dat
