@@ -933,7 +933,11 @@ def compute_all_V_q(
     nq_total = nq_full
     q_list_for_tile = None
 
-    if sym is not None and centroid_indices is not None:
+    # LORRAX_FORCE_FULL_BZ=1 bypasses the IBZ cascade (mirrors the g-flat path
+    # in v_q_g_flat._resolve_ibz_q_list — keeps the debug/gate seam consistent
+    # across both V_q drivers; production default 0 leaves behaviour unchanged).
+    _force_full_bz = bool(int(os.environ.get('LORRAX_FORCE_FULL_BZ', '0')))
+    if sym is not None and centroid_indices is not None and not _force_full_bz:
         from centroid.orbit_syms import compute_centroid_sym_perm
         n_tran = int(np.asarray(sym.sym_matrices).shape[0])
         centroid_idx_np = np.asarray(centroid_indices, dtype=np.int32)
