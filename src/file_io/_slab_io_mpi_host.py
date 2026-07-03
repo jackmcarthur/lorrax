@@ -45,28 +45,15 @@ import h5py
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax.experimental import multihost_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from ._slab_io_ffi import (
+    _barrier,
     _lustre_prestripe,
     _normalize_slab_request,
     _normalize_valid_shape,
+    _rank0,
 )
-
-
-def _rank0() -> bool:
-    return jax.process_index() == 0
-
-
-def _barrier(tag: str) -> None:
-    """Cross-process barrier; falls back to no-op if JAX hasn't
-    initialised the distributed runtime (single-process or test mode).
-    """
-    try:
-        multihost_utils.sync_global_devices(tag)
-    except Exception:
-        pass
 
 
 def _local_shard_and_global_offset(

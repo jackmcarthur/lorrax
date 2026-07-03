@@ -179,6 +179,36 @@ class IsdfHeader:
 
 
 # ---------------------------------------------------------------------------
+# Attribute binder (drop-in isdf_header surface for reader objects)
+# ---------------------------------------------------------------------------
+
+def bind_isdf_attrs(obj: object, isdf: IsdfHeader) -> None:
+    """Mirror the :class:`IsdfHeader` surface onto ``obj`` as attributes.
+
+    Both zeta readers expose the same isdf attribute surface so callers
+    can treat them interchangeably.  This is not a straight field copy:
+    it applies the readers' scalar coercions (``int``/``bool``/``str``)
+    and renames the ``ngkmax`` property to ``ngkmax_zeta`` (to avoid
+    colliding with the WFN's own ``ngkmax``).  ``n_rmu`` and
+    ``ngkmax_zeta`` come from int-returning properties, so the coercions
+    are idempotent — this binder is value-identical to both readers'
+    former inline blocks.
+    """
+    obj.density = isdf.density
+    obj.vertex_mu_L = isdf.vertex_mu_L
+    obj.r_mu_fft_idx = isdf.r_mu_fft_idx
+    obj.r_mu_crystal = isdf.r_mu_crystal
+    obj.n_rmu = int(isdf.n_rmu)
+    obj.zeta_is_done = bool(isdf.zeta_is_done)
+    obj.zeta_layout = str(isdf.zeta_layout)   # 'r_space' | 'G_flat'
+    # G-flat metadata surface (None for r-space files).
+    obj.gvec_components = isdf.gvec_components
+    obj.ngk_per_q = isdf.ngk_per_q
+    obj.zeta_cutoff_ry = isdf.zeta_cutoff_ry
+    obj.ngkmax_zeta = isdf.ngkmax   # WFN.h5-style padded G-axis size
+
+
+# ---------------------------------------------------------------------------
 # Read
 # ---------------------------------------------------------------------------
 
@@ -291,6 +321,7 @@ __all__ = [
     'IsdfHeader',
     'read_isdf_header',
     'read_isdf_header_from_file',
+    'bind_isdf_attrs',
     'write_isdf_header',
     'mark_zeta_done',
 ]

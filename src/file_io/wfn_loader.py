@@ -59,7 +59,7 @@ import numpy as np
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from .mf_header import read_mf_header_from_file
+from .mf_header import bind_mf_attrs, kpt_starts, read_mf_header_from_file
 
 
 __all__ = ["WfnLoader"]
@@ -151,41 +151,7 @@ class WfnLoader:
 
         # mf_header surface — same names WFNReader exposes (drop-in compat).
         hdr = read_mf_header_from_file(self._file)
-        self.version = hdr.version
-        self.flavor = hdr.flavor
-        self.nspin = hdr.nspin
-        self.nspinor = hdr.nspinor
-        self.nkpts = hdr.nkpts
-        self.nbands = hdr.nbands
-        self.ngkmax = hdr.ngkmax
-        self.ecutwfc = hdr.ecutwfc
-        self.kgrid = hdr.kgrid
-        self.shift = hdr.shift
-        self.ngk = hdr.ngk
-        self.ifmin = hdr.ifmin
-        self.ifmax = hdr.ifmax
-        self.kweights = hdr.kweights
-        self.kpoints = hdr.kpoints
-        self.energies = hdr.energies
-        self.occs = hdr.occs
-        self.ng = hdr.ng
-        self.ecutrho = hdr.ecutrho
-        self.fft_grid = hdr.fft_grid
-        self.ntran = hdr.ntran
-        self.cell_symmetry = hdr.cell_symmetry
-        self.sym_matrices = hdr.sym_matrices
-        self.translations = hdr.translations
-        self.cell_volume = hdr.cell_volume
-        self.recip_volume = hdr.recip_volume
-        self.alat = hdr.alat
-        self.blat = hdr.blat
-        self.nat = hdr.nat
-        self.avec = hdr.avec
-        self.bvec = hdr.bvec
-        self.adot = hdr.adot
-        self.bdot = hdr.bdot
-        self.atom_types = hdr.atom_types
-        self.atom_positions = hdr.atom_positions
+        bind_mf_attrs(self, hdr)
         # Cartesian-→-crystal: same expression legacy WFNReader exposed.
         self.atom_crys = np.einsum(
             'ij,kj->ki', np.linalg.inv(self.avec).T, self.atom_positions)
@@ -210,10 +176,8 @@ class WfnLoader:
         # behaviour as the legacy WFNReader.
         self._coeffs_raw = self._file["wfns/coeffs"][:]   # (nb, ns, ngktot, 2) f64
         self._gvecs_raw = self._file["wfns/gvecs"][:]     # (ngktot, 3) int
-        # kpt_starts = cumulative sum of ngk.
-        self._kpt_starts = np.zeros(self.nkpts, dtype=np.int64)
-        for ik in range(1, self.nkpts):
-            self._kpt_starts[ik] = self._kpt_starts[ik - 1] + int(self.ngk[ik - 1])
+        # kpt_starts = cumulative (exclusive prefix) sum of ngk.
+        self._kpt_starts = kpt_starts(self.ngk)
 
         # Lazy state.
         self._sym = None

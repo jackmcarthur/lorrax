@@ -25,18 +25,12 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import multihost_utils
 
-from ._slab_io_ffi import _normalize_slab_request, _normalize_valid_shape
-
-
-def _rank0() -> bool:
-    return jax.process_index() == 0
-
-
-def _barrier(tag: str) -> None:
-    try:
-        multihost_utils.sync_global_devices(tag)
-    except Exception:
-        pass
+from ._slab_io_ffi import (
+    _barrier,
+    _normalize_slab_request,
+    _normalize_valid_shape,
+    _rank0,
+)
 
 
 def _to_host(A: Any) -> np.ndarray:

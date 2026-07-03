@@ -18,6 +18,8 @@ import shutil
 import numpy as np
 import h5py
 
+from file_io.mf_header import kpt_starts
+
 
 def find_kpoint_mapping(wfn_kpoints, rot_kpoints, kgrid, shift, tol=1e-6):
     """
@@ -133,9 +135,7 @@ def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True, energ
             print(f"  ...")
     
     # Calculate k-point starts for indexing into coefficients
-    kpt_starts = np.zeros(nk_red, dtype=np.int64)
-    for ik in range(1, nk_red):
-        kpt_starts[ik] = kpt_starts[ik - 1] + ngk[ik - 1]
+    k_starts = kpt_starts(ngk)
     
     # Open output file for modification
     with h5py.File(output_file, 'r+') as f_out:
@@ -159,7 +159,7 @@ def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True, energ
             U_k = U_mnk[ik_full]  # (nb_sigma, nb_sigma), U[m,n] = <m_DFT|n_QP>
             
             # Get slice indices for this k-point's G-vectors
-            start = kpt_starts[ik_red]
+            start = k_starts[ik_red]
             end = start + ngk[ik_red]
             ng_k = ngk[ik_red]
             

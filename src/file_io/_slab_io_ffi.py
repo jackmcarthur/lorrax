@@ -28,6 +28,20 @@ from jax.experimental import multihost_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 
+def _rank0() -> bool:
+    return jax.process_index() == 0
+
+
+def _barrier(tag: str) -> None:
+    """Cross-process barrier; falls back to no-op if JAX hasn't
+    initialised the distributed runtime (single-process or test mode).
+    """
+    try:
+        multihost_utils.sync_global_devices(tag)
+    except Exception:
+        pass
+
+
 def _lustre_prestripe(path: str, stripe_count: int = 16,
                       stripe_size: str = "4M") -> None:
     """Pre-create ``path`` with an explicit Lustre stripe layout.

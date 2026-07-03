@@ -53,8 +53,8 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from .mf_header import read_mf_header
-from .isdf_header import read_isdf_header
+from .mf_header import bind_mf_attrs, read_mf_header
+from .isdf_header import bind_isdf_attrs, read_isdf_header
 from .slab_io import SlabIO
 
 
@@ -82,55 +82,10 @@ class ZetaReader:
         self._isdf = isdf
 
         # WFNReader-shape mf_header attributes (1:1 from MfHeader).
-        self.version = mf.version
-        self.flavor = mf.flavor
-        self.nspin = mf.nspin
-        self.nspinor = mf.nspinor
-        self.nkpts = mf.nkpts
-        self.nbands = mf.nbands
-        self.ngkmax = mf.ngkmax
-        self.ecutwfc = mf.ecutwfc
-        self.kgrid = mf.kgrid
-        self.shift = mf.shift
-        self.ngk = mf.ngk
-        self.ifmin = mf.ifmin
-        self.ifmax = mf.ifmax
-        self.kweights = mf.kweights
-        self.kpoints = mf.kpoints
-        self.energies = mf.energies
-        self.occs = mf.occs
-        self.ng = mf.ng
-        self.ecutrho = mf.ecutrho
-        self.fft_grid = mf.fft_grid
-        self.ntran = mf.ntran
-        self.cell_symmetry = mf.cell_symmetry
-        self.sym_matrices = mf.sym_matrices
-        self.translations = mf.translations
-        self.cell_volume = mf.cell_volume
-        self.recip_volume = mf.recip_volume
-        self.alat = mf.alat
-        self.blat = mf.blat
-        self.nat = mf.nat
-        self.avec = mf.avec
-        self.bvec = mf.bvec
-        self.adot = mf.adot
-        self.bdot = mf.bdot
-        self.atom_types = mf.atom_types
-        self.atom_positions = mf.atom_positions
+        bind_mf_attrs(self, mf)
 
         # isdf_header attributes.
-        self.density = isdf.density
-        self.vertex_mu_L = isdf.vertex_mu_L
-        self.zeta_is_done = bool(isdf.zeta_is_done)
-        self.zeta_layout = str(isdf.zeta_layout)   # 'r_space' | 'G_flat'
-        self.r_mu_fft_idx = isdf.r_mu_fft_idx
-        self.r_mu_crystal = isdf.r_mu_crystal
-        self.n_rmu = isdf.n_rmu
-        # G-flat metadata surface — None on r-space files.
-        self.gvec_components = isdf.gvec_components
-        self.ngk_per_q = isdf.ngk_per_q
-        self.zeta_cutoff_ry = isdf.zeta_cutoff_ry
-        self.ngkmax_zeta = isdf.ngkmax
+        bind_isdf_attrs(self, isdf)
 
         # ---- Capture on-disk q-axis size (IBZ vs full-BZ) ---------------
         # We poke the file directly here rather than going through SlabIO —

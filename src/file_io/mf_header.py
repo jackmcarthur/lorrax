@@ -12,10 +12,13 @@ built from.
 ``WFNReader`` reuses :func:`read_mf_header` so the on-disk schema lives
 in exactly one place.
 
-This module deliberately does NOT expose any derived quantities
-(``vbm``, ``efermi``, ``kpt_starts``, …) — those are computed by the
-consumer that needs them.  :class:`MfHeader` is a pure 1:1 mirror of
-the on-disk group.
+:class:`MfHeader` is a pure 1:1 mirror of the on-disk group and carries
+no derived quantities (``vbm``, ``efermi``, …) as fields — those are
+computed by the consumer that needs them.  The one derivation this
+module *does* provide as a free helper is :func:`kpt_starts` (the
+exclusive prefix sum of ``ngk`` into the concatenated G-axis), since
+every reader that indexes the flat ``(ngktot, …)`` coeff/G arrays needs
+exactly the same offset table.
 """
 
 from __future__ import annotations
@@ -149,6 +152,43 @@ def read_mf_header_from_file(f: h5.File) -> MfHeader:
 
 
 # ---------------------------------------------------------------------------
+# Attribute binder (drop-in mf_header surface for reader objects)
+# ---------------------------------------------------------------------------
+
+def kpt_starts(ngk: np.ndarray) -> np.ndarray:
+    """Exclusive prefix sum of the per-k G-sphere sizes ``ngk``.
+
+    Returns an ``int64`` array of the same length as ``ngk`` giving the
+    offset of each k-point's block in the concatenated ``(ngktot, …)``
+    G/coeff axis (``kpt_starts[0] == 0``, ``kpt_starts[k] == sum(ngk[:k])``).
+    ``ngk`` has one entry per (reduced) k-point, so the result length is
+    ``nkpts``.
+    """
+    ngk = np.asarray(ngk)
+    starts = np.zeros(ngk.shape[0], dtype=np.int64)
+    starts[1:] = np.cumsum(ngk[:-1].astype(np.int64))
+    return starts
+
+
+def bind_mf_attrs(obj: object, mf: MfHeader) -> None:
+    """Mirror every :class:`MfHeader` field onto ``obj`` as an attribute.
+
+    ``WFNReader`` and the zeta readers all expose the same ``mf_header``
+    surface (``obj.version``, ``obj.nkpts``, … ``obj.atom_positions``) so
+    downstream callers can treat any of them interchangeably.  The
+    attribute names match :class:`MfHeader`'s field names 1:1, so binding
+    is a straight copy over ``mf._fields`` — the single source of truth is
+    the NamedTuple schema above.
+
+    This binds only the 35 raw header fields.  Any derived quantities
+    (``atom_crys``, ``nelec``, ``vbm``, ``efermi``, …) remain the
+    responsibility of the individual reader that needs them.
+    """
+    for name in mf._fields:
+        setattr(obj, name, getattr(mf, name))
+
+
+# ---------------------------------------------------------------------------
 # Copy (verbatim)
 # ---------------------------------------------------------------------------
 
@@ -187,5 +227,7 @@ __all__ = [
     'MfHeader',
     'read_mf_header',
     'read_mf_header_from_file',
+    'kpt_starts',
+    'bind_mf_attrs',
     'copy_mf_header',
 ]
