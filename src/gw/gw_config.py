@@ -856,12 +856,16 @@ class LorraxConfig:
             )
 
         # --- Chunk utilization from env ---
+        # 0.0 (default) = auto: the planner uses its ns²-aware default
+        # (higher for scalar, lower for bispinor's 4× pair density).  A
+        # positive env value overrides it, clamped to [0.85, 1.0].
         try:
             chunk_utilization = float(
-                os.environ.get("ISDF_CHUNK_TARGET_UTILIZATION", "0.97"))
+                os.environ.get("ISDF_CHUNK_TARGET_UTILIZATION", "0.0"))
         except Exception:
-            chunk_utilization = 0.97
-        chunk_utilization = max(0.85, min(1.0, chunk_utilization))
+            chunk_utilization = 0.0
+        if chunk_utilization > 0:
+            chunk_utilization = max(0.85, min(1.0, chunk_utilization))
 
         # --- ZCT stage cap from env ---
         import jax

@@ -11,7 +11,7 @@ from jax.experimental.shard_map import shard_map
 # =============================================================================
 # FFT workspace query (for memory-model sizing)
 # =============================================================================
-# The stage-cost memory model in ``gw_init.compute_optimal_chunks`` (and the
+# The memory model in ``gflat_memory_model.plan_gflat_chunks`` (and the
 # V_q chooser in ``compute_vcoul._choose_v_q_chunks``) needs the per-rank peak
 # HBM an ``N``-D batched FFT will allocate.  Nominal ``N_copies × data_size``
 # fudge factors under-predict badly for mixed-radix boxes (24 = 2³·3, 10 = 2·5)

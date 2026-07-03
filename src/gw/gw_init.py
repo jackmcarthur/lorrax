@@ -1,407 +1,23 @@
-"""ISDF fitting orchestration and memory-aware chunk sizing for LORRAX GW.
+"""ISDF fitting orchestration for LORRAX GW.
 
-  compute_optimal_chunks — per-device memory model for the 6-stage ISDF pipeline
   fit_zeta / compute_V_q / build_wavefunction_bundle — pipeline steps
   prepare_isdf_and_wavefunctions — top-level orchestrator called by main()
+
+Chunk sizing (band_chunk / r_chunk / q_chunk / gflat_chunk_size) is owned
+entirely by :func:`gw.gflat_memory_model.plan_gflat_chunks` — the single
+production planner (persistent floor + max over five stage transients).
 """
 import os
-import math
-from dataclasses import dataclass
 from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec as P
 import numpy as np
 import h5py
 
 import common.timing as timing
 from common import jax_profile
 
-
-# ---------------------------------------------------------------------------
-# Memory model — internal helpers for ``compute_optimal_chunks``.
-#
-# The chunk-loop peak is described by five ``moments``: each is a snapshot of
-# concurrently-live device buffers at a distinct point in the r-chunk loop.
-# Every moment cost is linear in ``cr`` (the r-chunk size), so closed-form
-# inversion gives ``cr_max`` per moment without any iterative search.  The
-# functions and small dataclass below break the model up so each piece is
-# individually readable / testable; the public driver is unchanged.
-# ---------------------------------------------------------------------------
-
-_BYTES_C128 = 16.0
-_FFT_COPIES = 3   # cuFFT input + output + scratch (lower bound)
-_ZCT_ADDITIONAL_COEF = 3   # ZCT temp + output past the 2 persistent P_l/P_r
-                           # accumulators (AOT-measured; see scripts/validate_fft_workspaces.py)
-
-
-def _bytes_c128(*dims, shard: int = 1) -> float:
-    """Bytes for a complex128 array of shape ``dims`` per-device after sharding."""
-    result = _BYTES_C128
-    for d in dims:
-        result *= d
-    return result / shard
-
-
-@dataclass(frozen=True)
-class _ChunkAlphas:
-    """Per-cr byte coefficients for the five r-chunk moments.
-
-    Each ``α_*`` is the bytes-per-cr live in one moment after sharding.  ``c_solve``
-    is the cr-independent overhead for the per-q triangular solve (replicated L
-    + 3× full L slabs).  ``m_psi_G_bc`` is the transient per-bc ψ(G) slab on
-    device during one bc's FFT.
-    """
-    α_pair: float
-    α_psi_Y_bc: float
-    α_zcol: float
-    α_z_slice: float
-    α_gather: float
-    c_solve: float
-    m_psi_G_bc: float
-
-
-def _build_chunk_alphas(*, nk, ns, mu, nq, band_chunk, p_x, p_y, p, nr) -> _ChunkAlphas:
-    # α_pair scales by ns² because the unified open-spin pair density is
-    # rank-5 ``(nk, ns, ns, μ, cr)`` for ALL channels (charge γ̃^0=I and
-    # transverse γ̃^i=α^i alike — see :mod:`gw.isdf_fitting`).
-    return _ChunkAlphas(
-        α_pair=_bytes_c128(nk, ns, ns, mu, shard=p_x * p_y),
-        α_psi_Y_bc=_bytes_c128(nk, band_chunk, ns, shard=p_y),
-        α_zcol=_bytes_c128(nq, mu, shard=p),
-        α_z_slice=_bytes_c128(mu, shard=p),
-        α_gather=_bytes_c128(mu, shard=p) + 2 * _bytes_c128(mu),
-        c_solve=_bytes_c128(mu, mu, shard=p_x * p_x) + 3 * _bytes_c128(mu, mu),
-        m_psi_G_bc=_bytes_c128(nk, band_chunk, ns, nr, shard=p),
-    )
-
-
-def _fft_moment(cr, base, fft_inloop_bytes, a: _ChunkAlphas, *, n_bc: int = 1):
-    """Peak across the bc-loop's FFT + reshard + accumulate.
-
-    Live during a single bc-iteration: base + 2× pair-density accumulators
-    + the FFT workspace + the post-reshard ψ_bc_Y slab.
-
-    BUT: ``_make_fit_one_rchunk_kernel`` Python-unrolls the bc-loop
-    (``for bc_idx in band_chunk_ranges`` over ``n_bc`` iterations) inside
-    one giant jit, so XLA sees n_bc separate ``io_callback + FFT +
-    reshard + accumulate`` traces.  The FFT workspace itself can be
-    reused iter-to-iter (one cuFFT plan, scratch reused), but each
-    iter's post-reshard ψ_bc_Y is a distinct buffer the scheduler can
-    keep live concurrently with later iters' to overlap fetch with
-    accumulate — measured cumulative live across unroll matches
-    ``n_bc · α_psi_Y_bc · cr`` on CrI3 16-GPU (was missing 17 GB at
-    chunk_r=112016, band_chunk=16, n_bc=5).
-
-    Pass ``n_bc=1`` to recover the per-iter peak (the legacy model);
-    pass ``n_bc = nb / band_chunk`` to honour the unroll cost.
-    """
-    return base + 2 * a.α_pair * cr + fft_inloop_bytes + n_bc * a.α_psi_Y_bc * cr
-
-
-def _zct_moment(cr, base, a: _ChunkAlphas):
-    """Peak during the ZCT stage: 2 persistent + 3 transient pair-density buffers."""
-    return base + (2 + _ZCT_ADDITIONAL_COEF) * a.α_pair * cr
-
-
-def _reshard_moment(cr, base, a: _ChunkAlphas):
-    """Peak during Z_q → Z_col reshard (input + output + NCCL scratch)."""
-    return base + 3 * a.α_zcol * cr
-
-
-def _solve_moment(cr, base, q_batch, a: _ChunkAlphas):
-    """Peak during per-q-batch triangular solve."""
-    return base + 2 * a.α_zcol * cr + q_batch * (2 * a.α_z_slice * cr + a.c_solve)
-
-
-def _gather_moment(cr, base, q_gather, a: _ChunkAlphas):
-    """Peak during q-gather + H5 write."""
-    return base + a.α_zcol * cr + q_gather * a.α_gather * cr
-
-
-def _max_cr_per_stage(headroom, fft_cost_in_loop, a: _ChunkAlphas, *,
-                      nr_max, m_budget, m_zct_cap, n_bc: int = 1) -> dict:
-    """Closed-form max feasible ``cr`` for each moment (linear inversion).
-
-    Each moment is ``base + α·cr + c`` so ``cr ≤ (headroom − c) / α``; the
-    caller takes the minimum over moments.  Returns a per-stage dict so the
-    bottleneck can be reported.
-
-    ``n_bc`` honours the Python-unrolled bc-loop cost in the FFT moment
-    (cumulative ψ_bc_Y across n_bc iters live concurrent under XLA's
-    fused jit) — see :func:`_fft_moment` for the full rationale.
-    """
-    # Optional soft cap on zct stage (env override for tight-memory systems).
-    denom_fft = 2 * a.α_pair + n_bc * a.α_psi_Y_bc
-    denom_zct = (2 + _ZCT_ADDITIONAL_COEF) * a.α_pair
-    denom_solve = 2 * a.α_zcol + 2 * a.α_z_slice
-    limits = {
-        'fft':     (headroom - fft_cost_in_loop) / denom_fft if denom_fft > 0 else nr_max,
-        'zct':     headroom / denom_zct if denom_zct > 0 else nr_max,
-        'reshard': headroom / (3 * a.α_zcol) if a.α_zcol > 0 else nr_max,
-        'solve':   ((headroom - a.c_solve) / denom_solve) if denom_solve > 0 else nr_max,
-        'gather':  headroom / (a.α_zcol + a.α_gather) if (a.α_zcol + a.α_gather) > 0 else nr_max,
-    }
-    if m_zct_cap is not None and a.α_pair > 0:
-        zct_headroom = m_zct_cap - (m_budget - headroom)
-        if zct_headroom > 0:
-            limits['zct'] = min(limits['zct'], zct_headroom / denom_zct)
-    return limits
-
-
-
-def compute_optimal_chunks(
-    meta, mesh_xy, memory_budget_gb: float,
-    target_utilization: float = 0.97,
-    verbose: bool = True,
-    n_b_left: int | None = None, n_b_right: int | None = None,
-    r_chunk_override: int | None = None,
-    zct_stage_cap_gb: float | None = None,
-) -> dict:
-    """Derive ISDF chunk sizes that fit within the per-device memory budget.
-
-    System dimensions come from meta; device grid from mesh_xy.
-    The ISDF r-chunk loop has 6 stages, each with cost linear in chunk_r (cr):
-
-        stage_cost(cr) = base + αᵢ·cr + cᵢ
-
-    where base = centroids + L_q (persistent; ψ(G) now host-only, per-bc via io_callback),
-    αᵢ is the per-cr byte coefficient, and cᵢ is the cr-independent overhead.
-    The optimal cr is min over stages of (headroom − cᵢ) / αᵢ — one division
-    per stage, no iterative search.
-
-    The 6 stages and their XLA HLO-calibrated multipliers (CrI3, 16 GPUs):
-
-        FFT:     ψ(r_chunk) accumulator + 3× per-k FFT transient (cuFFT)
-        Pair:    ψ(r_chunk) + 2× pair density P(nk, μ, cr)
-        ZCT:     4× pair data  (P_r alive outside JIT + 3× donated left IFFT)
-        Reshard: 4× Z_col      (input + output + 2× NCCL all-to-all temp)
-        Solve:   2× Z_col + per-q (2× Z_slice + L_rep + 3× L_full)
-        Gather:  Z_col + per-q (input/p + 2× replicated output incl. NCCL)
-
-    Sharding: centroids and pair densities shard on (p_x, p_y).  Z_col and
-    solve arrays shard on p = p_x·p_y combined.  The α coefficients encode
-    the per-device sizes after sharding.
-    """
-    if memory_budget_gb <= 0:
-        raise ValueError("memory_per_device_gb must be > 0.")
-
-    p_x, p_y = mesh_xy.devices.shape
-    p = p_x * p_y
-    nb = meta.band_edges[4] - meta.band_edges[0]  # b4 - b0
-    nb_l = int(n_b_left) if n_b_left is not None else nb
-    nb_r = int(n_b_right) if n_b_right is not None else nb
-    nk = float(meta.nk_tot)
-    ns = float(meta.nspinor)
-    mu = float(meta.n_rmu)
-    nq = float(meta.nk_tot)
-    nr = float(meta.n_rtot)
-
-    m_budget = memory_budget_gb * 1e9 * target_utilization
-    m_zct_cap = float(zct_stage_cap_gb) * 1e9 if zct_stage_cap_gb and zct_stage_cap_gb > 0 else None
-
-    # ---- Persistent arrays (always resident during chunk loop) ----
-    # Centroids: left/right × X-sharded + Y-sharded copies.
-    # "full" = during initial load (all nb bands); "persist" = after slicing to nb_l + nb_r.
-    m_centroids_full = (
-        _bytes_c128(nk, ns, mu, nb, shard=p_y)
-        + _bytes_c128(nk, ns, mu, nb, shard=p_x)
-    )
-    m_centroids = (
-        _bytes_c128(nk, ns, mu, nb_l + nb_r, shard=p_y)
-        + _bytes_c128(nk, ns, mu, nb_l + nb_r, shard=p_x)
-    )
-    if m_centroids_full + m_centroids > m_budget:
-        raise ValueError(
-            f"Centroid storage requires {(m_centroids_full + m_centroids)/1e9:.2f} GB/device "
-            f"but only {memory_budget_gb:.2f} GB allocated.")
-
-    # ---- Band-chunked FFT (centroid extraction, runs before chunk loop) ----
-    # ψ(G) → IFFT → ψ(r).  ``_FFT_COPIES`` is the nominal lower bound (input +
-    # output + one scratch); the in-loop FFT cost is queried exactly via
-    # ``query_fft_peak_bytes`` below.  This pre-loop sizing uses the nominal
-    # 3× to set ``bpd_max``.
-    m_phase = _bytes_c128(nk, nr)
-    headroom_fft = m_budget - m_centroids_full
-    if headroom_fft <= m_phase:
-        raise ValueError("Insufficient memory for even a single-band FFT chunk.")
-    one_band = _FFT_COPIES * _bytes_c128(nk, ns, nr)
-    bpd_max = max(1, int((headroom_fft - m_phase) / one_band))
-    band_chunk = min(nb, bpd_max * p)
-    bpd = max(1, -(-band_chunk // p))  # ceil div matching read_Gvecs_to_devices
-    peak_centroid_fft_stage = (
-        m_centroids_full + _FFT_COPIES * _bytes_c128(nk, bpd, ns, nr) + m_phase
-    )
-
-    # ---- C_q build (pair density → C_q → L_q, runs before chunk loop) ----
-    stage_cct = (
-        m_centroids
-        + 2 * _bytes_c128(nk, mu, mu, shard=p_x * p_y)
-        + _bytes_c128(nq, mu, mu, shard=p_x * p_y)
-    )
-    if stage_cct > m_budget:
-        raise ValueError(f"C_q build requires {stage_cct/1e9:.2f} GB/device — exceeds budget.")
-    m_L_q = _bytes_c128(nq, mu, mu, shard=p_x * p_y)  # L_q persists; same size as C_q
-
-    # ψ(G) lives on HOST (per-rank band-sharded) and is fetched into the jit
-    # one bc at a time via io_callback; no persistent device residency.
-    # Only the currently active bc's ψ(G) is on device — captured in the
-    # ``_fft_moment`` term.  See ``_build_chunk_alphas`` and the moment
-    # functions at module top for the full memory model.
-
-    alphas = _build_chunk_alphas(
-        nk=nk, ns=ns, mu=mu, nq=nq,
-        band_chunk=band_chunk, p_x=p_x, p_y=p_y, p=p, nr=nr,
-    )
-
-    def _eval_stages(cr, base, fft_inloop, n_bc):
-        """Forward-evaluate each moment at a given cr.
-
-        Returns ``(stages_dict, m_zcol, m_solve_per_q, m_gather_per_q, k_batch)``.
-        Note: ``fft_inloop`` already includes the input (=m_psi_G_bc), output,
-        and cuFFT scratch via ``query_fft_peak_bytes``.
-
-        ``n_bc`` is the number of bc-iterations the kernel's Python-unrolled
-        bc-loop emits — fed into ``_fft_moment`` so the cumulative ψ_bc_Y
-        live across iters is honoured.
-        """
-        m_zcol = alphas.α_zcol * cr
-        m_solve_per_q = 2 * alphas.α_z_slice * cr + alphas.c_solve
-        m_gather_per_q = alphas.α_gather * cr
-        stages = {
-            'fft':     _fft_moment(cr, base, fft_inloop, alphas, n_bc=n_bc),
-            'zct':     _zct_moment(cr, base, alphas),
-            'reshard': _reshard_moment(cr, base, alphas),
-            'solve':   base + 2 * m_zcol + m_solve_per_q,    # q_batch=1 in AOT
-            'gather':  base + m_zcol + m_gather_per_q,        # q_gather=1 for sizing
-        }
-        # k_batch sizing — uses per-k FFT cost to pack as many k's as
-        # headroom allows.  Only matters for centroid-load FFT, which is a
-        # separate pre-loop stage.  The k_batch sizing models a SINGLE bc
-        # iter (one centroid load), not the cumulative bc-unroll, so this
-        # term keeps the legacy 1× α_psi_Y_bc.
-        fft_per_k = _FFT_COPIES * _bytes_c128(bpd, ns, nr) + _bytes_c128(nr)
-        fft_head = m_budget - base - (2 * alphas.α_pair + alphas.α_psi_Y_bc) * cr
-        k_batch = 1
-        if fft_per_k > 0 and fft_head > fft_per_k:
-            k_batch = min(int(nk), max(1, int(fft_head * 0.5 / fft_per_k)))
-        return stages, m_zcol, m_solve_per_q, m_gather_per_q, k_batch
-
-    def _find_r_chunk(fft_inloop, override=None):
-        """Compute optimal cr from closed-form moment inversion.
-
-        Persistent device residency: centroids (L + R copies on X, Y shards)
-        + L_q (sharded).  The ψ(G) cache is host-only now and pulled per-bc
-        via io_callback, so it doesn't enter ``base``.
-        """
-        base = m_centroids + m_L_q
-        headroom = m_budget - base
-        if headroom <= alphas.c_solve:
-            return None
-        # bc-loop is Python-unrolled inside the fit_one_rchunk kernel;
-        # n_bc copies of psi_bc_Y stack across XLA's fused trace.
-        n_bc = max(1, -(-int(nb) // int(band_chunk)))
-        if override and override > 0:
-            cr = min(int(override), int(nr))
-        else:
-            limits = _max_cr_per_stage(
-                headroom, fft_inloop, alphas,
-                nr_max=nr, m_budget=m_budget, m_zct_cap=m_zct_cap,
-                n_bc=n_bc,
-            )
-            cr = min(int(nr), max(0, int(min(limits.values()))))
-        pt = p_x * p_y  # cr must be divisible by p_total for solve sharding
-        if pt > 1 and cr > 0:
-            cr -= cr % pt
-        if cr <= 0:
-            return None
-        stages, m_zcol, m_spq, m_gpq, k_batch = _eval_stages(cr, base, fft_inloop, n_bc)
-        return {
-            'chunk_r': cr, 'peak': max(stages.values()),
-            'bottleneck': max(stages, key=stages.get), 'stages': stages,
-            'base': base, 'zcol': m_zcol, 'solve_per_q': m_spq,
-            'gather_per_q': m_gpq, 'k_batch': k_batch,
-            'cache_bytes': 0.0,  # host-only now
-        }
-
-    # ---- Solve for chunk sizes: try cache→no-cache, halving band_chunk if needed ----
-    # In-loop band-FFT tensor lives as (nk, bpd, ns, nx, ny, nz) — FULL nk,
-    # no k-chunking inside ``get_sharded_wfns_rchunk_slice``.  XLA holds
-    # FFT_COPIES concurrent copies (input, output, cuFFT scratch) in a
-    # single preallocated-temp slot.  The old ``fft_per_k = FFT_COPIES ·
-    # _mem(bpd, ns, nr)`` dropped the nk factor, assuming k-chunking that
-    # never happens — caused Si 10×10×10 4-GPU to under-predict peak by
-    # ~19 GiB (measured in module_0147.jit__kernel memory-usage-report:
-    # top preallocated-temp = 18.54 GiB = 3 × (nk·bpd·ns·nr · 16)).
-    # In-loop band-FFT workspace: query XLA directly for the exact per-rank
-    # peak its emitted FFT thunk would allocate, including cuFFT's planner-
-    # dependent scratch.  Pure-JAX, platform-portable, cached per shape — see
-    # common/fft_helpers.query_fft_peak_bytes.  Shape + sharding match the
-    # actual in-loop FFT in get_sharded_wfns_rchunk_slice: (nk, bpd, ns, nx,
-    # ny, nz) sharded on P(None, ('x','y'), None, None, None, None).
-    from common.fft_helpers import query_fft_peak_bytes
-
-    def _fft_inloop_bytes(band_chunk_val):
-        # Pass the UNSHARDED full shape — query_fft_peak_bytes applies the
-        # sharding to compute the per-rank peak.  Band axis is axis 1 of the
-        # 6-D tensor (nk, band_chunk, ns, nx, ny, nz); sharded on ('x','y')
-        # over p_x·p_y = p ranks so each rank sees bpd = band_chunk/p bands.
-        ix, iy, iz = meta.fft_grid
-        return query_fft_peak_bytes(
-            input_shape=(int(nk), int(band_chunk_val), int(ns),
-                         int(ix), int(iy), int(iz)),
-            fft_axes=(-3, -2, -1),
-            sharding=NamedSharding(
-                mesh_xy, P(None, ('x', 'y'), None, None, None, None)),
-            dtype=jnp.complex128,
-        )
-
-    fft_inloop = _fft_inloop_bytes(band_chunk)
-    result = _find_r_chunk(fft_inloop, r_chunk_override)
-    while result is None and bpd > 1:
-        bpd = max(1, bpd // 2)
-        band_chunk = min(nb, bpd * p)
-        bpd = max(1, -(-band_chunk // p))
-        fft_inloop = _fft_inloop_bytes(band_chunk)
-        if verbose:
-            print(f"    Reducing band_chunk to {band_chunk} (bands/device={bpd})")
-        result = _find_r_chunk(fft_inloop, r_chunk_override)
-    if result is None:
-        raise ValueError("Unable to find r-chunk that fits the memory budget.")
-
-    # ---- q_chunk (solve) and q_gather (H5 write): same linear model, different base ----
-    base, m_zcol = result['base'], result['zcol']
-    avail_solve = max(0.0, m_budget - base - 2 * m_zcol)
-    q_chunk = max(1, min(int(nq), int(avail_solve / result['solve_per_q']))) if result['solve_per_q'] > 0 else 1
-    avail_gather = max(0.0, m_budget - base - m_zcol)
-    q_gather = max(1, min(int(nq), int(avail_gather / result['gather_per_q']))) if result['gather_per_q'] > 0 else int(nq)
-
-    # ---- Overall peak across all stages (chunk loop + pre-loop) ----
-    overall_peak = max(
-        result['peak'],
-        base + 2 * m_zcol + q_chunk * result['solve_per_q'],
-        base + m_zcol + q_gather * result['gather_per_q'],
-        peak_centroid_fft_stage, m_centroids_full + m_centroids, stage_cct)
-
-    k_chunk = result['k_batch']
-    if k_chunk < int(nk) and verbose:
-        print(f"    K-point chunking: {k_chunk} k-pts per FFT batch (total {int(nk)})")
-
-    return {
-        'band_chunk': band_chunk,
-        'chunk_r': result['chunk_r'],
-        'q_chunk': q_chunk,
-        'q_gather': q_gather,
-        'k_chunk': k_chunk,
-        'memory_estimate': {
-            'peak_estimate_gb': overall_peak / 1e9,
-            'budget_gb': memory_budget_gb,
-            'bottleneck': result['bottleneck'],
-            'available_vcoul_gb': max(0.0, m_budget - m_centroids) / 1e9,
-            'limit_info': {k: v / 1e9 for k, v in result['stages'].items()},
-        },
-    }
 
 
 def get_effective_chunk_size(chunk_size: int) -> int | None:
@@ -438,8 +54,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 
 	The caller supplies (a) the full-range centroid wavefunctions
 	(``psi_rmu_Y`` / ``psi_rmuT_X``, spanning [b0, b4) as returned by
-	``load_centroids_band_chunked``) and (b) the chunk plan from
-	:func:`compute_optimal_chunks`.  Returns ``(zeta_h5_path, mem_est)``.
+	``load_centroids_band_chunked``) and (b) the chunk plan dict from
+	:func:`gw.gflat_memory_model.plan_gflat_chunks`.  Returns
+	``(zeta_h5_path, mem_est, transverse_wfn_data)``.
 	"""
 	from gw.isdf_fitting import fit_zeta_to_h5
 	from common.gamma_matrices import set_gamma_contract_mode
@@ -453,84 +70,10 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	band_range_left = (band_slices.b0, band_slices.b3)   # all val + sigma cond
 	band_range_right = (band_slices.b1, band_slices.b4)   # sigma val + all cond
 
+	# Chunk sizes (band_chunk / chunk_r / q_chunk / gflat_chunk_size) were
+	# picked once by ``plan_gflat_chunks`` in the caller and live in
+	# ``chunks``; fit_zeta is a pure consumer.
 	mem_est = chunks.get('memory_estimate', {})
-	_rank0 = (jax.process_index() == 0)
-	if _rank0 and mem_est:
-		print_fn(f"    Memory estimate: peak {mem_est['peak_estimate_gb']:.2f} GB "
-		         f"(budget {mem_est['budget_gb']:.2f} GB), bottleneck={mem_est['bottleneck']}")
-		stages = mem_est.get('limit_info', {})
-		if stages:
-			print_fn(f"    Per-stage: " + "  ".join(f"{k}={v:.2f}" for k, v in stages.items()) + " GB")
-
-	# AOT-derived driver-level peak + (optional) chunk-size override.
-	# G-flat memory model.  Picks band_chunk + chunk_r + gflat_chunk_size
-	# via a four-peak (A: centroid load · B: CCT/chol · C: fit_one_rchunk
-	# · D: accumulate) model.  Reports a per-rank HBM HWM estimate
-	# alongside the chunk plan so the log shows the budget utilisation.
-	# Leaves q_chunk / k_chunk on the legacy chunker (the G-flat path
-	# doesn't materially change those).
-	from gw.gflat_memory_model import plan_gflat_chunks
-	nb_total_chunker = (band_range_left[1] - band_range_left[0]
-	                    + band_range_right[1] - band_range_right[0])
-	# Q-axis on disk: IBZ size when write_ibz_only is on, else nk.  At
-	# this point we haven't computed n_q_ibz yet; the IBZ subset is
-	# built later in fit_zeta_to_h5.  Use a conservative full-BZ
-	# estimate (over-counts gflat_acc slightly on bispinor; the
-	# transverse path always writes IBZ-only).
-	_nq_disk_est = int(meta.nk_tot)
-	_ngkmax_est = int(getattr(meta, 'ngkmax', 0)) or int(0.06 * meta.n_rtot)
-	# Thread EVERY user-overrideable cohsex.in memory knob into the
-	# planner so its HWM estimate reflects what the runtime will
-	# actually allocate.  Per agent_j §5 (Round 3 finding): the prior
-	# code applied the ``cfg.memory.gflat_chunk_size`` override AFTER
-	# ``plan_gflat_chunks`` returned, so the planner's HWM was computed
-	# at the planner's own cs (capped at 100) rather than the runtime
-	# cs the user requested — under-predicting Peak D when the user
-	# overrode upward.  Round-4 fix: pass it as a kwarg so the planner
-	# warns if the override exceeds the safety cap.
-	gflat_plan = plan_gflat_chunks(
-		meta=meta, mesh_xy=mesh_xy,
-		nb_total=nb_total_chunker,
-		ngkmax=_ngkmax_est, n_q_disk=_nq_disk_est,
-		budget_gb=float(cfg.memory.per_device_gb),
-		# target_utilization=0.80 has been the only gflat-planner-call
-		# constant since the planner's introduction; the cohsex.in
-		# ``chunk_target_utilization`` knob (default 0.97) feeds the
-		# legacy ``compute_optimal_chunks`` path, NOT the gflat planner.
-		# The 0.80 here is hand-tuned to fit the bispinor 4-channel
-		# slack (centroid leftover, sphere-idx-pre-Round-4-leak, cuFFT
-		# scratch wiggle).  Wire it through MemoryConfig only when we
-		# add a separate ``gflat_target_utilization`` knob.
-		target_utilization=0.80,
-		fft_box_factor_A=4.0,
-		is_bispinor=bool(cfg.bispinor),
-		max_chunks=64,
-		r_chunk_override=(
-			int(cfg.memory.r_chunk_override)
-			if cfg.memory.r_chunk_override > 0 else None),
-		band_chunk_override=(
-			int(cfg.memory.band_chunk_size)
-			if cfg.memory.band_chunk_size > 0 else None),
-		gflat_chunk_size_override=(
-			int(cfg.memory.gflat_chunk_size)
-			if cfg.memory.gflat_chunk_size > 0 else None),
-	)
-	if _rank0:
-		print_fn("")
-		print_fn(gflat_plan.format())
-	chunks['band_chunk'] = int(gflat_plan.band_chunk)
-	chunks['chunk_r'] = int(gflat_plan.r_chunk)
-	chunks['gflat_hwm_gb'] = gflat_plan.hwm_bytes / 1e9
-	# ``gflat_plan.gflat_chunk_size`` now reflects the cohsex.in override
-	# when provided (the planner saw it via the kwarg above).  No
-	# post-planner override needed — the planner's pick IS the runtime cs.
-	chunks['gflat_chunk_size'] = int(gflat_plan.gflat_chunk_size)
-
-	# Round 6 deleted the ``gflat_to_rchunk_chunk_size`` cohsex knob —
-	# the new ``z_q_from_psi_sm`` streaming-scan body has no
-	# user-facing chunk size (per-iter FFT box is bounded by the
-	# rank's bpd_per_bc · ns · n_rtot · 16, set by the planner-picked
-	# ``band_chunk_size``).
 
 	zeta_h5_path = os.path.join(tmp_dir, "zeta_q.h5")
 	print_fn(f"\n  Chunked ISDF fitting:")
@@ -1033,27 +576,56 @@ def prepare_isdf_and_wavefunctions(
 		from common.wfn_transforms import get_enk_bandrange
 
 		with mesh_xy:
-			# Plan chunks (band/r/q sizes).
+			# Plan chunk sizes ONCE — the single production planner owns
+			# band_chunk / chunk_r / q_chunk / gflat_chunk_size, the rank
+			# floor P_min, and the binding-stage report.
+			from gw.gflat_memory_model import plan_gflat_chunks
 			mem = cfg.memory
-			chunks = compute_optimal_chunks(
-				meta, mesh_xy,
-				memory_budget_gb=mem.per_device_gb,
-				target_utilization=mem.chunk_target_utilization,
-				n_b_left=band_slices.b3 - band_slices.b0,
-				n_b_right=band_slices.b4 - band_slices.b1,
-				r_chunk_override=mem.r_chunk_override if mem.r_chunk_override > 0 else None,
-				zct_stage_cap_gb=mem.zct_stage_cap_gb,
+			nb_total = ((band_slices.b3 - band_slices.b0)
+			            + (band_slices.b4 - band_slices.b1))
+			# Q-axis on disk: conservative full-BZ (the transverse path
+			# writes IBZ-only, which is smaller).
+			_ngkmax = int(getattr(meta, 'ngkmax', 0)) or int(0.06 * meta.n_rtot)
+			gflat_plan = plan_gflat_chunks(
+				meta=meta, mesh_xy=mesh_xy,
+				nb_total=nb_total, ngkmax=_ngkmax,
+				n_q_disk=int(meta.nk_tot),
+				budget_gb=float(mem.per_device_gb),
+				target_utilization=(mem.chunk_target_utilization
+				                    if mem.chunk_target_utilization > 0 else None),
+				is_bispinor=bool(cfg.bispinor),
+				max_chunks=64,
+				r_chunk_override=(int(mem.r_chunk_override)
+				                  if mem.r_chunk_override > 0 else None),
+				band_chunk_override=(int(mem.band_chunk_size)
+				                     if mem.band_chunk_size > 0 else None),
+				gflat_chunk_size_override=(int(mem.gflat_chunk_size)
+				                           if mem.gflat_chunk_size > 0 else None),
 			)
-			# User-supplied ``band_chunk_size`` (cohsex.in) acts as an
-			# UPPER cap on the heuristic chooser's pick.  Lets the user
-			# force tighter band chunking when the chooser's
-			# replicated-FFT-box sizing over-predicts headroom (seen on
-			# CrI3 6×6×1 80 Ry: chooser picks band_chunk=nb_total but
-			# XLA actually materialises the FFT box unsharded → 121 GB
-			# OOM in to_rmu).  ``band_chunk_size <= 0`` disables the cap.
-			if mem.band_chunk_size > 0:
-				chunks['band_chunk'] = min(
-					int(chunks['band_chunk']), int(mem.band_chunk_size))
+			if jax.process_index() == 0:
+				print0("")
+				print0(gflat_plan.format())
+			if gflat_plan.p_min > mesh_xy.devices.size:
+				print0(f"  [planner] WARNING: rank floor P_min="
+				       f"{gflat_plan.p_min} exceeds the {mesh_xy.devices.size} "
+				       f"ranks in this mesh; the persistent ÷P floor will not "
+				       f"fit the budget (expect OOM).  Add ranks or raise "
+				       f"memory_per_device_gb.")
+			chunks = {
+				'band_chunk': int(gflat_plan.band_chunk),
+				'chunk_r': int(gflat_plan.r_chunk),
+				'q_chunk': int(gflat_plan.q_chunk),
+				'gflat_chunk_size': int(gflat_plan.gflat_chunk_size),
+				'gflat_hwm_gb': gflat_plan.hwm_bytes / 1e9,
+				'memory_estimate': {
+					'peak_estimate_gb': gflat_plan.hwm_bytes / 1e9,
+					'budget_gb': float(mem.per_device_gb),
+					'bottleneck': gflat_plan.bottleneck,
+					'available_vcoul_gb': max(
+						0.0, gflat_plan.budget_bytes
+						- gflat_plan.persistent_bytes) / 1e9,
+				},
+			}
 
 			# Load centroid ψ once for the full [b0, b4) range; reused by
 			# both the zeta fit (sliced into halves internally) and the

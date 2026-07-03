@@ -63,7 +63,7 @@ def main() -> int:
         os.chdir(workdir)
         # Mirror CLI invocation: python -m gw_isdf.gw_jax -i <input>
         sys.argv = ["gw_jax", "-i", args.input]
-        from gw_isdf import gw_jax
+        from gw import gw_jax
 
         # Collect a full trace for XProf (TensorBoard memory_viewer).
         with jax.profiler.trace(str(trace_dir)):
