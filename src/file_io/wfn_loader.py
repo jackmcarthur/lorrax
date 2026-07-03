@@ -990,13 +990,11 @@ class WfnLoader:
 # ---------------------------------------------------------------------------
 #
 # 2-spinor ψ (..., 2, ngkmax) → 4-spinor ψ (..., 4, ngkmax) via
-# (α/2) σ · (k+G) ψ_L applied to the upper components.  Matches the
-# legacy :func:`common.bispinor_init.get_small_psi_component` math
-# exactly but is vectorised across k.
-
-# Half the fine-structure constant α (Hartree units, matches
-# common.bispinor_init).
-_HALFALPHA = 0.00364867628215
+# (α/2) σ · (k+G) ψ_L applied to the upper components.  The constant + σ·p
+# contraction live once in :func:`common.bispinor_init.lift_to_4spinor`
+# (same math as :func:`common.bispinor_init.get_small_psi_component`, but
+# vectorised across k).  The loader only owns the jit-cache-by-sharding
+# wrapper below.
 
 
 @functools.lru_cache(maxsize=None)
@@ -1010,27 +1008,11 @@ def _get_bispinor_lift_jit(sharding: NamedSharding | None):
     enclosing scopes, blowing the cache.  Wrapping the whole body in a
     single ``jax.jit`` collapses all inner ops into one cached compile.
     """
+    from common.bispinor_init import lift_to_4spinor
+
     @jax.jit
     def _kernel(psi_2, gvecs, kvecs, bvec):
-        halfalpha = jnp.complex128(_HALFALPHA)
-        # (k + G) in cartesian, per (k, g).
-        pkG = gvecs + kvecs[:, None, :]                          # (n_k, ngkmax, 3)
-        p_cart = pkG @ bvec                                       # (n_k, ngkmax, 3)
-        px = p_cart[..., 0].astype(jnp.complex128)
-        py = p_cart[..., 1].astype(jnp.complex128)
-        pz = p_cart[..., 2].astype(jnp.complex128)
-        # σ·p as a (2, 2) Pauli-contraction stacked per (k, g):
-        #   [[ pz, px - i*py],
-        #    [px + i*py, -pz]]
-        sdp = jnp.stack(
-            [jnp.stack([pz,  px - 1j * py], axis=-1),
-             jnp.stack([px + 1j * py, -pz], axis=-1)],
-            axis=-2,
-        )                                                         # (n_k, ngkmax, 2, 2)
-        # ψ_S[k, b, i, g] = halfalpha · Σ_j σ·p[k, g, i, j] · ψ_L[k, b, j, g]
-        psi_S = halfalpha * jnp.einsum(
-            "kgij,kbjg->kbig", sdp, psi_2[:, :, 0:2, :])
-        out = jnp.concatenate([psi_2, psi_S], axis=2)             # (n_k, nb, 4, ngkmax)
+        out = lift_to_4spinor(psi_2, gvecs, kvecs, bvec)
         if sharding is not None:
             out = jax.lax.with_sharding_constraint(out, sharding)
         return out
