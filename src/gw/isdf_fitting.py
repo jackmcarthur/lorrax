@@ -11,9 +11,9 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 
-from . import Meta
-from . import timing
-from .gamma_matrices import (
+from common import Meta
+from common import timing
+from common.gamma_matrices import (
     gamma_perm_phase as _gamma_perm_phase_mu,
     gamma_double_contract,
 )
@@ -126,18 +126,18 @@ def _nvsmi_used_mb_local_gpu():
     except Exception:
         return 0
 from common import jax_profile
-from .cholesky_2d import (
+from common.cholesky_2d import (
     cholesky_2d_batched,
     dense_to_tiles,
     tiles_to_dense,
 )
-from .fft_helpers import (
+from common.fft_helpers import (
     make_flat_k_ifftn,
     make_flat_k_fftn,
     compute_block_size_for_2d_cholesky,
 )
-from .load_wfns import load_centroids_band_chunked
-from .wfn_transforms import to_rchunk_inner
+from common.load_wfns import load_centroids_band_chunked
+from common.wfn_transforms import to_rchunk_inner
 from jax.experimental import io_callback as _io_callback
 
 
@@ -532,7 +532,7 @@ def z_q_from_psi_sm(
 	    Z_q                 : (nq, n_rmu, n_zchunk) sharded
 	                          ``P(None, 'x', 'y')``.
 	"""
-	from .psi_G_store import _PSI_G_FLAT_SPEC  # noqa: F401  (sharding contract)
+	from common.psi_G_store import _PSI_G_FLAT_SPEC  # noqa: F401  (sharding contract)
 
 	fft_grid = tuple(int(s) for s in psi_G_store.meta.fft_grid)
 	nkx, nky, nkz = kgrid
@@ -2029,7 +2029,7 @@ def fit_zeta_to_h5(
     # reference comes from inside the per-chunk kernel jit and trips
     # a ConcretizationTypeError.
     if int(vertex_mu_L) != 0:
-        from . import gamma_matrices as _gm  # noqa: F401  (warm import)
+        from common import gamma_matrices as _gm  # noqa: F401  (warm import)
 
     # ── Finalize write_ibz_only BEFORE any IBZ slicing (bug fix) ─────────
     # The IBZ cascade slices C_q/L_q to IBZ rows in STEP 2/3 below, and
@@ -2122,7 +2122,7 @@ def fit_zeta_to_h5(
         # slice helper applies to χ_q for the W_q = (1 − v_q χ_q)^{-1} v_q
         # path once that lands.
         if write_ibz_only and getattr(sym, 'q_irr_full_idx', None) is not None:
-            from .symmetry_maps import slice_q_full_to_ibz
+            from common.symmetry_maps import slice_q_full_to_ibz
             C_q_flat = slice_q_full_to_ibz(
                 C_q_flat, sym.q_irr_full_idx, out_sharding=flat_shard)
 

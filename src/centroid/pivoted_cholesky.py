@@ -10,7 +10,7 @@ with the largest residual Schur-complement diagonal, and the corresponding
 on amplitude alone because it targets the coherence structure of the
 valence-conduction pair-product space the ISDF fit will actually use.
 
-Architectural map to ``common/isdf_fitting.py``:
+Architectural map to ``gw/isdf_fitting.py``:
 
     pair_density                      ←→  per-k open-spin P^{(v/c)}_{αβ}(a,b)
                                           (rank-5; same einsum at candidates
@@ -770,7 +770,7 @@ def make_sharded_pivoted_cholesky_select(
 # at q=0:
 #
 #   G[mu_X, nu_Y] = Σ_k w_k · conj(P_v_k) · P_c_k
-#                = common.isdf_fitting.compute_gram_q0_from_left_right(
+#                = gw.isdf_fitting.compute_gram_q0_from_left_right(
 #                      P_v_k, P_c_k, k_weights, mesh
 #                  )
 #
@@ -855,7 +855,7 @@ def build_gram_q0_via_loadwfns(
     # we don't want to charge the single-device prune path for it.
     from common.meta import Meta
     from common.load_wfns import load_centroids_band_chunked
-    from common.isdf_fitting import (
+    from gw.isdf_fitting import (
         pair_density,
         gram_q0_from_pair,
     )

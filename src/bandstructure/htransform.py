@@ -24,7 +24,7 @@ from common import Meta
 from common.load_wfns import (
     get_enk_bandrange, load_centroids_band_chunked, iter_psi_rchunk_bandwise,
 )
-from common.isdf_fitting import factor_c_q
+from gw.isdf_fitting import factor_c_q
 from common.fft_helpers import make_flat_k_ifftn
 
 

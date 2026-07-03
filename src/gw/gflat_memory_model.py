@@ -294,7 +294,7 @@ def _peak_B_cct_chol(*, nk, ns, nq, mu, nb_total, p, p_xy,
     #   lifetime class: persistent_throughout_zeta_fit (4 physical buffers:
     #                   ψ_l_rmuT_X, ψ_l_rmu_Y, ψ_r_rmuT_X, ψ_r_rmu_Y)
     #   source: common/load_wfns.py:474 (gflat_to_rmu) + transpose copy
-    #           lives at common/isdf_fitting.py:fit_zeta_to_h5 step 1
+    #           lives at gw/isdf_fitting.py:fit_zeta_to_h5 step 1
     #           (slice/divide-by-norms doubles each into a Y-form view)
     out = {
         "centroids_persistent":  # ×4 (L+R, both rmuT_X and rmu_Y)
@@ -339,7 +339,7 @@ def _peak_C_fit_one_rchunk(*, nk, ns, nq, nq_disk, mu, ngkmax, n_rtot, r_chunk,
     #   source: see _peak_B_cct_chol comment; same 4-buffer set
     # live_arrays signature: c128 (nq, mu, mu) — sharded /p_xy
     #   lifetime class: persistent_throughout_zeta_fit (L_q Cholesky factor)
-    #   source: common/isdf_fitting.py:factor_c_q (step 3 of fit_zeta_to_h5)
+    #   source: gw/isdf_fitting.py:factor_c_q (step 3 of fit_zeta_to_h5)
     # gflat_acc is RESIDENT during fit_one_rchunk (separate jit from
     # accumulate; the two jits each have isolated transient slots, so
     # counting gflat_acc in BOTH Peak C persistent and Peak D persistent
@@ -361,7 +361,7 @@ def _peak_C_fit_one_rchunk(*, nk, ns, nq, nq_disk, mu, ngkmax, n_rtot, r_chunk,
     #   lifetime class: accumulate_transient (XLA-internal scratch slots,
     #                   aliased to P_l_R_conj / P_r_R / FFT box across
     #                   non-overlapping lifetimes)
-    #   source: common/isdf_fitting.py:625-627 (P_l_acc/P_r_acc, scan
+    #   source: gw/isdf_fitting.py:625-627 (P_l_acc/P_r_acc, scan
     #           init) + isdf_fitting.py:713-720 (P_l_R_conj reshape)
     # The dominant transient is ``pair_density_slots`` rank-5 buffers;
     # psi_bc_Y, the FFT box, Z_q etc. all fit in the SAME lifetime slots
@@ -401,7 +401,7 @@ def _peak_D_accumulate(*, nk, ns, nq, nb_total, nq_disk, mu, n_rtot, ngkmax,
     #   lifetime class: persistent_throughout_zeta_fit (gflat_acc, lives
     #                   for the full r-chunk loop; donated in-place each
     #                   accumulate call)
-    #   source: common/isdf_fitting.py:2443 (jit(zeros) just before chunk
+    #   source: gw/isdf_fitting.py:2443 (jit(zeros) just before chunk
     #           loop) — live_arrays-verified at probe 1A in agent_f
     persistent = {
         "centroids_persist":  # ×4 (L+R rmuT_X + rmu_Y transpose)
@@ -417,7 +417,7 @@ def _peak_D_accumulate(*, nk, ns, nq, nb_total, nq_disk, mu, n_rtot, ngkmax,
     # live_arrays signature: c128 (nq_disk, mu, r_chunk) — sharded /p_xy
     #   lifetime class: fit_one_rchunk_transient (alive at after_fit, gone
     #                   at after_accumulate via donate_argnums=(1,))
-    #   source: common/isdf_fitting.py:fit_one_rchunk return path
+    #   source: gw/isdf_fitting.py:fit_one_rchunk return path
     # accumulate_fft_box live_arrays signature:
     #   c128 (cs, nx, ny, nz) — XLA-internal preallocated-temp; invisible
     #   to live_arrays() (lives inside the jit's scratch pool).  HLO-

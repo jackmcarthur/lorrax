@@ -17,8 +17,8 @@ This rewrite (P4c) replaces the legacy g_box host-cache with a
   band slab via ``io_callback``, padded to ``(nk, _bpd_max, ns,
   ngkmax)`` so the enclosing ``lax.scan`` body sees a static return
   shape.  Consumers
-  (:func:`common.isdf_fitting.z_q_from_psi_sm`,
-  :func:`common.isdf_fitting.c_q_from_psi_sm`,
+  (:func:`gw.isdf_fitting.z_q_from_psi_sm`,
+  :func:`gw.isdf_fitting.c_q_from_psi_sm`,
   :func:`common.wfn_transforms.gflat_to_rmu`) iterate band-chunks
   via ``lax.scan`` inside their ``shard_map`` body, pulling one bc
   per iter via the slicer + per-iter ``lax.all_gather`` along the

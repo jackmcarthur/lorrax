@@ -65,7 +65,7 @@ class _ChunkAlphas:
 def _build_chunk_alphas(*, nk, ns, mu, nq, band_chunk, p_x, p_y, p, nr) -> _ChunkAlphas:
     # α_pair scales by ns² because the unified open-spin pair density is
     # rank-5 ``(nk, ns, ns, μ, cr)`` for ALL channels (charge γ̃^0=I and
-    # transverse γ̃^i=α^i alike — see :mod:`common.isdf_fitting`).
+    # transverse γ̃^i=α^i alike — see :mod:`gw.isdf_fitting`).
     return _ChunkAlphas(
         α_pair=_bytes_c128(nk, ns, ns, mu, shard=p_x * p_y),
         α_psi_Y_bc=_bytes_c128(nk, band_chunk, ns, shard=p_y),
@@ -441,7 +441,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	``load_centroids_band_chunked``) and (b) the chunk plan from
 	:func:`compute_optimal_chunks`.  Returns ``(zeta_h5_path, mem_est)``.
 	"""
-	from common.isdf_fitting import fit_zeta_to_h5
+	from gw.isdf_fitting import fit_zeta_to_h5
 	from common.gamma_matrices import set_gamma_contract_mode
 	# Honour cohsex.in ``gamma_contract_mode`` for the γ̃·γ̃ kernel
 	# inside the monolithic pair pipeline.  Mode is module-level (the
@@ -697,7 +697,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		# The pair-density caches are intentionally preserved so the three
 		# transverse channels share the same n_rmu=n_rmu_current compile.
 		import gc
-		from common import isdf_fitting as _isdf
+		from gw import isdf_fitting as _isdf
 
 		def _drop_traced_caches():
 			_isdf._fit_one_rchunk_cache.clear()
@@ -1082,7 +1082,7 @@ def prepare_isdf_and_wavefunctions(
 			# returns forms the persistent baseline that V_q's transient
 			# peak stacks on top of.  Same env gate as the ζ-fit probes
 			# (LORRAX_MEM_DEBUG=1).  Round-1 addition.
-			from common.isdf_fitting import mem_probe as _mem_probe
+			from gw.isdf_fitting import mem_probe as _mem_probe
 			_mem_probe("pre_v_q")
 			V_qmunu, G0 = compute_V_q(
 				zeta_path, wfn, meta, mesh_xy, cfg,

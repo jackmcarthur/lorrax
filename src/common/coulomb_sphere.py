@@ -9,7 +9,7 @@ One source of truth for the radius condition
   ``(nx/2, ny/2, nz/2)``.  Returns both the flat-FFT indices (for
   gather/scatter on the FFT box) AND the Miller components (for on-disk
   storage in the WFN.h5 ``gspace/components`` convention).  Used by the
-  G-flat ζ writer (``common.isdf_fitting``) so the on-disk dataset
+  G-flat ζ writer (``gw.isdf_fitting``) so the on-disk dataset
   ``zeta_q_G(n_q, n_rmu, ngkmax)`` matches the WFN.h5 layout — fixed-size
   G-axis, per-q components written alongside.
 

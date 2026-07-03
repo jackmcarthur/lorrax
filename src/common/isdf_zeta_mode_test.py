@@ -45,7 +45,7 @@ _init()
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental import multihost_utils
-from common.isdf_fitting import factor_c_q, solve_zeta
+from gw.isdf_fitting import factor_c_q, solve_zeta
 
 
 def _log(s):
