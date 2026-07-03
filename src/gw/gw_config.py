@@ -400,7 +400,9 @@ def read_lorrax_input(filename: str) -> dict:
         else:
             section_lines = lines[start:end]
 
-        parser = configparser.ConfigParser()
+        # inline_comment_prefixes so 'key = off  # note' parses to 'off', not
+        # 'off  # note' (the latter silently voided flags — a real footgun).
+        parser = configparser.ConfigParser(inline_comment_prefixes=('#',))
         parser.read_string(''.join(section_lines))
         section = parser["cohsex"] if "cohsex" in parser else parser[parser.sections()[0]]
 

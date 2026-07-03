@@ -96,7 +96,10 @@ class WFNWriter:
         # Eigenvalues / occupations — filled per k-point
         self._el = np.zeros((self.nspin, self.nk, nbands), dtype=np.float64)
         self._occ = np.zeros((self.nspin, self.nk, nbands), dtype=np.float64)
-        n_occ = int(crystal.nelec)
+        # nspinor=2 (SOC/bispinor): spinor bands hold 1 e- each → nelec bands.
+        # nspinor=1 (spin-unpolarized): 2 e- per band → nelec//2. (nspin=2 not
+        # emitted by this writer — only channel [0] is filled.)
+        n_occ = int(crystal.nelec) if self.nspinor == 2 else int(crystal.nelec) // 2
         self._occ[0, :, :n_occ] = 1.0
 
         # Open file, write header, pre-allocate coeffs
@@ -132,7 +135,10 @@ class WFNWriter:
         f.create_dataset(kp + "el", data=self._el)
         f.create_dataset(kp + "occ", data=self._occ)
 
-        n_occ = int(crystal.nelec)
+        # nspinor=2 (SOC/bispinor): spinor bands hold 1 e- each → nelec bands.
+        # nspinor=1 (spin-unpolarized): 2 e- per band → nelec//2. (nspin=2 not
+        # emitted by this writer — only channel [0] is filled.)
+        n_occ = int(crystal.nelec) if self.nspinor == 2 else int(crystal.nelec) // 2
         ifmin = np.ones((nspin, nk), dtype=np.int32)
         ifmax = np.full((nspin, nk), n_occ, dtype=np.int32)
         f.create_dataset(kp + "ifmin", data=ifmin)
