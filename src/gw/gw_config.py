@@ -308,12 +308,8 @@ _DEFAULTS = {
     "sigma_omega_batch_size": 4,
     "sigma_omega_accumulation": "auto",
     # PPM sigma options
-    "ppm_sigma_scale": 1.0,
-    "ppm_sigma_flip_neg": False,
-    "ppm_invalid_mode": "static_limit",
     "fermi_reference": "midgap",
     "sigma_at_dft_extrapolate": False,
-    "sigma_at_dft_energies": False,
     # Debug
     "debug_hartree": False,
     "debug_omega": None,
@@ -344,7 +340,6 @@ _NORMALIZE_STR = {
     "wcoul0_source", "screening_method", "minimax_energy_reference",
     "sigma_omega_accumulation", "fermi_reference",
     "isdf_memory_mode",
-    "ppm_invalid_mode",
     "ppm_model",
 }
 
@@ -573,12 +568,8 @@ class PPMConfig:
     omega_accumulation: str       # "auto" | "kij" | "kij_stream"
 
     # --- on-shell evaluation knobs ---
-    sigma_scale: float
-    sigma_flip_neg: bool
-    invalid_mode: str             # "static_limit"
     fermi_reference: str          # "midgap" | "vbm"
     sigma_at_dft_extrapolate: bool
-    sigma_at_dft_energies: bool
 
 
 @dataclass(frozen=True)
@@ -942,12 +933,8 @@ class LorraxConfig:
             window_edge_factor=float(_g("sigma_window_edge_factor")),
             omega_batch_size=int(_g("sigma_omega_batch_size")),
             omega_accumulation=str(_g("sigma_omega_accumulation")).strip().lower(),
-            sigma_scale=float(_g("ppm_sigma_scale")),
-            sigma_flip_neg=bool(_g("ppm_sigma_flip_neg")),
-            invalid_mode=str(_g("ppm_invalid_mode") or "static_limit"),
             fermi_reference=str(_g("fermi_reference")).strip().lower(),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
-            sigma_at_dft_energies=bool(_g("sigma_at_dft_energies")),
         )
         memory = MemoryConfig(
             per_device_gb=memory_per_device_gb,
