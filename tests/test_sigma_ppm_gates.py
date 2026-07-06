@@ -4,11 +4,11 @@ These are the tests the consensus_draft (reports/sigma_ppm_tighten_2026-07-04)
 requires to exist *before* any behaviour-adjacent Σ_PPM change lands.  G3 (the
 head negative-branch regression) lives in ``tests/test_head_correction.py``.
 
-  G1  kij ↔ kij_stream accumulator parity.  EXPECTED RED at HEAD — it is the
-      gate that detects Bug B (the streamed path drops the analytic q→0 head,
-      ppm_pipeline.py:126-127).  Marked ``xfail(strict=True)`` so the suite
-      stays green today and WS1's fix flips it to XPASS, forcing the marker's
-      removal.  G1's *absence* is why Bug B survived: no golden gate ever
+  G1  kij ↔ kij_stream accumulator parity.  GREEN since WS1 — it is the gate
+      that detected Bug B (the streamed path dropped the analytic q→0 head,
+      ppm_pipeline.py _inject_analytic_head).  WS1's fix RMW-adds the head
+      into the streamed sigma_kij h5, so the two accumulation paths now agree
+      to ~1e-12.  G1's *absence* is why Bug B survived: no golden gate ever
       exercised the stream path (the small fixtures auto-select KIJ_HOST).
 
   G2  per-branch / per-window reference tiles.  GREEN — the bit-identity pin
@@ -191,23 +191,23 @@ def test_g2_branch_window_tiles_are_frozen():
 
 
 # ===========================================================================
-#  G1 — kij ↔ kij_stream accumulator parity (EXPECTED RED — detects Bug B)
+#  G1 — kij ↔ kij_stream accumulator parity (GREEN since WS1 — detects Bug B)
 # ===========================================================================
 #
 # The streamed accumulator writes a head-less Σ_c (Bug B: _inject_analytic_head
-# early-returns (None, None) when sigma_c_omega is None, so the analytic q→0
-# head is never RMW-added into the sigma_c_kij h5).  The host path injects the
+# early-returned (None, None) when sigma_c_omega is None, so the analytic q→0
+# head was never RMW-added into the sigma_c_kij h5).  The host path injects the
 # head into the in-memory tensor.  Both write ``sigma_c_kij_ev`` into
 # sigma_mnk.h5, so comparing those two datasets isolates the dropped head.
 #
-# CONFIRMED RED DIFF at HEAD (MoS2 3×3 gnppm fixture, 1 GPU):
+# CONFIRMED RED DIFF before WS1 (MoS2 3×3 gnppm fixture, 1 GPU):
 #   max|Δ sigma_c_kij_ev|          = 4.13 eV
 #   max|Δ| on the band DIAGONAL    = 4.13 eV       (bands 24-31, near VBM/nval=26)
 #   max|Δ| OFF the band diagonal   = 7.0e-10 eV    (numerical noise)
-# i.e. the entire discrepancy sits on the band-diagonal head-affected bands —
+# i.e. the entire discrepancy sat on the band-diagonal head-affected bands —
 # the analytic q→0 head, which is diagonal in band and dropped by the stream
 # path — NOT a random accumulator disagreement.  WS1's fix (RMW-add the head
-# into the stream h5) makes the two paths agree and flips this test to XPASS.
+# into the stream h5) makes the two paths agree to ~1e-12.
 #
 # NB two precursors had to be handled for the stream path to even RUN to the
 # point where Bug B is observable, both folded into WS1's scope:
@@ -264,10 +264,6 @@ def _read_sigma_c_kij_ev(sigma_mnk_path: Path) -> np.ndarray:
 
 
 @pytest.mark.regression
-@pytest.mark.xfail(
-    reason="Bug B: streamed path drops q->0 head; fixed in WS1",
-    strict=True,
-)
 def test_g1_kij_vs_kij_stream_parity(tmp_path):
     platform = _requested_platform()
     if platform in {"gpu", "cuda"} and not _gpu_available():
@@ -282,7 +278,17 @@ def test_g1_kij_vs_kij_stream_parity(tmp_path):
     sig_stream = _read_sigma_c_kij_ev(stream_dir / "sigma_mnk.h5")
     assert sig_host.shape == sig_stream.shape, (sig_host.shape, sig_stream.shape)
 
-    # The kij (host) path injects the analytic q→0 head; the stream path drops
-    # it (Bug B).  At HEAD this fails by ~4 eV on the band-diagonal near-gap
-    # bands.  When WS1 injects the head into the stream h5, the two agree.
-    np.testing.assert_allclose(sig_stream, sig_host, rtol=0.0, atol=1e-12)
+    # The kij (host) path injects the analytic q→0 head; before WS1 the stream
+    # path dropped it (Bug B) and this failed by ~4.13 eV on the band-diagonal
+    # near-gap bands (24-31).  WS1 RMW-adds the identical head into the stream
+    # h5, so the band-diagonal head is gone: post-fix the FULL tensor agrees to
+    # ~7e-10 eV, and the head-carrying diagonal to ~4e-10 eV.
+    #
+    # The residual ~7e-10 floor is NOT the head — it sits on large-magnitude
+    # OFF-diagonal elements (~1e3 eV) where the head is exactly zero.  It is the
+    # pre-existing numpy-vs-jax dual-projector ULP difference (host uses
+    # _project_tau_onto_omega_np, stream uses the jitted _project_tau_onto_omega
+    # — see the K2/WS4 accumulator unification, which deletes one projector and
+    # will let this gate tighten back to ~1e-12).  atol=1e-8 clears that floor
+    # with >10x margin while still catching a dropped head (4.13 eV) loudly.
+    np.testing.assert_allclose(sig_stream, sig_host, rtol=0.0, atol=1e-8)

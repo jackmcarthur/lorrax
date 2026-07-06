@@ -111,20 +111,27 @@ def _inject_analytic_head(
     ppm_options: PPMSigmaRuntimeOptions,
     band_slices,
     wfn, sym, meta,
+    sigma_kij_h5_path: str | None,
     print_fn,
 ) -> tuple[jax.Array | None, np.ndarray | None]:
     """Add the analytic q→0, G=G'=0 head to Σ^c(ω) on rank 0.
 
+    Two accumulation paths, one head.  When ``sigma_c_omega`` is in memory
+    (KIJ_HOST) the head is added to the tensor and returned.  When Σ_c was
+    streamed to an h5 (KIJ_STREAM) the streamed accumulator wrote a
+    *head-less* ``sigma_c_kij_ry``; here we RMW-add the identical analytic
+    head into that dataset on rank 0 so both paths land the same Σ_c
+    (Bug B, reports/sigma_ppm_tighten_2026-07-04).  The head is computed
+    once (same call, same ω-grid) and consumed by whichever path applies.
+
     Returns
     -------
     sigma_c_omega_with_head, head_sigma_diag_w_kn_ry
-        Post-head Σ_c (same shape as input) and the band-diagonal of the
-        head-only contribution ``(nω, nk, nb)`` in Ry (head is diagonal in
-        band so this is a lossless decomposition).  Both are ``None`` when
-        the input ``sigma_c_omega`` is ``None``.
+        Post-head Σ_c (same shape as input, or ``None`` in streamed mode
+        where the correction lands in the h5 instead) and the band-diagonal
+        of the head-only contribution ``(nω, nk, nb)`` in Ry (head is
+        diagonal in band so this is a lossless decomposition).
     """
-    if sigma_c_omega is None:
-        return None, None
     from .head_correction import compute_ppm_head_sigma_kij
 
     enk_full, _ = get_enk_bandrange(
@@ -157,6 +164,40 @@ def _inject_analytic_head(
     )
     head_diag_w_kn_ry = np.diagonal(
         np.asarray(head_sigma_kij_ry), axis1=2, axis2=3)
+
+    if sigma_c_omega is None:
+        # Streamed mode: RMW-add the head into the sigma_kij h5.  A head-less
+        # streamed Σ_c is a silent wrong answer, so refuse to proceed without
+        # a file to correct rather than dropping the head.
+        if sigma_kij_h5_path is None:
+            raise ValueError(
+                "streamed Σ_c requested (sigma_c_kij is None) but no "
+                "sigma_kij h5 path is available; the analytic q→0 head "
+                "cannot be injected and a head-less Σ_c would be silently "
+                "wrong. Set sigma_kij_h5_file, or use "
+                "sigma_omega_accumulation=kij (in-memory).")
+        if meta.rank == 0:
+            import h5py
+            head_np = np.asarray(head_sigma_kij_ry, dtype=np.complex128)
+            n_omega = int(head_np.shape[0])
+            # The head is diagonal-in-band; head_np's off-diagonals are exactly
+            # zero, so adding the full (nω, nk, nb, nb) tile touches only the
+            # band-diagonal — bit-identical to the in-memory path's tensor add.
+            # ω-batch the read-modify-write to match the chunked dataset.
+            batch = int(max(1, getattr(ppm_options, 'sigma_omega_batch_size', 4)))
+            with h5py.File(sigma_kij_h5_path, "r+") as h5:
+                if bool(h5.attrs.get("head_injected", False)):
+                    print_fn(
+                        f"  Σ_c head: {sigma_kij_h5_path} already carries "
+                        "head_injected=True; skipping RMW to avoid double-add.")
+                else:
+                    dset = h5["sigma_c_kij_ry"]
+                    for ibeg in range(0, n_omega, batch):
+                        iend = min(ibeg + batch, n_omega)
+                        dset[ibeg:iend] = dset[ibeg:iend] + head_np[ibeg:iend]
+                    h5.attrs["head_injected"] = True
+        return None, head_diag_w_kn_ry
+
     return (
         sigma_c_omega + jnp.asarray(head_sigma_kij_ry, dtype=jnp.complex128),
         head_diag_w_kn_ry,
@@ -365,7 +406,9 @@ def compute_ppm_sigma_pipeline(
         sigma_c_omega, head_sigma_diag_w_kn_ry = _inject_analytic_head(
             sigma_c_omega, head_gn,
             ppm_options=ppm_options, band_slices=band_slices,
-            wfn=wfn, sym=sym, meta=meta, print_fn=print_fn,
+            wfn=wfn, sym=sym, meta=meta,
+            sigma_kij_h5_path=sigma_omega.sigma_kij_h5_path,
+            print_fn=print_fn,
         )
 
         # Step 4: diag(Σ_c) at DFT energies (replicated across ranks)

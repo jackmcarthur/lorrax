@@ -626,6 +626,12 @@ def main(argv=None):
 			sigma_xc_at_dft_ev = sigma_c_at_dft_ev + np.real(np.diagonal(
 				np.asarray(sig_x), axis1=1, axis2=2)) * RYD_TO_EV
 	elif mode.is_dynamic and sigma_c_omega is not None:
+		# NB (streamed-mode fallthrough): in KIJ_STREAM accumulation
+		# ``sigma_c_omega`` is None (Σ_c lives only in the sigma_kij h5, which
+		# _inject_analytic_head has already head-corrected in place), so this
+		# on-shell QP fixed-point solve is skipped — streamed runs get the
+		# at-DFT diagnostic Σ_c only, not on-shell QP energies.  See WS1 /
+		# Bug B in reports/sigma_ppm_tighten_2026-07-04.
 		# G0W0/QSGW: diagonal-Σ(E) fixed point (with optional scissor) →
 		# QSGW Σ_xc^QSGW.  Restart-friendly: this whole block consumes only
 		# the on-device ``sigma_c_omega`` plus replicated (sig_x, sig_h),
