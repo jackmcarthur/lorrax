@@ -1555,7 +1555,7 @@ def compute_sigma_c_ppm_omega_grid(
             shape=(n_omega, nk_proj, nb_proj, nb_proj),
             dtype=np.complex128,
             chunks=(o_chunks, k_chunks, nb_proj, nb_proj),
-            fillvalue=0.0,
+            fillvalue=0j,  # h5py>=3.13 rejects a float fill on a complex dtype
         )
         h5_kij.attrs["layout"] = "omega,k,i,j"
 

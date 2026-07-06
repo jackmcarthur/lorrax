@@ -1,7 +1,10 @@
 import numpy as np
 
 from gw.head_correction import (
+    HeadSample,
     compute_static_head_terms,
+    fit_head_ppm,
+    fit_head_ppm_from_samples,
     resolve_head_override,
     static_head_terms_to_kij,
 )
@@ -76,3 +79,95 @@ def test_resolve_head_override_uses_frequency_specific_whead():
     assert imag.vc0 == complex(100.0)
     assert imag.wcoul0 == complex(40.0)
     assert "override(" in imag.source
+
+
+# ---------------------------------------------------------------------------
+# G3 (Σ_PPM tighten, WS0): head negative-branch (Ω_h² ≤ 0) regression.
+#
+# ``fit_head_ppm`` had ZERO coverage of the ``omega_h_sq <= 0`` branch
+# (head_correction.py:320-338) — the branch Bug A lived in.  Bug A: the
+# negative branch computed ``B_h = -w1 * omega_h_sq`` with the SIGNED
+# (negative) omega_h_sq while ``omega_h = |omega_h_sq|**0.5`` is positive,
+# so ``R_h = B_h / (2 omega_h)`` came out sign-FLIPPED relative to the
+# positive branch — the entire q→0 head Σ_c (hundreds of meV) had the wrong
+# sign whenever the GN head fit went imaginary.  The fix (2026-07-04, at
+# :327) uses ``B_h = -w1 * |omega_h_sq|`` so that
+#
+#     R_h = -w1 * sqrt(|omega_h_sq|) / 2          (both branches)
+#
+# i.e. |R_h| is magnitude-continuous across Ω²=0 and sign(R_h) = -sign(w1)
+# on BOTH sides.  These tests pin exactly that continuity.
+
+
+def _analytic_head_omega_h_sq(vc0, wc0_static, wc0_probe, probe_omega):
+    """The head fit's omega_h_sq formula, recomputed independently."""
+    w1 = wc0_static - vc0
+    w2 = wc0_probe - vc0
+    omega_2_sq = (complex(probe_omega) ** 2).real
+    return -w2 * omega_2_sq / (w1 - w2)
+
+
+def test_fit_head_ppm_negative_branch_sign_matches_positive_limit():
+    """Drive the Ω_h²<0 branch and assert R_h has the anti-Bug-A sign.
+
+    GN probe (purely imaginary ω_p) with |W^c(iω_p)| > |W^c(0)| forces
+    omega_h_sq < 0.  vc0=10, W^c(0)=w1=-5, W^c(iω_p)=w2=-8 (|w2|>|w1|):
+    omega_h_sq = -w2·(iω_p)²/(w1-w2) = 8·(-4)/3 = -32/3 < 0.
+    """
+    vc0, wc0_static, wc0_probe = 10.0, 5.0, 2.0   # w1=-5, w2=-8
+    probe_omega = 2.0j                             # GN: (iω_p)² = -4
+    w1 = wc0_static - vc0                           # -5
+
+    head = fit_head_ppm(vc0, wc0_static, wc0_probe, probe_omega)
+
+    # The negative branch really was taken.
+    assert head.omega_h_sq < 0.0
+    s = _analytic_head_omega_h_sq(vc0, wc0_static, wc0_probe, probe_omega)
+    np.testing.assert_allclose(head.omega_h_sq, s)
+    np.testing.assert_allclose(head.omega_h, abs(s) ** 0.5)
+
+    # The property Bug A violated: R_h = -w1·sqrt(|Ω²|)/2, so sign(R_h) is
+    # the SAME sign the positive branch would give (= -sign(w1)), NOT flipped.
+    expected_R_h = -w1 * abs(s) ** 0.5 / 2.0
+    np.testing.assert_allclose(head.R_h, expected_R_h)
+    assert np.sign(head.R_h) == np.sign(-w1)          # would FAIL under Bug A
+    # B_h likewise uses |Ω²| (the fix), not the signed value.
+    np.testing.assert_allclose(head.B_h, -w1 * abs(s))
+
+    # The resolved-sample entry point must agree bit-for-bit.
+    head_s = fit_head_ppm_from_samples(
+        HeadSample(vc0=complex(vc0), wcoul0=complex(wc0_static),
+                   source="unit", omega=0.0 + 0.0j),
+        HeadSample(vc0=complex(vc0), wcoul0=complex(wc0_probe),
+                   source="unit", omega=probe_omega),
+        probe_omega=probe_omega,
+    )
+    np.testing.assert_allclose(head_s.R_h, head.R_h)
+    np.testing.assert_allclose(head_s.B_h, head.B_h)
+
+
+def test_fit_head_ppm_R_h_continuous_across_omega_sq_zero():
+    """R_h is sign- and magnitude-continuous across the Ω_h²=0 crossing.
+
+    Hold w1 = W^c(0)-vc0 fixed and sweep W^c(iω_p) through vc0 (w2→0),
+    where omega_h_sq changes sign.  Just below (positive branch) and just
+    above (negative branch) the crossing, R_h must have the same sign and
+    nearly equal magnitude.  Under Bug A the negative side flipped sign,
+    making |ΔR_h| ≈ 2·|R_h| instead of →0.
+    """
+    vc0, wc0_static = 10.0, 5.0        # w1 = -5
+    probe_omega = 2.0j
+    w1 = wc0_static - vc0
+    delta = 0.01
+
+    # w2 = -delta  → omega_h_sq > 0 (positive branch, just below crossing)
+    pos = fit_head_ppm(vc0, wc0_static, vc0 - delta, probe_omega)
+    # w2 = +delta  → omega_h_sq < 0 (negative branch, just above crossing)
+    neg = fit_head_ppm(vc0, wc0_static, vc0 + delta, probe_omega)
+
+    assert pos.omega_h_sq > 0.0 and neg.omega_h_sq < 0.0   # bracket the crossing
+    # Same sign on both sides (the anti-Bug-A property) ...
+    assert np.sign(pos.R_h) == np.sign(neg.R_h) == np.sign(-w1)
+    # ... and continuous in magnitude (→0 as delta→0): |ΔR_h| ≪ |R_h|.
+    # Under Bug A the two sides are opposite-signed, so |ΔR_h| ≈ 2|R_h|.
+    assert abs(pos.R_h - neg.R_h) < 0.02 * abs(pos.R_h)
