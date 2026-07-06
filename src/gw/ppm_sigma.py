@@ -39,10 +39,10 @@ File layout
     data classes               PPMBuildResult / SigmaOmegaResult / _SigmaWindow / _SigmaPhysicsState / _SigmaBranch
     leaf jits (physics)        _prepare_sigma_state · _project_tau_onto_omega
     cached kernel factories    _get_sigma_kij_kernel · _get_sigma_tau_kernel
-    PPM fit                    fit_gn_ppm
+    PPM fit                    fit_ppm
     host-side window build     _build_single_sigma_window · _build_three_sigma_windows
     accumulators               _SigmaAccumulator protocol
-                               _ReduceScatterGpuAccumulator · _StreamedH5Accumulator
+                               _HostOmegaAccumulator · _StreamedH5Accumulator
     branch orchestration       _build_windows_for_branch (host) · _integrate_tau_windows_for_branch (device)
                                _run_sigma_branch (thin orchestrator)
     top-level driver           compute_sigma_c_ppm_omega_grid
@@ -68,10 +68,8 @@ from common.units import RYD_TO_EV
 from .minimax_config import MinimaxConfig, SigmaQuadratureConfig
 from .minimax_screening import (
     MinimaxNodes,
-    build_static_minimax_window_pair,
     fit_gn_ppm_from_wc_pair,
     solve_laplace_minimax_interval,
-    solve_laplace_minimax_imag_interval,
     solve_phase_minimax_bandwidth,
 )
 from . import w_isdf
@@ -155,13 +153,12 @@ class _SigmaWindow:
     name: str
     nodes: MinimaxNodes        # (t, alpha) complex128, carries this window's τ points
     mask_A: np.ndarray         # (nk, nb)
-    mask_B: np.ndarray | None  # (nk, nb)
     E_ref_A: float
     E_ref_B: float
     omega_sign: int
     project: str               # "full" (Laplace) or "imag" (crossing)
     prefactor: float
-    mask_B_mode: str = "explicit"
+    mask_B_mode: str = "all"
     mask_B_threshold: float | None = None
     crossing_kind: str | None = None
 
@@ -273,10 +270,6 @@ def _materialize_window_mask_B(
 ) -> jax.Array:
     """Build one window's B-side selector lazily on device."""
     mode = str(window.mask_B_mode)
-    if mode == "explicit":
-        if window.mask_B is None:
-            raise ValueError("window.mask_B must be provided when mask_B_mode='explicit'.")
-        return jnp.asarray(window.mask_B, dtype=bool)
     if mode == "all":
         return jnp.asarray(base_mask_B, dtype=bool)
     threshold = jnp.asarray(window.mask_B_threshold, dtype=Omega_q.dtype)
@@ -453,7 +446,21 @@ def _make_project_ri_reduce_scatter(mesh_xy: Mesh) -> Callable[..., jax.Array]:
 
     Same NCCL byte volume as the original pair of psums (on-ring LL128), but
     the output is sharded (m_X, n_Y) so every downstream coeff·σ multiply
-    stays local — which is the whole point.
+    stays local — which is the whole point.  A downstream Σ_c(ω, k, m, n)
+    accumulator that keeps this layout end-to-end holds a per-rank buffer of
+    (n_b/p_x)·(n_b/p_y)·n_ω·n_k — ~100× smaller than a replicated Σ_μν, which
+    is the scaling argument for shipping this layout end-to-end.
+
+    Deferred follow-up if that on-GPU sharded accumulator is ever wired:
+        (a) m-chunking at add-τ so σ^τ arrives one m-strip at a time rather
+            than a full (m_full, n_Y/p) shard (default chunk = 1 tile = m/p);
+            needed when (m, n, k, ω) per-rank stops fitting.
+        (b) τ batching via lax.scan over a stacked τ axis — previously tried
+            and reverted (regressed sigma_ppm ~80% at MoS2 3×3: multiple n_τ
+            compiles, no amortization, lost async-dispatch overlap).  Re-add
+            only when per-τ Python dispatch cost exceeds those costs.
+        (c) collective-flush SlabIO variant (stage many τ on GPU, one
+            parallel-HDF5 write at window close).
 
     Requires m % p_x == 0 and n % p_y == 0.  Padding at the caller is the
     cleanest place to handle non-divisibility (TODO when we hit that).
@@ -503,9 +510,9 @@ def _get_sigma_kij_kernel(
 ) -> Callable[..., jax.Array]:
     """Return a jit-compatible sigma-kij kernel with device-local FFTs.
 
-    The tail project (ψ* σ ψ → Σ_mn) uses the reduce-scatter variant so the
-    emitted σ^τ is sharded (m_X, n_Y) — matching what
-    _ReduceScatterGpuAccumulator expects without any downstream reshuffle.
+    The tail project (ψ* σ ψ → Σ_mn) uses the reduce-scatter variant
+    (_make_project_ri_reduce_scatter) so the emitted σ^τ is sharded
+    (m_X, n_Y) without any downstream reshuffle.
     """
 
     kgrid = tuple(int(x) for x in kgrid)
@@ -720,31 +727,6 @@ def fit_ppm(
     )
 
 
-def fit_gn_ppm(
-    W0_q: jax.Array,
-    Wiwp_q: jax.Array,
-    V_q: jax.Array,
-    omega_p: float,
-    mesh_xy: Mesh,
-    *,
-    fallback_omega: float = 2.0,
-    n_nodes_static: int = 0,
-    print_fn=None,
-) -> PPMBuildResult:
-    """Fit Godby-Needs PPM (imaginary probe ``i·omega_p``).
-
-    Thin wrapper around :func:`fit_ppm` for the GN model.
-    """
-    return fit_ppm(
-        W0_q, Wiwp_q, V_q, 1j * float(omega_p), mesh_xy,
-        fallback_omega=fallback_omega,
-        n_nodes_static=n_nodes_static,
-        print_fn=print_fn,
-        model_label="GN-PPM",
-    )
-
-
-
 # ---------------------------------------------------------------------------
 #  Minimax window construction
 # ---------------------------------------------------------------------------
@@ -785,7 +767,6 @@ def _build_single_sigma_window(
             name="single",
             nodes=q.to_minimax_nodes(time_axis='imag'),
             mask_A=np.asarray(base_mask_A, dtype=bool),
-            mask_B=None,
             E_ref_A=float(np.min(A_vals)),
             E_ref_B=float(mask_B_min),
             omega_sign=int(kernel_sign),
@@ -883,7 +864,6 @@ def _build_three_sigma_windows(
                 name=name,
                 nodes=nodes,
                 mask_A=np.asarray(mA, dtype=bool),
-                mask_B=None,
                 E_ref_A=E_ref_A,
                 E_ref_B=E_ref_B,
                 omega_sign=+1,
@@ -929,80 +909,6 @@ class _SigmaAccumulator:
     def add_tau(self, sigma_re, sigma_im, t_c: complex, alpha_eff_c: complex) -> None: ...
     def end_window(self) -> None: ...
     def finalize(self) -> jax.Array | None: ...
-
-
-class _ReduceScatterGpuAccumulator(_SigmaAccumulator):
-    """Σ_c(ω, k, m, n) held on-GPU sharded (m_X, n_Y).
-
-    σ^τ arrives already (m_X, n_Y)-sharded from the shard_map'd project at
-    the tail of the FFT/project kernel (see _make_project_ri_reduce_scatter),
-    and the ω-kernel multiply + accumulate stay local per-rank.  The per-rank
-    buffer is (n_b/p_x)·(n_b/p_y)·n_ω·n_k — ~100× smaller than Σ_μν, which
-    is the whole scaling argument for shipping this layout end-to-end.
-
-    Follow-up work (not yet wired; see _CollectiveFlushSlabIoAccumulator
-    stub for the I/O leg):
-
-        (a) m-chunking at add_tau so σ^τ arrives one m-strip at a time
-            rather than one full (m_full, n_Y/p) shard — default chunk = 1
-            tile, = m/p.  Needed when (m, n, k, ω) per-rank stops fitting.
-        (b) τ batching via lax.scan over a stacked τ axis — a dormant
-            scan factory existed here previously; deleted because it
-            regressed sigma_ppm by ~80% at MoS2 3×3 scale (multiple n_τ
-            compiles, no amortization, lost async-dispatch overlap).
-            Re-add when per-τ Python dispatch cost exceeds those costs
-            (larger mesh / larger n_rmu).
-        (c) Collective-flush SlabIO variant (see _StreamedH5Accumulator
-            docstring) — stages many τ on GPU and issues one parallel-HDF5
-            write at window close.
-    """
-
-    def __init__(self, shape: tuple[int, int, int, int], mesh_xy: Mesh,
-                 omega_vec: jax.Array):
-        self._sharding = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
-        self._omega_vec = omega_vec
-        # Allocate already-sharded.  jax.lax.with_sharding_constraint requires
-        # a trace context; jax.device_put is the equivalent for eager setup.
-        self.total = jax.device_put(
-            jnp.zeros(shape, dtype=jnp.complex128), self._sharding)
-        self._win_acc: jax.Array | None = None
-        # Window-scoped scalars cached at begin_window.
-        self._omega_sign_j = None
-        self._pref_j = None
-        self._project_code_j = None
-
-    def begin_window(self, window: _SigmaWindow, *, scale: float) -> None:
-        self._win_acc = jax.device_put(
-            jnp.zeros_like(self.total), self._sharding)
-        self._omega_sign_j   = jnp.asarray(float(window.omega_sign),       dtype=jnp.float64)
-        self._pref_j         = jnp.asarray(float(window.prefactor * scale), dtype=jnp.float64)
-        self._project_code_j = jnp.asarray(window.project_code,            dtype=jnp.int32)
-
-    def add_tau(self, sigma_re, sigma_im, t_c: complex, alpha_eff_c: complex) -> None:
-        assert self._win_acc is not None
-        t_j     = jnp.asarray(t_c,         dtype=jnp.complex128)
-        alpha_j = jnp.asarray(alpha_eff_c, dtype=jnp.complex128)
-        # σ^τ arrives already (k, m_X, n_Y)-sharded from the shard_map'd
-        # project inside the FFT/project kernel.  The ω-kernel multiply and
-        # add therefore touch only each rank's local (m/p_x, n/p_y) block.
-        self._win_acc = self._win_acc + _project_tau_onto_omega(
-            sigma_re, sigma_im, self._omega_vec,
-            t_j, alpha_j, self._omega_sign_j,
-            self._pref_j, self._project_code_j,
-        )
-        # Pin the running buffer's sharding so XLA doesn't replicate it
-        # between adds.
-        self._win_acc = jax.lax.with_sharding_constraint(
-            self._win_acc, self._sharding)
-
-    def end_window(self) -> None:
-        assert self._win_acc is not None
-        self.total = jax.lax.with_sharding_constraint(
-            self.total + self._win_acc, self._sharding)
-        self._win_acc = None
-
-    def finalize(self) -> jax.Array:
-        return self.total
 
 
 def _project_tau_onto_omega_np(
@@ -1119,8 +1025,8 @@ class _StreamedH5Accumulator(_SigmaAccumulator):
 
     Note on the FFI flush path (future work, comment-only here): a third
     accumulator — _CollectiveFlushSlabIoAccumulator — would keep the running Σ
-    sharded (m_X, n_Y) on GPU like _ReduceScatterGpuAccumulator, stack many
-    τ contributions per window without flushing, and at end_window() issue
+    sharded (m_X, n_Y) on GPU (the _make_project_ri_reduce_scatter layout),
+    stack many τ contributions per window without flushing, and at end_window() issue
     a single collective parallel-HDF5 write via SlabIO.write_slab against
     a pre-opened zarr-style (n_ω, n_k, m, n) dataset.  This removes the
     per-τ read-modify-write roundtrip that makes _StreamedH5Accumulator
@@ -1199,15 +1105,11 @@ def _build_windows_for_branch(
     if omega_nonneg_ry.size == 0:
         return []
 
-    print(f"  [DBG-PPM-WIN] {log_tag} pre E_A allgather rank={jax.process_index()}", flush=True)
     E_A_host = _to_host_np(E_A, dtype=np.float64, tiled=False)
-    print(f"  [DBG-PPM-WIN] {log_tag} post E_A shape={E_A_host.shape} rank={jax.process_index()}", flush=True)
     base_A_host = _to_host_np(base_mask_A, dtype=bool, tiled=False)
-    print(f"  [DBG-PPM-WIN] {log_tag} post base_A shape={base_A_host.shape} rank={jax.process_index()}", flush=True)
 
     _, mask_B_all_count, mask_B_all_min, mask_B_all_max = _masked_stats_device(
         Omega_q, base_mask_B)
-    print(f"  [DBG-PPM-WIN] {log_tag} post masked_stats rank={jax.process_index()}", flush=True)
 
     omega_max = float(np.max(omega_nonneg_ry))
     if kernel_sign == +1 and omega_max > 1.0e-14:
@@ -1333,9 +1235,9 @@ def _integrate_tau_windows_for_branch(
     """Walk windows; for each, dispatch ``minimax_tau_integrate_sigma``
     with closures that bind this window's (psi, masks, E_ref, kernel) and
     feed the window's σ^τ into the accumulator.  The result lands either
-    on-GPU (reduce-scatter accumulator) or streamed to H5 — that decision
+    on-GPU (host ω accumulator) or streamed to H5 — that decision
     is the accumulator's, not this loop's.  See
-    _ReduceScatterGpuAccumulator / _StreamedH5Accumulator.
+    _HostOmegaAccumulator / _StreamedH5Accumulator.
     """
     from common.progress import LoopProgress
 
@@ -1439,13 +1341,11 @@ def _run_sigma_branch(
     if not windows:
         return jnp.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=jnp.complex128), []
 
-    print(f"  [DBG-PPM] _run_sigma_branch[{log_tag}] post-windows nwin={len(windows)} rank={jax.process_index()}", flush=True)
     omega_vec = jnp.asarray(omega_nonneg_ry, dtype=jnp.float64)
     tau_kernel = _get_sigma_tau_kernel(
         mesh_xy=mesh_xy,
         kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
     )
-    print(f"  [DBG-PPM] _run_sigma_branch[{log_tag}] tau_kernel ready rank={jax.process_index()}", flush=True)
 
     if stream_writer is None:
         # Σ_c(ω,k,m,n) lives as per-rank numpy tiles matching σ(τ)'s
@@ -1584,7 +1484,6 @@ def compute_sigma_c_ppm_omega_grid(
             f"({100.0 * n_invalid / max(n_total_modes, 1):.2f}%)"
         )
 
-    print_fn(f"  [DBG-PPM] post-print rank={jax.process_index()}/{jax.process_count()}", flush=True) if False else print(f"  [DBG-PPM] post-print rank={jax.process_index()}/{jax.process_count()}", flush=True)
     # Decide accumulation mode + allocate any backing storage.
     nk_proj = int(psi_proj_xr.shape[0])
     nb_proj = int(psi_proj_xr.shape[1])
@@ -1669,9 +1568,7 @@ def compute_sigma_c_ppm_omega_grid(
         # Sum cond+val per ω-half before gathering to host.  Preserves the
         # original traversal order so reduction ordering stays bit-identical.
         per_half: dict[tuple, jax.Array] = {}
-        print(f"  [DBG-PPM] entering branches loop, n={len(branches)} rank={jax.process_index()}", flush=True)
         for _bi, br in enumerate(branches):
-            print(f"  [DBG-PPM] branch {_bi} {br.tag} start rank={jax.process_index()}", flush=True)
             sigma_kij, _ = _run_sigma_branch(
                 omega_nonneg_ry=br.omega_abs, omega_global_idx=br.omega_idx,
                 E_A=br.E_A, base_mask_A=br.base_mask_A,
@@ -1683,7 +1580,8 @@ def compute_sigma_c_ppm_omega_grid(
             per_half[key] = (per_half[key] + sigma_kij) if key in per_half else sigma_kij
 
         if not streaming:
-            # _ReduceScatterGpuAccumulator returns Σ sharded (m_X, n_Y), so the
+            # the reduce-scatter project (_make_project_ri_reduce_scatter)
+            # returns Σ sharded (m_X, n_Y), so the
             # host copy needs a cross-process gather rather than jax.device_get.
             # _to_host_np falls back to device_get for single-process / replicated.
             for key, total in per_half.items():

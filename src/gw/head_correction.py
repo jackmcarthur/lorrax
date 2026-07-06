@@ -345,21 +345,6 @@ def fit_head_ppm(
     )
 
 
-def fit_head_gn(
-    vc0: float,
-    wcoul0_static: float,
-    wcoul0_imfreq: float,
-    omega_p_ry: float,
-) -> HeadGNParams:
-    """Fit a scalar GN pole from two W^c head samples (imaginary probe)."""
-    return fit_head_ppm(
-        vc0=vc0,
-        wcoul0_static=wcoul0_static,
-        wcoul0_probe=wcoul0_imfreq,
-        probe_omega=1j * float(omega_p_ry),
-    )
-
-
 def fit_head_ppm_from_samples(
     head_static: HeadSample,
     head_probe: HeadSample,
@@ -483,14 +468,6 @@ def fit_head_with_fixed_omega_from_sample(
         vc0=float(head_static.vc0.real),
         wcoul0_static=float(head_static.wcoul0.real),
         omega_h_ry=omega_h_ry,
-    )
-
-
-def fit_head_gn_from_samples(head_static: HeadSample, head_imag: HeadSample,
-                             *, omega_p_ry: float) -> HeadGNParams:
-    """Fit the scalar GN head from resolved static and imag-frequency samples."""
-    return fit_head_ppm_from_samples(
-        head_static, head_imag, probe_omega=1j * float(omega_p_ry),
     )
 
 
@@ -640,7 +617,7 @@ def compute_ppm_head_sigma_kij(
 
     At q=0, ``M_{nm}(k, q→0, G=0) = δ_{nm}``, so the head only enters the
     band-diagonal ``(i, i)`` of the PPM ``Σ^c`` matrix.  With the GN pole
-    extracted in :func:`fit_head_gn` (``R_h = B_h / (2 Ω_h)``,
+    extracted in :func:`fit_head_ppm` (``R_h = B_h / (2 Ω_h)``,
     ``B_h = -W^c(0) · Ω_h²``):
 
         Σ^c_n^head(ω - E_F) =

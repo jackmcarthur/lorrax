@@ -308,22 +308,12 @@ _DEFAULTS = {
     "sigma_omega_batch_size": 4,
     "sigma_omega_accumulation": "auto",
     # PPM sigma options
-    "ppm_sigma_scale": 1.0,
-    "ppm_sigma_flip_neg": False,
     "ppm_invalid_mode": "static_limit",
     "fermi_reference": "midgap",
     "sigma_at_dft_extrapolate": False,
     "sigma_at_dft_energies": False,
     # Debug
-    "debug_hartree": False,
-    "debug_omega": None,
     "sigma_freq_debug_output": False,
-    "ppm_sigma_debug_static_norm": False,
-    "ppm_static_cohsex_check": False,
-    "sigma_debug_quadrature": False,
-    "sigma_debug_quadrature_samples": 200,
-    "write_w_copies_debug": False,
-    "w_copies_debug_file": "",
     "sigma_freq_debug_file": "sigma_freq_debug.dat",
     # QP wavefunction file dump.  Default True: end-of-run write of
     # ``WFN_qp.h5`` (BGW format, ψ rotated by the final U, energies
@@ -573,8 +563,6 @@ class PPMConfig:
     omega_accumulation: str       # "auto" | "kij" | "kij_stream"
 
     # --- on-shell evaluation knobs ---
-    sigma_scale: float
-    sigma_flip_neg: bool
     invalid_mode: str             # "static_limit"
     fermi_reference: str          # "midgap" | "vbm"
     sigma_at_dft_extrapolate: bool
@@ -633,15 +621,7 @@ class BackendConfig:
 @dataclass(frozen=True)
 class DebugConfig:
     """Debug-only flags + auxiliary output filenames."""
-    debug_hartree: bool
-    debug_omega: float | None
     sigma_freq_debug_output: bool
-    ppm_sigma_debug_static_norm: bool
-    ppm_static_cohsex_check: bool
-    sigma_debug_quadrature: bool
-    sigma_debug_quadrature_samples: int
-    write_w_copies_debug: bool
-    w_copies_debug_file: str
     sigma_freq_debug_file: str
     write_wfn_h5: bool
 
@@ -942,8 +922,6 @@ class LorraxConfig:
             window_edge_factor=float(_g("sigma_window_edge_factor")),
             omega_batch_size=int(_g("sigma_omega_batch_size")),
             omega_accumulation=str(_g("sigma_omega_accumulation")).strip().lower(),
-            sigma_scale=float(_g("ppm_sigma_scale")),
-            sigma_flip_neg=bool(_g("ppm_sigma_flip_neg")),
             invalid_mode=str(_g("ppm_invalid_mode") or "static_limit"),
             fermi_reference=str(_g("fermi_reference")).strip().lower(),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
@@ -1030,15 +1008,7 @@ class LorraxConfig:
             gamma_contract_mode=str(_g("gamma_contract_mode")).strip().lower(),
         )
         debug = DebugConfig(
-            debug_hartree=bool(_g("debug_hartree")),
-            debug_omega=_g("debug_omega"),
             sigma_freq_debug_output=bool(_g("sigma_freq_debug_output")),
-            ppm_sigma_debug_static_norm=bool(_g("ppm_sigma_debug_static_norm")),
-            ppm_static_cohsex_check=bool(_g("ppm_static_cohsex_check")),
-            sigma_debug_quadrature=bool(_g("sigma_debug_quadrature")),
-            sigma_debug_quadrature_samples=int(_g("sigma_debug_quadrature_samples")),
-            write_w_copies_debug=bool(_g("write_w_copies_debug")),
-            w_copies_debug_file=str(_g("w_copies_debug_file") or ""),
             sigma_freq_debug_file=str(_g("sigma_freq_debug_file")),
             write_wfn_h5=bool(_g("write_wfn_h5")),
         )
