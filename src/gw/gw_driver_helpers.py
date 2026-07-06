@@ -25,9 +25,13 @@ class PPMSigmaRuntimeOptions:
     sigma_edge_factor: float
     sigma_omega_batch_size: int
     sigma_omega_accumulation: str
+    ppm_sigma_scale: float
+    ppm_sigma_flip_neg: bool
+    ppm_invalid_mode: str
     sigma_freq_debug_output: bool
     fermi_reference: str
     sigma_at_dft_extrapolate: bool
+    sigma_at_dft_energies: bool
     ppm_sigma_debug_static_norm: bool
     ppm_static_cohsex_check: bool
     sigma_debug_quadrature: bool
@@ -263,9 +267,13 @@ def build_ppm_sigma_runtime_options(
         sigma_edge_factor=float(ppm.window_edge_factor),
         sigma_omega_batch_size=int(max(1, ppm.omega_batch_size)),
         sigma_omega_accumulation=str(ppm.omega_accumulation).strip().lower(),
+        ppm_sigma_scale=float(ppm.sigma_scale),
+        ppm_sigma_flip_neg=bool(ppm.sigma_flip_neg),
+        ppm_invalid_mode=str(ppm.invalid_mode).strip().lower(),
         sigma_freq_debug_output=bool(debug.sigma_freq_debug_output),
         fermi_reference=str(ppm.fermi_reference).strip().lower(),
         sigma_at_dft_extrapolate=bool(ppm.sigma_at_dft_extrapolate),
+        sigma_at_dft_energies=bool(ppm.sigma_at_dft_energies),
         ppm_sigma_debug_static_norm=bool(debug.ppm_sigma_debug_static_norm),
         ppm_static_cohsex_check=bool(debug.ppm_static_cohsex_check),
         sigma_debug_quadrature=bool(debug.sigma_debug_quadrature),
