@@ -65,7 +65,7 @@ import enum
 
 from common import jax_profile
 from common.units import RYD_TO_EV
-from .minimax_config import MinimaxConfig, SigmaQuadratureConfig
+from .minimax_config import SigmaQuadratureConfig
 from .minimax_screening import (
     MinimaxNodes,
     fit_gn_ppm_from_wc_pair,

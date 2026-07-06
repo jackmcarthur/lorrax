@@ -19,9 +19,10 @@ import numpy as np
 from common import Meta, jax_profile
 from .minimax_config import MinimaxConfig
 from .minimax_screening import (
+    _TINY,
     LaplaceMinimaxQuadrature,
     MinimaxNodes,
-    build_static_minimax_window_pair,
+    solve_laplace_minimax_interval,
 )
 
 
@@ -454,8 +455,35 @@ def build_static_quadrature(wfns, minimax_config, *, print_fn=None):
     enk_c = wfns.enk[:, s.cond]
     e_ref = resolve_minimax_energy_reference(
         enk_v, enk_c, reference=minimax_config.energy_reference)
-    _, quad = build_static_minimax_window_pair(
-        enk_v, enk_c, minimax_config=minimax_config, print_fn=print_fn)
+
+    # Interval derivation for 1/x on the band-energy span [x_min, x_max].
+    # (Inlined from the former minimax_screening.build_static_minimax_window_pair;
+    #  the window-pair object it returned was discarded here — only ``quad`` is used.)
+    enk_v_host = np.asarray(jax.device_get(enk_v), dtype=np.float64)
+    enk_c_host = np.asarray(jax.device_get(enk_c), dtype=np.float64)
+    if enk_v_host.size == 0 or enk_c_host.size == 0:
+        raise ValueError(
+            "Cannot build minimax window with empty valence/conduction energies.")
+    vmin = float(np.min(enk_v_host))
+    vmax = float(np.max(enk_v_host))
+    cmin = float(np.min(enk_c_host))
+    cmax = float(np.max(enk_c_host))
+    x_min = max(cmin - vmax, _TINY)
+    x_max = max(cmax - vmin, x_min * (1.0 + 1.0e-9))
+    quad = solve_laplace_minimax_interval(
+        x_min,
+        x_max,
+        target_error=float(minimax_config.target_error),
+        max_nodes=int(minimax_config.max_nodes),
+        use_shipped_tables=bool(minimax_config.use_shipped_tables),
+    )
+    if print_fn is not None:
+        R = quad.x_max / quad.x_min
+        print_fn(
+            "  Minimax static window: "
+            f"x=[{quad.x_min:.6e}, {quad.x_max:.6e}] Ry, "
+            f"R={R:.2f}, nodes={quad.node_count}, fit_err~{quad.max_error:.3e}"
+        )
     return quad, e_ref
 
 
