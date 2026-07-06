@@ -319,6 +319,12 @@ def fit_head_ppm(
 
     if omega_h_sq <= 0.0:
         omega_h = abs(omega_h_sq) ** 0.5 if omega_h_sq != 0.0 else 1.0
+        # Bug fix (2026-07-04): B_h at L318 used the SIGNED (negative) omega_h_sq
+        # while omega_h = abs(...)^0.5 is positive, so R_h = B_h/(2 omega_h) came
+        # out sign-flipped vs the positive branch — the whole q->0 head Sigma_c
+        # (hundreds of meV) had the wrong sign whenever the GN head fit went
+        # imaginary.  Use the magnitude so |R_h| is continuous across Omega^2=0.
+        B_h = -w1 * abs(omega_h_sq)
         R_h = B_h / (2.0 * omega_h) if omega_h > 1.0e-30 else 0.0
         return HeadGNParams(
             omega_h_sq=omega_h_sq,

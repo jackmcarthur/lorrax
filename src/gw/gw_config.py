@@ -308,7 +308,10 @@ _DEFAULTS = {
     "sigma_omega_batch_size": 4,
     "sigma_omega_accumulation": "auto",
     # PPM sigma options
-    "ppm_invalid_mode": "static_limit",
+    # PPM invalid-pole treatment (BGW invalid_gpp_mode). Default 'zero' matches
+    # the code's actual behavior (drop Omega^2<0 poles). '2ry' keeps the fallback
+    # pole; 'static_limit'/'infinity' (BGW default) not yet wired — see ppm_sigma.
+    "ppm_invalid_mode": "zero",
     "fermi_reference": "midgap",
     "sigma_at_dft_extrapolate": False,
     "sigma_at_dft_energies": False,
@@ -563,7 +566,7 @@ class PPMConfig:
     omega_accumulation: str       # "auto" | "kij" | "kij_stream"
 
     # --- on-shell evaluation knobs ---
-    invalid_mode: str             # "static_limit"
+    invalid_mode: str             # "zero" | "2ry" | "static_limit"(TODO) | "infinity"(TODO)
     fermi_reference: str          # "midgap" | "vbm"
     sigma_at_dft_extrapolate: bool
     sigma_at_dft_energies: bool
@@ -922,7 +925,7 @@ class LorraxConfig:
             window_edge_factor=float(_g("sigma_window_edge_factor")),
             omega_batch_size=int(_g("sigma_omega_batch_size")),
             omega_accumulation=str(_g("sigma_omega_accumulation")).strip().lower(),
-            invalid_mode=str(_g("ppm_invalid_mode") or "static_limit"),
+            invalid_mode=str(_g("ppm_invalid_mode") or "zero"),
             fermi_reference=str(_g("fermi_reference")).strip().lower(),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
             sigma_at_dft_energies=bool(_g("sigma_at_dft_energies")),

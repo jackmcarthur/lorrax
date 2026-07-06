@@ -311,6 +311,7 @@ def _prepare_sigma_state(
     Omega_q: jax.Array,
     valid_mask_q: jax.Array,
     use_midgap: jax.Array,
+    keep_invalid: jax.Array,
 ) -> _SigmaPhysicsState:
     """Derive Fermi level + derived energy/PPM arrays in one fused trace.
 
@@ -319,6 +320,12 @@ def _prepare_sigma_state(
     ``jnp.asarray(fermi_reference == 'midgap')``.  ``valid_mask_q`` is always
     a real bool array (the caller substitutes ``jnp.ones_like(...)`` when
     no mask is available), so the helper doesn't branch on None.
+
+    ``keep_invalid`` is a traced bool implementing ``ppm_invalid_mode`` (BGW
+    ``invalid_gpp_mode``) for poles with fitted ``Omega^2 < 0``: False = drop
+    them (``B_mask &= valid``; BGW mode 0 / "zero"); True = keep the fit's
+    fallback pole at ``fallback_omega`` (default 2 Ry; BGW mode 2 / "2ry").
+    The static-COHSEX mode (BGW 3) is handled/rejected at the caller.
     """
     occ_mask = occ_full > 0.5
     unocc_mask = ~occ_mask
@@ -336,7 +343,9 @@ def _prepare_sigma_state(
     B_corr = jnp.asarray(B_q, dtype=jnp.complex128)
     B_mask_raw = Omega_abs > 1.0e-14
     valid = jnp.asarray(valid_mask_q, dtype=bool)
-    B_mask = B_mask_raw & valid
+    # ppm_invalid_mode: keep_invalid=False drops Omega^2<0 poles (BGW mode 0);
+    # keep_invalid=True keeps the fit's fallback pole (BGW mode 2).
+    B_mask = B_mask_raw & (valid | keep_invalid)
     invalid_mask = B_mask_raw & (~valid)
 
     return _SigmaPhysicsState(
@@ -1429,6 +1438,7 @@ def compute_sigma_c_ppm_omega_grid(
     omega_accumulation = getattr(ppm_options, 'sigma_omega_accumulation', 'auto')
     sigma_kij_h5_path = getattr(ppm_options, 'sigma_kij_h5_path', None)
     fermi_reference = getattr(ppm_options, 'fermi_reference', 'midgap')
+    invalid_mode = getattr(ppm_options, 'ppm_invalid_mode', 'zero')
 
     if nk != int(enk_full.shape[0]):
         raise ValueError(f"enk_full shape mismatch: expected first dim {nk}, got {enk_full.shape[0]}")
@@ -1452,6 +1462,26 @@ def compute_sigma_c_ppm_omega_grid(
     if fermi_reference not in ("vbm", "midgap"):
         raise ValueError("fermi_reference must be 'vbm' or 'midgap'.")
 
+    # ppm_invalid_mode (BGW ``invalid_gpp_mode``): how to treat poles whose
+    # fitted Omega^2 came out < 0.  'zero'/'skip' drop them (BGW mode 0);
+    # '2ry' keeps the fit's fallback_omega pole (default 2 Ry, BGW mode 2).
+    # 'static_limit'/'infinity' (BGW mode 3, the BGW default) needs a static
+    # -1/2 Wc0 term not yet wired; 'imaginary' (BGW mode 1) needs complex Omega.
+    invalid_mode = str(invalid_mode).strip().lower()
+    if invalid_mode in ("static_limit", "infinity"):
+        raise NotImplementedError(
+            f"ppm_invalid_mode={invalid_mode!r} (BGW invalid_gpp_mode=3, static COHSEX) "
+            "needs the static -1/2*Wc0 Coulomb-hole term (Wc0 = B_q/Omega_q) added to the "
+            "diagonal Sigma_c; not yet wired. Use 'zero' (drop, BGW mode 0) or '2ry' "
+            "(keep the fallback_omega pole, BGW mode 2).")
+    if invalid_mode == "imaginary":
+        raise NotImplementedError(
+            "ppm_invalid_mode='imaginary' (BGW mode 1) needs a complex-Omega path.")
+    if invalid_mode not in ("zero", "skip", "2ry"):
+        raise ValueError(
+            f"ppm_invalid_mode must be zero/skip/2ry/static_limit/infinity; got {invalid_mode!r}")
+    keep_invalid = invalid_mode == "2ry"
+
     # Derive Fermi level, energy/band masks, and PPM pole masks in one fused trace.
     # valid_mask_q=None → all-true mask at the caller so the jit sees a real array.
     if valid_mask_q is None:
@@ -1459,6 +1489,7 @@ def compute_sigma_c_ppm_omega_grid(
     state = _prepare_sigma_state(
         enk_full, occ_full, B_q, Omega_q, valid_mask_q,
         jnp.asarray(fermi_reference == "midgap", dtype=bool),
+        jnp.asarray(keep_invalid, dtype=bool),
     )
     efermi = state.efermi
     E_cond = state.E_cond
