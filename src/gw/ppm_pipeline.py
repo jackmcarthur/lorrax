@@ -28,8 +28,7 @@ import common.timing as timing
 
 from .gw_config import ComputeMode, LorraxConfig
 from .gw_driver_helpers import (
-    PPMSigmaRuntimeOptions,
-    build_ppm_sigma_runtime_options,
+    _resolve_input_path,
     profile_section,
 )
 from .head_correction import HeadResolver
@@ -50,7 +49,6 @@ class PPMOutputs:
     omega_dft_rel_ev: np.ndarray | None    # (nk, nb)  E_DFT - E_F  (eV)
     efermi_dft_ev: float | None
     sigma_omega_h5_path: str
-    ppm_options: PPMSigmaRuntimeOptions
     # Diagonal of the analytic q→0 head added to ``sigma_c_omega`` — kept
     # separately for diagnostic printing (the head is band-diagonal so the
     # decomposition is lossless).  ``None`` when no head was injected.
@@ -108,7 +106,7 @@ def _fit_head_correction(
 
 def _inject_analytic_head(
     sigma_c_omega: jax.Array | None, head_gn, *,
-    ppm_options: PPMSigmaRuntimeOptions,
+    config: LorraxConfig,
     band_slices,
     wfn, sym, meta,
     sigma_kij_h5_path: str | None,
@@ -145,7 +143,7 @@ def _inject_analytic_head(
 
     head_sigma_kij_ry = compute_ppm_head_sigma_kij(
         head_gn,
-        omega_grid_ry=np.asarray(ppm_options.omega_grid_ry, dtype=np.float64),
+        omega_grid_ry=np.asarray(config.omega_grid_ry, dtype=np.float64),
         enk_ry=enk_full_np,
         efermi_ry=efermi_ry,
         n_occ=n_occ,
@@ -184,7 +182,7 @@ def _inject_analytic_head(
             # zero, so adding the full (nω, nk, nb, nb) tile touches only the
             # band-diagonal — bit-identical to the in-memory path's tensor add.
             # ω-batch the read-modify-write to match the chunked dataset.
-            batch = int(max(1, getattr(ppm_options, 'sigma_omega_batch_size', 4)))
+            batch = int(max(1, config.ppm.omega_batch_size))
             with h5py.File(sigma_kij_h5_path, "r+") as h5:
                 if bool(h5.attrs.get("head_injected", False)):
                     print_fn(
@@ -207,7 +205,7 @@ def _inject_analytic_head(
 def _eval_sigma_c_at_dft_energies(
     sigma_c_omega: jax.Array | None,
     sigma_omega: 'object', *,                          # noqa: F821 (forward decl)
-    ppm_options: PPMSigmaRuntimeOptions,
+    config: LorraxConfig,
     sig_x: jax.Array,
     band_slices, wfn, sym, meta, mesh_xy,
     print_fn,
@@ -239,7 +237,7 @@ def _eval_sigma_c_at_dft_energies(
         f"(VBM={vbm_ev:.6f}, CBM={cbm_ev:.6f})"
     )
 
-    omega_ev = np.asarray(ppm_options.omega_grid_ev, dtype=np.float64)
+    omega_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
     if sigma_c_omega is not None:
         from .qsgw_utils import extract_sigma_diag_replicated
         sig_c_diag = (
@@ -275,9 +273,8 @@ def _eval_sigma_c_at_dft_energies(
 
 
 def _write_sigma_omega_h5(
-    sigma_c_omega: jax.Array | None,
-    sigma_omega: 'object', *,                          # noqa: F821
-    ppm_options: PPMSigmaRuntimeOptions,
+    sigma_c_omega: jax.Array | None, *,
+    sigma_kij_h5_path: str | None,
     sig_x: jax.Array,
     sig_h: jax.Array,
     config: LorraxConfig,
@@ -285,7 +282,11 @@ def _write_sigma_omega_h5(
     meta,
     mesh_xy,
 ) -> str:
-    """Write the canonical sigma_mnk.h5 file (one writer, two backends)."""
+    """Write the canonical sigma_mnk.h5 file (one writer, two backends).
+
+    ``sigma_kij_h5_path`` is the streamed-Σ_c source (or ``None`` for the
+    in-memory path, which the SC end-of-run writer always takes).
+    """
     import os
     from file_io import (
         copy_sigma_kij_h5_to_omega_h5,
@@ -300,21 +301,21 @@ def _write_sigma_omega_h5(
         # SlabIO handles rank-0 dispatch internally; both backends need
         # all ranks to enter, so no ``if rank == 0`` guard.
         write_sigma_omega_h5(
-            out_path, ppm_options.omega_grid_ev, None,
+            out_path, config.omega_grid_ev, None,
             sigma_c_kij_ev=RYD_TO_EV * sigma_c_omega,
             sigma_sx_kij_ev=RYD_TO_EV * sig_x,
             hartree_kij_ev=RYD_TO_EV * sig_h,
             mesh=mesh_xy,
             backend=config.backend.slab_io,
         )
-    elif meta.rank == 0 and sigma_omega.sigma_kij_h5_path:
+    elif meta.rank == 0 and sigma_kij_h5_path:
         copy_sigma_kij_h5_to_omega_h5(
-            sigma_omega.sigma_kij_h5_path,
+            sigma_kij_h5_path,
             out_path,
-            ppm_options.omega_grid_ev,
+            config.omega_grid_ev,
             sigma_sx_kij_ev=sig_x,
             hartree_kij_ev=sig_h,
-            omega_batch_size=ppm_options.sigma_omega_batch_size,
+            omega_batch_size=int(max(1, config.ppm.omega_batch_size)),
         )
     return out_path
 
@@ -363,7 +364,10 @@ def compute_ppm_sigma_pipeline(
     if not config.do_screened:
         raise ValueError("PPM Σ^c pipeline requires do_screened=true.")
 
-    ppm_options = build_ppm_sigma_runtime_options(config, input_dir=input_dir)
+    # Resolve the streamed-Σ_c h5 path at the driver seam (input_dir lives
+    # here); "" normalizes to None so the kernel contract is str | None.
+    sigma_kij_h5_path = _resolve_input_path(
+        input_dir, str(config.paths.sigma_kij_h5_file or "").strip()) or None
     label = "HL-PPM" if config.compute_mode is ComputeMode.HL_PPM else "GN-PPM"
     from .gw_output import print_section
     print_section(f"{label} + FREQUENCY-INTEGRATED SIGMA", print_fn)
@@ -392,8 +396,11 @@ def compute_ppm_sigma_pipeline(
             precompile_sigma(wfns, ppm, meta, mesh_xy)
         with timing.section("sigma.exec"), profile_section("sigma_ppm", print_fn=print_fn):
             sigma_omega = compute_sigma_c_ppm_omega_grid(
-                wfns, ppm, meta, mesh_xy, ppm_options,
-                sigma_window_quad=config.sigma_quadrature_config,
+                wfns, ppm, meta, mesh_xy,
+                ppm_cfg=config.ppm,
+                quad=config.sigma_quadrature_config,
+                omega_grid_ry=config.omega_grid_ry,
+                sigma_kij_h5_path=sigma_kij_h5_path,
                 print_fn=print_fn,
             )
         sigma_c_omega = sigma_omega.sigma_c_kij  # None if streamed
@@ -405,7 +412,7 @@ def compute_ppm_sigma_pipeline(
         )
         sigma_c_omega, head_sigma_diag_w_kn_ry = _inject_analytic_head(
             sigma_c_omega, head_gn,
-            ppm_options=ppm_options, band_slices=band_slices,
+            config=config, band_slices=band_slices,
             wfn=wfn, sym=sym, meta=meta,
             sigma_kij_h5_path=sigma_omega.sigma_kij_h5_path,
             print_fn=print_fn,
@@ -417,7 +424,7 @@ def compute_ppm_sigma_pipeline(
          omega_dft_rel_ev,
          efermi_dft_ev) = _eval_sigma_c_at_dft_energies(
             sigma_c_omega, sigma_omega,
-            ppm_options=ppm_options, sig_x=sig_x,
+            config=config, sig_x=sig_x,
             band_slices=band_slices, wfn=wfn, sym=sym, meta=meta,
             mesh_xy=mesh_xy,
             print_fn=print_fn,
@@ -428,8 +435,9 @@ def compute_ppm_sigma_pipeline(
         # sigma_c_omega from the final SigmaResult).
         if write_sigma_omega_h5:
             sigma_omega_h5_path = _write_sigma_omega_h5(
-                sigma_c_omega, sigma_omega,
-                ppm_options=ppm_options, sig_x=sig_x, sig_h=sig_h,
+                sigma_c_omega,
+                sigma_kij_h5_path=sigma_omega.sigma_kij_h5_path,
+                sig_x=sig_x, sig_h=sig_h,
                 config=config, input_dir=input_dir,
                 meta=meta, mesh_xy=mesh_xy,
             )
@@ -447,6 +455,5 @@ def compute_ppm_sigma_pipeline(
         omega_dft_rel_ev=omega_dft_rel_ev,
         efermi_dft_ev=efermi_dft_ev,
         sigma_omega_h5_path=sigma_omega_h5_path,
-        ppm_options=ppm_options,
         head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
     )

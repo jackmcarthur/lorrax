@@ -20,10 +20,10 @@ The top-level ``LorraxConfig`` retains only system geometry
 mode flags (``compute_mode`` / ``self_consistent`` / etc.) that the
 driver reads on the fast path.
 
-Derived sub-objects (the math-internal ``MinimaxConfig`` and
-``SigmaQuadratureConfig`` from ``minimax_config.py``, plus
-``PPMSigmaRuntimeOptions`` from ``gw_driver_helpers.py``) are still
-constructed on demand via ``LorraxConfig`` properties.
+Derived sub-objects (the math-internal ``MinimaxConfig`` from
+``minimax_config.py``, one instance per quadrature consumer) and derived
+data (the Σ_c(ω) grid) are constructed on demand via ``LorraxConfig``
+properties.
 """
 
 from __future__ import annotations
@@ -571,6 +571,29 @@ class PPMConfig:
     sigma_at_dft_extrapolate: bool
     sigma_at_dft_energies: bool
 
+    def __post_init__(self):
+        # Validate scalar knobs once, at the parse site (values are already
+        # normalized in ``from_input_file``).  Capability gating for
+        # invalid_mode (static_limit/infinity → NotImplementedError until
+        # Wc0 retention lands) stays in the Σ^c kernel — this checks only
+        # that the *value* is recognized.
+        if self.omega_step_ev <= 0.0:
+            raise ValueError("ppm.omega_step_ev must be > 0.")
+        if self.omega_max_ev < self.omega_min_ev:
+            raise ValueError("ppm.omega_max_ev must be >= ppm.omega_min_ev.")
+        if self.fermi_reference not in ("vbm", "midgap"):
+            raise ValueError("ppm.fermi_reference must be 'vbm' or 'midgap'.")
+        if self.omega_accumulation not in ("auto", "kij", "kij_stream"):
+            raise ValueError(
+                "ppm.omega_accumulation must be auto/kij/kij_stream.")
+        if self.invalid_mode not in (
+            "zero", "skip", "2ry", "static_limit", "infinity", "imaginary"
+        ):
+            raise ValueError(
+                f"ppm.invalid_mode: unknown value {self.invalid_mode!r}")
+        if self.omega_batch_size < 1:
+            raise ValueError("ppm.omega_batch_size must be >= 1.")
+
 
 @dataclass(frozen=True)
 class MemoryConfig:
@@ -746,9 +769,9 @@ class LorraxConfig:
 
     @property
     def sigma_quadrature_config(self):
-        """Math-internal :class:`gw.minimax_config.SigmaQuadratureConfig`."""
-        from .minimax_config import SigmaQuadratureConfig
-        return SigmaQuadratureConfig(
+        """Math-internal :class:`gw.minimax_config.MinimaxConfig` for Σ^c."""
+        from .minimax_config import MinimaxConfig
+        return MinimaxConfig(
             target_error=self.ppm.sigma_target_error,
             max_nodes=self.ppm.sigma_max_nodes,
             crossing_max_nodes=max(500, self.ppm.sigma_max_nodes),
@@ -757,22 +780,22 @@ class LorraxConfig:
         )
 
     @property
-    def omega_grid_ry(self):
-        """Σ_c(ω) frequency grid in Rydberg."""
-        return np.arange(
-            self.ppm.omega_min_ev / RYD_TO_EV,
-            (self.ppm.omega_max_ev + 0.5 * self.ppm.omega_step_ev) / RYD_TO_EV,
-            self.ppm.omega_step_ev / RYD_TO_EV,
-        )
+    def omega_grid_ev(self):
+        """Σ_c(ω) frequency grid in eV (length-stable single formula).
+
+        ``n = floor((max−min)/step + 0.5) + 1`` — the Ry grid is derived
+        from this one by division so the two can never disagree in length
+        or accumulate independent float-step rounding.
+        """
+        p = self.ppm
+        n = int(np.floor(
+            (p.omega_max_ev - p.omega_min_ev) / p.omega_step_ev + 0.5)) + 1
+        return p.omega_min_ev + p.omega_step_ev * np.arange(n, dtype=np.float64)
 
     @property
-    def omega_grid_ev(self):
-        """Σ_c(ω) frequency grid in eV."""
-        return np.arange(
-            self.ppm.omega_min_ev,
-            self.ppm.omega_max_ev + 0.5 * self.ppm.omega_step_ev,
-            self.ppm.omega_step_ev,
-        )
+    def omega_grid_ry(self):
+        """Σ_c(ω) frequency grid in Rydberg (derived from the eV grid)."""
+        return self.omega_grid_ev / RYD_TO_EV
 
     # ------------------------------------------------------------------
     #  Back-compat aliases — the FFI/IO group changed semantics (bool /
@@ -925,7 +948,7 @@ class LorraxConfig:
             window_edge_factor=float(_g("sigma_window_edge_factor")),
             omega_batch_size=int(_g("sigma_omega_batch_size")),
             omega_accumulation=str(_g("sigma_omega_accumulation")).strip().lower(),
-            invalid_mode=str(_g("ppm_invalid_mode") or "zero"),
+            invalid_mode=str(_g("ppm_invalid_mode") or "zero").strip().lower(),
             fermi_reference=str(_g("fermi_reference")).strip().lower(),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
             sigma_at_dft_energies=bool(_g("sigma_at_dft_energies")),

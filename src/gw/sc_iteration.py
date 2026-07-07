@@ -662,18 +662,12 @@ def dump_sigma_omega_h5_final(
     if sigma_result is None or sigma_result.sigma_c_omega_kij_ry is None:
         return None
     from .ppm_pipeline import _write_sigma_omega_h5
-    from .gw_driver_helpers import build_ppm_sigma_runtime_options
-    from types import SimpleNamespace
 
-    ppm_options = build_ppm_sigma_runtime_options(config, input_dir=input_dir)
-    # _write_sigma_omega_h5 accepts an ``sigma_omega`` object whose
-    # only consulted attribute is ``sigma_kij_h5_path`` (used by the
-    # streamed-fallback branch); the in-memory branch we always hit
-    # here doesn't read it.  Stub it for shape compatibility.
-    sigma_omega_stub = SimpleNamespace(sigma_kij_h5_path=None)
+    # Converged SC always writes from the in-memory Σ_c tensor
+    # (sigma_c_omega_kij_ry is not None here), so no streamed source.
     path = _write_sigma_omega_h5(
-        sigma_result.sigma_c_omega_kij_ry, sigma_omega_stub,
-        ppm_options=ppm_options,
+        sigma_result.sigma_c_omega_kij_ry,
+        sigma_kij_h5_path=None,
         sig_x=sigma_result.sigma_x_kij_ry,
         sig_h=sigma_result.v_h_kij_ry,
         config=config, input_dir=input_dir,

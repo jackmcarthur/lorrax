@@ -65,7 +65,8 @@ import enum
 
 from common import jax_profile
 from common.units import RYD_TO_EV
-from .minimax_config import SigmaQuadratureConfig
+from .gw_config import PPMConfig
+from .minimax_config import MinimaxConfig
 from .minimax_screening import (
     MinimaxNodes,
     fit_gn_ppm_from_wc_pair,
@@ -1399,12 +1400,21 @@ def compute_sigma_c_ppm_omega_grid(
     ppm,
     meta,
     mesh_xy: Mesh,
-    ppm_options,
     *,
-    sigma_window_quad: SigmaQuadratureConfig | None = None,
+    ppm_cfg: PPMConfig,
+    quad: MinimaxConfig,
+    omega_grid_ry: np.ndarray,
+    sigma_kij_h5_path: str | None,
     print_fn=print,
 ) -> SigmaOmegaResult:
-    """Compute Σ^c_kij(ω) via GN-PPM windowed minimax integration."""
+    """Compute Σ^c_kij(ω) via GN-PPM windowed minimax integration.
+
+    Config seam (WS2): scalar knobs are read by direct attribute access
+    off the validated frozen ``ppm_cfg`` (no ``getattr(..., default)`` —
+    a stale/typo'd name must raise, not silently default); the derived
+    ω-grid and the input_dir-resolved h5 path arrive as explicit data
+    arguments.  ``ppm_cfg``/``quad`` never travel below this driver.
+    """
 
     s = wfns.slices
     psi_proj_xr = wfns.xr(s.sigma)
@@ -1412,33 +1422,28 @@ def compute_sigma_c_ppm_omega_grid(
     occ_full = wfns.occ[:, s.full]
     B_q = ppm.B_q
     Omega_q = ppm.Omega_q
-    valid_mask_q = getattr(ppm, 'valid_mask_q', None)
-    omega_values_ry = ppm_options.omega_grid_ry
+    valid_mask_q = ppm.valid_mask_q
+    omega_values_ry = omega_grid_ry
 
     # Flat nk is used throughout this driver; (nkx, nky, nkz) only flows
     # into the kernel factory (tau_kernel) below — it's already the
     # kernel's cache key, so we don't unpack kgrid here at the driver.
     nk = int(meta.nk_tot)
 
-    # Quadrature config
-    if sigma_window_quad is not None:
-        target_error = float(sigma_window_quad.target_error)
-        max_nodes = int(sigma_window_quad.max_nodes)
-        crossing_max_nodes = int(sigma_window_quad.crossing_max_nodes)
-        crossing_eps_q = float(sigma_window_quad.crossing_eps_q)
-        use_shipped_minimax_tables = bool(sigma_window_quad.use_shipped_tables)
-    else:
-        target_error, max_nodes = 1e-6, 64
-        crossing_max_nodes, crossing_eps_q = 500, 1e-3
-        use_shipped_minimax_tables = True
+    # Quadrature config (required — one merged MinimaxConfig instance).
+    target_error = float(quad.target_error)
+    max_nodes = int(quad.max_nodes)
+    crossing_max_nodes = int(quad.crossing_max_nodes)
+    crossing_eps_q = float(quad.crossing_eps_q)
+    use_shipped_minimax_tables = bool(quad.use_shipped_tables)
 
-    regularization_width_ry = getattr(ppm_options, 'sigma_regularization_ry', 0.018374661087827496)
-    edge_factor = getattr(ppm_options, 'sigma_edge_factor', 1.5)
-    omega_batch_size = getattr(ppm_options, 'sigma_omega_batch_size', 4)
-    omega_accumulation = getattr(ppm_options, 'sigma_omega_accumulation', 'auto')
-    sigma_kij_h5_path = getattr(ppm_options, 'sigma_kij_h5_path', None)
-    fermi_reference = getattr(ppm_options, 'fermi_reference', 'midgap')
-    invalid_mode = getattr(ppm_options, 'ppm_invalid_mode', 'zero')
+    # Scalar knobs — direct reads off the validated frozen PPMConfig.
+    regularization_width_ry = float(ppm_cfg.regularization_ev) / RYD_TO_EV
+    edge_factor = float(ppm_cfg.window_edge_factor)
+    omega_batch_size = int(ppm_cfg.omega_batch_size)
+    omega_accumulation = ppm_cfg.omega_accumulation
+    fermi_reference = ppm_cfg.fermi_reference
+    invalid_mode = ppm_cfg.invalid_mode
 
     if nk != int(enk_full.shape[0]):
         raise ValueError(f"enk_full shape mismatch: expected first dim {nk}, got {enk_full.shape[0]}")
@@ -1447,9 +1452,6 @@ def compute_sigma_c_ppm_omega_grid(
     if omega_req.ndim != 1 or omega_req.size == 0:
         raise ValueError("omega_values_ry must be a 1D non-empty array.")
     omega_batch_size = int(max(1, omega_batch_size))
-    omega_accumulation = str(omega_accumulation).strip().lower()
-    if omega_accumulation not in ("auto", "kij", "kij_stream"):
-        raise ValueError("omega_accumulation must be one of: auto, kij, kij_stream.")
 
     # Split omega grid into positive and negative relative to Fermi level
     idx_pos = np.where(omega_req >= 0.0)[0]
@@ -1457,10 +1459,8 @@ def compute_sigma_c_ppm_omega_grid(
     omega_pos = np.asarray(omega_req[idx_pos], dtype=np.float64)
     omega_neg_abs = np.asarray(-omega_req[idx_neg], dtype=np.float64)
 
-    # Fermi reference validation (string → traced bool for the jit)
-    fermi_reference = str(fermi_reference).strip().lower()
-    if fermi_reference not in ("vbm", "midgap"):
-        raise ValueError("fermi_reference must be 'vbm' or 'midgap'.")
+    # fermi_reference / omega_accumulation are validated + normalized at
+    # PPMConfig construction; used directly here (fermi → traced bool below).
 
     # ppm_invalid_mode (BGW ``invalid_gpp_mode``): how to treat poles whose
     # fitted Omega^2 came out < 0.  'zero'/'skip' drop them (BGW mode 0);

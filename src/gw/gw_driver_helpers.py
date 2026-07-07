@@ -2,36 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
 from typing import Callable, Optional
 
 import h5py
 import numpy as np
 
-from common.units import RYD_TO_EV
 from .gw_config import LorraxConfig, SlabIOBackend
-
-
-@dataclass(frozen=True)
-class PPMSigmaRuntimeOptions:
-    """Resolved PPM sigma options parsed once in the GW driver."""
-
-    omega_p_ry: float
-    ppm_fallback: float
-    omega_grid_ev: np.ndarray
-    omega_grid_ry: np.ndarray
-    sigma_regularization_ry: float
-    sigma_edge_factor: float
-    sigma_omega_batch_size: int
-    sigma_omega_accumulation: str
-    ppm_invalid_mode: str
-    sigma_freq_debug_output: bool
-    fermi_reference: str
-    sigma_at_dft_extrapolate: bool
-    sigma_at_dft_energies: bool
-    sigma_kij_h5_path: str
-    sigma_freq_debug_file: str
 
 
 def _resolve_input_path(input_dir: str, path: str) -> str:
@@ -225,45 +202,3 @@ def build_bgw_v_grid_fn(
         )
 
     return bgw_v_grid_fn
-
-
-def build_ppm_sigma_runtime_options(
-    config: LorraxConfig, *, input_dir: str
-) -> PPMSigmaRuntimeOptions:
-    """Build PPM sigma runtime options from a ``LorraxConfig``."""
-    ppm = config.ppm
-    debug = config.debug
-
-    if ppm.omega_step_ev <= 0.0:
-        raise ValueError("ppm.omega_step_ev must be > 0.")
-    if ppm.omega_max_ev < ppm.omega_min_ev:
-        raise ValueError("ppm.omega_max_ev must be >= ppm.omega_min_ev.")
-    if ppm.fermi_reference not in ("vbm", "midgap"):
-        raise ValueError("ppm.fermi_reference must be 'vbm' or 'midgap'.")
-
-    n_omega = int(np.floor(
-        (ppm.omega_max_ev - ppm.omega_min_ev) / ppm.omega_step_ev + 0.5
-    )) + 1
-    omega_grid_ev = (
-        ppm.omega_min_ev + ppm.omega_step_ev * np.arange(n_omega, dtype=np.float64)
-    )
-    omega_grid_ry = omega_grid_ev / RYD_TO_EV
-    sigma_regularization_ry = ppm.regularization_ev / RYD_TO_EV
-
-    return PPMSigmaRuntimeOptions(
-        omega_p_ry=float(ppm.omega_p),
-        ppm_fallback=float(ppm.fallback_omega),
-        omega_grid_ev=omega_grid_ev,
-        omega_grid_ry=omega_grid_ry,
-        sigma_regularization_ry=sigma_regularization_ry,
-        sigma_edge_factor=float(ppm.window_edge_factor),
-        sigma_omega_batch_size=int(max(1, ppm.omega_batch_size)),
-        sigma_omega_accumulation=str(ppm.omega_accumulation).strip().lower(),
-        ppm_invalid_mode=str(ppm.invalid_mode).strip().lower(),
-        sigma_freq_debug_output=bool(debug.sigma_freq_debug_output),
-        fermi_reference=str(ppm.fermi_reference).strip().lower(),
-        sigma_at_dft_extrapolate=bool(ppm.sigma_at_dft_extrapolate),
-        sigma_at_dft_energies=bool(ppm.sigma_at_dft_energies),
-        sigma_kij_h5_path=_resolve_input_path(input_dir, str(config.paths.sigma_kij_h5_file or "").strip()),
-        sigma_freq_debug_file=_resolve_input_path(input_dir, str(debug.sigma_freq_debug_file or "").strip()),
-    )

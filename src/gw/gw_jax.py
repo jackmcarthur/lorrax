@@ -448,10 +448,10 @@ def main(argv=None):
 	head_sigma_diag_w_kn_ry = (
 		ppm_outputs.head_sigma_diag_w_kn_ry if ppm_outputs else None)
 	omega_grid_ev = (
-		np.asarray(ppm_outputs.ppm_options.omega_grid_ev, dtype=np.float64)
+		np.asarray(config.omega_grid_ev, dtype=np.float64)
 		if ppm_outputs else None)
 	omega_grid_ry = (
-		np.asarray(ppm_outputs.ppm_options.omega_grid_ry, dtype=np.float64)
+		np.asarray(config.omega_grid_ry, dtype=np.float64)
 		if ppm_outputs else None)
 	del ppm_outputs                              # all fields now in bare locals
 

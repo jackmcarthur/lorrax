@@ -224,7 +224,7 @@ def compute_sigma_xc(
     # QSGW Σ_xc^QSGW evaluated at e_qp_ev.  Static Σ_x is added inside
     # the kernel, so the result already includes Σ_x.
     omega_grid_ev = np.asarray(
-        ppm_outputs.ppm_options.omega_grid_ev, dtype=np.float64)
+        config.omega_grid_ev, dtype=np.float64)
     efermi_ry = float(wfn.efermi)
     e_qp_rel_ev = np.asarray(e_qp_ev, dtype=np.float64) - efermi_ry * RYD_TO_EV
     sig_x_rep = jax.device_put(jnp.asarray(sig_x),
@@ -243,8 +243,8 @@ def compute_sigma_xc(
         sigma_c_omega_kij_ry=ppm_outputs.sigma_c_omega,
         sigma_c_at_dft_diag_ev=ppm_outputs.sigma_c_at_dft_ev,
         omega_dft_rel_ev=ppm_outputs.omega_dft_rel_ev,
-        omega_grid_ev=ppm_outputs.ppm_options.omega_grid_ev,
-        omega_grid_ry=ppm_outputs.ppm_options.omega_grid_ry,
+        omega_grid_ev=config.omega_grid_ev,
+        omega_grid_ry=config.omega_grid_ry,
         head_sigma_diag_w_kn_ry=ppm_outputs.head_sigma_diag_w_kn_ry,
         sigma_omega_h5_path=ppm_outputs.sigma_omega_h5_path,
     )
