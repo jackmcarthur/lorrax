@@ -67,7 +67,7 @@ def _build_branch_windows():
     """
     import jax.numpy as jnp
     from common.units import RYD_TO_EV
-    from gw.ppm_sigma import _build_windows_for_branch, _iter_branches
+    from gw.ppm_windows import _build_windows_for_branch, _iter_branches
 
     nk, nb = 2, 6                       # 3 valence + 3 conduction bands
     # E_cond (conduction) and H_val (valence) energies-above-Fermi (Ry),

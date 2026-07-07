@@ -35,8 +35,8 @@ from .head_correction import HeadResolver
 from .ppm_sigma import (
     compute_sigma_c_ppm_omega_grid,
     fit_ppm,
-    precompile_sigma,
 )
+from .ppm_tau_kernel import precompile_sigma
 
 
 @dataclass(frozen=True)
