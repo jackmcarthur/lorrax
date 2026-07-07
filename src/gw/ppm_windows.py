@@ -10,16 +10,22 @@ imports back.
 Branch decomposition
 --------------------
 
-Four branches span ω ∈ ℝ:
+Four branches span ω ∈ ℝ: {conduction/empty, valence/occupied} A-space ×
+{+ω, −ω} half.  Each branch is a definite-sign Laplace problem; a branch
+carries only its physical identity ``(space, neg_omega_half)`` — the signs
+that make Σ_c correct are written inline where the physics puts them, not
+stored as ±1 fields.  The pole S = E_A + Ω enters the Σ_c denominator either
+as (ω̃ − S), when S can coincide with a grid ω and the crossing (HGL)
+quadrature is needed, or as the sign-definite (ω̃ + S), a single Laplace
+window.  On the +ω half the conduction (empty) A-space is the crossing one;
+on the −ω half — where Σ_c is evaluated at |ω| with an overall −1 baked into
+each window's prefactor — the valence (occupied) A-space is.
 
-    (+ω, cond, kernel_sign=+1, scale=+1)   standard Laplace on E_A = E_c - E_F
-    (+ω, val,  kernel_sign=-1, scale=+1)   sign-flipped kernel for H_val = E_F - E_v
-    (-ω, cond, kernel_sign=-1, scale=-1)   evaluated at |ω|, symmetry factor -1
-    (-ω, val,  kernel_sign=+1, scale=-1)   evaluated at |ω|, symmetry factor -1
-
-Within each +ω branch the conduction kernel factors through a three-window
-decomposition (Laplace core + crossing stripe + tail slab) when the ω range
-is non-trivial; val and -ω branches use a single Laplace window.
+The −ω branches are computed explicitly, term by term; they are NOT the
+conjugate of the +ω result.  (The often-quoted *global* identity
+Σ_c(−ω) = −[Σ_c(ω)]* is false — the ω→−ω reflection holds only per pole
+term, which is exactly what swaps the crossing role between the conduction
+and valence A-spaces above.)
 """
 
 from __future__ import annotations
@@ -74,12 +80,19 @@ class _SigmaWindow:
 # ---------------------------------------------------------------------------
 
 class _SigmaBranch(NamedTuple):
-    """One branch of the Σ_c(ω) sum.  Four branches cover ω ∈ ℝ."""
+    """One branch of the Σ_c(ω) sum.  Four branches cover ω ∈ ℝ.
+
+    A branch stores only its physical identity — which A-space it sums and
+    which ω half it covers.  The signs (which way the pole enters the
+    denominator, the −1 that the −ω half carries) are derived from
+    ``(space, neg_omega_half)`` at each expression that needs them; see
+    ``_build_windows_for_branch``.
+    """
     tag: str                    # human label ("ω≥E_F cond" etc.) — drives progress output
     E_A: jax.Array              # (nk, nb) energy-above-Fermi for A-space (E_cond or H_val)
     base_mask_A: jax.Array      # (nk, nb) bool — which bands in A-space contribute
-    kernel_sign: int            # +1 (Laplace on E_A ≥ 0)  /  -1 (sign-flipped kernel)
-    scale: float                # global prefactor from ω ↔ -ω symmetry (±1)
+    space: str                  # "cond" (empty A-space, E_c−E_F) / "val" (occupied, E_F−E_v)
+    neg_omega_half: bool        # True on the −ω half — Σ_c evaluated at |ω|
     omega_abs: np.ndarray       # non-negative ω values to evaluate at (|ω_rel|)
     omega_idx: np.ndarray       # global ω indices these map into
 
@@ -91,34 +104,37 @@ def _iter_branches(
     E_cond: jax.Array, H_val: jax.Array,
     cond_mask: jax.Array, val_mask: jax.Array,
 ) -> list[_SigmaBranch]:
-    """Enumerate the 4 branches, skipping empty ω halves.
+    """Enumerate the 4 branches (A-space × ω-half), skipping empty ω halves.
 
-    Why the flipped signs?
+    Each branch is one definite-sign Laplace problem.  The +ω half sums Σ_c
+    directly on E_A = E_c−E_F (cond) or E_F−E_v (val); the −ω half evaluates at
+    |ω| and carries an overall −1.  No sign is stored here — the branch's
+    identity ``(space, neg_omega_half)`` is what the window builder reads to
+    place the pole in the denominator (crossing vs sign-definite) and to fold
+    the −ω-half −1 into each window's prefactor.
 
-        +ω  half:  Σ_c is a Laplace transform on E_A = E_c - E_F  (kernel_sign=+1).
-                   For the val space, E_A = E_F - E_v ≥ 0 but the kernel picks up
-                   the opposite sign so kernel_sign=-1 on the val side.
-        -ω  half:  evaluate at |ω| and exploit Σ_c(-ω) = -[Σ_c(ω)]^* for the same
-                   (E_A, mask) structure.  This means scale=-1 globally and
-                   kernel_sign swaps between cond and val relative to the +ω half.
+    The two −ω branches are built and integrated explicitly, exactly like the
+    +ω ones — they are not conjugated from the +ω result (the global
+    Σ_c(−ω) = −[Σ_c(ω)]* identity does not hold; the reflection is per pole
+    term, which is why the crossing role moves from cond to val across halves).
     """
     branches: list[_SigmaBranch] = []
     if omega_pos.size:
         branches += [
             _SigmaBranch(tag="ω≥E_F cond", E_A=E_cond, base_mask_A=cond_mask,
-                         kernel_sign=+1, scale=+1.0,
+                         space="cond", neg_omega_half=False,
                          omega_abs=omega_pos, omega_idx=idx_pos),
             _SigmaBranch(tag="ω≥E_F val",  E_A=H_val,  base_mask_A=val_mask,
-                         kernel_sign=-1, scale=+1.0,
+                         space="val",  neg_omega_half=False,
                          omega_abs=omega_pos, omega_idx=idx_pos),
         ]
     if omega_neg_abs.size:
         branches += [
             _SigmaBranch(tag="ω<E_F cond", E_A=E_cond, base_mask_A=cond_mask,
-                         kernel_sign=-1, scale=-1.0,
+                         space="cond", neg_omega_half=True,
                          omega_abs=omega_neg_abs, omega_idx=idx_neg),
             _SigmaBranch(tag="ω<E_F val",  E_A=H_val,  base_mask_A=val_mask,
-                         kernel_sign=+1, scale=-1.0,
+                         space="val",  neg_omega_half=True,
                          omega_abs=omega_neg_abs, omega_idx=idx_neg),
         ]
     return branches
@@ -182,7 +198,8 @@ def _build_single_sigma_window(
     mask_B_min: float | None,
     mask_B_max: float | None,
     omega_nonneg_ry: np.ndarray,
-    kernel_sign: int,
+    denom_can_cross: bool,
+    neg_omega_half: bool,
     target_error: float,
     max_nodes: int,
     use_shipped_tables: bool,
@@ -194,17 +211,27 @@ def _build_single_sigma_window(
     S_max = float(np.max(A_vals) + mask_B_max)
     omega_max = float(np.max(omega_nonneg_ry)) if omega_nonneg_ry.size else 0.0
     x_min = max(S_min, 1.0e-12)
-    if kernel_sign == -1:
-        x_max = max(S_max + omega_max, x_min * (1.0 + 1.0e-9))
-    else:
+    if denom_can_cross:
+        # Denominator ω̃ − S: the Laplace argument stays within [S_min, S_max]
+        # (the crossing region proper only appears once ω is large enough to
+        # split off the three-window path).
         x_max = max(S_max, x_min * (1.0 + 1.0e-9))
+    else:
+        # Sign-definite denominator ω̃ + S: its argument grows with ω, so the
+        # Laplace interval must reach S_max + ω_max.
+        x_max = max(S_max + omega_max, x_min * (1.0 + 1.0e-9))
     q = solve_laplace_minimax_interval(
         x_min, x_max,
         target_error=target_error,
         max_nodes=max_nodes,
         use_shipped_tables=use_shipped_tables,
     )
-    prefactor = 1.0 if kernel_sign == +1 else -1.0
+    # ω enters the ω-kernel as exp(+i·ω·τ) for the (ω̃ − S) branch and
+    # exp(−i·ω·τ) for the definite (ω̃ + S) branch; the (ω̃ + S) branch also
+    # carries the −1 from the Laplace-vs-kernel identity.  The −ω half applies
+    # an additional overall −1, folded into the prefactor here.
+    omega_sign = +1 if denom_can_cross else -1
+    prefactor = (1.0 if denom_can_cross else -1.0) * (-1.0 if neg_omega_half else 1.0)
     return [
         _SigmaWindow(
             name="single",
@@ -212,7 +239,7 @@ def _build_single_sigma_window(
             mask_A=np.asarray(base_mask_A, dtype=bool),
             E_ref_A=float(np.min(A_vals)),
             E_ref_B=float(mask_B_min),
-            omega_sign=int(kernel_sign),
+            omega_sign=omega_sign,
             project="full",
             prefactor=float(prefactor),
             mask_B_mode="all",
@@ -232,6 +259,7 @@ def _build_three_sigma_windows(
     mask_B_gt_min: float | None,
     mask_B_gt_max: float | None,
     omega_nonneg_ry: np.ndarray,
+    neg_omega_half: bool,
     regularization_width_ry: float,
     edge_factor: float,
     target_error: float,
@@ -240,6 +268,11 @@ def _build_three_sigma_windows(
     crossing_max_nodes: int,
     use_shipped_tables: bool,
 ) -> list[_SigmaWindow]:
+    # This is the crossing branch: the pole S can coincide with a grid ω, so
+    # the denominator is ω̃ − S and ω enters the kernel as exp(+i·ω·τ)
+    # (omega_sign=+1) on every window.  The −ω half carries an overall −1,
+    # folded into each window's prefactor via ``neg`` below.
+    neg = -1.0 if neg_omega_half else 1.0
     omega_max = float(np.max(omega_nonneg_ry)) if omega_nonneg_ry.size else 0.0
     xi = max(float(regularization_width_ry), 1.0e-12)
     z_edge = float(edge_factor) * xi
@@ -286,7 +319,7 @@ def _build_three_sigma_windows(
             # Crossing scaling: t = τ/ξ, α = α/ξ (both divided by ξ).
             nodes = MinimaxNodes(t=raw.t / xi, alpha=raw.alpha / xi)
             project = "imag"
-            prefactor = -1.0
+            prefactor = -1.0 * neg
         else:
             S_min = float(np.min(A_vals) + B_min)
             S_max = float(np.max(A_vals) + B_max)
@@ -300,7 +333,7 @@ def _build_three_sigma_windows(
             )
             nodes = q.to_minimax_nodes(time_axis='imag')
             project = "full"
-            prefactor = +1.0
+            prefactor = +1.0 * neg
 
         windows.append(
             _SigmaWindow(
@@ -333,7 +366,8 @@ def _build_windows_for_branch(
     base_mask_A: jax.Array,
     Omega_q: jax.Array,
     base_mask_B: jax.Array,
-    kernel_sign: int,
+    space: str,
+    neg_omega_half: bool,
     regularization_width_ry: float,
     edge_factor: float,
     target_error: float,
@@ -347,9 +381,16 @@ def _build_windows_for_branch(
     """Host-side window construction for a single branch.
 
     Gathers E_A and base_mask_A to host, computes masked B-side stats, and
-    picks either a single-Laplace window (kernel_sign=-1 or small ω) or the
-    three-window crossing+stripe+slab decomposition (kernel_sign=+1 with
-    non-trivial ω range).  Prints a one-line summary per returned window.
+    picks either the three-window crossing+stripe+slab decomposition (when the
+    pole S can coincide with a grid ω) or a single sign-definite Laplace window
+    (otherwise, or when the ω range is negligible).  Prints a one-line summary
+    per returned window.
+
+    Which case applies is a physical fact about the branch, not a stored sign:
+    the pole S = E_A + Ω crosses the evaluation point (denominator ω̃ − S) for
+    the conduction (empty) A-space on the +ω half and for the valence
+    (occupied) A-space on the −ω half; otherwise the denominator is the
+    sign-definite ω̃ + S.
     """
     if omega_nonneg_ry.size == 0:
         return []
@@ -360,8 +401,9 @@ def _build_windows_for_branch(
     _, mask_B_all_count, mask_B_all_min, mask_B_all_max = _masked_stats_device(
         Omega_q, base_mask_B)
 
+    denom_can_cross = (space == "cond") != neg_omega_half
     omega_max = float(np.max(omega_nonneg_ry))
-    if kernel_sign == +1 and omega_max > 1.0e-14:
+    if denom_can_cross and omega_max > 1.0e-14:
         xi = max(float(regularization_width_ry), 1.0e-12)
         T = omega_max + float(edge_factor) * xi
         _, mask_B_le_count, mask_B_le_min, mask_B_le_max = _masked_stats_device(
@@ -376,6 +418,7 @@ def _build_windows_for_branch(
             mask_B_gt_count=mask_B_gt_count,
             mask_B_gt_min=mask_B_gt_min, mask_B_gt_max=mask_B_gt_max,
             omega_nonneg_ry=omega_nonneg_ry,
+            neg_omega_half=neg_omega_half,
             regularization_width_ry=regularization_width_ry,
             edge_factor=edge_factor,
             target_error=target_error, max_nodes=max_nodes,
@@ -389,7 +432,8 @@ def _build_windows_for_branch(
             mask_B_count=mask_B_all_count,
             mask_B_min=mask_B_all_min, mask_B_max=mask_B_all_max,
             omega_nonneg_ry=omega_nonneg_ry,
-            kernel_sign=kernel_sign,
+            denom_can_cross=denom_can_cross,
+            neg_omega_half=neg_omega_half,
             target_error=target_error, max_nodes=max_nodes,
             use_shipped_tables=bool(use_shipped_minimax_tables),
         )

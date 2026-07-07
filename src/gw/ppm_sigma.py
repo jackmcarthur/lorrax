@@ -5,7 +5,13 @@ What this module computes
 
     Σ^c_nm(k, ω) = Σ_{branches} Σ_{windows} Σ_τ  α(τ) · e^{i·ω_sign·ω·τ}
                                                  · project[ σ^τ_nmk(τ) ]
-                                                 · pref · scale
+                                                 · pref
+
+where ``ω_sign`` and ``pref`` are the per-window signs the branch's physics
+fixes: +1/−1 in the ω-kernel for the (ω̃ − S)/(ω̃ + S) denominator, and a
+prefactor that already carries both the Laplace-vs-crossing sign and the −1
+that the −ω half contributes (folded in at window-build time — there is no
+separate ``scale`` factor).
 
 Per branch the τ nodes are placed by a minimax quadrature chosen from the
 range of E_A = E_c − E_F (cond) or E_F − E_v (val) and the PPM pole
@@ -308,7 +314,6 @@ def _integrate_tau_windows_for_branch(
     psi_proj_xr: jax.Array,
     psi_proj_yn: jax.Array,
     tau_kernel: Callable[..., jax.Array],
-    scale: float,
     log_tag: str,
     print_fn,
 ) -> None:
@@ -347,7 +352,7 @@ def _integrate_tau_windows_for_branch(
                         E_ref_A_j, E_ref_B_j, t_j,
                     )
 
-                accumulator.begin_window(win, scale=scale)
+                accumulator.begin_window(win)
                 minimax_tau_integrate_sigma(
                     win.nodes,
                     build_sigma_tau=build_sigma_tau,
@@ -369,7 +374,8 @@ def _run_sigma_branch(
     B_q: jax.Array,
     Omega_q: jax.Array,
     base_mask_B: jax.Array,
-    kernel_sign: int,
+    space: str,
+    neg_omega_half: bool,
     regularization_width_ry: float,
     edge_factor: float,
     target_error: float,
@@ -383,7 +389,6 @@ def _run_sigma_branch(
     print_fn=print,
     omega_batch_size: int = 4,
     stream_writer: Callable[[np.ndarray, jax.Array], None] | None = None,
-    scale: float = 1.0,
     use_shipped_minimax_tables: bool = True,
 ) -> tuple[jax.Array, list[_SigmaWindow]]:
     """Orchestrator for one branch (cond or val × pos or neg ω half).
@@ -410,7 +415,7 @@ def _run_sigma_branch(
         omega_nonneg_ry=omega_nonneg_ry,
         E_A=E_A, base_mask_A=base_mask_A,
         Omega_q=Omega_q, base_mask_B=base_mask_B,
-        kernel_sign=kernel_sign,
+        space=space, neg_omega_half=neg_omega_half,
         regularization_width_ry=regularization_width_ry,
         edge_factor=edge_factor,
         target_error=target_error, max_nodes=max_nodes,
@@ -451,7 +456,6 @@ def _run_sigma_branch(
         psi_coh_xn=psi_coh_xn, psi_coh_yr=psi_coh_yr,
         psi_proj_xr=psi_proj_xr, psi_proj_yn=psi_proj_yn,
         tau_kernel=tau_kernel,
-        scale=scale,
         log_tag=log_tag, print_fn=print_fn,
     )
 
@@ -658,7 +662,8 @@ def compute_sigma_c_ppm_omega_grid(
         )
 
         # Enumerate the 4 branches (ω sign × cond/val), skipping empty ω halves.
-        # See _iter_branches for the sign/scale convention derivation.
+        # See _iter_branches for how each branch's physical identity fixes its
+        # denominator/prefactor signs (no ±1 sign fields are carried).
         branches = _iter_branches(
             omega_pos=omega_pos, idx_pos=idx_pos,
             omega_neg_abs=omega_neg_abs, idx_neg=idx_neg,
@@ -673,8 +678,8 @@ def compute_sigma_c_ppm_omega_grid(
             sigma_kij, _ = _run_sigma_branch(
                 omega_nonneg_ry=br.omega_abs, omega_global_idx=br.omega_idx,
                 E_A=br.E_A, base_mask_A=br.base_mask_A,
-                kernel_sign=br.kernel_sign,
-                log_tag=br.tag, scale=br.scale,
+                space=br.space, neg_omega_half=br.neg_omega_half,
+                log_tag=br.tag,
                 **common_branch_kwargs,
             )
             key = tuple(br.omega_idx.tolist())

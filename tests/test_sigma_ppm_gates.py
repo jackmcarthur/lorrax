@@ -62,7 +62,7 @@ def _build_branch_windows():
     """Build the 4 branches × their windows from controlled synthetic inputs.
 
     Returns ``(branches, flat)`` where ``branches`` is a list of
-    ``(tag, kernel_sign, [_SigmaWindow, ...])`` and ``flat`` is the dict of
+    ``(tag, space, [_SigmaWindow, ...])`` and ``flat`` is the dict of
     plain numpy arrays / scalars captured for the reference freeze.
     """
     import jax.numpy as jnp
@@ -120,11 +120,11 @@ def _build_branch_windows():
             omega_nonneg_ry=br.omega_abs,
             E_A=br.E_A, base_mask_A=br.base_mask_A,
             Omega_q=jnp.asarray(Omega_abs), base_mask_B=jnp.asarray(B_mask),
-            kernel_sign=br.kernel_sign,
+            space=br.space, neg_omega_half=br.neg_omega_half,
             log_tag=br.tag, print_fn=lambda *a, **k: None,
             **quad,
         )
-        out.append((br.tag, int(br.kernel_sign), windows))
+        out.append((br.tag, br.space, windows))
         for wi, w in enumerate(windows):
             key = f"{br.tag}|{wi}|{w.name}"
             flat[f"{key}|t"] = np.asarray(w.nodes.t, dtype=np.complex128)
@@ -161,8 +161,9 @@ def test_g2_branch_window_tiles_are_frozen():
     tags = [t for t, _, _ in branches]
     assert tags == ["ω≥E_F cond", "ω≥E_F val", "ω<E_F cond", "ω<E_F val"], tags
     win_names = {t: [w.name for w in ws] for t, _, ws in branches}
-    # kernel_sign=+1 halves get the 3-window crossing/stripe/slab split;
-    # kernel_sign=-1 halves get the single Laplace window.
+    # The crossing branch (pole S can coincide with a grid ω) gets the 3-window
+    # crossing/stripe/slab split: conduction on the +ω half, valence on the −ω
+    # half.  The sign-definite branches get the single Laplace window.
     assert win_names["ω≥E_F cond"] == ["core", "a_stripe", "b_slab"], win_names
     assert win_names["ω<E_F val"] == ["core", "a_stripe", "b_slab"], win_names
     assert win_names["ω≥E_F val"] == ["single"], win_names

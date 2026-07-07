@@ -182,7 +182,7 @@ class _SigmaAccumulator:
 
         acc = AccumulatorCls(shape, gpu_mesh, omega_vec)    # ω_vec is branch-scoped
         for each window:
-            acc.begin_window(window, scale=scale)           # window carries its own metadata
+            acc.begin_window(window)                        # window carries its own metadata
             for each tau:
                 acc.add_tau(σ_re, σ_im, t_c, α_eff_c)       # only per-τ data
             acc.end_window()
@@ -192,10 +192,12 @@ class _SigmaAccumulator:
     ``_build_windows_for_branch`` — accumulators read whatever they need
     off it (``window.omega_sign``, ``window.prefactor``,
     ``window.project_code``) instead of being fed a parallel stream of
-    scalars.  ``t_c`` / ``α_eff_c`` are Python/host complex scalars
-    computed once in :func:`minimax_tau_integrate_sigma`.
+    scalars.  ``window.prefactor`` already carries every sign the branch's
+    physics fixes (including the −1 that the −ω half contributes), so there is
+    no separate scale argument.  ``t_c`` / ``α_eff_c`` are Python/host complex
+    scalars computed once in :func:`minimax_tau_integrate_sigma`.
     """
-    def begin_window(self, window: '_SigmaWindow', *, scale: float) -> None: ...
+    def begin_window(self, window: '_SigmaWindow') -> None: ...
     def add_tau(self, sigma_re, sigma_im, t_c: complex, alpha_eff_c: complex) -> None: ...
     def end_window(self) -> None: ...
     def finalize(self) -> jax.Array | None: ...
@@ -239,11 +241,11 @@ class _HostOmegaAccumulator(_SigmaAccumulator):
         self._pref_f: float = 0.0
         self._project_code: int = 0
 
-    def begin_window(self, window: _SigmaWindow, *, scale: float) -> None:
+    def begin_window(self, window: _SigmaWindow) -> None:
         self._win_acc = np.zeros(self._local_shape, dtype=np.complex128)
         self._pending.clear()
         self._omega_sign_f = float(window.omega_sign)
-        self._pref_f       = float(window.prefactor * scale)
+        self._pref_f       = float(window.prefactor)
         self._project_code = window.project_code
 
     def add_tau(self, sigma_re, sigma_im, t_c: complex, alpha_eff_c: complex) -> None:
@@ -310,10 +312,10 @@ class _StreamedH5Accumulator(_SigmaAccumulator):
         self._pref_j = None
         self._project_code_j = None
 
-    def begin_window(self, window: _SigmaWindow, *, scale: float) -> None:
-        self._omega_sign_j   = jnp.asarray(float(window.omega_sign),       dtype=jnp.float64)
-        self._pref_j         = jnp.asarray(float(window.prefactor * scale), dtype=jnp.float64)
-        self._project_code_j = jnp.asarray(window.project_code,            dtype=jnp.int32)
+    def begin_window(self, window: _SigmaWindow) -> None:
+        self._omega_sign_j   = jnp.asarray(float(window.omega_sign),  dtype=jnp.float64)
+        self._pref_j         = jnp.asarray(float(window.prefactor),   dtype=jnp.float64)
+        self._project_code_j = jnp.asarray(window.project_code,       dtype=jnp.int32)
 
     def add_tau(self, sigma_re, sigma_im, t_c: complex, alpha_eff_c: complex) -> None:
         t_j     = jnp.asarray(t_c,         dtype=jnp.complex128)
