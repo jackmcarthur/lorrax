@@ -22,6 +22,7 @@ from jax.experimental import io_callback as _io_callback
 
 from common import Meta
 from common import timing
+from runtime.padding import pad_last_axis_to, round_up, solve_at_logical
 from common.gamma_matrices import (
     gamma_perm_phase as _gamma_perm_phase_mu,
     gamma_double_contract,
@@ -1046,21 +1047,18 @@ def factor_c_q(
         # 2D-blocked / cuSolverMp paths below cannot slice — their
         # block-cyclic layout needs the mesh-divisible extent; their
         # residual pad-extent sensitivity is the measured ≤1e-7 rel.)
-        C_log = C_q[:, :n_rmu_logical, :n_rmu_logical]
-        trace_per_q = jnp.trace(C_log, axis1=-2, axis2=-1)
-        ridge = (1e-14 * jnp.abs(trace_per_q)[:, None, None]
-                 * jnp.eye(n_rmu_logical)[None, :, :])
-        L_log = jnp.linalg.cholesky(C_log + ridge)
-        mu_pad = n_rmu - n_rmu_logical
-        if mu_pad:
-            L_q_dense = jnp.pad(L_log, ((0, 0), (0, mu_pad), (0, mu_pad)))
-            idx = jnp.arange(n_rmu)
-            pad_diag = (idx >= n_rmu_logical).astype(L_q_dense.dtype)
-            L_q_dense = L_q_dense + jnp.diag(pad_diag)[None, :, :]
-        else:
-            L_q_dense = L_log
-        L_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-        return jax.lax.with_sharding_constraint(L_q_dense, L_shard)
+        def _ridged_chol(C_log):
+            trace_per_q = jnp.trace(C_log, axis1=-2, axis2=-1)
+            ridge = (1e-14 * jnp.abs(trace_per_q)[:, None, None]
+                     * jnp.eye(n_rmu_logical)[None, :, :])
+            return jnp.linalg.cholesky(C_log + ridge)
+
+        L_q_dense = solve_at_logical(
+            _ridged_chol, n_rmu_logical, (C_q,), pad_axes=(-2, -1))
+        # Pad-block factor = identity (√1 = 1): re-embed via the shared
+        # helper instead of re-deriving the diag construction here.
+        return _identity_pad_block_diagonal(
+            L_q_dense, n_rmu_logical=n_rmu_logical, mesh_xy=mesh_xy)
 
     # 2D-blocked path: requires n_rmu divisible into mesh-friendly tiles.
     # The caller is expected to pass C_q at PADDED μ extent
@@ -1261,13 +1259,9 @@ def solve_zeta(
         from ffi.cusolvermp import batched_distributed_potrs, CusolverMpBatchedLowerL
         Px = int(mesh_xy.shape['x'])
         Py = int(mesh_xy.shape['y'])
-        # potrs requires Z's last dim divisible by Py; zero-pad columns
-        # produce zero ζ columns and get trimmed on return.
-        n_zchunk_padded = ((n_zchunk + Py - 1) // Py) * Py
-        needs_padding = (n_zchunk_padded != n_zchunk)
-        if needs_padding:
-            Z_q = jnp.pad(Z_q, ((0, 0), (0, 0), (0, n_zchunk_padded - n_zchunk)),
-                          mode='constant')
+        # potrs requires Z's last dim divisible by Py (see pad_last_axis_to).
+        Z_q, n_zchunk = pad_last_axis_to(Z_q, Py)
+        needs_padding = int(Z_q.shape[-1]) != n_zchunk
         # Re-attach handle metadata (the raw array carries no shape/grid info).
         L_handle = CusolverMpBatchedLowerL(
             raw=L_q, mesh=mesh_xy, n=int(n_rmu),
@@ -1291,50 +1285,44 @@ def solve_zeta(
         from ffi.cusolvermp import batched_distributed_solve_lu
         Px = int(mesh_xy.shape['x'])
         Py = int(mesh_xy.shape['y'])
-        # μ-slice the system to the LOGICAL extent before the solve
-        # (guarded above: n_log divides both mesh axes on this path).
-        # L/Z pad rows are exact zeros (+ identity pad diag on L), so
-        # the sliced system IS the logical system; solving at the
-        # padded extent instead changes ζ_T wholesale — the pad-shape
-        # LU roundoff is amplified O(1) in the near-null transverse
-        # modes (ROOT_CAUSE.md 2026-07-08, Manifestation 1).  ζ pad
-        # rows are re-added as exact zeros after the solve (their
-        # correct value: Z pad rows are zero).
-        if mu_pad:
+        # getrs descB requires NRHS % Py == 0 (see pad_last_axis_to).
+        Z_q, n_zchunk = pad_last_axis_to(Z_q, Py)
+        needs_padding = int(Z_q.shape[-1]) != n_zchunk
+
+        def _dist_ridged_lu(L_log, Z_log):
+            # The μ-slice to the LOGICAL extent (via solve_at_logical;
+            # guarded above: n_log divides both mesh axes on this path)
+            # is load-bearing: L/Z pad rows are exact zeros (+ identity
+            # pad diag on L), so the sliced system IS the logical
+            # system; solving at the padded extent instead changes ζ_T
+            # wholesale — pad-shape LU roundoff is amplified O(1) in
+            # the near-null transverse modes (ROOT_CAUSE.md 2026-07-08,
+            # Manifestation 1).
             xy_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-            L_q = jax.lax.with_sharding_constraint(
-                L_q[:, :n_log, :n_log], xy_shard)
-            Z_q = jax.lax.with_sharding_constraint(
-                Z_q[:, :n_log, :], xy_shard)
-        # getrs descB requires NRHS % Py == 0; zero-pad columns produce
-        # zero ζ columns and get trimmed on return.
-        n_zchunk_padded = ((n_zchunk + Py - 1) // Py) * Py
-        needs_padding = (n_zchunk_padded != n_zchunk)
-        if needs_padding:
-            Z_q = jnp.pad(Z_q, ((0, 0), (0, 0), (0, n_zchunk_padded - n_zchunk)),
-                          mode='constant')
-        # Per-q ridge ε·|tr(L_log)|/n_log — same lift as the legacy 'lu'
-        # branch, to keep TRS-paired near-zero modes above the LU
-        # stability floor without perturbing well-conditioned ones.
-        # ``cct_trace_per_q`` is precomputed once per channel by the
-        # caller (fit_zeta_to_h5) over the LOGICAL block — the trace
-        # doesn't change across r-chunks since L_q is the per-channel
-        # CCT.  Computing it inline here re-fires an all-reduce across
-        # the (μ_X, ν_Y) sharding on every r-chunk: ~17 s GPU stream
-        # time on MoS2 3×3 bispinor at our default chunk count.  Both
-        # the trace and the denominator must be LOGICAL quantities or
-        # the ridge (hence ζ) depends on the pad extent.
-        LU_RIDGE = 1e-12
-        trace_per_q = (cct_trace_per_q if cct_trace_per_q is not None
-                       else jnp.einsum('qii->q', L_q))
-        ridge = (LU_RIDGE * jnp.abs(trace_per_q) / n_log)[:, None, None]
-        eye_n = jnp.eye(n_log, dtype=L_q.dtype)[None, :, :]
-        A_q = L_q + ridge * eye_n
-        zeta_xy = batched_distributed_solve_lu(A_q, Z_q, mesh=mesh_xy)
+            L_log = jax.lax.with_sharding_constraint(L_log, xy_shard)
+            Z_log = jax.lax.with_sharding_constraint(Z_log, xy_shard)
+            # Per-q ridge ε·|tr(L_log)|/n_log — same lift as the legacy
+            # 'lu' branch, to keep TRS-paired near-zero modes above the
+            # LU stability floor without perturbing well-conditioned
+            # ones.  ``cct_trace_per_q`` is precomputed once per channel
+            # by the caller (fit_zeta_to_h5) over the LOGICAL block —
+            # computing it inline re-fires an all-reduce across the
+            # (μ_X, ν_Y) sharding on every r-chunk (~17 s GPU stream at
+            # MoS2 3×3 bispinor).  Both the trace and the denominator
+            # must be LOGICAL quantities or the ridge (hence ζ) depends
+            # on the pad extent.
+            LU_RIDGE = 1e-12
+            trace_per_q = (cct_trace_per_q if cct_trace_per_q is not None
+                           else jnp.einsum('qii->q', L_log))
+            ridge = (LU_RIDGE * jnp.abs(trace_per_q) / n_log)[:, None, None]
+            eye_n = jnp.eye(n_log, dtype=L_log.dtype)[None, :, :]
+            return batched_distributed_solve_lu(
+                L_log + ridge * eye_n, Z_log, mesh=mesh_xy)
+
+        zeta_xy = solve_at_logical(_dist_ridged_lu, n_log, (L_q,), Z_q)
         if mu_pad:
             zeta_xy = jax.lax.with_sharding_constraint(
-                jnp.pad(zeta_xy, ((0, 0), (0, mu_pad), (0, 0))),
-                NamedSharding(mesh_xy, P(None, 'x', 'y')))
+                zeta_xy, NamedSharding(mesh_xy, P(None, 'x', 'y')))
         # Reshard rationale identical to the cholesky branch above.
         zeta_out = _reshard_zeta_mu_X_r_Y_to_mu_XY(zeta_xy, mesh_xy)
         if needs_padding:
@@ -1343,14 +1331,14 @@ def solve_zeta(
 
     # Compute padding needed for even sharding across all devices
     total_devices = mesh_xy.devices.size
-    n_zchunk_padded = ((n_zchunk + total_devices - 1) // total_devices) * total_devices
+    n_zchunk_padded = round_up(n_zchunk, total_devices)
     needs_padding = n_zchunk_padded != n_zchunk
 
     z_col_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
     L_rep_shard = NamedSharding(mesh_xy, P(None, None))
     L_batch_rep_shard = NamedSharding(mesh_xy, P(None, None, None))  # (B_q, n_rmu, n_rmu)
     q_batch = min(q_chunk_size, nq)
-    nq_padded = ((nq + q_batch - 1) // q_batch) * q_batch
+    nq_padded = round_up(nq, q_batch)
 
     # Dispatch on solver_kind (already resolved above) — independent of
     # vertex_mu_L so the rchunk kernel cache can collapse transverse
@@ -1378,49 +1366,35 @@ def solve_zeta(
 
     def _ridge_indef_solve(L: jax.Array, Z: jax.Array) -> jax.Array:
         """Solve (L + ε·tr(L)/n · I) · ζ = Z via pivoted LU at the
-        LOGICAL μ extent.
+        LOGICAL μ extent (slice/zero-refill via ``solve_at_logical`` —
+        load-bearing: LU at the identity-padded extent yields a
+        different, per-extent-deterministic ζ_T, amplified O(1) in the
+        near-null transverse modes; ROOT_CAUSE.md 2026-07-08).
 
-        ε = ``LU_RIDGE`` (1e-12).  The shift sits well below any
-        physically meaningful eigenvalue but well above the partial-
-        pivoting floor, so LU stays stable on TRS-paired near-zero
-        modes without perturbing the rest of the spectrum.
-
-        The μ-slice to ``n_log`` (and the logical trace/denominator in
-        the ridge) is load-bearing: LU at the identity-padded extent
-        yields a different, per-extent-deterministic ζ_T — amplified
-        O(1) in the near-null transverse modes (ROOT_CAUSE.md
-        2026-07-08).  ζ pad rows are re-added as exact zeros (their
-        correct value: Z pad rows are zero).  At zero pad the slice
-        and re-pad are no-ops and this is bit-identical to the
-        historical path.
+        ε = ``LU_RIDGE`` (1e-12) on the logical trace/denominator: well
+        below any physically meaningful eigenvalue but above the
+        partial-pivoting floor, so LU stays stable on TRS-paired
+        near-zero modes without perturbing the rest of the spectrum.
         """
-        n = L.shape[-1]
-        L_log = L[:n_log, :n_log]
-        Z_log = Z[:n_log, :]
-        ridge = LU_RIDGE * jnp.abs(jnp.trace(L_log)) / n_log
-        L_reg = L_log + ridge * jnp.eye(n_log, dtype=L.dtype)
-        zeta_log = jnp.linalg.solve(L_reg, Z_log)
-        if n != n_log:
-            zeta_log = jnp.pad(zeta_log, ((0, n - n_log), (0, 0)))
-        return zeta_log
+        def _ridged_lu(L_log, Z_log):
+            ridge = LU_RIDGE * jnp.abs(jnp.trace(L_log)) / n_log
+            L_reg = L_log + ridge * jnp.eye(n_log, dtype=L.dtype)
+            return jnp.linalg.solve(L_reg, Z_log)
+        return solve_at_logical(_ridged_lu, n_log, (L,), Z)
 
     def _tri_solve_logical(L: jax.Array, Z: jax.Array) -> jax.Array:
         """Charge-channel two-triangular back-solve at the LOGICAL μ
-        extent (same slice/zero-fill rationale as ``_ridge_indef_solve``
-        — the well-conditioned Cholesky back-solve only wobbles ≤1e-7
-        under a pad-extent change, but at fixed shape it is exactly
+        extent (same ``solve_at_logical`` rationale — the
+        well-conditioned Cholesky back-solve only wobbles ≤1e-7 under a
+        pad-extent change, but at fixed shape it is exactly
         pad-invariant, which the fixed-P invariance gate requires).
         L is the block-diag ``[L_log 0; 0 I]`` factor; its logical
         block is exactly the factor of the logical system."""
-        n = L.shape[-1]
-        L_log = L[:n_log, :n_log]
-        Z_log = Z[:n_log, :]
-        y = jax.scipy.linalg.solve_triangular(L_log, Z_log, lower=True)
-        zeta_log = jax.scipy.linalg.solve_triangular(
-            L_log.conj().T, y, lower=False)
-        if n != n_log:
-            zeta_log = jnp.pad(zeta_log, ((0, n - n_log), (0, 0)))
-        return zeta_log
+        def _chol_backsolve(L_log, Z_log):
+            y = jax.scipy.linalg.solve_triangular(L_log, Z_log, lower=True)
+            return jax.scipy.linalg.solve_triangular(
+                L_log.conj().T, y, lower=False)
+        return solve_at_logical(_chol_backsolve, n_log, (L,), Z)
 
     if cache_key not in _solve_cache:
         @partial(shard_map, mesh=mesh_xy,

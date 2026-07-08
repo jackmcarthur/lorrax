@@ -17,6 +17,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 
 from common import Meta, jax_profile
+from runtime.padding import round_up, solve_at_logical
 from .minimax_config import MinimaxConfig
 from .minimax_screening import (
     _TINY,
@@ -254,7 +255,7 @@ def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int,
 
         # Pad to device count then reshard to q-parallel
         total_devices = mesh_xy.devices.size
-        nq_padded = ((nq_local + total_devices - 1) // total_devices) * total_devices
+        nq_padded = round_up(nq_local, total_devices)
         pad = nq_padded - nq_local
         V_padded = jnp.pad(V_flat, ((0, pad), (0, 0), (0, 0))) if pad > 0 else V_flat
         chi_padded = jnp.pad(chi_scaled, ((0, pad), (0, 0), (0, 0))) if pad > 0 else chi_scaled
@@ -265,20 +266,23 @@ def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int,
 
         def _local_solve(V_local, chi_local):
             nq_dev = V_local.shape[0]
-            def solve_one(iq, W_acc):
+
+            def _dyson_log(V_log, chi_log):
                 # Solve at the LOGICAL μ extent (see _get_w_solve_fn
-                # docstring).  V/χ pad rows are exact zeros, so the
-                # sliced system IS the logical Dyson system; the W pad
-                # block would come out exactly zero anyway (A_pad = I,
-                # RHS_pad = 0) — writing into a zero-initialised W_acc
-                # block reproduces it without the pad-extent LU.
-                V_log = V_local[iq, :n_log, :n_log]
-                chi_log = chi_local[iq, :n_log, :n_log]
-                A = jnp.eye(n_log, dtype=V_local.dtype) - V_log @ chi_log
+                # docstring; slice/zero-refill via solve_at_logical).
+                # V/χ pad rows are exact zeros, so the sliced system IS
+                # the logical Dyson system; the W pad block is exactly
+                # zero (A_pad = I, RHS_pad = 0).
+                A = jnp.eye(n_log, dtype=V_log.dtype) - V_log @ chi_log
                 lu, piv = jsp_linalg.lu_factor(A)
-                W_log = jsp_linalg.lu_solve((lu, piv), V_log)
+                return jsp_linalg.lu_solve((lu, piv), V_log)
+
+            def solve_one(iq, W_acc):
+                W_row = solve_at_logical(
+                    _dyson_log, n_log, (V_local[iq], chi_local[iq]),
+                    pad_axes=(-2, -1))
                 return jax.lax.dynamic_update_slice(
-                    W_acc, W_log[None, :, :], (iq, 0, 0))
+                    W_acc, W_row[None, :, :], (iq, 0, 0))
             return jax.lax.fori_loop(0, nq_dev, solve_one, jnp.zeros_like(V_local))
 
         W_flat = shard_map(

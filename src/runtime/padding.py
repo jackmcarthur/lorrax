@@ -99,8 +99,88 @@ def padded_mu_extent(n_rmu: int, divisor) -> int:
     return base
 
 
+def solve_at_logical(solve_fn, n_logical, mats, rhs=None, *, pad_axes=(-2,)):
+    """Run a dense solve on the LOGICAL μ block of padded operands and
+    zero-embed the solution back at the padded extent.
+
+    THE grep-able invariant for "solves run at the logical extent"
+    (ROOT_CAUSE.md 2026-07-08): identity-padded factorizations regroup
+    partial sums per pad extent — catastrophically for near-singular
+    LU — so every dense solve must μ-slice to the logical extent and
+    zero-refill.  A solver branch routed through this helper cannot
+    forget the slice or the re-fill; hand-rolling the idiom at a new
+    site is a review flag.
+
+    Parameters
+    ----------
+    solve_fn : callable
+        ``solve_fn(*mats_log)`` or ``solve_fn(*mats_log, rhs_log)`` —
+        receives the sliced logical operands, returns the LOGICAL
+        solution.  Ridge/regularization terms belong inside (computed
+        on the logical block).
+    n_logical : int
+        Logical μ extent; the padded extent is read off the operands.
+    mats : sequence of arrays
+        Square ``(..., n, n)`` operands, each sliced
+        ``[..., :n_log, :n_log]``.
+    rhs : array | None
+        Optional ``(..., n, k)`` right-hand side, sliced
+        ``[..., :n_log, :]``.  Omit when a square operand doubles as
+        the RHS (e.g. Dyson ``W = (I - Vχ)⁻¹ V``) — then set
+        ``pad_axes=(-2, -1)``.
+    pad_axes : tuple of int
+        Output axes zero-padded back to the padded extent — ``(-2,)``
+        for an ``(..., n, k)`` solution (μ rows only), ``(-2, -1)``
+        for an ``(..., n, n)`` one.
+
+    The pad values are exact zeros (their correct value: RHS pad rows
+    are zero), so at zero pad this is bit-identical to calling
+    ``solve_fn`` directly.
+    """
+    import jax.numpy as jnp
+
+    n_log = int(n_logical)
+    n_pad = int(mats[0].shape[-1])
+    if n_log > n_pad:
+        raise ValueError(
+            f"solve_at_logical: n_logical={n_log} exceeds operand "
+            f"extent {n_pad}")
+    args = [m[..., :n_log, :n_log] for m in mats]
+    if rhs is not None:
+        args.append(rhs[..., :n_log, :])
+    out = solve_fn(*args)
+    if n_pad == n_log:
+        return out
+    widths = [(0, 0)] * out.ndim
+    for ax in pad_axes:
+        widths[ax % out.ndim] = (0, n_pad - n_log)
+    return jnp.pad(out, widths)
+
+
+def pad_last_axis_to(A, divisor):
+    """Zero-pad the last axis of ``A`` up to ``round_up(extent, divisor)``.
+
+    The NRHS-pad idiom for distributed solves whose block-cyclic RHS
+    descriptor needs last-axis divisibility: zero RHS columns produce
+    zero solution columns — trim with ``[..., :n_orig]`` on return.
+
+    Returns ``(A_padded, n_orig)``; a no-op (same array) when already
+    divisible.
+    """
+    import jax.numpy as jnp
+
+    n = int(A.shape[-1])
+    n_pad = round_up(n, divisor)
+    if n_pad == n:
+        return A, n
+    widths = [(0, 0)] * (A.ndim - 1) + [(0, n_pad - n)]
+    return jnp.pad(A, widths), n
+
+
 __all__ = [
     "round_up",
     "extra_mu_pad",
     "padded_mu_extent",
+    "solve_at_logical",
+    "pad_last_axis_to",
 ]
