@@ -1,10 +1,12 @@
-"""ω-projection + accumulators for the Σ_c(ω) GN-PPM integration.
+"""ω-projection + accumulator for the Σ_c(ω) GN-PPM integration.
 
-"What happens to σ^τ after the kernel returns": the ω-kernel projection (a
-jax/numpy mirror pair), the accumulator protocol, and the two concrete
-accumulators (host-tile and streamed-h5).  The τ loop doesn't care whether its
-outputs land in a GPU-adjacent host buffer or on disk; it just adds per-τ
-contributions and knows when a window boundary falls.
+"What happens to σ^τ after the kernel returns": the ω-kernel projection (one
+numpy function — the single source of truth), the accumulator protocol, and
+**one** async-D2H accumulator (`_TauAccumulator`) with **two sinks** deciding
+whether a finished window becomes an in-memory Σ tensor (`_MemoryTileSink`) or
+streamed h5 read-modify-write additions (`_H5Sink`).  The τ loop doesn't care
+which sink is behind the accumulator; it just adds per-τ contributions and
+knows when a window boundary falls.
 
 Imports ``_SigmaWindow`` (type only) from the ``ppm_windows`` leaf; nothing here
 imports the driver or the device kernel.
@@ -13,10 +15,10 @@ imports the driver or the device kernel.
 from __future__ import annotations
 
 import enum
+from collections import deque
 from typing import Callable
 
 import jax
-import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 
@@ -30,11 +32,11 @@ class _AccumMode(enum.Enum):
     shard layout of σ^τ; the full (n_ω, n_k, n_b, n_b) buffer never lives
     on any GPU.  Default for typical ω grids.
 
-    ``KIJ_STREAM`` writes per-(τ × ω-batch) contributions directly to an
-    ``sigma_c_kij_ry`` HDF5 dataset.  Single-process only (multi-process
-    falls back to KIJ_HOST because the read-modify-write storm is a real
-    perf problem at scale).  Useful when the kij accumulator blows the
-    GPU budget.
+    ``KIJ_STREAM`` accumulates each window's contribution on host and writes
+    it (ω-batched, read-modify-write) directly to an ``sigma_c_kij_ry`` HDF5
+    dataset.  Single-process only (multi-process falls back to KIJ_HOST
+    because the read-modify-write storm is a real perf problem at scale).
+    Useful when the kij accumulator blows the GPU budget.
     """
     KIJ_HOST = "kij_host"
     KIJ_STREAM = "kij_stream"
@@ -76,82 +78,27 @@ def _select_accum_mode(
     return _AccumMode.KIJ_STREAM
 
 
-def _combine_coeff_with_sigma_tau(
-    coeff_re: jax.Array,
-    coeff_im: jax.Array,
-    sigma_tau_kij_re: jax.Array,
-    sigma_tau_kij_im: jax.Array,
-    project_code: jax.Array,
-) -> jax.Array:
-    """Multiply ω-kernel coefficient by σ^τ, keeping only the physical piece.
-
-    σ^τ is carried as a real/imag pair because the crossing window's HGL
-    quadrature needs only Im[ coeff·σ^τ ] — carrying complex σ^τ through
-    the FFT pipeline would double memory for no benefit.  The window sets
-    ``project_code`` via ``_SigmaWindow.project``:
-
-        code=0 ("full")  Laplace window (stripe, slab, single) — keep the
-                         full complex product  (coeff_re + i·coeff_im) · (σ_re + i·σ_im).
-        code=1 ("imag")  Crossing window      — keep only  Im[coeff·σ]
-                                              = coeff_re·σ_im + coeff_im·σ_re.
-
-    The historical "real" code path (Re[coeff·σ]) is unused by every current
-    window builder.  lax.switch is retained with a 2-way dispatch so that
-    the generated HLO matches the previous "full" / "imag" lowering exactly
-    and no minimax-table consumer gets a silent behavior change.
-    """
-
-    def _full(_):
-        sigma_full = sigma_tau_kij_re[None, ...] + 1j * sigma_tau_kij_im[None, ...]
-        return (coeff_re + 1j * coeff_im) * sigma_full
-
-    def _imag(_):
-        return coeff_re * sigma_tau_kij_im[None, ...] + coeff_im * sigma_tau_kij_re[None, ...]
-
-    return jax.lax.switch(project_code, (_full, _imag), operand=None)
-
-
-@jax.jit
-def _project_tau_onto_omega(
-    sigma_tau_kij_re: jax.Array,
-    sigma_tau_kij_im: jax.Array,
-    omega_vec: jax.Array,
-    t_node: jax.Array,
-    alpha_eff: jax.Array,
-    omega_sign: jax.Array,
-    pref: jax.Array,
-    project_code: jax.Array,
-) -> jax.Array:
-    """Apply ω-kernel exp(i·ω_sign·ω·t_node) and project onto σ channels.
-
-    Returns the single-tau contribution at every ω in ``omega_vec``:
-        contrib[ω, k, i, j] = pref · α_eff · exp(i·sign·ω·t) · P(σ_re, σ_im)
-
-    where P selects {full, imag} via ``project_code`` — see
-    ``_combine_coeff_with_sigma_tau`` for why σ^τ is kept as a (re, im) pair.
-    Callers either accumulate the result on-GPU (+=) or write it to disk —
-    this kernel is agnostic to the consumer.
-    """
-    omega_kernel = jnp.exp(1j * omega_sign * omega_vec * t_node)
-    coeff = alpha_eff * omega_kernel
-    coeff_re = jnp.real(coeff)[:, None, None, None]
-    coeff_im = jnp.imag(coeff)[:, None, None, None]
-    contrib = _combine_coeff_with_sigma_tau(
-        coeff_re, coeff_im, sigma_tau_kij_re, sigma_tau_kij_im, project_code
-    )
-    return pref * contrib.astype(jnp.complex128)
-
-
 def _project_tau_onto_omega_np(
     sigma_re: np.ndarray, sigma_im: np.ndarray, omega_vec: np.ndarray,
     t_node: complex, alpha_eff: complex, omega_sign: float, pref: float,
     project_code: int,
 ) -> np.ndarray:
-    """Numpy mirror of :func:`_project_tau_onto_omega` for host-side use.
+    """Apply the ω-kernel exp(i·ω_sign·ω·t) and project onto σ channels (host).
 
-    Matches the jax version exactly: code=0 ("full") returns the full
-    complex product; code=1 ("imag") returns ``coeff_re·σ_im +
-    coeff_im·σ_re`` (a real array up-cast to complex128 with Im=0).
+    This is the **single** ω-projector in LORRAX (both sinks call it — there is
+    no jax mirror to keep in sync).  Returns the single-τ contribution at every
+    ω in ``omega_vec``:
+
+        contrib[ω, k, i, j] = pref · α_eff · exp(i·sign·ω·t) · P(σ_re, σ_im)
+
+    where σ^τ is carried as a real/imag pair because the crossing window's HGL
+    quadrature needs only Im[coeff·σ^τ] — carrying complex σ^τ through the FFT
+    pipeline would double memory for no benefit.  The window's ``project_code``:
+
+        code=0 ("full")  Laplace window (single/stripe/slab) — keep the full
+                         complex product (coeff_re + i·coeff_im)·(σ_re + i·σ_im).
+        code=1 ("imag")  Crossing window — keep only Im[coeff·σ]
+                         = coeff_re·σ_im + coeff_im·σ_re (real, up-cast to c128).
     """
     omega_kernel = np.exp(1j * omega_sign * omega_vec * t_node)
     coeff = alpha_eff * omega_kernel
@@ -168,11 +115,13 @@ def _project_tau_onto_omega_np(
 
 
 # ---------------------------------------------------------------------------
-#  Sigma accumulators — one interface, two strategies.
+#  Sigma accumulator — one async-D2H machine, two sinks.
 #
-#  The tau loop doesn't care whether its outputs land in a GPU buffer or on
-#  disk; it just needs to add per-tau contributions and knows when a window
-#  boundary falls.  The two implementations differ only in what "add" means.
+#  The tau loop doesn't care whether its outputs land in a GPU-adjacent host
+#  buffer or on disk; it just needs to add per-tau contributions and knows when
+#  a window boundary falls.  A single _TauAccumulator owns the async-D2H deque
+#  and the numpy projector; a sink owns the "what happens to a finished window"
+#  decision.
 # ---------------------------------------------------------------------------
 
 class _SigmaAccumulator:
@@ -180,7 +129,7 @@ class _SigmaAccumulator:
 
     Lifecycle per branch::
 
-        acc = AccumulatorCls(shape, gpu_mesh, omega_vec)    # ω_vec is branch-scoped
+        acc = _TauAccumulator(omega_vec, sink)              # ω_vec is branch-scoped
         for each window:
             acc.begin_window(window)                        # window carries its own metadata
             for each tau:
@@ -203,135 +152,176 @@ class _SigmaAccumulator:
     def finalize(self) -> jax.Array | None: ...
 
 
-class _HostOmegaAccumulator(_SigmaAccumulator):
-    """Σ_c(ω, k, m, n) held as per-rank numpy tiles — never GPU HBM.
+class _TauAccumulator(_SigmaAccumulator):
+    """Async-D2H deque + the single numpy ω-projector, feeding a sink.
 
-    σ(τ) arrives already sharded (m_X, n_Y) from the reduce-scatter tail
-    of ``_sigma_kij_kernel``; ``addressable_data(0)`` is this rank's
-    local tile (one GPU per process), exactly the shard it owns in the
-    final Σ accumulator.  The ω-kernel + accumulate runs in numpy — no
-    JAX sharding machinery, no collectives, no shard_map.
+    σ(τ) arrives already sharded (m_X, n_Y) from the reduce-scatter tail of
+    ``_sigma_kij_kernel``.  Per τ we kick off ``copy_to_host_async`` on **every
+    addressable shard** — not just shard 0 — because a single process can own
+    more than one GPU (`lxalloc N` interactive, an end-user 2-GPU desktop; the
+    code ships to arbitrary device counts, so no shard-0 assumption may survive
+    — this was Bug C).  The host reads (and projects/accumulates) each shard's
+    σ tile ``lag`` iterations later, so GPU work on τ_{k+lag} overlaps with the
+    numpy accumulate of τ_k.  ``end_window`` drains the queue and hands the
+    per-shard window tiles to the sink.
 
-    Async pipeline: each τ calls ``copy_to_host_async`` on the local σ
-    shards and appends to a small pending deque; the host actually reads
-    (and accumulates) the σ tile ``lag`` iterations later.  That lets
-    GPU work on τ_{k+lag} overlap with the numpy accumulate of τ_k.
-    ``end_window`` drains the queue.
-
-    At :meth:`finalize`, per-rank tiles are reassembled into a
-    process-sharded ``jax.Array`` via ``make_array_from_process_local_data``
-    so downstream (``per_half + sigma_kij``, ``_to_host_np``) sees the
-    same interface as the on-GPU accumulator.
+    The ω-kernel + accumulate runs entirely in numpy on host — no JAX sharding
+    machinery, no collectives, no shard_map.  Each shard's contribution is
+    independent (the projector is elementwise in (k, i, j) times the ω-kernel),
+    so per-shard projection is exact.
     """
 
-    def __init__(self, shape: tuple[int, int, int, int], gpu_mesh: Mesh,
-                 omega_vec: jax.Array, *, lag: int = 2):
-        self._shape = shape
-        self._sharding = NamedSharding(gpu_mesh, P(None, None, 'x', 'y'))
-        self._local_shape = self._sharding.shard_shape(shape)
+    def __init__(self, omega_vec: jax.Array, sink: '_WindowSink', *, lag: int = 2):
         self._omega_vec_np = np.asarray(jax.device_get(omega_vec),
                                         dtype=np.complex128)
-        self._total = np.zeros(self._local_shape, dtype=np.complex128)
-        self._win_acc: np.ndarray | None = None
+        self._sink = sink
         self._lag = int(lag)
-        from collections import deque
         self._pending: deque = deque()
+        # Per-addressable-shard window accumulators + their layout, discovered
+        # at the first add_tau (constant across τ for a given window shape).
+        self._win_shards: list[np.ndarray | None] | None = None
+        self._shard_index: list[tuple] | None = None
+        self._shard_devices: list | None = None
         # Window-scoped scalars cached at begin_window.
         self._omega_sign_f: float = 0.0
         self._pref_f: float = 0.0
         self._project_code: int = 0
 
     def begin_window(self, window: _SigmaWindow) -> None:
-        self._win_acc = np.zeros(self._local_shape, dtype=np.complex128)
         self._pending.clear()
+        self._win_shards = None
         self._omega_sign_f = float(window.omega_sign)
         self._pref_f       = float(window.prefactor)
         self._project_code = window.project_code
 
     def add_tau(self, sigma_re, sigma_im, t_c: complex, alpha_eff_c: complex) -> None:
-        # Grab local shard handles and start the D2H copy now — do NOT
-        # materialize to numpy yet.  ``copy_to_host_async`` returns the
-        # same shard object with the transfer kicked off in the background.
-        local_re = sigma_re.addressable_data(0)
-        local_im = sigma_im.addressable_data(0)
-        local_re.copy_to_host_async()
-        local_im.copy_to_host_async()
-        self._pending.append((local_re, local_im, t_c, alpha_eff_c))
+        # Grab EVERY local shard handle and start the D2H copies now — do NOT
+        # materialize to numpy yet.  ``copy_to_host_async`` returns the same
+        # shard object with the transfer kicked off in the background.
+        shards_re = sigma_re.addressable_shards
+        shards_im = sigma_im.addressable_shards
+        if self._shard_index is None:
+            self._shard_index = [s.index for s in shards_re]
+            self._shard_devices = [s.device for s in shards_re]
+        handles = []
+        for sr, si in zip(shards_re, shards_im):
+            sr.data.copy_to_host_async()
+            si.data.copy_to_host_async()
+            handles.append((sr.data, si.data))
+        self._pending.append((handles, t_c, alpha_eff_c))
         if len(self._pending) > self._lag:
             self._drain_one()
 
     def _drain_one(self) -> None:
-        local_re, local_im, t_c, alpha_eff_c = self._pending.popleft()
-        # ``np.asarray`` of an addressable shard waits on the D2H we
-        # kicked off earlier — by now the transfer has had ``lag``
-        # iterations of GPU work to overlap with.
-        sig_re = np.asarray(local_re)
-        sig_im = np.asarray(local_im)
-        self._win_acc += _project_tau_onto_omega_np(
-            sig_re, sig_im, self._omega_vec_np,
-            t_c, alpha_eff_c, self._omega_sign_f, self._pref_f, self._project_code,
-        )
+        handles, t_c, alpha_eff_c = self._pending.popleft()
+        if self._win_shards is None:
+            self._win_shards = [None] * len(handles)
+        for d, (hr, hi) in enumerate(handles):
+            # ``np.asarray`` of an addressable shard waits on the D2H we kicked
+            # off earlier — by now the transfer has had ``lag`` iterations of
+            # GPU work to overlap with.
+            proj = _project_tau_onto_omega_np(
+                np.asarray(hr), np.asarray(hi), self._omega_vec_np,
+                t_c, alpha_eff_c, self._omega_sign_f, self._pref_f, self._project_code,
+            )
+            if self._win_shards[d] is None:
+                self._win_shards[d] = np.zeros_like(proj)
+            self._win_shards[d] += proj
 
     def end_window(self) -> None:
-        assert self._win_acc is not None
         while self._pending:
             self._drain_one()
-        self._total += self._win_acc
-        self._win_acc = None
+        assert self._win_shards is not None
+        self._sink.consume_window(
+            self._win_shards, self._shard_index, self._shard_devices)
+        self._win_shards = None
 
-    def finalize(self) -> jax.Array:
-        return jax.make_array_from_process_local_data(
-            self._sharding, self._total, global_shape=self._shape)
+    def finalize(self) -> jax.Array | None:
+        return self._sink.result()
 
 
-class _StreamedH5Accumulator(_SigmaAccumulator):
-    """Project each tau contribution in ω-batches and hand to a writer callable.
+class _WindowSink:
+    """Protocol for what a finished window's per-shard tiles become."""
+    def consume_window(self, win_shards, shard_index, shard_devices) -> None: ...
+    def result(self) -> jax.Array | None: ...
 
-    The writer is expected to read-modify-write the backing HDF5 dataset;
-    this class is agnostic to the storage (rank-0 h5py, SlabIO, …).
 
-    Note on the FFI flush path (future work, comment-only here): a third
-    accumulator — _CollectiveFlushSlabIoAccumulator — would keep the running Σ
-    sharded (m_X, n_Y) on GPU (the _make_project_ri_reduce_scatter layout),
-    stack many τ contributions per window without flushing, and at end_window() issue
-    a single collective parallel-HDF5 write via SlabIO.write_slab against
-    a pre-opened zarr-style (n_ω, n_k, m, n) dataset.  This removes the
-    per-τ read-modify-write roundtrip that makes _StreamedH5Accumulator
-    catastrophic at multi-process scale.  Implement when the upstream
-    reduce-scatter project lands (without it, there's no point — σ^τ is
-    still gathered on every rank).
+class _MemoryTileSink(_WindowSink):
+    """Σ_c(ω, k, m, n) held as per-rank numpy tiles — never GPU HBM.
+
+    Each window's per-shard tiles are added into a running per-shard total.  At
+    :meth:`result`, each shard tile is placed back on the device that owned it
+    (``jax.device_put``) and the shards are assembled into a process-sharded
+    ``jax.Array`` via ``make_array_from_single_device_arrays`` — which is
+    correct on single-process multi-GPU and multi-process alike (each process
+    supplies exactly its addressable shards), unlike the old
+    ``make_array_from_process_local_data`` fed a shard-0-sized tile.  Downstream
+    (``sigma_kij_host`` add, ``_to_host_np``) sees the same (m_X, n_Y) sharding.
     """
-    def __init__(self, writer: Callable[[np.ndarray, jax.Array], None],
-                 omega_vec: jax.Array, *,
-                 omega_global_idx: np.ndarray, omega_batch_size: int):
+
+    def __init__(self, shape: tuple[int, int, int, int], sharding: NamedSharding):
+        self._shape = shape
+        self._sharding = sharding
+        self._total_shards: list[np.ndarray] | None = None
+        self._devices: list | None = None
+
+    def consume_window(self, win_shards, shard_index, shard_devices) -> None:
+        if self._total_shards is None:
+            self._total_shards = [np.zeros_like(w) for w in win_shards]
+            self._devices = list(shard_devices)
+        for d, w in enumerate(win_shards):
+            self._total_shards[d] += w
+
+    def result(self) -> jax.Array:
+        if self._total_shards is None:
+            # No window contributed a tile (empty branch): return a zero Σ.
+            local_shape = self._sharding.shard_shape(self._shape)
+            devices = list(self._sharding.addressable_devices)
+            arrays = [
+                jax.device_put(np.zeros(local_shape, dtype=np.complex128), d)
+                for d in devices
+            ]
+        else:
+            arrays = [
+                jax.device_put(t, d)
+                for t, d in zip(self._total_shards, self._devices)
+            ]
+        return jax.make_array_from_single_device_arrays(
+            self._shape, self._sharding, arrays)
+
+
+class _H5Sink(_WindowSink):
+    """Assemble each window's full (n_ω, nk, nb, nb) host buffer from its
+    per-shard tiles and RMW-add it into the streamed h5 dataset (rank-0),
+    ω-batched.
+
+    Streaming is single-process only (``_select_accum_mode`` gates on
+    ``n_proc == 1``), so this process owns every shard and the assembled buffer
+    is the complete window.  This replaces the old per-τ streamed accumulator:
+    D2H is now the ω-independent per-shard σ tile (was n_ω× the volume), and the
+    h5 read-modify-write count drops from ~n_τ per branch to n_windows per
+    branch.  The analytic q→0 head is RMW-added into this same dataset later by
+    ``ppm_pipeline._inject_analytic_head`` (idempotent via the ``head_injected``
+    attr); this sink leaves the dataset in exactly the head-less layout that
+    step expects.
+    """
+
+    def __init__(self, writer: Callable[[np.ndarray, np.ndarray], None], *,
+                 omega_global_idx: np.ndarray, omega_batch_size: int,
+                 full_spatial_shape: tuple[int, int, int]):
         self._writer = writer
-        self._omega_vec = omega_vec
         self._omega_global_idx = np.asarray(omega_global_idx, dtype=np.int64)
         self._batch = int(max(1, omega_batch_size))
-        self._omega_sign_j = None
-        self._pref_j = None
-        self._project_code_j = None
+        self._spatial = tuple(int(s) for s in full_spatial_shape)
 
-    def begin_window(self, window: _SigmaWindow) -> None:
-        self._omega_sign_j   = jnp.asarray(float(window.omega_sign),  dtype=jnp.float64)
-        self._pref_j         = jnp.asarray(float(window.prefactor),   dtype=jnp.float64)
-        self._project_code_j = jnp.asarray(window.project_code,       dtype=jnp.int32)
-
-    def add_tau(self, sigma_re, sigma_im, t_c: complex, alpha_eff_c: complex) -> None:
-        t_j     = jnp.asarray(t_c,         dtype=jnp.complex128)
-        alpha_j = jnp.asarray(alpha_eff_c, dtype=jnp.complex128)
-        n_omega = int(self._omega_vec.shape[0])
+    def consume_window(self, win_shards, shard_index, shard_devices) -> None:
+        n_omega = int(win_shards[0].shape[0])
+        full = np.zeros((n_omega,) + self._spatial, dtype=np.complex128)
+        for tile, idx in zip(win_shards, shard_index):
+            full[(slice(None),) + tuple(idx)] = tile
         for ibeg in range(0, n_omega, self._batch):
             iend = min(ibeg + self._batch, n_omega)
-            batch_proj = _project_tau_onto_omega(
-                sigma_re, sigma_im, self._omega_vec[ibeg:iend],
-                t_j, alpha_j, self._omega_sign_j,
-                self._pref_j, self._project_code_j,
-            )
-            self._writer(self._omega_global_idx[ibeg:iend], batch_proj)
+            self._writer(self._omega_global_idx[ibeg:iend], full[ibeg:iend])
 
-    def end_window(self) -> None:
-        pass
-
-    def finalize(self) -> None:
+    def result(self) -> None:
         return None

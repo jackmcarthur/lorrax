@@ -35,7 +35,8 @@ alongside it (acyclic: driver → stages → engine):
                          _SigmaWindow / _SigmaBranch vocabulary, the four-branch
                          Σc(−ω) decomposition, the minimax window builders).
     ppm_tau_kernel.py    the device τ-kernel unit + AOT precompile + caches.
-    ppm_accumulators.py  the ω-projection pair + the two accumulators.
+    ppm_accumulators.py  the single numpy ω-projector + one async-D2H
+                         accumulator with a memory-tile / streamed-h5 sink.
 
 This driver retains the physics prologue (PPM fit + physics-state prep) plus the
 τ-loop orchestration that binds window × kernel × accumulator, and reads as the
@@ -74,8 +75,9 @@ from .ppm_accumulators import (
     _AccumMode,
     _select_accum_mode,
     _SigmaAccumulator,
-    _HostOmegaAccumulator,
-    _StreamedH5Accumulator,
+    _TauAccumulator,
+    _MemoryTileSink,
+    _H5Sink,
 )
 
 
@@ -320,9 +322,9 @@ def _integrate_tau_windows_for_branch(
     """Walk windows; for each, dispatch ``minimax_tau_integrate_sigma``
     with closures that bind this window's (psi, masks, E_ref, kernel) and
     feed the window's σ^τ into the accumulator.  The result lands either
-    on-GPU (host ω accumulator) or streamed to H5 — that decision
-    is the accumulator's, not this loop's.  See
-    _HostOmegaAccumulator / _StreamedH5Accumulator.
+    in per-rank host tiles or streamed to H5 — that decision is the
+    accumulator's sink, not this loop's.  See
+    _TauAccumulator + _MemoryTileSink / _H5Sink.
     """
     from common.progress import LoopProgress
 
@@ -432,23 +434,29 @@ def _run_sigma_branch(
         kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
     )
 
+    # One async-D2H accumulator; the sink decides where a finished window goes.
+    # Both sinks consume the SAME per-shard host tiles produced by the single
+    # numpy projector (copy_to_host_async + a short deque overlap GPU-τ_{k+lag}
+    # with the numpy-τ_k accumulate).
     if stream_writer is None:
         # Σ_c(ω,k,m,n) lives as per-rank numpy tiles matching σ(τ)'s
         # (m_X, n_Y) sharding — the full (n_ω,n_k,n_b,n_b) buffer never
-        # exists on any GPU.  copy_to_host_async + a short deque overlap
-        # GPU-τ_{k+lag} with numpy-τ_k accumulate.
-        accumulator: _SigmaAccumulator = _HostOmegaAccumulator(
+        # exists on any GPU until the final device assembly at finalize().
+        sink: _MemoryTileSink | _H5Sink = _MemoryTileSink(
             shape=(n_omega, nk_proj, nb_proj, nb_proj),
-            gpu_mesh=mesh_xy,
-            omega_vec=omega_vec,
+            sharding=NamedSharding(mesh_xy, P(None, None, 'x', 'y')),
         )
     else:
-        accumulator = _StreamedH5Accumulator(
+        # Single-process streamed: assemble each window on host and RMW it to
+        # the h5 dataset ω-batched (n_windows RMW, not n_τ).
+        sink = _H5Sink(
             writer=stream_writer,
-            omega_vec=omega_vec,
             omega_global_idx=omega_global_idx,
             omega_batch_size=int(max(1, omega_batch_size)),
+            full_spatial_shape=(nk_proj, nb_proj, nb_proj),
         )
+    accumulator: _SigmaAccumulator = _TauAccumulator(
+        omega_vec=omega_vec, sink=sink)
 
     _integrate_tau_windows_for_branch(
         windows=windows, accumulator=accumulator,
@@ -634,12 +642,14 @@ def compute_sigma_c_ppm_omega_grid(
         h5_kij.attrs["layout"] = "omega,k,i,j"
 
     try:
-        def _accumulate_kij_stream(global_idx: np.ndarray, contrib_batch: jax.Array) -> None:
+        def _accumulate_kij_stream(global_idx: np.ndarray, contrib_batch: np.ndarray) -> None:
+            # Called by _H5Sink once per (window × ω-batch) with an already-host
+            # numpy buffer (the assembled window slab), read-modify-write add.
             if dset_sigma_kij is None:
                 return
             idx = np.asarray(global_idx, dtype=np.int64)
             buf = dset_sigma_kij[idx]
-            buf = buf + np.asarray(jax.device_get(contrib_batch), dtype=np.complex128)
+            buf = buf + np.asarray(contrib_batch, dtype=np.complex128)
             dset_sigma_kij[idx] = buf
 
         common_branch_kwargs = dict(
@@ -671,10 +681,14 @@ def compute_sigma_c_ppm_omega_grid(
             cond_mask=cond_mask, val_mask=val_mask,
         )
 
-        # Sum cond+val per ω-half before gathering to host.  Preserves the
-        # original traversal order so reduction ordering stays bit-identical.
-        per_half: dict[tuple, jax.Array] = {}
-        for _bi, br in enumerate(branches):
+        # Run each branch and fold its Σc directly into the host tensor at its
+        # global ω indices.  cond and val of a given ω-half share those indices,
+        # so the second branch's `+=` sums cond+val there — same values, same
+        # traversal order (cond before val, per-branch device reduction then
+        # host add) as the old per-ω-half dict, minus the tuple-of-ints key.
+        # Streaming writes straight to the h5 via the branch's _H5Sink; both
+        # cond and val RMW-add into the same dataset, so no host fold is needed.
+        for br in branches:
             sigma_kij, _ = _run_sigma_branch(
                 omega_nonneg_ry=br.omega_abs, omega_global_idx=br.omega_idx,
                 E_A=br.E_A, base_mask_A=br.base_mask_A,
@@ -682,17 +696,15 @@ def compute_sigma_c_ppm_omega_grid(
                 log_tag=br.tag,
                 **common_branch_kwargs,
             )
-            key = tuple(br.omega_idx.tolist())
-            per_half[key] = (per_half[key] + sigma_kij) if key in per_half else sigma_kij
-
-        if not streaming:
-            # the reduce-scatter project (_make_project_ri_reduce_scatter)
-            # returns Σ sharded (m_X, n_Y), so the
-            # host copy needs a cross-process gather rather than jax.device_get.
-            # _to_host_np falls back to device_get for single-process / replicated.
-            for key, total in per_half.items():
-                idx = np.asarray(key, dtype=np.int64)
-                sigma_kij_host[idx] = _to_host_np(total, dtype=np.complex128, tiled=False)
+            if not streaming:
+                # the reduce-scatter project (_make_project_ri_reduce_scatter)
+                # returns Σ sharded (m_X, n_Y), so the host copy needs a
+                # cross-process gather rather than jax.device_get; _to_host_np
+                # falls back to device_get for single-process / replicated.
+                idx = np.asarray(br.omega_idx, dtype=np.int64)
+                sigma_kij_host[idx] = (
+                    sigma_kij_host[idx]
+                    + _to_host_np(sigma_kij, dtype=np.complex128, tiled=False))
     finally:
         if h5_kij is not None:
             h5_kij.close()

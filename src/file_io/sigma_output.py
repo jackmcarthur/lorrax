@@ -359,7 +359,7 @@ def copy_sigma_kij_h5_to_omega_h5(
 ):
 	"""Convert a Ry-units streamed Σ_c(ω,k,i,j) HDF5 to an eV-units file.
 
-	The ``_StreamedH5Accumulator`` path in ``ppm_sigma`` writes per-(τ × ω-batch)
+	The ``_H5Sink`` path in ``ppm_accumulators`` writes per-(window × ω-batch)
 	contributions into a transient ``sigma_c_kij_ry`` dataset (single-process
 	only).  When the GW driver is in PPM mode and the accumulator returned
 	``sigma_c_omega = None`` (streamed path), this helper copies the result

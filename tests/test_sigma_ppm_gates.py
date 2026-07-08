@@ -282,14 +282,20 @@ def test_g1_kij_vs_kij_stream_parity(tmp_path):
     # The kij (host) path injects the analytic q→0 head; before WS1 the stream
     # path dropped it (Bug B) and this failed by ~4.13 eV on the band-diagonal
     # near-gap bands (24-31).  WS1 RMW-adds the identical head into the stream
-    # h5, so the band-diagonal head is gone: post-fix the FULL tensor agrees to
-    # ~7e-10 eV, and the head-carrying diagonal to ~4e-10 eV.
+    # h5, so the band-diagonal head is gone.
     #
-    # The residual ~7e-10 floor is NOT the head — it sits on large-magnitude
-    # OFF-diagonal elements (~1e3 eV) where the head is exactly zero.  It is the
-    # pre-existing numpy-vs-jax dual-projector ULP difference (host uses
-    # _project_tau_onto_omega_np, stream uses the jitted _project_tau_onto_omega
-    # — see the K2/WS4 accumulator unification, which deletes one projector and
-    # will let this gate tighten back to ~1e-12).  atol=1e-8 clears that floor
-    # with >10x margin while still catching a dropped head (4.13 eV) loudly.
-    np.testing.assert_allclose(sig_stream, sig_host, rtol=0.0, atol=1e-8)
+    # Post-WS4 (K2 accumulator unification) both accumulation modes share the
+    # ONE numpy ω-projector (_project_tau_onto_omega_np) and the same async-D2H
+    # accumulator; the streamed path differs only in where the finished-window
+    # host tiles land (h5 RMW vs an in-memory Σ tensor).  The old dual-projector
+    # (numpy-vs-jitted) ULP floor that forced atol=1e-8 in WS1 is GONE — a
+    # ~2000x tightening.
+    #
+    # The residual floor is now a single ULP of the largest matrix element: the
+    # two modes sum cond+val over windows in different associations (host folds
+    # (Σ_cond)+(Σ_val) per ω-half; the stream running-sums each window into the
+    # h5 dataset via read-modify-write), so on the ~1.5e4 eV off-diagonals they
+    # can differ in the last bit (measured: 1/2.36M elements, 1.8e-12 abs,
+    # 1.1e-16 rel).  atol=5e-12 clears that ULP floor with margin while still
+    # catching a dropped head (4.13 eV) or any real regression by ~1e12x.
+    np.testing.assert_allclose(sig_stream, sig_host, rtol=0.0, atol=5e-12)
