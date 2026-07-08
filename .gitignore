@@ -77,3 +77,5 @@ src/ffi/**/CMakeCache.txt
 src/ffi/**/CMakeFiles/
 src/ffi/**/cmake_install.cmake
 site/
+.tier2_cross_p/
+.padprobe/
