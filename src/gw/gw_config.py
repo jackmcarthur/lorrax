@@ -363,10 +363,10 @@ _DEFAULTS = {
     # PPM sigma options
     # PPM invalid-pole treatment (BGW invalid_gpp_mode). 'zero' drops Omega^2<0
     # poles (BGW mode 0); '2ry' keeps the fit's fallback pole (BGW mode 2);
-    # 'static_limit' drops the dynamical pole and adds the analytic
-    # static-COHSEX term for those modes (BGW mode 3 = BGW's default) — see
-    # ppm_sigma._compute_invalid_static_sigma.
-    "ppm_invalid_mode": "zero",
+    # 'static_limit' (default, matching BGW's default mode 3) drops the
+    # dynamical pole and adds the analytic static-COHSEX term for those
+    # modes — see ppm_sigma._compute_invalid_static_sigma.
+    "ppm_invalid_mode": "static_limit",
     "fermi_reference": "midgap",
     "sigma_at_dft_extrapolate": False,
     # Deprecated (2026-07-08): ``sigma_at_dft_energies = true`` is honored
@@ -1121,7 +1121,7 @@ class LorraxConfig:
             window_edge_factor=float(_g("sigma_window_edge_factor")),
             omega_batch_size=int(_g("sigma_omega_batch_size")),
             omega_accumulation=str(_g("sigma_omega_accumulation")).strip().lower(),
-            invalid_mode=str(_g("ppm_invalid_mode") or "zero").strip().lower(),
+            invalid_mode=str(_g("ppm_invalid_mode") or "static_limit").strip().lower(),
             fermi_reference=str(_g("fermi_reference")).strip().lower(),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
             sigma_at_dft_energies=bool(_g("sigma_at_dft_energies")),
