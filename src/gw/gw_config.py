@@ -9,6 +9,7 @@ along the same axes the input file's section comments already use:
     config.minimax     — screening-minimax target error / max nodes / table mode
     config.ppm         — PPM model + sigma quadrature + on-shell σ_c options
     config.sigma_grid  — ω-grid for Σ_c(ω) output
+    config.sc          — self-consistency loop knobs (qp_solver = self_consistent)
     config.memory      — chunk sizing
     config.backend     — FFI/IO backend selection (slab_io / gspace_io / screening_solver)
     config.debug       — debug-only flags & file paths
@@ -17,7 +18,7 @@ along the same axes the input file's section comments already use:
 
 The top-level ``LorraxConfig`` retains only system geometry
 (``nval`` / ``ncond`` / ``nband`` / ``sys_dim``) and the orthogonal
-mode flags (``compute_mode`` / ``self_consistent`` / etc.) that the
+mode flags (``compute_mode`` / ``qp_solver`` / etc.) that the
 driver reads on the fast path.
 
 Derived sub-objects (the math-internal ``MinimaxConfig`` from
@@ -47,8 +48,12 @@ from common.units import RYD_TO_EV
 class ComputeMode(str, enum.Enum):
     """The single axis describing what self-energy is computed.
 
-    Orthogonal to ``self_consistent``: any mode can in principle be wrapped
-    in a fixed-point loop (currently only ``COHSEX`` is wired).
+    Orthogonal to ``qp_solver`` (how QP energies are extracted from Σ):
+    any mode can be wrapped in the ``self_consistent`` QSGW loop — the
+    loop dispatches through the mode-agnostic
+    ``sigma_dispatch.compute_sigma_xc`` (COHSEX and GN-PPM verified
+    end-to-end; see reports/gw_refactor_map_2026-07-01/
+    G0W0_SC_TOGGLE_DESIGN.md §4).
 
     - ``X_ONLY`` — bare exchange Σ_X = -G·V (no screening, no correlation).
     - ``COHSEX`` — static screened-exchange + Coulomb-hole.
@@ -78,6 +83,37 @@ class ComputeMode(str, enum.Enum):
             ComputeMode.GN_PPM: "gn",
             ComputeMode.HL_PPM: "hl",
         }.get(self)
+
+
+class QPSolver(str, enum.Enum):
+    """How QP energies are extracted from Σ — orthogonal to ``compute_mode``.
+
+    The three states are mutually exclusive answers to the same physics
+    question, each naming a standard method:
+
+    - ``ONE_SHOT_DFT`` — textbook G0W0 (THE DEFAULT).  Σ is built once
+      from the DFT inputs and *everything* is evaluated at E_DFT: the
+      eqp0/eqp1 text outputs (at-DFT Newton + Z-linearization, as always)
+      AND the QSGW-symmetrised Σ_xc whose eigh produces ``E_qp_ry`` /
+      ``qp_wfn_rotations.h5`` / ``WFN_qp.h5``.  No iteration of any kind.
+    - ``FIXED_POINT`` — one-shot Σ + diagonal on-shell solve
+      E = h0 + ReΣ(E) for the QSGW-build evaluation energies
+      (eigenvalue-only; Σ is never rebuilt).  Dynamic modes only — static
+      Σ has no ω-grid to solve on.  ``ppm.sigma_at_dft_extrapolate`` is a
+      sub-knob of this state (scissor for out-of-grid bands).
+    - ``SELF_CONSISTENT`` — full QSGW loop (:mod:`gw.sc_iteration`):
+      Σ rebuilt each iteration from rotated ψ + the previous iteration's
+      E.  Loop knobs live in :class:`SCConfig` (``config.sc``).
+
+    eqp0.dat / eqp1.dat keep the same formula in all three states; only
+    the provenance of Σ changes under ``SELF_CONSISTENT`` (converged Σ,
+    still evaluated at E_DFT — one more at-DFT Newton step from the SC
+    fixed point).
+    """
+
+    ONE_SHOT_DFT = "one_shot_dft"
+    FIXED_POINT = "fixed_point"
+    SELF_CONSISTENT = "self_consistent"
 
 
 class SlabIOBackend(str, enum.Enum):
@@ -187,13 +223,30 @@ _DEFAULTS = {
     # ``ppm_model`` flags so existing input files keep working unchanged.
     # New input files should set ``compute_mode`` explicitly:
     #   "x_only" | "cohsex" | "gn_ppm" | "hl_ppm".
-    # ``self_consistent`` remains an orthogonal flag (currently only
-    # implemented on top of COHSEX).
     "compute_mode": "auto",
+    # ``qp_solver`` is the orthogonal axis describing how QP energies are
+    # extracted from Σ (see the ``QPSolver`` enum).  ``"auto"`` resolves
+    # from the deprecated ``self_consistent`` key (true → self_consistent)
+    # and otherwise defaults to "one_shot_dft" (standard G0W0).  New input
+    # files should set it explicitly:
+    #   "one_shot_dft" | "fixed_point" | "self_consistent".
+    "qp_solver": "auto",
     "do_screened": True,
     "bispinor": False,
     "do_G0": True,
+    # Deprecated (2026-07-08): ``self_consistent = true`` is honored as an
+    # alias for ``qp_solver = self_consistent`` via auto-resolution.  SC is
+    # wired for ALL modes (mode-agnostic sigma_dispatch), not just COHSEX.
     "self_consistent": False,
+    # Self-consistency loop knobs (read only when qp_solver=self_consistent).
+    # Promoted from the LORRAX_SC_* env vars (2026-07-08); the envs are
+    # still honored as deprecated overrides.
+    "sc_max_iter": 20,
+    "sc_tol_ev": 1.0e-4,
+    "sc_accelerator": "rcrop",   # rcrop | linear
+    "sc_history_depth": 5,       # rCROP history depth
+    "sc_mixing": 1.0,            # linear-mixing α (accelerator=linear only)
+    "sc_dump_dir": "",           # E-history npy dump dir ("" = off)
     "use_ppm_sigma": False,
     # BGW-style averaging of diagonal Σ within degenerate sets (mirrors
     # ``Sigma/shiftenergy.f90`` band-averaging).  ``no_degen_averaging =
@@ -314,6 +367,11 @@ _DEFAULTS = {
     "ppm_invalid_mode": "zero",
     "fermi_reference": "midgap",
     "sigma_at_dft_extrapolate": False,
+    # Deprecated (2026-07-08): ``sigma_at_dft_energies = true`` is honored
+    # as an alias for ``qp_solver = one_shot_dft`` — which is now the
+    # default — via auto-resolution.  (The key was parsed-but-unread for
+    # its whole life; its intended meaning, authoritative at-DFT QP
+    # evaluation, is exactly QPSolver.ONE_SHOT_DFT.)
     "sigma_at_dft_energies": False,
     # Debug
     "sigma_freq_debug_output": False,
@@ -334,6 +392,8 @@ _DEFAULTS = {
 # Keys whose string values should be lowercased and stripped
 _NORMALIZE_STR = {
     "compute_mode",
+    "qp_solver",
+    "sc_accelerator",
     "wcoul0_source", "screening_method", "minimax_energy_reference",
     "sigma_omega_accumulation", "fermi_reference",
     "isdf_memory_mode",
@@ -415,6 +475,20 @@ def read_lorrax_input(filename: str) -> dict:
                     f"``eqp1.dat`` (with Z-linearization) are written "
                     f"automatically.  Remove '{legacy_key}' from your "
                     f"input file.",
+                    DeprecationWarning, stacklevel=2,
+                )
+        # Deprecated qp_solver aliases (still honored via auto-resolution;
+        # see ``LorraxConfig.qp_solver``).
+        for legacy_key, replacement in (
+            ("self_consistent", "qp_solver = self_consistent"),
+            ("sigma_at_dft_energies", "qp_solver = one_shot_dft (the default)"),
+        ):
+            if section.get(legacy_key, fallback=None) is not None:
+                import warnings
+                warnings.warn(
+                    f"Input key '{legacy_key}' is deprecated; it is honored "
+                    f"via ``qp_solver = auto`` resolution.  Set "
+                    f"'{replacement}' instead.",
                     DeprecationWarning, stacklevel=2,
                 )
 
@@ -596,6 +670,45 @@ class PPMConfig:
 
 
 @dataclass(frozen=True)
+class SCConfig:
+    """Self-consistency loop knobs (read only when qp_solver=self_consistent).
+
+    Promoted from the ``LORRAX_SC_*`` env vars (NEXT_TARGETS #11); the
+    envs are still honored as deprecated overrides at config construction
+    (``from_input_file`` prints a note when one is active).
+
+    - ``max_iter`` / ``tol_ev``: loop length and RMS-ΔE convergence (eV).
+    - ``accelerator``: ``"rcrop"`` (Anderson-style restart-CROP, default —
+      required for QSGW's typical 2-cycle Jacobian) or ``"linear"``
+      (plain α-mixing, diagnostic).  rCROP makes TWO ``gw_iteration_map``
+      calls per accelerator iteration (trial + residual).
+    - ``history_depth``: rCROP history (m=5 is BGW's QSGW default).
+    - ``mixing``: linear-mixing α (``accelerator="linear"`` only).
+    - ``dump_dir``: per-iteration E-history .npy dump dir (None = off).
+    """
+    max_iter: int
+    tol_ev: float
+    accelerator: str      # "rcrop" | "linear"
+    history_depth: int
+    mixing: float
+    dump_dir: str | None
+
+    def __post_init__(self):
+        if self.max_iter < 1:
+            raise ValueError("sc_max_iter must be >= 1.")
+        if self.tol_ev <= 0.0:
+            raise ValueError("sc_tol_ev must be > 0.")
+        if self.accelerator not in ("rcrop", "linear"):
+            raise ValueError(
+                f"sc_accelerator must be 'rcrop' or 'linear'; "
+                f"got {self.accelerator!r}.")
+        if self.history_depth < 1:
+            raise ValueError("sc_history_depth must be >= 1.")
+        if not (0.0 < self.mixing <= 1.0):
+            raise ValueError("sc_mixing must be in (0, 1].")
+
+
+@dataclass(frozen=True)
 class MemoryConfig:
     """Per-device memory budget + chunk sizing + AOT chunk-chooser flag.
 
@@ -697,10 +810,11 @@ class LorraxConfig:
     # --- Core mode flags (top-level; hot path) ---
     restart: bool
     compute_mode_raw: str         # "auto" | one of ComputeMode.value strings
+    qp_solver_raw: str            # "auto" | one of QPSolver.value strings
     do_screened: bool
     bispinor: bool
     do_G0: bool
-    self_consistent: bool
+    self_consistent: bool         # deprecated alias; ``qp_solver`` is canonical
     use_ppm_sigma: bool           # legacy mirror; ``compute_mode`` is canonical
     no_degen_averaging: bool
     degen_avg_tol_ry: float
@@ -710,6 +824,7 @@ class LorraxConfig:
     head: HeadConfig
     screening: ScreeningConfig
     ppm: PPMConfig
+    sc: SCConfig
     memory: MemoryConfig
     backend: BackendConfig
     debug: DebugConfig
@@ -755,6 +870,62 @@ class LorraxConfig:
                 f"compute_mode={raw!r} invalid; expected one of: "
                 f"{', '.join(m.value for m in ComputeMode)}, or 'auto'."
             ) from exc
+
+    @property
+    def qp_solver(self) -> QPSolver:
+        """Resolve ``qp_solver`` from explicit input or legacy flags.
+
+        ``qp_solver = auto`` (the default) resolves:
+
+        1. ``self_consistent = true`` → ``SELF_CONSISTENT`` (deprecated
+           key, still honored);
+        2. else → ``ONE_SHOT_DFT`` — standard G0W0 is the default.
+           (The deprecated ``sigma_at_dft_energies = true`` alias also
+           lands here: its intended meaning — authoritative at-DFT QP
+           evaluation — IS the default.)
+
+        An explicit setting overrides the legacy flags, mirroring how
+        ``compute_mode`` absorbs ``do_screened`` / ``use_ppm_sigma``.
+
+        Validation (mutually inconsistent axis combinations):
+
+        - ``fixed_point`` × static mode → error (no ω-grid to solve on;
+          a silent no-op would blur the axis).
+        - ``fixed_point`` / ``self_consistent`` × dynamic mode with
+          ``sigma_omega_accumulation = kij_stream`` → error (streamed
+          Σ_c(ω) leaves no in-memory tensor for the on-shell solve /
+          QSGW rebuild; previously this pair silently degraded the eigh
+          outputs to static COHSEX).
+        """
+        raw = (self.qp_solver_raw or "auto").strip().lower()
+        if raw == "auto":
+            solver = (QPSolver.SELF_CONSISTENT if self.self_consistent
+                      else QPSolver.ONE_SHOT_DFT)
+        else:
+            try:
+                solver = QPSolver(raw)
+            except ValueError as exc:
+                raise ValueError(
+                    f"qp_solver={raw!r} invalid; expected one of: "
+                    f"{', '.join(s.value for s in QPSolver)}, or 'auto'."
+                ) from exc
+        mode = self.compute_mode
+        if solver is QPSolver.FIXED_POINT and not mode.is_dynamic:
+            raise ValueError(
+                f"qp_solver=fixed_point requires a dynamic compute_mode "
+                f"(gn_ppm / hl_ppm); static Σ ({mode.value}) has no ω-grid "
+                f"to solve E = h0 + ReΣ(E) on.  Use one_shot_dft (identical "
+                f"physics for static Σ) or self_consistent.")
+        if (solver in (QPSolver.FIXED_POINT, QPSolver.SELF_CONSISTENT)
+                and mode.is_dynamic
+                and self.ppm.omega_accumulation == "kij_stream"):
+            raise ValueError(
+                f"qp_solver={solver.value} is incompatible with "
+                f"sigma_omega_accumulation=kij_stream: streamed Σ_c(ω) "
+                f"leaves no in-memory ω-tensor for the on-shell solve / "
+                f"QSGW build (the eigh-family outputs would silently "
+                f"degrade to static Σ).  Use 'kij' or 'auto'.")
+        return solver
 
     @property
     def minimax_config(self):
@@ -953,6 +1124,39 @@ class LorraxConfig:
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
             sigma_at_dft_energies=bool(_g("sigma_at_dft_energies")),
         )
+        # SC loop knobs.  The LORRAX_SC_* env vars are deprecated overrides
+        # of the sc_* input keys (kept so existing sweep scripts run
+        # unchanged); a note is printed whenever one is active.
+        def _sc_env(env_key: str, cast, file_val, input_key: str):
+            raw_env = os.environ.get(env_key)
+            if raw_env is None or raw_env == "":
+                return file_val
+            val = cast(raw_env)
+            print_fn(
+                f"  [config] {env_key}={raw_env} (deprecated env override; "
+                f"set '{input_key} = {raw_env}' in cohsex.in instead)")
+            return val
+
+        sc = SCConfig(
+            max_iter=_sc_env(
+                "LORRAX_SC_MAX_ITER", int, int(_g("sc_max_iter")),
+                "sc_max_iter"),
+            tol_ev=_sc_env(
+                "LORRAX_SC_TOL_EV", float, float(_g("sc_tol_ev")),
+                "sc_tol_ev"),
+            accelerator=_sc_env(
+                "LORRAX_SC_ACCEL", lambda s: str(s).strip().lower(),
+                str(_g("sc_accelerator")).strip().lower(), "sc_accelerator"),
+            history_depth=_sc_env(
+                "LORRAX_SC_DEPTH", int, int(_g("sc_history_depth")),
+                "sc_history_depth"),
+            mixing=_sc_env(
+                "LORRAX_SC_MIXING", float, float(_g("sc_mixing")),
+                "sc_mixing"),
+            dump_dir=_sc_env(
+                "LORRAX_SC_DUMP_DIR", str, str(_g("sc_dump_dir") or ""),
+                "sc_dump_dir") or None,
+        )
         memory = MemoryConfig(
             per_device_gb=memory_per_device_gb,
             chunk_target_utilization=chunk_utilization,
@@ -1053,6 +1257,7 @@ class LorraxConfig:
             sys_dim=int(_g("sys_dim")),
             restart=bool(_g("restart")),
             compute_mode_raw=str(_g("compute_mode") or "auto").strip().lower(),
+            qp_solver_raw=str(_g("qp_solver") or "auto").strip().lower(),
             do_screened=bool(_g("do_screened")),
             bispinor=bool(_g("bispinor")),
             do_G0=bool(_g("do_G0")),
@@ -1065,6 +1270,7 @@ class LorraxConfig:
             head=head,
             screening=screening,
             ppm=ppm,
+            sc=sc,
             memory=memory,
             backend=backend,
             debug=debug,
