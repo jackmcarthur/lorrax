@@ -645,10 +645,13 @@ def fit_zeta_to_h5(
     #
     # Single SlabIO handle reused for both create_dataset and all
     # writes — avoids the ~900 ms cost of a second collective
-    # H5Fopen/close pair (measured 2026-04-18 at MoS2 3x3).  The
-    # allgather backend doesn't need a long-lived handle (rank 0 writes
-    # from a Python worker using plain h5py) so we keep the old
-    # create-then-reopen pattern for that path.
+    # H5Fopen/close pair (measured 2026-04-18 at MoS2 3x3).  The same
+    # handle serves BOTH backends: the allgather backend's handle is a
+    # cheap rank-0 h5py file object, and routing its final write through
+    # ``write_slab`` (instead of a hand-rolled gather + ``[...] =``)
+    # applies the shared ``valid_shape`` prefix clip — the bypass used
+    # to write the PADDED gathered buffer into the logical-shaped
+    # dataset and crashed whenever a μ pad existed (PADDING_AUDIT #2).
     #
     # mode='a' (not 'w') so the pre-written mf_header + isdf_header
     # are preserved.  SlabIO's FFI prestripe step is skipped on 'a'
@@ -674,25 +677,14 @@ def fit_zeta_to_h5(
         # full μ × full ngkmax keeps per-q reads contiguous.
         _n_G_sph = (int(_gflat_ngkmax)
                      if _gflat_ngkmax is not None else n_rtot)
-        if use_ffi_io:
-            zeta_io = SlabIO(output_file, mode='a', mesh=mesh_xy,
-                             backend=slab_io_backend)
-            zeta_io.create_dataset(
-                'zeta_q_G',
-                shape=(n_q_disk, n_rmu, _n_G_sph),
-                dtype=np.complex128,
-                chunks=(1, n_rmu, _n_G_sph),
-            )
-        else:
-            with SlabIO(output_file, mode='a', mesh=mesh_xy,
-                        backend=slab_io_backend) as _zeta_create_io:
-                _zeta_create_io.create_dataset(
-                    'zeta_q_G',
-                    shape=(n_q_disk, n_rmu, _n_G_sph),
-                    dtype=np.complex128,
-                    chunks=(1, n_rmu, _n_G_sph),
-                )
-            zeta_io = None
+        zeta_io = SlabIO(output_file, mode='a', mesh=mesh_xy,
+                         backend=slab_io_backend)
+        zeta_io.create_dataset(
+            'zeta_q_G',
+            shape=(n_q_disk, n_rmu, _n_G_sph),
+            dtype=np.complex128,
+            chunks=(1, n_rmu, _n_G_sph),
+        )
 
     # ========== STEP 5: Pre-load G-space for all band chunks (ONCE) ==========
     # This caches the expensive HDF5 read + scatter so we don't repeat it
@@ -968,35 +960,22 @@ def fit_zeta_to_h5(
                 _mask, gflat_acc, jnp.zeros_like(gflat_acc))
         jax.block_until_ready(gflat_acc)
         _n_G_sph = int(gflat_acc.shape[-1])
-        if use_ffi_io:
-            # On-disk extent is LOGICAL n_rmu; in-memory buffer is
-            # PADDED ``n_rmu_padded``.  SlabIO ``valid_shape=`` clips
-            # the trailing μ pad rows on write (they are zero by
-            # construction — L_q's pad block is identity).
-            zeta_io.write_slab(
-                'zeta_q_G', gflat_acc,
-                offset=(0, 0, 0),
-                global_shape=(n_q_disk, n_rmu, _n_G_sph),
-                valid_shape=(n_q_disk, n_rmu, _n_G_sph),
-            )
-        else:
-            # allgather backend: one per-q gather (not per chunk).
-            # The full tensor is at most a few GB replicated; for
-            # CrI3 scale the FFI backend is mandatory anyway.
-            from file_io._slab_io_allgather import _to_host as _gather_to_host
-            _g = _gather_to_host(gflat_acc)
-            if jax.process_index() == 0:
-                import h5py as _h5
-                with _h5.File(output_file, 'a') as _f:
-                    _f['zeta_q_G'][...] = _g
-            del _g
+        # On-disk extent is LOGICAL n_rmu; in-memory buffer is
+        # PADDED ``n_rmu_padded``.  SlabIO ``valid_shape=`` clips
+        # the trailing μ pad rows on write (they are zero by
+        # construction — L_q's pad block is identity).  Both backends
+        # implement the same prefix clip (FFI hyperslab / allgather
+        # rank-0 slice), so this is the single write path.
+        zeta_io.write_slab(
+            'zeta_q_G', gflat_acc,
+            offset=(0, 0, 0),
+            global_shape=(n_q_disk, n_rmu, _n_G_sph),
+            valid_shape=(n_q_disk, n_rmu, _n_G_sph),
+        )
     del gflat_acc
 
-    # Close the SlabIO handle (FFI path only; allgather path never
-    # opened one after STEP 4).
     with timing.section("zeta_fit.close_io"):
-        if zeta_io is not None:
-            zeta_io.close()
+        zeta_io.close()
 
     with timing.section("zeta_fit.sync_global"):
         jax.experimental.multihost_utils.sync_global_devices("zeta_writes_complete")
