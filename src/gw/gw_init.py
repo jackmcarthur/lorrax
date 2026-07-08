@@ -204,8 +204,11 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		# the charge-channel padded extent, and the C_q reshape at
 		# isdf_fitting.py:1442 trips a TypeError when the transverse
 		# centroid count differs from the charge count.
+		# ``padded_mu_extent`` also honors the test-only
+		# LORRAX_EXTRA_MU_PAD knob (pad-extent-invariance gate).
+		from runtime.padding import padded_mu_extent
 		_world_size = int(jax.device_count())
-		n_rmu_curr_padded = ((n_rmu_curr + _world_size - 1) // _world_size) * _world_size
+		n_rmu_curr_padded = padded_mu_extent(n_rmu_curr, _world_size)
 		meta_curr = dataclasses.replace(
 			meta,
 			n_rmu=int(n_rmu_curr),

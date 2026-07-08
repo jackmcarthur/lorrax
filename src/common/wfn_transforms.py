@@ -1698,7 +1698,7 @@ def load_centroids_band_chunked(
     del use_phdf5  # WfnLoader's backend='auto' picks phdf5 when it's safe
     del sym        # WfnLoader builds its own SymMaps lazily
     from common import timing
-    from runtime.padding import round_up_to_mesh_product
+    from runtime.padding import padded_mu_extent
 
     b_start, b_end = band_range
     nb_total = b_end - b_start
@@ -1756,7 +1756,10 @@ def load_centroids_band_chunked(
     out_X = NamedSharding(mesh_xy, P(None, 'x', None, None))
     stage_Y_4d = NamedSharding(mesh_xy, P(None, 'y', None, None))
 
-    n_rmu_padded = round_up_to_mesh_product(n_rmu, mesh_xy)
+    # Same divisor + test-only extra pad as Meta.n_rmu_padded — the ψ
+    # centroid extent loaded here must equal the meta extent the ζ-fit
+    # kernels were shaped with.
+    n_rmu_padded = padded_mu_extent(n_rmu, mesh_xy)
     sharding_load = P(None, ('x', 'y'), None, None)
 
     loader = wfn  # reuse top-level WfnLoader

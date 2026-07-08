@@ -505,12 +505,15 @@ class BispinorVqReader:
 
         Padding to ``gx*gy`` (rather than per-axis ``gx``/``gy``) is also
         what makes sharded reads with spec P(None,'x','y') divide
-        cleanly under any 2D mesh factorisation."""
+        cleanly under any 2D mesh factorisation.
+
+        Routed through ``runtime.padding.padded_mu_extent`` so the
+        test-only LORRAX_EXTRA_MU_PAD knob stays consistent with the
+        ψ-side / write-side extents."""
+        from runtime.padding import padded_mu_extent
         proc = int(self._mesh.shape['x']) * int(self._mesh.shape['y'])
-        def _pad(n):
-            rem = n % proc
-            return n + ((proc - rem) if rem else 0)
-        return _pad(int(n_L)), _pad(int(n_R))
+        return (padded_mu_extent(int(n_L), proc),
+                padded_mu_extent(int(n_R), proc))
 
     def get_tile(self, mu_L: int, nu_L: int) -> jax.Array:
         """Return V^{μ_L, ν_L}_q as a sharded JAX array (n_q, n_L_padded,

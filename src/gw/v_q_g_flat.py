@@ -353,11 +353,15 @@ def _compute_V_q_g_flat_one_tile(
     n_chunks = ngkmax // g_chunk
 
     # ---- μ padding to mesh-product per side ---------------------------
+    # ``padded_mu_extent`` = the same round-up (+ test-only
+    # LORRAX_EXTRA_MU_PAD rows) as ``Meta.n_rmu_padded`` — the V tiles
+    # built here must match the ψ-side μ extent exactly.
+    from runtime.padding import padded_mu_extent
     p_x = int(mesh_xy.shape['x'])
     p_y = int(mesh_xy.shape['y'])
     _proc = p_x * p_y
     def _pad(n: int) -> int:
-        return n + (_proc - n % _proc) % _proc
+        return padded_mu_extent(int(n), _proc)
     n_rmu_L_padded = _pad(int(n_rmu_L))
     n_rmu_R_padded = _pad(int(n_rmu_R))
     if verbose and jax.process_index() == 0:

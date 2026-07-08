@@ -130,7 +130,10 @@ class Meta:
         # n_rmu_padded uses world_size (== ∏ p_a over the device mesh), the
         # worst-case divisor for any single- or product-axis PartitionSpec on
         # the μ dim.  Parallel to b_id_4's use of world_size (line 100).
-        n_rmu_padded = _round_up(n_rmu, world_size)
+        # ``padded_mu_extent`` = round_up(n_rmu, world_size) plus the
+        # test-only LORRAX_EXTRA_MU_PAD rows (pad-extent-invariance gate).
+        from runtime.padding import padded_mu_extent
+        n_rmu_padded = padded_mu_extent(n_rmu, world_size)
         return cls(
             rank,
             n_proc,

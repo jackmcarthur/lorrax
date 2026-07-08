@@ -144,6 +144,73 @@ def round_up_to_mesh_product(n: int, mesh) -> int:
     return int(n) + ((prod - rem) if rem else 0)
 
 
+def extra_mu_pad() -> int:
+    """TEST-ONLY: extra μ-pad rows requested via ``LORRAX_EXTRA_MU_PAD``.
+
+    Returns the integer value of the ``LORRAX_EXTRA_MU_PAD`` environment
+    variable (0 when unset/empty).  Read at call time so tests can flip
+    it per-subprocess.
+
+    Purpose: device-count-invariance testing at FIXED device count.
+    ``n_rmu_padded = round_up(n_rmu, world_size)`` changes with the
+    device count, so a pad-extent bug (a computation that runs on the
+    padded instead of the logical μ extent) is normally only visible by
+    comparing runs at different P.  This knob forces additional zero
+    pad rows on top of the mesh round-up, reproducing e.g. the P=16 pad
+    extent in a P=1/P=4 run (see
+    ``reports/device_invariance_2026-07-08/ROOT_CAUSE.md``).  Any
+    result that changes under this knob at fixed P depends on the pad
+    extent and is a defect.
+
+    NEVER set this in production runs — it only wastes memory at best
+    and, before the pad-extent fixes, changed answers at worst.
+    """
+    import os
+    raw = os.environ.get("LORRAX_EXTRA_MU_PAD", "").strip()
+    if not raw:
+        return 0
+    val = int(raw)
+    if val < 0:
+        raise ValueError(f"LORRAX_EXTRA_MU_PAD must be >= 0; got {val}")
+    return val
+
+
+def padded_mu_extent(n_rmu: int, divisor) -> int:
+    """Single source of truth for the padded μ extent (``Meta.n_rmu_padded``).
+
+    ``round_up(n_rmu, divisor)`` — plus, when the test-only
+    ``LORRAX_EXTRA_MU_PAD`` env knob is set (see :func:`extra_mu_pad`),
+    that many extra pad rows, re-rounded so mesh divisibility is
+    preserved.  With ``extra % divisor == 0`` (the intended use, e.g.
+    extra=12 at P=4 to force the P=16 extent) the result is exactly
+    ``round_up(n_rmu, divisor) + extra``.
+
+    Parameters
+    ----------
+    n_rmu : int
+        Logical centroid count.
+    divisor : int | Mesh
+        Worst-case shard divisor — ``jax.device_count()`` (= ∏ p_a) or
+        a Mesh whose axis-size product is used.
+    """
+    if not isinstance(divisor, int):
+        try:
+            prod = 1
+            for axis in divisor.axis_names:
+                prod *= int(divisor.shape[axis])
+            divisor = prod
+        except AttributeError as exc:
+            raise TypeError(
+                f"padded_mu_extent: divisor must be an int or a Mesh; "
+                f"got {type(divisor)!r}") from exc
+    d = max(int(divisor), 1)
+    base = ((int(n_rmu) + d - 1) // d) * d
+    extra = extra_mu_pad()
+    if extra:
+        base = ((base + extra + d - 1) // d) * d
+    return base
+
+
 # ---------------------------------------------------------------------------
 # Array-level helpers (jit-safe; no host transfers)
 # ---------------------------------------------------------------------------
@@ -327,6 +394,8 @@ __all__ = [
     "logical_shape_from_padded",
     "PadAxis",
     "round_up_to_mesh_product",
+    "extra_mu_pad",
+    "padded_mu_extent",
     "pad_array_to_mesh",
     "unpad_array_from_mesh",
     "valid_shape_from_pad_meta",
