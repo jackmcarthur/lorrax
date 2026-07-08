@@ -129,7 +129,6 @@ def _prepare_sigma_state(
     valid_mask_q: jax.Array,
     use_midgap: jax.Array,
     keep_invalid: jax.Array,
-    mu_logical_mask: jax.Array,
 ) -> _SigmaPhysicsState:
     """Derive Fermi level + derived energy/PPM arrays in one fused trace.
 
@@ -145,16 +144,11 @@ def _prepare_sigma_state(
     fallback pole at ``fallback_omega`` (default 2 Ry; BGW mode 2 / "2ry").
     The static-COHSEX mode (BGW 3) is handled/rejected at the caller.
 
-    ``mu_logical_mask`` is a (μ,) bool selecting the LOGICAL centroid rows
-    (``arange(μ_padded) < n_rmu``).  μ-pad modes carry Wc0 = 0 exactly, so
-    the fit hands them the FALLBACK pole (Ω = fallback_omega > 1e-14) and
-    they would otherwise enter ``B_mask_raw`` — inflating ``n_total_modes``
-    / ``n_invalid`` by a pad-extent- (= device-count-) dependent amount, and
-    under ``keep_invalid`` also entering ``B_mask``, whose masked-Ω min/max
-    feed the adaptive minimax window construction (ROOT_CAUSE.md
-    2026-07-08, charge manifestation).  Physics is unchanged: pad-mode
-    B_q = −0.5·Wc0·Ω = 0 exactly, so they never contributed to Σ_c — only
-    to the census and the window statistics.
+    μ-pad safety is structural, not per-consumer: pad modes are born DEAD
+    at the fit (``fit_gn_ppm_from_wc_pair(n_mu_logical=...)`` zeroes their
+    Ω, hence B = 0 and valid = False), so ``B_mask_raw = Ω > 1e-14``
+    excludes them here — and in every other Ω/B consumer — with no mask
+    argument (ROOT_CAUSE.md 2026-07-08; PADDING_AUDIT item 3).
     """
     occ_mask = occ_full > 0.5
     unocc_mask = ~occ_mask
@@ -170,9 +164,7 @@ def _prepare_sigma_state(
 
     Omega_abs = jnp.maximum(jnp.real(Omega_q), 0.0).astype(jnp.float64)
     B_corr = jnp.asarray(B_q, dtype=jnp.complex128)
-    mu_log = jnp.asarray(mu_logical_mask, dtype=bool)
-    mode_logical = mu_log[:, None] & mu_log[None, :]          # (μ, μ)
-    B_mask_raw = (Omega_abs > 1.0e-14) & mode_logical[None, :, :]
+    B_mask_raw = Omega_abs > 1.0e-14
     valid = jnp.asarray(valid_mask_q, dtype=bool)
     # ppm_invalid_mode: keep_invalid=False drops Omega^2<0 poles (BGW mode 0);
     # keep_invalid=True keeps the fit's fallback pole (BGW mode 2).
@@ -204,7 +196,7 @@ def fit_ppm(
     n_nodes_static: int = 0,
     print_fn=None,
     model_label: str = "PPM",
-    n_mu_logical: int | None = None,
+    n_mu_logical: int,
 ) -> PPMBuildResult:
     """Fit two-point PPM pole parameters from precomputed W(0) and W(probe).
 
@@ -215,25 +207,20 @@ def fit_ppm(
     All input arrays are flat-q (nq, μ, μ).  Returns PPMBuildResult with
     B_q, Omega_q, valid_mask_q sharded as P(None, 'x', 'y').
 
-    ``n_mu_logical``: logical centroid count.  When the inputs are
-    μ-padded, restricts the printed ``unfulfilled`` fraction to the
-    logical (μ, ν) modes so it doesn't depend on the pad extent
-    (= device count).  The fitted tensors keep the padded extent.
+    ``n_mu_logical`` (REQUIRED, = ``meta.n_rmu``): logical centroid
+    count.  The fitted tensors keep the padded extent, but pad modes are
+    born DEAD (Ω = B = 0, valid = False) and the ``unfulfilled``
+    fraction counts logical modes only — see ``fit_gn_ppm_from_wc_pair``.
     """
     import time as _t
     z = complex(probe_omega)
     t0 = _t.perf_counter()
 
-    mode_mask = None
-    if n_mu_logical is not None:
-        mu_log = jnp.arange(int(W0_q.shape[-1])) < int(n_mu_logical)
-        mode_mask = mu_log[:, None] & mu_log[None, :]
-
     Wc0_q = W0_q - V_q
     Wci_q = Wprobe_q - V_q
     omega_qmunu, b_qmunu, valid_qmunu, unfulfilled = fit_gn_ppm_from_wc_pair(
         Wc0_q, Wci_q, z, fallback_omega=float(fallback_omega),
-        mode_mask=mode_mask)
+        n_mu_logical=int(n_mu_logical))
 
     q_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     Omega = jax.lax.with_sharding_constraint(jnp.asarray(omega_qmunu), q_shard)
@@ -592,17 +579,14 @@ def compute_sigma_c_ppm_omega_grid(
 
     # Derive Fermi level, energy/band masks, and PPM pole masks in one fused trace.
     # valid_mask_q=None → all-true mask at the caller so the jit sees a real array.
+    # (μ-pad modes need no mask here: they are born with Ω = 0 at the fit
+    # and drop out of B_mask_raw structurally — see _prepare_sigma_state.)
     if valid_mask_q is None:
         valid_mask_q = jnp.ones(Omega_q.shape, dtype=bool)
-    # Logical-μ selector: pad modes must not enter the mode census or the
-    # window statistics (see _prepare_sigma_state).  meta.n_rmu is the
-    # logical centroid count; Omega_q's extent is the padded one.
-    mu_logical_mask = jnp.arange(int(Omega_q.shape[-1])) < int(meta.n_rmu)
     state = _prepare_sigma_state(
         enk_full, occ_full, B_q, Omega_q, valid_mask_q,
         jnp.asarray(fermi_reference == "midgap", dtype=bool),
         jnp.asarray(keep_invalid, dtype=bool),
-        mu_logical_mask,
     )
     efermi = state.efermi
     E_cond = state.E_cond

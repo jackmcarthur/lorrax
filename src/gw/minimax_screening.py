@@ -347,24 +347,13 @@ class CrossingMinimaxQuadrature:
             self.tau, self.alpha, time_axis=time_axis)
 
 
-@dataclass(frozen=True)
-class GodbyNeedsPPM:
-    """GN-PPM parameters in ISDF form."""
-
-    omega_p: float
-    omega_qmunu: jnp.ndarray
-    b_qmunu: jnp.ndarray
-    valid_qmunu: jnp.ndarray
-    unfulfilled_fraction: float
-
-
 def fit_gn_ppm_from_wc_pair(
     Wc0_qmunu: jax.Array,
     Wc_probe_qmunu: jax.Array,
     probe_omega: complex,
     *,
     fallback_omega: float,
-    mode_mask: jax.Array | None = None,
+    n_mu_logical: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, float]:
     """Fit GN-PPM pole data elementwise on an already-sharded ``(q,mu,nu)`` tensor pair.
 
@@ -380,25 +369,39 @@ def fit_gn_ppm_from_wc_pair(
     fallback_omega
         Positive real fallback pole in Ry for entries that do not produce a valid
         positive-real ``Omega^2`` estimate.
-    mode_mask
-        Optional bool mask, broadcastable against ``Wc0_qmunu``, selecting the
-        LOGICAL (μ, ν) modes.  μ-padded inputs carry exact-zero pad rows/cols
-        whose fit is trivially "unfulfilled" (Wc0 = Wc_probe = 0); without the
-        mask they inflate ``unfulfilled_fraction`` by an amount that depends on
-        the pad extent — i.e. on the device count (ROOT_CAUSE.md 2026-07-08).
-        ``None`` keeps the historical whole-tensor mean.
+    n_mu_logical
+        Logical centroid count (``meta.n_rmu``).  REQUIRED — the trailing
+        (μ, ν) axes may carry the padded extent, and pad modes must be born
+        DEAD here: ``Ω = 0``, ``B = 0``, ``valid = False``.  Handing them the
+        live-looking fallback Ω instead used to inflate the mode census and
+        the masked-Ω window statistics by a pad-extent- (= device-count-)
+        dependent amount (ROOT_CAUSE.md 2026-07-08).  Zeroing Ω at birth
+        makes every present and future ``Omega_q``/``B_q`` consumer
+        structurally pad-safe: the ``Ω > 1e-14`` mode mask excludes pads with
+        no mask argument anywhere downstream.  Pass the padded extent
+        (all-true mask) when the inputs are unpadded.
 
     Returns
     -------
     omega_qmunu, B_qmunu, valid_qmunu, unfulfilled_fraction
         Elementwise GN-PPM parameters in the same ``(nkx,nky,nkz,n_rmu,n_rmu)``
-        layout. The fit is pure local algebra: no host gathers and no communication
-        beyond whatever sharding is already attached to the inputs.
+        layout; ``unfulfilled_fraction`` counts LOGICAL modes only. The fit is
+        pure local algebra: no host gathers and no communication beyond
+        whatever sharding is already attached to the inputs.
     """
 
     Wc0 = jnp.asarray(Wc0_qmunu, dtype=jnp.complex128)
     Wc_probe = jnp.asarray(Wc_probe_qmunu, dtype=jnp.complex128)
     z_probe = jnp.asarray(probe_omega, dtype=jnp.complex128)
+
+    n_mu = int(Wc0.shape[-1])
+    n_log = int(n_mu_logical)
+    if not (0 < n_log <= n_mu):
+        raise ValueError(
+            f"fit_gn_ppm_from_wc_pair: n_mu_logical={n_log} outside "
+            f"(0, {n_mu}] for input extent {n_mu}.")
+    mu_log = jnp.arange(n_mu) < n_log
+    mode_mask = mu_log[:, None] & mu_log[None, :]   # (μ, ν) logical selector
 
     denom = Wc0 - Wc_probe
     safe = jnp.abs(denom) > 1.0e-14
@@ -409,20 +412,20 @@ def fit_gn_ppm_from_wc_pair(
         safe
         & jnp.isfinite(omega_sq_re)
         & (omega_sq_re > 0.0)
+        & mode_mask
     )
 
     fallback = jnp.asarray(fallback_omega, dtype=jnp.float64)
-    omega_vals = jnp.where(good, jnp.sqrt(omega_sq_re), fallback)
+    # Pad modes born DEAD: Ω = 0 (hence B = -Wc0·Ω/2 = 0) outside the
+    # logical block — see ``n_mu_logical`` above.
+    omega_vals = jnp.where(
+        mode_mask, jnp.where(good, jnp.sqrt(omega_sq_re), fallback), 0.0)
     B_vals = -0.5 * Wc0 * omega_vals.astype(jnp.complex128)
-    if mode_mask is None:
-        unfulfilled_fraction = 1.0 - _scalar_to_host_float(
-            jnp.mean(good.astype(jnp.float64)))
-    else:
-        m = jnp.broadcast_to(jnp.asarray(mode_mask, dtype=bool), good.shape)
-        n_modes = jnp.sum(m.astype(jnp.float64))
-        n_good = jnp.sum((good & m).astype(jnp.float64))
-        unfulfilled_fraction = 1.0 - _scalar_to_host_float(
-            n_good / jnp.maximum(n_modes, 1.0))
+    m = jnp.broadcast_to(mode_mask, good.shape)
+    n_modes = jnp.sum(m.astype(jnp.float64))
+    n_good = jnp.sum(good.astype(jnp.float64))
+    unfulfilled_fraction = 1.0 - _scalar_to_host_float(
+        n_good / jnp.maximum(n_modes, 1.0))
     return omega_vals, B_vals, good, unfulfilled_fraction
 
 
@@ -681,40 +684,3 @@ def solve_phase_minimax_bandwidth(
     )
 
 
-def extract_gn_ppm_parameters_from_Wc(
-    Wc0_q: jnp.ndarray,
-    Wc_iwp_q: jnp.ndarray,
-    *,
-    omega_p: float,
-    fallback_omega: float = 2.0,
-) -> GodbyNeedsPPM:
-    """Extract GN-PPM parameters from W^c(0) and W^c(i*omega_p).
-
-    Accepts flat-q (nq, μ, μ) or 7D (nkx, nky, nkz, 1, μ, 1, μ).
-    """
-    omega_p = float(omega_p)
-    fallback_omega = float(fallback_omega)
-    if omega_p <= 0.0:
-        raise ValueError("omega_p must be > 0 for GN-PPM extraction.")
-
-    # Accept flat-q (nq, μ, μ) or 7D (nkx, nky, nkz, 1, μ, 1, μ)
-    if Wc0_q.ndim == 3:
-        Wc0 = jnp.asarray(Wc0_q, dtype=jnp.complex128)
-        Wci = jnp.asarray(Wc_iwp_q, dtype=jnp.complex128)
-    else:
-        Wc0 = jnp.asarray(Wc0_q[:, :, :, 0, :, 0, :], dtype=jnp.complex128)
-        Wci = jnp.asarray(Wc_iwp_q[:, :, :, 0, :, 0, :], dtype=jnp.complex128)
-    omega_vals, B, good, unfulfilled_fraction = fit_gn_ppm_from_wc_pair(
-        Wc0,
-        Wci,
-        1j * omega_p,
-        fallback_omega=fallback_omega,
-    )
-
-    return GodbyNeedsPPM(
-        omega_p=omega_p,
-        omega_qmunu=omega_vals,
-        b_qmunu=B,
-        valid_qmunu=good,
-        unfulfilled_fraction=unfulfilled_fraction,
-    )
