@@ -197,8 +197,6 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		         f"centroids: {cents_curr_path}")
 		_, cents_curr_idx, n_rmu_curr = load_centroids(
 			cents_curr_path, meta.fft_grid)
-		# Round n_rmu_jax to n_proc (legacy field, host-count divisor).
-		n_rmu_curr_jax = ((n_rmu_curr + meta.n_proc - 1) // meta.n_proc) * meta.n_proc
 		# n_rmu_padded uses world_size (= ∏ p_a over the device mesh).
 		# Without this refresh the bispinor transverse fit_zeta inherits
 		# the charge-channel padded extent, and the C_q reshape at
@@ -212,7 +210,6 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		meta_curr = dataclasses.replace(
 			meta,
 			n_rmu=int(n_rmu_curr),
-			n_rmu_jax=int(n_rmu_curr_jax),
 			n_rmu_padded=int(n_rmu_curr_padded),
 		)
 		# ``sys_dim`` is set dynamically on ``meta`` by gw_jax.main

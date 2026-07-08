@@ -55,9 +55,6 @@ def _build_toy_problem():
         nky=1,
         nkz=1,
         nk_tot=1,
-        nbnd_jax=1,
-        n_rtot_jax=1,
-        n_rmu_jax=1,
     )
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
     return E_v, E_c, psi_vTX, psi_vY, psi_cX, psi_cTY, [win], meta, mesh

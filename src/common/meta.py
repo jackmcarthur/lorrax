@@ -31,12 +31,6 @@ class Meta:
     nky: int
     nkz: int
     nk_tot: int
-    nbnd_jax: int
-    n_rtot_jax: int
-    n_rmu_jax: int            # legacy: round_up(n_rmu, n_proc).  n_proc is the host count
-                              # which is the wrong divisor for sharding constraints; kept for
-                              # back-compat with callers that still reference it.  Use
-                              # ``n_rmu_padded`` instead.
     n_rmu_padded: int = 0     # n_rmu rounded up to ``world_size`` (= jax.device_count() = ∏ p_a
                               # over the device mesh).  Worst-case sharding divisor — any
                               # single- or product-axis PartitionSpec on the μ dim divides this.
@@ -124,9 +118,6 @@ class Meta:
         npol = 4 if nspinor == 4 else 1
         nkx, nky, nkz = (int(x) for x in wfn.kgrid)
         nk_tot = int(sym.nk_tot)
-        nbnd_jax = _round_up(b_id_4, n_proc)
-        n_rtot_jax = _round_up(n_rtot, n_proc)
-        n_rmu_jax = _round_up(n_rmu, n_proc)
         # n_rmu_padded uses world_size (== ∏ p_a over the device mesh), the
         # worst-case divisor for any single- or product-axis PartitionSpec on
         # the μ dim.  Parallel to b_id_4's use of world_size (line 100).
@@ -155,9 +146,6 @@ class Meta:
             nky,
             nkz,
             nk_tot,
-            nbnd_jax,
-            n_rtot_jax,
-            n_rmu_jax,
             n_rmu_padded=n_rmu_padded,
             b_id_4_user=b_id_4_user,
         )

@@ -379,12 +379,13 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, solver, dtype, n_rmu):
 
     # JAX_NATIVE (q-parallel reshard + per-rank LU via shard_map).
     # Per-q LU runs at the LOGICAL μ extent (meta.n_rmu); W pad
-    # rows/cols are zero-filled — see _get_w_solve_fn.  Synthetic-meta
-    # callers (w_solve_modes_test) carry no n_rmu: their arrays ARE
-    # logical, so fall back to the array extent.
+    # rows/cols are zero-filled — see _get_w_solve_fn.  ``meta.n_rmu``
+    # is a HARD read: a soft getattr fallback here silently restored
+    # the padded-extent LU for any meta-like object missing the field
+    # (opt-out-by-omission, PADDING_AUDIT item 3).  Synthetic-meta
+    # callers must carry n_rmu (= the logical array extent).
     solve_fn = _get_w_solve_fn(
-        mesh_xy, nq, n_rmu,
-        n_rmu_logical=int(getattr(meta, 'n_rmu', n_rmu)))
+        mesh_xy, nq, n_rmu, n_rmu_logical=int(meta.n_rmu))
     return solve_fn, jnp.asarray(pref_scalar, dtype=jnp.complex128)
 
 

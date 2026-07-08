@@ -49,9 +49,6 @@ def _toy_bundle():
         nky=1,
         nkz=1,
         nk_tot=1,
-        nbnd_jax=1,
-        n_rtot_jax=1,
-        n_rmu_jax=1,
     )
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
     return wf, wins, meta, mesh

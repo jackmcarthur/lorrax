@@ -78,7 +78,9 @@ def main():
     V_q, chi0_q = make()
     jax.block_until_ready(V_q); jax.block_until_ready(chi0_q)
 
-    meta = SimpleNamespace(nk_tot=nq, nspin=1, nspinor=1)
+    # n_rmu is REQUIRED by _resolve_w_solve_fn (hard read; the
+    # synthetic arrays are unpadded so logical extent = n).
+    meta = SimpleNamespace(nk_tot=nq, nspin=1, nspinor=1, n_rmu=n)
 
     # solve_w donates its χ₀ input (position 1) so the caller must pass
     # an independent copy each time if it plans to re-use.  Run an
