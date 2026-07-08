@@ -140,6 +140,30 @@ def solve_diagonal_sigma_fixed_point(
 # Σ diagonal extraction from sharded Σ_c(ω, k, m_X, n_Y)
 # ---------------------------------------------------------------------------
 
+# Kernel cache: one jit'd extractor per mesh.  Module-scope (NOT a
+# closure inside the caller) so SC iterations hit the pjit cache instead
+# of retracing+recompiling a fresh function object every call.
+_EXTRACT_DIAG_KERNEL_CACHE: dict[int, object] = {}
+
+
+def _extract_diag_kernel(mesh_xy: Mesh):
+    key = id(mesh_xy)
+    fn = _EXTRACT_DIAG_KERNEL_CACHE.get(key)
+    if fn is None:
+        rep_3d = NamedSharding(mesh_xy, P(None, None, None))
+        rep_4d = NamedSharding(mesh_xy, P(None, None, None, None))
+
+        @jax.jit
+        def _extract(M):
+            M_full = jax.lax.with_sharding_constraint(M, rep_4d)
+            diag = jnp.einsum("...ii->...i", M_full)
+            return jax.lax.with_sharding_constraint(diag, rep_3d)
+
+        fn = _extract
+        _EXTRACT_DIAG_KERNEL_CACHE[key] = fn
+    return fn
+
+
 def extract_sigma_diag_replicated(
     sigma_w_kij: jax.Array,
     mesh_xy: Mesh,
@@ -159,21 +183,57 @@ def extract_sigma_diag_replicated(
     comfortably in the 28 GB device budget; a shard_map specialisation
     for the very-large-system case is left for follow-up.
     """
-    rep_3d = NamedSharding(mesh_xy, P(None, None, None))
-    rep_4d = NamedSharding(mesh_xy, P(None, None, None, None))
-
-    @jax.jit
-    def _extract(M):
-        M_full = jax.lax.with_sharding_constraint(M, rep_4d)
-        diag = jnp.einsum("...ii->...i", M_full)
-        return jax.lax.with_sharding_constraint(diag, rep_3d)
-
-    return _extract(sigma_w_kij)
+    return _extract_diag_kernel(mesh_xy)(sigma_w_kij)
 
 
 # ---------------------------------------------------------------------------
 # QSGW Σ_xc build — sharded ω-tensor + replicated E_kn → replicated (k, m, n)
 # ---------------------------------------------------------------------------
+
+# Kernel cache: one jit'd QSGW-build kernel per mesh (the index/weight
+# arrays are runtime args; only the replicated output sharding closes
+# over the mesh).  Module-scope for the same reason as
+# ``_extract_diag_kernel``: a closure inside ``build_qsgw_sigma_xc``
+# retraced+recompiled the full (nω, nk, nb, nb) gather every SC
+# iteration.
+_QSGW_BUILD_KERNEL_CACHE: dict[int, object] = {}
+
+
+def _qsgw_build_kernel(mesh_xy: Mesh):
+    key = id(mesh_xy)
+    fn = _QSGW_BUILD_KERNEL_CACHE.get(key)
+    if fn is None:
+        rep_3d = NamedSharding(mesh_xy, P(None, None, None))
+
+        @jax.jit
+        def _kernel(sig_w, sig_x, ilo, ihi, wlo, whi):
+            # ilo/ihi/wlo/whi: (nk, nb) replicated; sig_w: (nω, nk, nb_m_X, nb_n_Y).
+            # A[k, m, n] = Σ_c[idx[k, m], k, m, n] (interp at E_m(k))
+            # B[k, m, n] = Σ_c[idx[k, n], k, m, n] (interp at E_n(k))
+            full = sig_w.shape  # (nω, nk, nb, nb)
+
+            ilo_m = jnp.broadcast_to(ilo[None, :, :, None], full)
+            ihi_m = jnp.broadcast_to(ihi[None, :, :, None], full)
+            A_lo = jnp.take_along_axis(sig_w, ilo_m, axis=0)[0]
+            A_hi = jnp.take_along_axis(sig_w, ihi_m, axis=0)[0]
+            A = wlo[:, :, None] * A_lo + whi[:, :, None] * A_hi
+
+            ilo_n = jnp.broadcast_to(ilo[None, :, None, :], full)
+            ihi_n = jnp.broadcast_to(ihi[None, :, None, :], full)
+            B_lo = jnp.take_along_axis(sig_w, ilo_n, axis=0)[0]
+            B_hi = jnp.take_along_axis(sig_w, ihi_n, axis=0)[0]
+            B = wlo[:, None, :] * B_lo + whi[:, None, :] * B_hi
+
+            # Half-sum, then add static Σ_x and force replicated before
+            # Hermitisation (avoids a sharded transpose).
+            M = 0.5 * (A + B) + sig_x
+            M = jax.lax.with_sharding_constraint(M, rep_3d)
+            return 0.5 * (M + jnp.conj(jnp.swapaxes(M, -1, -2)))
+
+        fn = _kernel
+        _QSGW_BUILD_KERNEL_CACHE[key] = fn
+    return fn
+
 
 def build_qsgw_sigma_xc(
     sigma_c_omega_ry: jax.Array,
@@ -251,7 +311,6 @@ def build_qsgw_sigma_xc(
     w_lo = 1.0 - w_hi
 
     rep_2d = NamedSharding(mesh_xy, P(None, None))
-    rep_3d = NamedSharding(mesh_xy, P(None, None, None))
     # Numpy → replicated; ``jnp.asarray`` wrap would force a
     # single-device staging that turns device_put into an all-reduce.
     idx_lo_j = jax.device_put(idx_lo.astype(np.int32), rep_2d)
@@ -259,32 +318,7 @@ def build_qsgw_sigma_xc(
     w_lo_j   = jax.device_put(w_lo.astype(np.complex128), rep_2d)
     w_hi_j   = jax.device_put(w_hi.astype(np.complex128), rep_2d)
 
-    @jax.jit
-    def _kernel(sig_w, sig_x, ilo, ihi, wlo, whi):
-        # ilo/ihi/wlo/whi: (nk, nb) replicated; sig_w: (nω, nk, nb_m_X, nb_n_Y).
-        # A[k, m, n] = Σ_c[idx[k, m], k, m, n] (interp at E_m(k))
-        # B[k, m, n] = Σ_c[idx[k, n], k, m, n] (interp at E_n(k))
-        full = sig_w.shape  # (nω, nk, nb, nb)
-
-        ilo_m = jnp.broadcast_to(ilo[None, :, :, None], full)
-        ihi_m = jnp.broadcast_to(ihi[None, :, :, None], full)
-        A_lo = jnp.take_along_axis(sig_w, ilo_m, axis=0)[0]
-        A_hi = jnp.take_along_axis(sig_w, ihi_m, axis=0)[0]
-        A = wlo[:, :, None] * A_lo + whi[:, :, None] * A_hi
-
-        ilo_n = jnp.broadcast_to(ilo[None, :, None, :], full)
-        ihi_n = jnp.broadcast_to(ihi[None, :, None, :], full)
-        B_lo = jnp.take_along_axis(sig_w, ilo_n, axis=0)[0]
-        B_hi = jnp.take_along_axis(sig_w, ihi_n, axis=0)[0]
-        B = wlo[:, None, :] * B_lo + whi[:, None, :] * B_hi
-
-        # Half-sum, then add static Σ_x and force replicated before
-        # Hermitisation (avoids a sharded transpose).
-        M = 0.5 * (A + B) + sig_x
-        M = jax.lax.with_sharding_constraint(M, rep_3d)
-        return 0.5 * (M + jnp.conj(jnp.swapaxes(M, -1, -2)))
-
-    sigma_xc_qsgw = _kernel(
+    sigma_xc_qsgw = _qsgw_build_kernel(mesh_xy)(
         sigma_c_omega_ry, sigma_x_kij_ry,
         idx_lo_j, idx_hi_j, w_lo_j, w_hi_j,
     )
