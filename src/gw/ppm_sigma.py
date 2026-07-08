@@ -84,8 +84,10 @@ from .ppm_accumulators import (
 @dataclass(frozen=True)
 class PPMBuildResult:
     omega_p: float
-    W0_q: jax.Array           # (nq, μ, μ) flat-q
-    Wiwp_q: jax.Array         # (nq, μ, μ) flat-q
+    Wc0_q: jax.Array          # (nq, μ, μ) static W^c(0) = W(0) − V; the data
+                              # seam for the invalid-pole static-COHSEX term
+                              # (ppm_invalid_mode="static_limit", BGW mode 3).
+                              # Identity: Wc0 = −2·B_q/Ω_q elementwise.
     B_q: jax.Array            # (nq, μ, μ) PPM amplitude
     Omega_q: jax.Array        # (nq, μ, μ) PPM pole frequency
     valid_mask_q: jax.Array   # (nq, μ, μ)
@@ -116,6 +118,7 @@ class _SigmaPhysicsState(NamedTuple):
     B_corr: jax.Array          # (nq, μ, μ)     c128, ready-to-contract B_q
     Omega_abs: jax.Array       # (nq, μ, μ)     f64,  max(Re Ω_q, 0)
     B_mask: jax.Array          # (nq, μ, μ)     bool, B_mask_raw & valid
+    invalid_mask: jax.Array    # (nq, μ, μ)     bool, logical modes with Ω²<0
     n_total_modes: jax.Array   # scalar int64
     n_invalid: jax.Array       # scalar int64
 
@@ -140,9 +143,11 @@ def _prepare_sigma_state(
 
     ``keep_invalid`` is a traced bool implementing ``ppm_invalid_mode`` (BGW
     ``invalid_gpp_mode``) for poles with fitted ``Omega^2 < 0``: False = drop
-    them (``B_mask &= valid``; BGW mode 0 / "zero"); True = keep the fit's
-    fallback pole at ``fallback_omega`` (default 2 Ry; BGW mode 2 / "2ry").
-    The static-COHSEX mode (BGW 3) is handled/rejected at the caller.
+    them from the τ-pole sum (``B_mask &= valid``; BGW mode 0 / "zero", and
+    also the pole-sum half of "static_limit" / BGW mode 3 — the caller adds
+    the analytic static-COHSEX term for the modes flagged by
+    ``invalid_mask``); True = keep the fit's fallback pole at
+    ``fallback_omega`` (default 2 Ry; BGW mode 2 / "2ry").
 
     μ-pad safety is structural, not per-consumer: pad modes are born DEAD
     at the fit (``fit_gn_ppm_from_wc_pair(n_mu_logical=...)`` zeroes their
@@ -176,6 +181,7 @@ def _prepare_sigma_state(
         E_cond=E_cond, H_val=H_val,
         cond_mask=unocc_mask, val_mask=occ_mask,
         B_corr=B_corr, Omega_abs=Omega_abs, B_mask=B_mask,
+        invalid_mask=invalid_mask,
         n_total_modes=jnp.sum(B_mask_raw, dtype=jnp.int64),
         n_invalid=jnp.sum(invalid_mask, dtype=jnp.int64),
     )
@@ -226,6 +232,7 @@ def fit_ppm(
     Omega = jax.lax.with_sharding_constraint(jnp.asarray(omega_qmunu), q_shard)
     B = jax.lax.with_sharding_constraint(jnp.asarray(b_qmunu), q_shard)
     valid_mask = jax.lax.with_sharding_constraint(jnp.asarray(valid_qmunu), q_shard)
+    Wc0_q = jax.lax.with_sharding_constraint(Wc0_q, q_shard)
     t1 = _t.perf_counter()
 
     # ω_p in PPMBuildResult historically meant the imaginary-axis magnitude;
@@ -242,8 +249,7 @@ def fit_ppm(
 
     return PPMBuildResult(
         omega_p=probe_mag,
-        W0_q=W0_q,
-        Wiwp_q=Wprobe_q,
+        Wc0_q=Wc0_q,
         B_q=B,
         Omega_q=Omega,
         valid_mask_q=valid_mask,
@@ -486,6 +492,71 @@ def _run_sigma_branch(
     return acc_total, windows
 
 
+def _compute_invalid_static_sigma(
+    wfns,
+    Wc0_q: jax.Array,
+    invalid_mask: jax.Array,
+    meta,
+    mesh_xy: Mesh,
+) -> np.ndarray:
+    """Static-COHSEX Σ for the invalid PPM poles (BGW ``invalid_gpp_mode=3``).
+
+    BGW's default treatment of a pole with fitted ``Ω² < 0`` sets
+    ``ω̃ → 1/TOL_ZERO`` (mtxel_cor.f90:788/838), which is the Ω→∞ limit of
+    the full dynamical pole: for that mode's ``W_static = W^c(0)·mask``,
+
+        occupied   l:  ssx → −I_ε,  sch → −½·I_ε   ⇒  −W_static + ½·W_static
+        unoccupied l:                sch → −½·I_ε   ⇒            + ½·W_static
+
+    i.e. the mode is treated within static COHSEX: a screened-exchange
+    term over occupied states plus the Coulomb-hole over the full RI
+    window.  (Ω→∞ can NOT be pushed through the τ-integral — ``B ∝ Ω``
+    makes ``B·e^{−iΩτ}`` non-integrable — hence this analytic,
+    ω-independent term instead.)  Equivalently, per intermediate state:
+    occ → −½·W^c(0) (= B/Ω), unocc → +½·W^c(0) — the exact Ω→∞ limit of
+    the two-branch pole sum ``B/(ω−E_l∓Ω)``.
+
+    Reuses the two static COHSEX contraction kernels verbatim
+    (``cohsex_sigma._make_cohsex_kernels``) with the masked static
+    ``W^c(0)`` as the screening operand:
+
+        Σ_static = sigma_sx(G_occ, W_static) + sigma_coh(W_static − 0)
+                 = −⟨G_occ·W_static⟩ + ½·⟨G_RI·W_static⟩
+
+    matching design note GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md §8
+    (Σ_occ − ½·Σ_RI in its sign convention).  μ-pad safety is inherited
+    from ``invalid_mask`` (pad modes are born dead at the fit, so they
+    are never flagged invalid and ``W_static`` is exactly zero there).
+
+    Returns the replicated host tensor (nk, nb_sigma, nb_sigma) in Ry,
+    to be added to Σ_c at EVERY ω (the term is ω-independent).
+    """
+    from .cohsex_sigma import _make_cohsex_kernels, build_Gij
+
+    sigma_sx_k, sigma_coh_k, _ = _make_cohsex_kernels(
+        mesh_xy, meta.kgrid, int(meta.nk_tot))
+    Gij = build_Gij(meta, mesh_xy)
+    rep = NamedSharding(mesh_xy, P(None, None, None))
+
+    with mesh_xy:
+        W_static = jnp.where(
+            jnp.asarray(invalid_mask, dtype=bool),
+            jnp.asarray(Wc0_q, dtype=jnp.complex128),
+            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+        )
+        sig_static = (
+            sigma_sx_k(wfns, Gij, W_static)
+            + sigma_coh_k(wfns, W_static, jnp.zeros_like(W_static))
+        )
+        sig_static = jax.lax.with_sharding_constraint(sig_static, rep)
+        sig_static.block_until_ready()
+
+    # Replicated (None,None,None) ⇒ every process's first addressable shard
+    # IS the full tensor.  (_to_host_np's process_allgather would STACK a
+    # fully-replicated array across processes into (nproc, nk, nb, nb).)
+    return np.asarray(sig_static.addressable_data(0), dtype=np.complex128)
+
+
 # ---------------------------------------------------------------------------
 #  Top-level sigma driver
 # ---------------------------------------------------------------------------
@@ -559,23 +630,20 @@ def compute_sigma_c_ppm_omega_grid(
 
     # ppm_invalid_mode (BGW ``invalid_gpp_mode``): how to treat poles whose
     # fitted Omega^2 came out < 0.  'zero'/'skip' drop them (BGW mode 0);
-    # '2ry' keeps the fit's fallback_omega pole (default 2 Ry, BGW mode 2).
-    # 'static_limit'/'infinity' (BGW mode 3, the BGW default) needs a static
-    # -1/2 Wc0 term not yet wired; 'imaginary' (BGW mode 1) needs complex Omega.
+    # '2ry' keeps the fit's fallback_omega pole (default 2 Ry, BGW mode 2);
+    # 'static_limit'/'infinity' (BGW mode 3 = BGW's and LORRAX's default)
+    # drops them from the τ-pole sum AND adds the analytic ω-independent
+    # static-COHSEX term for those modes (see _compute_invalid_static_sigma);
+    # 'imaginary' (BGW mode 1) needs a complex-Omega path.
     invalid_mode = str(invalid_mode).strip().lower()
-    if invalid_mode in ("static_limit", "infinity"):
-        raise NotImplementedError(
-            f"ppm_invalid_mode={invalid_mode!r} (BGW invalid_gpp_mode=3, static COHSEX) "
-            "needs the static -1/2*Wc0 Coulomb-hole term (Wc0 = B_q/Omega_q) added to the "
-            "diagonal Sigma_c; not yet wired. Use 'zero' (drop, BGW mode 0) or '2ry' "
-            "(keep the fallback_omega pole, BGW mode 2).")
     if invalid_mode == "imaginary":
         raise NotImplementedError(
             "ppm_invalid_mode='imaginary' (BGW mode 1) needs a complex-Omega path.")
-    if invalid_mode not in ("zero", "skip", "2ry"):
+    if invalid_mode not in ("zero", "skip", "2ry", "static_limit", "infinity"):
         raise ValueError(
             f"ppm_invalid_mode must be zero/skip/2ry/static_limit/infinity; got {invalid_mode!r}")
     keep_invalid = invalid_mode == "2ry"
+    invalid_static = invalid_mode in ("static_limit", "infinity")
 
     # Derive Fermi level, energy/band masks, and PPM pole masks in one fused trace.
     # valid_mask_q=None → all-true mask at the caller so the jit sees a real array.
@@ -610,6 +678,31 @@ def compute_sigma_c_ppm_omega_grid(
         print_fn(
             f"  GN invalid modes: {n_invalid}/{n_total_modes} "
             f"({100.0 * n_invalid / max(n_total_modes, 1):.2f}%)"
+        )
+        # Per-q localization of the invalid poles (diagnostic; see
+        # reports/bgw_invalid_mode_refs_2026-07-08 — the ISDF invalid
+        # population sits on different (pair, q) structure than BGW's).
+        n_invalid_q = np.asarray(jax.device_get(
+            jnp.sum(state.invalid_mask, axis=(1, 2), dtype=jnp.int64)))
+        print_fn(
+            "  GN invalid modes per q: "
+            f"min={int(n_invalid_q.min())} max={int(n_invalid_q.max())} "
+            f"counts={np.array2string(n_invalid_q, max_line_width=100, threshold=64)}"
+        )
+
+    # ppm_invalid_mode='static_limit': ω-independent static-COHSEX term for
+    # the invalid poles (their dynamical poles were dropped via B_mask above).
+    # Computed once here, added to Σ_c at every ω on whichever accumulation
+    # path is active (host tensor add / streamed h5 RMW — same values, so
+    # kij↔kij_stream parity is preserved).
+    sigma_static_host = None
+    if invalid_static and n_invalid:
+        sigma_static_host = _compute_invalid_static_sigma(
+            wfns, ppm.Wc0_q, state.invalid_mask, meta, mesh_xy)
+        print_fn(
+            "  GN invalid modes → static COHSEX: max|Σ_static| = "
+            f"{float(np.max(np.abs(sigma_static_host))) * RYD_TO_EV:.4f} eV "
+            f"(diag max {float(np.max(np.abs(np.diagonal(sigma_static_host, axis1=1, axis2=2)))) * RYD_TO_EV:.4f} eV)"
         )
 
     # Decide accumulation mode + allocate any backing storage.
@@ -720,6 +813,23 @@ def compute_sigma_c_ppm_omega_grid(
                 sigma_kij_host[idx] = (
                     sigma_kij_host[idx]
                     + _to_host_np(sigma_kij, dtype=np.complex128, tiled=False))
+
+        # static_limit: fold the ω-independent invalid-pole static-COHSEX
+        # term into Σ_c at every ω (host add / streamed ω-batched h5 RMW —
+        # identical values on both paths).
+        if sigma_static_host is not None:
+            if not streaming:
+                sigma_kij_host += sigma_static_host[None, ...]
+            else:
+                for ibeg in range(0, n_omega, omega_batch_size):
+                    idx = np.arange(
+                        ibeg, min(ibeg + omega_batch_size, n_omega),
+                        dtype=np.int64)
+                    _accumulate_kij_stream(
+                        idx,
+                        np.broadcast_to(
+                            sigma_static_host,
+                            (idx.size, *sigma_static_host.shape)))
     finally:
         if h5_kij is not None:
             h5_kij.close()

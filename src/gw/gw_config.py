@@ -361,9 +361,11 @@ _DEFAULTS = {
     "sigma_omega_batch_size": 4,
     "sigma_omega_accumulation": "auto",
     # PPM sigma options
-    # PPM invalid-pole treatment (BGW invalid_gpp_mode). Default 'zero' matches
-    # the code's actual behavior (drop Omega^2<0 poles). '2ry' keeps the fallback
-    # pole; 'static_limit'/'infinity' (BGW default) not yet wired — see ppm_sigma.
+    # PPM invalid-pole treatment (BGW invalid_gpp_mode). 'zero' drops Omega^2<0
+    # poles (BGW mode 0); '2ry' keeps the fit's fallback pole (BGW mode 2);
+    # 'static_limit' drops the dynamical pole and adds the analytic
+    # static-COHSEX term for those modes (BGW mode 3 = BGW's default) — see
+    # ppm_sigma._compute_invalid_static_sigma.
     "ppm_invalid_mode": "zero",
     "fermi_reference": "midgap",
     "sigma_at_dft_extrapolate": False,
@@ -640,7 +642,7 @@ class PPMConfig:
     omega_accumulation: str       # "auto" | "kij" | "kij_stream"
 
     # --- on-shell evaluation knobs ---
-    invalid_mode: str             # "zero" | "2ry" | "static_limit"(TODO) | "infinity"(TODO)
+    invalid_mode: str             # "zero" | "2ry" | "static_limit" | "infinity"(alias)
     fermi_reference: str          # "midgap" | "vbm"
     sigma_at_dft_extrapolate: bool
     sigma_at_dft_energies: bool
@@ -648,8 +650,8 @@ class PPMConfig:
     def __post_init__(self):
         # Validate scalar knobs once, at the parse site (values are already
         # normalized in ``from_input_file``).  Capability gating for
-        # invalid_mode (static_limit/infinity → NotImplementedError until
-        # Wc0 retention lands) stays in the Σ^c kernel — this checks only
+        # invalid_mode ('imaginary' → NotImplementedError, needs a
+        # complex-Ω path) stays in the Σ^c kernel — this checks only
         # that the *value* is recognized.
         if self.omega_step_ev <= 0.0:
             raise ValueError("ppm.omega_step_ev must be > 0.")

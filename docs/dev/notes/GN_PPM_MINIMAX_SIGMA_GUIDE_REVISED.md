@@ -135,7 +135,10 @@ The GN extractor produces:
 Downstream, sigma uses:
 
 * `B_mask = Omega_abs > 1e-14`
-* and if `invalid_mode="static_limit"` then it masks out invalid GN elements: `B_mask &= valid_mask`.
+* `ppm_invalid_mode` (BGW `invalid_gpp_mode`): `"zero"` masks invalid GN
+  elements out of the pole sum (`B_mask &= valid_mask`, BGW 0); `"2ry"` keeps
+  the fit's fallback pole (BGW 2); `"static_limit"` (default, BGW 3) masks
+  them out of the pole sum AND adds the analytic static-COHSEX term of §8.
 
 ---
 
@@ -415,9 +418,12 @@ This is exactly what the code currently does.
 
 ## 8. Invalid GN modes: static-limit correction
 
-If `invalid_mode="static_limit"` and `Wc0_mu_nu` is provided and there are invalid elements:
+If `invalid_mode="static_limit"` (the default; BGW `invalid_gpp_mode=3`) and
+there are invalid elements (`W^c(0)` is retained on `PPMBuildResult.Wc0_q`;
+implementation: `ppm_sigma._compute_invalid_static_sigma`, which reuses the
+two static COHSEX kernels of `cohsex_sigma._make_cohsex_kernels`):
 
-1. Construct `Wc0_invalid = Wc0_mu_nu` on invalid mask only.
+1. Construct `Wc0_invalid = Wc0_q` on invalid mask only.
 
 2. Compute two static contractions:
 
