@@ -511,7 +511,12 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		with h5py.File(zeta_h5_path, 'a') as f:
 			if 'g0_mu' in f:
 				del f['g0_mu']
-			f.create_dataset('g0_mu', data=np.asarray(G0_gathered))
+			# Clip the μ axis to the LOGICAL extent: files on disk store
+			# logical extents so they re-read identically on any process
+			# count (G0_all is at the in-memory padded extent, pad
+			# entries exact zeros).
+			_g0_np = np.asarray(G0_gathered)[..., :int(meta.n_rmu)]
+			f.create_dataset('g0_mu', data=_g0_np)
 	jax.experimental.multihost_utils.sync_global_devices("g0_write")
 
 	# Scalar V_qmunu is just (nq, μ, μ).  The (1, npol, npol) leading
