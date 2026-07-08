@@ -778,17 +778,29 @@ def _identity_pad_block_diagonal(
     block_diag(M_log, I_pad)`` — block-diagonal with the input's
     logical block on top-left and identity on bottom-right.
 
-    Why this matters:  Cholesky and LU on the identity-padded matrix
-    produce factorisations whose **logical block is bit-identical** to
-    the factorisation of the un-padded logical-only matrix.  The
-    standard recursion for ``L[i, j]`` (Cholesky) and the column-
-    pivoting LU never read across the zero off-diagonal pad blocks,
-    and ``√1 = 1`` exactly in IEEE 754 so the pad-block factor is
-    exactly identity.  The downstream back-solve sees ``Z`` with zero
-    pad rows (bilinear in zero-padded ψ ⇒ zero pad rows), and
-    ``[L_log 0; 0 I][y_log; y_pad] = [Z_log; 0]`` gives
-    ``y_pad = 0`` and ``y_log = L_log⁻¹ Z_log`` — logical solve
-    unchanged.
+    Why this matters — and the limits of the guarantee:  In EXACT
+    arithmetic, Cholesky and LU on the identity-padded matrix produce
+    factorisations whose logical block equals the factorisation of the
+    un-padded logical-only matrix (the recursions never read across
+    the zero off-diagonal pad blocks, and ``√1 = 1`` exactly), and the
+    back-solve with zero-pad-row ``Z`` gives ``y_pad = 0`` with the
+    logical solve unchanged.  In FLOATING POINT the guarantee is only
+    approximate, because blocked/tiled implementations regroup partial
+    sums when the matrix extent changes:
+
+    * **Cholesky (charge channel): holds to ≤1e-7 rel** in practice
+      (measured ζ_C 5.5e-8 under a pad-extent flip at fixed P; the
+      well-conditioned PSD CCT does not amplify the regrouping noise).
+    * **LU on the near-singular indefinite transverse CCT: does NOT
+      hold.**  Shape-dependent LU roundoff is amplified O(1) in the
+      near-null modes — each pad extent yields a different,
+      per-extent-deterministic ζ_T, with catastrophic resonances at
+      some extents (MoS2 668→672: Σ^B tile(2,2) −0.15 → −117.9 eV).
+      See ``reports/device_invariance_2026-07-08/ROOT_CAUSE.md``.
+      For this reason :func:`solve_zeta` slices the indefinite solve
+      back to the LOGICAL extent — the identity pad added here is only
+      a non-singularity safety net for the padded buffer, never the
+      extent the transverse system is actually solved at.
 
     This is NOT ridge regularisation on C_q (which would corrupt the
     logical block).  The identity is added ONLY to the pad-block
@@ -935,13 +947,20 @@ def factor_c_q(
     identity ONLY to the pad-block diagonal in-place — turning C_q
     into a block-diagonal ``[C_log 0; 0 I_pad]`` matrix — and then
     run the same sharded Cholesky / LU path the divisible case uses.
-    Cholesky / LU of an identity-padded matrix produces a factor
-    whose logical block is bit-identical to the factor of the
-    logical-only matrix (the recursion never reads across zero
-    off-diagonal pad blocks, and ``√1 = 1`` exactly).  The pad-block
-    factor is exactly identity; the back-solve's pad rows of ζ come
-    out as zero (because Z's pad rows are zero by the same bilinear
-    argument); logical block of ζ is unchanged.
+    Cholesky of an identity-padded matrix produces a factor whose
+    logical block matches the logical-only factor in exact
+    arithmetic; in floating point the match is ≤1e-7 rel (blocked
+    implementations regroup partial sums when the extent changes —
+    see ``_identity_pad_block_diagonal``).  The pad-block factor is
+    exactly identity; the back-solve's pad rows of ζ come out as zero
+    (because Z's pad rows are zero by the same bilinear argument).
+    For the indefinite transverse channels the exact-arithmetic
+    guarantee FAILS in floating point (near-null-mode amplification —
+    ROOT_CAUSE.md 2026-07-08), so ``solve_zeta`` slices that solve
+    back to the logical extent.  On single-device meshes the dense
+    Cholesky below also factorises at the logical extent and
+    re-embeds, making the charge factor pad-extent-invariant at P=1
+    (the fixed-P invariance gate).
 
     This is NOT ridge regularisation of C_q.  The logical block is
     untouched; identity is added ONLY to the pad-block diagonal.
@@ -1016,10 +1035,30 @@ def factor_c_q(
         # rank-deficient (more centroids than band pairs), producing
         # tiny negative eigenvalues that break Cholesky. Add a small
         # ridge proportional to the trace to ensure positive definiteness.
-        trace_per_q = jnp.trace(C_q, axis1=-2, axis2=-1)
-        ridge = 1e-14 * jnp.abs(trace_per_q)[:, None, None] * jnp.eye(n_rmu)[None, :, :]
-        C_q_reg = C_q + ridge
-        L_q_dense = jnp.linalg.cholesky(C_q_reg)
+        #
+        # Factorise at the LOGICAL extent and re-embed: both the ridge
+        # trace and the blocked cuSOLVER potrf regroup partial sums
+        # when the matrix extent changes, so factorising at the padded
+        # extent makes the factor (and everything downstream) depend
+        # on the pad extent.  Slicing is free on a single device; at
+        # zero pad the slice/embed are no-ops and this path is
+        # bit-identical to the historical one.  (The multi-device
+        # 2D-blocked / cuSolverMp paths below cannot slice — their
+        # block-cyclic layout needs the mesh-divisible extent; their
+        # residual pad-extent sensitivity is the measured ≤1e-7 rel.)
+        C_log = C_q[:, :n_rmu_logical, :n_rmu_logical]
+        trace_per_q = jnp.trace(C_log, axis1=-2, axis2=-1)
+        ridge = (1e-14 * jnp.abs(trace_per_q)[:, None, None]
+                 * jnp.eye(n_rmu_logical)[None, :, :])
+        L_log = jnp.linalg.cholesky(C_log + ridge)
+        mu_pad = n_rmu - n_rmu_logical
+        if mu_pad:
+            L_q_dense = jnp.pad(L_log, ((0, 0), (0, mu_pad), (0, mu_pad)))
+            idx = jnp.arange(n_rmu)
+            pad_diag = (idx >= n_rmu_logical).astype(L_q_dense.dtype)
+            L_q_dense = L_q_dense + jnp.diag(pad_diag)[None, :, :]
+        else:
+            L_q_dense = L_log
         L_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
         return jax.lax.with_sharding_constraint(L_q_dense, L_shard)
 
@@ -1120,6 +1159,7 @@ def solve_zeta(
     vertex_mu_L: int = 0,
     solver_kind: str = 'auto',
     cct_trace_per_q: jax.Array | None = None,
+    n_rmu_logical: int | None = None,
 ) -> jax.Array:
     """
     Solve for zeta_q given pre-computed system matrix from
@@ -1164,6 +1204,19 @@ def solve_zeta(
                      'cusolvermp_cholesky' (distributed potrs via FFI),
                      or 'cusolvermp_lu' (distributed getrf+getrs via FFI
                      for the transverse channels).
+        n_rmu_logical: Logical centroid count.  When given and smaller
+                     than the padded input extent, every per-q dense
+                     solve (pivoted LU AND the per-q triangular
+                     back-solve) is μ-SLICED to this extent before the
+                     factorisation and the ζ pad rows are zero-filled
+                     after.  This is load-bearing for device-count
+                     invariance: solving the identity-padded system at
+                     the padded extent makes ζ depend deterministically
+                     on the pad extent (= on the device count), with
+                     O(1) amplification in the near-null transverse
+                     modes (reports/device_invariance_2026-07-08/
+                     ROOT_CAUSE.md).  ``None`` keeps the padded extent
+                     (back-compat for mesh-divisible callers).
 
     Returns:
         zeta_q: (nq, n_rmu, n_zchunk) solution, sharded P(None, ('x','y'), None)
@@ -1175,8 +1228,29 @@ def solve_zeta(
     """
     nq, n_rmu, _ = L_q.shape
     _, _, n_zchunk = Z_q.shape
+    n_log = int(n_rmu_logical) if n_rmu_logical is not None else int(n_rmu)
+    if n_log > n_rmu:
+        raise ValueError(
+            f"solve_zeta: n_rmu_logical={n_log} exceeds input extent {n_rmu}")
+    mu_pad = n_rmu - n_log
 
     solver_kind = _resolve_solver_kind(mesh_xy, vertex_mu_L, solver_kind)
+
+    if solver_kind == 'cusolvermp_lu' and mu_pad:
+        Px_ = int(mesh_xy.shape['x'])
+        Py_ = int(mesh_xy.shape['y'])
+        if (n_log % Px_) or (n_log % Py_):
+            # The indefinite solve MUST run at the logical extent (see
+            # ``n_rmu_logical`` above), but cuSolverMp's block-cyclic
+            # descriptors need n % Px == n % Py == 0.  Fall back to the
+            # per-q replicated LU, which runs at any logical extent.
+            import warnings
+            warnings.warn(
+                f"solve_zeta: n_rmu_logical={n_log} not divisible by the "
+                f"{Px_}x{Py_} mesh axes; transverse LU falls back from "
+                f"cuSolverMp to the per-q jnp.linalg.solve path so the "
+                f"solve can run at the logical extent.")
+            solver_kind = 'lu'
 
     if solver_kind == 'cusolvermp_cholesky':
         # Distributed potrs: Z stays at P(None,'x','y'), no input reshard
@@ -1217,6 +1291,21 @@ def solve_zeta(
         from ffi.cusolvermp import batched_distributed_solve_lu
         Px = int(mesh_xy.shape['x'])
         Py = int(mesh_xy.shape['y'])
+        # μ-slice the system to the LOGICAL extent before the solve
+        # (guarded above: n_log divides both mesh axes on this path).
+        # L/Z pad rows are exact zeros (+ identity pad diag on L), so
+        # the sliced system IS the logical system; solving at the
+        # padded extent instead changes ζ_T wholesale — the pad-shape
+        # LU roundoff is amplified O(1) in the near-null transverse
+        # modes (ROOT_CAUSE.md 2026-07-08, Manifestation 1).  ζ pad
+        # rows are re-added as exact zeros after the solve (their
+        # correct value: Z pad rows are zero).
+        if mu_pad:
+            xy_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+            L_q = jax.lax.with_sharding_constraint(
+                L_q[:, :n_log, :n_log], xy_shard)
+            Z_q = jax.lax.with_sharding_constraint(
+                Z_q[:, :n_log, :], xy_shard)
         # getrs descB requires NRHS % Py == 0; zero-pad columns produce
         # zero ζ columns and get trimmed on return.
         n_zchunk_padded = ((n_zchunk + Py - 1) // Py) * Py
@@ -1224,22 +1313,28 @@ def solve_zeta(
         if needs_padding:
             Z_q = jnp.pad(Z_q, ((0, 0), (0, 0), (0, n_zchunk_padded - n_zchunk)),
                           mode='constant')
-        # Per-q ridge ε·|tr(L)|/n_rmu — same lift as the legacy 'lu'
+        # Per-q ridge ε·|tr(L_log)|/n_log — same lift as the legacy 'lu'
         # branch, to keep TRS-paired near-zero modes above the LU
         # stability floor without perturbing well-conditioned ones.
         # ``cct_trace_per_q`` is precomputed once per channel by the
-        # caller (fit_zeta_to_h5) — the trace doesn't change across
-        # r-chunks since L_q is the per-channel CCT.  Computing it
-        # inline here re-fires an all-reduce across the (μ_X, ν_Y)
-        # sharding on every r-chunk: ~17 s GPU stream time on MoS2
-        # 3×3 bispinor at our default chunk count.
+        # caller (fit_zeta_to_h5) over the LOGICAL block — the trace
+        # doesn't change across r-chunks since L_q is the per-channel
+        # CCT.  Computing it inline here re-fires an all-reduce across
+        # the (μ_X, ν_Y) sharding on every r-chunk: ~17 s GPU stream
+        # time on MoS2 3×3 bispinor at our default chunk count.  Both
+        # the trace and the denominator must be LOGICAL quantities or
+        # the ridge (hence ζ) depends on the pad extent.
         LU_RIDGE = 1e-12
         trace_per_q = (cct_trace_per_q if cct_trace_per_q is not None
                        else jnp.einsum('qii->q', L_q))
-        ridge = (LU_RIDGE * jnp.abs(trace_per_q) / n_rmu)[:, None, None]
-        eye_n = jnp.eye(n_rmu, dtype=L_q.dtype)[None, :, :]
+        ridge = (LU_RIDGE * jnp.abs(trace_per_q) / n_log)[:, None, None]
+        eye_n = jnp.eye(n_log, dtype=L_q.dtype)[None, :, :]
         A_q = L_q + ridge * eye_n
         zeta_xy = batched_distributed_solve_lu(A_q, Z_q, mesh=mesh_xy)
+        if mu_pad:
+            zeta_xy = jax.lax.with_sharding_constraint(
+                jnp.pad(zeta_xy, ((0, 0), (0, mu_pad), (0, 0))),
+                NamedSharding(mesh_xy, P(None, 'x', 'y')))
         # Reshard rationale identical to the cholesky branch above.
         zeta_out = _reshard_zeta_mu_X_r_Y_to_mu_XY(zeta_xy, mesh_xy)
         if needs_padding:
@@ -1276,22 +1371,56 @@ def solve_zeta(
 
     # Cache key for solve function (includes q_chunk_size and padded size).
     # ``use_lu`` partitions the cache so the Cholesky and LU compiles
-    # don't collide on the same key.
-    cache_key = ('solve_from_L', id(mesh_xy), nq, n_rmu,
+    # don't collide on the same key.  ``n_log`` is closure state of the
+    # kernels below (the slice extent), so it keys the cache too.
+    cache_key = ('solve_from_L', id(mesh_xy), nq, n_rmu, n_log,
                  n_zchunk_padded, q_chunk_size, bool(use_lu))
 
     def _ridge_indef_solve(L: jax.Array, Z: jax.Array) -> jax.Array:
-        """Solve (L + ε·tr(L)/n · I) · ζ = Z via pivoted LU.
+        """Solve (L + ε·tr(L)/n · I) · ζ = Z via pivoted LU at the
+        LOGICAL μ extent.
 
         ε = ``LU_RIDGE`` (1e-12).  The shift sits well below any
         physically meaningful eigenvalue but well above the partial-
         pivoting floor, so LU stays stable on TRS-paired near-zero
         modes without perturbing the rest of the spectrum.
+
+        The μ-slice to ``n_log`` (and the logical trace/denominator in
+        the ridge) is load-bearing: LU at the identity-padded extent
+        yields a different, per-extent-deterministic ζ_T — amplified
+        O(1) in the near-null transverse modes (ROOT_CAUSE.md
+        2026-07-08).  ζ pad rows are re-added as exact zeros (their
+        correct value: Z pad rows are zero).  At zero pad the slice
+        and re-pad are no-ops and this is bit-identical to the
+        historical path.
         """
         n = L.shape[-1]
-        ridge = LU_RIDGE * jnp.abs(jnp.trace(L)) / n
-        L_reg = L + ridge * jnp.eye(n, dtype=L.dtype)
-        return jnp.linalg.solve(L_reg, Z)
+        L_log = L[:n_log, :n_log]
+        Z_log = Z[:n_log, :]
+        ridge = LU_RIDGE * jnp.abs(jnp.trace(L_log)) / n_log
+        L_reg = L_log + ridge * jnp.eye(n_log, dtype=L.dtype)
+        zeta_log = jnp.linalg.solve(L_reg, Z_log)
+        if n != n_log:
+            zeta_log = jnp.pad(zeta_log, ((0, n - n_log), (0, 0)))
+        return zeta_log
+
+    def _tri_solve_logical(L: jax.Array, Z: jax.Array) -> jax.Array:
+        """Charge-channel two-triangular back-solve at the LOGICAL μ
+        extent (same slice/zero-fill rationale as ``_ridge_indef_solve``
+        — the well-conditioned Cholesky back-solve only wobbles ≤1e-7
+        under a pad-extent change, but at fixed shape it is exactly
+        pad-invariant, which the fixed-P invariance gate requires).
+        L is the block-diag ``[L_log 0; 0 I]`` factor; its logical
+        block is exactly the factor of the logical system."""
+        n = L.shape[-1]
+        L_log = L[:n_log, :n_log]
+        Z_log = Z[:n_log, :]
+        y = jax.scipy.linalg.solve_triangular(L_log, Z_log, lower=True)
+        zeta_log = jax.scipy.linalg.solve_triangular(
+            L_log.conj().T, y, lower=False)
+        if n != n_log:
+            zeta_log = jnp.pad(zeta_log, ((0, n - n_log), (0, 0)))
+        return zeta_log
 
     if cache_key not in _solve_cache:
         @partial(shard_map, mesh=mesh_xy,
@@ -1301,9 +1430,7 @@ def solve_zeta(
             if use_lu:
                 # Indefinite CCT^μ: pivoted-LU back-solve with ridge.
                 return _ridge_indef_solve(L, Z_cols)
-            y = jax.scipy.linalg.solve_triangular(L, Z_cols, lower=True)
-            zeta = jax.scipy.linalg.solve_triangular(L.conj().T, y, lower=False)
-            return zeta
+            return _tri_solve_logical(L, Z_cols)
 
         # Vectorized solve for a batch of q-points
         @partial(shard_map, mesh=mesh_xy,
@@ -1318,10 +1445,7 @@ def solve_zeta(
                 # match.  We vmap the ridge-add per-q so each LU sees
                 # its own conditioning shift.
                 return jax.vmap(_ridge_indef_solve)(L_batch, Z_batch)
-            def solve_single(L, Z):
-                y = jax.scipy.linalg.solve_triangular(L, Z, lower=True)
-                return jax.scipy.linalg.solve_triangular(L.conj().T, y, lower=False)
-            return jax.vmap(solve_single)(L_batch, Z_batch)
+            return jax.vmap(_tri_solve_logical)(L_batch, Z_batch)
 
         @partial(jax.jit, donate_argnums=(2,))
         def _solve_batch_and_update(L_batch_sharded, Z_batch_col, zeta_acc, q_start):
@@ -1562,10 +1686,15 @@ def _make_fit_one_rchunk_kernel(
             Z_q_for_solve = Z_q[q_irr_idx_j]
         else:
             Z_q_for_solve = Z_q
+        # ``n_rmu_logical=meta.n_rmu``: the per-q dense solves run at
+        # the LOGICAL μ extent (ζ pad rows zero-filled after) so ζ is
+        # independent of the pad extent / device count.  See
+        # solve_zeta's n_rmu_logical docstring.
         return solve_zeta(
             L_q, Z_q_for_solve, mesh_xy, q_chunk_size,
             solver_kind=solver_kind,
-            cct_trace_per_q=cct_trace_per_q)
+            cct_trace_per_q=cct_trace_per_q,
+            n_rmu_logical=int(meta.n_rmu))
 
     @jax.jit
     def _kernel(
@@ -1641,7 +1770,7 @@ def fit_one_rchunk(
         tuple(band_range_left), tuple(band_range_right),
         tuple(band_range_full),
         q_chunk_size,
-        meta.n_rmu, meta.nk_tot, meta.nspinor,
+        meta.n_rmu, meta.n_rmu_padded, meta.nk_tot, meta.nspinor,
         tuple(meta.fft_grid),
         hash(kvecs_frac.tobytes()),
         id(psi_G_store),

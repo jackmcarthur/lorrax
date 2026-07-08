@@ -447,7 +447,14 @@ def fit_zeta_to_h5(
     # path) doesn't change across r-chunks, so the trace is invariant.
     if int(vertex_mu_L) != 0:
         with timing.section("zeta_fit.trace_L_q"):
-            cct_trace_per_q = jnp.einsum('qii->q', L_q)
+            # LOGICAL-block trace only: the identity pad block would
+            # contribute exactly +mu_pad to the padded trace, making
+            # the LU ridge (ε·|tr|/n) depend on the pad extent — i.e.
+            # on the device count.  The slice is a no-op when the
+            # extent is already logical.  solve_zeta divides by the
+            # logical n to match.
+            cct_trace_per_q = jnp.einsum(
+                'qii->q', L_q[:, :n_rmu, :n_rmu])
             cct_trace_per_q.block_until_ready()
     else:
         cct_trace_per_q = None

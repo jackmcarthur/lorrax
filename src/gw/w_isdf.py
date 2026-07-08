@@ -203,11 +203,28 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int]):
 # W solve with two-stage resharding (following load_wfns pattern)
 # ============================================================================
 
-def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int):
-    """W = (I - V χ)⁻¹ V via q-parallel shard_map.  All arrays flat-q: (nq, μ, μ)."""
+def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int,
+                    n_rmu_logical: int | None = None):
+    """W = (I - V χ)⁻¹ V via q-parallel shard_map.  All arrays flat-q: (nq, μ, μ).
+
+    ``n_rmu_logical``: when smaller than ``n_rmu`` (μ-padded inputs),
+    the per-q pivoted LU is μ-SLICED to the logical extent and the W
+    pad rows/cols are zero-filled after (their exact value: V pad rows
+    are zero).  Load-bearing for device-count invariance — LU at the
+    padded extent regroups partial sums per pad extent, and the
+    resulting 1e-8-rel W wobble is amplified to eV on near-pole GN-PPM
+    bands (reports/device_invariance_2026-07-08/ROOT_CAUSE.md, charge
+    manifestation).  At zero pad the slice/fill are no-ops.
+    """
     from jax.experimental.shard_map import shard_map
 
-    cache_key = (id(mesh_xy), nq, n_rmu)
+    n_log = int(n_rmu_logical) if n_rmu_logical is not None else int(n_rmu)
+    if n_log > int(n_rmu):
+        raise ValueError(
+            f"_get_w_solve_fn: n_rmu_logical={n_log} exceeds extent {n_rmu}")
+    mu_pad = int(n_rmu) - n_log
+
+    cache_key = (id(mesh_xy), nq, n_rmu, n_log)
     if cache_key in _w_solve_cache:
         return _w_solve_cache[cache_key]
 
@@ -249,9 +266,19 @@ def _get_w_solve_fn(mesh_xy: Mesh, nq: int, n_rmu: int):
         def _local_solve(V_local, chi_local):
             nq_dev = V_local.shape[0]
             def solve_one(iq, W_acc):
-                A = jnp.eye(n, dtype=V_local.dtype) - V_local[iq] @ chi_local[iq]
+                # Solve at the LOGICAL μ extent (see _get_w_solve_fn
+                # docstring).  V/χ pad rows are exact zeros, so the
+                # sliced system IS the logical Dyson system; the W pad
+                # block would come out exactly zero anyway (A_pad = I,
+                # RHS_pad = 0) — writing into a zero-initialised W_acc
+                # block reproduces it without the pad-extent LU.
+                V_log = V_local[iq, :n_log, :n_log]
+                chi_log = chi_local[iq, :n_log, :n_log]
+                A = jnp.eye(n_log, dtype=V_local.dtype) - V_log @ chi_log
                 lu, piv = jsp_linalg.lu_factor(A)
-                return W_acc.at[iq].set(jsp_linalg.lu_solve((lu, piv), V_local[iq]))
+                W_log = jsp_linalg.lu_solve((lu, piv), V_log)
+                return jax.lax.dynamic_update_slice(
+                    W_acc, W_log[None, :, :], (iq, 0, 0))
             return jax.lax.fori_loop(0, nq_dev, solve_one, jnp.zeros_like(V_local))
 
         W_flat = shard_map(
@@ -344,11 +371,20 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, solver, dtype, n_rmu):
 
     if solver is ScreeningSolver.CUBLASMP_FFI:
         # Fused FFI consumes pref as a Python complex scalar (compile-time attr).
+        # NOTE: the distributed FFI solve runs at the PADDED extent (its
+        # block-cyclic layout needs mesh divisibility) — it retains the
+        # ≤1e-8-rel pad-extent sensitivity the JAX_NATIVE path removes.
         solve_fn = _get_w_solve_fn_low_mem(mesh_xy, nq, n_rmu, dtype)
         return solve_fn, complex(pref_scalar)
 
     # JAX_NATIVE (q-parallel reshard + per-rank LU via shard_map).
-    solve_fn = _get_w_solve_fn(mesh_xy, nq, n_rmu)
+    # Per-q LU runs at the LOGICAL μ extent (meta.n_rmu); W pad
+    # rows/cols are zero-filled — see _get_w_solve_fn.  Synthetic-meta
+    # callers (w_solve_modes_test) carry no n_rmu: their arrays ARE
+    # logical, so fall back to the array extent.
+    solve_fn = _get_w_solve_fn(
+        mesh_xy, nq, n_rmu,
+        n_rmu_logical=int(getattr(meta, 'n_rmu', n_rmu)))
     return solve_fn, jnp.asarray(pref_scalar, dtype=jnp.complex128)
 
 
