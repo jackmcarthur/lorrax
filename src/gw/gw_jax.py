@@ -23,7 +23,7 @@ from file_io import (
 )
 from common import symmetry_maps
 from common.wfn_transforms import get_enk_bandrange
-from .gw_config import ComputeMode, LorraxConfig
+from .gw_config import ComputeMode, LorraxConfig, QPSolver
 from .gw_init import (
 	get_effective_chunk_size,
 	prepare_isdf_and_wavefunctions,
@@ -112,6 +112,10 @@ def main(argv=None):
 	# ========================================================================
 	config = LorraxConfig.from_input_file(args.input, print_fn=print0)
 	input_dir = config.input_dir
+	# Resolve + validate the QP-energy axis up front so inconsistent
+	# (qp_solver × compute_mode × accumulation) combinations fail before
+	# any heavy compute (see ``LorraxConfig.qp_solver``).
+	qp_solver = config.qp_solver
 
 	# ========================================================================
 	# INITIALIZATION
@@ -392,7 +396,8 @@ def main(argv=None):
 
 	# ---- Mode-pivoted dispatch ----
 	# ``compute_mode`` is the single axis describing the self-energy ansatz
-	# (X_ONLY / COHSEX / GN_PPM / HL_PPM); ``self_consistent`` is orthogonal.
+	# (X_ONLY / COHSEX / GN_PPM / HL_PPM); ``qp_solver`` (how QP energies
+	# are extracted from Σ) is orthogonal.
 	# Static COHSEX matrices were already computed above (the bare-X pass
 	# reuses the same kernel), so X_ONLY and COHSEX both fall through with
 	# the existing sig_sx / sig_coh / sig_x.  Dynamic modes go through the
@@ -409,7 +414,7 @@ def main(argv=None):
 	# Skip the standalone PPM pipeline when running SC-dynamic — the
 	# QSGW iteration map calls compute_sigma_xc internally each step
 	# and would re-do this work on iter 1.
-	if mode.is_dynamic and not config.self_consistent:
+	if mode.is_dynamic and qp_solver is not QPSolver.SELF_CONSISTENT:
 		# Mode-orthogonal screening: ask the scheme which W's it needs
 		# (PPM modes need a probe-frequency W in addition to the static
 		# one already in W_q), evaluate them in one pass, and hand the
@@ -473,7 +478,7 @@ def main(argv=None):
 	# ---- Mode-pivoted Σ_xc dispatch.  All branches yield ``sigma_total``
 	# replicated on the mesh as Σ_xc + V_H (Ry).
 	sc_rms_history: list[float] = []
-	if config.self_consistent:
+	if qp_solver is QPSolver.SELF_CONSISTENT:
 		# SC-GW iteration map — mode-agnostic.  Each step rotates ψ via
 		# U_qp from eigh(H_qp_dft), then recomputes χ₀ → W → Σ_xc via
 		# the mode-orthogonal compute_sigma_xc dispatch (X_ONLY / COHSEX
@@ -532,23 +537,19 @@ def main(argv=None):
 			print_fn=print0,
 		)
 		_state_init = make_initial_state_from_dft(_sc_inputs)
-		# TODO: plumb max_iter / tol_ev through config; env vars for now
-		# so the first end-to-end QSGW test can vary them without rebuild.
-		_max_iter = int(os.environ.get("LORRAX_SC_MAX_ITER", "20"))
-		_tol_ev = float(os.environ.get("LORRAX_SC_TOL_EV", "1.0e-4"))
-		_accel = os.environ.get("LORRAX_SC_ACCEL", "rcrop")
-		_history_depth = int(os.environ.get("LORRAX_SC_DEPTH", "5"))
-		_mixing = float(os.environ.get("LORRAX_SC_MIXING", "1.0"))
-		print0(f"  SC: mode={mode.value}, max_iter={_max_iter}, "
-		       f"tol={_tol_ev:.1e} eV, accel={_accel}"
-		       + (f", depth={_history_depth}" if _accel == "rcrop"
-		          else f", α={_mixing:.2f}"))
+		# Loop knobs from ``config.sc`` (the LORRAX_SC_* env vars are
+		# deprecated overrides, applied at config construction).
+		_sc = config.sc
+		print0(f"  SC: mode={mode.value}, max_iter={_sc.max_iter}, "
+		       f"tol={_sc.tol_ev:.1e} eV, accel={_sc.accelerator}"
+		       + (f", depth={_sc.history_depth}" if _sc.accelerator == "rcrop"
+		          else f", α={_sc.mixing:.2f}"))
 		_state_final, sc_rms_history = run_self_consistency(
 			_state_init, _sc_inputs,
-			max_iter=_max_iter, tol_ev=_tol_ev,
-			accelerator=_accel,
-			history_depth=_history_depth,
-			mixing=_mixing,
+			max_iter=_sc.max_iter, tol_ev=_sc.tol_ev,
+			accelerator=_sc.accelerator,
+			history_depth=_sc.history_depth,
+			mixing=_sc.mixing,
 		)
 		_sigma_result = _state_final.last_sigma_result
 		print0(
@@ -630,76 +631,91 @@ def main(argv=None):
 		# NB (streamed-mode fallthrough): in KIJ_STREAM accumulation
 		# ``sigma_c_omega`` is None (Σ_c lives only in the sigma_kij h5, which
 		# _inject_analytic_head has already head-corrected in place), so this
-		# on-shell QP fixed-point solve is skipped — streamed runs get the
-		# at-DFT diagnostic Σ_c only, not on-shell QP energies.  See WS1 /
+		# branch is skipped — streamed runs get the at-DFT diagnostic Σ_c
+		# only.  Config validation rejects fixed_point/self_consistent with
+		# explicit kij_stream (see ``LorraxConfig.qp_solver``); the eqp1
+		# Z-loss in streamed mode remains a separate WS1 fix.  See WS1 /
 		# Bug B in reports/sigma_ppm_tighten_2026-07-04.
-		# G0W0/QSGW: diagonal-Σ(E) fixed point (with optional scissor) →
-		# QSGW Σ_xc^QSGW.  Restart-friendly: this whole block consumes only
-		# the on-device ``sigma_c_omega`` plus replicated (sig_x, sig_h),
-		# so a future outer QSGW iteration loop can pass refreshed inputs
-		# in without touching the disk.
+		#
+		# ``qp_solver`` picks the evaluation energies for the QSGW-symmetrised
+		# Σ_xc whose eigh produces E_qp_ry / qp_wfn_rotations.h5 / WFN_qp.h5:
+		#   one_shot_dft — E_DFT − E_F (standard G0W0; consistent with eqp0)
+		#   fixed_point  — diagonal on-shell solve E = h0 + ReΣ(E)
+		#                  (+ optional scissor for out-of-grid bands)
+		# eqp0.dat/eqp1.dat are at-DFT in both cases (written downstream from
+		# ``sigma_c_at_dft_ev`` / the ω-grid diag; not from this branch).
+		# Restart-friendly: this whole block consumes only the on-device
+		# ``sigma_c_omega`` plus replicated (sig_x, sig_h), so a future outer
+		# QSGW iteration loop can pass refreshed inputs in without touching
+		# the disk.
 		# All quantities below are in **Rydberg** until the scissor's print
 		# summary and final eV outputs.  Σ_c(ω) lives natively in Ry on the
 		# Ry ω-grid; mixing that with eV-converted h0/Σ_x is a footgun.
-
-		# Diagonal Σ_c(ω, k, n) and Σ_x(k, n) replicated on host, in Ry.
-		sigma_c_diag_w_kn_ry = np.asarray(extract_sigma_diag_replicated(
-			sigma_c_omega, mesh_xy))
-		sigma_x_diag_kn_ry = np.real(
-			np.diagonal(np.asarray(sig_x), axis1=1, axis2=2))
-		sigma_xc_diag_w_kn_ry = sigma_c_diag_w_kn_ry + sigma_x_diag_kn_ry[None, :, :]
-
-		# Diagonal Σ(E) fixed point in Ry.
-		h0_diag_ry = np.real(
-			np.diagonal(np.asarray(kin_ion + sig_h), axis1=1, axis2=2))
-		efermi_ry = float(efermi_dft_ev) / RYD_TO_EV
-		E_sc_rel_ry, _, n_iter = solve_diagonal_sigma_fixed_point(
-			h0_diag_ry - efermi_ry, sigma_xc_diag_w_kn_ry, omega_grid_ry,
-			max_iter=120, tol_ev=1.0e-7 / RYD_TO_EV, mixing=0.6,
-		)
-
-		# Per-band scissor for out-of-grid bands.  A band is "in-grid" iff
-		# E_DFT[k, n] lies in [ω_min, ω_max] for every k; if any single k
-		# is outside, the band gets the scissor uniformly across k (the
-		# diagonal solver clipped Σ_c at the ω-boundary for the offending
-		# k, which would otherwise contaminate the band's k-dispersion).
-		# The scissor itself is fitted on in-grid bands only.  Default
-		# fallback when the scissor flag is off: E_DFT (the natural
-		# zeroth-order QP correction = 0 estimate); the older fallback
-		# of using ``eigvalsh(H_qp)`` was unreliable for pseudobands.
-		from .scissor import classify_bands_in_grid, fit_scissor
 		E_dft_rel_ry = np.asarray(omega_dft_rel_ev, dtype=np.float64) / RYD_TO_EV
-		band_in_grid, in_grid_kn_band = classify_bands_in_grid(
-			E_dft_rel_ry, float(omega_grid_ry[0]), float(omega_grid_ry[-1]))
-		n_bands_in = int(band_in_grid.sum())
-		n_bands_total = int(band_in_grid.size)
-		print0(
-			f"  Diagonal SC: {n_bands_in}/{n_bands_total} bands fully in grid, "
-			f"{n_iter} iterations")
-		if (
-			config.ppm.sigma_at_dft_extrapolate
-			and 0 < n_bands_in < n_bands_total
-		):
-			occ_mask_kn = np.broadcast_to(
-				np.arange(E_sc_rel_ry.shape[1])[None, :] < meta.nelec,
-				E_sc_rel_ry.shape).astype(bool)
-			# Fit in eV so the printed slopes/intercepts are human-readable.
-			# Sort-and-pair semantics (per-k argsort on each of E_DFT and
-			# E_QP independently) live inside ``fit_scissor`` and are
-			# robust to QSGW reorderings; one-shot G0W0 has no
-			# reordering and the sort is a no-op.
-			fit = fit_scissor(
-				E_dft_rel_ry * RYD_TO_EV,
-				E_sc_rel_ry * RYD_TO_EV,
-				valence_mask_kn=occ_mask_kn,
-				fit_mask_kn=in_grid_kn_band,
-			)
-			print0(f"  Scissor fit: {fit.summary()}")
-			extrap_rel_ry = E_dft_rel_ry + fit.predict(
-				E_dft_rel_ry * RYD_TO_EV, occ_mask_kn) / RYD_TO_EV
-			E_sc_rel_ry = np.where(in_grid_kn_band, E_sc_rel_ry, extrap_rel_ry)
+		if qp_solver is QPSolver.ONE_SHOT_DFT:
+			# G0W0: authoritative at-DFT evaluation — same dispatch pattern
+			# as the scissor's E_DFT fallback in the fixed_point branch.
+			E_sc_rel_ry = E_dft_rel_ry
+			print0("  QP solver: one_shot_dft — QSGW build evaluated at "
+			       "E_DFT (standard G0W0)")
 		else:
-			E_sc_rel_ry = np.where(in_grid_kn_band, E_sc_rel_ry, E_dft_rel_ry)
+			# QPSolver.FIXED_POINT: diagonal Σ(E) fixed point in Ry.
+			# Diagonal Σ_c(ω, k, n) and Σ_x(k, n) replicated on host, in Ry.
+			sigma_c_diag_w_kn_ry = np.asarray(extract_sigma_diag_replicated(
+				sigma_c_omega, mesh_xy))
+			sigma_x_diag_kn_ry = np.real(
+				np.diagonal(np.asarray(sig_x), axis1=1, axis2=2))
+			sigma_xc_diag_w_kn_ry = sigma_c_diag_w_kn_ry + sigma_x_diag_kn_ry[None, :, :]
+
+			h0_diag_ry = np.real(
+				np.diagonal(np.asarray(kin_ion + sig_h), axis1=1, axis2=2))
+			efermi_ry = float(efermi_dft_ev) / RYD_TO_EV
+			E_sc_rel_ry, _, n_iter = solve_diagonal_sigma_fixed_point(
+				h0_diag_ry - efermi_ry, sigma_xc_diag_w_kn_ry, omega_grid_ry,
+				max_iter=120, tol_ev=1.0e-7 / RYD_TO_EV, mixing=0.6,
+			)
+
+			# Per-band scissor for out-of-grid bands.  A band is "in-grid" iff
+			# E_DFT[k, n] lies in [ω_min, ω_max] for every k; if any single k
+			# is outside, the band gets the scissor uniformly across k (the
+			# diagonal solver clipped Σ_c at the ω-boundary for the offending
+			# k, which would otherwise contaminate the band's k-dispersion).
+			# The scissor itself is fitted on in-grid bands only.  Default
+			# fallback when the scissor flag is off: E_DFT (the natural
+			# zeroth-order QP correction = 0 estimate); the older fallback
+			# of using ``eigvalsh(H_qp)`` was unreliable for pseudobands.
+			from .scissor import classify_bands_in_grid, fit_scissor
+			band_in_grid, in_grid_kn_band = classify_bands_in_grid(
+				E_dft_rel_ry, float(omega_grid_ry[0]), float(omega_grid_ry[-1]))
+			n_bands_in = int(band_in_grid.sum())
+			n_bands_total = int(band_in_grid.size)
+			print0(
+				f"  Diagonal SC: {n_bands_in}/{n_bands_total} bands fully in grid, "
+				f"{n_iter} iterations")
+			if (
+				config.ppm.sigma_at_dft_extrapolate
+				and 0 < n_bands_in < n_bands_total
+			):
+				occ_mask_kn = np.broadcast_to(
+					np.arange(E_sc_rel_ry.shape[1])[None, :] < meta.nelec,
+					E_sc_rel_ry.shape).astype(bool)
+				# Fit in eV so the printed slopes/intercepts are human-readable.
+				# Sort-and-pair semantics (per-k argsort on each of E_DFT and
+				# E_QP independently) live inside ``fit_scissor`` and are
+				# robust to QSGW reorderings; one-shot G0W0 has no
+				# reordering and the sort is a no-op.
+				fit = fit_scissor(
+					E_dft_rel_ry * RYD_TO_EV,
+					E_sc_rel_ry * RYD_TO_EV,
+					valence_mask_kn=occ_mask_kn,
+					fit_mask_kn=in_grid_kn_band,
+				)
+				print0(f"  Scissor fit: {fit.summary()}")
+				extrap_rel_ry = E_dft_rel_ry + fit.predict(
+					E_dft_rel_ry * RYD_TO_EV, occ_mask_kn) / RYD_TO_EV
+				E_sc_rel_ry = np.where(in_grid_kn_band, E_sc_rel_ry, extrap_rel_ry)
+			else:
+				E_sc_rel_ry = np.where(in_grid_kn_band, E_sc_rel_ry, E_dft_rel_ry)
 		E_sc_rel_ev = E_sc_rel_ry * RYD_TO_EV
 
 		# QSGW Σ_xc^QSGW: sharded ω-tensor + replicated E_sc → replicated Σ_xc.
@@ -767,7 +783,7 @@ def main(argv=None):
 	# eigh runs on nk_full > wfn.nkpts and this path cannot build the artifact
 	# — skip with a warning rather than crash the whole run (the writer would
 	# raise ValueError on the k-count mismatch).
-	if config.debug.write_wfn_h5 and not config.self_consistent:
+	if config.debug.write_wfn_h5 and qp_solver is not QPSolver.SELF_CONSISTENT:
 		if int(U_full.shape[0]) != int(wfn.nkpts):
 			print0(
 				f"  QP WFN (one-shot): skipped — Σ on {int(U_full.shape[0])} "
@@ -940,7 +956,7 @@ def main(argv=None):
 		band_start=band_slices.b0,
 		band_stop=band_slices.b3,
 		use_ppm=mode.is_dynamic,
-		self_consistent=config.self_consistent,
+		self_consistent=qp_solver is QPSolver.SELF_CONSISTENT,
 		sigma_c_diag_at_dft_ry=sigma_c_diag_at_dft_ry,
 		sigma_xc_at_dft_ev=sigma_xc_at_dft_ev,
 		sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,

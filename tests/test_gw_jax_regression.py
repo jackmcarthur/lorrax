@@ -217,6 +217,55 @@ def test_gw_jax_matches_reference(
 
 
 @pytest.mark.regression
+def test_gnppm_fixed_point_reproduces_frozen_qp_rotations(tmp_path):
+    """``qp_solver = fixed_point`` must reproduce the pre-toggle eigh outputs.
+
+    The 2026-07-08 ``qp_solver`` toggle changed the DEFAULT eigh-family
+    behavior for dynamic modes (``E_qp_ry`` / ``qp_wfn_rotations.h5`` /
+    ``WFN_qp.h5``) from the diagonal on-shell fixed point to the at-DFT
+    G0W0 evaluation (``one_shot_dft``).  This gate proves the default flip
+    is a pure re-labeling, not a physics change: ``qp_solver = fixed_point``
+    on the GN-PPM fixture reproduces the ``E_qp_nk_rydberg`` eigenvalues
+    frozen from the pre-toggle HEAD (620b501) run of this exact fixture
+    (``eqp_rotations_fixedpoint_ref.npy``).  atol=1e-6 Ry only absorbs
+    GPU-nondeterministic last-ULP drift — the run is deterministic.
+    """
+    import h5py
+
+    platform = _requested_platform()
+    if platform in {"gpu", "cuda"} and not _gpu_available():
+        pytest.skip("CUDA GPU not available for requested ISDF_COHSEX_TEST_PLATFORM=gpu.")
+    case_dir = _REG / "gnppm_debug"
+    ref_file = case_dir / "eqp_rotations_fixedpoint_ref.npy"
+    assert ref_file.exists(), f"Missing frozen reference: {ref_file}"
+
+    run_dir = tmp_path / "gnppm_fixed_point"
+    shutil.copytree(
+        case_dir, run_dir,
+        ignore=shutil.ignore_patterns("tmp", "sigma_diag*.dat", "eqp*.dat"))
+    input_file = run_dir / "gnppm_test.in"
+    text = input_file.read_text()
+    assert "qp_solver = one_shot_dft" in text
+    input_file.write_text(
+        text.replace("qp_solver = one_shot_dft", "qp_solver = fixed_point"))
+
+    result = _run_gw_jax(run_dir, "gnppm_test.in", platform)
+    if result.returncode != 0:
+        pytest.fail(
+            f"fixed_point regression run failed.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    rot_file = run_dir / "qp_wfn_rotations.h5"
+    assert rot_file.exists(), f"missing {rot_file}"
+    with h5py.File(rot_file, "r") as f:
+        e_qp_ry = np.asarray(f["E_qp_nk_rydberg"])
+    e_ref_ry = np.load(ref_file)
+    assert e_qp_ry.shape == e_ref_ry.shape, (
+        f"shape mismatch: {e_qp_ry.shape} vs frozen {e_ref_ry.shape}")
+    np.testing.assert_allclose(e_qp_ry, e_ref_ry, rtol=0.0, atol=1e-6)
+
+
+@pytest.mark.regression
 def test_ibz_full_bz_equivalence(tmp_path):
     """IBZ cascade must reproduce full-BZ-direct to numerical precision.
 

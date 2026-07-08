@@ -427,7 +427,9 @@ def run_self_consistency(
     """
     print_fn = inputs.print_fn
     _, eigvalsh_kshard = _kshard_eigh_kernels(inputs.mesh_xy)
-    _dump_dir = os.environ.get("LORRAX_SC_DUMP_DIR")
+    # E-history dump dir from config.sc (LORRAX_SC_DUMP_DIR env is a
+    # deprecated override, applied at config construction).
+    _dump_dir = inputs.config.sc.dump_dir
 
     # One-shot fast path: no acceleration needed.
     if max_iter == 1:
