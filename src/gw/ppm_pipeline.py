@@ -389,6 +389,7 @@ def compute_ppm_sigma_pipeline(
             n_nodes_static=quad.node_count,
             print_fn=print_fn,
             model_label=label,
+            n_mu_logical=int(meta.n_rmu),
         )
 
         # Step 2: precompile + run Σ^c(ω, k, m, n)

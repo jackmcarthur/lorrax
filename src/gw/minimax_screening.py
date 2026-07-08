@@ -364,6 +364,7 @@ def fit_gn_ppm_from_wc_pair(
     probe_omega: complex,
     *,
     fallback_omega: float,
+    mode_mask: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, float]:
     """Fit GN-PPM pole data elementwise on an already-sharded ``(q,mu,nu)`` tensor pair.
 
@@ -379,6 +380,13 @@ def fit_gn_ppm_from_wc_pair(
     fallback_omega
         Positive real fallback pole in Ry for entries that do not produce a valid
         positive-real ``Omega^2`` estimate.
+    mode_mask
+        Optional bool mask, broadcastable against ``Wc0_qmunu``, selecting the
+        LOGICAL (μ, ν) modes.  μ-padded inputs carry exact-zero pad rows/cols
+        whose fit is trivially "unfulfilled" (Wc0 = Wc_probe = 0); without the
+        mask they inflate ``unfulfilled_fraction`` by an amount that depends on
+        the pad extent — i.e. on the device count (ROOT_CAUSE.md 2026-07-08).
+        ``None`` keeps the historical whole-tensor mean.
 
     Returns
     -------
@@ -406,7 +414,15 @@ def fit_gn_ppm_from_wc_pair(
     fallback = jnp.asarray(fallback_omega, dtype=jnp.float64)
     omega_vals = jnp.where(good, jnp.sqrt(omega_sq_re), fallback)
     B_vals = -0.5 * Wc0 * omega_vals.astype(jnp.complex128)
-    unfulfilled_fraction = 1.0 - _scalar_to_host_float(jnp.mean(good.astype(jnp.float64)))
+    if mode_mask is None:
+        unfulfilled_fraction = 1.0 - _scalar_to_host_float(
+            jnp.mean(good.astype(jnp.float64)))
+    else:
+        m = jnp.broadcast_to(jnp.asarray(mode_mask, dtype=bool), good.shape)
+        n_modes = jnp.sum(m.astype(jnp.float64))
+        n_good = jnp.sum((good & m).astype(jnp.float64))
+        unfulfilled_fraction = 1.0 - _scalar_to_host_float(
+            n_good / jnp.maximum(n_modes, 1.0))
     return omega_vals, B_vals, good, unfulfilled_fraction
 
 
