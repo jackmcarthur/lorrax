@@ -279,20 +279,20 @@ def unfold_v_q(
     # inv_perm = argsort(sym_perm) (= π⁻¹) which is a no-op for
     # involutive ops (MoS2 σ_h, Si cubic) but wrong for order-3 (CrI3
     # C3) — that was the silent 4 eV gap on hex systems.
-    # Pad with identity rows for centroid-axis padding to mesh-divisible.
+    # The μ pad is baked into the tables at construction
+    # (``_resolve_ibz_q_list``: identity tail on the permutation, zero
+    # tail on L).  REQUIRE an exact extent match in BOTH directions — a
+    # mismatch would otherwise feed ``promise_in_bounds`` gathers with
+    # out-of-range indices and clip SILENTLY (the TRS-bug failure
+    # shape).  Logical/logical callers (tests, unpadded runs) match
+    # trivially.
     fwd_perm = np.asarray(sym_perm, dtype=np.int32)
-    n_rmu_logical = int(fwd_perm.shape[-1])
-    n_rmu_padded = int(V_q_ibz.shape[-1])
-    if n_rmu_padded > n_rmu_logical:
-        pad_block = np.arange(n_rmu_logical, n_rmu_padded, dtype=np.int32)
-        pad_block = np.broadcast_to(
-            pad_block, (fwd_perm.shape[0], n_rmu_padded - n_rmu_logical))
-        fwd_perm = np.concatenate([fwd_perm, pad_block], axis=-1)
-    elif n_rmu_padded != n_rmu_logical:
+    if int(V_q_ibz.shape[-1]) != int(fwd_perm.shape[-1]):
         raise ValueError(
-            f"unfold_v_q: V_q_ibz μ-extent {n_rmu_padded} smaller than "
-            f"sym_perm logical extent {n_rmu_logical}; pad invariant "
-            f"violated.")
+            f"unfold_v_q: V_q_ibz μ-extent {int(V_q_ibz.shape[-1])} != "
+            f"sym_perm extent {int(fwd_perm.shape[-1])}.  Tables carry "
+            f"the μ pad from construction (_resolve_ibz_q_list); pass V "
+            f"at the same (padded) extent.")
     # Per-(q_full, μ) umklapp phase factor exp(2π i q_irr · L_μ).
     # ``L_table`` is shape (2·ntran, n_rmu, 3) int (any width); promote
     # to float64 then gather to (n_q_full, n_rmu, 3).  ``q_irr_frac`` is
@@ -300,14 +300,11 @@ def unfold_v_q(
     # product qL = q_irr · L is (n_q_full, n_rmu), then the bilinear
     # phase is qL[μ] − qL[ν] (per-q, outer-diff).
     L_arr = np.asarray(L_table, dtype=np.float64)
-    n_rmu_padded = int(V_q_ibz.shape[-1])
-    if L_arr.shape[1] < n_rmu_padded:
-        # Pad with zeros so the L axis matches the V μ-extent; padded
-        # centroids have no umklapp wrap.
-        pad = np.zeros(
-            (L_arr.shape[0], n_rmu_padded - L_arr.shape[1], 3),
-            dtype=np.float64)
-        L_arr = np.concatenate([L_arr, pad], axis=1)
+    if int(L_arr.shape[1]) != int(V_q_ibz.shape[-1]):
+        raise ValueError(
+            f"unfold_v_q: L_table μ-extent {int(L_arr.shape[1])} != "
+            f"V_q_ibz μ-extent {int(V_q_ibz.shape[-1])}; tables and V "
+            f"must share one (padded) extent.")
 
     # Sym tables are baked into the jit closure as constants — XLA folds
     # them into the HLO, which is materially faster per call than

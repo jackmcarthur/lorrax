@@ -198,6 +198,27 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid, verbose):
             sym_perm = None
             L_table = None
         if sym_perm is not None:
+            # Bake the μ pad into the tables ONCE at construction:
+            # identity tail on the permutation (pad centroids map to
+            # themselves), zero tail on the umklapp wrap (pad centroids
+            # never wrap).  Consumers (``unfold_v_q``,
+            # ``_unfold_g0_ibz_to_full``, gw_jax's W unfold) then
+            # REQUIRE an exact extent match instead of each re-padding
+            # per site — the too-small/too-large guards there replace a
+            # silent ``promise_in_bounds`` OOB gather (the TRS-bug
+            # failure shape) with a loud error.
+            from runtime.padding import padded_mu_extent
+            n_rmu_log = int(sym_perm.shape[-1])
+            n_rmu_pad = padded_mu_extent(n_rmu_log, int(jax.device_count()))
+            if n_rmu_pad > n_rmu_log:
+                tail = np.broadcast_to(
+                    np.arange(n_rmu_log, n_rmu_pad, dtype=sym_perm.dtype),
+                    (sym_perm.shape[0], n_rmu_pad - n_rmu_log))
+                sym_perm = np.concatenate([sym_perm, tail], axis=-1)
+                L_table = np.concatenate(
+                    [L_table,
+                     np.zeros((L_table.shape[0], n_rmu_pad - n_rmu_log, 3),
+                              dtype=L_table.dtype)], axis=1)
             q_irr_kgrid_int = sym.q_irr_kgrid_int
             q_full_to_irr_idx = sym.irr_idx_q
             q_full_to_irr_sym = sym.sym_idx_q
@@ -619,20 +640,21 @@ def _unfold_g0_ibz_to_full(
             f"inconsistent with sym_perm.shape[0]={n_sym_perm}.  "
             f"sym_perm must have shape (2·n_sym_spatial, n_rmu).")
 
-    # Pad ``inv_perm`` to the input's μ-extent (same logic as
-    # ``unfold_v_q``); g0 carries the padded μ count
-    # from the V_q kernel.
+    # The μ pad is baked into ``sym_perm`` at construction
+    # (``_resolve_ibz_q_list``); its identity tail argsorts to itself,
+    # so ``inv_perm`` needs no per-site pad-extension.  REQUIRE an
+    # exact extent match (both directions) — same rationale as
+    # ``unfold_v_q``: a mismatch would feed the ``promise_in_bounds``
+    # gather below with out-of-range indices and clip silently.
     inv_perm = np.argsort(sym_perm, axis=-1).astype(np.int32)
-    n_rmu_logical = int(inv_perm.shape[-1])
-    n_rmu_padded = int(g0_ibz.shape[-1])
+    if int(g0_ibz.shape[-1]) != int(inv_perm.shape[-1]):
+        raise ValueError(
+            f"_unfold_g0_ibz_to_full: g0 μ-extent {int(g0_ibz.shape[-1])}"
+            f" != sym_perm extent {int(inv_perm.shape[-1])}.  Tables "
+            f"carry the μ pad from construction (_resolve_ibz_q_list); "
+            f"pass g0 at the same (padded) extent.")
     full_to_irr_idx = np.asarray(full_to_irr_idx, dtype=np.int32)
     full_to_irr_sym = np.asarray(full_to_irr_sym, dtype=np.int32)
-    if n_rmu_padded > n_rmu_logical:
-        pad_block = np.arange(
-            n_rmu_logical, n_rmu_padded, dtype=np.int32)
-        pad_block = np.broadcast_to(
-            pad_block, (inv_perm.shape[0], n_rmu_padded - n_rmu_logical))
-        inv_perm = np.concatenate([inv_perm, pad_block], axis=-1)
     inv_perm_j = jnp.asarray(inv_perm)
     idx_j = jnp.asarray(full_to_irr_idx)
     sym_j = jnp.asarray(full_to_irr_sym)
