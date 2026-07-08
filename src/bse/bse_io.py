@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import glob
-import math
 import os
 from types import SimpleNamespace
 from typing import Optional
@@ -12,6 +11,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+from runtime.padding import padded_mu_extent
 
 
 class BSEData(SimpleNamespace):
@@ -436,8 +437,9 @@ def load_bse_data_from_restart_sharded(
         eps_c = jnp.asarray(enk_full[:, cond_indices])
 
         _, grid_x, grid_y = _get_local_mesh_coords(mesh_xy)
-        lcm_xy = math.lcm(grid_x, grid_y)
-        n_rmu_pad = ((n_rmu + lcm_xy - 1) // lcm_xy) * lcm_xy
+        # Disk stores the LOGICAL μ extent; re-pad to the ONE in-memory
+        # convention (mesh-product round-up, runtime.padding).
+        n_rmu_pad = padded_mu_extent(n_rmu, grid_x * grid_y)
         mu_per_x = n_rmu_pad // grid_x
         nu_per_y = n_rmu_pad // grid_y
 
@@ -871,8 +873,8 @@ def _load_ring_subset(
     V_qmunu = V_qmunu_flat
     W0_qmunu = W0_qmunu_flat
     nk = nkx * nky * nkz
-    lcm_xy = math.lcm(px, py)
-    n_rmu_pad = ((n_rmu + lcm_xy - 1) // lcm_xy) * lcm_xy
+    # Same μ re-pad convention as the sharded loader above.
+    n_rmu_pad = padded_mu_extent(n_rmu, px * py)
 
     n_bands_total = enk_full.shape[1]
     n_occ = resolve_n_occ(enk_full_np, n_occ=n_occ, input_file=input_file)

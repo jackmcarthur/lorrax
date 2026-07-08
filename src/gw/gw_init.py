@@ -687,6 +687,7 @@ def prepare_isdf_and_wavefunctions(
 			# split from flat-q V_qmunu without re-reading the WFN.
 			write_restart_state_to_h5(
 				tensors_filename,
+				n_rmu_logical=int(meta.n_rmu),
 				V_qmunu=V_qmunu, G0_mu_nu=G0, enk_full=enk_full,
 				init_W0=True, mesh=mesh_xy, backend=cfg.backend.slab_io,
 				mode="w", kgrid=tuple(int(v) for v in meta.kgrid),
@@ -717,6 +718,7 @@ def prepare_isdf_and_wavefunctions(
 			# Append ψ to the now-open restart file.
 			write_restart_state_to_h5(
 				tensors_filename,
+				n_rmu_logical=int(meta.n_rmu),
 				psi_full_y=wfns.psi_yr, mesh=mesh_xy,
 				backend=cfg.backend.slab_io, mode="a",
 			)

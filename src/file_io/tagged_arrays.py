@@ -11,9 +11,25 @@ import h5py
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 
+def _mu_logical_shape(shape, mu_axes, n_rmu_logical):
+    """On-disk (logical) shape for a μ-padded in-memory array: clip the
+    ``mu_axes`` extents of ``shape`` to ``n_rmu_logical``.
+
+    Disk contract (SHARDING_RULES §2): files store the LOGICAL μ extent
+    so a restart written at any device count re-reads on any other; the
+    in-memory pad (``Meta.n_rmu_padded``, zero rows by construction) is
+    re-applied on read via ``runtime.padding.padded_mu_extent``.
+    """
+    out = [int(s) for s in shape]
+    for ax in mu_axes:
+        out[ax] = min(out[ax], int(n_rmu_logical))
+    return tuple(out)
+
+
 def write_restart_state_to_h5(
     filename,
     *,
+    n_rmu_logical: int,
     V_qmunu=None,
     psi_full_y=None,
     enk_full=None,
@@ -37,6 +53,14 @@ def write_restart_state_to_h5(
     attribute written); with ``mode="a"`` the file is opened for
     append / overwrite of the named datasets.
 
+    ``n_rmu_logical`` (= ``meta.n_rmu``) clips every μ axis to the
+    logical extent on disk (SlabIO ``valid_shape``): in-memory arrays
+    carry the P-dependent padded extent ``meta.n_rmu_padded`` whose pad
+    rows are exact zeros, and persisting them verbatim would make the
+    restart file unreadable at a different device count (the
+    ROOT_CAUSE.md defect class, one hop downstream).
+    ``load_restart_state_from_h5`` re-pads on read.
+
     ``init_W0=True`` pre-allocates an all-zeros W0_qmunu dataset sized
     from ``V_qmunu``; the ``W0_ready`` attr on that dataset is set to
     False so downstream readers (bse_io) know to treat it as a
@@ -57,18 +81,18 @@ def write_restart_state_to_h5(
         if kgrid is not None and mode == "w":
             io.write_attr("kgrid", np.asarray(kgrid, dtype=np.int64))
 
-        def _write(name, arr):
+        def _write(name, arr, mu_axes=()):
             if arr is None:
                 return
-            shape = tuple(arr.shape)
+            shape = _mu_logical_shape(arr.shape, mu_axes, n_rmu_logical)
             io.create_dataset(name, shape=shape, dtype=arr.dtype)
-            io.write_slab(name, arr, global_shape=shape)
+            io.write_slab(name, arr, global_shape=shape, valid_shape=shape)
 
-        _write("V_qmunu",      V_qmunu)
-        _write("S_qmunu",      S_qmunu)
-        _write("V0_noG0_munu", V0_noG0_munu)
-        _write("G0_mu_nu",     G0_mu_nu)
-        _write("psi_full_y",   psi_full_y)
+        _write("V_qmunu",      V_qmunu,      mu_axes=(-2, -1))
+        _write("S_qmunu",      S_qmunu,      mu_axes=(-2, -1))
+        _write("V0_noG0_munu", V0_noG0_munu, mu_axes=(-2, -1))
+        _write("G0_mu_nu",     G0_mu_nu,     mu_axes=(-1,))
+        _write("psi_full_y",   psi_full_y,   mu_axes=(-1,))
         _write("enk_full",     enk_full)
 
         # W0_qmunu: either write the real data or pre-allocate an
@@ -76,14 +100,15 @@ def write_restart_state_to_h5(
         w0_touched = W0_qmunu is not None or init_W0
         w0_ready = False
         if W0_qmunu is not None:
-            shape = tuple(W0_qmunu.shape)
+            shape = _mu_logical_shape(W0_qmunu.shape, (-2, -1), n_rmu_logical)
             io.create_dataset("W0_qmunu", shape=shape, dtype=W0_qmunu.dtype)
-            io.write_slab("W0_qmunu", W0_qmunu, global_shape=shape)
+            io.write_slab("W0_qmunu", W0_qmunu, global_shape=shape,
+                          valid_shape=shape)
             w0_ready = True
         elif init_W0:
             if V_qmunu is None:
                 raise ValueError("init_W0=True requires V_qmunu to size the placeholder")
-            v_shape = tuple(V_qmunu.shape)
+            v_shape = _mu_logical_shape(V_qmunu.shape, (-2, -1), n_rmu_logical)
             v_dtype = V_qmunu.dtype
             io.create_dataset("W0_qmunu", shape=v_shape, dtype=v_dtype)
 
@@ -101,17 +126,22 @@ def write_restart_state_to_h5(
 
 
 def write_w0_qmunu_to_h5(
-    filename, W0_qmunu, mesh=None,
+    filename, W0_qmunu, *, n_rmu_logical: int, mesh=None,
     backend=None, use_ffi_io: bool | None = None,
 ):
-    """Overwrite or append the W0_qmunu dataset in an existing restart file."""
+    """Overwrite or append the W0_qmunu dataset in an existing restart file.
+
+    ``n_rmu_logical`` clips the trailing (μ, μ) axes to the logical
+    on-disk extent — same contract as ``write_restart_state_to_h5``.
+    """
     from .slab_io import SlabIO
 
-    shape = tuple(W0_qmunu.shape)
+    shape = _mu_logical_shape(W0_qmunu.shape, (-2, -1), n_rmu_logical)
     with SlabIO(filename, mode="a", mesh=mesh,
                 backend=backend, use_ffi_io=use_ffi_io) as io:
         io.create_dataset("W0_qmunu", shape=shape, dtype=W0_qmunu.dtype)
-        io.write_slab("W0_qmunu", W0_qmunu, global_shape=shape)
+        io.write_slab("W0_qmunu", W0_qmunu, global_shape=shape,
+                      valid_shape=shape)
 
     # W0_ready flag is a per-dataset attr read by bse_io.py.
     if jax.process_index() == 0:
@@ -228,6 +258,32 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None):
             -1, V_qmunu.shape[-2], V_qmunu.shape[-1])
     elif V_qmunu.ndim == 6:
         V_qmunu = jnp.asarray(V_qmunu)[0, 0, 0]
+
+    # Disk stores the LOGICAL μ extent (the writer clips via SlabIO
+    # ``valid_shape``); in-memory arrays carry the padded extent
+    # ``padded_mu_extent(n_rmu, world_size)`` with exact-zero pad rows.
+    # Re-apply the pad here so downstream shapes match ``Meta``.
+    # Restart files predating the clip carry an already-padded extent
+    # written at the same device count — ``padded_mu_extent`` is then a
+    # fixed point and every pad below is a no-op.
+    from runtime.padding import padded_mu_extent
+    n_rmu_disk = int(V_qmunu.shape[-1])
+    mu_pad = padded_mu_extent(n_rmu_disk, int(jax.device_count())) - n_rmu_disk
+    if mu_pad > 0:
+        V_qmunu = jnp.pad(V_qmunu, ((0, 0), (0, mu_pad), (0, mu_pad)))
+        if S_qmunu is not None:
+            S_qmunu = jnp.pad(
+                S_qmunu,
+                [(0, 0)] * (S_qmunu.ndim - 2) + [(0, mu_pad), (0, mu_pad)])
+        if V0_noG0_munu is not None:
+            V0_noG0_munu = jnp.pad(V0_noG0_munu, ((0, mu_pad), (0, mu_pad)))
+        if G0_mu_nu is not None:
+            G0_mu_nu = jnp.pad(
+                G0_mu_nu, [(0, 0)] * (G0_mu_nu.ndim - 1) + [(0, mu_pad)])
+        psi_full_y_raw = jnp.pad(
+            psi_full_y_raw,
+            [(0, 0)] * (psi_full_y_raw.ndim - 1) + [(0, mu_pad)])
+
     V_qmunu = jax.lax.with_sharding_constraint(V_qmunu, x1y2_3)
     if S_qmunu is not None:
         S_qmunu = jax.lax.with_sharding_constraint(S_qmunu, x3y4_5)
