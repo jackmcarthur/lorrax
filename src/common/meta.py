@@ -4,9 +4,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-
-def _round_up(x: int, n: int) -> int:
-    return ((x + n - 1) // n) * n
+from runtime.padding import round_up as _round_up
 
 
 @dataclass

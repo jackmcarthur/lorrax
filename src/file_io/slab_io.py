@@ -188,7 +188,7 @@ class SlabIO:
         shape; pass ``valid_shape`` on ``write_slab`` for chunk writes
         or to clip a padded ``A`` down to a smaller logical extent.
         Driver-side padding/unpadding is the caller's responsibility
-        (see ``runtime.padding`` in the agent/padding-refactor branch);
+        (see ``runtime.padding``);
         files always store the logical shape so they can be re-read
         on a different mesh size.
         """

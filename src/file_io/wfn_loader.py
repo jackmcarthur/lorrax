@@ -514,11 +514,6 @@ class WfnLoader:
                 p_band *= int(self._mesh.shape[a])
         return named, int(p_band)
 
-    @staticmethod
-    def _pad_to(n: int, multiple: int) -> int:
-        rem = n % multiple
-        return n + (multiple - rem) if rem else n
-
     # ------------------------------------------------------------------
     # The main load
     # ------------------------------------------------------------------
@@ -798,7 +793,8 @@ class WfnLoader:
         k_idxs, unfold = self._resolve_k(k)
         named_sharding, p_band = self._default_sharding(
             sharding, n_k=len(k_idxs))
-        nb_padded = self._pad_to(nb_logical, p_band)
+        from runtime.padding import round_up
+        nb_padded = round_up(nb_logical, p_band)
 
         # Backends produce 2-spinor ψ in the canonical layout
         # ``(n_k, nb_padded, nspinor, ngkmax)`` c128.  The optional
