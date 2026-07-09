@@ -7,7 +7,7 @@ import os
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh
 jax.config.update("jax_enable_x64", True)
 
 from runtime import init_jax_distributed, fallback_to_cpu_if_no_gpu_backend
@@ -23,7 +23,7 @@ from file_io import (
 )
 from common import symmetry_maps
 from common.wfn_transforms import get_enk_bandrange
-from .gw_config import LorraxConfig, QPSolver
+from .gw_config import ComputeMode, LorraxConfig, QPSolver
 from .gw_init import (
 	get_effective_chunk_size,
 	prepare_isdf_and_wavefunctions,
@@ -36,16 +36,11 @@ from .w_isdf import (
 	build_static_quadrature,
 	flatten_V_qmunu,
 )
-from .screening import compute_static_w
-from .ppm_pipeline import compute_ppm_sigma_pipeline
-from .cohsex_sigma import (
-	build_Gij,
-	compute_cohsex_sigma,
-)
+from .screening import compute_screening, screening_requests_for
+from .sigma_dispatch import compute_sigma_xc
 from .qsgw_utils import (
-	build_qsgw_sigma_xc,
 	extract_sigma_diag_replicated,
-	solve_diagonal_sigma_fixed_point,
+	solve_qp,
 )
 from .head_correction import (
 	HeadResolver,
@@ -201,35 +196,38 @@ def main(argv=None):
 		if wfns_transverse is not None else None
 	)
 
-	# --- Screening: χ₀ → W = (1 − Vχ)⁻¹ V ---
-	# V_qmunu is already flat-q ``(nq, μ, μ)``; downstream consumers
-	# bind ``V_q`` to that array directly.  ``flatten_V_qmunu`` is kept
-	# as a back-compat no-op for restart paths that may still feed in
-	# the legacy 8-D layout.
+	# --- Screening: χ₀ → W = (1 − Vχ)⁻¹ V at every ω the Σ scheme needs ---
+	# ``compute_mode`` is the single axis describing the self-energy ansatz
+	# (X_ONLY / COHSEX / GN_PPM / HL_PPM); ``qp_solver`` (how QP energies
+	# are extracted from Σ) is orthogonal.  X_ONLY needs no screening.
+	# V_qmunu is already flat-q ``(nq, μ, μ)``; ``flatten_V_qmunu`` is a
+	# back-compat no-op for restart paths that may feed the legacy layout.
 	V_q = flatten_V_qmunu(V_qmunu)
-	if config.do_screened:
+	mode = config.compute_mode
+	do_screened = mode is not ComputeMode.X_ONLY
+	quad, e_ref = None, None
+	if do_screened:
 		# The minimax τ-axis, solved on G's actual spectral range — shared
-		# by every χ₀ build this run (static W here, probe W for PPM, SC
-		# re-solves).
+		# by every χ₀ build this run (static + probe W here, SC re-solves).
 		quad, e_ref = build_static_quadrature(
 			wfns, config.minimax_config, print_fn=print0)
-		# W(0) = (1 − Vχ₀)⁻¹V, solved on the IBZ wedge and unfolded to
-		# the full BZ (see ``screening.compute_static_w``).
-		W_q = compute_static_w(
-			wfns, V_q, quad, e_ref=e_ref,
-			sym=sym, centroid_indices=centroid_indices,
-			config=config, meta=meta, mesh_xy=mesh_xy)
-	else:
-		W_q = V_q  # unscreened: W = V
+	# SC solves its own W's inside the iteration map; the static W is
+	# still solved once here to seed the W0 restart flush.
+	requests = screening_requests_for(mode, config)
+	if qp_solver is QPSolver.SELF_CONSISTENT:
+		requests = [r for r in requests if r.role == "static"]
+	W_by_role = compute_screening(
+		wfns, V_q, requests, quad=quad, e_ref=e_ref,
+		sym=sym, centroid_indices=centroid_indices,
+		config=config, meta=meta, mesh_xy=mesh_xy, print_fn=print0)
 
 	# Persist W0_qmunu + q=0 head scalars to the ISDF restart file for
 	# downstream consumers (BSE, future Σ-builders); no-op unless screened
 	# and the restart file exists.
 	persist_w0_and_head(
-		W_q, tensors_filename=tensors_filename, head_resolver=head_resolver,
+		W_by_role.get("static", V_q),
+		tensors_filename=tensors_filename, head_resolver=head_resolver,
 		config=config, meta=meta, mesh_xy=mesh_xy, print_fn=print0)
-
-	Gij = build_Gij(meta, mesh_xy)
 
 	# q→0 head correction.  The bare-X head is the same physical quantity in
 	# both COHSEX and PPM modes; gating this on ``not use_ppm_sigma`` was
@@ -241,49 +239,16 @@ def main(argv=None):
 	static_head_terms = None
 	if config.do_G0:
 		static_head_terms = _compute_static_head(
-			head_resolver, meta, config.do_screened, print0)
+			head_resolver, meta, do_screened, print0)
 
-	# ---- Static COHSEX: Σ_SX, Σ_COH, V_H + bare Σ_X ----
-	import gc; gc.collect()
-	with timing.section("gw_jax.sigma"):
-		cohsex = compute_cohsex_sigma(
-			wfns, V_q, W_q, meta, mesh_xy,
-			Gij=Gij, do_screened=config.do_screened,
-			static_head_terms=static_head_terms,
-			compute_bare_x=True,
-			wfns_transverse=wfns_transverse,
-			bispinor_v_q_path=bispinor_v_q_path,
-			backend=config.backend.slab_io,
-		)
-	sig_sx  = cohsex["sig_sx"]
-	sig_coh = cohsex["sig_coh"]
-	sig_h   = cohsex["sig_h"]
-	sig_x   = cohsex["sig_x"]
-
-	# Print bare Σ_X diagonal for ISDF quality assessment.  Apply BGW-style
-	# degenerate-set averaging (mirrors Sigma/shiftenergy.f90) unless
-	# explicitly disabled via ``no_degen_averaging``.  Without this, the
-	# QE basis-dependent splitting within degenerate manifolds shows up
-	# as a few-meV spread across symmetry-equivalent bands.
-	from .degen_average import average_within_degenerate_sets
-	sig_x_diag = np.real(np.diagonal(np.asarray(sig_x), axis1=1, axis2=2)) * RYD_TO_EV
-	if not config.no_degen_averaging:
-		sig_x_diag = average_within_degenerate_sets(
-			sig_x_diag,
-			energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
-			tol_ry=float(config.degen_avg_tol_ry),
-		)
-	print0(f"  Bare Σ_X diagonal (eV), k=0: "
-	       + "  ".join(f"{sig_x_diag[0, i]:.4f}" for i in range(min(8, sig_x_diag.shape[1]))))
-
-	# ---- Mode-pivoted dispatch ----
-	# ``compute_mode`` is the single axis describing the self-energy ansatz
-	# (X_ONLY / COHSEX / GN_PPM / HL_PPM); ``qp_solver`` (how QP energies
-	# are extracted from Σ) is orthogonal.
-	# Static COHSEX matrices were already computed above (the bare-X pass
-	# reuses the same kernel), so X_ONLY and COHSEX both fall through with
-	# the existing sig_sx / sig_coh / sig_x.  Dynamic modes go through the
-	# PPM pipeline.
+	# ---- Σ_xc + V_H: ONE dispatch for every mode ----
+	# The same ``compute_sigma_xc`` call the SC iteration map makes each
+	# step — static COHSEX kernels for X_ONLY/COHSEX, the PPM pipeline
+	# (fit → 4-branch τ-integration → analytic q→0 head → at-DFT interp)
+	# for the dynamic modes, with the QSGW-symmetrised Σ_xc evaluated at
+	# E_DFT (textbook G0W0; ``solve_qp`` re-evaluates for fixed_point).
+	# SC-iteration-1 ≡ this call, pinned by test_sc_oneshot_equivalence.
+	# SC runs skip it — the iteration map would re-do this work on iter 1.
 	#
 	# History note (kept here because it explains a specific decision and
 	# is not yet captured anywhere else): the analytic q→0 head injected
@@ -291,57 +256,75 @@ def main(argv=None):
 	# 2026-04-25 after being removed in 1542342 (Apr-10).  Magnitude is
 	# ±W^c(0)/(2·V_cell·N_k) on-shell — ~1.24 eV/band on Si 4×4×4 60b.
 	# See reports/mos2_kgrid_gnppm_head_convergence_2026-4-10/.
-	mode = config.compute_mode
-	ppm_outputs = None
-	# Skip the standalone PPM pipeline when running SC-dynamic — the
-	# QSGW iteration map calls compute_sigma_xc internally each step
-	# and would re-do this work on iter 1.
-	if mode.is_dynamic and qp_solver is not QPSolver.SELF_CONSISTENT:
-		# Mode-orthogonal screening: ask the scheme which W's it needs
-		# (PPM modes need a probe-frequency W in addition to the static
-		# one already in W_q), evaluate them in one pass, and hand the
-		# {role → W_q} dict to the Σ build.
-		from .screening import compute_screening, screening_requests_for
-		_requests = [r for r in screening_requests_for(mode, config)
-		             if r.role != "static"]   # static W already solved above
-		_W_extra = compute_screening(
-			wfns, V_q, _requests,
-			quad=quad, e_ref=e_ref,
-			config=config, meta=meta, mesh_xy=mesh_xy,
-			print_fn=print0,
-		)
-		ppm_outputs = compute_ppm_sigma_pipeline(
-			wfns=wfns,
-			V_q=V_q,
-			W_static_q=W_q,
-			W_probe_q=_W_extra["probe"],
-			sig_x=sig_x, sig_h=sig_h,
-			quad=quad, e_ref=e_ref,
-			config=config, meta=meta, mesh_xy=mesh_xy,
-			head_resolver=head_resolver,
-			band_slices=band_slices, wfn=wfn, sym=sym,
-			input_dir=input_dir,
-			print_fn=print0,
-		)
-	# Post-PPM seam: extract every downstream-consumed field into a bare
-	# local, so the writer / freq_debug / SC branch all read uniform names
-	# regardless of whether the data came from a one-shot ``ppm_outputs``,
-	# from a converged SC ``SigmaResult``, or is None (static modes).
-	sigma_omega_h5_path = ppm_outputs.sigma_omega_h5_path if ppm_outputs else None
-	sigma_c_at_dft_ev   = ppm_outputs.sigma_c_at_dft_ev   if ppm_outputs else None
-	sigma_xc_at_dft_ev  = ppm_outputs.sigma_xc_at_dft_ev  if ppm_outputs else None
-	omega_dft_rel_ev    = ppm_outputs.omega_dft_rel_ev    if ppm_outputs else None
-	efermi_dft_ev       = ppm_outputs.efermi_dft_ev       if ppm_outputs else None
-	sigma_c_omega       = ppm_outputs.sigma_c_omega       if ppm_outputs else None
-	head_sigma_diag_w_kn_ry = (
-		ppm_outputs.head_sigma_diag_w_kn_ry if ppm_outputs else None)
-	omega_grid_ev = (
-		np.asarray(config.omega_grid_ev, dtype=np.float64)
-		if ppm_outputs else None)
-	omega_grid_ry = (
-		np.asarray(config.omega_grid_ry, dtype=np.float64)
-		if ppm_outputs else None)
-	del ppm_outputs                              # all fields now in bare locals
+	import gc; gc.collect()
+	sigma_result = None
+	if qp_solver is not QPSolver.SELF_CONSISTENT:
+		with timing.section("gw_jax.sigma"):
+			sigma_result = compute_sigma_xc(
+				mode,
+				wfns=wfns, V_q=V_q, W_by_role=W_by_role,
+				e_qp_ev=np.asarray(enk_dft, dtype=np.float64) * RYD_TO_EV,
+				static_head_terms=static_head_terms,
+				head_resolver=head_resolver,
+				quad=quad, e_ref=e_ref,
+				config=config, meta=meta, mesh_xy=mesh_xy,
+				sym=sym, wfn=wfn, band_slices=band_slices,
+				input_dir=input_dir,
+				wfns_transverse=wfns_transverse,
+				bispinor_v_q_path=bispinor_v_q_path,
+				print_fn=print0,
+			)
+
+		# Print bare Σ_X diagonal for ISDF quality assessment.  Apply
+		# BGW-style degenerate-set averaging (mirrors Sigma/shiftenergy.f90)
+		# unless disabled — without it, the QE basis-dependent splitting
+		# within degenerate manifolds shows up as a few-meV spread across
+		# symmetry-equivalent bands.
+		from .degen_average import average_within_degenerate_sets
+		sig_x_diag = np.real(np.diagonal(
+			np.asarray(sigma_result.sigma_x_kij_ry),
+			axis1=1, axis2=2)) * RYD_TO_EV
+		if not config.no_degen_averaging:
+			sig_x_diag = average_within_degenerate_sets(
+				sig_x_diag,
+				energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+				tol_ry=float(config.degen_avg_tol_ry),
+			)
+		print0(f"  Bare Σ_X diagonal (eV), k=0: "
+		       + "  ".join(f"{sig_x_diag[0, i]:.4f}" for i in range(min(8, sig_x_diag.shape[1]))))
+
+	# Post-Σ seam: extract every downstream-consumed field into a bare
+	# local, so the writer / freq_debug / QP solve all read uniform names
+	# regardless of whether the data came from the one-shot SigmaResult
+	# above or (below) from a converged SC SigmaResult.  PPM-only fields
+	# are None in static modes.
+	if sigma_result is not None:
+		sig_h   = sigma_result.v_h_kij_ry
+		sig_x   = sigma_result.sigma_x_kij_ry
+		sig_sx  = (sigma_result.sigma_sx_kij_ry
+		           if sigma_result.sigma_sx_kij_ry is not None
+		           else jnp.zeros_like(sig_x))
+		sig_coh = (sigma_result.sigma_coh_kij_ry
+		           if sigma_result.sigma_coh_kij_ry is not None
+		           else jnp.zeros_like(sig_x))
+		sigma_omega_h5_path = sigma_result.sigma_omega_h5_path
+		sigma_c_at_dft_ev   = sigma_result.sigma_c_at_dft_diag_ev
+		omega_dft_rel_ev    = sigma_result.omega_dft_rel_ev
+		efermi_dft_ev       = sigma_result.efermi_dft_ev
+		sigma_c_omega       = sigma_result.sigma_c_omega_kij_ry
+		head_sigma_diag_w_kn_ry = sigma_result.head_sigma_diag_w_kn_ry
+		omega_grid_ev = (
+			np.asarray(sigma_result.omega_grid_ev, dtype=np.float64)
+			if sigma_result.omega_grid_ev is not None else None)
+		omega_grid_ry = (
+			np.asarray(sigma_result.omega_grid_ry, dtype=np.float64)
+			if sigma_result.omega_grid_ry is not None else None)
+		# Σ_xc(E_DFT) diagonal (eV) — drives eqp_g0w0.dat (PPM one-shot
+		# only).  Same spelling as the PPM pipeline's step 4.
+		sigma_xc_at_dft_ev = (
+			np.diagonal(np.asarray(sig_x), axis1=1, axis2=2) * RYD_TO_EV
+			+ sigma_c_at_dft_ev
+			if sigma_c_at_dft_ev is not None else None)
 
 	# ---- QP Hamiltonian: H_QP = (H_DFT - V_xc) + V_H + Σ_xc ----
 	#
@@ -408,7 +391,7 @@ def main(argv=None):
 			static_head_terms=static_head_terms,
 			head_resolver=head_resolver,
 			config=config, meta=meta, mesh_xy=mesh_xy,
-			sym=sym, wfn=wfn,
+			sym=sym, wfn=wfn, centroid_indices=centroid_indices,
 			band_slices=band_slices, input_dir=input_dir,
 			partition=_partition,
 			e_dft_active_kn_ry=_e_dft_active_kn_ry,
@@ -448,10 +431,6 @@ def main(argv=None):
 		# ``_sigma_result.sigma_xc_kij_ry`` lives in QP basis but
 		# ``kin_ion`` is DFT basis — fixed below by overriding
 		# ``sigma_total`` with ``state_final.H_qp_dft - kin_ion``.
-		from .sc_iteration import final_qp_eigenstates
-		_enk_qp_active_ry, _U_kmn, _efermi_final_ry = final_qp_eigenstates(
-			_state_final, n_occ=int(meta.nelec), mesh_xy=mesh_xy,
-		)
 		if config.debug.write_wfn_h5:
 			dump_qp_wfn_artifacts(
 				_state_final, n_occ=int(meta.nelec), mesh_xy=mesh_xy,
@@ -473,13 +452,15 @@ def main(argv=None):
 		# was called with the rotated wfn bundle).  Downstream code
 		# (post-Σ H build + eigh, writer, freq_debug) is written for
 		# DFT-basis matrices — kin_ion is DFT basis throughout — so we
-		# must rotate every QP-basis SigmaResult field back to DFT via
-		# the converged U from ``final_qp_eigenstates`` before plumbing
-		# into the bare locals.  Without this, the line-660 eigh sees
-		# ``kin_ion`` (DFT) + ``sigma_xc`` (QP) and produces nonsense
-		# eigenvalues for eqp0.dat (off by tens of eV per band on MoS2).
+		# must rotate every QP-basis SigmaResult field back to DFT.
+		# The U of record is ``state_final.last_sigma_basis_U`` — the
+		# unitary that DEFINED the basis the last compute_sigma_xc ran
+		# in.  NOT the converged U from ``final_qp_eigenstates``: that
+		# is one iteration ahead and agrees only at the fixed point
+		# (using it mis-rotated Σ_x/V_H by tens of eV at max_iter=1 —
+		# caught by test_sc_oneshot_equivalence).
 		from .sc_iteration import _rotate_to_dft_basis
-		_U_jax = jnp.asarray(_U_kmn)
+		_U_jax = jnp.asarray(_state_final.last_sigma_basis_U)
 		sig_h = _rotate_to_dft_basis(_sigma_result.v_h_kij_ry, _U_jax)
 		sig_x = _rotate_to_dft_basis(_sigma_result.sigma_x_kij_ry, _U_jax)
 		_sigma_xc_dft = _rotate_to_dft_basis(
@@ -506,112 +487,19 @@ def main(argv=None):
 		if sigma_c_at_dft_ev is not None:
 			sigma_xc_at_dft_ev = sigma_c_at_dft_ev + np.real(np.diagonal(
 				np.asarray(sig_x), axis1=1, axis2=2)) * RYD_TO_EV
-	elif mode.is_dynamic and sigma_c_omega is not None:
-		# NB (streamed-mode fallthrough): in KIJ_STREAM accumulation
-		# ``sigma_c_omega`` is None (Σ_c lives only in the sigma_kij h5, which
-		# _inject_analytic_head has already head-corrected in place), so this
-		# branch is skipped — streamed runs get the at-DFT diagnostic Σ_c
-		# only.  Config validation rejects fixed_point/self_consistent with
-		# explicit kij_stream (see ``LorraxConfig.qp_solver``); the eqp1
-		# Z-loss in streamed mode remains a separate WS1 fix.  See WS1 /
-		# Bug B in reports/sigma_ppm_tighten_2026-07-04.
-		#
-		# ``qp_solver`` picks the evaluation energies for the QSGW-symmetrised
-		# Σ_xc whose eigh produces E_qp_ry / qp_wfn_rotations.h5 / WFN_qp.h5:
-		#   one_shot_dft — E_DFT − E_F (standard G0W0; consistent with eqp0)
-		#   fixed_point  — diagonal on-shell solve E = h0 + ReΣ(E)
-		#                  (+ optional scissor for out-of-grid bands)
-		# eqp0.dat/eqp1.dat are at-DFT in both cases (written downstream from
-		# ``sigma_c_at_dft_ev`` / the ω-grid diag; not from this branch).
-		# Restart-friendly: this whole block consumes only the on-device
-		# ``sigma_c_omega`` plus replicated (sig_x, sig_h), so a future outer
-		# QSGW iteration loop can pass refreshed inputs in without touching
-		# the disk.
-		# All quantities below are in **Rydberg** until the scissor's print
-		# summary and final eV outputs.  Σ_c(ω) lives natively in Ry on the
-		# Ry ω-grid; mixing that with eV-converted h0/Σ_x is a footgun.
-		E_dft_rel_ry = np.asarray(omega_dft_rel_ev, dtype=np.float64) / RYD_TO_EV
-		if qp_solver is QPSolver.ONE_SHOT_DFT:
-			# G0W0: authoritative at-DFT evaluation — same dispatch pattern
-			# as the scissor's E_DFT fallback in the fixed_point branch.
-			E_sc_rel_ry = E_dft_rel_ry
-			print0("  QP solver: one_shot_dft — QSGW build evaluated at "
-			       "E_DFT (standard G0W0)")
 		else:
-			# QPSolver.FIXED_POINT: diagonal Σ(E) fixed point in Ry.
-			# Diagonal Σ_c(ω, k, n) and Σ_x(k, n) replicated on host, in Ry.
-			sigma_c_diag_w_kn_ry = np.asarray(extract_sigma_diag_replicated(
-				sigma_c_omega, mesh_xy))
-			sigma_x_diag_kn_ry = np.real(
-				np.diagonal(np.asarray(sig_x), axis1=1, axis2=2))
-			sigma_xc_diag_w_kn_ry = sigma_c_diag_w_kn_ry + sigma_x_diag_kn_ry[None, :, :]
-
-			h0_diag_ry = np.real(
-				np.diagonal(np.asarray(kin_ion + sig_h), axis1=1, axis2=2))
-			efermi_ry = float(efermi_dft_ev) / RYD_TO_EV
-			E_sc_rel_ry, _, n_iter = solve_diagonal_sigma_fixed_point(
-				h0_diag_ry - efermi_ry, sigma_xc_diag_w_kn_ry, omega_grid_ry,
-				max_iter=120, tol_ev=1.0e-7 / RYD_TO_EV, mixing=0.6,
-			)
-
-			# Per-band scissor for out-of-grid bands.  A band is "in-grid" iff
-			# E_DFT[k, n] lies in [ω_min, ω_max] for every k; if any single k
-			# is outside, the band gets the scissor uniformly across k (the
-			# diagonal solver clipped Σ_c at the ω-boundary for the offending
-			# k, which would otherwise contaminate the band's k-dispersion).
-			# The scissor itself is fitted on in-grid bands only.  Default
-			# fallback when the scissor flag is off: E_DFT (the natural
-			# zeroth-order QP correction = 0 estimate); the older fallback
-			# of using ``eigvalsh(H_qp)`` was unreliable for pseudobands.
-			from .scissor import classify_bands_in_grid, fit_scissor
-			band_in_grid, in_grid_kn_band = classify_bands_in_grid(
-				E_dft_rel_ry, float(omega_grid_ry[0]), float(omega_grid_ry[-1]))
-			n_bands_in = int(band_in_grid.sum())
-			n_bands_total = int(band_in_grid.size)
-			print0(
-				f"  Diagonal SC: {n_bands_in}/{n_bands_total} bands fully in grid, "
-				f"{n_iter} iterations")
-			if (
-				config.ppm.sigma_at_dft_extrapolate
-				and 0 < n_bands_in < n_bands_total
-			):
-				occ_mask_kn = np.broadcast_to(
-					np.arange(E_sc_rel_ry.shape[1])[None, :] < meta.nelec,
-					E_sc_rel_ry.shape).astype(bool)
-				# Fit in eV so the printed slopes/intercepts are human-readable.
-				# Sort-and-pair semantics (per-k argsort on each of E_DFT and
-				# E_QP independently) live inside ``fit_scissor`` and are
-				# robust to QSGW reorderings; one-shot G0W0 has no
-				# reordering and the sort is a no-op.
-				fit = fit_scissor(
-					E_dft_rel_ry * RYD_TO_EV,
-					E_sc_rel_ry * RYD_TO_EV,
-					valence_mask_kn=occ_mask_kn,
-					fit_mask_kn=in_grid_kn_band,
-				)
-				print0(f"  Scissor fit: {fit.summary()}")
-				extrap_rel_ry = E_dft_rel_ry + fit.predict(
-					E_dft_rel_ry * RYD_TO_EV, occ_mask_kn) / RYD_TO_EV
-				E_sc_rel_ry = np.where(in_grid_kn_band, E_sc_rel_ry, extrap_rel_ry)
-			else:
-				E_sc_rel_ry = np.where(in_grid_kn_band, E_sc_rel_ry, E_dft_rel_ry)
-		E_sc_rel_ev = E_sc_rel_ry * RYD_TO_EV
-
-		# QSGW Σ_xc^QSGW: sharded ω-tensor + replicated E_sc → replicated Σ_xc.
-		# Build kernel takes ω-grid and evaluation energies in **eV**; we
-		# convert at the seam (kernel internals convert; result is Ry).
-		sig_x_rep = jax.device_put(jnp.asarray(sig_x),
-			NamedSharding(mesh_xy, P(None, None, None)))
-		sigma_xc_qsgw_kij_ry, qsgw_diag = build_qsgw_sigma_xc(
-			sigma_c_omega, sig_x_rep,
-			omega_grid_ry * RYD_TO_EV, E_sc_rel_ev, mesh_xy,
-		)
-		print0(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
-			f"({100*qsgw_diag['frac_clipped']:.1f}%)")
-		sigma_total = sigma_xc_qsgw_kij_ry + sig_h
+			sigma_xc_at_dft_ev = None
 	else:
-		# Static modes (X_ONLY, COHSEX) and dynamic-streamed fallback.
-		sigma_total = sig_sx + sig_coh + sig_h
+		# ---- update_H[Σ; qp_solver] — one-shot (non-SC) paths ----
+		# ``one_shot_dft``: Σ_xc was already QSGW-built at E_DFT inside
+		# ``compute_sigma_xc`` (pass-through; also covers the static modes
+		# and the streamed-Σ_c stand-in).  ``fixed_point``: diagonal
+		# on-shell solve + scissor + QSGW rebuild at the solved energies.
+		# eqp0.dat/eqp1.dat are at-DFT in every case (written downstream
+		# from ``sigma_c_at_dft_ev`` / the ω-grid diag, not from here).
+		sigma_total = solve_qp(
+			qp_solver, sigma_result, kin_ion,
+			config=config, meta=meta, mesh_xy=mesh_xy, print_fn=print0)
 
 	# ---- BGW-style degenerate-set averaging at the H-build seam ----
 	# (mirrors Sigma/shiftenergy.f90; see ``degen_average``).

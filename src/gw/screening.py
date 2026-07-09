@@ -246,6 +246,8 @@ def compute_screening(
     *,
     quad,                     # static minimax quad from build_static_quadrature
     e_ref: float,
+    sym,
+    centroid_indices,
     config,
     meta,
     mesh_xy,
@@ -254,11 +256,16 @@ def compute_screening(
     """Evaluate W at each requested frequency.
 
     Returns ``{role: W_q}``.  The static role uses the prebuilt minimax
-    quadrature ``quad``; non-static roles build a single-frequency
-    quadrature on the fly using the existing
-    :func:`gw.w_isdf.build_imag_quadrature` /
+    quadrature ``quad`` and runs through :func:`compute_static_w` — the
+    IBZ fast path (slice → per-q Dyson solve on the wedge → unfold).
+    Non-static roles build a single-frequency quadrature on the fly
+    using the existing :func:`gw.w_isdf.build_imag_quadrature` /
     :func:`gw.w_isdf.build_real_quadrature` helpers (chosen by whether
-    ``omega_ry`` is on the imag or real axis).
+    ``omega_ry`` is on the imag or real axis) and solve on the full BZ
+    directly: the nonlinear PPM fit downstream has a documented ~0.1 meV
+    q-set path-dependence (see ``test_ibz_full_bz_equivalence``), so the
+    probe W stays on the frozen-golden full-BZ path until that is
+    re-frozen deliberately.
 
     The static minimax interval ``[x_min, x_max]`` is reused for both
     branches — both probe-quad builders take the same ``quad`` argument
@@ -277,23 +284,26 @@ def compute_screening(
     W_by_role: dict[str, jax.Array] = {}
     for req in requests:
         if req.role == "static":
-            quad_used = quad
+            W_by_role[req.role] = compute_static_w(
+                wfns, V_q, quad, e_ref=e_ref,
+                sym=sym, centroid_indices=centroid_indices,
+                config=config, meta=meta, mesh_xy=mesh_xy)
+            continue
+        # Pick imag or real axis by which component of ω is non-zero.
+        on_imag = abs(req.omega_ry.imag) > 0.0
+        on_real = abs(req.omega_ry.real) > 0.0
+        if on_imag and on_real:
+            raise ValueError(
+                f"compute_screening: complex-axis ω={req.omega_ry!r} "
+                f"not supported — ω must be pure real or pure imag.")
+        if on_imag:
+            quad_used = build_imag_quadrature(
+                quad, abs(req.omega_ry.imag),
+                config.minimax_config, print_fn=print_fn)
         else:
-            # Pick imag or real axis by which component of ω is non-zero.
-            on_imag = abs(req.omega_ry.imag) > 0.0
-            on_real = abs(req.omega_ry.real) > 0.0
-            if on_imag and on_real:
-                raise ValueError(
-                    f"compute_screening: complex-axis ω={req.omega_ry!r} "
-                    f"not supported — ω must be pure real or pure imag.")
-            if on_imag:
-                quad_used = build_imag_quadrature(
-                    quad, abs(req.omega_ry.imag),
-                    config.minimax_config, print_fn=print_fn)
-            else:
-                quad_used = build_real_quadrature(
-                    quad, abs(req.omega_ry.real),
-                    config.minimax_config, print_fn=print_fn)
+            quad_used = build_real_quadrature(
+                quad, abs(req.omega_ry.real),
+                config.minimax_config, print_fn=print_fn)
 
         chi0 = compute_chi0(
             wfns, quad_used, meta, mesh_xy, energy_reference=e_ref)

@@ -109,6 +109,7 @@ class SCInputs:
     mesh_xy: Mesh
     sym: object
     wfn: object              # WFNReader (for vbm/efermi anchor + paths)
+    centroid_indices: object  # ISDF centroid set — IBZ resolve for the static W
     band_slices: BandSlices
     input_dir: str
     partition: BandPartition
@@ -131,11 +132,19 @@ class SCState:
 
     ``last_sigma_result`` is purely for the final output writer (eqp.dat,
     sigma_diag.dat, freq_debug.dat); it does not feed the next iteration.
+    ``last_sigma_basis_U`` is the DFT→QP unitary that DEFINED the basis
+    ``last_sigma_result`` was computed in (the eigh of the *previous*
+    carry) — the writer must rotate Σ back to DFT with THIS U, not the
+    converged U of the final carry: the two agree only at convergence,
+    and using the converged U mis-rotates Σ_x/V_H whenever the loop
+    stops before the fixed point (maximally so at max_iter=1, where the
+    correct U is the identity).
     """
 
     H_qp_dft: jax.Array              # (nk, nb_active, nb_active) Ry, DFT basis
     iteration: int
     last_sigma_result: SigmaResult | None = None
+    last_sigma_basis_U: jax.Array | None = None   # (nk, nb, nb) ⟨DFT_m|QP_n⟩
 
 
 # ---------------------------------------------------------------------------
@@ -263,8 +272,37 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     from .screening import compute_screening, screening_requests_for
 
     n_occ = int(inputs.meta.nelec)
-    E_qp_ry, U_qp, efermi_ry = _diagonalize_and_get_efermi(
-        state.H_qp_dft, n_occ, inputs.mesh_xy)
+    E_qp_ry = U_qp = None
+    if state.iteration == 0:
+        # The canonical initial carry (``make_initial_state_from_dft``)
+        # is EXACTLY diag(E_DFT); its eigensystem is (E_DFT, I) by
+        # construction.  Do NOT run eigh on it: LAPACK roundtrips the
+        # eigenvalues at ~1 ulp, and the GN-PPM two-point fit amplifies
+        # ulp-scale enk noise to O(0.1–1 eV) in Σ_c(ω) via near-threshold
+        # pole modes (measured on the MoS2 3×3 fixture: +1 ulp on every
+        # WFN energy → max|ΔΣ_c| = 1.28 eV; same ill-conditioning family
+        # as the Fix-3 on-pole census sensitivity in
+        # reports/device_invariance_2026-07-08/ROOT_CAUSE.md).  The exact
+        # eigensystem keeps SC-iteration-1 ≡ one-shot G0W0 bit-exactly
+        # (gated by tests/test_sc_oneshot_equivalence.py).
+        H_np = np.asarray(state.H_qp_dft)
+        nb = H_np.shape[1]
+        diag = np.diagonal(H_np, axis1=1, axis2=2)
+        if not np.any(H_np - diag[:, :, None] * np.eye(nb)[None]):
+            E_np = np.ascontiguousarray(diag.real)
+            vbm = E_np[:, :n_occ].max()
+            cbm = E_np[:, n_occ:].min() if n_occ < nb else vbm
+            efermi_ry = 0.5 * (vbm + cbm)
+            rep2 = NamedSharding(inputs.mesh_xy, P(None, None))
+            rep3 = NamedSharding(inputs.mesh_xy, P(None, None, None))
+            E_qp_ry = jax.device_put(E_np, rep2)
+            U_qp = jax.device_put(
+                np.broadcast_to(
+                    np.eye(nb, dtype=np.complex128), H_np.shape).copy(),
+                rep3)
+    if E_qp_ry is None:
+        E_qp_ry, U_qp, efermi_ry = _diagonalize_and_get_efermi(
+            state.H_qp_dft, n_occ, inputs.mesh_xy)
 
     # Rotate the active subspace of the DFT bundle to this iteration's QP
     # basis.  Bands outside ``slices.sigma`` keep their DFT ψ + DFT energy
@@ -283,6 +321,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     W_by_role = compute_screening(
         wfns_qp, inputs.V_q, requests,
         quad=inputs.quad, e_ref=inputs.e_ref,
+        sym=inputs.sym, centroid_indices=inputs.centroid_indices,
         config=inputs.config, meta=inputs.meta, mesh_xy=inputs.mesh_xy,
         print_fn=inputs.print_fn,
     )
@@ -329,6 +368,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         H_qp_dft=H_qp_dft_new,
         iteration=state.iteration + 1,
         last_sigma_result=sigma_result,
+        last_sigma_basis_U=U_qp,
     )
 
 
@@ -482,6 +522,7 @@ def _run_linear_mixing(
                 H_qp_dft=H_mixed,
                 iteration=state_new.iteration,
                 last_sigma_result=state_new.last_sigma_result,
+                last_sigma_basis_U=state_new.last_sigma_basis_U,
             )
         E_new_ev = np.asarray(eigvalsh_kshard(state_new.H_qp_dft)) * RYD_TO_EV
         rms = float(np.sqrt(np.mean((E_new_ev - E_prev_ev) ** 2)))
@@ -535,6 +576,7 @@ def _run_rcrop(
     _e_history: list[np.ndarray] = [
         np.asarray(eigvalsh_kshard(H0)) * RYD_TO_EV]
     _last_sigma: list = [None]
+    _last_basis_U: list = [None]
     _iter_idx = [0]
     rms_history: list[float] = []
 
@@ -549,6 +591,7 @@ def _run_rcrop(
             last_sigma_result=_last_sigma[0])
         state_out = gw_iteration_map(state_in, inputs)
         _last_sigma[0] = state_out.last_sigma_result
+        _last_basis_U[0] = state_out.last_sigma_basis_U
         # Track per-call eigenvalue RMS so the user sees progress in the
         # same shape the linear path prints.
         E_new = np.asarray(eigvalsh_kshard(state_out.H_qp_dft)) * RYD_TO_EV
@@ -593,6 +636,7 @@ def _run_rcrop(
         H_qp_dft=H_final,
         iteration=_iter_idx[0],
         last_sigma_result=_last_sigma[0],
+        last_sigma_basis_U=_last_basis_U[0],
     )
     _maybe_dump_e_history(dump_dir, _e_history, print_fn)
     return state_final, rms_history

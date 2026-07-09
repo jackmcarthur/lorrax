@@ -25,6 +25,8 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.units import RYD_TO_EV
+
 
 # ---------------------------------------------------------------------------
 # Vectorised per-(k, n) ω-axis linear interpolation — shared helper
@@ -331,6 +333,135 @@ def build_qsgw_sigma_xc(
         "omega_max_ev": omega_hi,
     }
     return sigma_xc_qsgw, diagnostics
+
+
+# ---------------------------------------------------------------------------
+# update_H — the qp_solver dispatch (one-shot / fixed-point)
+# ---------------------------------------------------------------------------
+
+def solve_qp(
+    qp_solver,
+    sigma_result,
+    kin_ion: jax.Array,
+    *,
+    config,
+    meta,
+    mesh_xy: Mesh,
+    print_fn=print,
+) -> jax.Array:
+    """``update_H[Σ; qp_solver]`` — turn a :class:`~gw.sigma_dispatch.SigmaResult`
+    into the replicated ``sigma_total = Σ_xc + V_H`` (Ry) whose eigh
+    yields the QP eigenstates.
+
+    The three QP-energy definitions (see ``LorraxConfig.qp_solver``):
+
+    - ``one_shot_dft`` — textbook G0W0: the QSGW-symmetrised Σ_xc was
+      already evaluated at E_DFT inside ``compute_sigma_xc`` (the same
+      call the SC iteration map makes), so this is a pass-through.
+      Static modes (X_ONLY / COHSEX) and the streamed-Σ_c stand-in land
+      here too: ``sigma_xc_kij_ry`` is the mode's total Σ_xc by
+      construction.
+    - ``fixed_point`` — diagonal on-shell solve E = h₀ + ReΣ(E) followed
+      by a QSGW rebuild at the solved energies (+ optional per-band
+      scissor for out-of-grid bands).  Dynamic, non-streamed only
+      (validated at config load).  The dispatch's internal at-DFT build
+      is superseded here — one redundant (cheap) QSGW contraction, the
+      price of keeping ``compute_sigma_xc``'s signature uniform.
+    - ``self_consistent`` is NOT handled here — the SC driver owns its
+      own loop and rotation-back seam (``sc_iteration``).
+
+    All quantities are in **Rydberg** until the scissor's print summary
+    and the eV seam of the QSGW build kernel.  Σ_c(ω) lives natively in
+    Ry on the Ry ω-grid; mixing that with eV-converted h0/Σ_x is a
+    footgun.
+    """
+    from .gw_config import QPSolver
+
+    sig_h = sigma_result.v_h_kij_ry
+    sigma_c_omega = sigma_result.sigma_c_omega_kij_ry
+
+    if qp_solver is not QPSolver.FIXED_POINT or sigma_c_omega is None:
+        if config.compute_mode.is_dynamic and sigma_c_omega is not None:
+            print_fn("  QP solver: one_shot_dft — QSGW build evaluated at "
+                     "E_DFT (standard G0W0)")
+        return sigma_result.sigma_xc_kij_ry + sig_h
+
+    # QPSolver.FIXED_POINT: diagonal Σ(E) fixed point in Ry.
+    # Diagonal Σ_c(ω, k, n) and Σ_x(k, n) replicated on host, in Ry.
+    sig_x = sigma_result.sigma_x_kij_ry
+    omega_grid_ry = np.asarray(sigma_result.omega_grid_ry, dtype=np.float64)
+    E_dft_rel_ry = np.asarray(
+        sigma_result.omega_dft_rel_ev, dtype=np.float64) / RYD_TO_EV
+
+    sigma_c_diag_w_kn_ry = np.asarray(extract_sigma_diag_replicated(
+        sigma_c_omega, mesh_xy))
+    sigma_x_diag_kn_ry = np.real(
+        np.diagonal(np.asarray(sig_x), axis1=1, axis2=2))
+    sigma_xc_diag_w_kn_ry = sigma_c_diag_w_kn_ry + sigma_x_diag_kn_ry[None, :, :]
+
+    h0_diag_ry = np.real(
+        np.diagonal(np.asarray(kin_ion + sig_h), axis1=1, axis2=2))
+    efermi_ry = float(sigma_result.efermi_dft_ev) / RYD_TO_EV
+    E_sc_rel_ry, _, n_iter = solve_diagonal_sigma_fixed_point(
+        h0_diag_ry - efermi_ry, sigma_xc_diag_w_kn_ry, omega_grid_ry,
+        max_iter=120, tol_ev=1.0e-7 / RYD_TO_EV, mixing=0.6,
+    )
+
+    # Per-band scissor for out-of-grid bands.  A band is "in-grid" iff
+    # E_DFT[k, n] lies in [ω_min, ω_max] for every k; if any single k
+    # is outside, the band gets the scissor uniformly across k (the
+    # diagonal solver clipped Σ_c at the ω-boundary for the offending
+    # k, which would otherwise contaminate the band's k-dispersion).
+    # The scissor itself is fitted on in-grid bands only.  Default
+    # fallback when the scissor flag is off: E_DFT (the natural
+    # zeroth-order QP correction = 0 estimate); the older fallback
+    # of using ``eigvalsh(H_qp)`` was unreliable for pseudobands.
+    from .scissor import classify_bands_in_grid, fit_scissor
+    band_in_grid, in_grid_kn_band = classify_bands_in_grid(
+        E_dft_rel_ry, float(omega_grid_ry[0]), float(omega_grid_ry[-1]))
+    n_bands_in = int(band_in_grid.sum())
+    n_bands_total = int(band_in_grid.size)
+    print_fn(
+        f"  Diagonal SC: {n_bands_in}/{n_bands_total} bands fully in grid, "
+        f"{n_iter} iterations")
+    if (
+        config.ppm.sigma_at_dft_extrapolate
+        and 0 < n_bands_in < n_bands_total
+    ):
+        occ_mask_kn = np.broadcast_to(
+            np.arange(E_sc_rel_ry.shape[1])[None, :] < meta.nelec,
+            E_sc_rel_ry.shape).astype(bool)
+        # Fit in eV so the printed slopes/intercepts are human-readable.
+        # Sort-and-pair semantics (per-k argsort on each of E_DFT and
+        # E_QP independently) live inside ``fit_scissor`` and are
+        # robust to QSGW reorderings; one-shot G0W0 has no
+        # reordering and the sort is a no-op.
+        fit = fit_scissor(
+            E_dft_rel_ry * RYD_TO_EV,
+            E_sc_rel_ry * RYD_TO_EV,
+            valence_mask_kn=occ_mask_kn,
+            fit_mask_kn=in_grid_kn_band,
+        )
+        print_fn(f"  Scissor fit: {fit.summary()}")
+        extrap_rel_ry = E_dft_rel_ry + fit.predict(
+            E_dft_rel_ry * RYD_TO_EV, occ_mask_kn) / RYD_TO_EV
+        E_sc_rel_ry = np.where(in_grid_kn_band, E_sc_rel_ry, extrap_rel_ry)
+    else:
+        E_sc_rel_ry = np.where(in_grid_kn_band, E_sc_rel_ry, E_dft_rel_ry)
+    E_sc_rel_ev = E_sc_rel_ry * RYD_TO_EV
+
+    # QSGW Σ_xc^QSGW: sharded ω-tensor + replicated E_sc → replicated Σ_xc.
+    # Build kernel takes ω-grid and evaluation energies in **eV**; we
+    # convert at the seam (kernel internals convert; result is Ry).
+    sig_x_rep = jax.device_put(jnp.asarray(sig_x),
+        NamedSharding(mesh_xy, P(None, None, None)))
+    sigma_xc_qsgw_kij_ry, qsgw_diag = build_qsgw_sigma_xc(
+        sigma_c_omega, sig_x_rep,
+        omega_grid_ry * RYD_TO_EV, E_sc_rel_ev, mesh_xy,
+    )
+    print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
+        f"({100*qsgw_diag['frac_clipped']:.1f}%)")
+    return sigma_xc_qsgw_kij_ry + sig_h
 
 
 # ---------------------------------------------------------------------------

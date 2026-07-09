@@ -79,6 +79,7 @@ class SigmaResult:
     omega_grid_ry: np.ndarray | None = None
     head_sigma_diag_w_kn_ry: np.ndarray | None = None
     sigma_omega_h5_path: str | None = None
+    efermi_dft_ev: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +104,9 @@ def compute_sigma_xc(
     wfn,
     band_slices,
     input_dir: str,
+    Gij: jax.Array | None = None,
+    wfns_transverse=None,
+    bispinor_v_q_path: str | None = None,
     write_sigma_omega_h5: bool = True,
     print_fn: Callable = print,
 ) -> SigmaResult:
@@ -144,6 +148,13 @@ def compute_sigma_xc(
         ``w_isdf.build_static_quadrature`` once per W solve.
     config, meta, mesh_xy, sym, wfn, band_slices, input_dir
         Standard driver scaffolding.
+    Gij
+        Optional band-space occupation projector; ``None`` builds the
+        default DFT-occ projector inside the static kernels.
+    wfns_transverse, bispinor_v_q_path
+        Bispinor Σ^B channel (transverse-centroid ψ bundle + V^{i,j}
+        tile file).  Both-or-neither; Σ^B is folded into ``sig_x`` by
+        the static kernels.  ``None`` for scalar runs.
     print_fn
         Rank-0-only print.
 
@@ -161,19 +172,26 @@ def compute_sigma_xc(
     # V-only path so PPM / X_ONLY modes never invoke the W-touching
     # kernels and the two paths each get their own jit-cached graph.
     W_static = W_by_role.get("static", V_q)
+    backend = config.backend.slab_io
     if mode is ComputeMode.COHSEX:
         cohsex = compute_cohsex_sigma(
             wfns, V_q, W_static, meta, mesh_xy,
-            Gij=None,                            # default DFT-occ projector
+            Gij=Gij,
             do_screened=True,
             static_head_terms=static_head_terms,
             compute_bare_x=True,
+            wfns_transverse=wfns_transverse,
+            bispinor_v_q_path=bispinor_v_q_path,
+            backend=backend,
         )
     else:
         cohsex = compute_v_h_sigma_x(
             wfns, V_q, meta, mesh_xy,
-            Gij=None,
+            Gij=Gij,
             static_head_terms=static_head_terms,
+            wfns_transverse=wfns_transverse,
+            bispinor_v_q_path=bispinor_v_q_path,
+            backend=backend,
         )
     sig_h = cohsex["sig_h"]
     sig_x = cohsex["sig_x"]
@@ -181,11 +199,15 @@ def compute_sigma_xc(
     sig_coh = cohsex["sig_coh"]
 
     if mode is ComputeMode.X_ONLY:
-        sigma_xc = sig_x
+        # sigma_sx ← sig_x so the static sigma_diag.dat writer's sigSX
+        # column reports Σ_X (incl. the bispinor Σ^B fold-in) instead of
+        # zeros; sigTOT = sigSX + sigCOH stays consistent.
         return SigmaResult(
             v_h_kij_ry=sig_h,
             sigma_x_kij_ry=sig_x,
-            sigma_xc_kij_ry=sigma_xc,
+            sigma_xc_kij_ry=sig_x,
+            sigma_sx_kij_ry=sig_x,
+            sigma_coh_kij_ry=jnp.zeros_like(sig_x),
         )
     if mode is ComputeMode.COHSEX:
         sigma_xc = sig_sx + sig_coh
@@ -221,8 +243,42 @@ def compute_sigma_xc(
         print_fn=print_fn,
     )
 
+    if ppm_outputs.sigma_c_omega is None:
+        # Streamed Σ_c (kij_stream): no in-memory ω-tensor → no QSGW
+        # build.  The eigh family degrades to the static-COHSEX stand-in
+        # (same behavior the pre-unification driver had); eqp0/eqp1 stay
+        # correct — they are written downstream from the at-DFT
+        # diagnostics, which the streamed h5 path fills in.  Config
+        # validation already rejects kij_stream × fixed_point /
+        # self_consistent, so this branch is one-shot-only.
+        statics = compute_cohsex_sigma(
+            wfns, V_q, W_static, meta, mesh_xy,
+            Gij=Gij,
+            do_screened=True,
+            static_head_terms=static_head_terms,
+            compute_bare_x=False,
+        )
+        return SigmaResult(
+            v_h_kij_ry=sig_h,
+            sigma_x_kij_ry=sig_x,
+            sigma_xc_kij_ry=statics["sig_sx"] + statics["sig_coh"],
+            sigma_sx_kij_ry=statics["sig_sx"],
+            sigma_coh_kij_ry=statics["sig_coh"],
+            sigma_c_at_dft_diag_ev=ppm_outputs.sigma_c_at_dft_ev,
+            omega_dft_rel_ev=ppm_outputs.omega_dft_rel_ev,
+            omega_grid_ev=config.omega_grid_ev,
+            omega_grid_ry=config.omega_grid_ry,
+            head_sigma_diag_w_kn_ry=ppm_outputs.head_sigma_diag_w_kn_ry,
+            sigma_omega_h5_path=ppm_outputs.sigma_omega_h5_path,
+            efermi_dft_ev=ppm_outputs.efermi_dft_ev,
+        )
+
     # QSGW Σ_xc^QSGW evaluated at e_qp_ev.  Static Σ_x is added inside
-    # the kernel, so the result already includes Σ_x.
+    # the kernel, so the result already includes Σ_x.  The E_F reference
+    # is the LORRAX-canonical midgap (``wfn.efermi`` — the same value
+    # the PPM pipeline used for ``omega_dft_rel_ev``), so calling this
+    # with ``e_qp_ev = E_DFT`` evaluates at exactly the pipeline's
+    # at-DFT frequencies (textbook G0W0 / SC-iteration-1 equivalence).
     omega_grid_ev = np.asarray(
         config.omega_grid_ev, dtype=np.float64)
     efermi_ry = float(wfn.efermi)
@@ -247,6 +303,7 @@ def compute_sigma_xc(
         omega_grid_ry=config.omega_grid_ry,
         head_sigma_diag_w_kn_ry=ppm_outputs.head_sigma_diag_w_kn_ry,
         sigma_omega_h5_path=ppm_outputs.sigma_omega_h5_path,
+        efermi_dft_ev=ppm_outputs.efermi_dft_ev,
     )
 
 

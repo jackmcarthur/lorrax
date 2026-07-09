@@ -866,12 +866,22 @@ class LorraxConfig:
                 )
             return ComputeMode.COHSEX if self.do_screened else ComputeMode.X_ONLY
         try:
-            return ComputeMode(raw)
+            explicit = ComputeMode(raw)
         except ValueError as exc:
             raise ValueError(
                 f"compute_mode={raw!r} invalid; expected one of: "
                 f"{', '.join(m.value for m in ComputeMode)}, or 'auto'."
             ) from exc
+        # The enum is load-bearing: an explicit screened mode contradicts
+        # the legacy ``do_screened = false``.  (Explicit ``x_only`` simply
+        # wins over the do_screened default — the driver derives its
+        # screening entirely from the mode.)
+        if explicit is not ComputeMode.X_ONLY and not self.do_screened:
+            raise ValueError(
+                f"compute_mode={raw!r} requires screening, but the legacy "
+                f"flag do_screened=false was also set. Remove one of the two."
+            )
+        return explicit
 
     @property
     def qp_solver(self) -> QPSolver:
