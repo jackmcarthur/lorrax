@@ -59,7 +59,7 @@ class ScreeningRequest:
         pure imaginary on the Matsubara/Wick-rotated axis.  Both branches
         are supported by :func:`compute_screening` via the existing
         ``build_real_quadrature`` / ``build_imag_quadrature`` helpers in
-        :mod:`gw.w_isdf`.
+        :mod:`gw.minimax_screening`.
     role : str
         Symbolic label the Σ builder uses to look up this W in the
         screening output dict.  See module docstring for conventions.
@@ -136,7 +136,7 @@ def compute_static_w(
     V_q : (nq, μ, μ) jax.Array
         Bare Coulomb in flat-q ISDF basis, ``P(None, 'x', 'y')``.
     quad, e_ref
-        Static minimax quadrature from ``w_isdf.build_static_quadrature``.
+        Static minimax quadrature from ``minimax_screening.build_static_quadrature``.
     sym, centroid_indices
         Symmetry tables + ISDF centroid set for the IBZ resolve.
     config, meta, mesh_xy
@@ -259,8 +259,8 @@ def compute_screening(
     quadrature ``quad`` and runs through :func:`compute_static_w` — the
     IBZ fast path (slice → per-q Dyson solve on the wedge → unfold).
     Non-static roles build a single-frequency quadrature on the fly
-    using the existing :func:`gw.w_isdf.build_imag_quadrature` /
-    :func:`gw.w_isdf.build_real_quadrature` helpers (chosen by whether
+    using the existing :func:`gw.minimax_screening.build_imag_quadrature` /
+    :func:`gw.minimax_screening.build_real_quadrature` helpers (chosen by whether
     ``omega_ry`` is on the imag or real axis) and solve on the full BZ
     directly: the nonlinear PPM fit downstream has a documented ~0.1 meV
     q-set path-dependence (see ``test_ibz_full_bz_equivalence``), so the
@@ -274,12 +274,11 @@ def compute_screening(
     Caller is responsible for matching roles to its Σ build's
     expectations; an unrequested role lookup is a KeyError.
     """
-    from .w_isdf import (
+    from .minimax_screening import (
         build_imag_quadrature,
         build_real_quadrature,
-        compute_chi0,
-        solve_w,
     )
+    from .w_isdf import compute_chi0, solve_w
 
     W_by_role: dict[str, jax.Array] = {}
     for req in requests:

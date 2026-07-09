@@ -297,7 +297,6 @@ _DEFAULTS = {
     "gamma_contract_mode": "take",
     # Memory / chunking
     "memory_per_device_gb": 0.0,  # 0 = auto-detect
-    "chunk_size": -1,
     "band_chunk_size": 16,
     "r_chunk_size": 0,
     # ISDF
@@ -466,6 +465,17 @@ def read_lorrax_input(filename: str) -> dict:
             raise ValueError(
                 "Input key 'use_shipped_minimax_tables' is no longer supported. "
                 "Use 'regenerate_minimax_tables = true/false' instead.")
+        # ``chunk_size`` (legacy band-chunk knob) was a no-op: its only
+        # consumer wrote ``meta.chunk_size``, which nothing ever read —
+        # chunk sizing is owned by the gflat planner.  Dropped 2026-07-09.
+        if section.get("chunk_size", fallback=None) is not None:
+            import warnings
+            warnings.warn(
+                "Input key 'chunk_size' is no longer supported and will be "
+                "ignored (it was a no-op; chunk sizing is planner-owned — "
+                "see 'gflat_chunk_size' / 'band_chunk_size').",
+                DeprecationWarning, stacklevel=2,
+            )
         for legacy_key in ("output_file", "eqp_output_file"):
             if section.get(legacy_key, fallback=None) is not None:
                 import warnings
@@ -722,7 +732,6 @@ class MemoryConfig:
     """
     per_device_gb: float
     chunk_target_utilization: float
-    chunk_size: int               # legacy band-chunk knob; -1 = no chunking
     band_chunk_size: int
     r_chunk_override: int         # 0 = auto
     zct_stage_cap_gb: float | None
@@ -1172,7 +1181,6 @@ class LorraxConfig:
         memory = MemoryConfig(
             per_device_gb=memory_per_device_gb,
             chunk_target_utilization=chunk_utilization,
-            chunk_size=int(_g("chunk_size")),
             band_chunk_size=int(_g("band_chunk_size")),
             r_chunk_override=int(_g("r_chunk_size")),
             zct_stage_cap_gb=zct_stage_cap_gb,

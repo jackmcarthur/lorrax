@@ -27,3 +27,13 @@ def resolve_input_paths(params: dict, input_dir: str) -> dict:
 	
 	return params
 
+
+
+def resolve_input_path(input_dir: str, path: str) -> str:
+    """Join ``path`` onto ``input_dir`` unless empty or already absolute.
+
+    (moved from gw/gw_driver_helpers.py 2026-07-09)
+    """
+    if path and (not os.path.isabs(path)):
+        return os.path.join(input_dir, path)
+    return path

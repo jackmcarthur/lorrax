@@ -27,10 +27,8 @@ from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 
 from .gw_config import ComputeMode, LorraxConfig
-from .gw_driver_helpers import (
-    _resolve_input_path,
-    profile_section,
-)
+from common.jax_profile import profile_section
+from file_io.paths import resolve_input_path
 from .head_correction import HeadResolver
 from .ppm_sigma import (
     compute_sigma_c_ppm_omega_grid,
@@ -366,7 +364,7 @@ def compute_ppm_sigma_pipeline(
 
     # Resolve the streamed-Σ_c h5 path at the driver seam (input_dir lives
     # here); "" normalizes to None so the kernel contract is str | None.
-    sigma_kij_h5_path = _resolve_input_path(
+    sigma_kij_h5_path = resolve_input_path(
         input_dir, str(config.paths.sigma_kij_h5_file or "").strip()) or None
     label = "HL-PPM" if config.compute_mode is ComputeMode.HL_PPM else "GN-PPM"
     from .gw_output import print_section

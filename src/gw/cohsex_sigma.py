@@ -334,11 +334,3 @@ def compute_v_h_sigma_x(
     }
 
 
-def get_cohsex_kernels(meta, mesh_xy: Mesh):
-    """Return the three jit'd (sigma_sx, sigma_coh, hartree) kernels.
-
-    Exposed for the SC-COHSEX fixed-point loop, which needs to call the
-    kernels repeatedly with a mutated Gij inside its own jit/mixing
-    harness.  New callers should use :func:`compute_cohsex_sigma`.
-    """
-    return _make_cohsex_kernels(mesh_xy, meta.kgrid, int(meta.nk_tot))

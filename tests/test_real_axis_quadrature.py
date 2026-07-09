@@ -36,7 +36,7 @@ from gw.minimax_screening import (
     solve_laplace_minimax_interval,
 )
 from gw.minimax_config import MinimaxConfig
-from gw.w_isdf import build_real_quadrature
+from gw.minimax_screening import build_real_quadrature
 
 
 # Realistic Si 4×4×4 ranges: x ∈ [E_gap, E_max] ≈ [0.5, 5] Ry.

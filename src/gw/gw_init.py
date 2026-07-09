@@ -20,32 +20,8 @@ from common import jax_profile
 
 
 
-def get_effective_chunk_size(chunk_size: int) -> int | None:
-    """Convert chunk_size flag: -1=None (all bands), 0=auto (64), 1-2048=explicit."""
-    if chunk_size == -1:
-        return None
-    if chunk_size == 0:
-        return 64
-    if 1 <= chunk_size <= 2048:
-        return chunk_size
-    raise ValueError(f"chunk_size must be -1, 0, or 1-2048, got {chunk_size}")
-
-
 # Backward-compatible re-exports
 from .gw_config import read_lorrax_input, read_cohsex_input  # noqa: F401
-
-
-def get_bandranges(nv, nc, nband, nelec):
-	r"""Return ranges of bands necessary for \sigma_{X,SX,COH}.
-
-	Legacy helper used by psp/get_DFT_mtxels.py.  GW code uses BandSlices instead.
-	"""
-	nvrange = [int(nelec - nv), int(nelec)]
-	ncrange = [int(nelec), int(nelec + nc)]
-	nsigmarange = [int(nelec - nv), int(nelec + nc)]
-	n_fullrange = [0, int(nband)]
-	n_valrange = [0, int(nelec)]
-	return nvrange, ncrange, nsigmarange, n_fullrange, n_valrange
 
 
 def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,

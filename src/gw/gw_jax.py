@@ -24,18 +24,9 @@ from file_io import (
 from common import symmetry_maps
 from common.wfn_transforms import get_enk_bandrange
 from .gw_config import ComputeMode, LorraxConfig, QPSolver
-from .gw_init import (
-	get_effective_chunk_size,
-	prepare_isdf_and_wavefunctions,
-)
-from .gw_driver_helpers import (
-	build_bgw_v_grid_fn,
-	setup_runtime,
-)
-from .w_isdf import (
-	build_static_quadrature,
-	flatten_V_qmunu,
-)
+from .gw_init import prepare_isdf_and_wavefunctions
+from .compute_vcoul import build_bgw_v_grid_fn
+from .minimax_screening import build_static_quadrature
 from .screening import compute_screening, screening_requests_for
 from .sigma_dispatch import compute_sigma_xc
 from .qsgw_utils import (
@@ -66,6 +57,52 @@ def _build_mesh():
 	while gx > 1 and total % gx != 0:
 		gx -= 1
 	return Mesh(np.array(jax.devices()).reshape(gx, total // gx), ['x', 'y'])
+
+
+def _setup_runtime(config, mesh_xy, *, print_fn=print) -> None:
+	"""Pre-init NCCL + phdf5 MPI + JAX persistent compile cache.
+
+	All three are best-effort startup optimizations whose absence is not
+	fatal:
+
+	- **NCCL warmup**: pre-allocates communicators for full-mesh and
+	  per-axis psums so the first real collective (sigma's all-reduce-
+	  start) doesn't eat a timed section.  No-op in single-process.
+	- **phdf5 ``MPI_Init_thread``**: when the slab-IO backend is the
+	  phdf5 FFI, eagerly enter ``MPI_THREAD_MULTIPLE`` so the first
+	  collective ``H5Fcreate`` (in ``zeta_fit_chunked``) doesn't pay
+	  the ~400 ms MPI_Init cost on the critical path; failures are
+	  logged and swallowed.
+	- **JAX persistent compile cache**: enable XDG-style on-disk cache
+	  so warm-cache cold starts skip ~3 s of XLA compile.  Opt out via
+	  ``ISDF_JAX_CACHE_DIR=""``.
+	"""
+	from runtime import nccl_warmup
+	from .gw_config import SlabIOBackend
+
+	with timing.section("nccl_warmup"):
+		nccl_warmup(mesh_xy)
+
+	if config.backend.slab_io is SlabIOBackend.PHDF5_FFI:
+		try:
+			from ffi.common.ffi_loader import phdf5_init_mpi
+			phdf5_init_mpi()
+		except Exception as exc:
+			print_fn(f"  [phdf5 init_mpi] skipped: {exc}")
+	elif config.backend.slab_io is SlabIOBackend.PHDF5_HOST:
+		# mpi4py initialises MPI on first import; do it here so the
+		# ~400 ms MPI_Init cost is amortised before the first SlabIO
+		# open (same rationale as the FFI's phdf5_init_mpi).
+		try:
+			from mpi4py import MPI  # noqa: F401
+		except Exception as exc:
+			print_fn(f"  [phdf5_host mpi4py init] skipped: {exc}")
+
+	try:
+		from common.jax_compile_cache import ensure_jax_compile_cache
+		ensure_jax_compile_cache()
+	except Exception as exc:
+		print_fn(f"  [jax compile cache] skipped: {exc}")
 
 
 def _compute_static_head(head_resolver, meta, do_screened, print0):
@@ -119,7 +156,7 @@ def main(argv=None):
 	mesh_xy = _build_mesh()
 	grid_x, grid_y = mesh_xy.devices.shape
 
-	setup_runtime(config, mesh_xy, print_fn=print0)
+	_setup_runtime(config, mesh_xy, print_fn=print0)
 
 	from .gw_output import (
 		GWResults, persist_w0_and_head, print_banner,
@@ -148,8 +185,6 @@ def main(argv=None):
 	meta.n_proc = jax.process_count()
 	meta.sys_dim = config.sys_dim
 	meta.bispinor = config.bispinor
-	meta.chunk_size = get_effective_chunk_size(config.memory.chunk_size)
-
 	band_slices = BandSlices.from_band_edges(*meta.band_edges)
 
 	# DFT eigenvalues on the Σ band window (Ry) — one fetch, reused by the
@@ -200,9 +235,7 @@ def main(argv=None):
 	# ``compute_mode`` is the single axis describing the self-energy ansatz
 	# (X_ONLY / COHSEX / GN_PPM / HL_PPM); ``qp_solver`` (how QP energies
 	# are extracted from Σ) is orthogonal.  X_ONLY needs no screening.
-	# V_qmunu is already flat-q ``(nq, μ, μ)``; ``flatten_V_qmunu`` is a
-	# back-compat no-op for restart paths that may feed the legacy layout.
-	V_q = flatten_V_qmunu(V_qmunu)
+	V_q = V_qmunu               # flat-q (nq, μ, μ) — compute and restart alike
 	mode = config.compute_mode
 	do_screened = mode is not ComputeMode.X_ONLY
 	quad, e_ref = None, None

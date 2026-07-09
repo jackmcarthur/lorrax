@@ -17,14 +17,9 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 
 from common import Meta, jax_profile
+from common.jax_compile_cache import ensure_jax_compile_cache
 from runtime.padding import round_up, solve_at_logical
-from .minimax_config import MinimaxConfig
-from .minimax_screening import (
-    _TINY,
-    LaplaceMinimaxQuadrature,
-    MinimaxNodes,
-    solve_laplace_minimax_interval,
-)
+from .minimax_screening import MinimaxNodes
 
 
 # ============================================================================
@@ -33,13 +28,6 @@ from .minimax_screening import (
 
 _chi_minimax_kernel_cache: dict = {}
 _w_solve_cache: dict = {}
-
-
-# Thin wrapper around the shared activator so in-place callers in this
-# module keep working.  See common.jax_compile_cache.
-def _ensure_compilation_cache():
-    from common.jax_compile_cache import ensure_jax_compile_cache
-    ensure_jax_compile_cache()
 
 
 # ============================================================================
@@ -421,219 +409,6 @@ def solve_w(V_q, chi0_q, meta, mesh_xy, *, solver=None, memory_mode=None):
         return solve_fn(V_q, chi0_q, pref)
 
 
-def resolve_minimax_energy_reference(
-    enk_v: jax.Array,
-    enk_c: jax.Array,
-    *,
-    reference: str | float | int | None = "midgap",
-    reference_fn: Callable[[jax.Array, jax.Array], float] | None = None,
-) -> float:
-    """Resolve the minimax energy reference used to shift band energies.
-
-    This shift is algebraically neutral for χ0/W (only E_c-E_v enters), but
-    exposing it at the top-level minimax pipeline keeps reference conventions
-    explicit and synchronized with sigma paths.
-    """
-    if reference_fn is not None:
-        return float(reference_fn(enk_v, enk_c))
-
-    if reference is None:
-        return 0.0
-    if isinstance(reference, (int, float)):
-        return float(reference)
-
-    ref = str(reference).strip().lower()
-    if ref in ("none", "raw", "zero"):
-        return 0.0
-
-    enk_v_host = np.asarray(jax.device_get(enk_v), dtype=np.float64)
-    enk_c_host = np.asarray(jax.device_get(enk_c), dtype=np.float64)
-    vbm_ref = float(np.max(enk_v_host))
-    cbm_ref = float(np.min(enk_c_host))
-
-    if ref == "midgap":
-        return 0.5 * (vbm_ref + cbm_ref)
-    if ref == "vbm":
-        return vbm_ref
-    if ref == "cbm":
-        return cbm_ref
-    raise ValueError(f"Unknown minimax energy reference '{reference}'. Expected midgap/vbm/cbm/none or float.")
-
-
-# ---------------------------------------------------------------------------
-#  Top-level screening helpers (used directly by gw_jax.main)
-# ---------------------------------------------------------------------------
-
-def flatten_V_qmunu(V_qmunu):
-    """Strip the legacy ``(1, npol, npol, …)`` leading axes if present;
-    pass through if already flat-q ``(nq, μ, μ)``.
-
-    ``V_qmunu`` is now produced flat-q by ``compute_all_V_q``
-    (``(nq, μ, μ)``).  This helper is kept as a back-compat shim for
-    restart files written under the old 8-D ``(1, npol, npol, nkx, nky,
-    nkz, μ, μ)`` layout — strips the polarisation axes AND flattens the
-    k-grid.  In the new flat-q world it's a no-op.
-    """
-    arr = jnp.asarray(V_qmunu)
-    if arr.ndim == 8:
-        # Legacy (1, npol, npol, nkx, nky, nkz, μ, μ) → flat-q (nq, μ, μ).
-        return arr[0, 0, 0].reshape(-1, arr.shape[-2], arr.shape[-1])
-    if arr.ndim == 6:
-        # Transitional (1, npol, npol, nq, μ, μ) → flat-q (nq, μ, μ).
-        return arr[0, 0, 0]
-    # Already flat-q (3-D).
-    return arr
-
-
-def build_static_quadrature(wfns, minimax_config, *, print_fn=None):
-    """Build static minimax quadrature and energy reference from wavefunction bundle.
-
-    Returns (quad, e_ref) where quad is a LaplaceMinimaxQuadrature for 1/x
-    on the band-energy interval, and e_ref is the global energy zero.
-    """
-    s = wfns.slices
-    enk_v = wfns.enk[:, s.val]
-    enk_c = wfns.enk[:, s.cond]
-    e_ref = resolve_minimax_energy_reference(
-        enk_v, enk_c, reference=minimax_config.energy_reference)
-
-    # Interval derivation for 1/x on the band-energy span [x_min, x_max].
-    # (Inlined from the former minimax_screening.build_static_minimax_window_pair;
-    #  the window-pair object it returned was discarded here — only ``quad`` is used.)
-    enk_v_host = np.asarray(jax.device_get(enk_v), dtype=np.float64)
-    enk_c_host = np.asarray(jax.device_get(enk_c), dtype=np.float64)
-    if enk_v_host.size == 0 or enk_c_host.size == 0:
-        raise ValueError(
-            "Cannot build minimax window with empty valence/conduction energies.")
-    vmin = float(np.min(enk_v_host))
-    vmax = float(np.max(enk_v_host))
-    cmin = float(np.min(enk_c_host))
-    cmax = float(np.max(enk_c_host))
-    x_min = max(cmin - vmax, _TINY)
-    x_max = max(cmax - vmin, x_min * (1.0 + 1.0e-9))
-    quad = solve_laplace_minimax_interval(
-        x_min,
-        x_max,
-        target_error=float(minimax_config.target_error),
-        max_nodes=int(minimax_config.max_nodes),
-        use_shipped_tables=bool(minimax_config.use_shipped_tables),
-    )
-    if print_fn is not None:
-        R = quad.x_max / quad.x_min
-        print_fn(
-            "  Minimax static window: "
-            f"x=[{quad.x_min:.6e}, {quad.x_max:.6e}] Ry, "
-            f"R={R:.2f}, nodes={quad.node_count}, fit_err~{quad.max_error:.3e}"
-        )
-    return quad, e_ref
-
-
-def build_imag_quadrature(quad, omega_p, minimax_config, *, print_fn=None):
-    """Build imaginary-frequency minimax quadrature for x/(x²+ωp²).
-
-    Uses the same energy interval as the static quadrature.
-    """
-    from .minimax_screening import solve_laplace_minimax_imag_interval
-    quad_imag = solve_laplace_minimax_imag_interval(
-        quad.x_min, quad.x_max, float(omega_p),
-        target_error=float(minimax_config.target_error),
-        max_nodes=int(minimax_config.max_nodes),
-    )
-    if print_fn is not None:
-        R = quad_imag.x_max / quad_imag.x_min
-        print_fn(
-            f"  PPM imag-freq quadrature (ωp={float(omega_p):.4f} Ry): "
-            f"R={R:.1f}, nodes={quad_imag.node_count}, err~{quad_imag.max_error:.1e}")
-    return quad_imag
-
-
-def build_real_quadrature(quad, Omega, minimax_config, *, print_fn=None):
-    """Build real-frequency (HL-PPM) χ₀(Ω) quadrature without a new minimax kernel.
-
-    Decomposes the real-axis target into two ``1/y`` pieces and reuses
-    the existing static (noncrossing) Laplace minimax twice::
-
-        x / (x² - Ω²) = (1/2) · [ 1/(x - Ω)  +  1/(x + Ω) ]
-                      = -(1/2)/(Ω - x)  +  (1/2)/(Ω + x)
-
-    For ``Ω > x_max`` both ``Ω-x`` and ``Ω+x`` are strictly positive on
-    ``x ∈ [x_min, x_max]``, so each can be approximated by a standard
-    ``1/y`` minimax on the shifted interval (no new solver needed).
-
-    Combining via the substitutions ``y = Ω-x`` and ``y = Ω+x`` and
-    folding the constant ``e^{-τ·Ω}`` shift into the weights gives the
-    same ``Σ_l α_l e^{-τ_l x}`` representation that ``compute_chi0``
-    already consumes — with mixed-sign ``τ_l``: positive on the
-    ``(Ω+x)`` branch, negative on the ``(Ω-x)`` branch.
-
-    The numerical-stability prefold inside ``compute_chi0`` works
-    transparently because in the realistic HL regime (``Ω`` ≈ 200 Ry,
-    ``x_max`` ≈ 5 Ry → ``R'`` of either shifted interval ≈ 1.03)
-    each ``1/y`` minimax needs only 1-3 nodes and ``|τ_l|`` ≈ ``1/Ω``,
-    so any residual exponent ``|τ_l|·x_range`` ≈ 0.025 is harmless.
-
-    Requires ``Omega > quad.x_max``.
-    """
-    from .minimax_screening import solve_laplace_minimax_interval
-
-    Omega = float(Omega)
-    if Omega <= float(quad.x_max):
-        raise ValueError(
-            f"build_real_quadrature requires Omega > x_max "
-            f"(got Omega={Omega}, x_max={quad.x_max}). "
-            f"HL-PPM is only defined for probes above all transitions."
-        )
-    target_error = float(minimax_config.target_error)
-    max_nodes = int(minimax_config.max_nodes)
-
-    # (Ω + x) branch: y ∈ [Ω + x_min, Ω + x_max] (strictly positive).
-    quad_plus = solve_laplace_minimax_interval(
-        Omega + quad.x_min, Omega + quad.x_max,
-        target_error=target_error, max_nodes=max_nodes,
-    )
-    tau_plus = np.asarray(quad_plus.tau, dtype=np.float64)
-    alpha_plus = (
-        +0.5 * np.asarray(quad_plus.alpha, dtype=np.float64)
-        * np.exp(-tau_plus * Omega)
-    )
-
-    # (Ω - x) branch: y ∈ [Ω - x_max, Ω - x_min] (strictly positive for Ω > x_max).
-    quad_minus = solve_laplace_minimax_interval(
-        Omega - quad.x_max, Omega - quad.x_min,
-        target_error=target_error, max_nodes=max_nodes,
-    )
-    tau_minus_raw = np.asarray(quad_minus.tau, dtype=np.float64)
-    # 1/(Ω - x) ≈ Σ α e^{-τ(Ω-x)} = Σ [α e^{-τ·Ω}] e^{+τ·x}
-    # Cast into the kernel's e^{-τ'·x} form by τ' = -τ.  Decomposition sign is -1/2.
-    tau_minus = -tau_minus_raw
-    alpha_minus = (
-        -0.5 * np.asarray(quad_minus.alpha, dtype=np.float64)
-        * np.exp(-tau_minus_raw * Omega)
-    )
-
-    tau = np.concatenate([tau_plus, tau_minus])
-    alpha = np.concatenate([alpha_plus, alpha_minus])
-    err_combined = float(0.5 * (quad_plus.max_error + quad_minus.max_error))
-
-    fused = LaplaceMinimaxQuadrature(
-        x_min=float(quad.x_min),
-        x_max=float(quad.x_max),
-        tau=tau,
-        alpha=alpha,
-        max_error=err_combined,
-    )
-
-    if print_fn is not None:
-        print_fn(
-            f"  PPM real-freq quadrature (Ω={Omega:.4f} Ry, "
-            f"decomposed via 1/y minimax): "
-            f"+branch nodes={quad_plus.node_count} (R'={Omega/quad.x_min + quad.x_max/quad.x_min:.3f}), "
-            f"-branch nodes={quad_minus.node_count} "
-            f"(R'={(Omega-quad.x_min)/(Omega-quad.x_max):.3f}), "
-            f"err~{err_combined:.1e}")
-    return fused
-
-
 def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
     """Compute χ₀(q) from a wavefunction bundle and minimax quadrature.
 
@@ -650,7 +425,7 @@ def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
     Because only differences enter, this is algebraically invariant; the
     knob lets callers align the global zero (e.g. midgap, VBM, CBM).
     """
-    _ensure_compilation_cache()
+    ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
 
     s = wfns.slices
@@ -692,7 +467,7 @@ def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
     ``timing.section('chi0_W.chi.compile')`` block to separate compile
     from exec in the end-of-run timing report.
     """
-    _ensure_compilation_cache()
+    ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     eref = 0.0 if energy_reference is None else float(energy_reference)
     s = wfns.slices
@@ -734,7 +509,7 @@ def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, solver=None, memory_mode=N
     a runtime arg) so the precompile is a thin per-solver branch here.
     """
     from .gw_config import ScreeningSolver
-    _ensure_compilation_cache()
+    ensure_jax_compile_cache()
     chosen = solver if solver is not None else memory_mode
     solver_enum = _normalize_screening_solver(chosen)
     nq = int(meta.nk_tot)

@@ -18,10 +18,15 @@ G-chunked) lives in ``gw.v_q_g_flat`` / ``gw.v_q_bispinor``; nothing in
 this file does FFTs or μ × ν tiling any more.
 """
 
+from typing import Callable, Optional
+
+import h5py
 import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
+
+from file_io.paths import resolve_input_path
 
 
 def build_v_head_miniBZ_avg_3d(
@@ -250,3 +255,70 @@ def compute_all_V_q(
         "compute_all_V_q: only the G-flat zeta layout is supported. "
         "fit_zeta_to_h5 writes G_flat exclusively; the r-space tile path "
         "was removed 2026-07-02.")
+
+
+# ---------------------------------------------------------------------------
+# Optional BGW vcoul override (moved from gw/gw_driver_helpers.py 2026-07-09
+# — flag-gated diagnostic that belongs with the V_q machinery it feeds).
+# ---------------------------------------------------------------------------
+
+def build_bgw_v_grid_fn(
+    config, *,
+    wfn,
+    sym,
+    input_dir: str,
+    print_fn=print,
+) -> Optional[Callable[[tuple], np.ndarray]]:
+    """Build the optional BGW vcoul override closure (or None).
+
+    When ``config.head.use_bgw_vcoul`` is set the GW driver substitutes
+    BGW's MC-averaged ``v(q+G)`` for LORRAX's internal head-only
+    mini-BZ average — this enables bit-reproducible BGW comparisons.
+    The returned callable maps a fractional q-tuple to a dense G-grid
+    of Coulomb values; pass it through to ``compute_V_q``.
+
+    Returns ``None`` when the override is disabled, so callers can do
+    ``bgw_v_grid_fn = build_bgw_v_grid_fn(...)`` unconditionally.
+    """
+    head = config.head
+    if not head.use_bgw_vcoul:
+        return None
+    if head.bgw_vcoul_file is None:
+        raise ValueError(
+            "head.use_bgw_vcoul=true requires head.bgw_vcoul_file to be set"
+        )
+
+    from file_io import read_bgw_vcoul, fill_v_grid_for_q
+
+    bgw_path = resolve_input_path(input_dir, head.bgw_vcoul_file)
+    print_fn(f"  BGW vcoul override: loading {bgw_path}")
+    bgw_table = read_bgw_vcoul(bgw_path)
+    print_fn(
+        f"    {bgw_table.q_fracs.shape[0]} unique q-points, "
+        f"G counts per q: {[len(g) for g in bgw_table.G_miller_per_q]}"
+    )
+
+    cell_volume = float(wfn.cell_volume)
+    fft_grid = tuple(int(x) for x in wfn.fft_grid)
+
+    # BGW's vcoul file only stores unique IBZ q's; mapping LORRAX's
+    # full-BZ q to those needs the full crystal sym group.  A nosym WFN
+    # stores only identity in mf_header/symmetry/mtrx, so allow pulling
+    # the 48 ops from an aux sym-reduced WFN when provided.
+    if head.bgw_vcoul_sym_wfn:
+        aux_path = resolve_input_path(input_dir, head.bgw_vcoul_sym_wfn)
+        with h5py.File(aux_path, "r") as fsym:
+            sym_real = np.asarray(
+                fsym["mf_header/symmetry/mtrx"][:], dtype=np.int32)
+        print_fn(f"    crystal sym ops loaded from {aux_path}: {sym_real.shape[0]}")
+        sym_mats_k = sym_real.transpose(0, 2, 1).copy()
+    else:
+        sym_mats_k = np.asarray(sym.sym_mats_k, dtype=np.int32)
+
+    def bgw_v_grid_fn(q_frac_tuple):
+        return fill_v_grid_for_q(
+            bgw_table, q_frac_tuple, fft_grid, cell_volume,
+            sym_mats_k=sym_mats_k,
+        )
+
+    return bgw_v_grid_fn

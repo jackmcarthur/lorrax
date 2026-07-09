@@ -145,7 +145,7 @@ def compute_sigma_xc(
         false in the config.
     quad, e_ref
         Static minimax quadrature for χ₀; produced by
-        ``w_isdf.build_static_quadrature`` once per W solve.
+        ``minimax_screening.build_static_quadrature`` once per W solve.
     config, meta, mesh_xy, sym, wfn, band_slices, input_dir
         Standard driver scaffolding.
     Gij

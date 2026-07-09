@@ -27,7 +27,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 
-from . import w_isdf
+from common.jax_compile_cache import ensure_jax_compile_cache
 
 
 _sigma_tau_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
@@ -143,7 +143,7 @@ def _get_sigma_kij_kernel(
     from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
     from .wavefunction_bundle import G_FFT7D_SPEC as _G_spec, V_FFT5D_SPEC as _V_spec
 
-    w_isdf._ensure_compilation_cache()
+    ensure_jax_compile_cache()
     _G_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _G_spec, norm='ortho')
     _G_fftn  = make_flat_k_fftn( mesh_xy, kgrid, _G_spec, norm='ortho')
     _V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _V_spec, norm='ortho')
@@ -196,7 +196,7 @@ def _get_sigma_tau_kernel(
     if cache_key in _sigma_tau_kernel_cache:
         return _sigma_tau_kernel_cache[cache_key]
 
-    w_isdf._ensure_compilation_cache()
+    ensure_jax_compile_cache()
     q_mu_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     sigma_kij_kernel = _get_sigma_kij_kernel(mesh_xy=mesh_xy, kgrid=kgrid)
 
@@ -245,7 +245,7 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh) -> None:
     fixed shape+dtype+sharding; only values change per window) — so
     one AOT compile covers every branch.
     """
-    w_isdf._ensure_compilation_cache()
+    ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     tau_kernel = _get_sigma_tau_kernel(mesh_xy=mesh_xy, kgrid=kgrid)
 

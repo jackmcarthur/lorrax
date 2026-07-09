@@ -114,7 +114,3 @@ def ensure_jax_compile_cache() -> None:
         except Exception:
             pass
     _COMPILATION_CACHE_READY = True
-
-
-# Backward compat alias.
-_ensure_compilation_cache = ensure_jax_compile_cache
