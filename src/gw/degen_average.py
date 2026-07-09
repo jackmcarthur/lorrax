@@ -71,6 +71,53 @@ def average_within_degenerate_sets(
     return out
 
 
+def average_sigma_components(
+    sigma_total,
+    sig_sx,
+    sig_coh,
+    sig_h,
+    sig_x,
+    sigma_c_at_dft_ev,
+    *,
+    energies_kn_ry: np.ndarray,
+    tol_ry: float,
+    mesh_xy,
+):
+    """BGW-style degenerate-set averaging at the H-build seam.
+
+    Mirrors ``Sigma/shiftenergy.f90``; replaces the previous per-component
+    averaging at the writer.  Applied to:
+
+    - ``sigma_total``'s diagonal          → consistent E_qp from eigh
+    - ``sig_sx, sig_coh, sig_h, sig_x``   → consistent sigma_diag.dat
+    - ``sigma_c_at_dft_ev`` (1-D, or None) → consistent eqp.dat ``sigC``
+
+    Off-diagonals are preserved.  The averaging is cheap (a host loop
+    over k of contiguous degeneracy groups) so the redundancy across
+    components is not a perf concern.  Matrices come back replicated on
+    ``mesh_xy`` (``P(None, None, None)``), matching the post-Σ seam.
+
+    Returns the six inputs, averaged, in the same order.
+    """
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    rep = NamedSharding(mesh_xy, P(None, None, None))
+
+    def _dav(M):
+        return jax.device_put(apply_to_matrix_diagonals(
+            np.asarray(M), energies_kn_ry, tol_ry), rep)
+
+    sigma_total = _dav(sigma_total)
+    sig_sx, sig_coh, sig_h, sig_x = (
+        _dav(sig_sx), _dav(sig_coh), _dav(sig_h), _dav(sig_x))
+    if sigma_c_at_dft_ev is not None:
+        sigma_c_at_dft_ev = average_within_degenerate_sets(
+            np.asarray(sigma_c_at_dft_ev, dtype=np.complex128),
+            energies_kn_ry, tol_ry)
+    return sigma_total, sig_sx, sig_coh, sig_h, sig_x, sigma_c_at_dft_ev
+
+
 def apply_to_matrix_diagonals(
     matrix_knn: np.ndarray,
     energies_kn_ry: np.ndarray,

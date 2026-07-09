@@ -170,6 +170,263 @@ def print_system_summary(
 
 
 # ---------------------------------------------------------------------------
+# Restart persistence — W0 + q→0 head scalars
+# ---------------------------------------------------------------------------
+
+def persist_w0_and_head(
+    W_q,
+    *,
+    tensors_filename: str,
+    head_resolver,
+    config,
+    meta,
+    mesh_xy,
+    print_fn=print,
+):
+    """Persist W0_qmunu + q=0 head scalars to the ISDF restart file.
+
+    Downstream consumers (BSE, future Σ-builders) reload these and apply
+    the rank-1 head update via ``head_correction.apply_q0_head_rank1``.
+    The ``whead`` axis is length 1 for COHSEX (just static) and length 2
+    for GN-PPM (static + iω_p).  ``vhead``/``whead_*`` cohsex.in overrides
+    flow through automatically because ``HeadResolver`` consults the
+    config's override fields first before falling back to s_tensor/epshead.
+
+    No-op unless ``config.do_screened`` and the restart file exists.
+    """
+    from .gw_config import ComputeMode
+
+    if not (config.do_screened and os.path.exists(tensors_filename)):
+        return
+    from file_io import write_w0_qmunu_to_h5, write_head_scalars_to_h5
+    # W_q is already flat-q (nq, μ, μ).  The W0_qmunu placeholder
+    # created by ``write_restart_state_to_h5(init_W0=True)`` is
+    # rank-3 (sized from V_qmunu), so we write W_q at flat-q.
+    # Previously this reshaped to legacy 8-D and tripped
+    # ``phdf5 async write: dataset rank mismatch ds=/W0_qmunu
+    # file_rank=3 write_rank=8``.  Downstream (BSE) consumers
+    # of W0_qmunu were already updated to flat-q in commit a052a1c.
+    write_w0_qmunu_to_h5(tensors_filename, W_q,
+                         n_rmu_logical=int(meta.n_rmu),
+                         mesh=mesh_xy, backend=config.backend.slab_io)
+    head_static = head_resolver.at(0.0 + 0.0j)
+    if config.compute_mode.is_dynamic:
+        # GN-PPM: probe at iωp on the imaginary axis.
+        # HL-PPM: probe at Ω on the real axis (above all transitions).
+        if config.compute_mode is ComputeMode.HL_PPM:
+            omega_imp = complex(float(config.ppm.omega_p), 0.0)
+            _omega_grid_entry = float(omega_imp.real)
+        else:
+            omega_imp = 1j * float(config.ppm.omega_p)
+            _omega_grid_entry = float(omega_imp.imag)
+        head_imag = head_resolver.at(omega_imp)
+        whead_arr = np.array(
+            [head_static.wcoul0, head_imag.wcoul0], dtype=np.complex128)
+        omega_grid = np.array([0.0, _omega_grid_entry], dtype=np.float64)
+    else:
+        whead_arr = np.array([head_static.wcoul0], dtype=np.complex128)
+        omega_grid = np.array([0.0], dtype=np.float64)
+    write_head_scalars_to_h5(
+        tensors_filename,
+        vhead=complex(head_static.vc0),
+        whead=whead_arr,
+        omega_grid=omega_grid,
+    )
+    print_fn(
+        f"  Persisted W0_qmunu + q=0 head scalars: "
+        f"vhead={head_static.vc0.real:.3f} a.u.,  "
+        f"whead[ω=0]={whead_arr[0].real:.3f} a.u."
+        + (f",  whead[iωp]={whead_arr[1].real:.3f} a.u." if len(whead_arr) > 1 else "")
+    )
+
+
+# ---------------------------------------------------------------------------
+# One-shot QP-WFN dump (SC writes its own via dump_qp_wfn_artifacts)
+# ---------------------------------------------------------------------------
+
+def write_qp_wfn_oneshot(
+    U_full: np.ndarray,
+    E_full: np.ndarray,
+    *,
+    wfn,
+    band_slices,
+    input_dir: str,
+    print_fn=print,
+):
+    """One-shot WFN_qp.h5 dump (drop-in BSE / restart input).
+
+    The one-shot dump is an IBZ-only writer: it rotates the DFT bands the
+    WFN carries coefficients for, so it needs Σ (hence U_full/E_full) on the
+    same k-set as the WFN.  When Σ is unfolded to the full BZ the eigh runs
+    on nk_full > wfn.nkpts and this path cannot build the artifact — skip
+    with a warning rather than crash the whole run (the writer would raise
+    ValueError on the k-count mismatch).
+    """
+    import jax
+
+    if int(U_full.shape[0]) != int(wfn.nkpts):
+        print_fn(
+            f"  QP WFN (one-shot): skipped — Σ on {int(U_full.shape[0])} "
+            f"k-points but WFN carries {int(wfn.nkpts)} (IBZ); the one-shot "
+            f"dump only supports IBZ-Σ. Set debug.write_wfn_h5=false to silence.")
+        return
+    from file_io.qp_wfn import write_qp_wfn_h5
+    _qp_wfn_path = os.path.join(input_dir, "WFN_qp.h5")
+    if jax.process_index() == 0:
+        write_qp_wfn_h5(
+            _qp_wfn_path, wfn=wfn,
+            U_kmn=np.asarray(U_full, dtype=np.complex128),
+            enk_active_qp_ry=np.asarray(E_full, dtype=np.float64),
+            band_start=band_slices.b0, band_stop=band_slices.b3,
+        )
+    try:
+        from jax.experimental import multihost_utils as _mh
+        _mh.sync_global_devices("oneshot_qp_wfn_h5_write")
+    except Exception:
+        pass
+    print_fn(f"  QP WFN (one-shot): {_qp_wfn_path}")
+
+
+# ---------------------------------------------------------------------------
+# Σ-decomposition frequency-debug table
+# ---------------------------------------------------------------------------
+
+def write_freq_debug(
+    results: "GWResults",
+    *,
+    config,
+    static_head_terms,
+    omega_dft_rel_ev,
+    head_sigma_diag_w_kn_ry,
+    omega_grid_ry,
+    print_fn=print,
+):
+    """Optional Σ-decomposition debug table (rank-0 caller, all in eV).
+
+    Single seam at the H-build output: dumps the diagonal pieces that
+    feed the BGW-format ``eqp0`` (Σ_tot at E_DFT) and ``eqp1`` (the same
+    Σ_tot − E_DFT extrapolated by the Z-factor central-difference slope
+    of dRe[Σ_c]/dω at E=E_DFT).  By construction
+    ``eqp0 ≟ kin_ion + V_H + x_bare + sig_c(Edft).Re`` exactly, and
+    ``eqp1 ≟ E_DFT + Z·(eqp0 − E_DFT)`` with Z=1 in static modes
+    (degenerate eqp1==eqp0).  Head corrections are also exposed as
+    their own columns: ``x_head`` (always when the head is computed)
+    and either ``sig_c_head(Edft)`` (PPM) or ``sex_head/coh_head``
+    (static, screened mode).
+
+    No-op unless ``config.debug.sigma_freq_debug_output`` is set.
+    """
+    if not config.debug.sigma_freq_debug_output:
+        return
+    from file_io import write_sigma_freq_debug_table
+    from .eqp_bgw import (
+        compute_eqp_diag, compute_z_factor_from_omega_grid)
+
+    use_ppm_c = (
+        results.use_ppm and results.sigma_c_diag_at_dft_ry is not None)
+    _e_dft_ev_full = np.asarray(results.E_dft_ry, dtype=np.float64) * RYD_TO_EV
+    _kin_diag_ev = np.real(
+        np.diagonal(np.asarray(results.kin_ion_ry), axis1=1, axis2=2)) * RYD_TO_EV
+    _v_h_diag_ev = np.real(
+        np.diagonal(np.asarray(results.sig_h), axis1=1, axis2=2)) * RYD_TO_EV
+    _sig_x_diag_ev = np.real(
+        np.diagonal(np.asarray(results.sig_x), axis1=1, axis2=2)) * RYD_TO_EV
+    _nk, _nb = _e_dft_ev_full.shape
+    # Static-COHSEX q→0 head: band-diagonal ``(nb,)`` shifts applied
+    # in-place to Σ_x / Σ_SX / Σ_COH inside ``cohsex_sigma``.  The
+    # bare-X piece (``sigma_x_diag``) is added in PPM mode too (since
+    # Σ_x is static there as well), so ``x_head`` is emitted whenever
+    # the head was computed.  ``sex_head`` / ``coh_head`` are
+    # screened-channel pieces that only apply when ``do_screened``.
+    def _broadcast_head_diag_to_kij(diag_n_ry: np.ndarray) -> np.ndarray:
+        return np.broadcast_to(
+            np.real(np.asarray(diag_n_ry)) * RYD_TO_EV, (_nk, _nb)
+        ).astype(np.float64)
+
+    _cols = [
+        ("E_dft", _e_dft_ev_full),
+        ("Edft-Ef", _e_dft_ev_full - float(results.efermi_ev or 0.0)),
+        ("kin_ion", _kin_diag_ev),
+        ("V_H", _v_h_diag_ev),
+        ("x_bare", _sig_x_diag_ev),
+    ]
+    if static_head_terms is not None:
+        _cols.append((
+            "x_head",
+            _broadcast_head_diag_to_kij(static_head_terms.sigma_x_diag),
+        ))
+    if use_ppm_c:
+        # Compute Σ_c(E_DFT) + Z via the SAME recipe the eqp{0,1}.dat
+        # writer uses, so the freq_debug sig_c(Edft) column and the
+        # eqp0/eqp1 columns are bit-consistent.  PPM pipeline's own
+        # interp produces a numerically slightly different value (~10
+        # meV) due to a different vectorisation path.
+        _e_dft_rel_ev = np.asarray(omega_dft_rel_ev, dtype=np.float64)
+        _sigma_c_at_dft_for_eqp, _z_factor = (
+            compute_z_factor_from_omega_grid(
+                sigma_c_omega_diag_ev=np.asarray(
+                    results.sigma_c_omega_diag_ev, dtype=np.complex128),
+                omega_rel_ev=np.asarray(results.omega_rel_ev, dtype=np.float64),
+                e_dft_rel_ev=_e_dft_rel_ev,
+            ))
+        _cols.append(("sig_c(Edft)", _sigma_c_at_dft_for_eqp))
+        # PPM analytic head interpolated at the same E_DFT − E_F used
+        # for ``sig_c(Edft)`` (same ω-grid, same linear-interp recipe
+        # → cancellation analyses work column-by-column).
+        if head_sigma_diag_w_kn_ry is not None:
+            from .qsgw_utils import interp_along_omega
+            _eval_ry = (np.asarray(omega_dft_rel_ev, np.float64)
+                        / RYD_TO_EV)
+            _cols.append((
+                "sig_c_head(Edft)",
+                interp_along_omega(
+                    head_sigma_diag_w_kn_ry,
+                    omega_grid_ry,
+                    _eval_ry,
+                ) * RYD_TO_EV,
+            ))
+    else:
+        _cols.append(
+            ("sex_0", np.real(np.diagonal(
+                np.asarray(results.sig_sx), axis1=1, axis2=2)) * RYD_TO_EV))
+        _cols.append(
+            ("coh_0", np.real(np.diagonal(
+                np.asarray(results.sig_coh), axis1=1, axis2=2)) * RYD_TO_EV))
+        if static_head_terms is not None and config.do_screened:
+            _cols.append((
+                "sex_head",
+                _broadcast_head_diag_to_kij(static_head_terms.sigma_sx_diag),
+            ))
+            _cols.append((
+                "coh_head",
+                _broadcast_head_diag_to_kij(static_head_terms.sigma_coh_diag),
+            ))
+    # eqp0 / eqp1 — same math as the eqp{0,1}.dat writer.  In PPM
+    # mode (Σ_c, Z) were already computed above for the
+    # ``sig_c(Edft)`` column; in static modes the combined Σ_SX +
+    # Σ_COH plays the role of Σ_c(E_DFT) and Z = 1 so eqp1 == eqp0.
+    if not use_ppm_c:
+        _sigma_c_at_dft_for_eqp = np.real(np.diagonal(
+            np.asarray(results.sig_sx + results.sig_coh),
+            axis1=1, axis2=2)) * RYD_TO_EV
+        _z_factor = None
+    _eqp0_ev, _eqp1_ev = compute_eqp_diag(
+        kin_ion_diag_ev=_kin_diag_ev,
+        hartree_diag_ev=_v_h_diag_ev,
+        sigma_x_diag_ev=_sig_x_diag_ev,
+        sigma_c_at_dft_diag_ev=np.asarray(
+            _sigma_c_at_dft_for_eqp, dtype=np.complex128),
+        e_dft_ev=_e_dft_ev_full,
+        z_factor=_z_factor,
+    )
+    _cols.append(("eqp0", _eqp0_ev.astype(np.float64)))
+    _cols.append(("eqp1", _eqp1_ev.astype(np.float64)))
+    write_sigma_freq_debug_table(
+        config.debug.sigma_freq_debug_file, _cols)
+    print_fn(f"  Sigma freq debug: {config.debug.sigma_freq_debug_file}")
+
+
+# ---------------------------------------------------------------------------
 # Result writer  (QE ``punch('all')`` pattern)
 # ---------------------------------------------------------------------------
 

@@ -23,7 +23,7 @@ from file_io import (
 )
 from common import symmetry_maps
 from common.wfn_transforms import get_enk_bandrange
-from .gw_config import ComputeMode, LorraxConfig, QPSolver
+from .gw_config import LorraxConfig, QPSolver
 from .gw_init import (
 	get_effective_chunk_size,
 	prepare_isdf_and_wavefunctions,
@@ -34,12 +34,9 @@ from .gw_driver_helpers import (
 )
 from .w_isdf import (
 	build_static_quadrature,
-	compute_chi0,
 	flatten_V_qmunu,
-	precompile_chi0,
-	precompile_solve_w,
-	solve_w,
 )
+from .screening import compute_static_w
 from .ppm_pipeline import compute_ppm_sigma_pipeline
 from .cohsex_sigma import (
 	build_Gij,
@@ -58,7 +55,6 @@ from .head_correction import (
 )
 from .wavefunction_bundle import BandSlices
 from common import Meta, RYD_TO_EV
-from common import jax_profile
 import common.timing as timing
 
 
@@ -130,7 +126,11 @@ def main(argv=None):
 
 	setup_runtime(config, mesh_xy, print_fn=print0)
 
-	from .gw_output import print_banner, print_section, print_system_summary, write_results, GWResults
+	from .gw_output import (
+		GWResults, persist_w0_and_head, print_banner,
+		print_system_summary, write_freq_debug, write_qp_wfn_oneshot,
+		write_results,
+	)
 	print_banner(
 		backend=current_backend, n_devices=n_devices,
 		grid_x=grid_x, grid_y=grid_y, n_procs=n_procs,
@@ -156,6 +156,13 @@ def main(argv=None):
 	meta.chunk_size = get_effective_chunk_size(config.memory.chunk_size)
 
 	band_slices = BandSlices.from_band_edges(*meta.band_edges)
+
+	# DFT eigenvalues on the Σ band window (Ry) — one fetch, reused by the
+	# Σ_X diagnostic, the SC initial state, degeneracy averaging, and the
+	# results writer.
+	enk_dft, _ = get_enk_bandrange(
+		wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
+		nspinor=meta.nspinor)
 
 	# Single resolver for every q→0 head sample we'll need this run; the
 	# COHSEX static head, the W0 restart-flush head, and the PPM dynamic
@@ -201,148 +208,26 @@ def main(argv=None):
 	# the legacy 8-D layout.
 	V_q = flatten_V_qmunu(V_qmunu)
 	if config.do_screened:
-		# IBZ cascade for W = (1 − v χ₀)⁻¹ v: slice V_q, χ₀_q to IBZ
-		# rows before ``solve_w`` so the per-q Cholesky/LU factor runs
-		# only on ``n_q_ibz`` blocks; W_q comes out at IBZ shape and we
-		# unfold back to full BZ via the SAME helper V_q uses (it's the
-		# same physics — W is bilinear in centroids and rotates by
-		# centroid double-permute + L-phase + TRS conj under sym).
-		# Explicit-full-BZ debug bypass matches the V_q gate; IBZ
-		# activation otherwise depends only on orbit-closure of the
-		# centroid set (checked downstream in ``_resolve_ibz_q_list``).
-		_use_ibz_w_requested = not bool(
-			int(os.environ.get('LORRAX_FORCE_FULL_BZ', '0')))
-		_ibz_tables = None
-		if _use_ibz_w_requested and getattr(sym, 'q_irr_full_idx', None) is not None:
-			from .v_q_g_flat import _resolve_ibz_q_list
-			_ibz_tables = _resolve_ibz_q_list(
-				sym=sym, centroid_indices=centroid_indices,
-				kgrid=tuple(meta.kgrid),
-				fft_grid=tuple(meta.fft_grid),
-				verbose=False)
-			(_, _q_irr_frac, _full_to_irr_idx, _full_to_irr_sym,
-			 _sym_perm, _L_table, _use_ibz_w) = _ibz_tables
-		else:
-			_use_ibz_w = False
-
-		with timing.section("gw_jax.chi0_W"):
-			with jax_profile.trace_section("chi0_W"):
-				# Split compile vs exec for χ₀ and W.  Each section's
-				# wall time is read off the end-of-run timing report
-				# under ``gw_jax.chi0_W.{chi,W}.{compile,exec}``.  The
-				# explicit ``block_until_ready`` inside the exec sections
-				# is load-bearing: it (a) pins chi.exec / W.exec wall time
-				# to the actual dispatched compute (not just the host
-				# dispatch), and (b) drops the last Python reference to
-				# χ₀ before the W-solve call so XLA can donate that
-				# buffer.  Do NOT use ``_chi_sec.watch(...)`` here — it
-				# keeps a bound ``block_until_ready`` method alive on the
-				# section object past W-solve, which blocks donation.
-				quad, e_ref = build_static_quadrature(wfns, config.minimax_config, print_fn=print0)
-				with timing.section("chi.compile"):
-					precompile_chi0(wfns, quad, meta, mesh_xy,
-					                energy_reference=e_ref)
-				with timing.section("chi.exec"):
-					chi0_q = compute_chi0(wfns, quad, meta, mesh_xy,
-					                      energy_reference=e_ref)
-					chi0_q.block_until_ready()
-				# IBZ slice on V_q and χ₀_q.  Both retain the canonical
-				# ``P(None, 'x', 'y')`` sharding; the helper locks it in.
-				if _use_ibz_w:
-					from common.symmetry_maps import slice_q_full_to_ibz
-					_nat = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-					with timing.section("W.slice_to_ibz"):
-						V_q_solve = slice_q_full_to_ibz(
-							V_q, sym.q_irr_full_idx, out_sharding=_nat)
-						chi0_q_solve = slice_q_full_to_ibz(
-							chi0_q, sym.q_irr_full_idx, out_sharding=_nat)
-						del chi0_q
-						chi0_q_solve.block_until_ready()
-				else:
-					V_q_solve = V_q
-					chi0_q_solve = chi0_q
-				with timing.section("W.compile"):
-					precompile_solve_w(V_q_solve, chi0_q_solve, meta, mesh_xy,
-					                   solver=config.backend.screening_solver)
-				with timing.section("W.exec"):
-					W_q_solve = solve_w(V_q_solve, chi0_q_solve, meta, mesh_xy,
-					              solver=config.backend.screening_solver)
-					# χ₀ is donated inside solve_w — the reference is
-					# now invalid.  Do NOT touch ``chi0_q_solve`` after this.
-					del chi0_q_solve
-					W_q_solve.block_until_ready()
-				# IBZ → full-BZ unfold (centroid double-permute + L-phase
-				# + TRS conj) — same helper V_q uses.  Σ_COH/SX still
-				# iterate over the full BZ in the k-q sums.
-				if _use_ibz_w:
-					from common.symmetry_maps import unfold_v_q
-					with timing.section("W.unfold_to_full_bz"):
-						_n_sym_spatial = int(
-							np.asarray(_sym_perm).shape[0]) // 2
-						W_q = unfold_v_q(
-							W_q_solve,
-							irr_idx=_full_to_irr_idx,
-							sym_idx=_full_to_irr_sym,
-							sym_perm=_sym_perm, L_table=_L_table,
-							q_irr_frac=_q_irr_frac,
-							mesh_xy=mesh_xy,
-							n_sym_spatial=_n_sym_spatial)
-						del W_q_solve
-						W_q.block_until_ready()
-				else:
-					W_q = W_q_solve
-
-	if not config.do_screened:
+		# The minimax τ-axis, solved on G's actual spectral range — shared
+		# by every χ₀ build this run (static W here, probe W for PPM, SC
+		# re-solves).
+		quad, e_ref = build_static_quadrature(
+			wfns, config.minimax_config, print_fn=print0)
+		# W(0) = (1 − Vχ₀)⁻¹V, solved on the IBZ wedge and unfolded to
+		# the full BZ (see ``screening.compute_static_w``).
+		W_q = compute_static_w(
+			wfns, V_q, quad, e_ref=e_ref,
+			sym=sym, centroid_indices=centroid_indices,
+			config=config, meta=meta, mesh_xy=mesh_xy)
+	else:
 		W_q = V_q  # unscreened: W = V
 
-	# ── Persist W0_qmunu + q=0 head scalars to the restart file ──────────
-	# Downstream consumers (BSE, future Σ-builders) reload these and apply
-	# the rank-1 head update via ``head_correction.apply_q0_head_rank1``.
-	# The ``whead`` axis is length 1 for COHSEX (just static) and length 2
-	# for GN-PPM (static + iω_p).  ``vhead``/``whead_*`` cohsex.in overrides
-	# flow through automatically because ``HeadResolver`` consults the
-	# config's override fields first before falling back to s_tensor/epshead.
-	if config.do_screened and os.path.exists(tensors_filename):
-		from file_io import write_w0_qmunu_to_h5, write_head_scalars_to_h5
-		# W_q is already flat-q (nq, μ, μ).  The W0_qmunu placeholder
-		# created by ``write_restart_state_to_h5(init_W0=True)`` is
-		# rank-3 (sized from V_qmunu), so we write W_q at flat-q.
-		# Previously this reshaped to legacy 8-D and tripped
-		# ``phdf5 async write: dataset rank mismatch ds=/W0_qmunu
-		# file_rank=3 write_rank=8``.  Downstream (BSE) consumers
-		# of W0_qmunu were already updated to flat-q in commit a052a1c.
-		write_w0_qmunu_to_h5(tensors_filename, W_q,
-		                     n_rmu_logical=int(meta.n_rmu),
-		                     mesh=mesh_xy, backend=config.backend.slab_io)
-		head_static = head_resolver.at(0.0 + 0.0j)
-		if config.compute_mode.is_dynamic:
-			# GN-PPM: probe at iωp on the imaginary axis.
-			# HL-PPM: probe at Ω on the real axis (above all transitions).
-			if config.compute_mode is ComputeMode.HL_PPM:
-				omega_imp = complex(float(config.ppm.omega_p), 0.0)
-				_omega_grid_entry = float(omega_imp.real)
-			else:
-				omega_imp = 1j * float(config.ppm.omega_p)
-				_omega_grid_entry = float(omega_imp.imag)
-			head_imag = head_resolver.at(omega_imp)
-			whead_arr = np.array(
-				[head_static.wcoul0, head_imag.wcoul0], dtype=np.complex128)
-			omega_grid = np.array([0.0, _omega_grid_entry], dtype=np.float64)
-		else:
-			whead_arr = np.array([head_static.wcoul0], dtype=np.complex128)
-			omega_grid = np.array([0.0], dtype=np.float64)
-		write_head_scalars_to_h5(
-			tensors_filename,
-			vhead=complex(head_static.vc0),
-			whead=whead_arr,
-			omega_grid=omega_grid,
-		)
-		print0(
-			f"  Persisted W0_qmunu + q=0 head scalars: "
-			f"vhead={head_static.vc0.real:.3f} a.u.,  "
-			f"whead[ω=0]={whead_arr[0].real:.3f} a.u."
-			+ (f",  whead[iωp]={whead_arr[1].real:.3f} a.u." if len(whead_arr) > 1 else "")
-		)
+	# Persist W0_qmunu + q=0 head scalars to the ISDF restart file for
+	# downstream consumers (BSE, future Σ-builders); no-op unless screened
+	# and the restart file exists.
+	persist_w0_and_head(
+		W_q, tensors_filename=tensors_filename, head_resolver=head_resolver,
+		config=config, meta=meta, mesh_xy=mesh_xy, print_fn=print0)
 
 	Gij = build_Gij(meta, mesh_xy)
 
@@ -383,12 +268,9 @@ def main(argv=None):
 	from .degen_average import average_within_degenerate_sets
 	sig_x_diag = np.real(np.diagonal(np.asarray(sig_x), axis1=1, axis2=2)) * RYD_TO_EV
 	if not config.no_degen_averaging:
-		_enk_sigma_ry, _ = get_enk_bandrange(
-			wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
-			nspinor=meta.nspinor)
 		sig_x_diag = average_within_degenerate_sets(
 			sig_x_diag,
-			energies_kn_ry=np.asarray(_enk_sigma_ry, dtype=np.float64),
+			energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
 			tol_ry=float(config.degen_avg_tol_ry),
 		)
 	print0(f"  Bare Σ_X diagonal (eV), k=0: "
@@ -491,11 +373,8 @@ def main(argv=None):
 		from .band_partition import BandPartition
 		from .scissor import classify_bands_in_grid
 
-		_enk_active, _ = get_enk_bandrange(
-			wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
-			nspinor=meta.nspinor)
 		_e_dft_active_kn_ry = jnp.asarray(
-			np.asarray(_enk_active, dtype=np.float64))
+			np.asarray(enk_dft, dtype=np.float64))
 		_nb_active = _e_dft_active_kn_ry.shape[1]
 		_val_mask_active = jnp.broadcast_to(
 			jnp.arange(_nb_active) < int(meta.nelec),
@@ -508,7 +387,7 @@ def main(argv=None):
 		_efermi_ev = float(wfn.efermi) * RYD_TO_EV
 		_omega_min_ev = float(config.ppm.omega_min_ev) + _efermi_ev
 		_omega_max_ev = float(config.ppm.omega_max_ev) + _efermi_ev
-		_e_dft_ev = np.asarray(_enk_active, dtype=np.float64) * RYD_TO_EV
+		_e_dft_ev = np.asarray(enk_dft, dtype=np.float64) * RYD_TO_EV
 		_band_in_grid, _ = classify_bands_in_grid(
 			_e_dft_ev, _omega_min_ev, _omega_max_ev)
 		_in_range = jnp.asarray(_band_in_grid, dtype=bool)
@@ -735,76 +614,29 @@ def main(argv=None):
 		sigma_total = sig_sx + sig_coh + sig_h
 
 	# ---- BGW-style degenerate-set averaging at the H-build seam ----
-	# Mirrors Sigma/shiftenergy.f90; replaces the previous per-component
-	# averaging at the writer.  Applied to:
-	#   - sigma_total's diagonal           → consistent E_qp from eigh
-	#   - sig_sx, sig_coh, sig_h, sig_x    → consistent sigma_diag.dat
-	#   - sigma_c_at_dft_ev (1-D)          → consistent eqp.dat ``sigC``
-	# Off-diagonals are preserved.  The averaging is cheap (a host loop
-	# over k of contiguous degeneracy groups) so the redundancy across
-	# components is not a perf concern.
+	# (mirrors Sigma/shiftenergy.f90; see ``degen_average``).
 	if not config.no_degen_averaging:
-		from .degen_average import (
-			apply_to_matrix_diagonals,
-			average_within_degenerate_sets,
-		)
-		_enk_sigma_ry, _ = get_enk_bandrange(
-			wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
-			nspinor=meta.nspinor)
-		_e_kn_ry = np.asarray(_enk_sigma_ry, dtype=np.float64)
-		_tol = float(config.degen_avg_tol_ry)
-		_dav_rep = NamedSharding(mesh_xy, P(None, None, None))
-		def _dav(M):
-			return jax.device_put(apply_to_matrix_diagonals(
-				np.asarray(M), _e_kn_ry, _tol), _dav_rep)
-		sigma_total = _dav(sigma_total)
-		sig_sx, sig_coh, sig_h, sig_x = _dav(sig_sx), _dav(sig_coh), _dav(sig_h), _dav(sig_x)
-		if sigma_c_at_dft_ev is not None:
-			sigma_c_at_dft_ev = average_within_degenerate_sets(
-				np.asarray(sigma_c_at_dft_ev, dtype=np.complex128),
-				_e_kn_ry, _tol)
+		from .degen_average import average_sigma_components
+		(sigma_total, sig_sx, sig_coh, sig_h, sig_x,
+		 sigma_c_at_dft_ev) = average_sigma_components(
+			sigma_total, sig_sx, sig_coh, sig_h, sig_x, sigma_c_at_dft_ev,
+			energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+			tol_ry=float(config.degen_avg_tol_ry),
+			mesh_xy=mesh_xy)
 
 	# ---- Single H-build + diagonalization on replicated arrays ----
 	H = 0.5 * ((kin_ion + sigma_total) + jnp.conj(jnp.swapaxes(kin_ion + sigma_total, -1, -2)))
 	E_full, U_full = jax.vmap(jnp.linalg.eigh, in_axes=0)(H)
-
-	# ---- DFT energies for the writer ----
-	enk_dft, _ = get_enk_bandrange(wfn, sym,
-		band_slices.sigma_range, band_slices.sigma_range, nspinor=meta.nspinor)
 
 	# ---- One-shot WFN_qp.h5 dump (drop-in BSE / restart input).  SC
 	# already wrote its own WFN_qp.h5 above via dump_qp_wfn_artifacts
 	# (using state_final.H_qp_dft) — same physics, slightly different
 	# numerics from the post-Σ-seam eigh path.  Skip the second write
 	# in SC to avoid clobbering.
-	# The one-shot dump is an IBZ-only writer: it rotates the DFT bands the
-	# WFN carries coefficients for, so it needs Σ (hence U_full/E_full) on the
-	# same k-set as the WFN.  When Σ is unfolded to the full BZ (line 275) the
-	# eigh runs on nk_full > wfn.nkpts and this path cannot build the artifact
-	# — skip with a warning rather than crash the whole run (the writer would
-	# raise ValueError on the k-count mismatch).
 	if config.debug.write_wfn_h5 and qp_solver is not QPSolver.SELF_CONSISTENT:
-		if int(U_full.shape[0]) != int(wfn.nkpts):
-			print0(
-				f"  QP WFN (one-shot): skipped — Σ on {int(U_full.shape[0])} "
-				f"k-points but WFN carries {int(wfn.nkpts)} (IBZ); the one-shot "
-				f"dump only supports IBZ-Σ. Set debug.write_wfn_h5=false to silence.")
-		else:
-			from file_io.qp_wfn import write_qp_wfn_h5
-			_qp_wfn_path = os.path.join(input_dir, "WFN_qp.h5")
-			if jax.process_index() == 0:
-				write_qp_wfn_h5(
-					_qp_wfn_path, wfn=wfn,
-					U_kmn=np.asarray(U_full, dtype=np.complex128),
-					enk_active_qp_ry=np.asarray(E_full, dtype=np.float64),
-					band_start=band_slices.b0, band_stop=band_slices.b3,
-				)
-			try:
-				from jax.experimental import multihost_utils as _mh
-				_mh.sync_global_devices("oneshot_qp_wfn_h5_write")
-			except Exception:
-				pass
-			print0(f"  QP WFN (one-shot): {_qp_wfn_path}")
+		write_qp_wfn_oneshot(
+			U_full, E_full, wfn=wfn, band_slices=band_slices,
+			input_dir=input_dir, print_fn=print0)
 
 	# PPM mode: feed the writer the on-shell diag(Σ_c(E_DFT)) (Ry) so the
 	# eqp0.dat "sigC" column reports dynamic correlation directly comparable
@@ -825,123 +657,6 @@ def main(argv=None):
 		if (mode.is_dynamic and sigma_c_at_dft_ev is not None)
 		else None
 	)
-
-	# ---- Optional Σ-decomposition debug table (rank-0, all in eV) ----
-	# Single seam at the H-build output: dumps the diagonal pieces that
-	# feed the BGW-format ``eqp0`` (Σ_tot at E_DFT) and ``eqp1`` (the same
-	# Σ_tot − E_DFT extrapolated by the Z-factor central-difference slope
-	# of dRe[Σ_c]/dω at E=E_DFT).  By construction
-	# ``eqp0 ≟ kin_ion + V_H + x_bare + sig_c(Edft).Re`` exactly, and
-	# ``eqp1 ≟ E_DFT + Z·(eqp0 − E_DFT)`` with Z=1 in static modes
-	# (degenerate eqp1==eqp0).  Head corrections are also exposed as
-	# their own columns: ``x_head`` (always when the head is computed)
-	# and either ``sig_c_head(Edft)`` (PPM) or ``sex_head/coh_head``
-	# (static, screened mode).
-	if meta.rank == 0 and config.debug.sigma_freq_debug_output:
-		from file_io import write_sigma_freq_debug_table
-		from .eqp_bgw import (
-			compute_eqp_diag, compute_z_factor_from_omega_grid)
-		_e_dft_ev_full = np.asarray(enk_dft, dtype=np.float64) * RYD_TO_EV
-		_kin_diag_ev = np.real(
-			np.diagonal(np.asarray(kin_ion), axis1=1, axis2=2)) * RYD_TO_EV
-		_v_h_diag_ev = np.real(
-			np.diagonal(np.asarray(sig_h), axis1=1, axis2=2)) * RYD_TO_EV
-		_sig_x_diag_ev = np.real(
-			np.diagonal(np.asarray(sig_x), axis1=1, axis2=2)) * RYD_TO_EV
-		_nk, _nb = _e_dft_ev_full.shape
-		# Static-COHSEX q→0 head: band-diagonal ``(nb,)`` shifts applied
-		# in-place to Σ_x / Σ_SX / Σ_COH inside ``cohsex_sigma``.  The
-		# bare-X piece (``sigma_x_diag``) is added in PPM mode too (since
-		# Σ_x is static there as well), so ``x_head`` is emitted whenever
-		# the head was computed.  ``sex_head`` / ``coh_head`` are
-		# screened-channel pieces that only apply when ``do_screened``.
-		def _broadcast_head_diag_to_kij(diag_n_ry: np.ndarray) -> np.ndarray:
-			return np.broadcast_to(
-				np.real(np.asarray(diag_n_ry)) * RYD_TO_EV, (_nk, _nb)
-			).astype(np.float64)
-
-		_cols = [
-			("E_dft", _e_dft_ev_full),
-			("Edft-Ef", _e_dft_ev_full - float(efermi_dft_ev or 0.0)),
-			("kin_ion", _kin_diag_ev),
-			("V_H", _v_h_diag_ev),
-			("x_bare", _sig_x_diag_ev),
-		]
-		if static_head_terms is not None:
-			_cols.append((
-				"x_head",
-				_broadcast_head_diag_to_kij(static_head_terms.sigma_x_diag),
-			))
-		if mode.is_dynamic and sigma_c_at_dft_ev is not None:
-			# Compute Σ_c(E_DFT) + Z via the SAME recipe the eqp{0,1}.dat
-			# writer uses, so the freq_debug sig_c(Edft) column and the
-			# eqp0/eqp1 columns are bit-consistent.  PPM pipeline's own
-			# interp produces a numerically slightly different value (~10
-			# meV) due to a different vectorisation path.
-			_e_dft_rel_ev = np.asarray(omega_dft_rel_ev, dtype=np.float64)
-			_sigma_c_at_dft_for_eqp, _z_factor = (
-				compute_z_factor_from_omega_grid(
-					sigma_c_omega_diag_ev=np.asarray(
-						sigma_c_omega_diag_ev, dtype=np.complex128),
-					omega_rel_ev=np.asarray(omega_rel_ev, dtype=np.float64),
-					e_dft_rel_ev=_e_dft_rel_ev,
-				))
-			_cols.append(("sig_c(Edft)", _sigma_c_at_dft_for_eqp))
-			# PPM analytic head interpolated at the same E_DFT − E_F used
-			# for ``sig_c(Edft)`` (same ω-grid, same linear-interp recipe
-			# → cancellation analyses work column-by-column).
-			if head_sigma_diag_w_kn_ry is not None:
-				from .qsgw_utils import interp_along_omega
-				_eval_ry = (np.asarray(omega_dft_rel_ev, np.float64)
-				            / RYD_TO_EV)
-				_cols.append((
-					"sig_c_head(Edft)",
-					interp_along_omega(
-						head_sigma_diag_w_kn_ry,
-						omega_grid_ry,
-						_eval_ry,
-					) * RYD_TO_EV,
-				))
-		else:
-			_cols.append(
-				("sex_0", np.real(np.diagonal(
-					np.asarray(sig_sx), axis1=1, axis2=2)) * RYD_TO_EV))
-			_cols.append(
-				("coh_0", np.real(np.diagonal(
-					np.asarray(sig_coh), axis1=1, axis2=2)) * RYD_TO_EV))
-			if static_head_terms is not None and config.do_screened:
-				_cols.append((
-					"sex_head",
-					_broadcast_head_diag_to_kij(static_head_terms.sigma_sx_diag),
-				))
-				_cols.append((
-					"coh_head",
-					_broadcast_head_diag_to_kij(static_head_terms.sigma_coh_diag),
-				))
-		# eqp0 / eqp1 — same math as the eqp{0,1}.dat writer.  In PPM
-		# mode (Σ_c, Z) were already computed above for the
-		# ``sig_c(Edft)`` column; in static modes the combined Σ_SX +
-		# Σ_COH plays the role of Σ_c(E_DFT) and Z = 1 so eqp1 == eqp0.
-		if mode.is_dynamic and sigma_c_at_dft_ev is not None:
-			pass  # reuses _sigma_c_at_dft_for_eqp / _z_factor from above
-		else:
-			_sigma_c_at_dft_for_eqp = np.real(np.diagonal(
-				np.asarray(sig_sx + sig_coh), axis1=1, axis2=2)) * RYD_TO_EV
-			_z_factor = None
-		_eqp0_ev, _eqp1_ev = compute_eqp_diag(
-			kin_ion_diag_ev=_kin_diag_ev,
-			hartree_diag_ev=_v_h_diag_ev,
-			sigma_x_diag_ev=_sig_x_diag_ev,
-			sigma_c_at_dft_diag_ev=np.asarray(
-				_sigma_c_at_dft_for_eqp, dtype=np.complex128),
-			e_dft_ev=_e_dft_ev_full,
-			z_factor=_z_factor,
-		)
-		_cols.append(("eqp0", _eqp0_ev.astype(np.float64)))
-		_cols.append(("eqp1", _eqp1_ev.astype(np.float64)))
-		write_sigma_freq_debug_table(
-			config.debug.sigma_freq_debug_file, _cols)
-		print0(f"  Sigma freq debug: {config.debug.sigma_freq_debug_file}")
 
 	# ---- Output ----
 	results = GWResults(
@@ -966,6 +681,16 @@ def main(argv=None):
 		tensors_filename=tensors_filename,
 	)
 	if meta.rank == 0:
+		# Optional Σ-decomposition debug table (no-op unless
+		# ``debug.sigma_freq_debug_output``; see ``gw_output.write_freq_debug``).
+		write_freq_debug(
+			results, config=config,
+			static_head_terms=static_head_terms,
+			omega_dft_rel_ev=omega_dft_rel_ev,
+			head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
+			omega_grid_ry=omega_grid_ry,
+			print_fn=print0,
+		)
 		# Degen averaging was applied once at the H-build seam upstream;
 		# the writer just serializes the already-averaged Σ components.
 		write_results(

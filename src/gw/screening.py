@@ -30,11 +30,16 @@ looks them up by string, so no enum/registry retrofit is needed.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Callable
 
+import numpy as np
 import jax
+from jax.sharding import NamedSharding, PartitionSpec as P
 
+from common import jax_profile
+import common.timing as timing
 from .gw_config import ComputeMode
 
 
@@ -94,6 +99,140 @@ def screening_requests_for(
             omega_ry=complex(float(config.ppm.omega_p), 0.0), role="probe")]
     raise ValueError(
         f"screening_requests_for: unknown compute mode {mode!r}")
+
+
+# ---------------------------------------------------------------------------
+# Static W with the IBZ fast path
+# ---------------------------------------------------------------------------
+
+def compute_static_w(
+    wfns,
+    V_q: jax.Array,
+    quad,
+    *,
+    e_ref: float,
+    sym,
+    centroid_indices,
+    config,
+    meta,
+    mesh_xy,
+) -> jax.Array:
+    """W(ω=0) = (1 − Vχ₀)⁻¹V on the full BZ, solved on the IBZ wedge.
+
+    IBZ cascade for the Dyson solve: V_q and χ₀_q are sliced to IBZ rows
+    before :func:`gw.w_isdf.solve_w` so the per-q Cholesky/LU factor runs
+    only on ``n_q_ibz`` blocks; W_q comes out at IBZ shape and is unfolded
+    back to the full BZ via the SAME helper V_q uses (same physics — W is
+    bilinear in centroids and rotates by centroid double-permute + L-phase
+    + TRS conj under sym).  Explicit-full-BZ debug bypass
+    (``LORRAX_FORCE_FULL_BZ=1``) matches the V_q gate; IBZ activation
+    otherwise depends only on orbit-closure of the centroid set (checked
+    downstream in ``_resolve_ibz_q_list``).
+
+    Parameters
+    ----------
+    wfns
+        ``Wavefunctions`` bundle (DFT or current-QP basis).
+    V_q : (nq, μ, μ) jax.Array
+        Bare Coulomb in flat-q ISDF basis, ``P(None, 'x', 'y')``.
+    quad, e_ref
+        Static minimax quadrature from ``w_isdf.build_static_quadrature``.
+    sym, centroid_indices
+        Symmetry tables + ISDF centroid set for the IBZ resolve.
+    config, meta, mesh_xy
+        Standard driver scaffolding.
+
+    Returns
+    -------
+    W_q : (nq_full, μ, μ) jax.Array
+        Static screened Coulomb on the full BZ, ``P(None, 'x', 'y')``.
+    """
+    from .w_isdf import (
+        compute_chi0,
+        precompile_chi0,
+        precompile_solve_w,
+        solve_w,
+    )
+
+    use_ibz_w_requested = not bool(
+        int(os.environ.get('LORRAX_FORCE_FULL_BZ', '0')))
+    if use_ibz_w_requested and getattr(sym, 'q_irr_full_idx', None) is not None:
+        from .v_q_g_flat import _resolve_ibz_q_list
+        (_, q_irr_frac, full_to_irr_idx, full_to_irr_sym,
+         sym_perm, L_table, use_ibz_w) = _resolve_ibz_q_list(
+            sym=sym, centroid_indices=centroid_indices,
+            kgrid=tuple(meta.kgrid),
+            fft_grid=tuple(meta.fft_grid),
+            verbose=False)
+    else:
+        use_ibz_w = False
+
+    with timing.section("gw_jax.chi0_W"):
+        with jax_profile.trace_section("chi0_W"):
+            # Split compile vs exec for χ₀ and W.  Each section's
+            # wall time is read off the end-of-run timing report
+            # under ``gw_jax.chi0_W.{chi,W}.{compile,exec}``.  The
+            # explicit ``block_until_ready`` inside the exec sections
+            # is load-bearing: it (a) pins chi.exec / W.exec wall time
+            # to the actual dispatched compute (not just the host
+            # dispatch), and (b) drops the last Python reference to
+            # χ₀ before the W-solve call so XLA can donate that
+            # buffer.  Do NOT use ``_chi_sec.watch(...)`` here — it
+            # keeps a bound ``block_until_ready`` method alive on the
+            # section object past W-solve, which blocks donation.
+            with timing.section("chi.compile"):
+                precompile_chi0(wfns, quad, meta, mesh_xy,
+                                energy_reference=e_ref)
+            with timing.section("chi.exec"):
+                chi0_q = compute_chi0(wfns, quad, meta, mesh_xy,
+                                      energy_reference=e_ref)
+                chi0_q.block_until_ready()
+            # IBZ slice on V_q and χ₀_q.  Both retain the canonical
+            # ``P(None, 'x', 'y')`` sharding; the helper locks it in.
+            if use_ibz_w:
+                from common.symmetry_maps import slice_q_full_to_ibz
+                _nat = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+                with timing.section("W.slice_to_ibz"):
+                    V_q_solve = slice_q_full_to_ibz(
+                        V_q, sym.q_irr_full_idx, out_sharding=_nat)
+                    chi0_q_solve = slice_q_full_to_ibz(
+                        chi0_q, sym.q_irr_full_idx, out_sharding=_nat)
+                    del chi0_q
+                    chi0_q_solve.block_until_ready()
+            else:
+                V_q_solve = V_q
+                chi0_q_solve = chi0_q
+            with timing.section("W.compile"):
+                precompile_solve_w(V_q_solve, chi0_q_solve, meta, mesh_xy,
+                                   solver=config.backend.screening_solver)
+            with timing.section("W.exec"):
+                W_q_solve = solve_w(V_q_solve, chi0_q_solve, meta, mesh_xy,
+                              solver=config.backend.screening_solver)
+                # χ₀ is donated inside solve_w — the reference is
+                # now invalid.  Do NOT touch ``chi0_q_solve`` after this.
+                del chi0_q_solve
+                W_q_solve.block_until_ready()
+            # IBZ → full-BZ unfold (centroid double-permute + L-phase
+            # + TRS conj) — same helper V_q uses.  Σ_COH/SX still
+            # iterate over the full BZ in the k-q sums.
+            if use_ibz_w:
+                from common.symmetry_maps import unfold_v_q
+                with timing.section("W.unfold_to_full_bz"):
+                    n_sym_spatial = int(
+                        np.asarray(sym_perm).shape[0]) // 2
+                    W_q = unfold_v_q(
+                        W_q_solve,
+                        irr_idx=full_to_irr_idx,
+                        sym_idx=full_to_irr_sym,
+                        sym_perm=sym_perm, L_table=L_table,
+                        q_irr_frac=q_irr_frac,
+                        mesh_xy=mesh_xy,
+                        n_sym_spatial=n_sym_spatial)
+                    del W_q_solve
+                    W_q.block_until_ready()
+            else:
+                W_q = W_q_solve
+    return W_q
 
 
 # ---------------------------------------------------------------------------
@@ -172,5 +311,6 @@ def compute_screening(
 __all__ = [
     "ScreeningRequest",
     "screening_requests_for",
+    "compute_static_w",
     "compute_screening",
 ]
