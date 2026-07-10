@@ -10,27 +10,24 @@
 //   XLA_FFI_DEFINE_HANDLER_SYMBOL(SlateEighFfi, EighDispatch, Bind()...)
 //
 // JAX sharding layout that this handler expects
-//   A (input), Q (output):  P("x", "y") on an (p, q) mesh, 2-D block-
-//                           cyclic with one tile per rank (so SLATE
-//                           sees n/p rows × n/q cols of local data per
-//                           rank, matching JAX's block layout exactly
-//                           when the tile size nb = n/p).
-//   W (output):             replicated.  SLATE's heev returns eigenvalues
-//                           as a std::vector<real_t> on each rank; we
-//                           cudaMemcpy them to the replicated W buffer.
+//   A (input):   local shard LOCALLY TRANSPOSED by the Python wrapper
+//                (shard_map + jnp.transpose), so the bytes are the
+//                rank's (n/p, n/q) block in col-major layout — same
+//                convention as potrf_ffi.cc / trsm_ffi.cc.  Combined
+//                with the comm rank-remap (context.cc) SLATE sees the
+//                true global A on any square p × q mesh.
+//   Q (output):  SLATE col-major tiles; the Python wrapper reads them
+//                back with out_specs P('y','x') + a local transpose to
+//                recover Q at P('x','y') (cholesky handle convention).
+//   W (output):  replicated.  SLATE's heev returns eigenvalues as a
+//                std::vector<real_t> on each rank; we cudaMemcpy them
+//                to the replicated W buffer.
 //
-// Row-major vs column-major: JAX stores arrays row-major; SLATE's internal
-// layout is column-major but its fromDevices() takes local data as-is and
-// the caller promises the tiles are consistent.  For a Hermitian A,
-// transposition is a no-op (A = A^H), so handing SLATE the row-major JAX
-// buffer yields the same eigenvalues.  Eigenvectors come back in a basis
-// that's a unitary permutation of the input basis — consistent across
-// ranks, which is what downstream JAX code needs.
-//
-// Data overwriting: slate::heev overwrites A with its Householder
-// reduction intermediates.  The caller (Python side) must not rely on A
-// surviving the call; we treat A as an XLA input buffer which XLA may
-// recycle anyway.
+// Input preservation: slate::heev overwrites its input with Householder
+// reduction intermediates, but A is an XLA *input* buffer and must not
+// be mutated (XLA may share it with other consumers).  We copy the
+// local shard into the Q output buffer and let SLATE destroy that copy;
+// the eigenvector tiles are then written over it after heev returns.
 
 #include <complex>
 #include <cstdint>
@@ -107,8 +104,30 @@ static ffi::Error EighImpl(
         return ffi::Error(ffi::ErrorCode::kFailedPrecondition, os.str());
     }
     const int num_devices = 1;
-    T* A_ptrs[1] = { d_A_local };
-    T* Q_ptrs[1] = { d_Q_local };
+
+    // Copy the input shard into the Q output buffer: heev destroys its
+    // input during the Householder reduction, and XLA input buffers
+    // must never be mutated.  The Q buffer doubles as the scratch — the
+    // eigenvector tiles overwrite it after heev returns.
+    const int64_t local_rows = (n + p - 1) / p;
+    const int64_t local_cols = (n + q - 1) / q;
+    ce = cudaMemcpyAsync(d_Q_local, d_A_local,
+                         local_rows * local_cols * sizeof(T),
+                         cudaMemcpyDeviceToDevice, xla_stream);
+    if (ce != cudaSuccess) {
+        std::ostringstream os;
+        os << "slate.eigh: cudaMemcpyAsync(A -> scratch) failed: "
+           << cudaGetErrorString(ce);
+        return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+    }
+    ce = cudaStreamSynchronize(xla_stream);
+    if (ce != cudaSuccess) {
+        std::ostringstream os;
+        os << "slate.eigh: cudaStreamSynchronize after A copy failed: "
+           << cudaGetErrorString(ce);
+        return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+    }
+    T* A_ptrs[1] = { d_Q_local };
 
     // Build the distributed matrices over ctx->comm.  Lower triangular
     // storage — SLATE only supports Uplo::Lower for heev.
@@ -135,14 +154,25 @@ static ffi::Error EighImpl(
             sl::heev(A, Lambda, Z, opts);
 
             // Copy local tile data back to d_Q_local (col-major within
-            // the tile, matching what JAX interprets as row-major of
-            // Q^T).  At most one local tile per rank with our nb=n/p,
-            // though we loop to stay correct for smaller nb.
+            // the tile; the Python wrapper local-transposes back).  At
+            // most one local tile per rank with our nb=n/p, though we
+            // loop to stay correct for smaller nb.
+            //
+            // tileGetForReading is REQUIRED before touching tile data:
+            // heev's back-transformation (unmtr_hb2st / unmtr_he2hb via
+            // redistribute) can leave the valid copy of a tile on the
+            // HOST, with the device instance stale.  Reading Z(ti, tj,
+            // dev) directly returned the pre-back-transform bytes —
+            // the "eigvec layout artifact" was stale MOSI state, not a
+            // layout transform.
             cudaStream_t stream = xla_stream;
             for (int64_t ti = 0; ti < Z.mt(); ++ti) {
                 for (int64_t tj = 0; tj < Z.nt(); ++tj) {
                     if (!Z.tileIsLocal(ti, tj)) continue;
-                    auto tile = Z(ti, tj, Z.tileDevice(ti, tj));
+                    const int dev = Z.tileDevice(ti, tj);
+                    Z.tileGetForReading(ti, tj, dev,
+                                        sl::LayoutConvert::ColMajor);
+                    auto tile = Z(ti, tj, dev);
                     const T* src = tile.data();
                     const int64_t mb = tile.mb();
                     const int64_t nb_t = tile.nb();
@@ -166,6 +196,15 @@ static ffi::Error EighImpl(
                         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
                     }
                 }
+            }
+            // The 2-D memcpys read SLATE-owned tile memory that Z's
+            // destructor frees on scope exit — sync before Z dies.
+            ce = cudaStreamSynchronize(stream);
+            if (ce != cudaSuccess) {
+                std::ostringstream os;
+                os << "slate.eigh: cudaStreamSynchronize after Z copy "
+                   << "failed: " << cudaGetErrorString(ce);
+                return ffi::Error(ffi::ErrorCode::kInternal, os.str());
             }
         } else {
             sl::heev(A, Lambda, opts);

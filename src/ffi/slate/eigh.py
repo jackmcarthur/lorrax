@@ -1,7 +1,16 @@
 """``distributed_eigh`` — JAX FFI wrapper around ``slate::heev``.
 
 Shape contract mirrors ``ffi.cusolvermp.distributed_eigh`` so call sites
-can swap backends with a one-line import change.
+can swap backends with a one-line import change — with one upgrade: the
+returned ``Q`` here is the TRUE eigenvector matrix (columns are
+eigenvectors of A, ``A @ Q == Q @ diag(W)``), not the conj-transposed
+raw buffer the cusolvermp wrapper returns.
+
+Layout: same scheme as ``distributed_cholesky`` — per-rank local
+transpose on the input (row-major JAX shard → col-major bytes for
+SLATE) paired with the C++ comm rank-remap, and a local untranspose on
+the returned eigenvector tiles.  See ``cholesky.py`` and
+``src/ffi/slate/README.md``.
 """
 from __future__ import annotations
 
@@ -14,7 +23,8 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
 
 from ..common.ffi_loader import get_lib
-from .context import get_or_init_context, validate_mesh
+from .context import (get_or_init_context, validate_mesh,
+                      validate_tile_layout)
 
 __all__ = ["distributed_eigh"]
 
@@ -43,11 +53,13 @@ def distributed_eigh(
         If False, only eigenvalues are meaningful; ``Q`` is still returned
         but its contents are unspecified.
     block_size
-        Override SLATE's tile size ``nb``.  Default ``n/p`` (one tile per
-        rank = JAX's block sharding matches SLATE's tile grid exactly,
-        eigenvectors come out in-place).  Smaller ``nb`` increases
-        panel-factor parallelism at the cost of more MPI traffic; 256 is a
-        common A100 default for large ``n``.
+        Override SLATE's tile size ``nb``.  Default ``n/p``, which is the
+        ONLY value for which JAX's block sharding coincides with SLATE's
+        block-cyclic tile grid on a multi-rank mesh — overriding it there
+        makes SLATE assemble a permuted global matrix (eigenvalues survive
+        the symmetric permutation; eigenvectors do not).  Overriding is
+        therefore rejected on multi-rank meshes; on a 1×1 mesh any ``nb``
+        is layout-safe.
 
     Returns
     -------
@@ -55,7 +67,9 @@ def distributed_eigh(
         ``(n,)`` real eigenvalues, ascending, replicated.  Dtype is the
         real-part of A's dtype (``float64`` for both F64 and C128).
     Q
-        ``(n, n)`` eigenvectors, same dtype as A, sharded ``P('x','y')``.
+        ``(n, n)`` eigenvectors of A (as columns), same dtype as A,
+        sharded ``P('x','y')``.  ``A @ Q == Q @ diag(W)`` to machine
+        precision.
     """
     if A.ndim != 2 or A.shape[0] != A.shape[1]:
         raise ValueError(f"distributed_eigh: expected a square matrix, "
@@ -70,6 +84,7 @@ def distributed_eigh(
     ctx_handle = get_or_init_context(mesh)
 
     nb = n // p if block_size is None else int(block_size)
+    validate_tile_layout(n, nb, p, q, what="distributed_eigh")
 
     local_rows = n // p
     local_cols = n // q
@@ -77,7 +92,10 @@ def distributed_eigh(
     w_dtype = jnp.float64 if A.dtype in (jnp.complex128, jnp.float64) \
               else jnp.float32
     W_local = jax.ShapeDtypeStruct((n,), w_dtype)               # replicated
-    Q_local = jax.ShapeDtypeStruct((local_rows, local_cols), A.dtype)
+    # Q comes back as SLATE col-major tiles = row-major bytes of the
+    # per-rank block of Q^T; assembled at P('y','x') then locally
+    # untransposed (square mesh: local shape is (n/q, n/p)).
+    Q_local_T = jax.ShapeDtypeStruct((local_cols, local_rows), A.dtype)
 
     attrs = dict(
         n=n, nb=nb,
@@ -88,11 +106,22 @@ def distributed_eigh(
     @partial(shard_map,
              mesh=mesh,
              in_specs=P("x", "y"),
-             out_specs=(P(), P("x", "y")),
+             out_specs=(P(), P("y", "x")),
              check_rep=False)
     def _call(local_A):
+        # Local transpose: row-major shard bytes → col-major block, the
+        # layout SLATE reads (pure local op, pairs with the C++ comm
+        # rank-remap).  Same convention as distributed_cholesky.
+        local_A_T = jnp.transpose(local_A, (1, 0))
         return jax.ffi.ffi_call(
-            _FFI_TARGET, (W_local, Q_local))(local_A, **attrs)
+            _FFI_TARGET, (W_local, Q_local_T))(local_A_T, **attrs)
 
-    W, Q = _call(A)
-    return W, Q
+    W, Q_T = _call(A)
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=P("y", "x"), out_specs=P("x", "y"),
+             check_rep=False)
+    def _untranspose(local_Q_T):
+        return jnp.transpose(local_Q_T, (1, 0))
+
+    return W, _untranspose(Q_T)
