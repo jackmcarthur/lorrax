@@ -1,7 +1,40 @@
+"""GWJAX — the LORRAX GW driver.
+
+``main()`` is the physics scaffold.  Each line below is one stage call
+in this file, in execution order:
+
+    ζ, V, ψ         = prepare_isdf_and_wavefunctions(...)  # ISDF basis + bare Coulomb   (gw_init)
+    quad            = build_static_quadrature(E_nk)        # minimax τ-axis, solved on
+                                                           #   G's spectral range        (minimax_screening)
+    {W(ω)}          = compute_screening(ψ, V, requests)    # χ₀(G(τ)) → per-q Dyson
+                                                           #   solves, one W per (ω,
+                                                           #   role) the Σ scheme asks   (screening)
+    Σ_xc(ω), V_H    = compute_sigma_xc(ψ, V, {W})          # Σ_x ⊕ Σ_c [PPM fit +
+                                                           #   4-branch τ-integration]
+                                                           #   ⊕ q→0 head channel        (sigma_dispatch)
+    Σ_total         = solve_qp(Σ) | run_sc_driver(...)     # update_H per qp_solver      (qsgw_utils, sc_iteration)
+    E_qp, U_qp      = eigh(kin_ion + Σ_total)              # + degenerate-set averaging  (degen_average)
+    eqp0/eqp1/σ.dat = write_results(...)                   # writers, debug tables       (gw_output)
+
+Two orthogonal config axes pivot the flow: ``compute_mode`` — the
+self-energy ansatz (``x_only`` / ``cohsex`` / ``gn_ppm`` / ``hl_ppm``) —
+and ``qp_solver`` — how QP energies are extracted from Σ
+(``one_shot_dft`` / ``fixed_point`` / ``self_consistent``).  The
+self-consistent path iterates the same ``compute_sigma_xc`` dispatch;
+iteration 1 reproduces the one-shot result exactly (gated by
+``tests/test_invariance_gates.py::test_sc_iteration1_equals_one_shot``).
+
+Deliberate physics absences (do not "fix" these): G(τ) is never
+materialized — it exists only as ψψ*-phases inside the χ₀/Σ kernels;
+the q→0 Coulomb head is a scalar channel threaded through every stage,
+not a stage; W is evaluated at exactly the two frequencies {0, iω_p} a
+one-pole model is determined by.  See ``docs/theory/physics.md``.
+"""
 from runtime import set_default_env
 set_default_env()  # BEFORE `import jax` — JAX reads env at import time.
 
 import argparse
+import gc
 import os
 
 import numpy as np
@@ -14,24 +47,23 @@ from runtime import init_jax_distributed, fallback_to_cpu_if_no_gpu_backend
 init_jax_distributed()
 fallback_to_cpu_if_no_gpu_backend()
 
-# Back-compat shim: a few sandbox scripts import this name.  Prefer
-# ``runtime.init_jax_distributed`` in new code.
-_maybe_init_jax_distributed = init_jax_distributed
 from file_io import (
     WFNReader,
     load_kin_ion_submatrix, load_centroids,
 )
-from common import symmetry_maps
+from common import Meta, RYD_TO_EV, symmetry_maps
 from common.wfn_transforms import get_enk_bandrange
+import common.timing as timing
 from .gw_config import ComputeMode, LorraxConfig, QPSolver
 from .gw_init import prepare_isdf_and_wavefunctions
 from .compute_vcoul import build_bgw_v_grid_fn
 from .minimax_screening import build_static_quadrature
 from .screening import compute_screening, screening_requests_for
 from .sigma_dispatch import compute_sigma_xc
-from .qsgw_utils import (
-	extract_sigma_diag_replicated,
-	solve_qp,
+from .qsgw_utils import extract_sigma_diag_replicated, solve_qp
+from .degen_average import (
+	average_sigma_components,
+	average_within_degenerate_sets,
 )
 from .head_correction import (
 	HeadResolver,
@@ -40,14 +72,15 @@ from .head_correction import (
 	format_static_head_diagnostics,
 )
 from .wavefunction_bundle import BandSlices
-from common import Meta, RYD_TO_EV
-import common.timing as timing
-
-
-
-# ================= ISDF sigma =================
-#
-# Static COHSEX kernels (Σ_SX, Σ_COH, V_H) live in cohsex_sigma.py.
+from .gw_output import (
+	GWResults,
+	persist_w0_and_head,
+	print_banner,
+	print_system_summary,
+	write_freq_debug,
+	write_qp_wfn_oneshot,
+	write_results,
+)
 
 
 def _build_mesh():
@@ -106,7 +139,11 @@ def _setup_runtime(config, mesh_xy, *, print_fn=print) -> None:
 
 
 def _compute_static_head(head_resolver, meta, do_screened, print0):
-	"""Resolve q→0 head and compute exact band-diagonal head terms for COHSEX."""
+	"""Resolve the q→0 head sample and its exact band-diagonal Σ terms.
+
+	Used by every mode: the bare-X head piece applies to static and
+	dynamic Σ alike (the SX/COH pieces additionally apply when screened).
+	"""
 	head = head_resolver.at(0.0 + 0.0j)
 	print0(format_head_sample_diagnostics(head, include_screened=do_screened))
 	occ_mask = np.arange(meta.nb_sigma, dtype=np.int32) < meta.nelec
@@ -117,7 +154,9 @@ def _compute_static_head(head_resolver, meta, do_screened, print0):
 
 
 def main(argv=None):
-	argp = argparse.ArgumentParser(description="COHSEX self-energy driver")
+	argp = argparse.ArgumentParser(
+		description="LORRAX GW driver — COHSEX / GN-PPM / HL-PPM self-energy, "
+		            "one-shot or self-consistent (see gw_config.ComputeMode / QPSolver)")
 	argp.add_argument(
 		"-i",
 		"--input",
@@ -135,52 +174,41 @@ def main(argv=None):
 			k.setdefault("flush", True)
 			print(*a, **k)
 
-	# ========================================================================
-	# CONFIGURATION
-	# ========================================================================
+	# ---- Configuration ----
+	# The two orthogonal physics axes are resolved + validated up front so
+	# inconsistent (qp_solver × compute_mode × accumulation) combinations
+	# fail before any heavy compute (see ``LorraxConfig.qp_solver``).
 	config = LorraxConfig.from_input_file(args.input, print_fn=print0)
 	input_dir = config.input_dir
-	# Resolve + validate the QP-energy axis up front so inconsistent
-	# (qp_solver × compute_mode × accumulation) combinations fail before
-	# any heavy compute (see ``LorraxConfig.qp_solver``).
-	qp_solver = config.qp_solver
+	qp_solver = config.qp_solver     # how QP energies are extracted from Σ
+	mode = config.compute_mode       # the self-energy ansatz
+	do_screened = mode is not ComputeMode.X_ONLY
 
-	# ========================================================================
-	# INITIALIZATION
-	# ========================================================================
-	current_backend = jax.default_backend()
-	n_devices = len(jax.devices())
-	n_procs = jax.process_count()
-	device_names = jax.devices()[0].device_kind if n_devices > 0 else "unknown"
-
+	# ---- Runtime initialization: device mesh, NCCL/MPI/compile-cache ----
 	mesh_xy = _build_mesh()
-	grid_x, grid_y = mesh_xy.devices.shape
-
 	_setup_runtime(config, mesh_xy, print_fn=print0)
-
-	from .gw_output import (
-		GWResults, persist_w0_and_head, print_banner,
-		print_system_summary, write_freq_debug, write_qp_wfn_oneshot,
-		write_results,
-	)
 	print_banner(
-		backend=current_backend, n_devices=n_devices,
-		grid_x=grid_x, grid_y=grid_y, n_procs=n_procs,
-		device_kind=device_names, print_fn=print0,
+		backend=jax.default_backend(),
+		n_devices=len(jax.devices()),
+		grid_x=mesh_xy.devices.shape[0], grid_y=mesh_xy.devices.shape[1],
+		n_procs=jax.process_count(),
+		device_kind=jax.devices()[0].device_kind if jax.devices() else "unknown",
+		print_fn=print0,
 	)
 
+	# ---- System inputs: WFN, symmetry tables, ISDF centroids ----
 	wfn = WFNReader(config.paths.wfn_file, mesh=mesh_xy)
 	sym = symmetry_maps.SymMaps(wfn)
-	_, centroid_indices, _n_rmu = load_centroids(config.paths.centroids_file, wfn.fft_grid)
+	_, centroid_indices, n_rmu = load_centroids(config.paths.centroids_file, wfn.fft_grid)
 	tmp_dir = os.path.join(input_dir, "tmp")
 	os.makedirs(tmp_dir, exist_ok=True)
-	tensors_filename = os.path.join(tmp_dir, f"isdf_tensors_{_n_rmu}.h5")
+	tensors_filename = os.path.join(tmp_dir, f"isdf_tensors_{n_rmu}.h5")
 	print_system_summary(
-		n_rmu=_n_rmu, fft_grid=wfn.fft_grid,
+		n_rmu=n_rmu, fft_grid=wfn.fft_grid,
 		cell_volume=wfn.cell_volume, print_fn=print0,
 	)
 
-	meta = Meta.from_system(wfn, sym, config.nval, config.ncond, config.nband, _n_rmu, config.bispinor)
+	meta = Meta.from_system(wfn, sym, config.nval, config.ncond, config.nband, n_rmu, config.bispinor)
 	meta.rank = jax.process_index()
 	meta.n_proc = jax.process_count()
 	meta.sys_dim = config.sys_dim
@@ -231,13 +259,9 @@ def main(argv=None):
 		if wfns_transverse is not None else None
 	)
 
-	# --- Screening: χ₀ → W = (1 − Vχ)⁻¹ V at every ω the Σ scheme needs ---
-	# ``compute_mode`` is the single axis describing the self-energy ansatz
-	# (X_ONLY / COHSEX / GN_PPM / HL_PPM); ``qp_solver`` (how QP energies
-	# are extracted from Σ) is orthogonal.  X_ONLY needs no screening.
+	# ---- Screening: χ₀ → W = (1 − Vχ)⁻¹ V at every ω the Σ scheme needs ----
+	# X_ONLY requests no screening at all.
 	V_q = V_qmunu               # flat-q (nq, μ, μ) — compute and restart alike
-	mode = config.compute_mode
-	do_screened = mode is not ComputeMode.X_ONLY
 	quad, e_ref = None, None
 	if do_screened:
 		# The minimax τ-axis, solved on G's actual spectral range — shared
@@ -289,7 +313,7 @@ def main(argv=None):
 	# 2026-04-25 after being removed in 1542342 (Apr-10).  Magnitude is
 	# ±W^c(0)/(2·V_cell·N_k) on-shell — ~1.24 eV/band on Si 4×4×4 60b.
 	# See reports/mos2_kgrid_gnppm_head_convergence_2026-4-10/.
-	import gc; gc.collect()
+	gc.collect()   # drop ISDF-stage temporaries before the Σ build
 	sigma_result = None
 	if qp_solver is not QPSolver.SELF_CONSISTENT:
 		with timing.section("gw_jax.sigma"):
@@ -313,7 +337,6 @@ def main(argv=None):
 		# unless disabled — without it, the QE basis-dependent splitting
 		# within degenerate manifolds shows up as a few-meV spread across
 		# symmetry-equivalent bands.
-		from .degen_average import average_within_degenerate_sets
 		sig_x_diag = np.real(np.diagonal(
 			np.asarray(sigma_result.sigma_x_kij_ry),
 			axis1=1, axis2=2)) * RYD_TO_EV
@@ -402,7 +425,6 @@ def main(argv=None):
 	# ---- BGW-style degenerate-set averaging at the H-build seam ----
 	# (mirrors Sigma/shiftenergy.f90; see ``degen_average``).
 	if not config.no_degen_averaging:
-		from .degen_average import average_sigma_components
 		(sigma_total, sig_sx, sig_coh, sig_h, sig_x,
 		 sigma_c_at_dft_ev) = average_sigma_components(
 			sigma_total, sig_sx, sig_coh, sig_h, sig_x, sigma_c_at_dft_ev,
@@ -492,7 +514,7 @@ def main(argv=None):
 			kirr_to_kfull=np.array(sym.kirr_fullids, dtype=np.int32),
 			print_fn=print0,
 		)
-	if jax.process_index() == 0:
+	if meta.rank == 0:
 		timing.report(print_fn=print0, title="--- Timing ---")
 
 	return 0
