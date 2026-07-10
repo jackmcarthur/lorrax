@@ -21,6 +21,10 @@ import math
 import numpy as np
 import pytest
 
+# Memory-planner tooling; the GPU cuFFT probes skip inside the Shifter
+# container anyway — staged behind the `extra` marker (run with `-m extra`).
+pytestmark = pytest.mark.extra
+
 import jax
 import jax.numpy as jnp
 

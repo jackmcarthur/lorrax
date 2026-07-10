@@ -167,7 +167,7 @@ def test_compute_all_V_q_g_flat_matches_einsum_reference(
 def test_compute_all_V_q_g_flat_rejects_r_space_loader(
         tmp_path, single_device_mesh):
     """r-space file → orchestrator raises a clear error."""
-    from tests.test_zeta_loader import _build_zeta_h5
+    from tests.test_zeta_reader import _build_zeta_h5_rspace as _build_zeta_h5
     out = _build_zeta_h5(tmp_path, n_q_disk=2)
     with ZetaLoader(out, mesh=single_device_mesh) as loader:
         with pytest.raises(ValueError, match="layout must be 'G_flat'"):

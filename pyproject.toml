@@ -59,9 +59,14 @@ members = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 norecursedirs = ["archive"]
+# `extra` (tooling / experimental / out-of-repo-fixture suites) is
+# deselected by default; run them with `-m extra` (an explicit -m on the
+# command line overrides this addopts default).
+addopts = "-m 'not extra'"
 markers = [
     "regression: end-to-end physics regression tests with reference files",
     "gpu: tests that require a CUDA-capable JAX backend",
+    "extra: staged/tooling suites deselected by default (run with -m extra)",
 ]
 
 [dependency-groups]

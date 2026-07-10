@@ -7,6 +7,10 @@ from pathlib import Path
 import jax
 import pytest
 
+# Perf-pattern check (all-to-all emission), skipped on the container JAX
+# anyway — behind the `extra` marker (run with `-m extra`).
+pytestmark = pytest.mark.extra
+
 
 def _jit_supports_decorator_factory() -> bool:
     """Detect whether ``jax.jit`` supports the no-``fun`` decorator-factory

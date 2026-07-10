@@ -32,6 +32,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+# Depends on out-of-repo CrI3 fixtures (runs/ WFN + reports npz) and
+# skips where absent — behind the `extra` marker (run with `-m extra`).
+pytestmark = pytest.mark.extra
+
 
 # Skip cleanly when the fixture isn't reachable (CI / minimal sandbox).
 _FIXTURE_PATH = Path(

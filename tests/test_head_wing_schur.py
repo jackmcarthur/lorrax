@@ -17,6 +17,11 @@ via JAX's `_USE_PJIT_PARTITIONER` simulating the mesh on one device.
 """
 from __future__ import annotations
 
+import pytest
+
+# gw/experimental module — staged behind the `extra` marker (deselected
+# by default; run with `-m extra`) until head_wing_schur is promoted.
+pytestmark = pytest.mark.extra
 import os
 import sys
 

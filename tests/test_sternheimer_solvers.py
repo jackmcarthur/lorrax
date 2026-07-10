@@ -16,6 +16,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+# Sternheimer/W0 solver tooling (psp/orbital-mag program), not the GW
+# pipeline — staged behind the `extra` marker (deselected by default;
+# run with `-m extra`).
+pytestmark = pytest.mark.extra
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Helpers
