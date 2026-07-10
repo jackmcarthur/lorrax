@@ -1,26 +1,18 @@
-"""Σ_PPM tightening program — WS0 keystone gates (G1, G2).
+"""Σ_PPM WS0 keystone gate G2 — per-branch / per-window reference tiles.
 
-These are the tests the consensus_draft (reports/sigma_ppm_tighten_2026-07-04)
-requires to exist *before* any behaviour-adjacent Σ_PPM change lands.  G3 (the
-head negative-branch regression) lives in ``tests/test_head_correction.py``.
+G2 is the bit-identity pin the WS3 file split (moving _SigmaWindow /
+_SigmaBranch / _iter_branches / _build_*_sigma_windows /
+_build_windows_for_branch into ppm_windows.py) must stay identical
+against.  Also guards against a split silently dropping a branch (all 4
+branches × their windows asserted non-empty).
 
-  G1  kij ↔ kij_stream accumulator parity.  GREEN since WS1 — it is the gate
-      that detected Bug B (the streamed path dropped the analytic q→0 head,
-      ppm_pipeline.py _inject_analytic_head).  WS1's fix RMW-adds the head
-      into the streamed sigma_kij h5, so the two accumulation paths now agree
-      to ~1e-12.  G1's *absence* is why Bug B survived: no golden gate ever
-      exercised the stream path (the small fixtures auto-select KIJ_HOST).
-
-  G2  per-branch / per-window reference tiles.  GREEN — the bit-identity pin
-      the WS3 file split (moving _SigmaWindow / _SigmaBranch / _iter_branches /
-      _build_*_sigma_windows / _build_windows_for_branch into ppm_windows.py)
-      must stay identical against.  Also guards against a split silently
-      dropping a branch (all 4 branches × their windows asserted non-empty).
+G1 (kij ↔ kij_stream accumulator parity — the gate that detected Bug B,
+the streamed path dropping the analytic q→0 head) lives in
+``tests/test_invariance_gates.py::test_kij_stream_parity`` as a cheap
+from-restart Tier-2 variant.  G3 (the head negative-branch regression)
+lives in ``tests/test_head_correction.py``.
 """
 
-import os
-import re
-import shutil
 import sys
 from pathlib import Path
 
@@ -30,16 +22,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _REG = REPO_ROOT / "tests" / "regression"
 
-# Reuse the e2e subprocess runner + GPU gating from the regression harness so
-# G1 drives gw.gw_jax exactly the way the golden gates do.  (tests/ is a
-# package, so put its dir on sys.path for a bare sibling import under any
-# pytest import mode.)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_gw_jax_regression import (          # noqa: E402
-    _gpu_available,
-    _requested_platform,
-    _run_gw_jax,
-)
+from harness import gpu_available, requested_platform  # noqa: E402
 
 
 # ===========================================================================
@@ -152,7 +136,7 @@ def _regenerate_g2_reference():
 
 @pytest.mark.regression
 def test_g2_branch_window_tiles_are_frozen():
-    if _requested_platform() in {"gpu", "cuda"} and not _gpu_available():
+    if requested_platform() in {"gpu", "cuda"} and not gpu_available():
         pytest.skip("CUDA GPU not available for requested platform=gpu.")
 
     branches, flat = _build_branch_windows()
@@ -189,113 +173,3 @@ def test_g2_branch_window_tiles_are_frozen():
             assert np.array_equal(got, want), f"{key} tag mismatch: {got} != {want}"
         else:
             np.testing.assert_array_equal(got, want, err_msg=f"{key} not bit-identical")
-
-
-# ===========================================================================
-#  G1 — kij ↔ kij_stream accumulator parity (GREEN since WS1 — detects Bug B)
-# ===========================================================================
-#
-# The streamed accumulator writes a head-less Σ_c (Bug B: _inject_analytic_head
-# early-returned (None, None) when sigma_c_omega is None, so the analytic q→0
-# head was never RMW-added into the sigma_c_kij h5).  The host path injects the
-# head into the in-memory tensor.  Both write ``sigma_c_kij_ev`` into
-# sigma_mnk.h5, so comparing those two datasets isolates the dropped head.
-#
-# CONFIRMED RED DIFF before WS1 (MoS2 3×3 gnppm fixture, 1 GPU):
-#   max|Δ sigma_c_kij_ev|          = 4.13 eV
-#   max|Δ| on the band DIAGONAL    = 4.13 eV       (bands 24-31, near VBM/nval=26)
-#   max|Δ| OFF the band diagonal   = 7.0e-10 eV    (numerical noise)
-# i.e. the entire discrepancy sat on the band-diagonal head-affected bands —
-# the analytic q→0 head, which is diagonal in band and dropped by the stream
-# path — NOT a random accumulator disagreement.  WS1's fix (RMW-add the head
-# into the stream h5) makes the two paths agree to ~1e-12.
-#
-# NB two precursors had to be handled for the stream path to even RUN to the
-# point where Bug B is observable, both folded into WS1's scope:
-#   * ppm_sigma.py fillvalue=0.0 on a complex128 dataset crashes h5py>=3.13
-#     ("no appropriate function for conversion path") — see KNOWN_SANDBOX_ERRORS;
-#   * sigma_freq_debug_output feeds the None sigma_c_omega into the eqp
-#     z-factor writer (gw_jax.py:860) and crashes, so this gate disables it.
-
-G1_CASE = _REG / "gnppm_debug"
-_ACCUM_LINE = "sigma_omega_accumulation = "
-
-
-def _write_g1_input(dst_dir: Path, *, accumulation: str, kij_h5: str | None) -> str:
-    """Copy the gnppm fixture input, forcing the accumulation mode.
-
-    Disables sigma_freq_debug_output/sigma_debug_split_contrib (their None-Σ_c
-    handling is a separate Bug-B sibling that crashes the stream path before
-    the h5 is comparable) so both modes run to a written sigma_mnk.h5.
-    """
-    src = (G1_CASE / "gnppm_test.in").read_text()
-    lines = []
-    for ln in src.splitlines():
-        if ln.startswith("sigma_freq_debug_output"):
-            ln = "sigma_freq_debug_output = false"
-        elif ln.startswith("sigma_debug_split_contrib"):
-            ln = "sigma_debug_split_contrib = false"
-        elif ln.startswith("sigma_omega_h5_file"):
-            lines.append(f"sigma_omega_accumulation = {accumulation}")
-            if kij_h5 is not None:
-                lines.append(f"sigma_kij_h5_file = {kij_h5}")
-        lines.append(ln)
-    name = f"gnppm_{accumulation}.in"
-    (dst_dir / name).write_text("\n".join(lines) + "\n")
-    return name
-
-
-def _run_mode(tmp_path, platform, tag, *, accumulation, kij_h5):
-    run_dir = tmp_path / tag
-    shutil.copytree(
-        G1_CASE, run_dir,
-        ignore=shutil.ignore_patterns("tmp", "*.dat", "sigma_mnk.h5", "*_qp.h5"))
-    input_name = _write_g1_input(run_dir, accumulation=accumulation, kij_h5=kij_h5)
-    res = _run_gw_jax(run_dir, input_name, platform)
-    if res.returncode != 0:
-        pytest.fail(
-            f"G1 {tag} run failed.\nstdout:\n{res.stdout}\nstderr:\n{res.stderr}")
-    return run_dir
-
-
-def _read_sigma_c_kij_ev(sigma_mnk_path: Path) -> np.ndarray:
-    import h5py
-    with h5py.File(sigma_mnk_path, "r") as h5:
-        return np.asarray(h5["sigma_c_kij_ev"], dtype=np.complex128)
-
-
-@pytest.mark.regression
-def test_g1_kij_vs_kij_stream_parity(tmp_path):
-    platform = _requested_platform()
-    if platform in {"gpu", "cuda"} and not _gpu_available():
-        pytest.skip("CUDA GPU not available for requested platform=gpu.")
-
-    host_dir = _run_mode(tmp_path, platform, "kij",
-                         accumulation="kij", kij_h5=None)
-    stream_dir = _run_mode(tmp_path, platform, "kij_stream",
-                           accumulation="kij_stream", kij_h5="sigma_kij_stream.h5")
-
-    sig_host = _read_sigma_c_kij_ev(host_dir / "sigma_mnk.h5")
-    sig_stream = _read_sigma_c_kij_ev(stream_dir / "sigma_mnk.h5")
-    assert sig_host.shape == sig_stream.shape, (sig_host.shape, sig_stream.shape)
-
-    # The kij (host) path injects the analytic q→0 head; before WS1 the stream
-    # path dropped it (Bug B) and this failed by ~4.13 eV on the band-diagonal
-    # near-gap bands (24-31).  WS1 RMW-adds the identical head into the stream
-    # h5, so the band-diagonal head is gone.
-    #
-    # Post-WS4 (K2 accumulator unification) both accumulation modes share the
-    # ONE numpy ω-projector (_project_tau_onto_omega_np) and the same async-D2H
-    # accumulator; the streamed path differs only in where the finished-window
-    # host tiles land (h5 RMW vs an in-memory Σ tensor).  The old dual-projector
-    # (numpy-vs-jitted) ULP floor that forced atol=1e-8 in WS1 is GONE — a
-    # ~2000x tightening.
-    #
-    # The residual floor is now a single ULP of the largest matrix element: the
-    # two modes sum cond+val over windows in different associations (host folds
-    # (Σ_cond)+(Σ_val) per ω-half; the stream running-sums each window into the
-    # h5 dataset via read-modify-write), so on the ~1.5e4 eV off-diagonals they
-    # can differ in the last bit (measured: 1/2.36M elements, 1.8e-12 abs,
-    # 1.1e-16 rel).  atol=5e-12 clears that ULP floor with margin while still
-    # catching a dropped head (4.13 eV) or any real regression by ~1e12x.
-    np.testing.assert_allclose(sig_stream, sig_host, rtol=0.0, atol=5e-12)
