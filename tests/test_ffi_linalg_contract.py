@@ -628,7 +628,7 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 
 @needs_ffi
-def test_factor_c_q_slate_matches_reference():
+def test_factor_c_q_slate_matches_reference(mesh11):
     """factor_c_q(solver_kind='slate_cholesky') returns a conventional L
     equal to the numpy Cholesky (1×1 mesh), so downstream solve_zeta's
     triangular-solve branch consumes it unchanged."""
@@ -637,7 +637,7 @@ def test_factor_c_q_slate_matches_reference():
     from jax.sharding import NamedSharding, PartitionSpec as P
     from isdf.core import factor_c_q, _resolve_solver_kind_charge
 
-    mesh = _mesh_1x1()
+    mesh = mesh11
     assert _resolve_solver_kind_charge(mesh, "slate") == "slate_cholesky"
 
     rng = np.random.default_rng(7)
@@ -657,8 +657,8 @@ def test_factor_c_q_slate_matches_reference():
 
 
 @needs_ffi
-def test_resolver_never_auto_picks_slate():
+def test_resolver_never_auto_picks_slate(mesh11):
     from isdf.core import _resolve_solver_kind_charge
-    mesh = _mesh_1x1()
+    mesh = mesh11
     assert _resolve_solver_kind_charge(mesh, "auto") != "slate_cholesky"
     assert _resolve_solver_kind_charge(mesh, "off") == "sharded_cholesky"

@@ -871,7 +871,19 @@ def _resolve_solver_kind_charge(mesh_xy: Mesh, override: str = "auto") -> str:
     if override in ('on', 'cusolvermp'):
         return 'cusolvermp_cholesky' if is_2d else 'sharded_cholesky'
     if override == 'slate':
-        _require_slate_ffi()
+        # SLATE is an OPTIONAL dependency; nothing imports it unless the
+        # input file explicitly selects it — and then absence fails loudly.
+        try:
+            from ffi.common.ffi_loader import get_lib
+            get_lib()
+            from ffi.slate import distributed_cholesky  # noqa: F401
+        except Exception as exc:
+            raise RuntimeError(
+                "distributed_cholesky=slate requested but the SLATE FFI is "
+                f"unavailable ({exc}).  Build it with "
+                "src/ffi/slate/scripts/build_perlmutter.sh + "
+                "src/ffi/common/cpp/build.sh, or use "
+                "distributed_cholesky = auto|off|cusolvermp.") from exc
         if px == 1 and py > 1:
             raise ValueError(
                 f"distributed_cholesky=slate: 1×{py} meshes hit a SLATE "
@@ -882,25 +894,6 @@ def _resolve_solver_kind_charge(mesh_xy: Mesh, override: str = "auto") -> str:
     # auto (or unrecognised) → default policy.
     return 'cusolvermp_cholesky' if is_2d else 'sharded_cholesky'
 
-
-def _require_slate_ffi() -> None:
-    """Raise with an actionable message unless the SLATE FFI is loadable.
-
-    SLATE is an OPTIONAL dependency: nothing imports it unless the input
-    file explicitly selects ``distributed_cholesky = slate``.
-    """
-    try:
-        from ffi.common.ffi_loader import get_lib
-        get_lib()
-        from ffi.slate import distributed_cholesky  # noqa: F401
-    except Exception as exc:
-        raise RuntimeError(
-            "distributed_cholesky=slate requested but the SLATE FFI is "
-            f"unavailable ({exc}).  Build it with "
-            "src/ffi/slate/scripts/build_perlmutter.sh + "
-            "src/ffi/common/cpp/build.sh, or use "
-            "distributed_cholesky = auto|off|cusolvermp."
-        ) from exc
 
 
 def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto") -> str:

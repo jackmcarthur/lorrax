@@ -1242,23 +1242,20 @@ class LorraxConfig:
         # Distributed-linalg axes.  Legacy ``cusolvermp_charge`` /
         # ``cusolvermp_lu`` (auto|on|off; deprecation-warned at parse)
         # are honored only when the portable key is left at "auto".
-        _LEGACY_LINALG = {"auto": "auto", "on": "cusolvermp", "off": "off"}
+        def _legacy_linalg(key):
+            val = str(_g(key)).strip().lower()
+            mapped = {"auto": "auto", "on": "cusolvermp", "off": "off"}.get(val)
+            if mapped is None:
+                raise ValueError(
+                    f"{key}={val!r} invalid; expected auto/on/off.")
+            return mapped
+
         _dist_chol = str(_g("distributed_cholesky")).strip().lower()
         _dist_lu = str(_g("distributed_lu")).strip().lower()
-        for _legacy_key, _cur in (
-            ("cusolvermp_charge", _dist_chol),
-            ("cusolvermp_lu", _dist_lu),
-        ):
-            _legacy_val = str(_g(_legacy_key)).strip().lower()
-            _mapped = _LEGACY_LINALG.get(_legacy_val)
-            if _mapped is None:
-                raise ValueError(
-                    f"{_legacy_key}={_legacy_val!r} invalid; expected auto/on/off.")
-            if _cur == "auto" and _mapped != "auto":
-                if _legacy_key == "cusolvermp_charge":
-                    _dist_chol = _mapped
-                else:
-                    _dist_lu = _mapped
+        if _dist_chol == "auto":
+            _dist_chol = _legacy_linalg("cusolvermp_charge")
+        if _dist_lu == "auto":
+            _dist_lu = _legacy_linalg("cusolvermp_lu")
         if _dist_chol not in ("auto", "off", "cusolvermp", "slate"):
             raise ValueError(
                 f"distributed_cholesky={_dist_chol!r} invalid; expected "
