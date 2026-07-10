@@ -14,6 +14,15 @@ cuBLASMp, SLATE, NCCL, MPI) is absent — ``_ffi_skip_reason`` probes by
 actually loading the library.  Nothing here may fail on a machine
 without the FFI stack.
 
+Host platform: the slate ops also have CPU-backend handlers
+(``liblorrax_ffi_host.so``, registered under platform="cpu" — see
+src/ffi/slate/cpp/host_ffi.cc).  The ``*_cpu`` tests run the SAME check
+bodies on a 1x1 mesh of CPU devices in this very process (works on GPU
+nodes too: ``jax.ffi.ffi_call`` picks the handler by lowering platform)
+and skip cleanly when the host library is absent.  Multi-rank CPU
+meshes: run the CLI mode under ``JAX_PLATFORMS=cpu`` (non-slate cells
+are skipped there; ``--only slate`` narrows the log to the same set).
+
 Multi-rank findings this file pins (see
 reports/slate_linalg_ffi_2026-07-10/report.md for the full matrix):
 
@@ -48,13 +57,20 @@ if __name__ == "__main__":
     os.environ.setdefault("JAX_ENABLE_X64", "1")
     os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
     if int(os.environ.get("SLURM_NTASKS", "1")) > 1:
+        # Platform must be EXPLICIT here: get_lib(None) asks
+        # jax.default_backend(), which would initialize XLA before
+        # jax.distributed.initialize.
+        _plat = "CUDA" if "cuda" in os.environ["JAX_PLATFORMS"] else "cpu"
         try:
             from ffi.common.ffi_loader import get_lib as _get_lib
-            _get_lib().lrx_slate_init_mpi()
+            _get_lib(_plat).lrx_slate_init_mpi()
         except Exception as _exc:
             print(f"slate_init_mpi skipped: {_exc}", flush=True)
         import jax
-        jax.distributed.initialize(local_device_ids=[0])
+        if _plat == "CUDA":
+            jax.distributed.initialize(local_device_ids=[0])
+        else:
+            jax.distributed.initialize()
 
 # ---------------------------------------------------------------------------
 # Availability probes (module import must stay cheap + exception-free).
@@ -78,20 +94,51 @@ def _ffi_skip_reason():
         return "contract tests are single-process (use the CLI mode)"
     try:
         from ffi.common.ffi_loader import get_lib
-        get_lib()
+        get_lib("CUDA")
     except Exception as exc:
         return f"liblorrax_ffi.so unavailable: {exc}"
+    return None
+
+
+def _host_ffi_skip_reason():
+    """Return None if liblorrax_ffi_host.so loads, else the skip reason.
+
+    The host library is CUDA-free (slate + MPI only), so this probe
+    passes on CPU-only machines where ``_ffi_skip_reason`` skips.
+    """
+    try:
+        import jax
+        jax.devices("cpu")
+    except Exception as exc:
+        return f"jax cpu backend unavailable: {exc}"
+    if jax.process_count() != 1:
+        return "contract tests are single-process (use the CLI mode)"
+    try:
+        from ffi.common.ffi_loader import get_lib
+        get_lib("cpu")
+    except Exception as exc:
+        return f"liblorrax_ffi_host.so unavailable: {exc}"
     return None
 
 
 _SKIP = _ffi_skip_reason()
 needs_ffi = pytest.mark.skipif(_SKIP is not None, reason=_SKIP or "")
 
+_HOST_SKIP = _host_ffi_skip_reason()
+needs_host_ffi = pytest.mark.skipif(_HOST_SKIP is not None,
+                                    reason=_HOST_SKIP or "")
+
 
 def _mesh_1x1():
     import jax
     from jax.sharding import Mesh
     return Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+
+
+def _mesh_cpu_1x1():
+    import jax
+    from jax.sharding import Mesh
+    return Mesh(np.asarray(jax.devices("cpu")[:1]).reshape(1, 1), ("x", "y"))
 
 
 def _mesh_from_arg(spec):
@@ -538,6 +585,41 @@ def test_slate_tile_layout_validation():
 
 
 # ---------------------------------------------------------------------------
+# Host platform (JAX CPU backend) — the same slate check bodies on a 1x1
+# mesh of CPU devices, exercising liblorrax_ffi_host.so's handlers
+# (fromScaLAPACK + Target::HostTask) through the unchanged Python wrappers.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def mesh_cpu11():
+    return _mesh_cpu_1x1()
+
+
+@needs_host_ffi
+@pytest.mark.parametrize("dtype", ["complex128", "float64"])
+def test_slate_cholesky_trsm_cpu(mesh_cpu11, dtype):
+    check_slate_chol_trsm(mesh_cpu11, dtype)
+
+
+@needs_host_ffi
+@pytest.mark.parametrize("m", [16, 48])
+def test_slate_trsm_rectangular_rhs_cpu(mesh_cpu11, m):
+    check_slate_chol_trsm(mesh_cpu11, "complex128", n=32, m=m)
+
+
+@needs_host_ffi
+def test_slate_batched_cholesky_trsm_cpu(mesh_cpu11):
+    check_slate_batched(mesh_cpu11, "complex128")
+
+
+@needs_host_ffi
+@pytest.mark.parametrize("dtype", ["complex128", "float64"])
+def test_slate_eigh_true_eigenvectors_cpu(mesh_cpu11, dtype):
+    check_slate_eigh(mesh_cpu11, dtype)
+
+
+# ---------------------------------------------------------------------------
 # CLI mode — the multi-rank matrix.  Same checks on a PxQ process mesh.
 # ---------------------------------------------------------------------------
 
@@ -584,10 +666,16 @@ def _cli_main():
     mesh = _mesh_from_arg(args.mesh)
     px = int(mesh.shape["x"])
     py = int(mesh.shape["y"])
+    is_cpu = jax.default_backend() == "cpu"
 
     failures = 0
     for name, needs_square, fn in _CLI_CELLS:
         if args.only and args.only not in name:
+            continue
+        if is_cpu and not name.startswith("slate"):
+            if jax.process_index() == 0:
+                print(f"SKIP {name}[{args.mesh}] (CUDA-only backend)",
+                      flush=True)
             continue
         for dt in ("complex128", "float64"):
             tag = f"{name}[{args.mesh},{dt}]"

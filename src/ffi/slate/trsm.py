@@ -24,9 +24,8 @@ import jax.numpy as jnp
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
 
-from ..common.ffi_loader import get_lib
 from .cholesky import SlateLowerL
-from .context import (get_or_init_context, validate_mesh,
+from .context import (ensure_registered, get_or_init_context, validate_mesh,
                       validate_tile_layout as _validate_tile_layout)
 
 __all__ = ["distributed_trsm"]
@@ -108,7 +107,7 @@ def distributed_trsm(
             f"B.shape={tuple(B.shape)} must be divisible by the mesh axes "
             f"({p},{q}) along (rows, cols)")
 
-    get_lib()
+    ensure_registered(mesh)
     ctx_handle = get_or_init_context(mesh)
     nb = n // max(p, q) if block_size is None else int(block_size)
     _validate_tile_layout(n, nb, p, q, what="distributed_trsm")

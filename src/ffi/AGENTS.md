@@ -45,14 +45,20 @@ ffi/
 ├── PORTING.md           per-cluster + MPI stack notes, known issues
 ├── TEMPLATE.md          skeleton for a new target
 ├── common/
-│   ├── ffi_loader.py    ctypes-loads liblorrax_ffi.so, registers handlers
+│   ├── ffi_loader.py    ctypes-loads the per-platform .so's, registers
+│   │                    handlers (CUDA → liblorrax_ffi.so; cpu →
+│   │                    liblorrax_ffi_host.so; same target names, jaxlib-style)
 │   ├── broadcast.py     JAX-KV-store broadcast helpers
 │   └── cpp/
 │       ├── CMakeLists.txt   single build producing liblorrax_ffi.so
 │       ├── build.sh         invokes cmake + make inside Shifter
 │       ├── run_shifter.sh   Shifter launcher + MPI stack switch
 │       ├── ffi_helpers.h    LORRAX_*_CHECK + FFI_RETURN_IF_ERROR
-│       └── api.cc           extern "C" ABI for ctypes
+│       ├── api.cc           extern "C" ABI for ctypes
+│       └── host/            CUDA-free liblorrax_ffi_host.so (slate host
+│           │                handlers; JAX CPU backend)
+│           ├── CMakeLists.txt
+│           └── build_host.sh    host-side Cray PE build (no container)
 ├── cusolvermp/
 │   ├── {__init__,context,eigh}.py     public API + NCCL bootstrap + shard_map
 │   ├── scripts/stage_nvhpc.sh         copy cuSOLVERMp/libcal to /pscratch

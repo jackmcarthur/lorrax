@@ -1299,12 +1299,16 @@ class LorraxConfig:
                         "the system's parallel HDF5 to get PHDF5_HOST."
                     )
                     _slab_io_choice = SlabIOBackend.H5PY_ALLGATHER
-            if _dist_chol != "off":
+            if _dist_chol not in ("off", "slate"):
+                # slate passes through: it has a host-platform FFI
+                # (liblorrax_ffi_host.so, Target::HostTask) and keeps the
+                # explicit-request-fails-loudly semantics on CPU too.
                 print_fn(
                     f"  [config] distributed_cholesky={_dist_chol} "
-                    "requested but JAX backend is CPU; the cuSOLVERMp and "
-                    "SLATE FFIs are CUDA-only today.  Forcing 'off' "
-                    "(in-tree sharded_cholesky)."
+                    "requested but JAX backend is CPU; cuSOLVERMp is "
+                    "CUDA-only and auto never picks SLATE.  Forcing 'off' "
+                    "(in-tree sharded_cholesky).  SLATE's host FFI is "
+                    "available via explicit distributed_cholesky = slate."
                 )
                 _dist_chol = "off"
             if _dist_lu != "off":

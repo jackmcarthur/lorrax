@@ -898,7 +898,8 @@ def _require_slate_ffi() -> None:
             "distributed_cholesky=slate requested but the SLATE FFI is "
             f"unavailable ({exc}).  Build it with "
             "src/ffi/slate/scripts/build_perlmutter.sh + "
-            "src/ffi/common/cpp/build.sh, or use "
+            "src/ffi/common/cpp/build.sh (CUDA) or "
+            "src/ffi/common/cpp/host/build_host.sh (CPU backend), or use "
             "distributed_cholesky = auto|off|cusolvermp."
         ) from exc
 

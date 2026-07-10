@@ -36,6 +36,7 @@ from jax.sharding import Mesh
 from ..common import ffi_loader
 
 __all__ = [
+    "ensure_registered",
     "get_or_init_context",
     "get_or_init_subrow_context",
     "validate_mesh",
@@ -47,6 +48,18 @@ MeshKey = Tuple[int, int]  # (p, q)
 _LOCK = threading.Lock()
 _CACHE: Dict[MeshKey, int] = {}
 _SUBROW_CACHE: Dict[MeshKey, int] = {}
+
+
+def ensure_registered(mesh: Mesh) -> None:
+    """Load + register the FFI library for the MESH's device platform.
+
+    ``jax.ffi.ffi_call`` resolves the target registered for the lowering
+    platform, so the library that matters is the one matching the mesh's
+    devices — not necessarily the default backend (e.g. slate ops on a
+    CPU-device mesh inside a GPU-backend process).  Idempotent.
+    """
+    plat = mesh.devices.flat[0].platform
+    ffi_loader.get_lib("CUDA" if plat in ("gpu", "cuda") else "cpu")
 
 
 def validate_mesh(mesh: Mesh, *, require_square: bool = False) -> Tuple[int, int]:
@@ -123,7 +136,7 @@ def validate_tile_layout(n: int, nb: int, p: int, q: int, *, what: str,
 
 
 def _make_ctx(mesh: Mesh) -> int:
-    ffi_loader.get_lib()
+    ensure_registered(mesh)
     rank  = int(jax.process_index())
     world = int(jax.process_count())
     p, q  = validate_mesh(mesh)
@@ -147,7 +160,7 @@ def get_or_init_context(mesh: Mesh) -> int:
 
 
 def _make_subrow_ctx(mesh: Mesh) -> int:
-    ffi_loader.get_lib()
+    ensure_registered(mesh)
     rank  = int(jax.process_index())
     world = int(jax.process_count())
     Px, Py = validate_mesh(mesh)

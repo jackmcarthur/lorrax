@@ -41,9 +41,8 @@ import jax.numpy as jnp
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
 
-from ..common.ffi_loader import get_lib
-from .context import (get_or_init_subrow_context, validate_mesh,
-                      validate_tile_layout)
+from .context import (ensure_registered, get_or_init_subrow_context,
+                      validate_mesh, validate_tile_layout)
 
 __all__ = [
     "SlateBatchedLowerL",
@@ -125,7 +124,7 @@ def batched_distributed_cholesky(
             f"batched_distributed_cholesky: N={n} must be divisible by "
             f"mesh 'y' axis size {Py}.")
 
-    get_lib()
+    ensure_registered(mesh)
     ctx_handle = get_or_init_subrow_context(mesh)
 
     nb_batch_local = nbatch // Px
@@ -244,7 +243,7 @@ def batched_distributed_trsm(
         raise ValueError(
             f"N={n}, M={m} must be divisible by mesh 'y' axis {Py}.")
 
-    get_lib()
+    ensure_registered(mesh)
     ctx_handle = get_or_init_subrow_context(mesh)
     nbatch_local = nbatch // Px
     nb = n // Py if block_size is None else int(block_size)
