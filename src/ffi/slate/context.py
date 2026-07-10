@@ -39,6 +39,7 @@ __all__ = [
     "get_or_init_context",
     "get_or_init_subrow_context",
     "validate_mesh",
+    "validate_tile_layout",
 ]
 
 MeshKey = Tuple[int, int]  # (p, q)
@@ -69,6 +70,56 @@ def validate_mesh(mesh: Mesh, *, require_square: bool = False) -> Tuple[int, int
         raise ValueError(
             f"slate FFI: this op requires a square mesh (p == q); got {p}x{q}.")
     return p, q
+
+
+def validate_tile_layout(n: int, nb: int, p: int, q: int, *, what: str,
+                         allow_row_grid: bool = False) -> None:
+    """Reject (n, nb, p, q) combos where JAX block shards ≠ SLATE tiles.
+
+    ``fromDevices`` interprets each rank's buffer as 2-D block-cyclic
+    tiles of size ``nb``; JAX hands the FFI a CONTIGUOUS (n/p, n/q)
+    block.  The two coincide only when every multi-proc mesh axis holds
+    exactly one tile per rank (``nb == n/axis``); a single-proc axis is
+    layout-free (all tiles local, contiguous col-major).  Violations
+    don't fail loudly — SLATE silently assembles a permuted global
+    matrix (or throws an uncatchable ``blas::Error`` from an OpenMP task,
+    killing every rank) — so they must be rejected here.
+
+    ``p == 1 < q`` grids additionally trip a size-dependent SLATE
+    assertion (``internal_batch.hh:290: group.ld[m] == Mij.stride()``,
+    SIGABRT on every rank): the local buffer stride is ``lld = n`` while
+    tiles are ``nb = n/q``, and SLATE's device-region batching requires
+    uniform strides within a group.  ``p >= q`` meshes have
+    ``lld == nb`` and are safe.  Reproduced 2026-07-10 on 1x4 potrf
+    (n=64, c128) with the eval build @ ded15290.  ``allow_row_grid``
+    opts the batched wrappers out of this check: their per-slice (1, Py)
+    sub-grid is the same stride class but is production-validated at
+    GWJAX scale on 2x2 — the assert there is size-dependent (the
+    README's nbatch=8/n=128 1x4 repro) and remains an accepted risk
+    documented in README.md.
+    """
+    if p > 1 and q > 1 and p != q:
+        raise ValueError(
+            f"{what}: mesh {p}x{q} unsupported — with both axes > 1 the "
+            f"square SLATE tile size cannot give one tile per rank on "
+            f"both axes unless p == q.  Use a square or Nx1 mesh.")
+    if p == 1 and q > 1 and not allow_row_grid:
+        raise ValueError(
+            f"{what}: mesh {p}x{q} unsupported — on a 1xq grid the local "
+            f"stride (lld = n) differs from the tile size (nb = n/q) and "
+            f"SLATE's device-region batching aborts every rank with the "
+            f"internal_batch.hh:290 stride assertion.  Use the "
+            f"transposed (qx1) mesh instead.")
+    if p > 1 and nb != n // p:
+        raise ValueError(
+            f"{what}: block_size={nb} != n/p={n // p} on a {p}x{q} mesh — "
+            f"JAX's block sharding only matches SLATE's block-cyclic "
+            f"layout at one tile per rank.  Omit block_size.")
+    if q > 1 and nb != n // q:
+        raise ValueError(
+            f"{what}: block_size={nb} != n/q={n // q} on a {p}x{q} mesh — "
+            f"JAX's block sharding only matches SLATE's block-cyclic "
+            f"layout at one tile per rank.  Omit block_size.")
 
 
 def _make_ctx(mesh: Mesh) -> int:

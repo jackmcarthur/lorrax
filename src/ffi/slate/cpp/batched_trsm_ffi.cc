@@ -133,9 +133,16 @@ static ffi::Error BatchedTrsmImpl(
             uplo, diag, n,
             A_ptrs, num_devices, lld_A, nb, p, q, ctx->comm);
 
+        // X tile sizes: rows conform with A's tiles (p=1 makes any row
+        // tiling layout-consistent); the column tile must be one per
+        // rank when q > 1 so SLATE's block-cyclic assignment matches
+        // JAX's contiguous block shards.  A square-nb X here silently
+        // corrupted (or crashed) any Nrhs != N solve — same defect as
+        // the single-matrix trsm.
+        const int64_t nb_X = (q == 1) ? nb : B_cols / q;
         sl::Matrix<T> X = sl::Matrix<T>::fromDevices(
             B_rows, B_cols,
-            X_ptrs, num_devices, lld_B, nb, p, q, ctx->comm);
+            X_ptrs, num_devices, lld_B, nb, nb_X, p, q, ctx->comm);
 
         auto Aop = (op == sl::Op::Trans)     ? transpose(A)
                  : (op == sl::Op::ConjTrans) ? conj_transpose(A)

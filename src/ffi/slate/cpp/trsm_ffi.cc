@@ -63,17 +63,19 @@ static ffi::Error TrsmImpl(
 
     const int p = ctx->p;
     const int q = ctx->q;
+
+    sl::Side side = (side_int == 1) ? sl::Side::Right : sl::Side::Left;
+
     // A is n×n; its local leading dim:
     const int64_t lld_A = (n + p - 1) / p;
-    // B/X: m rows by n cols (for side == Left, A is n×n and B is n×m —
-    // but we adopt the Right-side (X * A = alpha * B) convention-free
-    // shape by passing B's rows and cols separately).  Here we use
-    // B.shape = (m, n) for side==Right and (n, m) for side==Left; we
-    // just handle side=Left for now (most common in GW).
-    const int64_t lld_B = (n + p - 1) / p;
+    // B/X shape: (n, m) for side==Left (op(A) X = alpha B), (m, n) for
+    // side==Right (X op(A) = alpha B).
+    const int64_t X_rows = (side == sl::Side::Left) ? n : m;
+    const int64_t X_cols = (side == sl::Side::Left) ? m : n;
+    const int64_t lld_B = (X_rows + p - 1) / p;
     // Count how many elements of B/X are local to this rank.
-    const int64_t local_rows = (n + p - 1) / p;
-    const int64_t local_cols = (m + q - 1) / q;
+    const int64_t local_rows = (X_rows + p - 1) / p;
+    const int64_t local_cols = (X_cols + q - 1) / q;
     ce = cudaMemcpyAsync(d_X_out, d_B_in,
                          local_rows * local_cols * sizeof(T),
                          cudaMemcpyDeviceToDevice, xla_stream);
@@ -98,7 +100,6 @@ static ffi::Error TrsmImpl(
 
     sl::Uplo uplo = (uplo_int == 1) ? sl::Uplo::Upper : sl::Uplo::Lower;
     sl::Diag diag = (diag_int == 1) ? sl::Diag::Unit  : sl::Diag::NonUnit;
-    sl::Side side = (side_int == 1) ? sl::Side::Right : sl::Side::Left;
     sl::Op   op   = (op_int == 2)   ? sl::Op::ConjTrans
                   : (op_int == 1)   ? sl::Op::Trans
                   :                   sl::Op::NoTrans;
@@ -107,11 +108,25 @@ static ffi::Error TrsmImpl(
         uplo, diag, n,
         A_ptrs, num_devices, lld_A, nb, p, q, ctx->comm);
 
-    // X is general m×n (rows=n, cols=m for side=Left).
-    const int64_t X_rows = (side == sl::Side::Left) ? n : m;
-    const int64_t X_cols = (side == sl::Side::Left) ? m : n;
+    // X tile sizes: along the solve dimension X's tiles must conform
+    // with A's (= nb); along the free dimension the tile size must make
+    // SLATE's block-cyclic assignment coincide with JAX's contiguous
+    // block shards — one tile per rank when that mesh axis is >1 (a
+    // square-nb X here was the m != n crash/corruption: tile (i,j) of a
+    // 64×32 X with nb=32 on a 2×2 grid lands on ranks that hold no X
+    // data at all).  With one proc on the axis any tile size is
+    // layout-consistent (all tiles local, contiguous col-major).
+    int64_t mb_X, nb_X;
+    if (side == sl::Side::Left) {           // X is n × m
+        mb_X = nb;
+        nb_X = (q == 1) ? nb : X_cols / q;
+    } else {                                // X is m × n
+        mb_X = (p == 1) ? nb : X_rows / p;
+        nb_X = nb;
+    }
     sl::Matrix<T> X = sl::Matrix<T>::fromDevices(
-        X_rows, X_cols, X_ptrs, num_devices, lld_B, nb, p, q, ctx->comm);
+        X_rows, X_cols, X_ptrs, num_devices, lld_B, mb_X, nb_X,
+        p, q, ctx->comm);
 
     // Apply op() to A via SLATE's in-matrix transform (no data movement).
     auto Aop = (op == sl::Op::Trans)     ? transpose(A)

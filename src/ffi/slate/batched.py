@@ -42,7 +42,8 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
 
 from ..common.ffi_loader import get_lib
-from .context import get_or_init_subrow_context, validate_mesh
+from .context import (get_or_init_subrow_context, validate_mesh,
+                      validate_tile_layout)
 
 __all__ = [
     "SlateBatchedLowerL",
@@ -129,6 +130,9 @@ def batched_distributed_cholesky(
 
     nb_batch_local = nbatch // Px
     nb = n // Py if block_size is None else int(block_size)
+    # Per-slice SLATE grid is (1, Py) on the sub-row comm.
+    validate_tile_layout(n, nb, 1, Py, what="batched_distributed_cholesky",
+                         allow_row_grid=True)
 
     key = ("potrf", _mesh_key(mesh), A.dtype,
            nbatch, n, nb, int(ctx_handle))
@@ -244,6 +248,8 @@ def batched_distributed_trsm(
     ctx_handle = get_or_init_subrow_context(mesh)
     nbatch_local = nbatch // Px
     nb = n // Py if block_size is None else int(block_size)
+    validate_tile_layout(n, nb, 1, Py, what="batched_distributed_trsm",
+                         allow_row_grid=True)
 
     alpha_c = complex(alpha)
     key = ("trsm", _mesh_key(mesh), B.dtype, A_is_handle,

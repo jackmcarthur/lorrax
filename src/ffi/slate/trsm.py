@@ -26,7 +26,8 @@ from jax.sharding import Mesh, PartitionSpec as P
 
 from ..common.ffi_loader import get_lib
 from .cholesky import SlateLowerL
-from .context import get_or_init_context, validate_mesh
+from .context import (get_or_init_context, validate_mesh,
+                      validate_tile_layout as _validate_tile_layout)
 
 __all__ = ["distributed_trsm"]
 
@@ -99,13 +100,18 @@ def distributed_trsm(
             raise ValueError(
                 f"side='R' requires B.shape[1]==n={n}; got B.shape={B.shape}")
         m = int(B.shape[0])
-    if n % p != 0 or m % q != 0:
+    # B is sharded P('x','y'): axis 0 over p, axis 1 over q — for BOTH
+    # sides (the old per-side (n % p, m % q) check validated the wrong
+    # axes for side='R').
+    if int(B.shape[0]) % p != 0 or int(B.shape[1]) % q != 0:
         raise ValueError(
-            f"n={n}, m={m} must be divisible by mesh axes ({p},{q})")
+            f"B.shape={tuple(B.shape)} must be divisible by the mesh axes "
+            f"({p},{q}) along (rows, cols)")
 
     get_lib()
     ctx_handle = get_or_init_context(mesh)
     nb = n // max(p, q) if block_size is None else int(block_size)
+    _validate_tile_layout(n, nb, p, q, what="distributed_trsm")
 
     # Local transpose of B: each rank flips its (B0/p, B1/q) row-major
     # shard to (B1/q, B0/p) row-major (= original block in col-major

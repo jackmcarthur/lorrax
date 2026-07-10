@@ -30,7 +30,8 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec as P
 
 from ..common.ffi_loader import get_lib
-from .context import get_or_init_context, validate_mesh
+from .context import (get_or_init_context, validate_mesh,
+                      validate_tile_layout)
 
 __all__ = ["SlateLowerL", "distributed_cholesky"]
 
@@ -94,6 +95,7 @@ def distributed_cholesky(
     # Default tile size divides by the larger grid axis so each rank
     # still holds >=1 tile along both directions.
     nb = n // max(p, q) if block_size is None else int(block_size)
+    validate_tile_layout(n, nb, p, q, what="distributed_cholesky")
 
     # Local transpose via shard_map: each rank flips its own (n/p, n/q)
     # row-major shard to (n/q, n/p) row-major.  Bytes are the same set
