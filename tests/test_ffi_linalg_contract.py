@@ -717,8 +717,7 @@ if __name__ == "__main__":
 # (factor_c_q wiring; see isdf.core._resolve_solver_kind_charge)
 # ---------------------------------------------------------------------------
 
-@needs_ffi
-def test_factor_c_q_slate_matches_reference():
+def check_factor_c_q_slate(mesh):
     """factor_c_q(solver_kind='slate_cholesky') returns a conventional L
     equal to the numpy Cholesky (1×1 mesh), so downstream solve_zeta's
     triangular-solve branch consumes it unchanged."""
@@ -727,7 +726,6 @@ def test_factor_c_q_slate_matches_reference():
     from jax.sharding import NamedSharding, PartitionSpec as P
     from isdf.core import factor_c_q, _resolve_solver_kind_charge
 
-    mesh = _mesh_1x1()
     assert _resolve_solver_kind_charge(mesh, "slate") == "slate_cholesky"
 
     rng = np.random.default_rng(7)
@@ -744,6 +742,18 @@ def test_factor_c_q_slate_matches_reference():
     # Determinism: second call bit-identical.
     L2 = np.asarray(factor_c_q(C_dev, mesh, solver_kind="slate_cholesky"))
     assert np.array_equal(L, L2)
+
+
+@needs_ffi
+def test_factor_c_q_slate_matches_reference():
+    check_factor_c_q_slate(_mesh_1x1())
+
+
+@needs_host_ffi
+def test_factor_c_q_slate_matches_reference_cpu():
+    # Same production wiring on a CPU-device mesh — the input-file
+    # ``distributed_cholesky = slate`` path a CPU-backend run takes.
+    check_factor_c_q_slate(_mesh_cpu_1x1())
 
 
 @needs_ffi
