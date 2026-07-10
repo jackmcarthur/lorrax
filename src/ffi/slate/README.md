@@ -146,11 +146,70 @@ of scope; cuSOLVERMp is the answer if you need rectangular meshes.
 - `scripts/stage_cray.sh` — populate `$HOME/software/lorrax_slate_cray/stage`
   with libsci + libmpi_gtl_cuda + xpmem + lustreapi (run once per
   module update).
+- `scripts/build_perlmutter.sh` — reproducible SLATE builds (see below).
 
-Build (login node — doesn't need an allocation):
+## Building
+
+### 1. SLATE itself (host-side, Cray PE — not in the container)
+
+```
+bash src/ffi/slate/scripts/build_perlmutter.sh gpu    # gpu_backend=cuda
+bash src/ffi/slate/scripts/build_perlmutter.sh cpu    # gpu_backend=none
+```
+
+Idempotent; installs under `$HOME/software/slate_builds/{gpu,cpu}/install`
+from a source checkout pinned at `v2025.05.28-1` (override:
+`LORRAX_SLATE_COMMIT`).  Module stacks (script-loaded, per NERSC docs):
+GPU = `PrgEnv-gnu cray-libsci cmake cudatoolkit craype-accel-nvidia80`;
+CPU = same minus the CUDA pair (explicitly unloaded — with
+`craype-accel-nvidia80` loaded the CC wrapper links `libmpi_gtl_cuda`,
+whose `libcuda.so.1` driver dependency is a portability landmine).
+The script's comments explain every non-obvious flag, especially
+`-DSCALAPACK_LIBRARIES=""` (ScaLAPACK lives *inside* wrapper-linked
+libsci; empty string keeps the tester's reference checks without a bogus
+`-lscalapack`).  If the login node is loaded, run it through the
+allocation: `srun --jobid=$SLURM_JOBID --overlap -N1 -n1 -c 48 bash
+src/ffi/slate/scripts/build_perlmutter.sh gpu`.
+
+**Which build where**: GPU nodes use `gpu/`; CPU nodes use `cpu/`.
+SLATE's execution target is a *runtime* option, and the cuda build does
+run host-side (`--target t` — verified on both node types; Perlmutter
+CPU nodes happen to ship `libcuda.so.1`), but the `none` build is the
+config that carries to non-NVIDIA machines and never drags CUDA/GTL
+into a CPU-node link.
+
+### 2. The FFI .so (inside the container)
+
 ```
 bash src/ffi/common/cpp/run_shifter.sh bash src/ffi/common/cpp/build.sh
 ```
+
+Login node works when shifter cooperates; otherwise run with
+`SLURM_JOBID` set to go through a compute node.  To build against a
+non-default SLATE without touching the in-tree `build/` (which other
+sessions may be using):
+
+```
+export LORRAX_SLATE_INSTALL_DIR=$HOME/software/slate_builds/gpu/install
+export LORRAX_FFI_BUILD_DIR=$HOME/software/slate_builds/ffi_build_gpu
+bash src/ffi/common/cpp/run_shifter.sh bash src/ffi/common/cpp/build.sh
+# then at run time:
+export LORRAX_FFI_SO=$LORRAX_FFI_BUILD_DIR/liblorrax_ffi.so   # loader override
+export LORRAX_SLATE_INSTALL_DIR=...                            # LDLIB override
+```
+
+### CPU story (status)
+
+The SLATE *library* is CPU-ready (the `cpu` build passes potrf/trsm/heev
+on Milan nodes at machine precision).  The FFI layer is **GPU-only**:
+every handler binds `PlatformStream<cudaStream_t>`, stages with
+`cudaMemcpyAsync`, builds matrices via `fromDevices()`, hardcodes
+`Target::Devices`, and `ffi_loader.py` registers `platform="CUDA"` only —
+and `liblorrax_ffi.so` hard-links cuSOLVERMp/NCCL/cudart.  A CPU port
+needs host handler variants (`fromScaLAPACK` + `Target::HostTask`,
+plain `memcpy`, no stream ctx), a CUDA-free .so target, and per-platform
+registration (`platform="Host"`).  See
+`reports/slate_linalg_ffi_2026-07-10/report.md` (P2) for the estimate.
 
 Tests under `src/common/slate_*_test.py` and `slate_*_bench.py`; run
 via `lxrun` (inside an `lxalloc`-created allocation).

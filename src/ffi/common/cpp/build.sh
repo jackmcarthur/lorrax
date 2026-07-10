@@ -15,7 +15,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="${SCRIPT_DIR}/build"
+# LORRAX_FFI_BUILD_DIR: alternate build dir (default: in-tree build/).
+# Useful for building against a different SLATE install without racing a
+# concurrently-used in-tree .so; point LORRAX_FFI_SO at the result.
+BUILD_DIR="${LORRAX_FFI_BUILD_DIR:-${SCRIPT_DIR}/build}"
 
 # Default HPC SDK install (a staged subset; see AGENTS.md).  The staged
 # tree is bind-mounted into Shifter at this path.  Override by setting
