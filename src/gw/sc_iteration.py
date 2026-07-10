@@ -658,6 +658,163 @@ def _maybe_dump_e_history(
     )
 
 
+def run_sc_driver(
+    wfns,
+    V_q: jax.Array,
+    kin_ion: jax.Array,
+    *,
+    quad,
+    e_ref: float,
+    static_head_terms,
+    head_resolver,
+    config,
+    meta,
+    mesh_xy: Mesh,
+    sym,
+    wfn,
+    centroid_indices,
+    band_slices: BandSlices,
+    input_dir: str,
+    enk_dft,
+    print_fn: Callable = print,
+) -> tuple[SigmaResult, jax.Array, list[float]]:
+    """Self-consistent QSGW, driver-facing: DFT inputs in, DFT-basis Σ out.
+
+    Wraps the whole SC machinery — band partition (protected / in-range /
+    scissored, from the ω-grid window), :class:`SCInputs` assembly,
+    :func:`run_self_consistency`, the post-SC artifact dumps (WFN_qp.h5 /
+    qp_wfn_rotations.h5 / converged sigma_mnk.h5) — and returns exactly
+    what the driver's post-Σ seam consumes:
+
+    Returns
+    -------
+    sigma_result : SigmaResult
+        The LAST iteration's Σ, **rotated back to the DFT basis** with
+        the basis-of-record U (``state.last_sigma_basis_U`` — the
+        unitary that defined the basis the last ``compute_sigma_xc``
+        call ran in; the converged U is one iteration ahead and agrees
+        only at the fixed point — see test_sc_oneshot_equivalence).
+        ``sigma_omega_h5_path`` points at the converged single-write
+        sigma_mnk.h5; ``efermi_dft_ev`` is filled for every mode.
+    sigma_total : (nk, nb, nb) Ry
+        Σ_xc + V_H in the DFT basis — the eigh operand
+        ``H_QP = kin_ion + sigma_total``.
+    rms_history : list[float]
+        RMS ΔE (eV) per iteration.
+    """
+    import dataclasses
+
+    from .band_partition import BandPartition
+    from .scissor import classify_bands_in_grid
+
+    e_dft_active_kn_ry = jnp.asarray(np.asarray(enk_dft, dtype=np.float64))
+    nb_active = e_dft_active_kn_ry.shape[1]
+    val_mask_active = jnp.broadcast_to(
+        jnp.arange(nb_active) < int(meta.nelec),
+        e_dft_active_kn_ry.shape)
+
+    # In-range mask: bands whose E_DFT lies inside [σ_ω_min, σ_ω_max]
+    # at *every* k.  Bands outside the ω-grid get the per-iteration
+    # scissor (otherwise their Σ_c is clamped at the grid edge → the
+    # QSGW H-build feeds garbage diagonals that explode the iteration).
+    efermi_ev = float(wfn.efermi) * RYD_TO_EV
+    omega_min_ev = float(config.ppm.omega_min_ev) + efermi_ev
+    omega_max_ev = float(config.ppm.omega_max_ev) + efermi_ev
+    e_dft_ev = np.asarray(enk_dft, dtype=np.float64) * RYD_TO_EV
+    band_in_grid, _ = classify_bands_in_grid(
+        e_dft_ev, omega_min_ev, omega_max_ev)
+    in_range = jnp.asarray(band_in_grid, dtype=bool)
+    # Default protected = in-range: these bands carry full off-diag Σ.
+    # Out-of-range bands take the scissor, no off-diag mixing.
+    print_fn(
+        f"  SC partition: protected/in-range = {int(band_in_grid.sum())}"
+        f"/{int(band_in_grid.size)} bands"
+    )
+    partition = BandPartition(
+        protected_mask=in_range, in_range_mask=in_range)
+    partition.warn_if_protected_outside_grid(print_fn=print_fn)
+
+    inputs = SCInputs(
+        wfns_dft=wfns, V_q=V_q, kin_ion_dft=kin_ion,
+        quad=quad, e_ref=e_ref,
+        static_head_terms=static_head_terms,
+        head_resolver=head_resolver,
+        config=config, meta=meta, mesh_xy=mesh_xy,
+        sym=sym, wfn=wfn, centroid_indices=centroid_indices,
+        band_slices=band_slices, input_dir=input_dir,
+        partition=partition,
+        e_dft_active_kn_ry=e_dft_active_kn_ry,
+        valence_mask_active_kn=val_mask_active,
+        print_fn=print_fn,
+    )
+    state_init = make_initial_state_from_dft(inputs)
+    # Loop knobs from ``config.sc`` (the LORRAX_SC_* env vars are
+    # deprecated overrides, applied at config construction).
+    sc = config.sc
+    print_fn(f"  SC: mode={config.compute_mode.value}, max_iter={sc.max_iter}, "
+             f"tol={sc.tol_ev:.1e} eV, accel={sc.accelerator}"
+             + (f", depth={sc.history_depth}" if sc.accelerator == "rcrop"
+                else f", α={sc.mixing:.2f}"))
+    state_final, rms_history = run_self_consistency(
+        state_init, inputs,
+        max_iter=sc.max_iter, tol_ev=sc.tol_ev,
+        accelerator=sc.accelerator,
+        history_depth=sc.history_depth,
+        mixing=sc.mixing,
+    )
+    sigma_result = state_final.last_sigma_result
+    print_fn(
+        f"  SC done: {len(rms_history)} iterations"
+        + (f", final RMS ΔE = {rms_history[-1]:.4e} eV"
+            if rms_history else " (one-shot)"))
+
+    # Post-SC dumps: WFN_qp.h5 (drop-in BSE / restart input),
+    # qp_wfn_rotations.h5 ((U, E_qp) companion), and the converged
+    # sigma_mnk.h5 (intermediate iterations skipped the H5 write, so
+    # this is the single end-of-run write).  WFN_qp.h5 uses the eigh of
+    # ``state_final.H_qp_dft`` — the converged DFT-basis H — so its
+    # eigenvalues + U are the *true* QP eigenstates of the SC fixed
+    # point (the driver's post-Σ-seam eigh differs slightly because the
+    # SC carry applies the band partition).
+    if config.debug.write_wfn_h5:
+        dump_qp_wfn_artifacts(
+            state_final, n_occ=int(meta.nelec), mesh_xy=mesh_xy,
+            wfn=wfn, band_slices=band_slices, kgrid=meta.kgrid,
+            output_dir=input_dir, print_fn=print_fn,
+        )
+    sigma_omega_h5_path = dump_sigma_omega_h5_final(
+        state_final, config=config, meta=meta, mesh_xy=mesh_xy,
+        input_dir=input_dir, print_fn=print_fn,
+    )
+
+    # Rotate every QP-basis SigmaResult field back to the DFT basis.
+    # The Σ matrices live in the basis of the wfn bundle the last
+    # ``compute_sigma_xc`` call ran in — the basis DEFINED by
+    # ``state.last_sigma_basis_U``.  Downstream driver code (H build +
+    # eigh, writer, freq_debug) is written for DFT-basis matrices
+    # (kin_ion is DFT basis throughout).
+    U = jnp.asarray(state_final.last_sigma_basis_U)
+    sig_h = _rotate_to_dft_basis(sigma_result.v_h_kij_ry, U)
+    sig_x = _rotate_to_dft_basis(sigma_result.sigma_x_kij_ry, U)
+    sigma_xc_dft = _rotate_to_dft_basis(sigma_result.sigma_xc_kij_ry, U)
+    sigma_total = sigma_xc_dft + sig_h
+    sigma_result_dft = dataclasses.replace(
+        sigma_result,
+        v_h_kij_ry=sig_h,
+        sigma_x_kij_ry=sig_x,
+        sigma_xc_kij_ry=sigma_xc_dft,
+        sigma_sx_kij_ry=(
+            _rotate_to_dft_basis(sigma_result.sigma_sx_kij_ry, U)
+            if sigma_result.sigma_sx_kij_ry is not None else None),
+        sigma_coh_kij_ry=(
+            _rotate_to_dft_basis(sigma_result.sigma_coh_kij_ry, U)
+            if sigma_result.sigma_coh_kij_ry is not None else None),
+        sigma_omega_h5_path=sigma_omega_h5_path,
+        efermi_dft_ev=float(wfn.efermi) * RYD_TO_EV,
+    )
+    return sigma_result_dft, sigma_total, rms_history
+
+
 def final_qp_eigenstates(
     state: SCState, *, n_occ: int, mesh_xy: Mesh,
 ) -> tuple[np.ndarray, np.ndarray, float]:
@@ -789,8 +946,8 @@ __all__ = [
     "gw_iteration_map",
     "make_initial_state_from_dft",
     "run_self_consistency",
+    "run_sc_driver",
     "final_qp_eigenstates",
     "dump_qp_wfn_artifacts",
     "dump_sigma_omega_h5_final",
-    "_rotate_to_dft_basis",       # used by main() to rotate SC SigmaResult fields
 ]

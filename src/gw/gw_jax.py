@@ -18,7 +18,7 @@ fallback_to_cpu_if_no_gpu_backend()
 # ``runtime.init_jax_distributed`` in new code.
 _maybe_init_jax_distributed = init_jax_distributed
 from file_io import (
-    WFNReader, write_sigma_omega_h5,
+    WFNReader,
     load_kin_ion_submatrix, load_centroids,
 )
 from common import symmetry_maps
@@ -326,39 +326,6 @@ def main(argv=None):
 		print0(f"  Bare Σ_X diagonal (eV), k=0: "
 		       + "  ".join(f"{sig_x_diag[0, i]:.4f}" for i in range(min(8, sig_x_diag.shape[1]))))
 
-	# Post-Σ seam: extract every downstream-consumed field into a bare
-	# local, so the writer / freq_debug / QP solve all read uniform names
-	# regardless of whether the data came from the one-shot SigmaResult
-	# above or (below) from a converged SC SigmaResult.  PPM-only fields
-	# are None in static modes.
-	if sigma_result is not None:
-		sig_h   = sigma_result.v_h_kij_ry
-		sig_x   = sigma_result.sigma_x_kij_ry
-		sig_sx  = (sigma_result.sigma_sx_kij_ry
-		           if sigma_result.sigma_sx_kij_ry is not None
-		           else jnp.zeros_like(sig_x))
-		sig_coh = (sigma_result.sigma_coh_kij_ry
-		           if sigma_result.sigma_coh_kij_ry is not None
-		           else jnp.zeros_like(sig_x))
-		sigma_omega_h5_path = sigma_result.sigma_omega_h5_path
-		sigma_c_at_dft_ev   = sigma_result.sigma_c_at_dft_diag_ev
-		omega_dft_rel_ev    = sigma_result.omega_dft_rel_ev
-		efermi_dft_ev       = sigma_result.efermi_dft_ev
-		sigma_c_omega       = sigma_result.sigma_c_omega_kij_ry
-		head_sigma_diag_w_kn_ry = sigma_result.head_sigma_diag_w_kn_ry
-		omega_grid_ev = (
-			np.asarray(sigma_result.omega_grid_ev, dtype=np.float64)
-			if sigma_result.omega_grid_ev is not None else None)
-		omega_grid_ry = (
-			np.asarray(sigma_result.omega_grid_ry, dtype=np.float64)
-			if sigma_result.omega_grid_ry is not None else None)
-		# Σ_xc(E_DFT) diagonal (eV) — drives eqp_g0w0.dat (PPM one-shot
-		# only).  Same spelling as the PPM pipeline's step 4.
-		sigma_xc_at_dft_ev = (
-			np.diagonal(np.asarray(sig_x), axis1=1, axis2=2) * RYD_TO_EV
-			+ sigma_c_at_dft_ev
-			if sigma_c_at_dft_ev is not None else None)
-
 	# ---- QP Hamiltonian: H_QP = (H_DFT - V_xc) + V_H + Σ_xc ----
 	#
 	# Sharding: kin_ion + all four static-COHSEX components (Σ_SX, Σ_COH,
@@ -373,166 +340,64 @@ def main(argv=None):
 		mesh=mesh_xy, backend=config.backend.slab_io,
 	)
 
-	# ---- Mode-pivoted Σ_xc dispatch.  All branches yield ``sigma_total``
-	# replicated on the mesh as Σ_xc + V_H (Ry).
-	sc_rms_history: list[float] = []
+	# ---- update_H[Σ; qp_solver] — all branches yield ``sigma_total``
+	# (Σ_xc + V_H, Ry, DFT basis, replicated) whose eigh gives E_qp/U_qp.
 	if qp_solver is QPSolver.SELF_CONSISTENT:
-		# SC-GW iteration map — mode-agnostic.  Each step rotates ψ via
-		# U_qp from eigh(H_qp_dft), then recomputes χ₀ → W → Σ_xc via
-		# the mode-orthogonal compute_sigma_xc dispatch (X_ONLY / COHSEX
-		# / GN_PPM / HL_PPM all use the same map).  The carry is just
-		# H_qp_dft on the active subspace; convergence is judged on RMS
-		# ΔE between consecutive eigvalsh.
-		from .sc_iteration import (
-			SCInputs, dump_qp_wfn_artifacts, dump_sigma_omega_h5_final,
-			make_initial_state_from_dft, run_self_consistency)
-		from .band_partition import BandPartition
-		from .scissor import classify_bands_in_grid
-
-		_e_dft_active_kn_ry = jnp.asarray(
-			np.asarray(enk_dft, dtype=np.float64))
-		_nb_active = _e_dft_active_kn_ry.shape[1]
-		_val_mask_active = jnp.broadcast_to(
-			jnp.arange(_nb_active) < int(meta.nelec),
-			_e_dft_active_kn_ry.shape)
-
-		# In-range mask: bands whose E_DFT lies inside [σ_ω_min, σ_ω_max]
-		# at *every* k.  Bands outside the ω-grid get the per-iteration
-		# scissor (otherwise their Σ_c is clamped at the grid edge → the
-		# QSGW H-build feeds garbage diagonals that explode the iteration).
-		_efermi_ev = float(wfn.efermi) * RYD_TO_EV
-		_omega_min_ev = float(config.ppm.omega_min_ev) + _efermi_ev
-		_omega_max_ev = float(config.ppm.omega_max_ev) + _efermi_ev
-		_e_dft_ev = np.asarray(enk_dft, dtype=np.float64) * RYD_TO_EV
-		_band_in_grid, _ = classify_bands_in_grid(
-			_e_dft_ev, _omega_min_ev, _omega_max_ev)
-		_in_range = jnp.asarray(_band_in_grid, dtype=bool)
-		# Default protected = in-range: these bands carry full off-diag Σ.
-		# Out-of-range bands take the scissor, no off-diag mixing.
-		_protected = _in_range
-		print0(
-			f"  SC partition: protected/in-range = {int(_band_in_grid.sum())}"
-			f"/{int(_band_in_grid.size)} bands"
-		)
-		_partition = BandPartition(
-			protected_mask=_protected, in_range_mask=_in_range)
-		_partition.warn_if_protected_outside_grid(print_fn=print0)
-
-		_sc_inputs = SCInputs(
-			wfns_dft=wfns, V_q=V_q, kin_ion_dft=kin_ion,
+		# SC-QSGW: iterate ψ-rotation → χ₀ → W → Σ_xc (the same
+		# compute_sigma_xc dispatch, mode-agnostic) to the fixed point;
+		# the returned SigmaResult is already rotated back to the DFT
+		# basis and its sigma_omega_h5_path points at the converged
+		# single-write sigma_mnk.h5.  See ``sc_iteration.run_sc_driver``.
+		from .sc_iteration import run_sc_driver
+		sigma_result, sigma_total, _ = run_sc_driver(
+			wfns, V_q, kin_ion,
 			quad=quad, e_ref=e_ref,
 			static_head_terms=static_head_terms,
 			head_resolver=head_resolver,
 			config=config, meta=meta, mesh_xy=mesh_xy,
 			sym=sym, wfn=wfn, centroid_indices=centroid_indices,
 			band_slices=band_slices, input_dir=input_dir,
-			partition=_partition,
-			e_dft_active_kn_ry=_e_dft_active_kn_ry,
-			valence_mask_active_kn=_val_mask_active,
-			print_fn=print0,
-		)
-		_state_init = make_initial_state_from_dft(_sc_inputs)
-		# Loop knobs from ``config.sc`` (the LORRAX_SC_* env vars are
-		# deprecated overrides, applied at config construction).
-		_sc = config.sc
-		print0(f"  SC: mode={mode.value}, max_iter={_sc.max_iter}, "
-		       f"tol={_sc.tol_ev:.1e} eV, accel={_sc.accelerator}"
-		       + (f", depth={_sc.history_depth}" if _sc.accelerator == "rcrop"
-		          else f", α={_sc.mixing:.2f}"))
-		_state_final, sc_rms_history = run_self_consistency(
-			_state_init, _sc_inputs,
-			max_iter=_sc.max_iter, tol_ev=_sc.tol_ev,
-			accelerator=_sc.accelerator,
-			history_depth=_sc.history_depth,
-			mixing=_sc.mixing,
-		)
-		_sigma_result = _state_final.last_sigma_result
-		print0(
-			f"  SC done: {len(sc_rms_history)} iterations"
-			+ (f", final RMS ΔE = {sc_rms_history[-1]:.4e} eV"
-				if sc_rms_history else " (one-shot)"))
-
-		# Post-SC dumps: WFN_qp.h5 (drop-in BSE / restart input),
-		# qp_wfn_rotations.h5 ((U, E_qp) companion), and the converged
-		# sigma_mnk.h5 (intermediate iterations skipped the H5 write,
-		# so this is the single end-of-run write).  WFN_qp.h5 uses
-		# ``final_qp_eigenstates(state_final.H_qp_dft)`` which is the
-		# converged DFT-basis H — so its eigenvalues + U are the *true*
-		# QP eigenstates of the SC fixed point.  The basis-mixed
-		# rebuild + eigh at the post-Σ seam below (line ~660) gives a
-		# DIFFERENT (incorrect) U / E for SC mode because
-		# ``_sigma_result.sigma_xc_kij_ry`` lives in QP basis but
-		# ``kin_ion`` is DFT basis — fixed below by overriding
-		# ``sigma_total`` with ``state_final.H_qp_dft - kin_ion``.
-		if config.debug.write_wfn_h5:
-			dump_qp_wfn_artifacts(
-				_state_final, n_occ=int(meta.nelec), mesh_xy=mesh_xy,
-				wfn=wfn, band_slices=band_slices, kgrid=meta.kgrid,
-				output_dir=input_dir, print_fn=print0,
-			)
-		sigma_omega_h5_path = dump_sigma_omega_h5_final(
-			_state_final, config=config, meta=meta, mesh_xy=mesh_xy,
-			input_dir=input_dir, print_fn=print0,
-		)
-
-		# Overwrite the post-PPM-seam bare locals from the converged
-		# SigmaResult.  Same names and shapes as the one-shot path, so
-		# the downstream writer / freq_debug code is identical for SC
-		# and one-shot.  PPM-only fields stay None for static SC modes.
-		#
-		# CRITICAL: ``_sigma_result.{v_h_kij_ry, sigma_x_kij_ry,
-		# sigma_xc_kij_ry}`` live in the **QP basis** (compute_sigma_xc
-		# was called with the rotated wfn bundle).  Downstream code
-		# (post-Σ H build + eigh, writer, freq_debug) is written for
-		# DFT-basis matrices — kin_ion is DFT basis throughout — so we
-		# must rotate every QP-basis SigmaResult field back to DFT.
-		# The U of record is ``state_final.last_sigma_basis_U`` — the
-		# unitary that DEFINED the basis the last compute_sigma_xc ran
-		# in.  NOT the converged U from ``final_qp_eigenstates``: that
-		# is one iteration ahead and agrees only at the fixed point
-		# (using it mis-rotated Σ_x/V_H by tens of eV at max_iter=1 —
-		# caught by test_sc_oneshot_equivalence).
-		from .sc_iteration import _rotate_to_dft_basis
-		_U_jax = jnp.asarray(_state_final.last_sigma_basis_U)
-		sig_h = _rotate_to_dft_basis(_sigma_result.v_h_kij_ry, _U_jax)
-		sig_x = _rotate_to_dft_basis(_sigma_result.sigma_x_kij_ry, _U_jax)
-		_sigma_xc_dft = _rotate_to_dft_basis(
-			_sigma_result.sigma_xc_kij_ry, _U_jax)
-		sigma_total = _sigma_xc_dft + sig_h
-		sig_sx = (_rotate_to_dft_basis(_sigma_result.sigma_sx_kij_ry, _U_jax)
-		          if _sigma_result.sigma_sx_kij_ry is not None
-		          else jnp.zeros_like(sig_x))
-		sig_coh = (_rotate_to_dft_basis(_sigma_result.sigma_coh_kij_ry, _U_jax)
-		           if _sigma_result.sigma_coh_kij_ry is not None
-		           else jnp.zeros_like(sig_x))
-		sigma_c_at_dft_ev = _sigma_result.sigma_c_at_dft_diag_ev
-		omega_dft_rel_ev = _sigma_result.omega_dft_rel_ev
-		efermi_dft_ev = float(wfn.efermi) * RYD_TO_EV
-		sigma_c_omega = _sigma_result.sigma_c_omega_kij_ry
-		head_sigma_diag_w_kn_ry = _sigma_result.head_sigma_diag_w_kn_ry
-		omega_grid_ev = (
-			np.asarray(_sigma_result.omega_grid_ev, dtype=np.float64)
-			if _sigma_result.omega_grid_ev is not None else None)
-		omega_grid_ry = (
-			np.asarray(_sigma_result.omega_grid_ry, dtype=np.float64)
-			if _sigma_result.omega_grid_ry is not None else None)
-		# (sigma_omega_h5_path was set above by dump_sigma_omega_h5_final.)
-		if sigma_c_at_dft_ev is not None:
-			sigma_xc_at_dft_ev = sigma_c_at_dft_ev + np.real(np.diagonal(
-				np.asarray(sig_x), axis1=1, axis2=2)) * RYD_TO_EV
-		else:
-			sigma_xc_at_dft_ev = None
+			enk_dft=enk_dft, print_fn=print0)
 	else:
-		# ---- update_H[Σ; qp_solver] — one-shot (non-SC) paths ----
-		# ``one_shot_dft``: Σ_xc was already QSGW-built at E_DFT inside
-		# ``compute_sigma_xc`` (pass-through; also covers the static modes
-		# and the streamed-Σ_c stand-in).  ``fixed_point``: diagonal
+		# One-shot: ``one_shot_dft`` = Σ_xc was already QSGW-built at
+		# E_DFT inside compute_sigma_xc (pass-through; also covers static
+		# modes and the streamed-Σ_c stand-in); ``fixed_point`` = diagonal
 		# on-shell solve + scissor + QSGW rebuild at the solved energies.
 		# eqp0.dat/eqp1.dat are at-DFT in every case (written downstream
 		# from ``sigma_c_at_dft_ev`` / the ω-grid diag, not from here).
 		sigma_total = solve_qp(
 			qp_solver, sigma_result, kin_ion,
 			config=config, meta=meta, mesh_xy=mesh_xy, print_fn=print0)
+
+	# ---- Post-Σ seam: bare locals from the (DFT-basis) SigmaResult ----
+	# One extraction for SC and one-shot alike; PPM-only fields are None
+	# in static modes.
+	sig_h   = sigma_result.v_h_kij_ry
+	sig_x   = sigma_result.sigma_x_kij_ry
+	sig_sx  = (sigma_result.sigma_sx_kij_ry
+	           if sigma_result.sigma_sx_kij_ry is not None
+	           else jnp.zeros_like(sig_x))
+	sig_coh = (sigma_result.sigma_coh_kij_ry
+	           if sigma_result.sigma_coh_kij_ry is not None
+	           else jnp.zeros_like(sig_x))
+	sigma_omega_h5_path = sigma_result.sigma_omega_h5_path
+	sigma_c_at_dft_ev   = sigma_result.sigma_c_at_dft_diag_ev
+	omega_dft_rel_ev    = sigma_result.omega_dft_rel_ev
+	efermi_dft_ev       = sigma_result.efermi_dft_ev
+	sigma_c_omega       = sigma_result.sigma_c_omega_kij_ry
+	head_sigma_diag_w_kn_ry = sigma_result.head_sigma_diag_w_kn_ry
+	omega_grid_ev = (
+		np.asarray(sigma_result.omega_grid_ev, dtype=np.float64)
+		if sigma_result.omega_grid_ev is not None else None)
+	omega_grid_ry = (
+		np.asarray(sigma_result.omega_grid_ry, dtype=np.float64)
+		if sigma_result.omega_grid_ry is not None else None)
+	# Σ_xc(E_DFT) diagonal (eV) — drives eqp_g0w0.dat (PPM one-shot
+	# only).  Same spelling as the PPM pipeline's step 4.
+	sigma_xc_at_dft_ev = (
+		np.diagonal(np.asarray(sig_x), axis1=1, axis2=2) * RYD_TO_EV
+		+ sigma_c_at_dft_ev
+		if sigma_c_at_dft_ev is not None else None)
 
 	# ---- BGW-style degenerate-set averaging at the H-build seam ----
 	# (mirrors Sigma/shiftenergy.f90; see ``degen_average``).
