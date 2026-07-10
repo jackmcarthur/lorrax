@@ -1,9 +1,9 @@
 [cohsex]
 restart = false
-centroids_file = centroids_frac_642.txt
+centroids_file = centroids_frac_399.txt
 nval = 26
-ncond = 54
-nband = 80
+ncond = 20
+nband = 46
 sys_dim = 2
 x_only = false
 do_screened = true

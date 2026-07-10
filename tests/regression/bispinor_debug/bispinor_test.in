@@ -1,9 +1,12 @@
 [cohsex]
-# Bispinor e2e regression gate (MoS2 3x3, nspinor=2).
-# Screened-charge COHSEX (Σ_SX + Σ_COH on charge W⁰⁰) + bare Breit Σ^B.
-# 4 ζ channels, 7 V_q tiles, transverse γ̃ centroids.  Σ^B is folded into
-# the sigSX column of sigma_diag (same labels as scalar COHSEX).
-# Frozen from a clean run of the 34-band truncated fixture WFN.
+# Bispinor GN-PPM e2e regression gate (MoS2 3x3, nspinor=2).
+# Dynamic GN-PPM Σ_c on the screened charge W plus bare Breit Σ^B folded
+# into the sigX column (4 ζ channels, 7 V_q tiles, transverse γ̃
+# centroids).  Charge centroid set is NON-orbit-closed (charge tiles run
+# full-BZ-direct); the transverse set is orbit-closed (TT tiles take the
+# IBZ cascade) — same properties as the original 640/668 fixture.
+# ω-grid is deliberately small (9 points).  See README.md for the
+# 2026-07-09 shrink + mode change (COHSEX → GN-PPM) and its validation.
 wfn_file = WFN.h5
 nval = 4
 ncond = 4
@@ -11,8 +14,8 @@ nband = 32
 sys_dim = 2
 bispinor = true
 
-centroids_file = centroids_frac_640.txt
-centroids_file_current = centroids_frac_668_current.txt
+centroids_file = centroids_frac_256.txt
+centroids_file_current = centroids_frac_209_current.txt
 
 memory_per_device_gb = 30.0
 
@@ -21,11 +24,23 @@ max_r_chunks = -1
 
 x_only = false
 do_screened = true
-screening = cohsex
+compute_mode = gn_ppm
 
 # Explicit head bypass (no dipole.h5 / eps0mat.h5): both heads = 0.
 vhead = 0.0
 whead_0freq = 0.0
+whead_imfreq = 0.0
 
 output_file = sigma_diag_bispinor_test.dat
 sigma_diag_file = sigma_diag_bispinor_test.dat
+
+qp_solver = one_shot_dft
+use_ppm_sigma = true
+screening_method = minimax
+ppm_omega_p = 2.0
+ppm_fallback_omega = 2.0
+sigma_omega_min_ev = -4.0
+sigma_omega_max_ev = 4.0
+sigma_omega_step_ev = 1.0
+sigma_regularization_ev = 0.25
+fermi_reference = midgap
