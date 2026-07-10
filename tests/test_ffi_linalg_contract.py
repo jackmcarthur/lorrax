@@ -667,6 +667,8 @@ def _cli_main():
     px = int(mesh.shape["x"])
     py = int(mesh.shape["y"])
     is_cpu = jax.default_backend() == "cpu"
+    if jax.process_index() == 0:
+        print(f"backend={jax.default_backend()} mesh={args.mesh}", flush=True)
 
     failures = 0
     for name, needs_square, fn in _CLI_CELLS:

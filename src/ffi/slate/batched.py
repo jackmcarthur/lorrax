@@ -65,7 +65,13 @@ _DIAG  = {"N": 0, "U": 1}
 _JIT_CACHE: dict = {}
 
 def _mesh_key(mesh: Mesh):
-    return (tuple(mesh.axis_names), tuple(int(s) for s in mesh.shape.values()))
+    # Device identity (platform + ids) must be part of the key: two meshes
+    # with the same axis names/shape but different devices (e.g. a GPU 1x1
+    # and a CPU 1x1 in one process) lower to DIFFERENT platform handlers.
+    return (tuple(mesh.axis_names),
+            tuple(int(s) for s in mesh.shape.values()),
+            mesh.devices.flat[0].platform,
+            tuple(d.id for d in mesh.devices.flat))
 
 
 @dataclass(frozen=True)
