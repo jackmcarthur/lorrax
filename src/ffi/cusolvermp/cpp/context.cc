@@ -347,20 +347,44 @@ void destroy_context(int64_t ctx_handle) {
 
 // Lazy init for cuBLASMp.  Reuses the cuSOLVERMp ctx's stream and comm.
 // cublasMpGridCreate's communicator-parameter ABI shifted from cal_comm_t
-// to ncclComm_t at the same time cuSolverMp's did (0.7.0).  We follow
-// the same dispatch as the cuSolverMp grid: CAL for ≤0.6.x, NCCL for
-// ≥0.7.0.  See create_context() above for the full rationale.
+// (≤0.4.x) to ncclComm_t (≥0.5.0) — cuBLASMp's own version numbering,
+// NOT cuSolverMp's (0.7.0).  The two libraries resolve from different
+// stage dirs at runtime, so keying this dispatch on
+// ctx->cusolvermp_version silently passed an ncclComm_t to a CAL-ABI
+// cuBLASMp when the stages drifted (cusolverMp 0.7.2 + cuBLASMp 0.4.0
+// → cublasMpGridCreate status=6 on every mesh, 2026-07-10).  Ask the
+// loaded cuBLASMp itself.
 void ensure_cublasmp(LorraxCusolverMpCtx* ctx) {
     if (ctx->cublasmp_handle && ctx->cublasmp_grid) return;
-    const bool use_nccl_comm_path = (ctx->cusolvermp_version >= 700);
+    int blasmp_version = 0;   // MAJOR*1000 + MINOR*100 + PATCH, e.g. 501
+    throw_if_cublasmp(cublasMpGetVersion(&blasmp_version),
+                      "cublasMpGetVersion");
+    const bool use_nccl_comm_path = (blasmp_version >= 500);
+    if (ctx->rank == 0) {
+        std::fprintf(stderr,
+            "[lorrax cuBLASMp] library %d.%d.%d, comm path: %s\n",
+            blasmp_version / 1000, (blasmp_version / 100) % 10,
+            blasmp_version % 100, use_nccl_comm_path ? "NCCL" : "CAL");
+    }
     if (!use_nccl_comm_path && !ctx->cal_comm) {
-        throw std::runtime_error(
-            "ensure_cublasmp: cuSOLVERMp ctx has no CAL comm — "
-            "cuBLASMp must be initialised after cuSOLVERMp.");
+        std::ostringstream os;
+        os << "ensure_cublasmp: loaded cuBLASMp " << blasmp_version
+           << " uses the CAL comm ABI, but the cuSOLVERMp context (version "
+           << ctx->cusolvermp_version << ") created no CAL comm — the "
+           << "staged library generations are mismatched.  Stage a "
+           << "cuBLASMp >= 0.5.0 next to cuSOLVERMp >= 0.7.0 (see "
+           << "src/ffi/cusolvermp/scripts/stage_cublasmp_redist.sh) or "
+           << "use the <= 0.6.x cuSOLVERMp stage.";
+        throw std::runtime_error(os.str());
     }
     if (use_nccl_comm_path && !ctx->nccl_comm) {
-        throw std::runtime_error(
-            "ensure_cublasmp: cuSOLVERMp ctx has no NCCL comm.");
+        std::ostringstream os;
+        os << "ensure_cublasmp: loaded cuBLASMp " << blasmp_version
+           << " uses the NCCL comm ABI, but the cuSOLVERMp context (version "
+           << ctx->cusolvermp_version << ") created no NCCL comm — the "
+           << "staged library generations are mismatched.  Pair cuBLASMp "
+           << ">= 0.5.0 with cuSOLVERMp >= 0.7.0.";
+        throw std::runtime_error(os.str());
     }
     if (!ctx->cublasmp_handle) {
         throw_if_cublasmp(

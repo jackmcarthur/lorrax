@@ -100,6 +100,26 @@ def batched_distributed_gemm(
         raise ValueError(f"transa/transb must be N/T/C; got {transa}/{transb}")
 
     Px, Py = _validate_mesh(mesh)
+    if Px != Py:
+        # cublasMpMatmul_bufferSize fails with status=3 (INVALID_VALUE)
+        # on 1-D process grids at every size/combo (verified 4x1 and
+        # 1x4, 2026-07-10); 1x1 and square grids work.
+        raise ValueError(
+            f"batched_distributed_gemm: mesh {Px}x{Py} is not square — "
+            f"cuBLASMp rejects non-square process grids in this layout.  "
+            f"Use a square mesh.")
+    if transb != "N" and Px * Py > 1:
+        # cuBLASMp 0.5.1 cublasMpMatmul with op(B) != N on a multi-rank
+        # grid is rank-DIVERGENT: some ranks return status=6
+        # (INVALID_VALUE), the rest block in a collective — the job
+        # deadlocks rather than erroring (observed 2x2, 2026-07-10).
+        # op(A) in {N, T, C} with op(B) = N works on every mesh; callers
+        # needing op(B) != N must pre-transpose B on the JAX side.
+        raise ValueError(
+            f"batched_distributed_gemm: transb={transb!r} on a "
+            f"{Px}x{Py} grid is not supported by cuBLASMp (rank-divergent "
+            f"INVALID_VALUE -> collective deadlock).  Pre-transpose B "
+            f"instead (transb='N' is the only multi-rank-safe value).")
     nq = int(A.shape[0])
     # Resolve op(A) = (m, k) and op(B) = (k, n)
     A_rows, A_cols = int(A.shape[1]), int(A.shape[2])
@@ -246,6 +266,17 @@ def batched_fused_w_solve_jit(
     if n % Px != 0 or n % Py != 0:
         raise ValueError(
             f"N={n} must be divisible by both Px={Px} and Py={Py}.")
+    if Px != Py:
+        # The fused solve runs cusolverMpPotrf internally, which needs
+        # square ScaLAPACK blocks (mb == nb) — impossible with the
+        # one-tile-per-rank layout on a non-square mesh; and cuBLASMp's
+        # Matmul_bufferSize likewise rejects 1-D grids (status=3,
+        # verified 4x1/1x4 2026-07-10).  1x1 and square meshes work.
+        raise ValueError(
+            f"batched_fused_w_solve: mesh {Px}x{Py} is not square — the "
+            f"embedded cusolverMpPotrf / cublasMpMatmul require square "
+            f"block-cyclic tiles.  Use a square mesh or the JAX_NATIVE "
+            f"screening solver.")
 
     get_lib()
     ctx_handle = get_or_init_context(mesh, col_major=False)

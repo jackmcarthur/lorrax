@@ -130,6 +130,18 @@ def batched_distributed_cholesky(
         raise ValueError(f"N={n} must be divisible by Px={Px}.")
     if n % Py != 0:
         raise ValueError(f"N={n} must be divisible by Py={Py}.")
+    if Px != Py:
+        # cusolverMpPotrf requires square ScaLAPACK blocks (mb == nb);
+        # our one-tile-per-rank descriptors give mb = N/Px, nb = N/Py, so
+        # a non-square mesh always violates it — bufferSize fails with
+        # CUSOLVER_STATUS_INVALID_VALUE (=3) at every size (verified 4x1
+        # and 1x4, 2026-07-10).  The isdf 'auto' resolver already routes
+        # 1-D meshes to the in-tree sharded_cholesky; this guard turns
+        # the residual explicit-override path into a clear error.
+        raise ValueError(
+            f"batched_distributed_cholesky: mesh {Px}x{Py} is not square "
+            f"— cusolverMpPotrf needs mb == nb (square block-cyclic).  "
+            f"Use a square mesh or solver_kind='sharded_cholesky'.")
 
     get_lib()
     # Row-major grid → tile (i, j) on rank i*Py + j = JAX rank ordering.

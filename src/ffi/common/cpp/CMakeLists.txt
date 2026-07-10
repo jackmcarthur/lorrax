@@ -432,9 +432,15 @@ target_include_directories(lorrax_ffi PRIVATE
 
 find_package(Threads REQUIRED)
 
+# libcal must be linked EXPLICITLY: context.cc references cal_comm_*
+# for the <=0.6.x CAL comm path.  The CAL-era cuBLASMp (<=0.4.x) NEEDed
+# libcal.so.0 itself, so the symbols used to resolve transitively; the
+# NCCL-era cuBLASMp (>=0.5.0) doesn't, and without this line the .so
+# fails to dlopen with "undefined symbol: cal_comm_destroy".
 target_link_libraries(lorrax_ffi PRIVATE
     "${CUSOLVERMP_LIBDIR}/libcusolverMp.so"
     "${CUSOLVERMP_LIBDIR}/libcublasmp.so"
+    "${CUSOLVERMP_LIBDIR}/libcal.so"
     "${NCCL_LIBRARY}"
     "${CUDART_LIBRARY}"
     "${CUSOLVER_LIBRARY}"

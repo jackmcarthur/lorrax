@@ -2,12 +2,14 @@
 
 Compiled-library call-sites for JAX: one shared object
 (`liblorrax_ffi.so`), one ctypes loader, one Shifter launcher.  Currently
-ships three targets, all validated on NERSC Perlmutter (1–4 nodes × 4×A100):
+ships five targets, all validated on NERSC Perlmutter (1–4 nodes × 4×A100):
 
 | Subpackage | Library | Process model | Smoke test | Status |
 |---|---|---|---|---|
-| `cusolvermp` | cuSOLVERMp (multi-proc multi-GPU, NCCL-backed CAL) | 1 proc per GPU | `common.cusolvermp_eigh_test` | F64+C128 @ n=128, err ≲ 1e-12 |
-| `cusolvermg` | cuSOLVERMg (single-proc multi-GPU, in-container) | 1 proc × N GPUs | `common.cusolvermg_eigh_test` | F64 @ n∈{128, 2048}, err ≲ 2e-11 |
+| `cusolvermp` | cuSOLVERMp (multi-proc multi-GPU, NCCL-backed CAL) | 1 proc per GPU | `common.cusolvermp_eigh_test`, `common.cusolvermp_batched_test`, `tests/test_ffi_linalg_contract.py` | potrf/potrs/getrf+getrs 1e-16–1e-14 on 1×1/2×2/4×1/1×4; syevd square meshes only (rect mesh DEADLOCKS — wrapper rejects) |
+| `cublasmp` | cuBLASMp (batched gemm + fused W-solve) | 1 proc per GPU | `common.cublasmp_gemm_test`, `common.cublasmp_w_solve_test`, contract tests | 1e-16–1e-14 on all meshes.  Comm ABI must match the LOADED cuBLASMp generation (≥0.5.0 = NCCL) — see `scripts/stage_cublasmp_redist.sh` |
+| `cusolvermg` | cuSOLVERMg (single-proc multi-GPU, in-container) | 1 proc × N GPUs | `common.cusolvermg_eigh_test` | F64 @ n∈{128, 2048}, err ≲ 2e-11.  No production consumer (benchmarks only) |
+| `slate` | SLATE (MPI + GPU tile linalg; AMD-portable path) | 1 proc per GPU | `common.slate_cholesky_trsm_test`, `common.slate_batched_test`, contract tests | potrf/trsm/heev ~1e-16/1e-14 on p==q or 1-D meshes; see [`slate/README.md`](slate/README.md) |
 | `phdf5`      | parallel HDF5 via MPI-IO (read + write sharded slabs) | 1 proc per GPU | `common.phdf5_write_test`, `common.phdf5_multi_offset_test` | 0.000e+00 round-trip; 4 / 9 GB/s write / read @ 16 GPUs. See [`phdf5/ARCHITECTURE.md`](phdf5/ARCHITECTURE.md) for the async-design rationale and the non-obvious pitfalls encountered along the way. |
 
 Multi-process targets share the same bootstrap pattern (KV-store broadcast
