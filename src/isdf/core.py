@@ -849,10 +849,18 @@ def _resolve_solver_kind_charge(mesh_xy: Mesh, override: str = "auto") -> str:
     difference ~0.5 s, within run-to-run noise.  We accept the small
     overhead for the larger-scale win.
 
-    Override via cohsex.in ``cusolvermp_charge``:
-      ``off`` → force sharded.
-      ``on``  → force cuSolverMp (still falls back on 1D meshes).
-      ``auto`` (default) → cuSolverMp on true 2D, sharded otherwise.
+    Override via cohsex.in ``distributed_cholesky``:
+      ``off``        → force the in-tree sharded Cholesky.
+      ``cusolvermp`` → force cuSolverMp (still falls back on 1D meshes;
+                       legacy alias ``on``).
+      ``slate``      → SLATE ``potrf`` — the portable (Frontier/Aurora)
+                       backend.  EXPLICIT choice: fails loudly if the
+                       FFI/library is absent or the mesh geometry is the
+                       guarded 1×q case (SLATE stride assert; see
+                       tests/test_ffi_linalg_contract.py) rather than
+                       silently running a different backend.
+      ``auto`` (default) → cuSolverMp on true 2D, sharded otherwise
+                       (slate is never auto-picked).
     """
     px = int(mesh_xy.shape['x'])
     py = int(mesh_xy.shape['y'])
@@ -860,11 +868,39 @@ def _resolve_solver_kind_charge(mesh_xy: Mesh, override: str = "auto") -> str:
 
     if override == 'off':
         return 'sharded_cholesky'
-    if override == 'on':
+    if override in ('on', 'cusolvermp'):
         return 'cusolvermp_cholesky' if is_2d else 'sharded_cholesky'
+    if override == 'slate':
+        _require_slate_ffi()
+        if px == 1 and py > 1:
+            raise ValueError(
+                f"distributed_cholesky=slate: 1×{py} meshes hit a SLATE "
+                f"stride assert (guarded; see ffi/slate README).  Use a "
+                f"{py}×1 or square mesh, or a different backend.")
+        return 'slate_cholesky'
 
     # auto (or unrecognised) → default policy.
     return 'cusolvermp_cholesky' if is_2d else 'sharded_cholesky'
+
+
+def _require_slate_ffi() -> None:
+    """Raise with an actionable message unless the SLATE FFI is loadable.
+
+    SLATE is an OPTIONAL dependency: nothing imports it unless the input
+    file explicitly selects ``distributed_cholesky = slate``.
+    """
+    try:
+        from ffi.common.ffi_loader import get_lib
+        get_lib()
+        from ffi.slate import distributed_cholesky  # noqa: F401
+    except Exception as exc:
+        raise RuntimeError(
+            "distributed_cholesky=slate requested but the SLATE FFI is "
+            f"unavailable ({exc}).  Build it with "
+            "src/ffi/slate/scripts/build_perlmutter.sh + "
+            "src/ffi/common/cpp/build.sh, or use "
+            "distributed_cholesky = auto|off|cusolvermp."
+        ) from exc
 
 
 def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto") -> str:
@@ -881,10 +917,12 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto") -> st
     2×2 mesh).  At CrI3 6×6 80 Ry (n_rmu≈1800, 4×4 mesh) the cuSolverMp
     path is the right tool.
 
-    Override via cohsex.in ``cusolvermp_lu``:
-      ``off`` → force per-q ``jnp.linalg.solve``.
-      ``on``  → force cuSolverMp (still falls back on 1D meshes).
+    Override via cohsex.in ``distributed_lu``:
+      ``off``        → force per-q ``jnp.linalg.solve``.
+      ``cusolvermp`` → force cuSolverMp (still falls back on 1D meshes;
+                       legacy alias ``on``).
       ``auto`` (default) → cuSolverMp on true 2D, legacy otherwise.
+      (No ``slate`` value: a SLATE getrf wrapper does not exist yet.)
     """
     px = int(mesh_xy.shape['x'])
     py = int(mesh_xy.shape['y'])
@@ -892,7 +930,7 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto") -> st
 
     if override == 'off':
         return 'lu'
-    if override == 'on':
+    if override in ('on', 'cusolvermp'):
         return 'cusolvermp_lu' if is_2d else 'lu'
 
     return 'cusolvermp_lu' if is_2d else 'lu'
@@ -900,8 +938,8 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto") -> st
 
 def _resolve_solver_kind(
     mesh_xy: Mesh, vertex_mu_L: int, solver_kind: str,
-    cusolvermp_charge: str = "auto",
-    cusolvermp_lu: str = "auto",
+    distributed_cholesky: str = "auto",
+    distributed_lu: str = "auto",
 ) -> str:
     """Single source of truth for the ``auto`` resolution.  Transverse
     channels (γ̃^i, μ_L≠0) take ``_resolve_solver_kind_transverse``;
@@ -910,8 +948,8 @@ def _resolve_solver_kind(
     if solver_kind != 'auto':
         return solver_kind
     if int(vertex_mu_L) != 0:
-        return _resolve_solver_kind_transverse(mesh_xy, cusolvermp_lu)
-    return _resolve_solver_kind_charge(mesh_xy, cusolvermp_charge)
+        return _resolve_solver_kind_transverse(mesh_xy, distributed_lu)
+    return _resolve_solver_kind_charge(mesh_xy, distributed_cholesky)
 
 
 def factor_c_q(
@@ -1024,6 +1062,30 @@ def factor_c_q(
         from ffi.cusolvermp import batched_distributed_cholesky
         L_handle = batched_distributed_cholesky(C_q, mesh=mesh_xy)
         return L_handle.raw
+
+    if solver_kind == 'slate_cholesky':
+        # SLATE ``potrf`` — the portable (non-NVIDIA-capable library)
+        # backend, explicit-request only (see _resolve_solver_kind_charge).
+        # One whole-mesh block-cyclic factorization per q: SLATE's
+        # *batched* API distributes the batch over the mesh 'x' axis
+        # (needs nq % px == 0), which doesn't match this call site's
+        # replicated-q layout — a per-q loop over nq ≲ tens of matrices
+        # is the correct shape here.  ``to_jax_lower`` returns a
+        # conventional row-major L at P('x','y'), so downstream
+        # ``solve_zeta`` consumes it through the SAME triangular-solve
+        # branch as 'sharded_cholesky' — no solve-side changes.
+        # (Wiring slate::trsm for the back-solve is a perf follow-up.)
+        # n_rmu here is the PADDED extent (divisible by px·py, hence by
+        # each axis individually), so SLATE's divisibility contract
+        # always holds.
+        from ffi.slate import distributed_cholesky as _slate_potrf
+        L_rows = [
+            _slate_potrf(C_q[iq], mesh=mesh_xy).to_jax_lower()
+            for iq in range(nq)
+        ]
+        return jax.lax.with_sharding_constraint(
+            jnp.stack(L_rows, axis=0),
+            NamedSharding(mesh_xy, P(None, 'x', 'y')))
 
     Pr = mesh_xy.shape['x']
     Pc = mesh_xy.shape['y']

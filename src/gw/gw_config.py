@@ -291,8 +291,23 @@ _DEFAULTS = {
     # ζ-fit solver path overrides (3-state).  Default ``auto`` picks
     # cuSolverMp on true 2D meshes (p_x ≥ 2 AND p_y ≥ 2) and the
     # JAX/CUDA fallback otherwise.  Force a path with ``on`` / ``off``.
-    "cusolvermp_charge": "auto",   # auto | on | off  → cusolvermp_cholesky | sharded_cholesky
-    "cusolvermp_lu":     "auto",   # auto | on | off  → cusolvermp_lu | lu
+    # Distributed dense-linalg backends (block-cyclic).  Portable axes —
+    # the values name LIBRARIES, not vendors' key names:
+    #   distributed_cholesky = auto | off | cusolvermp | slate
+    #       charge-channel ζ-fit Cholesky.  auto → cusolvermp on true-2D
+    #       GPU meshes, in-tree sharded_cholesky otherwise.  slate is the
+    #       portability path (Frontier/Aurora); explicit request fails
+    #       loudly if the FFI/library is absent (optional dependency).
+    #   distributed_lu = auto | off | cusolvermp
+    #       transverse-channel LU (SLATE getrf wrapper not yet written).
+    # Legacy aliases (deprecation-warned): cusolvermp_charge /
+    # cusolvermp_lu with values auto|on|off (on → cusolvermp).
+    "distributed_cholesky": "auto",
+    "distributed_lu":       "auto",
+    # Deprecated aliases (still parsed; warned at load; honored only when
+    # the portable key above is left at "auto"):
+    "cusolvermp_charge": "auto",   # auto | on | off
+    "cusolvermp_lu":     "auto",   # auto | on | off
     # γ̃-double-contract kernel variant inside the monolithic pair
     # pipeline (see ``common.gamma_matrices.gamma_double_contract``).
     # Math identical across all three; differ in HLO structure.
@@ -506,6 +521,19 @@ def read_lorrax_input(filename: str) -> dict:
                     f"Input key '{legacy_key}' is deprecated; it is honored "
                     f"via ``qp_solver = auto`` resolution.  Set "
                     f"'{replacement}' instead.",
+                    DeprecationWarning, stacklevel=2,
+                )
+
+        for _legacy_key, _new_key in (
+            ("cusolvermp_charge", "distributed_cholesky"),
+            ("cusolvermp_lu", "distributed_lu"),
+        ):
+            if section.get(_legacy_key, fallback=None) is not None:
+                import warnings
+                warnings.warn(
+                    f"Input key '{_legacy_key}' is deprecated; use "
+                    f"'{_new_key} = auto|off|cusolvermp' (legacy 'on' → "
+                    f"'cusolvermp').",
                     DeprecationWarning, stacklevel=2,
                 )
 
@@ -757,8 +785,8 @@ class BackendConfig:
     slab_io: SlabIOBackend
     gspace_io: GspaceIO
     screening_solver: ScreeningSolver
-    cusolvermp_charge: str    # "auto" | "on" | "off"
-    cusolvermp_lu: str        # "auto" | "on" | "off"
+    distributed_cholesky: str  # "auto" | "off" | "cusolvermp" | "slate"
+    distributed_lu: str        # "auto" | "off" | "cusolvermp"
     gamma_contract_mode: str  # "take" | "einsum" | "scan"
 
     def summary(self) -> str:
@@ -767,8 +795,8 @@ class BackendConfig:
             f"backend: slab_io={self.slab_io.value}, "
             f"gspace_io={self.gspace_io.value}, "
             f"screening_solver={self.screening_solver.value}, "
-            f"cusolvermp_charge={self.cusolvermp_charge}, "
-            f"cusolvermp_lu={self.cusolvermp_lu}, "
+            f"distributed_cholesky={self.distributed_cholesky}, "
+            f"distributed_lu={self.distributed_lu}, "
             f"gamma_contract={self.gamma_contract_mode}"
         )
 
@@ -1211,8 +1239,34 @@ class LorraxConfig:
             raise ValueError(
                 f"slab_io={_slab_io_in!r} invalid; expected auto / phdf5_ffi "
                 f"/ phdf5_host / h5py_allgather.")
-        _cusolvermp_charge = str(_g("cusolvermp_charge")).strip().lower()
-        _cusolvermp_lu = str(_g("cusolvermp_lu")).strip().lower()
+        # Distributed-linalg axes.  Legacy ``cusolvermp_charge`` /
+        # ``cusolvermp_lu`` (auto|on|off; deprecation-warned at parse)
+        # are honored only when the portable key is left at "auto".
+        _LEGACY_LINALG = {"auto": "auto", "on": "cusolvermp", "off": "off"}
+        _dist_chol = str(_g("distributed_cholesky")).strip().lower()
+        _dist_lu = str(_g("distributed_lu")).strip().lower()
+        for _legacy_key, _cur in (
+            ("cusolvermp_charge", _dist_chol),
+            ("cusolvermp_lu", _dist_lu),
+        ):
+            _legacy_val = str(_g(_legacy_key)).strip().lower()
+            _mapped = _LEGACY_LINALG.get(_legacy_val)
+            if _mapped is None:
+                raise ValueError(
+                    f"{_legacy_key}={_legacy_val!r} invalid; expected auto/on/off.")
+            if _cur == "auto" and _mapped != "auto":
+                if _legacy_key == "cusolvermp_charge":
+                    _dist_chol = _mapped
+                else:
+                    _dist_lu = _mapped
+        if _dist_chol not in ("auto", "off", "cusolvermp", "slate"):
+            raise ValueError(
+                f"distributed_cholesky={_dist_chol!r} invalid; expected "
+                f"auto / off / cusolvermp / slate.")
+        if _dist_lu not in ("auto", "off", "cusolvermp"):
+            raise ValueError(
+                f"distributed_lu={_dist_lu!r} invalid; expected auto / off "
+                f"/ cusolvermp (a SLATE getrf wrapper does not exist yet).")
         try:
             import jax as _jax
             _is_cpu_backend = _jax.default_backend() == "cpu"
@@ -1245,20 +1299,21 @@ class LorraxConfig:
                         "the system's parallel HDF5 to get PHDF5_HOST."
                     )
                     _slab_io_choice = SlabIOBackend.H5PY_ALLGATHER
-            if _cusolvermp_charge != "off":
+            if _dist_chol != "off":
                 print_fn(
-                    f"  [config] cusolvermp_charge={_cusolvermp_charge} "
-                    "requested but JAX backend is CPU; cuSOLVERMp is "
-                    "CUDA-only.  Forcing 'off' (in-tree sharded_cholesky)."
+                    f"  [config] distributed_cholesky={_dist_chol} "
+                    "requested but JAX backend is CPU; the cuSOLVERMp and "
+                    "SLATE FFIs are CUDA-only today.  Forcing 'off' "
+                    "(in-tree sharded_cholesky)."
                 )
-                _cusolvermp_charge = "off"
-            if _cusolvermp_lu != "off":
+                _dist_chol = "off"
+            if _dist_lu != "off":
                 print_fn(
-                    f"  [config] cusolvermp_lu={_cusolvermp_lu} requested "
+                    f"  [config] distributed_lu={_dist_lu} requested "
                     "but JAX backend is CPU; cuSOLVERMp is CUDA-only.  "
                     "Forcing 'off' (in-tree per-q jnp.linalg.solve)."
                 )
-                _cusolvermp_lu = "off"
+                _dist_lu = "off"
         if _slab_io_in != "auto":
             # Explicit backend: no platform second-guessing — a wrong
             # choice fails loudly at SlabIO open (e.g. phdf5_ffi on CPU),
@@ -1269,8 +1324,8 @@ class LorraxConfig:
             slab_io=_slab_io_choice,
             gspace_io=GspaceIO(str(_g("gspace_mode")).strip().lower()),
             screening_solver=_LEGACY_ISDF_MEMORY_MODE[isdf_memory_mode],
-            cusolvermp_charge=_cusolvermp_charge,
-            cusolvermp_lu=_cusolvermp_lu,
+            distributed_cholesky=_dist_chol,
+            distributed_lu=_dist_lu,
             gamma_contract_mode=str(_g("gamma_contract_mode")).strip().lower(),
         )
         debug = DebugConfig(

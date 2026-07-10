@@ -160,3 +160,47 @@ def test_sc_env_overrides_deprecated(tmp_path, monkeypatch):
 def test_sc_bad_accelerator_rejected(tmp_path):
     with pytest.raises(ValueError, match="sc_accelerator"):
         _config(tmp_path, "sc_accelerator = bogus\n")
+
+
+# ---------------------------------------------------------------------------
+# Distributed-linalg axes: distributed_cholesky / distributed_lu
+# (portable backend names; legacy cusolvermp_charge/cusolvermp_lu aliases)
+# ---------------------------------------------------------------------------
+
+def test_distributed_linalg_defaults(tmp_path):
+    cfg = _config(tmp_path)
+    assert cfg.backend.distributed_cholesky == "auto"
+    assert cfg.backend.distributed_lu == "auto"
+
+
+def test_distributed_cholesky_slate_accepted(tmp_path):
+    cfg = _config(tmp_path, "distributed_cholesky = slate\n")
+    assert cfg.backend.distributed_cholesky == "slate"
+
+
+def test_distributed_lu_slate_rejected(tmp_path):
+    # No SLATE getrf wrapper exists yet — the value must fail loudly.
+    with pytest.raises(ValueError, match="distributed_lu"):
+        _config(tmp_path, "distributed_lu = slate\n")
+
+
+def test_legacy_cusolvermp_aliases_warn_and_map(tmp_path):
+    with pytest.warns(DeprecationWarning, match="cusolvermp_charge"):
+        cfg = _config(tmp_path, "cusolvermp_charge = on\n")
+    assert cfg.backend.distributed_cholesky == "cusolvermp"
+    with pytest.warns(DeprecationWarning, match="cusolvermp_lu"):
+        cfg = _config(tmp_path, "cusolvermp_lu = off\n", name="cohsex_qp2.in")
+    assert cfg.backend.distributed_lu == "off"
+
+
+def test_explicit_new_key_beats_legacy_alias(tmp_path):
+    with pytest.warns(DeprecationWarning):
+        cfg = _config(
+            tmp_path,
+            "distributed_cholesky = off\ncusolvermp_charge = on\n")
+    assert cfg.backend.distributed_cholesky == "off"
+
+
+def test_distributed_cholesky_invalid_value_raises(tmp_path):
+    with pytest.raises(ValueError, match="distributed_cholesky"):
+        _config(tmp_path, "distributed_cholesky = scalapack\n")

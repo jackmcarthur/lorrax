@@ -139,8 +139,8 @@ def fit_zeta_to_h5(
     gspace_mode: str = "host_cache",
     vertex_mu_L: int = 0,
     solver_kind: str = 'auto',
-    cusolvermp_charge: str = "auto",
-    cusolvermp_lu: str = "auto",
+    distributed_cholesky: str = "auto",
+    distributed_lu: str = "auto",
     gflat_chunk_size: int = 0,
     write_ibz_only: bool = True,
     zeta_cutoff_ry: float | None = None,
@@ -419,8 +419,8 @@ def fit_zeta_to_h5(
         # downstream callees skip their own 'auto' fallback.
         _resolved_solver_kind = _resolve_solver_kind(
             mesh_xy, int(vertex_mu_L), solver_kind,
-            cusolvermp_charge=cusolvermp_charge,
-            cusolvermp_lu=cusolvermp_lu)
+            distributed_cholesky=distributed_cholesky,
+            distributed_lu=distributed_lu)
         if int(vertex_mu_L) == 0:
             print(f"  Computing L_q = chol(C_q)  [PSD, charge channel, "
                   f"path={_resolved_solver_kind}]")
