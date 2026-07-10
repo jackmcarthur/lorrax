@@ -88,6 +88,7 @@ def _load_wfn_k_fftbox_ibz(wfn: WFNReader, n_val: int) -> jnp.ndarray:
     pass a ``WfnLoader`` directly so this transient construction goes
     away.
     """
+    import jax
     from jax.sharding import Mesh
     from file_io.wfn_loader import WfnLoader
     from common.wfn_transforms import to_box
